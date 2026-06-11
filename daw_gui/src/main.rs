@@ -275,15 +275,15 @@ fn spawn_incoming_bridge(
     std::thread::spawn(move || {
         while let Some(msg) = rx.blocking_recv() {
             let event = match msg {
-                ChildToMain::SlotGuiOpened { track, slot, width, height } => Some(
-                    AppEvent::GuiOpenedFromChild { track, slot, width, height },
+                ChildToMain::SlotGuiOpened { track, index, width, height } => Some(
+                    AppEvent::GuiOpenedFromChild { track, index, width, height },
                 ),
-                ChildToMain::SlotGuiClosed { track, slot } => {
-                    Some(AppEvent::GuiClosedFromChild { track, slot })
+                ChildToMain::SlotGuiClosed { track, index } => {
+                    Some(AppEvent::GuiClosedFromChild { track, index })
                 }
                 ChildToMain::SlotPluginLoaded {
                     track,
-                    slot,
+                    index,
                     id,
                     name,
                     plugin_id,
@@ -298,7 +298,7 @@ fn spawn_incoming_bridge(
                     // 運び、 handler (on_plugin_loaded_from_child) で送る。
                     Some(AppEvent::SlotPluginLoadedFromChild {
                         track,
-                        slot,
+                        index,
                         id,
                         name,
                         plugin_id,
@@ -318,12 +318,12 @@ fn spawn_incoming_bridge(
                 }
                 ChildToMain::SlotPluginLoadFailed {
                     track,
-                    slot,
+                    index,
                     plugin_id,
                     reason,
                 } => Some(AppEvent::SlotPluginLoadFailedFromChild {
                     track,
-                    slot,
+                    index,
                     plugin_id,
                     reason,
                 }),
@@ -352,44 +352,44 @@ fn spawn_incoming_bridge(
                 // 変換して app に流す。 詳細 handler は app.rs 側。
                 ChildToMain::PluginParamList {
                     track,
-                    slot,
+                    index,
                     plugin_id,
                     params,
                 } => Some(AppEvent::PluginParamListFromChild {
                     track,
-                    slot,
+                    index,
                     plugin_id,
                     params,
                 }),
                 ChildToMain::PluginParamTouched {
                     track,
-                    slot,
+                    index,
                     param_id,
                     display_name,
                 } => Some(AppEvent::PluginParamTouchedFromChild {
                     track,
-                    slot,
+                    index,
                     param_id,
                     display_name,
                 }),
                 ChildToMain::PluginParamValueChanged {
                     track,
-                    slot,
+                    index,
                     param_id,
                     value,
                 } => Some(AppEvent::PluginParamValueChangedFromChild {
                     track,
-                    slot,
+                    index,
                     param_id,
                     value,
                 }),
                 ChildToMain::PluginParamGestureEnd {
                     track,
-                    slot,
+                    index,
                     param_id,
                 } => Some(AppEvent::PluginParamGestureEndFromChild {
                     track,
-                    slot,
+                    index,
                     param_id,
                 }),
                 ChildToMain::ChildDisconnected { kind } => {

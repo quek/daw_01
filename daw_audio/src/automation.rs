@@ -14,7 +14,6 @@
 use common::automation::lane_value_at;
 use common::model::{AutomationTarget, Song, TrackBuiltinParam};
 use common::process_data::ProcessData;
-use common::protocol::PluginSlot;
 
 /// Fill `volume_per_sample` / `pan_per_sample` (each at least `frames`
 /// long, but typically `MAX_FRAMES`) for the given track and buffer.
@@ -106,8 +105,9 @@ pub fn fill_track_param_ramps(
 }
 
 /// Phase 2b (`docs/plan_automation.md` §8.3): push automation events for
-/// the specified plugin slot into `pd.events_in` as `EventKind::
-/// ParamValue` entries. plugin_host's `process_server` decodes them into
+/// the specified device (by its position in the track's single `devices`
+/// chain) into `pd.events_in` as `EventKind::ParamValue` entries.
+/// plugin_host's `process_server` decodes them into
 /// `TimedParamEvent` and forwards to `LoadedPlugin::process(..,
 /// param_events, ..)` which converts them to CLAP `clap_event_param_value`
 /// / VST3 `IParameterChanges`.
@@ -124,7 +124,7 @@ pub fn fill_pd_param_events(
     pd: &mut ProcessData,
     song: &Song,
     track_id: u32,
-    slot: PluginSlot,
+    device_index: u32,
     sample_rate: u32,
     bpm: f32,
     playhead: u64,
@@ -160,8 +160,8 @@ pub fn fill_pd_param_events(
             continue;
         }
         let param_id = match &lane.target {
-            AutomationTarget::PluginParam { slot: s, param_id }
-                if *s == slot =>
+            AutomationTarget::PluginParam { device_index: d, param_id, .. }
+                if *d == device_index =>
             {
                 *param_id
             }
@@ -220,14 +220,13 @@ mod tests {
                 0.5,
             )
         };
-        song.tracks.push(Track {
-            id: 1,
-            name: "T".into(),
-            volume: 0.5,
-            automation_lanes: vec![lane],
-            next_lane_id: 2,
-            ..Track::default()
-        });
+        song.tracks.push(track(|t| {
+            t.id = 1;
+            t.name = "T".into();
+            t.volume = 0.5;
+            t.automation_lanes = vec![lane];
+            t.next_lane_id = 2;
+        }));
         song
     }
 
@@ -239,6 +238,17 @@ mod tests {
     fn empty_recording_lanes()
     -> std::collections::HashSet<(u32, common::model::AutomationTarget)> {
         std::collections::HashSet::new()
+    }
+
+    /// v23 single-chain: `Track` の `legacy_*` migration fields は `common`
+    /// crate に `pub(crate)` で閉じているため、 downstream crate (daw_audio)
+    /// の test では `Track { .., ..Track::default() }` の functional-update が
+    /// E0451 になる。 `Track::default()` から組んで mutator で埋める helper で
+    /// 回避する (private field に触れずに済む)。
+    fn track(f: impl FnOnce(&mut Track)) -> Track {
+        let mut t = Track::default();
+        f(&mut t);
+        t
     }
 
     #[test]
@@ -257,13 +267,12 @@ mod tests {
             bpm: 120.0,
             ..Song::default()
         };
-        song.tracks.push(Track {
-            id: 1,
-            name: "T".into(),
-            volume: 0.7,
-            pan: -0.25,
-            ..Track::default()
-        });
+        song.tracks.push(track(|t| {
+            t.id = 1;
+            t.name = "T".into();
+            t.volume = 0.7;
+            t.pan = -0.25;
+        }));
         let mut vol = vec![0.0_f32; 16];
         let mut pan = vec![0.0_f32; 16];
         let empty = empty_recording_lanes();
@@ -451,7 +460,7 @@ mod tests {
         }
     }
 
-    /// One track (id 7) with a single `PluginParam` (Instrument, param 5)
+    /// One track (id 7) with a single `PluginParam` (device_index 0, param 5)
     /// automation lane ramping 0.25 → 0.75 over beats 0..4.
     fn one_plugin_param_lane_song() -> Song {
         let mut song = Song {
@@ -468,7 +477,11 @@ mod tests {
                 ],
             }),
         );
-        let target = AutomationTarget::PluginParam { slot: PluginSlot::Instrument, param_id: 5 };
+        let target = AutomationTarget::PluginParam {
+            device_index: 0,
+            param_id: 5,
+            legacy_slot: None,
+        };
         let lane = AutomationLane {
             id: 1,
             clips: vec![AutomationClip {
@@ -481,13 +494,12 @@ mod tests {
             next_clip_id: 2,
             ..AutomationLane::new(target, 0.5)
         };
-        song.tracks.push(Track {
-            id: 7,
-            name: "T".into(),
-            automation_lanes: vec![lane],
-            next_lane_id: 2,
-            ..Track::default()
-        });
+        song.tracks.push(track(|t| {
+            t.id = 7;
+            t.name = "T".into();
+            t.automation_lanes = vec![lane];
+            t.next_lane_id = 2;
+        }));
         song
     }
 
@@ -498,14 +510,16 @@ mod tests {
     fn fill_pd_param_events_skips_recording_lanes() {
         let song = one_plugin_param_lane_song();
         let track_id = 7;
-        let target = AutomationTarget::PluginParam { slot: PluginSlot::Instrument, param_id: 5 };
+        let target = AutomationTarget::PluginParam {
+            device_index: 0,
+            param_id: 5,
+            legacy_slot: None,
+        };
 
         // Not recording: the curve value is pushed as a ParamValue event (read).
         let mut pd = ProcessData::empty();
         let empty = empty_recording_lanes();
-        fill_pd_param_events(
-            &mut pd, &song, track_id, PluginSlot::Instrument, SR, 120.0, 0, 64, &empty,
-        );
+        fill_pd_param_events(&mut pd, &song, track_id, 0, SR, 120.0, 0, 64, &empty);
         assert_eq!(pd.n_events_in, 1, "read mode must push the curve value");
 
         // Recording: the lane is skipped, so no curve event overwrites the
@@ -513,9 +527,7 @@ mod tests {
         let mut pd2 = ProcessData::empty();
         let mut rec = std::collections::HashSet::new();
         rec.insert((track_id, target));
-        fill_pd_param_events(
-            &mut pd2, &song, track_id, PluginSlot::Instrument, SR, 120.0, 0, 64, &rec,
-        );
+        fill_pd_param_events(&mut pd2, &song, track_id, 0, SR, 120.0, 0, 64, &rec);
         assert_eq!(pd2.n_events_in, 0, "recording lane curve must be suppressed");
     }
 }

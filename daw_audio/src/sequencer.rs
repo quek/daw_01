@@ -247,6 +247,16 @@ mod tests {
     use super::*;
     use common::model::{Clip, ClipContent, MidiContent, Track};
 
+    /// v23 single-chain: `Track` の `legacy_*` migration fields は `common`
+    /// に `pub(crate)` で閉じているので、 downstream の test では
+    /// `Track { .., ..Track::default() }` が E0451。 `Track::default()` を
+    /// mutator で埋める helper で回避する。
+    fn track(f: impl FnOnce(&mut Track)) -> Track {
+        let mut t = Track::default();
+        f(&mut t);
+        t
+    }
+
     fn one_note_song(start_beat: f64, duration_beats: f64, pitch: u8) -> Song {
         // v6: notes は Song.clip_contents に置く。 inline の `notes:` は
         // legacy field (空) のままで、 ensure_clip_contents が migrate する
@@ -269,10 +279,10 @@ mod tests {
                 }],
             }),
         );
-        song.tracks.push(Track {
-            id: 1,
-            name: "T".into(),
-            clips: vec![Clip {
+        song.tracks.push(track(|t| {
+            t.id = 1;
+            t.name = "T".into();
+            t.clips = vec![Clip {
                 id: 1,
                 name: "C".into(),
                 start_beat: 0.0,
@@ -281,9 +291,8 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
-            }],
-            ..Track::default()
-        });
+            }];
+        }));
         song
     }
 
@@ -505,10 +514,10 @@ mod tests {
                 ],
             }),
         );
-        song.tracks.push(Track {
-            id: 1,
-            name: "T".into(),
-            clips: vec![Clip {
+        song.tracks.push(track(|t| {
+            t.id = 1;
+            t.name = "T".into();
+            t.clips = vec![Clip {
                 id: 1,
                 name: "C".into(),
                 start_beat: 0.0,
@@ -517,9 +526,8 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
-            }],
-            ..Track::default()
-        });
+            }];
+        }));
         let mut out = Vec::new();
         let mut active = Vec::new();
         collect_events_for_buffer(

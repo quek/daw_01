@@ -2672,7 +2672,6 @@ fn draw_midi_clip_notes(
 #[cfg(test)]
 mod tests {
     use super::{clip_display_label, track_index_at_y};
-    use common::model::Track;
     use daw_ui_renderer::Rect;
 
     fn rect_at(y: f32, h: f32) -> Rect {
@@ -2753,9 +2752,9 @@ mod tests {
             (12, rect_at(60.0, 20.0)),      // song.tracks[2] (最下段)
         ];
         let tracks = [
-            Track { id: 10, ..Track::default() },
-            Track { id: 11, ..Track::default() },
-            Track { id: 12, ..Track::default() },
+            crate::app::track_with(|t| t.id = 10),
+            crate::app::track_with(|t| t.id = 11),
+            crate::app::track_with(|t| t.id = 12),
         ];
         // master 行の Y → song.tracks に居ないので None (新規 track / split 対象外)。
         assert_eq!(track_index_at_y(&rects, &tracks, 10.0), None);

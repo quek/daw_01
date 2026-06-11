@@ -51,7 +51,7 @@ struct PluginInstance {
     format: PluginFormat,
     state: Option<Vec<u8>>,
     sidechain_sources: Vec<Option<u32>>,
-    ports: PortConfig,              // ★追加: 役割導出の入力（load 時に DB から解決）
+    ports: PortConfig,              // ★追加: port 直結の入力（load 時に DB から解決）
 }
 ```
 
@@ -60,44 +60,43 @@ struct PluginInstance {
   音源境界なし）。非 master トラックだけ作り直す。
 - `AutomationTarget::PluginParam { slot } → { device_index: u32 }`。
 - `PortConfig` を `PluginInstance` に持たせ **LoadSong で daw_audio に運ぶ**ことで、
-  daw_audio が DB 無しに役割導出できる（SSoT: 導出入力は song が持つ）。
+  daw_audio が DB 無しに port 直結できる（SSoT: 接続入力は song が持つ）。
 
-## 4. 役割導出ルール（設計の心臓・SSoT）
+## 4. port 直結ルール（設計の心臓・Reaper 流）
 
-各 device の `PortConfig (N_i=note_in, N_o=note_out, A_o=audio_out)` から、チェーンを
-左→右に1回歩いて役割を決める純粋関数。**保持しない・毎回導出**。
+> **2026-06-11 改訂**: 当初は §4 を「PortConfig からチェーンを歩いて役割（Generator
+> /Instrument/AudioEffect/Inactive）を導出する純粋関数」として設計したが、実機で
+> 破綻した。`note_out` を持つ音源（MSoundFactory = Drum/Bell）や `note_in` を持つ
+> エフェクト（MTurboComp）が実在し、**port だけでは役割を分類できない**。役割を当てに
+> 行く時点で道を誤る。よって役割判定を**全廃**し、Reaper と同じ「port を順に直結する
+> だけ」に作り直した。挙動は各プラグインの port 構成 + 実処理から自然に決まる。
+
+各 device は `PortConfig (note_in, note_out, audio_out, audio_in)` を持つ。チェーンを
+左→右に1回歩き、2 本のバス（MIDI バス・audio バス）を順に接続するだけ。**判定しない**。
 
 ```text
-has_note_in_after[i] = OR{ device[j].N_i : j > i }     // 後方1パスで前計算
-signal = MIDI
-for i in 0..n:
-    d = device[i]
-    if signal == AUDIO:
-        role[i] = AudioEffect if d.A_o else Inactive    // audio 区間
-        continue
-    // MIDI 区間
-    can_instrument = d.N_i && d.A_o
-    pass_midi      = d.N_o && (has_note_in_after[i] || !can_instrument)
-    if pass_midi:
-        role[i] = Generator        // MIDI を出す。signal は MIDI のまま
-    elif can_instrument:
-        role[i] = Instrument       // audio を出す。signal = AUDIO に遷移
-    else:
-        role[i] = Inactive         // 音源前の audio FX 等（入力が来ない）
+midi_bus  = track の notes
+audio_bus = track の audio clips（無ければ無音）
+for d in devices:                       # 左→右
+    if d.note_in:   feed midi_bus  → d           # MIDI 入力を持つ機に現在の MIDI を渡す
+    if d.audio_in:  feed audio_bus → d           # audio 入力を持つ機に現在の audio を渡す
+    dispatch(d)
+    if d.note_out:  midi_bus = d.midi_out         # MIDI を出す機はバスを置換（出さなければ素通し）
+    if d.audio_out:
+        if d.audio_in: audio_bus = d.audio_out    # 入力を処理 → 置換（エフェクト的挙動）
+        else:          audio_bus += d.audio_out   # 入力を取らず生成 → 加算（音源的挙動）
+audio_bus を親（group / master）へ
 ```
 
-検証（ユーザーのケース）:
-- `[Scaler(N_i,N_o,A_o)]` → 下流に note 消費者なし → pass_midi=F → **Instrument**（鳴る）
-- `[Scaler, AnalogLab(N_i,A_o)]` → Scaler の下流に N_i あり → pass_midi=T → **Generator**、
-  AnalogLab は **Instrument**（Scaler が AnalogLab を駆動。Scaler 自身の audio は不使用）
-- AnalogLab を削除 → `[Scaler]` → 再び **Instrument**（**無音バグが構造的に解消**）
-- `[Reverb(A_o), AnalogLab]` → Reverb は音源前で Inactive、AnalogLab が Instrument
-  （実 DAW と同じ＝音源前の audio FX は無効）
-- 並び替えは**全許可**。`[AnalogLab, Scaler]` にしても crash せず役割が再導出される
-  （AnalogLab=音源、Scaler=audio 区間で audio FX か Inactive）。
-  → FIXME #32 の「Scaler↔AnalogLab を入れ替えられない」も**棄却ロジックごと消えて解決**。
-
-ロール = {Generator, Instrument, AudioEffect, Inactive}。`Inactive` は process skip。
+検証（ユーザーのケース。役割を当てず、port 接続の結果として説明できる）:
+- `[MSoundFactory(note_in,note_out,audio_out,audio_in)]`（Drum/Bell）→ notes を受けて
+  audio_out を出す → **鳴る**（旧 derive_roles は note_out を見て Generator に誤分類し無音だった）。
+- `[Scaler, AnalogLab]` → Scaler が notes を受け note_out で harmonized MIDI を出す →
+  AnalogLab がそれを受けて audio_out（audio_in 有り＝置換）→ **AnalogLab が鳴る**。
+- `[AnalogLab, Scaler]` → AnalogLab は note_out 無し＝track notes を素通し → Scaler が
+  同じ notes を受けて audio_out で置換 → **Scaler が鳴る**（ユーザー期待どおり）。
+- 並び替えは**全許可・棄却なし**（port を繋ぎ直すだけ）。
+  → FIXME #32 の「Scaler↔AnalogLab を入れ替えられない」は棄却ロジックごと消えて解決。
 
 ## 5. 各プロセスの変更（migration surface）
 
@@ -112,18 +111,18 @@ for i in 0..n:
 
 ### daw_gui (app.rs)
 - caches を `(track, u32)` 化: `loaded_slots`, `open_plugin_guis`, `plugin_params`。
-- `inspector_chain()`: flat な device 列を返し、**セクション見出し（生成器/音源/FX）は
-  役割導出で動的に付与**（§4 の role を表示用に流用）。
+- `inspector_chain()`: flat な device 列（plugin 名のみ）を返す。**役割見出しは無し**
+  （判定しないので生成器/音源/FX ラベルは付けない）。
 - `reorder_inspector_chain()`: **棄却なしの純 index 並べ替え**。任意 order を受け、
   `moves` を作って `ReorderChain` を両 child へ。能力チェック撤廃。
 - `select_plugin_from_db()`: 挿入 index を決めて `SetDevice`。降格/昇格ロジック撤廃
-  （位置で役割が決まるので不要）。`DemoteInstrumentToGenerator`/should_demote 撤廃。
+  （役割を持たないので不要）。`DemoteInstrumentToGenerator`/should_demote 撤廃。
 - `reconcile_*`: `(index, &PluginInstance)` で diff。
 
 ### daw_audio (engine.rs, automation.rs, graph/compile.rs, schedule.rs)
 - `slot_to_plugin_id: HashMap<(u32,u32),u32>`（track,index→pid）。ReorderChain で再キー。
-- `process_track_owned`: 3段（midi_fx/instrument/fx）を**単一 device ループ＋signal_type
-  状態機械**へ。各 device の `ports`（song 由来）で §4 を実行し、MIDI/audio をルーティング。
+- `process_track_owned`: 3段（midi_fx/instrument/fx）を**単一 device ループ**へ。各
+  device の `ports`（song 由来）で §4 の port 直結を行い、MIDI/audio をルーティング。
 - `fill_pd_param_events`: slot→device_index。
 - sidechain tap / PDC compile / group fx: セクション別 walk を device walk へ統一。
   ReorderChain でも PDC 再 compile をトリガ（src track 並べ替えで latency table を再構築）。

@@ -744,16 +744,18 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
 
     let ev_in = unsafe { component.getBusCount(MediaTypes_::kEvent, BusDirections_::kInput) };
     let ev_out = unsafe { component.getBusCount(MediaTypes_::kEvent, BusDirections_::kOutput) };
+    let au_in = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput) };
     let au_out = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput) };
     let _ = unsafe { component.terminate() };
 
-    // FIXME #29: bus 構成をそのまま port 構成として返す。 dual-role
-    // (ev_out>0 かつ au_out>0) も note-effect (ev_out>0・au_out==0) も区別なく拾える。
-    // 役割の解釈は daw_gui 側の `PluginCapability` が担う (SSoT は 3 bool)。
+    // bus 構成をそのまま port 構成として返す。v23: audio input bus も拾うことで、
+    // engine が「audio を生成する音源 (au_in==0)」と「audio を加工するエフェクト
+    // (au_in>0)」を port 直結で区別できる (audio_in 有り = 入力を処理して置換)。
     Ok(common::port_config::PortConfig {
         has_note_input: ev_in > 0,
         has_note_output: ev_out > 0,
         has_audio_output: au_out > 0,
+        has_audio_input: au_in > 0,
     })
 }
 

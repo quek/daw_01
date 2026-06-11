@@ -24,7 +24,7 @@ use boa_engine::{
 };
 use common::model::Song;
 use common::plugin_format::PluginFormat;
-use common::protocol::{ChildToMain, MainToChild, PluginSlot};
+use common::protocol::{ChildToMain, MainToChild};
 
 use crate::app::{AppData, AppEvent, ClipRef};
 use crate::bootstrap::Bootstrap;
@@ -194,14 +194,14 @@ impl ScriptHost {
                 track,
                 plugin_id,
                 shmem_id,
-                slot,
+                index,
                 ..
             } => {
                 let _ = self.bootstrap.audio_tx.send(MainToChild::OpenPluginShmem {
                     plugin_id: *plugin_id,
                     shmem_id: shmem_id.clone(),
                     track: *track,
-                    slot: *slot,
+                    index: *index,
                 });
                 self.plugin_to_track.insert(*plugin_id, *track);
                 self.track_plugin_ids
@@ -224,13 +224,13 @@ impl ScriptHost {
             }
             ChildToMain::SlotPluginLoadFailed {
                 track,
-                slot,
+                index,
                 plugin_id,
                 reason,
             } => {
                 tracing::error!(
                     track,
-                    ?slot,
+                    index,
                     %plugin_id,
                     %reason,
                     "script: plugin load failed"
@@ -362,6 +362,11 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             NativeFunction::from_fn_ptr(daw_inspect_song_json),
             js_string!("inspectSongJson"),
             0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_device_chain),
+            js_string!("deviceChain"),
+            1,
         )
         .function(
             NativeFunction::from_fn_ptr(daw_set_selection),
@@ -511,23 +516,14 @@ fn daw_set_slot_plugin(
     args: &[JsValue],
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
+    // 単一デバイスチェーン: `daw.setSlotPlugin(track, index, format, path, id)`。
+    // 旧 (slot_kind, slot_index) 2 引数を flat な device `index` 1 つに統合。
     let track_id = u32::try_from_js(args.get_or_undefined(0), ctx)?;
-    let slot_kind = u8::try_from_js(args.get_or_undefined(1), ctx)?;
-    let slot_index = u32::try_from_js(args.get_or_undefined(2), ctx)?;
-    let format_str = String::try_from_js(args.get_or_undefined(3), ctx)?;
-    let path_str = String::try_from_js(args.get_or_undefined(4), ctx)?;
-    let plugin_id = String::try_from_js(args.get_or_undefined(5), ctx)?;
+    let index = u32::try_from_js(args.get_or_undefined(1), ctx)?;
+    let format_str = String::try_from_js(args.get_or_undefined(2), ctx)?;
+    let path_str = String::try_from_js(args.get_or_undefined(3), ctx)?;
+    let plugin_id = String::try_from_js(args.get_or_undefined(4), ctx)?;
 
-    let slot = match slot_kind {
-        0 => PluginSlot::MidiFx(slot_index),
-        1 => PluginSlot::Instrument,
-        2 => PluginSlot::Fx(slot_index),
-        n => {
-            return Err(JsNativeError::range()
-                .with_message(format!("invalid slot_kind {n} (0=MidiFx,1=Instrument,2=Fx)"))
-                .into());
-        }
-    };
     let format = match format_str.as_str() {
         "clap" => PluginFormat::Clap,
         "vst3" => PluginFormat::Vst3,
@@ -540,7 +536,7 @@ fn daw_set_slot_plugin(
     with_host(|h| {
         let _ = h.bootstrap.plugin_tx.send(MainToChild::SetSlotPlugin {
             track: track_id,
-            slot,
+            index,
             format,
             path: PathBuf::from(path_str),
             plugin_id,
@@ -555,28 +551,18 @@ fn daw_wait_for_plugin_loaded(
     args: &[JsValue],
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
+    // 単一デバイスチェーン: `daw.waitForPluginLoaded(track, index, timeout)`。
     let track_id = u32::try_from_js(args.get_or_undefined(0), ctx)?;
-    let slot_kind = u8::try_from_js(args.get_or_undefined(1), ctx)?;
-    let slot_index = u32::try_from_js(args.get_or_undefined(2), ctx)?;
-    let timeout_ms = u64::try_from_js(args.get_or_undefined(3), ctx).unwrap_or(30_000);
-    let want_slot = match slot_kind {
-        0 => PluginSlot::MidiFx(slot_index),
-        1 => PluginSlot::Instrument,
-        2 => PluginSlot::Fx(slot_index),
-        n => {
-            return Err(JsNativeError::range()
-                .with_message(format!("invalid slot_kind {n}"))
-                .into());
-        }
-    };
+    let want_index = u32::try_from_js(args.get_or_undefined(1), ctx)?;
+    let timeout_ms = u64::try_from_js(args.get_or_undefined(2), ctx).unwrap_or(30_000);
 
     let res = with_host(|h| {
         h.pump_until(
             |msg| {
                 matches!(
                     msg,
-                    ChildToMain::SlotPluginLoaded { track, slot, .. }
-                        if *track == track_id && *slot == want_slot
+                    ChildToMain::SlotPluginLoaded { track, index, .. }
+                        if *track == track_id && *index == want_index
                 )
             },
             Duration::from_millis(timeout_ms),
@@ -750,6 +736,41 @@ fn daw_inspect_song_json(
         serde_json::to_string(&song)
     })
     .map_err(|e| js_native(format!("inspectSongJson: serialize: {e}")))?;
+    Ok(JsString::from(json.as_str()).into())
+}
+
+/// `daw.deviceChain(track_id)` → `host.app.song` の指定トラックの単一デバイス
+/// チェーンを、各 device の `{plugin_id, ports}` の JSON 配列文字列で返す。
+/// 役割判定はしない (engine は port を順に直結するだけ)。load → migration →
+/// port 解決 → 並び順 が production と同じ経路で正しく通ることを JS から
+/// end-to-end で検証する。`track_id == MASTER_TRACK_ID` は master_fx_chain を見る。
+fn daw_device_chain(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    #[derive(serde::Serialize)]
+    struct ChainDevice<'a> {
+        plugin_id: &'a str,
+        ports: common::port_config::PortConfig,
+    }
+    let track_id = u32::try_from_js(args.get_or_undefined(0), ctx)?;
+    let json = with_host(|host| {
+        let devices: &[common::model::PluginInstance] =
+            if track_id == common::model::MASTER_TRACK_ID {
+                &host.app.song.master_fx_chain
+            } else {
+                host.app
+                    .song
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == track_id)
+                    .map(|t| t.devices.as_slice())
+                    .unwrap_or(&[])
+            };
+        let chain: Vec<ChainDevice> = devices
+            .iter()
+            .map(|d| ChainDevice { plugin_id: d.plugin_id.as_str(), ports: d.ports })
+            .collect();
+        serde_json::to_string(&chain)
+    })
+    .map_err(|e| js_native(format!("deviceChain: serialize: {e}")))?;
     Ok(JsString::from(json.as_str()).into())
 }
 

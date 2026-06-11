@@ -57,11 +57,11 @@ fn clamp_dim(v: u32) -> i32 {
 pub struct EditorWindow {
     hwnd: HWND,
     /// The session-stable plugin id this editor belongs to. The `editor_windows`
-    /// map is keyed by `(track, slot)` for open/close/resize, but slots can
-    /// SHIFT while the editor is open (removing a lower Fx, or a dual-role
-    /// Instrument→MidiFx demotion). Plugin removal therefore matches by this
-    /// stable id (which never shifts) so a removed plugin's editor is always
-    /// torn down, not orphaned. Mirrors `plugin_registry`'s id keying.
+    /// map is keyed by `(track, device_index)` for open/close/resize, but the
+    /// index can SHIFT while the editor is open (removing a lower-index device,
+    /// or a chain reorder). Plugin removal therefore matches by this stable id
+    /// (which never shifts) so a removed plugin's editor is always torn down,
+    /// not orphaned. Mirrors `plugin_registry`'s id keying.
     plugin_id: u32,
     /// Set by the WNDPROC when the user clicks the window's ✕. The
     /// plugin-main loop polls this each iteration and runs the close flow

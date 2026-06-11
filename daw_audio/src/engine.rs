@@ -27,7 +27,6 @@ use common::audio_bridge::AudioBridgeHandle;
 use common::model::{Song, Track};
 use common::plugin_ref::{PluginRef, WorkerSyncRef};
 use common::process_data::EventKind;
-use common::protocol::PluginSlot;
 use common::timing::{effective_loop_bounds, song_ended};
 use common::worker_bridge::WorkerBridgeHandle;
 
@@ -68,31 +67,33 @@ pub enum AudioCommand {
     },
     /// A new plugin instance was loaded; the audio engine has opened
     /// its `ProcessData` shmem and is ready to drive `plugin.process()`.
-    /// `track` / `slot` let the engine slot the plugin into its routing
-    /// graph at the matching position. `handle` keeps the daw_audio-side
-    /// shmem mapping alive — without it, `plugin_ref.process_data` would
-    /// be a dangling pointer once `handle_open_plugin_shmem` returns and
-    /// drops its local `ProcessDataHandle`.
+    /// `track` / `index` let the engine slot the plugin into its routing
+    /// graph at the matching position in the single device chain. `handle`
+    /// keeps the daw_audio-side shmem mapping alive — without it,
+    /// `plugin_ref.process_data` would be a dangling pointer once
+    /// `handle_open_plugin_shmem` returns and drops its local
+    /// `ProcessDataHandle`.
     OpenPluginShmem {
         plugin_id: u32,
         plugin_ref: PluginRef,
         handle: common::process_data::ProcessDataHandle,
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     },
     /// Drop a previously-opened plugin shmem mapping. Triggered on
     /// RemoveSlotPlugin / RemoveTrack from the GUI side.
     ClosePluginShmem { plugin_id: u32 },
     /// FIXME #32: atomically re-key `slot_to_plugin_id` for a chain reorder.
-    /// `moves` is the complete `(old_slot, new_slot)` permutation of `track`'s
-    /// loaded plugins (see `MainToChild::ReorderChain`). Only the slot KEYS
-    /// move — the plugin ids and their `plugin_refs` are untouched, so no
-    /// plugin is ever briefly dropped (unlike a sequence of `OpenPluginShmem`
-    /// at swapping slots). The processing ORDER follows the matching
-    /// `LoadSong`; this just makes each slot resolve to its moved plugin.
+    /// `moves` is the complete `(old_index, new_index)` permutation of
+    /// `track`'s loaded plugins (see `MainToChild::ReorderChain`). Only the
+    /// device-index KEYS move — the plugin ids and their `plugin_refs` are
+    /// untouched, so no plugin is ever briefly dropped (unlike a sequence of
+    /// `OpenPluginShmem` at swapping indices). The processing ORDER follows
+    /// the matching `LoadSong`; this just makes each index resolve to its
+    /// moved plugin.
     ReorderChain {
         track: u32,
-        moves: Vec<(PluginSlot, PluginSlot)>,
+        moves: Vec<(u32, u32)>,
     },
     /// 鍵盤レーン click のプレビュー note-on (gui_01 #055)。 `track` は
     /// song.tracks の Vec index (= main.rs が `track_id` から現 song snapshot
@@ -195,9 +196,10 @@ pub struct EngineShared {
     /// `plugin_id` → `PluginRef` (process_data shmem ptr). New
     /// snapshot on every plugin load / unload.
     pub plugin_refs: ArcSwap<HashMap<u32, PluginRef>>,
-    /// `(track, slot)` → `plugin_id`. New snapshot in lock-step with
-    /// `plugin_refs`.
-    pub slot_to_plugin_id: ArcSwap<HashMap<(u32, PluginSlot), u32>>,
+    /// `(track, device_index)` → `plugin_id`. New snapshot in lock-step with
+    /// `plugin_refs`. v23 single-chain: addressed by the device's position in
+    /// `Track.devices` (was per-section `PluginSlot`).
+    pub slot_to_plugin_id: ArcSwap<HashMap<(u32, u32), u32>>,
     /// Worker pool that fans per-track work across N audio-engine
     /// workers. `None` until `OpenWorkerPool` arrives.
     pub worker_pool: ArcSwapOption<AudioWorkerPool>,
@@ -347,7 +349,7 @@ pub struct LocalState {
     #[cfg(debug_assertions)]
     pub heartbeat_plugin_ids: Vec<u32>,
     #[cfg(debug_assertions)]
-    pub heartbeat_slot_keys: Vec<((u32, PluginSlot), u32)>,
+    pub heartbeat_slot_keys: Vec<((u32, u32), u32)>,
 }
 
 impl LocalState {
@@ -469,23 +471,23 @@ impl LocalState {
                     plugin_ref,
                     handle,
                     track,
-                    slot,
+                    index,
                 } => {
                     // Snapshot-copy-mutate-publish so RT readers either
                     // see the old map or the fully-populated new one,
                     // never a partial state.
                     let mut new_refs: HashMap<u32, PluginRef> =
                         (**self.shared.plugin_refs.load()).clone();
-                    let mut new_slot: HashMap<(u32, PluginSlot), u32> =
+                    let mut new_slot: HashMap<(u32, u32), u32> =
                         (**self.shared.slot_to_plugin_id.load()).clone();
-                    if let Some(stale) = new_slot.insert((track, slot), plugin_id)
+                    if let Some(stale) = new_slot.insert((track, index), plugin_id)
                         && stale != plugin_id
                         // FIXME #31: only drop the displaced plugin from
-                        // plugin_refs if it isn't still mapped at ANOTHER slot.
-                        // On a dual-role demotion the instrument plugin MOVES to
-                        // a generator slot (its OpenPluginShmem at the new slot
-                        // arrives first); the new instrument then displaces it
-                        // here, but it must keep being processed at its new slot.
+                        // plugin_refs if it isn't still mapped at ANOTHER index.
+                        // On a live move the displaced plugin keeps being
+                        // processed at its new device index (its OpenPluginShmem
+                        // at the new index arrives first); the new plugin then
+                        // displaces it here, but it must stay in plugin_refs.
                         && !new_slot.values().any(|&pid| pid == stale)
                     {
                         new_refs.remove(&stale);
@@ -502,63 +504,51 @@ impl LocalState {
                     // leak-on-open pattern this mirrors.
                     let leaked = Box::leak(Box::new(handle));
                     let _ = leaked;
-                    tracing::info!(plugin_id, track, ?slot, "plugin shmem registered");
+                    tracing::info!(plugin_id, track, index, "plugin shmem registered");
                 }
                 AudioCommand::ClosePluginShmem { plugin_id } => {
                     let mut new_refs: HashMap<u32, PluginRef> =
                         (**self.shared.plugin_refs.load()).clone();
                     let cur_slot = self.shared.slot_to_plugin_id.load();
-                    // Find the (track_id, slot) that pointed at this
-                    // plugin_id BEFORE we remove the entry, so we can
-                    // shift remaining same-kind slots in the same
-                    // track downwards (mirrors the Vec::remove that
-                    // daw_gui / daw_plugin_host did on their fx_chain
-                    // / midi_fx_chain). Without this shift, removing
-                    // Fx(0) leaves Fx(1) stranded under its old key,
-                    // and `process_track_owned` looks up Fx(0) → no
-                    // hit → silent (group fx dropped on deletion).
+                    // Find the (track_id, device_index) that pointed at this
+                    // plugin_id BEFORE we remove the entry, so we can shift the
+                    // remaining higher device indices on the same track down by
+                    // one (mirrors the `Vec::remove` daw_gui / daw_plugin_host
+                    // did on `Track.devices`). v23 single-chain: the index
+                    // space is unified, so removing device i leaves device i+1
+                    // stranded under its old key; without this shift,
+                    // `process_track_owned` would look up index i → no hit →
+                    // silent (chain device dropped on deletion).
                     let removed_key = cur_slot
                         .iter()
                         .find_map(|(k, v)| if *v == plugin_id { Some(*k) } else { None });
-                    let mut new_slot: HashMap<(u32, PluginSlot), u32> = (**cur_slot).clone();
+                    let mut new_slot: HashMap<(u32, u32), u32> = (**cur_slot).clone();
                     new_slot.retain(|_, pid| *pid != plugin_id);
-                    if let Some((track_id, removed_slot)) = removed_key {
-                        let entries: Vec<((u32, PluginSlot), u32)> = new_slot.drain().collect();
-                        for ((tid, slot), pid) in entries {
-                            let new_slot_kind = if tid == track_id {
-                                match (removed_slot, slot) {
-                                    (PluginSlot::Fx(removed_i), PluginSlot::Fx(i))
-                                        if i > removed_i =>
-                                    {
-                                        PluginSlot::Fx(i - 1)
-                                    }
-                                    (PluginSlot::MidiFx(removed_i), PluginSlot::MidiFx(i))
-                                        if i > removed_i =>
-                                    {
-                                        PluginSlot::MidiFx(i - 1)
-                                    }
-                                    (_, other) => other,
-                                }
+                    if let Some((track_id, removed_idx)) = removed_key {
+                        let entries: Vec<((u32, u32), u32)> = new_slot.drain().collect();
+                        for ((tid, idx), pid) in entries {
+                            let new_idx = if tid == track_id && idx > removed_idx {
+                                idx - 1
                             } else {
-                                slot
+                                idx
                             };
-                            new_slot.insert((tid, new_slot_kind), pid);
+                            new_slot.insert((tid, new_idx), pid);
                         }
                     }
                     new_refs.remove(&plugin_id);
                     self.shared.plugin_refs.store(Arc::new(new_refs));
                     self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
-                    tracing::info!(plugin_id, "plugin shmem dropped + slot shifted");
+                    tracing::info!(plugin_id, "plugin shmem dropped + index shifted");
                 }
                 AudioCommand::ReorderChain { track, moves } => {
                     // Re-key slot_to_plugin_id from old→new in one atomic
                     // publish. Remove every old key FIRST (snapshot the pids),
-                    // then re-insert at the new keys, so a swap (Fx(0)↔Fx(1))
-                    // can't clobber the second pid. `plugin_refs` is left
-                    // untouched: the plugins themselves don't move, only the
-                    // (track, slot) → plugin_id addressing does — so no plugin
-                    // is ever transiently missing from the graph.
-                    let mut new_slot: HashMap<(u32, PluginSlot), u32> =
+                    // then re-insert at the new keys, so a swap (0↔1) can't
+                    // clobber the second pid. `plugin_refs` is left untouched:
+                    // the plugins themselves don't move, only the
+                    // (track, device_index) → plugin_id addressing does — so no
+                    // plugin is ever transiently missing from the graph.
+                    let mut new_slot: HashMap<(u32, u32), u32> =
                         (**self.shared.slot_to_plugin_id.load()).clone();
                     // Pass 1: detach every moved plugin from its old key,
                     // keeping the pids index-aligned with `moves`.
@@ -1132,7 +1122,7 @@ pub fn process_track_owned(
     song_track: &Track,
     scratch: &mut TrackScratch,
     plugin_refs: &HashMap<u32, PluginRef>,
-    slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
+    slot_to_plugin_id: &HashMap<(u32, u32), u32>,
     audio_renderer: Option<&AudioClipRenderer>,
     worker_sync: Option<&WorkerSyncRef>,
     sample_rate: u32,
@@ -1218,151 +1208,25 @@ pub fn process_track_owned(
     }
 
     let track_id = song_track.id;
-    // ---- MIDI FX chain ----
-    for i in 0..song_track.midi_fx_chain.len() {
-        // PR2.1: chains map の key は (track_id, slot)。 song.tracks の
-        // Vec position に依存しないので、 group 化や drag&drop reorder
-        // で index が shift しても plugin lookup が壊れない。
-        let key = (track_id, PluginSlot::MidiFx(i as u32));
-        let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
-            continue;
-        };
-        let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
-            continue;
-        };
-        let Some(ws) = worker_sync else { continue };
-
-        let pd = plugin_ref.data_mut();
-        pd.prepare();
-        pd.frames = frames;
-        pd.playing = if playing { 1 } else { 0 };
-        pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
-        // Phase 2b: MIDI FX 宛 PluginParam automation を ParamValue event 化。
-        if let Some(song) = song {
-            crate::automation::fill_pd_param_events(
-                pd,
-                song,
-                track_id,
-                PluginSlot::MidiFx(i as u32),
-                sample_rate,
-                song.bpm,
-                playhead,
-                frames,
-                recording_lanes,
-            );
-        }
-        for ev in &scratch.midi_bus_a {
-            match ev.event {
-                NoteTransition::On { note_id, key, velocity } => {
-                    pd.push_note_on(ev.time, key, velocity, 0, note_id)
-                }
-                NoteTransition::Off { note_id, key } => {
-                    pd.push_note_off(ev.time, key, 0, note_id)
-                }
-            }
-        }
-        if let Err(_e) = ws.dispatch(plugin_id) {
-            // RT path: skip on dispatch failure without per-buffer I/O.
-            #[cfg(debug_assertions)]
-            tracing::error!(error = ?_e, plugin_id, "midi_fx dispatch failed");
-            continue;
-        }
-        // Drain plugin's output events into midi_bus_b.
-        scratch.midi_bus_b.clear();
-        let n_out = pd.n_events_out as usize;
-        for ev in &pd.events_out[..n_out.min(pd.events_out.len())] {
-            let timed = match ev.kind {
-                EventKind::NoteOn => TimedNoteEvent {
-                    time: ev.time,
-                    event: NoteTransition::On {
-                        note_id: ev.note_id,
-                        key: ev.key,
-                        velocity: ev.velocity,
-                    },
-                },
-                EventKind::NoteOff => TimedNoteEvent {
-                    time: ev.time,
-                    event: NoteTransition::Off {
-                        note_id: ev.note_id,
-                        key: ev.key,
-                    },
-                },
-                EventKind::ParamValue => continue,
-            };
-            scratch.midi_bus_b.push(timed);
-        }
-        scratch.midi_bus_b.sort_unstable_by_key(|e| e.time);
-        std::mem::swap(&mut scratch.midi_bus_a, &mut scratch.midi_bus_b);
-    }
 
     // ---- Track audio output (cleared every buffer) ----
+    // 毎 buffer ゼロから組み立てる。直後に audio clip を加算し、その後 device chain が
+    // port 構成に従って audio を上書き / 加算していく。
     scratch.track_l[..n].fill(0.0);
     scratch.track_r[..n].fill(0.0);
 
-    // PR-V4: 旧 VOICEVOX 専用 vocal block を削除。 vocal track は
-    // `track.instrument` に builtin VOICEVOX plugin が居るので、 通常の
-    // Instrument 段階 (= 下記) で処理される。 daw_gui の migration
-    // (`migrate_legacy_vocal_tracks`) が project load 時に旧 vocal
-    // tracks を builtin path に移行する。
+    // PR-V4: 旧 VOICEVOX 専用 vocal block を削除。 vocal track は単一チェーン
+    // 中の builtin VOICEVOX plugin (audio_out を持つ音源) として処理される。
+    // daw_gui の migration が project load 時に旧 vocal tracks を builtin path
+    // に移行する。
 
-    // ---- Instrument ----
-    if song_track.instrument.is_some() {
-        let key = (track_id, PluginSlot::Instrument);
-        if let Some(&plugin_id) = slot_to_plugin_id.get(&key)
-            && let Some(plugin_ref) = plugin_refs.get(&plugin_id)
-            && let Some(ws) = worker_sync
-        {
-            let pd = plugin_ref.data_mut();
-            pd.prepare();
-            pd.frames = frames;
-            pd.playing = if playing { 1 } else { 0 };
-            pd.sample_rate = sample_rate;
-            // Phase 2b: automation lane の PluginParam target で
-            // Instrument 宛のものを ParamValue event として push。
-            if let Some(song) = song {
-                crate::automation::fill_pd_param_events(
-                    pd,
-                    song,
-                    track_id,
-                    PluginSlot::Instrument,
-                    sample_rate,
-                    song.bpm,
-                    playhead,
-                    frames,
-                    recording_lanes,
-                );
-            }
-            for ev in &scratch.midi_bus_a {
-                match ev.event {
-                    NoteTransition::On { note_id, key, velocity } => {
-                        pd.push_note_on(ev.time, key, velocity, 0, note_id)
-                    }
-                    NoteTransition::Off { note_id, key } => {
-                        pd.push_note_off(ev.time, key, 0, note_id)
-                    }
-                }
-            }
-            if let Err(_e) = ws.dispatch(plugin_id) {
-                // RT path: skip on dispatch failure without per-buffer I/O.
-                #[cfg(debug_assertions)]
-                tracing::error!(error = ?_e, plugin_id, "instrument dispatch failed");
-            } else {
-                scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
-                scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
-            }
-        }
-    }
-
-    // ---- Phase 1 PR6: audio clip events ----
-    // Bitwig Hybrid Track 流: audio clip 出力は instrument 出力に
-    // **加算** されてから fx chain を通る (`docs/plan_audio_clip.md`
-    // §13 Q6 / §6.1)。 1 track 内で MIDI clip と Audio clip が混在
-    // しても、 audio events は instrument を bypass して effect chain
-    // の入口でそのまま合流する。
-    //
-    // playing == false (Stop / 一時停止) では audio clip を mix しない
-    // (= 旧バグ: Stop でも render し続けてブーンと鳴り続けた)。
+    // ---- v23 single-chain: serial port connection (Reaper 流) -----------
+    // 役割判定はしない。track の MIDI (notes, midi_bus_a) と audio (clips) を
+    // 起点に、各 device を順に処理し、device の port 構成に従って MIDI / audio を
+    // 接続する。先に audio source (audio clip + sidechain alignment delay) を
+    // track_l/r に入れてからチェーンを通す (clips → エフェクトで処理 / 音源出力に
+    // 加算される)。playing == false では audio clip を mix しない (Stop で鳴り
+    // 続けるバグ防止)。
     if playing && let Some(renderer) = audio_renderer {
         crate::audio_clip_renderer::render_audio_events(
             renderer,
@@ -1376,25 +1240,22 @@ pub fn process_track_owned(
             granular_tempo_smoothed,
         );
     }
-
-    // ---- PR4.5 sidechain plugin-internal alignment ------------------
-    // Delay the track's main signal so it lines up musically with any
-    // sidechain `aux_in` the fx_chain plugins read from `pd.buffer_aux_in`.
-    // Without this delay, a compressor's main_in arrives at musical time t
-    // but its aux_in (= source.scratch tapped via SidechainTap) is at
-    // musical time t - source.path_latency, so the compressor's gain
-    // reduction lags the trigger by source.path_latency. The DelayLine's
-    // capacity was sized in `Engine::refresh_schedule` (only ever grows on
-    // edit-time, never in the RT path).
+    // PR4.5 sidechain plugin-internal alignment: main 信号を遅延させて sidechain
+    // source と musical time を揃える。capacity は edit-time 確保済 (RT で再確保なし)。
     if input_delay_samples > 0 {
-        scratch
-            .input_delay_line
-            .step_in_place(&mut scratch.track_l[..n], &mut scratch.track_r[..n], input_delay_samples as usize);
+        scratch.input_delay_line.step_in_place(
+            &mut scratch.track_l[..n],
+            &mut scratch.track_r[..n],
+            input_delay_samples as usize,
+        );
     }
 
-    // ---- Audio FX chain ----
-    for i in 0..song_track.fx_chain.len() {
-        let key = (track_id, PluginSlot::Fx(i as u32));
+    for i in 0..song_track.devices.len() {
+        // chain map の key は (track_id, device_index)。 song.tracks の Vec
+        // position に依存しないので、 group 化や drag&drop reorder で track
+        // index が shift しても plugin lookup が壊れない。
+        let key = (track_id, i as u32);
+        let ports = song_track.devices[i].ports;
         let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
             continue;
         };
@@ -1409,13 +1270,12 @@ pub fn process_track_owned(
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
         set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
-        // Phase 2b: automation の PluginParam target を ParamValue event 化。
         if let Some(song) = song {
             crate::automation::fill_pd_param_events(
                 pd,
                 song,
                 track_id,
-                PluginSlot::Fx(i as u32),
+                i as u32,
                 sample_rate,
                 song.bpm,
                 playhead,
@@ -1423,16 +1283,71 @@ pub fn process_track_owned(
                 recording_lanes,
             );
         }
-        pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
-        pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
+        // ---- inputs: device の port を持つものだけ現在のバスを渡す ----
+        if ports.has_note_input {
+            for ev in &scratch.midi_bus_a {
+                match ev.event {
+                    NoteTransition::On { note_id, key, velocity } => {
+                        pd.push_note_on(ev.time, key, velocity, 0, note_id)
+                    }
+                    NoteTransition::Off { note_id, key } => {
+                        pd.push_note_off(ev.time, key, 0, note_id)
+                    }
+                }
+            }
+        }
+        if ports.has_audio_input {
+            pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
+            pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
+        }
         if let Err(_e) = ws.dispatch(plugin_id) {
             // RT path: skip on dispatch failure without per-buffer I/O.
             #[cfg(debug_assertions)]
-            tracing::error!(error = ?_e, plugin_id, "fx dispatch failed");
+            tracing::error!(error = ?_e, plugin_id, "device dispatch failed");
             continue;
         }
-        scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
-        scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
+        // ---- outputs ----
+        // note 出力を持つなら出力 MIDI で次段のバスを置き換える (無ければ素通し)。
+        if ports.has_note_output {
+            scratch.midi_bus_b.clear();
+            let n_out = pd.n_events_out as usize;
+            for ev in &pd.events_out[..n_out.min(pd.events_out.len())] {
+                let timed = match ev.kind {
+                    EventKind::NoteOn => TimedNoteEvent {
+                        time: ev.time,
+                        event: NoteTransition::On {
+                            note_id: ev.note_id,
+                            key: ev.key,
+                            velocity: ev.velocity,
+                        },
+                    },
+                    EventKind::NoteOff => TimedNoteEvent {
+                        time: ev.time,
+                        event: NoteTransition::Off {
+                            note_id: ev.note_id,
+                            key: ev.key,
+                        },
+                    },
+                    EventKind::ParamValue => continue,
+                };
+                scratch.midi_bus_b.push(timed);
+            }
+            scratch.midi_bus_b.sort_unstable_by_key(|e| e.time);
+            std::mem::swap(&mut scratch.midi_bus_a, &mut scratch.midi_bus_b);
+        }
+        // audio 出力を持つなら: audio 入力も持つ機 (= エフェクト) は処理結果で
+        // 置き換え、入力を持たない機 (= 音源/生成器) はソースとして加算する。
+        if ports.has_audio_output {
+            if ports.has_audio_input {
+                scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
+                scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
+            } else {
+                for j in 0..n {
+                    scratch.track_l[j] += pd.buffer_out[0][j];
+                    scratch.track_r[j] += pd.buffer_out[1][j];
+                }
+            }
+        }
     }
 
     // ---- Pre-fader send tap ----
@@ -1544,8 +1459,8 @@ pub fn reduce_master(
 /// master bus の audio fx chain を直列 process する。 全 track が
 /// `master_l/r` に mix され終わった後・metronome を重ねる前に呼ばれる。
 /// track fx (`process_track_owned` の Audio FX chain 部) と同じ buffer io
-/// idiom: plugin は `(MASTER_TRACK_ID, PluginSlot::Fx(i))` keying で worker
-/// pool 経由 dispatch し、 in-place で `master_l/r` を上書きする。
+/// idiom: plugin は `(MASTER_TRACK_ID, device_index)` keying で worker pool
+/// 経由 dispatch し、 in-place で `master_l/r` を上書きする。
 ///
 /// master fx param automation は現状 song に target lane が無いので
 /// `fill_pd_param_events` は呼ばない (= 呼んでも no-op、 将来機能)。
@@ -1557,7 +1472,7 @@ pub fn process_master_fx_chain(
     master_l: &mut [f32],
     master_r: &mut [f32],
     plugin_refs: &HashMap<u32, PluginRef>,
-    slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
+    slot_to_plugin_id: &HashMap<(u32, u32), u32>,
     worker_sync: Option<&WorkerSyncRef>,
     sample_rate: u32,
     frames: u32,
@@ -1570,7 +1485,9 @@ pub fn process_master_fx_chain(
     let n = frames as usize;
     let Some(ws) = worker_sync else { return };
     for i in 0..master_fx_chain.len() {
-        let key = (common::model::MASTER_TRACK_ID, PluginSlot::Fx(i as u32));
+        // master は音源境界のない単一 audio FX Vec なので、 device_index は
+        // そのまま Vec position。
+        let key = (common::model::MASTER_TRACK_ID, i as u32);
         let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
             continue;
         };
@@ -1610,7 +1527,7 @@ pub fn execute_schedule_post_dispatch(
     n: usize,
     song: &Song,
     plugin_refs: &HashMap<u32, PluginRef>,
-    slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
+    slot_to_plugin_id: &HashMap<(u32, u32), u32>,
     worker_sync: Option<&WorkerSyncRef>,
     sample_rate: u32,
     frames: u32,
@@ -1715,7 +1632,7 @@ pub fn execute_schedule_post_dispatch(
             NodeOp::SidechainTap {
                 src,
                 dst_track,
-                dst_slot,
+                dst_index,
                 aux_in_port,
             } => {
                 // PR4 sidechain: copy source track's scratch L/R into the
@@ -1736,9 +1653,9 @@ pub fn execute_schedule_post_dispatch(
                 if port >= common::process_data::MAX_AUX_IN {
                     continue;
                 }
-                // Resolve the runtime plugin_id for (dst_track, dst_slot).
-                // PR2.1: the chains map is keyed by (track_id, slot).
-                let key = (*dst_track, *dst_slot);
+                // Resolve the runtime plugin_id for (dst_track, dst_index).
+                // v23: the chain map is keyed by (track_id, device_index).
+                let key = (*dst_track, *dst_index);
                 let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
                     continue;
                 };
@@ -2046,7 +1963,7 @@ fn run_group_fx_chain(
     song: &Song,
     scratch: &mut TrackScratch,
     plugin_refs: &HashMap<u32, PluginRef>,
-    slot_to_plugin_id: &HashMap<(u32, PluginSlot), u32>,
+    slot_to_plugin_id: &HashMap<(u32, u32), u32>,
     worker_sync: Option<&WorkerSyncRef>,
     sample_rate: u32,
     playhead: u64,
@@ -2062,10 +1979,22 @@ fn run_group_fx_chain(
     let n = frames as usize;
     let track_id = song_track.id;
 
-    for i in 0..song_track.fx_chain.len() {
-        // PR2.1: id ベースの key で lookup (plugin chain は track_id
-        // で識別、 song.tracks の Vec position に依存しない)。
-        let key = (track_id, PluginSlot::Fx(i as u32));
+    // v23 single-chain: a group / return bus has a summed audio input (no
+    // sequencer notes), so the chain runs entirely in the audio domain. Walk
+    // `devices` once and connect audio ports serially (Reaper 流) — feed the
+    // bus signal into any device that takes audio in, dispatch, then write the
+    // audio out back (replace when the device has an audio input = effect, add
+    // when it has none = pure source). MIDI ports are irrelevant on a bus.
+    for i in 0..song_track.devices.len() {
+        let ports = song_track.devices[i].ports;
+        if !ports.has_audio_output {
+            // No audio output (e.g. a pure MIDI effect) — nothing to contribute
+            // to a bus signal; skip.
+            continue;
+        }
+        // id ベースの key で lookup (chain は track_id + device_index で識別、
+        // song.tracks の Vec position に依存しない)。
+        let key = (track_id, i as u32);
         let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
             continue;
         };
@@ -2085,23 +2014,34 @@ fn run_group_fx_chain(
             pd,
             song,
             track_id,
-            PluginSlot::Fx(i as u32),
+            i as u32,
             sample_rate,
             song.bpm,
             playhead,
             frames,
             recording_lanes,
         );
-        pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
-        pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
+        if ports.has_audio_input {
+            pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
+            pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
+        }
         if let Err(_e) = ws.dispatch(plugin_id) {
             // RT path: skip on dispatch failure without per-buffer I/O.
             #[cfg(debug_assertions)]
             tracing::error!(error = ?_e, plugin_id, "group fx dispatch failed");
             continue;
         }
-        scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
-        scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
+        if ports.has_audio_input {
+            // effect: 入力を処理した結果で bus を置換。
+            scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
+            scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
+        } else {
+            // source: 入力を取らず生成する機 → bus に加算。
+            for j in 0..n {
+                scratch.track_l[j] += pd.buffer_out[0][j];
+                scratch.track_r[j] += pd.buffer_out[1][j];
+            }
+        }
     }
 
     // ---- Pre-fader send tap (bus / return source) ----
@@ -2267,6 +2207,16 @@ mod sidechain_tests {
     use common::model::{PluginInstance, Song, Track};
     use common::plugin_format::PluginFormat;
 
+    /// v23 single-chain: `Track::default()` を mutator で埋める helper。 downstream
+    /// crate (daw_audio) の test で `Track { .., ..Track::default() }` を書くと、
+    /// `common` 内の `pub(crate)` legacy migration fields が見えず E0451 になる
+    /// ため、 private field に触れない default + mutate で回避する。
+    fn track(f: impl FnOnce(&mut Track)) -> Track {
+        let mut t = Track::default();
+        f(&mut t);
+        t
+    }
+
     #[test]
     fn set_pd_transport_uses_real_beats_and_loop_toggle() {
         // SSoT 回帰防止: pd.song_pos_beats は daw_audio が渡す積分済み拍位置を
@@ -2303,18 +2253,29 @@ mod sidechain_tests {
     fn sidechain_tap_copies_source_track_into_plugin_aux_in_buffer() {
         let song = Song {
             tracks: vec![
-                Track { id: 1, name: "Source".into(), ..Track::default() },
-                Track {
-                    id: 2,
-                    name: "Dest".into(),
-                    fx_chain: vec![PluginInstance {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Source".into();
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Dest".into();
+                    // v23 single-chain: an audio-FX device (audio_output only,
+                    // no note input) → derives as AudioEffect at device 0.
+                    t.devices = vec![PluginInstance {
                         plugin_id: "test.scc".into(),
                         format: PluginFormat::Vst3,
                         state: None,
                         sidechain_sources: vec![Some(1)],
-                    }],
-                    ..Track::default()
-                },
+                        ports: common::port_config::PortConfig {
+                            has_note_input: false,
+                            has_note_output: false,
+                            has_audio_output: true,
+                            // audio-FX device: audio を加工する → audio 入力あり。
+                            has_audio_input: true,
+                        },
+                    }];
+                }),
             ],
             ..Song::default()
         };
@@ -2338,9 +2299,8 @@ mod sidechain_tests {
         let mut plugin_refs: HashMap<u32, common::plugin_ref::PluginRef> = HashMap::new();
         plugin_refs.insert(plugin_id, plugin_ref);
 
-        let mut slot_to_plugin_id: HashMap<(u32, common::protocol::PluginSlot), u32> =
-            HashMap::new();
-        slot_to_plugin_id.insert((2, common::protocol::PluginSlot::Fx(0)), plugin_id);
+        let mut slot_to_plugin_id: HashMap<(u32, u32), u32> = HashMap::new();
+        slot_to_plugin_id.insert((2, 0), plugin_id);
 
         execute_schedule_post_dispatch(
             &mut schedule,
@@ -2378,27 +2338,33 @@ mod send_tests {
     use super::*;
     use common::model::{Send, SendMode, Song, Track};
 
+    /// v23 single-chain: `Track::default()` を mutator で埋める helper
+    /// (`sidechain_tests::track` と同趣旨、 E0451 回避)。
+    fn track(f: impl FnOnce(&mut Track)) -> Track {
+        let mut t = Track::default();
+        f(&mut t);
+        t
+    }
+
     const FRAMES: usize = 64;
 
     fn song_with_send(gain: f32, mode: SendMode, enabled: bool) -> Song {
         Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Vocal".into(),
-                    sends: vec![Send {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Vocal".into();
+                    t.sends = vec![Send {
                         dest_track_id: 2,
                         gain,
                         mode,
                         enabled,
-                    }],
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Reverb".into(),
-                    ..Track::default()
-                },
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Reverb".into();
+                }),
             ],
             ..Song::default()
         }
@@ -2566,13 +2532,18 @@ mod send_tests {
     /// condition added to the effective-mute formula.
     #[test]
     fn soloed_group_keeps_children_audible() {
-        use common::model::Track;
         // id 10 = group, id 11 = child of 10, id 12 = unrelated.
         let song = Song {
             tracks: vec![
-                Track { id: 10, solo: true, ..Track::default() }, // solo the group
-                Track { id: 11, parent_group_id: Some(10), ..Track::default() },
-                Track { id: 12, ..Track::default() },
+                track(|t| {
+                    t.id = 10;
+                    t.solo = true;
+                }), // solo the group
+                track(|t| {
+                    t.id = 11;
+                    t.parent_group_id = Some(10);
+                }),
+                track(|t| t.id = 12),
             ],
             ..Default::default()
         };

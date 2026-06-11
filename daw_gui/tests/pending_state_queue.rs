@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use common::plugin_db::{PluginDatabase, PluginEntry};
 use common::plugin_format::PluginFormat;
-use common::protocol::{MainToChild, PluginSlot};
+use common::protocol::MainToChild;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent, PendingStateRequest};
@@ -37,6 +37,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_note_input: true,
                 has_note_output: false,
                 has_audio_output: true,
+                // instrument: audio を生成するだけ → audio 入力なし。
+                has_audio_input: false,
             },
             PluginEntry {
                 id: "test.bitcrush".into(),
@@ -50,6 +52,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_note_input: false,
                 has_note_output: false,
                 has_audio_output: true,
+                // audio-effect: audio を加工する → audio 入力あり。
+                has_audio_input: true,
             },
             PluginEntry {
                 id: "test.delay".into(),
@@ -63,6 +67,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_note_input: false,
                 has_note_output: false,
                 has_audio_output: true,
+                // audio-effect: audio を加工する → audio 入力あり。
+                has_audio_input: true,
             },
         ],
         scanned_at: None,
@@ -112,13 +118,13 @@ fn has_pending_save(app: &AppData) -> bool {
 fn fake_plugin_loaded(
     app: &mut AppData,
     track_id: u32,
-    slot: PluginSlot,
+    index: u32,
     id: &str,
     plugin_id: u32,
 ) {
     app.handle_event(AppEvent::SlotPluginLoadedFromChild {
         track: track_id,
-        slot,
+        index,
         id: id.into(),
         name: id.into(),
         plugin_id,
@@ -131,9 +137,9 @@ fn fake_plugin_loaded(
 fn consecutive_remove_slot_serializes_through_state_queue() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
 
-    // 1 つの track に instrument (Synth) + Fx 2 つ (Bitcrush, Delay) を
-    // 用意。 song_has_plugin() == true なので 各 RemoveSlot が deferred
-    // path を通る。
+    // 単一デバイスチェーン: 1 つの track に device 3 つ (synth=0, bitcrush=1,
+    // delay=2) を順に append。 song_has_plugin() == true なので 各 RemoveDevice が
+    // deferred path を通る。
     let track_id = app.song.tracks[0].id;
     app.handle_event(AppEvent::SelectTrack(0));
 
@@ -143,7 +149,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         keep_open: false,
         open_gui: true,
     });
-    fake_plugin_loaded(&mut app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    fake_plugin_loaded(&mut app, track_id, 0, "test.synth", 100);
 
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -151,7 +157,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         keep_open: false,
         open_gui: true,
     });
-    fake_plugin_loaded(&mut app, track_id, PluginSlot::Fx(0), "test.bitcrush", 200);
+    fake_plugin_loaded(&mut app, track_id, 1, "test.bitcrush", 200);
 
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -159,7 +165,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         keep_open: false,
         open_gui: true,
     });
-    fake_plugin_loaded(&mut app, track_id, PluginSlot::Fx(1), "test.delay", 201);
+    fake_plugin_loaded(&mut app, track_id, 2, "test.delay", 201);
 
     // pending_state_queue は初期で空。
     assert!(app.pending_state_queue.is_empty(), "queue starts empty");
@@ -167,16 +173,13 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     // セットアップ中の plugin_rx を捨てる。
     let _ = drain(&mut plugin_rx);
 
-    // 1 回目の RemoveSlot Fx(0) → queue.len == 1、 RequestAllStates が
-    // 1 発送られる。
-    app.handle_event(AppEvent::RemoveSlot {
-        slot_kind: 2,
-        slot_index: 0,
-    });
+    // 1 回目の RemoveDevice (bitcrush = index 1) → queue.len == 1、
+    // RequestAllStates が 1 発送られる。
+    app.handle_event(AppEvent::RemoveDevice { index: 1 });
     assert_eq!(
         app.pending_state_queue.len(),
         1,
-        "1st RemoveSlot enqueues 1 entry"
+        "1st RemoveDevice enqueues 1 entry"
     );
     let msgs = drain(&mut plugin_rx);
     assert_eq!(
@@ -184,7 +187,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
             .filter(|m| matches!(m, MainToChild::RequestAllStates))
             .count(),
         1,
-        "1st RemoveSlot triggers 1 RequestAllStates: {msgs:?}"
+        "1st RemoveDevice triggers 1 RequestAllStates: {msgs:?}"
     );
     assert!(
         !msgs
@@ -193,16 +196,13 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         "no RemoveSlotPlugin yet (still pending): {msgs:?}"
     );
 
-    // 2 回目の RemoveSlot Fx(1) — in-flight 中なので queue にだけ積まれて
-    // RequestAllStates は再発行されない。
-    app.handle_event(AppEvent::RemoveSlot {
-        slot_kind: 2,
-        slot_index: 1,
-    });
+    // 2 回目の RemoveDevice (delay = index 2) — in-flight 中なので queue にだけ
+    // 積まれて RequestAllStates は再発行されない。
+    app.handle_event(AppEvent::RemoveDevice { index: 2 });
     assert_eq!(
         app.pending_state_queue.len(),
         2,
-        "2nd RemoveSlot enqueues without sending another RequestAllStates"
+        "2nd RemoveDevice enqueues without sending another RequestAllStates"
     );
     let msgs = drain(&mut plugin_rx);
     assert!(
@@ -218,7 +218,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         "no RemoveSlotPlugin yet: {msgs:?}"
     );
 
-    // 1 回目の AllStatesReceived → 1 件目 (Fx(0)) が実行され、 queue 残り 1、
+    // 1 回目の AllStatesReceived → 1 件目 (index 1) が実行され、 queue 残り 1、
     // 次の RequestAllStates が再発行される。
     app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
     assert_eq!(
@@ -227,10 +227,10 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         "1st AllStatesReceived consumes 1 entry"
     );
     let msgs = drain(&mut plugin_rx);
-    let removed_fx0 = msgs
+    let removed_dev1 = msgs
         .iter()
-        .any(|m| matches!(m, MainToChild::RemoveSlotPlugin { track, slot: PluginSlot::Fx(0) } if *track == track_id));
-    assert!(removed_fx0, "RemoveSlotPlugin Fx(0) sent: {msgs:?}");
+        .any(|m| matches!(m, MainToChild::RemoveSlotPlugin { track, index: 1 } if *track == track_id));
+    assert!(removed_dev1, "RemoveSlotPlugin index 1 sent: {msgs:?}");
     let req_count = msgs
         .iter()
         .filter(|m| matches!(m, MainToChild::RequestAllStates))
@@ -240,7 +240,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         "after 1st response, exactly 1 follow-up RequestAllStates: {msgs:?}"
     );
 
-    // 2 回目の AllStatesReceived → 2 件目 (Fx(1)) が実行され、 queue 空、
+    // 2 回目の AllStatesReceived → 2 件目 (index 2) が実行され、 queue 空、
     // RequestAllStates は再発行されない (= no follow-up)。
     app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
     assert!(
@@ -248,10 +248,10 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
         "queue drained after both responses"
     );
     let msgs = drain(&mut plugin_rx);
-    let removed_fx1 = msgs
+    let removed_dev2 = msgs
         .iter()
-        .any(|m| matches!(m, MainToChild::RemoveSlotPlugin { track, slot: PluginSlot::Fx(1) } if *track == track_id));
-    assert!(removed_fx1, "RemoveSlotPlugin Fx(1) sent: {msgs:?}");
+        .any(|m| matches!(m, MainToChild::RemoveSlotPlugin { track, index: 2 } if *track == track_id));
+    assert!(removed_dev2, "RemoveSlotPlugin index 2 sent: {msgs:?}");
     let req_count = msgs
         .iter()
         .filter(|m| matches!(m, MainToChild::RequestAllStates))
@@ -272,7 +272,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     );
 }
 
-/// 1 つの track に instrument + Fx 2 つ (Bitcrush=Fx0, Delay=Fx1) を載せる。
+/// 1 つの track に device 3 つ (synth=0, bitcrush=1, delay=2) を載せる。
 fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
     let track_id = app.song.tracks[0].id;
     app.handle_event(AppEvent::SelectTrack(0));
@@ -283,7 +283,7 @@ fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
         keep_open: false,
         open_gui: true,
     });
-    fake_plugin_loaded(app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    fake_plugin_loaded(app, track_id, 0, "test.synth", 100);
 
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -291,7 +291,7 @@ fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
         keep_open: false,
         open_gui: true,
     });
-    fake_plugin_loaded(app, track_id, PluginSlot::Fx(0), "test.bitcrush", 200);
+    fake_plugin_loaded(app, track_id, 1, "test.bitcrush", 200);
 
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -299,7 +299,7 @@ fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
         keep_open: false,
         open_gui: true,
     });
-    fake_plugin_loaded(app, track_id, PluginSlot::Fx(1), "test.delay", 201);
+    fake_plugin_loaded(app, track_id, 2, "test.delay", 201);
     track_id
 }
 
@@ -323,13 +323,10 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
     assert!(app.pending_state_queue.is_empty(), "queue starts empty");
     let _ = drain(&mut plugin_rx);
 
-    // RemoveSlot Fx(0) → Deferred enqueue、 RequestAllStates(R1) 送信。 live は
-    // まだ [Bitcrush, Delay] (削除は deferred)。
-    app.handle_event(AppEvent::RemoveSlot {
-        slot_kind: 2,
-        slot_index: 0,
-    });
-    assert_eq!(app.pending_state_queue.len(), 1, "RemoveSlot enqueues Deferred");
+    // RemoveDevice (bitcrush = index 1) → Deferred enqueue、 RequestAllStates(R1)
+    // 送信。 live はまだ [synth, bitcrush, delay] (削除は deferred)。
+    app.handle_event(AppEvent::RemoveDevice { index: 1 });
+    assert_eq!(app.pending_state_queue.len(), 1, "RemoveDevice enqueues Deferred");
     let _ = drain(&mut plugin_rx);
 
     // Deferred in-flight 中に Save。 queue 後方に積まれ、 snapshot はまだ None
@@ -358,9 +355,9 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
         "no extra RequestAllStates while Deferred in-flight: {msgs:?}"
     );
 
-    // R1 応答 → Deferred(RemoveSlot Fx(0)) 実行 (live fx → [Delay])、 queue 残り
-    // [Save]、 dispatch_front_state_request が Save の snapshot を **今の** live
-    // (= 削除後 layout) で充填し、 R2 を送る。
+    // R1 応答 → Deferred(RemoveDevice index 1) 実行 (live devices → [synth, delay])、
+    // queue 残り [Save]、 dispatch_front_state_request が Save の snapshot を **今の**
+    // live (= 削除後 layout) で充填し、 R2 を送る。
     app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
     assert_eq!(
         app.pending_state_queue.len(),
@@ -368,14 +365,16 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
         "Deferred consumed, Save remains"
     );
 
-    // live は削除を反映している。
+    // live は削除を反映している (= [synth, delay]、 bitcrush が抜けて delay が
+    // index 1 へ shift)。
     let live_track = app.song.tracks.iter().find(|t| t.id == track_id).unwrap();
-    assert_eq!(live_track.fx_chain.len(), 1, "live: Bitcrush removed");
-    assert_eq!(live_track.fx_chain[0].plugin_id, "test.delay");
+    assert_eq!(live_track.devices.len(), 2, "live: bitcrush removed");
+    assert_eq!(live_track.devices[0].plugin_id, "test.synth");
+    assert_eq!(live_track.devices[1].plugin_id, "test.delay");
 
-    // 肝心の検証: Save の snapshot が **削除後** layout (fx 1 個 = Delay) で
-    // 凍結されている。 旧 snapshot-at-invoke なら 2 個 ([Bitcrush, Delay]) のまま
-    // で、 R2 の Fx(0)=Delay state が Bitcrush へ誤適用された。
+    // 肝心の検証: Save の snapshot が **削除後** layout (devices = [synth, delay])
+    // で凍結されている。 旧 snapshot-at-invoke なら 3 個のままで、 R2 の device
+    // state が誤適用された。
     match app.pending_state_queue.front() {
         Some(PendingStateRequest::Save { snapshot, .. }) => {
             let snap = snapshot
@@ -383,11 +382,11 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
                 .expect("snapshot is frozen once the Save reaches the front of the queue");
             let st = snap.tracks.iter().find(|t| t.id == track_id).unwrap();
             assert_eq!(
-                st.fx_chain.len(),
-                1,
+                st.devices.len(),
+                2,
                 "snapshot must reflect the post-removal layout (co-temporal with its states)"
             );
-            assert_eq!(st.fx_chain[0].plugin_id, "test.delay");
+            assert_eq!(st.devices[1].plugin_id, "test.delay");
         }
         other => panic!("front of queue should be Save, got {other:?}"),
     }
@@ -406,7 +405,7 @@ fn save_and_quit_clean_sets_should_quit() {
         keep_open: false,
         open_gui: true,
     });
-    fake_plugin_loaded(&mut app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    fake_plugin_loaded(&mut app, track_id, 0, "test.synth", 100);
     let _ = drain(&mut plugin_rx);
 
     // 非同期保存を enqueue し、 「保存して終了」 の意図を立てる
@@ -438,7 +437,7 @@ fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
         keep_open: false,
         open_gui: true,
     });
-    fake_plugin_loaded(&mut app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    fake_plugin_loaded(&mut app, track_id, 0, "test.synth", 100);
     let _ = drain(&mut plugin_rx);
 
     app.file_path = Some(std::env::temp_dir().join("daw01_test_quit_window_edit.daw"));
@@ -480,7 +479,7 @@ fn save_with_idle_queue_freezes_snapshot_at_invoke() {
         keep_open: false,
         open_gui: true,
     });
-    fake_plugin_loaded(&mut app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    fake_plugin_loaded(&mut app, track_id, 0, "test.synth", 100);
     assert!(app.pending_state_queue.is_empty(), "queue starts empty");
     let _ = drain(&mut plugin_rx);
 

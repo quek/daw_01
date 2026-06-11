@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use common::plugin_db::{PluginDatabase, PluginEntry};
 use common::plugin_format::PluginFormat;
-use common::protocol::{MainToChild, PluginSlot};
+use common::protocol::MainToChild;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent};
@@ -34,6 +34,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
             has_note_input: true,
             has_note_output: false,
             has_audio_output: true,
+            // instrument: audio を生成するだけ → audio 入力なし。
+            has_audio_input: false,
         }],
         scanned_at: None,
         port_probe_version: 0,
@@ -71,7 +73,8 @@ fn load_instrument(app: &mut AppData) {
     });
     app.handle_event(AppEvent::SlotPluginLoadedFromChild {
         track: track_id,
-        slot: PluginSlot::Instrument,
+        // 単一デバイスチェーン: picker は末尾 append、 空チェーンなので index 0。
+        index: 0,
         id: "test.synth".into(),
         name: "Test Synth".into(),
         plugin_id: 100,

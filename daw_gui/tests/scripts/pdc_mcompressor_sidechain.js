@@ -43,12 +43,13 @@ const song = {
       solo: false,
       reported_latency_samples: 0,
       clips: [{ id: 1, name: "bass", start_beat: 0.0, length_beats: 8.0 }],
-      fx_chain: [
+      devices: [
         {
           plugin_id: "MCompressor",
           format: "Vst3",
           state: null,
           sidechain_sources: wired ? [1] : [],
+          ports: { has_note_input: false, has_note_output: false, has_audio_output: true },
         },
       ],
     },
@@ -59,13 +60,12 @@ daw.loadSongFromObject(song);
 
 daw.setSlotPlugin(
   2,
-  2,
   0,
   "vst3",
   "C:/Program Files/Common Files/VST3/MeldaProduction/Dynamics/MCompressor.vst3",
   "",
 );
-daw.waitForPluginLoaded(2, 2, 0, 30000);
+daw.waitForPluginLoaded(2, 0, 30000);
 
 // Track 1: 短い loud burst (1.0 を 100 sample 続けて MCompressor の
 // envelope を確実に超えさせる)。

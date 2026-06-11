@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn none_transform_is_inactive() {
-        let mut track = Track { id: 7, ..Default::default() };
+        let mut track = crate::app::track_with(|t| t.id = 7);
         let song = Song::default();
         assert!(group_active_transform(&track, &song, 0.0).is_none());
         track.group_transform = Some(ident());
@@ -467,18 +467,16 @@ mod tests {
         use common::model::{Clip, ClipContent, ImageContent, ImageEvent, ImageSource, ImageSourcePath};
         let mut song = Song::default();
         let group_id = song.alloc_track_id();
-        song.tracks.push(Track {
-            id: group_id,
-            name: "G".into(),
-            ..Track::default()
-        });
+        song.tracks.push(crate::app::track_with(|t| {
+            t.id = group_id;
+            t.name = "G".into();
+        }));
         let child_id = song.alloc_track_id();
-        let mut child = Track {
-            id: child_id,
-            name: "child".into(),
-            parent_group_id: Some(group_id),
-            ..Track::default()
-        };
+        let mut child = crate::app::track_with(|t| {
+            t.id = child_id;
+            t.name = "child".into();
+            t.parent_group_id = Some(group_id);
+        });
         if visual {
             let img_id = song.alloc_image_source_id();
             song.image_sources.insert(

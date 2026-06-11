@@ -1,27 +1,26 @@
 //! Integration test: 楽器立て → 再生 → group 化 → group へ Bitcrush+Delay
 //! 追加 → Bitcrush 削除 → ungroup の一連シーケンスを通しで検証する。
 //!
+//! 単一デバイスチェーン (`docs/plan_linear_chain.md`): 役割別 3 chain を捨て、
+//! `Track.devices` を flat な `index: u32` 空間で扱う。plugin を picker で選ぶと
+//! 末尾に append され、reorder は棄却なしの純 permutation。
+//!
 //! 検証する不変量:
 //! 1. group 化で楽器 track が group の子になり、 group は楽器 track の
 //!    直前 (= 上) に挿入される (Live 互換)
-//! 2. group のチェーンに Bitcrush+Delay を順に積めて、 `track_plugin_ids`
-//!    に plugin_id が反映される
+//! 2. group のチェーンに Bitcrush+Delay を順に append できて、
+//!    `track_plugin_ids` に plugin_id が反映される
 //! 3. Bitcrush 削除で、 残った Delay の plugin_id だけが
 //!    `track_plugin_ids[group_id]` に残る
-//! 4. ungroup で
-//!    - audio 側に `ClosePluginShmem(<group の Delay の plugin_id>)` が
-//!      送信される (use-after-free 防止: plugin destroy より先に audio
-//!      engine の `plugin_refs` から外す)
-//!    - plugin_host 側に `RemoveTrack(<group_id>)` が送信される
-//!    - 楽器 track は `parent_group_id == None` で残る (= 音継続)
-//!    - `track_plugin_ids[<楽器 track id>]` に楽器 plugin_id が残ったまま
+//! 4. ungroup で audio 側に `ClosePluginShmem` / plugin_host 側に
+//!    `RemoveTrack` が送られ、 楽器 track は `parent_group_id == None` で残る
 
 use std::sync::Arc;
 
-use common::model::{AutomationLane, AutomationTarget, InstrumentSource, PluginInstance};
+use common::model::{AutomationLane, AutomationTarget, InstrumentSource};
 use common::plugin_db::{PluginDatabase, PluginEntry};
 use common::plugin_format::PluginFormat;
-use common::protocol::{MainToChild, PluginSlot};
+use common::protocol::MainToChild;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent};
@@ -46,6 +45,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_note_input: true,
                 has_note_output: false,
                 has_audio_output: true,
+                // instrument: audio を生成するだけ → audio 入力なし。
+                has_audio_input: false,
             },
             PluginEntry {
                 id: "test.bitcrush".into(),
@@ -59,6 +60,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_note_input: false,
                 has_note_output: false,
                 has_audio_output: true,
+                // audio-effect: audio を加工する → audio 入力あり。
+                has_audio_input: true,
             },
             PluginEntry {
                 id: "test.delay".into(),
@@ -72,6 +75,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_note_input: false,
                 has_note_output: false,
                 has_audio_output: true,
+                // audio-effect: audio を加工する → audio 入力あり。
+                has_audio_input: true,
             },
         ],
         scanned_at: None,
@@ -116,18 +121,18 @@ fn drain<T>(rx: &mut UnboundedReceiver<T>) -> Vec<T> {
 }
 
 /// ヘルパ: plugin_host の `SlotPluginLoaded` を AppEvent として fake
-/// dispatch。 production で plugin_host が返す内容を test がそのまま
-/// 模倣する。
+/// dispatch。 production で plugin_host が返す内容を test がそのまま模倣する。
+/// `index` は flat な device index (= 末尾 append した位置)。
 fn fake_plugin_loaded(
     app: &mut AppData,
     track_id: u32,
-    slot: PluginSlot,
+    index: u32,
     id: &str,
     plugin_id: u32,
 ) {
     app.handle_event(AppEvent::SlotPluginLoadedFromChild {
         track: track_id,
-        slot,
+        index,
         id: id.into(),
         name: id.into(),
         plugin_id,
@@ -142,15 +147,10 @@ fn fake_plugin_loaded(
 fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
 
-    // 初期状態: AppData::new で Track 1 が 1 つ作られている。
-    // この track の id はまだ採番前 (0) で、 `ensure_ids` 前の状態
-    // (production でも load 前は同じ)。 plugin_host との chain key は
-    // この id をそのまま使うので、 0 でも track_id ベースの routing は
-    // 動く (すべて id == 0 で揃うため)。
     assert_eq!(app.song.tracks.len(), 1);
     let inst_track_id = app.song.tracks[0].id;
 
-    // Step 1: track 0 を選択し、 instrument picker から synth を入れる。
+    // Step 1: track 0 を選択し、 picker から synth を入れる (= device 0 に append)。
     app.handle_event(AppEvent::SelectTrack(0));
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -159,33 +159,24 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         open_gui: true,
     });
 
-    // SetSlotPlugin が plugin_host 行きに sent されているはず。
+    // SetSlotPlugin が plugin_host 行きに sent されているはず (device 0)。
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs
             .iter()
-            .any(|m| matches!(m, MainToChild::SetSlotPlugin { track, slot: PluginSlot::Instrument, .. } if *track == inst_track_id)),
-        "SetSlotPlugin(Instrument) should be sent to plugin_host: {:?}",
+            .any(|m| matches!(m, MainToChild::SetSlotPlugin { track, index: 0, .. } if *track == inst_track_id)),
+        "SetSlotPlugin(index 0) should be sent to plugin_host: {:?}",
         plugin_msgs
     );
 
-    // plugin_host からの SlotPluginLoaded を fake dispatch。
-    fake_plugin_loaded(
-        &mut app,
-        inst_track_id,
-        PluginSlot::Instrument,
-        "test.synth",
-        100,
-    );
+    fake_plugin_loaded(&mut app, inst_track_id, 0, "test.synth", 100);
     assert_eq!(
         app.track_plugin_ids.get(&inst_track_id).map(|v| v.as_slice()),
         Some([100u32].as_slice()),
         "instrument plugin_id should register in track_plugin_ids"
     );
 
-    // 本セッションで手動追加した plugin は load 完了で daw_audio へ LoadSong を再送し、
-    // 新 plugin を signal path に入れる (add path の audio 再 sync 欠落 bug の回帰防止)。
-    // Step 2 の "Play は LoadSong を再送しない" assertion を汚さないよう、ここで drain。
+    // add path の audio 再 sync (LoadSong) を drain (Step 2 の assertion を汚さない)。
     let audio_after_add = drain(&mut audio_rx);
     assert!(
         audio_after_add
@@ -196,10 +187,6 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     );
 
     // Step 2: Play。 audio_tx に Play のみが出るはず。
-    // dbca77f 以降、 play() は LoadSong を再送しない (= 旧バグ: 大量 WAV の
-    // とき audio engine の compile_audio_schedule = decode + schedule build
-    // が同期で 2 秒以上かかり再生開始が遅延)。 LoadSong は
-    // sync_song_to_plugin_host 経由で都度 audio engine に届いている前提。
     app.handle_event(AppEvent::Play);
     let audio_msgs = drain(&mut audio_rx);
     assert!(
@@ -214,9 +201,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     );
     assert!(app.is_playing, "is_playing should be true after Play");
 
-    // Step 3: instrument track を group 化。 selected_track_ids が group 自身に
-    // なるよう仕様 (Live 互換)。 group 自体は instrument の **直前 (= 上)** に
-    // 挿入される。
+    // Step 3: instrument track を group 化。
     app.handle_event(AppEvent::GroupSelectedTracks {
         track_ids: vec![inst_track_id],
     });
@@ -246,8 +231,6 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         "newly created group has children → is_group_track == true"
     );
 
-    // group 化 → sync_song_to_plugin_host で audio へ LoadSong が送られた
-    // はず。 plugin chain に変更は無いので plugin_rx は空のまま。
     let _ = drain(&mut audio_rx);
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
@@ -256,8 +239,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         plugin_msgs
     );
 
-    // Step 4: group が selected な状態で Bitcrush を Fx 0 に追加。
-    // selected_track_ids = [group_id] の末尾は group_id なので cursor は group。
+    // Step 4: group が selected な状態で Bitcrush を append (= device 0 on group)。
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.bitcrush".into(),
@@ -268,18 +250,14 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            MainToChild::SetSlotPlugin {
-                track,
-                slot: PluginSlot::Fx(0),
-                ..
-            } if *track == group_id
+            MainToChild::SetSlotPlugin { track, index: 0, .. } if *track == group_id
         )),
-        "Bitcrush should land at Fx(0) on the group track: {:?}",
+        "Bitcrush should land at device 0 on the group track: {:?}",
         plugin_msgs
     );
-    fake_plugin_loaded(&mut app, group_id, PluginSlot::Fx(0), "test.bitcrush", 200);
+    fake_plugin_loaded(&mut app, group_id, 0, "test.bitcrush", 200);
 
-    // Step 5: 同じく group に Delay を Fx 1 に追加。
+    // Step 5: 同じく group に Delay を append (= device 1)。
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.delay".into(),
@@ -290,16 +268,12 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            MainToChild::SetSlotPlugin {
-                track,
-                slot: PluginSlot::Fx(1),
-                ..
-            } if *track == group_id
+            MainToChild::SetSlotPlugin { track, index: 1, .. } if *track == group_id
         )),
-        "Delay should land at Fx(1) on the group track: {:?}",
+        "Delay should land at device 1 on the group track: {:?}",
         plugin_msgs
     );
-    fake_plugin_loaded(&mut app, group_id, PluginSlot::Fx(1), "test.delay", 201);
+    fake_plugin_loaded(&mut app, group_id, 1, "test.delay", 201);
 
     // group_plugin_ids には Bitcrush(200), Delay(201) が register されている。
     assert_eq!(
@@ -311,33 +285,26 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         app.song.tracks
             .iter()
             .find(|t| t.id == group_id)
-            .map(|t| t.fx_chain.len()),
+            .map(|t| t.devices.len()),
         Some(2),
-        "group fx_chain has 2 entries"
+        "group devices has 2 entries"
     );
 
-    // Step 6: Bitcrush (Fx 0) を削除。
+    // Step 6: Bitcrush (device 0) を削除。
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
-    app.handle_event(AppEvent::RemoveSlot {
-        slot_kind: 2, // Fx
-        slot_index: 0,
-    });
-    // RemoveSlot は plugin の最新 state を取ってから Undo snapshot →
-    // 削除 という deferred path を通る (PendingStateRequest)。 test では
-    // plugin_host を mock していないので、 fake で AllStatesReceived を
-    // 流して deferred edit を実行させる。
+    app.handle_event(AppEvent::RemoveDevice { index: 0 });
+    // RemoveDevice は plugin の最新 state を取ってから Undo snapshot → 削除 という
+    // deferred path を通る。 test では plugin_host を mock していないので、 fake で
+    // AllStatesReceived を流して deferred edit を実行させる。
     app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            MainToChild::RemoveSlotPlugin {
-                track,
-                slot: PluginSlot::Fx(0),
-            } if *track == group_id
+            MainToChild::RemoveSlotPlugin { track, index: 0 } if *track == group_id
         )),
-        "RemoveSlotPlugin(Fx 0) should be sent to plugin_host: {:?}",
+        "RemoveSlotPlugin(index 0) should be sent to plugin_host: {:?}",
         plugin_msgs
     );
     // plugin_host が destroy 完了して SlotPluginUnloaded を返したのを fake。
@@ -353,28 +320,18 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         app.song.tracks
             .iter()
             .find(|t| t.id == group_id)
-            .map(|t| t.fx_chain.len()),
+            .map(|t| t.devices.len()),
         Some(1),
-        "after Bitcrush remove: group fx_chain has 1 entry"
+        "after Bitcrush remove: group devices has 1 entry"
     );
 
-    // Step 7: ungroup。 これが本テストの肝 (use-after-free 防止):
-    //   - audio 側に `ClosePluginShmem(201)` を **先に** 送る
-    //     → audio engine の `plugin_refs` / `slot_to_plugin_id` から
-    //        Delay の entry が消える
-    //   - そのあと plugin_host に `RemoveTrack(group_id)` を送る
-    //     → plugin_host が Delay の Box<Plugin> を destroy しても
-    //        audio worker は Delay にアクセスしないので AV しない
-    //   - 楽器 track は parent_group_id == None で残り、 plugin_id 100
-    //     も track_plugin_ids[inst_track_id] に保持される (= 音継続)。
+    // Step 7: ungroup。 use-after-free 防止: audio 側に `ClosePluginShmem(201)` を
+    // 先に送り、 そのあと plugin_host に `RemoveTrack(group_id)`。
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
     app.handle_event(AppEvent::UngroupTracks {
         track_ids: vec![group_id],
     });
-    // RemoveSlot と同じく、 group_track の fx_chain が削除されるため
-    // ungroup も deferred path (state 取得 → Undo snapshot → 実 ungroup)
-    // を通る。 fake で AllStatesReceived を流して inner を発火させる。
     app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
 
     let audio_msgs = drain(&mut audio_rx);
@@ -389,10 +346,6 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
                 "ClosePluginShmem(201) must be sent on audio_tx during ungroup: {audio_msgs:?}"
             )
         });
-    // ungroup 直後の (2 回目) sync_song_to_plugin_host で LoadSong が再度
-    // 送られるが、 これは ClosePluginShmem **より後** であって良い (audio
-    // engine 側の処理順としては、 ClosePluginShmem を先に処理しさえすれば
-    // race を防げる)。
     let load_after = audio_msgs.iter().enumerate().any(|(i, m)| {
         i > close_idx && matches!(m, MainToChild::LoadSong(_))
     });
@@ -442,15 +395,13 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         Some([100u32].as_slice()),
         "instrument track keeps its plugin_id (audio continues)"
     );
-    // 念のため song モデル側も instrument が残っているか。
+    // 念のため song モデル側も instrument device が残っているか。
     let inst_track = &app.song.tracks[0];
-    assert!(
-        matches!(
-            inst_track.instrument,
-            Some(PluginInstance { ref plugin_id, .. }) if plugin_id == "test.synth"
-        ),
-        "instrument PluginInstance still bound to test.synth: {:?}",
-        inst_track.instrument
+    assert_eq!(
+        inst_track.devices.first().map(|p| p.plugin_id.as_str()),
+        Some("test.synth"),
+        "instrument device still bound to test.synth: {:?}",
+        inst_track.devices
     );
     assert!(
         matches!(inst_track.source, InstrumentSource::None),
@@ -458,8 +409,8 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     );
 }
 
-/// Build track 0 = [synth(Instrument,100), bitcrush(Fx0,101), delay(Fx1,102)],
-/// all reported loaded, and drain both child channels. Returns the track id.
+/// Build track 0 = [synth(0,100), bitcrush(1,101), delay(2,102)], all reported
+/// loaded, and drain both child channels. Returns the track id.
 fn setup_loaded_chain(
     app: &mut AppData,
     audio_rx: &mut UnboundedReceiver<MainToChild>,
@@ -473,31 +424,27 @@ fn setup_loaded_chain(
         keep_open: false,
         open_gui: false,
     });
-    fake_plugin_loaded(app, track_id, PluginSlot::Instrument, "test.synth", 100);
+    fake_plugin_loaded(app, track_id, 0, "test.synth", 100);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.bitcrush".into(),
         keep_open: false,
         open_gui: false,
     });
-    fake_plugin_loaded(app, track_id, PluginSlot::Fx(0), "test.bitcrush", 101);
+    fake_plugin_loaded(app, track_id, 1, "test.bitcrush", 101);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.delay".into(),
         keep_open: false,
         open_gui: false,
     });
-    fake_plugin_loaded(app, track_id, PluginSlot::Fx(1), "test.delay", 102);
-    // Sanity: starting layout is [Instrument synth, Fx0 bitcrush, Fx1 delay].
+    fake_plugin_loaded(app, track_id, 2, "test.delay", 102);
+    // Sanity: starting layout is [synth, bitcrush, delay].
     {
         let t = &app.song.tracks[0];
         assert_eq!(
-            t.instrument.as_ref().map(|p| p.plugin_id.as_str()),
-            Some("test.synth")
-        );
-        assert_eq!(
-            t.fx_chain.iter().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
-            vec!["test.bitcrush", "test.delay"]
+            t.devices.iter().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
+            vec!["test.synth", "test.bitcrush", "test.delay"]
         );
     }
     let _ = drain(audio_rx);
@@ -505,59 +452,53 @@ fn setup_loaded_chain(
     track_id
 }
 
-/// FIXME #32: an inspector-chain drag reorder must (a) repartition the song,
-/// (b) re-key daw_gui's `(track, slot)` caches, and (c) send a `ReorderChain`
-/// with the correct `(old, new)` permutation to BOTH children, followed by a
-/// `LoadSong` that rebuilds the audio schedule. Before this fix only the song
-/// was repartitioned, so the audio engine's `slot_to_plugin_id` stayed stale
-/// and the actual processing order never followed the visual reorder.
+/// 単一デバイスチェーンの reorder は (a) song を permute、 (b) daw_gui の
+/// `(track, index)` cache を再キー、 (c) `ReorderChain` を BOTH children へ送り、
+/// その後 `LoadSong` で audio schedule を再構築する。
 #[test]
 fn inspector_chain_reorder_rekeys_both_children() {
     let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
     let track_id = setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
 
-    // Reorder. inspector_chain = [Instrument, Fx0, Fx1] (flat idx 0,1,2). The
-    // gui_01 contract is new[i] = items[order[i]]; order [0,2,1] keeps the
-    // instrument and swaps the two FX (delay before bitcrush).
+    // Reorder. devices = [synth(0), bitcrush(1), delay(2)]. gui_01 契約は
+    // new[i] = items[order[i]]; order [0,2,1] は synth を残して 2 つの FX を入れ替え
+    // (delay が bitcrush より前へ)。
     app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1]));
 
-    // (a) song repartition: FX order swapped, instrument untouched.
+    // (a) song permutation: device 順が [synth, delay, bitcrush] に。
     {
         let t = &app.song.tracks[0];
         assert_eq!(
-            t.instrument.as_ref().map(|p| p.plugin_id.as_str()),
-            Some("test.synth"),
-            "instrument stays the instrument"
-        );
-        assert_eq!(
-            t.fx_chain.iter().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
-            vec!["test.delay", "test.bitcrush"],
-            "fx_chain order swapped in the song model"
+            t.devices.iter().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
+            vec!["test.synth", "test.delay", "test.bitcrush"],
+            "devices order permuted in the song model"
         );
     }
 
-    // (b) daw_gui caches re-keyed so each slot resolves to its moved plugin.
+    // (b) daw_gui caches re-keyed so each device index resolves to its moved plugin.
     assert_eq!(
-        app.loaded_slots.get(&(track_id, PluginSlot::Fx(0))).map(|i| i.plugin_id),
-        Some(102),
-        "Fx(0) now maps to delay's plugin_id"
+        app.loaded_slots.get(&(track_id, 0)).map(|i| i.plugin_id),
+        Some(100),
+        "index 0 still maps to synth's plugin_id"
     );
     assert_eq!(
-        app.loaded_slots.get(&(track_id, PluginSlot::Fx(1))).map(|i| i.plugin_id),
+        app.loaded_slots.get(&(track_id, 1)).map(|i| i.plugin_id),
+        Some(102),
+        "index 1 now maps to delay's plugin_id"
+    );
+    assert_eq!(
+        app.loaded_slots.get(&(track_id, 2)).map(|i| i.plugin_id),
         Some(101),
-        "Fx(1) now maps to bitcrush's plugin_id"
+        "index 2 now maps to bitcrush's plugin_id"
     );
 
     // (c) ReorderChain with the correct (old -> new) permutation to BOTH
     // children, plus the LoadSong that rebuilds the audio schedule.
-    let expected_moves = vec![
-        (PluginSlot::Instrument, PluginSlot::Instrument),
-        (PluginSlot::Fx(1), PluginSlot::Fx(0)), // delay: old Fx(1) -> new Fx(0)
-        (PluginSlot::Fx(0), PluginSlot::Fx(1)), // bitcrush: old Fx(0) -> new Fx(1)
-    ];
+    // moves[i] = (order[i], i): synth stays, delay 2->1, bitcrush 1->2.
+    let expected_moves: Vec<(u32, u32)> = vec![(0, 0), (2, 1), (1, 2)];
     let plugin_msgs = drain(&mut plugin_rx);
     let audio_msgs = drain(&mut audio_rx);
-    let find_reorder = |msgs: &[MainToChild]| -> Option<Vec<(PluginSlot, PluginSlot)>> {
+    let find_reorder = |msgs: &[MainToChild]| -> Option<Vec<(u32, u32)>> {
         msgs.iter().find_map(|m| match m {
             MainToChild::ReorderChain { track, moves } if *track == track_id => {
                 Some(moves.clone())
@@ -581,21 +522,22 @@ fn inspector_chain_reorder_rekeys_both_children() {
     );
 }
 
-/// FIXME #32 (review finding #3): `AutomationTarget::PluginParam { slot }` lanes
-/// are addressed by chain slot and persisted. A reorder must re-point each lane
-/// old→new, or the moved plugin loses its automation and whatever took its old
-/// slot inherits it (audible wrong audio that also survives a reload).
+/// `AutomationTarget::PluginParam { device_index }` lanes are addressed by device
+/// index and persisted. A reorder must re-point each lane old→new, or the moved
+/// plugin loses its automation and whatever took its old index inherits it
+/// (audible wrong audio that also survives a reload).
 #[test]
 fn inspector_chain_reorder_remaps_automation_lane_slots() {
     let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
     let _track_id = setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
 
-    // Automate a param on the plugin currently at Fx(0) (bitcrush).
+    // Automate a param on bitcrush (currently device index 1).
     app.song.tracks[0].automation_lanes.push(AutomationLane {
         id: 1,
         target: AutomationTarget::PluginParam {
-            slot: PluginSlot::Fx(0),
+            device_index: 1,
             param_id: 42,
+            legacy_slot: None,
         },
         default_value: 0.25,
         enabled: true,
@@ -605,58 +547,58 @@ fn inspector_chain_reorder_remaps_automation_lane_slots() {
         next_clip_id: 1,
     });
 
-    // Swap the two FX (delay before bitcrush).
+    // Swap the two FX (delay before bitcrush): order [0,2,1].
     app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1]));
 
-    // bitcrush moved Fx(0) -> Fx(1); its lane must follow so it still drives
-    // bitcrush (not delay, which now sits at Fx(0)).
+    // bitcrush moved index 1 -> index 2; its lane must follow so it still drives
+    // bitcrush (not delay, which now sits at index 1).
     assert_eq!(
         app.song.tracks[0].automation_lanes[0].target,
         AutomationTarget::PluginParam {
-            slot: PluginSlot::Fx(1),
+            device_index: 2,
             param_id: 42,
+            legacy_slot: None,
         },
-        "the automation lane must track the plugin to its new slot"
+        "the automation lane must track the plugin to its new device index"
     );
 }
 
-/// FIXME #32 (review findings #1/#4): the reorder re-keys all three processes,
-/// but a failed/in-flight plugin load can leave a phantom in the song that the
-/// plugin host's live chain does not have. Applying the reorder then would make
-/// the host skip while the audio engine + daw_gui apply, diverging permanently.
-/// So the reorder must be a no-op (UI snaps back) unless the track's whole chain
-/// is consistently loaded across processes.
+/// The reorder re-keys all three processes, but a failed/in-flight plugin load
+/// can leave a phantom in the song that the plugin host's live chain does not
+/// have. Applying the reorder then would make the host skip while the audio
+/// engine + daw_gui apply, diverging permanently. So the reorder must be a no-op
+/// (UI snaps back) unless the track's whole chain is consistently loaded.
 #[test]
 fn inspector_chain_reorder_aborts_when_chain_not_fully_loaded() {
     let (mut app, mut audio_rx, mut plugin_rx, _proxy) = build_app();
     let track_id = setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
 
-    // Inject a PHANTOM third FX: present in the song (and the inspector chain)
+    // Inject a PHANTOM 4th device: present in the song (and the inspector chain)
     // but never reported loaded, mimicking a plugin whose load failed.
     app.song
         .tracks
         .iter_mut()
         .find(|t| t.id == track_id)
         .unwrap()
-        .fx_chain
-        .push(PluginInstance::new(
+        .devices
+        .push(common::model::PluginInstance::new(
             "test.delay".into(),
             common::plugin_format::PluginFormat::Clap,
         ));
     let before: Vec<String> = app.song.tracks[0]
-        .fx_chain
+        .devices
         .iter()
         .map(|p| p.plugin_id.clone())
         .collect();
     let _ = drain(&mut audio_rx);
     let _ = drain(&mut plugin_rx);
 
-    // Try to swap Fx(0) and Fx(1) over the 4-item chain [inst, fx0, fx1, phantom].
+    // Try to swap indices 1 and 2 over the 4-item chain [synth, bitcrush, delay, phantom].
     app.handle_event(AppEvent::ReorderInspectorChain(vec![0, 2, 1, 3]));
 
     // No song mutation and no ReorderChain to either child.
     let after: Vec<String> = app.song.tracks[0]
-        .fx_chain
+        .devices
         .iter()
         .map(|p| p.plugin_id.clone())
         .collect();

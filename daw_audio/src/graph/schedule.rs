@@ -6,8 +6,6 @@
 
 #![allow(dead_code)]
 
-use common::protocol::PluginSlot;
-
 use super::delay_line::DelayLine;
 use super::port_buffer::PortBufferPool;
 
@@ -65,16 +63,17 @@ pub enum NodeOp {
         frames: u32,
     },
 
-    /// PR4 sidechain: copy `src` into the plugin at `(dst_track, dst_slot)`'s
+    /// PR4 sidechain: copy `src` into the plugin at `(dst_track, dst_index)`'s
     /// `aux_in_port` shmem buffer **before** the plugin's `process()` runs.
-    /// `compile_schedule` keys by `(track, slot)` because the runtime
+    /// `compile_schedule` keys by `(track, device_index)` because the runtime
     /// `plugin_id` (assigned by daw_plugin_host) isn't visible at compile
     /// time. The engine resolves to a concrete `plugin_id` via
-    /// `slot_to_plugin_id` at dispatch time.
+    /// `slot_to_plugin_id` at dispatch time. v23 single-chain: `dst_index` is
+    /// the device's position in `Track.devices`.
     SidechainTap {
         src: BufRef,
         dst_track: u32,
-        dst_slot: PluginSlot,
+        dst_index: u32,
         aux_in_port: u8,
     },
 

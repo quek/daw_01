@@ -3,13 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 
-/// Addresses a single plugin slot inside a track. A track has:
-/// - MIDI FX chain: `MidiFx(0)`, `MidiFx(1)`, ...
-/// - one Instrument slot: `Instrument`
-/// - audio FX chain: `Fx(0)`, `Fx(1)`, ...
-///
-/// Indices within `MidiFx` / `Fx` are stable while the chain is unchanged;
-/// explicit `MoveSlot` messages rewrite them after a reorder.
+/// 旧 per-section plugin slot 表現 (MIDI FX chain / 単 Instrument / audio FX
+/// chain)。 single-chain 再設計 (`docs/plan_linear_chain.md`) 後の IPC は
+/// device index (`u32`) addressing に移行済みで、 この enum は
+/// [`crate::model::AutomationTarget::PluginParam`] の `legacy_slot` (= 旧
+/// project の save migration) からのみ参照される。
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode, Serialize, Deserialize,
 )]
@@ -97,7 +95,7 @@ pub enum ChildToMain {
     /// or 復元成功。
     SlotPluginLoaded {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         id: String,
         name: String,
         plugin_id: u32,
@@ -108,10 +106,10 @@ pub enum ChildToMain {
     /// extension missing.
     SlotPluginState {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         data: Option<Vec<u8>>,
     },
-    /// Reply to `RequestAllStates`: one entry per slot that had a plugin
+    /// Reply to `RequestAllStates`: one entry per device that had a plugin
     /// loaded at request time. Makes project save a single round-trip.
     AllPluginStates {
         entries: Vec<SlotState>,
@@ -119,14 +117,14 @@ pub enum ChildToMain {
     /// GUI opened at the requested size.
     SlotGuiOpened {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         width: u32,
         height: u32,
     },
     /// Plugin-initiated close (X button handled by plugin, or `closed`).
     SlotGuiClosed {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     },
     /// Plugin host destroyed a plugin instance (RemoveSlotPlugin /
     /// RemoveTrack 経由)。 daw_gui はこれを受け取って
@@ -146,7 +144,7 @@ pub enum ChildToMain {
     /// (例: "library load failed: ABI mismatch")。
     SlotPluginLoadFailed {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id: String,
         reason: String,
     },
@@ -156,7 +154,7 @@ pub enum ChildToMain {
     /// 直後) もしくは plugin が `host->request_restart()` /
     /// `IComponentHandler::restartComponent(kLatencyChanged)` で再 query
     /// を要求して deactivate→activate→get の往復を完了した直後に発火。
-    /// daw_gui は plugin_id から (track_id, slot) を逆引きして
+    /// daw_gui は plugin_id から (track_id, device index) を逆引きして
     /// `Track::reported_latency_samples` を更新し、 daw_audio に
     /// `LoadSong` を再送して compile_schedule に PDC を再計算させる。
     PluginLatencyChanged {
@@ -170,7 +168,7 @@ pub enum ChildToMain {
     /// lane の label / min/max / display 用に使う。
     PluginParamList {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id: u32,
         params: Vec<PluginParamInfo>,
     },
@@ -181,7 +179,7 @@ pub enum ChildToMain {
     /// PluginParamInfo lookup で補完して送る。
     PluginParamTouched {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         param_id: u32,
         display_name: String,
     },
@@ -192,7 +190,7 @@ pub enum ChildToMain {
     /// value cache に保存)。
     PluginParamValueChanged {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         param_id: u32,
         value: f64,
     },
@@ -203,7 +201,7 @@ pub enum ChildToMain {
     /// (= Touch mode で recording 終了 + curve eval bypass 解除)。
     PluginParamGestureEnd {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         param_id: u32,
     },
 }
@@ -252,11 +250,11 @@ pub mod plugin_param_flags {
 /// `error` is set when `state_save()` returned `Err(...)`. daw_gui surfaces
 /// the aggregated error list in `status_message` so the user notices that
 /// their saved project will reload with default plugin state for the
-/// affected slot(s) (= silent corruption fix). `None` = save succeeded.
+/// affected device(s) (= silent corruption fix). `None` = save succeeded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct SlotState {
     pub track: u32,
-    pub slot: PluginSlot,
+    pub index: u32,
     pub data: Option<Vec<u8>>,
     pub error: Option<String>,
 }
@@ -436,75 +434,59 @@ pub enum MainToChild {
     /// 0 検出で midi_recording_pending → midi_recording 遷移。 `samples = 0`
     /// で count-in を即時 cancel (= stop_recording 中の preroll キャンセル用)。
     StartCountIn { samples: u64 },
-    // --- Per-track plugin slot management -----------------------------
-    /// Load / replace the plugin in `(track, slot)`. `format` routes the
-    /// request to the CLAP or VST3 backend. Empty `plugin_id` picks the
-    /// first descriptor in `path`; non-empty selects by id (CLAP stable id
-    /// or VST3 FUID as hex). `initial_state`, when `Some`, is applied via
-    /// the backend's state-restore entry right after activate.
+    // --- Per-track plugin device management ---------------------------
+    /// Load / replace the plugin at `(track, device index)`. `format`
+    /// routes the request to the CLAP or VST3 backend. Empty `plugin_id`
+    /// picks the first descriptor in `path`; non-empty selects by id (CLAP
+    /// stable id or VST3 FUID as hex). `initial_state`, when `Some`, is
+    /// applied via the backend's state-restore entry right after activate.
     SetSlotPlugin {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         format: PluginFormat,
         path: std::path::PathBuf,
         plugin_id: String,
         initial_state: Option<Vec<u8>>,
     },
-    /// Remove the plugin at `(track, slot)` if any.
+    /// Remove the plugin at `(track, device index)` if any.
     RemoveSlotPlugin {
         track: u32,
-        slot: PluginSlot,
-    },
-    /// Reorder: move the plugin at `(track, from)` to `(track, to)`. Only
-    /// valid within the same section (`MidiFx → MidiFx`, `Fx → Fx`).
-    MoveSlot {
-        track: u32,
-        from: PluginSlot,
-        to: PluginSlot,
+        index: u32,
     },
     /// FIXME #32: apply an arbitrary chain reorder as a glitch-free **live
     /// move**. `moves` is the COMPLETE new layout of `track`'s chain: one
-    /// `(from, to)` per loaded plugin (including `from == to` for ones that
-    /// did not move), where `from` is the plugin's current `(track, slot)`
-    /// address and `to` is its address after the drag. The set of `from`
-    /// slots must exactly cover the track's currently-loaded plugins and the
-    /// `to` slots must form contiguous `MidiFx(0..)` / single `Instrument` /
-    /// `Fx(0..)` sections.
+    /// `(old_index, new_index)` per loaded plugin (including
+    /// `old_index == new_index` for ones that did not move), where
+    /// `old_index` is the plugin's current device index and `new_index` is
+    /// its device index after the drag. The set of `old_index` values must
+    /// exactly cover the track's currently-loaded devices and the
+    /// `new_index` values must form a contiguous `0..n` permutation.
     ///
     /// Sent to BOTH children:
     /// - the plugin host permutes its live `Box<dyn LoadedPlugin>`s in place
     ///   (heap address preserved → no re-instantiation, no audio glitch, open
-    ///   editor windows follow) and re-keys every `(track, slot)` book plus
-    ///   the worker registry entry slot;
-    /// - the audio engine atomically re-keys `slot_to_plugin_id` so each slot
-    ///   resolves to the moved plugin (the processing order itself follows the
-    ///   subsequent `LoadSong`). Supersedes the single-step `MoveSlot` for the
-    ///   inspector-chain drag reorder (which never wired `MoveSlot`).
+    ///   editor windows follow) and re-keys every `(track, device index)`
+    ///   book plus the worker registry entry index;
+    /// - the audio engine atomically re-keys `slot_to_plugin_id` so each
+    ///   device index resolves to the moved plugin (the processing order
+    ///   itself follows the subsequent `LoadSong`).
     ReorderChain {
         track: u32,
-        moves: Vec<(PluginSlot, PluginSlot)>,
+        moves: Vec<(u32, u32)>,
     },
-    /// FIXME #29/#31: demote the track's dual-role instrument to the END of
-    /// its MIDI-FX (generator) chain, preserving the LIVE plugin instance
-    /// (and its open editor window) instead of destroying + re-instantiating
-    /// it. Sent when a new instrument is inserted over a dual-role source.
-    /// The plugin host moves `chain.instrument → chain.midi_fx_chain.push`
-    /// and re-keys its `(track, slot)` bookkeeping (so the editor window
-    /// follows to the new slot). No-op if the track has no instrument.
-    DemoteInstrumentToGenerator { track: u32 },
     /// Drop the entire chain for `track` (every MIDI FX / Instrument / FX
     /// slot), tearing down each plugin's GUI first. `track` is a stable
     /// `Track::id` (since PR2.1 the plugin host's chain map is keyed by
     /// id, not Vec position). Sent when the user removes a whole track
     /// so the audio thread stops rendering it.
     RemoveTrack { track: u32 },
-    /// Ask the plugin_host to capture state for one slot. Reply is
+    /// Ask the plugin_host to capture state for one device. Reply is
     /// `ChildToMain::SlotPluginState`.
     RequestSlotState {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     },
-    /// Ask the plugin_host to capture state for every slot at once.
+    /// Ask the plugin_host to capture state for every device at once.
     /// Reply is `ChildToMain::AllPluginStates` containing one entry per
     /// loaded plugin. Used for project save.
     RequestAllStates,
@@ -515,15 +497,15 @@ pub enum MainToChild {
     /// resolve into the plugin-host process so JUCE's
     /// `Process::isForegroundProcess()` becomes true when the editor is
     /// focused — which is what lets cascade sub-menus stay open. `title`
-    /// is the window caption daw_gui composed (track / slot context).
+    /// is the window caption daw_gui composed (track / device context).
     OpenSlotGuiEmbedded {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         title: String,
     },
     CloseSlotGui {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     },
     // --- A2 audio engine refactor -------------------------------------
     /// Stand up the per-buffer plugin process worker pool. `n_workers`
@@ -542,7 +524,7 @@ pub enum MainToChild {
     /// workers exit and the IDs they held become invalid.
     CloseWorkerPool,
     /// Map a `ProcessData` shmem region into the consumer (daw_audio).
-    /// `track` and `slot` let the audio engine slot the plugin into the
+    /// `track` and `index` let the audio engine slot the plugin into the
     /// right place in its routing graph; `plugin_id` is the host's
     /// session-unique id and `shmem_id` names the shmem the host
     /// already created.
@@ -550,7 +532,7 @@ pub enum MainToChild {
         plugin_id: u32,
         shmem_id: String,
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     },
     /// Drop the `ProcessData` mapping for `plugin_id` after the plugin
     /// instance is being torn down.
@@ -610,13 +592,13 @@ mod tests {
             entries: vec![
                 SlotState {
                     track: 0,
-                    slot: PluginSlot::Instrument,
+                    index: 1,
                     data: Some(vec![1, 2, 3, 4]),
                     error: None,
                 },
                 SlotState {
                     track: 3,
-                    slot: PluginSlot::Fx(2),
+                    index: 4,
                     data: None,
                     error: Some("state save failed".to_string()),
                 },
@@ -629,7 +611,7 @@ mod tests {
     fn child_to_main_plugin_param_list_roundtrip() {
         let msg = ChildToMain::PluginParamList {
             track: 1,
-            slot: PluginSlot::MidiFx(0),
+            index: 0,
             plugin_id: 7,
             params: vec![
                 PluginParamInfo {
@@ -660,12 +642,7 @@ mod tests {
     fn main_to_child_reorder_chain_roundtrip() {
         let msg = MainToChild::ReorderChain {
             track: 4,
-            moves: vec![
-                (PluginSlot::Fx(0), PluginSlot::Fx(1)),
-                (PluginSlot::Fx(1), PluginSlot::Fx(0)),
-                (PluginSlot::MidiFx(2), PluginSlot::Instrument),
-                (PluginSlot::Instrument, PluginSlot::MidiFx(2)),
-            ],
+            moves: vec![(0, 1), (1, 0), (2, 3), (3, 2)],
         };
         assert_eq!(roundtrip(&msg), msg);
     }

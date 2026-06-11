@@ -52,11 +52,12 @@ const song = {
       solo: false,
       reported_latency_samples: 0,
       clips: [{ id: 1, name: "click", start_beat: 0.0, length_beats: 8.0 }],
-      fx_chain: [
+      devices: [
         {
           plugin_id: "MCenter",
           format: "Vst3",
           state: null,
+          ports: { has_note_input: false, has_note_output: false, has_audio_output: true },
         },
       ],
     },
@@ -67,13 +68,12 @@ daw.loadSongFromObject(song);
 
 daw.setSlotPlugin(
   2,
-  2, // Fx
-  0,
+  0, // device index (末尾 append、 単一デバイスチェーン)
   "vst3",
   "C:/Program Files/Common Files/VST3/MeldaProduction/Stereo/MCenter.vst3",
   "",
 );
-daw.waitForPluginLoaded(2, 2, 0, 30000);
+daw.waitForPluginLoaded(2, 0, 30000);
 
 // PR3.3: plugin が `ChildToMain::PluginLatencyChanged { plugin_id, samples }`
 // で自身の latency を IPC 経由で通知する。 script.rs の `pump_until` が

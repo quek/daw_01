@@ -24,7 +24,7 @@ use common::model::{
 };
 use common::plugin_db::PluginDatabase;
 use common::plugin_format::PluginFormat;
-use common::protocol::{MainToChild, PluginSlot, SlotState};
+use common::protocol::{MainToChild, SlotState};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::audio_source_cache::AudioSourceCache;
@@ -145,133 +145,31 @@ impl PluginCategory {
     }
 }
 
-/// FIXME #29: プラグインが「どの役割になれるか」。 note 出力の有無は
-/// [`common::plugin_db::PluginEntry`] の port 3 bool (probe で確定する SSoT) から、
-/// 音源↔音声エフェクトの区別は従来どおり `features` (= 信頼できる宣言) から導出する。
-/// 役割は最終的に「能力 + チェーン内の位置」で決まる ([`PluginCapability::allows_slot_kind`])。
-/// picker の挿入先決定と inspector の並べ替え drop 検証が共有する (SSoT / DRY)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginCapability {
-    /// note 出力あり・audio 出力なし (アルペジエータ等)。 生成器列 (midi_fx) 専用。
-    PureMidiEffect,
-    /// note 出力あり・audio 出力あり (例: Scaler 2)。 生成器にも音源にもなれる。
-    DualRole,
-    /// note 出力なし・音源 (feature=instrument)。 音源スロット専用。
-    Instrument,
-    /// note 出力なし・音声エフェクト (または未分類)。 audio-fx 列専用。
-    AudioFx,
-}
-
-impl PluginCapability {
-    pub fn from_entry(e: &common::plugin_db::PluginEntry) -> Self {
-        match (e.has_note_output, e.has_audio_output) {
-            (true, true) => Self::DualRole,
-            (true, false) => Self::PureMidiEffect,
-            // note 出力なし: 音声面の役割は feature で決める (probe より宣言が信頼できる)。
-            (false, _) => {
-                if e.features.iter().any(|f| f == "instrument") {
-                    Self::Instrument
-                } else {
-                    Self::AudioFx
-                }
-            }
-        }
-    }
-
-    /// この能力が占められるチェーン slot 種別 (`0=MidiFx`, `1=Instrument`, `2=Fx`)。
-    /// inspector の並べ替え drop 検証が、 ポート的に有効な落とし先だけ許すのに使う。
-    pub fn allows_slot_kind(self, slot_kind: u8) -> bool {
-        match self {
-            Self::PureMidiEffect => slot_kind == 0,
-            Self::DualRole => slot_kind == 0 || slot_kind == 1,
-            Self::Instrument => slot_kind == 1,
-            Self::AudioFx => slot_kind == 2,
-        }
+/// 単一デバイスチェーン (`docs/plan_linear_chain.md`): プラグインの役割は判定
+/// せず engine が port を順に直結するだけ。plugin を追加するときは追加先の
+/// `ports` だけが必要 — DB entry の 4 bool (probe で確定する SSoT) から
+/// [`PortConfig`] を組む小ヘルパ。
+fn port_config_of(e: &common::plugin_db::PluginEntry) -> common::port_config::PortConfig {
+    common::port_config::PortConfig {
+        has_note_input: e.has_note_input,
+        has_note_output: e.has_note_output,
+        has_audio_output: e.has_audio_output,
+        has_audio_input: e.has_audio_input,
     }
 }
 
-/// FIXME #29: 新 plugin が Instrument スロットを占めるとき、 既存音源を破棄
-/// (置換) するのでなく生成器列へ **降格** すべきか。 `existing_capability` は既存
-/// instrument の capability (None = 音源なし)。 **既存が dual-role のときだけ降格**
-/// する — 純粋音源は note 出力を持たず生成器になれないので従来どおり置換、
-/// 音源が無ければ降格対象も無い。 これで「Scaler 2 を先に刺してから Analog Lab V を
-/// 刺す」 と Scaler 2 が破棄されず生成器に降りる。
-fn should_demote_existing_instrument(
-    new_dest_is_instrument: bool,
-    existing_capability: Option<PluginCapability>,
-) -> bool {
-    new_dest_is_instrument && existing_capability == Some(PluginCapability::DualRole)
-}
-
-#[cfg(test)]
-mod plugin_capability_tests {
-    use super::PluginCapability;
-    use common::plugin_db::PluginEntry;
-    use common::plugin_format::PluginFormat;
-
-    fn entry(features: &[&str], note_out: bool, audio_out: bool) -> PluginEntry {
-        PluginEntry {
-            id: "x".into(),
-            format: PluginFormat::Clap,
-            name: "X".into(),
-            vendor: String::new(),
-            version: String::new(),
-            features: features.iter().map(|s| (*s).to_string()).collect(),
-            path: std::path::PathBuf::from("x"),
-            descriptor_index: 0,
-            has_note_input: false,
-            has_note_output: note_out,
-            has_audio_output: audio_out,
-        }
-    }
-
-    #[test]
-    fn from_entry_maps_ports_and_features() {
-        use PluginCapability::*;
-        // dual-role (例: Scaler 2): note 出力 + audio 出力。
-        assert_eq!(PluginCapability::from_entry(&entry(&["instrument"], true, true)), DualRole);
-        // 純 MIDI FX: note 出力のみ。
-        assert_eq!(PluginCapability::from_entry(&entry(&["note-effect"], true, false)), PureMidiEffect);
-        // 音源: note 出力なし + instrument feature。
-        assert_eq!(PluginCapability::from_entry(&entry(&["instrument"], false, true)), Instrument);
-        // 音声エフェクト: note 出力なし + instrument でない。
-        assert_eq!(PluginCapability::from_entry(&entry(&["audio-effect"], false, true)), AudioFx);
-        // 未分類 (port も feature も無し) は audio fx 扱い。
-        assert_eq!(PluginCapability::from_entry(&entry(&[], false, false)), AudioFx);
-    }
-
-    #[test]
-    fn allows_slot_kind_matches_role() {
-        use PluginCapability::*;
-        // slot_kind: 0=MidiFx, 1=Instrument, 2=Fx。
-        assert!(PureMidiEffect.allows_slot_kind(0));
-        assert!(!PureMidiEffect.allows_slot_kind(1));
-        assert!(!PureMidiEffect.allows_slot_kind(2));
-        // dual-role は生成器(0)・音源(1) 両方可、 audio fx(2) は不可。
-        assert!(DualRole.allows_slot_kind(0));
-        assert!(DualRole.allows_slot_kind(1));
-        assert!(!DualRole.allows_slot_kind(2));
-        assert!(Instrument.allows_slot_kind(1));
-        assert!(!Instrument.allows_slot_kind(0));
-        assert!(!Instrument.allows_slot_kind(2));
-        assert!(AudioFx.allows_slot_kind(2));
-        assert!(!AudioFx.allows_slot_kind(0));
-        assert!(!AudioFx.allows_slot_kind(1));
-    }
-
-    #[test]
-    fn demote_only_when_existing_is_dual_role() {
-        use super::should_demote_existing_instrument;
-        use PluginCapability::*;
-        // 既存音源が dual-role + 新 plugin が Instrument を占める → 降格。
-        assert!(should_demote_existing_instrument(true, Some(DualRole)));
-        // 既存が純粋音源 → 従来どおり置換 (降格しない、 要件: 既存挙動不変)。
-        assert!(!should_demote_existing_instrument(true, Some(Instrument)));
-        // 音源なし → 降格対象なし。
-        assert!(!should_demote_existing_instrument(true, None));
-        // 新 plugin が Instrument を占めない (FX / MIDI FX) → 降格しない。
-        assert!(!should_demote_existing_instrument(false, Some(DualRole)));
-    }
+/// `Track::default()` を生成し、`f` で一部 field だけ上書きして返す。
+///
+/// 単一デバイスチェーン migration で `Track` の legacy field
+/// (`legacy_midi_fx_chain` / `legacy_instrument` / `legacy_fx_chain`) が
+/// `pub(crate)` (= common 内の functional-update 専用) に降格したため、daw_gui
+/// から `Track { name, ..Track::default() }` の functional-update 構文を使うと
+/// E0451 (private fields) になる。daw_gui 側の全 Track 構築をこのヘルパ経由に
+/// 統一して、 public field だけを上書きする (legacy field は default のまま空)。
+pub fn track_with(f: impl FnOnce(&mut Track)) -> Track {
+    let mut t = Track::default();
+    f(&mut t);
+    t
 }
 
 impl PluginPickEntry {
@@ -291,22 +189,18 @@ impl PluginPickEntry {
     }
 }
 
+/// 単一デバイスチェーン上の 1 行 (`docs/plan_linear_chain.md` §5)。役割は持たず
+/// (判定もしない)、`device_index` (= `Track.devices` / `master_fx_chain` への
+/// flat な添字) でアドレスする。表示は plugin 名のみ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainEntry {
-    pub slot_kind: u8,
-    pub slot_index: u32,
-    pub section_label: String,
+    pub device_index: u32,
     pub plugin_name: String,
 }
 
 impl ChainEntry {
-    #[allow(dead_code)]
-    pub fn to_plugin_slot(&self) -> PluginSlot {
-        match self.slot_kind {
-            0 => PluginSlot::MidiFx(self.slot_index),
-            1 => PluginSlot::Instrument,
-            _ => PluginSlot::Fx(self.slot_index),
-        }
+    pub fn to_device_index(&self) -> u32 {
+        self.device_index
     }
 }
 
@@ -533,14 +427,14 @@ impl InspectorTextEventSummary {
 }
 
 /// Per-plugin sidechain wiring entry shown in the inspector. One row per
-/// chain plugin (MIDI FX / Instrument / Fx); the `current_source` field
-/// is the value of `PluginInstance::sidechain_sources[0]` (port 0; the
-/// inspector only exposes the first aux input port for now).
+/// chain device (addressed by `device_index` into `Track.devices` /
+/// `master_fx_chain`); the `current_source` field is the value of
+/// `PluginInstance::sidechain_sources[0]` (port 0; the inspector only
+/// exposes the first aux input port for now).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidechainEntry {
     pub track_id: u32,
-    pub slot_kind: u8,
-    pub slot_index: u32,
+    pub device_index: u32,
     pub plugin_name: String,
     pub current_source: Option<u32>,
 }
@@ -1029,7 +923,7 @@ pub struct AppData {
     /// stale 値が誤って record されるリスクは低い (= 念のため Step C-3
     /// follow-up で plugin unload 時に該当 entry を消す)。
     pub plugin_param_values: std::collections::HashMap<
-        (u32, common::protocol::PluginSlot, u32),
+        (u32, u32, u32),
         f64,
     >,
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
@@ -1038,7 +932,7 @@ pub struct AppData {
     /// Picker (Phase 3+) / lane の label 解決 / norm↔plain 変換に
     /// 使う。 session-only (save 対象外、 plugin reload で再取得)。
     pub plugin_params: std::collections::HashMap<
-        (u32, common::protocol::PluginSlot),
+        (u32, u32),
         Vec<common::protocol::PluginParamInfo>,
     >,
     /// gui_01 #031 (M14 Phase 63n-6): track ごとの row 高さ override。
@@ -1058,17 +952,17 @@ pub struct AppData {
     /// → all_done 永久 wait) を防ぐ。 daw_gui が plugin_id を保持する
     /// ための単一 source of truth。
     pub track_plugin_ids: std::collections::HashMap<u32, Vec<u32>>,
-    /// `(track_id, PluginSlot)` → 現在 plugin_host に load されている
+    /// `(track_id, device_index)` → 現在 plugin_host に load されている
     /// plugin の情報。 Undo/Redo の reconcile (`reconcile_plugins_with_song`)
-    /// で「Song の各 slot の plugin が host 側と一致しているか」 を slot
+    /// で「Song の各 device の plugin が host 側と一致しているか」 を device
     /// 粒度で diff するために使う。 [`Self::track_plugin_ids`] が track
-    /// 単位の plugin_id 集合だけを持つのに対し、 こちらは slot ごとの
-    /// 詳細 (どの slot にどの plugin string id) まで track する。
+    /// 単位の plugin_id 集合だけを持つのに対し、 こちらは device ごとの
+    /// 詳細 (どの index にどの plugin string id) まで track する。
     ///
     /// 更新タイミング: `SlotPluginLoaded` 受信時に insert、
     /// `SlotPluginUnloaded` 受信時に reverse-lookup retain、
-    /// 削除系編集の `_inner` 関数内で track / slot 単位で remove。
-    pub loaded_slots: std::collections::HashMap<(u32, PluginSlot), LoadedSlotInfo>,
+    /// 削除系編集の `_inner` 関数内で track / device index 単位で remove。
+    pub loaded_slots: std::collections::HashMap<(u32, u32), LoadedSlotInfo>,
     /// PR3.3 PDC: `plugin_id → reported latency samples`。 plugin_host から
     /// `ChildToMain::PluginLatencyChanged` を受信して更新、
     /// `SlotPluginUnloaded` で drop。 各 track の累積 latency は
@@ -1265,29 +1159,29 @@ pub struct AppData {
     /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
     /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
     /// it's a plain id set — the window FFI lives in the plugin-host process.
-    pub open_plugin_guis: std::collections::HashSet<(u32, PluginSlot)>,
+    pub open_plugin_guis: std::collections::HashSet<(u32, u32)>,
 
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,
 
     // -------- Plugin load tracking (A7 race-condition fix) -----------
-    /// `(track, slot)` pairs we've sent `SetSlotPlugin` for but haven't
-    /// yet received `SlotPluginLoaded` back. While non-empty, Play is
-    /// queued so the audio engine doesn't dispatch silent buffers for
+    /// `(track, device_index)` pairs we've sent `SetSlotPlugin` for but
+    /// haven't yet received `SlotPluginLoaded` back. While non-empty, Play
+    /// is queued so the audio engine doesn't dispatch silent buffers for
     /// tracks whose plugins are still being loaded.
-    pub pending_plugin_loads: std::collections::HashSet<(u32, PluginSlot)>,
+    pub pending_plugin_loads: std::collections::HashSet<(u32, u32)>,
     /// ユーザーが plugin picker で手動追加した plugin の集合。load 完了
     /// (`on_plugin_loaded_from_child`) で consume し、(1) daw_audio へ `LoadSong` を
     /// 再送して新 plugin を signal path に入れ、(2) GUI 自動 open を `gui_open_requests`
-    /// に queue する。`select_plugin_from_db` で (track_id, slot) を積む。
+    /// に queue する。`select_plugin_from_db` で (track_id, device_index) を積む。
     /// プロジェクト読込時の一斉復元では積まれない (= project-open 時の初回 LoadSong が
     /// 全 chain を渡すので per-plugin の再 sync は不要、 GUI も自動 open しない)。
-    pending_added_plugin_finalize: std::collections::HashSet<(u32, PluginSlot)>,
+    pending_added_plugin_finalize: std::collections::HashSet<(u32, u32)>,
     /// load 完了して「いま開く」段になった GUI auto-open 要求の queue。runner の
     /// frame loop が `drain_pending_gui_opens` で消費し `open_slot_gui` を呼ぶ。
     /// handle_event (IPC 受信) から直接 window を作らず frame loop へ 1 フレーム
     /// 遅延させる seam (headless test は frame loop を回さない → window を作らない)。
-    gui_open_requests: Vec<(u32, PluginSlot)>,
+    gui_open_requests: Vec<(u32, u32)>,
     /// `play()` was called while `pending_plugin_loads` was non-empty;
     /// re-fire it once the last `SlotPluginLoaded` arrives.
     pub pending_play: bool,
@@ -1541,10 +1435,7 @@ impl AppData {
         app_dirs: Option<common::app_dirs::AppDirs>,
     ) -> Self {
         let song = Song {
-            tracks: vec![Track {
-                name: "Track 1".into(),
-                ..Track::default()
-            }],
+            tracks: vec![track_with(|t| t.name = "Track 1".into())],
             ..Song::default()
         };
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
@@ -1985,83 +1876,47 @@ impl AppData {
     /// feeding a track its own output into a sidechain creates a
     /// feedback loop the schedule compiler catches with `GraphError::Cycle`.
     pub fn sidechain_entries(&self) -> Vec<SidechainEntry> {
-        // master bus は audio fx のみ。 各 master fx を sidechain entry として
-        // 返す (slot_kind=2 / track_id=MASTER_TRACK_ID)。 source 選択肢は通常
-        // track 同様 sidechain_source_choices が全 track を列挙する。
-        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            return self
-                .song
-                .master_fx_chain
-                .iter()
-                .enumerate()
-                .map(|(i, p)| SidechainEntry {
-                    track_id: common::model::MASTER_TRACK_ID,
-                    slot_kind: 2,
-                    slot_index: i as u32,
-                    plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
-                    current_source: p.sidechain_sources.first().copied().flatten(),
-                })
-                .collect();
-        }
-        let Some(track) = self
-            .cursor_track_index()
-            .and_then(|i| self.song.tracks.get(i))
-        else {
-            return Vec::new();
-        };
-        let mut entries: Vec<SidechainEntry> = Vec::new();
-        for (i, p) in track.midi_fx_chain.iter().enumerate() {
-            entries.push(SidechainEntry {
-                track_id: track.id,
-                slot_kind: 0,
-                slot_index: i as u32,
+        // 単一デバイスチェーン: master bus も通常 track も flat な device 列を
+        // `device_index` でアドレスする (役割は位置から導出するので保持しない)。
+        // master 選択時は track Vec ではなく Song.master_fx_chain を対象にする。
+        let (track_id, devices): (u32, &[common::model::PluginInstance]) =
+            if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+                (common::model::MASTER_TRACK_ID, &self.song.master_fx_chain)
+            } else {
+                let Some(track) = self
+                    .cursor_track_index()
+                    .and_then(|i| self.song.tracks.get(i))
+                else {
+                    return Vec::new();
+                };
+                (track.id, track.devices.as_slice())
+            };
+        let entries: Vec<SidechainEntry> = devices
+            .iter()
+            .enumerate()
+            .map(|(i, p)| SidechainEntry {
+                track_id,
+                device_index: i as u32,
                 plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
                 current_source: p.sidechain_sources.first().copied().flatten(),
-            });
-        }
-        if let Some(inst) = track.instrument.as_ref() {
-            entries.push(SidechainEntry {
-                track_id: track.id,
-                slot_kind: 1,
-                slot_index: 0,
-                plugin_name: resolve_plugin_name(&self.plugin_db, &inst.plugin_id),
-                current_source: inst.sidechain_sources.first().copied().flatten(),
-            });
-        }
-        for (i, p) in track.fx_chain.iter().enumerate() {
-            entries.push(SidechainEntry {
-                track_id: track.id,
-                slot_kind: 2,
-                slot_index: i as u32,
-                plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
-                current_source: p.sidechain_sources.first().copied().flatten(),
-            });
-        }
+            })
+            .collect();
         // PR4.5 diagnostic: if any chain plugin has a non-empty
         // sidechain_sources, log the resolved current_source values once
         // per inspector_chain rebuild. Helps catch UI ↔ model state
         // mismatches (= dropdown shows "—" but model has Some(id)).
-        let any_wired = entries.iter().any(|e| e.current_source.is_some())
-            || track
-                .midi_fx_chain
-                .iter()
-                .chain(track.fx_chain.iter())
-                .chain(track.instrument.as_ref())
-                .any(|p| !p.sidechain_sources.is_empty());
+        let any_wired = devices.iter().any(|p| !p.sidechain_sources.is_empty());
         if any_wired {
             // Dump raw model state alongside entries so we can see the
             // exact values UI is displaying. trace! to avoid frame-rate
             // spam at default log levels; enable with RUST_LOG=trace.
-            let raw: Vec<(u8, u32, String, Vec<Option<u32>>)> = track
-                .midi_fx_chain
+            let raw: Vec<(u32, String, Vec<Option<u32>>)> = devices
                 .iter()
                 .enumerate()
-                .map(|(i, p)| (0u8, i as u32, p.plugin_id.clone(), p.sidechain_sources.clone()))
-                .chain(track.instrument.as_ref().map(|p| (1u8, 0u32, p.plugin_id.clone(), p.sidechain_sources.clone())))
-                .chain(track.fx_chain.iter().enumerate().map(|(i, p)| (2u8, i as u32, p.plugin_id.clone(), p.sidechain_sources.clone())))
+                .map(|(i, p)| (i as u32, p.plugin_id.clone(), p.sidechain_sources.clone()))
                 .collect();
             tracing::trace!(
-                cursor_track_id = track.id,
+                cursor_track_id = track_id,
                 ?raw,
                 ?entries,
                 "sidechain_entries: rebuilt for cursor track"
@@ -2315,56 +2170,30 @@ impl AppData {
         }
     }
 
+    /// 単一デバイスチェーン (`docs/plan_linear_chain.md` §5): `Track.devices`
+    /// (master bus は `master_fx_chain`) を flat な行として返す。役割の判定は
+    /// せず、plugin 名のみを並べる (挙動は engine の port 直結で決まる)。
     pub fn inspector_chain(&self) -> Vec<ChainEntry> {
-        // master bus は audio fx のみ。 master_fx_chain を FX section として返す。
-        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            return self
-                .song
-                .master_fx_chain
-                .iter()
-                .enumerate()
-                .map(|(i, p)| ChainEntry {
-                    slot_kind: 2,
-                    slot_index: i as u32,
-                    section_label: "FX".into(),
-                    plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
-                })
-                .collect();
-        }
-        let Some(idx) = self.cursor_track_index() else {
-            return Vec::new();
-        };
-        let Some(track) = self.song.tracks.get(idx) else {
-            return Vec::new();
-        };
-        let mut chain: Vec<ChainEntry> = Vec::new();
-        // Reaper folder model: every track (group or not) can carry
-        // MIDI FX / instrument / audio FX, so show all rows uniformly.
-        for (i, p) in track.midi_fx_chain.iter().enumerate() {
-            chain.push(ChainEntry {
-                slot_kind: 0,
-                slot_index: i as u32,
-                section_label: "MIDI FX".into(),
+        let devices: &[common::model::PluginInstance] =
+            if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+                &self.song.master_fx_chain
+            } else {
+                let Some(idx) = self.cursor_track_index() else {
+                    return Vec::new();
+                };
+                let Some(track) = self.song.tracks.get(idx) else {
+                    return Vec::new();
+                };
+                track.devices.as_slice()
+            };
+        devices
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ChainEntry {
+                device_index: i as u32,
                 plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
-            });
-        }
-        if let Some(inst) = track.instrument.as_ref() {
-            chain.push(ChainEntry {
-                slot_kind: 1,
-                slot_index: 0,
-                section_label: "Instrument".into(),
-                plugin_name: resolve_plugin_name(&self.plugin_db, &inst.plugin_id),
-            });
-        }
-        for (i, p) in track.fx_chain.iter().enumerate() {
-            chain.push(ChainEntry {
-                slot_kind: 2,
-                slot_index: i as u32,
-                section_label: "FX".into(),
-                plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
-            });
-        }
-        chain
+            })
+            .collect()
     }
 
     /// v18 (`docs/plan_track_clip_color.md`): color_picker を開く。target と
@@ -2830,31 +2659,32 @@ impl AppData {
 
 /// 一部 variant は将来の機能 (rename UI / quantize / autosave / piano-roll
 /// shortcut 等) で使う予定なので、現時点で未参照でも残す。新規 variant 追加時に
-/// `loaded_slots` の値: 1 つの (track, slot) ペアに対する load 情報。
+/// `loaded_slots` の値: 1 つの (track, device_index) ペアに対する load 情報。
 #[derive(Debug, Clone)]
 pub struct LoadedSlotInfo {
     /// session-unique numeric plugin id (= plugin_host が割り当てる u32)。
     pub plugin_id: u32,
     /// stable string id (= `PluginInstance::plugin_id` と同じ値)。
-    /// reconcile の slot-level diff で「Song と host で同じ plugin が
+    /// reconcile の device-level diff で「Song と host で同じ plugin が
     /// 居るか」 を判定するキー。
     pub plugin_id_str: String,
 }
 
 /// `reconcile_plugins_with_song` の Phase B が計算する action。
 /// IPC dispatch から独立した純粋データ型にすることで unit test しやすく
-/// する (4dc982c で導入した slot-level diff の regression 防止)。
+/// する (4dc982c で導入した device-level diff の regression 防止)。
+/// 単一デバイスチェーン化で slot enum を捨て flat な `index: u32` でアドレス。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SlotReconcileAction {
-    /// host にあるが Song に無い slot を host から消す
+    /// host にあるが Song に無い device を host から消す
     /// (= `MainToChild::RemoveSlotPlugin` 相当)。
-    RemoveSlot { track_id: u32, slot: PluginSlot },
-    /// Song にあるが host に無い、 もしくは plugin_id_str が違う slot を
+    RemoveSlot { track_id: u32, index: u32 },
+    /// Song にあるが host に無い、 もしくは plugin_id_str が違う device を
     /// (再) load する (= `MainToChild::SetSlotPlugin` 相当)。 caller が
     /// `plugin_db` から format / path を解決して IPC を組み立てる。
     LoadSlot {
         track_id: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id_str: String,
         initial_state: Option<Vec<u8>>,
     },
@@ -2863,114 +2693,63 @@ pub enum SlotReconcileAction {
 /// Phase B 純粋関数化。 song と現在の loaded_slots cache を見て、 host
 /// と Song を揃えるための action 列を返す。 副作用なし (IPC は呼ばない、
 /// AppData にも触らない)。
+///
+/// 単一デバイスチェーン: 通常 track は `Track.devices`、 master bus は
+/// `master_fx_chain` を flat な `index: u32` 空間で diff する (役割別 3 chain
+/// 区分は撤廃、 load 順は Vec 順 = 音の処理順)。
 pub fn compute_slot_reconcile_actions(
     song: &common::model::Song,
-    loaded_slots: &HashMap<(u32, PluginSlot), LoadedSlotInfo>,
+    loaded_slots: &HashMap<(u32, u32), LoadedSlotInfo>,
 ) -> Vec<SlotReconcileAction> {
     let mut actions = Vec::new();
+
+    // 1 chain 分の reconcile。 track / master を同じロジックで処理する。
+    let mut reconcile_chain =
+        |track_id: u32, devices: &[common::model::PluginInstance]| {
+            let song_index_set: std::collections::HashSet<u32> =
+                (0..devices.len() as u32).collect();
+
+            // (1) host にあるが Song に無い index → RemoveSlot
+            // 順序を安定にするため index を sort してから push する (= test の
+            // assertion が決定的になる)。 production の挙動は HashMap iter
+            // 順依存だが、 RemoveSlot 同士は独立操作なので順序は無関係。
+            let mut host_extra: Vec<u32> = loaded_slots
+                .iter()
+                .filter(|((tid, _), _)| *tid == track_id)
+                .map(|((_, idx), _)| *idx)
+                .filter(|idx| !song_index_set.contains(idx))
+                .collect();
+            host_extra.sort_unstable();
+            for index in host_extra {
+                actions.push(SlotReconcileAction::RemoveSlot { track_id, index });
+            }
+
+            // (2) Song にあるが host に無い、 もしくは plugin_id_str が違う index → LoadSlot
+            for (i, inst) in devices.iter().enumerate() {
+                let index = i as u32;
+                let need_load = match loaded_slots.get(&(track_id, index)) {
+                    None => true,
+                    Some(info) => info.plugin_id_str != inst.plugin_id,
+                };
+                if !need_load {
+                    continue;
+                }
+                actions.push(SlotReconcileAction::LoadSlot {
+                    track_id,
+                    index,
+                    plugin_id_str: inst.plugin_id.clone(),
+                    initial_state: inst.state.clone(),
+                });
+            }
+        };
+
     for track in &song.tracks {
-        let track_id = track.id;
-
-        // Song 側 (slot, &PluginInstance) 列を midi_fx → instrument →
-        // fx の順で組み立て。 `reconcile_plugins_with_song` の従来動作と
-        // 同じ順序を維持する (= load 順が音にも影響するため変えない)。
-        let mut song_slots: Vec<(PluginSlot, &common::model::PluginInstance)> = Vec::new();
-        for (i, p) in track.midi_fx_chain.iter().enumerate() {
-            song_slots.push((PluginSlot::MidiFx(i as u32), p));
-        }
-        if let Some(inst) = track.instrument.as_ref() {
-            song_slots.push((PluginSlot::Instrument, inst));
-        }
-        for (i, p) in track.fx_chain.iter().enumerate() {
-            song_slots.push((PluginSlot::Fx(i as u32), p));
-        }
-        let song_slot_set: std::collections::HashSet<PluginSlot> =
-            song_slots.iter().map(|(s, _)| *s).collect();
-
-        // (1) host にあるが Song に無い slot → RemoveSlot
-        // 順序を安定にするため slot を sort してから push する (= test の
-        // assertion が決定的になる)。 production の挙動は HashMap iter
-        // 順依存だが、 RemoveSlot 同士は独立操作なので順序は無関係。
-        let mut host_extra_slots: Vec<PluginSlot> = loaded_slots
-            .iter()
-            .filter(|((tid, _), _)| *tid == track_id)
-            .map(|((_, s), _)| *s)
-            .filter(|s| !song_slot_set.contains(s))
-            .collect();
-        host_extra_slots.sort_by_key(|s| slot_sort_key(*s));
-        for slot in host_extra_slots {
-            actions.push(SlotReconcileAction::RemoveSlot { track_id, slot });
-        }
-
-        // (2) Song にあるが host に無い、 もしくは plugin_id_str が違う slot → LoadSlot
-        for (slot, inst) in song_slots {
-            let need_load = match loaded_slots.get(&(track_id, slot)) {
-                None => true,
-                Some(info) => info.plugin_id_str != inst.plugin_id,
-            };
-            if !need_load {
-                continue;
-            }
-            actions.push(SlotReconcileAction::LoadSlot {
-                track_id,
-                slot,
-                plugin_id_str: inst.plugin_id.clone(),
-                initial_state: inst.state.clone(),
-            });
-        }
+        reconcile_chain(track.id, &track.devices);
     }
+    // master bus fx chain (= 音源境界なしの全 audio FX)。
+    reconcile_chain(common::model::MASTER_TRACK_ID, &song.master_fx_chain);
 
-    // master bus fx chain。 通常 track と同じ reconcile を `track_id ==
-    // MASTER_TRACK_ID` / `PluginSlot::Fx(i)` keying で行う。 master は audio fx
-    // のみ持つので midi_fx / instrument 分岐は無い。
-    {
-        let track_id = common::model::MASTER_TRACK_ID;
-        let mut song_slots: Vec<(PluginSlot, &common::model::PluginInstance)> = Vec::new();
-        for (i, p) in song.master_fx_chain.iter().enumerate() {
-            song_slots.push((PluginSlot::Fx(i as u32), p));
-        }
-        let song_slot_set: std::collections::HashSet<PluginSlot> =
-            song_slots.iter().map(|(s, _)| *s).collect();
-
-        let mut host_extra_slots: Vec<PluginSlot> = loaded_slots
-            .iter()
-            .filter(|((tid, _), _)| *tid == track_id)
-            .map(|((_, s), _)| *s)
-            .filter(|s| !song_slot_set.contains(s))
-            .collect();
-        host_extra_slots.sort_by_key(|s| slot_sort_key(*s));
-        for slot in host_extra_slots {
-            actions.push(SlotReconcileAction::RemoveSlot { track_id, slot });
-        }
-
-        for (slot, inst) in song_slots {
-            let need_load = match loaded_slots.get(&(track_id, slot)) {
-                None => true,
-                Some(info) => info.plugin_id_str != inst.plugin_id,
-            };
-            if !need_load {
-                continue;
-            }
-            actions.push(SlotReconcileAction::LoadSlot {
-                track_id,
-                slot,
-                plugin_id_str: inst.plugin_id.clone(),
-                initial_state: inst.state.clone(),
-            });
-        }
-    }
     actions
-}
-
-/// `PluginSlot` を安定に sort するためのキー。 RemoveSlot 列の順序を
-/// 決定的にする (test 用)。 production 動作には影響しない (= RemoveSlot
-/// 同士は独立)。
-fn slot_sort_key(slot: PluginSlot) -> (u8, u32) {
-    match slot {
-        PluginSlot::MidiFx(i) => (0, i),
-        PluginSlot::Instrument => (1, 0),
-        PluginSlot::Fx(i) => (2, i),
-    }
 }
 
 /// `RequestAllStates` の発行理由。 plugin_host から `AllPluginStates`
@@ -3008,16 +2787,9 @@ pub enum PendingStateRequest {
 pub enum DeferredEdit {
     DeleteTrack { track_id: u32 },
     UngroupTracks { track_ids: Vec<u32> },
-    RemoveSlot { track_id: u32, slot: PluginSlot },
-    /// FIXME #29: 既存 dual-role 音源 (例 Scaler 2) を **破棄せず生成器列へ降格** して
-    /// から新音源 (例 Analog Lab V) を Instrument に入れる。 降格 plugin の最新 knob を
-    /// 保つため、 他の deferred edit と同じく RequestAllStates 完了後 (= state を Song に
-    /// 書き戻した後) に実行される。 host/audio の slot 鍵は reconcile が貼り替える。
-    ReplaceInstrumentDemoting {
-        track_id: u32,
-        new_plugin_id: String,
-        new_format: PluginFormat,
-    },
+    /// 単一デバイスチェーン: `Track.devices` / `master_fx_chain` の指定 index の
+    /// device を `Vec::remove` する (役割別 slot 区分は撤廃)。
+    RemoveDevice { track_id: u32, index: u32 },
 }
 
 /// 口パク (lip-sync) 背景ジョブの 1 vocal clip 分の結果。`query_phonemes` の
@@ -3475,7 +3247,7 @@ pub enum AppEvent {
     /// 経由で送られるたびに上書き。
     PluginParamListFromChild {
         track: u32,
-        slot: common::protocol::PluginSlot,
+        index: u32,
         plugin_id: u32,
         params: Vec<common::protocol::PluginParamInfo>,
     },
@@ -3483,7 +3255,7 @@ pub enum AppEvent {
     /// beginEdit)。 last_touched_param を plugin param で更新する。
     PluginParamTouchedFromChild {
         track: u32,
-        slot: common::protocol::PluginSlot,
+        index: u32,
         param_id: u32,
         display_name: String,
     },
@@ -3492,7 +3264,7 @@ pub enum AppEvent {
     /// mode の point 生成 source。
     PluginParamValueChangedFromChild {
         track: u32,
-        slot: common::protocol::PluginSlot,
+        index: u32,
         param_id: u32,
         value: f64,
     },
@@ -3502,7 +3274,7 @@ pub enum AppEvent {
     /// 停止 + audio bypass 解除)。
     PluginParamGestureEndFromChild {
         track: u32,
-        slot: common::protocol::PluginSlot,
+        index: u32,
         param_id: u32,
     },
     /// 子プロセス (daw_audio / daw_plugin_host) が exit したことを
@@ -3726,33 +3498,34 @@ pub enum AppEvent {
     /// load_overlay に「プラグイン走査中 done/total」を出す。
     RescanProgress { done: usize, total: usize },
 
-    ToggleSlotGui { slot_kind: u8, slot_index: u32 },
-    RemoveSlot { slot_kind: u8, slot_index: u32 },
+    /// 単一デバイスチェーン: `device_index` でアドレスする (役割別 slot 区分撤廃)。
+    ToggleSlotGui { index: u32 },
+    /// inspector の x ボタン: 指定 `device_index` の device を chain から削除。
+    RemoveDevice { index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
-    /// aux input port. `track_id` + (slot_kind, slot_index) identifies
-    /// the plugin instance; `port` selects the aux input port on that
-    /// plugin (0 = first sidechain bus); `source` is `Some(track_id)`
-    /// to wire from a track, or `None` to disconnect.
+    /// aux input port. `track_id` + `device_index` identifies the plugin
+    /// instance; `port` selects the aux input port on that plugin
+    /// (0 = first sidechain bus); `source` is `Some(track_id)` to wire
+    /// from a track, or `None` to disconnect.
     SetSidechainSource {
         track_id: u32,
-        slot_kind: u8,
-        slot_index: u32,
+        device_index: u32,
         port: u8,
         source: Option<u32>,
     },
-    /// inspector chain (MIDI FX → Instrument → FX を一列にした list) の reorder。
-    /// `order` は新順での旧 chain index 列。section 跨ぎ (slot_kind が変わる移動)
-    /// は handler 側で拒否する。
+    /// inspector chain (= `Track.devices` / `master_fx_chain` を一列にした list)
+    /// の reorder。`order` は gui_01 契約 `new[i] = items[order[i]]`。単一デバイス
+    /// チェーン化で **棄却なしの純 permutation** (役割は位置から再導出)。
     ReorderInspectorChain(Vec<usize>),
     SetMasterGain(f32),
 
     // -------- IPC events from plugin_host ---------------------------------
     Tick { samples: u64, peak_l: f32, peak_r: f32, preroll: u64 },
-    GuiOpenedFromChild { track: u32, slot: PluginSlot, width: u32, height: u32 },
-    GuiClosedFromChild { track: u32, slot: PluginSlot },
+    GuiOpenedFromChild { track: u32, index: u32, width: u32, height: u32 },
+    GuiClosedFromChild { track: u32, index: u32 },
     SlotPluginLoadedFromChild {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         id: String,
         name: String,
         /// plugin_host が割り振った session-unique な plugin instance id。
@@ -3783,7 +3556,7 @@ pub enum AppEvent {
     /// エラー表示、 `pending_play` が立っていれば flush する。
     SlotPluginLoadFailedFromChild {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id: String,
         reason: String,
     },
@@ -4739,15 +4512,15 @@ impl AppData {
             }
             AppEvent::PluginParamListFromChild {
                 track,
-                slot,
+                index,
                 plugin_id: _,
                 params,
             } => {
-                self.plugin_params.insert((track, slot), params);
+                self.plugin_params.insert((track, index), params);
             }
             AppEvent::PluginParamTouchedFromChild {
                 track,
-                slot,
+                index,
                 param_id,
                 display_name,
             } => {
@@ -4757,11 +4530,15 @@ impl AppData {
                 // がなければ host から送られてきた placeholder をそのまま。
                 let resolved_name = self
                     .plugin_params
-                    .get(&(track, slot))
+                    .get(&(track, index))
                     .and_then(|params| params.iter().find(|p| p.id == param_id))
                     .map(|info| info.name.clone())
                     .unwrap_or(display_name);
-                let target = common::model::AutomationTarget::PluginParam { slot, param_id };
+                let target = common::model::AutomationTarget::PluginParam {
+                    device_index: index,
+                    param_id,
+                    legacy_slot: None,
+                };
                 // Phase 4 Step C-3: ParamGestureBegin として同経路で active /
                 // latched に反映する (= mixer knob と同 idiom、 audio thread
                 // 側 bypass も統一)。 last_touched_param は handler 内で更新。
@@ -4773,29 +4550,34 @@ impl AppData {
             }
             AppEvent::PluginParamValueChangedFromChild {
                 track,
-                slot,
+                index,
                 param_id,
                 value,
             } => {
-                // Phase 4 Step C-3: plugin GUI knob の最新値を per-(track, slot,
-                // param_id) cache に保存。 `current_plain_value(PluginParam)`
-                // が record tick でこの値を read して point を生成する。
+                // Phase 4 Step C-3: plugin GUI knob の最新値を per-(track,
+                // device_index, param_id) cache に保存。
+                // `current_plain_value(PluginParam)` が record tick でこの値を
+                // read して point を生成する。
                 self.plugin_param_values
-                    .insert((track, slot, param_id), value);
+                    .insert((track, index, param_id), value);
             }
             AppEvent::ChildDisconnected { kind } => {
                 self.handle_child_disconnected(kind);
             }
             AppEvent::PluginParamGestureEndFromChild {
                 track,
-                slot,
+                index,
                 param_id,
             } => {
                 // Phase 4 Step C-3: plugin GUI knob release。 mixer の
                 // ParamGestureEnd と同経路に流す (= active_param_gestures
                 // から remove + sync_recording_lanes_with_audio で bypass
                 // 解除)。
-                let target = common::model::AutomationTarget::PluginParam { slot, param_id };
+                let target = common::model::AutomationTarget::PluginParam {
+                    device_index: index,
+                    param_id,
+                    legacy_slot: None,
+                };
                 self.handle_event(AppEvent::ParamGestureEnd {
                     track_id: track,
                     target,
@@ -5057,20 +4839,19 @@ impl AppData {
             AppEvent::SelectPluginFromDb { id, keep_open, open_gui } => {
                 self.select_plugin_from_db(id, keep_open, open_gui);
             }
-            AppEvent::ToggleSlotGui { slot_kind, slot_index } => {
-                self.toggle_slot_gui(slot_kind, slot_index);
+            AppEvent::ToggleSlotGui { index } => {
+                self.toggle_slot_gui(index);
             }
-            AppEvent::RemoveSlot { slot_kind, slot_index } => {
-                self.remove_slot(slot_kind, slot_index);
+            AppEvent::RemoveDevice { index } => {
+                self.remove_device(index);
             }
             AppEvent::SetSidechainSource {
                 track_id,
-                slot_kind,
-                slot_index,
+                device_index,
                 port,
                 source,
             } => {
-                self.set_sidechain_source(track_id, slot_kind, slot_index, port, source);
+                self.set_sidechain_source(track_id, device_index, port, source);
             }
             AppEvent::ReorderInspectorChain(order) => {
                 self.reorder_inspector_chain(&order);
@@ -5090,25 +4871,25 @@ impl AppData {
                 let _ = preroll;  // 上で消費
                 self.on_tick(samples, peak_l, peak_r);
             }
-            AppEvent::GuiOpenedFromChild { track, slot, width, height } => {
-                self.on_gui_opened(track, slot, width, height);
+            AppEvent::GuiOpenedFromChild { track, index, width, height } => {
+                self.on_gui_opened(track, index, width, height);
             }
-            AppEvent::GuiClosedFromChild { track, slot } => {
-                self.on_gui_closed(track, slot);
+            AppEvent::GuiClosedFromChild { track, index } => {
+                self.on_gui_closed(track, index);
             }
-            AppEvent::SlotPluginLoadedFromChild { track, slot, id, name, plugin_id, shmem_id, state_load_error } => {
-                self.on_plugin_loaded_from_child(track, slot, id, name, plugin_id, shmem_id, state_load_error);
+            AppEvent::SlotPluginLoadedFromChild { track, index, id, name, plugin_id, shmem_id, state_load_error } => {
+                self.on_plugin_loaded_from_child(track, index, id, name, plugin_id, shmem_id, state_load_error);
             }
             AppEvent::SlotPluginUnloadedFromChild { plugin_id } => {
                 self.on_plugin_unloaded_from_child(plugin_id);
             }
             AppEvent::SlotPluginLoadFailedFromChild {
                 track,
-                slot,
+                index,
                 plugin_id,
                 reason,
             } => {
-                self.on_plugin_load_failed_from_child(track, slot, plugin_id, reason);
+                self.on_plugin_load_failed_from_child(track, index, plugin_id, reason);
             }
             AppEvent::PluginLatencyChangedFromChild { plugin_id, samples } => {
                 self.on_plugin_latency_changed(plugin_id, samples);
@@ -5708,6 +5489,13 @@ impl AppData {
         if self.is_dragging {
             return;
         }
+        // v23 (review fix #4/#5/#6): daw_audio は各 device の役割を `ports` から
+        // 位置導出する。旧 v22 project は load 直後 ports が default(全 false) で、
+        // LoadSong 前に DB から解決しておかないと全 device が Inactive になり
+        // 楽器が無音 / group FX が bypass される。picker 追加や SlotPluginLoaded で
+        // 既に解決済みの device は ports != default なので skip され、steady state
+        // では bool 比較だけで安い。この単一 chokepoint で全 load 経路を保護する。
+        self.resolve_default_device_ports();
         // PR6: project_dir も送る (audio engine は AudioSourcePath::
         // ProjectRelative を解決するために必要、 §9.2)。 send_audio は
         // 順序保証付きの IPC なので SetProjectDir → LoadSong の順で
@@ -5729,9 +5517,36 @@ impl AppData {
         self.mark_lipsync_dirty();
     }
 
+    /// v23 (review fix): `ports` が default (全 false) の device を plugin DB
+    /// から解決する。旧 project load 直後の device は ports を持たないため、
+    /// LoadSong 前にこれを呼ばないと daw_audio の役割導出が全 Inactive になり
+    /// 無音になる。既に解決済み (= いずれかの port が true) の device は触らない
+    /// (= picker 追加 / SlotPluginLoaded backfill 済みは no-op、DB 不在も保持)。
+    fn resolve_default_device_ports(&mut self) {
+        let Some(db) = self.plugin_db.clone() else {
+            return;
+        };
+        let default_ports = common::port_config::PortConfig::default();
+        let resolve = |devices: &mut [common::model::PluginInstance]| {
+            for d in devices.iter_mut() {
+                if d.ports == default_ports
+                    && let Some(entry) = db.find_by_id(&d.plugin_id)
+                {
+                    d.ports = port_config_of(entry);
+                }
+            }
+        };
+        for track in self.song.tracks.iter_mut() {
+            resolve(&mut track.devices);
+        }
+        resolve(&mut self.song.master_fx_chain);
+    }
+
     // -------- File ----------------------------------------------------------
 
     fn action_new(&mut self) {
+        // 別プロジェクト (空) に切り替えるので現プロジェクトの plugin / editor を破棄。
+        self.teardown_all_loaded_plugins();
         let mut song = Song::default();
         Self::migrate_legacy_vocal_tracks(&mut song);
         self.song = song;
@@ -5922,6 +5737,11 @@ impl AppData {
                 tracing::info!(path = %path.display(), "loaded project");
                 song.ensure_ids();
                 Self::migrate_legacy_vocal_tracks(&mut song);
+                // 別プロジェクトを開くので、現プロジェクトの plugin と
+                // **開いている editor window** を先に全て破棄する。単一チェーン移行で
+                // project 切替時の teardown が漏れ、前プロジェクトの editor 窓が残って
+                // いた回帰の修正 (load 成功後・新 plugin load 前に実行)。
+                self.teardown_all_loaded_plugins();
                 self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path.clone());
@@ -6288,21 +6108,21 @@ impl AppData {
         let actions = compute_slot_reconcile_actions(&self.song, &self.loaded_slots);
         for action in actions {
             match action {
-                SlotReconcileAction::RemoveSlot { track_id, slot } => {
-                    tracing::info!(track_id, ?slot, "reconcile: removing extra host slot");
+                SlotReconcileAction::RemoveSlot { track_id, index } => {
+                    tracing::info!(track_id, index, "reconcile: removing extra host device");
                     // FIXME #31: close the editor before removing (see
-                    // remove_slot_inner for the ordering rationale).
-                    self.cleanup_slot_gui(track_id, slot);
+                    // remove_device_inner for the ordering rationale).
+                    self.cleanup_slot_gui(track_id, index);
                     self.send_plugin(MainToChild::RemoveSlotPlugin {
                         track: track_id,
-                        slot,
+                        index,
                     });
-                    self.loaded_slots.remove(&(track_id, slot));
-                    self.pending_plugin_loads.remove(&(track_id, slot));
+                    self.loaded_slots.remove(&(track_id, index));
+                    self.pending_plugin_loads.remove(&(track_id, index));
                 }
                 SlotReconcileAction::LoadSlot {
                     track_id,
-                    slot,
+                    index,
                     plugin_id_str,
                     initial_state,
                 } => {
@@ -6310,21 +6130,21 @@ impl AppData {
                         tracing::error!(
                             id = %plugin_id_str,
                             track = track_id,
-                            ?slot,
+                            index,
                             "reconcile: plugin id not in database"
                         );
                         continue;
                     };
                     tracing::info!(
                         track_id,
-                        ?slot,
+                        index,
                         plugin_id = %plugin_id_str,
-                        "reconcile: loading slot from song"
+                        "reconcile: loading device from song"
                     );
-                    self.track_pending_load(track_id, slot);
+                    self.track_pending_load(track_id, index);
                     self.send_plugin(MainToChild::SetSlotPlugin {
                         track: track_id,
-                        slot,
+                        index,
                         format: entry.format,
                         path: entry.path.clone(),
                         plugin_id: entry.id.clone(),
@@ -6346,19 +6166,34 @@ impl AppData {
     /// 済 or 手動で plugin を入れた) は touch しない。 idempotent。
     fn migrate_legacy_vocal_tracks(song: &mut Song) {
         for track in &mut song.tracks {
+            // 単一デバイスチェーン: 旧 `instrument.is_none()` は「チェーンに音源
+            // が無い」と等価。音源 = MIDI から audio を生む device (note_in +
+            // audio_out) を 1 つも持たないなら legacy vocal とみなす (役割判定はせず
+            // port を直接見る)。
+            let has_sound_source = track
+                .devices
+                .iter()
+                .any(|p| p.ports.has_note_input && p.ports.has_audio_output);
             let is_legacy_vocal = matches!(
                 track.source,
                 common::model::InstrumentSource::Vocal { .. }
-            ) && track.instrument.is_none();
+            ) && !has_sound_source;
             if !is_legacy_vocal {
                 continue;
             }
-            track.instrument = Some(common::model::PluginInstance {
-                plugin_id: common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
-                format: PluginFormat::Builtin,
-                state: None,
-                sidechain_sources: Vec::new(),
-            });
+            // builtin VOICEVOX は純粋音源 (note_in + audio_out)。チェーン末尾に
+            // 追加する (位置で音源として導出される)。
+            track.devices.push(common::model::PluginInstance::with_ports(
+                common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
+                PluginFormat::Builtin,
+                common::port_config::PortConfig {
+                    has_note_input: true,
+                    has_note_output: false,
+                    has_audio_output: true,
+                    // 音源 (audio を生成、加工はしない) なので audio 入力なし。
+                    has_audio_input: false,
+                },
+            ));
             tracing::info!(
                 track_id = track.id,
                 track_name = %track.name,
@@ -6367,39 +6202,58 @@ impl AppData {
         }
     }
 
+    /// 現在 host に load されている全 track の plugin を破棄する (project 切替時)。
+    /// reconcile Phase A と同じ IPC 順 (audio へ `ClosePluginShmem` 先送り →
+    /// plugin_host へ `RemoveTrack`) を全 loaded track に適用する。`RemoveTrack` は
+    /// plugin_host 側でそのトラックの chain と **editor window** (`editor_windows`)
+    /// を破棄するので、開いていた plugin editor 窓も閉じる。master fx も
+    /// `MASTER_TRACK_ID` の RemoveTrack で同様に片付く。最後に GUI 側 cache を全消去。
+    fn teardown_all_loaded_plugins(&mut self) {
+        let track_ids: std::collections::HashSet<u32> =
+            self.loaded_slots.keys().map(|(t, _)| *t).collect();
+        for track_id in track_ids {
+            if let Some(plugin_ids) = self.track_plugin_ids.remove(&track_id) {
+                for pid in plugin_ids {
+                    self.send_audio(MainToChild::ClosePluginShmem { plugin_id: pid });
+                }
+            }
+            self.send_plugin(MainToChild::RemoveTrack { track: track_id });
+        }
+        self.loaded_slots.clear();
+        self.open_plugin_guis.clear();
+        self.plugin_params.clear();
+        self.pending_plugin_loads.clear();
+        self.pending_added_plugin_finalize.clear();
+    }
+
     fn restore_plugin_from_song(&mut self, song: &Song) {
         let Some(db) = self.plugin_db.clone() else {
             tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
         };
         // PR2.1: send `Track::id` (not Vec position) so the plugin host
-        // keys its chains by id from the start.
-        let mut to_send: Vec<(u32, PluginSlot, common::model::PluginInstance)> = Vec::new();
+        // keys its chains by id from the start. 単一デバイスチェーン:
+        // `Track.devices` / `master_fx_chain` を flat な device index で送る。
+        let mut to_send: Vec<(u32, u32, common::model::PluginInstance)> = Vec::new();
         for track in song.tracks.iter() {
             let t = track.id;
-            for (i, p) in track.midi_fx_chain.iter().enumerate() {
-                to_send.push((t, PluginSlot::MidiFx(i as u32), p.clone()));
-            }
-            if let Some(inst) = track.instrument.as_ref() {
-                to_send.push((t, PluginSlot::Instrument, inst.clone()));
-            }
-            for (i, p) in track.fx_chain.iter().enumerate() {
-                to_send.push((t, PluginSlot::Fx(i as u32), p.clone()));
+            for (i, p) in track.devices.iter().enumerate() {
+                to_send.push((t, i as u32, p.clone()));
             }
         }
-        // master bus fx chain も `(MASTER_TRACK_ID, Fx(i))` で送る。
+        // master bus fx chain も `(MASTER_TRACK_ID, index)` で送る。
         for (i, p) in song.master_fx_chain.iter().enumerate() {
-            to_send.push((common::model::MASTER_TRACK_ID, PluginSlot::Fx(i as u32), p.clone()));
+            to_send.push((common::model::MASTER_TRACK_ID, i as u32, p.clone()));
         }
-        for (track, slot, inst) in to_send {
+        for (track, index, inst) in to_send {
             let Some(entry) = db.find_by_id(&inst.plugin_id) else {
-                tracing::error!(id = %inst.plugin_id, track, ?slot, "plugin id not in database");
+                tracing::error!(id = %inst.plugin_id, track, index, "plugin id not in database");
                 continue;
             };
-            self.track_pending_load(track, slot);
+            self.track_pending_load(track, index);
             self.send_plugin(MainToChild::SetSlotPlugin {
                 track,
-                slot,
+                index,
                 format: entry.format,
                 path: entry.path.clone(),
                 plugin_id: entry.id.clone(),
@@ -6518,9 +6372,7 @@ impl AppData {
     /// dispatcher は plugin なしを早期判定して即時実行に切り替える。
     fn song_has_plugin(&self) -> bool {
         !self.song.master_fx_chain.is_empty()
-            || self.song.tracks.iter().any(|t| {
-                t.instrument.is_some() || !t.fx_chain.is_empty() || !t.midi_fx_chain.is_empty()
-            })
+            || self.song.tracks.iter().any(|t| !t.devices.is_empty())
     }
 
     /// `AllPluginStates` で受け取った各 plugin の state を `Song` の
@@ -6543,42 +6395,28 @@ impl AppData {
             if s.error.is_some() {
                 tracing::warn!(
                     track = s.track,
-                    ?s.slot,
+                    index = s.index,
                     error = s.error.as_deref(),
                     "apply_plugin_states: state save errored, preserving previous state",
                 );
                 continue;
             }
-            // master bus は track ではなく Song.master_fx_chain に書き戻す
-            // (audio fx のみなので Fx slot だけ扱う)。
-            if s.track == common::model::MASTER_TRACK_ID {
-                if let PluginSlot::Fx(i) = s.slot
-                    && let Some(p) = song.master_fx_chain.get_mut(i as usize)
-                {
-                    p.state = s.data.clone();
-                }
-                continue;
-            }
-            let Some(track) = song.tracks.iter_mut().find(|t| t.id == s.track) else {
-                tracing::warn!(track = s.track, ?s.slot, "apply_plugin_states: track id not found");
+            // 単一デバイスチェーン: master は `master_fx_chain`、 通常 track は
+            // `devices` に flat な device index で書き戻す。
+            let chain = if s.track == common::model::MASTER_TRACK_ID {
+                Some(&mut song.master_fx_chain)
+            } else {
+                song.tracks
+                    .iter_mut()
+                    .find(|t| t.id == s.track)
+                    .map(|t| &mut t.devices)
+            };
+            let Some(chain) = chain else {
+                tracing::warn!(track = s.track, index = s.index, "apply_plugin_states: track id not found");
                 continue;
             };
-            match s.slot {
-                PluginSlot::Instrument => {
-                    if let Some(inst) = track.instrument.as_mut() {
-                        inst.state = s.data.clone();
-                    }
-                }
-                PluginSlot::Fx(i) => {
-                    if let Some(p) = track.fx_chain.get_mut(i as usize) {
-                        p.state = s.data.clone();
-                    }
-                }
-                PluginSlot::MidiFx(i) => {
-                    if let Some(p) = track.midi_fx_chain.get_mut(i as usize) {
-                        p.state = s.data.clone();
-                    }
-                }
+            if let Some(p) = chain.get_mut(s.index as usize) {
+                p.state = s.data.clone();
             }
         }
     }
@@ -6830,19 +6668,19 @@ impl AppData {
         self.is_playing = true;
     }
 
-    /// A7: register a `(track, slot)` we just sent `SetSlotPlugin` for,
-    /// and — if playback is currently running — pause it until the last
-    /// `SlotPluginLoaded` arrives. Without the pause, plugins loaded
+    /// A7: register a `(track, device_index)` we just sent `SetSlotPlugin`
+    /// for, and — if playback is currently running — pause it until the
+    /// last `SlotPluginLoaded` arrives. Without the pause, plugins loaded
     /// while playing render silent until the audio engine's
     /// `OpenPluginShmem` register catches up (typically several buffers
     /// or a loop wrap behind).
-    fn track_pending_load(&mut self, track: u32, slot: PluginSlot) {
+    fn track_pending_load(&mut self, track: u32, index: u32) {
         if self.pending_plugin_loads.is_empty() && self.is_playing {
             self.send_audio(MainToChild::Stop);
             self.is_playing = false;
             self.pending_play = true;
         }
-        self.pending_plugin_loads.insert((track, slot));
+        self.pending_plugin_loads.insert((track, index));
         if self.pending_play {
             self.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
@@ -7313,11 +7151,10 @@ impl AppData {
     fn ensure_first_track(&mut self) {
         if self.song.tracks.is_empty() {
             let id = self.song.alloc_track_id();
-            self.song.tracks.push(Track {
-                id,
-                name: "Track 1".into(),
-                ..Track::default()
-            });
+            self.song.tracks.push(track_with(|t| {
+                t.id = id;
+                t.name = "Track 1".into();
+            }));
             self.resize_track_peak_display();
         }
     }
@@ -7344,19 +7181,18 @@ impl AppData {
             if !matches!(track.source, common::model::InstrumentSource::Vocal { .. }) {
                 continue;
             }
-            // builtin VOICEVOX を instrument に持っているか?
-            let Some(inst) = track.instrument.as_ref() else {
+            // 単一デバイスチェーン: builtin VOICEVOX を chain 内に持つ device の
+            // index を探す (役割別 instrument slot は撤廃、 device index で引く)。
+            let Some(device_index) = track.devices.iter().position(|d| {
+                d.format == PluginFormat::Builtin
+                    && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
+            }) else {
                 continue;
             };
-            if inst.format != PluginFormat::Builtin
-                || inst.plugin_id != common::plugin_db::BUILTIN_ID_VOICEVOX
-            {
-                continue;
-            }
             // plugin_id (= u32 host-side id) を loaded_slots から引く。
             let Some(slot_info) = self
                 .loaded_slots
-                .get(&(track.id, PluginSlot::Instrument))
+                .get(&(track.id, device_index as u32))
             else {
                 continue;
             };
@@ -7626,13 +7462,12 @@ impl AppData {
     fn action_add_instrument_track(&mut self) {
         let id = self.song.alloc_track_id();
         let index = self.song.tracks.len() + 1;
-        let track = Track {
-            id,
-            name: format!("Track {index}"),
-            source: InstrumentSource::None,
-            clips: Vec::new(),
-            ..Track::default()
-        };
+        let track = track_with(|t| {
+            t.id = id;
+            t.name = format!("Track {index}");
+            t.source = InstrumentSource::None;
+            t.clips = Vec::new();
+        });
         // FIXME #30: 挿入位置は「選択中で最下段の track の直後」 (純ロジックは
         // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
         let insert_at = add_track_insert_index(&self.song.tracks, &self.selected_track_ids);
@@ -9591,18 +9426,17 @@ impl AppData {
         };
         let group_id = self.song.alloc_track_id();
         let group_index = self.song.tracks.len() + 1;
-        let group_track = Track {
-            id: group_id,
-            name: format!("Group {group_index}"),
+        let group_track = track_with(|t| {
+            t.id = group_id;
+            t.name = format!("Group {group_index}");
             // Reaper folder model: a "group" is just a track that has
             // children. No dedicated kind enum — once the children's
             // `parent_group_id` is repointed below, this track auto-
             // matically becomes a group bus to the engine.
-            parent_group_id: common_parent,
-            source: InstrumentSource::None,
-            clips: Vec::new(),
-            ..Track::default()
-        };
+            t.parent_group_id = common_parent;
+            t.source = InstrumentSource::None;
+            t.clips = Vec::new();
+        });
         // Repoint every selection-root track's parent to the new group.
         // 子孫 (= 親が選択集合内のトラック) は元の親に残すことで、 内側
         // グループの入れ子が保たれる (FIXME #13)。
@@ -11243,12 +11077,11 @@ impl AppData {
         // 新 track 作成 (空 plugin chain)。 名前は元 clip 名 + " (FX)"。
         let new_track_id = self.song.alloc_track_id();
         let new_track_name = format!("{} (FX)", pending.clip_name);
-        let new_track = Track {
-            id: new_track_id,
-            name: new_track_name.clone(),
-            clips: Vec::new(),
-            ..Track::default()
-        };
+        let new_track = track_with(|t| {
+            t.id = new_track_id;
+            t.name = new_track_name.clone();
+            t.clips = Vec::new();
+        });
         self.song.tracks.push(new_track);
         let new_track_idx = self.song.tracks.len() - 1;
 
@@ -13283,7 +13116,7 @@ impl AppData {
 
     // -------- Plugin GUI bridge --------------------------------------------
 
-    fn on_gui_opened(&mut self, _track: u32, _slot: PluginSlot, _width: u32, _height: u32) {
+    fn on_gui_opened(&mut self, _track: u32, _index: u32, _width: u32, _height: u32) {
         // FIXME #31: the editor window is created, sized, and owned by the
         // plugin-host process. daw_gui only records open state (done in
         // `open_slot_gui` when the request is sent), so there's nothing to do
@@ -13291,10 +13124,10 @@ impl AppData {
         // handled entirely in the plugin-host process now.
     }
 
-    fn on_gui_closed(&mut self, track: u32, slot: PluginSlot) {
+    fn on_gui_closed(&mut self, track: u32, index: u32) {
         // The plugin-host process tore the editor window down (user clicked
         // the window's ✕, or the plugin self-closed). Drop our open-state.
-        self.open_plugin_guis.remove(&(track, slot));
+        self.open_plugin_guis.remove(&(track, index));
     }
 
     // Args mirror the `SlotPluginLoadedFromChild` AppEvent (= the IPC
@@ -13304,7 +13137,7 @@ impl AppData {
     fn on_plugin_loaded_from_child(
         &mut self,
         track_id: u32,
-        slot: PluginSlot,
+        index: u32,
         id: String,
         _name: String,
         plugin_id: u32,
@@ -13324,13 +13157,13 @@ impl AppData {
             plugin_id,
             shmem_id,
             track: track_id,
-            slot,
+            index,
         });
         if let Some(reason) = state_load_error {
             let msg = format!(
-                "Plugin state 復元失敗 (track {track_id} {slot:?}, id={id}): {reason}"
+                "Plugin state 復元失敗 (track {track_id} device {index}, id={id}): {reason}"
             );
-            tracing::error!(track = track_id, ?slot, %id, %reason, "state_load failed (notified by plugin host)");
+            tracing::error!(track = track_id, index, %id, %reason, "state_load failed (notified by plugin host)");
             self.status_message = msg;
         }
         // PR2.1: ChildToMain `track` is now a `Track::id`. Resolve to
@@ -13342,43 +13175,26 @@ impl AppData {
         if !entry.contains(&plugin_id) {
             entry.push(plugin_id);
         }
-        // slot 単位での load 状態 cache。 reconcile の slot-level diff
+        // device index 単位での load 状態 cache。 reconcile の device-level diff
         // (Undo で同 track 内の plugin 構成が変化した場合の同期) で参照。
         self.loaded_slots.insert(
-            (track_id, slot),
+            (track_id, index),
             LoadedSlotInfo {
                 plugin_id,
                 plugin_id_str: id.clone(),
             },
         );
         self.ensure_first_track();
-        // master bus は track Vec に居ないので master_fx_chain に reconcile する。
-        // master は audio fx のみ (Fx slot) を持つ。 track 経路の sidechain 保存
-        // idiom をそのまま適用 (= 既存 instance の state/format/sidechain を引き継ぐ)。
-        // 以降の共通 finalize (sync / gui_open / pending_play flush) は master /
-        // track どちらも通る (early return しない)。
-        if track_id == common::model::MASTER_TRACK_ID {
-            if let PluginSlot::Fx(i) = slot {
-                let i = i as usize;
-                let (existing_state, format, existing_sc) = self
-                    .song
-                    .master_fx_chain
-                    .get(i)
-                    .map(|p| (p.state.clone(), p.format, p.sidechain_sources.clone()))
-                    .unwrap_or((None, PluginFormat::Clap, Vec::new()));
-                let inst = common::model::PluginInstance {
-                    plugin_id: id,
-                    format,
-                    state: existing_state,
-                    sidechain_sources: existing_sc,
-                };
-                if i < self.song.master_fx_chain.len() {
-                    self.song.master_fx_chain[i] = inst;
-                } else {
-                    self.song.master_fx_chain.push(inst);
-                }
-            }
-        } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
+
+        // resolve ports from the plugin DB (役割導出の入力)。 不在なら既存値を
+        // 引き継ぐ (= reconcile 由来の再 load で既存 instance がある場合)。
+        let db_ports = self
+            .plugin_db
+            .as_ref()
+            .and_then(|db| db.find_by_id(&id).map(port_config_of));
+
+        // 単一デバイスチェーン: master は `master_fx_chain`、 通常 track は
+        // `Track.devices` に flat な device index で reconcile する。
         // PR4.5 sidechain wiring preservation: when a plugin finishes
         // loading via SlotPluginLoaded, we replace the existing
         // PluginInstance with a fresh one carrying the resolved id +
@@ -13388,66 +13204,38 @@ impl AppData {
         // (a) makes the inspector dropdown display "—" instead of the
         //     wired source track, and (b) propagates to daw_audio via
         //     the next LoadSong, killing the SidechainTap in
-        //     `compile_schedule`. The user's symptom: dropdown empty +
-        //     no ducking after Open, then everything works once they
-        //     re-pick the source manually (which writes Some(id) back).
-        match slot {
-            PluginSlot::Instrument => {
-                let (state, format, existing_sc) = t
-                    .instrument
-                    .as_ref()
-                    .map(|i| (i.state.clone(), i.format, i.sidechain_sources.clone()))
-                    .unwrap_or((None, PluginFormat::Clap, Vec::new()));
-                t.instrument = Some(common::model::PluginInstance {
-                    plugin_id: id,
-                    format,
-                    state,
-                    sidechain_sources: existing_sc,
-                });
-            }
-            PluginSlot::Fx(i) => {
-                let i = i as usize;
-                let (existing_state, format, existing_sc) = t
-                    .fx_chain
-                    .get(i)
-                    .map(|p| (p.state.clone(), p.format, p.sidechain_sources.clone()))
-                    .unwrap_or((None, PluginFormat::Clap, Vec::new()));
-                let inst = common::model::PluginInstance {
-                    plugin_id: id,
-                    format,
-                    state: existing_state,
-                    sidechain_sources: existing_sc,
-                };
-                if i < t.fx_chain.len() {
-                    t.fx_chain[i] = inst;
-                } else {
-                    t.fx_chain.push(inst);
-                }
-            }
-            PluginSlot::MidiFx(i) => {
-                let i = i as usize;
-                let (existing_state, format, existing_sc) = t
-                    .midi_fx_chain
-                    .get(i)
-                    .map(|p| (p.state.clone(), p.format, p.sidechain_sources.clone()))
-                    .unwrap_or((None, PluginFormat::Clap, Vec::new()));
-                let inst = common::model::PluginInstance {
-                    plugin_id: id,
-                    format,
-                    state: existing_state,
-                    sidechain_sources: existing_sc,
-                };
-                if i < t.midi_fx_chain.len() {
-                    t.midi_fx_chain[i] = inst;
-                } else {
-                    t.midi_fx_chain.push(inst);
-                }
-            }
-        }
-        } else {
+        //     `compile_schedule`.
+        let chain: Option<&mut Vec<common::model::PluginInstance>> =
+            if track_id == common::model::MASTER_TRACK_ID {
+                Some(&mut self.song.master_fx_chain)
+            } else {
+                self.song
+                    .tracks
+                    .iter_mut()
+                    .find(|t| t.id == track_id)
+                    .map(|t| &mut t.devices)
+            };
+        let Some(chain) = chain else {
             // track id が Vec に無い (load 中に track 削除された等)。 master でも
             // なく該当 track も居ないので、 従来どおり finalize せず early return。
             return;
+        };
+        let i = index as usize;
+        let (existing_state, format, existing_sc, existing_ports) = chain
+            .get(i)
+            .map(|p| (p.state.clone(), p.format, p.sidechain_sources.clone(), p.ports))
+            .unwrap_or((None, PluginFormat::Clap, Vec::new(), Default::default()));
+        let inst = common::model::PluginInstance {
+            plugin_id: id,
+            format,
+            state: existing_state,
+            sidechain_sources: existing_sc,
+            ports: db_ports.unwrap_or(existing_ports),
+        };
+        if i < chain.len() {
+            chain[i] = inst;
+        } else {
+            chain.push(inst);
         }
 
         // ユーザーが手動追加した plugin の load 完了 finalize:
@@ -13456,14 +13244,14 @@ impl AppData {
         //     sync_song_to_plugin_host まで signal に反映されなかった (= bug)。
         // (2) GUI 自動 open を frame loop に queue する。
         // pending_play flush より前に sync し、 Play 待ち再生も最新 schedule で開始させる。
-        if self.pending_added_plugin_finalize.remove(&(track_id, slot)) {
+        if self.pending_added_plugin_finalize.remove(&(track_id, index)) {
             self.sync_song_to_plugin_host();
-            self.gui_open_requests.push((track_id, slot));
+            self.gui_open_requests.push((track_id, index));
         }
 
         // A7: this load is done. If Play was queued waiting for the
         // last plugin to register on the audio side, fire it now.
-        self.pending_plugin_loads.remove(&(track_id, slot));
+        self.pending_plugin_loads.remove(&(track_id, index));
         if self.pending_plugin_loads.is_empty() && self.pending_play {
             self.pending_play = false;
             self.status_message.clear();
@@ -13475,15 +13263,13 @@ impl AppData {
             );
         }
 
-        // PR-V3: builtin VOICEVOX が instrument に load されたら、 直後に
-        // 歌詞 metadata を flush して背景 synth を trigger する。 plugin_id
-        // が `loaded_slots` に登録された後でないと sync_vocal_metadata が
-        // skip するため、 ここで明示呼び出し。 vocal でない track の load
-        // も同 path を通るが、 sync_vocal_metadata 内で format check して
-        // skip するので overhead は最小。
-        if slot == PluginSlot::Instrument {
-            self.sync_vocal_metadata();
-        }
+        // PR-V3: builtin VOICEVOX が load されたら、 直後に歌詞 metadata を
+        // flush して背景 synth を trigger する。 plugin_id が `loaded_slots`
+        // に登録された後でないと sync_vocal_metadata が skip するため、 ここで
+        // 明示呼び出し。 単一デバイスチェーン化で「instrument slot」 という
+        // 区分は無いので、 全 device load 後に呼ぶ (sync_vocal_metadata 内で
+        // VOICEVOX device のみ拾うので overhead は最小)。
+        self.sync_vocal_metadata();
     }
 
     /// plugin_host で `SetSlotPlugin` が失敗した (`load_plugin` Err か
@@ -13501,21 +13287,21 @@ impl AppData {
     fn on_plugin_load_failed_from_child(
         &mut self,
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id: String,
         reason: String,
     ) {
         tracing::error!(
             track,
-            ?slot,
+            index,
             %plugin_id,
             %reason,
             "plugin load failed (notified by plugin host)"
         );
-        self.pending_plugin_loads.remove(&(track, slot));
+        self.pending_plugin_loads.remove(&(track, index));
         // load 失敗時は finalize 予約も取り消す (stale entry が後の project-load で
         // 誤 sync / 誤 open しないように)。
-        self.pending_added_plugin_finalize.remove(&(track, slot));
+        self.pending_added_plugin_finalize.remove(&(track, index));
         // pending_play 解放: A7 と同じロジック (`on_plugin_loaded_from_child`
         // と対称)。 失敗で空になったタイミングで queue Play を flush する。
         if self.pending_plugin_loads.is_empty() && self.pending_play {
@@ -13605,13 +13391,8 @@ impl AppData {
         }
     }
 
-    fn toggle_slot_gui(&mut self, slot_kind: u8, slot_index: u32) {
-        let slot = match slot_kind {
-            0 => PluginSlot::MidiFx(slot_index),
-            1 => PluginSlot::Instrument,
-            _ => PluginSlot::Fx(slot_index),
-        };
-        // PR2.1: open_plugin_guis / IPC は track_id ベース。 master 選択時は
+    fn toggle_slot_gui(&mut self, index: u32) {
+        // open_plugin_guis / IPC は track_id ベース。 master 選択時は
         // cursor_track_id が MASTER_TRACK_ID を返す (Vec に居ないので index 経由
         // 不可)。
         let Some(track_id) = self.cursor_track_id() else {
@@ -13621,38 +13402,35 @@ impl AppData {
         // FIXME #31: open 状態は open_plugin_guis (id set) で追跡。実 window は
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
         // B 側に破棄させ、SlotGuiClosed の受信で set から除去する。
-        if self.open_plugin_guis.contains(&(track_id, slot)) {
-            self.send_plugin(MainToChild::CloseSlotGui { track: track_id, slot });
+        if self.open_plugin_guis.contains(&(track_id, index)) {
+            self.send_plugin(MainToChild::CloseSlotGui { track: track_id, index });
             return;
         }
-        self.open_slot_gui(track_id, slot);
+        self.open_slot_gui(track_id, index);
     }
 
-    /// 指定 (track_id, slot) のプラグイン GUI を embedded container window で開く。
-    /// 既に開いていれば何もしない (重複 open 防止)。Windows 専用 (他 OS では no-op)。
-    /// `toggle_slot_gui` (手動トグル) と plugin 追加時の自動 open の両方から使う。
-    fn open_slot_gui(&mut self, track_id: u32, slot: PluginSlot) {
+    /// 指定 (track_id, device_index) のプラグイン GUI を embedded container
+    /// window で開く。既に開いていれば何もしない (重複 open 防止)。Windows 専用
+    /// (他 OS では no-op)。`toggle_slot_gui` (手動トグル) と plugin 追加時の自動
+    /// open の両方から使う。
+    fn open_slot_gui(&mut self, track_id: u32, index: u32) {
         #[cfg(windows)]
         {
-            if self.open_plugin_guis.contains(&(track_id, slot)) {
+            if self.open_plugin_guis.contains(&(track_id, index)) {
                 return;
             }
             let label = if track_id == common::model::MASTER_TRACK_ID {
-                match slot {
-                    PluginSlot::Fx(i) => self
-                        .song
-                        .master_fx_chain
-                        .get(i as usize)
-                        .map(|p| format!("Master / {}", self.resolve_name(&p.plugin_id))),
-                    _ => None,
-                }
-                .unwrap_or_else(|| "Master".into())
+                self.song
+                    .master_fx_chain
+                    .get(index as usize)
+                    .map(|p| format!("Master / {}", self.resolve_name(&p.plugin_id)))
+                    .unwrap_or_else(|| "Master".into())
             } else {
                 self.song
                     .tracks
                     .iter()
                     .find(|t| t.id == track_id)
-                    .and_then(|t| self.slot_ref_name(t, slot))
+                    .and_then(|t| self.slot_ref_name(t, index))
                     .unwrap_or_else(|| "(unknown)".into())
             };
             // FIXME #31: the editor's top-level window is created by the
@@ -13673,16 +13451,16 @@ impl AppData {
                 };
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
             }
-            self.open_plugin_guis.insert((track_id, slot));
+            self.open_plugin_guis.insert((track_id, index));
             self.send_plugin(MainToChild::OpenSlotGuiEmbedded {
                 track: track_id,
-                slot,
+                index,
                 title: format!("Plugin — {label}"),
             });
         }
         #[cfg(not(windows))]
         {
-            let _ = (track_id, slot);
+            let _ = (track_id, index);
         }
     }
 
@@ -13694,110 +13472,70 @@ impl AppData {
         if self.gui_open_requests.is_empty() {
             return;
         }
-        for (track_id, slot) in std::mem::take(&mut self.gui_open_requests) {
-            self.open_slot_gui(track_id, slot);
+        for (track_id, index) in std::mem::take(&mut self.gui_open_requests) {
+            self.open_slot_gui(track_id, index);
         }
     }
 
     #[cfg(windows)]
-    fn slot_ref_name(&self, track: &Track, slot: PluginSlot) -> Option<String> {
-        let id = match slot {
-            PluginSlot::Instrument => track.instrument.as_ref().map(|i| i.plugin_id.as_str())?,
-            PluginSlot::Fx(i) => track.fx_chain.get(i as usize).map(|p| p.plugin_id.as_str())?,
-            PluginSlot::MidiFx(i) => track
-                .midi_fx_chain
-                .get(i as usize)
-                .map(|p| p.plugin_id.as_str())?,
-        };
+    fn slot_ref_name(&self, track: &Track, index: u32) -> Option<String> {
+        let id = track.devices.get(index as usize).map(|p| p.plugin_id.as_str())?;
         Some(self.resolve_name(id))
     }
 
-    /// inspector chain (MIDI FX → Instrument → FX を一列で表示) の reorder。
-    /// `order[i]` は新位置 i に来る旧 chain index。FIXME #29: 並べ替えは各プラグインの
-    /// capability (ポート構成) で「ポート的に有効な配置」だけ許す。 dual-role は生成器位置
-    /// ⇔ 音源位置を跨いで動かせ、 純粋な音源/MIDI FX/audio FX は自セクション内のみ。
-    /// 無効な drop は early-return で no-op (UI は元の並びに戻る)。
+    /// inspector chain (= `Track.devices` / `master_fx_chain` を一列で表示) の
+    /// reorder。`order` は gui_01 契約 `new[i] = items[order[i]]`。
+    ///
+    /// 単一デバイスチェーン (`docs/plan_linear_chain.md` §5): **棄却なしの純
+    /// permutation**。役割は位置から再導出されるので、能力チェック / セクション跨ぎ
+    /// 検証は撤廃した (任意の並び替えを許す)。`moves: Vec<(old_index, new_index)>` を
+    /// 組んで 3 プロセスの per-device bookkeeping を貼り直す。
     fn reorder_inspector_chain(&mut self, order: &[usize]) {
-        let chain = self.inspector_chain();
-        if chain.len() != order.len() {
-            return;
-        }
-        // master bus は chain が master_fx_chain (FX only) なので順序だけ適用。
-        // cross-section は起きない (全 slot_kind == 2)。
-        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            let fx_count = self.song.master_fx_chain.len();
-            if fx_count == order.len()
-                && fx_count > 0
-                && order.iter().all(|&o| o < fx_count)
-            {
-                let new_fx: Vec<_> = (0..fx_count)
-                    .map(|new_i| self.song.master_fx_chain[order[new_i]].clone())
-                    .collect();
-                self.song.master_fx_chain = new_fx;
-                // FIXME #32: master FX は全て MASTER_TRACK_ID の Fx slot。
-                // 旧 Fx(order[i]) → 新 Fx(i) の moves で 3 プロセスを貼り直す。
-                let moves: Vec<(PluginSlot, PluginSlot)> = (0..fx_count)
-                    .map(|new_i| {
-                        (
-                            PluginSlot::Fx(order[new_i] as u32),
-                            PluginSlot::Fx(new_i as u32),
-                        )
-                    })
-                    .collect();
-                self.apply_chain_reorder(common::model::MASTER_TRACK_ID, moves);
-                self.sync_song_to_plugin_host();
-            }
-            return;
-        }
-        let Some(track_idx) = self.cursor_track_index() else {
-            return;
-        };
-        let Some(track_id) = self.song.tracks.get(track_idx).map(|t| t.id) else {
-            return;
-        };
-        // chain (= inspector_chain 順 [midi_fx..., inst?, fx...]) を flat な
-        // PluginInstance 列にする。 これで old chain index ↔ PluginInstance が対応。
-        // `flat_slots` は同じ並びで各 entry の **現在の** (track, slot) アドレスを
-        // 持つ。 reorder 後に plugin host / audio engine / 各 cache を旧→新 slot で
-        // 貼り直す `moves` を組むのに使う (FIXME #32)。
-        let (flat, flat_slots): (Vec<common::model::PluginInstance>, Vec<PluginSlot>) = {
+        let is_master = self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
+        // 対象チェーン (master / track) の現在の device 列と track_id を解決。
+        let (track_id, old_devices): (u32, Vec<common::model::PluginInstance>) = if is_master {
+            (common::model::MASTER_TRACK_ID, self.song.master_fx_chain.clone())
+        } else {
+            let Some(track_idx) = self.cursor_track_index() else {
+                return;
+            };
             let Some(track) = self.song.tracks.get(track_idx) else {
                 return;
             };
-            let mut v = Vec::with_capacity(chain.len());
-            let mut slots = Vec::with_capacity(chain.len());
-            for (i, p) in track.midi_fx_chain.iter().enumerate() {
-                v.push(p.clone());
-                slots.push(PluginSlot::MidiFx(i as u32));
-            }
-            if let Some(inst) = track.instrument.as_ref() {
-                v.push(inst.clone());
-                slots.push(PluginSlot::Instrument);
-            }
-            for (i, p) in track.fx_chain.iter().enumerate() {
-                v.push(p.clone());
-                slots.push(PluginSlot::Fx(i as u32));
-            }
-            (v, slots)
+            (track.id, track.devices.clone())
         };
-        if flat.len() != chain.len() || order.iter().any(|&o| o >= flat.len()) {
+        let n = old_devices.len();
+        // order の妥当性検証 (長さ一致 + 0..n の permutation)。不正なら no-op。
+        if order.len() != n || n == 0 {
             return;
         }
-        // FIXME #32 (review): slot 貼り替えは 3 プロセスの per-slot bookkeeping が
+        if order.iter().any(|&o| o >= n) {
+            return;
+        }
+        {
+            let mut seen = vec![false; n];
+            for &o in order {
+                if std::mem::replace(&mut seen[o], true) {
+                    return; // 重複 = 不正 permutation
+                }
+            }
+        }
+
+        // (review) device 貼り替えは 3 プロセスの per-device bookkeeping が
         // song チェーンと一致している前提。 ロード失敗 / 進行中の plugin が song に
-        // phantom として残ると、 host はその slot を持たず ReorderChain を skip する
-        // 一方で audio engine / daw_gui は適用し、 (track, slot)→plugin が恒久的に
-        // 分岐する。 song チェーンが loaded_slots と完全一致 (= 全 plugin が 3 プロセス
-        // でロード済) のときだけ並び替える (不一致なら snap back)。
+        // phantom として残ると、 host はその device を持たず ReorderChain を skip
+        // する一方で audio engine / daw_gui は適用し、 (track, index)→plugin が
+        // 恒久的に分岐する。 song チェーンが loaded_slots と完全一致 (= 全 plugin
+        // が 3 プロセスでロード済) のときだけ並び替える (不一致なら snap back)。
         let loaded_here = self
             .loaded_slots
             .keys()
             .filter(|(t, _)| *t == track_id)
             .count();
-        let fully_loaded = loaded_here == flat_slots.len()
-            && flat_slots.iter().zip(flat.iter()).all(|(slot, inst)| {
+        let fully_loaded = loaded_here == n
+            && old_devices.iter().enumerate().all(|(i, inst)| {
                 self.loaded_slots
-                    .get(&(track_id, *slot))
+                    .get(&(track_id, i as u32))
                     .is_some_and(|info| info.plugin_id_str == inst.plugin_id)
             });
         if !fully_loaded {
@@ -13805,109 +13543,41 @@ impl AppData {
                 "プラグインの読み込み中または失敗のため並び替えできません".to_string();
             return;
         }
-        // 各 flat index の capability を解決。 db 不在 / 未登録は prior slot_kind に
-        // 縛り (従来の section 内 reorder と等価な安全側)、 既知プラグインは port 由来。
-        let db = self.plugin_db.clone();
-        let caps: Vec<PluginCapability> = (0..flat.len())
-            .map(|i| {
-                db.as_ref()
-                    .and_then(|d| d.find_by_id(&flat[i].plugin_id))
-                    .map(PluginCapability::from_entry)
-                    .unwrap_or(match chain[i].slot_kind {
-                        0 => PluginCapability::PureMidiEffect,
-                        1 => PluginCapability::Instrument,
-                        _ => PluginCapability::AudioFx,
-                    })
-            })
-            .collect();
-        // 音源 (= prior slot_kind 1) の新位置。 これを境に前=生成器(0) / 後=audio fx(2)、
-        // その位置自身が音源(1)。 音源が無ければ生成器→audio fx の単調列。
-        let inst_new_pos = (0..order.len()).find(|&i| chain[order[i]].slot_kind == 1);
-        let mut new_kinds = vec![0u8; order.len()];
-        let mut saw_fx = false;
-        for i in 0..order.len() {
-            let cap = caps[order[i]];
-            let kind = match inst_new_pos {
-                Some(p) if i < p => 0,
-                Some(p) if i == p => 1,
-                Some(_) => 2,
-                None if cap == PluginCapability::AudioFx => 2,
-                None => 0,
-            };
-            // ポート的に置けない位置への drop は棄却 (= UI は元の並びへ)。
-            // FIXME #32: 黙って元へ戻ると「並び替えが効かない」と誤解されるので、
-            // なぜ棄却したかを status_message で伝える (= ノート生成器は音源より
-            // 前、 audio エフェクトは音源より後、 という port 由来の順序制約)。
-            if !cap.allows_slot_kind(kind) {
-                self.status_message =
-                    "その位置には置けません（並びは ノート生成器 → 音源 → エフェクト）"
-                        .to_string();
-                return;
-            }
-            // 音源の無い列では「生成器の後に audio fx」 の単調性だけ要求する。
-            if inst_new_pos.is_none() {
-                if kind == 2 {
-                    saw_fx = true;
-                } else if saw_fx {
-                    self.status_message =
-                        "その位置には置けません（ノート生成器は audio エフェクトより前）"
-                            .to_string();
-                    return;
-                }
-            }
-            new_kinds[i] = kind;
-        }
-        // 新順序 + new_kinds で 3 つの Vec へ再分割 (section 跨ぎ書き戻しを含む)。
-        // 同時に各 entry の旧 slot (flat_slots) → 新 slot の `moves` を組む。
-        let mut new_midi = Vec::new();
-        let mut new_inst = None;
-        let mut new_fx = Vec::new();
-        let mut moves: Vec<(PluginSlot, PluginSlot)> = Vec::with_capacity(order.len());
-        for i in 0..order.len() {
-            let inst = flat[order[i]].clone();
-            // 新 slot は配置先 Vec の (push 前の) 長さ = 連番 index。
-            let new_slot = match new_kinds[i] {
-                0 => {
-                    let s = PluginSlot::MidiFx(new_midi.len() as u32);
-                    new_midi.push(inst);
-                    s
-                }
-                1 => {
-                    new_inst = Some(inst);
-                    PluginSlot::Instrument
-                }
-                _ => {
-                    let s = PluginSlot::Fx(new_fx.len() as u32);
-                    new_fx.push(inst);
-                    s
-                }
-            };
-            moves.push((flat_slots[order[i]], new_slot));
-        }
-        let Some(track) = self.song.tracks.get_mut(track_idx) else {
+
+        // 新順での device 列を組む (new[i] = old[order[i]])。
+        let new_devices: Vec<common::model::PluginInstance> =
+            order.iter().map(|&o| old_devices[o].clone()).collect();
+        // moves: 各新位置 i について (old_index, new_index) = (order[i], i)。
+        let moves: Vec<(u32, u32)> =
+            (0..n).map(|i| (order[i] as u32, i as u32)).collect();
+
+        // song を書き換え。
+        if is_master {
+            self.song.master_fx_chain = new_devices;
+        } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
+            t.devices = new_devices;
+        } else {
             return;
-        };
-        track.midi_fx_chain = new_midi;
-        track.instrument = new_inst;
-        track.fx_chain = new_fx;
-        // FIXME #32: song を組み替えただけでは plugin host のチェーンも audio engine の
-        // slot→plugin_id マップも追従しない (= 見た目だけ並び替わり音は旧順のまま)。
-        // 旧→新 slot の `moves` で 3 プロセスの per-slot bookkeeping を貼り直してから
-        // LoadSong (= schedule 再構築) を送る。
+        }
+
+        // song を組み替えただけでは plugin host のチェーンも audio engine の
+        // index→plugin_id マップも追従しない (= 見た目だけ並び替わり音は旧順の
+        // まま)。 旧→新 index の `moves` で 3 プロセスの per-device bookkeeping を
+        // 貼り直してから LoadSong (= schedule 再構築) を送る。
         self.apply_chain_reorder(track_id, moves);
         self.sync_song_to_plugin_host();
     }
 
-    /// FIXME #32: propagate an inspector-chain reorder to the plugin host, the
-    /// audio engine, and our own `(track, slot)`-keyed caches. `moves` is the
-    /// complete `(old_slot, new_slot)` permutation for `track_id` (one entry
+    /// propagate an inspector-chain reorder to the plugin host, the audio
+    /// engine, and our own `(track, device_index)`-keyed caches. `moves` is the
+    /// complete `(old_index, new_index)` permutation for `track_id` (one entry
     /// per loaded plugin, `from == to` for ones that stayed put). The caller
     /// has already rewritten `self.song`; this re-keys everything else that is
-    /// addressed by slot so the moved plugins' real processing, editor
+    /// addressed by device index so the moved plugins' real processing, editor
     /// windows, param lists and load-state cache follow the new positions.
-    fn apply_chain_reorder(&mut self, track_id: u32, moves: Vec<(PluginSlot, PluginSlot)>) {
+    fn apply_chain_reorder(&mut self, track_id: u32, moves: Vec<(u32, u32)>) {
         // Local caches: remove ALL old keys first (snapshot), then re-insert at
-        // the new keys, so a swap (Fx(0)↔Fx(1)) can't clobber the second entry.
+        // the new keys, so a swap (0↔1) can't clobber the second entry.
         let mut new_loaded = Vec::new();
         let mut new_open = Vec::new();
         let mut new_params = Vec::new();
@@ -13931,11 +13601,12 @@ impl AppData {
         for (to, v) in new_params {
             self.plugin_params.insert((track_id, to), v);
         }
-        // FIXME #32 (review): automation lanes are addressed by chain slot
-        // (`AutomationTarget::PluginParam { slot, .. }`) and are persisted to
-        // the project. Re-point each matching lane old→new so the moved plugin
-        // keeps its automation — otherwise the plugin that took its old slot
-        // gets driven by it (audible wrong audio that also survives reload).
+        // (review) automation lanes are addressed by device index
+        // (`AutomationTarget::PluginParam { device_index, .. }`) and are
+        // persisted to the project. Re-point each matching lane old→new so the
+        // moved plugin keeps its automation — otherwise the plugin that took
+        // its old index gets driven by it (audible wrong audio that also
+        // survives reload).
         if track_id == common::model::MASTER_TRACK_ID {
             Self::remap_lane_slots(&mut self.song.song_lanes, &moves);
         } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
@@ -13954,21 +13625,29 @@ impl AppData {
         });
     }
 
-    /// FIXME #32 (review): rewrite every `AutomationTarget::PluginParam { slot }`
-    /// in `lanes` from its old chain slot to its new one per `moves`. Each lane
-    /// stores the pre-reorder slot, and `moves` maps old→new, so a single
+    /// (review) rewrite every `AutomationTarget::PluginParam { device_index }`
+    /// in `lanes` from its old device index to its new one per `moves`. Each
+    /// lane stores the pre-reorder index, and `moves` maps old→new, so a single
     /// per-lane lookup is collision-free (no shared structure is rekeyed here).
     fn remap_lane_slots(
         lanes: &mut [common::model::AutomationLane],
-        moves: &[(PluginSlot, PluginSlot)],
+        moves: &[(u32, u32)],
     ) {
         for lane in lanes.iter_mut() {
-            if let common::model::AutomationTarget::PluginParam { slot, param_id } = &lane.target {
-                let (old_slot, param_id) = (*slot, *param_id);
-                if let Some(&(_, new_slot)) = moves.iter().find(|(from, _)| *from == old_slot) {
+            if let common::model::AutomationTarget::PluginParam {
+                device_index,
+                param_id,
+                ..
+            } = &lane.target
+            {
+                let (old_index, param_id) = (*device_index, *param_id);
+                if let Some(&(_, new_index)) =
+                    moves.iter().find(|(from, _)| *from == old_index)
+                {
                     lane.target = common::model::AutomationTarget::PluginParam {
-                        slot: new_slot,
+                        device_index: new_index,
                         param_id,
+                        legacy_slot: None,
                     };
                 }
             }
@@ -13984,24 +13663,19 @@ impl AppData {
     fn set_sidechain_source(
         &mut self,
         track_id: u32,
-        slot_kind: u8,
-        slot_index: u32,
+        device_index: u32,
         port: u8,
         source: Option<u32>,
     ) {
-        // master bus は track Vec に居ないので master_fx_chain (Fx slot のみ)
-        // を対象にする。
+        // 単一デバイスチェーン: master は master_fx_chain、 通常 track は devices
+        // を flat な device index で引く。
         let inst = if track_id == common::model::MASTER_TRACK_ID {
-            self.song.master_fx_chain.get_mut(slot_index as usize)
+            self.song.master_fx_chain.get_mut(device_index as usize)
         } else {
             let Some(track) = self.song.track_by_id_mut(track_id) else {
                 return;
             };
-            match slot_kind {
-                0 => track.midi_fx_chain.get_mut(slot_index as usize),
-                1 => track.instrument.as_mut(),
-                _ => track.fx_chain.get_mut(slot_index as usize),
-            }
+            track.devices.get_mut(device_index as usize)
         };
         let Some(inst) = inst else { return };
         let port_idx = port as usize;
@@ -14012,14 +13686,9 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// `AppEvent::RemoveSlot` の dispatcher。 削除する plugin の最新
+    /// `AppEvent::RemoveDevice` の dispatcher。 削除する plugin の最新
     /// state を取ってから Undo snapshot + 削除を行う。
-    fn remove_slot(&mut self, slot_kind: u8, slot_index: u32) {
-        let slot = match slot_kind {
-            0 => PluginSlot::MidiFx(slot_index),
-            1 => PluginSlot::Instrument,
-            _ => PluginSlot::Fx(slot_index),
-        };
+    fn remove_device(&mut self, index: u32) {
         // master 選択時は cursor_track_id == MASTER_TRACK_ID (Vec に居ない)。
         let Some(track_id) = self.cursor_track_id() else {
             return;
@@ -14027,131 +13696,134 @@ impl AppData {
 
         if !self.song_has_plugin() {
             self.push_undo_snapshot();
-            self.remove_slot_inner(track_id, slot);
+            self.remove_device_inner(track_id, index);
             return;
         }
         self.enqueue_state_request(PendingStateRequest::Deferred(
-            DeferredEdit::RemoveSlot { track_id, slot },
+            DeferredEdit::RemoveDevice { track_id, index },
         ));
     }
 
-    fn remove_slot_inner(&mut self, track_id: u32, slot: PluginSlot) {
-        // master bus は track Vec に居ないので master_fx_chain から削除する。
-        // host への RemoveSlotPlugin + GUI cleanup + slot cache 削除は track と
-        // 共通 idiom。 master は Fx slot のみ。
-        if track_id == common::model::MASTER_TRACK_ID {
-            // FIXME #31: close the editor before removing the plugin (see the
-            // non-master path below for why order matters).
-            self.cleanup_slot_gui(track_id, slot);
-            self.send_plugin(MainToChild::RemoveSlotPlugin {
-                track: track_id,
-                slot,
-            });
-            self.loaded_slots.remove(&(track_id, slot));
-            if let PluginSlot::Fx(i) = slot {
-                let i = i as usize;
-                if i < self.song.master_fx_chain.len() {
-                    self.song.master_fx_chain.remove(i);
-                }
-            }
-            return;
-        }
-        let Some(track_idx) = self.song.track_index_by_id(track_id) else {
-            return;
-        };
+    /// 単一デバイスチェーン: `Track.devices` / `master_fx_chain` の指定 index の
+    /// device を `Vec::remove` する。host への RemoveSlotPlugin + GUI cleanup +
+    /// cache 削除 + 後続 index shift を行う。
+    fn remove_device_inner(&mut self, track_id: u32, index: u32) {
         // **GUI lifecycle** (FIXME #31): close the editor BEFORE removing the
         // plugin. cleanup_slot_gui sends CloseSlotGui so the plugin-host tears
-        // the editor window down while the plugin is still at this slot —
+        // the editor window down while the plugin is still at this index —
         // after RemoveSlotPlugin the chain shifts (Vec::remove), so a
         // post-remove close would target a shifted neighbor. RemoveSlotPlugin
         // also closes the editor by stable plugin id as a backstop, and shifts
         // the remaining open-state keys to match the new chain indices.
-        self.cleanup_slot_gui(track_id, slot);
+        self.cleanup_slot_gui(track_id, index);
         // PR2.1: send `Track::id` to the plugin host.
         self.send_plugin(MainToChild::RemoveSlotPlugin {
             track: track_id,
-            slot,
+            index,
         });
-        // slot cache から該当 entry を即時削除。 SlotPluginUnloaded event
-        // 到着前に reconcile が走っても stale entry を見ないようにする
-        // 防御策。
-        self.loaded_slots.remove(&(track_id, slot));
-        if let Some(track) = self.song.tracks.get_mut(track_idx) {
-            match slot {
-                PluginSlot::Instrument => {
-                    track.instrument = None;
-                    // instrument を外したら vocal 状態も解除 (vocal性は instrument 追従)。
-                    track.source = InstrumentSource::None;
-                }
-                PluginSlot::Fx(i) => {
-                    let i = i as usize;
-                    if i < track.fx_chain.len() {
-                        track.fx_chain.remove(i);
-                    }
-                }
-                PluginSlot::MidiFx(i) => {
-                    let i = i as usize;
-                    if i < track.midi_fx_chain.len() {
-                        track.midi_fx_chain.remove(i);
-                    }
-                }
-            }
+        // cache から該当 entry を即時削除。 SlotPluginUnloaded event 到着前に
+        // reconcile が走っても stale entry を見ないようにする防御策。
+        self.loaded_slots.remove(&(track_id, index));
+        // index 以降の loaded_slots / plugin_params を 1 つ前へ詰める (Vec::remove
+        // 後の device index と整合させる)。open_plugin_guis は cleanup_slot_gui →
+        // shift_slot_gui_keys が既に shift 済み。
+        self.shift_device_caches_after_remove(track_id, index);
+
+        // song を書き換え。master は master_fx_chain、 通常 track は devices。
+        let chain: Option<&mut Vec<common::model::PluginInstance>> =
+            if track_id == common::model::MASTER_TRACK_ID {
+                Some(&mut self.song.master_fx_chain)
+            } else {
+                self.song
+                    .tracks
+                    .iter_mut()
+                    .find(|t| t.id == track_id)
+                    .map(|t| &mut t.devices)
+            };
+        let Some(chain) = chain else {
+            return;
+        };
+        let i = index as usize;
+        if i >= chain.len() {
+            return;
+        }
+        let removed = chain.remove(i);
+        // VOICEVOX builtin (= vocal track の音源) を外したら vocal 状態も解除
+        // (vocal 性は VOICEVOX device の有無に追従)。master には適用しない。
+        if track_id != common::model::MASTER_TRACK_ID
+            && removed.format == PluginFormat::Builtin
+            && removed.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
+            && let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id)
+        {
+            track.source = InstrumentSource::None;
         }
     }
 
-    /// `(track_id, slot)` のプラグイン GUI を閉じ、 同 track の後続
-    /// Fx / MidiFx の open-state key を 1 つずつ前にずらす (Vec::remove 後の
-    /// chain index と整合させるため)。 Instrument は単一スロットなので
-    /// shift 不要。 FIXME #31: 実 window は plugin-host プロセス所有なので、
-    /// 破棄は `CloseSlotGui` を送って B 側に行わせる。 RemoveSlotPlugin /
-    /// RemoveTrack も B 側で window を破棄するので二重でも idempotent。
+    /// device を index で `Vec::remove` した後、`loaded_slots` / `plugin_params`
+    /// の `(track, idx)` キーのうち `idx > index` のものを 1 つ前へ詰める。
+    /// open_plugin_guis は `shift_slot_gui_keys` が別途扱う。
+    fn shift_device_caches_after_remove(&mut self, track_id: u32, index: u32) {
+        // loaded_slots
+        let mut moves: Vec<(u32, LoadedSlotInfo)> = Vec::new();
+        self.loaded_slots.retain(|&(t, idx), v| {
+            if t == track_id && idx > index {
+                moves.push((idx - 1, v.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        for (idx, v) in moves {
+            self.loaded_slots.insert((track_id, idx), v);
+        }
+        // plugin_params
+        let mut pmoves: Vec<(u32, Vec<common::protocol::PluginParamInfo>)> = Vec::new();
+        self.plugin_params.retain(|&(t, idx), v| {
+            if t == track_id && idx > index {
+                pmoves.push((idx - 1, v.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        for (idx, v) in pmoves {
+            self.plugin_params.insert((track_id, idx), v);
+        }
+    }
+
+    /// `(track_id, device_index)` のプラグイン GUI を閉じ、 同 track の後続
+    /// device (= `idx > index`) の open-state key を 1 つずつ前にずらす
+    /// (`Vec::remove` 後の chain index と整合させるため)。 FIXME #31: 実 window
+    /// は plugin-host プロセス所有なので、 破棄は `CloseSlotGui` を送って B 側に
+    /// 行わせる。 RemoveSlotPlugin / RemoveTrack も B 側で window を破棄するので
+    /// 二重でも idempotent。
     #[cfg(windows)]
-    fn cleanup_slot_gui(&mut self, track_id: u32, slot: PluginSlot) {
+    fn cleanup_slot_gui(&mut self, track_id: u32, index: u32) {
         // open 中なら B に閉じてもらう (= DestroyWindow は plugin-host 側)。
-        if self.open_plugin_guis.remove(&(track_id, slot)) {
-            self.send_plugin(MainToChild::CloseSlotGui { track: track_id, slot });
+        if self.open_plugin_guis.remove(&(track_id, index)) {
+            self.send_plugin(MainToChild::CloseSlotGui { track: track_id, index });
         }
-        match slot {
-            PluginSlot::Instrument => {}
-            PluginSlot::Fx(removed_idx) => {
-                self.shift_slot_gui_keys(track_id, removed_idx, true);
-            }
-            PluginSlot::MidiFx(removed_idx) => {
-                self.shift_slot_gui_keys(track_id, removed_idx, false);
-            }
-        }
+        self.shift_slot_gui_keys(track_id, index);
     }
 
     #[cfg(not(windows))]
-    fn cleanup_slot_gui(&mut self, _track_id: u32, _slot: PluginSlot) {}
+    fn cleanup_slot_gui(&mut self, _track_id: u32, _index: u32) {}
 
-    /// Fx (`is_fx == true`) または MidiFx の index >= `removed_idx + 1`
-    /// なエントリを 1 つずつ前にずらす。
+    /// 単一デバイスチェーン: `removed_idx` を `Vec::remove` した後、
+    /// `idx > removed_idx` な open-state key を 1 つずつ前にずらす。
     #[cfg(windows)]
-    fn shift_slot_gui_keys(&mut self, track_id: u32, removed_idx: u32, is_fx: bool) {
-        let mut moves: Vec<(PluginSlot, PluginSlot)> = Vec::new();
-        for &(t, slot) in self.open_plugin_guis.iter() {
-            if t != track_id {
-                continue;
-            }
-            match (is_fx, slot) {
-                (true, PluginSlot::Fx(i)) if i > removed_idx => {
-                    moves.push((PluginSlot::Fx(i), PluginSlot::Fx(i - 1)));
-                }
-                (false, PluginSlot::MidiFx(i)) if i > removed_idx => {
-                    moves.push((PluginSlot::MidiFx(i), PluginSlot::MidiFx(i - 1)));
-                }
-                _ => {}
-            }
-        }
-        // 前方から順に move (低 index 側を先に詰める)。
-        moves.sort_by_key(|(from, _)| match from {
-            PluginSlot::Fx(i) | PluginSlot::MidiFx(i) => *i,
-            PluginSlot::Instrument => 0,
-        });
-        for (from, to) in moves {
-            if self.open_plugin_guis.remove(&(track_id, from)) {
-                self.open_plugin_guis.insert((track_id, to));
+    fn shift_slot_gui_keys(&mut self, track_id: u32, removed_idx: u32) {
+        let mut moves: Vec<u32> = self
+            .open_plugin_guis
+            .iter()
+            .filter(|&&(t, idx)| t == track_id && idx > removed_idx)
+            .map(|&(_, idx)| idx)
+            .collect();
+        // 低 index 側を先に詰める (collision-free)。
+        moves.sort_unstable();
+        for idx in moves {
+            if self.open_plugin_guis.remove(&(track_id, idx)) {
+                self.open_plugin_guis.insert((track_id, idx - 1));
             }
         }
     }
@@ -14188,8 +13860,8 @@ impl AppData {
                     msg.push_str(", ");
                 }
                 msg.push_str(&format!(
-                    "track {} {:?}",
-                    s.track, s.slot
+                    "track {} device {}",
+                    s.track, s.index
                 ));
             }
             if failed.len() > 3 {
@@ -14242,14 +13914,9 @@ impl AppData {
             DeferredEdit::UngroupTracks { track_ids } => {
                 self.action_ungroup_tracks_inner(&track_ids)
             }
-            DeferredEdit::RemoveSlot { track_id, slot } => {
-                self.remove_slot_inner(track_id, slot)
+            DeferredEdit::RemoveDevice { track_id, index } => {
+                self.remove_device_inner(track_id, index)
             }
-            DeferredEdit::ReplaceInstrumentDemoting {
-                track_id,
-                new_plugin_id,
-                new_format,
-            } => self.replace_instrument_demoting_inner(track_id, new_plugin_id, new_format),
         }
     }
 
@@ -14487,9 +14154,9 @@ impl AppData {
                 .iter()
                 .find(|t| t.id == track_id)
                 .map(|t| f64::from(t.pan)),
-            common::model::AutomationTarget::PluginParam { slot, param_id } => self
+            common::model::AutomationTarget::PluginParam { device_index, param_id, .. } => self
                 .plugin_param_values
-                .get(&(track_id, *slot, *param_id))
+                .get(&(track_id, *device_index, *param_id))
                 .copied(),
             // Image PiP: 同 track の first image event の field 値を現在値とする
             // (`docs/plan_image_automation.md` §4)。 drag が ImageEvent.field を
@@ -14698,70 +14365,14 @@ impl AppData {
 
     // -------- Plugin picker -----------------------------------------------
 
-    /// FIXME #29: `DeferredEdit::ReplaceInstrumentDemoting` の実体。 既存 dual-role
-    /// 音源を破棄せず生成器列 (midi_fx_chain) 末尾へ降格し、 新音源を Instrument へ
-    /// 据える。 RequestAllStates 完了後に呼ばれるので降格 plugin の最新 state は既に
-    /// Song に書き戻されており、 reconcile が `initial_state` で復元する。 host/audio の
-    /// slot 鍵は LoadSong では再キーされないため、 必ず `reconcile_plugins_with_song`
-    /// を通す (diff が「Instrument 置換 + MidiFx 新規ロード」 を生成 → 旧音源 destroy /
-    /// 降格 plugin は MidiFx に state 込みで載せ替わる)。
-    fn replace_instrument_demoting_inner(
-        &mut self,
-        track_id: u32,
-        new_plugin_id: String,
-        new_format: PluginFormat,
-    ) {
-        let mut demoted_new_slot: Option<PluginSlot> = None;
-        {
-            let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
-                return;
-            };
-            if let Some(demoted) = track.instrument.take() {
-                demoted_new_slot = Some(PluginSlot::MidiFx(track.midi_fx_chain.len() as u32));
-                track.midi_fx_chain.push(demoted);
-            }
-            track.instrument = Some(common::model::PluginInstance::new(
-                new_plugin_id.clone(),
-                new_format,
-            ));
-            // 新音源が builtin VOICEVOX なら vocal track 化 (select_plugin_from_db と同ロジック)。
-            track.source = if new_plugin_id.as_str() == common::plugin_db::BUILTIN_ID_VOICEVOX {
-                InstrumentSource::Vocal {
-                    speaker_id: common::voicevox::DEFAULT_SINGER_ID,
-                    style_name: "ノーマル".into(),
-                }
-            } else {
-                InstrumentSource::None
-            };
-        }
-        // FIXME #29/#31: demote as a LIVE MOVE in the plugin host — the demoted
-        // instance and its editor window survive (same window, same on-screen
-        // position, no audio re-instantiation glitch) instead of being
-        // destroyed + re-created. Mirror the move in our caches so reconcile
-        // only loads the NEW instrument (not the demoted one) and so the open
-        // editor stays tracked at its new generator slot.
-        if let Some(new_slot) = demoted_new_slot {
-            self.send_plugin(MainToChild::DemoteInstrumentToGenerator { track: track_id });
-            if let Some(info) = self.loaded_slots.remove(&(track_id, PluginSlot::Instrument)) {
-                self.loaded_slots.insert((track_id, new_slot), info);
-            }
-            if self.open_plugin_guis.remove(&(track_id, PluginSlot::Instrument)) {
-                self.open_plugin_guis.insert((track_id, new_slot));
-            }
-            // Move the cached param list too (keyed by slot) so the demoted
-            // plugin's parameters stay available at its new slot — otherwise
-            // the new instrument's PluginParamList clobbers the Instrument key
-            // and the demoted source's params are lost from the picker/lanes.
-            if let Some(params) = self.plugin_params.remove(&(track_id, PluginSlot::Instrument)) {
-                self.plugin_params.insert((track_id, new_slot), params);
-            }
-        }
-        self.reconcile_plugins_with_song();
-    }
-
+    /// 単一デバイスチェーン (`docs/plan_linear_chain.md` §5): plugin を選ぶと、
+    /// 役割を判定せず **チェーン末尾に append** する (`index = devices.len()`)。
+    /// 役割は位置から導出されるので、降格 / 昇格 / セクション振り分けは不要
+    /// (ユーザーが後で並び替える)。builtin VOICEVOX を挿したときだけ vocal track
+    /// 化する特例 (`source = Vocal`) は維持する。
     fn select_plugin_from_db(&mut self, id: String, keep_open: bool, open_gui: bool) {
         // 無修飾 / Shift は選択で閉じる。 Ctrl (keep_open) は開いたまま連続追加
-        // できる (各プラグインは自分の種別で振り分く)。
+        // できる。
         if !keep_open {
             self.is_plugin_picker_open = false;
         }
@@ -14776,153 +14387,65 @@ impl AppData {
         let path = entry.path.clone();
         let entry_id = entry.id.clone();
         let entry_format = entry.format;
-        // FIXME #29: 行き先は features ではなく **port 構成由来の capability** で決める
-        // (note 出力の有無は probe 済みの SSoT)。 dual-role は音源の空き状況で
-        // 生成器 / 音源に振り分ける。
-        let capability = PluginCapability::from_entry(entry);
+        // 役割導出の入力 (= ports)。append する device に持たせ、LoadSong で
+        // daw_audio に運ぶ (= daw_audio が DB なしに役割を導出できる SSoT)。
+        let ports = port_config_of(entry);
+        let is_voicevox = entry_id.as_str() == common::plugin_db::BUILTIN_ID_VOICEVOX;
         self.ensure_first_track();
 
         // master bus 選択時は track Vec ではなく Song.master_fx_chain を対象に
-        // する。 master は audio fx のみ持つので、 note 出力や音源能力を持つ
-        // プラグイン (生成器 / 音源 / dual-role) は挿せない。
-        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            if capability != PluginCapability::AudioFx {
-                tracing::warn!(
-                    ?capability,
-                    "master bus に audio fx 以外は挿せない"
-                );
-                return;
-            }
-            let track_id = common::model::MASTER_TRACK_ID;
-            let dest_slot = PluginSlot::Fx(self.song.master_fx_chain.len() as u32);
-            self.track_pending_load(track_id, dest_slot);
-            // Shift (open_gui=false) のときは GUI 自動 open しない (ロードはする)。
-            if open_gui {
-                self.pending_added_plugin_finalize.insert((track_id, dest_slot));
-            }
-            self.send_plugin(MainToChild::SetSlotPlugin {
-                track: track_id,
-                slot: dest_slot,
-                format: entry_format,
-                path,
-                plugin_id: entry_id.clone(),
-                initial_state: None,
-            });
-            self.song.master_fx_chain.push(common::model::PluginInstance::new(
-                entry_id,
-                entry_format,
-            ));
-            return;
-        }
+        // する (= 音源境界なしの全 audio FX、 末尾 append)。
+        let track_id = match self.cursor_track_id() {
+            Some(id) => id,
+            None => return,
+        };
+        let is_master = track_id == common::model::MASTER_TRACK_ID;
 
-        let Some(track_idx) = self.cursor_track_index() else {
-            return;
-        };
-        // PR2.1: send `Track::id` to the plugin host (track_idx は
-        // ローカルの song.tracks 操作のみで使う)。
-        let track_id = self.song.tracks[track_idx].id;
-        // FIXME #29: 行き先スロットは capability + 音源の空き状況で決まる。
-        // PureMidiEffect は生成器列、 AudioFx は audio-fx 列、 Instrument は音源スロット
-        // (単一なので 2 つ目は差し替え)。 DualRole (例: Scaler 2) は音源が空なら音源、
-        // 埋まっていれば「後段を鳴らす生成器」として生成器列末尾へ (grilled 既定挿入)。
-        let dest_slot = match capability {
-            PluginCapability::Instrument => PluginSlot::Instrument,
-            PluginCapability::AudioFx => {
-                let next = self.song.tracks[track_idx].fx_chain.len() as u32;
-                PluginSlot::Fx(next)
-            }
-            PluginCapability::PureMidiEffect => {
-                let next = self.song.tracks[track_idx].midi_fx_chain.len() as u32;
-                PluginSlot::MidiFx(next)
-            }
-            PluginCapability::DualRole => {
-                if self.song.tracks[track_idx].instrument.is_none() {
-                    PluginSlot::Instrument
-                } else {
-                    let next = self.song.tracks[track_idx].midi_fx_chain.len() as u32;
-                    PluginSlot::MidiFx(next)
-                }
-            }
-        };
-        // FIXME #29: 新 plugin が Instrument を占め、 既存音源が dual-role なら、 置換
-        // (= 既存破棄) でなく生成器列へ降格する (Scaler 2 を先に刺してから Analog Lab V を
-        // 刺すケース)。 純粋音源同士の置換 (既存挙動) は不変。 降格 plugin の最新 knob を
-        // 捕まえるため deferred (RequestAllStates 完了後に実行) に乗せる。
-        if dest_slot == PluginSlot::Instrument {
-            let existing_cap = self.song.tracks[track_idx]
-                .instrument
-                .as_ref()
-                .and_then(|inst| db.find_by_id(&inst.plugin_id))
-                .map(PluginCapability::from_entry);
-            if should_demote_existing_instrument(true, existing_cap) {
-                // 新音源の GUI auto-open は reconcile の load 完了で発火させる。
-                if open_gui {
-                    self.pending_added_plugin_finalize
-                        .insert((track_id, PluginSlot::Instrument));
-                }
-                let edit = DeferredEdit::ReplaceInstrumentDemoting {
-                    track_id,
-                    new_plugin_id: entry_id.clone(),
-                    new_format: entry_format,
-                };
-                if self.song_has_plugin() {
-                    self.enqueue_state_request(PendingStateRequest::Deferred(edit));
-                } else {
-                    // 既存 instrument が居る = plugin あり なので通常ここは通らない。 防御的に即時。
-                    self.push_undo_snapshot();
-                    self.execute_deferred_edit(edit);
-                }
+        // 挿入 index = 現在のチェーン長 (= 末尾 append)。
+        let dest_index = if is_master {
+            self.song.master_fx_chain.len() as u32
+        } else {
+            let Some(track_idx) = self.cursor_track_index() else {
                 return;
-            }
-        }
-        self.track_pending_load(track_id, dest_slot);
+            };
+            self.song.tracks[track_idx].devices.len() as u32
+        };
+
+        self.track_pending_load(track_id, dest_index);
         // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync + GUI 自動
         // open する (project-load の一斉復元はこの集合に積まれない)。 Shift
         // (open_gui=false) のときは GUI 自動 open を抑止 (ロードはする)。
         if open_gui {
-            self.pending_added_plugin_finalize.insert((track_id, dest_slot));
+            self.pending_added_plugin_finalize.insert((track_id, dest_index));
         }
         self.send_plugin(MainToChild::SetSlotPlugin {
             track: track_id,
-            slot: dest_slot,
+            index: dest_index,
             format: entry_format,
             path,
             plugin_id: entry_id.clone(),
             initial_state: None,
         });
-        if let Some(track) = self.song.tracks.get_mut(track_idx) {
-            match dest_slot {
-                PluginSlot::Instrument => {
-                    track.instrument = Some(common::model::PluginInstance::new(
-                        entry_id.clone(),
-                        entry_format,
-                    ));
-                    // 統合モデル: instrument に builtin VOICEVOX を挿したら vocal track
-                    // 化 (source=Vocal)、 それ以外の音源なら通常 (None) に戻す。 旧
-                    // "+Vocal Track" ボタンの役割をここに集約 (sync_vocal_metadata が
-                    // source==Vocal を見て歌詞 synth を走らせる)。
-                    track.source = if entry_id.as_str() == common::plugin_db::BUILTIN_ID_VOICEVOX
-                    {
-                        InstrumentSource::Vocal {
-                            speaker_id: common::voicevox::DEFAULT_SINGER_ID,
-                            style_name: "ノーマル".into(),
-                        }
-                    } else {
-                        InstrumentSource::None
-                    };
-                }
-                PluginSlot::Fx(_) => {
-                    track.fx_chain.push(common::model::PluginInstance::new(
-                        entry_id.clone(),
-                        entry_format,
-                    ));
-                }
-                PluginSlot::MidiFx(_) => {
-                    track.midi_fx_chain.push(common::model::PluginInstance::new(
-                        entry_id.clone(),
-                        entry_format,
-                    ));
-                }
+
+        let new_device = common::model::PluginInstance::with_ports(
+            entry_id,
+            entry_format,
+            ports,
+        );
+        if is_master {
+            self.song.master_fx_chain.push(new_device);
+        } else if let Some(track_idx) = self.cursor_track_index() {
+            let track = &mut self.song.tracks[track_idx];
+            track.devices.push(new_device);
+            // builtin VOICEVOX を挿したら vocal track 化 (source=Vocal)。 旧
+            // "+Vocal Track" ボタンの役割をここに集約 (sync_vocal_metadata が
+            // source==Vocal を見て歌詞 synth を走らせる)。 それ以外を挿しても
+            // 既存の vocal 状態は変えない (= 単に device を 1 つ足すだけ)。
+            if is_voicevox {
+                track.source = InstrumentSource::Vocal {
+                    speaker_id: common::voicevox::DEFAULT_SINGER_ID,
+                    style_name: "ノーマル".into(),
+                };
             }
         }
     }
@@ -15019,6 +14542,7 @@ impl AppData {
                         e.has_note_input = cfg.has_note_input;
                         e.has_note_output = cfg.has_note_output;
                         e.has_audio_output = cfg.has_audio_output;
+                        e.has_audio_input = cfg.has_audio_input;
                     }
                 }
                 if total > 0 {
@@ -15130,13 +14654,12 @@ impl AppData {
             .filter(|t| self.is_return_track(t.id))
             .count();
         let id = self.song.alloc_track_id();
-        let track = Track {
-            id,
-            name: format!("Return {}", existing_returns + 1),
+        let track = track_with(|t| {
+            t.id = id;
+            t.name = format!("Return {}", existing_returns + 1);
             // リターンは master 直下に流す。
-            parent_group_id: None,
-            ..Track::default()
-        };
+            t.parent_group_id = None;
+        });
         self.song.tracks.push(track);
         // 選択中 track があれば、 そこから新リターンへ即座に send を 1 本張る
         // (Ableton "Add Return" の即時性)。 選択が無ければ wiring だけ作って
@@ -15608,7 +15131,7 @@ impl AppData {
     #[cfg(windows)]
     fn action_import_video(&mut self, paths: Vec<PathBuf>, target_beat: Option<f64>) {
         use common::model::{
-            AudioContent, AudioEvent, ClipContent, Track, VideoContent, VideoEvent,
+            AudioContent, AudioEvent, ClipContent, VideoContent, VideoEvent,
         };
 
         if paths.is_empty() {
@@ -15685,11 +15208,10 @@ impl AppData {
                 display_name.clone(),
             );
             let video_track_id = self.song.alloc_track_id();
-            let mut video_track = Track {
-                id: video_track_id,
-                name: format!("{display_name} (Video)"),
-                ..Track::default()
-            };
+            let mut video_track = track_with(|t| {
+                t.id = video_track_id;
+                t.name = format!("{display_name} (Video)");
+            });
             let v_clip_id = video_track.alloc_clip_id();
             video_track.clips.push(Clip {
                 id: v_clip_id,
@@ -15727,11 +15249,10 @@ impl AppData {
                     format!("{display_name} (audio)"),
                 );
                 let audio_track_id = self.song.alloc_track_id();
-                let mut audio_track = Track {
-                    id: audio_track_id,
-                    name: format!("{display_name} (Audio)"),
-                    ..Track::default()
-                };
+                let mut audio_track = track_with(|t| {
+                    t.id = audio_track_id;
+                    t.name = format!("{display_name} (Audio)");
+                });
                 let a_clip_id = audio_track.alloc_clip_id();
                 audio_track.clips.push(Clip {
                     id: a_clip_id,
@@ -15907,11 +15428,10 @@ impl AppData {
                     let image_track_id = self.song.alloc_track_id();
                     self.song.tracks.insert(
                         0,
-                        Track {
-                            id: image_track_id,
-                            name: format!("{display_name} (Image)"),
-                            ..Track::default()
-                        },
+                        track_with(|t| {
+                            t.id = image_track_id;
+                            t.name = format!("{display_name} (Image)");
+                        }),
                     );
                     0
                 }
@@ -17006,12 +16526,12 @@ fn add_track_insert_index(tracks: &[Track], selected: &[u32]) -> usize {
 
 #[cfg(test)]
 mod add_track_insert_index_tests {
-    use super::add_track_insert_index;
+    use super::{add_track_insert_index, track_with};
     use common::model::Track;
 
     fn tracks(ids: &[u32]) -> Vec<Track> {
         ids.iter()
-            .map(|&id| Track { id, ..Track::default() })
+            .map(|&id| track_with(|t| t.id = id))
             .collect()
     }
 
@@ -17180,19 +16700,26 @@ fn propagate_clip_color(tracks: &mut [Track], target: ClipRef, color: Option<[f3
 
 #[cfg(test)]
 mod clip_color_tests {
-    use super::{ClipRef, propagate_clip_color};
+    use super::{ClipRef, propagate_clip_color, track_with};
     use common::model::{Clip, Track};
 
     fn clip(id: u32, content_id: u32) -> Clip {
         Clip { id, content_id, length_beats: 4.0, ..Clip::default() }
     }
 
+    fn track(id: u32, clips: Vec<Clip>) -> Track {
+        track_with(|t| {
+            t.id = id;
+            t.clips = clips;
+        })
+    }
+
     #[test]
     fn set_color_propagates_to_all_clips_sharing_content_cross_track() {
         // track0: cid=7 と cid=9、 track1: cid=7 (linked, cross-track)。
         let mut tracks = vec![
-            Track { id: 1, clips: vec![clip(1, 7), clip(2, 9)], ..Track::default() },
-            Track { id: 2, clips: vec![clip(3, 7)], ..Track::default() },
+            track(1, vec![clip(1, 7), clip(2, 9)]),
+            track(2, vec![clip(3, 7)]),
         ];
         propagate_clip_color(&mut tracks, ClipRef { track: 0, clip: 0 }, Some([0.9, 0.3, 0.3]));
         // cid==7 は cross-track 含め全部同色、 cid==9 は不変 (= 確定動作 1)。
@@ -17205,7 +16732,7 @@ mod clip_color_tests {
     fn set_color_content_id_zero_colors_only_target() {
         // content_id == 0 (未採番 sentinel) は伝播せず target のみ (別の cid==0 を巻き込まない)。
         let mut tracks =
-            vec![Track { id: 1, clips: vec![clip(1, 0), clip(2, 0)], ..Track::default() }];
+            vec![track(1, vec![clip(1, 0), clip(2, 0)])];
         propagate_clip_color(&mut tracks, ClipRef { track: 0, clip: 0 }, Some([0.1, 0.2, 0.3]));
         assert_eq!(tracks[0].clips[0].color, Some([0.1, 0.2, 0.3]));
         assert_eq!(tracks[0].clips[1].color, None);
@@ -17213,7 +16740,7 @@ mod clip_color_tests {
 
     #[test]
     fn set_color_out_of_range_target_is_noop() {
-        let mut tracks = vec![Track { id: 1, clips: vec![clip(1, 7)], ..Track::default() }];
+        let mut tracks = vec![track(1, vec![clip(1, 7)])];
         propagate_clip_color(&mut tracks, ClipRef { track: 5, clip: 0 }, Some([0.5, 0.5, 0.5]));
         assert_eq!(tracks[0].clips[0].color, None);
     }
@@ -17464,13 +16991,12 @@ mod master_fx_tests {
     use super::{compute_slot_reconcile_actions, SlotReconcileAction};
     use common::model::{MASTER_TRACK_ID, PluginInstance, Song};
     use common::plugin_format::PluginFormat;
-    use common::protocol::PluginSlot;
     use std::collections::HashMap;
 
     #[test]
     fn reconcile_emits_loadslot_for_master_fx() {
         // master_fx_chain に 1 plugin、 host (loaded_slots) は空 → master の
-        // Fx(0) に対する LoadSlot が 1 件出る。
+        // device index 0 に対する LoadSlot が 1 件出る。
         let mut song = Song::default();
         song.master_fx_chain.push(PluginInstance::new(
             "vendor.reverb".to_string(),
@@ -17481,9 +17007,9 @@ mod master_fx_tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                SlotReconcileAction::LoadSlot { track_id, slot, plugin_id_str, .. }
+                SlotReconcileAction::LoadSlot { track_id, index, plugin_id_str, .. }
                     if *track_id == MASTER_TRACK_ID
-                        && *slot == PluginSlot::Fx(0)
+                        && *index == 0
                         && plugin_id_str == "vendor.reverb"
             )),
             "master fx に対する LoadSlot が emit されること: {actions:?}"

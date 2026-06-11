@@ -23,7 +23,6 @@ const TEXT_DIM: Color = Color { r: 0.62, g: 0.65, b: 0.70, a: 1.0 };
 const ROW_BG: Color = Color { r: 0.20, g: 0.20, b: 0.24, a: 1.0 };
 const ROW_BG_HOVER: Color = Color { r: 0.24, g: 0.24, b: 0.30, a: 1.0 };
 const ROW_BG_DRAGGING: Color = Color { r: 0.30, g: 0.40, b: 0.55, a: 0.85 };
-const SECTION_TEXT: Color = Color { r: 0.55, g: 0.62, b: 0.78, a: 1.0 };
 const DROP_INDICATOR: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
 
 // Audio event toggle (Reverse / Muted) 用 style。 mixer_strips の
@@ -1875,23 +1874,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         },
         |ui, entry, idx, row_rect, _selected, _dragging| {
             ui.label_at(
-                ("inspector_row_section", idx),
-                &entry.section_label,
-                row_rect.x + 6.0,
-                row_rect.y + 8.0,
-                10.0,
-                SECTION_TEXT,
-            );
-            ui.label_at(
                 ("inspector_row_name", idx),
                 &entry.plugin_name,
-                row_rect.x + 60.0,
+                row_rect.x + 8.0,
                 row_rect.y + 8.0,
                 11.0,
                 TEXT,
             );
-            let kind = entry.slot_kind;
-            let index = entry.slot_index;
+            let device_index = entry.device_index;
             let gui_x = row_rect.x + row_rect.w - btn_gui_w - btn_x_w - 4.0;
             ui.button_at(
                 ("inspector_row_gui", idx),
@@ -1904,10 +1894,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 },
                 move || {
                     Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::ToggleSlotGui {
-                            slot_kind: kind,
-                            slot_index: index,
-                        })
+                        app.handle_event(AppEvent::ToggleSlotGui { index: device_index })
                     })
                 },
             );
@@ -1923,10 +1910,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 },
                 move || {
                     Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::RemoveSlot {
-                            slot_kind: kind,
-                            slot_index: index,
-                        })
+                        app.handle_event(AppEvent::RemoveDevice { index: device_index })
                     })
                 },
             );
@@ -2004,14 +1988,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ) && let Some(choice) = choices.get(picked)
             {
                 let track_id = entry.track_id;
-                let slot_kind = entry.slot_kind;
-                let slot_index = entry.slot_index;
+                let device_index = entry.device_index;
                 let new_source = choice.track_id;
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetSidechainSource {
                         track_id,
-                        slot_kind,
-                        slot_index,
+                        device_index,
                         port: 0,
                         source: new_source,
                     });

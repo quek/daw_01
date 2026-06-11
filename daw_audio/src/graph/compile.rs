@@ -136,21 +136,11 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         if let Some(kids) = children_of.get(&track.id) {
             out.extend(kids.iter().copied());
         }
-        let push_chain_sc = |chain: &[common::model::PluginInstance],
-                             out: &mut Vec<u32>| {
-            for p in chain {
-                for src_id_opt in &p.sidechain_sources {
-                    if let Some(src_id) = src_id_opt
-                        && let Some(&src_idx) = id_to_idx.get(src_id)
-                    {
-                        out.push(src_idx);
-                    }
-                }
-            }
-        };
-        push_chain_sc(&track.midi_fx_chain, &mut out);
-        if let Some(inst) = &track.instrument {
-            for src_id_opt in &inst.sidechain_sources {
+        // v23 single-chain: sidechain wiring lives on every device's
+        // `sidechain_sources` regardless of its derived role, so a single
+        // walk over `devices` covers what the old per-section walks did.
+        for p in &track.devices {
+            for src_id_opt in &p.sidechain_sources {
                 if let Some(src_id) = src_id_opt
                     && let Some(&src_idx) = id_to_idx.get(src_id)
                 {
@@ -158,7 +148,6 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
                 }
             }
         }
-        push_chain_sc(&track.fx_chain, &mut out);
         // send edges: this track (the destination / return) depends on
         // every track that sends into it — the source must run before the
         // send is mixed in. Covers send feedback (A→B→A, self-send) for
@@ -301,9 +290,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             nodes.push(NodeOp::SidechainTap {
                 src: BufRef::TrackScratch(src_idx),
                 dst_track: common::model::MASTER_TRACK_ID,
-                dst_slot: common::protocol::PluginSlot::Fx(
-                    u32::try_from(slot_idx).unwrap_or(u32::MAX),
-                ),
+                dst_index: u32::try_from(slot_idx).unwrap_or(u32::MAX),
                 aux_in_port: port_idx as u8,
             });
         }
@@ -380,14 +367,18 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     }
 
     // PR4.5 sidechain plugin-internal alignment: per-track input delay.
-    // Only fx_chain plugin sidechain_sources contribute (instrument sidechain
-    // is MVP-out-of-scope because aligning it would require also delaying
-    // MIDI events into the instrument). Walk each track's fx_chain and
-    // pick `max(path_latency(src))` over all sidechain entries.
+    // The delay is applied to the track's main signal so it lines up with any
+    // sidechain a device reads. Only audio-processing devices (= has both an
+    // audio input and an audio output) can read a sidechain, so only those
+    // contribute (a pure source / MIDI device has no main-in to delay against).
+    // v23 single-chain: a direct port predicate, no role derivation. Edit-time.
     let mut input_delay_per_track = vec![0u32; n];
     for (i, track) in song.tracks.iter().enumerate() {
         let mut max_sc: u32 = 0;
-        for p in &track.fx_chain {
+        for p in &track.devices {
+            if !(p.ports.has_audio_input && p.ports.has_audio_output) {
+                continue;
+            }
             for src_id_opt in &p.sidechain_sources {
                 if let Some(src_id) = src_id_opt
                     && let Some(&src_idx) = id_to_idx.get(src_id)
@@ -410,12 +401,14 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     })
 }
 
-/// PR4 sidechain: track の chain (`midi_fx_chain` / `instrument` /
-/// `fx_chain`) を順に walk して、 各 plugin の `sidechain_sources` 中で
-/// 有効な (= source track が song に存在する) entry について
-/// `NodeOp::SidechainTap` を `nodes` に push する。 dangling reference は
-/// 寛容に skip (compile error にしない)。 source track の `ProcessTrack`
-/// が前に emit されていれば scratch が埋まっているので tap は意味を持つ。
+/// PR4 sidechain: track の単一 `devices` チェーンを walk して、 各 plugin の
+/// `sidechain_sources` 中で有効な (= source track が song に存在する) entry に
+/// ついて `NodeOp::SidechainTap` を `nodes` に push する。 v23 single-chain:
+/// `dst_index` は device の `Track.devices` 上の位置。 sidechain は役割に依らず
+/// どの device にも貼れるので、 役割導出なしに index 順で walk すればよい。
+/// dangling reference は寛容に skip (compile error にしない)。 source track の
+/// `ProcessTrack` が前に emit されていれば scratch が埋まっているので tap は
+/// 意味を持つ。
 fn emit_sidechain_taps(
     track: &common::model::Track,
     _dst_track_idx: u32,
@@ -423,39 +416,10 @@ fn emit_sidechain_taps(
     nodes: &mut Vec<NodeOp>,
 ) {
     let dst_track = track.id;
-    let push_taps = |nodes: &mut Vec<NodeOp>,
-                     plugins: &[common::model::PluginInstance],
-                     slot_kind: fn(u32) -> common::protocol::PluginSlot| {
-        for (slot_idx, inst) in plugins.iter().enumerate() {
-            // aux port は engine が `MAX_AUX_IN` までしか staging しないので
-            // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証し、
-            // `as u8` の wrap を防ぐ。
-            for (port_idx, src_track_id_opt) in inst
-                .sidechain_sources
-                .iter()
-                .take(common::process_data::MAX_AUX_IN)
-                .enumerate()
-            {
-                let Some(src_track_id) = src_track_id_opt else {
-                    continue;
-                };
-                let Some(src_idx) = id_to_idx.get(src_track_id) else {
-                    // dangling reference: silently skip
-                    continue;
-                };
-                nodes.push(NodeOp::SidechainTap {
-                    src: BufRef::TrackScratch(*src_idx),
-                    dst_track,
-                    dst_slot: slot_kind(u32::try_from(slot_idx).unwrap_or(u32::MAX)),
-                    aux_in_port: port_idx as u8,
-                });
-            }
-        }
-    };
-    push_taps(nodes, &track.midi_fx_chain, common::protocol::PluginSlot::MidiFx);
-    if let Some(inst) = &track.instrument {
+    for (device_index, inst) in track.devices.iter().enumerate() {
         // aux port は engine が `MAX_AUX_IN` までしか staging しないので
-        // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証する。
+        // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証し、
+        // `as u8` の wrap を防ぐ。
         for (port_idx, src_track_id_opt) in inst
             .sidechain_sources
             .iter()
@@ -466,17 +430,17 @@ fn emit_sidechain_taps(
                 continue;
             };
             let Some(src_idx) = id_to_idx.get(src_track_id) else {
+                // dangling reference: silently skip
                 continue;
             };
             nodes.push(NodeOp::SidechainTap {
                 src: BufRef::TrackScratch(*src_idx),
                 dst_track,
-                dst_slot: common::protocol::PluginSlot::Instrument,
+                dst_index: u32::try_from(device_index).unwrap_or(u32::MAX),
                 aux_in_port: port_idx as u8,
             });
         }
     }
-    push_taps(nodes, &track.fx_chain, common::protocol::PluginSlot::Fx);
 }
 
 /// `path_latency[idx]` を計算してキャッシュする。 既に値があれば即返却
@@ -485,9 +449,8 @@ fn emit_sidechain_taps(
 /// PR3: group (`is_group` メンバ) は子の path_latency の最大値を自身の input
 /// bus latency として、 そこに自身の `reported_latency_samples` を足す。
 ///
-/// PR4 sidechain × PDC: track の plugin chain (`midi_fx_chain` / `instrument`
-/// / `fx_chain`) の各 plugin の `sidechain_sources` も `input bus latency`
-/// に取り込む。 すなわち:
+/// PR4 sidechain × PDC: track の単一 `devices` チェーン上の各 plugin の
+/// `sidechain_sources` も `input bus latency` に取り込む。 すなわち:
 ///
 ///   input_latency(T) = max(
 ///       max(child.path_latency for child in children_of(T)),
@@ -567,17 +530,11 @@ fn compute_path_latency(
             }
         }
     };
-    for p in &track.midi_fx_chain {
-        for src in &p.sidechain_sources {
-            consider(src, cache);
-        }
-    }
-    if let Some(inst) = &track.instrument {
-        for src in &inst.sidechain_sources {
-            consider(src, cache);
-        }
-    }
-    for p in &track.fx_chain {
+    // v23 single-chain: latency propagation cares about every device's
+    // sidechain source regardless of role (a sidechain edge from any device
+    // raises this track's input latency), so a single walk over `devices`
+    // replaces the old per-section walks.
+    for p in &track.devices {
         for src in &p.sidechain_sources {
             consider(src, cache);
         }
@@ -615,6 +572,44 @@ fn compute_path_latency(
 mod tests {
     use super::*;
     use common::model::{Song, Track};
+    use common::port_config::PortConfig;
+
+    /// v23 single-chain: `Track::default()` を mutator で埋める helper。
+    /// downstream crate (daw_audio) の test で `Track { .., ..Track::default() }`
+    /// を書くと、 `common` 内の `pub(crate)` legacy migration fields が見えず
+    /// E0451 になるため、 private field に触れない default + mutate で回避する。
+    fn track(f: impl FnOnce(&mut Track)) -> Track {
+        let mut t = Track::default();
+        f(&mut t);
+        t
+    }
+
+    /// v23 single-chain: a pure audio-FX device (audio output only, no note
+    /// I/O) — derives as `AudioEffect` when no device in the chain has note
+    /// input. Used by the sidechain / PDC tests where the dest plugin is a
+    /// compressor on the track's audio signal.
+    fn audio_fx_ports() -> PortConfig {
+        PortConfig {
+            has_note_input: false,
+            has_note_output: false,
+            has_audio_output: true,
+            // pure audio-FX: audio を加工する → audio 入力あり。
+            has_audio_input: true,
+        }
+    }
+
+    /// v23 single-chain: an instrument device (note input + audio output) —
+    /// derives as `Instrument` (MIDI→audio). Used by the instrument-sidechain
+    /// test.
+    fn instrument_ports() -> PortConfig {
+        PortConfig {
+            has_note_input: true,
+            has_note_output: false,
+            has_audio_output: true,
+            // instrument: note→audio 生成。 audio を加工しない → audio 入力なし。
+            has_audio_input: false,
+        }
+    }
 
     #[test]
     fn empty_song_compiles_to_master_only_mix() {
@@ -634,14 +629,12 @@ mod tests {
     fn flat_audio_tracks_emit_process_then_mix() {
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    ..Track::default()
-                },
+                track(|t| {
+                    t.id = 1;
+                }),
+                track(|t| {
+                    t.id = 2;
+                }),
             ],
             ..Song::default()
         };
@@ -683,30 +676,26 @@ mod tests {
         //   Audio 4 (Lead) → Master  (no parent)
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Drums".into(),
-                    parent_group_id: None,
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Kick".into(),
-                    parent_group_id: Some(1),
-                    ..Track::default()
-                },
-                Track {
-                    id: 3,
-                    name: "Snare".into(),
-                    parent_group_id: Some(1),
-                    ..Track::default()
-                },
-                Track {
-                    id: 4,
-                    name: "Lead".into(),
-                    parent_group_id: None,
-                    ..Track::default()
-                },
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Drums".into();
+                    t.parent_group_id = None;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Kick".into();
+                    t.parent_group_id = Some(1);
+                }),
+                track(|t| {
+                    t.id = 3;
+                    t.name = "Snare".into();
+                    t.parent_group_id = Some(1);
+                }),
+                track(|t| {
+                    t.id = 4;
+                    t.name = "Lead".into();
+                    t.parent_group_id = None;
+                }),
             ],
             ..Song::default()
         };
@@ -808,21 +797,18 @@ mod tests {
         //     Audio 3 (parent=2)
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    parent_group_id: None,
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    parent_group_id: Some(1),
-                    ..Track::default()
-                },
-                Track {
-                    id: 3,
-                    parent_group_id: Some(2),
-                    ..Track::default()
-                },
+                track(|t| {
+                    t.id = 1;
+                    t.parent_group_id = None;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.parent_group_id = Some(1);
+                }),
+                track(|t| {
+                    t.id = 3;
+                    t.parent_group_id = Some(2);
+                }),
             ],
             ..Song::default()
         };
@@ -868,16 +854,14 @@ mod tests {
         // Track 1 ↔ Track 2 cycle.
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    parent_group_id: Some(2),
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    parent_group_id: Some(1),
-                    ..Track::default()
-                },
+                track(|t| {
+                    t.id = 1;
+                    t.parent_group_id = Some(2);
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.parent_group_id = Some(1);
+                }),
             ],
             ..Song::default()
         };
@@ -891,15 +875,13 @@ mod tests {
         // parent_group_id, so track 1 is treated as a group bus.
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    parent_group_id: Some(1),
-                    ..Track::default()
-                },
+                track(|t| {
+                    t.id = 1;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.parent_group_id = Some(1);
+                }),
             ],
             ..Song::default()
         };
@@ -924,11 +906,10 @@ mod tests {
     #[test]
     fn parent_pointing_to_unknown_track_is_rejected() {
         let song = Song {
-            tracks: vec![Track {
-                id: 1,
-                parent_group_id: Some(99),
-                ..Track::default()
-            }],
+            tracks: vec![track(|t| {
+                t.id = 1;
+                t.parent_group_id = Some(99);
+            })],
             ..Song::default()
         };
         assert_eq!(
@@ -952,18 +933,16 @@ mod tests {
     fn pdc_parallel_tracks_emit_compensating_delay_for_lower_latency_path() {
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Clean".into(),
-                    reported_latency_samples: 0,
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Latent".into(),
-                    reported_latency_samples: 100,
-                    ..Track::default()
-                },
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Clean".into();
+                    t.reported_latency_samples = 0;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Latent".into();
+                    t.reported_latency_samples = 100;
+                }),
             ],
             ..Song::default()
         };
@@ -1059,18 +1038,16 @@ mod tests {
 
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "A".into(),
-                    reported_latency_samples: 0,
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "B".into(),
-                    reported_latency_samples: 100,
-                    ..Track::default()
-                },
+                track(|t| {
+                    t.id = 1;
+                    t.name = "A".into();
+                    t.reported_latency_samples = 0;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "B".into();
+                    t.reported_latency_samples = 100;
+                }),
             ],
             ..Song::default()
         };
@@ -1282,27 +1259,25 @@ mod tests {
     fn sidechain_emits_tap_before_destination_process_track() {
         use common::model::PluginInstance;
         use common::plugin_format::PluginFormat;
-        use common::protocol::PluginSlot;
 
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Source".into(),
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Dest".into(),
-                    fx_chain: vec![PluginInstance {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Source".into();
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Dest".into();
+                    t.devices = vec![PluginInstance {
                         plugin_id: "test.compressor".into(),
                         format: PluginFormat::Vst3,
                         state: None,
                         // aux input port 0 ← Track 1's output
                         sidechain_sources: vec![Some(1)],
-                    }],
-                    ..Track::default()
-                },
+                        ports: audio_fx_ports(),
+                    }];
+                }),
             ],
             ..Song::default()
         };
@@ -1318,7 +1293,7 @@ mod tests {
                     NodeOp::SidechainTap {
                         src: BufRef::TrackScratch(0),
                         dst_track: 2,
-                        dst_slot: PluginSlot::Fx(0),
+                        dst_index: 0,
                         aux_in_port: 0,
                     }
                 )
@@ -1360,21 +1335,20 @@ mod tests {
     fn master_fx_sidechain_emits_tap_after_master_mix() {
         use common::model::{PluginInstance, MASTER_TRACK_ID};
         use common::plugin_format::PluginFormat;
-        use common::protocol::PluginSlot;
 
         // Track 1 → master bus fx[0] の aux input。 master fx の SidechainTap は
         // master Mix の **後** (source scratch 確定後) に emit される。
         let song = Song {
-            tracks: vec![Track {
-                id: 1,
-                name: "Source".into(),
-                ..Track::default()
-            }],
+            tracks: vec![track(|t| {
+                t.id = 1;
+                t.name = "Source".into();
+            })],
             master_fx_chain: vec![PluginInstance {
                 plugin_id: "test.bus_comp".into(),
                 format: PluginFormat::Vst3,
                 state: None,
                 sidechain_sources: vec![Some(1)],
+                ports: audio_fx_ports(),
             }],
             ..Song::default()
         };
@@ -1389,7 +1363,7 @@ mod tests {
                     NodeOp::SidechainTap {
                         src: BufRef::TrackScratch(0),
                         dst_track,
-                        dst_slot: PluginSlot::Fx(0),
+                        dst_index: 0,
                         aux_in_port: 0,
                     } if *dst_track == MASTER_TRACK_ID
                 )
@@ -1452,24 +1426,23 @@ mod tests {
 
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Source".into(),
-                    reported_latency_samples: 100,
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Dest".into(),
-                    reported_latency_samples: 50,
-                    fx_chain: vec![PluginInstance {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Source".into();
+                    t.reported_latency_samples = 100;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Dest".into();
+                    t.reported_latency_samples = 50;
+                    t.devices = vec![PluginInstance {
                         plugin_id: "test.compressor".into(),
                         format: PluginFormat::Vst3,
                         state: None,
                         sidechain_sources: vec![Some(1)],
-                    }],
-                    ..Track::default()
-                },
+                        ports: audio_fx_ports(),
+                    }];
+                }),
             ],
             ..Song::default()
         };
@@ -1554,29 +1527,27 @@ mod tests {
 
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Source".into(),
-                    reported_latency_samples: 100,
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Dest".into(),
-                    reported_latency_samples: 50,
-                    fx_chain: vec![PluginInstance {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Source".into();
+                    t.reported_latency_samples = 100;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Dest".into();
+                    t.reported_latency_samples = 50;
+                    t.devices = vec![PluginInstance {
                         plugin_id: "test.compressor".into(),
                         format: PluginFormat::Vst3,
                         state: None,
                         sidechain_sources: vec![Some(1)],
-                    }],
-                    ..Track::default()
-                },
-                Track {
-                    id: 3,
-                    name: "Bystander".into(),
-                    ..Track::default()
-                },
+                        ports: audio_fx_ports(),
+                    }];
+                }),
+                track(|t| {
+                    t.id = 3;
+                    t.name = "Bystander".into();
+                }),
             ],
             ..Song::default()
         };
@@ -1614,23 +1585,25 @@ mod tests {
 
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Source".into(),
-                    reported_latency_samples: 100,
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Dest".into(),
-                    instrument: Some(PluginInstance {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Source".into();
+                    t.reported_latency_samples = 100;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Dest".into();
+                    // v23 single-chain: an instrument device (note in + audio
+                    // out) → derives as Instrument, NOT AudioEffect, so its
+                    // sidechain does not contribute to input_delay_per_track.
+                    t.devices = vec![PluginInstance {
                         plugin_id: "test.synth".into(),
                         format: PluginFormat::Vst3,
                         state: None,
                         sidechain_sources: vec![Some(1)],
-                    }),
-                    ..Track::default()
-                },
+                        ports: instrument_ports(),
+                    }];
+                }),
             ],
             ..Song::default()
         };
@@ -1657,28 +1630,28 @@ mod tests {
         // B(id=2) の plugin が A(id=1) からの sidechain を要求 → cycle。
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "A".into(),
-                    fx_chain: vec![PluginInstance {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "A".into();
+                    t.devices = vec![PluginInstance {
                         plugin_id: "test.compressor".into(),
                         format: PluginFormat::Vst3,
                         state: None,
                         sidechain_sources: vec![Some(2)],
-                    }],
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "B".into(),
-                    fx_chain: vec![PluginInstance {
+                        ports: audio_fx_ports(),
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "B".into();
+                    t.devices = vec![PluginInstance {
                         plugin_id: "test.compressor".into(),
                         format: PluginFormat::Vst3,
                         state: None,
                         sidechain_sources: vec![Some(1)],
-                    }],
-                    ..Track::default()
-                },
+                        ports: audio_fx_ports(),
+                    }];
+                }),
             ],
             ..Song::default()
         };
@@ -1696,17 +1669,17 @@ mod tests {
         use common::plugin_format::PluginFormat;
 
         let song = Song {
-            tracks: vec![Track {
-                id: 1,
-                name: "Lone".into(),
-                fx_chain: vec![PluginInstance {
+            tracks: vec![track(|t| {
+                t.id = 1;
+                t.name = "Lone".into();
+                t.devices = vec![PluginInstance {
                     plugin_id: "test.compressor".into(),
                     format: PluginFormat::Vst3,
                     state: None,
                     sidechain_sources: vec![Some(99)], // 存在しない track
-                }],
-                ..Track::default()
-            }],
+                    ports: audio_fx_ports(),
+                }];
+            })],
             ..Song::default()
         };
         let sched = compile_schedule(&song).unwrap();
@@ -1729,22 +1702,20 @@ mod tests {
         // Vocal (id 1, idx 0) post-fader sends to Reverb (id 2, idx 1).
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Vocal".into(),
-                    sends: vec![Send {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Vocal".into();
+                    t.sends = vec![Send {
                         dest_track_id: 2,
                         gain: 0.5,
                         mode: SendMode::PostFader,
                         enabled: true,
-                    }],
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Reverb".into(),
-                    ..Track::default()
-                },
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Reverb".into();
+                }),
             ],
             ..Song::default()
         };
@@ -1832,22 +1803,20 @@ mod tests {
 
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Vocal".into(),
-                    sends: vec![Send {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Vocal".into();
+                    t.sends = vec![Send {
                         dest_track_id: 2,
                         gain: 1.0,
                         mode: SendMode::PreFader,
                         enabled: true,
-                    }],
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Cue".into(),
-                    ..Track::default()
-                },
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Cue".into();
+                }),
             ],
             ..Song::default()
         };
@@ -1871,17 +1840,16 @@ mod tests {
         use common::model::{Send, SendMode};
 
         let song = Song {
-            tracks: vec![Track {
-                id: 1,
-                name: "A".into(),
-                sends: vec![Send {
+            tracks: vec![track(|t| {
+                t.id = 1;
+                t.name = "A".into();
+                t.sends = vec![Send {
                     dest_track_id: 1, // sends to itself
                     gain: 1.0,
                     mode: SendMode::PostFader,
                     enabled: true,
-                }],
-                ..Track::default()
-            }],
+                }];
+            })],
             ..Song::default()
         };
         assert_eq!(compile_schedule(&song).err(), Some(GraphError::Cycle));
@@ -1893,28 +1861,26 @@ mod tests {
 
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "A".into(),
-                    sends: vec![Send {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "A".into();
+                    t.sends = vec![Send {
                         dest_track_id: 2,
                         gain: 1.0,
                         mode: SendMode::PostFader,
                         enabled: true,
-                    }],
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "B".into(),
-                    sends: vec![Send {
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "B".into();
+                    t.sends = vec![Send {
                         dest_track_id: 1,
                         gain: 1.0,
                         mode: SendMode::PostFader,
                         enabled: true,
-                    }],
-                    ..Track::default()
-                },
+                    }];
+                }),
             ],
             ..Song::default()
         };
@@ -1926,17 +1892,16 @@ mod tests {
         use common::model::{Send, SendMode};
 
         let song = Song {
-            tracks: vec![Track {
-                id: 1,
-                name: "Lone".into(),
-                sends: vec![Send {
+            tracks: vec![track(|t| {
+                t.id = 1;
+                t.name = "Lone".into();
+                t.sends = vec![Send {
                     dest_track_id: 99, // no such track
                     gain: 1.0,
                     mode: SendMode::PostFader,
                     enabled: true,
-                }],
-                ..Track::default()
-            }],
+                }];
+            })],
             ..Song::default()
         };
         let sched = compile_schedule(&song).unwrap();
@@ -1968,24 +1933,22 @@ mod tests {
         // dry Vocal (latency 0) must be delayed 100 to align with the wet.
         let song = Song {
             tracks: vec![
-                Track {
-                    id: 1,
-                    name: "Vocal".into(),
-                    reported_latency_samples: 0,
-                    sends: vec![Send {
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Vocal".into();
+                    t.reported_latency_samples = 0;
+                    t.sends = vec![Send {
                         dest_track_id: 2,
                         gain: 0.5,
                         mode: SendMode::PostFader,
                         enabled: true,
-                    }],
-                    ..Track::default()
-                },
-                Track {
-                    id: 2,
-                    name: "Reverb".into(),
-                    reported_latency_samples: 100,
-                    ..Track::default()
-                },
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Reverb".into();
+                    t.reported_latency_samples = 100;
+                }),
             ],
             ..Song::default()
         };

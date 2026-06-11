@@ -128,7 +128,7 @@ enum RtParamKind {
 struct RtParamEvent {
     kind: RtParamKind,
     track: u32,
-    slot: common::protocol::PluginSlot,
+    index: u32,
     plugin_id: u32,
     param_id: u32,
     value: f64,
@@ -139,7 +139,7 @@ impl Default for RtParamEvent {
         Self {
             kind: RtParamKind::Touch,
             track: 0,
-            slot: common::protocol::PluginSlot::Instrument,
+            index: 0,
             plugin_id: 0,
             param_id: 0,
             value: 0.0,
@@ -218,20 +218,20 @@ fn rt_param_to_event(ev: RtParamEvent) -> crate::PluginEvent {
     match ev.kind {
         RtParamKind::Touch => crate::PluginEvent::PluginParamTouched {
             track: ev.track,
-            slot: ev.slot,
+            index: ev.index,
             plugin_id: ev.plugin_id,
             param_id: ev.param_id,
         },
         RtParamKind::Value => crate::PluginEvent::PluginParamValueChanged {
             track: ev.track,
-            slot: ev.slot,
+            index: ev.index,
             plugin_id: ev.plugin_id,
             param_id: ev.param_id,
             value: ev.value,
         },
         RtParamKind::Release => crate::PluginEvent::PluginParamGestureEnd {
             track: ev.track,
-            slot: ev.slot,
+            index: ev.index,
             plugin_id: ev.plugin_id,
             param_id: ev.param_id,
         },
@@ -761,12 +761,12 @@ fn run_worker(
                 || !out_param_releases.is_empty()
             {
                 let track = entry.track;
-                let slot = entry.slot;
+                let index = entry.index;
                 for param_id in out_param_touches.drain(..) {
                     param_ring.push(RtParamEvent {
                         kind: RtParamKind::Touch,
                         track,
-                        slot,
+                        index,
                         plugin_id,
                         param_id,
                         value: 0.0,
@@ -776,7 +776,7 @@ fn run_worker(
                     param_ring.push(RtParamEvent {
                         kind: RtParamKind::Value,
                         track,
-                        slot,
+                        index,
                         plugin_id,
                         param_id,
                         value,
@@ -786,7 +786,7 @@ fn run_worker(
                     param_ring.push(RtParamEvent {
                         kind: RtParamKind::Release,
                         track,
-                        slot,
+                        index,
                         plugin_id,
                         param_id,
                         value: 0.0,

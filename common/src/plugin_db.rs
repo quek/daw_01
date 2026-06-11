@@ -55,15 +55,23 @@ pub struct PluginEntry {
     /// `note 出力`を持つ = **生成器になれる**（Scaler 2 のような dual-role 判定の基準）。
     #[serde(default)]
     pub has_note_output: bool,
-    /// `audio 出力`を持つ = **音源になれる**。
+    /// `audio 出力`を持つ。
     #[serde(default)]
     pub has_audio_output: bool,
+    /// `audio 入力`を持つ = **audio を加工できる (= エフェクト)**。v23 単一チェーン:
+    /// 役割の位置導出で「audio を生成する音源 (audio_in 無し)」と「audio を加工する
+    /// エフェクト (audio_in 有り)」を区別する決め手。実 plugin は MIDI 制御付き
+    /// audio エフェクトが note_in を持つため、note 系だけでは音源と区別できない。
+    /// 旧 cache は `#[serde(default)]` で `false`、`PORT_PROBE_VERSION` bump で再 probe。
+    #[serde(default)]
+    pub has_audio_input: bool,
 }
 
-/// FIXME #29: port 構成 probe スキーマの現行版。 `PluginEntry` に記録する 3 bool
-/// (note in/out・audio out) の取得方法・意味づけを変えたら上げる。 cache の
-/// `port_probe_version` がこれ未満なら、 起動時に再 probe (rescan) する。
-pub const PORT_PROBE_VERSION: u32 = 1;
+/// FIXME #29 / v23: port 構成 probe スキーマの現行版。 `PluginEntry` に記録する
+/// port bool (note in/out・audio out/**in**) の取得方法・意味づけを変えたら上げる。
+/// cache の `port_probe_version` がこれ未満なら、 起動時に再 probe (rescan) する。
+/// v23: `has_audio_input` を追加したので 1 → 2 (= 既存 cache を再 probe させる)。
+pub const PORT_PROBE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginDatabase {
@@ -222,9 +230,11 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             path: PathBuf::from(BUILTIN_ID_SILENCE),
             descriptor_index: 0,
             // 純粋音源: note を受け、 audio を出す。 note 出力は持たない。
+            // audio を加工しない (= audio 入力なし) ので instrument 扱い。
             has_note_input: true,
             has_note_output: false,
             has_audio_output: true,
+            has_audio_input: false,
         },
         PluginEntry {
             id: BUILTIN_ID_VOICEVOX.to_string(),
@@ -240,9 +250,11 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             path: PathBuf::from(BUILTIN_ID_VOICEVOX),
             descriptor_index: 0,
             // 純粋音源 (歌唱合成): note を受け、 audio を出す。
+            // audio を加工しない (= audio 入力なし) ので instrument 扱い。
             has_note_input: true,
             has_note_output: false,
             has_audio_output: true,
+            has_audio_input: false,
         },
     ]
 }
@@ -306,9 +318,11 @@ pub fn scan_system() -> Result<PluginDatabase> {
                     descriptor_index: c.descriptor_index,
                     // VST3 は scan 時に bus を読めない (probe は別 subprocess = Step 5)。
                     // probe 前の保守的暫定値: 純 audio 扱い。 probe が正確値で上書きする。
+                    // audio 入力有無は scan では不明なので暫定 false (= 音源扱い)。
                     has_note_input: false,
                     has_note_output: false,
                     has_audio_output: true,
+                    has_audio_input: false,
                 });
             }
         }
@@ -429,6 +443,11 @@ fn scan_one_file(path: &Path) -> Result<Vec<PluginEntry>> {
             has_note_input: has_note_eff || has_instr,
             has_note_output: has_note_eff,
             has_audio_output: !has_note_eff || has_instr,
+            // audio 入力 (= audio エフェクト) は note-effect でも instrument でも
+            // ない場合のみ true。 instrument は audio を「生成」するだけで「加工」
+            // しないので false、 note-effect は audio に触れないので false。 これで
+            // reverb/EQ/comp 等の純 audio-fx だけが true になる。 正確値は probe が上書き。
+            has_audio_input: !has_note_eff && !has_instr,
         });
     }
 
@@ -493,6 +512,8 @@ mod tests {
                 has_note_input: false,
                 has_note_output: false,
                 has_audio_output: true,
+                // instrument: audio を生成するだけで加工しない。
+                has_audio_input: false,
             }],
             scanned_at: Some(42),
             port_probe_version: 0,
@@ -526,6 +547,8 @@ mod tests {
                 has_note_input: false,
                 has_note_output: false,
                 has_audio_output: true,
+                // 外部 audio エフェクト (audio in/out)。
+                has_audio_input: true,
             }],
             scanned_at: Some(100),
             port_probe_version: 0,
@@ -592,6 +615,8 @@ mod tests {
                 has_note_input: false,
                 has_note_output: false,
                 has_audio_output: true,
+                // 外部 audio エフェクト (audio in/out)。
+                has_audio_input: true,
             }],
             scanned_at: Some(1),
             port_probe_version: 0,

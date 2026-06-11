@@ -180,7 +180,7 @@ fn denom_to_log2(denom: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::{Clip, ClipContent, MidiContent, Note, Song, Track};
+    use common::model::{Clip, ClipContent, MidiContent, Note, Song};
 
     fn note(pitch: u8, vel: u8, start: f64, dur: f64) -> Note {
         Note {
@@ -220,18 +220,17 @@ mod tests {
                 notes: vec![note(60, 100, 0.0, 1.0)], // C4 quarter note at beat 0
             }),
         );
-        let track = Track {
-            clips: vec![Clip {
+        let track = crate::app::track_with(|t| {
+            t.clips = vec![Clip {
                 id: 1,
                 start_beat: 0.0,
                 length_beats: 4.0,
                 name: "test".into(),
                 content_id: cid,
                 ..Default::default()
-            }],
-            next_clip_id: 2,
-            ..Default::default()
-        };
+            }];
+            t.next_clip_id = 2;
+        });
         song.tracks.push(track);
         export_midi(&song, &path).unwrap();
         let raw = std::fs::read(&path).unwrap();
@@ -277,10 +276,7 @@ mod tests {
         // Track に MIDI clip 1 つも無ければ build_midi_track が None を返す
         // (= SMF に含まれない)。
         let song = Song {
-            tracks: vec![Track {
-                clips: vec![],
-                ..Default::default()
-            }],
+            tracks: vec![crate::app::track_with(|t| t.clips = vec![])],
             ..Default::default()
         };
         let dir = tempfile::tempdir().unwrap();

@@ -288,7 +288,7 @@ fn fade_curve_value(progress: f32, curve: FadeCurve) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::{Clip, ClipContent, TextContent, TextEvent, Track};
+    use common::model::{Clip, ClipContent, TextContent, TextEvent};
 
     #[allow(clippy::too_many_arguments)]
     fn make_song_with_one_text(
@@ -329,11 +329,10 @@ mod tests {
             }),
         );
         let track_id = song.alloc_track_id();
-        let mut track = Track {
-            id: track_id,
-            name: "T".into(),
-            ..Track::default()
-        };
+        let mut track = crate::app::track_with(|t| {
+            t.id = track_id;
+            t.name = "T".into();
+        });
         let cl = track.alloc_clip_id();
         track.clips.push(Clip {
             id: cl,

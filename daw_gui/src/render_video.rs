@@ -782,11 +782,10 @@ mod tests {
             }),
         );
         let track_id = song.alloc_track_id();
-        let mut track = common::model::Track {
-            id: track_id,
-            name: "V".into(),
-            ..common::model::Track::default()
-        };
+        let mut track = crate::app::track_with(|t| {
+            t.id = track_id;
+            t.name = "V".into();
+        });
         let clip_id = track.alloc_clip_id();
         track.clips.push(common::model::Clip {
             id: clip_id,

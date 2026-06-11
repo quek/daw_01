@@ -185,10 +185,10 @@ async fn recv_loop(
                 plugin_id,
                 shmem_id,
                 track,
-                slot,
+                index,
             }) => {
                 if let Err(e) =
-                    handle_open_plugin_shmem(plugin_id, &shmem_id, track, slot, &cmd_tx)
+                    handle_open_plugin_shmem(plugin_id, &shmem_id, track, index, &cmd_tx)
                 {
                     tracing::error!(error = ?e, plugin_id, "failed to open plugin shmem");
                 }
@@ -493,8 +493,6 @@ async fn recv_loop(
             | Ok(MainToChild::Session(_))
             | Ok(MainToChild::SetSlotPlugin { .. })
             | Ok(MainToChild::RemoveSlotPlugin { .. })
-            | Ok(MainToChild::MoveSlot { .. })
-            | Ok(MainToChild::DemoteInstrumentToGenerator { .. })
             | Ok(MainToChild::RemoveTrack { .. })
             | Ok(MainToChild::RequestSlotState { .. })
             | Ok(MainToChild::RequestAllStates)
@@ -604,7 +602,7 @@ fn handle_open_plugin_shmem(
     plugin_id: u32,
     shmem_id: &str,
     track: u32,
-    slot: common::protocol::PluginSlot,
+    index: u32,
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
 ) -> Result<()> {
     let handle = common::process_data::ProcessDataHandle::open(shmem_id)
@@ -619,7 +617,7 @@ fn handle_open_plugin_shmem(
             plugin_ref,
             handle,
             track,
-            slot,
+            index,
         })
         .map_err(|_| anyhow::anyhow!("audio command channel closed"))?;
     Ok(())

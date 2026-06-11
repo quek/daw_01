@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use common::plugin_db::{PluginDatabase, PluginEntry};
 use common::plugin_format::PluginFormat;
-use common::protocol::{MainToChild, PluginSlot};
+use common::protocol::MainToChild;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent};
@@ -30,6 +30,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_note_input: true,
                 has_note_output: false,
                 has_audio_output: true,
+                // instrument: audio を生成するだけ → audio 入力なし。
+                has_audio_input: false,
             },
             PluginEntry {
                 id: "test.fx".into(),
@@ -43,6 +45,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_note_input: false,
                 has_note_output: false,
                 has_audio_output: true,
+                // audio-effect: audio を加工する → audio 入力あり。
+                has_audio_input: true,
             },
         ],
         scanned_at: None,
@@ -100,15 +104,16 @@ fn load_failure_releases_single_pending_and_flushes_play() {
     assert!(
         plugin_msgs.iter().any(|m| matches!(
             m,
-            MainToChild::SetSlotPlugin { track, slot: PluginSlot::Instrument, .. }
+            // 単一デバイスチェーン: picker は末尾 append、 空チェーンなので index 0。
+            MainToChild::SetSlotPlugin { track, index: 0, .. }
             if *track == track_id
         )),
         "SetSlotPlugin should be sent: {plugin_msgs:?}"
     );
     assert!(
         app.pending_plugin_loads
-            .contains(&(track_id, PluginSlot::Instrument)),
-        "pending_plugin_loads should contain the slot after track_pending_load"
+            .contains(&(track_id, 0)),
+        "pending_plugin_loads should contain the device index after track_pending_load"
     );
 
     // 2. Play を押す → pending があるので queue 化 (pending_play=true,
@@ -128,7 +133,7 @@ fn load_failure_releases_single_pending_and_flushes_play() {
     // 3. plugin_host から load failure 通知が届いた fake dispatch。
     app.handle_event(AppEvent::SlotPluginLoadFailedFromChild {
         track: track_id,
-        slot: PluginSlot::Instrument,
+        index: 0,
         plugin_id: "test.synth".into(),
         reason: "fake load failed".into(),
     });
@@ -136,7 +141,7 @@ fn load_failure_releases_single_pending_and_flushes_play() {
     // 4. pending 解放 + queue Play flush + status_message に失敗内容。
     assert!(
         !app.pending_plugin_loads
-            .contains(&(track_id, PluginSlot::Instrument)),
+            .contains(&(track_id, 0)),
         "pending_plugin_loads should be cleared after failure"
     );
     assert!(
@@ -200,23 +205,23 @@ fn load_failure_keeps_other_pending_unaffected() {
     assert!(app.pending_play);
     assert!(!app.is_playing);
 
-    // Instrument だけ失敗。 Fx の pending はそのまま残る。
+    // device 0 (test.synth) だけ失敗。 device 1 (test.fx) の pending は残る。
     app.handle_event(AppEvent::SlotPluginLoadFailedFromChild {
         track: track_id,
-        slot: PluginSlot::Instrument,
+        index: 0,
         plugin_id: "test.synth".into(),
         reason: "fake load failed".into(),
     });
 
     assert!(
         !app.pending_plugin_loads
-            .contains(&(track_id, PluginSlot::Instrument)),
-        "Instrument should be cleared"
+            .contains(&(track_id, 0)),
+        "device 0 should be cleared"
     );
     assert!(
         app.pending_plugin_loads
-            .contains(&(track_id, PluginSlot::Fx(0))),
-        "Fx pending should remain"
+            .contains(&(track_id, 1)),
+        "device 1 (fx) pending should remain"
     );
     assert!(
         app.pending_play,

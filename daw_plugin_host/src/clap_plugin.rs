@@ -1657,18 +1657,23 @@ fn clap_plugin_port_config(
             _ => (0, 0),
         }
     };
-    let audio_out = {
+    // audio port count: `count(plugin, is_input)` — false=output, true=input。
+    let (audio_in, audio_out) = {
         let ext = unsafe { get_ext(plugin_ptr, CLAP_EXT_AUDIO_PORTS.as_ptr()) }
             as *const clap_plugin_audio_ports;
         match (ext.is_null(), unsafe { ext.as_ref() }.and_then(|e| e.count)) {
-            (false, Some(count)) => unsafe { count(plugin_ptr, false) },
-            _ => 0,
+            (false, Some(count)) => (
+                unsafe { count(plugin_ptr, true) },
+                unsafe { count(plugin_ptr, false) },
+            ),
+            _ => (0, 0),
         }
     };
     Ok(common::port_config::PortConfig {
         has_note_input: note_in > 0,
         has_note_output: note_out > 0,
         has_audio_output: audio_out > 0,
+        has_audio_input: audio_in > 0,
     })
 }
 

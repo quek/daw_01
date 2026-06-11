@@ -5,9 +5,19 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
-use crate::protocol::PluginSlot;
 use crate::scale::ScaleChange;
 
+/// `23` 単一デバイスチェーン (`docs/plan_linear_chain.md`): 役割別 3 chain
+/// (`Track.{instrument, midi_fx_chain, fx_chain}`) を 1 本の
+/// `Track.devices: Vec<PluginInstance>` へ統合し、各 `PluginInstance` に
+/// `ports: PortConfig` を持たせる (役割は保持せず ports から位置導出)。
+/// `AutomationTarget::PluginParam { slot } → { device_index }`。v22 `.daw`
+/// files still load — 旧 3 fields は deserialize-only (`rename` で旧 field 名を
+/// 受ける) に降格し、load 時 (`Song::ensure_ids` → `Track::flatten_legacy_devices`)
+/// に `midi_fx_chain ++ instrument? ++ fx_chain` の順で `devices` へ平坦化、
+/// automation lane の旧 `slot` も同順序で `device_index` へ写像する。新規 save は
+/// `devices` のみ (旧 fields は `skip_serializing`)。
+///
 /// `22` 画像 source の元ファイル名: `ImageSource.name: String` (import 元
 /// ファイルの元名、 拡張子込み) が追加される。 on-disk `path` は content
 /// addressing のため `<sanitized_stem>_<hash8>.<ext>` に sanitize / hash
@@ -117,7 +127,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 22;
+pub const CURRENT_VERSION: u32 = 23;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -288,9 +298,9 @@ pub struct Song {
     /// migrates to `0`, then `ensure_image_source_ids` lifts it.
     #[serde(default)]
     pub next_image_source_id: ImageSourceId,
-    /// master bus の audio fx chain。 通常 track の `Track.fx_chain` と同 schema
-    /// (= 同 `PluginInstance` を再利用)。 master は instrument / midi_fx を持たず、
-    /// audio fx のみ持つ (master bus に instrument / arpeggiator は無意味)。 automation の
+    /// master bus の audio fx chain。 通常 track の `Track.devices` と同 schema
+    /// (= 同 `PluginInstance` を再利用)。 master は audio fx のみ持つ (= 音源境界
+    /// なしの単一 Vec、 master bus に instrument / arpeggiator は無意味)。 automation の
     /// `song_lanes` と同じく「master 固有データは Track ではなく Song 直下に置く」
     /// 既存パターン (`automation_lane_by_key_mut` 参照) の踏襲。 audio engine は全
     /// track mix 後・metronome 前に `(MASTER_TRACK_ID, PluginSlot::Fx(i))` keying で
@@ -571,16 +581,20 @@ impl Song {
         }
     }
 
-    /// track と master row を統一的に走査する fx chain accessor。
+    /// track と master row を統一的に走査する device chain accessor。
     /// `track_id == MASTER_TRACK_ID` なら `master_fx_chain` を、 そうでなければ
-    /// 該当 track の `fx_chain` を引く。 `automation_lane_by_key` と同 idiom
-    /// (master 固有データは Song 直下、 sentinel 分岐で透過アクセス)。 plugin
-    /// install / Inspector / chain 操作 handler から呼ぶ。
+    /// 該当 track の単一 `devices` chain を引く。 `automation_lane_by_key` と同
+    /// idiom (master 固有データは Song 直下、 sentinel 分岐で透過アクセス)。
+    /// plugin install / Inspector / chain 操作 handler から呼ぶ。
+    ///
+    /// v23: 非 master track は役割別 3 chain を `devices` に統合済みなので、
+    /// 旧 `fx_chain` ではなく chain 全体 (`devices`) を返す。master_fx_chain は
+    /// もともと単一 Vec (= 音源境界なしの全 audio FX) なのでそのまま。
     pub fn fx_chain_by_track_id(&self, track_id: u32) -> Option<&[PluginInstance]> {
         if track_id == MASTER_TRACK_ID {
             Some(&self.master_fx_chain)
         } else {
-            self.track_by_id(track_id).map(|t| t.fx_chain.as_slice())
+            self.track_by_id(track_id).map(|t| t.devices.as_slice())
         }
     }
 
@@ -592,7 +606,7 @@ impl Song {
         if track_id == MASTER_TRACK_ID {
             Some(&mut self.master_fx_chain)
         } else {
-            self.track_by_id_mut(track_id).map(|t| &mut t.fx_chain)
+            self.track_by_id_mut(track_id).map(|t| &mut t.devices)
         }
     }
 
@@ -609,6 +623,14 @@ impl Song {
     /// wiring (the references would dangle, `compile_schedule` silently
     /// skips dangling refs, and the user sees no sidechain signal).
     pub fn ensure_ids(&mut self) {
+        // v23 migration: 旧 3-split (midi_fx_chain / instrument / fx_chain) を
+        // 単一 `devices` へ平坦化し、automation lane の旧 slot を device_index へ
+        // 写像する。新形式 (devices 既存) は no-op。pass 1/2 の前に実行する必要が
+        // ある (pass 2 の sidechain remap は `devices` を走査するため)。
+        for track in &mut self.tracks {
+            track.flatten_legacy_devices();
+        }
+
         // Pass 1: assign fresh ids to sentinel tracks, recording the
         // (old_id → new_id) remap so refs can be patched in pass 2.
         let mut id_remap: std::collections::HashMap<u32, u32> =
@@ -648,20 +670,10 @@ impl Song {
                     send.dest_track_id = new_dest;
                 }
             }
-            let remap_chain = |chain: &mut [PluginInstance]| {
-                for p in chain.iter_mut() {
-                    for src in p.sidechain_sources.iter_mut() {
-                        if let Some(old_id) = *src
-                            && let Some(&new_id) = id_remap.get(&old_id)
-                        {
-                            *src = Some(new_id);
-                        }
-                    }
-                }
-            };
-            remap_chain(&mut track.midi_fx_chain);
-            if let Some(inst) = track.instrument.as_mut() {
-                for src in inst.sidechain_sources.iter_mut() {
+            // v23: 役割別 3 chain は単一 `devices` に統合済み。各 device の
+            // sidechain_sources を 1 ループで remap する。
+            for p in track.devices.iter_mut() {
+                for src in p.sidechain_sources.iter_mut() {
                     if let Some(old_id) = *src
                         && let Some(&new_id) = id_remap.get(&old_id)
                     {
@@ -669,7 +681,6 @@ impl Song {
                     }
                 }
             }
-            remap_chain(&mut track.fx_chain);
         }
 
         // master bus の fx chain も track fx_chain と同じく sidechain_sources を
@@ -1335,18 +1346,22 @@ impl Song {
     }
 }
 
-/// A track owns a full CLAP signal chain in three sections:
+/// v23 (`docs/plan_linear_chain.md`): a track owns **one** linear CLAP
+/// signal chain, `devices: Vec<PluginInstance>`. Roles (MIDI FX / instrument
+/// / audio FX) are **not classified at all** — the engine simply connects
+/// ports serially (Reaper 流): the track's notes flow into every device with a
+/// note input, the track's audio (clips) flows into every device with an audio
+/// input, and each device's note / audio outputs feed the next. The behaviour
+/// (whether a device acts as a generator, instrument, or effect) emerges from
+/// its own `PortConfig` + processing, not a stored or derived label. The final
+/// audio flows into the parent — either a `Group` track (when
+/// `parent_group_id == Some(id)`) or the master bus (when `None`). Reorder /
+/// insert / remove just permute the Vec; nothing else to re-key.
 ///
-/// 1. `midi_fx_chain` — note-effect plugins (arpeggiator / quantizer / ...)
-///    processed in order, piping out_events into the next plugin's in_events.
-/// 2. `instrument` — the note→audio plugin (receives the MIDI FX output).
-///    `None` when the track has no instrument yet.
-/// 3. `fx_chain` — audio-effect plugins (compressor / reverb / ...) applied
-///    to the instrument's audio output in order.
-///
-/// Clips on the track feed the MIDI FX chain at the top of the buffer. The
-/// final audio flows into the parent — either a `Group` track (when
-/// `parent_group_id == Some(id)`) or the master bus (when `None`).
+/// Older files used three role-keyed fields (`midi_fx_chain` / `instrument`
+/// / `fx_chain`); they deserialize into the private `legacy_*` slots and
+/// `Track::flatten_legacy_devices` (run from `Song::ensure_ids`) flattens
+/// them into `devices` in `midi_fx ++ instrument? ++ fx` order.
 ///
 /// v16 (`docs/plan_text_overlay.md`): 旧 `kind: TrackKind { Audio, Video }`
 /// を廃止し、 全 track が unified に audio path + visual composite path 両方
@@ -1354,9 +1369,9 @@ impl Song {
 /// text clip を混在可能)。 旧 Video track は v16 migration で audio
 /// defaults (instrument: None / fx_chain: vec![] / volume: 1.0 / pan: 0.0
 /// / armed: false / source: None) を自動補完し、 mixer / engine path に
-/// 静かに参加する (= 音は出ないが mute / volume 操作は可)。 旧 v15 file
-/// の `kind` field は serde が未知 field として捨てる (= deny_unknown_fields
-/// が無いため tolerant)。
+/// 静かに参加する (v23 以降は空 `devices` に相当)。 旧 v15 file の `kind`
+/// field は serde が未知 field として捨てる (= deny_unknown_fields が無いため
+/// tolerant)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Track {
     /// Stable id assigned by `Song::alloc_track_id`. `0` is "未採番"
@@ -1366,12 +1381,19 @@ pub struct Track {
     #[serde(default)]
     pub id: u32,
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instrument: Option<PluginInstance>,
+    /// v23: 1 本の線形デバイスチェーン。役割は保持せず ports から位置導出。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub midi_fx_chain: Vec<PluginInstance>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fx_chain: Vec<PluginInstance>,
+    pub devices: Vec<PluginInstance>,
+    // pub(crate): public API には出さないが、同 crate の sibling module
+    // (project.rs / timing.rs 等) が `..Track::default()` の functional-update
+    // 構文で Track を組むため、module-private では E0451 になる。migration
+    // 専用なので model module 外から直接読む用途は無い。
+    #[serde(default, rename = "midi_fx_chain", skip_serializing)]
+    pub(crate) legacy_midi_fx_chain: Vec<PluginInstance>,
+    #[serde(default, rename = "instrument", skip_serializing)]
+    pub(crate) legacy_instrument: Option<PluginInstance>,
+    #[serde(default, rename = "fx_chain", skip_serializing)]
+    pub(crate) legacy_fx_chain: Vec<PluginInstance>,
     pub volume: f32,
     pub pan: f32,
     /// Track silenced by the user. Additive with the global solo rule (see
@@ -1521,9 +1543,10 @@ impl Default for Track {
         Self {
             id: 0,
             name: String::new(),
-            instrument: None,
-            midi_fx_chain: Vec::new(),
-            fx_chain: Vec::new(),
+            devices: Vec::new(),
+            legacy_midi_fx_chain: Vec::new(),
+            legacy_instrument: None,
+            legacy_fx_chain: Vec::new(),
             volume: 1.0,
             pan: 0.0,
             muted: false,
@@ -1662,6 +1685,46 @@ impl Track {
     pub fn lane_by_id_mut(&mut self, lane_id: u32) -> Option<&mut AutomationLane> {
         self.automation_lanes.iter_mut().find(|l| l.id == lane_id)
     }
+
+    /// v23 migration: 旧 3-split を devices へ平坦化 (midi_fx ++ instrument? ++ fx) し、
+    /// automation lane の旧 slot を device_index へ写像する。新形式 (devices 既存) は no-op。
+    fn flatten_legacy_devices(&mut self) {
+        if !self.devices.is_empty()
+            || (self.legacy_midi_fx_chain.is_empty()
+                && self.legacy_instrument.is_none()
+                && self.legacy_fx_chain.is_empty())
+        {
+            return;
+        }
+        let n_midi = self.legacy_midi_fx_chain.len();
+        let has_inst = self.legacy_instrument.is_some();
+        let to_index = |slot: crate::protocol::PluginSlot| -> u32 {
+            use crate::protocol::PluginSlot;
+            match slot {
+                PluginSlot::MidiFx(i) => i,
+                PluginSlot::Instrument => n_midi as u32,
+                PluginSlot::Fx(i) => (n_midi + has_inst as usize) as u32 + i,
+            }
+        };
+        for lane in &mut self.automation_lanes {
+            if let AutomationTarget::PluginParam {
+                device_index,
+                legacy_slot,
+                ..
+            } = &mut lane.target
+                && let Some(slot) = legacy_slot.take()
+            {
+                *device_index = to_index(slot);
+            }
+        }
+        let mut devices = Vec::new();
+        devices.append(&mut self.legacy_midi_fx_chain);
+        if let Some(inst) = self.legacy_instrument.take() {
+            devices.push(inst);
+        }
+        devices.append(&mut self.legacy_fx_chain);
+        self.devices = devices;
+    }
 }
 
 /// Reference to a plugin loaded on a track, with the opaque state blob the
@@ -1691,6 +1754,9 @@ pub struct PluginInstance {
     /// ports stay silent).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidechain_sources: Vec<Option<u32>>,
+    /// v23: この device の port 構成。役割導出の入力。
+    #[serde(default)]
+    pub ports: crate::port_config::PortConfig,
 }
 
 impl PluginInstance {
@@ -1700,6 +1766,21 @@ impl PluginInstance {
             format,
             state: None,
             sidechain_sources: Vec::new(),
+            ports: crate::port_config::PortConfig::default(),
+        }
+    }
+
+    pub fn with_ports(
+        plugin_id: String,
+        format: PluginFormat,
+        ports: crate::port_config::PortConfig,
+    ) -> Self {
+        Self {
+            plugin_id,
+            format,
+            state: None,
+            sidechain_sources: Vec::new(),
+            ports,
         }
     }
 }
@@ -2637,13 +2718,17 @@ pub const MASTER_TRACK_ID: u32 = u32::MAX;
 pub enum AutomationTarget {
     /// Built-in track parameter (volume / pan / mute / send).
     TrackBuiltin(TrackBuiltinParam),
-    /// Plugin parameter on this track. `slot` identifies which plugin
-    /// inside the track's chain. `param_id` is the CLAP `clap_id` /
-    /// VST3 `ParamID` (both `u32`); the format is recovered through
-    /// `Track.{instrument,midi_fx_chain[idx],fx_chain[idx]}.format`.
+    /// Plugin parameter on this track. `device_index` identifies which
+    /// plugin inside the track's single `devices` chain. `param_id` is the
+    /// CLAP `clap_id` / VST3 `ParamID` (both `u32`); the format is
+    /// recovered through `Track.devices[device_index].format`.
     PluginParam {
-        slot: PluginSlot,
+        #[serde(default)]
+        device_index: u32,
         param_id: u32,
+        /// v22 以前 migration 用 (deserialize 専用)。旧 save は `slot` を持つ。
+        #[serde(default, rename = "slot", skip_serializing)]
+        legacy_slot: Option<crate::protocol::PluginSlot>,
     },
     /// Song-wide parameters. Lanes targeting these only make sense on
     /// a designated "master" track. M5 scope.
@@ -3247,11 +3332,13 @@ mod tests {
                     id: 1,
                     name: "Bass".into(),
                     parent_group_id: Some(0), // points at Kick's old sentinel id
-                    fx_chain: vec![PluginInstance {
+                    // v23: 役割別 chain は廃止。device chain (`devices`) に直接置く。
+                    devices: vec![PluginInstance {
                         plugin_id: "test.compressor".into(),
                         format: PluginFormat::Vst3,
                         state: None,
                         sidechain_sources: vec![Some(0)], // points at Kick
+                        ports: crate::port_config::PortConfig::default(),
                     }],
                     ..Track::default()
                 },
@@ -3276,10 +3363,140 @@ mod tests {
             "parent_group_id pointing at sentinel must be remapped to the new id"
         );
         assert_eq!(
-            bass.fx_chain[0].sidechain_sources,
+            bass.devices[0].sidechain_sources,
             vec![Some(new_kick_id)],
             "sidechain_sources pointing at sentinel must be remapped to the new id"
         );
+    }
+
+    /// v23 migration: a v22 track with the legacy role-keyed chains
+    /// (`midi_fx_chain` / `instrument` / `fx_chain`) flattens into a single
+    /// `devices` Vec in `midi_fx ++ instrument? ++ fx` order, and the
+    /// automation lanes' legacy `slot` remaps to the equivalent
+    /// `device_index`. `ensure_ids` drives the flattening (via
+    /// `flatten_legacy_devices`) before the id pass.
+    #[test]
+    fn ensure_ids_flattens_legacy_chains_and_remaps_lane_slots() {
+        use crate::plugin_format::PluginFormat;
+        use crate::protocol::PluginSlot;
+
+        let plug = |id: &str| PluginInstance::new(id.into(), PluginFormat::Clap);
+        // Layout: 2 MIDI FX, 1 instrument, 2 audio FX.
+        //   index:  0=arp 1=quant | 2=synth | 3=comp 4=reverb
+        let mut track = Track {
+            id: 1,
+            name: "Lead".into(),
+            legacy_midi_fx_chain: vec![plug("arp"), plug("quant")],
+            legacy_instrument: Some(plug("synth")),
+            legacy_fx_chain: vec![plug("comp"), plug("reverb")],
+            automation_lanes: vec![
+                AutomationLane {
+                    id: 1,
+                    ..AutomationLane::new(
+                        AutomationTarget::PluginParam {
+                            device_index: 0, // overwritten by legacy_slot
+                            param_id: 5,
+                            legacy_slot: Some(PluginSlot::Instrument),
+                        },
+                        0.0,
+                    )
+                },
+                AutomationLane {
+                    id: 2,
+                    ..AutomationLane::new(
+                        AutomationTarget::PluginParam {
+                            device_index: 0,
+                            param_id: 9,
+                            legacy_slot: Some(PluginSlot::Fx(1)),
+                        },
+                        0.0,
+                    )
+                },
+                AutomationLane {
+                    id: 3,
+                    ..AutomationLane::new(
+                        AutomationTarget::PluginParam {
+                            device_index: 0,
+                            param_id: 2,
+                            legacy_slot: Some(PluginSlot::MidiFx(1)),
+                        },
+                        0.0,
+                    )
+                },
+            ],
+            next_lane_id: 4,
+            ..Track::default()
+        };
+        // Pre-condition: nothing in `devices` yet.
+        assert!(track.devices.is_empty());
+
+        let mut song = Song {
+            tracks: vec![std::mem::take(&mut track)],
+            next_track_id: 2,
+            ..Song::default()
+        };
+        song.ensure_ids();
+
+        let t = &song.tracks[0];
+        // Flattened order: midi_fx ++ instrument ++ fx.
+        let ids: Vec<&str> = t.devices.iter().map(|p| p.plugin_id.as_str()).collect();
+        assert_eq!(ids, vec!["arp", "quant", "synth", "comp", "reverb"]);
+        // Legacy fields are drained.
+        assert!(t.legacy_midi_fx_chain.is_empty());
+        assert!(t.legacy_instrument.is_none());
+        assert!(t.legacy_fx_chain.is_empty());
+
+        // Lane slot → device_index: Instrument=2, Fx(1)=3+1=4, MidiFx(1)=1.
+        let device_index_of = |lane_id: u32| -> u32 {
+            match t.lane_by_id(lane_id).unwrap().target {
+                AutomationTarget::PluginParam {
+                    device_index,
+                    legacy_slot,
+                    ..
+                } => {
+                    assert!(legacy_slot.is_none(), "legacy_slot must be consumed");
+                    device_index
+                }
+                _ => panic!("expected PluginParam"),
+            }
+        };
+        assert_eq!(device_index_of(1), 2, "Instrument → n_midi (=2)");
+        assert_eq!(device_index_of(2), 4, "Fx(1) → n_midi + has_inst + 1 (=4)");
+        assert_eq!(device_index_of(3), 1, "MidiFx(1) → 1");
+    }
+
+    /// v23 migration is a no-op when `devices` is already populated (new
+    /// format): legacy fields are empty and lane device_index is untouched.
+    #[test]
+    fn flatten_legacy_devices_is_noop_for_new_format() {
+        use crate::plugin_format::PluginFormat;
+
+        let mut track = Track {
+            id: 1,
+            devices: vec![PluginInstance::new("synth".into(), PluginFormat::Clap)],
+            automation_lanes: vec![AutomationLane {
+                id: 1,
+                ..AutomationLane::new(
+                    AutomationTarget::PluginParam {
+                        device_index: 0,
+                        param_id: 3,
+                        legacy_slot: None,
+                    },
+                    0.0,
+                )
+            }],
+            next_lane_id: 2,
+            ..Track::default()
+        };
+        track.flatten_legacy_devices();
+        assert_eq!(track.devices.len(), 1);
+        assert_eq!(track.devices[0].plugin_id, "synth");
+        match track.automation_lanes[0].target {
+            AutomationTarget::PluginParam { device_index, .. } => {
+                assert_eq!(device_index, 0);
+            }
+            _ => panic!("expected PluginParam"),
+        }
     }
 
     #[test]
@@ -3360,14 +3577,17 @@ mod tests {
 
     #[test]
     fn current_version_is_pinned() {
-        // Bumped to 22 for `ImageSource.name`: the original import filename
-        // (extension included, pre-sanitize/hash) is stored so source-listing
-        // UIs (inspector / 口パク mapping dropdown) can show the original name
-        // instead of the content-addressed on-disk filename. v21 files
-        // forward-migrate via `#[serde(default)]` (empty `name`) and consumers
-        // fall back to `path.file_name()`. Pinning the constant catches
-        // accidental rollback. See `docs/plan_image_overlay.md`.
-        assert_eq!(CURRENT_VERSION, 22);
+        // Bumped to 23 for the single linear device chain: `Track`'s three
+        // role-keyed chains (`instrument` / `midi_fx_chain` / `fx_chain`)
+        // collapse into one `devices: Vec<PluginInstance>`, each carrying a
+        // `ports: PortConfig` (roles are derived from position, not stored),
+        // and `AutomationTarget::PluginParam { slot } → { device_index }`.
+        // v22 files forward-migrate: the old fields deserialize into
+        // private legacy slots and `Track::flatten_legacy_devices` (run from
+        // `ensure_ids`) flattens them into `devices` and remaps lane slots.
+        // Pinning the constant catches accidental rollback. See
+        // `docs/plan_linear_chain.md`.
+        assert_eq!(CURRENT_VERSION, 23);
     }
 
     #[test]
@@ -3887,12 +4107,14 @@ mod tests {
         s.insert(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume));
         s.insert(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan));
         s.insert(AutomationTarget::PluginParam {
-            slot: PluginSlot::Instrument,
+            device_index: 0,
             param_id: 7,
+            legacy_slot: None,
         });
         s.insert(AutomationTarget::PluginParam {
-            slot: PluginSlot::Fx(0),
+            device_index: 1,
             param_id: 7,
+            legacy_slot: None,
         });
         assert_eq!(s.len(), 4);
     }

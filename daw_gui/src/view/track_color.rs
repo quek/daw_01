@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn effective_track_color_prefers_override() {
-        let mut track = Track { id: 3, ..Track::default() };
+        let mut track = crate::app::track_with(|t| t.id = 3);
         assert_eq!(effective_track_color(&track), derived_track_color(3));
         track.color = Some([0.1, 0.2, 0.3]);
         assert_eq!(effective_track_color(&track), [0.1, 0.2, 0.3]);
@@ -105,7 +105,10 @@ mod tests {
 
     #[test]
     fn effective_clip_color_inherits_then_overrides() {
-        let track = Track { id: 5, color: Some([0.4, 0.5, 0.6]), ..Track::default() };
+        let track = crate::app::track_with(|t| {
+            t.id = 5;
+            t.color = Some([0.4, 0.5, 0.6]);
+        });
         // clip.color == None ⇒ トラック実効色を継承。
         let mut clip = Clip { id: 1, color: None, ..Clip::default() };
         assert_eq!(effective_clip_color(&track, &clip), [0.4, 0.5, 0.6]);

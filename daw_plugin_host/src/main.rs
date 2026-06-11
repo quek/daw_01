@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
 use common::protocol::{
-    AudioSession, ChildKind, ChildToMain, MainToChild, PluginSlot, RenderMode, SlotState,
+    AudioSession, ChildKind, ChildToMain, MainToChild, RenderMode, SlotState,
 };
 use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::NamedPipeClient;
@@ -37,23 +37,23 @@ use crate::plugin_instance::{HostCallbacks, LoadedPlugin, load_plugin};
 /// loop after a command has been pushed into the mpsc queue.
 const WM_COMMAND_WAKE: u32 = WM_APP + 1;
 
-/// Track-and-slot-addressed events pushed from the plugin-main thread (or
-/// its CLAP callbacks) to the IPC sender.
+/// Track-and-device-index-addressed events pushed from the plugin-main thread
+/// (or its CLAP callbacks) to the IPC sender.
 #[derive(Debug, Clone)]
 pub enum PluginEvent {
     SlotGuiOpened {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         width: u32,
         height: u32,
     },
     SlotGuiClosed {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     },
     SlotPluginLoaded {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         id: String,
         name: String,
         plugin_id: u32,
@@ -62,7 +62,7 @@ pub enum PluginEvent {
     },
     SlotPluginState {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         data: Option<Vec<u8>>,
     },
     AllPluginStates {
@@ -85,7 +85,7 @@ pub enum PluginEvent {
     /// 一覧。 activate / state restore 完了後に 1 度 emit。
     PluginParamList {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id: u32,
         params: Vec<common::protocol::PluginParamInfo>,
     },
@@ -94,7 +94,7 @@ pub enum PluginEvent {
     /// して emit、 daw_gui に転送して last_touched_param を更新させる。
     PluginParamTouched {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id: u32,
         param_id: u32,
     },
@@ -102,7 +102,7 @@ pub enum PluginEvent {
     /// out event 経由)。 Phase 4 recording mode で point 生成 source。
     PluginParamValueChanged {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id: u32,
         param_id: u32,
         value: f64,
@@ -112,7 +112,7 @@ pub enum PluginEvent {
     /// `active_param_gestures` から該当 PluginParam target を remove する。
     PluginParamGestureEnd {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id: u32,
         param_id: u32,
     },
@@ -122,7 +122,7 @@ pub enum PluginEvent {
     /// pending stuck で Play queue が永久に解放されない。
     PluginLoadFailed {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         plugin_id: String,
         reason: String,
     },
@@ -131,15 +131,15 @@ pub enum PluginEvent {
 impl From<PluginEvent> for ChildToMain {
     fn from(e: PluginEvent) -> Self {
         match e {
-            PluginEvent::SlotGuiOpened { track, slot, width, height } => {
-                ChildToMain::SlotGuiOpened { track, slot, width, height }
+            PluginEvent::SlotGuiOpened { track, index, width, height } => {
+                ChildToMain::SlotGuiOpened { track, index, width, height }
             }
-            PluginEvent::SlotGuiClosed { track, slot } => {
-                ChildToMain::SlotGuiClosed { track, slot }
+            PluginEvent::SlotGuiClosed { track, index } => {
+                ChildToMain::SlotGuiClosed { track, index }
             }
             PluginEvent::SlotPluginLoaded {
                 track,
-                slot,
+                index,
                 id,
                 name,
                 plugin_id,
@@ -147,15 +147,15 @@ impl From<PluginEvent> for ChildToMain {
                 state_load_error,
             } => ChildToMain::SlotPluginLoaded {
                 track,
-                slot,
+                index,
                 id,
                 name,
                 plugin_id,
                 shmem_id,
                 state_load_error,
             },
-            PluginEvent::SlotPluginState { track, slot, data } => {
-                ChildToMain::SlotPluginState { track, slot, data }
+            PluginEvent::SlotPluginState { track, index, data } => {
+                ChildToMain::SlotPluginState { track, index, data }
             }
             PluginEvent::AllPluginStates { entries } => ChildToMain::AllPluginStates { entries },
             PluginEvent::SlotPluginUnloaded { plugin_id } => {
@@ -166,23 +166,23 @@ impl From<PluginEvent> for ChildToMain {
             }
             PluginEvent::PluginParamList {
                 track,
-                slot,
+                index,
                 plugin_id,
                 params,
             } => ChildToMain::PluginParamList {
                 track,
-                slot,
+                index,
                 plugin_id,
                 params,
             },
             PluginEvent::PluginParamTouched {
                 track,
-                slot,
+                index,
                 plugin_id: _,
                 param_id,
             } => ChildToMain::PluginParamTouched {
                 track,
-                slot,
+                index,
                 param_id,
                 // display_name は daw_gui 側で AppData.plugin_params から
                 // 引いて解決する (= host で文字列構築は不要、 IPC
@@ -191,34 +191,34 @@ impl From<PluginEvent> for ChildToMain {
             },
             PluginEvent::PluginParamValueChanged {
                 track,
-                slot,
+                index,
                 plugin_id: _,
                 param_id,
                 value,
             } => ChildToMain::PluginParamValueChanged {
                 track,
-                slot,
+                index,
                 param_id,
                 value,
             },
             PluginEvent::PluginParamGestureEnd {
                 track,
-                slot,
+                index,
                 plugin_id: _,
                 param_id,
             } => ChildToMain::PluginParamGestureEnd {
                 track,
-                slot,
+                index,
                 param_id,
             },
             PluginEvent::PluginLoadFailed {
                 track,
-                slot,
+                index,
                 plugin_id,
                 reason,
             } => ChildToMain::SlotPluginLoadFailed {
                 track,
-                slot,
+                index,
                 plugin_id,
                 reason,
             },
@@ -241,7 +241,7 @@ fn publish_plugin_registry(
             plugin: PluginPtr(e.plugin.0),
             process_data: e.process_data,
             track: e.track,
-            slot: e.slot,
+            index: e.index,
         }))
         .collect();
     let idx = plugin_id as usize;
@@ -252,16 +252,16 @@ fn publish_plugin_registry(
     registry.store(std::sync::Arc::new(next));
 }
 
-/// Re-publish an existing registry entry with a corrected `(track, slot)`
+/// Re-publish an existing registry entry with a corrected `(track, index)`
 /// address, preserving the live `plugin` pointer and `process_data` slot.
-/// Used after `MoveSlot` reorders a chain so `PluginEntry.slot` (read by
-/// the worker pool to stamp param events) reflects the new position.
+/// Used after `ReorderChain` permutes a chain so `PluginEntry.index` (read
+/// by the worker pool to stamp param events) reflects the new position.
 /// No-op if the plugin id has no live entry.
 fn republish_entry_slot(
     registry: &PluginRegistry,
     plugin_id: u32,
     track: u32,
-    slot: PluginSlot,
+    index: u32,
 ) {
     let current = registry.load();
     let Some(Some(existing)) = current.get(plugin_id as usize) else {
@@ -271,7 +271,7 @@ fn republish_entry_slot(
         plugin: PluginPtr(existing.plugin.0),
         process_data: existing.process_data,
         track,
-        slot,
+        index,
     };
     // Drop the load guard before re-entering `publish_plugin_registry`
     // (which takes its own `load()`); avoids holding two guards at once.
@@ -283,7 +283,7 @@ fn republish_entry_slot(
 enum PluginCommand {
     SetSlotPlugin {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         format: PluginFormat,
         path: PathBuf,
         plugin_id: String,
@@ -291,40 +291,31 @@ enum PluginCommand {
     },
     RemoveSlotPlugin {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     },
-    MoveSlot {
-        track: u32,
-        from: PluginSlot,
-        to: PluginSlot,
-    },
-    /// FIXME #32: apply a complete chain permutation as a live move. `moves`
-    /// lists `(old_slot, new_slot)` for every loaded plugin on `track`.
+    /// Single-chain redesign: apply a complete chain permutation as a live
+    /// move. `moves` lists `(old_index, new_index)` for every loaded plugin
+    /// on `track` (one entry per device, possibly `old == new`).
     ReorderChain {
         track: u32,
-        moves: Vec<(PluginSlot, PluginSlot)>,
-    },
-    /// FIXME #29/#31: move the track's instrument to the generator-chain end,
-    /// preserving the live instance + its editor window (see protocol docs).
-    DemoteInstrumentToGenerator {
-        track: u32,
+        moves: Vec<(u32, u32)>,
     },
     RemoveTrack {
         track: u32,
     },
     RequestSlotState {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     },
     RequestAllStates,
     OpenSlotGui {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
         title: String,
     },
     CloseSlotGui {
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     },
     /// Stand up the per-buffer plugin process worker pool. Drives
     /// `process_server::WorkerPool::open` on the plugin-main thread so
@@ -557,7 +548,7 @@ fn plugin_main_loop(
     //     plugin instance is loaded.
     //   - `plugin_shmems` owns the `ProcessData` shmem created here so
     //     daw_audio can `OpenShared` it via `ChildToMain::SlotPluginLoaded`.
-    //   - `plugin_lookup` maps `(track, slot)` to the live plugin id so
+    //   - `plugin_lookup` maps `(track, index)` to the live plugin id so
     //     RemoveSlotPlugin / RemoveTrack / SwapTracks can clean up.
     //   - `plugin_registry` is the lock-free `plugin_id` → entry table
     //     read by the worker pool during dispatch.
@@ -574,27 +565,27 @@ fn plugin_main_loop(
     cleanup_leftover_shmems(plugin_host_pid);
     let mut next_plugin_id: u32 = 1;
     let mut plugin_shmems: HashMap<u32, common::process_data::ProcessDataHandle> = HashMap::new();
-    let mut plugin_lookup: HashMap<(u32, PluginSlot), u32> = HashMap::new();
+    let mut plugin_lookup: HashMap<(u32, u32), u32> = HashMap::new();
     // Defensive dedup: if the GUI somehow sends `SetSlotPlugin` twice
-    // for the same (track, slot, plugin_id) (we've seen the picker
+    // for the same (track, index, plugin_id) (we've seen the picker
     // double-fire) we skip the second to avoid the workers racing on
-    // a destroy → re-install path. Keyed by (track, slot) → loaded
+    // a destroy → re-install path. Keyed by (track, index) → loaded
     // plugin's stable id string.
-    let mut loaded_id_for_slot: HashMap<(u32, PluginSlot), String> = HashMap::new();
+    let mut loaded_id_for_slot: HashMap<(u32, u32), String> = HashMap::new();
     // PR4.5 fix: cache the display name + shmem id alongside loaded_id so
     // we can re-emit a `SlotPluginLoaded` event when SetSlotPlugin arrives
-    // for an already-loaded slot (= 2nd LoadSong of the same project).
+    // for an already-loaded device (= 2nd LoadSong of the same project).
     // Without re-emitting, daw_gui's `pending_plugin_loads` never clears
     // and queued Play (`pending_play`) can never fire — playback freezes.
-    let mut loaded_meta_for_slot: HashMap<(u32, PluginSlot), (String, String)> =
+    let mut loaded_meta_for_slot: HashMap<(u32, u32), (String, String)> =
         HashMap::new();
     let plugin_registry: PluginRegistry =
         Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
 
     // FIXME #31: plugin editor windows are now owned by THIS process. Each
     // open editor has a host-created top-level window (`EditorWindow`) keyed
-    // by (track, slot). Created/destroyed only on this (plugin-main) thread.
-    let mut editor_windows: HashMap<(u32, PluginSlot), editor_window::EditorWindow> =
+    // by (track, index). Created/destroyed only on this (plugin-main) thread.
+    let mut editor_windows: HashMap<(u32, u32), editor_window::EditorWindow> =
         HashMap::new();
     // Plugin-initiated GUI resize requests (CLAP `request_resize` / VST3
     // `IPlugFrame::resizeView`). The host callback runs on this thread and
@@ -603,33 +594,33 @@ fn plugin_main_loop(
     // keeps the `Send + Sync` bound the `HostCallbacks` closures require
     // (std `mpsc::Sender` is `!Sync`).
     let (gui_resize_tx, mut gui_resize_rx) =
-        tmpsc::unbounded_channel::<(u32, PluginSlot, u32, u32)>();
+        tmpsc::unbounded_channel::<(u32, u32, u32, u32)>();
     // Plugin-initiated GUI close (CLAP `clap_host_gui.closed` / lost gui
-    // connection). The host callback queues (track, slot); the loop drains it
+    // connection). The host callback queues (track, index); the loop drains it
     // and runs the full teardown (gui_destroy + DestroyWindow + notify). For
     // embedded GUIs this is rare (we own the window), but routing it through
     // the loop keeps the editor-window map and daw_gui's open set consistent.
-    let (gui_close_tx, mut gui_close_rx) = tmpsc::unbounded_channel::<(u32, PluginSlot)>();
+    let (gui_close_tx, mut gui_close_rx) = tmpsc::unbounded_channel::<(u32, u32)>();
 
-    // Per-(track, slot) host callbacks: each loaded plugin captures its
-    // (track, slot) so the async CLAP callback (request_resize / closed)
+    // Per-(track, index) host callbacks: each loaded plugin captures its
+    // (track, index) so the async CLAP callback (request_resize / closed)
     // can stamp the event with the correct address before reaching daw_gui.
-    let make_callbacks = |track: u32, slot: PluginSlot| HostCallbacks {
+    let make_callbacks = |track: u32, index: u32| HostCallbacks {
         on_request_resize: {
             let tx = gui_resize_tx.clone();
             Arc::new(move |w, h| {
-                let _ = tx.send((track, slot, w, h));
+                let _ = tx.send((track, index, w, h));
             })
         },
         on_closed: {
             let tx = gui_close_tx.clone();
             Arc::new(move || {
-                let _ = tx.send((track, slot));
+                let _ = tx.send((track, index));
             })
         },
         // VST3 param gesture (IComponentHandler::beginEdit/performEdit/endEdit)。
         // resize / closed と同 idiom で evt_tx に流す。 plugin_id は
-        // PluginEvent → ChildToMain 変換で破棄される (= daw_gui は (track, slot,
+        // PluginEvent → ChildToMain 変換で破棄される (= daw_gui は (track, index,
         // param_id) で解決する) ので 0 placeholder。 CLAP plugin はこの callback
         // を呼ばない (out_events 経由) ので二重発火しない。
         on_param_gesture_begin: {
@@ -637,7 +628,7 @@ fn plugin_main_loop(
             Arc::new(move |param_id| {
                 let _ = tx.send(PluginEvent::PluginParamTouched {
                     track,
-                    slot,
+                    index,
                     plugin_id: 0,
                     param_id,
                 });
@@ -648,7 +639,7 @@ fn plugin_main_loop(
             Arc::new(move |param_id, value| {
                 let _ = tx.send(PluginEvent::PluginParamValueChanged {
                     track,
-                    slot,
+                    index,
                     plugin_id: 0,
                     param_id,
                     value,
@@ -660,7 +651,7 @@ fn plugin_main_loop(
             Arc::new(move |param_id| {
                 let _ = tx.send(PluginEvent::PluginParamGestureEnd {
                     track,
-                    slot,
+                    index,
                     plugin_id: 0,
                     param_id,
                 });
@@ -729,12 +720,7 @@ fn plugin_main_loop(
                     // the extension, mode rejected) are best-effort and
                     // don't surface to the audio side.
                     for chain in tracks.tracks.chains.values_mut() {
-                        for plugin in chain
-                            .midi_fx_chain
-                            .iter_mut()
-                            .chain(chain.instrument.iter_mut())
-                            .chain(chain.fx_chain.iter_mut())
-                        {
+                        for plugin in chain.devices.iter_mut() {
                             let _ = plugin.set_render_mode(mode);
                         }
                     }
@@ -742,37 +728,37 @@ fn plugin_main_loop(
                 }
                 PluginCommand::SetSlotPlugin {
                     track,
-                    slot,
+                    index,
                     format,
                     path,
                     plugin_id,
                     initial_state,
                 } => {
                     // Defensive dedup against picker double-fire. Same
-                    // plugin id at the same slot ⇒ ignore re-load, but
+                    // plugin id at the same index ⇒ ignore re-load, but
                     // we must STILL emit `SlotPluginLoaded` so daw_gui
                     // can clear its `pending_plugin_loads` entry for this
-                    // slot — otherwise a second project-load (same plugins)
+                    // device — otherwise a second project-load (same plugins)
                     // leaves the entry pending forever and `play()`
                     // refuses to start (`pending_play=true` in
                     // `app.rs::play()`).
-                    if loaded_id_for_slot.get(&(track, slot)) == Some(&plugin_id) {
+                    if loaded_id_for_slot.get(&(track, index)) == Some(&plugin_id) {
                         tracing::info!(
                             track,
-                            ?slot,
+                            index,
                             id = %plugin_id,
                             "SetSlotPlugin: same plugin already loaded, re-emitting SlotPluginLoaded"
                         );
                         if let (Some(&new_plugin_id), Some((cached_id, cached_name))) = (
-                            plugin_lookup.get(&(track, slot)),
-                            loaded_meta_for_slot.get(&(track, slot)),
+                            plugin_lookup.get(&(track, index)),
+                            loaded_meta_for_slot.get(&(track, index)),
                         ) {
                             let shmem_id = format!(
                                 "daw_01_pd_{plugin_host_pid}_{new_plugin_id}"
                             );
                             let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
                                 track,
-                                slot,
+                                index,
                                 id: cached_id.clone(),
                                 name: cached_name.clone(),
                                 plugin_id: new_plugin_id,
@@ -783,7 +769,7 @@ fn plugin_main_loop(
                             });
                         } else {
                             tracing::warn!(
-                                track, ?slot,
+                                track, index,
                                 "duplicate SetSlotPlugin: meta cache miss, daw_gui pending may stick"
                             );
                         }
@@ -799,7 +785,7 @@ fn plugin_main_loop(
 
                     // (1) 新 plugin の instantiate。 ここまでで失敗 ⇒
                     //     旧 plugin の状態は触らずに早期 return。
-                    let callbacks = make_callbacks(track, slot);
+                    let callbacks = make_callbacks(track, index);
                     let mut plugin = match load_plugin(format, &path, &plugin_id, callbacks) {
                         Ok(p) => p,
                         Err(e) => {
@@ -811,7 +797,7 @@ fn plugin_main_loop(
                             // 継続再生)。
                             let _ = evt_tx.send(PluginEvent::PluginLoadFailed {
                                 track,
-                                slot,
+                                index,
                                 plugin_id: plugin_id.clone(),
                                 reason: format!("{e}"),
                             });
@@ -835,7 +821,7 @@ fn plugin_main_loop(
                                 let reason = format!("{e:#}");
                                 tracing::error!(
                                     track,
-                                    ?slot,
+                                    index,
                                     plugin = %plugin_id,
                                     error = %reason,
                                     "state_load failed (= plugin は default 状態で進む、 \
@@ -849,11 +835,15 @@ fn plugin_main_loop(
                     };
 
                     // (2) 旧 plugin を chain から detach (DLL call なし)。
-                    let old_pid = plugin_lookup.get(&(track, slot)).copied();
+                    // REPLACE semantics: `index < devices.len()` のとき同 index
+                    // の既存 device を取り出す (`install_plugin` が同 index に
+                    // 差し替える)。 `index == devices.len()` は append なので
+                    // detach 対象なし。
+                    let old_pid = plugin_lookup.get(&(track, index)).copied();
                     let mut detached_old: Option<Box<dyn LoadedPlugin>> = None;
                     tracks.mutate(|t| {
                         if let Some(chain) = t.chains.get_mut(&track) {
-                            detached_old = detach_plugin(chain, slot);
+                            detached_old = detach_plugin(chain, index);
                         }
                     });
 
@@ -881,7 +871,7 @@ fn plugin_main_loop(
                             &evt_tx,
                             |_, w| w.plugin_id() == pid,
                         );
-                        plugin_lookup.remove(&(track, slot));
+                        plugin_lookup.remove(&(track, index));
                         plugin_shmems.remove(&pid);
                     }
 
@@ -892,7 +882,7 @@ fn plugin_main_loop(
                     let sr = session.sample_rate;
                     let mf = session.max_frames;
                     tracks.mutate(|t| {
-                        install_plugin(t.ensure_track(track), slot, plugin, sr, mf)
+                        install_plugin(t.ensure_track(track), index, plugin, sr, mf)
                     });
 
                     // (7) 新 plugin に plugin_id を割り当て、 ProcessData
@@ -905,14 +895,14 @@ fn plugin_main_loop(
                         Ok(handle) => {
                             let pd_ptr = handle.ptr();
                             plugin_shmems.insert(new_plugin_id, handle);
-                            plugin_lookup.insert((track, slot), new_plugin_id);
-                            loaded_id_for_slot.insert((track, slot), plugin_id.clone());
+                            plugin_lookup.insert((track, index), new_plugin_id);
+                            loaded_id_for_slot.insert((track, index), plugin_id.clone());
                             // PR4.5: 同 plugin_id の SetSlotPlugin が再度
                             // 来たとき (= 同プロジェクトの 2 度目 LoadSong)
                             // に dedup branch から SlotPluginLoaded を再
                             // emit するためのキャッシュ。
                             loaded_meta_for_slot.insert(
-                                (track, slot),
+                                (track, index),
                                 (loaded_id.clone(), loaded_name.clone()),
                             );
 
@@ -920,7 +910,7 @@ fn plugin_main_loop(
                             // borrow scope で取得。 borrow が抜けたあとで
                             // tracks を再利用する。
                             let plugin_ptr_raw: Option<*mut (dyn LoadedPlugin + 'static)> = {
-                                let opt = tracks.tracks.plugin_at_mut(track, slot);
+                                let opt = tracks.tracks.plugin_at_mut(track, index);
                                 opt.map(|p| {
                                     // SAFETY: この trait object を所有する
                                     // `Box` は `tracks.chains` に住み、 drop
@@ -950,13 +940,13 @@ fn plugin_main_loop(
                                         plugin: PluginPtr(p),
                                         process_data: pd_ptr,
                                         track,
-                                        slot,
+                                        index,
                                     }),
                                 );
                             }
                             let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
                                 track,
-                                slot,
+                                index,
                                 id: loaded_id,
                                 name: loaded_name,
                                 plugin_id: new_plugin_id,
@@ -967,7 +957,7 @@ fn plugin_main_loop(
                             // active]` / VST3 `[UI-thread & Setup Done]`
                             // を満たすここ) で plugin の latency を query
                             // して daw_gui へ送る。 samples == 0 でも送る
-                            // ことで、 同 slot の plugin 入れ替え時に
+                            // ことで、 同 index の plugin 入れ替え時に
                             // 古い値を上書きできる。
                             if let Some(p) = plugin_ptr_raw {
                                 let samples = unsafe { (*p).query_latency() };
@@ -997,7 +987,7 @@ fn plugin_main_loop(
                                 }
                                 let _ = evt_tx.send(PluginEvent::PluginParamList {
                                     track,
-                                    slot,
+                                    index,
                                     plugin_id: new_plugin_id,
                                     params,
                                 });
@@ -1015,11 +1005,11 @@ fn plugin_main_loop(
                             // → teardown」 dance で安全に外す。 registry
                             // 側は new_plugin_id が未 publish なので publish
                             // None は不要。 旧 plugin は既に teardown 済
-                            // (line 540) なので slot は空のまま。
+                            // なので device 列は空のまま。
                             let mut detached: Option<Box<dyn LoadedPlugin>> = None;
                             tracks.mutate(|t| {
                                 if let Some(chain) = t.chains.get_mut(&track) {
-                                    detached = detach_plugin(chain, slot);
+                                    detached = detach_plugin(chain, index);
                                 }
                             });
                             if let Some(pool) = worker_pool.as_ref() {
@@ -1030,22 +1020,33 @@ fn plugin_main_loop(
                             }
                             let _ = evt_tx.send(PluginEvent::PluginLoadFailed {
                                 track,
-                                slot,
+                                index,
                                 plugin_id: plugin_id.clone(),
                                 reason: format!("shmem create failed: {e}"),
                             });
                         }
                     }
                 }
-                PluginCommand::RemoveSlotPlugin { track, slot } => {
+                PluginCommand::RemoveSlotPlugin { track, index } => {
+                    // 削除前の device 数を控える (= shift 範囲 index+1.. を
+                    // 後で 1 つ手前へ詰めるため)。
+                    let len_before = tracks
+                        .tracks
+                        .chains
+                        .get(&track)
+                        .map(|c| c.devices.len())
+                        .unwrap_or(0);
+
                     // (1) plugin を chain から取り出すだけ (DLL call なし)。
+                    // `Vec::remove(index)` は後続 device を 1 つ手前へ詰める
+                    // (= daw_gui / daw_audio の挙動と一致)。
                     let mut detached: Option<Box<dyn LoadedPlugin>> = None;
                     tracks.mutate(|t| {
                         if let Some(chain) = t.chains.get_mut(&track) {
-                            detached = detach_plugin(chain, slot);
+                            detached = detach_plugin(chain, index);
                         }
                     });
-                    let removed_pid = plugin_lookup.get(&(track, slot)).copied();
+                    let removed_pid = plugin_lookup.get(&(track, index)).copied();
 
                     // (2) registry から `None` を publish して、 以降の
                     // worker dispatch が この plugin_id を見つけられないよう
@@ -1071,20 +1072,60 @@ fn plugin_main_loop(
                     if let Some(pid) = removed_pid {
                         // FIXME #31: destroy this plugin's editor window (if
                         // open) after gui_destroy. Match by STABLE plugin id,
-                        // not by (track, slot): the plugin's slot may have
-                        // shifted while the editor was open (demotion or a
-                        // lower-slot removal), so a slot-keyed remove would
-                        // orphan the window. The helper also emits
-                        // SlotGuiClosed so daw_gui clears its open-GUI set.
+                        // not by (track, index): the plugin's index may have
+                        // shifted while the editor was open (a lower-index
+                        // removal), so an index-keyed remove would orphan the
+                        // window. The helper also emits SlotGuiClosed so
+                        // daw_gui clears its open-GUI set.
                         destroy_editor_windows_where(
                             &mut editor_windows,
                             &evt_tx,
                             |_, w| w.plugin_id() == pid,
                         );
-                        plugin_lookup.remove(&(track, slot));
+                        plugin_lookup.remove(&(track, index));
                         plugin_shmems.remove(&pid);
-                        loaded_id_for_slot.remove(&(track, slot));
-                        loaded_meta_for_slot.remove(&(track, slot));
+                        loaded_id_for_slot.remove(&(track, index));
+                        loaded_meta_for_slot.remove(&(track, index));
+
+                        // `Vec::remove(index)` shifted every device at old
+                        // idx > index down to idx-1. Re-key the `(track, idx)`
+                        // books for that range so they stay aligned with the
+                        // device列 (snapshot-remove-all-then-reinsert to avoid
+                        // a re-keyed entry colliding with a not-yet-freed old
+                        // one). `republish_entry_slot` corrects each moved
+                        // plugin's `PluginEntry.index` so the worker pool
+                        // stamps param events at the right device.
+                        type IdxBookkeeping = (
+                            u32,
+                            u32,
+                            Option<String>,
+                            Option<(String, String)>,
+                            Option<editor_window::EditorWindow>,
+                        );
+                        let mut remapped: Vec<IdxBookkeeping> = Vec::new();
+                        for old in (index + 1)..(len_before as u32) {
+                            if let Some(&pid) = plugin_lookup.get(&(track, old)) {
+                                let lid = loaded_id_for_slot.remove(&(track, old));
+                                let meta = loaded_meta_for_slot.remove(&(track, old));
+                                let win = editor_windows.remove(&(track, old));
+                                plugin_lookup.remove(&(track, old));
+                                remapped.push((old - 1, pid, lid, meta, win));
+                            }
+                        }
+                        for (new, pid, lid, meta, win) in remapped {
+                            plugin_lookup.insert((track, new), pid);
+                            if let Some(lid) = lid {
+                                loaded_id_for_slot.insert((track, new), lid);
+                            }
+                            if let Some(meta) = meta {
+                                loaded_meta_for_slot.insert((track, new), meta);
+                            }
+                            if let Some(win) = win {
+                                editor_windows.insert((track, new), win);
+                            }
+                            republish_entry_slot(&plugin_registry, pid, track, new);
+                        }
+
                         // PR2.1: daw_gui に `ClosePluginShmem` を audio engine
                         // に転送させて、 audio thread が destroyed plugin に
                         // process() を呼び続けないようにする。
@@ -1093,197 +1134,90 @@ fn plugin_main_loop(
                         });
                     }
                 }
-                PluginCommand::MoveSlot { track, from, to } => {
-                    let mut moved: Option<MovedRange> = None;
-                    tracks.mutate(|t| {
-                            if let Some(chain) = t.chains.get_mut(&track) {
-                                moved = move_plugin(chain, from, to);
-                            }
-                    });
-                    // move_plugin が Vec を並べ替えただけでは plugin_lookup /
-                    // loaded_id_for_slot / loaded_meta_for_slot / PluginEntry.slot
-                    // が旧順序のまま陳腐化する。 影響を受けた slot range を
-                    // 新順序に貼り直し、 該当 plugin の registry entry を再 publish
-                    // して slot 逆引きを正す。
-                    if let Some(MovedRange { is_midi, a, b }) = moved {
-                        let lo = a.min(b);
-                        let hi = a.max(b);
-                        let make_slot = |i: usize| {
-                            if is_midi {
-                                PluginSlot::MidiFx(i as u32)
-                            } else {
-                                PluginSlot::Fx(i as u32)
-                            }
-                        };
-                        // `remove(a)` + `insert(b)` の置換: old index → new index。
-                        let new_index = |old: usize| -> usize {
-                            if old == a {
-                                b
-                            } else if a < b {
-                                // a+1..=b が 1 つ手前へ詰まる。
-                                old - 1
-                            } else {
-                                // b..=a-1 が 1 つ後ろへずれる。
-                                old + 1
-                            }
-                        };
-                        // (1) 影響 range の旧 bookkeeping を snapshot してから
-                        //     一旦剥がす (新旧 slot の衝突を避けるため)。
-                        // FIXME #31: 開いている editor window も (track, slot)
-                        // keyed なので一緒に再キーする (= reorder 中に GUI を
-                        // 開いたままでも close/resize の逆引きが壊れない)。
-                        // (slot, plugin_id, loaded_id, loaded_meta(id, name), editor_window)
-                        type SlotBookkeeping = (
-                            PluginSlot,
-                            u32,
-                            Option<String>,
-                            Option<(String, String)>,
-                            Option<editor_window::EditorWindow>,
-                        );
-                        let mut remapped: Vec<SlotBookkeeping> = Vec::new();
-                        for old in lo..=hi {
-                            let old_slot = make_slot(old);
-                            if let Some(&pid) = plugin_lookup.get(&(track, old_slot)) {
-                                let lid = loaded_id_for_slot.remove(&(track, old_slot));
-                                let meta = loaded_meta_for_slot.remove(&(track, old_slot));
-                                let win = editor_windows.remove(&(track, old_slot));
-                                plugin_lookup.remove(&(track, old_slot));
-                                let new_slot = make_slot(new_index(old));
-                                remapped.push((new_slot, pid, lid, meta, win));
-                            }
-                        }
-                        // (2) 新 slot で貼り直し + registry entry の slot を補正。
-                        for (new_slot, pid, lid, meta, win) in remapped {
-                            plugin_lookup.insert((track, new_slot), pid);
-                            if let Some(lid) = lid {
-                                loaded_id_for_slot.insert((track, new_slot), lid);
-                            }
-                            if let Some(meta) = meta {
-                                loaded_meta_for_slot.insert((track, new_slot), meta);
-                            }
-                            if let Some(win) = win {
-                                editor_windows.insert((track, new_slot), win);
-                            }
-                            republish_entry_slot(&plugin_registry, pid, track, new_slot);
-                        }
-                    }
-                }
                 PluginCommand::ReorderChain { track, moves } => {
-                    // FIXME #32: apply a complete chain permutation as a LIVE
-                    // move. Every plugin's `Box<dyn LoadedPlugin>` keeps its
-                    // heap address across the shuffle (the worker pool's
-                    // `PluginPtr` stays valid → no re-instantiation, no audio
-                    // glitch), and the open editor windows follow by re-keying
-                    // `editor_windows`. Mirrors `MoveSlot` but for an arbitrary
-                    // permutation that can also cross sections (MidiFx ↔ Fx).
+                    // Single-chain redesign: apply a complete chain permutation
+                    // as a LIVE move over the single `devices: Vec<Box<dyn
+                    // LoadedPlugin>>`. Every plugin's `Box` keeps its heap
+                    // address across the shuffle (the worker pool's `PluginPtr`
+                    // stays valid → no re-instantiation, no audio glitch), and
+                    // the open editor windows follow by re-keying
+                    // `editor_windows`. `moves` is the COMPLETE permutation: one
+                    // `(old_index, new_index)` per device (possibly old == new).
                     //
                     // The audio engine is re-keyed directly by daw_gui (the
-                    // same `ReorderChain` is sent to it), so — unlike the
-                    // single-plugin demotion — we do NOT re-emit
+                    // same `ReorderChain` is sent to it), so we do NOT re-emit
                     // `SlotPluginLoaded` here.
 
-                    // --- 1. Validate `moves` against the live chain so a
-                    //        malformed permutation can never drop a live Box. ---
-                    let occupied: Vec<PluginSlot> = match tracks.tracks.chains.get(&track) {
-                        Some(chain) => {
-                            let mut v = Vec::new();
-                            for i in 0..chain.midi_fx_chain.len() {
-                                v.push(PluginSlot::MidiFx(i as u32));
-                            }
-                            if chain.instrument.is_some() {
-                                v.push(PluginSlot::Instrument);
-                            }
-                            for i in 0..chain.fx_chain.len() {
-                                v.push(PluginSlot::Fx(i as u32));
-                            }
-                            v
+                    // --- 1. Validate `moves` is a permutation of 0..n so a
+                    //        malformed list can never drop a live Box. ---
+                    let n = tracks
+                        .tracks
+                        .chains
+                        .get(&track)
+                        .map(|c| c.devices.len())
+                        .unwrap_or(0);
+                    let froms: Vec<u32> = moves.iter().map(|&(f, _)| f).collect();
+                    let tos: Vec<u32> = moves.iter().map(|&(_, t)| t).collect();
+                    // Both `old` and `new` columns must be exactly 0..n (no
+                    // dup, contiguous targets, full cover).
+                    let is_perm = |v: &[u32]| {
+                        if v.len() != n {
+                            return false;
                         }
-                        None => Vec::new(),
+                        let mut seen = vec![false; n];
+                        for &x in v {
+                            let i = x as usize;
+                            if i >= n || seen[i] {
+                                return false;
+                            }
+                            seen[i] = true;
+                        }
+                        true
                     };
-                    let froms: Vec<PluginSlot> = moves.iter().map(|&(f, _)| f).collect();
-                    let tos: Vec<PluginSlot> = moves.iter().map(|&(_, t)| t).collect();
-                    let no_dup =
-                        |v: &[PluginSlot]| v.iter().enumerate().all(|(i, s)| !v[..i].contains(s));
-                    let covers = occupied.len() == moves.len()
-                        && occupied.iter().all(|s| froms.contains(s));
-                    let n_inst = tos
-                        .iter()
-                        .filter(|t| matches!(t, PluginSlot::Instrument))
-                        .count();
-                    let mut midi_t: Vec<u32> = tos
-                        .iter()
-                        .filter_map(|t| match t {
-                            PluginSlot::MidiFx(i) => Some(*i),
-                            _ => None,
-                        })
-                        .collect();
-                    let mut fx_t: Vec<u32> = tos
-                        .iter()
-                        .filter_map(|t| match t {
-                            PluginSlot::Fx(i) => Some(*i),
-                            _ => None,
-                        })
-                        .collect();
-                    midi_t.sort_unstable();
-                    fx_t.sort_unstable();
-                    let contiguous = n_inst <= 1
-                        && midi_t.iter().copied().eq(0..midi_t.len() as u32)
-                        && fx_t.iter().copied().eq(0..fx_t.len() as u32);
-                    let valid = no_dup(&froms) && no_dup(&tos) && covers && contiguous;
+                    let valid = is_perm(&froms) && is_perm(&tos);
                     if !valid {
                         tracing::warn!(
                             track,
                             n_moves = moves.len(),
-                            occupied = occupied.len(),
+                            n,
                             "ReorderChain skipped: moves are not a complete chain permutation"
                         );
                     } else {
-                        // --- 2. Permute the live Boxes in place. ---
+                        // --- 2. Permute the live Boxes in place. Pull all
+                        //        devices into a temp map keyed by OLD index,
+                        //        then rebuild a Vec of length n with each at
+                        //        its NEW index. ---
                         tracks.mutate(|t| {
                             if let Some(chain) = t.chains.get_mut(&track) {
-                                let mut pool: HashMap<PluginSlot, Box<dyn LoadedPlugin>> =
+                                let mut pool: HashMap<u32, Box<dyn LoadedPlugin>> =
                                     HashMap::new();
-                                for (i, p) in chain.midi_fx_chain.drain(..).enumerate() {
-                                    pool.insert(PluginSlot::MidiFx(i as u32), p);
+                                for (i, p) in chain.devices.drain(..).enumerate() {
+                                    pool.insert(i as u32, p);
                                 }
-                                if let Some(inst) = chain.instrument.take() {
-                                    pool.insert(PluginSlot::Instrument, inst);
-                                }
-                                for (i, p) in chain.fx_chain.drain(..).enumerate() {
-                                    pool.insert(PluginSlot::Fx(i as u32), p);
-                                }
-                                let mut new_midi: Vec<Option<Box<dyn LoadedPlugin>>> =
-                                    (0..midi_t.len()).map(|_| None).collect();
-                                let mut new_inst: Option<Box<dyn LoadedPlugin>> = None;
-                                let mut new_fx: Vec<Option<Box<dyn LoadedPlugin>>> =
-                                    (0..fx_t.len()).map(|_| None).collect();
+                                let mut rebuilt: Vec<Option<Box<dyn LoadedPlugin>>> =
+                                    (0..n).map(|_| None).collect();
                                 for &(from, to) in &moves {
                                     if let Some(p) = pool.remove(&from) {
-                                        match to {
-                                            PluginSlot::MidiFx(i) => new_midi[i as usize] = Some(p),
-                                            PluginSlot::Instrument => new_inst = Some(p),
-                                            PluginSlot::Fx(i) => new_fx[i as usize] = Some(p),
-                                        }
+                                        rebuilt[to as usize] = Some(p);
                                     }
                                 }
                                 // `valid` guarantees every target was filled,
                                 // so `flatten` cannot silently drop a plugin.
-                                chain.midi_fx_chain = new_midi.into_iter().flatten().collect();
-                                chain.instrument = new_inst;
-                                chain.fx_chain = new_fx.into_iter().flatten().collect();
+                                chain.devices = rebuilt.into_iter().flatten().collect();
                             }
                         });
-                        // --- 3. Re-key every (track, slot) book old→new. Remove
-                        //        ALL old keys first, then re-insert, so a new
-                        //        slot never collides with a not-yet-freed old. ---
-                        type SlotBookkeeping = (
-                            PluginSlot,
+                        // --- 3. Re-key every (track, index) book old→new.
+                        //        Remove ALL old keys first, then re-insert, so a
+                        //        new index never collides with a not-yet-freed
+                        //        old one. ---
+                        type IdxBookkeeping = (
+                            u32,
                             u32,
                             Option<String>,
                             Option<(String, String)>,
                             Option<editor_window::EditorWindow>,
                         );
-                        let mut remapped: Vec<SlotBookkeeping> = Vec::new();
+                        let mut remapped: Vec<IdxBookkeeping> = Vec::new();
                         for &(from, to) in &moves {
                             if let Some(&pid) = plugin_lookup.get(&(track, from)) {
                                 let lid = loaded_id_for_slot.remove(&(track, from));
@@ -1307,71 +1241,6 @@ fn plugin_main_loop(
                             republish_entry_slot(&plugin_registry, pid, track, to);
                         }
                         tracing::info!(track, n = moves.len(), "ReorderChain applied (live move)");
-                    }
-                }
-                PluginCommand::DemoteInstrumentToGenerator { track } => {
-                    // FIXME #29/#31: move the LIVE instrument plugin to the end
-                    // of the MIDI-FX (generator) chain. The `Box<dyn ...>` (and
-                    // thus the plugin instance the worker pool's `PluginPtr`
-                    // points at) keeps its heap address across the move, so
-                    // there is no re-instantiation, no audio glitch, and — by
-                    // re-keying `editor_windows` — the open editor window
-                    // survives at the same HWND (same on-screen position).
-                    let mut new_idx: Option<usize> = None;
-                    tracks.mutate(|t| {
-                        if let Some(chain) = t.chains.get_mut(&track)
-                            && let Some(plugin) = chain.instrument.take()
-                        {
-                            new_idx = Some(chain.midi_fx_chain.len());
-                            chain.midi_fx_chain.push(plugin);
-                        }
-                    });
-                    if let Some(idx) = new_idx {
-                        let old_slot = PluginSlot::Instrument;
-                        let new_slot = PluginSlot::MidiFx(idx as u32);
-                        // Re-key every (track, slot) book so close / resize /
-                        // remove / param-stamping all follow to the new slot.
-                        if let Some(pid) = plugin_lookup.remove(&(track, old_slot)) {
-                            plugin_lookup.insert((track, new_slot), pid);
-                            republish_entry_slot(&plugin_registry, pid, track, new_slot);
-                        }
-                        if let Some(v) = loaded_id_for_slot.remove(&(track, old_slot)) {
-                            loaded_id_for_slot.insert((track, new_slot), v);
-                        }
-                        if let Some(v) = loaded_meta_for_slot.remove(&(track, old_slot)) {
-                            loaded_meta_for_slot.insert((track, new_slot), v);
-                        }
-                        // The editor window FOLLOWS — same HWND, no flicker.
-                        if let Some(win) = editor_windows.remove(&(track, old_slot)) {
-                            editor_windows.insert((track, new_slot), win);
-                        }
-                        // FIXME #31: re-emit SlotPluginLoaded at the new slot so
-                        // daw_gui re-issues OpenPluginShmem to the AUDIO engine,
-                        // mapping the moved plugin_id to its new generator slot.
-                        // The instance kept its id (no reload), so without this
-                        // the audio engine keeps treating it as the instrument
-                        // and the real new instrument gets no notes (= the
-                        // demoted source's MIDI never reaches it).
-                        if let (Some(&pid), Some((id, name))) = (
-                            plugin_lookup.get(&(track, new_slot)),
-                            loaded_meta_for_slot.get(&(track, new_slot)),
-                        ) {
-                            let shmem_id = format!("daw_01_pd_{plugin_host_pid}_{pid}");
-                            let _ = evt_tx.send(PluginEvent::SlotPluginLoaded {
-                                track,
-                                slot: new_slot,
-                                id: id.clone(),
-                                name: name.clone(),
-                                plugin_id: pid,
-                                shmem_id,
-                                state_load_error: None,
-                            });
-                        }
-                        tracing::info!(
-                            track,
-                            new_slot = idx,
-                            "demoted instrument to generator (live move)"
-                        );
                     }
                 }
                 PluginCommand::RemoveTrack { track } => {
@@ -1410,14 +1279,8 @@ fn plugin_main_loop(
                     // thread が active なまま COM object が消えて Drop で
                     // crash する。
                     if let Some(mut chain) = detached_chain {
-                        for mfx in chain.midi_fx_chain.drain(..) {
-                            teardown_plugin(mfx);
-                        }
-                        if let Some(inst) = chain.instrument.take() {
-                            teardown_plugin(inst);
-                        }
-                        for fx in chain.fx_chain.drain(..) {
-                            teardown_plugin(fx);
+                        for device in chain.devices.drain(..) {
+                            teardown_plugin(device);
                         }
                     }
 
@@ -1437,8 +1300,8 @@ fn plugin_main_loop(
                         let _ = evt_tx.send(PluginEvent::SlotPluginUnloaded { plugin_id: pid });
                     }
                 }
-                PluginCommand::RequestSlotState { track, slot } => {
-                    let data = match tracks.plugin_at_mut(track, slot) {
+                PluginCommand::RequestSlotState { track, index } => {
+                    let data = match tracks.plugin_at_mut(track, index) {
                         Some(plugin) => match plugin.state_save() {
                             Ok(s) => s,
                             Err(e) => {
@@ -1448,61 +1311,61 @@ fn plugin_main_loop(
                         },
                         None => None,
                     };
-                    let _ = evt_tx.send(PluginEvent::SlotPluginState { track, slot, data });
+                    let _ = evt_tx.send(PluginEvent::SlotPluginState { track, index, data });
                 }
                 PluginCommand::RequestAllStates => {
                     let entries = collect_all_states(&mut tracks);
                     let _ = evt_tx.send(PluginEvent::AllPluginStates { entries });
                 }
-                PluginCommand::OpenSlotGui { track, slot, title } => {
+                PluginCommand::OpenSlotGui { track, index, title } => {
                     // Stable id so plugin removal can match this editor even
-                    // after the plugin's slot shifts (demotion / lower-slot
-                    // removal) while the editor is open.
-                    let plugin_id = plugin_lookup.get(&(track, slot)).copied().unwrap_or(0);
+                    // after the plugin's index shifts (a lower-index removal /
+                    // a reorder) while the editor is open.
+                    let plugin_id = plugin_lookup.get(&(track, index)).copied().unwrap_or(0);
                     match open_gui(
                         &mut tracks,
                         &mut editor_windows,
                         track,
-                        slot,
+                        index,
                         plugin_id,
                         &title,
                     ) {
                         Ok(Some((w, h))) => {
                             let _ = evt_tx.send(PluginEvent::SlotGuiOpened {
                                 track,
-                                slot,
+                                index,
                                 width: w,
                                 height: h,
                             });
                         }
                         Ok(None) => {
-                            let _ = evt_tx.send(PluginEvent::SlotGuiClosed { track, slot });
+                            let _ = evt_tx.send(PluginEvent::SlotGuiClosed { track, index });
                         }
                         Err(e) => {
-                            tracing::error!(error = ?e, track, ?slot, "failed to open GUI");
+                            tracing::error!(error = ?e, track, index, "failed to open GUI");
                             // open_gui cleaned up its own (plugin + window) on
                             // failure; close_slot_gui is idempotent and also
                             // emits SlotGuiClosed for daw_gui's open-state set.
-                            close_slot_gui(&mut tracks, &mut editor_windows, track, slot, &evt_tx);
+                            close_slot_gui(&mut tracks, &mut editor_windows, track, index, &evt_tx);
                         }
                     }
                 }
-                PluginCommand::CloseSlotGui { track, slot } => {
-                    close_slot_gui(&mut tracks, &mut editor_windows, track, slot, &evt_tx);
+                PluginCommand::CloseSlotGui { track, index } => {
+                    close_slot_gui(&mut tracks, &mut editor_windows, track, index, &evt_tx);
                 }
                 PluginCommand::SetBuiltinPluginNoteMetadata {
                     plugin_id,
                     bpm,
                     entries,
                 } => {
-                    // plugin_lookup は `(track, slot) -> plugin_id` の
+                    // plugin_lookup は `(track, index) -> plugin_id` の
                     // forward map。 逆引きは O(n) walk。 同 frame に
                     // 数件しか呼ばれない ので n ≤ 数十で問題なし。
                     let target =
                         plugin_lookup.iter().find_map(|(k, v)| {
                             (*v == plugin_id).then_some(*k)
                         });
-                    let Some((track, slot)) = target else {
+                    let Some((track, index)) = target else {
                         tracing::warn!(
                             plugin_id,
                             "SetBuiltinPluginNoteMetadata: plugin_id not found"
@@ -1510,7 +1373,7 @@ fn plugin_main_loop(
                         continue;
                     };
                     tracks.mutate(|t| {
-                        if let Some(plugin) = t.plugin_at_mut(track, slot) {
+                        if let Some(plugin) = t.plugin_at_mut(track, index) {
                             plugin.set_note_metadata(bpm, &entries);
                         }
                     });
@@ -1520,31 +1383,31 @@ fn plugin_main_loop(
 
         // FIXME #31: drain plugin-initiated resize requests. The host
         // callback (CLAP request_resize / VST3 resizeView) ran on this
-        // thread and queued (track, slot, w, h); resize the owning editor
+        // thread and queued (track, index, w, h); resize the owning editor
         // window then tell the plugin to lay out into the new client size.
-        while let Ok((track, slot, w, h)) = gui_resize_rx.try_recv() {
-            if let Some(win) = editor_windows.get(&(track, slot)) {
+        while let Ok((track, index, w, h)) = gui_resize_rx.try_recv() {
+            if let Some(win) = editor_windows.get(&(track, index)) {
                 win.set_client_size(w, h);
             }
-            resize_gui(&mut tracks, track, slot, w, h);
+            resize_gui(&mut tracks, track, index, w, h);
         }
 
         // FIXME #31: handle plugin-initiated closes (CLAP `closed`).
-        while let Ok((track, slot)) = gui_close_rx.try_recv() {
-            close_slot_gui(&mut tracks, &mut editor_windows, track, slot, &evt_tx);
+        while let Ok((track, index)) = gui_close_rx.try_recv() {
+            close_slot_gui(&mut tracks, &mut editor_windows, track, index, &evt_tx);
         }
 
         // FIXME #31: handle editor windows the user closed via the window's
         // ✕ (WNDPROC flipped the close flag). Tear the GUI down in the
         // spec-correct order (plugin.gui_destroy → DestroyWindow) and notify
         // daw_gui so it clears its open-GUI state.
-        let to_close: Vec<(u32, PluginSlot)> = editor_windows
+        let to_close: Vec<(u32, u32)> = editor_windows
             .iter()
             .filter(|(_, win)| win.take_close_request())
             .map(|(&key, _)| key)
             .collect();
-        for (track, slot) in to_close {
-            close_slot_gui(&mut tracks, &mut editor_windows, track, slot, &evt_tx);
+        for (track, index) in to_close {
+            close_slot_gui(&mut tracks, &mut editor_windows, track, index, &evt_tx);
         }
 
         unsafe {
@@ -1574,14 +1437,20 @@ fn plugin_main_loop(
     tracing::info!("plugin-main thread exiting (WM_QUIT)");
 }
 
-/// `slot` に `plugin` を挿入する。 同じ slot に既存 plugin がある場合は
-/// 呼び出し側で先に [`detach_plugin`] で抜き取り、 `WorkerPool::quiesce`
-/// で in-flight な `process()` を排出してから [`teardown_plugin`] に
-/// 渡す責務がある。 ここでは新 plugin の `activate` / `start_processing`
-/// と Vec への挿入のみを行う。
+/// device `index` に `plugin` を置く。 単一チェーン redesign の install
+/// semantics:
+/// - `index == devices.len()` → append (push)
+/// - `index < devices.len()`  → REPLACE。 呼び出し側が先に
+///   [`detach_plugin`] で同 index の既存 device を抜き取り、
+///   `WorkerPool::quiesce` で in-flight な `process()` を排出してから
+///   [`teardown_plugin`] に渡しているので、 ここでは抜けた穴 (= 同 index)
+///   に `Vec::insert(index, ..)` で差し戻すだけ。
+///
+/// ここでは新 plugin の `activate` / `start_processing` と Vec への挿入
+/// のみを行う。
 fn install_plugin(
     chain: &mut Chain,
-    slot: PluginSlot,
+    index: u32,
     mut plugin: Box<dyn LoadedPlugin>,
     sample_rate: u32,
     max_frames: u32,
@@ -1591,56 +1460,28 @@ fn install_plugin(
     // dispatch に切り替えた現在は、 chain に置く時点で started 状態に
     // しておく必要がある。
     if let Err(e) = plugin.activate(f64::from(sample_rate), 64, max_frames) {
-        tracing::error!(error = ?e, ?slot, "plugin.activate failed");
+        tracing::error!(error = ?e, index, "plugin.activate failed");
     }
     if let Err(e) = plugin.start_processing() {
-        tracing::error!(error = ?e, ?slot, "start_processing failed; plugin may be silent");
+        tracing::error!(error = ?e, index, "start_processing failed; plugin may be silent");
     }
-    match slot {
-        PluginSlot::Instrument => {
-            chain.instrument = Some(plugin);
-        }
-        PluginSlot::Fx(i) => {
-            let i = i as usize;
-            if i <= chain.fx_chain.len() {
-                chain.fx_chain.insert(i, plugin);
-            } else {
-                chain.fx_chain.push(plugin);
-            }
-        }
-        PluginSlot::MidiFx(i) => {
-            let i = i as usize;
-            if i <= chain.midi_fx_chain.len() {
-                chain.midi_fx_chain.insert(i, plugin);
-            } else {
-                chain.midi_fx_chain.push(plugin);
-            }
-        }
-    }
+    let i = (index as usize).min(chain.devices.len());
+    chain.devices.insert(i, plugin);
 }
 
-/// `slot` の plugin を chain から **取り出すだけ** (DLL call なし)。
-/// 戻り値の `Box<dyn LoadedPlugin>` はまだ active / processing 状態の
-/// ことがあるため、 呼び出し側は registry から `None` を publish し
-/// `WorkerPool::quiesce` で in-flight `process()` を排出した後、
-/// [`teardown_plugin`] で破棄する。
+/// device `index` の plugin を chain から **取り出すだけ** (DLL call なし)。
+/// `Vec::remove(index)` は後続 device を 1 つ手前へ詰める。 戻り値の
+/// `Box<dyn LoadedPlugin>` はまだ active / processing 状態のことがあるため、
+/// 呼び出し側は registry から `None` を publish し `WorkerPool::quiesce` で
+/// in-flight `process()` を排出した後、 [`teardown_plugin`] で破棄する。
 ///
 /// 「detach → registry-None → quiesce → teardown」 の順序を分けて持つ
 /// のは、 plugin-main thread が `Box` を drop する瞬間に worker thread
 /// が `unsafe { &mut *entry.plugin.0 }` で deref していると UAF に
 /// なるため。 詳細は `process_server.rs` の module-level docs。
-fn detach_plugin(chain: &mut Chain, slot: PluginSlot) -> Option<Box<dyn LoadedPlugin>> {
-    match slot {
-        PluginSlot::Instrument => chain.instrument.take(),
-        PluginSlot::Fx(i) => {
-            let i = i as usize;
-            (i < chain.fx_chain.len()).then(|| chain.fx_chain.remove(i))
-        }
-        PluginSlot::MidiFx(i) => {
-            let i = i as usize;
-            (i < chain.midi_fx_chain.len()).then(|| chain.midi_fx_chain.remove(i))
-        }
-    }
+fn detach_plugin(chain: &mut Chain, index: u32) -> Option<Box<dyn LoadedPlugin>> {
+    let i = index as usize;
+    (i < chain.devices.len()).then(|| chain.devices.remove(i))
 }
 
 /// CLAP / VST3 spec の teardown 順 (stop_processing → deactivate →
@@ -1654,52 +1495,15 @@ fn teardown_plugin(mut plugin: Box<dyn LoadedPlugin>) {
     drop(plugin);
 }
 
-/// `move_plugin` の戻り値。 実際に reorder が起きたときだけ `Some` を返し、
-/// 影響を受けた chain 種別 (`is_midi`) と元の `(a, b)` index を伝える。
-/// 呼び出し側はこれを使って `plugin_lookup` / `loaded_*_for_slot` /
-/// `PluginEntry.slot` を新順序に貼り直す。
-struct MovedRange {
-    is_midi: bool,
-    a: usize,
-    b: usize,
-}
-
-fn move_plugin(chain: &mut Chain, from: PluginSlot, to: PluginSlot) -> Option<MovedRange> {
-    // Only Fx↔Fx and MidiFx↔MidiFx reorders are supported for MVP.
-    match (from, to) {
-        (PluginSlot::Fx(a), PluginSlot::Fx(b)) => {
-            let a = a as usize;
-            let b = b as usize;
-            if a < chain.fx_chain.len() && b < chain.fx_chain.len() && a != b {
-                let plugin = chain.fx_chain.remove(a);
-                chain.fx_chain.insert(b, plugin);
-                return Some(MovedRange { is_midi: false, a, b });
-            }
-            None
-        }
-        (PluginSlot::MidiFx(a), PluginSlot::MidiFx(b)) => {
-            let a = a as usize;
-            let b = b as usize;
-            if a < chain.midi_fx_chain.len() && b < chain.midi_fx_chain.len() && a != b {
-                let plugin = chain.midi_fx_chain.remove(a);
-                chain.midi_fx_chain.insert(b, plugin);
-                return Some(MovedRange { is_midi: true, a, b });
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
 /// Wrap `plugin.state_save()` with explicit error logging + error string
-/// extraction. Mirror of the inline pattern in `RequestSlotState` handler
-/// (line 935-941) so silent corruption (= `Err → None`) is surfaced both
-/// in logs (= plugin name + track/slot で trace) と IPC (= `SlotState
-/// .error` で daw_gui status_message へ伝播) で見えるようになる。
+/// extraction. Mirror of the inline pattern in the `RequestSlotState` handler
+/// so silent corruption (= `Err → None`) is surfaced both in logs (= plugin
+/// name + track/index で trace) と IPC (= `SlotState.error` で daw_gui
+/// status_message へ伝播) で見えるようになる。
 fn save_plugin_state_with_err(
     plugin: &mut dyn crate::plugin_instance::LoadedPlugin,
     track_id: u32,
-    slot: PluginSlot,
+    index: u32,
 ) -> (Option<Vec<u8>>, Option<String>) {
     match plugin.state_save() {
         Ok(s) => (s, None),
@@ -1707,7 +1511,7 @@ fn save_plugin_state_with_err(
             let reason = format!("{e:#}");
             tracing::error!(
                 track = track_id,
-                ?slot,
+                index,
                 plugin = plugin.name(),
                 error = %reason,
                 "state_save failed (= project save 時に plugin 状態が \
@@ -1725,50 +1529,19 @@ fn collect_all_states(handle: &mut TracksHandle) -> Vec<SlotState> {
     let mut keys: Vec<u32> = handle.tracks.chains.keys().copied().collect();
     keys.sort();
     for &track_id in &keys {
-        let (mfx_count, has_inst, fx_count) = {
-            let Some(chain) = handle.tracks.chains.get(&track_id) else {
-                continue;
-            };
-            (
-                chain.midi_fx_chain.len(),
-                chain.instrument.is_some(),
-                chain.fx_chain.len(),
-            )
+        let device_count = match handle.tracks.chains.get(&track_id) {
+            Some(chain) => chain.devices.len(),
+            None => continue,
         };
-        for i in 0..mfx_count {
-            let slot = PluginSlot::MidiFx(i as u32);
-            if let Some(plugin) = handle.plugin_at_mut(track_id, slot) {
+        // Flat walk over the single `devices` Vec: one entry per device.
+        for i in 0..device_count {
+            let index = i as u32;
+            if let Some(plugin) = handle.plugin_at_mut(track_id, index) {
                 let (data, error) =
-                    save_plugin_state_with_err(plugin, track_id, slot);
+                    save_plugin_state_with_err(plugin, track_id, index);
                 out.push(SlotState {
                     track: track_id,
-                    slot,
-                    data,
-                    error,
-                });
-            }
-        }
-        if has_inst {
-            let slot = PluginSlot::Instrument;
-            if let Some(plugin) = handle.plugin_at_mut(track_id, slot) {
-                let (data, error) =
-                    save_plugin_state_with_err(plugin, track_id, slot);
-                out.push(SlotState {
-                    track: track_id,
-                    slot,
-                    data,
-                    error,
-                });
-            }
-        }
-        for i in 0..fx_count {
-            let slot = PluginSlot::Fx(i as u32);
-            if let Some(plugin) = handle.plugin_at_mut(track_id, slot) {
-                let (data, error) =
-                    save_plugin_state_with_err(plugin, track_id, slot);
-                out.push(SlotState {
-                    track: track_id,
-                    slot,
+                    index,
                     data,
                     error,
                 });
@@ -1780,18 +1553,18 @@ fn collect_all_states(handle: &mut TracksHandle) -> Vec<SlotState> {
 
 /// FIXME #31: open the plugin editor inside a top-level window THIS process
 /// owns (created on the plugin-main thread). On success the `EditorWindow` is
-/// stored in `editor_windows` keyed by (track, slot). On any failure the
+/// stored in `editor_windows` keyed by (track, index). On any failure the
 /// plugin GUI and the (local) window are torn down before returning, so the
 /// caller never sees a half-open editor.
 fn open_gui(
     handle: &mut TracksHandle,
-    editor_windows: &mut HashMap<(u32, PluginSlot), editor_window::EditorWindow>,
+    editor_windows: &mut HashMap<(u32, u32), editor_window::EditorWindow>,
     track: u32,
-    slot: PluginSlot,
+    index: u32,
     plugin_id: u32,
     title: &str,
 ) -> Result<Option<(u32, u32)>> {
-    let Some(plugin) = handle.plugin_at_mut(track, slot) else {
+    let Some(plugin) = handle.plugin_at_mut(track, index) else {
         return Ok(None);
     };
     if !plugin.gui_is_embed_supported() {
@@ -1889,7 +1662,7 @@ fn open_gui(
     // and the editor doesn't open hidden behind the main DAW window.
     editor.set_client_size(final_size.0, final_size.1);
     editor.set_foreground();
-    editor_windows.insert((track, slot), editor);
+    editor_windows.insert((track, index), editor);
 
     tracing::info!(
         plugin = %plugin.name(),
@@ -1916,7 +1689,7 @@ fn pump_pending_messages() {
     }
 }
 
-/// FIXME #31: close the editor for (track, slot): tear the plugin GUI down
+/// FIXME #31: close the editor for (track, index): tear the plugin GUI down
 /// (`gui_hide` → `gui_destroy` = view.removed()) BEFORE destroying the
 /// host-owned container window, then notify daw_gui so it clears its
 /// open-GUI state. Idempotent — missing plugin and/or missing window are
@@ -1924,33 +1697,33 @@ fn pump_pending_messages() {
 /// explicit `CloseSlotGui`, and the `open_gui` failure path.
 fn close_slot_gui(
     handle: &mut TracksHandle,
-    editor_windows: &mut HashMap<(u32, PluginSlot), editor_window::EditorWindow>,
+    editor_windows: &mut HashMap<(u32, u32), editor_window::EditorWindow>,
     track: u32,
-    slot: PluginSlot,
+    index: u32,
     evt_tx: &tmpsc::UnboundedSender<PluginEvent>,
 ) {
-    if let Some(plugin) = handle.plugin_at_mut(track, slot) {
+    if let Some(plugin) = handle.plugin_at_mut(track, index) {
         let _ = plugin.gui_hide();
         plugin.gui_destroy();
     }
     // Drop = DestroyWindow, run after gui_destroy detached the plugin child.
-    editor_windows.remove(&(track, slot));
-    let _ = evt_tx.send(PluginEvent::SlotGuiClosed { track, slot });
+    editor_windows.remove(&(track, index));
+    let _ = evt_tx.send(PluginEvent::SlotGuiClosed { track, index });
 }
 
 /// FIXME #31: destroy every editor window matching `pred` (used on plugin
 /// removal, matched by STABLE `plugin_id` so a window isn't orphaned when the
-/// plugin's slot shifted while open) and notify daw_gui with each window's
-/// (track, slot) key so it clears its open-GUI state. The plugin's own
+/// plugin's index shifted while open) and notify daw_gui with each window's
+/// (track, index) key so it clears its open-GUI state. The plugin's own
 /// `gui_destroy` is the caller's responsibility (it happens in
 /// `teardown_plugin` before this runs); here we only drop the container
 /// window (= `DestroyWindow`) and emit `SlotGuiClosed`.
 fn destroy_editor_windows_where(
-    editor_windows: &mut HashMap<(u32, PluginSlot), editor_window::EditorWindow>,
+    editor_windows: &mut HashMap<(u32, u32), editor_window::EditorWindow>,
     evt_tx: &tmpsc::UnboundedSender<PluginEvent>,
-    mut pred: impl FnMut(&(u32, PluginSlot), &editor_window::EditorWindow) -> bool,
+    mut pred: impl FnMut(&(u32, u32), &editor_window::EditorWindow) -> bool,
 ) {
-    let keys: Vec<(u32, PluginSlot)> = editor_windows
+    let keys: Vec<(u32, u32)> = editor_windows
         .iter()
         .filter(|(k, w)| pred(k, w))
         .map(|(&k, _)| k)
@@ -1959,7 +1732,7 @@ fn destroy_editor_windows_where(
         editor_windows.remove(&key); // Drop = DestroyWindow
         let _ = evt_tx.send(PluginEvent::SlotGuiClosed {
             track: key.0,
-            slot: key.1,
+            index: key.1,
         });
     }
 }
@@ -1967,15 +1740,15 @@ fn destroy_editor_windows_where(
 fn resize_gui(
     handle: &mut TracksHandle,
     track: u32,
-    slot: PluginSlot,
+    index: u32,
     width: u32,
     height: u32,
 ) {
-    let Some(plugin) = handle.plugin_at_mut(track, slot) else {
+    let Some(plugin) = handle.plugin_at_mut(track, index) else {
         return;
     };
     if let Err(e) = plugin.gui_set_size(width, height) {
-        tracing::warn!(error = ?e, width, height, track, ?slot, "gui.set_size failed");
+        tracing::warn!(error = ?e, width, height, track, index, "gui.set_size failed");
     }
 }
 
@@ -2013,7 +1786,7 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
     match msg {
         MainToChild::SetSlotPlugin {
             track,
-            slot,
+            index,
             format,
             path,
             plugin_id,
@@ -2021,7 +1794,7 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         } => {
             tracing::info!(
                 track,
-                ?slot,
+                index,
                 ?format,
                 path = %path.display(),
                 id = %plugin_id,
@@ -2030,36 +1803,28 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             );
             plugin.send(PluginCommand::SetSlotPlugin {
                 track,
-                slot,
+                index,
                 format,
                 path,
                 plugin_id,
                 initial_state,
             });
         }
-        MainToChild::RemoveSlotPlugin { track, slot } => {
-            tracing::info!(track, ?slot, "received RemoveSlotPlugin");
-            plugin.send(PluginCommand::RemoveSlotPlugin { track, slot });
-        }
-        MainToChild::MoveSlot { track, from, to } => {
-            tracing::info!(track, ?from, ?to, "received MoveSlot");
-            plugin.send(PluginCommand::MoveSlot { track, from, to });
+        MainToChild::RemoveSlotPlugin { track, index } => {
+            tracing::info!(track, index, "received RemoveSlotPlugin");
+            plugin.send(PluginCommand::RemoveSlotPlugin { track, index });
         }
         MainToChild::ReorderChain { track, moves } => {
             tracing::info!(track, n = moves.len(), "received ReorderChain");
             plugin.send(PluginCommand::ReorderChain { track, moves });
         }
-        MainToChild::DemoteInstrumentToGenerator { track } => {
-            tracing::info!(track, "received DemoteInstrumentToGenerator");
-            plugin.send(PluginCommand::DemoteInstrumentToGenerator { track });
-        }
         MainToChild::RemoveTrack { track } => {
             tracing::info!(track, "received RemoveTrack");
             plugin.send(PluginCommand::RemoveTrack { track });
         }
-        MainToChild::RequestSlotState { track, slot } => {
-            tracing::info!(track, ?slot, "received RequestSlotState");
-            plugin.send(PluginCommand::RequestSlotState { track, slot });
+        MainToChild::RequestSlotState { track, index } => {
+            tracing::info!(track, index, "received RequestSlotState");
+            plugin.send(PluginCommand::RequestSlotState { track, index });
         }
         MainToChild::RequestAllStates => {
             tracing::info!("received RequestAllStates");
@@ -2067,15 +1832,15 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         }
         MainToChild::OpenSlotGuiEmbedded {
             track,
-            slot,
+            index,
             title,
         } => {
-            tracing::info!(track, ?slot, %title, "received OpenSlotGuiEmbedded");
-            plugin.send(PluginCommand::OpenSlotGui { track, slot, title });
+            tracing::info!(track, index, %title, "received OpenSlotGuiEmbedded");
+            plugin.send(PluginCommand::OpenSlotGui { track, index, title });
         }
-        MainToChild::CloseSlotGui { track, slot } => {
-            tracing::info!(track, ?slot, "received CloseSlotGui");
-            plugin.send(PluginCommand::CloseSlotGui { track, slot });
+        MainToChild::CloseSlotGui { track, index } => {
+            tracing::info!(track, index, "received CloseSlotGui");
+            plugin.send(PluginCommand::CloseSlotGui { track, index });
         }
         MainToChild::OpenWorkerPool {
             n_workers,
@@ -2126,12 +1891,12 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         // not into the plugin host (the plugin host is the *creator* of
         // the shmem and already owns the handle in `plugin_shmems`).
         // We log if these arrive here just to flag a routing bug.
-        MainToChild::OpenPluginShmem { plugin_id, shmem_id, track, slot } => {
+        MainToChild::OpenPluginShmem { plugin_id, shmem_id, track, index } => {
             tracing::warn!(
                 plugin_id,
                 shmem = %shmem_id,
                 track,
-                ?slot,
+                index,
                 "OpenPluginShmem reached plugin_host (should be daw_audio only)"
             );
         }
@@ -2210,7 +1975,7 @@ pub struct PluginEntry {
     /// param events を `PluginEvent::PluginParamTouched / ValueChanged`
     /// に詰めるための逆引き。 register / publish 時に固定。
     pub track: u32,
-    pub slot: PluginSlot,
+    pub index: u32,
 }
 unsafe impl Send for PluginEntry {}
 unsafe impl Sync for PluginEntry {}
@@ -2226,39 +1991,27 @@ pub type PluginRegistry =
 /// process-server worker pool reads `PluginPtr` snapshots from the
 /// shared `plugin_registry` to call `plugin.process()`.
 ///
-/// Each slot holds a `Box<dyn LoadedPlugin>` so CLAP (`ClapPlugin`) and
+/// Single-chain redesign (`docs/plan_linear_chain.md`): the old 3-section
+/// model (midi_fx_chain / instrument / fx_chain) is collapsed into one
+/// `devices: Vec<Box<dyn LoadedPlugin>>` addressed by `device_index: u32`.
+/// Roles (MIDI FX / instrument / audio FX) are derived from each device's
+/// declared ports by daw_audio when it walks the chain; the plugin host
+/// stores devices position-only.
+///
+/// Each device holds a `Box<dyn LoadedPlugin>` so CLAP (`ClapPlugin`) and
 /// VST3 (`Vst3Plugin`) implementations can coexist on the same chain.
 /// Boxing keeps the plugin pinned on the heap so the raw pointers stored
 /// in `PluginEntry` remain valid across `Vec` reallocations.
 #[derive(Default)]
 struct Chain {
-    /// Note-effect plugins executed before the instrument (e.g. arpeggiators).
-    /// Events flow left-to-right, with each plugin's emitted notes feeding
-    /// the next.
-    midi_fx_chain: Vec<Box<dyn LoadedPlugin>>,
-    /// Instrument slot (note→audio). `None` = no instrument loaded on the
-    /// track; audio thread produces silence at the instrument stage.
-    instrument: Option<Box<dyn LoadedPlugin>>,
-    /// Audio effects applied in order after the instrument.
-    fx_chain: Vec<Box<dyn LoadedPlugin>>,
+    devices: Vec<Box<dyn LoadedPlugin>>,
 }
 
 impl Chain {
-    fn plugin_at_mut(&mut self, slot: PluginSlot) -> Option<&mut (dyn LoadedPlugin + '_)> {
-        match slot {
-            PluginSlot::MidiFx(i) => self
-                .midi_fx_chain
-                .get_mut(i as usize)
-                .map(|b| &mut **b as &mut dyn LoadedPlugin),
-            PluginSlot::Instrument => self
-                .instrument
-                .as_mut()
-                .map(|b| &mut **b as &mut dyn LoadedPlugin),
-            PluginSlot::Fx(i) => self
-                .fx_chain
-                .get_mut(i as usize)
-                .map(|b| &mut **b as &mut dyn LoadedPlugin),
-        }
+    fn plugin_at_mut(&mut self, index: u32) -> Option<&mut (dyn LoadedPlugin + '_)> {
+        self.devices
+            .get_mut(index as usize)
+            .map(|b| &mut **b as &mut dyn LoadedPlugin)
     }
 }
 
@@ -2285,9 +2038,9 @@ impl Tracks {
     fn plugin_at_mut(
         &mut self,
         track_id: u32,
-        slot: PluginSlot,
+        index: u32,
     ) -> Option<&mut (dyn LoadedPlugin + '_)> {
-        self.chains.get_mut(&track_id).and_then(|c| c.plugin_at_mut(slot))
+        self.chains.get_mut(&track_id).and_then(|c| c.plugin_at_mut(index))
     }
 }
 
@@ -2313,9 +2066,9 @@ impl TracksHandle {
     fn plugin_at_mut(
         &mut self,
         track: u32,
-        slot: PluginSlot,
+        index: u32,
     ) -> Option<&mut (dyn LoadedPlugin + '_)> {
-        self.tracks.plugin_at_mut(track, slot)
+        self.tracks.plugin_at_mut(track, index)
     }
 
     /// 内部 `Tracks` に `f` を適用する。 process_server の worker pool
@@ -2341,14 +2094,8 @@ impl TracksHandle {
         // 順序: gui_destroy → 自動 Drop で stop_processing/deactivate/
         // destroy/terminate)。
         for chain in self.tracks.chains.values_mut() {
-            for mfx in &mut chain.midi_fx_chain {
-                mfx.gui_destroy();
-            }
-            if let Some(inst) = chain.instrument.as_mut() {
-                inst.gui_destroy();
-            }
-            for fx in &mut chain.fx_chain {
-                fx.gui_destroy();
+            for device in &mut chain.devices {
+                device.gui_destroy();
             }
         }
         // ここで `Plugin::drop` が main thread で走る。

@@ -23,7 +23,6 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use common::model::Song;
 use common::plugin_ref::{PluginRef, WorkerSyncRef};
-use common::protocol::PluginSlot;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{
@@ -52,7 +51,7 @@ pub struct DispatchShared {
     pub song_ptr: AtomicPtr<Song>,
     pub scratch_base: AtomicPtr<TrackScratch>,
     pub plugin_refs_ptr: AtomicPtr<HashMap<u32, PluginRef>>,
-    pub slot_map_ptr: AtomicPtr<HashMap<(u32, PluginSlot), u32>>,
+    pub slot_map_ptr: AtomicPtr<HashMap<(u32, u32), u32>>,
     /// PR6: per-buffer audio clip render snapshot. `null` ⇒ workers
     /// pass `None` to `process_track_owned` (= 旧挙動互換、 audio
     /// clip mix を skip)。
@@ -204,7 +203,7 @@ impl AudioWorkerPool {
         song: Option<&Song>,
         scratch: &mut [TrackScratch],
         plugin_refs: &HashMap<u32, PluginRef>,
-        slot_map: &HashMap<(u32, PluginSlot), u32>,
+        slot_map: &HashMap<(u32, u32), u32>,
         audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer,
         worker_syncs: &[WorkerSyncRef],
         master_l: &mut [f32],

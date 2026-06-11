@@ -1414,7 +1414,7 @@ fn read_one_frame(
 mod tests {
     use super::*;
     use common::model::{
-        Clip, ClipContent, Song, Track, VideoContent, VideoEvent,
+        Clip, ClipContent, Song, VideoContent, VideoEvent,
         VideoSource, VideoSourcePath,
     };
 
@@ -1449,11 +1449,10 @@ mod tests {
                 audio_source_id: None,
             },
         );
-        let mut track = Track {
-            id: 1,
-            name: "V".into(),
-            ..Track::default()
-        };
+        let mut track = crate::app::track_with(|t| {
+            t.id = 1;
+            t.name = "V".into();
+        });
         track.clips.push(Clip {
             id: 1,
             name: "vid".into(),
@@ -1497,11 +1496,10 @@ mod tests {
     fn active_source_at_skips_audio_tracks() {
         let mut song = song_with_video_clip(120.0, 1);
         // Stick an Audio track at the top — must be skipped.
-        let audio_track = Track {
-            id: 2,
-            name: "A".into(),
-            ..Track::default()
-        };
+        let audio_track = crate::app::track_with(|t| {
+            t.id = 2;
+            t.name = "A".into();
+        });
         song.tracks.insert(0, audio_track);
         let result = VideoPlaybackEngine::active_source_at(&song, 5.0);
         assert!(result.is_some(), "video track should still be found");
@@ -1778,10 +1776,10 @@ mod tests {
                 audio_source_id: None,
             },
         );
-        let top_track = Track {
-            id: 2,
-            name: "VTop".into(),
-            clips: vec![Clip {
+        let top_track = crate::app::track_with(|t| {
+            t.id = 2;
+            t.name = "VTop".into();
+            t.clips = vec![Clip {
                 id: 1,
                 name: "vclip2".into(),
                 start_beat: 4.0,
@@ -1790,10 +1788,9 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
-            }],
-            next_clip_id: 2,
-            ..Track::default()
-        };
+            }];
+            t.next_clip_id = 2;
+        });
         // Insert at position 0 = top of arrangement.
         song.tracks.insert(0, top_track);
 
