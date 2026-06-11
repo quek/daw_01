@@ -110,7 +110,13 @@ mod tests {
         let path = dir.path().join("project.daw");
         let song = Song::default();
         save(&path, &song).unwrap();
-        assert_eq!(load(&path).unwrap(), song);
+        let mut loaded = load(&path).unwrap();
+        // v24 (FIXME #33): default の project_id は 0 (未採番)。save は 0 のまま書き、
+        // load が `ensure_project_id` で採番するので loaded.project_id != 0。それ以外は
+        // 一致するはず。project_id を 0 に戻してから残りを比較する。
+        assert_ne!(loaded.project_id, 0, "load で project_id が採番される");
+        loaded.project_id = 0;
+        assert_eq!(loaded, song);
     }
 
     #[test]
@@ -382,6 +388,32 @@ mod tests {
         let song = load(&path).expect("v18 must forward-migrate");
         assert_eq!(song.tracks.len(), 1);
         assert_eq!(song.tracks[0].group_transform, None);
+    }
+
+    #[test]
+    fn load_v23_assigns_project_id_and_persists() {
+        // v23 saves had no `project_id`. Loading must succeed and assign a fresh
+        // non-zero id (`ensure_project_id`), and re-saving must persist it so the
+        // next load returns the SAME id (`docs/plan_fixme_33_clipboard.md`, FIXME #33).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v23.daw");
+        let v23_json = r#"{
+            "version": 23,
+            "song": {
+                "bpm": 120.0,
+                "time_sig": [4, 4],
+                "length_beats": 64.0,
+                "tracks": []
+            }
+        }"#;
+        fs::write(&path, v23_json).unwrap();
+        let song = load(&path).expect("v23 must forward-migrate");
+        assert_ne!(song.project_id, 0, "load で project_id が採番される");
+        let id = song.project_id;
+        // re-save → re-load で同一 id が保たれる (ensure_project_id は非 0 を上書きしない)。
+        save(&path, &song).unwrap();
+        let reloaded = load(&path).unwrap();
+        assert_eq!(reloaded.project_id, id, "save/load で project_id が保たれる");
     }
 
     #[test]

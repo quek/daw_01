@@ -302,6 +302,27 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
+    // FIXME #33: ノート paste の配置位置。grid 上のポインタを **clip-local** snapped
+    // beat にして毎フレーム mirror。`view.start_beat` は song-absolute (FIXME #3) なので、
+    // dbl-click の AddNote (`snapped_beat - clip_start_beat`) と同様に clip_start_beat を
+    // 引いて clip-local に変換する (paste_notes_at は clip-local 前提)。grid 外は None。
+    let hover_beat: Option<f64> = ui.pointer().pos.and_then(|(px, py)| {
+        if !grid_rect.contains(px, py) {
+            return None;
+        }
+        let beat_to_px = grid_rect.w as f64 / view.len_beats.max(1e-6);
+        let beat_raw = view.start_beat + (px - grid_rect.x) as f64 / beat_to_px;
+        let cfg = snap::piano_roll_snap_config(app);
+        let alt = ui.pointer().modifiers.alt;
+        let snapped = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x);
+        Some(snapped - clip_start_beat)
+    });
+    if app.pianoroll_hover_beat != hover_beat {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.pianoroll_hover_beat = hover_beat;
+        }));
+    }
+
     // 空白上 dbl-click → AddNote (snap_choice / Alt 押下を尊重)。
     if let Some((px, py)) = ui.take_double_click_in_rect(grid_rect)
         && note_hit(&widget_notes, view, grid_rect, px, py, resize_handle_px).is_none()

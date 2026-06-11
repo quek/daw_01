@@ -7,6 +7,13 @@ use serde::{Deserialize, Serialize};
 use crate::plugin_format::PluginFormat;
 use crate::scale::ScaleChange;
 
+/// `24` プロジェクト識別子 (`docs/plan_fixme_33_clipboard.md`, FIXME #33):
+/// `Song.project_id: u64` が追加される。New で 1 度採番し Save/Load で保持する
+/// document 固有の安定 ID で、クリップボード round-trip 時に「同一プロジェクト由来か」を
+/// 判定して clip/track paste のリンク共有 (同一) / 独立コピー (別) を分岐する。v23 `.daw`
+/// files still load — `project_id` は `#[serde(default)]` で `0` になり、`Song::ensure_project_id`
+/// (`normalize_after_load` 内) が load 時に採番する (`0` は未採番 sentinel)。
+///
 /// `23` 単一デバイスチェーン (`docs/plan_linear_chain.md`): 役割別 3 chain
 /// (`Track.{instrument, midi_fx_chain, fx_chain}`) を 1 本の
 /// `Track.devices: Vec<PluginInstance>` へ統合し、各 `PluginInstance` に
@@ -127,7 +134,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 23;
+pub const CURRENT_VERSION: u32 = 24;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -307,6 +314,12 @@ pub struct Song {
     /// 直列 process する。 旧 file は `#[serde(default)]` で空 Vec に forward-migrate。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub master_fx_chain: Vec<PluginInstance>,
+    /// v24 (FIXME #33): プロジェクト固有の安定 ID。New で 1 度採番、Save/Load で保持。
+    /// クリップボード round-trip で「同一プロジェクト由来か」を判定し、clip/track paste の
+    /// リンク共有 (同一) / 独立コピー (別) を分岐する。`0` は未採番 sentinel —
+    /// load 時に `0` なら `Song::ensure_project_id` が採番する (旧 file forward-migration)。
+    #[serde(default)]
+    pub project_id: u64,
 }
 
 fn default_video_resolution() -> (u32, u32) {
@@ -343,6 +356,7 @@ impl Default for Song {
             image_sources: HashMap::new(),
             next_image_source_id: 1,
             master_fx_chain: Vec::new(),
+            project_id: 0,
         }
     }
 }
@@ -494,7 +508,21 @@ impl Song {
     /// loaded song — value-range sanity, content / source migration, stable
     /// ids, and sort order — so `project::load`'s return value is always
     /// self-consistent regardless of how the file was produced. Idempotent.
+    /// v24 (FIXME #33): `project_id == 0` (未採番 / 旧 file / `Song::default`) なら
+    /// 新規採番する。既に非 0 なら触らない (idempotent) ので、New で採番済みの song に
+    /// `normalize_after_load` を再走させても上書きしない。uuid v4 の下位 64bit を使う
+    /// (別起動・別マシンでも衝突しない。`0` sentinel は引き直す)。
+    pub fn ensure_project_id(&mut self) {
+        if self.project_id == 0 {
+            self.project_id = uuid::Uuid::new_v4().as_u128() as u64;
+            if self.project_id == 0 {
+                self.project_id = 1;
+            }
+        }
+    }
+
     pub fn normalize_after_load(&mut self) {
+        self.ensure_project_id();
         self.sanitize_ranges();
         self.ensure_clip_contents();
         self.ensure_audio_source_ids();
@@ -3586,8 +3614,9 @@ mod tests {
         // private legacy slots and `Track::flatten_legacy_devices` (run from
         // `ensure_ids`) flattens them into `devices` and remaps lane slots.
         // Pinning the constant catches accidental rollback. See
-        // `docs/plan_linear_chain.md`.
-        assert_eq!(CURRENT_VERSION, 23);
+        // `docs/plan_linear_chain.md`. v24 adds `Song.project_id`
+        // (`docs/plan_fixme_33_clipboard.md`, clipboard same-project detection).
+        assert_eq!(CURRENT_VERSION, 24);
     }
 
     #[test]

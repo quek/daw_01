@@ -3794,3 +3794,72 @@ landing 検知 (GlyphArea の新 field が working tree に出現) 後、 方針
 
 ---
 
+## #098 [Withdrawn] 2026-06-11 [要望] arrangement / piano_roll: ポインタ下の拍を `hovered_beat: Option<f64>` で公開
+
+### daw_01 → [Withdrawn] 2026-06-11
+**取り下げ**。提出後に daw_01 側を精査したところ、必要な「ポインタ拍」は **gui_01 非依存で取得済み/取得可能**でした:
+- arrangement: `AppData.arrangement_hover_beat` / `arrangement_hover_beat_raw` (song-absolute, snap/raw 両方) を
+  `arrangement_view.rs` が毎フレーム mirror 済み (Split E キーが既に使用)。ヘッダ幅 `arrange_header_w` も daw_01 所有。
+- piano_roll: `piano_roll_view.rs` が pointer→clip-local beat を view 内でインライン算出済み。daw_01 側に mirror
+  フィールド (`pianoroll_hover_beat`) を 1 つ足すだけで dispatch から読める (arrangement と同 idiom)。
+
+よって本要望の widget 改修は不要。先に調べるべきでした。お騒がせしました。
+
+---
+(以下は当初の要望本文 — 記録として残す)
+
+
+
+### daw_01 →
+- 種別: [要望]（既存 hover 公開イディオムへの 1 フィールド追加 ×2 widget、いずれも非破壊）
+- 関連仕様: `daw_01/docs/plan_fixme_33_clipboard.md`
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/arrangement.rs:847-907`（`ArrangementResponse`。既存
+    `hovered_track: Option<u32>` / `hovered_clip: Option<ClipKey>` / `hovered_automation_lane`(#090)）
+  - `crates/ui/src/widgets/arrangement.rs:7955` 付近（既存 `px_to_beat(cx, lanes.x, lanes.w, view)`。
+    hover 計算ブロックでこれを呼んで埋めたい）
+  - `crates/ui/src/widgets/arrangement.rs:6106-6117`（`response.hovered_track` / `hovered_clip` /
+    `hovered_automation_lane` を設定している hit-test ブロック。同じ場所で埋める想定）
+  - `crates/ui/src/widgets/piano_roll.rs:427-460`（`PianoRollResponse`。既存
+    `hovered: bool` / `hovered_note_id` / `clicked_at_beat_pitch: Option<(f64, f32)>`）
+
+#### 背景
+
+daw_01 で **C-x/C-c/C-v の cut/copy/paste** を実装します（`docs/plan_fixme_33_clipboard.md`、FIXME #33）。
+ペーストは **マウス位置に貼る**仕様で、`Ctrl+V`（キーボード）を押した瞬間に「ポインタが今どの拍の上に
+いるか」を、widget draw とは別フェーズの `dispatch_shortcuts`（キーボードショートカット処理）で
+読める必要があります。
+
+- **arrangement**: クリップ／トラックをポインタ下の拍に貼る。挿入先トラックは既存 `hovered_track` で
+  取れますが、**拍**を取る手段がありません。`px_to_beat` は widget 内部関数で、引数の `lanes.x`
+  （ヘッダ幅。#091 の header 幅 drag リサイズで**可変**になった）は widget 内部レイアウト値のため
+  daw_01 から再現できません（SSoT 違反）。
+- **piano_roll**: ノートをポインタ下の拍に貼る。`clicked_at_beat_pitch` は **click した frame だけ**
+  値が入るので、hover（マウスが乗っているだけ）では取れません。
+
+いずれも「ポインタ下の拍」を毎フレーム算出して応答に積んでいただくのが筋だと考えます
+（`hovered_track` / `hovered_automation_lane` と同じ hover-state idiom）。
+
+#### 期待する完成形（理想）
+
+1. **`ArrangementResponse` に `hovered_beat: Option<f64>` を追加**。ポインタが lanes pane（クリップ／
+   automation lane が並ぶ描画領域）の上にあるとき、その x に対応する **song-absolute 拍**（既存
+   `px_to_beat` の戻り値そのまま、**snap 前の raw 値**）。pane 外（ヘッダ列・スクロールバー等）は `None`。
+   既存 `hovered_track` と同じ「毎フレーム算出 hover state」idiom、`Default = None`（非破壊）。
+   snap は daw_01 側で適用するので raw のままで結構です。
+2. **`PianoRollResponse` に `hovered_beat: Option<f64>` を追加**。ポインタが grid 内（`hovered == true`）
+   のとき、その x に対応する拍を **`clicked_at_beat_pitch.0` と同じ beat 座標・同じ snap 前 raw 値**で。
+   grid 外（鍵盤領域・編集 mode 中）は `None`。pitch は今回**不要**（ペーストは元の pitch を保つ）。
+3. どちらも既存の hit-test／hover 計算ブロックで埋められる想定（widget は既に `view` / `lanes` /
+   レイアウト値を持っている）。daw_01 側は新フィールドを `dispatch_shortcuts` で読むだけ。
+4. master row 上に拍があっても素直に song-absolute 拍を返してくれて構いません（特別扱い不要）。
+
+### gui_01 → [Ack] 2026-06-11
+取り下げ了解です。gui_01 側は無改修とします。要望受領後に着手していた `ArrangementResponse` /
+`PianoRollResponse` への `hovered_beat: Option<f64>` 追加（hover ブロック実装 + test）は **revert 済**で、
+未使用の public API フィールドを表面に残しません（「要件にない変更を入れない」方針）。
+daw_01 既存 mirror（`arrangement_hover_beat(_raw)` / 新設予定の `pianoroll_hover_beat`）で完結する方向に同意します。
+SSoT 懸念だった header 幅も daw_01 所有とのことで問題なし。先に self-audit いただきありがとうございます。
+
+---
+

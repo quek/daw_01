@@ -266,6 +266,290 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
     });
 }
 
+/// FIXME #33: clipboard / delete 操作の対象面。ポインタが乗っている編集面を最優先し、
+/// どの面でもなければ選択集合の非空優先順 (= 既存 Delete と同順) で決まる。
+/// copy / cut / paste / delete が共有する単一 arbiter (grill-me 2026-06-11)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditSurface {
+    AudioEvents,
+    Notes,
+    AutomationPoints,
+    AutomationClips,
+    Clips,
+    Tracks,
+}
+
+/// ポインタ面 → 選択優先順 で対象面を決める。
+fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface> {
+    // 1. ポインタが乗っている面を最優先。
+    if is_pianoroll_active {
+        return Some(if app.audio_editor_clip.is_some() {
+            EditSurface::AudioEvents
+        } else {
+            EditSurface::Notes
+        });
+    }
+    if app.arrange_hovered_automation_lane.is_some() {
+        return Some(EditSurface::AutomationPoints);
+    }
+    // 2. ポインタがどの編集面でもない → 選択集合の非空優先順。
+    if app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty() {
+        return Some(EditSurface::AudioEvents);
+    }
+    if !app.selected_automation_points.is_empty() {
+        return Some(EditSurface::AutomationPoints);
+    }
+    if !app.selected_notes.is_empty() {
+        return Some(EditSurface::Notes);
+    }
+    // 安価な空判定 (selected_clip_refs() は Vec を確保するので避ける)。
+    if app.selected_clip.is_some() || !app.selected_clips.is_empty() {
+        return Some(EditSurface::Clips);
+    }
+    if !app.selected_automation_clips.is_empty() {
+        return Some(EditSurface::AutomationClips);
+    }
+    if !app.selected_track_ids.is_empty() {
+        return Some(EditSurface::Tracks);
+    }
+    None
+}
+
+/// Ctrl+C: 対象面の選択を clipboard envelope にして OS clipboard へ。トラックだけは
+/// plugin state 収集が非同期なので `AppData::copy_tracks` 経由 (結果は
+/// `pending_clipboard_write` から flush される)。
+fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
+    let Some(surface) = surface else {
+        return;
+    };
+    let synced: Option<(String, usize, &'static str)> = match surface {
+        EditSurface::AudioEvents => app.copy_events_clip().map(|(j, c)| (j, c, "イベント")),
+        EditSurface::Notes => app.copy_notes_clip().map(|(j, c)| (j, c, "ノート")),
+        EditSurface::AutomationPoints => app
+            .copy_points_clip()
+            .map(|(j, c)| (j, c, "オートメーションポイント")),
+        EditSurface::Clips => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
+        EditSurface::AutomationClips | EditSurface::Tracks => None,
+    };
+    if let Some((json, count, label)) = synced {
+        ui.set_clipboard_text(json);
+        let label = label.to_string();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.status_message = format!("コピー: {count} {label}");
+        }));
+        return;
+    }
+    match surface {
+        EditSurface::Tracks => {
+            let ids = app.selected_track_ids.clone();
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.copy_tracks(ids);
+            }));
+        }
+        EditSurface::AutomationClips => {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.status_message = "オートメーションクリップの copy は未対応".to_string();
+            }));
+        }
+        _ => {}
+    }
+}
+
+/// Ctrl+X: copy (clipboard へ) + 対象の削除を 1 undo step。clipboard 書込は undo 対象外、
+/// 削除イベントが自前で undo snapshot を積む。トラックは `AppData::cut_tracks` で
+/// 非同期に copy+削除。
+fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
+    let Some(surface) = surface else {
+        return;
+    };
+    let synced: Option<(String, usize, &'static str)> = match surface {
+        EditSurface::AudioEvents => app.copy_events_clip().map(|(j, c)| (j, c, "イベント")),
+        EditSurface::Notes => app.copy_notes_clip().map(|(j, c)| (j, c, "ノート")),
+        EditSurface::AutomationPoints => app
+            .copy_points_clip()
+            .map(|(j, c)| (j, c, "オートメーションポイント")),
+        EditSurface::Clips => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
+        EditSurface::AutomationClips | EditSurface::Tracks => None,
+    };
+    if let Some((json, count, label)) = synced {
+        ui.set_clipboard_text(json);
+        let del = match surface {
+            EditSurface::AudioEvents => AppEvent::DeleteAudioEditorSelection,
+            EditSurface::Notes => AppEvent::DeleteSelectedNotes,
+            EditSurface::AutomationPoints => AppEvent::DeleteAutomationPoints {
+                points: app.selected_automation_points.clone(),
+            },
+            EditSurface::Clips => AppEvent::DeleteSelectedClip,
+            _ => return,
+        };
+        let label = label.to_string();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(del);
+            app.status_message = format!("カット: {count} {label}");
+        }));
+        return;
+    }
+    match surface {
+        EditSurface::Tracks => {
+            let ids = app.selected_track_ids.clone();
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.cut_tracks(ids);
+            }));
+        }
+        EditSurface::AutomationClips => {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.status_message = "オートメーションクリップの cut は未対応".to_string();
+            }));
+        }
+        _ => {}
+    }
+}
+
+/// Ctrl+V: clipboard envelope を種別で分岐し、**ポインタが合う面の上**でのみマウス位置に
+/// 貼る。合わなければ no-op + status (再生ヘッドへの fallback はしない)。
+fn paste_from_clipboard(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    text: &str,
+    is_pianoroll_active: bool,
+) {
+    let Some(env) = crate::clipboard::ClipboardEnvelope::from_json(text) else {
+        return; // 他アプリ text / 旧 format → 黙って無視
+    };
+    let src_pid = env.source_project_id;
+    use crate::clipboard::ClipboardPayload as P;
+    match env.payload {
+        P::Notes(notes) => {
+            if is_pianoroll_active
+                && app.audio_editor_clip.is_none()
+                && let Some(at) = app.pianoroll_hover_beat
+            {
+                let notes = crate::clipboard::sanitize_notes(notes);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let n = app.paste_notes_at(notes, at);
+                    if n > 0 {
+                        app.status_message = format!("貼り付け: {n} ノート");
+                    }
+                }));
+                return;
+            }
+            paste_noop(ui);
+        }
+        P::AudioEvents(events) => {
+            if is_pianoroll_active
+                && app.audio_editor_clip.is_some()
+                && let Some(at) = app.audio_editor_hover_beat_in_clip
+            {
+                let events = crate::clipboard::sanitize_audio_events(events);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let n = app.paste_events_at(events, at);
+                    if n > 0 {
+                        app.status_message = format!("貼り付け: {n} イベント");
+                    }
+                }));
+                return;
+            }
+            paste_noop(ui);
+        }
+        P::AutomationPoints(points) => {
+            if let (Some(lane), Some(at)) = (
+                app.arrange_hovered_automation_lane,
+                app.arrangement_hover_beat,
+            ) {
+                let points = crate::clipboard::sanitize_points(points);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let n = app.paste_points_at(points, lane, at);
+                    if n > 0 {
+                        app.status_message =
+                            format!("貼り付け: {n} オートメーションポイント");
+                    }
+                }));
+                return;
+            }
+            paste_noop(ui);
+        }
+        P::Clips(clips) => {
+            if !is_pianoroll_active
+                && app.arrange_hovered_automation_lane.is_none()
+                && let (Some(track), Some(at)) =
+                    (app.arrange_hovered_track, app.arrangement_hover_beat)
+            {
+                let clips = crate::clipboard::sanitize_clips(clips);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let n = app.paste_clips_at(clips, src_pid, track, at);
+                    if n > 0 {
+                        app.status_message = format!("貼り付け: {n} クリップ");
+                    }
+                }));
+                return;
+            }
+            paste_noop(ui);
+        }
+        P::Tracks(tracks) => {
+            if !is_pianoroll_active
+                && let Some(above) = app.arrange_hovered_track
+            {
+                let tracks = crate::clipboard::sanitize_tracks(tracks);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let n = app.paste_tracks_at(tracks, src_pid, above);
+                    if n > 0 {
+                        app.status_message = format!("貼り付け: {n} トラック");
+                    }
+                }));
+                return;
+            }
+            paste_noop(ui);
+        }
+    }
+}
+
+fn paste_noop(ui: &mut Ui<'_, AppData>) {
+    ui.push_edit(Edit::mutate(|app: &mut AppData| {
+        app.status_message =
+            "ここには貼り付けできません (貼り先の上にカーソルを置いてください)".to_string();
+    }));
+}
+
+/// Delete: ポインタが乗っている面の選択を最優先で削除、無ければ既存の選択優先順
+/// (audio event > automation point > note > automation clip > clip) で削除。後者は従来の
+/// 挙動そのままで回帰しない。
+fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
+    let audio_event_selected =
+        app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty();
+    let has_notes = !app.selected_notes.is_empty();
+    let auto_points =
+        (!app.selected_automation_points.is_empty()).then(|| app.selected_automation_points.clone());
+    let auto_clips =
+        (!app.selected_automation_clips.is_empty()).then(|| app.selected_automation_clips.clone());
+    let pointer_pick: Option<AppEvent> = match surface {
+        Some(EditSurface::AudioEvents) if audio_event_selected => {
+            Some(AppEvent::DeleteAudioEditorSelection)
+        }
+        Some(EditSurface::Notes) if has_notes => Some(AppEvent::DeleteSelectedNotes),
+        Some(EditSurface::AutomationPoints) => auto_points
+            .clone()
+            .map(|points| AppEvent::DeleteAutomationPoints { points }),
+        _ => None,
+    };
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        if let Some(ev) = pointer_pick {
+            app.handle_event(ev);
+            return;
+        }
+        if audio_event_selected {
+            app.handle_event(AppEvent::DeleteAudioEditorSelection);
+        } else if let Some(points) = auto_points {
+            app.handle_event(AppEvent::DeleteAutomationPoints { points });
+        } else if has_notes {
+            app.handle_event(AppEvent::DeleteSelectedNotes);
+        } else if let Some(keys) = auto_clips {
+            app.handle_event(AppEvent::DeleteAutomationClips { keys });
+        } else {
+            app.handle_event(AppEvent::DeleteSelectedClip);
+        }
+    }));
+}
+
 /// `ShortcutMap` ルックアップで判定済みの shortcut name を pull して AppEvent / undo
 /// 要求に変換する。`Ui::take_shortcut` は 1 度だけ消費するので、各 name について
 /// この関数で一括処理する。`app` は immut で受けて、コピーや状態判定のみで使う
@@ -375,94 +659,45 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::Redo)
         }));
     }
-    // Copy: automation point 選択 → note 選択 の優先順。 同フレームに
-    // 両方の selection が居ても、 直近で触っていそうな automation point
-    // 側を優先する (= 後で UX に応じて pointer 位置や focus view で
-    // 切り替える可能性あり、 まずは Phase 3 では automation 優先で固定)。
-    if ui.take_shortcut("copy") {
-        if let Some((json, count)) = app.copy_selected_automation_points_as_json() {
-            ui.set_clipboard_text(json);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.status_message = format!("コピー: {count} オートメーションポイント");
-            }));
-        } else if let Some((json, count)) = app.copy_selected_notes_as_json() {
-            ui.set_clipboard_text(json);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.status_message = format!("コピー: {count} ノート");
-            }));
-        }
-    }
-    // Paste: clipboard text を view まず note JSON として decode、 失敗
-    // したら automation JSON として decode を試みる。 順序が逆だと
-    // 「note paste 中なのに automation 側に行く」 ような微妙な事故が
-    // 起きづらいので、 note を先に試す。 paste 側の decode は
-    // `paste_*_from_json` が無効 JSON を silently 落とすので、 試行は
-    // 安全。
-    //
-    // ただし「現在 automation clip / point が selected」 のときは
-    // automation 優先で decode を試みる (= note JSON は受け付けない方が
-    // user 期待に近い)。
-    if ui.take_shortcut("paste")
-        && let Some(text) = ui.take_clipboard_paste()
-    {
-        let prefer_automation =
-            !app.selected_automation_clips.is_empty() || !app.selected_automation_points.is_empty();
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if prefer_automation {
-                app.paste_automation_points_from_json(&text);
-            } else {
-                app.paste_notes_from_json(&text);
-            }
-        }));
-    }
-    if ui.take_shortcut("delete") {
-        // 優先順:
-        //   1. Audio Editor 開いてて event 選択中 → DeleteAudioEditorSelection
-        //   2. automation point 選択あり → DeleteAutomationPoints (Phase 3)
-        //   3. notes 選択あり → DeleteSelectedNotes
-        //   4. automation clip 選択あり → DeleteAutomationClips (Phase 3)
-        //   5. それ以外 → DeleteSelectedClip
-        // 同 frame 内で重複 dispatch しないよう排他にする (= ノート
-        // 選択中に Delete 押して clip も消える事故を防ぐ)。
-        let audio_event_selected =
-            app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty();
-        let has_notes = !app.selected_notes.is_empty();
-        let auto_points = if app.selected_automation_points.is_empty() {
-            None
-        } else {
-            Some(app.selected_automation_points.clone())
-        };
-        let auto_clips = if app.selected_automation_clips.is_empty() {
-            None
-        } else {
-            Some(app.selected_automation_clips.clone())
-        };
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if audio_event_selected {
-                app.handle_event(AppEvent::DeleteAudioEditorSelection);
-            } else if let Some(points) = auto_points {
-                app.handle_event(AppEvent::DeleteAutomationPoints { points });
-            } else if has_notes {
-                app.handle_event(AppEvent::DeleteSelectedNotes);
-            } else if let Some(keys) = auto_clips {
-                app.handle_event(AppEvent::DeleteAutomationClips { keys });
-            } else {
-                app.handle_event(AppEvent::DeleteSelectedClip);
-            }
-        }));
-    }
-
-    // ----- Grid snap / fit -----
-    // active view 判定: マウスが bottom_panel 領域内 AND Piano Roll タブ選択中なら
-    // piano_roll 系、それ以外 (arrangement 領域 / Mixer タブ等) は arrange 系へ。
-    // タブ選択だけで判定すると、Piano Roll タブを開いたまま arrangement を
-    // 操作している時もショートカットが piano_roll 側に流れてしまう。
-    // focus 中の text_input は ShortcutMap 側で is_typing_only 判定により抑止される。
+    // ----- Clipboard / Delete (FIXME #33: 統一 arbiter) -----
+    // ポインタが乗っている編集面 → なければ選択優先順、で対象面を一意に決める
+    // (grill-me 2026-06-11)。copy / cut / paste / delete が同じ arbiter を共有。
+    // text_input focus 中は gui_01 が cut/copy/paste/delete を自動 suppress するので
+    // typing guard は不要。
+    // (`is_pianoroll_active` は以降の grid snap / fit / 全選択ブロックでも使う。)
     let pointer_in_bottom = ui
         .pointer()
         .pos
         .is_some_and(|(px, py)| bottom_rect.contains(px, py));
     let is_pianoroll_active = app.bottom_panel == 1 && pointer_in_bottom;
+    let surface = edit_surface(app, is_pianoroll_active);
+
+    // トラック copy/cut の非同期結果 (plugin state 収集後) を OS clipboard へ flush。
+    if let Some(text) = app.pending_clipboard_write.clone() {
+        ui.set_clipboard_text(text);
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.pending_clipboard_write = None;
+        }));
+    }
+
+    if ui.take_shortcut("copy") {
+        copy_for_surface(app, ui, surface);
+    }
+    if ui.take_shortcut("cut") {
+        cut_for_surface(app, ui, surface);
+    }
+    if ui.take_shortcut("paste")
+        && let Some(text) = ui.take_clipboard_paste()
+    {
+        paste_from_clipboard(app, ui, &text, is_pianoroll_active);
+    }
+    if ui.take_shortcut("delete") {
+        delete_for_surface(app, ui, surface);
+    }
+
+    // ----- Grid snap / fit -----
+    // active view 判定は上で算出した `is_pianoroll_active` を共有する
+    // (マウスが bottom_panel 領域内 AND Piano Roll タブ選択中)。
     if ui.take_shortcut("daw.toggle_snap") {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             if is_pianoroll_active {

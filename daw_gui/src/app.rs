@@ -791,6 +791,20 @@ pub struct AppData {
     /// clip is split. Falls back to the existing `selected_clips`
     /// when no clip is under the cursor.
     pub arrangement_hover_clip: Option<ClipRef>,
+    /// FIXME #33: ポインタ下のトラック id (`ArrangementResponse.hovered_track` の
+    /// mirror)。トラック paste の挿入先 (= マウス下トラックの直上) に使う。
+    /// `arrangement_view::draw` が毎フレーム更新。ヘッダ列・クリップレーンどちらの
+    /// 上でも同じトラック行を返す。
+    pub arrange_hovered_track: Option<u32>,
+    /// FIXME #33: ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
+    /// ノート paste の配置位置に使う。`piano_roll_view::draw` が毎フレーム更新、
+    /// grid 外 / 非 piano-roll は `None`。
+    pub pianoroll_hover_beat: Option<f64>,
+    /// FIXME #33: view 層が OS clipboard へ書く保留テキスト。トラック copy/cut は
+    /// plugin state 収集が非同期 (`on_all_states_from_child`、Ui 非保持) なので、
+    /// そこで serialize した envelope JSON をここに積み、`dispatch_shortcuts` が
+    /// 毎フレーム drain して `Ui::set_clipboard_text` する。
+    pub pending_clipboard_write: Option<String>,
 
     // -------- Selection --------
     /// Track multi-selection (Ableton Live / Reaper 互換)。 末尾要素 =
@@ -1434,10 +1448,13 @@ impl AppData {
         supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
         app_dirs: Option<common::app_dirs::AppDirs>,
     ) -> Self {
-        let song = Song {
+        let mut song = Song {
             tracks: vec![track_with(|t| t.name = "Track 1".into())],
             ..Song::default()
         };
+        // FIXME #33: 起動時の初期プロジェクトにも安定 project_id を採番する
+        // (clipboard の同一プロジェクト判定用)。
+        song.ensure_project_id();
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
         let initial_bpm = song.bpm;
         let initial_time_sig_num = song.time_sig.0;
@@ -1480,6 +1497,9 @@ impl AppData {
             arrangement_hover_beat: None,
             arrangement_hover_beat_raw: None,
             arrangement_hover_clip: None,
+            arrange_hovered_track: None,
+            pianoroll_hover_beat: None,
+            pending_clipboard_write: None,
             selected_track_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
             expanded_automation_tracks: std::collections::HashSet::new(),
@@ -2472,12 +2492,11 @@ impl AppData {
         )
     }
 
-    /// 選択中ノートを JSON シリアライズ。OS clipboard 経由で root.rs から
-    /// `Ui::set_clipboard_text` に渡される。何も copy できない (選択無し /
-    /// クリップ未選択 / シリアライズ失敗) 場合は `None`。
-    /// 戻り値は `(json, note_count)` 。`note_count` は呼び出し側で status_message
-    /// 表示等に使う (ここで status_message を書かないのは `&self` で済ませるため)。
-    pub fn copy_selected_notes_as_json(&self) -> Option<(String, usize)> {
+    /// FIXME #33: 選択中ノートを clipboard envelope (`ClipboardPayload::Notes`) JSON に。
+    /// 何も copy できない (選択無し / クリップ未選択 / シリアライズ失敗) 場合は `None`。
+    /// 戻り値は `(json, note_count)`。status_message は `&self` を保つため呼び出し側で書く。
+    /// 時間は選択群の最早 start を 0 とした相対に正規化する (paste でマウス拍に置く)。
+    pub fn copy_notes_clip(&self) -> Option<(String, usize)> {
         let r = self.selected_clip_ref()?;
         if self.selected_notes.is_empty() {
             return None;
@@ -2503,86 +2522,51 @@ impl AppData {
             }
         }
         let count = copied.len();
-        let json = serde_json::to_string(&copied).ok()?;
+        let json = crate::clipboard::ClipboardEnvelope::new(
+            self.song.project_id,
+            crate::clipboard::ClipboardPayload::Notes(copied),
+        )
+        .to_json()?;
         Some((json, count))
     }
 
-    /// OS clipboard から取得した text を `Vec<Note>` として deserialize し、
-    /// 既存の paste ロジックで貼り付ける。他アプリの text が来た場合は何もしない。
-    pub fn paste_notes_from_json(&mut self, json: &str) {
-        let Ok(clipboard) = serde_json::from_str::<Vec<Note>>(json) else {
-            return;
-        };
-        if clipboard.is_empty() {
-            return;
-        }
-        // 外部 (= 他アプリ / 改竄) clipboard 由来の値域を信用しない。
-        // pitch を 0..=127、 velocity を 1..=127 に clamp し、
-        // start_beat / duration_beats が非有限 or 負 (duration は 0 含む)
-        // の note は破棄する (= NaN/Inf を model に入れない)。
-        let mut clipboard: Vec<Note> = clipboard
-            .into_iter()
-            .filter_map(|mut n| {
-                if !n.start_beat.is_finite()
-                    || n.start_beat < 0.0
-                    || !n.duration_beats.is_finite()
-                    || n.duration_beats <= 0.0
-                {
-                    return None;
-                }
-                n.pitch = n.pitch.min(127);
-                n.velocity = n.velocity.clamp(1, 127);
-                Some(n)
-            })
-            .collect();
-        if clipboard.is_empty() {
-            return;
+    /// FIXME #33: ノート群を「編集中クリップ (`selected_clip`)」の `at_beat`
+    /// (clip-local 拍) に貼る。`notes` は最早=0 正規化済み相対 → 各 `start_beat += at_beat`。
+    /// 値域は呼び出し側で sanitize 済み。貼った note 群を新選択にする。戻り値は挿入数。
+    pub fn paste_notes_at(&mut self, mut notes: Vec<Note>, at_beat: f64) -> usize {
+        if notes.is_empty() {
+            return 0;
         }
         let Some(r) = self.selected_clip_ref() else {
             self.status_message = "貼り付け先のクリップが選択されていません".to_string();
-            return;
+            return 0;
         };
-        // 貼り付け先 clip が実在しなければ何も挿入しない (= notes_in_clip_mut
-        // が None を返す経路)。 ここで弾いておくことで spurious な undo
-        // snapshot を積まない。
+        // 貼り付け先 clip が実在しなければ spurious な undo snapshot を積まない。
         if self
             .song
             .notes_in_clip_mut(r.track as usize, r.clip as usize)
             .is_none()
         {
-            return;
+            return 0;
         }
-        let playhead = self.playhead_beat;
-        let anchor = if let Some(playhead) = playhead {
-            let clip_start = self
-                .song
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
-                .map(|c| c.start_beat)
-                .unwrap_or(0.0);
-            (playhead as f64 - clip_start).max(0.0)
-        } else {
-            0.0
-        };
-        // 実挿入の直前に undo snapshot を積む (= Ctrl+Z で paste を取り消せる)。
+        let anchor = at_beat.max(0.0);
         self.push_undo_snapshot();
-        let count = clipboard.len();
-        let Some(notes) = self
+        let count = notes.len();
+        let Some(dest) = self
             .song
             .notes_in_clip_mut(r.track as usize, r.clip as usize)
         else {
-            return;
+            return 0;
         };
-        let mut new_indices = Vec::with_capacity(clipboard.len());
-        for src in &mut clipboard {
+        let mut new_indices = Vec::with_capacity(notes.len());
+        for src in &mut notes {
             src.start_beat += anchor;
-            new_indices.push(notes.len() as u32);
-            notes.push(src.clone());
+            new_indices.push(dest.len() as u32);
+            dest.push(src.clone());
         }
         self.selected_notes = new_indices;
         self.sync_song_to_plugin_host();
-        self.status_message = format!("貼り付け: {count} ノート");
+        count
     }
 
     fn set_note_velocity(&mut self, note_idx: u32, velocity: u8) {
@@ -2778,6 +2762,11 @@ pub enum PendingStateRequest {
     /// state を Song に書き込んでから [`AppData::push_undo_snapshot`]
     /// を呼ぶことで、 削除直前の knob 値等を Undo で復元できる。
     Deferred(DeferredEdit),
+    /// FIXME #33: トラック copy (Ctrl+C)。state 書き戻し後の live song から
+    /// 該当トラックを最新 plugin state 込みで serialize して
+    /// `pending_clipboard_write` に積むだけ (Song 不変)。**undo snapshot は積まない**
+    /// (copy は履歴を汚さない) ので `Deferred` とは別 variant にする。
+    CopyToClipboard { track_ids: Vec<u32> },
 }
 
 /// state 取得が完了したあとに plugin-main thread へ実行させる編集。
@@ -2790,6 +2779,10 @@ pub enum DeferredEdit {
     /// 単一デバイスチェーン: `Track.devices` / `master_fx_chain` の指定 index の
     /// device を `Vec::remove` する (役割別 slot 区分は撤廃)。
     RemoveDevice { track_id: u32, index: u32 },
+    /// FIXME #33: トラック cut (Ctrl+X)。最新 plugin state 込みで serialize して
+    /// `pending_clipboard_write` に積んでから各トラックを削除する。`Deferred` 経由なので
+    /// 削除前に undo snapshot が積まれ、Ctrl+Z 1 回で復元できる。
+    CutTracks { track_ids: Vec<u32> },
 }
 
 /// 口パク (lip-sync) 背景ジョブの 1 vocal clip 分の結果。`query_phonemes` の
@@ -5548,6 +5541,9 @@ impl AppData {
         // 別プロジェクト (空) に切り替えるので現プロジェクトの plugin / editor を破棄。
         self.teardown_all_loaded_plugins();
         let mut song = Song::default();
+        // FIXME #33: New プロジェクトに新しい project_id を採番 (clipboard の
+        // 同一プロジェクト判定用、別 New 同士は別プロジェクト扱いになる)。
+        song.ensure_project_id();
         Self::migrate_legacy_vocal_tracks(&mut song);
         self.song = song;
         self.file_path = None;
@@ -6262,6 +6258,40 @@ impl AppData {
         }
     }
 
+    /// FIXME #33: 指定 track id 群の devices だけを plugin host に `SetSlotPlugin` で
+    /// 実体化する (paste したトラックの plugin を state 込みで新インスタンス化)。
+    /// [`Self::restore_plugin_from_song`] の track 限定版。`self.song` を読むため
+    /// to_send を先に owned で確保してから送る (borrow 回避)。
+    fn restore_plugins_for_tracks(&mut self, track_ids: &[u32]) {
+        let Some(db) = self.plugin_db.clone() else {
+            return;
+        };
+        let mut to_send: Vec<(u32, u32, common::model::PluginInstance)> = Vec::new();
+        for track in self.song.tracks.iter() {
+            if !track_ids.contains(&track.id) {
+                continue;
+            }
+            for (i, p) in track.devices.iter().enumerate() {
+                to_send.push((track.id, i as u32, p.clone()));
+            }
+        }
+        for (track, index, inst) in to_send {
+            let Some(entry) = db.find_by_id(&inst.plugin_id) else {
+                tracing::error!(id = %inst.plugin_id, track, index, "pasted plugin id not in database");
+                continue;
+            };
+            self.track_pending_load(track, index);
+            self.send_plugin(MainToChild::SetSlotPlugin {
+                track,
+                index,
+                format: entry.format,
+                path: entry.path.clone(),
+                plugin_id: entry.id.clone(),
+                initial_state: inst.state.clone(),
+            });
+        }
+    }
+
     fn action_save(&mut self) {
         if let Some(path) = self.file_path.clone() {
             self.begin_save(path);
@@ -6820,6 +6850,246 @@ impl AppData {
         self.enqueue_state_request(PendingStateRequest::Deferred(
             DeferredEdit::DeleteTrack { track_id },
         ));
+    }
+
+    // -------- FIXME #33: track clipboard --------
+
+    /// Ctrl+C (トラック面)。plugin があれば最新 state を取ってから serialize する
+    /// ため deferred、無ければ即時。copy は Song 不変なので undo を積まない。
+    pub fn copy_tracks(&mut self, track_ids: Vec<u32>) {
+        if track_ids.is_empty() {
+            return;
+        }
+        if !self.song_has_plugin() {
+            self.copy_tracks_inner(&track_ids);
+            return;
+        }
+        self.enqueue_state_request(PendingStateRequest::CopyToClipboard { track_ids });
+    }
+
+    /// Ctrl+X (トラック面)。copy → 削除を 1 undo step。plugin があれば deferred
+    /// (削除前に最新 state 捕捉 + undo snapshot)、無ければ即時。
+    pub fn cut_tracks(&mut self, track_ids: Vec<u32>) {
+        if track_ids.is_empty() {
+            return;
+        }
+        if !self.song_has_plugin() {
+            self.push_undo_snapshot();
+            self.cut_tracks_inner(&track_ids);
+            return;
+        }
+        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::CutTracks {
+            track_ids,
+        }));
+    }
+
+    /// copy 本体。最新 state 込みの live song から該当トラックを serialize して
+    /// `pending_clipboard_write` に積む (view が次フレーム OS clipboard へ flush)。
+    fn copy_tracks_inner(&mut self, track_ids: &[u32]) {
+        if let Some((json, count)) = self.serialize_tracks_to_envelope(track_ids) {
+            self.pending_clipboard_write = Some(json);
+            self.status_message = format!("コピー: {count} トラック");
+        }
+    }
+
+    /// cut 本体。serialize → `pending_clipboard_write` → 各トラック削除。呼び出し側で
+    /// undo snapshot 済み (deferred 経由 or 即時 fallback)。group は subtree 一括削除。
+    fn cut_tracks_inner(&mut self, track_ids: &[u32]) {
+        if let Some((json, count)) = self.serialize_tracks_to_envelope(track_ids) {
+            self.pending_clipboard_write = Some(json);
+            self.status_message = format!("カット: {count} トラック");
+        }
+        for &id in track_ids {
+            self.delete_track_inner(id);
+        }
+    }
+
+    /// 指定トラック群を `ClipboardPayload::Tracks` envelope JSON に。`order` は現在の
+    /// Vec 順 (上から)。各トラックの clips / automation lanes が参照する content を
+    /// inline 同梱 (別プロジェクト独立復元用)。`state` は呼び出し時点で最新化済み前提。
+    fn serialize_tracks_to_envelope(&self, track_ids: &[u32]) -> Option<(String, usize)> {
+        let mut out: Vec<crate::clipboard::TrackCopy> = Vec::new();
+        for t in self.song.tracks.iter() {
+            if !track_ids.contains(&t.id) {
+                continue;
+            }
+            let mut seen: std::collections::HashSet<common::model::ContentId> =
+                std::collections::HashSet::new();
+            let mut contents: Vec<crate::clipboard::ContentEntry> = Vec::new();
+            let mut cids: Vec<common::model::ContentId> =
+                t.clips.iter().map(|c| c.content_id).collect();
+            for lane in &t.automation_lanes {
+                for ac in &lane.clips {
+                    cids.push(ac.content_id);
+                }
+            }
+            for cid in cids {
+                if seen.insert(cid) {
+                    let content = self
+                        .song
+                        .clip_contents
+                        .get(&cid)
+                        .cloned()
+                        .unwrap_or_default();
+                    let name = self.song.clip_content_names.get(&cid).cloned();
+                    contents.push(crate::clipboard::ContentEntry {
+                        content_id: cid,
+                        content,
+                        name,
+                    });
+                }
+            }
+            out.push(crate::clipboard::TrackCopy {
+                order: out.len(),
+                track: t.clone(),
+                contents,
+            });
+        }
+        if out.is_empty() {
+            return None;
+        }
+        let count = out.len();
+        let json = crate::clipboard::ClipboardEnvelope::new(
+            self.song.project_id,
+            crate::clipboard::ClipboardPayload::Tracks(out),
+        )
+        .to_json()?;
+        Some((json, count))
+    }
+
+    /// トラック群を「マウス下トラック (`above_track`)」の直上に挿入する。content は
+    /// 同一プロジェクト (`src_pid == project_id`) なら流用 (リンク共有)、別なら inline
+    /// payload から新採番 (独立)。plugin は state 込み clone され paste 後 host で新
+    /// インスタンス化。track 内参照 (parent_group / sends / sidechain / lipsync) は copy
+    /// 集合内のものを新 id へ remap、集合外は同一プロジェクトなら据え置き (実在)、別
+    /// プロジェクトなら drop。挿入したトラック群を新選択にする。戻り値は挿入数。
+    pub fn paste_tracks_at(
+        &mut self,
+        mut tracks: Vec<crate::clipboard::TrackCopy>,
+        src_pid: u64,
+        above_track: u32,
+    ) -> usize {
+        if tracks.is_empty() {
+            return 0;
+        }
+        tracks.sort_by_key(|t| t.order);
+        let same_project = src_pid == self.song.project_id;
+
+        self.push_undo_snapshot();
+
+        // 1) 新 track id を全件先に採番し old→new remap を作る (集合内参照解決用)。
+        let mut track_remap: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
+        for tc in &tracks {
+            let new_id = self.song.alloc_track_id();
+            track_remap.insert(tc.track.id, new_id);
+        }
+
+        // 2) content remap。同一プロジェクトかつ content が現存すれば流用 (リンク共有)、
+        //    それ以外 (別プロジェクト / 欠落) は inline payload から新採番 (独立)。同一
+        //    content_id は 1 度だけ採番して dedup する (cross-track linked / 複数選択の
+        //    リンクを保ち、orphan content のリークを防ぐ)。same_project で content が現存
+        //    する場合は old→old を入れておき、step 4 の一律適用が no-op になる。
+        let mut content_remap: std::collections::HashMap<
+            common::model::ContentId,
+            common::model::ContentId,
+        > = std::collections::HashMap::new();
+        for tc in &tracks {
+            for ce in &tc.contents {
+                if content_remap.contains_key(&ce.content_id) {
+                    continue;
+                }
+                let new_cid =
+                    if same_project && self.song.clip_contents.contains_key(&ce.content_id) {
+                        ce.content_id
+                    } else {
+                        self.song
+                            .alloc_content(ce.content.clone(), ce.name.clone().unwrap_or_default())
+                    };
+                content_remap.insert(ce.content_id, new_cid);
+            }
+        }
+
+        // 3) drop 先の親 group context と挿入 index (above_track の直上)。
+        let drop_parent = self
+            .song
+            .track_by_id(above_track)
+            .and_then(|t| t.parent_group_id);
+        let insert_idx = self
+            .song
+            .track_index_by_id(above_track)
+            .unwrap_or(self.song.tracks.len());
+
+        // 4) 各 track を組み立て (参照 remap + content remap)。
+        let mut built: Vec<common::model::Track> = Vec::with_capacity(tracks.len());
+        for tc in &tracks {
+            let mut t = tc.track.clone();
+            t.id = *track_remap.get(&tc.track.id).unwrap();
+            t.parent_group_id = match t.parent_group_id {
+                Some(old) if track_remap.contains_key(&old) => Some(track_remap[&old]),
+                Some(old) if same_project && self.song.track_by_id(old).is_some() => Some(old),
+                _ => drop_parent,
+            };
+            t.sends.retain_mut(|s| {
+                if let Some(&new) = track_remap.get(&s.dest_track_id) {
+                    s.dest_track_id = new;
+                    true
+                } else {
+                    same_project && self.song.track_by_id(s.dest_track_id).is_some()
+                }
+            });
+            for dev in &mut t.devices {
+                for src in &mut dev.sidechain_sources {
+                    if let Some(old) = *src {
+                        *src = if let Some(&new) = track_remap.get(&old) {
+                            Some(new)
+                        } else if same_project && self.song.track_by_id(old).is_some() {
+                            Some(old)
+                        } else {
+                            None
+                        };
+                    }
+                }
+            }
+            t.lipsync_target_track = match t.lipsync_target_track {
+                Some(old) if track_remap.contains_key(&old) => Some(track_remap[&old]),
+                Some(old) if same_project && self.song.track_by_id(old).is_some() => Some(old),
+                _ => None,
+            };
+            for c in &mut t.clips {
+                if let Some(&new) = content_remap.get(&c.content_id) {
+                    c.content_id = new;
+                }
+            }
+            for lane in &mut t.automation_lanes {
+                for ac in &mut lane.clips {
+                    if let Some(&new) = content_remap.get(&ac.content_id) {
+                        ac.content_id = new;
+                    }
+                }
+            }
+            built.push(t);
+        }
+
+        // 5) above_track の直上に order 昇順を維持して連続挿入。
+        let n = built.len();
+        for (off, t) in built.into_iter().enumerate() {
+            self.song
+                .tracks
+                .insert((insert_idx + off).min(self.song.tracks.len()), t);
+        }
+        // 6) 選択を新 track 群に + plugin host へ各 device を SetSlotPlugin で実体化
+        //    (sync_song_to_plugin_host = LoadSong は audio 専属で plugin host では no-op
+        //    なので、 plugin の実体化には restore が別途必要。state 込みで新インスタンス化)。
+        let new_ids: Vec<u32> = tracks
+            .iter()
+            .filter_map(|tc| track_remap.get(&tc.track.id).copied())
+            .collect();
+        self.selected_track_ids = new_ids.clone();
+        self.restore_plugins_for_tracks(&new_ids);
+        self.resize_track_peak_display();
+        self.sync_song_to_plugin_host();
+        n
     }
 
     /// 実際の削除処理。 [`Self::on_all_states_from_child`] か上の
@@ -7468,7 +7738,7 @@ impl AppData {
             t.source = InstrumentSource::None;
             t.clips = Vec::new();
         });
-        // FIXME #30: 挿入位置は「選択中で最下段の track の直後」 (純ロジックは
+        // FIXME #33: 挿入位置は「選択中で最上段の track の直上」 (純ロジックは
         // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
         let insert_at = add_track_insert_index(&self.song.tracks, &self.selected_track_ids);
         self.song.tracks.insert(insert_at, track);
@@ -7879,7 +8149,7 @@ impl AppData {
     }
 
     /// Phase 3: 選択中 automation point を JSON 化して OS clipboard に
-    /// 出せるよう text を返す。 [`Self::copy_selected_notes_as_json`] と同
+    /// 出せるよう text を返す。 [`Self::copy_notes_clip`] と同
     /// idiom。 point の `value` は target ごとに値域が違う (Volume:
     /// 0..=2.0、 Pan: -1..=1 等) ので、 lane の `target` を引いて
     /// **normalized 0..=1** で serialize する。 paste 側でも target を
@@ -7888,17 +8158,12 @@ impl AppData {
     ///
     /// 戻り値は `(json, count)`。 何も copy できない (選択無し / lookup
     /// 失敗) 場合は `None`。
-    pub fn copy_selected_automation_points_as_json(&self) -> Option<(String, usize)> {
+    pub fn copy_points_clip(&self) -> Option<(String, usize)> {
         if self.selected_automation_points.is_empty() {
             return None;
         }
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct CopiedPoint {
-            time_beat: f64,
-            value_norm: f32,
-            curve: common::model::AutomationCurve,
-        }
-        let mut copied: Vec<CopiedPoint> = Vec::with_capacity(self.selected_automation_points.len());
+        let mut copied: Vec<crate::clipboard::CopiedPoint> =
+            Vec::with_capacity(self.selected_automation_points.len());
         for k in &self.selected_automation_points {
             let Some(lane) = self.song.automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
@@ -7915,7 +8180,7 @@ impl AppData {
                 continue;
             };
             let value_norm = common::automation::plain_to_norm(&lane.target, p.value);
-            copied.push(CopiedPoint {
+            copied.push(crate::clipboard::CopiedPoint {
                 time_beat: p.time_beat,
                 value_norm,
                 curve: p.curve,
@@ -7935,90 +8200,57 @@ impl AppData {
             }
         }
         let count = copied.len();
-        let json = serde_json::to_string(&copied).ok()?;
+        let json = crate::clipboard::ClipboardEnvelope::new(
+            self.song.project_id,
+            crate::clipboard::ClipboardPayload::AutomationPoints(copied),
+        )
+        .to_json()?;
         Some((json, count))
     }
 
-    /// Phase 3: clipboard 文字列を `Vec<CopiedPoint>` として deserialize
-    /// し、 現在「paste 先 clip」 に挿入する。 paste 先の決定順:
-    ///
-    /// 1. `selected_automation_clips` が単一なら、 その clip
-    /// 2. それ以外で `selected_automation_points` が非空なら、 最初の point
-    ///    が指す clip
-    /// 3. それ以外なら status_message で通知して no-op
-    ///
-    /// anchor: playhead が paste 先 clip の範囲内なら playhead 相対位置、
-    /// それ以外は clip 先頭 (= 0.0)。 各 point は target に応じて norm →
-    /// plain 変換して `insert_at = partition_point` で sort 維持 insert。
-    /// 完了後、 新規挿入 point の idx を `selected_automation_points` に
-    /// 上書き (= 直後に Delete / Move 等が selection 経由で効くように)。
-    pub fn paste_automation_points_from_json(&mut self, json: &str) {
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct CopiedPoint {
-            time_beat: f64,
-            value_norm: f32,
-            curve: common::model::AutomationCurve,
+    /// FIXME #33: `CopiedPoint` 群を「マウス下の automation lane」の `song_beat`
+    /// (song-absolute 拍) を含む automation clip に貼る。clip が無い (レーンの空き)
+    /// なら no-op + status。`song_beat - clip.start` を clip-local anchor とし、各 point の
+    /// 相対 `time_beat` を加算。value は lane.target に応じ norm→plain 復元して sort 維持
+    /// insert。貼った点群を新選択にする。戻り値は挿入数。
+    pub fn paste_points_at(
+        &mut self,
+        points_in: Vec<crate::clipboard::CopiedPoint>,
+        lane_key: common::model::AutomationLaneKey,
+        song_beat: f64,
+    ) -> usize {
+        if points_in.is_empty() {
+            return 0;
         }
-        let Ok(clipboard) = serde_json::from_str::<Vec<CopiedPoint>>(json) else {
-            return;
-        };
-        if clipboard.is_empty() {
-            return;
-        }
-
-        // paste 先 clip を決定。
-        let dest_key: common::model::AutomationClipKey =
-            if let [only] = self.selected_automation_clips.as_slice() {
-                *only
-            } else if let Some(first) = self.selected_automation_points.first() {
-                common::model::AutomationClipKey {
-                    track: first.track_id,
-                    lane: first.lane_id,
-                    clip: first.clip_id,
-                }
-            } else {
-                self.status_message =
-                    "貼り付け先の automation clip が選択されていません".to_string();
-                return;
-            };
-
-        let Some(lane) = self.song.automation_lane_by_key(dest_key.track, dest_key.lane) else {
-            return;
+        let Some(lane) = self.song.automation_lane_by_key(lane_key.track, lane_key.lane) else {
+            return 0;
         };
         let target = lane.target.clone();
-        let Some(clip) = lane.clip_by_id(dest_key.clip) else {
-            return;
+        let Some(clip) = lane
+            .clips
+            .iter()
+            .find(|c| song_beat >= c.start_beat && song_beat < c.start_beat + c.length_beats)
+        else {
+            self.status_message =
+                "貼り付け先の automation clip がありません (レーンの空き)".to_string();
+            return 0;
+        };
+        let dest_key = common::model::AutomationClipKey {
+            track: lane_key.track,
+            lane: lane_key.lane,
+            clip: clip.id,
         };
         let content_id = clip.content_id;
-        let clip_start = clip.start_beat;
-        let clip_len = clip.length_beats;
+        let anchor = (song_beat - clip.start_beat).max(0.0);
 
-        // anchor: playhead が clip 範囲内なら clip-local playhead、 それ以外
-        // は clip 先頭。 playhead 未設定 (= 停止中で初期位置) なら 0.0。
-        let anchor = self
-            .playhead_beat
-            .map(|ph| {
-                let local = ph as f64 - clip_start;
-                if local >= 0.0 && local < clip_len {
-                    local
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
-
-        // dest content が既存で automation でない壊れたモデルなら、 undo を
-        // 触る前に bail する (= no-op snapshot を積んで redo_stack を消さない)。
+        // dest content が automation でない壊れたモデルなら undo を触る前に bail。
         if let Some(c) = self.song.clip_contents.get(&content_id)
             && !matches!(c, common::model::ClipContent::Automation(_))
         {
             self.status_message =
                 "貼り付け先 clip が automation でない (型不整合)".to_string();
-            return;
+            return 0;
         }
-        // dest clip / lane が解決でき automation と確認できたので、 実際に挿入
-        // する直前で undo snapshot を積む (= Ctrl+Z で paste を取り消せる)。
-        // これより上の早期 return では song を変更していないので snapshot 不要。
         self.push_undo_snapshot();
 
         let entry = self
@@ -8032,18 +8264,14 @@ impl AppData {
             });
         let points = match entry {
             common::model::ClipContent::Automation(a) => &mut a.points,
-            _ => {
-                self.status_message =
-                    "貼り付け先 clip が automation でない (型不整合)".to_string();
-                return;
-            }
+            _ => return 0,
         };
 
         // 挿入後の新 idx は sort のたび変動するので、 全 point を挿入し
         // 終えてから「挿入した値ペア」 で再 lookup する。
-        let mut inserted_pairs: Vec<(f64, f64)> = Vec::with_capacity(clipboard.len());
-        let count = clipboard.len();
-        for src in &clipboard {
+        let mut inserted_pairs: Vec<(f64, f64)> = Vec::with_capacity(points_in.len());
+        let count = points_in.len();
+        for src in &points_in {
             let plain = common::automation::norm_to_plain(&target, src.value_norm);
             let t = (src.time_beat + anchor).max(0.0);
             let new_point = common::model::AutomationPoint {
@@ -8056,7 +8284,6 @@ impl AppData {
             inserted_pairs.push((t, plain));
         }
 
-        // 挿入後の idx を retrieve。 idiom は quantize 側と同じ。
         let new_indices: Vec<u32> = inserted_pairs
             .iter()
             .filter_map(|(t, v)| {
@@ -8077,7 +8304,249 @@ impl AppData {
             })
             .collect();
         self.sync_song_to_plugin_host();
-        self.status_message = format!("貼り付け: {count} オートメーションポイント");
+        count
+    }
+
+    // -------- FIXME #33: audio event clipboard --------
+
+    /// オーディオエディタで選択中のイベントを clipboard envelope
+    /// (`ClipboardPayload::AudioEvents`) JSON に。最早 start を 0 とした相対に正規化。
+    pub fn copy_events_clip(&self) -> Option<(String, usize)> {
+        let r = self.audio_editor_clip?;
+        if self.audio_editor_selected_events.is_empty() {
+            return None;
+        }
+        let track = self.song.tracks.get(r.track as usize)?;
+        let clip = track.clips.get(r.clip as usize)?;
+        let content = self.song.clip_contents.get(&clip.content_id)?;
+        let events = content.audio_events()?;
+        let mut copied: Vec<AudioEvent> = self
+            .audio_editor_selected_events
+            .iter()
+            .filter_map(|i| events.get(*i).cloned())
+            .collect();
+        if copied.is_empty() {
+            return None;
+        }
+        let earliest = copied
+            .iter()
+            .map(|e| e.event_start_in_clip_beats)
+            .fold(f64::INFINITY, f64::min);
+        if earliest.is_finite() {
+            for e in &mut copied {
+                e.event_start_in_clip_beats -= earliest;
+            }
+        }
+        let count = copied.len();
+        let json = crate::clipboard::ClipboardEnvelope::new(
+            self.song.project_id,
+            crate::clipboard::ClipboardPayload::AudioEvents(copied),
+        )
+        .to_json()?;
+        Some((json, count))
+    }
+
+    /// イベント群を「編集中オーディオクリップ (`audio_editor_clip`)」の `at_beat`
+    /// (clip-local 拍) に貼る。`events` は最早=0 正規化済み相対。値域は呼び出し側で
+    /// sanitize 済み。clip 長を必要なら拡張し、貼ったイベント群を新選択にする。戻り値は挿入数。
+    pub fn paste_events_at(&mut self, mut events: Vec<AudioEvent>, at_beat: f64) -> usize {
+        if events.is_empty() {
+            return 0;
+        }
+        let Some(target) = self.audio_editor_clip else {
+            self.status_message = "貼り付け先のオーディオクリップがありません".to_string();
+            return 0;
+        };
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return 0;
+        };
+        if !matches!(
+            self.song.clip_contents.get(&content_id),
+            Some(common::model::ClipContent::Audio(_))
+        ) {
+            self.status_message = "貼り付け先 clip が audio でない".to_string();
+            return 0;
+        }
+        let anchor = at_beat.max(0.0);
+        self.push_undo_snapshot();
+        let count = events.len();
+        let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return 0;
+        };
+        let mut new_indices = Vec::with_capacity(events.len());
+        let mut max_end = 0.0f64;
+        for e in &mut events {
+            e.event_start_in_clip_beats += anchor;
+            max_end = max_end.max(e.event_start_in_clip_beats + e.event_length_beats);
+            new_indices.push(audio.events.len());
+            audio.events.push(e.clone());
+        }
+        self.audio_editor_selected_events = new_indices;
+        // clip 長が足りなければ拡張 (add_audio_event_from_file と同 idiom)。
+        if let Some(track) = self.song.tracks.get_mut(target.track as usize)
+            && let Some(clip) = track.clips.get_mut(target.clip as usize)
+            && max_end > clip.length_beats
+        {
+            clip.length_beats = max_end;
+        }
+        self.is_dirty = true;
+        self.sync_song_to_plugin_host();
+        if self.clip_edit_buffer_target == Some(target) {
+            self.resync_clip_audio_event_edit_buffers(target);
+        }
+        count
+    }
+
+    // -------- FIXME #33: clip clipboard --------
+
+    /// 選択中クリップ群を clipboard envelope (`ClipboardPayload::Clips`) JSON に。
+    /// 最上段トラックを `track_offset` 0、最早 start を `start_beat` 0 とした相対で
+    /// 正規化。content payload と name を inline 同梱 (別プロジェクト独立復元用)、
+    /// `content_id` も保持 (同一プロジェクトのリンク共有用)。
+    pub fn copy_clips_clip(&self) -> Option<(String, usize)> {
+        let refs = self.selected_clip_refs();
+        if refs.is_empty() {
+            return None;
+        }
+        let mut resolved: Vec<(usize, common::model::Clip)> = Vec::new();
+        for r in &refs {
+            if let Some(t) = self.song.tracks.get(r.track as usize)
+                && let Some(c) = t.clips.get(r.clip as usize)
+            {
+                resolved.push((r.track as usize, c.clone()));
+            }
+        }
+        if resolved.is_empty() {
+            return None;
+        }
+        let min_track = resolved.iter().map(|(ti, _)| *ti).min().unwrap_or(0);
+        let earliest = resolved
+            .iter()
+            .map(|(_, c)| c.start_beat)
+            .fold(f64::INFINITY, f64::min);
+        let base = if earliest.is_finite() { earliest } else { 0.0 };
+        let mut clips = Vec::with_capacity(resolved.len());
+        for (ti, c) in &resolved {
+            let content = self
+                .song
+                .clip_contents
+                .get(&c.content_id)
+                .cloned()
+                .unwrap_or_default();
+            let name = self.song.clip_content_names.get(&c.content_id).cloned();
+            clips.push(crate::clipboard::ClipCopy {
+                track_offset: (*ti as i64) - (min_track as i64),
+                start_beat: c.start_beat - base,
+                length_beats: c.length_beats,
+                color: c.color,
+                auto_lipsync: c.auto_lipsync,
+                content_id: c.content_id,
+                content,
+                name,
+            });
+        }
+        let count = clips.len();
+        let json = crate::clipboard::ClipboardEnvelope::new(
+            self.song.project_id,
+            crate::clipboard::ClipboardPayload::Clips(clips),
+        )
+        .to_json()?;
+        Some((json, count))
+    }
+
+    /// クリップ群を「マウス下トラック (`anchor_track`)」を基準に `at_beat` (song-absolute,
+    /// snap 済) へ貼る。`track_offset` で相対トラック、`start_beat` で相対拍を復元。
+    /// content は同一プロジェクト (`src_pid == project_id`) かつ content が現存すれば流用
+    /// (リンク共有)、そうでなければ inline payload から新 content_id 採番 (独立)。
+    /// 貼ったクリップ群を新選択にする。戻り値は挿入数。
+    pub fn paste_clips_at(
+        &mut self,
+        clips: Vec<crate::clipboard::ClipCopy>,
+        src_pid: u64,
+        anchor_track: u32,
+        at_beat: f64,
+    ) -> usize {
+        if clips.is_empty() {
+            return 0;
+        }
+        let Some(anchor_idx) = self.song.track_index_by_id(anchor_track) else {
+            self.status_message = "貼り付け先のトラックがありません".to_string();
+            return 0;
+        };
+        let same_project = src_pid == self.song.project_id;
+        // 貼り付け対象 (target_idx が範囲内) が 1 件も無ければ undo を積まず return
+        // (= spurious な no-op undo step を作らない、paste_notes_at と同方針)。
+        let any_valid = clips.iter().any(|cc| {
+            let ti = anchor_idx as i64 + cc.track_offset;
+            ti >= 0 && (ti as usize) < self.song.tracks.len()
+        });
+        if !any_valid {
+            self.status_message = "貼り付け先のトラックがありません".to_string();
+            return 0;
+        }
+        self.push_undo_snapshot();
+        // content remap: 同一 source content_id は 1 度だけ採番して dedup する
+        // (linked クリップ群を複数貼っても貼り付け後もリンクを保つ)。同一プロジェクト
+        // かつ content 現存なら流用 (リンク共有)、それ以外は inline payload から独立採番。
+        let mut content_remap: std::collections::HashMap<
+            common::model::ContentId,
+            common::model::ContentId,
+        > = std::collections::HashMap::new();
+        let mut new_refs: Vec<ClipRef> = Vec::new();
+        for cc in &clips {
+            let target_idx = anchor_idx as i64 + cc.track_offset;
+            if target_idx < 0 || target_idx as usize >= self.song.tracks.len() {
+                continue;
+            }
+            let target_idx = target_idx as usize;
+            let content_id = if let Some(&new) = content_remap.get(&cc.content_id) {
+                new
+            } else {
+                let resolved =
+                    if same_project && self.song.clip_contents.contains_key(&cc.content_id) {
+                        cc.content_id
+                    } else {
+                        self.song
+                            .alloc_content(cc.content.clone(), cc.name.clone().unwrap_or_default())
+                    };
+                content_remap.insert(cc.content_id, resolved);
+                resolved
+            };
+            let Some(to_track) = self.song.tracks.get_mut(target_idx) else {
+                continue;
+            };
+            let new_clip_id = to_track.alloc_clip_id();
+            let new_idx = to_track.clips.len() as u32;
+            to_track.clips.push(common::model::Clip {
+                id: new_clip_id,
+                name: String::new(),
+                start_beat: (at_beat + cc.start_beat).max(0.0),
+                length_beats: cc.length_beats,
+                content_id,
+                notes: Vec::new(),
+                color: cc.color,
+                auto_lipsync: cc.auto_lipsync,
+            });
+            new_refs.push(ClipRef {
+                track: target_idx as u32,
+                clip: new_idx,
+            });
+        }
+        let pasted = new_refs.len();
+        if !new_refs.is_empty() {
+            self.select_new_clips(&new_refs);
+            self.selected_notes.clear();
+            self.sync_song_to_plugin_host();
+        }
+        pasted
     }
 
     /// 修飾なし drag release。source lane から取り出して target lane へ
@@ -13891,6 +14360,11 @@ impl AppData {
                 self.push_undo_snapshot();
                 self.execute_deferred_edit(edit);
             }
+            PendingStateRequest::CopyToClipboard { track_ids } => {
+                // FIXME #33: copy は Song 不変なので undo を積まない。最新 state
+                // 込みで serialize して pending_clipboard_write に積むだけ。
+                self.copy_tracks_inner(&track_ids);
+            }
         }
         // 後続の request が積まれていれば、 改めて `RequestAllStates` を発行して
         // 次の応答待ちに入る。 ここで「直前の edit が走ったあとの最新 state」 を
@@ -13917,6 +14391,7 @@ impl AppData {
             DeferredEdit::RemoveDevice { track_id, index } => {
                 self.remove_device_inner(track_id, index)
             }
+            DeferredEdit::CutTracks { track_ids } => self.cut_tracks_inner(&track_ids),
         }
     }
 
@@ -16511,17 +16986,18 @@ mod image_drop_target_tests {
     }
 }
 
-/// FIXME #30: 新規 track の挿入 index を決めるピュアロジック。 選択中の
-/// track が 1 つ以上あれば「最下段 (= `tracks` 内 index 最大) の選択の直後」、
-/// 無ければ末尾。 複数選択でも一番下を基準にすることで選択のかたまりを割らない。
+/// FIXME #33: 新規 track の挿入 index を決めるピュアロジック。 選択中の track が
+/// 1 つ以上あれば「最上段 (= `tracks` 内 index 最小) の選択の **直上**」、無ければ末尾。
+/// 複数選択でも一番上を基準にすることで選択のかたまりを割らない。
 /// `selected` 内の stale id (= `tracks` に存在しない) は `position()` が `None` を
 /// 返すので自然に無視され、 全部 stale なら末尾に fallback する。
+/// (FIXME #30 の「最下段の直後」から、ユーザー指定で「最上段の直上」へ変更。)
 fn add_track_insert_index(tracks: &[Track], selected: &[u32]) -> usize {
     selected
         .iter()
         .filter_map(|sid| tracks.iter().position(|t| t.id == *sid))
-        .max()
-        .map_or(tracks.len(), |bottom| bottom + 1)
+        .min()
+        .unwrap_or(tracks.len())
 }
 
 #[cfg(test)]
@@ -16542,24 +17018,24 @@ mod add_track_insert_index_tests {
     }
 
     #[test]
-    fn inserts_after_single_selected() {
+    fn inserts_above_single_selected() {
         let t = tracks(&[10, 11, 12]);
-        // 先頭 (id 10, index 0) を選択 → 直後 = index 1。
-        assert_eq!(add_track_insert_index(&t, &[10]), 1);
-        // 中央 (id 11, index 1) → index 2。
-        assert_eq!(add_track_insert_index(&t, &[11]), 2);
-        // 末尾 (id 12, index 2) → index 3 (= 末尾と一致)。
-        assert_eq!(add_track_insert_index(&t, &[12]), 3);
+        // 先頭 (id 10, index 0) を選択 → 直上 = index 0。
+        assert_eq!(add_track_insert_index(&t, &[10]), 0);
+        // 中央 (id 11, index 1) → index 1。
+        assert_eq!(add_track_insert_index(&t, &[11]), 1);
+        // 末尾 (id 12, index 2) → index 2。
+        assert_eq!(add_track_insert_index(&t, &[12]), 2);
     }
 
     #[test]
-    fn inserts_after_bottom_most_of_multi_selection() {
+    fn inserts_above_top_most_of_multi_selection() {
         let t = tracks(&[10, 11, 12, 13]);
-        // 選択 {10, 12} の最下段は 12 (index 2) → index 3。 vec の順序に依らない。
-        assert_eq!(add_track_insert_index(&t, &[10, 12]), 3);
-        assert_eq!(add_track_insert_index(&t, &[12, 10]), 3);
-        // {11, 12} の最下段は 12 (index 2) → index 3。
-        assert_eq!(add_track_insert_index(&t, &[11, 12]), 3);
+        // 選択 {10, 12} の最上段は 10 (index 0) → index 0。 vec の順序に依らない。
+        assert_eq!(add_track_insert_index(&t, &[10, 12]), 0);
+        assert_eq!(add_track_insert_index(&t, &[12, 10]), 0);
+        // {11, 12} の最上段は 11 (index 1) → index 1。
+        assert_eq!(add_track_insert_index(&t, &[11, 12]), 1);
     }
 
     #[test]
@@ -16567,8 +17043,8 @@ mod add_track_insert_index_tests {
         let t = tracks(&[10, 11]);
         // 全部 stale → 末尾。
         assert_eq!(add_track_insert_index(&t, &[999, 1000]), 2);
-        // 一部 stale → 生きている最下段 (id 10, index 0) の直後。
-        assert_eq!(add_track_insert_index(&t, &[10, 999]), 1);
+        // 一部 stale → 生きている最上段 (id 10, index 0) の直上。
+        assert_eq!(add_track_insert_index(&t, &[10, 999]), 0);
     }
 
     #[test]

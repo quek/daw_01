@@ -974,14 +974,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         None
     });
+    // FIXME #33: トラック paste の挿入先 (= マウス下トラックの直上)。ヘッダ列でも
+    // クリップレーン上でも効くよう、X はアレンジ全幅 (`area`)、Y は実 header rect で
+    // 判定する (hover_clip と同じ Y-only 手法、master 行 / ruler 上は None)。
+    let hovered_track_id: Option<u32> = ui.pointer().pos.and_then(|(px, py)| {
+        if !area.contains(px, py) {
+            return None;
+        }
+        let idx = track_index_at_y(&resp.track_header_rects, &app.song.tracks, py)?;
+        app.song.tracks.get(idx).map(|t| t.id)
+    });
     if app.arrangement_hover_beat != snapped_beat
         || app.arrangement_hover_beat_raw != raw_beat
         || app.arrangement_hover_clip != hover_clip
+        || app.arrange_hovered_track != hovered_track_id
     {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.arrangement_hover_beat = snapped_beat;
             app.arrangement_hover_beat_raw = raw_beat;
             app.arrangement_hover_clip = hover_clip;
+            app.arrange_hovered_track = hovered_track_id;
         }));
     }
 }

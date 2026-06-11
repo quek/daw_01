@@ -13,6 +13,7 @@
 pub mod app;
 pub mod audio_source_cache;
 pub mod bootstrap;
+pub mod clipboard;
 pub mod dispatcher;
 pub mod fuzzy;
 pub mod group_compose;
