@@ -3,6 +3,7 @@ pub mod audio_bridge;
 pub mod audio_render;
 pub mod automation;
 pub mod clap_scan;
+pub mod device_role;
 pub mod logging;
 pub mod meter;
 pub mod model;
