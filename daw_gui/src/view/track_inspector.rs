@@ -1501,7 +1501,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 声は per-clip (`Clip::speaker_id`) が SSoT、 SetClipVoice で焼き込む。
     if let Some(r) = app.selected_clip_ref()
         && let Some(track) = app.song.tracks.get(r.track as usize)
-        && matches!(track.source, common::model::InstrumentSource::Vocal)
+        && track.is_voicevox_vocal()
         && let Some(clip) = track.clips.get(r.clip as usize)
         && app
             .song
@@ -1735,7 +1735,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Vocal track のみ。生成した口画像 ImageEvent を焼き込む先の口 track
     // (立ち絵 group の子 image track) を選ぶ。設定で再生成が走る。
     if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i))
-        && matches!(track.source, common::model::InstrumentSource::Vocal)
+        && track.is_voicevox_vocal()
     {
         let self_id = track.id;
         // 候補: 自分以外の全 track (= 口 track はどれでも選べる)。

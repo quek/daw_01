@@ -117,7 +117,7 @@ pub fn synthesize_song(
     let mut results = Vec::new();
 
     for (track_idx, track) in song.tracks.iter().enumerate() {
-        if !matches!(track.source, crate::model::InstrumentSource::Vocal) {
+        if !track.is_voicevox_vocal() {
             continue;
         }
 
@@ -561,6 +561,14 @@ pub fn synthesize_notes_for_builtin(
         !notes.is_empty(),
         "synthesize_notes_for_builtin called with no notes"
     );
+    // (FIXME #36) speaker_id 0 = 未設定 → DEFAULT_SINGER_ID (歌唱可能 style) へ
+    // フォールバック。 旧プロジェクトの clip は声未焼き込み (0) で来るため、 0 を
+    // そのまま frame_synthesis に渡すと 500 Internal Server Error になる。
+    let speaker_id = if speaker_id != 0 {
+        speaker_id
+    } else {
+        DEFAULT_SINGER_ID
+    };
     let model_notes: Vec<Note> = notes.iter().map(|n| n.to_model_note()).collect();
 
     let client = reqwest::blocking::Client::builder()

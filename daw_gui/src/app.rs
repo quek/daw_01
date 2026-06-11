@@ -7650,14 +7650,12 @@ impl AppData {
     /// spawn、 builtin plugin の HTTP synth を成功させる前提)。
     pub fn sync_vocal_metadata(&mut self) {
         let bpm = self.song.bpm;
-        let has_vocal_track = self.song.tracks.iter().any(|t| {
-            matches!(t.source, common::model::InstrumentSource::Vocal)
-        });
+        let has_vocal_track = self.song.tracks.iter().any(|t| t.is_voicevox_vocal());
         if has_vocal_track {
             self.ensure_voicevox_engine();
         }
         for track in &self.song.tracks {
-            if !matches!(track.source, common::model::InstrumentSource::Vocal) {
+            if !track.is_voicevox_vocal() {
                 continue;
             }
             // 単一デバイスチェーン: builtin VOICEVOX を chain 内に持つ device の
@@ -13577,7 +13575,7 @@ impl AppData {
         // 直前 (= start_beat 最大の既存) clip の声、 無ければアプリ既定
         // (中国うさぎ ノーマル)。 非 vocal track では声は未設定 (0)。
         let (speaker_id, singer_name, style_name) =
-            if matches!(track.source, common::model::InstrumentSource::Vocal) {
+            if track.is_voicevox_vocal() {
                 track
                     .clips
                     .iter()
@@ -15376,10 +15374,12 @@ impl AppData {
         } else if let Some(track_idx) = self.cursor_track_index() {
             let track = &mut self.song.tracks[track_idx];
             track.devices.push(new_device);
-            // builtin VOICEVOX を挿したら vocal track 化 (source=Vocal)。 旧
-            // "+Vocal Track" ボタンの役割をここに集約 (sync_vocal_metadata が
-            // source==Vocal を見て歌詞 synth を走らせる)。 それ以外を挿しても
-            // 既存の vocal 状態は変えない (= 単に device を 1 つ足すだけ)。
+            // builtin VOICEVOX を挿したら vocal track 化。 旧 "+Vocal Track"
+            // ボタンの役割をここに集約。 歌詞 synth の gating 自体は
+            // `Track::is_voicevox_vocal()` (= device の実在) が SSoT なので、
+            // この marker が無くても device さえ在れば synth は走る。 marker は
+            // legacy migration (`migrate_legacy_vocal_tracks`) の入力として残す。
+            // それ以外の device を挿しても既存の vocal 状態は変えない。
             if is_voicevox {
                 // (FIXME #36) 声は per-clip (`Clip::speaker_id`)。 トラックは
                 // 「VOICEVOX で鳴らす」 印 (unit marker) のみ持つ。

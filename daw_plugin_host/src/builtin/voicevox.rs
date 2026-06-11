@@ -65,22 +65,25 @@ impl Default for VoicevoxState {
     }
 }
 
-/// 合成 thread に渡す 1 job。 (FIXME #36) per-clip 声: clip ごとに speaker が
-/// 違うので、 clip 単位の spec 列を持つ。 synth thread が clip ごとに合成して
-/// WAV を連結し、 note_offsets を累積シフトして 1 本の `SynthResult` にする。
+/// 合成 thread に渡す 1 job。 (FIXME #36) **声 (speaker) 単位**でグループ化した
+/// spec 列を持つ。 同じ声の clip 群を 1 query でまとめて合成することで、 旧
+/// single-WAV と同じく声内で音量が一貫する (clip 別に合成すると VOICEVOX の
+/// レンダ差で clip ごとに音量がばらつく)。 声違いの clip は別 spec (= 別 WAV)。
 struct SynthJob {
     bpm: f32,
-    clips: Vec<ClipSynthSpec>,
+    groups: Vec<SpeakerSynthSpec>,
 }
 
-/// (FIXME #36) 1 clip 分の合成指定 (= 1 speaker / 1 WAV)。 `clip_id` は
-/// `set_note_metadata` でのグルーピング用 (= 連続する同 clip_id の note を
-/// 1 spec にまとめる)。
-struct ClipSynthSpec {
-    clip_id: u32,
+/// (FIXME #36) 1 声 (speaker) 分の合成指定。 その声を使う全 clip の note を
+/// song-absolute timing で 1 つにまとめ、 1 回の `frame_synthesis` で合成する。
+struct SpeakerSynthSpec {
     speaker_id: u32,
     notes: Vec<BuiltinNoteSpec>,
 }
+
+/// 合成済み 1 声グループの配置結果。
+/// `(buffer 配置サンプル位置, mono WAV, [(note_id, buffer 内絶対 offset)])`。
+type PlacedGroup = (usize, Vec<f32>, Vec<(u32, u64)>);
 
 /// 合成完了時に共有される結果。 `Arc<Mutex<Option<...>>>` で audio thread と
 /// synth thread が共有 (= synth が新結果を書く時のみ lock、 audio thread
@@ -251,7 +254,7 @@ impl VoicevoxBuiltin {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         continue;
                     };
-                    if job.clips.iter().all(|c| c.notes.is_empty()) {
+                    if job.groups.iter().all(|c| c.notes.is_empty()) {
                         result_arc.store(None);
                         continue;
                     }
@@ -269,9 +272,9 @@ impl VoicevoxBuiltin {
                     // cursor jump のみ (= RT path 不変)。
                     let mut out_sr: u32 = 0;
                     // (placement_samples, mono WAV, [(note_id, abs_offset)]) を clip ごと収集。
-                    let mut placed: Vec<(usize, Vec<f32>, Vec<(u32, u64)>)> = Vec::new();
+                    let mut placed: Vec<PlacedGroup> = Vec::new();
                     let mut failed: Option<anyhow::Error> = None;
-                    for spec in &job.clips {
+                    for spec in &job.groups {
                         if spec.notes.is_empty() {
                             continue;
                         }
@@ -291,25 +294,33 @@ impl VoicevoxBuiltin {
                                 out_sr = sample_rate;
                                 let spb = f64::from(sample_rate) * 60.0
                                     / f64::from(job.bpm.max(0.001));
-                                // placement = (clip 先頭ノートの song-absolute サンプル位置)
-                                //  - (WAV 内 local offset)。 全ノートで一定 (= earliest*spb
-                                // - lead_in)。 note.start_beat は sync_vocal_metadata で
-                                // song-absolute 化済み。
-                                let placement = spec
+                                // placement = この声グループ先頭ノートの song-absolute
+                                // サンプル位置。 各グループの WAV をこの位置から配置し、
+                                // WAV 内 leading rest (REST_FRAMES) はそのまま buffer に
+                                // 残す。 こうすると全グループで不変条件「buffer 位置 =
+                                // note.start_beat*spb + lead_in」 (= rolling voice の
+                                // cursor と playhead の差が常に lead_in) が揃う。
+                                // note.start_beat は sync_vocal_metadata で song-absolute 化済み。
+                                //
+                                // 旧実装は placement から WAV 内 local offset (= 先頭ノートの
+                                // lead_in) を引いていた。 beat 0 始まりのグループは placement が
+                                // 負 → max(0) で潰れて k=lead_in、 一方 beat 8 始まりのグループは
+                                // 引かれて k=0 となり、 cursor 差がグループ間で食い違う。 結果、
+                                // 声違いで別 WAV になった次グループ先頭ノートが、 前グループ由来の
+                                // rolling voice に note_on より lead_in (≈107ms) 早く鳴らされ、
+                                // note_on の retrigger と二重発音になっていた (= 「ななつの」)。
+                                // 全グループを earliest*spb 配置に統一すると cursor 差が lead_in で
+                                // 揃い、 rolling voice が境界の手前で次グループを先取りしない。
+                                let earliest = spec
                                     .notes
                                     .iter()
-                                    .filter_map(|n| {
-                                        note_offsets
-                                            .get(&n.note_id)
-                                            .map(|off| n.start_beat * spb - *off as f64)
-                                    })
+                                    .map(|n| n.start_beat)
                                     .fold(f64::INFINITY, f64::min);
-                                let placement = if placement.is_finite() {
-                                    placement.max(0.0)
+                                let place_samples = if earliest.is_finite() {
+                                    (earliest * spb).max(0.0).round() as usize
                                 } else {
-                                    0.0
+                                    0
                                 };
-                                let place_samples = placement.round() as usize;
                                 // 各ノートの絶対 offset = placement + WAV 内 local offset。
                                 let abs: Vec<(u32, u64)> = note_offsets
                                     .iter()
@@ -368,8 +379,8 @@ impl VoicevoxBuiltin {
                         };
                         result_arc.store(Some(Arc::new(res)));
                         tracing::info!(
-                            clips = placed.len(),
-                            "VoicevoxBuiltin: synth complete (per-clip, song-absolute)"
+                            speaker_groups = placed.len(),
+                            "VoicevoxBuiltin: synth complete (per-speaker-group, song-absolute)"
                         );
                     }
                 }
@@ -625,33 +636,35 @@ impl LoadedPlugin for VoicevoxBuiltin {
         // BuiltinNoteSpec 配列を組み立てて synth thread に送る。 entries が
         // 空なら synth result を None にする job を送る (= 再生停止信号
         // 兼ねる)。
-        // (FIXME #36) entries を clip_id でグルーピングして per-clip synth spec
-        // に。 sync_vocal_metadata は clip を順に flatten する (= 同 clip_id の
-        // note は連続) ので、 「直前 spec と同 clip_id なら追記、 違えば新 spec」
-        // で出現順 (= note_id 連番順 = WAV 連結順) を保ったままグループ化できる。
-        // 各 clip の speaker_id は entry が持つ per-clip 声。
-        let mut clips: Vec<ClipSynthSpec> = Vec::new();
+        // (FIXME #36) entries を **声 (speaker) でグルーピング**して spec に。
+        // 同じ声の clip 群を 1 query でまとめて合成すると、 旧 single-WAV と同じく
+        // 声内で音量が一貫する (clip 別合成は VOICEVOX のレンダ差で clip ごとに
+        // 音量ばらつき)。 speaker_id 0 = 未設定は DEFAULT_SINGER_ID に解決して
+        // からグループ化する (= 未設定 clip と既定声 clip を同声としてまとめる)。
+        // note の song-absolute timing は entry が保持。
+        let mut by_speaker: HashMap<u32, Vec<BuiltinNoteSpec>> = HashMap::new();
         for e in entries {
-            let note = BuiltinNoteSpec {
+            let speaker = if e.speaker_id != 0 {
+                e.speaker_id
+            } else {
+                common::voicevox::DEFAULT_SINGER_ID
+            };
+            by_speaker.entry(speaker).or_default().push(BuiltinNoteSpec {
                 note_id: e.note_id,
                 start_beat: e.start_beat,
                 duration_beats: e.duration_beats,
                 pitch: e.pitch,
                 velocity: e.velocity,
                 lyric: e.lyric.clone(),
-            };
-            match clips.last_mut() {
-                Some(c) if c.clip_id == e.clip_id => c.notes.push(note),
-                _ => clips.push(ClipSynthSpec {
-                    clip_id: e.clip_id,
-                    speaker_id: e.speaker_id,
-                    notes: vec![note],
-                }),
-            }
+            });
         }
+        let groups: Vec<SpeakerSynthSpec> = by_speaker
+            .into_iter()
+            .map(|(speaker_id, notes)| SpeakerSynthSpec { speaker_id, notes })
+            .collect();
 
         if let Some(tx) = self.synth_tx.as_ref() {
-            let _ = tx.send(SynthJob { bpm, clips });
+            let _ = tx.send(SynthJob { bpm, groups });
         }
         tracing::debug!(
             count = self.lyrics.len(),

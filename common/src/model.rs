@@ -1648,6 +1648,17 @@ impl Default for GroupTransform {
 }
 
 impl Track {
+    /// (FIXME #36) このトラックが VOICEVOX で歌う vocal トラックか。 SSoT は
+    /// 「builtin VOICEVOX device を実際に持つか」。 旧 `InstrumentSource::Vocal`
+    /// marker は device 挿入と別管理で out-of-sync になり得る (旧プロジェクトで
+    /// source=None + device の実例あり) ため、 装置の実在を真実として判定する。
+    pub fn is_voicevox_vocal(&self) -> bool {
+        self.devices.iter().any(|d| {
+            d.format == crate::plugin_format::PluginFormat::Builtin
+                && d.plugin_id == crate::plugin_db::BUILTIN_ID_VOICEVOX
+        })
+    }
+
     /// Allocate a new stable clip id, bumping the per-track counter.
     pub fn alloc_clip_id(&mut self) -> u32 {
         let id = self.next_clip_id.max(1);
