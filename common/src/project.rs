@@ -49,12 +49,80 @@ pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
     Ok(())
 }
 
+/// (FIXME #36) 旧 `InstrumentSource::Vocal { speaker_id, style_name }`
+/// (= JSON object `{"Vocal": {...}}`) を unit `Vocal` (= JSON string
+/// `"Vocal"`) へ移行し、 旧トラック声をそのトラックの全 clip に焼き込む。
+/// 声は per-clip (`Clip::speaker_id` 等) が SSoT になったため。
+///
+/// - 既に `speaker_id` を持つ clip (= 新形式) は尊重して上書きしない。
+/// - `singer_name` は旧データに無いので空のまま (= `/singers` 取得後に
+///   app 側が speaker_id から逆引きして埋める)。
+/// - 新形式ファイル (source が既に string `"Vocal"` 等) は no-op。
+fn migrate_vocal_source_to_clips(value: &mut serde_json::Value) {
+    let Some(tracks) = value
+        .get_mut("song")
+        .and_then(|s| s.get_mut("tracks"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for track in tracks {
+        // 旧形式判定: source == { "Vocal": { speaker_id, style_name } }。
+        let Some(vocal) = track
+            .get("source")
+            .and_then(|s| s.get("Vocal"))
+            .filter(|v| v.is_object())
+        else {
+            continue;
+        };
+        let old_speaker = vocal
+            .get("speaker_id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let old_style = vocal
+            .get("style_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // source を unit "Vocal" に置換。
+        track["source"] = serde_json::Value::String("Vocal".to_string());
+        // 全 clip へ焼き込み (新形式 clip は触らない)。
+        let Some(clips) = track
+            .get_mut("clips")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for clip in clips {
+            let Some(obj) = clip.as_object_mut() else {
+                continue;
+            };
+            if obj.contains_key("speaker_id") {
+                continue;
+            }
+            if old_speaker != 0 {
+                obj.insert("speaker_id".to_string(), serde_json::json!(old_speaker));
+            }
+            if !old_style.is_empty() {
+                obj.insert("style_name".to_string(), serde_json::json!(old_style));
+            }
+        }
+    }
+}
+
 pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     let path = path.as_ref();
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let project: ProjectFile = serde_json::from_str(&text)
+    // (FIXME #36) per-clip 声移行: 旧 `InstrumentSource::Vocal { speaker_id,
+    // style_name }` (JSON object) を unit `Vocal` (JSON string) に変換し、
+    // 旧トラック声をそのトラックの全 clip へ焼き込んでから deserialize する
+    // (= 本 deserialize は unit `Vocal` だけ見れば良い、 声は per-clip が SSoT)。
+    let mut value: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse project JSON from {}", path.display()))?;
+    migrate_vocal_source_to_clips(&mut value);
+    let project: ProjectFile = serde_json::from_value(value)
+        .with_context(|| format!("failed to deserialize project from {}", path.display()))?;
     if project.version > CURRENT_VERSION {
         anyhow::bail!(
             "project file {} has version {} newer than supported {}",
@@ -150,10 +218,7 @@ mod tests {
         song.tracks.push(Track {
             id: 1,
             name: "Vocal".into(),
-            source: InstrumentSource::Vocal {
-                speaker_id: 3,
-                style_name: "ノーマル".into(),
-            },
+            source: InstrumentSource::Vocal,
             clips: vec![Clip {
                 id: 1,
                 name: "こんにちは".into(),
@@ -163,6 +228,9 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                speaker_id: 3061,
+                singer_name: "中国うさぎ".into(),
+                style_name: "ノーマル".into(),
             }],
             ..Track::default()
         });
@@ -173,6 +241,47 @@ mod tests {
         song.normalize_after_load();
         save(&path, &song).unwrap();
         assert_eq!(load(&path).unwrap(), song);
+    }
+
+    #[test]
+    fn migrate_old_vocal_source_bakes_voice_into_clips() {
+        // (FIXME #36) 旧形式: track.source = {"Vocal": {speaker_id, style_name}}、
+        // clip は声フィールド無し。 migration は source を unit "Vocal" に変換し、
+        // 旧トラック声を全 clip へ焼き込む (新形式 clip = 既に speaker_id 持ちは尊重)。
+        let mut value = serde_json::json!({
+            "version": 2,
+            "song": {
+                "tracks": [{
+                    "source": { "Vocal": { "speaker_id": 3061, "style_name": "へろへろ" } },
+                    "clips": [
+                        { "id": 1 },
+                        { "id": 2, "speaker_id": 7, "style_name": "あまあま" }
+                    ]
+                }]
+            }
+        });
+        migrate_vocal_source_to_clips(&mut value);
+        let track = &value["song"]["tracks"][0];
+        // source は unit "Vocal" (JSON string) に。
+        assert_eq!(track["source"], serde_json::json!("Vocal"));
+        // clip 1 (声無し): 旧トラック声を焼き込み。
+        assert_eq!(track["clips"][0]["speaker_id"], 3061);
+        assert_eq!(track["clips"][0]["style_name"], "へろへろ");
+        // clip 2 (既に speaker_id 持ち): 尊重して上書きしない。
+        assert_eq!(track["clips"][1]["speaker_id"], 7);
+        assert_eq!(track["clips"][1]["style_name"], "あまあま");
+    }
+
+    #[test]
+    fn migrate_is_noop_for_new_unit_vocal_source() {
+        // 新形式 (source が既に string "Vocal") は no-op。
+        let mut value = serde_json::json!({
+            "version": 2,
+            "song": { "tracks": [{ "source": "Vocal", "clips": [{ "id": 1 }] }] }
+        });
+        let before = value.clone();
+        migrate_vocal_source_to_clips(&mut value);
+        assert_eq!(value, before);
     }
 
     #[test]

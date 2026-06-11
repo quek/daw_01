@@ -128,6 +128,7 @@ mod tests {
                     notes: Vec::new(),
                     color: None,
                     auto_lipsync: false,
+                    ..Default::default()
                 }],
                 ..Track::default()
             }],
@@ -192,6 +193,7 @@ mod tests {
                         notes: Vec::new(),
                         color: None,
                         auto_lipsync: false,
+                        ..Default::default()
                     }],
                     ..Track::default()
                 },
@@ -206,6 +208,7 @@ mod tests {
                         notes: Vec::new(),
                         color: None,
                         auto_lipsync: false,
+                        ..Default::default()
                     }],
                     ..Track::default()
                 },

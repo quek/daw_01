@@ -660,6 +660,8 @@ mod tests {
                     pitch: 60,
                     velocity: 100,
                     lyric: "あ".to_string(),
+                    clip_id: 5,
+                    speaker_id: 3061,
                 },
                 crate::plugin_metadata::NoteMetadata {
                     note_id: 1,
@@ -668,6 +670,8 @@ mod tests {
                     pitch: 62,
                     velocity: 90,
                     lyric: String::new(),
+                    clip_id: 5,
+                    speaker_id: 3061,
                 },
             ],
         };

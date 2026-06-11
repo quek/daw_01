@@ -157,6 +157,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         bpm: app.song.bpm,
         time_sig: app.song.time_sig,
         snap: snap::piano_roll_snap_config(app),
+        // (FIXME #38) 3 段目グリッド (スナップ細分線) の線間隔 (拍)。
+        // `None` = subdivision なし (拍以上に粗いスナップ / OFF)。
+        sub_grid_interval_beats: snap::subgrid_interval_beats(
+            snap::piano_roll_snap_config(app),
+            zoom_x,
+        ),
         loop_range,
         scale,
         // Phase 7 B5 follow-up (gui_01 #042 Phase 70b): Highlight mode + Snap

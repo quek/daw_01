@@ -1496,67 +1496,155 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 描画しない (track 0 を誤対象にしない)。
     let cursor_idx = app.cursor_track_index();
 
-    // Vocal source 編集 (Vocal track のときのみ)
-    if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i))
-        && let common::model::InstrumentSource::Vocal { speaker_id, .. } = &track.source
+    // (FIXME #36) Clip Voice 編集: 選択中の clip が vocal track 上の MIDI clip の
+    // とき、 キャラ ▼ → スタイル ▼ の 2 段 dropdown で per-clip 声を選ぶ。
+    // 声は per-clip (`Clip::speaker_id`) が SSoT、 SetClipVoice で焼き込む。
+    if let Some(r) = app.selected_clip_ref()
+        && let Some(track) = app.song.tracks.get(r.track as usize)
+        && matches!(track.source, common::model::InstrumentSource::Vocal)
+        && let Some(clip) = track.clips.get(r.clip as usize)
+        && app
+            .song
+            .clip_contents
+            .get(&clip.content_id)
+            .is_none_or(|c| matches!(c, common::model::ClipContent::Midi(_)))
     {
+        let clip_key = common::model::ClipKey {
+            track_id: track.id,
+            clip_id: clip.id,
+        };
+        let cur_speaker = clip.speaker_id;
+        // 現在の声の表示名: clip 焼き込み名 → speaker_id 逆引き → アプリ既定。
+        let (cur_singer, cur_style) = if !clip.singer_name.is_empty() {
+            (clip.singer_name.clone(), clip.style_name.clone())
+        } else if let Some(found) = app.singers.iter().find_map(|s| {
+            s.styles
+                .iter()
+                .find(|st| st.id == cur_speaker)
+                .map(|st| (s.name.clone(), st.name.clone()))
+        }) {
+            found
+        } else {
+            (
+                common::voicevox::DEFAULT_SINGER_NAME.to_string(),
+                common::voicevox::DEFAULT_STYLE_NAME.to_string(),
+            )
+        };
+
         ui.label_at(
-            "inspector_vocal_label",
-            "Vocal Speaker",
+            "inspector_clip_voice_label",
+            "Clip Voice",
             area.x + pad,
             y,
             12.0,
             TEXT_DIM,
         );
         y += 18.0;
-        let dropdown_rect = Rect {
-            x: area.x + pad,
-            y,
-            w: area.w - pad * 2.0,
-            h: 24.0,
-        };
-        // singers が空 (engine 未起動 / fetch 失敗) なら placeholder ラベルだけ
+
         if app.singers.is_empty() {
+            // engine 未起動 / 一覧未取得: 焼き込み声名 + 取得中。 声名は常に出せる。
+            let txt = format!("{cur_singer} - {cur_style}  (一覧取得中…)");
             ui.label_at(
-                "inspector_vocal_placeholder",
-                "(VOICEVOX engine 未起動 — speaker 一覧取得待ち)",
-                dropdown_rect.x + 4.0,
-                dropdown_rect.y + 6.0,
+                "inspector_clip_voice_current",
+                &txt,
+                area.x + pad + 4.0,
+                y + 6.0,
                 11.0,
                 TEXT_DIM,
             );
+            y += 26.0;
         } else {
-            // entries (= (id, style_name) 逆引き) と labels (=「<キャラ> -
-            // <スタイル>」) は `singers` 投入時に AppData 側で 1 度キャッシュ
-            // 済み (`SingersLoaded`)。 ここでは毎フレーム format!/clone せず、
-            // cache から &str refs を集めるだけ (= heap 確保 1 回、format 0 回)。
-            let label_refs: Vec<&str> =
-                app.vocal_speaker_labels.iter().map(String::as_str).collect();
-            let selected_idx = app
-                .vocal_speaker_entries
+            // 上段: キャラ dropdown。
+            let char_labels: Vec<&str> =
+                app.singers.iter().map(|s| s.name.as_str()).collect();
+            let cur_char_idx = app
+                .singers
                 .iter()
-                .position(|(id, _)| *id == *speaker_id)
+                .position(|s| s.name == cur_singer)
                 .unwrap_or(0);
-            if let Some(picked) = ui.dropdown(
-                "inspector_vocal_dropdown",
-                dropdown_rect,
-                &label_refs,
-                selected_idx,
-            ) && let Some((id, style_name)) = app.vocal_speaker_entries.get(picked)
-            {
-                let track_idx = cursor_idx.unwrap_or(0) as u32;
-                let new_id = *id;
-                let new_style = style_name.clone();
+            let char_rect = Rect {
+                x: area.x + pad,
+                y,
+                w: area.w - pad * 2.0,
+                h: 24.0,
+            };
+            let picked_char = ui.dropdown(
+                "inspector_clip_voice_char",
+                char_rect,
+                &char_labels,
+                cur_char_idx,
+            );
+            y += 28.0;
+
+            // 下段: スタイル dropdown (= 上段で選んだ or 現在のキャラの styles)。
+            let char_idx = picked_char.unwrap_or(cur_char_idx).min(app.singers.len() - 1);
+            let singer = &app.singers[char_idx];
+            let style_labels: Vec<&str> =
+                singer.styles.iter().map(|st| st.name.as_str()).collect();
+            let cur_style_idx = singer
+                .styles
+                .iter()
+                .position(|st| st.id == cur_speaker)
+                .unwrap_or(0);
+            let style_rect = Rect {
+                x: area.x + pad,
+                y,
+                w: area.w - pad * 2.0,
+                h: 24.0,
+            };
+            let picked_style = ui.dropdown(
+                "inspector_clip_voice_style",
+                style_rect,
+                &style_labels,
+                cur_style_idx,
+            );
+            y += 28.0;
+
+            // 確定値: キャラを変えたらそのキャラの先頭 style、 style を変えたら
+            // その style を採用 (= (speaker_id, singer_name, style_name))。
+            let chosen: Option<(u32, String, String)> = if let Some(pc) = picked_char {
+                app.singers.get(pc).and_then(|s| {
+                    s.styles
+                        .first()
+                        .map(|st| (st.id, s.name.clone(), st.name.clone()))
+                })
+            } else if let Some(ps) = picked_style {
+                singer
+                    .styles
+                    .get(ps)
+                    .map(|st| (st.id, singer.name.clone(), st.name.clone()))
+            } else {
+                None
+            };
+            if let Some((sid, sn, stn)) = chosen {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetTrackSpeaker {
-                        track: track_idx,
-                        speaker_id: new_id,
-                        style_name: new_style.clone(),
+                    app.handle_event(AppEvent::SetClipVoice {
+                        clip: clip_key,
+                        speaker_id: sid,
+                        singer_name: sn.clone(),
+                        style_name: stn.clone(),
                     });
                 }));
             }
+
+            // 再取得ボタン (新規キャラ導入時に押す)。
+            let refetch_rect = Rect {
+                x: area.x + pad,
+                y,
+                w: area.w - pad * 2.0,
+                h: 22.0,
+            };
+            if ui.button_at_clicked(
+                "inspector_clip_voice_refetch",
+                "声一覧を再取得",
+                refetch_rect,
+            ) {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::RefetchSingers);
+                }));
+            }
+            y += 28.0;
         }
-        y += 30.0;
     }
 
     // ---- Parent group dropdown ---------------------------------------
@@ -1647,7 +1735,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Vocal track のみ。生成した口画像 ImageEvent を焼き込む先の口 track
     // (立ち絵 group の子 image track) を選ぶ。設定で再生成が走る。
     if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i))
-        && matches!(track.source, common::model::InstrumentSource::Vocal { .. })
+        && matches!(track.source, common::model::InstrumentSource::Vocal)
     {
         let self_id = track.id;
         // 候補: 自分以外の全 track (= 口 track はどれでも選べる)。

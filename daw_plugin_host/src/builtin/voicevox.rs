@@ -65,9 +65,19 @@ impl Default for VoicevoxState {
     }
 }
 
-/// 合成 thread に渡す 1 job。
+/// 合成 thread に渡す 1 job。 (FIXME #36) per-clip 声: clip ごとに speaker が
+/// 違うので、 clip 単位の spec 列を持つ。 synth thread が clip ごとに合成して
+/// WAV を連結し、 note_offsets を累積シフトして 1 本の `SynthResult` にする。
 struct SynthJob {
     bpm: f32,
+    clips: Vec<ClipSynthSpec>,
+}
+
+/// (FIXME #36) 1 clip 分の合成指定 (= 1 speaker / 1 WAV)。 `clip_id` は
+/// `set_note_metadata` でのグルーピング用 (= 連続する同 clip_id の note を
+/// 1 spec にまとめる)。
+struct ClipSynthSpec {
+    clip_id: u32,
     speaker_id: u32,
     notes: Vec<BuiltinNoteSpec>,
 }
@@ -241,7 +251,7 @@ impl VoicevoxBuiltin {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         continue;
                     };
-                    if job.notes.is_empty() {
+                    if job.clips.iter().all(|c| c.notes.is_empty()) {
                         result_arc.store(None);
                         continue;
                     }
@@ -249,43 +259,118 @@ impl VoicevoxBuiltin {
                     if shutdown.load(Ordering::SeqCst) {
                         return;
                     }
-                    match synthesize_notes_for_builtin(
-                        &job.notes,
-                        job.bpm,
-                        job.speaker_id,
-                    ) {
-                        Ok(BuiltinSynthOutput {
-                            samples,
-                            sample_rate,
-                            note_offsets,
-                        }) => {
-                            let res = SynthResult {
-                                samples: Arc::new(samples),
+                    // (FIXME #36) clip ごとに自分の speaker で合成し、 各 clip の
+                    // mono WAV を **song-absolute なサンプル位置** に配置した 1 本の
+                    // バッファを作る (clip 間のギャップ = 無音、 旧 single-WAV と同じ
+                    // 時間軸正しさを per-clip 声で再現)。 単純連結だと clip 間ギャップが
+                    // 消えて rolling voice がギャップ中に次 clip を早鳴りするため不可。
+                    // note_id は track 内通し番号で一意なので global map で衝突しない。
+                    // process() は従来どおり単一 samples + note_offsets[note_id] の
+                    // cursor jump のみ (= RT path 不変)。
+                    let mut out_sr: u32 = 0;
+                    // (placement_samples, mono WAV, [(note_id, abs_offset)]) を clip ごと収集。
+                    let mut placed: Vec<(usize, Vec<f32>, Vec<(u32, u64)>)> = Vec::new();
+                    let mut failed: Option<anyhow::Error> = None;
+                    for spec in &job.clips {
+                        if spec.notes.is_empty() {
+                            continue;
+                        }
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        match synthesize_notes_for_builtin(
+                            &spec.notes,
+                            job.bpm,
+                            spec.speaker_id,
+                        ) {
+                            Ok(BuiltinSynthOutput {
+                                samples,
                                 sample_rate,
-                                note_offsets: Arc::new(note_offsets),
-                            };
-                            result_arc.store(Some(Arc::new(res)));
-                            tracing::info!("VoicevoxBuiltin: synth complete");
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = ?e,
-                                "VoicevoxBuiltin: synth failed (engine 起動済? localhost:50021)"
-                            );
-                            // engine 起動中で接続失敗の可能性が高いので、
-                            // job を coalesce slot に戻して 1.5s 後に retry。
-                            // 受信 thread が新 job を入れたら override される
-                            // (= 最新版で再試行)、 入らなければ同 job を
-                            // また試す。 60s 待っても engine が立たない場合
-                            // user 介入が必要なので、 backoff は無限。
-                            if let Ok(mut slot) = coalesce.lock()
-                                && slot.is_none()
-                            {
-                                *slot = Some(job);
+                                note_offsets,
+                            }) => {
+                                out_sr = sample_rate;
+                                let spb = f64::from(sample_rate) * 60.0
+                                    / f64::from(job.bpm.max(0.001));
+                                // placement = (clip 先頭ノートの song-absolute サンプル位置)
+                                //  - (WAV 内 local offset)。 全ノートで一定 (= earliest*spb
+                                // - lead_in)。 note.start_beat は sync_vocal_metadata で
+                                // song-absolute 化済み。
+                                let placement = spec
+                                    .notes
+                                    .iter()
+                                    .filter_map(|n| {
+                                        note_offsets
+                                            .get(&n.note_id)
+                                            .map(|off| n.start_beat * spb - *off as f64)
+                                    })
+                                    .fold(f64::INFINITY, f64::min);
+                                let placement = if placement.is_finite() {
+                                    placement.max(0.0)
+                                } else {
+                                    0.0
+                                };
+                                let place_samples = placement.round() as usize;
+                                // 各ノートの絶対 offset = placement + WAV 内 local offset。
+                                let abs: Vec<(u32, u64)> = note_offsets
+                                    .iter()
+                                    .map(|(nid, off)| {
+                                        (*nid, (place_samples as u64).saturating_add(*off))
+                                    })
+                                    .collect();
+                                placed.push((place_samples, samples, abs));
                             }
-                            retry_after = std::time::Instant::now()
-                                + std::time::Duration::from_millis(1500);
+                            Err(e) => {
+                                failed = Some(e);
+                                break;
+                            }
                         }
+                    }
+                    if let Some(e) = failed {
+                        tracing::error!(
+                            error = ?e,
+                            "VoicevoxBuiltin: synth failed (engine 起動済? localhost:50021)"
+                        );
+                        // engine 起動中で接続失敗の可能性が高いので、 job を
+                        // coalesce slot に戻して 1.5s 後に retry (clip の 1 つでも
+                        // 失敗したら job 全体を再試行 = 部分結果は保存しない)。
+                        // 受信 thread が新 job を入れたら override される。
+                        if let Ok(mut slot) = coalesce.lock()
+                            && slot.is_none()
+                        {
+                            *slot = Some(job);
+                        }
+                        retry_after = std::time::Instant::now()
+                            + std::time::Duration::from_millis(1500);
+                    } else if placed.is_empty() {
+                        result_arc.store(None);
+                    } else {
+                        // track 長 = max(placement + WAV 長)。 clip 間ギャップは 0 (無音)。
+                        let total = placed
+                            .iter()
+                            .map(|(p, s, _)| p + s.len())
+                            .max()
+                            .unwrap_or(0);
+                        let mut buf = vec![0.0f32; total];
+                        let mut global_offsets: HashMap<u32, u64> = HashMap::new();
+                        for (place, samples, abs) in &placed {
+                            // 重なる clip は mix (加算)。 通常 clip は重ならないので copy 相当。
+                            for (i, s) in samples.iter().enumerate() {
+                                buf[place + i] += *s;
+                            }
+                            for (nid, off) in abs {
+                                global_offsets.insert(*nid, *off);
+                            }
+                        }
+                        let res = SynthResult {
+                            samples: Arc::new(buf),
+                            sample_rate: out_sr,
+                            note_offsets: Arc::new(global_offsets),
+                        };
+                        result_arc.store(Some(Arc::new(res)));
+                        tracing::info!(
+                            clips = placed.len(),
+                            "VoicevoxBuiltin: synth complete (per-clip, song-absolute)"
+                        );
                     }
                 }
             });
@@ -540,24 +625,33 @@ impl LoadedPlugin for VoicevoxBuiltin {
         // BuiltinNoteSpec 配列を組み立てて synth thread に送る。 entries が
         // 空なら synth result を None にする job を送る (= 再生停止信号
         // 兼ねる)。
-        let notes: Vec<BuiltinNoteSpec> = entries
-            .iter()
-            .map(|e| BuiltinNoteSpec {
+        // (FIXME #36) entries を clip_id でグルーピングして per-clip synth spec
+        // に。 sync_vocal_metadata は clip を順に flatten する (= 同 clip_id の
+        // note は連続) ので、 「直前 spec と同 clip_id なら追記、 違えば新 spec」
+        // で出現順 (= note_id 連番順 = WAV 連結順) を保ったままグループ化できる。
+        // 各 clip の speaker_id は entry が持つ per-clip 声。
+        let mut clips: Vec<ClipSynthSpec> = Vec::new();
+        for e in entries {
+            let note = BuiltinNoteSpec {
                 note_id: e.note_id,
                 start_beat: e.start_beat,
                 duration_beats: e.duration_beats,
                 pitch: e.pitch,
                 velocity: e.velocity,
                 lyric: e.lyric.clone(),
-            })
-            .collect();
+            };
+            match clips.last_mut() {
+                Some(c) if c.clip_id == e.clip_id => c.notes.push(note),
+                _ => clips.push(ClipSynthSpec {
+                    clip_id: e.clip_id,
+                    speaker_id: e.speaker_id,
+                    notes: vec![note],
+                }),
+            }
+        }
 
         if let Some(tx) = self.synth_tx.as_ref() {
-            let _ = tx.send(SynthJob {
-                bpm,
-                speaker_id: self.state.speaker_id,
-                notes,
-            });
+            let _ = tx.send(SynthJob { bpm, clips });
         }
         tracing::debug!(
             count = self.lyrics.len(),

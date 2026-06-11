@@ -1462,6 +1462,7 @@ mod tests {
             notes: Vec::new(),
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         });
         song.tracks.push(track);
         song
@@ -1788,6 +1789,7 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                ..Default::default()
             }];
             t.next_clip_id = 2;
         });

@@ -291,6 +291,7 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                ..Default::default()
             }];
         }));
         song
@@ -526,6 +527,7 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                ..Default::default()
             }];
         }));
         let mut out = Vec::new();

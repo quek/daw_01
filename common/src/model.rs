@@ -1561,7 +1561,13 @@ pub struct Send {
 pub enum InstrumentSource {
     #[default]
     None,
-    Vocal { speaker_id: u32, style_name: String },
+    /// (FIXME #36) 「このトラックは VOICEVOX builtin で歌わせる」印。
+    /// 声 (singer + style) は per-clip (`Clip::speaker_id` 等) が SSoT で、
+    /// トラックは声を持たない unit marker。旧プロジェクト
+    /// (`Vocal { speaker_id, style_name }`) は `project::load` の JSON
+    /// 前処理で旧トラック声を全 clip へ焼き込んでから unit `Vocal` に
+    /// 移行する (`migrate_vocal_source_to_clips`)。
+    Vocal,
     Vst3 { path: PathBuf },
     BuiltinSynth,
 }
@@ -1813,6 +1819,12 @@ impl PluginInstance {
     }
 }
 
+/// serde `skip_serializing_if` 用: `u32` が 0 か。`Clip::speaker_id` (FIXME #36)
+/// の「未採番は serialize しない」に使う。
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 /// A clip is a free-time container of notes positioned along the song
 /// timeline. `start_beat` and `length_beats` define where the clip lives;
 /// the actual notes are stored in `Song.clip_contents` keyed by
@@ -1863,6 +1875,22 @@ pub struct Clip {
     /// v20 files forward-migrate to `false`。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_lipsync: bool,
+    /// (FIXME #36) この clip の VOICEVOX 歌唱声 = `/frame_synthesis` の speaker
+    /// (= `/singers` の歌唱 style id)。clip 単位で独立・焼き込み (前の clip の
+    /// 声を後で変えても後続に波及しない)。`0` = 未採番 (= 合成時に
+    /// `voicevox::DEFAULT_SINGER_ID` へフォールバック)。vocal track 上の MIDI
+    /// clip でのみ意味を持つ (他 content type では未使用)。旧プロジェクトは
+    /// `project::load` の migration で旧トラック声を焼き込む。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub speaker_id: u32,
+    /// (FIXME #36) 表示用キャラ名 (例: "中国うさぎ")。`/singers` 未取得でも
+    /// inspector が現在の声を出せるよう焼き込む。空なら一覧取得後に
+    /// `speaker_id` から逆引きして埋める。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub singer_name: String,
+    /// (FIXME #36) 表示用スタイル名 (例: "ノーマル" / "へろへろ")。同上。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub style_name: String,
 }
 
 /// Shared content referenced by one or more `Clip`s via
@@ -3567,10 +3595,7 @@ mod tests {
         let song = Song {
             tracks: vec![Track {
                 name: "Vocal".into(),
-                source: InstrumentSource::Vocal {
-                    speaker_id: 3,
-                    style_name: "ノーマル".into(),
-                },
+                source: InstrumentSource::Vocal,
                 clips: vec![Clip {
                     id: 1,
                     name: "こんにちは".into(),
@@ -3595,6 +3620,9 @@ mod tests {
                     ],
                     color: None,
                     auto_lipsync: false,
+                    speaker_id: 3061,
+                    singer_name: "中国うさぎ".into(),
+                    style_name: "ノーマル".into(),
                 }],
                 ..Track::default()
             }],
@@ -4011,6 +4039,7 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                ..Default::default()
             }],
             automation_lanes: vec![AutomationLane {
                 id: 1,
@@ -4236,6 +4265,7 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                ..Default::default()
             }],
             next_clip_id: 2,
             ..Track::default()

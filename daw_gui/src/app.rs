@@ -1231,16 +1231,9 @@ pub struct AppData {
     pub load_progress_label: &'static str,
     /// VOICEVOX engine `/singers` の結果。 起動時に background thread が
     /// `AppEvent::SingersLoaded` で投入する。 engine 未起動 / fetch 失敗時は
-    /// 空のまま (Track Inspector の dropdown は default singer のみ表示)。
+    /// 空のまま (Clip Inspector の声 dropdown は焼き込み声名 + 「取得中…」表示)。
+    /// (FIXME #36) Clip Inspector の 2 段 dropdown (キャラ→style) が直接読む。
     pub singers: Vec<common::voicevox::VoiceVoxSinger>,
-    /// `singers` から派生した Vocal speaker dropdown のキャッシュ。
-    /// `vocal_speaker_entries` は `(speaker_id, style_name)` の逆引き、
-    /// `vocal_speaker_labels` は「<キャラ> - <スタイル>」表示ラベル。
-    /// `singers` 投入時 (`SingersLoaded`) にのみ再構築し、 Track Inspector
-    /// 描画の毎フレーム `format!` / `clone` を消す (singers は engine 起動時に
-    /// 一度設定されて以降ほぼ不変なので、 派生キャッシュが SSoT として安定)。
-    pub vocal_speaker_entries: Vec<(u32, String)>,
-    pub vocal_speaker_labels: Vec<String>,
     /// VOICEVOX 合成結果 in-memory cache (process lifetime のみ)。 Synth ボタン
     /// 押下時に各 clip の content_hash + singer_id を key に lookup → hit なら
     /// HTTP call をスキップ。 永続化は将来 Phase。
@@ -1710,8 +1703,6 @@ impl AppData {
             load_progress: None,
             load_progress_label: "",
             singers: Vec::new(),
-            vocal_speaker_entries: Vec::new(),
-            vocal_speaker_labels: Vec::new(),
             voicevox_cache: Arc::new(Mutex::new(common::voicevox_cache::VoiceVoxCache::new())),
             voicevox_job,
             supervisor,
@@ -2572,7 +2563,7 @@ impl AppData {
                 | AppEvent::CopyNotes(_)
                 | AppEvent::SetNoteLyrics { .. }
                 | AppEvent::SetNoteVelocities(_)
-                | AppEvent::SetTrackSpeaker { .. }
+                | AppEvent::SetClipVoice { .. }
                 | AppEvent::QuantizeSelectedNotes(_)
                 | AppEvent::SelectPluginFromDb { .. }
                 | AppEvent::CommitBpmEdit
@@ -3823,14 +3814,18 @@ pub enum AppEvent {
     /// 立てた timer thread が送る。`lipsync_gen` と一致するときだけ
     /// (= それ以降変更なし) 全 bound vocal track を再生成する。Undo 対象外。
     LipsyncDebounceFired(u64),
-    /// Track Inspector の Vocal speaker dropdown で選択された singer。
-    /// `track.source` を `InstrumentSource::Vocal { speaker_id, style_name }`
-    /// に書き換える。 Vocal 以外の track に対しては no-op。
-    SetTrackSpeaker {
-        track: u32,
+    /// (FIXME #36) Clip Inspector の 2 段 dropdown で選択された声を、 対象
+    /// clip (stable `ClipKey`) に焼き込む。 builtin へ再 flush して新しい声で
+    /// 再合成する。
+    SetClipVoice {
+        clip: common::model::ClipKey,
         speaker_id: u32,
+        singer_name: String,
         style_name: String,
     },
+    /// (FIXME #36) Clip Inspector の「再取得」ボタン。 VOICEVOX `/singers` を
+    /// 再取得して声 dropdown を更新する (新規キャラ導入時)。
+    RefetchSingers,
 
     // -------- WAV export -------------------------------------------------
     ExportWav,
@@ -5517,18 +5512,8 @@ impl AppData {
                     "VOICEVOX singers loaded"
                 );
                 self.singers = singers;
-                // Vocal speaker dropdown の派生キャッシュを再構築 (= Track
-                // Inspector の毎フレーム format!/clone を消す)。 singers が
-                // 変わるのはここだけなので、 ここで 1 度作れば常に整合する。
-                self.vocal_speaker_entries.clear();
-                self.vocal_speaker_labels.clear();
-                for s in &self.singers {
-                    for st in &s.styles {
-                        self.vocal_speaker_labels
-                            .push(format!("{} - {}", s.name, st.name));
-                        self.vocal_speaker_entries.push((st.id, st.name.clone()));
-                    }
-                }
+                // (FIXME #36) Clip Inspector の 2 段 dropdown は `singers` を
+                // 直接読む (キャラ→style の階層が要るので flat cache は持たない)。
             }
             AppEvent::LipsyncGenerated { vocal_track_id, bpm, clips, generation } => {
                 // FIXME #35: spawn 後に project が切り替わった (reset_saved_baseline
@@ -5558,8 +5543,11 @@ impl AppData {
                     }
                 }
             }
-            AppEvent::SetTrackSpeaker { track, speaker_id, style_name } => {
-                self.set_track_speaker(track, speaker_id, style_name);
+            AppEvent::SetClipVoice { clip, speaker_id, singer_name, style_name } => {
+                self.set_clip_voice(clip, speaker_id, singer_name, style_name);
+            }
+            AppEvent::RefetchSingers => {
+                self.spawn_fetch_singers();
             }
             AppEvent::SetPianoRollSnapEnabled(b) => {
                 self.pianoroll_snap_enabled = b;
@@ -6376,7 +6364,7 @@ impl AppData {
                 .any(|p| p.ports.has_note_input && p.ports.has_audio_output);
             let is_legacy_vocal = matches!(
                 track.source,
-                common::model::InstrumentSource::Vocal { .. }
+                common::model::InstrumentSource::Vocal
             ) && !has_sound_source;
             if !is_legacy_vocal {
                 continue;
@@ -7663,13 +7651,13 @@ impl AppData {
     pub fn sync_vocal_metadata(&mut self) {
         let bpm = self.song.bpm;
         let has_vocal_track = self.song.tracks.iter().any(|t| {
-            matches!(t.source, common::model::InstrumentSource::Vocal { .. })
+            matches!(t.source, common::model::InstrumentSource::Vocal)
         });
         if has_vocal_track {
             self.ensure_voicevox_engine();
         }
         for track in &self.song.tracks {
-            if !matches!(track.source, common::model::InstrumentSource::Vocal { .. }) {
+            if !matches!(track.source, common::model::InstrumentSource::Vocal) {
                 continue;
             }
             // 単一デバイスチェーン: builtin VOICEVOX を chain 内に持つ device の
@@ -7714,6 +7702,11 @@ impl AppData {
                         pitch: n.pitch,
                         velocity: n.velocity,
                         lyric: n.lyric.clone().unwrap_or_default(),
+                        // (FIXME #36) builtin が clip 単位で声を分けるための
+                        // grouping key + per-clip 歌唱 speaker (0 = builtin 側で
+                        // DEFAULT_SINGER_ID にフォールバック)。
+                        clip_id: clip.id,
+                        speaker_id: clip.speaker_id,
                     });
                 }
             }
@@ -7875,6 +7868,7 @@ impl AppData {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: true,
+                ..Default::default()
             });
         }
         // 削除した古い clip の content を回収。
@@ -8769,6 +8763,7 @@ impl AppData {
                 notes: Vec::new(),
                 color: cc.color,
                 auto_lipsync: cc.auto_lipsync,
+                ..Default::default()
             });
             new_refs.push(ClipRef {
                 track: target_idx as u32,
@@ -11956,6 +11951,7 @@ impl AppData {
             notes: Vec::new(),
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         });
 
         self.resize_track_peak_display();
@@ -13297,6 +13293,10 @@ impl AppData {
         let new_length = src_clip.length_beats;
         let content_id = src_clip.content_id;
         let src_color = src_clip.color;
+        // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
+        let src_speaker = src_clip.speaker_id;
+        let src_singer = src_clip.singer_name.clone();
+        let src_style = src_clip.style_name.clone();
         let track = self.song.tracks.get_mut(source.track as usize)?;
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
@@ -13309,6 +13309,9 @@ impl AppData {
             notes: Vec::new(),
             color: src_color,
             auto_lipsync: false,
+            speaker_id: src_speaker,
+            singer_name: src_singer,
+            style_name: src_style,
         });
         Some(ClipRef { track: source.track, clip: new_idx })
     }
@@ -13329,6 +13332,10 @@ impl AppData {
         let new_length = src_clip.length_beats;
         let src_content_id = src_clip.content_id;
         let src_color = src_clip.color;
+        // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
+        let src_speaker = src_clip.speaker_id;
+        let src_singer = src_clip.singer_name.clone();
+        let src_style = src_clip.style_name.clone();
         let new_content_id = self.song.fork_content(src_content_id);
         let track = self.song.tracks.get_mut(source.track as usize)?;
         let new_clip_id = track.alloc_clip_id();
@@ -13342,6 +13349,9 @@ impl AppData {
             notes: Vec::new(),
             color: src_color,
             auto_lipsync: false,
+            speaker_id: src_speaker,
+            singer_name: src_singer,
+            style_name: src_style,
         });
         Some(ClipRef { track: source.track, clip: new_idx })
     }
@@ -13421,6 +13431,12 @@ impl AppData {
             // source の色を引き継ぐ。
             let content_id = src_clip.content_id;
             let src_color = src_clip.color;
+            // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
+            let src_voice = (
+                src_clip.speaker_id,
+                src_clip.singer_name.clone(),
+                src_clip.style_name.clone(),
+            );
             let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
                 continue;
             };
@@ -13438,6 +13454,9 @@ impl AppData {
                 notes: Vec::new(),
                 color: src_color,
                 auto_lipsync: false,
+                speaker_id: src_voice.0,
+                singer_name: src_voice.1,
+                style_name: src_voice.2,
             });
             new_refs.push(ClipRef {
                 track: to_track_idx as u32,
@@ -13466,6 +13485,12 @@ impl AppData {
             // 独立コピー: content + 名前を fork。色 (per-clip) は source の色を引き継ぐ。
             let src_content_id = src_clip.content_id;
             let src_color = src_clip.color;
+            // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
+            let src_voice = (
+                src_clip.speaker_id,
+                src_clip.singer_name.clone(),
+                src_clip.style_name.clone(),
+            );
             let new_content_id = self.song.fork_content(src_content_id);
             let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
                 continue;
@@ -13484,6 +13509,9 @@ impl AppData {
                 notes: Vec::new(),
                 color: src_color,
                 auto_lipsync: false,
+                speaker_id: src_voice.0,
+                singer_name: src_voice.1,
+                style_name: src_voice.2,
             });
             new_refs.push(ClipRef {
                 track: to_track_idx as u32,
@@ -13538,6 +13566,27 @@ impl AppData {
         };
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
+        // (FIXME #36) vocal track の新規 clip は声を引き継ぐ: 同トラックの
+        // 直前 (= start_beat 最大の既存) clip の声、 無ければアプリ既定
+        // (中国うさぎ ノーマル)。 非 vocal track では声は未設定 (0)。
+        let (speaker_id, singer_name, style_name) =
+            if matches!(track.source, common::model::InstrumentSource::Vocal) {
+                track
+                    .clips
+                    .iter()
+                    .filter(|c| c.speaker_id != 0)
+                    .max_by(|a, b| a.start_beat.total_cmp(&b.start_beat))
+                    .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone()))
+                    .unwrap_or_else(|| {
+                        (
+                            common::voicevox::DEFAULT_SINGER_ID,
+                            common::voicevox::DEFAULT_SINGER_NAME.to_string(),
+                            common::voicevox::DEFAULT_STYLE_NAME.to_string(),
+                        )
+                    })
+            } else {
+                (0, String::new(), String::new())
+            };
         track.clips.push(Clip {
             id: new_clip_id,
             name: String::new(),
@@ -13547,6 +13596,9 @@ impl AppData {
             notes: Vec::new(),
             color: None,
             auto_lipsync: false,
+            speaker_id,
+            singer_name,
+            style_name,
         });
         // デフォルトでクリップ名は無し (= content_name 未設定)。 表示名は
         // arrangement_view::clip_display_label が内容 (Text 本文 / ノート歌詞)
@@ -13908,25 +13960,55 @@ impl AppData {
         }
         self.sync_song_to_plugin_host();    }
 
-    /// Track Inspector の Vocal speaker dropdown 経由で speaker_id 変更。
-    /// 対象 track が `InstrumentSource::Vocal` でなければ no-op。
-    fn set_track_speaker(&mut self, track: u32, speaker_id: u32, style_name: String) {
-        let Some(t) = self.song.tracks.get_mut(track as usize) else {
+    /// (FIXME #36) per-clip 声を設定。 Clip Inspector の 2 段 dropdown から
+    /// `SetClipVoice` 経由で呼ばれる。 stable `ClipKey` で対象 clip を引き、
+    /// 声 3 値を焼き込んで builtin へ再 flush (= 新しい声で再合成)。
+    fn set_clip_voice(
+        &mut self,
+        key: common::model::ClipKey,
+        speaker_id: u32,
+        singer_name: String,
+        style_name: String,
+    ) {
+        let Some(r) = self.clip_ref_of(key) else {
             return;
         };
-        let common::model::InstrumentSource::Vocal {
-            speaker_id: cur_id,
-            style_name: cur_style,
-        } = &mut t.source
+        let Some(clip) = self
+            .song
+            .tracks
+            .get_mut(r.track as usize)
+            .and_then(|t| t.clips.get_mut(r.clip as usize))
         else {
             return;
         };
-        if *cur_id == speaker_id && *cur_style == style_name {
+        if clip.speaker_id == speaker_id
+            && clip.singer_name == singer_name
+            && clip.style_name == style_name
+        {
             return;
         }
-        *cur_id = speaker_id;
-        *cur_style = style_name;
-        self.sync_song_to_plugin_host();
+        clip.speaker_id = speaker_id;
+        clip.singer_name = singer_name;
+        clip.style_name = style_name;
+        // 声変更を builtin に反映 (= clip 単位で再合成)。
+        self.sync_vocal_metadata();
+    }
+
+    /// (FIXME #36) VOICEVOX engine が ready になったら `/singers` を取得して
+    /// `SingersLoaded` を発行する (既存の死に配線を初めて発火させる)。 engine
+    /// 起動 (`ensure_voicevox_engine`) と「再取得」(`RefetchSingers`) から呼ぶ。
+    /// background thread (= ready 待ち + blocking HTTP) で走らせる。
+    fn spawn_fetch_singers(&self) {
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            // engine が ready になるまで待つ (未起動なら timeout で抜ける)。
+            common::voicevox_engine::wait_until_ready();
+            let singers = common::voicevox::fetch_singers().unwrap_or_else(|e| {
+                tracing::warn!(error = ?e, "VOICEVOX /singers fetch failed");
+                Vec::new()
+            });
+            proxy.send(AppEvent::SingersLoaded(singers));
+        });
     }
 
     /// gui_01 #017 (M14 Phase 59): piano_roll widget が L キー → Enter
@@ -15292,10 +15374,9 @@ impl AppData {
             // source==Vocal を見て歌詞 synth を走らせる)。 それ以外を挿しても
             // 既存の vocal 状態は変えない (= 単に device を 1 つ足すだけ)。
             if is_voicevox {
-                track.source = InstrumentSource::Vocal {
-                    speaker_id: common::voicevox::DEFAULT_SINGER_ID,
-                    style_name: "ノーマル".into(),
-                };
+                // (FIXME #36) 声は per-clip (`Clip::speaker_id`)。 トラックは
+                // 「VOICEVOX で鳴らす」 印 (unit marker) のみ持つ。
+                track.source = InstrumentSource::Vocal;
             }
         }
     }
@@ -15348,6 +15429,9 @@ impl AppData {
                 }
             }
         });
+        // (FIXME #36) engine が立ち上がる (or 既に起動中) のと並行して
+        // /singers を取得し、 Clip Inspector の声 dropdown を埋める。
+        self.spawn_fetch_singers();
     }
 
     // -------- Plugin DB rescan --------------------------------------------
@@ -15906,6 +15990,7 @@ impl AppData {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                ..Default::default()
             });
             next_start_beat += length_beats;
             imported_ok += 1;
@@ -16039,6 +16124,7 @@ impl AppData {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                ..Default::default()
             });
             self.song.tracks.push(video_track);
 
@@ -16080,6 +16166,7 @@ impl AppData {
                     notes: Vec::new(),
                     color: None,
                     auto_lipsync: false,
+                    ..Default::default()
                 });
                 self.song.tracks.push(audio_track);
             }
@@ -16260,6 +16347,7 @@ impl AppData {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                ..Default::default()
             });
             // 既存 track に複数枚貼るときだけ順送り。 新規 track 経路は各画像が
             // 自分の track を持つので beat 0 固定 (従来挙動)。
@@ -16328,6 +16416,7 @@ impl AppData {
             notes: Vec::new(),
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         });
 
         // create_clip と同様、 生成直後の clip を選択して inspector に出す。
@@ -17048,11 +17137,18 @@ impl AppData {
         // (length / content_id rewritten), and a new clip for the
         // back half is appended on the same track.
         let track = &mut self.song.tracks[target.track as usize];
-        {
+        // (FIXME #36) 前半は in-place で元 clip の声を保持。 後半 (新 clip) は
+        // その声を引き継ぐ。
+        let (src_speaker, src_singer, src_style) = {
             let clip_mut = &mut track.clips[target.clip as usize];
             clip_mut.length_beats = front_len;
             clip_mut.content_id = front_content_id;
-        }
+            (
+                clip_mut.speaker_id,
+                clip_mut.singer_name.clone(),
+                clip_mut.style_name.clone(),
+            )
+        };
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
@@ -17064,6 +17160,9 @@ impl AppData {
             notes: Vec::new(),
             color: src_color,
             auto_lipsync: false,
+            speaker_id: src_speaker,
+            singer_name: src_singer,
+            style_name: src_style,
         });
         new_selection.push(target);
         new_selection.push(ClipRef {
@@ -17333,6 +17432,7 @@ impl AppData {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                ..Default::default()
             });
             new_refs.push(ClipRef {
                 track: track_idx,

@@ -79,6 +79,11 @@ const QUERY_SPEAKER: u32 = 6000;
 /// Default singer for frame_synthesis when no explicit override is given.
 /// 3061 = 中国うさぎ ノーマル.
 pub const DEFAULT_SINGER_ID: u32 = 3061;
+/// (FIXME #36) `DEFAULT_SINGER_ID` の表示用キャラ名 / スタイル名。新規 vocal
+/// clip で声が未設定のときの既定表示、 旧プロジェクト migration で名前が
+/// 欠落しているときのフォールバックに使う。
+pub const DEFAULT_SINGER_NAME: &str = "中国うさぎ";
+pub const DEFAULT_STYLE_NAME: &str = "ノーマル";
 /// VOICEVOX frame rate (24000 Hz / 256 samples). 口パク (`crate::lipsync`) の
 /// frame_length → beat 変換でも参照する。
 pub(crate) const FRAME_RATE: f64 = 93.75;
@@ -96,9 +101,9 @@ pub(crate) const REST_FRAMES: u32 = 10;
 /// one `SynthResult` per clip processed (success or failure). Non-vocal
 /// tracks are skipped.
 ///
-/// `default_singer_id` is the fallback for sing mode when the track's
-/// `InstrumentSource::Vocal { speaker_id }` is 0 (uninitialised). Each
-/// vocal track may override with its own `speaker_id`.
+/// `default_singer_id` is the fallback for sing mode when a clip's
+/// `Clip::speaker_id` is 0 (未指定). Each vocal clip carries its own
+/// per-clip singer (FIXME #36).
 ///
 /// `default_talk_speaker_id` is the same fallback for talk mode (clips
 /// with no pitched notes).
@@ -112,19 +117,19 @@ pub fn synthesize_song(
     let mut results = Vec::new();
 
     for (track_idx, track) in song.tracks.iter().enumerate() {
-        let crate::model::InstrumentSource::Vocal {
-            speaker_id: model_speaker,
-            ..
-        } = &track.source
-        else {
+        if !matches!(track.source, crate::model::InstrumentSource::Vocal) {
             continue;
-        };
-        // sing/talk 両方とも、 track の speaker_id != 0 が指定されていれば
-        // それを優先 (UI で設定された singer)、 0 なら caller の default。
-        let track_speaker = *model_speaker;
-        let singer_id = if track_speaker != 0 { track_speaker } else { default_singer_id };
+        }
 
         for (clip_idx, clip) in track.clips.iter().enumerate() {
+            // (FIXME #36) 声は per-clip。 clip.speaker_id != 0 を優先、 0
+            // (未指定) なら caller の default にフォールバック。 sing / talk
+            // 両 path がこの per-clip singer_id を使う。
+            let singer_id = if clip.speaker_id != 0 {
+                clip.speaker_id
+            } else {
+                default_singer_id
+            };
             // v6 linked clip: notes は Song.clip_contents に。 共有 clip /
             // 独立 clip を区別せず、 同じ content_id の clip は同じ notes
             // で 1 回だけ合成 (cache key も notes ベース)。
@@ -193,7 +198,7 @@ pub fn synthesize_song(
                 if text.is_empty() {
                     continue;
                 }
-                let sid = if track_speaker != 0 { track_speaker } else { default_talk_speaker_id };
+                let sid = if clip.speaker_id != 0 { clip.speaker_id } else { default_talk_speaker_id };
                 match synthesize_talk(&client, &text, sid) {
                     Ok(b) => b,
                     Err(e) => {
@@ -737,6 +742,7 @@ mod tests {
             notes: Vec::new(),
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -761,6 +767,7 @@ mod tests {
             }],
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -797,6 +804,7 @@ mod tests {
             ],
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -839,6 +847,7 @@ mod tests {
             ],
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);
@@ -865,6 +874,7 @@ mod tests {
             }],
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         };
         let q = build_sing_query(&clip.notes, 120.0);
         // Must remain valid JSON despite embedded quotes.
@@ -897,6 +907,7 @@ mod tests {
             ],
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         };
         let q = build_sing_query(&clip.notes, 120.0);
         let entries = parse_query(&q);

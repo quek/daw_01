@@ -796,6 +796,7 @@ mod tests {
             notes: Vec::new(),
             color: None,
             auto_lipsync: false,
+            ..Default::default()
         });
         song.tracks.push(track);
 

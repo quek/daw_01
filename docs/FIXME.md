@@ -1,8 +1,8 @@
 理想とベストプラクティスを追求する。
 そのためは実装コストは無視して大胆に破壊して作り直す。
 
-## open 項目なし
+36. voicevox のシンガーとスタイル(へろへろとか)を指定可能に
+37. Mixer の高さが小さくなるとメーター目盛の数字同士が重なります。まびいてください。
+38. MIDI エディタでグリッド線に応してグリッドラインを表示してください。
 
-#16-#23 および follow-up (最上段 rename freeze / Open Recent cascade orphan) は全て解決。
-最後の gui_01 依存だった menu_bar cascade orphan は gui_01 Phase 120 (#095) で修正 landing
-(`close_orphaned_cascades` 再帰 close、 daw_01 無修正)。実機での最終一括確認待ち。
+※ このファイルは編集しないこと。

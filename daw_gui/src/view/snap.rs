@@ -101,6 +101,30 @@ pub fn arrange_snap_config(app: &AppData) -> SnapConfig {
     }
 }
 
+/// (FIXME #38) ピアノロール 3 段目グリッド (スナップ細分線) の「線間隔 (拍)」を返す。
+/// `None` = subdivision なし (snap OFF / 拍以上に粗いスナップ)。
+///
+/// gui_01 の `bar_beat_grid` には「1 拍あたり分割数」ではなく **線間隔 (interval_beats)**
+/// を渡す。これで直線/三連/付点すべてを literal に表現でき、1/4T (= 0.667 拍間隔 = 1 拍に
+/// 1.5 本 = 非整数 per-beat) も正しく描ける。`interval_beats < 1.0` (= 拍より細かい) の
+/// ときだけ `Some` を返し、3 段目を追加する (= 合意した「拍より細かいときだけ」ルール)。
+///
+/// - Straight / Triplet / Adaptive / Bars → snap unit (`beat_unit`) をそのまま線間隔に。
+///   例: 1/16 → 0.25, 1/8T → 0.333, 1/4T → 0.667, 1/2T → 1.333(→None), 1/4 → 1.0(→None)。
+/// - Dotted{div} → 付点間隔 (`6/div`) は不規則格子なので使わず、**内包する直線格子**
+///   `2/div` 拍 (1/8. → 0.25 = 1/16 線、1/16. → 0.125 = 1/32 線) を返す。
+#[must_use]
+pub fn subgrid_interval_beats(cfg: SnapConfig, zoom_x_px_per_beat: f32) -> Option<f64> {
+    if !cfg.is_active(false) {
+        return None;
+    }
+    let interval = match cfg.mode {
+        SnapMode::Dotted { div } => 2.0 / f64::from(div.max(1)),
+        _ => cfg.beat_unit(zoom_x_px_per_beat)?,
+    };
+    (interval < 1.0 - 1e-6).then_some(interval)
+}
+
 /// "1" キー (Narrow Grid): 細かく方向。 流れ:
 /// `4 bar → 2 bar → 1 bar → Adaptive → 1/2 → 1/4 → ... → 1/128` (no-op)。
 /// Triplet / Dotted 系は内部で div 倍化 (32 で頭打ち)。
@@ -228,5 +252,82 @@ mod tests {
         // "Adaptive" は "1/2 と 1 bar の中間" idx 16 に配置。
         assert!(matches!(choice_to_mode(16), SnapMode::Adaptive));
         assert_eq!(mode_to_choice(SnapMode::Adaptive), Some(16));
+    }
+
+    // ---- FIXME #38: subgrid_interval_beats ----
+
+    fn cfg(mode: SnapMode) -> SnapConfig {
+        SnapConfig {
+            mode,
+            enabled: true,
+            min_beat_unit: 1.0 / 128.0,
+            time_sig: (4, 4),
+        }
+    }
+
+    fn approx(got: Option<f64>, want: f64) {
+        match got {
+            Some(v) => assert!((v - want).abs() < 1e-9, "got {v}, want {want}"),
+            None => panic!("got None, want {want}"),
+        }
+    }
+
+    #[test]
+    fn subgrid_none_when_off_or_coarse() {
+        // snap OFF / disabled は subdivision なし。
+        assert_eq!(subgrid_interval_beats(SnapConfig::OFF, 100.0), None);
+        let mut disabled = cfg(SnapMode::Straight { div: 16 });
+        disabled.enabled = false;
+        assert_eq!(subgrid_interval_beats(disabled, 100.0), None);
+        // 拍以上に粗い直線 (1/4 = 1 拍, 1/2 = 2 拍) は 3 段目なし。
+        assert_eq!(subgrid_interval_beats(cfg(SnapMode::Straight { div: 4 }), 100.0), None);
+        assert_eq!(subgrid_interval_beats(cfg(SnapMode::Straight { div: 2 }), 100.0), None);
+        // Bars も拍以上。
+        assert_eq!(subgrid_interval_beats(cfg(SnapMode::Bars { count: 1 }), 100.0), None);
+    }
+
+    #[test]
+    fn subgrid_straight_interval() {
+        approx(subgrid_interval_beats(cfg(SnapMode::Straight { div: 8 }), 100.0), 0.5);
+        approx(subgrid_interval_beats(cfg(SnapMode::Straight { div: 16 }), 100.0), 0.25);
+        approx(subgrid_interval_beats(cfg(SnapMode::Straight { div: 32 }), 100.0), 0.125);
+    }
+
+    #[test]
+    fn subgrid_triplet_interval_including_non_integer_per_beat() {
+        // 1/8T = (8/3)/8 拍間隔。
+        approx(
+            subgrid_interval_beats(cfg(SnapMode::Triplet { div: 8 }), 100.0),
+            (8.0 / 3.0) / 8.0,
+        );
+        // 1/4T = (8/3)/4 = 0.6667 拍 (= 1 拍に 1.5 本、非整数 per-beat だが間隔モデルで正しく描ける)。
+        approx(
+            subgrid_interval_beats(cfg(SnapMode::Triplet { div: 4 }), 100.0),
+            (8.0 / 3.0) / 4.0,
+        );
+        // 1/2T = (8/3)/2 = 1.333 拍 (拍より粗い) → None。
+        assert_eq!(subgrid_interval_beats(cfg(SnapMode::Triplet { div: 2 }), 100.0), None);
+    }
+
+    #[test]
+    fn subgrid_dotted_uses_containing_straight_grid() {
+        // 1/8. → 内包する 1/16 線 = 0.25 拍 (付点間隔 6/8=0.75 ではない)。
+        approx(subgrid_interval_beats(cfg(SnapMode::Dotted { div: 8 }), 100.0), 0.25);
+        // 1/16. → 1/32 線 = 0.125。
+        approx(subgrid_interval_beats(cfg(SnapMode::Dotted { div: 16 }), 100.0), 0.125);
+        // 1/4. → 1/8 線 = 0.5。
+        approx(subgrid_interval_beats(cfg(SnapMode::Dotted { div: 4 }), 100.0), 0.5);
+    }
+
+    #[test]
+    fn subgrid_adaptive_matches_beat_unit() {
+        // Adaptive は beat_unit をそのまま (拍より細かいときだけ) 使う。zoom に応じた
+        // unit 値そのものは gui_01 の責務なので、ここでは「beat_unit を <1 で filter した値」
+        // と一致することだけ確認 (adaptive カーブの実装に依存しない)。
+        let c = cfg(SnapMode::Adaptive);
+        for zoom in [0.001_f32, 1.0, 50.0, 1000.0, 100_000.0] {
+            let expected = c.beat_unit(zoom).filter(|u| *u < 1.0 - 1e-6);
+            assert_eq!(subgrid_interval_beats(c, zoom), expected, "zoom {zoom}");
+        }
     }
 }
