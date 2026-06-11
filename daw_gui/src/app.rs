@@ -1432,8 +1432,13 @@ pub struct AppData {
     #[cfg(windows)]
     pub main_window_hwnd: Option<isize>,
     /// video export の保存先選択 dialog (background thread) が開いている間 true。
-    /// 二重起動防止。 `ExportMp4PathChosen` 受信でクリアする。
+    /// 二重起動防止。 `FileDialogResult { kind: ExportMp4 }` 受信でクリアする。
     pub export_dialog_open: bool,
+    /// Save As dialog (background thread) が開いている間 true。 二重起動防止に加え、
+    /// close 確認の「保存して終了」 が新規 project で Save As を非同期に開いたとき、
+    /// dialog 解決後 (`SaveAsResolved`) の begin_save 完了で終了するよう
+    /// `quit_after_save` を立てる判定に使う。 `SaveAsResolved` 受信でクリアする。
+    pub save_as_dialog_open: bool,
 
     /// 背景スレッド (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX
     /// 合成 / plugin DB rescan) からメインスレッドへ `AppEvent` を送るための
@@ -1488,6 +1493,42 @@ impl raw_window_handle::HasDisplayHandle for Win32Parent {
             )
         })
     }
+}
+
+/// native file dialog の種別 + 結果消費に必要な context。 dialog は別スレッドで
+/// 開き、 選択された path 群を `AppEvent::FileDialogResult` で GUI スレッドへ返した
+/// あと、 `handle_file_dialog_result` がこの kind で振り分ける。 dialog を GUI
+/// スレッドで同期に開くと、 preview window 等の 2 枚目 top-level window の再描画
+/// flood で dialog の modal pump が枯れて数分フリーズするため、 全 native file
+/// dialog をこの経路に統一している (commit 8b9f9d0 の export 修正を全 dialog へ展開)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileDialogKind {
+    /// プロジェクト (.daw) を開く。
+    OpenProject,
+    /// video export の mp4 出力先 (Windows のみ到達)。
+    ExportMp4,
+    /// WAV 書き出し。
+    ExportWav,
+    /// MIDI (SMF) 書き出し。
+    ExportMidi,
+    /// オーディオ取り込み (複数可)。
+    ImportAudio,
+    /// 動画取り込み (複数可)。
+    ImportVideo,
+    /// 画像取り込み (複数可)。
+    ImportImage,
+    /// Audio Editor の "Add From Source..."。 取り込み先 clip と挿入位置を保持。
+    AddAudioEvent {
+        clip: ClipRef,
+        position_in_clip_beats: f64,
+    },
+}
+
+/// `spawn_file_dialog` が走らせる rfd dialog の呼び出し種別。
+enum FileDialogMode {
+    Save,
+    PickFile,
+    PickFiles,
 }
 
 impl AppData {
@@ -1714,6 +1755,7 @@ impl AppData {
             snap_live_input: false,
             piano_roll_fold: false,
             export_dialog_open: false,
+            save_as_dialog_open: false,
             #[cfg(windows)]
             main_window_hwnd: None,
             event_proxy,
@@ -3850,13 +3892,19 @@ pub enum AppEvent {
     /// `AppEvent::ExportMp4` once the user picks paths.
     OpenExportMp4Dialog,
 
-    /// `action_open_export_mp4_dialog` が起動した background-thread の保存先
-    /// 選択 dialog の結果。 `Some(path)` = 選択確定、 `None` = キャンセル。 GUI
-    /// スレッドで受けて video export フロー (`action_begin_export_mp4`) を開始
-    /// する。 save dialog を GUI スレッドで同期に開くと、 dialog 自身のモーダル
-    /// メッセージポンプが preview window の WM_PAINT flood を捌き続けて入力が
-    /// 枯れ、 数分フリーズするため別スレッド化した。
-    ExportMp4PathChosen {
+    /// 別スレッドで開いた native file dialog の結果。 `kind` で振り分け、 `paths`
+    /// は選択された path 群 (空 = キャンセル)。 dialog を GUI スレッドで同期に開くと
+    /// preview window 等の再描画 flood で modal pump が枯れてフリーズするため、 全
+    /// native file dialog をこの経路 (別スレッド + owner-modal) に統一している。
+    FileDialogResult {
+        kind: FileDialogKind,
+        paths: Vec<PathBuf>,
+    },
+    /// `action_save_as` が別スレッドで解決した最終保存先 (.daw のフルパス)。 save
+    /// dialog + 上書き確認 (MessageDialog) を worker thread で済ませ、 `Some(path)`
+    /// で確定、 `None` でキャンセル / 上書き拒否。 GUI スレッドで `create_dir_all` +
+    /// `begin_save` を行う。
+    SaveAsResolved {
         path: Option<PathBuf>,
     },
 
@@ -5074,16 +5122,36 @@ impl AppData {
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
             }
-            AppEvent::ExportMp4PathChosen { path } => {
-                // background-thread の save dialog から戻った保存先。 二重起動
-                // ガードを解除し、 Some なら export フローを開始、 None (キャンセル)
-                // なら status に出すだけ。
-                self.export_dialog_open = false;
-                if let Some(output_path) = path {
-                    self.action_begin_export_mp4(output_path);
-                } else {
-                    self.status_message =
-                        "Video export をキャンセルしました".into();
+            AppEvent::FileDialogResult { kind, paths } => {
+                self.handle_file_dialog_result(kind, paths);
+            }
+            AppEvent::SaveAsResolved { path } => {
+                self.save_as_dialog_open = false;
+                let Some(path) = path else {
+                    // Save As キャンセル → 「保存して終了」 の終了意図を取り消し、
+                    // アプリに留まる (旧同期フローの「何もしない」 と同義)。
+                    self.quit_after_save = false;
+                    return;
+                };
+                if let Some(dir) = path.parent()
+                    && let Err(e) = std::fs::create_dir_all(dir)
+                {
+                    self.status_message = format!(
+                        "プロジェクトフォルダの作成に失敗: {} ({e})",
+                        dir.display()
+                    );
+                    // 保存できないなら終了しない (データ損失回避)。
+                    self.quit_after_save = false;
+                    return;
+                }
+                self.begin_save(path);
+                // 「保存して終了」 由来の終了意図があるとき: plugin 無しは begin_save が
+                // 同期保存して is_dirty が下りるので即終了。 plugin 有りは
+                // has_pending_save が立ち、 on_all_states 完了ハンドラ (既存) が終了
+                // させる。
+                if self.quit_after_save && !self.is_dirty && !self.has_pending_save() {
+                    self.should_quit = true;
+                    self.quit_after_save = false;
                 }
             }
             AppEvent::ExportMp4 { output_path, audio_wav } => {
@@ -5650,13 +5718,12 @@ impl AppData {
     }
 
     fn action_open(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("daw", &["daw"])
-            .pick_file()
-        else {
-            return;
-        };
-        self.action_open_path(path);
+        let dialog = rfd::FileDialog::new().add_filter("daw", &["daw"]);
+        self.spawn_file_dialog(
+            dialog,
+            FileDialogMode::PickFile,
+            FileDialogKind::OpenProject,
+        );
     }
 
     /// Phase 6 review fix: project load 直後に `self.song.audio_sources` 全件
@@ -6413,6 +6480,11 @@ impl AppData {
             self.should_quit = true;
         } else if self.has_pending_save() {
             self.quit_after_save = true;
+        } else if self.save_as_dialog_open {
+            // 新規 project で Save As ダイアログが非同期に開いた。 dialog 解決後の
+            // begin_save 完了 (`SaveAsResolved`) で終了するよう intent を立てる。
+            // dialog をキャンセルしたら `SaveAsResolved` 側でこの intent を取り消す。
+            self.quit_after_save = true;
         }
     }
 
@@ -6436,48 +6508,60 @@ impl AppData {
     /// の input 欄問題) を同時に解消する。 仕様書:
     /// `docs/plan_audio_clip.md` §5 / §13 Q2。
     fn action_save_as(&mut self) {
-        let Some(picked) = rfd::FileDialog::new()
+        if self.save_as_dialog_open {
+            return;
+        }
+        self.save_as_dialog_open = true;
+        let dialog = rfd::FileDialog::new()
             .add_filter("daw", &["daw"])
-            .set_title("プロジェクト名 / 保存先を選択 (フォルダは自動作成されます)")
-            .save_file()
-        else {
-            return;
-        };
-        let Some(stem) = picked
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
-            self.status_message = "プロジェクト名を取得できませんでした".to_string();
-            return;
-        };
-        let parent = picked
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let project_dir = parent.join(&stem);
-        let path = project_dir.join(format!("{stem}.daw"));
-        if path.exists() {
-            let res = rfd::MessageDialog::new()
-                .set_title("プロジェクトの上書き確認")
-                .set_description(format!(
-                    "{} は既に存在します。 上書きしますか？",
-                    path.display()
-                ))
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show();
-            if res != rfd::MessageDialogResult::Yes {
-                return;
-            }
-        }
-        if let Err(e) = std::fs::create_dir_all(&project_dir) {
-            self.status_message = format!(
-                "プロジェクトフォルダの作成に失敗: {} ({e})",
-                project_dir.display()
-            );
-            return;
-        }
-        self.begin_save(path);
+            .set_title("プロジェクト名 / 保存先を選択 (フォルダは自動作成されます)");
+        // save dialog + 上書き確認 (MessageDialog) を **worker thread** で開く。 GUI
+        // スレッドで同期に開くと preview window 等の再描画 flood で modal pump が枯れて
+        // フリーズするため (spawn_file_dialog と同じ理由)。 ここは 2 段 dialog + path
+        // 導出があるので generic helper ではなく専用 worker。 最終 .daw path を
+        // `SaveAsResolved` で返し、 GUI スレッドで create_dir_all + begin_save する。
+        #[cfg(windows)]
+        let parent_hwnd = self.main_window_hwnd;
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            #[cfg(windows)]
+            let dialog = match parent_hwnd {
+                Some(hwnd) => dialog.set_parent(&Win32Parent { hwnd }),
+                None => dialog,
+            };
+            let resolved = (|| {
+                let picked = dialog.save_file()?;
+                let stem = picked
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)?;
+                let parent = picked
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let project_dir = parent.join(&stem);
+                let path = project_dir.join(format!("{stem}.daw"));
+                if path.exists() {
+                    let confirm = rfd::MessageDialog::new()
+                        .set_title("プロジェクトの上書き確認")
+                        .set_description(format!(
+                            "{} は既に存在します。 上書きしますか？",
+                            path.display()
+                        ))
+                        .set_buttons(rfd::MessageButtons::YesNo);
+                    #[cfg(windows)]
+                    let confirm = match parent_hwnd {
+                        Some(hwnd) => confirm.set_parent(&Win32Parent { hwnd }),
+                        None => confirm,
+                    };
+                    if confirm.show() != rfd::MessageDialogResult::Yes {
+                        return None;
+                    }
+                }
+                Some(path)
+            })();
+            proxy.send(AppEvent::SaveAsResolved { path: resolved });
+        });
     }
 
     /// Song 内に CLAP/VST3 plugin が 1 つでもあるか。 何も無ければ
@@ -15465,21 +15549,8 @@ impl AppData {
     ///   4. On `ExportWavComplete` the handler flips render mode back
     ///      to Realtime (see `AppEvent::ExportWavComplete` arm).
     fn action_export_wav(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("WAV", &["wav"])
-            .save_file()
-        else {
-            return;
-        };
-        self.status_message = "WAV 書き出し中...".to_string();
-        // Make sure daw_audio has the latest song snapshot before the
-        // freewheel run starts.
-        let song = self.song.clone();
-        self.send_audio(MainToChild::LoadSong(song));
-        self.send_plugin(MainToChild::SetRenderMode(
-            common::protocol::RenderMode::Offline,
-        ));
-        self.send_audio(MainToChild::ExportWav { path });
+        let dialog = rfd::FileDialog::new().add_filter("WAV", &["wav"]);
+        self.spawn_file_dialog(dialog, FileDialogMode::Save, FileDialogKind::ExportWav);
     }
 
     /// Phase 7 B4 Step E (2026-05-13): File → Export MIDI...
@@ -15487,22 +15558,8 @@ impl AppData {
     /// で SMF1 書き出し。 audio engine への IPC 不要 (= GUI process 単独で
     /// `Song` snapshot を SMF に変換)。 失敗時は status_message に error。
     fn action_export_midi(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("MIDI", &["mid", "midi"])
-            .save_file()
-        else {
-            return;
-        };
-        match crate::midi_export::export_midi(&self.song, &path) {
-            Ok(()) => {
-                self.status_message =
-                    format!("MIDI 書き出し完了: {}", path.display());
-            }
-            Err(e) => {
-                self.status_message = format!("MIDI 書き出し失敗: {e}");
-                tracing::error!(error = %e, path = %path.display(), "MIDI export failed");
-            }
-        }
+        let dialog = rfd::FileDialog::new().add_filter("MIDI", &["mid", "midi"]);
+        self.spawn_file_dialog(dialog, FileDialogMode::Save, FileDialogKind::ExportMidi);
     }
 
     /// Import one or more audio files into the song (Phase 1 PR3).
@@ -15528,19 +15585,14 @@ impl AppData {
     /// した場合は no-op。 起点が違うだけで採番 / dedup / コピー / decode
     /// は drag&drop と完全に同じ pipeline。
     fn action_open_import_audio_dialog(&mut self) {
-        let Some(paths) = rfd::FileDialog::new()
+        let dialog = rfd::FileDialog::new()
             .add_filter("WAV", &["wav"])
-            .set_title("Import Audio")
-            .pick_files()
-        else {
-            return;
-        };
-        if paths.is_empty() {
-            return;
-        }
-        // dialog 経由は位置情報がないので target_track_idx / target_beat = None
-        // (= cursor_track / playhead にフォールバック)。
-        self.action_import_audio(paths, None, None);
+            .set_title("Import Audio");
+        self.spawn_file_dialog(
+            dialog,
+            FileDialogMode::PickFiles,
+            FileDialogKind::ImportAudio,
+        );
     }
 
     /// PR-D 段階 3: Audio Editor の context menu "Add From Source..."。
@@ -15554,18 +15606,17 @@ impl AppData {
         target: ClipRef,
         position_in_clip_beats: f64,
     ) {
-        let Some(path) = rfd::FileDialog::new()
+        let dialog = rfd::FileDialog::new()
             .add_filter("WAV", &["wav"])
-            .set_title("Add Audio Event")
-            .pick_file()
-        else {
-            return;
-        };
-        self.handle_event(AppEvent::AddAudioEventFromFile {
-            clip: target,
-            path,
-            position_in_clip_beats,
-        });
+            .set_title("Add Audio Event");
+        self.spawn_file_dialog(
+            dialog,
+            FileDialogMode::PickFile,
+            FileDialogKind::AddAudioEvent {
+                clip: target,
+                position_in_clip_beats,
+            },
+        );
     }
 
     fn action_import_audio(
@@ -15850,18 +15901,14 @@ impl AppData {
     /// path を `action_import_video` に転送する。
     #[cfg(windows)]
     fn action_open_import_video_dialog(&mut self) {
-        let Some(paths) = rfd::FileDialog::new()
+        let dialog = rfd::FileDialog::new()
             .add_filter("Video", &["mp4", "mov", "mkv", "webm", "m4v", "avi"])
-            .set_title("Import Video...")
-            .pick_files()
-        else {
-            return;
-        };
-        if paths.is_empty() {
-            return;
-        }
-        // dialog 経由は位置情報がないので target_beat = None (= playhead)。
-        self.action_import_video(paths, None);
+            .set_title("Import Video...");
+        self.spawn_file_dialog(
+            dialog,
+            FileDialogMode::PickFiles,
+            FileDialogKind::ImportVideo,
+        );
     }
 
     /// v13 (`docs/plan_image_overlay.md` §P2): import one or more
@@ -16094,22 +16141,17 @@ impl AppData {
     /// された path を `action_import_image` に転送する。 OS-neutral
     /// (= image crate のみ、 cfg(windows) 不要)。
     fn action_open_import_image_dialog(&mut self) {
-        let Some(paths) = rfd::FileDialog::new()
+        let dialog = rfd::FileDialog::new()
             .add_filter(
                 "Image",
                 &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "tga", "gif"],
             )
-            .set_title("Import Image...")
-            .pick_files()
-        else {
-            return;
-        };
-        if paths.is_empty() {
-            return;
-        }
-        // dialog 経由は drop 位置情報が無いので target_track_idx / target_beat = None
-        // (= 新規 track を先頭に作って貼る、従来挙動)。
-        self.action_import_image(paths, None, None);
+            .set_title("Import Image...");
+        self.spawn_file_dialog(
+            dialog,
+            FileDialogMode::PickFiles,
+            FileDialogKind::ImportImage,
+        );
     }
 
     /// File menu → "Export Video..." (`docs/plan_video.md` P8)。
@@ -16137,29 +16179,9 @@ impl AppData {
             .add_filter("MP4 Video", &["mp4"])
             .set_file_name(&default_name)
             .set_title("Export Video to MP4...");
-        // native save dialog を GUI スレッドで同期に開くと、 dialog 自身のモーダル
-        // メッセージポンプが GUI スレッド上で回り、 preview window + main window の
-        // WM_PAINT flood (2 枚の wgpu 描画ループ) を捌き続けて dialog の入力処理
-        // (保存ボタン → 上書き確認) が枯れ、 数分フリーズする (= preview window を
-        // 開いた状態での再現条件)。 dialog を専用スレッドで **owner-modal** に開き
-        // (main window を parent に渡す)、 結果を `ExportMp4PathChosen` で GUI
-        // スレッドへ返す。 これで GUI スレッドの event loop は preview の再描画を
-        // 自分のペースで回し続け、 dialog の pump とは完全に分離される。 export
-        // render を background thread 化済み (`action_export_mp4`) なのと同じ idiom。
-        // `rfd::FileDialog` は `Send` (set_parent で raw HWND を吸い出して格納) なので
-        // 構築済み dialog をそのまま thread へ move できる。
-        #[cfg(windows)]
-        let dialog = match self.main_window_hwnd {
-            Some(hwnd) => dialog.set_parent(&Win32Parent { hwnd }),
-            None => dialog,
-        };
         self.export_dialog_open = true;
         self.status_message = "保存先を選択中...".into();
-        let proxy = self.event_proxy.clone();
-        std::thread::spawn(move || {
-            let path = dialog.save_file();
-            proxy.send(AppEvent::ExportMp4PathChosen { path });
-        });
+        self.spawn_file_dialog(dialog, FileDialogMode::Save, FileDialogKind::ExportMp4);
     }
 
     /// `ExportMp4PathChosen` で保存先が確定したときの video export 後段。 旧
@@ -16182,6 +16204,115 @@ impl AppData {
             common::protocol::RenderMode::Offline,
         ));
         self.send_audio(MainToChild::ExportWav { path: temp_wav });
+    }
+
+    /// native file dialog を **別スレッド + owner-modal** で開く共通処理。 dialog を
+    /// GUI スレッドで同期に開くと、 dialog 自身のモーダルメッセージポンプが GUI
+    /// スレッド上で回り、 preview window 等の 2 枚目 top-level window の WM_PAINT
+    /// flood を捌き続けて dialog の入力 (保存ボタン → 上書き確認) が枯れ、 数分
+    /// フリーズする (preview window を開いた状態での再現条件)。 構築済み dialog
+    /// (`rfd::FileDialog` は `Send`) を専用スレッドへ move し、 main window を
+    /// `set_parent` で owner-modal 化して開く。 結果は `FileDialogResult { kind,
+    /// paths }` で GUI スレッドへ返し、 `handle_file_dialog_result` が振り分ける。
+    fn spawn_file_dialog(
+        &self,
+        dialog: rfd::FileDialog,
+        mode: FileDialogMode,
+        kind: FileDialogKind,
+    ) {
+        #[cfg(windows)]
+        let dialog = match self.main_window_hwnd {
+            Some(hwnd) => dialog.set_parent(&Win32Parent { hwnd }),
+            None => dialog,
+        };
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            let paths: Vec<PathBuf> = match mode {
+                FileDialogMode::Save => dialog.save_file().into_iter().collect(),
+                FileDialogMode::PickFile => dialog.pick_file().into_iter().collect(),
+                FileDialogMode::PickFiles => dialog.pick_files().unwrap_or_default(),
+            };
+            proxy.send(AppEvent::FileDialogResult { kind, paths });
+        });
+    }
+
+    /// `FileDialogResult` を kind で振り分け、 旧 dialog action の後段ロジックを
+    /// GUI スレッドで実行する。 `paths` 空 = キャンセル。
+    fn handle_file_dialog_result(&mut self, kind: FileDialogKind, paths: Vec<PathBuf>) {
+        match kind {
+            FileDialogKind::OpenProject => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.action_open_path(path);
+                }
+            }
+            FileDialogKind::ExportMp4 => {
+                // 二重起動ガードを解除し、 Some なら export フロー開始。
+                self.export_dialog_open = false;
+                match paths.into_iter().next() {
+                    Some(output_path) => self.action_begin_export_mp4(output_path),
+                    None => {
+                        self.status_message =
+                            "Video export をキャンセルしました".into();
+                    }
+                }
+            }
+            FileDialogKind::ExportWav => {
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+                self.status_message = "WAV 書き出し中...".to_string();
+                // freewheel 開始前に最新 song snapshot を daw_audio へ送る。
+                let song = self.song.clone();
+                self.send_audio(MainToChild::LoadSong(song));
+                self.send_plugin(MainToChild::SetRenderMode(
+                    common::protocol::RenderMode::Offline,
+                ));
+                self.send_audio(MainToChild::ExportWav { path });
+            }
+            FileDialogKind::ExportMidi => {
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+                match crate::midi_export::export_midi(&self.song, &path) {
+                    Ok(()) => {
+                        self.status_message =
+                            format!("MIDI 書き出し完了: {}", path.display());
+                    }
+                    Err(e) => {
+                        self.status_message = format!("MIDI 書き出し失敗: {e}");
+                        tracing::error!(error = %e, path = %path.display(), "MIDI export failed");
+                    }
+                }
+            }
+            FileDialogKind::ImportAudio => {
+                if !paths.is_empty() {
+                    // dialog 経由は位置情報がないので target = None (cursor / playhead)。
+                    self.action_import_audio(paths, None, None);
+                }
+            }
+            FileDialogKind::ImportVideo => {
+                if !paths.is_empty() {
+                    self.action_import_video(paths, None);
+                }
+            }
+            FileDialogKind::ImportImage => {
+                if !paths.is_empty() {
+                    self.action_import_image(paths, None, None);
+                }
+            }
+            FileDialogKind::AddAudioEvent {
+                clip,
+                position_in_clip_beats,
+            } => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.handle_event(AppEvent::AddAudioEventFromFile {
+                        clip,
+                        path,
+                        position_in_clip_beats,
+                    });
+                }
+            }
+        }
     }
 
     /// Synchronous mp4 render (`docs/plan_video.md` P8). Blocks the
