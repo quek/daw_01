@@ -475,6 +475,7 @@ fn pr_view(snap: SnapConfig) -> PianoRollView {
         loop_range: None,
         scale: None,
         snap_pitch_during_drag: false,
+        sub_grid_interval_beats: None,
     }
 }
 

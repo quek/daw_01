@@ -417,6 +417,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// dB 目盛り: **tick は L バーの左**、 **数字は R バーの右**、 **0dB はバーを横切る横線**。
     /// y は `meter_frac` (curve) をバーと共有するので必ず一致する (SSoT)。 `content` は ty マッピング、
     /// `clip` は外側 rect (端ラベルが vpad 領域でも見える)。
+    ///
+    /// (M14 Phase 123 / daw_01 #099) 高さが縮むと dB 数字が縦に重なるため、 **実ピクセル位置基準の
+    /// 貪欲間引き** ([`greedy_thin_scale`]) を行う: ① 全 `labels_db` の `ty` を解決 → ② 0dB を
+    /// アンカーに上下へ `|Δty| >= min_gap` (= line_height 相当) の要素のみ採用 → ③ 採用分だけ
+    /// tick + 数字を描画。 非線形カーブにより上は細かく下は粗く間引かれる (望ましい)。 tick も数字も
+    /// 一緒に gate する (採用集合で両方を制御)。 **0dB は常にアンカーで採用** + **0dB 横断線は採用に
+    /// 関係なく常時描画**。 既存 `has_label_room` (横余白) は維持し、 数字は「採用 AND has_label_room」、
+    /// tick は採用集合のみ。
     fn draw_meter_scale(
         &mut self,
         content: Rect,
@@ -429,21 +437,31 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let tick_right = left_x - 1.0; // L バー左端の 1px 左
         let label_left = bars_right + 3.0; // R バー右端の 3px 右
         let has_label_room = (clip.x + clip.w - label_left) > SCALE_FONT_PX * 0.8;
-        for &tick_db in scale.labels_db {
-            let f = meter_frac(tick_db, style);
-            let ty = (content.y + content.h - content.h * f).round(); // 整数 px で crisp
+
+        // ① 全ラベルの ty を実ピクセルで解決 (labels_db と同順 = 上→下)。
+        let tys: Vec<f32> = scale
+            .labels_db
+            .iter()
+            .map(|&db| (content.y + content.h - content.h * meter_frac(db, style)).round())
+            .collect();
+
+        // ② 0dB をアンカーに貪欲間引き。 min_gap は line_height (= SCALE_FONT_PX + 2) 相当。
+        //    アンカーは |dB| 最小 (= 0dB に最も近い) ラベル。 0dB が無くても中央寄りを 1 つ残す。
+        let anchor = scale
+            .labels_db
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map_or(0, |(i, _)| i);
+        let adopted = greedy_thin_scale(&tys, anchor, SCALE_FONT_PX + 2.0);
+
+        // ③ 採用分だけ描画。 0dB 横断線のみ採用に関係なく常時描画。
+        for (i, &tick_db) in scale.labels_db.iter().enumerate() {
+            let ty = tys[i];
             let is_zero = scale.emphasize_zero && tick_db.abs() < 1e-3;
-            // 左 tick (2px、 アンチエイリアスで消えない)。 0dB は色だけ明色。
-            let tick_left = (tick_right - SCALE_TICK_LEN).max(clip.x);
-            self.push_rect(RectCommand {
-                rect: Rect { x: tick_left, y: ty - 1.0, w: (tick_right - tick_left).max(1.0), h: 2.0 },
-                fill: if is_zero { style.scale_zero_color } else { style.scale_tick_color },
-                border: Color::TRANSPARENT,
-                border_width: 0.0,
-                radius: [0.0; 4],
-                clip_rect: Some(clip),
-            });
-            // 0dB は L/R 両バーを横切る 3px 横線。
+            // 0dB は L/R 両バーを横切る 3px 横線 (高さ極小でも必ず残る)。
             if is_zero {
                 self.push_rect(RectCommand {
                     rect: Rect { x: left_x, y: ty - 1.5, w: (bars_right - left_x).max(1.0), h: 3.0 },
@@ -454,6 +472,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     clip_rect: Some(clip),
                 });
             }
+            if !adopted[i] {
+                continue;
+            }
+            // 左 tick (2px、 アンチエイリアスで消えない)。 0dB は色だけ明色。
+            let tick_left = (tick_right - SCALE_TICK_LEN).max(clip.x);
+            self.push_rect(RectCommand {
+                rect: Rect { x: tick_left, y: ty - 1.0, w: (tick_right - tick_left).max(1.0), h: 2.0 },
+                fill: if is_zero { style.scale_zero_color } else { style.scale_tick_color },
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: Some(clip),
+            });
             if has_label_room {
                 let label = format_scale_db(tick_db);
                 let label_top =
@@ -531,6 +562,39 @@ fn curve_fraction(db: f32, curve: &[(f32, f32)]) -> f32 {
         }
     }
     curve.last().map_or(0.0, |&(_, f)| f)
+}
+
+/// `draw_meter_scale` の縦間引き (純粋ロジック、 test 可能、 daw_01 #099)。
+///
+/// `tys` は各 dB ラベルの実ピクセル y (`labels_db` と同順 = 上→下)、 `anchor` は常時採用する
+/// index (= 0dB に最も近いラベル)。 戻り値は各ラベルを描画するか。 anchor から上下それぞれへ
+/// 走査し、 **直近採用要素**との `|Δty| >= min_gap` を満たす要素のみ採用する貪欲法。 採用集合内の
+/// 隣接要素は構造上必ず `>= min_gap` 離れる (= 数字が縦に重ならない)。 非線形カーブ下では上
+/// (0dB 近傍) は細かく、 下 (-60dB 近傍) は粗く間引かれる。 高さ極小でも anchor は必ず採用される。
+fn greedy_thin_scale(tys: &[f32], anchor: usize, min_gap: f32) -> Vec<bool> {
+    let mut adopted = vec![false; tys.len()];
+    if tys.is_empty() {
+        return adopted;
+    }
+    let anchor = anchor.min(tys.len() - 1);
+    adopted[anchor] = true;
+    // anchor より上 (index 降順)。
+    let mut last = tys[anchor];
+    for i in (0..anchor).rev() {
+        if (tys[i] - last).abs() >= min_gap {
+            adopted[i] = true;
+            last = tys[i];
+        }
+    }
+    // anchor より下 (index 昇順)。
+    last = tys[anchor];
+    for i in (anchor + 1)..tys.len() {
+        if (tys[i] - last).abs() >= min_gap {
+            adopted[i] = true;
+            last = tys[i];
+        }
+    }
+    adopted
 }
 
 /// メーターの dB→frac。 `scale = Some` なら非線形カーブ、 `None` (clean bar) なら線形 `db_range`。
@@ -814,5 +878,85 @@ mod tests {
             scene.iter_glyphs().any(|g| g.text.as_ref() == "-inf"),
             "click reset 後は -inf"
         );
+    }
+
+    // ============================================================
+    // (M14 Phase 123 / daw_01 #099) 縦間引き (greedy_thin_scale + frame レベル)
+    // ============================================================
+
+    #[test]
+    fn greedy_thin_scale_keeps_anchor_and_spaces_min_gap() {
+        // 等間隔 5px の 10 要素、 anchor=中央 (idx 4)、 min_gap=11。
+        let tys: Vec<f32> = (0..10).map(|i| i as f32 * 5.0).collect();
+        let adopted = greedy_thin_scale(&tys, 4, 11.0);
+        assert!(adopted[4], "anchor は必ず採用");
+        // 採用要素の ty 差は全て >= min_gap (= 縦重なり無し)。
+        let kept: Vec<f32> =
+            tys.iter().zip(adopted.iter()).filter_map(|(&t, &a)| a.then_some(t)).collect();
+        assert_eq!(kept, vec![5.0, 20.0, 35.0], "5px 刻みでは 3 つ飛ばしで採用");
+        for w in kept.windows(2) {
+            assert!(w[1] - w[0] >= 11.0 - 1e-3, "採用間隔 {} >= min_gap", w[1] - w[0]);
+        }
+    }
+
+    #[test]
+    fn greedy_thin_scale_empty_and_single_and_anchor_clamp() {
+        assert!(greedy_thin_scale(&[], 0, 11.0).is_empty());
+        assert_eq!(greedy_thin_scale(&[7.0], 0, 11.0), vec![true]);
+        // anchor が範囲外でも clamp して anchor 採用。
+        assert_eq!(greedy_thin_scale(&[7.0], 5, 11.0), vec![true]);
+    }
+
+    /// scale=Some を `rect.h` を変えて render し Scene を返す (silence = peak-hold 線なし)。
+    fn scale_scene(h: f32) -> Scene {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let rect = Rect { x: 0.0, y: 0.0, w: 40.0, h };
+        let style = LevelMeterStyle { scale: Some(MeterScale::default()), ..Default::default() };
+        run_stereo(&mut host, rect, 0.0, 0.0, style, PointerFrame::default())
+    }
+
+    #[test]
+    fn scale_thins_when_short_no_label_overlap() {
+        // 小 rect.h=60 → 採用ラベルが減り、 隣接ラベル top 差は line_height (= 11px) 以上。
+        let scene = scale_scene(60.0);
+        let mut tops: Vec<f32> = scene.iter_glyphs().map(|g| g.top).collect();
+        tops.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(tops.len() >= 2, "少なくとも 2 ラベルは残る: got {}", tops.len());
+        assert!(tops.len() < 12, "12 全ては出ない (間引かれる): got {}", tops.len());
+        for w in tops.windows(2) {
+            assert!(
+                w[1] - w[0] >= (SCALE_FONT_PX + 2.0) - 0.01,
+                "隣接ラベル top 差 {} >= min_gap",
+                w[1] - w[0]
+            );
+        }
+    }
+
+    #[test]
+    fn scale_tick_count_equals_label_count() {
+        // tick (h≈2、 L バー左) と数字は同じ採用集合で gate されるので本数一致。
+        let scene = scale_scene(60.0);
+        let (left_x, _, _) = stereo_geom(Rect { x: 0.0, y: 0.0, w: 40.0, h: 60.0 });
+        let ticks = scene
+            .iter_rects()
+            .filter(|r| (r.rect.h - 2.0).abs() < 0.01 && r.rect.x + r.rect.w <= left_x + 0.5)
+            .count();
+        let labels = scene.iter_glyphs().count();
+        assert_eq!(ticks, labels, "tick {ticks} == label {labels}");
+    }
+
+    #[test]
+    fn scale_keeps_zero_label_when_tiny() {
+        // 極小 rect.h=24 → ほぼ 0dB のみ採用。 "0" は必ず残る。
+        let scene = scale_scene(24.0);
+        let labels: Vec<&str> = scene.iter_glyphs().map(|g| g.text.as_ref()).collect();
+        assert!(labels.contains(&"0"), "極小高さでも 0dB ラベルは残る: got {labels:?}");
+    }
+
+    #[test]
+    fn scale_shows_all_labels_when_tall() {
+        // 大 rect.h=400 → 全 12 ラベル (回帰)。
+        let scene = scale_scene(400.0);
+        assert_eq!(scene.iter_glyphs().count(), 12, "高さ十分なら全 12 ラベル");
     }
 }

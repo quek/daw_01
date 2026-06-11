@@ -120,6 +120,9 @@ impl PianoRollModel {
             // M14 Phase 70b / daw_01 #042 follow-up: Highlight + Snap on Draw 相当の drag preview snap。
             // S key で flip (下記 build_ui)。 demo 用、 daw_01 では `app.snap_on_draw` を流す想定。
             snap_pitch_during_drag: self.snap_pitch_during_drag,
+            // M14 Phase 124 / daw_01 #100: 3 段目 subdivision グリッド (1/16 = 0.25 拍間隔) を
+            // demo 表示。 daw_01 では snap 値から `piano_roll_subgrid_interval` で算出して渡す想定。
+            sub_grid_interval_beats: Some(0.25),
         }
     }
 }

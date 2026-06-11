@@ -6445,6 +6445,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         mapping,
                         sample_viewport,
                         grid_style,
+                        // M14 Phase 124 (#100): subdivision はピアノロール限定なので arrangement は None。
+                        None,
                     );
                     draw_clips(hctx, &tracks_owned, &tops_owned_for_heavy, view_copy, lanes, &style_copy);
                     // M14 Phase 63k (#025): audio_edit が Some の clip に dB handle line + fade envelope を重ねる。

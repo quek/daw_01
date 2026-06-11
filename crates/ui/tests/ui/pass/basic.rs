@@ -166,6 +166,8 @@ fn main() {
                 scale: None,
                 // M14 Phase 70b / daw_01 #042 follow-up: drag preview snap toggle (Copy bool)。
                 snap_pitch_during_drag: false,
+                // M14 Phase 124 / daw_01 #100: subdivision interval も Option<f64> (Copy) で no-Clone 互換。
+                sub_grid_interval_beats: None,
             };
             let style = PianoRollStyle::default();
             let _ = ui.piano_roll(

@@ -43,7 +43,7 @@ use crate::time::TimeMapping;
 use crate::ui::Ui;
 use crate::viewport::ViewportState1D;
 use crate::widgets::drag_rect::DragRect;
-use crate::widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
+use crate::widgets::time_grid::{BarBeatGridStyle, SubGridSpec, TimeRulerStyle};
 use crate::widgets::waveform::{WaveformResponse, WaveformSource, WaveformStyle, WaveformView};
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -221,6 +221,7 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     }
 
     /// `Ui::bar_beat_grid` の delegate (M13 Phase 55、cached layer 内で呼ぶ用)。
+    /// (M14 Phase 124 / daw_01 #100) `sub` で subdivision (3 段目) を追加可。
     pub fn bar_beat_grid(
         &mut self,
         id: impl Hash,
@@ -228,8 +229,9 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
         mapping: TimeMapping,
         viewport: ViewportState1D,
         style: BarBeatGridStyle,
+        sub: Option<SubGridSpec>,
     ) {
-        self.ui.bar_beat_grid(id, rect, mapping, viewport, style);
+        self.ui.bar_beat_grid(id, rect, mapping, viewport, style, sub);
     }
 
     // === M9 P1-3: input / popup / shortcut / clipboard / dialog / history pull API ===

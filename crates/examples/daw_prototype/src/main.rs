@@ -2601,7 +2601,7 @@ fn draw_piano_roll_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pan
         radius: [0.0; 4],
         clip_rect: None,
     });
-    ui.bar_beat_grid("pr_grid", grid_rect, mapping, viewport, BarBeatGridStyle::default());
+    ui.bar_beat_grid("pr_grid", grid_rect, mapping, viewport, BarBeatGridStyle::default(), None);
 
     // keyboard sidebar
     ui.push_rect(RectCommand {

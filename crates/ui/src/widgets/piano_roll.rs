@@ -55,7 +55,7 @@ use crate::widgets::ruler_ops::{
     LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
     compute_loop_drag_endpoints, loop_band_hit_kind,
 };
-use crate::widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
+use crate::widgets::time_grid::{BarBeatGridStyle, SubGridSpec, TimeRulerStyle};
 
 // ============================================================
 // Public types
@@ -366,6 +366,14 @@ pub struct PianoRollView {
     /// `scale = None` でも無視。 drag 中 `pointer.modifiers.alt` (= `nd.last_alt`) で snap 一時
     /// 無効 (= `snap_beat` と同 policy)。 距離 tie は **上を優先** (Cubase 流)。
     pub snap_pitch_during_drag: bool,
+    /// (M14 Phase 124 / daw_01 #100) **3 段目グリッド** (subdivision) の線間隔 (拍単位)。
+    /// `Some(0.25)` で 1/16、 `Some(2.0/3.0)` で 1/4T (三連)、 `Some(0.75)` で付点 8 分等。
+    /// スナップ値に追従させる用途 (caller が `snap` から算出して渡す)。 `None` (default) で
+    /// subdivision 非表示 = bar + beat の 2 段 (旧 API 完全互換)。 `interval_beats >= 1.0` を
+    /// 渡しても拍線と重複するだけなので caller 側で `None` 化するのが望ましい。 ズーム退避は
+    /// widget 内 (`px_per_interval < 6px` で自動的に 2 段に落ちる)。 線色・幅は
+    /// [`PianoRollStyle::sub_line`] / [`PianoRollStyle::sub_line_width_px`]。
+    pub sub_grid_interval_beats: Option<f64>,
 }
 
 /// piano roll が user に発行する Edit 要求の種別。
@@ -487,6 +495,12 @@ pub struct PianoRollStyle {
     pub beat_line: Color,
     pub bar_line_width_px: f32,
     pub beat_line_width_px: f32,
+    /// (M14 Phase 124 / daw_01 #100) **3 段目グリッド** (subdivision) の線色。
+    /// `beat_line` より淡くするのが通例 (default `rgba(1,1,1,0.06)`)。
+    /// `PianoRollView::sub_grid_interval_beats == Some(_)` のときのみ使用。
+    pub sub_line: Color,
+    /// (M14 Phase 124 / daw_01 #100) subdivision 線の幅 (px、 default `1.0`)。
+    pub sub_line_width_px: f32,
     pub note_fill_fn: NoteFillFn,
     pub note_border_radius_px: f32,
     pub note_selected_fill: Color,
@@ -601,6 +615,9 @@ impl Default for PianoRollStyle {
             beat_line: Color::rgba(1.0, 1.0, 1.0, 0.12),
             bar_line_width_px: 1.5,
             beat_line_width_px: 1.0,
+            // M14 Phase 124 / daw_01 #100: subdivision 線は beat_line (alpha 0.12) より淡く。
+            sub_line: Color::rgba(1.0, 1.0, 1.0, 0.06),
+            sub_line_width_px: 1.0,
             note_fill_fn: default_velocity_color,
             note_border_radius_px: 1.5,
             note_selected_fill: Color::rgb(1.0, 0.85, 0.30),
@@ -1918,6 +1935,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             (sc.root, sc.in_scale_mask, mode_tag)
         });
         let snap_drag_key: u8 = u8::from(view.snap_pitch_during_drag);
+        // (M14 Phase 124 / daw_01 #100) subdivision 間隔を cache key に含める。 cached() は
+        // viewport_key 一致時に内側 (bar_beat_grid 含む) を完全 skip するので、 bar_beat_grid 内の
+        // input_hash だけでは足りず、 ここで invalidate 経路を張る必要がある。 None=0 / Some=bits。
+        let sub_grid_key: u64 = view.sub_grid_interval_beats.map_or(0, f64::to_bits);
         let viewport_key = (
             (
                 b"piano_roll_widget_v3" as &[u8],
@@ -1937,6 +1958,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     u32::from(view.time_sig.1),
                     scale_key,
                     snap_drag_key,
+                    sub_grid_key,
                 ),
             ),
             internal_note_hash,
@@ -1962,6 +1984,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // M14 Phase 63m (daw_01 #027): zoom 連動の beat 線間引き (default 4px)。
             ..BarBeatGridStyle::default()
         };
+        // M14 Phase 124 (#100): 3 段目 subdivision。 caller が拍間隔を渡したときだけ構築
+        // (ズーム退避は bar_beat_grid 内の px_per_interval 判定に委ねる)。 cache 無効化は
+        // viewport_key に interval を含めて行う (下記、 cached が viewport_key で short-circuit
+        // するため bar_beat_grid 内の input_hash だけでは効かない)。
+        let sub_grid_pr: Option<SubGridSpec> = view.sub_grid_interval_beats.and_then(|iv| {
+            (iv > 0.0).then_some(SubGridSpec {
+                interval_beats: iv,
+                color: style.sub_line,
+                line_width: style.sub_line_width_px,
+            })
+        });
         let ruler_style_pr = TimeRulerStyle {
             bg: style.ruler_bg,
             tick_color: style.bar_line,
@@ -2022,6 +2055,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     mapping,
                     sample_viewport,
                     grid_style_pr,
+                    sub_grid_pr,
                 );
                 if ruler_h > 0.0 {
                     hctx.time_ruler(
@@ -3051,6 +3085,7 @@ mod tests {
             loop_range: None,
             scale: None,
             snap_pitch_during_drag: false,
+            sub_grid_interval_beats: None,
         }
     }
 
