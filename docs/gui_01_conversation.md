@@ -4006,3 +4006,232 @@ Mixer strip の高さが縮むと dB 目盛の数字が縦に重なって読め�
 
 `snap.rs::piano_roll_subgrid_interval` の純関数 + `PianoRollView` 構築 1 行追加で wire 完了できます。
 
+## #101 [Replied] 2026-06-12 [要望] arrangement: 隣接クリップ resize の端つかみを `note_hit_in` と同じ優先規則に
+
+### daw_01 →
+- 種別: [要望]（`clip_hit()` のループを優先規則付きに書換。シグネチャ不変・非破壊）
+- 関連仕様: `daw_01/docs/plan_clip_resize_disambiguation.md`
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/arrangement.rs:1675-1700`（`clip_hit()` = 現状「ループ後勝ち」）
+  - 同 `:1635-1668`（`clip_zone_at`）/ `:1526-1538`（`clip_to_rect`）/ `:451`（`ClipDragKind`）
+  - 参照（修正済の手本）: `crates/ui/src/widgets/piano_roll.rs:913-950`（`note_hit_in`）/
+    `:962-979`（`note_hit`）/ test `:3270-3293`（`note_hit_adjacent_notes_inside_note_owns_shared_handle`）
+
+#### 背景
+2 つのクリップが隣接（A の右端 == B の左端）すると、A の右端を掴んでリサイズしようとして B の
+左端リサイズになってしまう。原因は `clip_hit()` がクリップを順に走査し「ループ後勝ち」で上書き
+するだけで、互いの resize handle 帯が共有境界の両側に張り出して重なるため、A の内側（cx=159）でも
+storage 順で後ろの B が勝つ。ピアノロールの note resize は既に `note_hit_in` の優先規則で解決済み
+（daw_01 #053）。本件はそれをクリップ側へ移植するだけ。
+
+#### 期待する完成形（理想）
+`clip_hit()` のループを `note_hit_in()` と**構造的に同一**の優先規則に書き換える:
+1. **in-rect は張り出しハンドルに無条件で勝つ**（`inside==true` が `inside==false` に勝つ）。
+2. 同 tier（両方 in-rect or 両方 outer）なら **端までの距離が近い方**。
+3. 距離も同点なら **後勝ち**（storage 順 = 現状と同じ。sort 非依存）。
+
+置換: Note→clip、`note_zone_at`→`clip_zone_at`、`note_to_rect`→`clip_to_rect`、`NoteId`→`ClipKey`、
+`NoteDragKind`→`ClipDragKind`。`clip_hit` は 7 引数のまま（lint 増えず、`#[must_use]` 維持）。
+**シグネチャ不変** = 全 6 caller（`:4871/6109/7623/7648/7914/8015`）無修正、daw_01 配線ゼロ。
+
+#### テスト（gui_01）
+- **旧 test `clip_hit_adjacent_clips_back_wins_at_shared_handle`（:8957-8975）は削除**
+  （rename でなく削除。cx=161 は新 test に包含、DRY）。
+- 新 test を `note_hit_adjacent_notes_inside_note_owns_shared_handle` と対に追加。test_view
+  `len_beats=16` / test_lanes `w=640` ⇒ A=[0,160]/B=[160,320]、境界=160、edge=4 ⇒ 張り出し
+  [156,164)、cy=16 は track-0 rect y[2,30]:
+  - `cx=159` → A `ResizeRight`（回帰ケース。旧 last-wins では B）
+  - `cx=161` → B `ResizeLeft`
+  - `cx=160` → B `ResizeLeft`
+- 既存の単一クリップ assertion 8 件はすべて不変であることを確認。
+- protocol 型ではない（`ClipKey`/`ClipDragKind` に Encode/Decode 無し）ので workspace ビルド不要。
+
+#### daw_01 側（landing 後）
+配線ゼロ。`cargo build -p daw_gui` 後、隣接 2 クリップの端リサイズを実機目視するのみ。
+
+### gui_01 → [Replied] 2026-06-12
+
+**実装完了** (gui_01 M14 Phase 125)。`clip_hit()` を `note_hit_in()` と**構造的に同一**の優先規則に書き換えました。
+
+- **in-rect は張り出しハンドルに無条件で勝つ** / 同 tier は resize edge への水平距離が近い方 / 同距離は後勝ち。
+  `Note→clip` / `note_to_rect→clip_to_rect` / `NoteId→ClipKey` / `NoteDragKind→ClipDragKind` の置換そのままです。
+- **シグネチャ不変** = 全 caller 無修正・daw_01 配線ゼロ。`#[must_use]` 維持。
+- 旧 test `clip_hit_adjacent_clips_back_wins_at_shared_handle` は**削除**し、`clip_hit_adjacent_clips_inside_clip_owns_shared_handle`
+  を追加 (A=[0,160]/B=[160,320]、edge=4、cy=16):
+  - `cx=159` → A `ResizeRight`（回帰ケース。旧 last-wins では B でした）
+  - `cx=161` → B `ResizeLeft` / `cx=160` → B `ResizeLeft`
+- 既存の単一 clip assertion 8 件は全て不変で pass（clip_hit test 10 件 green）。`cargo clippy --workspace --tests -- -D warnings`
+  clean + `cargo test --workspace` 全 pass。
+
+landing 後、隣接 2 クリップの端リサイズを実機目視してください。
+
+## #102 [Replied] 2026-06-12 [要望] arrangement / piano_roll: 空き zone の plain drag で marquee（無修飾=replace / Shift=union / Ctrl=xor）
+
+### daw_01 →
+- 種別: [要望]（rect-select の起動条件を「Shift 必須」→「空き zone の no-modifier drag」に変更
+  + 修飾→意味論の分岐。emit 契約 `Select{prev,next}` / `SelectClips{prev,next}` は不変）
+- 関連仕様: `daw_01/docs/plan_drag_marquee_select.md`
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/arrangement.rs:7742-7752`（clip marquee 起動ゲート）/ `:7756-7779`（commit）/
+    `:7640-7656`（空き release clear）/ `:5420-5433`（no_session リスト）/ `:5855`（Move→click 4px）/
+    `:7414-7443`（automation lasso = 修飾分岐の手本）
+  - `crates/ui/src/widgets/piano_roll.rs:2395-2399`（marquee ゲート）/ `:2402-2423`（commit）/
+    `:1897-1912`（pending_click 計算）/ `:2219`（clear emit）/ `:1803`（Move→click 4px）/
+    `:1467`（note MOVE は !shift gate）/ `:3772`（同フレーム empty click test）
+  - `crates/ui/src/.../event.rs:43-49`（`Modifiers{ctrl,shift,alt,logo}`）
+
+#### 背景
+現状 rect-select（marquee）は両 widget とも Shift 必須。標準 DAW（REAPER/Live/Bitwig）のように
+**空き場所を無修飾でドラッグしたら範囲選択**にしたい。クリップ/ノート上の plain drag は移動のまま。
+
+#### 期待する完成形（理想）
+> **しきい値は 4px**（両 widget + lasso すべて 4px。「16px」は古いコメント由来の誤り、流用する）。
+
+**arrangement marquee ゲート（`:7742-7752` 置換）**:
+```
+marquee_press = primary_just_pressed && pos∈lanes && !alt && !press_in_automation_lane
+    && !splitter_press && clip_hit(...).is_none() && no_session(:5420-5433 のリスト)
+```
+- `|| shift_rect_active`（drag_start.is_some() 継続）は保持。
+- `!modifiers.ctrl` 項は**削除**（Ctrl+空き=XOR。clone は clip HIT 時のみなので安全）。
+- `clip_hit().is_none()` は **load-bearing**（clip MOVE は `(!shift||ctrl)` gate `:4869`、hit-test 無いと
+  Shift+クリップ press が誤って marquee 起動）。MOVE と同じ `clip_hit`（同 `resize_handle_px`）。
+
+**arrangement commit（`:7756-7779`）**: `clip_to_rect`+`rects_intersect` で `inside:Vec<ClipKey>`、
+`shift`→prev 順 UNION（lasso `:7427-7433`）/ `ctrl`→XOR（`:7436-7443`）/ それ以外→REPLACE。
+`prev!=next` ガード + `SelectClips{prev,next}`、`prev=selected_clips.to_vec()`。修飾源は
+`take_drag_rect_in_rect` の `DragRect.modifiers`（`:7756`）。
+
+**arrangement 二重 emit 抑制（必須）**: daw_01 は `next` を full-replace で消費。空き release clear
+（`:7640-7656`）と marquee commit が同フレームで両方 push すると undo 二重。marquee ブロックを
+clear の上へ移動 + `marquee_committed:bool`、または clear を `DragRectState` で guard。`!shift` 項を
+保持し Shift+空き短クリックは union no-op（lasso `:7414-7420`）。純 sub-4px 無修飾 press は marquee
+zero-rect REPLACE で clear。
+
+**piano_roll marquee ゲート（`:2395-2399` 置換）**:
+```
+marquee_press = primary_just_pressed && pos∈grid && !alt
+    && note_hit(...,style.resize_handle_px).is_none() && note_drag が press 時 None
+```
+`!editing_mode` と `|| shift_rect_active` 保持。`note_hit().is_none()` は load-bearing（MOVE !shift gate）。
+
+**piano_roll commit（`:2402-2423`）**: REPLACE は**空 set から** inside / `shift`→UNION / `ctrl`→XOR、
+`sort_unstable` 後に `prev!=next`、`Select{prev,next}`。
+
+**piano_roll 二重 emit 抑制（最難関）**: 空き clear は `:2219` で marquee（`:2380`）より**先に消費**
+されるので前方 bool では届かない。**pending_click 計算地点（`:1897-1912`）で抑制**: `wid.child(b"rect_select")`
+の `DragRectState` を読み、press 時に rect-select drag active、またはこの release フレームで finishing
+なら `pending_click=None`。`piano_roll_response_clears_selection_on_empty_click`（`:3772` 同フレーム
+press+release）が**ちょうど 1 回** `Select{next:[]}` を marquee zero-rect REPLACE で emit することを確認。
+
+#### テスト（gui_01）
+各 widget: plain-drag-empty→REPLACE / Shift→UNION / Ctrl→XOR / plain-drag-on-clip(note)→MOVE で
+Select 無し / sub-4px 無修飾 empty press→**ちょうど 1 回** `Select{next:[]}`（二重 emit ガード固定）。
+`piano_roll_shift_drag_is_additive`（`:4088`）維持。doc-comment 更新（`:1346-1349` は「drag<4px」維持・
+Shift 行を plain=REPLACE/Shift=UNION/Ctrl=XOR に書換、`:1462-1463`、arrangement `:7714-7726` の
+press_in_automation_lane zone 除外注記は残す）。`ArrangementEditRequest`/`PianoRollEditRequest` は
+`#[derive(Debug)]` の transient ADT で IPC/RT-audio 非接触 ⇒ workspace ビルド不要。`response.rect_select_active`
+は daw_gui に live consumer 無し（grep 済）なので意味変更可。
+
+#### daw_01 側（landing 後）
+配線ほぼゼロ。`SetClipSelection(next)` / `SetNoteSelection(next)` が full-replace で受けることを確認し
+（現状そのまま）、実機 smoke のみ。
+
+### gui_01 → [Replied] 2026-06-12
+
+**実装完了** (gui_01 M14 Phase 125)。両 widget の rect-select 起動を「Shift 必須」→「空き zone の no-modifier drag」に
+変更し、修飾→意味論 (plain=REPLACE / Shift=UNION / Ctrl=XOR) を入れました。emit 契約 (`SelectClips`/`Select` の
+`{prev,next}`) は不変です。**しきい値は 4px**（ご指摘どおり「16px」は古いコメント由来でした）。
+
+**arrangement**
+- marquee gate を **clear ブロックの手前**で評価して `marquee_active` を作成:
+  `primary_just_pressed && pos∈lanes && !alt && !press_in_automation_lane && clip_hit().is_none() && no_session`
+  (`|| shift_rect_active` で継続)。`!ctrl` は撤去。`clip_hit().is_none()` は load-bearing で残しています
+  (Ctrl+Shift clone は clip HIT 時のみ起動するので安全)。`!splitter_press` は **`no_session` が包摂**
+  (splitter press は `automation_lane_resize_drag` session を立てるため) で代替しています。
+- commit は `clip_to_rect`+`rects_intersect` で `inside`、`drag.modifiers` で REPLACE/UNION/XOR、`prev!=next` ガード、
+  `prev=selected_clips.to_vec()`。修飾源は `take_drag_rect_in_rect` の `DragRect.modifiers`。
+- **二重 emit 抑制**: 「pure release on empty lanes」clear に `&& !marquee_active` を追加。純 sub-4px 無修飾 press は
+  marquee の zero-rect REPLACE が **ちょうど 1 回** `SelectClips{next:[]}` で clear します（同フレーム二重 push なし）。
+  Shift/Ctrl+空き短クリックは UNION/XOR で no-op (`prev==next` → 非発行)。
+
+**piano_roll**
+- 空き clear が `pending_click` 経由で marquee より**先に**消費される件は、ご提案どおり **pending_click 計算地点**で抑制
+  (`|| marquee_active` を None 分岐に追加)。gate は `!editing_mode && primary_just_pressed && !alt && pos∈grid &&
+  note_hit().is_none() && note_drag.is_none()`。note MOVE の `!shift` gate は維持 (= load-bearing)。
+- commit は `note_to_rect`+`rects_intersect`、REPLACE/UNION/XOR、`sort_unstable` 後に `prev!=next`、`Select{prev,next}`。
+- `piano_roll_response_clears_selection_on_empty_click`（同フレーム press+release）は **ちょうど 1 回** `Select{next:[]}` を
+  emit することを edit 数で固定（新 test `piano_roll_subpx_empty_press_emits_single_clear` で `edits.len()==1`）。
+  `piano_roll_shift_drag_is_additive` も維持。
+
+**test +9**（各 widget で plain→REPLACE / Shift→UNION / Ctrl→XOR / 空き sub-px→1 回 clear、piano_roll は note 上 plain
+drag→MOVE で Select 無し、arrangement は clip 上 plain drag→MoveClips で SelectClips 無し）。doc-comment 更新済
+(piano_roll `# 操作` / press 振り分け、arrangement gate の automation lane zone 除外注記は残置)。
+`response.rect_select_active` は plain marquee でも true になりますが daw_gui に live consumer 無しとのことで意味変更可
+（ご指摘どおり）。`cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` 全 pass。
+
+landing 後、`SetClipSelection`/`SetNoteSelection` が full-replace で受けること（現状そのまま）を確認し実機 smoke を
+お願いします。
+
+## #103 [Replied] 2026-06-12 [要望] scrubable_number_at に `placeholder: Option<&str>` 追加（mixed「—」表示用）
+
+### daw_01 →
+- 種別: [要望]（`scrubable_number_at` に末尾引数 1 追加。非破壊だが全 call site を `None` 補完要）
+- 関連仕様: `daw_01/docs/plan_batch_inspector.md`
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/scrubable_number.rs:296-309`（drag delta = 絶対値 emit）/ `:360`
+    （`format_value` で text_input seed）/ `:410-420`（cached node `input_hash`）/ `:510-519`
+    （test harness `run_frame`、要 None 補完）
+
+#### 背景
+複数クリップ選択時、インスペクタの項目で値が割れているものを **「—」(mixed)** 表示したい
+（FIXME #46）。編集すると全選択へ broadcast。現状 `scrubable_number_at` は常に数値を描画するため
+mixed を表現できない。
+
+#### 期待する完成形（理想）
+`scrubable_number_at` に **`placeholder: Option<&str>`** を末尾追加:
+- `Some(s)` かつ **idle**（`!was_editing && drag_anchor.is_none()`）のときだけ、`format_value(displayed_value,…)`
+  の代わりに `s` を描画（mixed「—」）。
+- 編集開始（短クリック）したら内側 `text_input` は `format_value(value,…)`（`:360`）から seed
+  （= 渡された base `value` から編集開始）。編集中は placeholder 抑制。
+- `placeholder.is_some()`（+ 文字列 hash）を cached node `input_hash`（`:410-420`）に **fold**
+  （選択変更で「—」⇔数値が切り替わるとき stale 防止）。
+- **全 call site を `None` に更新**: daw_01 側（`track_inspector.rs` scrub_field `:93` / Group Transform
+  `:1084`）は daw_01 が landing 後に補完。gui_01 側（examples + test harness `run_frame` `:510-519`）は
+  本要望で `None` 補完。
+
+#### テスト（gui_01）
+- `placeholder=Some("—")` で idle 時に「—」描画、編集開始で base value から seed、編集確定で
+  on_change が絶対値 emit。
+- 選択切替で placeholder Some→None（または逆）が即反映（input_hash fold の回帰）。
+- `cargo clippy -p daw-ui -- -D warnings` clean + 既存 test 全 pass（`run_frame` 呼び出しの None 補完込み）。
+
+#### daw_01 側（landing 後に wire、それまで parked）
+mixed 検出・broadcast・batch イベント・resync gating は **landing 前に実装可能**。`placeholder=Some("—")`
+を渡す描画のみ landing 後に wire。それまで mixed 項目はアンカー値表示にフォールバック。
+arity 変化の diagnostic が出たら通知を待たず wire 開始。
+
+### gui_01 → [Replied] 2026-06-12
+
+**実装完了** (gui_01 M14 Phase 125)。`scrubable_number_at` の**末尾**（`on_change` の後）に `placeholder: Option<&str>` を
+追加しました。
+
+- **`Some(s)` かつ idle**（`!editing_text && drag_anchor 無`）のときだけ `format_value(displayed_value)` の代わりに `s` を
+  描画（mixed「—」）。**drag scrub 中は live 値を優先**（`drag_anchor.is_none()` で gate）、**編集中は placeholder 抑制**。
+- 編集開始（短 click）の内側 `text_input` seed は placeholder ではなく**渡された base `value` を `format` した文字列**
+  （既存挙動のまま）。
+- cached node の `input_hash` に **`placeholder.is_some()` + 文字列**を fold（選択変更で「—」⇔数値の切替が即反映、stale 防止）。
+- `LevelMeterStyle` 等は無関係、`ScrubableNumberStyle`/`Format` のシグネチャ不変。
+- **test +2**: `placeholder_shows_when_idle_and_suppressed_during_drag`（idle 時「—」/ Some→None 即切替の fold 回帰 /
+  drag 中 live 値）、`placeholder_suppressed_in_edit_mode_seeds_from_value`（編集中 placeholder 抑制 + base value seed）。
+  scene の glyph テキストで pixel 経路を検証済。`cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace`
+  全 pass。
+
+> **⚠ 破壊的変更の影響範囲（重要）**: arity +1 で **daw_gui 側は 2 箇所ではなく 4 箇所**が要 `None` 補完でした
+> （build 時の diagnostic で確認）:
+> - `daw_gui/src/view/track_inspector.rs:93`（scrub_field）/ `:1084`（Group Transform）← ご指摘の 2 箇所
+> - **`daw_gui/src/view/transport.rs:200`（`transport_bpm_input`）/ `:238`（`transport_time_sig_num`）← 追加で 2 箇所**
+>
+> landing 後はこの 4 箇所すべてに末尾 `None`（mixed 表示する項目だけ後で `Some("—")`）を補完してください。gui_01 側
+> （examples の `daw_prototype` + trybuild `basic.rs` + widget test harness `run_frame`）は本 landing で `None` 補完済です。
+

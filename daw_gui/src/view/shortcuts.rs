@@ -30,6 +30,12 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     m.bind("daw.synthesize_vocal", "V");
     m.bind("daw.export_wav", "Ctrl+E");
     m.bind("daw.toggle_help", "F1");
+    // FIXME #44: f キーでカーソル直下の拍 (song-absolute, 現在の snap 設定で吸着) へ
+    // プレイヘッドを移動して再生。再生中は seek してシームレスに継続、停止中はその位置
+    // から再生開始。root.rs::dispatch_shortcuts でアレンジ / piano_roll の hover 位置を
+    // 解決して発火 (どちらの grid 外でも no-op)。text_input フォーカス中は gui_01 が
+    // 単キーを抑制する。
+    m.bind("daw.play_from_cursor", "F");
     // Ableton Live 互換: Ctrl+G で選択トラック群をグループ化、
     // Alt+G で解除。 G 単独は元の grid snap toggle のまま。
     m.bind("daw.group_tracks", "Ctrl+G");

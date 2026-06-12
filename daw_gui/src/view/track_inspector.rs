@@ -11,7 +11,7 @@ use daw_ui_core::{
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{
-    text_num_to_builtin, AppData, AppEvent, ColorPickerTarget, InspectorScrubField,
+    text_num_to_builtin, AppData, AppEvent, ClipRef, ColorPickerTarget, InspectorScrubField,
     TextNumField,
 };
 use crate::view::track_color;
@@ -83,25 +83,39 @@ fn scrub_field(
     app: &AppData,
     id: impl std::hash::Hash,
     rect: Rect,
-    value: f64,
+    value: Option<f64>,
     default: f64,
     fmt: ScrubableNumberFormat,
     style: &ScrubableNumberStyle,
     scrub_key: InspectorScrubField,
-    make_event: impl Fn(f64) -> AppEvent + Clone + Send + Sync + 'static,
+    make_event: impl Fn(ClipRef, f64) -> AppEvent + Clone + Send + Sync + 'static,
 ) {
+    // FIXME #46: 複数選択時は inspector_target_refs 全体へ broadcast する。 値が
+    // 割れている field は `value == None` で渡され、 placeholder「—」を表示 (編集
+    // 開始で base = default に戻る)。 `mutate_*_events_in_clip` は variant-safe なので、
+    // broadcast 先に種別違いのクリップが混ざっても no-op で安全 (= その field を
+    // 持つクリップにだけ適用される)。
+    let base = value.unwrap_or(default);
+    let placeholder = if value.is_none() { Some("\u{2014}") } else { None };
     let resp = ui.scrubable_number_at(
         id,
         rect,
-        value,
+        base,
         default,
         fmt,
         style,
         "Inspector",
         move |v| {
             let make_event = make_event.clone();
-            Edit::mutate(move |app: &mut AppData| app.handle_event(make_event(v)))
+            Edit::mutate(move |app: &mut AppData| {
+                // 編集 (drag/text) 発火時のみ対象を解決する。 selection は 1 ストローク中
+                // 変わらないので edit 時点で十分で、 毎フレームの Vec alloc を避けられる。
+                for t in app.inspector_target_refs() {
+                    app.handle_event(make_event(t, v));
+                }
+            })
         },
+        placeholder,
     );
     // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
     let active = resp.dragging || resp.editing_text;
@@ -377,8 +391,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let input_x = area.x + pad + label_w;
         let input_w = row_w - label_w;
 
-        let target = summary.target;
-
         // Gain dB (-80..24)
         ui.label_at(
             "inspector_audio_gain_label",
@@ -393,7 +405,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_audio_gain_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            summary.gain_db.into(),
+            app.inspector_fold(|a, t| a.audio_first_event(t, |e| f64::from(e.gain_db))),
             0.0,
             ScrubableNumberFormat::Decimal(1),
             &ScrubableNumberStyle {
@@ -402,7 +414,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::Gain,
-            move |v| AppEvent::SetClipGainDb { target, gain_db: v as f32 },
+            move |t, v| AppEvent::SetClipGainDb { target: t, gain_db: v as f32 },
         );
         y += input_h + 4.0;
 
@@ -420,7 +432,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_audio_pan_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            summary.pan.into(),
+            app.inspector_fold(|a, t| a.audio_first_event(t, |e| f64::from(e.pan))),
             0.0,
             ScrubableNumberFormat::Decimal(2),
             &ScrubableNumberStyle {
@@ -429,7 +441,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::Pan,
-            move |v| AppEvent::SetClipPan { target, pan: v as f32 },
+            move |t, v| AppEvent::SetClipPan { target: t, pan: v as f32 },
         );
         y += input_h + 4.0;
 
@@ -447,7 +459,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_audio_pitch_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            summary.pitch_semitones.into(),
+            app.inspector_fold(|a, t| a.audio_first_event(t, |e| f64::from(e.pitch_semitones))),
             0.0,
             ScrubableNumberFormat::Decimal(1),
             &ScrubableNumberStyle {
@@ -456,7 +468,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::Pitch,
-            move |v| AppEvent::SetClipPitchSemitones { target, semitones: v as f32 },
+            move |t, v| AppEvent::SetClipPitchSemitones { target: t, semitones: v as f32 },
         );
         y += input_h + 8.0;
 
@@ -486,7 +498,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_audio_fade_in_input",
             Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-            summary.fade_in_beats,
+            app.inspector_fold(|a, t| a.audio_first_event(t, |e| e.fade_in_beats)),
             0.0,
             ScrubableNumberFormat::Decimal(3),
             &ScrubableNumberStyle {
@@ -495,7 +507,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::FadeIn,
-            move |v| AppEvent::SetClipFadeInBeats { target, beats: v },
+            move |t, v| AppEvent::SetClipFadeInBeats { target: t, beats: v },
         );
         let fade_in_idx = fade_curve_to_index(summary.fade_in_curve);
         if let Some(picked) = ui.dropdown(
@@ -529,7 +541,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_audio_fade_out_input",
             Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-            summary.fade_out_beats,
+            app.inspector_fold(|a, t| a.audio_first_event(t, |e| e.fade_out_beats)),
             0.0,
             ScrubableNumberFormat::Decimal(3),
             &ScrubableNumberStyle {
@@ -538,7 +550,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::FadeOut,
-            move |v| AppEvent::SetClipFadeOutBeats { target, beats: v },
+            move |t, v| AppEvent::SetClipFadeOutBeats { target: t, beats: v },
         );
         let fade_out_idx = fade_curve_to_index(summary.fade_out_curve);
         if let Some(picked) = ui.dropdown(
@@ -618,7 +630,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
         y += toggle_h + 8.0;
 
-        let target = summary.target;
         // PiP rect / opacity の scrubable は 0..1 normalized、 細かい step。
         let style_unit = ScrubableNumberStyle {
             sensitivity: 0.004,
@@ -640,12 +651,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_image_x_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            summary.x.into(),
+            app.inspector_fold(|a, t| a.image_first_event(t, |e| f64::from(e.x))),
             0.0,
             ScrubableNumberFormat::Decimal(3),
             &style_unit,
             InspectorScrubField::ImageX,
-            move |v| AppEvent::SetClipImageX { target, value: v as f32 },
+            move |t, v| AppEvent::SetClipImageX { target: t, value: v as f32 },
         );
         let x_auto_on = summary.x_automated;
         ui.toggle_button_at(
@@ -681,12 +692,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_image_y_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            summary.y.into(),
+            app.inspector_fold(|a, t| a.image_first_event(t, |e| f64::from(e.y))),
             0.0,
             ScrubableNumberFormat::Decimal(3),
             &style_unit,
             InspectorScrubField::ImageY,
-            move |v| AppEvent::SetClipImageY { target, value: v as f32 },
+            move |t, v| AppEvent::SetClipImageY { target: t, value: v as f32 },
         );
         let y_auto_on = summary.y_automated;
         ui.toggle_button_at(
@@ -722,12 +733,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_image_w_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            summary.w.into(),
-            summary.w.into(),
+            app.inspector_fold(|a, t| a.image_first_event(t, |e| f64::from(e.w))),
+            f64::from(summary.w),
             ScrubableNumberFormat::Decimal(3),
             &style_unit,
             InspectorScrubField::ImageW,
-            move |v| AppEvent::SetClipImageW { target, value: v as f32 },
+            move |t, v| AppEvent::SetClipImageW { target: t, value: v as f32 },
         );
         let w_auto_on = summary.w_automated;
         ui.toggle_button_at(
@@ -763,12 +774,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_image_h_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            summary.h.into(),
-            summary.h.into(),
+            app.inspector_fold(|a, t| a.image_first_event(t, |e| f64::from(e.h))),
+            f64::from(summary.h),
             ScrubableNumberFormat::Decimal(3),
             &style_unit,
             InspectorScrubField::ImageH,
-            move |v| AppEvent::SetClipImageH { target, value: v as f32 },
+            move |t, v| AppEvent::SetClipImageH { target: t, value: v as f32 },
         );
         let h_auto_on = summary.h_automated;
         ui.toggle_button_at(
@@ -804,12 +815,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_image_opacity_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            summary.opacity.into(),
+            app.inspector_fold(|a, t| a.image_first_event(t, |e| f64::from(e.opacity))),
             1.0,
             ScrubableNumberFormat::Decimal(3),
             &style_unit,
             InspectorScrubField::ImageOpacity,
-            move |v| AppEvent::SetClipImageOpacity { target, value: v as f32 },
+            move |t, v| AppEvent::SetClipImageOpacity { target: t, value: v as f32 },
         );
         let opacity_auto_on = summary.opacity_automated;
         ui.toggle_button_at(
@@ -852,7 +863,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_image_rotation_input",
             Rect { x: input_x, y, w: input_w, h: input_h },
-            f64::from(summary.rotation_radians.to_degrees()),
+            app.inspector_fold(|a, t| {
+                a.image_first_event(t, |e| f64::from(e.rotation_radians.to_degrees()))
+            }),
             0.0,
             ScrubableNumberFormat::Decimal(1),
             &ScrubableNumberStyle {
@@ -861,8 +874,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::ImageRotation,
-            move |v| AppEvent::SetClipImageRotation {
-                target,
+            move |t, v| AppEvent::SetClipImageRotation {
+                target: t,
                 value: (v as f32).to_radians(),
             },
         );
@@ -913,7 +926,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_image_fade_in_input",
             Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-            summary.fade_in_beats,
+            app.inspector_fold(|a, t| a.image_first_event(t, |e| e.fade_in_beats)),
             0.0,
             ScrubableNumberFormat::Decimal(3),
             &ScrubableNumberStyle {
@@ -922,7 +935,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::ImageFadeIn,
-            move |v| AppEvent::SetClipFadeInBeats { target, beats: v },
+            move |t, v| AppEvent::SetClipFadeInBeats { target: t, beats: v },
         );
         let fade_in_idx = fade_curve_to_index(summary.fade_in_curve);
         if let Some(picked) = ui.dropdown(
@@ -956,7 +969,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app,
             "inspector_image_fade_out_input",
             Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-            summary.fade_out_beats,
+            app.inspector_fold(|a, t| a.image_first_event(t, |e| e.fade_out_beats)),
             0.0,
             ScrubableNumberFormat::Decimal(3),
             &ScrubableNumberStyle {
@@ -965,7 +978,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::ImageFadeOut,
-            move |v| AppEvent::SetClipFadeOutBeats { target, beats: v },
+            move |t, v| AppEvent::SetClipFadeOutBeats { target: t, beats: v },
         );
         let fade_out_idx = fade_curve_to_index(summary.fade_out_curve);
         if let Some(picked) = ui.dropdown(
@@ -1104,6 +1117,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         })
                     })
                 },
+                None,
             );
             // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
             let active = resp.dragging || resp.editing_text;
@@ -1291,7 +1305,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // `scrub_field` で drag / text 編集を undo 1 step に bracket する。
         // automate 「A」 トグルは従来どおり共存。 値源は summary の first event
         // snapshot、 on_change は `SetClipTextNumField` (Rotation は deg→rad)。
-        let text_target = summary.target;
         let text_fade_max = summary.clip_length_beats.max(0.0);
         let emit_num_row = |ui: &mut Ui<'_, AppData>,
                             app: &AppData,
@@ -1363,19 +1376,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 app,
                 (field, "input"),
                 Rect { x: input_x, y: *row_y, w: numeric_input_w, h: input_h },
-                summary.text_num_field_value(field),
+                app.inspector_text_num_folded(field),
                 default,
                 fmt,
                 &style,
                 InspectorScrubField::Text(field),
-                move |v| {
+                move |t, v| {
                     // Rotation のみ degree 入力 → radians に変換 (handler が wrap)。
                     let value = if matches!(field, TextNumField::Rotation) {
                         (v as f32).to_radians()
                     } else {
                         v as f32
                     };
-                    AppEvent::SetClipTextNumField { target: text_target, field, value }
+                    AppEvent::SetClipTextNumField { target: t, field, value }
                 },
             );
             if let Some(builtin) = text_num_to_builtin(field) {

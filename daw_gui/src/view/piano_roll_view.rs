@@ -323,9 +323,24 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let snapped = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x);
         Some(snapped - clip_start_beat)
     });
-    if app.pianoroll_hover_beat != hover_beat {
+    // FIXME #44: f キー用に **song-absolute かつ snap なし** の生 beat も mirror する
+    // (clip_start_beat を引く前。snap は dispatch 側で live Alt 付きで song-absolute grid
+    // に対して行う)。clip_start_beat が snap unit の倍数でなくても、ruler が見せる
+    // song-absolute grid 線にプレイヘッドが乗るようにするため、clip-local の
+    // `pianoroll_hover_beat` とは別空間で保持する。
+    let hover_beat_song_raw: Option<f64> = ui.pointer().pos.and_then(|(px, py)| {
+        if !grid_rect.contains(px, py) {
+            return None;
+        }
+        let beat_to_px = grid_rect.w as f64 / view.len_beats.max(1e-6);
+        Some(view.start_beat + (px - grid_rect.x) as f64 / beat_to_px)
+    });
+    if app.pianoroll_hover_beat != hover_beat
+        || app.pianoroll_hover_beat_song_raw != hover_beat_song_raw
+    {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.pianoroll_hover_beat = hover_beat;
+            app.pianoroll_hover_beat_song_raw = hover_beat_song_raw;
         }));
     }
 

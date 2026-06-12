@@ -394,35 +394,42 @@ impl InspectorTextEventSummary {
     /// (= 旧 text_input が degree 表示だったのと整合、 on_change で
     /// radians に戻す)。
     pub fn text_num_field_value(&self, field: TextNumField) -> f64 {
-        use TextNumField as F;
-        let ev = &self.event;
-        match field {
-            F::X => ev.x.into(),
-            F::Y => ev.y.into(),
-            F::W => ev.w.into(),
-            F::H => ev.h.into(),
-            F::Rotation => ev.rotation_radians.to_degrees().into(),
-            F::FontSize => ev.font_size_px.into(),
-            F::Opacity => ev.opacity.into(),
-            F::FillR => ev.fill_color[0].into(),
-            F::FillG => ev.fill_color[1].into(),
-            F::FillB => ev.fill_color[2].into(),
-            F::FillA => ev.fill_color[3].into(),
-            F::OutlineR => ev.outline_color[0].into(),
-            F::OutlineG => ev.outline_color[1].into(),
-            F::OutlineB => ev.outline_color[2].into(),
-            F::OutlineA => ev.outline_color[3].into(),
-            F::OutlineWidth => ev.outline_width_px.into(),
-            F::ShadowR => ev.shadow_color[0].into(),
-            F::ShadowG => ev.shadow_color[1].into(),
-            F::ShadowB => ev.shadow_color[2].into(),
-            F::ShadowA => ev.shadow_color[3].into(),
-            F::ShadowOffsetX => ev.shadow_offset_px.0.into(),
-            F::ShadowOffsetY => ev.shadow_offset_px.1.into(),
-            F::ShadowBlur => ev.shadow_blur_px.into(),
-            F::FadeInBeats => ev.fade_in_beats,
-            F::FadeOutBeats => ev.fade_out_beats,
-        }
+        text_event_num_value(&self.event, field)
+    }
+}
+
+/// FIXME #15 / #46: `TextEvent` 1 つから `TextNumField` の現値 (f64) を取り出す。
+/// `InspectorTextEventSummary::text_num_field_value` (= アンカー代表値) と
+/// inspector の mixed 畳み込み (`inspector_text_num_folded`、 = 他クリップの event)
+/// の両方から使う single source。 Rotation は内部 radians を degree に変換。
+pub fn text_event_num_value(ev: &common::model::TextEvent, field: TextNumField) -> f64 {
+    use TextNumField as F;
+    match field {
+        F::X => ev.x.into(),
+        F::Y => ev.y.into(),
+        F::W => ev.w.into(),
+        F::H => ev.h.into(),
+        F::Rotation => ev.rotation_radians.to_degrees().into(),
+        F::FontSize => ev.font_size_px.into(),
+        F::Opacity => ev.opacity.into(),
+        F::FillR => ev.fill_color[0].into(),
+        F::FillG => ev.fill_color[1].into(),
+        F::FillB => ev.fill_color[2].into(),
+        F::FillA => ev.fill_color[3].into(),
+        F::OutlineR => ev.outline_color[0].into(),
+        F::OutlineG => ev.outline_color[1].into(),
+        F::OutlineB => ev.outline_color[2].into(),
+        F::OutlineA => ev.outline_color[3].into(),
+        F::OutlineWidth => ev.outline_width_px.into(),
+        F::ShadowR => ev.shadow_color[0].into(),
+        F::ShadowG => ev.shadow_color[1].into(),
+        F::ShadowB => ev.shadow_color[2].into(),
+        F::ShadowA => ev.shadow_color[3].into(),
+        F::ShadowOffsetX => ev.shadow_offset_px.0.into(),
+        F::ShadowOffsetY => ev.shadow_offset_px.1.into(),
+        F::ShadowBlur => ev.shadow_blur_px.into(),
+        F::FadeInBeats => ev.fade_in_beats,
+        F::FadeOutBeats => ev.fade_out_beats,
     }
 }
 
@@ -709,8 +716,20 @@ pub const MIN_AUDIO_EDITOR_VIEW_LEN_BEATS: f64 = 1.0 / 64.0;
 /// `source_path` は完了時に AudioSource として登録するときの
 /// `AudioSourcePath` (= ProjectRelative or Absolute、 outpath が
 /// `<project_dir>/bounce/...` か `bounce_cache/...` かで決まる)。
+/// FIXME #42: bounce の 2 モード。 完了 handler はこれで分岐する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BounceMode {
+    /// 音源/synth の素の音 (= insert FX 抜き) を **同じクリップに置換**。
+    InPlace,
+    /// 音源/synth + そのトラックの insert FX を **新トラックに複製**、
+    /// 元トラックは自動ミュート (非破壊・二重再生回避)。
+    WithFx,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingClipFxBounce {
+    /// FIXME #42: In Place (同位置置換) か With FX (新トラック) か。
+    pub mode: BounceMode,
     pub source_track: u32,
     pub source_clip: u32,
     pub out_path: PathBuf,
@@ -812,6 +831,11 @@ pub struct AppData {
     /// ノート paste の配置位置に使う。`piano_roll_view::draw` が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。
     pub pianoroll_hover_beat: Option<f64>,
+    /// FIXME #44: ピアノロール grid 上のポインタ拍を **song-absolute かつ snap なし**
+    /// (= clip_start_beat を引く前の生 beat) で mirror。`f` キー (PlayFromCursor) は
+    /// song-absolute の grid で snap する必要があるため、`pianoroll_hover_beat`
+    /// (clip-local snap 済) とは別に保持する。grid 外 / 非 piano-roll は `None`。
+    pub pianoroll_hover_beat_song_raw: Option<f64>,
     /// FIXME #33: view 層が OS clipboard へ書く保留テキスト。トラック copy/cut は
     /// plugin state 収集が非同期 (`on_all_states_from_child`、Ui 非保持) なので、
     /// そこで serialize した envelope JSON をここに積み、`dispatch_shortcuts` が
@@ -1607,6 +1631,7 @@ impl AppData {
             arrangement_hover_clip: None,
             arrange_hovered_track: None,
             pianoroll_hover_beat: None,
+            pianoroll_hover_beat_song_raw: None,
             pending_clipboard_write: None,
             selected_track_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
@@ -2541,7 +2566,10 @@ impl AppData {
                 | AppEvent::AutoFadeSelectedClips
                 | AppEvent::AutoCrossfadeSelectedClips
                 | AppEvent::ToggleClipReversed(_)
-                | AppEvent::BounceClipInPlace(_)
+                // FIXME #42: BounceClipInPlace は async 化したので非 undoable。
+                // 完了 handler (handle_bounce_clip_fx_complete) が成功時のみ 1 回
+                // push_undo_snapshot する (With FX と同じ。 dispatch 時 auto-push は
+                // IPC 往復前なので二重スナップ + 失敗時 spurious を生む)。
                 | AppEvent::SetClipGainDbBatch(_)
                 | AppEvent::SetClipFadeBeatsBatch(_)
                 | AppEvent::SetClipFadeCurveBatch(_)
@@ -2948,6 +2976,11 @@ pub enum AppEvent {
     Play,
     Stop,
     PlayToggle,
+    /// FIXME #44: `f` キー。カーソル直下の拍 (song-absolute, 現在の snap 設定で吸着済)
+    /// へプレイヘッドを移動して再生する。再生中は seek してシームレスに継続、停止中は
+    /// その位置から再生開始。view 層 (`dispatch_shortcuts`) が snap / ルーティング /
+    /// song-absolute 解決済みの beat を渡すので、handler は set-playhead + seek/play のみ。
+    PlayFromCursor { beat: f64 },
     ToggleLoop,
     /// `R` キー: 選択中 clip(s) の bounding range を loop 範囲に設定して
     /// loop ON + 再生開始。 既に loop ON かつ範囲が選択 clip と一致するなら
@@ -4346,6 +4379,9 @@ impl AppData {
                 } else {
                     self.play();
                 }
+            }
+            AppEvent::PlayFromCursor { beat } => {
+                self.action_play_from_cursor(beat);
             }
             AppEvent::ToggleLoop => {
                 self.toggle_loop();
@@ -6916,6 +6952,24 @@ impl AppData {
         self.playback_origin_beat = Some(self.playhead_beat.unwrap_or(0.0));
         self.send_audio(MainToChild::Play);
         self.is_playing = true;
+    }
+
+    /// FIXME #44: `f` キーの実体。 snap 済 song-absolute beat へプレイヘッドを置き、
+    /// audio engine に SeekTo を送る。 停止中は `play()` を呼んでその位置から再生開始
+    /// する (play() の export / asset / plugin ゲートと playback_origin_beat capture を
+    /// 継承するため body を再実装しない)。 再生中は SeekTo だけ送ってシームレスに継続
+    /// する (= play()/stop() を呼ばない。 既存の ruler クリック中再生と同じ挙動で、
+    /// Stop は元の play origin に戻る)。
+    fn action_play_from_cursor(&mut self, beat: f64) {
+        let beat = beat.max(0.0);
+        self.playhead_beat = Some(beat as f32);
+        let sr = common::audio_bridge::SAMPLE_RATE as f64;
+        let bpm = self.song.bpm.max(1.0) as f64;
+        let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
+        self.send_audio(MainToChild::SeekTo { samples });
+        if !self.is_playing {
+            self.play();
+        }
     }
 
     /// A7: register a `(track, device_index)` we just sent `SetSlotPlugin`
@@ -10877,6 +10931,119 @@ impl AppData {
             .collect()
     }
 
+    /// FIXME #46: inspector の編集対象クリップ群。 複数選択 (`selected_clips`) 全体を
+    /// 編集対象にする。 アンカー (`selected_clip`) は `select_clip` / `set_clip_selection`
+    /// の構築上 `selected_clips` の末尾にいるので別途足す必要はない。 `selected_clips`
+    /// が空 (= 単一選択経路のみ) のときだけ `selected_clip` にフォールバックする。
+    /// FIXME #46: inspector 編集対象クリップを **alloc せず** 順に渡す。 `selected_clips`
+    /// 全体 (空なら `selected_clip` 単体) を走査する。 mixed 検出 (`inspector_fold`) は
+    /// 毎フレーム全 field で呼ばれるので、 Vec を作らないこの基盤を使う。
+    fn for_each_inspector_target(&self, mut f: impl FnMut(ClipRef)) {
+        if self.selected_clips.is_empty() {
+            if let Some(r) = self.selected_clip_ref() {
+                f(r);
+            }
+        } else {
+            for k in &self.selected_clips {
+                if let Some(r) = self.clip_ref_of(*k) {
+                    f(r);
+                }
+            }
+        }
+    }
+
+    pub fn inspector_target_refs(&self) -> Vec<ClipRef> {
+        let mut refs = Vec::new();
+        self.for_each_inspector_target(|r| refs.push(r));
+        refs
+    }
+
+    /// FIXME #46: 編集対象クリップ各々に `extract` を適用し、 値が全て一致すれば
+    /// `Some(値)`、 割れていれば `None` (= mixed) を返す。 `extract` が `None` を返す
+    /// クリップ (= その field を持たない種別) は無視する。 表示中の section のアンカーは
+    /// 必ずその種別なので、 表示中 field では `None` == mixed と解釈できる。 毎フレーム
+    /// 全 field で呼ばれるので alloc しない (`for_each_inspector_target` を使う)。
+    pub fn inspector_fold(&self, extract: impl Fn(&AppData, ClipRef) -> Option<f64>) -> Option<f64> {
+        let mut acc: Option<f64> = None;
+        let mut mixed = false;
+        self.for_each_inspector_target(|t| {
+            if mixed {
+                return;
+            }
+            if let Some(v) = extract(self, t) {
+                match acc {
+                    None => acc = Some(v),
+                    Some(a) if (a - v).abs() > 1e-6 => mixed = true,
+                    _ => {}
+                }
+            }
+        });
+        if mixed { None } else { acc }
+    }
+
+    /// `target` clip の first `ImageEvent` に `f` を適用 (image clip でなければ `None`)。
+    /// FIXME #46 の mixed 畳み込み (`inspector_fold`) 用 accessor。
+    pub fn image_first_event<R>(
+        &self,
+        target: ClipRef,
+        f: impl FnOnce(&common::model::ImageEvent) -> R,
+    ) -> Option<R> {
+        let content_id = self
+            .song
+            .tracks
+            .get(target.track as usize)?
+            .clips
+            .get(target.clip as usize)?
+            .content_id;
+        match self.song.clip_contents.get(&content_id)? {
+            common::model::ClipContent::Image(img) => img.events.first().map(f),
+            _ => None,
+        }
+    }
+
+    /// `target` clip の first `TextEvent` に `f` を適用 (text clip でなければ `None`)。
+    pub fn text_first_event<R>(
+        &self,
+        target: ClipRef,
+        f: impl FnOnce(&common::model::TextEvent) -> R,
+    ) -> Option<R> {
+        let content_id = self
+            .song
+            .tracks
+            .get(target.track as usize)?
+            .clips
+            .get(target.clip as usize)?
+            .content_id;
+        match self.song.clip_contents.get(&content_id)? {
+            common::model::ClipContent::Text(text) => text.events.first().map(f),
+            _ => None,
+        }
+    }
+
+    /// `target` clip の first `AudioEvent` に `f` を適用 (audio clip でなければ `None`)。
+    pub fn audio_first_event<R>(
+        &self,
+        target: ClipRef,
+        f: impl FnOnce(&common::model::AudioEvent) -> R,
+    ) -> Option<R> {
+        let content_id = self
+            .song
+            .tracks
+            .get(target.track as usize)?
+            .clips
+            .get(target.clip as usize)?
+            .content_id;
+        match self.song.clip_contents.get(&content_id)? {
+            common::model::ClipContent::Audio(audio) => audio.events.first().map(f),
+            _ => None,
+        }
+    }
+
+    /// FIXME #46: text num field を `inspector_target_refs` 全体で畳む (mixed 検出)。
+    pub fn inspector_text_num_folded(&self, field: TextNumField) -> Option<f64> {
+        self.inspector_fold(|a, t| a.text_first_event(t, |e| text_event_num_value(e, field)))
+    }
+
     /// stable `ClipKey` → `&Clip` (track_by_id + clip_by_id)。
     pub fn clip_at(&self, key: common::model::ClipKey) -> Option<&common::model::Clip> {
         self.song
@@ -11453,139 +11620,43 @@ impl AppData {
     /// source の events を fade / gain / pan / pitch_ratio で mix した
     /// snapshot のみ。 plugin 効果込みの bounce は spec §3.8 "Bounce"
     /// (= 新 Clip + 新 track) で別 PR。
-    fn bounce_clip_in_place(&mut self, target: ClipRef) {
-        let Some(track) = self.song.tracks.get(target.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get(target.clip as usize).cloned() else {
-            return;
-        };
-        // 名前は content_id 単位 SSoT から (legacy clip.name は v20 で空)。
-        let clip_name = self.song.content_name(clip.content_id).to_string();
-        let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get(&clip.content_id).cloned()
-        else {
-            self.status_message = "Bounce In Place: audio clip ではありません".into();
-            return;
-        };
-        if audio.events.is_empty() {
-            self.status_message = "Bounce In Place: events が空です".into();
-            return;
-        }
-
-        let engine_sr = common::audio_bridge::SAMPLE_RATE;
-        let bpm = self.song.bpm.max(1.0) as f64;
-        let samples_per_beat = engine_sr as f64 * 60.0 / bpm;
-        let total_frames = (clip.length_beats * samples_per_beat).max(0.0) as usize;
-        if total_frames == 0 {
-            self.status_message = "Bounce In Place: clip 長が 0 です".into();
-            return;
-        }
-
-        // ---- mix loop (Pre-FX、 audio_clip_renderer のロジックを daw_gui
-        // 側に portion-wise port。 Phase 3+ で render_audio_events を共通
-        // crate に切り出して DRY 化を検討。 ここは offline 1 回きりの
-        // 計算なので allocation も自由)。
-        let mut mix_l = vec![0.0_f32; total_frames];
-        let mut mix_r = vec![0.0_f32; total_frames];
-        for event in &audio.events {
-            if event.muted {
-                continue;
-            }
-            let Some(buffer) = self.audio_source_cache.get(event.source_id) else {
-                continue;
-            };
-            let event_start =
-                (event.event_start_in_clip_beats * samples_per_beat).max(0.0) as usize;
-            let event_end =
-                ((event.event_start_in_clip_beats + event.event_length_beats) * samples_per_beat)
-                    .max(0.0) as usize;
-            let event_len = event_end.saturating_sub(event_start);
-            if event_len == 0 {
-                continue;
-            }
-
-            let pitch_ratio = common::audio_render::pitch_ratio_for(
-                event.stretch_mode,
-                buffer.sample_rate,
-                engine_sr,
-                event.pitch_semitones,
-            );
-            let gain_lin = 10f32.powf(event.gain_db / 20.0);
-            let pan_rad = (event.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-            let pan_l = pan_rad.cos();
-            let pan_r = pan_rad.sin();
-            let fade_in_frames =
-                (event.fade_in_beats.max(0.0) * samples_per_beat).max(0.0) as u64;
-            let fade_out_frames =
-                (event.fade_out_beats.max(0.0) * samples_per_beat).max(0.0) as u64;
-            let event_total = event_len as u64;
-            let source_len = event
-                .source_end_frames
-                .saturating_sub(event.source_start_frames);
-
-            let l_plane: &[f32] =
-                buffer.samples.first().map(Vec::as_slice).unwrap_or(&[]);
-            let r_plane: &[f32] = if buffer.channels >= 2 {
-                buffer.samples.get(1).map(Vec::as_slice).unwrap_or(l_plane)
-            } else {
-                l_plane
-            };
-
-            for i in 0..event_len {
-                let dst = event_start + i;
-                if dst >= total_frames {
-                    break;
-                }
-                let local = i as u64;
-                let fade_in = common::audio_render::fade_envelope(
-                    local,
-                    fade_in_frames,
-                    event.fade_in_curve,
-                );
-                let tail = event_total.saturating_sub(local + 1);
-                let fade_out = common::audio_render::fade_envelope(
-                    tail,
-                    fade_out_frames,
-                    event.fade_out_curve,
-                );
-                let env = fade_in * fade_out * gain_lin;
-                if env == 0.0 {
-                    continue;
-                }
-                let source_pos = i as f64 * pitch_ratio;
-                let source_pos = if event.reversed {
-                    source_len as f64 - 1.0 - source_pos
-                } else {
-                    source_pos
-                };
-                if source_pos < 0.0 {
-                    continue;
-                }
-                let i0 = source_pos.floor() as i64;
-                let frac = (source_pos - i0 as f64) as f32;
-                if i0 < 0 {
-                    continue;
-                }
-                let abs0 = event.source_start_frames + i0 as u64;
-                let abs1 = abs0 + 1;
-                if abs0 >= event.source_end_frames || abs0 >= buffer.frames {
-                    continue;
-                }
-                let s_l0 = l_plane.get(abs0 as usize).copied().unwrap_or(0.0);
-                let s_r0 = r_plane.get(abs0 as usize).copied().unwrap_or(0.0);
-                let s_l1 = l_plane.get(abs1 as usize).copied().unwrap_or(s_l0);
-                let s_r1 = r_plane.get(abs1 as usize).copied().unwrap_or(s_r0);
-                let s_l = s_l0 + (s_l1 - s_l0) * frac;
-                let s_r = s_r0 + (s_r1 - s_r0) * frac;
-                let sqrt2 = std::f32::consts::SQRT_2;
-                mix_l[dst] += s_l * env * pan_l * sqrt2;
-                mix_r[dst] += s_r * env * pan_r * sqrt2;
+    /// FIXME #42: bounce 用に「対象クリップの 1 トラックだけ」を残した Song を組む。
+    /// 他トラック・`master_fx_chain`・group/send/sidechain 参照を全て落とすので、engine の
+    /// offline render はそのトラック単独の音だけを焼く (= clip isolate、 他トラックが
+    /// 混ざらない)。`bypass_inserts == true` (Bounce In Place) のとき、残すトラックの
+    /// insert FX device (= `ports.has_audio_input`) を `PortConfig::default()` で中和して
+    /// 「音源/synth の素の音」だけにする。**device は削除しない**: engine は plugin を
+    /// `(track_id, device_index)` で解決し LoadSong では re-key されないため、index を
+    /// 保ったまま ports を空にして dispatch を無害化する。元トラックの mute も解除する
+    /// (= 元トラックが with-FX bounce で mute 済みでも isolate render は鳴らす)。
+    fn isolated_bounce_song(&self, target: ClipRef, bypass_inserts: bool) -> Option<Song> {
+        let track = self.song.tracks.get(target.track as usize)?;
+        let mut isolated = self.song.clone();
+        isolated.master_fx_chain.clear();
+        let mut kept = track.clone();
+        kept.parent_group_id = None;
+        kept.sends.clear();
+        kept.muted = false;
+        kept.solo = false;
+        for d in &mut kept.devices {
+            d.sidechain_sources.clear();
+            if bypass_inserts && d.ports.has_audio_input {
+                d.ports = common::port_config::PortConfig::default();
             }
         }
+        isolated.tracks = vec![kept];
+        Some(isolated)
+    }
 
-        // ---- WAV 書き出し ----
-        // file 名: clip 名を sanitize + ts8 (epoch milli の下 8 桁)。
+    /// FIXME #42: bounce 出力 WAV の path と `AudioSourcePath` を決める。保存済み
+    /// project は `<dir>/bounce/<name>[_fx]_<ts>.wav`、未保存は bounce_cache (save 時に
+    /// `migrate_unsaved_bounce_sources_into` が project へ移動 + ProjectRelative 化)。
+    /// With FX は suffix `_fx` で In Place と区別する。失敗時は status_message を立てて `None`。
+    fn bounce_output_path(
+        &mut self,
+        clip_name: &str,
+        mode: BounceMode,
+    ) -> Option<(PathBuf, common::model::AudioSourcePath)> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64 % 100_000_000)
@@ -11594,139 +11665,52 @@ impl AppData {
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
             .collect();
-        let safe_name = if safe_name.is_empty() {
-            "bounce".into()
-        } else {
-            safe_name
+        let safe_name = if safe_name.is_empty() { "bounce".into() } else { safe_name };
+        let infix = match mode {
+            BounceMode::InPlace => "",
+            BounceMode::WithFx => "_fx",
         };
-        let filename = format!("{safe_name}_{ts:08}.wav");
-
+        let filename = format!("{safe_name}{infix}_{ts:08}.wav");
         let project_dir = self
             .file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-        let (out_path, source_path) = match project_dir.as_deref() {
+        match project_dir.as_deref() {
             Some(dir) => {
                 let bounce_dir = dir.join("bounce");
                 if let Err(e) = std::fs::create_dir_all(&bounce_dir) {
-                    self.status_message =
-                        format!("Bounce In Place: bounce/ 作成失敗: {e}");
-                    return;
+                    self.status_message = format!("Bounce: bounce/ 作成失敗: {e}");
+                    return None;
                 }
-                let dst = bounce_dir.join(&filename);
-                (
-                    dst.clone(),
+                Some((
+                    bounce_dir.join(&filename),
                     common::model::AudioSourcePath::ProjectRelative(
                         std::path::PathBuf::from("bounce").join(&filename),
                     ),
-                )
+                ))
             }
             None => {
-                // 未保存 project: user bounce_cache に一時書き出し。
-                // save 時に `migrate_unsaved_bounce_sources_into` で
-                // `<project_dir>/bounce/` へ移動 + ProjectRelative 化される。
                 let cache = import_audio::unsaved_bounce_cache_dir();
                 if let Err(e) = std::fs::create_dir_all(&cache) {
-                    self.status_message =
-                        format!("Bounce In Place: bounce_cache/ 作成失敗: {e}");
-                    return;
+                    self.status_message = format!("Bounce: bounce_cache/ 作成失敗: {e}");
+                    return None;
                 }
                 let dst = cache.join(&filename);
-                (
-                    dst.clone(),
-                    common::model::AudioSourcePath::Absolute(dst.clone()),
-                )
-            }
-        };
-
-        let spec = hound::WavSpec {
-            channels: 2,
-            sample_rate: engine_sr,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let writer = match hound::WavWriter::create(&out_path, spec) {
-            Ok(w) => w,
-            Err(e) => {
-                self.status_message =
-                    format!("Bounce In Place: WAV create 失敗: {e}");
-                return;
-            }
-        };
-        let mut writer = writer;
-        for i in 0..total_frames {
-            if writer.write_sample(mix_l[i]).is_err()
-                || writer.write_sample(mix_r[i]).is_err()
-            {
-                self.status_message = "Bounce In Place: WAV 書き込み失敗".into();
-                let _ = std::fs::remove_file(&out_path);
-                return;
+                Some((dst.clone(), common::model::AudioSourcePath::Absolute(dst)))
             }
         }
-        if let Err(e) = writer.finalize() {
-            self.status_message =
-                format!("Bounce In Place: WAV finalize 失敗: {e}");
-            let _ = std::fs::remove_file(&out_path);
-            return;
-        }
-
-        // ---- AudioSource 採番 + Song / cache 更新 ----
-        let new_source_id = self.song.alloc_audio_source_id();
-        let new_source = common::model::AudioSource {
-            path: source_path,
-            sample_rate: engine_sr,
-            channels: 2,
-            frames: total_frames as u64,
-            original_bpm: Some(self.song.bpm),
-            root_key: None,
-        };
-        self.song.audio_sources.insert(new_source_id, new_source);
-        let new_buffer = std::sync::Arc::new(crate::audio_source_cache::AudioSourceBuffer {
-            sample_rate: engine_sr,
-            channels: 2,
-            frames: total_frames as u64,
-            samples: vec![mix_l, mix_r],
-        });
-        self.audio_source_cache.insert(new_source_id, new_buffer);
-
-        // ClipContent::Audio を 1 event 構成に置換 (= bounce 後は flat な
-        // single-event clip)。 Phase 1 の 1 clip 1 event 前提と整合。
-        let new_event = common::model::AudioEvent {
-            source_id: new_source_id,
-            event_start_in_clip_beats: 0.0,
-            event_length_beats: clip.length_beats,
-            source_start_frames: 0,
-            source_end_frames: total_frames as u64,
-            ..common::model::AudioEvent::default()
-        };
-        if let Some(content) = self.song.clip_contents.get_mut(&clip.content_id) {
-            *content = common::model::ClipContent::Audio(common::model::AudioContent {
-                events: vec![new_event],
-            });
-        }
-
-        self.is_dirty = true;
-        self.sync_song_to_plugin_host();
-        if self.clip_edit_buffer_target == Some(target) {
-            self.resync_clip_audio_event_edit_buffers(target);
-        }
-        self.status_message = format!(
-            "Bounce In Place: '{}' を {} に書き出し",
-            clip_name,
-            out_path.display()
-        );
     }
 
-    /// PR-C: plugin chain 込みで render し、 結果を **新 track + 新 Clip**
-    /// に配置 (`docs/plan_audio_followup.md` PR-C / `docs/plan_audio_clip
-    /// .md` §3.8 "Bounce")。 Bounce In Place (Pre-FX) と異なり async (=
-    /// IPC 経由で freewheel render 完了通知待ち)。 完了通知の handler
-    /// (`handle_bounce_clip_fx_complete`) 内で Undo snapshot を 1 回だけ
-    /// 取る。 既に bounce 進行中なら重複 request を拒否。
-    fn bounce_clip_with_fx(&mut self, target: ClipRef) {
+    /// FIXME #42: bounce のトリガ共通処理。対象クリップ 1 トラックだけを isolate した
+    /// song を engine に LoadSong し、offline render を要求する。In Place は insert FX を
+    /// バイパス (port 中和)、With FX は insert FX を通す。結果は完了通知 handler
+    /// (`handle_bounce_clip_fx_complete`) が mode に応じて「同位置置換」/「新トラック +
+    /// 元ミュート」する。Audio / MIDI / 歌唱クリップが対象 (= 旧 is-Audio guard を撤去し
+    /// 「全く無反応」 を解消)。完了通知の `sync_song_to_plugin_host` が full song を再
+    /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
+    fn start_clip_bounce(&mut self, target: ClipRef, mode: BounceMode) {
         if self.pending_clip_fx_bounce.is_some() {
-            self.status_message =
-                "Bounce (with FX): 既に bounce 中です。 完了をお待ちください".into();
+            self.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
         let Some(track) = self.song.tracks.get(target.track as usize) else {
@@ -11735,95 +11719,33 @@ impl AppData {
         let Some(clip) = track.clips.get(target.clip as usize).cloned() else {
             return;
         };
-        // 名前は content_id 単位 SSoT から (legacy clip.name は v20 で空)。
         let clip_name = self.song.content_name(clip.content_id).to_string();
-        let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get(&clip.content_id).cloned()
-        else {
-            self.status_message = "Bounce (with FX): audio clip ではありません".into();
-            return;
-        };
-        if audio.events.is_empty() {
-            self.status_message = "Bounce (with FX): events が空です".into();
+        // bounce 可能なのは Audio / Midi (= 歌唱含む) のみ。Automation/Video/Image/Text は対象外。
+        if !matches!(
+            self.song.clip_contents.get(&clip.content_id),
+            Some(common::model::ClipContent::Midi(_) | common::model::ClipContent::Audio(_))
+        ) {
+            self.status_message = "Bounce: audio / MIDI / 歌唱クリップのみ対象です".into();
             return;
         }
-
         let engine_sr = common::audio_bridge::SAMPLE_RATE;
         let bpm = self.song.bpm.max(1.0) as f64;
         let samples_per_beat = engine_sr as f64 * 60.0 / bpm;
         let start_frame = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-        let end_frame = ((clip.start_beat + clip.length_beats) * samples_per_beat)
-            .max(0.0) as u64;
+        let end_frame =
+            ((clip.start_beat + clip.length_beats) * samples_per_beat).max(0.0) as u64;
         if end_frame <= start_frame {
-            self.status_message = "Bounce (with FX): clip 長が 0 です".into();
+            self.status_message = "Bounce: clip 長が 0 です".into();
             return;
         }
-
-        // 出力 path を決定。 logic は bounce_clip_in_place と同じだが
-        // suffix を `_fx_` にして区別 (= 同 clip を Pre-FX / FX 両方
-        // bounce しても上書きにならない)。
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64 % 100_000_000)
-            .unwrap_or(0);
-        let safe_name: String = clip_name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let safe_name = if safe_name.is_empty() {
-            "bounce".into()
-        } else {
-            safe_name
+        let Some((out_path, source_path)) = self.bounce_output_path(&clip_name, mode) else {
+            return;
         };
-        let filename = format!("{safe_name}_fx_{ts:08}.wav");
-
-        let project_dir = self
-            .file_path
-            .as_ref()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-        let (out_path, source_path) = match project_dir.as_deref() {
-            Some(dir) => {
-                let bounce_dir = dir.join("bounce");
-                if let Err(e) = std::fs::create_dir_all(&bounce_dir) {
-                    self.status_message =
-                        format!("Bounce (with FX): bounce/ 作成失敗: {e}");
-                    return;
-                }
-                let dst = bounce_dir.join(&filename);
-                (
-                    dst.clone(),
-                    common::model::AudioSourcePath::ProjectRelative(
-                        std::path::PathBuf::from("bounce").join(&filename),
-                    ),
-                )
-            }
-            None => {
-                // 未保存 project: bounce_cache に一時書き出し。 save 時に
-                // `migrate_unsaved_bounce_sources_into` で `<project_dir>
-                // /bounce/` へ移動 + ProjectRelative 化される。
-                let cache = import_audio::unsaved_bounce_cache_dir();
-                if let Err(e) = std::fs::create_dir_all(&cache) {
-                    self.status_message =
-                        format!("Bounce (with FX): bounce_cache/ 作成失敗: {e}");
-                    return;
-                }
-                let dst = cache.join(&filename);
-                (
-                    dst.clone(),
-                    common::model::AudioSourcePath::Absolute(dst.clone()),
-                )
-            }
+        let Some(isolated) = self.isolated_bounce_song(target, mode == BounceMode::InPlace) else {
+            return;
         };
-
-        // pending entry をセット。 完了通知 handler はこの entry を見て
-        // 新 track / 新 clip を組み立てる。
         self.pending_clip_fx_bounce = Some(PendingClipFxBounce {
+            mode,
             source_track: target.track,
             source_clip: target.clip,
             out_path: out_path.clone(),
@@ -11832,12 +11754,9 @@ impl AppData {
             clip_length_beats: clip.length_beats,
             start_beat: clip.start_beat,
         });
-
-        // bookend: SetRenderMode(Offline) → LoadSong (= 最新 song
-        // snapshot を audio engine に渡す) → BounceClipFxOnline。
-        // ExportWav と同じ pattern。 完了通知で Realtime に戻す。
-        let song = self.song.clone();
-        self.send_audio(MainToChild::LoadSong(song));
+        // SetRenderMode(Offline) → LoadSong(isolated) → BounceClipFxOnline。完了通知で
+        // Realtime に戻し、sync_song_to_plugin_host が full song を再 LoadSong して復元する。
+        self.send_audio(MainToChild::LoadSong(isolated));
         self.send_plugin(MainToChild::SetRenderMode(
             common::protocol::RenderMode::Offline,
         ));
@@ -11848,8 +11767,62 @@ impl AppData {
             start_frame,
             end_frame,
         });
-        self.status_message =
-            format!("Bounce (with FX): '{}' を render 中...", clip_name);
+        let label = match mode {
+            BounceMode::InPlace => "Bounce In Place",
+            BounceMode::WithFx => "Bounce (with FX)",
+        };
+        self.status_message = format!("{label}: '{clip_name}' を render 中...");
+    }
+
+    /// FIXME #42: In Place = 音源/synth の素の音 (insert FX 抜き) を engine offline
+    /// render で焼き、**同じクリップに置換** (async)。歌唱の合成待ちは `request_bounce` 経由。
+    fn bounce_clip_in_place(&mut self, target: ClipRef) {
+        self.request_bounce(target, BounceMode::InPlace);
+    }
+
+    /// FIXME #42: bounce の入口。歌唱トラックは合成が非同期 HTTP で走るため、 render の
+    /// 前に `sync_vocal_metadata` で合成を確実にトリガーしておく (= 編集直後でも synth
+    /// job が queue 済みになる)。 通常の編集→試聴→bounce フローでは synth_result が既に
+    /// cache 済みなので render は正しい歌声を焼く。
+    ///
+    /// TODO(#42 vocal-synth-ready IPC): 編集直後に試聴せず即 bounce した場合、 合成が
+    /// offline render より遅いと無音になりうる。 堅牢化には plugin host から「合成完了」
+    /// シグナル (`PrepareVocalSynth` → `VocalSynthReady`、 `pending_vocal_synth_bounce`
+    /// で待機) を受けてから render を開始する必要がある。 builtin の synth thread が
+    /// `synth_result` を store した時点で `PluginEvent::VocalSynthReady` を emit し、
+    /// `ChildToMain` 経由で daw_gui が `start_clip_bounce` を再開する設計
+    /// (`docs/plan_bounce_redesign.md` C-3、 ユーザー選択: 合成完了シグナルを追加)。
+    /// 合成完了の検知には builtin 側の generation tracking (= stale synth_result 回避) が
+    /// 要るため、 実機 (VOICEVOX server) 検証込みで別途実装する。
+    fn request_bounce(&mut self, target: ClipRef, mode: BounceMode) {
+        if self.pending_clip_fx_bounce.is_some() {
+            self.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
+            return;
+        }
+        if self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .is_some_and(common::model::Track::is_voicevox_vocal)
+        {
+            // 歌唱: render 前に合成を確実にトリガー (synth job を queue)。
+            self.sync_vocal_metadata();
+        }
+        self.start_clip_bounce(target, mode);
+    }
+
+    /// PR-C: plugin chain 込みで render し、 結果を **新 track + 新 Clip**
+    /// に配置 (`docs/plan_audio_followup.md` PR-C / `docs/plan_audio_clip
+    /// .md` §3.8 "Bounce")。 Bounce In Place (Pre-FX) と異なり async (=
+    /// IPC 経由で freewheel render 完了通知待ち)。 完了通知の handler
+    /// (`handle_bounce_clip_fx_complete`) 内で Undo snapshot を 1 回だけ
+    /// 取る。 既に bounce 進行中なら重複 request を拒否。
+    /// FIXME #42: With FX = 音源/synth + そのトラックの insert FX を engine offline
+    /// render で焼き、**新トラックに複製** + 元トラック自動ミュート (非破壊・二重再生
+    /// 回避、async)。対象クリップ 1 トラックだけを isolate するので他トラックは混ざらない
+    /// (旧実装は時間範囲の全ミックスを焼くバグがあった)。歌唱の合成待ちは `request_bounce` 経由。
+    fn bounce_clip_with_fx(&mut self, target: ClipRef) {
+        self.request_bounce(target, BounceMode::WithFx);
     }
 
     /// PR-C: BounceClipFxOnline 完了通知の処理。 SetRenderMode(Realtime)
@@ -11929,18 +11902,7 @@ impl AppData {
             }
         }
 
-        // 新 track 作成 (空 plugin chain)。 名前は元 clip 名 + " (FX)"。
-        let new_track_id = self.song.alloc_track_id();
-        let new_track_name = format!("{} (FX)", pending.clip_name);
-        let new_track = track_with(|t| {
-            t.id = new_track_id;
-            t.name = new_track_name.clone();
-            t.clips = Vec::new();
-        });
-        self.song.tracks.push(new_track);
-        let new_track_idx = self.song.tracks.len() - 1;
-
-        // 新 Clip = single-event content (= bounce 結果は flat な audio)。
+        // 新 Clip / 置換に使う共通 audio event (single-event = bounce 結果は flat な audio)。
         let new_event = AudioEvent {
             source_id: new_source_id,
             event_start_in_clip_beats: 0.0,
@@ -11949,34 +11911,75 @@ impl AppData {
             source_end_frames: frames,
             ..AudioEvent::default()
         };
-        let new_content_id = self.song.alloc_content(
-            common::model::ClipContent::Audio(common::model::AudioContent {
-                events: vec![new_event],
-            }),
-            format!("{} (bounced FX)", pending.clip_name),
-        );
 
-        let new_track_mut = &mut self.song.tracks[new_track_idx];
-        let new_clip_id = new_track_mut.alloc_clip_id();
-        new_track_mut.clips.push(common::model::Clip {
-            id: new_clip_id,
-            name: String::new(),
-            start_beat: pending.start_beat,
-            length_beats: pending.clip_length_beats,
-            content_id: new_content_id,
-            notes: Vec::new(),
-            color: None,
-            auto_lipsync: false,
-            ..Default::default()
-        });
+        match pending.mode {
+            BounceMode::WithFx => {
+                // 新 track 作成 (空 plugin chain)。 名前は元 clip 名 + " (FX)"。
+                let new_track_id = self.song.alloc_track_id();
+                let new_track_name = format!("{} (FX)", pending.clip_name);
+                let new_track = track_with(|t| {
+                    t.id = new_track_id;
+                    t.name = new_track_name.clone();
+                    t.clips = Vec::new();
+                });
+                self.song.tracks.push(new_track);
+                let new_track_idx = self.song.tracks.len() - 1;
 
-        self.resize_track_peak_display();
-        self.is_dirty = true;
-        self.sync_song_to_plugin_host();
-        self.status_message = format!(
-            "Bounce (with FX) 完了: 新トラック '{}' を追加",
-            new_track_name
-        );
+                let new_content_id = self.song.alloc_content(
+                    common::model::ClipContent::Audio(common::model::AudioContent {
+                        events: vec![new_event],
+                    }),
+                    format!("{} (bounced FX)", pending.clip_name),
+                );
+
+                let new_track_mut = &mut self.song.tracks[new_track_idx];
+                let new_clip_id = new_track_mut.alloc_clip_id();
+                new_track_mut.clips.push(common::model::Clip {
+                    id: new_clip_id,
+                    name: String::new(),
+                    start_beat: pending.start_beat,
+                    length_beats: pending.clip_length_beats,
+                    content_id: new_content_id,
+                    notes: Vec::new(),
+                    color: None,
+                    auto_lipsync: false,
+                    ..Default::default()
+                });
+
+                // FIXME #42: 二重再生回避のため元トラックを自動ミュート。 別 SetTrackMuted は
+                // 不要 (下の sync_song_to_plugin_host が muted=true 込みの full song を LoadSong)。
+                if let Some(src) = self.song.tracks.get_mut(source_track as usize) {
+                    src.muted = true;
+                }
+
+                self.resize_track_peak_display();
+                self.is_dirty = true;
+                self.sync_song_to_plugin_host();
+                self.status_message = format!(
+                    "Bounce (with FX) 完了: 新トラック '{new_track_name}' を追加 (元トラックはミュート)",
+                );
+            }
+            BounceMode::InPlace => {
+                // FIXME #42: 元クリップの content を bounce 結果 (single audio event) に
+                // 置換 (= flat 化)。 同 content_id を共有する linked clip も追従する。
+                let content_id = self
+                    .song
+                    .tracks
+                    .get(source_track as usize)
+                    .and_then(|t| t.clips.get(source_clip as usize))
+                    .map(|c| c.content_id);
+                if let Some(cid) = content_id
+                    && let Some(content) = self.song.clip_contents.get_mut(&cid)
+                {
+                    *content = common::model::ClipContent::Audio(common::model::AudioContent {
+                        events: vec![new_event],
+                    });
+                }
+                self.is_dirty = true;
+                self.sync_song_to_plugin_host();
+                self.status_message = format!("Bounce In Place 完了: '{}'", pending.clip_name);
+            }
+        }
     }
 
     /// `target` clip の first event の `reversed` 値を読む。 audio で

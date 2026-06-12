@@ -11,7 +11,7 @@ use daw_ui_renderer::{Color, Rect};
 use crate::app::{AppData, AppEvent};
 use crate::view::{
     arrangement_view, bottom_panel, close_confirm_modal, export_overlay, font_picker,
-    load_overlay, plugin_picker, recovery_modal, status_bar, track_inspector, track_picker,
+    load_overlay, plugin_picker, recovery_modal, snap, status_bar, track_inspector, track_picker,
     transport,
 };
 
@@ -671,6 +671,29 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         .is_some_and(|(px, py)| bottom_rect.contains(px, py));
     let is_pianoroll_active = app.bottom_panel == 1 && pointer_in_bottom;
     let surface = edit_surface(app, is_pianoroll_active);
+
+    // FIXME #44: f キー。カーソル直下の拍 (song-absolute) を現在の snap 設定で吸着して
+    // プレイヘッドを移動し再生する。piano_roll active ならピアノロールの hover (song-raw)、
+    // それ以外はアレンジの hover (raw) を使い、view 層でここで snap + routing を解決して
+    // song-absolute beat にする。どちらの grid 外でも hover は None なので no-op。
+    // Alt はライブ取得 (一時 snap 解除)。再生中 seek 継続 / 停止中 play() は handler 側。
+    if ui.take_shortcut("daw.play_from_cursor") {
+        let alt = ui.pointer().modifiers.alt;
+        let target_beat = if is_pianoroll_active {
+            app.pianoroll_hover_beat_song_raw.map(|raw| {
+                snap::piano_roll_snap_config(app).snap_beat(raw, alt, app.pianoroll_zoom_x)
+            })
+        } else {
+            app.arrangement_hover_beat_raw.map(|raw| {
+                snap::arrange_snap_config(app).snap_beat(raw, alt, app.arrange_zoom_x.max(1.0))
+            })
+        };
+        if let Some(beat) = target_beat {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::PlayFromCursor { beat });
+            }));
+        }
+    }
 
     // トラック copy/cut の非同期結果 (plugin state 収集後) を OS clipboard へ flush。
     if let Some(text) = app.pending_clipboard_write.clone() {
