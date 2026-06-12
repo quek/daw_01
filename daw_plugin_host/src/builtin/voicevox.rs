@@ -21,7 +21,7 @@
 //! re-synth 必要なので「最初から re-synth」 で統一。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
@@ -72,6 +72,9 @@ impl Default for VoicevoxState {
 struct SynthJob {
     bpm: f32,
     groups: Vec<SpeakerSynthSpec>,
+    /// FIXME #42: この job の世代 (= `synth_queued_gen` の値)。 synth thread は完了時に
+    /// `synth_done_gen` をこの値へ進める。 歌唱 bounce の合成完了待ちに使う。
+    generation: u64,
 }
 
 /// (FIXME #36) 1 声 (speaker) 分の合成指定。 その声を使う全 clip の note を
@@ -148,6 +151,12 @@ pub struct VoicevoxBuiltin {
     /// が write contention で blocking しない (旧 `Arc<RwLock<_>>` は
     /// write 中に read が block する RT 違反だった)。
     synth_result: Arc<ArcSwapOption<SynthResult>>,
+    /// FIXME #42: `set_note_metadata` が synth job を queue するたびに +1 する世代。
+    synth_queued_gen: Arc<AtomicU64>,
+    /// FIXME #42: synth thread が job を完了 (= `synth_result` を store) した世代。
+    /// 歌唱 bounce は `done >= queued` になるまで待って「最新メタデータの合成完了」を
+    /// 保証する (stale な synth_result を完了と誤認しない)。
+    synth_done_gen: Arc<AtomicU64>,
 
     // --- process state (audio thread) -----------------------------------
     /// 再生中 voice 群 (PR-V2.4)。 note_on で push、 wav 終端で自動 drain、
@@ -171,6 +180,8 @@ impl VoicevoxBuiltin {
             synth_thread: None,
             synth_shutdown: Arc::new(AtomicBool::new(false)),
             synth_result: Arc::new(ArcSwapOption::from(None)),
+            synth_queued_gen: Arc::new(AtomicU64::new(0)),
+            synth_done_gen: Arc::new(AtomicU64::new(0)),
             active_voices: Vec::new(),
             was_playing: false,
         }
@@ -187,6 +198,9 @@ impl VoicevoxBuiltin {
         }
         let (tx, rx) = mpsc::channel::<SynthJob>();
         let result_arc = Arc::clone(&self.synth_result);
+        // FIXME #42: 完了世代を進める Arc。 失敗 (retry) では進めず、 成功 / 空 job /
+        // placement 無し (= 合成は走ったが音無し) で job.generation へ進める。
+        let done_gen = Arc::clone(&self.synth_done_gen);
         // 直前セッションの stop で立った flag を必ずリセットしてから spawn。
         self.synth_shutdown.store(false, Ordering::SeqCst);
         let shutdown = Arc::clone(&self.synth_shutdown);
@@ -256,6 +270,7 @@ impl VoicevoxBuiltin {
                     };
                     if job.groups.iter().all(|c| c.notes.is_empty()) {
                         result_arc.store(None);
+                        done_gen.store(job.generation, Ordering::SeqCst);
                         continue;
                     }
                     // synth (= blocking HTTP) に入る直前に shutdown を再確認。
@@ -354,6 +369,7 @@ impl VoicevoxBuiltin {
                             + std::time::Duration::from_millis(1500);
                     } else if placed.is_empty() {
                         result_arc.store(None);
+                        done_gen.store(job.generation, Ordering::SeqCst);
                     } else {
                         // track 長 = max(placement + WAV 長)。 clip 間ギャップは 0 (無音)。
                         let total = placed
@@ -378,6 +394,7 @@ impl VoicevoxBuiltin {
                             note_offsets: Arc::new(global_offsets),
                         };
                         result_arc.store(Some(Arc::new(res)));
+                        done_gen.store(job.generation, Ordering::SeqCst);
                         tracing::info!(
                             speaker_groups = placed.len(),
                             "VoicevoxBuiltin: synth complete (per-speaker-group, song-absolute)"
@@ -663,14 +680,25 @@ impl LoadedPlugin for VoicevoxBuiltin {
             .map(|(speaker_id, notes)| SpeakerSynthSpec { speaker_id, notes })
             .collect();
 
+        // FIXME #42: 世代を 1 進めてから job に乗せる。 synth thread が完了でこの世代まで
+        // synth_done_gen を進めるので、 歌唱 bounce は done >= この値 を待てばよい。
+        let generation = self.synth_queued_gen.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(tx) = self.synth_tx.as_ref() {
-            let _ = tx.send(SynthJob { bpm, groups });
+            let _ = tx.send(SynthJob { bpm, groups, generation });
         }
         tracing::debug!(
             count = self.lyrics.len(),
             bpm,
             "VoicevoxBuiltin: lyrics buffer updated, synth job queued"
         );
+    }
+
+    /// FIXME #42: 歌唱 bounce の合成完了待ち用に `(queued_gen, done_gen)` を公開。
+    fn voicevox_synth_progress(&self) -> Option<(Arc<AtomicU64>, Arc<AtomicU64>)> {
+        Some((
+            Arc::clone(&self.synth_queued_gen),
+            Arc::clone(&self.synth_done_gen),
+        ))
     }
 
     // --- Embedded GUI (PR-V2.4 で speaker picker / progress bar) -----------

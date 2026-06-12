@@ -346,6 +346,9 @@ fn spawn_incoming_bridge(
                     error,
                     frames,
                 }),
+                ChildToMain::VocalSynthReady { plugin_id } => {
+                    Some(AppEvent::VocalSynthReady { plugin_id })
+                }
                 ChildToMain::Hello { .. } => None,
                 // Phase 2 (`docs/plan_automation.md` §7.5): plugin の
                 // parameter 一覧 / touch / value change を AppEvent に

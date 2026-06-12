@@ -51,6 +51,11 @@ pub enum PluginEvent {
         track: u32,
         index: u32,
     },
+    /// FIXME #42: builtin VOICEVOX の歌唱合成が要求世代まで完了 (or timeout) した。
+    /// `From<PluginEvent> for ChildToMain` が `ChildToMain::VocalSynthReady` に変換。
+    VocalSynthReady {
+        plugin_id: u32,
+    },
     SlotPluginLoaded {
         track: u32,
         index: u32,
@@ -136,6 +141,9 @@ impl From<PluginEvent> for ChildToMain {
             }
             PluginEvent::SlotGuiClosed { track, index } => {
                 ChildToMain::SlotGuiClosed { track, index }
+            }
+            PluginEvent::VocalSynthReady { plugin_id } => {
+                ChildToMain::VocalSynthReady { plugin_id }
             }
             PluginEvent::SlotPluginLoaded {
                 track,
@@ -292,6 +300,12 @@ enum PluginCommand {
     RemoveSlotPlugin {
         track: u32,
         index: u32,
+    },
+    /// FIXME #42: 歌唱 bounce 用に、 `plugin_id` の builtin VOICEVOX の合成が
+    /// (直前の metadata flush 世代まで) 完了するのを待って `PluginEvent::VocalSynthReady`
+    /// を emit する。 plugin-main が builtin の世代 Arc を見て poll thread を spawn する。
+    PrepareVocalSynth {
+        plugin_id: u32,
     },
     /// Single-chain redesign: apply a complete chain permutation as a live
     /// move. `moves` lists `(old_index, new_index)` for every loaded plugin
@@ -1378,6 +1392,47 @@ fn plugin_main_loop(
                         }
                     });
                 }
+                PluginCommand::PrepareVocalSynth { plugin_id } => {
+                    // FIXME #42: 歌唱 bounce の前に合成完了を保証する。 plugin_id の builtin
+                    // VOICEVOX の (queued, done) 世代 Arc を取り出し、 直前 flush 世代まで
+                    // done になるのを別 thread で poll して VocalSynthReady を emit する
+                    // (非同期 HTTP 合成が offline render より遅れて無音になるのを防ぐ)。
+                    // 該当 builtin が無い (= 歌唱でない / 未 load) なら即 ready。
+                    let target = plugin_lookup
+                        .iter()
+                        .find_map(|(k, v)| (*v == plugin_id).then_some(*k));
+                    let mut progress = None;
+                    if let Some((track, index)) = target {
+                        tracks.mutate(|t| {
+                            if let Some(plugin) = t.plugin_at_mut(track, index) {
+                                progress = plugin.voicevox_synth_progress();
+                            }
+                        });
+                    }
+                    if let Some((queued, done)) = progress {
+                        use std::sync::atomic::Ordering;
+                        let target_gen = queued.load(Ordering::SeqCst);
+                        let evt_thread = evt_tx.clone();
+                        let spawn = std::thread::Builder::new()
+                            .name("voicevox-bounce-synth-wait".into())
+                            .spawn(move || {
+                                let deadline = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(30);
+                                while done.load(Ordering::SeqCst) < target_gen
+                                    && std::time::Instant::now() < deadline
+                                {
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                }
+                                let _ = evt_thread.send(PluginEvent::VocalSynthReady { plugin_id });
+                            });
+                        if spawn.is_err() {
+                            // thread spawn 失敗時は bounce を hang させないよう即 ready。
+                            let _ = evt_tx.send(PluginEvent::VocalSynthReady { plugin_id });
+                        }
+                    } else {
+                        let _ = evt_tx.send(PluginEvent::VocalSynthReady { plugin_id });
+                    }
+                }
             }
         }
 
@@ -1880,6 +1935,10 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
                 bpm,
                 entries,
             });
+        }
+        MainToChild::PrepareVocalSynth { plugin_id } => {
+            tracing::info!(plugin_id, "received PrepareVocalSynth");
+            plugin.send(PluginCommand::PrepareVocalSynth { plugin_id });
         }
         MainToChild::ExportWav { .. } => {
             // ExportWav is consumed by daw_audio (which freewheels the

@@ -1208,6 +1208,10 @@ pub struct AppData {
     /// 配置。 path / source_track / source_clip は IPC echo back と
     /// pending entry を identifier 照合するために保持。
     pub pending_clip_fx_bounce: Option<PendingClipFxBounce>,
+    /// FIXME #42: 歌唱クリップ bounce の合成待ち。`PrepareVocalSynth` を送って
+    /// `VocalSynthReady` を待つ間 `Some((target, mode))` を退避し、 ready 受信で
+    /// `start_clip_bounce` を呼ぶ。歌唱以外の bounce では使わない。
+    pub pending_vocal_synth_bounce: Option<(ClipRef, BounceMode)>,
     /// FIXME #31: which (track, slot) plugin editors are currently open. The
     /// editor *windows* are now created and owned by the plugin-host process
     /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
@@ -1716,6 +1720,7 @@ impl AppData {
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
             pending_clip_fx_bounce: None,
+            pending_vocal_synth_bounce: None,
             open_plugin_guis: std::collections::HashSet::new(),
             track_peak_display: initial_peak_display,
             pending_plugin_loads: std::collections::HashSet::new(),
@@ -2573,6 +2578,8 @@ impl AppData {
                 | AppEvent::SetClipGainDbBatch(_)
                 | AppEvent::SetClipFadeBeatsBatch(_)
                 | AppEvent::SetClipFadeCurveBatch(_)
+                // FIXME #46: discrete トグル/ドロップダウンの一括適用 = 1 undo step。
+                | AppEvent::BroadcastDiscreteClipEdit { .. }
                 | AppEvent::DuplicateAudioEditorEvent
                 | AppEvent::SetAudioEventStart { .. }
                 | AppEvent::SetAudioEventTrim { .. }
@@ -4154,6 +4161,11 @@ pub enum AppEvent {
         error: Option<String>,
         frames: u64,
     },
+    /// FIXME #42: plugin host から歌唱合成完了 (or timeout) 通知。`pending_vocal_synth_bounce`
+    /// があれば歌唱 bounce の offline render (`start_clip_bounce`) を開始する。
+    VocalSynthReady {
+        plugin_id: u32,
+    },
 
     // ---- multi-clip drag batch (Phase 2 PR-B) ---------------------------
     /// gui_01 widget が multi-clip 一括 drag (= dB / fade / curve) を 1
@@ -4166,6 +4178,14 @@ pub enum AppEvent {
     SetClipFadeBeatsBatch(Vec<(ClipRef, FadeEdgeKind, f64)>),
     /// `(target, edge, curve)` 列で fade curve を一括設定。
     SetClipFadeCurveBatch(Vec<(ClipRef, FadeEdgeKind, common::model::FadeCurve)>),
+    /// FIXME #46: inspector のトグル / ドロップダウン (= discrete undoable 編集) を
+    /// 複数選択クリップへ一括適用する。 単発イベントをループで撃つと is_undoable の
+    /// auto-push で N スナップになるため、 これ 1 つで 1 スナップにまとめ、 handler 内で
+    /// per-clip setter (variant-safe) をループする。
+    BroadcastDiscreteClipEdit {
+        targets: Vec<ClipRef>,
+        edit: DiscreteClipEdit,
+    },
 
     // ---- Audio Editor scroll / zoom -----------------------------------
     /// Audio Editor の `view_start_beat` を変更 (= 水平 scroll)。
@@ -4286,6 +4306,21 @@ pub enum QuantizePitchTarget {
 pub enum FadeEdgeKind {
     In,
     Out,
+}
+
+/// FIXME #46: [`AppEvent::BroadcastDiscreteClipEdit`] が運ぶ discrete inspector 編集の
+/// 種別。 per-clip setter (`set_clip_*`) は対象 `ClipContent` variant 違いで no-op に
+/// なる (variant-safe) ので、 broadcast 先に種別違いのクリップが混ざっても安全
+/// (= その field を持つクリップにだけ適用される)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiscreteClipEdit {
+    Reversed(bool),
+    Muted(bool),
+    StretchMode(common::model::StretchMode),
+    FadeCurve(FadeEdgeKind, common::model::FadeCurve),
+    TextMuted(bool),
+    TextAlign(common::model::TextAlign),
+    TextFadeCurve(FadeEdgeKind, common::model::FadeCurve),
 }
 
 /// Audio Editor の event trim 側 (左端 / 右端) marker。 `SetAudioEventTrim`
@@ -5478,6 +5513,14 @@ impl AppData {
                     frames,
                 );
             }
+            AppEvent::VocalSynthReady { plugin_id } => {
+                // FIXME #42: 歌唱合成完了 (or timeout) 通知。 同時 bounce は 1 件なので
+                // plugin_id は echo back 用。 pending があれば offline render を開始する。
+                let _ = plugin_id;
+                if let Some((target, mode)) = self.pending_vocal_synth_bounce.take() {
+                    self.start_clip_bounce(target, mode);
+                }
+            }
             AppEvent::SetClipGainDbBatch(entries) => {
                 for (target, gain_db) in &entries {
                     self.set_clip_audio_event_gain_db(*target, *gain_db);
@@ -5504,6 +5547,48 @@ impl AppData {
                         FadeEdgeKind::Out => {
                             self.set_clip_audio_event_fade_out_curve(*target, *curve);
                         }
+                    }
+                }
+            }
+            AppEvent::BroadcastDiscreteClipEdit { targets, edit } => {
+                // FIXME #46: discrete トグル/ドロップダウンを選択全クリップへ一括適用。
+                // 1 イベント = 1 undo snapshot (is_undoable)、 ここで per-clip setter を
+                // ループする。 各 setter は variant-safe なので種別違いは no-op。
+                for &t in &targets {
+                    match edit {
+                        DiscreteClipEdit::Reversed(v) => self.set_clip_audio_event_reversed(t, v),
+                        DiscreteClipEdit::Muted(v) => {
+                            if self.is_image_clip(t) {
+                                self.set_clip_image_event_muted(t, v);
+                            } else {
+                                self.set_clip_audio_event_muted(t, v);
+                            }
+                        }
+                        DiscreteClipEdit::StretchMode(m) => {
+                            self.set_clip_audio_event_stretch_mode(t, m);
+                        }
+                        DiscreteClipEdit::FadeCurve(edge, c) => match edge {
+                            FadeEdgeKind::In => {
+                                if self.is_image_clip(t) {
+                                    self.set_clip_image_event_fade_in_curve(t, c);
+                                } else {
+                                    self.set_clip_audio_event_fade_in_curve(t, c);
+                                }
+                            }
+                            FadeEdgeKind::Out => {
+                                if self.is_image_clip(t) {
+                                    self.set_clip_image_event_fade_out_curve(t, c);
+                                } else {
+                                    self.set_clip_audio_event_fade_out_curve(t, c);
+                                }
+                            }
+                        },
+                        DiscreteClipEdit::TextMuted(v) => self.set_clip_text_event_muted(t, v),
+                        DiscreteClipEdit::TextAlign(a) => self.set_clip_text_event_align(t, a),
+                        DiscreteClipEdit::TextFadeCurve(edge, c) => match edge {
+                            FadeEdgeKind::In => self.set_clip_text_event_fade_in_curve(t, c),
+                            FadeEdgeKind::Out => self.set_clip_text_event_fade_out_curve(t, c),
+                        },
                     }
                 }
             }
@@ -11780,33 +11865,42 @@ impl AppData {
         self.request_bounce(target, BounceMode::InPlace);
     }
 
-    /// FIXME #42: bounce の入口。歌唱トラックは合成が非同期 HTTP で走るため、 render の
-    /// 前に `sync_vocal_metadata` で合成を確実にトリガーしておく (= 編集直後でも synth
-    /// job が queue 済みになる)。 通常の編集→試聴→bounce フローでは synth_result が既に
-    /// cache 済みなので render は正しい歌声を焼く。
-    ///
-    /// TODO(#42 vocal-synth-ready IPC): 編集直後に試聴せず即 bounce した場合、 合成が
-    /// offline render より遅いと無音になりうる。 堅牢化には plugin host から「合成完了」
-    /// シグナル (`PrepareVocalSynth` → `VocalSynthReady`、 `pending_vocal_synth_bounce`
-    /// で待機) を受けてから render を開始する必要がある。 builtin の synth thread が
-    /// `synth_result` を store した時点で `PluginEvent::VocalSynthReady` を emit し、
-    /// `ChildToMain` 経由で daw_gui が `start_clip_bounce` を再開する設計
-    /// (`docs/plan_bounce_redesign.md` C-3、 ユーザー選択: 合成完了シグナルを追加)。
-    /// 合成完了の検知には builtin 側の generation tracking (= stale synth_result 回避) が
-    /// 要るため、 実機 (VOICEVOX server) 検証込みで別途実装する。
+    /// FIXME #42: track の builtin VOICEVOX device の host plugin_id を `loaded_slots`
+    /// から引く (`sync_vocal_metadata` と同じ解決)。device 未挿入 / plugin_id 未確定
+    /// (load 完了通知前) なら `None`。
+    fn vocal_builtin_plugin_id(&self, track: &common::model::Track) -> Option<u32> {
+        let device_index = track.devices.iter().position(|d| {
+            d.format == common::plugin_format::PluginFormat::Builtin
+                && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
+        })?;
+        self.loaded_slots
+            .get(&(track.id, device_index as u32))
+            .map(|s| s.plugin_id)
+    }
+
+    /// FIXME #42: bounce の入口。歌唱トラックは合成が非同期 HTTP で走り、 offline render が
+    /// 合成完了前に終わると無音になるため、 metadata を flush して `PrepareVocalSynth` を
+    /// 送り、 plugin host の `VocalSynthReady`（builtin の synth 世代が最新メタデータまで
+    /// 進んだ通知）を待ってから `start_clip_bounce` する。歌唱以外 (Audio / 通常 MIDI)、
+    /// または plugin_id 未確定なら即 `start_clip_bounce`。
     fn request_bounce(&mut self, target: ClipRef, mode: BounceMode) {
-        if self.pending_clip_fx_bounce.is_some() {
+        if self.pending_clip_fx_bounce.is_some() || self.pending_vocal_synth_bounce.is_some() {
             self.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
-        if self
+        // 歌唱トラック + builtin plugin_id 解決済み → 合成完了を待ってから render。
+        let vocal_plugin_id = self
             .song
             .tracks
             .get(target.track as usize)
-            .is_some_and(common::model::Track::is_voicevox_vocal)
-        {
-            // 歌唱: render 前に合成を確実にトリガー (synth job を queue)。
+            .filter(|t| t.is_voicevox_vocal())
+            .and_then(|t| self.vocal_builtin_plugin_id(t));
+        if let Some(plugin_id) = vocal_plugin_id {
+            self.pending_vocal_synth_bounce = Some((target, mode));
             self.sync_vocal_metadata();
+            self.send_plugin(common::protocol::MainToChild::PrepareVocalSynth { plugin_id });
+            self.status_message = "Bounce: 歌唱を合成中...".into();
+            return;
         }
         self.start_clip_bounce(target, mode);
     }

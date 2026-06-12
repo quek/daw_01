@@ -503,6 +503,8 @@ async fn recv_loop(
             | Ok(MainToChild::CloseSlotGui { .. })
             | Ok(MainToChild::SetRenderMode(_))
             | Ok(MainToChild::SetBuiltinPluginNoteMetadata { .. })
+            // FIXME #42: 歌唱合成は plugin host が担うので audio engine は無視。
+            | Ok(MainToChild::PrepareVocalSynth { .. })
             | Ok(MainToChild::CloseWorkerPool) => {}
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");

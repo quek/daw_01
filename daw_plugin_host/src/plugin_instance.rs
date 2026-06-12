@@ -10,6 +10,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use anyhow::Result;
 
@@ -266,6 +267,15 @@ pub trait LoadedPlugin: Send {
     /// にも flush される。
     /// `docs/plan_voicevox_synth.md` PR-V2.2 / V2.3 で導入。
     fn set_note_metadata(&mut self, _bpm: f32, _entries: &[NoteMetadata]) {}
+
+    /// FIXME #42: builtin VOICEVOX の歌唱合成の `(queued_gen, done_gen)` 世代カウンタを
+    /// 返す (それ以外の plugin は `None`)。 plugin host が歌唱 bounce の前に、
+    /// `set_note_metadata` が増やした `queued_gen` まで synth thread が `done_gen` を
+    /// 進める (= 最新メタデータの合成完了) のを待つために使う。 stale な synth_result を
+    /// 「完了」 と誤認しないための世代比較に用いる。
+    fn voicevox_synth_progress(&self) -> Option<(Arc<AtomicU64>, Arc<AtomicU64>)> {
+        None
+    }
 
     // --- embedded Win32 GUI (plugin-main thread) ------------------------
     //

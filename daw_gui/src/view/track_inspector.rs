@@ -11,8 +11,8 @@ use daw_ui_core::{
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{
-    text_num_to_builtin, AppData, AppEvent, ClipRef, ColorPickerTarget, InspectorScrubField,
-    TextNumField,
+    text_num_to_builtin, AppData, AppEvent, ClipRef, ColorPickerTarget, DiscreteClipEdit,
+    FadeEdgeKind, InspectorScrubField, TextNumField,
 };
 use crate::view::track_color;
 use common::model::{FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
@@ -306,7 +306,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let toggle_h = 24.0;
         let row_w = area.w - pad * 2.0;
         let toggle_w = (row_w - 6.0) * 0.5;
-        let target_rev = summary.target;
         let new_rev = !summary.reversed;
         ui.toggle_button_at(
             "inspector_audio_reverse",
@@ -316,14 +315,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &TOGGLE_AUDIO_BASE,
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetClipReversed {
-                        target: target_rev,
-                        reversed: new_rev,
+                    // FIXME #46: 選択全クリップへ一括 (variant-safe broadcast)。
+                    app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                        targets: app.inspector_target_refs(),
+                        edit: DiscreteClipEdit::Reversed(new_rev),
                     })
                 })
             },
         );
-        let target_mute = summary.target;
         let new_mute = !summary.muted;
         ui.toggle_button_at(
             "inspector_audio_mute",
@@ -338,9 +337,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &TOGGLE_AUDIO_BASE,
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetClipMuted {
-                        target: target_mute,
-                        muted: new_mute,
+                    app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                        targets: app.inspector_target_refs(),
+                        edit: DiscreteClipEdit::Muted(new_mute),
                     })
                 })
             },
@@ -370,12 +369,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             STRETCH_MODE_LABELS,
             cur_idx,
         ) {
-            let target_sm = summary.target;
             let new_mode = stretch_mode_from_index(picked);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetClipStretchMode {
-                    target: target_sm,
-                    mode: new_mode,
+                app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                    targets: app.inspector_target_refs(),
+                    edit: DiscreteClipEdit::StretchMode(new_mode),
                 })
             }));
         }
@@ -516,12 +514,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             FADE_CURVE_LABELS,
             fade_in_idx,
         ) {
-            let target = summary.target;
             let new_curve = fade_curve_from_index(picked);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetClipFadeInCurve {
-                    target,
-                    curve: new_curve,
+                app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                    targets: app.inspector_target_refs(),
+                    edit: DiscreteClipEdit::FadeCurve(FadeEdgeKind::In, new_curve),
                 })
             }));
         }
@@ -559,12 +556,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             FADE_CURVE_LABELS,
             fade_out_idx,
         ) {
-            let target = summary.target;
             let new_curve = fade_curve_from_index(picked);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetClipFadeOutCurve {
-                    target,
-                    curve: new_curve,
+                app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                    targets: app.inspector_target_refs(),
+                    edit: DiscreteClipEdit::FadeCurve(FadeEdgeKind::Out, new_curve),
                 })
             }));
         }
@@ -611,7 +607,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
         // Mute toggle (image 用 1 個だけ。 audio の Reverse は無い)。
         let toggle_h = 24.0;
-        let target_mute = summary.target;
         let new_mute = !summary.muted;
         ui.toggle_button_at(
             "inspector_image_mute",
@@ -621,9 +616,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &TOGGLE_AUDIO_BASE,
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetClipMuted {
-                        target: target_mute,
-                        muted: new_mute,
+                    app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                        targets: app.inspector_target_refs(),
+                        edit: DiscreteClipEdit::Muted(new_mute),
                     })
                 })
             },
@@ -944,12 +939,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             FADE_CURVE_LABELS,
             fade_in_idx,
         ) {
-            let target = summary.target;
             let new_curve = fade_curve_from_index(picked);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetClipFadeInCurve {
-                    target,
-                    curve: new_curve,
+                app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                    targets: app.inspector_target_refs(),
+                    edit: DiscreteClipEdit::FadeCurve(FadeEdgeKind::In, new_curve),
                 })
             }));
         }
@@ -987,12 +981,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             FADE_CURVE_LABELS,
             fade_out_idx,
         ) {
-            let target = summary.target;
             let new_curve = fade_curve_from_index(picked);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetClipFadeOutCurve {
-                    target,
-                    curve: new_curve,
+                app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                    targets: app.inspector_target_refs(),
+                    edit: DiscreteClipEdit::FadeCurve(FadeEdgeKind::Out, new_curve),
                 })
             }));
         }
@@ -1192,7 +1185,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
         // Mute toggle
         let toggle_h = 24.0;
-        let target_mute = summary.target;
         let new_mute = !summary.muted;
         ui.toggle_button_at(
             "inspector_text_mute",
@@ -1202,9 +1194,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &TOGGLE_AUDIO_BASE,
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetClipTextMuted {
-                        target: target_mute,
-                        muted: new_mute,
+                    app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                        targets: app.inspector_target_refs(),
+                        edit: DiscreteClipEdit::TextMuted(new_mute),
                     })
                 })
             },
@@ -1285,16 +1277,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ALIGN_LABELS,
             align_idx,
         ) {
-            let target_align = summary.target;
             let new_align = match picked {
                 0 => TextAlign::Left,
                 2 => TextAlign::Right,
                 _ => TextAlign::Center,
             };
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetClipTextAlign {
-                    target: target_align,
-                    value: new_align,
+                app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                    targets: app.inspector_target_refs(),
+                    edit: DiscreteClipEdit::TextAlign(new_align),
                 })
             }));
         }
@@ -1467,12 +1458,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             FADE_CURVE_LABELS,
             curve_to_idx(summary.fade_in_curve),
         ) {
-            let target_curve = summary.target;
             let new_curve = idx_to_curve(picked);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetClipTextFadeInCurve {
-                    target: target_curve,
-                    curve: new_curve,
+                app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                    targets: app.inspector_target_refs(),
+                    edit: DiscreteClipEdit::TextFadeCurve(FadeEdgeKind::In, new_curve),
                 })
             }));
         }
@@ -1491,12 +1481,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             FADE_CURVE_LABELS,
             curve_to_idx(summary.fade_out_curve),
         ) {
-            let target_curve = summary.target;
             let new_curve = idx_to_curve(picked);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetClipTextFadeOutCurve {
-                    target: target_curve,
-                    curve: new_curve,
+                app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
+                    targets: app.inspector_target_refs(),
+                    edit: DiscreteClipEdit::TextFadeCurve(FadeEdgeKind::Out, new_curve),
                 })
             }));
         }

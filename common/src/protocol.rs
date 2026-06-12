@@ -79,6 +79,13 @@ pub enum ChildToMain {
         error: Option<String>,
         frames: u64,
     },
+    /// FIXME #42: builtin VOICEVOX の歌唱合成が `MainToChild::PrepareVocalSynth`
+    /// で要求した世代まで完了した (or タイムアウトした) ことを daw_gui に通知する。
+    /// daw_gui は `pending_vocal_synth_bounce` が一致すれば歌唱 bounce の offline
+    /// render を開始する。 `plugin_id` は要求を echo back する builtin の host id。
+    VocalSynthReady {
+        plugin_id: u32,
+    },
     /// Plugin-host confirmed `SetSlotPlugin` and reported the stable id /
     /// display name of the descriptor that actually loaded.
     /// `plugin_id` is the host's session-unique identifier for this
@@ -324,6 +331,13 @@ pub enum MainToChild {
         plugin_id: u32,
         bpm: f32,
         entries: Vec<crate::plugin_metadata::NoteMetadata>,
+    },
+    /// FIXME #42: 歌唱 bounce の前に builtin VOICEVOX の合成完了を要求する。 直前に
+    /// 送った `SetBuiltinPluginNoteMetadata` の世代まで synth が終わったら plugin host が
+    /// `ChildToMain::VocalSynthReady` を返す (非同期 HTTP 合成が offline render より
+    /// 遅れて無音になるのを防ぐ)。 `plugin_id` は対象 builtin の host id。
+    PrepareVocalSynth {
+        plugin_id: u32,
     },
     /// Tell the plugin host to switch every loaded plugin's CLAP render
     /// mode (Realtime ↔ Offline). The audio side bookends an export
