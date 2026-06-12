@@ -1667,11 +1667,18 @@ fn clip_zone_at(
     })
 }
 
-/// lanes 内 cursor 位置から hit する (ClipKey, ClipDragKind) を返す (後勝ち)。
+/// lanes 内 cursor 位置から hit する (ClipKey, ClipDragKind) を返す。
 ///
 /// resize handle は clip rect の左右 edge から **内外** ±`resize_handle_px` の範囲
 /// (= 8px 幅のハンドル帯)。短 clip (`r.w <= resize_handle_px * 2`) は rect 内は Move 強制、
 /// rect 外側のみ resize 判定。
+///
+/// 隣接 clip (A.right == B.left) では両者の resize ハンドル帯が共有境界付近で重なる。
+/// このとき **cursor が rect 内部に在る clip (in-rect) を、外側拡張ハンドル
+/// (outer-extension) しか当たらない clip より無条件で優先**する。これにより A の右端を
+/// 掴みたいのに B の左端 resize に奪われる問題 (#101) を解消。同 tier (両方 in-rect = overlap、
+/// または両方 outer = 微小 gap) は resize edge への水平距離が近い方を採用し、同距離なら
+/// 後勝ち (描画順で前面) を踏襲する。piano_roll の [`note_hit_in`](super::piano_roll) と構造同一。
 #[must_use]
 pub fn clip_hit(
     visible_tracks: &[ArrangementTrack],
@@ -1689,11 +1696,33 @@ pub fn clip_hit(
     let track = visible_tracks.get(visible_idx)?;
     let row_top = tops[visible_idx];
     let mut hit: Option<(ClipKey, ClipDragKind)> = None;
+    let mut hit_inside = false;
+    let mut hit_edge_dist = f32::INFINITY;
     for clip in &track.clips {
-        if let Some(kind) =
+        let Some(kind) =
             clip_zone_at(row_top, view.track_row_h, clip, view, lanes, cx, cy, resize_handle_px)
-        {
+        else {
+            continue;
+        };
+        let r = clip_to_rect(row_top, view.track_row_h, clip, view, lanes);
+        let inside = cx >= r.x && cx < r.x + r.w;
+        // resize edge への水平距離 (Move は当該 cursor 位置 = 距離 0 扱い)。
+        let edge_x = match kind {
+            ClipDragKind::ResizeLeft => r.x,
+            ClipDragKind::ResizeRight => r.x + r.w,
+            ClipDragKind::Move => cx,
+        };
+        let dist = (cx - edge_x).abs();
+        // in-rect は outer に無条件で勝つ。同 tier は近い edge 優先 (同距離は後勝ち)。
+        let better = if inside == hit_inside {
+            dist <= hit_edge_dist
+        } else {
+            inside
+        };
+        if better {
             hit = Some((ClipKey { track: track.id, clip: clip.id }, kind));
+            hit_inside = inside;
+            hit_edge_dist = dist;
         }
     }
     hit
@@ -7637,12 +7666,73 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
+        // ---- M14 Phase 125 (#102): plain-drag marquee gate (空き zone の press を marquee が所有) ----
+        // 旧設計は rect-select 起動に Shift 必須だったが、 標準 DAW (REAPER/Live/Bitwig) に倣い
+        // **空き zone を無修飾 drag → 範囲選択** にする。 clip 上の plain drag は移動のまま。 修飾は
+        // release 時の next 計算で plain=REPLACE / Shift=UNION / Ctrl=XOR に分岐し、 press 時 modifier は
+        // `take_drag_rect_in_rect` が `DragRect.modifiers` に snapshot する (下の commit block で読む)。
+        // gate を **clear の前** で評価して `marquee_active` を作り、 同フレーム二重 emit を防ぐ。
+        // `clip_hit().is_none()` は load-bearing: clip MOVE は `(!shift||ctrl)` gate (#021) なので hit-test
+        // 無しだと Shift/Ctrl+clip press が誤って marquee 起動する (= Ctrl+Shift clone も clip HIT 時のみ
+        // なので安全)。 automation lane は lasso が所有するため `!press_in_automation_lane` で除外
+        // (no_session は `automation_lasso_drag` を含まないのでこの zone 除外が必須)。 splitter / 他 drag は
+        // no_session (= 全 session None) で除外 (splitter press は `automation_lane_resize_drag` を立てる)。
+        let drag_rect_wid = wid.child(b"rect_select");
+        let shift_rect_active = {
+            let state: &mut crate::widgets::drag_rect::DragRectState =
+                self.widget_state(drag_rect_wid);
+            state.drag_start.is_some()
+        };
+        let press_in_automation_lane = pointer.primary_just_pressed
+            && pointer.pos.is_some_and(|(_, py)| {
+                automation_lane_at(
+                    &visible_tracks,
+                    &press_tops,
+                    view.track_row_h,
+                    header_pane.x,
+                    header_pane.w,
+                    lanes.x,
+                    lanes.w,
+                    style,
+                    py,
+                )
+                .is_some()
+            });
+        let marquee_press = if pointer.primary_just_pressed
+            && !pointer.modifiers.alt
+            && !press_in_automation_lane
+            && let Some((px, py)) = pointer.pos
+            && lanes.contains(px, py)
+            && clip_hit(&visible_tracks, &press_tops, view, lanes, px, py, style.resize_handle_px)
+                .is_none()
+        {
+            let s: &ArrangementState = self.widget_state(wid);
+            s.track_volume_drag.is_none()
+                && s.track_reorder.is_none()
+                && s.audio_drag.is_none()
+                && s.clip_drag.is_none()
+                && s.automation_lane_default_drag.is_none()
+                && s.automation_point_drag.is_none()
+                && s.automation_clip_drag.is_none()
+                && s.automation_lane_resize_drag.is_none()
+                && s.track_row_resize_drag.is_none()
+                && s.playhead_drag.is_none()
+                && s.loop_drag.is_none()
+                && s.automation_curve_param_drag.is_none()
+        } else {
+            false
+        };
+        let marquee_active = marquee_press || shift_rect_active;
+
         // ---- pure release on empty lanes (no drag started) → SelectClips clear ----
-        // clip_drag_session が無い + 空白 release + Shift なし
+        // clip_drag_session が無い + 空白 release + Shift なし。 #102: marquee がこの空き zone press を
+        // 所有する frame (`marquee_active`) は下の commit が zero-rect REPLACE で clear するため、 ここでは
+        // push しない (= 同フレーム二重 emit / undo 二重を防ぐ。 daw_01 #102「二重 emit 抑制」)。
         if pointer.primary_just_released
             && clip_short_click_pos.is_none()
             && !clip_drag_release_was_some
             && !pointer.modifiers.shift
+            && !marquee_active
             && let Some((cx, cy)) = pointer.pos
             && lanes.contains(cx, cy)
             && clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px).is_none()
@@ -7711,69 +7801,54 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- Shift+drag rect select (lanes 内で加算) ----
-        // M14 Phase 63e follow-up (#021): **Ctrl+Shift** は clip_drag 側で
-        // `CloneClipsIndependent` を emit する独立コピー意図のため、 rect select セッションを
-        // 同時起動しない (`!ctrl` で除外)。 これを入れずに Ctrl+Shift+press したとき:
-        //   - 上の press 振り分けで clip_drag 起動 (`(!shift || ctrl)` 経由)
-        //   - ここで rect select 起動 → cyan overlay 描画 + release 時 `SelectClips` push
-        //   両方走って `CloneClipsIndependent` の後 `SelectClips` で selection が上書きされ、
-        //   user 視点「rect select に化けて clone が起きない」 症状になる。
-        // M14 Phase 63n-8 (#033): **automation lane 内 press の Shift+drag は lasso 専用** (Q2=A の
-        // zone 排他)、 MIDI rect_select は **MIDI/Audio track row のみ** で起動する。 press が automation
-        // lane 内なら shift_press を false にして session 起動を抑制 — lasso session は上の press 振り分け
-        // で既に立っているので、 こちらは抑止だけで OK。 `press_in_automation_lane` は press frame のみ
-        // 評価する (continuation / release は session で追跡)、 `automation_lane_at` の y 判定で十分。
-        let press_in_automation_lane = pointer.primary_just_pressed
-            && pointer.pos.is_some_and(|(_, py)| {
-                automation_lane_at(
-                    &visible_tracks,
-                    &press_tops,
-                    view.track_row_h,
-                    header_pane.x,
-                    header_pane.w,
-                    lanes.x,
-                    lanes.w,
-                    style,
-                    py,
-                )
-                .is_some()
-            });
-        let drag_rect_wid = wid.child(b"rect_select");
-        let shift_rect_active = {
-            let state: &mut crate::widgets::drag_rect::DragRectState =
-                self.widget_state(drag_rect_wid);
-            state.drag_start.is_some()
-        };
-        let shift_press = pointer.primary_just_pressed
-            && pointer.modifiers.shift
-            && !pointer.modifiers.ctrl
-            && !press_in_automation_lane;
-        if (shift_press || shift_rect_active)
+        // ---- M14 Phase 125 (#102): marquee commit (modifier 分岐: plain=REPLACE / Shift=UNION / Ctrl=XOR) ----
+        // gate `marquee_active` と `drag_rect_wid` は上の clear ガード手前で計算済 (空き zone press のみ所有)。
+        // `take_drag_rect_in_rect` は呼ぶだけで cyan overlay を自動描画し、 press 時 modifier を
+        // `DragRect.modifiers` に snapshot する。 release frame (`drag.finished`) に inside を計算して修飾で
+        // next を分岐。 REPLACE は inside そのまま (zero-rect → 空 → 選択 clear)。 `prev != next` ガードで
+        // no-op を抑制 (automation lasso #033 と同 idiom)。 Ctrl+Shift clone は clip HIT 時のみ (gate の
+        // `clip_hit().is_none()`) なので、 ここに来る press は必ず空き zone = clone と競合しない。
+        if marquee_active
             && let Some(drag) = self.take_drag_rect_in_rect(drag_rect_wid, lanes)
         {
             response.rect_select_active = true;
-            if drag.modifiers.shift && drag.finished {
+            if drag.finished {
                 let drag_rect = drag.rect();
-                let mut set: HashSet<ClipKey> = selected_clips.iter().copied().collect();
+                let mut inside: Vec<ClipKey> = Vec::new();
                 for (i, t) in visible_tracks.iter().enumerate() {
                     let row_top = press_tops[i];
                     for c in &t.clips {
                         let r = clip_to_rect(row_top, view.track_row_h, c, view, lanes);
                         if rects_intersect(r, drag_rect) {
-                            set.insert(ClipKey { track: t.id, clip: c.id });
+                            inside.push(ClipKey { track: t.id, clip: c.id });
                         }
                     }
                 }
-                let mut new_keys: Vec<ClipKey> = set.into_iter().collect();
-                new_keys.sort_by_key(|a| (a.track, a.clip));
-                let mut prev_sorted: Vec<ClipKey> = selected_clips.to_vec();
-                prev_sorted.sort_by_key(|a| (a.track, a.clip));
-                if prev_sorted != new_keys {
-                    self.push_edit(make_edit(ArrangementEditRequest::SelectClips {
-                        prev: selected_clips.to_vec(),
-                        next: new_keys,
-                    }));
+                let prev: Vec<ClipKey> = selected_clips.to_vec();
+                let next: Vec<ClipKey> = if drag.modifiers.shift {
+                    // UNION: prev 順を保持しつつ inside の新規だけ append。
+                    let mut out = prev.clone();
+                    for k in inside {
+                        if !out.contains(&k) {
+                            out.push(k);
+                        }
+                    }
+                    out
+                } else if drag.modifiers.ctrl {
+                    // XOR: prev に在って inside にも在る key を除き、 inside の新規を追加。
+                    let mut out: Vec<ClipKey> =
+                        prev.iter().copied().filter(|k| !inside.contains(k)).collect();
+                    for k in inside {
+                        if !prev.contains(&k) {
+                            out.push(k);
+                        }
+                    }
+                    out
+                } else {
+                    inside // REPLACE (zero-rect なら空 = clear)
+                };
+                if next != prev {
+                    self.push_edit(make_edit(ArrangementEditRequest::SelectClips { prev, next }));
                     response.selection_changed = true;
                 }
             }
@@ -8955,21 +9030,33 @@ mod tests {
     }
 
     #[test]
-    fn clip_hit_adjacent_clips_back_wins_at_shared_handle() {
+    fn clip_hit_adjacent_clips_inside_clip_owns_shared_handle() {
+        // clip A (id 100, start=0, len=4) → rect x∈[0,160]、右端拡張 [156,164)
+        // clip B (id 101, start=4, len=4) → rect x∈[160,320]、左端拡張 [156,164)
+        // 共有境界 boundary=160。各 clip は自分の rect 内側のハンドル px を所有する
+        // (in-rect は outer-extension に無条件で勝つ / #101、piano_roll note_hit_in と対)。
         let view = test_view();
         let lanes = test_lanes();
-        // clip A (id 100, start=0, len=4) → x∈[0,160]、右端拡張 [156,164)
-        // clip B (id 101, start=4, len=4) → x∈[160,320]、左端拡張 [156,164)
-        // cx=161 は両方の拡張ハンドル領域 → 後勝ちで B
         let tracks = vec![track(
             10,
             "t0",
             vec![clip(100, 0.0, 4.0, "a"), clip(101, 4.0, 4.0, "b")],
         )];
         let tops = make_tops(&tracks, lanes, view);
-        let hit = clip_hit(&tracks, &tops, view, lanes, 161.0, 16.0, 4.0);
+        // cx=159: A の rect 内側 (in-rect ResizeRight) が B の外側ハンドル (outer ResizeLeft)
+        // に勝つ。旧 last-wins では B ResizeLeft だった回帰ケース。
         assert_eq!(
-            hit,
+            clip_hit(&tracks, &tops, view, lanes, 159.0, 16.0, 4.0),
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
+        );
+        // cx=161: B の rect 内側 (in-rect ResizeLeft) が A の外側ハンドル (outer) に勝つ。
+        assert_eq!(
+            clip_hit(&tracks, &tops, view, lanes, 161.0, 16.0, 4.0),
+            Some((ClipKey { track: 10, clip: 101 }, ClipDragKind::ResizeLeft))
+        );
+        // cx=160: 共有境界。半開区間で B の rect 内側 → B の左端 resize。
+        assert_eq!(
+            clip_hit(&tracks, &tops, view, lanes, 160.0, 16.0, 4.0),
             Some((ClipKey { track: 10, clip: 101 }, ClipDragKind::ResizeLeft))
         );
     }
@@ -13207,5 +13294,237 @@ mod tests {
         assert_eq!(press_then_drag(10.0), 0, "indent 空白 press は volume drag を起動しない");
         // x=120 = indent 済 band 内 → volume drag 起動 (continuation で SetTrackVolume)。
         assert!(press_then_drag(120.0) >= 1, "indent 済 band 位置 press は volume drag を起動する");
+    }
+
+    // ============================================================
+    // M14 Phase 125 (#102): plain-drag marquee select (REPLACE / UNION / XOR)
+    // ============================================================
+
+    /// #102 marquee helper: press(modifiers) → release を 2 frame 流し、 発行された `SelectClips` の
+    /// (回数, 最後の next) と `MoveClips` 回数を返す。 test_view (len_beats=16, row_h=32, header/ruler=0)、
+    /// rect 800×400 ⇒ beat_to_px=50。 clip A=[0,200] / B=[400,600]、 y[2,30]。
+    fn run_marquee(
+        tracks: &[ArrangementTrack],
+        view: ArrangementView,
+        selected: &[ClipKey],
+        mods: daw_ui_platform::Modifiers,
+        press: (f32, f32),
+        release: (f32, f32),
+    ) -> (usize, Option<Vec<ClipKey>>, usize) {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let area = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let style = ArrangementStyle::default();
+        let select_count = Arc::new(Mutex::new(0usize));
+        let move_count = Arc::new(Mutex::new(0usize));
+        let last_next: Arc<Mutex<Option<Vec<ClipKey>>>> = Arc::new(Mutex::new(None));
+
+        let mut frame = |input: FrameInput| {
+            let mut scene = Scene::new();
+            let sc = Arc::clone(&select_count);
+            let mc = Arc::clone(&move_count);
+            let ln = Arc::clone(&last_next);
+            let _ = host.frame_to_edits(&(), &mut scene, screen, input, |(), ui| {
+                let _ = ui.arrangement(
+                    "arr",
+                    area,
+                    tracks,
+                    view,
+                    selected,
+                    &[],
+                    &[],
+                    &[],
+                    &style,
+                    None,
+                    move |req| {
+                        match &req {
+                            ArrangementEditRequest::SelectClips { next, .. } => {
+                                *sc.lock().unwrap() += 1;
+                                *ln.lock().unwrap() = Some(next.clone());
+                            }
+                            ArrangementEditRequest::MoveClips(_) => {
+                                *mc.lock().unwrap() += 1;
+                            }
+                            _ => {}
+                        }
+                        Edit::mutate(|(): &mut ()| {})
+                    },
+                );
+            });
+        };
+
+        frame(FrameInput {
+            pointer: PointerFrame {
+                pos: Some(press),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                modifiers: mods,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        });
+        frame(FrameInput {
+            pointer: PointerFrame {
+                pos: Some(release),
+                primary_just_released: true,
+                modifiers: mods,
+                ..PointerFrame::default()
+            },
+            ..FrameInput::default()
+        });
+
+        let c = *select_count.lock().unwrap();
+        let m = *move_count.lock().unwrap();
+        let n = last_next.lock().unwrap().clone();
+        (c, n, m)
+    }
+
+    fn marquee_tracks() -> Vec<ArrangementTrack> {
+        vec![track(0, "t", vec![clip(100, 0.0, 4.0, "a"), clip(101, 8.0, 4.0, "b")])]
+    }
+    fn ck(clip: u32) -> ClipKey {
+        ClipKey { track: 0, clip }
+    }
+
+    /// 空き zone の **無修飾** drag = marquee REPLACE。 prev [A] を捨てて rect 内 {B} に置換。
+    #[test]
+    fn arrangement_plain_drag_empty_is_replace() {
+        let tracks = marquee_tracks();
+        // press (250,15) は A(0..200) と B(400..600) の隙間 = 空き。 drag rect (250,15)-(650,20) は B のみ交差。
+        let (count, next, _) = run_marquee(
+            &tracks,
+            test_view(),
+            &[ck(100)],
+            daw_ui_platform::Modifiers::empty(),
+            (250.0, 15.0),
+            (650.0, 20.0),
+        );
+        assert_eq!(count, 1, "release で 1 回だけ SelectClips");
+        assert_eq!(next, Some(vec![ck(101)]), "REPLACE: prev [A] 破棄、 rect 内 [B]");
+    }
+
+    /// 空き zone の **Shift** drag = marquee UNION。 prev [A] に rect 内 {B} を加算。
+    #[test]
+    fn arrangement_shift_drag_empty_is_union() {
+        let tracks = marquee_tracks();
+        let (count, next, _) = run_marquee(
+            &tracks,
+            test_view(),
+            &[ck(100)],
+            daw_ui_platform::Modifiers { shift: true, ..daw_ui_platform::Modifiers::empty() },
+            (250.0, 15.0),
+            (650.0, 20.0),
+        );
+        assert_eq!(count, 1);
+        assert_eq!(next, Some(vec![ck(100), ck(101)]), "UNION: prev [A] ∪ {{B}} = [A,B]");
+    }
+
+    /// 空き zone の **Ctrl** drag = marquee XOR (toggle)。 prev [A,B] から rect 内 {B} を除去。
+    #[test]
+    fn arrangement_ctrl_drag_empty_is_xor() {
+        let tracks = marquee_tracks();
+        let (count, next, _) = run_marquee(
+            &tracks,
+            test_view(),
+            &[ck(100), ck(101)],
+            daw_ui_platform::Modifiers { ctrl: true, ..daw_ui_platform::Modifiers::empty() },
+            (250.0, 15.0),
+            (650.0, 20.0),
+        );
+        assert_eq!(count, 1);
+        assert_eq!(next, Some(vec![ck(100)]), "XOR: [A,B] ^ {{B}} = [A]");
+    }
+
+    /// clip の上の **無修飾** drag は marquee ではなく MOVE (SelectClips 発行しない)。
+    #[test]
+    fn arrangement_plain_drag_on_clip_is_move_not_select() {
+        let tracks = marquee_tracks();
+        // press (100,15) = clip A 中央 → clip drag。 release (300,15) = +200px (>4px、 Move commit)。
+        let (select_count, _, move_count) = run_marquee(
+            &tracks,
+            test_view(),
+            &[ck(100)],
+            daw_ui_platform::Modifiers::empty(),
+            (100.0, 15.0),
+            (300.0, 15.0),
+        );
+        assert_eq!(select_count, 0, "clip 上 plain drag は marquee 不発 (SelectClips ゼロ)");
+        assert!(move_count >= 1, "clip drag は MoveClips を発行する");
+    }
+
+    /// 空き zone の sub-4px 無修飾 press+release (同フレーム) は marquee zero-rect REPLACE で
+    /// **ちょうど 1 回** `SelectClips{next:[]}` を emit する (pure-release clear との二重 emit ガード)。
+    #[test]
+    fn arrangement_subpx_empty_press_emits_single_clear() {
+        use std::sync::Mutex;
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        let tracks = marquee_tracks();
+        let selected = vec![ck(100)];
+        let view = test_view();
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let area = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let style = ArrangementStyle::default();
+        let count = Arc::new(Mutex::new(0usize));
+        let last_next: Arc<Mutex<Option<Vec<ClipKey>>>> = Arc::new(Mutex::new(None));
+        let cc = Arc::clone(&count);
+        let ln = Arc::clone(&last_next);
+
+        let _ = host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((250.0, 15.0)),
+                    primary_just_pressed: true,
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            },
+            |(), ui| {
+                let _ = ui.arrangement(
+                    "arr",
+                    area,
+                    &tracks,
+                    view,
+                    &selected,
+                    &[],
+                    &[],
+                    &[],
+                    &style,
+                    None,
+                    move |req| {
+                        if let ArrangementEditRequest::SelectClips { next, .. } = &req {
+                            *cc.lock().unwrap() += 1;
+                            *ln.lock().unwrap() = Some(next.clone());
+                        }
+                        Edit::mutate(|(): &mut ()| {})
+                    },
+                );
+            },
+        );
+        assert_eq!(
+            *count.lock().unwrap(),
+            1,
+            "空き sub-px press は ちょうど 1 回 SelectClips (二重 emit ガード固定)"
+        );
+        assert_eq!(last_next.lock().unwrap().clone(), Some(vec![]), "REPLACE zero-rect で clear");
     }
 }

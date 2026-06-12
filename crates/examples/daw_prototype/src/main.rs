@@ -1287,6 +1287,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                 mm.last_action = format!("transport: scrubable BPM → {v_f32:.1}");
             })
         },
+        None,
     );
 
     // strip 背景

@@ -401,6 +401,7 @@ fn main() {
                 &scn_style,
                 "scrub",
                 |_v: f64| Edit::mutate(|_m: &mut Model| {}),
+                None,
             );
             // M14 Phase 88 (daw_01 #058): color_picker widget が non-Clone Model でコンパイルする。
             // Model に一切触れない (response を返すだけ) ので構造的に no-Clone 安全だが、API が

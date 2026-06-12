@@ -1344,9 +1344,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// - **note 中央 Ctrl+drag** = copy (release で `PianoRollEditRequest::Copy` 発行、Undoable、daw_01 #054)
     /// - **note 左右端 drag** = resize (release で `PianoRollEditRequest::Resize` 発行、Undoable)
     /// - **note click** (drag<4px) = selection 1 個 (`PianoRollEditRequest::Select` 発行)
-    /// - **空白 click** = selection clear (同上)
-    /// - **Shift+drag** = rect multi-select、**加算** (release で `PianoRollEditRequest::Select` 発行、
-    ///   既存 `selected` ∪ rect 内の note ids)。排他にしたい場合は空白 click で clear してから drag
+    /// - **空白 drag** (無修飾) = rect marquee select、**REPLACE** (rect 内 note ids で置換、#102)。
+    ///   `Shift+drag` = **UNION** (既存 `selected` ∪ rect 内)、`Ctrl+drag` = **XOR** (toggle)。
+    ///   いずれも release で `PianoRollEditRequest::Select` 発行 (Undoable)
+    /// - **空白 click** (無修飾、drag<4px) = selection clear (= zero-rect の REPLACE marquee)
     /// - **Insert** shortcut = pointer 位置に新規 note 追加 (`PianoRollEditRequest::Add`)。
     ///   `id` は user 側で `next_note_id` 等で割り当て、`make_edit` callback 内で参照する
     ///   ため、widget は **id=0 placeholder で `Add(vec![note_with_id_0])` を渡す**。
@@ -1459,8 +1460,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let visible: &[Note] = &notes[s_idx..e_idx];
 
         // ----- press 振り分け (state 更新) -----
-        // Shift+drag は take_drag_rect_in_rect が drag state を握るので、ここでは
-        // 「Shift なし note hit」だけ widget が drag を始める。
+        // 空き grid の drag は marquee (take_drag_rect_in_rect) が drag state を握るので (#102、
+        // gate の `note_hit().is_none()` で除外)、 ここでは「Shift なし note hit」だけ widget が drag を
+        // 始める。 この **!shift gate** は load-bearing: marquee gate が `note_hit().is_none()` を持つ前提で、
+        // Shift+note press が note drag を起動しない (= marquee にも行かない) ことで成立する。
         // M14 Phase 59: editing_mode 中は drag/click を全短絡。
         let just_pressed_on_note = !editing_mode
             && pointer.primary_just_pressed
@@ -1885,6 +1888,35 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.set_cursor(CursorIcon::Default);
         }
 
+        // ----- M14 Phase 125 (#102): plain-drag marquee gate (空き grid press を marquee が所有) -----
+        // 旧設計は rect-select 起動に Shift 必須だったが、 空き grid を無修飾 drag → 範囲選択にする
+        // (標準 DAW 慣習)。 note 上の plain drag は移動のまま。 修飾は release 時の next 計算で
+        // plain=REPLACE / Shift=UNION / Ctrl=XOR に分岐。 gate を **pending_click 計算の前** で評価して
+        // `marquee_active` を作り、 空き click clear (pending_click) が marquee の zero-rect REPLACE と
+        // 同フレーム二重 emit するのを防ぐ (空き clear は下の :2219 で marquee :2380 より先に消費される
+        // ため、 前方 bool での抑制が必須 — daw_01 #102「二重 emit 抑制」)。 `note_hit().is_none()` は
+        // load-bearing: note MOVE は !shift gate なので hit-test 無しだと Shift+note press が誤って marquee
+        // 起動する。 Alt は除外、 `note_drag` が press 時 None (= 真の空き press) を要求。
+        let drag_rect_wid = wid.child(b"rect_select");
+        let shift_rect_active = {
+            let state: &mut crate::widgets::drag_rect::DragRectState =
+                self.widget_state(drag_rect_wid);
+            state.drag_start.is_some()
+        };
+        let marquee_press = if !editing_mode
+            && pointer.primary_just_pressed
+            && !pointer.modifiers.alt
+            && let Some((px, py)) = pointer.pos
+            && grid.contains(px, py)
+            && note_hit(notes, view, grid, px, py, style.resize_handle_px).is_none()
+        {
+            let s: &PianoRollState = self.widget_state(wid);
+            s.note_drag.is_none()
+        } else {
+            false
+        };
+        let marquee_active = marquee_press || shift_rect_active;
+
         // ----- pending click 判定 -----
         // 2 通り: (a) drag が起こらなかった pure release、(b) drag は始まったが <16px で
         // click に格下げされた release。どちらも grid 上の click として selection 切替の
@@ -1897,7 +1929,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let pending_click: Option<(f32, f32)> = if editing_mode
             || drag_release.is_some()
             || velocity_drag_release.is_some()
+            || marquee_active
         {
+            // #102: marquee がこの空き grid press を所有する frame は marquee 側が zero-rect REPLACE で
+            // clear する。 ここで pending_click を立てると同フレーム二重 emit になるため None。
             None
         } else if let Some(p) = drag_short_click_pos {
             Some(p)
@@ -2377,47 +2412,54 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.push_edit(make_edit(PianoRollEditRequest::SetLoopRange { start, end }));
         }
 
-        // ----- Shift+drag rect multi-select (加算) -----
-        // `take_drag_rect_in_rect` は呼ぶだけで cyan 半透明 overlay を自動描画するため、
-        // pan / note drag と紛らわしくないよう **「Shift 押下時の press」または「既に rect-select
-        // drag が active」のときだけ呼ぶ**。drag 開始は press 時に Shift を見て gate、
-        // drag 中は state.drag_start.is_some() で active 判定して呼び続ける (release で finished)。
-        //
-        // 加算の意味: release frame で `next = prev ∪ rect_inside`。daw_01 旧自前実装と
-        // DAW 業界慣習 (Cubase / Logic / Bitwig) に合わせる。排他 (現選択を捨てて新規 rect)
-        // は「空白 click で clear → Shift+drag」の 2 ステップで実現可能 (新規 API 不要)。
-        let drag_rect_wid = wid.child(b"rect_select");
-        let shift_rect_active = {
-            let state: &mut crate::widgets::drag_rect::DragRectState =
-                self.widget_state(drag_rect_wid);
-            state.drag_start.is_some()
-        };
-        let shift_press = pointer.primary_just_pressed && pointer.modifiers.shift;
-        // M14 Phase 59: editing_mode 中は Shift+drag rect select も短絡。
+        // ----- M14 Phase 125 (#102): marquee commit (plain=REPLACE / Shift=UNION / Ctrl=XOR) -----
+        // gate `marquee_active` / `drag_rect_wid` は pending_click 計算の前で算出済 (空き grid press のみ)。
+        // `take_drag_rect_in_rect` は呼ぶだけで cyan 半透明 overlay を自動描画し、 press 時 modifier を
+        // `DragRect.modifiers` に snapshot する。 release frame (`drag.finished`) に inside を集めて修飾で
+        // next を分岐 (`sort_unstable` 後に `prev != next` で no-op 抑制)。 REPLACE は inside そのまま
+        // (zero-rect → 空 = 選択 clear)。 editing_mode 中は marquee_press が false なので走らない。
         if !editing_mode
-            && (shift_press || shift_rect_active)
+            && marquee_active
             && let Some(drag) = self.take_drag_rect_in_rect(drag_rect_wid, grid)
         {
             response.rect_select_active = true;
-            if drag.modifiers.shift && drag.finished {
+            if drag.finished {
                 let drag_rect = drag.rect();
-                let mut set: HashSet<NoteId> = selected.iter().copied().collect();
+                let mut inside: Vec<NoteId> = Vec::new();
                 for n in visible {
                     let r = note_to_rect(n, view, grid);
                     if rects_intersect(r, drag_rect) {
-                        set.insert(n.id);
+                        inside.push(n.id);
                     }
                 }
-                let mut new_ids: Vec<NoteId> = set.into_iter().collect();
-                new_ids.sort_unstable();
                 let prev: Vec<NoteId> = selected.to_vec();
+                let mut next: Vec<NoteId> = if drag.modifiers.shift {
+                    // UNION: prev に inside の新規だけ append。
+                    let mut out = prev.clone();
+                    for id in &inside {
+                        if !out.contains(id) {
+                            out.push(*id);
+                        }
+                    }
+                    out
+                } else if drag.modifiers.ctrl {
+                    // XOR: prev に在って inside にも在る id を除き、 inside の新規を追加。
+                    let mut out: Vec<NoteId> =
+                        prev.iter().copied().filter(|id| !inside.contains(id)).collect();
+                    for id in &inside {
+                        if !prev.contains(id) {
+                            out.push(*id);
+                        }
+                    }
+                    out
+                } else {
+                    inside // REPLACE (zero-rect → 空 = clear)
+                };
+                next.sort_unstable();
                 let mut prev_sorted = prev.clone();
                 prev_sorted.sort_unstable();
-                if prev_sorted != new_ids {
-                    self.push_edit(make_edit(PianoRollEditRequest::Select {
-                        prev,
-                        next: new_ids,
-                    }));
+                if prev_sorted != next {
+                    self.push_edit(make_edit(PianoRollEditRequest::Select { prev, next }));
                     response.selection_changed = true;
                 }
             }
@@ -4157,6 +4199,208 @@ mod tests {
             "加算: prev [3] + rect 内 {{1, 2}} = sorted [1, 2, 3]"
         );
         assert_eq!(model.last_select_prev, Some(vec![3]));
+    }
+
+    /// #102: 空き grid の **無修飾** drag = marquee REPLACE。 prev [3] を捨てて rect 内 {1,2} に置換。
+    #[test]
+    fn piano_roll_plain_drag_empty_is_replace() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![
+            note(1, 0.5, 0.5, 65),
+            note(2, 1.0, 0.5, 64),
+            note(3, 3.0, 0.5, 60),
+        ]);
+        model.selected = vec![3];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        let area = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+
+        // Frame 1: plain press at (50,50) (空白) — marquee 開始。
+        let sel1 = model.selected.clone();
+        run_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((50.0, 50.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |ui| {
+                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel1, &style, make_dispatch());
+            },
+        );
+        assert_eq!(model.last_request, None, "drag 中は Select 発行せず");
+
+        // Frame 2: plain release at (350,200) — rect (50,50)-(350,200) 内 {1,2} で REPLACE。
+        let sel2 = model.selected.clone();
+        run_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((350.0, 200.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |ui| {
+                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel2, &style, make_dispatch());
+            },
+        );
+        assert_eq!(model.last_request, Some(RequestKind::Select));
+        assert_eq!(model.last_select_next, Some(vec![1, 2]), "REPLACE: prev [3] 破棄、 rect 内 [1,2]");
+        assert_eq!(model.last_select_prev, Some(vec![3]));
+    }
+
+    /// #102: 空き grid の **Ctrl** drag = marquee XOR (toggle)。 prev [1,3] と rect 内 {1,2} の
+    /// 対称差 = {3,2} → sorted [2,3] (1 は両方に在り除外、 2 は追加、 3 は保持)。
+    #[test]
+    fn piano_roll_ctrl_drag_empty_is_xor() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![
+            note(1, 0.5, 0.5, 65),
+            note(2, 1.0, 0.5, 64),
+            note(3, 3.0, 0.5, 60),
+        ]);
+        model.selected = vec![1, 3];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        let area = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::empty() };
+
+        let sel1 = model.selected.clone();
+        run_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((50.0, 50.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    modifiers: ctrl,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |ui| {
+                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel1, &style, make_dispatch());
+            },
+        );
+        let sel2 = model.selected.clone();
+        run_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((350.0, 200.0)),
+                    primary_just_released: true,
+                    modifiers: ctrl,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |ui| {
+                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel2, &style, make_dispatch());
+            },
+        );
+        assert_eq!(model.last_select_next, Some(vec![2, 3]), "XOR: [1,3] ^ {{1,2}} = [2,3]");
+    }
+
+    /// #102: note の上の **無修飾** drag は marquee ではなく MOVE (Select 発行しない)。
+    #[test]
+    fn piano_roll_plain_drag_on_note_is_move_not_select() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(1, 0.5, 0.5, 65)]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        let area = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+
+        // press at (150,125) = note 1 中央 (x[100,200] y[116.67,133.33]) → note drag (Move)。
+        let sel1 = model.selected.clone();
+        run_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((150.0, 125.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |ui| {
+                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel1, &style, make_dispatch());
+            },
+        );
+        // release at (260,125) = +110px (>4px、 demote されず Move commit)。
+        let sel2 = model.selected.clone();
+        run_frame(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((260.0, 125.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+            |ui| {
+                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel2, &style, make_dispatch());
+            },
+        );
+        assert_eq!(model.last_request, Some(RequestKind::Move), "note 上 plain drag は Move、 marquee 不発");
+    }
+
+    /// #102: 空き grid の sub-4px 無修飾 press+release (同フレーム) は marquee zero-rect REPLACE で
+    /// **ちょうど 1 回** `Select{next:[]}` を emit する (pending_click との二重 emit ガード固定)。
+    #[test]
+    fn piano_roll_subpx_empty_press_emits_single_clear() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(1, 0.5, 0.5, 65)]);
+        model.selected = vec![1];
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        let area = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let sel = model.selected.clone();
+
+        // press+release 同フレーム、 空白 (50,50)、 無修飾。
+        let edits = {
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 800, height: 400 };
+            host.frame_to_edits(
+                &model,
+                &mut scene,
+                screen,
+                FrameInput {
+                    pointer: PointerFrame {
+                        pos: Some((50.0, 50.0)),
+                        primary_just_pressed: true,
+                        primary_just_released: true,
+                        ..PointerFrame::default()
+                    },
+                    ..Default::default()
+                },
+                |_, ui| {
+                    let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel, &style, make_dispatch());
+                },
+            )
+        };
+        assert_eq!(edits.len(), 1, "空き sub-px press は ちょうど 1 個の Edit (= marquee REPLACE clear)");
+        for e in edits {
+            e.apply(&mut model);
+        }
+        assert_eq!(model.last_select_next, Some(vec![]), "Select{{next:[]}} で clear");
     }
 
     /// 旧仕様 (Alt+drag rect select) は廃止された: Alt+drag で press → release しても

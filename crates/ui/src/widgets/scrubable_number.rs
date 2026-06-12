@@ -190,6 +190,11 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
     /// `label`: drag scrub の history label (= Ctrl+Z で表示される undo 単位名)。 dblclick reset /
     ///   text commit も同 label を共有 (drag 中含む user 操作はすべて 1 undo step に集約)。
     /// `on_change`: 値変化時の Edit を作る closure (knob_at と同形、 `Edit::Mutate` 限定で渡すこと)。
+    /// `placeholder`: `Some(s)` かつ **idle** (`!editing_text && drag_anchor 無`) のとき、 数値の
+    ///   代わりに `s` を描画する (= 複数選択で値が割れている mixed 項目を `"—"` 表示する用途、 daw_01 #103)。
+    ///   drag scrub 中 / 編集中は live 値・編集中テキストを優先 (placeholder 抑制)。 編集開始時の
+    ///   text_input seed は placeholder ではなく渡された base `value` を `format` した文字列。
+    ///   通常は `None`。
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn scrubable_number_at<F>(
         &mut self,
@@ -201,6 +206,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         style: &ScrubableNumberStyle,
         label: &'static str,
         on_change: F,
+        placeholder: Option<&str>,
     ) -> ScrubableNumberResponse
     where
         F: Fn(f64) -> Edit<M> + Clone + Send + Sync + 'static,
@@ -406,7 +412,16 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             } else {
                 style.bg_color
             };
+            // placeholder: Some かつ idle (drag/press 中でない) のとき、 数値の代わりに
+            // placeholder を描画 (= mixed 選択の「—」表示、 daw_01 #103)。 drag scrub 中は
+            // live 値を出すため抑制 (`drag_anchor.is_none()` で gate)。
+            let show_placeholder = placeholder.filter(|_| drag_anchor.is_none());
+            let text = match show_placeholder {
+                Some(ph) => ph.to_string(),
+                None => format_value(displayed_value, format),
+            };
             // input_hash で cache: 同じ表示値 / 同じ rect / 同じ bg なら再描画 skip。
+            // placeholder の有無 + 内容も fold (= 選択変更で「—」⇔数値が切替わったとき stale 防止)。
             let input_hash = hash_inputs((
                 b"scrubable_number",
                 rect.x.to_bits(),
@@ -417,8 +432,9 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 dragging_now,
                 hovered(rect, pointer),
                 style.font_size.to_bits(),
+                show_placeholder.is_some(),
+                show_placeholder.unwrap_or(""),
             ));
-            let text = format_value(displayed_value, format);
             let style_copy = *style;
             self.with_widget_node(wid, input_hash, |ui| {
                 draw_scrubable_number(ui, rect, &text, bg_fill, &style_copy);
@@ -498,12 +514,30 @@ mod tests {
         format: ScrubableNumberFormat,
         style: &ScrubableNumberStyle,
         pointer: PointerFrame,
+        placeholder: Option<&str>,
     ) -> Vec<Edit<BpmModel>> {
         let mut scene = Scene::new();
+        run_frame_scene(host, model, rect, value, default_value, format, style, pointer, placeholder, &mut scene)
+    }
+
+    /// `run_frame` と同一だが、 描画後の `scene` を呼び出し側に残す (= 描画テキストの検査用)。
+    #[allow(clippy::too_many_arguments)]
+    fn run_frame_scene(
+        host: &mut UiHost<BpmModel>,
+        model: &BpmModel,
+        rect: Rect,
+        value: f64,
+        default_value: f64,
+        format: ScrubableNumberFormat,
+        style: &ScrubableNumberStyle,
+        pointer: PointerFrame,
+        placeholder: Option<&str>,
+        scene: &mut Scene,
+    ) -> Vec<Edit<BpmModel>> {
         let screen = PhysicalSize { width: 200, height: 100 };
         host.frame_to_edits(
             model,
-            &mut scene,
+            scene,
             screen,
             FrameInput { pointer, ..Default::default() },
             |_, ui| {
@@ -516,6 +550,7 @@ mod tests {
                     style,
                     "scrub bpm",
                     |v| Edit::mutate(move |m: &mut BpmModel| m.bpm = v),
+                    placeholder,
                 );
             },
         )
@@ -581,6 +616,7 @@ mod tests {
         let edits = run_frame(
             &mut host, &model, rect, model.bpm, 120.0,
             ScrubableNumberFormat::Decimal(1), &style, press_at(center, false),
+            None,
         );
         for e in edits { e.apply(&mut model); }
         // drag up 20px (dy = -20) → expected 120 + (-(-20)) * 0.5 = 120 + 10 = 130
@@ -588,6 +624,7 @@ mod tests {
             &mut host, &model, rect, model.bpm, 120.0,
             ScrubableNumberFormat::Decimal(1), &style,
             hold_at((center.0, center.1 - 20.0), false),
+            None,
         );
         for e in edits { e.apply(&mut model); }
 
@@ -606,6 +643,7 @@ mod tests {
         let edits = run_frame(
             &mut host, &model, rect, model.bpm, 120.0,
             ScrubableNumberFormat::Decimal(1), &style, press_at(center, true),
+            None,
         );
         for e in edits { e.apply(&mut model); }
         // drag up 20px Ctrl → expected 120 + 20 * 0.5 * 0.1 = 120 + 1 = 121
@@ -613,6 +651,7 @@ mod tests {
             &mut host, &model, rect, model.bpm, 120.0,
             ScrubableNumberFormat::Decimal(1), &style,
             hold_at((center.0, center.1 - 20.0), true),
+            None,
         );
         for e in edits { e.apply(&mut model); }
 
@@ -635,6 +674,7 @@ mod tests {
         let edits = run_frame(
             &mut host, &model, rect, model.bpm, 120.0,
             ScrubableNumberFormat::Integer, &style, press_at(center, false),
+            None,
         );
         for e in edits { e.apply(&mut model); }
         // drag up 100px → raw = 200 + 100 * 10 = 1200、 clamp で 240。
@@ -642,6 +682,7 @@ mod tests {
             &mut host, &model, rect, model.bpm, 120.0,
             ScrubableNumberFormat::Integer, &style,
             hold_at((center.0, center.1 - 100.0), false),
+            None,
         );
         for e in edits { e.apply(&mut model); }
 
@@ -664,11 +705,13 @@ mod tests {
         let edits = run_frame(
             &mut host, &model, rect, model.bpm, 120.0,
             ScrubableNumberFormat::Decimal(1), &style, press_at(center, false),
+            None,
         );
         for e in edits { e.apply(&mut model); }
         let edits = run_frame(
             &mut host, &model, rect, model.bpm, 120.0,
             ScrubableNumberFormat::Decimal(1), &style, release_at(center),
+            None,
         );
         for e in edits { e.apply(&mut model); }
 
@@ -678,9 +721,93 @@ mod tests {
         let edits = run_frame(
             &mut host, &model, rect, model.bpm, 120.0,
             ScrubableNumberFormat::Decimal(1), &style, press_at(center, false),
+            None,
         );
         for e in edits { e.apply(&mut model); }
 
         assert!((model.bpm - 120.0).abs() < 1e-5, "dblclick で default 120.0 にリセット (got {})", model.bpm);
+    }
+
+    /// 描画された glyph テキスト一覧を取り出す (placeholder 描画の検査用)。
+    fn glyph_texts(scene: &Scene) -> Vec<String> {
+        scene.iter_glyphs().map(|g| g.text.as_ref().to_string()).collect()
+    }
+
+    /// daw_01 #103: placeholder = Some は **idle 時のみ** 数値の代わりに描画 (mixed「—」)、
+    /// drag scrub 中は抑制。 選択切替 Some→None は同 value/rect でも input_hash fold で即反映。
+    #[test]
+    fn placeholder_shows_when_idle_and_suppressed_during_drag() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let center = (40.0_f32, 14.0_f32);
+        let idle = PointerFrame::default();
+
+        // (1) idle + Some("—") → 「—」描画、 数値は出ない。
+        let mut scene = Scene::new();
+        run_frame_scene(
+            &mut host, &model, rect, 120.0, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, idle, Some("—"), &mut scene,
+        );
+        let t = glyph_texts(&scene);
+        assert!(t.iter().any(|s| s == "—"), "idle placeholder で「—」描画 (got {t:?})");
+        assert!(!t.iter().any(|s| s == "120.0"), "placeholder 中は数値を出さない (got {t:?})");
+
+        // (2) 選択切替 Some→None: 同 value/rect でも input_hash fold で即「120.0」に切替
+        //     (fold 漏れだと cache HIT で「—」が残る回帰ケース)。
+        let mut scene = Scene::new();
+        run_frame_scene(
+            &mut host, &model, rect, 120.0, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, idle, None, &mut scene,
+        );
+        let t = glyph_texts(&scene);
+        assert!(t.iter().any(|s| s == "120.0"), "placeholder None で数値に即切替 (got {t:?})");
+        assert!(!t.iter().any(|s| s == "—"), "切替後「—」が残らない (got {t:?})");
+
+        // (3) drag 中 (press → hold 20px) + Some("—") → placeholder 抑制、 live 値 130.0 を描画。
+        run_frame_scene(
+            &mut host, &model, rect, 120.0, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), Some("—"),
+            &mut Scene::new(),
+        );
+        let mut scene = Scene::new();
+        run_frame_scene(
+            &mut host, &model, rect, 120.0, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style,
+            hold_at((center.0, center.1 - 20.0), false), Some("—"), &mut scene,
+        );
+        let t = glyph_texts(&scene);
+        assert!(!t.iter().any(|s| s == "—"), "drag 中は placeholder 抑制 (got {t:?})");
+        assert!(t.iter().any(|s| s == "130.0"), "drag 中は live 値 130.0 (120 + 20*0.5) (got {t:?})");
+    }
+
+    /// daw_01 #103: 編集開始 (短 click) で内側 text_input は placeholder ではなく base value から
+    /// seed され、 編集中は placeholder「—」を抑制する。
+    #[test]
+    fn placeholder_suppressed_in_edit_mode_seeds_from_value() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle::default();
+        let center = (40.0_f32, 14.0_f32);
+
+        // press → release (< 4px = 短 click) で editing 突入。 placeholder は Some("—")。
+        run_frame_scene(
+            &mut host, &model, rect, 120.0, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), Some("—"),
+            &mut Scene::new(),
+        );
+        let mut scene = Scene::new();
+        run_frame_scene(
+            &mut host, &model, rect, 120.0, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, release_at(center), Some("—"), &mut scene,
+        );
+        let t = glyph_texts(&scene);
+        assert!(!t.iter().any(|s| s == "—"), "編集中は placeholder「—」を抑制 (got {t:?})");
+        assert!(
+            t.iter().any(|s| s.contains("120.0")),
+            "編集開始で base value 120.0 から seed (got {t:?})"
+        );
     }
 }
