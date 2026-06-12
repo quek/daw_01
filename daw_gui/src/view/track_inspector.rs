@@ -1647,89 +1647,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
-    // ---- Parent group dropdown ---------------------------------------
-    // Reaper folder / Live group equivalent. The selected track can
-    // optionally be reparented under any other track that already has
-    // children (or any track really — the cycle check in
-    // `action_set_track_parent` rejects bad picks). Master bus =
-    // "(top-level)" sentinel.
-    if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i)) {
-        // Candidates: tracks that already have at least one child (= are
-        // groups in the Reaper-folder sense), excluding the selected
-        // track itself and any of its descendants. Picking a non-group
-        // track as parent is also valid, but the dropdown only surfaces
-        // existing groups — to convert a regular track into a group,
-        // the user picks it as parent here and the act of pointing at
-        // it makes it one. PR2 phase 1 keeps the simpler "groups only"
-        // candidate list; expand later if it surfaces as a friction.
-        // group_ids[k] と labels[k+1] が対応 (labels[0] = "(top-level)" sentinel)。
-        // 表示名はここで 1 度だけ format/clone する (別 Vec への再 clone を避ける)。
-        let mut group_ids: Vec<u32> = Vec::new();
-        let mut labels: Vec<String> = Vec::new();
-        labels.push("(top-level)".into());
-        for t in app
-            .song
-            .tracks
-            .iter()
-            .filter(|t| app.is_group_track(t.id) && t.id != track.id)
-        {
-            group_ids.push(t.id);
-            labels.push(if t.name.is_empty() {
-                format!("Group {}", t.id)
-            } else {
-                t.name.clone()
-            });
-        }
-
-        ui.label_at(
-            "inspector_parent_label",
-            "Parent",
-            area.x + pad,
-            y,
-            12.0,
-            TEXT_DIM,
-        );
-        y += 18.0;
-
-        let dropdown_rect = Rect {
-            x: area.x + pad,
-            y,
-            w: area.w - pad * 2.0,
-            h: 24.0,
-        };
-
-        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-
-        let selected_idx = match track.parent_group_id {
-            None => 0,
-            Some(pid) => group_ids
-                .iter()
-                .position(|id| *id == pid)
-                .map(|i| i + 1)
-                .unwrap_or(0),
-        };
-
-        if let Some(picked) = ui.dropdown(
-            "inspector_parent_dropdown",
-            dropdown_rect,
-            &label_refs,
-            selected_idx,
-        ) {
-            let new_parent = if picked == 0 {
-                None
-            } else {
-                group_ids.get(picked - 1).copied()
-            };
-            let track_id = track.id;
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetTrackParent {
-                    track_id,
-                    parent_id: new_parent,
-                });
-            }));
-        }
-        y += 30.0;
-    }
+    // ---- 親グループ (Parent) の編集 UI はインスペクタから撤去した (FIXME #39) ----
+    // 親子 (グループ階層) の編集はアレンジビューでのトラックドラッグ
+    // (`ArrangementEditRequest::SetTrackParent`) 一本に統一する。階層は
+    // アレンジの入れ子インデントで可視化されるので、同じ概念をインスペクタの
+    // ドロップダウンでも編集できると Single Source of Truth が崩れる。
+    // `AppEvent::SetTrackParent` / `action_set_track_parent` 自体はアレンジ
+    // ドラッグが使うため残す。
 
     // ---- 口パク (lip-sync) 出力先 binding ----------------------------
     // Vocal track のみ。生成した口画像 ImageEvent を焼き込む先の口 track

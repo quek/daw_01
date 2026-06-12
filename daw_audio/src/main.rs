@@ -130,12 +130,15 @@ async fn recv_loop(
                 shared.looping.store(b, Ordering::Release);
             }
             Ok(MainToChild::SeekTo { samples }) => {
-                // SharedState::playhead は audio thread が毎 buffer
-                // store するので、 IPC 受信スレッドで store するのは
-                // race にならない (= 直前の値が一瞬だけ見えるが、 次
-                // buffer で確実に上書き)。 GUI 側 ruler click 経由で
-                // ユーザーが想定する位置に飛ぶ。
-                shared.playhead.store(samples, Ordering::Release);
+                // FIXME #41: playhead を IPC 受信スレッドから直接書かない。
+                // audio thread も buffer 末で playhead を store するため、両者が
+                // 同一 atomic を別スレッドから書く race になり、Stop 直後の開始
+                // 位置への巻き戻しが in-flight buffer の advance に上書きされて
+                // 停止位置から再生されるバグ (= FIXME #41) を生む。seek 要求は
+                // pending_seek に積み、audio thread が process_buffer 冒頭で
+                // swap 消費して playhead に反映する (playhead の writer を audio
+                // thread 単独に保つ)。ruler click / Stop 復帰の双方ともこの経路。
+                shared.pending_seek.store(samples, Ordering::Release);
                 tracing::info!(samples, "received SeekTo");
             }
             Ok(MainToChild::LoadSong(mut song)) => {

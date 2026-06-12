@@ -131,6 +131,11 @@ impl PlaybackCommand {
     }
 }
 
+/// `pending_seek` の sentinel = 「seek 要求なし」。playhead はサンプル単位で、
+/// この値 (u64::MAX サンプル ≈ 数百万年) に達することは現実的に無いので
+/// 「要求なし」を表す番兵に使える。
+pub const NO_PENDING_SEEK: u64 = u64::MAX;
+
 /// State shared between the audio thread and the IPC receive loop /
 /// future GUI commands. Every field is wait-free: the audio thread reads
 /// these on every buffer; the IPC side writes them on each command.
@@ -139,8 +144,17 @@ pub struct SharedState {
     pub playback: AtomicU8,
     pub looping: AtomicBool,
     /// Last published playhead in samples. Mirrored to shmem for the GUI
-    /// playhead cursor.
+    /// playhead cursor. **書き込みは audio thread (`process_buffer`) 単独**。
+    /// IPC スレッドは seek を `pending_seek` に積むだけで、ここを直接書かない
+    /// (FIXME #41: 直接書くと buffer 末の advance store と race して、Stop 直後
+    /// に停止位置へ巻き戻る = 開始位置に戻らないバグになる)。
     pub playhead: AtomicU64,
+    /// FIXME #41: GUI からの `SeekTo` 要求を audio thread に渡す single-writer
+    /// チャネル。IPC 受信スレッドが目標サンプル位置を `store`、audio thread が
+    /// `process_buffer` 冒頭で `swap` 消費して `playhead` に反映する。これにより
+    /// `playhead` の writer を audio thread 単独に保ち、停止/seek の競合を排除する。
+    /// `NO_PENDING_SEEK` = 要求なし。多重要求は last-wins。
+    pub pending_seek: AtomicU64,
     /// Phase 4 Step C-2 (`docs/plan_automation.md` §6): currently recording
     /// lane set (= GUI が `SetRecordingLanes` で更新)。 audio thread は
     /// 各 buffer の頭で `load()` し、 `fill_track_param_ramps` で該当 lane
@@ -164,6 +178,7 @@ impl SharedState {
             playback: AtomicU8::new(PlaybackCommand::Stop as u8),
             looping: AtomicBool::new(false),
             playhead: AtomicU64::new(0),
+            pending_seek: AtomicU64::new(NO_PENDING_SEEK),
             recording_lanes: arc_swap::ArcSwap::from_pointee(
                 std::collections::HashSet::new(),
             ),
@@ -684,6 +699,19 @@ impl LocalState {
             return;
         }
 
+        // FIXME #41: GUI からの seek 要求を audio thread 単独 writer として
+        // `playhead` に反映する。IPC スレッドが `playhead` を直接書くと、下の
+        // buffer 末 advance store と同一 atomic を別スレッドから書く race になり、
+        // Stop 直後 (in-flight buffer がまだ playing で advance する瞬間) に開始
+        // 位置への巻き戻しが上書きされて停止位置から再生されてしまう。`swap` で
+        // 消費する (多重要求は last-wins)。ここで `playhead` を書き換えておけば、
+        // 下の `playhead` load → seek 検出 (`playhead != last_known_playhead`) が
+        // `playhead_beats` を再同期する。
+        let pending_seek = shared.pending_seek.swap(NO_PENDING_SEEK, Ordering::AcqRel);
+        if pending_seek != NO_PENDING_SEEK {
+            shared.playhead.store(pending_seek, Ordering::Release);
+        }
+
         // Play / Stop edge handling. On Play, restart playhead and clear
         // active notes. On Stop, queue offs at frame 0 of the next buffer
         // so plugins drain cleanly.
@@ -691,13 +719,13 @@ impl LocalState {
         match (self.playing, desired) {
             (false, PlaybackCommand::Play) => {
                 self.playing = true;
-                // 旧挙動: Play で必ず playhead を 0 に戻す。 これは
-                // 「ruler click で位置を変えても Play 押すと頭から
-                // 再生される」 という不便さの原因。 業界標準 (REAPER /
-                // Ableton / Studio One) は「Play は現在の playhead
-                // から再生」、 ホームに戻すのは別 shortcut (= Home キー
-                // 等)。 daw_01 もそれに合わせ、 SeekTo IPC で書き込ま
-                // れた現在の playhead をそのまま使う。
+                // Play は **現在の playhead からそのまま再生する** (頭出しは
+                // しない)。「どこから再生するか」「停止でどこへ戻すか」は GUI 側
+                // が所有する (FIXME #41 のモデル A = Pro Tools / Ableton 流の
+                // 「停止すると再生を押した位置に戻る」)。GUI は play() 時の
+                // playhead を origin として記録し、stop() で SeekTo を送って
+                // engine カーソルを origin に揃える。engine はその SeekTo
+                // (= pending_seek 経由で playhead に反映済み) をそのまま使う。
                 for s in self.scratch.iter_mut() {
                     s.state.active_notes.clear();
                     s.state.pending_offs.clear();
@@ -1053,11 +1081,12 @@ impl LocalState {
             shared.playhead.store(new_ph, Ordering::Release);
             self.last_known_playhead = new_ph;
         } else {
-            // Stop 中は audio thread が playhead を進めないが、 GUI からの
-            // SeekTo IPC は shared.playhead を書き換える可能性がある。
-            // last_known_playhead を current 値で同期して、 次 Play 開始
-            // 時の seek 検出ロジックを誤発火させない (= stop 中の seek は
-            // 単に位置を変えるだけで playhead_beats 再計算が必要)。
+            // Stop 中は audio thread が playhead を advance しない。GUI からの
+            // SeekTo は process_buffer 冒頭の pending_seek consume で (audio
+            // thread 自身が) shared.playhead に反映済みなので、その値で
+            // last_known_playhead を同期し、次 Play 開始時の seek 検出を
+            // 誤発火させない (= stop 中の seek は位置を変えるだけで
+            // playhead_beats 再計算が必要)。
             self.last_known_playhead = playhead;
         }
     }

@@ -2358,7 +2358,7 @@ impl AppData {
 
     // -------- Undo/Redo ----------------------------------------------------
 
-    fn push_undo_snapshot(&mut self) {
+    pub(crate) fn push_undo_snapshot(&mut self) {
         if self.undo_stack.len() >= UNDO_LIMIT {
             self.undo_stack.pop_front();
         }
@@ -4304,6 +4304,17 @@ impl AppData {
 
         if Self::is_undoable(&event) {
             self.push_undo_snapshot();
+            // FIXME #40: undoable な discrete edit はすべてここで dirty を立てる。
+            // `is_dirty` の真値は `song != saved_song` (recompute_dirty) だが、
+            // それを再評価するトリガ (sticky flag) を各ハンドラが手で立てる方式
+            // だと立て忘れが起きる (= `set_clip_voice` が声/スタイル変更で dirty に
+            // しなかった、FIXME #40 の症状)。undo snapshot を積むのと同じ単一
+            // チョークポイントで dirty を立てれば、undo 対象 = 編集 = dirty が
+            // 一致し、新しい discrete edit を is_undoable に追加するだけで dirty も
+            // 自動で付く。no-op edit (値が変わらない) で over-mark しても、runner
+            // が毎フレーム recompute_dirty で `song == saved_song` を見て clean に
+            // 戻すので spurious な '*' は出ない (= 過剰 set は自己補正される)。
+            self.is_dirty = true;
         }
 
         match event {
@@ -7621,9 +7632,9 @@ impl AppData {
             self.set_clip_text_event_content(target, new_name);
         } else {
             self.song.set_content_name(content_id, new_name);
-            // content_name 経路は単独で is_dirty を立てないため明示的に arm する
-            // (push_undo_snapshot は is_undoable 経由で済むが dirty は立てない)。
-            self.is_dirty = true;
+            // content_name 経路は Song 側 set_content_name が dirty を持たないが、
+            // CommitRenameClip は is_undoable なので #40 のチョークポイント
+            // (handle_event 冒頭) が既に is_dirty を立てている (= 手動 arm 不要)。
         }
     }
 
@@ -14870,6 +14881,25 @@ impl AppData {
             )
             .map(|b| b as f32)
         };
+        // FIXME #41 (A1): 曲末に達したら engine の auto-stop (engine.rs の
+        // `song_ended` 判定で playing=false) に合わせて GUI 側 transport も止め、
+        // 再生開始位置 (origin) へ戻す。Tick は playing 状態を運ばないので、engine
+        // と同一の `song_ended` 述語 (= 停止境界がサンプル単位で一致) を使って GUI
+        // 自身が検知する。これが無いと engine が曲末で止まっても is_playing が true
+        // のまま playhead が末尾に固着する (既存の不整合)。手動 Stop と同じ
+        // stop() を通すので「どんな止まり方でも再生を押した位置へ戻る」が一貫する。
+        // loop 中は engine が wrap して止まらないので対象外。
+        if self.is_playing
+            && !self.is_looping
+            && playhead_samples != u64::MAX
+            && common::timing::song_ended(
+                Some(&self.song),
+                common::audio_bridge::SAMPLE_RATE,
+                playhead_samples,
+            )
+        {
+            self.stop();
+        }
         // 再生中のみ Tick の playhead を反映する。 停止中は GUI 側 playhead が
         // 権威 (stop() の「開始位置へ戻す」 / ruler seek / engine respawn 後の
         // 据え置き)。 これを入れないと、 stop() が playhead を origin に戻した

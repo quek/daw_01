@@ -1478,6 +1478,20 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             // (b) parent_group_id を新親に書き換え (c) anchor_after の
             // 直後 (None で先頭) に insert。
             Edit::mutate(move |app: &mut AppData| {
+                // FIXME #39: インスペクタの Parent dropdown (undo 可能だった) を
+                // 撤去し、reparent の唯一経路がこの drag になった。能力後退を
+                // 避けるため undo を回復する。remove 前に song 全体を 1 snapshot
+                // 取り、複数 track の reparent + reorder をまとめて 1 undo step に
+                // する (song 丸ごと snapshot なので reorder 意味論も完全に戻せる)。
+                // 対象 track が 1 つも実在しない no-op drag では spurious snapshot
+                // を避ける。
+                if !tracks
+                    .iter()
+                    .any(|id| app.song.tracks.iter().any(|t| t.id == *id))
+                {
+                    return;
+                }
+                app.push_undo_snapshot();
                 let mut moved: Vec<common::model::Track> = tracks
                     .iter()
                     .filter_map(|id| {
