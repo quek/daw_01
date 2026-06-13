@@ -67,7 +67,11 @@ pub struct ActiveImageFrame {
 ///
 /// Muted events and events whose fade envelope evaluates to 0 are
 /// dropped from the result entirely.
-pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveImageFrame> {
+pub fn active_image_sources_at(
+    song: &Song,
+    playhead_beat: f64,
+    mod_scalars: &[f32],
+) -> Vec<ActiveImageFrame> {
     let bpm = song.bpm as f64;
     if bpm <= 0.0 {
         return Vec::new();
@@ -130,7 +134,7 @@ pub fn active_image_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveIma
                 // fade が効く)。 rotation は lane 経路の override のみ
                 // (= fade 無関係)。
                 let (x, y, w, h, opacity, rotation) =
-                    resolve_image_fields(&lanes, song, event, playhead_beat);
+                    resolve_image_fields(&lanes, song, event, playhead_beat, mod_scalars);
                 let alpha = opacity * env;
                 if alpha <= 0.0 {
                     continue;
@@ -210,6 +214,7 @@ fn resolve_image_fields(
     song: &Song,
     event: &ImageEvent,
     song_beat: f64,
+    mod_scalars: &[f32],
 ) -> (f32, f32, f32, f32, f32, f32) {
     let resolve_norm = |lane: Option<&AutomationLane>, fallback: f32| -> f32 {
         let Some(lane) = lane else {
@@ -219,17 +224,19 @@ fn resolve_image_fields(
         // image lane の default は event 値とは独立 (= lane を空で作っ
         // ても event 値が見えるべきではない、 lane を作った時点で lane
         // が override)。 lane が enabled で clip が無い区間でも default
-        // _value が effective。
-        let v = common::automation::lane_value_at(lane, &song.clip_contents, song_beat);
+        // _value が effective。 docs/plan_modulation.md §2: follower 変調を
+        // 正規化領域で合成 (mod_routings が空なら lane_value_at と同値)。
+        let v =
+            common::automation::effective_value_with_scalars(song, lane, song_beat, mod_scalars);
         (v as f32).clamp(0.0, 1.0)
     };
     let rotation = match lanes.rotation {
         // Rotation は plain で radians、 範囲 -π..=π を超えても modulo
         // 2π で wrap (= 連続回転 lane を許容)。 lane.default_value は
         // 既に radians 単位。
-        Some(lane) => {
-            common::automation::lane_value_at(lane, &song.clip_contents, song_beat) as f32
-        }
+        Some(lane) => common::automation::effective_value_with_scalars(
+            song, lane, song_beat, mod_scalars,
+        ) as f32,
         None => event.rotation_radians,
     };
     let x = resolve_norm(lanes.x, event.x);
@@ -353,7 +360,7 @@ mod tests {
     #[test]
     fn active_image_returns_single_layer_inside_event() {
         let song = make_song_with_one_image(0.1, 0.2, 0.5, 0.5, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, 4.0);
+        let frames = active_image_sources_at(&song, 4.0, &[]);
         assert_eq!(frames.len(), 1);
         let f = frames[0];
         assert_eq!(f.x, 0.1);
@@ -367,14 +374,14 @@ mod tests {
     #[test]
     fn active_image_returns_empty_outside_event() {
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, 16.0);
+        let frames = active_image_sources_at(&song, 16.0, &[]);
         assert!(frames.is_empty());
     }
 
     #[test]
     fn active_image_applies_opacity_multiplier() {
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 0.5, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, 4.0);
+        let frames = active_image_sources_at(&song, 4.0, &[]);
         assert_eq!(frames.len(), 1);
         assert!((frames[0].alpha - 0.5).abs() < 1e-6);
     }
@@ -383,7 +390,7 @@ mod tests {
     fn active_image_applies_linear_fade_in() {
         // 4-beat fade-in, query at half-way → alpha = opacity * 0.5
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 4.0, 0.0);
-        let frames = active_image_sources_at(&song, 2.0);
+        let frames = active_image_sources_at(&song, 2.0, &[]);
         assert_eq!(frames.len(), 1);
         assert!(
             (frames[0].alpha - 0.5).abs() < 1e-6,
@@ -401,7 +408,7 @@ mod tests {
                 events[0].muted = true;
             }
         }
-        let frames = active_image_sources_at(&song, 4.0);
+        let frames = active_image_sources_at(&song, 4.0, &[]);
         assert!(frames.is_empty());
     }
 }

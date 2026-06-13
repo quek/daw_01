@@ -55,6 +55,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             delay_lines: Vec::new(),
             port_buffers: super::PortBufferPool::new(),
             input_delay_per_track: Vec::new(),
+            follower_slots: Vec::new(),
         });
     }
 
@@ -206,7 +207,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         // `process()` (i.e. before ProcessTrack / ProcessGroupFx for
         // this track) so the engine can stage the source signal in the
         // plugin's `pd.buffer_aux_in[port]` shmem region.
-        emit_sidechain_taps(track, track_idx, &id_to_idx, &mut nodes);
+        emit_aux_input_taps(&track.devices, track.id, &id_to_idx, &mut nodes);
 
         // A track is a "bus" if it has children (a group) and/or has
         // incoming sends (a return). Either way it sums its inputs into
@@ -266,36 +267,14 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     // `execute_schedule_post_dispatch` がこの tap を処理して source scratch を
     // master fx plugin の `pd.buffer_aux_in[port]` に staging し、 直後の
     // `process_master_fx_chain` が plugin process でそれを読む。 dst_track は
-    // `MASTER_TRACK_ID`、 dst_slot は `Fx(i)` (master は audio fx のみ)。 source
-    // が song に居ない dangling は寛容に skip (= track 経路と同方針)。
-    for (slot_idx, inst) in song.master_fx_chain.iter().enumerate() {
-        // aux port は `MAX_AUX_IN` までしか engine が staging しない
-        // (engine.rs の `port >= MAX_AUX_IN` ガードと整合)。 enumerate を
-        // `take(MAX_AUX_IN)` で打ち切ることで `port_idx < MAX_AUX_IN` を
-        // 構造的に保証し、 `as u8` の wrap を防ぐ。
-        for (port_idx, route_opt) in inst
-            .aux_inputs
-            .iter()
-            .take(common::process_data::MAX_AUX_IN)
-            .enumerate()
-        {
-            let Some(route) = route_opt else {
-                continue;
-            };
-            // Phase 1: tap_point は常に PostFader (= TrackScratch)。 3 段タップの
-            // BufRef 解決と follower emit は Phase 2/6 で emit_taps_and_followers
-            // に統合する (docs/plan_modulation.md §5)。
-            let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) else {
-                continue;
-            };
-            nodes.push(NodeOp::SidechainTap {
-                src: BufRef::TrackScratch(src_idx),
-                dst_track: common::model::MASTER_TRACK_ID,
-                dst_index: u32::try_from(slot_idx).unwrap_or(u32::MAX),
-                aux_in_port: port_idx as u8,
-            });
-        }
-    }
+    // `MASTER_TRACK_ID` (master は audio fx のみ)。 track 経路と同じ
+    // `emit_aux_input_taps` を使う (critique #1: emit site の単一化)。
+    emit_aux_input_taps(
+        &song.master_fx_chain,
+        common::model::MASTER_TRACK_ID,
+        &id_to_idx,
+        &mut nodes,
+    );
 
     // ---- PR3: Plugin Delay Compensation ----
     //
@@ -392,30 +371,60 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         input_delay_per_track[i] = max_sc;
     }
 
+    // docs/plan_modulation.md §3/§5: per-`ModSource` envelope follower.
+    // Emit `EnvelopeFollow` at the very end of the (post-PDC) schedule — all
+    // scratches are settled and the follower only produces a control-rate
+    // scalar (no audio feedback, so no ordering / cycle constraint). `slot` =
+    // the source's index in `Song::mod_sources` (capped at MAX_MOD_SOURCES);
+    // it indexes both `follower_slots` and `AudioBridge::mod_scalars`.
+    // Coefficients are baked here (recompile-time) so the RT path never
+    // derives them (§10).
+    let mut follower_slots: Vec<super::follower::FollowerSlot> = Vec::new();
+    for (slot, ms) in song
+        .mod_sources
+        .iter()
+        .take(common::audio_bridge::MAX_MOD_SOURCES)
+        .enumerate()
+    {
+        follower_slots.push(super::follower::FollowerSlot::from_config(
+            &ms.follower,
+            common::audio_bridge::SAMPLE_RATE,
+        ));
+        // Phase 1/2: tap_point は常に PostFader (= TrackScratch)。 dangling
+        // source は follower node を emit しない (scalar は 0 のまま)。
+        if let Some(&src_idx) = id_to_idx.get(&ms.tap.source_track) {
+            nodes_with_pdc.push(NodeOp::EnvelopeFollow {
+                src: BufRef::TrackScratch(src_idx),
+                slot: slot as u32,
+            });
+        }
+    }
+
     Ok(Schedule {
         nodes: nodes_with_pdc,
         delay_lines,
         port_buffers: super::PortBufferPool::new(),
         input_delay_per_track,
+        follower_slots,
     })
 }
 
-/// PR4 sidechain: track の単一 `devices` チェーンを walk して、 各 plugin の
-/// `aux_inputs` 中で有効な (= source track が song に存在する) route に
-/// ついて `NodeOp::SidechainTap` を `nodes` に push する。 v23 single-chain:
-/// `dst_index` は device の `Track.devices` 上の位置。 sidechain は役割に依らず
-/// どの device にも貼れるので、 役割導出なしに index 順で walk すればよい。
-/// dangling reference は寛容に skip (compile error にしない)。 source track の
-/// `ProcessTrack` が前に emit されていれば scratch が埋まっているので tap は
-/// 意味を持つ。
-fn emit_sidechain_taps(
-    track: &common::model::Track,
-    _dst_track_idx: u32,
+/// docs/plan_modulation.md §5: walk a device `chain` (a track's `devices` or
+/// the master `master_fx_chain`) and emit `NodeOp::SidechainTap` for every
+/// plugin `aux_inputs` route whose source track exists. The single helper
+/// replaces the former per-track `emit_sidechain_taps` + the inlined
+/// master-bus loop (critique #1: there were two emit sites). `dst_track` is
+/// the destination plugin's owning track id (`MASTER_TRACK_ID` for master
+/// fx); `dst_index` is the device's position in the chain. dangling
+/// references are skipped (no compile error). `ProcessTrack` of the source
+/// runs earlier, so its scratch is settled by the time the tap copies it.
+fn emit_aux_input_taps(
+    chain: &[common::model::PluginInstance],
+    dst_track: u32,
     id_to_idx: &HashMap<u32, u32>,
     nodes: &mut Vec<NodeOp>,
 ) {
-    let dst_track = track.id;
-    for (device_index, inst) in track.devices.iter().enumerate() {
+    for (device_index, inst) in chain.iter().enumerate() {
         // aux port は engine が `MAX_AUX_IN` までしか staging しないので
         // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証し、
         // `as u8` の wrap を防ぐ。
@@ -428,14 +437,14 @@ fn emit_sidechain_taps(
             let Some(route) = route_opt else {
                 continue;
             };
-            // Phase 1: tap_point は常に PostFader (= TrackScratch)。 3 段タップの
-            // BufRef 解決は Phase 2/6 で導入する (docs/plan_modulation.md §5)。
-            let Some(src_idx) = id_to_idx.get(&route.tap.source_track) else {
+            // Phase 1/2: tap_point は常に PostFader (= TrackScratch)。 3 段タップの
+            // BufRef 解決は Phase 6 で導入する (docs/plan_modulation.md §6)。
+            let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) else {
                 // dangling reference: silently skip
                 continue;
             };
             nodes.push(NodeOp::SidechainTap {
-                src: BufRef::TrackScratch(*src_idx),
+                src: BufRef::TrackScratch(src_idx),
                 dst_track,
                 dst_index: u32::try_from(device_index).unwrap_or(u32::MAX),
                 aux_in_port: port_idx as u8,
@@ -1153,6 +1162,10 @@ mod tests {
                         &mut scratch_r[i],
                         *frames as usize,
                     );
+                }
+                NodeOp::EnvelopeFollow { .. } => {
+                    // followers produce only control-rate scalars; they do
+                    // not affect the audio output exercised by this test.
                 }
             }
             // input は 1 buffer 分だけ消費するので、 2 回目以降は input を

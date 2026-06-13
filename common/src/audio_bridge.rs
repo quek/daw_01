@@ -11,6 +11,10 @@ pub const SAMPLE_BUFFER_LEN: usize = (MAX_FRAMES * CHANNELS) as usize;
 /// index are still processed, they just don't publish a meter. 32 matches
 /// Renoise's default Mixer column count.
 pub const MAX_TRACKS: usize = 32;
+/// docs/plan_modulation.md §4.2: hard cap for the modulation-scalar ring in
+/// shmem. `Song::mod_sources` beyond this index don't publish a scalar (their
+/// `EnvelopeFollow` node isn't emitted). Indexed by `ModSource` position.
+pub const MAX_MOD_SOURCES: usize = 64;
 
 /// Shared memory layout between daw_plugin_host (writer), daw_audio (reader +
 /// meter writer) and daw_gui (polling reader).
@@ -38,6 +42,12 @@ pub struct AudioBridge {
     /// Written by daw_plugin_host after summing each track into the master
     /// bus; read by daw_gui on its UI tick.
     pub track_peaks: [[AtomicU32; 2]; MAX_TRACKS],
+    /// docs/plan_modulation.md §4.2: per-`ModSource` envelope follower scalar
+    /// (`f32::to_bits`), block-rate. Written by the audio engine every buffer
+    /// (`env[frames-1]` of the source's follower), polled by the GUI at ~30Hz
+    /// alongside `track_peaks` and applied to modulated params. Indexed by
+    /// `ModSource` position in `Song::mod_sources` (= `EnvelopeFollow::slot`).
+    pub mod_scalars: [AtomicU32; MAX_MOD_SOURCES],
     /// Phase 7 B4 Step C (2026-05-13): count-in 残り samples mirror (audio
     /// thread が `process_buffer` で書く、 GUI が on_tick で poll)。 GUI 側は
     /// `midi_recording_pending` 中だけ参照、 0 検出で `midi_recording` に昇格。
@@ -177,6 +187,33 @@ impl AudioBridgeHandle {
             let l = f32::from_bits(slot[0].load(Ordering::Acquire));
             let r = f32::from_bits(slot[1].load(Ordering::Acquire));
             out.push((l, r));
+        }
+    }
+
+    /// docs/plan_modulation.md §4.2: publish one `ModSource`'s envelope
+    /// follower scalar. Out-of-range slots (beyond `MAX_MOD_SOURCES`) are
+    /// silently dropped. RT-safe atomic store.
+    pub fn set_mod_scalar(&self, slot: usize, v: f32) {
+        let Some(cell) = self.bridge().mod_scalars.get(slot) else {
+            return;
+        };
+        cell.store(v.to_bits(), Ordering::Release);
+    }
+
+    pub fn mod_scalar(&self, slot: usize) -> f32 {
+        let Some(cell) = self.bridge().mod_scalars.get(slot) else {
+            return 0.0;
+        };
+        f32::from_bits(cell.load(Ordering::Acquire))
+    }
+
+    /// Fills `out` with the modulation scalars for slots `0..MAX_MOD_SOURCES`.
+    pub fn mod_scalars(&self, out: &mut Vec<f32>) {
+        out.clear();
+        for i in 0..MAX_MOD_SOURCES {
+            out.push(f32::from_bits(
+                self.bridge().mod_scalars[i].load(Ordering::Acquire),
+            ));
         }
     }
 }

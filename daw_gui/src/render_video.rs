@@ -483,12 +483,16 @@ fn build_frame_scene(
     // docs/plan_image_overlay.md §P3: image overlay layers on top of
     // video. Normalized [0, 1] PiP rect maps to canvas pixels (= the
     // canvas IS the project resolution, so `x * out_w` is exact).
+    // docs/plan_modulation.md §7: export はライブの follower scalar を読めない
+    // (audio engine 非稼働)。 Phase 7 で env sidecar を frame 時刻でサンプルして
+    // ここに渡す。 それまでは空 = 変調なし (curve/base のみ)。
+    let mod_scalars: &[f32] = &[];
     let image_layers =
-        crate::image_compose::active_image_sources_at(song, playhead_beat);
+        crate::image_compose::active_image_sources_at(song, playhead_beat, mod_scalars);
     // v19 (docs/plan_tachie_group_transform.md §5.6): export も preview と同じ
     // gate（`active_visual_groups`）で group partition + offscreen 合成する
     // （preview/export byte parity 要件、SSoT）。
-    let active_groups = crate::group_compose::active_visual_groups(song, playhead_beat);
+    let active_groups = crate::group_compose::active_visual_groups(song, playhead_beat, mod_scalars);
     let mut group_children: std::collections::HashMap<
         u32,
         Vec<crate::group_compose::GroupChildQuad>,
@@ -594,7 +598,7 @@ fn build_frame_scene(
     // via `font_size * char_count * 0.55`; same MVP estimate as the
     // preview path.
     let text_layers =
-        crate::text_compose::active_text_sources_at(song, playhead_beat);
+        crate::text_compose::active_text_sources_at(song, playhead_beat, mod_scalars);
     for layer in text_layers {
         if layer.alpha <= 0.0 || layer.text.is_empty() {
             continue;

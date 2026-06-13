@@ -18,10 +18,12 @@
 
 mod compile;
 mod delay_line;
+mod follower;
 mod port_buffer;
 mod schedule;
 
 pub use compile::{GraphError, compile_schedule};
 pub use delay_line::DelayLine;
+pub use follower::FollowerSlot;
 pub use port_buffer::{PortBuffer, PortBufferPool};
 pub use schedule::{BufRef, NodeOp, Schedule};

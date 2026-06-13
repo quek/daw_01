@@ -468,6 +468,7 @@ fn spawn_autosave_timer(proxy: EventLoopProxy<AppEvent>) {
 fn spawn_playhead_poller(bridge: Arc<AudioBridgeHandle>, proxy: EventLoopProxy<AppEvent>) {
     std::thread::spawn(move || {
         let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
+        let mut mod_buf: Vec<f32> = Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES);
         loop {
             std::thread::sleep(Duration::from_millis(33));
             let samples = bridge.playhead_samples();
@@ -480,6 +481,16 @@ fn spawn_playhead_poller(bridge: Arc<AudioBridgeHandle>, proxy: EventLoopProxy<A
                     peak_r,
                     preroll,
                 })
+                .is_err()
+            {
+                break;
+            }
+            // docs/plan_modulation.md §4.2: poll the modulation scalars on the
+            // same ~30Hz tick as peaks and stream them to the model so visual
+            // modulation (image / group / video fx) can apply per frame.
+            bridge.mod_scalars(&mut mod_buf);
+            if proxy
+                .send_event(AppEvent::ModScalarsTick(std::mem::take(&mut mod_buf)))
                 .is_err()
             {
                 break;

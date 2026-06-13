@@ -48,6 +48,7 @@ pub fn group_active_transform(
     group_track: &Track,
     song: &Song,
     song_beat: f64,
+    mod_scalars: &[f32],
 ) -> Option<GroupTransform> {
     let has_lane = group_track
         .automation_lanes
@@ -64,8 +65,10 @@ pub fn group_active_transform(
             return fallback;
         };
         // lane 値は plain 単位（automation point / default_value が plain）。
-        // 正規化（log space / Pan idiom）は UI 表示専用なのでここでは使わない。
-        common::automation::lane_value_at(lane, &song.clip_contents, song_beat) as f32
+        // docs/plan_modulation.md §2: base(default+curve) に follower 変調を
+        // 正規化領域で合成。 mod_routings が空なら lane_value_at と同値。
+        common::automation::effective_value_with_scalars(song, lane, song_beat, mod_scalars)
+            as f32
     };
     t.x = resolve(GroupTransformParam::X, t.x);
     t.y = resolve(GroupTransformParam::Y, t.y);
@@ -142,6 +145,7 @@ pub fn group_has_visual_content(song: &Song, group_track_id: u32) -> bool {
 pub fn active_visual_groups(
     song: &Song,
     song_beat: f64,
+    mod_scalars: &[f32],
 ) -> std::collections::HashMap<u32, GroupTransform> {
     use std::collections::{HashMap, HashSet};
 
@@ -191,7 +195,7 @@ pub fn active_visual_groups(
         if !visual {
             continue;
         }
-        let gt = group_active_transform(track, song, song_beat).unwrap_or_default();
+        let gt = group_active_transform(track, song, song_beat, mod_scalars).unwrap_or_default();
         out.insert(track.id, gt);
     }
     out
@@ -456,9 +460,9 @@ mod tests {
     fn none_transform_is_inactive() {
         let mut track = crate::app::track_with(|t| t.id = 7);
         let song = Song::default();
-        assert!(group_active_transform(&track, &song, 0.0).is_none());
+        assert!(group_active_transform(&track, &song, 0.0, &[]).is_none());
         track.group_transform = Some(ident());
-        assert!(group_active_transform(&track, &song, 0.0).is_some());
+        assert!(group_active_transform(&track, &song, 0.0, &[]).is_some());
     }
 
     /// 子トラックを 1 本ぶら下げた group を作る。`visual` なら子に image clip を、
@@ -536,7 +540,7 @@ mod tests {
         let (song, group_id) = song_with_group(true);
         assert!(is_group_track(&song, group_id));
         assert!(group_has_visual_content(&song, group_id));
-        let active = active_visual_groups(&song, 0.0);
+        let active = active_visual_groups(&song, 0.0, &[]);
         let gt = active.get(&group_id).expect("visual group must be active");
         assert_eq!(*gt, GroupTransform::default(), "未設定なら identity");
     }
@@ -547,6 +551,6 @@ mod tests {
         let (song, group_id) = song_with_group(false);
         assert!(is_group_track(&song, group_id));
         assert!(!group_has_visual_content(&song, group_id));
-        assert!(!active_visual_groups(&song, 0.0).contains_key(&group_id));
+        assert!(!active_visual_groups(&song, 0.0, &[]).contains_key(&group_id));
     }
 }

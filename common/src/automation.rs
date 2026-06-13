@@ -15,7 +15,7 @@
 
 use crate::model::{
     AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationTarget,
-    ClipContent, ContentId, Song, TrackBuiltinParam,
+    ClipContent, ContentId, Polarity, Song, TrackBuiltinParam,
 };
 use std::collections::HashMap;
 
@@ -267,6 +267,66 @@ pub fn lane_value_at(
 #[inline]
 pub fn song_lane_value_at(song: &Song, lane: &AutomationLane, song_beat: f64) -> f64 {
     lane_value_at(lane, &song.clip_contents, song_beat)
+}
+
+/// docs/plan_modulation.md §2: the **effective plain-units value** of a
+/// target = its base (`default_value` + automation curve) combined with all
+/// `ModRouting` follower modulations. Composition happens in the *normalized*
+/// (`0..=1`) domain so a given `depth` means the same fraction of range across
+/// heterogeneous targets (volume `0..2`, rotation `-π..π`, image x `0..1`):
+///
+/// ```text
+/// norm_base = plain_to_norm(target, lane_value_at(lane, beat))
+/// mod_sum   = Σ routings: s = clamp(scalar(source_id), 0..1)
+///             Unipolar => depth*s,  Bipolar => depth*(2s - 1)
+/// norm_eff  = clamp(norm_base + mod_sum, 0..1)
+/// plain_eff = norm_to_plain(target, norm_eff)
+/// ```
+///
+/// `scalar` resolves a `ModRouting::source_id` to its latest follower value
+/// (live `AudioBridge::mod_scalars` in preview, baked sidecar in export). With
+/// no `mod_routings` this is exactly `lane_value_at` (no normalize round-trip),
+/// so unmodulated params are bit-for-bit unaffected. Pure / RT-safe.
+pub fn effective_value(
+    lane: &AutomationLane,
+    clip_contents: &HashMap<ContentId, ClipContent>,
+    song_beat: f64,
+    scalar: impl Fn(u32) -> f32,
+) -> f64 {
+    let base = lane_value_at(lane, clip_contents, song_beat);
+    if lane.mod_routings.is_empty() {
+        return base;
+    }
+    let norm_base = plain_to_norm(&lane.target, base);
+    let mut mod_sum = 0.0f32;
+    for r in &lane.mod_routings {
+        let s = scalar(r.source_id).clamp(0.0, 1.0);
+        mod_sum += match r.polarity {
+            Polarity::Unipolar => r.depth * s,
+            Polarity::Bipolar => r.depth * (2.0 * s - 1.0),
+        };
+    }
+    let norm_eff = (norm_base + mod_sum).clamp(0.0, 1.0);
+    norm_to_plain(&lane.target, norm_eff)
+}
+
+/// [`effective_value`] resolving follower scalars from `Song::mod_sources`
+/// (slot = position in the Vec) against a polled `mod_scalars` plane (e.g.
+/// `AppData::mod_scalars`). Dangling / out-of-range sources read as `0`.
+pub fn effective_value_with_scalars(
+    song: &Song,
+    lane: &AutomationLane,
+    song_beat: f64,
+    mod_scalars: &[f32],
+) -> f64 {
+    effective_value(lane, &song.clip_contents, song_beat, |source_id| {
+        song.mod_sources
+            .iter()
+            .position(|m| m.id == source_id)
+            .and_then(|i| mod_scalars.get(i))
+            .copied()
+            .unwrap_or(0.0)
+    })
 }
 
 /// Phase 4 Step D (`docs/plan_automation.md` §6): recording 中の point 列に

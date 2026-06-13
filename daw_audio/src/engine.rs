@@ -973,6 +973,13 @@ impl LocalState {
                 bridge.set_track_peak(i, tr.peak_l, tr.peak_r);
             }
 
+            // docs/plan_modulation.md §4.2: publish each ModSource's envelope
+            // follower scalar (block-rate, `env` after this buffer) so the GUI
+            // poller can apply visual/param modulation. Atomic stores, RT-safe.
+            for (slot, fs) in self.cached_schedule.follower_slots.iter().enumerate() {
+                bridge.set_mod_scalar(slot, fs.env);
+            }
+
             // Debug heartbeat: once per second of audio time, dump the
             // engine's view of the world so we can tell whether the
             // dispatch reached plugin.process(), what came back, and
@@ -1577,6 +1584,7 @@ pub fn execute_schedule_post_dispatch(
         delay_lines,
         port_buffers: _,
         input_delay_per_track: _,
+        follower_slots,
     } = schedule;
     for op in nodes.iter() {
         match op {
@@ -1734,6 +1742,25 @@ pub fn execute_schedule_post_dispatch(
                     recording_lanes,
                     n,
                 );
+            }
+
+            NodeOp::EnvelopeFollow { src, slot } => {
+                // docs/plan_modulation.md §3: advance this source's envelope
+                // follower over its (settled) scratch. The smoothed envelope
+                // lands in `follower_slots[slot].env`; `process_buffer`
+                // publishes it to `AudioBridge::mod_scalars` after this walk.
+                // RT-safe: pure arithmetic, no alloc / lock. Phase 1/2: src is
+                // always PostFader (`TrackScratch`).
+                let BufRef::TrackScratch(src_idx) = *src else {
+                    continue;
+                };
+                let Some(src_scratch) = scratch.get(src_idx as usize) else {
+                    continue;
+                };
+                let Some(fs) = follower_slots.get_mut(*slot as usize) else {
+                    continue;
+                };
+                fs.process_block(&src_scratch.track_l, &src_scratch.track_r, n);
             }
         }
     }

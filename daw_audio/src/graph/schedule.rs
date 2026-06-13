@@ -93,6 +93,15 @@ pub enum NodeOp {
         src_track_idx: u32,
         send_idx: u8,
     },
+
+    /// docs/plan_modulation.md §3: advance the envelope follower for
+    /// `ModSource` at `slot` over `src`'s final scratch. Emitted at the end
+    /// of the schedule (all scratches are settled) since the follower only
+    /// produces a control-rate scalar — it never feeds back into the audio
+    /// graph. `slot` indexes both `Schedule::follower_slots` and the
+    /// `AudioBridge::mod_scalars` plane (= the `ModSource`'s position in
+    /// `Song::mod_sources`).
+    EnvelopeFollow { src: BufRef, slot: u32 },
 }
 
 /// Compiled, immutable execution plan. Held inside an
@@ -121,6 +130,14 @@ pub struct Schedule {
     /// `midi_fx_chain` / `instrument` sidechain alignment requires
     /// delaying MIDI events too (out of scope for PR4.5).
     pub input_delay_per_track: Vec<u32>,
+    /// docs/plan_modulation.md §3: per-`ModSource` envelope follower state +
+    /// baked coefficients, indexed by slot (= `ModSource` position in
+    /// `Song::mod_sources`). `NodeOp::EnvelopeFollow { slot, .. }` advances
+    /// `follower_slots[slot].env` each buffer; the engine publishes that env
+    /// to `AudioBridge::mod_scalars[slot]`. Rebuilt on recompile (so env
+    /// resets), persists across buffers within one schedule (like
+    /// `delay_lines`).
+    pub follower_slots: Vec<super::follower::FollowerSlot>,
 }
 
 impl Schedule {
@@ -130,6 +147,7 @@ impl Schedule {
             delay_lines: Vec::new(),
             port_buffers: PortBufferPool::new(),
             input_delay_per_track: Vec::new(),
+            follower_slots: Vec::new(),
         }
     }
 }

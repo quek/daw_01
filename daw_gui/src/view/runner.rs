@@ -1152,6 +1152,7 @@ impl Runner {
                                     track,
                                     &state.app.song,
                                     state.app.playhead_beat.map(f64::from).unwrap_or(0.0),
+                                    &state.app.mod_scalars,
                                 )
                                 .unwrap_or_default()
                             })
@@ -1424,14 +1425,18 @@ impl Runner {
         let image_frames = crate::image_compose::active_image_sources_at(
             &state.app.song,
             playhead_beat,
+            &state.app.mod_scalars,
         );
         // v19 (docs/plan_tachie_group_transform.md §5.6): visual group の
         // active transform を 1 回解決（group track id → resolved transform）。
         // gate は `group_has_visual_content`（§5.6）。transform / lane 未設定の
         // visual group も identity として含むので、グループ化直後の立ち絵も合成
         // され、選択時にバウンディングボックスが出る。export と同一述語（SSoT）。
-        let active_groups =
-            crate::group_compose::active_visual_groups(&state.app.song, playhead_beat);
+        let active_groups = crate::group_compose::active_visual_groups(
+            &state.app.song,
+            playhead_beat,
+            &state.app.mod_scalars,
+        );
         // group track id → z 順（bottom→top）の子 quad。
         let mut group_children: std::collections::HashMap<
             u32,
@@ -1545,6 +1550,7 @@ impl Runner {
         let text_frames = crate::text_compose::active_text_sources_at(
             &state.app.song,
             playhead_beat,
+            &state.app.mod_scalars,
         );
         preview.set_text_layers(text_frames);
         // PiP rect の normalized 座標は project_resolution の letterbox

@@ -68,7 +68,11 @@ pub struct ActiveTextFrame {
 /// event that is active at `playhead_beat`. Muted events, events with
 /// alpha == 0 (= opacity × fade resolves to 0), and events on muted
 /// tracks are dropped. Mirrors `image_compose::active_image_sources_at`.
-pub fn active_text_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveTextFrame> {
+pub fn active_text_sources_at(
+    song: &Song,
+    playhead_beat: f64,
+    mod_scalars: &[f32],
+) -> Vec<ActiveTextFrame> {
     let bpm = song.bpm as f64;
     if bpm <= 0.0 {
         return Vec::new();
@@ -108,7 +112,7 @@ pub fn active_text_sources_at(song: &Song, playhead_beat: f64) -> Vec<ActiveText
                     continue;
                 }
                 let env = event_alpha_envelope(event, clip_local);
-                let resolved = resolve_text_fields(track, song, event, playhead_beat);
+                let resolved = resolve_text_fields(track, song, event, playhead_beat, mod_scalars);
                 let alpha = resolved.opacity * env;
                 if alpha <= 0.0 {
                     continue;
@@ -184,6 +188,7 @@ fn resolve_text_fields(
     song: &Song,
     event: &TextEvent,
     song_beat: f64,
+    mod_scalars: &[f32],
 ) -> ResolvedText {
     // Index the track's `TextBuiltin` lanes once (single pass) so the 23
     // field resolutions below are O(1) hashmap lookups instead of 23
@@ -196,7 +201,9 @@ fn resolve_text_fields(
     }
     let lane_value = |field: TextBuiltinParam| -> Option<f32> {
         let lane = *lane_index.get(&field)?;
-        let v = common::automation::lane_value_at(lane, &song.clip_contents, song_beat);
+        // docs/plan_modulation.md §2: follower 変調を正規化領域で合成。
+        let v =
+            common::automation::effective_value_with_scalars(song, lane, song_beat, mod_scalars);
         Some(v as f32)
     };
     let resolve_norm = |field: TextBuiltinParam, fallback: f32| -> f32 {
@@ -352,7 +359,7 @@ mod tests {
     #[test]
     fn active_text_returns_single_layer_inside_event() {
         let song = make_song_with_one_text("Hello", 0.1, 0.4, 0.8, 0.2, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_text_sources_at(&song, 4.0);
+        let frames = active_text_sources_at(&song, 4.0, &[]);
         assert_eq!(frames.len(), 1);
         let f = &frames[0];
         assert_eq!(&*f.text, "Hello");
@@ -367,14 +374,14 @@ mod tests {
     #[test]
     fn active_text_returns_empty_outside_event() {
         let song = make_song_with_one_text("Hi", 0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_text_sources_at(&song, 16.0);
+        let frames = active_text_sources_at(&song, 16.0, &[]);
         assert!(frames.is_empty());
     }
 
     #[test]
     fn active_text_applies_opacity_multiplier() {
         let song = make_song_with_one_text("Hi", 0.0, 0.0, 1.0, 1.0, 0.5, 8.0, 0.0, 0.0);
-        let frames = active_text_sources_at(&song, 4.0);
+        let frames = active_text_sources_at(&song, 4.0, &[]);
         assert_eq!(frames.len(), 1);
         assert!((frames[0].alpha - 0.5).abs() < 1e-6);
     }
@@ -383,7 +390,7 @@ mod tests {
     fn active_text_applies_linear_fade_in() {
         // 4-beat fade-in, query at half-way → alpha ~= opacity * 0.5.
         let song = make_song_with_one_text("Hi", 0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 4.0, 0.0);
-        let frames = active_text_sources_at(&song, 2.0);
+        let frames = active_text_sources_at(&song, 2.0, &[]);
         assert_eq!(frames.len(), 1);
         assert!(
             (frames[0].alpha - 0.5).abs() < 1e-6,
@@ -400,7 +407,7 @@ mod tests {
                 events[0].muted = true;
             }
         }
-        let frames = active_text_sources_at(&song, 4.0);
+        let frames = active_text_sources_at(&song, 4.0, &[]);
         assert!(frames.is_empty());
     }
 
@@ -419,7 +426,7 @@ mod tests {
             0.0,
             0.0,
         );
-        let frames = active_text_sources_at(&song, 4.0);
+        let frames = active_text_sources_at(&song, 4.0, &[]);
         let f = &frames[0];
         // TextEvent::default() defaults — see common/src/model.rs.
         assert_eq!(f.font_size_px, 64.0);

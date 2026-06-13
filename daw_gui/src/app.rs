@@ -1227,6 +1227,11 @@ pub struct AppData {
 
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,
+    /// docs/plan_modulation.md §4.2: latest envelope-follower scalars from the
+    /// audio engine, indexed by `ModSource` position in `Song::mod_sources`.
+    /// Refreshed each ~30Hz `ModScalarsTick`; read by the compose paths via
+    /// `mod_scalar_for_source` when applying modulation to params.
+    pub mod_scalars: Vec<f32>,
 
     // -------- Plugin load tracking (A7 race-condition fix) -----------
     /// `(track, device_index)` pairs we've sent `SetSlotPlugin` for but
@@ -1742,6 +1747,7 @@ impl AppData {
             pending_vocal_synth_bounce: None,
             open_plugin_guis: std::collections::HashSet::new(),
             track_peak_display: initial_peak_display,
+            mod_scalars: Vec::new(),
             pending_plugin_loads: std::collections::HashSet::new(),
             pending_added_plugin_finalize: std::collections::HashSet::new(),
             gui_open_requests: Vec::new(),
@@ -3839,6 +3845,10 @@ pub enum AppEvent {
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
     TrackPeaksTick(Vec<(f32, f32)>),
+    /// docs/plan_modulation.md §4.2: latest per-`ModSource` envelope follower
+    /// scalars (indexed by `ModSource` position), polled ~30Hz from
+    /// `AudioBridge::mod_scalars`. Drives visual modulation each frame.
+    ModScalarsTick(Vec<f32>),
 
     // -------- Aux send / return ------------------------------------------
     /// master 直下 (`parent_group_id = None`) の通常 track を 1 本作り
@@ -5224,6 +5234,12 @@ impl AppData {
             }
             AppEvent::TrackPeaksTick(peaks) => {
                 self.on_track_peaks_tick(&peaks);
+            }
+            AppEvent::ModScalarsTick(scalars) => {
+                // docs/plan_modulation.md §4.2: snapshot the latest follower
+                // scalars (already attack/release-smoothed by the engine — no
+                // extra GUI smoothing). Zero-copy: move the polled Vec in.
+                self.mod_scalars = scalars;
             }
             AppEvent::AddReturnTrack => {
                 self.action_add_return_track();
