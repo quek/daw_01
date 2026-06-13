@@ -160,6 +160,12 @@ cargo clippy --workspace -- -D warnings
 
 ## Coding Principles
 
+### 最終形まで実装する
+
+フェーズ分けをせずに最終形を一気に完成させる。
+「Phase 1 完成しました。Phase 2 に進みますか」などはだめ。
+ゴールまで完走する。
+
 ### ベストプラクティスを追求する
 - Rust Edition 2024 / 各 crate は最新版
 - `let-else` で早期リターン、`?` 演算子を `match` より優先

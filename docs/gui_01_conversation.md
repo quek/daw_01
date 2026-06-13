@@ -4520,7 +4520,7 @@ variant 追加の diagnostic が出たら通知を待たず wire 開始。
 
 ---
 
-## #107 [Replied] 2026-06-13 [要望] scrubable_number に Bitwig 風モジュレーションを組み込む（全パラメータコントロールで非破壊変調）
+## #107 [Resolved] 2026-06-13 [要望] scrubable_number に Bitwig 風モジュレーションを組み込む（全パラメータコントロールで非破壊変調）
 
 ### daw_01 →
 
@@ -4670,7 +4670,7 @@ cache-render / api-design / spec-fidelity）で confirmed 7 → 5 修正（relea
 ---
 
 
-## #108 [Replied] 2026-06-13 [要望] scrubable_number を縦だけでなく横ドラッグでも値変更可能に
+## #108 [Resolved] 2026-06-13 [要望] scrubable_number を縦だけでなく横ドラッグでも値変更可能に
 
 ### daw_01 →
 
