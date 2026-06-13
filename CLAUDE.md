@@ -117,16 +117,22 @@ cargo clippy --workspace -- -D warnings
 
 ## Reflection の確認 (AHE 自律改善ループ)
 
-セッション開始時、`~/.claude/projects/F--dev-daw-01/reflection_latest.md` の最新エントリを Read してから作業に入る。
-（per-project user dir に置く。metrics と同じ場所で、main repo / 全 worktree が同一ファイルを共有する。git 追跡対象外）
-過去セッションの自動検出（同じコマンド連続 / Edit 集中 / Bash 失敗 / Read 集中）が記録されており、
-改善余地があれば skill / hook / agent / command / memory への昇格を検討する。
+セッション開始時、`SessionStart` hook が出す **Required Action** を必ず triage してから user の依頼に入る。
+2 系統ある:
+- **reflection 候補**（user 修正 / rework 検出）… save (memory) / discard で終端。
+- **AHE backlog**（`~/.claude/projects/F--dev-daw-01/ahe_backlog.md` の OPEN 行 = metrics から検出した
+  再発フリクション）… `/promote-reflection` skill で **skill / command / memory に昇格**、hook は user 承認キュー、
+  不要なら dismiss。**memory で終わらせない**（それが旧ループの欠陥 = 提案が actuate せず memory だけ増えた）。
+  backlog は per-project user dir、全 worktree 共有・git 外。`done` / `dismissed` は終端で再浮上しない。
 
-ループ構造:
-1. 各 tool 呼び出しは `PostToolUse` hook (`scripts/log_metric.ps1`) で `~/.claude/projects/F--dev-daw-01/metrics/YYYY-MM.jsonl` に追記
-2. session 終了時に `Stop` hook (`scripts/reflect.ps1`) がパターン検出 → `~/.claude/projects/F--dev-daw-01/reflection_latest.md` に提案
-3. 次セッション開始時にここを読み、harness の改善（hook 追加 / skill 化 / memory 化）を検討
-4. 採用した改善は別 session で実装、次の log で効果が現れる
+ループ構造（observe → reflect → **actuate** → close）:
+1. 各 tool 呼び出しを `PostToolUse` hook (`scripts/log_metric.ps1`) が metrics jsonl に追記
+2. session 終了時に `Stop` hook (`scripts/reflect.ps1`) がパターン検出 → backlog に keyed row を **upsert**
+   （id でデデュープ、status / sessions 付き、truncate しない。旧 `reflection_latest.md` への prose 追記は廃止）
+3. 次 session 開始時、`SessionStart` hook が OPEN 行を Required Action として強制提示（= 唯一効く forcing function を
+   actionable な系統に向けた。旧構造ではこの強制力が memory 系統だけに刺さっていた）
+4. `/promote-reflection` で各行を終端（promote / hook 承認依頼 / dismiss）。hook 登録の変更だけは
+   user 承認が要るので backlog の "hook requests" 節に ready-to-paste spec を書いて依頼する
 
 詳細設計は `docs/plan_ahe.md` (章 1.5 autonomy spectrum + 章 3 H13/H14/H15)。
 
