@@ -27,6 +27,11 @@
             "type": "command",
             "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_compromise_smell.ps1",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_gui_conversation_entry.ps1",
+            "timeout": 5
           }
         ]
       },

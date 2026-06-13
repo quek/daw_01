@@ -66,6 +66,20 @@ grep -iE "<確認したいイベント>" target/verify_run.log | sed -E 's/\x1b\
   インスタンスで**ユーザーに手順を箇条書きで依頼**する (「1. ... を挿す 2. ... を hover」)。
 - 結果報告を受けてログと突き合わせる。NG ならログの該当イベントから原因を追う。
 
+### 7. 多面機能の検証 / 新機能のバグ報告の追い方 (2026-06-13 modulation で6ラウンド浪費)
+- **同じ capability が複数の UI 面に跨る機能は、全面を列挙してから「完成」と言う**。
+  例: per-control modulation は param コントロールが複数ある —
+  画像 PiP / グループ Transform / プラグイン param / テキスト / track vol-pan / song tempo。
+  1 面 (画像) だけ配線して全機能完成と報告 → ユーザーの実使用面 (グループ Transform) が
+  未配線で「動かない」になった。検証は**ユーザーが実際に使う面**で行い、配線済み面を全部試す
+  ([[feedback_enumerate_complete_feature_set]] / [[feedback_new_feature_bug_suspect_own_wiring]])。
+- **「動かない」報告は、ユーザー操作ミス・環境・飽和を仮定する前に、自分の新コード/未配線を
+  第一容疑にする**。推測で原因を断定せず、**一時診断ログ** (`tracing::info!`、後で削除) を
+  仕込んで実データを取ってから仮説を立てる (CLAUDE.md「Debugging Methodology / 実データから始める」)。
+  - 切り分けは**既存 UI の観測量**を先に使う (例: source meter が動く=follower 正常 → bug は下流)。
+  - パイプライン全体 (生成→IPC→poll→compose→描画) を上流から1点ずつ潰す。前提を確認せず
+    「ユーザーが手順を抜かした」と決めつけない (実際は抜けていなかった)。
+
 ## 注意
 - video preview 等の visual regression は `cargo run -p daw_gui -- --smoke-test <fixture.mp4>` の
   自動検証がある (exit 0 = healthy)。texture/shared-handle 周りはこちらを併用。
