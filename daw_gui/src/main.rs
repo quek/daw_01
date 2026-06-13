@@ -1,3 +1,7 @@
+// release ではコンソール窓を出さない (windows-subsystem)。 debug は console の
+// まま (cargo run + ログ grep の動線を維持)。 docs/plan_icon_and_console.md (#48)。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +12,7 @@ use common::protocol::ChildToMain;
 use tokio::sync::mpsc::UnboundedReceiver;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event_loop::EventLoopProxy;
-use winit::window::WindowAttributes;
+use winit::window::{Icon, WindowAttributes};
 
 use daw_gui::app::{AppData, AppEvent};
 use daw_gui::bootstrap::{Bootstrap, bootstrap_subprocess};
@@ -109,8 +113,28 @@ fn parse_args() -> Result<CliArgs> {
     })
 }
 
+/// メインウィンドウ左上 (タイトルバー) のアイコンを、 build.rs が
+/// `OUT_DIR/window_icon.rgba` にラスタライズした 256x256 straight-RGBA から構築する。
+/// `Icon::from_rgba` は straight (非 premultiplied) RGBA / 所有 `Vec<u8>` を要求する。
+/// 構築失敗 (寸法不一致等) は握りつぶさず warn して None (= アイコン無し) で続行する。
+/// exe / タスクバー / Alt+Tab のアイコンは build.rs の embed-resource 側 (別経路)。
+fn window_icon() -> Option<Icon> {
+    const ICON_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/window_icon.rgba"));
+    // 寸法の SSoT は build.rs の WINDOW_ICON_SIZE 一本。 ここで再宣言して二重化せず、
+    // build.rs が書いた square straight-RGBA バッファ長から edge を導出する
+    // (4 byte/px の正方形なので edge = sqrt(len/4))。
+    let edge = ((ICON_RGBA.len() / 4) as f64).sqrt() as u32;
+    match Icon::from_rgba(ICON_RGBA.to_vec(), edge, edge) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to build window icon; continuing without");
+            None
+        }
+    }
+}
+
 fn main() -> Result<()> {
-    common::logging::init_tracing();
+    let _log_guard = common::logging::init_tracing_for("daw_gui");
     tracing::info!("daw_gui starting");
 
     let cli = parse_args()?;
@@ -188,6 +212,7 @@ fn run_gui(
     let init_state = saved_window.unwrap_or_default();
     let mut window_attrs = WindowAttributes::default()
         .with_title("daw_01")
+        .with_window_icon(window_icon())
         .with_inner_size(LogicalSize::new(init_state.width, init_state.height))
         .with_position(PhysicalPosition::new(init_state.x, init_state.y));
     if init_state.maximized {

@@ -1,3 +1,7 @@
+// release ではコンソール窓を出さない (windows-subsystem)。 debug は console の
+// まま (standalone 起動時に stdout/tracing が見える)。 docs/plan_icon_and_console.md (#48)。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -30,7 +34,7 @@ use engine::{EngineShared, LocalState, PlaybackCommand, SharedState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    common::logging::init_tracing();
+    let _log_guard = common::logging::init_tracing_for("daw_audio");
     tracing::info!("daw_audio started");
 
     let pipe_name = std::env::args()

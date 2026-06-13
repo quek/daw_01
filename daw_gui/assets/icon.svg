@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  daw_01 application icon (SSoT, vector).
+  build.rs rasterizes this at 16/32/48/256 px via resvg into a multi-res .ico
+  (exe icon) and an RGBA buffer (winit window icon). See docs/plan_icon_and_console.md.
+
+  Motif: a bold cyan audio waveform (reads even at 16 px) with an eighth note
+  accent — "singing-voice DAW". Palette matches the app: dark navy plate
+  rgb(0.10,0.10,0.12) + cyan accent rgb(0.42..0.55, 0.78..0.85, 0.95).
+  No <text> elements, so no font dependency at rasterize time.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- dark rounded plate -->
+  <rect x="8" y="8" width="240" height="240" rx="52" ry="52" fill="#15151d"/>
+  <rect x="9.5" y="9.5" width="237" height="237" rx="50.5" ry="50.5"
+        fill="none" stroke="#2c2c40" stroke-width="3"/>
+
+  <!-- audio waveform: 5 rounded bars, vertically centered on y=140 -->
+  <g fill="#57c2ef">
+    <rect x="40"  y="105" width="22" height="70"  rx="11"/>
+    <rect x="78"  y="74"  width="22" height="132" rx="11"/>
+    <rect x="116" y="52"  width="22" height="176" rx="11"/>
+    <rect x="154" y="84"  width="22" height="112" rx="11"/>
+    <rect x="192" y="110" width="22" height="60"  rx="11"/>
+  </g>
+
+  <!-- eighth note accent, upper-right negative space -->
+  <g fill="#d6f0ff">
+    <!-- stem -->
+    <rect x="206" y="34" width="12" height="68" rx="6"/>
+    <!-- flag -->
+    <path d="M218 36 q30 11 27 50 q-3 -27 -27 -33 z"/>
+    <!-- note head -->
+    <ellipse cx="190" cy="100" rx="26" ry="20" transform="rotate(-20 190 100)"/>
+  </g>
+</svg>

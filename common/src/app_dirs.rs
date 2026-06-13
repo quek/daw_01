@@ -64,6 +64,13 @@ impl AppDirs {
     pub fn window_state(&self) -> PathBuf {
         self.root.join("window_state.json")
     }
+
+    /// `<root>\logs\` — 各プロセスの日次ローテーション tracing ログ置き場。
+    /// release で windows-subsystem 化 (コンソール無し) しても、 ここに
+    /// `<process>.YYYY-MM-DD` が常時書かれる。 docs/plan_icon_and_console.md (#48)。
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
 }
 
 #[cfg(test)]

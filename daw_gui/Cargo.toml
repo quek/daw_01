@@ -32,5 +32,14 @@ windows.workspace = true
 # docs/plan_video_export_libav.md.
 rsmpeg = "0.17"
 
+[build-dependencies]
+# #47 app icon: rasterize assets/icon.svg at build time into a multi-res .ico
+# (exe icon, via embed-resource) + a 256px RGBA buffer (winit window icon).
+# resvg re-exports usvg + tiny_skia — do NOT list those separately (avoids a
+# second mismatched tiny-skia). docs/plan_icon_and_console.md (#47).
+resvg = "0.47"
+ico = "0.5"
+embed-resource = "3"
+
 [dev-dependencies]
 tempfile = "3"

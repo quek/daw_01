@@ -10,6 +10,17 @@ use common::plugin_format::PluginFormat;
 use common::port_config::PortConfig;
 use tokio::process::{Child, Command};
 
+/// Windows: 子プロセスのコンソール窓を抑制する creation flag。 release では
+/// `CREATE_NO_WINDOW` (親が windows-subsystem で console を持たないとき、
+/// console-subsystem の子が新しいコンソール窓を開くのを防ぐ belt-and-suspenders。
+/// 子も release では windows-subsystem 化済み)。 debug では 0 (= フラグ無し。
+/// 子を standalone 起動したとき stdout/tracing が見える)。 どちらでも
+/// `Stdio::piped()` の stdout 取得は壊れない。 docs/plan_icon_and_console.md (#48)。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const CHILD_CREATION_FLAGS: u32 = if cfg!(debug_assertions) { 0 } else { CREATE_NO_WINDOW };
+
 /// FIXME #26/#29: daw_plugin_host を `--probe-vst3` / `--probe-clap` 使い捨て
 /// プロセスとして起動し、 プラグインの port 構成 (note in/out・audio out) を読む。
 /// **sync** (= rescan の std::thread から呼ぶので tokio Command は使わない)。
@@ -29,12 +40,18 @@ pub fn probe_plugin_ports(
         PluginFormat::Builtin => return None,
     };
     let exe = resolve_sibling_binary("daw_plugin_host").ok()?;
-    let mut child = std::process::Command::new(&exe)
-        .args([flag, &path.display().to_string(), target_id])
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args([flag, &path.display().to_string(), target_id])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // std::process::Command::creation_flags is the CommandExt *trait* — import it.
+    // CREATE_NO_WINDOW keeps the piped stdout fully readable (no visible window).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CHILD_CREATION_FLAGS);
+    }
+    let mut child = cmd.spawn().ok()?;
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -68,9 +85,13 @@ where
 {
     let path = resolve_sibling_binary(name)?;
     tracing::info!(binary = %path.display(), "spawning child process");
-    Command::new(&path)
-        .args(args)
-        .spawn()
+    let mut cmd = Command::new(&path);
+    cmd.args(args);
+    // tokio::process::Command::creation_flags は Windows の inherent method
+    // (trait import 不要)。 tokio が CREATE_UNICODE_ENVIRONMENT を OR する。
+    #[cfg(windows)]
+    cmd.creation_flags(CHILD_CREATION_FLAGS);
+    cmd.spawn()
         .with_context(|| format!("failed to spawn {}", path.display()))
 }
 

@@ -1,3 +1,7 @@
+// release ではコンソール窓を出さない (windows-subsystem)。 debug は console の
+// まま (standalone 起動時に stdout/tracing が見える)。 docs/plan_icon_and_console.md (#48)。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod builtin;
 mod clap_host;
 mod clap_plugin;
@@ -405,7 +409,9 @@ fn cleanup_leftover_shmems(my_pid: u32) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    common::logging::init_tracing();
+    // probe (--probe-vst3 / --probe-clap) の早期 return より前に guard を束縛し、
+    // probe 実行分のログも flush されるようにする。
+    let _log_guard = common::logging::init_tracing_for("daw_plugin_host");
     tracing::info!("daw_plugin_host started");
 
     // FIXME #26/#29: one-shot VST3 port-probe モード。 daw_gui の rescan が VST3
