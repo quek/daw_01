@@ -269,6 +269,16 @@ pub fn render_mp4_cancellable(
     // frame N without blocking, then collect N-1 and hand it to the encode
     // worker. So composite+submit(N) ∥ GPU readback(N-1) ∥ worker encode(N-2)
     // overlap — a 3-stage pipeline with the Phase 2a encode worker.
+    // docs/plan_modulation.md §7: load the baked modulation env sidecar written
+    // next to the audio WAV, so visual modulation renders the same as the live
+    // preview. Absent / unreadable → empty (no modulation, curve/base only).
+    let mod_sidecar = cfg
+        .audio_wav_path
+        .map(common::mod_sidecar::ModEnvSidecar::sidecar_path)
+        .and_then(|p| common::mod_sidecar::ModEnvSidecar::read(&p).ok())
+        .unwrap_or_default();
+    let mut mod_scalars_buf: Vec<f32> = Vec::new();
+
     let mut pending = None;
     for frame_index in 0..total_frames {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -279,6 +289,9 @@ pub fn render_mp4_cancellable(
         on_progress(frame_index, total_frames);
         let frame_seconds = frame_index as f64 / f64::from(framerate);
         let playhead_beat = seconds_to_beat(frame_seconds, cfg.song.bpm);
+        // docs/plan_modulation.md §7: sample the baked follower envelopes at
+        // this frame's beat (step / sample-and-hold), same composition as live.
+        mod_sidecar.sample_at(playhead_beat, &mut mod_scalars_buf);
         scene.primitives.clear();
         build_frame_scene(
             cfg.song,
@@ -288,6 +301,7 @@ pub fn render_mp4_cancellable(
             &mut video_textures,
             &image_textures,
             playhead_beat,
+            &mod_scalars_buf,
             out_w,
             out_h,
             &mut scene,
@@ -420,6 +434,7 @@ fn build_frame_scene(
     video_textures: &mut HashMap<VideoSourceId, (TextureHandle, u32, u32)>,
     image_textures: &HashMap<ImageSourceId, (TextureHandle, u32, u32)>,
     playhead_beat: f64,
+    mod_scalars: &[f32],
     out_w: u32,
     out_h: u32,
     scene: &mut Scene,
@@ -483,10 +498,9 @@ fn build_frame_scene(
     // docs/plan_image_overlay.md §P3: image overlay layers on top of
     // video. Normalized [0, 1] PiP rect maps to canvas pixels (= the
     // canvas IS the project resolution, so `x * out_w` is exact).
-    // docs/plan_modulation.md §7: export はライブの follower scalar を読めない
-    // (audio engine 非稼働)。 Phase 7 で env sidecar を frame 時刻でサンプルして
-    // ここに渡す。 それまでは空 = 変調なし (curve/base のみ)。
-    let mod_scalars: &[f32] = &[];
+    // docs/plan_modulation.md §7: `mod_scalars` are sampled by `render_mp4`
+    // from the baked env sidecar at this frame's beat (empty = no modulation),
+    // so visual modulation renders identically to the live preview.
     let image_layers =
         crate::image_compose::active_image_sources_at(song, playhead_beat, mod_scalars);
     // v19 (docs/plan_tachie_group_transform.md §5.6): export も preview と同じ

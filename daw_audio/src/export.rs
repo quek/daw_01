@@ -68,6 +68,9 @@ pub fn run_export(
     if song.bpm <= 0.0 {
         anyhow::bail!("song.bpm must be positive (got {})", song.bpm);
     }
+    // docs/plan_modulation.md §7: derive the modulation sidecar path up front,
+    // before `path` is moved into the WAV writer below.
+    let sidecar_path = common::mod_sidecar::ModEnvSidecar::sidecar_path(&path);
     let n_tracks = song.tracks.len().min(MAX_TRACKS);
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
     let song_length_samples = (song.length_beats * samples_per_beat).max(0.0) as u64;
@@ -130,7 +133,21 @@ pub fn run_export(
     // never gets wedged.
     engine_shared.export_running.store(false, Ordering::Release);
 
-    let frames_written = render_result?;
+    let (frames_written, env_sidecar) = render_result?;
+
+    // docs/plan_modulation.md §7: persist the modulation envelope sidecar next
+    // to the WAV (skip when there were no sources). Best-effort — a sidecar
+    // write failure must not fail the audio export; the video render falls back
+    // to no modulation (curve/base only).
+    if !env_sidecar.is_empty()
+        && let Err(e) = env_sidecar.write(&sidecar_path)
+    {
+        tracing::warn!(
+            error = %e,
+            path = %sidecar_path.display(),
+            "failed to write modulation env sidecar"
+        );
+    }
 
     writer
         .finalize()
@@ -158,7 +175,7 @@ fn render_loop(
     master_l: &mut [f32],
     master_r: &mut [f32],
     writer: &mut WavWriter<std::io::BufWriter<std::fs::File>>,
-) -> Result<u64> {
+) -> Result<(u64, common::mod_sidecar::ModEnvSidecar)> {
     // Tail-silence cutoff: stop early if the master bus stays under
     // -60 dB for half a second once we're past the song body.
     let silence_thresh: f32 = 0.001;
@@ -174,6 +191,11 @@ fn render_loop(
     // would silently bypass PR3 PDC and mis-render group hierarchies.
     let mut schedule = compile_schedule(song)
         .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
+
+    // docs/plan_modulation.md §7: bake each `ModSource`'s follower envelope per
+    // render buffer (keyed by beat) so the offline video render reproduces the
+    // live preview's modulation. Written to a sidecar next to the WAV.
+    let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(schedule.follower_slots.len());
 
     // Frame counter for the WAV output. Walking the song always starts
     // at frame 0 so plugin state at `write_start` is properly built up,
@@ -302,6 +324,16 @@ fn render_loop(
             false,
         );
 
+        // docs/plan_modulation.md §7: record this buffer's follower envelopes
+        // (block-rate `env`, same value the live engine publishes to
+        // `mod_scalars`) keyed by the block beat.
+        if env_sidecar.n_sources > 0 {
+            env_sidecar.beats.push(playhead_beats as f32);
+            for fs in &schedule.follower_slots {
+                env_sidecar.scalars.push(fs.env);
+            }
+        }
+
         // Compute block peak across the full block (for tail-silence
         // detection past write_end).
         let block_start = playhead;
@@ -358,5 +390,7 @@ fn render_loop(
         }
     }
 
-    Ok(frames_written)
+    // docs/plan_modulation.md §7: hand the baked envelope sidecar back to
+    // `run_export`, which owns the WAV path and persists it next to the WAV.
+    Ok((frames_written, env_sidecar))
 }
