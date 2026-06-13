@@ -1,7 +1,7 @@
 //! `scrubable_number` ウィジェット — drag-to-edit な数値入力。
 //!
 //! Phase 64a (daw_01 #034): BPM / TimeSig num 等の transport 数値表示で「数値そのものを
-//! mouse press + 縦 drag で連続変化」 + 「single-click で text input mode」 + 「Ctrl で fine drag」
+//! mouse press + 縦横 drag で連続変化」 + 「single-click で text input mode」 + 「Ctrl で fine drag」
 //! + 「dblclick で default reset」 という DAW 慣習を実装する widget。
 //!
 //! 既存 `knob_at` (= 円形 knob で drag scrub) と `text_input_at` (= keyboard 入力) を組み合わせた
@@ -9,7 +9,8 @@
 //! Esc rollback は全部既存実装に乗せ、 scrubable 側は state machine + drag 値計算 + format parse のみ。
 //!
 //! 操作 binding (Phase 64a confirmed by daw_01 #034):
-//! - press + 縦 drag (>= 4px) → scrub 開始 (`dragging = true`、 per-frame `on_change(new)`)
+//! - press + 縦横 drag (合成 >= 4px) → scrub 開始 (`dragging = true`、 per-frame `on_change(new)`)。
+//!   右 / 上で増加、 左 / 下で減少 (両軸の符号付き移動量を加算、 daw_01 #108、 画面端でも横で操作可)
 //! - Ctrl + drag → sensitivity × 0.1 (fine、 knob/fader と同 idiom)
 //! - dblclick (300ms / 5px 以内) → `default_value` リセット + `on_change(default)`
 //! - press → 4px 未満で release → text input mode (`editing_text = true`)、 内部 `text_input_at_focused`
@@ -105,7 +106,7 @@ pub struct ModEntry {
 
 /// depth ドラッグ編集 (= ある source を arm = 割当モードにしている) の記述 (daw_01 #107)。
 ///
-/// `Modulation::edit` が `Some` の間、 widget の press + 縦 drag は **base 値でなく depth** を
+/// `Modulation::edit` が `Some` の間、 widget の press + 縦横 drag は **base 値でなく depth** を
 /// 変化させ (base scrub は抑止 = 非破壊)、 移動した hold frame ごとに `on_mod_change(new_depth)`
 /// を発火する。 undo bracket は [`ScrubableNumberResponse::mod_dragging`] の edge を見て daw が
 /// 発火する想定 (base scrub と違い widget は Undoable wrap しない)。
@@ -177,21 +178,24 @@ pub struct ScrubableNumberResponse {
 /// scrubable_number の永続状態 (フレーム間で保持)。
 #[derive(Debug, Default)]
 pub(crate) struct ScrubableNumberState {
-    /// drag anchor (press 時の `(pointer_y, value, ctrl)`)。 `Some` で press 中 (= drag or short-click 判定待ち)。
+    /// drag anchor (press 時の `(pointer_x, pointer_y, value, ctrl)`)。 `Some` で press 中 (= drag or short-click 判定待ち)。
     drag_anchor: Option<DragAnchor>,
-    /// drag 累積距離 (px、 abs)。 release 時に DRAG_THRESHOLD_PX 未満なら short-click → editing。
-    drag_distance_y: f32,
+    /// drag 累積距離 (px、 縦横の合成 = `hypot(dx, dy)` の最大値)。 release 時に DRAG_THRESHOLD_PX
+    /// 未満なら short-click → editing (横ドラッグでも端で閾値に入る、 daw_01 #108)。
+    drag_distance: f32,
     /// 直近のクリック (ダブルクリック判定用)。
     last_click: Option<ClickRecord>,
     /// drag 開始時の値 (release frame で undoable Edit の inverse に使う、 knob/fader と同 idiom)。
     drag_initial_value: Option<f64>,
-    /// text input mode に入っているか (= editing_text)。 release で `drag_distance_y < DRAG_THRESHOLD_PX`
+    /// text input mode に入っているか (= editing_text)。 release で `drag_distance < DRAG_THRESHOLD_PX`
     /// のとき true へ遷移、 inner text_input が focus loss / commit で false へ戻る。
     editing: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct DragAnchor {
+    /// press 位置の x。 横ドラッグ (右=増 / 左=減) の起点 (daw_01 #108)。
+    pointer_x: f32,
     pointer_y: f32,
     /// 基準値。 base scrub では press 時の base 値、 depth-edit では press 時の depth 値。
     value: f64,
@@ -258,7 +262,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
     /// `modulation`: `Some` で Bitwig 流 modulation を表示・編集する (daw_01 #107)。 `None` で
     ///   従来描画・従来挙動 (完全回帰)。 [`Modulation::entries`] を base 値からの色帯で重畳描画、
     ///   [`Modulation::live_value`] を可動 tick で描画、 [`Modulation::edit`] が `Some` のとき
-    ///   press + 縦 drag は base でなく depth を変化させ `on_mod_change` を発火する (base scrub 抑止)。
+    ///   press + 縦横 drag は base でなく depth を変化させ `on_mod_change` を発火する (base scrub 抑止)。
     ///   帯 / tick の位置算出には `style.range` が必須 (無いと depth-edit 枠強調のみ)。
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn scrubable_number_at<F>(
@@ -305,7 +309,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         let mut short_click_release = false;
         // depth gesture の release frame で確定する最終 depth (= pointer の最終位置から再計算)。
         let mut release_depth: Option<f64> = None;
-        let (drag_anchor, drag_distance_y, was_editing) = {
+        let (drag_anchor, drag_distance, was_editing) = {
             let state: &mut ScrubableNumberState = self.widget_state(wid);
 
             if pointer.primary_just_pressed
@@ -324,7 +328,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                     state.last_click = None;
                     state.drag_anchor = None;
                     state.drag_initial_value = None;
-                    state.drag_distance_y = 0.0;
+                    state.drag_distance = 0.0;
                     state.editing = false;
                     reset_fired = true;
                 } else {
@@ -332,13 +336,14 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                     // depth-edit 中は anchor の基準値を base でなく現 depth にする。
                     let anchor_value = if depth_mode { current_depth } else { value };
                     state.drag_anchor = Some(DragAnchor {
+                        pointer_x: px,
                         pointer_y: py,
                         value: anchor_value,
                         ctrl: pointer.modifiers.ctrl,
                         depth_drag: depth_mode,
                     });
                     state.drag_initial_value = Some(value);
-                    state.drag_distance_y = 0.0;
+                    state.drag_distance = 0.0;
                     // press 時点で editing なら外す (= 新規 press で text input 終了)。
                     // ただし inner text_input の focus は別経路で残るので、 ここでは editing flag のみ。
                     state.editing = false;
@@ -348,11 +353,12 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             // mid-drag で Ctrl toggle されたら anchor 再設定 (= 値 jump 回避、 knob/fader と同 idiom)。
             // depth-edit gesture は depth 基準で、 base gesture は base 基準で再 anchor する。
             if let Some(anchor) = state.drag_anchor
-                && let Some((_, py)) = pointer.pos
+                && let Some((px, py)) = pointer.pos
                 && pointer.modifiers.ctrl != anchor.ctrl
             {
                 let anchor_value = if anchor.depth_drag { current_depth } else { value };
                 state.drag_anchor = Some(DragAnchor {
+                    pointer_x: px,
                     pointer_y: py,
                     value: anchor_value,
                     ctrl: pointer.modifiers.ctrl,
@@ -360,32 +366,32 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 });
             }
 
-            // drag 距離計測 (= drag_anchor が Some の間、 abs(py - anchor.py) の最大値を保持)。
-            if let (Some(anchor), Some((_, py))) = (state.drag_anchor, pointer.pos) {
-                let dist = (py - anchor.pointer_y).abs();
-                if dist > state.drag_distance_y {
-                    state.drag_distance_y = dist;
+            // drag 距離計測 (= drag_anchor が Some の間、 縦横合成 hypot(dx, dy) の最大値を保持)。
+            if let (Some(anchor), Some((px, py))) = (state.drag_anchor, pointer.pos) {
+                let dist = (px - anchor.pointer_x).hypot(py - anchor.pointer_y);
+                if dist > state.drag_distance {
+                    state.drag_distance = dist;
                 }
             }
 
             if pointer.primary_just_released {
                 let anchor_opt = state.drag_anchor;
                 let init = state.drag_initial_value.take();
-                let dist = state.drag_distance_y;
+                let dist = state.drag_distance;
                 let was_pressed = anchor_opt.is_some();
                 let was_depth = anchor_opt.is_some_and(|a| a.depth_drag);
                 state.drag_anchor = None;
-                state.drag_distance_y = 0.0;
+                state.drag_distance = 0.0;
                 if was_depth {
                     // depth gesture の release: per-frame は anchor が None になる release frame
                     // で fire しないため、 pointer の最終位置から depth を再計算して 1 度確定発火する
                     // (release frame で pointer が動いていた場合の最終値取りこぼし防止、 daw_01 #107
                     // 「release で最終 depth も発火」)。 閾値超 (= 実 drag) のみ。
                     if dist >= DRAG_THRESHOLD_PX
-                        && let (Some(anchor), Some((_, py))) = (anchor_opt, pointer.pos)
+                        && let (Some(anchor), Some((px, py))) = (anchor_opt, pointer.pos)
                     {
                         release_depth =
-                            Some(clamp_opt(raw_drag_value(anchor, py, depth_sens), depth_range));
+                            Some(clamp_opt(raw_drag_value(anchor, px, py, depth_sens), depth_range));
                     }
                 } else {
                     // base scrub のみ release で undoable wrap するため release_initial_value を残し、
@@ -398,26 +404,26 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 }
             }
 
-            (state.drag_anchor, state.drag_distance_y, state.editing)
+            (state.drag_anchor, state.drag_distance, state.editing)
         };
 
         // ---- 表示値の決定 ----
         // base 数値テキスト: reset > base scrub (depth-edit gesture 中は抑止) > value。
         let displayed_value = if reset_fired {
             default_value
-        } else if let (Some(anchor), Some((_, py))) = (drag_anchor, pointer.pos)
+        } else if let (Some(anchor), Some((px, py))) = (drag_anchor, pointer.pos)
             && !anchor.depth_drag
         {
-            clamp_opt(raw_drag_value(anchor, py, style.sensitivity), style.range)
+            clamp_opt(raw_drag_value(anchor, px, py, style.sensitivity), style.range)
         } else {
             value
         };
 
         // depth 値 (= modulation 帯 + on_mod_change): depth-edit gesture drag 中のみ更新。
-        let displayed_depth = if let (Some(anchor), Some((_, py))) = (drag_anchor, pointer.pos)
+        let displayed_depth = if let (Some(anchor), Some((px, py))) = (drag_anchor, pointer.pos)
             && anchor.depth_drag
         {
-            clamp_opt(raw_drag_value(anchor, py, depth_sens), depth_range)
+            clamp_opt(raw_drag_value(anchor, px, py, depth_sens), depth_range)
         } else {
             current_depth
         };
@@ -427,9 +433,9 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         let mut edit_text: Option<String> = None;
         // base scrub と depth-edit は排他 (anchor.depth_drag で判定)。
         let dragging_now =
-            drag_anchor.is_some_and(|a| !a.depth_drag) && drag_distance_y >= DRAG_THRESHOLD_PX;
+            drag_anchor.is_some_and(|a| !a.depth_drag) && drag_distance >= DRAG_THRESHOLD_PX;
         let mod_dragging =
-            drag_anchor.is_some_and(|a| a.depth_drag) && drag_distance_y >= DRAG_THRESHOLD_PX;
+            drag_anchor.is_some_and(|a| a.depth_drag) && drag_distance >= DRAG_THRESHOLD_PX;
 
         // depth (modulation) per-frame 発火: depth-edit gesture が hold 中 (release 後は anchor が
         // None になり displayed_depth == current_depth で skip)。 release は per-frame 済 + daw が
@@ -634,13 +640,20 @@ fn draw_scrubable_number<M: ?Sized + 'static>(
     });
 }
 
-/// anchor + 現 pointer_y から raw drag 値を出す (base / depth 共用)。 縦 drag 上方向で増加、
-/// Ctrl で `FINE_DRAG_SCALE` 倍精細 (sensitivity は units_per_pixel)。
-fn raw_drag_value(anchor: DragAnchor, py: f32, sensitivity: f32) -> f64 {
+/// anchor + 現 pointer から raw drag 値を出す (base / depth 共用)。 **縦横両方向** で値変化させる
+/// (daw_01 #108): 各軸が固定の意味を持ち (右=+ / 上=+ / 左=− / 下=−)、 両軸の符号付き移動量を
+/// **加算** (`dx + (-dy)`) する。 純縦ドラッグは従来と完全一致 (dx=0) で回帰なし、 画面端でも横で
+/// 操作できる。 Ctrl で `FINE_DRAG_SCALE` 倍精細 (sensitivity は units_per_pixel、 両軸共通)。
+///
+/// per-axis 合成の自然な帰結として、 **正確な右下 / 左上 の対角線では両軸が打ち消し合い値が
+/// 変わらない** (右の + と下の − が相殺、 dead zone でなく一貫仕様)。 short-click 閾値は合成距離
+/// `hypot(dx, dy)` (daw_01 #108「合成距離で端でも入りやすい」) で判定するので、 対角 drag は
+/// dragging 表示に入っても値据え置きになりうる (= 閾値 metric と値 metric が別目的なため意図的)。
+fn raw_drag_value(anchor: DragAnchor, px: f32, py: f32, sensitivity: f32) -> f64 {
     let scale = if anchor.ctrl { FINE_DRAG_SCALE } else { 1.0 };
-    // 上方向 (py < anchor_y) で値増加、 下方向で減少 (= DAW 慣習)。
-    let dy_px = -(py - anchor.pointer_y);
-    anchor.value + f64::from(dy_px) * f64::from(sensitivity) * f64::from(scale)
+    // 右 (px > anchor_x) で増加、 上 (py < anchor_y) で増加 (= DAW 慣習)。
+    let delta_px = (px - anchor.pointer_x) - (py - anchor.pointer_y);
+    anchor.value + f64::from(delta_px) * f64::from(sensitivity) * f64::from(scale)
 }
 
 /// `Some(range)` のとき clamp、 `None` でそのまま。
@@ -1422,5 +1435,242 @@ mod tests {
                 r.rect,
             );
         }
+    }
+
+    // ---- daw_01 #108: 横ドラッグ ----
+
+    /// 横ドラッグ右で base 値が増加 (縦と同 sensitivity)。
+    #[test]
+    fn horizontal_drag_right_increases_value() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let mut model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let center = (40.0_f32, 14.0_f32);
+
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        // drag right 20px (dx=+20, dy=0) → 120 + 20*0.5 = 130
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style,
+            hold_at((center.0 + 20.0, center.1), false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.bpm - 130.0).abs() < 1e-5, "横右 20px × 0.5 = +10 (got {})", model.bpm);
+    }
+
+    /// 横ドラッグ左で減少 (符号確認)。
+    #[test]
+    fn horizontal_drag_left_decreases_value() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let mut model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let center = (40.0_f32, 14.0_f32);
+
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        // drag left 20px (dx=-20) → 120 - 10 = 110
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style,
+            hold_at((center.0 - 20.0, center.1), false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.bpm - 110.0).abs() < 1e-5, "横左 20px × 0.5 = -10 (got {})", model.bpm);
+    }
+
+    /// 斜めドラッグは両軸を加算 (右 + 上で増加)。
+    #[test]
+    fn diagonal_drag_sums_both_axes() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let mut model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let center = (40.0_f32, 14.0_f32);
+
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        // dx=+10, dy=-10 (up) → delta = 10 + 10 = 20 → 120 + 20*0.5 = 130
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style,
+            hold_at((center.0 + 10.0, center.1 - 10.0), false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.bpm - 130.0).abs() < 1e-5, "斜め右上 (10,10) 加算 = +10 (got {})", model.bpm);
+    }
+
+    /// 純縦ドラッグは横追加後も従来と完全一致 (回帰なし、 dx=0)。
+    #[test]
+    fn vertical_only_drag_unchanged_after_horizontal_support() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let mut model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let center = (40.0_f32, 14.0_f32);
+
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        // drag up 20px, x 不変 → 従来どおり +10
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style,
+            hold_at((center.0, center.1 - 20.0), false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.bpm - 130.0).abs() < 1e-5, "純縦 20px = +10 で回帰なし (got {})", model.bpm);
+    }
+
+    /// depth ドラッグ (arm) も横で効く + 合成距離で mod_dragging 閾値に入る。
+    #[test]
+    fn depth_drag_works_horizontally() {
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let mut model = ModModel { bpm: 120.0, depth: 0.0 };
+        let rect = rect_default();
+        let style = mod_style();
+        let center = (40.0_f32, 14.0_f32);
+
+        let (edits, _) =
+            run_mod_frame(&mut host, &model, rect, &style, press_at(center, false), true, &[], None, &mut Scene::new());
+        for e in edits { e.apply(&mut model); }
+        // drag right 20px (dx=+20) → depth 0 + 20*0.5 = 10
+        let (edits, resp) = run_mod_frame(
+            &mut host, &model, rect, &style,
+            hold_at((center.0 + 20.0, center.1), false), true, &[], None, &mut Scene::new(),
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.depth - 10.0).abs() < 1e-5, "横右 depth scrub +10 (got {})", model.depth);
+        assert!(resp.mod_dragging, "横 20px の合成距離で mod_dragging=true");
+    }
+
+    /// 横ドラッグ下で base 値が減少 (下=−)。
+    #[test]
+    fn vertical_drag_down_decreases_value() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let mut model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let center = (40.0_f32, 14.0_f32);
+
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        // drag down 20px (dy=+20) → delta = 0 - 20 = -20 → 120 - 10 = 110
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style,
+            hold_at((center.0, center.1 + 20.0), false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.bpm - 110.0).abs() < 1e-5, "縦下 20px = -10 (got {})", model.bpm);
+    }
+
+    /// 左下ドラッグは両軸とも減少方向で加算 (左=− / 下=−)。
+    #[test]
+    fn diagonal_down_left_decreases_value() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let mut model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let center = (40.0_f32, 14.0_f32);
+
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        // dx=-10, dy=+10 → delta = -10 - 10 = -20 → 120 - 10 = 110
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style,
+            hold_at((center.0 - 10.0, center.1 + 10.0), false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.bpm - 110.0).abs() < 1e-5, "左下 (-10,-10) 加算 = -10 (got {})", model.bpm);
+    }
+
+    /// 右下の正確な対角線は両軸が打ち消し合い値が変わらない (per-axis 合成の一貫仕様)。
+    #[test]
+    fn diagonal_down_right_cancels_to_no_change() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let mut model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let center = (40.0_f32, 14.0_f32);
+
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        // dx=+15, dy=+15 → delta = 15 - 15 = 0 → 値不変 (右の + と下の − が相殺)
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style,
+            hold_at((center.0 + 15.0, center.1 + 15.0), false), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.bpm - 120.0).abs() < 1e-5, "右下対角は相殺で値不変 (got {})", model.bpm);
+    }
+
+    /// Ctrl fine sensitivity は横ドラッグにも効く (両軸共通)。
+    #[test]
+    fn ctrl_fine_applies_to_horizontal() {
+        let mut host: UiHost<BpmModel> = UiHost::no_redraw();
+        let mut model = BpmModel { bpm: 120.0 };
+        let rect = rect_default();
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let center = (40.0_f32, 14.0_f32);
+
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style, press_at(center, true), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        // drag right 20px Ctrl → 20 * 0.5 * 0.1 = 1.0 → 121
+        let edits = run_frame(
+            &mut host, &model, rect, model.bpm, 120.0,
+            ScrubableNumberFormat::Decimal(1), &style,
+            hold_at((center.0 + 20.0, center.1), true), None,
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.bpm - 121.0).abs() < 1e-5, "Ctrl 横右 = +1.0 (got {})", model.bpm);
+    }
+
+    /// Ctrl fine sensitivity は depth の横ドラッグにも効く (depth_sens × FINE)。
+    #[test]
+    fn ctrl_fine_applies_to_depth_horizontal() {
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let mut model = ModModel { bpm: 120.0, depth: 0.0 };
+        let rect = rect_default();
+        let style = mod_style(); // sensitivity 0.5
+        let center = (40.0_f32, 14.0_f32);
+
+        let (edits, _) =
+            run_mod_frame(&mut host, &model, rect, &style, press_at(center, true), true, &[], None, &mut Scene::new());
+        for e in edits { e.apply(&mut model); }
+        // drag right 20px Ctrl → depth 0 + 20 * 0.5 * 0.1 = 1.0
+        let (edits, _) = run_mod_frame(
+            &mut host, &model, rect, &style,
+            hold_at((center.0 + 20.0, center.1), true), true, &[], None, &mut Scene::new(),
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.depth - 1.0).abs() < 1e-5, "Ctrl 横右 depth = +1.0 (got {})", model.depth);
     }
 }
