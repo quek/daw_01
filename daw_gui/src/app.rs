@@ -480,6 +480,8 @@ pub struct ClipRef {
 pub enum ColorPickerTarget {
     Track(u32),
     Clip(ClipRef),
+    /// FIXME #53: Arranger セクション帯の色。
+    Section(u32),
 }
 
 /// gui_01 #028: 1 point の addressing。daw_01 側は `(track_id, lane_id,
@@ -848,6 +850,10 @@ pub struct AppData {
     /// arrangement) からは `selected_tracks: &[u32]` として渡す。 id
     /// ベース (Track::id) で持ち、 track 並び替えでも安定。
     pub selected_track_ids: Vec<u32>,
+    /// FIXME #53: 選択中の Arranger セクション id 集合 (`selected_track_ids` と同 idiom、
+    /// 末尾 = anchor)。 gui_01 の `SelectSection` で更新、 帯のハイライト + キーボード Delete
+    /// の対象。 section を選ぶと他面 (clip/note/track) の選択はクリアして Delete の曖昧さを避ける。
+    pub selected_section_ids: Vec<u32>,
     /// 折り畳み中の group track id 集合。 group 自身が `kind == Group`
     /// (= 子を持つ) かつこの set に含まれていれば子孫の row を hide。
     pub collapsed_groups: std::collections::HashSet<u32>,
@@ -1320,6 +1326,18 @@ pub struct AppData {
     /// (毎フレーム `Some` を渡すと outside-click で閉じても翌フレーム再 open するため)。
     pub clip_create_menu_open: bool,
 
+    /// FIXME #53: Arranger セクション帯の右クリックメニュー stash `(section_id, 右クリック pos)`。
+    /// `SecondaryClickSection` 受信で set、 overlay が pos にメニュー (ループ / 帯削除 /
+    /// 範囲削除) を描画、 on_select で `None` に戻す (`clip_create_menu` と同 idiom)。
+    pub section_menu: Option<(u32, (f32, f32))>,
+    /// 上記セクションメニューの 1-shot open trigger (`clip_create_menu_open` と同 idiom)。
+    pub section_menu_open: bool,
+    /// FIXME #53: inline 改名中のセクション id (`track_rename_id` の section 版)。`Some` の間、
+    /// arrangement view が該当帯 rect に text_input を重ねる。
+    pub section_rename_id: Option<u32>,
+    /// 上記改名の編集中文字列。
+    pub section_rename_text: String,
+
     /// Transport BPM 入力欄の編集中文字列。 commit (Enter) で parse + clamp +
     /// `song.bpm` に反映、 song を切り替える際 (open / new / undo / redo) は
     /// `resync_song_edit_texts` で formatted な現値に書き戻す。
@@ -1638,6 +1656,7 @@ impl AppData {
             pianoroll_hover_beat_song_raw: None,
             pending_clipboard_write: None,
             selected_track_ids: Vec::new(),
+            selected_section_ids: Vec::new(),
             collapsed_groups: std::collections::HashSet::new(),
             expanded_automation_tracks: std::collections::HashSet::new(),
             master_row_automation_expanded: false,
@@ -1746,6 +1765,10 @@ impl AppData {
             color_picker_session_dirty: false,
             clip_create_menu: None,
             clip_create_menu_open: false,
+            section_menu: None,
+            section_menu_open: false,
+            section_rename_id: None,
+            section_rename_text: String::new(),
             track_rename_text: String::new(),
             clip_rename: None,
             clip_rename_text: String::new(),
@@ -2466,6 +2489,11 @@ impl AppData {
         self.audio_editor_selected_events.clear();
         self.track_rename_id = None;
         self.track_rename_text.clear();
+        self.section_rename_id = None;
+        self.section_rename_text.clear();
+        // 削除/undo で消えた section id を選択から除外。
+        self.selected_section_ids
+            .retain(|id| self.song.sections.iter().any(|s| s.id == *id));
         self.clip_rename = None;
         self.clip_rename_text.clear();
         // selected_track_ids: undo で track が消えていたら除外。 残りが
@@ -2523,6 +2551,7 @@ impl AppData {
                 | AppEvent::SetMouthMapSlot { .. }
                 | AppEvent::RemoveLastTrack
                 | AppEvent::CommitRenameTrack
+                | AppEvent::CommitRenameSection
                 | AppEvent::CommitRenameClip
                 | AppEvent::CreateClip { .. }
                 | AppEvent::ResizeClip { .. }
@@ -3481,6 +3510,15 @@ pub enum AppEvent {
     RenameTrackChanged(String),
     CommitRenameTrack,
     CancelRenameTrack,
+    /// FIXME #53: Arranger セクション帯の改名 (track rename の section 版)。帯名ダブルクリック
+    /// またはメニュー「改名」で開始、 帯 rect に inline text_input を重ねる。
+    BeginRenameSection(u32),
+    RenameSectionChanged(String),
+    CommitRenameSection,
+    CancelRenameSection,
+    /// FIXME #53: セクション帯の色変更 (color_picker の live drag で発火)。 SetTrackColor と
+    /// 同様、 非 undoable で各 arm が snapshot_for_color_edit を呼ぶ。
+    SetSectionColor { id: u32, color: [f32; 3] },
     /// clip rename (track rename の clip 版)。 右クリックメニュー "Rename"
     /// または F2 で開始、 該当 clip rect に inline text_input を重ねる。
     BeginRenameClip(ClipRef),
@@ -4842,6 +4880,19 @@ impl AppData {
             AppEvent::CancelRenameTrack => {
                 self.track_rename_id = None;
                 self.track_rename_text.clear();
+            }
+            AppEvent::BeginRenameSection(id) => self.begin_rename_section(id),
+            AppEvent::RenameSectionChanged(text) => self.section_rename_text = text,
+            AppEvent::CommitRenameSection => self.commit_rename_section(),
+            AppEvent::CancelRenameSection => {
+                self.section_rename_id = None;
+                self.section_rename_text.clear();
+            }
+            AppEvent::SetSectionColor { id, color } => {
+                self.snapshot_for_color_edit();
+                if let Some(s) = self.song.sections.iter_mut().find(|s| s.id == id) {
+                    s.color = color;
+                }
             }
             AppEvent::BeginRenameClip(target) => self.begin_rename_clip(target),
             AppEvent::RenameClipChanged(text) => {
@@ -7039,19 +7090,28 @@ impl AppData {
         self.is_playing = true;
     }
 
-    /// FIXME #44: `f` キーの実体。 snap 済 song-absolute beat へプレイヘッドを置き、
-    /// audio engine に SeekTo を送る。 停止中は `play()` を呼んでその位置から再生開始
-    /// する (play() の export / asset / plugin ゲートと playback_origin_beat capture を
-    /// 継承するため body を再実装しない)。 再生中は SeekTo だけ送ってシームレスに継続
-    /// する (= play()/stop() を呼ばない。 既存の ruler クリック中再生と同じ挙動で、
-    /// Stop は元の play origin に戻る)。
-    fn action_play_from_cursor(&mut self, beat: f64) {
+    /// FIXME #50: プレイヘッドを `beat` に置き、「停止で戻るホーム」 (`playback_origin_beat`)
+    /// も同位置へ更新し、audio engine へ SeekTo を送る。 ruler click (arrangement /
+    /// piano_roll / audio_editor) と `f` キーから共通で呼ぶ唯一の seek 経路 (= 「停止 =
+    /// 最後に意図的に置いた位置に戻る」 の SSoT)。 再生中でも home を更新するので、
+    /// 再生中に置き直して停止すると新しい位置へ戻る。 `beat` は呼び出し側で snap 済を渡す。
+    pub(crate) fn seek_playhead_to(&mut self, beat: f64) {
         let beat = beat.max(0.0);
         self.playhead_beat = Some(beat as f32);
+        self.playback_origin_beat = Some(beat as f32);
         let sr = common::audio_bridge::SAMPLE_RATE as f64;
         let bpm = self.song.bpm.max(1.0) as f64;
         let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
         self.send_audio(MainToChild::SeekTo { samples });
+    }
+
+    /// FIXME #44: `f` キーの実体。 snap 済 song-absolute beat へプレイヘッドを置き
+    /// (`seek_playhead_to`: home も更新 + SeekTo)、停止中は `play()` を呼んでその位置から
+    /// 再生開始する (play() の export / asset / plugin ゲートと playback_origin_beat capture を
+    /// 継承するため body を再実装しない)。 再生中は `play()`/`stop()` を呼ばずシームレスに
+    /// 継続する (FIXME #50: home は `seek_playhead_to` が更新済なので Stop はこの位置へ戻る)。
+    fn action_play_from_cursor(&mut self, beat: f64) {
+        self.seek_playhead_to(beat);
         if !self.is_playing {
             self.play();
         }
@@ -7711,6 +7771,32 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
+    /// FIXME #53: セクション帯の inline 改名を開始する (現在名を編集バッファに seed)。
+    fn begin_rename_section(&mut self, id: u32) {
+        let Some(name) = self.song.sections.iter().find(|s| s.id == id).map(|s| s.name.clone())
+        else {
+            return;
+        };
+        self.section_rename_text = name;
+        self.section_rename_id = Some(id);
+    }
+
+    /// FIXME #53: セクション帯の改名を確定する (空名は無視)。
+    fn commit_rename_section(&mut self) {
+        let Some(id) = self.section_rename_id else {
+            return;
+        };
+        self.section_rename_id = None;
+        let new_name = self.section_rename_text.trim().to_string();
+        self.section_rename_text.clear();
+        if new_name.is_empty() {
+            return;
+        }
+        if let Some(s) = self.song.sections.iter_mut().find(|s| s.id == id) {
+            s.name = new_name;
+        }
+    }
+
     fn begin_rename_clip(&mut self, target: ClipRef) {
         let Some(content_id) = self
             .song
@@ -8109,21 +8195,186 @@ impl AppData {
     fn action_add_instrument_track(&mut self) {
         let id = self.song.alloc_track_id();
         let index = self.song.tracks.len() + 1;
+        // FIXME #33: 挿入位置は「選択中で最上段の track の直上」 (純ロジックは
+        // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
+        let insert_at = add_track_insert_index(&self.song.tracks, &self.selected_track_ids);
+        // FIXME #49: 新 track は挿入位置の基準 track (= 最上段の選択) と同じグループ
+        // 階層に入れる (parent_group_id を継承)。基準が無い (= 選択無しで末尾挿入、
+        // insert_at == tracks.len()) ときだけ master 直下 (None)。基準がグループ (子持ち)
+        // でも「同じ階層 = 兄弟」になる (parent_group_id 継承がそのまま兄弟化する)。
+        let parent_group_id = self.song.tracks.get(insert_at).and_then(|t| t.parent_group_id);
         let track = track_with(|t| {
             t.id = id;
             t.name = format!("Track {index}");
             t.source = InstrumentSource::None;
             t.clips = Vec::new();
+            t.parent_group_id = parent_group_id;
         });
-        // FIXME #33: 挿入位置は「選択中で最上段の track の直上」 (純ロジックは
-        // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
-        let insert_at = add_track_insert_index(&self.song.tracks, &self.selected_track_ids);
         self.song.tracks.insert(insert_at, track);
         // 追加直後はこの新 track を唯一の選択 + カーソルにする (次の操作の対象)。
         self.selected_track_ids = vec![id];
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
-        tracing::info!(insert_at, "added instrument track");
+        tracing::info!(insert_at, ?parent_group_id, "added instrument track");
+    }
+
+    // ----------------------------------------------------------------
+    // FIXME #53: Arranger セクション (曲のパート) の編集ハンドラ。gui_01 M14 Phase 127 の
+    // 帯操作 emit を受けて適用する。undo は全て push_undo_snapshot (Song 丸ごと clone) で
+    // Ctrl+Z 復帰可能。
+    //
+    // 現状は **帯 (Section エントリ) の作成 / 移動 / リサイズ / 複製** まで。「帯を動かすと
+    // 範囲内の全 clip + automation + tempo + 拍子 + key も一緒に動く」破壊的フルスコープ
+    // リフロー (境界での clip 分割 + ripple、`docs/plan_arranger_track.md` §3) は次段で
+    // 実装する (gui_01 の lane 描画 landing と並行)。
+    // ----------------------------------------------------------------
+
+    /// 新規セクションを作る。`start` / `len` は widget で snap 済。名前は Intro/Aメロ/サビ…
+    /// を巡回、色はパレットから採番。`normalize_sections` で昇順・非重複を保つ。
+    pub(crate) fn apply_create_section(&mut self, start: f64, len: f64) {
+        // len が正のときだけ作成 (NaN / 非正は無視)。
+        if len > 0.0 {
+            self.push_undo_snapshot();
+            let id = self.song.alloc_section_id();
+            let n = self.song.sections.len();
+            self.song.sections.push(common::model::Section {
+                id,
+                name: section_default_name(n),
+                color: section_default_color(n),
+                start_beat: start.max(0.0),
+                len_beats: len,
+            });
+            self.song.normalize_sections();
+            tracing::info!(id, start, len, "created arranger section");
+        }
+    }
+
+    /// セクション帯を `next_start` へ**破壊的に移動**する (`Song::move_section`: 範囲内の
+    /// 全トラック clip + automation + tempo/拍子/key を一緒に動かし、 前後を ripple)。 clip
+    /// 位置が変わるので `sync_song_to_plugin_host`。 移動が起きなければ undo snapshot を破棄。
+    /// （境界をまたぐ clip の分割は `Song::move_section` の次段。）
+    pub(crate) fn apply_move_section(&mut self, id: u32, next_start: f64) {
+        self.push_undo_snapshot();
+        if self.song.move_section(id, next_start) {
+            self.sync_song_to_plugin_host();
+        } else {
+            self.undo_stack.pop_back();
+        }
+    }
+
+    /// セクション帯をリサイズする (被覆範囲の再定義、内容は動かさない)。
+    pub(crate) fn apply_resize_section(&mut self, id: u32, next_start: f64, next_len: f64) {
+        if next_len > 0.0 {
+            self.push_undo_snapshot();
+            if let Some(s) = self.song.sections.iter_mut().find(|s| s.id == id) {
+                s.start_beat = next_start.max(0.0);
+                s.len_beats = next_len;
+            }
+            self.song.normalize_sections();
+        }
+    }
+
+    /// セクション帯を `dest_start` へ**複製挿入**する (`Song::duplicate_section`: 範囲内 content を
+    /// linked コピーし、 dest 以降を ripple で空けて落とす)。 clip が増えるので
+    /// `sync_song_to_plugin_host`。 複製が起きなければ undo snapshot を破棄。
+    pub(crate) fn apply_duplicate_section(&mut self, id: u32, dest_start: f64) {
+        self.push_undo_snapshot();
+        if self.song.duplicate_section(id, dest_start).is_some() {
+            self.sync_song_to_plugin_host();
+        } else {
+            self.undo_stack.pop_back();
+        }
+    }
+
+    /// 「このセクションをループ」: 帯の範囲を既存ループ領域に設定する (ループの SSoT を駆動、
+    /// 二重化しない)。
+    pub(crate) fn apply_loop_section(&mut self, id: u32) {
+        if let Some(s) = self.song.sections.iter().find(|s| s.id == id) {
+            let (start, end) = (s.start_beat, s.end_beat());
+            self.handle_event(AppEvent::SetLoopRange { start, end });
+        }
+    }
+
+    /// 「帯のみ削除」: セクション帯だけ消し、 内容は温存する (Studio One Backspace 相当)。
+    pub(crate) fn apply_delete_section_band(&mut self, id: u32) {
+        self.push_undo_snapshot();
+        if !self.song.delete_section(id) {
+            self.undo_stack.pop_back();
+        }
+    }
+
+    /// 「範囲ごと削除」: セクションの時間範囲と内容を消して詰める (破壊的、 Delete Range 相当)。
+    /// clip が変わるので plugin host へ sync。
+    pub(crate) fn apply_delete_section_range(&mut self, id: u32) {
+        self.push_undo_snapshot();
+        if self.song.delete_section_range(id) {
+            self.sync_song_to_plugin_host();
+        } else {
+            self.undo_stack.pop_back();
+        }
+    }
+
+    /// FIXME #53: gui_01 の `SelectSection { id, modifier }` を解決してセクション選択集合を
+    /// 更新する (`SelectModifier` は track header click と同 idiom、 末尾 = anchor)。 section を
+    /// 選んだ時点で clip / note / track 等の他面選択をクリアし、 キーボード Delete が曖昧に
+    /// ならないようにする (section は `edit_surface` の最低優先なので、 他選択が残っていると
+    /// Delete がそちらを向く)。
+    pub(crate) fn apply_select_section(&mut self, id: u32, modifier: daw_ui_core::SelectModifier) {
+        use daw_ui_core::SelectModifier;
+        match modifier {
+            SelectModifier::Single => self.selected_section_ids = vec![id],
+            SelectModifier::Toggle => {
+                if let Some(pos) = self.selected_section_ids.iter().position(|&s| s == id) {
+                    self.selected_section_ids.remove(pos);
+                } else {
+                    self.selected_section_ids.push(id);
+                }
+            }
+            SelectModifier::RangeFromAnchor => {
+                let anchor = self.selected_section_ids.last().copied();
+                let ordered: Vec<u32> = {
+                    let mut v: Vec<&common::model::Section> = self.song.sections.iter().collect();
+                    v.sort_by(|a, b| {
+                        a.start_beat
+                            .partial_cmp(&b.start_beat)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    v.into_iter().map(|s| s.id).collect()
+                };
+                let ai = anchor.and_then(|a| ordered.iter().position(|&x| x == a));
+                let bi = ordered.iter().position(|&x| x == id);
+                self.selected_section_ids = match (ai, bi) {
+                    (Some(ai), Some(bi)) => {
+                        let (lo, hi) = if ai <= bi { (ai, bi) } else { (bi, ai) };
+                        ordered[lo..=hi].to_vec()
+                    }
+                    _ => vec![id],
+                };
+            }
+        }
+        // section を選んだら他面の選択を消す (Delete の曖昧さ回避、 §doc 参照)。
+        self.selected_clips.clear();
+        self.selected_clip = None;
+        self.selected_notes.clear();
+        self.selected_automation_clips.clear();
+        self.selected_automation_points.clear();
+        self.selected_track_ids.clear();
+    }
+
+    /// FIXME #53: 選択中のセクション帯を削除する (帯のみ・内容温存、 キーボード Delete から)。
+    pub(crate) fn apply_delete_selected_sections(&mut self) {
+        if self.selected_section_ids.is_empty() {
+            return;
+        }
+        self.push_undo_snapshot();
+        let ids = std::mem::take(&mut self.selected_section_ids);
+        let mut removed = false;
+        for id in ids {
+            removed |= self.song.delete_section(id);
+        }
+        if !removed {
+            self.undo_stack.pop_back();
+        }
     }
 
     // ----------------------------------------------------------------
@@ -17695,6 +17946,30 @@ fn add_track_insert_index(tracks: &[Track], selected: &[u32]) -> usize {
         .filter_map(|sid| tracks.iter().position(|t| t.id == *sid))
         .min()
         .unwrap_or(tracks.len())
+}
+
+/// FIXME #53: 新規 Arranger セクションの既定名。Intro/Aメロ/サビ… を巡回し、
+/// それを超えたら `Part N` に連番フォールバック。
+fn section_default_name(index: usize) -> String {
+    const NAMES: [&str; 7] = ["Intro", "Aメロ", "Bメロ", "サビ", "間奏", "Cメロ", "アウトロ"];
+    NAMES
+        .get(index)
+        .map(|s| (*s).to_string())
+        .unwrap_or_else(|| format!("Part {}", index + 1))
+}
+
+/// FIXME #53: 新規 Arranger セクションの既定色 (パレットを巡回)。
+fn section_default_color(index: usize) -> [f32; 3] {
+    const PALETTE: [[f32; 3]; 7] = [
+        [0.35, 0.55, 0.85],
+        [0.45, 0.75, 0.55],
+        [0.85, 0.65, 0.35],
+        [0.85, 0.45, 0.55],
+        [0.60, 0.50, 0.80],
+        [0.40, 0.75, 0.80],
+        [0.80, 0.55, 0.75],
+    ];
+    PALETTE[index % PALETTE.len()]
 }
 
 #[cfg(test)]

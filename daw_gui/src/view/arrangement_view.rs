@@ -64,6 +64,8 @@ fn model_curve_from_widget(c: WidgetFadeCurve) -> common::model::FadeCurve {
 // とし (default 160.0)、 gui_01 widget の右端 splitter drag で可変。
 const RULER_H: f32 = 20.0;
 const TOOLBAR_H: f32 = 24.0;
+/// FIXME #53: Arranger レーン (曲のパート帯) の高さ (px)。ルーラー直下に確保。
+const SECTION_LANE_H: f32 = 18.0;
 const COLOR_TOOLBAR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
 
 const SNAP_TOGGLE_STYLE: ToggleButtonStyle = ToggleButtonStyle {
@@ -431,6 +433,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         bpm: app.song.bpm,
         time_sig: app.song.time_sig,
         snap: snap::arrange_snap_config(app),
+        // FIXME #53: Arranger レーン高 (px)。ルーラー直下に確保し、gui_01 が
+        // `draw_sections_lane` で色帯 + 名前を描く。曲のパート (Intro/Aメロ/サビ…) を
+        // ダブルクリック生成・ドラッグ移動・端リサイズ・Alt複製できる。
+        arranger_lane_h: SECTION_LANE_H,
     };
 
     // audio_edit が Some の clip に widget が描画する dB handle line (gain_db = 0
@@ -506,10 +512,28 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         height_px_override: None,
     };
 
+    // FIXME #53: Song.sections を gui_01 の SectionView へ mirror (name は Arc<str> 化)。
+    // 描画は `ArrangementView.arranger_lane_h > 0` のときのみ (現状 0.0 = gui_01 の
+    // lane 描画配線待ち、 data は渡しておく)。
+    let sections_view: Vec<daw_ui_core::SectionView> = app
+        .song
+        .sections
+        .iter()
+        .map(|s| daw_ui_core::SectionView {
+            id: s.id,
+            name: std::sync::Arc::from(s.name.as_str()),
+            color: s.color,
+            start_beat: s.start_beat,
+            len_beats: s.len_beats,
+            selected: app.selected_section_ids.contains(&s.id),
+        })
+        .collect();
+
     let resp = ui.arrangement(
         "arrangement",
         area,
         &tracks,
+        &sections_view,
         view,
         &selected_clips,
         selected_tracks,
@@ -841,10 +865,48 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 引き直す (= scroll off で rect が無ければ picker を閉じる)。`picked` を
     // live で model に反映 (open 中 widget 側は current を無視するので flicker
     // しない)、`dismissed` で target を None に戻す。
+    // FIXME #53: セクション帯の inline 改名。section_rename_id の帯 rect に text_input を重ねる
+    // (track rename と同 idiom)。Enter で commit、 Esc は root の escape handler が CancelRenameSection。
+    if let Some(rename_id) = app.section_rename_id {
+        for (sid, rect) in &resp.section_rects {
+            if *sid == rename_id {
+                let input_rect = Rect {
+                    x: rect.x + 2.0,
+                    y: rect.y + 1.0,
+                    w: (rect.w - 4.0).max(8.0),
+                    h: (rect.h - 2.0).max(12.0),
+                };
+                let r = ui.text_input_at_focused(
+                    ("section_rename", *sid),
+                    input_rect,
+                    &app.section_rename_text,
+                    |new| {
+                        Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::RenameSectionChanged(new.clone()));
+                        })
+                    },
+                );
+                // Enter で確定、 または text edit の外をクリックして focus を失ったら確定
+                // (Esc は press 無しなので commit せず、 root の escape handler が cancel する)。
+                let clicked_outside = {
+                    let p = ui.pointer();
+                    p.primary_just_pressed
+                        && p.pos.is_some_and(|(px, py)| !input_rect.contains(px, py))
+                };
+                if r.committed || clicked_outside {
+                    ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                        app.handle_event(AppEvent::CommitRenameSection);
+                    }));
+                }
+            }
+        }
+    }
+
     render_color_picker_overlay(app, ui);
 
     // gui_01 #071: 空きレーン右クリック (`SecondaryClickEmpty`) → clip 生成 context menu。
     render_clip_create_menu_overlay(app, ui);
+    render_section_menu_overlay(app, ui);
 
     // file drop の hint frame は widget の上に被せる。canvas (lanes) のみ受け付け。
     let canvas_area = Rect {
@@ -1036,6 +1098,43 @@ fn render_clip_create_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
     );
 }
 
+/// FIXME #53: Arranger セクション帯の右クリックメニュー。`SecondaryClickSection` で stash した
+/// `(section_id, pos)` を使い、 毎フレーム `ui.context_menu_at` で pos にメニューを描画する
+/// (`render_clip_create_menu_overlay` と同 idiom)。 項目: このセクションをループ / 帯のみ削除 /
+/// 範囲ごと削除。 選択で stash を `None` に戻す。
+fn render_section_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
+    let Some((section_id, pos)) = app.section_menu else {
+        return;
+    };
+    let open_at = if app.section_menu_open { Some(pos) } else { None };
+    if app.section_menu_open {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.section_menu_open = false;
+        }));
+    }
+    ui.context_menu_at(
+        "arrange_section_menu",
+        open_at,
+        &["改名", "色...", "このセクションをループ", "帯のみ削除", "範囲ごと削除"],
+        move |idx, ui| {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                match idx {
+                    0 => app.handle_event(AppEvent::BeginRenameSection(section_id)),
+                    1 => {
+                        let anchor = Rect { x: pos.0, y: pos.1, w: 1.0, h: 1.0 };
+                        app.open_color_picker(ColorPickerTarget::Section(section_id), anchor);
+                    }
+                    2 => app.apply_loop_section(section_id),
+                    3 => app.apply_delete_section_band(section_id),
+                    4 => app.apply_delete_section_range(section_id),
+                    _ => {}
+                }
+                app.section_menu = None;
+            }));
+        },
+    );
+}
+
 /// v18 (`docs/plan_track_clip_color.md`, gui_01 #058): `color_picker_target` が
 /// `Some` の間、保存した anchor (開いた場所 = header / clip / inspector swatch の
 /// rect) に color_picker overlay を描画する。`picked` は live で
@@ -1065,6 +1164,12 @@ fn render_color_picker_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
                     track_color::to_renderer(track_color::effective_clip_color(t, c))
                 })
             }),
+        ColorPickerTarget::Section(id) => app
+            .song
+            .sections
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| Color { r: s.color[0], g: s.color[1], b: s.color[2], a: 1.0 }),
     };
 
     let Some(current) = current else {
@@ -1084,6 +1189,9 @@ fn render_color_picker_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
             ColorPickerTarget::Clip(clip_ref) => {
                 app.handle_event(AppEvent::SetClipColor { target: clip_ref, color: Some(rgb) });
             }
+            ColorPickerTarget::Section(id) => {
+                app.handle_event(AppEvent::SetSectionColor { id, color: rgb });
+            }
         }));
     }
     if r.dismissed {
@@ -1099,6 +1207,7 @@ fn target_id_hash(target: ColorPickerTarget) -> u64 {
     match target {
         ColorPickerTarget::Track(id) => (1u64 << 63) | id as u64,
         ColorPickerTarget::Clip(r) => ((r.track as u64) << 32) | r.clip as u64,
+        ColorPickerTarget::Section(id) => (1u64 << 62) | id as u64,
     }
 }
 
@@ -1107,22 +1216,53 @@ fn target_id_hash(target: ColorPickerTarget) -> u64 {
 /// Edit 列をフレーム末尾 apply する gui_01 の流儀に乗る)。
 fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
     match req {
-        // gui_01 #024 (resolved): ruler click / drag で発火する seek
-        // 要求。 PR-V4 fix: GUI 側 playhead_beat を更新するだけでなく
-        // audio engine にも `MainToChild::SeekTo { samples }` を IPC
-        // 送信して再生位置を同期する (= Stop 中も Play 中も click 位置
-        // に飛ぶ)。 sample 換算は engine sample rate (= 48000) と
-        // song.bpm から `beat × 60 / bpm × sr`。
+        // gui_01 #024 (resolved): ruler click / drag で発火する seek 要求。
+        // GUI 側 playhead_beat 更新 + audio engine への SeekTo IPC を
+        // `AppData::seek_playhead_to` に集約 (= Stop 中も Play 中も click 位置に飛ぶ)。
+        // FIXME #50: seek_playhead_to は「停止で戻るホーム」も同位置に更新するので、
+        // 再生中にルーラーで置き直して停止すると新しい位置へ戻る。
         ArrangementEditRequest::SetPlayheadBeat(beat) => {
             Edit::mutate(move |app: &mut AppData| {
-                let beat = beat.max(0.0);
-                app.playhead_beat = Some(beat as f32);
-                let sr = common::audio_bridge::SAMPLE_RATE as f64;
-                let bpm = app.song.bpm.max(1.0) as f64;
-                let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
-                app.send_audio(common::protocol::MainToChild::SeekTo {
-                    samples,
-                });
+                app.seek_playhead_to(beat);
+            })
+        }
+        // FIXME #53: Arranger セクション (曲のパート) 編集。gui_01 M14 Phase 127 が帯の
+        // 操作を高レベル意図として emit し、daw_01 が適用する。破壊的フルスコープリフロー
+        // (境界での clip 分割 + ripple) は `docs/plan_arranger_track.md` §3 の次段で実装。
+        ArrangementEditRequest::CreateSection { start, len } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.apply_create_section(start, len);
+            })
+        }
+        ArrangementEditRequest::MoveSection { id, next_start, .. } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.apply_move_section(id, next_start);
+            })
+        }
+        ArrangementEditRequest::ResizeSection { id, next_start, next_len, .. } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.apply_resize_section(id, next_start, next_len);
+            })
+        }
+        ArrangementEditRequest::DuplicateSection { id, dest_start } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.apply_duplicate_section(id, dest_start);
+            })
+        }
+        ArrangementEditRequest::SelectSection { id, modifier } => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.apply_select_section(id, modifier);
+            })
+        }
+        ArrangementEditRequest::BeginRenameSection(id) => Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::BeginRenameSection(id));
+        }),
+        ArrangementEditRequest::SecondaryClickSection { id, pos } => {
+            // 帯の右クリック → pos にコンテキストメニュー (ループ / 帯削除 / 範囲削除) を開く。
+            // 実描画は render_section_menu_overlay が毎フレーム行う (clip_create_menu と同 idiom)。
+            Edit::mutate(move |app: &mut AppData| {
+                app.section_menu = Some((id, pos));
+                app.section_menu_open = true;
             })
         }
         ArrangementEditRequest::SelectClips { next, .. } => {

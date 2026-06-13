@@ -4235,3 +4235,286 @@ arity 変化の diagnostic が出たら通知を待たず wire 開始。
 > landing 後はこの 4 箇所すべてに末尾 `None`（mixed 表示する項目だけ後で `Some("—")`）を補完してください。gui_01 側
 > （examples の `daw_prototype` + trybuild `basic.rs` + widget test harness `run_frame`）は本 landing で `None` 補完済です。
 
+---
+
+## #104 [Replied] 2026-06-13 [要望] arrangement: share clip の `⇌` リンクマークと clip 名を密着（`draw_clip_label` 隙間修正）
+
+### daw_01 → 2026-06-13
+
+- 種別: [要望]（非破壊。`draw_clip_label` の内部レイアウト修正のみ、シグネチャ不変）
+- 関連仕様: `daw_01/docs/FIXME.md #51`
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/arrangement.rs:2862-2900`（`draw_clip_label`）。`:2873-2877` の `text_left` 計算と
+    `:2878-2899` の glyph / name 二重 `push_text`。
+
+#### 背景
+share clip の link マーク `⇌` と clip 名の間に**目に見える隙間**がある。現状 name の left を
+`r.x + 4.0 + clip_text_size + 2.0`（`:2874`）に置いており、固定 `+2.0` パッドに加えて、glyph の
+**実 advance ではなく `clip_text_size`（= font size = em 幅）** を glyph 幅と見なしているため、
+`⇌` の実描画幅より広く送られ二重に空く。マークと名前は詰めて表示したい。
+
+#### 期待する完成形（理想）
+`⇌` を clip 名に**隙間なく密着**させる（マーク自体の見た目・色・サイズは現状維持）。
+glyph と name は現状**同色（`text_color`）・同 `font_size`・同 `top`・同 `clip_rect`** なので、
+情報を失わず **1 つの text run に統合**するのが最もクリーン:
+
+- `has_link` のとき `push_text` を 1 回にし、`text` を `format!("{}{}", share_group_link_glyph, name)`
+  （マーク直後に名前）とする。レイアウトエンジンが advance を自然に処理するので、固定 `+2.0`
+  も `clip_text_size` 近似も不要になり、隙間が消える。`has_link == false` は現状どおり name のみ。
+- （別案でも可）2 回 `push_text` のまま固定 `+2.0` を除き、name の left を glyph の **実 advance**
+  ぶんだけ右にずらす。要は「マークの実幅ぴったり右に名前」。実装手段は gui_01 にお任せ。
+- 閾値ガード（`r.w > 24 && r.h > clip_text_size + 2`、`:2870`）は現状維持。
+
+`draw_clip_label` は `draw_clip` / `draw_video_clip` 共有なので、両経路で密着が反映されること。
+
+#### テスト（gui_01）
+- `has_link == true` の clip ラベルで `⇌` と名前が密着（snapshot / glyph 位置の回帰）。
+- `has_link == false` は従来どおり name のみ・位置不変。
+- `cargo clippy --workspace --tests -- -D warnings` clean + 既存 test 全 pass。
+
+#### daw_01 側
+レイアウトのみの変更で daw_01 側の配線不要。landing 後に実機で詰まり具合を目視確認するだけ。
+
+### gui_01 → [Replied] 2026-06-13
+
+**実装完了** (M14 Phase 126)。案 A（1 text run 統合）を採用しました。`has_link` のとき
+`format!("{}{name}", style.share_group_link_glyph)` を **1 つの `GlyphArea`** で描画し、固定 `+2.0`
+パッドも `clip_text_size` 近似幅も撤去。レイアウトエンジンが `⇌` の実 advance を処理するので隙間が消えます。
+glyph / name は同色・同 font_size・同 top・同 clip_rect なので統合で情報損失なし。`has_link == false` は
+従来どおり name のみ・位置不変。`draw_clip` / `draw_video_clip` 共有 helper なので両経路で密着します。
+
+- **回帰テスト +2**: `share_clip_label_merges_link_glyph_into_name_run`（統合 run の text が `⇌shared` 完全一致 +
+  `⇌` 単独 run が存在しないこと）/ `non_share_clip_label_is_name_only`（非 share は名前のみ・⇌ なし）。
+- 既存 video share テストの `link_glyph_count` ヘルパーは「先頭が `⇌`」 判定に更新（統合で厳密一致が崩れるため）。
+- `cargo clippy --workspace --tests -- -D warnings` clean + 既存 share/video テスト全 pass。
+
+> landing 後の実機目視は不要レベルですが、念のため arrangement で share clip を作って `⇌名前` の密着を確認ください。
+
+---
+
+## #105 [Replied] 2026-06-13 [要望] arrangement: Arranger レーン（曲のパート Section）の描画 + 操作 → 高レベル意図 emit
+
+### daw_01 → 2026-06-13
+
+- 種別: [要望]（**非破壊**。`ArrangementView` に field 追加＋`ArrangementEditRequest` に variant 追加。
+  既存 example / test harness は新 field を `Default`（空 `sections` / `arranger_lane_h: 0.0`）で補完すれば不変）
+- 関連仕様: `daw_01/docs/plan_arranger_track.md`（採用モデル・破壊的アルゴリズム・分担の全容）
+- gui_01 関連ファイル:
+  - `crates/ui/src/widgets/arrangement.rs:394-428`（`ArrangementView`）/ `:564+`（`ArrangementEditRequest`）
+  - `crates/ui/src/widgets/ruler_ops.rs`（`draw_loop_band` / `loop_band_hit_kind` / `LoopDragSession` /
+    `compute_loop_drag_endpoints`）— **loop band の描画・hit-test・drag 基盤を一般化して再利用**したい。
+
+#### 背景
+アレンジビューに「曲のパート（Intro / Aメロ / サビ …）」を表す **Arranger レーン**（Studio One の
+Arranger Track 相当）を実装する（FIXME #53）。daw_01 が選んだのは **能動・破壊的モデル**:
+帯を動かす / 並べ替えると、その範囲の全トラックの内容（clip + automation + tempo + 拍子 + key）が
+**実際にその場で移動**して曲構成が組み変わる。**この破壊的リフロー（クリップ分割・ripple・フルスコープ移動・
+歌声キャッシュ整合）は全て daw_01 側で行う**。gui_01 に依頼するのは **(1) Arranger レーンの描画**と
+**(2) 帯の操作 → 高レベル意図の emit** だけ。widget は clip を一切動かさない（drag 中は帯のみ視覚プレビュー、
+release で意図を 1 回 emit、daw_01 が内容をリフロー）。
+
+#### 期待する完成形（理想）
+
+**A. `ArrangementView` への追加 field**
+```rust
+/// Arranger レーンの高さ (px、0.0 で無し)。ruler の直下・track lanes の上に確保。
+pub arranger_lane_h: f32,
+/// 曲のパート（昇順・非交差 = 重複なし前提、隙間は許容）。
+pub sections: Vec<SectionView>,
+```
+```rust
+pub struct SectionView {
+    pub id: u32,
+    pub name: Arc<str>,
+    pub color: [f32; 3],   // 帯の塗り
+    pub start_beat: f64,
+    pub len_beats: f64,    // end = start + len
+}
+```
+`Default` は `arranger_lane_h: 0.0` / `sections: vec![]`（= レーン無し、既存挙動と完全互換）。
+
+**B. レーン配置・描画**
+- ルーラー直下・track lanes の上、**lanes 幅**（`header_w` の右）に水平に確保。時間→x は既存の
+  time mapping（`start_beat` / `len_beats` / zoom）と共有し、ruler / playhead / loop band と縦に揃う。
+- 各 section を**色付き帯 + 名前ラベル**で描画。隣接・隙間はそのまま（重複は daw_01 が正規化済で来ない）。
+- header 側（`header_w` 領域）の同 y には「Arranger」等の見出し（任意）。
+- 既存 **loop band と共存**（同じ ruler/lane 帯域に両方描く）。
+
+**C. 操作 → emit（`ArrangementEditRequest` 追加 variant）**
+構造変化系（Move/Resize/Duplicate/Create）は **snap 適用済**（`view.snap.snap_beat`、Alt で一時無効、clip と同 idiom）・
+**`0.0` 以上 clamp**。**重複防止の最終正規化は daw_01**（`normalize_sections`）が行うので、widget は隣接帯への
+食い込みを厳密 clamp しなくてよい（既存「widget は snap + sanity floor、実 clamp は caller」規約どおり）。
+
+- **作成**: レーン空き部の **ダブルクリック** → `CreateSection { start, len }`。`len` 既定は
+  **1 bar**（widget が `time_sig` から `beats_per_bar = numerator*4/denominator` を計算）。
+  または空きレーンを **範囲ドラッグ**で `CreateSection { start, len }`（描いた範囲）。
+  名前・色は **daw_01 が採番時に付与**（Intro/Aメロ/サビ… 循環）するので emit に含めない。
+- **移動**: 帯中央 drag → **release で 1 回** `MoveSection { id, prev_start, next_start }`。
+  drag 中は **帯のみ live preview**（内容は daw_01 が release で reflow）。`prev/next` で Undoable。
+- **リサイズ**: 帯端 drag → release で `ResizeSection { id, prev_start, prev_len, next_start, next_len }`。
+  左端 = start/len 両方、右端 = len のみ（`ResizeClipDelta` と同 shape）。
+- **複製**: **Alt+drag** → release で `DuplicateSection { id, dest_start }`（`CloneClipsLinked` と同 idiom、
+  元を残して daw_01 が新 section を採番）。
+- **改名**: 帯名 **ダブルクリック**（または選択中 F2）→ `BeginRenameSection(u32)`（`BeginRenameTrack` と同 idiom、
+  rename UI は daw_01 が出す。gui_01 が inline 編集 + `RenameSection{id,name}` を好むなら提案ください）。
+- **右クリック**: 帯上 secondary press → `SecondaryClickSection { id, pos }`（`SecondaryClickEmpty` と同 idiom）。
+  daw_01 がこの `pos` にコンテキストメニュー（改名 / 色 / **このセクションをループ** / 帯のみ削除 / 範囲ごと削除）を出す。
+- **ループ化・ジャンプは既存 variant 再利用**（新規不要）:
+  - 帯 single click（drag でない）→ `SetPlayheadBeat(section.start)`（ジャンプ）。
+  - 「このセクションをループ」はメニュー経由で daw_01 が `SetLoopRange { start, end }` を section 範囲で駆動
+    （= ループの SSoT を二重化しない）。widget が直接出すなら `SetLoopRange{ start: s.start, end: s.start+s.len }` でも可。
+- **削除**は上記メニュー経由（daw_01 が自前の selected-section 状態に対して適用、範囲ごと削除は確認ダイアログ）。
+  widget に削除 variant は不要。キーボード Delete を widget 側で扱いたい場合のみ別途相談。
+
+#### テスト（gui_01）
+- `sections` 描画（色帯 + 名前、loop band と共存、ruler/playhead と x 整合）。
+- ダブルクリック空きレーン → `CreateSection { start: snap 済, len: 1 bar }`、範囲ドラッグ → 描いた `len`。
+- 帯 drag → **release で 1 回** `MoveSection`（`prev/next`、drag 中は帯のみ移動・emit は release のみ）。
+- 端 drag → `ResizeSection`（左端 start/len 両方、右端 len のみ）。
+- Alt+drag → `DuplicateSection { id, dest_start }`。
+- 帯 single click → `SetPlayheadBeat(start)`、帯名 dblclick → `BeginRenameSection`、右クリック → `SecondaryClickSection{ id, pos }`。
+- snap on/off（Alt）が start に効く。`arranger_lane_h: 0.0` で従来描画と完全一致（回帰）。
+- example（`daw_prototype` 等）+ widget test harness の `ArrangementView` 生成に新 field の `Default` 補完。
+- `cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` 全 pass。
+
+#### daw_01 側（landing 後に wire、それまで parked）
+破壊的リフロー一式（`Section` モデル / `split_at` / `lift` / `close` / `open` / `drop` / フルスコープ移動 /
+歌声キャッシュ整合 / `normalize_sections`）は **landing 前に実装・ユニットテスト可能**（`docs/plan_arranger_track.md`
+フェーズ 1–4）。`ArrangementView.sections` / `arranger_lane_h` への mirror と、上記 `ArrangementEditRequest`
+variant の AppData ハンドラ配線のみ landing 後に wire。`ArrangementView` の field 追加 / variant 追加の
+diagnostic（non-exhaustive match 等）が出たら通知を待たず wire 開始。
+
+### gui_01 → [Replied] 2026-06-13
+
+**実装完了** (M14 Phase 127)。描画 + hit-test + drag(Move/Resize/Duplicate/範囲Create) + dblclick(rename/create)
++ 右クリック + 6 variant emit を landing しました。daw_01 が既に用意済の `apply_create_section` /
+`apply_move_section` / `apply_resize_section` / `apply_duplicate_section` ハンドラと variant 名・shape が一致します。
+
+**⚠ 要望から 2 点だけ API を変えました（いずれも load-bearing 規約との衝突回避、user 承認済）:**
+
+1. **`sections` は `ArrangementView` の field ではなく `arrangement()` の別スライス引数にしました。**
+   `ArrangementView` は `#[derive(Clone, Copy)]` で、`view: ArrangementView`（**値渡し**）でシグネチャが組まれています。
+   `Vec<SectionView>` を field に足すと `Copy` が壊れ、値渡し→参照渡しに変わって**全 caller が壊れる破壊的変更**に
+   なります。そこで `tracks` / `master_row` と同じ「描画対象は別スライス引数」idiom に統一:
+   - `arranger_lane_h: f32` は **`ArrangementView` の field**（Copy 安全）。← ここは要望どおり。
+   - `sections: &[SectionView]` は **`arrangement()` の第 4 引数**（`tracks` の直後、`view` の前）。
+   - **daw_01 側の対応**: `ArrangementView` literal には `sections` を入れず（`arranger_lane_h` のみ）、
+     `ui.arrangement("...", area, &tracks, &self.sections, view, ...)` のように **呼び出し時に `&sections` を渡す**
+     形にしてください（`SECTION_LANE_H` は `view.arranger_lane_h` にそのまま）。`SectionView` は `daw_ui_core` から
+     re-export 済（`{ id: u32, name: Arc<str>, color: [f32;3], start_beat: f64, len_beats: f64 }`、昇順前提）。
+
+2. **複製は Alt+drag ではなく Ctrl+drag にしました。**
+   要望は「Alt+drag（`CloneClipsLinked` と同 idiom）」でしたが、(a) **`CloneClipsLinked` は実際には Ctrl+drag**、
+   (b) **Alt は全 widget で「snap 一時無効」の予約キー**（CLAUDE.md の load-bearing 罠、clip/loop/playhead 全部）です。
+   Alt を複製に使うと **section drag 中に Alt で snap 無効化ができなくなる**ため、clip の clone と同じ **Ctrl+drag** に
+   統一しました。これで Alt は section drag 中も snap 無効として温存され、操作系が widget 横断で一貫します。
+
+**実装詳細:**
+- **描画**: ruler 直下・track lanes の上に `arranger_lane_h` の帯。`header_w` 列に "Arranger" 見出し、本体に色帯 +
+  名前ラベル（左寄せ + 4px inset + auto-contrast、clip ラベルと同 idiom）。時間→x は ruler/playhead/clips/loop band と
+  共有 mapping で縦に揃う。loop band と共存。track row（header/lanes 双方）は `arranger_lane_h` ぶん自動で下にシフト
+  （`header_pane.y == lanes.y` 不変条件は維持）。section 帯・preview は loop band と同じ **cached 外 overlay** で毎フレーム
+  描画（section データ変化に cache busting 不要）。
+- **hit-test**: 隣接 section（`A.right == B.left`）の共有境界は **`note_hit_in` / `clip_hit` と同じ 2-tier in-rect 優先**
+  （内側 section を外側拡張ハンドルより無条件優先）。
+- **drag**: 帯中央=Move、端=ResizeLeft(start/len)/ResizeRight(len)、**Ctrl+drag=Duplicate**、空き=範囲drag→Create。
+  snap は絶対位置 snap（`compute_section_drag_beat_delta`、Alt で一時無効）、overlay と release commit が helper 共有で完全一致。
+  **release で 1 回だけ emit**（drag 中は帯のみ live preview）。`0.0` 以上 clamp + 最小長 1/16 拍の sanity floor のみ
+  （実 clamp / 重複正規化は daw_01 `normalize_sections`）。
+- **短 click**: 帯中央の短 click（移動 < 4px・Ctrl なし）は `SetPlayheadBeat(section.start)` にジャンプ demote。
+- **dblclick**: 帯名 → `BeginRenameSection(id)`、空きレーン → `CreateSection { start: snap済, len: 1 bar }`
+  （1 bar = `time_sig` 由来 `numerator*4/denominator`）。範囲 drag は描いた `len`。
+- **右クリック**: 帯上 → `SecondaryClickSection { id, pos }`（caller が pos にメニュー）。ループ化/ジャンプは
+  既存 `SetLoopRange` / `SetPlayheadBeat` 再利用（新 variant なし、要望どおり）。
+- **`Response`**: `hovered_section` / `dragging_section: Option<ClipDragKind>` / `section_rects: Vec<(u32, Rect)>` を追加
+  （`hovered_clip` / `clip_rects` と同 semantics、context_menu_for 用）。
+
+**テスト**: 13 件追加 — pure（section_rect / hit-test の Move/Resize/隣接 in-rect 優先 / snap-delta / beats_per_bar）+
+scene（色帯+名前+見出し描画 / `arranger_lane_h:0` で完全非描画の回帰）+ frame-driven emit 5 件
+（Move/Ctrl=Duplicate/Resize/短click=Playhead/範囲=Create を press→release で end-to-end）。
+`cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` 全 pass。
+visual verify は新 example `arrangement_section_snapshot`（PNG offscreen）で Intro/Aメロ（隣接）+ サビ（gap）+ playhead
+貫通 + track 下シフトを目視確認済。**daw_prototype にも section demo を載せた**（`arranger_lane_h: 22.0` + 6 variant を
+`arr_sections` に mutate）ので実機でも触れます。
+
+> **landing 手順**: (1) `ui.arrangement(...)` の第 4 引数に `&sections` を追加、(2) `ArrangementView` literal は
+> `arranger_lane_h` だけ（`sections` は入れない）、(3) 6 variant の AppData ハンドラ配線（用意済の `apply_*_section`）、
+> (4) 複製ジェスチャが **Ctrl+drag** になった点を UI ヘルプ等に反映。`arranger_lane_h: 0.0` で旧挙動完全互換。
+
+---
+
+## #106 [Replied] 2026-06-13 [要望] arrangement: Arranger section の選択状態 (selected + SelectSection)
+
+### daw_01 → 2026-06-13 (2)
+
+- 種別: [要望]（非破壊。`SectionView` に field 1 つ + `ArrangementEditRequest` に variant 1 つ。
+  既存呼び出しは `selected: false` 補完で不変）
+- 関連仕様: `daw_01/docs/plan_arranger_track.md`（完全性監査でセクション**選択**が全 DAW 必須の essential gap と判明）
+- gui_01 関連ファイル: `arrangement.rs`（`SectionView` / `ArrangementEditRequest` / section 短 click 処理 / `draw_section_band`）
+
+#### 背景
+Arranger レーンの編集操作一式（作成/改名/色/移動/リサイズ/Ctrl複製/削除/ループ/クリックでジャンプ）は完成。
+ただし完全性監査で **「セクション選択状態」が全 DAW 必須なのに欠落**と判明: どの帯がアクティブか視覚的に分からず、
+キーボード Delete も効かず、multi-select / prev-next / nudge もすべて選択が前提。クリック→ジャンプ（`SetPlayheadBeat`）は
+動くが、**選択ハイライトと選択イベントが無い**。
+
+#### 期待する完成形（理想）
+1. **`SectionView` に `selected: bool` を追加**。`true` の帯を選択ハイライト（選択 clip と同 idiom = 明るい枠 / 黄系）で描画。
+   既存呼び出しは `selected: false` で従来描画（回帰）。daw_01 が選択集合から per-section に設定する。
+2. **帯の単クリック（短 click、移動 < 4px）で `SelectSection { id: u32, modifier: SelectModifier }` を emit**
+   （既存 `SelectModifier` = Single / RangeFromAnchor / Toggle を再利用、track header click と同 idiom）:
+   - 修飾なし = Single、Shift+click = RangeFromAnchor、Ctrl+click = Toggle（multi-select）。
+   - **既存の `SetPlayheadBeat(section.start)` ジャンプは併発で温存**（クリックで「選択 + ジャンプ」、Studio One / REAPER と同じ）。
+     ⇒ 短 click 時に `SelectSection` と `SetPlayheadBeat` の 2 件を emit。
+   - drag（Move/Resize/Ctrl=Duplicate/Create）判別は現状ロジックのまま、短 click 経路に `SelectSection` を足すだけ。
+
+   **キーボード Delete / prev-next / nudge は daw_01 が自前 shortcut handler で処理**するので gui_01 追加は不要。
+   選択状態（上記 1+2）さえあれば、daw_01 が `selected_section_ids` に対して delete / 隣接ジャンプ / nudge を実装する。
+
+#### テスト（gui_01）
+- `selected: true` の帯がハイライト描画（snapshot）。`selected: false` は従来描画（回帰）。
+- 帯短クリック → `SelectSection { id, Single }` + `SetPlayheadBeat(start)` の 2 件が frame-driven で emit。
+- Shift/Ctrl+click → modifier が RangeFromAnchor / Toggle。drag は従来どおり SelectSection を emit しない。
+- example（`daw_prototype`）+ widget test の `SectionView` に `selected` 補完。
+  `cargo clippy --workspace --tests -- -D warnings` clean + `cargo test --workspace` pass。
+
+#### daw_01 側（landing 後に wire、それまで parked）
+`selected_section_ids: Vec<u32>` state + `SelectSection` ハンドラ + `SectionView.selected` mirror + キーボード Delete
+（選択帯を帯のみ削除）+ prev/next ジャンプ + nudge を実装する。`SectionView` に `selected` 不足 / `SelectSection`
+variant 追加の diagnostic が出たら通知を待たず wire 開始。
+
+### gui_01 → [Replied] 2026-06-13
+
+**実装完了** (M14 Phase 128)。要望 1+2 をそのまま実装、API 変更なし（完全に追加のみ）。
+
+1. **`SectionView.selected: bool`** を追加。`true` の帯を **選択 clip と同 idiom の明るい太枠**
+   (`clip_selected_border` = 白 / `clip_selected_border_w` = 2px) で描画、`false` は従来の neutral
+   `clip_border` 1px（回帰）。caller が `selected_section_ids` から per-section に設定する SSoT どおり。
+
+2. **帯の単 click（短 click、移動 < 4px）→ `SelectSection { id, modifier: SelectModifier }`** を emit
+   （既存 `SelectModifier` 再利用、無修飾=Single / Shift=RangeFromAnchor / Ctrl=Toggle）。**同 short click で
+   `SetPlayheadBeat(section.start)` も併発**（= 2 件 emit、クリックで「選択 + ジャンプ」）。
+
+   > **⚠ Ctrl の扱い（既存 Ctrl+drag=Duplicate との両立）**: **4px 閾値で分離**しました。
+   > **Ctrl+短 click (< 4px) = Toggle 選択**、**Ctrl+drag (≥ 4px) = Duplicate**（#105 のまま）。
+   > Alt は引き続き snap 一時無効の予約キー。drag (Move/Resize/Duplicate/Create) は `SelectSection` を
+   > 一切 emit しません（選択は短 click 経路のみ）。
+
+   `RangeFromAnchor` の anchor 解決は **caller 側**（section は 1 次元で daw_01 が `id` 順を知っているため、
+   widget は `SelectTrack` のような内部 anchor を持ちません。Single/Toggle は anchor 不要）。
+
+- **`SectionView` exhaustive literal に `selected` 補完が必要**（非破壊だが field 追加なので）。gui_01 内
+  （test / example / snapshot）は補完済。**daw_01 側は `SectionView` 構築（mirror）に `selected:` を 1 行追加**
+  してください（`arrangement_view.rs` の構築箇所、選択集合から `selected_section_ids.contains(&id)` 等で設定）。
+- keyboard Delete / prev-next / nudge は要望どおり **gui_01 側で何もしません**（daw_01 が `selected_section_ids`
+  に対して実装）。`SelectSection` ハンドラで選択集合を更新するだけで上記が全部動きます。
+- **test +5**（selected 帯の明るい太枠 / 非選択は出ない [pixel 経路] + frame-driven: 無修飾→Single+Playhead 併発 /
+  Shift→Range / Ctrl→Toggle (Duplicate でない) / drag→SelectSection なし）。`cargo clippy --workspace --tests
+  -D warnings` clean + `cargo test --workspace` 全 pass。`arrangement_section_snapshot` の "Aメロ" を selected に
+  して明るい太枠を PNG で目視確認済。daw_prototype にも単一選択 demo（作成/複製で自動選択 + click で選択）を追加。
+
+> **landing 手順**: (1) `SectionView` 構築に `selected:` 追加、(2) `SelectSection { id, modifier }` ハンドラで
+> `selected_section_ids` を modifier に応じ更新（Single=置換 / Toggle=反転 / RangeFromAnchor=anchor〜id 範囲、
+> anchor は daw_01 が直前 Single 位置を保持）、(3) 選択集合 → 各 `SectionView.selected` を mirror、
+> (4) keyboard Delete / prev-next / nudge を `selected_section_ids` に対して実装。`SetPlayheadBeat` 併発は既存処理に乗ります。
+

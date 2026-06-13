@@ -13,7 +13,6 @@ use daw_ui_renderer::{Color, Rect};
 use crate::app::{AppData, AppEvent};
 
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
 
 const PANEL_W: f32 = 460.0;
 const PANEL_H: f32 = 176.0;
@@ -85,7 +84,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 panel.x + PAD,
                 panel.y + PAD + TITLE_H + 22.0,
                 13.0,
-                COLOR_TEXT_DIM,
+                COLOR_TEXT,
             );
 
             // ボタン行 (下部、 右寄せ)。 左から「保存して終了」「保存せず終了」

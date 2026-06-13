@@ -277,6 +277,8 @@ enum EditSurface {
     AutomationClips,
     Clips,
     Tracks,
+    /// FIXME #53: Arranger セクション帯 (選択中なら Delete で帯削除)。
+    Sections,
 }
 
 /// ポインタ面 → 選択優先順 で対象面を決める。
@@ -312,6 +314,11 @@ fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface>
     if !app.selected_track_ids.is_empty() {
         return Some(EditSurface::Tracks);
     }
+    // FIXME #53: section は最低優先 (他面が空のときだけ Delete 対象)。 section 選択時は
+    // apply_select_section が他面選択をクリアするので通常ここに到達する。
+    if !app.selected_section_ids.is_empty() {
+        return Some(EditSurface::Sections);
+    }
     None
 }
 
@@ -329,7 +336,7 @@ fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edi
             .copy_points_clip()
             .map(|(j, c)| (j, c, "オートメーションポイント")),
         EditSurface::Clips => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
-        EditSurface::AutomationClips | EditSurface::Tracks => None,
+        EditSurface::AutomationClips | EditSurface::Tracks | EditSurface::Sections => None,
     };
     if let Some((json, count, label)) = synced {
         ui.set_clipboard_text(json);
@@ -369,7 +376,7 @@ fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edit
             .copy_points_clip()
             .map(|(j, c)| (j, c, "オートメーションポイント")),
         EditSurface::Clips => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
-        EditSurface::AutomationClips | EditSurface::Tracks => None,
+        EditSurface::AutomationClips | EditSurface::Tracks | EditSurface::Sections => None,
     };
     if let Some((json, count, label)) = synced {
         ui.set_clipboard_text(json);
@@ -514,6 +521,13 @@ fn paste_noop(ui: &mut Ui<'_, AppData>) {
 /// (audio event > automation point > note > automation clip > clip) で削除。後者は従来の
 /// 挙動そのままで回帰しない。
 fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
+    // FIXME #53: section が対象面なら選択帯を削除して終わり (帯のみ・内容温存)。
+    if matches!(surface, Some(EditSurface::Sections)) {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.apply_delete_selected_sections();
+        }));
+        return;
+    }
     let audio_event_selected =
         app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty();
     let has_notes = !app.selected_notes.is_empty();
@@ -995,6 +1009,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         if app.track_rename_id.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameTrack)
+            }));
+        } else if app.section_rename_id.is_some() {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CancelRenameSection)
             }));
         } else if app.clip_rename.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {

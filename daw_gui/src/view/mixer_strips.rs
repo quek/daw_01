@@ -51,7 +51,6 @@ const COLOR_RETURN_BG: Color = Color { r: 0.18, g: 0.28, b: 0.22, a: 1.0 };
 const COLOR_RETURN_DIVIDER: Color = Color { r: 0.30, g: 0.40, b: 0.32, a: 1.0 };
 const COLOR_MASTER_BG: Color = Color { r: 0.22, g: 0.22, b: 0.28, a: 1.0 };
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
 /// Mute active 時の背景色 (= 業界標準の赤)。 旧 hint band 色を on_color に昇格
 /// (gui_01 #052 で hint_band 廃止 → ON は背景色のみで表現する idiom に統一)。
 const COLOR_MUTE_ACTIVE: Color = Color { r: 0.86, g: 0.27, b: 0.27, a: 1.0 };
@@ -395,7 +394,7 @@ fn draw_strip(
         y,
         11.0,
         // FIXME #14 (plan_mixer_name_contrast): 全トラック名を明色で描画。 旧 dim
-        // (COLOR_TEXT_DIM) は暗 strip 背景に対しコントラスト不足で読みにくかった。
+        // (COLOR_TEXT) は暗 strip 背景に対しコントラスト不足で読みにくかった。
         COLOR_TEXT,
     );
     y += TOP_LABEL_H;
@@ -546,7 +545,7 @@ fn draw_sends_section(
     ui.panel(
         ("mixer_sends_div", track_id as usize),
         Rect { x: rect.x + pad, y: band_top, w: rect.w - pad * 2.0, h: 1.0 },
-        COLOR_TEXT_DIM,
+        COLOR_TEXT,
         0.0,
     );
 
@@ -580,7 +579,7 @@ fn draw_sends_section(
             inner_x,
             y,
             10.0,
-            COLOR_TEXT_DIM,
+            COLOR_TEXT,
         );
         let row_y = y + 11.0;
 

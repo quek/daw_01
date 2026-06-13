@@ -261,18 +261,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 })
             }
             // gui_01 #041 (M14 Phase 69): ruler 上 plain click / drag の press +
-            // continuation frame で逐次発火する seek 要求。 arrangement
-            // `SetPlayheadBeat` と完全同形 idiom: playhead_beat 更新 + audio
-            // engine への seek IPC 送信。 clip 内 clamp は意図的に行わない
-            // (= song-global で自由に動かせる、 arrangement との挙動整合)。
+            // continuation frame で逐次発火する seek 要求。 arrangement と同形で
+            // `AppData::seek_playhead_to` に集約 (playhead 更新 + SeekTo)。 clip 内
+            // clamp は意図的に行わない (= song-global で自由に動かせる)。
+            // FIXME #50: seek_playhead_to は「停止で戻るホーム」も更新する。
             PianoRollEditRequest::SetPlayheadBeat(beat) => {
                 Edit::mutate(move |app: &mut AppData| {
-                    let beat = beat.max(0.0);
-                    app.playhead_beat = Some(beat as f32);
-                    let sr = common::audio_bridge::SAMPLE_RATE as f64;
-                    let bpm = app.song.bpm.max(1.0) as f64;
-                    let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
-                    app.send_audio(common::protocol::MainToChild::SeekTo { samples });
+                    app.seek_playhead_to(beat);
                 })
             }
             // gui_01 #041 (M14 Phase 69): Shift + ruler drag release で 1 度

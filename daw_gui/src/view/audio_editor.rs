@@ -25,7 +25,6 @@ use crate::app::{AppData, AppEvent, AudioEventTrimSide, MIN_AUDIO_EDITOR_VIEW_LE
 
 const BG: Color = Color { r: 0.10, g: 0.11, b: 0.13, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const TEXT_DIM: Color = Color { r: 0.62, g: 0.65, b: 0.70, a: 1.0 };
 const GHOST: Color = Color { r: 0.95, g: 0.78, b: 0.31, a: 0.85 };
 
 /// common な mono / stereo source 用の borrowed-plane スタック配列サイズ。
@@ -107,7 +106,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + 12.0,
                 area.y + 18.0,
                 12.0,
-                TEXT_DIM,
+                TEXT,
             );
             return;
         }
@@ -263,18 +262,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }
             }
         } else {
-            // 素 drag / 単発 click: Started + Continuing で連続 SetPlayheadBeat
+            // 素 drag / 単発 click: Started + Continuing で連続 seek
             // (= Stop 中も Play 中も即座にプレイカーソル移動 + IPC SeekTo)。
-            // arrangement_view の make_edit を参考に、 GUI 側 playhead_beat
-            // 更新 + audio engine への SeekTo IPC を 1 つの Edit にまとめる。
+            // arrangement / piano_roll と同形で `AppData::seek_playhead_to` に集約。
+            // FIXME #50: seek_playhead_to は「停止で戻るホーム」も更新する。
             if drag.kind != DragKind::Released {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    let beat = cur_beat.max(0.0);
-                    app.playhead_beat = Some(beat as f32);
-                    let sr = common::audio_bridge::SAMPLE_RATE as f64;
-                    let bpm = app.song.bpm.max(1.0) as f64;
-                    let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
-                    app.send_audio(common::protocol::MainToChild::SeekTo { samples });
+                    app.seek_playhead_to(cur_beat);
                 }));
             }
         }
@@ -304,7 +298,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             wf_area.x + 4.0,
             wf_area.y + 8.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         return;
     }
@@ -817,7 +811,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             area.y + area.h - 18.0,
             10.0,
-            TEXT_DIM,
+            TEXT,
         );
     }
 }

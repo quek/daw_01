@@ -10,7 +10,6 @@ use daw_ui_renderer::{Color, Rect};
 use crate::app::{AppData, AppEvent, PluginCategory};
 
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
 const COLOR_TEXT_FORMAT: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
 // 種別タグの色分け (楽器 / FX / MIDI)。 選択行は白に潰す。
 const COLOR_TAG_INST: Color = Color { r: 0.58, g: 0.85, b: 0.55, a: 1.0 };
@@ -133,7 +132,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     search_rect.x + 8.0,
                     search_rect.y + 6.0,
                     13.0,
-                    COLOR_TEXT_DIM,
+                    COLOR_TEXT,
                 );
             }
             // Enter でカーソル位置の候補を確定 (= list クリックと同じ経路でロード)。
@@ -167,7 +166,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     list_rect.x,
                     list_rect.y + 8.0,
                     12.0,
-                    COLOR_TEXT_DIM,
+                    COLOR_TEXT,
                 );
                 return;
             }
@@ -196,7 +195,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     let (name_color, vendor_color, format_color) = if is_selected {
                         (Color::WHITE, Color::WHITE, Color::WHITE)
                     } else {
-                        (COLOR_TEXT, COLOR_TEXT_DIM, COLOR_TEXT_FORMAT)
+                        (COLOR_TEXT, COLOR_TEXT, COLOR_TEXT_FORMAT)
                     };
                     ui.label_at(
                         ("pp_row_name", i),

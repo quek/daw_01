@@ -6,7 +6,9 @@ use daw_ui_renderer::{Color, Rect};
 use crate::app::AppData;
 
 const COLOR_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
-const COLOR_TEXT: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
+// FIXME #52: 旧 dim グレー (0.65/0.68/0.72) はコントラスト不足だったため primary
+// (= 他 view と同じ 0.92/0.93/0.96) に統一。MIDI/file ラベルの可読性を上げる。
+const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
 const COLOR_MSG: Color = Color { r: 0.55, g: 0.85, b: 0.55, a: 1.0 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {

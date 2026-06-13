@@ -179,6 +179,33 @@ pub struct ProjectFile {
     pub song: Song,
 }
 
+/// FIXME #53 (`docs/plan_arranger_track.md`): Arranger セクション (曲のパート =
+/// Intro / Aメロ / サビ …)。全トラックを縦断する時間レンジ + 名前 + 色で、`Song.sections`
+/// に保持する。位置 (`start_beat`) が並び順の SSoT (別途 order index は持たない)。
+/// `start_beat` 昇順・互いに非交差 (重複なし、隙間は許容) を `Song::normalize_sections`
+/// で保つ。帯を動かす / 並べ替えると範囲内の全 clip + automation + tempo + 拍子 + key が
+/// 一緒に動く破壊的アレンジャー (Studio One モデル) の位置メタデータ。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct Section {
+    /// Song 内で安定な id (`Song::alloc_section_id` で採番、`0` は sentinel)。
+    pub id: u32,
+    /// 表示名 (Intro / Aメロ / サビ …)。自動命名 + 自由 rename。
+    pub name: String,
+    /// 帯の塗り色 (RGB、`0.0..=1.0`)。
+    pub color: [f32; 3],
+    /// 開始拍 (song-absolute)。
+    pub start_beat: f64,
+    /// 長さ (拍)。`end = start_beat + len_beats`。
+    pub len_beats: f64,
+}
+
+impl Section {
+    /// 終端拍 (= `start_beat + len_beats`)。
+    pub fn end_beat(&self) -> f64 {
+        self.start_beat + self.len_beats
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Song {
     pub bpm: f32,
@@ -320,6 +347,14 @@ pub struct Song {
     /// load 時に `0` なら `Song::ensure_project_id` が採番する (旧 file forward-migration)。
     #[serde(default)]
     pub project_id: u64,
+    /// FIXME #53 (`docs/plan_arranger_track.md`): 曲のパートを表す Arranger セクション。
+    /// `start_beat` 昇順・互いに非交差 (重複なし、隙間は許容) の invariant を
+    /// `normalize_sections` で保つ。旧 file は空 Vec で forward-migrate。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<Section>,
+    /// Stable id allocator for `Section`。 `0` は "未採番" sentinel、 `1` から採番。
+    #[serde(default)]
+    pub next_section_id: u32,
 }
 
 fn default_video_resolution() -> (u32, u32) {
@@ -357,6 +392,8 @@ impl Default for Song {
             next_image_source_id: 1,
             master_fx_chain: Vec::new(),
             project_id: 0,
+            sections: Vec::new(),
+            next_section_id: 1,
         }
     }
 }
@@ -422,6 +459,551 @@ impl Song {
         let id = self.next_song_lane_id.max(1);
         self.next_song_lane_id = id.saturating_add(1);
         id
+    }
+
+    /// FIXME #53: allocate a new stable `Section` id, bumping `next_section_id`。
+    /// `0` は "未採番" sentinel なので最低 `1` から返す。
+    pub fn alloc_section_id(&mut self) -> u32 {
+        let id = self.next_section_id.max(1);
+        self.next_section_id = id.saturating_add(1);
+        id
+    }
+
+    /// FIXME #53: `sections` の invariant を回復する: `start_beat` 昇順、互いに非交差
+    /// (重複なし、隙間は許容)、`len_beats > 0`。セクションを追加 / 移動 / リサイズした
+    /// あとに呼ぶ。重複は「先に始まる方を優先」 (= 後発の `start_beat` を直前 section の
+    /// `end_beat` までクランプして隙間化) して解消し、長さが `0` 以下になった section は
+    /// 破棄する。idempotent。
+    pub fn normalize_sections(&mut self) {
+        self.sections.sort_by(|a, b| {
+            a.start_beat
+                .partial_cmp(&b.start_beat)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut prev_end = f64::NEG_INFINITY;
+        for s in &mut self.sections {
+            if s.start_beat < prev_end {
+                let end = s.end_beat();
+                s.start_beat = prev_end;
+                s.len_beats = (end - prev_end).max(0.0);
+            }
+            prev_end = s.end_beat();
+        }
+        self.sections.retain(|s| s.len_beats > f64::EPSILON);
+    }
+
+    /// FIXME #53 (`docs/plan_arranger_track.md` §3.2): タイムライン全体の ripple シフト。
+    /// `from_beat` 以降の全ての時間位置を `delta` だけずらす (結果は `0.0` 以上に clamp)。
+    /// 破壊的セクション移動の close (`delta < 0` = 範囲を詰める) / open (`delta > 0` =
+    /// 範囲を空ける) プリミティブ。 対象は全トラックの clip 位置、各トラックと `song_lanes`
+    /// の automation clip 位置、`scale_changes`、`sections`、loop 範囲、`length_beats`。
+    /// clip 内の note / event / point は clip-local なので動かさない (clip 位置だけずらせば
+    /// 中身は付いてくる = 歌声キャッシュ key 不変、再合成不要)。 シフト後に scale / sections
+    /// の invariant を復元する。
+    pub fn ripple_timeline(&mut self, from_beat: f64, delta: f64) {
+        fn shift(b: &mut f64, from: f64, delta: f64) {
+            if *b >= from {
+                *b = (*b + delta).max(0.0);
+            }
+        }
+        for t in &mut self.tracks {
+            for c in &mut t.clips {
+                shift(&mut c.start_beat, from_beat, delta);
+            }
+            for lane in &mut t.automation_lanes {
+                for c in &mut lane.clips {
+                    shift(&mut c.start_beat, from_beat, delta);
+                }
+            }
+        }
+        for lane in &mut self.song_lanes {
+            for c in &mut lane.clips {
+                shift(&mut c.start_beat, from_beat, delta);
+            }
+        }
+        for sc in &mut self.scale_changes {
+            shift(&mut sc.beat, from_beat, delta);
+        }
+        for s in &mut self.sections {
+            shift(&mut s.start_beat, from_beat, delta);
+        }
+        shift(&mut self.loop_start_beat, from_beat, delta);
+        shift(&mut self.loop_end_beat, from_beat, delta);
+        if self.length_beats >= from_beat {
+            self.length_beats = (self.length_beats + delta).max(0.0);
+        }
+        self.ensure_scale_changes_sorted();
+        self.normalize_sections();
+    }
+
+    /// FIXME #53 (`docs/plan_arranger_track.md` §3.3): セクション帯を `dest_start` へ
+    /// 破壊的に移動し、 曲構成を組み替える (Studio One 流の能動アレンジャー)。 帯の範囲
+    /// `[a, b)` 内の全トラック clip + automation + `song_lanes` automation + `scale_changes`
+    /// を帯と一緒に取り出し、 `[a,b)` を ripple-close で詰め、 `dest_start` に ripple-open で
+    /// 空けて落とし直す。 他セクション / 他 clip は ripple で前後に流れる。 戻り値は移動が
+    /// 起きたか。
+    ///
+    /// 境界をまたぐ clip は移動前に `split_clips_at(a)` / `split_clips_at(b)` で分割するので、
+    /// 帯範囲ぴったりの content だけが追従する (Studio One の split-at-boundary)。 残りの
+    /// content / 他セクションは ripple で前後に流れる。
+    pub fn move_section(&mut self, section_id: u32, dest_start: f64) -> bool {
+        let Some(sec) = self.sections.iter().find(|s| s.id == section_id).cloned() else {
+            return false;
+        };
+        let (a, len) = (sec.start_beat, sec.len_beats);
+        let b = a + len;
+        let dest_start = dest_start.max(0.0);
+        if len <= 0.0 || (dest_start - a).abs() < f64::EPSILON {
+            return false;
+        }
+        let in_range = |start: f64| start >= a && start < b;
+
+        // 0. 境界をまたぐ clip を a / b で分割し、 以降の membership 抽出を正確にする。
+        self.split_clips_at(a);
+        self.split_clips_at(b);
+
+        // 1. 範囲内の content を取り出し、 帯先頭 (a) 基準のローカル位置に正規化。
+        let mut taken_clips: Vec<(u32, Clip)> = Vec::new();
+        for t in &mut self.tracks {
+            let mut i = 0;
+            while i < t.clips.len() {
+                if in_range(t.clips[i].start_beat) {
+                    let mut c = t.clips.remove(i);
+                    c.start_beat -= a;
+                    taken_clips.push((t.id, c));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let mut taken_auto: Vec<(u32, u32, AutomationClip)> = Vec::new();
+        for t in &mut self.tracks {
+            let tid = t.id;
+            for lane in &mut t.automation_lanes {
+                let lid = lane.id;
+                let mut i = 0;
+                while i < lane.clips.len() {
+                    if in_range(lane.clips[i].start_beat) {
+                        let mut c = lane.clips.remove(i);
+                        c.start_beat -= a;
+                        taken_auto.push((tid, lid, c));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        let mut taken_song_auto: Vec<(u32, AutomationClip)> = Vec::new();
+        for lane in &mut self.song_lanes {
+            let lid = lane.id;
+            let mut i = 0;
+            while i < lane.clips.len() {
+                if in_range(lane.clips[i].start_beat) {
+                    let mut c = lane.clips.remove(i);
+                    c.start_beat -= a;
+                    taken_song_auto.push((lid, c));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let mut taken_scales: Vec<ScaleChange> = Vec::new();
+        self.scale_changes.retain(|sc| {
+            if in_range(sc.beat) {
+                let mut s = *sc;
+                s.beat -= a;
+                taken_scales.push(s);
+                false
+            } else {
+                true
+            }
+        });
+        // 帯自身も取り出す (ripple では動かさず、 後で dest に置き直す)。
+        self.sections.retain(|s| s.id != section_id);
+
+        // 2. `[a,b)` を詰める (close)。
+        self.ripple_timeline(b, -len);
+        // 3. 詰めた後の座標系での落とし先。
+        let dest2 = if dest_start >= b {
+            dest_start - len
+        } else if dest_start <= a {
+            dest_start
+        } else {
+            a
+        };
+        // 4. 落とし先に `len` ぶん空ける (open)。
+        self.ripple_timeline(dest2, len);
+
+        // 5. 取り出した content を `dest2` 基準で戻す。
+        for (tid, mut c) in taken_clips {
+            c.start_beat += dest2;
+            if let Some(t) = self.tracks.iter_mut().find(|t| t.id == tid) {
+                t.clips.push(c);
+            }
+        }
+        for (tid, lid, mut c) in taken_auto {
+            c.start_beat += dest2;
+            if let Some(l) = self
+                .tracks
+                .iter_mut()
+                .find(|t| t.id == tid)
+                .and_then(|t| t.automation_lanes.iter_mut().find(|l| l.id == lid))
+            {
+                l.clips.push(c);
+            }
+        }
+        for (lid, mut c) in taken_song_auto {
+            c.start_beat += dest2;
+            if let Some(l) = self.song_lanes.iter_mut().find(|l| l.id == lid) {
+                l.clips.push(c);
+            }
+        }
+        for mut s in taken_scales {
+            s.beat += dest2;
+            self.scale_changes.push(s);
+        }
+        // 6. 帯を dest2 に置き直す。
+        self.sections.push(Section {
+            id: sec.id,
+            name: sec.name,
+            color: sec.color,
+            start_beat: dest2,
+            len_beats: len,
+        });
+
+        self.ensure_scale_changes_sorted();
+        self.ensure_automation_points_sorted();
+        self.normalize_sections();
+        true
+    }
+
+    /// FIXME #53 (`docs/plan_arranger_track.md` §3.3): セクション帯を `dest_start` に複製
+    /// 挿入する (Ctrl+drag、 ripple-insert)。 範囲 `[a,b)` 内の clip / automation を **linked**
+    /// (= `content_id` 共有、 REAPER pooled idiom) で複製し、 clip id だけ新規採番。 `dest_start`
+    /// 以降を `len` ぶん右へ ripple して空けてから複製を落とす。 元の content は残す。 新しい
+    /// セクション id を採番して返す (`Some(new_id)`)。 `move_section` / `delete_section_range`
+    /// と同じく境界 `a` / `b` で `split_clips_at` してから `start_beat ∈ [a,b)` membership で複製する
+    /// ので、 境界をまたぐ clip も範囲内ぶんだけ正しく複製される。
+    pub fn duplicate_section(&mut self, section_id: u32, dest_start: f64) -> Option<u32> {
+        let sec = self.sections.iter().find(|s| s.id == section_id).cloned()?;
+        let (a, len) = (sec.start_beat, sec.len_beats);
+        let b = a + len;
+        let dest_start = dest_start.max(0.0);
+        if len <= 0.0 {
+            return None;
+        }
+        let in_range = |start: f64| start >= a && start < b;
+
+        // 0. 境界をまたぐ clip を a / b で分割 (move / delete-range と同じ split-at-boundary)。
+        //    これをしないと境界跨ぎ clip が membership から漏れ、 複製で境界の音が欠落する。
+        self.split_clips_at(a);
+        self.split_clips_at(b);
+
+        // 1. 範囲内 content の複製 (linked: content_id 共有、 clip id 新規採番、 a 基準ローカル)。
+        let mut copies_clips: Vec<(u32, Clip)> = Vec::new();
+        for t in &mut self.tracks {
+            let tid = t.id;
+            let srcs: Vec<Clip> = t.clips.iter().filter(|c| in_range(c.start_beat)).cloned().collect();
+            for mut c in srcs {
+                let id = t.next_clip_id.max(1);
+                t.next_clip_id = id + 1;
+                c.id = id;
+                c.start_beat -= a;
+                copies_clips.push((tid, c));
+            }
+        }
+        let mut copies_auto: Vec<(u32, u32, AutomationClip)> = Vec::new();
+        for t in &mut self.tracks {
+            let tid = t.id;
+            for lane in &mut t.automation_lanes {
+                let lid = lane.id;
+                let srcs: Vec<AutomationClip> =
+                    lane.clips.iter().filter(|c| in_range(c.start_beat)).cloned().collect();
+                for mut c in srcs {
+                    let id = lane.next_clip_id.max(1);
+                    lane.next_clip_id = id + 1;
+                    c.id = id;
+                    c.start_beat -= a;
+                    copies_auto.push((tid, lid, c));
+                }
+            }
+        }
+        let mut copies_song_auto: Vec<(u32, AutomationClip)> = Vec::new();
+        for lane in &mut self.song_lanes {
+            let lid = lane.id;
+            let srcs: Vec<AutomationClip> =
+                lane.clips.iter().filter(|c| in_range(c.start_beat)).cloned().collect();
+            for mut c in srcs {
+                let id = lane.next_clip_id.max(1);
+                lane.next_clip_id = id + 1;
+                c.id = id;
+                c.start_beat -= a;
+                copies_song_auto.push((lid, c));
+            }
+        }
+        let mut copies_scales: Vec<ScaleChange> = self
+            .scale_changes
+            .iter()
+            .filter(|sc| in_range(sc.beat))
+            .map(|sc| {
+                let mut s = *sc;
+                s.beat -= a;
+                s
+            })
+            .collect();
+
+        // 2. dest に len ぶん空ける (insert)。
+        self.ripple_timeline(dest_start, len);
+
+        // 3. 複製を dest_start 基準で挿入。
+        for (tid, mut c) in copies_clips {
+            c.start_beat += dest_start;
+            if let Some(t) = self.tracks.iter_mut().find(|t| t.id == tid) {
+                t.clips.push(c);
+            }
+        }
+        for (tid, lid, mut c) in copies_auto {
+            c.start_beat += dest_start;
+            if let Some(l) = self
+                .tracks
+                .iter_mut()
+                .find(|t| t.id == tid)
+                .and_then(|t| t.automation_lanes.iter_mut().find(|l| l.id == lid))
+            {
+                l.clips.push(c);
+            }
+        }
+        for (lid, mut c) in copies_song_auto {
+            c.start_beat += dest_start;
+            if let Some(l) = self.song_lanes.iter_mut().find(|l| l.id == lid) {
+                l.clips.push(c);
+            }
+        }
+        for sc in &mut copies_scales {
+            sc.beat += dest_start;
+        }
+        self.scale_changes.append(&mut copies_scales);
+
+        // 4. 新セクションを採番して挿入。
+        let new_id = self.alloc_section_id();
+        self.sections.push(Section {
+            id: new_id,
+            name: sec.name,
+            color: sec.color,
+            start_beat: dest_start,
+            len_beats: len,
+        });
+
+        self.ensure_scale_changes_sorted();
+        self.ensure_automation_points_sorted();
+        self.normalize_sections();
+        Some(new_id)
+    }
+
+    /// FIXME #53: セクション帯だけ削除する (内容は温存、 Studio One の Backspace 相当)。
+    /// 削除できたら `true`。
+    pub fn delete_section(&mut self, section_id: u32) -> bool {
+        let before = self.sections.len();
+        self.sections.retain(|s| s.id != section_id);
+        self.sections.len() != before
+    }
+
+    /// FIXME #53 (`docs/plan_arranger_track.md` §3.3): セクションの**時間範囲ごと**削除して
+    /// 詰める (Studio One の "Delete Range" 相当、 破壊的)。 境界を分割してから範囲内の全
+    /// content を消し、 `[a,b)` を ripple-close で詰める。 削除できたら `true`。
+    pub fn delete_section_range(&mut self, section_id: u32) -> bool {
+        let Some(sec) = self.sections.iter().find(|s| s.id == section_id).cloned() else {
+            return false;
+        };
+        let (a, len) = (sec.start_beat, sec.len_beats);
+        let b = a + len;
+        if len <= 0.0 {
+            return false;
+        }
+        self.split_clips_at(a);
+        self.split_clips_at(b);
+        let in_range = |s: f64| s >= a && s < b;
+        for t in &mut self.tracks {
+            t.clips.retain(|c| !in_range(c.start_beat));
+            for lane in &mut t.automation_lanes {
+                lane.clips.retain(|c| !in_range(c.start_beat));
+            }
+        }
+        for lane in &mut self.song_lanes {
+            lane.clips.retain(|c| !in_range(c.start_beat));
+        }
+        self.scale_changes.retain(|sc| !in_range(sc.beat));
+        self.sections.retain(|s| s.id != section_id);
+        self.ripple_timeline(b, -len);
+        self.ensure_scale_changes_sorted();
+        self.normalize_sections();
+        true
+    }
+
+    /// FIXME #53 (`docs/plan_arranger_track.md` §3.2): 全トラック clip / track automation clip /
+    /// `song_lanes` clip のうち `beat` を**厳密にまたぐ** (`start < beat < start+len`) ものを
+    /// 2 つに分割する。 左 clip は元 `content_id` を保持して長さを `beat` まで詰め (= content の
+    /// 先頭部分のみ再生)、 右 clip は `cut = beat - start` ぶん左シフトした **fork content** を
+    /// 新規採番して持つ (元 content は pooled で他 clip が共有するため不変)。 セクション移動の
+    /// 前にこれを境界 `a` / `b` で呼ぶと、 以降の「`start_beat ∈ [a,b)`」 membership 抽出が
+    /// 境界跨ぎ clip でも正確になる。 歌声 clip も MIDI として分割され、 右断片は note 集合が
+    /// 変わるのでキャッシュ key が変化し自動で再合成される。
+    pub fn split_clips_at(&mut self, beat: f64) {
+        for ti in 0..self.tracks.len() {
+            let mut i = 0;
+            while i < self.tracks[ti].clips.len() {
+                let (start, len, cid) = {
+                    let c = &self.tracks[ti].clips[i];
+                    (c.start_beat, c.length_beats, c.content_id)
+                };
+                if start < beat && beat < start + len {
+                    let cut = beat - start;
+                    let right_cid = self.fork_content_shifted_left(cid, cut);
+                    let right_id = self.tracks[ti].alloc_clip_id();
+                    let mut right = self.tracks[ti].clips[i].clone();
+                    right.id = right_id;
+                    right.content_id = right_cid;
+                    right.start_beat = beat;
+                    right.length_beats = len - cut;
+                    self.tracks[ti].clips[i].length_beats = cut;
+                    self.tracks[ti].clips.insert(i + 1, right);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            for li in 0..self.tracks[ti].automation_lanes.len() {
+                let mut j = 0;
+                while j < self.tracks[ti].automation_lanes[li].clips.len() {
+                    let (start, len, cid) = {
+                        let c = &self.tracks[ti].automation_lanes[li].clips[j];
+                        (c.start_beat, c.length_beats, c.content_id)
+                    };
+                    if start < beat && beat < start + len {
+                        let cut = beat - start;
+                        let right_cid = self.fork_content_shifted_left(cid, cut);
+                        let lane = &mut self.tracks[ti].automation_lanes[li];
+                        let right_id = lane.next_clip_id.max(1);
+                        lane.next_clip_id = right_id + 1;
+                        let mut right = lane.clips[j].clone();
+                        right.id = right_id;
+                        right.content_id = right_cid;
+                        right.start_beat = beat;
+                        right.length_beats = len - cut;
+                        lane.clips[j].length_beats = cut;
+                        lane.clips.insert(j + 1, right);
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+            }
+        }
+        for li in 0..self.song_lanes.len() {
+            let mut j = 0;
+            while j < self.song_lanes[li].clips.len() {
+                let (start, len, cid) = {
+                    let c = &self.song_lanes[li].clips[j];
+                    (c.start_beat, c.length_beats, c.content_id)
+                };
+                if start < beat && beat < start + len {
+                    let cut = beat - start;
+                    let right_cid = self.fork_content_shifted_left(cid, cut);
+                    let lane = &mut self.song_lanes[li];
+                    let right_id = lane.next_clip_id.max(1);
+                    lane.next_clip_id = right_id + 1;
+                    let mut right = lane.clips[j].clone();
+                    right.id = right_id;
+                    right.content_id = right_cid;
+                    right.start_beat = beat;
+                    right.length_beats = len - cut;
+                    lane.clips[j].length_beats = cut;
+                    lane.clips.insert(j + 1, right);
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+        }
+    }
+
+    /// FIXME #53: `content_id` の content を clip-local で `cut` 左シフトした新 content を
+    /// 採番して返す (clip 分割の右側用)。 元 content は不変 (pooled 共有のため)。 linked clip
+    /// 名も引き継ぐ。
+    fn fork_content_shifted_left(&mut self, content_id: ContentId, cut: f64) -> ContentId {
+        let mut content = self.clip_contents.get(&content_id).cloned().unwrap_or_default();
+        Self::shift_content_left(&mut content, cut);
+        let new_id = self.alloc_content_id();
+        self.clip_contents.insert(new_id, content);
+        if let Some(name) = self.clip_content_names.get(&content_id).cloned() {
+            self.clip_content_names.insert(new_id, name);
+        }
+        new_id
+    }
+
+    /// FIXME #53: clip content を clip-local で `cut` 拍ぶん左へずらす。 `cut` より前で完全に
+    /// 終わる event/note/point は落とし、 `cut` をまたぐものは先頭 `0` にクランプして長さを
+    /// 詰める。 audio は trim 分を `source_start_frames` に按分換算して進める (非ストレッチ前提の
+    /// 線形近似)。 automation は `cut` 前の point を落とす (境界値の補間 point 挿入は次段)。
+    fn shift_content_left(content: &mut ClipContent, cut: f64) {
+        macro_rules! shift_overlay {
+            ($events:expr) => {{
+                $events.retain_mut(|ev| {
+                    let new_end = (ev.event_start_in_clip_beats + ev.event_length_beats) - cut;
+                    if new_end <= 0.0 {
+                        return false;
+                    }
+                    let new_start = (ev.event_start_in_clip_beats - cut).max(0.0);
+                    ev.event_start_in_clip_beats = new_start;
+                    ev.event_length_beats = new_end - new_start;
+                    true
+                });
+            }};
+        }
+        match content {
+            ClipContent::Midi(m) => {
+                m.notes.retain_mut(|n| {
+                    let new_end = (n.start_beat + n.duration_beats) - cut;
+                    if new_end <= 0.0 {
+                        return false;
+                    }
+                    let new_start = (n.start_beat - cut).max(0.0);
+                    n.start_beat = new_start;
+                    n.duration_beats = new_end - new_start;
+                    true
+                });
+            }
+            ClipContent::Audio(a) => {
+                a.events.retain_mut(|ev| {
+                    let new_end = (ev.event_start_in_clip_beats + ev.event_length_beats) - cut;
+                    if new_end <= 0.0 {
+                        return false;
+                    }
+                    let new_start = ev.event_start_in_clip_beats - cut;
+                    if new_start < 0.0 {
+                        let trimmed = -new_start;
+                        let total = ev.event_length_beats.max(f64::EPSILON);
+                        let frames = ev.source_end_frames.saturating_sub(ev.source_start_frames);
+                        let adv = (trimmed / total * frames as f64) as u64;
+                        ev.source_start_frames = ev.source_start_frames.saturating_add(adv);
+                        ev.event_start_in_clip_beats = 0.0;
+                        ev.event_length_beats = new_end;
+                    } else {
+                        ev.event_start_in_clip_beats = new_start;
+                    }
+                    true
+                });
+            }
+            ClipContent::Automation(a) => {
+                for p in &mut a.points {
+                    p.time_beat -= cut;
+                }
+                a.points.retain(|p| p.time_beat >= 0.0);
+            }
+            ClipContent::Video(c) => shift_overlay!(c.events),
+            ClipContent::Image(c) => shift_overlay!(c.events),
+            ClipContent::Text(c) => shift_overlay!(c.events),
+        }
     }
 
     /// Phase 7 B5 (`docs/plan_scale.html`): 指定 beat における active な
@@ -3186,6 +3768,298 @@ mod tests {
     {
         let json = serde_json::to_string(value).unwrap();
         serde_json::from_str(&json).unwrap()
+    }
+
+    // ---- FIXME #53: Arranger Section model ----
+
+    fn mk_section(id: u32, start: f64, len: f64) -> Section {
+        Section {
+            id,
+            name: format!("S{id}"),
+            color: [0.5, 0.5, 0.5],
+            start_beat: start,
+            len_beats: len,
+        }
+    }
+
+    #[test]
+    fn section_end_beat_is_start_plus_len() {
+        assert_eq!(mk_section(1, 4.0, 8.0).end_beat(), 12.0);
+    }
+
+    #[test]
+    fn alloc_section_id_skips_zero_and_increments() {
+        let mut song = Song::default();
+        assert_eq!(song.alloc_section_id(), 1);
+        assert_eq!(song.alloc_section_id(), 2);
+        // `0` sentinel が入っていても 1 から採番。
+        song.next_section_id = 0;
+        assert_eq!(song.alloc_section_id(), 1);
+    }
+
+    #[test]
+    fn normalize_sections_sorts_disjoint_by_start() {
+        let mut song = Song::default();
+        song.sections = vec![mk_section(1, 8.0, 4.0), mk_section(2, 0.0, 4.0), mk_section(3, 4.0, 4.0)];
+        song.normalize_sections();
+        let ids: Vec<u32> = song.sections.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![2, 3, 1]);
+        assert_eq!(song.sections[0].start_beat, 0.0);
+        assert_eq!(song.sections[0].len_beats, 4.0);
+    }
+
+    #[test]
+    fn normalize_sections_resolves_overlap_by_clamping_later_start() {
+        let mut song = Song::default();
+        // [0,6) と [4,8) が重複 → 後発の start を直前 end(6) までクランプ → [6,8)。
+        song.sections = vec![mk_section(1, 0.0, 6.0), mk_section(2, 4.0, 4.0)];
+        song.normalize_sections();
+        assert_eq!(song.sections.len(), 2);
+        assert_eq!((song.sections[0].start_beat, song.sections[0].len_beats), (0.0, 6.0));
+        assert_eq!((song.sections[1].start_beat, song.sections[1].len_beats), (6.0, 2.0));
+    }
+
+    #[test]
+    fn normalize_sections_drops_zero_negative_and_fully_overlapped() {
+        let mut song = Song::default();
+        song.sections = vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 0.0), mk_section(3, 8.0, -1.0)];
+        song.normalize_sections();
+        assert_eq!(song.sections.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1]);
+
+        // [0,10) が [2,4) を完全に覆う → 後発は len 0 になり drop。
+        let mut song = Song::default();
+        song.sections = vec![mk_section(1, 0.0, 10.0), mk_section(2, 2.0, 2.0)];
+        song.normalize_sections();
+        assert_eq!(song.sections.len(), 1);
+        assert_eq!(song.sections[0].id, 1);
+    }
+
+    #[test]
+    fn section_survives_json_roundtrip() {
+        let s = mk_section(7, 12.0, 4.0);
+        assert_eq!(json_roundtrip(&s), s);
+    }
+
+    #[test]
+    fn ripple_timeline_open_shifts_everything_after_from_beat_right() {
+        let mut song = Song {
+            length_beats: 16.0,
+            loop_start_beat: 8.0,
+            loop_end_beat: 12.0,
+            sections: vec![mk_section(1, 0.0, 4.0), mk_section(2, 8.0, 4.0)],
+            tracks: vec![Track {
+                clips: vec![
+                    Clip { start_beat: 0.0, length_beats: 4.0, ..Default::default() },
+                    Clip { start_beat: 8.0, length_beats: 4.0, ..Default::default() },
+                ],
+                ..Track::default()
+            }],
+            ..Default::default()
+        };
+
+        // beat 4 に 4 拍挿入 (open) → `>= 4` が +4。
+        song.ripple_timeline(4.0, 4.0);
+
+        assert_eq!(song.tracks[0].clips[0].start_beat, 0.0); // 4 未満は不変
+        assert_eq!(song.tracks[0].clips[1].start_beat, 12.0); // 8 → 12
+        assert_eq!(song.sections[0].start_beat, 0.0);
+        assert_eq!(song.sections[1].start_beat, 12.0);
+        assert_eq!((song.loop_start_beat, song.loop_end_beat), (12.0, 16.0));
+        assert_eq!(song.length_beats, 20.0);
+    }
+
+    #[test]
+    fn move_section_reorders_content_with_ripple() {
+        let mut song = Song {
+            length_beats: 12.0,
+            sections: vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 4.0), mk_section(3, 8.0, 4.0)],
+            tracks: vec![Track {
+                id: 1,
+                clips: vec![
+                    Clip { id: 1, start_beat: 0.0, length_beats: 4.0, ..Default::default() }, // Intro
+                    Clip { id: 2, start_beat: 4.0, length_beats: 4.0, ..Default::default() }, // Verse
+                    Clip { id: 3, start_beat: 8.0, length_beats: 4.0, ..Default::default() }, // Chorus
+                ],
+                ..Track::default()
+            }],
+            ..Default::default()
+        };
+
+        // Chorus ([8,12), id=3) を Verse の前 (dest=4) へ移動。
+        assert!(song.move_section(3, 4.0));
+
+        // セクションは Intro[0,4) / Chorus[4,8) / Verse[8,12) に組み替わる (start 昇順)。
+        let secs: Vec<(u32, f64, f64)> =
+            song.sections.iter().map(|s| (s.id, s.start_beat, s.len_beats)).collect();
+        assert_eq!(secs, vec![(1, 0.0, 4.0), (3, 4.0, 4.0), (2, 8.0, 4.0)]);
+
+        // clip も帯に追従: clip1→0, clip3→4, clip2→8。
+        let mut clips: Vec<(u32, f64)> =
+            song.tracks[0].clips.iter().map(|c| (c.id, c.start_beat)).collect();
+        clips.sort_by_key(|c| c.0);
+        assert_eq!(clips, vec![(1, 0.0), (2, 8.0), (3, 4.0)]);
+    }
+
+    #[test]
+    fn duplicate_section_inserts_linked_copy_with_ripple() {
+        let mut song = Song {
+            length_beats: 8.0,
+            sections: vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 4.0)],
+            next_section_id: 3, // 既存 id 1,2 の続き (実運用は alloc 経由で採番される)
+            tracks: vec![Track {
+                id: 1,
+                clips: vec![
+                    Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id: 7, ..Default::default() },
+                    Clip { id: 2, start_beat: 4.0, length_beats: 4.0, content_id: 8, ..Default::default() },
+                ],
+                next_clip_id: 3,
+                ..Track::default()
+            }],
+            ..Default::default()
+        };
+
+        // section1 ([0,4), content_id 7) を 2 つの間 (dest=4) に複製。
+        let new_id = song.duplicate_section(1, 4.0).unwrap();
+        assert_eq!(new_id, 3);
+
+        // section1[0,4) / copy[4,8) / section2[8,12) の 3 つ。
+        assert_eq!(song.sections.len(), 3);
+        let mut starts: Vec<f64> = song.sections.iter().map(|s| s.start_beat).collect();
+        starts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(starts, vec![0.0, 4.0, 8.0]);
+
+        // clip: 元 clip1(0,c7) / 複製(4,c7 linked) / 元 clip2 は 4→8 へ ripple(8,c8)。
+        let mut clips: Vec<(f64, u32)> =
+            song.tracks[0].clips.iter().map(|c| (c.start_beat, c.content_id)).collect();
+        clips.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert_eq!(clips, vec![(0.0, 7), (4.0, 7), (8.0, 8)]);
+        // 複製は新しい clip id (>= 3)。
+        assert!(song.tracks[0].clips.iter().any(|c| c.start_beat == 4.0 && c.id >= 3));
+    }
+
+    #[test]
+    fn split_clips_at_forks_straddling_clip_content() {
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Midi(MidiContent {
+                notes: vec![
+                    Note { start_beat: 0.0, duration_beats: 1.0, pitch: 60, velocity: 100, lyric: None },
+                    Note { start_beat: 3.0, duration_beats: 1.0, pitch: 62, velocity: 100, lyric: None },
+                ],
+            }),
+        );
+        let track = Track {
+            id: 1,
+            clips: vec![Clip { id: 1, start_beat: 2.0, length_beats: 4.0, content_id: cid, ..Default::default() }],
+            next_clip_id: 2,
+            ..Track::default()
+        };
+        song.tracks = vec![track];
+
+        // clip [2,6) を beat 4 (clip-local 2.0) で分割。
+        song.split_clips_at(4.0);
+
+        let mut cs: Vec<(f64, f64, u32)> = song.tracks[0]
+            .clips
+            .iter()
+            .map(|c| (c.start_beat, c.length_beats, c.content_id))
+            .collect();
+        cs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert_eq!(cs.len(), 2);
+        // 左 [2,4) は元 content を保持、 右 [4,6) は fork content。
+        assert_eq!((cs[0].0, cs[0].1, cs[0].2), (2.0, 2.0, cid));
+        assert_eq!((cs[1].0, cs[1].1), (4.0, 2.0));
+        let right_cid = cs[1].2;
+        assert_ne!(right_cid, cid);
+
+        // 右 content の note は cut(2.0) 左シフト (3.0→1.0)、 0.0 の note は drop。
+        let ClipContent::Midi(m) = &song.clip_contents[&right_cid] else {
+            panic!("midi")
+        };
+        assert_eq!(m.notes.len(), 1);
+        assert_eq!(m.notes[0].start_beat, 1.0);
+        assert_eq!(m.notes[0].pitch, 62);
+
+        // 元 content は pooled で不変 (2 note のまま)。
+        let ClipContent::Midi(orig) = &song.clip_contents[&cid] else {
+            panic!("midi")
+        };
+        assert_eq!(orig.notes.len(), 2);
+    }
+
+    #[test]
+    fn delete_section_removes_band_only_keeping_content() {
+        let mut song = Song {
+            sections: vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 4.0)],
+            tracks: vec![Track {
+                id: 1,
+                clips: vec![Clip { id: 1, start_beat: 0.0, length_beats: 4.0, ..Default::default() }],
+                ..Track::default()
+            }],
+            ..Default::default()
+        };
+        assert!(song.delete_section(1));
+        assert_eq!(song.sections.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(song.tracks[0].clips.len(), 1); // 内容は温存
+        assert!(!song.delete_section(999)); // 不在は false
+    }
+
+    #[test]
+    fn delete_section_range_removes_content_and_ripples() {
+        let mut song = Song {
+            length_beats: 12.0,
+            sections: vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 4.0), mk_section(3, 8.0, 4.0)],
+            tracks: vec![Track {
+                id: 1,
+                clips: vec![
+                    Clip { id: 1, start_beat: 0.0, length_beats: 4.0, ..Default::default() },
+                    Clip { id: 2, start_beat: 4.0, length_beats: 4.0, ..Default::default() },
+                    Clip { id: 3, start_beat: 8.0, length_beats: 4.0, ..Default::default() },
+                ],
+                ..Track::default()
+            }],
+            ..Default::default()
+        };
+        // 真ん中 section2 [4,8) を範囲ごと削除 → clip2 消滅、 clip3 と section3 が 8→4 へ詰まる。
+        assert!(song.delete_section_range(2));
+        let mut secs: Vec<(u32, f64)> = song.sections.iter().map(|s| (s.id, s.start_beat)).collect();
+        secs.sort_by_key(|s| s.0);
+        assert_eq!(secs, vec![(1, 0.0), (3, 4.0)]);
+        let mut clips: Vec<(u32, f64)> =
+            song.tracks[0].clips.iter().map(|c| (c.id, c.start_beat)).collect();
+        clips.sort_by_key(|c| c.0);
+        assert_eq!(clips, vec![(1, 0.0), (3, 4.0)]);
+        assert_eq!(song.length_beats, 8.0);
+    }
+
+    #[test]
+    fn move_section_noop_when_dest_equals_start() {
+        let mut song = Song {
+            sections: vec![mk_section(1, 0.0, 4.0)],
+            ..Default::default()
+        };
+        assert!(!song.move_section(1, 0.0));
+        assert!(!song.move_section(99, 8.0)); // 存在しない id
+    }
+
+    #[test]
+    fn ripple_timeline_close_shifts_left_and_shrinks_length() {
+        let mut song = Song {
+            length_beats: 16.0,
+            tracks: vec![Track {
+                clips: vec![Clip { start_beat: 12.0, length_beats: 4.0, ..Default::default() }],
+                ..Track::default()
+            }],
+            ..Default::default()
+        };
+
+        // beat 8 以降を 4 拍詰める (close) → `>= 8` が -4。
+        song.ripple_timeline(8.0, -4.0);
+
+        assert_eq!(song.tracks[0].clips[0].start_beat, 8.0); // 12 → 8
+        assert_eq!(song.length_beats, 12.0);
     }
 
     #[test]

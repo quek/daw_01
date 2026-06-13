@@ -19,7 +19,6 @@ use common::model::{FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
 
 const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const TEXT_DIM: Color = Color { r: 0.62, g: 0.65, b: 0.70, a: 1.0 };
 const ROW_BG: Color = Color { r: 0.20, g: 0.20, b: 0.24, a: 1.0 };
 const ROW_BG_HOVER: Color = Color { r: 0.24, g: 0.24, b: 0.30, a: 1.0 };
 const ROW_BG_DRAGGING: Color = Color { r: 0.30, g: 0.40, b: 0.55, a: 0.85 };
@@ -298,7 +297,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT_DIM,
+            TEXT,
         );
         y += 18.0;
 
@@ -353,7 +352,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         y += 16.0;
         let dropdown_rect = Rect {
@@ -396,7 +395,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -423,7 +422,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -450,7 +449,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -489,7 +488,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -531,7 +530,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -589,7 +588,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT_DIM,
+            TEXT,
         );
         y += 18.0;
 
@@ -639,7 +638,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -680,7 +679,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -721,7 +720,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -762,7 +761,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -803,7 +802,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -849,7 +848,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         // Rotation は degree 表示 / 入力（model は radians）。 on_change で
         // degree→radians 変換、 handler 側が -π..π に wrap するので range なし。
@@ -914,7 +913,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -956,7 +955,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         scrub_field(
             ui,
@@ -1004,7 +1003,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT_DIM,
+            TEXT,
         );
         y += 18.0;
 
@@ -1084,7 +1083,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     "Opacity",
                 ),
             };
-            ui.label_at((param, "group_label"), label, area.x + pad, y + 5.0, 11.0, TEXT_DIM);
+            ui.label_at((param, "group_label"), label, area.x + pad, y + 5.0, 11.0, TEXT);
             let style =
                 ScrubableNumberStyle { sensitivity: sens, range, ..SCRUB_STYLE_GROUP };
             let resp = ui.scrubable_number_at(
@@ -1169,7 +1168,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT_DIM,
+            TEXT,
         );
         y += 18.0;
 
@@ -1210,7 +1209,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         let text_resp = ui.text_input_at(
             "inspector_text_content_input",
@@ -1238,7 +1237,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         let font_btn_label = if app.clip_text_font_family_edit_text.is_empty() {
             "(default)".to_string()
@@ -1263,7 +1262,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         const ALIGN_LABELS: &[&str] = &["Left", "Center", "Right"];
         let align_idx = match summary.align {
@@ -1308,7 +1307,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + pad,
                 *row_y + 5.0,
                 11.0,
-                TEXT_DIM,
+                TEXT,
             );
             // field 別の (書式, range, sensitivity[units/px])。 clamp は handler
             // (`set_clip_text_num_field`) と一致させる。
@@ -1450,7 +1449,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         if let Some(picked) = ui.dropdown(
             "inspector_text_fade_in_curve",
@@ -1473,7 +1472,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT_DIM,
+            TEXT,
         );
         if let Some(picked) = ui.dropdown(
             "inspector_text_fade_out_curve",
@@ -1539,7 +1538,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT_DIM,
+            TEXT,
         );
         y += 18.0;
 
@@ -1552,7 +1551,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + pad + 4.0,
                 y + 6.0,
                 11.0,
-                TEXT_DIM,
+                TEXT,
             );
             y += 26.0;
         } else {
@@ -1684,7 +1683,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT_DIM,
+            TEXT,
         );
         y += 18.0;
         let dropdown_rect = Rect {
@@ -1740,7 +1739,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + pad,
                 y,
                 12.0,
-                TEXT_DIM,
+                TEXT,
             );
             y += 18.0;
             // import 済み image source の (id, ファイル名) 一覧 (id 昇順)。
@@ -1779,7 +1778,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     area.x + pad,
                     y + 5.0,
                     11.0,
-                    TEXT_DIM,
+                    TEXT,
                 );
                 let dropdown_rect = Rect {
                     x: area.x + pad + 40.0,
@@ -1842,7 +1841,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         area.x + pad,
         y,
         12.0,
-        TEXT_DIM,
+        TEXT,
     );
     y += 18.0;
 
@@ -1946,7 +1945,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             sc_header_y,
             12.0,
-            TEXT_DIM,
+            TEXT,
         );
         let row_h = 24.0;
         let row_gap = 4.0;

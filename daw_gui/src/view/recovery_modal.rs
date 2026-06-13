@@ -12,7 +12,6 @@ use daw_ui_renderer::{Color, Rect};
 use crate::app::{AppData, AppEvent};
 
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
 
 const PANEL_W: f32 = 720.0;
 const ROW_H: f32 = 60.0;
@@ -105,7 +104,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     row_rect.x + 8.0,
                     row_rect.y + 26.0,
                     10.0,
-                    COLOR_TEXT_DIM,
+                    COLOR_TEXT,
                 );
 
                 // ボタン (右寄せ): 「復元」 / 「破棄」

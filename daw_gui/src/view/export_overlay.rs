@@ -13,7 +13,6 @@ use daw_ui_renderer::{Color, Rect};
 use crate::app::{AppData, AppEvent};
 
 const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const COLOR_TEXT_DIM: Color = Color { r: 0.65, g: 0.68, b: 0.72, a: 1.0 };
 const BAR_BG: Color = Color { r: 0.12, g: 0.13, b: 0.16, a: 1.0 };
 const BAR_FILL: Color = Color { r: 0.40, g: 0.70, b: 0.95, a: 1.0 };
 
@@ -86,7 +85,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                         panel.x + PAD,
                         panel.y + PAD + 28.0,
                         13.0,
-                        COLOR_TEXT_DIM,
+                        COLOR_TEXT,
                     );
                     // 進捗バー（bg + fill）。
                     let bar_y = panel.y + PAD + 54.0;
@@ -126,7 +125,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                         panel.x + PAD,
                         panel.y + PAD + 28.0,
                         13.0,
-                        COLOR_TEXT_DIM,
+                        COLOR_TEXT,
                     );
                     ui.label_at(
                         "exp_audio_note",
@@ -134,7 +133,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                         panel.x + PAD,
                         panel.y + PAD + 50.0,
                         11.0,
-                        COLOR_TEXT_DIM,
+                        COLOR_TEXT,
                     );
                 }
             }
