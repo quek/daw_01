@@ -45,6 +45,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_destructive_delete.ps1",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_gui01_pending.ps1",
             "timeout": 5
           }
