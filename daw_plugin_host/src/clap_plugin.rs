@@ -17,11 +17,11 @@ use clap_sys::ext::gui::{
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
 use clap_sys::events::{
-    CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END,
+    CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_MOD,
     CLAP_EVENT_PARAM_VALUE, CLAP_EVENT_TRANSPORT, CLAP_TRANSPORT_HAS_BEATS_TIMELINE,
     CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_HAS_TEMPO,
     CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_LOOP_ACTIVE,
-    CLAP_TRANSPORT_IS_PLAYING, clap_event_param_value, clap_event_transport,
+    CLAP_TRANSPORT_IS_PLAYING, clap_event_param_mod, clap_event_param_value, clap_event_transport,
 };
 use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use clap_sys::ext::params::{
@@ -46,6 +46,17 @@ use libloading::{Library, Symbol};
 
 use crate::clap_host::Host;
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent};
+
+/// Cached per-param metadata needed on the audio thread to convert a
+/// normalized modulation offset (`docs/plan_modulation_routing_redesign.md`
+/// §3.2). Built once at load from `enumerate_params`.
+#[derive(Clone, Copy)]
+struct ClapParamMeta {
+    min: f64,
+    max: f64,
+    /// `CLAP_PARAM_IS_MODULATABLE` — eligible for non-destructive `param_mod`.
+    modulatable: bool,
+}
 
 /// Loaded CLAP plugin instance. Holds every resource alive until dropped.
 /// Drop sequence:
@@ -79,11 +90,26 @@ pub struct ClapPlugin {
     /// caller's `param_events` slice. Merged with `pending_events` into
     /// the plugin's `in_events` via `EventListView`.
     pending_param_events: Vec<clap_event_param_value>,
-    /// Pre-allocated merge order over `pending_events` + `pending_param_events`,
-    /// sorted by `header.time`. CLAP requires `in_events` to be time-ascending
-    /// (`clap/events.h`); notes and params arrive pre-sorted only within their
-    /// own stream, so we stable-merge them here each `process()` (in-place
-    /// sort of a pre-allocated buffer — no RT heap alloc).
+    /// `docs/plan_modulation_routing_redesign.md` §3.2: pre-allocated input
+    /// `CLAP_EVENT_PARAM_MOD` buffer. Filled by process() for `ParamEventKind::
+    /// Mod` events on **modulatable** params — a non-destructive offset the
+    /// plugin adds to its own (automation-driven) base value (Bitwig二層).
+    pending_param_mods: Vec<clap_event_param_mod>,
+    /// `docs/plan_modulation_routing_redesign.md` §3.2 / §4: per-param
+    /// `(min, max, modulatable)` cached at load so the audio-thread process()
+    /// can convert a normalized modulation offset to a CLAP plain `amount`
+    /// (`offset·(max−min)`) and pick the param_mod-vs-fold path without
+    /// calling the main-thread-only `enumerate`.
+    param_meta: std::collections::HashMap<u32, ClapParamMeta>,
+    /// Last absolute value the host sent per param (base for the
+    /// non-modulatable fold path). Pre-populated with every param's default at
+    /// load so process() only ever updates existing keys (no RT heap alloc).
+    last_param_value: std::collections::HashMap<u32, f64>,
+    /// Pre-allocated merge order over the note / param_value / param_mod
+    /// streams, sorted by `header.time`. CLAP requires `in_events` to be
+    /// time-ascending (`clap/events.h`); each stream arrives pre-sorted, so we
+    /// stable-merge them here each `process()` (in-place sort of a pre-allocated
+    /// buffer — no RT heap alloc).
     event_order: Vec<EventOrderRef>,
     /// Notes emitted by the plugin during the previous `process()` call.
     /// Populated by the `out_events.try_push` callback and drained by the
@@ -316,7 +342,7 @@ impl ClapPlugin {
         };
         tracing::info!(has_params = params_ext.is_some(), "plugin params extension");
 
-        Ok(Some(Self {
+        let mut plugin = Self {
             _library: library,
             entry: entry_ptr,
             plugin: plugin_ptr,
@@ -338,6 +364,9 @@ impl ClapPlugin {
             // re-alloc; we log on the audio side if it happens.
             pending_events: Vec::with_capacity(256),
             pending_param_events: Vec::with_capacity(256),
+            pending_param_mods: Vec::with_capacity(256),
+            param_meta: std::collections::HashMap::new(),
+            last_param_value: std::collections::HashMap::new(),
             event_order: Vec::with_capacity(512),
             collected_out_param_touches: Vec::with_capacity(64),
             collected_out_param_values: Vec::with_capacity(256),
@@ -352,7 +381,34 @@ impl ClapPlugin {
             aux_input_buffers: Vec::new(),
             aux_input_ptrs: Vec::new(),
             params_ext,
-        }))
+        };
+        // `docs/plan_modulation_routing_redesign.md` §4: cache param min/max/
+        // modulatable + seed the base-value cache so the audio thread never
+        // needs the main-thread-only `enumerate` and never allocates.
+        plugin.init_param_meta();
+        Ok(Some(plugin))
+    }
+
+    /// Populate `param_meta` + `last_param_value` from the plugin's param list.
+    /// Called once at load (main thread). After this the audio-thread
+    /// `process()` only reads / updates existing keys — no allocation.
+    fn init_param_meta(&mut self) {
+        let infos = self.enumerate_params();
+        self.param_meta.reserve(infos.len());
+        self.last_param_value.reserve(infos.len());
+        for info in &infos {
+            let modulatable =
+                info.flags & common::protocol::plugin_param_flags::MODULATABLE != 0;
+            self.param_meta.insert(
+                info.id,
+                ClapParamMeta {
+                    min: info.min_value,
+                    max: info.max_value,
+                    modulatable,
+                },
+            );
+            self.last_param_value.insert(info.id, info.default_value);
+        }
     }
 
     /// Phase 2 (`docs/plan_automation.md` §7.5): enumerate every
@@ -724,24 +780,92 @@ impl ClapPlugin {
         // cookies and instead require the id, this is the case for plugins
         // that share parameters between instances」)、 host が cookie cache
         // を持たないので nullを渡して param_id 直引き。
-        self.pending_param_events.clear();
+        //
+        // `docs/plan_modulation_routing_redesign.md` §3.2: `ParamEventKind::Mod`
+        // events carry a *normalized* modulation offset. On **modulatable**
+        // params we emit a non-destructive `CLAP_EVENT_PARAM_MOD` (amount =
+        // offset·(max−min)); the plugin adds it to its own automation-driven
+        // base (Bitwig 二層). Non-modulatable params have no mod channel, so we
+        // fold the offset into an absolute `param_value` using the cached base.
+        use crate::plugin_instance::ParamEventKind;
+        // Pre-pass: refresh the base-value cache from this buffer's absolute
+        // Value events so any non-modulatable fold below sees the current base
+        // regardless of the (unstable) time sort order.
         for ev in param_events {
-            self.pending_param_events.push(clap_event_param_value {
-                header: clap_event_header {
-                    size: std::mem::size_of::<clap_event_param_value>() as u32,
-                    time: ev.time,
-                    space_id: CLAP_CORE_EVENT_SPACE_ID,
-                    type_: CLAP_EVENT_PARAM_VALUE,
-                    flags: 0,
-                },
-                param_id: ev.param_id,
-                cookie: std::ptr::null_mut(),
-                note_id: -1,
-                port_index: -1,
-                channel: -1,
-                key: -1,
-                value: ev.value,
-            });
+            if ev.kind == ParamEventKind::Value
+                && let Some(slot) = self.last_param_value.get_mut(&ev.param_id)
+            {
+                *slot = ev.value;
+            }
+        }
+        self.pending_param_events.clear();
+        self.pending_param_mods.clear();
+        let param_value_header = |time: u32| clap_event_header {
+            size: std::mem::size_of::<clap_event_param_value>() as u32,
+            time,
+            space_id: CLAP_CORE_EVENT_SPACE_ID,
+            type_: CLAP_EVENT_PARAM_VALUE,
+            flags: 0,
+        };
+        for ev in param_events {
+            match ev.kind {
+                ParamEventKind::Value => {
+                    self.pending_param_events.push(clap_event_param_value {
+                        header: param_value_header(ev.time),
+                        param_id: ev.param_id,
+                        cookie: std::ptr::null_mut(),
+                        note_id: -1,
+                        port_index: -1,
+                        channel: -1,
+                        key: -1,
+                        value: ev.value,
+                    });
+                }
+                ParamEventKind::Mod => {
+                    let Some(meta) = self.param_meta.get(&ev.param_id).copied() else {
+                        continue; // unknown param id — nothing to modulate
+                    };
+                    let amount = ev.value * (meta.max - meta.min);
+                    if meta.modulatable {
+                        self.pending_param_mods.push(clap_event_param_mod {
+                            header: clap_event_header {
+                                size: std::mem::size_of::<clap_event_param_mod>() as u32,
+                                time: ev.time,
+                                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                                type_: CLAP_EVENT_PARAM_MOD,
+                                flags: 0,
+                            },
+                            param_id: ev.param_id,
+                            cookie: std::ptr::null_mut(),
+                            note_id: -1,
+                            port_index: -1,
+                            channel: -1,
+                            key: -1,
+                            amount,
+                        });
+                    } else {
+                        // No CLAP modulation channel for this param: fold the
+                        // offset into the absolute value (host-computed, like
+                        // VST3). Base = cached last value (seeded with default).
+                        let base = self
+                            .last_param_value
+                            .get(&ev.param_id)
+                            .copied()
+                            .unwrap_or(meta.min);
+                        let value = (base + amount).clamp(meta.min, meta.max);
+                        self.pending_param_events.push(clap_event_param_value {
+                            header: param_value_header(ev.time),
+                            param_id: ev.param_id,
+                            cookie: std::ptr::null_mut(),
+                            note_id: -1,
+                            port_index: -1,
+                            channel: -1,
+                            key: -1,
+                            value,
+                        });
+                    }
+                }
+            }
         }
         self.collected_out_notes.clear();
 
@@ -840,26 +964,34 @@ impl ClapPlugin {
         for (idx, e) in self.pending_events.iter().enumerate() {
             self.event_order.push(EventOrderRef {
                 time: e.header.time,
-                is_param: false,
+                stream: EventStream::Note,
                 idx: idx as u32,
             });
         }
         for (idx, e) in self.pending_param_events.iter().enumerate() {
             self.event_order.push(EventOrderRef {
                 time: e.header.time,
-                is_param: true,
+                stream: EventStream::Param,
+                idx: idx as u32,
+            });
+        }
+        for (idx, e) in self.pending_param_mods.iter().enumerate() {
+            self.event_order.push(EventOrderRef {
+                time: e.header.time,
+                stream: EventStream::ParamMod,
                 idx: idx as u32,
             });
         }
         self.event_order.sort_by_key(|r| r.time);
 
-        // Phase 2b: note + param events を 1 view にまとめて vtable に
-        // 渡す。 EventListView は process() の lifetime 内だけ存続する
+        // Phase 2b: note + param (+ param_mod) events を 1 view にまとめて
+        // vtable に渡す。 EventListView は process() の lifetime 内だけ存続する
         // local 変数で、 plugin.process() が return するまで生きている
         // ので raw pointer cast は安全。
         let event_view = EventListView {
             notes: &self.pending_events,
             params: &self.pending_param_events,
+            param_mods: &self.pending_param_mods,
             order: &self.event_order,
         };
         let in_events = clap_input_events {
@@ -1289,23 +1421,33 @@ fn build_clap_transport_event(
 
 /// Phase 2b: 1 buffer 分の note + param event を 1 つの list として
 /// plugin に渡すための view。 `process()` のローカル変数として作られ、
+/// Which pre-allocated stream an [`EventOrderRef`] indexes into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventStream {
+    Note,
+    Param,
+    ParamMod,
+}
+
 /// `clap_input_events.ctx` が `*const Self` を指す。 plugin.process()
 /// 呼び出しの間だけ存続する短命オブジェクト。
-/// One entry in [`EventListView::order`]: references either a note or a param
-/// event by index, tagged with its `header.time` so the merged note+param
+/// One entry in [`EventListView::order`]: references a note / param_value /
+/// param_mod event by index, tagged with its `header.time` so the merged
 /// stream can be presented to the plugin in time-ascending order (a CLAP
 /// `clap_input_events` contract — `clap/events.h`).
 #[derive(Clone, Copy)]
 struct EventOrderRef {
     time: u32,
-    is_param: bool,
+    stream: EventStream,
     idx: u32,
 }
 
 struct EventListView<'a> {
     notes: &'a [clap_event_note],
     params: &'a [clap_event_param_value],
-    /// Time-sorted merge order over `notes` + `params`. Built per `process()`.
+    param_mods: &'a [clap_event_param_mod],
+    /// Time-sorted merge order over `notes` + `params` + `param_mods`. Built
+    /// per `process()`.
     order: &'a [EventOrderRef],
 }
 
@@ -1331,10 +1473,10 @@ unsafe extern "C" fn in_events_get(
     let Some(r) = view.order.get(index as usize) else {
         return std::ptr::null();
     };
-    if r.is_param {
-        std::ptr::from_ref(&view.params[r.idx as usize].header)
-    } else {
-        std::ptr::from_ref(&view.notes[r.idx as usize].header)
+    match r.stream {
+        EventStream::Note => std::ptr::from_ref(&view.notes[r.idx as usize].header),
+        EventStream::Param => std::ptr::from_ref(&view.params[r.idx as usize].header),
+        EventStream::ParamMod => std::ptr::from_ref(&view.param_mods[r.idx as usize].header),
     }
 }
 

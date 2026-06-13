@@ -213,6 +213,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             })
         },
         None,
+        None, // tempo modulation はラック経由
     );
     // Phase 4 Step B 流 ParamGesture edge 検知: drag 開始 (= dragging
     // false→true) で `ParamGestureBegin`、 終了で `ParamGestureEnd` を発火。
@@ -251,6 +252,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 app.handle_event(AppEvent::SetSongTimeSigNumFromScrub(next))
             })
         },
+        None,
         None,
     );
     let tsig_was_dragging = app

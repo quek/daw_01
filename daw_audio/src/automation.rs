@@ -11,7 +11,9 @@
 
 #![allow(dead_code)]
 
-use common::automation::effective_value_with_scalars;
+use common::automation::{
+    apply_modulation_with_scalars, lane_value_at, modulation_offset_norm_with_scalars,
+};
 use common::model::{AutomationTarget, Song, TrackBuiltinParam};
 use common::process_data::ProcessData;
 
@@ -78,36 +80,46 @@ pub fn fill_track_param_ramps(
         return;
     }
 
-    for lane in &track.automation_lanes {
-        if !lane.enabled {
-            continue;
+    // docs/plan_modulation_routing_redesign.md §3.1: Volume / Pan は lane の有無に
+    // 関わらず変調する。base = 「enabled かつ非 recording な lane があればその curve
+    // 値、無ければ track の constant 値」、そこに `Track.mod_routings` の当該 target
+    // 変調を正規化領域で乗せる。lane も mod_routing も無い target は constant fill の
+    // ままで正しいので per-sample ループを丸ごと skip (= 無回帰)。
+    let fill_builtin = |target: AutomationTarget, buf: &mut [f32], track_const: f32| {
+        // 当該 target を駆動する lane (enabled + 非 recording)。
+        let lane = track.automation_lanes.iter().find(|l| {
+            l.enabled
+                && l.target == target
+                && !recording_lanes
+                    .iter()
+                    .any(|(t, tg)| *t == track_id && *tg == l.target)
+        });
+        let has_mod = track.mod_routings.iter().any(|r| r.target == target);
+        if lane.is_none() && !has_mod {
+            // constant fill (上で書いた track.volume / track.pan) がそのまま正しい。
+            return;
         }
-        // Phase 4 Step C-2: 現在 recording 中の lane なら curve eval skip。
-        // 上で fill した track.volume / track.pan の constant が残る。
-        if recording_lanes
-            .iter()
-            .any(|(t, tg)| *t == track_id && *tg == lane.target)
-        {
-            continue;
-        }
-        // Borrow the right buffer for this lane's target. Plugin
-        // parameter / Mute / send / song-level lanes are handled
-        // elsewhere — skip silently here.
-        let buf: &mut [f32] = match lane.target {
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => {
-                volume_per_sample
-            }
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => pan_per_sample,
-            _ => continue,
-        };
         for (i, slot) in buf.iter_mut().enumerate().take(frames) {
-            let sample_pos = playhead + i as u64;
-            let beat = sample_pos as f64 / samples_per_beat;
-            // docs/plan_modulation.md §2/§5: base (default+curve) に follower 変調を
-            // 合成。 mod_routings が空なら lane_value_at と byte 同一。
-            *slot = effective_value_with_scalars(song, lane, beat, mod_scalars) as f32;
+            let beat = (playhead + i as u64) as f64 / samples_per_beat;
+            let base = match lane {
+                Some(l) => lane_value_at(l, &song.clip_contents, beat),
+                None => f64::from(track_const),
+            };
+            *slot =
+                apply_modulation_with_scalars(song, &target, base, &track.mod_routings, mod_scalars)
+                    as f32;
         }
-    }
+    };
+    fill_builtin(
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+        volume_per_sample,
+        track_volume,
+    );
+    fill_builtin(
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
+        pan_per_sample,
+        track_pan,
+    );
 }
 
 /// Phase 2b (`docs/plan_automation.md` §8.3): push automation events for
@@ -176,9 +188,32 @@ pub fn fill_pd_param_events(
             }
             _ => continue,
         };
-        // docs/plan_modulation.md §2/§5: base に follower 変調を合成。
-        let value = effective_value_with_scalars(song, lane, beat, mod_scalars);
-        pd.push_param(0, param_id, value);
+        // base = lane curve 値 (絶対値)。モジュレーションは下で正規化オフセットを
+        // ParamMod として別送する (`docs/plan_modulation_routing_redesign.md` §3.2)
+        // ので、CLAP modulatable param では automation(base) を破壊せず非破壊に乗る。
+        let base = lane_value_at(lane, &song.clip_contents, beat);
+        pd.push_param(0, param_id, base);
+    }
+
+    // docs/plan_modulation_routing_redesign.md §3.2: この device の plugin param を
+    // 変調する routing があれば、target ごとに正規化オフセット 1 個を `ParamMod` で
+    // 送る。**lane の有無に関わらず** (= lane-free モジュレーション)。plugin_host が
+    // per-format に CLAP `param_mod` / 合成へ変換する。follower が 0 に戻った時も
+    // offset 0 を送って mod を解除するため、毎バッファ無条件に emit する。
+    for (i, r) in track.mod_routings.iter().enumerate() {
+        let AutomationTarget::PluginParam { device_index: d, param_id, .. } = &r.target else {
+            continue;
+        };
+        if *d != device_index {
+            continue;
+        }
+        // 同一 target は 1 度だけ (先行する同 target routing があれば skip)。
+        if track.mod_routings[..i].iter().any(|p| p.target == r.target) {
+            continue;
+        }
+        let offset =
+            modulation_offset_norm_with_scalars(song, &r.target, &track.mod_routings, mod_scalars);
+        pd.push_param_mod(0, *param_id, f64::from(offset));
     }
 }
 

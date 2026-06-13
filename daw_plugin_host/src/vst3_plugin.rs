@@ -138,6 +138,15 @@ pub struct Vst3Plugin {
     /// automation lane values (`TimedParamEvent`) into the plugin. Owned
     /// here so the audio thread never allocates a COM object per buffer.
     in_param_changes: ComWrapper<Vst3InParamChanges>,
+    /// `docs/plan_modulation_routing_redesign.md` §3.3: last absolute
+    /// normalized value sent per param. VST3 has no modulation channel, so the
+    /// host folds a `ParamEventKind::Mod` offset into `base + offset` using this
+    /// cache (VST3 params are normalized `0..=1`, so `amount == offset`).
+    /// Pre-seeded with every param's default at load → no RT allocation.
+    param_mod_base: std::collections::HashMap<u32, f64>,
+    /// Pre-allocated scratch holding `param_events` with all `Mod` offsets
+    /// folded into absolute `Value`s, handed to `set_changes` each `process()`.
+    folded_param_events: Vec<crate::plugin_instance::TimedParamEvent>,
     /// Set by `process()` (RT thread) when the param-change pool overflowed
     /// (> capacity distinct params in one buffer; extra param events dropped).
     /// Logged once from `stop_processing()` (RT-external) so the hot path never
@@ -370,7 +379,7 @@ impl Vst3Plugin {
             "VST3 audio bus channel counts"
         );
 
-        Ok(Self {
+        let mut plugin = Self {
             _library: library,
             id: display_id,
             name: class_name,
@@ -404,6 +413,8 @@ impl Vst3Plugin {
             in_event_list: ComWrapper::new(Vst3InEventList::new()),
             out_event_list: ComWrapper::new(Vst3OutEventList::new()),
             in_param_changes: ComWrapper::new(Vst3InParamChanges::new()),
+            param_mod_base: std::collections::HashMap::new(),
+            folded_param_events: Vec::with_capacity(256),
             param_pool_overflowed: AtomicBool::new(false),
             #[cfg(debug_assertions)]
             process_status_err: std::sync::atomic::AtomicI32::new(kResultOk),
@@ -412,7 +423,23 @@ impl Vst3Plugin {
             view: None,
             plug_frame,
             gui_attached: std::cell::Cell::new(false),
-        })
+        };
+        // `docs/plan_modulation_routing_redesign.md` §3.3 / §4: seed the
+        // modulation base cache with every param's default (normalized) so the
+        // audio-thread fold only updates existing keys (no RT allocation).
+        plugin.init_param_mod_base();
+        Ok(plugin)
+    }
+
+    /// Populate `param_mod_base` from the plugin's param list (main thread,
+    /// once at load). Values are normalized `0..=1` (VST3 convention).
+    fn init_param_mod_base(&mut self) {
+        let infos = self.enumerate_params();
+        self.param_mod_base.reserve(infos.len());
+        for info in &infos {
+            self.param_mod_base
+                .insert(info.id, info.default_value.clamp(0.0, 1.0));
+        }
     }
 }
 
@@ -1180,7 +1207,38 @@ impl LoadedPlugin for Vst3Plugin {
         // 渡してくる。 VST3 の値は normalized [0,1] (= daw_gui の VST3 param
         // automation も normalized で持つ、 enumerate_params が min0/max1 で
         // 報告するため整合)。
-        if self.in_param_changes.set_changes(param_events) {
+        //
+        // `docs/plan_modulation_routing_redesign.md` §3.3: VST3 にはモジュレー
+        // ションチャネルが無いので、`ParamEventKind::Mod` のオフセットを host が
+        // `base + offset` に畳んで絶対値として送る (VST3 は normalized 0..=1 なので
+        // `amount == offset`)。base は last-set 値キャッシュ (`param_mod_base`)。
+        use crate::plugin_instance::ParamEventKind;
+        // Pre-pass: refresh base cache from this buffer's absolute Value events
+        // (unstable time sort ⇒ update before reading).
+        for ev in param_events {
+            if ev.kind == ParamEventKind::Value
+                && let Some(slot) = self.param_mod_base.get_mut(&ev.param_id)
+            {
+                *slot = ev.value;
+            }
+        }
+        self.folded_param_events.clear();
+        for ev in param_events {
+            match ev.kind {
+                ParamEventKind::Value => self.folded_param_events.push(*ev),
+                ParamEventKind::Mod => {
+                    let base = self.param_mod_base.get(&ev.param_id).copied().unwrap_or(0.0);
+                    let value = (base + ev.value).clamp(0.0, 1.0);
+                    self.folded_param_events.push(crate::plugin_instance::TimedParamEvent {
+                        time: ev.time,
+                        param_id: ev.param_id,
+                        value,
+                        kind: ParamEventKind::Value,
+                    });
+                }
+            }
+        }
+        if self.in_param_changes.set_changes(&self.folded_param_events) {
             // RT path: just raise a flag. The actual log (which formats
             // `%self.name`) happens once in `stop_processing()`, off the RT
             // thread, to keep `process()` free of heap allocation and tracing.

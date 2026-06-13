@@ -133,8 +133,14 @@ pub fn active_image_sources_at(
                 // opacity は fade envelope と multiply (= override しても
                 // fade が効く)。 rotation は lane 経路の override のみ
                 // (= fade 無関係)。
-                let (x, y, w, h, opacity, rotation) =
-                    resolve_image_fields(&lanes, song, event, playhead_beat, mod_scalars);
+                let (x, y, w, h, opacity, rotation) = resolve_image_fields(
+                    &lanes,
+                    song,
+                    &track.mod_routings,
+                    event,
+                    playhead_beat,
+                    mod_scalars,
+                );
                 let alpha = opacity * env;
                 if alpha <= 0.0 {
                     continue;
@@ -212,38 +218,46 @@ impl<'a> ImageLaneIndex<'a> {
 fn resolve_image_fields(
     lanes: &ImageLaneIndex<'_>,
     song: &Song,
+    track_mod_routings: &[common::model::ModRouting],
     event: &ImageEvent,
     song_beat: f64,
     mod_scalars: &[f32],
 ) -> (f32, f32, f32, f32, f32, f32) {
-    let resolve_norm = |lane: Option<&AutomationLane>, fallback: f32| -> f32 {
-        let Some(lane) = lane else {
-            return fallback;
+    // docs/plan_modulation_routing_redesign.md §3.1: base = lane があれば lane 値、
+    // 無ければ event の field 値。そこに `Track.mod_routings` の当該 `ImageBuiltin`
+    // 変調を正規化領域で乗せる (lane 無しでも変調する)。lane も routing も無ければ
+    // apply_modulation は base をそのまま返すので従来挙動 (= 無回帰)。
+    let resolve = |lane: Option<&AutomationLane>,
+                   param: ImageBuiltinParam,
+                   fallback: f32,
+                   clamp01: bool|
+     -> f32 {
+        let target = AutomationTarget::ImageBuiltin(param);
+        let base = match lane {
+            Some(l) => common::automation::lane_value_at(l, &song.clip_contents, song_beat),
+            None => f64::from(fallback),
         };
-        // lane_value_at は lane.default_value をフォールバックに使うが、
-        // image lane の default は event 値とは独立 (= lane を空で作っ
-        // ても event 値が見えるべきではない、 lane を作った時点で lane
-        // が override)。 lane が enabled で clip が無い区間でも default
-        // _value が effective。 docs/plan_modulation.md §2: follower 変調を
-        // 正規化領域で合成 (mod_routings が空なら lane_value_at と同値)。
-        let v =
-            common::automation::effective_value_with_scalars(song, lane, song_beat, mod_scalars);
-        (v as f32).clamp(0.0, 1.0)
+        let v = common::automation::apply_modulation_with_scalars(
+            song,
+            &target,
+            base,
+            track_mod_routings,
+            mod_scalars,
+        ) as f32;
+        if clamp01 { v.clamp(0.0, 1.0) } else { v }
     };
-    let rotation = match lanes.rotation {
-        // Rotation は plain で radians、 範囲 -π..=π を超えても modulo
-        // 2π で wrap (= 連続回転 lane を許容)。 lane.default_value は
-        // 既に radians 単位。
-        Some(lane) => common::automation::effective_value_with_scalars(
-            song, lane, song_beat, mod_scalars,
-        ) as f32,
-        None => event.rotation_radians,
-    };
-    let x = resolve_norm(lanes.x, event.x);
-    let y = resolve_norm(lanes.y, event.y);
-    let w = resolve_norm(lanes.w, event.w);
-    let h = resolve_norm(lanes.h, event.h);
-    let opacity = resolve_norm(lanes.opacity, event.opacity);
+    let x = resolve(lanes.x, ImageBuiltinParam::X, event.x, true);
+    let y = resolve(lanes.y, ImageBuiltinParam::Y, event.y, true);
+    let w = resolve(lanes.w, ImageBuiltinParam::W, event.w, true);
+    let h = resolve(lanes.h, ImageBuiltinParam::H, event.h, true);
+    let opacity = resolve(lanes.opacity, ImageBuiltinParam::Opacity, event.opacity, true);
+    // Rotation は plain radians (clamp なし、modulo 2π wrap は下流)。
+    let rotation = resolve(
+        lanes.rotation,
+        ImageBuiltinParam::Rotation,
+        event.rotation_radians,
+        false,
+    );
     (x, y, w, h, opacity, rotation)
 }
 

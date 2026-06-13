@@ -219,6 +219,7 @@ mod tests {
             time,
             param_id,
             value,
+            kind: crate::plugin_instance::ParamEventKind::Value,
         }
     }
 

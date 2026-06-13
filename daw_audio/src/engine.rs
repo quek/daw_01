@@ -1390,7 +1390,7 @@ pub fn process_track_owned(
                             key: ev.key,
                         },
                     },
-                    EventKind::ParamValue => continue,
+                    EventKind::ParamValue | EventKind::ParamMod => continue,
                 };
                 scratch.midi_bus_b.push(timed);
             }

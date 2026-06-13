@@ -125,7 +125,17 @@ pub struct Event {
 pub enum EventKind {
     NoteOn = 1,
     NoteOff = 2,
+    /// Absolute parameter value (automation / direct set). `value` is in the
+    /// daw's parameter domain (plugin host converts per-format to CLAP plain /
+    /// VST3 normalized).
     ParamValue = 3,
+    /// **lane 非依存モジュレーション** (`docs/plan_modulation_routing_redesign.md`
+    /// §3.2): a *normalized* (`-1..=1`) modulation offset for `param_id`. The
+    /// plugin host applies it per-format — CLAP modulatable params get a
+    /// non-destructive `clap_event_param_mod` (`amount = value·(max−min)`),
+    /// other params have it folded into the absolute value the host sends.
+    /// `value` carries the offset.
+    ParamMod = 4,
 }
 
 impl ProcessData {
@@ -233,6 +243,31 @@ impl ProcessData {
             param_id,
             note_id: 0,
             value,
+        };
+        self.n_events_in += 1;
+    }
+
+    /// Push a **normalized modulation offset** for `param_id`
+    /// (`docs/plan_modulation_routing_redesign.md` §3.2). `offset_norm` is in
+    /// the `-1..=1` normalized domain; the plugin host converts it per-format
+    /// (CLAP `param_mod` for modulatable params, else folded into the absolute
+    /// value). Same RT-safe truncation contract as `push_param`.
+    pub fn push_param_mod(&mut self, time: u32, param_id: u32, offset_norm: f64) {
+        let i = self.n_events_in as usize;
+        if i >= MAX_EVENTS {
+            return;
+        }
+        self.events_in[i] = Event {
+            kind: EventKind::ParamMod,
+            _pad: [0; 3],
+            time,
+            key: 0,
+            channel: 0,
+            _pad1: [0; 2],
+            velocity: 0.0,
+            param_id,
+            note_id: 0,
+            value: offset_norm,
         };
         self.n_events_in += 1;
     }

@@ -663,6 +663,15 @@ fn run_worker(
                         time: ev.time,
                         param_id: ev.param_id,
                         value: ev.value,
+                        kind: crate::plugin_instance::ParamEventKind::Value,
+                    });
+                }
+                EventKind::ParamMod => {
+                    param_events_in.push(crate::plugin_instance::TimedParamEvent {
+                        time: ev.time,
+                        param_id: ev.param_id,
+                        value: ev.value,
+                        kind: crate::plugin_instance::ParamEventKind::Mod,
                     });
                 }
             }

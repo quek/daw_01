@@ -366,6 +366,37 @@ pub enum InspectorScrubField {
     Text(TextNumField),
 }
 
+/// docs/plan_modulation.md §9: one row of the inspector modulation-source rack.
+#[derive(Debug, Clone, Copy)]
+pub struct ModSourceRow {
+    pub id: u32,
+    pub source_track: u32,
+    /// Live follower scalar (`0..` ) from the polled `mod_scalars` plane.
+    pub scalar: f32,
+    pub post_fader: bool,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+}
+
+/// docs/plan_modulation_routing_redesign.md §6: per-control modulation data the
+/// inspector turns into a gui_01 `Modulation` widget arg. All depths are in the
+/// control's plain value domain (see [`AppData::inspector_mod_data`]).
+#[derive(Debug, Clone, Default)]
+pub struct InspectorModData {
+    /// Assigned routings for this target: `(source color, plain depth)`.
+    pub entries: Vec<([f32; 3], f64)>,
+    /// The current modulated value (base ⊕ live offset), in plain units.
+    pub live_plain: f64,
+    /// `Some((source color, current plain depth, source_id))` when a source is
+    /// armed → the control enters depth-drag edit mode.
+    pub armed: Option<([f32; 3], f64, u32)>,
+    /// Track owning the routing (`MASTER_TRACK_ID` → song-level).
+    pub track_id: u32,
+    /// `norm_to_plain(target,1) − norm_to_plain(target,0)` — converts the
+    /// widget's plain depth back to the model's normalized depth.
+    pub span: f64,
+}
+
 /// docs/plan_text_overlay.md §4 P5: text inspector の read snapshot
 /// (= image idiom)。 `selected_clip` が `ClipContent::Text` を指していて
 /// 中に 1 event 以上あれば `inspector_text_event_summary()` が `Some` を
@@ -1376,6 +1407,22 @@ pub struct AppData {
     /// `EndInspectorScrub` を発火し、 一連の操作を undo 1 step に bracket
     /// する tracker（`None` = idle）。 group_scrub_active と同 idiom。
     pub inspector_scrub_active: Option<InspectorScrubField>,
+    /// docs/plan_modulation.md §3: true while an envelope-follower attack /
+    /// release scrub is being dragged. The scrub mutates the value + marks
+    /// dirty each frame but defers the (recompiling) `sync_song_to_plugin_host`
+    /// to the drag-end edge, avoiding a per-frame LoadSong storm.
+    pub mod_follower_scrub_active: bool,
+    /// docs/plan_modulation_routing_redesign.md §6: the `ModSource` currently
+    /// **armed** for assignment (Bitwig 流). `Some(id)` ⇒ every modulatable
+    /// inspector param control shows depth-drag edit mode (`scrubable_number_at`
+    /// の `Modulation::edit`); dragging a control assigns / sets that source's
+    /// depth on the control's target. `None` ⇒ controls show existing routings
+    /// (entries + live tick) but aren't editable. session-only (not persisted).
+    pub armed_mod_source: Option<u32>,
+    /// True while a per-control modulation depth drag is in progress (gui_01
+    /// widget `ScrubableNumberResponse::mod_dragging`). Edge-detected to bracket
+    /// the depth change into one undo step / defer the host resync to drag-end.
+    pub mod_depth_scrub_active: bool,
 
     /// Video export の進捗 `(done_frames, total_frames)`。background thread が
     /// `ExportProgress` で更新。`None` = export 非実行。UI が進捗オーバーレイの
@@ -1785,6 +1832,9 @@ impl AppData {
             clip_text_font_family_edit_text: String::new(),
             group_scrub_active: None,
             inspector_scrub_active: None,
+            mod_follower_scrub_active: false,
+            armed_mod_source: None,
+            mod_depth_scrub_active: false,
             export_progress: None,
             export_cancel: None,
             pending_video_export: None,
@@ -2130,71 +2180,221 @@ impl AppData {
 
     /// Sidechain source picker choices: "—" (None) followed by every
     /// track in the song **except** the cursor track itself.
-    /// docs/plan_modulation.md §9: rows for the modulation-source rack —
-    /// `(id, source-track label, live follower scalar, is_post_fader)`. The
-    /// scalar is read from the polled `mod_scalars` plane at the source's slot
+    /// docs/plan_modulation.md §9: one inspector row per `ModSource`. `scalar`
+    /// is the live follower value read from `mod_scalars` at the source's slot
     /// (= position in `Song::mod_sources`).
-    #[allow(clippy::type_complexity)]
-    pub fn mod_source_display(&self) -> Vec<(u32, String, f32, bool)> {
+    pub fn mod_source_display(&self) -> Vec<ModSourceRow> {
+        // docs/plan_modulation_routing_redesign.md §6: 帰属トラック (= カーソル
+        // トラック) のソースだけ列挙する。`enumerate()` の index はグローバル位置の
+        // ままなので `mod_scalars` lookup は正しい (follower plane はグローバル順)。
+        let owner = self.cursor_track_id();
         self.song
             .mod_sources
             .iter()
             .enumerate()
-            .map(|(i, m)| {
-                let name = self
-                    .song
-                    .track_by_id(m.tap.source_track)
-                    .map(|t| t.name.clone())
-                    .unwrap_or_else(|| format!("track {}", m.tap.source_track));
-                let post_fader = matches!(m.tap.tap_point, common::model::TapPoint::PostFader);
-                (
-                    m.id,
-                    name,
-                    self.mod_scalars.get(i).copied().unwrap_or(0.0),
-                    post_fader,
-                )
+            .filter(|(_, m)| Some(m.owner_track_id) == owner)
+            .map(|(i, m)| ModSourceRow {
+                id: m.id,
+                source_track: m.tap.source_track,
+                scalar: self.mod_scalars.get(i).copied().unwrap_or(0.0),
+                post_fader: matches!(m.tap.tap_point, common::model::TapPoint::PostFader),
+                attack_ms: m.follower.attack_ms,
+                release_ms: m.follower.release_ms,
             })
             .collect()
     }
 
-    /// docs/plan_modulation.md §9: the cursor track's automation lanes that can
-    /// host modulation — `(track_id, lane_id, target label, routings)` where
-    /// each routing is `(source_id, depth, is_bipolar)`. MASTER cursor →
-    /// `song_lanes`. Owned so inspector `Edit::mutate` closures can capture it.
-    #[allow(clippy::type_complexity)]
-    pub fn cursor_mod_lanes(&self) -> Vec<(u32, u32, String, Vec<(u32, f32, bool)>)> {
-        let (track_id, lanes) = if self.cursor_track_id()
-            == Some(common::model::MASTER_TRACK_ID)
-        {
-            (common::model::MASTER_TRACK_ID, &self.song.song_lanes)
-        } else {
-            match self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) {
-                Some(t) => (t.id, &t.automation_lanes),
-                None => return Vec::new(),
-            }
-        };
-        lanes
+    /// docs/plan_modulation.md §9: track choices for a `ModSource`'s source
+    /// dropdown — `(track_id, name)` for every track (a source may tap any
+    /// track, including itself: the follower is control-rate, not a feedback
+    /// loop).
+    pub fn mod_source_track_choices(&self) -> Vec<(u32, String)> {
+        self.song
+            .tracks
             .iter()
-            .map(|l| {
-                let routings = l
-                    .mod_routings
-                    .iter()
-                    .map(|r| {
-                        (
-                            r.source_id,
-                            r.depth,
-                            matches!(r.polarity, common::model::Polarity::Bipolar),
-                        )
-                    })
-                    .collect();
-                (
-                    track_id,
-                    l.id,
-                    automation_target_display_name(&l.target),
-                    routings,
-                )
-            })
+            .map(|t| (t.id, t.name.clone()))
             .collect()
+    }
+
+    /// docs/plan_modulation_routing_redesign.md §6: the cursor track's
+    /// **lane 非依存** modulation routings grouped by target —
+    /// `(track_id, target, target label, routings)` where each routing is
+    /// `(source_id, depth, is_bipolar)`. MASTER cursor → `song_mod_routings`.
+    /// Owned so inspector `Edit::mutate` closures can capture it.
+    #[allow(clippy::type_complexity)]
+    pub fn cursor_mod_routings(
+        &self,
+    ) -> Vec<(u32, common::model::AutomationTarget, String, Vec<(u32, f32, bool)>)> {
+        let (track_id, routings) =
+            if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+                (common::model::MASTER_TRACK_ID, &self.song.song_mod_routings)
+            } else {
+                match self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) {
+                    Some(t) => (t.id, &t.mod_routings),
+                    None => return Vec::new(),
+                }
+            };
+        // Group routings by target, preserving first-seen order.
+        let mut out: Vec<(u32, common::model::AutomationTarget, String, Vec<(u32, f32, bool)>)> =
+            Vec::new();
+        for r in routings {
+            let entry = (
+                r.source_id,
+                r.depth,
+                matches!(r.polarity, common::model::Polarity::Bipolar),
+            );
+            if let Some(group) = out.iter_mut().find(|(_, t, _, _)| *t == r.target) {
+                group.3.push(entry);
+            } else {
+                out.push((
+                    track_id,
+                    r.target.clone(),
+                    automation_target_display_name(&r.target),
+                    vec![entry],
+                ));
+            }
+        }
+        out
+    }
+
+    /// docs/plan_modulation_routing_redesign.md §6: a stable display color for a
+    /// `ModSource` (Bitwig 流の per-source 色)。source の `mod_sources` 内位置から
+    /// 固定パレットを引く (id でなく位置 = 追加順に色が回る)。
+    pub fn mod_source_color(&self, source_id: u32) -> [f32; 3] {
+        const PALETTE: [[f32; 3]; 8] = [
+            [0.30, 0.69, 0.96], // blue
+            [0.95, 0.61, 0.24], // orange
+            [0.46, 0.82, 0.40], // green
+            [0.85, 0.40, 0.78], // magenta
+            [0.95, 0.85, 0.30], // yellow
+            [0.40, 0.80, 0.80], // teal
+            [0.90, 0.42, 0.42], // red
+            [0.66, 0.55, 0.92], // purple
+        ];
+        let idx = self
+            .song
+            .mod_sources
+            .iter()
+            .position(|m| m.id == source_id)
+            .unwrap_or(0);
+        PALETTE[idx % PALETTE.len()]
+    }
+
+    /// docs/plan_modulation_routing_redesign.md §6: per-control modulation data
+    /// for `target` at base value `base_plain`, used by the inspector to build
+    /// the gui_01 `Modulation` widget arg. Resolves the cursor track's routings
+    /// (`MASTER_TRACK_ID` → song-level), the live modulated value, and — when a
+    /// source is **armed** — the depth-edit context.
+    ///
+    /// All depths are in the control's *plain* value domain (`norm_depth · span`
+    /// where `span = norm_to_plain(target,1) − norm_to_plain(target,0)`), matching
+    /// the widget's `range` domain. The model stores normalized depth, so the UI
+    /// converts back with `plain / span` on edit.
+    pub fn inspector_mod_data(
+        &self,
+        target: &common::model::AutomationTarget,
+        base_plain: f64,
+    ) -> InspectorModData {
+        let (track_id, routings): (u32, &[common::model::ModRouting]) =
+            if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+                (common::model::MASTER_TRACK_ID, &self.song.song_mod_routings)
+            } else {
+                match self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) {
+                    Some(t) => (t.id, &t.mod_routings),
+                    None => return InspectorModData::default(),
+                }
+            };
+        let span = common::automation::norm_to_plain(target, 1.0)
+            - common::automation::norm_to_plain(target, 0.0);
+        let mut entries: Vec<([f32; 3], f64)> = Vec::new();
+        let mut armed: Option<([f32; 3], f64, u32)> = None;
+        for r in routings.iter().filter(|r| &r.target == target) {
+            let color = self.mod_source_color(r.source_id);
+            let plain_depth = f64::from(r.depth) * span;
+            entries.push((color, plain_depth));
+            if Some(r.source_id) == self.armed_mod_source {
+                armed = Some((color, plain_depth, r.source_id));
+            }
+        }
+        // Armed source with no routing yet on this target → editable from depth 0
+        // (first drag creates the routing).
+        if armed.is_none()
+            && let Some(sid) = self.armed_mod_source
+        {
+            armed = Some((self.mod_source_color(sid), 0.0, sid));
+        }
+        let live_plain = common::automation::apply_modulation_with_scalars(
+            &self.song,
+            target,
+            base_plain,
+            routings,
+            &self.mod_scalars,
+        );
+        InspectorModData { entries, live_plain, armed, track_id, span }
+    }
+
+    /// docs/plan_modulation_routing_redesign.md §6: the cursor track's
+    /// modulatable param targets (for the rack's add-routing picker). Track
+    /// builtins always; group transform when the track is a group / has a
+    /// transform; plugin params per device; image / text builtins when the
+    /// track owns such clips. MASTER cursor → song-wide tempo.
+    pub fn cursor_modulatable_targets(&self) -> Vec<common::model::AutomationTarget> {
+        use common::model::{
+            AutomationTarget as AT, GroupTransformParam as GP, ImageBuiltinParam as IB,
+            TextBuiltinParam as TX, TrackBuiltinParam as TB,
+        };
+        let mut out: Vec<AT> = Vec::new();
+        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+            out.push(AT::SongTempo);
+            return out;
+        }
+        let Some(track) = self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) else {
+            return out;
+        };
+        out.push(AT::TrackBuiltin(TB::Volume));
+        out.push(AT::TrackBuiltin(TB::Pan));
+        if track.group_transform.is_some() || self.is_group_track(track.id) {
+            for p in [
+                GP::X, GP::Y, GP::ScaleX, GP::ScaleY, GP::Rotation, GP::Opacity, GP::AnchorX,
+                GP::AnchorY,
+            ] {
+                out.push(AT::GroupTransform(p));
+            }
+        }
+        for (di, _dev) in track.devices.iter().enumerate() {
+            if let Some(params) = self.plugin_params.get(&(track.id, di as u32)) {
+                for p in params {
+                    out.push(AT::PluginParam {
+                        device_index: di as u32,
+                        param_id: p.id,
+                        legacy_slot: None,
+                    });
+                }
+            }
+        }
+        let has_image = track.clips.iter().any(|c| {
+            self.song
+                .clip_contents
+                .get(&c.content_id)
+                .is_some_and(|cc| cc.image_events().is_some())
+        });
+        if has_image {
+            for p in [IB::X, IB::Y, IB::W, IB::H, IB::Opacity, IB::Rotation] {
+                out.push(AT::ImageBuiltin(p));
+            }
+        }
+        let has_text = track.clips.iter().any(|c| {
+            self.song
+                .clip_contents
+                .get(&c.content_id)
+                .is_some_and(|cc| cc.text_events().is_some())
+        });
+        if has_text {
+            for p in [TX::X, TX::Y, TX::Opacity, TX::Rotation, TX::FontSize] {
+                out.push(AT::TextBuiltin(p));
+            }
+        }
+        out
     }
 
     pub fn sidechain_source_choices(&self) -> Vec<SidechainSourceChoice> {
@@ -3798,37 +3998,54 @@ pub enum AppEvent {
     AddModSource { source_track: u32 },
     /// remove the `ModSource` with id `id` and every `ModRouting` referencing it.
     RemoveModSource { id: u32 },
-    /// add a follower modulation `ModRouting` on lane `(track_id, lane_id)`
-    /// (`track_id == MASTER_TRACK_ID` → `song_lanes`) driven by `ModSource`
-    /// `source_id`. No-op if the lane already routes that source.
+    /// **lane 非依存** (`docs/plan_modulation_routing_redesign.md` §5): add a
+    /// `ModRouting` on track `track_id` (`MASTER_TRACK_ID` → `song_mod_routings`)
+    /// targeting `target`, driven by `ModSource` `source_id`. No-op if a routing
+    /// for the same `(target, source_id)` already exists.
     AddModRouting {
         track_id: u32,
-        lane_id: u32,
+        target: common::model::AutomationTarget,
         source_id: u32,
     },
     RemoveModRouting {
         track_id: u32,
-        lane_id: u32,
+        target: common::model::AutomationTarget,
         source_id: u32,
     },
     /// set a routing's modulation depth (normalized-domain amount, clamped
     /// to `-1..=1`).
     SetModRoutingDepth {
         track_id: u32,
-        lane_id: u32,
+        target: common::model::AutomationTarget,
         source_id: u32,
         depth: f32,
     },
     /// toggle a routing's polarity (`true` = Bipolar, `false` = Unipolar).
     SetModRoutingPolarity {
         track_id: u32,
-        lane_id: u32,
+        target: common::model::AutomationTarget,
         source_id: u32,
         bipolar: bool,
     },
+    /// docs/plan_modulation.md §9: change which track a `ModSource` follows.
+    SetModSourceTrack { id: u32, source_track: u32 },
+    /// docs/plan_modulation.md §3: envelope follower attack / release (ms).
+    /// During a scrub drag these only mark dirty (no per-frame recompile); the
+    /// engine recompiles the baked coefficients once on drag-end (see
+    /// `SetModFollowerScrubbing`).
+    SetModSourceAttack { id: u32, ms: f32 },
+    SetModSourceRelease { id: u32, ms: f32 },
+    /// docs/plan_modulation.md §3: follower attack/release scrub drag edge.
+    /// `false` after `true` = drag-end → recompile follower coefficients once
+    /// (`sync_song_to_plugin_host`). Avoids a per-frame LoadSong storm.
+    SetModFollowerScrubbing(bool),
     /// docs/plan_modulation.md §6: flip a `ModSource`'s tap point
     /// (`true` = PostFader, `false` = PostFx / pre-fader).
     SetModSourceTapPoint { id: u32, post_fader: bool },
+    /// docs/plan_modulation_routing_redesign.md §6: arm / disarm a `ModSource`
+    /// for per-control depth assignment (Bitwig 流). `Some(id)` arms; `None`
+    /// disarms. While armed, inspector param controls enter depth-drag edit mode.
+    SetArmedModSource(Option<u32>),
     /// flip an aux-input route's tap point (sidechain plugin input).
     SetAuxInputTapPoint {
         track_id: u32,
@@ -5273,29 +5490,36 @@ impl AppData {
             AppEvent::RemoveModSource { id } => self.remove_mod_source(id),
             AppEvent::AddModRouting {
                 track_id,
-                lane_id,
+                target,
                 source_id,
-            } => self.add_mod_routing(track_id, lane_id, source_id),
+            } => self.add_mod_routing(track_id, target, source_id),
             AppEvent::RemoveModRouting {
                 track_id,
-                lane_id,
+                target,
                 source_id,
-            } => self.remove_mod_routing(track_id, lane_id, source_id),
+            } => self.remove_mod_routing(track_id, target, source_id),
             AppEvent::SetModRoutingDepth {
                 track_id,
-                lane_id,
+                target,
                 source_id,
                 depth,
-            } => self.set_mod_routing_depth(track_id, lane_id, source_id, depth),
+            } => self.set_mod_routing_depth(track_id, target, source_id, depth),
             AppEvent::SetModRoutingPolarity {
                 track_id,
-                lane_id,
+                target,
                 source_id,
                 bipolar,
-            } => self.set_mod_routing_polarity(track_id, lane_id, source_id, bipolar),
+            } => self.set_mod_routing_polarity(track_id, target, source_id, bipolar),
+            AppEvent::SetModSourceTrack { id, source_track } => {
+                self.set_mod_source_track(id, source_track)
+            }
+            AppEvent::SetModSourceAttack { id, ms } => self.set_mod_source_attack(id, ms),
+            AppEvent::SetModSourceRelease { id, ms } => self.set_mod_source_release(id, ms),
+            AppEvent::SetModFollowerScrubbing(active) => self.set_mod_follower_scrubbing(active),
             AppEvent::SetModSourceTapPoint { id, post_fader } => {
                 self.set_mod_source_tap_point(id, post_fader)
             }
+            AppEvent::SetArmedModSource(id) => self.armed_mod_source = id,
             AppEvent::SetAuxInputTapPoint {
                 track_id,
                 device_index,
@@ -9839,7 +10063,6 @@ impl AppData {
             height_px: 60,
             clips: Vec::new(),
             next_clip_id: 1,
-            mod_routings: Vec::new(),
         };
         track.automation_lanes.push(new_lane);
         self.expanded_automation_tracks.insert(track_id);
@@ -10095,7 +10318,6 @@ impl AppData {
             height_px: 60,
             clips: Vec::new(),
             next_clip_id: 1,
-            mod_routings: Vec::new(),
         });
         self.expanded_automation_tracks.insert(track_id);
         self.status_message = format!(
@@ -10263,7 +10485,6 @@ impl AppData {
             height_px: 60,
             clips: Vec::new(),
             next_clip_id: 1,
-            mod_routings: Vec::new(),
         });
         self.expanded_automation_tracks.insert(track_id);
         self.status_message = format!(
@@ -10454,7 +10675,6 @@ impl AppData {
                 height_px: 60,
                 clips: Vec::new(),
                 next_clip_id: 1,
-                mod_routings: Vec::new(),
             };
             self.song.song_lanes.push(new_lane);
             self.master_row_automation_expanded = true;
@@ -10472,7 +10692,6 @@ impl AppData {
                 height_px: 60,
                 clips: Vec::new(),
                 next_clip_id: 1,
-                mod_routings: Vec::new(),
             };
             track.automation_lanes.push(new_lane);
             self.expanded_automation_tracks.insert(touched.track_id);
@@ -15164,8 +15383,13 @@ impl AppData {
 
     fn add_mod_source(&mut self, source_track: u32) {
         let id = self.song.alloc_mod_source_id();
+        // 帰属トラック = カーソルトラック (= このラックを開いているトラック)。以後
+        // inspector ではこのトラックの下にだけ列挙される。follow 先 (tap.source_track)
+        // は初期 = カーソルで、ドロップダウンで別トラックへ変更できる。
+        let owner_track_id = self.cursor_track_id().unwrap_or(source_track);
         self.song.mod_sources.push(common::model::ModSource {
             id,
+            owner_track_id,
             tap: common::model::AudioTap::post_fader(source_track),
             follower: common::model::FollowerConfig::default(),
         });
@@ -15175,56 +15399,80 @@ impl AppData {
     fn remove_mod_source(&mut self, id: u32) {
         self.song.mod_sources.retain(|m| m.id != id);
         // この source を指す全 routing を掃除 (dangling は scalar 0 になるが、
-        // 残すと UI に幽霊 routing が出るので明示削除)。
+        // 残すと UI に幽霊 routing が出るので明示削除)。lane 非依存なので
+        // Track.mod_routings / Song.song_mod_routings を走査する。
         for t in &mut self.song.tracks {
-            for l in &mut t.automation_lanes {
-                l.mod_routings.retain(|r| r.source_id != id);
-            }
+            t.mod_routings.retain(|r| r.source_id != id);
         }
-        for l in &mut self.song.song_lanes {
-            l.mod_routings.retain(|r| r.source_id != id);
-        }
+        self.song.song_mod_routings.retain(|r| r.source_id != id);
         self.sync_song_to_plugin_host();
     }
 
-    /// Resolve `(track_id, lane_id)` to a mutable `AutomationLane`
-    /// (`MASTER_TRACK_ID` → `song_lanes`).
-    fn mod_lane_mut(
+    /// Resolve `track_id` to its mutable `mod_routings` Vec
+    /// (`MASTER_TRACK_ID` → `Song.song_mod_routings`,
+    /// `docs/plan_modulation_routing_redesign.md` §2).
+    fn mod_routings_mut(
         &mut self,
         track_id: u32,
-        lane_id: u32,
-    ) -> Option<&mut common::model::AutomationLane> {
-        let lanes = if track_id == common::model::MASTER_TRACK_ID {
-            &mut self.song.song_lanes
+    ) -> Option<&mut Vec<common::model::ModRouting>> {
+        if track_id == common::model::MASTER_TRACK_ID {
+            Some(&mut self.song.song_mod_routings)
         } else {
-            &mut self.song.track_by_id_mut(track_id)?.automation_lanes
-        };
-        lanes.iter_mut().find(|l| l.id == lane_id)
+            Some(&mut self.song.track_by_id_mut(track_id)?.mod_routings)
+        }
     }
 
-    fn add_mod_routing(&mut self, track_id: u32, lane_id: u32, source_id: u32) {
-        if let Some(lane) = self.mod_lane_mut(track_id, lane_id)
-            && !lane.mod_routings.iter().any(|r| r.source_id == source_id)
+    fn add_mod_routing(
+        &mut self,
+        track_id: u32,
+        target: common::model::AutomationTarget,
+        source_id: u32,
+    ) {
+        let added = if let Some(routings) = self.mod_routings_mut(track_id)
+            && !routings
+                .iter()
+                .any(|r| r.source_id == source_id && r.target == target)
         {
-            lane.mod_routings.push(common::model::ModRouting {
+            routings.push(common::model::ModRouting {
+                target,
                 source_id,
                 depth: 1.0,
                 polarity: common::model::Polarity::Unipolar,
             });
+            true
+        } else {
+            false
+        };
+        // 実際に追加したときだけ recompile (per-control depth ドラッグは毎フレーム
+        // AddModRouting を呼ぶので、no-op add で sync すると LoadSong 連発になる)。
+        if added {
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    fn remove_mod_routing(
+        &mut self,
+        track_id: u32,
+        target: common::model::AutomationTarget,
+        source_id: u32,
+    ) {
+        if let Some(routings) = self.mod_routings_mut(track_id) {
+            routings.retain(|r| !(r.source_id == source_id && r.target == target));
         }
         self.sync_song_to_plugin_host();
     }
 
-    fn remove_mod_routing(&mut self, track_id: u32, lane_id: u32, source_id: u32) {
-        if let Some(lane) = self.mod_lane_mut(track_id, lane_id) {
-            lane.mod_routings.retain(|r| r.source_id != source_id);
-        }
-        self.sync_song_to_plugin_host();
-    }
-
-    fn set_mod_routing_depth(&mut self, track_id: u32, lane_id: u32, source_id: u32, depth: f32) {
-        if let Some(lane) = self.mod_lane_mut(track_id, lane_id)
-            && let Some(r) = lane.mod_routings.iter_mut().find(|r| r.source_id == source_id)
+    fn set_mod_routing_depth(
+        &mut self,
+        track_id: u32,
+        target: common::model::AutomationTarget,
+        source_id: u32,
+        depth: f32,
+    ) {
+        if let Some(routings) = self.mod_routings_mut(track_id)
+            && let Some(r) = routings
+                .iter_mut()
+                .find(|r| r.source_id == source_id && r.target == target)
         {
             r.depth = depth.clamp(-1.0, 1.0);
         }
@@ -15236,12 +15484,14 @@ impl AppData {
     fn set_mod_routing_polarity(
         &mut self,
         track_id: u32,
-        lane_id: u32,
+        target: common::model::AutomationTarget,
         source_id: u32,
         bipolar: bool,
     ) {
-        if let Some(lane) = self.mod_lane_mut(track_id, lane_id)
-            && let Some(r) = lane.mod_routings.iter_mut().find(|r| r.source_id == source_id)
+        if let Some(routings) = self.mod_routings_mut(track_id)
+            && let Some(r) = routings
+                .iter_mut()
+                .find(|r| r.source_id == source_id && r.target == target)
         {
             r.polarity = if bipolar {
                 common::model::Polarity::Bipolar
@@ -15250,6 +15500,39 @@ impl AppData {
             };
         }
         self.sync_song_to_plugin_host();
+    }
+
+    fn set_mod_source_track(&mut self, id: u32, source_track: u32) {
+        if let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) {
+            m.tap.source_track = source_track;
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    fn set_mod_source_attack(&mut self, id: u32, ms: f32) {
+        if let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) {
+            m.follower.attack_ms = ms.max(0.0);
+        }
+        // 係数は recompile 時に bake される。 scrub ドラッグ中の per-frame
+        // LoadSong を避けるため dirty マークのみ。 drag-end に sync する
+        // (track_inspector の mod_follower_scrub_active エッジ検出)。
+        self.is_dirty = true;
+    }
+
+    fn set_mod_source_release(&mut self, id: u32, ms: f32) {
+        if let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) {
+            m.follower.release_ms = ms.max(0.0);
+        }
+        self.is_dirty = true;
+    }
+
+    fn set_mod_follower_scrubbing(&mut self, active: bool) {
+        // Drag-end edge (was scrubbing, now not) → recompile the baked follower
+        // coefficients once with the final attack/release values.
+        if self.mod_follower_scrub_active && !active {
+            self.sync_song_to_plugin_host();
+        }
+        self.mod_follower_scrub_active = active;
     }
 
     fn set_mod_source_tap_point(&mut self, id: u32, post_fader: bool) {

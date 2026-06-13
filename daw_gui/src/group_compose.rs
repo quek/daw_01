@@ -54,21 +54,34 @@ pub fn group_active_transform(
         .automation_lanes
         .iter()
         .any(|l| matches!(l.target, AutomationTarget::GroupTransform(_)));
-    if group_track.group_transform.is_none() && !has_lane {
+    // docs/plan_modulation_routing_redesign.md §3.1: GroupTransform param を
+    // 変調する routing があれば lane / group_transform が無くても transform を
+    // アクティブにする (lane-free モジュレーション)。
+    let has_mod = group_track
+        .mod_routings
+        .iter()
+        .any(|r| matches!(r.target, AutomationTarget::GroupTransform(_)));
+    if group_track.group_transform.is_none() && !has_lane && !has_mod {
         return None;
     }
     let mut t = group_track.group_transform.unwrap_or_default();
     let resolve = |param: GroupTransformParam, fallback: f32| -> f32 {
-        let Some(lane) = group_track.automation_lanes.iter().find(
+        let target = AutomationTarget::GroupTransform(param);
+        // base = lane があれば lane 値 (plain)、無ければ group_transform の値。
+        // そこに当該 GroupTransform 変調を正規化領域で合成 (lane 無しでも)。
+        let base = match group_track.automation_lanes.iter().find(
             |l| matches!(l.target, AutomationTarget::GroupTransform(p) if p == param),
-        ) else {
-            return fallback;
+        ) {
+            Some(lane) => common::automation::lane_value_at(lane, &song.clip_contents, song_beat),
+            None => f64::from(fallback),
         };
-        // lane 値は plain 単位（automation point / default_value が plain）。
-        // docs/plan_modulation.md §2: base(default+curve) に follower 変調を
-        // 正規化領域で合成。 mod_routings が空なら lane_value_at と同値。
-        common::automation::effective_value_with_scalars(song, lane, song_beat, mod_scalars)
-            as f32
+        common::automation::apply_modulation_with_scalars(
+            song,
+            &target,
+            base,
+            &group_track.mod_routings,
+            mod_scalars,
+        ) as f32
     };
     t.x = resolve(GroupTransformParam::X, t.x);
     t.y = resolve(GroupTransformParam::Y, t.y);

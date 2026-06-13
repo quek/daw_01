@@ -545,7 +545,6 @@ fn inspector_chain_reorder_remaps_automation_lane_slots() {
         height_px: 60,
         clips: Vec::new(),
         next_clip_id: 1,
-        mod_routings: Vec::new(),
     });
 
     // Swap the two FX (delay before bitcrush): order [0,2,1].

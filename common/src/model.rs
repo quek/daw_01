@@ -363,6 +363,12 @@ pub struct Song {
     /// Stable id allocator for `ModSource`。 `0` は "未採番" sentinel、 `1` から採番。
     #[serde(default)]
     pub next_mod_source_id: u32,
+    /// **song-level lane 非依存モジュレーション** (`docs/plan_modulation_routing_redesign.md`
+    /// §2): `SongTempo` / `SongTimeSigNumerator` 等の song-wide param を変調する
+    /// `ModRouting`。track 内 param は `Track.mod_routings`、song-wide はこちら
+    /// (`song_lanes` と同じ「master 固有データは Song 直下」流儀)。空 Vec で変調なし。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub song_mod_routings: Vec<ModRouting>,
 }
 
 fn default_video_resolution() -> (u32, u32) {
@@ -404,6 +410,7 @@ impl Default for Song {
             next_section_id: 1,
             mod_sources: Vec::new(),
             next_mod_source_id: 1,
+            song_mod_routings: Vec::new(),
         }
     }
 }
@@ -2118,6 +2125,13 @@ pub struct Track {
     /// load.
     #[serde(default)]
     pub next_lane_id: u32,
+    /// **lane 非依存モジュレーション** (`docs/plan_modulation_routing_redesign.md`
+    /// §2): この track 内の param (`TrackBuiltin` / `PluginParam` / `ImageBuiltin`
+    /// / `TextBuiltin` / `GroupTransform`) を変調する `ModRouting` の集合。各
+    /// routing の `target` が param を直接指すので automation lane は不要。空 Vec
+    /// で変調なし (旧 file は forward-migrate)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mod_routings: Vec<ModRouting>,
     /// v18 (`docs/plan_track_clip_color.md`): user-facing track color
     /// (RGB, opaque). `None` ⇒ the view layer derives a stable palette
     /// color from `id` (auto-assignment, reorder-stable). `Some(rgb)` ⇒
@@ -2224,6 +2238,7 @@ impl Default for Track {
             reported_latency_samples: 0,
             automation_lanes: Vec::new(),
             next_lane_id: 1,
+            mod_routings: Vec::new(),
             color: None,
             group_transform: None,
             lipsync_target_track: None,
@@ -2520,6 +2535,13 @@ pub struct ModSource {
     /// 安定 id。 `0` は "未採番" sentinel、 `ensure_ids` が採番。
     #[serde(default)]
     pub id: u32,
+    /// `docs/plan_modulation_routing_redesign.md` §6: このソースが**帰属する
+    /// トラック** (Bitwig 流: モジュレーターはトラックに属する)。ソースは `id` で
+    /// グローバル参照され続ける (= 他トラックの param も変調できる) が、inspector
+    /// では帰属トラックの下にだけ列挙する。master 帰属は `MASTER_TRACK_ID`。
+    /// `0` = legacy (どこにも表示しない。未リリース機能なので該当データは無い)。
+    #[serde(default)]
+    pub owner_track_id: u32,
     pub tap: AudioTap,
     #[serde(default)]
     pub follower: FollowerConfig,
@@ -2538,13 +2560,19 @@ pub enum Polarity {
 }
 
 /// Consumer B: param への変調 edge (加算スタック、 plan Q5)。
-/// `AutomationLane.mod_routings` に同居し、 lane の `target` を `source_id` の
-/// フォロワー値で変調する。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+/// **lane 非依存** — `Track.mod_routings` / `Song.song_mod_routings` に置かれ、
+/// `target` が指す param を `source_id` のフォロワー値で変調する
+/// (`docs/plan_modulation_routing_redesign.md` §2)。Bitwig と同じく automation
+/// レーンの有無に関係なく変調できる。base (= 変調前の値) は当該 target に
+/// automation lane があればその値、無ければモデルの現在値 (ノブ / plugin param
+/// 値キャッシュ)。`AutomationTarget` を内包するため `Copy` ではない。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ModRouting {
+    /// 変調先 param。lane と独立に param を直接指す。
+    pub target: AutomationTarget,
     /// → `Song.mod_sources[*].id`。
     pub source_id: u32,
-    /// target の *正規化* 領域での量 (0..=1)。
+    /// target の *正規化* 領域での量 (-1..=1)。
     pub depth: f32,
     #[serde(default)]
     pub polarity: Polarity,
@@ -3825,12 +3853,9 @@ pub struct AutomationLane {
     /// sentinel; valid allocations start at `1`.
     #[serde(default)]
     pub next_clip_id: u32,
-    /// docs/plan_modulation.md §1: この lane の `target` を変調する 0..N の
-    /// フォロワー edge (加算スタック)。 base (`default_value` + curve) に正規化
-    /// 領域で上乗せする (Phase 4 で `effective_norm` が消費)。 旧 file は空 Vec。
-    /// 追加 addressing state ゼロ — 既存 lane の `target` が param を 1:1 に指す。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mod_routings: Vec<ModRouting>,
+    // NOTE: モジュレーション routing は lane を離れ `Track.mod_routings` /
+    // `Song.song_mod_routings` に移動した (`docs/plan_modulation_routing_redesign.md`)。
+    // 旧 file の `mod_routings` キーは serde の unknown-field 無視で読み捨てられる。
 }
 
 fn default_true() -> bool {
@@ -3852,7 +3877,6 @@ impl AutomationLane {
             height_px: default_lane_height_px(),
             clips: Vec::new(),
             next_clip_id: 1,
-            mod_routings: Vec::new(),
         }
     }
 
@@ -4618,6 +4642,7 @@ mod tests {
             next_track_id: 2,
             mod_sources: vec![ModSource {
                 id: 0, // sentinel — assigned by ensure_ids
+                owner_track_id: 0,
                 tap: AudioTap::post_fader(0), // points at Kick's sentinel id
                 follower: FollowerConfig::default(),
             }],

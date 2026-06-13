@@ -5,8 +5,8 @@
 //! - + Instrument / + Effect / + MIDI FX ボタン
 
 use daw_ui_core::{
-    Edit, ReorderableListEditRequest, ReorderableListStyle, ScrubableNumberFormat,
-    ScrubableNumberStyle, ToggleButtonStyle, Ui,
+    Edit, ModEdit, ModEntry, Modulation, ReorderableListEditRequest, ReorderableListStyle,
+    ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::{Color, Rect};
 
@@ -15,7 +15,7 @@ use crate::app::{
     FadeEdgeKind, InspectorScrubField, TextNumField,
 };
 use crate::view::track_color;
-use common::model::{FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
+use common::model::{AutomationTarget, FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
 
 const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
 const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
@@ -96,6 +96,80 @@ fn scrub_field(
     // 持つクリップにだけ適用される)。
     let base = value.unwrap_or(default);
     let placeholder = if value.is_none() { Some("\u{2014}") } else { None };
+
+    // --- per-control modulation (docs/plan_modulation_routing_redesign.md §6) ---
+    // Derive the `AutomationTarget` from `scrub_key` so the image PiP inspector
+    // controls show the Bitwig 風 modulation overlay + depth-drag-when-armed
+    // without threading a target through every caller.
+    //
+    // 制限: per-control の depth ドメインは「コントロールの表示値 == target の正規化
+    // 領域」が成り立つ field に限る。image の X/Y/W/H/Opacity は 0..=1 でこれが成立。
+    // Rotation (度表示↔radians) / text の px・色・回転 / FontSize 等 (identity 正規化の
+    // placeholder) はドメインが食い違うので per-control では出さず、正しい正規化で動く
+    // **ラック** (`cursor_modulatable_targets` + add-dropdown) 経由にする。clip-level
+    // field (gain / pan / pitch / fades) は変調対象でない。
+    let mod_target: Option<AutomationTarget> = match scrub_key {
+        InspectorScrubField::ImageX => Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::X)),
+        InspectorScrubField::ImageY => Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y)),
+        InspectorScrubField::ImageW => Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::W)),
+        InspectorScrubField::ImageH => Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::H)),
+        InspectorScrubField::ImageOpacity => {
+            Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity))
+        }
+        _ => None,
+    };
+    let mod_data = mod_target.as_ref().map(|t| app.inspector_mod_data(t, base));
+    let to_color = |c: [f32; 3]| Color { r: c[0], g: c[1], b: c[2], a: 1.0 };
+    let mod_entries: Vec<ModEntry> = mod_data
+        .as_ref()
+        .map(|d| {
+            d.entries
+                .iter()
+                .map(|(c, depth)| ModEntry { color: to_color(*c), depth: *depth })
+                .collect()
+        })
+        .unwrap_or_default();
+    // edit context (= a source is armed) — Copy tuple so it stays usable below.
+    let edit_ctx: Option<([f32; 3], f64, u32, u32, f64)> =
+        mod_data.as_ref().and_then(|d| d.armed.map(|(c, cur, sid)| (c, cur, sid, d.track_id, d.span)));
+    let target_for_edit = mod_target.clone();
+    let on_mod_change = edit_ctx.map(|(_, _, sid, tid, span)| {
+        move |plain: f64| -> Edit<AppData> {
+            let target = target_for_edit.clone().expect("edit_ctx implies a mod target");
+            Edit::mutate(move |app: &mut AppData| {
+                // widget depth is plain (value domain); model depth is normalized.
+                let norm =
+                    if span.abs() > 1e-9 { (plain / span).clamp(-1.0, 1.0) as f32 } else { 0.0 };
+                // First drag on an unrouted (target, source) creates the routing.
+                app.handle_event(AppEvent::AddModRouting {
+                    track_id: tid,
+                    target: target.clone(),
+                    source_id: sid,
+                });
+                app.handle_event(AppEvent::SetModRoutingDepth {
+                    track_id: tid,
+                    target,
+                    source_id: sid,
+                    depth: norm,
+                });
+            })
+        }
+    });
+    let modulation = mod_data.as_ref().map(|d| Modulation {
+        entries: &mod_entries,
+        live_value: Some(d.live_plain),
+        edit: match (edit_ctx, &on_mod_change) {
+            (Some((c, cur, _, _, _)), Some(f)) => Some(ModEdit {
+                source_color: to_color(c),
+                current_depth: cur,
+                depth_range: None,
+                depth_sensitivity: None,
+                on_mod_change: f,
+            }),
+            _ => None,
+        },
+    });
+
     let resp = ui.scrubable_number_at(
         id,
         rect,
@@ -115,6 +189,7 @@ fn scrub_field(
             })
         },
         placeholder,
+        modulation,
     );
     // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
     let active = resp.dragging || resp.editing_text;
@@ -128,6 +203,17 @@ fn scrub_field(
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.inspector_scrub_active = None;
             app.handle_event(AppEvent::EndInspectorScrub);
+        }));
+    }
+    // modulation depth ドラッグの falling edge で host 再同期 (SetModRoutingDepth は
+    // dirty マークのみ — engine が新 depth を読むには LoadSong が要る)。
+    if resp.mod_dragging != app.mod_depth_scrub_active {
+        let now_dragging = resp.mod_dragging;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            if app.mod_depth_scrub_active && !now_dragging {
+                app.sync_song_to_plugin_host();
+            }
+            app.mod_depth_scrub_active = now_dragging;
         }));
     }
 }
@@ -1086,6 +1172,68 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ui.label_at((param, "group_label"), label, area.x + pad, y + 5.0, 11.0, TEXT);
             let style =
                 ScrubableNumberStyle { sensitivity: sens, range, ..SCRUB_STYLE_GROUP };
+            // per-control modulation (docs/plan_modulation_routing_redesign.md §6):
+            // 立ち絵を音でドラッグ変調する Bitwig 流。0..=1 恒等の param のみ
+            // (X/Y/AnchorX/AnchorY/Opacity)。Rotation(度表示)/Scale(log) は値ドメインが
+            // target 正規化と食い違うので per-control 非対応 (ラック経由)。
+            let g_mod_target: Option<AutomationTarget> = match param {
+                G::X | G::Y | G::AnchorX | G::AnchorY | G::Opacity => {
+                    Some(AutomationTarget::GroupTransform(param))
+                }
+                _ => None,
+            };
+            let g_mod_data = g_mod_target.as_ref().map(|t| app.inspector_mod_data(t, value));
+            let g_color = |c: [f32; 3]| Color { r: c[0], g: c[1], b: c[2], a: 1.0 };
+            let g_entries: Vec<ModEntry> = g_mod_data
+                .as_ref()
+                .map(|d| {
+                    d.entries
+                        .iter()
+                        .map(|(c, depth)| ModEntry { color: g_color(*c), depth: *depth })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let g_edit_ctx: Option<([f32; 3], f64, u32, u32, f64)> = g_mod_data
+                .as_ref()
+                .and_then(|d| d.armed.map(|(c, cur, sid)| (c, cur, sid, d.track_id, d.span)));
+            let g_target_for_edit = g_mod_target.clone();
+            let g_on_mod = g_edit_ctx.map(|(_, _, sid, tid, span)| {
+                move |plain: f64| -> Edit<AppData> {
+                    let target = g_target_for_edit.clone().expect("edit_ctx implies target");
+                    Edit::mutate(move |app: &mut AppData| {
+                        let norm = if span.abs() > 1e-9 {
+                            (plain / span).clamp(-1.0, 1.0) as f32
+                        } else {
+                            0.0
+                        };
+                        app.handle_event(AppEvent::AddModRouting {
+                            track_id: tid,
+                            target: target.clone(),
+                            source_id: sid,
+                        });
+                        app.handle_event(AppEvent::SetModRoutingDepth {
+                            track_id: tid,
+                            target,
+                            source_id: sid,
+                            depth: norm,
+                        });
+                    })
+                }
+            });
+            let g_modulation = g_mod_data.as_ref().map(|d| Modulation {
+                entries: &g_entries,
+                live_value: Some(d.live_plain),
+                edit: match (g_edit_ctx, &g_on_mod) {
+                    (Some((c, cur, _, _, _)), Some(f)) => Some(ModEdit {
+                        source_color: g_color(c),
+                        current_depth: cur,
+                        depth_range: None,
+                        depth_sensitivity: None,
+                        on_mod_change: f,
+                    }),
+                    _ => None,
+                },
+            });
             let resp = ui.scrubable_number_at(
                 (param, "group_scrub"),
                 Rect { x: input_x, y, w: input_w, h: input_h },
@@ -1110,7 +1258,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     })
                 },
                 None,
+                g_modulation,
             );
+            // modulation depth ドラッグの falling edge で host 再同期 (audio target の
+            // depth 反映用。visual group transform は compose が即読みするので視覚は即時)。
+            if resp.mod_dragging != app.mod_depth_scrub_active {
+                let now = resp.mod_dragging;
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    if app.mod_depth_scrub_active && !now {
+                        app.sync_song_to_plugin_host();
+                    }
+                    app.mod_depth_scrub_active = now;
+                }));
+            }
             // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
             let active = resp.dragging || resp.editing_text;
             let was_active = app.group_scrub_active == Some(param);
@@ -1871,20 +2031,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // source / routing lists at 3 visible rows each (overflow off-screen,
     // matching the sidechain section's no-scroll convention).
     let mod_sources = app.mod_source_display();
-    let mod_lanes = app.cursor_mod_lanes();
-    let mod_routing_count: usize = mod_lanes.iter().map(|(_, _, _, rs)| rs.len()).sum();
-    let mod_vis_src = mod_sources.len().min(3);
-    let mod_vis_route = mod_routing_count.min(3);
-    // header+add(26) + src rows(22) + routing rows(22) + add-routing row(24)
-    // (the latter two only when at least one source exists) + 6 pad.
-    let mod_section_h = 18.0
-        + 4.0
-        + 26.0
-        + mod_vis_src as f32 * 22.0
+    let mod_routings = app.cursor_mod_routings();
+    let mod_routing_count: usize = mod_routings.iter().map(|(_, _, _, rs)| rs.len()).sum();
+    // Each source is 2 rows (track/meter/tap/remove, then attack/release).
+    // Cap visible sources at 2 and routings at 2 so the section stays bounded
+    // in the no-scroll inspector.
+    let mod_vis_src = mod_sources.len().min(2);
+    let mod_vis_route = mod_routing_count.min(2);
+    // header+add(22) + src rows(2×22 each) + [routing rows(22) + add row(24) +
+    // gap] when a source exists + 6 pad.
+    let mod_section_h = 22.0
+        + mod_vis_src as f32 * 44.0
         + if mod_sources.is_empty() {
             0.0
         } else {
-            4.0 + mod_vis_route as f32 * 22.0 + 26.0
+            4.0 + mod_vis_route as f32 * 22.0 + 24.0
         }
         + 6.0;
 
@@ -2075,34 +2236,81 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         my += 22.0;
 
-        // Source rows: name + block-char meter (live scalar) + tap toggle
-        // (PoF = PostFader / PrF = pre-fader = PostFx) + remove.
-        for (i, (id, name, scalar, post_fader)) in mod_sources.iter().take(3).enumerate() {
-            let bars = (scalar.clamp(0.0, 1.0) * 8.0).round() as usize;
-            let label = format!("{name}  {}", "\u{25ae}".repeat(bars));
-            ui.label_at(
-                ("inspector_mod_src", i),
-                &label,
-                area.x + pad,
-                my + 4.0,
-                11.0,
-                TEXT,
-            );
+        // Source rows: [source-track dropdown] [live meter] [tap toggle
+        // PoF/PrF] [remove]. The dropdown lets the user pick / change which
+        // track the source follows (any track, including itself).
+        let mod_track_choices = app.mod_source_track_choices();
+        let mod_track_labels: Vec<&str> =
+            mod_track_choices.iter().map(|(_, l)| l.as_str()).collect();
+        let mut any_follower_drag = false;
+        for (i, src) in mod_sources.iter().take(2).enumerate() {
+            let sid = src.id;
+            // --- row 1: [source-track dropdown] [meter] [tap PoF/PrF] [×] ---
             let rm_rect = Rect {
                 x: area.x + area.w - pad - 20.0,
                 y: my,
                 w: 20.0,
                 h: 20.0,
             };
-            let tap_w = 34.0;
+            let tap_w = 30.0;
             let tap_rect = Rect {
                 x: rm_rect.x - 4.0 - tap_w,
                 y: my,
                 w: tap_w,
                 h: 20.0,
             };
-            let sid = *id;
-            let is_post = *post_fader;
+            let meter_w = 50.0;
+            let meter_x = tap_rect.x - 4.0 - meter_w;
+            let filled = ((src.scalar.clamp(0.0, 1.0) * 6.0).round() as usize).min(6);
+            let meter: String = "\u{25ae}".repeat(filled) + &"\u{25af}".repeat(6 - filled);
+            ui.label_at(
+                ("inspector_mod_src_meter", i),
+                &meter,
+                meter_x,
+                my + 4.0,
+                11.0,
+                TEXT,
+            );
+            // arm toggle (Bitwig 流, docs/plan_modulation_routing_redesign.md §6):
+            // クリックでこの source を depth 割当モードへ。armed 中は各 param control
+            // がドラッグで当該 source の depth を編集 (= routing 作成 / 変更) できる。
+            let arm_w = 24.0;
+            let arm_x = meter_x - 4.0 - arm_w;
+            let armed = app.armed_mod_source == Some(sid);
+            ui.button_at(
+                ("inspector_mod_src_arm", i),
+                if armed { "\u{25c9}" } else { "\u{25cb}" },
+                Rect { x: arm_x, y: my, w: arm_w, h: 20.0 },
+                move || {
+                    Edit::mutate(move |app: &mut AppData| {
+                        let next =
+                            if app.armed_mod_source == Some(sid) { None } else { Some(sid) };
+                        app.handle_event(AppEvent::SetArmedModSource(next));
+                    })
+                },
+            );
+            let dd_rect = Rect {
+                x: area.x + pad,
+                y: my,
+                w: (arm_x - 4.0 - (area.x + pad)).max(40.0),
+                h: 20.0,
+            };
+            let sel = mod_track_choices
+                .iter()
+                .position(|(tid, _)| *tid == src.source_track)
+                .unwrap_or(0);
+            if let Some(picked) =
+                ui.dropdown(("inspector_mod_src_track", i), dd_rect, &mod_track_labels, sel)
+                && let Some(&(tid, _)) = mod_track_choices.get(picked)
+            {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetModSourceTrack {
+                        id: sid,
+                        source_track: tid,
+                    });
+                }));
+            }
+            let is_post = src.post_fader;
             ui.button_at(
                 ("inspector_mod_src_tap", i),
                 if is_post { "PoF" } else { "PrF" },
@@ -2122,6 +2330,78 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 })
             });
             my += 22.0;
+
+            // --- row 2: attack / release (ms) scrubs. Per-frame sync would
+            // recompile the whole schedule, so the scrub only marks dirty and
+            // the recompile fires once on drag-end (any_follower_drag edge). ---
+            let lbl_w = 14.0;
+            let half = (area.w - pad * 2.0 - 8.0) / 2.0;
+            ui.label_at(("inspector_mod_a_lbl", i), "A", area.x + pad, my + 4.0, 10.0, TEXT);
+            let a_resp = ui.scrubable_number_at(
+                ("inspector_mod_attack", i),
+                Rect {
+                    x: area.x + pad + lbl_w,
+                    y: my,
+                    w: (half - lbl_w).max(20.0),
+                    h: 20.0,
+                },
+                f64::from(src.attack_ms),
+                1.0,
+                ScrubableNumberFormat::Decimal(1),
+                // attack/release は ms。負値は無意味なので ≥0 にクランプ (range 未設定だと
+                // 下方向ドラッグで負の値が表示されてしまうため)。
+                &ScrubableNumberStyle {
+                    range: Some((0.0, 60_000.0)),
+                    // attack/release は ms。基準 0.004 units/px だと細かすぎるので 10x。
+                    sensitivity: 0.04,
+                    ..SCRUB_STYLE_INSPECTOR
+                },
+                "Inspector",
+                move |v| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetModSourceAttack { id: sid, ms: v as f32 });
+                    })
+                },
+                None,
+                None, // follower attack はモジュレーション対象でない
+            );
+            let r_x = area.x + pad + half + 8.0;
+            ui.label_at(("inspector_mod_r_lbl", i), "R", r_x, my + 4.0, 10.0, TEXT);
+            let r_resp = ui.scrubable_number_at(
+                ("inspector_mod_release", i),
+                Rect {
+                    x: r_x + lbl_w,
+                    y: my,
+                    w: (half - lbl_w).max(20.0),
+                    h: 20.0,
+                },
+                f64::from(src.release_ms),
+                100.0,
+                ScrubableNumberFormat::Decimal(1),
+                &ScrubableNumberStyle {
+                    range: Some((0.0, 60_000.0)),
+                    // attack/release は ms。基準 0.004 units/px だと細かすぎるので 10x。
+                    sensitivity: 0.04,
+                    ..SCRUB_STYLE_INSPECTOR
+                },
+                "Inspector",
+                move |v| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetModSourceRelease { id: sid, ms: v as f32 });
+                    })
+                },
+                None,
+                None, // follower release はモジュレーション対象でない
+            );
+            any_follower_drag |=
+                a_resp.dragging || a_resp.editing_text || r_resp.dragging || r_resp.editing_text;
+            my += 22.0;
+        }
+        // Recompile follower coefficients once on the scrub drag-end edge.
+        if any_follower_drag != app.mod_follower_scrub_active {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetModFollowerScrubbing(any_follower_drag));
+            }));
         }
 
         // Routings only make sense once a source exists.
@@ -2130,19 +2410,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let src_name = |sid: u32| -> String {
                 mod_sources
                     .iter()
-                    .find(|(id, _, _, _)| *id == sid)
-                    .map(|(_, n, _, _)| n.clone())
+                    .find(|r| r.id == sid)
+                    .and_then(|r| app.song.track_by_id(r.source_track))
+                    .map(|t| t.name.clone())
                     .unwrap_or_else(|| format!("src {sid}"))
             };
-            // Existing routings (flat across cursor lanes), capped at 3 rows.
+            // docs/plan_modulation_routing_redesign.md §6: existing lane 非依存
+            // routings grouped by target. depth は polarity/× の隣で編集 (scrubable、
+            // ドラッグ中は handler が dirty のみ)。capped at 3 rows.
             let mut route_i = 0usize;
-            'routes: for (tid, lid, target, routings) in &mod_lanes {
+            'routes: for (tid, target, label, routings) in &mod_routings {
                 for (sid, depth, bipolar) in routings {
                     if route_i >= 3 {
                         break 'routes;
                     }
                     let row_y = my;
-                    let lbl = format!("{target} \u{2190} {}", src_name(*sid));
+                    let lbl = format!("{label} \u{2190} {}", src_name(*sid));
                     ui.label_at(
                         ("inspector_mod_rt_lbl", route_i),
                         &lbl,
@@ -2157,9 +2440,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     let rm_x = area.x + area.w - pad - rm_w;
                     let pol_x = rm_x - 4.0 - pol_w;
                     let depth_x = pol_x - 4.0 - depth_w;
-                    let (t, l, s) = (*tid, *lid, *sid);
-                    // depth scrub (scrubable_number idiom)。 visual-only なので
-                    // ドラッグ中は LoadSong せず dirty マークのみ (handler 側)。
+                    let (t, s) = (*tid, *sid);
+                    let tgt = target.clone();
                     ui.scrubable_number_at(
                         ("inspector_mod_rt_depth", route_i),
                         Rect {
@@ -2174,19 +2456,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         &SCRUB_STYLE_INSPECTOR,
                         "Inspector",
                         move |v| {
+                            let tgt = tgt.clone();
                             Edit::mutate(move |app: &mut AppData| {
                                 app.handle_event(AppEvent::SetModRoutingDepth {
                                     track_id: t,
-                                    lane_id: l,
+                                    target: tgt,
                                     source_id: s,
                                     depth: v as f32,
                                 });
                             })
                         },
                         None,
+                        None, // ラックの depth は数値直編集 (control 側 ring と別経路)
                     );
                     // polarity toggle (± = Bipolar, + = Unipolar)。
                     let bip = *bipolar;
+                    let tgt_pol = target.clone();
                     ui.button_at(
                         ("inspector_mod_rt_pol", route_i),
                         if bip { "\u{00b1}" } else { "+" },
@@ -2197,16 +2482,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                             h: 20.0,
                         },
                         move || {
+                            let tgt_pol = tgt_pol.clone();
                             Edit::mutate(move |app: &mut AppData| {
                                 app.handle_event(AppEvent::SetModRoutingPolarity {
                                     track_id: t,
-                                    lane_id: l,
+                                    target: tgt_pol,
                                     source_id: s,
                                     bipolar: !bip,
                                 });
                             })
                         },
                     );
+                    let tgt_rm = target.clone();
                     ui.button_at(
                         ("inspector_mod_rt_rm", route_i),
                         "\u{00d7}",
@@ -2217,10 +2504,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                             h: 20.0,
                         },
                         move || {
+                            let tgt_rm = tgt_rm.clone();
                             Edit::mutate(move |app: &mut AppData| {
                                 app.handle_event(AppEvent::RemoveModRouting {
                                     track_id: t,
-                                    lane_id: l,
+                                    target: tgt_rm,
                                     source_id: s,
                                 });
                             })
@@ -2230,17 +2518,28 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     route_i += 1;
                 }
             }
-            // Add-routing dropdown: "<lane target> <- <source>" combinations not
-            // yet wired. A single dropdown avoids persistent two-axis UI state.
+            // Add-routing dropdown: "<target> <- <source>" over the cursor track's
+            // modulatable targets × sources, excluding already-routed pairs.
+            let track_id = if app.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+                common::model::MASTER_TRACK_ID
+            } else {
+                app.cursor_track_id().unwrap_or(0)
+            };
             let mut add_labels: Vec<String> = vec!["+ route\u{2026}".into()];
-            let mut add_payload: Vec<(u32, u32, u32)> = vec![(0, 0, 0)];
-            for (tid, lid, target, routings) in &mod_lanes {
-                for (sid, name, _, _) in &mod_sources {
-                    if routings.iter().any(|(rs, _, _)| rs == sid) {
+            let mut add_payload: Vec<(common::model::AutomationTarget, u32)> =
+                vec![(common::model::AutomationTarget::SongTempo, 0)];
+            for target in app.cursor_modulatable_targets() {
+                let routed: &[(u32, f32, bool)] = mod_routings
+                    .iter()
+                    .find(|(_, t, _, _)| *t == target)
+                    .map_or(&[], |(_, _, _, rs)| rs.as_slice());
+                let tlabel = crate::app::automation_target_display_name(&target);
+                for r in &mod_sources {
+                    if routed.iter().any(|(rs, _, _)| *rs == r.id) {
                         continue;
                     }
-                    add_labels.push(format!("{target} \u{2190} {name}"));
-                    add_payload.push((*tid, *lid, *sid));
+                    add_labels.push(format!("{tlabel} \u{2190} {}", src_name(r.id)));
+                    add_payload.push((target.clone(), r.id));
                 }
             }
             if add_labels.len() > 1 {
@@ -2254,12 +2553,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 if let Some(picked) =
                     ui.dropdown("inspector_mod_add_route", dd_rect, &label_refs, 0)
                     && picked > 0
-                    && let Some(&(t, l, s)) = add_payload.get(picked)
+                    && let Some((tgt, s)) = add_payload.get(picked).cloned()
                 {
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::AddModRouting {
-                            track_id: t,
-                            lane_id: l,
+                            track_id,
+                            target: tgt,
                             source_id: s,
                         });
                     }));

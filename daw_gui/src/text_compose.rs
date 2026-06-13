@@ -199,18 +199,36 @@ fn resolve_text_fields(
             lane_index.insert(p, lane);
         }
     }
-    let lane_value = |field: TextBuiltinParam| -> Option<f32> {
-        let lane = *lane_index.get(&field)?;
-        // docs/plan_modulation.md §2: follower 変調を正規化領域で合成。
-        let v =
-            common::automation::effective_value_with_scalars(song, lane, song_beat, mod_scalars);
-        Some(v as f32)
+    // docs/plan_modulation_routing_redesign.md §3.1: base = lane があれば lane 値、
+    // 無ければ event の field 値。そこに `Track.mod_routings` の当該 `TextBuiltin`
+    // 変調を正規化領域で乗せる (lane 無しでも変調)。lane も routing も無ければ
+    // apply_modulation は base を返すので従来挙動 (= 無回帰)。
+    let base_for = |field: TextBuiltinParam, fallback: f32| -> f64 {
+        match lane_index.get(&field) {
+            Some(l) => common::automation::lane_value_at(l, &song.clip_contents, song_beat),
+            None => f64::from(fallback),
+        }
     };
     let resolve_norm = |field: TextBuiltinParam, fallback: f32| -> f32 {
-        lane_value(field).map_or(fallback, |v| v.clamp(0.0, 1.0))
+        let target = AutomationTarget::TextBuiltin(field);
+        (common::automation::apply_modulation_with_scalars(
+            song,
+            &target,
+            base_for(field, fallback),
+            &track.mod_routings,
+            mod_scalars,
+        ) as f32)
+            .clamp(0.0, 1.0)
     };
     let resolve_plain = |field: TextBuiltinParam, fallback: f32| -> f32 {
-        lane_value(field).unwrap_or(fallback)
+        let target = AutomationTarget::TextBuiltin(field);
+        common::automation::apply_modulation_with_scalars(
+            song,
+            &target,
+            base_for(field, fallback),
+            &track.mod_routings,
+            mod_scalars,
+        ) as f32
     };
     ResolvedText {
         x: resolve_norm(TextBuiltinParam::X, event.x),

@@ -15,7 +15,7 @@
 
 use crate::model::{
     AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationTarget,
-    ClipContent, ContentId, Polarity, Song, TrackBuiltinParam,
+    ClipContent, ContentId, ModRouting, Polarity, Song, TrackBuiltinParam,
 };
 use std::collections::HashMap;
 
@@ -269,63 +269,104 @@ pub fn song_lane_value_at(song: &Song, lane: &AutomationLane, song_beat: f64) ->
     lane_value_at(lane, &song.clip_contents, song_beat)
 }
 
-/// docs/plan_modulation.md §2: the **effective plain-units value** of a
-/// target = its base (`default_value` + automation curve) combined with all
-/// `ModRouting` follower modulations. Composition happens in the *normalized*
-/// (`0..=1`) domain so a given `depth` means the same fraction of range across
-/// heterogeneous targets (volume `0..2`, rotation `-π..π`, image x `0..1`):
+/// `docs/plan_modulation_routing_redesign.md` §3: the summed **normalized**
+/// (`0..=1` domain) modulation offset applied to `target` by every `ModRouting`
+/// in `routings` whose `target` matches. **lane 非依存** — `routings` is a
+/// `Track.mod_routings` / `Song.song_mod_routings` slice, not tied to any lane.
 ///
 /// ```text
-/// norm_base = plain_to_norm(target, lane_value_at(lane, beat))
-/// mod_sum   = Σ routings: s = clamp(scalar(source_id), 0..1)
-///             Unipolar => depth*s,  Bipolar => depth*(2s - 1)
-/// norm_eff  = clamp(norm_base + mod_sum, 0..1)
-/// plain_eff = norm_to_plain(target, norm_eff)
+/// offset = Σ routings(target match): s = clamp(scalar(source_id), 0..1)
+///          Unipolar => depth*s,  Bipolar => depth*(2s - 1)
 /// ```
 ///
-/// `scalar` resolves a `ModRouting::source_id` to its latest follower value
-/// (live `AudioBridge::mod_scalars` in preview, baked sidecar in export). With
-/// no `mod_routings` this is exactly `lane_value_at` (no normalize round-trip),
-/// so unmodulated params are bit-for-bit unaffected. Pure / RT-safe.
-pub fn effective_value(
-    lane: &AutomationLane,
-    clip_contents: &HashMap<ContentId, ClipContent>,
-    song_beat: f64,
+/// Composition happens in the normalized domain so a given `depth` means the
+/// same fraction of range across heterogeneous targets (volume `0..2`, rotation
+/// `-π..π`, image x `0..1`). `scalar` resolves a `ModRouting::source_id` to its
+/// latest follower value (live `AudioBridge::mod_scalars` in preview, baked
+/// sidecar in export). Returns `0.0` when no routing matches. Pure / RT-safe.
+pub fn modulation_offset_norm(
+    target: &AutomationTarget,
+    routings: &[ModRouting],
     scalar: impl Fn(u32) -> f32,
-) -> f64 {
-    let base = lane_value_at(lane, clip_contents, song_beat);
-    if lane.mod_routings.is_empty() {
-        return base;
-    }
-    let norm_base = plain_to_norm(&lane.target, base);
-    let mut mod_sum = 0.0f32;
-    for r in &lane.mod_routings {
+) -> f32 {
+    let mut sum = 0.0f32;
+    for r in routings {
+        if &r.target != target {
+            continue;
+        }
         let s = scalar(r.source_id).clamp(0.0, 1.0);
-        mod_sum += match r.polarity {
+        sum += match r.polarity {
             Polarity::Unipolar => r.depth * s,
             Polarity::Bipolar => r.depth * (2.0 * s - 1.0),
         };
     }
-    let norm_eff = (norm_base + mod_sum).clamp(0.0, 1.0);
-    norm_to_plain(&lane.target, norm_eff)
+    sum
 }
 
-/// [`effective_value`] resolving follower scalars from `Song::mod_sources`
-/// (slot = position in the Vec) against a polled `mod_scalars` plane (e.g.
-/// `AppData::mod_scalars`). Dangling / out-of-range sources read as `0`.
-pub fn effective_value_with_scalars(
+/// `docs/plan_modulation_routing_redesign.md` §3.1: the **effective plain-units
+/// value** of a non-plugin `target` = `base` (the model value or automation
+/// curve value) with `modulation_offset_norm` added in the normalized domain:
+///
+/// ```text
+/// norm_eff  = clamp(plain_to_norm(target, base) + offset, 0..1)
+/// plain_eff = norm_to_plain(target, norm_eff)
+/// ```
+///
+/// With no matching routing this returns `base` unchanged (no normalize
+/// round-trip), so unmodulated params are bit-for-bit unaffected. Used for
+/// track-builtin / image / text / group / song targets where the daw owns the
+/// final value. Plugin params instead send `modulation_offset_norm` to the
+/// plugin host (CLAP `param_mod`) — see the plan §3.2. Pure / RT-safe.
+pub fn apply_modulation(
+    target: &AutomationTarget,
+    base: f64,
+    routings: &[ModRouting],
+    scalar: impl Fn(u32) -> f32,
+) -> f64 {
+    let offset = modulation_offset_norm(target, routings, scalar);
+    if offset == 0.0 && !routings.iter().any(|r| &r.target == target) {
+        return base;
+    }
+    let norm_eff = (plain_to_norm(target, base) + offset).clamp(0.0, 1.0);
+    norm_to_plain(target, norm_eff)
+}
+
+/// Resolve a `ModRouting::source_id` to its latest follower scalar from
+/// `Song::mod_sources` (slot = position in the Vec) against a polled
+/// `mod_scalars` plane (e.g. `AppData::mod_scalars`). Dangling / out-of-range
+/// sources read as `0`.
+#[inline]
+pub fn source_scalar(song: &Song, mod_scalars: &[f32], source_id: u32) -> f32 {
+    song.mod_sources
+        .iter()
+        .position(|m| m.id == source_id)
+        .and_then(|i| mod_scalars.get(i))
+        .copied()
+        .unwrap_or(0.0)
+}
+
+/// [`apply_modulation`] resolving follower scalars from `Song::mod_sources`.
+pub fn apply_modulation_with_scalars(
     song: &Song,
-    lane: &AutomationLane,
-    song_beat: f64,
+    target: &AutomationTarget,
+    base: f64,
+    routings: &[ModRouting],
     mod_scalars: &[f32],
 ) -> f64 {
-    effective_value(lane, &song.clip_contents, song_beat, |source_id| {
-        song.mod_sources
-            .iter()
-            .position(|m| m.id == source_id)
-            .and_then(|i| mod_scalars.get(i))
-            .copied()
-            .unwrap_or(0.0)
+    apply_modulation(target, base, routings, |source_id| {
+        source_scalar(song, mod_scalars, source_id)
+    })
+}
+
+/// [`modulation_offset_norm`] resolving follower scalars from `Song::mod_sources`.
+pub fn modulation_offset_norm_with_scalars(
+    song: &Song,
+    target: &AutomationTarget,
+    routings: &[ModRouting],
+    mod_scalars: &[f32],
+) -> f32 {
+    modulation_offset_norm(target, routings, |source_id| {
+        source_scalar(song, mod_scalars, source_id)
     })
 }
 
@@ -1047,36 +1088,41 @@ mod tests {
     }
 
     #[test]
-    fn effective_value_adds_unipolar_modulation() {
-        use crate::model::{
-            AutomationLane, AutomationTarget, ModRouting, Polarity, TrackBuiltinParam,
-        };
-        // docs/plan_modulation.md §2: base (default 1.0, no curve) + a unipolar
-        // routing. scalar 0 → base (byte-identical to lane_value_at); scalar
-        // 1.0 raises the value; with no routings effective == lane_value_at.
-        let mut lane =
-            AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 1.0);
-        let cc = std::collections::HashMap::new();
-        let base = lane_value_at(&lane, &cc, 0.0);
-        assert_eq!(
-            effective_value(&lane, &cc, 0.0, |_| 0.5),
-            base,
-            "no routings → effective == base regardless of scalars"
-        );
-        lane.mod_routings.push(ModRouting {
+    fn apply_modulation_adds_unipolar() {
+        use crate::model::{AutomationTarget, ModRouting, Polarity, TrackBuiltinParam};
+        // docs/plan_modulation_routing_redesign.md §3: base (1.0) + a unipolar
+        // routing keyed by target. No matching routing → base unchanged; scalar
+        // 0 → base; scalar 1.0 raises the value.
+        let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
+        let base = 1.0_f64;
+        // No routings → base regardless of scalars.
+        assert_eq!(apply_modulation(&target, base, &[], |_| 0.5), base);
+        let routings = vec![ModRouting {
+            target: target.clone(),
             source_id: 5,
             depth: 0.5,
             polarity: Polarity::Unipolar,
-        });
+        }];
         assert_eq!(
-            effective_value(&lane, &cc, 0.0, |_| 0.0),
+            apply_modulation(&target, base, &routings, |_| 0.0),
             base,
             "scalar 0 → base (no modulation)"
         );
-        let v_full = effective_value(&lane, &cc, 0.0, |sid| if sid == 5 { 1.0 } else { 0.0 });
+        let v_full =
+            apply_modulation(&target, base, &routings, |sid| if sid == 5 { 1.0 } else { 0.0 });
         assert!(
             v_full > base,
             "unipolar depth 0.5 at scalar 1.0 must raise above base ({base} vs {v_full})"
         );
+        // A routing whose target doesn't match is ignored.
+        let other = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan);
+        assert_eq!(
+            apply_modulation(&other, 0.0, &routings, |_| 1.0),
+            0.0,
+            "non-matching target → base unchanged"
+        );
+        // offset_norm exposes the raw normalized offset.
+        let off = modulation_offset_norm(&target, &routings, |_| 1.0);
+        assert!((off - 0.5).abs() < 1e-6, "unipolar depth 0.5 at s=1 → 0.5, got {off}");
     }
 }
