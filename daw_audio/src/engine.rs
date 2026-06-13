@@ -1388,13 +1388,16 @@ pub fn process_track_owned(
 
     // ---- Pre-fader send tap ----
     // A pre-fader send reads the post-fx, pre-strip signal. Snapshot it
-    // before the strip overwrites `track_l/r` in place. Only copied when
-    // the track actually has a pre-fader send (cheap check; skips the
-    // memcpy otherwise).
-    if song_track
+    // before the strip overwrites `track_l/r` in place. docs/plan_modulation.md
+    // §6: a PostFx aux-input route or mod source also reads this snapshot, so
+    // capture it for those too. Only copied when something actually needs it
+    // (cheap check; skips the memcpy otherwise).
+    let has_prefader_send = song_track
         .sends
         .iter()
-        .any(|s| s.mode == common::model::SendMode::PreFader)
+        .any(|s| s.mode == common::model::SendMode::PreFader);
+    if has_prefader_send
+        || song.is_some_and(|s| track_needs_prefader_snapshot(s, song_track.id))
     {
         scratch.pre_fader_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);
@@ -1549,6 +1552,25 @@ pub fn process_master_fx_chain(
     }
 }
 
+/// docs/plan_modulation.md §6: does any aux-input route or mod source tap
+/// `track_id` at a pre-fader (PostFx / PreFx) point? Such taps read the
+/// track's `pre_fader_l/r` snapshot, so the per-track render must capture it.
+/// Read-only scan, no alloc — RT-safe.
+fn track_needs_prefader_snapshot(song: &Song, track_id: u32) -> bool {
+    let is_prefx = |t: &common::model::AudioTap| {
+        t.source_track == track_id
+            && !matches!(t.tap_point, common::model::TapPoint::PostFader)
+    };
+    let aux_prefx = song
+        .tracks
+        .iter()
+        .flat_map(|tr| tr.devices.iter())
+        .chain(song.master_fx_chain.iter())
+        .flat_map(|p| p.aux_inputs.iter().flatten())
+        .any(|r| is_prefx(&r.tap));
+    aux_prefx || song.mod_sources.iter().any(|m| is_prefx(&m.tap))
+}
+
 /// Replay the post-dispatch portion of the routing schedule:
 /// `Mix { dst: TrackScratch }` (children → group bus), `ProcessGroupFx`
 /// (group's fx_chain + strip), and `Mix { dst: Master }` (top-level
@@ -1672,19 +1694,26 @@ pub fn execute_schedule_post_dispatch(
                 dst_index,
                 aux_in_port,
             } => {
-                // PR4 sidechain: copy source track's scratch L/R into the
-                // destination plugin's `pd.buffer_aux_in[port]` shmem
-                // region, marking the port active so `daw_plugin_host`
-                // forwards it as a CLAP `clap_audio_buffer` / VST3
-                // aux bus on the next `process()`. Source != TrackScratch
-                // (e.g. a future PluginAuxOut output) is ignored — handled
-                // by PR4.4 / PR5.
+                // PR4 sidechain: copy the source track's scratch L/R into the
+                // destination plugin's `pd.buffer_aux_in[port]` shmem region,
+                // marking the port active so `daw_plugin_host` forwards it as a
+                // CLAP `clap_audio_buffer` / VST3 aux bus on the next
+                // `process()`. docs/plan_modulation.md §6: the tap point picks
+                // the buffer — `TrackScratch` = post-fader, `PreFaderScratch` =
+                // post-fx / pre-fader. Other `BufRef`s are ignored (PR4.4/PR5).
                 // RT path: skip silently on any miss (no per-buffer tracing).
-                let BufRef::TrackScratch(src_idx) = *src else {
-                    continue;
+                let (src_idx, pre_fader) = match *src {
+                    BufRef::TrackScratch(i) => (i, false),
+                    BufRef::PreFaderScratch(i) => (i, true),
+                    _ => continue,
                 };
                 let Some(src_scratch) = scratch.get(src_idx as usize) else {
                     continue;
+                };
+                let (src_l, src_r) = if pre_fader {
+                    (&src_scratch.pre_fader_l, &src_scratch.pre_fader_r)
+                } else {
+                    (&src_scratch.track_l, &src_scratch.track_r)
                 };
                 let port = *aux_in_port as usize;
                 if port >= common::process_data::MAX_AUX_IN {
@@ -1700,13 +1729,9 @@ pub fn execute_schedule_post_dispatch(
                     continue;
                 };
                 let pd = plugin_ref.data_mut();
-                let copy_n = n
-                    .min(src_scratch.track_l.len())
-                    .min(src_scratch.track_r.len());
-                pd.buffer_aux_in[port][0][..copy_n]
-                    .copy_from_slice(&src_scratch.track_l[..copy_n]);
-                pd.buffer_aux_in[port][1][..copy_n]
-                    .copy_from_slice(&src_scratch.track_r[..copy_n]);
+                let copy_n = n.min(src_l.len()).min(src_r.len());
+                pd.buffer_aux_in[port][0][..copy_n].copy_from_slice(&src_l[..copy_n]);
+                pd.buffer_aux_in[port][1][..copy_n].copy_from_slice(&src_r[..copy_n]);
                 pd.aux_in_active[port] = 1;
             }
 
@@ -1745,22 +1770,30 @@ pub fn execute_schedule_post_dispatch(
             }
 
             NodeOp::EnvelopeFollow { src, slot } => {
-                // docs/plan_modulation.md §3: advance this source's envelope
-                // follower over its (settled) scratch. The smoothed envelope
-                // lands in `follower_slots[slot].env`; `process_buffer`
-                // publishes it to `AudioBridge::mod_scalars` after this walk.
-                // RT-safe: pure arithmetic, no alloc / lock. Phase 1/2: src is
-                // always PostFader (`TrackScratch`).
-                let BufRef::TrackScratch(src_idx) = *src else {
-                    continue;
+                // docs/plan_modulation.md §3/§6: advance this source's envelope
+                // follower over its (settled) scratch, picking the buffer by
+                // tap point (`TrackScratch` = post-fader, `PreFaderScratch` =
+                // post-fx / pre-fader). The smoothed envelope lands in
+                // `follower_slots[slot].env`; `process_buffer` publishes it to
+                // `AudioBridge::mod_scalars` after this walk. RT-safe: pure
+                // arithmetic, no alloc / lock.
+                let (src_idx, pre_fader) = match *src {
+                    BufRef::TrackScratch(i) => (i, false),
+                    BufRef::PreFaderScratch(i) => (i, true),
+                    _ => continue,
                 };
                 let Some(src_scratch) = scratch.get(src_idx as usize) else {
                     continue;
                 };
+                let (src_l, src_r) = if pre_fader {
+                    (&src_scratch.pre_fader_l, &src_scratch.pre_fader_r)
+                } else {
+                    (&src_scratch.track_l, &src_scratch.track_r)
+                };
                 let Some(fs) = follower_slots.get_mut(*slot as usize) else {
                     continue;
                 };
-                fs.process_block(&src_scratch.track_l, &src_scratch.track_r, n);
+                fs.process_block(src_l, src_r, n);
             }
         }
     }

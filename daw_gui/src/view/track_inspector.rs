@@ -2075,9 +2075,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         my += 22.0;
 
-        // Source rows: name + block-char meter (live scalar) + remove.
-        for (i, (id, name, scalar)) in mod_sources.iter().take(3).enumerate() {
-            let bars = (scalar.clamp(0.0, 1.0) * 12.0).round() as usize;
+        // Source rows: name + block-char meter (live scalar) + tap toggle
+        // (PoF = PostFader / PrF = pre-fader = PostFx) + remove.
+        for (i, (id, name, scalar, post_fader)) in mod_sources.iter().take(3).enumerate() {
+            let bars = (scalar.clamp(0.0, 1.0) * 8.0).round() as usize;
             let label = format!("{name}  {}", "\u{25ae}".repeat(bars));
             ui.label_at(
                 ("inspector_mod_src", i),
@@ -2093,7 +2094,28 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 w: 20.0,
                 h: 20.0,
             };
+            let tap_w = 34.0;
+            let tap_rect = Rect {
+                x: rm_rect.x - 4.0 - tap_w,
+                y: my,
+                w: tap_w,
+                h: 20.0,
+            };
             let sid = *id;
+            let is_post = *post_fader;
+            ui.button_at(
+                ("inspector_mod_src_tap", i),
+                if is_post { "PoF" } else { "PrF" },
+                tap_rect,
+                move || {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetModSourceTapPoint {
+                            id: sid,
+                            post_fader: !is_post,
+                        });
+                    })
+                },
+            );
             ui.button_at(("inspector_mod_src_rm", i), "\u{00d7}", rm_rect, move || {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::RemoveModSource { id: sid });
@@ -2108,8 +2130,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let src_name = |sid: u32| -> String {
                 mod_sources
                     .iter()
-                    .find(|(id, _, _)| *id == sid)
-                    .map(|(_, n, _)| n.clone())
+                    .find(|(id, _, _, _)| *id == sid)
+                    .map(|(_, n, _, _)| n.clone())
                     .unwrap_or_else(|| format!("src {sid}"))
             };
             // Existing routings (flat across cursor lanes), capped at 3 rows.
@@ -2213,7 +2235,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let mut add_labels: Vec<String> = vec!["+ route\u{2026}".into()];
             let mut add_payload: Vec<(u32, u32, u32)> = vec![(0, 0, 0)];
             for (tid, lid, target, routings) in &mod_lanes {
-                for (sid, name, _) in &mod_sources {
+                for (sid, name, _, _) in &mod_sources {
                     if routings.iter().any(|(rs, _, _)| rs == sid) {
                         continue;
                     }

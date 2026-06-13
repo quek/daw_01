@@ -390,11 +390,11 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             &ms.follower,
             common::audio_bridge::SAMPLE_RATE,
         ));
-        // Phase 1/2: tap_point は常に PostFader (= TrackScratch)。 dangling
-        // source は follower node を emit しない (scalar は 0 のまま)。
+        // docs/plan_modulation.md §6: tap_point で source buffer を解決。
+        // dangling source は follower node を emit しない (scalar は 0 のまま)。
         if let Some(&src_idx) = id_to_idx.get(&ms.tap.source_track) {
             nodes_with_pdc.push(NodeOp::EnvelopeFollow {
-                src: BufRef::TrackScratch(src_idx),
+                src: tap_bufref(ms.tap.tap_point, src_idx),
                 slot: slot as u32,
             });
         }
@@ -418,6 +418,21 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
 /// fx); `dst_index` is the device's position in the chain. dangling
 /// references are skipped (no compile error). `ProcessTrack` of the source
 /// runs earlier, so its scratch is settled by the time the tap copies it.
+/// docs/plan_modulation.md §6: resolve a tap point to the source scratch
+/// buffer. `PostFader` = the track's final output (`TrackScratch`); `PostFx`
+/// = after the device chain but before the volume/pan strip
+/// (`PreFaderScratch`, snapshot guarded in the engine). `PreFx` (the raw,
+/// pre-device-chain signal) needs a dedicated snapshot buffer that isn't
+/// built yet, so it falls back to `PostFx`; the UI only offers PostFader /
+/// PostFx until that lands.
+fn tap_bufref(tap_point: common::model::TapPoint, src_idx: u32) -> BufRef {
+    use common::model::TapPoint;
+    match tap_point {
+        TapPoint::PostFader => BufRef::TrackScratch(src_idx),
+        TapPoint::PostFx | TapPoint::PreFx => BufRef::PreFaderScratch(src_idx),
+    }
+}
+
 fn emit_aux_input_taps(
     chain: &[common::model::PluginInstance],
     dst_track: u32,
@@ -437,14 +452,12 @@ fn emit_aux_input_taps(
             let Some(route) = route_opt else {
                 continue;
             };
-            // Phase 1/2: tap_point は常に PostFader (= TrackScratch)。 3 段タップの
-            // BufRef 解決は Phase 6 で導入する (docs/plan_modulation.md §6)。
             let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) else {
                 // dangling reference: silently skip
                 continue;
             };
             nodes.push(NodeOp::SidechainTap {
-                src: BufRef::TrackScratch(src_idx),
+                src: tap_bufref(route.tap.tap_point, src_idx),
                 dst_track,
                 dst_index: u32::try_from(device_index).unwrap_or(u32::MAX),
                 aux_in_port: port_idx as u8,

@@ -2131,10 +2131,11 @@ impl AppData {
     /// Sidechain source picker choices: "—" (None) followed by every
     /// track in the song **except** the cursor track itself.
     /// docs/plan_modulation.md §9: rows for the modulation-source rack —
-    /// `(id, source-track label, live follower scalar)`. The scalar is read
-    /// from the polled `mod_scalars` plane at the source's slot (= position
-    /// in `Song::mod_sources`).
-    pub fn mod_source_display(&self) -> Vec<(u32, String, f32)> {
+    /// `(id, source-track label, live follower scalar, is_post_fader)`. The
+    /// scalar is read from the polled `mod_scalars` plane at the source's slot
+    /// (= position in `Song::mod_sources`).
+    #[allow(clippy::type_complexity)]
+    pub fn mod_source_display(&self) -> Vec<(u32, String, f32, bool)> {
         self.song
             .mod_sources
             .iter()
@@ -2145,7 +2146,13 @@ impl AppData {
                     .track_by_id(m.tap.source_track)
                     .map(|t| t.name.clone())
                     .unwrap_or_else(|| format!("track {}", m.tap.source_track));
-                (m.id, name, self.mod_scalars.get(i).copied().unwrap_or(0.0))
+                let post_fader = matches!(m.tap.tap_point, common::model::TapPoint::PostFader);
+                (
+                    m.id,
+                    name,
+                    self.mod_scalars.get(i).copied().unwrap_or(0.0),
+                    post_fader,
+                )
             })
             .collect()
     }
@@ -3819,6 +3826,16 @@ pub enum AppEvent {
         source_id: u32,
         bipolar: bool,
     },
+    /// docs/plan_modulation.md §6: flip a `ModSource`'s tap point
+    /// (`true` = PostFader, `false` = PostFx / pre-fader).
+    SetModSourceTapPoint { id: u32, post_fader: bool },
+    /// flip an aux-input route's tap point (sidechain plugin input).
+    SetAuxInputTapPoint {
+        track_id: u32,
+        device_index: u32,
+        port: u8,
+        post_fader: bool,
+    },
     /// inspector chain (= `Track.devices` / `master_fx_chain` を一列にした list)
     /// の reorder。`order` は gui_01 契約 `new[i] = items[order[i]]`。単一デバイス
     /// チェーン化で **棄却なしの純 permutation** (役割は位置から再導出)。
@@ -5276,6 +5293,15 @@ impl AppData {
                 source_id,
                 bipolar,
             } => self.set_mod_routing_polarity(track_id, lane_id, source_id, bipolar),
+            AppEvent::SetModSourceTapPoint { id, post_fader } => {
+                self.set_mod_source_tap_point(id, post_fader)
+            }
+            AppEvent::SetAuxInputTapPoint {
+                track_id,
+                device_index,
+                port,
+                post_fader,
+            } => self.set_aux_input_tap_point(track_id, device_index, port, post_fader),
             AppEvent::ReorderInspectorChain(order) => {
                 self.reorder_inspector_chain(&order);
             }
@@ -15221,6 +15247,47 @@ impl AppData {
                 common::model::Polarity::Bipolar
             } else {
                 common::model::Polarity::Unipolar
+            };
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    fn set_mod_source_tap_point(&mut self, id: u32, post_fader: bool) {
+        if let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) {
+            m.tap.tap_point = if post_fader {
+                common::model::TapPoint::PostFader
+            } else {
+                common::model::TapPoint::PostFx
+            };
+        }
+        // tap_point は schedule の BufRef を変えるので recompile が要る。
+        self.sync_song_to_plugin_host();
+    }
+
+    fn set_aux_input_tap_point(
+        &mut self,
+        track_id: u32,
+        device_index: u32,
+        port: u8,
+        post_fader: bool,
+    ) {
+        let inst = if track_id == common::model::MASTER_TRACK_ID {
+            self.song.master_fx_chain.get_mut(device_index as usize)
+        } else {
+            self.song
+                .track_by_id_mut(track_id)
+                .and_then(|t| t.devices.get_mut(device_index as usize))
+        };
+        if let Some(inst) = inst
+            && let Some(route) = inst
+                .aux_inputs
+                .get_mut(port as usize)
+                .and_then(|o| o.as_mut())
+        {
+            route.tap.tap_point = if post_fader {
+                common::model::TapPoint::PostFader
+            } else {
+                common::model::TapPoint::PostFx
             };
         }
         self.sync_song_to_plugin_host();
