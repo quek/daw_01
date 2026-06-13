@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView, Edit, FrameInput,
-    PointerFrame, SectionView, SnapConfig, SnapMode, TrackKind, UiHost,
+    PointerFrame, SectionView, SelectModifier, SnapConfig, SnapMode, TrackKind, UiHost,
 };
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Rect, Scene};
@@ -63,15 +63,37 @@ fn release(x: f32, y: f32, ctrl: bool) -> PointerFrame {
     }
 }
 
+fn press_shift(x: f32, y: f32) -> PointerFrame {
+    PointerFrame {
+        pos: Some((x, y)),
+        primary_just_pressed: true,
+        primary_pressed: true,
+        modifiers: Modifiers { shift: true, ..Modifiers::empty() },
+        ..PointerFrame::default()
+    }
+}
+
+fn release_shift(x: f32, y: f32) -> PointerFrame {
+    PointerFrame {
+        pos: Some((x, y)),
+        primary_just_released: true,
+        modifiers: Modifiers { shift: true, ..Modifiers::empty() },
+        ..PointerFrame::default()
+    }
+}
+
 /// minimal Model: emit された section 系 request を捕まえる。
 #[derive(Default)]
 struct SecModel {
     sections: Vec<SectionView>,
     last: Option<ArrangementEditRequest>,
+    /// M14 Phase 128 (#106): SelectSection を別 capture (短 click は Select + Playhead を併発するため
+    /// `last` だけでは Select を取り逃す)。
+    select: Option<(u32, SelectModifier)>,
 }
 
 fn sec_model(sections: Vec<SectionView>) -> SecModel {
-    SecModel { sections, last: None }
+    SecModel { sections, ..Default::default() }
 }
 
 fn track() -> ArrangementTrack {
@@ -163,9 +185,18 @@ fn sec_frame(host: &mut UiHost<SecModel>, m: &mut SecModel, input: FrameInput) {
                     }
                     _ => None,
                 };
+                // SelectSection は last とは別 field に capture (短 click で Playhead と併発するため)。
+                let select = if let ArrangementEditRequest::SelectSection { id, modifier } = &req {
+                    Some((*id, *modifier))
+                } else {
+                    None
+                };
                 Edit::mutate(move |mm: &mut SecModel| {
                     if let Some(c) = captured {
                         mm.last = Some(c);
+                    }
+                    if let Some(s) = select {
+                        mm.select = Some(s);
                     }
                 })
             },
@@ -175,7 +206,14 @@ fn sec_frame(host: &mut UiHost<SecModel>, m: &mut SecModel, input: FrameInput) {
 
 fn one_section() -> Vec<SectionView> {
     // start=2.0 → x=128、 len=4.0 → x 128..384 (center beat 4.0 = x 256、 right edge x=384)。
-    vec![SectionView { id: 7, name: Arc::from("A"), color: [0.3, 0.4, 0.5], start_beat: 2.0, len_beats: 4.0 }]
+    vec![SectionView {
+        id: 7,
+        name: Arc::from("A"),
+        color: [0.3, 0.4, 0.5],
+        start_beat: 2.0,
+        len_beats: 4.0,
+        selected: false,
+    }]
 }
 
 /// 帯中央 drag (Ctrl なし) → release で `MoveSection` (snap OFF なので raw delta)。
@@ -266,6 +304,65 @@ fn empty_range_drag_emits_create() {
         }
         other => panic!("expected CreateSection, got {other:?}"),
     }
+}
+
+// ===== M14 Phase 128 (daw_01 #106): section 選択 (短 click → SelectSection + SetPlayheadBeat 併発) =====
+
+/// 修飾なし短 click → `SelectSection { Single }` と `SetPlayheadBeat(start)` の **2 件併発**。
+#[test]
+fn section_plain_short_click_selects_single_and_jumps() {
+    let mut host: UiHost<SecModel> = UiHost::no_redraw();
+    let mut m = sec_model(one_section());
+    sec_frame(&mut host, &mut m, frame(press(256.0, 10.0, false)));
+    sec_frame(&mut host, &mut m, frame(release(258.0, 10.0, false)));
+    assert_eq!(m.select, Some((7, SelectModifier::Single)), "Single 選択");
+    match m.last {
+        Some(ArrangementEditRequest::SetPlayheadBeat(b)) => {
+            assert!((b - 2.0).abs() < 1e-3, "ジャンプも併発 (start 2.0): got {b}");
+        }
+        other => panic!("SetPlayheadBeat も併発するはず, got {other:?}"),
+    }
+}
+
+/// Shift+短 click → `SelectSection { RangeFromAnchor }`。
+#[test]
+fn section_shift_short_click_selects_range() {
+    let mut host: UiHost<SecModel> = UiHost::no_redraw();
+    let mut m = sec_model(one_section());
+    sec_frame(&mut host, &mut m, frame(press_shift(256.0, 10.0)));
+    sec_frame(&mut host, &mut m, frame(release_shift(258.0, 10.0)));
+    assert_eq!(m.select, Some((7, SelectModifier::RangeFromAnchor)));
+}
+
+/// Ctrl+短 click (drag でない) → `SelectSection { Toggle }`。 Duplicate ではない (複製は Ctrl+drag のみ)。
+#[test]
+fn section_ctrl_short_click_selects_toggle_not_duplicate() {
+    let mut host: UiHost<SecModel> = UiHost::no_redraw();
+    let mut m = sec_model(one_section());
+    sec_frame(&mut host, &mut m, frame(press(256.0, 10.0, true)));
+    sec_frame(&mut host, &mut m, frame(release(258.0, 10.0, true)));
+    assert_eq!(m.select, Some((7, SelectModifier::Toggle)), "Ctrl+click は Toggle 選択");
+    assert!(
+        !matches!(m.last, Some(ArrangementEditRequest::DuplicateSection { .. })),
+        "Ctrl+短 click は Duplicate しない (複製は Ctrl+drag のみ): got {:?}",
+        m.last
+    );
+}
+
+/// 帯 drag (>= 4px) は `SelectSection` を emit しない (drag = Move/Duplicate、 選択は短 click のみ)。
+#[test]
+fn section_drag_does_not_select() {
+    let mut host: UiHost<SecModel> = UiHost::no_redraw();
+    let mut m = sec_model(one_section());
+    sec_frame(&mut host, &mut m, frame(press(256.0, 10.0, false)));
+    sec_frame(&mut host, &mut m, frame(hold(320.0, 10.0, false)));
+    sec_frame(&mut host, &mut m, frame(release(384.0, 10.0, false)));
+    assert_eq!(m.select, None, "drag では SelectSection を emit しない");
+    assert!(
+        matches!(m.last, Some(ArrangementEditRequest::MoveSection { .. })),
+        "drag は MoveSection: got {:?}",
+        m.last
+    );
 }
 
 fn frame(pointer: PointerFrame) -> FrameInput {

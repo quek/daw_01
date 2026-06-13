@@ -473,6 +473,10 @@ pub struct SectionView {
     pub start_beat: f64,
     /// 長さ拍 (end = `start_beat + len_beats`)。
     pub len_beats: f64,
+    /// M14 Phase 128 (daw_01 #106): 選択状態。 `true` の帯は選択ハイライト (選択 clip と同 idiom =
+    /// 明るい太枠) で描画。 caller が `selected_section_ids` 等の選択集合から per-section に設定する
+    /// (SSoT = caller、 widget は描画に使うだけ)。 `false` で従来描画 (回帰)。
+    pub selected: bool,
 }
 
 /// clip drag の種別 (hit-test 結果)。
@@ -635,6 +639,14 @@ pub enum ArrangementEditRequest {
     // (`view.snap.snap_beat`、 Alt で一時無効) + `0.0` 以上 clamp で emit。 隣接帯への食い込み厳密 clamp /
     // 重複正規化は caller (daw_01 `normalize_sections`) が行う (既存「widget は snap + sanity floor、
     // 実 clamp は caller」 規約どおり)。 ループ化・ジャンプは既存 `SetLoopRange` / `SetPlayheadBeat` を再利用。
+    /// M14 Phase 128 (daw_01 #106): 帯の単 click (短 click、 移動 < 4px) による section 選択変更。
+    /// `track header` click の `SelectTrack` と同 idiom で `modifier` (Single / RangeFromAnchor / Toggle) を
+    /// 載せる (修飾なし = Single、 Shift = RangeFromAnchor、 Ctrl = Toggle で multi-select)。 caller は
+    /// `selected_section_ids` に対して modifier に応じた選択変更を適用する。 **同 short click で
+    /// `SetPlayheadBeat(section.start)` も併発**する (= クリックで「選択 + ジャンプ」、 Studio One / REAPER 流)。
+    /// drag (Move/Resize/Duplicate/Create) では発火しない。 widget 内 anchor は持たず (`SelectTrack` と異なり
+    /// RangeFromAnchor の anchor 解決は caller 側、 section は 1 次元で caller が `id` 順を知っているため)。
+    SelectSection { id: u32, modifier: SelectModifier },
     /// 空き Arranger レーンの dblclick (既定長 1 bar = `time_sig` 由来) または範囲 drag (描いた範囲) による
     /// section 新規作成。 `start` は snap 適用済絶対拍 (`0.0` 以上)、 `len` は `> 0`。 名前・色は caller が
     /// 採番時に付与する (Intro / Aメロ / サビ … 循環) ので emit に含めない。
@@ -2400,6 +2412,10 @@ struct SectionDragSession {
     /// drag 中の最終 ctrl。 `Move + last_ctrl` で `DuplicateSection` に分岐 (clip の `CloneClipsLinked` と
     /// 同じ Ctrl+drag idiom)。 Alt は snap 無効に予約済なので複製には使わない。
     last_ctrl: bool,
+    /// M14 Phase 128 (daw_01 #106): drag 中の最終 shift。 短 click 時の `SelectSection` modifier を
+    /// Shift = `RangeFromAnchor` に分岐するため track。 `last_ctrl` と同じ仕組み (continuation で update、
+    /// release で skip)。
+    last_shift: bool,
 }
 
 // `LoopDragKind` / `LoopDragSession` は M14 Phase 69 (#041) で
@@ -3138,18 +3154,26 @@ fn draw_clip_label<M: ?Sized + 'static>(
     });
 }
 
-/// M14 Phase 127 (#105): section 帯 1 件を描く (色 fill + neutral border + 名前ラベル、 clip ラベルと同
+/// M14 Phase 127 (#105): section 帯 1 件を描く (色 fill + border + 名前ラベル、 clip ラベルと同
 /// 左寄せ + 4px inset + auto-contrast idiom)。 名前が空 / 帯が狭いときはラベルを省く。
+/// M14 Phase 128 (#106): `selected` の帯は選択 clip と同 idiom の明るい太枠 (`clip_selected_border`)、
+/// 非選択は neutral 1px (`clip_border`)。
 fn draw_section_band<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     name: &Arc<str>,
     color_rgb: [f32; 3],
     r: Rect,
+    selected: bool,
     style: &ArrangementStyle,
 ) {
     let fill = Color::rgb(color_rgb[0], color_rgb[1], color_rgb[2]);
     push_filled_rect(hctx, r, fill);
-    push_section_border(hctx, r, style.clip_border);
+    let (border_color, border_w) = if selected {
+        (style.clip_selected_border, style.clip_selected_border_w)
+    } else {
+        (style.clip_border, 1.0)
+    };
+    push_section_border(hctx, r, border_color, border_w);
     if r.w > 8.0 && r.h > style.clip_text_size + 2.0 && !name.is_empty() {
         let text_color = clip_text_color_for(style, fill, style.arranger_lane_bg);
         hctx.push_text(GlyphArea {
@@ -3167,13 +3191,18 @@ fn draw_section_band<M: ?Sized + 'static>(
     }
 }
 
-/// M14 Phase 127 (#105): section 帯 / preview の 1px neutral border。
-fn push_section_border<M: ?Sized + 'static>(hctx: &mut HeavyCtx<'_, '_, M>, r: Rect, border: Color) {
+/// M14 Phase 127 (#105): section 帯 / preview の border (M14 Phase 128 で width 可変化 = selected 太枠)。
+fn push_section_border<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    r: Rect,
+    border: Color,
+    width: f32,
+) {
     hctx.push_rect(RectCommand {
         rect: r,
         fill: Color::TRANSPARENT,
         border,
-        border_width: 1.0,
+        border_width: width,
         radius: [0.0; 4],
         clip_rect: Some(r),
     });
@@ -3262,7 +3291,7 @@ fn draw_sections_lane<M: ?Sized + 'static>(
             let (start, len) =
                 section_preview_start_len(s, section_drag, beat_per_px, snap, zoom_x_px_per_beat);
             let r = section_rect_from(start, len, view, arranger);
-            draw_section_band(hctx, &s.name, s.color, r, style);
+            draw_section_band(hctx, &s.name, s.color, r, s.selected, style);
         }
         let Some(sd) = section_drag else {
             return;
@@ -3275,7 +3304,7 @@ fn draw_sections_lane<M: ?Sized + 'static>(
                 let dest = (sd.anchor_start + delta).max(0.0);
                 let r = section_rect_from(dest, sd.anchor_len, view, arranger);
                 push_filled_rect(hctx, r, style.arranger_preview_fill);
-                push_section_border(hctx, r, style.clip_border);
+                push_section_border(hctx, r, style.clip_border, 1.0);
             }
             // 範囲 drag (Create): まだ存在しない section の preview 帯。
             SectionGesture::Create => {
@@ -3285,7 +3314,7 @@ fn draw_sections_lane<M: ?Sized + 'static>(
                 if hi > lo {
                     let r = section_rect_from(lo, hi - lo, view, arranger);
                     push_filled_rect(hctx, r, style.arranger_preview_fill);
-                    push_section_border(hctx, r, style.clip_border);
+                    push_section_border(hctx, r, style.clip_border, 1.0);
                 }
             }
             _ => {}
@@ -5358,6 +5387,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if !splitter_press && arranger_lane_h > 0.0 && arranger_rect.contains(px, py) {
                 let press_alt = pointer.modifiers.alt;
                 let press_ctrl = pointer.modifiers.ctrl;
+                let press_shift = pointer.modifiers.shift;
                 if let Some((sid, kind)) =
                     section_hit(sections, arranger_rect, view, px, py, style.resize_handle_px)
                     && let Some(s) = sections.iter().find(|s| s.id == sid)
@@ -5379,6 +5409,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         last_mouse: (px, py),
                         last_alt: press_alt,
                         last_ctrl: press_ctrl,
+                        last_shift: press_shift,
                     });
                 } else {
                     // 空きレーン → 範囲 drag による新規作成 session (press 端を snap で grid に着地)。
@@ -5396,6 +5427,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         last_mouse: (px, py),
                         last_alt: press_alt,
                         last_ctrl: press_ctrl,
+                        last_shift: press_shift,
                     });
                 }
             }
@@ -6020,6 +6052,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     sd.last_mouse = (px, py);
                     sd.last_alt = alt_now;
                     sd.last_ctrl = ctrl_now;
+                    sd.last_shift = shift_now;
                 } else if (px - sd.anchor_mouse.0).abs() > f32::EPSILON {
                     sd.last_mouse = (px, py);
                 }
@@ -8536,25 +8569,37 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
                 SectionGesture::Move => {
-                    // 短 click (Ctrl なし、 jitter 未満) は帯ジャンプ (SetPlayheadBeat) に demote。
-                    if !sd.last_ctrl && dist < 4.0 {
+                    if dist < 4.0 {
+                        // M14 Phase 128 (#106): 短 click (jitter 未満) = 選択 + 帯ジャンプを併発。 drag して
+                        // いないので Ctrl は Toggle-select (Duplicate は dist>=4 の Ctrl+drag のみ)。 modifier は
+                        // Shift=RangeFromAnchor / Ctrl=Toggle / 無=Single (`SelectTrack` と同 idiom)。
+                        let modifier = if sd.last_shift {
+                            SelectModifier::RangeFromAnchor
+                        } else if sd.last_ctrl {
+                            SelectModifier::Toggle
+                        } else {
+                            SelectModifier::Single
+                        };
+                        self.push_edit(make_edit(ArrangementEditRequest::SelectSection {
+                            id: sd.section_id,
+                            modifier,
+                        }));
                         self.push_edit(make_edit(ArrangementEditRequest::SetPlayheadBeat(
                             sd.anchor_start.max(0.0),
                         )));
+                    } else if sd.last_ctrl {
+                        let next_start = (sd.anchor_start + delta).max(0.0);
+                        self.push_edit(make_edit(ArrangementEditRequest::DuplicateSection {
+                            id: sd.section_id,
+                            dest_start: next_start,
+                        }));
                     } else {
                         let next_start = (sd.anchor_start + delta).max(0.0);
-                        if sd.last_ctrl {
-                            self.push_edit(make_edit(ArrangementEditRequest::DuplicateSection {
-                                id: sd.section_id,
-                                dest_start: next_start,
-                            }));
-                        } else {
-                            self.push_edit(make_edit(ArrangementEditRequest::MoveSection {
-                                id: sd.section_id,
-                                prev_start: sd.anchor_start,
-                                next_start,
-                            }));
-                        }
+                        self.push_edit(make_edit(ArrangementEditRequest::MoveSection {
+                            id: sd.section_id,
+                            prev_start: sd.anchor_start,
+                            next_start,
+                        }));
                     }
                 }
                 SectionGesture::ResizeLeft => {
@@ -10718,7 +10763,14 @@ mod tests {
     // ===== M14 Phase 127 (daw_01 #105): Arranger レーン (section) tests =====
 
     fn section(id: u32, start: f64, len: f64, name: &str) -> SectionView {
-        SectionView { id, name: Arc::from(name), color: [0.30, 0.45, 0.65], start_beat: start, len_beats: len }
+        SectionView {
+            id,
+            name: Arc::from(name),
+            color: [0.30, 0.45, 0.65],
+            start_beat: start,
+            len_beats: len,
+            selected: false,
+        }
     }
 
     fn snap_quarter() -> SnapConfig {
@@ -10741,6 +10793,7 @@ mod tests {
             last_mouse: last,
             last_alt: false,
             last_ctrl: ctrl,
+            last_shift: false,
         }
     }
 
@@ -10881,6 +10934,28 @@ mod tests {
         assert!(!scene.iter_rects().any(|r| r.fill == fill), "lane 0 では色帯を描かない");
         assert!(!scene.iter_glyphs().any(|g| g.text.as_ref() == "Intro"), "lane 0 では section 名なし");
         assert!(!scene.iter_glyphs().any(|g| g.text.as_ref() == "Arranger"), "lane 0 では見出しなし");
+    }
+
+    /// M14 Phase 128 (daw_01 #106): `selected: true` の帯は明るい太枠 (`clip_selected_border` /
+    /// `clip_selected_border_w`)、 `selected: false` は出ない (= 選択ハイライトの有無を pixel 経路で確認)。
+    #[test]
+    fn selected_section_draws_highlight_border() {
+        let style = ArrangementStyle::default();
+        let sel_border = |scene: &daw_ui_renderer::Scene| {
+            scene.iter_rects().any(|r| {
+                r.border == style.clip_selected_border
+                    && (r.border_width - style.clip_selected_border_w).abs() < 1e-3
+            })
+        };
+        let mut sel = section(1, 0.0, 4.0, "Sel");
+        sel.selected = true;
+        assert!(sel_border(&render_sections_scene(vec![sel], 22.0)), "selected 帯は明るい太枠");
+
+        // 非選択帯は selected 太枠を描かない (= 太枠の出所が選択であることを保証)。
+        assert!(
+            !sel_border(&render_sections_scene(vec![section(2, 0.0, 4.0, "Unsel")], 22.0)),
+            "非選択帯は selected 太枠なし"
+        );
     }
 
     /// id=10, beat 2..6 の clip に share_group hue / in_active_group を載せた test clip。

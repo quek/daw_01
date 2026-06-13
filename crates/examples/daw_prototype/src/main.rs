@@ -321,8 +321,8 @@ impl DawModel {
                 let (n0, c0) = section_palette(0);
                 let (n1, c1) = section_palette(1);
                 vec![
-                    SectionView { id: 0, name: n0, color: c0, start_beat: 0.0, len_beats: 8.0 },
-                    SectionView { id: 1, name: n1, color: c1, start_beat: 8.0, len_beats: 8.0 },
+                    SectionView { id: 0, name: n0, color: c0, start_beat: 0.0, len_beats: 8.0, selected: false },
+                    SectionView { id: 1, name: n1, color: c1, start_beat: 8.0, len_beats: 8.0, selected: false },
                 ]
             },
             arr_next_section_id: 2,
@@ -1593,17 +1593,32 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             // M14 Phase 127 (daw_01 #105): Arranger section 編集 demo。 widget は意図のみ emit するので
             // caller (この demo) が arr_sections を実際に mutate する (start_beat 昇順を保つ)。 本物の
             // 破壊的リフロー (clip 移動 / ripple 等) は daw_01 が担当。
+            // M14 Phase 128 (daw_01 #106): 帯短 click で SelectSection + SetPlayheadBeat が併発する。
+            // demo は単一選択 (clicked のみ selected)、 multi-select (Toggle / Range) は daw_01 が実装。
+            ArrangementEditRequest::SelectSection { id, modifier } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    for s in &mut mm.arr_sections {
+                        s.selected = s.id == id;
+                    }
+                    mm.last_action = format!("arr: SelectSection #{id} ({modifier:?})");
+                })
+            }
             ArrangementEditRequest::CreateSection { start, len } => {
                 Edit::mutate(move |mm: &mut DawModel| {
                     let id = mm.arr_next_section_id;
                     mm.arr_next_section_id += 1;
                     let (name, color) = section_palette(id);
+                    // 新規 section を選択状態にして他を解除 (作成 = 選択、 DAW 慣習)。
+                    for s in &mut mm.arr_sections {
+                        s.selected = false;
+                    }
                     mm.arr_sections.push(SectionView {
                         id,
                         name,
                         color,
                         start_beat: start.max(0.0),
                         len_beats: len.max(0.25),
+                        selected: true,
                     });
                     mm.arr_sections.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
                     mm.last_action = format!("arr: CreateSection #{id} @ {start:.2} len {len:.2}");
@@ -1639,12 +1654,16 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                         let new_id = mm.arr_next_section_id;
                         mm.arr_next_section_id += 1;
                         let (name, _) = section_palette(new_id);
+                        for s in &mut mm.arr_sections {
+                            s.selected = false;
+                        }
                         mm.arr_sections.push(SectionView {
                             id: new_id,
                             name,
                             color,
                             start_beat: dest_start.max(0.0),
                             len_beats: len,
+                            selected: true,
                         });
                         mm.arr_sections.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
                     }

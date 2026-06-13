@@ -59,8 +59,8 @@ fn track(id: u32, name: &str, clips: Vec<ArrangementClip>) -> ArrangementTrack {
     }
 }
 
-fn section(id: u32, name: &str, color: [f32; 3], start: f64, len: f64) -> SectionView {
-    SectionView { id, name: Arc::from(name), color, start_beat: start, len_beats: len }
+fn section(id: u32, name: &str, color: [f32; 3], start: f64, len: f64, selected: bool) -> SectionView {
+    SectionView { id, name: Arc::from(name), color, start_beat: start, len_beats: len, selected }
 }
 
 fn view() -> ArrangementView {
@@ -96,10 +96,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     // 隣接 (Intro|Aメロ) + gap (サビは 1 拍空けて配置) の両方を確認する。
+    // M14 Phase 128 (#106): "Aメロ" を selected にして選択ハイライト (明るい太枠) を 1 枚で確認。
     let sections = vec![
-        section(0, "Intro", [0.30, 0.45, 0.65], 0.0, 4.0),
-        section(1, "Aメロ", [0.35, 0.55, 0.40], 4.0, 4.0),
-        section(2, "サビ", [0.70, 0.45, 0.35], 9.0, 5.0),
+        section(0, "Intro", [0.30, 0.45, 0.65], 0.0, 4.0, false),
+        section(1, "Aメロ", [0.35, 0.55, 0.40], 4.0, 4.0, true),
+        section(2, "サビ", [0.70, 0.45, 0.35], 9.0, 5.0, false),
     ];
 
     let mut host: UiHost<()> = UiHost::no_redraw();

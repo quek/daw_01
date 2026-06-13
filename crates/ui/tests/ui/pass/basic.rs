@@ -378,6 +378,9 @@ fn main() {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                     // M14 Phase 127 (daw_01 #105): Arranger レーン (section) の編集意図 6 variant。
+                    ArrangementEditRequest::SelectSection { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
                     ArrangementEditRequest::CreateSection { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
