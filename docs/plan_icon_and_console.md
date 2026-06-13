@@ -60,6 +60,8 @@
   - [x] logging: `rolling::daily` (panic する `.expect()`) → `builder().build()` で graceful degrade、返り値 `Option<WorkerGuard>` 化 (release=コンソール無しでファイル open 失敗時に無言死を回避)
   - [x] window icon 寸法二重化 → main.rs はバッファ長から edge 導出、`ICON_SIZE` const 撤去 (SSoT 化)
   - [ ] `git add daw_gui/assets/icon.svg` (untracked / include_bytes! の hard dep) — commit 時に必須
-- [ ] 修正後 re-build (workspace + clippy + release) green
-- [ ] commit + post-commit release build hook 確認
-- [ ] 実機: 窓が出ないこと / アイコン表示 / ログがファイルに出ること
+- [x] 修正後 re-build (workspace + clippy -D warnings + release) すべて green
+- [x] commit (1de8027、icon.svg 含む / FIXME.md 除外) + post-commit release build hook OK
+- [x] 実機 (release): 3 プロセスがファイルログ出力 + handshake 成功 + window icon 構築成功 (warning 0)
+- [ ] 実機 視覚 (user): タスクバー/ウィンドウ/Explorer のアイコン表示 + コンソール窓が出ないこと
+      (no-console は PE subsystem=GUI(2) で確証済、視覚は最終確認のみ)
