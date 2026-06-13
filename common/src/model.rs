@@ -355,6 +355,14 @@ pub struct Song {
     /// Stable id allocator for `Section`。 `0` は "未採番" sentinel、 `1` から採番。
     #[serde(default)]
     pub next_section_id: u32,
+    /// docs/plan_modulation.md §1: 共有モジュレーション源 (sidechain +
+    /// エンベロープフォロワー) の唯一の store。 `AuxInputRoute` / `ModRouting`
+    /// から `ModSource.id` で参照される。 旧 file は空 Vec で forward-migrate。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mod_sources: Vec<ModSource>,
+    /// Stable id allocator for `ModSource`。 `0` は "未採番" sentinel、 `1` から採番。
+    #[serde(default)]
+    pub next_mod_source_id: u32,
 }
 
 fn default_video_resolution() -> (u32, u32) {
@@ -394,6 +402,8 @@ impl Default for Song {
             project_id: 0,
             sections: Vec::new(),
             next_section_id: 1,
+            mod_sources: Vec::new(),
+            next_mod_source_id: 1,
         }
     }
 }
@@ -466,6 +476,14 @@ impl Song {
     pub fn alloc_section_id(&mut self) -> u32 {
         let id = self.next_section_id.max(1);
         self.next_section_id = id.saturating_add(1);
+        id
+    }
+
+    /// docs/plan_modulation.md §1: allocate a new stable `ModSource` id,
+    /// bumping `next_mod_source_id`。 `0` は "未採番" sentinel なので最低 `1` から返す。
+    pub fn alloc_mod_source_id(&mut self) -> u32 {
+        let id = self.next_mod_source_id.max(1);
+        self.next_mod_source_id = id.saturating_add(1);
         id
     }
 
@@ -1227,7 +1245,7 @@ impl Song {
     ///
     /// PR4.5 sidechain regression fix: when a track's id changes here,
     /// every reference to the old id (= other tracks' `parent_group_id`
-    /// and per-plugin `sidechain_sources` entries) is remapped to the new
+    /// and per-plugin `aux_inputs` tap sources) is remapped to the new
     /// id. Without this remap, a saved project that used `id == 0` as a
     /// sentinel for the first track would, on load, lose all its sidechain
     /// wiring (the references would dangle, `compile_schedule` silently
@@ -1239,6 +1257,18 @@ impl Song {
         // ある (pass 2 の sidechain remap は `devices` を走査するため)。
         for track in &mut self.tracks {
             track.flatten_legacy_devices();
+        }
+
+        // docs/plan_modulation.md §8: 旧 `sidechain_sources` を `aux_inputs` へ
+        // lift する。 device は flatten 済みなので全 PluginInstance を走査する。
+        // id_remap guard より前 (= sentinel track の有無に関わらず) 必ず走る。
+        for track in &mut self.tracks {
+            for p in track.devices.iter_mut() {
+                p.migrate_legacy_aux();
+            }
+        }
+        for p in self.master_fx_chain.iter_mut() {
+            p.migrate_legacy_aux();
         }
 
         // Pass 1: assign fresh ids to sentinel tracks, recording the
@@ -1281,29 +1311,32 @@ impl Song {
                 }
             }
             // v23: 役割別 3 chain は単一 `devices` に統合済み。各 device の
-            // sidechain_sources を 1 ループで remap する。
+            // aux_inputs tap の source_track を 1 ループで remap する。
             for p in track.devices.iter_mut() {
-                for src in p.sidechain_sources.iter_mut() {
-                    if let Some(old_id) = *src
-                        && let Some(&new_id) = id_remap.get(&old_id)
-                    {
-                        *src = Some(new_id);
+                for route in p.aux_inputs.iter_mut().flatten() {
+                    if let Some(&new_id) = id_remap.get(&route.tap.source_track) {
+                        route.tap.source_track = new_id;
                     }
                 }
             }
         }
 
-        // master bus の fx chain も track fx_chain と同じく sidechain_sources を
+        // master bus の fx chain も track fx_chain と同じく aux_inputs tap を
         // remap する。 master fx が他 track を sidechain source に取るケースに備える
-        // (track ループ内 `remap_chain` closure は loop scope なので再利用不可、
-        // ここで open-code)。
+        // (track ループ内 closure は loop scope なので再利用不可、 ここで open-code)。
         for p in self.master_fx_chain.iter_mut() {
-            for src in p.sidechain_sources.iter_mut() {
-                if let Some(old_id) = *src
-                    && let Some(&new_id) = id_remap.get(&old_id)
-                {
-                    *src = Some(new_id);
+            for route in p.aux_inputs.iter_mut().flatten() {
+                if let Some(&new_id) = id_remap.get(&route.tap.source_track) {
+                    route.tap.source_track = new_id;
                 }
+            }
+        }
+
+        // docs/plan_modulation.md §8: mod_source の tap も track id remap に追従する
+        // (mod_source.id は track id ではないので不変、 tap.source_track のみ)。
+        for ms in self.mod_sources.iter_mut() {
+            if let Some(&new_id) = id_remap.get(&ms.tap.source_track) {
+                ms.tap.source_track = new_id;
             }
         }
 
@@ -1334,6 +1367,21 @@ impl Song {
         }
         if self.next_song_lane_id == 0 {
             self.next_song_lane_id = 1;
+        }
+
+        // docs/plan_modulation.md §8: mod_source id も song_lanes と同様に採番。
+        // sentinel (0) のみ上書き、 既存非 0 id は触らず counter を bump する。
+        for ms in &mut self.mod_sources {
+            if ms.id == 0 {
+                let new_id = self.next_mod_source_id.max(1);
+                self.next_mod_source_id = new_id + 1;
+                ms.id = new_id;
+            } else if ms.id >= self.next_mod_source_id {
+                self.next_mod_source_id = ms.id + 1;
+            }
+        }
+        if self.next_mod_source_id == 0 {
+            self.next_mod_source_id = 1;
         }
     }
 
@@ -2354,6 +2402,154 @@ impl Track {
     }
 }
 
+// =====================================================================
+// Modulation routing (sidechain + envelope follower) — docs/plan_modulation.md
+// =====================================================================
+//
+// 「音をどこから取るか」の唯一の真実 = `AudioTap`。 消費者は 2 つだけで、
+// どちらも AudioTap の "使い方" であって新しいルートではない:
+//   - Consumer A: `AuxInputRoute` → プラグイン aux 入力 (旧 sidechain を吸収)
+//   - Consumer B: `ModSource` の envelope follower → param 変調 (`ModRouting`)
+
+/// タップ点。 track の音をどの段で拾うか (plan §6, Q4)。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum TapPoint {
+    /// device chain 適用前の素の音 (新スナップショット点、 Phase 6 で実装)。
+    PreFx,
+    /// device chain 適用後・ fader 前 (`PreFaderScratch`)。
+    PostFx,
+    /// fader 後 (`TrackScratch`)。 旧 sidechain の既定。
+    #[default]
+    PostFader,
+}
+
+/// 「音をどこから取るか」 の SSoT。 source track + タップ点。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
+pub struct AudioTap {
+    /// 音源となる `Track::id`。
+    pub source_track: u32,
+    /// どの段で拾うか。 旧 file は `PostFader` に forward-migrate。
+    #[serde(default)]
+    pub tap_point: TapPoint,
+}
+
+impl AudioTap {
+    /// 旧 sidechain (= 常に post-fader) からの lift / 既定構築。
+    pub fn post_fader(source_track: u32) -> Self {
+        Self {
+            source_track,
+            tap_point: TapPoint::PostFader,
+        }
+    }
+}
+
+/// Consumer A: プラグイン aux 入力ルート。 旧 `sidechain_sources` を置換し、
+/// 生音声を `pd.buffer_aux_in[port]` に staging する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct AuxInputRoute {
+    pub tap: AudioTap,
+}
+
+impl AuxInputRoute {
+    /// 旧 sidechain (常に post-fader) からの lift / 既定構築。
+    pub fn post_fader(source_track: u32) -> Self {
+        Self {
+            tap: AudioTap::post_fader(source_track),
+        }
+    }
+}
+
+/// エンベロープフォロワーの検出モード (plan §3)。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum FollowerMode {
+    /// ピーク (max|L|,|R|)。
+    #[default]
+    Peak,
+    /// RMS (sqrt(½(L²+R²)))。
+    Rms,
+}
+
+/// キック抽出用の帯域フィルタ (plan §3, Q3)。 検出前に source 音へ適用。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct BandFilter {
+    /// ハイパス cutoff (Hz)。
+    pub hp_hz: f32,
+    /// ローパス cutoff (Hz)。
+    pub lp_hz: f32,
+}
+
+/// フォロワー解析パラメータ。 状態 (env/biquad) はエンジン所有リングに置き、
+/// ここには設定のみ (RT-safe・ Copy、 plan §10)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct FollowerConfig {
+    pub mode: FollowerMode,
+    /// 検出前に全波整流するか。
+    pub rectify: bool,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    /// 検出前ゲイン。
+    pub gain: f32,
+    /// キック抽出等の帯域制限。 `None` で全帯域。
+    #[serde(default)]
+    pub band_filter: Option<BandFilter>,
+}
+
+impl Default for FollowerConfig {
+    fn default() -> Self {
+        Self {
+            mode: FollowerMode::Peak,
+            rectify: true,
+            attack_ms: 1.0,
+            release_ms: 100.0,
+            gain: 1.0,
+            band_filter: None,
+        }
+    }
+}
+
+/// 共有モジュレーション源 (1 source → 多 params、 plan Q2)。 `Song.mod_sources`
+/// が route の唯一の所有者。 `id` で `ModRouting.source_id` から参照される。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ModSource {
+    /// 安定 id。 `0` は "未採番" sentinel、 `ensure_ids` が採番。
+    #[serde(default)]
+    pub id: u32,
+    pub tap: AudioTap,
+    #[serde(default)]
+    pub follower: FollowerConfig,
+}
+
+/// 変調の極性 (plan Q5)。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum Polarity {
+    /// 0..=1 を `depth*s` で加算。
+    #[default]
+    Unipolar,
+    /// -1..=1 を `depth*(2s-1)` で加算。
+    Bipolar,
+}
+
+/// Consumer B: param への変調 edge (加算スタック、 plan Q5)。
+/// `AutomationLane.mod_routings` に同居し、 lane の `target` を `source_id` の
+/// フォロワー値で変調する。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ModRouting {
+    /// → `Song.mod_sources[*].id`。
+    pub source_id: u32,
+    /// target の *正規化* 領域での量 (0..=1)。
+    pub depth: f32,
+    #[serde(default)]
+    pub polarity: Polarity,
+}
+
 /// Reference to a plugin loaded on a track, with the opaque state blob the
 /// plugin itself produced (CLAP `clap_plugin_state.save` or VST3
 /// `IComponent::getState`). Paths are NOT stored — `(format, plugin_id)`
@@ -2373,14 +2569,22 @@ pub struct PluginInstance {
         with = "base64_opt"
     )]
     pub state: Option<Vec<u8>>,
-    /// PR4 sidechain: per-aux-input-port routing source. Each entry maps
-    /// the plugin's `is_main=false` aux input port index to a source
-    /// `Track::id`. `None` (or absent index) leaves that port silent.
-    /// `Vec` length = number of aux input ports the user has hooked up;
-    /// shorter than the plugin's actual port count is fine (trailing
-    /// ports stay silent).
+    /// Consumer A (旧 sidechain、 docs/plan_modulation.md §1): aux 入力ポート
+    /// ごとのルート。 各 entry は plugin の `is_main=false` aux input port
+    /// index → `AudioTap`。 `None` (or 不足 index) はそのポートを無音に。
+    /// `Vec` 長 = user が配線した aux port 数 (plugin の実 port 数より短くて
+    /// よい — 末尾は無音)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sidechain_sources: Vec<Option<u32>>,
+    pub aux_inputs: Vec<Option<AuxInputRoute>>,
+    /// deserialize 専用 migration: 旧 save の `sidechain_sources:
+    /// Vec<Option<u32>>`。 `ensure_ids` が `migrate_legacy_aux` で
+    /// `Some(id) → AuxInputRoute{tap:{id, PostFader}}` に lift して
+    /// `aux_inputs` を埋める。 serialize はしない (`legacy_slot` /
+    /// `legacy_*_chain` と同 idiom)。 ロード後は常に空。 `pub` は外部クレートが
+    /// `..PluginInstance::with_ports(..)` (FRU) で instance を組めるようにする
+    /// ためで、 設定値に意味は無い (= migrate 後 drain される)。
+    #[serde(default, rename = "sidechain_sources", skip_serializing)]
+    pub legacy_aux_sources: Vec<Option<u32>>,
     /// v23: この device の port 構成。役割導出の入力。
     #[serde(default)]
     pub ports: crate::port_config::PortConfig,
@@ -2392,7 +2596,8 @@ impl PluginInstance {
             plugin_id,
             format,
             state: None,
-            sidechain_sources: Vec::new(),
+            aux_inputs: Vec::new(),
+            legacy_aux_sources: Vec::new(),
             ports: crate::port_config::PortConfig::default(),
         }
     }
@@ -2406,8 +2611,23 @@ impl PluginInstance {
             plugin_id,
             format,
             state: None,
-            sidechain_sources: Vec::new(),
+            aux_inputs: Vec::new(),
+            legacy_aux_sources: Vec::new(),
             ports,
+        }
+    }
+
+    /// 旧 `sidechain_sources` (deserialize 専用 `legacy_aux_sources`) を
+    /// `aux_inputs` に lift する。 `ensure_ids` が load 時に各 instance へ呼ぶ。
+    /// idempotent (lift 後 / 新形式は no-op、 legacy を drain するだけ)。
+    pub(crate) fn migrate_legacy_aux(&mut self) {
+        if self.aux_inputs.is_empty() && !self.legacy_aux_sources.is_empty() {
+            self.aux_inputs = std::mem::take(&mut self.legacy_aux_sources)
+                .into_iter()
+                .map(|opt| opt.map(AuxInputRoute::post_fader))
+                .collect();
+        } else {
+            self.legacy_aux_sources = Vec::new();
         }
     }
 }
@@ -3605,6 +3825,12 @@ pub struct AutomationLane {
     /// sentinel; valid allocations start at `1`.
     #[serde(default)]
     pub next_clip_id: u32,
+    /// docs/plan_modulation.md §1: この lane の `target` を変調する 0..N の
+    /// フォロワー edge (加算スタック)。 base (`default_value` + curve) に正規化
+    /// 領域で上乗せする (Phase 4 で `effective_norm` が消費)。 旧 file は空 Vec。
+    /// 追加 addressing state ゼロ — 既存 lane の `target` が param を 1:1 に指す。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mod_routings: Vec<ModRouting>,
 }
 
 fn default_true() -> bool {
@@ -3626,6 +3852,7 @@ impl AutomationLane {
             height_px: default_lane_height_px(),
             clips: Vec::new(),
             next_clip_id: 1,
+            mod_routings: Vec::new(),
         }
     }
 
@@ -3799,8 +4026,10 @@ mod tests {
 
     #[test]
     fn normalize_sections_sorts_disjoint_by_start() {
-        let mut song = Song::default();
-        song.sections = vec![mk_section(1, 8.0, 4.0), mk_section(2, 0.0, 4.0), mk_section(3, 4.0, 4.0)];
+        let mut song = Song {
+            sections: vec![mk_section(1, 8.0, 4.0), mk_section(2, 0.0, 4.0), mk_section(3, 4.0, 4.0)],
+            ..Default::default()
+        };
         song.normalize_sections();
         let ids: Vec<u32> = song.sections.iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![2, 3, 1]);
@@ -3810,9 +4039,11 @@ mod tests {
 
     #[test]
     fn normalize_sections_resolves_overlap_by_clamping_later_start() {
-        let mut song = Song::default();
         // [0,6) と [4,8) が重複 → 後発の start を直前 end(6) までクランプ → [6,8)。
-        song.sections = vec![mk_section(1, 0.0, 6.0), mk_section(2, 4.0, 4.0)];
+        let mut song = Song {
+            sections: vec![mk_section(1, 0.0, 6.0), mk_section(2, 4.0, 4.0)],
+            ..Default::default()
+        };
         song.normalize_sections();
         assert_eq!(song.sections.len(), 2);
         assert_eq!((song.sections[0].start_beat, song.sections[0].len_beats), (0.0, 6.0));
@@ -3821,14 +4052,18 @@ mod tests {
 
     #[test]
     fn normalize_sections_drops_zero_negative_and_fully_overlapped() {
-        let mut song = Song::default();
-        song.sections = vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 0.0), mk_section(3, 8.0, -1.0)];
+        let mut song = Song {
+            sections: vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 0.0), mk_section(3, 8.0, -1.0)],
+            ..Default::default()
+        };
         song.normalize_sections();
         assert_eq!(song.sections.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1]);
 
         // [0,10) が [2,4) を完全に覆う → 後発は len 0 になり drop。
-        let mut song = Song::default();
-        song.sections = vec![mk_section(1, 0.0, 10.0), mk_section(2, 2.0, 2.0)];
+        let mut song = Song {
+            sections: vec![mk_section(1, 0.0, 10.0), mk_section(2, 2.0, 2.0)],
+            ..Default::default()
+        };
         song.normalize_sections();
         assert_eq!(song.sections.len(), 1);
         assert_eq!(song.sections[0].id, 1);
@@ -4242,7 +4477,7 @@ mod tests {
 
     /// Regression test for sidechain pipeline: when `ensure_ids()` rewrites
     /// a `track.id == 0` sentinel into a fresh id, every reference to that
-    /// old id (= `sidechain_sources` entries and `parent_group_id`) must be
+    /// old id (= `aux_inputs` tap source + `parent_group_id`) must be
     /// remapped too. Otherwise the references dangle, `compile_schedule`
     /// silently skips them (treating dangling sidechain sources as
     /// `continue`), and the user sees no sidechain signal even though the
@@ -4250,13 +4485,13 @@ mod tests {
     ///
     /// Setup:
     ///   Track Kick id=0 (sentinel) → after ensure_ids gets id=2
-    ///   Track Bass id=1 with fx[0].sidechain_sources=[Some(0)] (= Kick)
+    ///   Track Bass id=1 with fx[0].aux_inputs=[post_fader(0)] (= Kick)
     ///                    parent_group_id = Some(0) (= Kick)
     /// Expected after ensure_ids:
-    ///   Bass.fx[0].sidechain_sources == [Some(2)]
+    ///   Bass.fx[0].aux_inputs == [post_fader(2)]
     ///   Bass.parent_group_id == Some(2)
     #[test]
-    fn ensure_ids_remaps_sidechain_sources_and_parent_group_id() {
+    fn ensure_ids_remaps_aux_inputs_and_parent_group_id() {
         use crate::plugin_format::PluginFormat;
 
         let mut song = Song {
@@ -4275,11 +4510,13 @@ mod tests {
                     parent_group_id: Some(0), // points at Kick's old sentinel id
                     // v23: 役割別 chain は廃止。device chain (`devices`) に直接置く。
                     devices: vec![PluginInstance {
-                        plugin_id: "test.compressor".into(),
-                        format: PluginFormat::Vst3,
-                        state: None,
-                        sidechain_sources: vec![Some(0)], // points at Kick
-                        ports: crate::port_config::PortConfig::default(),
+                        // points at Kick (sentinel id 0)
+                        aux_inputs: vec![Some(AuxInputRoute::post_fader(0))],
+                        ..PluginInstance::with_ports(
+                            "test.compressor".into(),
+                            PluginFormat::Vst3,
+                            crate::port_config::PortConfig::default(),
+                        )
                     }],
                     ..Track::default()
                 },
@@ -4304,9 +4541,97 @@ mod tests {
             "parent_group_id pointing at sentinel must be remapped to the new id"
         );
         assert_eq!(
-            bass.devices[0].sidechain_sources,
-            vec![Some(new_kick_id)],
-            "sidechain_sources pointing at sentinel must be remapped to the new id"
+            bass.devices[0].aux_inputs,
+            vec![Some(AuxInputRoute::post_fader(new_kick_id))],
+            "aux_inputs tap pointing at sentinel must be remapped to the new id"
+        );
+    }
+
+    /// docs/plan_modulation.md §8: a v-old project that stored sidechain
+    /// wiring under the legacy `sidechain_sources: Vec<Option<u32>>` JSON key
+    /// must `ensure_ids`-migrate into `aux_inputs` as `PostFader` taps, with
+    /// the legacy field drained. No track sentinel here, so the migration
+    /// must run even when the id-remap pass is a no-op.
+    #[test]
+    fn ensure_ids_migrates_legacy_sidechain_sources_to_aux_inputs() {
+        use crate::plugin_format::PluginFormat;
+
+        let mut song = Song {
+            tracks: vec![
+                Track {
+                    id: 1,
+                    name: "Kick".into(),
+                    ..Track::default()
+                },
+                Track {
+                    id: 2,
+                    name: "Bass".into(),
+                    devices: vec![PluginInstance {
+                        // emulate a deserialized old project: legacy field set,
+                        // aux_inputs empty.
+                        legacy_aux_sources: vec![Some(1), None],
+                        ..PluginInstance::with_ports(
+                            "test.compressor".into(),
+                            PluginFormat::Vst3,
+                            crate::port_config::PortConfig::default(),
+                        )
+                    }],
+                    ..Track::default()
+                },
+            ],
+            next_track_id: 3,
+            ..Song::default()
+        };
+
+        song.ensure_ids();
+
+        let bass = &song.tracks[1];
+        assert_eq!(
+            bass.devices[0].aux_inputs,
+            vec![Some(AuxInputRoute::post_fader(1)), None],
+            "legacy sidechain_sources must lift to PostFader aux_inputs"
+        );
+        assert!(
+            bass.devices[0].legacy_aux_sources.is_empty(),
+            "legacy field must be drained after migration"
+        );
+    }
+
+    /// docs/plan_modulation.md §8: `mod_sources` get stable ids assigned
+    /// (sentinel 0 → fresh) and their `tap.source_track` follows a track id
+    /// remap, exactly like `aux_inputs` taps.
+    #[test]
+    fn ensure_ids_assigns_mod_source_ids_and_remaps_tap() {
+        let mut song = Song {
+            tracks: vec![
+                Track {
+                    id: 0, // sentinel — rebased by ensure_ids
+                    name: "Kick".into(),
+                    ..Track::default()
+                },
+                Track {
+                    id: 1,
+                    name: "Bass".into(),
+                    ..Track::default()
+                },
+            ],
+            next_track_id: 2,
+            mod_sources: vec![ModSource {
+                id: 0, // sentinel — assigned by ensure_ids
+                tap: AudioTap::post_fader(0), // points at Kick's sentinel id
+                follower: FollowerConfig::default(),
+            }],
+            ..Song::default()
+        };
+
+        song.ensure_ids();
+
+        let new_kick_id = song.tracks[0].id;
+        assert_ne!(new_kick_id, 0, "Kick sentinel rebased");
+        assert_ne!(song.mod_sources[0].id, 0, "mod_source id assigned");
+        assert_eq!(
+            song.mod_sources[0].tap.source_track, new_kick_id,
+            "mod_source tap.source_track must follow the track id remap"
         );
     }
 

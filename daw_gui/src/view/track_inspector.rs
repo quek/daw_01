@@ -1933,7 +1933,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ---- Sidechain section ------------------------------------------
     // PR4.5 sidechain UI: per-plugin source picker. ECS-flat dropdown per
     // chain row so the user can wire any track's output into the plugin's
-    // first aux input port (sidechain_sources[0]). Self-track is filtered
+    // first aux input port (aux_inputs[0]). Self-track is filtered
     // out (would create a feedback cycle which `compile_schedule` rejects).
     // Only the first aux port is exposed; multi-port plugins (rare) still
     // need editing via .daw file or follow-up UI.

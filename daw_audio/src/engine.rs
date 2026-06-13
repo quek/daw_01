@@ -1143,7 +1143,7 @@ pub fn set_pd_transport(
 /// delayed by that many samples **before** the audio FX chain runs.
 /// The caller (engine main loop / export) passes
 /// `Schedule::input_delay_per_track[track_idx]`, which compile_schedule
-/// has set to `max(path_latency(src) for src in fx_chain[*].sidechain_sources)`.
+/// has set to `max(path_latency(src) for src in fx_chain[*].aux_inputs[*].tap)`.
 /// 0 = no delay (the common case).
 #[allow(clippy::too_many_arguments)]
 pub fn process_track_owned(
@@ -2292,17 +2292,18 @@ mod sidechain_tests {
                     // v23 single-chain: an audio-FX device (audio_output only,
                     // no note input) → derives as AudioEffect at device 0.
                     t.devices = vec![PluginInstance {
-                        plugin_id: "test.scc".into(),
-                        format: PluginFormat::Vst3,
-                        state: None,
-                        sidechain_sources: vec![Some(1)],
-                        ports: common::port_config::PortConfig {
-                            has_note_input: false,
-                            has_note_output: false,
-                            has_audio_output: true,
-                            // audio-FX device: audio を加工する → audio 入力あり。
-                            has_audio_input: true,
-                        },
+                        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
+                        ..PluginInstance::with_ports(
+                            "test.scc".into(),
+                            PluginFormat::Vst3,
+                            common::port_config::PortConfig {
+                                has_note_input: false,
+                                has_note_output: false,
+                                has_audio_output: true,
+                                // audio-FX device: audio を加工する → audio 入力あり。
+                                has_audio_input: true,
+                            },
+                        )
                     }];
                 }),
             ],

@@ -114,7 +114,7 @@ pub struct Schedule {
     /// time.
     ///
     /// Indexed by song track index (parallel to `song.tracks`). Entry `i`
-    /// is `max(path_latency(src) for src in fx_chain[*].sidechain_sources)`,
+    /// is `max(path_latency(src) for src in fx_chain[*].aux_inputs[*].tap)`,
     /// or 0 if the track has no fx_chain sidechain wiring.
     ///
     /// MVP scope: only `fx_chain` plugin sidechain is reflected here.

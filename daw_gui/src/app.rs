@@ -436,7 +436,7 @@ pub fn text_event_num_value(ev: &common::model::TextEvent, field: TextNumField) 
 /// Per-plugin sidechain wiring entry shown in the inspector. One row per
 /// chain device (addressed by `device_index` into `Track.devices` /
 /// `master_fx_chain`); the `current_source` field is the value of
-/// `PluginInstance::sidechain_sources[0]` (port 0; the inspector only
+/// `PluginInstance::aux_inputs[0]` tap source (port 0; the inspector only
 /// exposes the first aux input port for now).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidechainEntry {
@@ -2053,7 +2053,7 @@ impl AppData {
 
     /// Per-plugin sidechain wiring entries shown in the inspector. One
     /// entry per chain plugin (MidiFx / Instrument / Fx); each carries
-    /// the plugin's current `sidechain_sources[0]` value (port 0; PR4
+    /// the plugin's current `aux_inputs[0]` tap source (port 0; PR4
     /// only exposes the first aux input port through the inspector). The
     /// track picker UI maps `None` → "—" and `Some(track_id)` → the
     /// track's name. Self-track is filtered out by the picker because
@@ -2082,14 +2082,18 @@ impl AppData {
                 track_id,
                 device_index: i as u32,
                 plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
-                current_source: p.sidechain_sources.first().copied().flatten(),
+                current_source: p
+                    .aux_inputs
+                    .first()
+                    .and_then(|o| o.as_ref())
+                    .map(|r| r.tap.source_track),
             })
             .collect();
         // PR4.5 diagnostic: if any chain plugin has a non-empty
-        // sidechain_sources, log the resolved current_source values once
+        // aux_inputs, log the resolved current_source values once
         // per inspector_chain rebuild. Helps catch UI ↔ model state
         // mismatches (= dropdown shows "—" but model has Some(id)).
-        let any_wired = devices.iter().any(|p| !p.sidechain_sources.is_empty());
+        let any_wired = devices.iter().any(|p| !p.aux_inputs.is_empty());
         if any_wired {
             // Dump raw model state alongside entries so we can see the
             // exact values UI is displaying. trace! to avoid frame-rate
@@ -2097,7 +2101,16 @@ impl AppData {
             let raw: Vec<(u32, String, Vec<Option<u32>>)> = devices
                 .iter()
                 .enumerate()
-                .map(|(i, p)| (i as u32, p.plugin_id.clone(), p.sidechain_sources.clone()))
+                .map(|(i, p)| {
+                    (
+                        i as u32,
+                        p.plugin_id.clone(),
+                        p.aux_inputs
+                            .iter()
+                            .map(|o| o.as_ref().map(|r| r.tap.source_track))
+                            .collect(),
+                    )
+                })
                 .collect();
             tracing::trace!(
                 cursor_track_id = track_id,
@@ -7458,15 +7471,16 @@ impl AppData {
                 }
             });
             for dev in &mut t.devices {
-                for src in &mut dev.sidechain_sources {
-                    if let Some(old) = *src {
-                        *src = if let Some(&new) = track_remap.get(&old) {
-                            Some(new)
-                        } else if same_project && self.song.track_by_id(old).is_some() {
-                            Some(old)
-                        } else {
-                            None
-                        };
+                for slot in &mut dev.aux_inputs {
+                    if let Some(route) = slot {
+                        let old = route.tap.source_track;
+                        if let Some(&new) = track_remap.get(&old) {
+                            route.tap.source_track = new;
+                        } else if !(same_project && self.song.track_by_id(old).is_some()) {
+                            // dangling after paste: drop the route (keep tap_point
+                            // intact when the source survives).
+                            *slot = None;
+                        }
                     }
                 }
             }
@@ -9666,6 +9680,7 @@ impl AppData {
             height_px: 60,
             clips: Vec::new(),
             next_clip_id: 1,
+            mod_routings: Vec::new(),
         };
         track.automation_lanes.push(new_lane);
         self.expanded_automation_tracks.insert(track_id);
@@ -9921,6 +9936,7 @@ impl AppData {
             height_px: 60,
             clips: Vec::new(),
             next_clip_id: 1,
+            mod_routings: Vec::new(),
         });
         self.expanded_automation_tracks.insert(track_id);
         self.status_message = format!(
@@ -10088,6 +10104,7 @@ impl AppData {
             height_px: 60,
             clips: Vec::new(),
             next_clip_id: 1,
+            mod_routings: Vec::new(),
         });
         self.expanded_automation_tracks.insert(track_id);
         self.status_message = format!(
@@ -10278,6 +10295,7 @@ impl AppData {
                 height_px: 60,
                 clips: Vec::new(),
                 next_clip_id: 1,
+                mod_routings: Vec::new(),
             };
             self.song.song_lanes.push(new_lane);
             self.master_row_automation_expanded = true;
@@ -10295,6 +10313,7 @@ impl AppData {
                 height_px: 60,
                 clips: Vec::new(),
                 next_clip_id: 1,
+                mod_routings: Vec::new(),
             };
             track.automation_lanes.push(new_lane);
             self.expanded_automation_tracks.insert(touched.track_id);
@@ -11975,7 +11994,7 @@ impl AppData {
         kept.muted = false;
         kept.solo = false;
         for d in &mut kept.devices {
-            d.sidechain_sources.clear();
+            d.aux_inputs.clear();
             if bypass_inserts && d.ports.has_audio_input {
                 d.ports = common::port_config::PortConfig::default();
             }
@@ -14488,7 +14507,7 @@ impl AppData {
         // PR4.5 sidechain wiring preservation: when a plugin finishes
         // loading via SlotPluginLoaded, we replace the existing
         // PluginInstance with a fresh one carrying the resolved id +
-        // saved state, but **must preserve `sidechain_sources`** —
+        // saved state, but **must preserve `aux_inputs`** —
         // otherwise wiring set by the user (or loaded from a saved .daw
         // file) gets clobbered to `Vec::new()` here, which then
         // (a) makes the inspector dropdown display "—" instead of the
@@ -14511,16 +14530,18 @@ impl AppData {
             return;
         };
         let i = index as usize;
-        let (existing_state, format, existing_sc, existing_ports) = chain
+        let (existing_state, format, existing_aux, existing_ports) = chain
             .get(i)
-            .map(|p| (p.state.clone(), p.format, p.sidechain_sources.clone(), p.ports))
+            .map(|p| (p.state.clone(), p.format, p.aux_inputs.clone(), p.ports))
             .unwrap_or((None, PluginFormat::Clap, Vec::new(), Default::default()));
         let inst = common::model::PluginInstance {
-            plugin_id: id,
-            format,
             state: existing_state,
-            sidechain_sources: existing_sc,
-            ports: db_ports.unwrap_or(existing_ports),
+            aux_inputs: existing_aux,
+            ..common::model::PluginInstance::with_ports(
+                id,
+                format,
+                db_ports.unwrap_or(existing_ports),
+            )
         };
         if i < chain.len() {
             chain[i] = inst;
@@ -14946,7 +14967,7 @@ impl AppData {
 
     /// PR4 sidechain: route a track's output into a plugin's `aux_in_port`.
     /// `source = None` disconnects. The plugin's
-    /// `PluginInstance.sidechain_sources[port]` slot is created on demand;
+    /// `PluginInstance.aux_inputs[port]` slot is created on demand;
     /// shorter vectors are extended with `None` placeholders so port `port`
     /// becomes addressable. After mutation we re-`sync_song_to_plugin_host`
     /// so `compile_schedule` regenerates the `SidechainTap` ops.
@@ -14969,10 +14990,12 @@ impl AppData {
         };
         let Some(inst) = inst else { return };
         let port_idx = port as usize;
-        if inst.sidechain_sources.len() <= port_idx {
-            inst.sidechain_sources.resize(port_idx + 1, None);
+        if inst.aux_inputs.len() <= port_idx {
+            inst.aux_inputs.resize(port_idx + 1, None);
         }
-        inst.sidechain_sources[port_idx] = source;
+        // Phase 1: UI は常に PostFader タップを張る (旧 sidechain と同挙動)。
+        // Pre/PostFx トグルは Phase 6 で追加する (docs/plan_modulation.md §9)。
+        inst.aux_inputs[port_idx] = source.map(common::model::AuxInputRoute::post_fader);
         self.sync_song_to_plugin_host();
     }
 

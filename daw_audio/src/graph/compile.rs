@@ -137,13 +137,11 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             out.extend(kids.iter().copied());
         }
         // v23 single-chain: sidechain wiring lives on every device's
-        // `sidechain_sources` regardless of its derived role, so a single
-        // walk over `devices` covers what the old per-section walks did.
+        // `aux_inputs` regardless of its derived role, so a single walk over
+        // `devices` covers what the old per-section walks did.
         for p in &track.devices {
-            for src_id_opt in &p.sidechain_sources {
-                if let Some(src_id) = src_id_opt
-                    && let Some(&src_idx) = id_to_idx.get(src_id)
-                {
+            for route in p.aux_inputs.iter().flatten() {
+                if let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) {
                     out.push(src_idx);
                 }
             }
@@ -203,7 +201,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         let track = &song.tracks[i as usize];
         let track_idx = i;
         // PR4 sidechain: emit `SidechainTap` for every plugin on this
-        // track with a `sidechain_sources` entry pointing at a valid
+        // track with an `aux_inputs` route pointing at a valid
         // source track. The tap must run **before** the plugin's own
         // `process()` (i.e. before ProcessTrack / ProcessGroupFx for
         // this track) so the engine can stage the source signal in the
@@ -275,16 +273,19 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         // (engine.rs の `port >= MAX_AUX_IN` ガードと整合)。 enumerate を
         // `take(MAX_AUX_IN)` で打ち切ることで `port_idx < MAX_AUX_IN` を
         // 構造的に保証し、 `as u8` の wrap を防ぐ。
-        for (port_idx, src_track_id_opt) in inst
-            .sidechain_sources
+        for (port_idx, route_opt) in inst
+            .aux_inputs
             .iter()
             .take(common::process_data::MAX_AUX_IN)
             .enumerate()
         {
-            let Some(src_track_id) = src_track_id_opt else {
+            let Some(route) = route_opt else {
                 continue;
             };
-            let Some(&src_idx) = id_to_idx.get(src_track_id) else {
+            // Phase 1: tap_point は常に PostFader (= TrackScratch)。 3 段タップの
+            // BufRef 解決と follower emit は Phase 2/6 で emit_taps_and_followers
+            // に統合する (docs/plan_modulation.md §5)。
+            let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) else {
                 continue;
             };
             nodes.push(NodeOp::SidechainTap {
@@ -379,10 +380,8 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             if !(p.ports.has_audio_input && p.ports.has_audio_output) {
                 continue;
             }
-            for src_id_opt in &p.sidechain_sources {
-                if let Some(src_id) = src_id_opt
-                    && let Some(&src_idx) = id_to_idx.get(src_id)
-                {
+            for route in p.aux_inputs.iter().flatten() {
+                if let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) {
                     let l = path_latency[src_idx as usize];
                     if l > max_sc {
                         max_sc = l;
@@ -402,7 +401,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
 }
 
 /// PR4 sidechain: track の単一 `devices` チェーンを walk して、 各 plugin の
-/// `sidechain_sources` 中で有効な (= source track が song に存在する) entry に
+/// `aux_inputs` 中で有効な (= source track が song に存在する) route に
 /// ついて `NodeOp::SidechainTap` を `nodes` に push する。 v23 single-chain:
 /// `dst_index` は device の `Track.devices` 上の位置。 sidechain は役割に依らず
 /// どの device にも貼れるので、 役割導出なしに index 順で walk すればよい。
@@ -420,16 +419,18 @@ fn emit_sidechain_taps(
         // aux port は engine が `MAX_AUX_IN` までしか staging しないので
         // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証し、
         // `as u8` の wrap を防ぐ。
-        for (port_idx, src_track_id_opt) in inst
-            .sidechain_sources
+        for (port_idx, route_opt) in inst
+            .aux_inputs
             .iter()
             .take(common::process_data::MAX_AUX_IN)
             .enumerate()
         {
-            let Some(src_track_id) = src_track_id_opt else {
+            let Some(route) = route_opt else {
                 continue;
             };
-            let Some(src_idx) = id_to_idx.get(src_track_id) else {
+            // Phase 1: tap_point は常に PostFader (= TrackScratch)。 3 段タップの
+            // BufRef 解決は Phase 2/6 で導入する (docs/plan_modulation.md §5)。
+            let Some(src_idx) = id_to_idx.get(&route.tap.source_track) else {
                 // dangling reference: silently skip
                 continue;
             };
@@ -450,7 +451,7 @@ fn emit_sidechain_taps(
 /// bus latency として、 そこに自身の `reported_latency_samples` を足す。
 ///
 /// PR4 sidechain × PDC: track の単一 `devices` チェーン上の各 plugin の
-/// `sidechain_sources` も `input bus latency` に取り込む。 すなわち:
+/// `aux_inputs` の tap も `input bus latency` に取り込む。 すなわち:
 ///
 ///   input_latency(T) = max(
 ///       max(child.path_latency for child in children_of(T)),
@@ -535,8 +536,8 @@ fn compute_path_latency(
     // raises this track's input latency), so a single walk over `devices`
     // replaces the old per-section walks.
     for p in &track.devices {
-        for src in &p.sidechain_sources {
-            consider(src, cache);
+        for route in p.aux_inputs.iter().flatten() {
+            consider(&Some(route.tap.source_track), cache);
         }
     }
 
@@ -1270,12 +1271,13 @@ mod tests {
                     t.id = 2;
                     t.name = "Dest".into();
                     t.devices = vec![PluginInstance {
-                        plugin_id: "test.compressor".into(),
-                        format: PluginFormat::Vst3,
-                        state: None,
                         // aux input port 0 ← Track 1's output
-                        sidechain_sources: vec![Some(1)],
-                        ports: audio_fx_ports(),
+                        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
+                        ..PluginInstance::with_ports(
+                            "test.compressor".into(),
+                            PluginFormat::Vst3,
+                            audio_fx_ports(),
+                        )
                     }];
                 }),
             ],
@@ -1344,11 +1346,12 @@ mod tests {
                 t.name = "Source".into();
             })],
             master_fx_chain: vec![PluginInstance {
-                plugin_id: "test.bus_comp".into(),
-                format: PluginFormat::Vst3,
-                state: None,
-                sidechain_sources: vec![Some(1)],
-                ports: audio_fx_ports(),
+                aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
+                ..PluginInstance::with_ports(
+                    "test.bus_comp".into(),
+                    PluginFormat::Vst3,
+                    audio_fx_ports(),
+                )
             }],
             ..Song::default()
         };
@@ -1436,11 +1439,12 @@ mod tests {
                     t.name = "Dest".into();
                     t.reported_latency_samples = 50;
                     t.devices = vec![PluginInstance {
-                        plugin_id: "test.compressor".into(),
-                        format: PluginFormat::Vst3,
-                        state: None,
-                        sidechain_sources: vec![Some(1)],
-                        ports: audio_fx_ports(),
+                        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
+                        ..PluginInstance::with_ports(
+                            "test.compressor".into(),
+                            PluginFormat::Vst3,
+                            audio_fx_ports(),
+                        )
                     }];
                 }),
             ],
@@ -1537,11 +1541,12 @@ mod tests {
                     t.name = "Dest".into();
                     t.reported_latency_samples = 50;
                     t.devices = vec![PluginInstance {
-                        plugin_id: "test.compressor".into(),
-                        format: PluginFormat::Vst3,
-                        state: None,
-                        sidechain_sources: vec![Some(1)],
-                        ports: audio_fx_ports(),
+                        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
+                        ..PluginInstance::with_ports(
+                            "test.compressor".into(),
+                            PluginFormat::Vst3,
+                            audio_fx_ports(),
+                        )
                     }];
                 }),
                 track(|t| {
@@ -1597,11 +1602,12 @@ mod tests {
                     // out) → derives as Instrument, NOT AudioEffect, so its
                     // sidechain does not contribute to input_delay_per_track.
                     t.devices = vec![PluginInstance {
-                        plugin_id: "test.synth".into(),
-                        format: PluginFormat::Vst3,
-                        state: None,
-                        sidechain_sources: vec![Some(1)],
-                        ports: instrument_ports(),
+                        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
+                        ..PluginInstance::with_ports(
+                            "test.synth".into(),
+                            PluginFormat::Vst3,
+                            instrument_ports(),
+                        )
                     }];
                 }),
             ],
@@ -1634,22 +1640,24 @@ mod tests {
                     t.id = 1;
                     t.name = "A".into();
                     t.devices = vec![PluginInstance {
-                        plugin_id: "test.compressor".into(),
-                        format: PluginFormat::Vst3,
-                        state: None,
-                        sidechain_sources: vec![Some(2)],
-                        ports: audio_fx_ports(),
+                        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(2))],
+                        ..PluginInstance::with_ports(
+                            "test.compressor".into(),
+                            PluginFormat::Vst3,
+                            audio_fx_ports(),
+                        )
                     }];
                 }),
                 track(|t| {
                     t.id = 2;
                     t.name = "B".into();
                     t.devices = vec![PluginInstance {
-                        plugin_id: "test.compressor".into(),
-                        format: PluginFormat::Vst3,
-                        state: None,
-                        sidechain_sources: vec![Some(1)],
-                        ports: audio_fx_ports(),
+                        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
+                        ..PluginInstance::with_ports(
+                            "test.compressor".into(),
+                            PluginFormat::Vst3,
+                            audio_fx_ports(),
+                        )
                     }];
                 }),
             ],
@@ -1673,11 +1681,13 @@ mod tests {
                 t.id = 1;
                 t.name = "Lone".into();
                 t.devices = vec![PluginInstance {
-                    plugin_id: "test.compressor".into(),
-                    format: PluginFormat::Vst3,
-                    state: None,
-                    sidechain_sources: vec![Some(99)], // 存在しない track
-                    ports: audio_fx_ports(),
+                    // 存在しない track を指す → dangling、 Tap は emit されない
+                    aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(99))],
+                    ..PluginInstance::with_ports(
+                        "test.compressor".into(),
+                        PluginFormat::Vst3,
+                        audio_fx_ports(),
+                    )
                 }];
             })],
             ..Song::default()
