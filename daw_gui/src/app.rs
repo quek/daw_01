@@ -2130,6 +2130,66 @@ impl AppData {
 
     /// Sidechain source picker choices: "—" (None) followed by every
     /// track in the song **except** the cursor track itself.
+    /// docs/plan_modulation.md §9: rows for the modulation-source rack —
+    /// `(id, source-track label, live follower scalar)`. The scalar is read
+    /// from the polled `mod_scalars` plane at the source's slot (= position
+    /// in `Song::mod_sources`).
+    pub fn mod_source_display(&self) -> Vec<(u32, String, f32)> {
+        self.song
+            .mod_sources
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let name = self
+                    .song
+                    .track_by_id(m.tap.source_track)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| format!("track {}", m.tap.source_track));
+                (m.id, name, self.mod_scalars.get(i).copied().unwrap_or(0.0))
+            })
+            .collect()
+    }
+
+    /// docs/plan_modulation.md §9: the cursor track's automation lanes that can
+    /// host modulation — `(track_id, lane_id, target label, routings)` where
+    /// each routing is `(source_id, depth, is_bipolar)`. MASTER cursor →
+    /// `song_lanes`. Owned so inspector `Edit::mutate` closures can capture it.
+    #[allow(clippy::type_complexity)]
+    pub fn cursor_mod_lanes(&self) -> Vec<(u32, u32, String, Vec<(u32, f32, bool)>)> {
+        let (track_id, lanes) = if self.cursor_track_id()
+            == Some(common::model::MASTER_TRACK_ID)
+        {
+            (common::model::MASTER_TRACK_ID, &self.song.song_lanes)
+        } else {
+            match self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) {
+                Some(t) => (t.id, &t.automation_lanes),
+                None => return Vec::new(),
+            }
+        };
+        lanes
+            .iter()
+            .map(|l| {
+                let routings = l
+                    .mod_routings
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.source_id,
+                            r.depth,
+                            matches!(r.polarity, common::model::Polarity::Bipolar),
+                        )
+                    })
+                    .collect();
+                (
+                    track_id,
+                    l.id,
+                    automation_target_display_name(&l.target),
+                    routings,
+                )
+            })
+            .collect()
+    }
+
     pub fn sidechain_source_choices(&self) -> Vec<SidechainSourceChoice> {
         let cursor_id = self.cursor_track_id();
         let mut choices: Vec<SidechainSourceChoice> = Vec::with_capacity(self.song.tracks.len() + 1);
@@ -15142,7 +15202,9 @@ impl AppData {
         {
             r.depth = depth.clamp(-1.0, 1.0);
         }
-        self.sync_song_to_plugin_host();
+        // depth は GUI compose が毎フレーム読む visual-only 値 (Phase 4)。 scrub
+        // ドラッグ中の per-frame LoadSong を避け、 dirty マークだけ立てる。
+        self.is_dirty = true;
     }
 
     fn set_mod_routing_polarity(

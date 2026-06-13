@@ -1865,10 +1865,33 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         18.0 + 4.0 + visible_rows as f32 * (row_h + row_gap) + 6.0
     };
 
+    // docs/plan_modulation.md §9: modulation rack — sources (create / list /
+    // live meter / remove) + per-lane follower routings (depth / polarity).
+    // Always shown so a source can be created; vertical budget caps the
+    // source / routing lists at 3 visible rows each (overflow off-screen,
+    // matching the sidechain section's no-scroll convention).
+    let mod_sources = app.mod_source_display();
+    let mod_lanes = app.cursor_mod_lanes();
+    let mod_routing_count: usize = mod_lanes.iter().map(|(_, _, _, rs)| rs.len()).sum();
+    let mod_vis_src = mod_sources.len().min(3);
+    let mod_vis_route = mod_routing_count.min(3);
+    // header+add(26) + src rows(22) + routing rows(22) + add-routing row(24)
+    // (the latter two only when at least one source exists) + 6 pad.
+    let mod_section_h = 18.0
+        + 4.0
+        + 26.0
+        + mod_vis_src as f32 * 22.0
+        + if mod_sources.is_empty() {
+            0.0
+        } else {
+            4.0 + mod_vis_route as f32 * 22.0 + 26.0
+        }
+        + 6.0;
+
     let list_x = area.x + pad;
     let list_y = y;
     let list_w = area.w - pad * 2.0;
-    let list_h = (btns_y - 6.0 - list_y - sc_section_h).max(0.0);
+    let list_h = (btns_y - 6.0 - list_y - sc_section_h - mod_section_h).max(0.0);
     let list_rect = Rect { x: list_x, y: list_y, w: list_w, h: list_h };
 
     let btn_gui_w = 44.0;
@@ -2013,6 +2036,213 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }));
             }
             row_y += row_h + row_gap;
+        }
+    }
+
+    // ---- Modulation rack (docs/plan_modulation.md §9) ----------------
+    // Sources: create from cursor track / live follower meter / remove.
+    // Routings: per cursor-track automation lane, follower modulation with
+    // depth + polarity. Sits above the Sidechain section.
+    {
+        let mut my = btns_y - sc_section_h - mod_section_h;
+        ui.label_at(
+            "inspector_mod_label",
+            "Modulation",
+            area.x + pad,
+            my,
+            12.0,
+            TEXT,
+        );
+        // [+ Src] creates a ModSource tapping the cursor track (PostFader).
+        // master has no own audio output to follow, so only non-master tracks.
+        if let Some(cursor) = app.cursor_track_id()
+            && cursor != common::model::MASTER_TRACK_ID
+        {
+            let add_w = 56.0;
+            let add_rect = Rect {
+                x: area.x + area.w - pad - add_w,
+                y: my - 2.0,
+                w: add_w,
+                h: 20.0,
+            };
+            ui.button_at("inspector_mod_add_src", "+ Src", add_rect, move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::AddModSource {
+                        source_track: cursor,
+                    });
+                })
+            });
+        }
+        my += 22.0;
+
+        // Source rows: name + block-char meter (live scalar) + remove.
+        for (i, (id, name, scalar)) in mod_sources.iter().take(3).enumerate() {
+            let bars = (scalar.clamp(0.0, 1.0) * 12.0).round() as usize;
+            let label = format!("{name}  {}", "\u{25ae}".repeat(bars));
+            ui.label_at(
+                ("inspector_mod_src", i),
+                &label,
+                area.x + pad,
+                my + 4.0,
+                11.0,
+                TEXT,
+            );
+            let rm_rect = Rect {
+                x: area.x + area.w - pad - 20.0,
+                y: my,
+                w: 20.0,
+                h: 20.0,
+            };
+            let sid = *id;
+            ui.button_at(("inspector_mod_src_rm", i), "\u{00d7}", rm_rect, move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::RemoveModSource { id: sid });
+                })
+            });
+            my += 22.0;
+        }
+
+        // Routings only make sense once a source exists.
+        if !mod_sources.is_empty() {
+            my += 4.0;
+            let src_name = |sid: u32| -> String {
+                mod_sources
+                    .iter()
+                    .find(|(id, _, _)| *id == sid)
+                    .map(|(_, n, _)| n.clone())
+                    .unwrap_or_else(|| format!("src {sid}"))
+            };
+            // Existing routings (flat across cursor lanes), capped at 3 rows.
+            let mut route_i = 0usize;
+            'routes: for (tid, lid, target, routings) in &mod_lanes {
+                for (sid, depth, bipolar) in routings {
+                    if route_i >= 3 {
+                        break 'routes;
+                    }
+                    let row_y = my;
+                    let lbl = format!("{target} \u{2190} {}", src_name(*sid));
+                    ui.label_at(
+                        ("inspector_mod_rt_lbl", route_i),
+                        &lbl,
+                        area.x + pad,
+                        row_y + 4.0,
+                        11.0,
+                        TEXT,
+                    );
+                    let depth_w = 46.0;
+                    let pol_w = 22.0;
+                    let rm_w = 20.0;
+                    let rm_x = area.x + area.w - pad - rm_w;
+                    let pol_x = rm_x - 4.0 - pol_w;
+                    let depth_x = pol_x - 4.0 - depth_w;
+                    let (t, l, s) = (*tid, *lid, *sid);
+                    // depth scrub (scrubable_number idiom)。 visual-only なので
+                    // ドラッグ中は LoadSong せず dirty マークのみ (handler 側)。
+                    ui.scrubable_number_at(
+                        ("inspector_mod_rt_depth", route_i),
+                        Rect {
+                            x: depth_x,
+                            y: row_y,
+                            w: depth_w,
+                            h: 20.0,
+                        },
+                        f64::from(*depth),
+                        1.0,
+                        ScrubableNumberFormat::Decimal(2),
+                        &SCRUB_STYLE_INSPECTOR,
+                        "Inspector",
+                        move |v| {
+                            Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::SetModRoutingDepth {
+                                    track_id: t,
+                                    lane_id: l,
+                                    source_id: s,
+                                    depth: v as f32,
+                                });
+                            })
+                        },
+                        None,
+                    );
+                    // polarity toggle (± = Bipolar, + = Unipolar)。
+                    let bip = *bipolar;
+                    ui.button_at(
+                        ("inspector_mod_rt_pol", route_i),
+                        if bip { "\u{00b1}" } else { "+" },
+                        Rect {
+                            x: pol_x,
+                            y: row_y,
+                            w: pol_w,
+                            h: 20.0,
+                        },
+                        move || {
+                            Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::SetModRoutingPolarity {
+                                    track_id: t,
+                                    lane_id: l,
+                                    source_id: s,
+                                    bipolar: !bip,
+                                });
+                            })
+                        },
+                    );
+                    ui.button_at(
+                        ("inspector_mod_rt_rm", route_i),
+                        "\u{00d7}",
+                        Rect {
+                            x: rm_x,
+                            y: row_y,
+                            w: rm_w,
+                            h: 20.0,
+                        },
+                        move || {
+                            Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::RemoveModRouting {
+                                    track_id: t,
+                                    lane_id: l,
+                                    source_id: s,
+                                });
+                            })
+                        },
+                    );
+                    my += 22.0;
+                    route_i += 1;
+                }
+            }
+            // Add-routing dropdown: "<lane target> <- <source>" combinations not
+            // yet wired. A single dropdown avoids persistent two-axis UI state.
+            let mut add_labels: Vec<String> = vec!["+ route\u{2026}".into()];
+            let mut add_payload: Vec<(u32, u32, u32)> = vec![(0, 0, 0)];
+            for (tid, lid, target, routings) in &mod_lanes {
+                for (sid, name, _) in &mod_sources {
+                    if routings.iter().any(|(rs, _, _)| rs == sid) {
+                        continue;
+                    }
+                    add_labels.push(format!("{target} \u{2190} {name}"));
+                    add_payload.push((*tid, *lid, *sid));
+                }
+            }
+            if add_labels.len() > 1 {
+                let label_refs: Vec<&str> = add_labels.iter().map(String::as_str).collect();
+                let dd_rect = Rect {
+                    x: area.x + pad,
+                    y: my,
+                    w: area.w - pad * 2.0,
+                    h: 22.0,
+                };
+                if let Some(picked) =
+                    ui.dropdown("inspector_mod_add_route", dd_rect, &label_refs, 0)
+                    && picked > 0
+                    && let Some(&(t, l, s)) = add_payload.get(picked)
+                {
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::AddModRouting {
+                            track_id: t,
+                            lane_id: l,
+                            source_id: s,
+                        });
+                    }));
+                }
+            }
         }
     }
 
