@@ -11,7 +11,7 @@
 
 #![allow(dead_code)]
 
-use common::automation::lane_value_at;
+use common::automation::effective_value_with_scalars;
 use common::model::{AutomationTarget, Song, TrackBuiltinParam};
 use common::process_data::ProcessData;
 
@@ -45,6 +45,10 @@ pub fn fill_track_param_ramps(
     volume_per_sample: &mut [f32],
     pan_per_sample: &mut [f32],
     recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    // docs/plan_modulation.md §5: per-`ModSource` follower scalars (block-rate
+    // snapshot, slot = `Song::mod_sources` position) so volume/pan lanes with
+    // `mod_routings` get modulated. Empty = no modulation.
+    mod_scalars: &[f32],
 ) {
     let frames = (frames as usize).min(volume_per_sample.len()).min(pan_per_sample.len());
     if frames == 0 {
@@ -99,7 +103,9 @@ pub fn fill_track_param_ramps(
         for (i, slot) in buf.iter_mut().enumerate().take(frames) {
             let sample_pos = playhead + i as u64;
             let beat = sample_pos as f64 / samples_per_beat;
-            *slot = lane_value_at(lane, &song.clip_contents, beat) as f32;
+            // docs/plan_modulation.md §2/§5: base (default+curve) に follower 変調を
+            // 合成。 mod_routings が空なら lane_value_at と byte 同一。
+            *slot = effective_value_with_scalars(song, lane, beat, mod_scalars) as f32;
         }
     }
 }
@@ -130,6 +136,9 @@ pub fn fill_pd_param_events(
     playhead: u64,
     frames: u32,
     recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    // docs/plan_modulation.md §5: follower scalars (block-rate snapshot) so
+    // PluginParam lanes with `mod_routings` get modulated. Empty = none.
+    mod_scalars: &[f32],
 ) {
     if frames == 0 || bpm <= 0.0 || sample_rate == 0 {
         return;
@@ -167,7 +176,8 @@ pub fn fill_pd_param_events(
             }
             _ => continue,
         };
-        let value = lane_value_at(lane, &song.clip_contents, beat);
+        // docs/plan_modulation.md §2/§5: base に follower 変調を合成。
+        let value = effective_value_with_scalars(song, lane, beat, mod_scalars);
         pd.push_param(0, param_id, value);
     }
 }
@@ -256,7 +266,7 @@ mod tests {
         let mut vol = vec![0.0_f32; 8];
         let mut pan = vec![0.5_f32; 8];
         let empty = empty_recording_lanes();
-        fill_track_param_ramps(None, 0, SR, 120.0, 0, 8, &mut vol, &mut pan, &empty);
+        fill_track_param_ramps(None, 0, SR, 120.0, 0, 8, &mut vol, &mut pan, &empty, &[]);
         assert!(vol.iter().all(|&v| (v - 1.0).abs() < 1e-6));
         assert!(pan.iter().all(|&p| p.abs() < 1e-6));
     }
@@ -286,6 +296,7 @@ mod tests {
             &mut vol,
             &mut pan,
             &empty,
+            &[],
         );
         assert!(vol.iter().all(|&v| (v - 0.7).abs() < 1e-6));
         assert!(pan.iter().all(|&p| (p - -0.25).abs() < 1e-6));
@@ -310,6 +321,7 @@ mod tests {
             &mut vol,
             &mut pan,
             &empty,
+            &[],
         );
         assert!(vol[0].abs() < 1e-6);
         assert!(vol[15] > 0.0 && vol[15] < 0.001, "vol[15]={}", vol[15]);
@@ -335,6 +347,7 @@ mod tests {
             &mut vol,
             &mut pan,
             &empty,
+            &[],
         );
         for &v in vol.iter() {
             assert!((v - 0.5).abs() < 0.001, "expected ~0.5, got {}", v);
@@ -359,6 +372,7 @@ mod tests {
             &mut vol,
             &mut pan,
             &empty,
+            &[],
         );
         // Bypass returns the lane's default — but `fill_track_param_ramps`
         // only writes the lane buffer when `enabled = true`. With the
@@ -387,6 +401,7 @@ mod tests {
             &mut vol,
             &mut pan,
             &empty,
+            &[],
         );
         for &v in vol.iter() {
             assert!((v - 0.5).abs() < 1e-6, "got {}", v);
@@ -423,6 +438,7 @@ mod tests {
             &mut vol,
             &mut pan,
             &recording,
+            &[],
         );
         for &v in vol.iter() {
             assert!(
@@ -454,6 +470,7 @@ mod tests {
             &mut vol,
             &mut pan,
             &empty,
+            &[],
         );
         for &v in vol.iter() {
             assert!((v - 0.5).abs() < 0.001, "expected curve eval (0.5), got {}", v);
@@ -519,7 +536,7 @@ mod tests {
         // Not recording: the curve value is pushed as a ParamValue event (read).
         let mut pd = ProcessData::empty();
         let empty = empty_recording_lanes();
-        fill_pd_param_events(&mut pd, &song, track_id, 0, SR, 120.0, 0, 64, &empty);
+        fill_pd_param_events(&mut pd, &song, track_id, 0, SR, 120.0, 0, 64, &empty, &[]);
         assert_eq!(pd.n_events_in, 1, "read mode must push the curve value");
 
         // Recording: the lane is skipped, so no curve event overwrites the
@@ -527,7 +544,7 @@ mod tests {
         let mut pd2 = ProcessData::empty();
         let mut rec = std::collections::HashSet::new();
         rec.insert((track_id, target));
-        fill_pd_param_events(&mut pd2, &song, track_id, 0, SR, 120.0, 0, 64, &rec);
+        fill_pd_param_events(&mut pd2, &song, track_id, 0, SR, 120.0, 0, 64, &rec, &[]);
         assert_eq!(pd2.n_events_in, 0, "recording lane curve must be suppressed");
     }
 }

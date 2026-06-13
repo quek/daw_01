@@ -349,6 +349,13 @@ pub struct LocalState {
     /// will move `compile_schedule` off the audio thread entirely and
     /// publish via `ArcSwap` for fully wait-free pickup.
     pub cached_schedule: Schedule,
+    /// docs/plan_modulation.md §5: reusable per-buffer snapshot of follower
+    /// scalars (slot = `ModSource` position), filled from
+    /// `cached_schedule.follower_slots` before dispatch (= the previous
+    /// buffer's envelopes) and published to the audio workers so volume / pan /
+    /// plugin-param lanes with `mod_routings` modulate. Reused across buffers
+    /// (no per-buffer allocation once warmed).
+    pub mod_scalars_snapshot: Vec<f32>,
     /// Last `Arc<Song>` we compiled the schedule from, kept alive so
     /// pointer equality is meaningful across buffers.
     pub cached_song: Option<Arc<Song>>,
@@ -386,6 +393,7 @@ impl LocalState {
             cmd_rx,
             shared,
             cached_schedule: Schedule::empty(),
+            mod_scalars_snapshot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
             cached_song: None,
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
@@ -838,6 +846,16 @@ impl LocalState {
             let audio_renderer_g = self.shared.audio_clip_renderer.load();
             let audio_renderer: &AudioClipRenderer = &audio_renderer_g;
 
+            // docs/plan_modulation.md §5: snapshot the previous buffer's
+            // follower envelopes (slot order = `ModSource` position) for audio-
+            // param modulation, reusing the buffer (no per-buffer alloc). The
+            // EnvelopeFollow nodes for THIS buffer run post-dispatch, so param
+            // events see the prior buffer's env — a ~1-buffer (block-rate) lag.
+            self.mod_scalars_snapshot.clear();
+            for fs in &self.cached_schedule.follower_slots {
+                self.mod_scalars_snapshot.push(fs.env);
+            }
+
             // Fan the per-track work out across the audio worker pool
             // when one is bound; otherwise fall back to serial dispatch
             // through `worker_syncs[0]` (still correct, just slower).
@@ -862,6 +880,7 @@ impl LocalState {
                     self.playhead_beats,
                     self.granular_tempo_smoothed,
                     looping,
+                    &self.mod_scalars_snapshot,
                 );
             } else {
                 let worker_sync = worker_syncs_g.first();
@@ -894,6 +913,7 @@ impl LocalState {
                         self.playhead_beats,
                         self.granular_tempo_smoothed,
                         looping,
+                        &self.mod_scalars_snapshot,
                     );
                 }
             }
@@ -1185,6 +1205,11 @@ pub fn process_track_owned(
     granular_tempo_smoothed: f64,
     // user の loop button 実状態 (= `shared.looping`)。 set_pd_transport に渡す。
     looping: bool,
+    // docs/plan_modulation.md §5: per-`ModSource` follower scalars (block-rate
+    // snapshot, slot = `Song::mod_sources` position). fill_track_param_ramps /
+    // fill_pd_param_events に渡して volume/pan/plugin param を follower 変調する。
+    // 空なら変調なし (= 既存挙動と byte 同一)。
+    mod_scalars: &[f32],
 ) {
     let n = frames as usize;
 
@@ -1317,6 +1342,7 @@ pub fn process_track_owned(
                 playhead,
                 frames,
                 recording_lanes,
+                mod_scalars,
             );
         }
         // ---- inputs: device の port を持つものだけ現在のバスを渡す ----
@@ -1430,6 +1456,7 @@ pub fn process_track_owned(
         &mut scratch.volume_per_sample,
         &mut scratch.pan_per_sample,
         recording_lanes,
+        mod_scalars,
     );
     let mut peak_l = 0.0_f32;
     let mut peak_r = 0.0_f32;
@@ -2109,6 +2136,9 @@ fn run_group_fx_chain(
             playhead,
             frames,
             recording_lanes,
+            // group/master fx の param follower 変調は follow-up (post-dispatch
+            // 段でのスナップショット plumbing 未配線)。 track param 変調が主用途。
+            &[],
         );
         if ports.has_audio_input {
             pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
@@ -2170,6 +2200,8 @@ fn run_group_fx_chain(
         &mut scratch.volume_per_sample,
         &mut scratch.pan_per_sample,
         recording_lanes,
+        // group/master bus の volume/pan follower 変調は follow-up。
+        &[],
     );
     let mut peak_l = 0.0_f32;
     let mut peak_r = 0.0_f32;

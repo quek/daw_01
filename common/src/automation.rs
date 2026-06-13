@@ -1045,4 +1045,38 @@ mod tests {
             "near_end in (150, 180), got {v_near_end}"
         );
     }
+
+    #[test]
+    fn effective_value_adds_unipolar_modulation() {
+        use crate::model::{
+            AutomationLane, AutomationTarget, ModRouting, Polarity, TrackBuiltinParam,
+        };
+        // docs/plan_modulation.md §2: base (default 1.0, no curve) + a unipolar
+        // routing. scalar 0 → base (byte-identical to lane_value_at); scalar
+        // 1.0 raises the value; with no routings effective == lane_value_at.
+        let mut lane =
+            AutomationLane::new(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume), 1.0);
+        let cc = std::collections::HashMap::new();
+        let base = lane_value_at(&lane, &cc, 0.0);
+        assert_eq!(
+            effective_value(&lane, &cc, 0.0, |_| 0.5),
+            base,
+            "no routings → effective == base regardless of scalars"
+        );
+        lane.mod_routings.push(ModRouting {
+            source_id: 5,
+            depth: 0.5,
+            polarity: Polarity::Unipolar,
+        });
+        assert_eq!(
+            effective_value(&lane, &cc, 0.0, |_| 0.0),
+            base,
+            "scalar 0 → base (no modulation)"
+        );
+        let v_full = effective_value(&lane, &cc, 0.0, |sid| if sid == 5 { 1.0 } else { 0.0 });
+        assert!(
+            v_full > base,
+            "unipolar depth 0.5 at scalar 1.0 must raise above base ({base} vs {v_full})"
+        );
+    }
 }

@@ -196,6 +196,9 @@ fn render_loop(
     // render buffer (keyed by beat) so the offline video render reproduces the
     // live preview's modulation. Written to a sidecar next to the WAV.
     let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(schedule.follower_slots.len());
+    // docs/plan_modulation.md §5: reusable per-buffer follower scalar snapshot
+    // (prev buffer's env) for audio-param modulation, mirroring the live engine.
+    let mut mod_scalars_snapshot: Vec<f32> = Vec::with_capacity(schedule.follower_slots.len());
 
     // Frame counter for the WAV output. Walking the song always starts
     // at frame 0 so plugin state at `write_start` is properly built up,
@@ -239,6 +242,13 @@ fn render_loop(
         // LP smoothing も不要 (= 過渡応答が無い、 click 源も無い)。
         const GRANULAR_TEMPO_SMOOTHED_FREEWHEEL: f64 = 1.0;
 
+        // docs/plan_modulation.md §5: snapshot the prev buffer's follower envs
+        // (slot order) so audio-param modulation renders into the WAV too.
+        mod_scalars_snapshot.clear();
+        for fs in &schedule.follower_slots {
+            mod_scalars_snapshot.push(fs.env);
+        }
+
         if let Some(pool) = pool_g.as_deref() {
             pool.dispatch_and_wait(
                 Some(song),
@@ -261,6 +271,7 @@ fn render_loop(
                 GRANULAR_TEMPO_SMOOTHED_FREEWHEEL,
                 // export (freewheel render) は loop しない。
                 false,
+                &mod_scalars_snapshot,
             );
         } else {
             let worker_sync = worker_syncs_g.first();
@@ -293,6 +304,7 @@ fn render_loop(
                     GRANULAR_TEMPO_SMOOTHED_FREEWHEEL,
                     // export (freewheel render) は loop しない。
                     false,
+                    &mod_scalars_snapshot,
                 );
             }
         }
