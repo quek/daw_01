@@ -3726,6 +3726,39 @@ pub enum AppEvent {
         port: u8,
         source: Option<u32>,
     },
+    /// docs/plan_modulation.md §9: create a project-level `ModSource` tapping
+    /// `source_track` (PostFader, default follower).
+    AddModSource { source_track: u32 },
+    /// remove the `ModSource` with id `id` and every `ModRouting` referencing it.
+    RemoveModSource { id: u32 },
+    /// add a follower modulation `ModRouting` on lane `(track_id, lane_id)`
+    /// (`track_id == MASTER_TRACK_ID` → `song_lanes`) driven by `ModSource`
+    /// `source_id`. No-op if the lane already routes that source.
+    AddModRouting {
+        track_id: u32,
+        lane_id: u32,
+        source_id: u32,
+    },
+    RemoveModRouting {
+        track_id: u32,
+        lane_id: u32,
+        source_id: u32,
+    },
+    /// set a routing's modulation depth (normalized-domain amount, clamped
+    /// to `-1..=1`).
+    SetModRoutingDepth {
+        track_id: u32,
+        lane_id: u32,
+        source_id: u32,
+        depth: f32,
+    },
+    /// toggle a routing's polarity (`true` = Bipolar, `false` = Unipolar).
+    SetModRoutingPolarity {
+        track_id: u32,
+        lane_id: u32,
+        source_id: u32,
+        bipolar: bool,
+    },
     /// inspector chain (= `Track.devices` / `master_fx_chain` を一列にした list)
     /// の reorder。`order` は gui_01 契約 `new[i] = items[order[i]]`。単一デバイス
     /// チェーン化で **棄却なしの純 permutation** (役割は位置から再導出)。
@@ -5159,6 +5192,30 @@ impl AppData {
             } => {
                 self.set_sidechain_source(track_id, device_index, port, source);
             }
+            AppEvent::AddModSource { source_track } => self.add_mod_source(source_track),
+            AppEvent::RemoveModSource { id } => self.remove_mod_source(id),
+            AppEvent::AddModRouting {
+                track_id,
+                lane_id,
+                source_id,
+            } => self.add_mod_routing(track_id, lane_id, source_id),
+            AppEvent::RemoveModRouting {
+                track_id,
+                lane_id,
+                source_id,
+            } => self.remove_mod_routing(track_id, lane_id, source_id),
+            AppEvent::SetModRoutingDepth {
+                track_id,
+                lane_id,
+                source_id,
+                depth,
+            } => self.set_mod_routing_depth(track_id, lane_id, source_id, depth),
+            AppEvent::SetModRoutingPolarity {
+                track_id,
+                lane_id,
+                source_id,
+                bipolar,
+            } => self.set_mod_routing_polarity(track_id, lane_id, source_id, bipolar),
             AppEvent::ReorderInspectorChain(order) => {
                 self.reorder_inspector_chain(&order);
             }
@@ -15012,6 +15069,98 @@ impl AppData {
         // Phase 1: UI は常に PostFader タップを張る (旧 sidechain と同挙動)。
         // Pre/PostFx トグルは Phase 6 で追加する (docs/plan_modulation.md §9)。
         inst.aux_inputs[port_idx] = source.map(common::model::AuxInputRoute::post_fader);
+        self.sync_song_to_plugin_host();
+    }
+
+    // ---- docs/plan_modulation.md §9: modulation source / routing CRUD ----
+    // すべて `Song` を mutate して `sync_song_to_plugin_host` で締める
+    // (audio engine が follower schedule を再 compile、 preview が再合成)。
+
+    fn add_mod_source(&mut self, source_track: u32) {
+        let id = self.song.alloc_mod_source_id();
+        self.song.mod_sources.push(common::model::ModSource {
+            id,
+            tap: common::model::AudioTap::post_fader(source_track),
+            follower: common::model::FollowerConfig::default(),
+        });
+        self.sync_song_to_plugin_host();
+    }
+
+    fn remove_mod_source(&mut self, id: u32) {
+        self.song.mod_sources.retain(|m| m.id != id);
+        // この source を指す全 routing を掃除 (dangling は scalar 0 になるが、
+        // 残すと UI に幽霊 routing が出るので明示削除)。
+        for t in &mut self.song.tracks {
+            for l in &mut t.automation_lanes {
+                l.mod_routings.retain(|r| r.source_id != id);
+            }
+        }
+        for l in &mut self.song.song_lanes {
+            l.mod_routings.retain(|r| r.source_id != id);
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// Resolve `(track_id, lane_id)` to a mutable `AutomationLane`
+    /// (`MASTER_TRACK_ID` → `song_lanes`).
+    fn mod_lane_mut(
+        &mut self,
+        track_id: u32,
+        lane_id: u32,
+    ) -> Option<&mut common::model::AutomationLane> {
+        let lanes = if track_id == common::model::MASTER_TRACK_ID {
+            &mut self.song.song_lanes
+        } else {
+            &mut self.song.track_by_id_mut(track_id)?.automation_lanes
+        };
+        lanes.iter_mut().find(|l| l.id == lane_id)
+    }
+
+    fn add_mod_routing(&mut self, track_id: u32, lane_id: u32, source_id: u32) {
+        if let Some(lane) = self.mod_lane_mut(track_id, lane_id)
+            && !lane.mod_routings.iter().any(|r| r.source_id == source_id)
+        {
+            lane.mod_routings.push(common::model::ModRouting {
+                source_id,
+                depth: 1.0,
+                polarity: common::model::Polarity::Unipolar,
+            });
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    fn remove_mod_routing(&mut self, track_id: u32, lane_id: u32, source_id: u32) {
+        if let Some(lane) = self.mod_lane_mut(track_id, lane_id) {
+            lane.mod_routings.retain(|r| r.source_id != source_id);
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    fn set_mod_routing_depth(&mut self, track_id: u32, lane_id: u32, source_id: u32, depth: f32) {
+        if let Some(lane) = self.mod_lane_mut(track_id, lane_id)
+            && let Some(r) = lane.mod_routings.iter_mut().find(|r| r.source_id == source_id)
+        {
+            r.depth = depth.clamp(-1.0, 1.0);
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    fn set_mod_routing_polarity(
+        &mut self,
+        track_id: u32,
+        lane_id: u32,
+        source_id: u32,
+        bipolar: bool,
+    ) {
+        if let Some(lane) = self.mod_lane_mut(track_id, lane_id)
+            && let Some(r) = lane.mod_routings.iter_mut().find(|r| r.source_id == source_id)
+        {
+            r.polarity = if bipolar {
+                common::model::Polarity::Bipolar
+            } else {
+                common::model::Polarity::Unipolar
+            };
+        }
         self.sync_song_to_plugin_host();
     }
 
