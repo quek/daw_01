@@ -1321,6 +1321,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             })
         },
         None,
+        None,
     );
 
     // strip 背景

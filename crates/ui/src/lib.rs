@@ -89,7 +89,8 @@ pub use widgets::reorderable_list::{
     ReorderableListEditRequest, ReorderableListResponse, ReorderableListStyle,
 };
 pub use widgets::scrubable_number::{
-    ScrubableNumberFormat, ScrubableNumberResponse, ScrubableNumberStyle,
+    ModEdit, ModEntry, Modulation, ScrubableNumberFormat, ScrubableNumberResponse,
+    ScrubableNumberStyle,
 };
 pub use widgets::button::ButtonTextAlign;
 pub use widgets::text_input::TextInputResponse;

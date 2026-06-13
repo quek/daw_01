@@ -90,6 +90,58 @@ impl Default for ScrubableNumberStyle {
     }
 }
 
+/// 割り当て済み 1 本の modulation routing の視覚化記述 (Bitwig 流の色帯、 daw_01 #107)。
+///
+/// `depth` は **widget が描く plain 値単位** (= [`ScrubableNumberStyle::range`] と同じ値ドメイン)。
+/// polarity (bipolar の `±` / unipolar の片側) は caller が符号で解決して渡す前提で、 widget は
+/// `base` から `base + depth` までを 1 本の帯として描くだけ。
+#[derive(Debug, Clone, Copy)]
+pub struct ModEntry {
+    /// source に割り当てられた色。 複数 entry は strip を縦に等分して各々この色で描く。
+    pub color: Color,
+    /// base からの到達量 (plain 値単位、 符号付き)。 0 で帯なし。
+    pub depth: f64,
+}
+
+/// depth ドラッグ編集 (= ある source を arm = 割当モードにしている) の記述 (daw_01 #107)。
+///
+/// `Modulation::edit` が `Some` の間、 widget の press + 縦 drag は **base 値でなく depth** を
+/// 変化させ (base scrub は抑止 = 非破壊)、 移動した hold frame ごとに `on_mod_change(new_depth)`
+/// を発火する。 undo bracket は [`ScrubableNumberResponse::mod_dragging`] の edge を見て daw が
+/// 発火する想定 (base scrub と違い widget は Undoable wrap しない)。
+pub struct ModEdit<'a, M: ?Sized + 'static> {
+    /// 編集中 source の色 (= 枠 / 編集帯の強調に使う)。
+    pub source_color: Color,
+    /// 現在の depth (plain 値単位、 polarity 解決済)。 drag anchor の初期値。
+    pub current_depth: f64,
+    /// depth の clamp 範囲 (plain 値単位)。 `None` で clamp 無し。
+    pub depth_range: Option<(f64, f64)>,
+    /// depth drag の sensitivity (units_per_pixel)。 `None` で [`ScrubableNumberStyle::sensitivity`]
+    /// を流用 (depth が base と同じ値スパンなら自然)。 depth_range のスパンが base range と大きく
+    /// 異なり「同じ px で同じ割合動かしたい」 ときは `Some` で専用値を渡す (daw_01 #107 で 流用/専用
+    /// 両対応の要望)。
+    pub depth_sensitivity: Option<f32>,
+    /// depth 変化時の Edit を作る closure。 widget が即時 call して `push_edit` するため
+    /// `'static` / `Clone` / `Send` は不要 (= borrow で渡せる)。 返す Edit の制約のみ caller 責任。
+    pub on_mod_change: &'a dyn Fn(f64) -> Edit<M>,
+}
+
+/// `scrubable_number_at` に渡す Bitwig 流 modulation 記述 (optional、 daw_01 #107)。
+///
+/// `None` で従来描画・従来挙動 (完全回帰)。 `Some` でも `entries` 空 + `live_value` None +
+/// `edit` None なら描画差分なし。 帯 / live tick の位置算出には [`ScrubableNumberStyle::range`]
+/// が必須 (range 無しのとき帯は描かれず、 depth-edit の枠強調のみ出る)。
+pub struct Modulation<'a, M: ?Sized + 'static> {
+    /// 割り当て済み routing の視覚化 (色帯で重畳描画)。 空で帯なし。
+    pub entries: &'a [ModEntry],
+    /// 変調後の現在実値 (= 可動 live tick)。 **plain 値単位** ([`ScrubableNumberStyle::range`] と
+    /// 同じドメイン、 正規化値でない)。 `None` で描かない。 ~30Hz 更新前提で overlay 描画
+    /// (= cache に載せず毎フレーム描く)。
+    pub live_value: Option<f64>,
+    /// `Some` で depth ドラッグ編集モード (base scrub 抑止)。 `None` で従来 base scrub。
+    pub edit: Option<ModEdit<'a, M>>,
+}
+
 /// `scrubable_number_at` の戻り値。
 ///
 /// `bool` field を 3 つ持つが、 各々 (hovered / dragging / editing_text / committed) は
@@ -105,6 +157,10 @@ pub struct ScrubableNumberResponse {
     /// drag scrub 中 (= press → 4px 以上動いた状態 → release まで true)。 edge 検出で
     /// caller が `ParamGestureBegin/End` を発火する。
     pub dragging: bool,
+    /// modulation depth の drag 編集中 (= `Modulation::edit` Some + press → 4px 超 → release まで)。
+    /// edge 検出で caller が `ParamGestureBegin/End` 相当の undo bracket を発火する (daw_01 #107)。
+    /// base `dragging` とは排他 (depth-edit 中は base scrub を抑止する)。
+    pub mod_dragging: bool,
     /// text input mode に入っているか (= キーボード入力受付中、 cursor 表示)。
     pub editing_text: bool,
     /// 文字入力 commit (Enter or NumpadEnter) の瞬間 true、 1 frame のみ。
@@ -137,9 +193,13 @@ pub(crate) struct ScrubableNumberState {
 #[derive(Debug, Clone, Copy)]
 struct DragAnchor {
     pointer_y: f32,
+    /// 基準値。 base scrub では press 時の base 値、 depth-edit では press 時の depth 値。
     value: f64,
     /// 押下時の Ctrl 状態。 mid-drag で Ctrl toggle 時に再 anchor する判定用 (knob/fader と同 idiom)。
     ctrl: bool,
+    /// この gesture が depth-edit (= `Modulation::edit` Some) で開始したか。 true なら drag は
+    /// base でなく depth を変化させる。 gesture 途中で固定 (arm 状態が変わっても継続)。
+    depth_drag: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -195,6 +255,11 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
     ///   drag scrub 中 / 編集中は live 値・編集中テキストを優先 (placeholder 抑制)。 編集開始時の
     ///   text_input seed は placeholder ではなく渡された base `value` を `format` した文字列。
     ///   通常は `None`。
+    /// `modulation`: `Some` で Bitwig 流 modulation を表示・編集する (daw_01 #107)。 `None` で
+    ///   従来描画・従来挙動 (完全回帰)。 [`Modulation::entries`] を base 値からの色帯で重畳描画、
+    ///   [`Modulation::live_value`] を可動 tick で描画、 [`Modulation::edit`] が `Some` のとき
+    ///   press + 縦 drag は base でなく depth を変化させ `on_mod_change` を発火する (base scrub 抑止)。
+    ///   帯 / tick の位置算出には `style.range` が必須 (無いと depth-edit 枠強調のみ)。
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn scrubable_number_at<F>(
         &mut self,
@@ -207,6 +272,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         label: &'static str,
         on_change: F,
         placeholder: Option<&str>,
+        modulation: Option<Modulation<'_, M>>,
     ) -> ScrubableNumberResponse
     where
         F: Fn(f64) -> Edit<M> + Clone + Send + Sync + 'static,
@@ -220,10 +286,25 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         let pointer = self.pointer;
         let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
 
+        // ---- modulation 記述の展開 (None = 完全回帰、 borrow のみ取り出す) ----
+        let mod_ref = modulation.as_ref();
+        let mod_entries: &[ModEntry] = mod_ref.map_or(&[], |m| m.entries);
+        let mod_live = mod_ref.and_then(|m| m.live_value);
+        let mod_edit = mod_ref.and_then(|m| m.edit.as_ref());
+        let depth_mode = mod_edit.is_some();
+        let current_depth = mod_edit.map_or(0.0, |e| e.current_depth);
+        let depth_range = mod_edit.and_then(|e| e.depth_range);
+        // depth drag の sensitivity: ModEdit 指定が無ければ base scrub の sensitivity を流用。
+        let depth_sens = mod_edit
+            .and_then(|e| e.depth_sensitivity)
+            .unwrap_or(style.sensitivity);
+
         // ---- press / drag / release 処理 (knob と同 pattern + drag distance 計測) ----
         let mut reset_fired = false;
         let mut release_initial_value: Option<f64> = None;
         let mut short_click_release = false;
+        // depth gesture の release frame で確定する最終 depth (= pointer の最終位置から再計算)。
+        let mut release_depth: Option<f64> = None;
         let (drag_anchor, drag_distance_y, was_editing) = {
             let state: &mut ScrubableNumberState = self.widget_state(wid);
 
@@ -237,8 +318,9 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                         && (c.pos.0 - px).hypot(c.pos.1 - py) < DOUBLE_CLICK_PX
                 });
 
-                if is_double {
-                    // dblclick → default reset (= editing も解除)。
+                if is_double && !depth_mode {
+                    // dblclick → default reset (= editing も解除)。 depth-edit 中は base を
+                    // 触らない (非破壊) ので dblclick reset は抑止し下の通常 press 扱いにする。
                     state.last_click = None;
                     state.drag_anchor = None;
                     state.drag_initial_value = None;
@@ -247,10 +329,13 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                     reset_fired = true;
                 } else {
                     state.last_click = Some(ClickRecord { when: now, pos: (px, py) });
+                    // depth-edit 中は anchor の基準値を base でなく現 depth にする。
+                    let anchor_value = if depth_mode { current_depth } else { value };
                     state.drag_anchor = Some(DragAnchor {
                         pointer_y: py,
-                        value,
+                        value: anchor_value,
                         ctrl: pointer.modifiers.ctrl,
+                        depth_drag: depth_mode,
                     });
                     state.drag_initial_value = Some(value);
                     state.drag_distance_y = 0.0;
@@ -261,14 +346,17 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             }
 
             // mid-drag で Ctrl toggle されたら anchor 再設定 (= 値 jump 回避、 knob/fader と同 idiom)。
+            // depth-edit gesture は depth 基準で、 base gesture は base 基準で再 anchor する。
             if let Some(anchor) = state.drag_anchor
                 && let Some((_, py)) = pointer.pos
                 && pointer.modifiers.ctrl != anchor.ctrl
             {
+                let anchor_value = if anchor.depth_drag { current_depth } else { value };
                 state.drag_anchor = Some(DragAnchor {
                     pointer_y: py,
-                    value,
+                    value: anchor_value,
                     ctrl: pointer.modifiers.ctrl,
+                    depth_drag: anchor.depth_drag,
                 });
             }
 
@@ -281,43 +369,85 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             }
 
             if pointer.primary_just_released {
-                release_initial_value = state.drag_initial_value.take();
+                let anchor_opt = state.drag_anchor;
+                let init = state.drag_initial_value.take();
                 let dist = state.drag_distance_y;
-                let was_pressed = state.drag_anchor.is_some();
+                let was_pressed = anchor_opt.is_some();
+                let was_depth = anchor_opt.is_some_and(|a| a.depth_drag);
                 state.drag_anchor = None;
                 state.drag_distance_y = 0.0;
-                // short-click (= drag < threshold、 rect 内 release) → text input mode へ遷移。
-                if was_pressed && dist < DRAG_THRESHOLD_PX && inside && !reset_fired {
-                    state.editing = true;
-                    short_click_release = true;
+                if was_depth {
+                    // depth gesture の release: per-frame は anchor が None になる release frame
+                    // で fire しないため、 pointer の最終位置から depth を再計算して 1 度確定発火する
+                    // (release frame で pointer が動いていた場合の最終値取りこぼし防止、 daw_01 #107
+                    // 「release で最終 depth も発火」)。 閾値超 (= 実 drag) のみ。
+                    if dist >= DRAG_THRESHOLD_PX
+                        && let (Some(anchor), Some((_, py))) = (anchor_opt, pointer.pos)
+                    {
+                        release_depth =
+                            Some(clamp_opt(raw_drag_value(anchor, py, depth_sens), depth_range));
+                    }
+                } else {
+                    // base scrub のみ release で undoable wrap するため release_initial_value を残し、
+                    // short-click → text input mode も base gesture 限定 (depth は text 編集しない)。
+                    release_initial_value = init;
+                    if was_pressed && dist < DRAG_THRESHOLD_PX && inside && !reset_fired {
+                        state.editing = true;
+                        short_click_release = true;
+                    }
                 }
             }
 
             (state.drag_anchor, state.drag_distance_y, state.editing)
         };
 
-        // ---- 表示値の決定 (reset > drag > value) ----
+        // ---- 表示値の決定 ----
+        // base 数値テキスト: reset > base scrub (depth-edit gesture 中は抑止) > value。
         let displayed_value = if reset_fired {
             default_value
-        } else if let (Some(anchor), Some((_, py))) = (drag_anchor, pointer.pos) {
-            let scale = if anchor.ctrl { FINE_DRAG_SCALE } else { 1.0 };
-            // 縦 drag: 上方向 (py < anchor_y) で値増加、 下方向で減少 (= DAW 慣習)。
-            let dy_px = -(py - anchor.pointer_y);
-            let raw_delta = f64::from(dy_px) * f64::from(style.sensitivity) * f64::from(scale);
-            let raw = anchor.value + raw_delta;
-            if let Some((min, max)) = style.range {
-                raw.clamp(min, max)
-            } else {
-                raw
-            }
+        } else if let (Some(anchor), Some((_, py))) = (drag_anchor, pointer.pos)
+            && !anchor.depth_drag
+        {
+            clamp_opt(raw_drag_value(anchor, py, style.sensitivity), style.range)
         } else {
             value
+        };
+
+        // depth 値 (= modulation 帯 + on_mod_change): depth-edit gesture drag 中のみ更新。
+        let displayed_depth = if let (Some(anchor), Some((_, py))) = (drag_anchor, pointer.pos)
+            && anchor.depth_drag
+        {
+            clamp_opt(raw_drag_value(anchor, py, depth_sens), depth_range)
+        } else {
+            current_depth
         };
 
         // ---- on_change 発火 (drag 中 = per-frame、 reset 1 回、 release final、 commit 1 回) ----
         let mut committed = false;
         let mut edit_text: Option<String> = None;
-        let dragging_now = drag_anchor.is_some() && drag_distance_y >= DRAG_THRESHOLD_PX;
+        // base scrub と depth-edit は排他 (anchor.depth_drag で判定)。
+        let dragging_now =
+            drag_anchor.is_some_and(|a| !a.depth_drag) && drag_distance_y >= DRAG_THRESHOLD_PX;
+        let mod_dragging =
+            drag_anchor.is_some_and(|a| a.depth_drag) && drag_distance_y >= DRAG_THRESHOLD_PX;
+
+        // depth (modulation) per-frame 発火: depth-edit gesture が hold 中 (release 後は anchor が
+        // None になり displayed_depth == current_depth で skip)。 release は per-frame 済 + daw が
+        // mod_dragging falling edge で undo bracket するため widget 側で追加 commit はしない。
+        if let Some(edit) = mod_edit
+            && drag_anchor.is_some_and(|a| a.depth_drag)
+            && (displayed_depth - current_depth).abs() > f64::EPSILON
+        {
+            self.push_edit((edit.on_mod_change)(displayed_depth));
+        }
+
+        // depth release-frame の最終確定発火 (= 上の per-frame は release frame で skip される)。
+        if let Some(edit) = mod_edit
+            && let Some(final_depth) = release_depth
+            && (final_depth - current_depth).abs() > f64::EPSILON
+        {
+            self.push_edit((edit.on_mod_change)(final_depth));
+        }
 
         // reset: dblclick で default にリセット (1 frame、 Undoable で Ctrl+Z 戻し可)。
         if reset_fired && (default_value - value).abs() > f64::EPSILON {
@@ -439,12 +569,30 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             self.with_widget_node(wid, input_hash, |ui| {
                 draw_scrubable_number(ui, rect, &text, bg_fill, &style_copy);
             });
+
+            // ---- modulation overlay (= cache node の外、 毎フレーム描画) ----
+            // live_value は ~30Hz 更新、 base/depth は drag 追従なので cache に載せず overlay 化。
+            // bg/text の cache node は modulation 非依存のまま据え置き (None で完全回帰)。
+            // piano_roll の `draw_lyrics` と同じ「overlay は cache の後に描く」 idiom。
+            if mod_ref.is_some() {
+                draw_modulation_overlay(
+                    self,
+                    rect,
+                    style,
+                    displayed_value,
+                    displayed_depth,
+                    mod_entries,
+                    mod_live,
+                    mod_edit.map(|e| e.source_color),
+                );
+            }
         }
 
         ScrubableNumberResponse {
             displayed_value,
             hovered: hovered(rect, pointer),
             dragging: dragging_now,
+            mod_dragging,
             editing_text: was_editing,
             committed,
             edit_text,
@@ -484,6 +632,136 @@ fn draw_scrubable_number<M: ?Sized + 'static>(
         clip_rect: Some(rect),
         ..GlyphArea::default()
     });
+}
+
+/// anchor + 現 pointer_y から raw drag 値を出す (base / depth 共用)。 縦 drag 上方向で増加、
+/// Ctrl で `FINE_DRAG_SCALE` 倍精細 (sensitivity は units_per_pixel)。
+fn raw_drag_value(anchor: DragAnchor, py: f32, sensitivity: f32) -> f64 {
+    let scale = if anchor.ctrl { FINE_DRAG_SCALE } else { 1.0 };
+    // 上方向 (py < anchor_y) で値増加、 下方向で減少 (= DAW 慣習)。
+    let dy_px = -(py - anchor.pointer_y);
+    anchor.value + f64::from(dy_px) * f64::from(sensitivity) * f64::from(scale)
+}
+
+/// `Some(range)` のとき clamp、 `None` でそのまま。
+fn clamp_opt(v: f64, range: Option<(f64, f64)>) -> f64 {
+    match range {
+        Some((min, max)) => v.clamp(min, max),
+        None => v,
+    }
+}
+
+/// modulation の色帯 + base マーカー + live tick + depth-edit 枠強調を描く (daw_01 #107)。
+///
+/// cache node の **後** に毎フレーム呼ばれる overlay (= live_value 30Hz / drag 追従でも
+/// bg/text の cache を無効化しない)。 帯 / tick の位置算出には `style.range` が必須で、 無い
+/// ときは depth-edit の枠強調だけ出して帯は描かない。
+#[allow(clippy::too_many_arguments)]
+fn draw_modulation_overlay<M: ?Sized + 'static>(
+    ui: &mut Ui<'_, M>,
+    rect: Rect,
+    style: &ScrubableNumberStyle,
+    base_value: f64,
+    edit_depth: f64,
+    entries: &[ModEntry],
+    live_value: Option<f64>,
+    edit_color: Option<Color>,
+) {
+    // depth-edit 中の枠強調 (range の有無に関係なく出す)。
+    if let Some(c) = edit_color {
+        ui.push_rect(RectCommand {
+            rect,
+            fill: Color::TRANSPARENT,
+            border: c,
+            border_width: 1.5,
+            radius: [style.radius; 4],
+            clip_rect: None,
+        });
+    }
+
+    // 帯 / tick は値→x 写像が要る = range 必須。 無ければ枠強調のみで return。
+    let Some((min, max)) = style.range else {
+        return;
+    };
+    if max <= min {
+        return;
+    }
+    let inset = 2.0_f32;
+    let track_w = (rect.w - inset * 2.0).max(0.0);
+    let value_to_x = |v: f64| -> f32 {
+        // 非有限 (NaN/Inf) は track 左端に丸めて renderer に NaN 座標を渡さない
+        // (caller bug 防御、 format_value と同じ姿勢)。
+        if !v.is_finite() {
+            return rect.x + inset;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let t = (((v - min) / (max - min)) as f32).clamp(0.0, 1.0);
+        rect.x + inset + t * track_w
+    };
+
+    // 帯の strip (rect 下端、 数値テキストに被らない位置)。
+    let strip_h = (rect.h * 0.16).clamp(2.5, 4.0);
+    let strip_y = rect.y + rect.h - strip_h - 1.0;
+    let base_x = value_to_x(base_value);
+
+    // 割り当て済み routing を色帯で重畳 (複数は strip を縦に等分し各 row に 1 本ずつ)。
+    let n = entries.len().max(1);
+    #[allow(clippy::cast_precision_loss)]
+    let row_h = (strip_h / n as f32).max(1.0);
+    for (i, e) in entries.iter().enumerate() {
+        let end_x = value_to_x(base_value + e.depth);
+        let (x0, x1) = (base_x.min(end_x), base_x.max(end_x));
+        #[allow(clippy::cast_precision_loss)]
+        let ry = strip_y + i as f32 * row_h;
+        ui.push_rect(RectCommand {
+            rect: Rect { x: x0, y: ry, w: (x1 - x0).max(1.0), h: row_h },
+            fill: Color { a: 0.9, ..e.color },
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [0.0; 4],
+            clip_rect: Some(rect),
+        });
+    }
+
+    // depth-edit 中: 編集中 depth を source 色で strip 全高に重ね描き (drag の live feedback)。
+    if let Some(c) = edit_color {
+        let end_x = value_to_x(base_value + edit_depth);
+        let (x0, x1) = (base_x.min(end_x), base_x.max(end_x));
+        ui.push_rect(RectCommand {
+            rect: Rect { x: x0, y: strip_y, w: (x1 - x0).max(1.0), h: strip_h },
+            fill: Color { a: 0.85, ..c },
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [0.0; 4],
+            clip_rect: Some(rect),
+        });
+    }
+
+    // base 位置のマーカー (= 帯の起点、 細い縦線)。 帯 / live tick / edit の **いずれも無い**
+    // 空 modulation では描かない (= `Some` でも全内容空なら描画差分なしの contract を守る)。
+    if !entries.is_empty() || live_value.is_some() || edit_color.is_some() {
+        ui.push_rect(RectCommand {
+            rect: Rect { x: base_x - 0.5, y: strip_y - 1.0, w: 1.0, h: strip_h + 2.0 },
+            fill: Color::rgba(0.70, 0.70, 0.75, 0.85),
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [0.0; 4],
+            clip_rect: Some(rect),
+        });
+    }
+
+    // live 変調値の可動 tick (最前面、 明るい縦線)。
+    if let Some(lv) = live_value {
+        let lx = value_to_x(lv);
+        ui.push_rect(RectCommand {
+            rect: Rect { x: lx - 0.75, y: strip_y - 2.0, w: 1.5, h: strip_h + 4.0 },
+            fill: Color::rgba(0.98, 0.98, 1.0, 0.95),
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [0.0; 4],
+            clip_rect: Some(rect),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +829,7 @@ mod tests {
                     "scrub bpm",
                     |v| Edit::mutate(move |m: &mut BpmModel| m.bpm = v),
                     placeholder,
+                    None,
                 );
             },
         )
@@ -809,5 +1088,339 @@ mod tests {
             t.iter().any(|s| s.contains("120.0")),
             "編集開始で base value 120.0 から seed (got {t:?})"
         );
+    }
+
+    // ---- daw_01 #107: Bitwig 流 modulation ----
+
+    /// base (bpm) と depth を別々に持つ test model。
+    struct ModModel {
+        bpm: f64,
+        depth: f64,
+    }
+
+    /// modulation 付き 1 frame を描画 + 処理し、 edits と response を返す。
+    #[allow(clippy::too_many_arguments)]
+    fn run_mod_frame(
+        host: &mut UiHost<ModModel>,
+        model: &ModModel,
+        rect: Rect,
+        style: &ScrubableNumberStyle,
+        pointer: PointerFrame,
+        edit_mode: bool,
+        entries: &[ModEntry],
+        live_value: Option<f64>,
+        scene: &mut Scene,
+    ) -> (Vec<Edit<ModModel>>, ScrubableNumberResponse) {
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let base = model.bpm;
+        let cur_depth = model.depth;
+        let resp_cell: std::cell::RefCell<ScrubableNumberResponse> =
+            std::cell::RefCell::new(ScrubableNumberResponse::default());
+        let edits = host.frame_to_edits(
+            model,
+            scene,
+            screen,
+            FrameInput { pointer, ..Default::default() },
+            |_, ui| {
+                let on_mod = |d: f64| Edit::mutate(move |m: &mut ModModel| m.depth = d);
+                let edit_desc = edit_mode.then_some(ModEdit {
+                    source_color: Color::rgb(1.0, 0.4, 0.2),
+                    current_depth: cur_depth,
+                    depth_range: Some((-50.0, 50.0)),
+                    depth_sensitivity: None,
+                    on_mod_change: &on_mod,
+                });
+                let modulation = Modulation { entries, live_value, edit: edit_desc };
+                let r = ui.scrubable_number_at(
+                    "mtest",
+                    rect,
+                    base,
+                    120.0,
+                    ScrubableNumberFormat::Decimal(1),
+                    style,
+                    "scrub",
+                    |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v),
+                    None,
+                    Some(modulation),
+                );
+                *resp_cell.borrow_mut() = r;
+            },
+        );
+        (edits, resp_cell.into_inner())
+    }
+
+    fn mod_style() -> ScrubableNumberStyle {
+        ScrubableNumberStyle {
+            sensitivity: 0.5,
+            range: Some((100.0, 140.0)),
+            ..ScrubableNumberStyle::default()
+        }
+    }
+
+    /// arm 中 (edit_mode) の press + 縦 drag は **depth** を変化させ、 base (bpm) は触らない (非破壊)。
+    #[test]
+    fn mod_edit_drag_changes_depth_not_base() {
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let mut model = ModModel { bpm: 120.0, depth: 0.0 };
+        let rect = rect_default();
+        let style = mod_style();
+        let center = (40.0_f32, 14.0_f32);
+
+        let (edits, _) =
+            run_mod_frame(&mut host, &model, rect, &style, press_at(center, false), true, &[], None, &mut Scene::new());
+        for e in edits { e.apply(&mut model); }
+        // drag up 20px → depth = 0 + 20 * 0.5 = 10。 bpm は不変。
+        let (edits, resp) = run_mod_frame(
+            &mut host, &model, rect, &style,
+            hold_at((center.0, center.1 - 20.0), false), true, &[], None, &mut Scene::new(),
+        );
+        for e in edits { e.apply(&mut model); }
+
+        assert!((model.depth - 10.0).abs() < 1e-5, "depth scrub +10 (got {})", model.depth);
+        assert!((model.bpm - 120.0).abs() < 1e-5, "base bpm は depth-edit 中 不変 (got {})", model.bpm);
+        assert!(resp.mod_dragging, "depth drag 中は mod_dragging=true");
+        assert!(!resp.dragging, "depth drag 中は base dragging=false (排他)");
+    }
+
+    /// 非 arm (edit_mode=false) の drag は従来どおり base を scrub し、 depth は触らない。
+    #[test]
+    fn non_arm_drag_scrubs_base_only() {
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let mut model = ModModel { bpm: 120.0, depth: 7.0 };
+        let rect = rect_default();
+        let style = mod_style();
+        let center = (40.0_f32, 14.0_f32);
+
+        let (edits, _) =
+            run_mod_frame(&mut host, &model, rect, &style, press_at(center, false), false, &[], None, &mut Scene::new());
+        for e in edits { e.apply(&mut model); }
+        let (edits, resp) = run_mod_frame(
+            &mut host, &model, rect, &style,
+            hold_at((center.0, center.1 - 10.0), false), false, &[], None, &mut Scene::new(),
+        );
+        for e in edits { e.apply(&mut model); }
+
+        assert!((model.bpm - 125.0).abs() < 1e-5, "base scrub +5 (got {})", model.bpm);
+        assert!((model.depth - 7.0).abs() < 1e-5, "非 arm では depth 不変 (got {})", model.depth);
+        assert!(resp.dragging, "非 arm は base dragging=true");
+        assert!(!resp.mod_dragging, "非 arm は mod_dragging=false");
+    }
+
+    /// arm 中 dblclick は base default reset を発火しない (非破壊)。
+    #[test]
+    fn mod_edit_dblclick_does_not_reset_base() {
+        use std::thread;
+        use std::time::Duration;
+
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let mut model = ModModel { bpm: 200.0, depth: 0.0 };
+        let rect = rect_default();
+        let style = mod_style();
+        let center = (40.0_f32, 14.0_f32);
+
+        let (edits, _) =
+            run_mod_frame(&mut host, &model, rect, &style, press_at(center, false), true, &[], None, &mut Scene::new());
+        for e in edits { e.apply(&mut model); }
+        let (edits, _) =
+            run_mod_frame(&mut host, &model, rect, &style, release_at(center), true, &[], None, &mut Scene::new());
+        for e in edits { e.apply(&mut model); }
+        thread::sleep(Duration::from_millis(50));
+        let (edits, _) =
+            run_mod_frame(&mut host, &model, rect, &style, press_at(center, false), true, &[], None, &mut Scene::new());
+        for e in edits { e.apply(&mut model); }
+
+        assert!((model.bpm - 200.0).abs() < 1e-5, "arm 中 dblclick で base は reset されない (got {})", model.bpm);
+    }
+
+    /// `entries` を渡すと色帯 rect が overlay として追加され、 entry 色で描かれる。 `None` 回帰では出ない。
+    #[test]
+    fn entries_draw_colored_band_rects() {
+        let band = Color::rgb(0.2, 0.8, 1.0);
+        // (a) modulation None: overlay 無し (= bg rect のみ)。
+        let mut host_n: UiHost<ModModel> = UiHost::no_redraw();
+        let model = ModModel { bpm: 120.0, depth: 0.0 };
+        let style = mod_style();
+        let mut scene_none = Scene::new();
+        host_n.frame_to_edits(
+            &model, &mut scene_none, PhysicalSize { width: 200, height: 100 },
+            FrameInput::default(),
+            |_, ui| {
+                ui.scrubable_number_at(
+                    "mtest", rect_default(), 120.0, 120.0,
+                    ScrubableNumberFormat::Decimal(1), &style, "scrub",
+                    |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v),
+                    None, None,
+                );
+            },
+        );
+        let count_none = scene_none.rect_count();
+        assert!(
+            !scene_none.iter_rects().any(|r| (r.fill.b - 1.0).abs() < 1e-3 && r.fill.a < 0.95 && r.fill.g > 0.7),
+            "None では band rect は出ない",
+        );
+
+        // (b) modulation Some + 1 entry: 帯 rect (entry 色) + base marker が追加。
+        let mut host_s: UiHost<ModModel> = UiHost::no_redraw();
+        let entries = [ModEntry { color: band, depth: 8.0 }];
+        let mut scene_some = Scene::new();
+        let (_, _) = run_mod_frame(
+            &mut host_s, &model, rect_default(), &style,
+            PointerFrame::default(), false, &entries, None, &mut scene_some,
+        );
+        assert!(
+            scene_some.rect_count() > count_none,
+            "entries で overlay rect が増える (none={count_none}, some={})",
+            scene_some.rect_count(),
+        );
+        assert!(
+            scene_some.iter_rects().any(|r| {
+                (r.fill.r - band.r).abs() < 1e-3
+                    && (r.fill.g - band.g).abs() < 1e-3
+                    && (r.fill.b - band.b).abs() < 1e-3
+            }),
+            "entry 色の帯 rect が描かれる",
+        );
+    }
+
+    /// `live_value` を渡すと可動 tick rect が 1 本追加される。
+    #[test]
+    fn live_value_draws_tick_rect() {
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let model = ModModel { bpm: 120.0, depth: 0.0 };
+        let style = mod_style();
+
+        let mut scene_no_tick = Scene::new();
+        run_mod_frame(&mut host, &model, rect_default(), &style, PointerFrame::default(), false, &[], None, &mut scene_no_tick);
+
+        let mut host2: UiHost<ModModel> = UiHost::no_redraw();
+        let mut scene_tick = Scene::new();
+        run_mod_frame(&mut host2, &model, rect_default(), &style, PointerFrame::default(), false, &[], Some(130.0), &mut scene_tick);
+
+        assert!(
+            scene_tick.rect_count() > scene_no_tick.rect_count(),
+            "live_value で tick rect が増える (no_tick={}, tick={})",
+            scene_no_tick.rect_count(),
+            scene_tick.rect_count(),
+        );
+    }
+
+    /// depth gesture の release frame で pointer が動いた最終位置の depth が確定発火する。
+    #[test]
+    fn mod_edit_release_commits_final_depth() {
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let mut model = ModModel { bpm: 120.0, depth: 0.0 };
+        let rect = rect_default();
+        let style = mod_style();
+        let center = (40.0_f32, 14.0_f32);
+
+        // press → hold -20px (depth 10 fired & applied)。
+        let (edits, _) =
+            run_mod_frame(&mut host, &model, rect, &style, press_at(center, false), true, &[], None, &mut Scene::new());
+        for e in edits { e.apply(&mut model); }
+        let (edits, _) = run_mod_frame(
+            &mut host, &model, rect, &style,
+            hold_at((center.0, center.1 - 20.0), false), true, &[], None, &mut Scene::new(),
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!((model.depth - 10.0).abs() < 1e-5, "hold で depth 10 (got {})", model.depth);
+
+        // release は press 位置より更に上 (-30px) で離す → 最終 depth 15 が release frame で確定。
+        let (edits, _) = run_mod_frame(
+            &mut host, &model, rect, &style,
+            release_at((center.0, center.1 - 30.0)), true, &[], None, &mut Scene::new(),
+        );
+        for e in edits { e.apply(&mut model); }
+        assert!(
+            (model.depth - 15.0).abs() < 1e-5,
+            "release frame で pointer 最終位置の depth 15 を確定発火 (got {})",
+            model.depth,
+        );
+    }
+
+    /// `depth_sensitivity: Some` は depth drag で base の `style.sensitivity` を上書きする。
+    #[test]
+    fn depth_sensitivity_overrides_base() {
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let mut model = ModModel { bpm: 120.0, depth: 0.0 };
+        let rect = rect_default();
+        // base sensitivity 0.5 だが depth は 2.0 を使う。
+        let style = mod_style();
+        let center = (40.0_f32, 14.0_f32);
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        let run = |host: &mut UiHost<ModModel>, model: &ModModel, pointer: PointerFrame| -> Vec<Edit<ModModel>> {
+            let cur = model.depth;
+            host.frame_to_edits(model, &mut Scene::new(), screen, FrameInput { pointer, ..Default::default() }, |_, ui| {
+                let on_mod = |d: f64| Edit::mutate(move |m: &mut ModModel| m.depth = d);
+                let m = Modulation {
+                    entries: &[],
+                    live_value: None,
+                    edit: Some(ModEdit {
+                        source_color: Color::WHITE,
+                        current_depth: cur,
+                        depth_range: Some((-100.0, 100.0)),
+                        depth_sensitivity: Some(2.0),
+                        on_mod_change: &on_mod,
+                    }),
+                };
+                ui.scrubable_number_at(
+                    "mtest", rect, model.bpm, 120.0, ScrubableNumberFormat::Decimal(1),
+                    &style, "scrub", |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v), None, Some(m),
+                );
+            })
+        };
+
+        for e in run(&mut host, &model, press_at(center, false)) { e.apply(&mut model); }
+        // drag up 10px × depth_sensitivity 2.0 = 20 (style.sensitivity 0.5 なら 5)。
+        for e in run(&mut host, &model, hold_at((center.0, center.1 - 10.0), false)) { e.apply(&mut model); }
+        assert!((model.depth - 20.0).abs() < 1e-5, "depth_sensitivity 2.0 で +20 (got {})", model.depth);
+    }
+
+    /// `Some` でも entries 空 + live None + edit None なら overlay 描画差分なし (base marker も出ない)。
+    #[test]
+    fn empty_modulation_draws_no_overlay() {
+        let model = ModModel { bpm: 120.0, depth: 0.0 };
+        let style = mod_style();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        let mut host_n: UiHost<ModModel> = UiHost::no_redraw();
+        let mut scene_none = Scene::new();
+        host_n.frame_to_edits(&model, &mut scene_none, screen, FrameInput::default(), |_, ui| {
+            ui.scrubable_number_at(
+                "mtest", rect_default(), 120.0, 120.0, ScrubableNumberFormat::Decimal(1),
+                &style, "scrub", |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v), None, None,
+            );
+        });
+
+        let mut host_e: UiHost<ModModel> = UiHost::no_redraw();
+        let mut scene_empty = Scene::new();
+        run_mod_frame(&mut host_e, &model, rect_default(), &style, PointerFrame::default(), false, &[], None, &mut scene_empty);
+
+        assert_eq!(
+            scene_empty.rect_count(),
+            scene_none.rect_count(),
+            "empty Some は None と同じ rect 数 (= base marker も出ない、 contract)",
+        );
+    }
+
+    /// 非有限 (NaN) な live_value / depth を渡しても scene の rect 座標に NaN を出さない。
+    #[test]
+    fn nonfinite_values_produce_no_nan_rects() {
+        let mut host: UiHost<ModModel> = UiHost::no_redraw();
+        let model = ModModel { bpm: 120.0, depth: 0.0 };
+        let style = mod_style();
+        let entries = [ModEntry { color: Color::WHITE, depth: f64::NAN }];
+        let mut scene = Scene::new();
+        run_mod_frame(
+            &mut host, &model, rect_default(), &style,
+            PointerFrame::default(), false, &entries, Some(f64::INFINITY), &mut scene,
+        );
+        for r in scene.iter_rects() {
+            assert!(
+                r.rect.x.is_finite() && r.rect.y.is_finite() && r.rect.w.is_finite() && r.rect.h.is_finite(),
+                "rect 座標に NaN/Inf が出ない (got {:?})",
+                r.rect,
+            );
+        }
     }
 }

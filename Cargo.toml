@@ -26,6 +26,7 @@ members = [
     "crates/examples/piano_roll_label_snapshot",
     "crates/examples/font_picker_snapshot",
     "crates/examples/text_align_snapshot",
+    "crates/examples/scrubable_number_modulation_snapshot",
 ]
 
 [workspace.package]
