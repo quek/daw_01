@@ -22,13 +22,29 @@ use daw_ui_core::{
     Edit, FaderResponse,
     FileDialogFilter, InputAccumulator, LevelMeterStyle, ListViewStyle, MASTER_TRACK_ID,
     MenuItemSpec, MeterBallistic, MeterScale, ModalStyle, Orientation, ReorderableListEditRequest,
-    ReorderableListStyle, SnapConfig, TimeMapping, TimeRulerStyle, UiHost, ViewportState1D,
+    ReorderableListStyle, SectionView, SnapConfig, TimeMapping, TimeRulerStyle, UiHost,
+    ViewportState1D,
 };
 use daw_ui_platform::{AppEvent, AppHost, WindowBackend, winit_backend};
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
 use winit::window::WindowAttributes;
 
 const N_CH: usize = 8;
+
+/// M14 Phase 127 (daw_01 #105): demo 用の section 名/色 循環パレット (Intro / Aメロ / サビ / Bメロ)。
+/// 本物の採番ポリシー (循環名 + 色) は daw_01 側が持つ。 ここは widget の Arranger レーンを
+/// 実機で触って確認するための最小実装。
+fn section_palette(id: u32) -> (Arc<str>, [f32; 3]) {
+    const NAMES: [&str; 4] = ["Intro", "Aメロ", "サビ", "Bメロ"];
+    const COLORS: [[f32; 3]; 4] = [
+        [0.30, 0.45, 0.65],
+        [0.35, 0.55, 0.40],
+        [0.70, 0.45, 0.35],
+        [0.50, 0.40, 0.60],
+    ];
+    let i = (id % 4) as usize;
+    (Arc::from(NAMES[i]), COLORS[i])
+}
 const N_TRACKS: usize = 12;
 const N_BROWSER_ITEMS: usize = 40;
 
@@ -121,6 +137,12 @@ struct DawModel {
     // (M9 Phase 45e) arrangement widget 用 state
     arr_tracks: Vec<DawTrack>,
     arr_view: ArrangementView,
+    /// M14 Phase 127 (daw_01 #105): Arranger レーンの曲パート demo。 `CreateSection` /
+    /// `MoveSection` / `ResizeSection` / `DuplicateSection` を受信してこの Vec を直接 mutate し、
+    /// `arrangement()` に `&m.arr_sections` で渡す (start_beat 昇順を保つ)。
+    arr_sections: Vec<SectionView>,
+    /// section 採番カウンタ (Create / Duplicate で連番 id + 循環名/色を `section_palette` で付与)。
+    arr_next_section_id: u32,
     arr_selected_clips: Vec<ClipKey>,
     /// M14 Phase 96 (daw_01 #068): 前フレームの `ArrangementResponse.hovered_clip` を保持し、
     /// 次フレームの連動ハイライト (`in_active_group`) 計算に使う。 daw_01 が「前フレーム hovered_clip
@@ -281,6 +303,8 @@ impl DawModel {
             time_sig: (4, 4),
             // M9 Phase 45f (#010 [Replied]): デフォルト Adaptive snap で grid 吸着の動作確認。
             snap: SnapConfig::DEFAULT,
+            // M14 Phase 127 (daw_01 #105): Arranger レーンを 22px で表示 (section 帯 demo)。
+            arranger_lane_h: 22.0,
         };
         Self {
             faders: [0.55, 0.70, 0.30, 0.60, 0.40, 0.80, 0.20, 0.55],
@@ -293,6 +317,15 @@ impl DawModel {
             open_demo_request: false,
             arr_tracks: tracks,
             arr_view,
+            arr_sections: {
+                let (n0, c0) = section_palette(0);
+                let (n1, c1) = section_palette(1);
+                vec![
+                    SectionView { id: 0, name: n0, color: c0, start_beat: 0.0, len_beats: 8.0 },
+                    SectionView { id: 1, name: n1, color: c1, start_beat: 8.0, len_beats: 8.0 },
+                ]
+            },
+            arr_next_section_id: 2,
             arr_selected_clips: Vec::new(),
             arr_hovered_clip: None,
             arr_selected_tracks: Vec::new(),
@@ -1338,6 +1371,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         "arr",
         arr_pane,
         &arr_tracks,
+        &m.arr_sections,
         m.arr_view,
         &m.arr_selected_clips,
         &m.arr_selected_tracks,
@@ -1554,6 +1588,79 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     mm.arr_ctx_menu_open = true;
                     mm.last_action =
                         format!("arr: SecondaryClickEmpty @ track {track} beat {beat:.2}");
+                })
+            }
+            // M14 Phase 127 (daw_01 #105): Arranger section 編集 demo。 widget は意図のみ emit するので
+            // caller (この demo) が arr_sections を実際に mutate する (start_beat 昇順を保つ)。 本物の
+            // 破壊的リフロー (clip 移動 / ripple 等) は daw_01 が担当。
+            ArrangementEditRequest::CreateSection { start, len } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let id = mm.arr_next_section_id;
+                    mm.arr_next_section_id += 1;
+                    let (name, color) = section_palette(id);
+                    mm.arr_sections.push(SectionView {
+                        id,
+                        name,
+                        color,
+                        start_beat: start.max(0.0),
+                        len_beats: len.max(0.25),
+                    });
+                    mm.arr_sections.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                    mm.last_action = format!("arr: CreateSection #{id} @ {start:.2} len {len:.2}");
+                })
+            }
+            ArrangementEditRequest::MoveSection { id, next_start, .. } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(s) = mm.arr_sections.iter_mut().find(|s| s.id == id) {
+                        s.start_beat = next_start.max(0.0);
+                    }
+                    mm.arr_sections.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                    mm.last_action = format!("arr: MoveSection #{id} -> {next_start:.2}");
+                })
+            }
+            ArrangementEditRequest::ResizeSection { id, next_start, next_len, .. } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    if let Some(s) = mm.arr_sections.iter_mut().find(|s| s.id == id) {
+                        s.start_beat = next_start.max(0.0);
+                        s.len_beats = next_len.max(0.25);
+                    }
+                    mm.last_action =
+                        format!("arr: ResizeSection #{id} -> {next_start:.2}+{next_len:.2}");
+                })
+            }
+            ArrangementEditRequest::DuplicateSection { id, dest_start } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    let src = mm
+                        .arr_sections
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map(|s| (s.len_beats, s.color));
+                    if let Some((len, color)) = src {
+                        let new_id = mm.arr_next_section_id;
+                        mm.arr_next_section_id += 1;
+                        let (name, _) = section_palette(new_id);
+                        mm.arr_sections.push(SectionView {
+                            id: new_id,
+                            name,
+                            color,
+                            start_beat: dest_start.max(0.0),
+                            len_beats: len,
+                        });
+                        mm.arr_sections.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                    }
+                    mm.last_action = format!("arr: DuplicateSection #{id} -> {dest_start:.2}");
+                })
+            }
+            ArrangementEditRequest::BeginRenameSection(id) => {
+                // demo では inline rename UI は出さず last_action に記録するのみ (daw_01 が実 rename UI 提供)。
+                Edit::mutate(move |mm: &mut DawModel| {
+                    mm.last_action = format!("arr: BeginRenameSection #{id}");
+                })
+            }
+            ArrangementEditRequest::SecondaryClickSection { id, pos } => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    mm.last_action =
+                        format!("arr: SecondaryClickSection #{id} @ ({:.0},{:.0})", pos.0, pos.1);
                 })
             }
             ArrangementEditRequest::BeginRenameTrack(id) => Edit::mutate(move |mm: &mut DawModel| {

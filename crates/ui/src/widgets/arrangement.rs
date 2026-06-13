@@ -425,6 +425,12 @@ pub struct ArrangementView {
     /// `Default::default()` は `Adaptive` ON。 raw 動作を保ちたい caller は `SnapConfig::OFF` を渡す。
     /// drag 中 `pointer.modifiers.alt` で一時無効化。
     pub snap: SnapConfig,
+    /// M14 Phase 127 (daw_01 #105): Arranger レーンの高さ (px、`0.0` で無し)。 ruler の直下・track lanes
+    /// の上に水平に確保し、 曲のパート (Intro / Aメロ / サビ …) を表す色帯 (`SectionView`) を描く。
+    /// `0.0` で従来描画と完全互換 (レーン無し)。 section データ自体は `arrangement()` の
+    /// `sections: &[SectionView]` 引数で渡す (`ArrangementView` の `Copy` を壊さないため、 可変長 `Vec`
+    /// は view の field には持たせない = `tracks` / `master_row` と同じ「描画対象は別引数」 idiom)。
+    pub arranger_lane_h: f32,
 }
 
 impl Default for ArrangementView {
@@ -443,8 +449,30 @@ impl Default for ArrangementView {
             bpm: 120.0,
             time_sig: (4, 4),
             snap: SnapConfig::DEFAULT,
+            arranger_lane_h: 0.0,
         }
     }
+}
+
+/// M14 Phase 127 (daw_01 #105): Arranger レーンに描く「曲のパート」 1 件 (Studio One の Arranger Track
+/// 相当)。 `arrangement()` に `&[SectionView]` のスライスで渡す (昇順・非交差 = 重複なし前提、 隙間は許容)。
+///
+/// widget は section を一切 mutate しない (drag 中は帯のみ視覚プレビュー、 release で高レベル意図を
+/// `ArrangementEditRequest` (`CreateSection` / `MoveSection` / `ResizeSection` / `DuplicateSection` …)
+/// として 1 度 emit するだけ)。 破壊的リフロー (clip 分割 / ripple / フルスコープ移動 / 重複正規化) は
+/// 全て caller (daw_01) が行う。 `ArrangementClip` と同じく `Arc<str>` name を持つので `Copy` ではない。
+#[derive(Clone, Debug)]
+pub struct SectionView {
+    /// caller が採番する安定 id (Move / Resize / Rename / 右クリックの対象指定に使う)。
+    pub id: u32,
+    /// 帯に描く名前 (Intro / Aメロ / サビ …)。
+    pub name: Arc<str>,
+    /// 帯の塗り色 (linear RGB)。 名前ラベルは `clip_text_color_for` で自動コントラスト選択。
+    pub color: [f32; 3],
+    /// 開始拍。
+    pub start_beat: f64,
+    /// 長さ拍 (end = `start_beat + len_beats`)。
+    pub len_beats: f64,
 }
 
 /// clip drag の種別 (hit-test 結果)。
@@ -602,6 +630,37 @@ pub enum ArrangementEditRequest {
     /// - master row 上 / clip 上 / automation lane 上では発火しない (= `DoubleClickEmpty` と
     ///   同じ exclusion)。
     SecondaryClickEmpty { track: u32, beat: f64, pos: (f32, f32) },
+    // ===== M14 Phase 127 (daw_01 #105): Arranger レーン (曲のパート Section) の編集意図 =====
+    // widget は section を一切 mutate しない。 構造変化 (Create/Move/Resize/Duplicate) は snap 適用済
+    // (`view.snap.snap_beat`、 Alt で一時無効) + `0.0` 以上 clamp で emit。 隣接帯への食い込み厳密 clamp /
+    // 重複正規化は caller (daw_01 `normalize_sections`) が行う (既存「widget は snap + sanity floor、
+    // 実 clamp は caller」 規約どおり)。 ループ化・ジャンプは既存 `SetLoopRange` / `SetPlayheadBeat` を再利用。
+    /// 空き Arranger レーンの dblclick (既定長 1 bar = `time_sig` 由来) または範囲 drag (描いた範囲) による
+    /// section 新規作成。 `start` は snap 適用済絶対拍 (`0.0` 以上)、 `len` は `> 0`。 名前・色は caller が
+    /// 採番時に付与する (Intro / Aメロ / サビ … 循環) ので emit に含めない。
+    CreateSection { start: f64, len: f64 },
+    /// 帯中央 drag → release で 1 度発火する section 平行移動。 `next_start` は snap 適用済 (`0.0` 以上)。
+    /// `prev_start` で Undoable 構築容易 (`SetTrackVolume` と同 pattern)。 drag 中は帯のみ live preview、
+    /// 内容のリフローは caller が release で行う。
+    MoveSection { id: u32, prev_start: f64, next_start: f64 },
+    /// 帯端 drag → release で発火する section リサイズ。 左端 = start / len 両方変化、 右端 = len のみ
+    /// (`next_start == prev_start`)。 `ResizeClipDelta` と同 shape。 snap 適用済 (`0.0` 以上、 `len > 0`)。
+    ResizeSection {
+        id: u32,
+        prev_start: f64,
+        prev_len: f64,
+        next_start: f64,
+        next_len: f64,
+    },
+    /// Ctrl+drag → release で発火する section 複製 (`CloneClipsLinked` と同じ Ctrl+drag idiom)。 元 section
+    /// (`id`) を残し、 caller が新 section を `dest_start` (snap 適用済絶対拍) に採番して追加する意図。
+    DuplicateSection { id: u32, dest_start: f64 },
+    /// 帯名 dblclick → section の改名開始 (`BeginRenameTrack` と同 idiom、 rename UI は caller が出す)。
+    BeginRenameSection(u32),
+    /// 帯上の右クリック (secondary press) → caller が `pos` (viewport 座標) にコンテキストメニュー
+    /// (改名 / 色 / このセクションをループ / 帯のみ削除 / 範囲ごと削除) を開く入口 (`SecondaryClickEmpty`
+    /// と同 idiom)。
+    SecondaryClickSection { id: u32, pos: (f32, f32) },
     BeginRenameTrack(u32),
     DeleteTrack(u32),
     MoveTrackUp(u32),
@@ -905,6 +964,18 @@ pub struct ArrangementResponse {
     /// `hovered_automation_lane` は `None` (排他、 piano_roll の `hovered_*` と同流儀)。 lane と clip は
     /// 縦に別領域なので通常同時には成立しないが、 構造的に排他を保証する。
     pub hovered_automation_lane: Option<AutomationLaneKey>,
+    /// M14 Phase 127 (daw_01 #105): ポインタが今 hover している Arranger section の id (`hovered_clip`
+    /// と同じ「毎フレーム算出の hover state」 idiom)。 section は ruler と track lanes の中間 lane なので
+    /// clip / automation lane とは y 領域が排他 (同時に複数 hover しない)。
+    pub hovered_section: Option<u32>,
+    /// M14 Phase 127 (daw_01 #105): drag 中の section drag kind (`Some` なら既存 section の Move/Resize
+    /// drag セッション進行中)。 `dragging` (MIDI clip) / `dragging_automation_clip` と直交、 同 frame 内で
+    /// 複数 `Some` にならない (y 領域排他)。 範囲 drag による新規作成中は `None` (transient creation)。
+    pub dragging_section: Option<ClipDragKind>,
+    /// M14 Phase 127 (daw_01 #105): 全 visible section の Arranger レーン内 rect (`clip_rects` と同
+    /// semantics、 描画順 = 左から右)。 caller が `context_menu_for(rect, ...)` で右クリックメニューを
+    /// 重ねる用 (`SecondaryClickSection` の `pos` と併用可)。 完全 off-screen (beat 範囲外) の section は除外。
+    pub section_rects: Vec<(u32, Rect)>,
 }
 
 impl Default for ArrangementResponse {
@@ -927,6 +998,9 @@ impl Default for ArrangementResponse {
             dragging_automation_clip: None,
             automation_lasso_active: false,
             hovered_automation_lane: None,
+            hovered_section: None,
+            dragging_section: None,
+            section_rects: Vec::new(),
         }
     }
 }
@@ -985,6 +1059,13 @@ pub struct ArrangementStyle {
     pub loop_band: Color,
     pub loop_handle: Color,
     pub loop_handle_w: f32,
+    /// M14 Phase 127 (daw_01 #105): Arranger レーンの背景色 (header 見出し列 + 本体帯)。
+    pub arranger_lane_bg: Color,
+    /// M14 Phase 127 (daw_01 #105): Arranger header 見出し ("Arranger") のテキスト色。
+    pub arranger_label_color: Color,
+    /// M14 Phase 127 (daw_01 #105): section の範囲 drag 作成 preview / Ctrl+drag 複製 ghost を薄く
+    /// 描く半透明 fill (まだ存在しない / 複製先の帯)。
+    pub arranger_preview_fill: Color,
     /// resize handle の幅 (px)。clip rect 左右 edge から **内外** この px = resize、
     /// それ以外 (rect 中央) = move。短 clip (`r.w <= resize_handle_px * 2`) は rect 内
     /// すべて Move、rect 外側のみ resize 判定。
@@ -1253,6 +1334,9 @@ impl Default for ArrangementStyle {
             loop_band: Color::rgba(0.50, 0.85, 1.0, 0.20),
             loop_handle: Color::rgb(0.50, 0.85, 1.0),
             loop_handle_w: 2.0,
+            arranger_lane_bg: Color::rgb(0.14, 0.15, 0.18),
+            arranger_label_color: Color::rgb(0.70, 0.72, 0.78),
+            arranger_preview_fill: Color::rgba(0.85, 0.88, 0.95, 0.25),
             resize_handle_px: 4.0,
             mute_button,
             solo_button,
@@ -1728,6 +1812,98 @@ pub fn clip_hit(
     hit
 }
 
+/// M14 Phase 127 (daw_01 #105): section の Arranger レーン内 rect (`clip_to_rect` の section 版)。
+/// レーンは track row のような縦分割を持たないので高さは arranger レーン全高。 時間→x は ruler /
+/// clips と同じ `beat_to_px` mapping を共有 (ruler / playhead / loop band と縦に揃う)。
+fn section_to_rect(section: &SectionView, view: ArrangementView, arranger: Rect) -> Rect {
+    section_rect_from(section.start_beat, section.len_beats, view, arranger)
+}
+
+/// M14 Phase 127 (#105): `(start_beat, len_beats)` から Arranger レーン内 rect を計算 (`section_to_rect`
+/// と drag preview 描画が共有、 preview のために temp `SectionView` を作らずに済む)。
+fn section_rect_from(start_beat: f64, len_beats: f64, view: ArrangementView, arranger: Rect) -> Rect {
+    let beat_to_px = f64::from(arranger.w) / view.len_beats.max(1e-6);
+    let x = arranger.x + ((start_beat - view.start_beat) * beat_to_px) as f32;
+    let w = ((len_beats * beat_to_px) as f32).max(2.0);
+    Rect { x, y: arranger.y, w, h: arranger.h }
+}
+
+/// M14 Phase 127 (#105): section rect 上の cursor x がどの zone (Move / ResizeLeft / ResizeRight) かを返す。
+/// `clip_zone_at` の x ロジックと同一 (resize handle は rect 左右 edge から内外 ±`edge`、 短 section は
+/// rect 内 Move 強制 / 外側のみ resize)。 y は arranger レーン全高なので呼び出し側の `arranger.contains`
+/// で既に保証され、 ここでは x のみ判定する。
+fn section_zone_at(r: Rect, cx: f32, edge: f32) -> Option<ClipDragKind> {
+    if cx < r.x - edge || cx >= r.x + r.w + edge {
+        return None;
+    }
+    let in_rect = cx >= r.x && cx < r.x + r.w;
+    let near_left = cx < r.x + edge;
+    let near_right = cx >= r.x + r.w - edge;
+    let short = r.w <= edge * 2.0;
+    Some(if short && in_rect {
+        ClipDragKind::Move
+    } else if near_left && (!in_rect || cx - r.x < edge) {
+        ClipDragKind::ResizeLeft
+    } else if near_right && (!in_rect || (r.x + r.w) - cx < edge) {
+        ClipDragKind::ResizeRight
+    } else {
+        ClipDragKind::Move
+    })
+}
+
+/// M14 Phase 127 (#105): Arranger レーン内 cursor 位置から hit する `(section id, ClipDragKind)` を返す。
+/// `clip_hit` と同じ **2-tier in-rect 優先** (隣接 section の共有境界では内側 section を、 外側拡張ハンドル
+/// しか当たらない section より無条件優先、 同 tier は resize edge への水平距離が近い方、 同距離は後勝ち)。
+/// section は arranger レーン全高なので y は `arranger.contains` のみで判定する。
+#[must_use]
+fn section_hit(
+    sections: &[SectionView],
+    arranger: Rect,
+    view: ArrangementView,
+    cx: f32,
+    cy: f32,
+    resize_handle_px: f32,
+) -> Option<(u32, ClipDragKind)> {
+    if arranger.h <= 0.0 || !arranger.contains(cx, cy) {
+        return None;
+    }
+    let mut hit: Option<(u32, ClipDragKind)> = None;
+    let mut hit_inside = false;
+    let mut hit_edge_dist = f32::INFINITY;
+    for s in sections {
+        let r = section_to_rect(s, view, arranger);
+        let Some(kind) = section_zone_at(r, cx, resize_handle_px) else {
+            continue;
+        };
+        let inside = cx >= r.x && cx < r.x + r.w;
+        let edge_x = match kind {
+            ClipDragKind::ResizeLeft => r.x,
+            ClipDragKind::ResizeRight => r.x + r.w,
+            ClipDragKind::Move => cx,
+        };
+        let dist = (cx - edge_x).abs();
+        let better = if inside == hit_inside {
+            dist <= hit_edge_dist
+        } else {
+            inside
+        };
+        if better {
+            hit = Some((s.id, kind));
+            hit_inside = inside;
+            hit_edge_dist = dist;
+        }
+    }
+    hit
+}
+
+/// M14 Phase 127 (#105): 拍子から 1 bar の拍数を返す (`numerator * 4 / denominator`)。 4/4=4、 3/4=3、
+/// 6/8=3。 0 除算 / 0 拍を避けるため numerator / denominator は 1 以上、 結果は `1.0` 以上に floor する。
+fn beats_per_bar(time_sig: (u8, u8)) -> f64 {
+    let num = f64::from(time_sig.0.max(1));
+    let den = f64::from(time_sig.1.max(1));
+    (num * 4.0 / den).max(1.0)
+}
+
 /// y 座標から **visible track index** を計算 (M14 Phase 63n-1: prefix-sum 化)。
 /// `tops` は `visible_track_row_tops` の戻り値 (= len = visible_tracks.len() + 1、 prefix sum
 /// of expanded heights)。 lane 0 個 = `tops[i] = lanes_y - track_top + i * track_row_h` と等価で
@@ -1860,6 +2036,12 @@ pub fn apply_reorder<T: Clone>(items: &[T], anchor_index: usize, target_index: u
 /// これ未満は click (= SelectTrack) 扱い。 pending_drop (commit) と reorder_overlay (描画) が
 /// **同じ閾値**を使うことで preview と commit の発火条件が一致する。
 const REORDER_DRAG_THRESHOLD_PX: f32 = 16.0;
+
+/// M14 Phase 127 (daw_01 #105): section resize / create の **sanity floor** 拍 (= 異常入力で len が
+/// 0 / 負にならない最小値)。 実用 clamp (隣接帯への食い込み防止 / 重複正規化) は caller の
+/// `normalize_sections` が行うので、 widget はこの floor のみ (既存「widget は snap + sanity floor、
+/// 実 clamp は caller」 規約どおり)。
+const SECTION_MIN_LEN_BEATS: f64 = 1.0 / 16.0;
 
 /// M14 Phase 101 (daw_01 #072): track header drag&drop の **drop 解決結果**。
 /// `pending_drop` (実適用 = `SetTrackParent` 発行) と `reorder_overlay` (描画プレビュー) が
@@ -2184,6 +2366,42 @@ struct ClipDragSession {
     anchors: Vec<ClipDragAnchor>,
 }
 
+/// M14 Phase 127 (daw_01 #105): Arranger section drag の gesture 種別。 Move/ResizeLeft/ResizeRight は
+/// `ClipDragKind` と 1:1 (左端 = start/len 両方、 右端 = len のみ)、 `Create` は空きレーンの範囲 drag
+/// (press 位置から現在位置まで描いて release で `CreateSection`)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SectionGesture {
+    Move,
+    ResizeLeft,
+    ResizeRight,
+    Create,
+}
+
+/// M14 Phase 127 (daw_01 #105): Arranger section の Move / Resize / Duplicate / 範囲作成 drag session。
+/// `ClipDragSession` と同じ「continuation frame で `last_*` を update、 release frame では skip して
+/// 直前値を保持」 idiom (winit 0.30 の `ModifiersChanged` が `MouseInput(Released)` より先に届く race を
+/// 回避)。 drag overlay (preview) と release commit は **同じ `compute_section_drag_beat_delta` を共有** し、
+/// 「release で grid に飛ぶ」 不整合を構造的に防ぐ。 単一 section 限定 (multi-select は仕様外)。
+#[derive(Clone, Copy, Debug)]
+struct SectionDragSession {
+    kind: SectionGesture,
+    /// Move/Resize/Duplicate の対象 section id (`Create` では未使用)。
+    section_id: u32,
+    /// drag 開始時の section start / len (Move/Resize の絶対位置 snap pivot)。 `Create` では未使用。
+    anchor_start: f64,
+    anchor_len: f64,
+    /// press 時の snap 適用済拍 (`Create` の range もう一端 = 固定端)。
+    anchor_press_beat: f64,
+    anchor_mouse: (f32, f32),
+    /// continuation で update、 release で skip (`ClipDragSession.last_mouse` と同理由)。
+    last_mouse: (f32, f32),
+    /// drag 中の最終 alt (snap 一時無効、 overlay と commit が同一値を読む)。
+    last_alt: bool,
+    /// drag 中の最終 ctrl。 `Move + last_ctrl` で `DuplicateSection` に分岐 (clip の `CloneClipsLinked` と
+    /// 同じ Ctrl+drag idiom)。 Alt は snap 無効に予約済なので複製には使わない。
+    last_ctrl: bool,
+}
+
 // `LoopDragKind` / `LoopDragSession` は M14 Phase 69 (#041) で
 // `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
@@ -2481,6 +2699,10 @@ pub(crate) struct ArrangementState {
     /// release で `SetAutomationCurveParam { point, kind, prev_value, next_value }` 1 件発火、 drag 中は
     /// preview_value を継続更新して curve を live preview (cached 外で overlay 描画)。
     automation_curve_param_drag: Option<AutomationCurveParamDragSession>,
+    /// M14 Phase 127 (daw_01 #105): Arranger section の Move/Resize/Duplicate/範囲作成 drag session
+    /// (release で `MoveSection` / `ResizeSection` / `DuplicateSection` / `CreateSection` のいずれか
+    /// 1 件発火、 短 drag の Move は `SetPlayheadBeat` (帯ジャンプ) に demote)。
+    section_drag: Option<SectionDragSession>,
     /// M14 Phase 63c (#016): 直前の `Single` クリック位置 (= Shift+click 範囲選択の起点)。
     /// caller には公開せず widget 内 SSoT として持つ (piano_roll の note multi-select は anchor
     /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
@@ -2590,6 +2812,26 @@ fn compute_clip_drag_beat_delta(
     let snapped_pivot =
         snap.snap_beat(pivot + raw_beat_delta, nd.last_alt, zoom_x_px_per_beat);
     snapped_pivot - pivot
+}
+
+/// M14 Phase 127 (daw_01 #105): section drag の snap 適用済 beat delta (`compute_clip_drag_beat_delta`
+/// の section 版)。 pivot = 編集対象端の **絶対位置** (Move/ResizeLeft = `anchor_start`、 ResizeRight =
+/// `anchor_start + anchor_len`、 Create = `anchor_press_beat` の固定端) を snap して差分を返す
+/// (絶対位置 snap、 delta-snap NG という CLAUDE.md の drag snap 規約)。 overlay と release commit が
+/// この helper を共有して描画 / commit を完全一致させる。
+fn compute_section_drag_beat_delta(
+    sd: &SectionDragSession,
+    raw_beat_delta: f64,
+    snap: &SnapConfig,
+    zoom_x_px_per_beat: f32,
+) -> f64 {
+    let pivot = match sd.kind {
+        SectionGesture::Move | SectionGesture::ResizeLeft => sd.anchor_start,
+        SectionGesture::ResizeRight => sd.anchor_start + sd.anchor_len,
+        SectionGesture::Create => sd.anchor_press_beat,
+    };
+    let snapped = snap.snap_beat(pivot + raw_beat_delta, sd.last_alt, zoom_x_px_per_beat);
+    snapped - pivot
 }
 
 // `compute_loop_drag_endpoints` は M14 Phase 69 (#041) で
@@ -2855,10 +3097,13 @@ fn aspect_fit_rect(rect: Rect, tex_width: u32, tex_height: u32) -> Rect {
 /// M14 Phase 108 (daw_01 #080): clip 名 + (share clip なら) 名前左の link glyph を描く共通 helper。
 /// audio 経路 (`draw_clip`) と video 経路 (`draw_video_clip`) で共有 (share マークの link glyph
 /// 描画ロジックを 1 箇所に集約)。 `text_color` は呼び出し側が実 fill から `clip_text_color_for` で
-/// 導出済を渡す (SSoT = widget が唯一 fill を知る)。 `has_link == true` のとき name を glyph 幅 +
-/// 2px 右にずらし、 name の左に `share_group_link_glyph` を 1 文字描く (#022: selection と独立 =
-/// selected でも shared なら描画)。 文字を描けない小ささ (`r.w <= 24` or `r.h <= clip_text_size + 2`)
-/// では何も描かない (audio / video 経路で同一だった閾値をここに集約)。
+/// 導出済を渡す (SSoT = widget が唯一 fill を知る)。 `has_link == true` のとき `share_group_link_glyph`
+/// (⇌) を **clip 名と 1 つの text run に統合** して描く (#022: selection と独立 = selected でも shared
+/// なら描画)。 M14 Phase 126 (#104) 以前は glyph を別 run にして name を `clip_text_size + 2px` 右送り
+/// していたが、 em 幅近似 + 固定パッドで実 advance より広く隙間が空いていたため 1 run に統合した
+/// (glyph / name は同色・同 font_size・同 top・同 clip_rect なので情報損失なし)。 文字を描けない
+/// 小ささ (`r.w <= 24` or `r.h <= clip_text_size + 2`) では何も描かない (audio / video 経路で同一だった
+/// 閾値をここに集約)。
 fn draw_clip_label<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     r: Rect,
@@ -2870,16 +3115,49 @@ fn draw_clip_label<M: ?Sized + 'static>(
     if !(r.w > 24.0 && r.h > style.clip_text_size + 2.0) {
         return;
     }
-    let text_left = if has_link {
-        r.x + 4.0 + style.clip_text_size + 2.0
+    // M14 Phase 126 (daw_01 #104): share clip の link glyph (⇌) と clip 名を 1 つの text run に統合。
+    // 旧実装は name の left を `r.x + 4.0 + clip_text_size + 2.0` に置き、glyph 幅を実 advance ではなく
+    // `clip_text_size` (= font size = em 幅) で近似 + 固定 `+2.0` パッドを足していたため、⇌ の実描画幅より
+    // 広く名前を右送りして二重に隙間が空いていた。glyph / name は同色・同 font_size・同 top・同 clip_rect
+    // なので 1 run に統合してレイアウトエンジンに advance を委ねれば情報を失わず隙間が消える。
+    // `has_link == false` は従来どおり name のみ。
+    let text: Arc<str> = if has_link {
+        Arc::from(format!("{}{name}", style.share_group_link_glyph))
     } else {
-        r.x + 4.0
+        name.clone()
     };
-    if has_link {
+    hctx.push_text(GlyphArea {
+        text,
+        left: r.x + 4.0,
+        top: r.y + 2.0,
+        font_size: style.clip_text_size,
+        line_height: style.clip_text_size * 1.2,
+        color: text_color,
+        clip_rect: Some(r),
+        ..GlyphArea::default()
+    });
+}
+
+/// M14 Phase 127 (#105): section 帯 1 件を描く (色 fill + neutral border + 名前ラベル、 clip ラベルと同
+/// 左寄せ + 4px inset + auto-contrast idiom)。 名前が空 / 帯が狭いときはラベルを省く。
+fn draw_section_band<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    name: &Arc<str>,
+    color_rgb: [f32; 3],
+    r: Rect,
+    style: &ArrangementStyle,
+) {
+    let fill = Color::rgb(color_rgb[0], color_rgb[1], color_rgb[2]);
+    push_filled_rect(hctx, r, fill);
+    push_section_border(hctx, r, style.clip_border);
+    if r.w > 8.0 && r.h > style.clip_text_size + 2.0 && !name.is_empty() {
+        let text_color = clip_text_color_for(style, fill, style.arranger_lane_bg);
         hctx.push_text(GlyphArea {
-            text: Arc::from(style.share_group_link_glyph.to_string()),
+            // 毎フレーム描画なので `Arc::from(&str)` (byte copy) でなく Arc refcount clone
+            // (draw_clip_label と同じ安価経路、 section 数が多い曲で per-frame alloc を避ける)。
+            text: name.clone(),
             left: r.x + 4.0,
-            top: r.y + 2.0,
+            top: r.y + (r.h - style.clip_text_size) * 0.5,
             font_size: style.clip_text_size,
             line_height: style.clip_text_size * 1.2,
             color: text_color,
@@ -2887,15 +3165,131 @@ fn draw_clip_label<M: ?Sized + 'static>(
             ..GlyphArea::default()
         });
     }
-    hctx.push_text(GlyphArea {
-        text: name.clone(),
-        left: text_left,
-        top: r.y + 2.0,
-        font_size: style.clip_text_size,
-        line_height: style.clip_text_size * 1.2,
-        color: text_color,
+}
+
+/// M14 Phase 127 (#105): section 帯 / preview の 1px neutral border。
+fn push_section_border<M: ?Sized + 'static>(hctx: &mut HeavyCtx<'_, '_, M>, r: Rect, border: Color) {
+    hctx.push_rect(RectCommand {
+        rect: r,
+        fill: Color::TRANSPARENT,
+        border,
+        border_width: 1.0,
+        radius: [0.0; 4],
         clip_rect: Some(r),
-        ..GlyphArea::default()
+    });
+}
+
+/// M14 Phase 127 (#105): drag 中対象 section の preview `(start, len)` を返す (Move/Resize。 非対象 /
+/// Create / Ctrl+drag (複製) の元帯は base を返す = 複製は元帯を残し ghost を別途描く)。 draw と release が
+/// 同じ `compute_section_drag_beat_delta` を通すことで overlay == commit を保証する。
+fn section_preview_start_len(
+    s: &SectionView,
+    section_drag: Option<SectionDragSession>,
+    beat_per_px: f64,
+    snap: &SnapConfig,
+    zoom_x_px_per_beat: f32,
+) -> (f64, f64) {
+    let Some(sd) = section_drag else {
+        return (s.start_beat, s.len_beats);
+    };
+    if sd.kind == SectionGesture::Create || sd.section_id != s.id {
+        return (s.start_beat, s.len_beats);
+    }
+    let raw = f64::from(sd.last_mouse.0 - sd.anchor_mouse.0) * beat_per_px;
+    let delta = compute_section_drag_beat_delta(&sd, raw, snap, zoom_x_px_per_beat);
+    match sd.kind {
+        SectionGesture::Move => {
+            if sd.last_ctrl {
+                (s.start_beat, s.len_beats)
+            } else {
+                ((s.start_beat + delta).max(0.0), s.len_beats)
+            }
+        }
+        SectionGesture::ResizeLeft => {
+            let right = sd.anchor_start + sd.anchor_len;
+            let ns = (sd.anchor_start + delta).clamp(0.0, (right - SECTION_MIN_LEN_BEATS).max(0.0));
+            (ns, (right - ns).max(SECTION_MIN_LEN_BEATS))
+        }
+        SectionGesture::ResizeRight => {
+            (sd.anchor_start, (sd.anchor_len + delta).max(SECTION_MIN_LEN_BEATS))
+        }
+        SectionGesture::Create => (s.start_beat, s.len_beats),
+    }
+}
+
+/// M14 Phase 127 (daw_01 #105): Arranger レーン全体 (背景 + "Arranger" 見出し + section 色帯群 + drag
+/// preview) を描く overlay helper。 loop band と同じく cached 外で毎フレーム描画する (section データ
+/// 変化に cache busting 不要、 selection / loop band と同流儀)。 drag 中は対象 section を
+/// `section_preview_start_len` の preview geometry で描き、 overlay == release commit を helper 共有で
+/// 構造保証する。 Ctrl+drag (複製) は元帯 + 複製先 ghost、 範囲 drag (Create) は preview 帯を描く。
+#[allow(clippy::too_many_arguments)]
+fn draw_sections_lane<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    sections: &[SectionView],
+    section_drag: Option<SectionDragSession>,
+    view: ArrangementView,
+    arranger: Rect,
+    arranger_header: Rect,
+    snap: &SnapConfig,
+    zoom_x_px_per_beat: f32,
+    style: &ArrangementStyle,
+) {
+    if arranger.h <= 0.0 {
+        return;
+    }
+    // 背景 + header 見出し ("Arranger")。
+    if arranger_header.w > 0.0 {
+        push_filled_rect(hctx, arranger_header, style.arranger_lane_bg);
+        if arranger_header.h > style.clip_text_size + 2.0 {
+            hctx.push_text(GlyphArea {
+                text: Arc::from("Arranger"),
+                left: arranger_header.x + 4.0,
+                top: arranger_header.y + (arranger_header.h - style.clip_text_size) * 0.5,
+                font_size: style.clip_text_size,
+                line_height: style.clip_text_size * 1.2,
+                color: style.arranger_label_color,
+                clip_rect: Some(arranger_header),
+                ..GlyphArea::default()
+            });
+        }
+    }
+    push_filled_rect(hctx, arranger, style.arranger_lane_bg);
+
+    let beat_per_px = view.len_beats / f64::from(arranger.w.max(1.0));
+    hctx.with_clip_rect(arranger, |hctx| {
+        // 各 section 帯 (drag 対象は preview geometry)。
+        for s in sections {
+            let (start, len) =
+                section_preview_start_len(s, section_drag, beat_per_px, snap, zoom_x_px_per_beat);
+            let r = section_rect_from(start, len, view, arranger);
+            draw_section_band(hctx, &s.name, s.color, r, style);
+        }
+        let Some(sd) = section_drag else {
+            return;
+        };
+        let raw = f64::from(sd.last_mouse.0 - sd.anchor_mouse.0) * beat_per_px;
+        let delta = compute_section_drag_beat_delta(&sd, raw, snap, zoom_x_px_per_beat);
+        match sd.kind {
+            // Ctrl+drag (複製): 複製先に半透明 ghost 帯。
+            SectionGesture::Move if sd.last_ctrl => {
+                let dest = (sd.anchor_start + delta).max(0.0);
+                let r = section_rect_from(dest, sd.anchor_len, view, arranger);
+                push_filled_rect(hctx, r, style.arranger_preview_fill);
+                push_section_border(hctx, r, style.clip_border);
+            }
+            // 範囲 drag (Create): まだ存在しない section の preview 帯。
+            SectionGesture::Create => {
+                let other = (sd.anchor_press_beat + delta).max(0.0);
+                let lo = sd.anchor_press_beat.min(other);
+                let hi = sd.anchor_press_beat.max(other);
+                if hi > lo {
+                    let r = section_rect_from(lo, hi - lo, view, arranger);
+                    push_filled_rect(hctx, r, style.arranger_preview_fill);
+                    push_section_border(hctx, r, style.clip_border);
+                }
+            }
+            _ => {}
+        }
     });
 }
 
@@ -4668,6 +5062,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         rect: Rect,
         tracks: &[ArrangementTrack],
+        // M14 Phase 127 (daw_01 #105): Arranger レーンの曲パート (昇順・非交差前提)。 空 slice で
+        // レーン無し (= `view.arranger_lane_h == 0.0` と併せ従来描画と完全互換)。 `tracks` と同じく
+        // 「描画対象は別 slice 引数」 idiom で渡し、 `ArrangementView` の `Copy` を壊さない。
+        sections: &[SectionView],
         view: ArrangementView,
         selected_clips: &[ClipKey],
         selected_tracks: &[u32],
@@ -4695,14 +5093,32 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ---- rect 分割 ----
         let header_w = view.header_w.max(0.0);
         let ruler_h = view.ruler_h.max(0.0);
-        let lanes_h = (rect.h - ruler_h).max(1.0);
+        // M14 Phase 127 (daw_01 #105): Arranger レーンを ruler の直下・track lanes の上に確保する。
+        // `arranger_lane_h == 0.0` で従来レイアウトと完全一致 (レーン無し)。 track lanes / header_pane の
+        // y 原点を arranger 分だけ下げることで track row (header / lanes 双方) が自動的に下にずれる
+        // (`header_pane.y == lanes.y` の不変条件は維持 = press_tops を header / lanes で共有する前提)。
+        let arranger_lane_h = view.arranger_lane_h.max(0.0);
+        let lanes_h = (rect.h - ruler_h - arranger_lane_h).max(1.0);
         let lanes_w = (rect.w - header_w).max(1.0);
-        let header_pane =
-            Rect { x: rect.x, y: rect.y + ruler_h, w: header_w, h: lanes_h };
+        let header_pane = Rect {
+            x: rect.x,
+            y: rect.y + ruler_h + arranger_lane_h,
+            w: header_w,
+            h: lanes_h,
+        };
         let ruler =
             Rect { x: rect.x + header_w, y: rect.y, w: lanes_w, h: ruler_h };
-        let lanes =
-            Rect { x: rect.x + header_w, y: rect.y + ruler_h, w: lanes_w, h: lanes_h };
+        // Arranger レーン本体 (lanes 幅、 ruler 直下) と header 側の見出し領域 ("Arranger" ラベル用)。
+        let arranger_rect =
+            Rect { x: rect.x + header_w, y: rect.y + ruler_h, w: lanes_w, h: arranger_lane_h };
+        let arranger_header_rect =
+            Rect { x: rect.x, y: rect.y + ruler_h, w: header_w, h: arranger_lane_h };
+        let lanes = Rect {
+            x: rect.x + header_w,
+            y: rect.y + ruler_h + arranger_lane_h,
+            w: lanes_w,
+            h: lanes_h,
+        };
 
         // M9 Phase 45f / M14 Phase 63j (#024): snap 用 zoom = lanes.w / view.len_beats。
         // press 振り分け (ruler の playhead seek) でも snap 計算に必要なため、 後の overlay 計算と
@@ -4933,6 +5349,53 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         last_ctrl: press_ctrl,
                         last_shift: press_shift,
                         anchors,
+                    });
+                }
+            }
+            // M14 Phase 127 (daw_01 #105): Arranger レーン press 振り分け。 arranger_rect は ruler /
+            // lanes / header_pane と y 領域が排他なので独立 block で扱う。 header 幅 splitter
+            // (全高に張る) との競合のみ `!splitter_press` で回避 (clip / ruler と同 gate)。
+            if !splitter_press && arranger_lane_h > 0.0 && arranger_rect.contains(px, py) {
+                let press_alt = pointer.modifiers.alt;
+                let press_ctrl = pointer.modifiers.ctrl;
+                if let Some((sid, kind)) =
+                    section_hit(sections, arranger_rect, view, px, py, style.resize_handle_px)
+                    && let Some(s) = sections.iter().find(|s| s.id == sid)
+                {
+                    // 既存 section 上 → Move / Resize session (Ctrl は release で Duplicate に分岐)。
+                    let gesture = match kind {
+                        ClipDragKind::Move => SectionGesture::Move,
+                        ClipDragKind::ResizeLeft => SectionGesture::ResizeLeft,
+                        ClipDragKind::ResizeRight => SectionGesture::ResizeRight,
+                    };
+                    let state: &mut ArrangementState = self.widget_state(wid);
+                    state.section_drag = Some(SectionDragSession {
+                        kind: gesture,
+                        section_id: sid,
+                        anchor_start: s.start_beat,
+                        anchor_len: s.len_beats,
+                        anchor_press_beat: px_to_beat(px, arranger_rect.x, arranger_rect.w, view),
+                        anchor_mouse: (px, py),
+                        last_mouse: (px, py),
+                        last_alt: press_alt,
+                        last_ctrl: press_ctrl,
+                    });
+                } else {
+                    // 空きレーン → 範囲 drag による新規作成 session (press 端を snap で grid に着地)。
+                    // 単純 click (drag 距離 < 4px) は release で no-op、 新規作成は dblclick が担当する。
+                    let raw = px_to_beat(px, arranger_rect.x, arranger_rect.w, view);
+                    let anchor = view.snap.snap_beat(raw, press_alt, zoom_x_px_per_beat).max(0.0);
+                    let state: &mut ArrangementState = self.widget_state(wid);
+                    state.section_drag = Some(SectionDragSession {
+                        kind: SectionGesture::Create,
+                        section_id: 0,
+                        anchor_start: anchor,
+                        anchor_len: 0.0,
+                        anchor_press_beat: anchor,
+                        anchor_mouse: (px, py),
+                        last_mouse: (px, py),
+                        last_alt: press_alt,
+                        last_ctrl: press_ctrl,
                     });
                 }
             }
@@ -5550,6 +6013,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     nd.last_mouse = (px, py);
                 }
             }
+            // M14 Phase 127 (daw_01 #105): section drag continuation。 clip_drag と同じく continuation で
+            // last_mouse / last_alt / last_ctrl を update、 release frame は巻き戻し検知時のみ update。
+            if let Some(ref mut sd) = state.section_drag {
+                if !is_release {
+                    sd.last_mouse = (px, py);
+                    sd.last_alt = alt_now;
+                    sd.last_ctrl = ctrl_now;
+                } else if (px - sd.anchor_mouse.0).abs() > f32::EPSILON {
+                    sd.last_mouse = (px, py);
+                }
+            }
             if let Some(ref mut ld) = state.loop_drag {
                 if !is_release {
                     ld.last_mouse_x = px;
@@ -5902,6 +6376,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             None
         };
 
+        // M14 Phase 127 (daw_01 #105): section drag の overlay 用 copy (SectionDragSession は Copy) と
+        // release 取り出し (`loop_drag` と同 idiom)。
+        let section_drag_session: Option<SectionDragSession> = {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.section_drag
+        };
+        let section_drag_release: Option<SectionDragSession> = if pointer.primary_just_released {
+            let state: &mut ArrangementState = self.widget_state(wid);
+            state.section_drag.take()
+        } else {
+            None
+        };
+
         // M10 Phase 46: track reorder session の overlay 用 clone と release 取り出し。
         // M14 Phase 63c (#016): TrackReorderSession は Vec<u32> を持つため Copy 不可。 ここで clone。
         let track_reorder_session: Option<TrackReorderSession> = {
@@ -6157,9 +6644,35 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 .map(|(key, _body_rect)| key);
             }
         }
+        // M14 Phase 127 (daw_01 #105): Arranger section hover (arranger_rect 内、 clip / lane と y 排他)。
+        if let Some((cx, cy)) = pointer.pos
+            && arranger_lane_h > 0.0
+            && arranger_rect.contains(cx, cy)
+        {
+            response.hovered_section =
+                section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
+                    .map(|(id, _)| id);
+        }
+        // visible section の rect を response に積む (clip_rects と同 semantics、 caller の context_menu_for
+        // 用)。 完全 off-screen (arranger_rect と x 交差しない) は除外。
+        if arranger_lane_h > 0.0 {
+            for s in sections {
+                let r = section_to_rect(s, view, arranger_rect);
+                if r.x + r.w >= arranger_rect.x && r.x <= arranger_rect.x + arranger_rect.w {
+                    response.section_rects.push((s.id, r));
+                }
+            }
+        }
         response.dragging = clip_drag_session.as_ref().map(|nd| nd.kind);
         response.reordering = track_reorder_session.as_ref().map(|tr| tr.anchor_track_id);
         response.dragging_track_volume = track_volume_session.map(|tv| tv.track_id);
+        // 既存 section の Move/Resize drag のみ報告 (Create 範囲 drag は transient creation なので None)。
+        response.dragging_section = section_drag_session.and_then(|sd| match sd.kind {
+            SectionGesture::Move => Some(ClipDragKind::Move),
+            SectionGesture::ResizeLeft => Some(ClipDragKind::ResizeLeft),
+            SectionGesture::ResizeRight => Some(ClipDragKind::ResizeRight),
+            SectionGesture::Create => None,
+        });
 
         // ---- cursor ----
         // drag 中 / hover 中の clip 上 / それ以外で arrangement 内なら明示的に Default
@@ -6355,6 +6868,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
         let loop_preview_clone = loop_drag_preview_range;
         let header_pane_copy = header_pane;
+        // M14 Phase 127 (daw_01 #105): Arranger レーン overlay 用 capture (heavy closure に move)。
+        // section データは borrow を closure に持ち込めないので owned Vec に clone (SectionView は
+        // Arc<str> name の安価 clone)。 drag session / rect / lane 高さは Copy。
+        let sections_for_draw: Vec<SectionView> = sections.to_vec();
+        let section_drag_overlay = section_drag_session;
+        let arranger_rect_copy = arranger_rect;
+        let arranger_header_rect_copy = arranger_header_rect;
+        let arranger_lane_h_copy = arranger_lane_h;
         // M10 Phase 46 → 101 (daw_01 #072): track reorder の drag preview geometry。
         // dist >= 閾値 のときのみ overlay 描画 (短 click 中は静止 = button click と区別がつかないため
         // UI ノイズ)。 **commit (`pending_drop`) と同じ `resolve_track_drop`** を通すので indicator が
@@ -7068,6 +7589,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     style_copy.loop_band,
                     style_copy.loop_handle,
                     style_copy.loop_handle_w,
+                );
+            }
+            // M14 Phase 127 (daw_01 #105): Arranger レーン (背景 + section 帯 + drag preview)。 loop band と
+            // 同じく cached 外・track scroll 非依存なので below_ruler scope の外で描画 (ruler と lanes の間)。
+            if arranger_lane_h_copy > 0.0 {
+                draw_sections_lane(
+                    hctx,
+                    &sections_for_draw,
+                    section_drag_overlay,
+                    view_copy,
+                    arranger_rect_copy,
+                    arranger_header_rect_copy,
+                    &view_copy.snap,
+                    zoom_x_px_per_beat,
+                    &style_copy,
                 );
             }
             if let Some(b) = view_copy.playhead_beat
@@ -7975,6 +8511,117 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
+        // ---- M14 Phase 127 (daw_01 #105): Arranger section drag release dispatch ----
+        // overlay (preview) と同じ `compute_section_drag_beat_delta` で確定値を計算 (release で grid に
+        // 飛ぶ不整合を構造的に回避)。 alt は session の `last_alt` を真値とする (clip_drag と同 pattern)。
+        if let Some(sd) = section_drag_release {
+            let raw_px_delta = sd.last_mouse.0 - sd.anchor_mouse.0;
+            let raw_beat_delta = f64::from(raw_px_delta) * beat_per_px;
+            let dist = raw_px_delta.abs();
+            let delta =
+                compute_section_drag_beat_delta(&sd, raw_beat_delta, &view.snap, zoom_x_px_per_beat);
+            match sd.kind {
+                SectionGesture::Create => {
+                    // 範囲 drag のみ作成 (単純 click は dblclick が 1 bar 作成を担当)。
+                    if dist >= 4.0 {
+                        let other = (sd.anchor_press_beat + delta).max(0.0);
+                        let start = sd.anchor_press_beat.min(other);
+                        let len = (sd.anchor_press_beat - other).abs();
+                        if len >= SECTION_MIN_LEN_BEATS {
+                            self.push_edit(make_edit(ArrangementEditRequest::CreateSection {
+                                start,
+                                len,
+                            }));
+                        }
+                    }
+                }
+                SectionGesture::Move => {
+                    // 短 click (Ctrl なし、 jitter 未満) は帯ジャンプ (SetPlayheadBeat) に demote。
+                    if !sd.last_ctrl && dist < 4.0 {
+                        self.push_edit(make_edit(ArrangementEditRequest::SetPlayheadBeat(
+                            sd.anchor_start.max(0.0),
+                        )));
+                    } else {
+                        let next_start = (sd.anchor_start + delta).max(0.0);
+                        if sd.last_ctrl {
+                            self.push_edit(make_edit(ArrangementEditRequest::DuplicateSection {
+                                id: sd.section_id,
+                                dest_start: next_start,
+                            }));
+                        } else {
+                            self.push_edit(make_edit(ArrangementEditRequest::MoveSection {
+                                id: sd.section_id,
+                                prev_start: sd.anchor_start,
+                                next_start,
+                            }));
+                        }
+                    }
+                }
+                SectionGesture::ResizeLeft => {
+                    // 左端 drag: start/len 両方変化。 start は 0 以上 & 右端 - 最小長 を越えない sanity floor。
+                    let right = sd.anchor_start + sd.anchor_len;
+                    let next_start = (sd.anchor_start + delta)
+                        .clamp(0.0, (right - SECTION_MIN_LEN_BEATS).max(0.0));
+                    let next_len = (right - next_start).max(SECTION_MIN_LEN_BEATS);
+                    self.push_edit(make_edit(ArrangementEditRequest::ResizeSection {
+                        id: sd.section_id,
+                        prev_start: sd.anchor_start,
+                        prev_len: sd.anchor_len,
+                        next_start,
+                        next_len,
+                    }));
+                }
+                SectionGesture::ResizeRight => {
+                    // 右端 drag: len のみ変化 (start 固定)。
+                    let next_len = (sd.anchor_len + delta).max(SECTION_MIN_LEN_BEATS);
+                    self.push_edit(make_edit(ArrangementEditRequest::ResizeSection {
+                        id: sd.section_id,
+                        prev_start: sd.anchor_start,
+                        prev_len: sd.anchor_len,
+                        next_start: sd.anchor_start,
+                        next_len,
+                    }));
+                }
+            }
+        }
+
+        // ---- M14 Phase 127 (daw_01 #105): Arranger レーンの double-click ----
+        //  - section 帯上 → `BeginRenameSection` (帯名 dblclick で改名開始、 `BeginRenameTrack` と同 idiom)
+        //  - 空きレーン → `CreateSection` (既定長 1 bar = `time_sig` 由来、 snap 適用済)
+        if arranger_lane_h > 0.0
+            && let Some((cx, cy)) = self.take_double_click_in_rect(arranger_rect)
+        {
+            if let Some((sid, _)) =
+                section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
+            {
+                self.push_edit(make_edit(ArrangementEditRequest::BeginRenameSection(sid)));
+            } else {
+                let raw_beat = px_to_beat(cx, arranger_rect.x, arranger_rect.w, view);
+                let start = view
+                    .snap
+                    .snap_beat(raw_beat, pointer.modifiers.alt, zoom_x_px_per_beat)
+                    .max(0.0);
+                self.push_edit(make_edit(ArrangementEditRequest::CreateSection {
+                    start,
+                    len: beats_per_bar(view.time_sig),
+                }));
+            }
+        }
+
+        // ---- M14 Phase 127 (daw_01 #105): Arranger レーンの secondary (右) click ----
+        // section 帯上のみ `SecondaryClickSection { id, pos }` を発火 (caller が `pos` にコンテキスト
+        // メニューを開く、 `SecondaryClickEmpty` と同 idiom)。 空きレーン上の右クリックは現状 no-op。
+        if arranger_lane_h > 0.0
+            && let Some((cx, cy)) = self.take_secondary_press_in_rect(arranger_rect)
+            && let Some((sid, _)) =
+                section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
+        {
+            self.push_edit(make_edit(ArrangementEditRequest::SecondaryClickSection {
+                id: sid,
+                pos: (cx, cy),
+            }));
+        }
+
         // ---- double-click (lanes 内で clip / lane body / 空白 track row) ----
         // M14 Phase 63n-2 (#028) + Phase 63n-4 (#029): priority 順:
         //  1. clip hit (track row 内 clip rect) → DoubleClickClip
@@ -8760,6 +9407,7 @@ mod tests {
             time_sig: (4, 4),
             // 数値検証 test は raw beat 値を期待するので明示 OFF。
             snap: SnapConfig::OFF,
+            arranger_lane_h: 0.0,
         }
     }
 
@@ -9138,6 +9786,7 @@ mod tests {
                     "arr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
+                    &[],
                     m.view,
                     &[],
                     &[],
@@ -9204,6 +9853,7 @@ mod tests {
                     "arr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
+                    &[],
                     m.view,
                     &[],
                     &[],
@@ -9271,6 +9921,7 @@ mod tests {
                     "arr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
+                    &[],
                     m.view,
                     &[],
                     &[],
@@ -9784,6 +10435,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -9870,6 +10522,7 @@ mod tests {
                 "arr_test",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
+                &[],
                 view,
                 &[],
                 &[],
@@ -9912,6 +10565,7 @@ mod tests {
                 "arr_strip",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
+                &[],
                 view,
                 &[],
                 &[],
@@ -9978,6 +10632,7 @@ mod tests {
                 "arr_strip_indent",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
+                &[],
                 view,
                 &[],
                 &[],
@@ -10046,6 +10701,7 @@ mod tests {
                 "arr_active_group",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
+                &[],
                 test_view(),
                 selected,
                 &[],
@@ -10057,6 +10713,174 @@ mod tests {
             );
         });
         scene
+    }
+
+    // ===== M14 Phase 127 (daw_01 #105): Arranger レーン (section) tests =====
+
+    fn section(id: u32, start: f64, len: f64, name: &str) -> SectionView {
+        SectionView { id, name: Arc::from(name), color: [0.30, 0.45, 0.65], start_beat: start, len_beats: len }
+    }
+
+    fn snap_quarter() -> SnapConfig {
+        SnapConfig {
+            mode: crate::snap::SnapMode::Straight { div: 4 },
+            enabled: true,
+            min_beat_unit: 1.0 / 128.0,
+            time_sig: (4, 4),
+        }
+    }
+
+    fn section_drag(kind: SectionGesture, start: f64, len: f64, last: (f32, f32), ctrl: bool) -> SectionDragSession {
+        SectionDragSession {
+            kind,
+            section_id: 7,
+            anchor_start: start,
+            anchor_len: len,
+            anchor_press_beat: start,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: last,
+            last_alt: false,
+            last_ctrl: ctrl,
+        }
+    }
+
+    /// arranger lane に sections を載せて 1 frame 描画した scene を返す。
+    fn render_sections_scene(sections: Vec<SectionView>, arranger_lane_h: f32) -> daw_ui_renderer::Scene {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let tracks = vec![track(0, "t0", vec![])];
+        // header_w > 0 で arranger_header 領域を確保 ("Arranger" 見出しの描画確認用)。
+        let view = ArrangementView { arranger_lane_h, header_w: 160.0, ..test_view() };
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 400 };
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            let style = ArrangementStyle::default();
+            let _ = ui.arrangement(
+                "arr_sections",
+                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                &tracks,
+                &sections,
+                view,
+                &[],
+                &[],
+                &[],
+                &[],
+                &style,
+                None,
+                |_| Edit::mutate(|()| {}),
+            );
+        });
+        scene
+    }
+
+    /// `section_rect_from`: beat → arranger レーン内 px (高さは lane 全高)。
+    #[test]
+    fn section_rect_from_basic_position() {
+        let arranger = Rect { x: 0.0, y: 0.0, w: 400.0, h: 20.0 };
+        let view = ArrangementView { start_beat: 0.0, len_beats: 8.0, ..ArrangementView::default() };
+        // 1 beat = 50 px。 start=2.0 → x=100、 len=4.0 → w=200、 高さは lane 全高。
+        let r = section_rect_from(2.0, 4.0, view, arranger);
+        assert!((r.x - 100.0).abs() < 1e-3, "x=100: got {}", r.x);
+        assert!((r.w - 200.0).abs() < 1e-3, "w=200: got {}", r.w);
+        assert!((r.y - 0.0).abs() < 1e-3 && (r.h - 20.0).abs() < 1e-3, "lane 全高");
+    }
+
+    /// `section_hit`: 帯中央 = Move、 左端 = ResizeLeft、 右端 = ResizeRight、 lane 外 (y) = None。
+    #[test]
+    fn section_hit_move_resize_zones() {
+        let arranger = Rect { x: 0.0, y: 0.0, w: 400.0, h: 20.0 };
+        let view = ArrangementView { start_beat: 0.0, len_beats: 8.0, ..ArrangementView::default() };
+        let secs = vec![section(7, 2.0, 4.0, "A")]; // x 100..300
+        assert_eq!(section_hit(&secs, arranger, view, 200.0, 10.0, 4.0), Some((7, ClipDragKind::Move)));
+        assert_eq!(section_hit(&secs, arranger, view, 100.0, 10.0, 4.0), Some((7, ClipDragKind::ResizeLeft)));
+        assert_eq!(section_hit(&secs, arranger, view, 300.0, 10.0, 4.0), Some((7, ClipDragKind::ResizeRight)));
+        assert_eq!(section_hit(&secs, arranger, view, 200.0, 25.0, 4.0), None, "lane の y 外は None");
+    }
+
+    /// `section_hit`: 隣接 section の共有境界 (A.right == B.left) では、 cursor が A の rect 内
+    /// (A 右端ハンドル) なら、 B の左端外側拡張ハンドルより A を優先 (#101 / piano_roll #053 と同 2-tier)。
+    #[test]
+    fn section_hit_adjacent_in_rect_priority() {
+        let arranger = Rect { x: 0.0, y: 0.0, w: 400.0, h: 20.0 };
+        let view = ArrangementView { start_beat: 0.0, len_beats: 8.0, ..ArrangementView::default() };
+        // A 0..4 (x 0..200)、 B 4..8 (x 200..400)。 共有境界 x=200。
+        let secs = vec![section(1, 0.0, 4.0, "A"), section(2, 4.0, 4.0, "B")];
+        // x=199: A の rect 内 (右端 -1px) なので A の ResizeRight が、 B の左端外側ハンドルより勝つ。
+        assert_eq!(
+            section_hit(&secs, arranger, view, 199.0, 10.0, 4.0),
+            Some((1, ClipDragKind::ResizeRight)),
+            "A の右端 (in-rect) が B の左端 outer より優先"
+        );
+        // x=201: B の rect 内 (左端 +1px) なので B の ResizeLeft。
+        assert_eq!(
+            section_hit(&secs, arranger, view, 201.0, 10.0, 4.0),
+            Some((2, ClipDragKind::ResizeLeft)),
+            "B の左端 (in-rect) が A の右端 outer より優先"
+        );
+    }
+
+    /// `compute_section_drag_beat_delta`: snap OFF は pivot+raw を素通し (= 各 gesture で delta = raw)。
+    #[test]
+    fn section_drag_delta_raw_passthrough_off() {
+        let off = &SnapConfig::OFF;
+        // Move: pivot = anchor_start。
+        let sd = section_drag(SectionGesture::Move, 4.0, 4.0, (0.0, 0.0), false);
+        assert!((compute_section_drag_beat_delta(&sd, 1.5, off, 50.0) - 1.5).abs() < 1e-6);
+        // ResizeRight: pivot = anchor_start + anchor_len。
+        let sd = section_drag(SectionGesture::ResizeRight, 4.0, 4.0, (0.0, 0.0), false);
+        assert!((compute_section_drag_beat_delta(&sd, 0.7, off, 50.0) - 0.7).abs() < 1e-6);
+        // Create: pivot = anchor_press_beat (= anchor_start in helper)。
+        let sd = section_drag(SectionGesture::Create, 2.0, 0.0, (0.0, 0.0), false);
+        assert!((compute_section_drag_beat_delta(&sd, 3.0, off, 50.0) - 3.0).abs() < 1e-6);
+    }
+
+    /// `compute_section_drag_beat_delta`: quarter snap で pivot+raw を grid に丸めた差分を返す
+    /// (絶対位置 snap)。 Move pivot=4.0 + raw 1.1 = 5.1 → snap 5.0 → delta 1.0。
+    #[test]
+    fn section_drag_delta_snaps_pivot() {
+        let snap = snap_quarter();
+        let sd = section_drag(SectionGesture::Move, 4.0, 4.0, (0.0, 0.0), false);
+        let d = compute_section_drag_beat_delta(&sd, 1.1, &snap, 50.0);
+        assert!((d - 1.0).abs() < 1e-6, "5.1 → snap 5.0 → delta 1.0: got {d}");
+    }
+
+    /// `beats_per_bar`: 4/4=4、 3/4=3、 6/8=3、 7/8=3.5、 異常 0 は 1 以上に floor。
+    #[test]
+    fn beats_per_bar_time_sigs() {
+        assert!((beats_per_bar((4, 4)) - 4.0).abs() < 1e-6);
+        assert!((beats_per_bar((3, 4)) - 3.0).abs() < 1e-6);
+        assert!((beats_per_bar((6, 8)) - 3.0).abs() < 1e-6);
+        assert!((beats_per_bar((7, 8)) - 3.5).abs() < 1e-6);
+        assert!(beats_per_bar((0, 0)) >= 1.0, "0/0 は 1 以上に floor");
+    }
+
+    /// arranger_lane_h > 0 + sections: 色帯 (section.color fill) と名前 glyph + "Arranger" 見出しを描く。
+    #[test]
+    fn sections_render_band_and_name() {
+        let mut s = section(1, 0.0, 4.0, "Intro");
+        s.color = [0.70, 0.20, 0.30];
+        let scene = render_sections_scene(vec![s], 22.0);
+        let fill = Color::rgb(0.70, 0.20, 0.30);
+        assert!(scene.iter_rects().any(|r| r.fill == fill), "section の色帯を描く");
+        assert!(scene.iter_glyphs().any(|g| g.text.as_ref() == "Intro"), "section 名 glyph");
+        assert!(scene.iter_glyphs().any(|g| g.text.as_ref() == "Arranger"), "header 見出し");
+    }
+
+    /// arranger_lane_h == 0: section / 見出しを一切描かない (= 従来描画と互換、 回帰防止)。
+    #[test]
+    fn arranger_lane_zero_draws_nothing() {
+        let mut s = section(1, 0.0, 4.0, "Intro");
+        s.color = [0.70, 0.20, 0.30];
+        let scene = render_sections_scene(vec![s], 0.0);
+        let fill = Color::rgb(0.70, 0.20, 0.30);
+        assert!(!scene.iter_rects().any(|r| r.fill == fill), "lane 0 では色帯を描かない");
+        assert!(!scene.iter_glyphs().any(|g| g.text.as_ref() == "Intro"), "lane 0 では section 名なし");
+        assert!(!scene.iter_glyphs().any(|g| g.text.as_ref() == "Arranger"), "lane 0 では見出しなし");
     }
 
     /// id=10, beat 2..6 の clip に share_group hue / in_active_group を載せた test clip。
@@ -10099,6 +10923,52 @@ mod tests {
             "color 未指定 share clip は clip_default_fill"
         );
         assert_eq!(link_glyph_count(&scene, &style), 1, "⇌ glyph は描く");
+    }
+
+    /// M14 Phase 126 (daw_01 #104): share clip のラベルは ⇌ と clip 名を **1 つの text run に統合**
+    /// して描く (旧実装の固定 +2px パッド + em 幅近似による隙間を撤去)。 統合 run の text は `⇌<name>`
+    /// 完全一致で、 ⇌ 単独の別 run は存在しない (= マークと名前が密着)。
+    #[test]
+    fn share_clip_label_merges_link_glyph_into_name_run() {
+        let style = ArrangementStyle::default();
+        let glyph = style.share_group_link_glyph;
+        // shared_clip の name は "shared"。
+        let scene = render_clips_scene(vec![shared_clip(false, Some(0.33))], &[]);
+
+        let expected = format!("{glyph}shared");
+        let link_runs: Vec<&str> = scene
+            .iter_glyphs()
+            .map(|g| g.text.as_ref())
+            .filter(|t| t.starts_with(glyph))
+            .collect();
+        assert_eq!(
+            link_runs,
+            vec![expected.as_str()],
+            "⇌ と名前が 1 つの text run に密着 (got {link_runs:?})"
+        );
+        // ⇌ 単独 (= 旧実装の別 glyph run) は存在しない。
+        let bare = glyph.to_string();
+        assert!(
+            !scene.iter_glyphs().any(|g| g.text.as_ref() == bare),
+            "⇌ 単独の別 run は無い (name と統合済)"
+        );
+    }
+
+    /// `has_link == false` の通常 clip は名前のみの run (⇌ を含まない、 位置不変)。 #104 の回帰防止。
+    #[test]
+    fn non_share_clip_label_is_name_only() {
+        let style = ArrangementStyle::default();
+        let scene = render_clips_scene(vec![clip(10, 2.0, 4.0, "plain")], &[]);
+        assert!(
+            scene.iter_glyphs().any(|g| g.text.as_ref() == "plain"),
+            "非 share clip は名前のみの run"
+        );
+        assert!(
+            !scene
+                .iter_glyphs()
+                .any(|g| g.text.as_ref().starts_with(style.share_group_link_glyph)),
+            "非 share clip に ⇌ は付かない"
+        );
     }
 
     /// M14 Phase 114 (#086): active group 強調色は identity-neutral な `share_group_active_color`。
@@ -10190,6 +11060,7 @@ mod tests {
                 "arr_ring_only",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
+                &[],
                 test_view(),
                 &[],
                 &[],
@@ -10288,6 +11159,7 @@ mod tests {
                 "arr_video_share",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
+                &[],
                 test_view(),
                 selected,
                 &[],
@@ -10303,8 +11175,13 @@ mod tests {
 
     /// scene 内に link glyph (`share_group_link_glyph`) を描いた GlyphArea の個数。
     fn link_glyph_count(scene: &daw_ui_renderer::Scene, style: &ArrangementStyle) -> usize {
-        let glyph = style.share_group_link_glyph.to_string();
-        scene.iter_glyphs().filter(|g| g.text.as_ref() == glyph).count()
+        // M14 Phase 126 (#104): link glyph (⇌) は clip 名と 1 つの text run に統合されたので、
+        // 厳密一致ではなく「先頭が ⇌ で始まる」 glyph run を share マーク付きラベルとして数える
+        // (非 share clip の名前は ⇌ で始まらないので従来の count==0 も保たれる)。
+        scene
+            .iter_glyphs()
+            .filter(|g| g.text.as_ref().starts_with(style.share_group_link_glyph))
+            .count()
     }
 
     /// M14 Phase 114 (#086): thumbnail 無しの video share clip は `clip.color` を fill source にし
@@ -10446,6 +11323,7 @@ mod tests {
                 "arr_master_sel",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
+                &[],
                 view,
                 &[],
                 &[],
@@ -10520,6 +11398,7 @@ mod tests {
                     "arr_hover_lane",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &tracks,
+                    &[],
                     view,
                     &[],
                     &[],
@@ -10672,6 +11551,7 @@ mod tests {
                 "arr_auto_text",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &tracks,
+                &[],
                 view,
                 &[],
                 &[],
@@ -11110,6 +11990,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -11175,6 +12056,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -11247,6 +12129,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -11312,6 +12195,7 @@ mod tests {
                     "arr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
+                    &[],
                     m.view,
                     &[],
                     &[],
@@ -11439,6 +12323,7 @@ mod tests {
                     "arr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
+                    &[],
                     m.view,
                     &[],
                     &[],
@@ -11564,6 +12449,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -12009,6 +12895,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -12046,6 +12933,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -12083,6 +12971,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -12167,6 +13056,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -12214,6 +13104,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -12261,6 +13152,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -12553,7 +13445,7 @@ mod tests {
         let _edits =
             host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |m, ui| {
                 let _ = ui.arrangement(
-                    "arr", arr_rect, &m.tracks, m.view, &[], &[], &[], &[], &style, None,
+                    "arr", arr_rect, &m.tracks, &[], m.view, &[], &[], &[], &[], &style, None,
                     |_| Edit::mutate(|_: &mut Model| {}),
                 );
             });
@@ -12622,6 +13514,7 @@ mod tests {
                     "arr",
                     arr_rect,
                     &m.tracks,
+                    &[],
                     m.view,
                     &[], // selected_clips
                     &[10_u32], // selected_tracks → row 背景 push が走る
@@ -12692,7 +13585,7 @@ mod tests {
         let _edits =
             host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |m, ui| {
                 let _ = ui.arrangement(
-                    "arr", arr_rect, &m.tracks, m.view, &[], &[], &[], &[], &style, None,
+                    "arr", arr_rect, &m.tracks, &[], m.view, &[], &[], &[], &[], &style, None,
                     |_| Edit::mutate(|_: &mut Model| {}),
                 );
             });
@@ -12782,6 +13675,7 @@ mod tests {
                     "arr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
+                    &[],
                     m.view,
                     &[],
                     &[],
@@ -12890,6 +13784,7 @@ mod tests {
                     "arr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
+                    &[],
                     m.view,
                     &[],
                     &[],
@@ -13001,6 +13896,7 @@ mod tests {
                         "arr",
                         Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                         &m.tracks,
+                        &[],
                         m.view,
                         &[],
                         &[],
@@ -13096,6 +13992,7 @@ mod tests {
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.tracks,
+                &[],
                 m.view,
                 &[],
                 &[],
@@ -13172,6 +14069,7 @@ mod tests {
                     "arr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.tracks,
+                    &[],
                     m.view,
                     &[],
                     &[],
@@ -13245,6 +14143,7 @@ mod tests {
                         "arr",
                         Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                         &m.tracks,
+                        &[],
                         m.view,
                         &[],
                         &[],
@@ -13337,6 +14236,7 @@ mod tests {
                     "arr",
                     area,
                     tracks,
+                    &[],
                     view,
                     selected,
                     &[],
@@ -13503,6 +14403,7 @@ mod tests {
                     "arr",
                     area,
                     &tracks,
+                    &[],
                     view,
                     &selected,
                     &[],

@@ -203,13 +203,15 @@ fn main() {
                 },
             );
             // M9 Phase 45e: arrangement widget が non-Clone Model でコンパイルする。
-            // 全 17 variants を make_edit でハンドルすることで API exhaustive 担保。
+            // 全 variants を make_edit でハンドルすることで API exhaustive 担保
+            // (M14 Phase 127 で Arranger section の 6 variant を追加)。
             let arr_view = ArrangementView::default();
             let arr_style = ArrangementStyle::default();
             let _ = ui.arrangement(
                 "arr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &m.arr_tracks,
+                &[],
                 arr_view,
                 &m.arr_selected_clips,
                 &m.arr_selected_tracks,
@@ -373,6 +375,25 @@ fn main() {
                     }
                     // M14 Phase 117 (daw_01 #091): header / lanes 境界 splitter drag → SetHeaderW。
                     ArrangementEditRequest::SetHeaderW { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    // M14 Phase 127 (daw_01 #105): Arranger レーン (section) の編集意図 6 variant。
+                    ArrangementEditRequest::CreateSection { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::MoveSection { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::ResizeSection { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::DuplicateSection { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::BeginRenameSection(_) => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    ArrangementEditRequest::SecondaryClickSection { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                 },

@@ -1,17 +1,11 @@
-//! group track の背景 tint 撤去 (daw_01 #085 / Phase 113) の offscreen visual verify。
+//! M14 Phase 127 (daw_01 #105): Arranger レーン (曲のパート Section) の offscreen visual verify。
 //!
-//! header pane 付きで group track (= 子を持つ track) と通常 track を縦に並べ、 group row の
-//! 背景が **他の track と同じ neutral** で塗られる (= 旧 `track_group_bg` の青 tint が出ない) こと、
-//! 一方で **indent (`depth * indent_px`) と disclosure ▶/▼ の構造手掛かりは残る** ことを 1 枚で確認する。
+//! ruler の直下・track lanes の上に `arranger_lane_h` の帯を確保し、 色付き section (Intro / Aメロ /
+//! サビ) を名前ラベル付きで描く。 header 側 (`header_w` 列) に "Arranger" 見出し、 帯は ruler /
+//! playhead / clips と時間軸 (x) が揃うことを 1 枚で確認する。
 //!
-//! 構成 (上から):
-//! - "Group A" (id 0, depth 0, 子あり = group) … 旧設計では行背景が青 tint だった row。 修正後 neutral。
-//! - "Child 1" (id 1, parent=0, depth 1) … indent される子。
-//! - "Child 2" (id 2, parent=0, depth 1)
-//! - "Audio"   (id 3, depth 0, 子なし = 通常) … group row と背景が一致することの比較対象。
-//!
-//! 実行: `cargo run --bin arrangement_group_snapshot`
-//!   → `<workspace>/target/arrangement_group_snapshot.png`。
+//! 実行: `cargo run --bin arrangement_section_snapshot`
+//!   → `<workspace>/target/arrangement_section_snapshot.png`。
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -26,7 +20,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ArrangementClip, ArrangementStyle, ArrangementTrack, ArrangementView, Edit, FrameInput,
-    SnapConfig, TrackKind, UiHost,
+    SectionView, SnapConfig, TrackKind, UiHost,
 };
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Color, OffscreenRenderer, Rect, Scene};
@@ -45,13 +39,7 @@ fn clip(id: u32, start: f64, len: f64, name: &str) -> ArrangementClip {
     }
 }
 
-fn track(
-    id: u32,
-    name: &str,
-    parent_id: Option<u32>,
-    depth: u8,
-    clips: Vec<ArrangementClip>,
-) -> ArrangementTrack {
+fn track(id: u32, name: &str, clips: Vec<ArrangementClip>) -> ArrangementTrack {
     ArrangementTrack {
         id,
         name: Arc::from(name),
@@ -60,8 +48,8 @@ fn track(
         armed: false,
         clips,
         volume: 1.0,
-        parent_id,
-        depth,
+        parent_id: None,
+        depth: 0,
         automation_lanes_collapsed: true,
         automation_lanes: Vec::new(),
         collapsed: false,
@@ -71,36 +59,47 @@ fn track(
     }
 }
 
+fn section(id: u32, name: &str, color: [f32; 3], start: f64, len: f64) -> SectionView {
+    SectionView { id, name: Arc::from(name), color, start_beat: start, len_beats: len }
+}
+
 fn view() -> ArrangementView {
     ArrangementView {
         start_beat: 0.0,
-        len_beats: 8.0,
+        len_beats: 16.0,
         track_top: 0.0,
-        tracks_visible: 4.0,
-        track_row_h: 48.0,
-        header_w: 168.0,
+        tracks_visible: 3.0,
+        track_row_h: 44.0,
+        header_w: 150.0,
         ruler_h: 22.0,
-        playhead_beat: None,
-        loop_range: None,
+        playhead_beat: Some(6.0),
+        loop_range: Some((4.0, 12.0)),
         data_generation: 0,
         bpm: 120.0,
         time_sig: (4, 4),
         snap: SnapConfig::OFF,
-        arranger_lane_h: 0.0,
+        // Arranger レーンを 22px で確保。
+        arranger_lane_h: 22.0,
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let width: u32 = 820;
-    let height: u32 = 230;
+    let width: u32 = 840;
+    let height: u32 = 200;
 
     let mut renderer = OffscreenRenderer::new(width, height)?;
 
     let tracks = vec![
-        track(0, "Group A", None, 0, vec![clip(1, 0.0, 3.0, "intro")]),
-        track(1, "Child 1", Some(0), 1, vec![clip(2, 0.5, 2.0, "lead")]),
-        track(2, "Child 2", Some(0), 1, vec![clip(3, 2.0, 3.5, "pad")]),
-        track(3, "Audio", None, 0, vec![clip(4, 1.0, 4.0, "drums")]),
+        track(0, "Vocal", vec![clip(1, 0.0, 8.0, "verse")]),
+        track(1, "Drums", vec![clip(2, 0.0, 16.0, "beat")]),
+        track(2, "Bass", vec![clip(3, 8.0, 4.0, "low")]),
+    ];
+
+    // 隣接 (Intro|Aメロ) + gap (サビは 1 拍空けて配置) の両方を確認する。
+    let sections = vec![
+        section(0, "Intro", [0.30, 0.45, 0.65], 0.0, 4.0),
+        section(1, "Aメロ", [0.35, 0.55, 0.40], 4.0, 4.0),
+        section(2, "サビ", [0.70, 0.45, 0.35], 9.0, 5.0),
     ];
 
     let mut host: UiHost<()> = UiHost::no_redraw();
@@ -111,10 +110,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
         let style = ArrangementStyle::default();
         let _ = ui.arrangement(
-            "arr_group_snapshot",
+            "arr_section_snapshot",
             Rect { x: 0.0, y: 0.0, w: width as f32, h: height as f32 },
             &tracks,
-            &[],
+            &sections,
             view(),
             &[],
             &[],
@@ -129,9 +128,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rgba = renderer.render_to_rgba(&scene)?;
     let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target");
     fs::create_dir_all(&target_dir)?;
-    let out_path = target_dir.join("arrangement_group_snapshot.png");
+    let out_path = target_dir.join("arrangement_section_snapshot.png");
     save_png(&out_path, &rgba, width, height)?;
-    println!("arrangement group snapshot saved to {}", out_path.display());
+    println!("arrangement section snapshot saved to {}", out_path.display());
     Ok(())
 }
 

@@ -130,6 +130,7 @@ fn make_view() -> ArrangementView {
         time_sig: (4, 4),
         // 数値検証 test は raw beat 値を期待するので明示 OFF。
         snap: SnapConfig::OFF,
+        arranger_lane_h: 0.0,
     }
 }
 
@@ -206,6 +207,7 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
             "arr",
             WIDGET_RECT,
             &model.tracks,
+            &[],
             view,
             &[],
             &[],

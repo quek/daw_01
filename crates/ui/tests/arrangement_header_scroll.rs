@@ -70,6 +70,7 @@ fn make_view() -> ArrangementView {
         bpm: 120.0,
         time_sig: (4, 4),
         snap: SnapConfig::OFF,
+        arranger_lane_h: 0.0,
     }
 }
 
@@ -96,6 +97,7 @@ fn run_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: FrameInput) {
             "arr",
             WIDGET_RECT,
             &model.tracks,
+            &[],
             view,
             &[],
             &[],

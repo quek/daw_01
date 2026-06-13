@@ -131,6 +131,7 @@ fn arr_view(snap: SnapConfig) -> ArrangementView {
         bpm: 120.0,
         time_sig: (4, 4),
         snap,
+        arranger_lane_h: 0.0,
     }
 }
 
@@ -144,6 +145,7 @@ fn arr_frame(host: &mut UiHost<ArrModel>, m: &mut ArrModel, input: FrameInput, s
             "arr",
             WIDGET_RECT,
             &model.tracks,
+            &[],
             view,
             &model.selected,
             &[],

@@ -109,6 +109,7 @@ fn view(width: u32, height: u32) -> ArrangementView {
         bpm: 120.0,
         time_sig: (4, 4),
         snap: SnapConfig::OFF,
+        arranger_lane_h: 0.0,
     }
 }
 
@@ -173,6 +174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "arr_share_snapshot",
             Rect { x: 0.0, y: 0.0, w: width as f32, h: height as f32 },
             &tracks,
+            &[],
             view(width, height),
             &selected,
             &[],
