@@ -618,6 +618,8 @@ mod tests {
             has_audio_output: true,
             // pure audio-FX: audio を加工する → audio 入力あり。
             has_audio_input: true,
+            has_video_input: false,
+            has_video_output: false,
         }
     }
 
@@ -631,6 +633,8 @@ mod tests {
             has_audio_output: true,
             // instrument: note→audio 生成。 audio を加工しない → audio 入力なし。
             has_audio_input: false,
+            has_video_input: false,
+            has_video_output: false,
         }
     }
 

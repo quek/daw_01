@@ -2394,6 +2394,8 @@ mod sidechain_tests {
                                 has_audio_output: true,
                                 // audio-FX device: audio を加工する → audio 入力あり。
                                 has_audio_input: true,
+                                has_video_input: false,
+                                has_video_output: false,
                             },
                         )
                     }];

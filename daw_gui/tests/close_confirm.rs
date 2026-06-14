@@ -36,6 +36,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
             has_audio_output: true,
             // instrument: audio を生成するだけ → audio 入力なし。
             has_audio_input: false,
+            has_video_input: false,
+            has_video_output: false,
         }],
         scanned_at: None,
         port_probe_version: 0,

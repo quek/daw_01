@@ -145,6 +145,9 @@ impl DecodedFrame {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ActiveVideoFrame {
     pub video_source_id: VideoSourceId,
+    /// FIXME #54: この動画フレームを持つ track id (映像効果チェーンの解決に使う、
+    /// `ActiveImageFrame::owning_track_id` と対)。
+    pub owning_track_id: u32,
     pub source_micros: u64,
     /// Per-event alpha derived from `fade_in_beats` / `fade_out_beats`
     /// and the matching curve. `1.0` is fully opaque, `0.0` invisible.
@@ -416,6 +419,7 @@ impl VideoPlaybackEngine {
                     }
                     out.push(ActiveVideoFrame {
                         video_source_id: event.source_id,
+                        owning_track_id: track.id,
                         source_micros,
                         alpha,
                         z_index,

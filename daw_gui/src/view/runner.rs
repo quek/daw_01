@@ -1406,6 +1406,21 @@ impl Runner {
             // the texture's. If they diverge the texture got
             // re-created underneath us — fall back to ring-slot dims.
             let _ = (w, h);
+            // FIXME #54: この動画 track の映像効果チェーンを解決して layer に付与
+            // (描画側が texture に適用)。
+            let fx = state
+                .app
+                .song
+                .track_by_id(frame_info.owning_track_id)
+                .map(|t| {
+                    crate::video_fx::resolve_track_effects(
+                        &state.app.song,
+                        t,
+                        playhead_beat,
+                        &state.app.mod_scalars,
+                    )
+                })
+                .unwrap_or_default();
             layers.push(crate::view::preview_window::CompositeLayer {
                 texture: handle,
                 width: slot.width,
@@ -1415,6 +1430,7 @@ impl Runner {
                 // image-overlay path only.
                 pip_rect: None,
                 rotation_radians: 0.0,
+                fx,
             });
         }
 
@@ -1485,6 +1501,20 @@ impl Runner {
                     },
                 );
             } else {
+                // FIXME #54: 非グループ image overlay の owning track の効果チェーン。
+                let fx = state
+                    .app
+                    .song
+                    .track_by_id(frame_info.owning_track_id)
+                    .map(|t| {
+                        crate::video_fx::resolve_track_effects(
+                            &state.app.song,
+                            t,
+                            playhead_beat,
+                            &state.app.mod_scalars,
+                        )
+                    })
+                    .unwrap_or_default();
                 layers.push(crate::view::preview_window::CompositeLayer {
                     texture: handle,
                     width: dims.0,
@@ -1497,6 +1527,7 @@ impl Runner {
                         frame_info.h,
                     )),
                     rotation_radians: frame_info.rotation_radians,
+                    fx,
                 });
             }
         }
@@ -1535,10 +1566,18 @@ impl Runner {
             if children.is_empty() && !selected {
                 continue;
             }
+            // FIXME #54: group track の映像効果チェーン (合成 1 枚へ適用)。
+            let fx = crate::video_fx::resolve_track_effects(
+                &state.app.song,
+                track,
+                playhead_beat,
+                &state.app.mod_scalars,
+            );
             group_layers.push(crate::group_compose::GroupLayer {
                 children,
                 transform: *transform,
                 selected,
+                fx,
             });
         }
         preview.set_group_layers(group_layers);

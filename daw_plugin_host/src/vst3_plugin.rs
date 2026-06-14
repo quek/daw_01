@@ -783,6 +783,9 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
         has_note_output: ev_out > 0,
         has_audio_output: au_out > 0,
         has_audio_input: au_in > 0,
+        // VST3 は映像 port を持たない。
+        has_video_input: false,
+        has_video_output: false,
     })
 }
 

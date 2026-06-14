@@ -120,12 +120,18 @@ pub enum PluginCategory {
     Instrument,
     Fx,
     MidiFx,
+    /// FIXME #54: 内蔵 GPU 映像効果 (`builtin.video.*`、feature `video-effect`)。
+    /// GUI 描画パスで処理する device。チェーンに刺さるが audio バスは素通り。
+    Video,
 }
 
 impl PluginCategory {
     pub fn from_features(features: &[String]) -> Self {
         let has = |k: &str| features.iter().any(|f| f == k);
-        if has("note-effect") {
+        if has("video-effect") {
+            // FIXME #54: 映像効果は audio/note の前に判定 (排他)。
+            Self::Video
+        } else if has("note-effect") {
             Self::MidiFx
         } else if has("instrument") {
             Self::Instrument
@@ -141,6 +147,7 @@ impl PluginCategory {
             Self::Instrument => "楽器",
             Self::Fx => "FX",
             Self::MidiFx => "MIDI",
+            Self::Video => "映像",
         }
     }
 }
@@ -155,6 +162,9 @@ fn port_config_of(e: &common::plugin_db::PluginEntry) -> common::port_config::Po
         has_note_output: e.has_note_output,
         has_audio_output: e.has_audio_output,
         has_audio_input: e.has_audio_input,
+        // FIXME #54: 内蔵映像効果のみ video ports を持つ。
+        has_video_input: e.has_video_input,
+        has_video_output: e.has_video_output,
     }
 }
 
@@ -3255,10 +3265,18 @@ pub fn compute_slot_reconcile_actions(
     // 1 chain 分の reconcile。 track / master を同じロジックで処理する。
     let mut reconcile_chain =
         |track_id: u32, devices: &[common::model::PluginInstance]| {
-            let song_index_set: std::collections::HashSet<u32> =
-                (0..devices.len() as u32).collect();
+            // FIXME #54: 内蔵映像効果は plugin_host の host slot ではない (GUI 描画 device)。
+            // 「host slot を持つ index 集合」= **映像でない** device の index。これにより
+            // 映像 device は LoadSlot されず、 また音声 device 削除で映像 device が同 index に
+            // ずれ込んでも、 古い host slot は (この集合に無いので) RemoveSlot される。
+            let host_slot_indices: std::collections::HashSet<u32> = devices
+                .iter()
+                .enumerate()
+                .filter(|(_, inst)| !inst.ports.is_video())
+                .map(|(i, _)| i as u32)
+                .collect();
 
-            // (1) host にあるが Song に無い index → RemoveSlot
+            // (1) host にあるが Song の host slot に無い index → RemoveSlot
             // 順序を安定にするため index を sort してから push する (= test の
             // assertion が決定的になる)。 production の挙動は HashMap iter
             // 順依存だが、 RemoveSlot 同士は独立操作なので順序は無関係。
@@ -3266,7 +3284,7 @@ pub fn compute_slot_reconcile_actions(
                 .iter()
                 .filter(|((tid, _), _)| *tid == track_id)
                 .map(|((_, idx), _)| *idx)
-                .filter(|idx| !song_index_set.contains(idx))
+                .filter(|idx| !host_slot_indices.contains(idx))
                 .collect();
             host_extra.sort_unstable();
             for index in host_extra {
@@ -3275,6 +3293,10 @@ pub fn compute_slot_reconcile_actions(
 
             // (2) Song にあるが host に無い、 もしくは plugin_id_str が違う index → LoadSlot
             for (i, inst) in devices.iter().enumerate() {
+                // FIXME #54: 映像 device は plugin_host に load しない。
+                if inst.ports.is_video() {
+                    continue;
+                }
                 let index = i as u32;
                 let need_load = match loaded_slots.get(&(track_id, index)) {
                     None => true,
@@ -7051,6 +7073,8 @@ impl AppData {
                     has_audio_output: true,
                     // 音源 (audio を生成、加工はしない) なので audio 入力なし。
                     has_audio_input: false,
+                    has_video_input: false,
+                    has_video_output: false,
                 },
             ));
             tracing::info!(
@@ -7105,6 +7129,11 @@ impl AppData {
             to_send.push((common::model::MASTER_TRACK_ID, i as u32, p.clone()));
         }
         for (track, index, inst) in to_send {
+            // FIXME #54: 内蔵映像効果は GUI 描画 device。plugin_host に load しない
+            // (該当 builtin 無し)。engine は未登録 index を skip する (= 音声素通り)。
+            if inst.ports.is_video() {
+                continue;
+            }
             let Some(entry) = db.find_by_id(&inst.plugin_id) else {
                 tracing::error!(id = %inst.plugin_id, track, index, "plugin id not in database");
                 continue;
@@ -7139,6 +7168,10 @@ impl AppData {
             }
         }
         for (track, index, inst) in to_send {
+            // FIXME #54: 内蔵映像効果は plugin_host に load しない (GUI 描画 device)。
+            if inst.ports.is_video() {
+                continue;
+            }
             let Some(entry) = db.find_by_id(&inst.plugin_id) else {
                 tracing::error!(id = %inst.plugin_id, track, index, "pasted plugin id not in database");
                 continue;
@@ -16448,21 +16481,29 @@ impl AppData {
             self.song.tracks[track_idx].devices.len() as u32
         };
 
-        self.track_pending_load(track_id, dest_index);
-        // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync + GUI 自動
-        // open する (project-load の一斉復元はこの集合に積まれない)。 Shift
-        // (open_gui=false) のときは GUI 自動 open を抑止 (ロードはする)。
-        if open_gui {
-            self.pending_added_plugin_finalize.insert((track_id, dest_index));
+        // FIXME #54: 内蔵映像効果は GUI 描画パスで処理する device。plugin_host に
+        // load せず (load_builtin に該当無し)、モデルへ append するだけ。engine の
+        // `process_track_owned` は `slot_to_plugin_id` 未登録の index を skip し
+        // (= 音声バス素通り)、append は既存 device の index をずらさないので
+        // audio 側は完全に不変。param は GUI が automation/変調を評価して描画に使う。
+        let is_video = ports.is_video();
+        if !is_video {
+            self.track_pending_load(track_id, dest_index);
+            // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync + GUI 自動
+            // open する (project-load の一斉復元はこの集合に積まれない)。 Shift
+            // (open_gui=false) のときは GUI 自動 open を抑止 (ロードはする)。
+            if open_gui {
+                self.pending_added_plugin_finalize.insert((track_id, dest_index));
+            }
+            self.send_plugin(MainToChild::SetSlotPlugin {
+                track: track_id,
+                index: dest_index,
+                format: entry_format,
+                path,
+                plugin_id: entry_id.clone(),
+                initial_state: None,
+            });
         }
-        self.send_plugin(MainToChild::SetSlotPlugin {
-            track: track_id,
-            index: dest_index,
-            format: entry_format,
-            path,
-            plugin_id: entry_id.clone(),
-            initial_state: None,
-        });
 
         let new_device = common::model::PluginInstance::with_ports(
             entry_id,
@@ -16902,6 +16943,9 @@ impl AppData {
         // プラグインだけをリストに出す (それ以外は挿せないので隠す)。 通常トラックは
         // 全カテゴリ混合で見せ、 種別は選択時に features から自動振り分けする
         // (plan_unified_plugin_picker.md)。
+        // FIXME #54: master 映像チェーン (master_fx_chain への video device + 最終合成で
+        // apply_chain) は後続。 それまで master picker から Video は除外し、 描画されない
+        // 孤立 device をユーザーが挿せないようにする (orphaned feature を出さない)。
         let master = self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
         // 検索クエリ (前後空白を除去)。 空なら (master フィルタを除き) 全件、 非空なら
         // name / vendor のいずれかへの subsequence マッチで AND 絞り込みする。
@@ -19297,6 +19341,9 @@ mod plugin_category_tests {
             // 未分類 (主カテゴリ無し / 空) は FX チェーンへ倒す。
             (&[], PluginCategory::Fx),
             (&["reverb"], PluginCategory::Fx),
+            // FIXME #54: video-effect は最優先で映像カテゴリへ (排他)。
+            (&["video-effect", "video-color"], PluginCategory::Video),
+            (&["video-effect"], PluginCategory::Video),
         ];
         for (features, expected) in cases {
             assert_eq!(

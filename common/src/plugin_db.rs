@@ -65,13 +65,22 @@ pub struct PluginEntry {
     /// 旧 cache は `#[serde(default)]` で `false`、`PORT_PROBE_VERSION` bump で再 probe。
     #[serde(default)]
     pub has_audio_input: bool,
+    /// FIXME #54: 映像 (RGBA テクスチャ) 入力ポートを持つ。内蔵映像効果
+    /// (`builtin.video.*`) のみ true。外部 CLAP/VST3 は probe で常に false。
+    #[serde(default)]
+    pub has_video_input: bool,
+    /// FIXME #54: 映像 (RGBA テクスチャ) 出力ポートを持つ。
+    #[serde(default)]
+    pub has_video_output: bool,
 }
 
 /// FIXME #29 / v23: port 構成 probe スキーマの現行版。 `PluginEntry` に記録する
 /// port bool (note in/out・audio out/**in**) の取得方法・意味づけを変えたら上げる。
 /// cache の `port_probe_version` がこれ未満なら、 起動時に再 probe (rescan) する。
 /// v23: `has_audio_input` を追加したので 1 → 2 (= 既存 cache を再 probe させる)。
-pub const PORT_PROBE_VERSION: u32 = 2;
+/// FIXME #54: `has_video_input`/`has_video_output` を追加し probe 行を 6 キー化したので
+/// 2 → 3 (= 旧 4-キー probe 結果の cache を再 probe させ、外部 plugin の video=false を確定)。
+pub const PORT_PROBE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginDatabase {
@@ -217,7 +226,7 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
         "instrument".to_string(),
         "synthesizer".to_string(),
     ];
-    vec![
+    let mut entries = vec![
         PluginEntry {
             id: BUILTIN_ID_SILENCE.to_string(),
             format: PluginFormat::Builtin,
@@ -235,6 +244,8 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             has_note_output: false,
             has_audio_output: true,
             has_audio_input: false,
+            has_video_input: false,
+            has_video_output: false,
         },
         PluginEntry {
             id: BUILTIN_ID_VOICEVOX.to_string(),
@@ -255,8 +266,37 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             has_note_output: false,
             has_audio_output: true,
             has_audio_input: false,
+            has_video_input: false,
+            has_video_output: false,
         },
-    ]
+    ];
+    // FIXME #54 / docs/plan_video_fx.md §9: 内蔵映像効果 (`builtin.video.*`) を
+    // SSoT (`crate::video_fx` カタログ) から列挙する。映像 device は GUI 描画パスで
+    // 処理されるため audio/note port は全 false、video in/out を立てる。これにより
+    // engine の `process_track_owned` は `slot_to_plugin_id` 未登録の index として
+    // skip し (= 音声バス素通り)、plugin host へは load 要求が飛ばない (daw_gui 側で抑止)。
+    for def in crate::video_fx::builtin_video_fx() {
+        entries.push(PluginEntry {
+            id: def.id.to_string(),
+            format: PluginFormat::Builtin,
+            name: def.name.to_string(),
+            vendor: "daw_01".to_string(),
+            version: version.to_string(),
+            features: vec![
+                "video-effect".to_string(),
+                def.category.feature_tag().to_string(),
+            ],
+            path: PathBuf::from(def.id),
+            descriptor_index: 0,
+            has_note_input: false,
+            has_note_output: false,
+            has_audio_output: false,
+            has_audio_input: false,
+            has_video_input: true,
+            has_video_output: true,
+        });
+    }
+    entries
 }
 
 /// Scan every `.clap` under the system CLAP directory plus every `.vst3`
@@ -323,6 +363,9 @@ pub fn scan_system() -> Result<PluginDatabase> {
                     has_note_output: false,
                     has_audio_output: true,
                     has_audio_input: false,
+                    // 外部 VST3 は映像 device ではない。
+                    has_video_input: false,
+                    has_video_output: false,
                 });
             }
         }
@@ -448,6 +491,9 @@ fn scan_one_file(path: &Path) -> Result<Vec<PluginEntry>> {
             // しないので false、 note-effect は audio に触れないので false。 これで
             // reverb/EQ/comp 等の純 audio-fx だけが true になる。 正確値は probe が上書き。
             has_audio_input: !has_note_eff && !has_instr,
+            // 外部 CLAP は映像 device ではない。
+            has_video_input: false,
+            has_video_output: false,
         });
     }
 
@@ -514,6 +560,8 @@ mod tests {
                 has_audio_output: true,
                 // instrument: audio を生成するだけで加工しない。
                 has_audio_input: false,
+                has_video_input: false,
+                has_video_output: false,
             }],
             scanned_at: Some(42),
             port_probe_version: 0,
@@ -549,6 +597,8 @@ mod tests {
                 has_audio_output: true,
                 // 外部 audio エフェクト (audio in/out)。
                 has_audio_input: true,
+                has_video_input: false,
+                has_video_output: false,
             }],
             scanned_at: Some(100),
             port_probe_version: 0,
@@ -617,6 +667,8 @@ mod tests {
                 has_audio_output: true,
                 // 外部 audio エフェクト (audio in/out)。
                 has_audio_input: true,
+                has_video_input: false,
+                has_video_output: false,
             }],
             scanned_at: Some(1),
             port_probe_version: 0,

@@ -41,4 +41,5 @@ pub mod single_instance;
 #[cfg(windows)]
 pub mod smoke_test;
 pub mod subprocess;
+pub mod video_fx;
 pub mod view;

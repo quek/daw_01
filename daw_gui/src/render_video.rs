@@ -278,6 +278,10 @@ pub fn render_mp4_cancellable(
         .and_then(|p| common::mod_sidecar::ModEnvSidecar::read(&p).ok())
         .unwrap_or_default();
     let mut mod_scalars_buf: Vec<f32> = Vec::new();
+    // FIXME #54: トラック映像効果の GPU 実行基盤 (preview と同一の VideoFxEngine)。
+    // pipeline cache + ping-pong pool を frame 跨ぎ保持。export 終了で offscreen
+    // と共に drop (= pool target も解放)。
+    let mut fx_engine = crate::video_fx::VideoFxEngine::new();
 
     let mut pending = None;
     for frame_index in 0..total_frames {
@@ -298,6 +302,7 @@ pub fn render_mp4_cancellable(
             cfg.project_dir,
             &mut decoder,
             &mut offscreen,
+            &mut fx_engine,
             &mut video_textures,
             &image_textures,
             playhead_beat,
@@ -431,6 +436,7 @@ fn build_frame_scene(
     project_dir: Option<&Path>,
     decoder: &mut crate::libav_decoder::LibavVideoDecoder,
     offscreen: &mut OffscreenRenderer,
+    fx_engine: &mut crate::video_fx::VideoFxEngine,
     video_textures: &mut HashMap<VideoSourceId, (TextureHandle, u32, u32)>,
     image_textures: &HashMap<ImageSourceId, (TextureHandle, u32, u32)>,
     playhead_beat: f64,
@@ -439,6 +445,9 @@ fn build_frame_scene(
     out_h: u32,
     scene: &mut Scene,
 ) {
+    // FIXME #54: 前 frame の効果 target を解放 (前 frame は submit_readback で sample 済み)。
+    // 今 frame の apply_chain が同寸でも別 target を払い出し、レイヤー間衝突を防ぐ。
+    fx_engine.end_frame(offscreen);
     let video_layers = VideoPlaybackEngine::active_sources_at(song, playhead_beat);
     for layer in video_layers {
         let Some(path) =
@@ -483,6 +492,16 @@ fn build_frame_scene(
             .expect("just inserted");
         offscreen.upload_texture_bgra(texture, bgra);
         let (rx, ry, rw, rh) = aspect_fit(out_w, out_h, width, height);
+        // FIXME #54: この動画 track の映像効果チェーンを適用 (preview と同経路)。
+        let fx = song
+            .track_by_id(layer.owning_track_id)
+            .map(|t| crate::video_fx::resolve_track_effects(song, t, playhead_beat, mod_scalars))
+            .unwrap_or_default();
+        let texture = if fx.is_empty() {
+            texture
+        } else {
+            fx_engine.apply_chain(offscreen, texture, width, height, &fx)
+        };
         scene.push_textured_quad(TexturedQuad {
             rect: Rect::new(rx as f32, ry as f32, rw as f32, rh as f32),
             texture,
@@ -512,7 +531,7 @@ fn build_frame_scene(
         Vec<crate::group_compose::GroupChildQuad>,
     > = std::collections::HashMap::new();
     for layer in image_layers {
-        let Some((texture, _, _)) = image_textures.get(&layer.image_source_id) else {
+        let Some((texture, iw, ih)) = image_textures.get(&layer.image_source_id) else {
             continue; // not decoded / failed import
         };
         // owning track の親が active visual group なら bucket、さもなくば直接 push。
@@ -538,9 +557,19 @@ fn build_frame_scene(
         if rw == 0.0 || rh == 0.0 {
             continue;
         }
+        // FIXME #54: 非グループ image overlay の owning track の効果チェーンを適用。
+        let fx = song
+            .track_by_id(layer.owning_track_id)
+            .map(|t| crate::video_fx::resolve_track_effects(song, t, playhead_beat, mod_scalars))
+            .unwrap_or_default();
+        let texture = if fx.is_empty() {
+            *texture
+        } else {
+            fx_engine.apply_chain(offscreen, *texture, *iw, *ih, &fx)
+        };
         scene.push_textured_quad(TexturedQuad {
             rect: Rect::new(rx, ry, rw, rh),
-            texture: *texture,
+            texture,
             alpha: layer.alpha,
             uv_min: (0.0, 0.0),
             uv_max: (1.0, 1.0),
@@ -593,6 +622,13 @@ fn build_frame_scene(
         if rw <= 0.0 || rh <= 0.0 || alpha <= 0.0 {
             continue;
         }
+        // FIXME #54: 子を 1 枚へ合成した「トラック合成画」に group track の効果を適用。
+        let fx = crate::video_fx::resolve_track_effects(song, track, playhead_beat, mod_scalars);
+        let handle = if fx.is_empty() {
+            handle
+        } else {
+            fx_engine.apply_chain(offscreen, handle, cw, ch, &fx)
+        };
         scene.push_textured_quad(TexturedQuad {
             rect: Rect::new(rx, ry, rw, rh),
             texture: handle,

@@ -36,6 +36,10 @@ pub struct GroupLayer {
     pub transform: GroupTransform,
     /// この group track が選択中か（preview に bounding box + anchor を描く）。
     pub selected: bool,
+    /// FIXME #54: この group track の映像効果チェーン (解決済み実効値)。子を 1 枚へ
+    /// 合成した**あと**に親 affine の前段でチェーン順適用する (合成 1 枚 = §3 そのまま、
+    /// 二重適用なし)。空なら効果なし。
+    pub fx: Vec<crate::video_fx::ResolvedEffect>,
 }
 
 /// group track の「現在 effective な」 transform を解決する。

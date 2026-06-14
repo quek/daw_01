@@ -1816,6 +1816,9 @@ fn clap_plugin_port_config(
         has_note_output: note_out > 0,
         has_audio_output: audio_out > 0,
         has_audio_input: audio_in > 0,
+        // CLAP は映像 port を持たない (内蔵映像効果は GUI 側 device、probe しない)。
+        has_video_input: false,
+        has_video_output: false,
     })
 }
 

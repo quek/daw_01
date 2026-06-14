@@ -1,10 +1,15 @@
-//! FIXME #29: プラグインの port 構成。 capability（生成器/音源/エフェクト）の
-//! **Single Source of Truth** となる 3 bool を運ぶ。
+//! FIXME #29: プラグインの port 構成。 capability（生成器/音源/エフェクト/映像効果）の
+//! **Single Source of Truth** となる bool 群を運ぶ。
 //!
 //! probe subprocess（`daw_plugin_host --probe-vst3` / `--probe-clap`）が
 //! [`PortConfig::to_line`] で stdout に 1 行出力し、 rescan 側（`daw_gui`）が
-//! [`PortConfig::parse_line`] で復元して `PluginEntry` の 3 bool に格納する。
+//! [`PortConfig::parse_line`] で復元して `PluginEntry` の bool に格納する。
 //! VST3 / CLAP どちらの probe も同じ型・同じ行形式を使う（DRY）。
+//!
+//! FIXME #54 / docs/plan_video_fx.md: 内蔵映像効果用に `has_video_input` /
+//! `has_video_output` を追加。映像 device は GUI 描画パスで処理されるため、
+//! audio engine / plugin host から見ると `slot_to_plugin_id` 未登録の index で、
+//! `process_track_owned` がそのまま skip する (= 音声バスを素通り)。
 
 #[derive(
     Debug,
@@ -32,6 +37,23 @@ pub struct PortConfig {
     /// audio_in を持たず audio_out を持つ = 音源、audio_in を持つ = エフェクト。
     #[serde(default)]
     pub has_audio_input: bool,
+    /// FIXME #54: 映像 (RGBA テクスチャ) 入力ポートを持つ。内蔵映像効果
+    /// (`builtin.video.*`) はこれと [`has_video_output`](Self::has_video_output)
+    /// の両方を立て、audio/note 系は全て false にする。
+    #[serde(default)]
+    pub has_video_input: bool,
+    /// FIXME #54: 映像 (RGBA テクスチャ) 出力ポートを持つ。
+    #[serde(default)]
+    pub has_video_output: bool,
+}
+
+impl PortConfig {
+    /// FIXME #54: 映像 device か (映像 in/out のいずれかを持つ)。GUI 描画パスで
+    /// 処理する device の判定 (audio engine / plugin host はこれを load しない)。
+    #[must_use]
+    pub fn is_video(&self) -> bool {
+        self.has_video_input || self.has_video_output
+    }
 }
 
 impl PortConfig {
@@ -39,17 +61,19 @@ impl PortConfig {
     #[must_use]
     pub fn to_line(&self) -> String {
         format!(
-            "note_in={} note_out={} audio_out={} audio_in={}",
+            "note_in={} note_out={} audio_out={} audio_in={} video_in={} video_out={}",
             self.has_note_input,
             self.has_note_output,
             self.has_audio_output,
-            self.has_audio_input
+            self.has_audio_input,
+            self.has_video_input,
+            self.has_video_output
         )
     }
 
-    /// probe subprocess の stdout から復元。 4 キーが揃わない / 値が `true`/`false`
-    /// でない行は `None`（呼び元は scan-time の暫定値を残す fallback）。旧 3-キー
-    /// 行は `None` を返すので `port_probe_version` bump で再 probe される。
+    /// probe subprocess の stdout から復元。 6 キーが揃わない / 値が `true`/`false`
+    /// でない行は `None`（呼び元は scan-time の暫定値を残す fallback）。旧 4-キー
+    /// 行は `None` を返すので `PORT_PROBE_VERSION` bump で再 probe される。
     #[must_use]
     pub fn parse_line(s: &str) -> Option<PortConfig> {
         let mut cfg = PortConfig::default();
@@ -78,10 +102,18 @@ impl PortConfig {
                     cfg.has_audio_input = b;
                     seen |= 8;
                 }
+                "video_in" => {
+                    cfg.has_video_input = b;
+                    seen |= 16;
+                }
+                "video_out" => {
+                    cfg.has_video_output = b;
+                    seen |= 32;
+                }
                 _ => {}
             }
         }
-        (seen == 0b1111).then_some(cfg)
+        (seen == 0b111111).then_some(cfg)
     }
 }
 
@@ -97,18 +129,33 @@ mod tests {
                 has_note_output: true,
                 has_audio_output: true,
                 has_audio_input: true,
+                has_video_input: false,
+                has_video_output: false,
             },
             PortConfig {
                 has_note_input: true,
                 has_note_output: false,
                 has_audio_output: true,
                 has_audio_input: false,
+                has_video_input: false,
+                has_video_output: false,
             },
             PortConfig {
                 has_note_input: true,
                 has_note_output: true,
                 has_audio_output: false,
                 has_audio_input: true,
+                has_video_input: false,
+                has_video_output: false,
+            },
+            // FIXME #54: 純映像 device (note/audio 全 false、video in/out)。
+            PortConfig {
+                has_note_input: false,
+                has_note_output: false,
+                has_audio_output: false,
+                has_audio_input: false,
+                has_video_input: true,
+                has_video_output: true,
             },
             PortConfig::default(),
         ] {
@@ -118,10 +165,11 @@ mod tests {
 
     #[test]
     fn parse_tolerates_surrounding_log_noise_only_on_the_line() {
-        // 1 行に 4 キー揃っていれば順不同で復元できる。
-        let cfg =
-            PortConfig::parse_line("audio_in=true audio_out=false note_out=true note_in=true")
-                .unwrap();
+        // 1 行に 6 キー揃っていれば順不同で復元できる。
+        let cfg = PortConfig::parse_line(
+            "video_out=true audio_in=true audio_out=false note_out=true note_in=true video_in=false",
+        )
+        .unwrap();
         assert_eq!(
             cfg,
             PortConfig {
@@ -129,19 +177,24 @@ mod tests {
                 has_note_output: true,
                 has_audio_output: false,
                 has_audio_input: true,
+                has_video_input: false,
+                has_video_output: true,
             }
         );
     }
 
     #[test]
     fn parse_rejects_incomplete_or_malformed() {
-        assert_eq!(PortConfig::parse_line("note_in=true note_out=true"), None); // audio_out/in 欠落
-        // 旧 3-キー行 (audio_in 無し) は None。 PORT_PROBE_VERSION bump で再 probe される。
+        assert_eq!(PortConfig::parse_line("note_in=true note_out=true"), None); // audio/video 欠落
+        // 旧 4-キー行 (video 無し) は None。 PORT_PROBE_VERSION bump で再 probe される。
         assert_eq!(
-            PortConfig::parse_line("note_in=true note_out=true audio_out=true"),
+            PortConfig::parse_line("note_in=true note_out=true audio_out=true audio_in=false"),
             None
         );
-        assert_eq!(PortConfig::parse_line("note_in=yes note_out=true audio_out=true"), None); // 値不正
+        assert_eq!(
+            PortConfig::parse_line("note_in=yes note_out=true audio_out=true"),
+            None
+        ); // 値不正
         assert_eq!(PortConfig::parse_line(""), None);
         assert_eq!(PortConfig::parse_line("garbage"), None);
     }

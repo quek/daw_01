@@ -15,6 +15,8 @@ const COLOR_TEXT_FORMAT: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
 const COLOR_TAG_INST: Color = Color { r: 0.58, g: 0.85, b: 0.55, a: 1.0 };
 const COLOR_TAG_FX: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
 const COLOR_TAG_MIDI: Color = Color { r: 0.95, g: 0.74, b: 0.45, a: 1.0 };
+/// FIXME #54: 内蔵映像効果タグ色 (紫系、audio/midi と区別)。
+const COLOR_TAG_VIDEO: Color = Color { r: 0.80, g: 0.62, b: 0.95, a: 1.0 };
 
 const PANEL_W: f32 = 520.0;
 const PANEL_H: f32 = 460.0;
@@ -229,6 +231,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                             PluginCategory::Instrument => COLOR_TAG_INST,
                             PluginCategory::Fx => COLOR_TAG_FX,
                             PluginCategory::MidiFx => COLOR_TAG_MIDI,
+                            PluginCategory::Video => COLOR_TAG_VIDEO,
                         }
                     };
                     ui.label_at(

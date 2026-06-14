@@ -103,6 +103,10 @@ pub struct PreviewWindowState {
     /// preview window がリサイズされても画像 PiP の aspect ratio は
     /// project resolution に固定される (= 動画と同じ aspect-fit 動作)。
     pub project_resolution: (u32, u32),
+    /// FIXME #54 / docs/plan_video_fx.md: トラック映像効果の GPU 実行基盤。
+    /// `render_placeholder` が composite layer / group layer の texture へ
+    /// チェーン順適用する (pipeline cache + ping-pong pool を frame 跨ぎ保持)。
+    pub fx_engine: crate::video_fx::VideoFxEngine,
 }
 
 /// One textured layer in the preview composite. The runner builds a
@@ -119,13 +123,17 @@ pub struct PreviewWindowState {
 ///   maps `(x, y, w, h)` to screen px and draws the layer at exactly
 ///   that sub-rect of the preview surface, regardless of aspect.
 ///   Used by `ClipContent::Image` for ロゴ / ジャケット overlays.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CompositeLayer {
     pub texture: TextureHandle,
     pub width: u32,
     pub height: u32,
     pub alpha: f32,
     pub pip_rect: Option<(f32, f32, f32, f32)>,
+    /// FIXME #54: この layer の owning track の映像効果チェーン (解決済み実効値)。
+    /// 描画時に `texture` へチェーン順適用してから push する。空なら効果なし。
+    /// 通常運用 (1 トラック 1 視覚内容) では「トラック合成画に適用」(§3) と一致する。
+    pub fx: Vec<crate::video_fx::ResolvedEffect>,
     /// v15 (`docs/plan_image_automation.md` rotation): rect 中心を旋回
     /// 中心とする 2D 回転 (radians、 clockwise positive)。 PiP layer (=
     /// `pip_rect = Some`) でのみ意味を持ち、 video aspect-fit layer は
@@ -190,6 +198,7 @@ impl PreviewWindowState {
             // 既定値があれば最初の 1 frame だけ少しズレるだけで以降は
             // 正しい aspect になる。
             project_resolution: initial_size,
+            fx_engine: crate::video_fx::VideoFxEngine::new(),
         })
     }
 
@@ -402,6 +411,10 @@ impl PreviewWindowState {
     /// at intermediate alphas. Empty layer list falls back to the
     /// P4 placeholder text.
     pub fn render_placeholder(&mut self) {
+        // FIXME #54: 前 frame の効果 target を解放 (前 frame は末尾の render() で sample 済み)。
+        // これで今 frame の apply_chain が同寸でも別 target を払い出し、レイヤー間衝突を防ぐ
+        // (gui_01 CompositePool::end_cycle を render 冒頭で呼ぶのと同 idiom)。
+        self.fx_engine.end_frame(&mut self.renderer);
         self.scene.clear();
         let screen = self.renderer.size();
         // Dark backdrop spanning the entire window so any unfilled
@@ -471,9 +484,22 @@ impl PreviewWindowState {
                         nh * project_box.3,
                     ),
                 };
+                // FIXME #54: owning track の映像効果チェーンを texture へ適用してから push。
+                // 効果無し (空チェーン) は src をそのまま返す (no-op、追加コストなし)。
+                let texture = if layer.fx.is_empty() {
+                    layer.texture
+                } else {
+                    self.fx_engine.apply_chain(
+                        &mut self.renderer,
+                        layer.texture,
+                        layer.width,
+                        layer.height,
+                        &layer.fx,
+                    )
+                };
                 self.scene.push_textured_quad(TexturedQuad {
                     rect: daw_ui_renderer::Rect::new(dst.0, dst.1, dst.2, dst.3),
-                    texture: layer.texture,
+                    texture,
                     alpha: layer.alpha,
                     uv_min: (0.0, 0.0),
                     uv_max: (1.0, 1.0),
@@ -525,6 +551,19 @@ impl PreviewWindowState {
                     }
                     match self.renderer.composite_scene_to_texture(&sub, cw, ch) {
                         Ok(handle) => {
+                            // FIXME #54: 子を 1 枚へ合成した「トラック合成画」に group track の
+                            // 映像効果チェーンを適用 (§3 そのまま、親 affine の前段)。
+                            let handle = if group.fx.is_empty() {
+                                handle
+                            } else {
+                                self.fx_engine.apply_chain(
+                                    &mut self.renderer,
+                                    handle,
+                                    cw,
+                                    ch,
+                                    &group.fx,
+                                )
+                            };
                             self.scene.push_textured_quad(TexturedQuad {
                                 rect: daw_ui_renderer::Rect::new(rx, ry, rw, rh),
                                 texture: handle,

@@ -47,6 +47,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_audio_output: true,
                 // instrument: audio を生成するだけ → audio 入力なし。
                 has_audio_input: false,
+                has_video_input: false,
+                has_video_output: false,
             },
             PluginEntry {
                 id: "test.bitcrush".into(),
@@ -62,6 +64,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_audio_output: true,
                 // audio-effect: audio を加工する → audio 入力あり。
                 has_audio_input: true,
+                has_video_input: false,
+                has_video_output: false,
             },
             PluginEntry {
                 id: "test.delay".into(),
@@ -77,6 +81,8 @@ fn make_plugin_db() -> Arc<PluginDatabase> {
                 has_audio_output: true,
                 // audio-effect: audio を加工する → audio 入力あり。
                 has_audio_input: true,
+                has_video_input: false,
+                has_video_output: false,
             },
         ],
         scanned_at: None,
