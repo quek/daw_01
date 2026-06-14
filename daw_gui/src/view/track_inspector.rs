@@ -5,8 +5,8 @@
 //! - + Instrument / + Effect / + MIDI FX ボタン
 
 use daw_ui_core::{
-    Edit, ModEdit, ModEntry, Modulation, ReorderableListEditRequest, ReorderableListStyle,
-    ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui,
+    Edit, ReorderableListEditRequest, ReorderableListStyle, ScrubableNumberFormat,
+    ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::{Color, Rect};
 
@@ -14,6 +14,7 @@ use crate::app::{
     text_num_to_builtin, AppData, AppEvent, ClipRef, ColorPickerTarget, DiscreteClipEdit,
     FadeEdgeKind, InspectorScrubField, TextNumField,
 };
+use crate::view::modulation::{self as mod_widget, build_mod, scrub_field_mod, ModBuild};
 use crate::view::track_color;
 use common::model::{AutomationTarget, FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
 
@@ -98,77 +99,17 @@ fn scrub_field(
     let placeholder = if value.is_none() { Some("\u{2014}") } else { None };
 
     // --- per-control modulation (docs/plan_modulation_routing_redesign.md §6) ---
-    // Derive the `AutomationTarget` from `scrub_key` so the image PiP inspector
-    // controls show the Bitwig 風 modulation overlay + depth-drag-when-armed
-    // without threading a target through every caller.
-    //
-    // 制限: per-control の depth ドメインは「コントロールの表示値 == target の正規化
-    // 領域」が成り立つ field に限る。image の X/Y/W/H/Opacity は 0..=1 でこれが成立。
-    // Rotation (度表示↔radians) / text の px・色・回転 / FontSize 等 (identity 正規化の
-    // placeholder) はドメインが食い違うので per-control では出さず、正しい正規化で動く
-    // **ラック** (`cursor_modulatable_targets` + add-dropdown) 経由にする。clip-level
-    // field (gain / pan / pitch / fades) は変調対象でない。
-    let mod_target: Option<AutomationTarget> = match scrub_key {
-        InspectorScrubField::ImageX => Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::X)),
-        InspectorScrubField::ImageY => Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y)),
-        InspectorScrubField::ImageW => Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::W)),
-        InspectorScrubField::ImageH => Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::H)),
-        InspectorScrubField::ImageOpacity => {
-            Some(AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity))
-        }
-        _ => None,
-    };
-    let mod_data = mod_target.as_ref().map(|t| app.inspector_mod_data(t, base));
-    let to_color = |c: [f32; 3]| Color { r: c[0], g: c[1], b: c[2], a: 1.0 };
-    let mod_entries: Vec<ModEntry> = mod_data
+    // scrub_key から target + 表示↔model 変換 (回転 deg↔rad 等) を引き、Bitwig 風の
+    // modulation overlay + arm 中の depth-drag を組む。`build_mod` が image / text /
+    // (回転含む) を 1 経路で扱う。clip-level field (gain / pan / pitch / fades) は
+    // `scrub_field_mod` が `None` を返すので従来どおり overlay なし。
+    // inspector の image/text field は cursor track の clip に属する。
+    let cursor_track = app.cursor_track_id().unwrap_or(common::model::MASTER_TRACK_ID);
+    let mod_spec = scrub_field_mod(scrub_key);
+    let mod_build = mod_spec
         .as_ref()
-        .map(|d| {
-            d.entries
-                .iter()
-                .map(|(c, depth)| ModEntry { color: to_color(*c), depth: *depth })
-                .collect()
-        })
-        .unwrap_or_default();
-    // edit context (= a source is armed) — Copy tuple so it stays usable below.
-    let edit_ctx: Option<([f32; 3], f64, u32, u32, f64)> =
-        mod_data.as_ref().and_then(|d| d.armed.map(|(c, cur, sid)| (c, cur, sid, d.track_id, d.span)));
-    let target_for_edit = mod_target.clone();
-    let on_mod_change = edit_ctx.map(|(_, _, sid, tid, span)| {
-        move |plain: f64| -> Edit<AppData> {
-            let target = target_for_edit.clone().expect("edit_ctx implies a mod target");
-            Edit::mutate(move |app: &mut AppData| {
-                // widget depth is plain (value domain); model depth is normalized.
-                let norm =
-                    if span.abs() > 1e-9 { (plain / span).clamp(-1.0, 1.0) as f32 } else { 0.0 };
-                // First drag on an unrouted (target, source) creates the routing.
-                app.handle_event(AppEvent::AddModRouting {
-                    track_id: tid,
-                    target: target.clone(),
-                    source_id: sid,
-                });
-                app.handle_event(AppEvent::SetModRoutingDepth {
-                    track_id: tid,
-                    target,
-                    source_id: sid,
-                    depth: norm,
-                });
-            })
-        }
-    });
-    let modulation = mod_data.as_ref().map(|d| Modulation {
-        entries: &mod_entries,
-        live_value: Some(d.live_plain),
-        edit: match (edit_ctx, &on_mod_change) {
-            (Some((c, cur, _, _, _)), Some(f)) => Some(ModEdit {
-                source_color: to_color(c),
-                current_depth: cur,
-                depth_range: None,
-                depth_sensitivity: None,
-                on_mod_change: f,
-            }),
-            _ => None,
-        },
-    });
+        .map(|(target, domain)| build_mod(app, target.clone(), base, *domain, cursor_track));
+    let modulation = mod_build.as_ref().map(ModBuild::modulation);
 
     let resp = ui.scrubable_number_at(
         id,
@@ -205,16 +146,10 @@ fn scrub_field(
             app.handle_event(AppEvent::EndInspectorScrub);
         }));
     }
-    // modulation depth ドラッグの falling edge で host 再同期 (SetModRoutingDepth は
-    // dirty マークのみ — engine が新 depth を読むには LoadSong が要る)。
-    if resp.mod_dragging != app.mod_depth_scrub_active {
-        let now_dragging = resp.mod_dragging;
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if app.mod_depth_scrub_active && !now_dragging {
-                app.sync_song_to_plugin_host();
-            }
-            app.mod_depth_scrub_active = now_dragging;
-        }));
+    // modulation depth ドラッグの falling edge で host 再同期 (自コントロールの
+    // target を key に、他コントロールと干渉せず drag-end で 1 回だけ recompile)。
+    if let Some((target, _)) = &mod_spec {
+        mod_widget::push_mod_drag_resync(ui, app, cursor_track, target, resp.mod_dragging);
     }
 }
 
@@ -950,7 +885,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ScrubableNumberFormat::Decimal(1),
             &ScrubableNumberStyle {
                 sensitivity: 1.0,
-                range: None,
+                // 度域 range で modulation の色帯/live tick を描けるように (gui_01
+                // overlay は range 必須)。handler は -π..π wrap のまま。
+                range: Some((-180.0, 180.0)),
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::ImageRotation,
@@ -1124,7 +1061,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     gt.rotation_radians.to_degrees().into(),
                     0.0,
                     ScrubableNumberFormat::Decimal(1),
-                    None,
+                    // 度域 range。modulation の色帯/live tick は range が要る (gui_01 overlay
+                    // は range なしだと枠強調のみ)。handler は従来どおり -π..π wrap。
+                    Some((-180.0, 180.0)),
                     1.0,
                     "Rot (°)",
                 ),
@@ -1173,67 +1112,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let style =
                 ScrubableNumberStyle { sensitivity: sens, range, ..SCRUB_STYLE_GROUP };
             // per-control modulation (docs/plan_modulation_routing_redesign.md §6):
-            // 立ち絵を音でドラッグ変調する Bitwig 流。0..=1 恒等の param のみ
-            // (X/Y/AnchorX/AnchorY/Opacity)。Rotation(度表示)/Scale(log) は値ドメインが
-            // target 正規化と食い違うので per-control 非対応 (ラック経由)。
-            let g_mod_target: Option<AutomationTarget> = match param {
-                G::X | G::Y | G::AnchorX | G::AnchorY | G::Opacity => {
-                    Some(AutomationTarget::GroupTransform(param))
-                }
-                _ => None,
+            // 立ち絵を音でドラッグ変調する Bitwig 流。全 8 param を対象 (Rotation は
+            // deg↔rad、ScaleX/Y は log space を `build_mod` が到達値ベースで吸収)。
+            let g_target = AutomationTarget::GroupTransform(param);
+            let g_domain = if matches!(param, G::Rotation) {
+                mod_widget::PLAIN_ROTATION
+            } else {
+                mod_widget::PLAIN_IDENT
             };
-            let g_mod_data = g_mod_target.as_ref().map(|t| app.inspector_mod_data(t, value));
-            let g_color = |c: [f32; 3]| Color { r: c[0], g: c[1], b: c[2], a: 1.0 };
-            let g_entries: Vec<ModEntry> = g_mod_data
-                .as_ref()
-                .map(|d| {
-                    d.entries
-                        .iter()
-                        .map(|(c, depth)| ModEntry { color: g_color(*c), depth: *depth })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let g_edit_ctx: Option<([f32; 3], f64, u32, u32, f64)> = g_mod_data
-                .as_ref()
-                .and_then(|d| d.armed.map(|(c, cur, sid)| (c, cur, sid, d.track_id, d.span)));
-            let g_target_for_edit = g_mod_target.clone();
-            let g_on_mod = g_edit_ctx.map(|(_, _, sid, tid, span)| {
-                move |plain: f64| -> Edit<AppData> {
-                    let target = g_target_for_edit.clone().expect("edit_ctx implies target");
-                    Edit::mutate(move |app: &mut AppData| {
-                        let norm = if span.abs() > 1e-9 {
-                            (plain / span).clamp(-1.0, 1.0) as f32
-                        } else {
-                            0.0
-                        };
-                        app.handle_event(AppEvent::AddModRouting {
-                            track_id: tid,
-                            target: target.clone(),
-                            source_id: sid,
-                        });
-                        app.handle_event(AppEvent::SetModRoutingDepth {
-                            track_id: tid,
-                            target,
-                            source_id: sid,
-                            depth: norm,
-                        });
-                    })
-                }
-            });
-            let g_modulation = g_mod_data.as_ref().map(|d| Modulation {
-                entries: &g_entries,
-                live_value: Some(d.live_plain),
-                edit: match (g_edit_ctx, &g_on_mod) {
-                    (Some((c, cur, _, _, _)), Some(f)) => Some(ModEdit {
-                        source_color: g_color(c),
-                        current_depth: cur,
-                        depth_range: None,
-                        depth_sensitivity: None,
-                        on_mod_change: f,
-                    }),
-                    _ => None,
-                },
-            });
+            let g_mod_build = build_mod(app, g_target.clone(), value, g_domain, track_id);
+            let g_modulation = Some(g_mod_build.modulation());
             let resp = ui.scrubable_number_at(
                 (param, "group_scrub"),
                 Rect { x: input_x, y, w: input_w, h: input_h },
@@ -1262,15 +1150,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             );
             // modulation depth ドラッグの falling edge で host 再同期 (audio target の
             // depth 反映用。visual group transform は compose が即読みするので視覚は即時)。
-            if resp.mod_dragging != app.mod_depth_scrub_active {
-                let now = resp.mod_dragging;
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    if app.mod_depth_scrub_active && !now {
-                        app.sync_song_to_plugin_host();
-                    }
-                    app.mod_depth_scrub_active = now;
-                }));
-            }
+            mod_widget::push_mod_drag_resync(ui, app, track_id, &g_target, resp.mod_dragging);
             // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
             let active = resp.dragging || resp.editing_text;
             let was_active = app.group_scrub_active == Some(param);
@@ -1477,7 +1357,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     (ScrubableNumberFormat::Decimal(3), Some((0.0, 1.0)), 0.004)
                 }
                 // Rotation: degree 表示、 handler が -π..π wrap (range なし)。
-                TextNumField::Rotation => (ScrubableNumberFormat::Decimal(1), None, 1.0),
+                // 度域 range で modulation overlay を描けるように (handler は -π..π wrap)。
+                TextNumField::Rotation => {
+                    (ScrubableNumberFormat::Decimal(1), Some((-180.0, 180.0)), 1.0)
+                }
                 // Font size (px, >= 1.0)。
                 TextNumField::FontSize => {
                     (ScrubableNumberFormat::Decimal(1), Some((1.0, 4096.0)), 0.5)

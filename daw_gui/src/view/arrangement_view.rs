@@ -2266,54 +2266,11 @@ fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay 
 /// の変換。 Phase 1 で必要な範囲のみ実装。 plugin param は min/max を
 /// 知らないと正規化できないので、 とりあえず `clamp(0, 1)` で渡す
 /// (Phase 2 で `AppData.plugin_params` lookup に置換)。
+/// 正規化 (UI 0..=1) の SSoT は `common::automation::plain_to_norm`。
+/// arrangement の automation curve 表示も同じ変換を使うため、ローカルに
+/// 複製せず委譲する (旧複製は逐一 common と手で同期する DRY 違反だった)。
 fn plain_to_norm(target: &common::model::AutomationTarget, plain: f64) -> f32 {
-    use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
-    let v = match target {
-        // Track.volume は通常 0.0..=2.0 で扱う (1.0 = unity、 amp_to_fader
-        // を通せば dB 表現)。 widget の slider band も 0..1 範囲なので
-        // 1/2 で normalize。 fader 表示としては不正確だが、 lane の
-        // default_value_norm は単に slider 帯の位置決めなので OK。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => plain / 2.0,
-        // Pan は -1..=1 → 0..1。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => (plain + 1.0) / 2.0,
-        // Mute は bool 相当 (0 or 1)。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => {
-            if plain >= 0.5 {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        // SendGain も 0..2 と仮定。
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => plain / 2.0,
-        // PluginParam は min/max 不明 → そのまま clamp。
-        AutomationTarget::PluginParam { .. } => plain,
-        // Song-level: Phase 5 で実装。 適当に 0 を返す。
-        AutomationTarget::SongTempo | AutomationTarget::SongTimeSigNumerator => 0.0,
-        // Image PiP Rotation のみ Pan 同 idiom で normalize、 残りは恒等。
-        AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation) => {
-            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
-        }
-        AutomationTarget::ImageBuiltin(_) => plain,
-        // Text Builtin: Rotation のみ Pan idiom、 残りは plain と norm が
-        // 同単位 (= image と同 idiom)。
-        AutomationTarget::TextBuiltin(common::model::TextBuiltinParam::Rotation) => {
-            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
-        }
-        AutomationTarget::TextBuiltin(_) => plain,
-        // Group transform: common::automation::plain_to_norm と厳密一致させる
-        // (UI ↔ engine 正規化の SSoT。位置/アンカー/Opacity 恒等、Rotation は Pan
-        // idiom、ScaleX/ScaleY は 0.1..=10 log space)。
-        AutomationTarget::GroupTransform(common::model::GroupTransformParam::Rotation) => {
-            (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
-        }
-        AutomationTarget::GroupTransform(
-            common::model::GroupTransformParam::ScaleX
-            | common::model::GroupTransformParam::ScaleY,
-        ) => (plain.clamp(0.1, 10.0) / 0.1).ln() / 100.0_f64.ln(),
-        AutomationTarget::GroupTransform(_) => plain,
-    };
-    v.clamp(0.0, 1.0) as f32
+    common::automation::plain_to_norm(target, plain)
 }
 
 /// `common::model::AutomationCurve` (incoming curve) → widget

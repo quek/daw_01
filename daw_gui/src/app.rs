@@ -378,23 +378,61 @@ pub struct ModSourceRow {
     pub release_ms: f32,
 }
 
+/// per-control modulation で、コントロールの *表示* 値ドメインと target の *model*
+/// 値ドメイン (= `automation::plain_to_norm` の入力単位) の橋渡し方法。
+/// scrubable_number は plain ドメイン (fn ptr 変換)、knob / fader は正規化 0..=1
+/// ドメイン (target の `norm_to_plain`/`plain_to_norm` を使う)。`Copy` なので
+/// `build_mod` の on_mod_change closure に capture できる。
+#[derive(Clone, Copy)]
+pub enum ModControlDomain {
+    /// 表示値 == target の model plain 値。`to_model`/`to_display` で変換
+    /// (恒等 = image/group pos、回転 = deg↔rad)。
+    Plain { to_model: fn(f64) -> f64, to_display: fn(f64) -> f64 },
+    /// 表示値 == target の正規化 0..=1 (knob / fader のトラック位置)。
+    Norm,
+}
+
+impl ModControlDomain {
+    /// コントロール表示値 → target の model plain 値。
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn to_model(self, target: &common::model::AutomationTarget, display: f64) -> f64 {
+        match self {
+            ModControlDomain::Plain { to_model, .. } => to_model(display),
+            ModControlDomain::Norm => common::automation::norm_to_plain(target, display as f32),
+        }
+    }
+    /// target の model plain 値 → コントロール表示値。
+    pub fn to_display(self, target: &common::model::AutomationTarget, model: f64) -> f64 {
+        match self {
+            ModControlDomain::Plain { to_display, .. } => to_display(model),
+            ModControlDomain::Norm => f64::from(common::automation::plain_to_norm(target, model)),
+        }
+    }
+}
+
 /// docs/plan_modulation_routing_redesign.md §6: per-control modulation data the
-/// inspector turns into a gui_01 `Modulation` widget arg. All depths are in the
-/// control's plain value domain (see [`AppData::inspector_mod_data`]).
+/// inspector turns into a gui_01 `Modulation` widget arg. entries / live / armed
+/// depth はすべてコントロールの *表示* ドメイン ([`ModControlDomain`]) で持つ
+/// (see [`AppData::inspector_mod_data`]).
 #[derive(Debug, Clone, Default)]
 pub struct InspectorModData {
-    /// Assigned routings for this target: `(source color, plain depth)`.
+    /// Assigned routings for this target: `(source color, reachable depth in the
+    /// control's *display* domain)`. Computed from the actual reachable value
+    /// `to_display(norm_to_plain(base_norm + depth))` so it is exact for affine
+    /// (image/group pos), unit-shifted (rotation deg↔rad) and log (scale) targets.
     pub entries: Vec<([f32; 3], f64)>,
-    /// The current modulated value (base ⊕ live offset), in plain units.
-    pub live_plain: f64,
-    /// `Some((source color, current plain depth, source_id))` when a source is
+    /// The current modulated value (base ⊕ live offset), in the control's
+    /// *display* units. `None` when this target has no routings (no live tick).
+    pub live_display: Option<f64>,
+    /// `Some((source color, current display depth, source_id))` when a source is
     /// armed → the control enters depth-drag edit mode.
     pub armed: Option<([f32; 3], f64, u32)>,
     /// Track owning the routing (`MASTER_TRACK_ID` → song-level).
     pub track_id: u32,
-    /// `norm_to_plain(target,1) − norm_to_plain(target,0)` — converts the
-    /// widget's plain depth back to the model's normalized depth.
-    pub span: f64,
+    /// `plain_to_norm(target, to_model(display_base))` — the base in normalized
+    /// space, so a dragged display depth maps back to model normalized depth via
+    /// `plain_to_norm(to_model(display_base + d)) − base_norm`.
+    pub base_norm: f64,
 }
 
 /// docs/plan_text_overlay.md §4 P5: text inspector の read snapshot
@@ -1419,10 +1457,14 @@ pub struct AppData {
     /// depth on the control's target. `None` ⇒ controls show existing routings
     /// (entries + live tick) but aren't editable. session-only (not persisted).
     pub armed_mod_source: Option<u32>,
-    /// True while a per-control modulation depth drag is in progress (gui_01
-    /// widget `ScrubableNumberResponse::mod_dragging`). Edge-detected to bracket
-    /// the depth change into one undo step / defer the host resync to drag-end.
-    pub mod_depth_scrub_active: bool,
+    /// The `(track_id, target)` whose per-control modulation depth drag is in
+    /// progress (gui_01 `mod_dragging`), or `None`. Keyed by **track + target**
+    /// (not target alone) because the mixer draws the same target — e.g.
+    /// `TrackBuiltin(Pan)` — on every strip; a target-only key would make all of
+    /// them fight over one flag and fire a host resync every frame during any one
+    /// drag. Each control reacts only to *its own* drag edge, deferring the host
+    /// resync to that control's drag-end. session-only.
+    pub mod_depth_scrub_active: Option<(u32, common::model::AutomationTarget)>,
 
     /// Video export の進捗 `(done_frames, total_frames)`。background thread が
     /// `ExportProgress` で更新。`None` = export 非実行。UI が進捗オーバーレイの
@@ -1834,7 +1876,7 @@ impl AppData {
             inspector_scrub_active: None,
             mod_follower_scrub_active: false,
             armed_mod_source: None,
-            mod_depth_scrub_active: false,
+            mod_depth_scrub_active: None,
             export_progress: None,
             export_cancel: None,
             pending_video_export: None,
@@ -2281,39 +2323,58 @@ impl AppData {
     }
 
     /// docs/plan_modulation_routing_redesign.md §6: per-control modulation data
-    /// for `target` at base value `base_plain`, used by the inspector to build
-    /// the gui_01 `Modulation` widget arg. Resolves the cursor track's routings
-    /// (`MASTER_TRACK_ID` → song-level), the live modulated value, and — when a
-    /// source is **armed** — the depth-edit context.
+    /// for `target` on track `track_id` whose control displays `display_base` in
+    /// `domain` units, used to build the gui_01 `Modulation` widget arg. Resolves
+    /// that track's routings (`MASTER_TRACK_ID` → song-level), the live modulated
+    /// value, and — when a source is **armed** — the depth-edit context. The
+    /// caller passes the *owning* track (inspector = cursor track, mixer strip =
+    /// that strip's track) so it works for any track, not just the cursor's.
     ///
-    /// All depths are in the control's *plain* value domain (`norm_depth · span`
-    /// where `span = norm_to_plain(target,1) − norm_to_plain(target,0)`), matching
-    /// the widget's `range` domain. The model stores normalized depth, so the UI
-    /// converts back with `plain / span` on edit.
+    /// entries / live / armed depth are returned in the control's *display* domain,
+    /// computed as the reachable display value
+    /// `to_display(norm_to_plain((base_norm + depth).clamp(0,1))) − display_base`
+    /// (exact for affine / rotation deg↔rad / log scale targets). `base_norm =
+    /// plain_to_norm(target, to_model(display_base))`; the on-edit inverse is
+    /// `plain_to_norm(to_model(display_base + d)) − base_norm` (see `build_mod`).
     pub fn inspector_mod_data(
         &self,
         target: &common::model::AutomationTarget,
-        base_plain: f64,
+        display_base: f64,
+        domain: ModControlDomain,
+        track_id: u32,
     ) -> InspectorModData {
-        let (track_id, routings): (u32, &[common::model::ModRouting]) =
-            if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-                (common::model::MASTER_TRACK_ID, &self.song.song_mod_routings)
+        let routings: &[common::model::ModRouting] =
+            if track_id == common::model::MASTER_TRACK_ID {
+                &self.song.song_mod_routings
             } else {
-                match self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) {
-                    Some(t) => (t.id, &t.mod_routings),
+                match self.song.tracks.iter().find(|t| t.id == track_id) {
+                    Some(t) => &t.mod_routings,
                     None => return InspectorModData::default(),
                 }
             };
-        let span = common::automation::norm_to_plain(target, 1.0)
-            - common::automation::norm_to_plain(target, 0.0);
+        let model_base = domain.to_model(target, display_base);
+        let base_norm = f64::from(common::automation::plain_to_norm(target, model_base));
+        // Reachable display depth for a normalized `depth`: convert the value the
+        // base would reach at full scalar back into the control's display domain.
+        // Exact for affine / rotation / log targets (vs. a linear `depth*span`).
+        let reach_depth = |depth: f32| -> f64 {
+            let reach_norm = (base_norm + f64::from(depth)).clamp(0.0, 1.0);
+            #[allow(clippy::cast_possible_truncation)]
+            let reach_model = common::automation::norm_to_plain(target, reach_norm as f32);
+            domain.to_display(target, reach_model) - display_base
+        };
         let mut entries: Vec<([f32; 3], f64)> = Vec::new();
         let mut armed: Option<([f32; 3], f64, u32)> = None;
+        // NOTE: 各 entry は `base + depth` (= scalar 1.0) 側の到達量を 1 本表示する。
+        // bipolar routing は live tick (apply_modulation) が `base − depth` 側にも
+        // 振れるが、帯は +depth 側のみ (shipped image/group と同挙動。両振れ表示は
+        // widget が単一 depth しか持たないため将来 gui_01 拡張時に対応)。
         for r in routings.iter().filter(|r| &r.target == target) {
             let color = self.mod_source_color(r.source_id);
-            let plain_depth = f64::from(r.depth) * span;
-            entries.push((color, plain_depth));
+            let depth_display = reach_depth(r.depth);
+            entries.push((color, depth_display));
             if Some(r.source_id) == self.armed_mod_source {
-                armed = Some((color, plain_depth, r.source_id));
+                armed = Some((color, depth_display, r.source_id));
             }
         }
         // Armed source with no routing yet on this target → editable from depth 0
@@ -2323,21 +2384,32 @@ impl AppData {
         {
             armed = Some((self.mod_source_color(sid), 0.0, sid));
         }
-        let live_plain = common::automation::apply_modulation_with_scalars(
-            &self.song,
-            target,
-            base_plain,
-            routings,
-            &self.mod_scalars,
-        );
-        InspectorModData { entries, live_plain, armed, track_id, span }
+        // Live tick only when this target actually has modulation (otherwise the
+        // modulated value equals the base and the tick is redundant noise).
+        let live_display = (!entries.is_empty()).then(|| {
+            let live_model = common::automation::apply_modulation_with_scalars(
+                &self.song,
+                target,
+                model_base,
+                routings,
+                &self.mod_scalars,
+            );
+            domain.to_display(target, live_model)
+        });
+        InspectorModData { entries, live_display, armed, track_id, base_norm }
     }
 
     /// docs/plan_modulation_routing_redesign.md §6: the cursor track's
     /// modulatable param targets (for the rack's add-routing picker). Track
     /// builtins always; group transform when the track is a group / has a
     /// transform; plugin params per device; image / text builtins when the
-    /// track owns such clips. MASTER cursor → song-wide tempo.
+    /// track owns such clips.
+    ///
+    /// NOTE: song-level targets (tempo / time-sig) are intentionally **excluded**:
+    /// the audio engine's `evaluate_song_tempo` reads only lane curves + `song.bpm`
+    /// and never consumes `song_mod_routings`, so follower→tempo modulation would be
+    /// a silent no-op. Tempo can still be *automated* via lanes. (Re-add once the
+    /// engine + export bake consume song-level modulation.)
     pub fn cursor_modulatable_targets(&self) -> Vec<common::model::AutomationTarget> {
         use common::model::{
             AutomationTarget as AT, GroupTransformParam as GP, ImageBuiltinParam as IB,
@@ -2345,7 +2417,6 @@ impl AppData {
         };
         let mut out: Vec<AT> = Vec::new();
         if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            out.push(AT::SongTempo);
             return out;
         }
         let Some(track) = self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) else {

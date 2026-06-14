@@ -197,6 +197,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // on_change を発火するので、 daw_01 が `SetSongBpmFromScrub` 経由で
     // song.bpm 更新 + 軽量 IPC で audio engine に即時伝搬する。
     let bpm_w = 64.0;
+    // NOTE: tempo (SongTempo) は per-control modulation **非対象**。audio engine の
+    // `evaluate_song_tempo` は lane curve + song.bpm のみ読み、song-level の
+    // follower modulation (`song_mod_routings`) を一切消費しない (export も song.bpm
+    // 直読み)。tempo を音で変調可能にするのはエンジン + export bake を要する別機能なので、
+    // 「効かないのに変調できそうに見えるコントロール」を作らないため modulation 引数は None。
+    // (tempo AUTOMATION は lane 経由で従来どおり機能する。)
     let bpm_resp = ui.scrubable_number_at(
         "transport_bpm_input",
         Rect { x, y: cy, w: bpm_w, h: bh },
@@ -213,7 +219,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             })
         },
         None,
-        None, // tempo modulation はラック経由
+        None,
     );
     // Phase 4 Step B 流 ParamGesture edge 検知: drag 開始 (= dragging
     // false→true) で `ParamGestureBegin`、 終了で `ParamGestureEnd` を発火。

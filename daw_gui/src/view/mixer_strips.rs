@@ -10,11 +10,12 @@
 use common::model::{AutomationTarget, SendMode, TrackBuiltinParam};
 use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, MeterScale, ToggleButtonStyle, Ui};
 
+use crate::view::modulation::{build_mod, push_mod_drag_resync};
 use crate::view::param_gesture::push_param_gesture_edges;
 use crate::view::track_color;
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
-use crate::app::{AppData, AppEvent};
+use crate::app::{AppData, AppEvent, ModControlDomain};
 
 const STRIP_WIDTH: f32 = 80.0;
 const STRIP_GAP: f32 = 4.0;
@@ -192,6 +193,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ----- MASTER strip (右端固定) -----
     // Master strip は track ではないので gesture 対象外 (= 渡す flag は false)。
     draw_strip(
+        app,
         ui,
         usize::MAX,
         "MASTER",
@@ -243,6 +245,7 @@ fn draw_track_strip(
     let n_sends = app.song.track_by_id(track_id).map_or(0, |t| t.sends.len());
     let sends_band_h = sends_band_height(n_sends);
     draw_strip(
+        app,
         ui,
         track_id as usize,
         &display_name,
@@ -277,6 +280,7 @@ fn draw_return_strip(
     let track_id = entry.track_id;
     let (was_dragging_vol, was_dragging_pan) = drag_flags(app, track_id);
     draw_strip(
+        app,
         ui,
         track_id as usize,
         &entry.name,
@@ -312,6 +316,7 @@ fn drag_flags(app: &AppData, track_id: u32) -> (bool, bool) {
 
 #[allow(clippy::too_many_arguments)]
 fn draw_strip(
+    app: &AppData,
     ui: &mut Ui<'_, AppData>,
     layout_idx: usize,
     name: &str,
@@ -431,6 +436,12 @@ fn draw_strip(
         let knob_x = rect.x + (rect.w - KNOB_SIZE) * 0.5;
         let knob_value = (pan + 1.0) * 0.5;
         let track_idx_for_pan = track_idx;
+        // per-control modulation (docs/plan_modulation_routing_redesign.md §6, gui_01
+        // #109): Pan を音でドラッグ変調する Bitwig 流。knob は値が 0..=1 正規化なので
+        // `ModControlDomain::Norm`、routing 帰属はこの strip のトラック (track_idx)。
+        let pan_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan);
+        let pan_mod =
+            build_mod(app, pan_target.clone(), f64::from(knob_value), ModControlDomain::Norm, track_idx);
         let pan_resp = ui.knob_at(
             ("mixer_strip_pan", layout_idx),
             Rect { x: knob_x, y, w: KNOB_SIZE, h: KNOB_SIZE },
@@ -446,6 +457,7 @@ fn draw_strip(
                     })
                 })
             },
+            Some(pan_mod.modulation()),
         );
         push_param_gesture_edges(
             ui,
@@ -455,6 +467,7 @@ fn draw_strip(
             was_dragging_pan,
             pan_resp.dragging,
         );
+        push_mod_drag_resync(ui, app, track_idx, &pan_target, pan_resp.mod_dragging);
         y += KNOB_SIZE + 4.0;
     }
 
@@ -611,6 +624,9 @@ fn draw_sends_section(
                     })
                 })
             },
+            // SendGain は per-control modulation 非対象 (cursor_modulatable_targets
+            // = Volume/Pan のみ)。ラックからもルーティングしない。
+            None,
         );
         // send-gain automation の gesture edge を volume / pan と同様に発火。
         push_param_gesture_edges(

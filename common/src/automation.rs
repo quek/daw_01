@@ -46,7 +46,11 @@ pub fn plain_to_norm(target: &AutomationTarget, plain: f64) -> f32 {
         }
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => plain / 2.0,
         AutomationTarget::PluginParam { .. } => plain,
-        AutomationTarget::SongTempo | AutomationTarget::SongTimeSigNumerator => 0.0,
+        // Song-level: 旧 placeholder (常に 0) は tempo automation / 変調の値域を
+        // 失わせていた。control の表示レンジ (transport.rs SCRUB_STYLE_BPM /
+        // SCRUB_STYLE_TSIG_NUM) に揃えて affine 正規化する。
+        AutomationTarget::SongTempo => (plain - 1.0) / 399.0,
+        AutomationTarget::SongTimeSigNumerator => (plain - 1.0) / 31.0,
         // Image PiP field: x/y/w/h/opacity は既に 0..=1 (恒等)、 Rotation
         // のみ Pan と同 idiom で `(plain + π) / (2π)` mapping。
         AutomationTarget::ImageBuiltin(crate::model::ImageBuiltinParam::Rotation) => {
@@ -60,6 +64,11 @@ pub fn plain_to_norm(target: &AutomationTarget, plain: f64) -> f32 {
         AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::Rotation) => {
             (plain + std::f64::consts::PI) / (2.0 * std::f64::consts::PI)
         }
+        // FontSize は px。control レンジ (1..=4096) に揃えた affine 正規化
+        // (旧 identity placeholder では 48px などが norm 1 に飽和していた)。
+        AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::FontSize) => {
+            (plain - 1.0) / 4095.0
+        }
         AutomationTarget::TextBuiltin(_) => plain,
         // Group transform (§4.4): 位置/アンカー (X/Y/AnchorX/AnchorY) と Opacity は
         // 0..=1 恒等、 Rotation は Pan idiom、 ScaleX/ScaleY は 0.1..=10 の log space。
@@ -70,6 +79,11 @@ pub fn plain_to_norm(target: &AutomationTarget, plain: f64) -> f32 {
         AutomationTarget::GroupTransform(
             crate::model::GroupTransformParam::ScaleX | crate::model::GroupTransformParam::ScaleY,
         ) => (plain.clamp(0.1, 10.0) / 0.1).ln() / 100.0_f64.ln(),
+        // X/Y/AnchorX/AnchorY は恒等。注意: X/Y は「アンカー基準オフセット」で
+        // 負 / >1 を取りうる (model.rs)。下の clamp(0,1) で base が [0,1] 外だと
+        // base_norm が端に飽和し、per-control modulation の depth ドラッグが片側に
+        // 潰れる (画面内 0..1 の範囲でのみ正確)。将来 X/Y に実座標レンジを与えて
+        // affine 化する余地あり (今回スコープ外)。
         AutomationTarget::GroupTransform(_) => plain,
     };
     v.clamp(0.0, 1.0) as f32
@@ -91,7 +105,9 @@ pub fn norm_to_plain(target: &AutomationTarget, norm: f32) -> f64 {
         }
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { .. }) => n * 2.0,
         AutomationTarget::PluginParam { .. } => n,
-        AutomationTarget::SongTempo | AutomationTarget::SongTimeSigNumerator => n,
+        // plain_to_norm の厳密逆 (control 表示レンジ)。
+        AutomationTarget::SongTempo => 1.0 + n * 399.0,
+        AutomationTarget::SongTimeSigNumerator => 1.0 + n * 31.0,
         // Image PiP field: x/y/w/h/opacity は normalize と plain が同単位、
         // Rotation のみ `n * 2π - π` で -π..=π に展開。
         AutomationTarget::ImageBuiltin(crate::model::ImageBuiltinParam::Rotation) => {
@@ -101,6 +117,7 @@ pub fn norm_to_plain(target: &AutomationTarget, norm: f32) -> f64 {
         AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::Rotation) => {
             n * 2.0 * std::f64::consts::PI - std::f64::consts::PI
         }
+        AutomationTarget::TextBuiltin(crate::model::TextBuiltinParam::FontSize) => 1.0 + n * 4095.0,
         AutomationTarget::TextBuiltin(_) => n,
         // Group transform (§4.4): plain_to_norm の厳密逆。X/Y/AnchorX/AnchorY/
         // Opacity は恒等、 Rotation は `n·2π - π`、 ScaleX/ScaleY は `0.1·100^n`。
@@ -548,6 +565,34 @@ mod tests {
         assert!((f64::from(plain_to_norm(&rot, 0.0)) - 0.5).abs() < 1e-6);
         let back = norm_to_plain(&rot, plain_to_norm(&rot, 1.234));
         assert!((back - 1.234).abs() < 1e-5);
+    }
+
+    #[test]
+    fn song_level_and_font_size_norm_ranges() {
+        use crate::model::TextBuiltinParam as T;
+        // SongTempo (1..400): norm 端点と round-trip。旧 placeholder では
+        // plain_to_norm が常に 0 を返し tempo automation/変調が壊れていた。
+        let tempo = AutomationTarget::SongTempo;
+        assert!((f64::from(plain_to_norm(&tempo, 1.0)) - 0.0).abs() < 1e-6);
+        assert!((f64::from(plain_to_norm(&tempo, 400.0)) - 1.0).abs() < 1e-6);
+        for plain in [1.0, 60.0, 120.0, 174.0, 400.0] {
+            let back = norm_to_plain(&tempo, plain_to_norm(&tempo, plain));
+            assert!((back - plain).abs() < 0.05, "tempo round-trip: {plain} -> {back}");
+        }
+        // SongTimeSigNumerator (1..32)。
+        let tsig = AutomationTarget::SongTimeSigNumerator;
+        assert!((norm_to_plain(&tsig, 0.0) - 1.0).abs() < 1e-6);
+        assert!((norm_to_plain(&tsig, 1.0) - 32.0).abs() < 1e-6);
+        // TextBuiltin FontSize (1..4096, px)。
+        let fs = AutomationTarget::TextBuiltin(T::FontSize);
+        assert!((f64::from(plain_to_norm(&fs, 1.0)) - 0.0).abs() < 1e-6);
+        for plain in [1.0, 12.0, 48.0, 256.0, 4096.0] {
+            let back = norm_to_plain(&fs, plain_to_norm(&fs, plain));
+            assert!((back - plain).abs() < 0.5, "font-size round-trip: {plain} -> {back}");
+        }
+        // 他の TextBuiltin (X 等) は従来どおり 0..=1 恒等。
+        let tx = AutomationTarget::TextBuiltin(T::X);
+        assert!((norm_to_plain(&tx, 0.3) - 0.3).abs() < 1e-6);
     }
 
     #[test]
