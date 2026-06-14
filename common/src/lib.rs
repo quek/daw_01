@@ -7,6 +7,7 @@ pub mod logging;
 pub mod meter;
 pub mod mod_sidecar;
 pub mod model;
+pub mod modulators;
 pub mod lipsync;
 pub mod plugin_db;
 pub mod plugin_format;

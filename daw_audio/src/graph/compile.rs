@@ -56,6 +56,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             port_buffers: super::PortBufferPool::new(),
             input_delay_per_track: Vec::new(),
             follower_slots: Vec::new(),
+            mod_kinds: Vec::new(),
         });
     }
 
@@ -379,24 +380,42 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     // it indexes both `follower_slots` and `AudioBridge::mod_scalars`.
     // Coefficients are baked here (recompile-time) so the RT path never
     // derives them (§10).
+    // FIXME #56: `follower_slots` は全 `ModSource` と 1:1 (slot 順 = source 位置 =
+    // `AudioBridge::mod_scalars` index)。envelope follower の slot は EnvelopeFollow
+    // node が `env` を駆動するが、generator (LFO/Random/MSEG/Steps) の slot は inert
+    // で、 engine が `common::modulators::generator_scalar` を `song_beat` から評価して
+    // publish する (`mod_kinds` を保持)。
     let mut follower_slots: Vec<super::follower::FollowerSlot> = Vec::new();
+    let mut mod_kinds: Vec<common::model::ModSourceKind> = Vec::new();
     for (slot, ms) in song
         .mod_sources
         .iter()
         .take(common::audio_bridge::MAX_MOD_SOURCES)
         .enumerate()
     {
-        follower_slots.push(super::follower::FollowerSlot::from_config(
-            &ms.follower,
-            common::audio_bridge::SAMPLE_RATE,
-        ));
-        // docs/plan_modulation.md §6: tap_point で source buffer を解決。
-        // dangling source は follower node を emit しない (scalar は 0 のまま)。
-        if let Some(&src_idx) = id_to_idx.get(&ms.tap.source_track) {
-            nodes_with_pdc.push(NodeOp::EnvelopeFollow {
-                src: tap_bufref(ms.tap.tap_point, src_idx),
-                slot: slot as u32,
-            });
+        mod_kinds.push(ms.kind.clone());
+        match &ms.kind {
+            common::model::ModSourceKind::EnvelopeFollower { tap, follower } => {
+                follower_slots.push(super::follower::FollowerSlot::from_config(
+                    follower,
+                    common::audio_bridge::SAMPLE_RATE,
+                ));
+                // docs/plan_modulation.md §6: tap_point で source buffer を解決。
+                // dangling source は follower node を emit しない (scalar は 0 のまま)。
+                if let Some(&src_idx) = id_to_idx.get(&tap.source_track) {
+                    nodes_with_pdc.push(NodeOp::EnvelopeFollow {
+                        src: tap_bufref(tap.tap_point, src_idx),
+                        slot: slot as u32,
+                    });
+                }
+            }
+            // generator: inert slot (env 未使用、 generator_scalar が値を供給)。
+            _ => {
+                follower_slots.push(super::follower::FollowerSlot::from_config(
+                    &common::model::FollowerConfig::default(),
+                    common::audio_bridge::SAMPLE_RATE,
+                ));
+            }
         }
     }
 
@@ -406,6 +425,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         port_buffers: super::PortBufferPool::new(),
         input_delay_per_track,
         follower_slots,
+        mod_kinds,
     })
 }
 

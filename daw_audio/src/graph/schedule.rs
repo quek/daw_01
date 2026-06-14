@@ -145,6 +145,12 @@ pub struct Schedule {
     /// resets), persists across buffers within one schedule (like
     /// `delay_lines`).
     pub follower_slots: Vec<super::follower::FollowerSlot>,
+    /// FIXME #56 (docs/plan_fixme_56_modulators.md): per-`ModSource` の種別を
+    /// slot 順 (= `follower_slots` / `AudioBridge::mod_scalars` と 1:1) に保持。
+    /// generator (LFO/Random/MSEG/Steps) は `common::modulators::generator_scalar`
+    /// で `song_beat` から直接算出され、その slot の `follower_slots` 値は使われない
+    /// (inert)。envelope follower の slot は `follower_slots[slot].env` を使う。
+    pub mod_kinds: Vec<common::model::ModSourceKind>,
 }
 
 impl Schedule {
@@ -155,6 +161,7 @@ impl Schedule {
             port_buffers: PortBufferPool::new(),
             input_delay_per_track: Vec::new(),
             follower_slots: Vec::new(),
+            mod_kinds: Vec::new(),
         }
     }
 }

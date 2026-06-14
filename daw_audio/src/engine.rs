@@ -851,9 +851,20 @@ impl LocalState {
             // param modulation, reusing the buffer (no per-buffer alloc). The
             // EnvelopeFollow nodes for THIS buffer run post-dispatch, so param
             // events see the prior buffer's env — a ~1-buffer (block-rate) lag.
+            // FIXME #56: follower の env (= 前 buffer 値、 上記の lag) に加え、
+            // generator (LFO/Random/MSEG/Steps) は `song_beat`/`song_secs` から
+            // この buffer の値を直接算出する (状態レス・lag なし、 決定論)。
             self.mod_scalars_snapshot.clear();
-            for fs in &self.cached_schedule.follower_slots {
-                self.mod_scalars_snapshot.push(fs.env);
+            let song_secs = playhead as f64 / sample_rate as f64;
+            for (fs, kind) in self
+                .cached_schedule
+                .follower_slots
+                .iter()
+                .zip(self.cached_schedule.mod_kinds.iter())
+            {
+                let v = common::modulators::generator_scalar(kind, self.playhead_beats, song_secs)
+                    .unwrap_or(fs.env);
+                self.mod_scalars_snapshot.push(v);
             }
 
             // Fan the per-track work out across the audio worker pool
@@ -996,8 +1007,18 @@ impl LocalState {
             // docs/plan_modulation.md §4.2: publish each ModSource's envelope
             // follower scalar (block-rate, `env` after this buffer) so the GUI
             // poller can apply visual/param modulation. Atomic stores, RT-safe.
-            for (slot, fs) in self.cached_schedule.follower_slots.iter().enumerate() {
-                bridge.set_mod_scalar(slot, fs.env);
+            // FIXME #56: follower は env、 generator は song 位置から直接算出して publish。
+            let pub_song_secs = playhead as f64 / sample_rate as f64;
+            for (slot, (fs, kind)) in self
+                .cached_schedule
+                .follower_slots
+                .iter()
+                .zip(self.cached_schedule.mod_kinds.iter())
+                .enumerate()
+            {
+                let v = common::modulators::generator_scalar(kind, self.playhead_beats, pub_song_secs)
+                    .unwrap_or(fs.env);
+                bridge.set_mod_scalar(slot, v);
             }
 
             // Debug heartbeat: once per second of audio time, dump the
@@ -1619,7 +1640,12 @@ fn any_tap_at(song: &Song, track_id: u32, want: common::model::TapPoint) -> bool
         .chain(song.master_fx_chain.iter())
         .flat_map(|p| p.aux_inputs.iter().flatten())
         .any(|r| hit(&r.tap))
-        || song.mod_sources.iter().any(|m| hit(&m.tap))
+        // FIXME #56: generator (LFO/Random/MSEG/Steps) は tap を持たない。 follower のみ走査。
+        || song
+            .mod_sources
+            .iter()
+            .filter_map(|m| m.follower())
+            .any(|(tap, _)| hit(tap))
 }
 
 /// A `PostFx` tap reads the track's `pre_fader_l/r` snapshot (post-fx,
@@ -1670,6 +1696,7 @@ pub fn execute_schedule_post_dispatch(
         port_buffers: _,
         input_delay_per_track: _,
         follower_slots,
+        mod_kinds: _,
     } = schedule;
     for op in nodes.iter() {
         match op {
