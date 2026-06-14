@@ -17,23 +17,22 @@ use std::time::Instant;
 
 use daw_ui_core::{ArboardClipboard, InputAccumulator, UiHost};
 use daw_ui_platform::{
-    AppEvent as PlatformEvent, ElementState, KeyEvent, Modifiers, MouseButton, PhysicalKey,
-    PhysicalPosition, PhysicalSize, ScrollDelta, WindowBackend,
+    AppEvent as PlatformEvent, KeyEvent, Modifiers, PhysicalPosition, PhysicalSize, ScrollDelta,
+    WindowBackend,
 };
 use daw_ui_renderer::{Renderer, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition as WinitPhysPos;
-use winit::event::{
-    ElementState as WinitElemState, Ime as WinitIme, MouseButton as WinitMouseBtn,
-    MouseScrollDelta, WindowEvent,
-};
+use winit::event::{Ime as WinitIme, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-use winit::keyboard::{KeyCode, PhysicalKey as WinitPhysKey};
 use winit::window::{WindowAttributes, WindowId};
 
 use crate::app::{AppData, AppEvent, ClipRef};
 use crate::view::shortcuts::daw_shortcut_map;
-use crate::view::window::DawGuiWindow;
+use daw_ui_platform::WinitWindow;
+use daw_ui_platform::winit_backend::{
+    map_button, map_phys_key, map_state, query_cursor_pos_in_window,
+};
 
 /// アプリ初期化で渡すパラメータ。`run` の中で main window を作って AppData を組み立てる。
 pub struct RunnerInit {
@@ -62,8 +61,8 @@ pub fn run(init: RunnerInit) -> Result<(), winit::error::EventLoopError> {
 }
 
 struct RunnerState {
-    window: Arc<DawGuiWindow>,
-    renderer: Renderer<DawGuiWindow>,
+    window: Arc<WinitWindow>,
+    renderer: Renderer<WinitWindow>,
     ui: UiHost<AppData>,
     app: AppData,
     scene: Scene,
@@ -611,7 +610,7 @@ impl ApplicationHandler<AppEvent> for Runner {
             .create_window(attrs)
             .expect("create_window 失敗");
         let window = Arc::new(window);
-        let dwin = Arc::new(DawGuiWindow::new(window));
+        let dwin = Arc::new(WinitWindow::new(window));
         let renderer = Renderer::new(dwin.clone()).expect("Renderer::new");
 
         // `with_window` で `set_cursor_request` callback を `WindowBackend::set_cursor`
@@ -815,7 +814,7 @@ impl ApplicationHandler<AppEvent> for Runner {
 }
 
 fn save_main_window_state(
-    window: &DawGuiWindow,
+    window: &WinitWindow,
     app_dirs: Option<&common::app_dirs::AppDirs>,
 ) {
     let Some(path) = app_dirs.map(|d| d.window_state()) else { return };
@@ -1727,7 +1726,7 @@ impl Runner {
     /// CPU-side copy.
     fn drain_video_thumbnail_uploads(
         app: &mut AppData,
-        renderer: &mut Renderer<DawGuiWindow>,
+        renderer: &mut Renderer<WinitWindow>,
     ) {
         if app.pending_thumbnail_uploads.is_empty() {
             return;
@@ -1770,137 +1769,6 @@ fn resolve_video_path(
     }
 }
 
-fn map_button(b: WinitMouseBtn) -> MouseButton {
-    match b {
-        WinitMouseBtn::Left => MouseButton::Left,
-        WinitMouseBtn::Right => MouseButton::Right,
-        WinitMouseBtn::Middle => MouseButton::Middle,
-        WinitMouseBtn::Other(n) => MouseButton::Other(n),
-        _ => MouseButton::Other(0xffff),
-    }
-}
-
-fn map_state(s: WinitElemState) -> ElementState {
-    match s {
-        WinitElemState::Pressed => ElementState::Pressed,
-        WinitElemState::Released => ElementState::Released,
-    }
-}
-
-fn map_phys_key(k: WinitPhysKey) -> PhysicalKey {
-    match k {
-        WinitPhysKey::Code(KeyCode::Escape) => PhysicalKey::Escape,
-        WinitPhysKey::Code(KeyCode::Enter) => PhysicalKey::Enter,
-        WinitPhysKey::Code(KeyCode::NumpadEnter) => PhysicalKey::NumpadEnter,
-        WinitPhysKey::Code(KeyCode::Space) => PhysicalKey::Space,
-        WinitPhysKey::Code(KeyCode::Tab) => PhysicalKey::Tab,
-        WinitPhysKey::Code(KeyCode::Backspace) => PhysicalKey::Backspace,
-        WinitPhysKey::Code(KeyCode::Delete) => PhysicalKey::Delete,
-        WinitPhysKey::Code(KeyCode::Insert) => PhysicalKey::Insert,
-        WinitPhysKey::Code(KeyCode::ArrowUp) => PhysicalKey::ArrowUp,
-        WinitPhysKey::Code(KeyCode::ArrowDown) => PhysicalKey::ArrowDown,
-        WinitPhysKey::Code(KeyCode::ArrowLeft) => PhysicalKey::ArrowLeft,
-        WinitPhysKey::Code(KeyCode::ArrowRight) => PhysicalKey::ArrowRight,
-
-        // Letter A-Z (gui_01 winit_backend に揃えて uppercase 表現)
-        WinitPhysKey::Code(KeyCode::KeyA) => PhysicalKey::Char('A'),
-        WinitPhysKey::Code(KeyCode::KeyB) => PhysicalKey::Char('B'),
-        WinitPhysKey::Code(KeyCode::KeyC) => PhysicalKey::Char('C'),
-        WinitPhysKey::Code(KeyCode::KeyD) => PhysicalKey::Char('D'),
-        WinitPhysKey::Code(KeyCode::KeyE) => PhysicalKey::Char('E'),
-        WinitPhysKey::Code(KeyCode::KeyF) => PhysicalKey::Char('F'),
-        WinitPhysKey::Code(KeyCode::KeyG) => PhysicalKey::Char('G'),
-        WinitPhysKey::Code(KeyCode::KeyH) => PhysicalKey::Char('H'),
-        WinitPhysKey::Code(KeyCode::KeyI) => PhysicalKey::Char('I'),
-        WinitPhysKey::Code(KeyCode::KeyJ) => PhysicalKey::Char('J'),
-        WinitPhysKey::Code(KeyCode::KeyK) => PhysicalKey::Char('K'),
-        WinitPhysKey::Code(KeyCode::KeyL) => PhysicalKey::Char('L'),
-        WinitPhysKey::Code(KeyCode::KeyM) => PhysicalKey::Char('M'),
-        WinitPhysKey::Code(KeyCode::KeyN) => PhysicalKey::Char('N'),
-        WinitPhysKey::Code(KeyCode::KeyO) => PhysicalKey::Char('O'),
-        WinitPhysKey::Code(KeyCode::KeyP) => PhysicalKey::Char('P'),
-        WinitPhysKey::Code(KeyCode::KeyQ) => PhysicalKey::Char('Q'),
-        WinitPhysKey::Code(KeyCode::KeyR) => PhysicalKey::Char('R'),
-        WinitPhysKey::Code(KeyCode::KeyS) => PhysicalKey::Char('S'),
-        WinitPhysKey::Code(KeyCode::KeyT) => PhysicalKey::Char('T'),
-        WinitPhysKey::Code(KeyCode::KeyU) => PhysicalKey::Char('U'),
-        WinitPhysKey::Code(KeyCode::KeyV) => PhysicalKey::Char('V'),
-        WinitPhysKey::Code(KeyCode::KeyW) => PhysicalKey::Char('W'),
-        WinitPhysKey::Code(KeyCode::KeyX) => PhysicalKey::Char('X'),
-        WinitPhysKey::Code(KeyCode::KeyY) => PhysicalKey::Char('Y'),
-        WinitPhysKey::Code(KeyCode::KeyZ) => PhysicalKey::Char('Z'),
-
-        // Digit 0-9
-        WinitPhysKey::Code(KeyCode::Digit0) => PhysicalKey::Digit(0),
-        WinitPhysKey::Code(KeyCode::Digit1) => PhysicalKey::Digit(1),
-        WinitPhysKey::Code(KeyCode::Digit2) => PhysicalKey::Digit(2),
-        WinitPhysKey::Code(KeyCode::Digit3) => PhysicalKey::Digit(3),
-        WinitPhysKey::Code(KeyCode::Digit4) => PhysicalKey::Digit(4),
-        WinitPhysKey::Code(KeyCode::Digit5) => PhysicalKey::Digit(5),
-        WinitPhysKey::Code(KeyCode::Digit6) => PhysicalKey::Digit(6),
-        WinitPhysKey::Code(KeyCode::Digit7) => PhysicalKey::Digit(7),
-        WinitPhysKey::Code(KeyCode::Digit8) => PhysicalKey::Digit(8),
-        WinitPhysKey::Code(KeyCode::Digit9) => PhysicalKey::Digit(9),
-
-        // Function keys F1-F24
-        WinitPhysKey::Code(KeyCode::F1) => PhysicalKey::F(1),
-        WinitPhysKey::Code(KeyCode::F2) => PhysicalKey::F(2),
-        WinitPhysKey::Code(KeyCode::F3) => PhysicalKey::F(3),
-        WinitPhysKey::Code(KeyCode::F4) => PhysicalKey::F(4),
-        WinitPhysKey::Code(KeyCode::F5) => PhysicalKey::F(5),
-        WinitPhysKey::Code(KeyCode::F6) => PhysicalKey::F(6),
-        WinitPhysKey::Code(KeyCode::F7) => PhysicalKey::F(7),
-        WinitPhysKey::Code(KeyCode::F8) => PhysicalKey::F(8),
-        WinitPhysKey::Code(KeyCode::F9) => PhysicalKey::F(9),
-        WinitPhysKey::Code(KeyCode::F10) => PhysicalKey::F(10),
-        WinitPhysKey::Code(KeyCode::F11) => PhysicalKey::F(11),
-        WinitPhysKey::Code(KeyCode::F12) => PhysicalKey::F(12),
-        WinitPhysKey::Code(KeyCode::F13) => PhysicalKey::F(13),
-        WinitPhysKey::Code(KeyCode::F14) => PhysicalKey::F(14),
-        WinitPhysKey::Code(KeyCode::F15) => PhysicalKey::F(15),
-        WinitPhysKey::Code(KeyCode::F16) => PhysicalKey::F(16),
-        WinitPhysKey::Code(KeyCode::F17) => PhysicalKey::F(17),
-        WinitPhysKey::Code(KeyCode::F18) => PhysicalKey::F(18),
-        WinitPhysKey::Code(KeyCode::F19) => PhysicalKey::F(19),
-        WinitPhysKey::Code(KeyCode::F20) => PhysicalKey::F(20),
-        WinitPhysKey::Code(KeyCode::F21) => PhysicalKey::F(21),
-        WinitPhysKey::Code(KeyCode::F22) => PhysicalKey::F(22),
-        WinitPhysKey::Code(KeyCode::F23) => PhysicalKey::F(23),
-        WinitPhysKey::Code(KeyCode::F24) => PhysicalKey::F(24),
-
-        WinitPhysKey::Code(c) => PhysicalKey::Other(c as u32),
-        WinitPhysKey::Unidentified(_) => PhysicalKey::Other(0),
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn query_cursor_pos_in_window(window: &winit::window::Window) -> Option<PhysicalPosition> {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use std::ffi::c_void;
-    use windows::Win32::Foundation::{HWND, POINT};
-    use windows::Win32::Graphics::Gdi::ScreenToClient;
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-
-    let handle = window.window_handle().ok()?;
-    let hwnd = match handle.as_raw() {
-        RawWindowHandle::Win32(h) => HWND(h.hwnd.get() as *mut c_void),
-        _ => return None,
-    };
-    let mut pt = POINT { x: 0, y: 0 };
-    if unsafe { GetCursorPos(&raw mut pt) }.is_err() {
-        return None;
-    }
-    if !unsafe { ScreenToClient(hwnd, &raw mut pt) }.as_bool() {
-        return None;
-    }
-    Some(PhysicalPosition {
-        x: f64::from(pt.x),
-        y: f64::from(pt.y),
-    })
-}
-
-#[cfg(not(target_os = "windows"))]
-fn query_cursor_pos_in_window(_window: &winit::window::Window) -> Option<PhysicalPosition> {
-    None
-}
+// map_button / map_state / map_phys_key / query_cursor_pos_in_window は
+// daw_ui_platform::winit_backend に一本化 (Phase 4 で手写しミラーを撤去)。
 

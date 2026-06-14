@@ -16,3 +16,6 @@ pub mod winit_backend;
 pub use event::*;
 pub use text_document::{ImeTextEdit, RectPx, TextDocument};
 pub use window::*;
+// 独自イベントループを持つ consumer (daw_01 runner) が直接構築・利用できるよう
+// root に re-export する (`run_app` 経由でない使い方)。
+pub use winit_backend::WinitWindow;

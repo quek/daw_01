@@ -52,8 +52,28 @@ pub struct WinitWindow {
 }
 
 impl WinitWindow {
-    fn new(window: Arc<Window>) -> Self {
+    pub fn new(window: Arc<Window>) -> Self {
         Self { inner: window }
+    }
+
+    /// 内部の winit `Window` への参照。consumer (例: daw_01 の独自イベントループ)
+    /// が title / redraw / minimize / window_state 保存など winit を直接触る必要が
+    /// あるときに使う。
+    pub fn inner(&self) -> &Arc<Window> {
+        &self.inner
+    }
+
+    /// Windows 上で `HWND` を `isize` として返す
+    /// (`WindowAttributesExtWindows::with_owner_window` 等の引数用)。
+    /// raw-window-handle が Win32 variant でなければ `None`。
+    #[cfg(target_os = "windows")]
+    pub fn hwnd_isize(&self) -> Option<isize> {
+        use raw_window_handle::RawWindowHandle;
+        let handle = self.inner.window_handle().ok()?;
+        match handle.as_raw() {
+            RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+            _ => None,
+        }
     }
 }
 
@@ -325,7 +345,9 @@ impl<H: AppHost, F: FnOnce(WinitWindow) -> H> ApplicationHandler for WinitRunner
     }
 }
 
-fn map_button(b: WinitMouseBtn) -> MouseButton {
+/// winit のマウスボタンを中立 `MouseButton` に変換。独自イベントループを持つ
+/// consumer (daw_01 runner 等) が `run_app` を使わず WindowEvent を直接捌くときに使う。
+pub fn map_button(b: WinitMouseBtn) -> MouseButton {
     match b {
         WinitMouseBtn::Left => MouseButton::Left,
         WinitMouseBtn::Right => MouseButton::Right,
@@ -336,15 +358,17 @@ fn map_button(b: WinitMouseBtn) -> MouseButton {
     }
 }
 
-fn map_state(s: WinitElemState) -> ElementState {
+/// winit の押下状態を中立 `ElementState` に変換 ([`map_button`] と同じ用途)。
+pub fn map_state(s: WinitElemState) -> ElementState {
     match s {
         WinitElemState::Pressed => ElementState::Pressed,
         WinitElemState::Released => ElementState::Released,
     }
 }
 
+/// winit の物理キーを中立 `PhysicalKey` に変換 ([`map_button`] と同じ用途)。
 #[allow(clippy::too_many_lines)]
-fn map_phys_key(k: WinitPhysKey) -> PhysicalKey {
+pub fn map_phys_key(k: WinitPhysKey) -> PhysicalKey {
     match k {
         WinitPhysKey::Code(KeyCode::Escape) => PhysicalKey::Escape,
         WinitPhysKey::Code(KeyCode::Enter) => PhysicalKey::Enter,
@@ -449,7 +473,7 @@ fn map_phys_key(k: WinitPhysKey) -> PhysicalKey {
 /// `MouseInput` 直前に `GetCursorPos` で位置を補う必要がある。
 /// 他プラットフォームは `None` を返す (該当の問題が同じ形で出るかは未検証)。
 #[cfg(target_os = "windows")]
-fn query_cursor_pos_in_window(window: &Window) -> Option<PhysicalPosition> {
+pub fn query_cursor_pos_in_window(window: &Window) -> Option<PhysicalPosition> {
     use std::ffi::c_void;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::Foundation::{HWND, POINT};
@@ -472,7 +496,7 @@ fn query_cursor_pos_in_window(window: &Window) -> Option<PhysicalPosition> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn query_cursor_pos_in_window(_window: &Window) -> Option<PhysicalPosition> {
+pub fn query_cursor_pos_in_window(_window: &Window) -> Option<PhysicalPosition> {
     None
 }
 

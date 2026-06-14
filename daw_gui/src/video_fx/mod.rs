@@ -8,7 +8,7 @@
 //! / `device` / `queue`) の上に、daw_01 が**自前の effect pipeline** を組む
 //! (効果の定義は daw_01 ドメイン = SSoT、gui_01 は汎用レンダラのまま)。
 //!
-//! preview (`Renderer<DawGuiWindow>`) と export (`OffscreenRenderer`) の両方で
+//! preview (`Renderer<WinitWindow>`) と export (`OffscreenRenderer`) の両方で
 //! 同一適用するため、必要な操作を [`VideoFxRenderer`] trait に抽象化し両者へ実装する。
 //!
 //! ## submit 順序 (gui_01 #111 D2 契約)
@@ -31,7 +31,7 @@ use common::model::{AutomationTarget, Song, Track};
 use common::video_fx::{PassKind, VideoFxDef, def_by_id};
 use daw_ui_renderer::{OffscreenRenderer, Renderer, TextureHandle};
 
-use crate::view::window::DawGuiWindow;
+use daw_ui_platform::WinitWindow;
 
 /// preview / export の両レンダラを効果実行基盤から統一して触るための抽象。
 /// gui_01 #111 で公開された interop primitive をそのまま薄く束ねる。
@@ -53,7 +53,7 @@ pub trait VideoFxRenderer {
     fn fx_format(&self) -> wgpu::TextureFormat;
 }
 
-impl VideoFxRenderer for Renderer<DawGuiWindow> {
+impl VideoFxRenderer for Renderer<WinitWindow> {
     fn fx_device(&self) -> &wgpu::Device {
         self.device()
     }

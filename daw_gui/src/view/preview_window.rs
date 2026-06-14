@@ -13,7 +13,7 @@
 //!   daw_gui boots without one)
 //! - `true` → the runner creates a `PreviewWindowState` on the next
 //!   frame, including a fresh `winit::Window`, a `Renderer` over a
-//!   `DawGuiWindow` wrapper, and a `Scene`
+//!   `WinitWindow` wrapper, and a `Scene`
 //! - User clicks the window's close button → the runner notices the
 //!   `WindowEvent::CloseRequested` and flips the field back to false,
 //!   which destroys the state on the next frame
@@ -26,14 +26,14 @@ use winit::dpi::LogicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{WindowAttributes, WindowId};
 
-use crate::view::window::DawGuiWindow;
+use daw_ui_platform::WinitWindow;
 
 /// Per-window state owned by the runner while the preview is visible.
 /// Dropped (= destroys the OS window) when `AppData.preview_window_visible`
 /// transitions back to `false`.
 pub struct PreviewWindowState {
-    pub window: Arc<DawGuiWindow>,
-    pub renderer: Renderer<DawGuiWindow>,
+    pub window: Arc<WinitWindow>,
+    pub renderer: Renderer<WinitWindow>,
     pub scene: Scene,
     /// docs/plan_video_perf.md P4: per-`(VideoSourceId, slot_idx)`
     /// GPU textures backing the lookahead ring. The worker
@@ -177,7 +177,7 @@ impl PreviewWindowState {
             .create_window(attrs)
             .map_err(|e| format!("create preview window: {e}"))?;
         let window = Arc::new(window);
-        let dwin = Arc::new(DawGuiWindow::new(window));
+        let dwin = Arc::new(WinitWindow::new(window));
         let renderer = Renderer::new(dwin.clone())
             .map_err(|e| format!("preview Renderer::new: {e}"))?;
         Ok(Self {
