@@ -418,18 +418,19 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
 /// fx); `dst_index` is the device's position in the chain. dangling
 /// references are skipped (no compile error). `ProcessTrack` of the source
 /// runs earlier, so its scratch is settled by the time the tap copies it.
-/// docs/plan_modulation.md §6: resolve a tap point to the source scratch
-/// buffer. `PostFader` = the track's final output (`TrackScratch`); `PostFx`
-/// = after the device chain but before the volume/pan strip
-/// (`PreFaderScratch`, snapshot guarded in the engine). `PreFx` (the raw,
-/// pre-device-chain signal) needs a dedicated snapshot buffer that isn't
-/// built yet, so it falls back to `PostFx`; the UI only offers PostFader /
-/// PostFx until that lands.
+/// docs/plan_modulation.md §6 / docs/plan_modulation_followups.md §1: resolve a
+/// tap point to the source scratch buffer. `PostFader` = the track's final
+/// output (`TrackScratch`); `PostFx` = after the device chain but before the
+/// volume/pan strip (`PreFaderScratch`, snapshot guarded in the engine);
+/// `PreFx` = the raw signal before the device chain (`PreFxScratch`, snapshot
+/// guarded in the engine). All three snapshots are captured only when a tap
+/// actually needs them.
 fn tap_bufref(tap_point: common::model::TapPoint, src_idx: u32) -> BufRef {
     use common::model::TapPoint;
     match tap_point {
         TapPoint::PostFader => BufRef::TrackScratch(src_idx),
-        TapPoint::PostFx | TapPoint::PreFx => BufRef::PreFaderScratch(src_idx),
+        TapPoint::PostFx => BufRef::PreFaderScratch(src_idx),
+        TapPoint::PreFx => BufRef::PreFxScratch(src_idx),
     }
 }
 
@@ -646,6 +647,16 @@ mod tests {
             }
             other => panic!("expected Mix → Master, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tap_bufref_resolves_three_tap_points() {
+        use common::model::TapPoint;
+        // docs/plan_modulation_followups.md §1: PostFader=TrackScratch,
+        // PostFx=PreFaderScratch, PreFx=専用 PreFxScratch (旧フォールバック撤廃)。
+        assert_eq!(tap_bufref(TapPoint::PostFader, 3), BufRef::TrackScratch(3));
+        assert_eq!(tap_bufref(TapPoint::PostFx, 3), BufRef::PreFaderScratch(3));
+        assert_eq!(tap_bufref(TapPoint::PreFx, 3), BufRef::PreFxScratch(3));
     }
 
     #[test]

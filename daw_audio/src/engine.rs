@@ -1311,6 +1311,14 @@ pub fn process_track_owned(
         );
     }
 
+    // docs/plan_modulation_followups.md §1: snapshot the **pre-FX** signal (the
+    // raw audio clip / input before the device chain) for any PreFx tap / mod
+    // source. Guarded so untouched tracks skip the memcpy — RT-safe.
+    if song.is_some_and(|s| track_needs_prefx_snapshot(s, track_id)) {
+        scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
+        scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
+    }
+
     for i in 0..song_track.devices.len() {
         // chain map の key は (track_id, device_index)。 song.tracks の Vec
         // position に依存しないので、 group 化や drag&drop reorder で track
@@ -1579,23 +1587,51 @@ pub fn process_master_fx_chain(
     }
 }
 
-/// docs/plan_modulation.md §6: does any aux-input route or mod source tap
-/// `track_id` at a pre-fader (PostFx / PreFx) point? Such taps read the
-/// track's `pre_fader_l/r` snapshot, so the per-track render must capture it.
-/// Read-only scan, no alloc — RT-safe.
-fn track_needs_prefader_snapshot(song: &Song, track_id: u32) -> bool {
-    let is_prefx = |t: &common::model::AudioTap| {
-        t.source_track == track_id
-            && !matches!(t.tap_point, common::model::TapPoint::PostFader)
-    };
-    let aux_prefx = song
-        .tracks
+/// Resolve a tap `BufRef` (PostFader / PostFx / PreFx) to the source track's
+/// `(L, R)` buffers. Returns `None` for a non-tap `BufRef` or out-of-range
+/// track. docs/plan_modulation_followups.md §1. RT-safe (pure slicing).
+fn resolve_tap_buffers(scratch: &[TrackScratch], src: BufRef) -> Option<(&[f32], &[f32])> {
+    Some(match src {
+        BufRef::TrackScratch(i) => {
+            let s = scratch.get(i as usize)?;
+            (s.track_l.as_slice(), s.track_r.as_slice())
+        }
+        BufRef::PreFaderScratch(i) => {
+            let s = scratch.get(i as usize)?;
+            (s.pre_fader_l.as_slice(), s.pre_fader_r.as_slice())
+        }
+        BufRef::PreFxScratch(i) => {
+            let s = scratch.get(i as usize)?;
+            (s.pre_fx_l.as_slice(), s.pre_fx_r.as_slice())
+        }
+        _ => return None,
+    })
+}
+
+/// docs/plan_modulation.md §6 / docs/plan_modulation_followups.md §1: does any
+/// aux-input route or mod source tap `track_id` exactly at `want`? Read-only
+/// scan, no alloc — RT-safe.
+fn any_tap_at(song: &Song, track_id: u32, want: common::model::TapPoint) -> bool {
+    let hit = |t: &common::model::AudioTap| t.source_track == track_id && t.tap_point == want;
+    song.tracks
         .iter()
         .flat_map(|tr| tr.devices.iter())
         .chain(song.master_fx_chain.iter())
         .flat_map(|p| p.aux_inputs.iter().flatten())
-        .any(|r| is_prefx(&r.tap));
-    aux_prefx || song.mod_sources.iter().any(|m| is_prefx(&m.tap))
+        .any(|r| hit(&r.tap))
+        || song.mod_sources.iter().any(|m| hit(&m.tap))
+}
+
+/// A `PostFx` tap reads the track's `pre_fader_l/r` snapshot (post-fx,
+/// pre-strip), so the per-track render must capture it.
+fn track_needs_prefader_snapshot(song: &Song, track_id: u32) -> bool {
+    any_tap_at(song, track_id, common::model::TapPoint::PostFx)
+}
+
+/// A `PreFx` tap reads the track's `pre_fx_l/r` snapshot (the raw signal
+/// before the device chain), so the per-track render must capture it.
+fn track_needs_prefx_snapshot(song: &Song, track_id: u32) -> bool {
+    any_tap_at(song, track_id, common::model::TapPoint::PreFx)
 }
 
 /// Replay the post-dispatch portion of the routing schedule:
@@ -1656,12 +1692,13 @@ pub fn execute_schedule_post_dispatch(
                 dst:
                     BufRef::Pooled(_)
                     | BufRef::PluginAuxOut { .. }
-                    | BufRef::PreFaderScratch(_),
+                    | BufRef::PreFaderScratch(_)
+                    | BufRef::PreFxScratch(_),
                 ..
             } => {
                 // PR4: pooled targets and plugin aux-out routing land
                 // here once parallel-out support arrives. A Mix into a
-                // PreFaderScratch is never emitted (those are written by
+                // Pre*Scratch is never emitted (those are written by
                 // ProcessTrack), but the arm keeps the match exhaustive.
             }
             NodeOp::ProcessGroupFx { track_idx } => {
@@ -1729,18 +1766,10 @@ pub fn execute_schedule_post_dispatch(
                 // the buffer — `TrackScratch` = post-fader, `PreFaderScratch` =
                 // post-fx / pre-fader. Other `BufRef`s are ignored (PR4.4/PR5).
                 // RT path: skip silently on any miss (no per-buffer tracing).
-                let (src_idx, pre_fader) = match *src {
-                    BufRef::TrackScratch(i) => (i, false),
-                    BufRef::PreFaderScratch(i) => (i, true),
-                    _ => continue,
-                };
-                let Some(src_scratch) = scratch.get(src_idx as usize) else {
+                // docs/plan_modulation_followups.md §1: the tap point picks the
+                // source buffer — PostFader / PostFx (pre-fader) / PreFx.
+                let Some((src_l, src_r)) = resolve_tap_buffers(scratch, *src) else {
                     continue;
-                };
-                let (src_l, src_r) = if pre_fader {
-                    (&src_scratch.pre_fader_l, &src_scratch.pre_fader_r)
-                } else {
-                    (&src_scratch.track_l, &src_scratch.track_r)
                 };
                 let port = *aux_in_port as usize;
                 if port >= common::process_data::MAX_AUX_IN {
@@ -1804,18 +1833,8 @@ pub fn execute_schedule_post_dispatch(
                 // `follower_slots[slot].env`; `process_buffer` publishes it to
                 // `AudioBridge::mod_scalars` after this walk. RT-safe: pure
                 // arithmetic, no alloc / lock.
-                let (src_idx, pre_fader) = match *src {
-                    BufRef::TrackScratch(i) => (i, false),
-                    BufRef::PreFaderScratch(i) => (i, true),
-                    _ => continue,
-                };
-                let Some(src_scratch) = scratch.get(src_idx as usize) else {
+                let Some((src_l, src_r)) = resolve_tap_buffers(scratch, *src) else {
                     continue;
-                };
-                let (src_l, src_r) = if pre_fader {
-                    (&src_scratch.pre_fader_l, &src_scratch.pre_fader_r)
-                } else {
-                    (&src_scratch.track_l, &src_scratch.track_r)
                 };
                 let Some(fs) = follower_slots.get_mut(*slot as usize) else {
                     continue;
@@ -2094,6 +2113,14 @@ fn run_group_fx_chain(
 ) {
     let n = frames as usize;
     let track_id = song_track.id;
+
+    // docs/plan_modulation_followups.md §1: a group's pre-FX signal = the summed
+    // children before its own device chain. Capture for any PreFx tap / mod
+    // source (guarded — untouched groups skip the memcpy).
+    if track_needs_prefx_snapshot(song, track_id) {
+        scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
+        scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
+    }
 
     // v23 single-chain: a group / return bus has a summed audio input (no
     // sequencer notes), so the chain runs entirely in the audio domain. Walk

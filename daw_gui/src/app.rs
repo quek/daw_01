@@ -373,7 +373,8 @@ pub struct ModSourceRow {
     pub source_track: u32,
     /// Live follower scalar (`0..` ) from the polled `mod_scalars` plane.
     pub scalar: f32,
-    pub post_fader: bool,
+    /// docs/plan_modulation_followups.md §1: PreFx (素の音) / PostFx / PostFader。
+    pub tap_point: common::model::TapPoint,
     pub attack_ms: f32,
     pub release_ms: f32,
 }
@@ -2260,7 +2261,7 @@ impl AppData {
                 id: m.id,
                 source_track: m.tap.source_track,
                 scalar: self.mod_scalars.get(i).copied().unwrap_or(0.0),
-                post_fader: matches!(m.tap.tap_point, common::model::TapPoint::PostFader),
+                tap_point: m.tap.tap_point,
                 attack_ms: m.follower.attack_ms,
                 release_ms: m.follower.release_ms,
             })
@@ -2357,6 +2358,24 @@ impl AppData {
     /// (exact for affine / rotation deg↔rad / log scale targets). `base_norm =
     /// plain_to_norm(target, to_model(display_base))`; the on-edit inverse is
     /// `plain_to_norm(to_model(display_base + d)) − base_norm` (see `build_mod`).
+    /// docs/plan_modulation_followups.md §2: a `PluginParam` target's plain
+    /// `(min, max)` from the `plugin_params` cache (= `PluginParamInfo` shipped
+    /// by the plugin host), for range-aware display normalization. `None` for a
+    /// non-plugin target, an unknown param, or a degenerate range.
+    pub fn plugin_param_range(
+        &self,
+        track_id: u32,
+        target: &common::model::AutomationTarget,
+    ) -> Option<(f64, f64)> {
+        let common::model::AutomationTarget::PluginParam { device_index, param_id, .. } = target
+        else {
+            return None;
+        };
+        let params = self.plugin_params.get(&(track_id, *device_index))?;
+        let info = params.iter().find(|p| p.id == *param_id)?;
+        (info.max_value > info.min_value).then_some((info.min_value, info.max_value))
+    }
+
     pub fn inspector_mod_data(
         &self,
         target: &common::model::AutomationTarget,
@@ -2374,14 +2393,19 @@ impl AppData {
                 }
             };
         let model_base = domain.to_model(target, display_base);
-        let base_norm = f64::from(common::automation::plain_to_norm(target, model_base));
+        // docs/plan_modulation_followups.md §2: plugin params normalize against
+        // their real min/max (identity placeholder would saturate the overlay).
+        let plugin_range = self.plugin_param_range(track_id, target);
+        let base_norm =
+            f64::from(common::automation::plain_to_norm_ranged(target, model_base, plugin_range));
         // Reachable display depth for a normalized `depth`: convert the value the
         // base would reach at full scalar back into the control's display domain.
         // Exact for affine / rotation / log targets (vs. a linear `depth*span`).
         let reach_depth = |depth: f32| -> f64 {
             let reach_norm = (base_norm + f64::from(depth)).clamp(0.0, 1.0);
             #[allow(clippy::cast_possible_truncation)]
-            let reach_model = common::automation::norm_to_plain(target, reach_norm as f32);
+            let reach_model =
+                common::automation::norm_to_plain_ranged(target, reach_norm as f32, plugin_range);
             domain.to_display(target, reach_model) - display_base
         };
         let mut entries: Vec<([f32; 3], f64)> = Vec::new();
@@ -4133,7 +4157,7 @@ pub enum AppEvent {
     SetModFollowerScrubbing(bool),
     /// docs/plan_modulation.md §6: flip a `ModSource`'s tap point
     /// (`true` = PostFader, `false` = PostFx / pre-fader).
-    SetModSourceTapPoint { id: u32, post_fader: bool },
+    SetModSourceTapPoint { id: u32, tap_point: common::model::TapPoint },
     /// docs/plan_modulation_routing_redesign.md §6: arm / disarm a `ModSource`
     /// for per-control depth assignment (Bitwig 流). `Some(id)` arms; `None`
     /// disarms. While armed, inspector param controls enter depth-drag edit mode.
@@ -4143,7 +4167,7 @@ pub enum AppEvent {
         track_id: u32,
         device_index: u32,
         port: u8,
-        post_fader: bool,
+        tap_point: common::model::TapPoint,
     },
     /// inspector chain (= `Track.devices` / `master_fx_chain` を一列にした list)
     /// の reorder。`order` は gui_01 契約 `new[i] = items[order[i]]`。単一デバイス
@@ -5608,16 +5632,16 @@ impl AppData {
             AppEvent::SetModSourceAttack { id, ms } => self.set_mod_source_attack(id, ms),
             AppEvent::SetModSourceRelease { id, ms } => self.set_mod_source_release(id, ms),
             AppEvent::SetModFollowerScrubbing(active) => self.set_mod_follower_scrubbing(active),
-            AppEvent::SetModSourceTapPoint { id, post_fader } => {
-                self.set_mod_source_tap_point(id, post_fader)
+            AppEvent::SetModSourceTapPoint { id, tap_point } => {
+                self.set_mod_source_tap_point(id, tap_point)
             }
             AppEvent::SetArmedModSource(id) => self.armed_mod_source = id,
             AppEvent::SetAuxInputTapPoint {
                 track_id,
                 device_index,
                 port,
-                post_fader,
-            } => self.set_aux_input_tap_point(track_id, device_index, port, post_fader),
+                tap_point,
+            } => self.set_aux_input_tap_point(track_id, device_index, port, tap_point),
             AppEvent::ReorderInspectorChain(order) => {
                 self.reorder_inspector_chain(&order);
             }
@@ -15657,13 +15681,9 @@ impl AppData {
         self.mod_follower_scrub_active = active;
     }
 
-    fn set_mod_source_tap_point(&mut self, id: u32, post_fader: bool) {
+    fn set_mod_source_tap_point(&mut self, id: u32, tap_point: common::model::TapPoint) {
         if let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) {
-            m.tap.tap_point = if post_fader {
-                common::model::TapPoint::PostFader
-            } else {
-                common::model::TapPoint::PostFx
-            };
+            m.tap.tap_point = tap_point;
         }
         // tap_point は schedule の BufRef を変えるので recompile が要る。
         self.sync_song_to_plugin_host();
@@ -15674,7 +15694,7 @@ impl AppData {
         track_id: u32,
         device_index: u32,
         port: u8,
-        post_fader: bool,
+        tap_point: common::model::TapPoint,
     ) {
         let inst = if track_id == common::model::MASTER_TRACK_ID {
             self.song.master_fx_chain.get_mut(device_index as usize)
@@ -15689,11 +15709,7 @@ impl AppData {
                 .get_mut(port as usize)
                 .and_then(|o| o.as_mut())
         {
-            route.tap.tap_point = if post_fader {
-                common::model::TapPoint::PostFader
-            } else {
-                common::model::TapPoint::PostFx
-            };
+            route.tap.tap_point = tap_point;
         }
         self.sync_song_to_plugin_host();
     }

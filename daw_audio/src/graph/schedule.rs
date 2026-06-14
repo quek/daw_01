@@ -31,6 +31,13 @@ pub enum BufRef {
     /// and read by a `MixSend` whose send `mode == PreFader`. Indexed by
     /// song-track index, parallel to `TrackScratch`.
     PreFaderScratch(u32),
+    /// A track's **pre-FX** scratch (the raw signal *before* its device
+    /// chain — audio clips / sidechain-aligned input, with no FX applied).
+    /// Captured by `ProcessTrack` / `ProcessGroupFx` just before the device
+    /// loop runs, and read by a `SidechainTap` / `EnvelopeFollow` whose tap
+    /// point is `TapPoint::PreFx`. Indexed by song-track index, parallel to
+    /// `TrackScratch`. docs/plan_modulation_followups.md §1.
+    PreFxScratch(u32),
 }
 
 /// A unit of work in a `Schedule`. The RT thread iterates `Schedule::nodes`

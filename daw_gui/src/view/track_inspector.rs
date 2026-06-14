@@ -2135,7 +2135,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 w: 20.0,
                 h: 20.0,
             };
-            let tap_w = 30.0;
+            let tap_w = 60.0;
             let tap_rect = Rect {
                 x: rm_rect.x - 4.0 - tap_w,
                 y: my,
@@ -2193,20 +2193,23 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     });
                 }));
             }
-            let is_post = src.post_fader;
-            ui.button_at(
-                ("inspector_mod_src_tap", i),
-                if is_post { "PoF" } else { "PrF" },
-                tap_rect,
-                move || {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetModSourceTapPoint {
-                            id: sid,
-                            post_fader: !is_post,
-                        });
-                    })
-                },
-            );
+            // docs/plan_modulation_followups.md §1: 3-tap selector (素の音 PreFx /
+            // PostFx / PostFader)。signal-flow 順に並べる。
+            const TAP_POINTS: [common::model::TapPoint; 3] = [
+                common::model::TapPoint::PreFx,
+                common::model::TapPoint::PostFx,
+                common::model::TapPoint::PostFader,
+            ];
+            let tap_labels = ["Pre-FX", "Post-FX", "Post-Fader"];
+            let tap_sel = TAP_POINTS.iter().position(|t| *t == src.tap_point).unwrap_or(2);
+            if let Some(picked) =
+                ui.dropdown(("inspector_mod_src_tap", i), tap_rect, &tap_labels, tap_sel)
+                && let Some(&tp) = TAP_POINTS.get(picked)
+            {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetModSourceTapPoint { id: sid, tap_point: tp });
+                }));
+            }
             ui.button_at(("inspector_mod_src_rm", i), "\u{00d7}", rm_rect, move || {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::RemoveModSource { id: sid });

@@ -58,6 +58,15 @@ pub struct TrackScratch {
     /// send `mode == PreFader`. `MAX_FRAMES` long, allocated once.
     pub pre_fader_l: Vec<f32>,
     pub pre_fader_r: Vec<f32>,
+    /// **Pre-FX** snapshot of this track's signal (the raw audio clip /
+    /// input *before* the device chain runs). Written by
+    /// `process_track_owned` / `run_group_fx_chain` only when a
+    /// `TapPoint::PreFx` tap / mod source reads this track
+    /// (`track_needs_prefx_snapshot`), and read by a `SidechainTap` /
+    /// `EnvelopeFollow` resolving `BufRef::PreFxScratch`. `MAX_FRAMES` long,
+    /// allocated once. docs/plan_modulation_followups.md §1.
+    pub pre_fx_l: Vec<f32>,
+    pub pre_fx_r: Vec<f32>,
 }
 
 impl TrackScratch {
@@ -79,6 +88,8 @@ impl TrackScratch {
             pan_per_sample: vec![0.0; MAX_FRAMES],
             pre_fader_l: vec![0.0; MAX_FRAMES],
             pre_fader_r: vec![0.0; MAX_FRAMES],
+            pre_fx_l: vec![0.0; MAX_FRAMES],
+            pre_fx_r: vec![0.0; MAX_FRAMES],
         }
     }
 }

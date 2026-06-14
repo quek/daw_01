@@ -34,6 +34,27 @@ use std::collections::HashMap;
 /// ので `clamp(0,1)` の placeholder。Phase 2 で
 /// `AppData.plugin_params` lookup に置換する。
 pub fn plain_to_norm(target: &AutomationTarget, plain: f64) -> f32 {
+    plain_to_norm_ranged(target, plain, None)
+}
+
+/// `plain_to_norm` の range-aware 版 (docs/plan_modulation_followups.md §2)。
+/// `PluginParam` は plugin の実 min/max を知る呼び出し側 (daw_gui の
+/// `plugin_params` cache) が `plugin_range = Some((min, max))` を渡すと affine
+/// `(plain - min) / (max - min)` で正規化する (modulation overlay の色帯 /
+/// arrangement automation 曲線の y 位置を正す)。range が無い (= audio engine
+/// 経路、`PluginParam` を normalize しない) / 非 `PluginParam` target は
+/// `plugin_range` を無視し既存ロジックへ委譲 → 完全回帰。
+pub fn plain_to_norm_ranged(
+    target: &AutomationTarget,
+    plain: f64,
+    plugin_range: Option<(f64, f64)>,
+) -> f32 {
+    if let AutomationTarget::PluginParam { .. } = target
+        && let Some((min, max)) = plugin_range
+        && max > min
+    {
+        return (((plain - min) / (max - min)) as f32).clamp(0.0, 1.0);
+    }
     let v = match target {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => plain / 2.0,
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => (plain + 1.0) / 2.0,
@@ -92,7 +113,24 @@ pub fn plain_to_norm(target: &AutomationTarget, plain: f64) -> f32 {
 /// Normalized 0..=1 → plain (target's native unit)。`plain_to_norm` の
 /// 逆変換。`Mute` は 0.5 を閾値に 0.0 / 1.0 へ snap。
 pub fn norm_to_plain(target: &AutomationTarget, norm: f32) -> f64 {
+    norm_to_plain_ranged(target, norm, None)
+}
+
+/// `norm_to_plain` の range-aware 版 (docs/plan_modulation_followups.md §2) —
+/// `plain_to_norm_ranged` の厳密逆。`PluginParam` + `Some((min, max))`(max>min)
+/// で `min + norm * (max - min)`、それ以外は既存ロジックへ委譲。
+pub fn norm_to_plain_ranged(
+    target: &AutomationTarget,
+    norm: f32,
+    plugin_range: Option<(f64, f64)>,
+) -> f64 {
     let n = norm.clamp(0.0, 1.0) as f64;
+    if let AutomationTarget::PluginParam { .. } = target
+        && let Some((min, max)) = plugin_range
+        && max > min
+    {
+        return min + n * (max - min);
+    }
     match target {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => n * 2.0,
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => n * 2.0 - 1.0,
@@ -565,6 +603,37 @@ mod tests {
         assert!((f64::from(plain_to_norm(&rot, 0.0)) - 0.5).abs() < 1e-6);
         let back = norm_to_plain(&rot, plain_to_norm(&rot, 1.234));
         assert!((back - 1.234).abs() < 1e-5);
+    }
+
+    #[test]
+    fn plugin_param_ranged_normalizes_with_real_minmax() {
+        // docs/plan_modulation_followups.md §2: PluginParam は identity
+        // placeholder でなく実 min/max で affine 正規化される (range が渡された
+        // とき)。audio engine 経路 (range = None) と非 PluginParam target は不変。
+        let target = AutomationTarget::PluginParam {
+            device_index: 0,
+            param_id: 7,
+            legacy_slot: None,
+        };
+        let range = Some((20.0_f64, 20_000.0_f64));
+        // 端点 + 中点 (20..20000 の 10010 = 中点)。
+        assert!(plain_to_norm_ranged(&target, 20.0, range).abs() < 1e-6);
+        assert!((plain_to_norm_ranged(&target, 20_000.0, range) - 1.0).abs() < 1e-6);
+        let mid = plain_to_norm_ranged(&target, 10_010.0, range);
+        assert!((f64::from(mid) - 0.5).abs() < 1e-3, "mid norm {mid}");
+        // round-trip。
+        let back = norm_to_plain_ranged(&target, mid, range);
+        assert!((back - 10_010.0).abs() < 1.0, "round-trip {back}");
+        // range 無し → 旧 identity placeholder (clamp 0..1) を維持 = audio 経路不変。
+        assert!((f64::from(plain_to_norm_ranged(&target, 0.3, None)) - 0.3).abs() < 1e-6);
+        assert!((plain_to_norm_ranged(&target, 5.0, None) - 1.0).abs() < 1e-6); // clamp
+        // degenerate range (min == max) は無視して placeholder へ (0 除算回避)。
+        let degen = Some((1.0, 1.0));
+        assert!((f64::from(plain_to_norm_ranged(&target, 0.3, degen)) - 0.3).abs() < 1e-6);
+        // 非 PluginParam target は range を無視 (Volume は /2 のまま) = 完全回帰。
+        let vol = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
+        assert!((f64::from(plain_to_norm_ranged(&vol, 1.0, Some((0.0, 100.0)))) - 0.5).abs() < 1e-6);
+        assert!((norm_to_plain_ranged(&vol, 0.5, Some((0.0, 100.0))) - 1.0).abs() < 1e-9);
     }
 
     #[test]
