@@ -663,7 +663,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let is_selected = selected_clips.contains(clip_key);
         draw_audio_clip_waveform(app, ui, *clip_key, *rect, lanes_x, is_selected);
         draw_audio_clip_value_overlay(app, ui, *clip_key, *rect);
-        draw_midi_clip_notes(app, ui, *clip_key, *rect, lanes_x, is_selected);
+        draw_midi_clip_notes(app, ui, *clip_key, *rect, lanes_x, is_selected, &style);
 
         // clip rename mode 中はこの clip rect の上端に text_input を重ね描き。
         // track rename と同 idiom (text_input_at_focused が click で focus 取得、
@@ -2692,6 +2692,7 @@ fn draw_midi_clip_notes(
     clip_rect: Rect,
     lanes_x: f32,
     is_selected: bool,
+    style: &ArrangementStyle,
 ) {
     let Some(t_idx) = app.song.tracks.iter().position(|t| t.id == clip_key.track) else {
         return;
@@ -2756,11 +2757,29 @@ fn draw_midi_clip_notes(
     let pitch_span = (max_p as i32 - min_p as i32).max(1) as f32;
     let row_h = (view_rect.h / pitch_span).max(1.0);
 
-    let base_fill = if is_selected {
-        Color::rgba(0.10, 0.15, 0.30, 1.0)
+    // ノート色は固定値ではなく、clip の **実 fill 背景** の輝度から auto-contrast で
+    // 選ぶ (FIXME #57: 旧固定 light-cyan / dark-blue が selected の黄背景や custom 色
+    // clip でコントラスト不足だった)。背景 fill は widget が実際に塗る色と完全一致
+    // させる: selected は `clip_selected_fill` 最優先 (`draw_clip` lines 3418-3423)、
+    // 非 selected は clip の **effective 色** (個別上書き or トラック色継承、SSoT は
+    // `track_color::effective_clip_color`)。これは widget へ渡す `ArrangementClip.color`
+    // (line 250) と同一値で、widget は `clip.color.unwrap_or(clip_default_fill)` で塗る。
+    // 半透明になり得る lane bg と合成した実効色で判定する (clip fill は不透明だが、
+    // 輝度計算は clip 名 (#060) / piano_roll 鍵盤ラベル (#093) と同 SSoT helper に委譲)。
+    let track = &app.song.tracks[t_idx];
+    let clip_bg = if is_selected {
+        style.clip_selected_fill
     } else {
-        Color::rgba(0.55, 0.85, 0.95, 1.0)
+        track_color::to_renderer(track_color::effective_clip_color(track, clip))
     };
+    let effective_bg = daw_ui_core::color::composite_over(clip_bg, style.bg);
+    // 明背景 (黄 selection / 明るい custom 色) には黒寄り、暗背景 (既定の青 / 暗い
+    // custom 色) には白寄りを選ぶ。WCAG relative luminance 閾値 (≈0.179) で分岐。
+    let base_fill = daw_ui_core::color::pick_contrast(
+        effective_bg,
+        Color::rgba(0.96, 0.97, 1.0, 1.0),
+        Color::rgba(0.06, 0.07, 0.12, 1.0),
+    );
 
     let clip_len_beats = clip.length_beats.max(0.0001) as f32;
     let px_per_beat = view_rect.w / clip_len_beats;
