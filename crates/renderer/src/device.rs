@@ -535,6 +535,67 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         self.config.format
     }
 
+    // ============================================================
+    // M14 Phase 133 (daw_01 #111): 映像効果フレームワーク用 texture interop primitive
+    // ============================================================
+
+    /// handle が指す `wgpu::Texture` への参照を返す (destroy 済 / 未知の handle は `None`)。
+    ///
+    /// daw_01 の映像効果チェーンが、 合成済トラック画像 ([`Self::composite_scene_to_texture`] の戻り) や
+    /// 動画フレーム handle を **自前の effect pipeline の sampler に bind** するための入口。 効果の定義
+    /// (WGSL / パラメータ表 / ping-pong / 履歴) は daw_01 ドメインなので、 gui_01 はこの生 texture を渡す
+    /// だけで「効果とは何か」 を知らない (SSoT)。 gui_01 自身の text effect compositor が `TextureStore` の
+    /// 同 method で blur / composite pass を組んでいるのと同型の primitive。
+    ///
+    /// 戻りは `&wgpu::Texture` (`&self` 借用)。 同じ renderer の `&mut self` メソッド
+    /// ([`Self::create_render_target`] / [`Self::create_texture`] 等) と借用が衝突する場合は、
+    /// `wgpu::Texture` は Arc-backed で clone が安価なので `renderer.raw_texture(h).cloned()` で所有権を
+    /// 取ってから `&mut` メソッドを呼ぶ (内部の async readback `offscreen.rs` も同パターンで handle を clone)。
+    #[must_use]
+    pub fn raw_texture(&self, handle: TextureHandle) -> Option<&wgpu::Texture> {
+        self.texture_store.raw_texture(handle)
+    }
+
+    /// `RENDER_ATTACHMENT | TEXTURE_BINDING` な空 texture を確保し、 `(handle, color_attachment_view)` を
+    /// 返す (映像効果の出力 / ping-pong 中間 / 履歴ターゲット用)。
+    ///
+    /// - `handle`: store 登録済なので、 効果適用後にそのまま [`Scene::push_textured_quad`] で base scene へ
+    ///   戻して sample できる (texture pipeline の sampler/layout で bind 済)。 別の effect pass の sample
+    ///   入力にしたい場合は [`Self::raw_texture`] で生 texture を取り、 自前 bind group を作る。
+    /// - 戻りの `wgpu::TextureView` は `begin_render_pass` の `color_attachments[].view` 用 (= 効果 pass を
+    ///   ここへ描く)。 view は使い終えたら drop してよい (sampling 用 view は store の bind_group 内に別途保持)。
+    /// - `format` は base pass に揃える (preview = [`Self::surface_format`] / export = `OffscreenRenderer::target_format`)。
+    ///
+    /// # lifecycle (caller 管理)
+    /// [`Self::create_texture`] と同じ texture pool 上の handle。 [`Self::composite_scene_to_texture`] の
+    /// renderer-managed handle (次の `render()` まで有効、 caller は destroy しない) と違い、 こちらは renderer が
+    /// **recycle しない** ので、 不要になったら [`Self::destroy_texture`] で解放する。 `(chain, size)` ごとに
+    /// 2〜3 枚 + 履歴 1 枚を frame 跨ぎで使い回す想定。 `render()` 冒頭の composite pool eviction はこの handle を
+    /// **触らない** (= caller が destroy するまで生存)。
+    ///
+    /// # submit 順序の契約
+    /// 効果 pass を **自前 encoder に積んで `queue.submit` してから** [`Self::render`] を呼ぶこと。 GPU は submit
+    /// 順に実行するので、 同一 frame 内の「create → 効果 pass 描画 (submit A) → 最終 handle を push して render
+    /// (submit B)」 は安全 ([`Self::composite_scene_to_texture`] = #063 と同じ「別 submit なら安全」、 CLAUDE.md
+    /// wgpu 罠「LAST WRITE WINS の対」)。 **履歴 (feedback) target** も「前 frame の write (submit) → 今 frame の
+    /// sample (submit)」 の順なので安全。 ただし **同一 render pass で同じ texture を sample と render target の
+    /// 両方にしない** (ping-pong で読みと書きを別 texture に分ける)。
+    pub fn create_render_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> (TextureHandle, wgpu::TextureView) {
+        self.texture_store.create_render_target(
+            &self.device,
+            self.texture.sampler(),
+            self.texture.texture_bind_group_layout(),
+            format,
+            width,
+            height,
+        )
+    }
+
     /// M14 Phase 93 (daw_01 #063): `scene.primitives` を `width × height` の GPU 常駐 sampleable
     /// texture に合成し、 その [`TextureHandle`] を返す。 立ち絵 group transform 等で「子 quad 群を
     /// 1 枚に焼いてから親 affine (#064 の `rotation_pivot` 込み) を 1 回かける」 用途。

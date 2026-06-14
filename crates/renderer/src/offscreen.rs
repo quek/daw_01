@@ -256,6 +256,49 @@ impl OffscreenRenderer {
     }
 
     // ============================================================
+    // M14 Phase 133 (daw_01 #111): 映像効果用 texture interop primitive (`Renderer<W>` と同 idiom)
+    // ============================================================
+
+    /// 内部 `wgpu::Device` への参照 (export 経路で daw_01 が自前 effect pipeline を組むのに必要)。
+    /// `Renderer<W>::device` の `OffscreenRenderer` 版。
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// 内部 `wgpu::Queue` への参照 (effect pass の `submit` 用)。 `Renderer<W>::queue` の同等。
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// handle が指す `wgpu::Texture` への参照 (destroy 済 / 未知は `None`)。 詳細・借用の扱いは
+    /// [`Renderer::raw_texture`](crate::Renderer::raw_texture) 参照。
+    #[must_use]
+    pub fn raw_texture(&self, handle: TextureHandle) -> Option<&wgpu::Texture> {
+        self.texture_store.raw_texture(handle)
+    }
+
+    /// `RENDER_ATTACHMENT | TEXTURE_BINDING` な空 texture を確保し `(handle, color_attachment_view)` を
+    /// 返す (映像効果出力 / ping-pong / 履歴)。 lifecycle = caller 管理、 submit 順序の契約は
+    /// [`Renderer::create_render_target`](crate::Renderer::create_render_target) 参照 (export では
+    /// `render()` の代わりに `render_to_rgba` / `submit_readback` が「効果 pass の submit 後」 になる)。
+    /// `format` は base pass の `target_format()` に揃える。
+    pub fn create_render_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> (TextureHandle, wgpu::TextureView) {
+        self.texture_store.create_render_target(
+            &self.device,
+            self.texture.sampler(),
+            self.texture.texture_bind_group_layout(),
+            format,
+            width,
+            height,
+        )
+    }
+
+    // ============================================================
     // M14 Phase 71 (daw_01 #043): texture pool public API (Renderer<W> と同 idiom)
     // ============================================================
 
