@@ -1291,6 +1291,10 @@ pub struct AppData {
     /// spawn + handshake + Session/OpenWorkerPool 再送し、 新 tx で
     /// `audio_tx` / `plugin_tx` を差し替える。
     pub supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
+    /// 直近の child 切断時刻 (kind 別)。短時間に閾値以上切断したら crash-loop と
+    /// 判断して自動 respawn を止める (= 落ちるプラグインを抱えたプロジェクトで
+    /// respawn→reload→再 crash の無限ループに陥り GUI が固まるのを防ぐ)。session-only。
+    pub child_disconnect_log: Vec<(common::protocol::ChildKind, std::time::Instant)>,
 
     /// Phase 2 PR-C: plugin-FX bounce が進行中なら `Some`。 `None` で
     /// 新規 bounce を受け付ける。 同時 1 件のみ。 `MainToChild::
@@ -1866,6 +1870,7 @@ impl AppData {
             voicevox_cache: Arc::new(Mutex::new(common::voicevox_cache::VoiceVoxCache::new())),
             voicevox_job,
             supervisor,
+            child_disconnect_log: Vec::new(),
             voicevox_launch_attempted: false,
             lipsync_gen: 0,
             is_rescanning: false,
@@ -10644,6 +10649,36 @@ impl AppData {
                 self.loaded_slots.clear();
                 tracing::warn!("daw_plugin_host child disconnected");
             }
+        }
+
+        // crash-loop ガード: 短時間に同 kind が閾値以上切断したら自動 respawn を
+        // 止める。落ちるプラグインを抱えたプロジェクト (例: state 復元後に
+        // restartComponent を連発して host を落とす VST3) で respawn→reload→再 crash
+        // の無限ループに陥り、 GUI が固まるのを防ぐ。
+        const CRASH_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+        const CRASH_LIMIT: usize = 3;
+        let now = std::time::Instant::now();
+        self.child_disconnect_log
+            .retain(|(_, t)| now.duration_since(*t) < CRASH_WINDOW);
+        self.child_disconnect_log.push((kind, now));
+        let recent = self
+            .child_disconnect_log
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .count();
+        if recent >= CRASH_LIMIT {
+            self.status_message = format!(
+                "{}が繰り返しクラッシュしています — 自動再起動を停止しました。\
+                 プロジェクトのプラグインを確認してください{}",
+                kind.as_str(),
+                if was_playing { " (再生停止)" } else { "" }
+            );
+            tracing::error!(
+                ?kind,
+                recent,
+                "child crash-loop detected; giving up auto-respawn to keep the UI responsive"
+            );
+            return;
         }
 
         // supervisor 経由で respawn を試みる。 supervisor が None

@@ -135,7 +135,13 @@ impl ChildSupervisor {
                     .with_context(|| format!("failed to create pipe {pipe_for_spawn}"))?;
                 let child = crate::subprocess::spawn_sibling(binary, [&pipe_for_spawn])?;
                 job.assign(&child)?;
-                let (_hello, server) = handshake(server, kind).await?;
+                // handshake に timeout を付ける: respawn は GUI main thread の
+                // block_on で呼ばれるので、 新 child が Hello を送る前にハング/
+                // crash すると main thread が永久に固まる。 5s で諦めて Err を返す。
+                let (_hello, server) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), handshake(server, kind))
+                        .await
+                        .context("respawn handshake timed out (new child died before handshake?)")??;
                 anyhow::Ok((server, child))
             })?;
 
