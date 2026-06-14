@@ -1,0 +1,36 @@
+[package]
+name = "daw-ui-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+raw-window-handle = "0.6.2"
+winit = "0.30.13"
+
+# Windows 限定: フォーカス取得直後のクリックで cursor 位置が不明になる問題を
+# GetCursorPos / ScreenToClient で補うために使う (winit_backend.rs 参照)。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+# Windows 限定: text_input を TSF ITextStoreACP として OS IME に公開する (tsf/ module)。
+# rtry (Try-Code TIP) のまぜ書き GetText / MS-IME 再変換を成立させる。windows-core が
+# windows-implement を内包するので COM オブジェクト実装 (#[implement]) に追加 feature は不要。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",     # ITextStoreACP_Impl / TS_ATTRVAL (VARIANT) の gate
+    "Win32_UI_TextServices",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"

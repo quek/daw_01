@@ -1,0 +1,63 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/session_start_daw01_open.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/sessionstart_show_pending_reflections.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/pretooluse_git_commit_review_reminder.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/pretooluse_daw_01_conversation_best_practice_reminder.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/pretooluse_ask_user_question_best_practice_reminder.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/stop_session_reflect.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash F:/dev/gui_01/.claude/hooks/stop_daw01_open_check.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

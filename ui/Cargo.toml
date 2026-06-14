@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/platform",
+    "crates/renderer",
+    "crates/ui",
+    "crates/examples/mixer",
+    "crates/examples/waveform_validation",
+    "crates/examples/piano_roll",
+    "crates/examples/sample_editor",
+    "crates/examples/arrangement",
+    "crates/examples/automation",
+    "crates/examples/embedded_host",
+    "crates/examples/sample_edit_ops",
+    "crates/examples/daw_prototype",
+    "crates/examples/composite_validation",
+    "crates/examples/text_input_ime",
+    "crates/examples/meter_snapshot",
+    "crates/examples/track_header_snapshot",
+    "crates/examples/arrangement_share_snapshot",
+    "crates/examples/channel_fader_meter_snapshot",
+    "crates/examples/arrangement_group_snapshot",
+    "crates/examples/arrangement_section_snapshot",
+    "crates/examples/text_effect_overlay_snapshot",
+    "crates/examples/color_picker_verify",
+    "crates/examples/piano_roll_label_snapshot",
+    "crates/examples/font_picker_snapshot",
+    "crates/examples/text_align_snapshot",
+    "crates/examples/scrubable_number_modulation_snapshot",
+    "crates/examples/knob_modulation_snapshot",
+    "crates/examples/fader_modulation_snapshot",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# DAW-GUI 設計上 derive(Clone) 等を要求しない方針なので一部 pedantic を緩める
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# 日本語ドキュメントでの偽陽性を避ける
+doc_markdown = "allow"
+# ライフタイム名は明示の方がドキュメントとして読みやすい場面があるため
+elidable_lifetime_names = "allow"
+# 1 関数 1 役で書きやすくするため
+needless_pass_by_value = "allow"
+unreadable_literal = "allow"
+
+# 内部 crate 同士の path 依存は workspace 直書き、外部 crate は workspace.dependencies で管理
+[workspace.dependencies]
+daw-ui-platform = { path = "crates/platform" }
+daw-ui-renderer = { path = "crates/renderer" }
+daw-ui-core = { path = "crates/ui" }
+
+[profile.dev]
+opt-level = 1            # wgpu/glyphon は debug が遅すぎるので軽く最適化
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 3            # 依存 crate は full 最適化
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

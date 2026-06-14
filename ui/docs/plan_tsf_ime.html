@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>M15: text_input を TSF ITextStoreACP として OS IME に公開</title>
+<style>
+:root { color-scheme: light dark; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN",
+    "Yu Gothic", Meiryo, sans-serif;
+  line-height: 1.6;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 32px 24px 80px;
+  color: #1f2328;
+  background: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  body { color: #e6edf3; background: #0d1117; }
+  a { color: #58a6ff; }
+  code, pre { background: #161b22; }
+  hr { border-color: #30363d; }
+  blockquote { color: #8b949e; border-left-color: #30363d; }
+  th, td { border-color: #30363d; }
+  tr:nth-child(2n) { background: #161b22; }
+}
+h1, h2, h3, h4 { line-height: 1.25; margin: 1.6em 0 0.6em; }
+h1 { font-size: 2em; border-bottom: 1px solid #d1d9e0; padding-bottom: 0.3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid #d1d9e0; padding-bottom: 0.3em; }
+h3 { font-size: 1.25em; }
+h4 { font-size: 1em; }
+a { color: #0969da; text-decoration: none; }
+a:hover { text-decoration: underline; }
+code {
+  font-family: "HackGen Console NF", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: #eff1f3;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+pre {
+  background: #eff1f3;
+  padding: 12px 16px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 0.88em;
+}
+pre code { background: transparent; padding: 0; font-size: inherit; }
+blockquote {
+  margin: 0 0 1em;
+  padding: 0 1em;
+  color: #59636e;
+  border-left: 4px solid #d1d9e0;
+}
+ul, ol { padding-left: 2em; }
+li { margin: 0.15em 0; }
+hr { border: 0; border-top: 1px solid #d1d9e0; margin: 2em 0; }
+table { border-collapse: collapse; margin: 1em 0; width: 100%; }
+th, td { border: 1px solid #d1d9e0; padding: 6px 12px; text-align: left; }
+th { background: #eff1f3; font-weight: 600; }
+tr:nth-child(2n) { background: #f6f8fa; }
+.note {
+  margin-top: 3em;
+  padding: 12px 16px;
+  border-radius: 6px;
+  background: #eff1f3;
+  font-size: 0.85em;
+  color: #59636e;
+}
+@media (prefers-color-scheme: dark) {
+  .note { background: #161b22; color: #8b949e; }
+}
+</style>
+</head>
+<body>
+<h1 id="m15-tsf-itextstoreacp">M15: text_input を TSF <code>ITextStoreACP</code> として OS IME に公開 (完了 2026-06-01)</h1>
+
+<h2 id="context">Context — なぜ</h2>
+<p><code>rtry</code> (<code>F:\dev\rtry</code>) は user 自作の <strong>Windows TSF IME (Try-Code)</strong>。
+focus 中アプリの context に対し <code>GetSelection → Collapse(TF_ANCHOR_START) → ShiftStart(-10) →
+GetText</code> で <strong>カーソル前テキストを読み</strong> まぜ書き変換する。winit/wgpu の自前描画
+ウィンドウは legacy (非 TSF) app なので msctf の CUAS 互換ストアが任意 range の <code>GetText</code> を
+返せず、rtry の <code>GetText</code> が空 = まぜ書きが動かなかった。winit は <code>WM_IME_REQUEST</code> も
+未処理なので MS-IME 再変換も無反応だった。</p>
+<p><strong>結論</strong>: gui_01 platform 層に <strong>TSF <code>ITextStoreACP</code> document store を 1 つ実装</strong>
+すれば、rtry・MS-IME・ATOK 全 TIP に対し GetText / 再変換 / 候補位置 / document feed が一括で通る。
+Windows 限定 (既存 IME workaround も Windows 限定)。</p>
+
+<h2 id="architecture">アーキテクチャ</h2>
+<h3>モジュール (<code>crates/platform/src/</code>)</h3>
+<ul>
+<li><code>acp_map.rs</code> — UTF-16 ACP ⇔ UTF-8 byte の純粋マッピング (サロゲート/CJK/emoji)。全 OS で単体テスト。</li>
+<li><code>text_document.rs</code> — 中立型 <code>TextDocument</code> / <code>ImeTextEdit</code> / <code>RectPx</code>。</li>
+<li><code>tsf/doc_state.rs</code> — <code>DocState</code>: キャッシュ snapshot + 編集キュー + echo 抑制 diff (COM 非依存・単体テスト)。</li>
+<li><code>tsf/text_store.rs</code> — <code>#[implement(ITextStoreACP)] DocumentStore</code> (薄い COM shim)。</li>
+<li><code>tsf/thread_mgr.rs</code> — <code>TsfManager</code>: CoInitialize(STA) → ThreadMgr Activate → Context → Push → <code>AssociateFocus</code>。</li>
+</ul>
+<p>実装するのは <code>ITextStoreACP</code> ストアのみ。msctf が <code>ITfRange</code>/<code>ITfContext</code>/view を合成し、
+rtry の <code>ShiftStart</code>/<code>GetText</code>/<code>SetText</code>/<code>GetTextExt</code> を我々の ACP メソッドに翻訳する。</p>
+
+<h3>immediate-mode ↔ 長命 store の同期</h3>
+<p>IME は <code>ITextStoreACP</code> をメッセージポンプ中の任意タイミングで同期呼び出しするが、
+<code>text_input</code> は <code>frame()</code> 中にしか存在しない。<code>DocState</code> がキャッシュ snapshot を保持し:</p>
+<ul>
+<li><strong>publish (UI→store)</strong>: focus 中 <code>text_input</code> が毎フレーム <code>Ui::publish_text_document(text, sel, caret)</code>
+→ <code>frame()</code> 末で <code>WindowBackend::set_text_input_document</code> に flush (cursor flush と同じ transient 経路)。</li>
+<li><strong>drain (store→UI)</strong>: IME の <code>SetText</code>/<code>InsertTextAtSelection</code> は byte 空間の
+<code>ImeTextEdit</code> をキューに積む → 次フレーム頭で <code>ImeEvent::ReplaceRange</code> / <code>SetSelection</code> に
+変換して <code>text_input</code> が <code>replace_range(min..max, new)</code> 不変条件で適用。</li>
+<li><strong>echo 抑制</strong>: IME 自身が最後に set した値 (<code>last_ime_*</code>) を覚え、widget が echo back する間は
+<code>OnTextChange</code>/<code>OnSelectionChange</code> を抑制 (通知ストーム防止)。</li>
+</ul>
+<p>caller boilerplate ゼロ: 既存の「app が <code>ime_request()</code> で <code>set_ime_allowed</code> を駆動」 contract は不変
+(TSF は純粋に additive)。daw_01 は無改修で TSF を得る。</p>
+
+<h2 id="traps">既知の罠 (実機で踏んだ)</h2>
+<ul>
+<li><strong><code>AssociateFocus</code> 必須 (<code>SetFocus</code> だけでは不可)</strong>: <code>SetFocus(doc_mgr)</code> は thread の
+focus doc を設定するが <strong>document を HWND に束縛しない</strong>。window が OS focus を得ると msctf は
+CUAS の既定 document を使い、TIP の編集が我々の store に届かない (症状: rtry ログで <code>ShiftStart(-10)
+shifted=0</code> / <code>TSF read failed, using postbuf fallback</code>、変換が postbuf の backspace 再現にズレる)。
+<code>ITfThreadMgr::AssociateFocus(hwnd, doc_mgr)</code> で束縛して解決。</li>
+<li><strong>winit はデフォルト IME 無効</strong>: 生成時 <code>set_ime_allowed(window, false)</code> される。focus 中に
+app が <code>set_ime_allowed(true)</code> を呼ばないと IME を ON にできない (TSF doc focus だけでは不足)。</li>
+<li><strong>STA は winit が保証</strong>: winit が <code>OleInitialize</code> で event loop スレッドを STA 化するので、
+<code>CoInitializeEx(APARTMENTTHREADED)</code> は <code>S_FALSE</code> (既に STA) を返す = 正常。<code>RPC_E_CHANGED_MODE</code>
+時のみ TSF 無効化 + IMM fallback。</li>
+<li><strong><code>AcpMap::default()</code> underflow</strong>: <code>#[derive(Default)]</code> だと <code>Vec</code> が空になり
+<code>len16()</code> の <code>len()-1</code> が underflow panic (<code>DocState::new()</code> が踏む)。Default を <code>build("")</code> 相当
+(sentinel <code>[0]</code>) に手実装 + <code>saturating_sub</code> 防御。<strong>invariant 型は Default/空構築もテストする</strong>。</li>
+<li><strong>COM shim の lint</strong>: windows API の wildcard import / <code>#[implement]</code> マクロ生成 (<code>inline_always</code>) /
+ACP i32 cast / out-param raw pointer は不可避 → COM module 単位で <code>#![allow(...)]</code>。</li>
+<li><strong>非 Send 維持</strong>: TSF COM は STA / Rc 保持で非 Send。<code>WinitWindow</code> (Send 要求) に持たせず
+UI スレッド thread-local (<code>TsfSlot</code>: Untried/Failed/Active) に置く。</li>
+</ul>
+
+<h2 id="verification">検証</h2>
+<ul>
+<li>自動: <code>cargo test</code> (AcpMap/DocState の純粋ロジック、surrogate 往復、storm 抑制、<code>ReplaceRange</code> 適用)、
+<code>cargo clippy --workspace --tests -- -D warnings</code> green。</li>
+<li>実機 (rtry 有効化、<code>examples/text_input_ime</code>): 「ねこ」+ <code>fj</code> → 「猫」。rtry ログで
+<code>ShiftStart(-10) shifted=-2</code> / <code>text before cursor = 'ねこ'</code> (postbuf fallback 不使用)、gui_01 ログで
+<code>GetText -> 'ねこ'</code> → <code>SetText [0,2)='猫'</code> → widget <code>working='猫'</code> の完全往復を確認。</li>
+</ul>
+
+<h2 id="todo">残作業</h2>
+<ul>
+<li>composition の下線表示 (現状まぜ書き中テキストは通常文字として表示、機能は完結)。</li>
+<li><code>GetACPFromPoint</code> 逆 hit-test (マウス再変換 / 手書き、優先度低)。</li>
+<li><code>mixer</code>/<code>piano_roll</code> の <code>ime_enabled</code> boilerplate を library 吸収する案 (daw_01 が同 contract を持つため要調整)。</li>
+</ul>
+
+<p class="note">設計の元 plan は session の plan ファイル、 phase 別知見は <code>~/.claude/projects/F--dev-gui-01/memory/</code>
+(<code>project_rtry_tsf_ime</code>) を参照。</p>
+</body>
+</html>

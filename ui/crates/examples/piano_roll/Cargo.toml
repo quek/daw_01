@@ -1,0 +1,20 @@
+[package]
+name = "daw-ui-example-piano-roll"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "piano_roll"
+path = "src/main.rs"
+
+[dependencies]
+daw-ui-platform.workspace = true
+daw-ui-renderer.workspace = true
+daw-ui-core.workspace = true
+winit = "0.30.13"

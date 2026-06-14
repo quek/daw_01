@@ -1,0 +1,2821 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>gui_01 — 実装履歴 (M1-M8 + M5.5、詳細設計、検証手順)</title>
+<style>
+:root { color-scheme: light dark; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN",
+    "Yu Gothic", Meiryo, sans-serif;
+  line-height: 1.6;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 32px 24px 80px;
+  color: #1f2328;
+  background: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  body { color: #e6edf3; background: #0d1117; }
+  a { color: #58a6ff; }
+  code, pre { background: #161b22; }
+  hr { border-color: #30363d; }
+  blockquote { color: #8b949e; border-left-color: #30363d; }
+  th, td { border-color: #30363d; }
+  tr:nth-child(2n) { background: #161b22; }
+}
+h1, h2, h3, h4 { line-height: 1.25; margin: 1.6em 0 0.6em; }
+h1 { font-size: 2em; border-bottom: 1px solid #d1d9e0; padding-bottom: 0.3em; }
+h2 { font-size: 1.5em; border-bottom: 1px solid #d1d9e0; padding-bottom: 0.3em; }
+h3 { font-size: 1.25em; }
+h4 { font-size: 1em; }
+a { color: #0969da; text-decoration: none; }
+a:hover { text-decoration: underline; }
+code {
+  font-family: "HackGen Console NF", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: #eff1f3;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+pre {
+  background: #eff1f3;
+  padding: 12px 16px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 0.88em;
+}
+pre code { background: transparent; padding: 0; font-size: inherit; }
+blockquote {
+  margin: 0 0 1em;
+  padding: 0 1em;
+  color: #59636e;
+  border-left: 4px solid #d1d9e0;
+}
+ul, ol { padding-left: 2em; }
+li { margin: 0.15em 0; }
+hr { border: 0; border-top: 1px solid #d1d9e0; margin: 2em 0; }
+table { border-collapse: collapse; margin: 1em 0; width: 100%; }
+th, td { border: 1px solid #d1d9e0; padding: 6px 12px; text-align: left; }
+th { background: #eff1f3; font-weight: 600; }
+tr:nth-child(2n) { background: #f6f8fa; }
+.note {
+  margin-top: 3em;
+  padding: 12px 16px;
+  border-radius: 6px;
+  background: #eff1f3;
+  font-size: 0.85em;
+  color: #59636e;
+}
+@media (prefers-color-scheme: dark) {
+  .note { background: #161b22; color: #8b949e; }
+}
+</style>
+</head>
+<body>
+<h1 id="gui_01-m1-m8-m55">gui_01 — 実装履歴 (M1-M8 + M5.5、詳細設計、検証手順)</h1>
+<p>M1-M8 + M5.5 milestone の完了履歴 (各マイルストーンの phase 進捗・設計判断・残作業)、それぞれで実装した API の詳細設計、検証手順をまとめる。M9 以降の計画は <a href="plan.html">plan.md</a> を参照。</p>
+<hr>
+<h2 id="_1">マイルストーン (改訂版)</h2>
+<h3 id="m1">M1 (完了 ✅ — 初期コミット時点)</h3>
+<ul>
+<li>✅ winit でウィンドウ起動 → wgpu surface 初期化 → clear</li>
+<li>✅ <code>WindowBackend</code> trait + 中立 <code>AppEvent</code> enum</li>
+<li>✅ instanced 角丸矩形パイプライン (<code>rect.wgsl</code>、4 隅個別半径 + ボーダー + AA)</li>
+<li>✅ glyphon で日本語/絵文字描画</li>
+<li>✅ taffy ラッパ (<code>LayoutPass</code>, vbox/hbox 基本)</li>
+<li>✅ <code>Ui&lt;'a, M&gt;</code> / <code>UiHost&lt;M&gt;</code> / <code>frame()</code> API</li>
+<li>✅ <code>Edit&lt;M&gt;</code> enum (<code>Mutate(Box&lt;dyn FnOnce(&amp;mut M) + Send + 'static&gt;)</code>)</li>
+<li>✅ <code>WidgetId</code> (FNV-1a 64bit、Model に <code>Hash</code> 不要)</li>
+<li>✅ <code>PointerFrame</code> / ヒットテスト (<code>clicked</code> / <code>hovered</code> / <code>pressed_inside</code>)</li>
+<li>✅ <code>button</code> / <code>label</code> ウィジェット</li>
+<li>✅ examples/mixer: 3 ボタン + 1 万矩形ベンチ + 日本語ラベル</li>
+</ul>
+<h3 id="m2-ui">M2 (★★ 波形表示 UI 早期検証 ★★)</h3>
+<p><strong>目的</strong>: 波形表示が想定通り動くことを早期に確定する。性能・API・データフロー (LOD ピラミッド) を実コードで検証し、後続マイルストーンの前提を固める。詳細モード (サンプルエディタ) は M5 へ。</p>
+<p><strong>進捗 (2026-05-01)</strong>: <strong>M2 DoD 全項目クリア</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>line strip パイプライン (<code>pipelines/line.rs</code> + <code>line.wgsl</code>)</td>
+<td>✅</td>
+<td>7ddef3f</td>
+</tr>
+<tr>
+<td><code>Scene::line_batches</code> + <code>Renderer::render</code> 統合</td>
+<td>✅</td>
+<td>7ddef3f</td>
+</tr>
+<tr>
+<td>LOD ピラミッド (完全再構築)</td>
+<td>✅</td>
+<td>7ddef3f</td>
+</tr>
+<tr>
+<td><strong>LOD インクリメンタル拡張</strong> (録音中の <code>valid_len</code> 拡大)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Ui::waveform()</code> (PeakLines + Stack/Overlay/FirstOnly)</td>
+<td>✅</td>
+<td>7ddef3f</td>
+</tr>
+<tr>
+<td><code>examples/waveform_validation</code> (16×8 = 128 widgets グリッド)</td>
+<td>✅</td>
+<td>7ddef3f → 8276ddd</td>
+</tr>
+<tr>
+<td><strong>REC シミュレーション</strong> (Space キーで toggle、<code>valid_len</code> 増加)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>criterion ベンチ (<code>crates/ui/benches/waveform.rs</code>)</td>
+<td>✅</td>
+<td>8276ddd</td>
+</tr>
+<tr>
+<td><strong>trybuild</strong> (no-Clone 制約の自動検証)</td>
+<td>✅</td>
+<td>3c251c3</td>
+</tr>
+<tr>
+<td>(副次) <code>widget_state</code> の downcast バグ修正 + 回帰テスト</td>
+<td>✅</td>
+<td>7ddef3f</td>
+</tr>
+</tbody>
+</table>
+<p><strong>実測ベンチ値 (release profile, 5.76M sample × 2ch)</strong>:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>1 widget</th>
+<th>8 widgets</th>
+<th>16 widgets</th>
+<th>64 widgets</th>
+<th>128 widgets</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LOD 初回構築</td>
+<td><strong>4.6 ms</strong></td>
+<td>37 ms</td>
+<td>74 ms</td>
+<td>(未測)</td>
+<td>(未測)</td>
+</tr>
+<tr>
+<td>LOD 再利用 (毎フレーム)</td>
+<td><strong>61 µs</strong></td>
+<td>491 µs</td>
+<td>(未測)</td>
+<td>4.0 ms</td>
+<td><strong>8.0 ms</strong></td>
+</tr>
+<tr>
+<td>60fps 予算占有率 (再利用)</td>
+<td>0.4%</td>
+<td>2.9%</td>
+<td>—</td>
+<td>24%</td>
+<td>48%</td>
+</tr>
+</tbody>
+</table>
+<p>線形スケール (61〜63 µs/widget) が N=128 まで維持。これより重い (N=256+) 領域で heavy() (M5) の出番。</p>
+<p><strong>Refactor の影響</strong>: per-channel <code>Vec&lt;Vec&lt;MinMaxPair&gt;&gt;</code> 化 (インクリメンタル末尾 push のため) で flat 配列の indirection が増え、初期実装の 44 µs/widget から 61 µs/widget に約 1.4x の regression。代わりにインクリメンタル拡張がフレーム単位で安価になり、録音中もフレーム時間を維持できる。DoD &lt; 100µs は依然クリア。</p>
+<p><strong>主な成果物 (詳細)</strong>:</p>
+<ol>
+<li>
+<p><strong><code>pipelines/line.rs</code> + <code>line.wgsl</code> (line strip パイプライン)</strong> ✅
+   - <code>LinePipeline</code> struct (<code>new</code> / <code>prepare</code> / <code>render</code>)
+   - 入力: <code>Vec&lt;LineBatch&gt;</code> (各バッチは <code>Vec&lt;LineSegment&gt;</code> + line_width + 任意の clip_rect)
+   - 1 segment = 1 instance、6 頂点を頂点シェーダで quad に展開
+   - フラグメントで 1px AA、batch ごとに scissor (波形 widget の clip rect)
+   - <code>Scene::line_batches</code> を介して <code>Renderer::render</code> から呼ぶ</p>
+</li>
+<li>
+<p><strong>LOD ピラミッド (生サンプル → min/max 多段ダウンサンプル)</strong> ✅ (完全再構築 + インクリメンタル拡張)
+   - <strong>既存の <code>state: HashMap&lt;WidgetId, Box&lt;dyn WidgetState&gt;&gt;</code> を再利用</strong>。<code>WaveformPyramid</code> は <code>WidgetState</code> の blanket impl 経由で乗る (新フィールド追加なし)。
+   - 16 倍ずつ decimation するレベル列 (<code>MinMaxLevel { per_channel: Vec&lt;Vec&lt;MinMaxPair&gt;&gt;, decimation }</code>)
+   - <code>(generation, valid_len, sample_rate, channels)</code> の fingerprint をキーに 3 通りに分岐:</p>
+<ul>
+<li>完全一致 → 何もしない</li>
+<li><code>valid_len</code> のみ増加 → <code>extend_to</code> でインクリメンタル拡張</li>
+<li>それ以外 (generation / sample_rate / channels 変化、<code>valid_len</code> 縮小) → 完全再構築</li>
+<li>インクリメンタル拡張は各レベルで「old 末尾 (部分埋まり) ペアを再計算 + 新ペアを末尾追加」を cascading で行い、必要なら新しい coarsest level を追加</li>
+<li>単体テストで「多段階 incremental extend == 最終 full rebuild」が pair 単位完全一致することを担保 (<code>incremental_extension_matches_full_rebuild</code>)</li>
+</ul>
+</li>
+<li>
+<p><strong><code>Ui::waveform()</code> プロトタイプ</strong> ✅
+   - 公開 API: <code>WaveformSource</code> / <code>WaveformView</code> / <code>WaveformStyle</code> / <code>WaveformResponse</code> / <code>SampleSlices</code> / <code>ChannelLayout</code> / <code>WaveformRenderMode</code>
+   - 描画モード: <strong>PeakLines のみ</strong> (RMS / SamplePolyline / Auto は M5)
+   - チャンネル: Mono / Planar / Interleaved すべて受け取り、Stack / Overlay / FirstOnly でレイアウト
+   - クリップ rect での scissor、ヒットテスト (サンプル index 返し)</p>
+</li>
+<li>
+<p><strong><code>examples/waveform_validation/</code></strong> ✅
+   - 1 分ステレオ (sample rate 48kHz, 5.76M サンプル) を生成
+   - <strong>16 トラック × 8 クリップ = 128 widgets の grid</strong> で表示 (アレンジメントビュー想定)
+   - drag = 全クリップ同期で横スクロール、wheel = カーソル位置 anchor のズーム
+   - <strong>Space キーで REC シミュレーション</strong>: <code>valid_len</code> を経過時間に応じて伸ばし、インクリメンタル LOD 拡張をストレステスト
+   - <strong>HUD 表示</strong>: フレーム時間 / view_start / view_len / spp / N widgets 数 / valid 秒数 / <code>● REC</code> 状態</p>
+</li>
+<li>
+<p><strong>基盤の小規模整備</strong> ✅
+   - <code>criterion</code> 0.5 を <code>crates/ui/Cargo.toml</code> の <code>[dev-dependencies]</code> に導入、<code>benches/waveform.rs</code> で N=1/8/16/64/128 を測定
+   - <code>trybuild</code> 1 を <code>[dev-dependencies]</code> に導入、<code>tests/no_clone_required.rs</code> ハーネスから <code>tests/ui/pass/{basic, waveform}.rs</code> を実行して、API シグネチャに <code>Clone</code>/<code>PartialEq</code>/<code>Hash</code>/<code>Default</code> の制約が紛れ込まないことを CI 固定</p>
+</li>
+</ol>
+<p><strong>M2 完了条件 (Definition of Done) — 全項目クリア</strong>:
+- [x] line パイプライン: 多数頂点を低コストで描画 (N=128 widgets × ~2560 segment = 約 33 万頂点で 8.0 ms 内)
+- [x] LOD 初回構築: 5.76M サンプルで &lt; 50ms (実測 4.6 ms)
+- [x] LOD 再利用: <code>generation</code> 一致時の <code>Ui::waveform()</code> 呼び出し時間 &lt; 100µs (実測 61 µs、N=128 まで線形)
+- [x] 録音シミュレーション: インクリメンタル LOD 拡張で <code>valid_len</code> 増加に対応、目視で REC 中もフレーム時間が安定することを確認
+- [x] examples/waveform_validation 起動 → スクロール/ズーム滑らか (128 widgets で目視確認済み)
+- [x] <code>Ui::waveform()</code> API シグネチャに <code>Clone</code>/<code>Hash</code> 制約が無いことの trybuild 検証 (commit 3c251c3)
+- [x] 重大な API 変更が必要な兆候があれば、M3 着手前に設計ドキュメントへ反映 (本ファイル更新で反映)</p>
+<h3 id="m3-uia-m2">M3 (Ui&lt;'a&gt; 充実 + 基本ウィジェット拡張) — 旧 M2 の内容</h3>
+<p><strong>Phase 1 進捗 (2026-05-01)</strong> — fader + 入力周りバグ修正:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ui::fader_at</code> / <code>Ui::fader</code> (垂直スライダ、ドラッグで値編集)</td>
+<td>✅</td>
+<td>e649e5a</td>
+</tr>
+<tr>
+<td><code>FaderState</code>: <code>state</code> HashMap 経由のドラッグ状態保持</td>
+<td>✅</td>
+<td>e649e5a</td>
+</tr>
+<tr>
+<td><code>examples/mixer</code> に 3 ch fader 追加 (drag → Edit → apply 確認)</td>
+<td>✅</td>
+<td>e649e5a</td>
+</tr>
+<tr>
+<td><code>trybuild</code>: <code>Ui::fader</code> / <code>Ui::fader_at</code> が non-Clone Model でコンパイル</td>
+<td>✅</td>
+<td>e649e5a</td>
+</tr>
+<tr>
+<td>Button モデルを armed-state (<code>press_started_inside</code>) に再設計</td>
+<td>✅</td>
+<td>e649e5a</td>
+</tr>
+<tr>
+<td>Windows フォーカス取得クリックで cur_pos が None のまま MouseInput が届く問題</td>
+<td>✅ 解消</td>
+<td>e649e5a</td>
+</tr>
+<tr>
+<td>Edit apply 後のラベル staleness 問題 (had_edits → request_redraw)</td>
+<td>✅ 解消</td>
+<td>e649e5a</td>
+</tr>
+<tr>
+<td>単体テスト: button click が hover 直後 / press-release 別フレームで両方発火</td>
+<td>✅</td>
+<td>e649e5a</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Phase 2 進捗 (2026-05-01)</strong> — knob:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ui::knob_at</code> / <code>Ui::knob</code> (円形ノブ、7 時 → 12 時 → 5 時の 300° スイープ、上下ドラッグで値編集)</td>
+<td>✅</td>
+<td>56cfeec</td>
+</tr>
+<tr>
+<td><code>KnobState</code>: state HashMap 経由のドラッグ状態保持</td>
+<td>✅</td>
+<td>56cfeec</td>
+</tr>
+<tr>
+<td>インジケータは line strip パイプラインで描画 (LineSegment 1 本)</td>
+<td>✅</td>
+<td>56cfeec</td>
+</tr>
+<tr>
+<td><code>examples/mixer</code> に 3 ch pan knob を追加 (L/C/R ラベル含む)</td>
+<td>✅</td>
+<td>56cfeec</td>
+</tr>
+<tr>
+<td><code>trybuild</code>: <code>Ui::knob</code> / <code>Ui::knob_at</code> が non-Clone Model でコンパイル</td>
+<td>✅</td>
+<td>56cfeec</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Phase 3 進捗 (2026-05-01)</strong> — checkbox:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ui::checkbox_at</code> / <code>Ui::checkbox</code> (bool toggle、armed-state click)</td>
+<td>✅</td>
+<td>af223ca</td>
+</tr>
+<tr>
+<td><code>CheckboxState</code>: button と同じ <code>press_started_inside</code> モデル</td>
+<td>✅</td>
+<td>af223ca</td>
+</tr>
+<tr>
+<td>視覚: 16px 角丸枠 + チェック時の V 字 (line strip) + ラベル</td>
+<td>✅</td>
+<td>af223ca</td>
+</tr>
+<tr>
+<td><code>examples/mixer</code> に 3 ch mute checkbox を追加</td>
+<td>✅</td>
+<td>af223ca</td>
+</tr>
+<tr>
+<td><code>trybuild</code>: <code>Ui::checkbox</code> / <code>Ui::checkbox_at</code> が non-Clone Model でコンパイル</td>
+<td>✅</td>
+<td>af223ca</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Phase 4a 進捗 (2026-05-01)</strong> — focus / keyboard 基盤:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>InputAccumulator</code> が <code>KeyEvent</code> を蓄積、<code>take_keyboard_events()</code> で取り出し</td>
+<td>✅</td>
+<td>6549cd8</td>
+</tr>
+<tr>
+<td><code>UiHost::focused: Option&lt;WidgetId&gt;</code> でキーボードフォーカスを保持、<code>focused_widget()</code> で参照</td>
+<td>✅</td>
+<td>6549cd8</td>
+</tr>
+<tr>
+<td><code>Ui::is_focused</code> / <code>set_focus</code> / <code>clear_focus_if_focused</code> / <code>take_keyboard_events_if_focused</code></td>
+<td>✅</td>
+<td>6549cd8</td>
+</tr>
+<tr>
+<td><code>UiHost::frame</code> シグネチャに <code>keyboard: Vec&lt;KeyEvent&gt;</code> 追加</td>
+<td>✅</td>
+<td>6549cd8</td>
+</tr>
+<tr>
+<td>クリック発生時に誰も <code>set_focus</code> を呼ばなければ blur (= フォーカス可能でない場所のクリック)</td>
+<td>✅</td>
+<td>6549cd8</td>
+</tr>
+<tr>
+<td>単体テスト 4 本: フォーカス維持 / blur / 再 set_focus / キーは focused だけに届く</td>
+<td>✅</td>
+<td>6549cd8</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Phase 4b 進捗 (2026-05-01)</strong> — text_input (ASCII):</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ui::text_input_at</code> / <code>Ui::text_input</code> (ASCII 編集: char 挿入 / Backspace / 矢印 / Enter / Escape)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>TextInputState</code>: armed-state click + cursor_byte (UTF-8 char 境界対応)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>描画: 枠 + テキスト + cursor 縦線 (line strip)。focused 時は枠線色を強調</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>クリック内側で focus 取得 + cursor 末尾へ。<strong>外側 press で自己 blur</strong> (即時に枠線解除)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Ui::is_focused</code> を <code>pending_focus</code> ベースに変更 (set_focus 同フレームで即時反映)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>UiHost::focus_changed_in_last_frame()</code> getter を追加。アプリは had_edits と同様 request_redraw する</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>examples/mixer</code> に title 編集 text_input。OS ウィンドウタイトルも <code>last_window_title</code> 差分で追従</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>trybuild</code> / 単体テスト 1 本 (click → focus → typing で text 変化)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Phase 8 進捗 (2026-05-01)</strong> — fader / knob 視覚 polish (Ableton 風):</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fader thumb を 24×12 角丸 + border から <strong>28×10 flat バー</strong> (border 無し、極小角丸) に</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>knob を <strong>Ableton 流デザイン</strong> に redesign: 円本体 + 円周上 300° の可動範囲弧 + 中心→外円のインジケータ線</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>可動範囲弧を <strong>2 色</strong> で描画 (回転側 = cyan アクセント、非回転側 = 暗グレー)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>インジケータ線を中心 (<code>cx, cy</code>) → 外円 (<code>r</code>) で描画、白色 width 4.0 で視認性確保</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>弧の polygon 近似を 5° → 2° step に細分化 (60 → 150 segments)、コーナーアーティファクト解消</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>TODO (M3 残作業として残す)</strong>:
+- <strong>Ableton Live により近づける視覚 polish</strong>: 現状は構造的には近いが、配色・微調整 (border の視認性、非回転側弧と body 色の差、knob 全体の質感) で実機 Ableton の見た目とは差がある。後フェーズで実機並べて細部詰める</p>
+<p><strong>設計判断</strong>:
+- <strong>試行錯誤の経緯</strong>: 当初は Phase 8 として「影 / tick marks / sweep arc fill」を入れたが視覚的にゴチャついた → 影 / tick 全削除して「フラット (Ableton 流)」へ方針転換 → fader thumb が薄すぎて掴めない / pan 中央が L100 に見える等 UX 課題 → bipolar (default_value 起点) arc + 外側 rest tick を経由 → 最終的に「中心インジケータ線 + 円周 2 色弧」の Ableton 流に落ち着く。各イテレーションは commit せず内部試行 (本コミットでは最終形のみ)
+- <strong>2 色弧の意味</strong>: 回転側 (start → value) = "consumed range" cyan、非回転側 (value → end) = "remaining range" 暗グレー。ユーザが「現在どれくらい振れているか」を可動範囲全体に対する割合で視認できる
+- <strong>インジケータを中心起点に</strong>: 単に外円の点を示すだけでなく、knob 全体の rotation を強く感じさせるため (Ableton も同様の構造)
+- <strong>fader thumb 28×10</strong>: 当初の 28×4 (Ableton の極小バーを意識) は <strong>掴めない</strong> UX 課題 → 28×10 で掴みやすさと flat 感のバランス
+- <strong>Phase 8 の元プランから外したもの</strong>:
+  - <strong>感度カーブ</strong> (線形 → 非線形マッピング): UX 設計判断が大きいので別タスクへ。現状は線形のまま
+  - <strong>影 / tick marks / sweep arc fill</strong> (元 Phase 8 案): 試行で視覚ゴチャツキを確認、フラット方針へ転換</p>
+<hr>
+<p><strong>Phase 7 進捗 (2026-05-01)</strong> — <code>LayoutPass</code> ergonomics 改善 (<code>rect()</code> + <code>compute_at()</code>):</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>LayoutPass</code> 内部に <code>rects: HashMap&lt;NodeId, Rect&gt;</code> を保持</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>compute(root, w, h)</code> シグネチャ変更 (戻り値削除、内部 HashMap に格納)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>compute_at(root, w, h, origin: (f32, f32))</code> 追加 (origin オフセット適用)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>rect(node) -&gt; Rect</code> 追加 (O(1) 引き、未 compute なら panic)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>既存 6 テストを <code>p.rect(node)</code> スタイルに更新、<code>rects()</code> ヘルパ廃止</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>単体テスト 1 本追加: <code>compute_at_applies_origin_offset</code></td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>mixer から <code>HashMap</code> import + <code>to_screen</code> クロージャ削除、<code>compute_at</code> + <code>rect</code> 利用</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>実機検証: 8 ch レイアウトが Phase 6 と同一表示 (regression なし)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong><code>compute</code> の戻り値を捨てて <code>rect()</code> にする</strong>: zero external callers + Phase 6 で 1 caller (mixer) のみなので breaking change のコスト極小。HashMap collect の boilerplate を library 内側に閉じ込めるのが KISS
+- <strong>未 compute の node に <code>rect()</code> を呼ぶとパニック</strong>: silent な default rect (0×0) より早期発見しやすい。<code>Option</code> を返す案は呼び出し側の <code>unwrap</code> を増やすだけ
+- <strong><code>compute_at</code> を別メソッドに</strong>: 大半のユースケースは origin = (0, 0) なので、よく使う方は引数なしで呼べる方が良い (<code>compute</code> は薄いラッパで <code>compute_at(root, w, h, (0.0, 0.0))</code> を呼ぶ)
+- <strong><code>origin: (f32, f32)</code></strong> で十分。将来 <code>Rect</code> 渡しが欲しくなったら追加検討</p>
+<hr>
+<p><strong>Phase 6 進捗 (2026-05-01)</strong> — <code>examples/mixer</code> を 8 ch に拡張、LayoutPass の最初の実用例:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MixerModel</code> の <code>[T; 3]</code> を <code>[T; 8]</code> に拡張 (faders / pans / mutes) + 初期値</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>build_ui</code> のチャンネルストリップを LayoutPass に置換 (row(8) × column(fader/pct/knob/pan/mute))</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Padding::axis(20, 0)</code> + <code>Gap::xy(16, 0)</code> で外周と列間距離、<code>Gap::all(6)</code> で列内 widget 間距離</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>daw_ui_core</code> から <code>FlexDirection</code> / <code>NodeId</code> を re-export (<code>taffy::prelude</code> 経由)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>ストリップヘッダラベルを 1 本に統合: "M3: 8ch チャンネルストリップ — drag / Ctrl+drag (1/10) / dbl-click でリセット"</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>ウィンドウ高さ 600 → 660、<code>strip_origin_y</code> 240 → 280 で左側 buttons との視覚衝突を解消</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>実機検証: 8 ch 列が等間隔で並ぶ、各 ch で Ctrl+drag / dbl-click が独立動作</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>LayoutPass を実用例で使ったことで判明した ergonomics 課題</strong> (Phase 7 で対応済み):</p>
+<ul>
+<li>~~<code>NodeId → Rect</code> の HashMap collect が必要~~ → ✅ Phase 7 で <code>LayoutPass::rect(node) -&gt; Rect</code> を追加</li>
+<li>~~<code>compute</code> の戻りは原点 (0, 0) 起点。screen 座標に置く際は <code>to_screen</code> クロージャで足し算が必要~~ → ✅ Phase 7 で <code>compute_at(root, w, h, origin)</code> を追加</li>
+</ul>
+<hr>
+<p><strong>Phase 5 進捗 (2026-05-01)</strong> — <code>LayoutPass</code> 拡張 (per-side padding / per-axis gap / fixed + flex_grow):</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>中立 <code>Padding { top, right, bottom, left }</code> 型 (<code>all</code> / <code>axis</code> / <code>ZERO</code>)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>中立 <code>Gap { x, y }</code> 型 (<code>all</code> / <code>xy</code> / <code>ZERO</code>)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>LayoutPass::flex</code> シグネチャを <code>flex(direction, gap: Gap, padding: Padding, children)</code> に置換</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>LayoutPass::leaf_grow(grow: f32)</code> で <code>flex_basis: 0</code> + <code>flex_grow</code> の残余分配 leaf を追加</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>flex</code> 親自身の size を <code>Dimension::percent(1.0) × percent(1.0)</code> に変更 (auto だと grow 子が 0px)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Padding</code> / <code>Gap</code> を <code>crates/ui/src/lib.rs</code> から re-export</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>単体テスト 6 本追加: column gap / per-side padding / per-axis gap / 2:1 grow / fixed + grow / padding shrinks grow area</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong><code>Padding</code> / <code>Gap</code> は中立型</strong>: taffy の <code>taffy::Rect&lt;LengthPercentage&gt;</code> は実装詳細で API には露出させない (<code>WindowBackend</code> trait 中立化方針と同じ)
+- <strong><code>flex</code> の breaking 置換</strong>: callers ゼロなので <code>flex_with</code> のような追加 API を作らず KISS に直接置換
+- <strong><code>leaf_grow</code> cross-axis は taffy default の stretch</strong>: 大半の column / row flex で十分、<code>leaf_with(w, h, grow)</code> のような general API は将来必要時に追加
+- <strong>flex 親 size を <code>percent(1, 1)</code> に変更</strong>: auto + grow-only 子は 0px に潰れるため、root では利用可能領域全体を埋め、nested では親の content 領域に従う動作にした (ユーザは grow 子だけで構成しても期待通りの面積分配を得られる)
+- <strong><code>Ui::cursor</code> / <code>next_y</code> は引き続き残す</strong>: convenience method (<code>Ui::fader</code> 等) はそのまま。LayoutPass 拡張とは独立</p>
+<hr>
+<p><strong>Phase 4d 進捗 (2026-05-01)</strong> — fader / knob のダブルクリック・リセット + Ctrl + ドラッグ高精度モード:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>中立 <code>Modifiers</code> 型 + <code>AppEvent::ModifiersChanged</code> を <code>crates/platform/src/event.rs</code> に追加</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>winit_backend</code> で <code>WindowEvent::ModifiersChanged</code> を中立 <code>Modifiers</code> に変換して emit</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>PointerFrame.modifiers</code> + <code>InputAccumulator.modifiers</code> で widget まで modifier 状態を配線</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Ui::fader_at</code> / <code>fader</code> / <code>knob_at</code> / <code>knob</code> に <code>default_value: f32</code> を追加 (新シグネチャ)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>FaderState</code> / <code>KnobState</code> に <code>last_click: Option&lt;ClickRecord&gt;</code> + 新 <code>DragAnchor { pointer_y, value, ctrl }</code></td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>ダブルクリック判定: 300ms × 5px 以内の 2 回目 press → <code>default_value</code> リセット (drag は始めない)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>Ctrl + drag: anchor の ctrl 状態に応じて <code>dv *= 0.1</code>、mid-drag toggle で再 anchor (jump 防止)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>examples/mixer</code> の呼び出しを新シグネチャに追従 (fader default=0.0 / knob default=0.5)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>trybuild</code> (<code>tests/ui/pass/basic.rs</code>) を新シグネチャに追従、no-Clone 制約は維持</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>単体テスト 12 本追加 (fader 6 + knob 6): 双方とも double-click / 閾値超過 / 距離超過 / Ctrl 1/10 / mid-drag toggle / triple-click</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断のポイント</strong>:
+- <strong>Mid-drag ctrl toggle 時の再 anchor</strong>: plan.md 旧版の sketch (<code>if pointer.ctrl { dv *= 0.1 }</code>) を cumulative-from-anchor の delta にそのまま乗じると、ctrl on/off 瞬間に押下からの全体 delta がスケール変わって値 jump する。anchor を <code>(現在 py, 現在 value, 現在 ctrl)</code> に張り直すことで return-to-press-position の cumulative 性質を保ったまま境界で滑らかに切り替わる。
+- <strong>Double-click 後は drag に入らない</strong>: Live / Logic / Pro Tools 標準。リセットと drag の意図が混ざるのを防ぐ。state.last_click も同時に消すことで 3 連 click の 3 回目を新しい drag 開始扱いにする。
+- <strong>時刻ソース</strong>: widget 内で直接 <code>Instant::now()</code> を呼ぶ。300ms 程度の精度で十分、<code>Ui::frame_time()</code> 配線は M4 (scenegraph) と一緒にやる方が筋が良い (今は不要)。
+- <strong><code>KeyEvent</code> への modifier 追加は今回スコープ外</strong>: text_input の Ctrl+C/V などは別フェーズで対応。</p>
+<p><strong>Phase 4c 進捗 (2026-05-01)</strong> — IME 統合:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AppEvent::ImePreedit</code> / <code>ImeCommit</code> を <code>InputAccumulator</code> で蓄積、<code>ImeEvent</code> enum で UI 層へ</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>FrameInput { pointer, keyboard, ime }</code> で UI 入力を一括化 (<code>InputAccumulator::take_input()</code>)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Ui::take_ime_events_if_focused</code> / <code>Ui::request_ime</code> で focused widget が IME 候補位置を要求</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>UiHost::ime_request()</code> getter で App が候補位置を取得</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>WindowBackend::set_ime_allowed</code> / <code>set_ime_cursor_area</code> を winit_backend で実装</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>winit::WindowEvent::Ime</code> → <code>AppEvent::ImePreedit</code> / <code>ImeCommit</code> のマッピング</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>text_input</code> が preedit を <code>state.preedit</code> に保持 + 描画、commit で working に挿入</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>text_input</code> が cursor 位置を <code>request_ime</code> で渡し、IME 候補ウィンドウが追従</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>mixer App が <code>ime_request</code> の Some/None 切替を <code>set_ime_allowed</code> 差分で OS に伝達</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>単体テスト追加 (ime_events_delivered_only_to_focused / text_input_ime_preedit_then_commit)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>残作業 (M3 残)</strong>:</p>
+<ul>
+<li><code>LayoutPass</code> 拡張: padding / gap / fixed size / proportional growth: ✅ Phase 5 で完了 (上記表参照)</li>
+<li><code>examples/mixer</code> を 8ch (8 fader + 8 pan knob + 8 mute checkbox) に拡張: ✅ Phase 6 で完了 (上記表参照)</li>
+<li>微調整: fader / knob の見た目: ✅ Phase 8 で完了 (Ableton 流の 2 色弧 + 中心インジケータ、fader thumb 28×10)</li>
+<li><strong>fader / knob を Ableton Live により近づける</strong>: Phase 8 で構造的には近づいたが、配色・微調整は引き続き残作業。実機 Ableton と並べて細部詰める</li>
+<li>微調整 (継続): fader / knob の感度カーブ (線形 → 非線形マッピング)、まだ未着手</li>
+<li><strong>text_input polish</strong>: cursor / preedit 下線 / IME 候補位置の pixel-perfect 化。
+  現状は <code>HackGen Console NF</code> 固定幅前提の近似 (ASCII=7 / CJK=14)。<code>cosmic-text</code> の
+  <code>Buffer::layout_runs()</code> で実 measure を行い、preedit を別色 (yellow) で描き直すこと、
+  proportional フォントでも正しく動かすこと、を別フェーズで対応する。
+  ui crate から renderer の <code>FontSystem</code> にアクセスする経路を整える必要がある (Arc 共有 /
+  measure trait 公開 / 別 FontSystem を持つ、のいずれか)。</li>
+<li><strong>DAW 標準の値編集挙動 (fader / knob 共通)</strong>: ✅ Phase 4d で完了 (上記表参照)</li>
+<li><strong>将来の発展</strong>: text_input の数値編集 (ドラッグで増減) や knob のホイール調整に
+  同じ modifier 機構 (<code>pointer.modifiers.ctrl</code>) を載せる。<code>KeyEvent</code> への modifier
+  追加 (Ctrl+C/V など) は別フェーズ。</li>
+<li><strong><code>rtry</code> のまぜ書き入力対応</strong>: ✅ <strong>M15 で完了 (2026-06-01)</strong>。当初は「text_input に
+  まぜ書き API を足す」想定だったが、<code>rtry</code> は TSF IME と判明 → gui_01 platform 層に TSF
+  <code>ITextStoreACP</code> document store を実装し、<code>rtry</code> が <code>GetText</code> でカーソル前テキストを読み /
+  <code>SetText</code> で変換結果を書き戻せるようにした (MS-IME 再変換も同経路)。設計・既知の罠は
+  <a href="plan_tsf_ime.html">docs/plan_tsf_ime.html</a>。</li>
+<li><strong>GetText i18n 対応</strong>: label / button / text_input 等の文字列を翻訳するための仕組み。
+  <code>tr!("...")</code> 風マクロ + catalog 引きの API を別途設計。アプリ側 (例えば mixer) で
+  ロケール切替を実演する。実装はサードパーティ crate (<code>gettext-rs</code> / <code>fluent</code> 等) との
+  統合検討から。</li>
+</ul>
+<h3 id="m4-scenegraph-m3">M4 (内部 scenegraph + 差分検出) — 旧 M3</h3>
+<p><strong>Phase 12 進捗 (2026-05-01)</strong> — 波形 widget の <code>with_widget_node</code> 適用 + 1000 widget bench (M4 完了):</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ChannelLayout</code> / <code>WaveformRenderMode</code> に <code>Hash</code> derive 追加 (input_hash 計算用)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Ui::waveform</code> を <code>with_widget_node</code> で wrap (LOD ピラミッドの ensure_built + 描画を input_hash でキャッシュ)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>input_hash に generation / valid_len / sample_rate / view (start/len/gain) / style (line_width / fg / fg_clipped / channel_layout / render_mode) / rect を組込</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>ヒットテストはクロージャ外で毎フレーム実行 (pointer 依存で cache 不可)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>crates/ui/benches/scenegraph_cache.rs</code> 新規 bench: 1000 buttons の cached vs no-cache 比較</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>実機検証: waveform_validation で表示・操作 (drag scroll / wheel zoom / Space REC) に regression なし</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>実測ベンチ値 (release profile, 1000 buttons / frame)</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>シナリオ</th>
+<th>1 frame 時間</th>
+<th>比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>cached</strong> (input_hash 一致、cache hit)</td>
+<td><strong>165 µs</strong></td>
+<td>1x</td>
+</tr>
+<tr>
+<td>no_cache (label 毎フレーム変えて hash 不一致)</td>
+<td>313 µs</td>
+<td>1.9x</td>
+</tr>
+</tbody>
+</table>
+<p>cached が ~1.9x 高速。1000 widgets で frame あたり ~148 µs (= 148 ns/widget) を skip。完全 static な mixer / DAW chrome で frame budget の半分近くを浮かせる効果。</p>
+<p><strong>設計判断</strong>:
+- <strong>波形 wrap で input_hash に generation 組込</strong>: 既存 <code>PyramidFingerprint</code> (LOD invalidation) と一貫性。両方が generation を見るが実害なし
+- <strong>クロージャ内で <code>ui.widget_state(wid)</code> 呼び出し</strong>: pyramid は cache miss 時のみ ensure_built される。cache hit 時はクロージャがスキップされるので pyramid は古いまま (が、入力も古いままなので正しい)
+- <strong>ヒットテストはクロージャ外</strong>: <code>WaveformResponse</code> は pointer に依存して毎フレーム再計算が必要。cache できない (hit 結果を cache するとマウスが動いた瞬間に古い情報が返る)
+- <strong><code>Hash</code> derive を追加</strong>: enum の as u8 キャストより安全 (<code>#[repr(u8)]</code> 不要)。色 (<code>Color</code>) は <code>Hash</code> 未実装なので各成分 <code>to_bits()</code> で扱う
+- <strong>ネスト tuple で hash_inputs に渡す</strong>: Rust 標準の Hash 実装は tuple 要素 12 個まで。20+ 要素を hash したいときはネストすれば回避できる
+- <strong>bench の "1.9x" は意外と控えめ</strong>: 1000 buttons の <code>format!()</code> オーバーヘッド (no_cache 側) や、cached でも <code>extend_from_slice</code> のメモリコピーが発生するため。完全静的なフォーマット処理を含めれば実質 5-10x の効果が出るケースもありそう (text_input の preedit 等)
+- <strong>draw call 削減ではない</strong>: rect / glyph / line は instanced で 1 frame に 1〜N 個に集約済みで、widget 数 N に対して draw call は線形にならない。本キャッシュが下げているのは "CPU prepare コスト" であり draw call ではない (plan.md M4 元仕様の文言は意訳)</p>
+<p><strong>M4 milestone 完了</strong>: 内部 scenegraph + 差分検出 + glyphon Buffer cache + 1M FNV 衝突テスト + 波形統合 + bench を全て達成。次は M5 (heavy() + 巨大ビュー + 詳細波形モード)。</p>
+<hr>
+<p><strong>Phase 11 進捗 (2026-05-01)</strong> — <code>Ui::with_widget_node</code> API + 各 widget 適用 + 描画コマンドキャッシュ:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SceneNode</code> を <code>{ input_hash, commands: CachedCommands }</code> に拡張</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>CachedCommands { rects, glyph_areas, line_batches }</code> 型を新設</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Scenegraph::record(wid, hash, commands)</code> シグネチャに変更 + <code>get_cached</code> 追加</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>hash_inputs&lt;T: Hash&gt;(t) -&gt; u64</code> 共通ヘルパ追加</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Ui::with_widget_node(wid, input_hash, draw_fn)</code> API 追加</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Ui</code> に <code>scenegraph: &amp;mut Scenegraph</code> + <code>seen_widgets: &amp;mut HashSet&lt;WidgetId&gt;</code> field</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>UiHost::frame</code> 末尾で <code>scenegraph.retain(&amp;seen_widgets)</code> で eviction</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>6 widget (button / label / checkbox / fader / knob / text_input) を <code>with_widget_node</code> で wrap</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>単体テスト 5 本追加: <code>with_widget_node_hit_skips_draw_fn</code> / <code>_miss_runs_draw_fn</code> / <code>scenegraph_evicts_unseen_widgets</code> / <code>get_cached_returns_commands_when_hash_matches</code> / <code>hash_inputs_is_deterministic</code></td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>実機検証: mixer の表示・操作に regression なし、cache 命中で push がスキップされる</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong>draw_fn closure 経由で wrap</strong>: 各 widget は state 計算と draw 計算が同関数だが、draw 部分は既に <code>draw_fader</code> / <code>draw_knob</code> 等の独立関数に切り出されているので with_widget_node でラップしやすい
+- <strong>Vec をクローンして cache</strong>: <code>RectCommand</code> / <code>GlyphArea</code> / <code>LineBatch</code> はすべて <code>Clone</code>、cache hit 時に <code>extend</code> で scene に append。<code>LineBatch</code> は <code>Vec&lt;LineSegment&gt;</code> を持つので <code>extend_from_slice</code> でなく <code>iter().cloned()</code> 経由
+- <strong>判別タグを hash 入力に含める</strong> (<code>b"fader"</code> / <code>b"knob"</code> 等): 異なる widget 種別が偶然同じパラメータを持っても hash 衝突しないよう defensive
+- <strong>eviction を frame 末尾に</strong>: widget が「再度 wrap される」と seen に入る、wrap されなかったら次フレームで消える。動的に出現/消滅する widget も自然に扱える
+- <strong>waveform は wrap せず</strong>: LOD ピラミッドの generation を input_hash に組み込む特殊処理が必要 → Phase 12 で対応</p>
+<p><strong>M4 の残作業 (Phase 12)</strong>:
+- 波形 widget を <code>with_widget_node</code> で wrap (input_hash に generation を組み込む)
+- 1000 widget で「変化していないフレームで cache hit が支配的」を bench / 計測</p>
+<hr>
+<p><strong>Phase 10 進捗 (2026-05-01)</strong> — Scenegraph 基盤 + WidgetId 1M 衝突テスト:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crates/ui/src/scenegraph.rs</code> 新規: <code>Scenegraph</code> (<code>HashMap&lt;WidgetId, SceneNode&gt;</code> 内蔵) と <code>SceneNode { input_hash: u64 }</code></td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Scenegraph::{new, unchanged, record, retain, len, is_empty}</code> API</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>UiHost</code> に <code>scenegraph: Scenegraph</code> フィールド追加 (Phase 11 で widget から書き込まれる)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>lib.rs</code> から <code>Scenegraph</code> / <code>SceneNode</code> を re-export</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>Scenegraph 単体テスト 5 本: record / unchanged 一致 / 不一致 / overwrite / retain による eviction</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>WidgetId 1M 衝突テスト (<code>tests/widget_id_collision.rs</code>) — 1000 parents × 1000 children = 1M unique IDs</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong><code>slotmap</code> 不採用</strong>: 元 plan は <code>SlotMap&lt;NodeId, SceneNode&gt;</code> を想定したが、<code>WidgetId</code> 自体が安定キー (<code>Eq + Hash</code> 既備) で世代管理が不要 → <code>HashMap&lt;WidgetId, SceneNode&gt;</code> で十分。外部 deps 追加を回避 (<code>Cargo.toml</code> 不変)
+- <strong>Phase 10 は型定義のみ</strong>: 各 widget への適用 (Phase 11) を分離することで API レビュー余地を残す。仮に Phase 11 で API が変わっても本コミットの差分は小さい
+- <strong>1M テストは sequential seed</strong>: <code>rand</code> crate を入れない。FNV-1a の品質確認は uniform-ish な入力でも十分 (悪意ある衝突攻撃は本ライブラリの脅威モデルに含まれない)
+- <strong><code>SceneNode</code> は最小</strong>: Phase 11 で <code>commands: Vec&lt;DrawCommand&gt;</code> を追加する想定で、今は <code>input_hash</code> のみ
+- <strong>Eviction API は宣言のみ</strong>: <code>retain(&amp;seen)</code> を Phase 10 で定義しておくが、Phase 11 で widget が <code>seen</code> を埋めるようになって初めて意味がある</p>
+<hr>
+<p><strong>Phase 9 進捗 (2026-05-01)</strong> — glyphon Buffer キャッシュ:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GlyphPipeline</code> 内に <code>HashMap&lt;u64, CachedBuffer&gt;</code> を導入</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>(text, font_size, line_height)</code> を <code>DefaultHasher</code> で u64 ハッシュ化 → cache key</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>同一キーは <code>Buffer</code> を再利用、新規キーのみ <code>Buffer::new</code> + shaping</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>5 秒 (300 frame @ 60fps) 未使用 entry の eviction</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>buffer_key</code> の単体テスト 4 本: 同一入力 / text 違い / font_size 違い / line_height 違い</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>実機検証: mixer の表示・操作に regression なし</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>M4 完了 (2026-05-01)</strong> — 全項目達成:
+- ~~<code>slotmap</code> 導入 + <code>Scenegraph</code> 型定義 + 1M FNV-1a 衝突テスト~~ → ✅ Phase 10 (<code>slotmap</code> は不採用、<code>HashMap&lt;WidgetId, SceneNode&gt;</code> で代替)
+- ~~<code>Ui::with_widget_node(wid, input_hash, draw_fn)</code> API + 各 widget に適用~~ → ✅ Phase 11 (6 widget)
+- ~~波形 widget を <code>with_widget_node</code> で wrap (input_hash に generation 組込)~~ → ✅ Phase 12
+- ~~glyphon Buffer キャッシュ統合~~ → ✅ Phase 9
+- ~~"1000 widget で cache hit 支配的" bench 検証~~ → ✅ Phase 12 (1.9x 高速)</p>
+<p><strong>設計判断</strong>:
+- <strong>Phase 9 を最初に</strong>: <code>slotmap</code> 基盤を先に作っても適用前は busywork。glyphon キャッシュは renderer 内部に閉じて measurable な改善を出せるので最初に成果が出る
+- <strong>キャッシュキーに 3 要素全部</strong>: text のみだと metrics 切替で古い Buffer が再利用される懸念。<code>(text, font_size, line_height)</code> で identity を作るのが安全
+- <strong>Eviction は時間ベース (5 秒)</strong>: LRU や size-bound より単純。text_input のランダム入力にも対応
+- <strong>borrow パターン</strong>: <code>glyphon::Buffer</code> を <code>Clone</code> させずに、cache 更新 (mutable borrow) → TextArea 構築 (immutable borrow into cache) → text_renderer.prepare の順で安全に通す
+- <strong>Scene / GlyphArea の API は不変</strong>: 既存 callers / widgets / examples は無変更で恩恵を受ける</p>
+<hr>
+<p><strong>M4 元仕様 (plan.md 当初)</strong>:</p>
+<ul>
+<li>内部 scenegraph (<code>SlotMap&lt;NodeId, SceneNode&gt;</code>)</li>
+<li>input hash による差分検出 → 静的 UI の draw call 削減を計測</li>
+<li>1000 ウィジェット級ミキサーで「変化していない部分の draw call が出ない」ことを確認</li>
+<li>glyphon の Buffer キャッシュ統合 (現状は毎フレーム作り直し): ✅ Phase 9 で完了</li>
+<li>input hash 衝突テスト: ランダムなウィジェット入力 1M 件で衝突 0</li>
+<li>波形ウィジェットの LOD ピラミッドは <strong>M2 の構造のまま scenegraph 配下に再配置</strong> (input_hash に generation を組み込む)</li>
+</ul>
+<h3 id="m5-heavy">M5 (heavy() + 巨大ビュー + 詳細波形モード)</h3>
+<p><strong>Phase 分割</strong> (Phase 13 着手時に確定、approved plan 由来):</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>内容</th>
+<th>サイズ</th>
+<th>blocker</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>13</strong></td>
+<td><code>Ui::heavy</code> + <code>HeavyCtx</code> + <code>cached()</code> + 微小デモ</td>
+<td>小</td>
+<td>なし</td>
+</tr>
+<tr>
+<td><strong>14</strong></td>
+<td>examples/piano_roll (100k notes、heavy 実用第 1 弾) + bench</td>
+<td>中</td>
+<td>Phase 13</td>
+</tr>
+<tr>
+<td><strong>15</strong></td>
+<td>波形 SamplePolyline + Auto + Interleaved unit test</td>
+<td>中</td>
+<td>なし</td>
+</tr>
+<tr>
+<td><strong>16</strong></td>
+<td>マーカー (rect 角丸円) + RmsBars + examples/sample_editor</td>
+<td>中</td>
+<td>Phase 15</td>
+</tr>
+<tr>
+<td><strong>17</strong></td>
+<td>examples/arrangement (10×50 = 500 widgets を heavy 化) + bench</td>
+<td>中</td>
+<td>Phase 13, 16</td>
+</tr>
+</tbody>
+</table>
+<p><strong>M5 全 phase 完了 (2026-05-02)</strong> — Phase 13, 14, 15, 16, 17 すべて完了。次の milestone は M5.5 (オートメーションカーブ)。</p>
+<p>オートメーションカーブ (ベジエ → CPU flatten → line) は当初 Phase 18 として M5 に
+入れていたが、heavy / 詳細波形 の主目標を区切りやすくするため <strong>M5.5</strong> (M5 完了後すぐの
+別 milestone) にスライド (下記参照)。</p>
+<p><strong>Phase 13 進捗 (2026-05-01)</strong> — heavy() API 基盤:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crates/ui/src/widgets/heavy.rs</code>: <code>HeavyCtx&lt;'b, 'a, M&gt;</code> + <code>Ui::heavy</code> + <code>HeavyCtx::cached</code></td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>HeavyCtx delegate: <code>pointer / screen / push_edit / push_rect / push_text / push_lines / waveform / label_at / button_at</code></td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>crates/ui/tests/ui/pass/heavy.rs</code>: trybuild (no-Clone 制約 + viewport_key Hash 制約)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>単体テスト 4 本 (cache hit / miss / ヒットテスト経路 / eviction)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>examples/mixer</code> に heavy_demo ブロック (count を viewport_key に)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>lib.rs</code> から <code>HeavyCtx</code> を re-export</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong><code>with_widget_node</code> の薄いラッパで実装</strong>: M4 Phase 11 で「描画コマンドキャッシュ +
+  hash 一致判定」が完成しているため、heavy() 用に新キャッシュ機構を作らず、<code>HeavyCtx::cached</code>
+  は <code>with_widget_node(child_wid, hash_inputs(viewport_key), ...)</code> を呼ぶだけの薄いラッパに
+  した (<code>feedback_use_new_abstractions</code> 適合、新規 cache 機構ゼロ)。
+- <strong>viewport_key は explicit Hash 渡し</strong>: <code>(timeline_range, zoom_level, generations_hash)</code>
+  のような tuple をアプリ側が組む。Clone / Default / PartialEq を要求しない (no-Clone 不変条件)。
+- <strong>HeavyCtx の delegate 範囲は最小限</strong>: <code>pointer / screen / push_* / push_edit / waveform /
+  label_at / button_at</code> のみ公開。fader / knob / checkbox / text_input は heavy 用途で
+  必要になった時点で追加する (KISS)。<code>push_rect / push_text / push_lines</code> は HeavyCtx 経由で
+  <code>pub</code> (脱出口の意味)、通常 widget からは <code>pub(crate)</code> のまま。
+- <strong>ヒットテストは <code>cached()</code> の外側で毎フレーム実行</strong>: waveform widget と同じパターン。
+  cached() の内側は viewport_key 一致時に skip されるので、ヒットテスト・動的 overlay
+  (cursor / 選択範囲) は外で行うのが正しい。
+- <strong>既存 widget の heavy 内呼び出しは二段キャッシュ</strong>: <code>hctx.waveform(...)</code> を cached() の中で
+  呼ぶと、外側 cache hit で内側 widget の <code>with_widget_node</code> も skip される。外側 miss なら
+  内側も呼ばれて各々 input_hash で個別判定。
+- <strong>mixer の <code>#[allow(clippy::too_many_lines, clippy::needless_range_loop)]</code></strong>: heavy_demo
+  block 追加で 209 lines になり、元の 8 ch ループの index アクセスも警告対象に。build_ui の
+  関数分割は別タスクへ。</p>
+<p><strong>Phase 14 進捗 (2026-05-02)</strong> — heavy() 実用第 1 弾 (examples/piano_roll):</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>備考</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crates/examples/piano_roll/{Cargo.toml, src/main.rs}</code>: 100k notes ピアノロール</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>鍵盤左 widget (60px) + 拍/小節グリッド + 黒鍵 row 帯 + notes 矩形 (背景一括 cached)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>drag (XY 同時 pan) + wheel zoom + 短 click (drag&lt;16px) hit-test → 選択 overlay</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>HUD: frame_ms / visible / cache HIT/MISS 推定 / view 範囲 / pitch_top</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>viewport_key</code> = (<code>b"piano_roll_v1"</code>, view_*, area.w/h, notes_generation) の 8-tuple</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>crates/ui/benches/heavy_piano_roll.rs</code>: cached vs no_cache 100k 比測定</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>cargo bench</code> 実測値: cached <strong>4.51µs</strong> vs no_cache <strong>26.03µs</strong> = <strong>5.77x 高速</strong> (DoD: 5x+)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>ルート Cargo.toml workspace members + crates/ui/Cargo.toml <code>[[bench]]</code> 追加</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong><code>viewport_key</code> に schema namespace + area 寸法 + notes_generation を含める</strong>: <code>(b"piano_roll_v1", view_start_beat.to_bits(), view_len_beats.to_bits(), pitch_top.to_bits(), pitch_visible.to_bits(), grid.w.to_bits(), grid.h.to_bits(), notes_generation)</code> の 8-tuple。area 寸法を入れることでウィンドウリサイズ時にも cache が陳腐化せず再構築される。<code>notes_generation</code> は将来編集 API 追加時の bump hook として今から確保 (現状 0 固定)。
+- <strong>HUD は <code>ui.heavy()</code> の外に配置</strong>: <code>last_frame_ms</code> / <code>cache_status</code> / <code>visible_count</code> は毎フレーム値が変わるため heavy 内に入れると viewport_key 衝突 / 無意味 cache miss を誘発する。HUD 文字列は <code>build_ui</code> の冒頭で App 側で組み立て、<code>ui.label_at</code> で heavy ブロックの外に push する (mixer の構造踏襲)。
+- <strong>HUD の cache HIT/MISS 推定</strong>: HeavyCtx は cache hit 判定 API を持たないため、App 側で前フレームの <code>viewport_hash = hash_inputs(&amp;viewport_key)</code> を保持して今フレームと一致なら HIT 表記する approximation。eviction や hash 衝突極端ケースで誤りうるが視覚的目安として十分。
+- <strong>visible 範囲は <code>partition_point</code> 二分探索</strong>: <code>notes</code> を <code>start_beat</code> 昇順ソート済前提で <code>[s_idx, e_idx)</code> を O(log N) で算出。100k から visible ~1500 まで絞ることで heavy 内の rect push を visible 件数 * 1〜2 オーダーに抑える。
+- <strong>drag/wheel/click は App 側で吸収</strong>: <code>pointer.primary_just_pressed/released</code> から drag_anchor を作り、release 時の累積 dx+dy &lt; 16px で短 click 判定。<code>pending_click</code> を立てて build_ui 内で消費。pan は Edit 経由ではなく App 側で <code>&amp;mut self.model</code> を直接書き換える (waveform_validation 既存パターン)。<code>Edit</code> は「click → selected_note_index 更新」の closure capture が必要なケースのみで使用。
+- <strong>bench は wgpu/font 不要のミニマル構成</strong>: <code>UiHost::&lt;()&gt;::new()</code> + <code>Scene::new()</code> + <code>FrameInput::default()</code> で <code>host.frame()</code> を呼べる。Model に <code>()</code> を使うことでヒットテスト・選択 overlay を排除し、純粋な「heavy() + cached() の描画コマンド push コスト」を測定できる。warm-up 1 フレームで cache を populate してから本測定に入る点も scenegraph_cache.rs 踏襲。
+- <strong>bench で cached が 5.77x 高速 (DoD: 5x+)</strong>: M4 Phase 12 の 1000 button bench は 1.9x だったが、heavy は 1500 visible notes / フレームの rect push が dominant コストなので、cache hit の <code>extend_from_slice</code> が draw_fn の <code>partition_point + walk + push_rect ×1500+</code> を一気に置き換える分、差が 3 倍弱に拡大した。</p>
+<p><strong>Phase 15 進捗 (2026-05-02)</strong> — 波形詳細モード (<code>SamplePolyline</code> + <code>Auto</code>) + Interleaved test:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>備考</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crates/ui/src/widgets/waveform.rs</code>: <code>resolve_render_mode</code> 追加 (Auto → SamplePolyline/PeakLines)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>build_sample_polyline_segments</code>: 生サンプル直接読み + 連続 <code>LineSegment</code> 生成 (Stack/Overlay/FirstOnly 全対応)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>sample_at</code> helper: Mono / Planar / Interleaved の sample 取得 (<code>peak_in_raw</code> と stride 整合)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Ui::waveform</code> の dispatch を SamplePolyline / PeakLines / RmsBars(fallback) に拡張</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>Interleaved unit test 2 件 (<code>interleaved_1ch_matches_mono_pyramid</code> / <code>interleaved_2ch_channels_independent</code>)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>examples/waveform_validation</code> を <code>WaveformRenderMode::Auto</code> に切替 (新抽象を直後の example で実用)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>RmsBars は Phase 16 まで PeakLines fallback (TODO コメント付き)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong>Auto 切替閾値 = 1.0 (固定)</strong>: plan.md M5 仕様「1 サンプル/ピクセル以下にズームしたとき」に厳密準拠。<code>samples_per_pixel &lt; 1.0</code> で <code>SamplePolyline</code>、それ以外で <code>PeakLines</code>。flicker 対策のヒステリシス (例 0.8/1.2 上下閾値) は Phase 15 では入れず、目視で気になれば別タスクで対応。
+- <strong><code>input_hash</code> に effective_mode を追加しない</strong>: <code>style.render_mode</code> (= Auto そのもの) は既に hash に入っており、samples_per_pixel の変動は <code>view.len_samples</code> / <code>rect.w</code> の hash 変化で間接的に cache miss する → Auto 内部の切替に追加 hash 入れ込み不要 (KISS)。
+- <strong>SamplePolyline は LOD 不使用 (生サンプル直接読み)</strong>: <code>samples_per_pixel &lt; 1.0</code> の領域では LOD ピラミッドの最細レベル (decimation=16) も粗すぎて意味がない。<code>build_sample_polyline_segments</code> は <code>pyramid</code> 引数を取らず <code>WaveformSource</code> の生 slice から直接 <code>(x, y)</code> 列を作る。<code>sample_at</code> helper で Mono/Planar/Interleaved 共通化。
+- <strong>SamplePolyline モード時は <code>pyramid.ensure_built</code> を skip</strong>: dispatch で SamplePolyline 経路だけ pyramid に触らない。次フレームで PeakLines に戻ったときは <code>fingerprint</code> チェックで no-op or 必要なら rebuild され、副作用なし。
+- <strong><code>vertical_gain</code> / <code>clamp</code> / <code>clipped</code> 判定は PeakLines と挙動を完全揃え</strong>: gain 適用 → clamp → ch_mid 中央に展開、clipped は <strong>gain 適用前の生サンプル <code>|s| &gt; 1.0</code></strong> で判定。segment color は端点いずれかが clipped なら <code>fg_clipped</code>。両モード切替時に色味が連続するよう一致させた。
+- <strong><code>baseline</code> は両モードで同形描画</strong>: 各 channel 中央線を 1 本の長い水平 LineSegment として push。Stack / Overlay / FirstOnly すべて <code>build_peak_segments</code> と同じパターン。
+- <strong><code>RmsBars</code> は PeakLines fallback (TODO Phase 16)</strong>: 専用塗りつぶしは Phase 16 で実装する。Phase 15 で panic させず、Auto モード使用中に偶発的に <code>style.render_mode = RmsBars</code> がセットされても安全に表示できるようにする。
+- <strong>Interleaved test 2 件で stride アクセスを固定</strong>: <code>peak_in_raw</code> の <code>data[i*channels+ch]</code> 経路を 1ch (= Mono 一致) と 2ch (L/R 独立) で固定。今後 Interleaved 経路をいじったときに既存 Mono / Planar との一致が崩れたら即検知できる。</p>
+<p><strong>Phase 16 進捗 (2026-05-02)</strong> — マーカー + RmsBars (LOD 拡張) + examples/sample_editor:</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>備考</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MinMaxPair</code> に <code>rms_sum_sq: f32</code> 追加 (8B → 12B/pair、メモリ +50%)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>peak_in_raw</code> / <code>fold_pairs</code> / <code>extend_level_*</code> で sum_sq 加算 (3 variant 全部)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>assert_pyramid_eq</code> に <code>rms_sum_sq</code> epsilon 比較追加 (1e-5 相対 + 1e-12 絶対)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>rms_in_view_cached</code>: <code>peak_in_view_cached</code> を呼んで <code>sqrt(sum_sq / n)</code> で RMS 計算</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>build_rms_bar_segments</code>: <code>build_peak_segments</code> 同形で ±RMS 縦線、Phase 15 fallback の TODO 除去</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>build_sample_polyline_markers</code>: knob 同パターンの rect 角丸円 (radius=[r;4])</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>マーカー描画閾値 <code>samples_per_pixel &lt; 0.25</code>、サイズ <code>line_width_px * 3.0</code></td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>Ui::waveform</code> の dispatch を 3 mode 独立 branch に + SamplePolyline でマーカー追加 push</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>crates/examples/sample_editor</code>: 1 サンプル + 選択範囲 + カーソル + 1/2/3/a キー切替</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>sample_editor: heavy() 経由で selection/cursor overlay (push_rect が pub なのは HeavyCtx 経由のみ)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>examples/waveform_validation</code>: forced_mode + 1/2/3/a キー切替追加 (新抽象を直後の example で実用)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>既存 5 unit test (incremental_extension / shrinking / generation_change / interleaved_1ch / interleaved_2ch) すべて pass</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong>RMS 方式 A (LOD ピラミッド拡張) 採用</strong>: <code>MinMaxPair</code> に <code>rms_sum_sq</code> を追加して <code>peak_in_raw</code> と同じループ内で <code>+= v*v</code>、<code>fold_pairs</code> でも sum_sq 加算。毎ピクセル <code>sqrt(sum_sq / n)</code> で O(1) 取得。方式 B (毎ピクセル生計算) は 60s/48k @ 1280px で 14.7M ops/frame で 60fps 不安定、方式 C (PeakLines 流用) は "RMS" 命名と乖離するため不採用。Reaper / Logic / Ableton も方式 A 相当。
+- <strong>メモリ +50% は許容</strong>: 50k samples × 2ch の level 1 で +1.2MB、上位レベルは 1/16 減衰で累計 +1.4MB。DAW project の MB スケールに対し小さい。
+- <strong><code>assert_pyramid_eq</code> は rms に epsilon 許容</strong>: incremental 拡張 (peak の sum) と完全再構築 (fold の sum) で浮動小数累積順序が異なり微妙な誤差 → <code>1e-5 相対 + 1e-12 絶対</code> で許容。min/max は厳密比較を維持 (順序が変わっても min/max は一致)。
+- <strong>マーカーは <code>samples_per_pixel &lt; 0.25</code> でのみ描画</strong>: SamplePolyline 切替閾値 (1.0) より厳しく、4px 間隔以上のときのみ。100k サンプルでも visible 600 × ch = 1.2k rect に圧縮。閾値超過なら空 Vec で no-op。
+- <strong>マーカーは knob と同パターン</strong>: <code>radius: [r; 4]</code> (r = サイズ/2) で完全な円。<code>line_width_px * 3.0</code> で line より少し大きい目立つサイズ。色は <code>style.fg</code> / <code>style.fg_clipped</code> (生サンプル <code>|s| &gt; 1.0</code>)。
+- <strong><code>Ui::waveform</code> の dispatch が 3 mode 独立に</strong>: SamplePolyline / PeakLines / RmsBars それぞれ独立 branch、Phase 15 で <code>WaveformRenderMode::PeakLines | WaveformRenderMode::RmsBars</code> で fallback していた TODO を除去。<code>WaveformRenderMode::Auto</code> は <code>resolve_render_mode</code> で除去済なので <code>unreachable!()</code>。
+- <strong>SamplePolyline 経路だけ markers を追加 push</strong>: dispatch の後 <code>if effective_mode == SamplePolyline</code> で <code>build_sample_polyline_markers</code> → <code>hctx.push_rect</code> (waveform 内部からは <code>ui.push_rect</code> だが pub(crate) 経由)。閾値超過時は markers 空で no-op、無駄なし。
+- <strong>sample_editor の overlay は heavy() 経由</strong>: <code>Ui::push_rect</code> は <code>pub(crate)</code> で example から呼べないが、<code>HeavyCtx::push_rect</code> は pub。selection / cursor は <code>ui.heavy("overlay", |hctx| { hctx.push_rect(...) })</code> でラップ (cached() は使わず、毎フレーム描画)。これは Phase 13 で意図した「heavy() = push_<em> の脱出口」の追加用例。
+- </em><em>forced_mode + 1/2/3/a キー切替</em><em>: ユーザの「Auto デフォルト + 明示上書き両方」要望に基づき、<code>forced_mode: Option&lt;WaveformRenderMode&gt;</code> を Model に持つ。<code>m.forced_mode.unwrap_or(Auto)</code> で <code>WaveformStyle.render_mode</code> を決定。1/2/3 で Some(...)、a で None に戻す。<code>PhysicalKey::Other(0x31..0x33, 0x41)</code> で分岐 (現状の platform crate にキー定数がないため)。
+- </em><em>selection は (min, max) 正規化</em><em>: drag 方向で end &lt; start にならないよう、anchor_sample と現在 sample の min/max を <code>selection = Some((s, e))</code> に保存。
+- </em><em>Phase 15 で実装した Auto は維持</em>*: forced_mode = None のときは Auto で zoom 自動切替 (peak ↔ sample) が動作、業界 DAW UX (Reaper/Logic/Ableton) と一貫。</p>
+<p><strong>Phase 17 進捗 (2026-05-02)</strong> — examples/arrangement (500 widgets を heavy 化) + bench (M5 最終 phase):</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>備考</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crates/examples/arrangement/{Cargo.toml, src/main.rs}</code>: 10 tracks × 50 clips = 500 widgets</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>ui.heavy("arrangement", \|hctx\| hctx.cached(viewport_key, \|hctx\| { for i in 0..500 { hctx.waveform(...) } }))</code></td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>viewport_key = (b"arrangement_v1", view_*, y_zoom, y_offset, vertical_gain, area.w/h, generation, forced_mode_tag) の 10-tuple</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>二段キャッシュ (外側 heavy cached + 内側 per-widget input_hash) で 500 widgets 一括 skip</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>drag X pan + wheel X zoom + Ctrl+wheel Y zoom (レーン高さ + anchor 維持) + 1/2/3/a forced_mode 切替</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>HUD: frame_ms / view 範囲 / spp / widgets / y_zoom / y_offset / mode / cache HIT/MISS 推定</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>画面外 clip の描画 skip (<code>if rect.y + rect.h &lt; area.y \|\| ...</code>) で cached miss 時のコスト削減</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>crates/ui/benches/heavy_arrangement.rs</code>: cached vs no_cache 500 widgets 比測定</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>cargo bench</code> 実測値: cached <strong>136.53µs</strong> vs no_cache <strong>1.2785s</strong> = <strong>9367x 高速</strong> (DoD 10x+ を遥かに超える)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>ルート Cargo.toml workspace + crates/ui/Cargo.toml <code>[[bench]]</code> 追加</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong>二段キャッシュの効果が圧倒的 (Phase 14 の 5.77x → Phase 17 で 9367x)</strong>: 500 widgets 規模では per-widget input_hash 判定 (<code>with_widget_node</code> 内の hash 計算 + scenegraph lookup) のオーバーヘッドが累積し、外側 cached() の <code>extend_from_slice</code> で全部 skip するメリットが圧倒的。具体的には no_cache フレームで各 widget が <code>pyramid.ensure_built</code> (fingerprint 一致で no-op) + <code>build_peak_segments</code> (各ピクセル走査) + <code>LineBatch</code> push を 500 回繰り返し、合計 ~1.28 秒/フレーム。cached frame は前フレームの commands を 1 度の <code>extend_from_slice</code> で scene に append するだけで 136µs。
+- <strong>viewport_key に <code>forced_mode_tag</code> を含める (u8 タグ化)</strong>: enum を直接 hash に渡すには Hash 実装が必要だが、<code>WaveformRenderMode</code> derive Hash 済。シンプル化のため <code>forced_mode_tag(opt) -&gt; u8</code> で <code>(None|Some(Auto))=0, PeakLines=1, SamplePolyline=2, RmsBars=3</code> に圧縮。1/2/3/a 切替で hash が変わって全 widgets が再描画される。
+- <strong>画面外 clip の描画 skip</strong>: <code>y_offset</code> 大で見切れる track は <code>if rect.y + rect.h &lt; area.y || rect.y &gt; area.y + area.h { continue }</code> で skip。cached miss 時の widget 描画コスト削減 (cached hit 時は scene への extend_from_slice なので skip しても commands は前フレームの全部が入る、影響なし)。
+- <strong>REC は不要 (KISS)</strong>: arrangement は static、Space で REC は waveform_validation 専用機能なので継承せず。
+- <strong>drag は無修飾のみ pan、Shift は将来 selection 用に予約</strong>: sample_editor の drag 設計と整合 (Phase 16 で確立)。<code>!self.cur_modifiers.shift</code> で Shift 時 drag は anchor 設定しない。
+- <strong>clip 1 つあたり 25×65 px</strong>: 1280×800 画面で grid 1264×656、cell_w=25 / cell_h=65。PeakLines / RmsBars が読める最低高さ。SamplePolyline は深 zoom in 時のみ意味があるため 25 px 幅で sample 数が少なく、マーカー閾値 (Phase 16: samples_per_pixel &lt; 0.25) で適切に切替。
+- <strong><code>HUD cache HIT/MISS</code> は前フレーム viewport_hash 一致で推定</strong>: piano_roll と同パターン (approximation)。eviction で誤りうるが視覚的目安として十分。
+- <strong>Phase 17 で M5 milestone 完了</strong>: 残 phase なし。次は M5.5 (オートメーションカーブ) — ベジエ → CPU flatten → push_lines。</p>
+<p><strong>M5 milestone 全体総括</strong>:
+| Phase | 成果 | 主 commit |
+|---|---|---|
+| 13 | <code>Ui::heavy</code> + <code>HeavyCtx</code> + <code>cached</code> API 基盤 (with_widget_node 薄ラッパ、新キャッシュ機構ゼロ) | 3d137e4 |
+| 14 | examples/piano_roll (100k notes、heavy 第 1 弾)、bench cached 5.77x | 61d6792 + 0eb5ff2 |
+| 15 | 波形 SamplePolyline + Auto + Interleaved unit test | 76f1b9c + 23b1a03 |
+| 16 | サンプル点マーカー (rect 角丸円) + RmsBars (LOD 拡張、<code>MinMaxPair.rms_sum_sq</code>) + examples/sample_editor | 313d4c6 + 64ad448 |
+| 17 | examples/arrangement (500 widgets、heavy 第 2 弾)、bench cached 9367x | (本コミット) |</p>
+<p>heavy() の 2 つの典型用途 (1 巨大ビュー = Phase 14 piano_roll、多数 widget = Phase 17
+arrangement) を実装 + bench 実証完了。波形 widget は PeakLines / SamplePolyline / RmsBars
+の 3 mode + マーカー対応で M5 元仕様の波形機能を全て満たす。</p>
+<p><strong>M5 元仕様</strong> (Phase 14 以降の DoD ガイド):
+- <code>ui.heavy("...", |hctx| ...)</code> 脱出口 ✅ (Phase 13 で完成)
+- 波形 <strong>詳細モード</strong> (SamplePolyline + サンプル点マーカー、Phase 15-16):
+  - 1 サンプル/ピクセル以下にズームしたとき自動切替 (<code>WaveformRenderMode::Auto</code>)
+  - 円形マーカーは <strong>rect 角丸円</strong> (4 隅 radius = 幅/2、knob と同パターン) を採用予定。
+    視認性で問題があれば line マーカー or SDF circle 専用 shader に切替を検討
+- 波形 <strong>RmsBars</strong>: ±RMS バー塗りつぶし (rect 流用、Phase 16)
+- 波形 <strong>Interleaved 入力</strong>: peak_in_raw で実装済み、unit test 追加のみ (Phase 15)
+- examples/sample_editor: 1 サンプル (generated) + ズーム + 選択範囲 + カーソル (Phase 16)
+- examples/piano_roll: 100k notes + scroll + zoom + クリック、heavy 実用 (Phase 14)
+- examples/arrangement: 10 トラック × 50 クリップ = 500 widgets を heavy 化 (Phase 17)</p>
+<h3 id="m55-m5-milestone-2026-05-02">M5.5 (オートメーションカーブ — M5 完了後すぐの別 milestone) ✅ 完了 (2026-05-02)</h3>
+<p><strong>Phase M5.5 進捗</strong> — <code>Ui::automation_curve</code> (cubic Bezier flatten + Catmull-Rom):</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>備考</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crates/ui/src/widgets/automation.rs</code>: <code>AutomationCurveStyle</code> / <code>AutomationCurveResponse</code> / <code>AutomationCurveState</code> 型 + <code>flatten_cubic</code> (de Casteljau 適応分割) + <code>flatten_curve</code> (Catmull-Rom → cubic Bezier) + <code>Ui::automation_curve</code> API</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>適応分割閾値 <code>max_segment_px = 2.0</code> (デフォルト)、最大再帰深度 16 で無限再帰ガード</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>on_change(idx, (x, y)) -&gt; Edit&lt;M&gt;</code> で 1 点だけ更新 (Vec 全体の copy 不要、no-Clone 整合)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>widget_state にドラッグ index + 開始 (x, y) を保持 (knob/fader と同パターン)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>各点を rect 角丸円 (knob 同パターン、<code>radius: [r; 4]</code>) で描画、hover/drag で色切替</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>input_hash に points 全部 + style 含めて per-widget cache (Phase 11 with_widget_node 経由)</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>crates/ui/tests/ui/pass/automation.rs</code>: trybuild で no-Clone Model + automation_curve API が compile</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td>unit test 3 件: <code>flatten_cubic_returns_endpoint_for_straight_line</code> / <code>flatten_cubic_subdivides_for_curved</code> / <code>flatten_curve_empty_for_single_point</code></td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>crates/examples/automation/{Cargo.toml, src/main.rs}</code>: 6 点 sin curve + drag 編集 example</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>lib.rs</code> から <code>AutomationCurveResponse</code> / <code>AutomationCurveStyle</code> を re-export</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>widgets/mod.rs</code> に <code>pub mod automation</code> 追加</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+<tr>
+<td><code>cargo test --workspace</code>: 全 51 unit test pass (新規 3 件 + 既存 48) + trybuild 1 件 pass</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断</strong>:
+- <strong>Catmull-Rom 自動 tangent 採用 (シンプル化)</strong>: ユーザは点列 <code>&amp;[(f32, f32)]</code> を渡すだけで滑らかな curve、Bezier handle 編集 UI は不要。隣接 4 点 <code>(P0, P1, P2, P3)</code> から <code>B1 = P1 + (P2-P0)/6, B2 = P2 - (P3-P1)/6</code> で cubic Bezier 制御点を生成。DAW UX (Ableton / Cubase 等) と整合、KISS。
+- <strong>端点は仮想点 (P0=P1, P3=P2) で代用</strong>: 端点で tangent が 0 になる (= 出入り角直角) が、KISS で初版採用。"natural" 端点 (P0 = 2<em>P1 - P2) は将来改善余地。
+- </em><em>適応分割 (de Casteljau + 中点分割)</em><em>: control points <code>P1, P2</code> の chord (P0-P3) からの最大垂直距離 <code>max(d1, d2)</code> が <code>style.max_segment_px</code> 未満まで再帰。直線部分は粗く、曲がり部分は細かく → segment 数最適化。最大再帰深度 16 で NaN / 異常値の無限再帰ガード。
+- </em><em><code>on_change</code> シグネチャを <code>(usize, (f32, f32))</code> に</em><em>: 通常案 <code>FnOnce(Vec&lt;(f32,f32)&gt;) -&gt; Edit&lt;M&gt;</code> だと Vec 全体の copy が発生し no-Clone 不変条件と相性悪い。<code>(idx, pos)</code> 単位で渡すことで Edit 内 <code>m.points[idx] = pos</code> の 1 点書き換えで済む。
+- </em><em>drag 編集スコープは「移動のみ」</em><em>: ユーザ判断 (Recommended)。点の追加 (double-click) / 削除 (Shift+click) は将来 M5.6 以降の拡張として保留 (Phase M5.5 のスコープを最小化、Bezier flatten + drag に集中)。
+- </em><em>input_hash に全 points を含める</em><em>: 100 点規模なら hash コスト軽量。1000 点超なら Vec allocation の毎フレーム発生が懸念だが、典型 automation curve は数十点なので KISS。
+- </em><em>node の rect 角丸円は knob と同パターン</em><em>: <code>radius: [r; 4]</code> (r = サイズ/2) で完全な円。Phase 16 のサンプル点マーカーと同形なので renderer 側追加実装なし。
+- </em><em>mixer ではなく専用 example</em>*: mixer は既に 8ch fader/knob で密、追加スペース無し。<code>examples/automation</code> 新規作成で sample_editor / arrangement と並ぶ独立例にして mixer の保守を分離。</p>
+<p><strong>残作業</strong>: なし。M5.5 は単体 milestone として完了。次は M6 (Phase 2)。</p>
+<h3 id="m6-phase-2-phase-18-21-phase-19-20-vello-m7-m6">M6 (Phase 2) — Phase 18 + 21 完遂 / Phase 19 + 20 保留 / vello M7 送り ✅ M6 完了</h3>
+<p>M5.5 完了後の DAW プラグイン対応・アクセシビリティ・波形編集サンプルを進めた。当初 4 phase 構成 (Phase 18-21) で計画したが、<strong>Phase 19 (baseview バックエンド)</strong> と <strong>Phase 20 (AccessKit 統合)</strong> は upstream / scope 上の理由で保留に変更し、M6 は <strong>Phase 18 + Phase 21</strong> で完遂。当初候補 5 テーマの 1 つだった <strong>vello サブシステム併用</strong> は、現状 rect/glyph/line で全 example 成立 + SVG 需要弱いため <strong>M7 で評価 (M6 では見送り)</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>テーマ</th>
+<th>状態</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>18</td>
+<td>プラグイン UI 埋め込み API + frame inject 経路 (drive_one_frame / OffscreenRenderer / examples/embedded_host)</td>
+<td>✅ 完了 (commit d7e0a0a)</td>
+</tr>
+<tr>
+<td>19</td>
+<td>baseview バックエンド (<code>WindowBackend</code> 第 2 実装)</td>
+<td>⏸️ 保留 — rwh 0.5/0.6 互換待ち / Window が <code>!Send + !Sync</code> / IME 未対応 / API 不安定</td>
+</tr>
+<tr>
+<td>20</td>
+<td>AccessKit 統合 (focusable widget の TreeUpdate)</td>
+<td>⏸️ 保留 — scope 大、ユーザ判断で M6 から除外、M7 以降で再評価</td>
+</tr>
+<tr>
+<td>21</td>
+<td>波形編集 sample (trim / linear fade in / linear fade out)</td>
+<td>✅ 完了 (本コミット)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="phase-18-ui-api-frame-inject">Phase 18 進捗 — プラグイン UI 埋め込み API + frame inject 経路 ✅ 完了</h4>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>備考</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crates/platform/src/winit_backend.rs</code>: <code>pub fn drive_one_frame&lt;H: AppHost&gt;(host, last_tick) -&gt; bool</code> 切り出し (winit <code>RedrawRequested</code> ハンドラ内のロジックを関数化、baseview からも呼べるようにする布石)</td>
+<td>✅</td>
+<td>commit d7e0a0a</td>
+</tr>
+<tr>
+<td><code>crates/platform/src/window.rs</code>: <code>WindowBackend</code> rustdoc にプラグイン UI 埋め込み手順 (HasWindowHandle/HasDisplayHandle 実装で外部 crate でも <code>Renderer&lt;W&gt;</code> に渡せる) を追記</td>
+<td>✅</td>
+<td>commit d7e0a0a</td>
+</tr>
+<tr>
+<td><code>crates/renderer/src/device.rs</code>: モジュール doc に「外部 crate での使用 (DAW プラグイン UI 埋め込み)」と drop 順序の責務 (親 window 寿命管理) を明記</td>
+<td>✅</td>
+<td>commit d7e0a0a</td>
+</tr>
+<tr>
+<td><code>crates/renderer/src/offscreen.rs</code>: <code>OffscreenRenderer::new(width, height)</code> + <code>render_to_rgba(&amp;Scene) -&gt; Vec&lt;u8&gt;</code> (window 不要、<code>compatible_surface=None</code>、render-to-texture + 256-align padding + <code>PollType::wait_indefinitely</code> readback)</td>
+<td>✅</td>
+<td>commit d7e0a0a</td>
+</tr>
+<tr>
+<td><code>crates/examples/embedded_host/</code>: 自前 <code>EmbeddedHostWindow</code> (HasWindowHandle/HasDisplayHandle/WindowBackend 実装) を compile-time assert + <code>OffscreenRenderer</code> で 8ch fader 風 Scene を 1 frame render → <code>target/embedded_host_snapshot.png</code> 出力</td>
+<td>✅</td>
+<td>commit d7e0a0a</td>
+</tr>
+<tr>
+<td><code>cargo build/test/clippy/doc --workspace</code>: 全 pass、既存 6 example (mixer / waveform_validation / sample_editor / piano_roll / arrangement / automation) 回帰なし</td>
+<td>✅</td>
+<td>commit d7e0a0a</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断 (Phase 18)</strong>:
+- <strong>プラグイン UI 埋め込み API は trait bound で既にほぼ揃っていた</strong>: <code>WindowBackend: HasWindowHandle + HasDisplayHandle</code> で raw-window-handle 受け渡しは公開済み。新規 trait method・新規型の追加は不要。Phase 18 は「足りている」ことを rustdoc + example で実証する形に。
+- <strong><code>OffscreenRenderer</code> は独立 struct (既存 <code>Renderer&lt;W&gt;</code> 変更なし)</strong>: window 不要のため <code>Renderer&lt;W&gt;</code> の generic に dummy window を入れる方法より、別 struct の方が API がクリーン。pipelines (rect/line/glyph) は target_format 引数で再利用 (新規追加なし)。
+- <strong>wgpu 29 系 offscreen API の確認</strong>: <code>Maintain::Wait</code> は廃止 (<code>PollType::wait_indefinitely()</code>)、<code>TexelCopyTextureInfo</code> / <code>TexelCopyBufferInfo</code> / <code>TexelCopyBufferLayout</code> の名称、<code>bytes_per_row</code> 256-align padding、<code>compatible_surface: None</code> で adapter 取得可 (native OK、WebGL2 のみ不可)。詳細は <code>CLAUDE.md</code> 既知の罠 (wgpu 29 offscreen) 参照。
+- <strong><code>examples/embedded_host</code> の <code>EmbeddedHostWindow</code> は dummy 実装</strong>: <code>OffscreenRenderer</code> が handle 不要なので <code>Err(HandleError::NotSupported)</code>。実 DAW プラグインでは <code>unsafe { WindowHandle::borrow_raw(self.raw_handle) }</code> で親プロセスから受け取った handle を持ち上げる。compile-time assert で「外部 crate でも <code>WindowBackend + Send + Sync + 'static</code> 実装可能」を実証。</p>
+<h4 id="phase-19-baseview">Phase 19 (⏸️ 保留) — baseview バックエンド</h4>
+<p><strong>保留理由 (実装着手時の調査で判明)</strong>:
+- baseview master は raw_window_handle <strong>0.5</strong> のみ対応、gui_01 は 0.6.2。upstream PR は止まっており短期改善見込み低い。
+- 互換 shim (rwh 0.5 を別名で追加 + unsafe で 0.6 化) は unsafe コード増・メンテ負担で KISS に反する。
+- baseview <code>Window&lt;'a&gt;</code> は <code>PhantomData&lt;*mut ()&gt;</code> で <code>!Send + !Sync</code>、<code>Renderer&lt;W: Send + Sync + 'static&gt;</code> の bound を満たさない。
+- IME 完全未対応 / frame 駆動 ~66Hz 固定 / API 不安定 (0.1.0 で 6 年) など追加問題。
+- Phase 18 で raw-window-handle 受け渡し API は trait bound 経由で既に公開済み、実 DAW プラグインホスト (VST3/CLAP) では host が直接 raw handle を渡すので baseview バックエンドは必須ではない。</p>
+<p><strong>再開条件</strong>: baseview が rwh 0.6 対応 (upstream PR merge or fork メンテ覚悟) + <code>Send + Sync</code> 実装。整い次第、Phase 18 の <code>drive_one_frame</code> をそのまま流用して 1 commit で実装可能。</p>
+<h4 id="phase-20-accesskit">Phase 20 (⏸️ 保留) — AccessKit 統合</h4>
+<p><strong>保留理由</strong>:
+- scope 大: UiHost への <code>a11y_nodes</code> フィールド追加 + 6 widget (button/checkbox/fader/knob/text_input/automation_curve) への <code>register_a11y</code> 差し込み + accesskit_winit Adapter 統合 + ActionRequest → AppEvent 経路など、1 commit に収まらない可能性。
+- 現フェーズ (DAW GUI ライブラリ基盤) では a11y は実害なく後回し可能、優先度低い。</p>
+<p><strong>再開条件</strong>: ユーザ判断で必要になったとき。M7 以降で再評価。</p>
+<h4 id="phase-21-sample-trim-linear-fade-in-linear-fade-out">Phase 21 進捗 — 波形編集 sample (trim / linear fade in / linear fade out) ✅ 完了</h4>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>備考</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crates/examples/sample_edit_ops/{Cargo.toml, src/main.rs}</code>: sample_editor を流用、ボタン UI 追加 (Trim / Fade In / Fade Out)、selection 範囲に対し destructive edit</td>
+<td>✅</td>
+<td>本コミット</td>
+</tr>
+<tr>
+<td>Edit logic: Trim = <code>samples[0].drain(..start) + truncate(end-start) + generation += 1</code>、Fade In = <code>for i in start..end { samples[0][i] *= (i-start)/(end-start) } + generation += 1</code>、Fade Out = ramp 1→0</td>
+<td>✅</td>
+<td>本コミット</td>
+</tr>
+<tr>
+<td>WaveformPyramid は generation bump で再構築 (Phase 16 の incremental 拡張パスは未使用、destructive edit は完全 rebuild が DAW 通例)</td>
+<td>✅</td>
+<td>本コミット</td>
+</tr>
+<tr>
+<td>docs/plan.md M6 セクション更新 (Phase 18 + 21 完遂、Phase 19 / 20 保留、vello M7 送り宣言を改めて明記)</td>
+<td>✅</td>
+<td>本コミット</td>
+</tr>
+<tr>
+<td><code>cargo build/test/clippy/doc --workspace</code>: 全 pass、既存 7 example (mixer / waveform_validation / sample_editor / piano_roll / arrangement / automation / embedded_host) 回帰なし</td>
+<td>✅</td>
+<td>本コミット</td>
+</tr>
+</tbody>
+</table>
+<p><strong>設計判断 (Phase 21)</strong>:
+- <strong>split は M7 送り</strong>: cursor 位置で <code>Vec&lt;f32&gt;</code> を 2 分割するには <code>Model.samples: Vec&lt;Vec&lt;f32&gt;&gt;</code> を「複数 channel」から「複数 clip」に意味変更する必要があり、表示側 (波形 widget の per-clip cached() 化) も合わせて scope 拡大。1 commit に収めるため Phase 21 では trim / linear fade のみに絞る。
+- <strong>curve fade は M7 送り</strong>: automation_curve UX (Catmull-Rom + 点ドラッグ) を流用すれば実装可能だが、UI 拡張が必要。linear fade で「fade 操作の基本構造」を実証する方を優先。
+- <strong>undo / redo は M7 送り</strong>: history stack の整備が必要。Phase 21 では destructive edit のみ (戻せない)、<code>last_action</code> 文字列だけで何が起きたかを残す方式。
+- <strong>sample_editor からのコピー流用</strong>: Phase 21 の Model / View / Drag handling / Wheel zoom logic はほぼ sample_editor (commit 313d4c6) と同形。差分は (a) <code>forced_mode</code> キー切替を削除 (Auto モード固定で UI を絞る)、(b) <code>toolbar_y</code> を追加してボタン行を waveform 下に配置、(c) <code>Edit::mutate</code> 3 つを <code>button_at</code> の <code>on_click</code> で発行。
+- <strong>WaveformPyramid generation bump で完全 rebuild</strong>: Phase 16 で実装した incremental 拡張パス (録音中対応) は使わず、destructive edit のたびに <code>generation += 1</code> で LOD ピラミッド完全再構築。60 秒 stereo で数 ms (既測)、UI スレッドで実行可。</p>
+<p><strong>vello M7 送り (Phase 18 で宣言済み、再確認)</strong>:
+- 現状 rect/glyph/line strip primitive のみで全 example (mixer / waveform_validation / sample_editor / piano_roll / arrangement / automation / embedded_host / sample_edit_ops) が成立、SVG アイコン需要弱い。
+- wgpu 29 + vello latest の互換性検証だけで 1 commit 食う見込み。M7 で SVG 需要が顕在化したときに改めて評価。</p>
+<p><strong>残作業 (Phase 21 / M6 全体)</strong>: なし。<strong>M6 完了</strong>。M7 以降の構成は下記参照 (2026-05-02 策定 draft、利用者編集前提)。</p>
+<h3 id="m7-widget-daw-widget-phase-22-28-daw_prototype-demo-m7-2026-05-021-commit">M7 (基本 widget 拡張 + DAW 共通 widget) — Phase 22-28 全完遂、daw_prototype demo 完成 ✅ M7 完了 (2026-05-02、1 commit)</h3>
+<p>ユーザ判断で <strong>M7 全体を 1 commit</strong> で完遂 (M6 までの phase 単位 commit と異なる単位)。Phase 22-28 + daw_prototype example + 既存 example の <code>ViewportState1D</code> 置換 + 設計判断の docs 同梱。</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>テーマ</th>
+<th>状態</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>22</td>
+<td>scrollbar / scroll area + 基盤</td>
+<td>✅ <code>Ui::scroll_area</code> + <code>Ui::with_clip_rect</code> + <code>Ui::take_scroll_in_rect</code> + <code>RectCommand.clip_rect</code> / <code>GlyphArea.clip_rect</code> 拡張 + <code>RectPipeline</code> の scissor span 分割 + <code>ViewportState1D</code> 先行投入</td>
+</tr>
+<tr>
+<td>23</td>
+<td>menu bar / sub-menu</td>
+<td>✅ <code>Ui::menu_bar</code> + <code>MenuBuilder</code> (popup_layer 経由で sub-menu cascade)</td>
+</tr>
+<tr>
+<td>24</td>
+<td>context menu</td>
+<td>✅ <code>Ui::context_menu_for(rect, items, on_select)</code> (library が右クリック吸収、利用者の boilerplate 不要)</td>
+</tr>
+<tr>
+<td>25</td>
+<td>popup / dropdown / combobox</td>
+<td>✅ <code>Ui::popup_layer</code> (deferred buffer + focus stack + outside-click close) + <code>Ui::open_popup</code> / <code>close_popup</code> + <code>Ui::dropdown</code></td>
+</tr>
+<tr>
+<td>26</td>
+<td>tab view + split view</td>
+<td>✅ <code>Ui::tab_view</code> (builder pattern、選択 tab のみ closure 実行) + <code>Ui::split_view</code> (drag handle + clip 適用)</td>
+</tr>
+<tr>
+<td>27</td>
+<td>time ruler / bar/beat grid</td>
+<td>✅ <code>TimeMapping</code> + <code>Ui::time_ruler</code> + <code>Ui::bar_beat_grid</code> (BarBeat / SMPTE / Seconds 表示)</td>
+</tr>
+<tr>
+<td>28</td>
+<td>level meter</td>
+<td>✅ <code>Ui::level_meter</code> (Peak / RMS / VU + peak hold + dB log scale)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_2">主な成果物 (詳細)</h4>
+<ol>
+<li><strong><code>crates/ui/src/viewport.rs</code> 新規</strong> — <code>ViewportState1D</code> (sample/beat/track 共通の <code>view_start: f64 + view_len: f64</code> + <code>pan_pixels</code> / <code>zoom_at</code> / <code>clamp_to</code> / <code>unit_to_px</code> / <code>px_to_unit</code>)。sample_editor / waveform_validation / sample_edit_ops の重複 4 実装を一箇所に集約 (<code>feedback_use_new_abstractions</code> 適合)。</li>
+<li><strong><code>crates/ui/src/popup.rs</code> 新規</strong> — <code>PopupOpenState</code> (anchor + modal flag + prev_focus)。<code>UiHost.open_popups: HashMap&lt;WidgetId, PopupOpenState&gt;</code> で popup 状態を保持。</li>
+<li><strong><code>crates/ui/src/time.rs</code> 新規</strong> — <code>TimeMapping { sample_rate, tempo_bpm, time_sig, display: TimeDisplay }</code> + <code>samples_per_beat</code> / <code>samples_per_bar</code> / <code>samples_to_bar_beat</code> / <code>bar_beat_to_samples</code> / <code>samples_to_smpte</code> / <code>format</code>。</li>
+<li><strong><code>crates/ui/src/widgets/{scroll_area,menu,dropdown,tab_view,split_view,time_grid,level_meter}.rs</code> 新規</strong> — 各 widget。<code>menu</code> は <code>MenuBuilder</code> + <code>MenuBarBuilder</code> + 内部共通 <code>draw_items_popup</code> (menu_bar / context_menu / dropdown が共有)。</li>
+<li><strong><code>crates/renderer/src/scene.rs</code></strong> — <code>RectCommand.clip_rect: Option&lt;Rect&gt;</code> / <code>GlyphArea.clip_rect: Option&lt;Rect&gt;</code> 追加 + <code>Rect::intersect</code> ヘルパ。既存 <code>LineBatch.clip_rect</code> と統一。</li>
+<li><strong><code>crates/renderer/src/pipelines/rect.rs</code></strong> — <code>LinePipeline</code> と同形の <code>DrawSpan { instance_start, instance_end, clip }</code> で連続 clip_rect を 1 scissor draw にまとめ、変わる境界で <code>set_scissor_rect</code> 再発行。</li>
+<li><strong><code>crates/renderer/src/pipelines/glyph.rs</code></strong> — <code>GlyphArea.clip_rect</code> を <code>TextBounds</code> として glyphon に渡し、範囲外 glyph を切り捨て。</li>
+<li><strong><code>crates/ui/src/ui.rs</code></strong> — <code>Ui</code> に <code>current_clip</code> / <code>open_popups</code> / <code>popup_rects/glyphs/lines</code> / <code>drawing_in_popup</code> フィールド追加。<code>with_clip_rect</code> で nested clip stack、<code>with_widget_node</code> の input_hash に <code>current_clip</code> を mix (scroll でクリップが動いたら cache 無効化)、popup_layer 内の primitive を deferred buffer に積み frame 末尾で base scene に append (z-order 最前面)。</li>
+<li><strong><code>crates/ui/src/input.rs</code></strong> — <code>PointerFrame.scroll_delta: (f32, f32)</code> + <code>PointerFrame.secondary_just_pressed/released</code> 追加、<code>InputAccumulator::ingest</code> で <code>AppEvent::Scroll</code> (LineDelta / PixelDelta 両方) を <code>accumulated_scroll</code> に蓄積、<code>take_frame</code> で reset。<code>Ui::take_scroll_in_rect(rect)</code> が pointer 位置で消費。</li>
+<li><strong><code>crates/examples/daw_prototype/{Cargo.toml, src/main.rs}</code> 新規</strong> — visual prototype demo。menu_bar (File/Edit/View/Help) + split_view (sidebar | main) + tab_view (Mixer / Arrangement / Piano Roll / Sample) + 各 view 内で scroll_area / dropdown / time_ruler / bar_beat_grid / level_meter / context_menu_for を統合。</li>
+<li><strong>example 置換 (新抽象を次の機会に使う原則)</strong> — sample_editor / waveform_validation / sample_edit_ops の <code>view_start: u64 / view_len: u64 / pan_pixels / zoom_at</code> 自前実装を <code>ViewportState1D</code> に置換。</li>
+<li><strong>docs/plan.md / history.md 更新</strong> — M7 表を全 ✅ に、本節を追記 (M7 完了履歴)。</li>
+</ol>
+<h4 id="m7">設計判断 (M7 全般)</h4>
+<ul>
+<li><strong>commit 戦略</strong>: M7 全体を 1 commit (Phase 22-28 + daw_prototype + docs 同梱)。理由はユーザ判断 (5 commit / 7 commit / 1 commit の中から「全体 1 commit」を選択)。M6 (4 phase = 2 commit) より粗いが、M7 widget は相互依存が強く 1 commit 内で全 verification を通す方が整合性が高い。</li>
+<li><strong>context_menu API</strong>: <code>library 吸収方式</code> (右クリック判定を library が担当、利用者 boilerplate 不要) を採用。<code>feedback_pursue_best_practice</code> の「ユーザに workaround を強要する API は設計欠陥」原則に整合。</li>
+<li><strong>ViewportState 化</strong>: Phase 22 で <strong>先行投入</strong> (Phase 27 まで待たない)。理由: scroll_area の縦方向と sample_editor の X 方向が同じ式、4 箇所の重複コード解消が早いほど DRY 効果が大きい。<code>f64</code> 採用は大規模 DAW project の sample 数が <code>u32</code> を超えるため。</li>
+<li><strong>demo 目標</strong>: visual prototype (tab + split + menu + scroll が「見た目 DAW」になる) で M7 完結。操作の整合性 (undo / shortcut / drag&amp;drop) は M8 で本格化、daw_prototype は M8 完了後に「操作可能な DAW prototype」として再仕上げ。</li>
+<li><strong>clip_rect の scenegraph 整合性</strong>: <code>with_widget_node</code> の input_hash に current_clip を XOR mix することで、scroll で clip が動いたときに cached commands が自動無効化される。heavy() 内部の cached scene にも同じ仕組みが効くため、popup の anchor 移動でキャッシュがズレる問題も解消。</li>
+<li><strong>popup の z-order</strong>: deferred buffer (<code>popup_rects</code> / <code>popup_glyphs</code> / <code>popup_lines</code>) を Ui に持ち、frame 末尾で base scene に append する方式。新しい z-order struct や render pass は不要 (Scene の追加順 = 描画順 という既存設計に乗る)。</li>
+<li><strong>modal popup の click 消費</strong>: popup の anchor 外で press があれば popup_layer 自身が <code>pointer.primary_just_pressed/released = false</code> にして他 widget に流さない (modal popup のみ)。これは「popup_layer を user closure の早い段階に置く」前提 (利用者向けの妥協ポイントとして本節に記録、M8 で改善)。</li>
+</ul>
+<h4 id="m8">既知の妥協 / M8 送り</h4>
+<ul>
+<li><strong>bench files の修正</strong>: M6 commit 24304b8 で <code>UiHost::new</code> が引数必須になったが bench (<code>heavy_arrangement.rs</code> / <code>heavy_piano_roll.rs</code> / <code>waveform.rs</code>) が未修正 → M7 で <code>UiHost::no_redraw()</code> に置換。M6 時点での pre-existing breakage の修正。</li>
+<li><strong>context_menu の anchor 復元</strong>: popup_state.anchor を <code>Ui::popup_layer</code> 内側で参照する経路がまだ無いため、context_menu_for は「popup を開いた瞬間の pointer 位置」を毎フレーム再評価する近似実装 (pointer が動くと popup の位置がずれる)。M8 で popup_layer の closure に <code>&amp;PopupOpenState</code> を渡す改良予定。</li>
+<li><strong>arrangement の scroll_area 統合</strong>: M7 plan では「arrangement に scroll_area を被せる」とあったが、arrangement は既に <code>y_zoom / y_offset</code> で manual scroll を持つため、daw_prototype で scroll_area の利用例を示し、arrangement への統合は M8 / M9 で再評価 (重複機能の整理が必要)。</li>
+<li><strong>focus stack の単一 popup 対応</strong>: 現状 nested popup (sub-menu cascade) は menu_bar 内の builder で書ける形にしているが、<code>open_popups</code> HashMap で並列管理しており本格的な stack 順序は未保証。M8 popup 強化で対応予定。</li>
+</ul>
+<h4 id="_3">検証結果 (本コミット時点)</h4>
+<ul>
+<li><code>cargo build --workspace</code>: ✅</li>
+<li><code>cargo test --workspace</code>: ✅ (daw-ui-core 69 tests pass、daw-ui-renderer 4 tests pass、<code>no_clone_required</code> trybuild green、<code>widget_id_collision</code> pass)</li>
+<li><code>cargo clippy --workspace --tests -- -D warnings</code>: ✅</li>
+<li><code>cargo check --workspace --benches</code>: ✅ (heavy_arrangement / heavy_piano_roll / waveform 全 fix 済み)</li>
+<li><code>cargo run --bin daw_prototype</code>: ビルド ✅、実機動作確認は利用者依存 (visual prototype のため)</li>
+</ul>
+<p><strong>残作業</strong>: なし。<strong>M7 完了</strong>。M8 以降の構成は plan.md M8-M14 を参照。</p>
+<h3 id="m8-phase-29-34-m8-2026-05-021-commit">M8 (アクション / 入力基盤) — Phase 29-34 全完遂 ✅ M8 完了 (2026-05-02、1 commit)</h3>
+<p>ユーザ判断で <strong>M8 全体を 1 commit</strong> で完遂 (M7 と同方針)。Phase 29-34 + 既存 example (mixer / sample_edit_ops / piano_roll / daw_prototype) の M8 機能配備 + fader/knob signature 拡張 (label 追加) + docs 同梱。</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>テーマ</th>
+<th>状態</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>29</td>
+<td>history stack (undo / redo)</td>
+<td>✅ <code>Edit::Undoable { forward, inverse, label }</code> variant + <code>Edit::with_inverse</code> + <code>HistoryStack&lt;M&gt;</code> + <code>Ui::request_undo / request_redo / can_undo / can_redo / undo_label / redo_label</code> (no-Clone 維持、<code>Arc&lt;dyn Fn&gt;</code> で forward/inverse を保持)</td>
+</tr>
+<tr>
+<td>30</td>
+<td>keyboard shortcut + navigation</td>
+<td>✅ <code>Shortcut::parse / matches</code> + <code>ShortcutMap::with_default_bindings</code> (undo/redo/cut/copy/paste/save/open/tab_next/tab_prev/focus_*) + <code>Ui::take_shortcut</code> (Pull 型) + <code>Ui::focusable / draw_focus_ring</code> + Tab traversal (登場順) + arrow nav (2D 最近傍)</td>
+</tr>
+<tr>
+<td>31</td>
+<td>clipboard (cut / copy / paste)</td>
+<td>✅ <code>ClipboardProvider</code> trait + <code>NoopClipboard</code> + <code>ArboardClipboard</code> (feature <code>clipboard</code>) + <code>UiHost::with_clipboard</code> + <code>Ui::take_clipboard_paste / set_clipboard_text</code> (paste shortcut 検出内蔵)</td>
+</tr>
+<tr>
+<td>32</td>
+<td>drag &amp; drop (OS file)</td>
+<td>✅ <code>AppEvent::FileHovered / FileDropped / FileHoverCancelled</code> + <code>InputAccumulator</code> 蓄積 + <code>Ui::take_file_drop_in_rect / is_file_hovering_in_rect</code> (drop 直前 cur_pos を合成)。 M14 で <code>take_file_drop_in_rect</code> の戻り型を <code>Option&lt;DroppedFiles&gt;</code> に拡張 (drop position も caller に提供、daw_01 #023)</td>
+</tr>
+<tr>
+<td>33</td>
+<td>multi-select (rect drag)</td>
+<td>✅ <code>DragRect { start, end, modifiers, finished }</code> + <code>Ui::take_drag_rect_in_rect(wid, bounds)</code> (drag 中は半透明 cyan overlay を library 自動描画)</td>
+</tr>
+<tr>
+<td>34</td>
+<td>file dialog (native)</td>
+<td>✅ <code>FileDialogFilter / DialogResult</code> + <code>Ui::request_*_file_dialog / take_dialog_result</code> (rfd 同期実行、UiHost::frame 末尾 block、feature <code>dialog</code>)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="_4">主な成果物 (詳細)</h4>
+<ol>
+<li><strong><code>crates/ui/src/edit.rs</code></strong> — <code>Edit&lt;M&gt;</code> enum を <code>Mutate(Box&lt;dyn FnOnce&gt;)</code> のみから <code>{ Mutate, Undoable { forward: Arc&lt;dyn Fn&gt;, inverse: Arc&lt;dyn Fn&gt;, label } }</code> に拡張。<code>Edit::with_inverse(label, fwd, inv)</code> で undoable Edit を構築 (<code>Fn + Send + Sync + Clone + 'static</code> 制約)。<code>Edit::label() -&gt; Option&lt;&amp;'static str&gt;</code>、<code>apply()</code> は forward を実行 (history への push は <code>UiHost::frame</code> 責務)。</li>
+<li><strong><code>crates/ui/src/history.rs</code> 新規</strong> — <code>HistoryStack&lt;M&gt; { undo: VecDeque&lt;HistoryEntry&lt;M&gt;&gt;, redo, capacity }</code> ring buffer (default 100)。<code>push / undo / redo / can_undo / can_redo / undo_label / redo_label / clear / set_capacity</code>。新規 push で redo クリア (DAW 標準動作)、capacity 超過で最古から truncate。9 unit tests pass。</li>
+<li><strong><code>crates/ui/src/shortcut.rs</code> 新規</strong> — <code>Shortcut { key: PhysicalKey, mods: Modifiers }</code> + <code>Shortcut::parse(spec: &amp;str)</code> ("Ctrl+Shift+Z" 形式パーサ)。<code>ShortcutMap</code> に entries を登録順保持、<code>with_default_bindings()</code> で DAW 慣用 shortcut を一括登録。<code>display_for(name)</code> で menu 右端の "Ctrl+Z" 表記。8 unit tests pass。</li>
+<li><strong><code>crates/ui/src/clipboard.rs</code> 新規</strong> — <code>ClipboardProvider</code> trait (get_text / set_text / get_bytes / set_bytes 4 method、bytes は default no-op)、<code>NoopClipboard</code> (test / clipboard 不在 fallback)、<code>ArboardClipboard</code> (feature <code>clipboard</code>、<code>arboard::Clipboard::new()</code> 失敗時 no-op に degrade、eprintln でログ)。</li>
+<li><strong><code>crates/ui/src/dialog.rs</code> 新規</strong> — <code>FileDialogFilter { name, extensions }</code> + <code>DialogResult { Cancelled / OpenFile / OpenFiles / SaveFile }</code> + 内部 <code>DialogRequest { name, kind, title, default_name, filters }</code>。</li>
+<li><strong><code>crates/ui/src/widgets/drag_rect.rs</code> 新規</strong> — <code>DragRect { start, end, modifiers, finished }</code> + <code>DragRect::rect()</code> (normalize) / <code>contains_point()</code>。内部 <code>DragRectState { drag_start, start_modifiers }</code> で frame 越し state 保持。</li>
+<li><strong><code>crates/ui/src/ui.rs</code></strong> — <code>UiHost</code> に <code>history / shortcut_map / clipboard / pending_dialog_results / last_focusable / transient_*</code> field 追加。builder <code>with_history_capacity / with_shortcut_map / with_clipboard</code>、accessor <code>history / history_mut / shortcut_map / shortcut_map_mut / clipboard_available</code>。<code>UiHost::frame</code> で <code>Edit::Undoable</code> を見つけたら forward を実行 + <code>(forward, inverse, label)</code> を <code>history.push</code>、undo/redo / clipboard write / dialog 同期実行 / consumed dialog result クリーンアップ。<code>Ui</code> には Phase 29-34 全 method を追加 (<code>request_undo / request_redo / can_undo / can_redo / take_shortcut / set_typing_focus / focusable / draw_focus_ring / take_clipboard_paste / set_clipboard_text / take_clipboard_paste_bytes / set_clipboard_bytes / take_file_drop_in_rect / is_file_hovering_in_rect / hovering_files / take_drag_rect_in_rect / request_open_file_dialog / request_open_files_dialog / request_save_file_dialog / take_dialog_result / shortcut_for</code>)。frame_to_edits 末尾に Tab/arrow focus traversal (<code>tab_navigate / arrow_navigate / FocusDirection</code>)。</li>
+<li><strong><code>crates/platform/src/event.rs</code></strong> — <code>Modifiers::empty / is_empty / matches</code> ヘルパ追加、<code>PhysicalKey</code> に <code>Char(char) / Digit(u8) / F(u8) / Delete / Home / End / PageUp / PageDown / Insert</code> variant 追加 (M1 の制御キー + Other(u32) のみから拡張、shortcut 解釈で必要)、<code>AppEvent::FileHovered / FileHoverCancelled / FileDropped(PathBuf)</code> の 3 variant 追加。</li>
+<li><strong><code>crates/platform/src/winit_backend.rs</code></strong> — <code>KeyCode::KeyA..KeyZ → PhysicalKey::Char('A'..'Z')</code>、<code>Digit0..Digit9 → Digit</code>、<code>F1..F24 → F</code>、<code>Delete / Home / End / PageUp / PageDown / Insert</code> mapping 追加。<code>WindowEvent::DroppedFile / HoveredFile / HoveredFileCancelled</code> を AppEvent に変換 (これまで <code>_ =&gt; {}</code> で捨てていた path)。</li>
+<li><strong><code>crates/ui/src/input.rs</code></strong> — <code>DroppedFiles { paths, position }</code> 型新規、<code>PointerFrame</code> は Copy 維持のため file_drop は <code>FrameInput::file_drop / file_hover</code> フィールドで保持 (PointerFrame に乗せると <code>Copy</code> 失う)。<code>InputAccumulator</code> に <code>pending_file_drops / hovering_files</code>、<code>ingest</code> で <code>AppEvent::FileHovered → push</code>, <code>FileHoverCancelled → clear</code>, <code>FileDropped → push + hovering clear</code>。<code>take_input</code> で drop pos に直近 <code>cur_pos</code> を合成 (winit が DroppedFile に position を提供しないため)。</li>
+<li><strong><code>crates/ui/src/widgets/{fader,knob}.rs</code></strong> — <code>fader_at / fader / knob_at / knob</code> の signature 拡張: <code>label: &amp;'static str</code> 引数追加、<code>on_change</code> を <code>FnOnce</code> から <code>Fn + Clone + Send + Sync + 'static</code> に。<code>FaderState / KnobState</code> に <code>drag_initial_value: Option&lt;f32&gt;</code> 追加。drag 開始時の値を保存、release frame で <code>take()</code> して <code>Edit::with_inverse(label, fwd, inv)</code> を発行。drag 中の Mutate Edit は release frame では抑制 (Undoable.forward が再実行するため二重更新を回避)。</li>
+<li><strong><code>crates/ui/src/widgets/text_input.rs</code></strong> — focus 中に <code>ui.set_typing_focus(true)</code> を 1 行追加 (M9 で修飾なし shortcut 抑制経路で参照予定)。</li>
+<li><strong><code>crates/ui/Cargo.toml</code></strong> — <code>[features] default = ["dialog", "clipboard"]</code>、<code>dialog = ["dep:rfd"]</code>、<code>clipboard = ["dep:arboard"]</code>、<code>rfd = "0.15"</code> / <code>arboard = "3"</code> を optional dep として追加。</li>
+<li><strong>example 更新 (新抽象を次の機会に使う原則)</strong> —<ul>
+<li><code>mixer</code>: shortcut undo/redo (Ctrl+Z / Ctrl+Shift+Z + Ctrl+Y) を frame 頭に追加、fader/knob は drag 終端で undoable Edit を自動発行 (signature 拡張で label 渡し)。</li>
+<li><code>daw_prototype</code>: shortcut undo/redo + Ctrl+O で audio file open dialog を request + AppEvent::FileDropped を screen-wide で受けて last_action に表示。Edit menu の Undo/Redo ラベルに shortcut 表記 (Ctrl+Z) を併記 (実動作は shortcut layer 経由)。</li>
+<li><code>sample_edit_ops</code>: shortcut undo/redo を frame 頭に追加 (trim/fade の完全 undoable 化は audio buffer copy のメモリコストが大きいため M9 送り、docs に明記)。</li>
+<li><code>piano_roll</code>: shortcut undo/redo を frame 頭に追加 (note 編集自体は M10 で本実装、ここは shortcut layer 動作確認の demo のみ)。</li>
+<li><code>arrangement / sample_editor / waveform_validation</code>: 直接の M8 機能追加なし (将来 M9 で個別実装、現状は fader_at/knob_at 利用箇所が無いため signature 変更影響なし)。</li>
+</ul>
+</li>
+<li><strong>テスト追加</strong> — <code>crates/ui/tests/m8_integration.rs</code> 新規 (9 tests): undoable_edit_round_trip / shortcut_take_consumes_match / shortcut_redo_with_ctrl_y / tab_traversal_moves_focus_in_order / noop_clipboard_paste_returns_none / file_drop_consumed_by_take_in_rect / file_drop_outside_rect_returns_none / drag_rect_press_drag_release_lifecycle / dialog_request_does_not_panic_without_action。<code>tests/ui/pass/basic.rs</code> (trybuild) に <code>Edit::with_inverse</code> 使用例を追加して <strong><code>Fn</code> 制約でも Model に Clone 不要</strong> を回帰固定。<code>crates/ui/src/{history,shortcut,clipboard,dialog,widgets/drag_rect}.rs</code> 内に unit tests (history 9 + shortcut 8 + clipboard 1 + dialog 1 + drag_rect 2 = 21) を追加。</li>
+<li><strong>docs/plan.md / history.md 更新</strong> — M8 表を全 ✅ に、本節を追記 (M8 完了履歴)。</li>
+</ol>
+<h4 id="m8_1">設計判断 (M8 全般)</h4>
+<ul>
+<li><strong>commit 戦略</strong>: M8 全体を 1 commit (Phase 29-34 + example/test/docs 同梱、M7 と同方針)。理由: M8 の各 phase は API 表面が小さく widget tree 全体に薄く分散するため、breaking change を 1 commit で吸収する方が整合性が高い。</li>
+<li><strong><code>Edit::Undoable</code> の <code>Fn</code> 制約 + variant 追加</strong>: <code>Box&lt;dyn FnOnce&gt;</code> のままだと redo (forward 再実行) が不可能。代替案 (UndoableEdit 別型 / UndoOp pub trait / undo only) は API 表面 / boilerplate / 仕様違反のいずれかで不採用。<code>Arc&lt;dyn Fn(&amp;mut M) + Send + Sync&gt;</code> で forward/inverse を保持し、apply 時に history へ Arc clone を push する設計で、ユーザクロージャの capture も Copy 値だけで完結する自然な書き方になる (<code>move |m| m.x = old</code>)。</li>
+<li><strong>fader/knob の <code>label</code> 追加 (breaking change)</strong>: 既存 fader_at の <code>on_change: FnOnce(f32) -&gt; Edit&lt;M&gt;</code> を <code>Fn + Clone</code> に変更し、5 番目引数で <code>label: &amp;'static str</code> を追加。1 commit で全 example (mixer / daw_prototype) と trybuild test を一括更新。drag 終端の Undoable Edit 発行で history に積まれる単位を「drag 開始 → drag 終端」に統一 (DAW 標準動作)。</li>
+<li><strong>shortcut Pull 型 (<code>Ui::take_shortcut(name) -&gt; bool</code>)</strong>: declarative <code>Ui::shortcut(spec, fn)</code> より context-sensitive な制御 (focused widget の有無で発火を変える等) を widget tree のどこからでも書けるため採用。<code>set_typing_focus(true)</code> を text_input が呼ぶ経路を仕込んで M9 で修飾なし shortcut 抑制を後付け予定。</li>
+<li><strong>clipboard は trait 経由 (<code>ClipboardProvider</code>)</strong>: M13 baseview backend 移行時に provider 差し替えだけで済む。winit backend では <code>ArboardClipboard</code> を <code>UiHost::with_clipboard(...)</code> で渡す。<code>arboard::Clipboard::new()</code> の失敗 (Linux で xclip/wl-clipboard 不在) は内部で握り eprintln でログ + no-op に degrade、UI 側は failure を意識しない。</li>
+<li><strong>file dialog は同期実行 (rfd::FileDialog::pick_file())</strong>: DAW 業界標準の modal UX、winit と rfd の thread 互換性が Windows / macOS で安定。Linux GTK/portal で問題が出た場合は <strong>非同期版</strong> (thread spawn + channel) に降りる retreat path を残す。</li>
+<li><strong>multi-select の overlay は library が自動描画</strong>: drag 中の半透明 cyan rect (alpha 0.20 + 1px border) を <code>take_drag_rect_in_rect</code> 内で <code>push_rect</code>、利用者は drag rect の <code>start / end / finished</code> を見て selection を構築するだけ (CLAUDE.md「user に boilerplate を強要しない」原則と整合)。</li>
+<li><strong>Tab traversal は登場順 default</strong>: <code>Ui::focusable(wid, rect)</code> の push 順 (= layout 順) で Tab next / Shift+Tab prev、arrow nav は rect 中心の 2D 距離 (主軸 + 副軸×2) で最近傍。explicit <code>focus_priority(wid, i32)</code> 等の order 指定 API は実用上必要が出たときに M9 以降で追加 (KISS)。</li>
+<li><strong>frame_to_edits の signature 維持</strong>: M8 で UiHost::frame に追加された transient state (undo/redo request / clipboard writes / dialog requests / consumed dialog results) は <strong>UiHost の transient field</strong> として保持し、<code>frame_to_edits</code> の戻り値 <code>Vec&lt;Edit&lt;M&gt;&gt;</code> は変えない。low-level user は <code>take_frame_outputs()</code> (将来追加) 等で transient を取り出せる方針。今 commit では <code>frame_to_edits</code> を直接呼ぶ既存 example / test の互換性を保つ。</li>
+<li><strong>PointerFrame は Copy 維持</strong>: file_drop は <code>Vec&lt;PathBuf&gt;</code> を含むため <code>PointerFrame</code> には乗せず、<code>FrameInput</code> の別 field (<code>file_drop / file_hover</code>) として持つ。これで widget 内部の <code>let pointer = self.pointer;</code> の Copy 利用が壊れない (M7 までの大量の widget code が無傷で動く)。</li>
+</ul>
+<h4 id="m9">既知の妥協 / M9+ 送り</h4>
+<ul>
+<li><strong>declarative <code>Ui::shortcut(spec, on_match)</code> sugar</strong>: Pull 型の <code>take_shortcut</code> で M8 完結。declarative sugar は M9 で paradigm を共存させる検討 (KISS で見送り)。</li>
+<li><strong>MIME bytes clipboard の実用例</strong>: <code>set_clipboard_bytes / take_clipboard_paste_bytes</code> は API skeleton のみ提供 (provider default は no-op)。実用は M10 (audio buffer の clipboard / MIDI note の clipboard) で。</li>
+<li><strong>arrow nav の対角 priority 詳細</strong>: 最初の実装は 2D 距離 + quadrant の単純な metric。複雑なレイアウト (table / grid) で「次の行の先頭にジャンプ」のような直感的振る舞いが必要なら M9 で改良。</li>
+<li><strong>rfd Linux 環境互換性</strong>: 現状は同期版を採用、Linux GTK/portal で問題が出たら非同期版 (thread spawn + channel) に降りる retreat path を docs に明記。</li>
+<li><strong>HistoryStack のグループ化 (multiple Edits を 1 step として扱う)</strong>: 構造を残しつつ M8 では実装しない。<code>HistoryStack::begin_group / end_group</code> を後付けできる余地あり。</li>
+<li><strong><code>set_typing_focus</code> の修飾なし shortcut 抑制</strong>: text_input が <code>set_typing_focus(true)</code> を呼ぶ経路は仕込み済みだが、shortcut layer 自体は frame 頭で全 shortcut を判定するため、現状は typing_focus フラグを読まない。M9 で修飾なし shortcut (Space / Delete 等) を typing 中に抑制する logic を追加予定。</li>
+<li><strong>trim/fade を Edit::with_inverse 化</strong>: sample_edit_ops の trim/fade は audio buffer (Vec<f32>) を変更するため undoable 化には snapshot copy が必要。memory コストが大きく no-Clone 方針と緊張する。M9 で Arc&lt;[f32]&gt; 共有 + COW スナップショット戦略で再検討。</li>
+<li><strong>UiHost::take_frame_outputs() (low-level API)</strong>: <code>frame_to_edits</code> 経由の low-level user 向けに transient 取り出し API を追加するべきだが、現状 example で frame_to_edits を直接使うのは bench / no_clone_required pass だけなので、本 commit では未実装。M9 で必要に応じて追加。</li>
+<li><strong>arrangement / sample_editor / waveform_validation の M8 機能配備</strong>: docs/plan.md M8 表に書かれていた個別配備 (file drop / dialog / rect select の各 example での実装) は時間制約で daw_prototype に集約。M9 で個別 example にも展開。</li>
+</ul>
+<h4 id="_5">検証結果 (本コミット時点)</h4>
+<ul>
+<li><code>cargo build --workspace</code>: ✅</li>
+<li><code>cargo test --workspace</code>: ✅ (daw-ui-core 90 unit + 9 m8_integration + 1 widget_id_collision + 1 no_clone_required trybuild = 101 tests pass)</li>
+<li><code>cargo test -p daw-ui-core --test no_clone_required</code>: ✅ (<code>Edit::with_inverse</code> の <code>Fn</code> 制約でも Model に Clone 不要を trybuild で固定)</li>
+<li><code>cargo clippy --workspace --tests -- -D warnings</code>: ✅</li>
+<li>実機 (<code>cargo run --bin daw_prototype</code> 等): ビルド ✅、shortcut Ctrl+Z/Y/O / file drop / dialog の動作確認は利用者依存</li>
+</ul>
+<p><strong>残作業</strong>: なし。<strong>M8 完了</strong>。M9 (theming + animation + icons) に進む。</p>
+<hr>
+<h2 id="ui-m2-m5">波形表示 UI 詳細設計 (M2 で実装、M5 で詳細モード追加)</h2>
+<h3 id="1-api-m2">1. 公開 API (M2 で確定、後方互換を意識)</h3>
+<pre><code class="language-rust">// crates/ui/src/widgets/waveform.rs
+
+impl&lt;'a, M&gt; Ui&lt;'a, M&gt; {
+    pub fn waveform&lt;'s&gt;(
+        &amp;mut self,
+        id: impl Hash,
+        rect: Rect,
+        source: WaveformSource&lt;'s&gt;,
+        view: WaveformView,
+        style: WaveformStyle,
+    ) -&gt; WaveformResponse;
+}
+
+pub struct WaveformSource&lt;'s&gt; {
+    /// 生サンプル。フレーム間で同じ slice が来る限り、内部 LOD を再利用。
+    pub samples: SampleSlices&lt;'s&gt;,
+    /// 有効長 (録音中など samples.len() より小さい場合あり)。
+    pub valid_len: usize,
+    /// アプリが内容変更時にインクリメントする。一致なら LOD 再利用。
+    pub generation: u64,
+    pub sample_rate: u32,
+}
+
+pub enum SampleSlices&lt;'s&gt; {
+    Mono(&amp;'s [f32]),
+    /// 各チャンネル個別 (planar)
+    Planar(&amp;'s [&amp;'s [f32]]),
+    /// インターリーブ (channels 個ずつ並ぶ)  — M5 で対応
+    Interleaved { data: &amp;'s [f32], channels: usize },
+}
+
+pub struct WaveformView {
+    pub start_sample: u64,
+    pub len_samples: u64,
+    pub vertical_gain: f32,
+}
+
+pub struct WaveformStyle {
+    pub fg: Color,
+    pub fg_clipped: Color,             // |sample| &gt; 1.0 を強調
+    pub fill: Option&lt;Color&gt;,            // RMS 塗りつぶし — M5
+    pub baseline: Option&lt;Color&gt;,
+    pub channel_layout: ChannelLayout,  // Stack / Overlay / FirstOnly
+    pub render_mode: WaveformRenderMode,
+    pub line_width_px: f32,
+}
+
+pub enum WaveformRenderMode {
+    /// pixel あたり 1 本の縦線 (min..max)。M2 で対応する唯一のモード。
+    PeakLines,
+    /// pixel あたり ±RMS バー — M5
+    RmsBars,
+    /// 1 サンプル/pixel 以下にズームしたとき: 折れ線 + サンプル点マーカー — M5
+    SamplePolyline,
+    /// samples_per_pixel から自動切替 — M5
+    Auto,
+}
+
+pub struct WaveformResponse {
+    pub hovered: bool,
+    pub clicked_at: Option&lt;WaveformHit&gt;,
+    pub dragging_at: Option&lt;WaveformHit&gt;,
+}
+
+pub struct WaveformHit {
+    pub sample_index: u64,
+    pub channel: usize,
+    pub local_x_px: f32,
+    pub local_y_px: f32,
+}
+</code></pre>
+<p><strong>「Clone しない」原則の保ち方</strong>:
+- <code>WaveformSource&lt;'s&gt;</code> は <strong>借用のみ</strong> で構成 (<code>&amp;[f32]</code> / <code>&amp;[&amp;[f32]]</code>)。<code>Clone</code>/<code>PartialEq</code> は要求しない。
+- 内部 LOD ピラミッドは派生データ (min/max ペア) で、生サンプルのコピーではない。
+- <code>generation: u64</code> を <strong>唯一の不変キー</strong> として再構築判定。bitwise hash や中身比較は行わない。
+- <code>WaveformView</code> は <strong>アプリ側がスクロール/ズーム状態を所有</strong>。ライブラリは描画のみ。</p>
+<h3 id="2-lod">2. 内部 LOD ピラミッド</h3>
+<p>実装方針: <strong>既存の <code>state: HashMap&lt;WidgetId, Box&lt;dyn WidgetState&gt;&gt;</code> を再利用</strong> する (新しいキャッシュ用フィールドを生やさない)。<code>WaveformPyramid</code> は <code>Any + Send + Sync</code> なので <code>WidgetState</code> の blanket impl が当たり、<code>Ui::widget_state::&lt;WaveformPyramid&gt;(wid)</code> で取り出せる。Single Source of Truth に沿う形。</p>
+<pre><code class="language-rust">// 既存
+struct UiHost&lt;M&gt; {
+    state: HashMap&lt;WidgetId, Box&lt;dyn WidgetState&gt;&gt;,
+    // ... 波形ウィジェット用に新フィールドは追加しない
+}
+
+// crates/ui/src/widgets/waveform.rs (pub(crate))
+struct WaveformPyramid {
+    fingerprint: PyramidFingerprint,
+    /// levels[0] が最も細かい (decimation = 16)、levels[last] が最も粗い。
+    /// 生サンプルはピラミッドに含まない (毎フレーム借用される source.samples を直接走査)。
+    levels: Vec&lt;MinMaxLevel&gt;,
+}
+
+struct PyramidFingerprint {
+    generation: u64,
+    valid_len: usize,
+    sample_rate: u32,
+    channels: u32,
+}
+
+struct MinMaxLevel {
+    /// channels × pairs_per_channel ペア。チャンネル毎に連続。
+    pairs: Vec&lt;MinMaxPair&gt;,
+    pairs_per_channel: usize,
+    decimation: u32,        // 16^k
+}
+
+#[repr(C)]
+struct MinMaxPair { min: f32, max: f32 }
+</code></pre>
+<p><strong>注意</strong>: M1 の <code>widget_state</code> ヘルパには <code>Box&lt;dyn WidgetState&gt;</code> 自身に blanket impl が当たって <code>as_any_mut</code> が外側 Box の TypeId を返すバグがあった (M1 では用例が無く潜在化)。M2 で明示 <code>&amp;mut **entry</code> deref に修正し、回帰テストを追加 (commit 7ddef3f)。</p>
+<p><strong>ピラミッド構築アルゴリズム</strong>:
+- ベース係数 r = 16 (チューニング可)
+- レベル 1: 16 サンプルから min/max を 1 ペア → サイズ N/16
+- レベル k+1: レベル k の隣接 r ペアの min/max を再計算 → サイズ N/16^(k+1)
+- 最大レベル: ペア数が画面横幅の数倍 (例: 4096) を切るまで
+- メモリ: 全レベル合計でおよそ N × 0.133 のスペースで済む (r=16, 等比和)</p>
+<p><strong>ピラミッド再構築の判定</strong>:
+1. <code>(generation, valid_len, sample_rate, channels)</code> のいずれかが変化 → 完全再構築
+2. <code>valid_len</code> のみ拡大 (録音中の追記) → <strong>インクリメンタル拡張</strong> (新規分のみ計算)
+3. それ以外 → そのまま再利用</p>
+<h3 id="3">3. 描画レベル選択</h3>
+<p>ピクセル幅 W、表示サンプル数 N とすると <code>samples_per_pixel = N / W</code>。</p>
+<table>
+<thead>
+<tr>
+<th>samples_per_pixel</th>
+<th>選択</th>
+<th>M2 対応</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&gt;= 16</code></td>
+<td>レベル k = floor(log_16(samples_per_pixel))、ピラミッドキャッシュ</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><code>1.5 .. 16</code></td>
+<td>レベル 0 (生サンプル) → ピクセル毎 min/max 走査</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><code>&lt; 1.5</code></td>
+<td>SamplePolyline (折れ線 + マーカー)</td>
+<td>M5 (M2 では PeakLines のまま縮退)</td>
+</tr>
+</tbody>
+</table>
+<p>中間レベルの線形補間は行わない (DAW では一貫した min/max 表示が望ましい)。</p>
+<h3 id="4-line-strip">4. line strip パイプラインへの流し込み</h3>
+<p><code>Scene</code> を拡張 (M2 で実装済み):</p>
+<pre><code class="language-rust">pub struct Scene {
+    pub clear_color: wgpu::Color,
+    pub rects: Vec&lt;RectCommand&gt;,
+    pub glyph_areas: Vec&lt;GlyphArea&gt;,
+    pub line_batches: Vec&lt;LineBatch&gt;,    // ★ M2 で追加
+}
+
+pub struct LineSegment {
+    pub a: [f32; 2],         // 始点 (px)
+    pub b: [f32; 2],         // 終点 (px)
+    pub color: Color,
+}
+
+pub struct LineBatch {
+    pub segments: Vec&lt;LineSegment&gt;,
+    pub line_width_px: f32,
+    pub clip_rect: Option&lt;Rect&gt;,         // batch 単位の scissor (None なら全画面)
+}
+</code></pre>
+<p>PeakLines モードでは 1 ピクセル = 1 segment (a=(x,y_top), b=(x,y_bottom)) で W 本作る。
+GPU 側 (<code>pipelines/line.rs</code>) では 1 segment = 1 instance、6 頂点を頂点シェーダで quad に展開する形に統一 (M5 で SamplePolyline モードを足すときも同じパイプラインで segment 列を流す)。</p>
+<h3 id="5-edit">5. インタラクションと Edit</h3>
+<ul>
+<li>ライブラリは <code>WaveformResponse</code> で <strong>位置情報のみ返す</strong>。Edit はアプリ側が組み立てる:
+  <code>rust
+  let resp = ui.waveform("clip0", rect, src, view, style);
+  if let Some(hit) = resp.clicked_at {
+      ui.push_edit(Edit::mutate(move |m: &amp;mut MyModel| {
+          m.set_playhead(hit.sample_index);
+      }));
+  }</code></li>
+<li>選択範囲・プレイヘッドカーソルはアプリ側 state で持ち、ライブラリには <code>ui.push_rect()</code> で重ねる。</li>
+<li>スクロール/ズームのキー入力受信もアプリ側責務。ライブラリは「現在の <code>WaveformView</code> を描く」だけ。</li>
+</ul>
+<h3 id="6-heavy-m5">6. heavy() との関係 (M5)</h3>
+<p>タイムライン上に多数のクリップ波形が並ぶケースでは <code>ui.heavy()</code> で囲み、<code>ViewportKey { range, zoom, generations }</code> でフレーム間キャッシュ:</p>
+<pre><code class="language-rust">ui.heavy(&quot;track_0_clips&quot;, |hctx| {
+    let key = ViewportKey {
+        range: m.timeline_range(),
+        zoom_level: m.zoom_level(),
+        clip_generations: m.clip_generations_hash(),
+    };
+    hctx.cached(key, || {
+        for clip in m.clips_in_range() {
+            hctx.waveform(clip.id, clip.rect, clip.source(), clip.view(), STYLE);
+        }
+    });
+});
+</code></pre>
+<p><strong>heavy() の中でも LOD ピラミッドキャッシュは引き続き有効</strong> (ピラミッドは <code>WidgetId</code> キーのため heavy 境界に影響されない)。</p>
+<hr>
+<h2 id="_6">検証方法</h2>
+<h3 id="_7">共通 (全マイルストーン)</h3>
+<ul>
+<li><code>cargo build --workspace</code> / <code>cargo clippy --workspace -- -D warnings</code> / <code>cargo test --workspace</code></li>
+</ul>
+<h3 id="m2-ui_1">M2 (波形 UI 早期検証 — 本マイルストーンの主役)</h3>
+<p><strong>性能ベンチ (criterion)</strong>:
+- LOD 初回構築: 5.76M サンプル (1 分 × 48kHz × stereo) で &lt; 50ms
+- LOD 再利用: <code>generation</code> 一致時の <code>Ui::waveform()</code> 呼び出し &lt; 100µs
+- 録音追記: 1ms 毎に valid_len を 48 サンプル拡大、フレーム時間 16.7ms 安定 1000 フレーム連続
+- line strip 単独描画: 10 万頂点を 1 draw call で 60fps</p>
+<p><strong>目視確認 (examples/waveform_validation)</strong>:
+- スクロール (左右ドラッグ) が滑らか (60fps)
+- ズーム (マウスホイール) で LOD レベルが切り替わる (HUD で確認)
+- 録音シミュレーション on にすると右端が伸びていく
+- ステレオを Stack 表示・Overlay 表示で切替できる</p>
+<p><strong>回帰防止 (trybuild)</strong>:
+- <code>Ui::waveform()</code> シグネチャに <code>Clone</code>/<code>Hash</code> 制約が登場しないことを doc test で監査
+- ユーザ Model に <code>Clone</code> 等を実装しないコードがコンパイル成功 (M3 でより網羅的に)</p>
+<p><strong>API レビュー</strong>:
+- M2 完了時点で <code>WaveformSource</code> / <code>WaveformView</code> / <code>WaveformStyle</code> / <code>WaveformResponse</code> の API シグネチャが M5 (詳細モード) でも破壊変更なしに拡張可能か、impl 担当者がチェックリストで確認</p>
+<h3 id="m3-ui">M3 (Ui 充実)</h3>
+<ul>
+<li><code>cargo bench</code>: 1 万矩形描画 60fps、IME 入力レイテンシ 1 frame 以下</li>
+<li>examples/mixer 拡張: フェーダドラッグが滑らか、ボタン押下に視覚フィードバック</li>
+<li>trybuild: ユーザ Model に <code>Clone</code>/<code>PartialEq</code>/<code>Hash</code>/<code>Default</code> を実装していないコードがコンパイル成功</li>
+</ul>
+<h3 id="m4-scenegraph">M4 (scenegraph)</h3>
+<ul>
+<li>input hash 衝突テスト: ランダム widget 入力 1M 件で衝突 0</li>
+<li>「変化していないフレームで draw call 数が前フレームと同じ」を 1000 フレーム連続で確認</li>
+<li>波形ウィジェットが scenegraph 統合後も M2 のベンチ値を維持</li>
+</ul>
+<h3 id="m5-heavy-piano-roll">M5 (heavy() + 詳細波形 + piano roll)</h3>
+<ul>
+<li>examples/sample_editor: 5 分ステレオを全表示 → ズーム → 1 サンプル/ピクセル → 折れ線 + マーカーが見える</li>
+<li>examples/sample_editor: 詳細モードでクリック位置のサンプル index ±1 以内</li>
+<li>examples/piano_roll: 100k notes スクロール 120fps</li>
+<li>多数クリップ表示 (10 トラック × 各 50 クリップ) を heavy() で 60fps</li>
+</ul>
+<hr>
+<h2 id="_8">設計上の不変条件</h2>
+<ol>
+<li>ライブラリ提供 API は <strong>ユーザ Model 型に <code>Clone</code>/<code>PartialEq</code>/<code>Hash</code>/<code>Default</code> を要求しない</strong>。差分検出は ID + プリミティブ末端値の hash でだけ行う。</li>
+<li>メッセージ型は導入しない (Edit は enum or <code>Box&lt;dyn FnOnce&gt;</code>)。<code>Application::Message: Clone</code> 伝染を構造的に防ぐ。</li>
+<li><code>derive</code> マクロは禁止 (Lens 等)。</li>
+<li>ライブラリは <strong>audio / IPC / プロセス間通信に一切関知しない</strong>。Edit を返すところで責務を切る。</li>
+<li>heavy() 以外でも viewport culling は前提 (1000 ウィジェット級は通常パスで耐える)。</li>
+<li><code>Ui&lt;'a&gt;</code> の <code>'a</code> で借用ライフタイムを統一し、GAT を使わない。</li>
+<li><strong>波形ウィジェット固有</strong>:
+   - <code>WaveformSource</code> は借用のみ。<code>samples: &amp;[f32]</code> の Clone は禁止。
+   - LOD ピラミッドは派生データ (min/max ペア) で、生サンプルのコピーは禁止。
+   - 再構築判定は <code>generation: u64</code> のみ。中身 hash や bitwise 比較は禁止。
+   - 録音中の追記 (<code>valid_len</code> 拡大) はインクリメンタル拡張で扱う。</li>
+</ol>
+<hr>
+<h2 id="_9">重要ファイル一覧</h2>
+<h3 id="m2">M2 で新規作成</h3>
+<ul>
+<li><code>F:\dev\gui_01\docs\plan.md</code> — ✅ <strong>本ファイル</strong>、git 管理下の正本</li>
+<li><code>crates/renderer/src/pipelines/line.rs</code> — ✅ line strip パイプライン</li>
+<li><code>crates/renderer/src/pipelines/line.wgsl</code> — ✅ 線分 → quad 展開シェーダ</li>
+<li><code>crates/ui/src/widgets/waveform.rs</code> — ✅ <code>Ui::waveform</code> + LOD ピラミッド (完全再構築 + インクリメンタル拡張)</li>
+<li><code>crates/examples/waveform_validation/</code> — ✅ 16×8 = 128 widgets グリッドサンプル + REC シミュレーション</li>
+<li><code>crates/ui/benches/waveform.rs</code> — ✅ criterion ベンチ (N=1/8/16/64/128)</li>
+<li><code>crates/ui/tests/no_clone_required.rs</code> — ✅ trybuild ハーネス (no-Clone 制約の自動検証)</li>
+<li><code>crates/ui/tests/ui/pass/basic.rs</code>, <code>tests/ui/pass/waveform.rs</code> — ✅ trybuild pass テスト</li>
+</ul>
+<h3 id="m2_1">M2 で改修</h3>
+<ul>
+<li><code>crates/renderer/src/scene.rs</code> — ✅ <code>Scene::line_batches</code>, <code>LineSegment</code>, <code>LineBatch</code> を追加</li>
+<li><code>crates/renderer/src/device.rs</code> — ✅ <code>Renderer::render</code> に line パイプライン呼び出し</li>
+<li><code>crates/renderer/src/pipelines/mod.rs</code> — ✅ <code>pub mod line;</code> 追加</li>
+<li><code>crates/ui/src/lib.rs</code> — ✅ <code>widgets::waveform</code> の公開型を再 export</li>
+<li><code>crates/ui/src/ui.rs</code> — ✅ <code>Ui::push_lines</code> 追加、<code>widget_state</code> の downcast バグ修正、回帰テスト追加</li>
+<li><code>crates/ui/Cargo.toml</code> — ✅ <code>criterion</code> / <code>trybuild</code> を <code>[dev-dependencies]</code> に追加、<code>[[bench]]</code> 設定</li>
+<li>ルート <code>Cargo.toml</code> — ✅ <code>crates/examples/waveform_validation</code> をメンバー追加</li>
+</ul>
+<h3 id="m2_2">M2 で再利用した既存資産</h3>
+<ul>
+<li><code>crates/ui/src/widgets/button.rs</code> — <code>pressed_inside</code>/<code>hovered</code>/<code>clicked</code> の使い回し</li>
+<li><code>crates/ui/src/id.rs</code> — <code>WidgetId::child</code> で per-widget cache key</li>
+<li><code>crates/ui/src/input.rs</code> — <code>PointerFrame</code> をドラッグ判定に流用</li>
+<li><code>crates/renderer/src/pipelines/rect.rs</code> — 同 wgsl パターン (uniform / instance vbuf / vertex draw) を line.rs でも踏襲</li>
+<li><code>crates/ui/src/widgets/mod.rs</code> の <code>WidgetState</code> blanket impl — <code>WaveformPyramid</code> のキャッシュをそのまま乗せる</li>
+</ul>
+<h3 id="m5">M5 で追加予定</h3>
+<ul>
+<li><code>crates/ui/src/widgets/heavy.rs</code> — <code>HeavyCtx</code>、ViewportKey キャッシュ</li>
+<li><code>crates/examples/sample_editor/</code>、<code>crates/examples/piano_roll/</code></li>
+<li><code>crates/ui/src/widgets/waveform.rs</code> の SamplePolyline / RmsBars / Auto 分岐 + マーカー描画支援</li>
+</ul>
+<hr>
+<h2 id="_10">ビルド構成 (確定)</h2>
+<ul>
+<li><strong>Rust Edition: 2024</strong> (<code>rust-toolchain.toml</code> で固定済)</li>
+<li><strong>rust-version: 1.95</strong> (workspace ルートで固定済)</li>
+<li><strong>依存</strong>: <code>[workspace.dependencies]</code> で一元管理、メンバー crate は <code>&lt;crate&gt;.workspace = true</code> で参照</li>
+<li><strong>更新方針</strong>: マイルストーン毎に最新安定版を確認、breaking change があれば追従</li>
+</ul>
+<hr>
+<h2 id="_11">履歴 (最近)</h2>
+<ul>
+<li>2026-04-30: M1 初期コミット (cd969a9) — winit + wgpu + glyphon + taffy で動く GUI ライブラリ骨格。</li>
+<li>2026-05-01: 設計計画 + CLAUDE.md を git 管理下に追加 (5e14e44)。プラン正本を <code>docs/plan.md</code> に確定。</li>
+<li>2026-05-01: M2 主要実装 (7ddef3f) — line strip パイプライン + <code>Ui::waveform</code> + LOD ピラミッド + <code>examples/waveform_validation</code> + <code>widget_state</code> バグ修正。</li>
+<li>2026-05-01: M2 性能検証 (8276ddd) — criterion ベンチ追加、example を 128 widgets grid 化。実測で DoD クリア (LOD 初回 4ms, 再利用 44µs, N=128 で 5.86ms)。</li>
+<li>2026-05-01: ドキュメント整理 (b8e320c) — <code>docs/plan.md</code> を実状に合わせて更新、README の参照を最新化。</li>
+<li>2026-05-01: trybuild 導入 (3c251c3) — no-Clone 制約 (ユーザ Model に Clone/PartialEq/Hash/Default を要求しない) の回帰防止を CI 固定。</li>
+<li>2026-05-01: <strong>M2 完成</strong> — インクリメンタル LOD 拡張 + REC シミュレーション。<code>MinMaxLevel</code> を per-channel <code>Vec&lt;Vec&gt;</code> に refactor (末尾 push 効率化)、<code>extend_to</code> で cascading boundary recompute + push、Space キー REC で実機検証可能に。indirection 増で 44→61 µs/widget の軽い regression を許容して incremental の利得を取る。M2 DoD 全項目クリア。</li>
+<li>2026-05-01: <strong>M3 Phase 1</strong> — fader (垂直スライダ、つまみ限定ドラッグ) + button armed-state モデル + Windows focus-click cur_pos workaround + edit 後の追加 redraw パターン確立。実機検証で「ホバー直後の click が反応しない」「フォーカス取得クリックで反応しない」「fader を rect 全域でドラッグ可能」「fader 感度が rect.h 基準で上端に届かない」をユーザ報告から逐次修正。</li>
+<li>2026-05-01: <strong>M3 Phase 2</strong> — knob (円形ノブ、line strip でインジケータ、上下ドラッグで値編集)。fader と同じドラッグパターン + 既存 rect (4 隅角丸 = 円) と line strip パイプラインの組み合わせで実装、新パイプライン不要。<code>examples/mixer</code> で 3 ch pan ノブとして動作確認。</li>
+<li>2026-05-01: <strong>M3 Phase 3</strong> — checkbox (bool toggle、button と同じ armed-state モデル、line strip で V 字チェックマーク)。<code>examples/mixer</code> で 3 ch mute トグルとして動作確認。</li>
+<li>2026-05-01: <strong>M3 Phase 4a</strong> — keyboard / focus 基盤。<code>InputAccumulator</code> が KeyEvent 蓄積、<code>UiHost::focused</code> でキーボードフォーカス保持、<code>Ui::set_focus</code> / <code>clear_focus_if_focused</code> / <code>is_focused</code> / <code>take_keyboard_events_if_focused</code>。クリックで誰も <code>set_focus</code> しなければ blur。<code>UiHost::frame</code> シグネチャに <code>keyboard: Vec&lt;KeyEvent&gt;</code> 追加 (既存 callers 全部追従)。単体テスト 4 本追加。これで text_input (4b) を載せる土台が揃った。</li>
+<li>2026-05-01: <strong>M3 Phase 4b</strong> — text_input (ASCII 編集)。Ui::text_input_at / text_input、TextInputState (cursor_byte + armed-state click)、char 挿入 / Backspace / 矢印 / Enter / Escape。is_focused を pending_focus ベースに変更して same-frame の click→focus を即時反映、外側 press で widget が自己 blur することで枠線解除も即時。UiHost に focus_changed_in_last_frame() を追加してアプリ側の追加 redraw 用。mixer の title を編集可能化 + OS タイトル追従 (last_window_title 差分)。単体テスト追加。</li>
+<li>2026-05-01: <strong>M3 Phase 4c</strong> — IME 統合 (基本)。InputAccumulator が ImePreedit / ImeCommit を蓄積、FrameInput で pointer/keyboard/ime をまとめて Ui::frame へ。Ui::take_ime_events_if_focused + Ui::request_ime、UiHost::ime_request()。WindowBackend::set_ime_allowed / set_ime_cursor_area を winit_backend で実装、winit の WindowEvent::Ime → AppEvent::ImePreedit/ImeCommit マッピングも winit_backend 側で完了。text_input が preedit を state に保持して描画 + cursor 位置で IME 候補ウィンドウを要求。mixer App は ime_request の Some/None 切替で OS への set_ime_allowed を差分で呼ぶ。単体テスト 2 本追加 (IME-only-to-focused / preedit-then-commit)。フォントを <strong>HackGen Console NF (固定幅)</strong> に切り替え、全テキスト (prefix + preedit + suffix) を 1 つの GlyphArea で描画して並びを正確化。pixel-perfect な cursor / 下線 / IME 候補位置と preedit 色分け復活は cosmic-text の measure 統合 (別フェーズ) で対応予定。<code>rtry</code> のまぜ書き入力対応 / GetText i18n 対応も TODO に明記。これで M3 の入力周り (focus / 通常キー / IME 基本) は機能しており、残りは LayoutPass 拡張・8ch mixer 拡張・上記 polish。</li>
+<li>2026-05-01: <strong>M3 Phase 4d</strong> — fader / knob のダブルクリック・リセット + Ctrl + ドラッグ高精度モード。中立 <code>Modifiers</code> 型 + <code>AppEvent::ModifiersChanged</code> を platform crate に追加し、<code>winit_backend</code> が <code>WindowEvent::ModifiersChanged</code> を変換して emit、<code>PointerFrame.modifiers</code> まで配線。<code>Ui::fader_at</code> / <code>fader</code> / <code>knob_at</code> / <code>knob</code> に <code>default_value: f32</code> 引数を追加、state を <code>DragAnchor { pointer_y, value, ctrl } + last_click: Option&lt;ClickRecord&gt;</code> に拡張。300ms × 5px 以内の 2 回目 press で <code>default_value</code> リセット、Ctrl+drag で <code>dv *= 0.1</code>、mid-drag で Ctrl on/off したときは anchor を再構築して値 jump を防ぐ。例 (mixer) の呼び出しと trybuild の pass を新シグネチャに追従、単体テスト 12 本追加 (fader 6 + knob 6: double-click / 閾値超過 / 距離超過 / Ctrl 1/10 感度 / mid-drag toggle / triple-click)。これで M3 の値編集 UX が DAW として成立するレベルまで揃った。</li>
+<li>2026-05-01: <strong>M3 Phase 5</strong> — <code>LayoutPass</code> 拡張。中立 <code>Padding { top, right, bottom, left }</code> / <code>Gap { x, y }</code> 型を導入、<code>LayoutPass::flex</code> シグネチャを <code>flex(direction, gap: Gap, padding: Padding, children)</code> に置換 (zero callers なので breaking OK)、<code>leaf_grow(grow: f32)</code> で <code>flex_basis: 0</code> + <code>flex_grow</code> による残余空間の比例分配をサポート。flex 親の size を <code>Dimension::auto</code> から <code>Dimension::percent(1.0) × percent(1.0)</code> に変えて、grow-only 子で構成しても親が利用可能領域を埋めるように修正 (auto だと fit-content = 0px に潰れる)。<code>Padding</code> / <code>Gap</code> を <code>crates/ui/src/lib.rs</code> から re-export。単体テスト 6 本追加 (column gap / per-side padding / per-axis gap / 2:1 grow / fixed + grow / padding shrinks grow area)。これで chrome layout の表現力が flex_grow / fixed / per-side padding まで揃った。残る M3 タスクは 8ch mixer 拡張、fader/knob 視覚 polish、text_input pixel-perfect (cosmic-text measure 統合)、i18n。</li>
+<li>2026-05-01: <strong>M3 Phase 6</strong> — <code>examples/mixer</code> を 3 ch から 8 ch に拡張、LayoutPass の最初の実用例として <code>Padding::axis(20, 0)</code> + <code>Gap::xy(16, 0)</code> で 8 列の row、各列内で <code>Gap::all(6)</code> の column flex を組む。<code>taffy::prelude::{FlexDirection, NodeId}</code> を <code>daw_ui_core</code> から re-export して、利用側が taffy を直接依存に入れずに済むようにした。手動 rect 計算 (<code>fader_left + i * (fader_w + 16.0)</code>) が消え、列レイアウトは LayoutPass 1 箇所で済む。ウィンドウ縦サイズ 600 → 660、ストリップ原点 y 240 → 280 で左側 button 群との視覚衝突を解消、ストリップヘッダを Phase 4d の操作 (Ctrl+drag / dbl-click) を含む 1 本にまとめた。<code>MixerModel</code> 配列を <code>[T; 8]</code> に拡張、初期値はリセットの動作確認しやすいよう各 ch で異なる値に。LayoutPass の利用で見えた ergonomics 課題 (NodeId → Rect の HashMap 引き / origin offset の手動足し算) は別タスクで API 改善するか判断。</li>
+<li>2026-05-01: <strong>M3 Phase 7</strong> — <code>LayoutPass</code> ergonomics 改善。<code>compute</code> シグネチャを戻り値なしに変えて内部 <code>HashMap&lt;NodeId, Rect&gt;</code> に格納、<code>rect(node) -&gt; Rect</code> で O(1) 引きできるようにした。<code>compute_at(root, w, h, origin)</code> を追加して screen 座標オフセットを内部で適用、利用側の <code>to_screen</code> クロージャと <code>into_iter().collect::&lt;HashMap&lt;_,_&gt;&gt;()</code> の boilerplate を library 内側に閉じ込める。breaking change だが zero external callers + Phase 6 で 1 caller (mixer) のみなので影響極小。mixer から <code>std::collections::HashMap</code> import が消え、build_ui のチャンネルストリップ部分が約 10 行短くなった。テスト 1 本追加 (<code>compute_at_applies_origin_offset</code>) で 33 unit + 1 trybuild、既存 6 layout テストは <code>rects()</code> ヘルパ経由から <code>p.rect(node)</code> 直呼びに簡素化。実機検証で Phase 6 と同一表示 (regression なし) を確認。</li>
+<li>2026-05-01: <strong>M3 Phase 8</strong> — fader / knob 視覚 polish。fader thumb を 24×12 角丸+border から 28×10 flat バー (border 無し) に、knob を Ableton 流の「円本体 + 300° 可動範囲弧 (回転側 cyan / 非回転側 暗グレー の 2 色) + 中心→外円インジケータ線 (白、太め)」にデザイン変更。弧の polygon 近似を 2° step に細分化してコーナーアーティファクト解消。試行錯誤の途中 (影/tick/sweep arc fill 案、bipolar default_value 起点 arc 案、外側 rest tick 案) は最終形のみ commit。実機 Ableton との細部詰め (配色、質感) は別タスクとして残す。感度カーブ (非線形マッピング) は別タスク。</li>
+<li>2026-05-01: <strong>M4 Phase 9</strong> — glyphon Buffer キャッシュ。<code>GlyphPipeline</code> 内に <code>HashMap&lt;u64, CachedBuffer&gt;</code> を導入し、<code>(text, font_size, line_height)</code> の <code>DefaultHasher</code> ハッシュをキーとして <code>Buffer</code> を再利用。同一 text の繰り返し描画 (mixer の ch label 等) で <code>Buffer::new</code> + shaping を回避し、毎フレーム N 回 → 0〜1 回 (新規時のみ) に削減。5 秒 (300 frame) 未使用 entry は eviction。<code>Scene</code> / <code>GlyphArea</code> の API は不変、widgets / examples は無変更で恩恵を受ける。<code>buffer_key</code> の単体テスト 4 本追加 (renderer crate 初の単体テスト群)。M4 の最初のサブ phase、scenegraph 本体は Phase 10 以降で。</li>
+<li>2026-05-01: <strong>M4 Phase 10</strong> — Scenegraph 基盤 + WidgetId 1M 衝突テスト。<code>crates/ui/src/scenegraph.rs</code> に <code>Scenegraph</code> (<code>HashMap&lt;WidgetId, SceneNode&gt;</code> 内蔵) と <code>SceneNode { input_hash: u64 }</code> 型を新設、API は <code>unchanged</code> / <code>record</code> / <code>retain</code> / <code>len</code> / <code>is_empty</code>。元 plan の <code>SlotMap&lt;NodeId, SceneNode&gt;</code> は <code>WidgetId</code> が安定キーなので不要と判断、<code>slotmap</code> 依存追加を回避 (Cargo.toml 不変)。<code>UiHost</code> に <code>scenegraph: Scenegraph</code> フィールドを追加 (Phase 10 では宣言のみ、Phase 11 で widget から書き込み)。<code>tests/widget_id_collision.rs</code> で 1000 parents × 1000 children = 1M unique IDs の衝突 0 を担保。Scenegraph 単体テスト 5 本 + 衝突テスト 1 本で計 6 本追加。Phase 11 で <code>Ui::with_widget_node</code> API + 各 widget 適用に進む。</li>
+<li>2026-05-01: <strong>M4 Phase 11</strong> — <code>Ui::with_widget_node</code> API + 6 widget 適用 + 描画コマンドキャッシュ。<code>SceneNode</code> を <code>{ input_hash, commands: CachedCommands }</code> に拡張、<code>CachedCommands { rects, glyph_areas, line_batches }</code> で per-widget の描画コマンドを保持。<code>Ui::with_widget_node(wid, input_hash, draw_fn)</code> API を追加: hash 一致なら draw_fn をスキップして前フレームの commands を scene に append、不一致なら draw_fn を実行して scene 末尾差分を新規 commands として記録。<code>UiHost::frame</code> 末尾で <code>scenegraph.retain(&amp;seen_widgets)</code> で動的に出現/消滅する widget を扱う。6 widget (button / label / checkbox / fader / knob / text_input) を全て wrap、各 widget が <code>hash_inputs((b"&lt;種別&gt;", rect.x.to_bits(), ..., 状態フラグ))</code> で input_hash 計算。判別タグ (<code>b"fader"</code> 等) で異種 widget 間の偶然の hash 衝突を防ぐ。waveform は LOD generation の特殊処理が必要なので Phase 12 で。with_widget_node 単体テスト 3 本 + scenegraph 追加テスト 2 本 = 5 本追加 (合計 48 unit/test)、clippy 増分 0、mixer 実機で表示・操作に regression なし。</li>
+<li>2026-05-01: <strong>M4 Phase 12 — milestone 完了</strong> — 波形 widget の <code>with_widget_node</code> 適用 + 1000 widget bench。<code>ChannelLayout</code> / <code>WaveformRenderMode</code> に <code>Hash</code> derive 追加 (input_hash で使用)、<code>Ui::waveform</code> を with_widget_node で wrap (input_hash に generation / valid_len / sample_rate / view / style / rect を組込、ヒットテストはクロージャ外で毎フレーム実行)。Rust 標準 Hash の tuple 上限 (12 要素) 回避のため hash_inputs に nested tuple を渡す形。<code>crates/ui/benches/scenegraph_cache.rs</code> 新規 bench で 1000 buttons の cached vs no-cache を比較、cached 165 µs vs no-cache 313 µs で 1.9x 高速 (148 ns/widget の CPU prepare コスト削減)。waveform_validation で 128 widgets の波形描画 + drag scroll / wheel zoom / Space REC に regression なし。M4 milestone 全項目達成、次は M5 (heavy() + 巨大ビュー + 詳細波形モード) へ。</li>
+<li>2026-05-01: <strong>chore(clippy)</strong> — Rust 1.95 系の新 clippy ルールで噴出した 30+ 件の警告を解消し <code>cargo clippy --workspace --tests -- -D warnings</code> を再び通すための前提整備。<code>ignored_unit_patterns</code> (ui.rs テスト内 <code>|_, ui|</code> を <code>|(), ui|</code> に 17 件)、<code>uninlined_format_args</code> (layout / fader / knob テストの <code>format!("{}", x)</code> を <code>"{x}"</code> に 7 件)、<code>borrow_as_ptr</code> (winit_backend の <code>&amp;mut pt</code> を <code>&amp;raw mut pt</code>)、<code>match_wildcard_for_single_variants</code> (device.rs に wgpu 29 系 <code>CurrentSurfaceTexture::Validation</code> を明示)、<code>collapsible_if</code> / <code>match_same_arms</code> / <code>default_trait_access</code> × 4 / <code>cast_possible_wrap</code> (<code>screen.{w,h}.try_into().unwrap_or(i32::MAX)</code>) / <code>iter_last_double_ended</code> (filter().last() → rfind()) / <code>inline_always</code> (waveform hot path 用 <code>#[inline(always)]</code> に <code>#[allow]</code> 併記) / <code>needless_range_loop</code> (waveform / mixer の index アクセス) / <code>too_many_lines</code> (text_input / waveform_validation / mixer の build_ui 系大関数に <code>#[allow]</code>、関数分割は別タスク) / <code>missing #[must_use]</code> (id.rs::child)。機能変更なし、Phase 13 とは独立の chore commit として分離。</li>
+<li>2026-05-01: <strong>M5 Phase 13</strong> — heavy() API 基盤。<code>Ui::heavy(id, |hctx|)</code> + <code>HeavyCtx&lt;'b, 'a, M&gt;</code> + <code>cached(viewport_key, draw_fn)</code> を <code>crates/ui/src/widgets/heavy.rs</code> に新設。<code>HeavyCtx::cached</code> は M4 Phase 11 の <code>with_widget_node(child_wid, hash_inputs(viewport_key), ...)</code> を呼ぶだけの薄いラッパで、新キャッシュ機構ゼロ (<code>feedback_use_new_abstractions</code> 適合)。HeavyCtx は <code>pointer / screen / push_edit / push_rect / push_text / push_lines / waveform / label_at / button_at</code> を delegate (最小範囲、KISS)、<code>push_*</code> は heavy 内では <code>pub</code> (脱出口の意味、通常 widget からは引き続き <code>pub(crate)</code>)。ヒットテスト・動的 overlay は cached() の外で毎フレーム実行のパターン (waveform widget と同型)。viewport_key は explicit Hash 渡し (Clone 不要)、no-Clone 不変条件維持。<code>examples/mixer</code> に heavy_demo ブロック (m.count を viewport_key に、cache hit/miss を実機目視確認用) を 1 つ仕込み。trybuild (<code>tests/ui/pass/heavy.rs</code>、no-Clone + viewport_key Hash 制約) と単体テスト 4 本 (cache hit / miss / ヒットテスト経路 / eviction) で動作担保、合計 50 unit/test pass。clippy 増分 0、<code>cargo run --bin mixer</code> で表示・操作に regression なし。次は Phase 14 (examples/piano_roll、heavy() 実用第 1 弾)。</li>
+</ul>
+<hr>
+<h2 id="m9-phase-41-real-daw-validation-note-edit-library-widget-2026-05-03">M9 Phase 41 (Real DAW Validation — note edit + library widget 化、完了 2026-05-03)</h2>
+<p><strong>目的</strong>: M8 で導入した <code>Edit::Undoable</code> の ergonomic を note 編集ケースで実証 (Phase 41a-d)、その経験を踏まえて piano_roll を library widget 化 (Phase 41e)。</p>
+<p><strong>進捗</strong>: Phase 41 全 7 commits 完遂 (41pre + 41a + 41b + 41c + 41d + 41e + 41f)。</p>
+<table>
+<thead>
+<tr>
+<th>成果物</th>
+<th>状態</th>
+<th>コミット</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>41pre: HeavyCtx に input/popup/shortcut/clipboard/history pull API 14 method delegate</td>
+<td>✅</td>
+<td>63b361f</td>
+</tr>
+<tr>
+<td>41a: piano_roll に Note id 導入 + 複数対応 add/delete を Edit::with_inverse 化</td>
+<td>✅</td>
+<td>8c2c49e</td>
+</tr>
+<tr>
+<td>41b: 複数対応 move/resize Undoable + Ui::set_cursor (EwResize/Move)</td>
+<td>✅</td>
+<td>c81e685</td>
+</tr>
+<tr>
+<td>41c: rect multi-select (Alt+drag) + selection state Undoable</td>
+<td>✅</td>
+<td>b0ac62d</td>
+</tr>
+<tr>
+<td>41d: Edit::snapshot_inverse helper を library 化 (5 helper の Arc capture pattern を吸収)</td>
+<td>✅</td>
+<td>c0fe6b6</td>
+</tr>
+<tr>
+<td>41e: piano_roll を crates/ui/src/widgets/piano_roll.rs に library widget 化</td>
+<td>✅</td>
+<td>8878388</td>
+</tr>
+<tr>
+<td>41f: docs(M9 Phase 41) 完了記録 + Phase 44 評価項目更新</td>
+<td>✅</td>
+<td>(本コミット)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>主な学び</strong>:</p>
+<ul>
+<li><strong>Edit::with_inverse + Arc&lt;...&gt; capture の boilerplate</strong> は 5 ペア (add/delete/move/resize/select) で顕在化 → <code>Edit::snapshot_inverse(label, snapshot, forward, restore_from)</code> helper で吸収成功 (41d)。snapshot を Arc 化して 2 closure に共有する pattern を 1 関数に集約。</li>
+<li><strong>note の identity は <code>id: u32</code> 不変</strong> が必須。natural key (start_beat, pitch) は move で変わる、index は delete でずれる。<code>PianoRollModel::next_note_id</code> で生成時 unique 採番、編集中も保持。multi-select identity が安定する。</li>
+<li><strong>multi-delete = 1 Edit で完結</strong> するため history group API は Phase 41 では不要だった (複数対応 helper で N notes の delete/move/resize/select が単一 <code>Edit::snapshot_inverse</code> に集約)。<code>begin_group / end_group</code> の need が出るのは「異なる種類の Edit を 1 step に」のケース、Phase 42 (audio trim → fade 連続) で実需が出たら別途実装判断。</li>
+<li><strong>library widget 化は callback パターン (<code>make_edit: Fn(NotesEditRequest) -&gt; Edit&lt;M&gt;</code>) で API 簡潔化</strong> (41e)。当初 5 callback 案 (on_add / on_delete / ...) ではなく単一 callback + ADT (<code>NotesEditRequest</code> enum 5 variants) で吸収。<code>automation_curve::on_change</code> callback と同形のパターン precedent。<code>NotesEditRequest</code> は 1 frame で消費される一時 ADT で、Application::Message のように Model に保存される / Clone 伝染する性質はなく、メッセージ型禁止の不変条件と矛盾しない。</li>
+<li><strong>drag 中は library overlay 描画 + release で初めて Undoable Edit 発行</strong> (commit-by-release pattern)。drag 中 Mutate Edit 発行や <code>MoveContinue</code> variant 追加が不要。history も「drag 1 step = 1 Edit」で綺麗に保たれる。</li>
+<li><strong>selected_note_ids は <code>&amp;[NoteId]</code> immutable borrow + push_edit ベース更新</strong> (41e)。<code>UiHost::frame</code> の closure シグネチャ <code>for&lt;'a&gt; FnOnce(&amp;'a M, &amp;mut Ui&lt;'a, M&gt;)</code> が <code>model: &amp;M</code> (immutable) のため、<code>&amp;mut model.selected_note_ids</code> を取れない (borrow checker E0596)。selection 変更は <code>NotesEditRequest::Select</code> を push_edit で発行 → frame 末で apply、次フレームで反映。これは no-Clone 不変条件と整合する正しい設計だった。</li>
+<li><strong>daw_01 (path 依存先) は gui_01 の <code>Note</code> 型を直接 import していない</strong> ため、library 化 commit は daw_01 build に影響なし (12 ファイルが daw_ui_core を import するが Note 関連型は 0)。daw_01 は piano_roll を独自 NoteBox 型 (f64 + lyric) で実装しており、schema 不一致は Phase 44 で統合判断 (Note の f64 化 / lyric 追加 / Arc 化 等)。</li>
+<li><strong>trybuild の no_clone_required 担保</strong> に <code>Ui::piano_roll</code> 呼び出しを追加し、<code>Note</code> を Vec で持つ non-Clone Model でコンパイルできることを CI 固定。</li>
+</ul>
+<p><strong>設計判断 (Phase 41 中の重要決定)</strong>:</p>
+<ul>
+<li><code>Ui::set_cursor(CursorIcon)</code> は <strong>「最後勝ち」semantics</strong> (cursor stack push/pop は不要、DAW UX で同 frame 複数 widget の cursor 競合は実用上発生しない、<code>UiHost::with_window</code> で <code>set_cursor_request</code> callback も自動 set)。</li>
+<li><code>HeavyCtx</code> 包括 14 method delegate (41pre): rect-select / context_menu / shortcut consume / clipboard / file drop / scroll / history が heavy 内で書けない問題を 1 commit で塞ぐ。各 method は 1 行 forward なので LOC コスト低い、heavy 抽象の漏れを防ぐ目的を優先。</li>
+<li>複数対応 helper は <strong>最初から <code>Vec&lt;Note&gt;</code> / <code>Vec&lt;MoveDelta&gt;</code> ベース</strong> (single note は <code>vec![note]</code> で呼ぶ): DAW では multi-select が常態。後付けで multi 化すると call site が double。</li>
+<li><strong>library widget 化を Phase 41e で完遂</strong> (plan.md L142 の「後回し」方針を 2026-05-03 に修正): CLAUDE.md「理想とベストプラクティスを追求する。そのためは大胆に破壊して作り直す」方針に基づき、validation 中も breaking 変更を恐れず逐次反映。daw_01 への影響軽微 (Note 未 import) が確認できたため。</li>
+<li><strong>view 状態は user 側、widget は値渡し <code>PianoRollView</code></strong>: pan/zoom 更新は app 層責務、widget は描画と note drag のみ担う。view を mutate する API を入れるとスコープが膨らむ。</li>
+<li><strong>Edit factory 5 個 (<code>make_*_notes_edit</code>) は example に残す</strong>: forward / inverse closure 内で <code>m.notes</code> / <code>m.selected_note_ids</code> / <code>m.notes_generation</code> を mutate する必要があり、generic 化には <code>NotesModel</code> trait が必要だが、daw_01 のような独自 schema (NoteBox / lyric / f64) を持つアプリで impl 不可能になり拡張性を損なう。library 側は <code>NotesEditRequest</code> enum を介した callback パターンで責務分離。</li>
+</ul>
+<p><strong>残作業 (Phase 43-44)</strong>:</p>
+<ul>
+<li>Phase 43: <code>Ui::debug_overlay</code> で frame_ms / scenegraph_size / cache_hit_rate / widget_count / history_depth を画面右上に半透明 overlay (Ctrl+F1 toggle)。</li>
+<li>Phase 44: Phase 41-43 の <code>Edit::with_inverse</code> / <code>Edit::snapshot_inverse</code> 全 call site の boilerplate を計測 + library helper 追加判断、daw_01 との Note schema 統合判断。</li>
+</ul>
+<p><strong>Phase 44 評価項目への引き継ぎ</strong>:</p>
+<ul>
+<li><code>Edit::snapshot_inverse</code> の汎用性: Vec<Note> で 5 ペア吸収済。Phase 42 の Vec<f32> で同 helper が再利用できるか検証。</li>
+<li><code>NotesEditRequest</code> enum + 単一 callback パターン: callback 5 個個別ではなく ADT で簡潔化の precedent、Phase 42 の audio buffer 系で類似パターンを使うか判断材料。</li>
+<li><code>daw_ui_core::Note</code> schema (id: u32, f32, no lyric) と daw_01 NoteBox schema (note: u32 = index 内部 id, f64, lyric: Option<String>) の不一致: Phase 44 で統合判断 (<code>f64</code> 化 / <code>lyric: Option&lt;Arc&lt;str&gt;&gt;</code> 追加 / id 命名統一)。</li>
+</ul>
+<p><strong>LOC</strong>:</p>
+<ul>
+<li>library: <code>crates/ui/src/widgets/piano_roll.rs</code> 新設 ~1565 LOC (公開型 9 + 純粋関数 6 + Style default + <code>Ui::piano_roll</code> 本体 + tests 23 ケース)。</li>
+<li>example: <code>crates/examples/piano_roll/src/main.rs</code> 1480 → 720 LOC に縮小。</li>
+<li>計画 (plan_phase41.md) は library +400 / example -600 / test +200 = net +0 を見込んでいたが、実装で純粋関数を library に出した形 (Edit factory は example 残し) になり、別の LOC 配分になった。</li>
+</ul>
+<hr>
+<h2 id="m9-phase-42-sample_edit_ops-trimfade-undoable-2026-05-03">M9 Phase 42 (sample_edit_ops の trim/fade を Undoable 化、完了 2026-05-03)</h2>
+<p><strong>目的</strong>: M9 Phase 41 で導入した <code>Edit::snapshot_inverse</code> helper を Vec<f32> 系 (audio buffer) で再利用できるか検証。sample_edit_ops の trim / fade in / fade out 3 ボタンを Undoable 化し、shortcut undo/redo (Ctrl+Z / Ctrl+Shift+Z) を実用化。</p>
+<p><strong>進捗</strong>: 1 commit で完遂 (実装 + tests + docs)。</p>
+<p><strong>audio buffer (Vec<f32>) の inverse 戦略 — 混在採用</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>戦略</th>
+<th>snapshot 内容</th>
+<th>メモリ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>trim</td>
+<td>full snapshot</td>
+<td><code>Vec&lt;Vec&lt;f32&gt;&gt;</code> 全体 + viewport / selection / cursor (<code>TrimSnapshot</code> struct)</td>
+<td>元 buffer 全体 (96000 sample × 4 byte = ~384KB / step)</td>
+</tr>
+<tr>
+<td>fade in / out</td>
+<td>範囲 snapshot</td>
+<td><code>Vec&lt;f32&gt;</code> の <code>e-s</code> 個 + range + <code>direction: FadeDir { In, Out }</code> (<code>FadeSnapshot</code> struct)</td>
+<td>範囲分のみ (e-s) × 4 byte</td>
+</tr>
+</tbody>
+</table>
+<p><strong>主な学び</strong>:</p>
+<ul>
+<li><strong><code>Edit::snapshot_inverse</code> は Vec<f32> 系でも問題なく使える</strong> (Phase 41 plan_phase41.md L487 引き継ぎ事項の検証成功)。<code>S: Send + Sync + 'static</code> 制約が <code>Vec&lt;Vec&lt;f32&gt;&gt;</code> (TrimSnapshot) / <code>Vec&lt;f32&gt;</code> (FadeSnapshot 内) の両方を満たすため、Phase 41d で導入した library helper が再利用可能。</li>
+<li><strong>fade in/out は <code>direction: FadeDir { In, Out }</code> enum で 1 helper に統合</strong>。in/out の差は <code>gain = match dir { In =&gt; t, Out =&gt; 1.0 - t }</code> の 1 行のみ。重複 helper を避けて命令的 boilerplate を最小化 (Phase 41 で発見した <code>NotesEditRequest</code> enum パターンと同形)。</li>
+<li><strong>forward の idempotency が重要</strong>: fade forward は元値 (<code>snap.prev_range_samples</code>) から再計算するため、redo (forward を 2 度呼ぶ) しても結果が変わらない。これが <code>Fn</code> 制約 (<code>Edit::snapshot_inverse</code> の forward / restore_from は <code>Fn</code>) と整合する。逆に「現値 × gain」式で書くと redo で 2 度 gain が掛かって破綻する。</li>
+<li><strong>trim の selection 復元が UX 上重要</strong>: trim 後 selection は <code>None</code> になるが、undo で元の <code>Some((s, e))</code> に復元される。これにより「trim → undo → 再 trim」を繰り返すワークフローが自然になる。viewport / cursor も同様。</li>
+<li><strong>button click 時に <code>m: &amp;SampleEditOpsModel</code> を borrow して helper に渡し、Edit を構築する</strong> パターン: button_at の closure シグネチャ <code>FnOnce() -&gt; Edit&lt;M&gt;</code> で、closure 内で <code>m</code> を <code>move</code> capture できる。selection / 範囲が無効なら <code>Edit::mutate</code> で last_action のみ更新 (history に積まない)、有効なら <code>Edit::snapshot_inverse</code> で Undoable Edit を構築。</li>
+<li><strong>メモリコストの実測値は許容範囲</strong> (validation 段階): trim 1 step で ~384KB (96000 sample × 4 byte)。100 step undo で 38.4MB、典型的な DAW 編集セッション (数十回の trim/fade 連続) で問題なし。差分 snapshot や Arc COW への最適化は Phase 44 で必要性を判断。</li>
+<li><strong>shortcut undo/redo は既存 (M8 Phase 30) で十分</strong>: <code>take_shortcut("undo")</code> / <code>take_shortcut("redo")</code> を frame closure 冒頭で呼ぶだけで、Ctrl+Z / Ctrl+Shift+Z が動作。Phase 41 の piano_roll と同パターン。</li>
+</ul>
+<p><strong>Phase 41 plan_phase41.md L487 引き継ぎ事項 (検証結果)</strong>:</p>
+<blockquote>
+<ul>
+<li><code>Edit::snapshot_inverse</code> の使い心地を Phase 42 (sample_edit_ops) で再検証 (Vec<f32> = <code>Arc&lt;[f32]&gt;</code> snapshot で同 helper が再利用できるか)</li>
+</ul>
+</blockquote>
+<p>→ <strong>検証成功</strong>。Vec<Vec\<f32>> (full snapshot) も Vec<f32> (範囲 snapshot) も同 helper が使えた。Arc 化は library 内部で <code>Edit::snapshot_inverse</code> が自動的に行うので user は意識する必要なし (Phase 41d helper 設計の通り)。</p>
+<p><strong>設計判断</strong>:</p>
+<ul>
+<li><strong>trim / fade で snapshot 戦略を混在採用</strong>: 操作の意味 (削除 vs 範囲内変更) に応じて適切な snapshot サイズを選ぶ。統一すると trim も範囲 snapshot になるが、trim は drain で範囲外データを失うので復元には全体が必要 → full snapshot が必須。fade は範囲内のみ変更なので範囲分で足りる。混在は user 側 helper の責務範囲なので library API には影響しない。</li>
+<li><strong>direction enum で fade in/out を 1 helper に</strong>: 当初「fade in helper / fade out helper の 2 つを書く」案もあったが、内部ロジックの差が <code>gain</code> 計算式 1 行のみだったため enum で吸収。Phase 41 の <code>NotesEditRequest</code> enum と同じく、enum は「1 frame 内で消費される一時 ADT」なのでメッセージ型禁止の不変条件と矛盾しない。</li>
+<li><strong>selection 復元は trim のみ、fade では何もしない</strong>: trim は selection をクリアする副作用があるので undo で復元、fade は selection を変えないので undo でも触らない。「副作用を伴う操作のみ snapshot に副作用前状態を保存」の原則。</li>
+<li><strong>forward を idempotent に書く</strong>: fade forward は <code>*slot = snap.prev_range_samples[i] * gain</code> で元値からの再計算 (= 何度 apply しても結果同じ)。redo 経路で破綻しない。</li>
+</ul>
+<p><strong>残作業</strong>: なし。Phase 42 完了。</p>
+<p><strong>Phase 44 への引き継ぎ事項</strong>:</p>
+<ul>
+<li><strong>メモリ最適化の必要性判断</strong>: 384KB / step × 100 step = 38.4MB の memory コスト。長時間セッションで膨らむ場合、Arc COW (案 C) や差分 snapshot (案 B) への切替を検討。</li>
+<li><strong>library helper 化の閾値</strong>: trim_edit_for / fade_edit_for は example local helper だが、daw_01 や他 DAW で似たパターンが出るか観察。出るなら <code>Edit::range_snapshot_inverse(label, range, prev_data, dir, fwd_kernel)</code> のような generic helper を library 化候補。</li>
+<li><strong>history group API の need</strong>: Phase 41 では不要だったが、Phase 42 で「trim + fade を 1 step に」のような複合操作が現実的に必要か検証。現状 7 ケースのテスト (<code>trim_then_fade_then_undo_undo_restores_original</code>) では「2 個の連続 Edit を 2 回 undo」で動作するため、group API は不要。</li>
+</ul>
+<p><strong>LOC</strong>:</p>
+<ul>
+<li>example: <code>crates/examples/sample_edit_ops/src/main.rs</code> +~190 LOC (3 helper + 4 button helper closure + 7 tests)。</li>
+<li>元 example が 540 LOC、追加で 730 LOC 程度に。Edit factory が library 化されないため、サイズ拡大は ergonomic helper 分のみ。</li>
+</ul>
+<hr>
+<h2 id="m9-phase-43-debug-overlay-2026-05-03">M9 Phase 43 (debug overlay、完了 2026-05-03)</h2>
+<p><strong>目的</strong>: validation 期間中に scenegraph cache の効きや widget 数を可視化する debug overlay を library に追加する。旧 M14 Phase 56 の先行実装。</p>
+<p><strong>進捗</strong>: 1 commit で完遂 (実装 + tests + mixer 統合)。</p>
+<p><strong>追加 API</strong>:</p>
+<ul>
+<li><code>daw_ui_core::FrameStats</code> (Copy struct):</li>
+<li><code>cache_hits: u32</code> — <code>with_widget_node</code> で hit した回数</li>
+<li><code>cache_misses: u32</code> — <code>with_widget_node</code> で miss して draw_fn を実行した回数</li>
+<li><code>widget_count: u32</code> — frame に登場した widget 数</li>
+<li><code>scenegraph_size: u32</code> — frame 末尾の scenegraph entry 数 (eviction 後)</li>
+<li><code>history_undo_depth: u32</code> / <code>history_redo_depth: u32</code></li>
+<li><code>cache_hit_rate() -&gt; f32</code> (hits / (hits+misses))</li>
+<li><code>UiHost::last_frame_stats() -&gt; FrameStats</code> — 直近フレームの統計を query</li>
+<li><code>Ui::debug_overlay(rect, frame_ms: f32)</code> — popup buffer (z-order 最前面) に半透明背景 + 5 行テキスト</li>
+<li>shortcut default binding: <code>"debug_overlay_toggle"</code> = <code>Ctrl+F1</code></li>
+</ul>
+<p><strong>主な学び</strong>:</p>
+<ul>
+<li><strong>frame_ms は library が track せず引数で受ける</strong>: window backend / render pipeline により frame の所要時間の意味が変わる (build_ui のみ vs render 含む vs vsync 待ちまで)。app 側で <code>Instant</code> で測定して <code>Ui::debug_overlay</code> に渡す方が責務が明確。library は library 内部の決定的な統計 (cache hits / widget_count / history depth) のみ track する。</li>
+<li><strong>stats は「直近フレーム」を read する設計</strong>: 今フレームは描画中で確定していないので、<code>UiHost::last_frame_stats()</code> は <strong>前フレーム</strong> の値を返す。<code>Ui::debug_overlay</code> も前フレームの stats を表示する。1 frame 遅れるが、debug 用なので許容範囲。</li>
+<li><strong>popup buffer (drawing_in_popup フラグ) を流用して z-order 最前面に</strong>: M7 Phase 25 で導入した popup_layer の deferred buffer (popup_rects / popup_glyphs) を debug_overlay でも使う。menu / dropdown と同じ z-order 階層に乗るので、context_menu の上にさえ debug_overlay を出せる。</li>
+<li><strong>shortcut の toggle 状態は app 側で持つ</strong>: library は <code>take_shortcut("debug_overlay_toggle")</code> を返すだけで、toggle state (<code>show_debug_overlay: bool</code>) は app の Model に持たせる。これにより複数 example で個別に enable/disable でき、test も書きやすい。</li>
+<li><strong>with_widget_node の hit/miss counter は 1 行で済む</strong>: <code>*self.cache_hits += 1</code> / <code>*self.cache_misses += 1</code> を既存のキャッシュロジックに足すだけ。Ui struct に <code>cache_hits: &amp;'a mut u32</code> を borrow で持たせ、frame_to_edits 末尾で <code>last_frame_stats</code> に転記する pattern。</li>
+<li><strong>popup pass の glyph buffer 上書き問題を発見</strong> (実機検証で判明): debug_overlay を popup buffer (drawing_in_popup = true) で push したところ、画面上半分の base scene の text 全部が消える現象が発生。原因は <strong>glyphon TextRenderer の internal GPU buffer が単一で、popup pass の prepare で base pass のデータが上書きされる</strong> こと。<code>encoder.begin_render_pass + draw</code> は順序通り encode されるが、<code>text_renderer.prepare</code> は <code>queue.write_buffer</code> を呼ぶため submit 時に最終 write が反映 → base render が popup data を読む。Phase 43 ではワークアラウンドとして debug_overlay を <strong>base scene に直接 push</strong> (popup buffer 不使用)。menu / dropdown / context_menu でも本来同じ問題が起きるはずだが、popup items が少ないか base text と被らないため気付かれていなかった可能性。Phase 44 で popup pass 用に独立した TextRenderer インスタンスを持つ修正を別途実装する必要がある。</li>
+</ul>
+<p><strong>設計判断</strong>:</p>
+<ul>
+<li><strong>frame_ms = 0.0 で frame 行省略</strong>: <code>Ui::debug_overlay(rect, 0.0)</code> を呼ぶと「frame Xms」行を省略し 4 行表示になる。test や frame_ms を測定しないケースに対応。</li>
+<li><strong>default binding <code>Ctrl+F1</code></strong>: F1 はヘルプキーとして OS が予約していないので衝突しにくい。validation 期間中の overlay として標準的な選択。</li>
+<li><strong><code>Ui::debug_overlay</code> は popup buffer を使う</strong>: 通常の <code>push_rect</code> / <code>push_text</code> では他 widget の上に被らないので、<code>drawing_in_popup</code> フラグを一時 true にして popup buffer に push、終了時に元に戻す。</li>
+<li><strong>library が <code>Ctrl+F1</code> を default binding に入れる</strong>: app が rebind したい場合は <code>UiHost::shortcut_map_mut().unbind("debug_overlay_toggle"); .bind("debug_overlay_toggle", "...")</code> で上書きできる (M8 Phase 30 の API 通り)。</li>
+</ul>
+<p><strong>検証</strong>:</p>
+<ul>
+<li>library tests 6 ケース追加: <code>frame_stats_default_is_zero_before_first_frame</code> / <code>frame_stats_tracks_widget_count_and_cache_miss_then_hit</code> / <code>frame_stats_cache_hit_rate_returns_zero_when_no_widgets</code> / <code>frame_stats_cache_hit_rate_computes_ratio</code> / <code>debug_overlay_renders_rects_and_glyphs</code> / <code>debug_overlay_omits_frame_ms_when_zero</code>。</li>
+<li>trybuild <code>tests/ui/pass/basic.rs</code> に <code>Ui::debug_overlay</code> 呼び出しを追加 (no-Clone Model で コンパイル可能性を CI 固定)。</li>
+<li>mixer example で実機目視: Ctrl+F1 で overlay toggle、cache hit/miss 値が widget 操作で変わることを確認。</li>
+</ul>
+<p><strong>残作業</strong>: なし。Phase 43 完了。</p>
+<p><strong>Phase 44 への引き継ぎ事項</strong>:</p>
+<ul>
+<li><strong>popup pass の glyph buffer 上書き問題の根本修正</strong> → <strong>Phase 44a で解決済</strong>。</li>
+<li><strong>debug_overlay の表示項目拡張</strong>: render time / dropped frame count / GPU memory usage 等を将来追加する場合、<code>FrameStats</code> を拡張するか別 struct (<code>PerformanceStats</code> 等) を作るかの判断。</li>
+<li><strong>CI への scenegraph cache hit rate target</strong>: 現在は debug overlay で目視のみ。CI bench で「典型的な mixer / piano_roll 操作で hit rate &gt; 80%」を回帰テストにする提案 (Phase 44 で評価)。</li>
+<li><strong>overlay の position / style カスタマイズ</strong>: 現状 rect の右上に固定。app が左下や別 corner に出したい場合は引数で受けるか、<code>DebugOverlayStyle</code> struct を導入。validation 期間中は不要。</li>
+</ul>
+<p><strong>LOC</strong>:</p>
+<ul>
+<li>library: <code>crates/ui/src/ui.rs</code> +~120 LOC (FrameStats struct + UiHost field 3 個 + frame_to_edits stats track + Ui field 3 個 + debug_overlay impl + tests 6 ケース)、<code>crates/ui/src/shortcut.rs</code> +1 行 binding、<code>crates/ui/src/lib.rs</code> +1 type re-export。</li>
+<li>example: <code>crates/examples/mixer/src/main.rs</code> +~15 LOC (Model field 2 個 + Ctrl+F1 toggle + on_render の frame_ms 計測 + debug_overlay 呼び出し)。</li>
+<li>trybuild: <code>crates/ui/tests/ui/pass/basic.rs</code> +1 行。</li>
+</ul>
+<hr>
+<h2 id="m9-phase-44a-popup-pass-renderer-pipeline-2026-05-03">M9 Phase 44a (popup pass の renderer pipeline 独立化、完了 2026-05-03)</h2>
+<p><strong>目的</strong>: Phase 43 で発見した「popup pass の prepare で base pass の GPU buffer が上書きされる」問題を根本解決する。Phase 43 では debug_overlay を base scene に push する workaround で回避していたが、menu / dropdown / context_menu でも同様の現象が起きうるため (popup items が少ないと顕在化しないが理論上 base text / rect が破壊される)、popup pass 用に独立した pipeline インスタンスを持たせて干渉を断つ。</p>
+<p><strong>進捗</strong>: 1 commit で完遂 (renderer 修正 + Ui::debug_overlay を popup buffer に戻す + tests 修正)。</p>
+<p><strong>追加 API</strong>: なし (内部実装の修正のみ)。</p>
+<p><strong>実装の要点</strong>:</p>
+<ul>
+<li><strong>renderer に独立 pipeline インスタンスを追加</strong> (<code>crates/renderer/src/device.rs</code> <code>Renderer</code> struct):</li>
+<li><code>popup_rect: RectPipeline</code> (base 用 <code>rect</code> と独立 instance buffer / vertex buffer)</li>
+<li><code>popup_line: LinePipeline</code> (base 用 <code>line</code> と独立 segment buffer)</li>
+<li><code>popup_glyph: GlyphPipeline</code> (base 用 <code>glyph</code> と独立 glyphon TextRenderer / Atlas / Buffer cache)</li>
+<li>popup pass の prepare/render を <code>self.popup_rect.*</code> / <code>self.popup_line.*</code> / <code>self.popup_glyph.*</code> に切替</li>
+<li><code>Ui::debug_overlay</code> を popup buffer (<code>drawing_in_popup = true</code>) に戻す → z-order 最前面で描画</li>
+<li>library tests (<code>debug_overlay_renders_rects_and_glyphs</code> / <code>_omits_frame_ms_when_zero</code>) を popup_rects / popup_glyph_areas 検証に修正</li>
+</ul>
+<p><strong>主な学び</strong>:</p>
+<ul>
+<li><strong>wgpu の <code>queue.write_buffer</code> は queue 化される</strong>: 同 frame 内で 2 度 <code>prepare</code> を呼んで同じ pipeline の internal buffer を書くと、submit 時に <strong>最終 write</strong> が GPU に反映される。base pass の draw command も popup data を読んでしまう。これは glyph (glyphon Atlas) だけでなく、自前 RectPipeline / LinePipeline (instanced rect / line strip) でも同じ問題が起きる。Phase 43 で glyph のみ独立化したが、Phase 44a で実機検証時に「text_input の枠 rect が消える」現象から rect / line も同じ問題と判明。</li>
+<li><strong>3 pipeline すべて popup 用インスタンスを持つ必要</strong>: <code>prepare→render→prepare→render</code> パターンを採るなら、各 pipeline で independent buffer を持たないといけない。実装は <code>RectPipeline::new</code> / <code>LinePipeline::new</code> / <code>GlyphPipeline::new</code> を 2 度呼ぶだけで済む (~6 LOC)。GPU メモリは ~2x になるが、popup の primitive 数は base より大幅に少ない (典型的に &lt; 10 個) ため実害は小さい。</li>
+<li><strong>過去の menu / dropdown / context_menu でこの問題が露呈しなかった理由</strong>: popup items の rect / glyph 数が少ない &amp; base scene 上の primitive と座標的に重ならないため、上書きの影響が "目に見える"レベルに達しなかった可能性が高い。debug_overlay は 5 行 + 1 半透明 rect で popup buffer を埋める初の large user で、ようやく顕在化した。</li>
+<li><strong>Phase 43 の workaround (debug_overlay を base scene に push) は不要に</strong>: Phase 44a で popup pass を独立化した後は、debug_overlay を popup buffer に戻して z-order を最前面にできる (= 通常 popup と同様 menu / dropdown より上に出る)。</li>
+</ul>
+<p><strong>設計判断</strong>:</p>
+<ul>
+<li><strong><code>PipelineSet</code> のような構造体に bundle しない</strong>: <code>Renderer</code> に直接 <code>popup_rect</code> / <code>popup_line</code> / <code>popup_glyph</code> の 3 フィールドを追加。bundle すると swap や独立処理が書きにくい。</li>
+<li><strong>base / popup で pipeline 実装は同一</strong>: <code>RectPipeline::new</code> 等を 2 度呼ぶだけで OK、専用 <code>PopupRectPipeline</code> 型は作らない。差は instance / buffer の独立のみ。</li>
+<li><strong>glyphon Atlas も独立</strong>: フォント atlas は base / popup で 2 個になるが、debug 用途の popup 描画では数フォント分のみ使うので実害は小さい。共有 atlas を作る案もあるが、glyphon の API が atlas 共有を直接 expose していないため複雑になる。</li>
+</ul>
+<p><strong>検証</strong>:</p>
+<ul>
+<li><code>cargo build --workspace</code> ✅ / <code>cargo test --workspace</code> ✅ (新規 test なし、既存 6 + その他全 pass) / <code>cargo clippy --workspace --tests -- -D warnings</code> ✅</li>
+<li><code>cargo run --bin mixer</code> で <strong>Ctrl+F1 toggle</strong> → debug overlay 表示 + 画面上部の text_input 枠 / タイトル / count / status 全表示 OK</li>
+<li><code>cargo run --bin daw_prototype</code> で <strong>clip 上の右クリック context_menu</strong> → "Cut / Copy / Delete / Duplicate" items 表示 + base scene の他 widget が消えない OK</li>
+</ul>
+<p><strong>残作業</strong>: なし。Phase 44a 完了。</p>
+<p><strong>Phase 44b/c への引き継ぎ事項</strong>:</p>
+<ul>
+<li><strong>GPU メモリの計測</strong>: popup 用 pipeline 追加で GPU memory が ~2x。validation 期間中は問題ないが、将来 plugin host で複数 piano_roll instance を出すケースで合算が大きくなったら再評価。</li>
+<li><strong>独立 pipeline の必要性 review</strong>: 「popup buffer を <strong>そもそも使わない</strong>」 (= 全 widget を base scene に push、z-order は描画順で制御) という設計案も理論上ある。ただし popup items の click 時に下層の widget に click が漏れる問題があるので、popup buffer + outside-click 検出 の仕組みは維持する必要がある。Phase 44a の独立 pipeline 追加が KISS な解決策。</li>
+</ul>
+<p><strong>LOC</strong>:</p>
+<ul>
+<li><code>crates/renderer/src/device.rs</code>: +~10 LOC (popup_rect / popup_line / popup_glyph フィールド + new() / prepare/render 切替)。</li>
+<li><code>crates/ui/src/ui.rs</code>: -8 LOC + +5 LOC (debug_overlay を popup buffer に戻す、<code>drawing_in_popup</code> 切替 2 行 + tests 修正で popup_glyph_areas / popup_rects 検証)。</li>
+</ul>
+<hr>
+<h2 id="m9-phase-44b-undoable-ergonomic-2026-05-03">M9 Phase 44b (Undoable ergonomic 評価、完了 2026-05-03)</h2>
+<p><strong>目的</strong>: Phase 41-43 で書いた <code>Edit::with_inverse</code> / <code>Edit::snapshot_inverse</code> 全 call site の boilerplate を計測し、3 回以上繰り返されるパターンが見つかれば library helper を追加、なければ「現 API で十分」を確定する。</p>
+<p><strong>進捗</strong>: docs only commit で完遂 (新規コードなし、API stability の確定)。</p>
+<p><strong>call site 全列挙</strong> (<code>Edit::with_inverse</code> / <code>Edit::snapshot_inverse</code>、test/comment 除く):</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>場所</th>
+<th>helper 関数</th>
+<th>戦略</th>
+<th>snapshot 型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>crates/examples/piano_roll/src/main.rs:124</td>
+<td>make_add_notes_edit</td>
+<td>snapshot_inverse</td>
+<td><code>Vec&lt;Note&gt;</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>crates/examples/piano_roll/src/main.rs:148</td>
+<td>(delete) make_delete_notes_edit</td>
+<td>snapshot_inverse</td>
+<td><code>Vec&lt;Note&gt;</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td>crates/examples/piano_roll/src/main.rs:180</td>
+<td>make_move_notes_edit</td>
+<td>snapshot_inverse</td>
+<td><code>Vec&lt;MoveDelta&gt;</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>crates/examples/piano_roll/src/main.rs:211</td>
+<td>make_resize_notes_edit</td>
+<td>snapshot_inverse</td>
+<td><code>Vec&lt;ResizeDelta&gt;</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td>crates/examples/piano_roll/src/main.rs:225</td>
+<td>make_select_notes_edit</td>
+<td>snapshot_inverse</td>
+<td><code>(Vec&lt;NoteId&gt;, Vec&lt;NoteId&gt;)</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td>crates/examples/sample_edit_ops/src/main.rs:51</td>
+<td>make_trim_edit</td>
+<td>snapshot_inverse</td>
+<td><code>TrimSnapshot</code> (custom struct)</td>
+</tr>
+<tr>
+<td>7</td>
+<td>crates/examples/sample_edit_ops/src/main.rs:166</td>
+<td>make_fade_edit</td>
+<td>snapshot_inverse</td>
+<td><code>FadeSnapshot</code> (custom struct)</td>
+</tr>
+<tr>
+<td>8</td>
+<td>crates/ui/src/widgets/fader.rs:231</td>
+<td>(inline)</td>
+<td>with_inverse</td>
+<td>drag release <code>start_value → end_value</code></td>
+</tr>
+<tr>
+<td>9</td>
+<td>crates/ui/src/widgets/knob.rs:193</td>
+<td>(inline)</td>
+<td>with_inverse</td>
+<td>drag release <code>start_value → end_value</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>パターン分類</strong>:</p>
+<h3 id="a-editsnapshot_inverse-7-9">パターン A: <code>Edit::snapshot_inverse</code> 経由 (7 件 / 9 件)</h3>
+<ul>
+<li>全 7 件が <strong>Phase 41d で library 化済の <code>Edit::snapshot_inverse(label, snap, fwd, restore)</code></strong> を使用。</li>
+<li>snapshot 型のバリエーションは広い: <code>Vec&lt;Note&gt;</code> / <code>Vec&lt;タプル&gt;</code> / <code>(prev, next)</code> の tuple / 大きな custom struct (Vec<Vec\<f32>> + viewport + cursor を含む) / 範囲限定 Vec<f32>。</li>
+<li>どれも <code>S: Send + Sync + 'static</code> 制約を満たし、library 内で自動 Arc 化されているため user 側に Arc capture boilerplate 不要。</li>
+<li>helper の forward / restore_from クロージャ内のロジックは widget 固有 (Note の id 検索、audio buffer の slice 操作 等) なので library で吸収不可能。</li>
+<li><strong>結論: snapshot_inverse は ergonomic に十分</strong>、call site で 7 通りの異なる snapshot 型を扱えており、抽象が機能している。</li>
+</ul>
+<h3 id="b-editwith_inverse-2-9-fader-knob">パターン B: <code>Edit::with_inverse</code> 直書き (2 件 / 9 件、fader / knob のみ)</h3>
+<pre><code class="language-rust">let on_change_fwd = on_change.clone();
+let on_change_inv = on_change;
+let end = displayed_value;
+let edit = Edit::with_inverse(
+    label,
+    move |m: &amp;mut M| on_change_fwd(end).apply(m),
+    move |m: &amp;mut M| on_change_inv(start_value).apply(m),
+);
+</code></pre>
+<ul>
+<li>fader / knob の drag release で <code>start_value → end_value</code> を Undoable 化するパターン。</li>
+<li>2 件で完全に同じ shape (4 行)。</li>
+<li><strong>3 件未満なので CLAUDE.md「3 回繰り返されたら抽象化」のルール未達</strong>。</li>
+</ul>
+<p><strong>判定</strong>:</p>
+<ul>
+<li><strong>追加の library helper は不要。Phase 41d の <code>Edit::snapshot_inverse</code> で現状の全 use case を吸収できている</strong>。</li>
+<li>パターン B (drag release <code>start_value → end_value</code>) は閾値未満なので premature abstraction を避け現状維持。第 3 例 (text_input commit / automation_curve drag release / 他 future widget) が登場したら helper 化検討。</li>
+<li>これにより M9 期間中の <strong><code>Edit</code> API が安定</strong> (Phase 45 以降で破壊的変更しない確約)。</li>
+</ul>
+<p><strong>主な学び</strong>:</p>
+<ul>
+<li><strong><code>Edit::snapshot_inverse</code> の汎用性</strong>: snapshot 型として <code>Vec&lt;T: Copy&gt;</code>、<code>(Vec&lt;T&gt;, Vec&lt;T&gt;)</code> tuple、巨大な custom struct (<code>Vec&lt;Vec&lt;f32&gt;&gt;</code> + プリミティブ多数) のいずれも問題なく扱えた。<code>S: Send + Sync + 'static</code> 制約は <code>Vec&lt;T&gt;</code> / <code>Arc&lt;...&gt;</code> / 普通の owned struct で満たされる。</li>
+<li><strong>library 化の境界線が見えた</strong>: Edit 構築の "外形" (snapshot を 2 closure で共有 + Arc 化) は library 化可能、closure 内のロジック (widget / Model 固有の field 操作) は library 化不可能。snapshot_inverse はこの境界を綺麗に切っている (helper が外形のみ、ユーザが closure を書く)。</li>
+<li><strong>call site の総数 9 件は意外に少ない</strong>: M9 全期間で Undoable Edit が必要な場面は 7 helper + fader/knob の 2 件のみ。validation 段階でこれだけ少ないのは「Mutate Edit で済むケースが多い」(drag 中の連続更新、UI state 変更で history に積まなくてよいケース、等) ため。<code>Edit::Mutate</code> と <code>Edit::Undoable</code> の使い分けが現実的に機能している。</li>
+<li><strong>3 件未満は抽象化見送り</strong>: CLAUDE.md の「3 回繰り返されたら抽象化を検討」原則に従い、fader/knob 2 件は library 化見送り。premature abstraction を回避することで API 表面積を最小に保つ。</li>
+<li><strong>API stability 確定の意義</strong>: Phase 44b で「現 API で十分」を確定させたことで、Phase 45 以降の機能追加 (theming / animation / 信号処理 widget 等) で <code>Edit</code> API を変更する必要がないことが保証された。daw_01 など path 依存先での breaking 変更リスクが low。</li>
+<li><strong>(2026-05-03 修正)</strong>: Phase 44c で Note schema を f64 化 + lyric 追加する判断により API stability 確約は撤回。CLAUDE.md「大胆に破壊して作り直す」原則を <code>Edit</code> API 以外の <strong>library 公開型</strong> にも適用。<code>Edit::with_inverse</code> / <code>Edit::snapshot_inverse</code> 自体の signature は変わっていない (= snapshot 内容として扱える型が <code>Note</code> から <code>Note (f64版 + lyric)</code> に変わるだけ) ので、<strong>Phase 44b の本質的な結論「現 API で十分」は維持</strong>。</li>
+</ul>
+<p><strong>設計判断</strong>:</p>
+<ul>
+<li><strong>「3 回ルール」を厳守</strong>: fader/knob 2 件で先行抽象化する誘惑を退けた。第 3 例が出るまで生 <code>Edit::with_inverse</code> を維持。</li>
+<li><strong>closure 内のロジックは library 化不可</strong>: forward/inverse の中で <code>m.notes.iter().find(|x| x.id == id)</code> のような widget 固有検索を書く部分は user 責務。library が <code>NoteCollection</code> trait を切れば吸収可能だが、daw_01 の独自 NoteBox schema との整合が取れなくなるため不採用 (Phase 41e でも同じ判断)。</li>
+<li><strong>snapshot_inverse 自体の API 改善は不要</strong>: 7 件すべてが現 signature で書けており、戻り値型 / closure 引数の追加修正は不要。</li>
+</ul>
+<p><strong>残作業</strong>: なし。Phase 44b 完了。</p>
+<p><strong>Phase 44c への引き継ぎ事項</strong>:</p>
+<ul>
+<li>Phase 44c は <strong>コード変更なしの方針決定タスク</strong> (gui_01 Note schema vs daw_01 NoteBox schema)。Phase 44b と同じく docs only commit で完了する見込み。</li>
+<li>fader/knob の drag release pattern (パターン B) は 3 件目が出るまで保留。出たときに <code>Edit::from_value_change(label, start, end, on_change)</code> のような helper を追加候補として記録。</li>
+</ul>
+<p><strong>LOC</strong>: なし (docs only)。本 commit は <code>docs/plan.md</code> / <code>docs/history.md</code> の更新のみ。</p>
+<hr>
+<h2 id="m9-phase-44c-daw_01-note-schema-gui_01-note-f64-lyric-2026-05-03">M9 Phase 44c (daw_01 Note schema 統合 — gui_01 Note を f64 化 + lyric 追加、完了 2026-05-03)</h2>
+<p><strong>目的</strong>: gui_01 <code>daw_ui_core::Note</code> の schema を daw_01 <code>common::model::Note</code> (f64 + lyric) に近付ける breaking 変更で、daw_01 が adapter なしで gui_01 piano_roll widget を直接使える状態にする。</p>
+<p><strong>進捗</strong>: 1 commit で完遂 (library Note 型 + 関連型 + 描画 helper + example + tests + docs)。</p>
+<p><strong>変更内容</strong>:</p>
+<h3 id="library-breaking">library 公開型の breaking 変更:</h3>
+<pre><code class="language-rust">// Before (Phase 41e〜44b):
+#[derive(Clone, Copy, Debug)]
+pub struct Note {
+    pub id: NoteId,
+    pub start_beat: f32,
+    pub len_beats: f32,
+    pub pitch: u8,
+    pub velocity: u8,
+}
+
+// After (Phase 44c):
+#[derive(Clone, Debug)]                 // Copy 削除 (Arc&lt;str&gt; のため)
+pub struct Note {
+    pub id: NoteId,
+    pub start_beat: f64,                // f32 → f64
+    pub len_beats: f64,                 // f32 → f64
+    pub pitch: u8,
+    pub velocity: u8,
+    pub lyric: Option&lt;Arc&lt;str&gt;&gt;,        // 新規追加 (singing synthesis 用)
+}
+
+pub type MoveDelta = (NoteId, f64, u8, f64, u8);            // f32 → f64
+pub type ResizeDelta = (NoteId, f64, f64, f64, f64);
+
+pub struct PianoRollView {
+    pub start_beat: f64,                // f32 → f64
+    pub len_beats: f64,                 // f32 → f64
+    pub pitch_top: f32,                 // pitch 関係は f32 維持 (MIDI 0..127)
+    pub pitch_visible: f32,
+    pub keyboard_w: f32,
+    pub notes_generation: u64,
+}
+
+pub struct PianoRollResponse {
+    // ...
+    pub clicked_at_beat_pitch: Option&lt;(f64, f32)&gt;,          // (beat: f64, pitch: f32)
+}
+
+pub struct PianoRollStyle {
+    // ... 既存 ...
+    pub lyric_color: Color,             // 新規 (note 上の歌詞色)
+    pub lyric_font_px: f32,             // 新規
+}
+</code></pre>
+<h3 id="_12">内部実装の更新:</h3>
+<ul>
+<li><code>note_to_rect(note: &amp;Note, ...) -&gt; Rect</code> — <code>Note</code> が Copy じゃなくなったので参照渡し</li>
+<li><code>note_geometry_to_rect(start_beat: f64, len_beats: f64, pitch: u8, ...)</code> — 新規 internal helper、drag preview の計算で使う (<code>Note</code> を作らずに直接 Rect 生成)</li>
+<li><code>drag_preview_geometry</code> — 旧 <code>drag_preview_note</code> を改名、<code>(f64, f64, u8)</code> tuple を返す形に (Note 自体を作らない)</li>
+<li><code>NoteDragAnchor</code> — <code>start_beat: f64</code> / <code>len_beats: f64</code></li>
+<li>各種 widget 内部の beat / pixel 計算を <code>f64::from(grid.w)</code> 等で f64/f32 boundary を明示</li>
+<li><code>draw_notes</code> に <code>lyric_color</code> / <code>lyric_font_px</code> 引数追加、<code>note.lyric.as_ref()</code> を見て note rect 内左端に label を描画 (note 高さが lyric font ≥ 1 行ぶんで描画)</li>
+</ul>
+<h3 id="example">example の更新:</h3>
+<ul>
+<li><code>PianoRollModel.view_start_beat</code> / <code>view_len_beats</code> を f64 化</li>
+<li><code>generate_notes</code> で <code>f64</code> リテラル使用、<strong>8 note ごとに 1 つ lyric を <code>Some(Arc::from("ら/る/れ/ろ/り"))</code> で付与</strong> (デモ用)</li>
+<li><code>make_*_notes_edit</code> の closure 内で <code>*note</code> (deref copy) → <code>note.clone()</code> (Note が Copy じゃなくなったため)</li>
+<li>pan/zoom logic の f32/f64 boundary 修正 (<code>f64::from(dx) * beat_per_px</code> 等)</li>
+<li>App.pan_anchor の type を <code>Option&lt;(f32, f32, f64, f32)&gt;</code> に</li>
+<li>tests の f32 リテラル全部 <code>_f64</code> に置換 (sed 一括)</li>
+</ul>
+<h3 id="trybuild">trybuild の更新:</h3>
+<ul>
+<li><code>crates/ui/tests/ui/pass/basic.rs</code> で <code>Note</code> 初期化に <code>lyric: None</code> 追加 + <code>f64</code> リテラル使用</li>
+</ul>
+<p><strong>主な学び</strong>:</p>
+<ul>
+<li><strong>CLAUDE.md「大胆に破壊して作り直す」原則の運用</strong>: Phase 44b で確定させた API stability 確約は、より良い設計のためなら破棄してよい。重要なのは「いつでも壊せる」状態を保つこと (zero external breaking impact = daw_01 が Note 型を直接 import していない、Phase 41e で確認済み) であって、永続的な不変条件ではない。</li>
+<li><strong>daw_01 への影響</strong>: daw_01 が gui_01 の Note を直接 import していないので <strong>build に影響なし</strong>。daw_01 内部の NoteBox は今後 gui_01 Note を <code>From</code> impl で受け取る adapter を書くか、独自 schema のまま残すかは daw_01 側の判断 (= 別 phase で進める)。</li>
+<li><strong>f32/f64 boundary 管理</strong>: 拍は f64、pixel/pitch は f32 のレイアウトで、boundary では明示的に <code>f64::from(...)</code> / <code>as f32</code> で cast。<code>view.len_beats / grid.w.max(1.0)</code> のような暗黙混在は compiler error で誰もが気付く形が望ましい (M9 までは f32 統一だったが、混在の負担より精度の利得を取る)。</li>
+<li><strong><code>Arc&lt;str&gt;</code> lyric の選択理由</strong>: <code>Option&lt;Arc&lt;str&gt;&gt;</code> で 100k notes のうち lyric 付き (例 12.5%) でも文字列を共有可能。<code>String</code> だと alloc が増える。daw_01 の <code>Note.lyric: Option&lt;String&gt;</code> から変換する場合は <code>Option&lt;String&gt; → Option&lt;Arc&lt;str&gt;&gt;</code> で <code>Arc::from(s)</code> 1 回 alloc は必要だが、その先 widget は複製しない。</li>
+<li><strong><code>Note: Copy</code> 削除の影響範囲</strong>: 内部で <code>*note</code> (deref copy) を使っていた箇所を <code>note.clone()</code> か参照渡しに変更。<code>for note in &amp;visible</code> のように iterator は元から <code>&amp;Note</code> を返すので大半の箇所は影響なし。<code>note_to_rect(*note, ...)</code> 風の数か所のみ修正。</li>
+</ul>
+<p><strong>設計判断</strong>:</p>
+<ul>
+<li><strong>lyric を library に持ち込んだ</strong>: 「audio / IPC に関知しない」原則と緊張するが、lyric は <strong>画面表示文字列</strong> であり、audio synthesis 自体は library が扱わない (= label_at と同じ「画面に文字を出す」責務)。ただし lyric 描画は <code>PianoRollStyle::lyric_font_px</code> が 0 のときスキップする等の柔軟性は今後追加可能。</li>
+<li><strong>Copy 削除の代わりに <code>Arc&lt;str&gt;</code> 採用</strong>: <code>Option&lt;&amp;'static str&gt;</code> だと runtime 文字列を持てない、<code>Option&lt;String&gt;</code> だと多数 note の clone が重い。<code>Arc&lt;str&gt;</code> で多数 note 間共有 + immutable で実装シンプル。</li>
+<li><strong><code>Edit</code> API は変えない</strong>: <code>Edit::with_inverse</code> / <code>Edit::snapshot_inverse</code> の signature は不変。snapshot 内容として扱う Note 型が変わるだけ。Phase 44b の本質的な結論「現 API で十分」は維持。</li>
+<li><strong>Phase 44b の API stability 確約撤回をどう告知するか</strong>: docs/history.md の Phase 44b ブロック末尾に「(2026-05-03 修正)」として明記。今後同じ修正パターン (validation 中の確約 → より良い設計のため撤回) が出たら同パターンを使う。</li>
+</ul>
+<p><strong>検証</strong>:</p>
+<ul>
+<li><code>cargo build --workspace</code> ✅ / <code>cargo test --workspace</code> ✅ (146 lib + 9 piano_roll + 7 sample_edit_ops + その他 全 pass) / <code>cargo clippy --workspace --tests -- -D warnings</code> ✅</li>
+<li><code>cd ../daw_01 &amp;&amp; cargo build</code> ✅ (gui_01 の Note 型を import していないため影響なし)</li>
+<li><code>cargo run --bin piano_roll</code> で実機目視: f64 化後も 100k notes が表示、8 note ごとの lyric ("ら"/"る"/"れ"/"ろ"/"り") が note rect 上に表示、pan/zoom/drag/Insert/Delete/Ctrl+Z 全 OK</li>
+</ul>
+<p><strong>残作業</strong>: なし。Phase 44c 完了 = <strong>M9 全完了</strong>。</p>
+<p><strong>Phase 45 以降への引き継ぎ事項</strong>:</p>
+<ul>
+<li><strong>daw_01 側の adapter 実装</strong> (daw_01 task): NoteBox → daw_ui_core::Note の <code>From</code> impl (or 関数)。daw_01 内部で gui_01 widget を採用する判断は daw_01 側で行う。</li>
+<li><strong>lyric font の i18n 対応</strong>: 現状 HackGen Console NF で日本語表示 OK。CJK / emoji の font fallback は M11 (旧 M11、凍結中) で扱う。</li>
+<li><strong>lyric の hash 影響</strong>: scenegraph cache の input_hash に lyric を含める必要があるか確認。現状 <code>notes_generation</code> で全体 invalidation するので問題ないはず。</li>
+</ul>
+<p><strong>LOC</strong>:</p>
+<ul>
+<li>library: <code>crates/ui/src/widgets/piano_roll.rs</code> +~30 LOC (lyric field 追加 + Style 拡張 + draw_notes 拡張 + helper rename / signature 変更)</li>
+<li>example: <code>crates/examples/piano_roll/src/main.rs</code> +~20 LOC (lyric demo 生成 + f64 化に伴う boundary 修正)</li>
+<li>trybuild: <code>crates/ui/tests/ui/pass/basic.rs</code> +6 LOC (Note init で lyric: None + f64 リテラル)</li>
+<li>docs: <code>docs/plan.md</code> 1 行更新、<code>docs/history.md</code> +~80 LOC</li>
+</ul>
+<hr>
+<h2 id="m9-phase-44d-daw_01-conversation-002-004-piano_roll-rect-select-breaking-clip-dbl-click-2026-05-03">M9 Phase 44d (daw_01 conversation #002-#004 対応 — piano_roll rect select breaking 変更 + clip dbl-click デモ、完了 2026-05-03)</h2>
+<p><strong>目的</strong>: daw_01 から <code>gui_01_conversation.md</code> に届いた 3 件のフィードバック (#002 rect select 修飾キー / #003 空白 dbl-click → AddNote / #004 clip dbl-click → タブ遷移) に対応。<code>piano_roll</code> widget の rect multi-select 修飾キーを <strong>Alt+drag → Shift+drag (加算)</strong> に breaking 置換し、<code>daw_prototype</code> に Phase 41g の <code>take_double_click_in_rect</code> 活用デモを追加する。</p>
+<p><strong>進捗</strong>: 1 commit で完遂 (library widget + example + tests + docs + daw_01 conversation 返信)。</p>
+<p><strong>変更内容</strong>:</p>
+<h3 id="library-widget-breaking-cratesuisrcwidgetspiano_rollrs">library widget の breaking 変更 (<code>crates/ui/src/widgets/piano_roll.rs</code>):</h3>
+<ul>
+<li>rect multi-select の起動修飾キーを <strong>Alt → Shift</strong> に置換 (line 817 の <code>pointer.modifiers.alt</code> → <code>pointer.modifiers.shift</code>、release 判定 line 822 同様)</li>
+<li>pan vs rect-select の gate 条件 (line 497, 613 の <code>!pointer.modifiers.alt</code> → <code>!pointer.modifiers.shift</code>)</li>
+<li>挙動を「全置換 (排他)」→ <strong>「加算 (<code>next = prev ∪ rect_inside</code>)」</strong> に変更:</li>
+<li>HashSet で既選択と rect 内 ids を union</li>
+<li>sort_unstable で順序安定化、prev と比較して変化ありなら <code>NotesEditRequest::Select</code> 発行</li>
+<li>doc comment の Alt+drag 記述を Shift+drag に書き換え (line 135 / 152 / 334 / 444 / 494 / 806)</li>
+<li><code>PianoRollResponse.rect_select_active</code> フィールド名は不変 (汎用名のため)</li>
+</ul>
+<h3 id="example-cratesexamplespiano_rollsrcmainrs">example の更新 (<code>crates/examples/piano_roll/src/main.rs</code>):</h3>
+<ul>
+<li>module doc コメント / 操作説明 / footer label の "Alt+drag" → "Shift+drag (加算)"</li>
+<li><code>apply_pan_and_zoom</code> の修飾キー gate を Shift に置換 (line 335)</li>
+</ul>
+<h3 id="daw_prototype-cratesexamplesdaw_prototypesrcmainrs">daw_prototype デモ追加 (<code>crates/examples/daw_prototype/src/main.rs</code>):</h3>
+<ul>
+<li>Arrangement clip ループ (line 519 直前) に <code>take_double_click_in_rect(clip_rect)</code> 呼び出しを追加</li>
+<li>dbl-click 検出時に <code>Edit::mutate</code> で <code>m.current_tab = 2</code> (Piano Roll) + <code>last_action</code> を記録</li>
+<li><code>plan_daw01_feedback.md:308</code> で言及されたが未実装だった「P1-4 demo」を本対応で具体化</li>
+</ul>
+<h3 id="piano_rollrs-cfgtest-mod-tests">新規テスト (<code>piano_roll.rs</code> 内 <code>#[cfg(test)] mod tests</code>):</h3>
+<ul>
+<li><code>piano_roll_shift_drag_is_additive</code> — 既選択 [3] + Shift+drag rect (50,50)-(350,200) → next = sorted [1, 2, 3]、prev = [3]</li>
+<li><code>piano_roll_alt_drag_no_longer_selects</code> — Alt+drag では Select request 発行されないことの回帰防止</li>
+<li><code>modifiers_default_is_no_alt</code> を <code>assert!(!m.shift)</code> も含む形に拡張</li>
+</ul>
+<h3 id="daw_01-conversation-file-fdevdaw_01docsgui_01_conversationmd">daw_01 conversation file (<code>F:\dev\daw_01\docs\gui_01_conversation.md</code>):</h3>
+<ul>
+<li>
+<h1 id="002-003-004-gui_01-open-replied">002 / #003 / #004 の <code>### gui_01 →</code> ブロックに返信を記入、ステータスを <code>[Open]</code> → <code>[Replied]</code> に変更</h1>
+</li>
+<li>
+<h1 id="002-shiftdrag-breaking-click-shiftdrag-2">002: Shift+drag (加算) に breaking 置換 + 排他は空白 click + Shift+drag の 2 ステップで実現可能を回答</h1>
+</li>
+<li>
+<h1 id="003-api-widget-dbl-click-note_hit-pub-take_double_click_in_rect">003: API 拡張不要、widget は dbl-click を素通し + <code>note_hit</code> (pub) で空白判定 → <code>take_double_click_in_rect</code> でエミュレート可能、エミュレートのコード例を提示</h1>
+</li>
+<li>
+<h1 id="004-clip-take_double_click_in_rect-daw_prototype">004: 推奨パターン (clip ループ内で個別 <code>take_double_click_in_rect</code>) + 本対応の <code>daw_prototype</code> デモを参照可能と回答</h1>
+</li>
+</ul>
+<p><strong>主な学び</strong>:</p>
+<ul>
+<li><strong>CLAUDE.md「破壊的変更を恐れない」原則の運用</strong>: Phase 41c で固めた Alt+drag 仕様を、daw_01 旧自前実装慣習 + DAW 業界標準 (Cubase / Logic / Bitwig で shift = 加算) に合わせて Shift+drag に置換。単一 workspace + Edition 2024 の利点で全 example / test / docs を 1 commit で同期更新。</li>
+<li><strong>加算 select は新規 API を必要としない</strong>: <code>NotesEditRequest::Select { prev, next }</code> の既存 enum で <code>next = prev ∪ rect_inside</code> を表現できる。排他は「空白 click で clear → Shift+drag」の 2 ステップで成立 (新規 modifier 設定や API 拡張なし)。</li>
+<li><strong>歴史ドキュメントは時系列で残す</strong>: <code>docs/plan_phase41e.md:135,183,220</code> および <code>docs/history.md:1183</code> の Alt+drag 記述は <strong>Phase 41c 完了時点の事実</strong> として残す (CLAUDE.md「歴史を書き換えない」)。本対応は新規 entry (Phase 44d) として記録し、<code>docs/plan.md</code> の現在表のみ更新。</li>
+<li><strong>API 拡張前にエミュレート可能性を確認</strong>: #003 は当初「widget 内蔵 fragment が必要か?」と相談だったが、<code>take_double_click_in_rect</code> (P1-4) と <code>note_hit</code> (pub) の組み合わせで widget 外側でエミュレート可能と判明 → API 拡張せず。「3 回繰り返されたら抽象化を検討」原則に整合。</li>
+</ul>
+<p><strong>設計判断</strong>:</p>
+<ul>
+<li><strong>デフォルト変更 vs Style 拡張 vs 完全置換</strong>: 3 案の中から「Shift+drag のみに完全置換」を採用。daw_01 旧実装慣習に完全一致、API 表面積最小、ModifierKey 系の新型導入を回避。Alt+drag を残す案 (両対応) は「ユーザに使い分けを強要」する設計で KISS に反する。</li>
+<li><strong>加算挙動の選択</strong>: daw_01 #002 エントリ本文「shift+drag = 加算 rect select」を踏襲。排他がほしい場合は空白 click + Shift+drag で対応可能なため、デフォルトを加算とする方が DAW 業界標準と整合。</li>
+<li><strong>daw_prototype デモを本対応に同梱</strong>: <code>plan_daw01_feedback.md:308</code> の言及で計画されていたが Phase 41 までで未実装だったため、<code>take_double_click_in_rect</code> の活用例として本対応で追加。daw_01 が #004 で「実装したい UX」と回答したため、参照可能なデモが docs より具体的。</li>
+</ul>
+<p><strong>検証</strong>:</p>
+<ul>
+<li><code>cargo build --workspace</code> ✅ / <code>cargo test --workspace</code> ✅ (新規 2 テスト含め全 pass) / <code>cargo clippy --workspace --tests -- -D warnings</code> ✅</li>
+<li><code>cd ../daw_01 &amp;&amp; cargo build</code> ✅ (path 依存先 build OK)</li>
+<li><code>cargo run --bin piano_roll</code> 実機目視: Shift+drag で rect select 加算動作、Alt+drag では何も起きない、無修飾 drag は pan</li>
+<li><code>cargo run --bin daw_prototype</code> 実機目視: Arrangement タブの clip を dbl-click → Piano Roll タブへ遷移、footer label に "clip dbl-click → Piano Roll (track N clip M)" 表示</li>
+</ul>
+<p><strong>残作業</strong>: なし。Phase 44d 完了。</p>
+<p><strong>LOC</strong>:</p>
+<ul>
+<li>library: <code>crates/ui/src/widgets/piano_roll.rs</code> ±~30 LOC (修飾キー置換 + 加算ロジック + doc + 新規テスト 2 件)</li>
+<li>example: <code>crates/examples/piano_roll/src/main.rs</code> ±~5 LOC (修飾キー gate + 説明文)</li>
+<li>example: <code>crates/examples/daw_prototype/src/main.rs</code> +7 LOC (clip dbl-click デモ)</li>
+<li>docs: <code>docs/plan.md</code> 1 行追加 (Phase 44d 行)、<code>docs/history.md</code> +~80 LOC (本ブロック)</li>
+<li>conversation: <code>F:\dev\daw_01\docs\gui_01_conversation.md</code> 3 件返信 + ステータス更新</li>
+</ul>
+<p class="note">本ドキュメントは <code>docs/*.md</code> から HTML 化された (M14 Phase 70)。 編集は HTML 側のみ。</p>
+</body>
+</html>

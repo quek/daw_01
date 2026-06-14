@@ -1,0 +1,20 @@
+[package]
+name = "daw-ui-example-knob-modulation-snapshot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "knob_modulation_snapshot"
+path = "src/main.rs"
+
+[dependencies]
+daw-ui-platform.workspace = true
+daw-ui-renderer.workspace = true
+daw-ui-core.workspace = true
+png = "0.17"

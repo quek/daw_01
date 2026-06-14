@@ -1,0 +1,29 @@
+[package]
+name = "daw-ui-renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+daw-ui-platform.workspace = true
+glyphon = "0.11.0"
+pollster = "0.4.0"
+wgpu = "29.0.1"
+
+# M14 Phase 74 (daw_01 #045 §B): D3D11 shared NT handle texture import (DX12 backend 限定)。
+# wgpu-hal 29.0.1 内部 pin と一致させて `ID3D12Resource` 型互換を確保 (= 0.62 不一致だと型不互換)。
+# daw_01 workspace は windows = 0.61 を使うので、 公開 API は raw `isize` で受け取り D3D12 open
+# 処理は本 crate 内部で完結させる設計 (= daw_01 dependency 変更ゼロ)。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
