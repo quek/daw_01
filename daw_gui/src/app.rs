@@ -898,6 +898,24 @@ pub(crate) struct ArrangeViewSnapshot {
     row_overrides: std::collections::HashMap<u32, u16>,
 }
 
+/// 進行中 export の現在フェーズ + 進捗。`AppData::export_stage` が単一の真実源で、
+/// 進捗オーバーレイ表示・入力 gate (`handle_event` 冒頭)・再生抑止 (`play`) の判定に
+/// 使う。`None` = export 非実行。
+///
+/// 標準 WAV export と video export の前段は `AudioRender` (daw_audio が freewheel で
+/// 音声を書き出す)、video export の後段は `VideoRender` (daw_gui がフレームを render)。
+/// 標準 WAV か video かの区別 (= overlay タイトル) は `pending_video_export` の有無と
+/// `VideoRender` フェーズで判定する (`export_overlay::draw`)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ExportStage {
+    /// daw_audio が freewheel で音声をレンダリング中。`(done, total)` は **sample 数**
+    /// (song body)。標準 WAV export では唯一フェーズ、video export では前段。
+    AudioRender { done: u64, total: u64 },
+    /// daw_gui が映像フレームをレンダリング中 (video export 後段)。`(done, total)` は
+    /// **frame 数**。
+    VideoRender { done: u64, total: u64 },
+}
+
 pub struct AppData {
     // -------- Song / file --------
     pub song: Song,
@@ -1546,10 +1564,16 @@ pub struct AppData {
     /// resync to that control's drag-end. session-only.
     pub mod_depth_scrub_active: Option<(u32, common::model::AutomationTarget)>,
 
-    /// Video export の進捗 `(done_frames, total_frames)`。background thread が
-    /// `ExportProgress` で更新。`None` = export 非実行。UI が進捗オーバーレイの
-    /// 表示判定に使う。
-    pub export_progress: Option<(u64, u64)>,
+    /// 進行中 export の現在フェーズ + 進捗 ([`ExportStage`])。音声 freewheel
+    /// (標準 WAV export / video 前段) は daw_audio の `ExportWavProgress`、映像
+    /// render (video 後段) は daw_gui の `ExportProgress` で更新。`None` = export
+    /// 非実行。進捗オーバーレイ表示・入力 gate・再生抑止の単一真実源。
+    pub export_stage: Option<ExportStage>,
+    /// 音声 freewheel フェーズ (`AudioRender`) の最後に進捗が動いた時刻。export
+    /// 開始時と各 `ExportWavProgress` で更新する。`on_tick` の watchdog が、
+    /// daw_audio が（crash でなく）hang して完了通知も進捗も来ない状態を検出して
+    /// overlay を強制解除するために使う（永久ロック防止）。`None` = 音声 render 非実行。
+    pub export_progress_at: Option<std::time::Instant>,
     /// 実行中 export のキャンセルフラグ。UI の Cancel ボタンで `true` にすると
     /// render loop が次フレームで中断し出力を破棄する。`None` = export 非実行。
     pub export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1958,7 +1982,8 @@ impl AppData {
             mod_follower_scrub_active: false,
             armed_mod_source: None,
             mod_depth_scrub_active: None,
-            export_progress: None,
+            export_stage: None,
+            export_progress_at: None,
             export_cancel: None,
             pending_video_export: None,
             export_temp_wav: None,
@@ -4434,7 +4459,14 @@ pub enum AppEvent {
 
     // -------- WAV export -------------------------------------------------
     ExportWav,
-    ExportWavComplete { error: Option<String> },
+    /// daw_audio の offline WAV render 完了通知。`cancelled` はユーザー中断
+    /// (`CancelExport`)、`error` は失敗理由（成功は両方 None/false）。型で
+    /// 判定し、error 文字列での分岐はしない。
+    ExportWavComplete { error: Option<String>, cancelled: bool },
+    /// daw_audio が offline WAV render 中に送る音声フェーズの進捗 `(done, total)`
+    /// (sample 数)。`export_stage` を `AudioRender` に更新して進捗オーバーレイに
+    /// 反映する。標準 WAV export / video export 前段のどちらでも来る。非 undoable。
+    ExportWavProgress { done: u64, total: u64 },
     /// Phase 7 B4 Step E (2026-05-13): MIDI export menu trigger。 rfd で
     /// path 取得 → `midi_export::export_midi(&song, &path)` で SMF1 書き出し。
     /// 失敗時は status_message に error を出すのみ (= モーダル無し)。
@@ -4559,11 +4591,11 @@ pub enum AppEvent {
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
     },
-    /// background export thread が毎フレーム発火（`done` / `total` フレーム）。
-    /// `export_progress` を更新して進捗オーバーレイに反映。非 undoable。
+    /// 映像 render thread が発火（`done` / `total` フレーム）。`export_stage` を
+    /// `VideoRender` に更新して進捗オーバーレイに反映。非 undoable。
     ExportProgress { done: u64, total: u64 },
-    /// background export thread の完了通知（成功時は出力 path、失敗 /
-    /// キャンセル時は理由）。`export_progress` / `export_cancel` をクリアして
+    /// 映像 render thread の完了通知（成功時は出力 path、失敗 /
+    /// キャンセル時は理由）。`export_stage` / `export_cancel` をクリアして
     /// status_message に結果を出す。非 undoable。
     ExportFinished {
         result: Result<PathBuf, String>,
@@ -4922,15 +4954,29 @@ impl AppData {
         //   ExportProgress / ExportFinished … background render thread からの進捗/完了
         //   CancelExport … modal の Cancel ボタン（plugin GUI 等の別 OS window 経由の
         //   close は handle_event を通らないので on_tick 側で別 gate）
-        if self.pending_video_export.is_some() || self.export_progress.is_some() {
+        if self.pending_video_export.is_some() || self.export_stage.is_some() {
             let allow = matches!(
                 event,
                 AppEvent::ExportWavComplete { .. }
+                    | AppEvent::ExportWavProgress { .. }
                     | AppEvent::ExportProgress { .. }
                     | AppEvent::ExportFinished { .. }
                     | AppEvent::CancelExport
+                    // child crash 検出は export 中でも処理しないと、daw_audio が
+                    // 音声 render 中に落ちたとき完了通知が永遠に来ず overlay +
+                    // 入力 gate で GUI が永久ロックする (audio 分岐で export を
+                    // 後始末する)。respawn 経路もここを通る。
+                    | AppEvent::ChildDisconnected { .. }
+                    // 30Hz の playhead poll tick。export 中も通して `on_tick` の
+                    // export watchdog (進捗が止まった hang を検出して overlay を
+                    // 強制解除する) を動かす。`on_tick` の本体は is_playing で
+                    // 内部ガードされ、export 中は engine へ何も送らない (無害)。
+                    | AppEvent::Tick { .. }
             );
             if !allow {
+                // gate で落とした event を観測可能にする (silent drop だと
+                // 「dialog で選んだのに何も起きない」等の原因究明が困難)。
+                tracing::debug!(?event, "event gated during export");
                 return;
             }
         }
@@ -5909,11 +5955,22 @@ impl AppData {
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
             }
+            AppEvent::ExportWavProgress { done, total } => {
+                // daw_audio の音声 freewheel 進捗。標準 WAV export / video 前段の
+                // どちらでも来る。stage が AudioRender でない (= export 非実行 or
+                // 既に映像フェーズ) なら stale とみなして無視する (overlay の
+                // 亡霊化を防ぐ)。
+                if matches!(self.export_stage, Some(ExportStage::AudioRender { .. })) {
+                    self.export_stage = Some(ExportStage::AudioRender { done, total });
+                    // watchdog: 進捗が来ている間は生存とみなしてタイマーをリセット。
+                    self.export_progress_at = Some(std::time::Instant::now());
+                }
+            }
             AppEvent::ExportProgress { done, total } => {
-                self.export_progress = Some((done, total));
+                self.export_stage = Some(ExportStage::VideoRender { done, total });
             }
             AppEvent::ExportFinished { result } => {
-                self.export_progress = None;
+                self.export_stage = None;
                 self.export_cancel = None;
                 // 自動レンダリングした音声 temp WAV を削除。
                 if let Some(wav) = self.export_temp_wav.take() {
@@ -5934,12 +5991,25 @@ impl AppData {
                     }
                 }
             }
-            AppEvent::CancelExport => {
-                if let Some(flag) = &self.export_cancel {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.status_message = "Video export をキャンセル中...".into();
+            AppEvent::CancelExport => match self.export_stage {
+                // 映像フェーズは daw_gui プロセス内の render thread。in-process の
+                // atomic flag で次フレーム中断させる。
+                Some(ExportStage::VideoRender { .. }) => {
+                    if let Some(flag) = &self.export_cancel {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.status_message = "Video export をキャンセル中...".into();
+                    }
                 }
-            }
+                // 音声 freewheel は daw_audio プロセス。IPC で cancel を送り、
+                // freewheel ループが次 buffer で中断 → `ExportWavComplete
+                // { error: None, cancelled: true }` が返る (cancel は typed flag で
+                // 伝わる)。標準 WAV export / video 前段のどちらでも有効。
+                Some(ExportStage::AudioRender { .. }) => {
+                    self.send_audio(MainToChild::CancelExport);
+                    self.status_message = "書き出しをキャンセル中...".into();
+                }
+                None => {}
+            },
             AppEvent::SetClipReversed { target, reversed } => {
                 self.set_clip_audio_event_reversed(target, reversed);
             }
@@ -6223,35 +6293,69 @@ impl AppData {
             AppEvent::GlueSelectedClips => {
                 self.action_glue_selected_clips();
             }
-            AppEvent::ExportWavComplete { error } => {
+            AppEvent::ExportWavComplete { error, cancelled } => {
+                // この完了が今 track している音声 render のものでなければ無視する
+                // (BounceClipFxComplete の stale ガードと対称)。crash / watchdog で
+                // 既に abort 済みの後着完了 (= 中止 status を「完了」で上書きしてしまう)
+                // や、daw_audio の二重起動ガードが弾いた reject 完了が、走行中 export の
+                // overlay / plugin render mode / status を壊すのを防ぐ。正規完了は
+                // 標準 WAV / video 前段とも export_stage=AudioRender なので素通りする。
+                if !matches!(self.export_stage, Some(ExportStage::AudioRender { .. }))
+                    && self.pending_video_export.is_none()
+                {
+                    tracing::warn!(
+                        ?error,
+                        cancelled,
+                        "ExportWavComplete with no active audio export; ignoring"
+                    );
+                    return;
+                }
                 // Either way, hand the plugins back to realtime mode
                 // (we set Offline before triggering the export).
                 self.send_plugin(MainToChild::SetRenderMode(
                     common::protocol::RenderMode::Realtime,
                 ));
+                // 音声 freewheel フェーズ終了。overlay の AudioRender 状態を
+                // 必ずクリアする（標準 WAV はこれで overlay が閉じ、video 後段は
+                // この後 `action_export_mp4` が VideoRender を再設定する）。
+                // watchdog 用の進捗タイムスタンプも落とす。
+                self.export_progress_at = None;
+                self.export_stage = None;
                 if let Some(mp4_path) = self.pending_video_export.take() {
-                    // 1 ステップ video export の音声レンダリング完了 → video
-                    // export を開始（音声失敗時は映像のみで続行）。
-                    let wav = match &error {
-                        Some(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "audio render for video export failed; video-only"
-                            );
-                            self.status_message = format!(
-                                "音声レンダリング失敗 ({err}); 映像のみで書き出します"
-                            );
-                            if let Some(t) = self.export_temp_wav.take() {
-                                let _ = std::fs::remove_file(&t);
-                            }
-                            None
+                    if cancelled {
+                        // 前段（音声）でキャンセル → video export 全体を中止し、
+                        // 映像 render には進まない。
+                        if let Some(t) = self.export_temp_wav.take() {
+                            let _ = std::fs::remove_file(&t);
                         }
-                        None => self.export_temp_wav.clone(),
-                    };
-                    #[cfg(windows)]
-                    self.action_export_mp4(mp4_path, wav);
-                    #[cfg(not(windows))]
-                    let _ = (mp4_path, wav);
+                        let _ = mp4_path;
+                        self.status_message = "Video export をキャンセルしました".into();
+                    } else {
+                        // 1 ステップ video export の音声レンダリング完了 → video
+                        // export を開始（音声失敗時は映像のみで続行）。
+                        let wav = match &error {
+                            Some(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "audio render for video export failed; video-only"
+                                );
+                                self.status_message = format!(
+                                    "音声レンダリング失敗 ({err}); 映像のみで書き出します"
+                                );
+                                if let Some(t) = self.export_temp_wav.take() {
+                                    let _ = std::fs::remove_file(&t);
+                                }
+                                None
+                            }
+                            None => self.export_temp_wav.clone(),
+                        };
+                        #[cfg(windows)]
+                        self.action_export_mp4(mp4_path, wav);
+                        #[cfg(not(windows))]
+                        let _ = (mp4_path, wav);
+                    }
+                } else if cancelled {
+                    self.status_message = "WAV 書き出しをキャンセルしました".into();
                 } else if let Some(err) = error {
                     self.status_message = format!("WAV 書き出し失敗: {err}");
                 } else {
@@ -7635,9 +7739,11 @@ impl AppData {
     fn play(&mut self) {
         // export 中は再生を禁止する。音声 freewheel フェーズの realtime play は
         // offline render と競合し、書き出される音声を壊しうる（映像フェーズは
-        // 独立だが、 混乱を避けて export 全体で一律に止める）。
-        if self.pending_video_export.is_some() || self.export_progress.is_some() {
-            self.status_message = "Video export 中は再生できません".into();
+        // 独立だが、 混乱を避けて export 全体で一律に止める）。標準 WAV export も
+        // `export_stage` が立つので同じ gate で止まる（旧構造では WAV export 中に
+        // 再生できてしまい render を壊しえた）。
+        if self.pending_video_export.is_some() || self.export_stage.is_some() {
+            self.status_message = "書き出し中は再生できません".into();
             return;
         }
         // FIXME #24: プロジェクトロードの asset decode 中は音声がまだ揃って
@@ -10735,9 +10841,20 @@ impl AppData {
         self.pending_play = false;
         self.active_param_gestures.clear();
         self.latched_param_gestures.clear();
+        // 音声 render 中の crash で export を中止したか。respawn 成功時の status に
+        // 「書き出しを中止しました」を併記して、中止の事実が上書きで消えないようにする。
+        let mut export_aborted = false;
         match kind {
             ChildKind::Audio => {
                 self.audio_tx = None;
+                // 音声 render 中の crash なら ExportWavComplete が永遠に来ない。
+                // export を強制終了して overlay / 入力 gate を解除する（解除しないと
+                // GUI が永久ロックする）。AudioRender 中でなければ no-op。中止した
+                // ことは下の respawn status に併記する（respawn 成功 status に
+                // 上書きされて「書き出しが中止された」事実が消えないように）。
+                export_aborted = self.abort_audio_export(
+                    "音声エンジンがクラッシュしたため書き出しを中止しました".into(),
+                );
                 tracing::warn!("daw_audio child disconnected");
             }
             ChildKind::PluginHost => {
@@ -10747,6 +10864,13 @@ impl AppData {
                 tracing::warn!("daw_plugin_host child disconnected");
             }
         }
+
+        // 中止した書き出しがあれば status に併記する suffix。
+        let export_suffix = if export_aborted {
+            " — 書き出しを中止しました"
+        } else {
+            ""
+        };
 
         // crash-loop ガード: 短時間に同 kind が閾値以上切断したら自動 respawn を
         // 止める。落ちるプラグインを抱えたプロジェクト (例: state 復元後に
@@ -10766,9 +10890,10 @@ impl AppData {
         if recent >= CRASH_LIMIT {
             self.status_message = format!(
                 "{}が繰り返しクラッシュしています — 自動再起動を停止しました。\
-                 プロジェクトのプラグインを確認してください{}",
+                 プロジェクトのプラグインを確認してください{}{}",
                 kind.as_str(),
-                if was_playing { " (再生停止)" } else { "" }
+                if was_playing { " (再生停止)" } else { "" },
+                export_suffix
             );
             tracing::error!(
                 ?kind,
@@ -10782,9 +10907,10 @@ impl AppData {
         // (= script / test 経路) なら通知だけで終わる。
         let Some(supervisor) = self.supervisor.clone() else {
             self.status_message = format!(
-                "{}が切断されました{} — supervisor 無効",
+                "{}が切断されました{}{} — supervisor 無効",
                 kind.as_str(),
-                if was_playing { " (再生停止)" } else { "" }
+                if was_playing { " (再生停止)" } else { "" },
+                export_suffix
             );
             return;
         };
@@ -10801,17 +10927,19 @@ impl AppData {
                 self.restore_plugin_from_song(&song_snapshot);
                 self.sync_song_to_plugin_host();
                 self.status_message = format!(
-                    "{}を再起動しました{}",
+                    "{}を再起動しました{}{}",
                     kind.as_str(),
-                    if was_playing { " (再生は手動で再開してください)" } else { "" }
+                    if was_playing { " (再生は手動で再開してください)" } else { "" },
+                    export_suffix
                 );
                 tracing::info!(?kind, "child respawn + state restore completed");
             }
             Err(e) => {
                 self.status_message = format!(
-                    "{}の再起動に失敗しました: {} — アプリ再起動が必要です",
+                    "{}の再起動に失敗しました: {}{} — アプリ再起動が必要です",
                     kind.as_str(),
-                    e
+                    e,
+                    export_suffix
                 );
                 tracing::error!(error = %e, ?kind, "child respawn failed");
             }
@@ -16199,6 +16327,25 @@ impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
     fn on_tick(&mut self, playhead_samples: u64, peak_l_raw: f32, peak_r_raw: f32) {
+        // Export watchdog: daw_audio が crash でなく hang した場合 (進捗 heartbeat も
+        // 完了通知も止まる) は ChildDisconnected も発火しないので overlay + 入力 gate
+        // が永久に残る。一定時間進捗が来なければ強制終了して脱出口を確保する。
+        // daw_audio は render 中 250ms ごとに heartbeat を送るので、無進捗が
+        // この閾値を超えるのは実質 hang のみ (長尺 render での誤発火は無い)。
+        // VideoRender は daw_gui 内で必ず ExportFinished を返すので対象外。
+        const EXPORT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+        if matches!(self.export_stage, Some(ExportStage::AudioRender { .. }))
+            && let Some(since) = self.export_progress_at
+            && since.elapsed() > EXPORT_WATCHDOG
+        {
+            tracing::error!(
+                elapsed_s = since.elapsed().as_secs(),
+                "offline WAV render stalled past watchdog timeout; aborting export"
+            );
+            self.abort_audio_export(
+                "音声エンジンが応答しないため書き出しを中止しました".into(),
+            );
+        }
         let next_beat = if playhead_samples == u64::MAX {
             None
         } else {
@@ -17217,6 +17364,18 @@ impl AppData {
     ///   4. On `ExportWavComplete` the handler flips render mode back
     ///      to Realtime (see `AppEvent::ExportWavComplete` arm).
     fn action_export_wav(&mut self) {
+        // 二重起動ガード (video export と対称)。dialog 表示中はまだ export_stage が
+        // 立たないので、専用フラグ export_dialog_open でも弾く。これが無いと
+        // dialog を開いたまま再度 Export WAV を選べてしまい、両方で path を確定すると
+        // ExportWav が 2 本 daw_audio に飛んで export thread が二重 spawn される。
+        if self.export_stage.is_some()
+            || self.pending_video_export.is_some()
+            || self.export_dialog_open
+        {
+            self.status_message = "書き出しを実行中です".into();
+            return;
+        }
+        self.export_dialog_open = true;
         let dialog = rfd::FileDialog::new().add_filter("WAV", &["wav"]);
         self.spawn_file_dialog(dialog, FileDialogMode::Save, FileDialogKind::ExportWav);
     }
@@ -17834,7 +17993,7 @@ impl AppData {
     /// WAV を別途選ばせる 2 つ目のダイアログ」 は廃止。
     #[cfg(windows)]
     fn action_open_export_mp4_dialog(&mut self) {
-        if self.export_progress.is_some()
+        if self.export_stage.is_some()
             || self.pending_video_export.is_some()
             || self.export_dialog_open
         {
@@ -17862,10 +18021,22 @@ impl AppData {
     /// 「音声を temp WAV へ自動レンダリング → 完了後に video export + mux」 を、
     /// dialog 別スレッド化に伴いここへ移設した。
     fn action_begin_export_mp4(&mut self, output_path: PathBuf) {
+        // audio engine が死んでいる (audio_tx=None) と前段の音声 render が
+        // start できず ExportWavComplete が来ない → overlay 永久ロック。
+        // 開始前にガードする（標準 WAV export と同じ防御）。
+        if self.audio_tx.is_none() {
+            self.status_message =
+                "音声エンジンが利用できないため Video export を開始できません".into();
+            return;
+        }
         let temp_wav = std::env::temp_dir()
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
         self.pending_video_export = Some(output_path);
         self.export_temp_wav = Some(temp_wav.clone());
+        // 前段 = 音声 freewheel。daw_audio の `ExportWavProgress` で determinate
+        // 進捗が来る（旧構造では indeterminate「音声レンダリング中」だった）。
+        self.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+        self.export_progress_at = Some(std::time::Instant::now());
         self.status_message = "音声をレンダリング中...".into();
         // 再生中なら停止（freewheel と realtime play の競合を回避）。
         if self.is_playing {
@@ -17877,6 +18048,39 @@ impl AppData {
             common::protocol::RenderMode::Offline,
         ));
         self.send_audio(MainToChild::ExportWav { path: temp_wav });
+    }
+
+    /// 音声 freewheel フェーズ (`AudioRender`) を強制終了する。daw_audio が
+    /// crash した (`handle_child_disconnected`) / hang して進捗も完了通知も来ない
+    /// (`on_tick` watchdog) ときの脱出口。export_stage を None に戻して overlay /
+    /// 入力 gate / 再生抑止を解除し、video 前段だった場合は後段に進まず全体中止
+    /// (pending_video_export / temp WAV を破棄)、plugin を Realtime へ戻す。
+    /// `reason` を status_message に出す。`AudioRender` 中でなければ no-op
+    /// (= VideoRender は daw_gui 内なので audio 断の影響を受けない)。
+    /// 実際に中止したら `true`、`AudioRender` 中でなく no-op なら `false` を返す。
+    /// 呼び出し側 (`handle_child_disconnected`) が status 文言の組み立てに使う。
+    fn abort_audio_export(&mut self, reason: String) -> bool {
+        if !matches!(self.export_stage, Some(ExportStage::AudioRender { .. })) {
+            return false;
+        }
+        self.export_stage = None;
+        self.export_progress_at = None;
+        self.pending_video_export = None;
+        if let Some(t) = self.export_temp_wav.take() {
+            let _ = std::fs::remove_file(&t);
+        }
+        // daw_audio がまだ生きている (= watchdog が slow render を hang と誤検出した
+        // ケース等) 場合、freewheel を止めて export_running を落とさせる。落とさないと
+        // CPAL callback が無音を書き続け「再生しても音が出ない」状態になる。crash 時は
+        // 既に audio_tx=None なので send_audio は no-op (= 害なし)。
+        self.send_audio(MainToChild::CancelExport);
+        // export 開始時に Offline へ切り替えた plugin を Realtime に戻す。plugin
+        // host は daw_audio とは別プロセスなので audio 断でも生存している。
+        self.send_plugin(MainToChild::SetRenderMode(
+            common::protocol::RenderMode::Realtime,
+        ));
+        self.status_message = reason;
+        true
     }
 
     /// native file dialog を **別スレッド + owner-modal** で開く共通処理。 dialog を
@@ -17930,10 +18134,31 @@ impl AppData {
                 }
             }
             FileDialogKind::ExportWav => {
+                // dialog が閉じた（確定 or キャンセル）ので二重起動ガードを解除。
+                self.export_dialog_open = false;
                 let Some(path) = paths.into_iter().next() else {
                     return;
                 };
+                // audio engine が死んでいる (respawn 失敗 / crash-loop give-up で
+                // audio_tx=None) と、ExportWav は send_audio に黙って drop される。
+                // ここで export_stage を立ててしまうと完了通知が永遠に来ず overlay
+                // + 入力 gate で GUI が永久ロックする。先にガードして start しない。
+                if self.audio_tx.is_none() {
+                    self.status_message =
+                        "音声エンジンが利用できないため WAV 書き出しを開始できません".into();
+                    return;
+                }
                 self.status_message = "WAV 書き出し中...".to_string();
+                // 進捗オーバーレイ（modal）を即表示。最初の `ExportWavProgress` が
+                // 来るまでは 0% 表示、以降 daw_audio の freewheel 進捗で更新、
+                // `ExportWavComplete` で None に戻して閉じる。これで WAV export 中
+                // の入力 gate / 再生抑止も video と同様に効く。
+                self.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+                self.export_progress_at = Some(std::time::Instant::now());
+                // 再生中なら停止（freewheel と realtime play の競合を回避）。
+                if self.is_playing {
+                    self.stop();
+                }
                 // freewheel 開始前に最新 song snapshot を daw_audio へ送る。
                 let song = self.song.clone();
                 self.send_audio(MainToChild::LoadSong(song));
@@ -18005,7 +18230,10 @@ impl AppData {
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
     ) {
-        if self.export_progress.is_some() {
+        // 何らかの export が走っている間は再入を弾く。video 後段への chain は
+        // `ExportWavComplete` ハンドラが先に `export_stage` を None に戻してから
+        // 呼ぶので通る。
+        if self.export_stage.is_some() {
             self.status_message = "Video export を実行中です".into();
             return;
         }
@@ -18017,7 +18245,7 @@ impl AppData {
         let proxy = self.event_proxy.clone();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.export_cancel = Some(cancel.clone());
-        self.export_progress = Some((0, 0));
+        self.export_stage = Some(ExportStage::VideoRender { done: 0, total: 0 });
         self.status_message = format!("Video export 開始: {}", output_path.display());
         std::thread::spawn(move || {
             let cfg = crate::render_video::RenderConfig::new(&song, &output_path)
