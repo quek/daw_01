@@ -27,9 +27,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use common::model::{ImageSourceId, Song, VideoSourceId, VideoSourcePath};
-use daw_ui_renderer::{
-    Color, GlyphArea, OffscreenRenderer, Rect, Scene, TextureHandle, TexturedQuad,
-};
+use daw_ui_renderer::{OffscreenRenderer, Rect, Scene, TextureHandle, TexturedQuad};
 
 use crate::video_playback::VideoPlaybackEngine;
 
@@ -448,6 +446,17 @@ fn build_frame_scene(
     // FIXME #54: 前 frame の効果 target を解放 (前 frame は submit_readback で sample 済み)。
     // 今 frame の apply_chain が同寸でも別 target を払い出し、レイヤー間衝突を防ぐ。
     fx_engine.end_frame(offscreen);
+    // FIXME #54 Wave4: 時間系効果の P.time（秒）。preview と同じ song 時間（playhead_beat ×
+    // 60/bpm）を渡して時間系効果も一致させる。
+    fx_engine.set_time((playhead_beat * 60.0 / f64::from(song.bpm.max(1.0))) as f32);
+    // FIXME #54 Wave2 (plan_video_fx §3): 動画 / PiP 画像 / テキストを owning track
+    // ごとに 1 枚へ合成する (preview と同一の per-track composite。byte parity)。各 track の
+    // 視覚アイテムを bucket に集め、track 順 (z 順) に共通の composite_and_place で描く。
+    use crate::group_compose::CompositeItem;
+    let canvas = (out_w.max(1) as f32, out_h.max(1) as f32);
+    let mut buckets: HashMap<u32, Vec<CompositeItem>> = HashMap::new();
+
+    // 動画フレーム (in-process libav software decode → BGRA texture) → owning track bucket。
     let video_layers = VideoPlaybackEngine::active_sources_at(song, playhead_beat);
     for layer in video_layers {
         let Some(path) =
@@ -455,11 +464,7 @@ fn build_frame_scene(
         else {
             continue;
         };
-        // In-process libav software decode (handles 10-bit H.264 / HEVC / AV1;
-        // no Media Foundation, no `ffmpeg.exe` subprocess). Decode errors are
-        // logged, not silently swallowed — a dropped frame would otherwise
-        // leave the video black with no diagnostic (the exact bug the old
-        // MF + ffmpeg.exe export path hit on 10-bit sources).
+        // decode errors はログのみ (黙って黒くしない。10-bit で MF/ffmpeg.exe が踏んだ罠)。
         let frame = match decoder.decode_at(layer.video_source_id, &path, layer.source_micros) {
             Ok(f) => f,
             Err(e) => {
@@ -473,8 +478,7 @@ fn build_frame_scene(
             }
         };
         let (bgra, width, height) = (&frame.bgra, frame.width, frame.height);
-        // Get-or-create the per-source BGRA texture, recreating when
-        // the source dimensions change (= shouldn't, but defensive).
+        // Get-or-create the per-source BGRA texture, recreating on dimension change。
         let recreate = match video_textures.get(&layer.video_source_id) {
             Some((_, w, h)) => *w != width || *h != height,
             None => true,
@@ -491,220 +495,96 @@ fn build_frame_scene(
             .map(|(h, _, _)| *h)
             .expect("just inserted");
         offscreen.upload_texture_bgra(texture, bgra);
-        let (rx, ry, rw, rh) = aspect_fit(out_w, out_h, width, height);
-        // FIXME #54: この動画 track の映像効果チェーンを適用 (preview と同経路)。
-        let fx = song
-            .track_by_id(layer.owning_track_id)
-            .map(|t| crate::video_fx::resolve_track_effects(song, t, playhead_beat, mod_scalars))
-            .unwrap_or_default();
-        let texture = if fx.is_empty() {
-            texture
-        } else {
-            fx_engine.apply_chain(offscreen, texture, width, height, &fx)
-        };
-        scene.push_textured_quad(TexturedQuad {
-            rect: Rect::new(rx as f32, ry as f32, rw as f32, rh as f32),
+        let dest = crate::group_compose::aspect_fit_norm(canvas, (width as f32, height as f32));
+        buckets.entry(layer.owning_track_id).or_default().push(CompositeItem::Quad {
             texture,
+            dest,
             alpha: layer.alpha,
-            uv_min: (0.0, 0.0),
-            uv_max: (1.0, 1.0),
-            clip_rect: None,
             rotation_radians: 0.0,
-            rotation_pivot: None,
         });
     }
 
-    // docs/plan_image_overlay.md §P3: image overlay layers on top of
-    // video. Normalized [0, 1] PiP rect maps to canvas pixels (= the
-    // canvas IS the project resolution, so `x * out_w` is exact).
-    // docs/plan_modulation.md §7: `mod_scalars` are sampled by `render_mp4`
-    // from the baked env sidecar at this frame's beat (empty = no modulation),
-    // so visual modulation renders identically to the live preview.
+    // active visual groups (preview と同一 gate `active_visual_groups`、SSoT)。
+    // mod_scalars は render_mp4 が baked env sidecar から sample (空 = 変調なし)。
+    let active_groups = crate::group_compose::active_visual_groups(song, playhead_beat, mod_scalars);
+
+    // PiP 画像 → 親が active group ならその group bucket へ吸収、さもなくば owning track bucket。
     let image_layers =
         crate::image_compose::active_image_sources_at(song, playhead_beat, mod_scalars);
-    // v19 (docs/plan_tachie_group_transform.md §5.6): export も preview と同じ
-    // gate（`active_visual_groups`）で group partition + offscreen 合成する
-    // （preview/export byte parity 要件、SSoT）。
-    let active_groups = crate::group_compose::active_visual_groups(song, playhead_beat, mod_scalars);
-    let mut group_children: std::collections::HashMap<
-        u32,
-        Vec<crate::group_compose::GroupChildQuad>,
-    > = std::collections::HashMap::new();
     for layer in image_layers {
-        let Some((texture, iw, ih)) = image_textures.get(&layer.image_source_id) else {
+        let Some((texture, _iw, _ih)) = image_textures.get(&layer.image_source_id) else {
             continue; // not decoded / failed import
         };
-        // owning track の親が active visual group なら bucket、さもなくば直接 push。
-        let group_id = song
+        let target_track = song
             .track_by_id(layer.owning_track_id)
             .and_then(|t| t.parent_group_id)
-            .filter(|g| active_groups.contains_key(g));
-        if let Some(g) = group_id {
-            group_children.entry(g).or_default().push(
-                crate::group_compose::GroupChildQuad {
-                    texture: *texture,
-                    dest: (layer.x, layer.y, layer.w, layer.h),
-                    alpha: layer.alpha,
-                    rotation_radians: layer.rotation_radians,
-                },
-            );
-            continue;
-        }
-        let rx = layer.x * out_w as f32;
-        let ry = layer.y * out_h as f32;
-        let rw = (layer.w * out_w as f32).max(0.0);
-        let rh = (layer.h * out_h as f32).max(0.0);
-        if rw == 0.0 || rh == 0.0 {
-            continue;
-        }
-        // FIXME #54: 非グループ image overlay の owning track の効果チェーンを適用。
-        let fx = song
-            .track_by_id(layer.owning_track_id)
-            .map(|t| crate::video_fx::resolve_track_effects(song, t, playhead_beat, mod_scalars))
-            .unwrap_or_default();
-        let texture = if fx.is_empty() {
-            *texture
-        } else {
-            fx_engine.apply_chain(offscreen, *texture, *iw, *ih, &fx)
-        };
-        scene.push_textured_quad(TexturedQuad {
-            rect: Rect::new(rx, ry, rw, rh),
-            texture,
+            .filter(|g| active_groups.contains_key(g))
+            .unwrap_or(layer.owning_track_id);
+        buckets.entry(target_track).or_default().push(CompositeItem::Quad {
+            texture: *texture,
+            dest: (layer.x, layer.y, layer.w, layer.h),
             alpha: layer.alpha,
-            uv_min: (0.0, 0.0),
-            uv_max: (1.0, 1.0),
-            clip_rect: None,
             rotation_radians: layer.rotation_radians,
-            rotation_pivot: None,
-        });
-    }
-    // 立ち絵 group を track 順（決定的）に合成 → 親 affine quad を push。
-    for track in &song.tracks {
-        let (Some(children), Some(transform)) =
-            (group_children.remove(&track.id), active_groups.get(&track.id))
-        else {
-            continue;
-        };
-        if children.is_empty() {
-            continue;
-        }
-        let (cw, ch) =
-            crate::group_compose::group_composite_canvas((out_w, out_h), transform);
-        let mut sub = Scene::new();
-        for child in &children {
-            sub.push_textured_quad(TexturedQuad {
-                rect: Rect::new(
-                    child.dest.0 * cw as f32,
-                    child.dest.1 * ch as f32,
-                    child.dest.2 * cw as f32,
-                    child.dest.3 * ch as f32,
-                ),
-                texture: child.texture,
-                alpha: child.alpha,
-                uv_min: (0.0, 0.0),
-                uv_max: (1.0, 1.0),
-                clip_rect: None,
-                rotation_radians: child.rotation_radians,
-                rotation_pivot: None,
-            });
-        }
-        let handle = match offscreen.composite_scene_to_texture(&sub, cw, ch) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!(error = %e, "export composite 立ち絵 group failed");
-                    continue;
-                }
-            };
-        let (rx, ry, rw, rh, rot, px, py, alpha) = crate::group_compose::group_quad_params(
-            transform,
-            (0.0, 0.0, out_w as f32, out_h as f32),
-        );
-        if rw <= 0.0 || rh <= 0.0 || alpha <= 0.0 {
-            continue;
-        }
-        // FIXME #54: 子を 1 枚へ合成した「トラック合成画」に group track の効果を適用。
-        let fx = crate::video_fx::resolve_track_effects(song, track, playhead_beat, mod_scalars);
-        let handle = if fx.is_empty() {
-            handle
-        } else {
-            fx_engine.apply_chain(offscreen, handle, cw, ch, &fx)
-        };
-        scene.push_textured_quad(TexturedQuad {
-            rect: Rect::new(rx, ry, rw, rh),
-            texture: handle,
-            alpha,
-            uv_min: (0.0, 0.0),
-            uv_max: (1.0, 1.0),
-            clip_rect: None,
-            rotation_radians: rot,
-            rotation_pivot: Some((px, py)),
         });
     }
 
-    // docs/plan_text_overlay.md §4 P3: text overlays on top of every
-    // video / image layer. Canvas size = project resolution so
-    // `font_size_px` / `outline_width_px` / `shadow_*` map 1:1 to
-    // output px (= scale = 1.0). Horizontal alignment is approximated
-    // via `font_size * char_count * 0.55`; same MVP estimate as the
-    // preview path.
+    // テキスト → owning track bucket (合成画に焼き込んで track 効果を乗せる)。
     let text_layers =
         crate::text_compose::active_text_sources_at(song, playhead_beat, mod_scalars);
-    for layer in text_layers {
-        if layer.alpha <= 0.0 || layer.text.is_empty() {
-            continue;
+    for tf in text_layers {
+        buckets.entry(tf.owning_track_id).or_default().push(CompositeItem::Text(tf));
+    }
+
+    // track 順 (bottom→top = rev) に共通 composite_and_place で描く (preview と同一 SSoT、
+    // byte parity)。export は選択オーバーレイ無し。
+    let project_box = (0.0, 0.0, out_w as f32, out_h as f32);
+    for track in song.tracks.iter().rev() {
+        let items = buckets.remove(&track.id).unwrap_or_default();
+        if items.is_empty() {
+            continue; // export は overlay 不要なので空 bucket は skip。
         }
-        let rx = layer.x * out_w as f32;
-        let ry = layer.y * out_h as f32;
-        let rw = (layer.w * out_w as f32).max(0.0);
-        let rh = (layer.h * out_h as f32).max(0.0);
-        let font_size = layer.font_size_px.max(1.0);
-        let line_height = font_size * 1.2;
-        // FIXME #28 (gui_01 #097): 揃えはレンダラに委譲。 box = (rx, ry, rw, rh)。
-        // preview path と同一コードで、 自前の文字幅推定は撤去。
-        let fill = Color::rgba(
-            layer.fill_color[0],
-            layer.fill_color[1],
-            layer.fill_color[2],
-            layer.fill_color[3] * layer.alpha,
+        // FIXME #54 Wave3: 配置 transform は Transform device から解決（preview と同一 SSoT）。
+        let transform = crate::video_fx::resolve_track_transform(song, track, playhead_beat, mod_scalars);
+        let fx = crate::video_fx::resolve_track_effects(song, track, playhead_beat, mod_scalars);
+        let tc = crate::group_compose::TrackComposite {
+            track_id: track.id,
+            items,
+            transform,
+            fx,
+            selected: false,
+        };
+        crate::group_compose::composite_and_place(
+            &tc,
+            project_box,
+            (out_w, out_h),
+            offscreen,
+            fx_engine,
+            scene,
         );
-        let outline = Color::rgba(
-            layer.outline_color[0],
-            layer.outline_color[1],
-            layer.outline_color[2],
-            layer.outline_color[3] * layer.alpha,
-        );
-        let shadow = Color::rgba(
-            layer.shadow_color[0],
-            layer.shadow_color[1],
-            layer.shadow_color[2],
-            layer.shadow_color[3] * layer.alpha,
-        );
-        scene.push_text(GlyphArea {
-            text: layer.text.clone(),
-            // 空文字列は renderer default フォント (= None)、 指定があればそのファミリ。
-            font_family: if layer.font_family.is_empty() {
-                None
-            } else {
-                Some(layer.font_family.clone())
-            },
-            left: rx,
-            top: ry,
-            font_size,
-            line_height,
-            color: fill,
-            clip_rect: None,
-            outline_color: outline,
-            outline_width_px: layer.outline_width_px,
-            shadow_color: shadow,
-            shadow_offset_px: layer.shadow_offset_px,
-            shadow_blur_px: layer.shadow_blur_px,
-            rotation_radians: layer.rotation_radians,
-            // FIXME #28: box 内アライメント (実 glyph 幅でレンダラが配置)。
-            box_width: Some(rw),
-            box_height: Some(rh),
-            align_h: crate::text_compose::halign_for(layer.align),
-            align_v: daw_ui_renderer::VAlign::Center,
-        });
+    }
+
+    // FIXME #54 Wave1: マスター映像チェーン。全トラック合成後の scene を 1 枚の master
+    // canvas へ集約 → master fx をチェーン順適用 → scene を master 1 quad で置換（preview と
+    // 同一 SSoT）。空なら何もしない。
+    let master_fx = crate::video_fx::resolve_master_effects(song, playhead_beat, mod_scalars);
+    if !master_fx.is_empty() {
+        match offscreen.composite_scene_to_texture(scene, out_w, out_h) {
+            Ok(handle) => {
+                let handle = fx_engine.apply_chain(offscreen, handle, out_w, out_h, &master_fx);
+                scene.primitives.clear();
+                scene.push_textured_quad(TexturedQuad {
+                    rect: Rect::new(0.0, 0.0, out_w as f32, out_h as f32),
+                    texture: handle,
+                    alpha: 1.0,
+                    uv_min: (0.0, 0.0),
+                    uv_max: (1.0, 1.0),
+                    clip_rect: None,
+                    rotation_radians: 0.0,
+                    rotation_pivot: None,
+                });
+            }
+            Err(e) => tracing::warn!(error = %e, "master 映像 composite 失敗 (export)"),
+        }
     }
 }
 
@@ -720,51 +600,12 @@ fn resolve_video_source_path(
     }
 }
 
-/// Aspect-fit dst rect for a `src_w x src_h` source landing on a
-/// `dst_w x dst_h` canvas. Returns `(x, y, w, h)` in canvas pixels.
-fn aspect_fit(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32) -> (i32, i32, u32, u32) {
-    if src_w == 0 || src_h == 0 {
-        return (0, 0, 0, 0);
-    }
-    let dst_aspect = dst_w as f64 / dst_h as f64;
-    let src_aspect = src_w as f64 / src_h as f64;
-    if src_aspect >= dst_aspect {
-        let h = (dst_w as f64 / src_aspect).round() as u32;
-        let y = ((dst_h - h.min(dst_h)) / 2) as i32;
-        (0, y, dst_w, h.min(dst_h))
-    } else {
-        let w = (dst_h as f64 * src_aspect).round() as u32;
-        let x = ((dst_w - w.min(dst_w)) / 2) as i32;
-        (x, 0, w.min(dst_w), dst_h)
-    }
-}
+// 動画フレームの aspect-fit は `crate::group_compose::aspect_fit_norm`（normalized）に
+// 統一 (Wave2 で per-track 合成 1 枚化、テストは group_compose 側)。
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn aspect_fit_pillarbox() {
-        // 16:9 source (1920x1080) onto 4:3 canvas (640x480) → letterbox
-        // top/bottom.
-        let (x, y, w, h) = aspect_fit(640, 480, 1920, 1080);
-        assert_eq!(x, 0);
-        assert_eq!(w, 640);
-        // 640 / (16/9) = 360 → height 360, y centred
-        assert_eq!(h, 360);
-        assert_eq!(y, 60);
-    }
-
-    #[test]
-    fn aspect_fit_letterbox() {
-        // 9:16 portrait source onto landscape canvas → side bars.
-        let (x, y, w, h) = aspect_fit(640, 480, 1080, 1920);
-        assert_eq!(y, 0);
-        assert_eq!(h, 480);
-        // 480 * (9/16) = 270 → width 270, x centred
-        assert_eq!(w, 270);
-        assert_eq!(x, 185);
-    }
 
     /// End-to-end smoke: build a tiny project with one video track +
     /// one video clip pointing at an `ffmpeg`-generated source mp4,

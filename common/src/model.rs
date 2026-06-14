@@ -52,6 +52,13 @@ use crate::scale::ScaleChange;
 /// backfill される (共有 content は最初に見た非空名を採用)。
 /// See `docs/plan_clip_shared_name.md`.
 ///
+/// `25` 映像 Transform device (FIXME #54 Wave3): 「動かす変形」をチェーン上の
+/// `builtin.video.transform` 配置 device に一本化。値・automation・変調は既存
+/// `GroupTransform` 系のまま (破壊的な値 migration 無し)。`ensure_ids` が旧
+/// `group_transform` 持ちトラックに Transform device を補い (idempotent)、
+/// `resolve_track_transform` が device-gate で配置を効かせる。v24 `.daw` files still
+/// load — device 追加は additive で forward/backward compatible。See `docs/plan_video_fx.md` §5。
+///
 /// `19` 立ち絵 group transform: `Track.group_transform: Option<GroupTransform>`
 /// (位置 X/Y・回転・非一様スケール ScaleX/ScaleY・任意アンカー AnchorX/AnchorY・Opacity の
 /// 2D affine。AE の Transform プロパティ群と同構成) と
@@ -134,7 +141,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 24;
+pub const CURRENT_VERSION: u32 = 25;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -1276,6 +1283,29 @@ impl Song {
         }
         for p in self.master_fx_chain.iter_mut() {
             p.migrate_legacy_aux();
+        }
+
+        // FIXME #54 Wave3 (v25): 旧 `group_transform` を持つトラックにチェーン上の
+        // Transform 配置 device を補う。これで「動かす変形」がチェーンの 1 device
+        // として現れ、`resolve_track_transform` の device-gate で効く（device を抜けば
+        // 変換が無効）。値・automation・変調は GroupTransform 系のまま（破壊的な値
+        // migration は不要）。idempotent（device 既存 / group_transform 無しは no-op）。
+        for track in &mut self.tracks {
+            let has_transform = track
+                .devices
+                .iter()
+                .any(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID);
+            if track.group_transform.is_some() && !has_transform {
+                track.devices.push(PluginInstance::with_ports(
+                    crate::video_fx::TRANSFORM_ID.to_string(),
+                    crate::plugin_format::PluginFormat::Builtin,
+                    crate::port_config::PortConfig {
+                        has_video_input: true,
+                        has_video_output: true,
+                        ..Default::default()
+                    },
+                ));
+            }
         }
 
         // Pass 1: assign fresh ids to sentinel tracks, recording the
@@ -5208,7 +5238,47 @@ mod tests {
         // Pinning the constant catches accidental rollback. See
         // `docs/plan_linear_chain.md`. v24 adds `Song.project_id`
         // (`docs/plan_fixme_33_clipboard.md`, clipboard same-project detection).
-        assert_eq!(CURRENT_VERSION, 24);
+        // v25 (FIXME #54 Wave3): 旧 `group_transform` 持ちトラックに `builtin.video.transform`
+        // 配置 device を `ensure_ids` で補う (additive、値 migration 無し)。
+        assert_eq!(CURRENT_VERSION, 25);
+    }
+
+    #[test]
+    fn v25_ensure_ids_adds_transform_device_for_group_transform_tracks() {
+        // FIXME #54 Wave3: 旧 group_transform 持ちトラックは ensure_ids で Transform
+        // 配置 device を 1 つ得る (idempotent: 2 回呼んでも 1 つ)。group_transform 無しは付かない。
+        let mut song = Song {
+            tracks: vec![
+                Track { id: 1, group_transform: Some(GroupTransform::default()), ..Track::default() },
+                Track { id: 2, ..Track::default() },
+            ],
+            next_track_id: 3,
+            ..Song::default()
+        };
+        song.ensure_ids();
+        let t1 = song.track_by_id(1).unwrap();
+        assert_eq!(
+            t1.devices.iter().filter(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID).count(),
+            1,
+            "group_transform 持ちトラックに Transform device が 1 つ付くべき"
+        );
+        let t2 = song.track_by_id(2).unwrap();
+        assert!(
+            !t2.devices.iter().any(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID),
+            "group_transform 無しトラックには Transform device を付けない"
+        );
+        // idempotent: 再実行で増えない。
+        song.ensure_ids();
+        assert_eq!(
+            song.track_by_id(1)
+                .unwrap()
+                .devices
+                .iter()
+                .filter(|d| d.plugin_id == crate::video_fx::TRANSFORM_ID)
+                .count(),
+            1,
+            "ensure_ids は idempotent (Transform device は重複しない)"
+        );
     }
 
     #[test]

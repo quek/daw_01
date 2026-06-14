@@ -62,6 +62,9 @@ pub struct ActiveTextFrame {
     /// Bottom-up draw order。 caller がこれで video / image / text を
     /// interleave して higher track を front に置く。
     pub z_index: u32,
+    /// FIXME #54 Wave2: この text event の owning track id。トラック合成画へ
+    /// 振り分ける（同一トラックの動画 / PiP / テキストを 1 枚へ）ために使う。
+    pub owning_track_id: u32,
 }
 
 /// Walk the song bottom-up and return one `ActiveTextFrame` per text
@@ -135,6 +138,7 @@ pub fn active_text_sources_at(
                     shadow_offset_px: resolved.shadow_offset_px,
                     shadow_blur_px: resolved.shadow_blur_px,
                     z_index,
+                    owning_track_id: track.id,
                 });
                 track_emitted = true;
             }

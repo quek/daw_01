@@ -108,8 +108,18 @@ pub enum Unit {
 /// パラメータの種別と表示レンジ。保存値は常に 0..=1 正規化 plain (モジュール doc 参照)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ParamKind {
-    /// 連続値。`min`/`max`/`default` は **表示・シェーダの実レンジ**。
+    /// 線形連続値。`min`/`max`/`default` は **表示・シェーダの実レンジ**。
     Scalar {
+        min: f32,
+        max: f32,
+        default: f32,
+        unit: Unit,
+    },
+    /// 対数連続値（`min`/`max` は **正の実レンジ**、正規化は log 空間）。スケール系
+    /// （0.1..10 で 0.5 = 等倍）のように乗法的な param 用。FIXME #54 Wave3: Transform
+    /// device の ScaleX/Y が既存 GroupTransform と同じ log 正規化を保つため
+    /// （[`crate::automation`] の plain_to_norm log 写像と一致、automation curve drift なし）。
+    LogScalar {
         min: f32,
         max: f32,
         default: f32,
@@ -125,7 +135,7 @@ impl ParamKind {
     #[must_use]
     pub fn range(&self) -> (f32, f32) {
         match *self {
-            Self::Scalar { min, max, .. } => (min, max),
+            Self::Scalar { min, max, .. } | Self::LogScalar { min, max, .. } => (min, max),
             Self::Bool { .. } => (0.0, 1.0),
         }
     }
@@ -141,6 +151,13 @@ impl ParamKind {
                     f64::from((default - min) / (max - min)).clamp(0.0, 1.0)
                 }
             }
+            Self::LogScalar { min, max, default, .. } => {
+                if min <= 0.0 || max <= 0.0 || (max - min).abs() < f32::EPSILON {
+                    0.0
+                } else {
+                    (f64::from(default / min).ln() / f64::from(max / min).ln()).clamp(0.0, 1.0)
+                }
+            }
             Self::Bool { default } => {
                 if default {
                     1.0
@@ -151,13 +168,52 @@ impl ParamKind {
         }
     }
 
-    /// 正規化値 `norm` (0..=1) を実レンジ値へ展開 (シェーダ uniform 用)。
+    /// 正規化値 `norm` (0..=1) を実レンジ値へ展開 (シェーダ uniform / Transform 値用)。
     #[must_use]
     pub fn norm_to_real(&self, norm: f64) -> f32 {
-        let (min, max) = self.range();
         #[allow(clippy::cast_possible_truncation)]
         let n = norm.clamp(0.0, 1.0) as f32;
-        min + n * (max - min)
+        match *self {
+            Self::LogScalar { min, max, .. } if min > 0.0 && max > 0.0 => {
+                min * (max / min).powf(n)
+            }
+            _ => {
+                let (min, max) = self.range();
+                min + n * (max - min)
+            }
+        }
+    }
+
+    /// 実レンジ値 `real` を正規化 0..=1 へ逆写像 (`norm_to_real` の逆)。インスペクタの
+    /// スクラブ編集が「表示の実値 → lane の保存値 (0..=1)」へ戻すのに使う。
+    #[must_use]
+    pub fn real_to_norm(&self, real: f32) -> f64 {
+        match *self {
+            Self::LogScalar { min, max, .. } if min > 0.0 && max > 0.0 && real > 0.0 => {
+                (f64::from(real / min).ln() / f64::from(max / min).ln()).clamp(0.0, 1.0)
+            }
+            Self::Bool { .. } => {
+                if real >= 0.5 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            _ => {
+                let (min, max) = self.range();
+                if (max - min).abs() < f32::EPSILON {
+                    0.0
+                } else {
+                    f64::from((real - min) / (max - min)).clamp(0.0, 1.0)
+                }
+            }
+        }
+    }
+
+    /// このパラメータが log スケール (`LogScalar`) か。modulation domain の選択に使う。
+    #[must_use]
+    pub fn is_log(&self) -> bool {
+        matches!(self, Self::LogScalar { .. })
     }
 }
 
@@ -437,8 +493,381 @@ fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
     needs_history: false,
 };
 
-/// 内蔵映像効果の正準リスト (ピッカ表示順)。
-static BUILTIN_VIDEO_FX: &[VideoFxDef] = &[COLOR_GRADE, HUE_TEMP, DUOTONE, INVERT, VIGNETTE];
+/// ガウシアンブラー。分離プリミティブ ([`PassKind::SeparableBlur`]) を H/V 2 パスで適用する
+/// 最初の効果 (plan_video_fx §1.2: bloom/glow/soft-vignette/unsharp の土台)。半径 (px) は
+/// 第 1 param で、効果実行基盤がこれを sigma=radius/3 のガウシアンに展開する (body は engine 生成)。
+const GAUSSIAN_BLUR: VideoFxDef = VideoFxDef {
+    id: "builtin.video.gaussian_blur",
+    name: "Gaussian Blur",
+    category: VideoFxCategory::Blur,
+    params: &[VideoFxParam {
+        id: 0,
+        key: "radius",
+        name: "Radius",
+        kind: ParamKind::Scalar { min: 0.0, max: 64.0, default: 8.0, unit: Unit::Px },
+    }],
+    passes: &[
+        // SeparableBlur パスの wgsl は engine が生成するため未使用 (空文字)。
+        VideoFxPass { kind: PassKind::SeparableBlur { horizontal: true }, wgsl: "" },
+        VideoFxPass { kind: PassKind::SeparableBlur { horizontal: false }, wgsl: "" },
+    ],
+    needs_history: false,
+};
+
+/// モザイク / ピクセル化。★ 音反応の花形 (plan §4)。`cells` = 横方向のセル数、縦は
+/// アスペクト比から導いて正方セルにする。Simple 1 パス (近傍量子化 + 再サンプル)。
+const PIXELATE: VideoFxDef = VideoFxDef {
+    id: "builtin.video.pixelate",
+    name: "Pixelate / Mosaic",
+    category: VideoFxCategory::Distort,
+    params: &[VideoFxParam {
+        id: 0,
+        key: "cells",
+        name: "Cells",
+        kind: ParamKind::Scalar { min: 2.0, max: 240.0, default: 48.0, unit: Unit::None },
+    }],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let cx = max(P.cells, 1.0);
+    // 正方セル: 縦のセル数を解像度のアスペクト比でスケール。
+    let cy = max(cx * P.resolution.y / max(P.resolution.x, 1.0), 1.0);
+    let snapped = vec2<f32>(
+        (floor(uv.x * cx) + 0.5) / cx,
+        (floor(uv.y * cy) + 0.5) / cy,
+    );
+    return sample(snapped);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// RGB スプリット（色収差）。★ 音反応の花形。R を +amount、B を −amount（px）水平にずらす。
+const RGB_SPLIT: VideoFxDef = VideoFxDef {
+    id: "builtin.video.rgb_split",
+    name: "RGB Split",
+    category: VideoFxCategory::Distort,
+    params: &[VideoFxParam {
+        id: 0,
+        key: "amount",
+        name: "Amount",
+        kind: ParamKind::Scalar { min: 0.0, max: 60.0, default: 8.0, unit: Unit::Px },
+    }],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let off = vec2<f32>(P.amount * P.texel.x, 0.0);
+    let r = sample(uv + off).r;
+    let b = sample(uv - off).b;
+    return vec4<f32>(r, src.g, b, src.a);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// しきい値（2 値化）。★ luma がしきい値以上なら白、未満なら黒。
+const THRESHOLD: VideoFxDef = VideoFxDef {
+    id: "builtin.video.threshold",
+    name: "Threshold",
+    category: VideoFxCategory::Stylize,
+    params: &[VideoFxParam {
+        id: 0,
+        key: "threshold",
+        name: "Threshold",
+        kind: ParamKind::Scalar { min: 0.0, max: 1.0, default: 0.5, unit: Unit::None },
+    }],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let l = dot(src.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let v = step(P.threshold, l);
+    return vec4<f32>(vec3<f32>(v), src.a);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// ポスタライズ（階調圧縮）。★ 各チャンネルを `levels` 段に量子化。
+const POSTERIZE: VideoFxDef = VideoFxDef {
+    id: "builtin.video.posterize",
+    name: "Posterize",
+    category: VideoFxCategory::Stylize,
+    params: &[VideoFxParam {
+        id: 0,
+        key: "levels",
+        name: "Levels",
+        kind: ParamKind::Scalar { min: 2.0, max: 32.0, default: 4.0, unit: Unit::None },
+    }],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let n = max(P.levels, 2.0) - 1.0;
+    let c = floor(src.rgb * n + vec3<f32>(0.5)) / n;
+    return vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), src.a);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// エッジ検出 / スケッチ。Sobel で輪郭強度を出し黒地に白線で描く。
+const EDGE_DETECT: VideoFxDef = VideoFxDef {
+    id: "builtin.video.edge_detect",
+    name: "Edge Detect",
+    category: VideoFxCategory::Stylize,
+    params: &[VideoFxParam {
+        id: 0,
+        key: "strength",
+        name: "Strength",
+        kind: ParamKind::Scalar { min: 0.0, max: 4.0, default: 1.0, unit: Unit::None },
+    }],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn elum(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let t = P.texel;
+    let tl = elum(sample(uv + vec2<f32>(-t.x, -t.y)).rgb);
+    let tc = elum(sample(uv + vec2<f32>(0.0, -t.y)).rgb);
+    let tr = elum(sample(uv + vec2<f32>(t.x, -t.y)).rgb);
+    let ml = elum(sample(uv + vec2<f32>(-t.x, 0.0)).rgb);
+    let mr = elum(sample(uv + vec2<f32>(t.x, 0.0)).rgb);
+    let bl = elum(sample(uv + vec2<f32>(-t.x, t.y)).rgb);
+    let bc = elum(sample(uv + vec2<f32>(0.0, t.y)).rgb);
+    let br = elum(sample(uv + vec2<f32>(t.x, t.y)).rgb);
+    let gx = (tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl);
+    let gy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
+    let g = clamp(sqrt(gx * gx + gy * gy) * P.strength, 0.0, 1.0);
+    return vec4<f32>(vec3<f32>(g), src.a);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// ミラー（鏡像）。右半分（または下半分）を反対側の鏡像で埋める。
+const MIRROR: VideoFxDef = VideoFxDef {
+    id: "builtin.video.mirror",
+    name: "Mirror",
+    category: VideoFxCategory::Distort,
+    params: &[VideoFxParam {
+        id: 0,
+        key: "vertical",
+        name: "Vertical",
+        kind: ParamKind::Bool { default: false },
+    }],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    var u = uv;
+    if (P.vertical > 0.5) {
+        if (u.y > 0.5) { u.y = 1.0 - u.y; }
+    } else {
+        if (u.x > 0.5) { u.x = 1.0 - u.x; }
+    }
+    return sample(u);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// クロマキー（色抜き）。キー色との距離が小さい画素を透明にする（グリーンバック等）。
+const CHROMA_KEY: VideoFxDef = VideoFxDef {
+    id: "builtin.video.chroma_key",
+    name: "Chroma Key",
+    category: VideoFxCategory::Key,
+    params: &[
+        VideoFxParam {
+            id: 0,
+            key: "key_r",
+            name: "Key R",
+            kind: ParamKind::Scalar { min: 0.0, max: 1.0, default: 0.0, unit: Unit::None },
+        },
+        VideoFxParam {
+            id: 1,
+            key: "key_g",
+            name: "Key G",
+            kind: ParamKind::Scalar { min: 0.0, max: 1.0, default: 1.0, unit: Unit::None },
+        },
+        VideoFxParam {
+            id: 2,
+            key: "key_b",
+            name: "Key B",
+            kind: ParamKind::Scalar { min: 0.0, max: 1.0, default: 0.0, unit: Unit::None },
+        },
+        VideoFxParam {
+            id: 3,
+            key: "threshold",
+            name: "Threshold",
+            kind: ParamKind::Scalar { min: 0.0, max: 1.0, default: 0.4, unit: Unit::None },
+        },
+        VideoFxParam {
+            id: 4,
+            key: "softness",
+            name: "Softness",
+            kind: ParamKind::Scalar { min: 0.01, max: 1.0, default: 0.1, unit: Unit::None },
+        },
+    ],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let key = vec3<f32>(P.key_r, P.key_g, P.key_b);
+    let d = distance(src.rgb, key);
+    let a = smoothstep(P.threshold, P.threshold + P.softness, d);
+    return vec4<f32>(src.rgb, src.a * a);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// シャープ（アンシャープマスク）。4 近傍平均との差を amount 倍して足す。
+const SHARPEN: VideoFxDef = VideoFxDef {
+    id: "builtin.video.sharpen",
+    name: "Sharpen",
+    category: VideoFxCategory::Blur,
+    params: &[VideoFxParam {
+        id: 0,
+        key: "amount",
+        name: "Amount",
+        kind: ParamKind::Scalar { min: 0.0, max: 4.0, default: 1.0, unit: Unit::None },
+    }],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let t = P.texel;
+    let blur = (sample(uv + vec2<f32>(t.x, 0.0)).rgb
+              + sample(uv - vec2<f32>(t.x, 0.0)).rgb
+              + sample(uv + vec2<f32>(0.0, t.y)).rgb
+              + sample(uv - vec2<f32>(0.0, t.y)).rgb) * 0.25;
+    let c = src.rgb + (src.rgb - blur) * P.amount;
+    return vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), src.a);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// フィルムグレイン（ノイズ）。★ ハッシュノイズを time でアニメして加算。
+const FILM_GRAIN: VideoFxDef = VideoFxDef {
+    id: "builtin.video.film_grain",
+    name: "Film Grain",
+    category: VideoFxCategory::Noise,
+    params: &[VideoFxParam {
+        id: 0,
+        key: "amount",
+        name: "Amount",
+        kind: ParamKind::Scalar { min: 0.0, max: 1.0, default: 0.12, unit: Unit::Pct },
+    }],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn ghash(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let seed = uv * P.resolution + vec2<f32>(P.time * 60.0, P.time * 37.0);
+    let n = ghash(seed) - 0.5;
+    let c = src.rgb + vec3<f32>(n * P.amount);
+    return vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), src.a);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// スキャンライン（走査線）。横縞で暗くする（CRT/VHS 風）。
+const SCANLINES: VideoFxDef = VideoFxDef {
+    id: "builtin.video.scanlines",
+    name: "Scanlines",
+    category: VideoFxCategory::Stylize,
+    params: &[
+        VideoFxParam {
+            id: 0,
+            key: "count",
+            name: "Count",
+            kind: ParamKind::Scalar { min: 10.0, max: 1080.0, default: 240.0, unit: Unit::None },
+        },
+        VideoFxParam {
+            id: 1,
+            key: "intensity",
+            name: "Intensity",
+            kind: ParamKind::Scalar { min: 0.0, max: 1.0, default: 0.5, unit: Unit::Pct },
+        },
+    ],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let s = sin(uv.y * P.count * 3.14159265) * 0.5 + 0.5;
+    let v = mix(1.0, s, P.intensity);
+    return vec4<f32>(src.rgb * v, src.a);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// Transform（座標変換）。FIXME #54 Wave3 / plan_video_fx §5: 「動かす変形」をチェーン上の
+/// 1 device として刺せるようにする。**GPU シェーダパスも video param も持たない**マーカー
+/// device で、効果実行基盤は apply_chain に流さない。値（位置/スケール/回転/アンカー/不透明度）の
+/// SSoT は purpose-built な [`GroupTransform`](crate::model::GroupTransform)（log スケール・AE 流
+/// アンカー math・automation・変調を完備、立ち絵 group で実績）で、効果実行基盤は
+/// [`crate::model::GroupTransform`] を resolve して合成画 1 枚の配置（approach X: rect + 任意
+/// pivot 回転）に使う。device を刺すと当該トラックの `group_transform` が有効化され、どのトラック
+/// でも（立ち絵 group も通常の動画/画像トラックも）座標変換できる。
+const TRANSFORM: VideoFxDef = VideoFxDef {
+    id: "builtin.video.transform",
+    name: "Transform",
+    category: VideoFxCategory::Transform,
+    // video param 無し（値は GroupTransform に持つ。inspector は専用 Group Transform セクションで編集）。
+    params: &[],
+    // GPU パス無し（配置 device）。効果実行基盤が GroupTransform を resolve して合成段で消費。
+    passes: &[],
+    needs_history: false,
+};
+
+/// Transform 配置 device の id（効果実行基盤 / picker / inspector が「配置 device」を識別する）。
+pub const TRANSFORM_ID: &str = "builtin.video.transform";
+
+/// 内蔵映像効果の正準リスト (ピッカ表示順)。Transform を先頭に置く（配置の基本）、
+/// 以降は色補正 → ブラー/シャープ → 歪み → スタイライズ → キーイング → ノイズ の順。
+static BUILTIN_VIDEO_FX: &[VideoFxDef] = &[
+    TRANSFORM,
+    // 色補正 / グレード
+    COLOR_GRADE,
+    HUE_TEMP,
+    DUOTONE,
+    INVERT,
+    VIGNETTE,
+    // ブラー / シャープ
+    GAUSSIAN_BLUR,
+    SHARPEN,
+    // 歪み / ワープ
+    PIXELATE,
+    RGB_SPLIT,
+    MIRROR,
+    // スタイライズ
+    THRESHOLD,
+    POSTERIZE,
+    EDGE_DETECT,
+    SCANLINES,
+    // キーイング
+    CHROMA_KEY,
+    // ノイズ / 質感
+    FILM_GRAIN,
+];
 
 /// 内蔵映像効果の正準リストを返す。`plugin_db::builtin_descriptors` /
 /// 効果実行基盤 / インスペクタが参照する **Single Source of Truth**。
@@ -472,7 +901,12 @@ mod tests {
                 "duplicate id {}",
                 d.id
             );
-            assert!(!d.passes.is_empty(), "{} has no passes", d.id);
+            // Transform は配置 device で GPU パスを持たない（apply_chain 非対象）。
+            assert!(
+                !d.passes.is_empty() || d.category == VideoFxCategory::Transform,
+                "{} has no passes",
+                d.id
+            );
         }
     }
 
@@ -509,14 +943,19 @@ mod tests {
             for p in d.params {
                 let n = p.kind.default_norm();
                 assert!((0.0..=1.0).contains(&n), "{}.{} default_norm OOR", d.id, p.key);
-                if let ParamKind::Scalar { default, .. } = p.kind {
-                    let real = p.kind.norm_to_real(n);
-                    assert!(
-                        (real - default).abs() < 1e-4,
-                        "{}.{}: default {default} != round-trip {real}",
-                        d.id,
-                        p.key
-                    );
+                match p.kind {
+                    ParamKind::Scalar { default, .. } | ParamKind::LogScalar { default, .. } => {
+                        let real = p.kind.norm_to_real(n);
+                        // LogScalar は乗法的なので相対許容、Scalar は絶対許容。
+                        let tol = (default.abs() * 1e-4).max(1e-4);
+                        assert!(
+                            (real - default).abs() < tol,
+                            "{}.{}: default {default} != round-trip {real}",
+                            d.id,
+                            p.key
+                        );
+                    }
+                    ParamKind::Bool { .. } => {}
                 }
             }
         }

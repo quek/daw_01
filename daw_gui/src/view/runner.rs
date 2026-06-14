@@ -1133,28 +1133,21 @@ impl Runner {
                             let _ = self.proxy.send_event(begin_ev);
                         }
                     }
-                    // 立ち絵 group box drag begin（clip drag が始まらなかったとき
-                    // のみ）。選択中の visual group が対象。base group_transform が
-                    // 未設定でも overlay と同じ effective transform（automation 解決後
-                    // or identity）で hit-test する（= 枠が出れば必ず掴める。§5.6 で
-                    // overlay gate を group_has_visual_content に揃えたので drag も一致。
-                    // 最初の drag で SetGroupTransformField が base を identity から
-                    // materialize する）。
+                    // Transform box drag begin（clip drag が始まらなかったときのみ）。
+                    // FIXME #54 Wave3: 選択中トラックに Transform 配置 device が刺さって
+                    // いれば対象（立ち絵 group も通常トラックも）。base group_transform は
+                    // device 追加時に materialize 済なので overlay と同じ effective transform
+                    // で hit-test する（枠が出れば必ず掴める）。
                     if state.preview_drag.is_none()
                         && let Some(cursor) = state.preview_cursor
                         && let Some(track_id) = state.app.cursor_track_id()
-                        && state.app.is_group_track(track_id)
-                        && state.app.group_has_visual_content(track_id)
-                        && let Some(transform) =
-                            state.app.song.track_by_id(track_id).map(|track| {
-                                crate::group_compose::group_active_transform(
-                                    track,
-                                    &state.app.song,
-                                    state.app.playhead_beat.map(f64::from).unwrap_or(0.0),
-                                    &state.app.mod_scalars,
-                                )
-                                .unwrap_or_default()
-                            })
+                        && let Some(track) = state.app.song.track_by_id(track_id)
+                        && let Some(transform) = crate::video_fx::resolve_track_transform(
+                            &state.app.song,
+                            track,
+                            state.app.playhead_beat.map(f64::from).unwrap_or(0.0),
+                            &state.app.mod_scalars,
+                        )
                     {
                         let size = preview.renderer.size();
                         let screen = (size.width as f32, size.height as f32);
@@ -1334,8 +1327,7 @@ impl Runner {
         state.last_preview_drive_at = Some(now);
 
         let Some(playhead_beat) = state.app.playhead_beat.map(f64::from) else {
-            preview.set_composite_layers(Vec::new());
-            preview.set_text_layers(Vec::new());
+            preview.set_track_composites(Vec::new());
             return;
         };
         let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(
@@ -1382,14 +1374,20 @@ impl Runner {
             }
         }
 
-        // Step 4: build composite layers by picking the cached ring
-        // slot nearest to each active source's current `source_micros`.
-        // docs/plan_video_perf.md P4: this is where the lookahead pays
-        // off — when the worker is mid-decode for the next ring, the
-        // composite still has the previous ring's nearest slot to show,
-        // so frame-pacing is smooth even under decode jitter.
-        let mut layers: Vec<crate::view::preview_window::CompositeLayer> =
-            Vec::with_capacity(active.len());
+        // FIXME #54 Wave2 (plan_video_fx §3): 動画フレーム / PiP 画像 / テキストを
+        // **owning track ごと** に 1 枚の RGBA「トラック合成画」へ集約する。各 track の
+        // 視覚アイテムを bucket に集め、track 順 (= z 順) に 1 TrackComposite として
+        // preview に渡す。立ち絵 group の子画像は親 group の bucket へ吸収 (approach X)。
+        // 効果も配置 transform も無い track は消費側が合成往復せず直接描く (plain track の
+        // fast-path = 回帰なし・クリスプ・無コスト)。これで spatial 効果 (blur/歪み) が
+        // 個別素材でなく「トラックの最終見た目 1 枚」に正しくかかる。
+        use crate::group_compose::CompositeItem;
+        let (proj_w, proj_h) = state.app.song.video_resolution;
+        let canvas = (proj_w.max(1) as f32, proj_h.max(1) as f32);
+        let mut buckets: std::collections::HashMap<u32, Vec<CompositeItem>> =
+            std::collections::HashMap::new();
+
+        // 動画フレーム → owning track の bucket (canvas 内 aspect-fit normalized)。
         for frame_info in active {
             let Some(ring) = state.cached_rings.get(&frame_info.video_source_id) else {
                 continue; // worker hasn't produced a ring yet
@@ -1398,69 +1396,36 @@ impl Runner {
                 continue; // ring is empty (= all slots failed to decode)
             };
             let key = (frame_info.video_source_id, slot.slot_idx);
-            let Some((handle, w, h)) = preview.frame_textures.get(&key).copied() else {
+            let Some((handle, _w, _h)) = preview.frame_textures.get(&key).copied() else {
                 continue; // texture not yet imported for this slot
             };
-            // Sanity: dimensions in the cached ring slot must match
-            // the texture's. If they diverge the texture got
-            // re-created underneath us — fall back to ring-slot dims.
-            let _ = (w, h);
-            // FIXME #54: この動画 track の映像効果チェーンを解決して layer に付与
-            // (描画側が texture に適用)。
-            let fx = state
-                .app
-                .song
-                .track_by_id(frame_info.owning_track_id)
-                .map(|t| {
-                    crate::video_fx::resolve_track_effects(
-                        &state.app.song,
-                        t,
-                        playhead_beat,
-                        &state.app.mod_scalars,
-                    )
-                })
-                .unwrap_or_default();
-            layers.push(crate::view::preview_window::CompositeLayer {
-                texture: handle,
-                width: slot.width,
-                height: slot.height,
-                alpha: frame_info.alpha,
-                // Video clips always letterbox; the PiP rect is the
-                // image-overlay path only.
-                pip_rect: None,
-                rotation_radians: 0.0,
-                fx,
-            });
+            let dest = crate::group_compose::aspect_fit_norm(
+                canvas,
+                (slot.width as f32, slot.height as f32),
+            );
+            buckets.entry(frame_info.owning_track_id).or_default().push(
+                CompositeItem::Quad { texture: handle, dest, alpha: frame_info.alpha, rotation_radians: 0.0 },
+            );
         }
 
-        // docs/plan_image_overlay.md §P3: image overlay layers.
-        // `active_image_sources_at` returns frames already sorted
-        // bottom→top by `z_index`; interleave them with video layers
-        // by re-sorting the combined Vec on z_index ascending.
-        let image_frames = crate::image_compose::active_image_sources_at(
-            &state.app.song,
-            playhead_beat,
-            &state.app.mod_scalars,
-        );
-        // v19 (docs/plan_tachie_group_transform.md §5.6): visual group の
-        // active transform を 1 回解決（group track id → resolved transform）。
-        // gate は `group_has_visual_content`（§5.6）。transform / lane 未設定の
-        // visual group も identity として含むので、グループ化直後の立ち絵も合成
-        // され、選択時にバウンディングボックスが出る。export と同一述語（SSoT）。
+        // v19 (docs/plan_tachie_group_transform.md §5.6): visual group の active
+        // transform を 1 回解決（group track id → resolved transform）。gate は
+        // `group_has_visual_content`。transform / lane 未設定の visual group も identity
+        // として含む。export と同一述語（SSoT）。
         let active_groups = crate::group_compose::active_visual_groups(
             &state.app.song,
             playhead_beat,
             &state.app.mod_scalars,
         );
-        // group track id → z 順（bottom→top）の子 quad。
-        let mut group_children: std::collections::HashMap<
-            u32,
-            Vec<crate::group_compose::GroupChildQuad>,
-        > = std::collections::HashMap::new();
+
+        // PiP 画像 → 親が active group ならその group bucket へ吸収、さもなくば owning
+        // track の bucket。
+        let image_frames = crate::image_compose::active_image_sources_at(
+            &state.app.song,
+            playhead_beat,
+            &state.app.mod_scalars,
+        );
         for frame_info in image_frames {
-            // `AppData::image_texture_cache` stores just the
-            // TextureHandle (dimensions come from
-            // `Song.image_sources`).
             let Some(handle) =
                 state.app.image_texture_cache.get(&frame_info.image_source_id).copied()
             else {
@@ -1476,121 +1441,75 @@ impl Runner {
             if dims.0 == 0 || dims.1 == 0 {
                 continue;
             }
-            // owning track の親が active visual group なら、その group へ
-            // bucket（= 1 枚へ合成して親 transform を適用）。さもなくば従来
-            // どおり単独の composite layer として push。
-            let group_id = state
+            let target_track = state
                 .app
                 .song
                 .track_by_id(frame_info.owning_track_id)
                 .and_then(|t| t.parent_group_id)
-                .filter(|g| active_groups.contains_key(g));
-            if let Some(g) = group_id {
-                group_children.entry(g).or_default().push(
-                    crate::group_compose::GroupChildQuad {
-                        texture: handle,
-                        dest: (
-                            frame_info.x,
-                            frame_info.y,
-                            frame_info.w,
-                            frame_info.h,
-                        ),
-                        alpha: frame_info.alpha,
-                        rotation_radians: frame_info.rotation_radians,
-                    },
-                );
-            } else {
-                // FIXME #54: 非グループ image overlay の owning track の効果チェーン。
-                let fx = state
-                    .app
-                    .song
-                    .track_by_id(frame_info.owning_track_id)
-                    .map(|t| {
-                        crate::video_fx::resolve_track_effects(
-                            &state.app.song,
-                            t,
-                            playhead_beat,
-                            &state.app.mod_scalars,
-                        )
-                    })
-                    .unwrap_or_default();
-                layers.push(crate::view::preview_window::CompositeLayer {
-                    texture: handle,
-                    width: dims.0,
-                    height: dims.1,
-                    alpha: frame_info.alpha,
-                    pip_rect: Some((
-                        frame_info.x,
-                        frame_info.y,
-                        frame_info.w,
-                        frame_info.h,
-                    )),
-                    rotation_radians: frame_info.rotation_radians,
-                    fx,
-                });
-            }
+                .filter(|g| active_groups.contains_key(g))
+                .unwrap_or(frame_info.owning_track_id);
+            buckets.entry(target_track).or_default().push(CompositeItem::Quad {
+                texture: handle,
+                dest: (frame_info.x, frame_info.y, frame_info.w, frame_info.h),
+                alpha: frame_info.alpha,
+                rotation_radians: frame_info.rotation_radians,
+            });
         }
-        // z_index ascending = bottom→top draw order. Video frames
-        // populated `z_index` from `active_sources_at`; image frames
-        // populated theirs from `active_image_sources_at` (same
-        // counter convention). After this sort the composite pass
-        // draws layers in the right order.
-        //
-        // Stable so identical z_index between video & image keeps
-        // their relative order from the per-helper emit (= image
-        // typically dropped at top track index 0, so it ends up
-        // above the video in the composite naturally).
-        //
-        // Note: each helper computes its z_index independently, so a
-        // mixed scene may produce duplicate z_index values that don't
-        // perfectly reflect the user-visible track order. P4
-        // (inspector) is the right place to consolidate this into a
-        // single multi-kind active_sources iterator; for now the
-        // image-on-top convention covers the MV-overlay use case.
-        let _ = ();
-        preview.set_composite_layers(layers);
-        // v19 (docs/plan_tachie_group_transform.md §5): 立ち絵 group layer を
-        // track 順（決定的）に構築。各 group に resolved transform を付与し、
-        // preview が子を 1 枚へ合成 → 親 affine をかけて push する。
-        let mut group_layers: Vec<crate::group_compose::GroupLayer> = Vec::new();
-        for track in &state.app.song.tracks {
-            let Some(transform) = active_groups.get(&track.id) else {
-                continue;
-            };
-            let children = group_children.remove(&track.id).unwrap_or_default();
+
+        // テキスト → owning track の bucket (合成画に焼き込んで track 効果を乗せる)。
+        let text_frames = crate::text_compose::active_text_sources_at(
+            &state.app.song,
+            playhead_beat,
+            &state.app.mod_scalars,
+        );
+        for tf in text_frames {
+            buckets.entry(tf.owning_track_id).or_default().push(CompositeItem::Text(tf));
+        }
+
+        // track 順 (bottom→top = rev) に TrackComposite を構築。group track は
+        // 吸収した子 + group affine、通常 track は自分の視覚アイテム + identity 配置。
+        // 選択中 group は children 空でも bounding box 用に emit。
+        let mut composites: Vec<crate::group_compose::TrackComposite> = Vec::new();
+        for track in state.app.song.tracks.iter().rev() {
+            let items = buckets.remove(&track.id).unwrap_or_default();
+            // FIXME #54 Wave3: 配置 transform は **どのトラックでも** Transform device から
+            // 解決（立ち絵 group も通常トラックも統一）。device が無ければ None = identity 配置。
+            let transform = crate::video_fx::resolve_track_transform(
+                &state.app.song,
+                track,
+                playhead_beat,
+                &state.app.mod_scalars,
+            );
             let selected = state.app.cursor_track_id() == Some(track.id);
-            // 子が（この playhead で）1 枚も active でなく、かつ未選択なら描く
-            // ものが無い。選択中は children が空でも bounding box を出すため layer
-            // を作る（group transform はクリップ非依存の track-level param）。
-            if children.is_empty() && !selected {
+            if items.is_empty() && !(transform.is_some() && selected) {
                 continue;
             }
-            // FIXME #54: group track の映像効果チェーン (合成 1 枚へ適用)。
             let fx = crate::video_fx::resolve_track_effects(
                 &state.app.song,
                 track,
                 playhead_beat,
                 &state.app.mod_scalars,
             );
-            group_layers.push(crate::group_compose::GroupLayer {
-                children,
-                transform: *transform,
-                selected,
+            composites.push(crate::group_compose::TrackComposite {
+                track_id: track.id,
+                items,
+                transform,
                 fx,
+                selected,
             });
         }
-        preview.set_group_layers(group_layers);
-        // docs/plan_text_overlay.md §4 P3: text overlay layers are
-        // resolved independently (= no GPU texture, just font / color
-        // / rect metadata) and rendered on top of every textured-quad
-        // layer. The runner gathers them per frame so lane automation
-        // tracks the playhead in real time.
-        let text_frames = crate::text_compose::active_text_sources_at(
+        // FIXME #54 Wave4: 時間系効果（ノイズ/スキャンライン等）の `P.time`（秒）。
+        // preview/export 一致のため wall-clock でなく song 時間（playhead_beat × 60/bpm）。
+        let bpm = state.app.song.bpm.max(1.0) as f64;
+        preview.fx_engine.set_time((playhead_beat * 60.0 / bpm) as f32);
+        preview.set_track_composites(composites);
+        // FIXME #54 Wave1: マスター映像チェーン（master_fx_chain の映像 device）を解決して渡す。
+        // 空でなければ preview が全トラック合成画を master canvas 1 枚に集約してから適用する。
+        preview.set_master_fx(crate::video_fx::resolve_master_effects(
             &state.app.song,
             playhead_beat,
             &state.app.mod_scalars,
-        );
-        preview.set_text_layers(text_frames);
+        ));
         // PiP rect の normalized 座標は project_resolution の letterbox
         // 内で展開される (= window resize しても画像 aspect が崩れない)。
         // Song.video_resolution を毎 frame 同期。

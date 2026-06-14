@@ -455,6 +455,11 @@ pub enum ModControlDomain {
     /// dB↔frac 写像で橋渡しする。model depth は従来どおり線形 (volume/2) 空間に
     /// 留まる (engine の `fill_track_param_ramps` がその空間で消費するため)。
     FaderDb(daw_ui_core::MeterScale),
+    /// FIXME #54 Wave4: 映像 FX param。表示は実レンジ (`min`..`max`、`log` なら対数)、
+    /// model は正規化 0..=1 (`PluginParam` は `plain==norm` なので model==norm)。
+    /// `to_model` = 実値→norm、`to_display` = norm→実値 ([`common::video_fx::ParamKind`]
+    /// と同写像)。インスペクタの video FX param スクラブ + per-control 変調で使う。
+    Ranged { min: f64, max: f64, log: bool },
 }
 
 impl ModControlDomain {
@@ -469,6 +474,16 @@ impl ModControlDomain {
                 let db = scale.frac_to_db(display as f32);
                 10f64.powf(f64::from(db) / 20.0)
             }
+            // 実値 → norm (PluginParam は model==norm)。
+            ModControlDomain::Ranged { min, max, log } => {
+                if log && min > 0.0 && max > 0.0 && display > 0.0 {
+                    ((display / min).ln() / (max / min).ln()).clamp(0.0, 1.0)
+                } else if (max - min).abs() < f64::EPSILON {
+                    0.0
+                } else {
+                    ((display - min) / (max - min)).clamp(0.0, 1.0)
+                }
+            }
         }
     }
     /// target の model plain 値 → コントロール表示値。
@@ -481,6 +496,15 @@ impl ModControlDomain {
             ModControlDomain::FaderDb(scale) => {
                 let db = if model > 0.0 { 20.0 * (model as f32).log10() } else { f32::NEG_INFINITY };
                 f64::from(scale.db_to_frac(db))
+            }
+            // norm (model) → 実値表示。
+            ModControlDomain::Ranged { min, max, log } => {
+                let n = model.clamp(0.0, 1.0);
+                if log && min > 0.0 && max > 0.0 {
+                    min * (max / min).powf(n)
+                } else {
+                    min + n * (max - min)
+                }
             }
         }
     }
@@ -687,6 +711,17 @@ pub struct GroupTransformInspectorSummary {
     /// 編集対象の base transform（`group_transform` 無しなら default）。
     /// inspector の scrubable_number が毎フレーム現値として表示する。
     pub transform: common::model::GroupTransform,
+}
+
+/// FIXME #54 Wave4: 開いている内蔵映像 FX param パネルのデータ（inspector が
+/// scrubable_number 行に展開する）。`def` はカタログ定義、`values` は `def.params`
+/// 同順の現在実値（lane default_value or manifest default を実レンジへ展開）。
+#[derive(Clone)]
+pub struct VideoFxParamsInspector {
+    pub track_id: u32,
+    pub device_index: u32,
+    pub def: &'static common::video_fx::VideoFxDef,
+    pub values: Vec<f32>,
 }
 
 /// inspector / resync が走査する `GroupTransformParam` の固定順
@@ -1373,6 +1408,10 @@ pub struct AppData {
     /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
     /// it's a plain id set — the window FFI lives in the plugin-host process.
     pub open_plugin_guis: std::collections::HashSet<(u32, u32)>,
+    /// FIXME #54 Wave4: 内蔵映像 FX は plugin window を持たないので、チェーン行の "GUI"
+    /// ボタンはインスペクタ内のパラメータ調整パネルを開く。`Some((track_id, device_index))`
+    /// で 1 つだけ開く（別の FX の GUI を押すと切り替わる）。cursor track 以外に切り替えたら閉じる。
+    pub open_video_fx_params: Option<(u32, u32)>,
 
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,
@@ -1915,6 +1954,7 @@ impl AppData {
             pending_clip_fx_bounce: None,
             pending_vocal_synth_bounce: None,
             open_plugin_guis: std::collections::HashSet::new(),
+            open_video_fx_params: None,
             track_peak_display: initial_peak_display,
             mod_scalars: Vec::new(),
             pending_plugin_loads: std::collections::HashSet::new(),
@@ -4155,6 +4195,9 @@ pub enum AppEvent {
 
     /// 単一デバイスチェーン: `device_index` でアドレスする (役割別 slot 区分撤廃)。
     ToggleSlotGui { index: u32 },
+    /// FIXME #54 Wave4: 内蔵映像 FX の param 調整パネルから 1 param を編集。
+    /// `value_real` は表示の実レンジ値 → lane の保存値 (0..=1) へ逆写像して格納。
+    SetVideoFxParam { device_index: u32, param_id: u32, value_real: f32 },
     /// inspector の x ボタン: 指定 `device_index` の device を chain から削除。
     RemoveDevice { index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
@@ -5651,6 +5694,9 @@ impl AppData {
             }
             AppEvent::ToggleSlotGui { index } => {
                 self.toggle_slot_gui(index);
+            }
+            AppEvent::SetVideoFxParam { device_index, param_id, value_real } => {
+                self.set_video_fx_param(device_index, param_id, value_real);
             }
             AppEvent::RemoveDevice { index } => {
                 self.remove_device(index);
@@ -10589,9 +10635,17 @@ impl AppData {
     pub fn inspector_group_transform_summary(
         &self,
     ) -> Option<GroupTransformInspectorSummary> {
-        let idx = self.cursor_track_index()?;
-        let track = self.song.tracks.get(idx)?;
-        if !self.is_group_track(track.id) || !self.group_has_visual_content(track.id) {
+        // FIXME #54 Wave4: Transform もチェーン行の "GUI" ボタンでトグル開閉する（他 FX と統一、
+        // 出っぱなしにしない）。開いている device が cursor track の Transform 配置 device の
+        // ときだけ Group Transform セクションを出す。
+        let (open_track, open_idx) = self.open_video_fx_params?;
+        if self.cursor_track_id() != Some(open_track) {
+            return None;
+        }
+        let track = self.song.track_by_id(open_track)?;
+        if track.devices.get(open_idx as usize).map(|d| d.plugin_id.as_str())
+            != Some(common::video_fx::TRANSFORM_ID)
+        {
             return None;
         }
         let mut automated = [false; 8];
@@ -10605,6 +10659,104 @@ impl AppData {
             automated,
             transform: track.group_transform.unwrap_or_default(),
         })
+    }
+
+    /// FIXME #54 Wave4: 開いている映像 FX param パネル（`open_video_fx_params`）が cursor
+    /// track と一致するとき、その device の def + 各 param の現在実値を返す。inspector が
+    /// scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
+    pub fn inspector_video_fx_params(&self) -> Option<VideoFxParamsInspector> {
+        let (track_id, device_index) = self.open_video_fx_params?;
+        if self.cursor_track_id() != Some(track_id) {
+            return None;
+        }
+        let def = self
+            .song
+            .fx_chain_by_track_id(track_id)?
+            .get(device_index as usize)
+            .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))?;
+        if def.params.is_empty() {
+            return None; // Transform 等は専用セクションで編集。
+        }
+        let empty: &[common::model::AutomationLane] = &[];
+        let lanes: &[common::model::AutomationLane] =
+            if track_id == common::model::MASTER_TRACK_ID {
+                &self.song.song_lanes
+            } else {
+                self.song
+                    .track_by_id(track_id)
+                    .map_or(empty, |t| t.automation_lanes.as_slice())
+            };
+        let values: Vec<f32> = def
+            .params
+            .iter()
+            .map(|p| {
+                let target = common::model::AutomationTarget::PluginParam {
+                    device_index,
+                    param_id: p.id,
+                    legacy_slot: None,
+                };
+                // base = lane default_value、無ければ manifest default（実レンジ表示）。
+                let norm = lanes
+                    .iter()
+                    .find(|l| l.target == target)
+                    .map_or_else(|| p.kind.default_norm(), |l| l.default_value);
+                p.kind.norm_to_real(norm)
+            })
+            .collect();
+        Some(VideoFxParamsInspector { track_id, device_index, def, values })
+    }
+
+    /// FIXME #54 Wave4: 内蔵映像 FX param を 1 つ編集（パネルの scrubable から）。値の SSoT は
+    /// `PluginParam` lane の `default_value`（0..=1 norm、`video_fx` モジュール doc）。lane が
+    /// 無ければ値保持用（`visible=false`・curve 無し）を作る。master は `song_lanes`。
+    fn set_video_fx_param(&mut self, device_index: u32, param_id: u32, value_real: f32) {
+        use common::model::{AutomationLane, AutomationTarget};
+        let Some(track_id) = self.cursor_track_id() else {
+            return;
+        };
+        // def_by_id は &'static を返すので self.song の借用はここで終わる。
+        let Some(def) = self
+            .song
+            .fx_chain_by_track_id(track_id)
+            .and_then(|c| c.get(device_index as usize))
+            .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))
+        else {
+            return;
+        };
+        let Some(param) = def.param(param_id) else {
+            return;
+        };
+        let display_name = format!("{} {}", def.name, param.name);
+        let norm = param.kind.real_to_norm(value_real);
+        let target = AutomationTarget::PluginParam { device_index, param_id, legacy_slot: None };
+        if track_id == common::model::MASTER_TRACK_ID {
+            if let Some(lane) = self.song.song_lanes.iter_mut().find(|l| l.target == target) {
+                lane.default_value = norm;
+            } else {
+                let id = self.song.alloc_song_lane_id();
+                let mut lane = AutomationLane::new(target.clone(), norm);
+                lane.id = id;
+                lane.visible = false;
+                self.song.song_lanes.push(lane);
+            }
+        } else if let Some(track) = self.song.track_by_id_mut(track_id) {
+            if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
+                lane.default_value = norm;
+            } else {
+                let id = track.alloc_lane_id();
+                let mut lane = AutomationLane::new(target.clone(), norm);
+                lane.id = id;
+                lane.visible = false;
+                track.automation_lanes.push(lane);
+            }
+        }
+        // 「A」キー (last_touched_param) で automation lane を可視化/curve 化できる。
+        self.last_touched_param = Some(TouchedParam {
+            track_id,
+            target,
+            display_name,
+            touched_at: std::time::Instant::now(),
+        });
     }
 
     /// docs/plan_text_overlay.md §4 P8: 選択中 text clip の track に
@@ -15306,6 +15458,24 @@ impl AppData {
         let Some(track_id) = self.cursor_track_id() else {
             return;
         };
+        // FIXME #54 Wave4: 内蔵映像 FX は plugin window を持たない。"GUI" ボタンは
+        // インスペクタ内のパラメータ調整パネルをトグルする (plugin window は開かない)。
+        // Transform も同様にトグル開閉 (開くと Group Transform セクションが出る。出っぱなしにしない)。
+        let device = self
+            .song
+            .fx_chain_by_track_id(track_id)
+            .and_then(|chain| chain.get(index as usize));
+        if let Some(d) = device
+            && d.ports.is_video()
+        {
+            let key = (track_id, index);
+            self.open_video_fx_params = if self.open_video_fx_params == Some(key) {
+                None
+            } else {
+                Some(key)
+            };
+            return; // 映像 device は plugin window を持たない。
+        }
         // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
         // FIXME #31: open 状態は open_plugin_guis (id set) で追跡。実 window は
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
@@ -15986,6 +16156,11 @@ impl AppData {
         // also closes the editor by stable plugin id as a backstop, and shifts
         // the remaining open-state keys to match the new chain indices.
         self.cleanup_slot_gui(track_id, index);
+        // FIXME #54 Wave4: 開いている映像 FX param パネルが同トラックなら閉じる
+        // (削除で device index がずれて別 device を指すのを防ぐ)。
+        if self.open_video_fx_params.is_some_and(|(t, _)| t == track_id) {
+            self.open_video_fx_params = None;
+        }
         // PR2.1: send `Track::id` to the plugin host.
         self.send_plugin(MainToChild::RemoveSlotPlugin {
             track: track_id,
@@ -16026,6 +16201,19 @@ impl AppData {
             && let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id)
         {
             track.source = InstrumentSource::None;
+        }
+        // FIXME #54 Wave3: Transform 配置 device を外したら group_transform を消す
+        // (device-gate で配置は即無効になるが、残すと ensure_ids が次回ロードで device を
+        // 再生成してしまう)。同 track に別の Transform device が残っていれば保持。
+        if track_id != common::model::MASTER_TRACK_ID
+            && removed.plugin_id == common::video_fx::TRANSFORM_ID
+            && let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id)
+            && !track
+                .devices
+                .iter()
+                .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID)
+        {
+            track.group_transform = None;
         }
     }
 
@@ -16739,7 +16927,14 @@ impl AppData {
             self.song.master_fx_chain.push(new_device);
         } else if let Some(track_idx) = self.cursor_track_index() {
             let track = &mut self.song.tracks[track_idx];
+            let added_transform = new_device.plugin_id == common::video_fx::TRANSFORM_ID;
             track.devices.push(new_device);
+            // FIXME #54 Wave3: Transform 配置 device を刺したら group_transform を有効化
+            // (resolve_track_transform は device-gate + group_transform 値。未初期化なら
+            // identity 配置で no-op になり、inspector で編集を始められない)。
+            if added_transform && track.group_transform.is_none() {
+                track.group_transform = Some(common::model::GroupTransform::default());
+            }
             // builtin VOICEVOX を挿したら vocal track 化。 旧 "+Vocal Track"
             // ボタンの役割をここに集約。 歌詞 synth の gating 自体は
             // `Track::is_voicevox_vocal()` (= device の実在) が SSoT なので、
@@ -17164,13 +17359,12 @@ impl AppData {
     }
 
     fn refresh_picker_visible(&mut self) {
-        // master bus は audio FX しか持てないので、 master 選択中は FX カテゴリの
-        // プラグインだけをリストに出す (それ以外は挿せないので隠す)。 通常トラックは
-        // 全カテゴリ混合で見せ、 種別は選択時に features から自動振り分けする
-        // (plan_unified_plugin_picker.md)。
-        // FIXME #54: master 映像チェーン (master_fx_chain への video device + 最終合成で
-        // apply_chain) は後続。 それまで master picker から Video は除外し、 描画されない
-        // 孤立 device をユーザーが挿せないようにする (orphaned feature を出さない)。
+        // master bus は audio FX と **映像効果** を持てる (FIXME #54 Wave1: master 映像
+        // チェーン = master_fx_chain の video device を最終合成 1 枚に apply_chain)。master
+        // 選択中は FX / Video のみ出す (instrument / midi-fx は master に挿せない)。通常
+        // トラックは全カテゴリ混合で見せ、種別は選択時に features から自動振り分け。
+        // Transform 配置 device は master には出さない (master は全画面 = 配置の意味が薄く、
+        // master group_transform の受け皿も無い)。
         let master = self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
         // 検索クエリ (前後空白を除去)。 空なら (master フィルタを除き) 全件、 非空なら
         // name / vendor のいずれかへの subsequence マッチで AND 絞り込みする。
@@ -17178,7 +17372,12 @@ impl AppData {
         let visible: Vec<PluginPickEntry> = self
             .plugin_picker_entries
             .iter()
-            .filter(|e| !master || e.category == PluginCategory::Fx)
+            .filter(|e| {
+                !master
+                    || (matches!(e.category, PluginCategory::Fx | PluginCategory::Video)
+                        // master には Transform 配置 device を出さない (全画面 master に配置は無意味)。
+                        && e.id != common::video_fx::TRANSFORM_ID)
+            })
             .filter(|e| {
                 query.is_empty()
                     || crate::fuzzy::subsequence_match(&e.name, query)
