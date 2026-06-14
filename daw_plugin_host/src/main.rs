@@ -2012,6 +2012,7 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         | MainToChild::SetMetronomeEnabled(_)
         | MainToChild::PreviewNoteOn { .. }
         | MainToChild::PreviewNoteOff { .. }
+        | MainToChild::CancelExport
         | MainToChild::StartCountIn { .. } => {
             // daw_audio 専属、 plugin_host では no-op (silent)。
         }

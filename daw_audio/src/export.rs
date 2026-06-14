@@ -4,17 +4,20 @@
 //! cooperates by checking `EngineShared::export_running` and writing
 //! silence while we hold the resources (see [`engine::LocalState::process_buffer`]).
 //!
-//! Threading model: caller spawns `run_export` on a dedicated
-//! `std::thread`. The export thread:
+//! Threading model: the daw_audio receive loop reserves
+//! `EngineShared::export_running` (compare_exchange, to mute the CPAL
+//! callback and serialize against a second export), resets `export_cancel`,
+//! then spawns `run_export` on a dedicated `std::thread`. The export thread:
 //!
-//! 1. Sets `EngineShared::export_running = true` to mute the CPAL callback.
-//! 2. Allocates its own `scratch` / `master_l` / `master_r` (heap is fine
+//! 1. Allocates its own `scratch` / `master_l` / `master_r` (heap is fine
 //!    here; this thread is RT-irrelevant once the realtime callback is
 //!    parked).
-//! 3. Walks the song from frame 0 to `length_beats * samples_per_beat`,
+//! 2. Walks the song from frame 0 to `length_beats * samples_per_beat`,
 //!    calling `pool.dispatch_and_wait` (or the serial fallback) every
 //!    buffer and writing the master bus into `hound::WavWriter`.
-//! 4. Clears `export_running` so live playback can resume.
+//!
+//! The spawn closure (not `run_export`) releases `export_running` after this
+//! returns, on every path, so live playback can resume.
 //!
 //! `clap_plugin_render.set(CLAP_RENDER_OFFLINE)` is bookended by the GUI
 //! around this call (it sends `MainToChild::SetRenderMode(Offline)` to
@@ -39,6 +42,17 @@ use crate::mixer::TrackScratch;
 /// inflating the WAV indefinitely.
 const TAIL_MAX_SECONDS: u64 = 10;
 
+/// Outcome of [`run_export`]. `cancelled` distinguishes a user abort
+/// (`MainToChild::CancelExport`) from success / error so the host can
+/// branch on a typed flag instead of matching an error string.
+pub struct ExportOutcome {
+    /// Frames written to the WAV (0 when cancelled — the partial file is
+    /// deleted).
+    pub frames: u64,
+    /// `true` if the render was aborted via `EngineShared::export_cancel`.
+    pub cancelled: bool,
+}
+
 /// Run the offline WAV export to completion. Blocks the caller until the
 /// file is finalised. RT-irrelevant — the CPAL callback writes silence
 /// while `engine_shared.export_running` is set.
@@ -57,6 +71,18 @@ const TAIL_MAX_SECONDS: u64 = 10;
 /// Returns the number of frames written to the WAV (= can be less than
 /// the requested range if tail silence is detected and the render
 /// stopped early).
+///
+/// `on_progress(done, total)` is called every render buffer with the
+/// song-body samples rendered so far (`done`, capped at the body length)
+/// and the body length in samples (`total`). The caller is expected to
+/// throttle the actual IPC send. Standalone WAV export passes a sender
+/// that emits `ChildToMain::ExportWavProgress`; the clip-range bounce
+/// passes a no-op (no progress overlay).
+///
+/// Cancellation: if `EngineShared::export_cancel` is raised mid-render
+/// (via `MainToChild::CancelExport`), the loop breaks, the partial WAV is
+/// deleted, and the function returns `Ok(ExportOutcome { cancelled: true, .. })`
+/// (a cancel is not an error).
 pub fn run_export(
     path: PathBuf,
     engine_shared: Arc<EngineShared>,
@@ -64,7 +90,8 @@ pub fn run_export(
     sample_rate: u32,
     max_frames: usize,
     range: Option<(u64, u64)>,
-) -> Result<u64> {
+    on_progress: impl FnMut(u64, u64),
+) -> Result<ExportOutcome> {
     if song.bpm <= 0.0 {
         anyhow::bail!("song.bpm must be positive (got {})", song.bpm);
     }
@@ -111,9 +138,13 @@ pub fn run_export(
     let mut master_l: Vec<f32> = vec![0.0; max_frames];
     let mut master_r: Vec<f32> = vec![0.0; max_frames];
 
-    // Tell the CPAL callback to silence itself.
-    engine_shared.export_running.store(true, Ordering::Release);
-
+    // NB: `export_running` (the CPAL-silence flag) and `export_cancel` are
+    // both owned by the daw_audio receive loop, not by this function. The
+    // recv loop reserves `export_running` with a compare_exchange and resets
+    // `export_cancel` *before* spawning this thread (so both are FIFO-ordered
+    // against a later `CancelExport`), and the spawn closure releases
+    // `export_running` after this returns (on every path, including an early
+    // bail above). We only read `export_cancel` here.
     let render_result = render_loop(
         &engine_shared,
         &song,
@@ -127,13 +158,21 @@ pub fn run_export(
         &mut master_l,
         &mut master_r,
         &mut writer,
+        on_progress,
     );
 
-    // Always clear the flag, even on render error, so live playback
-    // never gets wedged.
-    engine_shared.export_running.store(false, Ordering::Release);
+    let (frames_written, env_sidecar, cancelled) = render_result?;
 
-    let (frames_written, env_sidecar) = render_result?;
+    // User aborted mid-render: discard the partial WAV (don't finalize —
+    // an un-finalized hound header would leave a corrupt file) and report
+    // the cancel via the typed `cancelled` flag (not an error). The
+    // modulation sidecar was never written on this path.
+    if cancelled {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        tracing::info!(path = %path.display(), frames_written, "offline WAV export cancelled");
+        return Ok(ExportOutcome { frames: 0, cancelled: true });
+    }
 
     // docs/plan_modulation.md §7: persist the modulation envelope sidecar next
     // to the WAV (skip when there were no sources). Best-effort — a sidecar
@@ -158,7 +197,7 @@ pub fn run_export(
         frames_written,
         "offline WAV export finished"
     );
-    Ok(frames_written)
+    Ok(ExportOutcome { frames: frames_written, cancelled: false })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -175,7 +214,8 @@ fn render_loop(
     master_l: &mut [f32],
     master_r: &mut [f32],
     writer: &mut WavWriter<std::io::BufWriter<std::fs::File>>,
-) -> Result<(u64, common::mod_sidecar::ModEnvSidecar)> {
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<(u64, common::mod_sidecar::ModEnvSidecar, bool)> {
     // Tail-silence cutoff: stop early if the master bus stays under
     // -60 dB for half a second once we're past the song body.
     let silence_thresh: f32 = 0.001;
@@ -206,6 +246,12 @@ fn render_loop(
     let mut frames_written: u64 = 0;
     let mut playhead: u64 = 0;
     while playhead < total_samples {
+        // User abort (`MainToChild::CancelExport`). Checked before any
+        // work this buffer so the render stops promptly; `run_export`
+        // discards the partial WAV on the `cancelled = true` return.
+        if engine_shared.export_cancel.load(Ordering::Acquire) {
+            return Ok((frames_written, env_sidecar, true));
+        }
         let remaining = total_samples - playhead;
         let frames = (remaining as usize).min(max_frames);
         let frames_u32 = frames as u32;
@@ -396,6 +442,13 @@ fn render_loop(
 
         playhead += frames as u64;
 
+        // Report song-body render progress to the host (the caller's
+        // sender throttles the actual IPC send). `done` caps at
+        // `write_end` so the bar reaches 100 % at the song-body end; the
+        // tail-silence walk past `write_end` holds it there until the
+        // export finalises.
+        on_progress(playhead.min(write_end), write_end);
+
         // Tail-silence detection only kicks in once we're past
         // `write_end` (= the declared song / clip body). The body
         // itself may legitimately be silent (intro, gap between
@@ -420,5 +473,6 @@ fn render_loop(
 
     // docs/plan_modulation.md §7: hand the baked envelope sidecar back to
     // `run_export`, which owns the WAV path and persists it next to the WAV.
-    Ok((frames_written, env_sidecar))
+    // `false` = ran to completion (not cancelled).
+    Ok((frames_written, env_sidecar, false))
 }

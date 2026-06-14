@@ -355,8 +355,11 @@ fn spawn_incoming_bridge(
                 ChildToMain::PluginLatencyChanged { plugin_id, samples } => {
                     Some(AppEvent::PluginLatencyChangedFromChild { plugin_id, samples })
                 }
-                ChildToMain::ExportWavComplete { error } => {
-                    Some(AppEvent::ExportWavComplete { error })
+                ChildToMain::ExportWavComplete { error, cancelled } => {
+                    Some(AppEvent::ExportWavComplete { error, cancelled })
+                }
+                ChildToMain::ExportWavProgress { done, total } => {
+                    Some(AppEvent::ExportWavProgress { done, total })
                 }
                 ChildToMain::BounceClipFxComplete {
                     path,

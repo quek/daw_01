@@ -122,7 +122,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // 保存せず終了 / キャンセル」 確認。 app.show_close_confirm を監視。
     close_confirm_modal::draw(app, ui, screen);
 
-    // Overlay: Video export 中の進捗 + Cancel。app.export_progress を監視。
+    // Overlay: WAV / Video export 中の進捗 + Cancel。app.export_stage を監視。
     export_overlay::draw(app, ui, screen);
 }
 

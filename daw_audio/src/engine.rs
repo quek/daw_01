@@ -222,6 +222,15 @@ pub struct EngineShared {
     /// callback skips its `process_buffer` and writes silence so the
     /// export render can drive `plugin.process()` exclusively.
     pub export_running: AtomicBool,
+    /// Cancel request for the in-flight offline render. The daw_audio
+    /// receive loop resets it to `false` *before* spawning each export
+    /// thread (in the `ExportWav` / `BounceClipFxOnline` handlers), so the
+    /// reset is FIFO-ordered against a later `MainToChild::CancelExport`
+    /// and a stale cancel from a previous render can't abort the next one.
+    /// `run_export` / the freewheel loop only **read** it (every buffer)
+    /// and abort (deleting the partial WAV) when set. Raised by
+    /// `MainToChild::CancelExport` (= the progress overlay's Cancel button).
+    pub export_cancel: AtomicBool,
     /// Audio clip render snapshot. Built off-thread in
     /// `compile_audio_schedule` (PR6) and published via `ArcSwap`. The
     /// audio thread `load()`s once per buffer to find events that
@@ -255,6 +264,7 @@ impl EngineShared {
             slot_to_plugin_id: ArcSwap::from_pointee(HashMap::new()),
             worker_pool: ArcSwapOption::empty(),
             export_running: AtomicBool::new(false),
+            export_cancel: AtomicBool::new(false),
             audio_clip_renderer: ArcSwap::from_pointee(AudioClipRenderer::empty()),
             project_dir: ArcSwapOption::empty(),
             preroll_total_samples: AtomicU64::new(0),

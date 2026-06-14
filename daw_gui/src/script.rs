@@ -616,8 +616,8 @@ fn daw_export_wav(
         )
     });
     match pump_result {
-        Ok(ChildToMain::ExportWavComplete { error: None }) => Ok(JsValue::undefined()),
-        Ok(ChildToMain::ExportWavComplete { error: Some(e) }) => Err(JsError::from_native(
+        Ok(ChildToMain::ExportWavComplete { error: None, .. }) => Ok(JsValue::undefined()),
+        Ok(ChildToMain::ExportWavComplete { error: Some(e), .. }) => Err(JsError::from_native(
             JsNativeError::error().with_message(format!("export failed: {e}")),
         )),
         Ok(_) => unreachable!(),
