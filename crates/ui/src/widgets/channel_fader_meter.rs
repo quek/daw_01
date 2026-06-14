@@ -106,7 +106,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let meter_col = Rect { x: meter_x, y: rect.y, w: meter_w, h: rect.h };
 
         // fader (左列): 共有 region を track 領域 (thumb 中心の可動域) として fader_core に渡す。
-        // fader_core は self.pointer を raw で読み thumb 内 press のみ反応する (press を消費しない)。
+        // fader_core は self.pointer を raw で読み thumb 内 press のみ反応する。 base drag の press は
+        // 消費せず (下の consume が担当)、 depth gesture (#110) の press のみ内部で consume する
+        // (meter peak-reset の二重処理を防ぐ)。
         let fader_wid = WidgetId::ROOT.child((b"cfm_fader", &id));
         let fader = self.fader_core(
             fader_wid,
@@ -358,5 +360,89 @@ mod tests {
         }
 
         assert_eq!(model.db, 0.0, "meter 列の press/drag は fader 値を変えない");
+    }
+
+    /// #110: arm 中 (modulation edit=Some) の depth gesture press が overlap 領域でも meter peak-reset を
+    /// 起こさず (fader_core が内部 consume)、 depth を編集する (base 音量は不変)。 base drag 版
+    /// `overlap_region_press_grabs_fader_and_suppresses_meter_reset` の modulation 版。
+    #[test]
+    fn overlap_depth_gesture_suppresses_meter_reset_and_edits_depth() {
+        use daw_ui_renderer::Color;
+
+        use crate::widgets::scrubable_number::{ModEdit, Modulation};
+
+        struct VolMod {
+            db: f32,
+            depth: f64,
+        }
+
+        let mut host: UiHost<VolMod> = UiHost::no_redraw();
+        let mut model = VolMod { db: 0.0, depth: 0.0 };
+        let rect = group_rect();
+        let region = meter_content_region(rect, true, true);
+        let scale = MeterScale::default();
+        let thumb_y = region.y + region.h * (1.0 - scale.db_to_frac(0.0));
+        // 重なり領域 x: thumb (THUMB_W=28) が meter 列に食い込む位置 (base 版テストと同じ)。
+        let overlap_x = rect.x + FADER_W + METER_GAP + 1.0;
+        let screen = PhysicalSize { width: 200, height: 320 };
+
+        let run = |host: &mut UiHost<VolMod>, model: &VolMod, pointer: PointerFrame, l: f32, r: f32| {
+            let mut scene = Scene::new();
+            let cur = model.depth;
+            let edits = host.frame_to_edits(
+                model,
+                &mut scene,
+                screen,
+                FrameInput { pointer, ..Default::default() },
+                |m: &VolMod, ui| {
+                    let on_mod = |d: f64| Edit::mutate(move |mm: &mut VolMod| mm.depth = d);
+                    let modu = Modulation {
+                        entries: &[],
+                        live_value: None,
+                        edit: Some(ModEdit {
+                            source_color: Color::rgb(0.2, 0.9, 0.4),
+                            current_depth: cur,
+                            depth_range: Some((-1.0, 1.0)),
+                            depth_sensitivity: None,
+                            on_mod_change: &on_mod,
+                        }),
+                    };
+                    ui.channel_fader_meter(
+                        "cfm",
+                        group_rect(),
+                        FADER_W,
+                        m.db,
+                        0.0,
+                        l,
+                        r,
+                        MeterBallistic::Peak,
+                        style(),
+                        "Volume",
+                        |new_db| Edit::mutate(move |mm: &mut VolMod| mm.db = new_db),
+                        Some(modu),
+                    );
+                },
+            );
+            (scene, edits)
+        };
+
+        // frame 1: 高レベルで long_peak を立てる (reset 検出の基準)。
+        let _ = run(&mut host, &model, PointerFrame::default(), 0.9, 0.9);
+        // frame 2: 重なり領域で depth press → fader_core が consume、 meter は reset されない。
+        let (scene, edits) = run(&mut host, &model, press_at((overlap_x, thumb_y)), 0.0, 0.0);
+        for e in edits {
+            e.apply(&mut model);
+        }
+        assert!(
+            !scene.iter_glyphs().any(|g| g.text.as_ref() == "-inf"),
+            "depth press (overlap) で meter peak が reset されない (long_peak 維持)"
+        );
+        // frame 3: 上へ drag → depth が変わる、 base 音量は不変 (非破壊)。
+        let (_, edits) = run(&mut host, &model, hold_at((overlap_x, region.y)), 0.0, 0.0);
+        for e in edits {
+            e.apply(&mut model);
+        }
+        assert!(model.depth > 0.0, "depth gesture で depth が編集される (got {})", model.depth);
+        assert_eq!(model.db, 0.0, "arm 中 depth gesture は base 音量を変えない");
     }
 }
