@@ -396,35 +396,37 @@ async fn handshake(
 }
 
 async fn audio_pipe_loop(
-    mut pipe: NamedPipeServer,
+    pipe: NamedPipeServer,
     mut rx: UnboundedReceiver<MainToChild>,
     incoming_tx: UnboundedSender<ChildToMain>,
 ) {
-    loop {
-        tokio::select! {
-            msg = read_msg::<_, ChildToMain>(&mut pipe) => {
-                match msg {
-                    Ok(m) => {
-                        if incoming_tx.send(m).is_err() {
-                            tracing::info!("incoming receiver dropped; audio pipe loop exiting");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::info!(error = ?e, "daw_audio pipe closed");
-                        break;
-                    }
-                }
+    // read/write half を別タスクに分けて read を絶対 cancel しない
+    // (詳細は plugin_pipe_loop / daw_plugin_host::pipe_loop)。旧 select! 構造は
+    // read_msg を write 発火で途中 cancel し stream を desync させていた。
+    let (mut read_half, mut write_half) = tokio::io::split(pipe);
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = write_msg(&mut write_half, &msg).await {
+                tracing::error!(error = ?e, ?msg, "failed to send message to daw_audio");
+                break;
             }
-            Some(msg) = rx.recv() => {
-                if let Err(e) = write_msg(&mut pipe, &msg).await {
-                    tracing::error!(error = ?e, ?msg, "failed to send message to daw_audio");
+        }
+    });
+    loop {
+        match read_msg::<_, ChildToMain>(&mut read_half).await {
+            Ok(m) => {
+                if incoming_tx.send(m).is_err() {
+                    tracing::info!("incoming receiver dropped; audio pipe loop exiting");
                     break;
                 }
             }
-            else => break,
+            Err(e) => {
+                tracing::info!(error = ?e, "daw_audio pipe closed");
+                break;
+            }
         }
     }
+    writer.abort();
     // 子プロセス側 (or 自前 write) が die / decode 失敗で抜けたケース。
     // 上位 (AppData::handle_event) で respawn + state restore に拾ってもらう。
     let _ = incoming_tx.send(ChildToMain::ChildDisconnected { kind: ChildKind::Audio });
@@ -432,35 +434,40 @@ async fn audio_pipe_loop(
 }
 
 async fn plugin_pipe_loop(
-    mut pipe: NamedPipeServer,
+    pipe: NamedPipeServer,
     mut rx: UnboundedReceiver<MainToChild>,
     incoming_tx: UnboundedSender<ChildToMain>,
 ) {
-    loop {
-        tokio::select! {
-            msg = read_msg::<_, ChildToMain>(&mut pipe) => {
-                match msg {
-                    Ok(m) => {
-                        if incoming_tx.send(m).is_err() {
-                            tracing::info!("incoming receiver dropped; pipe loop exiting");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::info!(error = ?e, "plugin_host pipe closed");
-                        break;
-                    }
-                }
+    // read_msg / write_msg (wire.rs の read_exact / write_all) は
+    // cancellation-unsafe。旧構造の `select! { read_msg, rx.recv()=>write_msg }`
+    // は、大きい message (例: 3.8MB の LoadSong response) の read 途中で write が
+    // 発火すると read future を drop し消費済みバイトを捨てて stream を desync
+    // させる (1GB garbage length → 切断ループの真因)。read/write half を別タスクに
+    // 分けて read を絶対 cancel しない (daw_plugin_host::pipe_loop と同じ)。
+    let (mut read_half, mut write_half) = tokio::io::split(pipe);
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = write_msg(&mut write_half, &msg).await {
+                tracing::error!(error = ?e, ?msg, "failed to send message to plugin_host");
+                break;
             }
-            Some(msg) = rx.recv() => {
-                if let Err(e) = write_msg(&mut pipe, &msg).await {
-                    tracing::error!(error = ?e, ?msg, "failed to send message to plugin_host");
+        }
+    });
+    loop {
+        match read_msg::<_, ChildToMain>(&mut read_half).await {
+            Ok(m) => {
+                if incoming_tx.send(m).is_err() {
+                    tracing::info!("incoming receiver dropped; pipe loop exiting");
                     break;
                 }
             }
-            else => break,
+            Err(e) => {
+                tracing::info!(error = ?e, "plugin_host pipe closed");
+                break;
+            }
         }
     }
+    writer.abort();
     let _ = incoming_tx.send(ChildToMain::ChildDisconnected { kind: ChildKind::PluginHost });
     tracing::info!("plugin pipe loop ended");
 }

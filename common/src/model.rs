@@ -1342,8 +1342,11 @@ impl Song {
         // docs/plan_modulation.md §8: mod_source の tap も track id remap に追従する
         // (mod_source.id は track id ではないので不変、 tap.source_track のみ)。
         for ms in self.mod_sources.iter_mut() {
-            if let Some(&new_id) = id_remap.get(&ms.tap.source_track) {
-                ms.tap.source_track = new_id;
+            // generator (LFO/Random/MSEG/Steps) は tap を持たない。 follower のみ remap。
+            if let Some(tap) = ms.follower_tap_mut()
+                && let Some(&new_id) = id_remap.get(&tap.source_track)
+            {
+                tap.source_track = new_id;
             }
         }
 
@@ -2528,8 +2531,25 @@ impl Default for FollowerConfig {
     }
 }
 
+/// source rack の色割当 palette (Bitwig 流、 作成順に循環)。
+pub const MOD_SOURCE_PALETTE: [[f32; 3]; 8] = [
+    [0.30, 0.69, 1.00], // 青
+    [1.00, 0.55, 0.26], // 橙
+    [0.45, 0.85, 0.45], // 緑
+    [0.95, 0.45, 0.75], // 桃
+    [0.80, 0.65, 1.00], // 紫
+    [1.00, 0.85, 0.30], // 黄
+    [0.40, 0.85, 0.85], // 水
+    [0.95, 0.45, 0.45], // 赤
+];
+
+fn default_mod_color() -> [f32; 3] {
+    MOD_SOURCE_PALETTE[0]
+}
+
 /// 共有モジュレーション源 (1 source → 多 params、 plan Q2)。 `Song.mod_sources`
 /// が route の唯一の所有者。 `id` で `ModRouting.source_id` から参照される。
+/// FIXME #56: envelope follower 専用から **generator 種別** (`kind`) へ一般化。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ModSource {
     /// 安定 id。 `0` は "未採番" sentinel、 `ensure_ids` が採番。
@@ -2542,9 +2562,37 @@ pub struct ModSource {
     /// `0` = legacy (どこにも表示しない。未リリース機能なので該当データは無い)。
     #[serde(default)]
     pub owner_track_id: u32,
-    pub tap: AudioTap,
+    /// source 識別色 (depth リング/rack 用)。 作成時に palette から循環割当。
+    #[serde(default = "default_mod_color")]
+    pub color: [f32; 3],
+    /// 変調器種別 (envelope follower / LFO / Random / MSEG / Steps)。
     #[serde(default)]
-    pub follower: FollowerConfig,
+    pub kind: ModSourceKind,
+}
+
+impl ModSource {
+    /// 作成順 `index` に対応する palette 色。
+    pub fn palette_color(index: usize) -> [f32; 3] {
+        MOD_SOURCE_PALETTE[index % MOD_SOURCE_PALETTE.len()]
+    }
+
+    /// envelope follower のときだけ `(tap, follower)` を返す (generator は `None`)。
+    pub fn follower(&self) -> Option<(&AudioTap, &FollowerConfig)> {
+        if let ModSourceKind::EnvelopeFollower { tap, follower } = &self.kind {
+            Some((tap, follower))
+        } else {
+            None
+        }
+    }
+
+    /// envelope follower の tap を可変借用 (generator は `None`)。
+    pub fn follower_tap_mut(&mut self) -> Option<&mut AudioTap> {
+        if let ModSourceKind::EnvelopeFollower { tap, .. } = &mut self.kind {
+            Some(tap)
+        } else {
+            None
+        }
+    }
 }
 
 /// 変調の極性 (plan Q5)。
@@ -2576,6 +2624,283 @@ pub struct ModRouting {
     pub depth: f32,
     #[serde(default)]
     pub polarity: Polarity,
+}
+
+// =====================================================================
+// Generator modulators (LFO / Random / MSEG / Steps) — docs/plan_fixme_56_modulators.md
+// =====================================================================
+//
+// `ModSource` を envelope follower 専用から **generator 種別** へ一般化する
+// (FIXME #56)。envelope follower は audio 入力に依存し engine ring が `env` を
+// 算出するが、generator (LFO/Random/MSEG/Steps) は **`song_beat` の純粋関数** で
+// audio に依存しない。よって ring 不要・状態レス・全経路 (RT preview / 音声書き出し
+// / video export) で同一関数 → drift ゼロ・bounce 完全再現。評価は
+// `common::modulators::generator_scalar`。出力は常に unipolar 0..=1 で、極性は
+// 後段の `ModRouting.polarity` が担う (SSoT、 follower と同じ契約)。
+
+/// 全 generator 共通の rate。 free-running な絶対周波数か、 tempo-synced な音価。
+/// free でも壁時計でなく **song 秒** で評価するので決定論的 (plan §0)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub enum ModRate {
+    /// transport 非同期の絶対周波数 (Hz)。 phase = `frac(song_secs * hz + phase0)`。
+    Free { hz: f32 },
+    /// 音価同期。 `period_beats = 4.0 * numerator / denominator`
+    /// (1/4=(1,4)→1拍, 1bar=(1,1)→4拍, 1/8三連=(1,12), 付点1/4=(3,8))。
+    Sync { numerator: u32, denominator: u32 },
+}
+
+impl Default for ModRate {
+    fn default() -> Self {
+        // 1/4 note。
+        ModRate::Sync {
+            numerator: 1,
+            denominator: 4,
+        }
+    }
+}
+
+/// タイムライン変調器の retrigger。 per-note 鍵盤文脈は無いので、 壁時計・再生
+/// イベント基準は採らない (決定論を壊す)。 phase は常に song 位置の関数 (plan §0)。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, Encode, Decode)]
+pub enum RetriggerMode {
+    /// phase = f(song_beat) を連続評価。 既定 (Bitwig "Sync" 相当)。 loop 跨ぎでも一致。
+    #[default]
+    FreeRun,
+    /// phase = f(song_beat - anchor_beat)。 clip / loop 開始等の beat 基準。 MSEG OneShot 用。
+    FromBeat { anchor_beat: f64 },
+}
+
+/// LFO 波形。 phase 0..=1 → unipolar 0..=1。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, Encode, Decode)]
+pub enum LfoShape {
+    #[default]
+    Sine,
+    Triangle,
+    /// 上昇ノコギリ (ramp)。
+    SawUp,
+    /// 下降ノコギリ。
+    SawDown,
+    /// 矩形 (duty 50%)。
+    Square,
+    /// 可変 duty パルス。 `width` 0..=1。
+    Pulse {
+        width: f32,
+    },
+}
+
+/// 周期波 LFO。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct LfoConfig {
+    pub shape: LfoShape,
+    pub rate: ModRate,
+    /// cycle 内の開始オフセット 0..=1。
+    pub phase: f32,
+    pub retrigger: RetriggerMode,
+}
+
+impl Default for LfoConfig {
+    fn default() -> Self {
+        Self {
+            shape: LfoShape::Sine,
+            rate: ModRate::default(),
+            phase: 0.0,
+            retrigger: RetriggerMode::FreeRun,
+        }
+    }
+}
+
+/// Random の補間モード。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum RandomMode {
+    /// step 間を線形補間 (滑らかな乱数)。
+    #[default]
+    Smooth,
+    /// 階段状 (sample & hold)。
+    SampleHold,
+}
+
+/// 乱数変調器。 `seed` を保存し `hash(seed, step)` の純関数にして **オフライン再現**
+/// を保証する (Vital は mt19937 をグローバル seed で非再現、 plan §0)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct RandomConfig {
+    pub rate: ModRate,
+    pub mode: RandomMode,
+    /// 決定論のための seed (source 作成時に採番・保存。 UI で re-roll 可)。
+    pub seed: u64,
+    pub retrigger: RetriggerMode,
+}
+
+impl Default for RandomConfig {
+    fn default() -> Self {
+        Self {
+            rate: ModRate::default(),
+            mode: RandomMode::Smooth,
+            seed: 0,
+            retrigger: RetriggerMode::FreeRun,
+        }
+    }
+}
+
+/// MSEG の 1 ブレークポイント。 `time`/`value` は 0..=1、 `time` は単調増加で
+/// `points[0].time == 0.0`。 `curve` は次セグメントへの tension (-1..=1、 0=linear、
+/// +=凸、 -=凹)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct MsegPoint {
+    pub time: f32,
+    pub value: f32,
+    pub curve: f32,
+}
+
+/// MSEG の 1 周の再生モード (per-note sustain はタイムライン文脈で無効なので除外)。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum MsegPlayMode {
+    /// 1 周のみ (FromBeat anchor から)。
+    OneShot,
+    /// 連続ループ。
+    #[default]
+    Loop,
+    /// 折り返しループ (forward → backward)。
+    PingPong,
+}
+
+/// 自由描画できる多段エンベロープ (Bitwig Curves/Segments、 Vital LineGenerator 相当)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct MsegConfig {
+    /// 時刻昇順の breakpoint 列 (`points[0].time == 0.0`、 不変条件)。
+    pub points: Vec<MsegPoint>,
+    /// 1 周の長さ。
+    pub rate: ModRate,
+    pub play_mode: MsegPlayMode,
+    pub retrigger: RetriggerMode,
+}
+
+impl Default for MsegConfig {
+    fn default() -> Self {
+        // 既定 = 三角 (0,0)-(0.5,1)-(1,0)。
+        Self {
+            points: vec![
+                MsegPoint {
+                    time: 0.0,
+                    value: 0.0,
+                    curve: 0.0,
+                },
+                MsegPoint {
+                    time: 0.5,
+                    value: 1.0,
+                    curve: 0.0,
+                },
+                MsegPoint {
+                    time: 1.0,
+                    value: 0.0,
+                    curve: 0.0,
+                },
+            ],
+            rate: ModRate::default(),
+            play_mode: MsegPlayMode::Loop,
+            retrigger: RetriggerMode::FreeRun,
+        }
+    }
+}
+
+/// ステップシーケンサの進行方向。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum StepsDirection {
+    #[default]
+    Forward,
+    Backward,
+    /// 端で折り返し。
+    PingPong,
+}
+
+/// ステップシーケンサ (Bitwig Steps 相当)。 各 step の値 (0..=1) を順に出す。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct StepsConfig {
+    /// step 値 0..=1 (最低 1 個)。
+    pub values: Vec<f32>,
+    /// 1 周 (全 step) の長さ。
+    pub rate: ModRate,
+    pub direction: StepsDirection,
+    /// step 間の slew (0=階段、 >0 で隣接 step を補間)。
+    pub slew: f32,
+    pub retrigger: RetriggerMode,
+}
+
+impl Default for StepsConfig {
+    fn default() -> Self {
+        // 既定 = 8 step の上昇階段 (一目で sequencer と分かる)。
+        Self {
+            values: (0..8).map(|i| i as f32 / 7.0).collect(),
+            rate: ModRate::default(),
+            direction: StepsDirection::Forward,
+            slew: 0.0,
+            retrigger: RetriggerMode::FreeRun,
+        }
+    }
+}
+
+/// `ModSource` の変調器種別 (plan §1)。 envelope follower は既存を内包し、
+/// generator 4 種を追加。 `Vec` を持つため `Copy` 不可 (`ModRouting` と同じ)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub enum ModSourceKind {
+    /// 他トラック音声のエンベロープフォロワー (既存基盤)。
+    EnvelopeFollower {
+        tap: AudioTap,
+        follower: FollowerConfig,
+    },
+    Lfo(LfoConfig),
+    Random(RandomConfig),
+    Mseg(MsegConfig),
+    Steps(StepsConfig),
+}
+
+impl Default for ModSourceKind {
+    fn default() -> Self {
+        ModSourceKind::EnvelopeFollower {
+            tap: AudioTap::post_fader(0),
+            follower: FollowerConfig::default(),
+        }
+    }
+}
+
+impl ModSourceKind {
+    /// generator 共通の rate (follower は `None`)。
+    pub fn rate_mut(&mut self) -> Option<&mut ModRate> {
+        match self {
+            ModSourceKind::Lfo(c) => Some(&mut c.rate),
+            ModSourceKind::Random(c) => Some(&mut c.rate),
+            ModSourceKind::Mseg(c) => Some(&mut c.rate),
+            ModSourceKind::Steps(c) => Some(&mut c.rate),
+            ModSourceKind::EnvelopeFollower { .. } => None,
+        }
+    }
+
+    /// generator 共通の retrigger (follower は `None`)。
+    pub fn retrigger_mut(&mut self) -> Option<&mut RetriggerMode> {
+        match self {
+            ModSourceKind::Lfo(c) => Some(&mut c.retrigger),
+            ModSourceKind::Random(c) => Some(&mut c.retrigger),
+            ModSourceKind::Mseg(c) => Some(&mut c.retrigger),
+            ModSourceKind::Steps(c) => Some(&mut c.retrigger),
+            ModSourceKind::EnvelopeFollower { .. } => None,
+        }
+    }
+
+    /// 短い種別ラベル (UI rack ヘッダ用)。
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            ModSourceKind::EnvelopeFollower { .. } => "Follow",
+            ModSourceKind::Lfo(_) => "LFO",
+            ModSourceKind::Random(_) => "Rand",
+            ModSourceKind::Mseg(_) => "MSEG",
+            ModSourceKind::Steps(_) => "Steps",
+        }
+    }
 }
 
 /// Reference to a plugin loaded on a track, with the opaque state blob the
@@ -4643,8 +4968,11 @@ mod tests {
             mod_sources: vec![ModSource {
                 id: 0, // sentinel — assigned by ensure_ids
                 owner_track_id: 0,
-                tap: AudioTap::post_fader(0), // points at Kick's sentinel id
-                follower: FollowerConfig::default(),
+                color: ModSource::palette_color(0),
+                kind: ModSourceKind::EnvelopeFollower {
+                    tap: AudioTap::post_fader(0), // points at Kick's sentinel id
+                    follower: FollowerConfig::default(),
+                },
             }],
             ..Song::default()
         };
@@ -4655,7 +4983,8 @@ mod tests {
         assert_ne!(new_kick_id, 0, "Kick sentinel rebased");
         assert_ne!(song.mod_sources[0].id, 0, "mod_source id assigned");
         assert_eq!(
-            song.mod_sources[0].tap.source_track, new_kick_id,
+            song.mod_sources[0].follower().unwrap().0.source_track,
+            new_kick_id,
             "mod_source tap.source_track must follow the track id remap"
         );
     }

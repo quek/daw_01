@@ -337,7 +337,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // lane が空の track でも collapsed flag は設定するが、 widget は
             // 「lane 0 件 → disclosure ▶/▼ 非表示」 で扱う。
             automation_lanes_collapsed: !app.expanded_automation_tracks.contains(&t.id),
-            automation_lanes: build_arrangement_automation_lanes(t, &app.song, &refcount_by_content),
+            automation_lanes: build_arrangement_automation_lanes(
+                t,
+                &app.song,
+                &refcount_by_content,
+                &|tgt| app.plugin_param_range(t.id, tgt),
+            ),
             // gui_01 #031 (M14 Phase 63n-6): 個別 track row 高さ override。
             // None なら global `view.track_row_h` (= Alt+wheel で動く既存値) を
             // 使う。Some(px) なら override (Alt+drag / 下端 splitter drag で
@@ -504,8 +509,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // session state、 negation で widget 側 `automation_lanes_collapsed` に
     // map)。 song_lanes が空でも master_row 自体は表示するため、 常に
     // `Some(...)` を渡す idiom (= None は本機能未使用時用)。
-    let master_row_lanes =
-        build_arrangement_lanes_from_slice(&app.song.song_lanes, &app.song, &refcount_by_content);
+    let master_row_lanes = build_arrangement_lanes_from_slice(
+        &app.song.song_lanes,
+        &app.song,
+        &refcount_by_content,
+        &|_| None,
+    );
     let master_row = daw_ui_core::ArrangementMasterRow {
         automation_lanes_collapsed: !app.master_row_automation_expanded,
         automation_lanes: master_row_lanes,
@@ -2046,8 +2055,9 @@ fn build_arrangement_automation_lanes(
     track: &common::model::Track,
     song: &common::model::Song,
     refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
+    range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
 ) -> Vec<ArrangementAutomationLane> {
-    build_arrangement_lanes_from_slice(&track.automation_lanes, song, refcount_by_content)
+    build_arrangement_lanes_from_slice(&track.automation_lanes, song, refcount_by_content, range_of)
 }
 
 /// gui_01 #034 (Phase 63n-10): `Track.automation_lanes` でも `Song.song_lanes`
@@ -2057,12 +2067,18 @@ fn build_arrangement_lanes_from_slice(
     lanes: &[common::model::AutomationLane],
     song: &common::model::Song,
     refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
+    range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
 ) -> Vec<ArrangementAutomationLane> {
     lanes
         .iter()
         .map(|lane| {
             let display = lane_target_display(&lane.target);
-            let default_value_norm = plain_to_norm(&lane.target, lane.default_value);
+            // docs/plan_modulation_followups.md §2: plugin param lanes normalize
+            // against the plugin's real min/max (else the curve saturates at the
+            // top for params whose range isn't 0..=1).
+            let range = range_of(&lane.target);
+            let default_value_norm =
+                common::automation::plain_to_norm_ranged(&lane.target, lane.default_value, range);
             let clips: Vec<ArrangementAutomationClip> = lane
                 .clips
                 .iter()
@@ -2075,7 +2091,11 @@ fn build_arrangement_lanes_from_slice(
                         .iter()
                         .map(|p| ArrangementAutomationPoint {
                             time_beat: p.time_beat,
-                            value_norm: plain_to_norm(&lane.target, p.value),
+                            value_norm: common::automation::plain_to_norm_ranged(
+                                &lane.target,
+                                p.value,
+                                range,
+                            ),
                             curve: model_curve_to_widget(p.curve),
                         })
                         .collect();
@@ -2260,17 +2280,6 @@ fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay 
             }
         }
     }
-}
-
-/// Plain (target's native unit) → normalized 0..1 で widget に渡すため
-/// の変換。 Phase 1 で必要な範囲のみ実装。 plugin param は min/max を
-/// 知らないと正規化できないので、 とりあえず `clamp(0, 1)` で渡す
-/// (Phase 2 で `AppData.plugin_params` lookup に置換)。
-/// 正規化 (UI 0..=1) の SSoT は `common::automation::plain_to_norm`。
-/// arrangement の automation curve 表示も同じ変換を使うため、ローカルに
-/// 複製せず委譲する (旧複製は逐一 common と手で同期する DRY 違反だった)。
-fn plain_to_norm(target: &common::model::AutomationTarget, plain: f64) -> f32 {
-    common::automation::plain_to_norm(target, plain)
 }
 
 /// `common::model::AutomationCurve` (incoming curve) → widget

@@ -227,6 +227,68 @@ fn image_source_label(src: &common::model::ImageSource) -> String {
         .to_string()
 }
 
+// FIXME #56: generator の rate (tempo 同期 division か Free Hz) 選択肢。
+const MOD_RATE_DIVS: [(&str, u32, u32); 9] = [
+    ("1/16", 1, 16),
+    ("1/8T", 1, 12),
+    ("1/8", 1, 8),
+    ("1/4T", 1, 6),
+    ("1/4", 1, 4),
+    ("1/2", 1, 2),
+    ("1bar", 1, 1),
+    ("2bar", 2, 1),
+    ("4bar", 4, 1),
+];
+
+/// 種別ごとの inspector 行数 (各行 22px)。
+fn mod_src_rows(kind: &common::model::ModSourceKind) -> usize {
+    use common::model::ModSourceKind as K;
+    match kind {
+        K::EnvelopeFollower { .. } | K::Lfo(_) | K::Random(_) => 2,
+        K::Mseg(_) | K::Steps(_) => 3,
+    }
+}
+
+/// rate ドロップダウン (tempo 同期 division + Free)。pick で `EditModSource::Rate` を emit。
+fn mod_rate_control(
+    ui: &mut Ui<'_, AppData>,
+    id_seed: u32,
+    rect: Rect,
+    rate: &common::model::ModRate,
+    sid: u32,
+) {
+    use common::model::ModRate;
+    let mut labels: Vec<&str> = MOD_RATE_DIVS.iter().map(|(l, _, _)| *l).collect();
+    labels.push("Free");
+    let sel = match rate {
+        ModRate::Sync {
+            numerator,
+            denominator,
+        } => MOD_RATE_DIVS
+            .iter()
+            .position(|(_, n, d)| n == numerator && d == denominator)
+            .unwrap_or(4),
+        ModRate::Free { .. } => MOD_RATE_DIVS.len(),
+    };
+    if let Some(picked) = ui.dropdown(("inspector_mod_rate", id_seed), rect, &labels, sel) {
+        let new_rate = if picked < MOD_RATE_DIVS.len() {
+            let (_, n, d) = MOD_RATE_DIVS[picked];
+            ModRate::Sync {
+                numerator: n,
+                denominator: d,
+            }
+        } else {
+            ModRate::Free { hz: 1.0 }
+        };
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::EditModSource {
+                id: sid,
+                edit: crate::app::ModSourceEdit::Rate(new_rate),
+            });
+        }));
+    }
+}
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     ui.panel("inspector_bg", area, BG, 0.0);
 
@@ -1919,12 +1981,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Each source is 2 rows (track/meter/tap/remove, then attack/release).
     // Cap visible sources at 2 and routings at 2 so the section stays bounded
     // in the no-scroll inspector.
-    let mod_vis_src = mod_sources.len().min(2);
     let mod_vis_route = mod_routing_count.min(2);
-    // header+add(22) + src rows(2×22 each) + [routing rows(22) + add row(24) +
+    // FIXME #56: 種別ごとに行数が違う (follower/LFO/Random=2、 MSEG/Steps=3)。
+    // 可視 source を 2 個に cap し、 高さは種別別に合算 (no-scroll で bounded)。
+    let mod_src_h: f32 = mod_sources
+        .iter()
+        .take(2)
+        .map(|r| mod_src_rows(&r.kind) as f32 * 22.0)
+        .sum();
+    // header+add(22) + src rows(種別別) + [routing rows(22) + add row(24) +
     // gap] when a source exists + 6 pad.
     let mod_section_h = 22.0
-        + mod_vis_src as f32 * 44.0
+        + mod_src_h
         + if mod_sources.is_empty() {
             0.0
         } else {
@@ -2097,53 +2165,65 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             12.0,
             TEXT,
         );
-        // [+ Src] creates a ModSource tapping the cursor track (PostFader).
-        // master has no own audio output to follow, so only non-master tracks.
-        if let Some(cursor) = app.cursor_track_id()
-            && cursor != common::model::MASTER_TRACK_ID
+        // FIXME #56: [+ ▾] add-menu — 種別 (Follow/LFO/Random/MSEG/Steps) を選んで作成。
         {
-            let add_w = 56.0;
+            let add_w = 64.0;
             let add_rect = Rect {
                 x: area.x + area.w - pad - add_w,
                 y: my - 2.0,
                 w: add_w,
                 h: 20.0,
             };
-            ui.button_at("inspector_mod_add_src", "+ Src", add_rect, move || {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::AddModSource {
-                        source_track: cursor,
-                    });
-                })
-            });
+            let add_labels = ["+ \u{25be}", "Follow", "LFO", "Random", "MSEG", "Steps"];
+            if let Some(picked) = ui.dropdown("inspector_mod_add_src", add_rect, &add_labels, 0)
+                && picked > 0
+            {
+                let tag = match picked {
+                    1 => crate::app::ModSourceKindTag::Follower,
+                    2 => crate::app::ModSourceKindTag::Lfo,
+                    3 => crate::app::ModSourceKindTag::Random,
+                    4 => crate::app::ModSourceKindTag::Mseg,
+                    _ => crate::app::ModSourceKindTag::Steps,
+                };
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::AddModSource { kind: tag });
+                }));
+            }
         }
         my += 22.0;
 
-        // Source rows: [source-track dropdown] [live meter] [tap toggle
-        // PoF/PrF] [remove]. The dropdown lets the user pick / change which
-        // track the source follows (any track, including itself).
+        // Source rows (FIXME #56): row1 共通 = [name/track] [meter] [arm] [×]、
+        // row2+ は種別別エディタ (follower=tap/A/R, LFO=shape/rate/phase,
+        // Random=mode/rate/reroll, Steps=count/dir/slew + step bars,
+        // MSEG=play/rate/±pt + point values)。
         let mod_track_choices = app.mod_source_track_choices();
         let mod_track_labels: Vec<&str> =
             mod_track_choices.iter().map(|(_, l)| l.as_str()).collect();
-        let mut any_follower_drag = false;
+        let mut any_mod_drag = false;
         for (i, src) in mod_sources.iter().take(2).enumerate() {
+            use common::model::ModSourceKind as K;
+            use crate::app::ModSourceEdit as E;
             let sid = src.id;
-            // --- row 1: [source-track dropdown] [meter] [tap PoF/PrF] [×] ---
+            let i_u = i as u32;
+            let lx = area.x + pad;
+            let row_w = area.w - pad * 2.0;
+            // 0..=1 用の共通 scrub スタイル。
+            let unit_style = ScrubableNumberStyle {
+                range: Some((0.0, 1.0)),
+                sensitivity: 0.006,
+                ..SCRUB_STYLE_INSPECTOR
+            };
+
+            // --- row 1 (共通): [name/track dropdown] [meter] [arm] [×] ---
             let rm_rect = Rect {
                 x: area.x + area.w - pad - 20.0,
                 y: my,
                 w: 20.0,
                 h: 20.0,
             };
-            let tap_w = 30.0;
-            let tap_rect = Rect {
-                x: rm_rect.x - 4.0 - tap_w,
-                y: my,
-                w: tap_w,
-                h: 20.0,
-            };
+            // FIXME #56: follower の 3 段タップセレクタは row2 (kind 別エディタ) へ移動。
             let meter_w = 50.0;
-            let meter_x = tap_rect.x - 4.0 - meter_w;
+            let meter_x = rm_rect.x - 4.0 - meter_w;
             let filled = ((src.scalar.clamp(0.0, 1.0) * 6.0).round() as usize).min(6);
             let meter: String = "\u{25ae}".repeat(filled) + &"\u{25af}".repeat(6 - filled);
             ui.label_at(
@@ -2154,9 +2234,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 11.0,
                 TEXT,
             );
-            // arm toggle (Bitwig 流, docs/plan_modulation_routing_redesign.md §6):
-            // クリックでこの source を depth 割当モードへ。armed 中は各 param control
-            // がドラッグで当該 source の depth を編集 (= routing 作成 / 変更) できる。
+            // arm toggle (Bitwig 流): armed 中は各 param control をドラッグで depth 編集。
             let arm_w = 24.0;
             let arm_x = meter_x - 4.0 - arm_w;
             let armed = app.armed_mod_source == Some(sid);
@@ -2172,41 +2250,41 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     })
                 },
             );
-            let dd_rect = Rect {
-                x: area.x + pad,
+            let name_rect = Rect {
+                x: lx,
                 y: my,
-                w: (arm_x - 4.0 - (area.x + pad)).max(40.0),
+                w: (arm_x - 4.0 - lx).max(40.0),
                 h: 20.0,
             };
-            let sel = mod_track_choices
-                .iter()
-                .position(|(tid, _)| *tid == src.source_track)
-                .unwrap_or(0);
-            if let Some(picked) =
-                ui.dropdown(("inspector_mod_src_track", i), dd_rect, &mod_track_labels, sel)
-                && let Some(&(tid, _)) = mod_track_choices.get(picked)
-            {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetModSourceTrack {
-                        id: sid,
-                        source_track: tid,
-                    });
-                }));
-            }
-            let is_post = src.post_fader;
-            ui.button_at(
-                ("inspector_mod_src_tap", i),
-                if is_post { "PoF" } else { "PrF" },
-                tap_rect,
-                move || {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetModSourceTapPoint {
+            if let K::EnvelopeFollower { tap, .. } = &src.kind {
+                let sel = mod_track_choices
+                    .iter()
+                    .position(|(tid, _)| *tid == tap.source_track)
+                    .unwrap_or(0);
+                if let Some(picked) = ui.dropdown(
+                    ("inspector_mod_src_track", i),
+                    name_rect,
+                    &mod_track_labels,
+                    sel,
+                ) && let Some(&(tid, _)) = mod_track_choices.get(picked)
+                {
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetModSourceTrack {
                             id: sid,
-                            post_fader: !is_post,
+                            source_track: tid,
                         });
-                    })
-                },
-            );
+                    }));
+                }
+            } else {
+                ui.label_at(
+                    ("inspector_mod_src_kind", i),
+                    src.kind.short_label(),
+                    name_rect.x,
+                    my + 4.0,
+                    12.0,
+                    TEXT,
+                );
+            }
             ui.button_at(("inspector_mod_src_rm", i), "\u{00d7}", rm_rect, move || {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::RemoveModSource { id: sid });
@@ -2214,88 +2292,331 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             });
             my += 22.0;
 
-            // --- row 2: attack / release (ms) scrubs. Per-frame sync would
-            // recompile the whole schedule, so the scrub only marks dirty and
-            // the recompile fires once on drag-end (any_follower_drag edge). ---
-            let lbl_w = 14.0;
-            let half = (area.w - pad * 2.0 - 8.0) / 2.0;
-            ui.label_at(("inspector_mod_a_lbl", i), "A", area.x + pad, my + 4.0, 10.0, TEXT);
-            let a_resp = ui.scrubable_number_at(
-                ("inspector_mod_attack", i),
-                Rect {
-                    x: area.x + pad + lbl_w,
-                    y: my,
-                    w: (half - lbl_w).max(20.0),
-                    h: 20.0,
-                },
-                f64::from(src.attack_ms),
-                1.0,
-                ScrubableNumberFormat::Decimal(1),
-                // attack/release は ms。負値は無意味なので ≥0 にクランプ (range 未設定だと
-                // 下方向ドラッグで負の値が表示されてしまうため)。
-                &ScrubableNumberStyle {
-                    range: Some((0.0, 60_000.0)),
-                    // attack/release は ms。基準 0.004 units/px だと細かすぎるので 10x。
-                    sensitivity: 0.04,
-                    ..SCRUB_STYLE_INSPECTOR
-                },
-                "Inspector",
-                move |v| {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetModSourceAttack { id: sid, ms: v as f32 });
-                    })
-                },
-                None,
-                None, // follower attack はモジュレーション対象でない
-            );
-            let r_x = area.x + pad + half + 8.0;
-            ui.label_at(("inspector_mod_r_lbl", i), "R", r_x, my + 4.0, 10.0, TEXT);
-            let r_resp = ui.scrubable_number_at(
-                ("inspector_mod_release", i),
-                Rect {
-                    x: r_x + lbl_w,
-                    y: my,
-                    w: (half - lbl_w).max(20.0),
-                    h: 20.0,
-                },
-                f64::from(src.release_ms),
-                100.0,
-                ScrubableNumberFormat::Decimal(1),
-                &ScrubableNumberStyle {
-                    range: Some((0.0, 60_000.0)),
-                    // attack/release は ms。基準 0.004 units/px だと細かすぎるので 10x。
-                    sensitivity: 0.04,
-                    ..SCRUB_STYLE_INSPECTOR
-                },
-                "Inspector",
-                move |v| {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetModSourceRelease { id: sid, ms: v as f32 });
-                    })
-                },
-                None,
-                None, // follower release はモジュレーション対象でない
-            );
-            any_follower_drag |=
-                a_resp.dragging || a_resp.editing_text || r_resp.dragging || r_resp.editing_text;
-            my += 22.0;
+            // --- 種別別エディタ行 ---
+            match &src.kind {
+                K::EnvelopeFollower { tap, follower } => {
+                    // row2: [tap 3 段セレクタ][A][R]。drag-end edge で recompile。
+                    // docs/plan_modulation_followups.md §1: Pre-FX (素の音) / Post-FX / Post-Fader。
+                    let tap_w = 64.0;
+                    const TAP_POINTS: [common::model::TapPoint; 3] = [
+                        common::model::TapPoint::PreFx,
+                        common::model::TapPoint::PostFx,
+                        common::model::TapPoint::PostFader,
+                    ];
+                    let tap_labels = ["Pre-FX", "Post-FX", "Post-Fdr"];
+                    let tap_sel =
+                        TAP_POINTS.iter().position(|t| *t == tap.tap_point).unwrap_or(2);
+                    if let Some(picked) = ui.dropdown(
+                        ("inspector_mod_src_tap", i),
+                        Rect { x: lx, y: my, w: tap_w, h: 20.0 },
+                        &tap_labels,
+                        tap_sel,
+                    ) && let Some(&tp) = TAP_POINTS.get(picked)
+                    {
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::SetModSourceTapPoint {
+                                id: sid,
+                                tap_point: tp,
+                            });
+                        }));
+                    }
+                    let rest_x = lx + tap_w + 6.0;
+                    let half = (area.x + area.w - pad - rest_x - 6.0) / 2.0;
+                    let ar_style = ScrubableNumberStyle {
+                        range: Some((0.0, 60_000.0)),
+                        sensitivity: 0.04,
+                        ..SCRUB_STYLE_INSPECTOR
+                    };
+                    ui.label_at(("inspector_mod_a_lbl", i), "A", rest_x, my + 4.0, 10.0, TEXT);
+                    let a_resp = ui.scrubable_number_at(
+                        ("inspector_mod_attack", i),
+                        Rect { x: rest_x + 12.0, y: my, w: (half - 12.0).max(20.0), h: 20.0 },
+                        f64::from(follower.attack_ms),
+                        1.0,
+                        ScrubableNumberFormat::Decimal(1),
+                        &ar_style,
+                        "Inspector",
+                        move |v| {
+                            Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::SetModSourceAttack { id: sid, ms: v as f32 });
+                            })
+                        },
+                        None,
+                        None,
+                    );
+                    let r_x = rest_x + half + 6.0;
+                    ui.label_at(("inspector_mod_r_lbl", i), "R", r_x, my + 4.0, 10.0, TEXT);
+                    let r_resp = ui.scrubable_number_at(
+                        ("inspector_mod_release", i),
+                        Rect { x: r_x + 12.0, y: my, w: (half - 12.0).max(20.0), h: 20.0 },
+                        f64::from(follower.release_ms),
+                        100.0,
+                        ScrubableNumberFormat::Decimal(1),
+                        &ar_style,
+                        "Inspector",
+                        move |v| {
+                            Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::SetModSourceRelease { id: sid, ms: v as f32 });
+                            })
+                        },
+                        None,
+                        None,
+                    );
+                    any_mod_drag |= a_resp.dragging
+                        || a_resp.editing_text
+                        || r_resp.dragging
+                        || r_resp.editing_text;
+                    my += 22.0;
+                }
+                K::Lfo(c) => {
+                    // row2: [shape dd][rate dd][phase scrub]
+                    let shape_w = 56.0;
+                    let shapes = ["Sin", "Tri", "SawU", "SawD", "Sqr", "Pulse"];
+                    let ssel = match c.shape {
+                        common::model::LfoShape::Sine => 0,
+                        common::model::LfoShape::Triangle => 1,
+                        common::model::LfoShape::SawUp => 2,
+                        common::model::LfoShape::SawDown => 3,
+                        common::model::LfoShape::Square => 4,
+                        common::model::LfoShape::Pulse { .. } => 5,
+                    };
+                    if let Some(p) = ui.dropdown(
+                        ("inspector_lfo_shape", i),
+                        Rect { x: lx, y: my, w: shape_w, h: 20.0 },
+                        &shapes,
+                        ssel,
+                    ) {
+                        let shape = match p {
+                            0 => common::model::LfoShape::Sine,
+                            1 => common::model::LfoShape::Triangle,
+                            2 => common::model::LfoShape::SawUp,
+                            3 => common::model::LfoShape::SawDown,
+                            4 => common::model::LfoShape::Square,
+                            _ => common::model::LfoShape::Pulse { width: 0.5 },
+                        };
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::EditModSource { id: sid, edit: E::LfoShape(shape) });
+                        }));
+                    }
+                    let rate_w = 56.0;
+                    mod_rate_control(ui, i_u, Rect { x: lx + shape_w + 6.0, y: my, w: rate_w, h: 20.0 }, &c.rate, sid);
+                    let ph_x = lx + shape_w + rate_w + 12.0;
+                    ui.label_at(("inspector_lfo_ph_lbl", i), "\u{03c6}", ph_x, my + 4.0, 10.0, TEXT);
+                    let ph_resp = ui.scrubable_number_at(
+                        ("inspector_lfo_phase", i),
+                        Rect { x: ph_x + 12.0, y: my, w: (area.x + area.w - pad - ph_x - 12.0).max(20.0), h: 20.0 },
+                        f64::from(c.phase),
+                        0.0,
+                        ScrubableNumberFormat::Decimal(2),
+                        &unit_style,
+                        "Inspector",
+                        move |v| {
+                            Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::EditModSource { id: sid, edit: E::LfoPhase(v as f32) });
+                            })
+                        },
+                        None,
+                        None,
+                    );
+                    any_mod_drag |= ph_resp.dragging || ph_resp.editing_text;
+                    my += 22.0;
+                }
+                K::Random(c) => {
+                    // row2: [mode toggle][rate dd][reroll]
+                    let mode_w = 64.0;
+                    let is_smooth = matches!(c.mode, common::model::RandomMode::Smooth);
+                    ui.button_at(
+                        ("inspector_rand_mode", i),
+                        if is_smooth { "Smooth" } else { "S&H" },
+                        Rect { x: lx, y: my, w: mode_w, h: 20.0 },
+                        move || {
+                            Edit::mutate(move |app: &mut AppData| {
+                                let mode = if is_smooth {
+                                    common::model::RandomMode::SampleHold
+                                } else {
+                                    common::model::RandomMode::Smooth
+                                };
+                                app.handle_event(AppEvent::EditModSource { id: sid, edit: E::RandomMode(mode) });
+                            })
+                        },
+                    );
+                    let rate_w = 56.0;
+                    mod_rate_control(ui, i_u, Rect { x: lx + mode_w + 6.0, y: my, w: rate_w, h: 20.0 }, &c.rate, sid);
+                    let rr_x = lx + mode_w + rate_w + 12.0;
+                    ui.button_at(
+                        ("inspector_rand_reroll", i),
+                        "\u{21bb} seed",
+                        Rect { x: rr_x, y: my, w: (area.x + area.w - pad - rr_x).max(40.0), h: 20.0 },
+                        move || {
+                            Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::EditModSource { id: sid, edit: E::RerollSeed });
+                            })
+                        },
+                    );
+                    my += 22.0;
+                }
+                K::Steps(c) => {
+                    // row2: [-][+][dir][rate][slew]; row3: per-step bars。
+                    let n = c.values.len();
+                    ui.button_at(("inspector_steps_dec", i), "\u{2212}", Rect { x: lx, y: my, w: 22.0, h: 20.0 }, move || {
+                        Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepsCount(n.saturating_sub(1)) });
+                        })
+                    });
+                    ui.button_at(("inspector_steps_inc", i), "+", Rect { x: lx + 26.0, y: my, w: 22.0, h: 20.0 }, move || {
+                        Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepsCount(n + 1) });
+                        })
+                    });
+                    let dirs = ["Fwd", "Bwd", "Ping"];
+                    let dsel = match c.direction {
+                        common::model::StepsDirection::Forward => 0,
+                        common::model::StepsDirection::Backward => 1,
+                        common::model::StepsDirection::PingPong => 2,
+                    };
+                    if let Some(p) = ui.dropdown(("inspector_steps_dir", i), Rect { x: lx + 52.0, y: my, w: 50.0, h: 20.0 }, &dirs, dsel) {
+                        let dir = match p {
+                            0 => common::model::StepsDirection::Forward,
+                            1 => common::model::StepsDirection::Backward,
+                            _ => common::model::StepsDirection::PingPong,
+                        };
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepsDirection(dir) });
+                        }));
+                    }
+                    mod_rate_control(ui, i_u, Rect { x: lx + 106.0, y: my, w: 50.0, h: 20.0 }, &c.rate, sid);
+                    let sl_x = lx + 160.0;
+                    ui.label_at(("inspector_steps_sl_lbl", i), "sl", sl_x, my + 4.0, 9.0, TEXT);
+                    let sl_resp = ui.scrubable_number_at(
+                        ("inspector_steps_slew", i),
+                        Rect { x: sl_x + 16.0, y: my, w: (area.x + area.w - pad - sl_x - 16.0).max(20.0), h: 20.0 },
+                        f64::from(c.slew),
+                        0.0,
+                        ScrubableNumberFormat::Decimal(2),
+                        &unit_style,
+                        "Inspector",
+                        move |v| {
+                            Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepsSlew(v as f32) });
+                            })
+                        },
+                        None,
+                        None,
+                    );
+                    any_mod_drag |= sl_resp.dragging || sl_resp.editing_text;
+                    my += 22.0;
+                    // row3: per-step bars (上下ドラッグで 0..1)、 横幅に収まる数だけ。
+                    let shown = n.min(16);
+                    if shown > 0 {
+                        let cell = (row_w / shown as f32).max(8.0);
+                        for j in 0..shown {
+                            let resp = ui.scrubable_number_at(
+                                ("inspector_step_val", i * 100 + j),
+                                Rect { x: lx + j as f32 * cell, y: my, w: (cell - 2.0).max(6.0), h: 20.0 },
+                                f64::from(c.values[j]),
+                                0.0,
+                                ScrubableNumberFormat::Decimal(2),
+                                &unit_style,
+                                "Inspector",
+                                move |v| {
+                                    Edit::mutate(move |app: &mut AppData| {
+                                        app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepValue { index: j, value: v as f32 } });
+                                    })
+                                },
+                                None,
+                                None,
+                            );
+                            any_mod_drag |= resp.dragging || resp.editing_text;
+                        }
+                    }
+                    my += 22.0;
+                }
+                K::Mseg(c) => {
+                    // row2: [play_mode][rate][+pt][-pt]; row3: per-point value scrubs。
+                    let pmodes = ["1shot", "Loop", "Ping"];
+                    let psel = match c.play_mode {
+                        common::model::MsegPlayMode::OneShot => 0,
+                        common::model::MsegPlayMode::Loop => 1,
+                        common::model::MsegPlayMode::PingPong => 2,
+                    };
+                    if let Some(p) = ui.dropdown(("inspector_mseg_play", i), Rect { x: lx, y: my, w: 56.0, h: 20.0 }, &pmodes, psel) {
+                        let pm = match p {
+                            0 => common::model::MsegPlayMode::OneShot,
+                            1 => common::model::MsegPlayMode::Loop,
+                            _ => common::model::MsegPlayMode::PingPong,
+                        };
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::EditModSource { id: sid, edit: E::MsegPlayMode(pm) });
+                        }));
+                    }
+                    mod_rate_control(ui, i_u, Rect { x: lx + 62.0, y: my, w: 56.0, h: 20.0 }, &c.rate, sid);
+                    let np = c.points.len();
+                    ui.button_at(("inspector_mseg_addpt", i), "+pt", Rect { x: lx + 124.0, y: my, w: 34.0, h: 20.0 }, move || {
+                        Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::EditModSource { id: sid, edit: E::MsegAddPoint { time: 0.5, value: 0.5 } });
+                        })
+                    });
+                    ui.button_at(("inspector_mseg_rmpt", i), "\u{2212}pt", Rect { x: lx + 162.0, y: my, w: 34.0, h: 20.0 }, move || {
+                        Edit::mutate(move |app: &mut AppData| {
+                            if np > 2 {
+                                app.handle_event(AppEvent::EditModSource { id: sid, edit: E::MsegRemovePoint(np - 2) });
+                            }
+                        })
+                    });
+                    my += 22.0;
+                    // row3: per-point の高さ (value) を編集。 time は既存値を保持。
+                    let shown = np.min(8);
+                    if shown > 0 {
+                        let cell = (row_w / shown as f32).max(8.0);
+                        for j in 0..shown {
+                            let t = c.points[j].time;
+                            let resp = ui.scrubable_number_at(
+                                ("inspector_mseg_val", i * 100 + j),
+                                Rect { x: lx + j as f32 * cell, y: my, w: (cell - 2.0).max(6.0), h: 20.0 },
+                                f64::from(c.points[j].value),
+                                0.0,
+                                ScrubableNumberFormat::Decimal(2),
+                                &unit_style,
+                                "Inspector",
+                                move |v| {
+                                    Edit::mutate(move |app: &mut AppData| {
+                                        app.handle_event(AppEvent::EditModSource { id: sid, edit: E::MsegMovePoint { index: j, time: t, value: v as f32 } });
+                                    })
+                                },
+                                None,
+                                None,
+                            );
+                            any_mod_drag |= resp.dragging || resp.editing_text;
+                        }
+                    }
+                    my += 22.0;
+                }
+            }
         }
-        // Recompile follower coefficients once on the scrub drag-end edge.
-        if any_follower_drag != app.mod_follower_scrub_active {
+        // Sync once on the scrub drag-end edge (follower coeffs の recompile +
+        // generator config の schedule `mod_kinds` 反映)。
+        if any_mod_drag != app.mod_follower_scrub_active {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetModFollowerScrubbing(any_follower_drag));
+                app.handle_event(AppEvent::SetModFollowerScrubbing(any_mod_drag));
             }));
         }
 
         // Routings only make sense once a source exists.
         if !mod_sources.is_empty() {
             my += 4.0;
+            // FIXME #56: follower は follow 先トラック名、 generator は種別ラベル。
             let src_name = |sid: u32| -> String {
                 mod_sources
                     .iter()
                     .find(|r| r.id == sid)
-                    .and_then(|r| app.song.track_by_id(r.source_track))
-                    .map(|t| t.name.clone())
+                    .map(|r| match &r.kind {
+                        common::model::ModSourceKind::EnvelopeFollower { tap, .. } => app
+                            .song
+                            .track_by_id(tap.source_track)
+                            .map(|t| t.name.clone())
+                            .unwrap_or_else(|| format!("src {sid}")),
+                        other => other.short_label().to_string(),
+                    })
                     .unwrap_or_else(|| format!("src {sid}"))
             };
             // docs/plan_modulation_routing_redesign.md §6: existing lane 非依存

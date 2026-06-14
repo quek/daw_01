@@ -244,9 +244,17 @@ fn render_loop(
 
         // docs/plan_modulation.md §5: snapshot the prev buffer's follower envs
         // (slot order) so audio-param modulation renders into the WAV too.
+        // FIXME #56: follower は env、 generator は song 位置から直接算出 (live と同経路)。
+        let export_song_secs = playhead as f64 / sample_rate as f64;
         mod_scalars_snapshot.clear();
-        for fs in &schedule.follower_slots {
-            mod_scalars_snapshot.push(fs.env);
+        for (fs, kind) in schedule
+            .follower_slots
+            .iter()
+            .zip(schedule.mod_kinds.iter())
+        {
+            let v = common::modulators::generator_scalar(kind, playhead_beats, export_song_secs)
+                .unwrap_or(fs.env);
+            mod_scalars_snapshot.push(v);
         }
 
         if let Some(pool) = pool_g.as_deref() {
@@ -341,8 +349,16 @@ fn render_loop(
         // `mod_scalars`) keyed by the block beat.
         if env_sidecar.n_sources > 0 {
             env_sidecar.beats.push(playhead_beats as f32);
-            for fs in &schedule.follower_slots {
-                env_sidecar.scalars.push(fs.env);
+            // FIXME #56: follower は env、 generator は song 位置から算出して焼き込む
+            // (render_video は sidecar を sample するだけで全種別を再現)。
+            for (fs, kind) in schedule
+                .follower_slots
+                .iter()
+                .zip(schedule.mod_kinds.iter())
+            {
+                let v = common::modulators::generator_scalar(kind, playhead_beats, export_song_secs)
+                    .unwrap_or(fs.env);
+                env_sidecar.scalars.push(v);
             }
         }
 

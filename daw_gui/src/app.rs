@@ -376,16 +376,66 @@ pub enum InspectorScrubField {
     Text(TextNumField),
 }
 
-/// docs/plan_modulation.md §9: one row of the inspector modulation-source rack.
-#[derive(Debug, Clone, Copy)]
+/// docs/plan_modulation.md §9 / FIXME #56: one row of the inspector
+/// modulation-source rack. `kind` を clone 保持し、 UI が種別別 (follower / LFO /
+/// Random / MSEG / Steps) のエディタを出す。
+#[derive(Debug, Clone)]
 pub struct ModSourceRow {
     pub id: u32,
-    pub source_track: u32,
-    /// Live follower scalar (`0..` ) from the polled `mod_scalars` plane.
+    pub color: [f32; 3],
+    /// Live scalar (`0..=1`) from the polled `mod_scalars` plane — follower env
+    /// または generator 値 (engine が全種別を publish、 FIXME #56)。
     pub scalar: f32,
-    pub post_fader: bool,
-    pub attack_ms: f32,
-    pub release_ms: f32,
+    /// 変調器種別 + 設定。FIXME #56: follower の tap_point (PreFx/PostFx/PostFader、
+    /// docs/plan_modulation_followups.md §1) は `EnvelopeFollower { tap }` 内に内包。
+    pub kind: common::model::ModSourceKind,
+}
+
+/// `AddModSource` で作る変調器の種別タグ (FIXME #56)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModSourceKindTag {
+    Follower,
+    Lfo,
+    Random,
+    Mseg,
+    Steps,
+}
+
+/// generator (LFO/Random/MSEG/Steps) 設定の編集 (consolidated event、 FIXME #56)。
+/// follower の track/attack/release/tap は既存の専用 event を使う。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModSourceEdit {
+    /// 全 generator 共通の rate。
+    Rate(common::model::ModRate),
+    /// 全 generator 共通の retrigger。
+    Retrigger(common::model::RetriggerMode),
+    LfoShape(common::model::LfoShape),
+    LfoPhase(f32),
+    RandomMode(common::model::RandomMode),
+    /// 乱数列を引き直す (seed を派生更新)。
+    RerollSeed,
+    MsegPlayMode(common::model::MsegPlayMode),
+    MsegAddPoint {
+        time: f32,
+        value: f32,
+    },
+    MsegMovePoint {
+        index: usize,
+        time: f32,
+        value: f32,
+    },
+    MsegSetCurve {
+        segment: usize,
+        curve: f32,
+    },
+    MsegRemovePoint(usize),
+    StepsCount(usize),
+    StepValue {
+        index: usize,
+        value: f32,
+    },
+    StepsDirection(common::model::StepsDirection),
+    StepsSlew(f32),
 }
 
 /// per-control modulation で、コントロールの *表示* 値ドメインと target の *model*
@@ -2268,11 +2318,9 @@ impl AppData {
             .filter(|(_, m)| Some(m.owner_track_id) == owner)
             .map(|(i, m)| ModSourceRow {
                 id: m.id,
-                source_track: m.tap.source_track,
+                color: m.color,
                 scalar: self.mod_scalars.get(i).copied().unwrap_or(0.0),
-                post_fader: matches!(m.tap.tap_point, common::model::TapPoint::PostFader),
-                attack_ms: m.follower.attack_ms,
-                release_ms: m.follower.release_ms,
+                kind: m.kind.clone(),
             })
             .collect()
     }
@@ -2334,23 +2382,13 @@ impl AppData {
     /// `ModSource` (Bitwig 流の per-source 色)。source の `mod_sources` 内位置から
     /// 固定パレットを引く (id でなく位置 = 追加順に色が回る)。
     pub fn mod_source_color(&self, source_id: u32) -> [f32; 3] {
-        const PALETTE: [[f32; 3]; 8] = [
-            [0.30, 0.69, 0.96], // blue
-            [0.95, 0.61, 0.24], // orange
-            [0.46, 0.82, 0.40], // green
-            [0.85, 0.40, 0.78], // magenta
-            [0.95, 0.85, 0.30], // yellow
-            [0.40, 0.80, 0.80], // teal
-            [0.90, 0.42, 0.42], // red
-            [0.66, 0.55, 0.92], // purple
-        ];
-        let idx = self
-            .song
+        // FIXME #56: 色は `ModSource.color` が SSoT (作成時に palette から割当)。
+        self.song
             .mod_sources
             .iter()
-            .position(|m| m.id == source_id)
-            .unwrap_or(0);
-        PALETTE[idx % PALETTE.len()]
+            .find(|m| m.id == source_id)
+            .map(|m| m.color)
+            .unwrap_or(common::model::MOD_SOURCE_PALETTE[0])
     }
 
     /// docs/plan_modulation_routing_redesign.md §6: per-control modulation data
@@ -2367,6 +2405,24 @@ impl AppData {
     /// (exact for affine / rotation deg↔rad / log scale targets). `base_norm =
     /// plain_to_norm(target, to_model(display_base))`; the on-edit inverse is
     /// `plain_to_norm(to_model(display_base + d)) − base_norm` (see `build_mod`).
+    /// docs/plan_modulation_followups.md §2: a `PluginParam` target's plain
+    /// `(min, max)` from the `plugin_params` cache (= `PluginParamInfo` shipped
+    /// by the plugin host), for range-aware display normalization. `None` for a
+    /// non-plugin target, an unknown param, or a degenerate range.
+    pub fn plugin_param_range(
+        &self,
+        track_id: u32,
+        target: &common::model::AutomationTarget,
+    ) -> Option<(f64, f64)> {
+        let common::model::AutomationTarget::PluginParam { device_index, param_id, .. } = target
+        else {
+            return None;
+        };
+        let params = self.plugin_params.get(&(track_id, *device_index))?;
+        let info = params.iter().find(|p| p.id == *param_id)?;
+        (info.max_value > info.min_value).then_some((info.min_value, info.max_value))
+    }
+
     pub fn inspector_mod_data(
         &self,
         target: &common::model::AutomationTarget,
@@ -2384,14 +2440,19 @@ impl AppData {
                 }
             };
         let model_base = domain.to_model(target, display_base);
-        let base_norm = f64::from(common::automation::plain_to_norm(target, model_base));
+        // docs/plan_modulation_followups.md §2: plugin params normalize against
+        // their real min/max (identity placeholder would saturate the overlay).
+        let plugin_range = self.plugin_param_range(track_id, target);
+        let base_norm =
+            f64::from(common::automation::plain_to_norm_ranged(target, model_base, plugin_range));
         // Reachable display depth for a normalized `depth`: convert the value the
         // base would reach at full scalar back into the control's display domain.
         // Exact for affine / rotation / log targets (vs. a linear `depth*span`).
         let reach_depth = |depth: f32| -> f64 {
             let reach_norm = (base_norm + f64::from(depth)).clamp(0.0, 1.0);
             #[allow(clippy::cast_possible_truncation)]
-            let reach_model = common::automation::norm_to_plain(target, reach_norm as f32);
+            let reach_model =
+                common::automation::norm_to_plain_ranged(target, reach_norm as f32, plugin_range);
             domain.to_display(target, reach_model) - display_base
         };
         let mut entries: Vec<([f32; 3], f64)> = Vec::new();
@@ -4107,11 +4168,13 @@ pub enum AppEvent {
         port: u8,
         source: Option<u32>,
     },
-    /// docs/plan_modulation.md §9: create a project-level `ModSource` tapping
-    /// `source_track` (PostFader, default follower).
-    AddModSource { source_track: u32 },
+    /// docs/plan_modulation.md §9 / FIXME #56: create a project-level `ModSource`
+    /// of the given kind, owned by the cursor track. follower は cursor track を tap。
+    AddModSource { kind: ModSourceKindTag },
     /// remove the `ModSource` with id `id` and every `ModRouting` referencing it.
     RemoveModSource { id: u32 },
+    /// FIXME #56: generator (LFO/Random/MSEG/Steps) 設定の編集 (consolidated)。
+    EditModSource { id: u32, edit: ModSourceEdit },
     /// **lane 非依存** (`docs/plan_modulation_routing_redesign.md` §5): add a
     /// `ModRouting` on track `track_id` (`MASTER_TRACK_ID` → `song_mod_routings`)
     /// targeting `target`, driven by `ModSource` `source_id`. No-op if a routing
@@ -4155,7 +4218,7 @@ pub enum AppEvent {
     SetModFollowerScrubbing(bool),
     /// docs/plan_modulation.md §6: flip a `ModSource`'s tap point
     /// (`true` = PostFader, `false` = PostFx / pre-fader).
-    SetModSourceTapPoint { id: u32, post_fader: bool },
+    SetModSourceTapPoint { id: u32, tap_point: common::model::TapPoint },
     /// docs/plan_modulation_routing_redesign.md §6: arm / disarm a `ModSource`
     /// for per-control depth assignment (Bitwig 流). `Some(id)` arms; `None`
     /// disarms. While armed, inspector param controls enter depth-drag edit mode.
@@ -4165,7 +4228,7 @@ pub enum AppEvent {
         track_id: u32,
         device_index: u32,
         port: u8,
-        post_fader: bool,
+        tap_point: common::model::TapPoint,
     },
     /// inspector chain (= `Track.devices` / `master_fx_chain` を一列にした list)
     /// の reorder。`order` は gui_01 契約 `new[i] = items[order[i]]`。単一デバイス
@@ -5600,7 +5663,8 @@ impl AppData {
             } => {
                 self.set_sidechain_source(track_id, device_index, port, source);
             }
-            AppEvent::AddModSource { source_track } => self.add_mod_source(source_track),
+            AppEvent::AddModSource { kind } => self.add_mod_source(kind),
+            AppEvent::EditModSource { id, edit } => self.edit_mod_source(id, edit),
             AppEvent::RemoveModSource { id } => self.remove_mod_source(id),
             AppEvent::AddModRouting {
                 track_id,
@@ -5630,16 +5694,16 @@ impl AppData {
             AppEvent::SetModSourceAttack { id, ms } => self.set_mod_source_attack(id, ms),
             AppEvent::SetModSourceRelease { id, ms } => self.set_mod_source_release(id, ms),
             AppEvent::SetModFollowerScrubbing(active) => self.set_mod_follower_scrubbing(active),
-            AppEvent::SetModSourceTapPoint { id, post_fader } => {
-                self.set_mod_source_tap_point(id, post_fader)
+            AppEvent::SetModSourceTapPoint { id, tap_point } => {
+                self.set_mod_source_tap_point(id, tap_point)
             }
             AppEvent::SetArmedModSource(id) => self.armed_mod_source = id,
             AppEvent::SetAuxInputTapPoint {
                 track_id,
                 device_index,
                 port,
-                post_fader,
-            } => self.set_aux_input_tap_point(track_id, device_index, port, post_fader),
+                tap_point,
+            } => self.set_aux_input_tap_point(track_id, device_index, port, tap_point),
             AppEvent::ReorderInspectorChain(order) => {
                 self.reorder_inspector_chain(&order);
             }
@@ -15536,19 +15600,186 @@ impl AppData {
     // すべて `Song` を mutate して `sync_song_to_plugin_host` で締める
     // (audio engine が follower schedule を再 compile、 preview が再合成)。
 
-    fn add_mod_source(&mut self, source_track: u32) {
+    fn add_mod_source(&mut self, tag: ModSourceKindTag) {
+        use common::model::{ModSourceKind, RandomConfig};
         let id = self.song.alloc_mod_source_id();
         // 帰属トラック = カーソルトラック (= このラックを開いているトラック)。以後
-        // inspector ではこのトラックの下にだけ列挙される。follow 先 (tap.source_track)
-        // は初期 = カーソルで、ドロップダウンで別トラックへ変更できる。
-        let owner_track_id = self.cursor_track_id().unwrap_or(source_track);
+        // inspector ではこのトラックの下にだけ列挙される。
+        let owner_track_id = self.cursor_track_id().unwrap_or(0);
+        let color = common::model::ModSource::palette_color(self.song.mod_sources.len());
+        let kind = match tag {
+            // follower の follow 先は初期 = カーソルトラック。
+            ModSourceKindTag::Follower => ModSourceKind::EnvelopeFollower {
+                tap: common::model::AudioTap::post_fader(owner_track_id),
+                follower: common::model::FollowerConfig::default(),
+            },
+            ModSourceKindTag::Lfo => ModSourceKind::Lfo(Default::default()),
+            // seed は source ごとに決定論的かつ相異にする (id から)。
+            ModSourceKindTag::Random => ModSourceKind::Random(RandomConfig {
+                seed: u64::from(id),
+                ..Default::default()
+            }),
+            ModSourceKindTag::Mseg => ModSourceKind::Mseg(Default::default()),
+            ModSourceKindTag::Steps => ModSourceKind::Steps(Default::default()),
+        };
         self.song.mod_sources.push(common::model::ModSource {
             id,
             owner_track_id,
-            tap: common::model::AudioTap::post_fader(source_track),
-            follower: common::model::FollowerConfig::default(),
+            color,
+            kind,
         });
         self.sync_song_to_plugin_host();
+    }
+
+    /// envelope follower の `(tap, follower)` を可変借用 (generator は `None`)。
+    fn mod_source_follower_mut(
+        &mut self,
+        id: u32,
+    ) -> Option<(
+        &mut common::model::AudioTap,
+        &mut common::model::FollowerConfig,
+    )> {
+        self.song
+            .mod_sources
+            .iter_mut()
+            .find(|m| m.id == id)
+            .and_then(|m| {
+                if let common::model::ModSourceKind::EnvelopeFollower { tap, follower } =
+                    &mut m.kind
+                {
+                    Some((tap, follower))
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// FIXME #56: generator (LFO/Random/MSEG/Steps) 設定の編集。`scrub` は連続
+    /// ドラッグ系 (per-frame の recompile を避け dirty のみ、 drag-end で sync)。
+    fn edit_mod_source(&mut self, id: u32, edit: ModSourceEdit) {
+        use common::model::ModSourceKind;
+        let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) else {
+            return;
+        };
+        let mut scrub = false;
+        match edit {
+            ModSourceEdit::Rate(rate) => {
+                if let Some(r) = m.kind.rate_mut() {
+                    *r = rate;
+                }
+            }
+            ModSourceEdit::Retrigger(rt) => {
+                if let Some(r) = m.kind.retrigger_mut() {
+                    *r = rt;
+                }
+            }
+            ModSourceEdit::LfoShape(shape) => {
+                if let ModSourceKind::Lfo(c) = &mut m.kind {
+                    c.shape = shape;
+                }
+            }
+            ModSourceEdit::LfoPhase(p) => {
+                if let ModSourceKind::Lfo(c) = &mut m.kind {
+                    c.phase = p.clamp(0.0, 1.0);
+                }
+                scrub = true;
+            }
+            ModSourceEdit::RandomMode(mode) => {
+                if let ModSourceKind::Random(c) = &mut m.kind {
+                    c.mode = mode;
+                }
+            }
+            ModSourceEdit::RerollSeed => {
+                if let ModSourceKind::Random(c) = &mut m.kind {
+                    // 決定論的に別の seed へ派生 (壁時計/RNG を使わない)。
+                    c.seed = common::modulators::reseed(c.seed);
+                }
+            }
+            ModSourceEdit::MsegPlayMode(pm) => {
+                if let ModSourceKind::Mseg(c) = &mut m.kind {
+                    c.play_mode = pm;
+                }
+            }
+            ModSourceEdit::MsegAddPoint { time, value } => {
+                if let ModSourceKind::Mseg(c) = &mut m.kind {
+                    let p = common::model::MsegPoint {
+                        time: time.clamp(0.0, 1.0),
+                        value: value.clamp(0.0, 1.0),
+                        curve: 0.0,
+                    };
+                    let idx = c
+                        .points
+                        .partition_point(|q| q.time <= p.time)
+                        .clamp(1, c.points.len()); // 両端の間にだけ挿入
+                    c.points.insert(idx, p);
+                }
+            }
+            ModSourceEdit::MsegMovePoint { index, time, value } => {
+                if let ModSourceKind::Mseg(c) = &mut m.kind
+                    && index < c.points.len()
+                {
+                    let n = c.points.len();
+                    // 両端は time 固定 (0.0 / 1.0)、 中間は隣接点間に clamp で単調維持。
+                    if index > 0 && index < n - 1 {
+                        let lo = c.points[index - 1].time + 1e-3;
+                        let hi = c.points[index + 1].time - 1e-3;
+                        c.points[index].time = time.clamp(lo, hi);
+                    }
+                    c.points[index].value = value.clamp(0.0, 1.0);
+                }
+                scrub = true;
+            }
+            ModSourceEdit::MsegSetCurve { segment, curve } => {
+                if let ModSourceKind::Mseg(c) = &mut m.kind
+                    && segment < c.points.len()
+                {
+                    c.points[segment].curve = curve.clamp(-1.0, 1.0);
+                }
+                scrub = true;
+            }
+            ModSourceEdit::MsegRemovePoint(index) => {
+                if let ModSourceKind::Mseg(c) = &mut m.kind
+                    && index > 0
+                    && index + 1 < c.points.len()
+                {
+                    // 両端 (0 と末尾) は削除しない。
+                    c.points.remove(index);
+                }
+            }
+            ModSourceEdit::StepsCount(count) => {
+                if let ModSourceKind::Steps(c) = &mut m.kind {
+                    let count = count.clamp(1, 64);
+                    c.values.resize(count, 0.5);
+                }
+            }
+            ModSourceEdit::StepValue { index, value } => {
+                if let ModSourceKind::Steps(c) = &mut m.kind
+                    && index < c.values.len()
+                {
+                    c.values[index] = value.clamp(0.0, 1.0);
+                }
+                scrub = true;
+            }
+            ModSourceEdit::StepsDirection(dir) => {
+                if let ModSourceKind::Steps(c) = &mut m.kind {
+                    c.direction = dir;
+                }
+            }
+            ModSourceEdit::StepsSlew(slew) => {
+                if let ModSourceKind::Steps(c) = &mut m.kind {
+                    c.slew = slew.clamp(0.0, 1.0);
+                }
+                scrub = true;
+            }
+        }
+        // generator の値は engine が schedule の `mod_kinds` から評価するので、 設定
+        // 変更は recompile で engine に反映する。 連続ドラッグ系は per-frame LoadSong
+        // を避け dirty のみ (drag-end edge で sync、 follower の attack/release と同流儀)。
+        if scrub {
+            self.is_dirty = true;
+        } else {
+            self.sync_song_to_plugin_host();
+        }
     }
 
     fn remove_mod_source(&mut self, id: u32) {
@@ -15658,15 +15889,15 @@ impl AppData {
     }
 
     fn set_mod_source_track(&mut self, id: u32, source_track: u32) {
-        if let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) {
-            m.tap.source_track = source_track;
+        if let Some((tap, _)) = self.mod_source_follower_mut(id) {
+            tap.source_track = source_track;
         }
         self.sync_song_to_plugin_host();
     }
 
     fn set_mod_source_attack(&mut self, id: u32, ms: f32) {
-        if let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) {
-            m.follower.attack_ms = ms.max(0.0);
+        if let Some((_, follower)) = self.mod_source_follower_mut(id) {
+            follower.attack_ms = ms.max(0.0);
         }
         // 係数は recompile 時に bake される。 scrub ドラッグ中の per-frame
         // LoadSong を避けるため dirty マークのみ。 drag-end に sync する
@@ -15675,8 +15906,8 @@ impl AppData {
     }
 
     fn set_mod_source_release(&mut self, id: u32, ms: f32) {
-        if let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) {
-            m.follower.release_ms = ms.max(0.0);
+        if let Some((_, follower)) = self.mod_source_follower_mut(id) {
+            follower.release_ms = ms.max(0.0);
         }
         self.is_dirty = true;
     }
@@ -15690,13 +15921,11 @@ impl AppData {
         self.mod_follower_scrub_active = active;
     }
 
-    fn set_mod_source_tap_point(&mut self, id: u32, post_fader: bool) {
-        if let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) {
-            m.tap.tap_point = if post_fader {
-                common::model::TapPoint::PostFader
-            } else {
-                common::model::TapPoint::PostFx
-            };
+    fn set_mod_source_tap_point(&mut self, id: u32, tap_point: common::model::TapPoint) {
+        // FIXME #56: tap は EnvelopeFollower{tap} 内に内包 (generator には無い)。
+        // dbfed6c の 3 段 TapPoint (PreFx/PostFx/PostFader) をそのまま設定。
+        if let Some((tap, _)) = self.mod_source_follower_mut(id) {
+            tap.tap_point = tap_point;
         }
         // tap_point は schedule の BufRef を変えるので recompile が要る。
         self.sync_song_to_plugin_host();
@@ -15707,7 +15936,7 @@ impl AppData {
         track_id: u32,
         device_index: u32,
         port: u8,
-        post_fader: bool,
+        tap_point: common::model::TapPoint,
     ) {
         let inst = if track_id == common::model::MASTER_TRACK_ID {
             self.song.master_fx_chain.get_mut(device_index as usize)
@@ -15722,11 +15951,7 @@ impl AppData {
                 .get_mut(port as usize)
                 .and_then(|o| o.as_mut())
         {
-            route.tap.tap_point = if post_fader {
-                common::model::TapPoint::PostFader
-            } else {
-                common::model::TapPoint::PostFx
-            };
+            route.tap.tap_point = tap_point;
         }
         self.sync_song_to_plugin_host();
     }

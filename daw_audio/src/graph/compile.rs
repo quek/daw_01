@@ -56,6 +56,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             port_buffers: super::PortBufferPool::new(),
             input_delay_per_track: Vec::new(),
             follower_slots: Vec::new(),
+            mod_kinds: Vec::new(),
         });
     }
 
@@ -379,24 +380,42 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     // it indexes both `follower_slots` and `AudioBridge::mod_scalars`.
     // Coefficients are baked here (recompile-time) so the RT path never
     // derives them (§10).
+    // FIXME #56: `follower_slots` は全 `ModSource` と 1:1 (slot 順 = source 位置 =
+    // `AudioBridge::mod_scalars` index)。envelope follower の slot は EnvelopeFollow
+    // node が `env` を駆動するが、generator (LFO/Random/MSEG/Steps) の slot は inert
+    // で、 engine が `common::modulators::generator_scalar` を `song_beat` から評価して
+    // publish する (`mod_kinds` を保持)。
     let mut follower_slots: Vec<super::follower::FollowerSlot> = Vec::new();
+    let mut mod_kinds: Vec<common::model::ModSourceKind> = Vec::new();
     for (slot, ms) in song
         .mod_sources
         .iter()
         .take(common::audio_bridge::MAX_MOD_SOURCES)
         .enumerate()
     {
-        follower_slots.push(super::follower::FollowerSlot::from_config(
-            &ms.follower,
-            common::audio_bridge::SAMPLE_RATE,
-        ));
-        // docs/plan_modulation.md §6: tap_point で source buffer を解決。
-        // dangling source は follower node を emit しない (scalar は 0 のまま)。
-        if let Some(&src_idx) = id_to_idx.get(&ms.tap.source_track) {
-            nodes_with_pdc.push(NodeOp::EnvelopeFollow {
-                src: tap_bufref(ms.tap.tap_point, src_idx),
-                slot: slot as u32,
-            });
+        mod_kinds.push(ms.kind.clone());
+        match &ms.kind {
+            common::model::ModSourceKind::EnvelopeFollower { tap, follower } => {
+                follower_slots.push(super::follower::FollowerSlot::from_config(
+                    follower,
+                    common::audio_bridge::SAMPLE_RATE,
+                ));
+                // docs/plan_modulation.md §6: tap_point で source buffer を解決。
+                // dangling source は follower node を emit しない (scalar は 0 のまま)。
+                if let Some(&src_idx) = id_to_idx.get(&tap.source_track) {
+                    nodes_with_pdc.push(NodeOp::EnvelopeFollow {
+                        src: tap_bufref(tap.tap_point, src_idx),
+                        slot: slot as u32,
+                    });
+                }
+            }
+            // generator: inert slot (env 未使用、 generator_scalar が値を供給)。
+            _ => {
+                follower_slots.push(super::follower::FollowerSlot::from_config(
+                    &common::model::FollowerConfig::default(),
+                    common::audio_bridge::SAMPLE_RATE,
+                ));
+            }
         }
     }
 
@@ -406,6 +425,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         port_buffers: super::PortBufferPool::new(),
         input_delay_per_track,
         follower_slots,
+        mod_kinds,
     })
 }
 
@@ -418,18 +438,19 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
 /// fx); `dst_index` is the device's position in the chain. dangling
 /// references are skipped (no compile error). `ProcessTrack` of the source
 /// runs earlier, so its scratch is settled by the time the tap copies it.
-/// docs/plan_modulation.md §6: resolve a tap point to the source scratch
-/// buffer. `PostFader` = the track's final output (`TrackScratch`); `PostFx`
-/// = after the device chain but before the volume/pan strip
-/// (`PreFaderScratch`, snapshot guarded in the engine). `PreFx` (the raw,
-/// pre-device-chain signal) needs a dedicated snapshot buffer that isn't
-/// built yet, so it falls back to `PostFx`; the UI only offers PostFader /
-/// PostFx until that lands.
+/// docs/plan_modulation.md §6 / docs/plan_modulation_followups.md §1: resolve a
+/// tap point to the source scratch buffer. `PostFader` = the track's final
+/// output (`TrackScratch`); `PostFx` = after the device chain but before the
+/// volume/pan strip (`PreFaderScratch`, snapshot guarded in the engine);
+/// `PreFx` = the raw signal before the device chain (`PreFxScratch`, snapshot
+/// guarded in the engine). All three snapshots are captured only when a tap
+/// actually needs them.
 fn tap_bufref(tap_point: common::model::TapPoint, src_idx: u32) -> BufRef {
     use common::model::TapPoint;
     match tap_point {
         TapPoint::PostFader => BufRef::TrackScratch(src_idx),
-        TapPoint::PostFx | TapPoint::PreFx => BufRef::PreFaderScratch(src_idx),
+        TapPoint::PostFx => BufRef::PreFaderScratch(src_idx),
+        TapPoint::PreFx => BufRef::PreFxScratch(src_idx),
     }
 }
 
@@ -650,6 +671,16 @@ mod tests {
             }
             other => panic!("expected Mix → Master, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tap_bufref_resolves_three_tap_points() {
+        use common::model::TapPoint;
+        // docs/plan_modulation_followups.md §1: PostFader=TrackScratch,
+        // PostFx=PreFaderScratch, PreFx=専用 PreFxScratch (旧フォールバック撤廃)。
+        assert_eq!(tap_bufref(TapPoint::PostFader, 3), BufRef::TrackScratch(3));
+        assert_eq!(tap_bufref(TapPoint::PostFx, 3), BufRef::PreFaderScratch(3));
+        assert_eq!(tap_bufref(TapPoint::PreFx, 3), BufRef::PreFxScratch(3));
     }
 
     #[test]

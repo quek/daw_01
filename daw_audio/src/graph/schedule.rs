@@ -31,6 +31,13 @@ pub enum BufRef {
     /// and read by a `MixSend` whose send `mode == PreFader`. Indexed by
     /// song-track index, parallel to `TrackScratch`.
     PreFaderScratch(u32),
+    /// A track's **pre-FX** scratch (the raw signal *before* its device
+    /// chain — audio clips / sidechain-aligned input, with no FX applied).
+    /// Captured by `ProcessTrack` / `ProcessGroupFx` just before the device
+    /// loop runs, and read by a `SidechainTap` / `EnvelopeFollow` whose tap
+    /// point is `TapPoint::PreFx`. Indexed by song-track index, parallel to
+    /// `TrackScratch`. docs/plan_modulation_followups.md §1.
+    PreFxScratch(u32),
 }
 
 /// A unit of work in a `Schedule`. The RT thread iterates `Schedule::nodes`
@@ -138,6 +145,12 @@ pub struct Schedule {
     /// resets), persists across buffers within one schedule (like
     /// `delay_lines`).
     pub follower_slots: Vec<super::follower::FollowerSlot>,
+    /// FIXME #56 (docs/plan_fixme_56_modulators.md): per-`ModSource` の種別を
+    /// slot 順 (= `follower_slots` / `AudioBridge::mod_scalars` と 1:1) に保持。
+    /// generator (LFO/Random/MSEG/Steps) は `common::modulators::generator_scalar`
+    /// で `song_beat` から直接算出され、その slot の `follower_slots` 値は使われない
+    /// (inert)。envelope follower の slot は `follower_slots[slot].env` を使う。
+    pub mod_kinds: Vec<common::model::ModSourceKind>,
 }
 
 impl Schedule {
@@ -148,6 +161,7 @@ impl Schedule {
             port_buffers: PortBufferPool::new(),
             input_delay_per_track: Vec::new(),
             follower_slots: Vec::new(),
+            mod_kinds: Vec::new(),
         }
     }
 }
