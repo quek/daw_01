@@ -1816,31 +1816,38 @@ fn resize_gui(
 // --- pipe_loop: multiplex read (commands) + write (events) ---------------
 
 async fn pipe_loop(
-    mut pipe: NamedPipeClient,
+    pipe: NamedPipeClient,
     plugin: PluginThreadSender,
     mut evt_rx: tmpsc::UnboundedReceiver<PluginEvent>,
 ) {
-    loop {
-        tokio::select! {
-            msg = read_msg::<_, MainToChild>(&mut pipe) => {
-                match msg {
-                    Ok(m) => handle_main_to_child(m, &plugin),
-                    Err(e) => {
-                        tracing::info!(error = ?e, "pipe ended");
-                        return;
-                    }
-                }
+    // wire.rs の framing (read_exact / write_all) は **cancellation-unsafe**。
+    // 旧構造の `tokio::select! { read_msg, evt_rx.recv()=>write_msg }` は、
+    // read_msg が大きい body (例: 3.8MB の LoadSong) を読んでいる途中で
+    // evt_rx (= 書き戻し event の flood) が ready になると read future を drop し、
+    // 既に pipe から消費したバイトを捨てる → stream が desync → 次の read が
+    // body の途中を length prefix と誤読 (= 1GB の garbage length) → crash。
+    // pipe を read/write half に split して別タスクで回し、read を絶対に
+    // cancel しない (daw_audio::recv_loop と同じ pattern)。
+    let (mut read_half, mut write_half) = tokio::io::split(pipe);
+    let writer = tokio::spawn(async move {
+        while let Some(evt) = evt_rx.recv().await {
+            let child_msg = ChildToMain::from(evt);
+            if let Err(e) = write_msg(&mut write_half, &child_msg).await {
+                tracing::error!(error = ?e, ?child_msg, "failed to forward plugin event");
+                break;
             }
-            evt = evt_rx.recv() => {
-                let Some(evt) = evt else { return };
-                let child_msg = ChildToMain::from(evt);
-                if let Err(e) = write_msg(&mut pipe, &child_msg).await {
-                    tracing::error!(error = ?e, ?child_msg, "failed to forward plugin event");
-                    return;
-                }
+        }
+    });
+    loop {
+        match read_msg::<_, MainToChild>(&mut read_half).await {
+            Ok(m) => handle_main_to_child(m, &plugin),
+            Err(e) => {
+                tracing::info!(error = ?e, "pipe ended");
+                break;
             }
         }
     }
+    writer.abort();
 }
 
 fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
