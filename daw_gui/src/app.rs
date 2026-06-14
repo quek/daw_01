@@ -374,6 +374,9 @@ pub enum InspectorScrubField {
     ImageFadeIn,
     ImageFadeOut,
     Text(TextNumField),
+    /// FIXME #54 Wave4: 内蔵映像 FX param scrub（device_index, param_id 単位で
+    /// drag stroke を undo 1 step に bracket する）。
+    VideoFx { device_index: u32, param_id: u32 },
 }
 
 /// docs/plan_modulation.md §9 / FIXME #56: one row of the inspector

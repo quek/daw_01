@@ -1303,6 +1303,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 None,
                 modulation,
             );
+            // drag / text 編集の開始・終了 edge で undo を 1 step に bracket（毎フレームの
+            // SetVideoFxParam は非 undoable、stroke 先頭で 1 snapshot）。
+            let active = resp.dragging || resp.editing_text;
+            let scrub_key = crate::app::InspectorScrubField::VideoFx { device_index, param_id };
+            let was_active = app.inspector_scrub_active == Some(scrub_key);
+            if active && !was_active {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.inspector_scrub_active = Some(scrub_key);
+                    app.handle_event(AppEvent::BeginInspectorScrub);
+                }));
+            } else if !active && was_active {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.inspector_scrub_active = None;
+                    app.handle_event(AppEvent::EndInspectorScrub);
+                }));
+            }
             // 変調 depth ドラッグの falling edge で host 再同期（音声 target の depth 反映用）。
             mod_widget::push_mod_drag_resync(ui, app, track_id, &target, resp.mod_dragging);
             y += input_h + 4.0;
