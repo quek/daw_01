@@ -11,12 +11,14 @@ Cargo workspace (Edition 2024)。
 
 ```
 common/            -- 共有型・IPC プロトコル・shared memory・データモデル
-daw_gui/           -- GUI プロセス (gui_01 / daw-ui = winit + wgpu + 自作 immediate-mode UI)
+daw_gui/           -- GUI プロセス (daw-ui = winit + wgpu + 自作 immediate-mode UI)
 daw_audio/         -- Audio Engine プロセス (CPAL)
 daw_plugin_host/   -- Plugin Host プロセス (CLAP/VST3)
+ui/                -- UI ライブラリ daw-ui (旧 gui_01)。crates/{platform,renderer,ui} + examples
 ```
 
-gui_01 は隣の sibling、参照のみ可。実装変更は gui_01 session で。
+UI ライブラリ daw-ui は `ui/` に統合済み (旧 sibling repo gui_01)。同一 workspace・同一
+セッションで直接編集する。UI 固有の技術ガイド・既知の罠は `ui/CLAUDE.md` 参照。
 
 ## Development Workflow
 
@@ -66,7 +68,7 @@ cargo clippy --workspace -- -D warnings
 ### gui_01 (daw-ui) アーキテクチャ要点
 
 - **path 依存**: `daw-ui-platform` / `daw-ui-renderer` / `daw-ui-core` は workspace で
-  `path = "../gui_01/crates/*"` 指定。直接の依存は `winit 0.30` / `raw-window-handle 0.6` も追加
+  `path = "ui/crates/*"` 指定 (統合済み)。直接の依存は `winit 0.30` / `raw-window-handle 0.6` も追加
 - **AppData は plain mutable struct**: Signal/Memo/derive は使わない。派生は method
   (`app.track_headers() -> Vec<TrackHeader>`) として毎フレーム計算。重ければ view 側で 1 frame 分キャッシュ
 - **イベント dispatch**: view から `Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::X))`、
@@ -287,8 +289,8 @@ commit 前にこれを通す**。 詳細は `daw_gui/src/smoke_test.rs`。
 
 ## 参照プロジェクト
 
-- `F:\dev\gui_01` — 自作 GUI ライブラリ (daw-ui)。daw_gui はこれを path 依存で取り込んでいる。
-  API ドキュメントは crate doc-comments、サンプルは `crates/examples/{mixer, arrangement, piano_roll, ...}` 参照。
-  gui_01 への要望・バグ報告・質問は `docs/gui_01_conversation.md` に追記する（gui_01 Claude が同ファイルに直接返信する）
+- `ui/` — 自作 GUI ライブラリ daw-ui (旧 gui_01, 統合済み)。同一 workspace・同一セッションで
+  直接編集する。API は crate doc-comments、サンプルは `ui/crates/examples/{mixer, arrangement,
+  piano_roll, ...}`、UI 固有の技術ガイド・既知の罠は `ui/CLAUDE.md`、設計正本は `ui/docs/plan.html`。
 - `F:\dev\sing_like_coding` — 前作 Rust DAW。IPC, CLAP ホスト, オーディオエンジンの参照実装
 - `%APPDATA%\REAPER\Scripts\yoshino\voicevox\` — VOICEVOX API 統合の参照実装 (Lua)

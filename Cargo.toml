@@ -1,10 +1,25 @@
 [workspace]
 resolver = "3"
-members = ["common", "daw_gui", "daw_audio", "daw_plugin_host"]
+members = [
+    "common",
+    "daw_gui",
+    "daw_audio",
+    "daw_plugin_host",
+    # UI ライブラリ (旧 gui_01 / daw-ui)。daw_01/ui/ に統合 (subtree merge, 履歴保持)。
+    "ui/crates/platform",
+    "ui/crates/renderer",
+    "ui/crates/ui",
+    "ui/crates/examples/*",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# 旧 gui_01 crate (ui/crates/*) が rust-version / license / publish を
+# *.workspace = true で継承するため、 統合に伴いここに集約する。
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
 
 [workspace.dependencies]
 anyhow = "1"
@@ -43,12 +58,51 @@ tracing-appender = "0.2.5"
 reqwest = { version = "0.12", features = ["blocking"] }
 vst3 = "0.3"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D10", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_Storage_Xps", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_WindowsAndMessaging"] }
-daw-ui-platform = { path = "../gui_01/crates/platform" }
-daw-ui-renderer = { path = "../gui_01/crates/renderer" }
-daw-ui-core = { path = "../gui_01/crates/ui" }
+# UI ライブラリ (旧 gui_01)。統合により ../gui_01/crates/* → ui/crates/* へ。
+# この 3 定義が daw_gui と ui/crates 内部の両方の解決元 (単一定義)。
+daw-ui-platform = { path = "ui/crates/platform" }
+daw-ui-renderer = { path = "ui/crates/renderer" }
+daw-ui-core = { path = "ui/crates/ui" }
 winit = "0.30.13"
 raw-window-handle = "0.6.2"
-# Match gui_01 (crates/renderer/Cargo.toml) — passing `wgpu::TextureFormat`
-# across the API boundary needs the same crate version, otherwise the
-# nominal types are incompatible at the language level.
+# 単一 workspace = 単一 Cargo.lock になったので wgpu は ui/crates/renderer と
+# 自動で同一バージョンに unify される (旧来の手動 byte 一致同期は不要)。
 wgpu = "29.0.1"
+
+# 旧 gui_01 の lints。ui/crates/* のみ [lints] workspace = true で opt-in する。
+# daw_01 既存 crate は opt-in しないので pedantic は適用されない。
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# DAW-GUI 設計上 derive(Clone) 等を要求しない方針なので一部 pedantic を緩める
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# 日本語ドキュメントでの偽陽性を避ける
+doc_markdown = "allow"
+# ライフタイム名は明示の方がドキュメントとして読みやすい場面があるため
+elidable_lifetime_names = "allow"
+# 1 関数 1 役で書きやすくするため
+needless_pass_by_value = "allow"
+unreadable_literal = "allow"
+
+# 旧 gui_01 の profile。wgpu/glyphon は debug が遅すぎるので軽く最適化する。
+# profile は workspace 全体 (root のみ有効) なので daw_01 crate にも効く。
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 3            # 依存 crate は full 最適化
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
