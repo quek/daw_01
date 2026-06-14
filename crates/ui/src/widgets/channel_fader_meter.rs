@@ -37,6 +37,7 @@ use crate::id::WidgetId;
 use crate::ui::Ui;
 use crate::widgets::fader::FaderResponse;
 use crate::widgets::level_meter::{LevelMeterStyle, MeterBallistic, meter_content_region};
+use crate::widgets::scrubable_number::Modulation;
 
 /// fader 列と meter 列の間の隙間 (px)。 daw_01 の従来 `METER_GAP` と一致 (group_w 55 =
 /// fader 18 + gap 2 + meter 35 を内部分割で踏襲)。
@@ -47,6 +48,9 @@ pub struct ChannelFaderMeterResponse {
     /// fader 部分のレスポンス。 `displayed_value` は dB (無音 = `f32::NEG_INFINITY`)。
     /// gesture edge 検出には `dragging` を使う。
     pub fader: FaderResponse,
+    /// modulation depth の drag 編集中 (= `fader.mod_dragging` の便宜 re-export、 daw_01 #110)。
+    /// edge 検出で caller が depth の undo bracket を発火する。 base `fader.dragging` とは排他。
+    pub mod_dragging: bool,
     // meter の peak-reset click は widget 内部で消費済み。
 }
 
@@ -61,6 +65,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ///
     /// `on_change(new_db)` が値変化時に `Edit<M>` を発行する (undo/redo は dB 空間、 `fader_at` と同じ
     /// inverse 機構)。 frac0 (下端) は `f32::NEG_INFINITY` で渡る。
+    ///
+    /// `modulation`: `Some` で Bitwig 流 modulation を表示・編集する (daw_01 #110、 #109 knob / #107
+    ///   scrubable の fader 版)。 `None` で従来描画・従来挙動 (完全回帰)。 値ドメインは dB でなく
+    ///   **フェーダーの正規化トラック位置 0..=1** (= つまみの 0=最下端〜1=最上端): 絶対
+    ///   [`Modulation::live_value`](crate::Modulation) は 0..=1、 符号付き [`ModEntry::depth`](crate::ModEntry)
+    ///   / `ModEdit::current_depth` は base 位置からの増減量 (dB/log 写像でなく位置の frac、 polarity と
+    ///   volume↔位置 解決は caller)。 縦トラックに沿った色帯 ([`Modulation::entries`](crate::Modulation)) +
+    ///   可動の水平 live マーク + arm 中の source 色枠/帯を fader 列に cache 外 overlay 描画 (dB 目盛り /
+    ///   メーター / peak と共存、 meter 列へははみ出さない)。 arm 中 (`edit` Some) は thumb の press + 縦
+    ///   drag が base(音量) でなく depth を変化させ `on_mod_change` を発火する (base 移動抑止 = 非破壊)。
     #[allow(clippy::too_many_arguments)]
     pub fn channel_fader_meter<F>(
         &mut self,
@@ -75,6 +89,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         style: LevelMeterStyle,
         label: &'static str,
         on_change: F,
+        modulation: Option<Modulation<'_, M>>,
     ) -> ChannelFaderMeterResponse
     where
         F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
@@ -103,24 +118,26 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             style.scale,
             label,
             on_change,
+            modulation,
         );
 
         // hit-test を真に「列で分離」 にする: thumb は THUMB_W=28 で fader_w (=18 等) より広く、
-        // 右へ ~3px はみ出して meter 列に食い込む。 fader がこのフレームの press で drag を掴んだら
-        // その press を消費し、 続く meter_body の peak-reset が同 press を二重処理しないようにする
-        // (= 重なり領域では fader が優先。 fader を掴まない純粋な meter 列 press は従来どおり reset)。
+        // 右へ ~3px はみ出して meter 列に食い込む。 fader が base drag を掴んだら その press を消費し、
+        // 続く meter_body の peak-reset が同 press を二重処理しないようにする (= 重なり領域では fader が
+        // 優先。 fader を掴まない純粋な meter 列 press は従来どおり reset)。 depth gesture (#110) は
+        // fader_core が内部で既に consume 済なので、 ここは base drag だけを見れば足りる。
         if fader.dragging && self.pointer.primary_just_pressed {
             self.consume_pointer_click();
         }
 
         // meter (右列): 同じ region.y / region.h を縦 content として meter_body に渡す。
-        // meter_body は meter_col 内の primary press を peak reset として消費する (上の consume で
-        // fader が掴んだ press は既に除かれているので衝突しない)。
+        // meter_body は meter_col 内の primary press を peak reset として消費する (上の consume +
+        // depth の fader_core consume で fader が掴んだ press は既に除かれているので衝突しない)。
         let meter_wid = WidgetId::ROOT.child((b"cfm_meter", &id));
         let content = Rect { x: meter_col.x, y: region.y, w: meter_col.w, h: region.h };
         self.meter_body(meter_wid, meter_col, content, l, r, ballistic, &style);
 
-        ChannelFaderMeterResponse { fader }
+        ChannelFaderMeterResponse { mod_dragging: fader.mod_dragging, fader }
     }
 }
 
@@ -187,6 +204,7 @@ mod tests {
                     style(),
                     "Volume",
                     |new_db| Edit::mutate(move |m: &mut Vol| m.db = new_db),
+                    None,
                 );
             },
         );

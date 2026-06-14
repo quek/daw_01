@@ -78,6 +78,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     },
                     "Volume",
                     |_new_db| daw_ui_core::Edit::mutate(|()| {}),
+                    None,
                 );
             }
 

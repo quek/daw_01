@@ -28,6 +28,7 @@ members = [
     "crates/examples/text_align_snapshot",
     "crates/examples/scrubable_number_modulation_snapshot",
     "crates/examples/knob_modulation_snapshot",
+    "crates/examples/fader_modulation_snapshot",
 ]
 
 [workspace.package]

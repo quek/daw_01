@@ -89,6 +89,7 @@ fn main() {
                 None,
                 "fader",
                 |v| Edit::mutate(move |m: &mut Model| m.volume = v),
+                None,
             );
             let _ = ui.fader("vol2", m.volume, 0.0, None, "fader", |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)

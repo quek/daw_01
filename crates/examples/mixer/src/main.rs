@@ -264,7 +264,7 @@ impl App {
                                 m.faders[i] = v;
                                 m.last_action = format!("ch{} fader = {v:.2}", i + 1);
                             })
-                        });
+                        }, None);
                     let percent = (resp.displayed_value * 100.0).round() as i32;
                     ui.label_at(
                         ("fader_pct", i),

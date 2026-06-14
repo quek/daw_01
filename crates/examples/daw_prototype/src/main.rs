@@ -868,7 +868,7 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
         let cur = m.faders[ch];
         let _resp: FaderResponse = ui.fader_at(("ch_fader", ch), fader_rect, cur, 0.7, None, "fader", move |v| {
             Edit::mutate(move |m: &mut DawModel| m.faders[ch] = v)
-        });
+        }, None);
 
         // ステレオ level meter: 全 ch に dB 目盛り + 数値ピーク (Ableton Live 風、 #074)。
         // L/R を少し変えてステレオを可視化。
@@ -1358,6 +1358,7 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     mm.last_action = format!("minimix: track {tid} → {v:.2}");
                 })
             },
+            None,
         );
         // track 番号 label
         let label = format!("{}", i + 1);
