@@ -388,8 +388,13 @@ pub enum ModControlDomain {
     /// 表示値 == target の model plain 値。`to_model`/`to_display` で変換
     /// (恒等 = image/group pos、回転 = deg↔rad)。
     Plain { to_model: fn(f64) -> f64, to_display: fn(f64) -> f64 },
-    /// 表示値 == target の正規化 0..=1 (knob / fader のトラック位置)。
+    /// 表示値 == target の正規化 0..=1 (knob のトラック位置 = `plain_to_norm`)。
     Norm,
+    /// 表示値 == フェーダーの正規化トラック位置 0..=1 (dB taper、gui_01 #110)。
+    /// volume(amp) ↔ frac を `scale` (= フェーダーに渡すのと同じ `MeterScale`) の
+    /// dB↔frac 写像で橋渡しする。model depth は従来どおり線形 (volume/2) 空間に
+    /// 留まる (engine の `fill_track_param_ramps` がその空間で消費するため)。
+    FaderDb(daw_ui_core::MeterScale),
 }
 
 impl ModControlDomain {
@@ -399,13 +404,24 @@ impl ModControlDomain {
         match self {
             ModControlDomain::Plain { to_model, .. } => to_model(display),
             ModControlDomain::Norm => common::automation::norm_to_plain(target, display as f32),
+            // frac → dB → volume amp。
+            ModControlDomain::FaderDb(scale) => {
+                let db = scale.frac_to_db(display as f32);
+                10f64.powf(f64::from(db) / 20.0)
+            }
         }
     }
     /// target の model plain 値 → コントロール表示値。
+    #[allow(clippy::cast_possible_truncation)]
     pub fn to_display(self, target: &common::model::AutomationTarget, model: f64) -> f64 {
         match self {
             ModControlDomain::Plain { to_display, .. } => to_display(model),
             ModControlDomain::Norm => f64::from(common::automation::plain_to_norm(target, model)),
+            // volume amp → dB → frac (volume<=0 は −∞dB = frac 下端)。
+            ModControlDomain::FaderDb(scale) => {
+                let db = if model > 0.0 { 20.0 * (model as f32).log10() } else { f32::NEG_INFINITY };
+                f64::from(scale.db_to_frac(db))
+            }
         }
     }
 }

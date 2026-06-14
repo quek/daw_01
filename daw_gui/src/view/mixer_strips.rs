@@ -490,10 +490,23 @@ fn draw_strip(
     // group rect (group_w = FADER_W + METER_GAP + METER_SCALE_W = 55) を渡すと
     // widget が内部で fader 列 (fader_w) と meter 列に分割し、両者の高さ写像が
     // 構造的に一致する (旧 fader_at + level_meter_stereo 別置きの ~13px ズレ解消)。
+    let vol_scale = MeterScale::default();
     let style = LevelMeterStyle {
-        scale: Some(MeterScale::default()),
+        scale: Some(vol_scale),
         peak_readout: true,
         ..LevelMeterStyle::default()
+    };
+    // per-control modulation (docs/plan_modulation_routing_redesign.md §6, gui_01
+    // #110): 音量フェーダーを音でドラッグ変調。表示ドメインは「フェーダーの正規化
+    // トラック位置」(dB taper) なので base も `MeterScale::db_to_frac(dB)` の frac で
+    // 渡し、`ModControlDomain::FaderDb` が volume(amp) ↔ frac を解決する。master は
+    // 変調対象外 (cursor_modulatable_targets と同様)。
+    let vol_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
+    let vol_mod = if is_master {
+        None
+    } else {
+        let base_frac = f64::from(vol_scale.db_to_frac(fader_db));
+        Some(build_mod(app, vol_target.clone(), base_frac, ModControlDomain::FaderDb(vol_scale), track_idx))
     };
     let resp = ui.channel_fader_meter(
         ("mixer_strip_fader", layout_idx),
@@ -519,6 +532,7 @@ fn draw_strip(
                 }
             })
         },
+        vol_mod.as_ref().map(|m| m.modulation()),
     );
     // Phase 4 Step B: master strip は automation target を持たないので skip。
     if !is_master {
@@ -530,6 +544,7 @@ fn draw_strip(
             was_dragging_vol,
             resp.fader.dragging,
         );
+        push_mod_drag_resync(ui, app, track_idx, &vol_target, resp.mod_dragging);
     }
 }
 
