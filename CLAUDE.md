@@ -29,6 +29,17 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ```
 
+### vendored FFmpeg（fresh machine / worktree で必須）
+
+- `third_party/ffmpeg`（BtbN n7.1 win64 LGPL shared）は **gitignore** で checkout には入らない。
+  fresh なマシン / worktree では **`make fetch-ffmpeg`** で取得する（idempotent。`make build` /
+  `test` / `check` の前提条件にも入れてある。BtbN の asset 名変更に耐えるよう URL 固定でなく
+  latest リリースの asset 一覧から n7.1 lgpl-shared を発見して DL する）。
+- git に無いので **rm / `git worktree remove` で third_party junction を辿ると本体が消えて
+  復元不能**になる（2026-06-14 に worktree 削除が内部の third_party junction を辿って本体を
+  削除した事故あり → `make fetch-ffmpeg` で復旧）。worktree を消す前に内部の reparse point を
+  `cmd //c rmdir <junction>` で外してから削除すること。
+
 ### ビルドと検証の区別（重要）
 
 - `cargo clippy` / `cargo check` / `cargo test` は**実行バイナリを生成しない** or 生成してもテストビルドのみ。

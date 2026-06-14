@@ -1,7 +1,7 @@
 # rsmpeg (in-process libav) build config — docs/plan_video_export_libav.md.
 #
-# FFmpeg = BtbN `ffmpeg-n7.1-latest-win64-lgpl-shared` under third_party/ffmpeg
-# (gitignored, fetched per machine). soname: avcodec-61 / avformat-61 /
+# FFmpeg = BtbN n7.1 win64 LGPL shared under third_party/ffmpeg (gitignored,
+# fetched per machine via `make fetch-ffmpeg`). soname: avcodec-61 / avformat-61 /
 # avutil-59 / swscale-8 / swresample-5. rusty_ffmpeg pinned to 0.16.5
 # (= +ffmpeg.7.1) in Cargo.lock; cargo otherwise picks 0.16.7 (+ffmpeg.8)
 # because it ignores `+build` metadata.
