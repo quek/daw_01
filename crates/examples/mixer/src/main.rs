@@ -292,7 +292,7 @@ impl App {
                                     format!("ch{} pan = R{:.0}", i + 1, lr * 100.0)
                                 };
                             })
-                        });
+                        }, None);
                     let lr = (kresp.displayed_value - 0.5) * 2.0;
                     let pan_label = if lr.abs() < 0.02 {
                         "C".to_string()

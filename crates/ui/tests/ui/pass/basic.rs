@@ -101,6 +101,7 @@ fn main() {
                 0.5,
                 "knob",
                 |v| Edit::mutate(move |m: &mut Model| m.volume = v),
+                None,
             );
             let _ = ui.knob("pan2", m.volume, 0.5, "knob", |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)
