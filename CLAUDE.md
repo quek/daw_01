@@ -78,7 +78,8 @@ cargo clippy --workspace -- -D warnings
   ピアノロール / アレンジビュー等の大量描画はこの中で `push_rect / push_text / push_lines` を呼ぶ
 - **Edit<M>**: `Box<dyn FnOnce(&mut M) + Send + 'static>`。view 内クロージャから直接モデル変更可
 - **WindowBackend**: `daw-ui-platform::WindowBackend` trait を満たす型を `Renderer<W>` に渡す。
-  daw_gui は `view/window.rs::DawGuiWindow` で winit::Window をラップ
+  daw_gui は `daw_ui_platform::WinitWindow` (上流の正準実装) を直接使う
+  (Phase 4 で手写しミラー DawGuiWindow を撤去。TSF/IME 配線・入力 mapping も上流に一本化)
 - **イベントループ**: `view/runner.rs::Runner` が `winit::ApplicationHandler<AppEvent>` を実装。
   WindowEvent → `daw_ui_platform::AppEvent` 変換 + InputAccumulator ingest、user_event →
   `AppData::handle_event` dispatch、IME 差分管理、Win32 cursor 位置補正
