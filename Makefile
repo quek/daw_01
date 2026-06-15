@@ -1,4 +1,4 @@
-.PHONY: help build run test clippy clean release run-release fmt check fetch-ffmpeg
+.PHONY: help build run test clippy clean release run-release fmt check fetch-ffmpeg rm-worktree rm-worktrees-merged
 
 .DEFAULT_GOAL := release
 
@@ -29,6 +29,8 @@ help:
 	@echo "  make fmt           cargo fmt"
 	@echo "  make fetch-ffmpeg  third_party/ffmpeg を取得 (無ければ DL、各マシン 1 回)"
 	@echo "  make clean         target/ を削除"
+	@echo "  make rm-worktree NAME=<name>   マージ済み worktree を安全に削除 (junction 安全 + ロック解除 + branch 削除)"
+	@echo "  make rm-worktrees-merged       マージ済み worktree を全部削除"
 
 # third_party/ffmpeg を取得する (gitignore なので checkout では入らない)。
 # avcodec.lib があれば skip (idempotent)。再取得は: rm -rf third_party/ffmpeg && make fetch-ffmpeg
@@ -82,3 +84,15 @@ fmt:
 
 clean:
 	cargo clean
+
+# マージ済み worktree を安全に削除する (junction を辿って vendored ffmpeg を消す事故を防ぎ、
+# rust-analyzer / daw exe のロックを外し、git worktree 解除 + branch 削除まで一括)。
+# マージ時は .githooks が自動でこれを呼ぶ。手動で消したいときだけ使う。
+# 使い方: make rm-worktree NAME=fixme-64-...   (未マージ/dirty は拒否。FORCE=1 で強制)
+rm-worktree:
+	@[ -n "$(NAME)" ] || { echo "usage: make rm-worktree NAME=<worktree-name> [FORCE=1]"; exit 1; }
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cleanup_worktree.ps1 -Name "$(NAME)" $(if $(FORCE),-Force,)
+
+# マージ済み (自分の commit が全部 main に入っている) worktree を全部削除する。
+rm-worktrees-merged:
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cleanup_worktree.ps1 -All
