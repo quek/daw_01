@@ -57,13 +57,18 @@ cargo clippy --workspace -- -D warnings
   `ui/crates/examples/*` (daw-ui-example-*) は実行に不要で、release link (lto=thin /
   codegen-units=1) が重く `--workspace` 全体を遅くしていた主因なので除外する (FIXME #65)。
   daw_gui が common / daw-ui-* lib を transitively 引くので runtime 依存はすべて build される。
-- 自動化は **git-native post-commit hook** で行う（`.githooks/post-commit` →
-  `scripts/release_build_bg.ps1` を detached 起動。`core.hooksPath = .githooks`）。
-  commit の起動手段（Bash/PowerShell ツール・手動・`!` passthrough）に依存せず必ず発火する。
+- 自動化は **git-native hook** で行う（`core.hooksPath = .githooks`）。共通トリガーは
+  `.githooks/lib/release_build_trigger.sh`（main ブランチでのみ `scripts/release_build_bg.ps1`
+  を detached 起動）で、**post-commit と post-merge の両方**から source する。
+  commit / merge の起動手段（Bash/PowerShell ツール・手動・`!` passthrough）に依存せず発火する。
   hook は **main 以外のブランチ（= 各 worktree の feature ブランチ）では skip** し、release
-  検証は main への統合 (merge) commit 時に行う（clean merge は post-commit が branch=main /
-  MERGE_HEAD 無しで発火する。実測確認済み）。ビルドは非ブロッキング、結果は
-  `target/release-build.log`、失敗時は `target/.release-build-failed` marker + ダイアログ。
+  検証は main への統合時に行う。**重要**: git は `git commit` で post-commit を、`git merge` /
+  `git pull` で post-merge を発火する（git 2.50 で実測。**merge コミット生成でも post-commit は
+  一切呼ばれない**ので post-commit only だと merge 統合が release build されない穴があった。
+  FIXME #66 follow-up で発覚・修正）。直接 commit / fast-forward / no-ff merge / conflict 解決
+  commit / pull の全経路がちょうど 1 回 build される（rebase / am 中の build storm は lib 側で
+  skip）。ビルドは非ブロッキング、結果は `target/release-build.log`、失敗時は
+  `target/.release-build-failed` marker + ダイアログ。
 - Claude 自身も **main への commit 後に**
   `cargo build --release -p daw_gui -p daw_audio -p daw_plugin_host` を実行して green を確認する
   （hook の background build と cargo の target lock で直列化されるので二重ビルドにはならない）。
