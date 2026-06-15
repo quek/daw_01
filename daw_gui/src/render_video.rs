@@ -49,6 +49,14 @@ pub struct RenderConfig<'a> {
     /// Average AAC audio bitrate. 192 kbit/s is the YouTube / SoundCloud
     /// upload sweet spot for music.
     pub audio_bitrate: u32,
+    /// FIXME #55: user-chosen export window in **beats**, `(start_beat,
+    /// end_beat)`. `None` = whole song (frame 0 → `length_beats`). When
+    /// `Some`, the frame loop renders only `[start_beat, end_beat)`, with
+    /// the first output frame mapped to `start_beat`. The muxed
+    /// `audio_wav_path` must already be trimmed to the same window (the
+    /// audio export writes only its requested frame range starting at
+    /// sample 0), so video and audio stay aligned at output frame 0.
+    pub range_beats: Option<(f64, f64)>,
 }
 
 impl<'a> RenderConfig<'a> {
@@ -60,6 +68,7 @@ impl<'a> RenderConfig<'a> {
             audio_wav_path: None,
             video_bitrate: 5_000_000,
             audio_bitrate: 192_000,
+            range_beats: None,
         }
     }
 
@@ -70,6 +79,13 @@ impl<'a> RenderConfig<'a> {
 
     pub fn with_audio_wav(mut self, path: Option<&'a Path>) -> Self {
         self.audio_wav_path = path;
+        self
+    }
+
+    /// FIXME #55: restrict the rendered window to `[start_beat, end_beat)`.
+    /// `None` renders the whole song (default).
+    pub fn with_range_beats(mut self, range: Option<(f64, f64)>) -> Self {
+        self.range_beats = range;
         self
     }
 }
@@ -251,15 +267,36 @@ pub fn render_mp4_cancellable(
     // BGRA8 with avcodec + swscale. Replaces the MF SW decode + ffmpeg.exe
     // fallback, which silently dropped 10-bit video in the export's SW path.
     let mut decoder = crate::libav_decoder::LibavVideoDecoder::new();
-    let total_seconds = beat_to_seconds(cfg.song.length_beats, cfg.song.bpm);
-    let total_frames = (total_seconds * f64::from(framerate)).ceil() as u64;
+    // FIXME #55: render only the chosen beat window (default = whole song).
+    // `start_beat` becomes output frame 0; the audio WAV muxed in is already
+    // trimmed to the same window starting at its own sample 0, so A/V stay
+    // aligned. Clamp into [0, length_beats] and require end > start (the GUI
+    // validates this too, but never trust a cross-process payload).
+    let (start_beat, end_beat) = match cfg.range_beats {
+        Some((s, e)) => {
+            let s = s.clamp(0.0, cfg.song.length_beats);
+            let e = e.clamp(0.0, cfg.song.length_beats);
+            (s.min(e), s.max(e))
+        }
+        None => (0.0, cfg.song.length_beats),
+    };
+    let window_seconds = beat_to_seconds(end_beat - start_beat, cfg.song.bpm);
+    let total_frames = (window_seconds * f64::from(framerate)).ceil() as u64;
     let mut scene = Scene::new();
     // Opaque black backdrop — matches the pre-P2 CPU path (= the canvas
     // was cleared to (0,0,0,255) before any blit). Letterboxed video
     // layers leave bars; uncovered regions read as black.
     scene.clear_color = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 
-    tracing::info!(total_frames, out_w, out_h, "export: starting frame loop");
+    tracing::info!(
+        total_frames,
+        out_w,
+        out_h,
+        start_beat,
+        end_beat,
+        is_range = cfg.range_beats.is_some(),
+        "export: starting frame loop"
+    );
     let mut cancelled = false;
     // Phase 2b (gui_01 #077 submit_readback/finish_readback): 1-frame-ahead
     // async readback. At the top of iteration N, `pending` holds frame N-1's
@@ -289,8 +326,10 @@ pub fn render_mp4_cancellable(
             break;
         }
         on_progress(frame_index, total_frames);
+        // Output frame 0 maps to `start_beat` (= the window origin), so a
+        // range export starts compositing at the chosen position.
         let frame_seconds = frame_index as f64 / f64::from(framerate);
-        let playhead_beat = seconds_to_beat(frame_seconds, cfg.song.bpm);
+        let playhead_beat = start_beat + seconds_to_beat(frame_seconds, cfg.song.bpm);
         // docs/plan_modulation.md §7: sample the baked follower envelopes at
         // this frame's beat (step / sample-and-hold), same composition as live.
         mod_sidecar.sample_at(playhead_beat, &mut mod_scalars_buf);

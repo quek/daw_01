@@ -361,6 +361,7 @@ fn spawn_incoming_bridge(
                 ChildToMain::ExportWavProgress { done, total } => {
                     Some(AppEvent::ExportWavProgress { done, total })
                 }
+                ChildToMain::PluginsReinitDone => Some(AppEvent::PluginsReinitDone),
                 ChildToMain::BounceClipFxComplete {
                     path,
                     source_track,

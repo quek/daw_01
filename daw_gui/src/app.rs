@@ -638,6 +638,32 @@ pub struct SendPickerState {
     pub src_track_id: u32,
 }
 
+/// FIXME #55: どの種類の export がレンジピッカーを開いたか。 ピッカー確定後に
+/// 元の export action へ戻るための分岐に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportRangeKind {
+    /// File → Export WAV...
+    Wav,
+    /// File → Export Video... (mp4)。 Windows 専用。
+    Mp4,
+}
+
+/// FIXME #55: Export WAV / Video の前に出すレンジピッカーモーダルの状態。
+/// `Some` の間だけ `export_range_modal` が描画され、 下の UI 操作をブロック
+/// する。 Ardour / REAPER の time-selection export に倣い、 ユーザーが書き出す
+/// 時間範囲を **拍 (beat)** で選ぶ。 拍は song の native 単位なので audio
+/// (beat→sample) と video (frame→秒→拍) の両 export が同じ窓で揃い、 A/V sync
+/// が崩れない。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExportRangePicker {
+    /// 開始拍 (0 以上、 `end_beat` 未満)。
+    pub start_beat: f64,
+    /// 終了拍 (`start_beat` より大、 song 長以下)。
+    pub end_beat: f64,
+    /// 確定後に戻る export 種別。
+    pub kind: ExportRangeKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClipRef {
     pub track: u32,
@@ -882,6 +908,9 @@ pub const ARRANGE_PX_PER_BEAT: f32 = 24.0;
 pub const ARRANGE_TRACK_HEIGHT: f32 = 88.0;
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
+/// FIXME #55: export レンジの最小幅 (拍)。 start == end の縮退で 0 フレームの
+/// 出力を作らないよう、 end は常に start + これ以上に保つ。
+pub const MIN_EXPORT_RANGE_BEATS: f64 = 0.25;
 /// 鍵盤レーン click のプレビュー発音 velocity (MIDI 0..=127、 固定値)。
 /// gui_01 #055: widget は押下 pitch のみ返すので velocity は daw_01 側で固定。
 const PREVIEW_VELOCITY: u8 = 100;
@@ -953,6 +982,10 @@ pub enum ExportStage {
     /// **frame 数**。
     VideoRender { done: u64, total: u64 },
 }
+
+/// FIXME #55: a WAV export held while plugins reinitialise — `(path,
+/// range_frames, write_mod_sidecar)`. See [`AppData::pending_export`].
+pub type PendingExport = (std::path::PathBuf, Option<(u64, u64)>, bool);
 
 pub struct AppData {
     // -------- Song / file --------
@@ -1626,6 +1659,21 @@ pub struct AppData {
     pub pending_video_export: Option<std::path::PathBuf>,
     /// 自動レンダリングした音声 temp WAV。video export 完了後に削除する。
     pub export_temp_wav: Option<std::path::PathBuf>,
+    /// FIXME #55: video export 待ちの **拍** レンジ `(start_beat, end_beat)`。
+    /// `pending_video_export` と対で立ち、 `ExportWavComplete` で video render を
+    /// 始めるときに `RenderConfig::with_range_beats` へ渡す (音声 temp WAV も
+    /// 同じ窓に trim 済みなので A/V が揃う)。 `None` = 全曲。
+    pub pending_video_export_range: Option<(f64, f64)>,
+    /// FIXME #55: a WAV export request held while the plugin host reinitialises
+    /// all plugins (deactivate→activate) for a clean offline cold render. Set by
+    /// [`Self::begin_wav_export`] (which sends `ReinitPluginsForExport`); fired
+    /// as `MainToChild::ExportWav` on `AppEvent::PluginsReinitDone`. Tuple is
+    /// `(path, range_frames, write_mod_sidecar)`.
+    pub pending_export: Option<PendingExport>,
+    /// FIXME #55: Export WAV / Video のレンジピッカーモーダルの状態。 `Some` の
+    /// 間だけ `export_range_modal` を描画してレンジ確定を待つ。 確定後は元の
+    /// export action (file dialog) を `kind` に応じて起動する。 `None` = 非表示。
+    pub export_range_picker: Option<ExportRangePicker>,
 
     /// docs/plan_text_overlay.md §4 P5: text inspector の文字列 edit buffer。
     /// `text` / `font_family` は文字列 field なので text_input のまま
@@ -1800,10 +1848,16 @@ impl raw_window_handle::HasDisplayHandle for Win32Parent {
 pub enum FileDialogKind {
     /// プロジェクト (.daw) を開く。
     OpenProject,
-    /// video export の mp4 出力先 (Windows のみ到達)。
-    ExportMp4,
-    /// WAV 書き出し。
-    ExportWav,
+    /// video export の mp4 出力先 (Windows のみ到達)。 FIXME #55: レンジ
+    /// ピッカーで選んだ書き出し窓 (拍)。 `None` = 全曲。
+    ExportMp4 {
+        range_beats: Option<(f64, f64)>,
+    },
+    /// WAV 書き出し。 FIXME #55: レンジピッカーで選んだ書き出し窓 (sample
+    /// frame; beat→frame 変換済み)。 `None` = 全曲。
+    ExportWav {
+        range: Option<(u64, u64)>,
+    },
     /// MIDI (SMF) 書き出し。
     ExportMidi,
     /// オーディオ取り込み (複数可)。
@@ -2030,6 +2084,9 @@ impl AppData {
             export_cancel: None,
             pending_video_export: None,
             export_temp_wav: None,
+            pending_video_export_range: None,
+            pending_export: None,
+            export_range_picker: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             // 実値は new 末尾で `app.saved_song = app.song.clone()` に上書き
@@ -4504,6 +4561,8 @@ pub enum AppEvent {
     RefetchSingers,
 
     // -------- WAV export -------------------------------------------------
+    /// File → Export WAV...: open the FIXME #55 range picker (default窓 = 全曲)。
+    /// 確定で `ConfirmExportRange` → file dialog → freewheel render。
     ExportWav,
     /// daw_audio の offline WAV render 完了通知。`cancelled` はユーザー中断
     /// (`CancelExport`)、`error` は失敗理由（成功は両方 None/false）。型で
@@ -4513,6 +4572,24 @@ pub enum AppEvent {
     /// (sample 数)。`export_stage` を `AudioRender` に更新して進捗オーバーレイに
     /// 反映する。標準 WAV export / video export 前段のどちらでも来る。非 undoable。
     ExportWavProgress { done: u64, total: u64 },
+    /// FIXME #55: the plugin host finished reinitialising all plugins for an
+    /// offline cold render → send the stashed `ExportWav` now (clean state).
+    PluginsReinitDone,
+
+    // -------- Export range picker (FIXME #55) ----------------------------
+    /// レンジピッカーの開始拍を更新 (scrubable_number から)。 end 未満 / 0 以上に
+    /// clamp。
+    SetExportRangeStart(f64),
+    /// レンジピッカーの終了拍を更新 (scrubable_number から)。 start 超 / song 長
+    /// 以下に clamp。
+    SetExportRangeEnd(f64),
+    /// レンジピッカーを「全曲」 (start=0, end=length_beats) に戻す。
+    ResetExportRange,
+    /// レンジピッカーを確定し、 `kind` に応じた export action (file dialog) を
+    /// 起動する。 picker は閉じる。
+    ConfirmExportRange,
+    /// レンジピッカーを破棄して export を中止する。
+    CancelExportRange,
     /// Phase 7 B4 Step E (2026-05-13): MIDI export menu trigger。 rfd で
     /// path 取得 → `midi_export::export_midi(&song, &path)` で SMF1 書き出し。
     /// 失敗時は status_message に error を出すのみ (= モーダル無し)。
@@ -4629,13 +4706,15 @@ pub enum AppEvent {
         path: Option<PathBuf>,
     },
 
-    /// Synchronous mp4 render at `output_path`, optionally muxing the
-    /// PCM Float32 WAV at `audio_wav` as an AAC stream. Blocks the
-    /// GUI thread for the duration (= MVP simplicity). v12
-    /// (`docs/plan_video.md` P8).
+    /// Background mp4 render at `output_path`, optionally muxing the
+    /// PCM Float32 WAV at `audio_wav` as an AAC stream. v12
+    /// (`docs/plan_video.md` P8). FIXME #55: `range_beats` restricts the
+    /// rendered window to `[start_beat, end_beat)` (`None` = whole song);
+    /// the muxed `audio_wav` is already trimmed to the same window.
     ExportMp4 {
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
+        range_beats: Option<(f64, f64)>,
     },
     /// 映像 render thread が発火（`done` / `total` フレーム）。`export_stage` を
     /// `VideoRender` に更新して進捗オーバーレイに反映。非 undoable。
@@ -5906,7 +5985,33 @@ impl AppData {
                 self.send_picker = None;
             }
             AppEvent::ExportWav => {
-                self.action_export_wav();
+                self.open_export_range_picker(ExportRangeKind::Wav);
+            }
+            AppEvent::SetExportRangeStart(beat) => {
+                if let Some(p) = self.export_range_picker.as_mut() {
+                    // start は [0, end) に clamp。 end と等しくなる入力は拒否
+                    // (end より僅かに手前へ)。
+                    p.start_beat = beat.clamp(0.0, (p.end_beat - MIN_EXPORT_RANGE_BEATS).max(0.0));
+                }
+            }
+            AppEvent::SetExportRangeEnd(beat) => {
+                if let Some(p) = self.export_range_picker.as_mut() {
+                    let max = self.song.length_beats.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
+                    p.end_beat = beat.clamp(p.start_beat + MIN_EXPORT_RANGE_BEATS, max);
+                }
+            }
+            AppEvent::ResetExportRange => {
+                if let Some(p) = self.export_range_picker.as_mut() {
+                    p.start_beat = 0.0;
+                    p.end_beat = self.song.length_beats.max(MIN_EXPORT_RANGE_BEATS);
+                }
+            }
+            AppEvent::ConfirmExportRange => {
+                self.confirm_export_range();
+            }
+            AppEvent::CancelExportRange => {
+                self.export_range_picker = None;
+                self.status_message = "Export をキャンセルしました".into();
             }
             AppEvent::ExportMidi => {
                 self.action_export_midi();
@@ -5955,7 +6060,7 @@ impl AppData {
             }
             AppEvent::OpenExportMp4Dialog => {
                 #[cfg(windows)]
-                self.action_open_export_mp4_dialog();
+                self.open_export_range_picker(ExportRangeKind::Mp4);
                 #[cfg(not(windows))]
                 {
                     self.status_message =
@@ -5994,12 +6099,12 @@ impl AppData {
                     self.quit_after_save = false;
                 }
             }
-            AppEvent::ExportMp4 { output_path, audio_wav } => {
+            AppEvent::ExportMp4 { output_path, audio_wav, range_beats } => {
                 #[cfg(windows)]
-                self.action_export_mp4(output_path, audio_wav);
+                self.action_export_mp4(output_path, audio_wav, range_beats);
                 #[cfg(not(windows))]
                 {
-                    let _ = (output_path, audio_wav);
+                    let _ = (output_path, audio_wav, range_beats);
                     self.status_message =
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
@@ -6342,6 +6447,18 @@ impl AppData {
             AppEvent::GlueSelectedClips => {
                 self.action_glue_selected_clips();
             }
+            AppEvent::PluginsReinitDone => {
+                // FIXME #55: plugins are now reinitialised to a clean state —
+                // fire the stashed offline export. (If nothing is pending, a
+                // stray reply; ignore.)
+                if let Some((path, range, write_mod_sidecar)) = self.pending_export.take() {
+                    self.send_audio(MainToChild::ExportWav {
+                        path,
+                        range,
+                        write_mod_sidecar,
+                    });
+                }
+            }
             AppEvent::ExportWavComplete { error, cancelled } => {
                 // この完了が今 track している音声 render のものでなければ無視する
                 // (BounceClipFxComplete の stale ガードと対称)。crash / watchdog で
@@ -6371,13 +6488,16 @@ impl AppData {
                 self.export_progress_at = None;
                 self.export_stage = None;
                 if let Some(mp4_path) = self.pending_video_export.take() {
+                    // FIXME #55: 音声と同じ拍範囲で video を render する (= 全曲
+                    // なら None)。 取り出して消費。
+                    let range_beats = self.pending_video_export_range.take();
                     if cancelled {
                         // 前段（音声）でキャンセル → video export 全体を中止し、
                         // 映像 render には進まない。
                         if let Some(t) = self.export_temp_wav.take() {
                             let _ = std::fs::remove_file(&t);
                         }
-                        let _ = mp4_path;
+                        let _ = (mp4_path, range_beats);
                         self.status_message = "Video export をキャンセルしました".into();
                     } else {
                         // 1 ステップ video export の音声レンダリング完了 → video
@@ -6399,9 +6519,9 @@ impl AppData {
                             None => self.export_temp_wav.clone(),
                         };
                         #[cfg(windows)]
-                        self.action_export_mp4(mp4_path, wav);
+                        self.action_export_mp4(mp4_path, wav, range_beats);
                         #[cfg(not(windows))]
-                        let _ = (mp4_path, wav);
+                        let _ = (mp4_path, wav, range_beats);
                     }
                 } else if cancelled {
                     self.status_message = "WAV 書き出しをキャンセルしました".into();
@@ -7326,7 +7446,7 @@ impl AppData {
         self.pending_added_plugin_finalize.clear();
     }
 
-    fn restore_plugin_from_song(&mut self, song: &Song) {
+    pub(crate) fn restore_plugin_from_song(&mut self, song: &Song) {
         let Some(db) = self.plugin_db.clone() else {
             tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
@@ -17555,31 +17675,123 @@ impl AppData {
             .unwrap_or_else(|| plugin_id.to_string())
     }
 
-    /// File → Export WAV...:
-    ///   1. Pick a destination via the OS file dialog.
-    ///   2. Tell the plugin host to switch every plugin to
-    ///      `CLAP_RENDER_OFFLINE` so plugins offering the `clap.render`
-    ///      extension can use higher-quality algorithms.
-    ///   3. Send `ExportWav { path }` to daw_audio, which freewheels
-    ///      the song through the existing AudioWorker pool while the
-    ///      CPAL callback writes silence.
-    ///   4. On `ExportWavComplete` the handler flips render mode back
-    ///      to Realtime (see `AppEvent::ExportWavComplete` arm).
-    fn action_export_wav(&mut self) {
-        // 二重起動ガード (video export と対称)。dialog 表示中はまだ export_stage が
-        // 立たないので、専用フラグ export_dialog_open でも弾く。これが無いと
-        // dialog を開いたまま再度 Export WAV を選べてしまい、両方で path を確定すると
-        // ExportWav が 2 本 daw_audio に飛んで export thread が二重 spawn される。
-        if self.export_stage.is_some()
-            || self.pending_video_export.is_some()
-            || self.export_dialog_open
+    /// FIXME #55: レンジピッカーを開くときの既定範囲 (拍)。 ループ範囲が設定
+    /// されていれば (`loop_end_beat > loop_start_beat`) それを既定にし、 無ければ
+    /// 全曲 (0..length_beats) にフォールバックする。 ループ範囲は `Song` が所有する
+    /// SSoT (`common/src/model.rs`) で、 transport の再生ループと同じ値を使う
+    /// (= 「ループしている区間をそのまま書き出す」 という DAW で一般的な既定)。
+    /// 末尾は最低 `MIN_EXPORT_RANGE_BEATS` を保証する。
+    fn default_export_range(&self) -> (f64, f64) {
+        let (start, end) = if self.song.loop_end_beat > self.song.loop_start_beat {
+            (self.song.loop_start_beat, self.song.loop_end_beat)
+        } else {
+            (0.0, self.song.length_beats)
+        };
+        let start = start.max(0.0);
+        (start, end.max(start + MIN_EXPORT_RANGE_BEATS))
+    }
+
+    /// FIXME #55: Export WAV / Video を押したときに、 まず書き出す **時間範囲**
+    /// (拍) を選ぶレンジピッカーモーダルを開く。 デフォルト窓は `default_export_range`
+    /// = ループ範囲 (設定されていれば) / 無ければ全曲。 確定 (`ConfirmExportRange`)
+    /// で `kind` に応じた既存の export action (file dialog) を起動する。 Ardour /
+    /// REAPER の time-selection export と同じ「範囲を指定して書き出す」 UX。
+    fn open_export_range_picker(&mut self, kind: ExportRangeKind) {
+        // video export は実行中だと二重起動できない (旧 action_open_export_mp4_dialog
+        // のガードをここへ移設)。
+        if matches!(kind, ExportRangeKind::Mp4)
+            && (self.export_stage.is_some()
+                || self.pending_video_export.is_some()
+                || self.export_dialog_open)
         {
-            self.status_message = "書き出しを実行中です".into();
+            self.status_message = "Video export を実行中です".into();
             return;
         }
-        self.export_dialog_open = true;
-        let dialog = rfd::FileDialog::new().add_filter("WAV", &["wav"]);
-        self.spawn_file_dialog(dialog, FileDialogMode::Save, FileDialogKind::ExportWav);
+        let (start_beat, end_beat) = self.default_export_range();
+        self.export_range_picker = Some(ExportRangePicker {
+            start_beat,
+            end_beat,
+            kind,
+        });
+    }
+
+    /// FIXME #55: レンジピッカー確定。 選んだ拍範囲を kind に応じて変換し、 元の
+    /// export action を起動する。 「全曲」 (start=0, end=length) のときは範囲なし
+    /// (`None`) として従来どおり全曲を書き出す。
+    fn confirm_export_range(&mut self) {
+        let Some(picker) = self.export_range_picker.take() else {
+            return;
+        };
+        // start=0 かつ end>=length は全曲とみなす (= None)。 浮動小数の比較は緩く。
+        let is_full = picker.start_beat <= f64::EPSILON
+            && picker.end_beat >= self.song.length_beats - f64::EPSILON;
+        let range_beats: Option<(f64, f64)> =
+            if is_full { None } else { Some((picker.start_beat, picker.end_beat)) };
+        match picker.kind {
+            ExportRangeKind::Wav => {
+                let range = range_beats.map(|(s, e)| self.export_beats_to_frames(s, e));
+                let dialog = rfd::FileDialog::new().add_filter("WAV", &["wav"]);
+                self.spawn_file_dialog(
+                    dialog,
+                    FileDialogMode::Save,
+                    FileDialogKind::ExportWav { range },
+                );
+            }
+            ExportRangeKind::Mp4 => {
+                #[cfg(windows)]
+                self.action_open_export_mp4_dialog(range_beats);
+                #[cfg(not(windows))]
+                {
+                    let _ = range_beats;
+                    self.status_message =
+                        "Video export は Windows 専用 (WMF 経由) です".into();
+                }
+            }
+        }
+    }
+
+    /// FIXME #55: 拍範囲 → sample frame 範囲。 audio engine と同じ式・同じ
+    /// sample rate (`common::audio_bridge::SAMPLE_RATE`、 AudioSession に渡す値)
+    /// で換算するので、 daw_audio 側 `run_export` の `samples_per_beat` と完全に
+    /// 一致する (bounce の `clip_range_to_frames` と同じ SSoT)。
+    fn export_beats_to_frames(&self, start_beat: f64, end_beat: f64) -> (u64, u64) {
+        let sr = f64::from(common::audio_bridge::SAMPLE_RATE);
+        let bpm = f64::from(self.song.bpm).max(f64::EPSILON);
+        let spb = sr * 60.0 / bpm;
+        let s = (start_beat * spb).max(0.0) as u64;
+        let e = (end_beat * spb).max(0.0) as u64;
+        (s, e)
+    }
+
+    /// FIXME #55: begin an offline WAV export the right way — stop playback,
+    /// push the latest song + offline render mode, then **reinitialise every
+    /// plugin** (deactivate→activate) for a clean cold render before the render
+    /// runs. The actual `ExportWav` is sent on `AppEvent::PluginsReinitDone`
+    /// (see the handler) once the plugin host confirms the reinit. Without the
+    /// reinit a synth holding a live voice (VCV Rack 2) bleeds into the head;
+    /// CLAP `reset()` alone does not clear it. Used by both the standalone WAV
+    /// export and the video export's audio render.
+    fn begin_wav_export(
+        &mut self,
+        path: std::path::PathBuf,
+        range: Option<(u64, u64)>,
+        write_mod_sidecar: bool,
+    ) {
+        // 書き出しは freewheel render。 再生中なら先に停止する (live dispatch と
+        // export dispatch が同じ plugin host worker slot で衝突するのを防ぐ)。
+        if self.is_playing {
+            self.stop();
+        }
+        // freewheel 開始前に最新 song snapshot + project_dir を daw_audio へ。
+        let song = self.song.clone();
+        self.send_audio(MainToChild::LoadSong(song));
+        self.send_plugin(MainToChild::SetRenderMode(
+            common::protocol::RenderMode::Offline,
+        ));
+        // 全 plugin を deactivate→activate でクリーンにしてから export する。
+        // 完了 (`PluginsReinitDone`) で stashed export を発火。
+        self.pending_export = Some((path, range, write_mod_sidecar));
+        self.send_plugin(MainToChild::ReinitPluginsForExport);
     }
 
     /// Phase 7 B4 Step E (2026-05-13): File → Export MIDI...
@@ -18193,8 +18405,11 @@ impl AppData {
     /// 自動レンダリング（daw_audio の freewheel）し、完了（`ExportWavComplete`）
     /// 後に video export して mux する（`action_export_mp4`）。旧仕様の「音声
     /// WAV を別途選ばせる 2 つ目のダイアログ」 は廃止。
+    /// FIXME #55: `range_beats` はレンジピッカーで確定した書き出し窓 (拍)。
+    /// `None` = 全曲。 二重起動ガードはピッカーを開く時点 (`open_export_range_picker`)
+    /// で済んでいるが、 ピッカー表示中に状態が変わる経路は無いので念のため残す。
     #[cfg(windows)]
-    fn action_open_export_mp4_dialog(&mut self) {
+    fn action_open_export_mp4_dialog(&mut self, range_beats: Option<(f64, f64)>) {
         if self.export_stage.is_some()
             || self.pending_video_export.is_some()
             || self.export_dialog_open
@@ -18215,14 +18430,24 @@ impl AppData {
             .set_title("Export Video to MP4...");
         self.export_dialog_open = true;
         self.status_message = "保存先を選択中...".into();
-        self.spawn_file_dialog(dialog, FileDialogMode::Save, FileDialogKind::ExportMp4);
+        self.spawn_file_dialog(
+            dialog,
+            FileDialogMode::Save,
+            FileDialogKind::ExportMp4 { range_beats },
+        );
     }
 
     /// `ExportMp4PathChosen` で保存先が確定したときの video export 後段。 旧
     /// `action_open_export_mp4_dialog` が dialog の戻り値で同期に走らせていた
     /// 「音声を temp WAV へ自動レンダリング → 完了後に video export + mux」 を、
-    /// dialog 別スレッド化に伴いここへ移設した。
-    fn action_begin_export_mp4(&mut self, output_path: PathBuf) {
+    /// dialog 別スレッド化に伴いここへ移設した。 FIXME #55: `range_beats` は
+    /// 書き出し窓 (拍)。 音声 temp WAV はこの窓に trim して書き、 video render も
+    /// 同じ窓で回す (`pending_video_export_range` 経由) ので A/V が揃う。
+    fn action_begin_export_mp4(
+        &mut self,
+        output_path: PathBuf,
+        range_beats: Option<(f64, f64)>,
+    ) {
         // audio engine が死んでいる (audio_tx=None) と前段の音声 render が
         // start できず ExportWavComplete が来ない → overlay 永久ロック。
         // 開始前にガードする（標準 WAV export と同じ防御）。
@@ -18234,22 +18459,19 @@ impl AppData {
         let temp_wav = std::env::temp_dir()
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
         self.pending_video_export = Some(output_path);
+        self.pending_video_export_range = range_beats;
         self.export_temp_wav = Some(temp_wav.clone());
         // 前段 = 音声 freewheel。daw_audio の `ExportWavProgress` で determinate
         // 進捗が来る（旧構造では indeterminate「音声レンダリング中」だった）。
         self.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
         self.export_progress_at = Some(std::time::Instant::now());
         self.status_message = "音声をレンダリング中...".into();
-        // 再生中なら停止（freewheel と realtime play の競合を回避）。
-        if self.is_playing {
-            self.stop();
-        }
-        let song = self.song.clone();
-        self.send_audio(MainToChild::LoadSong(song));
-        self.send_plugin(MainToChild::SetRenderMode(
-            common::protocol::RenderMode::Offline,
-        ));
-        self.send_audio(MainToChild::ExportWav { path: temp_wav });
+        // 音声も video と同じ窓で freewheel render (beat→frame は audio engine と
+        // 同じ式)。 `None` で全曲。 FIXME #55: stop → reinit plugins → ExportWav
+        // (begin_wav_export 経由)。 video render が `.modenv` sidecar を sample して
+        // modulation を再現するので、 ここだけ sidecar を書く。
+        let range = range_beats.map(|(s, e)| self.export_beats_to_frames(s, e));
+        self.begin_wav_export(temp_wav, range, true);
     }
 
     /// 音声 freewheel フェーズ (`AudioRender`) を強制終了する。daw_audio が
@@ -18324,18 +18546,27 @@ impl AppData {
                     self.action_open_path(path);
                 }
             }
-            FileDialogKind::ExportMp4 => {
+            FileDialogKind::ExportMp4 { range_beats } => {
                 // 二重起動ガードを解除し、 Some なら export フロー開始。
                 self.export_dialog_open = false;
                 match paths.into_iter().next() {
-                    Some(output_path) => self.action_begin_export_mp4(output_path),
+                    #[cfg(windows)]
+                    Some(output_path) => {
+                        self.action_begin_export_mp4(output_path, range_beats)
+                    }
+                    #[cfg(not(windows))]
+                    Some(_output_path) => {
+                        let _ = range_beats;
+                        self.status_message =
+                            "Video export は Windows 専用 (WMF 経由) です".into();
+                    }
                     None => {
                         self.status_message =
                             "Video export をキャンセルしました".into();
                     }
                 }
             }
-            FileDialogKind::ExportWav => {
+            FileDialogKind::ExportWav { range } => {
                 // dialog が閉じた（確定 or キャンセル）ので二重起動ガードを解除。
                 self.export_dialog_open = false;
                 let Some(path) = paths.into_iter().next() else {
@@ -18357,17 +18588,11 @@ impl AppData {
                 // の入力 gate / 再生抑止も video と同様に効く。
                 self.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
                 self.export_progress_at = Some(std::time::Instant::now());
-                // 再生中なら停止（freewheel と realtime play の競合を回避）。
-                if self.is_playing {
-                    self.stop();
-                }
-                // freewheel 開始前に最新 song snapshot を daw_audio へ送る。
-                let song = self.song.clone();
-                self.send_audio(MainToChild::LoadSong(song));
-                self.send_plugin(MainToChild::SetRenderMode(
-                    common::protocol::RenderMode::Offline,
-                ));
-                self.send_audio(MainToChild::ExportWav { path });
+                // FIXME #55: standalone WAV export — stop → reinit plugins →
+                // (on PluginsReinitDone) ExportWav。begin_wav_export が再生停止 /
+                // LoadSong / SetRenderMode(Offline) / 全 plugin 再初期化を行う。
+                // modulation は音に焼き込み済みなので `.modenv` sidecar は書かない。
+                self.begin_wav_export(path, range, false);
             }
             FileDialogKind::ExportMidi => {
                 let Some(path) = paths.into_iter().next() else {
@@ -18431,6 +18656,7 @@ impl AppData {
         &mut self,
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
+        range_beats: Option<(f64, f64)>,
     ) {
         // 何らかの export が走っている間は再入を弾く。video 後段への chain は
         // `ExportWavComplete` ハンドラが先に `export_stage` を None に戻してから
@@ -18450,9 +18676,12 @@ impl AppData {
         self.export_stage = Some(ExportStage::VideoRender { done: 0, total: 0 });
         self.status_message = format!("Video export 開始: {}", output_path.display());
         std::thread::spawn(move || {
+            // FIXME #55: video の render 窓も拍範囲に合わせる (audio temp WAV は
+            // 既に同じ窓に trim 済み → frame 0 で A/V が揃う)。
             let cfg = crate::render_video::RenderConfig::new(&song, &output_path)
                 .with_project_dir(project_dir.as_deref())
-                .with_audio_wav(audio_wav.as_deref());
+                .with_audio_wav(audio_wav.as_deref())
+                .with_range_beats(range_beats);
             // 進捗は 5 フレームごと（+ 開始 / 完了）に間引いて送る（毎フレーム
             // 送ると event queue を圧迫する）。
             let mut last_sent = 0u64;

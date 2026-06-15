@@ -384,7 +384,7 @@ async fn recv_loop(
             // export thread silences the CPAL callback via
             // `EngineShared::export_running` while it holds the audio
             // resources.
-            Ok(MainToChild::ExportWav { path }) => {
+            Ok(MainToChild::ExportWav { path, range, write_mod_sidecar }) => {
                 // Multi-process defense: atomically reserve the engine for this
                 // render. compare_exchange on the recv loop serializes against a
                 // second ExportWav — the old "load here, set inside the spawned
@@ -435,6 +435,10 @@ async fn recv_loop(
                 let out_tx_clone = out_tx.clone();
                 let out_tx_progress = out_tx.clone();
                 let sample_rate = session_sample_rate;
+                // FIXME #55: by the time this thread runs, the GUI has stopped
+                // playback and reinitialised every plugin (deactivate→activate)
+                // for a clean cold start. The export thread waits for the live
+                // CPAL callback to park, then freewheels and reports progress.
                 if let Err(e) = std::thread::Builder::new()
                     .name("daw-audio-export".into())
                     .spawn(move || {
@@ -468,13 +472,20 @@ async fn recv_loop(
                                     .send(ChildToMain::ExportWavProgress { done, total });
                             }
                         };
+                        // FIXME #55: user export range walks cold from the range
+                        // start (matches Play-from-here); full export walks 0..len.
+                        let span = match range {
+                            Some((start, end)) => export::RenderSpan::RangeCold { start, end },
+                            None => export::RenderSpan::Full,
+                        };
                         let result = export::run_export(
                             path,
                             engine_shared_clone,
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                            None,
+                            span,
+                            write_mod_sidecar,
                             on_progress,
                         );
                         // Release the engine reservation now the render is done,
@@ -514,6 +525,10 @@ async fn recv_loop(
                     .export_cancel
                     .store(true, std::sync::atomic::Ordering::Release);
                 tracing::info!("received CancelExport; offline render will abort");
+            }
+            Ok(MainToChild::ReinitPluginsForExport) => {
+                // FIXME #55: plugin reinit is the plugin host's job (it owns the
+                // instances). The audio side has no plugins — ignore.
             }
             Ok(MainToChild::BounceClipFxOnline {
                 path,
@@ -581,13 +596,20 @@ async fn recv_loop(
                     .name("daw-audio-bounce-fx".into())
                     .spawn(move || {
                         let path_for_complete = path_for_thread.clone();
+                        // Clip-FX bounce: warm walk from frame 0 so plugin tails /
+                        // sidechain state at the clip start are correct. No video
+                        // consumer, so no modulation sidecar.
                         let result = export::run_export(
                             path_for_thread,
                             engine_shared_clone,
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                            Some((start_frame, end_frame)),
+                            export::RenderSpan::RangeWarm {
+                                start: start_frame,
+                                end: end_frame,
+                            },
+                            false,
                             // Clip-range bounce has no progress overlay (it
                             // completes quickly and replaces the clip in place).
                             |_, _| {},
