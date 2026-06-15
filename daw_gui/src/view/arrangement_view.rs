@@ -1772,6 +1772,7 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                             target,
                             start_beat: d.next_start,
                             length: d.next_len,
+                            stretch: d.stretch,
                         });
                     }
                 }
