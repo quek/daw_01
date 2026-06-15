@@ -715,7 +715,7 @@ fn daw_reinit_for_export(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -
         let _ = h
             .bootstrap
             .plugin_tx
-            .send(MainToChild::ReinitPluginsForExport);
+            .send(MainToChild::ReinitAllPlugins);
         h.pump_until(
             |msg| matches!(msg, ChildToMain::PluginsReinitDone),
             Duration::from_millis(timeout_ms),

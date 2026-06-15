@@ -187,7 +187,7 @@ pub fn run_export(
     }
 
     // Plugins are reinitialised (deactivate→activate) by the GUI's
-    // `begin_wav_export` → `ReinitPluginsForExport` handshake *before* this
+    // `begin_wav_export` → `ReinitAllPlugins` handshake *before* this
     // render runs, so a cold range / full export starts from a clean state (no
     // live reverb tail / VOICEVOX phrase / synth voice bleeding into the head).
     let render_result = render_loop(

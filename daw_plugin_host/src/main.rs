@@ -45,9 +45,10 @@ const WM_COMMAND_WAKE: u32 = WM_APP + 1;
 /// (or its CLAP callbacks) to the IPC sender.
 #[derive(Debug, Clone)]
 pub enum PluginEvent {
-    /// FIXME #55: every plugin reinitialised (deactivate→activate) for an
-    /// offline cold render (reply to `PluginCommand::ReinitPluginsForExport`).
-    /// `From<PluginEvent>` maps to `ChildToMain::PluginsReinitDone`.
+    /// Every plugin reinitialised (deactivate→activate) to a clean state
+    /// (reply to `PluginCommand::ReinitAllPlugins` — export prep FIXME #55 or
+    /// the panic button FIXME #60). `From<PluginEvent>` maps to
+    /// `ChildToMain::PluginsReinitDone`.
     PluginsReinitDone,
     SlotGuiOpened {
         track: u32,
@@ -298,9 +299,10 @@ fn republish_entry_slot(
 
 /// Commands processed serially on the plugin-main thread.
 enum PluginCommand {
-    /// FIXME #55: reinitialise (deactivate→activate) every loaded plugin for a
-    /// clean offline cold render, then reply `PluginEvent::PluginsReinitDone`.
-    ReinitPluginsForExport,
+    /// Reinitialise (deactivate→activate) every loaded plugin to a clean
+    /// state, then reply `PluginEvent::PluginsReinitDone`. Shared by export
+    /// prep (FIXME #55) and the panic button (FIXME #60).
+    ReinitAllPlugins,
     SetSlotPlugin {
         track: u32,
         index: u32,
@@ -754,11 +756,20 @@ fn plugin_main_loop(
                     }
                     tracing::info!(?mode, "render mode broadcast to all plugins");
                 }
-                PluginCommand::ReinitPluginsForExport => {
-                    // FIXME #55: full deactivate→activate of every plugin so an
-                    // offline cold render starts clean even for plugins that
-                    // ignore CLAP `reset()` / `stop_processing` (VCV Rack 2 keeps
-                    // a live voice ringing through those). Same safety contract
+                PluginCommand::ReinitAllPlugins => {
+                    // Force every plugin back to a clean, silent state with a
+                    // two-pronged reset (one prong alone is insufficient):
+                    //   - deactivate→activate clears stubborn held voices that
+                    //     survive CLAP `reset()` (VCV Rack 2 keeps a live voice
+                    //     ringing through reset / start-stop_processing);
+                    //   - `reset()` (CLAP `clap_plugin.reset`) clears the audio
+                    //     processing state — filters / delay lines / reverb
+                    //     tails — that a deactivate→activate alone leaves intact
+                    //     for a CLAP reverb's internal feedback-delay network
+                    //     (FIXME #60 実機: パニック後もテイルが鳴り続けた).
+                    // Shared by export prep (FIXME #55, clean cold render) and
+                    // the panic button (FIXME #60, kill all sound now). Same
+                    // safety contract
                     // as plugin teardown: detach from the registry so workers
                     // skip these instances, `quiesce` to drain in-flight
                     // dispatch, mutate on this (plugin-main) thread, then
@@ -804,6 +815,11 @@ fn plugin_main_loop(
                             if let Err(e) = plugin.start_processing() {
                                 tracing::error!(error = ?e, "reinit: start_processing failed");
                             }
+                            // Clear DSP tails (reverb / delay / filters) now that
+                            // the instance is active + processing. CLAP forwards
+                            // to `clap_plugin.reset()`; VST3 / builtin already
+                            // flushed via the deactivate / stop_processing above.
+                            plugin.reset();
                             n += 1;
                         }
                     }
@@ -820,7 +836,7 @@ fn plugin_main_loop(
                             }),
                         );
                     }
-                    tracing::info!(plugins = n, "FIXME#55: reinitialised all plugins for offline render");
+                    tracing::info!(plugins = n, "reinitialised all plugins to clean state (export prep / panic)");
                     let _ = evt_tx.send(PluginEvent::PluginsReinitDone);
                 }
                 PluginCommand::SetSlotPlugin {
@@ -2036,9 +2052,9 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             // host doesn't drive the render any more — it only switches
             // render mode on `MainToChild::SetRenderMode`.
         }
-        MainToChild::ReinitPluginsForExport => {
-            tracing::info!("received ReinitPluginsForExport");
-            plugin.send(PluginCommand::ReinitPluginsForExport);
+        MainToChild::ReinitAllPlugins => {
+            tracing::info!("received ReinitAllPlugins");
+            plugin.send(PluginCommand::ReinitAllPlugins);
         }
         // OpenPluginShmem / ClosePluginShmem flow daw_gui → daw_audio,
         // not into the plugin host (the plugin host is the *creator* of
@@ -2073,6 +2089,8 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::Ack
         | MainToChild::Play
         | MainToChild::Stop
+        | MainToChild::Panic
+        | MainToChild::PanicRelease
         | MainToChild::Session(_)
         | MainToChild::LoadSong(_)
         | MainToChild::SetLoop(_)

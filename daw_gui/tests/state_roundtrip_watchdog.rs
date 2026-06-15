@@ -329,9 +329,9 @@ fn watchdog_does_not_fire_after_roundtrip_completes() {
 }
 
 /// review finding (export gate): `PluginsReinitDone` は export 自身のハンドシェイク
-/// 返信 (FIXME #55 の ReinitPluginsForExport 応答) なのに、 export gate
+/// 返信 (FIXME #55 の ReinitAllPlugins 応答) なのに、 export gate
 /// (handle_event 冒頭) の whitelist から漏れていて drop されていた。 begin_wav_export は
-/// export_stage を立てた *後* に ReinitPluginsForExport を送るので、 この応答は必ず
+/// export_stage を立てた *後* に ReinitAllPlugins を送るので、 この応答は必ず
 /// export 中に到着する。 drop されると stashed `ExportWav` が永遠に発射されず、 GUI 実機
 /// の WAV / video export が reinit でハングしていた (headless script 経路は gate を
 /// 通らないので露見しなかった)。 gate を通過して handler が `ExportWav` を audio へ
