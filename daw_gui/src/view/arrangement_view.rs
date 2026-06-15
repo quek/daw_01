@@ -236,12 +236,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     id: c.id,
                     start_beat: c.start_beat,
                     len_beats: c.length_beats,
-                    // クリップ表示名の導出 (SSoT): デフォルトでクリップ名は
-                    // 無く、 内容から表示名を導出する。 明示名 (content_id 単位
-                    // の共有名) があればそれ、 無ければ Text クリップは本文、
-                    // それも無ければノートの歌詞 (VOICEVOX 歌唱) を連結、 どれも
-                    // 無ければ無名 (空)。 同 content を共有する linked clip は
-                    // 同じ表示名になる。
+                    // クリップ表示名の導出 (SSoT): 明示名優先。 Text クリップは
+                    // 本文、 非 Text はユーザーが付けた明示名 (content_id 単位の
+                    // 共有名) を最優先し、 名前が無ければノートの歌詞 (VOICEVOX
+                    // 歌唱) を連結、 どれも無ければ無名 (空)。 同 content を共有
+                    // する linked clip は同じ表示名になる。 詳細は clip_display_label。
                     name: clip_display_label(c, &app.song),
                     // v18 (`docs/plan_track_clip_color.md`): clip は effective
                     // 色 (個別上書き or トラック色継承) で塗る。共有 clip
@@ -2022,25 +2021,44 @@ fn lyric_clip_label(
     Some(out)
 }
 
-/// クリップの表示名を導出する (SSoT)。 **内容優先**で
-/// Text クリップの本文 → MIDI ノートの歌詞 → 明示名 (content_id 単位の共有名
-/// `Song::content_name`) → 無名 (空文字) の順に解決する。
+/// クリップの表示名を導出する (SSoT)。 **明示名優先**で
+/// Text クリップの本文 → ユーザーが付けた明示名 (content_id 単位の共有名
+/// `Song::content_name`) → MIDI ノートの歌詞 → 無名 (空文字) の順に解決する。
 ///
-/// 本文 / 歌詞を content_name より優先するのは、 既存プロジェクトや録音/複製等の
-/// 生成経路が content_name に自動命名 ("Clip N" / "Recorded N" / "Title") を入れて
-/// いても、 Text 本文や歌詞が **clip 生成経路に依らず一貫して**表示されるように
-/// するため (= ⑤⑦ の「できたりできなかったり」 を解消)。 デフォルトでは
-/// クリップ名を持たず (`create_clip` / `add_text_clip_to_track` は空で作る)、
-/// content_name は内容を持たない clip の fallback 兼ユーザー明示 rename の置き場。
-fn clip_display_label(clip: &common::model::Clip, song: &common::model::Song) -> Arc<str> {
+/// 明示名 (rename) を歌詞より優先するのは DAW 標準の挙動 (REAPER / Ardour 等で
+/// ユーザーが付けた名前は常に表示され、 本文 / 歌詞は **名前を付けていない**
+/// クリップの既定表示)。 旧版 (FIXME ⑤⑦) は逆に内容優先だったが、 これは
+/// 録音クリップの自動名 ("Recorded N") が歌詞を隠す問題への対症療法であり、
+/// 「Bell トラックの歌詞付きクリップを rename しても歌詞のまま変わらない」
+/// (FIXME #69) を生んでいた。 根本原因 = content_name が自動名と明示名を混在
+/// させていたこと。 自動名の書き込み元 (録音の `ensure_midi_clip_at_playhead`)
+/// を断ち content_name を **明示 rename 専用** にしたので、 明示名が空でない
+/// なら必ずユーザーの意図 = 最優先で正しい。 ⑤⑦ の目的 (自動名が歌詞を隠さ
+/// ない) も「自動名がそもそも入らない」 ことで保たれる。
+///
+/// Text クリップは rename が本文 (`set_clip_text_event_content`) を書き換える
+/// ので、 本文が「名前」 そのもの。 よって本文を content_name より先に見る
+/// (レガシーで content_name に "Title" が残っていても本文が一貫して出る)。
+/// デフォルトではどの生成経路もクリップ名を持たず (`create_clip` /
+/// `add_text_clip_to_track` / 録音は空で作る)。
+pub(crate) fn clip_display_label(
+    clip: &common::model::Clip,
+    song: &common::model::Song,
+) -> Arc<str> {
+    // Text クリップ: 本文が名前 (rename は本文を編集する)。content_name は無視。
     if let Some(t) = text_clip_label(clip, &song.clip_contents) {
         return Arc::from(t);
     }
+    // 非 Text: ユーザーが付けた明示名 (rename) が最優先。
+    let explicit = song.content_name(clip.content_id);
+    if !explicit.is_empty() {
+        return Arc::from(explicit);
+    }
+    // 名前が無ければ MIDI ノートの歌詞 (VOICEVOX 歌唱) を連結、 それも無ければ空。
     if let Some(l) = lyric_clip_label(clip, &song.clip_contents) {
         return Arc::from(l);
     }
-    // 本文も歌詞も無い clip: 明示名 (rename) / 自動名、 無ければ空 (無名)。
-    Arc::from(song.content_name(clip.content_id))
+    Arc::from("")
 }
 
 /// gui_01 #028 (M14 Phase 63n-1): `Track.automation_lanes` を widget が
@@ -2830,8 +2848,9 @@ mod tests {
         Rect { x: 0.0, y, w: 100.0, h }
     }
 
-    /// クリップ表示名の導出優先順位 (issues 5/7): 明示名 → Text 本文 →
-    /// ノート歌詞 (start_beat 順) → 無名 (空)。
+    /// クリップ表示名の導出優先順位 (FIXME #69): Text 本文 → 明示名 (rename) →
+    /// ノート歌詞 (start_beat 順) → 無名 (空)。 明示名は歌詞より優先される
+    /// (ユーザーが付けた名前は常に表示、 歌詞は無名クリップの既定表示)。
     #[test]
     fn clip_display_label_priority() {
         use common::model::{
@@ -2866,13 +2885,18 @@ mod tests {
         let text_clip = Clip { id: 2, content_id: 2, ..Clip::default() };
         assert_eq!(&*clip_display_label(&text_clip, &song), "Hello");
 
-        // 内容優先: Text 本文は content_name (自動名/明示名) より優先される。
-        // 既存プロジェクトで "Title" 等が入っていても本文が一貫して出る。
+        // Text 本文は content_name より優先される (Text の rename は本文を
+        // 編集するので本文が名前。 レガシーで "Title" 等が残っていても本文が出る)。
         song.set_content_name(2, "MyName".into());
         assert_eq!(&*clip_display_label(&text_clip, &song), "Hello");
-        // 歌詞付き MIDI クリップも content_name より歌詞が優先 (録音クリップで
-        // "Recorded N" が入っていても歌詞が出る)。
-        song.set_content_name(1, "Recorded 1".into());
+        // 明示名優先 (FIXME #69): 歌詞付き MIDI クリップ (Bell トラックの
+        // 「あかねに」 等) でも、 ユーザーが付けた明示名があれば歌詞より優先して
+        // それを表示する (DAW 標準挙動)。 名前を付けても歌詞のまま変わらなかった
+        // 不具合の回帰テスト。
+        song.set_content_name(1, "Bell".into());
+        assert_eq!(&*clip_display_label(&midi_clip, &song), "Bell");
+        // 明示名を消せば再び歌詞に戻る (名前は content_id 単位の共有名)。
+        song.clip_content_names.remove(&1);
         assert_eq!(&*clip_display_label(&midi_clip, &song), "こんにか");
 
         // content 3: 歌詞も本文も無い MIDI → content_name (無ければ空)。
