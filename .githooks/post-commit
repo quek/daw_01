@@ -1,39 +1,19 @@
 #!/bin/sh
-# git-native post-commit hook: main ブランチの commit のたびに release build を走らせる。
+# git-native post-commit hook: main への「直接 commit」で release build を走らせる。
 #
-# CLAUDE.md ルール「commit したら必ず release build を行なう」の唯一の保証点。
-# 旧来の Claude-Code PostToolUse hook (matcher "Bash") は Bash ツール経由 /
-# hook 有効 session の commit にしか発火せず、PowerShell ツール・手動 commit・
-# ! passthrough で取りこぼしていた。git hook は commit object 自体に紐づくので
-# 起動手段に依存せず必ず走る (= invocation-agnostic)。
+# CLAUDE.md ルール「commit したら必ず release build」の保証点の片割れ。git は
+# `git commit` でのみ post-commit を発火する (merge は post-merge: post-merge hook と
+# lib/release_build_trigger.sh の解説参照。git 2.50 で実測)。
+# 旧来の Claude-Code PostToolUse hook (matcher "Bash") は起動手段で取りこぼしていたため
+# git hook へ移行した経緯は変わらず (= invocation-agnostic)。
 #
-# 実ビルドは scripts/release_build_bg.ps1 に detached (Start-Process -Hidden) で
-# 投げ、git commit は即座に戻る (非ブロッキング)。結果は target/release-build.log、
-# 失敗時は target/.release-build-failed marker + ダイアログ通知。
+# 旧版はここで MERGE_HEAD / CHERRY_PICK_HEAD 存在時に skip していたが、これは誤りだった:
+#   - clean な merge は そもそも post-commit を発火しない (post-merge 側) ので、この skip は
+#     merge 対策として無意味だった。
+#   - 唯一 MERGE_HEAD が立つのは「conflict を解決して git commit で締める merge」= まさに
+#     build したい単発 commit。これを取りこぼしていた (post-merge は conflict merge では
+#     走らないので、ここで拾わないと release build ゼロになる)。撤去した。
+# rebase 中の build storm 回避 (rebase-merge / rebase-apply 検出) は lib 側に残してある。
 #
-# rebase / merge / cherry-pick / am の最中は build storm を避けるため skip する。
-
-repo="$(git rev-parse --show-toplevel)"
-
-for d in rebase-merge rebase-apply; do
-  p="$(git rev-parse --git-path "$d" 2>/dev/null)"
-  if [ -n "$p" ] && [ -d "$p" ]; then exit 0; fi
-done
-for f in MERGE_HEAD CHERRY_PICK_HEAD; do
-  p="$(git rev-parse --git-path "$f" 2>/dev/null)"
-  if [ -n "$p" ] && [ -f "$p" ]; then exit 0; fi
-done
-
-# release build は main ブランチの commit でのみ走らせる (FIXME #65)。各 worktree の
-# feature ブランチでは skip し、release 検証は main への統合 (merge) commit 時に一度だけ行う。
-# clean merge は post-commit が branch=main / MERGE_HEAD 無しで発火するので、main へ
-# 取り込んだ統合結果が確実に release build される (実測で確認済み)。
-branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
-if [ "$branch" != "main" ]; then exit 0; fi
-
-# Start-Process は即時に戻る -> hidden な独立プロセスで release_build_bg.ps1 が走る。
-powershell -NoProfile -ExecutionPolicy Bypass -Command \
-  "Start-Process -WindowStyle Hidden -FilePath powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','$repo/scripts/release_build_bg.ps1','-Repo','$repo'" \
-  >/dev/null 2>&1
-
-exit 0
+# 共通ロジックは lib/release_build_trigger.sh に集約 (post-merge と DRY)。
+. "$(dirname "$0")/lib/release_build_trigger.sh"
