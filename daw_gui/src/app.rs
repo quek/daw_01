@@ -12944,6 +12944,27 @@ impl AppData {
         out
     }
 
+    /// Ctrl+A (automation lane / #071): 指定 lane 内の全 automation clip を
+    /// `AutomationClipKey` で列挙する。 lane が無い / clip が無いなら空。
+    /// `all_automation_points_in_lane` の clip 版 (= Ctrl+A 段階拡大の clip 段)。
+    pub fn all_automation_clips_in_lane(
+        &self,
+        lane: common::model::AutomationLaneKey,
+    ) -> Vec<common::model::AutomationClipKey> {
+        let Some(lane_ref) = self.song.automation_lane_by_key(lane.track, lane.lane) else {
+            return Vec::new();
+        };
+        lane_ref
+            .clips
+            .iter()
+            .map(|clip| common::model::AutomationClipKey {
+                track: lane.track,
+                lane: lane.lane,
+                clip: clip.id,
+            })
+            .collect()
+    }
+
     /// 右クリック「共有を一括選択」: `target` と同じ `content_id` を持つ
     /// main clip を全 track から集めて選択する (linked clip group)。
     /// `content_id` は payload 種別ごとに別空間なので automation clip 等と
