@@ -1913,6 +1913,29 @@ fn section_hit(
     hit
 }
 
+/// FIXME #067: cursor が strictly どの section 帯の **内側** (in-rect) にあるかを返す。 `section_hit` と
+/// 違い resize handle の外側拡張 (`±resize_handle_px`) を **一切含めない**。 dblclick rename / 右クリック
+/// メニューは「帯そのもの」 を対象にする **point gesture** で、 帯の外側 (隣の空きレーン) で発火しては
+/// いけない (帯のすぐ隣の空白を dblclick すると隣 section の rename になっていた bug)。 Move/Resize の
+/// **drag** は掴みやすさのため引き続き `section_hit` の拡張ハンドルを使う。 section は昇順・非交差前提、
+/// 共有境界 (`A.right == B.left`) は半開区間 `[x, x+w)` で右 section に属す (= 1 点に高々 1 section)。
+#[must_use]
+fn section_at_inrect(
+    sections: &[SectionView],
+    arranger: Rect,
+    view: ArrangementView,
+    cx: f32,
+    cy: f32,
+) -> Option<u32> {
+    if arranger.h <= 0.0 || !arranger.contains(cx, cy) {
+        return None;
+    }
+    sections.iter().find_map(|s| {
+        let r = section_to_rect(s, view, arranger);
+        (cx >= r.x && cx < r.x + r.w).then_some(s.id)
+    })
+}
+
 /// M14 Phase 127 (#105): 拍子から 1 bar の拍数を返す (`numerator * 4 / denominator`)。 4/4=4、 3/4=3、
 /// 6/8=3。 0 除算 / 0 拍を避けるため numerator / denominator は 1 以上、 結果は `1.0` 以上に floor する。
 fn beats_per_bar(time_sig: (u8, u8)) -> f64 {
@@ -8642,14 +8665,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- M14 Phase 127 (daw_01 #105): Arranger レーンの double-click ----
-        //  - section 帯上 → `BeginRenameSection` (帯名 dblclick で改名開始、 `BeginRenameTrack` と同 idiom)
-        //  - 空きレーン → `CreateSection` (既定長 1 bar = `time_sig` 由来、 snap 適用済)
+        //  - section 帯上 (in-rect) → `BeginRenameSection` (帯名 dblclick で改名開始、 `BeginRenameTrack` と同 idiom)
+        //  - 空きレーン (帯の外、 隣接する resize ハンドル拡張部も含む) → `CreateSection` (既定長 1 bar)
+        // FIXME #067: rename 判定は `section_hit` (resize ハンドルを ±px 外側拡張) でなく `section_at_inrect`
+        // (帯内のみ) を使う。 拡張ハンドルは drag の掴みやすさ用で、 「帯のすぐ隣の空白」 の dblclick を
+        // 隣 section の rename に化けさせていた。 帯外の dblclick は空きレーン扱いで CreateSection に回る。
         if arranger_lane_h > 0.0
             && let Some((cx, cy)) = self.take_double_click_in_rect(arranger_rect)
         {
-            if let Some((sid, _)) =
-                section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
-            {
+            if let Some(sid) = section_at_inrect(sections, arranger_rect, view, cx, cy) {
                 self.push_edit(make_edit(ArrangementEditRequest::BeginRenameSection(sid)));
             } else {
                 let raw_beat = px_to_beat(cx, arranger_rect.x, arranger_rect.w, view);
@@ -8665,12 +8689,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- M14 Phase 127 (daw_01 #105): Arranger レーンの secondary (右) click ----
-        // section 帯上のみ `SecondaryClickSection { id, pos }` を発火 (caller が `pos` にコンテキスト
-        // メニューを開く、 `SecondaryClickEmpty` と同 idiom)。 空きレーン上の右クリックは現状 no-op。
+        // section 帯上 (in-rect) のみ `SecondaryClickSection { id, pos }` を発火 (caller が `pos` に
+        // コンテキストメニューを開く、 `SecondaryClickEmpty` と同 idiom)。 空きレーン上の右クリックは no-op。
+        // FIXME #067: dblclick rename と同じく point gesture なので `section_at_inrect` (帯内のみ) を使う。
+        // resize ハンドル拡張 (`section_hit`) だと帯のすぐ隣の空白の右クリックで隣 section のメニューが出る。
         if arranger_lane_h > 0.0
             && let Some((cx, cy)) = self.take_secondary_press_in_rect(arranger_rect)
-            && let Some((sid, _)) =
-                section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
+            && let Some(sid) = section_at_inrect(sections, arranger_rect, view, cx, cy)
         {
             self.push_edit(make_edit(ArrangementEditRequest::SecondaryClickSection {
                 id: sid,
@@ -10886,6 +10911,31 @@ mod tests {
             Some((2, ClipDragKind::ResizeLeft)),
             "B の左端 (in-rect) が A の右端 outer より優先"
         );
+    }
+
+    /// FIXME #067: `section_at_inrect` は帯の **内側のみ** を返し、 resize handle の外側拡張
+    /// (`±resize_handle_px`) を含めない。 帯のすぐ隣の空白の dblclick / 右クリックを隣 section の
+    /// rename / メニューに化けさせない (= `section_hit` との決定的な差)。
+    #[test]
+    fn section_at_inrect_excludes_resize_handle_extension() {
+        let arranger = Rect { x: 0.0, y: 0.0, w: 400.0, h: 20.0 };
+        let view = ArrangementView { start_beat: 0.0, len_beats: 8.0, ..ArrangementView::default() };
+        let secs = vec![section(7, 2.0, 4.0, "Aメロ")]; // x 100..300
+        // 帯の内側はヒットする (中央 / 端の内側 1px)。
+        assert_eq!(section_at_inrect(&secs, arranger, view, 200.0, 10.0), Some(7), "帯中央");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 100.0, 10.0), Some(7), "左端 (in-rect)");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 299.0, 10.0), Some(7), "右端 -1px (in-rect)");
+        // 帯の **すぐ隣の空白** (resize handle 拡張部 ±4px の内側) は None = リネームしない。
+        assert_eq!(section_at_inrect(&secs, arranger, view, 98.0, 10.0), None, "左端の外 2px は空白");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 300.0, 10.0), None, "右端ちょうど (= rect 外) は空白");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 302.0, 10.0), None, "右端の外 2px は空白");
+        // 同じ外側 2px で `section_hit` は拡張ハンドルにヒットする (= bug の発生源、 drag では正当)。
+        assert!(
+            section_hit(&secs, arranger, view, 302.0, 10.0, 4.0).is_some(),
+            "section_hit は外側拡張を含む (drag 用) — point gesture では section_at_inrect を使う"
+        );
+        // lane の y 外 (帯外の縦領域) も None。
+        assert_eq!(section_at_inrect(&secs, arranger, view, 200.0, 25.0), None, "lane の y 外");
     }
 
     /// `compute_section_drag_beat_delta`: snap OFF は pivot+raw を素通し (= 各 gesture で delta = raw)。
