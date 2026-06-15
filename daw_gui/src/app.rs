@@ -374,6 +374,9 @@ pub enum InspectorScrubField {
     ImageFadeIn,
     ImageFadeOut,
     Text(TextNumField),
+    /// FIXME #54 Wave4: 内蔵映像 FX param scrub（device_index, param_id 単位で
+    /// drag stroke を undo 1 step に bracket する）。
+    VideoFx { device_index: u32, param_id: u32 },
 }
 
 /// docs/plan_modulation.md §9 / FIXME #56: one row of the inspector
@@ -455,6 +458,11 @@ pub enum ModControlDomain {
     /// dB↔frac 写像で橋渡しする。model depth は従来どおり線形 (volume/2) 空間に
     /// 留まる (engine の `fill_track_param_ramps` がその空間で消費するため)。
     FaderDb(daw_ui_core::MeterScale),
+    /// FIXME #54 Wave4: 映像 FX param。表示は実レンジ (`min`..`max`、`log` なら対数)、
+    /// model は正規化 0..=1 (`PluginParam` は `plain==norm` なので model==norm)。
+    /// `to_model` = 実値→norm、`to_display` = norm→実値 ([`common::video_fx::ParamKind`]
+    /// と同写像)。インスペクタの video FX param スクラブ + per-control 変調で使う。
+    Ranged { min: f64, max: f64, log: bool },
 }
 
 impl ModControlDomain {
@@ -469,6 +477,16 @@ impl ModControlDomain {
                 let db = scale.frac_to_db(display as f32);
                 10f64.powf(f64::from(db) / 20.0)
             }
+            // 実値 → norm (PluginParam は model==norm)。
+            ModControlDomain::Ranged { min, max, log } => {
+                if log && min > 0.0 && max > 0.0 && display > 0.0 {
+                    ((display / min).ln() / (max / min).ln()).clamp(0.0, 1.0)
+                } else if (max - min).abs() < f64::EPSILON {
+                    0.0
+                } else {
+                    ((display - min) / (max - min)).clamp(0.0, 1.0)
+                }
+            }
         }
     }
     /// target の model plain 値 → コントロール表示値。
@@ -481,6 +499,15 @@ impl ModControlDomain {
             ModControlDomain::FaderDb(scale) => {
                 let db = if model > 0.0 { 20.0 * (model as f32).log10() } else { f32::NEG_INFINITY };
                 f64::from(scale.db_to_frac(db))
+            }
+            // norm (model) → 実値表示。
+            ModControlDomain::Ranged { min, max, log } => {
+                let n = model.clamp(0.0, 1.0);
+                if log && min > 0.0 && max > 0.0 {
+                    min * (max / min).powf(n)
+                } else {
+                    min + n * (max - min)
+                }
             }
         }
     }
@@ -611,6 +638,32 @@ pub struct SendPickerState {
     pub src_track_id: u32,
 }
 
+/// FIXME #55: どの種類の export がレンジピッカーを開いたか。 ピッカー確定後に
+/// 元の export action へ戻るための分岐に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportRangeKind {
+    /// File → Export WAV...
+    Wav,
+    /// File → Export Video... (mp4)。 Windows 専用。
+    Mp4,
+}
+
+/// FIXME #55: Export WAV / Video の前に出すレンジピッカーモーダルの状態。
+/// `Some` の間だけ `export_range_modal` が描画され、 下の UI 操作をブロック
+/// する。 Ardour / REAPER の time-selection export に倣い、 ユーザーが書き出す
+/// 時間範囲を **拍 (beat)** で選ぶ。 拍は song の native 単位なので audio
+/// (beat→sample) と video (frame→秒→拍) の両 export が同じ窓で揃い、 A/V sync
+/// が崩れない。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExportRangePicker {
+    /// 開始拍 (0 以上、 `end_beat` 未満)。
+    pub start_beat: f64,
+    /// 終了拍 (`start_beat` より大、 song 長以下)。
+    pub end_beat: f64,
+    /// 確定後に戻る export 種別。
+    pub kind: ExportRangeKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClipRef {
     pub track: u32,
@@ -687,6 +740,17 @@ pub struct GroupTransformInspectorSummary {
     /// 編集対象の base transform（`group_transform` 無しなら default）。
     /// inspector の scrubable_number が毎フレーム現値として表示する。
     pub transform: common::model::GroupTransform,
+}
+
+/// FIXME #54 Wave4: 開いている内蔵映像 FX param パネルのデータ（inspector が
+/// scrubable_number 行に展開する）。`def` はカタログ定義、`values` は `def.params`
+/// 同順の現在実値（lane default_value or manifest default を実レンジへ展開）。
+#[derive(Clone)]
+pub struct VideoFxParamsInspector {
+    pub track_id: u32,
+    pub device_index: u32,
+    pub def: &'static common::video_fx::VideoFxDef,
+    pub values: Vec<f32>,
 }
 
 /// inspector / resync が走査する `GroupTransformParam` の固定順
@@ -844,6 +908,9 @@ pub const ARRANGE_PX_PER_BEAT: f32 = 24.0;
 pub const ARRANGE_TRACK_HEIGHT: f32 = 88.0;
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
+/// FIXME #55: export レンジの最小幅 (拍)。 start == end の縮退で 0 フレームの
+/// 出力を作らないよう、 end は常に start + これ以上に保つ。
+pub const MIN_EXPORT_RANGE_BEATS: f64 = 0.25;
 /// 鍵盤レーン click のプレビュー発音 velocity (MIDI 0..=127、 固定値)。
 /// gui_01 #055: widget は押下 pitch のみ返すので velocity は daw_01 側で固定。
 const PREVIEW_VELOCITY: u8 = 100;
@@ -897,6 +964,28 @@ pub(crate) struct ArrangeViewSnapshot {
     track_top: f32,
     row_overrides: std::collections::HashMap<u32, u16>,
 }
+
+/// 進行中 export の現在フェーズ + 進捗。`AppData::export_stage` が単一の真実源で、
+/// 進捗オーバーレイ表示・入力 gate (`handle_event` 冒頭)・再生抑止 (`play`) の判定に
+/// 使う。`None` = export 非実行。
+///
+/// 標準 WAV export と video export の前段は `AudioRender` (daw_audio が freewheel で
+/// 音声を書き出す)、video export の後段は `VideoRender` (daw_gui がフレームを render)。
+/// 標準 WAV か video かの区別 (= overlay タイトル) は `pending_video_export` の有無と
+/// `VideoRender` フェーズで判定する (`export_overlay::draw`)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ExportStage {
+    /// daw_audio が freewheel で音声をレンダリング中。`(done, total)` は **sample 数**
+    /// (song body)。標準 WAV export では唯一フェーズ、video export では前段。
+    AudioRender { done: u64, total: u64 },
+    /// daw_gui が映像フレームをレンダリング中 (video export 後段)。`(done, total)` は
+    /// **frame 数**。
+    VideoRender { done: u64, total: u64 },
+}
+
+/// FIXME #55: a WAV export held while plugins reinitialise — `(path,
+/// range_frames, write_mod_sidecar)`. See [`AppData::pending_export`].
+pub type PendingExport = (std::path::PathBuf, Option<(u64, u64)>, bool);
 
 pub struct AppData {
     // -------- Song / file --------
@@ -1373,6 +1462,10 @@ pub struct AppData {
     /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
     /// it's a plain id set — the window FFI lives in the plugin-host process.
     pub open_plugin_guis: std::collections::HashSet<(u32, u32)>,
+    /// FIXME #54 Wave4: 内蔵映像 FX は plugin window を持たないので、チェーン行の "GUI"
+    /// ボタンはインスペクタ内のパラメータ調整パネルを開く。`Some((track_id, device_index))`
+    /// で 1 つだけ開く（別の FX の GUI を押すと切り替わる）。cursor track 以外に切り替えたら閉じる。
+    pub open_video_fx_params: Option<(u32, u32)>,
 
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,
@@ -1546,10 +1639,16 @@ pub struct AppData {
     /// resync to that control's drag-end. session-only.
     pub mod_depth_scrub_active: Option<(u32, common::model::AutomationTarget)>,
 
-    /// Video export の進捗 `(done_frames, total_frames)`。background thread が
-    /// `ExportProgress` で更新。`None` = export 非実行。UI が進捗オーバーレイの
-    /// 表示判定に使う。
-    pub export_progress: Option<(u64, u64)>,
+    /// 進行中 export の現在フェーズ + 進捗 ([`ExportStage`])。音声 freewheel
+    /// (標準 WAV export / video 前段) は daw_audio の `ExportWavProgress`、映像
+    /// render (video 後段) は daw_gui の `ExportProgress` で更新。`None` = export
+    /// 非実行。進捗オーバーレイ表示・入力 gate・再生抑止の単一真実源。
+    pub export_stage: Option<ExportStage>,
+    /// 音声 freewheel フェーズ (`AudioRender`) の最後に進捗が動いた時刻。export
+    /// 開始時と各 `ExportWavProgress` で更新する。`on_tick` の watchdog が、
+    /// daw_audio が（crash でなく）hang して完了通知も進捗も来ない状態を検出して
+    /// overlay を強制解除するために使う（永久ロック防止）。`None` = 音声 render 非実行。
+    pub export_progress_at: Option<std::time::Instant>,
     /// 実行中 export のキャンセルフラグ。UI の Cancel ボタンで `true` にすると
     /// render loop が次フレームで中断し出力を破棄する。`None` = export 非実行。
     pub export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1560,6 +1659,21 @@ pub struct AppData {
     pub pending_video_export: Option<std::path::PathBuf>,
     /// 自動レンダリングした音声 temp WAV。video export 完了後に削除する。
     pub export_temp_wav: Option<std::path::PathBuf>,
+    /// FIXME #55: video export 待ちの **拍** レンジ `(start_beat, end_beat)`。
+    /// `pending_video_export` と対で立ち、 `ExportWavComplete` で video render を
+    /// 始めるときに `RenderConfig::with_range_beats` へ渡す (音声 temp WAV も
+    /// 同じ窓に trim 済みなので A/V が揃う)。 `None` = 全曲。
+    pub pending_video_export_range: Option<(f64, f64)>,
+    /// FIXME #55: a WAV export request held while the plugin host reinitialises
+    /// all plugins (deactivate→activate) for a clean offline cold render. Set by
+    /// [`Self::begin_wav_export`] (which sends `ReinitPluginsForExport`); fired
+    /// as `MainToChild::ExportWav` on `AppEvent::PluginsReinitDone`. Tuple is
+    /// `(path, range_frames, write_mod_sidecar)`.
+    pub pending_export: Option<PendingExport>,
+    /// FIXME #55: Export WAV / Video のレンジピッカーモーダルの状態。 `Some` の
+    /// 間だけ `export_range_modal` を描画してレンジ確定を待つ。 確定後は元の
+    /// export action (file dialog) を `kind` に応じて起動する。 `None` = 非表示。
+    pub export_range_picker: Option<ExportRangePicker>,
 
     /// docs/plan_text_overlay.md §4 P5: text inspector の文字列 edit buffer。
     /// `text` / `font_family` は文字列 field なので text_input のまま
@@ -1734,10 +1848,16 @@ impl raw_window_handle::HasDisplayHandle for Win32Parent {
 pub enum FileDialogKind {
     /// プロジェクト (.daw) を開く。
     OpenProject,
-    /// video export の mp4 出力先 (Windows のみ到達)。
-    ExportMp4,
-    /// WAV 書き出し。
-    ExportWav,
+    /// video export の mp4 出力先 (Windows のみ到達)。 FIXME #55: レンジ
+    /// ピッカーで選んだ書き出し窓 (拍)。 `None` = 全曲。
+    ExportMp4 {
+        range_beats: Option<(f64, f64)>,
+    },
+    /// WAV 書き出し。 FIXME #55: レンジピッカーで選んだ書き出し窓 (sample
+    /// frame; beat→frame 変換済み)。 `None` = 全曲。
+    ExportWav {
+        range: Option<(u64, u64)>,
+    },
     /// MIDI (SMF) 書き出し。
     ExportMidi,
     /// オーディオ取り込み (複数可)。
@@ -1915,6 +2035,7 @@ impl AppData {
             pending_clip_fx_bounce: None,
             pending_vocal_synth_bounce: None,
             open_plugin_guis: std::collections::HashSet::new(),
+            open_video_fx_params: None,
             track_peak_display: initial_peak_display,
             mod_scalars: Vec::new(),
             pending_plugin_loads: std::collections::HashSet::new(),
@@ -1958,10 +2079,14 @@ impl AppData {
             mod_follower_scrub_active: false,
             armed_mod_source: None,
             mod_depth_scrub_active: None,
-            export_progress: None,
+            export_stage: None,
+            export_progress_at: None,
             export_cancel: None,
             pending_video_export: None,
             export_temp_wav: None,
+            pending_video_export_range: None,
+            pending_export: None,
+            export_range_picker: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             // 実値は new 末尾で `app.saved_song = app.song.clone()` に上書き
@@ -4162,6 +4287,9 @@ pub enum AppEvent {
 
     /// 単一デバイスチェーン: `device_index` でアドレスする (役割別 slot 区分撤廃)。
     ToggleSlotGui { index: u32 },
+    /// FIXME #54 Wave4: 内蔵映像 FX の param 調整パネルから 1 param を編集。
+    /// `value_real` は表示の実レンジ値 → lane の保存値 (0..=1) へ逆写像して格納。
+    SetVideoFxParam { device_index: u32, param_id: u32, value_real: f32 },
     /// inspector の x ボタン: 指定 `device_index` の device を chain から削除。
     RemoveDevice { index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
@@ -4440,8 +4568,35 @@ pub enum AppEvent {
     RefetchSingers,
 
     // -------- WAV export -------------------------------------------------
+    /// File → Export WAV...: open the FIXME #55 range picker (default窓 = 全曲)。
+    /// 確定で `ConfirmExportRange` → file dialog → freewheel render。
     ExportWav,
-    ExportWavComplete { error: Option<String> },
+    /// daw_audio の offline WAV render 完了通知。`cancelled` はユーザー中断
+    /// (`CancelExport`)、`error` は失敗理由（成功は両方 None/false）。型で
+    /// 判定し、error 文字列での分岐はしない。
+    ExportWavComplete { error: Option<String>, cancelled: bool },
+    /// daw_audio が offline WAV render 中に送る音声フェーズの進捗 `(done, total)`
+    /// (sample 数)。`export_stage` を `AudioRender` に更新して進捗オーバーレイに
+    /// 反映する。標準 WAV export / video export 前段のどちらでも来る。非 undoable。
+    ExportWavProgress { done: u64, total: u64 },
+    /// FIXME #55: the plugin host finished reinitialising all plugins for an
+    /// offline cold render → send the stashed `ExportWav` now (clean state).
+    PluginsReinitDone,
+
+    // -------- Export range picker (FIXME #55) ----------------------------
+    /// レンジピッカーの開始拍を更新 (scrubable_number から)。 end 未満 / 0 以上に
+    /// clamp。
+    SetExportRangeStart(f64),
+    /// レンジピッカーの終了拍を更新 (scrubable_number から)。 start 超 / song 長
+    /// 以下に clamp。
+    SetExportRangeEnd(f64),
+    /// レンジピッカーを「全曲」 (start=0, end=length_beats) に戻す。
+    ResetExportRange,
+    /// レンジピッカーを確定し、 `kind` に応じた export action (file dialog) を
+    /// 起動する。 picker は閉じる。
+    ConfirmExportRange,
+    /// レンジピッカーを破棄して export を中止する。
+    CancelExportRange,
     /// Phase 7 B4 Step E (2026-05-13): MIDI export menu trigger。 rfd で
     /// path 取得 → `midi_export::export_midi(&song, &path)` で SMF1 書き出し。
     /// 失敗時は status_message に error を出すのみ (= モーダル無し)。
@@ -4558,19 +4713,21 @@ pub enum AppEvent {
         path: Option<PathBuf>,
     },
 
-    /// Synchronous mp4 render at `output_path`, optionally muxing the
-    /// PCM Float32 WAV at `audio_wav` as an AAC stream. Blocks the
-    /// GUI thread for the duration (= MVP simplicity). v12
-    /// (`docs/plan_video.md` P8).
+    /// Background mp4 render at `output_path`, optionally muxing the
+    /// PCM Float32 WAV at `audio_wav` as an AAC stream. v12
+    /// (`docs/plan_video.md` P8). FIXME #55: `range_beats` restricts the
+    /// rendered window to `[start_beat, end_beat)` (`None` = whole song);
+    /// the muxed `audio_wav` is already trimmed to the same window.
     ExportMp4 {
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
+        range_beats: Option<(f64, f64)>,
     },
-    /// background export thread が毎フレーム発火（`done` / `total` フレーム）。
-    /// `export_progress` を更新して進捗オーバーレイに反映。非 undoable。
+    /// 映像 render thread が発火（`done` / `total` フレーム）。`export_stage` を
+    /// `VideoRender` に更新して進捗オーバーレイに反映。非 undoable。
     ExportProgress { done: u64, total: u64 },
-    /// background export thread の完了通知（成功時は出力 path、失敗 /
-    /// キャンセル時は理由）。`export_progress` / `export_cancel` をクリアして
+    /// 映像 render thread の完了通知（成功時は出力 path、失敗 /
+    /// キャンセル時は理由）。`export_stage` / `export_cancel` をクリアして
     /// status_message に結果を出す。非 undoable。
     ExportFinished {
         result: Result<PathBuf, String>,
@@ -4929,15 +5086,29 @@ impl AppData {
         //   ExportProgress / ExportFinished … background render thread からの進捗/完了
         //   CancelExport … modal の Cancel ボタン（plugin GUI 等の別 OS window 経由の
         //   close は handle_event を通らないので on_tick 側で別 gate）
-        if self.pending_video_export.is_some() || self.export_progress.is_some() {
+        if self.pending_video_export.is_some() || self.export_stage.is_some() {
             let allow = matches!(
                 event,
                 AppEvent::ExportWavComplete { .. }
+                    | AppEvent::ExportWavProgress { .. }
                     | AppEvent::ExportProgress { .. }
                     | AppEvent::ExportFinished { .. }
                     | AppEvent::CancelExport
+                    // child crash 検出は export 中でも処理しないと、daw_audio が
+                    // 音声 render 中に落ちたとき完了通知が永遠に来ず overlay +
+                    // 入力 gate で GUI が永久ロックする (audio 分岐で export を
+                    // 後始末する)。respawn 経路もここを通る。
+                    | AppEvent::ChildDisconnected { .. }
+                    // 30Hz の playhead poll tick。export 中も通して `on_tick` の
+                    // export watchdog (進捗が止まった hang を検出して overlay を
+                    // 強制解除する) を動かす。`on_tick` の本体は is_playing で
+                    // 内部ガードされ、export 中は engine へ何も送らない (無害)。
+                    | AppEvent::Tick { .. }
             );
             if !allow {
+                // gate で落とした event を観測可能にする (silent drop だと
+                // 「dialog で選んだのに何も起きない」等の原因究明が困難)。
+                tracing::debug!(?event, "event gated during export");
                 return;
             }
         }
@@ -5660,6 +5831,9 @@ impl AppData {
             AppEvent::ToggleSlotGui { index } => {
                 self.toggle_slot_gui(index);
             }
+            AppEvent::SetVideoFxParam { device_index, param_id, value_real } => {
+                self.set_video_fx_param(device_index, param_id, value_real);
+            }
             AppEvent::RemoveDevice { index } => {
                 self.remove_device(index);
             }
@@ -5819,7 +5993,33 @@ impl AppData {
                 self.send_picker = None;
             }
             AppEvent::ExportWav => {
-                self.action_export_wav();
+                self.open_export_range_picker(ExportRangeKind::Wav);
+            }
+            AppEvent::SetExportRangeStart(beat) => {
+                if let Some(p) = self.export_range_picker.as_mut() {
+                    // start は [0, end) に clamp。 end と等しくなる入力は拒否
+                    // (end より僅かに手前へ)。
+                    p.start_beat = beat.clamp(0.0, (p.end_beat - MIN_EXPORT_RANGE_BEATS).max(0.0));
+                }
+            }
+            AppEvent::SetExportRangeEnd(beat) => {
+                if let Some(p) = self.export_range_picker.as_mut() {
+                    let max = self.song.length_beats.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
+                    p.end_beat = beat.clamp(p.start_beat + MIN_EXPORT_RANGE_BEATS, max);
+                }
+            }
+            AppEvent::ResetExportRange => {
+                if let Some(p) = self.export_range_picker.as_mut() {
+                    p.start_beat = 0.0;
+                    p.end_beat = self.song.length_beats.max(MIN_EXPORT_RANGE_BEATS);
+                }
+            }
+            AppEvent::ConfirmExportRange => {
+                self.confirm_export_range();
+            }
+            AppEvent::CancelExportRange => {
+                self.export_range_picker = None;
+                self.status_message = "Export をキャンセルしました".into();
             }
             AppEvent::ExportMidi => {
                 self.action_export_midi();
@@ -5868,7 +6068,7 @@ impl AppData {
             }
             AppEvent::OpenExportMp4Dialog => {
                 #[cfg(windows)]
-                self.action_open_export_mp4_dialog();
+                self.open_export_range_picker(ExportRangeKind::Mp4);
                 #[cfg(not(windows))]
                 {
                     self.status_message =
@@ -5907,21 +6107,32 @@ impl AppData {
                     self.quit_after_save = false;
                 }
             }
-            AppEvent::ExportMp4 { output_path, audio_wav } => {
+            AppEvent::ExportMp4 { output_path, audio_wav, range_beats } => {
                 #[cfg(windows)]
-                self.action_export_mp4(output_path, audio_wav);
+                self.action_export_mp4(output_path, audio_wav, range_beats);
                 #[cfg(not(windows))]
                 {
-                    let _ = (output_path, audio_wav);
+                    let _ = (output_path, audio_wav, range_beats);
                     self.status_message =
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
             }
+            AppEvent::ExportWavProgress { done, total } => {
+                // daw_audio の音声 freewheel 進捗。標準 WAV export / video 前段の
+                // どちらでも来る。stage が AudioRender でない (= export 非実行 or
+                // 既に映像フェーズ) なら stale とみなして無視する (overlay の
+                // 亡霊化を防ぐ)。
+                if matches!(self.export_stage, Some(ExportStage::AudioRender { .. })) {
+                    self.export_stage = Some(ExportStage::AudioRender { done, total });
+                    // watchdog: 進捗が来ている間は生存とみなしてタイマーをリセット。
+                    self.export_progress_at = Some(std::time::Instant::now());
+                }
+            }
             AppEvent::ExportProgress { done, total } => {
-                self.export_progress = Some((done, total));
+                self.export_stage = Some(ExportStage::VideoRender { done, total });
             }
             AppEvent::ExportFinished { result } => {
-                self.export_progress = None;
+                self.export_stage = None;
                 self.export_cancel = None;
                 // 自動レンダリングした音声 temp WAV を削除。
                 if let Some(wav) = self.export_temp_wav.take() {
@@ -5942,12 +6153,25 @@ impl AppData {
                     }
                 }
             }
-            AppEvent::CancelExport => {
-                if let Some(flag) = &self.export_cancel {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.status_message = "Video export をキャンセル中...".into();
+            AppEvent::CancelExport => match self.export_stage {
+                // 映像フェーズは daw_gui プロセス内の render thread。in-process の
+                // atomic flag で次フレーム中断させる。
+                Some(ExportStage::VideoRender { .. }) => {
+                    if let Some(flag) = &self.export_cancel {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.status_message = "Video export をキャンセル中...".into();
+                    }
                 }
-            }
+                // 音声 freewheel は daw_audio プロセス。IPC で cancel を送り、
+                // freewheel ループが次 buffer で中断 → `ExportWavComplete
+                // { error: None, cancelled: true }` が返る (cancel は typed flag で
+                // 伝わる)。標準 WAV export / video 前段のどちらでも有効。
+                Some(ExportStage::AudioRender { .. }) => {
+                    self.send_audio(MainToChild::CancelExport);
+                    self.status_message = "書き出しをキャンセル中...".into();
+                }
+                None => {}
+            },
             AppEvent::SetClipReversed { target, reversed } => {
                 self.set_clip_audio_event_reversed(target, reversed);
             }
@@ -6231,35 +6455,84 @@ impl AppData {
             AppEvent::GlueSelectedClips => {
                 self.action_glue_selected_clips();
             }
-            AppEvent::ExportWavComplete { error } => {
+            AppEvent::PluginsReinitDone => {
+                // FIXME #55: plugins are now reinitialised to a clean state —
+                // fire the stashed offline export. (If nothing is pending, a
+                // stray reply; ignore.)
+                if let Some((path, range, write_mod_sidecar)) = self.pending_export.take() {
+                    self.send_audio(MainToChild::ExportWav {
+                        path,
+                        range,
+                        write_mod_sidecar,
+                    });
+                }
+            }
+            AppEvent::ExportWavComplete { error, cancelled } => {
+                // この完了が今 track している音声 render のものでなければ無視する
+                // (BounceClipFxComplete の stale ガードと対称)。crash / watchdog で
+                // 既に abort 済みの後着完了 (= 中止 status を「完了」で上書きしてしまう)
+                // や、daw_audio の二重起動ガードが弾いた reject 完了が、走行中 export の
+                // overlay / plugin render mode / status を壊すのを防ぐ。正規完了は
+                // 標準 WAV / video 前段とも export_stage=AudioRender なので素通りする。
+                if !matches!(self.export_stage, Some(ExportStage::AudioRender { .. }))
+                    && self.pending_video_export.is_none()
+                {
+                    tracing::warn!(
+                        ?error,
+                        cancelled,
+                        "ExportWavComplete with no active audio export; ignoring"
+                    );
+                    return;
+                }
                 // Either way, hand the plugins back to realtime mode
                 // (we set Offline before triggering the export).
                 self.send_plugin(MainToChild::SetRenderMode(
                     common::protocol::RenderMode::Realtime,
                 ));
+                // 音声 freewheel フェーズ終了。overlay の AudioRender 状態を
+                // 必ずクリアする（標準 WAV はこれで overlay が閉じ、video 後段は
+                // この後 `action_export_mp4` が VideoRender を再設定する）。
+                // watchdog 用の進捗タイムスタンプも落とす。
+                self.export_progress_at = None;
+                self.export_stage = None;
                 if let Some(mp4_path) = self.pending_video_export.take() {
-                    // 1 ステップ video export の音声レンダリング完了 → video
-                    // export を開始（音声失敗時は映像のみで続行）。
-                    let wav = match &error {
-                        Some(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "audio render for video export failed; video-only"
-                            );
-                            self.status_message = format!(
-                                "音声レンダリング失敗 ({err}); 映像のみで書き出します"
-                            );
-                            if let Some(t) = self.export_temp_wav.take() {
-                                let _ = std::fs::remove_file(&t);
-                            }
-                            None
+                    // FIXME #55: 音声と同じ拍範囲で video を render する (= 全曲
+                    // なら None)。 取り出して消費。
+                    let range_beats = self.pending_video_export_range.take();
+                    if cancelled {
+                        // 前段（音声）でキャンセル → video export 全体を中止し、
+                        // 映像 render には進まない。
+                        if let Some(t) = self.export_temp_wav.take() {
+                            let _ = std::fs::remove_file(&t);
                         }
-                        None => self.export_temp_wav.clone(),
-                    };
-                    #[cfg(windows)]
-                    self.action_export_mp4(mp4_path, wav);
-                    #[cfg(not(windows))]
-                    let _ = (mp4_path, wav);
+                        let _ = (mp4_path, range_beats);
+                        self.status_message = "Video export をキャンセルしました".into();
+                    } else {
+                        // 1 ステップ video export の音声レンダリング完了 → video
+                        // export を開始（音声失敗時は映像のみで続行）。
+                        let wav = match &error {
+                            Some(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "audio render for video export failed; video-only"
+                                );
+                                self.status_message = format!(
+                                    "音声レンダリング失敗 ({err}); 映像のみで書き出します"
+                                );
+                                if let Some(t) = self.export_temp_wav.take() {
+                                    let _ = std::fs::remove_file(&t);
+                                }
+                                None
+                            }
+                            None => self.export_temp_wav.clone(),
+                        };
+                        #[cfg(windows)]
+                        self.action_export_mp4(mp4_path, wav, range_beats);
+                        #[cfg(not(windows))]
+                        let _ = (mp4_path, wav, range_beats);
+                    }
+                } else if cancelled {
+                    self.status_message = "WAV 書き出しをキャンセルしました".into();
                 } else if let Some(err) = error {
                     self.status_message = format!("WAV 書き出し失敗: {err}");
                 } else {
@@ -7181,7 +7454,7 @@ impl AppData {
         self.pending_added_plugin_finalize.clear();
     }
 
-    fn restore_plugin_from_song(&mut self, song: &Song) {
+    pub(crate) fn restore_plugin_from_song(&mut self, song: &Song) {
         let Some(db) = self.plugin_db.clone() else {
             tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
@@ -7643,9 +7916,11 @@ impl AppData {
     fn play(&mut self) {
         // export 中は再生を禁止する。音声 freewheel フェーズの realtime play は
         // offline render と競合し、書き出される音声を壊しうる（映像フェーズは
-        // 独立だが、 混乱を避けて export 全体で一律に止める）。
-        if self.pending_video_export.is_some() || self.export_progress.is_some() {
-            self.status_message = "Video export 中は再生できません".into();
+        // 独立だが、 混乱を避けて export 全体で一律に止める）。標準 WAV export も
+        // `export_stage` が立つので同じ gate で止まる（旧構造では WAV export 中に
+        // 再生できてしまい render を壊しえた）。
+        if self.pending_video_export.is_some() || self.export_stage.is_some() {
+            self.status_message = "書き出し中は再生できません".into();
             return;
         }
         // FIXME #24: プロジェクトロードの asset decode 中は音声がまだ揃って
@@ -10597,9 +10872,17 @@ impl AppData {
     pub fn inspector_group_transform_summary(
         &self,
     ) -> Option<GroupTransformInspectorSummary> {
-        let idx = self.cursor_track_index()?;
-        let track = self.song.tracks.get(idx)?;
-        if !self.is_group_track(track.id) || !self.group_has_visual_content(track.id) {
+        // FIXME #54 Wave4: Transform もチェーン行の "GUI" ボタンでトグル開閉する（他 FX と統一、
+        // 出っぱなしにしない）。開いている device が cursor track の Transform 配置 device の
+        // ときだけ Group Transform セクションを出す。
+        let (open_track, open_idx) = self.open_video_fx_params?;
+        if self.cursor_track_id() != Some(open_track) {
+            return None;
+        }
+        let track = self.song.track_by_id(open_track)?;
+        if track.devices.get(open_idx as usize).map(|d| d.plugin_id.as_str())
+            != Some(common::video_fx::TRANSFORM_ID)
+        {
             return None;
         }
         let mut automated = [false; 8];
@@ -10613,6 +10896,104 @@ impl AppData {
             automated,
             transform: track.group_transform.unwrap_or_default(),
         })
+    }
+
+    /// FIXME #54 Wave4: 開いている映像 FX param パネル（`open_video_fx_params`）が cursor
+    /// track と一致するとき、その device の def + 各 param の現在実値を返す。inspector が
+    /// scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
+    pub fn inspector_video_fx_params(&self) -> Option<VideoFxParamsInspector> {
+        let (track_id, device_index) = self.open_video_fx_params?;
+        if self.cursor_track_id() != Some(track_id) {
+            return None;
+        }
+        let def = self
+            .song
+            .fx_chain_by_track_id(track_id)?
+            .get(device_index as usize)
+            .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))?;
+        if def.params.is_empty() {
+            return None; // Transform 等は専用セクションで編集。
+        }
+        let empty: &[common::model::AutomationLane] = &[];
+        let lanes: &[common::model::AutomationLane] =
+            if track_id == common::model::MASTER_TRACK_ID {
+                &self.song.song_lanes
+            } else {
+                self.song
+                    .track_by_id(track_id)
+                    .map_or(empty, |t| t.automation_lanes.as_slice())
+            };
+        let values: Vec<f32> = def
+            .params
+            .iter()
+            .map(|p| {
+                let target = common::model::AutomationTarget::PluginParam {
+                    device_index,
+                    param_id: p.id,
+                    legacy_slot: None,
+                };
+                // base = lane default_value、無ければ manifest default（実レンジ表示）。
+                let norm = lanes
+                    .iter()
+                    .find(|l| l.target == target)
+                    .map_or_else(|| p.kind.default_norm(), |l| l.default_value);
+                p.kind.norm_to_real(norm)
+            })
+            .collect();
+        Some(VideoFxParamsInspector { track_id, device_index, def, values })
+    }
+
+    /// FIXME #54 Wave4: 内蔵映像 FX param を 1 つ編集（パネルの scrubable から）。値の SSoT は
+    /// `PluginParam` lane の `default_value`（0..=1 norm、`video_fx` モジュール doc）。lane が
+    /// 無ければ値保持用（`visible=false`・curve 無し）を作る。master は `song_lanes`。
+    fn set_video_fx_param(&mut self, device_index: u32, param_id: u32, value_real: f32) {
+        use common::model::{AutomationLane, AutomationTarget};
+        let Some(track_id) = self.cursor_track_id() else {
+            return;
+        };
+        // def_by_id は &'static を返すので self.song の借用はここで終わる。
+        let Some(def) = self
+            .song
+            .fx_chain_by_track_id(track_id)
+            .and_then(|c| c.get(device_index as usize))
+            .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))
+        else {
+            return;
+        };
+        let Some(param) = def.param(param_id) else {
+            return;
+        };
+        let display_name = format!("{} {}", def.name, param.name);
+        let norm = param.kind.real_to_norm(value_real);
+        let target = AutomationTarget::PluginParam { device_index, param_id, legacy_slot: None };
+        if track_id == common::model::MASTER_TRACK_ID {
+            if let Some(lane) = self.song.song_lanes.iter_mut().find(|l| l.target == target) {
+                lane.default_value = norm;
+            } else {
+                let id = self.song.alloc_song_lane_id();
+                let mut lane = AutomationLane::new(target.clone(), norm);
+                lane.id = id;
+                lane.visible = false;
+                self.song.song_lanes.push(lane);
+            }
+        } else if let Some(track) = self.song.track_by_id_mut(track_id) {
+            if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
+                lane.default_value = norm;
+            } else {
+                let id = track.alloc_lane_id();
+                let mut lane = AutomationLane::new(target.clone(), norm);
+                lane.id = id;
+                lane.visible = false;
+                track.automation_lanes.push(lane);
+            }
+        }
+        // 「A」キー (last_touched_param) で automation lane を可視化/curve 化できる。
+        self.last_touched_param = Some(TouchedParam {
+            track_id,
+            target,
+            display_name,
+            touched_at: std::time::Instant::now(),
+        });
     }
 
     /// docs/plan_text_overlay.md §4 P8: 選択中 text clip の track に
@@ -10743,9 +11124,20 @@ impl AppData {
         self.pending_play = false;
         self.active_param_gestures.clear();
         self.latched_param_gestures.clear();
+        // 音声 render 中の crash で export を中止したか。respawn 成功時の status に
+        // 「書き出しを中止しました」を併記して、中止の事実が上書きで消えないようにする。
+        let mut export_aborted = false;
         match kind {
             ChildKind::Audio => {
                 self.audio_tx = None;
+                // 音声 render 中の crash なら ExportWavComplete が永遠に来ない。
+                // export を強制終了して overlay / 入力 gate を解除する（解除しないと
+                // GUI が永久ロックする）。AudioRender 中でなければ no-op。中止した
+                // ことは下の respawn status に併記する（respawn 成功 status に
+                // 上書きされて「書き出しが中止された」事実が消えないように）。
+                export_aborted = self.abort_audio_export(
+                    "音声エンジンがクラッシュしたため書き出しを中止しました".into(),
+                );
                 tracing::warn!("daw_audio child disconnected");
             }
             ChildKind::PluginHost => {
@@ -10755,6 +11147,13 @@ impl AppData {
                 tracing::warn!("daw_plugin_host child disconnected");
             }
         }
+
+        // 中止した書き出しがあれば status に併記する suffix。
+        let export_suffix = if export_aborted {
+            " — 書き出しを中止しました"
+        } else {
+            ""
+        };
 
         // crash-loop ガード: 短時間に同 kind が閾値以上切断したら自動 respawn を
         // 止める。落ちるプラグインを抱えたプロジェクト (例: state 復元後に
@@ -10774,9 +11173,10 @@ impl AppData {
         if recent >= CRASH_LIMIT {
             self.status_message = format!(
                 "{}が繰り返しクラッシュしています — 自動再起動を停止しました。\
-                 プロジェクトのプラグインを確認してください{}",
+                 プロジェクトのプラグインを確認してください{}{}",
                 kind.as_str(),
-                if was_playing { " (再生停止)" } else { "" }
+                if was_playing { " (再生停止)" } else { "" },
+                export_suffix
             );
             tracing::error!(
                 ?kind,
@@ -10790,9 +11190,10 @@ impl AppData {
         // (= script / test 経路) なら通知だけで終わる。
         let Some(supervisor) = self.supervisor.clone() else {
             self.status_message = format!(
-                "{}が切断されました{} — supervisor 無効",
+                "{}が切断されました{}{} — supervisor 無効",
                 kind.as_str(),
-                if was_playing { " (再生停止)" } else { "" }
+                if was_playing { " (再生停止)" } else { "" },
+                export_suffix
             );
             return;
         };
@@ -10809,17 +11210,19 @@ impl AppData {
                 self.restore_plugin_from_song(&song_snapshot);
                 self.sync_song_to_plugin_host();
                 self.status_message = format!(
-                    "{}を再起動しました{}",
+                    "{}を再起動しました{}{}",
                     kind.as_str(),
-                    if was_playing { " (再生は手動で再開してください)" } else { "" }
+                    if was_playing { " (再生は手動で再開してください)" } else { "" },
+                    export_suffix
                 );
                 tracing::info!(?kind, "child respawn + state restore completed");
             }
             Err(e) => {
                 self.status_message = format!(
-                    "{}の再起動に失敗しました: {} — アプリ再起動が必要です",
+                    "{}の再起動に失敗しました: {}{} — アプリ再起動が必要です",
                     kind.as_str(),
-                    e
+                    e,
+                    export_suffix
                 );
                 tracing::error!(error = %e, ?kind, "child respawn failed");
             }
@@ -15478,6 +15881,24 @@ impl AppData {
         let Some(track_id) = self.cursor_track_id() else {
             return;
         };
+        // FIXME #54 Wave4: 内蔵映像 FX は plugin window を持たない。"GUI" ボタンは
+        // インスペクタ内のパラメータ調整パネルをトグルする (plugin window は開かない)。
+        // Transform も同様にトグル開閉 (開くと Group Transform セクションが出る。出っぱなしにしない)。
+        let device = self
+            .song
+            .fx_chain_by_track_id(track_id)
+            .and_then(|chain| chain.get(index as usize));
+        if let Some(d) = device
+            && d.ports.is_video()
+        {
+            let key = (track_id, index);
+            self.open_video_fx_params = if self.open_video_fx_params == Some(key) {
+                None
+            } else {
+                Some(key)
+            };
+            return; // 映像 device は plugin window を持たない。
+        }
         // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
         // FIXME #31: open 状態は open_plugin_guis (id set) で追跡。実 window は
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
@@ -16158,6 +16579,11 @@ impl AppData {
         // also closes the editor by stable plugin id as a backstop, and shifts
         // the remaining open-state keys to match the new chain indices.
         self.cleanup_slot_gui(track_id, index);
+        // FIXME #54 Wave4: 開いている映像 FX param パネルが同トラックなら閉じる
+        // (削除で device index がずれて別 device を指すのを防ぐ)。
+        if self.open_video_fx_params.is_some_and(|(t, _)| t == track_id) {
+            self.open_video_fx_params = None;
+        }
         // PR2.1: send `Track::id` to the plugin host.
         self.send_plugin(MainToChild::RemoveSlotPlugin {
             track: track_id,
@@ -16198,6 +16624,19 @@ impl AppData {
             && let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id)
         {
             track.source = InstrumentSource::None;
+        }
+        // FIXME #54 Wave3: Transform 配置 device を外したら group_transform を消す
+        // (device-gate で配置は即無効になるが、残すと ensure_ids が次回ロードで device を
+        // 再生成してしまう)。同 track に別の Transform device が残っていれば保持。
+        if track_id != common::model::MASTER_TRACK_ID
+            && removed.plugin_id == common::video_fx::TRANSFORM_ID
+            && let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id)
+            && !track
+                .devices
+                .iter()
+                .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID)
+        {
+            track.group_transform = None;
         }
     }
 
@@ -16371,6 +16810,25 @@ impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
     fn on_tick(&mut self, playhead_samples: u64, peak_l_raw: f32, peak_r_raw: f32) {
+        // Export watchdog: daw_audio が crash でなく hang した場合 (進捗 heartbeat も
+        // 完了通知も止まる) は ChildDisconnected も発火しないので overlay + 入力 gate
+        // が永久に残る。一定時間進捗が来なければ強制終了して脱出口を確保する。
+        // daw_audio は render 中 250ms ごとに heartbeat を送るので、無進捗が
+        // この閾値を超えるのは実質 hang のみ (長尺 render での誤発火は無い)。
+        // VideoRender は daw_gui 内で必ず ExportFinished を返すので対象外。
+        const EXPORT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+        if matches!(self.export_stage, Some(ExportStage::AudioRender { .. }))
+            && let Some(since) = self.export_progress_at
+            && since.elapsed() > EXPORT_WATCHDOG
+        {
+            tracing::error!(
+                elapsed_s = since.elapsed().as_secs(),
+                "offline WAV render stalled past watchdog timeout; aborting export"
+            );
+            self.abort_audio_export(
+                "音声エンジンが応答しないため書き出しを中止しました".into(),
+            );
+        }
         let next_beat = if playhead_samples == u64::MAX {
             None
         } else {
@@ -16911,7 +17369,14 @@ impl AppData {
             self.song.master_fx_chain.push(new_device);
         } else if let Some(track_idx) = self.cursor_track_index() {
             let track = &mut self.song.tracks[track_idx];
+            let added_transform = new_device.plugin_id == common::video_fx::TRANSFORM_ID;
             track.devices.push(new_device);
+            // FIXME #54 Wave3: Transform 配置 device を刺したら group_transform を有効化
+            // (resolve_track_transform は device-gate + group_transform 値。未初期化なら
+            // identity 配置で no-op になり、inspector で編集を始められない)。
+            if added_transform && track.group_transform.is_none() {
+                track.group_transform = Some(common::model::GroupTransform::default());
+            }
             // builtin VOICEVOX を挿したら vocal track 化。 旧 "+Vocal Track"
             // ボタンの役割をここに集約。 歌詞 synth の gating 自体は
             // `Track::is_voicevox_vocal()` (= device の実在) が SSoT なので、
@@ -17336,13 +17801,12 @@ impl AppData {
     }
 
     fn refresh_picker_visible(&mut self) {
-        // master bus は audio FX しか持てないので、 master 選択中は FX カテゴリの
-        // プラグインだけをリストに出す (それ以外は挿せないので隠す)。 通常トラックは
-        // 全カテゴリ混合で見せ、 種別は選択時に features から自動振り分けする
-        // (plan_unified_plugin_picker.md)。
-        // FIXME #54: master 映像チェーン (master_fx_chain への video device + 最終合成で
-        // apply_chain) は後続。 それまで master picker から Video は除外し、 描画されない
-        // 孤立 device をユーザーが挿せないようにする (orphaned feature を出さない)。
+        // master bus は audio FX と **映像効果** を持てる (FIXME #54 Wave1: master 映像
+        // チェーン = master_fx_chain の video device を最終合成 1 枚に apply_chain)。master
+        // 選択中は FX / Video のみ出す (instrument / midi-fx は master に挿せない)。通常
+        // トラックは全カテゴリ混合で見せ、種別は選択時に features から自動振り分け。
+        // Transform 配置 device は master には出さない (master は全画面 = 配置の意味が薄く、
+        // master group_transform の受け皿も無い)。
         let master = self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
         // 検索クエリ (前後空白を除去)。 空なら (master フィルタを除き) 全件、 非空なら
         // name / vendor のいずれかへの subsequence マッチで AND 絞り込みする。
@@ -17350,7 +17814,12 @@ impl AppData {
         let visible: Vec<PluginPickEntry> = self
             .plugin_picker_entries
             .iter()
-            .filter(|e| !master || e.category == PluginCategory::Fx)
+            .filter(|e| {
+                !master
+                    || (matches!(e.category, PluginCategory::Fx | PluginCategory::Video)
+                        // master には Transform 配置 device を出さない (全画面 master に配置は無意味)。
+                        && e.id != common::video_fx::TRANSFORM_ID)
+            })
             .filter(|e| {
                 query.is_empty()
                     || crate::fuzzy::subsequence_match(&e.name, query)
@@ -17378,19 +17847,123 @@ impl AppData {
             .unwrap_or_else(|| plugin_id.to_string())
     }
 
-    /// File → Export WAV...:
-    ///   1. Pick a destination via the OS file dialog.
-    ///   2. Tell the plugin host to switch every plugin to
-    ///      `CLAP_RENDER_OFFLINE` so plugins offering the `clap.render`
-    ///      extension can use higher-quality algorithms.
-    ///   3. Send `ExportWav { path }` to daw_audio, which freewheels
-    ///      the song through the existing AudioWorker pool while the
-    ///      CPAL callback writes silence.
-    ///   4. On `ExportWavComplete` the handler flips render mode back
-    ///      to Realtime (see `AppEvent::ExportWavComplete` arm).
-    fn action_export_wav(&mut self) {
-        let dialog = rfd::FileDialog::new().add_filter("WAV", &["wav"]);
-        self.spawn_file_dialog(dialog, FileDialogMode::Save, FileDialogKind::ExportWav);
+    /// FIXME #55: レンジピッカーを開くときの既定範囲 (拍)。 ループ範囲が設定
+    /// されていれば (`loop_end_beat > loop_start_beat`) それを既定にし、 無ければ
+    /// 全曲 (0..length_beats) にフォールバックする。 ループ範囲は `Song` が所有する
+    /// SSoT (`common/src/model.rs`) で、 transport の再生ループと同じ値を使う
+    /// (= 「ループしている区間をそのまま書き出す」 という DAW で一般的な既定)。
+    /// 末尾は最低 `MIN_EXPORT_RANGE_BEATS` を保証する。
+    fn default_export_range(&self) -> (f64, f64) {
+        let (start, end) = if self.song.loop_end_beat > self.song.loop_start_beat {
+            (self.song.loop_start_beat, self.song.loop_end_beat)
+        } else {
+            (0.0, self.song.length_beats)
+        };
+        let start = start.max(0.0);
+        (start, end.max(start + MIN_EXPORT_RANGE_BEATS))
+    }
+
+    /// FIXME #55: Export WAV / Video を押したときに、 まず書き出す **時間範囲**
+    /// (拍) を選ぶレンジピッカーモーダルを開く。 デフォルト窓は `default_export_range`
+    /// = ループ範囲 (設定されていれば) / 無ければ全曲。 確定 (`ConfirmExportRange`)
+    /// で `kind` に応じた既存の export action (file dialog) を起動する。 Ardour /
+    /// REAPER の time-selection export と同じ「範囲を指定して書き出す」 UX。
+    fn open_export_range_picker(&mut self, kind: ExportRangeKind) {
+        // video export は実行中だと二重起動できない (旧 action_open_export_mp4_dialog
+        // のガードをここへ移設)。
+        if matches!(kind, ExportRangeKind::Mp4)
+            && (self.export_stage.is_some()
+                || self.pending_video_export.is_some()
+                || self.export_dialog_open)
+        {
+            self.status_message = "Video export を実行中です".into();
+            return;
+        }
+        let (start_beat, end_beat) = self.default_export_range();
+        self.export_range_picker = Some(ExportRangePicker {
+            start_beat,
+            end_beat,
+            kind,
+        });
+    }
+
+    /// FIXME #55: レンジピッカー確定。 選んだ拍範囲を kind に応じて変換し、 元の
+    /// export action を起動する。 「全曲」 (start=0, end=length) のときは範囲なし
+    /// (`None`) として従来どおり全曲を書き出す。
+    fn confirm_export_range(&mut self) {
+        let Some(picker) = self.export_range_picker.take() else {
+            return;
+        };
+        // start=0 かつ end>=length は全曲とみなす (= None)。 浮動小数の比較は緩く。
+        let is_full = picker.start_beat <= f64::EPSILON
+            && picker.end_beat >= self.song.length_beats - f64::EPSILON;
+        let range_beats: Option<(f64, f64)> =
+            if is_full { None } else { Some((picker.start_beat, picker.end_beat)) };
+        match picker.kind {
+            ExportRangeKind::Wav => {
+                let range = range_beats.map(|(s, e)| self.export_beats_to_frames(s, e));
+                let dialog = rfd::FileDialog::new().add_filter("WAV", &["wav"]);
+                self.spawn_file_dialog(
+                    dialog,
+                    FileDialogMode::Save,
+                    FileDialogKind::ExportWav { range },
+                );
+            }
+            ExportRangeKind::Mp4 => {
+                #[cfg(windows)]
+                self.action_open_export_mp4_dialog(range_beats);
+                #[cfg(not(windows))]
+                {
+                    let _ = range_beats;
+                    self.status_message =
+                        "Video export は Windows 専用 (WMF 経由) です".into();
+                }
+            }
+        }
+    }
+
+    /// FIXME #55: 拍範囲 → sample frame 範囲。 audio engine と同じ式・同じ
+    /// sample rate (`common::audio_bridge::SAMPLE_RATE`、 AudioSession に渡す値)
+    /// で換算するので、 daw_audio 側 `run_export` の `samples_per_beat` と完全に
+    /// 一致する (bounce の `clip_range_to_frames` と同じ SSoT)。
+    fn export_beats_to_frames(&self, start_beat: f64, end_beat: f64) -> (u64, u64) {
+        let sr = f64::from(common::audio_bridge::SAMPLE_RATE);
+        let bpm = f64::from(self.song.bpm).max(f64::EPSILON);
+        let spb = sr * 60.0 / bpm;
+        let s = (start_beat * spb).max(0.0) as u64;
+        let e = (end_beat * spb).max(0.0) as u64;
+        (s, e)
+    }
+
+    /// FIXME #55: begin an offline WAV export the right way — stop playback,
+    /// push the latest song + offline render mode, then **reinitialise every
+    /// plugin** (deactivate→activate) for a clean cold render before the render
+    /// runs. The actual `ExportWav` is sent on `AppEvent::PluginsReinitDone`
+    /// (see the handler) once the plugin host confirms the reinit. Without the
+    /// reinit a synth holding a live voice (VCV Rack 2) bleeds into the head;
+    /// CLAP `reset()` alone does not clear it. Used by both the standalone WAV
+    /// export and the video export's audio render.
+    fn begin_wav_export(
+        &mut self,
+        path: std::path::PathBuf,
+        range: Option<(u64, u64)>,
+        write_mod_sidecar: bool,
+    ) {
+        // 書き出しは freewheel render。 再生中なら先に停止する (live dispatch と
+        // export dispatch が同じ plugin host worker slot で衝突するのを防ぐ)。
+        if self.is_playing {
+            self.stop();
+        }
+        // freewheel 開始前に最新 song snapshot + project_dir を daw_audio へ。
+        let song = self.song.clone();
+        self.send_audio(MainToChild::LoadSong(song));
+        self.send_plugin(MainToChild::SetRenderMode(
+            common::protocol::RenderMode::Offline,
+        ));
+        // 全 plugin を deactivate→activate でクリーンにしてから export する。
+        // 完了 (`PluginsReinitDone`) で stashed export を発火。
+        self.pending_export = Some((path, range, write_mod_sidecar));
+        self.send_plugin(MainToChild::ReinitPluginsForExport);
     }
 
     /// Phase 7 B4 Step E (2026-05-13): File → Export MIDI...
@@ -18004,9 +18577,12 @@ impl AppData {
     /// 自動レンダリング（daw_audio の freewheel）し、完了（`ExportWavComplete`）
     /// 後に video export して mux する（`action_export_mp4`）。旧仕様の「音声
     /// WAV を別途選ばせる 2 つ目のダイアログ」 は廃止。
+    /// FIXME #55: `range_beats` はレンジピッカーで確定した書き出し窓 (拍)。
+    /// `None` = 全曲。 二重起動ガードはピッカーを開く時点 (`open_export_range_picker`)
+    /// で済んでいるが、 ピッカー表示中に状態が変わる経路は無いので念のため残す。
     #[cfg(windows)]
-    fn action_open_export_mp4_dialog(&mut self) {
-        if self.export_progress.is_some()
+    fn action_open_export_mp4_dialog(&mut self, range_beats: Option<(f64, f64)>) {
+        if self.export_stage.is_some()
             || self.pending_video_export.is_some()
             || self.export_dialog_open
         {
@@ -18026,29 +18602,81 @@ impl AppData {
             .set_title("Export Video to MP4...");
         self.export_dialog_open = true;
         self.status_message = "保存先を選択中...".into();
-        self.spawn_file_dialog(dialog, FileDialogMode::Save, FileDialogKind::ExportMp4);
+        self.spawn_file_dialog(
+            dialog,
+            FileDialogMode::Save,
+            FileDialogKind::ExportMp4 { range_beats },
+        );
     }
 
     /// `ExportMp4PathChosen` で保存先が確定したときの video export 後段。 旧
     /// `action_open_export_mp4_dialog` が dialog の戻り値で同期に走らせていた
     /// 「音声を temp WAV へ自動レンダリング → 完了後に video export + mux」 を、
-    /// dialog 別スレッド化に伴いここへ移設した。
-    fn action_begin_export_mp4(&mut self, output_path: PathBuf) {
+    /// dialog 別スレッド化に伴いここへ移設した。 FIXME #55: `range_beats` は
+    /// 書き出し窓 (拍)。 音声 temp WAV はこの窓に trim して書き、 video render も
+    /// 同じ窓で回す (`pending_video_export_range` 経由) ので A/V が揃う。
+    fn action_begin_export_mp4(
+        &mut self,
+        output_path: PathBuf,
+        range_beats: Option<(f64, f64)>,
+    ) {
+        // audio engine が死んでいる (audio_tx=None) と前段の音声 render が
+        // start できず ExportWavComplete が来ない → overlay 永久ロック。
+        // 開始前にガードする（標準 WAV export と同じ防御）。
+        if self.audio_tx.is_none() {
+            self.status_message =
+                "音声エンジンが利用できないため Video export を開始できません".into();
+            return;
+        }
         let temp_wav = std::env::temp_dir()
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
         self.pending_video_export = Some(output_path);
+        self.pending_video_export_range = range_beats;
         self.export_temp_wav = Some(temp_wav.clone());
+        // 前段 = 音声 freewheel。daw_audio の `ExportWavProgress` で determinate
+        // 進捗が来る（旧構造では indeterminate「音声レンダリング中」だった）。
+        self.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+        self.export_progress_at = Some(std::time::Instant::now());
         self.status_message = "音声をレンダリング中...".into();
-        // 再生中なら停止（freewheel と realtime play の競合を回避）。
-        if self.is_playing {
-            self.stop();
+        // 音声も video と同じ窓で freewheel render (beat→frame は audio engine と
+        // 同じ式)。 `None` で全曲。 FIXME #55: stop → reinit plugins → ExportWav
+        // (begin_wav_export 経由)。 video render が `.modenv` sidecar を sample して
+        // modulation を再現するので、 ここだけ sidecar を書く。
+        let range = range_beats.map(|(s, e)| self.export_beats_to_frames(s, e));
+        self.begin_wav_export(temp_wav, range, true);
+    }
+
+    /// 音声 freewheel フェーズ (`AudioRender`) を強制終了する。daw_audio が
+    /// crash した (`handle_child_disconnected`) / hang して進捗も完了通知も来ない
+    /// (`on_tick` watchdog) ときの脱出口。export_stage を None に戻して overlay /
+    /// 入力 gate / 再生抑止を解除し、video 前段だった場合は後段に進まず全体中止
+    /// (pending_video_export / temp WAV を破棄)、plugin を Realtime へ戻す。
+    /// `reason` を status_message に出す。`AudioRender` 中でなければ no-op
+    /// (= VideoRender は daw_gui 内なので audio 断の影響を受けない)。
+    /// 実際に中止したら `true`、`AudioRender` 中でなく no-op なら `false` を返す。
+    /// 呼び出し側 (`handle_child_disconnected`) が status 文言の組み立てに使う。
+    fn abort_audio_export(&mut self, reason: String) -> bool {
+        if !matches!(self.export_stage, Some(ExportStage::AudioRender { .. })) {
+            return false;
         }
-        let song = self.song.clone();
-        self.send_audio(MainToChild::LoadSong(song));
+        self.export_stage = None;
+        self.export_progress_at = None;
+        self.pending_video_export = None;
+        if let Some(t) = self.export_temp_wav.take() {
+            let _ = std::fs::remove_file(&t);
+        }
+        // daw_audio がまだ生きている (= watchdog が slow render を hang と誤検出した
+        // ケース等) 場合、freewheel を止めて export_running を落とさせる。落とさないと
+        // CPAL callback が無音を書き続け「再生しても音が出ない」状態になる。crash 時は
+        // 既に audio_tx=None なので send_audio は no-op (= 害なし)。
+        self.send_audio(MainToChild::CancelExport);
+        // export 開始時に Offline へ切り替えた plugin を Realtime に戻す。plugin
+        // host は daw_audio とは別プロセスなので audio 断でも生存している。
         self.send_plugin(MainToChild::SetRenderMode(
-            common::protocol::RenderMode::Offline,
+            common::protocol::RenderMode::Realtime,
         ));
-        self.send_audio(MainToChild::ExportWav { path: temp_wav });
+        self.status_message = reason;
+        true
     }
 
     /// native file dialog を **別スレッド + owner-modal** で開く共通処理。 dialog を
@@ -18090,29 +18718,53 @@ impl AppData {
                     self.action_open_path(path);
                 }
             }
-            FileDialogKind::ExportMp4 => {
+            FileDialogKind::ExportMp4 { range_beats } => {
                 // 二重起動ガードを解除し、 Some なら export フロー開始。
                 self.export_dialog_open = false;
                 match paths.into_iter().next() {
-                    Some(output_path) => self.action_begin_export_mp4(output_path),
+                    #[cfg(windows)]
+                    Some(output_path) => {
+                        self.action_begin_export_mp4(output_path, range_beats)
+                    }
+                    #[cfg(not(windows))]
+                    Some(_output_path) => {
+                        let _ = range_beats;
+                        self.status_message =
+                            "Video export は Windows 専用 (WMF 経由) です".into();
+                    }
                     None => {
                         self.status_message =
                             "Video export をキャンセルしました".into();
                     }
                 }
             }
-            FileDialogKind::ExportWav => {
+            FileDialogKind::ExportWav { range } => {
+                // dialog が閉じた（確定 or キャンセル）ので二重起動ガードを解除。
+                self.export_dialog_open = false;
                 let Some(path) = paths.into_iter().next() else {
                     return;
                 };
+                // audio engine が死んでいる (respawn 失敗 / crash-loop give-up で
+                // audio_tx=None) と、ExportWav は send_audio に黙って drop される。
+                // ここで export_stage を立ててしまうと完了通知が永遠に来ず overlay
+                // + 入力 gate で GUI が永久ロックする。先にガードして start しない。
+                if self.audio_tx.is_none() {
+                    self.status_message =
+                        "音声エンジンが利用できないため WAV 書き出しを開始できません".into();
+                    return;
+                }
                 self.status_message = "WAV 書き出し中...".to_string();
-                // freewheel 開始前に最新 song snapshot を daw_audio へ送る。
-                let song = self.song.clone();
-                self.send_audio(MainToChild::LoadSong(song));
-                self.send_plugin(MainToChild::SetRenderMode(
-                    common::protocol::RenderMode::Offline,
-                ));
-                self.send_audio(MainToChild::ExportWav { path });
+                // 進捗オーバーレイ（modal）を即表示。最初の `ExportWavProgress` が
+                // 来るまでは 0% 表示、以降 daw_audio の freewheel 進捗で更新、
+                // `ExportWavComplete` で None に戻して閉じる。これで WAV export 中
+                // の入力 gate / 再生抑止も video と同様に効く。
+                self.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+                self.export_progress_at = Some(std::time::Instant::now());
+                // FIXME #55: standalone WAV export — stop → reinit plugins →
+                // (on PluginsReinitDone) ExportWav。begin_wav_export が再生停止 /
+                // LoadSong / SetRenderMode(Offline) / 全 plugin 再初期化を行う。
+                // modulation は音に焼き込み済みなので `.modenv` sidecar は書かない。
+                self.begin_wav_export(path, range, false);
             }
             FileDialogKind::ExportMidi => {
                 let Some(path) = paths.into_iter().next() else {
@@ -18176,8 +18828,12 @@ impl AppData {
         &mut self,
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
+        range_beats: Option<(f64, f64)>,
     ) {
-        if self.export_progress.is_some() {
+        // 何らかの export が走っている間は再入を弾く。video 後段への chain は
+        // `ExportWavComplete` ハンドラが先に `export_stage` を None に戻してから
+        // 呼ぶので通る。
+        if self.export_stage.is_some() {
             self.status_message = "Video export を実行中です".into();
             return;
         }
@@ -18189,12 +18845,15 @@ impl AppData {
         let proxy = self.event_proxy.clone();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.export_cancel = Some(cancel.clone());
-        self.export_progress = Some((0, 0));
+        self.export_stage = Some(ExportStage::VideoRender { done: 0, total: 0 });
         self.status_message = format!("Video export 開始: {}", output_path.display());
         std::thread::spawn(move || {
+            // FIXME #55: video の render 窓も拍範囲に合わせる (audio temp WAV は
+            // 既に同じ窓に trim 済み → frame 0 で A/V が揃う)。
             let cfg = crate::render_video::RenderConfig::new(&song, &output_path)
                 .with_project_dir(project_dir.as_deref())
-                .with_audio_wav(audio_wav.as_deref());
+                .with_audio_wav(audio_wav.as_deref())
+                .with_range_beats(range_beats);
             // 進捗は 5 フレームごと（+ 開始 / 完了）に間引いて送る（毎フレーム
             // 送ると event queue を圧迫する）。
             let mut last_sent = 0u64;

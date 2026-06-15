@@ -45,6 +45,10 @@ const WM_COMMAND_WAKE: u32 = WM_APP + 1;
 /// (or its CLAP callbacks) to the IPC sender.
 #[derive(Debug, Clone)]
 pub enum PluginEvent {
+    /// FIXME #55: every plugin reinitialised (deactivate→activate) for an
+    /// offline cold render (reply to `PluginCommand::ReinitPluginsForExport`).
+    /// `From<PluginEvent>` maps to `ChildToMain::PluginsReinitDone`.
+    PluginsReinitDone,
     SlotGuiOpened {
         track: u32,
         index: u32,
@@ -149,6 +153,7 @@ impl From<PluginEvent> for ChildToMain {
             PluginEvent::VocalSynthReady { plugin_id } => {
                 ChildToMain::VocalSynthReady { plugin_id }
             }
+            PluginEvent::PluginsReinitDone => ChildToMain::PluginsReinitDone,
             PluginEvent::SlotPluginLoaded {
                 track,
                 index,
@@ -293,6 +298,9 @@ fn republish_entry_slot(
 
 /// Commands processed serially on the plugin-main thread.
 enum PluginCommand {
+    /// FIXME #55: reinitialise (deactivate→activate) every loaded plugin for a
+    /// clean offline cold render, then reply `PluginEvent::PluginsReinitDone`.
+    ReinitPluginsForExport,
     SetSlotPlugin {
         track: u32,
         index: u32,
@@ -745,6 +753,75 @@ fn plugin_main_loop(
                         }
                     }
                     tracing::info!(?mode, "render mode broadcast to all plugins");
+                }
+                PluginCommand::ReinitPluginsForExport => {
+                    // FIXME #55: full deactivate→activate of every plugin so an
+                    // offline cold render starts clean even for plugins that
+                    // ignore CLAP `reset()` / `stop_processing` (VCV Rack 2 keeps
+                    // a live voice ringing through those). Same safety contract
+                    // as plugin teardown: detach from the registry so workers
+                    // skip these instances, `quiesce` to drain in-flight
+                    // dispatch, mutate on this (plugin-main) thread, then
+                    // republish — safe even while the live callback is running.
+                    let sr = session.sample_rate;
+                    let mf = session.max_frames;
+                    // (1) snapshot registry entries (Boxes never move during an
+                    //     in-place reinit, so the raw pointers stay valid) and
+                    //     detach every plugin.
+                    type SavedEntry = (
+                        u32,
+                        *mut (dyn LoadedPlugin + 'static),
+                        *mut common::process_data::ProcessData,
+                        u32,
+                        u32,
+                    );
+                    let saved: Vec<SavedEntry> = plugin_registry
+                        .load()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(pid, opt)| {
+                            opt.as_ref()
+                                .map(|e| (pid as u32, e.plugin.0, e.process_data, e.track, e.index))
+                        })
+                        .collect();
+                    for (pid, ..) in &saved {
+                        publish_plugin_registry(&plugin_registry, *pid, None);
+                    }
+                    // (2) drain in-flight dispatch so no worker derefs a plugin
+                    //     while we deactivate it.
+                    if let Some(pool) = worker_pool.as_ref() {
+                        pool.quiesce();
+                    }
+                    // (3) full CLAP/VST3 lifecycle reset in place.
+                    let mut n = 0u32;
+                    for chain in tracks.tracks.chains.values_mut() {
+                        for plugin in chain.devices.iter_mut() {
+                            plugin.stop_processing();
+                            plugin.deactivate();
+                            if let Err(e) = plugin.activate(f64::from(sr), 64, mf) {
+                                tracing::error!(error = ?e, "reinit: activate failed");
+                            }
+                            if let Err(e) = plugin.start_processing() {
+                                tracing::error!(error = ?e, "reinit: start_processing failed");
+                            }
+                            n += 1;
+                        }
+                    }
+                    // (4) republish the saved entries (pointers unchanged).
+                    for (pid, ptr, pd, track, index) in saved {
+                        publish_plugin_registry(
+                            &plugin_registry,
+                            pid,
+                            Some(PluginEntry {
+                                plugin: PluginPtr(ptr),
+                                process_data: pd,
+                                track,
+                                index,
+                            }),
+                        );
+                    }
+                    tracing::info!(plugins = n, "FIXME#55: reinitialised all plugins for offline render");
+                    let _ = evt_tx.send(PluginEvent::PluginsReinitDone);
                 }
                 PluginCommand::SetSlotPlugin {
                     track,
@@ -1959,6 +2036,10 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             // host doesn't drive the render any more — it only switches
             // render mode on `MainToChild::SetRenderMode`.
         }
+        MainToChild::ReinitPluginsForExport => {
+            tracing::info!("received ReinitPluginsForExport");
+            plugin.send(PluginCommand::ReinitPluginsForExport);
+        }
         // OpenPluginShmem / ClosePluginShmem flow daw_gui → daw_audio,
         // not into the plugin host (the plugin host is the *creator* of
         // the shmem and already owns the handle in `plugin_shmems`).
@@ -2012,6 +2093,7 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         | MainToChild::SetMetronomeEnabled(_)
         | MainToChild::PreviewNoteOn { .. }
         | MainToChild::PreviewNoteOff { .. }
+        | MainToChild::CancelExport
         | MainToChild::StartCountIn { .. } => {
             // daw_audio 専属、 plugin_host では no-op (silent)。
         }

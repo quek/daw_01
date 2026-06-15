@@ -222,6 +222,24 @@ pub struct EngineShared {
     /// callback skips its `process_buffer` and writes silence so the
     /// export render can drive `plugin.process()` exclusively.
     pub export_running: AtomicBool,
+    /// Cancel request for the in-flight offline render. The daw_audio
+    /// receive loop resets it to `false` *before* spawning each export
+    /// thread (in the `ExportWav` / `BounceClipFxOnline` handlers), so the
+    /// reset is FIFO-ordered against a later `MainToChild::CancelExport`
+    /// and a stale cancel from a previous render can't abort the next one.
+    /// `run_export` / the freewheel loop only **read** it (every buffer)
+    /// and abort (deleting the partial WAV) when set. Raised by
+    /// `MainToChild::CancelExport` (= the progress overlay's Cancel button).
+    pub export_cancel: AtomicBool,
+    /// FIXME #55: set `true` by the CPAL callback once it observes
+    /// `export_running` and parks (writes silence, skips dispatch); set `false`
+    /// on any normal (non-parked) buffer. The export thread sets
+    /// `export_running` then waits for this to go `true` before it dispatches,
+    /// guaranteeing the live callback's *in-flight* buffer has fully drained —
+    /// otherwise two drivers would race on the shared plugin-host worker slots
+    /// ("プラグインで処理がぶつかる"). It is the single-producer (CPAL callback)
+    /// flag the single-consumer (export thread) polls.
+    pub live_parked: AtomicBool,
     /// Audio clip render snapshot. Built off-thread in
     /// `compile_audio_schedule` (PR6) and published via `ArcSwap`. The
     /// audio thread `load()`s once per buffer to find events that
@@ -255,6 +273,8 @@ impl EngineShared {
             slot_to_plugin_id: ArcSwap::from_pointee(HashMap::new()),
             worker_pool: ArcSwapOption::empty(),
             export_running: AtomicBool::new(false),
+            export_cancel: AtomicBool::new(false),
+            live_parked: AtomicBool::new(false),
             audio_clip_renderer: ArcSwap::from_pointee(AudioClipRenderer::empty()),
             project_dir: ArcSwapOption::empty(),
             preroll_total_samples: AtomicU64::new(0),
@@ -658,10 +678,14 @@ impl LocalState {
         // A3 freewheel: while the export thread holds the audio
         // resources, write silence and skip dispatch so the worker pool
         // and plugin instances are exclusively driven by the export
-        // render loop.
+        // render loop. Publish `live_parked` so the export thread knows the
+        // live callback has stopped dispatching before it starts its own (no
+        // collision on the shared plugin-host worker slots).
         if export_running {
+            self.shared.live_parked.store(true, Ordering::Release);
             return;
         }
+        self.shared.live_parked.store(false, Ordering::Release);
 
         // Phase 7 B4 Step C (2026-05-13): count-in モード — preroll > 0 なら
         // 通常 dispatch / clip render を skip し、 metronome のみ render +

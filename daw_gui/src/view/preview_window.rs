@@ -60,26 +60,20 @@ pub struct PreviewWindowState {
         common::model::ImageSourceId,
         (TextureHandle, u32, u32),
     >,
-    /// docs/plan_video.md P7: composite layer list the runner pushes
-    /// each frame, ordered bottom→top (= lowest video track first,
-    /// crossfade-partner clip on top of fading-out clip). Each entry
-    /// references a `frame_textures` handle. Cleared at the start of
-    /// every frame and refilled by the runner before
-    /// `render_placeholder`. Empty = the placeholder text appears.
-    pub composite_layers: Vec<CompositeLayer>,
-    /// docs/plan_text_overlay.md §4 P3: text overlay layers, drawn on
-    /// top of every `composite_layers` entry. Built each frame by the
-    /// runner from `text_compose::active_text_sources_at` and pushed
-    /// via `gui_01` `Scene::push_text` (= the GlyphArea pipeline
-    /// composites outline + shadow + rotation internally, Phase 78).
-    pub text_layers: Vec<crate::text_compose::ActiveTextFrame>,
-    /// v19 (`docs/plan_tachie_group_transform.md` §5): 立ち絵 group layer
-    /// 群。各 `GroupLayer` は子パーツ quad 群 + 解決済み親 transform を持つ。
-    /// `render_placeholder` が `composite_scene_to_texture` で子を 1 枚へ
-    /// 合成 → 親 affine（任意アンカー回転・非一様スケール・opacity）を
-    /// かけて 1 quad として composite layer の上に push する（アプローチ X）。
-    /// runner が毎 frame で `set_group_layers` を呼んで更新。
-    pub group_layers: Vec<crate::group_compose::GroupLayer>,
+    /// FIXME #54 Wave2 (plan_video_fx §3): トラック合成画リスト。runner が毎 frame
+    /// 構築し、bottom→top (track z 順) に並ぶ。各 `TrackComposite` は 1 トラックの
+    /// 動画 / PiP 画像 / テキストを `items` に持ち、`render_placeholder` が:
+    /// - 効果も配置 transform も無ければ items を直接描く (plain track の fast-path)、
+    /// - さもなくば `composite_scene_to_texture` で 1 枚へ合成 → track 効果チェーンを
+    ///   `apply_chain` → 配置 transform (identity = canvas 全体 / group affine) で 1 quad push。
+    ///
+    /// 空 = placeholder text を表示。旧 `composite_layers`/`group_layers`/`text_layers` を統合。
+    pub track_composites: Vec<crate::group_compose::TrackComposite>,
+    /// FIXME #54 Wave1: マスター映像チェーン（`Song.master_fx_chain` の映像 device を
+    /// 解決した実効効果）。空でなければ `render_placeholder` が全トラック合成画を project
+    /// 解像度の master canvas 1 枚に集約 → これをチェーン順 `apply_chain` → screen へ配置。
+    /// runner が毎 frame `set_master_fx` で更新。
+    pub master_fx: Vec<crate::video_fx::ResolvedEffect>,
     /// `docs/plan_image_automation.md` §5 / `plan_image_overlay.md` §4
     /// P5: 選択中 image event の PiP rect (normalized 0..=1)。 `Some`
     /// なら render pass が縁取り + 4 corner handle + center handle を
@@ -186,9 +180,8 @@ impl PreviewWindowState {
             scene: Scene::new(),
             frame_textures: std::collections::HashMap::new(),
             image_textures: std::collections::HashMap::new(),
-            composite_layers: Vec::new(),
-            text_layers: Vec::new(),
-            group_layers: Vec::new(),
+            track_composites: Vec::new(),
+            master_fx: Vec::new(),
             selection_overlay: None,
             selection_rotation_radians: 0.0,
             selection_group_transform: None,
@@ -359,35 +352,23 @@ impl PreviewWindowState {
         for (_, (h, _, _)) in self.image_textures.drain() {
             self.renderer.destroy_texture(h);
         }
-        self.composite_layers.clear();
-        self.text_layers.clear();
-        self.group_layers.clear();
+        self.track_composites.clear();
     }
 
-    /// Refresh the per-frame composite layer list. Called by the
-    /// runner each frame BEFORE `render_placeholder` with the
-    /// bottom→top stack of (texture, dimensions, alpha) tuples.
-    /// Replaces any previous frame's layers so the preview never
-    /// shows stale content.
-    pub fn set_composite_layers(&mut self, layers: Vec<CompositeLayer>) {
-        self.composite_layers = layers;
-    }
-
-    /// v19 (`docs/plan_tachie_group_transform.md` §5): 立ち絵 group layer を
-    /// 毎 frame 更新。`set_composite_layers` の隣で runner が呼ぶ。group は
-    /// ungrouped layer の上（text の下）に合成される。
-    pub fn set_group_layers(&mut self, layers: Vec<crate::group_compose::GroupLayer>) {
-        self.group_layers = layers;
-    }
-
-    /// Refresh the per-frame text overlay list. Called alongside
-    /// `set_composite_layers` from the runner. Text is rendered on top
-    /// of every textured-quad layer (= MV title / 字幕 / credits 用途)。
-    pub fn set_text_layers(
+    /// FIXME #54 Wave2: トラック合成画リストを毎 frame 更新。runner が
+    /// `render_placeholder` の前に bottom→top (track z 順) で渡す。旧
+    /// `set_composite_layers`/`set_group_layers`/`set_text_layers` を統合。
+    pub fn set_track_composites(
         &mut self,
-        layers: Vec<crate::text_compose::ActiveTextFrame>,
+        composites: Vec<crate::group_compose::TrackComposite>,
     ) {
-        self.text_layers = layers;
+        self.track_composites = composites;
+    }
+
+    /// FIXME #54 Wave1: マスター映像チェーンの解決済み効果を毎 frame 更新（runner）。
+    /// 空でなければ `render_placeholder` が master canvas 1 枚に集約してから適用する。
+    pub fn set_master_fx(&mut self, fx: Vec<crate::video_fx::ResolvedEffect>) {
+        self.master_fx = fx;
     }
 
     /// `winit::WindowId` for routing `WindowEvent`s in the runner.
@@ -446,13 +427,9 @@ impl PreviewWindowState {
             ),
         );
 
-        if self.composite_layers.is_empty()
-            && self.group_layers.is_empty()
-            && self.text_layers.is_empty()
-        {
-            // No frame / overlay available — show the P4 placeholder
-            // text so the user knows the window is alive but waiting
-            // on a clip / playhead.
+        if self.track_composites.is_empty() {
+            // No content — show the P4 placeholder text so the user knows the
+            // window is alive but waiting on a clip / playhead.
             let text = "Video Preview";
             let approx_w = text.len() as f32 * 9.0;
             self.scene.push_text(GlyphArea::new(
@@ -464,230 +441,65 @@ impl PreviewWindowState {
                 Color::rgb(0.65, 0.7, 0.8),
             ));
         } else {
-            for layer in &self.composite_layers {
-                if layer.width == 0 || layer.height == 0 || layer.alpha <= 0.0 {
-                    continue;
+            // FIXME #54 Wave2/Wave1: トラック合成画を bottom→top に描く。borrow 分離のため
+            // 一旦 take して iterate。runner が毎 frame 再設定するので take しても問題ない。
+            let composites = std::mem::take(&mut self.track_composites);
+            let master_fx = std::mem::take(&mut self.master_fx);
+            if master_fx.is_empty() {
+                // 通常: 各トラック合成画を screen project_box へ直接描く（fast-path 含む）。
+                for tc in &composites {
+                    self.draw_track_composite(tc, project_box);
                 }
-                // docs/plan_image_overlay.md §P3: PiP rect handling.
-                // Video clips (`pip_rect = None`) letterbox; image
-                // overlays (`pip_rect = Some(x,y,w,h)` in normalized
-                // 0-1) map to a sub-rect inside `project_box`.
-                let dst = match layer.pip_rect {
-                    None => aspect_fit_rect(
-                        (screen.width as f32, screen.height as f32),
-                        (layer.width as f32, layer.height as f32),
-                    ),
-                    Some((nx, ny, nw, nh)) => (
-                        project_box.0 + nx * project_box.2,
-                        project_box.1 + ny * project_box.3,
-                        nw * project_box.2,
-                        nh * project_box.3,
-                    ),
-                };
-                // FIXME #54: owning track の映像効果チェーンを texture へ適用してから push。
-                // 効果無し (空チェーン) は src をそのまま返す (no-op、追加コストなし)。
-                let texture = if layer.fx.is_empty() {
-                    layer.texture
-                } else {
-                    self.fx_engine.apply_chain(
+            } else {
+                // FIXME #54 Wave1: master 映像チェーン。全トラック合成画を project 解像度の
+                // master canvas 1 枚に集約 → master fx をチェーン順適用 → screen project_box へ
+                // 配置（export と同一 SSoT）。overlay は UI なので master fx の対象外、合成後に
+                // screen 座標で別途描く。
+                let (pw, ph) = self.project_resolution;
+                let (pw, ph) = (pw.max(1), ph.max(1));
+                let content_box = (0.0, 0.0, pw as f32, ph as f32);
+                let mut content = Scene::new();
+                for tc in &composites {
+                    crate::group_compose::composite_and_place(
+                        tc,
+                        content_box,
+                        self.project_resolution,
                         &mut self.renderer,
-                        layer.texture,
-                        layer.width,
-                        layer.height,
-                        &layer.fx,
-                    )
-                };
-                self.scene.push_textured_quad(TexturedQuad {
-                    rect: daw_ui_renderer::Rect::new(dst.0, dst.1, dst.2, dst.3),
-                    texture,
-                    alpha: layer.alpha,
-                    uv_min: (0.0, 0.0),
-                    uv_max: (1.0, 1.0),
-                    clip_rect: None,
-                    rotation_radians: layer.rotation_radians,
-                    rotation_pivot: None,
-                });
-            }
-            // v19 (docs/plan_tachie_group_transform.md §5): 立ち絵 group。
-            // 子を 1 枚へ合成（アプローチ X）→ 親 affine（任意アンカー回転 +
-            // 非一様スケール + opacity）をかけて ungrouped layer の上・text の
-            // 下に 1 quad として push。合成キャンバスは project resolution。
-            let (proj_w, proj_h) = self.project_resolution;
-            for group in &self.group_layers {
-                // quad / overlay とも同一の rect / pivot / rotation を使う。子が
-                // 無くても（選択中グループの bounding box 用に）これは必要。
-                let (rx, ry, rw, rh, rot, px, py, alpha) =
-                    crate::group_compose::group_quad_params(&group.transform, project_box);
-                if rw <= 0.0 || rh <= 0.0 {
-                    continue;
-                }
-                // 子が 1 枚以上 active かつ可視なら 1 枚へ合成 → 親 affine quad を
-                // push（§5 アプローチ X）。子が空 / 合成失敗のときは quad を出さず、
-                // 選択中なら overlay だけ描く（box は transform から計算するため
-                // 合成結果に依存しない）。
-                if !group.children.is_empty() && alpha > 0.0 {
-                    // 合成キャンバス = supersample 後の解像度（§8.1 案 B）。
-                    let (cw, ch) = crate::group_compose::group_composite_canvas(
-                        (proj_w, proj_h),
-                        &group.transform,
+                        &mut self.fx_engine,
+                        &mut content,
                     );
-                    let mut sub = Scene::new();
-                    for child in &group.children {
-                        sub.push_textured_quad(TexturedQuad {
+                }
+                match self.renderer.composite_scene_to_texture(&content, pw, ph) {
+                    Ok(handle) => {
+                        let handle =
+                            self.fx_engine.apply_chain(&mut self.renderer, handle, pw, ph, &master_fx);
+                        self.scene.push_textured_quad(TexturedQuad {
                             rect: daw_ui_renderer::Rect::new(
-                                child.dest.0 * cw as f32,
-                                child.dest.1 * ch as f32,
-                                child.dest.2 * cw as f32,
-                                child.dest.3 * ch as f32,
+                                project_box.0,
+                                project_box.1,
+                                project_box.2,
+                                project_box.3,
                             ),
-                            texture: child.texture,
-                            alpha: child.alpha,
+                            texture: handle,
+                            alpha: 1.0,
                             uv_min: (0.0, 0.0),
                             uv_max: (1.0, 1.0),
                             clip_rect: None,
-                            rotation_radians: child.rotation_radians,
+                            rotation_radians: 0.0,
                             rotation_pivot: None,
                         });
                     }
-                    match self.renderer.composite_scene_to_texture(&sub, cw, ch) {
-                        Ok(handle) => {
-                            // FIXME #54: 子を 1 枚へ合成した「トラック合成画」に group track の
-                            // 映像効果チェーンを適用 (§3 そのまま、親 affine の前段)。
-                            let handle = if group.fx.is_empty() {
-                                handle
-                            } else {
-                                self.fx_engine.apply_chain(
-                                    &mut self.renderer,
-                                    handle,
-                                    cw,
-                                    ch,
-                                    &group.fx,
-                                )
-                            };
-                            self.scene.push_textured_quad(TexturedQuad {
-                                rect: daw_ui_renderer::Rect::new(rx, ry, rw, rh),
-                                texture: handle,
-                                alpha,
-                                uv_min: (0.0, 0.0),
-                                uv_max: (1.0, 1.0),
-                                clip_rect: None,
-                                rotation_radians: rot,
-                                rotation_pivot: Some((px, py)),
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "composite 立ち絵 group failed");
-                        }
-                    }
+                    Err(e) => tracing::warn!(error = %e, "master 映像 composite 失敗"),
                 }
-                // 選択中 group は bounding box + anchor marker を描く。quad と
-                // 同一の rect / rotation / pivot を使うので位置は完全一致（近似なし）。
-                if group.selected {
-                    let pivx = rx + px;
-                    let pivy = ry + py;
-                    let (sin_r, cos_r) = rot.sin_cos();
-                    let rotate_pt = |sx: f32, sy: f32| -> [f32; 2] {
-                        let lx = sx - pivx;
-                        let ly = sy - pivy;
-                        [pivx + lx * cos_r - ly * sin_r, pivy + lx * sin_r + ly * cos_r]
-                    };
-                    let c0 = rotate_pt(rx, ry);
-                    let c1 = rotate_pt(rx + rw, ry);
-                    let c2 = rotate_pt(rx + rw, ry + rh);
-                    let c3 = rotate_pt(rx, ry + rh);
-                    const STROKE: Color = Color { r: 0.45, g: 0.82, b: 1.0, a: 0.9 };
-                    let edges = vec![
-                        daw_ui_renderer::LineSegment { a: c0, b: c1, color: STROKE },
-                        daw_ui_renderer::LineSegment { a: c1, b: c2, color: STROKE },
-                        daw_ui_renderer::LineSegment { a: c2, b: c3, color: STROKE },
-                        daw_ui_renderer::LineSegment { a: c3, b: c0, color: STROKE },
-                    ];
-                    self.scene.push_lines(daw_ui_renderer::LineBatch {
-                        segments: std::sync::Arc::from(edges),
-                        line_width_px: 2.0,
-                        clip_rect: None,
-                    });
-                    // rotate handle: 上辺中点から 24px 外側へ伸ばす線 + 先端
-                    // マーカー（runner の group_hit_test の rotate 判定位置と一致）。
-                    let top_mid = rotate_pt(rx + rw * 0.5, ry);
-                    let rot_tip = rotate_pt(rx + rw * 0.5, ry - 24.0);
-                    const RHM: f32 = 5.0;
-                    let rot_handle = vec![
-                        daw_ui_renderer::LineSegment { a: top_mid, b: rot_tip, color: STROKE },
-                        daw_ui_renderer::LineSegment {
-                            a: [rot_tip[0] - RHM, rot_tip[1]],
-                            b: [rot_tip[0] + RHM, rot_tip[1]],
-                            color: STROKE,
-                        },
-                        daw_ui_renderer::LineSegment {
-                            a: [rot_tip[0], rot_tip[1] - RHM],
-                            b: [rot_tip[0], rot_tip[1] + RHM],
-                            color: STROKE,
-                        },
-                    ];
-                    self.scene.push_lines(daw_ui_renderer::LineBatch {
-                        segments: std::sync::Arc::from(rot_handle),
-                        line_width_px: 2.0,
-                        clip_rect: None,
-                    });
-                    // anchor marker: pivot（= 回転・スケール中心）に小さな十字。
-                    const AH: f32 = 7.0;
-                    let cross = vec![
-                        daw_ui_renderer::LineSegment {
-                            a: [pivx - AH, pivy],
-                            b: [pivx + AH, pivy],
-                            color: STROKE,
-                        },
-                        daw_ui_renderer::LineSegment {
-                            a: [pivx, pivy - AH],
-                            b: [pivx, pivy + AH],
-                            color: STROKE,
-                        },
-                    ];
-                    self.scene.push_lines(daw_ui_renderer::LineBatch {
-                        segments: std::sync::Arc::from(cross),
-                        line_width_px: 2.0,
-                        clip_rect: None,
-                    });
-                    // rotate handle: 上辺中点から外側 24px（group_hit_test の
-                    // Rotate 判定位置と一致）。line + 端のノブで掴める位置を明示。
-                    let top_mid = rotate_pt(rx + rw * 0.5, ry);
-                    let rot_knob = rotate_pt(rx + rw * 0.5, ry - 24.0);
-                    self.scene.push_lines(daw_ui_renderer::LineBatch {
-                        segments: std::sync::Arc::from(vec![daw_ui_renderer::LineSegment {
-                            a: top_mid,
-                            b: rot_knob,
-                            color: STROKE,
-                        }]),
-                        line_width_px: 2.0,
-                        clip_rect: None,
-                    });
-                    // handle ノブ（rotate ＋ 4 corner scale）を小四角で描画。
-                    // 4 corner は group_hit_test の Resize 判定位置（= box 角）。
-                    const KNOB: f32 = 9.0;
-                    for [hx, hy] in [rot_knob, c0, c1, c2, c3] {
-                        self.scene.push_rect(daw_ui_renderer::RectCommand {
-                            rect: daw_ui_renderer::Rect::new(
-                                hx - KNOB * 0.5,
-                                hy - KNOB * 0.5,
-                                KNOB,
-                                KNOB,
-                            ),
-                            fill: STROKE,
-                            border: Color::TRANSPARENT,
-                            border_width: 0.0,
-                            radius: [2.0; 4],
-                            clip_rect: None,
-                        });
+                // 選択中トラックの Transform overlay を screen 座標で（master fx 後）。
+                for tc in &composites {
+                    if tc.selected && let Some(t) = tc.transform {
+                        self.draw_group_overlay(&t, project_box);
                     }
                 }
             }
-            // docs/plan_text_overlay.md §4 P3: text overlays drawn on
-            // top of every video / image layer (= title / 字幕 / credits
-            // 用途)。 project_box 内の normalized 0..=1 で位置 / size、
-            // project px → screen px scale で font_size / outline / shadow
-            // をスケール。
-            self.push_text_layers(project_box);
+            self.track_composites = composites;
+            self.master_fx = master_fx;
         }
         self.draw_selection_overlay(screen.width as f32, screen.height as f32);
 
@@ -696,80 +508,101 @@ impl PreviewWindowState {
         }
     }
 
-    /// docs/plan_text_overlay.md §4 P3: walk `self.text_layers` and
-    /// push one `GlyphArea` per active text overlay. `project_box` is
-    /// the project-resolution letterbox area inside the preview window
-    /// (in screen px), used to expand each text's normalized rect /
-    /// scale its project-px font_size / outline / shadow to screen px.
-    /// Horizontal alignment is approximated via an `font_size *
-    /// char_count * 0.55` glyph-width estimate; precise alignment will
-    /// follow when gui_01 exposes a `Buffer::layout_runs` width API.
-    fn push_text_layers(&mut self, project_box: (f32, f32, f32, f32)) {
-        let scale = if self.project_resolution.0 == 0 {
-            1.0
-        } else {
-            project_box.2 / self.project_resolution.0 as f32
+    /// FIXME #54 Wave2 (plan_video_fx §3): 1 トラック合成画を描く。効果も配置
+    /// transform も無ければ items を直接 screen px へ描く (plain track の fast-path =
+    /// 現状維持・クリスプ・無コスト)。さもなくば items を canvas へ 1 枚合成 →
+    /// track 効果チェーンを `apply_chain` → 配置 transform (identity = canvas 全体 /
+    /// group affine = approach X) で 1 quad push。
+    fn draw_track_composite(
+        &mut self,
+        tc: &crate::group_compose::TrackComposite,
+        project_box: (f32, f32, f32, f32),
+    ) {
+        // 合成 + 配置は preview / export 共通の SSoT 経路（byte parity）。
+        crate::group_compose::composite_and_place(
+            tc,
+            project_box,
+            self.project_resolution,
+            &mut self.renderer,
+            &mut self.fx_engine,
+            &mut self.scene,
+        );
+        // 選択中 group / Transform は bounding box + handle を描く（preview のみ）。
+        if tc.selected && let Some(t) = tc.transform {
+            self.draw_group_overlay(&t, project_box);
+        }
+    }
+
+    /// 選択中 group / Transform の bounding box + anchor 十字 + rotate/scale ハンドルを
+    /// 描く。描画 quad と同一の [`group_quad_params`](crate::group_compose::group_quad_params)
+    /// を使うので位置は完全一致（近似なし）。
+    fn draw_group_overlay(
+        &mut self,
+        t: &common::model::GroupTransform,
+        project_box: (f32, f32, f32, f32),
+    ) {
+        let (rx, ry, rw, rh, rot, px, py, _alpha) =
+            crate::group_compose::group_quad_params(t, project_box);
+        if rw <= 0.0 || rh <= 0.0 {
+            return;
+        }
+        let pivx = rx + px;
+        let pivy = ry + py;
+        let (sin_r, cos_r) = rot.sin_cos();
+        let rotate_pt = |sx: f32, sy: f32| -> [f32; 2] {
+            let lx = sx - pivx;
+            let ly = sy - pivy;
+            [pivx + lx * cos_r - ly * sin_r, pivy + lx * sin_r + ly * cos_r]
         };
-        for layer in &self.text_layers {
-            if layer.alpha <= 0.0 || layer.text.is_empty() {
-                continue;
-            }
-            let rx = project_box.0 + layer.x * project_box.2;
-            let ry = project_box.1 + layer.y * project_box.3;
-            let rw = layer.w * project_box.2;
-            let rh = layer.h * project_box.3;
-            let font_size = (layer.font_size_px * scale).max(1.0);
-            let line_height = font_size * 1.2;
-            // FIXME #28 (gui_01 #097): 揃えはレンダラに委譲する。 box 原点
-            // = (rx, ry)、 box サイズ = (rw, rh) を渡し、 実 glyph 幅で
-            // `[rx, rx+rw]` / `[ry, ry+rh]` 内に配置させる。 自前の文字幅推定
-            // (旧 `char_count * 0.55`) は撤去 — CJK で center がずれる主因。
-            let fill = Color::rgba(
-                layer.fill_color[0],
-                layer.fill_color[1],
-                layer.fill_color[2],
-                layer.fill_color[3] * layer.alpha,
-            );
-            let outline = Color::rgba(
-                layer.outline_color[0],
-                layer.outline_color[1],
-                layer.outline_color[2],
-                layer.outline_color[3] * layer.alpha,
-            );
-            let shadow = Color::rgba(
-                layer.shadow_color[0],
-                layer.shadow_color[1],
-                layer.shadow_color[2],
-                layer.shadow_color[3] * layer.alpha,
-            );
-            self.scene.push_text(GlyphArea {
-                text: layer.text.clone(),
-                // 空文字列は renderer default フォント (= None)、 指定があればそのファミリ。
-                font_family: if layer.font_family.is_empty() {
-                    None
-                } else {
-                    Some(layer.font_family.clone())
-                },
-                left: rx,
-                top: ry,
-                font_size,
-                line_height,
-                color: fill,
+        let c0 = rotate_pt(rx, ry);
+        let c1 = rotate_pt(rx + rw, ry);
+        let c2 = rotate_pt(rx + rw, ry + rh);
+        let c3 = rotate_pt(rx, ry + rh);
+        const STROKE: Color = Color { r: 0.45, g: 0.82, b: 1.0, a: 0.9 };
+        let edges = vec![
+            daw_ui_renderer::LineSegment { a: c0, b: c1, color: STROKE },
+            daw_ui_renderer::LineSegment { a: c1, b: c2, color: STROKE },
+            daw_ui_renderer::LineSegment { a: c2, b: c3, color: STROKE },
+            daw_ui_renderer::LineSegment { a: c3, b: c0, color: STROKE },
+        ];
+        self.scene.push_lines(daw_ui_renderer::LineBatch {
+            segments: std::sync::Arc::from(edges),
+            line_width_px: 2.0,
+            clip_rect: None,
+        });
+        // anchor marker: pivot（= 回転・スケール中心）に小さな十字。
+        const AH: f32 = 7.0;
+        let cross = vec![
+            daw_ui_renderer::LineSegment { a: [pivx - AH, pivy], b: [pivx + AH, pivy], color: STROKE },
+            daw_ui_renderer::LineSegment { a: [pivx, pivy - AH], b: [pivx, pivy + AH], color: STROKE },
+        ];
+        self.scene.push_lines(daw_ui_renderer::LineBatch {
+            segments: std::sync::Arc::from(cross),
+            line_width_px: 2.0,
+            clip_rect: None,
+        });
+        // rotate handle: 上辺中点から外側 24px（runner の group_hit_test の Rotate 判定位置と一致）。
+        let top_mid = rotate_pt(rx + rw * 0.5, ry);
+        let rot_knob = rotate_pt(rx + rw * 0.5, ry - 24.0);
+        self.scene.push_lines(daw_ui_renderer::LineBatch {
+            segments: std::sync::Arc::from(vec![daw_ui_renderer::LineSegment {
+                a: top_mid,
+                b: rot_knob,
+                color: STROKE,
+            }]),
+            line_width_px: 2.0,
+            clip_rect: None,
+        });
+        // handle ノブ（rotate + 4 corner scale）を小四角で描画（box 角 = Resize 判定位置）。
+        const KNOB: f32 = 9.0;
+        for [hx, hy] in [rot_knob, c0, c1, c2, c3] {
+            self.scene.push_rect(daw_ui_renderer::RectCommand {
+                rect: daw_ui_renderer::Rect::new(hx - KNOB * 0.5, hy - KNOB * 0.5, KNOB, KNOB),
+                fill: STROKE,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [2.0; 4],
                 clip_rect: None,
-                outline_color: outline,
-                outline_width_px: layer.outline_width_px * scale,
-                shadow_color: shadow,
-                shadow_offset_px: (
-                    layer.shadow_offset_px.0 * scale,
-                    layer.shadow_offset_px.1 * scale,
-                ),
-                shadow_blur_px: layer.shadow_blur_px * scale,
-                rotation_radians: layer.rotation_radians,
-                // FIXME #28: box 内アライメント (実 glyph 幅でレンダラが配置)。
-                box_width: Some(rw),
-                box_height: Some(rh),
-                align_h: crate::text_compose::halign_for(layer.align),
-                align_v: daw_ui_renderer::VAlign::Center,
             });
         }
     }

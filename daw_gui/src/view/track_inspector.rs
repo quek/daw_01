@@ -1250,6 +1250,82 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += 8.0;
     }
 
+    // FIXME #54 Wave4: 内蔵映像 FX のパラメータ調整パネル（チェーン行の "GUI" ボタンで開閉）。
+    // 各 param を scrubable_number で実レンジ表示 + per-control 変調（Ranged domain で kick→効果）。
+    // 値の SSoT は PluginParam lane の default_value（`SetVideoFxParam` が格納）。
+    if let Some(view) = app.inspector_video_fx_params() {
+        ui.label_at("inspector_vfx_label", view.def.name, area.x + pad, y, 12.0, TEXT);
+        y += 18.0;
+        let row_w = area.w - pad * 2.0;
+        let input_h = 22.0;
+        let label_w = 88.0;
+        let input_x = area.x + pad + label_w;
+        let input_w = (row_w - label_w).max(40.0);
+        let track_id = view.track_id;
+        let device_index = view.device_index;
+        for (i, param) in view.def.params.iter().enumerate() {
+            let value = f64::from(view.values[i]);
+            let (min, max) = param.kind.range();
+            let (min, max) = (f64::from(min), f64::from(max));
+            let default_real = f64::from(param.kind.norm_to_real(param.kind.default_norm()));
+            #[allow(clippy::cast_possible_truncation)]
+            let sens = (((max - min) / 220.0).max(0.0001)) as f32;
+            ui.label_at((i, "vfx_label"), param.name, area.x + pad, y + 5.0, 11.0, TEXT);
+            let style =
+                ScrubableNumberStyle { sensitivity: sens, range: Some((min, max)), ..SCRUB_STYLE_GROUP };
+            let target = AutomationTarget::PluginParam {
+                device_index,
+                param_id: param.id,
+                legacy_slot: None,
+            };
+            let domain = crate::app::ModControlDomain::Ranged { min, max, log: param.kind.is_log() };
+            let mod_build = build_mod(app, target.clone(), value, domain, track_id);
+            let modulation = Some(mod_build.modulation());
+            let param_id = param.id;
+            let resp = ui.scrubable_number_at(
+                (i, "vfx_scrub"),
+                Rect { x: input_x, y, w: input_w, h: input_h },
+                value,
+                default_real,
+                ScrubableNumberFormat::Decimal(3),
+                &style,
+                "Video FX",
+                move |v| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetVideoFxParam {
+                            device_index,
+                            param_id,
+                            value_real: v as f32,
+                        });
+                    })
+                },
+                None,
+                modulation,
+            );
+            // drag / text 編集の開始・終了 edge で undo を 1 step に bracket（毎フレームの
+            // SetVideoFxParam は非 undoable、stroke 先頭で 1 snapshot）。
+            let active = resp.dragging || resp.editing_text;
+            let scrub_key = crate::app::InspectorScrubField::VideoFx { device_index, param_id };
+            let was_active = app.inspector_scrub_active == Some(scrub_key);
+            if active && !was_active {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.inspector_scrub_active = Some(scrub_key);
+                    app.handle_event(AppEvent::BeginInspectorScrub);
+                }));
+            } else if !active && was_active {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.inspector_scrub_active = None;
+                    app.handle_event(AppEvent::EndInspectorScrub);
+                }));
+            }
+            // 変調 depth ドラッグの falling edge で host 再同期（音声 target の depth 反映用）。
+            mod_widget::push_mod_drag_resync(ui, app, track_id, &target, resp.mod_dragging);
+            y += input_h + 4.0;
+        }
+        y += 8.0;
+    }
+
     // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5 + P5.B) --
     // selected_clip が `ClipContent::Text` のとき、 first event の全 field
     // (text / font / align / 23 numeric + 2 fade beats / fade curves / mute)

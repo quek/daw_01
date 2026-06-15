@@ -201,3 +201,39 @@ TikTok Effect House post-process、ISF ~200 シェーダライブラリ、CapCut
 6. **カタログ拡充**: §4 を カテゴリ単位で波状に実装（色 → ブラー/グロー → 歪み/スタイライズ →
    ノイズ/フィードバック → キーイング）。各波で visual smoke test。
 7. **マスター映像チェーン** + **書き出し一致検証**（preview=export）。
+
+## 13. 実装進捗（2026-06-14、worktree `videofx-waves`）
+
+Phase 1〜3・5（変調基盤）は先行 commit（`abcb5ef` 他）で landed。本セッションで以下を実装・検証:
+
+- **Wave4a（効果実行基盤拡張）**: `apply_chain` に **SeparableBlur**（H/V 2 パス、1 軸ガウシアン）を
+  実行配線。カタログに Gaussian Blur / Pixelate 追加。GPU pixel-verify テストで実 sample を確認。
+- **Wave2（トラック合成 1 枚化）**: `composite_layers`/`group_layers`/`text_layers` を **`TrackComposite`
+  に統合**。動画 + PiP 画像 + テキストを owning track ごとに 1 枚の RGBA（canvas 解像度）へ合成 →
+  track 効果チェーンを 1 回適用 → 配置。**spatial 効果がトラックの最終見た目 1 枚に正しく作用**。
+  preview / export は共通 `group_compose::composite_and_place`（SSoT）。効果も transform も無い
+  plain トラックは合成往復しない fast-path（クリスプ・無回帰）。
+- **Wave3（Transform 一本化）**: `builtin.video.transform` を **チェーン上の配置 device** として刺せる
+  （どのトラックでも）。値・automation・変調は purpose-built な `GroupTransform` 系をそのまま使用
+  （log スケール・AE 流アンカー・実績あり、**破壊的な値 migration なし**）。`resolve_track_transform`
+  が device-gate で配置を効かせ、`ensure_ids`（v25）が旧 `group_transform` 持ちトラックに device を
+  補完（additive、idempotent）。picker / inspector / preview drag / add-remove を device 連動に配線。
+- **Wave1（マスター映像チェーン）**: `master_fx_chain` に映像 device を許可（混在 1 Vec）。全トラック
+  合成後の master canvas 1 枚に master 効果を適用（preview = `render_placeholder`、export =
+  `build_frame_scene` 末尾、同一 SSoT）。master 用 automation/変調は `song_lanes`/`song_mod_routings`。
+  master picker の Video 除外を解除（Transform は除く）。
+- **Wave4b（カタログ拡充）**: `P.time`（song 時間、preview/export 一致）を配線。**+9 効果**を追加
+  （RGB Split・Threshold・Posterize・Edge Detect・Mirror・Chroma Key・Sharpen・Film Grain・
+  Scanlines）。全効果の WGSL コンパイル+実行を GPU テスト（`all_catalog_effects_compile_and_run`）で検証。
+
+検証: `cargo build/clippy --workspace` green、common 267 + daw_gui 132 lib tests + GPU executor 8 +
+model migration test 全 pass、**`daw_gui --smoke-test` PASSED**（unique_colors 22844 / black 9%、
+合成パイプライン非回帰）。
+
+### 残（follow-up）
+
+- **History / フィードバック系プリミティブ**（echo・残像トレイル★・VHS・モーションブラー合成）+
+  **Bloom/Glow**（blur + 原画合成）: いずれも **2 入力**（前フレーム出力 or 原画 + 現フレーム）を要し、
+  `apply_chain` の bind group を 2 texture に拡張 + per-effect-instance の **frame 跨ぎ永続ターゲット**
+  （安定 `chain_key` で keying、`end_frame` の recycle 対象外）の新設が要る。SeparableBlur プリミティブ
+  と broad なステートレスカタログは完了済。2 入力 engine 経路は単独の follow-up として実装する。

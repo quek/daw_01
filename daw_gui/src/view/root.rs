@@ -10,9 +10,9 @@ use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 use crate::view::{
-    arrangement_view, bottom_panel, close_confirm_modal, export_overlay, font_picker,
-    load_overlay, plugin_picker, recovery_modal, snap, status_bar, track_inspector, track_picker,
-    transport,
+    arrangement_view, bottom_panel, close_confirm_modal, export_overlay, export_range_modal,
+    font_picker, load_overlay, plugin_picker, recovery_modal, snap, status_bar, track_inspector,
+    track_picker, transport,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -122,7 +122,11 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // 保存せず終了 / キャンセル」 確認。 app.show_close_confirm を監視。
     close_confirm_modal::draw(app, ui, screen);
 
-    // Overlay: Video export 中の進捗 + Cancel。app.export_progress を監視。
+    // Modal: 書き出し範囲ピッカー (FIXME #55)。app.export_range_picker == Some の
+    // とき開く。 export 実行前なので export_overlay より前に描いてよい。
+    export_range_modal::draw(app, ui, screen);
+
+    // Overlay: WAV / Video export 中の進捗 + Cancel。app.export_stage を監視。
     export_overlay::draw(app, ui, screen);
 }
 

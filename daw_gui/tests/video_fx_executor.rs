@@ -211,3 +211,105 @@ fn empty_chain_returns_src() {
     assert_eq!(out, src, "空チェーンは src をそのまま返すべき");
     r.destroy_texture(src);
 }
+
+fn gaussian_blur(radius: f32) -> ResolvedEffect {
+    ResolvedEffect {
+        def: def_by_id("builtin.video.gaussian_blur").expect("gaussian_blur def"),
+        params: vec![radius],
+    }
+}
+
+fn pixelate(cells: f32) -> ResolvedEffect {
+    ResolvedEffect {
+        def: def_by_id("builtin.video.pixelate").expect("pixelate def"),
+        params: vec![cells],
+    }
+}
+
+/// Wave4a 回帰: SeparableBlur (H/V 2 パス) が red|blue の鋭いエッジを混色へ軟化する。
+/// 新しい分離ブラープリミティブの WGSL 生成 + 2 パス ping-pong + texel 配線を pixel 検証。
+#[test]
+fn gaussian_blur_softens_edge() {
+    const W: u32 = 32;
+    const H: u32 = 16;
+    let Some(mut r) = try_renderer(W, H) else { return };
+
+    let src = r.create_texture(W, H);
+    r.upload_texture_rgba(src, &red_left_blue_right(W, H)); // edge at x=16
+
+    let mut engine = VideoFxEngine::new();
+    let out = engine.apply_chain(&mut r, src, W, H, &[gaussian_blur(6.0)]);
+
+    let bytes = readback(&mut r, out, W, H);
+    // エッジ (x=16) 付近は red と blue が混ざり両チャネルが立つ (= 実際に近傍を sample している)。
+    let edge = px(&bytes, W, 16, 8);
+    assert!(
+        edge.0 > 30 && edge.2 > 30,
+        "ブラー後のエッジが混色でない (近傍 sample してない?): {edge:?}"
+    );
+    // 遠方は元色を概ね保持 (sampler は ClampToEdge)。
+    let far_left = px(&bytes, W, 1, 8);
+    let far_right = px(&bytes, W, 30, 8);
+    assert!(far_left.0 > far_left.2, "遠左が red 寄りでない: {far_left:?}");
+    assert!(far_right.2 > far_right.0, "遠右が blue 寄りでない: {far_right:?}");
+
+    engine.clear(&mut r);
+    r.destroy_texture(src);
+}
+
+/// Wave4a 回帰: Pixelate (Simple 1 パス) の WGSL がコンパイル・実行され、ブロック中心を
+/// sample して概ね元色を保つ。 red|blue を粗いセルで潰しても遠方の支配色が保存される。
+#[test]
+fn pixelate_runs_and_preserves_dominant_colors() {
+    const W: u32 = 16;
+    const H: u32 = 16;
+    let Some(mut r) = try_renderer(W, H) else { return };
+
+    let src = r.create_texture(W, H);
+    r.upload_texture_rgba(src, &red_left_blue_right(W, H)); // edge at x=8
+
+    let mut engine = VideoFxEngine::new();
+    // cells=8 → 2px ブロック。各ブロック中心を sample (左端=red ブロック / 右端=blue ブロック)。
+    let out = engine.apply_chain(&mut r, src, W, H, &[pixelate(8.0)]);
+
+    let bytes = readback(&mut r, out, W, H);
+    assert!(is_red(px(&bytes, W, 1, 8)), "左端ブロックが red でない: {:?}", px(&bytes, W, 1, 8));
+    assert!(is_blue(px(&bytes, W, 14, 8)), "右端ブロックが blue でない: {:?}", px(&bytes, W, 14, 8));
+
+    engine.clear(&mut r);
+    r.destroy_texture(src);
+}
+
+/// Wave4b 回帰: カタログの**全効果**（passes を持つもの）が WGSL コンパイル + 実行できる
+/// （pipeline 生成 = naga 検証）。1 つでも壊れた WGSL / param レイアウト不整合があれば
+/// apply_chain の pipeline 作成で panic する。Transform（passes 空＝配置 device）は
+/// apply_chain 非対象なので skip。各効果は manifest default param で 1 回適用する。
+#[test]
+fn all_catalog_effects_compile_and_run() {
+    const W: u32 = 16;
+    const H: u32 = 16;
+    let Some(mut r) = try_renderer(W, H) else { return };
+    let src = r.create_texture(W, H);
+    r.upload_texture_rgba(src, &red_left_blue_right(W, H));
+
+    let mut engine = VideoFxEngine::new();
+    for def in common::video_fx::builtin_video_fx() {
+        if def.passes.is_empty() {
+            continue; // Transform 等の配置 device（GPU パス無し）。
+        }
+        // 全 param を manifest default（実レンジ）で。
+        let params: Vec<f32> = def
+            .params
+            .iter()
+            .map(|p| p.kind.norm_to_real(p.kind.default_norm()))
+            .collect();
+        let eff = ResolvedEffect { def, params };
+        let out = engine.apply_chain(&mut r, src, W, H, &[eff]);
+        let bytes = readback(&mut r, out, W, H);
+        assert_eq!(bytes.len(), (W * H * 4) as usize, "{}: readback size mismatch", def.id);
+        engine.end_frame(&mut r);
+    }
+
+    engine.clear(&mut r);
+    r.destroy_texture(src);
+}

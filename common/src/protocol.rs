@@ -60,12 +60,37 @@ pub enum ChildToMain {
     ChildDisconnected {
         kind: ChildKind,
     },
-    /// Offline WAV export finished (or failed). Sent by daw_audio when
-    /// the export thread finalises (or hits an error). `error == None`
-    /// means the WAV file at the requested path is fully written.
+    /// Offline WAV export finished, was cancelled, or failed. Sent by
+    /// daw_audio when the export thread finalises (or aborts). Exactly one
+    /// of the states holds:
+    /// - `error == None && !cancelled` — the WAV at the requested path is
+    ///   fully written (success).
+    /// - `cancelled == true` — the user aborted via
+    ///   `MainToChild::CancelExport`; the partial WAV was deleted. `error`
+    ///   is `None`. The host treats this as a cancel, not a failure.
+    /// - `error == Some(msg)` — render failed; `msg` is the reason.
     ExportWavComplete {
         error: Option<String>,
+        cancelled: bool,
     },
+    /// Offline WAV render progress, sent by daw_audio while
+    /// `MainToChild::ExportWav` freewheels through the song. `done` is the
+    /// number of song-body samples rendered so far, `total` the song-body
+    /// length in samples (= the progress-bar denominator). Throttled by the
+    /// sender (≈ every 0.5 % of `total`) so it never floods the IPC pipe.
+    /// The host maps it to `AppEvent::ExportWavProgress` to drive the
+    /// determinate progress overlay (= standalone WAV export, and the audio
+    /// render phase of a video export).
+    ExportWavProgress {
+        done: u64,
+        total: u64,
+    },
+    /// FIXME #55: the plugin host finished reinitialising (deactivate→activate)
+    /// every plugin for an imminent offline cold render — reply to
+    /// `MainToChild::ReinitPluginsForExport`. The reinit forces a clean state
+    /// even for plugins that ignore CLAP `reset()` (e.g. VCV Rack 2 holding a
+    /// live voice), so the host knows it is safe to send `ExportWav`.
+    PluginsReinitDone,
     /// Offline plugin-FX bounce finished (or failed). Mirror of
     /// `ExportWavComplete` but for `MainToChild::BounceClipFxOnline`.
     /// `frames` is the actual number of frames written to the WAV
@@ -293,13 +318,52 @@ pub enum MainToChild {
     LoadSong(crate::model::Song),
     SetLoop(bool),
     SetMasterGain(f32),
-    /// Offline-render the entire song to a WAV file. Sent to daw_audio,
-    /// which freewheels through the song using its existing AudioWorker
-    /// pool + plugin handshake, then replies with
-    /// `ChildToMain::ExportWavComplete`.
+    /// Offline-render the song to a WAV file. Sent to daw_audio, which
+    /// freewheels through the song using its existing AudioWorker pool +
+    /// plugin handshake, then replies with `ChildToMain::ExportWavComplete`.
+    ///
+    /// `range`:
+    /// - `None` — full-song export (frame 0 → `length_beats` + tail).
+    /// - `Some((start_frame, end_frame))` — render only that frame window
+    ///   (FIXME #55, user-chosen export range). The render walks the song
+    ///   **from `start_frame`** (cold start), so audio whose note began
+    ///   before `start_frame` (e.g. a VOICEVOX phrase still ringing, a held
+    ///   note) is *not* retriggered — the result matches pressing Play at
+    ///   `start_frame`. Only frames in `[start_frame, end_frame)` (plus tail
+    ///   decay) are written. Frames are absolute sample offsets at the
+    ///   session sample rate; the GUI converts the chosen beat range with
+    ///   `samples_per_beat = sample_rate * 60 / bpm`. (Plugin tails start
+    ///   dry; the warm-from-0 walk is `BounceClipFxOnline`'s job, not this.)
     ExportWav {
         path: std::path::PathBuf,
+        range: Option<(u64, u64)>,
+        /// Write the modulation-envelope sidecar (`.modenv`) next to the WAV.
+        /// Only the offline video render consumes it (it samples the sidecar
+        /// to reproduce LFO/envelope modulation frame-accurately). A
+        /// standalone WAV export has the modulation already baked into the
+        /// audio, so it passes `false` and doesn't litter the user's folder
+        /// with a file nothing reads. The GUI sets `true` only for the
+        /// video-export temp WAV (FIXME #55 follow-up).
+        write_mod_sidecar: bool,
     },
+    /// Abort the in-flight offline render (= `ExportWav`). daw_audio sets
+    /// `EngineShared::export_cancel`; the freewheel loop checks it every
+    /// buffer, breaks, deletes the partial WAV, and replies with
+    /// `ChildToMain::ExportWavComplete { error: None, cancelled: true }`
+    /// (cancel is signalled by the typed `cancelled` flag, not an error
+    /// string). No-op when no export is running. Sent by the progress
+    /// overlay's Cancel button (and Esc) while the audio render phase is active.
+    CancelExport,
+    /// FIXME #55: reinitialise (deactivate→activate) every loaded plugin so an
+    /// imminent offline cold render starts from a clean state. Sent to the
+    /// plugin host **before** `ExportWav` (for a user range / cold render).
+    /// CLAP `reset()` is not enough for some plugins (VCV Rack 2 keeps a live
+    /// voice ringing through reset / start-stop_processing); a full
+    /// deactivate→activate cycle is the only reliable clean slate. Handled on
+    /// the plugin-main thread via the proven detach→quiesce→mutate→republish
+    /// pattern (so it is safe even while the live callback is running), then
+    /// replies `ChildToMain::PluginsReinitDone`.
+    ReinitPluginsForExport,
     /// Offline-render a clip range with the **full plugin chain** (= post-FX)
     /// to a WAV file. Used by `Bounce (with FX)` (`docs/plan_audio_clip
     /// .md` §3.8). Same freewheel pipeline as `ExportWav` but the WAV
@@ -597,6 +661,32 @@ mod tests {
     #[test]
     fn main_to_child_load_song_roundtrip() {
         let msg = MainToChild::LoadSong(crate::model::Song::default());
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn child_to_main_export_wav_complete_roundtrip() {
+        // 成功 / キャンセル / 失敗 の 3 状態すべて wire roundtrip する。
+        let ok = ChildToMain::ExportWavComplete { error: None, cancelled: false };
+        assert_eq!(roundtrip(&ok), ok);
+        let cancelled = ChildToMain::ExportWavComplete { error: None, cancelled: true };
+        assert_eq!(roundtrip(&cancelled), cancelled);
+        let failed = ChildToMain::ExportWavComplete {
+            error: Some("render failed".to_string()),
+            cancelled: false,
+        };
+        assert_eq!(roundtrip(&failed), failed);
+    }
+
+    #[test]
+    fn child_to_main_export_wav_progress_roundtrip() {
+        let msg = ChildToMain::ExportWavProgress { done: 123, total: 48_000 };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn main_to_child_cancel_export_roundtrip() {
+        let msg = MainToChild::CancelExport;
         assert_eq!(roundtrip(&msg), msg);
     }
 

@@ -384,47 +384,151 @@ async fn recv_loop(
             // export thread silences the CPAL callback via
             // `EngineShared::export_running` while it holds the audio
             // resources.
-            Ok(MainToChild::ExportWav { path }) => {
+            Ok(MainToChild::ExportWav { path, range, write_mod_sidecar }) => {
+                // Multi-process defense: atomically reserve the engine for this
+                // render. compare_exchange on the recv loop serializes against a
+                // second ExportWav — the old "load here, set inside the spawned
+                // thread" pattern had a TOCTOU window where two ExportWav could
+                // both pass the check before either set the flag and double-spawn,
+                // corrupting the shared WAV writer / plugin chain. The spawn
+                // closure (and the early-out paths below) release it.
+                if engine_shared
+                    .export_running
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    tracing::warn!("ExportWav received while a render is already running; ignoring");
+                    let _ = out_tx.send(ChildToMain::ExportWavComplete {
+                        error: Some("export already in progress".into()),
+                        cancelled: false,
+                    });
+                    continue;
+                }
                 let song_snap = shared.song.load();
                 let Some(song_arc) = song_snap.as_ref() else {
                     tracing::warn!("ExportWav received but no song loaded");
+                    // Release the reservation we just took (no render will run).
+                    engine_shared
+                        .export_running
+                        .store(false, std::sync::atomic::Ordering::Release);
                     let _ = out_tx.send(ChildToMain::ExportWavComplete {
                         error: Some("no song loaded".into()),
+                        cancelled: false,
                     });
                     continue;
                 };
                 let song = (**song_arc).clone();
                 drop(song_snap);
+                // Clear any stale cancel from a previous render, synchronously
+                // on this receive loop so it's FIFO-ordered against a later
+                // CancelExport (which then aborts THIS render, not a prior one).
+                engine_shared
+                    .export_cancel
+                    .store(false, std::sync::atomic::Ordering::Release);
                 let engine_shared_clone = Arc::clone(&engine_shared);
+                let engine_shared_release = Arc::clone(&engine_shared);
                 let out_tx_clone = out_tx.clone();
+                let out_tx_progress = out_tx.clone();
                 let sample_rate = session_sample_rate;
+                // FIXME #55: by the time this thread runs, the GUI has stopped
+                // playback and reinitialised every plugin (deactivate→activate)
+                // for a clean cold start. The export thread waits for the live
+                // CPAL callback to park, then freewheels and reports progress.
                 if let Err(e) = std::thread::Builder::new()
                     .name("daw-audio-export".into())
                     .spawn(move || {
+                        // Throttle progress to ~every 0.5% of the song body so
+                        // the determinate overlay updates smoothly without
+                        // flooding the IPC pipe, PLUS a 250 ms wall-clock
+                        // heartbeat. The heartbeat fires even when `done` is
+                        // unchanged — during the tail-silence walk `done` is
+                        // pinned at `total`, so without an unconditional
+                        // heartbeat the GUI would get no message for the whole
+                        // tail and its no-progress watchdog could false-fire on a
+                        // heavy/slow tail. 250 ms throttle bounds the plateau to
+                        // ~4 msgs/s (≈40 over the 10 s tail cap), not a flood.
+                        let mut last_sent: Option<u64> = None;
+                        let mut last_at = std::time::Instant::now();
+                        let on_progress = move |done: u64, total: u64| {
+                            let step = (total / 200).max(1);
+                            let crossed = match last_sent {
+                                None => true,
+                                Some(prev) => {
+                                    done.saturating_sub(prev) >= step
+                                        || (done >= total && prev < total)
+                                }
+                            };
+                            let heartbeat = last_at.elapsed()
+                                >= std::time::Duration::from_millis(250);
+                            if crossed || heartbeat {
+                                last_sent = Some(done);
+                                last_at = std::time::Instant::now();
+                                let _ = out_tx_progress
+                                    .send(ChildToMain::ExportWavProgress { done, total });
+                            }
+                        };
+                        // FIXME #55: user export range walks cold from the range
+                        // start (matches Play-from-here); full export walks 0..len.
+                        let span = match range {
+                            Some((start, end)) => export::RenderSpan::RangeCold { start, end },
+                            None => export::RenderSpan::Full,
+                        };
                         let result = export::run_export(
                             path,
                             engine_shared_clone,
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                            None,
+                            span,
+                            write_mod_sidecar,
+                            on_progress,
                         );
-                        let error_msg = match result {
-                            Ok(_frames) => None,
+                        // Release the engine reservation now the render is done,
+                        // on every path (including an early bail inside
+                        // run_export, which no longer touches export_running).
+                        engine_shared_release
+                            .export_running
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        let (error_msg, cancelled) = match result {
+                            Ok(outcome) => (None, outcome.cancelled),
                             Err(e) => {
                                 tracing::error!(error = ?e, "offline WAV export failed");
-                                Some(format!("{e:#}"))
+                                (Some(format!("{e:#}")), false)
                             }
                         };
-                        let _ = out_tx_clone
-                            .send(ChildToMain::ExportWavComplete { error: error_msg });
+                        let _ = out_tx_clone.send(ChildToMain::ExportWavComplete {
+                            error: error_msg,
+                            cancelled,
+                        });
                     })
                 {
                     tracing::error!(error = ?e, "failed to spawn export thread");
+                    // No thread will release the reservation we took above.
+                    engine_shared
+                        .export_running
+                        .store(false, std::sync::atomic::Ordering::Release);
                     let _ = out_tx.send(ChildToMain::ExportWavComplete {
                         error: Some(format!("failed to spawn export thread: {e}")),
+                        cancelled: false,
                     });
                 }
+            }
+            // CancelExport: raise the flag the freewheel loop polls. No-op
+            // when no export is running (the next run clears it on entry).
+            Ok(MainToChild::CancelExport) => {
+                engine_shared
+                    .export_cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::info!("received CancelExport; offline render will abort");
+            }
+            Ok(MainToChild::ReinitPluginsForExport) => {
+                // FIXME #55: plugin reinit is the plugin host's job (it owns the
+                // instances). The audio side has no plugins — ignore.
             }
             Ok(MainToChild::BounceClipFxOnline {
                 path,
@@ -433,9 +537,38 @@ async fn recv_loop(
                 start_frame,
                 end_frame,
             }) => {
+                // Reserve the engine (same atomic reservation as ExportWav —
+                // bounce and WAV export share EngineShared / the CPAL-silence
+                // flag and must not run concurrently). run_export no longer sets
+                // export_running, so the bounce path must reserve it here too,
+                // otherwise the CPAL callback wouldn't be silenced during the
+                // bounce render. The closure / early-outs release it.
+                if engine_shared
+                    .export_running
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    tracing::warn!("BounceClipFxOnline received while a render is already running; ignoring");
+                    let _ = out_tx.send(ChildToMain::BounceClipFxComplete {
+                        path,
+                        source_track,
+                        source_clip,
+                        error: Some("export already in progress".into()),
+                        frames: 0,
+                    });
+                    continue;
+                }
                 let song_snap = shared.song.load();
                 let Some(song_arc) = song_snap.as_ref() else {
                     tracing::warn!("BounceClipFxOnline received but no song loaded");
+                    engine_shared
+                        .export_running
+                        .store(false, std::sync::atomic::Ordering::Release);
                     let _ = out_tx.send(ChildToMain::BounceClipFxComplete {
                         path,
                         source_track,
@@ -447,7 +580,15 @@ async fn recv_loop(
                 };
                 let song = (**song_arc).clone();
                 drop(song_snap);
+                // Clear stale cancel (FIFO-ordered with CancelExport), same as
+                // the ExportWav path. The bounce itself has no Cancel UI, but
+                // this prevents a leftover cancel from a prior aborted export
+                // from killing the bounce render on its first buffer.
+                engine_shared
+                    .export_cancel
+                    .store(false, std::sync::atomic::Ordering::Release);
                 let engine_shared_clone = Arc::clone(&engine_shared);
+                let engine_shared_release = Arc::clone(&engine_shared);
                 let out_tx_clone = out_tx.clone();
                 let sample_rate = session_sample_rate;
                 let path_for_thread = path.clone();
@@ -455,16 +596,33 @@ async fn recv_loop(
                     .name("daw-audio-bounce-fx".into())
                     .spawn(move || {
                         let path_for_complete = path_for_thread.clone();
+                        // Clip-FX bounce: warm walk from frame 0 so plugin tails /
+                        // sidechain state at the clip start are correct. No video
+                        // consumer, so no modulation sidecar.
                         let result = export::run_export(
                             path_for_thread,
                             engine_shared_clone,
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                            Some((start_frame, end_frame)),
+                            export::RenderSpan::RangeWarm {
+                                start: start_frame,
+                                end: end_frame,
+                            },
+                            false,
+                            // Clip-range bounce has no progress overlay (it
+                            // completes quickly and replaces the clip in place).
+                            |_, _| {},
                         );
+                        // Release the engine reservation on every path.
+                        engine_shared_release
+                            .export_running
+                            .store(false, std::sync::atomic::Ordering::Release);
                         let (error_msg, frames) = match result {
-                            Ok(frames) => (None, frames),
+                            // Bounce has no Cancel UI; `outcome.cancelled` is
+                            // ignored (it can only be set if a stale cancel
+                            // slipped through, which the recv-loop reset prevents).
+                            Ok(outcome) => (None, outcome.frames),
                             Err(e) => {
                                 tracing::error!(
                                     error = ?e,
@@ -483,6 +641,10 @@ async fn recv_loop(
                     })
                 {
                     tracing::error!(error = ?e, "failed to spawn bounce thread");
+                    // No thread will release the reservation we took above.
+                    engine_shared
+                        .export_running
+                        .store(false, std::sync::atomic::Ordering::Release);
                     let _ = out_tx.send(ChildToMain::BounceClipFxComplete {
                         path,
                         source_track,

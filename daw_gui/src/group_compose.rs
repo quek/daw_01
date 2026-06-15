@@ -15,31 +15,58 @@
 //! render_video が、[`GroupChildQuad`] / [`GroupLayer`] を受け取って行う。
 
 use common::model::{AutomationTarget, GroupTransform, GroupTransformParam, Song, Track};
-use daw_ui_renderer::TextureHandle;
+use daw_ui_renderer::{Color, GlyphArea, Rect, Scene, TextureHandle, TexturedQuad, VAlign};
 
-/// 合成キャンバスへ描く 1 子パーツ。`dest` は合成キャンバス（= project
-/// resolution）内の normalized 0..1 PiP rect、`rotation_radians` は子自身の
-/// rect 中心回転。texture は preview / offscreen renderer に登録済みの handle。
-#[derive(Debug, Clone, Copy)]
-pub struct GroupChildQuad {
-    pub texture: TextureHandle,
-    /// 合成キャンバス内 normalized 0..1 PiP rect (x, y, w, h)。
-    pub dest: (f32, f32, f32, f32),
-    pub alpha: f32,
-    pub rotation_radians: f32,
+use crate::video_fx::{VideoFxEngine, VideoFxRenderer};
+
+/// 1 トラックの合成画に積む 1 アイテム。座標は合成キャンバス（= project
+/// resolution、transform 拡大時は supersample 後）内の normalized 0..1。
+/// FIXME #54 Wave2: 立ち絵 group の子パーツも、通常トラックの動画フレーム /
+/// PiP 画像 / テキストも、すべてこの型で「トラック合成画」へ積む（SSoT）。
+#[derive(Debug, Clone)]
+pub enum CompositeItem {
+    /// テクスチャ quad（動画フレーム / PiP 画像 / 立ち絵子パーツ）。
+    Quad {
+        texture: TextureHandle,
+        /// 合成キャンバス内 normalized 0..1 PiP rect (x, y, w, h)。
+        dest: (f32, f32, f32, f32),
+        alpha: f32,
+        /// rect 中心回転（radians）。
+        rotation_radians: f32,
+    },
+    /// テキストオーバーレイ（canvas-normalized rect + project-px font）。合成画へ
+    /// 焼き込むことで track 効果がテキストにも乗る（plan_video_fx §3）。
+    Text(crate::text_compose::ActiveTextFrame),
 }
 
-/// 1 つの visual group。z 順（bottom→top）の子 quad と、解決済みの親 affine。
+/// 1 トラックの視覚合成（plan_video_fx §3 の「トラック合成画」）。動画 + PiP 画像 +
+/// テキストを z 順に 1 枚の RGBA へ合成し、track 効果チェーンを 1 回かけてから配置する。
+///
+/// `transform == None` は identity 配置（合成画を canvas 全体 = project_box に置く）。
+/// `Some` は立ち絵 group / Transform device の affine 配置（approach X: 1 枚へ合成
+/// した**あと**に親 affine、shear / 二重適用なし）。`items` が単一 quad で `fx` 空・
+/// `transform` None のときは、消費側が合成往復を省いて直接描く（plain トラックの
+/// fast-path = 現状維持・クリスプ・無コスト）。
 #[derive(Debug, Clone)]
-pub struct GroupLayer {
-    pub children: Vec<GroupChildQuad>,
-    pub transform: GroupTransform,
-    /// この group track が選択中か（preview に bounding box + anchor を描く）。
-    pub selected: bool,
-    /// FIXME #54: この group track の映像効果チェーン (解決済み実効値)。子を 1 枚へ
-    /// 合成した**あと**に親 affine の前段でチェーン順適用する (合成 1 枚 = §3 そのまま、
-    /// 二重適用なし)。空なら効果なし。
+pub struct TrackComposite {
+    /// この合成の owning track id（選択判定 / デバッグ用）。
+    pub track_id: u32,
+    /// bottom→top の合成アイテム（canvas 空間）。
+    pub items: Vec<CompositeItem>,
+    /// 配置 transform。None = identity（canvas 全体）。Some = group / Transform affine。
+    pub transform: Option<GroupTransform>,
+    /// track 効果チェーン（解決済み実効値）。合成画 1 枚へチェーン順適用。空なら効果なし。
     pub fx: Vec<crate::video_fx::ResolvedEffect>,
+    /// 選択中か（group / Transform 選択時に bounding box + anchor を描く）。
+    pub selected: bool,
+}
+
+impl TrackComposite {
+    /// fast-path 可否: 効果も配置 transform も無ければ、合成往復せず item を直接描ける。
+    #[must_use]
+    pub fn is_passthrough(&self) -> bool {
+        self.fx.is_empty() && self.transform.is_none()
+    }
 }
 
 /// group track の「現在 effective な」 transform を解決する。
@@ -330,6 +357,21 @@ impl CanvasMap {
     }
 }
 
+/// `src` を `canvas` に aspect-fit（レターボックス）した **normalized 0..1** rect を返す。
+/// FIXME #54 Wave2: 動画フレームをトラック合成キャンバス内に収めるのに使う（PiP 画像は
+/// 既に normalized なので不要）。`canvas`/`src` は px 寸法。
+#[must_use]
+pub fn aspect_fit_norm(canvas: (f32, f32), src: (f32, f32)) -> (f32, f32, f32, f32) {
+    let (cw, ch) = (canvas.0.max(1.0), canvas.1.max(1.0));
+    let (sw, sh) = (src.0.max(1.0), src.1.max(1.0));
+    let scale = (cw / sw).min(ch / sh);
+    let w = sw * scale;
+    let h = sh * scale;
+    let x = (cw - w) * 0.5;
+    let y = (ch - h) * 0.5;
+    (x / cw, y / ch, w / cw, h / ch)
+}
+
 /// 合成キャンバスの解像度を決める（§8.1 案 B supersample）。
 ///
 /// 親が拡大（scale > 1）すると project 解像度で合成した 1 枚が引き伸ばされて
@@ -353,12 +395,224 @@ pub fn group_composite_canvas(proj: (u32, u32), t: &GroupTransform) -> (u32, u32
     (w, h)
 }
 
+/// FIXME #54 Wave2 (plan_video_fx §3): 1 [`TrackComposite`] を `scene` に描く
+/// **preview / export 共通の SSoT 経路**。
+///
+/// - `is_passthrough`（効果も配置 transform も無い plain track）: items を `project_box`
+///   内 screen/canvas px へ直接描く（合成往復なし・クリスプ・無コスト）。
+/// - さもなくば: items を canvas（`group_composite_canvas`、transform 拡大時 supersample）へ
+///   1 枚合成 → track 効果チェーンを `apply_chain` → 配置 transform（identity = `project_box`
+///   全体 / group affine = approach X）で 1 quad push。
+///
+/// 選択オーバーレイ（bounding box / handle）は含まない（preview のみが別途描く）。
+/// `proj_res` は合成キャンバス基準解像度（preview = `Song.video_resolution`、export =
+/// 出力解像度）。`project_box` は配置先 px 矩形（preview = letterbox 区域、export =
+/// `(0,0,out_w,out_h)`）。
+pub(crate) fn composite_and_place<R: VideoFxRenderer>(
+    tc: &TrackComposite,
+    project_box: (f32, f32, f32, f32),
+    proj_res: (u32, u32),
+    renderer: &mut R,
+    fx_engine: &mut VideoFxEngine,
+    scene: &mut Scene,
+) {
+    if tc.is_passthrough() {
+        let pscale = if proj_res.0 == 0 {
+            1.0
+        } else {
+            project_box.2 / proj_res.0 as f32
+        };
+        for item in &tc.items {
+            match item {
+                CompositeItem::Quad { texture, dest, alpha, rotation_radians } => {
+                    if *alpha <= 0.0 {
+                        continue;
+                    }
+                    scene.push_textured_quad(TexturedQuad {
+                        rect: Rect::new(
+                            project_box.0 + dest.0 * project_box.2,
+                            project_box.1 + dest.1 * project_box.3,
+                            dest.2 * project_box.2,
+                            dest.3 * project_box.3,
+                        ),
+                        texture: *texture,
+                        alpha: *alpha,
+                        uv_min: (0.0, 0.0),
+                        uv_max: (1.0, 1.0),
+                        clip_rect: None,
+                        rotation_radians: *rotation_radians,
+                        rotation_pivot: None,
+                    });
+                }
+                CompositeItem::Text(tf) => push_text_glyph(scene, tf, project_box, pscale),
+            }
+        }
+        return;
+    }
+    if tc.items.is_empty() {
+        return; // 効果/transform はあるが描く素材が無い（選択 group の overlay は呼び側）。
+    }
+    let (proj_w, proj_h) = proj_res;
+    let (cw, ch) = match tc.transform {
+        Some(t) => group_composite_canvas((proj_w, proj_h), &t),
+        None => (proj_w.max(1), proj_h.max(1)),
+    };
+    let canvas_scale = cw as f32 / proj_w.max(1) as f32;
+    let mut sub = Scene::new();
+    for item in &tc.items {
+        match item {
+            CompositeItem::Quad { texture, dest, alpha, rotation_radians } => {
+                sub.push_textured_quad(TexturedQuad {
+                    rect: Rect::new(
+                        dest.0 * cw as f32,
+                        dest.1 * ch as f32,
+                        dest.2 * cw as f32,
+                        dest.3 * ch as f32,
+                    ),
+                    texture: *texture,
+                    alpha: *alpha,
+                    uv_min: (0.0, 0.0),
+                    uv_max: (1.0, 1.0),
+                    clip_rect: None,
+                    rotation_radians: *rotation_radians,
+                    rotation_pivot: None,
+                });
+            }
+            CompositeItem::Text(tf) => {
+                push_text_glyph(&mut sub, tf, (0.0, 0.0, cw as f32, ch as f32), canvas_scale);
+            }
+        }
+    }
+    let handle = match renderer.fx_composite_scene(&sub, cw, ch) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, track = tc.track_id, "composite track 合成失敗");
+            return;
+        }
+    };
+    let handle = if tc.fx.is_empty() {
+        handle
+    } else {
+        fx_engine.apply_chain(renderer, handle, cw, ch, &tc.fx)
+    };
+    match tc.transform {
+        Some(t) => {
+            let (rx, ry, rw, rh, rot, px, py, alpha) = group_quad_params(&t, project_box);
+            if rw > 0.0 && rh > 0.0 && alpha > 0.0 {
+                scene.push_textured_quad(TexturedQuad {
+                    rect: Rect::new(rx, ry, rw, rh),
+                    texture: handle,
+                    alpha,
+                    uv_min: (0.0, 0.0),
+                    uv_max: (1.0, 1.0),
+                    clip_rect: None,
+                    rotation_radians: rot,
+                    rotation_pivot: Some((px, py)),
+                });
+            }
+        }
+        None => {
+            scene.push_textured_quad(TexturedQuad {
+                rect: Rect::new(project_box.0, project_box.1, project_box.2, project_box.3),
+                texture: handle,
+                alpha: 1.0,
+                uv_min: (0.0, 0.0),
+                uv_max: (1.0, 1.0),
+                clip_rect: None,
+                rotation_radians: 0.0,
+                rotation_pivot: None,
+            });
+        }
+    }
+}
+
+/// 1 つの [`crate::text_compose::ActiveTextFrame`] を `box_xywh`（px 領域）内に
+/// `font_scale`（project px → 出力 px）でスケールして `scene` に push する。fast-path
+/// （box = `project_box` の screen px、scale = box幅/proj幅）と、トラック合成画への
+/// 焼き込み（box = `(0,0,cw,ch)` の canvas px、scale = canvas/proj）で共有する。
+pub(crate) fn push_text_glyph(
+    scene: &mut Scene,
+    tf: &crate::text_compose::ActiveTextFrame,
+    box_xywh: (f32, f32, f32, f32),
+    font_scale: f32,
+) {
+    if tf.alpha <= 0.0 || tf.text.is_empty() {
+        return;
+    }
+    let rx = box_xywh.0 + tf.x * box_xywh.2;
+    let ry = box_xywh.1 + tf.y * box_xywh.3;
+    let rw = tf.w * box_xywh.2;
+    let rh = tf.h * box_xywh.3;
+    let font_size = (tf.font_size_px * font_scale).max(1.0);
+    let line_height = font_size * 1.2;
+    let fill = Color::rgba(
+        tf.fill_color[0],
+        tf.fill_color[1],
+        tf.fill_color[2],
+        tf.fill_color[3] * tf.alpha,
+    );
+    let outline = Color::rgba(
+        tf.outline_color[0],
+        tf.outline_color[1],
+        tf.outline_color[2],
+        tf.outline_color[3] * tf.alpha,
+    );
+    let shadow = Color::rgba(
+        tf.shadow_color[0],
+        tf.shadow_color[1],
+        tf.shadow_color[2],
+        tf.shadow_color[3] * tf.alpha,
+    );
+    scene.push_text(GlyphArea {
+        text: tf.text.clone(),
+        // 空文字列は renderer default フォント (= None)、指定があればそのファミリ。
+        font_family: if tf.font_family.is_empty() {
+            None
+        } else {
+            Some(tf.font_family.clone())
+        },
+        left: rx,
+        top: ry,
+        font_size,
+        line_height,
+        color: fill,
+        clip_rect: None,
+        outline_color: outline,
+        outline_width_px: tf.outline_width_px * font_scale,
+        shadow_color: shadow,
+        shadow_offset_px: (tf.shadow_offset_px.0 * font_scale, tf.shadow_offset_px.1 * font_scale),
+        shadow_blur_px: tf.shadow_blur_px * font_scale,
+        rotation_radians: tf.rotation_radians,
+        // FIXME #28: box 内アライメント (実 glyph 幅でレンダラが配置)。
+        box_width: Some(rw),
+        box_height: Some(rh),
+        align_h: crate::text_compose::halign_for(tf.align),
+        align_v: VAlign::Center,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ident() -> GroupTransform {
         GroupTransform::default()
+    }
+
+    #[test]
+    fn aspect_fit_norm_letterbox_and_pillarbox() {
+        // 16:9 source into 4:3 canvas → 上下バー (height < 1、横は全幅)。
+        let (x, y, w, h) = aspect_fit_norm((640.0, 480.0), (1920.0, 1080.0));
+        assert!((x - 0.0).abs() < 1e-4, "x={x}");
+        assert!((w - 1.0).abs() < 1e-4, "w={w}");
+        assert!((h - 0.75).abs() < 1e-3, "h={h}"); // 360/480
+        assert!((y - 0.125).abs() < 1e-3, "y={y}"); // 60/480
+        // 9:16 portrait into 4:3 landscape → 左右バー (width < 1、縦は全高)。
+        let (x, y, w, h) = aspect_fit_norm((640.0, 480.0), (1080.0, 1920.0));
+        assert!((y - 0.0).abs() < 1e-4, "y={y}");
+        assert!((h - 1.0).abs() < 1e-4, "h={h}");
+        assert!((w - 0.421875).abs() < 1e-3, "w={w}"); // 270/640
+        assert!((x - 0.289_062_5).abs() < 1e-3, "x={x}"); // 185/640
     }
 
     #[test]

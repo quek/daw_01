@@ -27,8 +27,8 @@
 use std::collections::HashMap;
 
 use common::automation;
-use common::model::{AutomationTarget, Song, Track};
-use common::video_fx::{PassKind, VideoFxDef, def_by_id};
+use common::model::{AutomationLane, AutomationTarget, GroupTransform, ModRouting, Song, Track};
+use common::video_fx::{PassKind, VideoFxCategory, VideoFxDef, def_by_id};
 use daw_ui_renderer::{OffscreenRenderer, Renderer, TextureHandle};
 
 use daw_ui_platform::WinitWindow;
@@ -51,6 +51,15 @@ pub trait VideoFxRenderer {
     fn fx_destroy_texture(&mut self, handle: TextureHandle);
     /// 効果 target / base pass の color format (preview = surface、export = Rgba8UnormSrgb)。
     fn fx_format(&self) -> wgpu::TextureFormat;
+    /// `scene` を `width × height` の sampleable texture へ合成して handle を返す
+    /// (トラック合成画 1 枚化)。preview = `Renderer::composite_scene_to_texture`、
+    /// export = `OffscreenRenderer::composite_scene_to_texture`。
+    fn fx_composite_scene(
+        &mut self,
+        scene: &daw_ui_renderer::Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<TextureHandle, daw_ui_renderer::RenderError>;
 }
 
 impl VideoFxRenderer for Renderer<WinitWindow> {
@@ -76,6 +85,14 @@ impl VideoFxRenderer for Renderer<WinitWindow> {
     }
     fn fx_format(&self) -> wgpu::TextureFormat {
         self.surface_format()
+    }
+    fn fx_composite_scene(
+        &mut self,
+        scene: &daw_ui_renderer::Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<TextureHandle, daw_ui_renderer::RenderError> {
+        self.composite_scene_to_texture(scene, width, height)
     }
 }
 
@@ -103,6 +120,14 @@ impl VideoFxRenderer for OffscreenRenderer {
     fn fx_format(&self) -> wgpu::TextureFormat {
         self.target_format()
     }
+    fn fx_composite_scene(
+        &mut self,
+        scene: &daw_ui_renderer::Scene,
+        width: u32,
+        height: u32,
+    ) -> Result<TextureHandle, daw_ui_renderer::RenderError> {
+        self.composite_scene_to_texture(scene, width, height)
+    }
 }
 
 /// チェーン上の 1 効果の **実効パラメータ**。`def` はカタログ定義、`params` は
@@ -114,10 +139,77 @@ pub struct ResolvedEffect {
     pub params: Vec<f32>,
 }
 
+/// 1 video device の全 param を **実レンジ値**列に解決する（automation lane の default/curve
+/// ⊕ 変調を 0..=1 で合成 → manifest の実レンジへ展開）。`lanes` / `mod_routings` は track の
+/// （`track.automation_lanes` / `track.mod_routings`）か master の（`song.song_lanes` /
+/// `song.song_mod_routings`）。`device_index` は当該チェーン上の位置（[`AutomationTarget::PluginParam`]）。
+fn resolve_device_real_params(
+    song: &Song,
+    lanes: &[AutomationLane],
+    mod_routings: &[ModRouting],
+    device_index: u32,
+    def: &VideoFxDef,
+    song_beat: f64,
+    mod_scalars: &[f32],
+) -> Vec<f32> {
+    def.params
+        .iter()
+        .map(|p| {
+            let target = AutomationTarget::PluginParam {
+                device_index,
+                param_id: p.id,
+                legacy_slot: None,
+            };
+            // base = lane の default/curve (0..=1)、無ければ manifest default (0..=1)。
+            let base = lanes
+                .iter()
+                .find(|l| l.target == target)
+                .map_or_else(
+                    || p.kind.default_norm(),
+                    |l| automation::lane_value_at(l, &song.clip_contents, song_beat),
+                );
+            // 変調を 0..=1 領域で合成 (PluginParam は plain==norm なので恒等)。
+            let eff_norm = automation::apply_modulation_with_scalars(
+                song,
+                &target,
+                base,
+                mod_routings,
+                mod_scalars,
+            );
+            p.kind.norm_to_real(eff_norm)
+        })
+        .collect()
+}
+
+/// `devices` 列のうち映像効果 device を [`ResolvedEffect`] に解決する共通ロジック。
+/// Transform 配置 device は除外（GPU シェーダではない）。track / master で共有。
+fn resolve_video_chain(
+    song: &Song,
+    devices: &[common::model::PluginInstance],
+    lanes: &[AutomationLane],
+    mod_routings: &[ModRouting],
+    song_beat: f64,
+    mod_scalars: &[f32],
+) -> Vec<ResolvedEffect> {
+    let mut out = Vec::new();
+    for (di, inst) in devices.iter().enumerate() {
+        if !inst.ports.is_video() {
+            continue;
+        }
+        let Some(def) = def_by_id(&inst.plugin_id) else {
+            continue;
+        };
+        if def.category == VideoFxCategory::Transform {
+            continue; // 配置 device は apply_chain 非対象（合成段で GroupTransform として消費）。
+        }
+        let params =
+            resolve_device_real_params(song, lanes, mod_routings, di as u32, def, song_beat, mod_scalars);
+        out.push(ResolvedEffect { def, params });
+    }
+    out
+}
+
 /// トラックの video device チェーンを解決して [`ResolvedEffect`] 列を返す。
-/// `track.devices` 中の映像 device (`builtin.video.*`) を順に拾い、各 param の
-/// 実効値 (automation lane の default/curve ⊕ 変調、0..=1) を manifest の実レンジへ展開。
-/// `device_index` は統合 `Track.devices` 上の位置 ([`AutomationTarget::PluginParam`])。
 #[must_use]
 pub fn resolve_track_effects(
     song: &Song,
@@ -125,47 +217,56 @@ pub fn resolve_track_effects(
     song_beat: f64,
     mod_scalars: &[f32],
 ) -> Vec<ResolvedEffect> {
-    let mut out = Vec::new();
-    for (di, inst) in track.devices.iter().enumerate() {
-        if !inst.ports.is_video() {
-            continue;
-        }
-        let Some(def) = def_by_id(&inst.plugin_id) else {
-            continue;
-        };
-        let device_index = di as u32;
-        let params = def
-            .params
-            .iter()
-            .map(|p| {
-                let target = AutomationTarget::PluginParam {
-                    device_index,
-                    param_id: p.id,
-                    legacy_slot: None,
-                };
-                // base = lane の default/curve (0..=1)、無ければ manifest default (0..=1)。
-                let base = track
-                    .automation_lanes
-                    .iter()
-                    .find(|l| l.target == target)
-                    .map_or_else(
-                        || p.kind.default_norm(),
-                        |l| automation::lane_value_at(l, &song.clip_contents, song_beat),
-                    );
-                // 変調を 0..=1 領域で合成 (PluginParam は plain==norm なので恒等)。
-                let eff_norm = automation::apply_modulation_with_scalars(
-                    song,
-                    &target,
-                    base,
-                    &track.mod_routings,
-                    mod_scalars,
-                );
-                p.kind.norm_to_real(eff_norm)
-            })
-            .collect();
-        out.push(ResolvedEffect { def, params });
+    resolve_video_chain(
+        song,
+        &track.devices,
+        &track.automation_lanes,
+        &track.mod_routings,
+        song_beat,
+        mod_scalars,
+    )
+}
+
+/// FIXME #54 Wave1: マスター映像チェーン（`Song.master_fx_chain` の映像 device）を解決する。
+/// automation / 変調は master 流儀の `song_lanes` / `song_mod_routings`（`song_lanes` と同じ
+/// 「master 固有データは Song 直下」）。全トラック合成後の master canvas 1 枚へ作用する。
+#[must_use]
+pub fn resolve_master_effects(
+    song: &Song,
+    song_beat: f64,
+    mod_scalars: &[f32],
+) -> Vec<ResolvedEffect> {
+    resolve_video_chain(
+        song,
+        &song.master_fx_chain,
+        &song.song_lanes,
+        &song.song_mod_routings,
+        song_beat,
+        mod_scalars,
+    )
+}
+
+/// トラックの配置 [`GroupTransform`] を解決する（無ければ `None`）。FIXME #54 Wave3:
+/// 「動かす変形」をチェーン上の Transform device に一本化。device が刺さっている
+/// トラックだけ（立ち絵 group も通常トラックも）変換が効く（device を抜けば変換なし）。
+/// 値・automation・変調は purpose-built な [`GroupTransform`] 系（`group_active_transform`、
+/// log スケール・AE 流アンカー・実績あり）をそのまま使う。合成段（`composite_and_place`）が
+/// approach X の配置に使う。
+#[must_use]
+pub fn resolve_track_transform(
+    song: &Song,
+    track: &Track,
+    song_beat: f64,
+    mod_scalars: &[f32],
+) -> Option<GroupTransform> {
+    let has_transform_device = track
+        .devices
+        .iter()
+        .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID);
+    if !has_transform_device {
+        return None;
     }
-    out
+    crate::group_compose::group_active_transform(track, song, song_beat, mod_scalars)
 }
 
 // ============================================================================
@@ -208,6 +309,10 @@ pub struct VideoFxEngine {
     common: Option<CommonGpu>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     pool: HashMap<(u32, u32), SizePool>,
+    /// FIXME #54 Wave4: 効果シェーダの `P.time`（秒）。ノイズ/スキャンライン/時間系効果の
+    /// アニメに使う。preview/export 一致のため wall-clock でなく song 時間（playhead_beat ×
+    /// 60/bpm）を caller が毎 frame [`set_time`](Self::set_time) で渡す。
+    current_time: f32,
 }
 
 /// device に紐づく共有リソース (sampler + bind group layout)。
@@ -222,6 +327,13 @@ impl VideoFxEngine {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// FIXME #54 Wave4: 効果シェーダの `P.time`（秒）を設定する。caller が毎 frame、
+    /// 合成（`apply_chain`）の前に song 時間（`playhead_beat * 60/bpm`）を渡す。
+    /// preview/export で同じ song 時間を渡せば時間系効果も一致する。
+    pub fn set_time(&mut self, secs: f32) {
+        self.current_time = secs;
     }
 
     /// pool / pipeline を全破棄 (renderer teardown / format 変更時)。target handle を
@@ -406,12 +518,14 @@ impl VideoFxEngine {
         height: u32,
         chain: &[ResolvedEffect],
     ) -> TextureHandle {
-        // 実行可能 (= Simple) パスを平坦化。SeparableBlur / History は後続実装
-        // (効果実行基盤の波状拡張、現カタログは全 Simple)。
+        // 実行可能パスを平坦化。Simple と SeparableBlur (H/V) は共に 1-in-1-out なので
+        // 同じ ping-pong 経路で実行できる (assemble_module がパス種別ごとに WGSL を生成)。
+        // History は前フレーム出力を読む 2 入力パスで、安定 chain_key + 永続 target が要るため
+        // 別経路 (後続実装)。
         let mut passes: Vec<(&'static VideoFxDef, usize, &[f32])> = Vec::new();
         for eff in chain {
             for (pi, pass) in eff.def.passes.iter().enumerate() {
-                if matches!(pass.kind, PassKind::Simple) {
+                if matches!(pass.kind, PassKind::Simple | PassKind::SeparableBlur { .. }) {
                     passes.push((eff.def, pi, &eff.params));
                 }
             }
@@ -466,7 +580,8 @@ impl VideoFxEngine {
             };
             let in_view = in_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-            let ubuf = make_uniform_buffer(&device, def, params, resolution, texel);
+            let ubuf =
+                make_uniform_buffer(&device, def, params, resolution, texel, self.current_time);
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(def.id),
                 layout: &self.ensure_common(&device).layout,
@@ -526,10 +641,11 @@ fn make_uniform_buffer(
     params: &[f32],
     resolution: [f32; 2],
     texel: [f32; 2],
+    time: f32,
 ) -> wgpu::Buffer {
     let mut data: Vec<f32> = Vec::with_capacity(8 + def.params.len() + 3);
     data.extend_from_slice(&[resolution[0], resolution[1], texel[0], texel[1]]);
-    data.push(0.0); // time (現カタログ未使用、将来 noise/feedback 用)
+    data.push(time); // P.time（秒）。ノイズ/スキャンライン等の時間系効果用。
     data.extend_from_slice(&[0.0, 0.0, 0.0]); // pad0..2 (prelude を 8 float = 32B に)
     for (i, _p) in def.params.iter().enumerate() {
         data.push(params.get(i).copied().unwrap_or(0.0));
@@ -544,12 +660,14 @@ fn make_uniform_buffer(
     device.create_buffer_init_compat(&bytes)
 }
 
-/// `def` の `pass` 番目 effect-body を標準ハーネス (頂点シェーダ + bind group +
-/// `Params` uniform + `@fragment`) で包んで完全な WGSL モジュールにする。
-/// uniform レイアウトは [`make_uniform_buffer`] と一致 (prelude 8 float → params)。
+/// `def` の `pass` 番目を標準ハーネス (頂点シェーダ + bind group + `Params` uniform) で
+/// 包んで完全な WGSL モジュールにする。uniform レイアウトは [`make_uniform_buffer`] と一致
+/// (prelude 8 float → params)。trailer (`@fragment`) はパス種別で分岐:
+/// - [`PassKind::Simple`] / [`PassKind::History`]: effect-body (`fn effect(uv, src)`) を呼ぶ。
+/// - [`PassKind::SeparableBlur`]: 1 軸ガウシアンブラーを engine が生成 (body は使わない。
+///   半径は def の第 1 param)。plan_video_fx §1.2 の共有プリミティブ。
 #[must_use]
 pub fn assemble_module(def: &VideoFxDef, pass: usize) -> String {
-    let body = def.passes[pass].wgsl;
     let mut param_fields = String::new();
     for p in def.params {
         param_fields.push_str(&format!("    {}: f32,\n", p.key));
@@ -563,7 +681,8 @@ pub fn assemble_module(def: &VideoFxDef, pass: usize) -> String {
     for i in 0..tail {
         tail_fields.push_str(&format!("    _tail{i}: f32,\n"));
     }
-    format!(
+    // 共有プレリュード: Params uniform + bind group + sample() + 全画面三角形頂点シェーダ。
+    let prelude = format!(
         r#"struct Params {{
     resolution: vec2<f32>,
     texel: vec2<f32>,
@@ -599,7 +718,49 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {{
     out.uv = vec2<f32>((xy.x + 1.0) * 0.5, 1.0 - (xy.y + 1.0) * 0.5);
     return out;
 }}
-
+"#
+    );
+    // パス種別ごとの trailer。
+    let trailer = match def.passes[pass].kind {
+        PassKind::SeparableBlur { horizontal } => {
+            // 1 軸の分離ガウシアン。半径 (px) は def の第 1 param。sigma = radius/3 (3σ rule)。
+            let axis = if horizontal {
+                "vec2<f32>(P.texel.x, 0.0)"
+            } else {
+                "vec2<f32>(0.0, P.texel.y)"
+            };
+            let radius_key = def.params.first().map_or("radius", |p| p.key);
+            format!(
+                r#"
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
+    let radius = max(P.{radius_key}, 0.0);
+    if (radius < 0.5) {{
+        return sample(in.uv);
+    }}
+    let sigma = max(radius / 3.0, 0.5);
+    let two_s2 = 2.0 * sigma * sigma;
+    let dir = {axis};
+    let r = i32(min(ceil(radius), 96.0));
+    var acc = vec4<f32>(0.0);
+    var wsum = 0.0;
+    for (var i = -r; i <= r; i = i + 1) {{
+        let fi = f32(i);
+        let w = exp(-(fi * fi) / two_s2);
+        acc = acc + sample(in.uv + dir * fi) * w;
+        wsum = wsum + w;
+    }}
+    return acc / max(wsum, 1e-5);
+}}
+"#
+            )
+        }
+        // Simple / History は effect-body を呼ぶ標準 trailer (History は executor 未配線だが、
+        // 型網羅のため body 経路で組む)。
+        PassKind::Simple | PassKind::History => {
+            let body = def.passes[pass].wgsl;
+            format!(
+                r#"
 {body}
 
 @fragment
@@ -607,7 +768,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
     return effect(in.uv, sample(in.uv));
 }}
 "#
-    )
+            )
+        }
+    };
+    format!("{prelude}{trailer}")
 }
 
 /// `wgpu::util::DeviceExt::create_buffer_init` 相当 (util feature 非依存の薄い helper)。
@@ -641,7 +805,10 @@ mod tests {
                 let src = assemble_module(def, pass);
                 assert!(src.contains("fn vs_main"), "{} missing vs", def.id);
                 assert!(src.contains("fn fs_main"), "{} missing fs", def.id);
-                assert!(src.contains("fn effect"), "{} body missing effect()", def.id);
+                // SeparableBlur は engine 生成 fragment で effect-body を持たない。
+                if matches!(def.passes[pass].kind, PassKind::Simple | PassKind::History) {
+                    assert!(src.contains("fn effect"), "{} body missing effect()", def.id);
+                }
                 assert_eq!(
                     src.matches('{').count(),
                     src.matches('}').count(),
