@@ -10,7 +10,7 @@ use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 use crate::view::{
-    arrangement_view, bottom_panel, close_confirm_modal, export_overlay, export_range_modal,
+    arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
     font_picker, load_overlay, plugin_picker, recovery_modal, snap, status_bar, track_inspector,
     track_picker, transport,
 };
@@ -118,9 +118,10 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // app.show_recovery_modal を internal で監視するため常時呼び。
     recovery_modal::draw(app, ui, screen);
 
-    // Modal: 未保存変更ありで閉じようとしたときの「保存して終了 /
-    // 保存せず終了 / キャンセル」 確認。 app.show_close_confirm を監視。
-    close_confirm_modal::draw(app, ui, screen);
+    // Modal: 未保存変更ありで「プロジェクトを破棄する操作」 (終了 / New /
+    // Open / Open Recent) をしようとしたときの「保存して続行 / 保存せず続行 /
+    // キャンセル」 確認 (FIXME #63)。 app.dirty_guard を監視。
+    dirty_guard_modal::draw(app, ui, screen);
 
     // Modal: 書き出し範囲ピッカー (FIXME #55)。app.export_range_picker == Some の
     // とき開く。 export 実行前なので export_overlay より前に描いてよい。

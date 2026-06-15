@@ -1729,20 +1729,32 @@ pub struct AppData {
     pub recovery_candidates: Vec<PathBuf>,
     /// `recovery_candidates` を modal に出すかどうか (Dismiss で false)。
     pub show_recovery_modal: bool,
-    /// 未保存変更がある状態でウィンドウを閉じようとしたとき表示する
-    /// 「保存して終了 / 保存せず終了 / キャンセル」 確認モーダル
-    /// (`close_confirm_modal`)。 `request_close` で is_dirty なら立てる。
-    pub show_close_confirm: bool,
+    /// 未保存変更がある状態で「現在のプロジェクトを破棄する操作」 (= 終了 /
+    /// New / Open / Open Recent) を行おうとしたとき表示する確認モーダル
+    /// (`dirty_guard_modal`)。 `Some(action)` の間モーダルが開き、 「保存」
+    /// 「保存しない」「キャンセル」 を選ばせる。 保存 / 破棄が済んでから
+    /// `action` を実行する。 `request_guarded_action` で is_dirty なら立てる。
+    /// FIXME #63: 旧 `show_close_confirm` (bool, 終了専用) を一般化した。
+    pub dirty_guard: Option<DirtyGuardAction>,
     /// Runner が毎フレーム監視し、 `true` になったら cleanup して
     /// event loop を抜ける終了フラグ。 not-dirty close / 「保存せず終了」 /
     /// 保存完了 (sync or async) のいずれかで立つ。
     pub should_quit: bool,
-    /// 「保存して終了」 を選んだが plugin state 取得待ちで save が非同期
-    /// (`PendingStateRequest::Save`) になっている間 `true`。
-    /// `on_all_states_from_child` で save が完了 (is_dirty=false) したら
-    /// `should_quit` に変える。 save 試行が終われば (= pending Save が
-    /// 消えれば) クリアする (後続の手動 save が誤って quit しないように)。
-    pub quit_after_save: bool,
+    /// ガードモーダルで「保存して続行」 を選んだが plugin state 取得待ちで
+    /// save が非同期 (`PendingStateRequest::Save`) になっている間
+    /// `Some(action)`。 `on_all_states_from_child` で save が完了
+    /// (is_dirty=false) したら `action` を実行する。 save 試行が終われば
+    /// (= pending Save が消えれば) クリアする (後続の手動 save が誤って
+    /// action を実行しないように)。 FIXME #63: 旧 `quit_after_save` を一般化。
+    pub guard_after_save: Option<DirtyGuardAction>,
+    /// FIXME #63: plugin-state round-trip (`pending_state_queue` の Save /
+    /// Deferred edit / Copy) が in-flight の間にガード操作 (New / Open /
+    /// Open Recent / 終了) が要求されたとき、 queue が drain するまで保留する操作。
+    /// round-trip 完了処理は `self.song` を変更し得る (Deferred edit は track 削除等、
+    /// Save 完了は dirty を下ろす) ので、 その最中に破壊操作を走らせると保存待ちの
+    /// 編集が別 project に誤適用される / clean 判定が陳腐化する。 queue 完了時に
+    /// `recompute_dirty` してから **再評価** する (= clean なら実行、 dirty なら確認)。
+    pub guard_pending_action: Option<DirtyGuardAction>,
     pub is_dragging: bool,
     pub midi_input_label: String,
 
@@ -1778,9 +1790,9 @@ pub struct AppData {
     /// 二重起動防止。 `FileDialogResult { kind: ExportMp4 }` 受信でクリアする。
     pub export_dialog_open: bool,
     /// Save As dialog (background thread) が開いている間 true。 二重起動防止に加え、
-    /// close 確認の「保存して終了」 が新規 project で Save As を非同期に開いたとき、
-    /// dialog 解決後 (`SaveAsResolved`) の begin_save 完了で終了するよう
-    /// `quit_after_save` を立てる判定に使う。 `SaveAsResolved` 受信でクリアする。
+    /// ガードの「保存して続行」 が新規 project で Save As を非同期に開いたとき、
+    /// dialog 解決後 (`SaveAsResolved`) の begin_save 完了で action を実行するよう
+    /// `guard_after_save` を立てる判定に使う。 `SaveAsResolved` 受信でクリアする。
     pub save_as_dialog_open: bool,
 
     /// 背景スレッド (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX
@@ -2109,9 +2121,10 @@ impl AppData {
             recovery_session_id: common::recovery::new_session_id(),
             recovery_candidates,
             show_recovery_modal,
-            show_close_confirm: false,
+            dirty_guard: None,
             should_quit: false,
-            quit_after_save: false,
+            guard_after_save: None,
+            guard_pending_action: None,
             is_dragging: false,
             midi_input_label: String::new(),
             step_cursor_beat: 0.0,
@@ -3117,8 +3130,12 @@ impl AppData {
     fn is_undoable(event: &AppEvent) -> bool {
         matches!(
             event,
-            AppEvent::New
-                | AppEvent::AddInstrumentTrack
+            // FIXME #63: `New` はここに **入れない**。 New は直前に
+            // `dirty_guard` 確認を挟むため、 dispatch 時に is_dirty を
+            // clobber すると clean な project でも常にダイアログが出てしまう。
+            // また `action_new` が `reset_saved_baseline` で undo/redo を破棄する
+            // ので、 ここで積む undo snapshot はどのみち捨てられる (= dead だった)。
+            AppEvent::AddInstrumentTrack
                 | AppEvent::GroupSelectedTracks { .. }
                 | AppEvent::SetTrackParent { .. }
                 | AppEvent::SetLipsyncTarget { .. }
@@ -3573,6 +3590,22 @@ pub struct LipsyncClipResult {
     pub phonemes: Vec<common::voicevox::Phoneme>,
 }
 
+/// FIXME #63: 未保存変更がある状態で「現在のプロジェクトを破棄する操作」 を
+/// 行おうとしたとき、 ガードモーダル (`dirty_guard_modal`) で保存確認を挟んでから
+/// 実行する操作の種類。 終了 (`Quit`、 旧 close 確認) と、 New / Open /
+/// Open Recent を一本化する (= 同じ「破棄する前に確認」 セマンティクス)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirtyGuardAction {
+    /// ウィンドウを閉じる (= アプリ終了)。
+    Quit,
+    /// 新規プロジェクト (`action_new`)。
+    New,
+    /// プロジェクトを開く (ファイル選択 dialog、 `action_open`)。
+    Open,
+    /// 指定パスのプロジェクトを開く (Open Recent、 `action_open_path`)。
+    OpenPath(PathBuf),
+}
+
 /// 既存の event handler と一貫性を保つため、enum 全体に `#[allow(dead_code)]`
 /// を付ける。
 #[allow(dead_code)]
@@ -3583,14 +3616,15 @@ pub enum AppEvent {
     Open,
     Save,
     SaveAs,
-    /// 未保存変更ありの close 確認モーダルで「保存して終了」。 save を発行し、
-    /// 完了後に終了する (plugin 有り project は非同期保存を待つ)。
-    CloseConfirmSave,
-    /// close 確認モーダルで「保存せず終了」。 保存せず即終了。
-    CloseConfirmDiscard,
-    /// close 確認モーダルで「キャンセル」 (Esc / 外クリック / ✕ 含む)。
-    /// 終了を取りやめてアプリに戻る。
-    CloseConfirmCancel,
+    /// 未保存変更ありのガードモーダルで「保存して続行」。 save を発行し、
+    /// 完了後に保留中の操作 (終了 / New / Open) を実行する (plugin 有り
+    /// project は非同期保存を待つ)。
+    DirtyGuardSave,
+    /// ガードモーダルで「保存せず続行」。 保存せず即操作を実行。
+    DirtyGuardDiscard,
+    /// ガードモーダルで「キャンセル」 (Esc / 外クリック / ✕ 含む)。
+    /// 操作を取りやめてアプリに戻る。
+    DirtyGuardCancel,
     /// FIXME #27: 別の daw_gui を起動しようとした (single-instance)。 2 つ目の
     /// プロセスが既存インスタンスにこれを送って前面化を要求する。 window 操作
     /// なので runner の `user_event` が直接処理し、 `handle_event` には届かない。
@@ -5129,21 +5163,45 @@ impl AppData {
         }
 
         match event {
-            AppEvent::New => self.action_new(),
-            AppEvent::Open => self.action_open(),
+            // FIXME #63: New / Open は現在のプロジェクトを破棄するので、 dirty なら
+            // 先に保存確認ダイアログを挟む (clean なら即実行)。
+            AppEvent::New => self.request_guarded_action(DirtyGuardAction::New),
+            AppEvent::Open => self.request_guarded_action(DirtyGuardAction::Open),
             AppEvent::Save => {
-                self.action_save();
+                // FIXME #63: ガード確認中 / 保存後アクション待ち中 / queue drain 待ち中は
+                // 手動保存を無視する。 この間に別経路の保存を走らせると pending_state_queue
+                // に余分な Save が積まれ、 続く New/Open が project を破壊しうる (guard_save が
+                // 発行する保存に一本化する)。 finish_save の再保存ループは begin_save 直呼び
+                // なのでこの gate を通らない。
+                if self.dirty_guard.is_none()
+                    && self.guard_after_save.is_none()
+                    && self.guard_pending_action.is_none()
+                {
+                    self.action_save();
+                }
             }
             AppEvent::SaveAs => {
-                self.action_save_as();
+                if self.dirty_guard.is_none()
+                    && self.guard_after_save.is_none()
+                    && self.guard_pending_action.is_none()
+                {
+                    self.action_save_as();
+                }
             }
-            AppEvent::CloseConfirmSave => self.close_confirm_save(),
-            AppEvent::CloseConfirmDiscard => {
-                self.show_close_confirm = false;
-                self.should_quit = true;
+            AppEvent::DirtyGuardSave => self.guard_save(),
+            AppEvent::DirtyGuardDiscard => {
+                if let Some(action) = self.dirty_guard.take() {
+                    // 「保存せず続行/終了」 = 現プロジェクトの未保存変更を破棄する。
+                    // その変更を写した autosave (sidecar / session recovery file) を
+                    // 消してから操作を実行する。 残すと、 同じ file を開き直したとき /
+                    // 次回起動時に recovery 機構が「破棄したはずの変更を復元しますか？」
+                    // と聞いてしまう (FIXME #63 実機検証で発覚)。
+                    self.discard_current_autosave();
+                    self.perform_guard_action(action);
+                }
             }
-            AppEvent::CloseConfirmCancel => {
-                self.show_close_confirm = false;
+            AppEvent::DirtyGuardCancel => {
+                self.dirty_guard = None;
             }
             AppEvent::Play => {
                 self.play();
@@ -5615,7 +5673,9 @@ impl AppData {
                 self.is_help_open = false;
             }
             AppEvent::OpenRecent(path) => {
-                self.action_open_path(path);
+                // FIXME #63: Open Recent も「プロジェクトを開く」 = 現プロジェクト破棄
+                // なので dirty なら保存確認を挟む。
+                self.request_guarded_action(DirtyGuardAction::OpenPath(path));
             }
             AppEvent::AutosaveTick => {
                 self.maybe_autosave();
@@ -6081,9 +6141,9 @@ impl AppData {
             AppEvent::SaveAsResolved { path } => {
                 self.save_as_dialog_open = false;
                 let Some(path) = path else {
-                    // Save As キャンセル → 「保存して終了」 の終了意図を取り消し、
+                    // Save As キャンセル → 「保存して続行」 の保留操作を取り消し、
                     // アプリに留まる (旧同期フローの「何もしない」 と同義)。
-                    self.quit_after_save = false;
+                    self.guard_after_save = None;
                     return;
                 };
                 if let Some(dir) = path.parent()
@@ -6093,18 +6153,21 @@ impl AppData {
                         "プロジェクトフォルダの作成に失敗: {} ({e})",
                         dir.display()
                     );
-                    // 保存できないなら終了しない (データ損失回避)。
-                    self.quit_after_save = false;
+                    // 保存できないなら操作を実行しない (データ損失回避)。
+                    self.guard_after_save = None;
                     return;
                 }
                 self.begin_save(path);
-                // 「保存して終了」 由来の終了意図があるとき: plugin 無しは begin_save が
-                // 同期保存して is_dirty が下りるので即終了。 plugin 有りは
-                // has_pending_save が立ち、 on_all_states 完了ハンドラ (既存) が終了
-                // させる。
-                if self.quit_after_save && !self.is_dirty && !self.has_pending_save() {
-                    self.should_quit = true;
-                    self.quit_after_save = false;
+                // 「保存して続行」 由来の保留操作があるとき: plugin 無しは begin_save が
+                // 同期保存して is_dirty が下りるので即実行。 plugin 有りは
+                // has_pending_save が立ち、 on_all_states 完了ハンドラ (既存) が実行
+                // する。
+                if self.guard_after_save.is_some()
+                    && !self.is_dirty
+                    && !self.has_pending_save()
+                    && let Some(action) = self.guard_after_save.take()
+                {
+                    self.perform_guard_action(action);
                 }
             }
             AppEvent::ExportMp4 { output_path, audio_wav, range_beats } => {
@@ -7155,6 +7218,43 @@ impl AppData {
         self.last_autosave = std::time::Instant::now();
     }
 
+    /// FIXME #63: ダーティーガードで「保存せず続行/終了」 (discard) を選んだとき、
+    /// 破棄する **現プロジェクト** の autosave を消す。 `maybe_autosave` が書く 2 箇所
+    /// (file_path Some なら sidecar、 加えて session recovery file) を両方消し、
+    /// `recovery_candidates` からも除く。 これをしないと、 同じ file を開き直したとき
+    /// (`action_open_path` の sidecar 検出) や次回起動時の recovery scan で、
+    /// 「破棄したはずの未保存変更を復元しますか？」 という矛盾した modal が出る。
+    /// `clear_stale_autosave_after_save` の discard 版 (save 成功でなく明示破棄が trigger、
+    /// untitled = file_path None も session file だけ掃除する)。
+    fn discard_current_autosave(&mut self) {
+        let mut stale: Vec<PathBuf> = Vec::new();
+        if let Some(orig) = self.file_path.as_ref() {
+            stale.push(common::recovery::sidecar_for(orig));
+        }
+        if let Some(dir) = self.app_dirs.as_ref().map(|d| d.recovery_dir()) {
+            stale.push(common::recovery::recovery_path_for_session(
+                &dir,
+                &self.recovery_session_id,
+            ));
+        }
+        for p in stale {
+            if p.exists() {
+                match std::fs::remove_file(&p) {
+                    Ok(()) => tracing::info!(
+                        path = %p.display(),
+                        "removed autosave of discarded project"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = ?e,
+                        path = %p.display(),
+                        "failed to remove autosave on discard"
+                    ),
+                }
+            }
+            self.recovery_candidates.retain(|c| c != &p);
+        }
+    }
+
     /// sidecar autosave が元 `.daw` より新しい (= 前回 unclean exit 時の未保存
     /// 変更を表す) かを mtime で判定する。 どちらかの mtime が取れない場合は
     /// 安全側に倒して `true` (= 候補に出して user 判断に委ねる) を返す。
@@ -7542,40 +7642,90 @@ impl AppData {
     }
 
     /// ウィンドウを閉じる要求 (`WindowEvent::CloseRequested`) のエントリ。
-    /// 未保存変更があれば確認モーダルを開き、 無ければ即 `should_quit` を
-    /// 立てる (= Runner が cleanup + exit する)。 ふつうの DAW と同じく
-    /// 「閉じる前に保存するか確認」 する。
+    /// FIXME #63 で New / Open と一本化したガードの「終了」 ケース。
     pub fn request_close(&mut self) {
-        // 既に終了確定 / 非同期保存待ち中なら、 ✕ 連打でモーダルを
-        // 再表示しない (= 二重操作の無視)。
-        if self.should_quit || self.quit_after_save {
+        self.request_guarded_action(DirtyGuardAction::Quit);
+    }
+
+    /// FIXME #63: 現在のプロジェクトを破棄する操作 (終了 / New / Open /
+    /// Open Recent) のエントリ。 未保存変更があれば確認モーダルを開き、
+    /// 無ければ即 `action` を実行する。 ふつうの DAW と同じく「破棄する前に
+    /// 保存するか確認」 する。
+    pub fn request_guarded_action(&mut self, action: DirtyGuardAction) {
+        // 既に終了確定 / 保存後アクション待ち / queue drain 待ち / モーダル表示中
+        // なら、 連打で多重に処理しない (= 二重操作の無視 / ユーザーの判断待ち)。
+        if self.should_quit
+            || self.guard_after_save.is_some()
+            || self.guard_pending_action.is_some()
+            || self.dirty_guard.is_some()
+        {
+            return;
+        }
+        // plugin-state round-trip (Save / Deferred edit / Copy) が in-flight の間は、
+        // self.song も dirty 判定も確定していない (Deferred edit は完了時に track を
+        // 削除する等)。 確認モーダルを出さず、 破壊操作も走らせず、 queue が drain
+        // したら最新状態で **再評価** する (= `on_all_states_from_child` 末尾)。
+        // 出してしまうと: ① 保存完了で clean 化した後も「未保存です」 と聞く stale
+        // 表示、 ② Deferred edit (track 削除等) 完了前に self.song を差し替えると、
+        // pending な編集が別 project に誤適用されデータ破壊、 になる。
+        if !self.pending_state_queue.is_empty() {
+            self.guard_pending_action = Some(action);
             return;
         }
         if self.is_dirty {
-            self.show_close_confirm = true;
+            self.dirty_guard = Some(action);
         } else {
-            self.should_quit = true;
+            self.perform_guard_action(action);
         }
     }
 
-    /// close 確認モーダルで「保存して終了」 を選んだ処理。 save を発行し:
-    /// - 同期保存が済んだ (plugin 無し / 既存 path) → 即 `should_quit`
-    /// - plugin state 取得待ちで非同期保存が enqueue された → `quit_after_save`
-    ///   を立て、 `on_all_states_from_child` の完了で終了する
+    /// ガード確認を抜けた (= 保存済 / 破棄選択 / clean) あとに、 保留していた
+    /// 操作を実際に実行する。
+    fn perform_guard_action(&mut self, action: DirtyGuardAction) {
+        // データ破壊ガード: New / Open / OpenPath は self.song / file_path を
+        // 破壊的に差し替える。 pending_state_queue に未完了 round-trip
+        // (Save / Deferred edit / Copy) が残っている間に実行すると、 その完了処理が
+        // 「差し替え後の song」 を「差し替え前に捕まえた path / track_id」 で扱い、
+        // 別 project を上書き / 別 project の track を削除して破壊する。 queue が
+        // drain するまで保留し、 完了ハンドラ (`on_all_states_from_child` 末尾) が
+        // queue 空の状態で再評価する。 (Quit は song を触らないので保留不要。)
+        if !self.pending_state_queue.is_empty()
+            && matches!(
+                action,
+                DirtyGuardAction::New | DirtyGuardAction::Open | DirtyGuardAction::OpenPath(_)
+            )
+        {
+            self.guard_pending_action = Some(action);
+            return;
+        }
+        match action {
+            DirtyGuardAction::Quit => self.should_quit = true,
+            DirtyGuardAction::New => self.action_new(),
+            DirtyGuardAction::Open => self.action_open(),
+            DirtyGuardAction::OpenPath(path) => self.action_open_path(path),
+        }
+    }
+
+    /// ガードモーダルで「保存して続行」 を選んだ処理。 save を発行し:
+    /// - 同期保存が済んだ (plugin 無し / 既存 path) → 即 `action` を実行
+    /// - plugin state 取得待ちで非同期保存が enqueue された → `guard_after_save`
+    ///   を立て、 `on_all_states_from_child` の完了で `action` を実行する
+    /// - 新規 project で Save As ダイアログが非同期に開いた → `guard_after_save`
+    ///   を立て、 dialog 解決後の begin_save 完了 (`SaveAsResolved`) で実行する
     /// - Save As ダイアログをキャンセルした (保存されず pending も無い) →
     ///   何もしない (モーダルは閉じてアプリに留まる)
-    fn close_confirm_save(&mut self) {
-        self.show_close_confirm = false;
+    fn guard_save(&mut self) {
+        let Some(action) = self.dirty_guard.take() else {
+            return;
+        };
         self.action_save();
         if !self.is_dirty {
-            self.should_quit = true;
+            self.perform_guard_action(action);
         } else if self.has_pending_save() {
-            self.quit_after_save = true;
+            self.guard_after_save = Some(action);
         } else if self.save_as_dialog_open {
-            // 新規 project で Save As ダイアログが非同期に開いた。 dialog 解決後の
-            // begin_save 完了 (`SaveAsResolved`) で終了するよう intent を立てる。
             // dialog をキャンセルしたら `SaveAsResolved` 側でこの intent を取り消す。
-            self.quit_after_save = true;
+            self.guard_after_save = Some(action);
         }
     }
 
@@ -7887,26 +8037,26 @@ impl AppData {
                 self.send_audio(MainToChild::SetProjectDir(project_dir));
                 let song = self.song.clone();
                 self.send_audio(MainToChild::LoadSong(song));
-                // 「保存して終了」: この保存は成功した。 plugin state 待ちの間に live へ
+                // 「保存して続行」: この保存は成功した。 plugin state 待ちの間に live へ
                 // 編集が入って dirty なら (co-temporal snapshot は編集前で凍結されている
                 // ため、 その編集はこの保存に含まれない)、 残りを確定するため同じ path へ
-                // 再保存して終了意図を維持する。 clean なら終了する。 save 成功が分かる
-                // この場所で判定するので、 失敗時の無限再保存ループに陥らない。
-                if self.quit_after_save {
+                // 再保存して保留操作を維持する。 clean なら保留操作 (終了 / New / Open)
+                // を実行する。 save 成功が分かるこの場所で判定するので、 失敗時の無限
+                // 再保存ループに陥らない。
+                if self.guard_after_save.is_some() {
                     if self.is_dirty {
                         self.begin_save(path);
-                    } else {
-                        self.should_quit = true;
-                        self.quit_after_save = false;
+                    } else if let Some(action) = self.guard_after_save.take() {
+                        self.perform_guard_action(action);
                     }
                 }
             }
             Err(e) => {
                 tracing::error!(error = ?e, path = %path.display(), "failed to save project");
                 self.status_message = format!("保存に失敗しました: {e}");
-                // 保存失敗 → 終了しない (データ損失回避)。 終了意図はクリアして、
+                // 保存失敗 → 操作を実行しない (データ損失回避)。 保留操作はクリアして、
                 // state 待ちのたびに再保存が走り続ける無限ループを防ぐ。
-                self.quit_after_save = false;
+                self.guard_after_save = None;
             }
         }
     }
@@ -11144,6 +11294,23 @@ impl AppData {
                 self.plugin_tx = None;
                 self.pending_plugin_loads.clear();
                 self.loaded_slots.clear();
+                // FIXME #63: plugin state 取得待ちの非同期保存はもう完了しない
+                // (host 消滅で AllStatesReceived が来ない)。 stale な state request を
+                // 破棄しないと `enqueue_state_request` の was_idle 判定が永久に false
+                // のまま以後の保存が dispatch されず、 さらに `guard_after_save` が
+                // Some のまま残ると `request_guarded_action` が早期 return し続けて
+                // New/Open/終了(✕) が GUI から一切できなくなる。 保存は失敗したので
+                // 保留していた破棄系操作 (New/Open) は **実行しない** (データ損失回避)。
+                self.pending_state_queue.clear();
+                // 両方とも無条件に take する (`||` の短絡で 2 つ目が消えないように)。
+                let had_after_save = self.guard_after_save.take().is_some();
+                let had_pending = self.guard_pending_action.take().is_some();
+                if had_after_save || had_pending {
+                    tracing::warn!(
+                        "plugin host disconnect aborted an in-flight state round-trip; \
+                         dropping the deferred dirty-guard action"
+                    );
+                }
                 tracing::warn!("daw_plugin_host child disconnected");
             }
         }
@@ -16786,6 +16953,13 @@ impl AppData {
         // その Save の snapshot は返ってくる state と同じ layout になる。
         if !self.pending_state_queue.is_empty() {
             self.dispatch_front_state_request();
+        } else if let Some(action) = self.guard_pending_action.take() {
+            // FIXME #63: round-trip が全て drain した。 in-flight 中に保留していた
+            // ガード操作 (New/Open/Open Recent/終了) を、 deferred edit / save 反映後の
+            // **最新 dirty 状態で再評価** する (= clean なら実行、 dirty なら確認モーダル)。
+            // queue は空なので破壊操作も安全に走る。
+            self.recompute_dirty();
+            self.request_guarded_action(action);
         }
         // 「保存して終了」 の完了判定は `finish_save` (save 成否が分かる場所) が行う。
     }

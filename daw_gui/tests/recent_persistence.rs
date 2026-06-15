@@ -5,7 +5,7 @@
 //!
 //! 以前は `push_recent` / `push_recent_saved` が `common::recent::default_path()`
 //! (= 実 `%LOCALAPPDATA%\daw_01\recent*.json`) に直接書き込んでいた。 その結果
-//! `tempfile::tempdir()` を使う Save 系 integration test (close_confirm 等) が
+//! `tempfile::tempdir()` を使う Save 系 integration test (dirty_guard 等) が
 //! 走るたびに、 tempdir の `proj.daw` パスが実ユーザーの recent list に残り、
 //! GUI の「Open Recent」 /「Recently Saved」 メニューに test ファイルが出続けた。
 //!
@@ -53,14 +53,14 @@ fn build_app(app_dirs: Option<AppDirs>) -> (AppData, UnboundedReceiver<MainToChi
 }
 
 /// 共通の Save シナリオ: file_path を tempdir の `proj.daw` にセットし、
-/// dirty にしてから「保存して終了」 を発火 (plugin 無しなので同期保存)。
+/// dirty にしてから「保存して続行(終了)」 を発火 (plugin 無しなので同期保存)。
 /// 保存された project ファイルのパスを返す。
 fn save_fresh_project(app: &mut AppData, proj_dir: &std::path::Path) -> std::path::PathBuf {
     let proj_path = proj_dir.join("proj.daw");
     app.file_path = Some(proj_path.clone());
     app.is_dirty = true;
     app.request_close();
-    app.handle_event(AppEvent::CloseConfirmSave);
+    app.handle_event(AppEvent::DirtyGuardSave);
     proj_path
 }
 
