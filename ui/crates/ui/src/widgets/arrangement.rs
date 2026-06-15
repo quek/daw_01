@@ -985,6 +985,11 @@ pub struct ArrangementResponse {
     /// と同じ「毎フレーム算出の hover state」 idiom)。 section は ruler と track lanes の中間 lane なので
     /// clip / automation lane とは y 領域が排他 (同時に複数 hover しない)。
     pub hovered_section: Option<u32>,
+    /// FIXME #067: ポインタが今 hover している Arranger section の zone (Move / ResizeLeft / ResizeRight)。
+    /// clip の `hovered_zone` と同 idiom で widget 内の cursor 設定が読む (帯端 hover で `EwResize`、 帯中央
+    /// hover で `Move`)。 これが無いと section 帯はクリップと違い resize ハンドルの ↔ カーソルが出ず、 端を
+    /// 掴んでリサイズできることが discoverable でなかった (= ユーザ報告「Aメロの端でカーソルが矢印にならない」)。
+    pub hovered_section_zone: Option<ClipDragKind>,
     /// M14 Phase 127 (daw_01 #105): drag 中の section drag kind (`Some` なら既存 section の Move/Resize
     /// drag セッション進行中)。 `dragging` (MIDI clip) / `dragging_automation_clip` と直交、 同 frame 内で
     /// 複数 `Some` にならない (y 領域排他)。 範囲 drag による新規作成中は `None` (transient creation)。
@@ -1016,6 +1021,7 @@ impl Default for ArrangementResponse {
             automation_lasso_active: false,
             hovered_automation_lane: None,
             hovered_section: None,
+            hovered_section_zone: None,
             dragging_section: None,
             section_rects: Vec::new(),
         }
@@ -1934,6 +1940,16 @@ fn section_at_inrect(
         let r = section_to_rect(s, view, arranger);
         (cx >= r.x && cx < r.x + r.w).then_some(s.id)
     })
+}
+
+/// FIXME #067: clip / section の drag zone (`ClipDragKind`) を cursor 形状へ写す共通マップ
+/// (中央 Move → `Move`、 端 Resize → `EwResize`)。 clip drag / clip hover / section drag / section hover の
+/// 4 経路が同じ写像を共有する (= 端を掴んでリサイズできることを ↔ カーソルで discoverable にする)。
+fn drag_kind_cursor(kind: ClipDragKind) -> CursorIcon {
+    match kind {
+        ClipDragKind::Move => CursorIcon::Move,
+        ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
+    }
 }
 
 /// M14 Phase 127 (#105): 拍子から 1 bar の拍数を返す (`numerator * 4 / denominator`)。 4/4=4、 3/4=3、
@@ -6714,9 +6730,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && arranger_lane_h > 0.0
             && arranger_rect.contains(cx, cy)
         {
-            response.hovered_section =
+            // FIXME #067: hover の zone (Move/Resize) も保持して cursor を駆動する (id だけ捨てない)。
+            if let Some((id, kind)) =
                 section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
-                    .map(|(id, _)| id);
+            {
+                response.hovered_section = Some(id);
+                response.hovered_section_zone = Some(kind);
+            }
         }
         // visible section の rect を response に積む (clip_rects と同 semantics、 caller の context_menu_for
         // 用)。 完全 off-screen (arranger_rect と x 交差しない) は除外。
@@ -6760,27 +6780,26 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
         let dragging_kind = response
             .dragging
-            .or(automation_clip_drag_session.as_ref().map(|acd| acd.kind));
+            .or(automation_clip_drag_session.as_ref().map(|acd| acd.kind))
+            // FIXME #067: section の Move/Resize drag 中も clip と同じ cursor (Move / EwResize)。
+            // clip drag と section drag は y 領域排他なので同時に Some にならない。
+            .or(response.dragging_section);
         if header_resize_active {
             self.set_cursor(CursorIcon::EwResize);
         } else if resize_active {
             self.set_cursor(CursorIcon::NsResize);
         } else if let Some(kind) = dragging_kind {
-            let cur = match kind {
-                ClipDragKind::Move => CursorIcon::Move,
-                ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
-            };
-            self.set_cursor(cur);
+            self.set_cursor(drag_kind_cursor(kind));
         } else if response.reordering.is_some() {
             self.set_cursor(CursorIcon::Move);
         } else if response.dragging_track_volume.is_some() {
             self.set_cursor(CursorIcon::EwResize);
         } else if let Some(zone) = response.hovered_zone {
-            let cur = match zone {
-                ClipDragKind::Move => CursorIcon::Move,
-                ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
-            };
-            self.set_cursor(cur);
+            self.set_cursor(drag_kind_cursor(zone));
+        } else if let Some(zone) = response.hovered_section_zone {
+            // FIXME #067: section 帯の hover も clip と同 idiom — 端 (Resize zone) で EwResize、
+            // 中央 (Move zone) で Move。 帯端を掴んでリサイズできることを ↔ カーソルで示す。
+            self.set_cursor(drag_kind_cursor(zone));
         } else if let Some((cx, cy)) = pointer.pos
             && (automation_lane_resize_splitter_at(
                 &visible_tracks,
