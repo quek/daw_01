@@ -16,22 +16,12 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit",
+        "matcher": "Edit|Write|MultiEdit|Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_antipattern.ps1",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_compromise_smell.ps1",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_gui_conversation_entry.ps1",
-            "timeout": 5
+            "command": "python F:/dev/daw_01/scripts/guard_engine.py",
+            "timeout": 10
           }
         ]
       },
@@ -50,12 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_destructive_delete.ps1",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/check_gui01_pending.ps1",
+            "command": "python F:/dev/daw_01/scripts/check_destructive_delete.py",
             "timeout": 5
           }
         ]
@@ -67,7 +52,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/log_metric.ps1",
+            "command": "python F:/dev/daw_01/scripts/log_metric.py",
             "timeout": 5
           }
         ]
@@ -83,7 +68,7 @@
           },
           {
             "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File F:/dev/daw_01/scripts/reflect.ps1",
+            "command": "python F:/dev/daw_01/scripts/reflect.py",
             "timeout": 10
           }
         ]

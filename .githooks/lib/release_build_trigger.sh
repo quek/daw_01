@@ -23,10 +23,9 @@ done
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 if [ "$branch" != "main" ]; then exit 0; fi
 
-# Start-Process は即時に戻る -> hidden な独立プロセスで release_build_bg.ps1 が走る。
+# detached background build: nohup + & so git's post-commit returns immediately while the
+# build runs independently. PowerShell-free (bash): scripts/release_build_bg.sh.
 repo="$(git rev-parse --show-toplevel)"
-powershell -NoProfile -ExecutionPolicy Bypass -Command \
-  "Start-Process -WindowStyle Hidden -FilePath powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','$repo/scripts/release_build_bg.ps1','-Repo','$repo'" \
-  >/dev/null 2>&1
+nohup sh "$repo/scripts/release_build_bg.sh" "$repo" >/dev/null 2>&1 &
 
 exit 0

@@ -848,28 +848,46 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 app.handle_event(AppEvent::SetNoteSelection(ids.clone()));
             }));
         } else if let Some(lane) = app.arrange_hovered_automation_lane {
-            // automation lane 上: 段階拡大。 1 回目 = lane の全ポイント、
-            // 既に全ポイント選択済 (or ポイント無し) なら 2 回目 = 全クリップ。
-            let next = app.all_automation_points_in_lane(lane);
-            let already_all = !next.is_empty()
-                && app.selected_automation_points.len() == next.len()
-                && {
+            // automation lane 上: 段階拡大 (#071 で clip 段を追加)。
+            //   1 回目 = lane の全ポイント
+            //   2 回目 (全ポイント選択済 or ポイント無し) = lane の全 automation clip
+            //   3 回目 (全 clip 選択済 or clip 無し)     = 曲全体の全 (通常) クリップ
+            let all_points = app.all_automation_points_in_lane(lane);
+            let points_done = all_points.is_empty()
+                || (app.selected_automation_points.len() == all_points.len() && {
                     let cur: std::collections::HashSet<_> =
                         app.selected_automation_points.iter().collect();
-                    next.iter().all(|p| cur.contains(p))
-                };
-            if next.is_empty() || already_all {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::SelectAllClips);
-                }));
-            } else {
+                    all_points.iter().all(|p| cur.contains(p))
+                });
+            if !points_done {
                 let prev = app.selected_automation_points.clone();
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SelectAutomationPoints {
                         prev: prev.clone(),
-                        next: next.clone(),
+                        next: all_points.clone(),
                     });
                 }));
+            } else {
+                let all_clips = app.all_automation_clips_in_lane(lane);
+                let clips_done = all_clips.is_empty()
+                    || (app.selected_automation_clips.len() == all_clips.len() && {
+                        let cur: std::collections::HashSet<_> =
+                            app.selected_automation_clips.iter().collect();
+                        all_clips.iter().all(|c| cur.contains(c))
+                    });
+                if !clips_done {
+                    let prev = app.selected_automation_clips.clone();
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SelectAutomationClips {
+                            prev: prev.clone(),
+                            next: all_clips.clone(),
+                        });
+                    }));
+                } else {
+                    ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                        app.handle_event(AppEvent::SelectAllClips);
+                    }));
+                }
             }
         } else {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
