@@ -1,5 +1,5 @@
 #!/bin/sh
-# git-native post-commit hook: commit のたびに release build を必ず走らせる。
+# git-native post-commit hook: main ブランチの commit のたびに release build を走らせる。
 #
 # CLAUDE.md ルール「commit したら必ず release build を行なう」の唯一の保証点。
 # 旧来の Claude-Code PostToolUse hook (matcher "Bash") は Bash ツール経由 /
@@ -23,6 +23,13 @@ for f in MERGE_HEAD CHERRY_PICK_HEAD; do
   p="$(git rev-parse --git-path "$f" 2>/dev/null)"
   if [ -n "$p" ] && [ -f "$p" ]; then exit 0; fi
 done
+
+# release build は main ブランチの commit でのみ走らせる (FIXME #65)。各 worktree の
+# feature ブランチでは skip し、release 検証は main への統合 (merge) commit 時に一度だけ行う。
+# clean merge は post-commit が branch=main / MERGE_HEAD 無しで発火するので、main へ
+# 取り込んだ統合結果が確実に release build される (実測で確認済み)。
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+if [ "$branch" != "main" ]; then exit 0; fi
 
 # Start-Process は即時に戻る -> hidden な独立プロセスで release_build_bg.ps1 が走る。
 powershell -NoProfile -ExecutionPolicy Bypass -Command \

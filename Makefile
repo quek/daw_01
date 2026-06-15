@@ -2,6 +2,11 @@
 
 .DEFAULT_GOAL := release
 
+# 実行に必要な 3 つの exe (= runtime product)。ui/crates/examples/* (daw-ui-example-*) は
+# 実行に不要なので release では作らない (FIXME #65)。examples もコンパイル検証したい
+# test / clippy / check は --workspace のまま残す。
+RUN_PKGS := -p daw_gui -p daw_audio -p daw_plugin_host
+
 # ---- vendored FFmpeg (third_party/ffmpeg は gitignore、各マシンで fetch) ----
 # ABI は avcodec-61 / avformat-61 / avutil-59 / swscale-8 / swresample-5 (= ffmpeg 7.1)
 # を維持すること (vendored binding daw_gui/ffmpeg/binding_ffmpeg_7.1.rs と一致させるため)。
@@ -16,7 +21,7 @@ help:
 	@echo ""
 	@echo "  make build         workspace をビルド (debug)"
 	@echo "  make run           daw_gui をビルド × 起動 (debug)"
-	@echo "  make release       workspace を release でビルド"
+	@echo "  make release       実行 3 exe (daw_gui/daw_audio/daw_plugin_host) を release ビルド"
 	@echo "  make run-release   daw_gui をビルド × 起動 (release)"
 	@echo "  make test          workspace 全テスト"
 	@echo "  make clippy        clippy をエラー扱いで走らせる"
@@ -58,7 +63,7 @@ run: build
 	cargo run -p daw_gui
 
 release: fetch-ffmpeg
-	cargo build --workspace --release
+	cargo build --release $(RUN_PKGS)
 
 run-release: release
 	cargo run -p daw_gui --release

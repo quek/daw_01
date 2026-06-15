@@ -1,4 +1,5 @@
-# Detached background release build, launched by .githooks/post-commit after EVERY commit.
+# Detached background release build, launched by .githooks/post-commit after every commit
+# ON main (FIXME #65: the hook skips non-main branches). Builds only the 3 runtime exes.
 #
 # ASCII-only: PowerShell 5.1 misparses BOM-less UTF-8 files containing non-ASCII text
 # (Write/Edit emit BOM-less UTF-8), which previously corrupted string literals. Keep
@@ -26,10 +27,15 @@ $sha   = (& git rev-parse --short HEAD).Trim()
 $start = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 Set-Content -LiteralPath $log -Value "[post-commit] release build start $sha at $start" -Encoding ascii
 
+# Build only the 3 runtime exes (FIXME #65). ui/crates/examples/* (daw-ui-example-*) are
+# not needed to run the DAW; their release link (lto=thin, codegen-units=1) dominated the
+# old --workspace build. daw_gui pulls common + daw-ui-* libs transitively, so every
+# runtime dependency is still compiled in release.
+#
 # Use cmd's OS-level redirection (>> 2>&1) rather than PowerShell's *>> so PS 5.1 does
 # NOT wrap cargo's stderr (its normal progress output) as NativeCommandError records,
 # and the log stays single-encoding. $LASTEXITCODE carries cargo's real exit code.
-cmd /c "cargo build --workspace --release >> `"$log`" 2>&1"
+cmd /c "cargo build --release -p daw_gui -p daw_audio -p daw_plugin_host >> `"$log`" 2>&1"
 $code = $LASTEXITCODE
 
 $end = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
