@@ -17,7 +17,7 @@ use common::plugin_format::PluginFormat;
 use common::protocol::MainToChild;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::{AppData, AppEvent, PendingStateRequest};
+use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, PendingStateRequest};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
@@ -414,17 +414,20 @@ fn save_and_quit_clean_sets_should_quit() {
     fake_plugin_loaded(&mut app, track_id, 0, "test.synth", 100);
     let _ = drain(&mut plugin_rx);
 
-    // 非同期保存を enqueue し、 「保存して終了」 の意図を立てる
-    // (= close_confirm_save が plugin 有り dirty project でやること)。
+    // 非同期保存を enqueue し、 「保存して続行(終了)」 の意図を立てる
+    // (= guard_save が plugin 有り dirty project でやること)。
     app.file_path = Some(std::env::temp_dir().join("daw01_test_quit_clean.daw"));
     app.handle_event(AppEvent::Save);
-    app.quit_after_save = true;
+    app.guard_after_save = Some(DirtyGuardAction::Quit);
     assert!(has_pending_save(&app), "Save in-flight");
 
     // 編集なしで応答到着 → finish_save が clean を確認して should_quit。
     app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
     assert!(app.should_quit, "clean async save-and-quit sets should_quit");
-    assert!(!app.quit_after_save, "quit intent cleared after quitting");
+    assert!(
+        app.guard_after_save.is_none(),
+        "quit intent cleared after quitting"
+    );
 }
 
 /// 「保存して終了」 で plugin state 待ちの間に編集が入った場合、 co-temporal
@@ -448,7 +451,7 @@ fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
 
     app.file_path = Some(std::env::temp_dir().join("daw01_test_quit_window_edit.daw"));
     app.handle_event(AppEvent::Save);
-    app.quit_after_save = true;
+    app.guard_after_save = Some(DirtyGuardAction::Quit);
     let _ = drain(&mut plugin_rx);
 
     // state 待ちの間に live を編集する (snapshot は既に凍結済みなので含まれない)。
@@ -463,7 +466,7 @@ fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
         "window edit during save-and-quit must NOT quit (would drop the edit)"
     );
     assert!(
-        app.quit_after_save,
+        app.guard_after_save.is_some(),
         "quit intent stays alive across the follow-up save"
     );
     assert!(
