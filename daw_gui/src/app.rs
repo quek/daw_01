@@ -915,6 +915,13 @@ pub const MIN_EXPORT_RANGE_BEATS: f64 = 0.25;
 /// gui_01 #055: widget は押下 pitch のみ返すので velocity は daw_01 側で固定。
 const PREVIEW_VELOCITY: u8 = 100;
 
+/// FIXME #60: パニックボタンで `MainToChild::Panic`（master declick）を送ってから
+/// `ReinitAllPlugins` を送るまでの遅延。 audio engine が次の buffer で declick を
+/// 開始し fade-out（5ms）し切るまで（= buffer 1 個分 + 5ms ≒ 最大数十 ms）master
+/// が 0 になるのを待ってから plugin を mix から外す。 80ms あれば大きめの buffer
+/// でも余裕。 `on_tick`（30Hz ≒ 33ms 間隔）が経過判定する。
+const PANIC_REINIT_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
+
 /// Audio Editor zoom の最小 view span (beats)。 1/64 拍 = 約 0.015 beats。
 /// これ未満は描画上意味がなく `view_len` を 0 に近づけると `beats_per_px`
 /// が発散するので clamp。
@@ -1382,6 +1389,16 @@ pub struct AppData {
     ///   間 (= まだ一度も play していない or stop 済みで restore 完了) は
     ///   stop() は何もしない。
     pub playback_origin_beat: Option<f32>,
+    /// FIXME #60: パニックボタンが立てる「遅延 reinit」 の起点時刻。 `Some` の間、
+    /// `on_tick` が [`PANIC_REINIT_DELAY`] 経過で `ReinitAllPlugins` を plugin host
+    /// に送って `None` に戻す。 master の declick フェードアウト完了後に plugin の
+    /// detach を起こすための遅延（段差クリック回避、 [`Self::panic`] 参照）。
+    pub panic_reinit_due: Option<std::time::Instant>,
+    /// FIXME #60: パニックの declick が「ミュート解除待ち」 か。 `panic` で `true`、
+    /// `ReinitAllPlugins` の完了通知 `PluginsReinitDone` を受けた時に engine へ
+    /// `PanicRelease` を送って `false` に戻す。 ミュート解除を reinit 完了に結び
+    /// つけるためのフラグ（[`Self::panic`] 参照）。
+    pub panic_release_pending: bool,
     pub master_gain: f32,
     pub peak_l_display: f32,
     pub peak_r_display: f32,
@@ -1666,7 +1683,7 @@ pub struct AppData {
     pub pending_video_export_range: Option<(f64, f64)>,
     /// FIXME #55: a WAV export request held while the plugin host reinitialises
     /// all plugins (deactivate→activate) for a clean offline cold render. Set by
-    /// [`Self::begin_wav_export`] (which sends `ReinitPluginsForExport`); fired
+    /// [`Self::begin_wav_export`] (which sends `ReinitAllPlugins`); fired
     /// as `MainToChild::ExportWav` on `AppEvent::PluginsReinitDone`. Tuple is
     /// `(path, range_frames, write_mod_sidecar)`.
     pub pending_export: Option<PendingExport>,
@@ -2021,6 +2038,8 @@ impl AppData {
             is_looping: false,
             playhead_beat: None,
             playback_origin_beat: None,
+            panic_reinit_due: None,
+            panic_release_pending: false,
             master_gain: 1.0,
             peak_l_display: 0.0,
             peak_r_display: 0.0,
@@ -3632,6 +3651,10 @@ pub enum AppEvent {
     Play,
     Stop,
     PlayToggle,
+    /// FIXME #60: パニック — 鳴っている全ての音を即座に止める transport ボタン。
+    /// 再生中なら transport stop し、全 plugin を deactivate→activate で
+    /// 再初期化する（WAV 書き出しと同じ `ReinitAllPlugins` 機構を流用）。
+    Panic,
     /// FIXME #44: `f` キー。カーソル直下の拍 (song-absolute, 現在の snap 設定で吸着済)
     /// へプレイヘッドを移動して再生する。再生中は seek してシームレスに継続、停止中は
     /// その位置から再生開始。view 層 (`dispatch_shortcuts`) が snap / ルーティング /
@@ -5216,6 +5239,9 @@ impl AppData {
                     self.play();
                 }
             }
+            AppEvent::Panic => {
+                self.panic();
+            }
             AppEvent::PlayFromCursor { beat } => {
                 self.action_play_from_cursor(beat);
             }
@@ -6528,6 +6554,18 @@ impl AppData {
                         range,
                         write_mod_sidecar,
                     });
+                }
+                // FIXME #60: a panic's reinit just completed — release the audio
+                // engine's master declick hold so it fades back in over a now
+                // clean (silent) mix. Coupling the un-mute to the real reinit
+                // completion (not a timer) is what keeps a stalled GUI thread or
+                // a long reinit from re-exposing the sound. Guard on
+                // `panic_reinit_due.is_none()` so a rapid second panic (whose
+                // reinit is still queued for `on_tick`) doesn't release early on
+                // the previous reinit's reply — the newer reinit's reply will.
+                if self.panic_release_pending && self.panic_reinit_due.is_none() {
+                    self.panic_release_pending = false;
+                    self.send_audio(MainToChild::PanicRelease);
                 }
             }
             AppEvent::ExportWavComplete { error, cancelled } => {
@@ -8183,6 +8221,46 @@ impl AppData {
         // が反映される)。 currently_recording_lanes は !is_playing なので
         // 必ず empty に解決する。
         self.sync_recording_lanes_with_audio();
+    }
+
+    /// FIXME #60: パニック — 鳴っている全ての音を即座に止める。
+    ///
+    /// 1. 再生中なら [`Self::stop`] で transport を止める（sequencer note-off を
+    ///    flush、audio clip / metronome を停止、playhead を開始位置へ戻す）。
+    /// 2. 全 plugin を `ReinitAllPlugins`（deactivate→activate）で再初期化し、
+    ///    note-off を無視する音源（VCV Rack 2 の hold voice）/ reverb tail /
+    ///    鍵盤プレビューの stuck note / 自己発振まで確実に黙らせる。WAV 書き出し
+    ///    開始時のクリーンリセットと同じ機構をそのまま流用する（ユーザー要望）。
+    ///
+    /// 書き出し中（offline render / 映像）は freewheel を壊さないよう no-op。
+    /// reinit は fire-and-forget — 返信の `PluginsReinitDone` は pending_export が
+    /// 無いので handler 側で無視される。
+    ///
+    /// クリック対策: `ReinitAllPlugins` は全 plugin を audio engine の mix から
+    /// 一瞬で外すので、 master がフル音量のまま外すと段差クリック（「ビープ」）に
+    /// なる。 そこで:
+    /// 1. まず engine に `Panic` を送って master を declick フェードアウト →
+    ///    **ミュート保持** させる。
+    /// 2. reinit を [`PANIC_REINIT_DELAY`] だけ遅延させ、 plugin の detach が
+    ///    master ミュート後に起きるようにする（`on_tick` が遅延 reinit を発火）。
+    /// 3. reinit 完了通知 `PluginsReinitDone` を受けたら engine に `PanicRelease`
+    ///    を送り、 master をフェードインで戻す（`panic_release_pending`）。
+    ///
+    /// ミュート解除を固定タイマーでなく**実際の reinit 完了**に結びつけることで、
+    /// GUI メインスレッド stall や巨大 reinit でも、 plugin が mix に残ったまま
+    /// master が戻る（クリック / reverb tail 復活）ことを防ぐ。engine 側にも
+    /// plugin-host hang 用の安全 auto-release がある。
+    fn panic(&mut self) {
+        if self.pending_video_export.is_some() || self.export_stage.is_some() {
+            return;
+        }
+        if self.is_playing {
+            self.stop();
+        }
+        self.send_audio(MainToChild::Panic);
+        self.panic_reinit_due = Some(std::time::Instant::now());
+        self.panic_release_pending = true;
+        self.status_message = "パニック: 全ての音を停止しました".into();
     }
 
     fn toggle_loop(&mut self) {
@@ -16984,6 +17062,18 @@ impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
     fn on_tick(&mut self, playhead_samples: u64, peak_l_raw: f32, peak_r_raw: f32) {
+        // FIXME #60: パニックの遅延 reinit を発火する。 master の declick フェード
+        // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を
+        // 送ることで、 plugin を mix から外す detach が master ミュート後に起き、
+        // 段差クリック (「ビープ」) を出さずに reverb tail / 全 plugin 状態をクリア
+        // する (`Self::panic` 参照)。
+        if let Some(due) = self.panic_reinit_due
+            && due.elapsed() >= PANIC_REINIT_DELAY
+        {
+            self.panic_reinit_due = None;
+            self.send_plugin(MainToChild::ReinitAllPlugins);
+        }
+
         // Export watchdog: daw_audio が crash でなく hang した場合 (進捗 heartbeat も
         // 完了通知も止まる) は ChildDisconnected も発火しないので overlay + 入力 gate
         // が永久に残る。一定時間進捗が来なければ強制終了して脱出口を確保する。
@@ -18137,7 +18227,7 @@ impl AppData {
         // 全 plugin を deactivate→activate でクリーンにしてから export する。
         // 完了 (`PluginsReinitDone`) で stashed export を発火。
         self.pending_export = Some((path, range, write_mod_sidecar));
-        self.send_plugin(MainToChild::ReinitPluginsForExport);
+        self.send_plugin(MainToChild::ReinitAllPlugins);
     }
 
     /// Phase 7 B4 Step E (2026-05-13): File → Export MIDI...

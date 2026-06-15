@@ -130,6 +130,20 @@ async fn recv_loop(
                     .playback
                     .store(PlaybackCommand::Stop as u8, Ordering::Release);
             }
+            Ok(MainToChild::Panic) => {
+                // FIXME #60: arm the master declick. The CPAL callback consumes
+                // this edge flag, fades the master out and holds at zero until
+                // `PanicRelease`, so the imminent `ReinitAllPlugins` (which yanks
+                // every plugin out of the mix) doesn't produce a step click.
+                tracing::info!("received Panic (master declick)");
+                shared.panic_declick.store(true, Ordering::Release);
+            }
+            Ok(MainToChild::PanicRelease) => {
+                // FIXME #60: the plugin reinit finished — release the declick
+                // hold so the master fades back in over a now-silent mix.
+                tracing::info!("received PanicRelease (declick fade-in)");
+                shared.panic_release.store(true, Ordering::Release);
+            }
             Ok(MainToChild::SetLoop(b)) => {
                 shared.looping.store(b, Ordering::Release);
             }
@@ -526,9 +540,10 @@ async fn recv_loop(
                     .store(true, std::sync::atomic::Ordering::Release);
                 tracing::info!("received CancelExport; offline render will abort");
             }
-            Ok(MainToChild::ReinitPluginsForExport) => {
-                // FIXME #55: plugin reinit is the plugin host's job (it owns the
-                // instances). The audio side has no plugins — ignore.
+            Ok(MainToChild::ReinitAllPlugins) => {
+                // Plugin reinit (export prep / panic button) is the plugin
+                // host's job — it owns the instances. The audio side has no
+                // plugins — ignore.
             }
             Ok(MainToChild::BounceClipFxOnline {
                 path,
@@ -862,6 +877,28 @@ fn build_stream(
     // touched outside the audio thread.
     let mut local = LocalState::new(max_frames, cmd_rx, engine_shared);
 
+    // FIXME #60: panic-button master declick. `MainToChild::Panic` sets
+    // `shared.panic_declick`; the callback consumes that edge and fades the
+    // master out, then HOLDS it at zero until `MainToChild::PanicRelease`
+    // (`shared.panic_release`) arrives — which daw_gui sends only once the
+    // plugin host has actually finished `ReinitAllPlugins` (reply
+    // `PluginsReinitDone`). Holding until the real reinit completion (rather
+    // than a fixed timer) means a stalled GUI main thread or a slow/large
+    // reinit can never un-mute the master while plugins are still ringing in
+    // the mix (the step-discontinuity click / re-exposed reverb tail this whole
+    // mechanism exists to prevent). A `declick_max_hold` safety auto-releases if
+    // the reply never comes (plugin-host hang) so the master can't get stuck.
+    //
+    // `declick_t` = samples since the envelope started (`None` = inactive).
+    // `declick_released_at` = the `declick_t` at which the fade-in began
+    // (`None` = still fading out / holding). Durations derive from the sample rate.
+    let sr64 = u64::from(session_sample_rate);
+    let declick_fade_out = (sr64 * 5 / 1000).max(1); // 5 ms
+    let declick_fade_in = (sr64 * 20 / 1000).max(1); // 20 ms
+    let declick_max_hold = sr64 * 2; // 2 s safety: auto-release if no reply
+    let mut declick_t: Option<u64> = None;
+    let mut declick_released_at: Option<u64> = None;
+
     let stream = device
         .build_output_stream(
             config,
@@ -881,14 +918,41 @@ fn build_stream(
 
                 let gain = f32::from_bits(master_gain.load(Ordering::Relaxed));
 
+                // FIXME #60: consume the panic edge to (re)start the master
+                // declick envelope at sample 0 of this buffer.
+                if shared.panic_declick.swap(false, Ordering::AcqRel) {
+                    declick_t = Some(0);
+                    declick_released_at = None;
+                }
+                // Once the fade-out is done and we're holding at zero, release
+                // (begin the fade-in) when daw_gui signals the reinit finished,
+                // or when the safety hold cap is hit (reply never arrived).
+                if let Some(t) = declick_t
+                    && declick_released_at.is_none()
+                    && t >= declick_fade_out
+                    && (shared.panic_release.swap(false, Ordering::AcqRel)
+                        || t >= declick_fade_out + declick_max_hold)
+                {
+                    declick_released_at = Some(t);
+                }
+
                 // Interleave master_l/r into the device buffer, applying
-                // master_gain. Lanes beyond stereo on the device are
-                // zeroed.
+                // master_gain (and the panic declick envelope when active).
+                // Lanes beyond stereo on the device are zeroed.
                 unsafe {
                     let dst = data.as_mut_ptr();
                     for i in 0..frames {
-                        let l = local.master_l[i] * gain;
-                        let r = local.master_r[i] * gain;
+                        let dg = match declick_t {
+                            Some(t) => panic_declick_gain(
+                                t + i as u64,
+                                declick_fade_out,
+                                declick_fade_in,
+                                declick_released_at,
+                            ),
+                            None => 1.0,
+                        };
+                        let l = local.master_l[i] * gain * dg;
+                        let r = local.master_r[i] * gain * dg;
                         let out = dst.add(i * channels_usize);
                         *out = l;
                         if channels_usize > 1 {
@@ -898,6 +962,15 @@ fn build_stream(
                             *out.add(c) = 0.0;
                         }
                     }
+                }
+                // Advance the envelope; clear it once the fade-in has finished
+                // so the master returns to full gain.
+                if let Some(t) = declick_t {
+                    let next = t + frames as u64;
+                    declick_t = match declick_released_at {
+                        Some(r) if next >= r + declick_fade_in => None,
+                        _ => Some(next),
+                    };
                 }
                 let filled = frames * channels_usize;
                 for s in &mut data[filled..] {
@@ -912,6 +985,35 @@ fn build_stream(
         )
         .context("failed to build output stream")?;
     Ok(stream)
+}
+
+/// FIXME #60: master gain multiplier for the panic declick envelope at sample
+/// offset `t` (samples since the panic was armed):
+/// `fade_out` (1 → 0) → hold (0, until `released_at` is set) → fade-in (0 → 1
+/// over `fade_in`, starting at `released_at`) → done (1). The master is faded to
+/// silence *before* `ReinitAllPlugins` yanks every plugin out of the mix (so the
+/// step discontinuity is masked) and HELD there until `released_at` is set — by
+/// the caller when daw_gui confirms the reinit actually completed — so the
+/// un-mute can never happen while plugins are still ringing in the mix. RT-safe:
+/// branch + one division, no allocation.
+fn panic_declick_gain(t: u64, fade_out: u64, fade_in: u64, released_at: Option<u64>) -> f32 {
+    if t < fade_out {
+        return 1.0 - t as f32 / fade_out as f32; // fade-out
+    }
+    match released_at {
+        // Holding at zero until release.
+        None => 0.0,
+        Some(r) if t < r => 0.0,
+        // Fade back in from the release point.
+        Some(r) => {
+            let u = t - r;
+            if u < fade_in {
+                u as f32 / fade_in as f32
+            } else {
+                1.0
+            }
+        }
+    }
 }
 
 /// Scan interleaved `data` (stride = `channels`) for the per-channel peak of
@@ -958,5 +1060,25 @@ mod tests {
     fn block_peaks_stereo_interleaved_picks_per_channel_max() {
         let data = [0.1, -0.4, -0.2, 0.3, 0.05, -0.5];
         assert_eq!(block_peaks_stereo(&data, 2), (0.2, 0.5));
+    }
+
+    // FIXME #60: panic declick envelope (fade_out=4, fade_in=4), hold-until-release.
+    #[test]
+    fn panic_declick_envelope_phases() {
+        let (fo, fi) = (4u64, 4u64);
+        // fade-out: 1.0 at t=0, linearly to 0 at t=fo.
+        assert_eq!(panic_declick_gain(0, fo, fi, None), 1.0);
+        assert!((panic_declick_gain(2, fo, fi, None) - 0.5).abs() < 1e-6);
+        // hold (not released): zero forever, however long t grows.
+        assert_eq!(panic_declick_gain(fo, fo, fi, None), 0.0);
+        assert_eq!(panic_declick_gain(10_000, fo, fi, None), 0.0);
+        // released at t=20: still zero before the release point, then fade-in.
+        let r = Some(20);
+        assert_eq!(panic_declick_gain(19, fo, fi, r), 0.0);
+        assert_eq!(panic_declick_gain(20, fo, fi, r), 0.0);
+        assert!((panic_declick_gain(22, fo, fi, r) - 0.5).abs() < 1e-6);
+        // done: full gain once the fade-in completes.
+        assert_eq!(panic_declick_gain(24, fo, fi, r), 1.0);
+        assert_eq!(panic_declick_gain(10_000, fo, fi, r), 1.0);
     }
 }

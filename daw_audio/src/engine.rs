@@ -169,6 +169,19 @@ pub struct SharedState {
     /// `render_metronome` で読む。 false なら click 生成を skip (= 無音)。
     /// 起動時 default false。
     pub metronome_enabled: AtomicBool,
+    /// FIXME #60: パニックボタンの declick トリガ。 IPC スレッドが
+    /// `MainToChild::Panic` で `true` を store、 CPAL コールバックが各 buffer 頭で
+    /// `swap(false)` して master を fade-out → hold へ入れる。 panic が全 plugin を
+    /// mix から外す瞬間の段差クリックを、 master を先にフェードミュートして隠す
+    /// ための edge フラグ。
+    pub panic_declick: AtomicBool,
+    /// FIXME #60: declick の hold を解除して fade-in へ移すトリガ。 daw_gui が
+    /// `ReinitAllPlugins` の完了 (`PluginsReinitDone`) を確認してから
+    /// `MainToChild::PanicRelease` で `true` を store する。 これで master の
+    /// ミュート解除を「固定タイマー」 ではなく「reinit が実際に終わった瞬間」 に
+    /// 結びつけ、 GUI メインスレッド stall や巨大 reinit でも、 plugin が mix に
+    /// 残ったまま master が戻る (= クリック / reverb tail 復活) ことを防ぐ。
+    pub panic_release: AtomicBool,
 }
 
 impl SharedState {
@@ -183,6 +196,8 @@ impl SharedState {
                 std::collections::HashSet::new(),
             ),
             metronome_enabled: AtomicBool::new(false),
+            panic_declick: AtomicBool::new(false),
+            panic_release: AtomicBool::new(false),
         }
     }
 }

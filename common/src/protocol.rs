@@ -85,11 +85,12 @@ pub enum ChildToMain {
         done: u64,
         total: u64,
     },
-    /// FIXME #55: the plugin host finished reinitialising (deactivate→activate)
-    /// every plugin for an imminent offline cold render — reply to
-    /// `MainToChild::ReinitPluginsForExport`. The reinit forces a clean state
-    /// even for plugins that ignore CLAP `reset()` (e.g. VCV Rack 2 holding a
-    /// live voice), so the host knows it is safe to send `ExportWav`.
+    /// The plugin host finished reinitialising (deactivate→activate) every
+    /// plugin — reply to `MainToChild::ReinitAllPlugins`. The reinit forces a
+    /// clean state even for plugins that ignore CLAP `reset()` (e.g. VCV Rack 2
+    /// holding a live voice). For an offline export (FIXME #55) the host waits
+    /// for this before sending `ExportWav`; for the panic button (FIXME #60) it
+    /// is fire-and-forget (the host ignores the reply when no export is queued).
     PluginsReinitDone,
     /// Offline plugin-FX bounce finished (or failed). Mirror of
     /// `ExportWavComplete` but for `MainToChild::BounceClipFxOnline`.
@@ -314,6 +315,19 @@ pub enum MainToChild {
     Ack,
     Play,
     Stop,
+    /// FIXME #60: パニックボタン — master 出力を declick フェードで一瞬ミュート
+    /// する。 panic は直後に（master がミュートされてから）`ReinitAllPlugins` を
+    /// 送るので、 全 plugin を mix から外す瞬間の段差クリックがフェードで隠れる。
+    /// audio engine は master を fade-out して **`PanicRelease` が来るまで 0 で
+    /// hold** する（plugin-host hang 用に数秒の安全 auto-release あり）。transport
+    /// の Stop とは独立。
+    Panic,
+    /// FIXME #60: パニックの declick hold を解除して fade-in に移す。 daw_gui が
+    /// `ReinitAllPlugins` の完了通知 `PluginsReinitDone` を受けてから送る。 master
+    /// のミュート解除を「reinit が実際に終わった瞬間」 に結びつけることで、 GUI
+    /// メインスレッド stall や巨大 reinit でも plugin が mix に残ったまま master が
+    /// 戻る（クリック / reverb tail 復活）ことを防ぐ。
+    PanicRelease,
     Session(AudioSession),
     LoadSong(crate::model::Song),
     SetLoop(bool),
@@ -354,16 +368,21 @@ pub enum MainToChild {
     /// string). No-op when no export is running. Sent by the progress
     /// overlay's Cancel button (and Esc) while the audio render phase is active.
     CancelExport,
-    /// FIXME #55: reinitialise (deactivate→activate) every loaded plugin so an
-    /// imminent offline cold render starts from a clean state. Sent to the
-    /// plugin host **before** `ExportWav` (for a user range / cold render).
+    /// Reinitialise (deactivate→activate) every loaded plugin to a clean state.
     /// CLAP `reset()` is not enough for some plugins (VCV Rack 2 keeps a live
     /// voice ringing through reset / start-stop_processing); a full
     /// deactivate→activate cycle is the only reliable clean slate. Handled on
     /// the plugin-main thread via the proven detach→quiesce→mutate→republish
     /// pattern (so it is safe even while the live callback is running), then
     /// replies `ChildToMain::PluginsReinitDone`.
-    ReinitPluginsForExport,
+    ///
+    /// Two callers share this single operation (SSoT for "force all plugins to
+    /// silence / clean state"):
+    /// - FIXME #55: sent **before** `ExportWav` (for a user range / cold
+    ///   render) so an offline cold render starts from a clean state.
+    /// - FIXME #60: the transport **panic button** — kills stuck voices /
+    ///   reverb tails / held preview notes immediately. Fire-and-forget.
+    ReinitAllPlugins,
     /// Offline-render a clip range with the **full plugin chain** (= post-FX)
     /// to a WAV file. Used by `Bounce (with FX)` (`docs/plan_audio_clip
     /// .md` §3.8). Same freewheel pipeline as `ExportWav` but the WAV

@@ -746,6 +746,21 @@ impl ClapPlugin {
         self.output_ptrs.clear();
     }
 
+    /// CLAP `clap_plugin.reset()` — clear the plugin's audio processing state
+    /// (filters, delay lines, reverb tails, voices) while keeping parameters
+    /// and loaded state intact. Spec context is `[audio-thread & active]`; the
+    /// caller (plugin reinit) invokes it after the instance is detached +
+    /// quiesced, so no audio worker touches the plugin concurrently. No-op if
+    /// inactive or if the plugin left the `reset` slot null.
+    pub fn reset(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(reset) = unsafe { (*self.plugin).reset } {
+            unsafe { reset(self.plugin) };
+        }
+    }
+
     /// Calls the plugin's process() with optional input audio and zero or
     /// more timed note events. Must be called on the audio thread only.
     /// Events must be sorted by ascending `time` (CLAP requirement).
@@ -1849,6 +1864,10 @@ impl LoadedPlugin for ClapPlugin {
 
     fn stop_processing(&mut self) {
         self.stop_processing();
+    }
+
+    fn reset(&mut self) {
+        self.reset();
     }
 
     fn process(

@@ -136,6 +136,21 @@ const STYLE_PLAY: ToggleButtonStyle = ToggleButtonStyle {
     on_text_color: None,
 };
 
+/// FIXME #60: パニックボタンのスタイル。 momentary（toggle ではない）ので常時
+/// 「危険」 を示す赤で塗る（`toggle_button_at` に `value=false` を渡し、 off_color
+/// が常に効く）。 record（active 時のみ赤）と違い常時赤なので、 label「Panic」 と
+/// あわせて「押すと全部止まる緊急ボタン」 と一目で分かる。
+const STYLE_PANIC: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: Color { r: 0.80, g: 0.16, b: 0.16, a: 1.0 },
+    on_color: Color { r: 0.92, g: 0.28, b: 0.28, a: 1.0 },
+    border: Color { r: 0.50, g: 0.26, b: 0.26, a: 1.0 },
+    border_width: 1.0,
+    radius: 4.0,
+    font_size: 12.0,
+    text_color: Color { r: 0.98, g: 0.95, b: 0.95, a: 1.0 },
+    on_text_color: None,
+};
+
 /// Click (metronome) toggle の icon ボタンスタイル。 active 時は Ableton 流の
 /// bright yellow 背景 + 黒文字 (= `on_text_color = Some(black)`)、 inactive は
 /// 灰背景 + 白文字 (= `text_color = white`)。 record (赤) / loop (青) / play (緑)
@@ -405,6 +420,20 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleLoop)),
     );
     x += loop_w + 12.0;
+
+    // FIXME #60: パニックボタン — 押すと鳴っている全ての音を即座に止める。
+    // momentary なので toggle_button_at に value=false を渡して常時 off（= 赤）
+    // 表示にし、 click で `AppEvent::Panic` を発火する（停止 + 全 plugin 再初期化）。
+    let panic_w = 52.0;
+    ui.toggle_button_at(
+        "transport_panic",
+        "Panic",
+        Rect { x, y: cy, w: panic_w, h: bh },
+        false,
+        &STYLE_PANIC,
+        |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Panic)),
+    );
+    x += panic_w + 12.0;
 
     // Phase 4 (`docs/plan_automation.md` §6): automation recording mode
     // 4 択 (Read / Touch / Latch / Write) を dropdown 化。 排他選択なので

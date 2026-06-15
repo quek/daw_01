@@ -196,6 +196,17 @@ pub trait LoadedPlugin: Send {
     // --- audio-thread entry points --------------------------------------
     fn start_processing(&mut self) -> Result<()>;
     fn stop_processing(&mut self);
+    /// Clear the plugin's audio processing state — filters, delay lines,
+    /// reverb tails, envelopes, held voices — without touching parameters or
+    /// loaded state. CLAP backends forward to `clap_plugin.reset()` (the spec's
+    /// `[audio-thread & active]` tail-clear); VST3 / builtin keep the default
+    /// no-op because their tails are already flushed by the `deactivate` /
+    /// `stop_processing` half of a reinit cycle. Called (in addition to the
+    /// deactivate→activate cycle) when force-silencing every plugin — export
+    /// cold render (FIXME #55) and the panic button (FIXME #60) — because a
+    /// deactivate→activate alone does not reliably zero a CLAP reverb's
+    /// internal feedback-delay network.
+    fn reset(&mut self) {}
     /// Runs one buffer. `events` must be sorted by ascending `time` (CLAP
     /// requirement, also honoured by VST3 for consistency).
     /// `aux_inputs` carries PR4 sidechain audio: one entry per `is_main=false`
