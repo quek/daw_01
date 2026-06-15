@@ -66,6 +66,12 @@ pub enum ChildToMain {
     ExportWavComplete {
         error: Option<String>,
     },
+    /// FIXME #55: the plugin host finished reinitialising (deactivate→activate)
+    /// every plugin for an imminent offline cold render — reply to
+    /// `MainToChild::ReinitPluginsForExport`. The reinit forces a clean state
+    /// even for plugins that ignore CLAP `reset()` (e.g. VCV Rack 2 holding a
+    /// live voice), so the host knows it is safe to send `ExportWav`.
+    PluginsReinitDone,
     /// Offline plugin-FX bounce finished (or failed). Mirror of
     /// `ExportWavComplete` but for `MainToChild::BounceClipFxOnline`.
     /// `frames` is the actual number of frames written to the WAV
@@ -293,13 +299,44 @@ pub enum MainToChild {
     LoadSong(crate::model::Song),
     SetLoop(bool),
     SetMasterGain(f32),
-    /// Offline-render the entire song to a WAV file. Sent to daw_audio,
-    /// which freewheels through the song using its existing AudioWorker
-    /// pool + plugin handshake, then replies with
-    /// `ChildToMain::ExportWavComplete`.
+    /// Offline-render the song to a WAV file. Sent to daw_audio, which
+    /// freewheels through the song using its existing AudioWorker pool +
+    /// plugin handshake, then replies with `ChildToMain::ExportWavComplete`.
+    ///
+    /// `range`:
+    /// - `None` — full-song export (frame 0 → `length_beats` + tail).
+    /// - `Some((start_frame, end_frame))` — render only that frame window
+    ///   (FIXME #55, user-chosen export range). The render walks the song
+    ///   **from `start_frame`** (cold start), so audio whose note began
+    ///   before `start_frame` (e.g. a VOICEVOX phrase still ringing, a held
+    ///   note) is *not* retriggered — the result matches pressing Play at
+    ///   `start_frame`. Only frames in `[start_frame, end_frame)` (plus tail
+    ///   decay) are written. Frames are absolute sample offsets at the
+    ///   session sample rate; the GUI converts the chosen beat range with
+    ///   `samples_per_beat = sample_rate * 60 / bpm`. (Plugin tails start
+    ///   dry; the warm-from-0 walk is `BounceClipFxOnline`'s job, not this.)
     ExportWav {
         path: std::path::PathBuf,
+        range: Option<(u64, u64)>,
+        /// Write the modulation-envelope sidecar (`.modenv`) next to the WAV.
+        /// Only the offline video render consumes it (it samples the sidecar
+        /// to reproduce LFO/envelope modulation frame-accurately). A
+        /// standalone WAV export has the modulation already baked into the
+        /// audio, so it passes `false` and doesn't litter the user's folder
+        /// with a file nothing reads. The GUI sets `true` only for the
+        /// video-export temp WAV (FIXME #55 follow-up).
+        write_mod_sidecar: bool,
     },
+    /// FIXME #55: reinitialise (deactivate→activate) every loaded plugin so an
+    /// imminent offline cold render starts from a clean state. Sent to the
+    /// plugin host **before** `ExportWav` (for a user range / cold render).
+    /// CLAP `reset()` is not enough for some plugins (VCV Rack 2 keeps a live
+    /// voice ringing through reset / start-stop_processing); a full
+    /// deactivate→activate cycle is the only reliable clean slate. Handled on
+    /// the plugin-main thread via the proven detach→quiesce→mutate→republish
+    /// pattern (so it is safe even while the live callback is running), then
+    /// replies `ChildToMain::PluginsReinitDone`.
+    ReinitPluginsForExport,
     /// Offline-render a clip range with the **full plugin chain** (= post-FX)
     /// to a WAV file. Used by `Bounce (with FX)` (`docs/plan_audio_clip
     /// .md` §3.8). Same freewheel pipeline as `ExportWav` but the WAV

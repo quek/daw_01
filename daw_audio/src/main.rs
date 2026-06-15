@@ -384,7 +384,7 @@ async fn recv_loop(
             // export thread silences the CPAL callback via
             // `EngineShared::export_running` while it holds the audio
             // resources.
-            Ok(MainToChild::ExportWav { path }) => {
+            Ok(MainToChild::ExportWav { path, range, write_mod_sidecar }) => {
                 let song_snap = shared.song.load();
                 let Some(song_arc) = song_snap.as_ref() else {
                     tracing::warn!("ExportWav received but no song loaded");
@@ -398,16 +398,29 @@ async fn recv_loop(
                 let engine_shared_clone = Arc::clone(&engine_shared);
                 let out_tx_clone = out_tx.clone();
                 let sample_rate = session_sample_rate;
+                // FIXME #55: the export thread owns the whole offline render —
+                // it parks the live CPAL callback (`export_running`), waits for
+                // it to drain, resets every plugin on the plugin-host worker
+                // (the CLAP audio thread) for a clean cold start, then
+                // freewheels. No cross-process handshake: the reset rides the
+                // export's own `process()` dispatch via `ProcessData::reset`.
                 if let Err(e) = std::thread::Builder::new()
                     .name("daw-audio-export".into())
                     .spawn(move || {
+                        // FIXME #55: user export range walks cold from the range
+                        // start (matches Play-from-here); full export walks 0..len.
+                        let span = match range {
+                            Some((start, end)) => export::RenderSpan::RangeCold { start, end },
+                            None => export::RenderSpan::Full,
+                        };
                         let result = export::run_export(
                             path,
                             engine_shared_clone,
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                            None,
+                            span,
+                            write_mod_sidecar,
                         );
                         let error_msg = match result {
                             Ok(_frames) => None,
@@ -425,6 +438,10 @@ async fn recv_loop(
                         error: Some(format!("failed to spawn export thread: {e}")),
                     });
                 }
+            }
+            Ok(MainToChild::ReinitPluginsForExport) => {
+                // FIXME #55: plugin reinit is the plugin host's job (it owns the
+                // instances). The audio side has no plugins — ignore.
             }
             Ok(MainToChild::BounceClipFxOnline {
                 path,
@@ -455,13 +472,20 @@ async fn recv_loop(
                     .name("daw-audio-bounce-fx".into())
                     .spawn(move || {
                         let path_for_complete = path_for_thread.clone();
+                        // Clip-FX bounce: warm walk from frame 0 so plugin tails /
+                        // sidechain state at the clip start are correct. No video
+                        // consumer, so no modulation sidecar.
                         let result = export::run_export(
                             path_for_thread,
                             engine_shared_clone,
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                            Some((start_frame, end_frame)),
+                            export::RenderSpan::RangeWarm {
+                                start: start_frame,
+                                end: end_frame,
+                            },
+                            false,
                         );
                         let (error_msg, frames) = match result {
                             Ok(frames) => (None, frames),

@@ -72,13 +72,21 @@ pub fn playhead_to_beat(song: Option<&Song>, sample_rate: u32, playhead: u64) ->
 /// from the time signature as `num * 4 / den` (= 4 for 4/4, 6 for 6/8). The
 /// transport readout and the rulers therefore agree on which bar a beat is in.
 pub fn beat_to_bar_beat(beat: f64, time_sig: (u8, u8)) -> (u32, f64) {
-    let beats_per_bar = f64::from(time_sig.0) * 4.0 / f64::from(time_sig.1.max(1));
-    if beats_per_bar <= 0.0 || !beat.is_finite() {
+    let bpb = beats_per_bar(time_sig);
+    if bpb <= 0.0 || !beat.is_finite() {
         return (1, 1.0);
     }
-    let bar = (beat / beats_per_bar).floor().max(0.0) as u32 + 1;
-    let beat_in_bar = beat - (f64::from(bar) - 1.0) * beats_per_bar + 1.0;
+    let bar = (beat / bpb).floor().max(0.0) as u32 + 1;
+    let beat_in_bar = beat - (f64::from(bar) - 1.0) * bpb + 1.0;
     (bar, beat_in_bar)
+}
+
+/// Quarter-note beats per bar for a `(num, den)` time signature: `num * 4 /
+/// den` (= 4 for 4/4, 3 for 6/8, 6 for 6/4). Single source of truth for the
+/// bar/beat math shared by [`beat_to_bar_beat`], the rulers, and the export
+/// range picker's bar.beat field.
+pub fn beats_per_bar(time_sig: (u8, u8)) -> f64 {
+    f64::from(time_sig.0) * 4.0 / f64::from(time_sig.1.max(1))
 }
 
 /// Converts a beat-domain position to seconds using the song's constant
