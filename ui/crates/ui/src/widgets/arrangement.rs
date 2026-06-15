@@ -12208,7 +12208,7 @@ mod tests {
                 pointer: PointerFrame { pos: Some(pos), ..PointerFrame::default() },
                 ..Default::default()
             };
-            host.frame(&mut (), &mut scene, screen, input, |_, ui| {
+            host.frame(&mut (), &mut scene, screen, input, |(), ui| {
                 let _ = ui.arrangement(
                     "arr_auto_cursor",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
@@ -12224,8 +12224,7 @@ mod tests {
                     |_| Edit::mutate(|()| {}),
                 );
             });
-            let v = captured.lock().unwrap().clone();
-            v
+            captured.lock().unwrap().clone()
         };
 
         // clip rect は y[38..106] (lane y=32, pad=6, h=80-12=68)。 y=72 は clip 内中段。
