@@ -1432,6 +1432,17 @@ pub struct AppData {
     /// 間は新規 request を発行するときに即時 `RequestAllStates` を送る。
     /// 詳細は [`PendingStateRequest`] / [`DeferredEdit`]。
     pub pending_state_queue: VecDeque<PendingStateRequest>,
+    /// FIXME #64: いま in-flight な `RequestAllStates` (plugin-state round-trip) を
+    /// 送った時刻。 `dispatch_front_state_request` が送信の瞬間に `Some(now)` を立て、
+    /// `on_all_states_from_child` で応答が来たら `None` に戻す (後続 request が
+    /// あれば dispatch が再武装する)。 plugin host が crash でなく **hang** した
+    /// (プロセス・パイプは生存のまま `state_save` 等で停止) 場合は
+    /// `ChildDisconnected` も発火せず `AllStatesReceived` が永久に来ないので、
+    /// `pending_state_queue` が drain せず保存 / New / Open / Open Recent / 終了(✕)
+    /// が恒久ロックする (#63 のダーティーガードが round-trip 完了を待つため)。
+    /// `on_tick` の watchdog がこの時刻からの無応答経過を見て round-trip を破棄し、
+    /// 脱出口を作る (export watchdog と同型)。 `None` = round-trip 非進行。
+    state_request_sent_at: Option<std::time::Instant>,
     pub audio_tx: Option<UnboundedSender<MainToChild>>,
     pub plugin_tx: Option<UnboundedSender<MainToChild>>,
     /// 子プロセス自動再起動 supervisor (`bootstrap::ChildSupervisor`)。
@@ -2042,6 +2053,7 @@ impl AppData {
             font_picker_restore: String::new(),
             send_picker: None,
             pending_state_queue: VecDeque::new(),
+            state_request_sent_at: None,
             audio_tx: Some(audio_tx),
             plugin_tx: Some(plugin_tx),
             pending_clip_fx_bounce: None,
@@ -5138,6 +5150,22 @@ impl AppData {
                     // 強制解除する) を動かす。`on_tick` の本体は is_playing で
                     // 内部ガードされ、export 中は engine へ何も送らない (無害)。
                     | AppEvent::Tick { .. }
+                    // FIXME #64 review: `PluginsReinitDone` は **export 自身の**
+                    // ハンドシェイク返信 (FIXME #55: ReinitPluginsForExport の応答)。
+                    // begin_wav_export が export_stage を立てた *後* に
+                    // ReinitPluginsForExport を送るので、この応答は必ず export 中に
+                    // 到着する。これを gate で drop すると `ExportWav` が永遠に発射されず
+                    // (handler が pending_export を撃つのが唯一の経路)、ExportWavComplete も
+                    // 来ず overlay + 入力 gate で GUI が永久ロックする (= 標準 WAV /
+                    // video 前段の両方が hang する)。handler は pending_export が Some の
+                    // ときだけ動くので stray reply は no-op = 安全。
+                    //
+                    // 他の plugin-host 返信 (AllStatesReceived の Deferred edit / bounce /
+                    // plugin load 完了) は **意図的に gate 維持**: export はプラグイン
+                    // インスタンスを流用するため、export 中に RemoveSlotPlugin / LoadSong を
+                    // host へ送ると render が使用中の plugin を抜いて壊す。これらの
+                    // round-trip が宙吊りになる件は #64 watchdog (state round-trip) が回収する。
+                    | AppEvent::PluginsReinitDone
             );
             if !allow {
                 // gate で落とした event を観測可能にする (silent drop だと
@@ -7881,6 +7909,22 @@ impl AppData {
     /// 反映済みであり、 この送信より後の変更は host では `RequestAllStates` の後に
     /// 処理されるため、 返る state は必ず「今 live にある配置」 と一致する。
     fn dispatch_front_state_request(&mut self) {
+        // FIXME #64 review: plugin host が居ない (crash 後 respawn 断念 = crash-loop
+        // 上限 / supervisor 無し / respawn 失敗) と RequestAllStates は届かず応答も
+        // 永久に来ない。 一方 enqueue gate は接続状態でなく `song_has_plugin()`
+        // (model 上 plugin が在るか) なので、 この degraded 状態でも round-trip が
+        // 積まれてしまう。 30s watchdog を待たせるのは無駄なので、 host 不在を
+        // 検知したら即 round-trip を破棄して脱出する (待っても完了し得ない)。
+        if self.plugin_tx.is_none() {
+            tracing::warn!(
+                "plugin host unavailable; aborting state round-trip immediately (no host to answer)"
+            );
+            self.abort_state_roundtrip();
+            self.status_message =
+                "プラグインホストが応答しないため保存/操作を中止しました（オートセーブは保持されています）"
+                    .into();
+            return;
+        }
         let needs_snapshot = matches!(
             self.pending_state_queue.front(),
             Some(PendingStateRequest::Save { snapshot: None, .. })
@@ -7894,6 +7938,79 @@ impl AppData {
             }
         }
         self.send_plugin(MainToChild::RequestAllStates);
+        // FIXME #64: この瞬間から応答 (AllStatesReceived) までを on_tick の watchdog
+        // が監視する。 host が hang して応答が来ないと永久ロックになるため。
+        self.state_request_sent_at = Some(std::time::Instant::now());
+    }
+
+    /// in-flight な plugin-state round-trip を強制的に破棄する。 plugin host が
+    /// crash した (`handle_child_disconnected`) / hang して応答が来ない
+    /// (`poll_state_roundtrip_watchdog`) / そもそも host が居ない
+    /// (`dispatch_front_state_request` の不在検知) ときの共通脱出口。
+    ///
+    /// stale な `pending_state_queue` をクリアし、 round-trip 完了待ちで保留して
+    /// いたダーティーガード操作 (`guard_after_save` / `guard_pending_action`) を
+    /// **実行せず破棄** する。 クリアしないと `enqueue_state_request` の `was_idle`
+    /// 判定が永久に false のまま以後の保存が一切 dispatch されず、 さらに `guard_*`
+    /// が Some のまま `request_guarded_action` が早期 return し続けて
+    /// New / Open / Open Recent / 終了(✕) が GUI から不可能になる (= #63/#64 の症状)。
+    ///
+    /// 保留していた破棄系操作 (New/Open) を **実行しない** のは、 保存が成立して
+    /// いない状態で project を差し替えると未保存変更を失う / 別 project を破壊する
+    /// ため (autosave があるのでデータ自体は失われない)。
+    fn abort_state_roundtrip(&mut self) {
+        self.pending_state_queue.clear();
+        self.state_request_sent_at = None;
+        // 両方とも無条件に take する (`||` の短絡で 2 つ目が消えないように)。
+        let had_after_save = self.guard_after_save.take().is_some();
+        let had_pending = self.guard_pending_action.take().is_some();
+        if had_after_save || had_pending {
+            tracing::warn!(
+                "aborted an in-flight plugin-state round-trip; \
+                 dropping the deferred dirty-guard action"
+            );
+        }
+    }
+
+    /// FIXME #64: plugin-state round-trip (`RequestAllStates` → `AllStatesReceived`)
+    /// の hang watchdog。 `on_tick` (33ms / ~30Hz の playhead poll、 plugin host
+    /// とは独立した daw_audio 由来なので host が hang しても発火し続ける) から毎回
+    /// 呼ばれる。 応答が一定時間来なければ round-trip を破棄して脱出口を作る。
+    ///
+    /// 引数 `now` を取るのは test が経過時間を注入できるようにするため (`Instant` は
+    /// 任意時刻を構築できないので `elapsed()` を内部で呼ばず、 渡された `now` との
+    /// 差で判定する)。 production は `Instant::now()` を渡す。
+    ///
+    /// 閾値は export watchdog (60s) より短い。 plugin の `state_save` は通常 1 秒
+    /// 未満で、 host main-thread が別の重い操作 (plugin GUI 起動等) で詰まっても
+    /// 数秒で済む。 30 秒を超えるのは実質 hang のみ (= 誤発火しない一方、 永久
+    /// ロックよりは遥かに短く脱出できる)。
+    pub fn poll_state_roundtrip_watchdog(&mut self, now: std::time::Instant) {
+        // FIXME #64 review: export 進行中は handle_event の gate (`Tick` のみ
+        // whitelist) が `AllStatesReceived` を drop するので、 この間は応答が来ても
+        // round-trip は完了し得ない。 deadline を進めると、 export 開始直前に
+        // armed だった round-trip を「hang した」と誤判定して、 実際には応答が
+        // gate に食われただけの save を中止してしまう。 gate と同条件の間は watchdog を
+        // 止め、 export 後 (gate 解除後) に再評価する (応答が来ない真の hang なら、
+        // gate 解除後に改めて閾値超過で発火する)。
+        if self.export_stage.is_some() || self.pending_video_export.is_some() {
+            return;
+        }
+        const STATE_ROUNDTRIP_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+        let Some(since) = self.state_request_sent_at else {
+            return;
+        };
+        if now.saturating_duration_since(since) <= STATE_ROUNDTRIP_WATCHDOG {
+            return;
+        }
+        tracing::error!(
+            elapsed_s = now.saturating_duration_since(since).as_secs(),
+            "plugin-state round-trip stalled past watchdog timeout; aborting (host hang?)"
+        );
+        self.abort_state_roundtrip();
+        self.status_message =
+            "プラグインが応答しないため保存/操作を中止しました（オートセーブは保持されています）"
+                .into();
     }
 
     /// project save の trigger。 plugin がある場合は plugin_host から
@@ -11294,23 +11411,11 @@ impl AppData {
                 self.plugin_tx = None;
                 self.pending_plugin_loads.clear();
                 self.loaded_slots.clear();
-                // FIXME #63: plugin state 取得待ちの非同期保存はもう完了しない
-                // (host 消滅で AllStatesReceived が来ない)。 stale な state request を
-                // 破棄しないと `enqueue_state_request` の was_idle 判定が永久に false
-                // のまま以後の保存が dispatch されず、 さらに `guard_after_save` が
-                // Some のまま残ると `request_guarded_action` が早期 return し続けて
-                // New/Open/終了(✕) が GUI から一切できなくなる。 保存は失敗したので
-                // 保留していた破棄系操作 (New/Open) は **実行しない** (データ損失回避)。
-                self.pending_state_queue.clear();
-                // 両方とも無条件に take する (`||` の短絡で 2 つ目が消えないように)。
-                let had_after_save = self.guard_after_save.take().is_some();
-                let had_pending = self.guard_pending_action.take().is_some();
-                if had_after_save || had_pending {
-                    tracing::warn!(
-                        "plugin host disconnect aborted an in-flight state round-trip; \
-                         dropping the deferred dirty-guard action"
-                    );
-                }
+                // FIXME #63/#64: plugin state 取得待ちの round-trip はもう完了しない
+                // (host 消滅で AllStatesReceived が来ない)。 stale な queue / 保留ガードを
+                // 破棄して GUI の恒久ロックを防ぐ。 hang watchdog (`abort_state_roundtrip`)
+                // と同じ脱出処理に一本化する。
+                self.abort_state_roundtrip();
                 tracing::warn!("daw_plugin_host child disconnected");
             }
         }
@@ -16882,6 +16987,9 @@ impl AppData {
     /// queue に後続がある場合は次の `RequestAllStates` を改めて発行し、
     /// 連続 deferred edit が個別に最新 state を捕まえられるようにする。
     fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
+        // FIXME #64: in-flight だった round-trip の応答が来た。 watchdog の deadline を
+        // 解除する。 この後 queue に後続があれば dispatch_front_state_request が再武装する。
+        self.state_request_sent_at = None;
         // live song の plugin state を最新化する (= dirty 判定の整合と、
         // Deferred の Undo snapshot が最新 knob を捕まえるため)。 queue が空
         // だった場合 (= 想定外タイミングの応答) でも害はない。 Save の serialize
@@ -17003,6 +17111,13 @@ impl AppData {
                 "音声エンジンが応答しないため書き出しを中止しました".into(),
             );
         }
+        // FIXME #64: plugin host が crash でなく hang した場合 (プロセス・パイプは
+        // 生存のまま state_save 等で停止) は ChildDisconnected も発火せず、
+        // RequestAllStates の応答が永久に来ない。 すると pending_state_queue が
+        // drain せず保存 / New / Open / Open Recent / 終了(✕) が恒久ロックする
+        // (#63 のダーティーガードが round-trip 完了を待つため)。 export watchdog と
+        // 同型に、 一定時間応答が無ければ round-trip を破棄して脱出口を作る。
+        self.poll_state_roundtrip_watchdog(std::time::Instant::now());
         let next_beat = if playhead_samples == u64::MAX {
             None
         } else {
