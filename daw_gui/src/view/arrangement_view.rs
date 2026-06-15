@@ -577,6 +577,35 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
+    // FIXME #74: arrangement ヘッダのトラック音量スライダ drag を mixer フェーダーと
+    // 同じ gesture 経路に乗せ、 「1 drag = 1 undo step」 にする。 widget が返す
+    // `dragging_track_volume` (drag 中のトラック id) を前フレーム値と差分し、
+    // None→Some で `ParamGestureBegin` (gesture 先頭で 1 snapshot)、 Some→None で
+    // `ParamGestureEnd` を発火する (`push_param_gesture_edges` と同じ edge 検知を
+    // response field 経由で行う)。 これが無いとスライダ操作が undo に積まれず、
+    // mixer フェーダーと同じ「Undo がクリップ移動まで巻き戻る」 症状になる。
+    let drag_vol = resp.dragging_track_volume;
+    if drag_vol != app.arrange_dragging_track_volume {
+        let prev = app.arrange_dragging_track_volume;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            use common::model::{AutomationTarget, TrackBuiltinParam};
+            if let Some(t) = prev {
+                app.handle_event(AppEvent::ParamGestureEnd {
+                    track_id: t,
+                    target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                });
+            }
+            if let Some(t) = drag_vol {
+                app.handle_event(AppEvent::ParamGestureBegin {
+                    track_id: t,
+                    target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    display_name: "Volume".to_string(),
+                });
+            }
+            app.arrange_dragging_track_volume = drag_vol;
+        }));
+    }
+
     // gui_01 #020 (M14 Phase 63f): clip 上の右クリックメニュー (Make Unique)。
     // widget が `clip_rects: Vec<(ClipKey, Rect)>` を返してくれるので、
     // track_header_rects と同じパターンで context_menu_for を重ねる。

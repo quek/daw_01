@@ -1290,6 +1290,12 @@ pub struct AppData {
     /// 使う。 `None` = clip 領域 / lane 外。 1 フレーム遅延だが pointer は
     /// 瞬間移動しないので実用上問題なし (= `arrange_hover_content` と同 idiom)。
     pub arrange_hovered_automation_lane: Option<common::model::AutomationLaneKey>,
+    /// FIXME #74: arrangement ヘッダのトラック音量スライダを drag 中のトラック id
+    /// (`ArrangementResponse.dragging_track_volume` を前フレーム値として mirror)。
+    /// None↔Some の edge で `ParamGestureBegin`/`End` を発火し、 mixer フェーダーと
+    /// 同じ「1 drag = 1 undo step」 経路 (gesture begin で 1 snapshot) に乗せる。
+    /// session-only (`arrange_hover_content` と同 idiom)。
+    pub arrange_dragging_track_volume: Option<u32>,
     /// 鍵盤レーン click のプレビュー発音中の `(track_id, pitch)` (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 widget の
     /// `PianoRollResponse::keyboard_active_pitch` を前フレーム値と差分して
@@ -2026,6 +2032,7 @@ impl AppData {
             selected_notes: Vec::new(),
             arrange_zoom_history: Vec::new(),
             arrange_hover_content: None,
+            arrange_dragging_track_volume: None,
             arrange_hovered_automation_lane: None,
             bottom_panel: 0,
             audio_editor_clip: None,
@@ -2310,6 +2317,53 @@ impl AppData {
         depth
     }
 
+    /// FIXME #72: `(track, target)` の built-in コントロールが mixer / arrangement で
+    /// **表示すべき値**を返す。 再生中に enabled かつ現在 recording 対象でない
+    /// automation lane があれば playhead 位置の curve 値 (= audio engine の
+    /// `fill_track_param_ramps` と同じ read-mode 解決)、 それ以外 (停止中 / lane 無し
+    /// / 当該 param を書き込み中) は静的な `fallback`。 これで:
+    /// - 再生中はノブ / フェーダーがオートメーションに追従して audio と一致して動く、
+    /// - 停止中はコントロールをそのまま手動操作でき、
+    /// - 書き込み (Touch/Latch/Write) 中の drag はマウスに追従する
+    ///   (audio engine の `recording_lanes` bypass と対称)。
+    ///
+    /// 変調 (`Track.mod_routings`) は各ノブの per-control modulation overlay
+    /// (`view::modulation::build_mod` の live_display) が別途表示するので、 ここは
+    /// **lane 値のみ**返して二重適用を避ける。
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn live_param_value(
+        &self,
+        track: &Track,
+        target: &common::model::AutomationTarget,
+        fallback: f32,
+    ) -> f32 {
+        if !self.is_playing {
+            return fallback;
+        }
+        // `currently_recording_lanes` と同じ判定の single-key 版: 当該 param を
+        // 書き込み中なら lane を読まず手動値を返す (audio thread に送る
+        // `recording_lanes` と同集合 = UI と audio が drift しない)。
+        let key = (track.id, target.clone());
+        let recording = self.recording_mode != common::model::RecordingMode::Read
+            && (self.active_param_gestures.contains(&key)
+                || (matches!(
+                    self.recording_mode,
+                    common::model::RecordingMode::Latch | common::model::RecordingMode::Write
+                ) && self.latched_param_gestures.contains(&key)));
+        if recording {
+            return fallback;
+        }
+        let Some(lane) = track
+            .automation_lanes
+            .iter()
+            .find(|l| l.enabled && l.target == *target)
+        else {
+            return fallback;
+        };
+        let beat = f64::from(self.playhead_beat.unwrap_or(0.0));
+        common::automation::lane_value_at(lane, &self.song.clip_contents, beat) as f32
+    }
+
     pub fn track_mix(&self) -> Vec<TrackMixEntry> {
         // Phase 6 review perf (E10): 旧コードは各 track ごとに
         // `is_group_track(t.id)` (= O(N) all-tracks scan) +
@@ -2365,8 +2419,23 @@ impl AppData {
                     } else {
                         t.name.clone()
                     },
-                    volume: t.volume,
-                    pan: t.pan,
+                    // FIXME #72: 再生中はオートメーション lane の playhead 値を表示
+                    // (= audio と一致してフェーダー / パンノブが動く)。 停止中・非
+                    // automation・書き込み中は静的値。
+                    volume: self.live_param_value(
+                        t,
+                        &common::model::AutomationTarget::TrackBuiltin(
+                            common::model::TrackBuiltinParam::Volume,
+                        ),
+                        t.volume,
+                    ),
+                    pan: self.live_param_value(
+                        t,
+                        &common::model::AutomationTarget::TrackBuiltin(
+                            common::model::TrackBuiltinParam::Pan,
+                        ),
+                        t.pan,
+                    ),
                     muted: t.muted,
                     solo: t.solo,
                     peak_l_raw: l,
@@ -5574,6 +5643,20 @@ impl AppData {
                 target,
                 display_name,
             } => {
+                // FIXME #74: built-in トラックコントロール (Volume / Pan / SendGain)
+                // の drag は gesture 先頭で 1 回だけ Song snapshot を取り、 「1 drag =
+                // 1 undo step」 にする (`BeginInspectorScrub` と同 idiom)。 per-frame に
+                // 発火する `SetTrackVolume` / `SetTrackPan` / `SetSendGain` 自体は
+                // 非 undoable のまま (連続発火で履歴が溢れるため)。 これが無いと
+                // フェーダー操作が undo スタックに積まれず、 Undo が直前のクリップ移動
+                // 等まで巻き戻してしまう。 `ParamGestureBegin` は gesture 立ち上がりで
+                // 1 度だけ発火する (`push_param_gesture_edges` の edge 検知) ので二重に
+                // ならない。 `PluginParam` は値が Song snapshot に入らない (plugin 内部
+                // 状態) ので除外、 `SongTempo` / `TimeSig` は transport 側の commit
+                // ベース undo に委ねる。
+                if matches!(target, common::model::AutomationTarget::TrackBuiltin(_)) {
+                    self.push_undo_snapshot();
+                }
                 self.active_param_gestures.insert((track_id, target.clone()));
                 // Phase 4 Step C: Latch / Write mode で 再生中の gesture begin は
                 // latched_param_gestures にも入れる。 stop まで「触れた事実」 を
