@@ -1070,6 +1070,11 @@ pub struct AppData {
     /// `arrangement_view::draw` が毎フレーム更新。ヘッダ列・クリップレーンどちらの
     /// 上でも同じトラック行を返す。
     pub arrange_hovered_track: Option<u32>,
+    /// FIXME #68: ミキサーでポインタ直下の strip の track id。`mixer_strips::draw`
+    /// が毎フレーム更新 (arrangement の `arrange_hovered_track` と同 idiom)。S キーで
+    /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master
+    /// strip は solo を持たないので None 扱い。
+    pub mixer_hovered_track: Option<u32>,
     /// FIXME #33: ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
     /// ノート paste の配置位置に使う。`piano_roll_view::draw` が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。
@@ -1986,6 +1991,7 @@ impl AppData {
             arrangement_hover_beat_raw: None,
             arrangement_hover_clip: None,
             arrange_hovered_track: None,
+            mixer_hovered_track: None,
             pianoroll_hover_beat: None,
             pianoroll_hover_beat_song_raw: None,
             pending_clipboard_write: None,
@@ -12514,8 +12520,11 @@ impl AppData {
             ..Default::default()
         };
         track.clips.push(new_clip);
-        self.song
-            .set_content_name(cid, format!("Recorded {new_clip_id}"));
+        // content_name は **明示 rename 専用** (FIXME #69)。 ここで自動名
+        // ("Recorded N") を入れると、 後でノートに歌詞が付いたとき明示名優先
+        // ルールで歌詞を隠してしまう (= ⑤⑦ の再来)。 生成クリップは
+        // `create_clip` と同様 **無名** で作り、 表示名は歌詞 / 本文から導出する
+        // (`clip_display_label`)。 名前が要るならユーザーが rename する。
     }
 
     /// playhead が clip 範囲 `[start_beat, start_beat + length_beats)` に

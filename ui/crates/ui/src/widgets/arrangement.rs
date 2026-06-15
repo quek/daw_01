@@ -985,6 +985,11 @@ pub struct ArrangementResponse {
     /// と同じ「毎フレーム算出の hover state」 idiom)。 section は ruler と track lanes の中間 lane なので
     /// clip / automation lane とは y 領域が排他 (同時に複数 hover しない)。
     pub hovered_section: Option<u32>,
+    /// FIXME #067: ポインタが今 hover している Arranger section の zone (Move / ResizeLeft / ResizeRight)。
+    /// clip の `hovered_zone` と同 idiom で widget 内の cursor 設定が読む (帯端 hover で `EwResize`、 帯中央
+    /// hover で `Move`)。 これが無いと section 帯はクリップと違い resize ハンドルの ↔ カーソルが出ず、 端を
+    /// 掴んでリサイズできることが discoverable でなかった (= ユーザ報告「Aメロの端でカーソルが矢印にならない」)。
+    pub hovered_section_zone: Option<ClipDragKind>,
     /// M14 Phase 127 (daw_01 #105): drag 中の section drag kind (`Some` なら既存 section の Move/Resize
     /// drag セッション進行中)。 `dragging` (MIDI clip) / `dragging_automation_clip` と直交、 同 frame 内で
     /// 複数 `Some` にならない (y 領域排他)。 範囲 drag による新規作成中は `None` (transient creation)。
@@ -1016,6 +1021,7 @@ impl Default for ArrangementResponse {
             automation_lasso_active: false,
             hovered_automation_lane: None,
             hovered_section: None,
+            hovered_section_zone: None,
             dragging_section: None,
             section_rects: Vec::new(),
         }
@@ -1911,6 +1917,39 @@ fn section_hit(
         }
     }
     hit
+}
+
+/// FIXME #067: cursor が strictly どの section 帯の **内側** (in-rect) にあるかを返す。 `section_hit` と
+/// 違い resize handle の外側拡張 (`±resize_handle_px`) を **一切含めない**。 dblclick rename / 右クリック
+/// メニューは「帯そのもの」 を対象にする **point gesture** で、 帯の外側 (隣の空きレーン) で発火しては
+/// いけない (帯のすぐ隣の空白を dblclick すると隣 section の rename になっていた bug)。 Move/Resize の
+/// **drag** は掴みやすさのため引き続き `section_hit` の拡張ハンドルを使う。 section は昇順・非交差前提、
+/// 共有境界 (`A.right == B.left`) は半開区間 `[x, x+w)` で右 section に属す (= 1 点に高々 1 section)。
+#[must_use]
+fn section_at_inrect(
+    sections: &[SectionView],
+    arranger: Rect,
+    view: ArrangementView,
+    cx: f32,
+    cy: f32,
+) -> Option<u32> {
+    if arranger.h <= 0.0 || !arranger.contains(cx, cy) {
+        return None;
+    }
+    sections.iter().find_map(|s| {
+        let r = section_to_rect(s, view, arranger);
+        (cx >= r.x && cx < r.x + r.w).then_some(s.id)
+    })
+}
+
+/// FIXME #067: clip / section の drag zone (`ClipDragKind`) を cursor 形状へ写す共通マップ
+/// (中央 Move → `Move`、 端 Resize → `EwResize`)。 clip drag / clip hover / section drag / section hover の
+/// 4 経路が同じ写像を共有する (= 端を掴んでリサイズできることを ↔ カーソルで discoverable にする)。
+fn drag_kind_cursor(kind: ClipDragKind) -> CursorIcon {
+    match kind {
+        ClipDragKind::Move => CursorIcon::Move,
+        ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
+    }
 }
 
 /// M14 Phase 127 (#105): 拍子から 1 bar の拍数を返す (`numerator * 4 / denominator`)。 4/4=4、 3/4=3、
@@ -4967,11 +5006,10 @@ fn draw_automation_lane<M: ?Sized + 'static>(
     // ---- header: ★ icon label slider 帯 👁▣✕ (描画 + Phase 63n-2 hit-test 対応) ----
     // M14 Phase 63n-2 (#028): 描画と hit-test の SSoT を `automation_lane_header_layout` に集約。
     // header_rect.w が極狭の場合 (`< automation_lane_header_min_w_px`) は layout が `None` で描画 skip。
-    let curve_color = if lane.enabled {
-        lane.color
-    } else {
-        style.automation_lane_disabled_color
-    };
+    // FIXME #70: curve line / point dot の色は「lane.color 直塗り」 をやめ、 clip ごとに実際の
+    // `fill` 輝度から白/黒 neutral を auto-contrast する (= clip 名 `clip_text_color_for` と同 SSoT)。
+    // 黄など明るい識別色でも常にコントラストを確保する狙い。 実際の色決定は下の clip ループ内
+    // (fill 確定後) で行う。 header の icon glyph 色は従来どおり `lane.color` を直接使う。
     if let Some(layout) = automation_lane_header_layout(header_rect, style) {
         let icon_size = style.automation_lane_icon_size.max(4.0);
         let pad = 4.0_f32;
@@ -5162,6 +5200,26 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             });
         }
 
+        // FIXME #70: curve line / point dot を背景輝度から白/黒 neutral で auto-contrast する。
+        // enabled lane は実際に塗った `fill` (selected = 黄不透明 / 非選択 = lane.color alpha 0.20 を
+        // lane_bg と合成) の実効輝度から `pick_contrast` で line / dot fill 色を選び、 dot の枠は
+        // その逆色にして「line から浮いた node」 として常に縁が見えるようにする。 disabled lane は
+        // bypass marker として従来の灰色 (`automation_lane_disabled_color`) を維持 (= clip 名と同方針)。
+        let (curve_line_color, point_fill, point_border) = if lane.enabled {
+            let eff_bg = crate::color::composite_over(fill, style.automation_lane_bg);
+            let neutral =
+                crate::color::pick_contrast(eff_bg, style.clip_text_color, style.clip_text_color_dark);
+            let edge = crate::color::pick_contrast(
+                neutral,
+                style.clip_text_color,
+                style.clip_text_color_dark,
+            );
+            (neutral, neutral, edge)
+        } else {
+            let dc = style.automation_lane_disabled_color;
+            (dc, dc, Color { r: 1.0, g: 1.0, b: 1.0, a: 0.4 })
+        };
+
         // curve flatten (clip 内描画域 = clip_rect 全体)。 caller の screen-wide な beat_to_px
         // (= body_rect.w / view.len_beats) を渡すことで、 curve x 座標が point dot 描画と完全一致。
         let flat = flatten_lane_curve(c, clip_rect, view.start_beat, body_rect.x, beat_to_px, 2.0);
@@ -5171,7 +5229,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
                 .map(|w| daw_ui_renderer::LineSegment {
                     a: [w[0].0, w[0].1],
                     b: [w[1].0, w[1].1],
-                    color: curve_color,
+                    color: curve_line_color,
                 })
                 .collect();
             hctx.push_lines(daw_ui_renderer::LineBatch {
@@ -5193,8 +5251,8 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             let py = clip_rect.y + (1.0 - p.value_norm.clamp(0.0, 1.0)) * clip_rect.h;
             hctx.push_rect(RectCommand {
                 rect: Rect { x: px - r, y: py - r, w: r * 2.0, h: r * 2.0 },
-                fill: curve_color,
-                border: Color { r: 1.0, g: 1.0, b: 1.0, a: if lane.enabled { 0.85 } else { 0.4 } },
+                fill: point_fill,
+                border: point_border,
                 border_width: 1.0,
                 radius: [r; 4],
                 clip_rect: Some(clip_rect),
@@ -6845,9 +6903,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && arranger_lane_h > 0.0
             && arranger_rect.contains(cx, cy)
         {
-            response.hovered_section =
+            // FIXME #067: hover の zone (Move/Resize) も保持して cursor を駆動する (id だけ捨てない)。
+            if let Some((id, kind)) =
                 section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
-                    .map(|(id, _)| id);
+            {
+                response.hovered_section = Some(id);
+                response.hovered_section_zone = Some(kind);
+            }
         }
         // visible section の rect を response に積む (clip_rects と同 semantics、 caller の context_menu_for
         // 用)。 完全 off-screen (arranger_rect と x 交差しない) は除外。
@@ -6891,27 +6953,26 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
         let dragging_kind = response
             .dragging
-            .or(automation_clip_drag_session.as_ref().map(|acd| acd.kind));
+            .or(automation_clip_drag_session.as_ref().map(|acd| acd.kind))
+            // FIXME #067: section の Move/Resize drag 中も clip と同じ cursor (Move / EwResize)。
+            // clip drag と section drag は y 領域排他なので同時に Some にならない。
+            .or(response.dragging_section);
         if header_resize_active {
             self.set_cursor(CursorIcon::EwResize);
         } else if resize_active {
             self.set_cursor(CursorIcon::NsResize);
         } else if let Some(kind) = dragging_kind {
-            let cur = match kind {
-                ClipDragKind::Move => CursorIcon::Move,
-                ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
-            };
-            self.set_cursor(cur);
+            self.set_cursor(drag_kind_cursor(kind));
         } else if response.reordering.is_some() {
             self.set_cursor(CursorIcon::Move);
         } else if response.dragging_track_volume.is_some() {
             self.set_cursor(CursorIcon::EwResize);
         } else if let Some(zone) = response.hovered_zone {
-            let cur = match zone {
-                ClipDragKind::Move => CursorIcon::Move,
-                ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
-            };
-            self.set_cursor(cur);
+            self.set_cursor(drag_kind_cursor(zone));
+        } else if let Some(zone) = response.hovered_section_zone {
+            // FIXME #067: section 帯の hover も clip と同 idiom — 端 (Resize zone) で EwResize、
+            // 中央 (Move zone) で Move。 帯端を掴んでリサイズできることを ↔ カーソルで示す。
+            self.set_cursor(drag_kind_cursor(zone));
         } else if let Some((cx, cy)) = pointer.pos
             && (automation_lane_resize_splitter_at(
                 &visible_tracks,
@@ -6945,6 +7006,31 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // M14 Phase 117 (daw_01 #091): header / lanes 境界 hover で EwResize (discoverability)。
             // lane/row splitter (NsResize) を上で先に判定済なので角の競合は NsResize 優先。
             self.set_cursor(CursorIcon::EwResize);
+        } else if let Some((cx, cy)) = pointer.pos
+            && let Some((_key, kind, _clip_rect, _body_rect)) = automation_clip_zone_at(
+                &visible_tracks,
+                &press_tops,
+                view.track_row_h,
+                view,
+                header_pane.x,
+                header_pane.w,
+                lanes,
+                style,
+                cx,
+                cy,
+                style.resize_handle_px,
+            )
+        {
+            // FIXME #70: automation clip も MIDI clip と同様に端で EwResize / 本体で Move を出す。
+            // press 側は `automation_clip_zone_at` で resize/move を既に判定して clip drag を起動して
+            // いるが、 hover cursor だけ未配線で「端でカーソルが左右矢印にならない」 状態だった。
+            // lane/row/header splitter の resize hover はこの上で先に判定済なので、 角の競合は
+            // それらが優先される (= press 側の splitter 優先順位と一致)。
+            let cur = match kind {
+                ClipDragKind::Move => CursorIcon::Move,
+                ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
+            };
+            self.set_cursor(cur);
         } else if let Some((px, py)) = pointer.pos
             && (lanes.contains(px, py) || ruler.contains(px, py) || header_pane.contains(px, py))
         {
@@ -8875,14 +8961,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- M14 Phase 127 (daw_01 #105): Arranger レーンの double-click ----
-        //  - section 帯上 → `BeginRenameSection` (帯名 dblclick で改名開始、 `BeginRenameTrack` と同 idiom)
-        //  - 空きレーン → `CreateSection` (既定長 1 bar = `time_sig` 由来、 snap 適用済)
+        //  - section 帯上 (in-rect) → `BeginRenameSection` (帯名 dblclick で改名開始、 `BeginRenameTrack` と同 idiom)
+        //  - 空きレーン (帯の外、 隣接する resize ハンドル拡張部も含む) → `CreateSection` (既定長 1 bar)
+        // FIXME #067: rename 判定は `section_hit` (resize ハンドルを ±px 外側拡張) でなく `section_at_inrect`
+        // (帯内のみ) を使う。 拡張ハンドルは drag の掴みやすさ用で、 「帯のすぐ隣の空白」 の dblclick を
+        // 隣 section の rename に化けさせていた。 帯外の dblclick は空きレーン扱いで CreateSection に回る。
         if arranger_lane_h > 0.0
             && let Some((cx, cy)) = self.take_double_click_in_rect(arranger_rect)
         {
-            if let Some((sid, _)) =
-                section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
-            {
+            if let Some(sid) = section_at_inrect(sections, arranger_rect, view, cx, cy) {
                 self.push_edit(make_edit(ArrangementEditRequest::BeginRenameSection(sid)));
             } else {
                 let raw_beat = px_to_beat(cx, arranger_rect.x, arranger_rect.w, view);
@@ -8898,12 +8985,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- M14 Phase 127 (daw_01 #105): Arranger レーンの secondary (右) click ----
-        // section 帯上のみ `SecondaryClickSection { id, pos }` を発火 (caller が `pos` にコンテキスト
-        // メニューを開く、 `SecondaryClickEmpty` と同 idiom)。 空きレーン上の右クリックは現状 no-op。
+        // section 帯上 (in-rect) のみ `SecondaryClickSection { id, pos }` を発火 (caller が `pos` に
+        // コンテキストメニューを開く、 `SecondaryClickEmpty` と同 idiom)。 空きレーン上の右クリックは no-op。
+        // FIXME #067: dblclick rename と同じく point gesture なので `section_at_inrect` (帯内のみ) を使う。
+        // resize ハンドル拡張 (`section_hit`) だと帯のすぐ隣の空白の右クリックで隣 section のメニューが出る。
         if arranger_lane_h > 0.0
             && let Some((cx, cy)) = self.take_secondary_press_in_rect(arranger_rect)
-            && let Some((sid, _)) =
-                section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
+            && let Some(sid) = section_at_inrect(sections, arranger_rect, view, cx, cy)
         {
             self.push_edit(make_edit(ArrangementEditRequest::SecondaryClickSection {
                 id: sid,
@@ -11121,6 +11209,31 @@ mod tests {
         );
     }
 
+    /// FIXME #067: `section_at_inrect` は帯の **内側のみ** を返し、 resize handle の外側拡張
+    /// (`±resize_handle_px`) を含めない。 帯のすぐ隣の空白の dblclick / 右クリックを隣 section の
+    /// rename / メニューに化けさせない (= `section_hit` との決定的な差)。
+    #[test]
+    fn section_at_inrect_excludes_resize_handle_extension() {
+        let arranger = Rect { x: 0.0, y: 0.0, w: 400.0, h: 20.0 };
+        let view = ArrangementView { start_beat: 0.0, len_beats: 8.0, ..ArrangementView::default() };
+        let secs = vec![section(7, 2.0, 4.0, "Aメロ")]; // x 100..300
+        // 帯の内側はヒットする (中央 / 端の内側 1px)。
+        assert_eq!(section_at_inrect(&secs, arranger, view, 200.0, 10.0), Some(7), "帯中央");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 100.0, 10.0), Some(7), "左端 (in-rect)");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 299.0, 10.0), Some(7), "右端 -1px (in-rect)");
+        // 帯の **すぐ隣の空白** (resize handle 拡張部 ±4px の内側) は None = リネームしない。
+        assert_eq!(section_at_inrect(&secs, arranger, view, 98.0, 10.0), None, "左端の外 2px は空白");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 300.0, 10.0), None, "右端ちょうど (= rect 外) は空白");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 302.0, 10.0), None, "右端の外 2px は空白");
+        // 同じ外側 2px で `section_hit` は拡張ハンドルにヒットする (= bug の発生源、 drag では正当)。
+        assert!(
+            section_hit(&secs, arranger, view, 302.0, 10.0, 4.0).is_some(),
+            "section_hit は外側拡張を含む (drag 用) — point gesture では section_at_inrect を使う"
+        );
+        // lane の y 外 (帯外の縦領域) も None。
+        assert_eq!(section_at_inrect(&secs, arranger, view, 200.0, 25.0), None, "lane の y 外");
+    }
+
     /// `compute_section_drag_beat_delta`: snap OFF は pivot+raw を素通し (= 各 gesture で delta = raw)。
     #[test]
     fn section_drag_delta_raw_passthrough_off() {
@@ -11921,6 +12034,212 @@ mod tests {
             glyph("disclip").color,
             style.automation_lane_disabled_color,
             "disabled lane は automation_lane_disabled_color 固定"
+        );
+    }
+
+    /// FIXME #70: automation curve line / point dot を背景輝度から白/黒 neutral で auto-contrast する。
+    /// (1) 非選択 enabled lane (= lane.color alpha 0.20 を暗い lane_bg と合成 → 暗い実効 fill) では
+    ///     line / point fill = 明色 (clip_text_color)、 point 枠 = 暗色 (clip_text_color_dark)。
+    /// (2) 選択 clip (= clip_selected_fill の明るい黄 fill) では line / point fill = 暗色、 枠 = 明色。
+    /// lane.color が黄など明るい識別色でも、 line / point が fill と同色化して埋もれる問題 (#70) を防ぐ。
+    #[test]
+    fn automation_curve_and_points_auto_contrast_neutral() {
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::FrameInput;
+        use crate::ui::UiHost;
+
+        let style = ArrangementStyle::default();
+
+        // 明るい識別色 (黄系) の lane + 2 点の Linear curve (= segment が出る)。
+        let clip = ArrangementAutomationClip {
+            id: 10,
+            start_beat: 0.0,
+            len_beats: 8.0,
+            name: Arc::from("auto"),
+            points: vec![
+                ArrangementAutomationPoint {
+                    time_beat: 0.0,
+                    value_norm: 0.2,
+                    curve: ArrangementCurveKind::Linear,
+                },
+                ArrangementAutomationPoint {
+                    time_beat: 4.0,
+                    value_norm: 0.8,
+                    curve: ArrangementCurveKind::Linear,
+                },
+            ],
+            share_group_color: None,
+        };
+        let mut t0 = track(7, "t0", vec![]);
+        t0.automation_lanes_collapsed = false;
+        t0.automation_lanes = vec![ArrangementAutomationLane {
+            id: 1,
+            label: Arc::from("L"),
+            icon_glyph: 'V',
+            color: Color::rgb(0.95, 0.85, 0.55), // 明るい黄系の識別色
+            enabled: true,
+            visible: true,
+            height_px: 80,
+            default_value_norm: 0.5,
+            clips: vec![clip],
+        }];
+        let tracks = vec![t0];
+
+        let mut view = test_view();
+        view.len_beats = 16.0;
+
+        // (curve 由来の line 色全件, point dot の (fill, border) 全件) を返す。
+        let render = |selected: &[AutomationClipKey]| -> (Vec<Color>, Vec<(Color, Color)>) {
+            let mut host: UiHost<()> = UiHost::no_redraw();
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 800, height: 400 };
+            host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+                let _ = ui.arrangement(
+                    "arr_auto_contrast",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &tracks,
+                    &[],
+                    view,
+                    &[],
+                    &[],
+                    selected,
+                    &[],
+                    &style,
+                    None,
+                    |_| Edit::mutate(|()| {}),
+                );
+            });
+            // curve line: scene の line segment のうち、 neutral 2 色 (clip_text_color /
+            // clip_text_color_dark) は curve からしか出ない (grid = 半透明白、 default 線 = 白 alpha 0.18)
+            // ので、 全 segment 色を集めて neutral だけ後で判定する。
+            let line_colors: Vec<Color> = scene
+                .iter_lines()
+                .flat_map(|lb| lb.segments.iter().map(|s| s.color))
+                .filter(|c| *c == style.clip_text_color || *c == style.clip_text_color_dark)
+                .collect();
+            // point dot: 半径 4 → 8x8 rect (clip rect は大きく、 selected overlay/handle は無し)。
+            let dot_w = style.automation_point_radius_px * 2.0;
+            let dots: Vec<(Color, Color)> = scene
+                .iter_rects()
+                .filter(|r| (r.rect.w - dot_w).abs() < 1e-3 && (r.rect.h - dot_w).abs() < 1e-3)
+                .map(|r| (r.fill, r.border))
+                .collect();
+            (line_colors, dots)
+        };
+
+        // (1) 非選択: 暗い実効 fill → line/point fill = 明色、 point 枠 = 暗色。
+        let (lines, dots) = render(&[]);
+        assert!(
+            !lines.is_empty() && lines.iter().all(|c| *c == style.clip_text_color),
+            "非選択 curve line は明色 (clip_text_color): got {lines:?}"
+        );
+        assert_eq!(dots.len(), 2, "point dot は 2 個: got {dots:?}");
+        assert!(
+            dots.iter()
+                .all(|(f, b)| *f == style.clip_text_color && *b == style.clip_text_color_dark),
+            "非選択 point は fill=明色 / 枠=暗色: got {dots:?}"
+        );
+
+        // (2) 選択: 明るい黄 fill → line/point fill = 暗色、 point 枠 = 明色。
+        let sel = [AutomationClipKey { track: 7, lane: 1, clip: 10 }];
+        let (lines_s, dots_s) = render(&sel);
+        assert!(
+            !lines_s.is_empty() && lines_s.iter().all(|c| *c == style.clip_text_color_dark),
+            "選択 curve line は暗色 (clip_text_color_dark): got {lines_s:?}"
+        );
+        assert_eq!(dots_s.len(), 2, "選択 point dot は 2 個: got {dots_s:?}");
+        assert!(
+            dots_s
+                .iter()
+                .all(|(f, b)| *f == style.clip_text_color_dark && *b == style.clip_text_color),
+            "選択 point は fill=暗色 / 枠=明色: got {dots_s:?}"
+        );
+    }
+
+    /// FIXME #70: automation clip の左右端 hover で `EwResize`、 本体中央 hover で `Move` cursor を出す
+    /// (MIDI clip と対称、 press 側 `automation_clip_zone_at` の resize/move 判定に hover cursor を配線)。
+    #[test]
+    fn automation_clip_edge_hover_sets_ew_resize_cursor() {
+        use std::sync::{Arc as StdArc, Mutex};
+
+        use daw_ui_platform::PhysicalSize;
+        use daw_ui_renderer::Scene;
+
+        use crate::input::{FrameInput, PointerFrame};
+        use crate::ui::UiHost;
+
+        let style = ArrangementStyle::default();
+        let clip = ArrangementAutomationClip {
+            id: 10,
+            start_beat: 0.0,
+            len_beats: 8.0,
+            name: Arc::from("a"),
+            points: Vec::new(),
+            share_group_color: None,
+        };
+        let mut t0 = track(7, "t0", vec![]);
+        t0.automation_lanes_collapsed = false;
+        t0.automation_lanes = vec![ArrangementAutomationLane {
+            id: 1,
+            label: Arc::from("L"),
+            icon_glyph: 'V',
+            color: Color::rgb(0.42, 0.78, 0.95),
+            enabled: true,
+            visible: true,
+            height_px: 80,
+            default_value_norm: 0.5,
+            clips: vec![clip],
+        }];
+        let tracks = vec![t0];
+        let mut view = test_view();
+        view.len_beats = 16.0; // beat_to_px = 800/16 = 50 → clip [0..8] = x[0..400]
+
+        // pointer を pos に置いて 1 frame 回し、 flush された cursor を集める (`frame` のみが flush する)。
+        let cursor_at = |pos: (f32, f32)| -> Vec<CursorIcon> {
+            let captured: StdArc<Mutex<Vec<CursorIcon>>> = StdArc::new(Mutex::new(Vec::new()));
+            let cc = StdArc::clone(&captured);
+            let mut host: UiHost<()> = UiHost::no_redraw();
+            host.set_cursor_request = Some(Box::new(move |c| cc.lock().unwrap().push(c)));
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 800, height: 400 };
+            let input = FrameInput {
+                pointer: PointerFrame { pos: Some(pos), ..PointerFrame::default() },
+                ..Default::default()
+            };
+            host.frame(&mut (), &mut scene, screen, input, |_, ui| {
+                let _ = ui.arrangement(
+                    "arr_auto_cursor",
+                    Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
+                    &tracks,
+                    &[],
+                    view,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &style,
+                    None,
+                    |_| Edit::mutate(|()| {}),
+                );
+            });
+            let v = captured.lock().unwrap().clone();
+            v
+        };
+
+        // clip rect は y[38..106] (lane y=32, pad=6, h=80-12=68)。 y=72 は clip 内中段。
+        // 右端 (beat 8 = x 400) → ResizeRight → EwResize。
+        assert_eq!(
+            cursor_at((400.0, 72.0)).as_slice(),
+            &[CursorIcon::EwResize],
+            "automation clip 右端は EwResize"
+        );
+        // 本体中央 (x 200) → Move。
+        assert_eq!(
+            cursor_at((200.0, 72.0)).as_slice(),
+            &[CursorIcon::Move],
+            "automation clip 本体は Move"
         );
     }
 

@@ -797,22 +797,38 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
-    // ----- FIXME #19: Piano roll track solo (S) -----
-    // MIDI エディタ内で S を押すと、 編集中 clip の所属 track を solo toggle する
-    // (mixer / arrangement の S ボタンと同じ ToggleTrackSolo を発火)。
-    // is_pianoroll_active (= pointer が bottom panel 内 + Piano Roll タブ選択) の
-    // ときだけ作用。 audio editor を開いているときは MIDI 編集文脈ではないので除外。
-    // ClipRef.track は track index なので id へ解決してから渡す。
-    if ui.take_shortcut("daw.toggle_pianoroll_track_solo")
-        && is_pianoroll_active
-        && app.audio_editor_clip.is_none()
-        && let Some(target) = app.selected_clip_ref()
-        && let Some(track) = app.song.tracks.get(target.track as usize)
-    {
-        let track_id = track.id;
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::ToggleTrackSolo(track_id));
-        }));
+    // ----- Track solo (S): FIXME #19 (piano roll) + FIXME #68 (arrangement / mixer) -----
+    // S キーで「マウス直下のトラック」を solo toggle する (mixer / arrangement の
+    // S ボタンと同じ ToggleTrackSolo を発火)。 対象 track は pointer の位置で決まる:
+    // - piano roll active (= pointer が bottom panel 内 + Piano Roll タブ。 audio
+    //   editor は MIDI 編集文脈ではないので除外): 編集中 clip の所属 track
+    //   (ClipRef.track は index なので id へ解決)。
+    // - mixer (= pointer が bottom panel 内 + Mixer タブ): マウス直下のストリップ
+    //   (`mixer_hovered_track`、 FIXME #68)。 master strip / strip 外は None で no-op。
+    // - それ以外 (= pointer がアレンジ上): マウス直下のトラック
+    //   (`arrange_hovered_track`、 FIXME #33)。 ヘッダ列でもクリップレーン上でも
+    //   同じトラック行を返し、 ruler / master 行 / トラック外は None で no-op。
+    //   いずれも選択トラックではなく「カーソルがあるトラック」を solo する。
+    // text_input focus 中は gui_01 が単キーを抑制するので rename / 歌詞編集中は発火しない。
+    if ui.take_shortcut("daw.toggle_track_solo") {
+        let target_track_id = if is_pianoroll_active {
+            if app.audio_editor_clip.is_some() {
+                None
+            } else {
+                app.selected_clip_ref()
+                    .and_then(|c| app.song.tracks.get(c.track as usize))
+                    .map(|t| t.id)
+            }
+        } else if app.bottom_panel == 0 && pointer_in_bottom {
+            app.mixer_hovered_track
+        } else {
+            app.arrange_hovered_track
+        };
+        if let Some(track_id) = target_track_id {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleTrackSolo(track_id));
+            }));
+        }
     }
 
     // ----- Ctrl+A: 文脈別全選択 (grill-me 2026-06-09) -----

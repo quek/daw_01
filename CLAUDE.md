@@ -48,36 +48,6 @@ cargo clippy --workspace -- -D warnings
   `cargo build -p <crate>` または `cargo build --workspace`
 - `cargo run -p daw_gui` は dependency crate も自動ビルドしてくれるが、既に起動中のプロセスのバイナリは上書きされない場合がある（Windows の ERROR 5）。必要なら先に全プロセスを終了
 
-### commit したら必ず release build（厳守）
-
-- **main ブランチの commit の後に release build を必ず通す**。release は debug と別 profile
-  なので、debug-clean でも release で壊れることがある。build 対象は **実行に必要な 3 つの exe**
-  (`daw_gui` / `daw_audio` / `daw_plugin_host`) のみ:
-  `cargo build --release -p daw_gui -p daw_audio -p daw_plugin_host`。
-  `ui/crates/examples/*` (daw-ui-example-*) は実行に不要で、release link (lto=thin /
-  codegen-units=1) が重く `--workspace` 全体を遅くしていた主因なので除外する (FIXME #65)。
-  daw_gui が common / daw-ui-* lib を transitively 引くので runtime 依存はすべて build される。
-- 自動化は **git-native hook** で行う（`core.hooksPath = .githooks`）。共通トリガーは
-  `.githooks/lib/release_build_trigger.sh`（main ブランチでのみ `scripts/release_build_bg.ps1`
-  を detached 起動）で、**post-commit と post-merge の両方**から source する。
-  commit / merge の起動手段（Bash/PowerShell ツール・手動・`!` passthrough）に依存せず発火する。
-  hook は **main 以外のブランチ（= 各 worktree の feature ブランチ）では skip** し、release
-  検証は main への統合時に行う。**重要**: git は `git commit` で post-commit を、`git merge` /
-  `git pull` で post-merge を発火する（git 2.50 で実測。**merge コミット生成でも post-commit は
-  一切呼ばれない**ので post-commit only だと merge 統合が release build されない穴があった。
-  FIXME #66 follow-up で発覚・修正）。直接 commit / fast-forward / no-ff merge / conflict 解決
-  commit / pull の全経路がちょうど 1 回 build される（rebase / am 中の build storm は lib 側で
-  skip）。ビルドは非ブロッキング、結果は `target/release-build.log`、失敗時は
-  `target/.release-build-failed` marker + ダイアログ。
-- Claude 自身も **main への commit 後に**
-  `cargo build --release -p daw_gui -p daw_audio -p daw_plugin_host` を実行して green を確認する
-  （hook の background build と cargo の target lock で直列化されるので二重ビルドにはならない）。
-  `target/.release-build-failed` があれば別作業に進まず即修正する。worktree の feature ブランチでは
-  hook が skip するので Claude も強制しない。
-- 旧 Claude-Code PostToolUse hook（matcher `"Bash"`）は Bash ツール経由 / hook 有効 session の
-  commit にしか発火せず取りこぼしていた（2026-06-08 に FIXME 5 commit で release build が
-  走らず発覚）。git hook へ移行済み。
-
 ### IPC 境界で送る型
 
 - `MainToChild` / `ChildToMain` 等の protocol 型、およびそれが保持する内側の型すべてに
