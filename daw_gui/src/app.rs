@@ -3151,6 +3151,11 @@ impl AppData {
                 | AppEvent::DuplicateClipsUnique(_)
                 | AppEvent::CloneClipsLinked(_)
                 | AppEvent::CloneClipsIndependent(_)
+                // FIXME #66: clip drag move。 widget は commit-by-release
+                // (drag 中は overlay 描画のみ、 release frame で `MoveClips`
+                // → `SetClipPositions` を 1 件発火) なので、 1 drag = 1 undo
+                // step になる。 兄弟の Clone*/MoveAutomationClips と同列。
+                | AppEvent::SetClipPositions(_)
                 | AppEvent::MakeClipUnique(_)
                 | AppEvent::SplitClipAtPlayhead { .. }
                 | AppEvent::GlueSelectedClips
