@@ -53,20 +53,35 @@ pub struct ExportOutcome {
     pub cancelled: bool,
 }
 
+/// How the offline render walks the song relative to the window it writes.
+/// The render always *writes* only `[write_start, write_end)` (plus tail),
+/// but where it starts *walking* differs by intent.
+#[derive(Debug, Clone, Copy)]
+pub enum RenderSpan {
+    /// Full-song export: write (and walk) `0..song_length`. (`ExportWav`
+    /// with `range = None`.)
+    Full,
+    /// User export range (FIXME #55): write `[start, end)` and walk **from
+    /// `start`** (cold). Audio whose note began before `start` (e.g. a
+    /// VOICEVOX phrase, a held note) is therefore *not* retriggered — the
+    /// result matches pressing Play at `start`. Plugin tails start dry.
+    RangeCold { start: u64, end: u64 },
+    /// Clip-FX bounce: write `[start, end)` but walk **from frame 0** (warm)
+    /// so plugin state at `start` is fully accumulated (reverb tails /
+    /// parameter ramps / sidechain history). (`BounceClipFxOnline`.)
+    RangeWarm { start: u64, end: u64 },
+}
+
 /// Run the offline WAV export to completion. Blocks the caller until the
 /// file is finalised. RT-irrelevant — the CPAL callback writes silence
 /// while `engine_shared.export_running` is set.
 ///
-/// `range`:
-/// - `None` — full song export (= `MainToChild::ExportWav`). Walks
-///   `0..(song.length_beats × samples_per_beat) + tail_max` and writes
-///   every frame to the WAV.
-/// - `Some((start_frame, end_frame))` — clip-range bounce
-///   (`MainToChild::BounceClipFxOnline`). Walks the song from frame 0
-///   so plugin state at `start_frame` is fully accumulated (= reverb
-///   tails / parameter ramps / sidechain history are correct), but
-///   writes only frames in `[start_frame, end_frame)` plus tail
-///   silence past `end_frame`. Returns the frame count written.
+/// `span` selects the written window and where the walk starts (see
+/// [`RenderSpan`]): `Full` (whole song), `RangeCold` (user export range —
+/// walk from the range start), or `RangeWarm` (clip bounce — walk from 0 to
+/// warm plugin state). `write_mod_sidecar` persists the modulation-envelope
+/// sidecar (`.modenv`) next to the WAV; only the offline video render reads
+/// it, so standalone WAV exports / clip bounces pass `false`.
 ///
 /// Returns the number of frames written to the WAV (= can be less than
 /// the requested range if tail silence is detected and the render
@@ -83,13 +98,15 @@ pub struct ExportOutcome {
 /// (via `MainToChild::CancelExport`), the loop breaks, the partial WAV is
 /// deleted, and the function returns `Ok(ExportOutcome { cancelled: true, .. })`
 /// (a cancel is not an error).
+#[allow(clippy::too_many_arguments)]
 pub fn run_export(
     path: PathBuf,
     engine_shared: Arc<EngineShared>,
     song: Song,
     sample_rate: u32,
     max_frames: usize,
-    range: Option<(u64, u64)>,
+    span: RenderSpan,
+    write_mod_sidecar: bool,
     on_progress: impl FnMut(u64, u64),
 ) -> Result<ExportOutcome> {
     if song.bpm <= 0.0 {
@@ -103,15 +120,21 @@ pub fn run_export(
     let song_length_samples = (song.length_beats * samples_per_beat).max(0.0) as u64;
     let tail_max_samples = u64::from(sample_rate) * TAIL_MAX_SECONDS;
 
-    let (write_start, write_end) = range.unwrap_or((0, song_length_samples));
+    // `write_*` = the window written to the WAV; `walk_start` = where the
+    // render starts processing. Cold range starts the walk at `write_start`
+    // (no pre-range retrigger); warm range / full start at 0.
+    let (write_start, write_end, walk_start) = match span {
+        RenderSpan::Full => (0, song_length_samples, 0),
+        RenderSpan::RangeCold { start, end } => (start, end, start),
+        RenderSpan::RangeWarm { start, end } => (start, end, 0),
+    };
     if write_end < write_start {
         anyhow::bail!(
-            "invalid bounce range: end_frame ({write_end}) < start_frame ({write_start})"
+            "invalid export range: end_frame ({write_end}) < start_frame ({write_start})"
         );
     }
-    // walk past write_end by tail_max so plugin release tails / verbs
-    // can decay; walk start is always frame 0 to keep plugin state
-    // consistent at the requested start_frame.
+    // walk past write_end by tail_max so plugin release tails / verbs can
+    // decay.
     let total_samples = write_end.saturating_add(tail_max_samples);
 
     tracing::info!(
@@ -121,7 +144,8 @@ pub fn run_export(
         song_length_samples,
         write_start,
         write_end,
-        is_clip_range = range.is_some(),
+        walk_start,
+        write_mod_sidecar,
         "starting offline WAV export"
     );
 
@@ -139,12 +163,33 @@ pub fn run_export(
     let mut master_r: Vec<f32> = vec![0.0; max_frames];
 
     // NB: `export_running` (the CPAL-silence flag) and `export_cancel` are
-    // both owned by the daw_audio receive loop, not by this function. The
-    // recv loop reserves `export_running` with a compare_exchange and resets
+    // both owned by the daw_audio receive loop, not by this function. The recv
+    // loop reserves `export_running` with a compare_exchange and resets
     // `export_cancel` *before* spawning this thread (so both are FIFO-ordered
     // against a later `CancelExport`), and the spawn closure releases
     // `export_running` after this returns (on every path, including an early
     // bail above). We only read `export_cancel` here.
+    //
+    // FIXME #55: `export_running` is already set (by the recv loop), so wait for
+    // the live CPAL callback to actually park before we touch the shared
+    // plugin-host worker slots. Otherwise a CPAL buffer that was mid-
+    // `process_buffer` when the flag flipped would dispatch to the same worker
+    // slots concurrently with our render ("plugin processing collides"). Once
+    // `live_parked` is observed `true`, the live callback has gone through the
+    // gate and any in-flight buffer has fully drained (CPAL calls serially).
+    let park_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !engine_shared.live_parked.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= park_deadline {
+            tracing::warn!("live callback did not report parked within 2s; proceeding anyway");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    // Plugins are reinitialised (deactivate→activate) by the GUI's
+    // `begin_wav_export` → `ReinitPluginsForExport` handshake *before* this
+    // render runs, so a cold range / full export starts from a clean state (no
+    // live reverb tail / VOICEVOX phrase / synth voice bleeding into the head).
     let render_result = render_loop(
         &engine_shared,
         &song,
@@ -154,6 +199,8 @@ pub fn run_export(
         total_samples,
         write_start,
         write_end,
+        walk_start,
+        write_mod_sidecar,
         &mut scratch,
         &mut master_l,
         &mut master_r,
@@ -210,6 +257,8 @@ fn render_loop(
     total_samples: u64,
     write_start: u64,
     write_end: u64,
+    walk_start: u64,
+    write_mod_sidecar: bool,
     scratch: &mut [TrackScratch],
     master_l: &mut [f32],
     master_r: &mut [f32],
@@ -234,17 +283,25 @@ fn render_loop(
 
     // docs/plan_modulation.md §7: bake each `ModSource`'s follower envelope per
     // render buffer (keyed by beat) so the offline video render reproduces the
-    // live preview's modulation. Written to a sidecar next to the WAV.
-    let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(schedule.follower_slots.len());
+    // live preview's modulation. Written to a sidecar next to the WAV — but
+    // only when a video render will consume it (`write_mod_sidecar`). A
+    // standalone WAV export skips it (n_sources = 0 → no recording, no file):
+    // the modulation is already baked into the rendered audio below regardless.
+    let mut env_sidecar = common::mod_sidecar::ModEnvSidecar::new(if write_mod_sidecar {
+        schedule.follower_slots.len()
+    } else {
+        0
+    });
     // docs/plan_modulation.md §5: reusable per-buffer follower scalar snapshot
     // (prev buffer's env) for audio-param modulation, mirroring the live engine.
     let mut mod_scalars_snapshot: Vec<f32> = Vec::with_capacity(schedule.follower_slots.len());
 
-    // Frame counter for the WAV output. Walking the song always starts
-    // at frame 0 so plugin state at `write_start` is properly built up,
-    // but we don't write samples to the WAV before reaching `write_start`.
+    // Frame counter for the WAV output. The walk starts at `walk_start`
+    // (= 0 for full / warm bounce so plugin state at `write_start` is built
+    // up; = `write_start` for a cold range so nothing before it is
+    // retriggered). Samples before `write_start` are rendered but not written.
     let mut frames_written: u64 = 0;
-    let mut playhead: u64 = 0;
+    let mut playhead: u64 = walk_start;
     while playhead < total_samples {
         // User abort (`MainToChild::CancelExport`). Checked before any
         // work this buffer so the render stops promptly; `run_export`

@@ -343,6 +343,29 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             js_string!("exportWav"),
             2,
         )
+        // ----- FIXME #55 headless export-range test harness ----------------
+        .function(
+            NativeFunction::from_fn_ptr(daw_load_song_file),
+            js_string!("loadSongFile"),
+            1,
+        )
+        .function(NativeFunction::from_fn_ptr(daw_play), js_string!("play"), 0)
+        .function(NativeFunction::from_fn_ptr(daw_stop), js_string!("stop"), 0)
+        .function(
+            NativeFunction::from_fn_ptr(daw_sleep_ms),
+            js_string!("sleepMs"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_reinit_for_export),
+            js_string!("reinitForExport"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_export_wav_range),
+            js_string!("exportWavRange"),
+            4,
+        )
         .function(
             NativeFunction::from_fn_ptr(daw_set_track_latency),
             js_string!("setTrackLatency"),
@@ -609,6 +632,10 @@ fn daw_export_wav(
         h.drain_pending_for(Duration::from_millis(50));
         let _ = h.bootstrap.audio_tx.send(MainToChild::ExportWav {
             path: PathBuf::from(path_str),
+            // scripting API は全曲 export (FIXME #55 のレンジは GUI 専用)。
+            range: None,
+            // standalone WAV (video render なし) なので modulation sidecar は不要。
+            write_mod_sidecar: false,
         });
         h.pump_until(
             |msg| matches!(msg, ChildToMain::ExportWavComplete { .. }),
@@ -624,6 +651,107 @@ fn daw_export_wav(
         Err(e) => Err(JsError::from_native(
             JsNativeError::error().with_message(format!("exportWav: {e}")),
         )),
+    }
+}
+
+/// `daw.loadSongFile(path)` — open a real `.daw` project headlessly, exactly
+/// like the GUI's File→Open: deserialize, populate the plugin DB, instantiate
+/// every plugin (`SetSlotPlugin`), and push the song + project_dir to the audio
+/// engine. Lets an automated test drive the *real* project (real plugins) with
+/// no human operating the GUI (FIXME #55 export-bleed regression harness).
+fn daw_load_song_file(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let path_str = String::try_from_js(args.get_or_undefined(0), ctx)?;
+    let path = PathBuf::from(&path_str);
+    let mut song = common::project::load(&path)
+        .map_err(|e| js_native(format!("loadSongFile: load {path_str}: {e}")))?;
+    song.ensure_ids();
+    with_host(|h| {
+        // Resolve plugin ids → DLL paths from the cached DB the bootstrap built.
+        h.app.plugin_db = h.bootstrap.plugin_db.clone();
+        h.app.file_path = Some(path.clone());
+        // Instantiate every plugin in the chain (sends SetSlotPlugin), then push
+        // the song + project_dir + LoadSong to the audio engine.
+        h.app.restore_plugin_from_song(&song);
+        h.app.song = song.clone();
+        h.app.sync_song_to_plugin_host();
+        h.last_loaded_song = Some(song);
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.play()` — start realtime transport in the audio engine (bypasses the
+/// GUI play-gating, which assumes the winit loop). Used to reproduce the
+/// "played first" state where a synth holds a live voice.
+fn daw_play(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    with_host(|h| {
+        let _ = h.bootstrap.audio_tx.send(MainToChild::Play);
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.stop()` — stop realtime transport.
+fn daw_stop(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    with_host(|h| {
+        let _ = h.bootstrap.audio_tx.send(MainToChild::Stop);
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.sleepMs(ms)` — wall-clock wait that keeps pumping incoming IPC events
+/// (so plugin loads / shmem opens are serviced). Lets realtime playback run for
+/// a fixed duration and gives async plugin instantiation time to complete.
+fn daw_sleep_ms(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let ms = u64::try_from_js(args.get_or_undefined(0), ctx).unwrap_or(0);
+    with_host(|h| h.drain_pending_for(Duration::from_millis(ms)));
+    Ok(JsValue::undefined())
+}
+
+/// `daw.reinitForExport(timeoutMs)` — reinitialise all plugins (deactivate→
+/// activate) for a clean offline cold render and block until done. Mirrors the
+/// GUI's pre-export reinit step so the headless harness exercises the real fix.
+fn daw_reinit_for_export(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let timeout_ms = u64::try_from_js(args.get_or_undefined(0), ctx).unwrap_or(30_000);
+    let res = with_host(|h| {
+        let _ = h
+            .bootstrap
+            .plugin_tx
+            .send(MainToChild::ReinitPluginsForExport);
+        h.pump_until(
+            |msg| matches!(msg, ChildToMain::PluginsReinitDone),
+            Duration::from_millis(timeout_ms),
+        )
+    });
+    res.map_err(|e| js_native(format!("reinitForExport: {e}")))?;
+    Ok(JsValue::undefined())
+}
+
+/// `daw.exportWavRange(path, startFrame, endFrame, timeoutMs)` — offline export
+/// of a sample-frame range (the FIXME #55 cold range, GUI's
+/// `MainToChild::ExportWav { range: Some(..) }`), driven headlessly.
+fn daw_export_wav_range(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let path_str = String::try_from_js(args.get_or_undefined(0), ctx)?;
+    let start = u64::try_from_js(args.get_or_undefined(1), ctx)?;
+    let end = u64::try_from_js(args.get_or_undefined(2), ctx)?;
+    let timeout_ms = u64::try_from_js(args.get_or_undefined(3), ctx).unwrap_or(120_000);
+    let pump_result = with_host(|h| {
+        h.drain_pending_for(Duration::from_millis(50));
+        let _ = h.bootstrap.audio_tx.send(MainToChild::ExportWav {
+            path: PathBuf::from(path_str),
+            range: Some((start, end)),
+            write_mod_sidecar: false,
+        });
+        h.pump_until(
+            |msg| matches!(msg, ChildToMain::ExportWavComplete { .. }),
+            Duration::from_millis(timeout_ms),
+        )
+    });
+    match pump_result {
+        Ok(ChildToMain::ExportWavComplete { error: None, .. }) => Ok(JsValue::undefined()),
+        Ok(ChildToMain::ExportWavComplete { error: Some(e), .. }) => Err(js_native(format!(
+            "exportWavRange failed: {e}"
+        ))),
+        Ok(_) => unreachable!(),
+        Err(e) => Err(js_native(format!("exportWavRange: {e}"))),
     }
 }
 

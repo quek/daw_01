@@ -38,12 +38,18 @@ const DRAG_THRESHOLD_PX: f32 = 4.0;
 const FINE_DRAG_SCALE: f32 = 0.1;
 
 /// 数値の表示書式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScrubableNumberFormat {
     /// 整数表示 (例: BPM の int 部、 TimeSig num)。 `value.round() as i64` で表示 / parse。
     Integer,
     /// 小数 N 桁 (例: `Decimal(1)` で `"120.0"`、 `Decimal(3)` で `"120.345"`)。
     Decimal(u8),
+    /// 1-based **小節.拍** 表記。 内部値は 4 分音符 beat、 `beats_per_bar` は 1 小節
+    /// の beat 数 (4/4 → 4)。 表示は末尾の不要な 0 / 小数点を落とす (例 `8.0` beat →
+    /// `"3.1"`、 `9.5` beat → `"3.2.5"`)。 入力は最初の `.` で小節と拍を分割し、
+    /// `"3"` / `"3.1"` / `"3.2.5"` を受ける。 ドメイン非依存にするため拍/小節換算は
+    /// `beats_per_bar` 引数で受け取る (UI ライブラリは time signature を知らない)。
+    BarBeat { beats_per_bar: f64 },
 }
 
 /// `scrubable_number_at` のスタイル + sensitivity + range。
@@ -229,6 +235,7 @@ fn format_value(value: f64, format: ScrubableNumberFormat) -> String {
             // `n` は表示桁数 (例: 1 で "120.0")。
             format!("{:.*}", usize::from(n), value)
         }
+        ScrubableNumberFormat::BarBeat { beats_per_bar } => format_bar_beat(value, beats_per_bar),
     }
 }
 
@@ -238,6 +245,53 @@ fn parse_value(text: &str, format: ScrubableNumberFormat) -> Option<f64> {
     match format {
         ScrubableNumberFormat::Integer => trimmed.parse::<i64>().ok().map(|v| v as f64),
         ScrubableNumberFormat::Decimal(_) => trimmed.parse::<f64>().ok(),
+        ScrubableNumberFormat::BarBeat { beats_per_bar } => parse_bar_beat(trimmed, beats_per_bar),
+    }
+}
+
+/// beat → 1-based "小節.拍" 文字列。 `beat_to_bar_beat` (common::timing) と同じ式
+/// (bar = floor(beat/bpb)+1、 beat_in_bar = beat-(bar-1)*bpb+1) なので ruler /
+/// transport と表記が一致する。 末尾の不要な 0 / 小数点は落とす。
+fn format_bar_beat(beat: f64, beats_per_bar: f64) -> String {
+    if beats_per_bar <= 0.0 || !beat.is_finite() {
+        return "1.1".to_string();
+    }
+    let bar_idx = (beat / beats_per_bar).floor().max(0.0);
+    let beat_in_bar = beat - bar_idx * beats_per_bar + 1.0;
+    #[allow(clippy::cast_possible_truncation)]
+    let bar_num = bar_idx as i64 + 1;
+    format!("{bar_num}.{}", trim_decimals(beat_in_bar))
+}
+
+/// "小節" / "小節.拍" (拍は小数可) → beat。 最初の `.` で小節と拍を分割するので、
+/// `"3"` (= 拍 1 既定) / `"3.1"` / `"3.2.5"` を受ける。 不正入力は `None`。
+fn parse_bar_beat(text: &str, beats_per_bar: f64) -> Option<f64> {
+    if beats_per_bar <= 0.0 {
+        return None;
+    }
+    let (bar_str, beat_str) = text.split_once('.').unwrap_or((text, ""));
+    let bar: f64 = bar_str.trim().parse().ok()?;
+    let beat_str = beat_str.trim();
+    let beat_in_bar: f64 = if beat_str.is_empty() {
+        1.0
+    } else {
+        beat_str.parse().ok()?
+    };
+    if !bar.is_finite() || !beat_in_bar.is_finite() {
+        return None;
+    }
+    let beat = (bar - 1.0) * beats_per_bar + (beat_in_bar - 1.0);
+    beat.is_finite().then_some(beat)
+}
+
+/// f64 を末尾 0 / 小数点を落として文字列化 (`1.0`→`"1"`、 `2.5`→`"2.5"`)。
+fn trim_decimals(v: f64) -> String {
+    let s = format!("{v:.3}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -893,6 +947,49 @@ mod tests {
         assert_eq!(parse_value("120.5", ScrubableNumberFormat::Decimal(1)), Some(120.5));
         assert_eq!(parse_value("abc", ScrubableNumberFormat::Integer), None);
         assert_eq!(parse_value("  120  ", ScrubableNumberFormat::Integer), Some(120.0));
+    }
+
+    #[test]
+    fn format_bar_beat_4_4_trims_zeros() {
+        // 4/4 (beats_per_bar = 4): beat 0 = 小節1拍1、 beat 8 = 小節3拍1。
+        assert_eq!(format_bar_beat(0.0, 4.0), "1.1");
+        assert_eq!(format_bar_beat(4.0, 4.0), "2.1");
+        assert_eq!(format_bar_beat(8.0, 4.0), "3.1");
+        assert_eq!(format_bar_beat(9.0, 4.0), "3.2");
+        // sub-beat は末尾 0 を落として "小節.拍.端数" 風 ("3.2.5")。
+        assert_eq!(format_bar_beat(9.5, 4.0), "3.2.5");
+        // 退化入力。
+        assert_eq!(format_bar_beat(f64::NAN, 4.0), "1.1");
+        assert_eq!(format_bar_beat(5.0, 0.0), "1.1");
+    }
+
+    #[test]
+    fn parse_bar_beat_roundtrips() {
+        // "小節.拍" → beat。
+        assert_eq!(parse_bar_beat("1.1", 4.0), Some(0.0));
+        assert_eq!(parse_bar_beat("3.1", 4.0), Some(8.0));
+        assert_eq!(parse_bar_beat("3.2", 4.0), Some(9.0));
+        assert_eq!(parse_bar_beat("3.2.5", 4.0), Some(9.5));
+        // 小節のみ → 拍1 既定。
+        assert_eq!(parse_bar_beat("3", 4.0), Some(8.0));
+        assert_eq!(parse_bar_beat("3.", 4.0), Some(8.0));
+        // 不正入力。
+        assert_eq!(parse_bar_beat("abc", 4.0), None);
+        assert_eq!(parse_bar_beat("3.x", 4.0), None);
+        assert_eq!(parse_bar_beat("3.1", 0.0), None);
+        // round-trip: format → parse で同じ beat。
+        for &beat in &[0.0_f64, 8.0, 9.0, 9.5, 13.25] {
+            let s = format_bar_beat(beat, 4.0);
+            let back = parse_bar_beat(&s, 4.0).unwrap();
+            assert!((back - beat).abs() < 1e-6, "roundtrip {beat} -> {s} -> {back}");
+        }
+    }
+
+    #[test]
+    fn parse_value_bar_beat_via_format() {
+        let f = ScrubableNumberFormat::BarBeat { beats_per_bar: 4.0 };
+        assert_eq!(parse_value("3.1", f), Some(8.0));
+        assert_eq!(format_value(8.0, f), "3.1");
     }
 
     /// drag 上方向 (= dy negative) で値が増加、 sensitivity が units_per_pixel として効く。

@@ -507,6 +507,11 @@ pub struct ResizeClipDelta {
     pub prev_len: f64,
     pub next_start: f64,
     pub next_len: f64,
+    /// FIXME #61: Shift 修飾で開始した端 drag は **time-stretch** (= 内容を
+    /// 新しい長さに伸縮)、 無印は **trim** (= 再生範囲を変える)。 geometry
+    /// (`next_start` / `next_len`) は両者同一で、 解釈だけ caller (daw_01) が
+    /// 分岐する。 `Ableton` 流 (plain=trim / Shift=stretch)。
+    pub stretch: bool,
 }
 
 /// M14 Phase 63k (#025): `SetClipGainDb` の delta 1 件 (release 時に発火)。
@@ -5340,9 +5345,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
             } else if !splitter_press
                 && in_lanes
-                && (!shift || ctrl)
                 && let Some((hit_key, kind)) =
                     clip_hit(&visible_tracks, &press_tops, view, lanes, px, py, style.resize_handle_px)
+                && (!shift
+                    || ctrl
+                    // FIXME #61: 左右端 grip は Shift = time-stretch を許可
+                    // (clip 本体 Move の Shift は従来どおり選択へ fall through)。
+                    || matches!(kind, ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight))
             {
                 let drag_keys: Vec<ClipKey> = if selected_clips.contains(&hit_key) {
                     selected_clips.to_vec()
@@ -7808,6 +7817,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                 prev_len: a.len_beats,
                                 next_start: a.start_beat,
                                 next_len: new_len,
+                                stretch: nd.last_shift,
                             });
                         }
                     }
@@ -7831,6 +7841,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                 prev_len: a.len_beats,
                                 next_start: new_start,
                                 next_len: new_len,
+                                stretch: nd.last_shift,
                             });
                         }
                     }

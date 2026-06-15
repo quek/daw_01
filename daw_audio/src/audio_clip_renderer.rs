@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use common::audio_render::{fade_envelope, pitch_ratio_for};
+use common::audio_render::{fade_envelope, pitch_ratio_for, stretch_ratio_for};
 use common::model::{
     AudioSourceId, AudioSourcePath, ClipContent, FadeCurve, Song, StretchMode,
 };
@@ -86,6 +86,14 @@ pub struct RenderedEvent {
     /// `pitch_ratio * current_bpm / nominal_bpm` でスケール、 他 mode は
     /// 不変)。 1.0 = same speed as engine SR at nominal bpm。
     pub pitch_ratio: f64,
+    /// FIXME #61 (clip time-stretch): source の native 長 / event の配置長 の比
+    /// (= `native_secs / event_secs`、 nominal bpm 基準)。 `1.0` で「source を
+    /// そのまま」 (= trim、 native rate)。 `< 1.0` で event slot の方が長い → source
+    /// を引き伸ばす (slow)、 `> 1.0` で詰める (fast)。 Repitch は pitch にも乗る
+    /// (tape)、 Stretch は granular で pitch 保持、 Slice は slice 配置にのみ作用、
+    /// **Raw は無視** (= Raw は時間操作しない定義、 trim/cut)。 compile 時に
+    /// off-RT で除算して確定し、 render loop では掛けるだけ (RT 安全)。
+    pub stretch_ratio: f64,
     /// compile 時に使われた base bpm。 Repitch mode の tempo ratio (= current
     /// / nominal) 計算に使う。 SongTempo curve が無い song は `song.bpm` と
     /// 一致するが、 ある song でも nominal は constant `song.bpm` (= base)。
@@ -270,6 +278,16 @@ pub fn compile_audio_schedule(
                     engine_sample_rate,
                     event.pitch_semitones,
                 );
+                // FIXME #61: clip time-stretch 量 = source native 長 / event 配置長
+                // (秒で比較、 engine SR に依らない)。 nominal bpm 基準で固定し、
+                // tempo-follow (current/nominal) とは render loop で乗算合成する。
+                // trim では source 窓と event 長が lockstep するので比 ≈ 1.0。
+                let stretch_ratio = stretch_ratio_for(
+                    event.source_end_frames.saturating_sub(event.source_start_frames),
+                    buffer.sample_rate,
+                    event.event_length_beats,
+                    song.bpm,
+                );
                 let gain_lin = 10f32.powf(event.gain_db / 20.0);
                 if event.muted {
                     continue;
@@ -293,6 +311,7 @@ pub fn compile_audio_schedule(
                     gain_lin,
                     pan: event.pan.clamp(-1.0, 1.0),
                     pitch_ratio,
+                    stretch_ratio,
                     nominal_bpm: song.bpm,
                     fade_in_beats: event.fade_in_beats.max(0.0),
                     fade_out_beats: event.fade_out_beats.max(0.0),
@@ -394,7 +413,10 @@ pub fn render_audio_events(
             1.0
         };
         let effective_pitch_ratio = match event.stretch_mode {
-            StretchMode::Repitch => event.pitch_ratio * tempo_ratio,
+            // FIXME #61: Repitch (tape 式) は clip 長 stretch も再生速度に乗る
+            // (= pitch も一緒に変わる)。 Raw は stretch_ratio を無視 (= 時間操作
+            // しない定義、 native rate で trim/cut)。
+            StretchMode::Repitch => event.pitch_ratio * tempo_ratio * event.stretch_ratio,
             _ => event.pitch_ratio,
         };
 
@@ -481,6 +503,9 @@ pub fn render_audio_events(
             let (s_l, s_r) = match event.stretch_mode {
                 StretchMode::Stretch => granular_sample_at(
                     event_local,
+                    // FIXME #61: clip 長 stretch を tempo-follow と乗算合成。
+                    // grain hop が stretch_ratio で伸縮 → source を event 長に
+                    // 充填 (= pitch 保持の time-stretch、 ピッチ保持が既定)。
                     // Phase 5 follow-up (click 抑制): per-event の instant
                     // tempo_ratio ではなく LP smoothed 版を渡す。 nominal_bpm
                     // == song.bpm の前提下で `granular_tempo_smoothed` =
@@ -489,7 +514,7 @@ pub fn render_audio_events(
                     // life (= ~2*HOP samples) 内での source pos jump が
                     // 小さくなる (= click 振幅低減)。 完全 click-free には
                     // per-event grain-trigger lock-in が必要 (= 別 phase)。
-                    granular_tempo_smoothed,
+                    granular_tempo_smoothed * event.stretch_ratio,
                     l_plane,
                     r_plane,
                     event.source_start_frames,
@@ -499,7 +524,8 @@ pub fn render_audio_events(
                 ),
                 StretchMode::Slice => slice_sample_at(
                     event_local,
-                    tempo_ratio,
+                    // FIXME #61: slice 配置にも clip 長 stretch を合成。
+                    tempo_ratio * event.stretch_ratio,
                     l_plane,
                     r_plane,
                     event.source_start_frames,

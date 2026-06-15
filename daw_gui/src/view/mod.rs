@@ -5,6 +5,7 @@ pub mod audio_editor;
 pub mod bottom_panel;
 pub mod dirty_guard_modal;
 pub mod export_overlay;
+pub mod export_range_modal;
 pub mod font_picker;
 pub mod load_overlay;
 pub mod mixer_strips;
