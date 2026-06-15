@@ -71,6 +71,31 @@ pub fn pitch_ratio_for(
     }
 }
 
+/// FIXME #61 (clip time-stretch): clip 伸縮量 = source の native 再生長 (秒) /
+/// event の配置長 (秒、 nominal bpm 基準) の比。 `1.0` で trim 相当 (= source を
+/// そのまま native rate で再生)、 `< 1.0` で event slot の方が長い → source を
+/// 引き伸ばす (slow)、 `> 1.0` で event slot が短い → 詰める (fast)。 engine SR に
+/// 依らない (秒で比較するので source SR ≠ engine SR でも一意)。 退化入力
+/// (SR/bpm/長さ 0) は `1.0` (= 伸縮なし) を返す defensive。 compile 時 (off-RT) に
+/// 1 回だけ呼び、 render loop では結果を掛けるだけにする。
+#[inline]
+pub fn stretch_ratio_for(
+    native_frames: u64,
+    source_sample_rate: u32,
+    event_length_beats: f64,
+    bpm: f32,
+) -> f64 {
+    if source_sample_rate == 0 || bpm <= 0.0 || event_length_beats <= 0.0 || native_frames == 0 {
+        return 1.0;
+    }
+    let native_secs = native_frames as f64 / f64::from(source_sample_rate);
+    let event_secs = event_length_beats * 60.0 / f64::from(bpm);
+    if event_secs <= 1e-9 {
+        return 1.0;
+    }
+    native_secs / event_secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +184,45 @@ mod tests {
         // Defensive: engine_sr=0 で divide-by-zero しない (= sr_factor=1.0)。
         let r = pitch_ratio_for(StretchMode::Raw, 48_000, 0, 0.0);
         assert!((r - 1.0).abs() < 1e-9);
+    }
+
+    // ---- stretch_ratio_for (FIXME #61) ----
+
+    #[test]
+    fn stretch_ratio_native_equals_event_is_unity() {
+        // 1 秒の source (48k) を 120bpm で 2 拍 (= 1 秒) に置く → trim 相当、 比 1.0。
+        let r = stretch_ratio_for(48_000, 48_000, 2.0, 120.0);
+        assert!((r - 1.0).abs() < 1e-9, "got {r}");
+    }
+
+    #[test]
+    fn stretch_ratio_longer_event_slows_source() {
+        // 1 秒の source を 2 秒分 (= 4 拍 @120bpm) の slot に伸ばす → source は
+        // 半速で進む → 比 0.5。
+        let r = stretch_ratio_for(48_000, 48_000, 4.0, 120.0);
+        assert!((r - 0.5).abs() < 1e-9, "got {r}");
+    }
+
+    #[test]
+    fn stretch_ratio_shorter_event_speeds_source() {
+        // 1 秒の source を 0.5 秒分 (= 1 拍 @120bpm) の slot に詰める → 倍速 → 比 2.0。
+        let r = stretch_ratio_for(48_000, 48_000, 1.0, 120.0);
+        assert!((r - 2.0).abs() < 1e-9, "got {r}");
+    }
+
+    #[test]
+    fn stretch_ratio_independent_of_engine_sr() {
+        // source SR が違っても秒で比較するので比は同じ (24k source、 1 秒 = 24000
+        // frames を 1 秒 slot へ)。
+        let r = stretch_ratio_for(24_000, 24_000, 2.0, 120.0);
+        assert!((r - 1.0).abs() < 1e-9, "got {r}");
+    }
+
+    #[test]
+    fn stretch_ratio_degenerate_is_unity() {
+        assert!((stretch_ratio_for(0, 48_000, 2.0, 120.0) - 1.0).abs() < 1e-9);
+        assert!((stretch_ratio_for(48_000, 0, 2.0, 120.0) - 1.0).abs() < 1e-9);
+        assert!((stretch_ratio_for(48_000, 48_000, 0.0, 120.0) - 1.0).abs() < 1e-9);
+        assert!((stretch_ratio_for(48_000, 48_000, 2.0, 0.0) - 1.0).abs() < 1e-9);
     }
 }

@@ -4040,10 +4040,17 @@ pub enum AppEvent {
     /// `AudioEvent.event_start_in_clip_beats` / `source_start_frames` /
     /// `event_length_beats` を追従させる (Bitwig spec §3.2)。 gui_01
     /// `ResizeClipDelta` の `next_start` / `next_len` 両方をそのまま流す。
+    ///
+    /// FIXME #61: `stretch == false` は **trim** (= 再生範囲を変える。 audio は
+    /// source 窓と event 長を lockstep、 MIDI は clip 長で note を gate)、
+    /// `stretch == true` は **time-stretch** (= 内容を新長さに伸縮。 audio は
+    /// source 窓固定で event 長のみ変更し render が stretch_ratio で warp、 MIDI は
+    /// note の start/length を比例 scale)。 Shift + 端 drag で `true` (Ableton 流)。
     ResizeClip {
         target: ClipRef,
         start_beat: f64,
         length: f64,
+        stretch: bool,
     },
     /// `(source_ref, to_track_id, next_start_beat)` のタプル列。
     /// to_track_id == source の track id なら同 track 内 move、 違えば
@@ -5518,8 +5525,9 @@ impl AppData {
                 target,
                 start_beat,
                 length,
+                stretch,
             } => {
-                self.resize_clip(target, start_beat, length);
+                self.resize_clip(target, start_beat, length, stretch);
             }
             AppEvent::SetClipPositions(entries) => {
                 self.set_clip_positions(&entries);
@@ -14152,17 +14160,24 @@ impl AppData {
     /// 負方向に動かすのは安全でない (source 開始フレームを超えると
     /// 配列範囲外) ので、 単純な後方スライドのみ。
     ///
-    /// 右端 trim (delta_start == 0): 既存挙動 = length_beats を縮め、
-    /// audio event を new_length_beats でクランプ。
+    /// 右端 trim (delta_start == 0): length_beats を変え、 audio event は
+    /// `source_end_frames` を event 長に **lockstep** させる (FIXME #61。 旧実装は
+    /// event 長を clamp するだけで source 窓を動かさず、 波形が clip 幅に
+    /// rubber-band されて「見た目だけ伸縮・音は range」 という矛盾になっていた)。
     ///
-    /// Phase 2 PR4 では Raw mode 前提で source_start_frames 計算に
-    /// source.sample_rate * 60 / song.bpm を使う (= Repitch 中の左端 trim
-    /// は pitch_ratio 補正が要るが将来 PR スコープ)。
-    fn resize_clip(&mut self, target: ClipRef, new_start_beat: f64, new_length_beats: f64) {
+    /// FIXME #61: `stretch == true` (Shift + 端 drag) は trim ではなく
+    /// **time-stretch** (= 内容を新 clip 長に伸縮)。 `stretch_clip_content` 参照。
+    fn resize_clip(
+        &mut self,
+        target: ClipRef,
+        new_start_beat: f64,
+        new_length_beats: f64,
+        stretch: bool,
+    ) {
         let new_length_beats = new_length_beats.max(0.0625);
         let new_start_beat = new_start_beat.max(0.0);
         let bpm = self.song.bpm.max(1.0) as f64;
-        let (content_id, prev_start_beat) = {
+        let (content_id, prev_start_beat, prev_length_beats) = {
             let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
                 return;
             };
@@ -14170,66 +14185,223 @@ impl AppData {
                 return;
             };
             let prev_start_beat = clip.start_beat;
+            let prev_length_beats = clip.length_beats;
             clip.start_beat = new_start_beat;
             clip.length_beats = new_length_beats;
-            (clip.content_id, prev_start_beat)
+            (clip.content_id, prev_start_beat, prev_length_beats)
         };
         let delta_start = new_start_beat - prev_start_beat;
 
-        // Snapshot の per-source sample_rate (event ごとに lookup できる
-        // よう immutable borrow を先に切る)。 Phase 2 PR4 は Raw mode 前提。
-        let audio_sources = self.song.audio_sources.clone();
+        // FIXME #61: Shift + 端 drag = time-stretch。 content を新 clip 長に
+        // 伸縮し (audio は source 窓固定で event 長変更 + Raw→Stretch 昇格、
+        // MIDI は note を比例 scale)、 trim とは別経路で処理する。
+        if stretch {
+            self.stretch_clip_content(
+                target,
+                content_id,
+                prev_start_beat,
+                prev_length_beats,
+                new_start_beat,
+                new_length_beats,
+            );
+            self.sync_song_to_plugin_host();
+            return;
+        }
 
+        // ---- trim (= 再生範囲を変える) ----
+        // Snapshot の per-source metadata (event ごとに lookup できるよう
+        // immutable borrow を先に切る)。
+        let audio_sources = self.song.audio_sources.clone();
         if let Some(ClipContent::Audio(audio)) = self.song.clip_contents.get_mut(&content_id) {
             for event in &mut audio.events {
-                if delta_start > 0.0 {
-                    // 左端 trim: event を delta_start だけ手前にずらして
-                    // 絶対位置を維持する。 結果が負なら event の左端を
-                    // 削る (source_start_frames を進める)。
-                    let new_evt_start = event.event_start_in_clip_beats - delta_start;
-                    if new_evt_start >= 0.0 {
-                        event.event_start_in_clip_beats = new_evt_start;
-                    } else {
-                        let chopped_beats = -new_evt_start;
-                        let source_sr = audio_sources
-                            .get(&event.source_id)
-                            .map(|s| s.sample_rate as f64)
-                            .unwrap_or(48000.0);
-                        let chopped_samples =
-                            (chopped_beats * source_sr * 60.0 / bpm).max(0.0) as u64;
-                        event.event_start_in_clip_beats = 0.0;
-                        event.event_length_beats =
-                            (event.event_length_beats - chopped_beats).max(0.0);
-                        event.source_start_frames = event
-                            .source_start_frames
-                            .saturating_add(chopped_samples)
-                            .min(event.source_end_frames);
-                    }
-                } else if delta_start < 0.0 {
-                    // 左端を伸ばした: event を後方スライド。 source は
-                    // 触らない (= 追加範囲は無音、 §3.2 に合致)。
-                    event.event_start_in_clip_beats -= delta_start;
-                }
-                // 右端 trim 相当の clamp (delta_start のいずれかでも適用)
-                let max_event_len =
-                    (new_length_beats - event.event_start_in_clip_beats).max(0.0);
-                if event.event_length_beats > max_event_len {
-                    event.event_length_beats = max_event_len;
-                }
+                Self::trim_audio_event(
+                    event,
+                    delta_start,
+                    prev_length_beats,
+                    new_length_beats,
+                    bpm,
+                    &audio_sources,
+                );
             }
         }
 
         // FIXME #6: overlay clip (image / video / text) は「clip 長 = 表示長」が
-        // 不変条件。 上の Audio 分岐は overlay event を触らないので、 clip を
-        // 伸ばしただけだと event 長が据え置かれ、 clip 範囲内でも event 範囲を
-        // 抜けて途中で消える。 当該 content の単一/末尾 event を新 clip 長まで
-        // extend する (extend-only / idempotent / linked clip 安全、 load 修復の
-        // `ensure_overlay_event_coverage` と同一ロジック)。
+        // 不変条件。 Audio/Midi では no-op、 overlay の末尾 event だけ新 clip 長
+        // まで extend する (extend-only / idempotent / linked clip 安全)。
         if let Some(content) = self.song.clip_contents.get_mut(&content_id) {
             content.ensure_event_covers_clip(new_length_beats);
         }
 
         self.sync_song_to_plugin_host();
+    }
+
+    /// FIXME #61: trim (= 再生範囲を変える) の 1 audio event 分の追従。 source 窓
+    /// (`source_start/end_frames`) と event 長 (`event_length_beats`) を
+    /// **lockstep** させる (= 現在の frames-per-beat 比を保ったまま窓を動かす)。
+    /// これで (a) 右端を縮めると source_end も縮んで波形が crop 表示になり、
+    /// (b) 左端の出し入れで source_start が往復し、 「波形は伸縮するのに音は
+    /// range だけ変わる」 という #61 の矛盾が解消する (stretch = 比を変える、 とは
+    /// 別物)。 比は event の現値から取るので Raw でも stretch 済 event でも正しい。
+    fn trim_audio_event(
+        event: &mut AudioEvent,
+        delta_start: f64,
+        prev_length_beats: f64,
+        new_length_beats: f64,
+        bpm: f64,
+        sources: &std::collections::HashMap<common::model::AudioSourceId, common::model::AudioSource>,
+    ) {
+        let source = sources.get(&event.source_id);
+        let source_frames = source.map_or(u64::MAX, |s| s.frames);
+        let source_sr = source.map_or(48_000.0, |s| f64::from(s.sample_rate));
+        // 現在の source 窓 / event 長 = frames-per-beat (= trim で保つ比)。
+        // 退化 (0 長 / 0 窓) は native (Raw) rate に fallback。
+        let orig_len = event.event_length_beats;
+        let orig_span = event
+            .source_end_frames
+            .saturating_sub(event.source_start_frames);
+        let fpb = if orig_len > 1e-9 && orig_span > 0 {
+            orig_span as f64 / orig_len
+        } else {
+            source_sr * 60.0 / bpm
+        }
+        .max(1e-9);
+        // この event が clip 右端まで届いているか (= clip の右境界を所有するか)。
+        // 多 event clip で、 clip を伸ばしたとき「右端を所有する event だけ」 を
+        // 伸ばし、 中間 event は長さ据え置き (clip を縮めたときの cut は両者共通)。
+        let reached_end = event.event_start_in_clip_beats + orig_len >= prev_length_beats - 1e-6;
+
+        // --- 左端 ---
+        if delta_start > 0.0 {
+            // 左端を右へ: 絶対位置維持で event_start を手前に。 越えたら head chop。
+            let new_evt_start = event.event_start_in_clip_beats - delta_start;
+            if new_evt_start >= 0.0 {
+                event.event_start_in_clip_beats = new_evt_start;
+            } else {
+                let chopped = -new_evt_start;
+                let chopped_frames = (chopped * fpb).max(0.0) as u64;
+                event.event_start_in_clip_beats = 0.0;
+                event.source_start_frames = event
+                    .source_start_frames
+                    .saturating_add(chopped_frames)
+                    .min(event.source_end_frames);
+            }
+        } else if delta_start < 0.0 {
+            if event.event_start_in_clip_beats <= 1e-9 {
+                // 左端を左へ (spanning event): source head を再露出 (source_start
+                // を戻す)、 source 先頭で頭打ち。 足りない分は無音前置きとして
+                // event をスライド (源より手前は無音)。
+                let reveal = -delta_start;
+                let reveal_frames = (reveal * fpb).max(0.0) as u64;
+                let actual_frames = reveal_frames.min(event.source_start_frames);
+                event.source_start_frames -= actual_frames;
+                let remainder = reveal - actual_frames as f64 / fpb;
+                if remainder > 1e-9 {
+                    event.event_start_in_clip_beats += remainder;
+                }
+            } else {
+                // 前方タイル event は単純後方スライド (source 不変)。
+                event.event_start_in_clip_beats -= delta_start;
+            }
+        }
+
+        // --- 右端: source_end を event 長に lockstep ---
+        // 右端を所有する event は clip 長まで充填 (grow/shrink)、 中間 event は
+        // 長さ据え置き (ただし clip を縮めたら cut)。 いずれも source_end は
+        // 結果長に lockstep するので波形は crop 表示になる (#61)。
+        let max_event_len = (new_length_beats - event.event_start_in_clip_beats).max(0.0);
+        let avail_beats =
+            source_frames.saturating_sub(event.source_start_frames) as f64 / fpb;
+        let desired_len = if reached_end {
+            max_event_len
+        } else {
+            orig_len.min(max_event_len)
+        };
+        let target_len = desired_len.min(avail_beats);
+        event.event_length_beats = target_len;
+        let span_frames = (target_len * fpb).max(0.0) as u64;
+        event.source_end_frames = event
+            .source_start_frames
+            .saturating_add(span_frames)
+            .min(source_frames);
+    }
+
+    /// FIXME #61: Shift + 端 drag = time-stretch。 clip 内容を新 clip 長に伸縮する。
+    /// audio は source 窓 (`source_start/end_frames`) を **固定**して event 長のみ
+    /// 変え (engine が `stretch_ratio = native/event 長` で warp 再生)、 Raw は
+    /// pitch 保持の `Stretch` (granular) へ昇格 (= ピッチ保持が既定)。 MIDI は
+    /// note の `start_beat` / `duration_beats` を比例 scale。 共有 content は fork
+    /// してから伸縮し linked siblings (= 別 length) を巻き込まない。 pivot は
+    /// 固定端 (右端 drag = 左端固定 / 左端 drag = 右端固定)。
+    fn stretch_clip_content(
+        &mut self,
+        target: ClipRef,
+        content_id: common::model::ContentId,
+        prev_start: f64,
+        prev_len: f64,
+        new_start: f64,
+        new_len: f64,
+    ) {
+        if prev_len <= 1e-9 || new_len <= 1e-9 {
+            return;
+        }
+        // 共有 content は fork してから伸縮 (siblings の length と無関係)。
+        let content_id = if self.song.clip_content_refcount(content_id) > 1 {
+            let new_id = self.song.fork_content(content_id);
+            if let Some(clip) = self
+                .song
+                .tracks
+                .get_mut(target.track as usize)
+                .and_then(|t| t.clips.get_mut(target.clip as usize))
+            {
+                clip.content_id = new_id;
+            }
+            new_id
+        } else {
+            content_id
+        };
+
+        match self.song.clip_contents.get_mut(&content_id) {
+            Some(ClipContent::Audio(audio)) => {
+                for e in &mut audio.events {
+                    let (s, l) = stretch_remap(
+                        prev_start,
+                        prev_len,
+                        new_start,
+                        new_len,
+                        e.event_start_in_clip_beats,
+                        e.event_length_beats,
+                    );
+                    e.event_start_in_clip_beats = s;
+                    e.event_length_beats = l;
+                    // ピッチ保持を既定: Raw (= 時間操作しない定義) は Stretch
+                    // (granular) へ昇格。 既に Repitch/Stretch/Slice なら維持。
+                    if e.stretch_mode == common::model::StretchMode::Raw {
+                        e.stretch_mode = common::model::StretchMode::Stretch;
+                    }
+                    // source 窓は固定 = これが stretch の本質。
+                }
+            }
+            Some(ClipContent::Midi(midi)) => {
+                for n in &mut midi.notes {
+                    let (s, l) = stretch_remap(
+                        prev_start,
+                        prev_len,
+                        new_start,
+                        new_len,
+                        n.start_beat,
+                        n.duration_beats,
+                    );
+                    n.start_beat = s;
+                    n.duration_beats = l;
+                }
+            }
+            _ => {
+                // overlay / automation は stretch 概念なし → 長さ追従のみ。
+                if let Some(content) = self.song.clip_contents.get_mut(&content_id) {
+                    content.ensure_event_covers_clip(new_len);
+                }
+            }
+        }
     }
 
     /// 共有コピー (D shortcut): 末尾直後 (start+length) に同サイズの clip を
@@ -18922,6 +19094,155 @@ mod image_drop_target_tests {
         // track が 0 本 → 何を指しても新規 track。
         assert_eq!(resolve_image_drop_target(Some(0), 0), None);
         assert_eq!(resolve_image_drop_target(None, 0), None);
+    }
+}
+
+/// FIXME #61: time-stretch で clip-local の (start, len) を新 clip 長へ写像する
+/// ピュア関数。 固定端 pivot (右端 drag = 左端固定 / 左端 drag = 右端固定) で
+/// 絶対 beat 上を `factor = new_len/prev_len` で scale し、 新 clip-local へ戻す。
+/// `prev_len <= 0` は identity (退化保護)。 audio event / MIDI note 共通。
+fn stretch_remap(
+    prev_start: f64,
+    prev_len: f64,
+    new_start: f64,
+    new_len: f64,
+    local_start: f64,
+    local_len: f64,
+) -> (f64, f64) {
+    if prev_len <= 1e-9 {
+        return (local_start, local_len);
+    }
+    let factor = new_len / prev_len;
+    // start が動いた = 左端 drag (右端固定)、 不動 = 右端 drag (左端固定)。
+    let pivot_abs = if (new_start - prev_start).abs() > 1e-9 {
+        prev_start + prev_len
+    } else {
+        prev_start
+    };
+    let old_abs = prev_start + local_start;
+    let new_abs = pivot_abs + (old_abs - pivot_abs) * factor;
+    ((new_abs - new_start).max(0.0), (local_len * factor).max(0.0))
+}
+
+#[cfg(test)]
+mod stretch_remap_tests {
+    use super::stretch_remap;
+
+    #[test]
+    fn right_edge_stretch_scales_from_left() {
+        // clip [0,4] を右端 drag で [0,8] (2x)。 左端固定。
+        // spanning event (0,4) → (0,8)。
+        let (s, l) = stretch_remap(0.0, 4.0, 0.0, 8.0, 0.0, 4.0);
+        assert!((s - 0.0).abs() < 1e-9 && (l - 8.0).abs() < 1e-9, "got ({s},{l})");
+        // 中間 event (2,1) → start 4 (= 2*2)、 len 2。
+        let (s, l) = stretch_remap(0.0, 4.0, 0.0, 8.0, 2.0, 1.0);
+        assert!((s - 4.0).abs() < 1e-9 && (l - 2.0).abs() < 1e-9, "got ({s},{l})");
+    }
+
+    #[test]
+    fn left_edge_stretch_scales_from_right() {
+        // clip [0,4] を左端 drag で [2,2] (start +2, len 0.5x)。 右端固定。
+        // spanning event (0,4) は新 clip-local [0,2] を覆う。
+        let (s, l) = stretch_remap(0.0, 4.0, 2.0, 2.0, 0.0, 4.0);
+        assert!((s - 0.0).abs() < 1e-9 && (l - 2.0).abs() < 1e-9, "got ({s},{l})");
+        // 元 clip 末尾 (4) にあった点は新 clip 末尾 (local 2) へ。
+        let (s, _l) = stretch_remap(0.0, 4.0, 2.0, 2.0, 4.0, 0.0);
+        assert!((s - 2.0).abs() < 1e-9, "got {s}");
+    }
+
+    #[test]
+    fn degenerate_prev_len_is_identity() {
+        let (s, l) = stretch_remap(0.0, 0.0, 0.0, 4.0, 1.5, 2.0);
+        assert!((s - 1.5).abs() < 1e-9 && (l - 2.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod trim_audio_event_tests {
+    use super::AppData;
+    use common::model::{AudioEvent, AudioSource, AudioSourcePath};
+    use std::collections::HashMap;
+
+    // 48k / 120bpm → native 24000 frames/beat。 ratio=1 (Raw 相当) の event を組む。
+    const SR: u32 = 48_000;
+    const BPM: f64 = 120.0;
+    const FPB: u64 = 24_000; // SR*60/BPM
+
+    fn sources(frames: u64) -> HashMap<u32, AudioSource> {
+        let mut m = HashMap::new();
+        m.insert(
+            1,
+            AudioSource {
+                path: AudioSourcePath::Generated { id: 1 },
+                sample_rate: SR,
+                channels: 2,
+                frames,
+                original_bpm: None,
+                root_key: None,
+            },
+        );
+        m
+    }
+
+    fn event(start: f64, len: f64, src_start: u64, src_end: u64) -> AudioEvent {
+        AudioEvent {
+            source_id: 1,
+            event_start_in_clip_beats: start,
+            event_length_beats: len,
+            source_start_frames: src_start,
+            source_end_frames: src_end,
+            ..AudioEvent::default()
+        }
+    }
+
+    #[test]
+    fn right_trim_shrink_locksteps_source_end() {
+        // clip [0,4] の spanning event を [0,2] に右端 trim → source_end も半分に
+        // (= 波形が crop 表示になる、 #61 の核心)。
+        let mut e = event(0.0, 4.0, 0, 4 * FPB);
+        AppData::trim_audio_event(&mut e, 0.0, 4.0, 2.0, BPM, &sources(4 * FPB));
+        assert!((e.event_length_beats - 2.0).abs() < 1e-9);
+        assert_eq!(e.source_start_frames, 0);
+        assert_eq!(e.source_end_frames, 2 * FPB);
+    }
+
+    #[test]
+    fn right_trim_grow_reveals_more_source() {
+        // 8 拍分の source の前半 4 拍だけ見せている event を 6 拍に伸ばす → 6 拍露出。
+        let mut e = event(0.0, 4.0, 0, 4 * FPB);
+        AppData::trim_audio_event(&mut e, 0.0, 4.0, 6.0, BPM, &sources(8 * FPB));
+        assert!((e.event_length_beats - 6.0).abs() < 1e-9);
+        assert_eq!(e.source_end_frames, 6 * FPB);
+    }
+
+    #[test]
+    fn right_trim_grow_caps_at_source_end() {
+        // source が 4 拍しか無いのに 6 拍へ → source 末尾で頭打ち、 残りは無音。
+        let mut e = event(0.0, 4.0, 0, 4 * FPB);
+        AppData::trim_audio_event(&mut e, 0.0, 4.0, 6.0, BPM, &sources(4 * FPB));
+        assert!((e.event_length_beats - 4.0).abs() < 1e-9);
+        assert_eq!(e.source_end_frames, 4 * FPB);
+    }
+
+    #[test]
+    fn left_trim_advances_source_start_keeps_source_end() {
+        // clip [0,4] を [1,3] へ左端 trim (start +1, len -1)。 右端固定。
+        let mut e = event(0.0, 4.0, 0, 4 * FPB);
+        AppData::trim_audio_event(&mut e, 1.0, 4.0, 3.0, BPM, &sources(4 * FPB));
+        assert_eq!(e.event_start_in_clip_beats, 0.0);
+        assert!((e.event_length_beats - 3.0).abs() < 1e-9);
+        assert_eq!(e.source_start_frames, FPB); // 頭を 1 拍分 chop
+        assert_eq!(e.source_end_frames, 4 * FPB); // 末尾は不変
+    }
+
+    #[test]
+    fn left_trim_regrow_reveals_head_again() {
+        // 一旦左端を 1 拍 chop した状態 (start_frame=FPB) から、 左端を左へ 1 拍
+        // 戻す (delta_start=-1) と source head が再露出する。
+        let mut e = event(0.0, 3.0, FPB, 4 * FPB);
+        AppData::trim_audio_event(&mut e, -1.0, 3.0, 4.0, BPM, &sources(4 * FPB));
+        assert_eq!(e.source_start_frames, 0); // 頭が戻る
+        assert!((e.event_length_beats - 4.0).abs() < 1e-9);
     }
 }
 
