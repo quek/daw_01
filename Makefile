@@ -91,8 +91,8 @@ clean:
 # 使い方: make rm-worktree NAME=fixme-64-...   (未マージ/dirty は拒否。FORCE=1 で強制)
 rm-worktree:
 	@[ -n "$(NAME)" ] || { echo "usage: make rm-worktree NAME=<worktree-name> [FORCE=1]"; exit 1; }
-	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cleanup_worktree.ps1 -Name "$(NAME)" $(if $(FORCE),-Force,)
+	bash scripts/cleanup_worktree.sh --name "$(NAME)" $(if $(FORCE),--force,)
 
 # マージ済み (自分の commit が全部 main に入っている) worktree を全部削除する。
 rm-worktrees-merged:
-	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cleanup_worktree.ps1 -All
+	bash scripts/cleanup_worktree.sh --all
