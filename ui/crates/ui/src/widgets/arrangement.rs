@@ -1056,8 +1056,18 @@ pub struct ArrangementStyle {
     pub clip_border: Color,
     pub clip_border_w: f32,
     pub clip_radius: f32,
+    /// FIXME #73: clip / automation point の **drag ゴースト** (drag 中の半透明
+    /// プレビュー) のハイライト塗り色。 かつては選択中 clip 本体の fill にも使って
+    /// いたが、 黄色など同系色の clip だと「選択 = 黄塗り」 が clip 本来の色と衝突して
+    /// 選択状態が判別できなかった (#73)。 選択表示は fill を潰さず `push_selection_ring`
+    /// の 2 重リング (明 + 暗) で示すようにし、 この色は drag ゴースト専用に絞った。
     pub clip_selected_fill: Color,
+    /// 選択リングの **外側 (明)** 線。 暗い lane 背景に対して光る。
     pub clip_selected_border: Color,
+    /// 選択リングの **内側 (暗)** 線 (FIXME #73)。 黄 / 白など明るい fill に対して
+    /// コントラストする。 `clip_selected_border` (明) と対で、 fill 色に依らず
+    /// どんな clip でも選択枠が視認できる 2 重リングを成す。
+    pub clip_selected_border_inner: Color,
     pub clip_selected_border_w: f32,
     pub clip_text_color: Color,
     /// M14 Phase 89 (daw_01 #060): auto-contrast が「暗い文字」を選んだときの色 (明るい fill 上)。
@@ -1343,6 +1353,8 @@ impl Default for ArrangementStyle {
             clip_radius: 3.0,
             clip_selected_fill: Color::rgb(1.0, 0.85, 0.30),
             clip_selected_border: Color::rgb(1.0, 1.0, 1.0),
+            // FIXME #73: 選択リング内側の暗線。 明るい fill (黄 / 白) でも枠が見える。
+            clip_selected_border_inner: Color::rgb(0.06, 0.06, 0.09),
             clip_selected_border_w: 2.0,
             clip_text_color: Color::rgb(0.95, 0.95, 0.97),
             // M14 Phase 89 (daw_01 #060): auto-contrast の暗文字プール (旧 selected ハードコード値)。
@@ -3212,12 +3224,13 @@ fn draw_section_band<M: ?Sized + 'static>(
 ) {
     let fill = Color::rgb(color_rgb[0], color_rgb[1], color_rgb[2]);
     push_filled_rect(hctx, r, fill);
-    let (border_color, border_w) = if selected {
-        (style.clip_selected_border, style.clip_selected_border_w)
+    // FIXME #73: 選択帯は fill 色に依らず見える 2 重リング (clip と同 idiom、 帯は
+    // 角丸 0)。 非選択は neutral な 1px 枠。 これで白 / 黄の section でも選択が判別できる。
+    if selected {
+        push_selection_ring(hctx, r, style, 0.0, Some(r));
     } else {
-        (style.clip_border, 1.0)
-    };
-    push_section_border(hctx, r, border_color, border_w);
+        push_section_border(hctx, r, style.clip_border, 1.0);
+    }
     if r.w > 8.0 && r.h > style.clip_text_size + 2.0 && !name.is_empty() {
         let text_color = clip_text_color_for(style, fill, style.arranger_lane_bg);
         hctx.push_text(GlyphArea {
@@ -3250,6 +3263,47 @@ fn push_section_border<M: ?Sized + 'static>(
         radius: [0.0; 4],
         clip_rect: Some(r),
     });
+}
+
+/// FIXME #73: 選択枠を fill 色に依存せず描く 2 重リング。 clip / video clip /
+/// section 帯の選択表示に共通で使う。 呼び出し側は fill を **clip 本来の色**で
+/// 描き、 ここは枠だけを重ねる: 外側の明線 (`clip_selected_border`) が暗い lane
+/// 背景に、 内側の暗線 (`clip_selected_border_inner`) が黄 / 白など明るい fill に
+/// 必ずコントラストするので、 どんな clip 色 (選択色と同色を含む) でも選択を
+/// 判別できる。 `radius` は枠の角丸 (clip = `clip_radius`、 section 帯 = 0)。
+/// rect 内側に描く SDF ボーダー (rect.wgsl) なので、 外側リングを `r`、 内側
+/// リングを `r` を線幅ぶん inset した矩形に描けば 2 本が隣接して並ぶ。
+fn push_selection_ring<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    r: Rect,
+    style: &ArrangementStyle,
+    radius: f32,
+    clip_rect: Option<Rect>,
+) {
+    let w = style.clip_selected_border_w;
+    // 外側: 明線 (暗い lane 背景に対して光る)。
+    hctx.push_rect(RectCommand {
+        rect: r,
+        fill: Color::TRANSPARENT,
+        border: style.clip_selected_border,
+        border_width: w,
+        radius: [radius; 4],
+        clip_rect,
+    });
+    // 内側: 暗線 (黄 / 白など明るい fill に対してコントラスト)。 r を線幅ぶん
+    // inset し角丸も縮める。 inset が潰れる極小 clip では外側リングのみ。
+    let inner = Rect { x: r.x + w, y: r.y + w, w: r.w - w * 2.0, h: r.h - w * 2.0 };
+    if inner.w > 0.0 && inner.h > 0.0 {
+        let ir = (radius - w).max(0.0);
+        hctx.push_rect(RectCommand {
+            rect: inner,
+            fill: Color::TRANSPARENT,
+            border: style.clip_selected_border_inner,
+            border_width: w,
+            radius: [ir; 4],
+            clip_rect,
+        });
+    }
 }
 
 /// M14 Phase 127 (#105): drag 中対象 section の preview `(start, len)` を返す (Move/Resize。 非対象 /
@@ -3369,10 +3423,11 @@ fn draw_sections_lane<M: ?Sized + 'static>(
 /// M14 Phase 72 (daw_01 #044): video track の clip 描画 (audio path とは別 helper)。
 ///
 /// 描画順:
-/// 1. base fill: selected なら `clip_selected_fill`、 そうでなければ `clip.color`
-///    (未指定 None なら `video_clip_loading` = letterbox の黒帯背景としても兼用)
+/// 1. base fill: 常に `clip.color` (未指定 None なら `video_clip_loading` =
+///    letterbox の黒帯背景としても兼用)。 FIXME #73: 選択でも fill は潰さない。
 /// 2. thumbnail = Some なら aspect-fit (黒帯 letterbox) で texture overlay (`HeavyCtx::push_textured_quad`)
 /// 3. name + (share clip なら) link glyph 描画 (`draw_clip_label`、 audio 経路と共通)
+/// 4. selected なら `push_selection_ring` の 2 重リング (明 + 暗) を最後に重ねる (FIXME #73)
 ///
 /// M14 Phase 108 (daw_01 #080): share マーク (⇌) は「content 共有」 の意味で track kind と直交するため、
 /// video clip でも `share_group_color.is_some()` で link glyph を描く。
@@ -3393,18 +3448,14 @@ fn draw_video_clip<M: ?Sized + 'static>(
     // letterbox / loading 背景 `video_clip_loading` を使う (= 既存の非 share video clip と互換)。
     // thumbnail があればその上に aspect-fit で texture を重ねる (fill は letterbox の黒帯として残る)。
     // リンク識別は ⇌ glyph + #068 hover 強調が担う (track kind に依らず share マークが出る、 #080 不変)。
-    let (fill, border, border_w) = if selected {
-        (
-            style.clip_selected_fill,
-            style.clip_selected_border,
-            style.clip_selected_border_w,
-        )
+    // FIXME #73: fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
+    // `push_selection_ring` の 2 重リングで示し、 選択時は本体 border を消して
+    // リングへ一本化する (黄 clip でも選択が判別できる)。
+    let fill = clip.color.unwrap_or(style.video_clip_loading);
+    let (border, border_w) = if selected {
+        (Color::TRANSPARENT, 0.0)
     } else {
-        (
-            clip.color.unwrap_or(style.video_clip_loading),
-            style.clip_border,
-            style.clip_border_w,
-        )
+        (style.clip_border, style.clip_border_w)
     };
     // M14 Phase 89 (daw_01 #060): 名前色は fill 輝度から auto-contrast (selected の黄 fill → 暗文字、
     // loading の暗 fill → 明文字)。 video lane bg と合成した実効色で判定 (不透明 fill は no-op、
@@ -3433,6 +3484,10 @@ fn draw_video_clip<M: ?Sized + 'static>(
     }
     // name + (share clip なら) link glyph。 thumbnail の **後** に描くので texture の上に乗る。
     draw_clip_label(hctx, r, &clip.name, has_link, text_color, style);
+    // FIXME #73: 選択枠は最後に重ねて thumbnail / label の上に乗せる。
+    if selected {
+        push_selection_ring(hctx, r, style, style.clip_radius, Some(lanes));
+    }
 }
 
 fn draw_clip<M: ?Sized + 'static>(
@@ -3459,18 +3514,14 @@ fn draw_clip<M: ?Sized + 'static>(
     // 役割を「リンク識別」 に絞り、 fill / border を一切上書きしない (= ⇌ glyph + #068 hover 強調
     // 専用)。 これにより「clip で色を選べば共有クリップ全部がその色になる」「トラックに揃えれば
     // その色になる」 が成立する (#019/#022 で hue fill が `color` を握り潰していた FIXME #8 の解消)。
-    let (fill, border, border_w) = if selected {
-        (
-            style.clip_selected_fill,
-            style.clip_selected_border,
-            style.clip_selected_border_w,
-        )
+    // FIXME #73: fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
+    // `push_selection_ring` の 2 重リングで示し、 選択時は本体 border を消して
+    // リングへ一本化する (黄 clip でも選択が判別できる)。
+    let fill = clip.color.unwrap_or(style.clip_default_fill);
+    let (border, border_w) = if selected {
+        (Color::TRANSPARENT, 0.0)
     } else {
-        (
-            clip.color.unwrap_or(style.clip_default_fill),
-            style.clip_border,
-            style.clip_border_w,
-        )
+        (style.clip_border, style.clip_border_w)
     };
     // M14 Phase 89 (daw_01 #060): 名前 + link glyph 色を fill 輝度から auto-contrast。 不透明 fill は
     // no-op、 半透明 fill (alpha < 1) は lane bg (audio lane = `style.bg`) と合成した実効色で判定する。
@@ -3488,6 +3539,10 @@ fn draw_clip<M: ?Sized + 'static>(
     // ロジックは video 経路と共通の `draw_clip_label` に集約 (M14 Phase 108、 daw_01 #080)。
     let has_link = clip.share_group_color.is_some();
     draw_clip_label(hctx, r, &clip.name, has_link, text_color, style);
+    // FIXME #73: 選択枠を最後に重ねる (label の上、 clip 本来の色 fill の上)。
+    if selected {
+        push_selection_ring(hctx, r, style, style.clip_radius, Some(lanes));
+    }
 }
 
 fn draw_clips<M: ?Sized + 'static>(
@@ -11303,8 +11358,8 @@ mod tests {
         );
     }
 
-    /// 選択中かつ active group の member は、 selection (黄塗り) が active overlay の **後** に
-    /// 描画されて優先される (#068 の「選択中 member は黄塗り優先」)。
+    /// 選択中かつ active group の member は、 selection リング (FIXME #73) が active
+    /// overlay の **後** に描画されて優先される (#068 の「選択中 member は選択枠優先」)。
     #[test]
     fn selection_fill_drawn_after_active_overlay() {
         let style = ArrangementStyle::default();
@@ -11322,8 +11377,11 @@ mod tests {
             .expect("active border rect が存在する");
         let sel_idx = rects
             .iter()
-            .position(|r| r.fill == style.clip_selected_fill)
-            .expect("selection fill rect が存在する");
+            .position(|r| {
+                r.border == style.clip_selected_border
+                    && (r.border_width - style.clip_selected_border_w).abs() < 1e-3
+            })
+            .expect("selection ring (明枠) rect が存在する");
         assert!(
             sel_idx > active_idx,
             "selection は active overlay の後 (= 上) に描画される: sel={sel_idx} active={active_idx}"
@@ -11447,8 +11505,9 @@ mod tests {
         assert_eq!(scene.iter_textures().count(), 1, "thumbnail texture を描く");
     }
 
-    /// selected な video share clip: selection 色が最優先 (fill = 黄) で、 link glyph は #022 どおり
-    /// selected でも描く。 base + selection overlay の 2 回描画で glyph は 2 個。
+    /// selected な video share clip: fill は clip 本来の色のまま、 選択は 2 重リング
+    /// (FIXME #73) で示す。 link glyph は #022 どおり selected でも描く。 base +
+    /// selection overlay の 2 回描画で glyph は 2 個。
     #[test]
     fn selected_video_share_clip_keeps_link_glyph() {
         let style = ArrangementStyle::default();
@@ -11457,8 +11516,11 @@ mod tests {
         let scene = render_video_clips_scene(vec![shared_clip(false, Some(hue))], &[key]);
 
         assert!(
-            scene.iter_rects().any(|r| r.fill == style.clip_selected_fill),
-            "selected video clip は selection 色で塗る (selection 最優先)"
+            scene.iter_rects().any(|r| {
+                r.border == style.clip_selected_border
+                    && (r.border_width - style.clip_selected_border_w).abs() < 1e-3
+            }),
+            "selected video clip は selection リング (明枠) を描く (FIXME #73)"
         );
         assert_eq!(
             link_glyph_count(&scene, &style),

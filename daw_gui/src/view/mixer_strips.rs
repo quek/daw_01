@@ -651,10 +651,19 @@ fn draw_sends_section(
                 send_idx: send_idx as u8,
             }),
         ));
+        // FIXME #72: 再生中は SendGain オートメーションの playhead 値に追従させる
+        // (volume / pan と同 idiom)。 停止中・非 automation・書き込み中は send.gain。
+        let live_gain = app.live_param_value(
+            src_track,
+            &AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
+                send_idx: send_idx as u8,
+            }),
+            send.gain,
+        );
         let knob_resp = ui.knob_at(
             ("mixer_send_knob", track_id as usize, send_idx),
             knob_rect,
-            (send.gain * 0.5).clamp(0.0, 1.0),
+            (live_gain * 0.5).clamp(0.0, 1.0),
             // double-click reset = unity (= 1.0 linear → 0.5 normalized)。
             0.5,
             "Send",
