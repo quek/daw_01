@@ -123,6 +123,12 @@ def escalate_guards(today):
         gid = rule.get("id")
         if not gid or str(rule.get("action")) != "warn":
             continue
+        if rule.get("escalate") is False:
+            # advisory / precision-limited guard: a substring-level matcher that is
+            # fine as a nudge but would over-cancel as a block (e.g. command-chaining
+            # firing on `&&` in a commit message, or confirm-before-commit cancelling
+            # every commit). Opt these out of auto warn->block escalation.
+            continue
         rec = hits.get(gid)
         if not rec:
             continue

@@ -64,6 +64,75 @@ def _oprint(text):
     sys.stdout.buffer.write(text.encode("utf-8", "replace"))
 
 
+def _mask_shell_literals(cmd):
+    """Return cmd with shell *literal* text blanked to spaces (newlines kept):
+    heredoc bodies, single/double-quoted spans, and # comments. This lets a guard
+    regex match shell-significant CODE -- the command verbs, operators and real
+    paths -- instead of DATA: commit messages, grep/--grep patterns, comments and
+    file bodies. That is what separates "INVOKE powershell" (a real violation)
+    from "MENTION powershell" (an innocent `git commit -m '...powershell...'` or
+    `git grep powershell`). Fail-open: any error returns the raw command, and
+    over-masking can only make a guard MISS (never wrongly cancel). Never raises.
+    """
+    try:
+        # pass 1: blank heredoc bodies (line-oriented)
+        lines = cmd.split("\n")
+        body = [False] * len(lines)
+        i = 0
+        while i < len(lines):
+            m = re.search(r"<<-?\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?", lines[i])
+            if m:
+                delim = m.group(1)
+                j = i + 1
+                while j < len(lines) and lines[j].strip() != delim:
+                    body[j] = True
+                    j += 1
+                i = j + 1
+                continue
+            i += 1
+        text = "\n".join((" " * len(ln)) if body[k] else ln for k, ln in enumerate(lines))
+
+        # pass 2: blank quoted spans and comments (char scan)
+        res = list(text)
+        n = len(text)
+        st = 0  # 0 normal, 1 single-quote, 2 double-quote
+        p = 0
+        while p < n:
+            c = text[p]
+            if st == 0:
+                if c == "'":
+                    st = 1
+                    res[p] = " "
+                elif c == '"':
+                    st = 2
+                    res[p] = " "
+                elif c == "#" and (p == 0 or text[p - 1] in " \t\n;&|("):
+                    while p < n and text[p] != "\n":
+                        res[p] = " "
+                        p += 1
+                    continue
+            elif st == 1:
+                if c != "\n":
+                    res[p] = " "
+                    if c == "'":
+                        st = 0
+            else:  # st == 2
+                if c == "\\" and p + 1 < n:
+                    res[p] = " "
+                    if text[p + 1] != "\n":
+                        res[p + 1] = " "
+                    p += 2
+                    continue
+                if c != "\n":
+                    res[p] = " "
+                    if c == '"':
+                        st = 0
+            p += 1
+        return "".join(res)
+    except Exception:
+        return cmd
+
+
 def main():
     raw = sys.stdin.buffer.read().decode("utf-8", "replace")
     if not raw.strip():
@@ -127,6 +196,8 @@ def main():
         field = str(rule.get("field") or "text")
         if field == "command":
             text = command
+        elif field == "command_code":
+            text = _mask_shell_literals(command)
         elif field == "file_path":
             text = file_path
         else:
@@ -137,6 +208,12 @@ def main():
         glob = rule.get("file_glob")
         if glob and not fnmatch.fnmatch(file_path_norm, str(glob)):
             continue
+
+        glob_not = rule.get("file_glob_not")
+        if glob_not:
+            gn = glob_not if isinstance(glob_not, list) else [glob_not]
+            if any(fnmatch.fnmatch(file_path_norm, str(g)) for g in gn if g):
+                continue
 
         all_pats = rule.get("all") or []
         all_pats = all_pats if isinstance(all_pats, list) else [all_pats]
