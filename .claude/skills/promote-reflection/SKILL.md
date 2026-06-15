@@ -5,7 +5,7 @@ description: |
   実際の artifact に昇格させ、行を終端状態に倒すワークフロー。
   SessionStart フックが「Required Action: AHE backlog の未処理パターンを triage」を
   出したとき、または「backlog を処理して」「reflection を昇格」「この検出パターンを skill/hook に」
-  等のとき発動。検出された再発フリクションを skill / command / memory に変換するか、
+  等のとき発動。検出された再発フリクションを guard (guards.jsonl) / skill / command / memory に変換するか、
   hook は user 承認キューに回すか、dismiss する。memory に書いて終わりにしない (= 旧ループの欠陥) 。
 allowed-tools: Read, Write, Edit, Glob, Grep
 ---
@@ -22,13 +22,13 @@ artifact** に昇格させる。旧ループは「memory に save / discard」�
 - file: `~/.claude/projects/F--dev-daw-01/ahe_backlog.md` (per-project user dir、全 worktree 共有、git 外)
 - patterns テーブル列: `id | status | sessions | target | first-seen | last-seen | last-session | pattern | notes`
 - status: `open` → `done` | `dismissed` | `needs-user`
-- **insert は reflect.ps1 が所有**。status / target / notes は人間とこの skill が所有。
-  `done` / `dismissed` は終端 = reflect.ps1 は二度と再浮上させない。
+- **insert は reflect.py が所有**。status / target / notes は人間とこの skill が所有。
+  `done` / `dismissed` は終端 = reflect.py は二度と再浮上させない。
 - `sessions >= 3` は escalated (何度も踏んでいる)。優先的に promote する。
 
 ## 手順
 
-1. **対象行を読む**。`id` と `pattern` と `target` を確認。`target` は reflect.ps1 の既定提案に
+1. **対象行を読む**。`id` と `pattern` と `target` を確認。`target` は reflect.py の既定提案に
    過ぎない。**実態に合わなければ正しい target に変える** (例: read-hotspot の既定は memory だが、
    巨大ファイルなら「分割」や「ナビ skill」が正解のこともある)。
 2. **重複確認**。既存 skill (`.claude/skills/`) / memory (`MEMORY.md`) / command (`.claude/commands/`) に
@@ -37,6 +37,25 @@ artifact** に昇格させる。旧ループは「memory に save / discard」�
 4. **行を終端させる** (必須)。`ahe_backlog.md` を Edit し、その行の `status` セルを
    `done` / `dismissed` / `needs-user` に書き換え、必要なら `notes` セルに 1 文。
    - テーブルを壊さない: セル区切り `|` の数を変えない。**notes に `|` を入れない**。
+
+### target = guard  (← 機械化できる再発の主経路。settings.json 不要・承認不要)
+- 「同じ機械的ミスを繰り返す」(= tool 入力の正規表現で表現できる) なら、**guard registry に 1 行追記する**
+  だけで能動的強制力になる。`guard_engine.py` は settings.json に登録済なので、ルール追加に
+  hook 登録編集 (classifier ブロック) は不要 = 自分で完結できる。
+- file: `~/.claude/projects/F--dev-daw-01/guards.jsonl` (1 行 1 JSON ルール、全 worktree 共有、git 外)。
+- ルール形:
+  `{"id":<slug>,"source":<feedback メモリ slug>,"tool":["Bash"]|["Edit","Write","MultiEdit"],`
+  `"field":"command"|"text"|"file_path","file_glob":<任意>,"all":[<正規表現…全 match>],`
+  `"none":[<任意・どれか match で抑制>],"action":"warn"|"block","msg":<日本語の是正文>}`
+  - `all` の正規表現はバックスラッシュを **JSON で 2 重** に (`\\s`)。追記後に
+    `python -c "import json;[json.loads(l) for l in open(PATH,encoding='utf-8') if l.strip() and not l.startswith('#')]"`
+    で全行パースを必ず確認 (printf で追記するとバックスラッシュが潰れて不正 JSON になる前科あり → Write/Edit で書く)。
+  - `block` は誤検知で tool 呼び出しを取り消すので **高精度 (複数トークン / アンカー) のときだけ**。
+    曖昧なら `warn`。warn は 3 つの異なる session で発火すると reflect.py が自動で block に昇格する。
+  - 既存 guard と重複しないか確認 (同 `source` / 同パターン)。
+- 検証: `echo '{"tool_name":"Bash","tool_input":{"command":"…"}}' | python scripts/guard_engine.py` で
+  発火 (warn=stdout / block=exit2) を目視。
+- 行 status を `done`、notes に guard id。
 
 ### target = memory
 - 一般化できる learning を `~/.claude/projects/F--dev-daw-01/memory/<type>_<slug>.md` に書く
@@ -65,11 +84,14 @@ artifact** に昇格させる。旧ループは「memory に save / discard」�
 
 ### dismiss
 - 単発ノイズ・既存でカバー済み・誤検出なら、行 status を `dismissed`、notes に理由 1 文。
-- 以後 reflect.ps1 は同 id を再浮上させない。
+- 以後 reflect.py は同 id を再浮上させない。
 
 ## 原則
-- **memory で終わらせない**。target が skill/hook/command なら必ずその artifact を作る (または
-  hook なら承認キューに載せる)。memory は target=memory のときだけ。
+- **memory で終わらせない**。target が guard/skill/hook/command なら必ずその artifact を作る (または
+  新規 hook 種別なら承認キューに載せる)。memory は target=memory のときだけ。
+- **機械化できる再発 (tool 入力パターン) は guard を最優先**。「振る舞いで直す」と言って dismiss するのは
+  旧ループの欠陥そのもの (例: ahe_backlog の cd-prefix 再発は guard 経路が無く dismiss され再発し続けた)。
+  能動ガードにすれば物理的に再発できなくなる。
 - 1 行 = 1 終端。OPEN のまま放置しない (放置すると毎 session escalated で再提示される)。
 - 関連 memory: [[feedback_verify_env_var_before_use]] (hook script を書くときの破壊操作ガード)、
   CLAUDE.md「Reflection の確認」節、`docs/plan_ahe.md`。

@@ -119,23 +119,52 @@ cargo clippy --workspace -- -D warnings
 2 系統ある:
 - **reflection 候補**（user 修正 / rework 検出）… save (memory) / discard で終端。
 - **AHE backlog**（`~/.claude/projects/F--dev-daw-01/ahe_backlog.md` の OPEN 行 = metrics から検出した
-  再発フリクション）… `/promote-reflection` skill で **skill / command / memory に昇格**、hook は user 承認キュー、
-  不要なら dismiss。**memory で終わらせない**（それが旧ループの欠陥 = 提案が actuate せず memory だけ増えた）。
-  backlog は per-project user dir、全 worktree 共有・git 外。`done` / `dismissed` は終端で再浮上しない。
+  再発フリクション）… `/promote-reflection` skill で **guard (guards.jsonl) / skill / command / memory に昇格**、
+  新規 hook 種別は user 承認キュー、不要なら dismiss。**memory で終わらせない**（それが旧ループの欠陥 =
+  提案が actuate せず memory だけ増えた）。backlog は per-project user dir、全 worktree 共有・git 外。
+  `done` / `dismissed` は終端で再浮上しない。
+
+#### Guard layer（メモリ → 能動的強制力）= 旧ループ最大の欠陥の修正
+
+feedback メモリは `<system-reminder>` の **受動的背景** として recall されるだけで「ミスの瞬間」に
+強制力を持たない（= 「メモリに書いた、でも同じミスを繰り返す」）。唯一 action-time に効くのは
+PreToolUse hook。従来はメモリを hook 化するのに bespoke スクリプト + settings.json 編集
+(classifier ブロック) が要り重すぎて actuate せず、backlog で dismiss → 再発していた
+（例: cd-prefix 再発は guard 経路が無く dismiss され続けた）。
+
+**解決 = データ駆動の汎用ガードエンジン (Python・追加依存なし・cross-platform)**:
+- `guards.jsonl`（per-project user dir、全 worktree 共有・git 外）に 1 行 1 ルール。各行は feedback
+  メモリ 1 件の能動的強制（`source` でメモリへ逆リンク = SSoT）。
+- `scripts/guard_engine.py`（PreToolUse）が全ルールを適用。**一度だけ** settings.json に登録すれば、
+  以後ガード追加は **guards.jsonl に 1 行追記するだけ**（新規スクリプトも settings 編集も承認も不要
+  = classifier ブロック回避）。これが loop 自律化の鍵。`warn`=stdout/exit0、`block`=stderr/exit2（取消）。
+- 発火は `guard_hits.jsonl` に記録 → `reflect.py` が **warn ガードが 3 つ以上の異なる session で発火したら
+  自動で warn→block に昇格**（人手 triage 不要で actuate）。
+- 正規表現 1 本で表せない security block（`check_destructive_delete.py` の per-statement 分割）は
+  code hook のまま。**pattern guard は data、logic guard は code** の分離。
 
 ループ構造（observe → reflect → **actuate** → close）:
-1. 各 tool 呼び出しを `PostToolUse` hook (`scripts/log_metric.ps1`) が metrics jsonl に追記
-2. session 終了時に `Stop` hook (`scripts/reflect.ps1`) がパターン検出 → backlog に keyed row を **upsert**
-   （id でデデュープ、status / sessions 付き、truncate しない。旧 `reflection_latest.md` への prose 追記は廃止）
-3. 次 session 開始時、`SessionStart` hook が OPEN 行を Required Action として強制提示（= 唯一効く forcing function を
-   actionable な系統に向けた。旧構造ではこの強制力が memory 系統だけに刺さっていた）
-4. `/promote-reflection` で各行を終端（promote / hook 承認依頼 / dismiss）。hook 登録の変更だけは
-   user 承認が要るので backlog の "hook requests" 節に ready-to-paste spec を書いて依頼する
+1. `PostToolUse` で `scripts/log_metric.py` が metrics jsonl に追記し、`scripts/guard_engine.py` が
+   `guards.jsonl` の各ルールをその tool 呼び出しに対し発火・`guard_hits.jsonl` に記録
+2. `Stop` で `scripts/reflect.py` が **warn ガードの自動 block 昇格** + Bash 連続失敗を backlog に upsert
+   （id でデデュープ、status / sessions 付き、truncate しない。ノイズだった read/edit/bash hotspot 検出は撤去）
+3. 次 session 開始時、`SessionStart` hook が OPEN 行を Required Action として強制提示
+4. `/promote-reflection` で各行を終端。**機械化できる再発は guard (guards.jsonl 追記) が主経路で
+   settings.json 不要・承認不要**。新規 hook 種別の登録だけは user 承認が要るので backlog の
+   "hook requests" 節に ready-to-paste spec を書いて依頼する
 
 詳細設計は `docs/plan_ahe.md` (章 1.5 autonomy spectrum + 章 3 H13/H14/H15)。
 
 ### hook 配置ポリシー
 
+- **hook / スクリプトは PowerShell 禁止。bash を既定**とし、**JSON を構造的にパースする必要がある
+  ものだけ Python (stdlib のみ、jq 不要)** で書く (Linux でも動くこと。PS 5.1 の encoding 地獄 +
+  Windows 専用を排除。memory [[feedback_no_powershell_cross_platform]])。
+  - JSON 解析が要る → Python: `guard_engine.py` (ルール DB) / `reflect.py` (hits/metrics 解析 +
+    ルール再シリアライズ) / `log_metric.py` (Windows パスの `\` を含む JSON 出力) /
+    `check_destructive_delete.py` (security block・確実な command 抽出 + `\b` 正規表現)。
+  - JSON 不要 (テキスト/git/build) → bash: `release_build_bg.sh` / `cleanup_worktree.sh` /
+    `.githooks/**`。新規 .ps1 は guard が block する。
 - AHE hook (PreToolUse / PostToolUse / Stop) は **`.claude/settings.json`** に集約する。
   このファイルは git 追跡対象なので、新規 worktree でも何もせず hook が有効になる。
 - `.claude/settings.local.json` は **マシン固有 permissions allowlist 専用** に残す
@@ -144,7 +173,7 @@ cargo clippy --workspace -- -D warnings
   `settings.local.json` に hook を書くと、harness の同期次第で worktree に伝わらず
   AHE ループが片肺になる。
 - **例外: release-build-on-commit は git-native hook (`.githooks/post-commit`)**。
-  AHE 系の「観測」hook と違い、これは commit の起動手段すべて（手動・`!`・PowerShell ツール）で
+  AHE 系の「観測」hook と違い、これは commit の起動手段すべて（手動・`!`・Bash ツール）で
   発火する必要があるため、Claude-Code の PostToolUse（Bash ツールしか拾えない）ではなく
   git hook に置く。`core.hooksPath = .githooks` で tracked・worktree 共通。
 - `.claude/settings.json` の編集は harness の auto-mode classifier に self-modification として
@@ -209,7 +238,7 @@ cargo clippy --workspace -- -D warnings
 - どれが **caller boilerplate が少ない** か?
 - どれが **現実的** か?
 
-「実装コスト」「影響範囲」「連鎖する」「許容範囲」「現実的に」「妥協」 — これらが思考に出てきた**時点で**、 理想以外の選択肢を比較対象に上げてしまっている。 PreToolUse hook (`scripts/check_antipattern.ps1`) がこれらのキーワードを Edit / Write の対象 string に見つけたら、 警告を emit する (block はしない、 思考の中断点として作用)。
+「実装コスト」「影響範囲」「連鎖する」「許容範囲」「現実的に」「妥協」 — これらが思考に出てきた**時点で**、 理想以外の選択肢を比較対象に上げてしまっている。 PreToolUse の guard engine (`scripts/guard_engine.py` + `guards.jsonl` の compromise-smell-ja/en ルール) がこれらのキーワードを Edit / Write の対象 string に見つけたら、 警告を emit する (block はしない、 思考の中断点として作用)。
 
 #### 実例 (2026-05-25, この principle を破った)
 
