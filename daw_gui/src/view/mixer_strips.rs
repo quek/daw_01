@@ -102,6 +102,13 @@ const STYLE_SEND_PREPOST: ToggleButtonStyle = ToggleButtonStyle {
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     ui.panel("mixer_bg", area, COLOR_BG, 0.0);
 
+    // FIXME #68: S キーで「マウス直下のストリップ」を solo するため、 各 strip の
+    // rect にポインタ当たり判定をして hover track を求める (arrangement の
+    // `arrange_hovered_track` と同 idiom)。 layout を持つこの draw が唯一の算出点
+    // (SSoT)。 master strip は solo を持たないので対象外 (= None のまま)。
+    let ptr = ui.pointer().pos;
+    let mut hovered_strip: Option<u32> = None;
+
     let inner_pad = 8.0;
     let strip_y = area.y + inner_pad;
     let strip_h = area.h - inner_pad * 2.0;
@@ -154,7 +161,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             if x + STRIP_WIDTH < scroll_x || x > scroll_x + scroll_w {
                 continue;
             }
-            draw_track_strip(app, ui, entry, Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h });
+            let strip_rect = Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h };
+            // scroll_rect で clip して当たり判定 (はみ出した strip の不可視部分を除外)。
+            if let Some((px, py)) = ptr
+                && scroll_rect.contains(px, py)
+                && strip_rect.contains(px, py)
+            {
+                hovered_strip = Some(entry.track_id);
+            }
+            draw_track_strip(app, ui, entry, strip_rect);
         }
     });
 
@@ -186,7 +201,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // ならない想定だが、 リターンから別リターンへ送るのも閉路防止
             // 込みで許容されている (本タスクでは Sends セクションはリターン
             // strip には出さない = 簡潔さ優先、 normal strip 経由で繋ぐ)。
-            draw_return_strip(app, ui, entry, Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h });
+            let strip_rect = Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h };
+            if let Some((px, py)) = ptr
+                && strip_rect.contains(px, py)
+            {
+                hovered_strip = Some(entry.track_id);
+            }
+            draw_return_strip(app, ui, entry, strip_rect);
         }
     }
 
@@ -213,6 +234,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         false,
         false,
     );
+
+    // FIXME #68: 算出した hover track を AppData に反映 (変化時のみ Edit、
+    // arrange_hovered_track と同じ diff-guard)。 dispatch_shortcuts が S キーで読む。
+    if app.mixer_hovered_track != hovered_strip {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.mixer_hovered_track = hovered_strip;
+        }));
+    }
 }
 
 /// 通常 (= 非リターン) track strip。 fader / pan / mute / solo + Sends

@@ -1070,6 +1070,11 @@ pub struct AppData {
     /// `arrangement_view::draw` が毎フレーム更新。ヘッダ列・クリップレーンどちらの
     /// 上でも同じトラック行を返す。
     pub arrange_hovered_track: Option<u32>,
+    /// FIXME #68: ミキサーでポインタ直下の strip の track id。`mixer_strips::draw`
+    /// が毎フレーム更新 (arrangement の `arrange_hovered_track` と同 idiom)。S キーで
+    /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master
+    /// strip は solo を持たないので None 扱い。
+    pub mixer_hovered_track: Option<u32>,
     /// FIXME #33: ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
     /// ノート paste の配置位置に使う。`piano_roll_view::draw` が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。
@@ -1986,6 +1991,7 @@ impl AppData {
             arrangement_hover_beat_raw: None,
             arrangement_hover_clip: None,
             arrange_hovered_track: None,
+            mixer_hovered_track: None,
             pianoroll_hover_beat: None,
             pianoroll_hover_beat_song_raw: None,
             pending_clipboard_write: None,
