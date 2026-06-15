@@ -387,6 +387,11 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             0,
         )
         .function(
+            NativeFunction::from_fn_ptr(daw_clip_display_label),
+            js_string!("clipDisplayLabel"),
+            1,
+        )
+        .function(
             NativeFunction::from_fn_ptr(daw_device_chain),
             js_string!("deviceChain"),
             1,
@@ -865,6 +870,34 @@ fn daw_inspect_song_json(
     })
     .map_err(|e| js_native(format!("inspectSongJson: serialize: {e}")))?;
     Ok(JsString::from(json.as_str()).into())
+}
+
+/// `daw.clipDisplayLabel(refJson)` — return the **rendered** clip label
+/// (`clip_display_label` の結果) for `{track, clip}` indices. `inspectSongJson`
+/// が返す `content_name` (= モデルの明示名) と違い、 Text 本文 / 歌詞 / 明示名の
+/// 導出後の **画面に出る文字列** を返す。 FIXME #69 (歌詞付きクリップを rename
+/// しても歌詞のまま) の回帰を headless で検証するための hook。 存在しない
+/// track / clip は空文字。
+fn daw_clip_display_label(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let ref_json = arg_to_string(args, 0, ctx)?;
+    let target: ClipRef = serde_json::from_str(&ref_json)
+        .map_err(|e| js_native(format!("clipDisplayLabel: parse: {e}")))?;
+    let label = with_host(|host| {
+        let song = &host.app.song;
+        let Some(clip) = song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+        else {
+            return String::new();
+        };
+        crate::view::arrangement_view::clip_display_label(clip, song).to_string()
+    });
+    Ok(JsString::from(label.as_str()).into())
 }
 
 /// `daw.deviceChain(track_id)` → `host.app.song` の指定トラックの単一デバイス

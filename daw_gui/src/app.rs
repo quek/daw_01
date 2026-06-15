@@ -12514,8 +12514,11 @@ impl AppData {
             ..Default::default()
         };
         track.clips.push(new_clip);
-        self.song
-            .set_content_name(cid, format!("Recorded {new_clip_id}"));
+        // content_name は **明示 rename 専用** (FIXME #69)。 ここで自動名
+        // ("Recorded N") を入れると、 後でノートに歌詞が付いたとき明示名優先
+        // ルールで歌詞を隠してしまう (= ⑤⑦ の再来)。 生成クリップは
+        // `create_clip` と同様 **無名** で作り、 表示名は歌詞 / 本文から導出する
+        // (`clip_display_label`)。 名前が要るならユーザーが rename する。
     }
 
     /// playhead が clip 範囲 `[start_beat, start_beat + length_beats)` に
