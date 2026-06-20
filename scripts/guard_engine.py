@@ -200,6 +200,21 @@ def main():
             text = _mask_shell_literals(command)
         elif field == "file_path":
             text = file_path
+        elif field == "ask_options":
+            # AskUserQuestion の質問文 + 全選択肢の label / description を 1 文字列に
+            # 連結して scan する。 「妥協案を user の選択肢として出す」 瞬間を
+            # compromise-smell で捕まえるための field (PreToolUse hook は assistant の
+            # 地の文は見られないが、 AskUserQuestion は tool 呼び出しなので捕捉できる)。
+            parts = []
+            for q in tool_input.get("questions") or []:
+                if not isinstance(q, dict):
+                    continue
+                parts.append(str(q.get("question") or ""))
+                for o in q.get("options") or []:
+                    if isinstance(o, dict):
+                        parts.append(str(o.get("label") or ""))
+                        parts.append(str(o.get("description") or ""))
+            text = "\n".join(parts)
         else:
             text = edit_text
         if not text:

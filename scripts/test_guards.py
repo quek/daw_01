@@ -111,7 +111,7 @@ def check_registry():
                 bad("registry:%s-has-all" % rid, "missing 'all'")
             if r.get("action") not in ("warn", "block"):
                 bad("registry:%s-action" % rid, "action=%r" % r.get("action"))
-            if r.get("field") not in ("command", "command_code", "text", "file_path", None):
+            if r.get("field") not in ("command", "command_code", "text", "file_path", "ask_options", None):
                 bad("registry:%s-field" % rid, "field=%r" % r.get("field"))
             pats = []
             for key in ("all", "none"):
@@ -205,6 +205,22 @@ CASES = [
      {"compromise-smell-en"}, set()),
     ("en/neg-clean", "Edit", {"file_path": "x.rs", "new_string": "the ideal architecture"}, 0,
      set(), {"compromise-smell-en"}),
+    # compromise-smell-ask (AskUserQuestion の選択肢で妥協案を user に提示する smell)
+    ("ask/pos-approx", "AskUserQuestion",
+     {"questions": [{"question": "どうしますか？", "header": "方針", "options": [
+         {"label": "まず近似版（推奨）", "description": "確実・低リスクで手戻りが少ない。"},
+         {"label": "理想形", "description": "大きめの改修。"}]}]},
+     0, {"compromise-smell-ask"}, set()),
+    ("ask/pos-cost", "AskUserQuestion",
+     {"questions": [{"question": "どれにしますか？", "header": "X", "options": [
+         {"label": "A", "description": "実装コストが低い。"},
+         {"label": "B", "description": "影響範囲が広いが理想。"}]}]},
+     0, {"compromise-smell-ask"}, set()),
+    ("ask/neg-ideal-only", "AskUserQuestion",
+     {"questions": [{"question": "声をどう保存しますか？", "header": "保存", "options": [
+         {"label": "per-user global", "description": "コンテンツアドレスで跨ぎ再利用。"},
+         {"label": "per-project", "description": "プロジェクトに自己完結。"}]}]},
+     0, set(), {"compromise-smell-ask"}),
     # confirm-before-commit
     ("commit/pos", "Bash", {"command": "git commit -m 'x'"}, 0, {"confirm-before-commit"}, set()),
     ("commit/neg", "Bash", {"command": "git status"}, 0, set(), {"confirm-before-commit"}),
