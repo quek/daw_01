@@ -192,22 +192,34 @@ impl ScriptHost {
         match msg {
             ChildToMain::SlotPluginLoaded {
                 track,
+                index,
+                id,
+                name,
                 plugin_id,
                 shmem_id,
-                index,
-                ..
+                state_load_error,
             } => {
-                let _ = self.bootstrap.audio_tx.send(MainToChild::OpenPluginShmem {
-                    plugin_id: *plugin_id,
-                    shmem_id: shmem_id.clone(),
-                    track: *track,
-                    index: *index,
-                });
+                // script 専用 bookkeeping (deviceChain 等が参照)。
                 self.plugin_to_track.insert(*plugin_id, *track);
                 self.track_plugin_ids
                     .entry(*track)
                     .or_default()
                     .push(*plugin_id);
+                // GUI runner と同じく app へ dispatch する。これで `loaded_slots` が
+                // 埋まり、OpenPluginShmem 送信 + `sync_vocal_metadata` 再 flush
+                // (= builtin VOICEVOX の歌唱/読み上げ合成 trigger) が走る。これが
+                // 無いと、 slot ロード前の初回 flush が skip されたまま再 flush されず、
+                // VOICEVOX を含む project の headless export が無音になる
+                // (`docs/plan_voicevox_talk.md` §7 で talk export 検証時に発覚)。
+                self.app.handle_event(AppEvent::SlotPluginLoadedFromChild {
+                    track: *track,
+                    index: *index,
+                    id: id.clone(),
+                    name: name.clone(),
+                    plugin_id: *plugin_id,
+                    shmem_id: shmem_id.clone(),
+                    state_load_error: state_load_error.clone(),
+                });
             }
             ChildToMain::SlotPluginUnloaded { plugin_id } => {
                 self.plugin_latencies.remove(plugin_id);

@@ -369,6 +369,8 @@ enum PluginCommand {
         plugin_id: u32,
         bpm: f32,
         entries: Vec<common::plugin_metadata::NoteMetadata>,
+        /// (talk) 同トラックの読み上げ群 (`docs/plan_voicevox_talk.md` §3.3)。
+        talk: Vec<common::plugin_metadata::TalkMetadata>,
     },
     Shutdown,
 }
@@ -1470,6 +1472,7 @@ fn plugin_main_loop(
                     plugin_id,
                     bpm,
                     entries,
+                    talk,
                 } => {
                     // plugin_lookup は `(track, index) -> plugin_id` の
                     // forward map。 逆引きは O(n) walk。 同 frame に
@@ -1487,7 +1490,7 @@ fn plugin_main_loop(
                     };
                     tracks.mutate(|t| {
                         if let Some(plugin) = t.plugin_at_mut(track, index) {
-                            plugin.set_note_metadata(bpm, &entries);
+                            plugin.set_note_metadata(bpm, &entries, &talk);
                         }
                     });
                 }
@@ -2029,17 +2032,19 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(?mode, "received SetRenderMode");
             plugin.send(PluginCommand::SetRenderMode(mode));
         }
-        MainToChild::SetBuiltinPluginNoteMetadata { plugin_id, bpm, entries } => {
+        MainToChild::SetBuiltinPluginNoteMetadata { plugin_id, bpm, entries, talk } => {
             tracing::debug!(
                 plugin_id,
                 bpm,
                 count = entries.len(),
+                talk = talk.len(),
                 "received SetBuiltinPluginNoteMetadata"
             );
             plugin.send(PluginCommand::SetBuiltinPluginNoteMetadata {
                 plugin_id,
                 bpm,
                 entries,
+                talk,
             });
         }
         MainToChild::PrepareVocalSynth { plugin_id } => {

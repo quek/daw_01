@@ -1537,8 +1537,16 @@ impl Runner {
                     let ev = events.first()?;
                     Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
                 } else if let Some(events) = content.text_events() {
-                    let ev = events.first()?;
-                    Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
+                    // (talk/v26) 字幕 (`builtin.video.subtitle`) device が刺さっている
+                    // トラックの Text だけ画面に出る (`text_compose` の表示 gate と一致)。
+                    // 出ない Text の選択枠 (縁取り + handle) を preview に出すと「刺して
+                    // ないのに枠が出る」混乱になるので gate する (`docs/plan_voicevox_talk.md`)。
+                    if track.has_subtitle_device() {
+                        let ev = events.first()?;
+                        Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }

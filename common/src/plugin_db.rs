@@ -215,6 +215,13 @@ pub fn default_cache_path() -> Option<PathBuf> {
 /// on the URI to construct the Rust implementation.
 pub const BUILTIN_ID_SILENCE: &str = "builtin://daw_01.silence";
 pub const BUILTIN_ID_VOICEVOX: &str = "builtin://daw_01.voicevox";
+/// (talk) 字幕(テキスト表示)デバイス。`ClipContent::Text` clip を画面 overlay 化
+/// するかの**表示ゲート marker** (`docs/plan_voicevox_talk.md` §1.2/§2)。shader 効果では
+/// なく、`text_compose` が「このトラックに在るか」で表示を gate するだけ。`builtin.video.*`
+/// 一族として video in/out port を立て、audio engine / plugin host から skip させる
+/// (`PortConfig::is_video`)。`video_fx` の shader catalog には載せない (= FX executor が
+/// `def_by_id` 未ヒットで素通り)。
+pub const SUBTITLE_ID: &str = "builtin.video.subtitle";
 
 /// Returns the canonical list of daw_01-bundled plugin descriptors.
 /// `scan_system` appends these unconditionally so the picker UI sees
@@ -268,6 +275,28 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             has_audio_input: false,
             has_video_input: false,
             has_video_output: false,
+        },
+        // (talk) 字幕(テキスト表示)デバイス。video overlay marker。挿さっている
+        // トラックの `ClipContent::Text` だけが画面に出る (`text_compose` が gate)。
+        // video in/out を立てて audio engine / plugin host から skip させる。
+        PluginEntry {
+            id: SUBTITLE_ID.to_string(),
+            format: PluginFormat::Builtin,
+            name: "字幕 (builtin)".to_string(),
+            vendor: "daw_01".to_string(),
+            version: version.to_string(),
+            features: vec![
+                "video-overlay".to_string(),
+                "text".to_string(),
+            ],
+            path: PathBuf::from(SUBTITLE_ID),
+            descriptor_index: 0,
+            has_note_input: false,
+            has_note_output: false,
+            has_audio_output: false,
+            has_audio_input: false,
+            has_video_input: true,
+            has_video_output: true,
         },
     ];
     // FIXME #54 / docs/plan_video_fx.md §9: 内蔵映像効果 (`builtin.video.*`) を

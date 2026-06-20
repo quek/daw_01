@@ -230,6 +230,51 @@ pub fn collect_events_for_buffer(
         note_id_base += clip_note_count;
     }
 
+    // (talk) 読み上げトリガ (`docs/plan_voicevox_talk.md` §3.4)。VOICEVOX デバイス付き
+    // トラックの `ClipContent::Text` の各 TextEvent 開始位置で、合成 note_on を発火する。
+    // note_id = `talk_event_id(clip.id, event_index)` (= builtin の note_offsets と対応する
+    // high band id)。builtin は wav 終端で自動 drain するので note_off は不要 (= active_notes
+    // にも積まない)。空テキストは flush 側 (sync_vocal_metadata) と同条件で skip して
+    // event_id の対応を保つ。歌唱 MIDI clip と talk Text clip が混在しても、note_id (= 小さい
+    // 通し index) と event_id (= high band) は衝突しない。
+    if track.is_voicevox_vocal() {
+        for clip in &track.clips {
+            let Some(events) = song
+                .clip_contents
+                .get(&clip.content_id)
+                .and_then(|c| c.text_events())
+            else {
+                continue;
+            };
+            for (event_index, ev) in events.iter().enumerate() {
+                if ev.text.is_empty() {
+                    continue;
+                }
+                let on_abs_beat = clip.start_beat + ev.event_start_in_clip_beats;
+                if on_abs_beat >= playhead_beats
+                    && on_abs_beat < buf_end_beats
+                    && out.len() < MAX_EVENTS
+                {
+                    let time_samples =
+                        ((on_abs_beat - playhead_beats) * samples_per_beat).max(0.0);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let time = time_samples as u32;
+                    out.push(TimedNoteEvent {
+                        time,
+                        event: NoteTransition::On {
+                            note_id: common::plugin_metadata::talk_event_id(
+                                clip.id,
+                                event_index as u32,
+                            ),
+                            key: 0,
+                            velocity: 1.0,
+                        },
+                    });
+                }
+            }
+        }
+    }
+
     // CLAP requires in-events sorted by time. At equal times, Off must come
     // before On so a re-attack at the same frame doesn't drop because the
     // synth saw On→Off in the same buffer.

@@ -15,7 +15,7 @@ use std::sync::atomic::AtomicU64;
 use anyhow::Result;
 
 use common::plugin_format::PluginFormat;
-use common::plugin_metadata::NoteMetadata;
+use common::plugin_metadata::{NoteMetadata, TalkMetadata};
 use common::protocol::{PluginParamInfo, RenderMode};
 
 use crate::builtin;
@@ -294,7 +294,16 @@ pub trait LoadedPlugin: Send {
     /// (= VOICEVOX `singing_query` のフレーム計算)。 song の bpm 変更時
     /// にも flush される。
     /// `docs/plan_voicevox_synth.md` PR-V2.2 / V2.3 で導入。
-    fn set_note_metadata(&mut self, _bpm: f32, _entries: &[NoteMetadata]) {}
+    /// (talk, `docs/plan_voicevox_talk.md` §3.3) `_talk` は同トラックの
+    /// `ClipContent::Text` 由来の読み上げ群。歌唱 (`_entries`) と talk を 1 回の flush で
+    /// 受け、builtin が 1 つの合成 job (= 1 連続バッファ) に統合する。CLAP/VST3 は無視。
+    fn set_note_metadata(
+        &mut self,
+        _bpm: f32,
+        _entries: &[NoteMetadata],
+        _talk: &[TalkMetadata],
+    ) {
+    }
 
     /// FIXME #42: builtin VOICEVOX の歌唱合成の `(queued_gen, done_gen)` 世代カウンタを
     /// 返す (それ以外の plugin は `None`)。 plugin host が歌唱 bounce の前に、

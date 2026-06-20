@@ -12,7 +12,7 @@ use std::io::Cursor;
 
 use anyhow::{Context, Result};
 
-use crate::model::{Note, Song};
+use crate::model::{Note, Song, TalkParams};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -42,15 +42,29 @@ pub struct VoiceVoxStyle {
 /// blocking、 5 秒 timeout。 engine 未起動なら `Err`。 起動直後 (= まだ ready
 /// でない) なら 5 秒 timeout 内で接続エラー、 リトライ可能。
 pub fn fetch_singers() -> anyhow::Result<Vec<VoiceVoxSinger>> {
+    fetch_voices("/singers")
+}
+
+/// (talk) VOICEVOX engine の `/speakers` を叩いて全 talk キャラクター + スタイル
+/// 一覧を取得する (`docs/plan_voicevox_talk.md` §4)。レスポンス構造は `/singers` と
+/// 同型 (`[{name, styles:[{id, name}]}]`、 talk は別途 `speaker_uuid` を持つが無視)。
+/// 各 style の `id` が `/audio_query` + `/synthesis` に渡す talk speaker id。
+pub fn fetch_speakers() -> anyhow::Result<Vec<VoiceVoxSinger>> {
+    fetch_voices("/speakers")
+}
+
+/// `/singers` (sing) / `/speakers` (talk) 共通の取得 + パース。両 endpoint は
+/// `[{name, styles:[{id, name}]}]` の同型レスポンスを返す。blocking、5 秒 timeout。
+fn fetch_voices(path: &str) -> anyhow::Result<Vec<VoiceVoxSinger>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    let resp = client.get(format!("{VOICEVOX_URL}/singers")).send()?;
+    let resp = client.get(format!("{VOICEVOX_URL}{path}")).send()?;
     let body = resp.text()?;
     let json: serde_json::Value = serde_json::from_str(&body)?;
     let arr = json
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("/singers response is not a JSON array"))?;
+        .ok_or_else(|| anyhow::anyhow!("{path} response is not a JSON array"))?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let name = item["name"].as_str().unwrap_or("").to_string();
@@ -79,6 +93,17 @@ const QUERY_SPEAKER: u32 = 6000;
 /// Default singer for frame_synthesis when no explicit override is given.
 /// 3061 = 中国うさぎ ノーマル.
 pub const DEFAULT_SINGER_ID: u32 = 3061;
+/// (talk) Default talk speaker for `/audio_query` + `/synthesis` when a Text clip
+/// has no explicit talk speaker (`Clip::speaker_id == 0`)。歌唱の sing style とは別
+/// id 空間 (`/speakers`)。3 = ずんだもん ノーマル (VOICEVOX 標準の代表 talk voice)。
+pub const DEFAULT_TALK_SPEAKER_ID: u32 = 3;
+
+/// 音声 **合成** (`frame_synthesis` / `synthesis`) HTTP の timeout。歌唱は曲全体の
+/// 全 note を 1 query にまとめて `frame_synthesis` する (json 数 KB) ため、合成は
+/// 数十秒かかり得る。旧 5 秒では曲が大きいと毎回 timeout して「歌が鳴らない」
+/// (2026-06-20、 実機 27 トラック曲で発覚)。engine 不在 (= 接続拒否) は timeout を
+/// 待たず即 Err になるので、 長め設定でも engine-down 時のリトライは遅くならない。
+const SYNTH_HTTP_TIMEOUT_SECS: u64 = 120;
 /// (FIXME #36) `DEFAULT_SINGER_ID` の表示用キャラ名 / スタイル名。新規 vocal
 /// clip で声が未設定のときの既定表示、 旧プロジェクト migration で名前が
 /// 欠落しているときのフォールバックに使う。
@@ -199,7 +224,8 @@ pub fn synthesize_song(
                     continue;
                 }
                 let sid = if clip.speaker_id != 0 { clip.speaker_id } else { default_talk_speaker_id };
-                match synthesize_talk(&client, &text, sid) {
+                let scales = clip.talk.unwrap_or_default();
+                match synthesize_talk(&client, &text, sid, &scales) {
                     Ok(b) => b,
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -390,10 +416,14 @@ fn parse_phonemes(body: &str) -> Result<Vec<Phoneme>> {
 // Talk
 // ---------------------------------------------------------------------------
 
+/// `text` を talk 合成して WAV bytes を返す。`/audio_query` → (TalkParams patch) →
+/// `/synthesis`。`scales` の話速/音高/抑揚/音量 を audio_query 応答に適用してから
+/// synthesis する (`docs/plan_voicevox_talk.md` §3.1)。blocking。
 fn synthesize_talk(
     client: &reqwest::blocking::Client,
     text: &str,
     speaker_id: u32,
+    scales: &TalkParams,
 ) -> Result<Vec<u8>> {
     // Step 1: audio_query
     let url = format!(
@@ -413,14 +443,7 @@ fn synthesize_talk(
         anyhow::bail!("audio_query returned {}: {}", status, preview);
     }
 
-    let patched = if let Some(field) = find_sample_rate_field(&body) {
-        body.replace(
-            &field,
-            &format!("\"outputSamplingRate\":{}", OUTPUT_SAMPLE_RATE),
-        )
-    } else {
-        body
-    };
+    let patched = apply_talk_params(&body, scales)?;
 
     // Step 2: synthesis
     let url = format!("{}/synthesis?speaker={}", VOICEVOX_URL, speaker_id);
@@ -438,6 +461,133 @@ fn synthesize_talk(
     }
 
     Ok(wav.to_vec())
+}
+
+/// talk builtin 向けラッパ: `text` を talk 合成して **mono f32 + sample_rate** を返す
+/// (`docs/plan_voicevox_talk.md` §3.1)。builtin (plugin host) が 1 TextEvent につき
+/// 1 回呼び、結果を song-absolute 位置へ配置する。`note_offsets` は builtin 側で
+/// event_id と placement から組むのでここでは返さない (sing の
+/// `synthesize_notes_for_builtin` と違い talk は単一発話 = 単一 voice)。
+pub fn synthesize_talk_for_builtin(
+    text: &str,
+    speaker_id: u32,
+    scales: &TalkParams,
+) -> Result<(Vec<f32>, u32)> {
+    anyhow::ensure!(!text.is_empty(), "synthesize_talk_for_builtin called with empty text");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
+        .build()?;
+    let wav = synthesize_talk(&client, text, speaker_id, scales)?;
+    decode_wav_to_f32(&wav)
+}
+
+/// (talk) `TalkParams` を `/audio_query` 応答 JSON に適用して再シリアライズする。
+/// RT 外 (background synth thread) なので serde_json で素直に parse → 値設定 →
+/// 再シリアライズ (sing の string-replace patch と違い複数 scale field を確実に上書き)。
+/// `outputSamplingRate` も 48000 に揃える。
+fn apply_talk_params(audio_query_json: &str, scales: &TalkParams) -> Result<String> {
+    let mut v: serde_json::Value = serde_json::from_str(audio_query_json)
+        .context("parsing audio_query response JSON")?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("audio_query response is not a JSON object"))?;
+    obj.insert("speedScale".into(), serde_json::json!(scales.speed_scale));
+    obj.insert("pitchScale".into(), serde_json::json!(scales.pitch_scale));
+    obj.insert(
+        "intonationScale".into(),
+        serde_json::json!(scales.intonation_scale),
+    );
+    obj.insert("volumeScale".into(), serde_json::json!(scales.volume_scale));
+    obj.insert(
+        "outputSamplingRate".into(),
+        serde_json::json!(OUTPUT_SAMPLE_RATE),
+    );
+    serde_json::to_string(&v).context("re-serializing patched audio_query")
+}
+
+// ---------------------------------------------------------------------------
+// Talk lip-sync phoneme query (口パク, docs/plan_voicevox_talk.md §5)
+// ---------------------------------------------------------------------------
+
+/// (talk) `text` の `/audio_query` を叩き、phoneme 列を返す (口パク用、`/synthesis`
+/// は呼ばない)。歌唱の `query_phonemes` と同じ `Vec<Phoneme>` を返すので、生成先
+/// clip への配置は `crate::lipsync::build_mouth_events` をそのまま再利用できる。
+/// 先頭/末尾の `pau` (pre/post phoneme length) を含む。`scales.speed_scale` で
+/// frame_length を割り、実際に鳴る (= speed 適用後の) 音声と口を揃える。
+pub fn query_talk_phonemes(
+    text: &str,
+    speaker_id: u32,
+    scales: &TalkParams,
+) -> Result<Vec<Phoneme>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let url = format!(
+        "{}/audio_query?speaker={}&text={}",
+        VOICEVOX_URL,
+        speaker_id,
+        urlencoding_encode(text)
+    );
+    let resp = client
+        .post(&url)
+        .send()
+        .context("audio_query request failed")?;
+    let status = resp.status();
+    let body = resp.text().context("reading audio_query response")?;
+    if !status.is_success() {
+        let preview: String = body.chars().take(200).collect();
+        anyhow::bail!("audio_query returned {}: {}", status, preview);
+    }
+    parse_talk_phonemes(&body, scales.speed_scale)
+}
+
+/// `/audio_query` 応答 JSON (`accent_phrases[].moras[]` + pre/post phoneme length +
+/// pause_mora) を `Vec<Phoneme>` へ変換する純粋関数。各モーラは子音 (あれば) +
+/// 母音の 2 phoneme に展開し、長さ (秒) を `FRAME_RATE` × `1/speed` で frame へ。
+/// 先頭に `prePhonemeLength`、末尾に `postPhonemeLength` 由来の `pau` を置く
+/// (歌唱の leading/trailing rest に相当)。`build_mouth_events` の lead-in と整合する。
+fn parse_talk_phonemes(body: &str, speed_scale: f32) -> Result<Vec<Phoneme>> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).context("parsing audio_query JSON")?;
+    let speed = f64::from(speed_scale).max(0.01);
+    let sec_to_frames = |s: f64| -> u32 { (s / speed * FRAME_RATE).round().max(0.0) as u32 };
+
+    let mut out: Vec<Phoneme> = Vec::new();
+    // 先頭 pau (prePhonemeLength、無ければ 0.1s)。
+    let pre = json["prePhonemeLength"].as_f64().unwrap_or(0.1);
+    out.push(Phoneme { phoneme: "pau".into(), frame_length: sec_to_frames(pre) });
+
+    let phrases = json["accent_phrases"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("audio_query response has no accent_phrases array"))?;
+    for phrase in phrases {
+        if let Some(moras) = phrase["moras"].as_array() {
+            for mora in moras {
+                if let Some(cons) = mora["consonant"].as_str() {
+                    let len = mora["consonant_length"].as_f64().unwrap_or(0.0);
+                    out.push(Phoneme { phoneme: cons.to_string(), frame_length: sec_to_frames(len) });
+                }
+                let vowel = mora["vowel"].as_str().unwrap_or("");
+                if !vowel.is_empty() {
+                    let len = mora["vowel_length"].as_f64().unwrap_or(0.0);
+                    out.push(Phoneme { phoneme: vowel.to_string(), frame_length: sec_to_frames(len) });
+                }
+            }
+        }
+        // accent_phrase 間のポーズ (pause_mora、vowel は通常 "pau")。
+        if let Some(pause) = phrase["pause_mora"].as_object() {
+            let len = pause
+                .get("vowel_length")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            out.push(Phoneme { phoneme: "pau".into(), frame_length: sec_to_frames(len) });
+        }
+    }
+
+    // 末尾 pau (postPhonemeLength)。
+    let post = json["postPhonemeLength"].as_f64().unwrap_or(0.1);
+    out.push(Phoneme { phoneme: "pau".into(), frame_length: sec_to_frames(post) });
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -572,7 +722,7 @@ pub fn synthesize_notes_for_builtin(
     let model_notes: Vec<Note> = notes.iter().map(|n| n.to_model_note()).collect();
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
         .build()?;
     let wav_bytes = synthesize_sing_clip(&client, &model_notes, bpm, speaker_id)?;
     let (samples, sample_rate) = decode_wav_to_f32(&wav_bytes)?;
@@ -721,7 +871,7 @@ fn urlencoding_encode(s: &str) -> String {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::model::Clip;
+    use crate::model::{Clip, TalkParams};
     use serde_json::Value;
 
     fn parse_query(json: &str) -> Vec<(Option<i64>, i64, String)> {
@@ -922,6 +1072,105 @@ mod tests {
         // After sort: rest, note(60,こ), gap_rest, note(64,に), rest
         assert_eq!(entries[1].0, Some(60));
         assert_eq!(entries[3].0, Some(64));
+    }
+
+    // ---- talk (docs/plan_voicevox_talk.md §3) ------------------------------
+
+    #[test]
+    fn apply_talk_params_sets_all_scales_and_keeps_query() {
+        let query = r#"{"accent_phrases":[{"moras":[]}],"speedScale":1.0,"pitchScale":0.0,"intonationScale":1.0,"volumeScale":1.0,"outputSamplingRate":24000}"#;
+        let scales = TalkParams {
+            speed_scale: 1.3,
+            pitch_scale: 0.05,
+            intonation_scale: 0.8,
+            volume_scale: 1.5,
+        };
+        let out = apply_talk_params(query, &scales).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!((v["speedScale"].as_f64().unwrap() as f32 - 1.3).abs() < 1e-6);
+        assert!((v["pitchScale"].as_f64().unwrap() as f32 - 0.05).abs() < 1e-6);
+        assert!((v["intonationScale"].as_f64().unwrap() as f32 - 0.8).abs() < 1e-6);
+        assert!((v["volumeScale"].as_f64().unwrap() as f32 - 1.5).abs() < 1e-6);
+        // outputSamplingRate は 48000 に揃う。
+        assert_eq!(v["outputSamplingRate"].as_u64().unwrap(), u64::from(OUTPUT_SAMPLE_RATE));
+        // 既存の query 構造 (accent_phrases) は保持される。
+        assert!(v["accent_phrases"].is_array());
+    }
+
+    #[test]
+    fn parse_talk_phonemes_expands_moras_with_pauses() {
+        // 「コ」(k+o) + 句間ポーズ + 「ン」(N)。前後 0.1s の pau 付き。
+        let body = r#"{
+          "accent_phrases":[
+            {"moras":[{"text":"コ","consonant":"k","consonant_length":0.05,"vowel":"o","vowel_length":0.1,"pitch":5.5}],
+             "accent":1,
+             "pause_mora":{"text":"、","consonant":null,"consonant_length":null,"vowel":"pau","vowel_length":0.3,"pitch":0.0}},
+            {"moras":[{"text":"ン","consonant":null,"consonant_length":null,"vowel":"N","vowel_length":0.15,"pitch":5.0}],
+             "accent":1,"pause_mora":null}
+          ],
+          "prePhonemeLength":0.1,"postPhonemeLength":0.1
+        }"#;
+        let ph = parse_talk_phonemes(body, 1.0).unwrap();
+        let syms: Vec<&str> = ph.iter().map(|p| p.phoneme.as_str()).collect();
+        assert_eq!(syms, vec!["pau", "k", "o", "pau", "N", "pau"]);
+        // frame_length = 秒 × FRAME_RATE。
+        assert_eq!(ph[1].frame_length, (0.05 * FRAME_RATE).round() as u32);
+        assert_eq!(ph[2].frame_length, (0.1 * FRAME_RATE).round() as u32);
+        assert_eq!(ph[3].frame_length, (0.3 * FRAME_RATE).round() as u32);
+    }
+
+    #[test]
+    fn parse_talk_phonemes_divides_length_by_speed() {
+        let body = r#"{"accent_phrases":[{"moras":[{"text":"ア","consonant":null,"consonant_length":null,"vowel":"a","vowel_length":0.2,"pitch":5.0}],"accent":1,"pause_mora":null}],"prePhonemeLength":0.0,"postPhonemeLength":0.0}"#;
+        let ph = parse_talk_phonemes(body, 2.0).unwrap();
+        let a = ph.iter().find(|p| p.phoneme == "a").expect("vowel a present");
+        // speed 2.0 → 長さ半分。
+        assert_eq!(a.frame_length, (0.2 / 2.0 * FRAME_RATE).round() as u32);
+    }
+
+    /// 実 VOICEVOX engine に対する talk 合成の統合テスト (`docs/plan_voicevox_talk.md`)。
+    /// engine (localhost:50021) が要るので通常 `cargo test` では無視。実機検証で
+    /// `cargo test -p common -- --ignored talk_synth_against_real_engine` で走らせる。
+    #[test]
+    #[ignore = "requires a running VOICEVOX engine at localhost:50021"]
+    fn talk_synth_against_real_engine_produces_audio_and_phonemes() {
+        let scales = TalkParams::default();
+        // 1) 読み上げ合成: 非無音の mono PCM が返る (= 実際に喋っている)。
+        let (samples, sr) = synthesize_talk_for_builtin(
+            "こんにちは。テストです。",
+            DEFAULT_TALK_SPEAKER_ID,
+            &scales,
+        )
+        .expect("talk synth against real engine");
+        assert!(sr >= 24000, "sample_rate looks valid: {sr}");
+        assert!(!samples.is_empty(), "got samples");
+        let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+        assert!(rms > 0.001, "synthesized talk audio is non-silent (rms={rms})");
+        // 2) 口パク phoneme: 母音を含む列が返る (= build_mouth_events に流せる)。
+        let phonemes =
+            query_talk_phonemes("こんにちは", DEFAULT_TALK_SPEAKER_ID, &scales).expect("talk phonemes");
+        let syms: Vec<&str> = phonemes.iter().map(|p| p.phoneme.as_str()).collect();
+        assert!(
+            phonemes
+                .iter()
+                .any(|p| matches!(p.phoneme.as_str(), "a" | "i" | "u" | "e" | "o")),
+            "phoneme list has vowels: {syms:?}"
+        );
+        // 先頭・末尾は pau (pre/post phoneme length)。
+        assert_eq!(phonemes.first().map(|p| p.phoneme.as_str()), Some("pau"));
+        assert_eq!(phonemes.last().map(|p| p.phoneme.as_str()), Some("pau"));
+    }
+
+    /// 実 engine で `/speakers` (talk 声一覧) が取れること。
+    #[test]
+    #[ignore = "requires a running VOICEVOX engine at localhost:50021"]
+    fn fetch_speakers_against_real_engine() {
+        let speakers = fetch_speakers().expect("fetch /speakers");
+        assert!(!speakers.is_empty(), "engine returns talk speakers");
+        assert!(
+            speakers.iter().any(|s| !s.styles.is_empty()),
+            "at least one speaker has styles"
+        );
     }
 
     // ---- split_into_morae --------------------------------------------------

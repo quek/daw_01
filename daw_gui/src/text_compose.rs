@@ -89,6 +89,13 @@ pub fn active_text_sources_at(
         if song.track_visually_silenced(track.id) {
             continue;
         }
+        // (talk/v26) テキストオーバーレイ表示は字幕デバイスでゲートする
+        // (`docs/plan_voicevox_talk.md` §2)。字幕 (`builtin.video.subtitle`) device を
+        // 持つトラックの `ClipContent::Text` だけが画面に出る。VOICEVOX device のみの
+        // トラック上の Text は「読み上げるが映さない」= ここで skip される。
+        if !track.has_subtitle_device() {
+            continue;
+        }
         let mut track_emitted = false;
         for clip in &track.clips {
             let clip_start = clip.start_beat;
@@ -361,6 +368,16 @@ mod tests {
         let mut track = crate::app::track_with(|t| {
             t.id = track_id;
             t.name = "T".into();
+            // (v26) 表示は字幕デバイスで gate される → テストトラックにも挿す。
+            t.devices.push(common::model::PluginInstance::with_ports(
+                common::plugin_db::SUBTITLE_ID.to_string(),
+                common::plugin_format::PluginFormat::Builtin,
+                common::port_config::PortConfig {
+                    has_video_input: true,
+                    has_video_output: true,
+                    ..Default::default()
+                },
+            ));
         });
         let cl = track.alloc_clip_id();
         track.clips.push(Clip {

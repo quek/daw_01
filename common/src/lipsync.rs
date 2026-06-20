@@ -20,6 +20,15 @@ fn frames_to_beats(frames: f64, bpm: f32) -> f64 {
     frames / FRAME_RATE * (bpm as f64) / 60.0
 }
 
+/// (talk) `build_mouth_events` が先頭 pau の手前に置く lead-in (= `REST_FRAMES` 分)
+/// の beats。talk 経路 (`docs/plan_voicevox_talk.md` §5) は TextEvent 開始位置に
+/// この量を足して `first_note_local_beat` に渡すことで、cursor 起点を WAV 配置位置
+/// (= event 開始) に揃え、実音声 (= placement から WAV 先頭再生) と口を一致させる。
+#[must_use]
+pub fn lead_in_beats(bpm: f32) -> f64 {
+    frames_to_beats(f64::from(REST_FRAMES), bpm)
+}
+
 /// phoneme 文字列が母音 (a/i/u/e/o/N) なら対応する口形状。子音 / cl / pau は
 /// `None`。REAPER の VOWELS セット (撥音 N を含む) と同じ判定。
 fn vowel_shape(phoneme: &str) -> Option<MouthShape> {

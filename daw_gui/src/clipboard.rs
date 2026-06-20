@@ -73,6 +73,10 @@ pub struct ClipCopy {
     pub singer_name: String,
     #[serde(default)]
     pub style_name: String,
+    /// (talk) per-clip 読み上げスケール。 paste 先 clip へ引き継ぐ。 旧 clipboard
+    /// JSON との互換のため serde default (`None`)。
+    #[serde(default)]
+    pub talk: Option<common::model::TalkParams>,
 }
 
 /// 正規化済みトラックまるごと。`track` は raw (旧 legacy field は skip_serializing で
@@ -350,6 +354,7 @@ mod tests {
             speaker_id: 0,
             singer_name: String::new(),
             style_name: String::new(),
+            talk: None,
         };
         let out = sanitize_clips(vec![
             mk(4.0, 0.0),          // valid

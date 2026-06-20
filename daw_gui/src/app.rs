@@ -1554,6 +1554,11 @@ pub struct AppData {
     /// 空のまま (Clip Inspector の声 dropdown は焼き込み声名 + 「取得中…」表示)。
     /// (FIXME #36) Clip Inspector の 2 段 dropdown (キャラ→style) が直接読む。
     pub singers: Vec<common::voicevox::VoiceVoxSinger>,
+    /// (talk) VOICEVOX engine `/speakers` の結果 (`docs/plan_voicevox_talk.md` §4)。
+    /// Text clip の talk 声 dropdown (キャラ→talk style) が直接読む。sing の `singers`
+    /// (= `/singers`) とは別 id 空間。engine 起動時に background thread が
+    /// `AppEvent::SpeakersLoaded` で投入。未取得なら焼き込み声名 + 「取得中…」表示。
+    pub talk_speakers: Vec<common::voicevox::VoiceVoxSinger>,
     /// VOICEVOX 合成結果 in-memory cache (process lifetime のみ)。 Synth ボタン
     /// 押下時に各 clip の content_hash + singer_id を key に lookup → hit なら
     /// HTTP call をスキップ。 永続化は将来 Phase。
@@ -2104,6 +2109,7 @@ impl AppData {
             load_progress: None,
             load_progress_label: "",
             singers: Vec::new(),
+            talk_speakers: Vec::new(),
             voicevox_cache: Arc::new(Mutex::new(common::voicevox_cache::VoiceVoxCache::new())),
             voicevox_job,
             supervisor,
@@ -3697,8 +3703,105 @@ pub struct LipsyncClipResult {
     pub clip_len_beats: f64,
     /// clip 内 earliest note の clip-local start_beat (REST offset 配置の基準)。
     pub first_note_local_beat: f64,
+    /// (talk) この結果の元ソーストラックの並び順 index (= 口パク優先度)。複数の
+    /// ソーストラック (歌唱 Vox / 読み上げ Talk 等) が同じ口 track を出力先に
+    /// 指定したとき、時間が重なる部分は **index が小さい (= 上の) トラック**が
+    /// 優先される (`docs/plan_voicevox_talk.md`、apply 側で区間マージ)。
+    pub priority: u32,
     /// VOICEVOX phoneme 列 (先頭/末尾 pau 込み、frame 0 起点)。
     pub phonemes: Vec<common::voicevox::Phoneme>,
+}
+
+/// (talk) 複数ソーストラックの口パク mouth event 区間を、上位トラック優先で重なり
+/// なく統合する (`docs/plan_voicevox_talk.md`)。入力は `(song-absolute start, end,
+/// image_id, priority)` — priority はソーストラックの並び順 index (小 = 上 = 優先)。
+/// 戻り値は start 昇順・非重複の `(start, end, image_id)`。上位が claim した時間帯は
+/// 下位が埋めず、隙間 (どのソースも clip を持たない時間) は event 無し。これで Vox
+/// (歌唱) と Talk (読み上げ) が同じ口 track を共有でき、重なりは上のトラックが勝つ。
+fn merge_lipsync_events_by_priority(mut events: Vec<(f64, f64, u32, u32)>) -> Vec<(f64, f64, u32)> {
+    // 上 (priority 小) → 下、同 priority 内は start 昇順。上位から claim させる。
+    events.sort_by(|a, b| a.3.cmp(&b.3).then(a.0.total_cmp(&b.0)));
+    let mut claimed: Vec<(f64, f64)> = Vec::new(); // sorted, non-overlapping
+    let mut out: Vec<(f64, f64, u32)> = Vec::new();
+    for (s, e, img, _prio) in events {
+        if e - s <= 1e-9 {
+            continue;
+        }
+        // [s, e] から既 claim を引いた未 claim 部分だけ emit。
+        let mut cursor = s;
+        for &(cs, ce) in &claimed {
+            if ce <= cursor {
+                continue;
+            }
+            if cs >= e {
+                break;
+            }
+            if cs > cursor {
+                out.push((cursor, cs.min(e), img));
+            }
+            cursor = cursor.max(ce);
+            if cursor >= e {
+                break;
+            }
+        }
+        if cursor < e {
+            out.push((cursor, e, img));
+        }
+        // [s, e] を claimed に挿入して coalesce (= 以後この区間は claim 済み)。
+        claimed.push((s, e));
+        claimed.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut coalesced: Vec<(f64, f64)> = Vec::with_capacity(claimed.len());
+        for &(cs, ce) in &claimed {
+            if let Some(last) = coalesced.last_mut()
+                && cs <= last.1 + 1e-9
+            {
+                last.1 = last.1.max(ce);
+                continue;
+            }
+            coalesced.push((cs, ce));
+        }
+        claimed = coalesced;
+    }
+    // start 昇順に並べ、隣接同 image をマージ。
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, f64, u32)> = Vec::with_capacity(out.len());
+    for (s, e, img) in out {
+        if let Some(last) = merged.last_mut()
+            && last.2 == img
+            && (s - last.1).abs() <= 1e-6
+        {
+            last.1 = e;
+            continue;
+        }
+        merged.push((s, e, img));
+    }
+    merged
+}
+
+#[cfg(test)]
+mod lipsync_merge_tests {
+    use super::merge_lipsync_events_by_priority;
+
+    #[test]
+    fn non_overlapping_sources_both_kept() {
+        // 上(prio 0) [0,2) img1、下(prio 1) [3,5) img2 — 重ならない → 両方残る。
+        let m = merge_lipsync_events_by_priority(vec![(0.0, 2.0, 1, 0), (3.0, 5.0, 2, 1)]);
+        assert_eq!(m, vec![(0.0, 2.0, 1), (3.0, 5.0, 2)]);
+    }
+
+    #[test]
+    fn overlap_upper_priority_wins() {
+        // 上(prio 0) [1,3) img1、下(prio 1) [0,4) img2。重なる [1,3) は上が勝ち、
+        // 下は [0,1) と [3,4) のみ残る。
+        let m = merge_lipsync_events_by_priority(vec![(1.0, 3.0, 1, 0), (0.0, 4.0, 2, 1)]);
+        assert_eq!(m, vec![(0.0, 1.0, 2), (1.0, 3.0, 1), (3.0, 4.0, 2)]);
+    }
+
+    #[test]
+    fn adjacent_same_image_coalesced() {
+        let m = merge_lipsync_events_by_priority(vec![(0.0, 1.0, 5, 0), (1.0, 2.0, 5, 1)]);
+        assert_eq!(m, vec![(0.0, 2.0, 5)]);
+    }
 }
 
 /// FIXME #63: 未保存変更がある状態で「現在のプロジェクトを破棄する操作」 を
@@ -3715,6 +3818,16 @@ pub enum DirtyGuardAction {
     Open,
     /// 指定パスのプロジェクトを開く (Open Recent、 `action_open_path`)。
     OpenPath(PathBuf),
+}
+
+/// (talk) Text clip の読み上げスケール 1 項目 (`AppEvent::SetClipTalkParam`)。
+/// VOICEVOX `audio_query` の話速/音高/抑揚/音量に対応 (`docs/plan_voicevox_talk.md` §4)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TalkParamKind {
+    Speed,
+    Pitch,
+    Intonation,
+    Volume,
 }
 
 /// 既存の event handler と一貫性を保つため、enum 全体に `#[allow(dead_code)]`
@@ -4715,6 +4828,19 @@ pub enum AppEvent {
     /// (FIXME #36) Clip Inspector の「再取得」ボタン。 VOICEVOX `/singers` を
     /// 再取得して声 dropdown を更新する (新規キャラ導入時)。
     RefetchSingers,
+    /// (talk) VOICEVOX engine `/speakers` の取得結果 (`docs/plan_voicevox_talk.md` §4)。
+    /// 起動時 background thread が 1 度発行。失敗時は空 Vec。
+    SpeakersLoaded(Vec<common::voicevox::VoiceVoxSinger>),
+    /// (talk) Text clip Inspector の「再取得」ボタン。`/speakers` を再取得する。
+    RefetchSpeakers,
+    /// (talk) Text clip Inspector の talk スケール (話速/音高/抑揚/音量) を 1 つ
+    /// 編集する。対象 clip (stable `ClipKey`) の `Clip::talk` に焼き込んで builtin へ
+    /// 再 flush (= 新しいスケールで再合成)。
+    SetClipTalkParam {
+        clip: common::model::ClipKey,
+        param: TalkParamKind,
+        value: f32,
+    },
 
     // -------- WAV export -------------------------------------------------
     /// File → Export WAV...: open the FIXME #55 range picker (default窓 = 全曲)。
@@ -6792,15 +6918,28 @@ impl AppData {
             }
             AppEvent::LipsyncDebounceFired(generation) => {
                 if generation == self.lipsync_gen {
-                    let ids: Vec<u32> = self
+                    // (talk) regen は target 中心 (= その口 track を出力先にする全ソースを
+                    // まとめて再生成) なので、口 track ごとに 1 回だけ呼べば足りる。同じ
+                    // target を複数ソースぶん呼ぶと全ソース regen が重複するため、出力先
+                    // track 単位で dedup し代表ソースを 1 つ渡す。
+                    let mut targets: Vec<u32> = self
                         .song
                         .tracks
                         .iter()
-                        .filter(|t| t.lipsync_target_track.is_some())
-                        .map(|t| t.id)
+                        .filter_map(|t| t.lipsync_target_track)
                         .collect();
-                    for id in ids {
-                        self.regenerate_lipsync_for_track(id);
+                    targets.sort_unstable();
+                    targets.dedup();
+                    for target in targets {
+                        if let Some(src_id) = self
+                            .song
+                            .tracks
+                            .iter()
+                            .find(|t| t.lipsync_target_track == Some(target))
+                            .map(|t| t.id)
+                        {
+                            self.regenerate_lipsync_for_track(src_id);
+                        }
                     }
                 }
             }
@@ -6809,6 +6948,16 @@ impl AppData {
             }
             AppEvent::RefetchSingers => {
                 self.spawn_fetch_singers();
+            }
+            AppEvent::SpeakersLoaded(speakers) => {
+                tracing::info!(count = speakers.len(), "VOICEVOX talk speakers loaded");
+                self.talk_speakers = speakers;
+            }
+            AppEvent::RefetchSpeakers => {
+                self.spawn_fetch_speakers();
+            }
+            AppEvent::SetClipTalkParam { clip, param, value } => {
+                self.set_clip_talk_param(clip, param, value);
             }
             AppEvent::SetPianoRollSnapEnabled(b) => {
                 self.pianoroll_snap_enabled = b;
@@ -9252,10 +9401,46 @@ impl AppData {
                     });
                 }
             }
+            // (talk) 同トラックの `ClipContent::Text` 由来の読み上げ群を集める
+            // (`docs/plan_voicevox_talk.md` §3.2)。event_id は `talk_event_id(clip.id,
+            // event_index)` で決定論的に導出 (sequencer の talk-trigger と同式)。空
+            // テキストは両側で skip して event_id の対応を保つ。声は per-clip
+            // (`clip.speaker_id` を talk style として解釈)、スケールは `clip.talk`。
+            let mut talk: Vec<common::plugin_metadata::TalkMetadata> = Vec::new();
+            for clip in &track.clips {
+                let Some(events) = self
+                    .song
+                    .clip_contents
+                    .get(&clip.content_id)
+                    .and_then(|c| c.text_events())
+                else {
+                    continue;
+                };
+                let scales = clip.talk.unwrap_or_default();
+                for (event_index, ev) in events.iter().enumerate() {
+                    if ev.text.is_empty() {
+                        continue;
+                    }
+                    talk.push(common::plugin_metadata::TalkMetadata {
+                        event_id: common::plugin_metadata::talk_event_id(
+                            clip.id,
+                            event_index as u32,
+                        ),
+                        start_beat: clip.start_beat + ev.event_start_in_clip_beats,
+                        text: ev.text.clone(),
+                        speaker_id: clip.speaker_id,
+                        speed_scale: scales.speed_scale,
+                        pitch_scale: scales.pitch_scale,
+                        intonation_scale: scales.intonation_scale,
+                        volume_scale: scales.volume_scale,
+                    });
+                }
+            }
             self.send_plugin(MainToChild::SetBuiltinPluginNoteMetadata {
                 plugin_id: host_plugin_id,
                 bpm,
                 entries,
+                talk,
             });
         }
     }
@@ -9280,32 +9465,63 @@ impl AppData {
             return;
         }
         let bpm = self.song.bpm;
-        // notes を持つ各 vocal clip を snapshot (配置情報 + notes の owned copy)。
-        let mut snaps: Vec<(f64, f64, f64, Vec<common::model::Note>)> = Vec::new();
-        for clip in &vocal.clips {
-            let Some(notes) = self
-                .song
-                .clip_contents
-                .get(&clip.content_id)
-                .and_then(|c| c.notes())
-            else {
-                continue;
-            };
-            if notes.is_empty() {
+        let lead_in = common::lipsync::lead_in_beats(bpm);
+        // (talk) target 中心: 出力先が `target_id` の **全ソーストラック** をまとめて
+        // 再生成する (`docs/plan_voicevox_talk.md`)。トラック並び順 index を priority に
+        // し、apply 側で重なりを上位優先で解決する。各 clip は notes (歌唱) があれば sing、
+        // 無く Text なら talk として扱う。`vocal` (trigger) は target 解決にのみ使用。
+        let _ = &vocal;
+        let mut snaps: Vec<(f64, f64, f64, u32, Vec<common::model::Note>)> = Vec::new();
+        let mut talk_snaps: Vec<(f64, f64, f64, u32, String, u32, common::model::TalkParams)> =
+            Vec::new();
+        for (idx, src) in self.song.tracks.iter().enumerate() {
+            if src.lipsync_target_track != Some(target_id) {
                 continue;
             }
-            let first_note_local_beat = notes
-                .iter()
-                .map(|n| n.start_beat)
-                .fold(f64::INFINITY, f64::min);
-            snaps.push((
-                clip.start_beat,
-                clip.length_beats,
-                first_note_local_beat,
-                notes.to_vec(),
-            ));
+            let priority = idx as u32;
+            for clip in &src.clips {
+                // sing: notes を持つ clip。
+                if let Some(notes) = self
+                    .song
+                    .clip_contents
+                    .get(&clip.content_id)
+                    .and_then(|c| c.notes())
+                    && !notes.is_empty()
+                {
+                    let first_note_local_beat = notes
+                        .iter()
+                        .map(|n| n.start_beat)
+                        .fold(f64::INFINITY, f64::min);
+                    snaps.push((
+                        clip.start_beat,
+                        clip.length_beats,
+                        first_note_local_beat,
+                        priority,
+                        notes.to_vec(),
+                    ));
+                    continue;
+                }
+                // talk: Text clip の先頭の非空 TextEvent。
+                if let Some(events) = self
+                    .song
+                    .clip_contents
+                    .get(&clip.content_id)
+                    .and_then(|c| c.text_events())
+                    && let Some(ev) = events.iter().find(|e| !e.text.is_empty())
+                {
+                    talk_snaps.push((
+                        clip.start_beat,
+                        clip.length_beats,
+                        ev.event_start_in_clip_beats + lead_in,
+                        priority,
+                        ev.text.clone(),
+                        clip.speaker_id,
+                        clip.talk.unwrap_or_default(),
+                    ));
+                }
+            }
         }
-        if snaps.is_empty() {
+        if snaps.is_empty() && talk_snaps.is_empty() {
             return;
         }
         self.ensure_voicevox_engine();
@@ -9315,17 +9531,36 @@ impl AppData {
         let generation = self.lipsync_gen;
         let proxy = self.event_proxy.clone();
         std::thread::spawn(move || {
-            let mut clips = Vec::with_capacity(snaps.len());
-            for (clip_start_beat, clip_len_beats, first_note_local_beat, notes) in snaps {
+            let mut clips = Vec::with_capacity(snaps.len() + talk_snaps.len());
+            for (clip_start_beat, clip_len_beats, first_note_local_beat, priority, notes) in snaps {
                 match common::voicevox::query_phonemes(&notes, bpm) {
                     Ok(phonemes) => clips.push(LipsyncClipResult {
                         clip_start_beat,
                         clip_len_beats,
                         first_note_local_beat,
+                        priority,
                         phonemes,
                     }),
                     Err(e) => {
                         tracing::warn!(error = ?e, vocal_track_id, "lip-sync phoneme query failed");
+                    }
+                }
+            }
+            // (talk) 読み上げ phoneme を `query_talk_phonemes` で取り、同じ
+            // `LipsyncClipResult` に詰める (= apply 経路は歌唱と共通)。
+            for (clip_start_beat, clip_len_beats, first_note_local_beat, priority, text, speaker_id, scales) in
+                talk_snaps
+            {
+                match common::voicevox::query_talk_phonemes(&text, speaker_id, &scales) {
+                    Ok(phonemes) => clips.push(LipsyncClipResult {
+                        clip_start_beat,
+                        clip_len_beats,
+                        first_note_local_beat,
+                        priority,
+                        phonemes,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, vocal_track_id, "talk lip-sync phoneme query failed");
                     }
                 }
             }
@@ -9368,32 +9603,52 @@ impl AppData {
         };
         // 既存の自動生成 clip を全削除 (手編集保持しない)。
         self.song.tracks[m_idx].clips.retain(|c| !c.auto_lipsync);
-        // 各 vocal clip 分の口画像 clip を生成して口 track へ追加。
         let res = self.song.video_resolution;
+        // (talk) 全ソースの mouth event を song-absolute (start, end, image_id, priority) に
+        // 展開する。複数ソース (歌唱 Vox / 読み上げ Talk) が同じ口 track を共有しても、
+        // 次の merge で重なりが上位 (priority 小 = 上のトラック) 優先で解決され、口画像が
+        // 二重表示にならない (`docs/plan_voicevox_talk.md`)。
+        let mut spans: Vec<(f64, f64, u32, u32)> = Vec::new();
         for r in &results {
-            let mut events = common::lipsync::build_mouth_events(
+            let events = common::lipsync::build_mouth_events(
                 &r.phonemes,
                 &mouth_map,
                 bpm,
                 r.first_note_local_beat,
                 r.clip_len_beats,
             );
-            if events.is_empty() {
-                continue;
+            for ev in events {
+                let s = r.clip_start_beat + ev.event_start_in_clip_beats;
+                let e = s + ev.event_length_beats;
+                if e > s {
+                    spans.push((s, e, ev.source_id, r.priority));
+                }
             }
-            // build_mouth_events は rect を全画面 default で返すので、 そのままだと
-            // 口画像が preview 全面に伸びて「大きすぎる / 他レイヤーとサイズが合わ
-            // ない」。 通常の画像取り込み (action_import_image) と同じく、 各口画像の
-            // 素材寸法から aspect-fit rect を計算して上書きし、 立ち絵の他の子レイヤー
-            // (眉 / 目 等を同寸 PNG で取り込んだもの) と同じ収まりに揃える。
-            for ev in &mut events {
-                if let Some(src) = self.song.image_sources.get(&ev.source_id) {
+        }
+        // 上位優先で重なりを解決した非重複 mouth event 列。これを 1 本の auto_lipsync
+        // Image clip にまとめて口 track へ置く (event 間の隙間 = 口画像なし = 自然)。
+        let merged = merge_lipsync_events_by_priority(spans);
+        if !merged.is_empty() {
+            let clip_start = merged.iter().map(|m| m.0).fold(f64::INFINITY, f64::min);
+            let clip_end = merged.iter().map(|m| m.1).fold(f64::NEG_INFINITY, f64::max);
+            let mut events: Vec<common::model::ImageEvent> = Vec::with_capacity(merged.len());
+            for (s, e, img) in merged {
+                let mut ev = common::model::ImageEvent {
+                    source_id: img,
+                    event_start_in_clip_beats: s - clip_start,
+                    event_length_beats: e - s,
+                    ..common::model::ImageEvent::default()
+                };
+                // build_mouth_events は rect を全画面 default で返すので、素材寸法から
+                // aspect-fit rect を計算して上書き (立ち絵の他の子レイヤーと収まりを揃える)。
+                if let Some(src) = self.song.image_sources.get(&img) {
                     let (x, y, w, h) = aspect_fit_pip_rect(res, (src.width, src.height));
                     ev.x = x;
                     ev.y = y;
                     ev.w = w;
                     ev.h = h;
                 }
+                events.push(ev);
             }
             let content_id = self.song.alloc_content(
                 common::model::ClipContent::Image(common::model::ImageContent { events }),
@@ -9404,8 +9659,8 @@ impl AppData {
             m.clips.push(Clip {
                 id: clip_id,
                 name: String::new(),
-                start_beat: r.clip_start_beat,
-                length_beats: r.clip_len_beats,
+                start_beat: clip_start,
+                length_beats: clip_end - clip_start,
                 content_id,
                 notes: Vec::new(),
                 color: None,
@@ -10391,6 +10646,8 @@ impl AppData {
                 speaker_id: c.speaker_id,
                 singer_name: c.singer_name.clone(),
                 style_name: c.style_name.clone(),
+                // (talk) per-clip 読み上げスケールも clipboard へ。
+                talk: c.talk,
             });
         }
         let count = clips.len();
@@ -10478,6 +10735,8 @@ impl AppData {
                 speaker_id: cc.speaker_id,
                 singer_name: cc.singer_name.clone(),
                 style_name: cc.style_name.clone(),
+                // (talk) per-clip 読み上げスケールも引き継ぐ。
+                talk: cc.talk,
             });
             new_refs.push(ClipRef {
                 track: target_idx as u32,
@@ -14062,6 +14321,12 @@ impl AppData {
             // 表示名は content から導出するので content_name は触らない
             // (デフォルト無名のまま、 clip_display_label が本文を表示)。
             self.is_dirty = true;
+            // (talk) Text は VOICEVOX トラックでは読み上げ原稿。本文変更を builtin へ
+            // 再 flush (= 新テキストで talk 再合成) + 口パク再生成。非 VOICEVOX
+            // トラックの Text 編集では sync_vocal_metadata は no-op、debounce も
+            // bound track 無しで無害。
+            self.sync_vocal_metadata();
+            self.mark_lipsync_dirty();
         }
         self.resync_clip_text_event_edit_buffers(target);
     }
@@ -15320,6 +15585,7 @@ impl AppData {
         let src_speaker = src_clip.speaker_id;
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
+        let src_talk = src_clip.talk;
         let track = self.song.tracks.get_mut(source.track as usize)?;
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
@@ -15335,6 +15601,7 @@ impl AppData {
             speaker_id: src_speaker,
             singer_name: src_singer,
             style_name: src_style,
+            talk: src_talk,
         });
         Some(ClipRef { track: source.track, clip: new_idx })
     }
@@ -15359,6 +15626,7 @@ impl AppData {
         let src_speaker = src_clip.speaker_id;
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
+        let src_talk = src_clip.talk;
         let new_content_id = self.song.fork_content(src_content_id);
         let track = self.song.tracks.get_mut(source.track as usize)?;
         let new_clip_id = track.alloc_clip_id();
@@ -15375,6 +15643,7 @@ impl AppData {
             speaker_id: src_speaker,
             singer_name: src_singer,
             style_name: src_style,
+            talk: src_talk,
         });
         Some(ClipRef { track: source.track, clip: new_idx })
     }
@@ -15459,6 +15728,7 @@ impl AppData {
                 src_clip.speaker_id,
                 src_clip.singer_name.clone(),
                 src_clip.style_name.clone(),
+                src_clip.talk,
             );
             let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
                 continue;
@@ -15480,6 +15750,7 @@ impl AppData {
                 speaker_id: src_voice.0,
                 singer_name: src_voice.1,
                 style_name: src_voice.2,
+                talk: src_voice.3,
             });
             new_refs.push(ClipRef {
                 track: to_track_idx as u32,
@@ -15513,6 +15784,7 @@ impl AppData {
                 src_clip.speaker_id,
                 src_clip.singer_name.clone(),
                 src_clip.style_name.clone(),
+                src_clip.talk,
             );
             let new_content_id = self.song.fork_content(src_content_id);
             let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
@@ -15535,6 +15807,7 @@ impl AppData {
                 speaker_id: src_voice.0,
                 singer_name: src_voice.1,
                 style_name: src_voice.2,
+                talk: src_voice.3,
             });
             new_refs.push(ClipRef {
                 track: to_track_idx as u32,
@@ -15622,6 +15895,8 @@ impl AppData {
             speaker_id,
             singer_name,
             style_name,
+            // (talk) 新規 clip は読み上げスケール未設定 (= 全既定)。
+            talk: None,
         });
         // デフォルトでクリップ名は無し (= content_name 未設定)。 表示名は
         // arrangement_view::clip_display_label が内容 (Text 本文 / ノート歌詞)
@@ -16015,6 +16290,51 @@ impl AppData {
         clip.style_name = style_name;
         // 声変更を builtin に反映 (= clip 単位で再合成)。
         self.sync_vocal_metadata();
+        // (talk) talk 声変更は phoneme (= 口パク) も変える (speaker で prosody が変わる)。
+        // sing 声変更は phoneme 不変 (QUERY_SPEAKER 固定) なので no-op に近いが無害。
+        self.mark_lipsync_dirty();
+    }
+
+    /// (talk) `SetClipTalkParam` 経由。Text clip の読み上げスケール 1 項目を
+    /// `Clip::talk` に焼き込み、builtin へ再 flush (= 新スケールで再合成)。全項目が
+    /// 既定なら `None` に畳む (serialize しない)。値が変わらないなら no-op。
+    fn set_clip_talk_param(
+        &mut self,
+        key: common::model::ClipKey,
+        param: TalkParamKind,
+        value: f32,
+    ) {
+        let Some(r) = self.clip_ref_of(key) else {
+            return;
+        };
+        let Some(clip) = self
+            .song
+            .tracks
+            .get_mut(r.track as usize)
+            .and_then(|t| t.clips.get_mut(r.clip as usize))
+        else {
+            return;
+        };
+        let mut talk = clip.talk.unwrap_or_default();
+        // VOICEVOX `audio_query` の受理範囲にクランプ (範囲外は 422 を返す)。
+        match param {
+            TalkParamKind::Speed => talk.speed_scale = value.clamp(0.5, 2.0),
+            TalkParamKind::Pitch => talk.pitch_scale = value.clamp(-0.15, 0.15),
+            TalkParamKind::Intonation => talk.intonation_scale = value.clamp(0.0, 2.0),
+            TalkParamKind::Volume => talk.volume_scale = value.clamp(0.0, 2.0),
+        }
+        let new_talk = if talk == common::model::TalkParams::default() {
+            None
+        } else {
+            Some(talk)
+        };
+        if clip.talk == new_talk {
+            return;
+        }
+        clip.talk = new_talk;
+        self.sync_vocal_metadata();
+        // (talk) スケール変更 (特に話速) は phoneme 長 = 口パクタイミングを変える。
+        self.mark_lipsync_dirty();
     }
 
     /// (FIXME #36) VOICEVOX engine が ready になったら `/singers` を取得して
@@ -16031,6 +16351,21 @@ impl AppData {
                 Vec::new()
             });
             proxy.send(AppEvent::SingersLoaded(singers));
+        });
+    }
+
+    /// (talk) VOICEVOX engine が ready になったら `/speakers` (talk 声一覧) を取得して
+    /// `SpeakersLoaded` を発行する。engine 起動 (`ensure_voicevox_engine`) と「再取得」
+    /// (`RefetchSpeakers`) から呼ぶ。background thread (= ready 待ち + blocking HTTP)。
+    fn spawn_fetch_speakers(&self) {
+        let proxy = self.event_proxy.clone();
+        std::thread::spawn(move || {
+            common::voicevox_engine::wait_until_ready();
+            let speakers = common::voicevox::fetch_speakers().unwrap_or_else(|e| {
+                tracing::warn!(error = ?e, "VOICEVOX /speakers fetch failed");
+                Vec::new()
+            });
+            proxy.send(AppEvent::SpeakersLoaded(speakers));
         });
     }
 
@@ -17939,6 +18274,9 @@ impl AppData {
         // (FIXME #36) engine が立ち上がる (or 既に起動中) のと並行して
         // /singers を取得し、 Clip Inspector の声 dropdown を埋める。
         self.spawn_fetch_singers();
+        // (talk) /speakers (talk 声一覧) も取得し、 Text clip Inspector の talk 声
+        // dropdown を埋める (`docs/plan_voicevox_talk.md` §4)。
+        self.spawn_fetch_speakers();
     }
 
     // -------- Plugin DB rescan --------------------------------------------
@@ -19843,7 +20181,7 @@ impl AppData {
         let track = &mut self.song.tracks[target.track as usize];
         // (FIXME #36) 前半は in-place で元 clip の声を保持。 後半 (新 clip) は
         // その声を引き継ぐ。
-        let (src_speaker, src_singer, src_style) = {
+        let (src_speaker, src_singer, src_style, src_talk) = {
             let clip_mut = &mut track.clips[target.clip as usize];
             clip_mut.length_beats = front_len;
             clip_mut.content_id = front_content_id;
@@ -19851,6 +20189,7 @@ impl AppData {
                 clip_mut.speaker_id,
                 clip_mut.singer_name.clone(),
                 clip_mut.style_name.clone(),
+                clip_mut.talk,
             )
         };
         let new_clip_id = track.alloc_clip_id();
@@ -19867,6 +20206,7 @@ impl AppData {
             speaker_id: src_speaker,
             singer_name: src_singer,
             style_name: src_style,
+            talk: src_talk,
         });
         new_selection.push(target);
         new_selection.push(ClipRef {
@@ -20114,14 +20454,14 @@ impl AppData {
 
             // (FIXME #36) merged clip は最初 (= 最も早い index = sorted 先頭) の
             // source clip の声を採用 (複数声混在時のポリシー)。 source 削除前に capture。
-            let (glue_speaker, glue_singer, glue_style) = {
+            let (glue_speaker, glue_singer, glue_style, glue_talk) = {
                 let track = &self.song.tracks[track_idx as usize];
                 refs.iter()
                     .map(|r| r.clip as usize)
                     .min()
                     .and_then(|i| track.clips.get(i))
-                    .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone()))
-                    .unwrap_or((0, String::new(), String::new()))
+                    .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone(), c.talk))
+                    .unwrap_or((0, String::new(), String::new(), None))
             };
             // Remove source clips (descending index to keep earlier
             // indices stable).
@@ -20150,6 +20490,7 @@ impl AppData {
                 speaker_id: glue_speaker,
                 singer_name: glue_singer,
                 style_name: glue_style,
+                talk: glue_talk,
             });
             new_refs.push(ClipRef {
                 track: track_idx,

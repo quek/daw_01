@@ -72,9 +72,85 @@ pub struct NoteMetadata {
     pub speaker_id: u32,
 }
 
+/// (talk) 1 件の読み上げ (= `ClipContent::Text` の 1 `TextEvent`) を builtin VOICEVOX
+/// に渡すメタデータ (`docs/plan_voicevox_talk.md` §3.2)。`NoteMetadata` の talk 版。
+/// builtin はこれを `event_id` ごとに talk 合成 (`/audio_query` → `/synthesis`) し、
+/// `start_beat` の song-absolute 位置へ配置する。再生は sequencer が `event_id` を
+/// note_id とする合成 note_on を `start_beat` で発火してトリガする。
+#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize, Default)]
+pub struct TalkMetadata {
+    /// `talk_event_id(clip_id, event_index)`。sing の `note_id` 空間 (= 通し index、
+    /// 小さい値) と衝突しない high band に置く。sequencer の note_on と builtin の
+    /// `note_offsets` がこの id で対応する。
+    pub event_id: u32,
+    /// 読み上げ開始位置 (song-absolute beat = `clip.start_beat +
+    /// event_start_in_clip_beats`)。
+    pub start_beat: f64,
+    /// 読み上げるテキスト (= `TextEvent.text`、表示字幕と同一文字列)。
+    pub text: String,
+    /// talk style speaker id (`/speakers`)。`0` = 未設定 → builtin が既定 talk
+    /// speaker にフォールバック。
+    pub speaker_id: u32,
+    /// 全体スケール (`TalkParams`)。`audio_query` 応答に patch される。
+    pub speed_scale: f32,
+    pub pitch_scale: f32,
+    pub intonation_scale: f32,
+    pub volume_scale: f32,
+}
+
+/// (talk) `event_id` の high band 起点。sing の `note_id` (= track 内 note 通し
+/// index、現実的に < 数万) と衝突しないよう十分高くする。
+pub const TALK_EVENT_ID_BASE: u32 = 1 << 28;
+/// (talk) 1 clip あたりの最大 TextEvent 数 (`event_id` 導出の基数)。
+pub const MAX_TEXT_EVENTS_PER_CLIP: u32 = 4096;
+
+/// (talk) `(clip_id, event_index)` から決定論的に `event_id` を導出する。flush
+/// (daw_gui) と再生トリガ (daw_audio sequencer) が**同じ式**で計算するので、running
+/// counter の skip 計数を同期させる必要がない (= §8 の id-space リスクを構造的に解消)。
+/// `clip_id` は track 内一意で安定 (`Clip::id`)、`event_index` は clip 内の TextEvent
+/// 位置。`saturating_*` で overflow を防ぐ (現実的な範囲では衝突しない)。
+#[must_use]
+pub fn talk_event_id(clip_id: u32, event_index: u32) -> u32 {
+    TALK_EVENT_ID_BASE
+        .saturating_add(clip_id.saturating_mul(MAX_TEXT_EVENTS_PER_CLIP))
+        .saturating_add(event_index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn talk_event_ids_are_unique_and_above_base() {
+        let a = talk_event_id(1, 0);
+        let b = talk_event_id(1, 1);
+        let c = talk_event_id(2, 0);
+        assert!(a >= TALK_EVENT_ID_BASE);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        // sing note_id (= 小さい通し index) とは重ならない。
+        assert!(talk_event_id(0, 0) > 100_000);
+    }
+
+    #[test]
+    fn talk_metadata_bincode_roundtrip() {
+        let m = TalkMetadata {
+            event_id: talk_event_id(3, 2),
+            start_beat: 8.0,
+            text: "こんにちは".to_string(),
+            speaker_id: 3,
+            speed_scale: 1.2,
+            pitch_scale: 0.0,
+            intonation_scale: 1.0,
+            volume_scale: 1.0,
+        };
+        let cfg = bincode::config::standard();
+        let bytes = bincode::encode_to_vec(&m, cfg).unwrap();
+        let (decoded, _): (TalkMetadata, usize) =
+            bincode::decode_from_slice(&bytes, cfg).unwrap();
+        assert_eq!(decoded, m);
+    }
 
     #[test]
     fn bincode_roundtrip() {

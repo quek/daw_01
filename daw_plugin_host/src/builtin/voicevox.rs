@@ -30,9 +30,12 @@ use arc_swap::ArcSwapOption;
 use bincode::{Decode, Encode};
 use common::plugin_db::BUILTIN_ID_VOICEVOX;
 use common::plugin_format::PluginFormat;
-use common::plugin_metadata::NoteMetadata;
+use common::model::TalkParams;
+use common::plugin_metadata::{NoteMetadata, TalkMetadata};
 use common::protocol::RenderMode;
-use common::voicevox::{BuiltinNoteSpec, BuiltinSynthOutput, synthesize_notes_for_builtin};
+use common::voicevox::{
+    BuiltinNoteSpec, BuiltinSynthOutput, synthesize_notes_for_builtin, synthesize_talk_for_builtin,
+};
 
 use crate::plugin_instance::{AuxInputBuf, LoadedPlugin, TimedNoteEvent};
 
@@ -72,6 +75,9 @@ impl Default for VoicevoxState {
 struct SynthJob {
     bpm: f32,
     groups: Vec<SpeakerSynthSpec>,
+    /// (talk) `ClipContent::Text` 由来の読み上げ群 (`docs/plan_voicevox_talk.md` §3.3)。
+    /// 歌唱 (`groups`) と同じ合成パスで song-absolute に配置し、1 連続バッファへ統合する。
+    talk: Vec<TalkSynthSpec>,
     /// FIXME #42: この job の世代 (= `synth_queued_gen` の値)。 synth thread は完了時に
     /// `synth_done_gen` をこの値へ進める。 歌唱 bounce の合成完了待ちに使う。
     generation: u64,
@@ -82,6 +88,17 @@ struct SynthJob {
 struct SpeakerSynthSpec {
     speaker_id: u32,
     notes: Vec<BuiltinNoteSpec>,
+}
+
+/// (talk) 1 件の読み上げ (= 1 `TextEvent`) の合成指定。`/audio_query` → `/synthesis`
+/// で 1 WAV を作り、`start_beat` の song-absolute 位置へ配置する。`event_id` は
+/// sequencer の talk-trigger note_on と builtin の `note_offsets` を対応させる鍵。
+struct TalkSynthSpec {
+    event_id: u32,
+    start_beat: f64,
+    text: String,
+    speaker_id: u32,
+    scales: TalkParams,
 }
 
 /// 合成済み 1 声グループの配置結果。
@@ -268,7 +285,9 @@ impl VoicevoxBuiltin {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         continue;
                     };
-                    if job.groups.iter().all(|c| c.notes.is_empty()) {
+                    if job.groups.iter().all(|c| c.notes.is_empty())
+                        && job.talk.is_empty()
+                    {
                         result_arc.store(None);
                         done_gen.store(job.generation, Ordering::SeqCst);
                         continue;
@@ -348,6 +367,43 @@ impl VoicevoxBuiltin {
                             Err(e) => {
                                 failed = Some(e);
                                 break;
+                            }
+                        }
+                    }
+                    // (talk) 読み上げ群を同じ placed バッファへ。1 TextEvent = 1 WAV を
+                    // `start_beat * spb` の song-absolute 位置に置き、note_offsets は
+                    // event_id → placement (= WAV 先頭。cursor jump で talk WAV を頭から
+                    // 流す)。process() は note_id / event_id を区別せず note_offsets を
+                    // 引くだけなので RT path は不変。
+                    if failed.is_none() {
+                        for tspec in &job.talk {
+                            if tspec.text.is_empty() {
+                                continue;
+                            }
+                            if shutdown.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            match synthesize_talk_for_builtin(
+                                &tspec.text,
+                                tspec.speaker_id,
+                                &tspec.scales,
+                            ) {
+                                Ok((samples, sample_rate)) => {
+                                    out_sr = sample_rate;
+                                    let spb = f64::from(sample_rate) * 60.0
+                                        / f64::from(job.bpm.max(0.001));
+                                    let place_samples =
+                                        (tspec.start_beat * spb).max(0.0).round() as usize;
+                                    placed.push((
+                                        place_samples,
+                                        samples,
+                                        vec![(tspec.event_id, place_samples as u64)],
+                                    ));
+                                }
+                                Err(e) => {
+                                    failed = Some(e);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -637,7 +693,7 @@ impl LoadedPlugin for VoicevoxBuiltin {
         Ok(())
     }
 
-    fn set_note_metadata(&mut self, bpm: f32, entries: &[NoteMetadata]) {
+    fn set_note_metadata(&mut self, bpm: f32, entries: &[NoteMetadata], talk: &[TalkMetadata]) {
         // 内部 lyrics map を完全置換 (introspection 用)。
         self.lyrics.clear();
         for e in entries {
@@ -680,14 +736,42 @@ impl LoadedPlugin for VoicevoxBuiltin {
             .map(|(speaker_id, notes)| SpeakerSynthSpec { speaker_id, notes })
             .collect();
 
+        // (talk) 読み上げ群を TalkSynthSpec に。speaker_id 0 = 未設定は default talk
+        // speaker へ解決 (歌唱 default = sing style とは別 id 空間。talk は /speakers)。
+        let talk_specs: Vec<TalkSynthSpec> = talk
+            .iter()
+            .map(|t| TalkSynthSpec {
+                event_id: t.event_id,
+                start_beat: t.start_beat,
+                text: t.text.clone(),
+                speaker_id: if t.speaker_id != 0 {
+                    t.speaker_id
+                } else {
+                    common::voicevox::DEFAULT_TALK_SPEAKER_ID
+                },
+                scales: TalkParams {
+                    speed_scale: t.speed_scale,
+                    pitch_scale: t.pitch_scale,
+                    intonation_scale: t.intonation_scale,
+                    volume_scale: t.volume_scale,
+                },
+            })
+            .collect();
+
         // FIXME #42: 世代を 1 進めてから job に乗せる。 synth thread が完了でこの世代まで
         // synth_done_gen を進めるので、 歌唱 bounce は done >= この値 を待てばよい。
         let generation = self.synth_queued_gen.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(tx) = self.synth_tx.as_ref() {
-            let _ = tx.send(SynthJob { bpm, groups, generation });
+            let _ = tx.send(SynthJob {
+                bpm,
+                groups,
+                talk: talk_specs,
+                generation,
+            });
         }
         tracing::debug!(
             count = self.lyrics.len(),
+            talk = talk.len(),
             bpm,
             "VoicevoxBuiltin: lyrics buffer updated, synth job queued"
         );
@@ -828,15 +912,60 @@ mod tests {
         // synth_tx は activate 前の flush でも自動起動するので、 thread が
         // 起動して channel に送信される (= HTTP は呼ばれるが engine 不在で
         // 失敗ログのみ、 test 自体には影響なし)。
-        p.set_note_metadata(120.0, &[mk(0, "あ"), mk(1, "い")]);
+        p.set_note_metadata(120.0, &[mk(0, "あ"), mk(1, "い")], &[]);
         let lyrics = p.lyrics_for_test();
         assert_eq!(lyrics.len(), 2);
         assert_eq!(lyrics.get(&1).map(String::as_str), Some("い"));
         // 空 flush で全消去。
-        p.set_note_metadata(120.0, &[]);
+        p.set_note_metadata(120.0, &[], &[]);
         assert_eq!(p.lyrics_for_test().len(), 0);
         // synth thread を停止 (= test process が hang しないよう)。
         p.stop_synth_thread();
+    }
+
+    /// (talk) builtin の talk 経路を実 VOICEVOX engine に対して end-to-end 検証
+    /// (`docs/plan_voicevox_talk.md` §3.3)。`set_note_metadata(talk)` → synth thread →
+    /// 実 engine 合成 → `synth_result` に非無音 PCM + event_id 起点の note_offset。
+    /// engine (localhost:50021) が要るので通常 test では無視。
+    #[test]
+    #[ignore = "requires a running VOICEVOX engine at localhost:50021"]
+    fn talk_metadata_synthesizes_via_real_engine() {
+        let mut p = VoicevoxBuiltin::new();
+        p.activate(48000.0, 0, 256).unwrap();
+        let eid = common::plugin_metadata::talk_event_id(1, 0);
+        let talk = vec![TalkMetadata {
+            event_id: eid,
+            start_beat: 0.0,
+            text: "こんにちは".to_string(),
+            speaker_id: common::voicevox::DEFAULT_TALK_SPEAKER_ID,
+            speed_scale: 1.0,
+            pitch_scale: 0.0,
+            intonation_scale: 1.0,
+            volume_scale: 1.0,
+        }];
+        p.set_note_metadata(120.0, &[], &talk);
+        // synth thread (background, blocking HTTP) の完了を待つ (queued → done)。
+        let (queued, done) = p.voicevox_synth_progress().unwrap();
+        let target = queued.load(Ordering::SeqCst);
+        let mut ok = false;
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) >= target {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(ok, "synth thread completed within 10s");
+        let res = p.synth_result.load_full().expect("synth_result present after talk synth");
+        assert!(!res.samples.is_empty(), "talk synth produced samples");
+        let rms =
+            (res.samples.iter().map(|s| s * s).sum::<f32>() / res.samples.len() as f32).sqrt();
+        assert!(rms > 0.001, "talk audio is non-silent (rms={rms})");
+        assert!(
+            res.note_offsets.contains_key(&eid),
+            "note_offsets keyed by talk event_id"
+        );
+        p.deactivate();
     }
 
     #[test]

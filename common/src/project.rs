@@ -110,6 +110,41 @@ fn migrate_vocal_source_to_clips(value: &mut serde_json::Value) {
     }
 }
 
+/// (v26) device-gated text overlay 移行 (`docs/plan_voicevox_talk.md` §6)。
+/// v25 以前は `ClipContent::Text` がトラック非依存で常時 overlay 表示されていた。
+/// v26 で `builtin.video.subtitle` device が表示ゲートになったため、旧プロジェクトの
+/// 「Text clip を 1 つ以上持つトラック」へ字幕デバイスを auto-insert して見た目を保つ。
+/// idempotent (既に字幕デバイスを持つトラックは no-op)。**version-gate 前提** — 新規
+/// プロジェクトには適用しない (= ユーザーが字幕デバイスを抜いた「喋るが映さない」
+/// トラックを誤って表示化しない)。caller が `project.version < CURRENT_VERSION` で gate。
+fn migrate_text_overlay_to_subtitle_device(song: &mut Song) {
+    use crate::model::ClipContent;
+    // clip_contents は tracks と別 borrow になるので、Text な content_id を先に集める。
+    let text_content_ids: std::collections::HashSet<crate::model::ContentId> = song
+        .clip_contents
+        .iter()
+        .filter(|(_, c)| matches!(c, ClipContent::Text(_)))
+        .map(|(id, _)| *id)
+        .collect();
+    for track in &mut song.tracks {
+        let has_text_clip = track
+            .clips
+            .iter()
+            .any(|c| text_content_ids.contains(&c.content_id));
+        if has_text_clip && !track.has_subtitle_device() {
+            track.devices.push(crate::model::PluginInstance::with_ports(
+                crate::plugin_db::SUBTITLE_ID.to_string(),
+                crate::plugin_format::PluginFormat::Builtin,
+                crate::port_config::PortConfig {
+                    has_video_input: true,
+                    has_video_output: true,
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+}
+
 pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     let path = path.as_ref();
     let text = fs::read_to_string(path)
@@ -149,6 +184,13 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
         );
     }
     let mut song = project.song;
+    // (v26) 旧プロジェクト (= device-gated text overlay 以前) の Text 持ちトラックへ
+    // 字幕デバイスを補い、表示を保つ。normalize の前に挿すことで、追加 device も
+    // 他 device と同じ正規化 (aux migration 等) を通る。新規 (version == CURRENT) は
+    // 対象外 = 「喋るが映さない」を温存。
+    if project.version < CURRENT_VERSION {
+        migrate_text_overlay_to_subtitle_device(&mut song);
+    }
     // Re-establish every invariant the codebase assumes about a loaded
     // song in one SSoT call: value-range sanity (bpm/time_sig/length/loop
     // — defends downstream divisors against 0/NaN from corrupt files),
@@ -169,8 +211,157 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Clip, ClipContent, InstrumentSource, MidiContent, Note, Track};
+    use crate::model::{
+        Clip, ClipContent, InstrumentSource, MidiContent, Note, TextContent, TextEvent, Track,
+    };
     use tempfile::tempdir;
+
+    /// version `v` の project file を `path` に書く (song は Rust で組んで serialize)。
+    /// device-gated text overlay 移行 (v26) の version-gate を試すための helper。
+    fn write_project_with_version(path: &Path, song: &Song, v: u32) {
+        let song_value = serde_json::to_value(song).unwrap();
+        let project = serde_json::json!({ "version": v, "song": song_value });
+        std::fs::write(path, serde_json::to_string(&project).unwrap()).unwrap();
+    }
+
+    /// Text clip 1 つを持つ非 vocal トラック 1 本だけの song (字幕デバイス無し)。
+    fn song_with_one_text_clip() -> Song {
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Text(TextContent {
+                events: vec![TextEvent {
+                    text: "こんにちは".into(),
+                    event_length_beats: 8.0,
+                    ..TextEvent::default()
+                }],
+            }),
+        );
+        let mut track = Track {
+            id: 1,
+            name: "Subs".into(),
+            ..Track::default()
+        };
+        track.clips.push(Clip {
+            id: 1,
+            start_beat: 0.0,
+            length_beats: 8.0,
+            content_id: cid,
+            ..Clip::default()
+        });
+        song.tracks.push(track);
+        song
+    }
+
+    #[test]
+    fn migrate_v25_text_overlay_adds_subtitle_device() {
+        // v25 (= device-gated text 以前) は Text overlay がトラック非依存で常時表示。
+        // load 時に Text 持ちトラックへ字幕デバイスが補われ、表示が保たれる。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old.daw");
+        write_project_with_version(&path, &song_with_one_text_clip(), 25);
+        let song = load(&path).unwrap();
+        assert!(
+            song.tracks[0].has_subtitle_device(),
+            "v25 の Text 持ちトラックへ字幕デバイスが auto-insert される"
+        );
+    }
+
+    #[test]
+    fn migrate_skips_when_subtitle_device_already_present() {
+        // 既に字幕デバイスを持つ v25 トラックは二重挿入しない (idempotent)。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old_with_dev.daw");
+        let mut song = song_with_one_text_clip();
+        song.tracks[0]
+            .devices
+            .push(crate::model::PluginInstance::with_ports(
+                crate::plugin_db::SUBTITLE_ID.to_string(),
+                crate::plugin_format::PluginFormat::Builtin,
+                crate::port_config::PortConfig {
+                    has_video_input: true,
+                    has_video_output: true,
+                    ..Default::default()
+                },
+            ));
+        write_project_with_version(&path, &song, 25);
+        let loaded = load(&path).unwrap();
+        let n = loaded.tracks[0]
+            .devices
+            .iter()
+            .filter(|d| d.plugin_id == crate::plugin_db::SUBTITLE_ID)
+            .count();
+        assert_eq!(n, 1, "字幕デバイスは二重挿入されない");
+    }
+
+    /// (talk) 実機 end-to-end 検証用の fixture 生成 (`docs/plan_voicevox_talk.md` §7)。
+    /// VOICEVOX device 付きトラック + 読み上げテキストの Text clip を 1 本持つ .daw を
+    /// `target/talk_fixture.daw` に書く。`daw_gui --script` がこれを load → exportWav し、
+    /// 出力 WAV の非無音判定で「full pipeline で実際に喋る」を headless 検証する。
+    /// 通常 test では不要なので `#[ignore]` (= 明示実行で再生成)。
+    #[test]
+    #[ignore = "fixture generator: writes target/talk_fixture.daw"]
+    fn gen_talk_fixture() {
+        use crate::model::{PluginInstance, TextContent, TextEvent};
+        use crate::port_config::PortConfig;
+        let mut song = Song::default();
+        song.bpm = 120.0;
+        song.length_beats = 16.0;
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Text(TextContent {
+                events: vec![TextEvent {
+                    text: "こんにちは。これは読み上げのテストです。".into(),
+                    event_start_in_clip_beats: 0.0,
+                    event_length_beats: 8.0,
+                    ..TextEvent::default()
+                }],
+            }),
+        );
+        let mut track = Track {
+            id: 1,
+            name: "Talk".into(),
+            ..Track::default()
+        };
+        // VOICEVOX builtin (instrument: note_in → audio_out)。= is_voicevox_vocal。
+        track.devices.push(PluginInstance::with_ports(
+            crate::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
+            crate::plugin_format::PluginFormat::Builtin,
+            PortConfig {
+                has_note_input: true,
+                has_audio_output: true,
+                ..Default::default()
+            },
+        ));
+        track.clips.push(Clip {
+            id: 1,
+            start_beat: 0.0,
+            length_beats: 8.0,
+            content_id: cid,
+            speaker_id: crate::voicevox::DEFAULT_TALK_SPEAKER_ID,
+            ..Clip::default()
+        });
+        song.tracks.push(track);
+        let path = Path::new(r"F:\dev\daw_01\target\talk_fixture.daw");
+        save(path, &song).unwrap();
+        eprintln!("wrote talk fixture: {}", path.display());
+    }
+
+    #[test]
+    fn no_migration_for_current_version_text_clip() {
+        // v26 (= CURRENT) の Text 持ちトラックは migration 対象外。字幕デバイスを
+        // 抜いた「喋るが映さない」トラックを誤って表示化しない。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("new.daw");
+        write_project_with_version(&path, &song_with_one_text_clip(), CURRENT_VERSION);
+        let song = load(&path).unwrap();
+        assert!(
+            !song.tracks[0].has_subtitle_device(),
+            "新規 (v26) の Text 持ちトラックには字幕デバイスを補わない"
+        );
+    }
 
     #[test]
     fn save_and_load_default_song() {
@@ -231,6 +422,7 @@ mod tests {
                 speaker_id: 3061,
                 singer_name: "中国うさぎ".into(),
                 style_name: "ノーマル".into(),
+                talk: None,
             }],
             ..Track::default()
         });

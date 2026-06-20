@@ -12,7 +12,7 @@ use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{
     text_num_to_builtin, AppData, AppEvent, ClipRef, ColorPickerTarget, DiscreteClipEdit,
-    FadeEdgeKind, InspectorScrubField, TextNumField,
+    FadeEdgeKind, InspectorScrubField, TalkParamKind, TextNumField,
 };
 use crate::view::modulation::{self as mod_widget, build_mod, scrub_field_mod, ModBuild};
 use crate::view::track_color;
@@ -1332,7 +1332,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // を expose。 FIXME #15: numeric field は scrubable_number 化され、
     // on_change が `TextNumField` discriminator 付き `SetClipTextNumField` を
     // 直接 dispatch する (drag / type 両対応、 undo は Begin/EndInspectorScrub)。
-    if let Some(summary) = app.inspector_text_event_summary() {
+    //
+    // (talk/v26) これは「字幕の見た目」編集 UI。字幕 (`builtin.video.subtitle`) device が
+    // 挿さっているトラック (= 画面表示が有効) のときだけ出す。device 無しで字幕パラメータが
+    // 出るのは無意味なので gate する (`docs/plan_voicevox_talk.md`)。本文 (セリフ) 自体は
+    // talk 節 (VOICEVOX device 時) でも編集できるので、ここで隠しても talk-only トラックの
+    // テキスト編集は失われない。
+    let text_track_has_subtitle = app
+        .selected_clip_ref()
+        .and_then(|r| app.song.tracks.get(r.track as usize))
+        .is_some_and(common::model::Track::has_subtitle_device);
+    if text_track_has_subtitle && let Some(summary) = app.inspector_text_event_summary() {
         if app.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -1826,6 +1836,274 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }));
             }
             y += 28.0;
+        }
+    }
+
+    // (talk) Text Clip 読み上げ編集 (`docs/plan_voicevox_talk.md` §4)。選択中 clip が
+    // VOICEVOX デバイス付きトラック上の Text clip のとき、talk 話者 (キャラ→talk style)
+    // + 読み上げスケール 4 つ (話速/音高/抑揚/音量) を編集する。声は `Clip::speaker_id`
+    // を talk style として流用 (SetClipVoice で焼き込み)。スケールは `Clip::talk`。
+    if let Some(r) = app.selected_clip_ref()
+        && let Some(track) = app.song.tracks.get(r.track as usize)
+        && track.is_voicevox_vocal()
+        && let Some(clip) = track.clips.get(r.clip as usize)
+        && app
+            .song
+            .clip_contents
+            .get(&clip.content_id)
+            .is_some_and(|c| matches!(c, common::model::ClipContent::Text(_)))
+    {
+        let clip_key = common::model::ClipKey {
+            track_id: track.id,
+            clip_id: clip.id,
+        };
+        let cur_speaker = clip.speaker_id;
+        let has_subtitle = track.has_subtitle_device();
+        let talk = clip.talk.unwrap_or_default();
+        // 現在の talk 声名: clip 焼き込み名 → speaker_id 逆引き → 空 (取得中表示)。
+        let (cur_char, cur_style) = if !clip.singer_name.is_empty() {
+            (clip.singer_name.clone(), clip.style_name.clone())
+        } else {
+            app.talk_speakers
+                .iter()
+                .find_map(|s| {
+                    s.styles
+                        .iter()
+                        .find(|st| st.id == cur_speaker)
+                        .map(|st| (s.name.clone(), st.name.clone()))
+                })
+                .unwrap_or_default()
+        };
+
+        ui.label_at(
+            "inspector_talk_label",
+            "読み上げ (Talk)",
+            area.x + pad,
+            y,
+            12.0,
+            TEXT,
+        );
+        y += 18.0;
+
+        // 字幕デバイス未挿入 = 画面非表示。ワンクリック追加ヘルパ (Q10)。
+        if !has_subtitle {
+            let warn_rect = Rect {
+                x: area.x + pad,
+                y,
+                w: area.w - pad * 2.0,
+                h: 22.0,
+            };
+            if ui.button_at_clicked(
+                "inspector_talk_add_subtitle",
+                "+ 字幕デバイス (画面に表示)",
+                warn_rect,
+            ) {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::SelectPluginFromDb {
+                        id: common::plugin_db::SUBTITLE_ID.to_string(),
+                        keep_open: false,
+                        open_gui: false,
+                    });
+                }));
+            }
+            y += 26.0;
+        }
+
+        // (talk) 本文 (セリフ) 入力。字幕 device 時は overlay「Text Event」節が本文入力を
+        // 持つので、ここは字幕 device 無し (= 喋るが映さない talk-only) のときだけ出し、
+        // 二重入力を避ける。編集 buffer / events は overlay と共用 (同時表示しないので競合せず)。
+        if !has_subtitle {
+            if app.clip_edit_buffer_target != Some(r) {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ResyncClipTextEditBuffers(r));
+                }));
+            }
+            ui.label_at(
+                "inspector_talk_text_label",
+                "セリフ",
+                area.x + pad,
+                y + 5.0,
+                11.0,
+                TEXT,
+            );
+            let resp = ui.text_input_at(
+                "inspector_talk_text_input",
+                Rect {
+                    x: area.x + pad + 48.0,
+                    y,
+                    w: area.w - pad * 2.0 - 48.0,
+                    h: 22.0,
+                },
+                &app.clip_text_content_edit_text,
+                |s| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::ClipTextContentEditChanged(s))
+                    })
+                },
+            );
+            if resp.committed {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::CommitClipTextContentEdit)
+                }));
+            }
+            y += 26.0;
+        }
+
+        // talk 話者 picker (キャラ → talk style)。
+        if app.talk_speakers.is_empty() {
+            let txt = if cur_char.is_empty() {
+                "(talk 声一覧 取得中…)".to_string()
+            } else {
+                format!("{cur_char} - {cur_style}  (一覧取得中…)")
+            };
+            ui.label_at(
+                "inspector_talk_voice_current",
+                &txt,
+                area.x + pad + 4.0,
+                y + 6.0,
+                11.0,
+                TEXT,
+            );
+            y += 26.0;
+        } else {
+            let char_labels: Vec<&str> =
+                app.talk_speakers.iter().map(|s| s.name.as_str()).collect();
+            let cur_char_idx = app
+                .talk_speakers
+                .iter()
+                .position(|s| s.name == cur_char)
+                .or_else(|| {
+                    app.talk_speakers
+                        .iter()
+                        .position(|s| s.styles.iter().any(|st| st.id == cur_speaker))
+                })
+                .unwrap_or(0);
+            let char_rect = Rect {
+                x: area.x + pad,
+                y,
+                w: area.w - pad * 2.0,
+                h: 24.0,
+            };
+            let picked_char =
+                ui.dropdown("inspector_talk_char", char_rect, &char_labels, cur_char_idx);
+            y += 28.0;
+
+            let char_idx = picked_char
+                .unwrap_or(cur_char_idx)
+                .min(app.talk_speakers.len() - 1);
+            let speaker = &app.talk_speakers[char_idx];
+            let style_labels: Vec<&str> =
+                speaker.styles.iter().map(|st| st.name.as_str()).collect();
+            let cur_style_idx = speaker
+                .styles
+                .iter()
+                .position(|st| st.id == cur_speaker)
+                .unwrap_or(0);
+            let style_rect = Rect {
+                x: area.x + pad,
+                y,
+                w: area.w - pad * 2.0,
+                h: 24.0,
+            };
+            let picked_style = ui.dropdown(
+                "inspector_talk_style",
+                style_rect,
+                &style_labels,
+                cur_style_idx,
+            );
+            y += 28.0;
+
+            let chosen: Option<(u32, String, String)> = if let Some(pc) = picked_char {
+                app.talk_speakers.get(pc).and_then(|s| {
+                    s.styles
+                        .first()
+                        .map(|st| (st.id, s.name.clone(), st.name.clone()))
+                })
+            } else if let Some(ps) = picked_style {
+                speaker
+                    .styles
+                    .get(ps)
+                    .map(|st| (st.id, speaker.name.clone(), st.name.clone()))
+            } else {
+                None
+            };
+            if let Some((sid, sn, stn)) = chosen {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetClipVoice {
+                        clip: clip_key,
+                        speaker_id: sid,
+                        singer_name: sn.clone(),
+                        style_name: stn.clone(),
+                    });
+                }));
+            }
+
+            let refetch_rect = Rect {
+                x: area.x + pad,
+                y,
+                w: area.w - pad * 2.0,
+                h: 22.0,
+            };
+            if ui.button_at_clicked(
+                "inspector_talk_refetch",
+                "talk 声一覧を再取得",
+                refetch_rect,
+            ) {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::RefetchSpeakers);
+                }));
+            }
+            y += 28.0;
+        }
+
+        // 読み上げスケール 4 つ。VOICEVOX talk の話速/音高/抑揚/音量。
+        let scales = [
+            ("話速", TalkParamKind::Speed, f64::from(talk.speed_scale), 1.0),
+            ("音高", TalkParamKind::Pitch, f64::from(talk.pitch_scale), 0.0),
+            (
+                "抑揚",
+                TalkParamKind::Intonation,
+                f64::from(talk.intonation_scale),
+                1.0,
+            ),
+            ("音量", TalkParamKind::Volume, f64::from(talk.volume_scale), 1.0),
+        ];
+        for (label, kind, val, default) in scales {
+            ui.label_at(
+                ("inspector_talk_scale_label", label),
+                label,
+                area.x + pad,
+                y + 4.0,
+                11.0,
+                TEXT,
+            );
+            let input_rect = Rect {
+                x: area.x + pad + 48.0,
+                y,
+                w: area.w - pad * 2.0 - 48.0,
+                h: 20.0,
+            };
+            ui.scrubable_number_at(
+                ("inspector_talk_scale", label),
+                input_rect,
+                val,
+                default,
+                ScrubableNumberFormat::Decimal(2),
+                &SCRUB_STYLE_INSPECTOR,
+                "Inspector",
+                move |v| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetClipTalkParam {
+                            clip: clip_key,
+                            param: kind,
+                            value: v as f32,
+                        });
+                    })
+                },
+                None,
+                None,
+            );
+            y += 24.0;
         }
     }
 

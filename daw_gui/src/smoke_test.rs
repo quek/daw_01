@@ -244,6 +244,20 @@ pub fn spawn_text_overlay_orchestrator(proxy: EventLoopProxy<AppEvent>) {
             if proxy.send_event(AppEvent::AddInstrumentTrack).is_err() {
                 fail("event loop closed before AddInstrumentTrack could be sent");
             }
+            // (v26) text overlay 表示は字幕 (`builtin.video.subtitle`) device で
+            // gate される。新規 track は明示挿入が前提なので、smoke では
+            // AddInstrumentTrack 直後 (= cursor track が新 track) に字幕デバイスを
+            // 挿す。これが無いと text は scene に push されず capture が真っ黒になる。
+            if proxy
+                .send_event(AppEvent::SelectPluginFromDb {
+                    id: common::plugin_db::SUBTITLE_ID.to_string(),
+                    keep_open: false,
+                    open_gui: false,
+                })
+                .is_err()
+            {
+                fail("event loop closed before SelectPluginFromDb (subtitle) could be sent");
+            }
             if proxy
                 .send_event(AppEvent::AddTextClipAt {
                     track: 1,

@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 use crate::plugin_format::PluginFormat;
 use crate::scale::ScaleChange;
 
+/// `26` 字幕デバイスゲート + VOICEVOX トーク (`docs/plan_voicevox_talk.md`):
+/// `Clip.talk: Option<TalkParams>` 追加 (= 読み上げ全体スケール、`#[serde(default)]`)。
+/// テキストオーバーレイ表示が `builtin.video.subtitle` device の有無で gate される
+/// ようになり、v25 以前 (= 全トラック常時表示) の `.daw` は load 時に Text 持ち
+/// トラックへ字幕デバイスを auto-insert して表示を保つ (`project::migrate_text_overlay_
+/// to_subtitle_device`、version-gate)。新規 .daw は migration 対象外なので「喋るが
+/// 映さない」(VOICEVOX device のみ) を表現できる。
+///
 /// `24` プロジェクト識別子 (`docs/plan_fixme_33_clipboard.md`, FIXME #33):
 /// `Song.project_id: u64` が追加される。New で 1 度採番し Save/Load で保持する
 /// document 固有の安定 ID で、クリップボード round-trip 時に「同一プロジェクト由来か」を
@@ -141,7 +149,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 25;
+pub const CURRENT_VERSION: u32 = 26;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -2337,6 +2345,17 @@ impl Track {
         })
     }
 
+    /// (talk) このトラックが字幕(テキスト表示)デバイスを持つか。SSoT は
+    /// 「builtin 字幕 device を実際に持つか」(`is_voicevox_vocal` と同思想)。
+    /// `true` のときだけ、このトラック上の `ClipContent::Text` clip が画面に
+    /// overlay 表示される (`docs/plan_voicevox_talk.md` §2、`text_compose` が gate)。
+    pub fn has_subtitle_device(&self) -> bool {
+        self.devices.iter().any(|d| {
+            d.format == crate::plugin_format::PluginFormat::Builtin
+                && d.plugin_id == crate::plugin_db::SUBTITLE_ID
+        })
+    }
+
     /// Allocate a new stable clip id, bumping the per-track counter.
     pub fn alloc_clip_id(&mut self) -> u32 {
         let id = self.next_clip_id.max(1);
@@ -3021,6 +3040,36 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+/// (talk) VOICEVOX 読み上げの全体スケール。`ClipContent::Text` clip が VOICEVOX
+/// デバイス付きトラックに居るとき、その clip の全 `TextEvent` をこの 1 声・1 スケールで
+/// 読み上げる。値は VOICEVOX `audio_query` 応答 JSON の同名フィールドへ patch してから
+/// `/synthesis` に渡す (`docs/plan_voicevox_talk.md` §3.1)。VOICEVOX talk UI の
+/// 話速 / 音高 / 抑揚 / 音量 に対応。`Clip::talk == None` は「全部既定」を意味する。
+/// 声 (talk style) は別フィールド `Clip::speaker_id` を流用する (Text clip では talk
+/// style id、MIDI clip では sing style id と解釈し、content 種別で分岐する)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct TalkParams {
+    /// 話速 (speedScale)。`1.0` = 等速。VOICEVOX 推奨範囲 0.5..=2.0。
+    pub speed_scale: f32,
+    /// 音高 (pitchScale)。`0.0` = 既定。VOICEVOX 推奨範囲 -0.15..=0.15。
+    pub pitch_scale: f32,
+    /// 抑揚 (intonationScale)。`1.0` = 既定。`0.0` で棒読み。
+    pub intonation_scale: f32,
+    /// 音量 (volumeScale)。`1.0` = 等倍。
+    pub volume_scale: f32,
+}
+
+impl Default for TalkParams {
+    fn default() -> Self {
+        Self {
+            speed_scale: 1.0,
+            pitch_scale: 0.0,
+            intonation_scale: 1.0,
+            volume_scale: 1.0,
+        }
+    }
+}
+
 /// A clip is a free-time container of notes positioned along the song
 /// timeline. `start_beat` and `length_beats` define where the clip lives;
 /// the actual notes are stored in `Song.clip_contents` keyed by
@@ -3087,6 +3136,12 @@ pub struct Clip {
     /// (FIXME #36) 表示用スタイル名 (例: "ノーマル" / "へろへろ")。同上。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub style_name: String,
+    /// (talk) VOICEVOX 読み上げの全体スケール (話速/音高/抑揚/音量)。
+    /// `ClipContent::Text` clip が VOICEVOX デバイス付きトラックに居るときだけ意味を
+    /// 持つ (`docs/plan_voicevox_talk.md`)。`None` = 全既定。声 (talk style) は
+    /// `Clip::speaker_id` を流用する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub talk: Option<TalkParams>,
 }
 
 /// Shared content referenced by one or more `Clip`s via
@@ -5217,6 +5272,7 @@ mod tests {
                     speaker_id: 3061,
                     singer_name: "中国うさぎ".into(),
                     style_name: "ノーマル".into(),
+                    talk: None,
                 }],
                 ..Track::default()
             }],
@@ -5240,7 +5296,10 @@ mod tests {
         // (`docs/plan_fixme_33_clipboard.md`, clipboard same-project detection).
         // v25 (FIXME #54 Wave3): 旧 `group_transform` 持ちトラックに `builtin.video.transform`
         // 配置 device を `ensure_ids` で補う (additive、値 migration 無し)。
-        assert_eq!(CURRENT_VERSION, 25);
+        // v26 (`docs/plan_voicevox_talk.md`): `Clip.talk` 追加 + テキストオーバーレイ表示が
+        // `builtin.video.subtitle` device gate になり、v25 以前は load 時に Text 持ち
+        // トラックへ字幕デバイスを auto-insert (`project::migrate_text_overlay_to_subtitle_device`)。
+        assert_eq!(CURRENT_VERSION, 26);
     }
 
     #[test]

@@ -414,6 +414,11 @@ pub enum MainToChild {
         plugin_id: u32,
         bpm: f32,
         entries: Vec<crate::plugin_metadata::NoteMetadata>,
+        /// (talk) 同トラックの `ClipContent::Text` 由来の読み上げ群
+        /// (`docs/plan_voicevox_talk.md` §3.2)。歌唱 (`entries`) と talk を同じ
+        /// flush で運び、builtin が 1 つの合成 job (= 1 連続バッファ) に統合する。
+        /// IPC 専用 (= 全プロセス同時 rebuild) なので bincode 後方互換は不要。
+        talk: Vec<crate::plugin_metadata::TalkMetadata>,
     },
     /// FIXME #42: 歌唱 bounce の前に builtin VOICEVOX の合成完了を要求する。 直前に
     /// 送った `SetBuiltinPluginNoteMetadata` の世代まで synth が終わったら plugin host が
@@ -797,6 +802,16 @@ mod tests {
                     speaker_id: 3061,
                 },
             ],
+            talk: vec![crate::plugin_metadata::TalkMetadata {
+                event_id: crate::plugin_metadata::talk_event_id(7, 0),
+                start_beat: 4.0,
+                text: "こんにちは".to_string(),
+                speaker_id: 3,
+                speed_scale: 1.1,
+                pitch_scale: 0.0,
+                intonation_scale: 1.0,
+                volume_scale: 1.0,
+            }],
         };
         assert_eq!(roundtrip(&msg), msg);
     }
