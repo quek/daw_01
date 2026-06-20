@@ -23,6 +23,10 @@ const COLOR_HINT: Color = Color { r: 0.62, g: 0.65, b: 0.72, a: 1.0 };
 
 const PANEL_W: f32 = 380.0;
 const PANEL_H: f32 = 210.0;
+/// FIXME #79: Mp4 は範囲に加えて解像度 / fps の dropdown 行を最下段に持つので背が高い。
+/// dropdown の popup は panel 下端より下 (= 暗転 overlay、 widget 無し) に開くため、
+/// ボタン行を dropdown 行の **上** に置く (popup と button の z / 入力衝突を構造的に回避)。
+const PANEL_H_MP4: f32 = 220.0;
 const PAD: f32 = 18.0;
 const ROW_H: f32 = 26.0;
 const FIELD_W: f32 = 130.0;
@@ -54,6 +58,32 @@ const SCRUB_STYLE: ScrubableNumberStyle = ScrubableNumberStyle {
     range: None,
 };
 
+/// FIXME #79: video export の出力解像度プリセット (label, width, height)。 すべて
+/// 偶数 (H.264 yuv420p は幅・高さが偶数必須)。 dropdown の closed 表示と選択肢の
+/// 両方に使う。 既定 (= プロジェクト現在値 1920x1080) は `RES_DEFAULT_IDX`。
+const RES_PRESETS: &[(&str, u32, u32)] = &[
+    ("3840 × 2160 (4K UHD)", 3840, 2160),
+    ("2560 × 1440 (QHD)", 2560, 1440),
+    ("1920 × 1080 (FHD)", 1920, 1080),
+    ("1280 × 720 (HD)", 1280, 720),
+    ("854 × 480 (SD)", 854, 480),
+    ("1080 × 1920 (縦型 9:16)", 1080, 1920),
+    ("1080 × 1080 (正方形 1:1)", 1080, 1080),
+];
+/// FHD の `RES_PRESETS` index。 picker 値が一覧に無い (理論上のみ) ときの fallback。
+const RES_DEFAULT_IDX: usize = 2;
+
+/// FIXME #79: video export の出力フレームレートプリセット (label, fps)。 整数のみ。
+const FPS_PRESETS: &[(&str, f32)] = &[
+    ("24", 24.0),
+    ("25", 25.0),
+    ("30", 30.0),
+    ("50", 50.0),
+    ("60", 60.0),
+];
+/// 30 fps の `FPS_PRESETS` index。 picker 値が一覧に無いときの fallback。
+const FPS_DEFAULT_IDX: usize = 2;
+
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let Some(picker) = app.export_range_picker else {
         if ui.is_modal_open("export_range") {
@@ -71,16 +101,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let end_beat = picker.end_beat;
     // dblclick リセット時の default: 開始=曲頭(0)、 終了=曲末(length_beats)。
     let song_len = app.song.length_beats;
+    // FIXME #79: Mp4 のときだけ出力解像度 / fps の dropdown を出す。 値は picker が
+    // 保持する per-export override (open 時に Song から seed 済み)。
+    let is_mp4 = matches!(kind, ExportRangeKind::Mp4);
+    let resolution = picker.resolution;
+    let framerate = picker.framerate;
+    let panel_size = if is_mp4 { (PANEL_W, PANEL_H_MP4) } else { (PANEL_W, PANEL_H) };
 
     ui.modal(
         "export_range",
-        (PANEL_W, PANEL_H),
+        panel_size,
         &MODAL_STYLE,
         None,
         move |ui, panel| {
             let title = match kind {
                 ExportRangeKind::Wav => "WAV 書き出し範囲",
-                ExportRangeKind::Mp4 => "Video 書き出し範囲",
+                ExportRangeKind::Mp4 => "Video 書き出し設定",
             };
             ui.label_at(
                 "exr_title",
@@ -145,8 +181,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 }));
             }
 
-            // ---- ボタン行 (右下: Export / 左: キャンセル) ----
-            let btn_y = panel.y + panel.h - PAD - BTN_H;
+            // ---- ボタン行 (右: Export / 左: キャンセル) ----
+            // FIXME #79: Mp4 は dropdown 行を最下段に置く (popup が panel 下端より下の
+            // 暗転領域に開けるよう、 button より下に widget を置かない)。 ボタンは終了行
+            // の直下に上げる。 Wav は従来どおり panel 最下部。
+            let btn_y = if is_mp4 {
+                row1_y + ROW_H + 16.0
+            } else {
+                panel.y + panel.h - PAD - BTN_H
+            };
             let export_x = panel.x + panel.w - PAD - BTN_W;
             if ui.button_at_clicked(
                 "exr_confirm",
@@ -166,6 +209,58 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::CancelExportRange)
                 }));
+            }
+
+            // ---- FIXME #79: 出力解像度 / fps (Mp4 のみ、 最下段に side-by-side) ----
+            // dropdown を最後に描く + panel 下端 (widget 無し) に popup を開かせるので、
+            // popup と他 widget の z / 入力衝突が起きない。 popup は modal の z 上で出る
+            // (modal body と同じ popup_buffer の後方 = 最前面)。
+            if is_mp4 {
+                let dd_y = btn_y + BTN_H + 16.0;
+                // 解像度
+                ui.label_at(
+                    "exr_res_label",
+                    "解像度",
+                    panel.x + PAD,
+                    dd_y + 6.0,
+                    13.0,
+                    COLOR_TEXT,
+                );
+                let res_labels: Vec<&str> =
+                    RES_PRESETS.iter().map(|(l, _, _)| *l).collect();
+                let res_sel = RES_PRESETS
+                    .iter()
+                    .position(|(_, w, h)| *w == resolution.0 && *h == resolution.1)
+                    .unwrap_or(RES_DEFAULT_IDX);
+                let res_rect = Rect { x: panel.x + PAD + 50.0, y: dd_y, w: 168.0, h: ROW_H };
+                if let Some(idx) = ui.dropdown("exr_res_dd", res_rect, &res_labels, res_sel) {
+                    let (_, w, h) = RES_PRESETS[idx];
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetExportResolution(w, h))
+                    }));
+                }
+                // fps
+                let fps_label_x = res_rect.x + res_rect.w + 16.0;
+                ui.label_at(
+                    "exr_fps_label",
+                    "fps",
+                    fps_label_x,
+                    dd_y + 6.0,
+                    13.0,
+                    COLOR_TEXT,
+                );
+                let fps_labels: Vec<&str> = FPS_PRESETS.iter().map(|(l, _)| *l).collect();
+                let fps_sel = FPS_PRESETS
+                    .iter()
+                    .position(|(_, f)| (*f - framerate).abs() < 0.001)
+                    .unwrap_or(FPS_DEFAULT_IDX);
+                let fps_rect = Rect { x: fps_label_x + 30.0, y: dd_y, w: 58.0, h: ROW_H };
+                if let Some(idx) = ui.dropdown("exr_fps_dd", fps_rect, &fps_labels, fps_sel) {
+                    let (_, f) = FPS_PRESETS[idx];
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetExportFramerate(f))
+                    }));
+                }
             }
         },
     );

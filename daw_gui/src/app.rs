@@ -688,6 +688,14 @@ pub struct ExportRangePicker {
     pub end_beat: f64,
     /// 確定後に戻る export 種別。
     pub kind: ExportRangeKind,
+    /// FIXME #79: video export の出力解像度 `(width, height)`。 picker を開いた
+    /// 時点で `Song.video_resolution` を seed し、 dropdown で変更する。 確定時に
+    /// `RenderConfig.output_resolution` へ渡る per-export override (Song /
+    /// preview には永続しない)。 `Wav` では未使用。
+    pub resolution: (u32, u32),
+    /// FIXME #79: video export の出力フレームレート。 picker を開いた時点で
+    /// `Song.video_framerate` を seed し、 dropdown で変更する。 `Wav` では未使用。
+    pub framerate: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
@@ -1777,6 +1785,12 @@ pub struct AppData {
     /// 始めるときに `RenderConfig::with_range_beats` へ渡す (音声 temp WAV も
     /// 同じ窓に trim 済みなので A/V が揃う)。 `None` = 全曲。
     pub pending_video_export_range: Option<(f64, f64)>,
+    /// FIXME #79: video export 待ちの出力解像度 `(w, h)` と fps。
+    /// `pending_video_export` と対で立ち、 `ExportWavComplete` で video render を
+    /// 始めるときに `RenderConfig::with_output_resolution` / `with_output_framerate`
+    /// へ渡す per-export override (= export ダイアログで選んだ値。 Song / preview
+    /// には永続しない)。 `None` = video export 待ちでない (= プロジェクト値を使用)。
+    pub pending_video_export_dims: Option<((u32, u32), f32)>,
     /// FIXME #55: a WAV export request held while the plugin host reinitialises
     /// all plugins (deactivate→activate) for a clean offline cold render. Set by
     /// [`Self::begin_wav_export`] (which sends `ReinitAllPlugins`); fired
@@ -1974,9 +1988,12 @@ pub enum FileDialogKind {
     /// プロジェクト (.daw) を開く。
     OpenProject,
     /// video export の mp4 出力先 (Windows のみ到達)。 FIXME #55: レンジ
-    /// ピッカーで選んだ書き出し窓 (拍)。 `None` = 全曲。
+    /// ピッカーで選んだ書き出し窓 (拍)。 `None` = 全曲。 FIXME #79: 出力解像度
+    /// `(w, h)` と fps (= picker で選んだ per-export override)。
     ExportMp4 {
         range_beats: Option<(f64, f64)>,
+        resolution: (u32, u32),
+        framerate: f32,
     },
     /// WAV 書き出し。 FIXME #55: レンジピッカーで選んだ書き出し窓 (sample
     /// frame; beat→frame 変換済み)。 `None` = 全曲。
@@ -2218,6 +2235,7 @@ impl AppData {
             pending_video_export: None,
             export_temp_wav: None,
             pending_video_export_range: None,
+            pending_video_export_dims: None,
             pending_export: None,
             export_range_picker: None,
             undo_stack: VecDeque::new(),
@@ -4976,6 +4994,12 @@ pub enum AppEvent {
     SetExportRangeEnd(f64),
     /// レンジピッカーを「全曲」 (start=0, end=length_beats) に戻す。
     ResetExportRange,
+    /// FIXME #79: video export の出力解像度 `(width, height)` を更新 (dropdown
+    /// から)。 picker が開いている間だけ有効。 per-export override で Song /
+    /// preview には反映しない。
+    SetExportResolution(u32, u32),
+    /// FIXME #79: video export の出力フレームレートを更新 (dropdown から)。
+    SetExportFramerate(f32),
     /// レンジピッカーを確定し、 `kind` に応じた export action (file dialog) を
     /// 起動する。 picker は閉じる。
     ConfirmExportRange,
@@ -5102,10 +5126,13 @@ pub enum AppEvent {
     /// (`docs/plan_video.md` P8). FIXME #55: `range_beats` restricts the
     /// rendered window to `[start_beat, end_beat)` (`None` = whole song);
     /// the muxed `audio_wav` is already trimmed to the same window.
+    /// FIXME #79: `dims` = picker で選んだ出力解像度 `(w, h)` と fps の
+    /// per-export override (`None` = プロジェクト値)。
     ExportMp4 {
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
         range_beats: Option<(f64, f64)>,
+        dims: Option<((u32, u32), f32)>,
     },
     /// 映像 render thread が発火（`done` / `total` フレーム）。`export_stage` を
     /// `VideoRender` に更新して進捗オーバーレイに反映。非 undoable。
@@ -6474,6 +6501,23 @@ impl AppData {
                     p.end_beat = self.song.length_beats.max(MIN_EXPORT_RANGE_BEATS);
                 }
             }
+            AppEvent::SetExportResolution(w, h) => {
+                // FIXME #79: dropdown はプリセット (全て偶数・正値) しか出さないが、
+                // 念のため 0 を弾く (encoder は w/h != 0 を要求)。
+                if let Some(p) = self.export_range_picker.as_mut()
+                    && w > 0
+                    && h > 0
+                {
+                    p.resolution = (w, h);
+                }
+            }
+            AppEvent::SetExportFramerate(fps) => {
+                if let Some(p) = self.export_range_picker.as_mut()
+                    && fps > 0.0
+                {
+                    p.framerate = fps;
+                }
+            }
             AppEvent::ConfirmExportRange => {
                 self.confirm_export_range();
             }
@@ -6570,12 +6614,12 @@ impl AppData {
                     self.perform_guard_action(action);
                 }
             }
-            AppEvent::ExportMp4 { output_path, audio_wav, range_beats } => {
+            AppEvent::ExportMp4 { output_path, audio_wav, range_beats, dims } => {
                 #[cfg(windows)]
-                self.action_export_mp4(output_path, audio_wav, range_beats);
+                self.action_export_mp4(output_path, audio_wav, range_beats, dims);
                 #[cfg(not(windows))]
                 {
-                    let _ = (output_path, audio_wav, range_beats);
+                    let _ = (output_path, audio_wav, range_beats, dims);
                     self.status_message =
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
@@ -6988,13 +7032,17 @@ impl AppData {
                     // FIXME #55: 音声と同じ拍範囲で video を render する (= 全曲
                     // なら None)。 取り出して消費。
                     let range_beats = self.pending_video_export_range.take();
+                    // FIXME #79: picker で選んだ出力解像度 / fps の per-export
+                    // override。 None (= 旧経路) なら action_export_mp4 が
+                    // プロジェクト値にフォールバックする。
+                    let dims = self.pending_video_export_dims.take();
                     if cancelled {
                         // 前段（音声）でキャンセル → video export 全体を中止し、
                         // 映像 render には進まない。
                         if let Some(t) = self.export_temp_wav.take() {
                             let _ = std::fs::remove_file(&t);
                         }
-                        let _ = (mp4_path, range_beats);
+                        let _ = (mp4_path, range_beats, dims);
                         self.status_message = "Video export をキャンセルしました".into();
                     } else {
                         // 1 ステップ video export の音声レンダリング完了 → video
@@ -7016,9 +7064,9 @@ impl AppData {
                             None => self.export_temp_wav.clone(),
                         };
                         #[cfg(windows)]
-                        self.action_export_mp4(mp4_path, wav, range_beats);
+                        self.action_export_mp4(mp4_path, wav, range_beats, dims);
                         #[cfg(not(windows))]
-                        let _ = (mp4_path, wav, range_beats);
+                        let _ = (mp4_path, wav, range_beats, dims);
                     }
                 } else if cancelled {
                     self.status_message = "WAV 書き出しをキャンセルしました".into();
@@ -19174,6 +19222,10 @@ impl AppData {
             start_beat,
             end_beat,
             kind,
+            // FIXME #79: 既定はプロジェクト現在値 (= 1920x1080 / 30)。 dropdown で
+            // 変更した値は per-export override として確定時に運ばれる。
+            resolution: self.song.video_resolution,
+            framerate: self.song.video_framerate,
         });
     }
 
@@ -19200,11 +19252,14 @@ impl AppData {
                 );
             }
             ExportRangeKind::Mp4 => {
+                // FIXME #79: picker で選んだ出力解像度 / fps を後段へ運ぶ。
+                let resolution = picker.resolution;
+                let framerate = picker.framerate;
                 #[cfg(windows)]
-                self.action_open_export_mp4_dialog(range_beats);
+                self.action_open_export_mp4_dialog(range_beats, resolution, framerate);
                 #[cfg(not(windows))]
                 {
-                    let _ = range_beats;
+                    let _ = (range_beats, resolution, framerate);
                     self.status_message =
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
@@ -19871,7 +19926,12 @@ impl AppData {
     /// `None` = 全曲。 二重起動ガードはピッカーを開く時点 (`open_export_range_picker`)
     /// で済んでいるが、 ピッカー表示中に状態が変わる経路は無いので念のため残す。
     #[cfg(windows)]
-    fn action_open_export_mp4_dialog(&mut self, range_beats: Option<(f64, f64)>) {
+    fn action_open_export_mp4_dialog(
+        &mut self,
+        range_beats: Option<(f64, f64)>,
+        resolution: (u32, u32),
+        framerate: f32,
+    ) {
         if self.export_stage.is_some()
             || self.pending_video_export.is_some()
             || self.export_dialog_open
@@ -19895,7 +19955,7 @@ impl AppData {
         self.spawn_file_dialog(
             dialog,
             FileDialogMode::Save,
-            FileDialogKind::ExportMp4 { range_beats },
+            FileDialogKind::ExportMp4 { range_beats, resolution, framerate },
         );
     }
 
@@ -19909,6 +19969,8 @@ impl AppData {
         &mut self,
         output_path: PathBuf,
         range_beats: Option<(f64, f64)>,
+        resolution: (u32, u32),
+        framerate: f32,
     ) {
         // audio engine が死んでいる (audio_tx=None) と前段の音声 render が
         // start できず ExportWavComplete が来ない → overlay 永久ロック。
@@ -19922,6 +19984,9 @@ impl AppData {
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
         self.pending_video_export = Some(output_path);
         self.pending_video_export_range = range_beats;
+        // FIXME #79: 音声 render 完了後に始める video render へ、 picker で選んだ
+        // 出力解像度 / fps を per-export override として持ち越す。
+        self.pending_video_export_dims = Some((resolution, framerate));
         self.export_temp_wav = Some(temp_wav.clone());
         // 前段 = 音声 freewheel。daw_audio の `ExportWavProgress` で determinate
         // 進捗が来る（旧構造では indeterminate「音声レンダリング中」だった）。
@@ -20008,17 +20073,17 @@ impl AppData {
                     self.action_open_path(path);
                 }
             }
-            FileDialogKind::ExportMp4 { range_beats } => {
+            FileDialogKind::ExportMp4 { range_beats, resolution, framerate } => {
                 // 二重起動ガードを解除し、 Some なら export フロー開始。
                 self.export_dialog_open = false;
                 match paths.into_iter().next() {
                     #[cfg(windows)]
                     Some(output_path) => {
-                        self.action_begin_export_mp4(output_path, range_beats)
+                        self.action_begin_export_mp4(output_path, range_beats, resolution, framerate)
                     }
                     #[cfg(not(windows))]
                     Some(_output_path) => {
-                        let _ = range_beats;
+                        let _ = (range_beats, resolution, framerate);
                         self.status_message =
                             "Video export は Windows 専用 (WMF 経由) です".into();
                     }
@@ -20119,6 +20184,9 @@ impl AppData {
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
         range_beats: Option<(f64, f64)>,
+        // FIXME #79: picker で選んだ出力解像度 / fps の per-export override。
+        // `None` ならプロジェクト値 (`Song.video_resolution` / `video_framerate`) を使う。
+        dims: Option<((u32, u32), f32)>,
     ) {
         // 何らかの export が走っている間は再入を弾く。video 後段への chain は
         // `ExportWavComplete` ハンドラが先に `export_stage` を None に戻してから
@@ -20140,10 +20208,18 @@ impl AppData {
         std::thread::spawn(move || {
             // FIXME #55: video の render 窓も拍範囲に合わせる (audio temp WAV は
             // 既に同じ窓に trim 済み → frame 0 で A/V が揃う)。
+            // FIXME #79: per-export override を分解 (None ならビルダーに None を渡し、
+            // RenderConfig が resolved_* で song 値へフォールバックする)。
+            let (override_res, override_fps) = match dims {
+                Some((res, fps)) => (Some(res), Some(fps)),
+                None => (None, None),
+            };
             let cfg = crate::render_video::RenderConfig::new(&song, &output_path)
                 .with_project_dir(project_dir.as_deref())
                 .with_audio_wav(audio_wav.as_deref())
-                .with_range_beats(range_beats);
+                .with_range_beats(range_beats)
+                .with_output_resolution(override_res)
+                .with_output_framerate(override_fps);
             // 進捗は 5 フレームごと（+ 開始 / 完了）に間引いて送る（毎フレーム
             // 送ると event queue を圧迫する）。
             let mut last_sent = 0u64;

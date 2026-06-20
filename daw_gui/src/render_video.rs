@@ -57,6 +57,19 @@ pub struct RenderConfig<'a> {
     /// audio export writes only its requested frame range starting at
     /// sample 0), so video and audio stay aligned at output frame 0.
     pub range_beats: Option<(f64, f64)>,
+    /// FIXME #79: per-export output resolution `(width, height)` chosen in the
+    /// export dialog. `None` = use the project canvas (`Song.video_resolution`).
+    /// When `Some`, the `OffscreenRenderer` composites directly at this size, so
+    /// clips are aspect-fit (letterboxed) onto the chosen canvas with no extra
+    /// resample — identical to changing the project canvas, but ephemeral (the
+    /// project / preview are left untouched).
+    pub output_resolution: Option<(u32, u32)>,
+    /// FIXME #79: per-export output frame rate chosen in the export dialog.
+    /// `None` = use the project frame rate (`Song.video_framerate`). The frame
+    /// loop steps at this rate (one composited frame per output tick), so it is
+    /// purely an output-timeline parameter — audio (beat→sample) is unaffected
+    /// and A/V stay aligned at output frame 0.
+    pub output_framerate: Option<f32>,
 }
 
 impl<'a> RenderConfig<'a> {
@@ -69,6 +82,8 @@ impl<'a> RenderConfig<'a> {
             video_bitrate: 5_000_000,
             audio_bitrate: 192_000,
             range_beats: None,
+            output_resolution: None,
+            output_framerate: None,
         }
     }
 
@@ -87,6 +102,34 @@ impl<'a> RenderConfig<'a> {
     pub fn with_range_beats(mut self, range: Option<(f64, f64)>) -> Self {
         self.range_beats = range;
         self
+    }
+
+    /// FIXME #79: override the output resolution for this export. `None` keeps
+    /// the project canvas (`Song.video_resolution`).
+    pub fn with_output_resolution(mut self, resolution: Option<(u32, u32)>) -> Self {
+        self.output_resolution = resolution;
+        self
+    }
+
+    /// FIXME #79: override the output frame rate for this export. `None` keeps
+    /// the project frame rate (`Song.video_framerate`).
+    pub fn with_output_framerate(mut self, framerate: Option<f32>) -> Self {
+        self.output_framerate = framerate;
+        self
+    }
+
+    /// FIXME #79: the effective output resolution — the per-export override if
+    /// set, else the project canvas. SSoT for "what size this export encodes at".
+    #[must_use]
+    pub fn resolved_resolution(&self) -> (u32, u32) {
+        self.output_resolution.unwrap_or(self.song.video_resolution)
+    }
+
+    /// FIXME #79: the effective output frame rate — the per-export override if
+    /// set, else the project frame rate.
+    #[must_use]
+    pub fn resolved_framerate(&self) -> f32 {
+        self.output_framerate.unwrap_or(self.song.video_framerate)
     }
 }
 
@@ -116,15 +159,19 @@ pub fn render_mp4_cancellable(
     crate::import_video::ensure_mf_startup_pub()
         .map_err(|e| format!("MFStartup: {e}"))?;
 
-    let (out_w, out_h) = cfg.song.video_resolution;
+    // FIXME #79: output dims/fps come from the per-export override (export
+    // dialog) when set, else the project canvas (`Song`). The OffscreenRenderer
+    // composites directly at `out_w x out_h`, so a chosen size just re-letterboxes
+    // the clips onto that canvas (no extra resample).
+    let (out_w, out_h) = cfg.resolved_resolution();
     if out_w == 0 || out_h == 0 {
         return Err(format!(
-            "invalid project video_resolution {out_w}x{out_h}"
+            "invalid export video_resolution {out_w}x{out_h}"
         ));
     }
-    let framerate = cfg.song.video_framerate;
+    let framerate = cfg.resolved_framerate();
     if framerate <= 0.0 {
-        return Err(format!("invalid project video_framerate {framerate}"));
+        return Err(format!("invalid export video_framerate {framerate}"));
     }
     if cfg.song.bpm <= 0.0 {
         return Err(format!("invalid project bpm {}", cfg.song.bpm));
@@ -646,26 +693,50 @@ fn resolve_video_source_path(
 mod tests {
     use super::*;
 
-    /// End-to-end smoke: build a tiny project with one video track +
-    /// one video clip pointing at an `ffmpeg`-generated source mp4,
-    /// run `render_mp4`, and check the output exists + WMF can re-read
-    /// it (= the container + H.264 stream were finalized correctly).
-    /// Audio is skipped (video-only mp4) to keep the test fast and
-    /// avoid pulling AAC encode setup into the smoke.
+    /// FIXME #79: the export output dims/fps default to the project canvas, but
+    /// a per-export override (export dialog) wins when set. This is the SSoT the
+    /// render loop reads — project values stay untouched (ephemeral override).
     #[test]
-    fn render_mp4_video_only_smoke() {
-        let Some(ffmpeg) = locate_ffmpeg() else {
-            eprintln!("render_mp4: ffmpeg not on PATH, skipping");
-            return;
+    fn resolved_dims_use_override_else_project() {
+        let song = Song {
+            video_resolution: (1920, 1080),
+            video_framerate: 30.0,
+            ..Song::default()
         };
-        let dir = tempfile::tempdir().unwrap();
-        let src_mp4 = dir.path().join("src.mp4");
-        let out_mp4 = dir.path().join("out.mp4");
-        // 1 second @ 30fps blue source.
-        let status = std::process::Command::new(&ffmpeg)
+        let out = std::path::PathBuf::from("out.mp4");
+
+        // No override → project canvas / project fps.
+        let base = RenderConfig::new(&song, &out);
+        assert_eq!(base.resolved_resolution(), (1920, 1080));
+        assert_eq!(base.resolved_framerate(), 30.0);
+
+        // Resolution override only → fps still falls back to project.
+        let res_only = RenderConfig::new(&song, &out).with_output_resolution(Some((1280, 720)));
+        assert_eq!(res_only.resolved_resolution(), (1280, 720));
+        assert_eq!(res_only.resolved_framerate(), 30.0);
+
+        // Both overridden (e.g. vertical 9:16 @ 60).
+        let both = RenderConfig::new(&song, &out)
+            .with_output_resolution(Some((1080, 1920)))
+            .with_output_framerate(Some(60.0));
+        assert_eq!(both.resolved_resolution(), (1080, 1920));
+        assert_eq!(both.resolved_framerate(), 60.0);
+    }
+
+    /// Test helper: generate a `w x h` blue H.264 source mp4 via the `ffmpeg`
+    /// CLI (1 second @ 30fps). Returns the written source path.
+    fn gen_blue_source(
+        ffmpeg: &std::path::Path,
+        dir: &std::path::Path,
+        w: u32,
+        h: u32,
+    ) -> std::path::PathBuf {
+        let src_mp4 = dir.join("src.mp4");
+        let lavfi = format!("color=c=blue:size={w}x{h}:duration=1:rate=30");
+        let status = std::process::Command::new(ffmpeg)
             .args([
                 "-f", "lavfi",
-                "-i", "color=c=blue:size=320x240:duration=1:rate=30",
+                "-i", &lavfi,
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-y",
@@ -676,15 +747,17 @@ mod tests {
             .status()
             .expect("ffmpeg run");
         assert!(status.success());
+        src_mp4
+    }
 
-        // Build a song: 1 video track, 1 clip 4 beats long @ 120 BPM
-        // (= 2 seconds). The source is only 1 second so the second
-        // half renders the last-frame fallback (= acceptable for
-        // smoke).
+    /// Test helper: a 1-video-track song, 1 clip 4 beats @ 120 BPM (= 2 seconds),
+    /// project canvas `(w, h)` @ 30fps, pointing at `src_mp4` (1s source → the
+    /// second half renders the last-frame fallback, acceptable for smoke).
+    fn build_one_video_song(src_mp4: std::path::PathBuf, w: u32, h: u32) -> Song {
         let mut song = Song {
             bpm: 120.0,
             length_beats: 4.0,
-            video_resolution: (320, 240),
+            video_resolution: (w, h),
             video_framerate: 30.0,
             ..Song::default()
         };
@@ -693,8 +766,8 @@ mod tests {
             vsrc_id,
             common::model::VideoSource {
                 path: common::model::VideoSourcePath::Absolute(src_mp4),
-                width: 320,
-                height: 240,
+                width: w,
+                height: h,
                 framerate: 30.0,
                 duration_micros: 1_000_000,
                 codec: "h264".into(),
@@ -733,6 +806,25 @@ mod tests {
             ..Default::default()
         });
         song.tracks.push(track);
+        song
+    }
+
+    /// End-to-end smoke: build a tiny project with one video track +
+    /// one video clip pointing at an `ffmpeg`-generated source mp4,
+    /// run `render_mp4`, and check the output exists + WMF can re-read
+    /// it (= the container + H.264 stream were finalized correctly).
+    /// Audio is skipped (video-only mp4) to keep the test fast and
+    /// avoid pulling AAC encode setup into the smoke.
+    #[test]
+    fn render_mp4_video_only_smoke() {
+        let Some(ffmpeg) = locate_ffmpeg() else {
+            eprintln!("render_mp4: ffmpeg not on PATH, skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out_mp4 = dir.path().join("out.mp4");
+        let src_mp4 = gen_blue_source(&ffmpeg, dir.path(), 320, 240);
+        let song = build_one_video_song(src_mp4, 320, 240);
 
         let cfg = RenderConfig::new(&song, &out_mp4);
         let stats = match render_mp4(&cfg) {
@@ -761,6 +853,47 @@ mod tests {
             .expect("output mp4 should be readable by WMF");
         assert_eq!(md.width, 320);
         assert_eq!(md.height, 240);
+        assert_eq!(md.codec, "h264");
+    }
+
+    /// FIXME #79: the per-export output resolution + fps override must propagate
+    /// all the way through the OffscreenRenderer + encoder into the actual mp4 —
+    /// output dimensions equal the override (1280x720), NOT the project canvas
+    /// (320x240), and the higher fps (60) yields ~double the frame count. This is
+    /// the end-to-end proof that "書き出し時だけ指定" works (project untouched).
+    #[test]
+    fn render_mp4_honors_output_resolution_and_fps_override() {
+        let Some(ffmpeg) = locate_ffmpeg() else {
+            eprintln!("render_mp4: ffmpeg not on PATH, skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out_mp4 = dir.path().join("out.mp4");
+        let src_mp4 = gen_blue_source(&ffmpeg, dir.path(), 320, 240);
+        // Project canvas is 320x240 @ 30; the export overrides to 1280x720 @ 60.
+        let song = build_one_video_song(src_mp4, 320, 240);
+
+        let cfg = RenderConfig::new(&song, &out_mp4)
+            .with_output_resolution(Some((1280, 720)))
+            .with_output_framerate(Some(60.0));
+        let stats = match render_mp4(&cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("override smoke: encoder unavailable ({e}); skipping");
+                return;
+            }
+        };
+        assert!(out_mp4.exists(), "output mp4 should exist");
+        // 2 seconds @ 60fps = 120 frames (ceil rounding).
+        assert!(
+            stats.frames_written >= 118 && stats.frames_written <= 122,
+            "frame count near 120 (60fps override), got {}",
+            stats.frames_written
+        );
+        let md = crate::import_video::extract_metadata(&out_mp4)
+            .expect("output mp4 should be readable by WMF");
+        assert_eq!(md.width, 1280, "output width = override, not project canvas");
+        assert_eq!(md.height, 720, "output height = override, not project canvas");
         assert_eq!(md.codec, "h264");
     }
 
