@@ -387,11 +387,13 @@ fn spawn_incoming_bridge(
                     index,
                     plugin_id,
                     params,
+                    has_embedded_gui,
                 } => Some(AppEvent::PluginParamListFromChild {
                     track,
                     index,
                     plugin_id,
                     params,
+                    has_embedded_gui,
                 }),
                 ChildToMain::PluginParamTouched {
                     track,

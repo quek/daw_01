@@ -71,6 +71,16 @@ impl AppDirs {
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
+
+    /// `<root>\voicevox_cache\` — VOICEVOX 合成結果 (WAV) の per-user 永続
+    /// キャッシュ (FIXME #77)。 合成 wav は (歌詞 / pitch / bpm / speaker) の
+    /// 純粋関数 = コンテンツアドレス可能なので、 プロジェクト跨ぎで再利用できる
+    /// per-user global に置く。 プロジェクトを開き直しても再合成しないための
+    /// ディスクキャッシュ。 合成プロセス (daw_plugin_host) も `dirs::data_local
+    /// _dir` (env ベース) で同じ root を解決できる。
+    pub fn voicevox_cache_dir(&self) -> PathBuf {
+        self.root.join("voicevox_cache")
+    }
 }
 
 #[cfg(test)]

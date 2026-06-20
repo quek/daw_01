@@ -204,6 +204,12 @@ pub enum ChildToMain {
         index: u32,
         plugin_id: u32,
         params: Vec<PluginParamInfo>,
+        /// FIXME #78: この plugin が埋め込み GUI (editor window) を持つか
+        /// (`LoadedPlugin::gui_is_embed_supported`)。 daw_gui はチェーン行の
+        /// ボタンを分岐する: GUI あり = editor window を開く「GUI」、 なし =
+        /// インライン param パネルをトグルする「⚙」。 builtin (VOICEVOX /
+        /// Silence) は false。
+        has_embedded_gui: bool,
     },
     /// Phase 2: plugin GUI で knob を **touch** した通知 (= CLAP
     /// `CLAP_EVENT_PARAM_GESTURE_BEGIN` / VST3 `IComponentHandler
@@ -762,6 +768,7 @@ mod tests {
                         | plugin_param_flags::PERIODIC,
                 },
             ],
+            has_embedded_gui: true,
         };
         assert_eq!(roundtrip(&msg), msg);
     }

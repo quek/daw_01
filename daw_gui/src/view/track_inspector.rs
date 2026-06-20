@@ -347,7 +347,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let body_top = y;
     let max_param_h = (area.y + area.h - body_top - CHAIN_MIN_H).max(0.0);
     let content_h = app.inspector_body_h.max(1.0);
-    let param_h = content_h.min(max_param_h);
+    // FIXME #78: param viewport の高さは **常に最大** に固定する。 旧実装は
+    // `content_h.min(max_param_h)` で content に追従させていたため、 device の
+    // 「Par」パラメータパネルを開くと content_h が増えて viewport が伸び、
+    // chain band (= Par ボタン) が下にずれて「押した瞬間ボタンが動く / 表示して
+    // すぐ非表示」 という操作不能感を生んでいた。 高さを固定すると boundary_y が
+    // パネル開閉で不変になり、 chain band が一切動かない (= Par トグルが安定)。
+    // content < viewport の余白は scroll 領域内の空きになるだけで無害。
+    let param_h = max_param_h;
     let param_vp = Rect { x: area.x, y: body_top, w: area.w, h: param_h };
     let boundary_y = body_top + param_h;
     let measured_body_h = std::cell::Cell::new(0.0_f32);
@@ -1076,6 +1083,98 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += input_h + 12.0;
     }
 
+    // ---- Plugin chain + 行内アコーディオン (FIXME #78) -----------------
+    // チェーン (プラグイン一覧) を viewport 内に出し、 各行の Par で開いたデバイスの
+    // param パネルを **その行の直下** に展開する (`reorderable_list_expandable`)。 開いた
+    // 行だけ `row_extra_h > 0` → expansion クロージャが呼ばれ、 中の各 section gate が
+    // その開いたデバイスの params を描く。 展開高は前フレーム測定値
+    // (`inspector_device_panel_h`、 未測定は default で bootstrap して 1 度描かせる)。
+    {
+        let chain = app.inspector_chain();
+        let cursor_tid = app.cursor_track_id();
+        let row_total_h = CHAIN_LIST_STYLE.row_height + CHAIN_LIST_STYLE.row_gap;
+        // 開いているデバイスの chain device_index (open_plugin_params / open_video_fx_params、
+        // cursor track 上のものだけ)。
+        let open_dev: Option<u32> = app
+            .open_plugin_params
+            .or(app.open_video_fx_params)
+            .filter(|(t, _)| Some(*t) == cursor_tid)
+            .map(|(_, idx)| idx);
+        let panel_h = if app.inspector_device_panel_h > 1.0 {
+            app.inspector_device_panel_h
+        } else {
+            280.0 // 初回 bootstrap: expansion を 1 度描かせて実測させる
+        };
+        let chain_h = chain.len() as f32 * row_total_h
+            + if open_dev.is_some() { panel_h } else { 0.0 }
+            + 4.0;
+        let btn_gui_w = 44.0;
+        let btn_x_w = 30.0;
+        ui.label_at("inspector_chain_label", "Chain", area.x + pad, y, 12.0, TEXT);
+        y += 18.0;
+        let chain_rect = Rect { x: area.x, y, w: area.w, h: chain_h };
+        ui.reorderable_list_expandable(
+            "inspector_chain",
+            chain_rect,
+            &chain,
+            None,
+            &CHAIN_LIST_STYLE,
+            |req| match req {
+                ReorderableListEditRequest::Reorder(order) => {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::ReorderInspectorChain(order.clone()));
+                    })
+                }
+            },
+            |ui, entry, idx, row_rect, _selected, _dragging| {
+                ui.label_at(
+                    ("inspector_row_name", idx),
+                    &entry.plugin_name,
+                    row_rect.x + 8.0,
+                    row_rect.y + 8.0,
+                    11.0,
+                    TEXT,
+                );
+                let device_index = entry.device_index;
+                let gui_x = row_rect.x + row_rect.w - btn_gui_w - btn_x_w - 4.0;
+                if entry.shows_button() {
+                    let label = if entry.shows_param_panel() { "Par" } else { "GUI" };
+                    ui.button_at(
+                        ("inspector_row_gui", idx),
+                        label,
+                        Rect { x: gui_x, y: row_rect.y + 2.0, w: btn_gui_w, h: row_rect.h - 4.0 },
+                        move || {
+                            Edit::mutate(move |app: &mut AppData| {
+                                app.handle_event(AppEvent::ToggleSlotGui { index: device_index })
+                            })
+                        },
+                    );
+                }
+                let xb_x = row_rect.x + row_rect.w - btn_x_w;
+                ui.button_at(
+                    ("inspector_row_remove", idx),
+                    "x",
+                    Rect { x: xb_x, y: row_rect.y + 2.0, w: btn_x_w, h: row_rect.h - 4.0 },
+                    move || {
+                        Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::RemoveDevice { index: device_index })
+                        })
+                    },
+                );
+            },
+            |i| {
+                if chain.get(i).map(|e| e.device_index) == open_dev {
+                    panel_h
+                } else {
+                    0.0
+                }
+            },
+            |ui, _exp_i, exp_rect| {
+                let panel_top = exp_rect.y;
+                #[allow(unused_mut)]
+                let mut y = exp_rect.y;
+                // ====== 開いたデバイスの param パネル本体 (各 section gate が選別) ======
+
     // ---- Group Transform section (`docs/plan_tachie_group_transform.md` §5.5) --
     // cursor track が visual group のとき、立ち絵全体の 2D affine + opacity を
     // 数値編集 + per-param「A」automate トグルで expose。image inspector と同
@@ -1326,6 +1425,100 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += 8.0;
     }
 
+    // ---- Plugin param panel (FIXME #78) -----------------------------------
+    // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し CLAP・VST3) の
+    // チェーン行「Par」ボタンで開閉。 VOICEVOX は device 既定の声 (キャラ→スタイル)
+    // を、 汎用 plugin は param を scrubable_number で実レンジ編集する。 値の SSoT は
+    // PluginParam lane の default_value (= `set_plugin_param`、 映像 FX と同 idiom)。
+    if let Some(view) = app.inspector_plugin_params() {
+        let device_index = view.device_index;
+        let track_id = view.track_id;
+        ui.label_at("inspector_pp_label", &view.plugin_name, area.x + pad, y, 12.0, TEXT);
+        y += 18.0;
+
+        // 汎用 param 行 (scrubable_number で実レンジ + per-control 変調)。
+        let row_w = area.w - pad * 2.0;
+        let input_h = 22.0;
+        let label_w = 96.0;
+        let input_x = area.x + pad + label_w;
+        let input_w = (row_w - label_w).max(40.0);
+        for (i, p) in view.params.iter().enumerate() {
+            ui.label_at((i, "pp_name"), &p.name, area.x + pad, y + 5.0, 11.0, TEXT);
+            if p.readonly {
+                // 編集不可 param は現値をラベル表示するだけ。
+                let txt = format!("{:.3}", p.value_real);
+                ui.label_at((i, "pp_ro"), &txt, input_x, y + 5.0, 11.0, TEXT);
+                y += input_h + 4.0;
+                continue;
+            }
+            let (min, max) = (p.min, p.max);
+            #[allow(clippy::cast_possible_truncation)]
+            let sens = (((max - min) / 220.0).max(0.0001)) as f32;
+            let style = ScrubableNumberStyle {
+                sensitivity: sens,
+                range: Some((min, max)),
+                ..SCRUB_STYLE_GROUP
+            };
+            let target = AutomationTarget::PluginParam {
+                device_index,
+                param_id: p.id,
+                legacy_slot: None,
+            };
+            let domain = crate::app::ModControlDomain::Ranged { min, max, log: false };
+            let mod_build = build_mod(app, target.clone(), p.value_real, domain, track_id);
+            let modulation = Some(mod_build.modulation());
+            let param_id = p.id;
+            let fmt = if p.stepped {
+                ScrubableNumberFormat::Decimal(0)
+            } else {
+                ScrubableNumberFormat::Decimal(3)
+            };
+            let resp = ui.scrubable_number_at(
+                (i, "pp_scrub"),
+                Rect { x: input_x, y, w: input_w, h: input_h },
+                p.value_real,
+                p.default_real,
+                fmt,
+                &style,
+                "Plugin",
+                move |v| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetPluginParam {
+                            device_index,
+                            param_id,
+                            value_real: v,
+                        });
+                    })
+                },
+                None,
+                modulation,
+            );
+            // drag / text 編集 stroke を undo 1 step に bracket (`SetPluginParam` は
+            // per-frame 非 undoable)。 終端で host へ 1 回 resync して音に反映する
+            // (映像 FX と違い audio plugin は daw_audio が lane を読むため要 push)。
+            let active = resp.dragging || resp.editing_text;
+            let scrub_key = crate::app::InspectorScrubField::PluginParam { device_index, param_id };
+            let was_active = app.inspector_scrub_active == Some(scrub_key);
+            if active && !was_active {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.inspector_scrub_active = Some(scrub_key);
+                    app.handle_event(AppEvent::BeginInspectorScrub);
+                }));
+            } else if !active && was_active {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.inspector_scrub_active = None;
+                    app.handle_event(AppEvent::EndInspectorScrub);
+                    // 確定値を host へ push (drag 終端なので is_dragging=false → 実 push)。
+                    app.sync_song_to_plugin_host();
+                }));
+            }
+            // 変調 depth ドラッグの falling edge で host 再同期。
+            mod_widget::push_mod_drag_resync(ui, app, track_id, &target, resp.mod_dragging);
+            y += input_h + 4.0;
+        }
+        y += 8.0;
+    }
+
     // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5 + P5.B) --
     // selected_clip が `ClipContent::Text` のとき、 first event の全 field
     // (text / font / align / 23 numeric + 2 fade beats / fade curves / mute)
@@ -1342,7 +1535,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .selected_clip_ref()
         .and_then(|r| app.song.tracks.get(r.track as usize))
         .is_some_and(common::model::Track::has_subtitle_device);
-    if text_track_has_subtitle && let Some(summary) = app.inspector_text_event_summary() {
+    // FIXME #78: 字幕 device の「Par」を押したときだけ Text Event 欄を出す
+    // (= 専用欄を常時表示せず Par パネルに集約)。
+    if text_track_has_subtitle
+        && app.subtitle_param_panel_open()
+        && let Some(summary) = app.inspector_text_event_summary()
+    {
         if app.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -1691,7 +1889,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (FIXME #36) Clip Voice 編集: 選択中の clip が vocal track 上の MIDI clip の
     // とき、 キャラ ▼ → スタイル ▼ の 2 段 dropdown で per-clip 声を選ぶ。
     // 声は per-clip (`Clip::speaker_id`) が SSoT、 SetClipVoice で焼き込む。
-    if let Some(r) = app.selected_clip_ref()
+    if app.voicevox_param_panel_open()
+        && let Some(r) = app.selected_clip_ref()
         && let Some(track) = app.song.tracks.get(r.track as usize)
         && track.is_voicevox_vocal()
         && let Some(clip) = track.clips.get(r.clip as usize)
@@ -1843,7 +2042,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // VOICEVOX デバイス付きトラック上の Text clip のとき、talk 話者 (キャラ→talk style)
     // + 読み上げスケール 4 つ (話速/音高/抑揚/音量) を編集する。声は `Clip::speaker_id`
     // を talk style として流用 (SetClipVoice で焼き込み)。スケールは `Clip::talk`。
-    if let Some(r) = app.selected_clip_ref()
+    if app.voicevox_param_panel_open()
+        && let Some(r) = app.selected_clip_ref()
         && let Some(track) = app.song.tracks.get(r.track as usize)
         && track.is_voicevox_vocal()
         && let Some(clip) = track.clips.get(r.clip as usize)
@@ -2118,7 +2318,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ---- 口パク (lip-sync) 出力先 binding ----------------------------
     // Vocal track のみ。生成した口画像 ImageEvent を焼き込む先の口 track
     // (立ち絵 group の子 image track) を選ぶ。設定で再生成が走る。
-    if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i))
+    // FIXME #78: VOICEVOX device の「Par」を押したときだけ出す (= 専用欄を常時
+    // 表示せず Par パネルに集約。声 / 話速 / 口パク先をまとめて 1 箇所で編集)。
+    if app.voicevox_param_panel_open()
+        && let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i))
         && track.is_voicevox_vocal()
     {
         let self_id = track.id;
@@ -2180,6 +2383,20 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         y += 30.0;
     }
+                // ====== /device param panel ======
+                // 展開部の実消費高を測って次フレームの row_extra_h に使う (lag-by-one)。
+                let measured = (y - panel_top).max(0.0);
+                if (app.inspector_device_panel_h - measured).abs() > 0.5 {
+                    ui.push_edit(Edit::mutate(move |a: &mut AppData| {
+                        a.inspector_device_panel_h = measured;
+                    }));
+                }
+            },
+        );
+        // チェーン (rows + 開いた展開) ぶん viewport y を進める。
+        y = chain_rect.y + chain_rect.h + 8.0;
+    }
+    let cursor_idx = app.cursor_track_index();
 
     // ---- 口パク mapping (口形状 → 画像) -------------------------------
     // この track を口パク出力先に指定している vocal track があるとき、7 形状
@@ -2290,21 +2507,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.inspector_body_h = measured;
         }));
     }
-    // chain band は area 下端 pinned。 param viewport 直下 (boundary_y) から描く。
-    let mut y = boundary_y;
-
-    // 「Chain」見出し
-    ui.label_at(
-        "inspector_chain_label",
-        "Chain",
-        area.x + pad,
-        y,
-        12.0,
-        TEXT,
-    );
-    y += 18.0;
-
-    let chain = app.inspector_chain();
+    // chain band (下端 pinned): sidechain / modulation / 下端ボタン。 chain list 本体と
+    // 各デバイスの param パネルは viewport 内のアコーディオン (上の
+    // reorderable_list_expandable、 FIXME #78) に移動した。
+    let _ = boundary_y;
     let btns_h = 26.0;
     let btns_y = area.y + area.h - btns_h - pad;
 
@@ -2353,71 +2559,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             4.0 + mod_vis_route as f32 * 22.0 + 24.0
         }
         + 6.0;
-
-    let list_x = area.x + pad;
-    let list_y = y;
-    let list_w = area.w - pad * 2.0;
-    let list_h = (btns_y - 6.0 - list_y - sc_section_h - mod_section_h).max(0.0);
-    let list_rect = Rect { x: list_x, y: list_y, w: list_w, h: list_h };
-
-    let btn_gui_w = 44.0;
-    let btn_x_w = 30.0;
-
-    ui.reorderable_list(
-        "inspector_chain",
-        list_rect,
-        &chain,
-        None,
-        &CHAIN_LIST_STYLE,
-        |req| match req {
-            ReorderableListEditRequest::Reorder(order) => Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ReorderInspectorChain(order.clone()));
-            }),
-        },
-        |ui, entry, idx, row_rect, _selected, _dragging| {
-            ui.label_at(
-                ("inspector_row_name", idx),
-                &entry.plugin_name,
-                row_rect.x + 8.0,
-                row_rect.y + 8.0,
-                11.0,
-                TEXT,
-            );
-            let device_index = entry.device_index;
-            let gui_x = row_rect.x + row_rect.w - btn_gui_w - btn_x_w - 4.0;
-            ui.button_at(
-                ("inspector_row_gui", idx),
-                "GUI",
-                Rect {
-                    x: gui_x,
-                    y: row_rect.y + 2.0,
-                    w: btn_gui_w,
-                    h: row_rect.h - 4.0,
-                },
-                move || {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::ToggleSlotGui { index: device_index })
-                    })
-                },
-            );
-            let xb_x = row_rect.x + row_rect.w - btn_x_w;
-            ui.button_at(
-                ("inspector_row_remove", idx),
-                "x",
-                Rect {
-                    x: xb_x,
-                    y: row_rect.y + 2.0,
-                    w: btn_x_w,
-                    h: row_rect.h - 4.0,
-                },
-                move || {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::RemoveDevice { index: device_index })
-                    })
-                },
-            );
-        },
-    );
 
     // ---- Sidechain section ------------------------------------------
     // PR4.5 sidechain UI: per-plugin source picker. ECS-flat dropdown per

@@ -19,6 +19,19 @@
 //!   先に新順序を計算 → state に保存 → 同フレーム + 次フレームの 1 度ずつ新順序で描画して
 //!   Edit 適用 1 frame 遅延の visual 揺れを抑える。
 //! - reorder logic は arrangement の `compute_reorder_target_index` / `apply_reorder` を再利用。
+//!
+//! ## 行内アコーディオン展開 (daw_01 FIXME #78)
+//!
+//! [`Ui::reorderable_list_expandable`] は各 row の **直下に可変高の展開領域** を持てる。
+//! `row_extra_h(i)` が row `i` の展開高 (`0.0` = 折りたたみ) を返し、`expansion(ui, i, rect)` が
+//! その領域を描く。これで「チェーン行の Par を押すと、その行の真下に params が開いて以降の行が
+//! 下にずれる」 アコーディオン UI を、 drag 並べ替えを保ったまま実現する。
+//!
+//! **drag 中は全展開を畳む** (uniform 行高に戻す) ことで、 既存の uniform な hit-test /
+//! `compute_reorder_target_index` / drop indicator ロジックを丸ごと再利用する (= 可変高 hit-test
+//! の作り直しを避けつつ、 reorder の正しさを構造的に保証)。展開は drag していないフレームだけ描く。
+//! press → session 開始の anchor 判定は「前フレームに表示されていた (= 可変高の) layout」 で行い、
+//! 次フレームから畳む (1 frame 遅延、 視覚的に滑らか)。
 
 use std::cell::Cell;
 use std::hash::Hash;
@@ -117,7 +130,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ///
     /// `selected: Option<usize>` は描画用ハイライトのみ (本 widget は selection を管理しない、
     /// caller が `clicked` を見て更新する)。
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub fn reorderable_list<T, F, R>(
         &mut self,
         id: impl Hash,
@@ -126,17 +139,115 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         selected: Option<usize>,
         style: &ReorderableListStyle,
         make_edit: F,
-        mut row: R,
+        row: R,
     ) -> ReorderableListResponse
     where
         F: Fn(ReorderableListEditRequest) -> Edit<M> + Clone + Send + Sync + 'static,
         R: FnMut(&mut Ui<'a, M>, &T, usize, Rect, /*selected*/ bool, /*dragging*/ bool),
     {
+        self.reorderable_list_core(
+            id,
+            rect,
+            items,
+            selected,
+            style,
+            make_edit,
+            row,
+            |_| 0.0,
+            |_, _, _| {},
+        )
+    }
+
+    /// 各 row の **直下に可変高の展開領域** を持てる reorderable list (FIXME #78、行内アコーディオン)。
+    ///
+    /// - `row_extra_h(i)`: row `i` の展開高 (px)。`0.0` で折りたたみ。
+    /// - `expansion(ui, i, rect)`: row `i` の展開領域 (`rect` は base row の直下、高さ
+    ///   `row_extra_h(i)`) を描く。
+    ///
+    /// drag 中は全展開を畳んで uniform 行高で扱うので、 reorder のセマンティクスは
+    /// [`Self::reorderable_list`] と完全に同じ。
+    #[allow(clippy::too_many_arguments)]
+    pub fn reorderable_list_expandable<T, F, R, H, E>(
+        &mut self,
+        id: impl Hash,
+        rect: Rect,
+        items: &[T],
+        selected: Option<usize>,
+        style: &ReorderableListStyle,
+        make_edit: F,
+        row: R,
+        row_extra_h: H,
+        expansion: E,
+    ) -> ReorderableListResponse
+    where
+        F: Fn(ReorderableListEditRequest) -> Edit<M> + Clone + Send + Sync + 'static,
+        R: FnMut(&mut Ui<'a, M>, &T, usize, Rect, bool, bool),
+        H: Fn(usize) -> f32,
+        E: FnMut(&mut Ui<'a, M>, usize, Rect),
+    {
+        self.reorderable_list_core(
+            id,
+            rect,
+            items,
+            selected,
+            style,
+            make_edit,
+            row,
+            row_extra_h,
+            expansion,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn reorderable_list_core<T, F, R, H, E>(
+        &mut self,
+        id: impl Hash,
+        rect: Rect,
+        items: &[T],
+        selected: Option<usize>,
+        style: &ReorderableListStyle,
+        make_edit: F,
+        mut row: R,
+        row_extra_h: H,
+        mut expansion: E,
+    ) -> ReorderableListResponse
+    where
+        F: Fn(ReorderableListEditRequest) -> Edit<M> + Clone + Send + Sync + 'static,
+        R: FnMut(&mut Ui<'a, M>, &T, usize, Rect, bool, bool),
+        H: Fn(usize) -> f32,
+        E: FnMut(&mut Ui<'a, M>, usize, Rect),
+    {
         let wid = WidgetId::ROOT.child((b"reorderable_list", &id));
         let pointer = self.pointer;
         let row_total_h = style.row_height + style.row_gap;
         let item_count = items.len();
-        let content_h = (item_count as f32) * row_total_h;
+
+        // ---- frame 開始時の session / pending_order 状態 ----
+        // drag 中 (session あり) or reorder 直後の settle (pending あり) は **全展開を畳む** =
+        // uniform 行高。 これで press / release / drop-indicator は既存の uniform ロジックを
+        // そのまま使え、 可変高は「静止時の表示」 だけに閉じ込められる。
+        let (collapsed, pending_at_start) = {
+            let state: &mut ReorderableListState = self.widget_state(wid);
+            (state.session.is_some() || state.pending_order.is_some(), state.pending_order.is_some())
+        };
+        let _ = pending_at_start;
+
+        // ---- 各 row の base-top (content 空間) の累積 + content_h ----
+        // row i は [tops[i], tops[i]+row_height) が base、 続く extra_h(i) が展開、 末尾 row_gap。
+        let extra_of = |i: usize| -> f32 {
+            if collapsed {
+                0.0
+            } else {
+                row_extra_h(i).max(0.0)
+            }
+        };
+        let mut tops: Vec<f32> = Vec::with_capacity(item_count);
+        let mut acc = 0.0;
+        for i in 0..item_count {
+            tops.push(acc);
+            acc += style.row_height + extra_of(i) + style.row_gap;
+        }
+        let content_h = acc;
 
         let needs_scrollbar = content_h > rect.h;
         let row_visible_w = if needs_scrollbar {
@@ -146,7 +257,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         };
 
         // ---- press 検出 ----
-        // drag_handle_w 範囲内 (or row 全体) で primary_just_pressed → reorder session 開始
+        // drag_handle_w 範囲内 (or row 全体) の **base row 部分** で primary_just_pressed →
+        // reorder session 開始。 展開領域 (expansion) を押しても drag は始めない (中の widget が
+        // 入力を消費する)。
         if pointer.primary_just_pressed
             && let Some((px, py)) = pointer.pos
             && rect.contains(px, py)
@@ -161,9 +274,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let scroll_y = self.scroll_offset(("reorderable_list_scroll", &id)).1;
                 let local = py - rect.y + scroll_y;
                 if local >= 0.0 {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let idx = (local / row_total_h) as usize;
-                    if idx < item_count {
+                    let hit = (0..item_count).find(|&i| {
+                        local >= tops[i] && local < tops[i] + style.row_height
+                    });
+                    if let Some(idx) = hit {
                         let state: &mut ReorderableListState = self.widget_state(wid);
                         state.session = Some(ReorderSession {
                             anchor_index: idx,
@@ -184,6 +298,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- release: session 取り出し → Reorder 発行 or click 格下げ ----
+        // release 時 (drag 中) は collapsed = true なので layout は uniform。 target も uniform な
+        // `compute_reorder_target_index` (row_total_h) で計算する。
         let release_session: Option<ReorderSession> = if pointer.primary_just_released {
             let state: &mut ReorderableListState = self.widget_state(wid);
             state.session.take()
@@ -236,6 +352,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let style_copy = *style;
         let item_count_copy = item_count;
         let hovered = Cell::new(None::<usize>);
+        // 展開を描くのは「静止時」 のみ (= collapsed=false かつ drag overlay 無し)。
+        let draw_expanded = !collapsed && session_for_overlay.is_none();
+        let tops_for_draw = tops;
 
         self.scroll_area(
             ("reorderable_list_scroll", &id),
@@ -247,6 +366,60 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
                 let visible_top = offset.1;
                 let visible_bottom = offset.1 + rect.h;
+
+                if draw_expanded {
+                    // ---- 可変高 (静止) 描画: tops_for_draw に従って base row + 展開を描く ----
+                    for i in 0..item_count_copy {
+                        let base_top = tops_for_draw[i];
+                        let extra = (row_extra_h(i)).max(0.0);
+                        let row_bottom = base_top + style_copy.row_height + extra;
+                        if row_bottom < visible_top || base_top > visible_bottom {
+                            continue; // 画面外 row は skip
+                        }
+                        let row_y = rect.y - offset.1 + base_top;
+                        let row_rect = Rect {
+                            x: rect.x,
+                            y: row_y,
+                            w: row_visible_w,
+                            h: style_copy.row_height,
+                        };
+                        let inside = pointer
+                            .pos
+                            .is_some_and(|(px, py)| row_rect.contains(px, py));
+                        let is_selected = selected == Some(i);
+                        let bg = if is_selected {
+                            style_copy.row_bg_selected
+                        } else if inside {
+                            style_copy.row_bg_hover
+                        } else {
+                            style_copy.row_bg
+                        };
+                        ui.push_rect(RectCommand {
+                            rect: row_rect,
+                            fill: bg,
+                            border: Color::TRANSPARENT,
+                            border_width: 0.0,
+                            radius: [style_copy.radius; 4],
+                            clip_rect: None,
+                        });
+                        row(ui, &items[i], i, row_rect, is_selected, false);
+                        if extra > 0.0 {
+                            let exp_rect = Rect {
+                                x: rect.x,
+                                y: row_y + style_copy.row_height,
+                                w: row_visible_w,
+                                h: extra,
+                            };
+                            expansion(ui, i, exp_rect);
+                        }
+                        if inside {
+                            hovered.set(Some(i));
+                        }
+                    }
+                    return;
+                }
+
+                // ---- uniform (drag / settle) 描画: 既存ロジック (pending_order の表示順) ----
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let i_start = (visible_top / row_total_h).floor().max(0.0) as usize;
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -665,5 +838,58 @@ mod tests {
         });
 
         assert_eq!(calls.get(), 0, "空 list で row callback は 0 回");
+    }
+
+    /// FIXME #78: 行内アコーディオン。 1 行を展開すると、 その行の直下に展開領域が描かれ、
+    /// 後続行が `row_extra_h` 分だけ下にずれる (= 可変行高 layout)。
+    #[test]
+    fn expandable_row_pushes_later_rows_down_and_calls_expansion() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+        let style = ReorderableListStyle::default(); // row_height 26, gap 2 → row_total 28
+        let items: Vec<u32> = (0..4).collect();
+
+        // row 1 を 100px 展開。
+        let expanded = 1usize;
+        let extra_h = 100.0_f32;
+
+        // expansion callback が呼ばれた (idx, rect.y) を記録。
+        let expansion_calls: Cell<u32> = Cell::new(0);
+        let expansion_idx: Cell<i64> = Cell::new(-1);
+        let expansion_y: Cell<f32> = Cell::new(-1.0);
+        // row 2 (展開行の次) の base row.y を記録 → 展開分ずれているか検証。
+        let row2_y: Cell<f32> = Cell::new(-1.0);
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.reorderable_list_expandable(
+                "rl",
+                Rect { x: 0.0, y: 0.0, w: 200.0, h: 600.0 },
+                &items,
+                None,
+                &style,
+                |_| Edit::mutate(|()| {}),
+                |_ui, _item, i, row_rect, _sel, _drag| {
+                    if i == 2 {
+                        row2_y.set(row_rect.y);
+                    }
+                },
+                |i| if i == expanded { extra_h } else { 0.0 },
+                |_ui, i, rect| {
+                    expansion_calls.set(expansion_calls.get() + 1);
+                    expansion_idx.set(i as i64);
+                    expansion_y.set(rect.y);
+                },
+            );
+        });
+
+        // 展開 callback は展開行 (1) で 1 度だけ。
+        assert_eq!(expansion_calls.get(), 1, "展開行で expansion が 1 度呼ばれる");
+        assert_eq!(expansion_idx.get(), expanded as i64);
+        // 展開領域は row1 の base (top = 1*28 = 28) の直下 (= 28 + row_height 26 = 54)。
+        assert!((expansion_y.get() - 54.0).abs() < 0.01, "expansion rect.y = row1底 (got {})", expansion_y.get());
+        // row 2 の base top = row0(28) + row1(26+100+2=128) = ... tops[2] = 28 + 128 = 156。
+        // (tops[0]=0, tops[1]=28, tops[2]=28+(26+100+2)=156)
+        assert!((row2_y.get() - 156.0).abs() < 0.01, "row2 は展開分ずれる (got {})", row2_y.get());
     }
 }

@@ -206,11 +206,35 @@ impl PluginPickEntry {
 pub struct ChainEntry {
     pub device_index: u32,
     pub plugin_name: String,
+    /// FIXME #78: チェーン行ボタンの分岐用。 埋め込み GUI (editor window) を持つ
+    /// plugin か (`PluginParamList` の `has_embedded_gui`、 未受信は楽観的に true)。
+    pub has_embedded_gui: bool,
+    /// この device が内蔵映像 FX (= `ports.is_video()`) か。 映像 FX は専用の
+    /// インライン param パネル (`open_video_fx_params`) を持つ。
+    pub is_video: bool,
+    /// この device が VOICEVOX builtin か (= 声選択パネルを出す対象)。
+    pub is_voicevox: bool,
+    /// host から param 一覧が届いていて 1 つ以上 param があるか (= 汎用 param
+    /// パネルに出す中身がある)。
+    pub has_params: bool,
 }
 
 impl ChainEntry {
     pub fn to_device_index(&self) -> u32 {
         self.device_index
+    }
+
+    /// FIXME #78: チェーン行ボタンが「埋め込み GUI window を開く」 のではなく
+    /// 「インライン param パネルをトグルする」 種類か。 映像 FX / VOICEVOX /
+    /// 埋め込み GUI を持たないが param がある plugin が該当。
+    pub fn shows_param_panel(&self) -> bool {
+        self.is_video || self.is_voicevox || (!self.has_embedded_gui && self.has_params)
+    }
+
+    /// FIXME #78: チェーン行にボタンを出すか。 GUI も param パネルも無い device
+    /// (= Silence 等の no-op builtin) はボタンを出さない。
+    pub fn shows_button(&self) -> bool {
+        (self.has_embedded_gui && !self.is_video) || self.shows_param_panel()
     }
 }
 
@@ -377,6 +401,8 @@ pub enum InspectorScrubField {
     /// FIXME #54 Wave4: 内蔵映像 FX param scrub（device_index, param_id 単位で
     /// drag stroke を undo 1 step に bracket する）。
     VideoFx { device_index: u32, param_id: u32 },
+    /// FIXME #78: 汎用 plugin param scrub (「⚙」パネル、device_index, param_id 単位)。
+    PluginParam { device_index: u32, param_id: u32 },
 }
 
 /// docs/plan_modulation.md §9 / FIXME #56: one row of the inspector
@@ -751,6 +777,33 @@ pub struct VideoFxParamsInspector {
     pub device_index: u32,
     pub def: &'static common::video_fx::VideoFxDef,
     pub values: Vec<f32>,
+}
+
+/// FIXME #78: 埋め込み GUI を持たない plugin の「⚙」インライン param パネルの
+/// read snapshot。 `open_plugin_params` が cursor track の device を指すとき
+/// `inspector_plugin_params()` が返す。 VOICEVOX builtin は `voice` に device
+/// 既定の声を、 汎用 plugin は `params` に編集可能な param 行を載せる。
+pub struct PluginParamsInspector {
+    pub track_id: u32,
+    pub device_index: u32,
+    pub plugin_name: String,
+    /// 汎用 plugin param 行 (lane default_value を実レンジ化した現値つき)。
+    pub params: Vec<PluginParamRow>,
+}
+
+/// `PluginParamsInspector` の 1 param 行 (実レンジ表示 + 編集レンジ情報)。
+pub struct PluginParamRow {
+    pub id: u32,
+    pub name: String,
+    pub value_real: f64,
+    /// plugin の default value (実レンジ)。 scrubable のダブルクリックリセット用。
+    pub default_real: f64,
+    pub min: f64,
+    pub max: f64,
+    /// `STEPPED` フラグ (= 整数ステップ)。 表示フォーマットの分岐に使う。
+    pub stepped: bool,
+    /// `READONLY` フラグ。 編集不可なので scrubable でなくラベル表示にする。
+    pub readonly: bool,
 }
 
 /// inspector / resync が走査する `GroupTransformParam` の固定順
@@ -1237,6 +1290,12 @@ pub struct AppData {
         (u32, u32),
         Vec<common::protocol::PluginParamInfo>,
     >,
+    /// FIXME #78: `(track_id, slot)` ごとに plugin が埋め込み GUI (editor window)
+    /// を持つか (`PluginParamList` で host が `gui_is_embed_supported` を通知)。
+    /// チェーン行のボタン分岐に使う: GUI あり = 「GUI」 で window を開く、 なし =
+    /// 「⚙」 でインライン param パネルをトグル。 plugin_params と同じ寿命・同じ箇所
+    /// (insert / reorder / remove / clear) で維持する。
+    pub slot_has_gui: std::collections::HashMap<(u32, u32), bool>,
     /// gui_01 #031 (M14 Phase 63n-6): track ごとの row 高さ override。
     /// `Some(px)` で個別 track 高さ、`None` (= map に entry なし) で
     /// global default `arrange_track_row_h` を使う。 widget の Alt+drag
@@ -1361,6 +1420,11 @@ pub struct AppData {
     /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。
     /// session-only (save / Undo 対象外)。
     pub inspector_body_h: f32,
+    /// FIXME #78: チェーン行アコーディオンで開いているデバイスの param パネル実高さ
+    /// (px、 前フレーム測定値)。 `reorderable_list_expandable` の `row_extra_h` に渡して
+    /// 開いた行の直下に確保する展開高に使う (lag-by-one、 `inspector_body_h` と同 idiom)。
+    /// session-only。
+    pub inspector_device_panel_h: f32,
     pub pianoroll_zoom_x: f32,
     pub pianoroll_zoom_y: f32,
     pub pianoroll_top_pitch: u8,
@@ -1505,6 +1569,11 @@ pub struct AppData {
     /// ボタンはインスペクタ内のパラメータ調整パネルを開く。`Some((track_id, device_index))`
     /// で 1 つだけ開く（別の FX の GUI を押すと切り替わる）。cursor track 以外に切り替えたら閉じる。
     pub open_video_fx_params: Option<(u32, u32)>,
+    /// FIXME #78: 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
+    /// CLAP・VST3) の「⚙」ボタンで開くインライン param パネル。 `open_video_fx_params`
+    /// と同 idiom: `Some((track_id, device_index))` で 1 つだけ、 cursor track 以外
+    /// では非表示、 device 削除で同トラックなら閉じる。
+    pub open_plugin_params: Option<(u32, u32)>,
 
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,
@@ -1537,7 +1606,6 @@ pub struct AppData {
     pub pending_play: bool,
 
     // -------- Background workers --------
-    pub synth_result: Arc<Mutex<Vec<common::voicevox::SynthResult>>>,
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
     /// プロジェクトロード時の audio / image background decode の staging。
     /// `Some` の間は streaming load 進行中 (= 再生 gate + 進捗 overlay 表示、
@@ -1559,10 +1627,6 @@ pub struct AppData {
     /// (= `/singers`) とは別 id 空間。engine 起動時に background thread が
     /// `AppEvent::SpeakersLoaded` で投入。未取得なら焼き込み声名 + 「取得中…」表示。
     pub talk_speakers: Vec<common::voicevox::VoiceVoxSinger>,
-    /// VOICEVOX 合成結果 in-memory cache (process lifetime のみ)。 Synth ボタン
-    /// 押下時に各 clip の content_hash + singer_id を key に lookup → hit なら
-    /// HTTP call をスキップ。 永続化は将来 Phase。
-    pub voicevox_cache: Arc<Mutex<common::voicevox_cache::VoiceVoxCache>>,
     /// VOICEVOX engine の auto-kill 用 Job dispatcher。
     /// production は `Win32JobDispatcher` (`JobHandle::assign_std` ラップ)、
     /// test は `NoopJobDispatcher`。 trait DI により AppData::new の
@@ -2028,6 +2092,7 @@ impl AppData {
             last_sent_recording_lanes: std::collections::HashSet::new(),
             plugin_param_values: std::collections::HashMap::new(),
             plugin_params: std::collections::HashMap::new(),
+            slot_has_gui: std::collections::HashMap::new(),
             track_row_overrides: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
             loaded_slots: std::collections::HashMap::new(),
@@ -2051,6 +2116,7 @@ impl AppData {
             arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
             arrange_header_w: 160.0,
             inspector_body_h: 800.0,
+            inspector_device_panel_h: 0.0,
             pianoroll_zoom_x: 64.0,
             pianoroll_zoom_y: 14.0,
             pianoroll_top_pitch: 84, // C6
@@ -2097,20 +2163,19 @@ impl AppData {
             pending_vocal_synth_bounce: None,
             open_plugin_guis: std::collections::HashSet::new(),
             open_video_fx_params: None,
+            open_plugin_params: None,
             track_peak_display: initial_peak_display,
             mod_scalars: Vec::new(),
             pending_plugin_loads: std::collections::HashSet::new(),
             pending_added_plugin_finalize: std::collections::HashSet::new(),
             gui_open_requests: Vec::new(),
             pending_play: false,
-            synth_result: Arc::new(Mutex::new(Vec::new())),
             rescan_result: Arc::new(Mutex::new(None)),
             asset_decode: None,
             load_progress: None,
             load_progress_label: "",
             singers: Vec::new(),
             talk_speakers: Vec::new(),
-            voicevox_cache: Arc::new(Mutex::new(common::voicevox_cache::VoiceVoxCache::new())),
             voicevox_job,
             supervisor,
             child_disconnect_log: Vec::new(),
@@ -3057,8 +3122,11 @@ impl AppData {
     /// (master bus は `master_fx_chain`) を flat な行として返す。役割の判定は
     /// せず、plugin 名のみを並べる (挙動は engine の port 直結で決まる)。
     pub fn inspector_chain(&self) -> Vec<ChainEntry> {
+        let Some(track_id) = self.cursor_track_id() else {
+            return Vec::new();
+        };
         let devices: &[common::model::PluginInstance] =
-            if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+            if track_id == common::model::MASTER_TRACK_ID {
                 &self.song.master_fx_chain
             } else {
                 let Some(idx) = self.cursor_track_index() else {
@@ -3072,9 +3140,32 @@ impl AppData {
         devices
             .iter()
             .enumerate()
-            .map(|(i, p)| ChainEntry {
-                device_index: i as u32,
-                plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+            .map(|(i, p)| {
+                let device_index = i as u32;
+                // FIXME #78: 埋め込み GUI の有無。 builtin (VOICEVOX / Silence) は
+                // 規定で持たないので format から即断 (= PluginParamList 到着前でも
+                // 正しく「Par」routing)。 外部 CLAP・VST3 は host の通知
+                // (`slot_has_gui`)、 未受信 (load 直後) は楽観的に true で「GUI」のまま。
+                let has_embedded_gui = p.format != PluginFormat::Builtin
+                    && self
+                        .slot_has_gui
+                        .get(&(track_id, device_index))
+                        .copied()
+                        .unwrap_or(true);
+                let has_params = self
+                    .plugin_params
+                    .get(&(track_id, device_index))
+                    .is_some_and(|v| !v.is_empty());
+                let is_voicevox = p.format == PluginFormat::Builtin
+                    && p.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX;
+                ChainEntry {
+                    device_index,
+                    plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+                    has_embedded_gui,
+                    is_video: p.ports.is_video(),
+                    is_voicevox,
+                    has_params,
+                }
             })
             .collect()
     }
@@ -4283,6 +4374,7 @@ pub enum AppEvent {
         index: u32,
         plugin_id: u32,
         params: Vec<common::protocol::PluginParamInfo>,
+        has_embedded_gui: bool,
     },
     /// Phase 2: plugin GUI で knob touch (CLAP gesture begin / VST3
     /// beginEdit)。 last_touched_param を plugin param で更新する。
@@ -4552,6 +4644,12 @@ pub enum AppEvent {
     /// FIXME #54 Wave4: 内蔵映像 FX の param 調整パネルから 1 param を編集。
     /// `value_real` は表示の実レンジ値 → lane の保存値 (0..=1) へ逆写像して格納。
     SetVideoFxParam { device_index: u32, param_id: u32, value_real: f32 },
+    /// FIXME #78: 埋め込み GUI を持たない plugin の「⚙」インライン param パネルで
+    /// param を 1 つ編集。 `value_real` は表示の実レンジ値 → host が送った
+    /// `PluginParamInfo` の min/max で lane `default_value` (0..=1) へ逆写像。
+    /// scrubable の per-frame 発火なので **非 undoable** (`BeginInspectorScrub`
+    /// で 1 undo step に bracket)。
+    SetPluginParam { device_index: u32, param_id: u32, value_real: f64 },
     /// inspector の x ボタン: 指定 `device_index` の device を chain から削除。
     RemoveDevice { index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
@@ -5822,8 +5920,10 @@ impl AppData {
                 index,
                 plugin_id: _,
                 params,
+                has_embedded_gui,
             } => {
                 self.plugin_params.insert((track, index), params);
+                self.slot_has_gui.insert((track, index), has_embedded_gui);
             }
             AppEvent::PluginParamTouchedFromChild {
                 track,
@@ -6167,6 +6267,9 @@ impl AppData {
             }
             AppEvent::SetVideoFxParam { device_index, param_id, value_real } => {
                 self.set_video_fx_param(device_index, param_id, value_real);
+            }
+            AppEvent::SetPluginParam { device_index, param_id, value_real } => {
+                self.set_plugin_param(device_index, param_id, value_real);
             }
             AppEvent::RemoveDevice { index } => {
                 self.remove_device(index);
@@ -7859,6 +7962,7 @@ impl AppData {
         self.loaded_slots.clear();
         self.open_plugin_guis.clear();
         self.plugin_params.clear();
+        self.slot_has_gui.clear();
         self.pending_plugin_loads.clear();
         self.pending_added_plugin_finalize.clear();
     }
@@ -11686,6 +11790,175 @@ impl AppData {
             }
         }
         // 「A」キー (last_touched_param) で automation lane を可視化/curve 化できる。
+        self.last_touched_param = Some(TouchedParam {
+            track_id,
+            target,
+            display_name,
+            touched_at: std::time::Instant::now(),
+        });
+    }
+
+    /// FIXME #78: 汎用 plugin の「Par」インライン param パネルの read snapshot。
+    /// `open_plugin_params` が cursor track の device を指し、 host から param 一覧が
+    /// 届いているときに、 lane default_value を実レンジ化した編集可能な param 行を返す。
+    /// VOICEVOX / 字幕 builtin は host param を持たず、 専用セクション (Clip Voice /
+    /// Talk / Text Event) が `*_param_panel_open()` gate で Par パネルとして描画される
+    /// ので、 ここでは `None` (= 汎用パネルは出さない)。
+    pub fn inspector_plugin_params(&self) -> Option<PluginParamsInspector> {
+        let (track_id, device_index) = self.open_plugin_params?;
+        if self.cursor_track_id() != Some(track_id) {
+            return None;
+        }
+        let device = self
+            .song
+            .fx_chain_by_track_id(track_id)?
+            .get(device_index as usize)?;
+        let plugin_name = resolve_plugin_name(&self.plugin_db, &device.plugin_id);
+
+        // param 行: lane default_value (無ければ info.default_value を正規化) を
+        // 実レンジへ。 HIDDEN は出さない。
+        let empty: &[common::model::AutomationLane] = &[];
+        let lanes: &[common::model::AutomationLane] =
+            if track_id == common::model::MASTER_TRACK_ID {
+                &self.song.song_lanes
+            } else {
+                self.song
+                    .track_by_id(track_id)
+                    .map_or(empty, |t| t.automation_lanes.as_slice())
+            };
+        let params: Vec<PluginParamRow> = self
+            .plugin_params
+            .get(&(track_id, device_index))
+            .map(|infos| {
+                infos
+                    .iter()
+                    .filter(|p| {
+                        p.flags & common::protocol::plugin_param_flags::HIDDEN == 0
+                    })
+                    .map(|p| {
+                        let span = p.max_value - p.min_value;
+                        let target = common::model::AutomationTarget::PluginParam {
+                            device_index,
+                            param_id: p.id,
+                            legacy_slot: None,
+                        };
+                        let norm = lanes.iter().find(|l| l.target == target).map_or_else(
+                            || {
+                                if span.abs() < f64::EPSILON {
+                                    0.0
+                                } else {
+                                    ((p.default_value - p.min_value) / span).clamp(0.0, 1.0)
+                                }
+                            },
+                            |l| l.default_value,
+                        );
+                        PluginParamRow {
+                            id: p.id,
+                            name: p.name.clone(),
+                            value_real: p.min_value + norm * span,
+                            default_real: p.default_value,
+                            min: p.min_value,
+                            max: p.max_value,
+                            stepped: p.flags
+                                & common::protocol::plugin_param_flags::STEPPED
+                                != 0,
+                            readonly: p.flags
+                                & common::protocol::plugin_param_flags::READONLY
+                                != 0,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // param が 1 つも無い device (VOICEVOX / 字幕 / Silence) は汎用パネルを出さない
+        // (= 専用セクションが Par パネルを担う)。
+        if params.is_empty() {
+            return None;
+        }
+        Some(PluginParamsInspector {
+            track_id,
+            device_index,
+            plugin_name,
+            params,
+        })
+    }
+
+    /// FIXME #78: 「Par」パネルが開いている device の plugin_id (cursor track 上)。
+    /// VOICEVOX / 字幕 など専用セクションを持つ builtin の Par 開閉判定に使う。
+    fn open_param_panel_plugin_id(&self) -> Option<&str> {
+        let (track_id, idx) = self.open_plugin_params?;
+        if self.cursor_track_id() != Some(track_id) {
+            return None;
+        }
+        self.song
+            .fx_chain_by_track_id(track_id)?
+            .get(idx as usize)
+            .map(|d| d.plugin_id.as_str())
+    }
+
+    /// FIXME #78: VOICEVOX builtin の「Par」パネルが開いているか (= Clip Voice /
+    /// Talk セクションを Par パネルとして描画する gate)。
+    pub fn voicevox_param_panel_open(&self) -> bool {
+        self.open_param_panel_plugin_id() == Some(common::plugin_db::BUILTIN_ID_VOICEVOX)
+    }
+
+    /// FIXME #78: 字幕 builtin の「Par」パネルが開いているか (= Text Event
+    /// セクションを Par パネルとして描画する gate)。
+    pub fn subtitle_param_panel_open(&self) -> bool {
+        self.open_param_panel_plugin_id() == Some(common::plugin_db::SUBTITLE_ID)
+    }
+
+    /// FIXME #78: 汎用 plugin param を 1 つ編集 (「⚙」パネルの scrubable から)。 値の
+    /// SSoT は `PluginParam` lane の `default_value` (0..=1 norm)。 実レンジ↔norm は
+    /// host が送った `PluginParamInfo` の min/max。 lane が無ければ値保持用
+    /// (`visible=false`) を作る。 master は `song_lanes`。 音への反映 (host push) は
+    /// scrub 終端で inspector が `sync_song_to_plugin_host` を呼ぶ (RT 安全)。
+    fn set_plugin_param(&mut self, device_index: u32, param_id: u32, value_real: f64) {
+        use common::model::{AutomationLane, AutomationTarget};
+        let Some(track_id) = self.cursor_track_id() else {
+            return;
+        };
+        let Some(info) = self
+            .plugin_params
+            .get(&(track_id, device_index))
+            .and_then(|v| v.iter().find(|p| p.id == param_id))
+            .cloned()
+        else {
+            return;
+        };
+        let display_name = if info.module.is_empty() {
+            info.name.clone()
+        } else {
+            format!("{} {}", info.module, info.name)
+        };
+        let span = info.max_value - info.min_value;
+        let norm = if span.abs() < f64::EPSILON {
+            0.0
+        } else {
+            ((value_real - info.min_value) / span).clamp(0.0, 1.0)
+        };
+        let target = AutomationTarget::PluginParam { device_index, param_id, legacy_slot: None };
+        if track_id == common::model::MASTER_TRACK_ID {
+            if let Some(lane) = self.song.song_lanes.iter_mut().find(|l| l.target == target) {
+                lane.default_value = norm;
+            } else {
+                let id = self.song.alloc_song_lane_id();
+                let mut lane = AutomationLane::new(target.clone(), norm);
+                lane.id = id;
+                lane.visible = false;
+                self.song.song_lanes.push(lane);
+            }
+        } else if let Some(track) = self.song.track_by_id_mut(track_id) {
+            if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
+                lane.default_value = norm;
+            } else {
+                let id = track.alloc_lane_id();
+                let mut lane = AutomationLane::new(target.clone(), norm);
+                lane.id = id;
+                lane.visible = false;
+                track.automation_lanes.push(lane);
+            }
+        }
         self.last_touched_param = Some(TouchedParam {
             track_id,
             target,
@@ -16691,16 +16964,44 @@ impl AppData {
             .song
             .fx_chain_by_track_id(track_id)
             .and_then(|chain| chain.get(index as usize));
+        // 映像 FX (色補正 / Transform 等) は専用の video_fx パネル。 ただし字幕
+        // (`builtin.video.subtitle`) は video device だが video_fx def を持たず、
+        // 専用パラメータは Text Event セクション (= Par パネルで描画) なので、 ここで
+        // 弾いて下の open_plugin_params 経路へ流す。
         if let Some(d) = device
             && d.ports.is_video()
+            && d.plugin_id != common::plugin_db::SUBTITLE_ID
         {
             let key = (track_id, index);
+            self.open_plugin_params = None; // 2 種のインライン param パネルは相互排他。
             self.open_video_fx_params = if self.open_video_fx_params == Some(key) {
                 None
             } else {
                 Some(key)
             };
             return; // 映像 device は plugin window を持たない。
+        }
+        // FIXME #78: 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
+        // CLAP・VST3) は editor window を開けない。 代わりにインスペクタ内の汎用
+        // param パネル (`open_plugin_params`) をトグルする。 builtin は format から
+        // 即断 (PluginParamList 到着前でも正しく分岐)、 外部 plugin は host の
+        // `PluginParamList`(has_embedded_gui=false) 通知に従う。
+        let is_builtin = device.is_some_and(|d| d.format == PluginFormat::Builtin);
+        let has_embedded_gui = !is_builtin
+            && self
+                .slot_has_gui
+                .get(&(track_id, index))
+                .copied()
+                .unwrap_or(true);
+        if !has_embedded_gui {
+            let key = (track_id, index);
+            self.open_video_fx_params = None; // 2 種のインライン param パネルは相互排他。
+            self.open_plugin_params = if self.open_plugin_params == Some(key) {
+                None
+            } else {
+                Some(key)
+            };
+            return;
         }
         // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
         // FIXME #31: open 状態は open_plugin_guis (id set) で追跡。実 window は
@@ -16885,6 +17186,7 @@ impl AppData {
         let mut new_loaded = Vec::new();
         let mut new_open = Vec::new();
         let mut new_params = Vec::new();
+        let mut new_has_gui = Vec::new();
         for &(from, to) in &moves {
             if let Some(v) = self.loaded_slots.remove(&(track_id, from)) {
                 new_loaded.push((to, v));
@@ -16895,12 +17197,18 @@ impl AppData {
             if let Some(v) = self.plugin_params.remove(&(track_id, from)) {
                 new_params.push((to, v));
             }
+            if let Some(v) = self.slot_has_gui.remove(&(track_id, from)) {
+                new_has_gui.push((to, v));
+            }
         }
         for (to, v) in new_loaded {
             self.loaded_slots.insert((track_id, to), v);
         }
         for to in new_open {
             self.open_plugin_guis.insert((track_id, to));
+        }
+        for (to, v) in new_has_gui {
+            self.slot_has_gui.insert((track_id, to), v);
         }
         for (to, v) in new_params {
             self.plugin_params.insert((track_id, to), v);
@@ -17387,6 +17695,10 @@ impl AppData {
         if self.open_video_fx_params.is_some_and(|(t, _)| t == track_id) {
             self.open_video_fx_params = None;
         }
+        // FIXME #78: 汎用 param パネルも同様に閉じる。
+        if self.open_plugin_params.is_some_and(|(t, _)| t == track_id) {
+            self.open_plugin_params = None;
+        }
         // PR2.1: send `Track::id` to the plugin host.
         self.send_plugin(MainToChild::RemoveSlotPlugin {
             track: track_id,
@@ -17472,6 +17784,19 @@ impl AppData {
         });
         for (idx, v) in pmoves {
             self.plugin_params.insert((track_id, idx), v);
+        }
+        // slot_has_gui (FIXME #78): plugin_params と同じ index シフト。
+        let mut gmoves: Vec<(u32, bool)> = Vec::new();
+        self.slot_has_gui.retain(|&(t, idx), v| {
+            if t == track_id && idx > index {
+                gmoves.push((idx - 1, *v));
+                false
+            } else {
+                true
+            }
+        });
+        for (idx, v) in gmoves {
+            self.slot_has_gui.insert((track_id, idx), v);
         }
     }
 

@@ -12,7 +12,7 @@ use std::io::Cursor;
 
 use anyhow::{Context, Result};
 
-use crate::model::{Note, Song, TalkParams};
+use crate::model::{Note, TalkParams};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -122,184 +122,23 @@ pub(crate) const REST_FRAMES: u32 = 10;
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Synthesize every vocal clip on every vocal track in `song`, returning
-/// one `SynthResult` per clip processed (success or failure). Non-vocal
-/// tracks are skipped.
-///
-/// `default_singer_id` is the fallback for sing mode when a clip's
-/// `Clip::speaker_id` is 0 (未指定). Each vocal clip carries its own
-/// per-clip singer (FIXME #36).
-///
-/// `default_talk_speaker_id` is the same fallback for talk mode (clips
-/// with no pitched notes).
-pub fn synthesize_song(
-    song: &Song,
-    default_singer_id: u32,
-    default_talk_speaker_id: u32,
-    cache: &mut crate::voicevox_cache::VoiceVoxCache,
-) -> Vec<SynthResult> {
-    let client = reqwest::blocking::Client::new();
-    let mut results = Vec::new();
-
-    for (track_idx, track) in song.tracks.iter().enumerate() {
-        if !track.is_voicevox_vocal() {
-            continue;
-        }
-
-        for (clip_idx, clip) in track.clips.iter().enumerate() {
-            // (FIXME #36) 声は per-clip。 clip.speaker_id != 0 を優先、 0
-            // (未指定) なら caller の default にフォールバック。 sing / talk
-            // 両 path がこの per-clip singer_id を使う。
-            let singer_id = if clip.speaker_id != 0 {
-                clip.speaker_id
-            } else {
-                default_singer_id
-            };
-            // v6 linked clip: notes は Song.clip_contents に。 共有 clip /
-            // 独立 clip を区別せず、 同じ content_id の clip は同じ notes
-            // で 1 回だけ合成 (cache key も notes ベース)。
-            let notes: &[Note] = song
-                .clip_contents
-                .get(&clip.content_id)
-                .and_then(|c| c.notes())
-                .unwrap_or(&[]);
-
-            // Cache lookup — notes 内容 + singer_id が同じなら HTTP call
-            // を skip。 talk mode も sing mode も同じ key 体系で hit。
-            let cache_key =
-                crate::voicevox_cache::VoiceVoxCache::key_for_notes(notes, singer_id);
-            if let Some(cached) = cache.get(cache_key) {
-                tracing::info!(
-                    track = track_idx,
-                    clip = clip_idx,
-                    cache_key,
-                    "VOICEVOX cache hit"
-                );
-                results.push(SynthResult {
-                    track: track_idx as u32,
-                    clip: clip_idx as u32,
-                    samples: cached.samples.clone(),
-                    sample_rate: cached.sample_rate,
-                    error: None,
-                });
-                continue;
-            }
-
-            // A clip with at least one note that has any pitch goes into
-            // sing mode; otherwise we fall back to talk mode using
-            // whatever lyrics are attached (used for spoken intros, etc.).
-            let has_pitched_notes = notes
-                .iter()
-                .any(|n| n.pitch > 0 && n.duration_beats > 0.0);
-            let wav_bytes = if has_pitched_notes {
-                match synthesize_sing_clip(&client, notes, song.bpm, singer_id) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let msg = format!("{e:#}");
-                        tracing::error!(error = ?e, track = track_idx, clip = clip_idx, "sing synthesis failed");
-                        results.push(SynthResult {
-                            track: track_idx as u32,
-                            clip: clip_idx as u32,
-                            samples: Vec::new(),
-                            sample_rate: 0,
-                            error: Some(msg),
-                        });
-                        continue;
-                    }
-                }
-            } else {
-                // Talk mode: concatenate lyrics in time order.
-                let mut sorted: Vec<&Note> = notes.iter().collect();
-                sorted.sort_by(|a, b| {
-                    a.start_beat
-                        .partial_cmp(&b.start_beat)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let text: String = sorted
-                    .iter()
-                    .filter_map(|n| n.lyric.as_deref())
-                    .collect::<Vec<_>>()
-                    .join("");
-                if text.is_empty() {
-                    continue;
-                }
-                let sid = if clip.speaker_id != 0 { clip.speaker_id } else { default_talk_speaker_id };
-                let scales = clip.talk.unwrap_or_default();
-                match synthesize_talk(&client, &text, sid, &scales) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let msg = format!("{e:#}");
-                        tracing::error!(error = ?e, track = track_idx, clip = clip_idx, "talk synthesis failed");
-                        results.push(SynthResult {
-                            track: track_idx as u32,
-                            clip: clip_idx as u32,
-                            samples: Vec::new(),
-                            sample_rate: 0,
-                            error: Some(msg),
-                        });
-                        continue;
-                    }
-                }
-            };
-
-            match decode_wav_to_f32(&wav_bytes) {
-                Ok((samples, sr)) => {
-                    // Cache に store (次回同 clip 同 singer で hit)
-                    cache.insert(
-                        cache_key,
-                        crate::voicevox_cache::CachedClip {
-                            samples: samples.clone(),
-                            sample_rate: sr,
-                        },
-                    );
-                    results.push(SynthResult {
-                        track: track_idx as u32,
-                        clip: clip_idx as u32,
-                        samples,
-                        sample_rate: sr,
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    tracing::error!(error = ?e, track = track_idx, clip = clip_idx, "WAV decode failed");
-                    results.push(SynthResult {
-                        track: track_idx as u32,
-                        clip: clip_idx as u32,
-                        samples: Vec::new(),
-                        sample_rate: 0,
-                        error: Some(msg),
-                    });
-                }
-            }
-        }
-    }
-
-    results
-}
-
-#[derive(Debug, Clone)]
-pub struct SynthResult {
-    pub track: u32,
-    pub clip: u32,
-    /// Mono f32 samples, −1..+1. Empty when `error` is `Some`.
-    pub samples: Vec<f32>,
-    pub sample_rate: u32,
-    /// Non-None when synthesis failed for this clip.
-    pub error: Option<String>,
-}
+// NOTE (FIXME #77): 旧 `synthesize_song` + in-memory `VoiceVoxCache` は撤去した。
+// 合成は `daw_plugin_host` の builtin plugin が `synthesize_notes_for_builtin` /
+// `synthesize_talk_for_builtin` 経由で行い、 結果は `voicevox_cache`
+// (`VoiceVoxDiskCache`) で per-user global に永続化する。
 
 // ---------------------------------------------------------------------------
 // Sing
 // ---------------------------------------------------------------------------
 
-fn synthesize_sing_clip(
+/// 既に組み立て済みの sing query JSON を `frame_synthesis` に流して WAV bytes を
+/// 得る (`build_sing_query` → 本関数 の 2 段)。 caller が query を先に作るのは
+/// キャッシュキー (= query 内容 + singer) を HTTP 前に計算するため (FIXME #77)。
+fn sing_query_to_wav(
     client: &reqwest::blocking::Client,
-    notes: &[Note],
-    bpm: f32,
+    query_json: &str,
     singer_id: u32,
 ) -> Result<Vec<u8>> {
-    let query_json = build_sing_query(notes, bpm);
     tracing::info!(json_len = query_json.len(), "sing_frame_audio_query");
 
     // Step 1: sing_frame_audio_query
@@ -310,7 +149,7 @@ fn synthesize_sing_clip(
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
-        .body(query_json)
+        .body(query_json.to_owned())
         .send()
         .context("sing_frame_audio_query request failed")?;
     let status = resp.status();
@@ -474,10 +313,23 @@ pub fn synthesize_talk_for_builtin(
     scales: &TalkParams,
 ) -> Result<(Vec<f32>, u32)> {
     anyhow::ensure!(!text.is_empty(), "synthesize_talk_for_builtin called with empty text");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
-        .build()?;
-    let wav = synthesize_talk(&client, text, speaker_id, scales)?;
+    // FIXME #77: 永続キャッシュ (text + talk speaker + scales)。 再オープンで
+    // 読み上げを再合成しない。
+    let cache = crate::voicevox_cache::VoiceVoxDiskCache::production();
+    let cache_key = crate::voicevox_cache::key_for_talk(text, speaker_id, scales);
+    let wav = if let Some(hit) = cache.as_ref().and_then(|c| c.get(cache_key)) {
+        tracing::info!(cache_key, "VOICEVOX talk cache hit (HTTP skip)");
+        hit
+    } else {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
+            .build()?;
+        let wav = synthesize_talk(&client, text, speaker_id, scales)?;
+        if let Some(c) = cache.as_ref() {
+            c.put(cache_key, &wav);
+        }
+        wav
+    };
     decode_wav_to_f32(&wav)
 }
 
@@ -720,11 +572,26 @@ pub fn synthesize_notes_for_builtin(
         DEFAULT_SINGER_ID
     };
     let model_notes: Vec<Note> = notes.iter().map(|n| n.to_model_note()).collect();
+    let query_json = build_sing_query(&model_notes, bpm);
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
-        .build()?;
-    let wav_bytes = synthesize_sing_clip(&client, &model_notes, bpm, speaker_id)?;
+    // FIXME #77: 永続コンテンツアドレスキャッシュ。 query 内容 (= 歌詞 / pitch /
+    // frame / bpm が畳み込み済) + singer が同じなら、 HTTP 合成を丸ごと skip して
+    // 保存済 WAV を返す。 プロジェクト再オープンで全曲を再合成しないための要。
+    let cache = crate::voicevox_cache::VoiceVoxDiskCache::production();
+    let cache_key = crate::voicevox_cache::key_for_sing(&query_json, speaker_id);
+    let wav_bytes = if let Some(hit) = cache.as_ref().and_then(|c| c.get(cache_key)) {
+        tracing::info!(cache_key, "VOICEVOX sing cache hit (HTTP skip)");
+        hit
+    } else {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
+            .build()?;
+        let wav = sing_query_to_wav(&client, &query_json, speaker_id)?;
+        if let Some(c) = cache.as_ref() {
+            c.put(cache_key, &wav);
+        }
+        wav
+    };
     let (samples, sample_rate) = decode_wav_to_f32(&wav_bytes)?;
 
     // Note frame offsets relative to frame 0 of the rendered buffer.

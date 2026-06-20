@@ -102,6 +102,7 @@ pub enum PluginEvent {
         index: u32,
         plugin_id: u32,
         params: Vec<common::protocol::PluginParamInfo>,
+        has_embedded_gui: bool,
     },
     /// Phase 2c: plugin GUI で knob を touch した通知 (CLAP
     /// PARAM_GESTURE_BEGIN out event 経由)。 process_server で drain
@@ -187,11 +188,13 @@ impl From<PluginEvent> for ChildToMain {
                 index,
                 plugin_id,
                 params,
+                has_embedded_gui,
             } => ChildToMain::PluginParamList {
                 track,
                 index,
                 plugin_id,
                 params,
+                has_embedded_gui,
             },
             PluginEvent::PluginParamTouched {
                 track,
@@ -1100,11 +1103,17 @@ fn plugin_main_loop(
                                         "plugin enumerated params"
                                     );
                                 }
+                                // FIXME #78: 埋め込み GUI の有無を一緒に通知。
+                                // daw_gui がチェーン行ボタン (GUI window vs
+                                // インライン param パネル) を分岐する判断材料。
+                                let has_embedded_gui =
+                                    unsafe { (*p).gui_is_embed_supported() };
                                 let _ = evt_tx.send(PluginEvent::PluginParamList {
                                     track,
                                     index,
                                     plugin_id: new_plugin_id,
                                     params,
+                                    has_embedded_gui,
                                 });
                             }
                         }
