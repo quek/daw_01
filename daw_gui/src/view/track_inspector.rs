@@ -356,7 +356,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // content < viewport の余白は scroll 領域内の空きになるだけで無害。
     let param_h = max_param_h;
     let param_vp = Rect { x: area.x, y: body_top, w: area.w, h: param_h };
-    let boundary_y = body_top + param_h;
     let measured_body_h = std::cell::Cell::new(0.0_f32);
     ui.scroll_area("inspector_body", param_vp, (param_vp.w, content_h), |ui, scroll_off| {
     let mut y = body_top - scroll_off.1;
@@ -2510,7 +2509,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // chain band (下端 pinned): sidechain / modulation / 下端ボタン。 chain list 本体と
     // 各デバイスの param パネルは viewport 内のアコーディオン (上の
     // reorderable_list_expandable、 FIXME #78) に移動した。
-    let _ = boundary_y;
     let btns_h = 26.0;
     let btns_y = area.y + area.h - btns_h - pad;
 
