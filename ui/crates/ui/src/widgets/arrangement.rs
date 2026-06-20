@@ -8620,17 +8620,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- M14 Phase 125 (#102): plain-drag marquee gate (空き zone の press を marquee が所有) ----
+        // ---- M14 Phase 125 (#102) + daw_01 #75: drag marquee gate ----
         // 旧設計は rect-select 起動に Shift 必須だったが、 標準 DAW (REAPER/Live/Bitwig) に倣い
-        // **空き zone を無修飾 drag → 範囲選択** にする。 clip 上の plain drag は移動のまま。 修飾は
-        // release 時の next 計算で plain=REPLACE / Shift=UNION / Ctrl=XOR に分岐し、 press 時 modifier は
+        // **空き zone を無修飾 drag → 範囲選択** にする。 修飾は release 時の next 計算で
+        // plain=REPLACE / Shift=UNION / Ctrl=XOR に分岐し、 press 時 modifier は
         // `take_drag_rect_in_rect` が `DragRect.modifiers` に snapshot する (下の commit block で読む)。
         // gate を **clear の前** で評価して `marquee_active` を作り、 同フレーム二重 emit を防ぐ。
-        // `clip_hit().is_none()` は load-bearing: clip MOVE は `(!shift||ctrl)` gate (#021) なので hit-test
-        // 無しだと Shift/Ctrl+clip press が誤って marquee 起動する (= Ctrl+Shift clone も clip HIT 時のみ
-        // なので安全)。 automation lane は lasso が所有するため `!press_in_automation_lane` で除外
-        // (no_session は `automation_lasso_drag` を含まないのでこの zone 除外が必須)。 splitter / 他 drag は
-        // no_session (= 全 session None) で除外 (splitter press は `automation_lane_resize_drag` を立てる)。
+        //
+        // #75: clip の **上から** でも範囲選択を開始できるようにする。 起動 zone を `marquee_zone_ok`
+        // で判定する:
+        //   - clip 無し (空き zone)              → 任意修飾で marquee (従来どおり)。
+        //   - clip の **Move zone** + Shift+!Ctrl → marquee (NEW)。 plain Move / Ctrl(+Shift) clone /
+        //                                           Shift+resize time-stretch とは排他。
+        //   - clip の resize handle / その他      → marquee 不可 (time-stretch・clone・move に譲る)。
+        // この zone 判定は press 側 clip_drag gate (#021 の `(!shift||ctrl)` / FIXME #61 の resize) と
+        // 鏡像で、 marquee に入る press は press 側で clip_drag session を **起動しない** ものに限られる。
+        // 二重防御として下の no-session ガード (全 session None) でも弾く。 automation lane は lasso が
+        // 所有するため `!press_in_automation_lane` で除外 (no_session は `automation_lasso_drag` を
+        // 含まないのでこの zone 除外が必須)。 splitter / 他 drag も no-session で除外。
         let drag_rect_wid = wid.child(b"rect_select");
         let shift_rect_active = {
             let state: &mut crate::widgets::drag_rect::DragRectState =
@@ -8652,14 +8659,30 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 )
                 .is_some()
             });
-        let marquee_press = if pointer.primary_just_pressed
+        let marquee_zone_ok = pointer.primary_just_pressed
             && !pointer.modifiers.alt
             && !press_in_automation_lane
-            && let Some((px, py)) = pointer.pos
-            && lanes.contains(px, py)
-            && clip_hit(&visible_tracks, &press_tops, view, lanes, px, py, style.resize_handle_px)
-                .is_none()
-        {
+            && pointer.pos.is_some_and(|(px, py)| {
+                lanes.contains(px, py)
+                    && match clip_hit(
+                        &visible_tracks,
+                        &press_tops,
+                        view,
+                        lanes,
+                        px,
+                        py,
+                        style.resize_handle_px,
+                    ) {
+                        None => true,
+                        // #75: clip 本体 (Move zone) は Shift(Ctrl なし) のときだけ marquee 起動。
+                        Some((_, ClipDragKind::Move)) => {
+                            pointer.modifiers.shift && !pointer.modifiers.ctrl
+                        }
+                        // resize handle 上は time-stretch (#61) / resize に譲る。
+                        Some(_) => false,
+                    }
+            });
+        let marquee_press = if marquee_zone_ok {
             let s: &ArrangementState = self.widget_state(wid);
             s.track_volume_drag.is_none()
                 && s.track_reorder.is_none()
@@ -15057,6 +15080,49 @@ mod tests {
         );
         assert_eq!(select_count, 0, "clip 上 plain drag は marquee 不発 (SelectClips ゼロ)");
         assert!(move_count >= 1, "clip drag は MoveClips を発行する");
+    }
+
+    /// #75: clip の **上から** 始める **Shift** drag は marquee UNION を起動する (clip move しない)。
+    /// press (100,15) = clip A 中央。 Shift は move zone の clip_drag を抑止するので、 marquee が
+    /// この press を所有して rect 内 {A,B} を prev [A] に UNION する。
+    #[test]
+    fn arrangement_shift_drag_on_clip_starts_marquee_union() {
+        let tracks = marquee_tracks();
+        let (select_count, next, move_count) = run_marquee(
+            &tracks,
+            test_view(),
+            &[ck(100)],
+            daw_ui_platform::Modifiers { shift: true, ..daw_ui_platform::Modifiers::empty() },
+            (100.0, 15.0),
+            (650.0, 20.0),
+        );
+        assert_eq!(select_count, 1, "clip 上 Shift drag は marquee を起動して SelectClips 1 回");
+        assert_eq!(
+            next,
+            Some(vec![ck(100), ck(101)]),
+            "UNION: prev [A] ∪ rect 内 {{A,B}} = [A,B]"
+        );
+        assert_eq!(move_count, 0, "clip 上 Shift drag は move しない (MoveClips ゼロ)");
+    }
+
+    /// #75 排他性: clip 上の **Ctrl+Shift** drag は independent clone であって marquee ではない
+    /// (`!ctrl` 条件で marquee から除外)。 SelectClips を発行しないことで marquee 不発を確認する。
+    #[test]
+    fn arrangement_ctrl_shift_drag_on_clip_is_not_marquee() {
+        let tracks = marquee_tracks();
+        let (select_count, _, _) = run_marquee(
+            &tracks,
+            test_view(),
+            &[ck(100)],
+            daw_ui_platform::Modifiers {
+                shift: true,
+                ctrl: true,
+                ..daw_ui_platform::Modifiers::empty()
+            },
+            (100.0, 15.0),
+            (300.0, 15.0),
+        );
+        assert_eq!(select_count, 0, "clip 上 Ctrl+Shift drag は clone であって marquee 不発");
     }
 
     /// 空き zone の sub-4px 無修飾 press+release (同フレーム) は marquee zero-rect REPLACE で
