@@ -48,6 +48,25 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
     }
 
+    /// `button_at` の font_size 可変版。 click 判定・外観は `button_at` と完全同一で、
+    /// テキストの font_size だけを呼び出し側が指定する。 16px 固定の `button_at` では
+    /// 大きすぎる狭い領域の小ボタン (mixer send slot の × 等) を、 ボタン外で
+    /// `button_at_clicked_sized` + `push_edit` (pub(crate) で view から呼べない) を
+    /// 手書きする boilerplate なしに置けるようにする。
+    pub fn button_at_sized(
+        &mut self,
+        id: impl std::hash::Hash,
+        text: &str,
+        rect: Rect,
+        font_size: f32,
+        on_click: impl FnOnce() -> Edit<M>,
+    ) {
+        if self.button_at_clicked_sized(id, text, rect, font_size) {
+            let edit = on_click();
+            self.push_edit(edit);
+        }
+    }
+
     /// `button_at` の Edit-less 版。click された frame で `true` を返す。
     ///
     /// 用途: button click 内で `Ui` 操作 (modal の `close_modal` / `set_focus` /

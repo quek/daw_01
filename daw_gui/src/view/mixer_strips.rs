@@ -29,10 +29,22 @@ const METER_GAP: f32 = 2.0;
 /// 付けつつ現 80px ストリップ (fader 18 と並べて) に収まる幅。 数字 "-60" が
 /// 読める最小幅で、 バーは ~5px ずつ残る。
 const METER_SCALE_W: f32 = 35.0;
-/// Sends セクション 1 行の高さ (= 宛先名ラベル + 小 knob / 小ボタン群)。
-const SEND_ROW_H: f32 = 30.0;
+/// Sends セクション 1 行の高さ (= 宛先名 + × の header 行 + knob / Pre-Post / M の
+/// controls 行)。 2 行構成にして Pre/Post トグルに "Post" が省略されない幅を確保する。
+const SEND_ROW_H: f32 = 33.0;
 /// Sends セクション内の send 用ミニ knob のサイズ。
 const SEND_KNOB_SIZE: f32 = 18.0;
+/// Sends セクションの内側左右パディング。
+const SEND_PAD: f32 = 6.0;
+/// send 行内の小ボタン同士の隙間。
+const SEND_BTN_GAP: f32 = 3.0;
+/// per-send mute (M) ボタンの幅 (1 文字なので固定の狭幅)。
+const SEND_MUTE_BTN_W: f32 = 14.0;
+/// × (remove send) ボタンの幅 (header 行右上)。 controls 行の M の真上に揃う。
+const SEND_CLOSE_BTN_W: f32 = 14.0;
+/// Pre/Post トグルの font_size (controls 行)。 "Post" (最長ラベル) が
+/// `send_prepost_width` に省略なしで収まる前提 (回帰テストで固定)。
+const SEND_PREPOST_FONT: f32 = 10.0;
 /// 「＋ Send」 ボタンの高さ。
 const ADD_SEND_H: f32 = 16.0;
 /// returns 帯と通常 strip 帯を分ける divider の幅。
@@ -94,7 +106,7 @@ const STYLE_SEND_MUTE: ToggleButtonStyle = ToggleButtonStyle {
 /// Pre/Post 切替トグル。 PreFader のとき on_color (青系) で強調する。
 const STYLE_SEND_PREPOST: ToggleButtonStyle = ToggleButtonStyle {
     on_color: Color { r: 0.32, g: 0.55, b: 0.85, a: 1.0 },
-    font_size: 9.0,
+    font_size: SEND_PREPOST_FONT,
     ..TOGGLE_BUTTON_BASE
 };
 
@@ -585,10 +597,22 @@ fn sends_band_height(n_sends: usize) -> f32 {
     4.0 + (n_sends as f32) * SEND_ROW_H + ADD_SEND_H + 4.0
 }
 
-/// strip 下部の Sends セクションを描画する。 各 send 1 行:
-///   宛先名ラベル + [ミニ level knob | Pre/Post | M(per-send mute) | ×]
-/// 末尾に「＋ Send」 ボタン (= track picker を開く)。 `band_h` は
-/// `sends_band_height` と一致する (= caller が両方に同値を渡す)。
+/// controls 行で Pre/Post トグルに割り当てる幅。 knob 右の小ボタン帯から per-send mute
+/// (M) を固定幅で引いた残り全部を Pre/Post に与え、 "Post" (最長ラベル) が省略
+/// (P…) されないようにする。 `inner_w` は strip の内側幅 (= `rect.w - SEND_PAD*2`)。
+/// `draw_sends_section` と回帰テストの SSoT。
+fn send_prepost_width(inner_w: f32) -> f32 {
+    let btns_w = inner_w - (SEND_KNOB_SIZE + 4.0);
+    (btns_w - SEND_MUTE_BTN_W - SEND_BTN_GAP).max(0.0)
+}
+
+/// strip 下部の Sends セクションを描画する。 各 send は 2 行の slot:
+///   header 行 : 宛先名ラベル (省略付き) + × (remove、 右上)
+///   controls 行: [ミニ level knob | Pre/Post | M(per-send mute)]
+/// 80px ストリップ幅に 4 要素を 1 行で詰めると Pre/Post が ~13px しか取れず "Post"/"Pre"
+/// が "P…" に省略される (daw_01 UI/UX 修正)。 × を header 右上に逃がし、 controls 行の
+/// 残り幅を Pre/Post に寄せて省略を無くす。 末尾に「＋ Send」 ボタン (= track picker を
+/// 開く)。 `band_h` は `sends_band_height` と一致する (= caller が両方に同値を渡す)。
 fn draw_sends_section(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -596,7 +620,7 @@ fn draw_sends_section(
     rect: Rect,
     band_h: f32,
 ) {
-    let pad = 6.0;
+    let pad = SEND_PAD;
     let band_top = rect.y + rect.h - pad - band_h;
     // 上端に薄い区切り線。
     ui.panel(
@@ -629,16 +653,34 @@ fn draw_sends_section(
             })
             .unwrap_or_else(|| format!("→ ?{}", send.dest_track_id));
 
-        // 宛先名 (1 行)。
-        ui.label_at(
+        // header 行: 宛先名 (左、 × にかぶらないよう省略付き) + × (右上)。
+        let close_x = inner_x + inner_w - SEND_CLOSE_BTN_W;
+        let name_max_w = (close_x - SEND_BTN_GAP - inner_x).max(0.0);
+        ui.label_at_clipped(
             ("mixer_send_name", track_id as usize, send_idx),
             &dest_name,
-            inner_x,
-            y,
+            Rect { x: inner_x, y, w: name_max_w, h: 12.0 },
             10.0,
             COLOR_TEXT,
         );
-        let row_y = y + 11.0;
+        // × (remove send) — slot 右上 (= 一般的な「閉じる / 削除」位置)。
+        let send_idx_for_remove = send_idx;
+        ui.button_at_sized(
+            ("mixer_send_remove", track_id as usize, send_idx),
+            "x",
+            Rect { x: close_x, y, w: SEND_CLOSE_BTN_W, h: 13.0 },
+            11.0,
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::RemoveSend {
+                        track_id,
+                        send_idx: send_idx_for_remove,
+                    })
+                })
+            },
+        );
+        // controls 行は header の下。
+        let row_y = y + 14.0;
 
         // ミニ level knob (0..2 → 0..1 normalized、 volume / pan と同 idiom)。
         // gain は linear 0..2、 knob は 0..1 表示なので gain/2 を渡す。
@@ -693,11 +735,10 @@ fn draw_sends_section(
             knob_resp.dragging,
         );
 
-        // knob 右に小ボタン 3 つを横並び: Pre/Post | M | ×。
+        // knob 右に Pre/Post (広め) と M (1 文字・狭め) を横並び。 × は header に
+        // 逃がしたので、 残り幅を Pre/Post に寄せて "Post" の省略を無くす。
         let btns_x = inner_x + SEND_KNOB_SIZE + 4.0;
-        let btns_w = (inner_x + inner_w - btns_x).max(0.0);
-        let gap = 3.0;
-        let btn_w = ((btns_w - gap * 2.0) / 3.0).max(0.0);
+        let prepost_w = send_prepost_width(inner_w);
         let btn_h = SEND_KNOB_SIZE.min(16.0);
         let btn_y = row_y;
 
@@ -708,7 +749,7 @@ fn draw_sends_section(
         ui.toggle_button_at(
             ("mixer_send_prepost", track_id as usize, send_idx),
             mode_label,
-            Rect { x: btns_x, y: btn_y, w: btn_w, h: btn_h },
+            Rect { x: btns_x, y: btn_y, w: prepost_w, h: btn_h },
             is_pre,
             &STYLE_SEND_PREPOST,
             move |_| {
@@ -731,7 +772,7 @@ fn draw_sends_section(
         ui.toggle_button_at(
             ("mixer_send_mute", track_id as usize, send_idx),
             "M",
-            Rect { x: btns_x + btn_w + gap, y: btn_y, w: btn_w, h: btn_h },
+            Rect { x: btns_x + prepost_w + SEND_BTN_GAP, y: btn_y, w: SEND_MUTE_BTN_W, h: btn_h },
             !enabled,
             &STYLE_SEND_MUTE,
             move |_| {
@@ -740,22 +781,6 @@ fn draw_sends_section(
                         track_id,
                         send_idx: send_idx_for_mute,
                         enabled: !enabled,
-                    })
-                })
-            },
-        );
-
-        // × (remove send)。
-        let send_idx_for_remove = send_idx;
-        ui.button_at(
-            ("mixer_send_remove", track_id as usize, send_idx),
-            "x",
-            Rect { x: btns_x + (btn_w + gap) * 2.0, y: btn_y, w: btn_w, h: btn_h },
-            move || {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::RemoveSend {
-                        track_id,
-                        send_idx: send_idx_for_remove,
                     })
                 })
             },
@@ -782,3 +807,38 @@ fn draw_sends_section(
 // Phase 4 Step B の `push_param_gesture_edges` は共通 helper として
 // `view::param_gesture` に抽出 (Phase 5 follow-up review、 transport.rs と
 // 重複していたため)。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daw_ui_core::{FrameInput, UiHost};
+    use daw_ui_platform::PhysicalSize;
+    use daw_ui_renderer::Scene;
+
+    /// daw_01 UI/UX 修正の回帰固定: 旧レイアウトは Pre/Post トグルが ~13px しか
+    /// 取れず "Pre"/"Post" が "P…" に省略されていた。 再設計後の `send_prepost_width`
+    /// に最長ラベル "Post" が実 measure で省略なしに収まることを保証する。
+    #[test]
+    fn send_prepost_label_fits_without_ellipsis() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        let mut post_w = 0.0_f32;
+        let mut pre_w = 0.0_f32;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            post_w = ui.measure_text("Post", SEND_PREPOST_FONT);
+            pre_w = ui.measure_text("Pre", SEND_PREPOST_FONT);
+        });
+
+        let avail = send_prepost_width(STRIP_WIDTH - SEND_PAD * 2.0);
+        assert!(
+            post_w <= avail,
+            "'Post' ({post_w}px @ {SEND_PREPOST_FONT}pt) は Pre/Post 幅 {avail}px に収まる"
+        );
+        assert!(
+            pre_w <= avail,
+            "'Pre' ({pre_w}px @ {SEND_PREPOST_FONT}pt) は Pre/Post 幅 {avail}px に収まる"
+        );
+    }
+}
