@@ -47,7 +47,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     draw_snap_toolbar(app, ui, toolbar_rect);
 
     let Some(target) = app.selected_clip_ref() else {
-        // クリップ未選択時のプレースホルダ
+        // クリップ未選択時のプレースホルダ。 widget が走らないので、 もし歌詞編集
+        // mirror が残っていたら false に戻す (FIXME #84、 stale-true で Esc が widget へ
+        // 委ねられ続けて消える事故を防ぐ)。
+        if app.piano_roll_lyric_editing {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.piano_roll_lyric_editing = false;
+            }));
+        }
         ui.panel("pr_bg_empty", body, COLOR_BG, 0.0);
         ui.label_at(
             "pr_no_clip",
@@ -290,6 +297,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &style,
         make_edit,
     );
+
+    // FIXME #84: 歌詞 inline 編集中フラグを app に mirror する。 root.rs の
+    // `dispatch_shortcuts` は piano_roll widget より前に走って `take_shortcut("escape")`
+    // を消費してしまうため、 編集中は app 側フラグを見て Esc を消費させず widget に委ねる
+    // (= widget が歌詞編集を 1 frame で cancel)。 変化したフレームだけ Edit を発行する
+    // (keyboard_active_pitch mirror と同方針、 毎フレーム push を避ける)。
+    let lyric_editing = resp.lyric_editing.is_some();
+    if lyric_editing != app.piano_roll_lyric_editing {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.piano_roll_lyric_editing = lyric_editing;
+        }));
+    }
 
     // gui_01 #055: 鍵盤レーン click のピッチプレビュー。 widget が押下中の pitch を
     // keyboard_active_pitch で返す。 前フレーム値 (app.preview_note の pitch) と

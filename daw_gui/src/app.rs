@@ -1395,6 +1395,17 @@ pub struct AppData {
 
     // -------- View state --------
     pub bottom_panel: u8,
+    /// piano_roll widget が歌詞 inline 編集 (gui_01 #017、 note 上の L キー編集) の
+    /// text_input overlay を出している間 `true`。 widget 内部状態 (`PianoRollState`) の
+    /// session-only ミラーで、 `piano_roll_view::draw` が毎フレーム `resp.lyric_editing`
+    /// から更新する (project save には含めない)。
+    ///
+    /// 用途は root.rs の Esc dispatch との調停 (FIXME #84)。 `dispatch_shortcuts` は
+    /// piano_roll widget より前に走って `take_shortcut("escape")` を消費するため、
+    /// このミラーが立っている間は Esc を消費せず widget に委ねる (widget 側が歌詞編集を
+    /// キャンセルする)。 ミラーは 1 frame 遅延だが、 編集モードは L 押下〜Esc 押下まで
+    /// 複数フレーム持続するので調停に支障はない。
+    pub piano_roll_lyric_editing: bool,
     /// `Some(target)` で Audio Editor (= clip ダブルクリックで開く波形
     /// 編集 view) が開いている。 bottom_panel の Piano Roll タブが
     /// audio_editor view に切り替わる (`docs/plan_audio_clip.md` §3.10
@@ -2150,6 +2161,7 @@ impl AppData {
             arrange_dragging_track_volume: None,
             arrange_hovered_automation_lane: None,
             bottom_panel: 0,
+            piano_roll_lyric_editing: false,
             audio_editor_clip: None,
             audio_editor_selected_events: Vec::new(),
             audio_editor_hover_beat_in_clip: None,
