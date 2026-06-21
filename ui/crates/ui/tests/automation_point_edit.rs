@@ -27,7 +27,6 @@ struct ObsModel {
     tracks: Vec<ArrangementTrack>,
     lane_enabled: Vec<(AutomationLaneKey, bool)>,
     lane_visible: Vec<(AutomationLaneKey, bool)>,
-    lane_default: Vec<(AutomationLaneKey, f32, f32)>,
     deleted_lanes: Vec<AutomationLaneKey>,
     added_points: Vec<(AutomationClipKey, f64, f32)>,
     moved_points: Vec<MoveAutomationPointDelta>,
@@ -54,6 +53,10 @@ struct ObsModel {
     curve_param_events: Vec<(AutomationPointKey, SetAutomationCurveParamKind, f32, f32)>,
     /// M14 Phase 99 (#071): 観測した `SecondaryClickEmpty` の (track, beat, pos) 列。
     secondary_empty: Vec<(u32, f64, (f32, f32))>,
+    /// FIXME #81: 観測した `DoubleClickAutomationPoint` (= 値の数値入力開始) の key 列。
+    dbl_click_points: Vec<AutomationPointKey>,
+    /// FIXME #81: 観測した `automation_lane_default_rects` (lane header の default 値フィールド rect)。
+    default_rects: Vec<(AutomationLaneKey, Rect)>,
 }
 
 fn make_lane(id: u32, enabled: bool) -> ArrangementAutomationLane {
@@ -227,11 +230,6 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
                         mm.lane_visible.push((lane, visible));
                     })
                 }
-                ArrangementEditRequest::SetLaneDefault { lane, prev, next } => {
-                    Edit::mutate(move |mm: &mut ObsModel| {
-                        mm.lane_default.push((lane, prev, next));
-                    })
-                }
                 ArrangementEditRequest::DeleteLane(k) => Edit::mutate(move |mm: &mut ObsModel| {
                     mm.deleted_lanes.push(k);
                 }),
@@ -329,15 +327,24 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
                         mm.secondary_empty.push((track, beat, pos));
                     })
                 }
+                // FIXME #81: 既存 point 上の dblclick → 値の数値入力開始。
+                ArrangementEditRequest::DoubleClickAutomationPoint(k) => {
+                    Edit::mutate(move |mm: &mut ObsModel| {
+                        mm.dbl_click_points.push(k);
+                    })
+                }
                 _ => Edit::mutate(|_| {}),
             },
         );
         // automation_point_rects を観測 (毎 frame、 caller が context_menu_for で popup anchor 用に使う)
         let rects = resp.automation_point_rects.clone();
         let lasso_active = resp.automation_lasso_active;
+        // FIXME #81: lane header の default 値フィールド rect を観測。
+        let default_rects = resp.automation_lane_default_rects.clone();
         ui.push_edit(Edit::mutate(move |mm: &mut ObsModel| {
             mm.point_rects = rects;
             mm.lasso_active_frames.push(lasso_active);
+            mm.default_rects = default_rects;
         }));
     });
 }
@@ -454,6 +461,85 @@ fn lane_body_double_click_emits_add_automation_point() {
     assert!((time_beat - 6.0).abs() < 0.05, "time_beat ≈ 6.0、 actual {time_beat}");
     // value_norm ≈ 0.5 (lane mid)
     assert!((value_norm - 0.5).abs() < 0.05, "value_norm ≈ 0.5、 actual {value_norm}");
+}
+
+/// FIXME #81: 既存 point の **上**での dblclick は `DoubleClickAutomationPoint` を発火し、
+/// 新規点追加 (`AddAutomationPoint`) は発火しない (widget 内 priority: point hit > clip body)。
+#[test]
+fn dblclick_on_existing_point_emits_double_click_not_add() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+    // 既存 point[1] = (time 4, value_norm 0.3)。
+    //   body x = 200 + 4 * (600/16) = 350
+    //   clip_y = 32 + 6 = 38、 clip_h = 60 - 12 = 48
+    //   py = 38 + (1 - 0.3) * 48 = 71.6
+    let cx = 350.0;
+    let cy = 71.6;
+
+    // 1 click 目 (= 点を選択)。
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    // 2 click 目 → dblclick on point → DoubleClickAutomationPoint。
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_press(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+    run_arrangement_frame(&mut host, &mut m, FrameInput {
+        pointer: pointer_release(cx, cy, Modifiers::empty()),
+        ..FrameInput::default()
+    });
+
+    assert_eq!(
+        m.dbl_click_points.len(),
+        1,
+        "dblclick on point で DoubleClickAutomationPoint を 1 度発火、 got {:?}",
+        m.dbl_click_points
+    );
+    assert_eq!(
+        m.dbl_click_points[0],
+        AutomationPointKey {
+            clip: AutomationClipKey { track: 1, lane: 10, clip: 100 },
+            point_idx: 1,
+        }
+    );
+    assert_eq!(
+        m.added_points.len(),
+        0,
+        "point 上 dblclick では AddAutomationPoint を発火しない (priority 排他)"
+    );
+}
+
+/// FIXME #81: lane header が default 値の数値入力フィールド rect を `automation_lane_default_rects`
+/// で公開する (caller がここに scrubable_number_at を overlay する)。 lane 高さ 60px はフィールドを
+/// 載せられるので Some。
+#[test]
+fn lane_header_exposes_default_value_field_rect() {
+    let mut host: UiHost<ObsModel> = UiHost::no_redraw();
+    let mut m = ObsModel::default();
+    m.tracks = vec![make_track(1, vec![make_lane(10, true)])];
+
+    // hover も press も無い idle frame で rect が出ることを確認。
+    run_arrangement_frame(&mut host, &mut m, FrameInput::default());
+
+    let found = m
+        .default_rects
+        .iter()
+        .find(|(k, _)| *k == AutomationLaneKey { track: 1, lane: 10 });
+    let (_, rect) = found.expect("lane 10 の default 値フィールド rect が公開される");
+    assert!(rect.w > 0.0 && rect.h > 0.0, "field rect は正の面積、 got {rect:?}");
+    // header pane (左、 x < view.header_w = 200) 内に居る。
+    assert!(
+        rect.x < 200.0,
+        "default フィールドは header pane 内、 got x={}",
+        rect.x
+    );
 }
 
 /// M14 Phase 63n-4 (#029): lane body 内 clip ギャップ (= 既存 clip と x 範囲が重ならない) で

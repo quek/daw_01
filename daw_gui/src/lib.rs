@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod audio_source_cache;
+pub mod automation_value;
 pub mod bootstrap;
 pub mod clipboard;
 pub mod dispatcher;

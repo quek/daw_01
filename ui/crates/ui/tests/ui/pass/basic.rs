@@ -320,13 +320,14 @@ fn main() {
                     ArrangementEditRequest::SetLaneVisible { .. } => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
-                    ArrangementEditRequest::SetLaneDefault { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
                     ArrangementEditRequest::DeleteLane(_) => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                     ArrangementEditRequest::AddAutomationPoint { .. } => {
+                        Edit::mutate(|_m: &mut Model| {})
+                    }
+                    // FIXME #81: 既存 point 上の dblclick → 値の数値入力開始。
+                    ArrangementEditRequest::DoubleClickAutomationPoint(_) => {
                         Edit::mutate(|_m: &mut Model| {})
                     }
                     ArrangementEditRequest::MoveAutomationPoints(_) => {

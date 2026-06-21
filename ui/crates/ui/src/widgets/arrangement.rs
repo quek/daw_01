@@ -277,6 +277,16 @@ pub struct AutomationPointKey {
     pub point_idx: u32,
 }
 
+/// FIXME #81: point drag 中の **live 値** (caller がカーソル近くに現値を数値表示する用)。
+/// `value_norm` は drag 中の正規化値 (release commit と同じ式で算出)、 `cursor` は ghost dot の
+/// 画面座標 (caller はここから少しオフセットして readout を描く)。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct AutomationPointDragInfo {
+    pub key: AutomationPointKey,
+    pub value_norm: f32,
+    pub cursor: (f32, f32),
+}
+
 /// M14 Phase 63n-1 (#028): automation point の incoming curve 種別 (= 直前の point からこの point に
 /// 至る曲線形状)。 daw_01 conversation #033 で `apply_curve` の式を更新済 (Bezier は真の S 字 cubic
 /// に書き直し、 Exponential variant を追加)。 描画は daw_01 `common::automation::apply_curve` を SSoT
@@ -779,10 +789,9 @@ pub enum ArrangementEditRequest {
     /// M14 Phase 63n-2 (#028): lane header の `👁` icon click。 caller は `lane.visible = visible`
     /// を保存する。 `visible = false` で lane 行は描画しない + 高さに含めない (= 隣 lane が詰める)。
     SetLaneVisible { lane: AutomationLaneKey, visible: bool },
-    /// M14 Phase 63n-2 (#028): lane header の default value horizontal slider 帯 drag による
-    /// `default_value_norm` 変更 (release 時に 1 度発火)。 `prev` / `next` で Undoable 構築容易
-    /// (`SetTrackVolume` と同 pattern)。 widget 側で `0.0..=1.0` に clamp 済。
-    SetLaneDefault { lane: AutomationLaneKey, prev: f32, next: f32 },
+    // FIXME #81: 旧 `SetLaneDefault { lane, prev, next }` (slider 帯 drag) は廃止。 default value は
+    // caller (daw_01) が lane header の数値入力フィールド (`automation_lane_default_rects`) に
+    // scrubable_number_at を overlay して直接 `AppEvent::SetLaneDefault` を発火する。
     /// M14 Phase 63n-5 (#030): lane 下端 splitter (高さ ±`automation_lane_resize_handle_px` の hot zone)
     /// drag による `lane.height_px` 変更。 widget 側で `style.automation_lane_min_height_px` /
     /// `style.automation_lane_max_height_px` に clamp 済 (caller は `next` を信用して別 clamp しない)。
@@ -811,6 +820,12 @@ pub enum ArrangementEditRequest {
         time_beat: f64,
         value_norm: f32,
     },
+    /// FIXME #81: 既存 point の **上**での dblclick (= 値の数値入力開始)。 widget は値編集 UI を
+    /// 持たない (heavy 内で text_input 不可) ので、 caller (daw_01) が `automation_point_rects` で
+    /// 当該 point の rect を引き、 その位置に inline 数値入力 overlay (`text_input_at_focused`) を
+    /// 出す入口として使う。 dblclick が既存 point に当たらなければ従来どおり `AddAutomationPoint` /
+    /// `CreateAutomationClip` (widget 内 priority: point hit > clip body > clip gap)。
+    DoubleClickAutomationPoint(AutomationPointKey),
     /// M14 Phase 63n-4 (#029): lane body 内 clip ギャップ (= 既存 clip と x 範囲が重ならない empty zone)
     /// での dblclick による automation clip 新規作成。 MIDI `DoubleClickEmpty { track, beat }` の lane 版
     /// idiom: `start_beat` は widget 側で snap 適用済 (Alt+dblclick で snap 一時無効、 既存 dblclick と
@@ -1004,6 +1019,15 @@ pub struct ArrangementResponse {
     /// semantics、 描画順 = 左から右)。 caller が `context_menu_for(rect, ...)` で右クリックメニューを
     /// 重ねる用 (`SecondaryClickSection` の `pos` と併用可)。 完全 off-screen (beat 範囲外) の section は除外。
     pub section_rects: Vec<(u32, Rect)>,
+    /// FIXME #81: 各 visible automation lane の **デフォルト値フィールド** rect
+    /// (lane header 内、`automation_lane_header_layout` の `default_field_rect`)。
+    /// caller (daw_01) はここに `scrubable_number_at` を overlay して default 値を
+    /// ドラッグ/数値入力で編集する (旧スライダー帯は廃止)。 `automation_point_rects`
+    /// と同 semantics (描画順 = 上から下、 hidden / collapsed / 行高不足の lane は除外)。
+    pub automation_lane_default_rects: Vec<(AutomationLaneKey, Rect)>,
+    /// FIXME #81: point drag セッション進行中の live 値 (`Some` のとき caller は
+    /// `cursor` 近傍に `value_norm` を人間可読単位で表示する)。 release frame では `None`。
+    pub automation_point_drag: Option<AutomationPointDragInfo>,
 }
 
 impl Default for ArrangementResponse {
@@ -1030,6 +1054,8 @@ impl Default for ArrangementResponse {
             hovered_section_zone: None,
             dragging_section: None,
             section_rects: Vec::new(),
+            automation_lane_default_rects: Vec::new(),
+            automation_point_drag: None,
         }
     }
 }
@@ -1269,8 +1295,9 @@ pub struct ArrangementStyle {
     /// 渡すのみ。 MIDI `DoubleClickEmpty` は caller が len を決める idiom だが、 lane は zoom / snap に
     /// 合わせた賢い default を widget 側で持てる余地があるため style 経由で expose (#029 §A 参照)。
     pub automation_clip_default_len_beats: f64,
-    /// lane header の slider 帯 (default_value_norm 表示) の縦幅 (px)。 default 4.0。
-    pub automation_default_band_h: f32,
+    /// FIXME #81: lane header の default value 数値入力フィールドの縦幅 (px)。 default 18.0
+    /// (旧スライダー帯 `automation_default_band_h` を置換、 scrubable_number_at が読める高さ)。
+    pub automation_default_field_h: f32,
     /// M14 Phase 63n-5 (#030): lane 下端 splitter drag の hot zone 高さ (px)。 default 4.0。
     /// `lane_y + lh - handle ≤ py < lane_y + lh` の y 範囲 + body x 範囲が hit zone。
     /// `automation_clip_v_pad_px` (= 6.0) の bottom padding 内に収まるよう小さめに設定 (clip rect とは
@@ -1462,7 +1489,7 @@ impl Default for ArrangementStyle {
             automation_default_line_width_px: 1.0,
             automation_clip_v_pad_px: 6.0,
             automation_clip_default_len_beats: 4.0,
-            automation_default_band_h: 4.0,
+            automation_default_field_h: 18.0,
             automation_lane_resize_handle_px: 4.0,
             header_resize_handle_px: 8.0,
             automation_lane_min_height_px: 30,
@@ -2599,22 +2626,8 @@ struct AutomationPointDragSession {
     start_modifiers: Modifiers,
 }
 
-/// M14 Phase 63n-2 (#028): lane header の default value horizontal slider 帯 drag session。
-/// `TrackVolumeDragSession` と同 pattern (per-frame Mutate emit + release Undoable wrap、 ただし
-/// Phase 63n-2 では release で `SetLaneDefault { prev, next }` の単発発火のみで undo は caller 責務)。
-#[derive(Clone, Copy, Debug)]
-struct AutomationLaneDefaultDragSession {
-    lane: AutomationLaneKey,
-    anchor_value_norm: f32,
-    /// drag 開始時の band rect (mouse_x → 0..1 マップ用、 view 変化耐性)。
-    band_rect: Rect,
-    last_mouse_x: f32,
-    /// drag 中に最後に発火した値 (毎 frame 同値発火を抑制、 SetTrackVolume と同 pattern)。
-    last_emitted_value: f32,
-}
-
 /// M14 Phase 63n-5 (#030): lane 下端 splitter drag session (lane height 変更)。
-/// `AutomationLaneDefaultDragSession` と同 pattern (per-frame `SetLaneHeight` emit + release で
+/// per-frame `SetLaneHeight` emit + release で
 /// 最終値 1 度発火) — `last_emitted_height` で同値発火を抑制し、 `anchor_height_px` (= press 時の
 /// `lane.height_px`) と `anchor_mouse_y` で view scroll 耐性を確保 (anchor 固定なので caller が
 /// `lane.height_px = next` を反映しても drag 中 cursor 追従が壊れない)。
@@ -2775,9 +2788,6 @@ pub(crate) struct ArrangementState {
     audio_drag: Option<AudioDragSession>,
     /// M14 Phase 63n-2 (#028): lane 内 point の drag session (release で MoveAutomationPoints 1 件)。
     automation_point_drag: Option<AutomationPointDragSession>,
-    /// M14 Phase 63n-2 (#028): lane header default value band drag session
-    /// (release で SetLaneDefault 1 件)。
-    automation_lane_default_drag: Option<AutomationLaneDefaultDragSession>,
     /// M14 Phase 63n-5 (#030): lane 下端 splitter drag session
     /// (release で `SetLaneHeight { prev: anchor, next: final }` 1 件)。
     automation_lane_resize_drag: Option<AutomationLaneResizeDragSession>,
@@ -4067,8 +4077,8 @@ fn draw_audio_drag_ghost<M: ?Sized + 'static>(
 /// M14 Phase 63n-2 (#028): lane header の icon / band の rect 一式 (描画 + hit-test の SSoT)。
 /// `header_rect.w < style.automation_lane_header_min_w_px` の極狭幅では `None` (描画 + hit 共に skip)。
 /// icon は描画 push_text の `(left, top)` と一致した正方形 rect (icon_size 角)、 hit zone は
-/// 同 rect で `Rect::contains` 判定で OK (描画と hit の SSoT)。 `default_band_rect` は band_h > 0
-/// かつ header 行高に余裕がある場合のみ `Some`。
+/// 同 rect で `Rect::contains` 判定で OK (描画と hit の SSoT)。 `default_field_rect` は
+/// header 行高に余裕がある場合のみ `Some` (FIXME #81: 旧スライダー帯を数値入力フィールドに置換)。
 #[derive(Clone, Copy, Debug)]
 pub struct AutomationLaneHeaderLayout {
     /// `★`/`☆` icon (lane.enabled 切替用、 click で `SetLaneEnabled`)。
@@ -4081,9 +4091,10 @@ pub struct AutomationLaneHeaderLayout {
     pub mute_icon_rect: Rect,
     /// `✕` icon (lane 削除、 click で `DeleteLane`)。
     pub delete_icon_rect: Rect,
-    /// horizontal slider 帯 (default_value_norm 編集、 drag で `SetLaneDefault`)。
-    /// header 行高が icon + band を載せられない場合は `None`。
-    pub default_band_rect: Option<Rect>,
+    /// FIXME #81: default value の **数値入力フィールド** rect (旧 horizontal slider 帯を置換)。
+    /// caller (daw_01) がここに `scrubable_number_at` を overlay して default 値を編集する。
+    /// header 行高が icon 行 + フィールドを載せられない場合は `None` (= 極狭 lane では非表示)。
+    pub default_field_rect: Option<Rect>,
 }
 
 /// M14 Phase 63n-2 (#028): lane header rect から icon / band の sub-rect 群を計算。
@@ -4117,13 +4128,15 @@ pub fn automation_lane_header_layout(
     let mute_icon_rect = Rect { x: mute_x, y: cy, w: icon_size, h: icon_size };
     let delete_icon_rect = Rect { x: delete_x, y: cy, w: icon_size, h: icon_size };
 
-    // band: header 行下端から pad だけ上、 cy + icon_size より下に band 自身が収まるなら Some。
-    let band_h = style.automation_default_band_h;
-    let band_y = header_rect.y + header_rect.h - band_h - pad;
-    let band_x = cx;
-    let band_w = (header_rect.w - pad * 2.0).max(0.0);
-    let default_band_rect = if band_h > 0.0 && band_w > 0.0 && band_y >= cy + icon_size {
-        Some(Rect { x: band_x, y: band_y, w: band_w, h: band_h })
+    // FIXME #81: default value 数値入力フィールド (旧スライダー帯を置換)。 caller が
+    // scrubable_number_at を overlay できる読める高さ。 header 行下端から pad だけ上、
+    // icon 行 (cy + icon_size) より下にフィールドが収まるなら Some。
+    let field_h = style.automation_default_field_h;
+    let field_y = header_rect.y + header_rect.h - field_h - pad;
+    let field_x = cx;
+    let field_w = (header_rect.w - pad * 2.0).max(0.0);
+    let default_field_rect = if field_h > 0.0 && field_w > 0.0 && field_y >= cy + icon_size {
+        Some(Rect { x: field_x, y: field_y, w: field_w, h: field_h })
     } else {
         None
     };
@@ -4134,7 +4147,7 @@ pub fn automation_lane_header_layout(
         visible_icon_rect,
         mute_icon_rect,
         delete_icon_rect,
-        default_band_rect,
+        default_field_rect,
     })
 }
 
@@ -5151,16 +5164,10 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             clip_rect: Some(label_clip),
             ..GlyphArea::default()
         });
-        // default value slider 帯 (band_rect が `Some` の場合のみ、 行高に余裕がある時)
-        if let Some(band) = layout.default_band_rect {
-            push_filled_rect(hctx, band, style.track_volume_band_track);
-            let fill_w = band.w * lane.default_value_norm.clamp(0.0, 1.0);
-            push_filled_rect(
-                hctx,
-                Rect { x: band.x, y: band.y, w: fill_w, h: band.h },
-                style.track_volume_band_fill,
-            );
-        }
+        // FIXME #81: default value はレーンヘッダの数値入力フィールド (`default_field_rect`) を
+        // caller が scrubable_number_at で overlay する (= 旧スライダー帯描画は廃止)。 widget は
+        // ここで何も描かない (フィールドの bg / 値は overlay 側が持つ)。 本体の水平ガイド線
+        // (下記 default_value_norm 位置) は残す (default 値の視覚位置の手がかり)。
         // 右寄せ icon 群 (👁 ▣ ✕、 Phase 63n-2 で hit-test 対応)
         for &(g, r) in &[
             ('👁', layout.visible_icon_rect),
@@ -5182,8 +5189,14 @@ fn draw_automation_lane<M: ?Sized + 'static>(
 
     // ---- body 背景 (header と区切り線) ----
     push_filled_rect(hctx, body_rect, style.automation_lane_bg);
-    // default_value 水平線
-    let default_y = body_rect.y + (1.0 - lane.default_value_norm.clamp(0.0, 1.0)) * body_rect.h;
+    // default_value 水平線。 FIXME #81: point dot と同じ **縦 padding スケール** で描く
+    // (= clip_rect の `[body.y+pad, body.y+H-pad]`、 5221 と SSoT)。 旧実装は body 全高を使って
+    // いたため、 同じ値でも point とガイド線が `pad*(2v-1)` だけ縦にずれていた (user 報告)。
+    let default_pad = style.automation_clip_v_pad_px;
+    let default_clip_h = (body_rect.h - default_pad * 2.0).max(2.0);
+    let default_y = body_rect.y
+        + default_pad
+        + (1.0 - lane.default_value_norm.clamp(0.0, 1.0)) * default_clip_h;
     hctx.push_lines(daw_ui_renderer::LineBatch {
         segments: vec![daw_ui_renderer::LineSegment {
             a: [body_rect.x, default_y],
@@ -5926,27 +5939,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                 } else if layout.delete_icon_rect.contains(px, py) {
                                     press_lane_button =
                                         Some(ArrangementEditRequest::DeleteLane(lane_key));
-                                } else if let Some(band) = layout.default_band_rect
-                                    && band.contains(px, py)
-                                    && !pointer.modifiers.alt
-                                {
-                                    // M14 Phase 63n-6 (#031): Alt 修飾は **lane resize gesture に予約**
-                                    // (= 後段の Alt+drag fallback で lane resize 起動)。 Alt+press on
-                                    // default band は default value の sub-grid 微調整用途より lane
-                                    // resize 優先 (= user feedback)。
-                                    let initial = volume_from_mouse_x(px, band.x, band.w);
-                                    let state: &mut ArrangementState = self.widget_state(wid);
-                                    state.automation_lane_default_drag =
-                                        Some(AutomationLaneDefaultDragSession {
-                                            lane: lane_key,
-                                            anchor_value_norm: lane
-                                                .default_value_norm
-                                                .clamp(0.0, 1.0),
-                                            band_rect: band,
-                                            last_mouse_x: px,
-                                            last_emitted_value: initial,
-                                        });
                                 }
+                                // FIXME #81: default value フィールドの press は caller の
+                                // scrubable_number_at overlay が直接処理する (widget 内 band drag は廃止)。
                             }
                             break;
                         }
@@ -6178,7 +6173,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         && s.track_reorder.is_none()
                         && s.audio_drag.is_none()
                         && s.clip_drag.is_none()
-                        && s.automation_lane_default_drag.is_none()
                         && s.automation_point_drag.is_none()
                         && s.automation_clip_drag.is_none()
                         && s.automation_lane_resize_drag.is_none()
@@ -6266,7 +6260,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         && s.track_reorder.is_none()
                         && s.audio_drag.is_none()
                         && s.clip_drag.is_none()
-                        && s.automation_lane_default_drag.is_none()
                         && s.automation_point_drag.is_none()
                         && s.automation_clip_drag.is_none()
                         && s.automation_lane_resize_drag.is_none()
@@ -6445,13 +6438,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     ad.last_mouse = (px, py);
                 }
             }
-            // M14 Phase 63n-2 (#028): automation_lane_default_drag continuation で last_mouse_x を update
-            // (TrackVolumeDragSession と同 pattern、 release frame は per-frame emit ブロックで処理)。
-            if let Some(ref mut ld) = state.automation_lane_default_drag
-                && !is_release
-            {
-                ld.last_mouse_x = px;
-            }
             // M14 Phase 63n-5 (#030): automation_lane_resize_drag continuation で last_mouse_y を update
             // (lane_default_drag と同 pattern、 release frame は release block で処理)。
             if let Some(ref mut rd) = state.automation_lane_resize_drag
@@ -6515,30 +6501,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // M14 Phase 63n-2 (#028): automation_lane_default_drag の per-frame live update
-        // (TrackVolumeDragSession と同 pattern)。 drag 中は live preview を caller に流す + 同値抑制。
-        if let Some((px, _py)) = pointer.pos
-            && !pointer.primary_just_released
-        {
-            let mut emit: Option<(AutomationLaneKey, f32, f32)> = None;
-            {
-                let state: &mut ArrangementState = self.widget_state(wid);
-                if let Some(ref mut ld) = state.automation_lane_default_drag {
-                    let next = volume_from_mouse_x(px, ld.band_rect.x, ld.band_rect.w);
-                    if (next - ld.last_emitted_value).abs() > 1e-4 {
-                        emit = Some((ld.lane, ld.anchor_value_norm, next));
-                        ld.last_emitted_value = next;
-                    }
-                }
-            }
-            if let Some((lane, prev, next)) = emit {
-                self.push_edit(make_edit(ArrangementEditRequest::SetLaneDefault {
-                    lane,
-                    prev,
-                    next,
-                }));
-            }
-        }
+        // FIXME #81: default value の per-frame 編集は caller の scrubable_number_at overlay が担う
+        // (旧 band drag の per-frame SetLaneDefault emit は廃止)。
 
         // M14 Phase 63n-5 (#030): automation_lane_resize_drag の per-frame live update。
         // drag 中は user に「lane が伸び縮みする様子」 を見せたいので、 height 変化を毎 frame 発行する
@@ -6835,20 +6799,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if pointer.primary_just_released {
                 let state: &mut ArrangementState = self.widget_state(wid);
                 state.automation_point_drag.take()
-            } else {
-                None
-            };
-
-        // M14 Phase 63n-2 (#028): automation_lane_default_drag overlay clone + release take。
-        // overlay は draw_automation_lane の band fill を上書きする (cached 外、 drag 中のみ)。
-        let lane_default_drag_session: Option<AutomationLaneDefaultDragSession> = {
-            let state: &mut ArrangementState = self.widget_state(wid);
-            state.automation_lane_default_drag
-        };
-        let lane_default_drag_release: Option<AutomationLaneDefaultDragSession> =
-            if pointer.primary_just_released {
-                let state: &mut ArrangementState = self.widget_state(wid);
-                state.automation_lane_default_drag.take()
             } else {
                 None
             };
@@ -7215,11 +7165,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M14 Phase 63k (#025): audio_drag overlay 用 clone (heavy closure に move)。
         // ghost (drag 中の preview line / fade envelope / label) は cached 外で描画する。
         let audio_drag_overlay = audio_drag_session;
-        // M14 Phase 63n-2 (#028): point_drag / lane_default_drag の overlay 用 clone (heavy closure
-        // に move)。 point ghost は drag 中の preview を新位置に上書き、 band fill は drag 中の
-        // last_emitted_value で塗り直し (cached 内描画は anchor 値のままなので cached 外で被せる)。
+        // M14 Phase 63n-2 (#028): point_drag の overlay 用 clone (heavy closure に move)。
+        // point ghost は drag 中の preview を新位置に上書き (cached 内描画は anchor 値のまま)。
         let point_drag_overlay = point_drag_session;
-        let lane_default_drag_overlay = lane_default_drag_session;
         // M14 Phase 63n-3 (#028): automation_clip_drag overlay (heavy closure に move)。
         // ghost rect は drag 中の preview (新位置 / 新長さ、 cross-lane drop なら新 lane の body 内) を
         // cached 外で重ねる。 base 描画 (cached 内) も同 frame 表示されるが、 ghost が上に重なる。
@@ -7532,23 +7480,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // ghost が上に重なって最新値を user に見せる。
             if let Some(ad) = audio_drag_overlay {
                 draw_audio_drag_ghost(hctx, &ad, beat_per_px, &style_copy);
-            }
-            // M14 Phase 63n-2 (#028): automation_lane_default_drag overlay (band fill width 上書き)。
-            // cached 内で描画される base band fill は `lane.default_value_norm` の anchor 値、 drag 中は
-            // `last_emitted_value` で塗り直して live preview を user に見せる (TrackVolumeDragSession の
-            // header band と同 pattern)。 trough は cached 内のままで、 fill rect だけ上書き。
-            if let Some(ld) = lane_default_drag_overlay {
-                let preview = volume_from_mouse_x(ld.last_mouse_x, ld.band_rect.x, ld.band_rect.w);
-                push_filled_rect(
-                    hctx,
-                    Rect {
-                        x: ld.band_rect.x,
-                        y: ld.band_rect.y,
-                        w: ld.band_rect.w * preview,
-                        h: ld.band_rect.h,
-                    },
-                    style_copy.track_volume_band_fill,
-                );
             }
             // M14 Phase 63n-2 (#028): automation_point_drag ghost (新位置の point dot を半透明で重ねる)。
             // anchor 固定の `body_rect_anchor` / `clip_rect_anchor` で beat_to_px / y 軸を計算 (drag
@@ -8483,20 +8414,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- M14 Phase 63n-2 (#028): automation_lane_default_drag release → SetLaneDefault ----
-        // drag 中は per-frame Mutate emit で live update 済 (TrackVolumeDragSession と同 pattern)。
-        // release frame は 1 度だけ最終値を `SetLaneDefault { prev: anchor, next: end }` で発行。
-        if let Some(ld) = lane_default_drag_release {
-            let end = volume_from_mouse_x(ld.last_mouse_x, ld.band_rect.x, ld.band_rect.w);
-            if (end - ld.anchor_value_norm).abs() > 1e-4 {
-                self.push_edit(make_edit(ArrangementEditRequest::SetLaneDefault {
-                    lane: ld.lane,
-                    prev: ld.anchor_value_norm,
-                    next: end,
-                }));
-            }
-        }
-
         // ---- M14 Phase 63n-3 (#028): automation_clip_drag release ----
         // commit-by-release: 短 click (Move + !Alt + dist < 4px) は **`SelectAutomationClips` に demote**
         // (= 既存 MIDI clip の `clip_short_click_pos` 経路と同 idiom、 lane body 上 click は automation
@@ -8758,7 +8675,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 && s.track_reorder.is_none()
                 && s.audio_drag.is_none()
                 && s.clip_drag.is_none()
-                && s.automation_lane_default_drag.is_none()
                 && s.automation_point_drag.is_none()
                 && s.automation_clip_drag.is_none()
                 && s.automation_lane_resize_drag.is_none()
@@ -9161,6 +9077,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px)
             {
                 self.push_edit(make_edit(ArrangementEditRequest::DoubleClickClip(hit_key)));
+            } else if let Some((pt_key, _)) = automation_point_at(
+                &visible_tracks,
+                &press_tops,
+                view.track_row_h,
+                view,
+                header_pane.x,
+                header_pane.w,
+                lanes,
+                cx,
+                cy,
+                style,
+            ) {
+                // FIXME #81: 既存 point の上での dblclick → 値の数値入力を開始 (新規点追加より優先)。
+                // caller (daw_01) が automation_point_rects で rect を引いて inline 数値入力 overlay を出す。
+                self.push_edit(make_edit(ArrangementEditRequest::DoubleClickAutomationPoint(
+                    pt_key,
+                )));
             } else if let Some((t_idx, lane_idx, _h_rect, body_rect)) = automation_lane_at(
                 &visible_tracks,
                 &press_tops,
@@ -9731,6 +9664,64 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let r = clip_to_rect(row_top, row_h, c, view, lanes);
                 response.clip_rects.push((ClipKey { track: t.id, clip: c.id }, r));
             }
+        }
+
+        // ---- FIXME #81: automation_lane_default_rects を毎 frame 積む ----
+        // 各 visible lane header の default value 数値入力フィールド rect (= caller が
+        // scrubable_number_at を overlay する位置)。 master row (synthetic track) の lane も
+        // `visible_tracks[t_idx].id == MASTER_TRACK_ID` で含まれる。 行高不足で field rect が
+        // 無い (= layout.default_field_rect == None) lane は除外。
+        for_each_visible_lane(
+            &visible_tracks,
+            &press_tops,
+            view.track_row_h,
+            header_pane.x,
+            header_pane.w,
+            lanes.x,
+            lanes.w,
+            style,
+            |t_idx, _l_idx, lane, h_rect, _body_rect| {
+                if h_rect.y + h_rect.h < lanes.y || h_rect.y > lanes.y + lanes.h {
+                    return;
+                }
+                if let Some(layout) = automation_lane_header_layout(h_rect, style)
+                    && let Some(field) = layout.default_field_rect
+                {
+                    let key = AutomationLaneKey {
+                        track: visible_tracks[t_idx].id,
+                        lane: lane.id,
+                    };
+                    response.automation_lane_default_rects.push((key, field));
+                }
+            },
+        );
+
+        // ---- FIXME #81: point drag 中の live 値を response に乗せる ----
+        // overlay ghost (上の cached 外描画) と同じ式で next_value / cursor を算出し、 caller が
+        // カーソル近傍に現値を人間可読単位で表示できるようにする。 release frame は session が
+        // take 済 (None) になるので、 ここは drag 継続中のみ Some。
+        if !pointer.primary_just_released
+            && let Some(pd) = point_drag_session
+        {
+            let dx = pd.last_mouse.0 - pd.anchor_mouse.0;
+            let dy = pd.last_mouse.1 - pd.anchor_mouse.1;
+            let beat_to_px = f64::from(pd.body_rect_anchor.w) / view.len_beats.max(1e-6);
+            let raw_dt = f64::from(dx) / beat_to_px;
+            let raw_abs = pd.clip_start_beat + pd.anchor_time_beat + raw_dt;
+            let snapped_abs = view.snap.snap_beat(raw_abs, pd.last_alt, zoom_x_px_per_beat);
+            let next_local =
+                (snapped_abs - pd.clip_start_beat).clamp(0.0, pd.clip_len_beats.max(0.0));
+            let next_value =
+                (pd.anchor_value_norm - dy / pd.clip_rect_anchor.h.max(1.0)).clamp(0.0, 1.0);
+            let abs_beat = pd.clip_start_beat + next_local;
+            #[allow(clippy::cast_possible_truncation)]
+            let px = pd.body_rect_anchor.x + ((abs_beat - view.start_beat) * beat_to_px) as f32;
+            let py = pd.clip_rect_anchor.y + (1.0 - next_value) * pd.clip_rect_anchor.h;
+            response.automation_point_drag = Some(AutomationPointDragInfo {
+                key: pd.point,
+                value_norm: next_value,
+                cursor: (px, py),
+            });
         }
 
         // ---- M14 Phase 63n-2 (#028): automation_point_rects を毎 frame 積む ----
