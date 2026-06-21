@@ -378,6 +378,13 @@ pub struct PianoRollView {
     /// widget 内 (`px_per_interval < 6px` で自動的に 2 段に落ちる)。 線色・幅は
     /// [`PianoRollStyle::sub_line`] / [`PianoRollStyle::sub_line_width_px`]。
     pub sub_grid_interval_beats: Option<f64>,
+    /// (FIXME #82) 新規 note の **既定長** (拍)。 (a) Insert shortcut、 (b) 空白ダブルクリック
+    /// 作成で **ドラッグせず即放し** したときの note 長に使う。 caller (daw_01) は
+    /// `last_note_duration_beats` (= 直近に描いた / 選択した note の長さ) を渡す = Bitwig の
+    /// 「直前にドラッグした長さがそのクリップの新既定になる」 挙動を SSoT 1 本で実現する。
+    /// ダブルクリック作成でボタンを放さず左右ドラッグしたときは、 ドラッグ長 (snap 済み右端 −
+    /// start) が優先され、 この既定長は使われない。 値は widget 側で `0.0625` (1/16) 下限に clamp。
+    pub default_note_len_beats: f64,
 }
 
 /// piano roll が user に発行する Edit 要求の種別。
@@ -469,6 +476,10 @@ pub struct PianoRollResponse {
     /// 独立 (鍵盤 press は note drag を開始しない)。caller は前フレーム値との差分で note-on/off を
     /// 導出する (`None→Some`=on / `Some(a)→Some(b)`=off+on / `Some→None`=off)。
     pub keyboard_active_pitch: Option<u8>,
+    /// (FIXME #82) 空白ダブルクリック作成 session が active か (押下のまま drag で長さ決定中)。
+    /// `true` のとき作成プレビューが grid に出ており、release で `Add` 発行。 caller は `dragging`
+    /// と同様に「drag/作成中は wheel zoom/scroll を無効化」する判断に使う。
+    pub creating: bool,
 }
 
 /// velocity → fill Color の関数。`fn` pointer (closure 不可、Style: Copy 維持のため)。
@@ -1140,6 +1151,61 @@ struct NoteDragSession {
     last_ctrl: bool,
 }
 
+/// (FIXME #82) 空白ダブルクリック作成で「ドラッグした」と判定する左右いずれかの最小移動量 (px)。
+/// これ未満は jitter とみなし既定長で作成 (note_drag の short-click 閾値 4px と同値)。
+/// 左方向も対象 (左ドラッグで既定長より短く作るとき右へ振る手間を不要にする)。
+const NOTE_CREATE_DRAG_PX: f32 = 4.0;
+
+/// (FIXME #82) ドラッグで決める note 長の下限 (拍)。snap unit 無効時の floor。
+/// daw_01 add_note 側が更に `0.0625` (1/16) に clamp するが、 widget preview と commit を
+/// 一致させるため widget でも下限を設ける (resize の `0.05` floor と同値)。
+const NOTE_CREATE_MIN_LEN: f64 = 0.05;
+
+/// (FIXME #82) 空白ダブルクリック作成 session (Bitwig 流の「ダブルクリックのボタンを放さず
+/// 左右ドラッグで note 長を決める」)。
+///
+/// `take_double_click_press_in_rect` が返した「2 度目の press」 が空白 grid 上だったときに開始。
+/// press → drag → release で完結し、 release frame で **1 個の `PianoRollEditRequest::Add`** を
+/// 発行する (= note 作成と長さ確定が 1 undo step に収まる)。 note drag (Move/Resize) と同 frame
+/// に両方 active にならない (作成 press は空白 grid なので note_hit が None)。
+///
+/// **カーソル warp (Ableton Live 流)**: press 時にカーソルを既定長ノートの **右端** へ warp し、
+/// `anchor_mouse` をその右端に置く。 これでカーソル＝掴んでいる右端が一致し、 「ドラッグ開始で
+/// 右端がカーソル位置 (最短) に飛ぶ」 違和感を消す。 warp は非同期反映なので `warp_settled` で
+/// 着地まで last_mouse 追従を止める (warp ジャンプを長さに混入させない)。
+///
+/// 長さの決め方 (右端 = start+default を起点にした相対 resize、 絶対位置 snap):
+/// - `dragged == false` (まだ閾値ぶん動かしていない / 即放し) → `view.default_note_len_beats`。
+/// - `dragged == true` (左右いずれかに閾値ぶん drag した) → `max(min_len, snap((start+default) +
+///   raw_delta) − start)`。 右ドラッグで伸長、 左ドラッグで右端から短縮 (min_len まで)。
+///
+/// start_beat / pitch は press 時に確定 (= クリック位置の snap 済み beat と行 pitch)。 長さ軸
+/// (左右) のみ扱い、 pitch (上下) は固定 (Bitwig は上下 drag で velocity だが本 #82 は長さに限定)。
+#[derive(Clone, Copy, Debug)]
+struct NoteCreateSession {
+    /// 作成 note の開始拍 (song-absolute、 press 時に snap 済みで確定)。
+    start_beat: f64,
+    /// 作成 note の pitch (press 時の行で確定)。
+    pitch: u8,
+    /// **既定長ノートの右端** の screen x (= warp 先 = カーソルを移動した先)。 長さ計算の
+    /// 起点 (raw_delta = last_mouse − anchor_mouse) かつ warp 着地判定の終点。 y は press y。
+    anchor_mouse: (f32, f32),
+    /// press した screen x (warp 前のカーソル位置)。 warp 着地判定 (press→anchor の中点越え) に使う。
+    press_x: f32,
+    /// drag 中の最終 pointer 位置 (note_drag と同パターン: winit release frame の pos 巻き戻し対策)。
+    /// warp 着地までは anchor_mouse のまま保持 (= 既定長表示、 warp ジャンプを長さに混入させない)。
+    last_mouse: (f32, f32),
+    /// drag 中の最終 alt 状態 (snap 一時無効)。 continuation で update、 release で保持
+    /// (`NoteDragSession.last_alt` と同 careful-update)。
+    last_alt: bool,
+    /// 左右いずれかに作成閾値 (4px) ぶん drag したか (latch)。 false の間は既定長、 true で右端追従長。
+    dragged: bool,
+    /// カーソル warp が着地したか。 press 後カーソルが press_x→anchor_mouse.x の中点を越えたら true。
+    /// false の間 (warp 未反映) は last_mouse 追従を止めて既定長を保ち、 warp ジャンプ由来の
+    /// `PointerMoved` を長さ計算に混入させない (= ドラッグ開始直後の一瞬の最短化を防ぐ)。
+    warp_settled: bool,
+}
+
 /// (M14 Phase 64 / daw_01 #018) velocity lane 内 drag session。
 ///
 /// note drag (Move/Resize) と独立: vel_area での press → release で完結する別状態。
@@ -1288,6 +1354,9 @@ pub(crate) struct PianoRollState {
     /// `true`、release で `false`。grid の note drag とは独立 (領域が x で排他)。押下中の pitch は
     /// 毎フレーム pointer.y から計算するので held 値は持たず、「press 開始が鍵盤か」だけを track する。
     keyboard_pressing: bool,
+    /// (FIXME #82) 空白ダブルクリック作成 session (押下のまま drag で note 長を決める)。
+    /// 2 度目の press で `Some`、release で `take` して 1 個の `Add` を発行 → `None`。
+    note_create: Option<NoteCreateSession>,
 }
 
 // ============================================================
@@ -1337,6 +1406,48 @@ fn drag_preview_geometry(
             (new_start, (anchor.len_beats - actual_delta).max(min_len), anchor.pitch)
         }
     }
+}
+
+/// (FIXME #82) note_create session の現在の `(start_beat, len_beats, pitch)` を計算
+/// (drag preview と release commit で共有 = 描画と確定が必ず一致)。
+///
+/// **モデル: 既定長ノートの「右端」を掴んで動かす相対 resize** (Ableton Live / ダブルクリックで
+/// カーソルが右端へ warp し、 そこを掴んでいる感覚)。 `anchor_mouse` は warp 先 (= 右端 screen x)
+/// なので、 ドラッグ開始時 (cursor == anchor) の `raw_delta == 0` で長さは既定長のまま (= 最短へ
+/// 飛ばない)。 そこからの移動量ぶんだけ右端が動く (cursor がそのまま右端に追従)。
+///
+/// - `dragged == false` (即放し / jitter 以下 / warp 未着地): 長さ = `view.default_note_len_beats`
+///   (= caller の `last_note_duration_beats`)。 `0.0625` (1/16) 下限。
+/// - `dragged == true` (warp 着地後に左右いずれかへ閾値ぶん drag した): 右端 pivot = `start + default`、
+///   warp 先からの移動量 `raw_delta = (last_mouse.x − anchor_mouse.x) × beat_per_px` を pivot に足して
+///   **絶対位置 snap** (`snap(pivot + raw_delta)`、 ui/CLAUDE.md の delta-snap NG ガイドライン /
+///   note_drag ResizeRight と同方式。 anchor が右端なので実効的に `snap(cursor 位置)` = 右端が
+///   cursor に一致)。 長さ = `max(min_len, snapped_right − start)`。 右ドラッグで伸長、 左ドラッグで
+///   右端から短縮 (min_len まで)。 alt は session の `last_alt` を真値とし `pointer.modifiers.alt` を
+///   直接見ない (overlay と commit の一致)。
+fn note_create_geometry(
+    nc: &NoteCreateSession,
+    view: PianoRollView,
+    beat_per_px: f64,
+    zoom_x_px_per_beat: f32,
+) -> (f64, f64, u8) {
+    let default_len = view.default_note_len_beats.max(0.0625);
+    let len = if nc.dragged {
+        let raw_delta = f64::from(nc.last_mouse.0 - nc.anchor_mouse.0) * beat_per_px;
+        let pivot = nc.start_beat + default_len;
+        let right = view.snap.snap_beat(pivot + raw_delta, nc.last_alt, zoom_x_px_per_beat);
+        let min_len = if view.snap.is_active(nc.last_alt) {
+            view.snap
+                .beat_unit(zoom_x_px_per_beat)
+                .map_or(NOTE_CREATE_MIN_LEN, |u| u.max(NOTE_CREATE_MIN_LEN))
+        } else {
+            NOTE_CREATE_MIN_LEN
+        };
+        (right - nc.start_beat).max(min_len)
+    } else {
+        default_len
+    };
+    (nc.start_beat, len, nc.pitch)
 }
 
 // ============================================================
@@ -1598,6 +1709,51 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let zoom_x_px_per_beat: f32 = (1.0 / beat_per_px) as f32;
         let pitch_per_px = view.pitch_visible / grid.h.max(1.0);
 
+        // ----- (FIXME #82) 空白ダブルクリック作成 press の検出 -----
+        // 「double-click の 2 度目の press」が空白 grid 上 (note_hit なし) なら note 作成 session を
+        // 開始する。press 即時に取るので、このままボタンを放さず drag すれば長さを決められる
+        // (Bitwig 流「continue to hold the mouse down, and then drag left or right to ... lengthen」)。
+        // start_beat (snap) と pitch (行 ceil = Insert と同式) を press 位置で確定。長さ軸 (左右)
+        // のみ扱い pitch は固定。editing_mode / note_drag 既存中は skip。`note_create_press` は
+        // 下の marquee gate でも参照し、この press を marquee が二重に所有しないよう抑制する。
+        let note_create_press: Option<(f32, f32)> = if editing_mode {
+            None
+        } else {
+            self.take_double_click_press_in_rect(grid)
+        };
+        if let Some((px, py)) = note_create_press
+            && note_hit(notes, view, grid, px, py, style.resize_handle_px).is_none()
+            && self.widget_state::<PianoRollState>(wid).note_drag.is_none()
+        {
+            let press_alt = pointer.modifiers.alt;
+            let raw_start = (view.start_beat + f64::from(px - grid.x) * beat_per_px).max(0.0);
+            let start_beat = view
+                .snap
+                .snap_beat(raw_start, press_alt, zoom_x_px_per_beat)
+                .max(0.0);
+            // Insert / 旧 dbl-click 作成と同じ ceil 逆写像 (#012)。Fold mode も RowGeometry が吸収。
+            let geom = RowGeometry::compute(view, grid);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pitch = (geom.y_to_pitch_f(py).ceil() as i32).clamp(0, 127) as u8;
+            // (FIXME #82) warp 先 = 既定長ノートの右端の screen x (Ableton Live 流)。
+            // カーソルをここへ動かし、 anchor をここに置く = カーソル＝掴んでいる右端が一致。
+            let default_len = view.default_note_len_beats.max(0.0625);
+            #[allow(clippy::cast_possible_truncation)]
+            let warp_x = grid.x + ((start_beat + default_len - view.start_beat) / beat_per_px) as f32;
+            self.warp_cursor(warp_x, py);
+            let state: &mut PianoRollState = self.widget_state(wid);
+            state.note_create = Some(NoteCreateSession {
+                start_beat,
+                pitch,
+                anchor_mouse: (warp_x, py),
+                press_x: px,
+                last_mouse: (warp_x, py),
+                last_alt: press_alt,
+                dragged: false,
+                warp_settled: false,
+            });
+        }
+
         // ----- ruler press 振り分け (M14 Phase 69 / daw_01 #041) -----
         // arrangement #024 と完全同 idiom: plain (= Shift 非保持) は playhead seek、
         // Shift 押下で loop range edit (NewRange / Start/End/Middle drag)。
@@ -1698,6 +1854,36 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     nd.last_mouse = (px, py);
                 }
             }
+            // (FIXME #82) note_create continuation。 まず warp 着地判定: press_x → anchor (右端) の
+            // 中点をカーソルが越えたら settled。 settled までは last_mouse を更新せず anchor のまま
+            // 保持する (warp の非同期ジャンプ由来の `PointerMoved` を長さに混入させない = ドラッグ
+            // 開始直後の一瞬の最短化を防ぐ)。 settled 後は note_drag と同じ winit release-frame 巻き
+            // 戻し対策で last_mouse / last_alt を update し、 左右いずれかに作成閾値 (4px) ぶん動いたら
+            // `dragged` を latch (一度立てば解除しない)。 **左方向も latch 対象**: 右端から左へ短縮
+            // するとき一度右へ振り直す手間を不要にする (Bitwig「drag left or right to shorten or lengthen」)。
+            if let Some(ref mut nc) = state.note_create {
+                if !nc.warp_settled {
+                    let mid = (nc.press_x + nc.anchor_mouse.0) * 0.5;
+                    // 右端 (anchor) は press_x 以上にあるので、 中点以上 = warp が反映された。
+                    if px >= mid {
+                        nc.warp_settled = true;
+                    }
+                }
+                if nc.warp_settled {
+                    if !pointer.primary_just_released {
+                        nc.last_mouse = (px, py);
+                        nc.last_alt = alt_now;
+                        if (px - nc.anchor_mouse.0).abs() >= NOTE_CREATE_DRAG_PX {
+                            nc.dragged = true;
+                        }
+                    } else if (px, py) != nc.anchor_mouse {
+                        nc.last_mouse = (px, py);
+                        if (px - nc.anchor_mouse.0).abs() >= NOTE_CREATE_DRAG_PX {
+                            nc.dragged = true;
+                        }
+                    }
+                }
+            }
             // velocity_drag 側も同様に last_mouse update (note_drag と同じ winit release frame
             // pos 巻き戻し対策)。 alt は velocity drag の挙動に影響しない (絶対値 mode 固定)。
             // continuation frame は常に update、 release frame は pointer.pos が anchor と異なる
@@ -1776,6 +1962,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let velocity_drag_session: Option<VelocityDragSession> = {
             let state: &mut PianoRollState = self.widget_state(wid);
             state.velocity_drag.clone()
+        };
+        // (FIXME #82) note_create overlay 用 clone と release 用 take。
+        let note_create_session: Option<NoteCreateSession> = {
+            let state: &mut PianoRollState = self.widget_state(wid);
+            state.note_create
+        };
+        let note_create_release: Option<NoteCreateSession> = if pointer.primary_just_released {
+            let state: &mut PianoRollState = self.widget_state(wid);
+            state.note_create.take()
+        } else {
+            None
         };
         // (M14 Phase 69 / daw_01 #041) loop_drag overlay & release 用 clone / take。
         let loop_drag_session: Option<LoopDragSession> = {
@@ -1872,6 +2069,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
         response.dragging = drag_session.as_ref().map(|nd| nd.kind);
         response.velocity_dragging = velocity_drag_session.is_some();
+        // (FIXME #82) 作成 session 中は creating=true (caller の wheel 無効化用)。
+        response.creating = note_create_session.is_some();
         // (M14 Phase 84 / daw_01 #055) 鍵盤レーン press 中の pitch を held-value で返す。
         // session 中 (press 開始が kbd) かつ まだ押下中 (primary_pressed) かつ pointer が kbd 内の
         // ときだけ Some。release frame は primary_pressed=false で None (= note-off)、kbd 外への drag
@@ -1888,7 +2087,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // hover 中の cursor 形状要求 (drag 中は drag kind、note hover (拡張範囲含む) は
         // hover_cursor、その他 widget 内は Default に明示 reset で stale cursor を防ぐ)。
         // winit は state-full なので set_cursor を呼ばないと前フレームの形状が残る (ui.rs:999)。
-        if response.dragging.is_some() {
+        if response.creating {
+            // (FIXME #82) 作成中は右端を伸ばす操作なので EwResize (resize と同じ)。
+            self.set_cursor(CursorIcon::EwResize);
+        } else if response.dragging.is_some() {
             let cursor = match response.dragging {
                 Some(NoteDragKind::Move) => CursorIcon::Move,
                 Some(NoteDragKind::ResizeLeft | NoteDragKind::ResizeRight) => {
@@ -1924,6 +2126,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let marquee_press = if !editing_mode
             && pointer.primary_just_pressed
             && !pointer.modifiers.alt
+            // (FIXME #82) この press が「ダブルクリック作成」 のものなら marquee を起動しない
+            // (作成 session が press を所有。 二重所有を防ぐ load-bearing gate)。
+            && note_create_press.is_none()
             && let Some((px, py)) = pointer.pos
             && grid.contains(px, py)
             && note_hit(notes, view, grid, px, py, style.resize_handle_px).is_none()
@@ -1948,6 +2153,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             || drag_release.is_some()
             || velocity_drag_release.is_some()
             || marquee_active
+            // (FIXME #82) 作成 release frame は Add で新規 note を選択するので、 ここで
+            // 空白 click 扱いして selection clear を emit しない (二重 emit 抑制)。
+            || note_create_release.is_some()
         {
             // #102: marquee がこの空き grid press を所有する frame は marquee 側が zero-rect REPLACE で
             // clear する。 ここで pending_click を立てると同フレーム二重 emit になるため None。
@@ -2098,6 +2306,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let loop_handle_color = style.loop_handle;
         let loop_handle_w = style.loop_handle_w;
 
+        // (FIXME #82) note_create preview: 作成中 note の rect (drag preview と同じ helper で
+        // 長さ確定値を計算 → grid clamp)。session 不在なら None。色は resize ghost (selected) と同じ。
+        let note_create_preview: Option<Rect> = note_create_session.map(|nc| {
+            let (start_beat, len_beats, pitch) =
+                note_create_geometry(&nc, view, beat_per_px, zoom_x_px_per_beat);
+            note_geometry_to_rect(start_beat, len_beats, pitch, view, grid)
+        });
+
         self.heavy(("piano_roll_inner", &id), move |hctx| {
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
             hctx.cached(viewport_key, |hctx| {
@@ -2170,6 +2386,28 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     pd,
                     drag_overlay_min_len,
                 );
+            }
+            // (FIXME #82) note_create preview (作成中の note を selection ghost 色で描画)。
+            if let Some(r) = note_create_preview {
+                let x_left = r.x.max(grid.x);
+                let x_right = (r.x + r.w).min(grid.x + grid.w);
+                let y_top = r.y.max(grid.y);
+                let y_bot = (r.y + r.h).min(grid.y + grid.h);
+                if x_right > x_left && y_bot > y_top {
+                    hctx.push_rect(RectCommand {
+                        rect: Rect {
+                            x: x_left,
+                            y: y_top,
+                            w: x_right - x_left,
+                            h: y_bot - y_top,
+                        },
+                        fill: style_copy.note_selected_fill,
+                        border: style_copy.note_selected_border,
+                        border_width: style_copy.note_selected_border_w,
+                        radius: [style_copy.note_border_radius_px; 4],
+                        clip_rect: None,
+                    });
+                }
             }
             // M14 Phase 59: lyric 描画 (selection overlay より後 = 黄色 fill に隠れない、
             // 編集中 note は text_input overlay に譲る)。 font_size は note 高さスケール。
@@ -2251,10 +2489,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
             // note id は user 側で next_note_id を bump して上書き。
             // ここでは placeholder id=0 で渡す (user は make_edit closure 内で bump 済 id を使う)。
+            // (FIXME #82) 長さは caller の既定長 (= last_note_duration_beats) に統一。 旧 0.5 固定だと
+            // 直前にドラッグ / resize した長さが Insert に反映されず一貫性が無かった。 下限 1/16。
             let new_note = Note {
                 id: 0,
                 start_beat,
-                len_beats: 0.5,
+                len_beats: view.default_note_len_beats.max(0.0625),
                 pitch,
                 velocity: 96,
                 lyric: None,
@@ -2420,6 +2660,26 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     self.push_edit(make_edit(PianoRollEditRequest::SetVelocity(updates)));
                 }
             }
+        }
+
+        // ----- (FIXME #82) note_create release → Add 発行 (作成 + 長さ確定を 1 undo step に) -----
+        // overlay と同じ `note_create_geometry` で長さを確定 (描画と commit の一致)。 ドラッグせず
+        // 即放しなら既定長、 ドラッグしていれば pointer 追従長。 id=0 placeholder (caller が採番)。
+        // daw_01 は `n.len_beats` を尊重して AddNote { duration } に変換する (旧: last_note_duration_beats
+        // 固定だったのを #82 で n.len_beats へ)。 pitch は press 時に確定済み。
+        if let Some(nc) = note_create_release {
+            let (start_beat, len_beats, pitch) =
+                note_create_geometry(&nc, view, beat_per_px, zoom_x_px_per_beat);
+            let new_note = Note {
+                id: 0,
+                start_beat,
+                len_beats,
+                pitch,
+                velocity: 100,
+                lyric: None,
+                muted: false,
+            };
+            self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
         }
 
         // ----- loop drag release → SetLoopRange (M14 Phase 69 / daw_01 #041) -----
@@ -3180,6 +3440,8 @@ mod tests {
             scale: None,
             snap_pitch_during_drag: false,
             sub_grid_interval_beats: None,
+            // 既定長 1 拍 (test の数値検証で扱いやすい値)。 個別 test で上書き可。
+            default_note_len_beats: 1.0,
         }
     }
 
@@ -3568,6 +3830,8 @@ mod tests {
         last_set_lyrics: Option<Vec<(NoteId, Option<String>)>>,
         /// (M14 Phase 61d / daw_01 #012) 最後に Add request で渡された note の pitch。
         last_added_pitch: Option<u8>,
+        /// (FIXME #82) 最後に Add request で渡された note の `(start_beat, len_beats)`。
+        last_added: Option<(f64, f64)>,
         /// (M14 Phase 64 / daw_01 #018) 最後に発行された `SetVelocity` の内容。
         last_set_velocity: Option<Vec<VelocityUpdate>>,
         /// (M14 Phase 69 / daw_01 #041) ruler 上 click / drag で発行された全 `SetPlayheadBeat` の
@@ -3601,6 +3865,7 @@ mod tests {
                 last_select_next: None,
                 last_set_lyrics: None,
                 last_added_pitch: None,
+                last_added: None,
                 last_set_velocity: None,
                 playhead_beats: Vec::new(),
                 last_set_loop_range: None,
@@ -3614,9 +3879,11 @@ mod tests {
             match req {
                 PianoRollEditRequest::Add(notes) => {
                     let pitch = notes.first().map(|n| n.pitch);
+                    let geom = notes.first().map(|n| (n.start_beat, n.len_beats));
                     Edit::mutate(move |m: &mut TestModel| {
                         m.last_request = Some(RequestKind::Add);
                         m.last_added_pitch = pitch;
+                        m.last_added = geom;
                     })
                 }
                 PianoRollEditRequest::Delete(notes) => Edit::mutate(move |m: &mut TestModel| {
@@ -4027,6 +4294,317 @@ mod tests {
             );
         });
         assert_eq!(model.last_request, Some(RequestKind::Move), "release で Move 発行");
+    }
+
+    // -------- (FIXME #82) 空白ダブルクリック作成 (放さずドラッグで長さ決定、Bitwig 流) --------
+
+    /// ダブルクリックの 2 度目の press でカーソルが既定長ノートの右端へ warp し、 そのまま右へ
+    /// ドラッグ → 右端が cursor に追従し、 release で `Add` を発行する (cursor＝右端モデル)。
+    /// test_view: snap OFF / 4 拍 / grid 800px → beat_per_px = 0.005、default = 1.0。
+    /// press x=200 (beat 1.0 = start) → warp 先 = 右端 beat 2.0 = x400 (anchor)。 cursor を x600
+    /// (beat 3.0) へドラッグ → 右端 beat 3.0 → len = 3.0−1.0 = 2.0。 warp は test では no-op なので
+    /// warp 着地フレーム (cursor=anchor) を明示的に挟む。
+    #[test]
+    fn note_create_double_click_drag_emits_add_with_dragged_length() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+
+        // Frame 1: 1 度目の click (release) → UiHost が last_click を記録。
+        let f1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 100.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f1, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+        assert_eq!(model.last_request, None, "1 度目 click だけでは作成しない");
+
+        // Frame 2: 2 度目の press (放さない) → 作成 session 開始 (anchor = warp 先 x400)。creating = true。
+        let f2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 100.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let creating2 = std::cell::Cell::new(false);
+        run_frame(&mut host, &mut model, f2, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let resp = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            creating2.set(resp.creating);
+        });
+        assert!(creating2.get(), "2 度目 press で作成 session が active (creating=true)");
+        assert_eq!(model.last_request, None, "press だけでは Add しない (release で確定)");
+
+        // Frame 3: warp 着地 (cursor が右端 anchor x400 へ。test では明示的に与える)。
+        let f3 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((400.0, 100.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f3, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+
+        // Frame 4: 右端をさらに右 (cursor x600 = beat 3.0) へドラッグ (held)。
+        let f4 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((600.0, 100.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f4, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+
+        // Frame 5: release → cursor 位置 (beat 3.0) を右端とする長さで Add。
+        let f5 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((600.0, 100.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f5, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+        assert_eq!(model.last_request, Some(RequestKind::Add), "release で Add 発行");
+        let (start, len) = model.last_added.expect("Add の geometry");
+        assert!((start - 1.0).abs() < 1e-9, "start_beat=1.0 (press x=200)、got {start}");
+        assert!(
+            (len - 2.0).abs() < 1e-9,
+            "len=2.0 (右端が cursor beat 3.0、start 1.0)、got {len}"
+        );
+    }
+
+    /// warp 着地後、右へ振らずそのまま左へドラッグするだけで既定長より短いノートを作れる
+    /// (= cursor＝右端なので右端を左へ動かす = 短縮、 一度右に振る必要がない、FIXME #82 follow-up)。
+    /// press x=400 (beat 2.0 = start、default 1.0 → warp 先 = 右端 beat 3.0 = x600 = anchor)。
+    /// warp 着地後 cursor を x500 (beat 2.5) へ左ドラッグ → 右端 beat 2.5 → len = 2.5−2.0 = 0.5
+    /// (既定 1.0 より短い)。
+    #[test]
+    fn note_create_drag_left_shortens_without_prior_right_drag() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = test_view(); // default_note_len_beats = 1.0、snap OFF
+        let style = PianoRollStyle::default();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+
+        // Frame 1: 1 度目 click。
+        let f1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((400.0, 100.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f1, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+
+        // Frame 2: 2 度目 press (start beat 2.0、anchor = warp 先 x600)。
+        let f2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((400.0, 100.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f2, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+
+        // Frame 3: warp 着地 (cursor が右端 anchor x600 へ)。
+        let f3 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((600.0, 100.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f3, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+
+        // Frame 4: 右へ振らず **左へ** ドラッグ (cursor x500 = beat 2.5、held)。
+        let f4 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((500.0, 100.0)),
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f4, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+
+        // Frame 5: release → 既定長 1.0 より短い 0.5 で Add (右端から滑らかに短縮)。
+        let f5 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((500.0, 100.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f5, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+        assert_eq!(model.last_request, Some(RequestKind::Add));
+        let (start, len) = model.last_added.expect("Add の geometry");
+        assert!((start - 2.0).abs() < 1e-9, "start_beat=2.0、got {start}");
+        assert!(
+            len < 1.0 && (len - 0.5).abs() < 1e-9,
+            "左ドラッグだけで既定長 1.0 より短い 0.5 になる (min ではなく右端から相対短縮)、got {len}"
+        );
+    }
+
+    /// ダブルクリックしてドラッグせず即座に放す → **既定長** (`view.default_note_len_beats`) で
+    /// `Add`。test_view の default_note_len_beats = 1.0。start=1.0 (press x=200)。
+    #[test]
+    fn note_create_double_click_without_drag_uses_default_length() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+
+        // Frame 1: 1 度目 click (release)。
+        let f1 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 100.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f1, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+
+        // Frame 2: 2 度目 press。
+        let f2 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 100.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f2, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+
+        // Frame 3: 動かさず release。
+        let f3 = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 100.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, f3, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+        assert_eq!(model.last_request, Some(RequestKind::Add), "即放しでも Add 発行");
+        let (start, len) = model.last_added.expect("Add の geometry");
+        assert!((start - 1.0).abs() < 1e-9, "start_beat=1.0、got {start}");
+        assert!(
+            (len - 1.0).abs() < 1e-9,
+            "ドラッグなしは既定長 default_note_len_beats=1.0、got {len}"
+        );
+    }
+
+    /// 単発 click (ダブルクリックでない) は作成しない (= release-based 検出が press に化けない)。
+    /// 1 度の press → release だけでは `note_create` session は始まらず Add も出ない。
+    #[test]
+    fn note_create_single_click_does_not_create() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+
+        // press → release を別フレームで (= 普通の単発クリック、直前 click 無し)。
+        let press = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 100.0)),
+                primary_just_pressed: true,
+                primary_pressed: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        let creating = std::cell::Cell::new(false);
+        run_frame(&mut host, &mut model, press, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let resp = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            creating.set(resp.creating);
+        });
+        assert!(!creating.get(), "単発 press では作成 session は始まらない");
+
+        let release = FrameInput {
+            pointer: PointerFrame {
+                pos: Some((200.0, 100.0)),
+                primary_just_released: true,
+                ..PointerFrame::default()
+            },
+            ..Default::default()
+        };
+        run_frame(&mut host, &mut model, release, |ui| {
+            let d = make_dispatch();
+            let sel: Vec<NoteId> = vec![];
+            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+        });
+        assert_eq!(model.last_request, None, "単発クリックでは Add しない");
     }
 
     /// (M14 Phase 83 / daw_01 #054) Ctrl+drag は release で `Move` ではなく `Copy` を発行する。

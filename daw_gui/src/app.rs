@@ -1238,6 +1238,11 @@ pub struct AppData {
     /// 入力として動くので先行実装する。 widget からは
     /// `SelectAutomationPoints` (#033) で上書き。 session-only。
     pub selected_automation_points: Vec<AutomationPointKeyRef>,
+    /// FIXME #81: inline 数値入力中の automation point (`Some` のとき
+    /// `arrangement_view` が当該 point の rect に `text_input_at_focused`
+    /// overlay を出す)。session-only / Undo・save 対象外。点をダブルクリック
+    /// で `Some`、 確定 (Enter) / blur / Esc で `None`。
+    pub editing_automation_point: Option<AutomationPointKeyRef>,
     /// gui_01 #028 §7.3: 最後にユーザーが触った parameter。`A` キー
     /// shortcut で「対応 lane を所有 track に追加」 する source。
     /// session-only (起動 None、Undo / save 対象外)。
@@ -1411,6 +1416,11 @@ pub struct AppData {
     /// 同じ「1 drag = 1 undo step」 経路 (gesture begin で 1 snapshot) に乗せる。
     /// session-only (`arrange_hover_content` と同 idiom)。
     pub arrange_dragging_track_volume: Option<u32>,
+    /// FIXME #81: レーンヘッダの default value scrubable がドラッグ / テキスト編集中の
+    /// lane (`Some` の間 1 つだけ)。`inspector_scrub_active` と同 idiom で、 active 立ち上がり
+    /// で `BeginInspectorScrub` (= Song snapshot)、 立ち下がりで `EndInspectorScrub` を発火し、
+    /// 一連の `SetLaneDefault` を undo 1 step に bracket する。session-only。
+    pub arrange_default_scrub_active: Option<common::model::AutomationLaneKey>,
     /// 鍵盤レーン click のプレビュー発音中の `(track_id, pitch)` (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 widget の
     /// `PianoRollResponse::keyboard_active_pitch` を前フレーム値と差分して
@@ -1422,6 +1432,17 @@ pub struct AppData {
 
     // -------- View state --------
     pub bottom_panel: u8,
+    /// piano_roll widget が歌詞 inline 編集 (gui_01 #017、 note 上の L キー編集) の
+    /// text_input overlay を出している間 `true`。 widget 内部状態 (`PianoRollState`) の
+    /// session-only ミラーで、 `piano_roll_view::draw` が毎フレーム `resp.lyric_editing`
+    /// から更新する (project save には含めない)。
+    ///
+    /// 用途は root.rs の Esc dispatch との調停 (FIXME #84)。 `dispatch_shortcuts` は
+    /// piano_roll widget より前に走って `take_shortcut("escape")` を消費するため、
+    /// このミラーが立っている間は Esc を消費せず widget に委ねる (widget 側が歌詞編集を
+    /// キャンセルする)。 ミラーは 1 frame 遅延だが、 編集モードは L 押下〜Esc 押下まで
+    /// 複数フレーム持続するので調停に支障はない。
+    pub piano_roll_lyric_editing: bool,
     /// `Some(target)` で Audio Editor (= clip ダブルクリックで開く波形
     /// 編集 view) が開いている。 bottom_panel の Piano Roll タブが
     /// audio_editor view に切り替わる (`docs/plan_audio_clip.md` §3.10
@@ -2166,6 +2187,7 @@ impl AppData {
             selected_automation_clips: Vec::new(),
             last_automation_select: None,
             selected_automation_points: Vec::new(),
+            editing_automation_point: None,
             last_touched_param: None,
             recording_mode: common::model::RecordingMode::default(),
             metronome_enabled: false,
@@ -2195,8 +2217,10 @@ impl AppData {
             arrange_primary_lane_content_top: None,
             arrange_hover_content: None,
             arrange_dragging_track_volume: None,
+            arrange_default_scrub_active: None,
             arrange_hovered_automation_lane: None,
             bottom_panel: 0,
+            piano_roll_lyric_editing: false,
             audio_editor_clip: None,
             audio_editor_selected_events: Vec::new(),
             audio_editor_hover_beat_in_clip: None,
@@ -3553,6 +3577,9 @@ impl AppData {
                 | AppEvent::AddAutomationPoint { .. }
                 | AppEvent::MoveAutomationPoints { .. }
                 | AppEvent::DeleteAutomationPoints { .. }
+                // FIXME #81: inline 数値入力の確定 1 件は discrete commit なので
+                // Undo step 化 (`BeginEditAutomationPointValue` は session-only で除外)。
+                | AppEvent::SetAutomationPointValue { .. }
                 | AppEvent::SetAutomationCurveType { .. }
                 | AppEvent::MoveAutomationClips { .. }
                 | AppEvent::CloneAutomationClipsLinked { .. }
@@ -3652,7 +3679,9 @@ impl AppData {
             new_indices.push(dest.len() as u32);
             dest.push(src.clone());
         }
-        self.selected_notes = new_indices;
+        // FIXME #83: 貼り付けた note を勝者として重なり解消。選択は remap で追従。
+        let remap = resolve_note_overlaps(dest, &new_indices);
+        self.selected_notes = remap_indices(&remap, &new_indices);
         self.sync_song_to_plugin_host();
         count
     }
@@ -3721,6 +3750,9 @@ impl AppData {
                 n.start_beat = snap(n.start_beat).max(0.0);
             }
         }
+        // FIXME #83: 量子化で同一ピッチが同点に丸まる重なりを解消。選択は remap で追従。
+        let remap = resolve_note_overlaps(notes, &selected);
+        self.selected_notes = remap_indices(&remap, &selected);
         self.sync_song_to_plugin_host();    }
 
     fn resize_track_peak_display(&mut self) {
@@ -4201,6 +4233,20 @@ pub enum AppEvent {
     /// 相当) で運ぶ。
     DeleteAutomationPoints {
         points: Vec<AutomationPointKeyRef>,
+    },
+    /// FIXME #81: 既存 point 上の dblclick → その point の値の **inline 数値入力**
+    /// を開始する。session-only (undo 対象外)。`editing_automation_point` を
+    /// セットするだけで、 描画は `arrangement_view` が `automation_point_rects`
+    /// から rect を引いて `text_input_at_focused` overlay を出す。
+    BeginEditAutomationPointValue {
+        key: AutomationPointKeyRef,
+    },
+    /// FIXME #81: inline 数値入力の確定 → 1 point の `value` を **plain 単位の
+    /// 絶対値** で上書き (時間 = `time_beat` は不変、 sort 不要)。Undo step 化
+    /// (構造変化系)。`MoveAutomationPoints` (norm delta) と異なり absolute plain。
+    SetAutomationPointValue {
+        key: AutomationPointKeyRef,
+        value: f64,
     },
     /// 右クリック popup → curve type 選択 → 1 point の `curve` 更新。
     /// `prev` / `next` は Undo 構築用に両方持たせる (gui_01 §11.4 と
@@ -5847,6 +5893,17 @@ impl AppData {
             }
             AppEvent::DeleteAutomationPoints { points } => {
                 self.delete_automation_points(&points)
+            }
+            AppEvent::BeginEditAutomationPointValue { key } => {
+                // session-only: 該当 point が存在するときだけ編集開始 (race で
+                // 既に消えていれば no-op)。
+                if self.automation_point_value(&key).is_some() {
+                    self.editing_automation_point = Some(key);
+                }
+            }
+            AppEvent::SetAutomationPointValue { key, value } => {
+                self.set_automation_point_value(&key, value);
+                self.editing_automation_point = None;
             }
             AppEvent::SetAutomationCurveType {
                 track_id,
@@ -10351,6 +10408,44 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
+    /// FIXME #81: point の現在値 (plain 単位) を読む。inline 数値入力の prefill /
+    /// 編集開始可否判定に使う。master row (`MASTER_TRACK_ID`) lane も
+    /// `automation_lane_by_key` が解決する。
+    pub(crate) fn automation_point_value(&self, key: &AutomationPointKeyRef) -> Option<f64> {
+        let lane = self
+            .song
+            .automation_lane_by_key(key.track_id, key.lane_id)?;
+        let clip = lane.clip_by_id(key.clip_id)?;
+        let content = self.song.clip_contents.get(&clip.content_id)?;
+        let pts = content.automation_points()?;
+        pts.get(key.point_idx as usize).map(|p| p.value)
+    }
+
+    /// FIXME #81: point の値を **plain 単位の絶対値**で上書き (inline 数値入力の確定)。
+    /// `value` は呼び出し側 (`arrangement_view`) で表示単位レンジに clamp +
+    /// `from_display` 済の plain。時間 (`time_beat`) は変えないので sort 順は不変。
+    fn set_automation_point_value(&mut self, key: &AutomationPointKeyRef, value: f64) {
+        let Some(lane) = self
+            .song
+            .automation_lane_by_key(key.track_id, key.lane_id)
+        else {
+            return;
+        };
+        let Some(clip) = lane.clip_by_id(key.clip_id) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Automation(a)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        if let Some(p) = a.points.get_mut(key.point_idx as usize) {
+            p.value = value;
+        }
+        self.sync_song_to_plugin_host();
+    }
+
     fn delete_automation_points(&mut self, points: &[AutomationPointKeyRef]) {
         if points.is_empty() {
             return;
@@ -13260,8 +13355,11 @@ impl AppData {
             lyric: None,
             muted: false,
         });
+        // FIXME #83: ステップ入力した note を勝者として重なり解消。
+        let remap = resolve_note_overlaps(notes, &[new_idx]);
+        let selected = remap_indices(&remap, &[new_idx]);
         let next_cursor = cursor + step;
-        self.selected_notes = vec![new_idx];
+        self.selected_notes = selected;
         self.step_cursor_beat = next_cursor;
         self.sync_song_to_plugin_host();
     }
@@ -16823,6 +16921,10 @@ impl AppData {
                 "対象 note は既に in-scale です".to_string();
             return;
         }
+        // FIXME #83: pitch 補正で異なる pitch が同一 pitch に丸まると同一ピッチの
+        // 重なりが生じ得るので、補正した note を勝者として重なり解消する。
+        let winners: Vec<u32> = snaps.iter().map(|&(i, _)| i).collect();
+        let mut remap: Option<Vec<Option<u32>>> = None;
         if let Some(notes) = self
             .song
             .notes_in_clip_mut(r.track as usize, r.clip as usize)
@@ -16832,6 +16934,11 @@ impl AppData {
                     n.pitch = new_pitch;
                 }
             }
+            remap = Some(resolve_note_overlaps(notes, &winners));
+        }
+        if let Some(remap) = remap {
+            let sel = std::mem::take(&mut self.selected_notes);
+            self.selected_notes = remap_indices(&remap, &sel);
         }
         self.status_message =
             format!("{count} 件の note を scale に補正しました");
@@ -16881,6 +16988,9 @@ impl AppData {
             lyric: None,
             muted: false,
         });
+        // FIXME #83: 追加した note を勝者として同一ピッチの重なりを解消。
+        let remap = resolve_note_overlaps(notes, &[new_idx]);
+        let selected = remap_indices(&remap, &[new_idx]);
         let r = ClipRef {
             track: track_idx,
             clip: clip_idx,
@@ -16891,7 +17001,7 @@ impl AppData {
                 self.selected_clips = vec![key];
             }
         }
-        self.selected_notes = vec![new_idx];
+        self.selected_notes = selected;
         self.last_note_duration_beats = duration;
         self.sync_song_to_plugin_host();    }
 
@@ -16926,6 +17036,7 @@ impl AppData {
         } else {
             entries.to_vec()
         };
+        let winners: Vec<u32> = snapped.iter().map(|&(idx, _, _)| idx).collect();
         let Some(notes) = self
             .song
             .notes_in_clip_mut(r.track as usize, r.clip as usize)
@@ -16939,12 +17050,18 @@ impl AppData {
             note.start_beat = beat.max(0.0);
             note.pitch = pitch;
         }
+        // FIXME #83: 移動した note を勝者として重なり解消。既存選択 (未選択 note を
+        // 単独ドラッグした場合は winners と一致しない) を remap で追従させる。
+        let remap = resolve_note_overlaps(notes, &winners);
+        let sel = std::mem::take(&mut self.selected_notes);
+        self.selected_notes = remap_indices(&remap, &sel);
         self.sync_song_to_plugin_host();    }
 
     fn resize_notes(&mut self, entries: &[(u32, f64, f64)]) {
         let Some(r) = self.selected_clip_ref() else {
             return;
         };
+        let winners: Vec<u32> = entries.iter().map(|&(idx, _, _)| idx).collect();
         let Some(notes) = self
             .song
             .notes_in_clip_mut(r.track as usize, r.clip as usize)
@@ -16958,6 +17075,11 @@ impl AppData {
             note.start_beat = start.max(0.0);
             note.duration_beats = duration.max(0.0625);
         }
+        // FIXME #83: リサイズした note を勝者として重なり解消。既存選択 (未選択 note の
+        // 端を単独ドラッグした場合は winners と一致しない) を remap で追従させる。
+        let remap = resolve_note_overlaps(notes, &winners);
+        let sel = std::mem::take(&mut self.selected_notes);
+        self.selected_notes = remap_indices(&remap, &sel);
         if let Some(&(_, _, duration)) = entries.last() {
             self.last_note_duration_beats = duration.max(0.0625);
         }
@@ -16985,7 +17107,9 @@ impl AppData {
         if new_ids.is_empty() {
             return;
         }
-        self.selected_notes = new_ids;
+        // FIXME #83: 複製を勝者として重なり解消 (元と密接な複製は元を据え置く)。
+        let remap = resolve_note_overlaps(notes, &new_ids);
+        self.selected_notes = remap_indices(&remap, &new_ids);
         self.sync_song_to_plugin_host();    }
 
     /// gui_01 #054 (Ctrl+drag コピー): `entries` = [(source note index,
@@ -17005,7 +17129,9 @@ impl AppData {
         if new_ids.is_empty() {
             return;
         }
-        self.selected_notes = new_ids;
+        // FIXME #83: コピーを勝者として重なり解消。選択は remap で追従。
+        let remap = resolve_note_overlaps(notes, &new_ids);
+        self.selected_notes = remap_indices(&remap, &new_ids);
         self.sync_song_to_plugin_host();    }
 
     fn resize_note(
@@ -17026,6 +17152,10 @@ impl AppData {
             return;
         };
         note.duration_beats = new_duration;
+        // FIXME #83: リサイズした note を勝者として重なり解消。既存選択は remap で追従。
+        let remap = resolve_note_overlaps(notes, &[note_idx]);
+        let sel = std::mem::take(&mut self.selected_notes);
+        self.selected_notes = remap_indices(&remap, &sel);
         self.sync_song_to_plugin_host();    }
 
     fn delete_selected_notes(&mut self) {
@@ -21318,6 +21448,10 @@ impl AppData {
                 GlueKind::Midi => {
                     let mut notes = frags.midi_notes;
                     notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+                    // FIXME #83: glue で別 clip 由来の同一ピッチ note が時間的に
+                    // 重なり得るので、全 note を勝者として重なりを解消する。
+                    let all: Vec<u32> = (0..notes.len() as u32).collect();
+                    resolve_note_overlaps(&mut notes, &all);
                     ClipContent::Midi(MidiContent { notes })
                 }
             };
@@ -21809,6 +21943,149 @@ fn copy_notes_into(notes: &mut Vec<Note>, entries: &[(u32, f64, u8)]) -> Vec<u32
     (base..base + count).collect()
 }
 
+/// FIXME #83: 同一ピッチの MIDI ノートが時間的に重ならない不変条件を強制する
+/// (Bitwig / Ableton 流、`docs/plan_fixme_83_note_overlap.md`)。
+///
+/// `winners` = 直前に追加 / 移動 / サイズ変更 / コピーされたノートの index (= 衝突時に
+/// 勝つ側)。同一ピッチで winner と重なる loser を **last-note-wins** で解消する:
+/// - 完全被覆 → loser 削除
+/// - loser が winner より前に始まる → loser 末尾を winner 開始でトリム
+///   (末尾重なり + 中央挿入 = truncate-not-split、自動分割しない)
+/// - loser 先頭が winner に覆われ後半が残る → loser 開始を winner 終端へ前送りし後半を残す
+///   (REAPER 流の非破壊的挙動、FIXME #83 で user 採用)
+///
+/// winner 同士の重なり (時間 / ピッチ量子化・glue で発生し得る) は pitch ごとに start 昇順で
+/// 「後から始まる方が勝ち、前のノート末尾をトリム」で解消する (move / copy 等の並進操作では
+/// winner 群は重ならないので no-op)。**異なるピッチは一切触らない** (= 和音は自由)。
+///
+/// 削除で index がずれるため、戻り値は古い index → 新 index の remap 表 (削除は `None`)。
+/// 削除は降順 `Vec::remove` で行う (`delete_selected_notes` と同 idiom)。caller は
+/// [`remap_indices`] で `selected_notes` / 新規 winner id を写し替える。
+fn resolve_note_overlaps(notes: &mut Vec<Note>, winners: &[u32]) -> Vec<Option<u32>> {
+    const EPS: f64 = 1e-9;
+    let n = notes.len();
+    // winner index を範囲内・重複除去して正規化 (入力順は保持)。
+    let mut is_winner = vec![false; n];
+    let mut winner_order: Vec<usize> = Vec::new();
+    for &w in winners {
+        let w = w as usize;
+        if w < n && !is_winner[w] {
+            is_winner[w] = true;
+            winner_order.push(w);
+        }
+    }
+    let mut deleted = vec![false; n];
+
+    // ---- Phase B: winner 同士の重なり解消 (pitch ごとに start 昇順、後勝ち) ----
+    {
+        let mut by_pitch: std::collections::HashMap<u8, Vec<usize>> =
+            std::collections::HashMap::new();
+        for &w in &winner_order {
+            by_pitch.entry(notes[w].pitch).or_default().push(w);
+        }
+        for group in by_pitch.values_mut() {
+            if group.len() < 2 {
+                continue;
+            }
+            group.sort_by(|&a, &b| {
+                notes[a]
+                    .start_beat
+                    .total_cmp(&notes[b].start_beat)
+                    .then(a.cmp(&b))
+            });
+            for i in 0..group.len() - 1 {
+                let a = group[i];
+                let c = group[i + 1];
+                if deleted[a] {
+                    continue;
+                }
+                let a_end = notes[a].start_beat + notes[a].duration_beats;
+                let c_start = notes[c].start_beat;
+                if a_end > c_start + EPS {
+                    let new_dur = c_start - notes[a].start_beat;
+                    if new_dur <= EPS {
+                        deleted[a] = true;
+                    } else {
+                        notes[a].duration_beats = new_dur;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Phase A: 各 winner が同一ピッチの loser をトリム / 削除 ----
+    for &w in &winner_order {
+        if deleted[w] {
+            continue;
+        }
+        let ws = notes[w].start_beat;
+        let we = ws + notes[w].duration_beats;
+        if we <= ws + EPS {
+            continue;
+        }
+        let p = notes[w].pitch;
+        for b in 0..n {
+            if b == w || is_winner[b] || deleted[b] || notes[b].pitch != p {
+                continue;
+            }
+            let bs = notes[b].start_beat;
+            let be = bs + notes[b].duration_beats;
+            // 重なり無し (隣接 be == ws / bs == we は許容)。
+            if be <= ws + EPS || bs >= we - EPS {
+                continue;
+            }
+            if ws <= bs + EPS && be <= we + EPS {
+                // 完全被覆 → 削除。
+                deleted[b] = true;
+            } else if bs < ws - EPS {
+                // loser が winner より前に始まる → 末尾を winner 開始でトリム
+                // (末尾重なり + 中央挿入 = truncate-not-split)。
+                let new_dur = ws - bs;
+                if new_dur <= EPS {
+                    deleted[b] = true;
+                } else {
+                    notes[b].duration_beats = new_dur;
+                }
+            } else {
+                // loser 先頭が winner に覆われ後半が we を超える → 開始を we へ前送り
+                // して後半を残す (REAPER 流、FIXME #83 user 採用)。
+                let new_dur = be - we;
+                if new_dur <= EPS {
+                    deleted[b] = true;
+                } else {
+                    notes[b].start_beat = we;
+                    notes[b].duration_beats = new_dur;
+                }
+            }
+        }
+    }
+
+    // ---- 削除を適用 + remap 表を構築 ----
+    let mut remap: Vec<Option<u32>> = vec![None; n];
+    let mut deleted_before = 0u32;
+    for i in 0..n {
+        if deleted[i] {
+            deleted_before += 1;
+        } else {
+            remap[i] = Some(i as u32 - deleted_before);
+        }
+    }
+    for i in (0..n).rev() {
+        if deleted[i] {
+            notes.remove(i);
+        }
+    }
+    remap
+}
+
+/// [`resolve_note_overlaps`] の remap 表で古い index 列を新 index 列へ写す
+/// (削除されたものは除外)。selected_notes / 新規 winner id の付け替えに使う。
+fn remap_indices(remap: &[Option<u32>], idxs: &[u32]) -> Vec<u32> {
+    idxs.iter()
+        .filter_map(|&i| remap.get(i as usize).copied().flatten())
+        .collect()
+}
+
 /// `SetClipColor` の core: target clip の `content_id` を共有する全 track の全 clip へ
 /// `color` を伝播する (= 共有クリップの色を変えれば共有先全部が同色、 cross-track 含む)。
 /// `content_id == 0` (未採番 sentinel) のときは伝播せず target clip のみ塗る (defensive、
@@ -22074,6 +22351,167 @@ mod note_duplicate_tests {
         let new_ids = copy_notes_into(&mut notes, &[]);
         assert!(new_ids.is_empty());
         assert_eq!(notes.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod note_overlap_tests {
+    // FIXME #83: resolve_note_overlaps の純ロジック検証
+    // (docs/plan_fixme_83_note_overlap.md)。
+    use super::{remap_indices, resolve_note_overlaps};
+    use common::model::Note;
+
+    fn note(start: f64, dur: f64, pitch: u8) -> Note {
+        Note {
+            start_beat: start,
+            duration_beats: dur,
+            pitch,
+            velocity: 100,
+            lyric: None,
+            muted: false,
+        }
+    }
+
+    #[test]
+    fn full_cover_deletes_existing() {
+        // 既存 [0,4) の上に同一ピッチ winner [0,4) → 既存削除、winner だけ残る。
+        let mut notes = vec![note(0.0, 4.0, 60), note(0.0, 4.0, 60)];
+        let remap = resolve_note_overlaps(&mut notes, &[1]);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].start_beat, 0.0);
+        assert_eq!(notes[0].duration_beats, 4.0);
+        // 古い idx0 (loser) は削除、idx1 (winner) は新 idx0 へ。
+        assert_eq!(remap, vec![None, Some(0)]);
+        assert_eq!(remap_indices(&remap, &[1]), vec![0]);
+    }
+
+    #[test]
+    fn tail_overlap_trims_existing_tail() {
+        // 既存 [0,4)、winner [2,6) が既存の末尾に食い込む → 既存を [0,2) にトリム。
+        let mut notes = vec![note(0.0, 4.0, 60), note(2.0, 4.0, 60)];
+        let remap = resolve_note_overlaps(&mut notes, &[1]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].start_beat, 0.0);
+        assert_eq!(notes[0].duration_beats, 2.0); // 末尾を winner 開始でトリム
+        assert_eq!(notes[1].start_beat, 2.0);
+        assert_eq!(notes[1].duration_beats, 4.0); // winner は不変
+        assert_eq!(remap, vec![Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn head_overlap_keeps_remnant() {
+        // winner [0,4) が既存 [2,12) の先頭を覆う。後半 [4,12) を残す (REAPER 流)。
+        let mut notes = vec![note(0.0, 4.0, 60), note(2.0, 10.0, 60)];
+        resolve_note_overlaps(&mut notes, &[0]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].start_beat, 0.0);
+        assert_eq!(notes[0].duration_beats, 4.0); // winner 不変
+        assert_eq!(notes[1].start_beat, 4.0); // 開始を winner 終端へ前送り
+        assert_eq!(notes[1].duration_beats, 8.0); // 12 - 4 = 8
+    }
+
+    #[test]
+    fn middle_insertion_truncates_not_split() {
+        // 長い既存 [0,8) の中央に短い winner [3,5) → 既存を [0,3) に切り詰め。
+        // 自動 split しない (= note 数は 2 のまま、後半 [5,8) は残さない)。
+        let mut notes = vec![note(0.0, 8.0, 60), note(3.0, 2.0, 60)];
+        resolve_note_overlaps(&mut notes, &[1]);
+        assert_eq!(notes.len(), 2); // split されない
+        assert_eq!(notes[0].start_beat, 0.0);
+        assert_eq!(notes[0].duration_beats, 3.0); // 切り詰め
+        assert_eq!(notes[1].start_beat, 3.0); // winner 不変
+        assert_eq!(notes[1].duration_beats, 2.0);
+    }
+
+    #[test]
+    fn different_pitch_untouched() {
+        // ピッチが違えば重なってよい (= 和音)。何も変わらない。
+        let mut notes = vec![note(0.0, 4.0, 60), note(1.0, 2.0, 62)];
+        let remap = resolve_note_overlaps(&mut notes, &[1]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].duration_beats, 4.0);
+        assert_eq!(notes[1].start_beat, 1.0);
+        assert_eq!(notes[1].duration_beats, 2.0);
+        assert_eq!(remap, vec![Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn adjacent_notes_not_trimmed() {
+        // 隣接 (既存 [0,2)、winner [2,2)+) は重なっていないので不干渉。
+        let mut notes = vec![note(0.0, 2.0, 60), note(2.0, 2.0, 60)];
+        resolve_note_overlaps(&mut notes, &[1]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].duration_beats, 2.0);
+        assert_eq!(notes[1].start_beat, 2.0);
+    }
+
+    #[test]
+    fn winner_trims_multiple_losers() {
+        // winner [0.5,3.5) が前後 2 つの loser を同時に解消。
+        // B1 [0,2) → 末尾トリム [0,0.5)、B2 [2,4) → 先頭前送り [3.5,4)。
+        let mut notes = vec![note(0.0, 2.0, 60), note(2.0, 2.0, 60), note(0.5, 3.0, 60)];
+        resolve_note_overlaps(&mut notes, &[2]);
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[0].start_beat, 0.0);
+        assert_eq!(notes[0].duration_beats, 0.5);
+        assert_eq!(notes[1].start_beat, 3.5);
+        assert!((notes[1].duration_beats - 0.5).abs() < 1e-9);
+        assert_eq!(notes[2].start_beat, 0.5); // winner 不変
+        assert_eq!(notes[2].duration_beats, 3.0);
+    }
+
+    #[test]
+    fn winner_winner_quantize_collision() {
+        // 量子化で同一ピッチの 2 winner が重なる → 後勝ち、前の末尾をトリム。
+        let mut notes = vec![note(0.0, 2.0, 60), note(1.0, 2.0, 60)];
+        resolve_note_overlaps(&mut notes, &[0, 1]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].start_beat, 0.0);
+        assert_eq!(notes[0].duration_beats, 1.0); // [0,2)→[0,1)
+        assert_eq!(notes[1].start_beat, 1.0);
+        assert_eq!(notes[1].duration_beats, 2.0); // 後発は不変
+    }
+
+    #[test]
+    fn coincident_winners_dedup() {
+        // 同位置・同ピッチの 2 winner → 前を削除 (長さ 0)、1 つに集約。
+        let mut notes = vec![note(0.0, 2.0, 60), note(0.0, 2.0, 60)];
+        let remap = resolve_note_overlaps(&mut notes, &[0, 1]);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].start_beat, 0.0);
+        assert_eq!(notes[0].duration_beats, 2.0);
+        assert_eq!(remap, vec![None, Some(0)]);
+    }
+
+    #[test]
+    fn group_translation_preserves_all() {
+        // move/copy 相当: winner 2 つが並進 (互いに重ならない)、loser 無し → 無変化。
+        let mut notes = vec![note(0.0, 1.0, 60), note(2.0, 1.0, 60)];
+        let remap = resolve_note_overlaps(&mut notes, &[0, 1]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].duration_beats, 1.0);
+        assert_eq!(notes[1].start_beat, 2.0);
+        assert_eq!(remap, vec![Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn empty_winners_is_noop() {
+        let mut notes = vec![note(0.0, 4.0, 60), note(1.0, 4.0, 60)];
+        let remap = resolve_note_overlaps(&mut notes, &[]);
+        assert_eq!(notes.len(), 2); // 重なりがあっても winner 無しなら触らない
+        assert_eq!(remap, vec![Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn remap_drops_deleted_and_shifts_survivors() {
+        // 削除されたノートを参照する selected_notes は除外され、後続は前詰めされる。
+        // notes: [loser0, winner1(覆う), survivor2]。loser0 を winner1 が完全被覆。
+        let mut notes = vec![note(0.0, 2.0, 60), note(0.0, 2.0, 60), note(5.0, 1.0, 72)];
+        let remap = resolve_note_overlaps(&mut notes, &[1]);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(remap, vec![None, Some(0), Some(1)]);
+        // 旧 selection [0,2] → 0 は削除で消え、2 は 1 へ。
+        assert_eq!(remap_indices(&remap, &[0, 2]), vec![1]);
     }
 }
 

@@ -2003,18 +2003,8 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                         format!("arr: SetLaneVisible t{} l{} → {}", lane.track, lane.lane, visible);
                 })
             }
-            ArrangementEditRequest::SetLaneDefault { lane, prev: _, next } => {
-                Edit::mutate(move |mm: &mut DawModel| {
-                    if let Some(lanes) = lanes_mut_for_track(mm, lane.track)
-                        && let Some(l) = lanes.iter_mut().find(|l| l.id == lane.lane)
-                    {
-                        l.default_value_norm = next.clamp(0.0, 1.0);
-                    }
-                    mm.arr_view.data_generation += 1;
-                    mm.last_action =
-                        format!("arr: SetLaneDefault t{} l{} → {:.2}", lane.track, lane.lane, next);
-                })
-            }
+            // FIXME #81: 旧 SetLaneDefault (slider 帯 drag) は廃止 (default 値編集は daw_01 本体が
+            // lane header に scrubable_number_at を overlay する)。
             // M14 Phase 63n-5 (#030): lane 下端 splitter drag による高さ変更。 widget 側で
             // [min, max] = [30, 200] (style 既定) に clamp 済 — caller は別 clamp 不要。
             // drag 中は per-frame 受信 → caller が `lane.height_px = next` で反映 → 次 frame で
@@ -2070,6 +2060,16 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     clip.track, clip.lane, clip.clip, time_beat, value_norm
                 );
             }),
+            // FIXME #81: 既存 point 上の dblclick → 値の数値入力開始 (daw_01 本体が inline 入力
+            // overlay を出す)。prototype は last_action にログするだけ。
+            ArrangementEditRequest::DoubleClickAutomationPoint(point) => {
+                Edit::mutate(move |mm: &mut DawModel| {
+                    mm.last_action = format!(
+                        "arr: DoubleClickAutomationPoint t{} l{} c{} p{}",
+                        point.clip.track, point.clip.lane, point.clip.clip, point.point_idx
+                    );
+                })
+            }
             // M14 Phase 63n-4 (#029): lane body 内 clip ギャップでの dblclick → 新規 automation clip 作成。
             // widget は snap 適用済 start_beat と style 既定 len_beats を渡す。 prototype は単純に lane に
             // 新 clip を追加 (新 id = 既存 max+1、 share_group なし、 Linear curve の point 1 個 [0.0, default])。

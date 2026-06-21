@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# Integration test for scripts/cleanup_worktree.sh.
+#
+# Builds a throwaway git repo with one worktree per scenario, runs the REAL
+# cleanup script, and asserts which worktrees (and branches) get removed / kept.
+# Everything happens under a mktemp scratch dir; the real repo is never touched.
+# No --force is used for the headline cases, so they never run taskkill -> safe &
+# cross-platform. A dedicated --force case at the end exercises the force path on
+# a worktree that no process holds open, so taskkill is still never reached.
+#
+# Coverage:
+#   merged detection : A ancestor-merged, B merge-flow leftover (the motivating
+#                      fix), C unmerged, G add-then-revert net-zero (MUST be kept:
+#                      net tree is empty but the commits live only on the branch),
+#                      H squash-merged (conservatively kept).
+#   --all gates       : D tip==main HEAD excluded, E dirty (tracked) skipped,
+#                      I_notes dirty gitignored deliverable skipped, I_target dirty
+#                      regenerable-ignored (target/) NOT a blocker -> removed,
+#                      F orphan (no merge-base) kept, L locked skipped.
+#   remove_one guards : --name on unmerged (merge guard, the most-used path),
+#                      --path outside .claude/worktrees (location guard),
+#                      --path the main worktree (main-worktree guard),
+#                      --path a detached worktree (detached-HEAD guard; also pins
+#                      the US-delimiter field parse that the guard depends on).
+#   force path        : --force removes an otherwise-skipped worktree (no taskkill).
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cleanup="$here/cleanup_worktree.sh"
+[ -f "$cleanup" ] || { echo "FATAL: cannot find $cleanup" >&2; exit 2; }
+
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+
+fail=0
+pass() { printf '  PASS: %s\n' "$1"; }
+die()  { printf '  FAIL: %s\n' "$1"; fail=1; }
+
+# wt_gone <path>: true if neither the dir nor a git registration remains.
+wt_gone() {
+  local p="$1"
+  [ -e "$p" ] && return 1
+  git -C "$scratch" worktree list --porcelain 2>/dev/null | grep -qx "worktree $p" && return 1
+  return 0
+}
+wt_present()      { ! wt_gone "$1"; }
+branch_exists()   { git -C "$scratch" show-ref --quiet "refs/heads/$1"; }
+# commit_reachable <sha> <ref>: true if <sha> is an ancestor of (reachable from) <ref>.
+commit_reachable() { git -C "$scratch" merge-base --is-ancestor "$1" "$2" 2>/dev/null; }
+
+run_cleanup() { ( cd "$scratch" && bash "$cleanup" "$@" >/dev/null 2>&1 ); }
+
+# ---- build scratch repo ----------------------------------------------------
+git init -q -b main "$scratch"
+git -C "$scratch" config user.email t@t.t
+git -C "$scratch" config user.name t
+wt() { echo "$scratch/.claude/worktrees/$1"; }
+
+cm() { # cm <file> <content> <msg>  (commit on current branch of scratch main repo)
+  printf '%s\n' "$2" > "$scratch/$1"
+  git -C "$scratch" add "$1"
+  git -C "$scratch" commit -q -m "$3"
+}
+
+cm base "0" "C0 base"
+C0="$(git -C "$scratch" rev-parse HEAD)"
+
+# .gitignore on main (so checked-out branches inherit it) for the gitignored-clean
+# scenarios. notes.md = a precious untracked deliverable; target/ + third_party/ =
+# regenerable trees the clean guard must NOT treat as blocking.
+printf 'notes.md\ntarget/\nthird_party/\n' > "$scratch/.gitignore"
+git -C "$scratch" add .gitignore
+git -C "$scratch" commit -q -m "add .gitignore"
+GI="$(git -C "$scratch" rev-parse HEAD)"
+
+# Scenario A "ancestor-merged": feature work merged into main via --no-ff; the
+# branch tip stays reachable from main, and main has since advanced. Expect: --all removes.
+git -C "$scratch" checkout -q -b featA "$C0"
+cm a "A1" "A1 feature work"
+git -C "$scratch" checkout -q main
+git -C "$scratch" merge -q --no-ff featA -m "merge featA"
+cm c2 "C2" "C2 later main work"   # advance main so featA tip != main HEAD
+
+# Scenario B "mergeflow-merged": THE FIX, replicating lucky/quizzical exactly.
+# featB's real work (B1) lands in main via --no-ff, main advances (C3), then featB
+# pulls main back in with --no-ff. featB's tip is thus a "merge main into featB"
+# commit that is NOT reachable from main (so the old --is-ancestor test skipped
+# it) yet has no UNIQUE non-merge commit (B1 is already in main) and adds no net
+# content. --no-ff is essential: a plain `git merge main` would fast-forward featB
+# onto main's tip, collapsing the scenario. Expect: --all removes.
+git -C "$scratch" checkout -q -b featB "$C0"
+cm b "B1" "B1 feature work"
+git -C "$scratch" checkout -q main
+git -C "$scratch" merge -q --no-ff featB -m "merge featB"
+cm c3 "C3" "C3 later main work"
+git -C "$scratch" checkout -q featB
+git -C "$scratch" merge -q --no-ff main -m "Merge branch 'main' into featB"  # tip = non-ff merge-of-main
+git -C "$scratch" checkout -q main
+
+# Scenario C "unmerged": featC has real new work never put into main. Expect: --all keeps.
+git -C "$scratch" checkout -q -b featC main
+cm u "U1" "U1 unmerged work"
+git -C "$scratch" checkout -q main
+
+# Scenario E "dirty-merged": content-merged (branch at an ancestor) but worktree
+# has an uncommitted TRACKED change. Expect: --all keeps (clean guard).
+git -C "$scratch" branch dirtyE "$GI"   # ancestor of main -> content-merged, tip != main HEAD
+
+# Scenario F "orphan": no common ancestor with main. Expect: --all keeps (no merge-base).
+git -C "$scratch" checkout -q --orphan orphanF
+git -C "$scratch" rm -q -rf . >/dev/null 2>&1 || true
+printf 'x\n' > "$scratch/orphan.txt"
+git -C "$scratch" add orphan.txt
+git -C "$scratch" commit -q -m "orphan root"
+git -C "$scratch" checkout -q main
+
+# Scenario G "netzero-revert": REGRESSION GUARD for the three-dot false-positive.
+# netG commits real work (big.rs) then reverts it; its tip TREE equals its
+# merge-base tree (net-zero) so a bare three-dot test would call it "merged" and
+# `branch -D` would orphan the work. But it has UNIQUE non-merge commits, so the
+# rev-list guard must keep it. Expect: --all KEEPS + the add-commit stays reachable.
+git -C "$scratch" checkout -q -b netG "$C0"
+cm big "BIG" "G add big.rs (real work)"
+G_ADD="$(git -C "$scratch" rev-parse HEAD)"
+git -C "$scratch" rm -q big
+git -C "$scratch" commit -q -m "G remove big.rs (shelve/revert)"
+git -C "$scratch" checkout -q main
+
+# Scenario H "squash-merged": single-commit feature squashed into main (distinct
+# SHA on main). featH's commit is unique by SHA so it is conservatively KEPT
+# (same as the old --is-ancestor); documents the deliberate false-negative.
+git -C "$scratch" checkout -q -b featH "$GI"
+cm s "S1" "S1 squashed work"
+git -C "$scratch" checkout -q main
+git -C "$scratch" merge -q --squash featH >/dev/null 2>&1
+git -C "$scratch" commit -q -m "squash featH into main"
+git -C "$scratch" checkout -q main
+
+# Scenarios I_notes / I_target: content-merged (ancestor) clean-of-tracked-changes
+# branches; difference is purely the gitignored content placed in the worktree.
+git -C "$scratch" branch ignNotes "$GI"
+git -C "$scratch" branch ignTarget "$GI"
+
+# Scenario L "locked": content-merged + clean, but git-locked. Expect: --all skips.
+git -C "$scratch" branch lockL "$GI"
+
+# Branch literally named "0", content-merged: makes the OLD tab-collapse bug
+# actually destructive for a detached worktree (it would read branch="0", find it
+# merged, and remove the detached tree). With the US delimiter the detached row's
+# branch field stays empty and the detached-HEAD guard fires. Presence alone arms
+# the regression; no worktree is materialized for it.
+git -C "$scratch" branch 0 main
+
+# Outside worktree (NOT under .claude/worktrees): only the location guard keeps it.
+git -C "$scratch" branch outsideBr "$GI"
+
+# Scenario D "fresh-at-head": branch == main HEAD. Created LAST, after every commit
+# to main, so its tip really is main HEAD. Expect: --all keeps (tip==main HEAD
+# gate), --name removes.
+git -C "$scratch" branch freshD main
+
+# ---- materialize worktrees -------------------------------------------------
+git -C "$scratch" worktree add -q "$(wt A)" featA
+git -C "$scratch" worktree add -q "$(wt B)" featB
+git -C "$scratch" worktree add -q "$(wt C)" featC
+git -C "$scratch" worktree add -q "$(wt D)" freshD
+git -C "$scratch" worktree add -q "$(wt E)" dirtyE
+git -C "$scratch" worktree add -q "$(wt F)" orphanF
+git -C "$scratch" worktree add -q "$(wt G)" netG
+git -C "$scratch" worktree add -q "$(wt H)" featH
+git -C "$scratch" worktree add -q "$(wt I_notes)" ignNotes
+git -C "$scratch" worktree add -q "$(wt I_target)" ignTarget
+git -C "$scratch" worktree add -q "$(wt L)" lockL
+git -C "$scratch" worktree add -q "$scratch/outside_dir" outsideBr
+git -C "$scratch" worktree add -q --detach "$(wt DET)" main
+
+printf 'dirty\n' >> "$(wt E)/base"                 # E: uncommitted TRACKED change
+printf 'precious notes\n' > "$(wt I_notes)/notes.md"   # I_notes: gitignored deliverable
+mkdir -p "$(wt I_target)/target"
+printf 'cache\n' > "$(wt I_target)/target/out.bin"     # I_target: regenerable ignored only
+printf 'det work\n' > "$(wt DET)/det.txt"              # DET: commit unique to detached HEAD
+git -C "$(wt DET)" add det.txt
+git -C "$(wt DET)" commit -q -m "detached unique work"
+git -C "$scratch" worktree lock "$(wt L)"
+
+# ---- act: make worktree-rm-merged (--all, non-force) -----------------------
+echo "== run: cleanup_worktree.sh --all =="
+run_cleanup --all
+
+wt_gone    "$(wt A)"  && pass "A ancestor-merged removed"            || die "A ancestor-merged NOT removed"
+! branch_exists featA && pass "A branch deleted"                     || die "A branch survived"
+wt_gone    "$(wt B)"  && pass "B mergeflow-merged removed (FIX)"     || die "B mergeflow-merged NOT removed (regression)"
+! branch_exists featB && pass "B branch deleted"                     || die "B branch survived"
+wt_present "$(wt C)"  && pass "C unmerged kept"                      || die "C unmerged WRONGLY removed (DATA LOSS)"
+branch_exists featC   && pass "C branch kept"                        || die "C branch wrongly deleted"
+wt_present "$(wt D)"  && pass "D fresh-at-head kept by --all"        || die "D fresh-at-head wrongly removed"
+wt_present "$(wt E)"  && pass "E dirty(tracked)-merged kept"         || die "E dirty-merged WRONGLY removed (DATA LOSS)"
+wt_present "$(wt F)"  && pass "F orphan kept"                        || die "F orphan WRONGLY removed (DATA LOSS)"
+wt_present "$(wt G)"  && pass "G netzero-revert kept (regression)"   || die "G netzero-revert WRONGLY removed (DATA LOSS)"
+{ branch_exists netG && commit_reachable "$G_ADD" netG; } \
+                      && pass "G unique commit still reachable"      || die "G unique commit ORPHANED (DATA LOSS)"
+wt_present "$(wt H)"  && pass "H squash-merged conservatively kept"  || die "H squash-merged WRONGLY removed"
+wt_present "$(wt I_notes)"  && pass "I_notes dirty-gitignored kept"  || die "I_notes WRONGLY removed (lost notes.md)"
+wt_gone    "$(wt I_target)" && pass "I_target (only target/) removed" || die "I_target NOT removed (regenerable ignored should not block)"
+wt_present "$(wt L)"  && pass "L locked kept"                        || die "L locked WRONGLY removed"
+
+# ---- remove_one guards via targeted modes ----------------------------------
+echo "== run: cleanup_worktree.sh --name C (unmerged, targeted) =="
+run_cleanup --name C
+wt_present "$(wt C)" && pass "C unmerged kept by --name (merge guard)" || die "C unmerged WRONGLY removed by --name (DATA LOSS)"
+branch_exists featC  && pass "C branch survives targeted --name"       || die "C branch wrongly -D'd by --name"
+
+echo "== run: cleanup_worktree.sh --path <outside .claude/worktrees> =="
+run_cleanup --path "$scratch/outside_dir"
+wt_present "$scratch/outside_dir" && pass "outside worktree kept (location guard)" || die "location guard BYPASSED (escaped .claude/worktrees)"
+branch_exists outsideBr           && pass "outside branch kept"                    || die "outside branch wrongly deleted"
+
+echo "== run: cleanup_worktree.sh --path <main worktree> =="
+run_cleanup --path "$scratch"
+[ -e "$scratch/base" ] && pass "main worktree refused" || die "DISASTER: cleanup deleted/entered the main worktree"
+
+echo "== run: cleanup_worktree.sh --path <detached worktree> =="
+run_cleanup --path "$(wt DET)"
+wt_present "$(wt DET)" && pass "detached worktree kept (detached-HEAD guard + US parse)" || die "detached worktree WRONGLY removed (DATA LOSS; tab-collapse regression?)"
+
+# ---- positive paths: --name and --force ------------------------------------
+echo "== run: cleanup_worktree.sh --name D =="
+run_cleanup --name D
+wt_gone "$(wt D)" && pass "D removed by --name"   || die "D NOT removed by --name"
+! branch_exists freshD && pass "D branch deleted" || die "D branch survived"
+
+echo "== run: cleanup_worktree.sh --name C --force (force bypasses merge guard) =="
+run_cleanup --name C --force
+wt_gone "$(wt C)" && pass "C removed by --force"  || die "C NOT removed by --force"
+! branch_exists featC && pass "C branch deleted by --force" || die "C branch survived --force"
+
+echo
+if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES PRESENT"; fi
+exit "$fail"
