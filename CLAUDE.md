@@ -29,16 +29,23 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ```
 
-### vendored FFmpeg（fresh machine / worktree で必須）
+### vendored FFmpeg（fresh machine / 手動 worktree で必須）
 
 - `third_party/ffmpeg`（BtbN n7.1 win64 LGPL shared）は **gitignore** で checkout には入らない。
-  fresh なマシン / worktree では **`make fetch-ffmpeg`** で取得する（idempotent。`make build` /
+  fresh なマシン（main checkout 自身）では **`make fetch-ffmpeg`** で取得する（idempotent。`make build` /
   `test` / `check` の前提条件にも入れてある。BtbN の asset 名変更に耐えるよう URL 固定でなく
   latest リリースの asset 一覧から n7.1 lgpl-shared を発見して DL する）。
+- **Claude Code の worktree（`--worktree` / EnterWorktree / subagent）は自動コピー**: リポジトリ直下の
+  `.worktreeinclude`（`/third_party/`）により、新 worktree 作成時に main checkout から ffmpeg が
+  **実コピー**される（junction ではない）。よって Claude が作る worktree では `make fetch-ffmpeg` は不要。
+  ただし `.worktreeinclude` は「main にある物を持ち込む」だけなので、main checkout 自身が未取得なら
+  先に `make fetch-ffmpeg` しておくこと。手動 `git worktree add` で作った worktree は `.worktreeinclude`
+  を経由しないので従来どおり `make fetch-ffmpeg` する。参考: https://code.claude.com/docs/en/worktrees
 - git に無いので **rm / `git worktree remove` で third_party junction を辿ると本体が消えて
   復元不能**になる（2026-06-14 に worktree 削除が内部の third_party junction を辿って本体を
-  削除した事故あり → `make fetch-ffmpeg` で復旧）。worktree を消す前に内部の reparse point を
-  `cmd //c rmdir <junction>` で外してから削除すること。
+  削除した事故あり → `make fetch-ffmpeg` で復旧）。**`.worktreeinclude` 経由は実コピーなのでこの
+  junction ハザードは無い**が、手動で junction を張った場合は worktree を消す前に内部の reparse
+  point を `cmd //c rmdir <junction>` で外してから削除すること。
 
 ### ビルドと検証の区別（重要）
 
