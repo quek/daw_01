@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 common = { path = "../common" }
 anyhow.workspace = true
-boa_engine = "0.21"
+boa_engine = { version = "0.21", optional = true }
 midir.workspace = true
 midly.workspace = true
 rfd.workspace = true
@@ -24,6 +24,14 @@ wgpu.workspace = true
 hound = "3.5"
 sha2 = "0.10"
 image.workspace = true
+
+[features]
+# `--script` headless テスト駆動 (src/script.rs) の JS エンジン boa_engine (単体
+# コンパイル ~112s = コールドビルド最大の単独コスト) を default ビルドから除外する。
+# 通常起動 / post-commit release / make release / fresh worktree は boa を一切
+# コンパイルしない。headless script テストを回すときだけ `--features script` を付ける:
+#   cargo run -p daw_gui --features script -- --script <path.js> [--output ...] [--arg K=V]
+script = ["dep:boa_engine"]
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

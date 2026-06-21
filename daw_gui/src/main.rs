@@ -17,6 +17,7 @@ use winit::window::{Icon, WindowAttributes};
 use daw_gui::app::{AppData, AppEvent};
 use daw_gui::bootstrap::{Bootstrap, bootstrap_subprocess};
 use daw_gui::dispatcher::{Win32JobDispatcher, WinitDispatcher};
+#[cfg(feature = "script")]
 use daw_gui::script::run_scripted;
 use daw_gui::view::runner::{RunnerInit, run as run_runner};
 
@@ -170,7 +171,21 @@ fn main() -> Result<()> {
 
     if let Some(script_path) = cli.script.as_ref() {
         tracing::info!(script = %script_path.display(), "headless script mode");
+        #[cfg(feature = "script")]
         return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra);
+        // boa_engine (JS エンジン) は default ビルドのコールド時間短縮のため除外している。
+        // --script を使う headless テストは `--features script` を付けてビルドすること。
+        #[cfg(not(feature = "script"))]
+        {
+            // output / extra は script モード専用。feature off では未使用なので明示的に
+            // 読んで dead_code を回避しつつ、bootstrap (子プロセス所有) を畳んでから返す。
+            let _ = (cli.output.as_ref(), cli.extra.len());
+            drop(bootstrap);
+            anyhow::bail!(
+                "--script requires building daw_gui with `--features script` \
+                 (the JS test driver / boa_engine is gated out of default builds to keep them fast)"
+            );
+        }
     }
 
     // `_singleton` は run_gui (= event loop) が返るまで保持し、 mutex を握り続ける。

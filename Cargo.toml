@@ -33,9 +33,13 @@ dirs = "5"
 hound = "3"
 # v13 image overlay (docs/plan_image_overlay.md §P2): PNG / JPEG / WebP
 # / BMP / TIFF / TGA / GIF (static) decode → `RgbaImage` buffer. Pure
-# Rust, no system deps. WebP and GIF decode are enabled by default
-# features.
-image = "0.25"
+# Rust, no system deps. import_image::is_supported_extension がこの 7 形式に
+# 限定する SSoT なので、default-features を切って同じ 7 つだけを明示有効化する。
+# これで未使用の avif (= ravif AVIF encoder、単体コンパイル ~28s) / exr / hdr /
+# qoi / ico / pnm / dds が依存ツリーから外れ、コールドビルドが縮む (moxcms は
+# image の hard dep なので残る)。arboard 経由の image エッジは bmp 等を独立に
+# 有効化しており avif を引かないので、この絞り込みは安全に効く。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "tga", "gif"] }
 cpal = "0.15"
 libloading = "0.8"
 midir = "0.10"
@@ -103,6 +107,15 @@ debug = true
 [profile.dev.package."*"]
 opt-level = 3            # 依存 crate は full 最適化
 
+# オーディオ経路の最適化は維持しつつ、ビルド時間だけを削る方針。
+# - opt-level=3 / lto="thin" は据え置き (runtime 性能を犠牲にしない)。
+# - codegen-units は 1 → 16 (= 非 incremental ビルドの既定値)。1 は crate 内のコード生成を
+#   単一スレッドに直列化し、daw_gui (~50k 行) / ui (~47k 行) の巨大 crate で 32 コアマシンの
+#   1 コアしか使えなくしていた (差分ビルドの最大ボトルネック)。lto="thin" 下では 1 の runtime
+#   寄与は限界的 (cross-crate inline は thin-LTO が担う) なので、並列化を取る。
+#   docs: https://doc.rust-lang.org/cargo/reference/profiles.html#codegen-units
+# 最大最適化の配布ビルドが要るときは codegen-units=1 + lto="fat" の別 profile を切ること。
 [profile.release]
+opt-level = 3
 lto = "thin"
-codegen-units = 1
+codegen-units = 16

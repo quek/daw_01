@@ -25,3 +25,13 @@
 [env]
 FFMPEG_LIBS_DIR = { value = "third_party/ffmpeg/lib", relative = true }
 FFMPEG_BINDING_PATH = { value = "daw_gui/ffmpeg/binding_ffmpeg_7.1.rs", relative = true }
+
+# リンカを MSVC link.exe → 同梱の LLD (rust-lld) に切り替える。最終リンク (特に LTO 有り) が
+# 大幅に速くなり、runtime コストはゼロ。rust-lld.exe は sysroot の
+# lib/rustlib/x86_64-pc-windows-msvc/bin/ に同梱されており、バイナリ名だけで解決される。
+# windows-msvc では rustc が COFF/MSVC フレーバを自動で渡すので -flavor link 等は不要。
+# (-Clinker-features=+lld は Rust 1.95 時点で linux-gnu 専用、windows-msvc は未対応 #71520)。
+# target 別セクションなので Linux ビルドには一切影響しない。
+# ref: https://github.com/bevyengine/bevy/blob/main/.cargo/config_fast_builds.toml
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
