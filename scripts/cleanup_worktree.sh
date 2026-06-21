@@ -19,7 +19,13 @@
 #   --path <path>       remove the worktree at <path>.
 #   --merged-tip <sha>  remove the worktree whose HEAD == <sha>. No-op if none.
 #   --all               remove EVERY worktree under .claude/worktrees whose branch
-#                       has its own commits and is fully merged into main.
+#                       is fully merged into main AND does not sit at main's
+#                       current tip. The "merged" test is `merge-base --is-ancestor
+#                       <branch> main`; for a merged branch that is ALWAYS equal to
+#                       its tip, so a "tip != merge-base" gate (the old logic) is
+#                       self-contradictory and matched nothing. We instead exclude
+#                       only `tip == main HEAD` (a fresh or fast-forward worktree we
+#                       cannot tell apart from active) -- target those with --name.
 # Safety (skipped only with --force):
 #   * target must live under <repo>/.claude/worktrees/ (never the main worktree).
 #   * branch must be fully merged into main (no unmerged work lost).
@@ -149,11 +155,11 @@ while IFS=$'\t' read -r p h b lk; do
   if [ "$o_all" -eq 1 ]; then
     case "$pn/" in "$wtroot_n"/*) : ;; *) continue;; esac
     [ -n "$b" ] || continue
-    mb="$(git -C "$repo" merge-base "$b" main 2>/dev/null || true)"
+    git -C "$repo" merge-base --is-ancestor "$b" main 2>/dev/null || continue  # fully merged
     tip="$(git -C "$repo" rev-parse "$b" 2>/dev/null || true)"
-    [ -n "$mb" ] && [ -n "$tip" ] || continue
-    [ "$mb" != "$tip" ] || continue                                   # no own work -> active/fresh, skip
-    git -C "$repo" merge-base --is-ancestor "$b" main 2>/dev/null || continue
+    mainhead="$(git -C "$repo" rev-parse main 2>/dev/null || true)"
+    [ -n "$tip" ] && [ -n "$mainhead" ] || continue
+    [ "$tip" != "$mainhead" ] || continue                            # at main HEAD -> fresh/ff, use --name
     matched=1; remove_one "$p" "$h" "$b" "$lk"
   elif [ -n "$o_tip" ]; then
     case "$pn/" in "$wtroot_n"/*) : ;; *) continue;; esac

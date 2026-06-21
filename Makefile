@@ -85,14 +85,27 @@ fmt:
 clean:
 	cargo clean
 
-# マージ済み worktree を安全に削除する (junction を辿って vendored ffmpeg を消す事故を防ぎ、
-# rust-analyzer / daw exe のロックを外し、git worktree 解除 + branch 削除まで一括)。
-# マージ時は .githooks が自動でこれを呼ぶ。手動で消したいときだけ使う。
+# cleanup_worktree.sh は「bash の絶対パス」+「script の絶対パス」で起動する。理由 (2026-06-21):
+#   素の cmd.exe では PATH 上の最初の `bash` が WSL の C:\Windows\System32\bash.exe に解決される
+#   (System PATH が User PATH の MSYS2 より先、Git は cmd\ に bash を持たない)。recipe を裸の
+#   `bash scripts/...` で書くと WSL bash が起動し、Linux FS 上で相対パスも /f/... も解決できず
+#   "/bin/bash: scripts/cleanup_worktree.sh: No such file" (Error 127) で落ちる。
+#   そこで PATH 経由の語 `bash` を使わず、make 自身の runtime が解決する実 bash を絶対パスで指す
+#   ($(BASH))。Windows では MSYS2 の bash、Linux では system bash (/usr/bin/bash) になる。script は bash 必須
+#   (BASH_SOURCE + `< <(...)` プロセス置換)。script は ARG で渡す (PATH/shebang 経由でないので
+#   ここでも WSL に逸れない)。CURDIR は make 自身の cwd で常に正しいので絶対パス化に使う。
+# 削除は明示・手動のみ。git hook には決して繋がない ([[feedback_no_auto_worktree_delete]]、
+# script ヘッダの "deliberately NOT wired into a git hook" 参照)。
+BASH := /usr/bin/bash
+CLEANUP_WT := $(CURDIR)/scripts/cleanup_worktree.sh
+
+# マージ済み worktree を安全に削除する (vendored ffmpeg を巻き込まず、rust-analyzer /
+# daw exe のロックを外し、git worktree 解除 + branch 削除まで一括)。手動で消したいときだけ使う。
 # 使い方: make worktree-rm NAME=fixme-64-...   (未マージ/dirty は拒否。FORCE=1 で強制)
 worktree-rm:
 	@[ -n "$(NAME)" ] || { echo "usage: make worktree-rm NAME=<worktree-name> [FORCE=1]"; exit 1; }
-	bash scripts/cleanup_worktree.sh --name "$(NAME)" $(if $(FORCE),--force,)
+	$(BASH) "$(CLEANUP_WT)" --name "$(NAME)" $(if $(FORCE),--force,)
 
-# マージ済み (自分の commit が全部 main に入っている) worktree を全部削除する。
+# マージ済み (merge commit 経由で main に入り、tip != main HEAD) worktree を全部削除する。
 worktree-rm-merged:
-	bash scripts/cleanup_worktree.sh --all
+	$(BASH) "$(CLEANUP_WT)" --all
