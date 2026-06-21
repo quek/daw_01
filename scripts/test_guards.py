@@ -65,9 +65,12 @@ def _sandbox_env(home):
     return env
 
 
-def run_engine(tool_name, tool_input, home=None):
-    payload = json.dumps({"session_id": "TEST_SESSION", "tool_name": tool_name,
-                          "tool_input": tool_input})
+def run_engine(tool_name, tool_input, home=None, cwd=None):
+    payload_obj = {"session_id": "TEST_SESSION", "tool_name": tool_name,
+                   "tool_input": tool_input}
+    if cwd is not None:
+        payload_obj["cwd"] = cwd
+    payload = json.dumps(payload_obj)
     p = subprocess.run([sys.executable, ENGINE], input=payload.encode("utf-8"),
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                        env=_sandbox_env(home or _sandbox))
@@ -111,7 +114,8 @@ def check_registry():
                 bad("registry:%s-has-all" % rid, "missing 'all'")
             if r.get("action") not in ("warn", "block"):
                 bad("registry:%s-action" % rid, "action=%r" % r.get("action"))
-            if r.get("field") not in ("command", "command_code", "text", "file_path", "ask_options", None):
+            if r.get("field") not in ("command", "command_code", "text", "file_path",
+                                      "ask_options", "worktree_outside", "ask_multi", None):
                 bad("registry:%s-field" % rid, "field=%r" % r.get("field"))
             pats = []
             for key in ("all", "none"):
@@ -213,6 +217,16 @@ CASES = [
          {"label": "per-user global", "description": "コンテンツアドレスで跨ぎ再利用。"},
          {"label": "per-project", "description": "プロジェクトに自己完結。"}]}]},
      0, set(), {"compromise-smell-ask"}),
+    # one-question-at-a-time (ask_multi: >1 question fires; neutral text so smell stays silent)
+    ("askmulti/pos", "AskUserQuestion",
+     {"questions": [
+         {"question": "保存先は？", "header": "保存", "options": [{"label": "global", "description": "跨ぎ再利用。"}]},
+         {"question": "命名規則は？", "header": "命名", "options": [{"label": "slug", "description": "安定 ID。"}]}]},
+     0, {"one-question-at-a-time"}, set()),
+    ("askmulti/neg-single", "AskUserQuestion",
+     {"questions": [
+         {"question": "保存先は？", "header": "保存", "options": [{"label": "global", "description": "跨ぎ再利用。"}]}]},
+     0, set(), {"one-question-at-a-time"}),
     # confirm-before-commit
     ("commit/pos", "Bash", {"command": "git commit -m 'x'"}, 0, {"confirm-before-commit"}, set()),
     ("commit/neg", "Bash", {"command": "git status"}, 0, set(), {"confirm-before-commit"}),
@@ -471,10 +485,45 @@ def check_escalation():
     shutil.rmtree(sb3, ignore_errors=True)
 
 
+# ------------------------------------------------- worktree-path-discipline (cwd)
+def check_worktree_guard():
+    """worktree-path-discipline is a cwd-relational guard, so cases must pass cwd."""
+    WT = "F:/dev/daw_01/.claude/worktrees/foo"
+    MAIN = "F:/dev/daw_01"
+    # (label, file_path, cwd, expect_exit, should_fire)
+    WCASES = [
+        ("wtpath/pos-main", "F:/dev/daw_01/src/x.rs", WT, 2, True),
+        ("wtpath/pos-backslash", "F:\\dev\\daw_01\\daw_gui\\src\\app.rs", WT, 2, True),
+        ("wtpath/pos-sibling", "F:/dev/daw_01/.claude/worktrees/bar/x.rs", WT, 2, True),
+        ("wtpath/neg-own-worktree", "F:/dev/daw_01/.claude/worktrees/foo/src/x.rs", WT, 0, False),
+        ("wtpath/neg-memory-outside-repo",
+         "C:/Users/x/.claude/projects/F--dev-daw-01/memory/feedback_x.md", WT, 0, False),
+        ("wtpath/neg-relative", "src/x.rs", WT, 0, False),
+        ("wtpath/neg-main-session", "F:/dev/daw_01/src/x.rs", MAIN, 0, False),
+        ("wtpath/neg-no-cwd", "F:/dev/daw_01/src/x.rs", None, 0, False),
+    ]
+    for label, fp, cwd, exp_exit, should in WCASES:
+        rc, out = run_engine("Write", {"file_path": fp, "content": "x"}, cwd=cwd)
+        f = fired_ids(out)
+        problems = []
+        if rc != exp_exit:
+            problems.append("exit=%d want %d" % (rc, exp_exit))
+        fired = "worktree-path-discipline" in f
+        if should and not fired:
+            problems.append("expected fire")
+        if not should and fired:
+            problems.append("unexpected fire")
+        if problems:
+            bad("wtguard:%s" % label, "; ".join(problems) + " | fired=%s" % sorted(f))
+        else:
+            ok("wtguard:%s" % label)
+
+
 def main():
     check_registry()
     check_engine()
     check_engine_robustness()
+    check_worktree_guard()
     check_destruct()
     check_escalation()
     shutil.rmtree(_sandbox, ignore_errors=True)

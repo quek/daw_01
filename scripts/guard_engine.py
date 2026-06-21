@@ -29,8 +29,11 @@ metrics/backlog (no git churn, no merge conflict). Each rule:
     source    feedback memory slug it enforces (link back = single source of truth)
     tool      tool name or list ("Bash","Edit","Write","MultiEdit","PowerShell");
               "*" = any tool
-    field     which tool_input to scan: "command" | "text" (Edit/Write/MultiEdit
-              new content) | "file_path"
+    field     which tool_input to scan: "command" | "command_code" (shell literals
+              masked) | "text" (Edit/Write/MultiEdit new content) | "file_path" |
+              "ask_options" (AskUserQuestion question+option text) | "worktree_outside"
+              / "ask_multi" (cwd-aware LOGIC fields computed in code; rule supplies
+              only action/msg, see the cwd-aware block in main())
     file_glob optional fnmatch glob on tool_input.file_path (forward-slash
               normalized); rule skipped if it does not match
     all       list of regex; ALL must match the field text for the rule to fire
@@ -170,6 +173,30 @@ def main():
     else:
         edit_text = ""
 
+    # --- cwd-aware LOGIC fields (relation between session CWD and the target) ---
+    # The hook payload carries `cwd` (verified present in Claude Code). These fields
+    # encode a relational check that a single-field regex cannot: the rule row in
+    # guards.jsonl only supplies action/msg/source, the logic lives here (CLAUDE.md:
+    # "pattern guard は data、logic guard は code").
+    cwd_norm = str(data.get("cwd") or "").replace("\\", "/")
+    # worktree path discipline: when CWD is inside a worktree, an ABSOLUTE-path file
+    # op under the repo root but OUTSIDE this worktree (= the main checkout or a
+    # sibling worktree) is the cross-agent contention hazard. Paths outside the repo
+    # (user-dir memory / guards.jsonl etc.) and relative paths (resolve under the
+    # worktree) are NOT flagged. Comparison is case-insensitive (Windows paths).
+    worktree_outside = ""
+    mwt = re.match(r"^(.*?)/\.claude/worktrees/[^/]+", cwd_norm)
+    if mwt and file_path and os.path.isabs(file_path):
+        repo_l = mwt.group(1).lower()
+        wt_l = mwt.group(0).lower()
+        fpl = file_path_norm.lower()
+        if (fpl == repo_l or fpl.startswith(repo_l + "/")) and \
+           not (fpl == wt_l or fpl.startswith(wt_l + "/")):
+            worktree_outside = file_path_norm
+    # AskUserQuestion batching: more than one question asked at once.
+    _qs = tool_input.get("questions")
+    ask_multi = "multi" if isinstance(_qs, list) and len([q for q in _qs if isinstance(q, dict)]) > 1 else ""
+
     fired = []
     try:
         with open(guard_file, "r", encoding="utf-8") as fh:
@@ -200,6 +227,10 @@ def main():
             text = _mask_shell_literals(command)
         elif field == "file_path":
             text = file_path
+        elif field == "worktree_outside":
+            text = worktree_outside
+        elif field == "ask_multi":
+            text = ask_multi
         elif field == "ask_options":
             # AskUserQuestion の質問文 + 全選択肢の label / description を 1 文字列に
             # 連結して scan する。 「妥協案を user の選択肢として出す」 瞬間を
