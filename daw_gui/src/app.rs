@@ -440,7 +440,8 @@ pub enum ModSourceEdit {
     Retrigger(common::model::RetriggerMode),
     LfoShape(common::model::LfoShape),
     LfoPhase(f32),
-    RandomMode(common::model::RandomMode),
+    /// Bitwig 流 Stepped↔Smoothed 連続モーフ (0..=1)。
+    RandomSmooth(f32),
     /// 乱数列を引き直す (seed を派生更新)。
     RerollSeed,
     MsegPlayMode(common::model::MsegPlayMode),
@@ -1743,6 +1744,11 @@ pub struct AppData {
     /// depth on the control's target. `None` ⇒ controls show existing routings
     /// (entries + live tick) but aren't editable. session-only (not persisted).
     pub armed_mod_source: Option<u32>,
+    /// FIXME #56: the set of `ModSource`s whose inspector row is **expanded** to its
+    /// full Bitwig 風グラフィカルエディタ (MSEG curve canvas / Steps grid / LFO·Random
+    /// preview + 全コントロール). **Multi-expand** — 複数同時に開ける (Bitwig 同様)。
+    /// chevron クリックで toggle。 session-only (not persisted)。
+    pub expanded_mod_sources: std::collections::HashSet<u32>,
     /// The `(track_id, target)` whose per-control modulation depth drag is in
     /// progress (gui_01 `mod_dragging`), or `None`. Keyed by **track + target**
     /// (not target alone) because the mixer draws the same target — e.g.
@@ -2211,6 +2217,7 @@ impl AppData {
             inspector_scrub_active: None,
             mod_follower_scrub_active: false,
             armed_mod_source: None,
+            expanded_mod_sources: std::collections::HashSet::new(),
             mod_depth_scrub_active: None,
             export_stage: None,
             export_progress_at: None,
@@ -17518,10 +17525,11 @@ impl AppData {
                 }
                 scrub = true;
             }
-            ModSourceEdit::RandomMode(mode) => {
+            ModSourceEdit::RandomSmooth(s) => {
                 if let ModSourceKind::Random(c) = &mut m.kind {
-                    c.mode = mode;
+                    c.smooth = s.clamp(0.0, 1.0);
                 }
+                scrub = true;
             }
             ModSourceEdit::RerollSeed => {
                 if let ModSourceKind::Random(c) = &mut m.kind {

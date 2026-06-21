@@ -20,6 +20,7 @@ pub mod level_meter;
 pub mod list_view;
 pub mod menu;
 pub mod modal;
+pub mod modulator_editor;
 pub mod panel;
 pub mod piano_roll;
 pub mod playhead;
