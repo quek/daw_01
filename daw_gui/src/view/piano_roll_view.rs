@@ -338,6 +338,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.pianoroll_hover_beat_song_raw = hover_beat_song_raw;
         }));
     }
+    // FIXME #80: q キー (選択が無ければカーソル直下 note を mute) 用に、ポインタ直下の
+    // note index (= clip 内 notes Vec の index、`selected_notes` と同空間) を毎フレーム mirror。
+    // grid 外 / note 外は None。widget の `note_hit` を流用して drag hit-test と同じ判定にする。
+    let hover_note: Option<u32> = ui.pointer().pos.and_then(|(px, py)| {
+        note_hit(&widget_notes, view, grid_rect, px, py, resize_handle_px).map(|(id, _)| id)
+    });
+    if app.pianoroll_hover_note != hover_note {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.pianoroll_hover_note = hover_note;
+        }));
+    }
 
     // 空白上 dbl-click → AddNote (snap_choice / Alt 押下を尊重)。
     if let Some((px, py)) = ui.take_double_click_in_rect(grid_rect)
@@ -544,6 +555,8 @@ fn build_widget_notes(app: &AppData, target: ClipRef) -> Vec<Note> {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map(Arc::from),
+            // FIXME #80: note mute (dim + 斜線ハッチ表示)。`Note.muted` をそのまま渡す。
+            muted: n.muted,
         })
         .collect()
 }

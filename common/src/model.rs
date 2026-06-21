@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 use crate::plugin_format::PluginFormat;
 use crate::scale::ScaleChange;
 
+/// `27` クリップ / ノートのミュート (FIXME #80): `Clip.muted: bool` (= 全 content type
+/// 共通の clip-level mute の SSoT) と `Note.muted: bool` (note 単位 mute) が追加される。
+/// `true` の clip / note は再生 / 書き出しから除外され、GUI は dim + 斜線ハッチで表示する。
+/// `q` ショートカットと inspector の "Mute" トグルが SSoT としてここを読み書きする。v26
+/// 以前は per-event mute (`AudioEvent`/`ImageEvent`/`VideoEvent`/`TextEvent` の `muted`) で
+/// clip mute を表現していたので、load 時に `project::migrate_per_event_mute_to_clip_mute` が
+/// 「event が muted な clip」を `Clip.muted = true` へ畳み込み、event 側を false に戻す
+/// (version-gate)。両 field とも `#[serde(default)]` で v26 以前は `false` に forward-migrate。
+///
 /// `26` 字幕デバイスゲート + VOICEVOX トーク (`docs/plan_voicevox_talk.md`):
 /// `Clip.talk: Option<TalkParams>` 追加 (= 読み上げ全体スケール、`#[serde(default)]`)。
 /// テキストオーバーレイ表示が `builtin.video.subtitle` device の有無で gate される
@@ -149,7 +158,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 26;
+pub const CURRENT_VERSION: u32 = 27;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -3120,6 +3129,16 @@ pub struct Clip {
     /// v20 files forward-migrate to `false`。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_lipsync: bool,
+    /// (FIXME #80) clip 全体のミュート (= MIDI / audio / video / image / 字幕 / 歌唱
+    /// すべての content type 共通の clip-level mute の SSoT)。`true` で再生・書き出しから
+    /// この clip を除外し、GUI は dim + 斜線ハッチで「ミュート中」を表示する。`q`
+    /// ショートカット (選択 clip / カーソル直下 clip を toggle) と各 content inspector の
+    /// "Mute" トグルがここを唯一の source として読み書きする。`Track.muted` とは独立で、
+    /// 再生時は `track.muted || clip.muted` で合成される。v26 以前の per-event mute は
+    /// `project::migrate_per_event_mute_to_clip_mute` で本フラグへ畳み込まれる。v26 以前は
+    /// `false` に forward-migrate。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
     /// (FIXME #36) この clip の VOICEVOX 歌唱声 = `/frame_synthesis` の speaker
     /// (= `/singers` の歌唱 style id)。clip 単位で独立・焼き込み (前の clip の
     /// 声を後で変えても後続に波及しない)。`0` = 未採番 (= 合成時に
@@ -3992,6 +4011,13 @@ pub struct Note {
     pub velocity: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lyric: Option<String>,
+    /// (FIXME #80) note 単位のミュート。`true` でこの note を再生・書き出しから除外し
+    /// (歌唱 note も含む)、piano roll は dim + 斜線ハッチで「ミュート中」を表示する。`q`
+    /// ショートカット (選択 note / カーソル直下 note を toggle) が読み書きする。linked clip は
+    /// content (= notes) を共有するので、note mute も linked clip 間で共有される。v26 以前は
+    /// `false` に forward-migrate。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
 }
 
 // =============================================================================
@@ -4614,8 +4640,8 @@ mod tests {
             cid,
             ClipContent::Midi(MidiContent {
                 notes: vec![
-                    Note { start_beat: 0.0, duration_beats: 1.0, pitch: 60, velocity: 100, lyric: None },
-                    Note { start_beat: 3.0, duration_beats: 1.0, pitch: 62, velocity: 100, lyric: None },
+                    Note { start_beat: 0.0, duration_beats: 1.0, pitch: 60, velocity: 100, lyric: None, muted: false },
+                    Note { start_beat: 3.0, duration_beats: 1.0, pitch: 62, velocity: 100, lyric: None, muted: false },
                 ],
             }),
         );
@@ -5231,6 +5257,7 @@ mod tests {
             pitch: 60,
             velocity: 100,
             lyric: Some("こ".into()),
+            muted: false,
         };
         assert_eq!(
             serde_json::to_string(&note).unwrap(),
@@ -5258,6 +5285,7 @@ mod tests {
                             pitch: 60,
                             velocity: 100,
                             lyric: Some("こ".into()),
+                            muted: false,
                         },
                         Note {
                             start_beat: 1.5,
@@ -5265,10 +5293,12 @@ mod tests {
                             pitch: 62,
                             velocity: 100,
                             lyric: Some("ん".into()),
+                            muted: false,
                         },
                     ],
                     color: None,
                     auto_lipsync: false,
+                    muted: false,
                     speaker_id: 3061,
                     singer_name: "中国うさぎ".into(),
                     style_name: "ノーマル".into(),
@@ -5299,7 +5329,9 @@ mod tests {
         // v26 (`docs/plan_voicevox_talk.md`): `Clip.talk` 追加 + テキストオーバーレイ表示が
         // `builtin.video.subtitle` device gate になり、v25 以前は load 時に Text 持ち
         // トラックへ字幕デバイスを auto-insert (`project::migrate_text_overlay_to_subtitle_device`)。
-        assert_eq!(CURRENT_VERSION, 26);
+        // v27 (FIXME #80): `Clip.muted` / `Note.muted` 追加 (clip / note mute の SSoT)、v26 以前の
+        // per-event mute は `project::migrate_per_event_mute_to_clip_mute` で `Clip.muted` へ畳み込む。
+        assert_eq!(CURRENT_VERSION, 27);
     }
 
     #[test]

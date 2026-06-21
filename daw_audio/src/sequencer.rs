@@ -142,6 +142,13 @@ pub fn collect_events_for_buffer(
             .unwrap_or(&[]);
         let clip_note_count = notes.len() as u32;
 
+        // FIXME #80: muted clip は全 note を skip (note_id 通し番号は維持して
+        // builtin VOICEVOX 側の note_id 対応がずれないよう base は加算する)。
+        if clip.muted {
+            note_id_base += clip_note_count;
+            continue;
+        }
+
         if clip.length_beats <= 0.0 {
             note_id_base += clip_note_count;
             continue;
@@ -157,6 +164,11 @@ pub fn collect_events_for_buffer(
 
         for (note_idx, note) in notes.iter().enumerate() {
             let note_id = note_id_base + note_idx as u32;
+            // FIXME #80: muted note は On/Off を一切 emit しない (On を出さないので
+            // stuck note にならない)。note_id 通し番号は enumerate で維持される。
+            if note.muted {
+                continue;
+            }
             if note.duration_beats <= 0.0 {
                 continue;
             }
@@ -239,6 +251,10 @@ pub fn collect_events_for_buffer(
     // 通し index) と event_id (= high band) は衝突しない。
     if track.is_voicevox_vocal() {
         for clip in &track.clips {
+            // FIXME #80: muted な Text(読み上げ) clip は talk note_on を発火しない。
+            if clip.muted {
+                continue;
+            }
             let Some(events) = song
                 .clip_contents
                 .get(&clip.content_id)
@@ -321,6 +337,7 @@ mod tests {
                     pitch,
                     velocity: 100,
                     lyric: None,
+                    muted: false,
                 }],
             }),
         );
@@ -365,6 +382,76 @@ mod tests {
         assert_eq!(out[0].time, 0);
         assert!(matches!(out[0].event, NoteTransition::On { key: 60, .. }));
         assert_eq!(active, vec![60]);
+    }
+
+    /// FIXME #80: muted clip は note イベントを 1 つも emit しない。
+    #[test]
+    fn muted_clip_emits_no_note_events() {
+        let mut song = one_note_song(0.0, 1.0, 60);
+        song.tracks[0].clips[0].muted = true;
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            0.0,
+            120.0,
+            1024,
+            &mut out,
+            &mut active,
+        );
+        assert!(out.is_empty(), "muted clip must emit no events");
+        assert!(active.is_empty());
+    }
+
+    /// FIXME #80: muted note を skip しても、 同 clip 内の sibling note の `note_id`
+    /// (= enumerate 通し index) はずれない (builtin VOICEVOX の note_id ↔ 合成 wav
+    /// frame offset 対応を壊さないための不変条件)。
+    #[test]
+    fn muted_note_skipped_but_sibling_keeps_running_note_id() {
+        let mut song = one_note_song(0.0, 1.0, 60);
+        let cid = song.tracks[0].clips[0].content_id;
+        if let Some(ClipContent::Midi(m)) = song.clip_contents.get_mut(&cid) {
+            // idx 0 = mute、 idx 1 = 鳴る (pitch 64)。
+            m.notes[0].muted = true;
+            m.notes.push(Note {
+                start_beat: 0.0,
+                duration_beats: 1.0,
+                pitch: 64,
+                velocity: 100,
+                lyric: None,
+                muted: false,
+            });
+        }
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(
+            Some(&song),
+            0,
+            SR,
+            0.0,
+            120.0,
+            1024,
+            &mut out,
+            &mut active,
+        );
+        let ons: Vec<_> = out
+            .iter()
+            .filter(|e| matches!(e.event, NoteTransition::On { .. }))
+            .collect();
+        assert_eq!(ons.len(), 1, "only the unmuted sibling emits On");
+        match ons[0].event {
+            NoteTransition::On { note_id, key, .. } => {
+                assert_eq!(key, 64);
+                assert_eq!(
+                    note_id, 1,
+                    "unmuted sibling keeps running note_id = enumerate index 1"
+                );
+            }
+            NoteTransition::Off { .. } => unreachable!(),
+        }
+        assert_eq!(active, vec![64]);
     }
 
     #[test]
@@ -427,6 +514,7 @@ mod tests {
                 pitch: 64,
                 velocity: 100,
                 lyric: None,
+                muted: false,
             });
         let mut out = Vec::new();
         let mut active = Vec::new();
@@ -549,6 +637,7 @@ mod tests {
                         pitch: 60,
                         velocity: 100,
                         lyric: None,
+                        muted: false,
                     },
                     Note {
                         start_beat: 1.0,
@@ -556,6 +645,7 @@ mod tests {
                         pitch: 60,
                         velocity: 100,
                         lyric: None,
+                        muted: false,
                     },
                 ],
             }),

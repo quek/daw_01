@@ -650,6 +650,7 @@ impl BuiltinNoteSpec {
             } else {
                 Some(self.lyric.clone())
             },
+            muted: false,
         }
     }
 }
@@ -789,6 +790,7 @@ mod tests {
                 pitch: 60,
                 velocity: 100,
                 lyric: Some("ら".into()),
+                muted: false,
             }],
             color: None,
             auto_lipsync: false,
@@ -818,6 +820,7 @@ mod tests {
                     pitch: 60,
                     velocity: 100,
                     lyric: Some("こ".into()),
+                    muted: false,
                 },
                 Note {
                     start_beat: 2.0,
@@ -825,6 +828,7 @@ mod tests {
                     pitch: 62,
                     velocity: 100,
                     lyric: Some("ん".into()),
+                    muted: false,
                 },
             ],
             color: None,
@@ -861,6 +865,7 @@ mod tests {
                     pitch: 60,
                     velocity: 100,
                     lyric: Some("こ".into()),
+                    muted: false,
                 },
                 Note {
                     start_beat: 1.0,
@@ -868,6 +873,7 @@ mod tests {
                     pitch: 62,
                     velocity: 100,
                     lyric: Some("ん".into()),
+                    muted: false,
                 },
             ],
             color: None,
@@ -896,6 +902,7 @@ mod tests {
                 pitch: 60,
                 velocity: 100,
                 lyric: Some("\"a\"".into()),
+                muted: false,
             }],
             color: None,
             auto_lipsync: false,
@@ -921,6 +928,7 @@ mod tests {
                     pitch: 64,
                     velocity: 100,
                     lyric: Some("に".into()),
+                    muted: false,
                 },
                 Note {
                     start_beat: 0.0,
@@ -928,6 +936,7 @@ mod tests {
                     pitch: 60,
                     velocity: 100,
                     lyric: Some("こ".into()),
+                    muted: false,
                 },
             ],
             color: None,

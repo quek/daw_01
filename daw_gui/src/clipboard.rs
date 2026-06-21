@@ -59,6 +59,10 @@ pub struct ClipCopy {
     pub length_beats: f64,
     pub color: Option<[f32; 3]>,
     pub auto_lipsync: bool,
+    /// (FIXME #80) clip-level mute。 paste 先 clip へ引き継ぐ。 旧 clipboard JSON
+    /// との互換のため serde default (`false`)。
+    #[serde(default)]
+    pub muted: bool,
     /// source プロジェクトでの content_id (同一プロジェクト paste でリンク共有)。
     pub content_id: ContentId,
     /// content payload (別プロジェクト paste で独立復元)。
@@ -293,6 +297,7 @@ mod tests {
             pitch,
             velocity: vel,
             lyric: None,
+            muted: false,
         }
     }
 
@@ -348,6 +353,7 @@ mod tests {
             length_beats: len,
             color: None,
             auto_lipsync: false,
+            muted: false,
             content_id: 0 as ContentId,
             content: ClipContent::default(),
             name: None,

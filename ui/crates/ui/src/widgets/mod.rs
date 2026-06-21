@@ -36,6 +36,54 @@ pub mod waveform;
 
 use std::any::Any;
 
+use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
+
+use crate::widgets::heavy::HeavyCtx;
+
+/// (FIXME #80 / daw_01) muted な clip / note の塗り色。fill の alpha を落として lane 背景を
+/// 透過させ、暗く沈める (REAPER / Ableton 流)。clip rect / note rect 共通で使う。
+#[must_use]
+pub(crate) fn muted_dim_fill(c: Color) -> Color {
+    Color { a: c.a * 0.42, ..c }
+}
+
+/// (FIXME #80 / daw_01) muted な矩形に 45°(`╱`) の斜線ハッチを重ねる。線は rect の上下端を
+/// 結ぶ平行線群 (`x + y = const`) を `spacing_px` 間隔で生成し、`scissor` で rect 内だけに
+/// clip する (x が rect 外に伸びても scissor が切る)。clip / note 共通。
+pub(crate) fn push_muted_hatch<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    rect: Rect,
+    scissor: Rect,
+    color: Color,
+    spacing_px: f32,
+    width_px: f32,
+) {
+    if rect.w <= 1.0 || rect.h <= 1.0 || spacing_px <= 0.0 {
+        return;
+    }
+    let bottom = rect.y + rect.h;
+    let lo = rect.x + rect.y;
+    let hi = (rect.x + rect.w) + bottom;
+    let mut segments: Vec<LineSegment> = Vec::new();
+    let mut k = lo;
+    while k <= hi {
+        segments.push(LineSegment {
+            a: [k - rect.y, rect.y],
+            b: [k - bottom, bottom],
+            color,
+        });
+        k += spacing_px;
+    }
+    if segments.is_empty() {
+        return;
+    }
+    hctx.push_lines(LineBatch {
+        segments: segments.into(),
+        line_width_px: width_px,
+        clip_rect: Some(scissor),
+    });
+}
+
 /// ウィジェット永続状態の共通インタフェース (`Box<dyn WidgetState>` で保持するため)。
 pub trait WidgetState: Any + Send + Sync {
     fn as_any_mut(&mut self) -> &mut dyn Any;

@@ -31,6 +31,7 @@ use crate::time::{TimeDisplay, TimeMapping};
 use crate::ui::Ui;
 use crate::viewport::ViewportState1D;
 use crate::widgets::heavy::HeavyCtx;
+use crate::widgets::{muted_dim_fill, push_muted_hatch};
 use crate::widgets::playhead::draw_playhead_line;
 use crate::widgets::ruler_ops::{
     LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
@@ -165,6 +166,11 @@ pub struct ArrangementClip {
     /// hover 由来で毎フレーム変わるため widget は viewport_key (cache key) には含めず、 cached 外の
     /// overlay で毎フレーム描画する (selection overlay と同 idiom)。
     pub in_active_group: bool,
+    /// FIXME #80 (daw_01): clip がミュート中なら `true`。 widget は fill alpha を落として
+    /// 暗く沈め (`muted_dim_fill`)、 45° の斜線ハッチを重ねて「再生されない」 を示す
+    /// (REAPER / Ableton 流)。 caller (daw_01) は `Clip.muted` をそのまま渡す。
+    /// `false` のとき描画は既存と完全一致。
+    pub muted: bool,
 }
 
 /// 1 つの track。`clips` は `start_beat` 昇順前提。
@@ -1056,6 +1062,12 @@ pub struct ArrangementStyle {
     pub clip_border: Color,
     pub clip_border_w: f32,
     pub clip_radius: f32,
+    /// FIXME #80 (daw_01): muted clip に重ねる斜線ハッチの色 (半透明)。default は暗い
+    /// 半透明黒 `rgba(0,0,0,0.34)`。`ArrangementClip.muted == true` のときのみ描画。
+    pub clip_muted_hatch_color: Color,
+    /// FIXME #80 (daw_01): muted ハッチ線の間隔 (px、default 7.0) と線幅 (px、default 1.5)。
+    pub clip_muted_hatch_spacing_px: f32,
+    pub clip_muted_hatch_width_px: f32,
     /// FIXME #73: clip / automation point の **drag ゴースト** (drag 中の半透明
     /// プレビュー) のハイライト塗り色。 かつては選択中 clip 本体の fill にも使って
     /// いたが、 黄色など同系色の clip だと「選択 = 黄塗り」 が clip 本来の色と衝突して
@@ -1351,6 +1363,9 @@ impl Default for ArrangementStyle {
             clip_border: Color::rgb(0.30, 0.55, 0.78),
             clip_border_w: 1.0,
             clip_radius: 3.0,
+            clip_muted_hatch_color: Color::rgba(0.0, 0.0, 0.0, 0.34),
+            clip_muted_hatch_spacing_px: 7.0,
+            clip_muted_hatch_width_px: 1.5,
             clip_selected_fill: Color::rgb(1.0, 0.85, 0.30),
             clip_selected_border: Color::rgb(1.0, 1.0, 1.0),
             // FIXME #73: 選択リング内側の暗線。 明るい fill (黄 / 白) でも枠が見える。
@@ -3485,7 +3500,9 @@ fn draw_video_clip<M: ?Sized + 'static>(
     // FIXME #73: fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
     // `push_selection_ring` の 2 重リングで示し、 選択時は本体 border を消して
     // リングへ一本化する (黄 clip でも選択が判別できる)。
-    let fill = clip.color.unwrap_or(style.video_clip_loading);
+    let base_fill = clip.color.unwrap_or(style.video_clip_loading);
+    // FIXME #80 (daw_01): muted video clip も fill を暗く沈める。
+    let fill = if clip.muted { muted_dim_fill(base_fill) } else { base_fill };
     let (border, border_w) = if selected {
         (Color::TRANSPARENT, 0.0)
     } else {
@@ -3515,6 +3532,17 @@ fn draw_video_clip<M: ?Sized + 'static>(
             rotation_radians: 0.0,
             rotation_pivot: None,
         });
+    }
+    // FIXME #80 (daw_01): muted は thumbnail の上に斜線ハッチを重ねる (label の下)。
+    if clip.muted {
+        push_muted_hatch(
+            hctx,
+            r,
+            r.intersect(lanes),
+            style.clip_muted_hatch_color,
+            style.clip_muted_hatch_spacing_px,
+            style.clip_muted_hatch_width_px,
+        );
     }
     // name + (share clip なら) link glyph。 thumbnail の **後** に描くので texture の上に乗る。
     draw_clip_label(hctx, r, &clip.name, has_link, text_color, style);
@@ -3551,7 +3579,9 @@ fn draw_clip<M: ?Sized + 'static>(
     // FIXME #73: fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
     // `push_selection_ring` の 2 重リングで示し、 選択時は本体 border を消して
     // リングへ一本化する (黄 clip でも選択が判別できる)。
-    let fill = clip.color.unwrap_or(style.clip_default_fill);
+    let base_fill = clip.color.unwrap_or(style.clip_default_fill);
+    // FIXME #80 (daw_01): muted clip は fill を暗く沈めて「再生されない」 を示す。
+    let fill = if clip.muted { muted_dim_fill(base_fill) } else { base_fill };
     let (border, border_w) = if selected {
         (Color::TRANSPARENT, 0.0)
     } else {
@@ -3568,6 +3598,17 @@ fn draw_clip<M: ?Sized + 'static>(
         radius: [style.clip_radius; 4],
         clip_rect: Some(lanes),
     });
+    // FIXME #80 (daw_01): muted は斜線ハッチを fill の上・label の下に重ねる (label は読める)。
+    if clip.muted {
+        push_muted_hatch(
+            hctx,
+            r,
+            r.intersect(lanes),
+            style.clip_muted_hatch_color,
+            style.clip_muted_hatch_spacing_px,
+            style.clip_muted_hatch_width_px,
+        );
+    }
     // share clip は name の左に link glyph (`⇌` 等) を 1 文字描画 (selection と独立 = selected でも
     // shared なら描画、 #022)。 等幅 (HackGen Console NF) では `clip_text_size` ~= 1 文字幅。 描画
     // ロジックは video 経路と共通の `draw_clip_label` に集約 (M14 Phase 108、 daw_01 #080)。
@@ -3793,6 +3834,8 @@ fn draw_drag_preview<M: ?Sized + 'static>(
             thumbnail: None,
             // drag preview は transient なので連動ハイライト対象外 (元 clip 側 overlay で描画済)。
             in_active_group: false,
+            // drag ghost は半透明プレビューなので mute ハッチは出さない (元 clip 側で描画済)。
+            muted: false,
         };
         // drag_preview_geometry が n_tracks 範囲内に clamp 済なので tops から必ず取れる前提。
         // 万一範囲外なら preview を skip (clip 描画消失だけで panic はしない、 defensive)。
@@ -9802,6 +9845,7 @@ mod tests {
             audio_edit: None,
             thumbnail: None,
             in_active_group: false,
+            muted: false,
         }
     }
 
@@ -9823,6 +9867,7 @@ mod tests {
             audio_edit: Some(audio),
             thumbnail: None,
             in_active_group: false,
+            muted: false,
         }
     }
 
@@ -10482,6 +10527,7 @@ mod tests {
             audio_edit: None,
             thumbnail: Some((h, 1920, 1080)),
             in_active_group: false,
+            muted: false,
         };
         let (got_h, w, ht) = c.thumbnail.unwrap();
         assert_eq!(got_h.raw(), 7);

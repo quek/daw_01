@@ -269,6 +269,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     // gui_01 #068: アクティブな共有グループ member なら true。
                     // widget が selection とは別レイヤで hue glow + 太枠を描く。
                     in_active_group: active_groups.contains(&c.content_id),
+                    // FIXME #80: clip mute (dim + 斜線ハッチ表示)。`Clip.muted` をそのまま渡す。
+                    muted: c.muted,
                     // gui_01 #025 (M14 Phase 63k): audio clip のとき first event の
                     // 値を渡して widget に dB handle / fade 角 grip / envelope を
                     // 描かせる。 Phase 1 で 1 clip 1 event 前提なので first event
@@ -405,6 +407,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 c.id.hash(&mut h);
                 c.name.hash(&mut h);
                 c.in_active_group.hash(&mut h);
+                // FIXME #80: mute 状態変化で heavy cache を無効化する。
+                c.muted.hash(&mut h);
                 c.share_group_color.map(f32::to_bits).hash(&mut h);
                 if let Some(col) = c.color {
                     [col.r, col.g, col.b, col.a].map(f32::to_bits).hash(&mut h);

@@ -189,6 +189,7 @@ fn main() {
                             pitch: 60,
                             velocity: 96,
                             lyric: None,
+                            muted: false,
                         };
                     }),
                     PianoRollEditRequest::Delete(_) => Edit::mutate(|_m: &mut Model| {}),
@@ -239,6 +240,7 @@ fn main() {
                             audio_edit: None,
                             thumbnail: None,
                             in_active_group: false,
+                            muted: false,
                         };
                     }),
                     ArrangementEditRequest::CloneClipsLinked(_) => {

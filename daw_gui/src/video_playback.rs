@@ -381,6 +381,10 @@ impl VideoPlaybackEngine {
             }
             let mut track_emitted = false;
             for clip in &track.clips {
+                // FIXME #80: muted clip は video composite から除外する (黒/下層が出る)。
+                if clip.muted {
+                    continue;
+                }
                 let clip_start = clip.start_beat;
                 let clip_end = clip.start_beat + clip.length_beats;
                 if playhead_beat < clip_start || playhead_beat >= clip_end {
@@ -456,6 +460,10 @@ impl VideoPlaybackEngine {
                 continue;
             }
             for clip in &track.clips {
+                // FIXME #80: muted clip は video composite から除外する。
+                if clip.muted {
+                    continue;
+                }
                 let clip_start = clip.start_beat;
                 let clip_end = clip.start_beat + clip.length_beats;
                 if playhead_beat < clip_start || playhead_beat >= clip_end {

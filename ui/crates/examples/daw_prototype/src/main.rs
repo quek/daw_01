@@ -979,6 +979,8 @@ fn arr_track_views(m: &DawModel) -> Vec<ArrangementTrack> {
                     in_active_group: c
                         .share_group_id
                         .is_some_and(|g| active_groups.contains(&g)),
+                    // daw_prototype は mute demo を持たない (= 既存挙動互換)。
+                    muted: false,
                 })
                 .collect(),
             parent_id: t.parent_id,

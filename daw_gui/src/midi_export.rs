@@ -189,6 +189,7 @@ mod tests {
             pitch,
             velocity: vel,
             lyric: None,
+            muted: false,
         }
     }
 

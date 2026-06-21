@@ -84,6 +84,10 @@ pub struct Note {
     pub pitch: u8,
     pub velocity: u8,
     pub lyric: Option<Arc<str>>,
+    /// FIXME #80 (daw_01): note がミュート中なら `true`。 widget は note fill を暗く沈め
+    /// (`muted_dim_fill`)、 斜線ハッチを重ねて「再生されない」 を示す。 caller は
+    /// `Note.muted` をそのまま渡す。 `false` のとき描画は既存と完全一致。
+    pub muted: bool,
 }
 
 /// move helper の delta タプル: (id, prev_start_beat, prev_pitch, next_start_beat, next_pitch)。
@@ -503,6 +507,13 @@ pub struct PianoRollStyle {
     pub sub_line_width_px: f32,
     pub note_fill_fn: NoteFillFn,
     pub note_border_radius_px: f32,
+    /// FIXME #80 (daw_01): muted note に重ねる斜線ハッチの色 (半透明)。default は
+    /// 半透明黒 `rgba(0,0,0,0.40)`。`Note.muted == true` のときのみ描画。
+    pub note_muted_hatch_color: Color,
+    /// FIXME #80 (daw_01): muted note ハッチの線間隔 (px、default 5.0) と線幅 (px、default 1.0)。
+    /// note は clip より小さいので clip ハッチより密にする。
+    pub note_muted_hatch_spacing_px: f32,
+    pub note_muted_hatch_width_px: f32,
     pub note_selected_fill: Color,
     pub note_selected_border: Color,
     pub note_selected_border_w: f32,
@@ -620,6 +631,9 @@ impl Default for PianoRollStyle {
             sub_line_width_px: 1.0,
             note_fill_fn: default_velocity_color,
             note_border_radius_px: 1.5,
+            note_muted_hatch_color: Color::rgba(0.0, 0.0, 0.0, 0.40),
+            note_muted_hatch_spacing_px: 5.0,
+            note_muted_hatch_width_px: 1.0,
             note_selected_fill: Color::rgb(1.0, 0.85, 0.30),
             note_selected_border: Color::rgb(1.0, 1.0, 1.0),
             note_selected_border_w: 2.0,
@@ -1235,6 +1249,10 @@ fn fold_piano_roll_note_hash(notes: &[Note]) -> u64 {
         h ^= u64::from(n.pitch);
         h = h.wrapping_mul(PRIME);
         h ^= u64::from(n.velocity);
+        h = h.wrapping_mul(PRIME);
+        // FIXME #80: mute 状態を cache key に含めて、 mute トグルで note レイヤの
+        // dim + 斜線ハッチ再描画が即時反映されるようにする。
+        h ^= u64::from(n.muted);
         h = h.wrapping_mul(PRIME);
         if let Some(s) = &n.lyric {
             h ^= Arc::as_ptr(s).cast::<()>() as usize as u64;
@@ -2108,6 +2126,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     grid,
                     style_copy.note_fill_fn,
                     style_copy.note_border_radius_px,
+                    style_copy.note_muted_hatch_color,
+                    style_copy.note_muted_hatch_spacing_px,
+                    style_copy.note_muted_hatch_width_px,
                 );
             });
 
@@ -2237,6 +2258,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 pitch,
                 velocity: 96,
                 lyric: None,
+                muted: false,
             };
             self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
         }
@@ -2877,6 +2899,9 @@ fn draw_notes<M: ?Sized + 'static>(
     grid: Rect,
     note_fill_fn: NoteFillFn,
     radius_px: f32,
+    muted_hatch_color: Color,
+    muted_hatch_spacing_px: f32,
+    muted_hatch_width_px: f32,
 ) {
     for note in visible {
         let r = note_to_rect(note, view, grid);
@@ -2893,7 +2918,24 @@ fn draw_notes<M: ?Sized + 'static>(
             w: x_right - x_left,
             h: y_bot - y_top,
         };
-        hctx.push_rect(note_rect_command(clipped, note_fill_fn(note.velocity), radius_px));
+        // FIXME #80 (daw_01): muted note は fill を暗く沈め、斜線ハッチを重ねる。
+        let base = note_fill_fn(note.velocity);
+        let fill = if note.muted {
+            crate::widgets::muted_dim_fill(base)
+        } else {
+            base
+        };
+        hctx.push_rect(note_rect_command(clipped, fill, radius_px));
+        if note.muted {
+            crate::widgets::push_muted_hatch(
+                hctx,
+                clipped,
+                clipped,
+                muted_hatch_color,
+                muted_hatch_spacing_px,
+                muted_hatch_width_px,
+            );
+        }
     }
 }
 
@@ -3106,7 +3148,7 @@ mod tests {
     use daw_ui_renderer::Scene;
 
     fn note(id: NoteId, start: f64, len: f64, pitch: u8) -> Note {
-        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None }
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None, muted: false }
     }
 
     fn test_view() -> PianoRollView {
@@ -4519,6 +4561,7 @@ mod tests {
             pitch: 60,
             velocity: 0,
             lyric: None,
+            muted: false,
         }];
         let (rects_off, _) = count_rects_with_view(v_off, &n_zero);
         let (rects_on, _) = count_rects_with_view(v_on, &n_zero);
@@ -5040,8 +5083,8 @@ mod tests {
         let mut host: UiHost<TestModel> = UiHost::no_redraw();
         // note 1: velocity 64, note 2: velocity 127
         let mut model = TestModel::new(vec![
-            Note { id: 1, start_beat: 0.5, len_beats: 0.5, pitch: 60, velocity: 64, lyric: None },
-            Note { id: 2, start_beat: 1.0, len_beats: 0.5, pitch: 60, velocity: 127, lyric: None },
+            Note { id: 1, start_beat: 0.5, len_beats: 0.5, pitch: 60, velocity: 64, lyric: None, muted: false },
+            Note { id: 2, start_beat: 1.0, len_beats: 0.5, pitch: 60, velocity: 127, lyric: None, muted: false },
         ]);
         model.selected = vec![1, 2];
         let mut view = test_view();
@@ -5771,6 +5814,7 @@ mod tests {
             pitch: 60,
             velocity: 96,
             lyric: Some(Arc::from("x")),
+            muted: false,
         }]);
         model.selected = vec![0];
         let view = test_view();
@@ -5812,6 +5856,7 @@ mod tests {
             pitch: 60,
             velocity: 96,
             lyric: Some(Arc::from("x")),
+            muted: false,
         }]);
         model.selected = vec![0];
         let view = test_view();
@@ -5932,7 +5977,7 @@ mod tests {
     // 化、 (6) lyric Arc identity の振る舞い (同 Arc clone は同 hash、 別 Arc::from は別 hash)。
 
     fn note_with_velocity(id: NoteId, start: f64, len: f64, pitch: u8, vel: u8) -> Note {
-        Note { id, start_beat: start, len_beats: len, pitch, velocity: vel, lyric: None }
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: vel, lyric: None, muted: false }
     }
 
     #[test]
@@ -5985,6 +6030,19 @@ mod tests {
         );
     }
 
+    /// FIXME #80: mute トグルで note cache (dim + 斜線ハッチ) が再描画されるよう、
+    /// `muted` が hash に効くことを保証する (cache 無効化の回帰防止)。
+    #[test]
+    fn fold_piano_roll_note_hash_changes_on_muted() {
+        let before = vec![note(0, 0.0, 1.0, 60)];
+        let mut muted = note(0, 0.0, 1.0, 60);
+        muted.muted = true;
+        assert_ne!(
+            fold_piano_roll_note_hash(&before),
+            fold_piano_roll_note_hash(std::slice::from_ref(&muted)),
+        );
+    }
+
     #[test]
     fn fold_piano_roll_note_hash_lyric_arc_identity() {
         let shared: Arc<str> = Arc::from("a");
@@ -5995,6 +6053,7 @@ mod tests {
             pitch: 60,
             velocity: 96,
             lyric: Some(Arc::clone(&shared)),
+            muted: false,
         };
         let n1_dup = Note { lyric: Some(Arc::clone(&shared)), ..n1.clone() };
         // 同 Arc::clone → 同 pointer → 同 hash
@@ -6720,6 +6779,7 @@ mod tests {
             pitch: 60,
             velocity: 96,
             lyric: None,
+            muted: false,
         }]);
         let view = test_view(); // scale = None
         let style = PianoRollStyle::default();
@@ -6784,6 +6844,7 @@ mod tests {
             pitch: 61,
             velocity: 96,
             lyric: None,
+            muted: false,
         }]);
         let view = PianoRollView {
             scale: Some(scale_c_major(PianoRollScaleMode::Fold)),

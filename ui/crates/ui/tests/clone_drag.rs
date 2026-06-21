@@ -94,6 +94,7 @@ fn arr_model() -> ArrModel {
             audio_edit: None,
             thumbnail: None,
             in_active_group: false,
+            muted: false,
         }],
         volume: 1.0,
         parent_id: None,

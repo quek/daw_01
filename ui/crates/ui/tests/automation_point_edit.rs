@@ -180,6 +180,7 @@ fn make_clip_track(id: u32) -> ArrangementTrack {
             audio_edit: None,
             thumbnail: None,
             in_active_group: false,
+            muted: false,
         }],
         volume: 1.0,
         parent_id: None,

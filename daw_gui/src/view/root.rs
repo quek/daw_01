@@ -831,6 +831,57 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
 
+    // ----- Mute (Q): FIXME #80 -----
+    // 「選択中のものがあればそれらを、 無ければマウスカーソル直下のものを」 mute toggle。
+    // 対象は文脈で決まる:
+    // - piano roll active (= bottom panel が piano roll タブ + pointer が bottom 内、 ただし
+    //   audio editor を開いていない MIDI 編集文脈): note を対象。 選択 note (`selected_notes`)
+    //   があればそれら、 無ければカーソル直下 note (`pianoroll_hover_note`)。
+    // - それ以外 (アレンジ / audio editor): clip を対象。 audio editor 中はその clip、
+    //   そうでなければ選択 clip (`selected_clips`)、 無ければカーソル直下 clip
+    //   (`arrangement_hover_clip`)。
+    // toggle 方向は「対象が全部 muted なら unmute、 1 つでも非 muted なら全 mute」。
+    // text_input フォーカス中は gui_01 が単キーを抑制する。
+    if ui.take_shortcut("daw.toggle_mute") {
+        if is_pianoroll_active && app.audio_editor_clip.is_none() {
+            if let Some(clip) = app.selected_clip_ref() {
+                let notes: Vec<u32> = if !app.selected_notes.is_empty() {
+                    app.selected_notes.clone()
+                } else {
+                    app.pianoroll_hover_note.into_iter().collect()
+                };
+                if !notes.is_empty() {
+                    let new_muted = !app.all_notes_muted(clip, &notes);
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetNotesMuted {
+                            clip,
+                            notes,
+                            muted: new_muted,
+                        });
+                    }));
+                }
+            }
+        } else {
+            let targets: Vec<crate::app::ClipRef> = if is_pianoroll_active {
+                // audio waveform editor を開いている: その clip を mute。
+                app.audio_editor_clip.into_iter().collect()
+            } else if app.selected_clip.is_some() || !app.selected_clips.is_empty() {
+                app.selected_clip_refs()
+            } else {
+                app.arrangement_hover_clip.into_iter().collect()
+            };
+            if !targets.is_empty() {
+                let new_muted = !app.all_clips_muted(&targets);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetClipsMuted {
+                        targets,
+                        muted: new_muted,
+                    });
+                }));
+            }
+        }
+    }
+
     // ----- Ctrl+A: 文脈別全選択 (grill-me 2026-06-09) -----
     // マウス位置で対象を判定する (選択前なので Delete の「非空セット」判定は
     // 使えず pointer 位置で振り分け)。 下部パネル + audio editor 開: 全 event、

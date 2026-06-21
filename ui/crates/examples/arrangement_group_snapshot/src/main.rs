@@ -42,6 +42,7 @@ fn clip(id: u32, start: f64, len: f64, name: &str) -> ArrangementClip {
         audio_edit: None,
         thumbnail: None,
         in_active_group: false,
+        muted: false,
     }
 }
 

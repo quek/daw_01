@@ -142,6 +142,7 @@ fn generate_notes(count: usize) -> Vec<Note> {
                 pitch: 60,
                 velocity: 96,
                 lyric: None,
+                muted: false,
             })
             .collect();
     }
@@ -176,7 +177,7 @@ fn generate_notes(count: usize) -> Vec<Note> {
         } else {
             None
         };
-        notes.push(Note { id: i as NoteId, start_beat, len_beats, pitch, velocity, lyric });
+        notes.push(Note { id: i as NoteId, start_beat, len_beats, pitch, velocity, lyric, muted: false });
     }
     notes.sort_by(|a, b| a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal));
     notes
@@ -984,7 +985,7 @@ mod tests {
     use daw_ui_core::Edit;
 
     fn note(id: NoteId, start: f64, len: f64, pitch: u8) -> Note {
-        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None }
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None, muted: false }
     }
 
     #[test]

@@ -97,6 +97,7 @@ fn arr_model() -> ArrModel {
             audio_edit: None,
             thumbnail: None,
             in_active_group: false,
+            muted: false,
         }],
         volume: 1.0,
         parent_id: None,
@@ -455,6 +456,7 @@ fn pr_model() -> PrModel {
         pitch: 60,
         velocity: 100,
         lyric: None,
+        muted: false,
     };
     PrModel { notes: vec![note], selected: vec![42], last_move: None }
 }

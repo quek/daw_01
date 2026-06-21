@@ -145,6 +145,57 @@ fn migrate_text_overlay_to_subtitle_device(song: &mut Song) {
     }
 }
 
+/// (v27) per-event mute → clip-level mute 統合 (FIXME #80)。v26 以前は clip の mute を
+/// audio / image / video / text event の `muted` フラグ (inspector の "Mute" トグルが clip 内
+/// 全 event を mute) で表現していた。v27 で `Clip.muted` を SSoT に一本化したので、旧プロジェクトの
+/// 「event が muted な content」を `Clip.muted = true` へ畳み込み、event 側の `muted` は false に戻す。
+/// 共有 content (linked clip) は 1 度 false 化すれば全 clip に効く。idempotent。**version-gate 前提** —
+/// 新規 (v27) プロジェクトの event.muted は触らない (将来 per-event mute UI 用に温存)。caller が
+/// `project.version < CURRENT_VERSION` で gate。
+fn migrate_per_event_mute_to_clip_mute(song: &mut Song) {
+    use crate::model::{ClipContent, ContentId};
+    // content_id 単位で「event が 1 つでも muted だったか」を判定しつつ event.muted を false に戻す。
+    let mut muted_contents: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
+    for (id, content) in song.clip_contents.iter_mut() {
+        let any_muted = match content {
+            ClipContent::Audio(c) => {
+                let m = c.events.iter().any(|e| e.muted);
+                c.events.iter_mut().for_each(|e| e.muted = false);
+                m
+            }
+            ClipContent::Image(c) => {
+                let m = c.events.iter().any(|e| e.muted);
+                c.events.iter_mut().for_each(|e| e.muted = false);
+                m
+            }
+            ClipContent::Video(c) => {
+                let m = c.events.iter().any(|e| e.muted);
+                c.events.iter_mut().for_each(|e| e.muted = false);
+                m
+            }
+            ClipContent::Text(c) => {
+                let m = c.events.iter().any(|e| e.muted);
+                c.events.iter_mut().for_each(|e| e.muted = false);
+                m
+            }
+            ClipContent::Midi(_) | ClipContent::Automation(_) => false,
+        };
+        if any_muted {
+            muted_contents.insert(*id);
+        }
+    }
+    if muted_contents.is_empty() {
+        return;
+    }
+    for track in &mut song.tracks {
+        for clip in &mut track.clips {
+            if muted_contents.contains(&clip.content_id) {
+                clip.muted = true;
+            }
+        }
+    }
+}
+
 pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     let path = path.as_ref();
     let text = fs::read_to_string(path)
@@ -190,6 +241,8 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     // 対象外 = 「喋るが映さない」を温存。
     if project.version < CURRENT_VERSION {
         migrate_text_overlay_to_subtitle_device(&mut song);
+        // (v27 FIXME #80) 旧 per-event mute を `Clip.muted` へ畳み込む。
+        migrate_per_event_mute_to_clip_mute(&mut song);
     }
     // Re-establish every invariant the codebase assumes about a loaded
     // song in one SSoT call: value-range sanity (bpm/time_sig/length/loop
@@ -252,6 +305,34 @@ mod tests {
         });
         song.tracks.push(track);
         song
+    }
+
+    /// FIXME #80 (v27): event 単位 mute だった clip を `Clip.muted` へ畳み込み、
+    /// event 側の `muted` を false に戻す。
+    #[test]
+    fn migrate_per_event_mute_folds_into_clip_and_clears_event() {
+        let mut song = song_with_one_text_clip();
+        let cid = song.tracks[0].clips[0].content_id;
+        if let Some(ClipContent::Text(t)) = song.clip_contents.get_mut(&cid) {
+            t.events[0].muted = true;
+        }
+        migrate_per_event_mute_to_clip_mute(&mut song);
+        assert!(
+            song.tracks[0].clips[0].muted,
+            "event が muted な clip は Clip.muted = true に畳み込まれる"
+        );
+        let Some(ClipContent::Text(t)) = song.clip_contents.get(&cid) else {
+            panic!("expected Text content");
+        };
+        assert!(!t.events[0].muted, "畳み込み後は event.muted = false に戻る");
+    }
+
+    /// FIXME #80: 元々 mute されていない clip は migration で変化しない。
+    #[test]
+    fn migrate_per_event_mute_leaves_unmuted_clip_untouched() {
+        let mut song = song_with_one_text_clip();
+        migrate_per_event_mute_to_clip_mute(&mut song);
+        assert!(!song.tracks[0].clips[0].muted);
     }
 
     #[test]
@@ -395,6 +476,7 @@ mod tests {
                         pitch: 60,
                         velocity: 100,
                         lyric: Some("こ".into()),
+                        muted: false,
                     },
                     Note {
                         start_beat: 1.0,
@@ -402,6 +484,7 @@ mod tests {
                         pitch: 62,
                         velocity: 100,
                         lyric: Some("ん".into()),
+                        muted: false,
                     },
                 ],
             }),
@@ -419,6 +502,7 @@ mod tests {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                muted: false,
                 speaker_id: 3061,
                 singer_name: "中国うさぎ".into(),
                 style_name: "ノーマル".into(),

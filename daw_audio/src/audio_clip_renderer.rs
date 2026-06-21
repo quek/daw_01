@@ -263,6 +263,11 @@ pub fn compile_audio_schedule(
             let ClipContent::Audio(audio) = content else {
                 continue;
             };
+            // FIXME #80: muted clip は全 audio event を schedule から除外する
+            // (per-event `event.muted` とは独立。clip-level mute の SSoT)。
+            if clip.muted {
+                continue;
+            }
             for event in &audio.events {
                 let Some(buffer) = sources.get(&event.source_id) else {
                     continue;

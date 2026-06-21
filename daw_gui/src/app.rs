@@ -1137,6 +1137,11 @@ pub struct AppData {
     /// song-absolute の grid で snap する必要があるため、`pianoroll_hover_beat`
     /// (clip-local snap 済) とは別に保持する。grid 外 / 非 piano-roll は `None`。
     pub pianoroll_hover_beat_song_raw: Option<f64>,
+    /// FIXME #80: ピアノロール grid 上のポインタ直下の note index (= clip 内 notes Vec の
+    /// index、`selected_notes` と同空間)。`q` キーで「選択が無ければカーソル直下 note を
+    /// mute」する対象解決に使う。`piano_roll_view::draw` が `note_hit` で毎フレーム更新、
+    /// grid 外 / note 外 / 非 piano-roll は `None`。
+    pub pianoroll_hover_note: Option<u32>,
     /// FIXME #33: view 層が OS clipboard へ書く保留テキスト。トラック copy/cut は
     /// plugin state 収集が非同期 (`on_all_states_from_child`、Ui 非保持) なので、
     /// そこで serialize した envelope JSON をここに積み、`dispatch_shortcuts` が
@@ -2069,6 +2074,7 @@ impl AppData {
             mixer_hovered_track: None,
             pianoroll_hover_beat: None,
             pianoroll_hover_beat_song_raw: None,
+            pianoroll_hover_note: None,
             pending_clipboard_write: None,
             selected_track_ids: Vec::new(),
             selected_section_ids: Vec::new(),
@@ -2925,7 +2931,8 @@ impl AppData {
         Some(InspectorAudioEventSummary {
             target: cref,
             reversed: event.reversed,
-            muted: event.muted,
+            // FIXME #80: "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
+            muted: clip.muted,
             stretch_mode: event.stretch_mode,
             fade_in_curve: event.fade_in_curve,
             fade_out_curve: event.fade_out_curve,
@@ -2995,7 +3002,8 @@ impl AppData {
         };
         Some(InspectorImageEventSummary {
             target: cref,
-            muted: event.muted,
+            // FIXME #80: "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
+            muted: clip.muted,
             fade_in_curve: event.fade_in_curve,
             fade_out_curve: event.fade_out_curve,
             x_automated: has_lane(common::model::ImageBuiltinParam::X),
@@ -3364,6 +3372,9 @@ impl AppData {
                 | AppEvent::GlueSelectedClips
                 | AppEvent::SetClipReversed { .. }
                 | AppEvent::SetClipMuted { .. }
+                // FIXME #80: clip / note mute トグルは 1 操作 = 1 undo step。
+                | AppEvent::SetClipsMuted { .. }
+                | AppEvent::SetNotesMuted { .. }
                 // ResetTrackClipColors は discrete な一括編集なので undoable。
                 // (SetTrackColor / SetClipColor は picker live drag のため非 undoable)
                 | AppEvent::ResetTrackClipColors { .. }
@@ -5138,11 +5149,23 @@ pub enum AppEvent {
     /// 走査する flag。
     SetClipReversed { target: ClipRef, reversed: bool },
 
-    /// Toggle `AudioEvent.muted` for every event in the selected audio
-    /// clip. Mute は event 単位の silent flag (§3.7 / §3.9 AudioEvent
-    /// 選択時 Mute toggle)、 track-mute とは独立。 Phase 1 では 1 clip 1
-    /// event 前提なので「event mute = clip mute」 と同義。
+    /// FIXME #80: clip 全体の mute を設定 (`Clip.muted` = clip-level mute の SSoT)。
+    /// 旧 (v26 以前) は per-event `AudioEvent.muted` を立てていたが、v27 で `Clip.muted` に
+    /// 一本化したので audio inspector の "Mute" トグルもここを設定する。track-mute とは独立。
     SetClipMuted { target: ClipRef, muted: bool },
+
+    /// FIXME #80: 複数 clip の mute を一括設定 (= `q` ショートカットで選択 clip / カーソル
+    /// 直下 clip を toggle した結果)。各 target の `Clip.muted` に `muted` を設定する。
+    SetClipsMuted { targets: Vec<ClipRef>, muted: bool },
+
+    /// FIXME #80: ある clip 内の note 群 (index 指定) の `Note.muted` を一括設定
+    /// (= `q` で選択 note / カーソル直下 note を toggle した結果)。linked clip は content
+    /// 共有なので mute も共有される。
+    SetNotesMuted {
+        clip: ClipRef,
+        notes: Vec<u32>,
+        muted: bool,
+    },
 
     /// v18 (`docs/plan_track_clip_color.md`): clip の表示色を設定。
     /// `color == None` でトラック色継承に戻す (Ableton "match track color")。
@@ -6620,11 +6643,28 @@ impl AppData {
                 propagate_clip_color(&mut self.song.tracks, target, color);
             }
             AppEvent::SetClipMuted { target, muted } => {
-                if self.is_image_clip(target) {
-                    self.set_clip_image_event_muted(target, muted);
-                } else {
-                    self.set_clip_audio_event_muted(target, muted);
+                // FIXME #80: clip-level mute の SSoT (`Clip.muted`)。 content type を問わない。
+                self.set_clip_muted(target, muted);
+            }
+            AppEvent::SetClipsMuted { targets, muted } => {
+                // FIXME #80: `q` で選択 clip / カーソル直下 clip を一括 toggle した結果。
+                let mut changed = false;
+                for target in targets {
+                    if let Some(track) = self.song.tracks.get_mut(target.track as usize)
+                        && let Some(clip) = track.clips.get_mut(target.clip as usize)
+                        && clip.muted != muted
+                    {
+                        clip.muted = muted;
+                        changed = true;
+                    }
                 }
+                if changed {
+                    self.sync_song_to_plugin_host();
+                }
+            }
+            AppEvent::SetNotesMuted { clip, notes, muted } => {
+                // FIXME #80: `q` で選択 note / カーソル直下 note を一括 toggle した結果。
+                self.set_notes_muted(clip, &notes, muted);
             }
             AppEvent::SetClipStretchMode { target, mode } => {
                 self.set_clip_audio_event_stretch_mode(target, mode);
@@ -6711,7 +6751,8 @@ impl AppData {
                 self.end_text_pip_drag_recording();
             }
             AppEvent::SetClipTextMuted { target, muted } => {
-                self.set_clip_text_event_muted(target, muted);
+                // FIXME #80: 字幕 clip mute も clip-level `Clip.muted` に一本化。
+                self.set_clip_muted(target, muted);
             }
             AppEvent::SetClipTextContent { target, value } => {
                 self.set_clip_text_event_content(target, value);
@@ -6854,13 +6895,8 @@ impl AppData {
                 for &t in &targets {
                     match edit {
                         DiscreteClipEdit::Reversed(v) => self.set_clip_audio_event_reversed(t, v),
-                        DiscreteClipEdit::Muted(v) => {
-                            if self.is_image_clip(t) {
-                                self.set_clip_image_event_muted(t, v);
-                            } else {
-                                self.set_clip_audio_event_muted(t, v);
-                            }
-                        }
+                        // FIXME #80: inspector の "Mute" トグルも clip-level `Clip.muted` に一本化。
+                        DiscreteClipEdit::Muted(v) => self.set_clip_muted(t, v),
                         DiscreteClipEdit::StretchMode(m) => {
                             self.set_clip_audio_event_stretch_mode(t, m);
                         }
@@ -6880,7 +6916,8 @@ impl AppData {
                                 }
                             }
                         },
-                        DiscreteClipEdit::TextMuted(v) => self.set_clip_text_event_muted(t, v),
+                        // FIXME #80: 字幕 inspector の "Mute" も clip-level `Clip.muted` に一本化。
+                        DiscreteClipEdit::TextMuted(v) => self.set_clip_muted(t, v),
                         DiscreteClipEdit::TextAlign(a) => self.set_clip_text_event_align(t, a),
                         DiscreteClipEdit::TextFadeCurve(edge, c) => match edge {
                             FadeEdgeKind::In => self.set_clip_text_event_fade_in_curve(t, c),
@@ -10743,6 +10780,8 @@ impl AppData {
                 length_beats: c.length_beats,
                 color: c.color,
                 auto_lipsync: c.auto_lipsync,
+                // (FIXME #80) clip-level mute も clipboard へ。
+                muted: c.muted,
                 content_id: c.content_id,
                 content,
                 name,
@@ -10835,6 +10874,8 @@ impl AppData {
                 notes: Vec::new(),
                 color: cc.color,
                 auto_lipsync: cc.auto_lipsync,
+                // (FIXME #80) clipboard の clip-level mute を paste 先 clip へ引き継ぐ。
+                muted: cc.muted,
                 // (FIXME #36) clipboard の per-clip 声を paste 先 clip へ引き継ぐ。
                 speaker_id: cc.speaker_id,
                 singer_name: cc.singer_name.clone(),
@@ -12962,6 +13003,7 @@ impl AppData {
             pitch,
             velocity,
             lyric: None,
+            muted: false,
         });
         let next_cursor = cursor + step;
         self.selected_notes = vec![new_idx];
@@ -13022,6 +13064,7 @@ impl AppData {
                     pitch,
                     velocity,
                     lyric: None,
+                    muted: false,
                 });
             }
         }
@@ -14381,10 +14424,90 @@ impl AppData {
         self.mutate_audio_events_in_clip(target, |e| e.reversed = reversed);
     }
 
-    /// `AudioEvent.muted` を更新 (event 単位 silent flag、 track-mute と
-    /// 独立)。 broadcast 範囲は `audio_event_target_indices` 仕様。
-    fn set_clip_audio_event_muted(&mut self, target: ClipRef, muted: bool) {
-        self.mutate_audio_events_in_clip(target, |e| e.muted = muted);
+    /// FIXME #80: `targets` の clip が **全て** muted なら `true` (空なら `false`)。`q` の
+    /// toggle 方向決定用 (全 muted → unmute、 1 つでも非 muted → 全 mute)。
+    pub fn all_clips_muted(&self, targets: &[ClipRef]) -> bool {
+        !targets.is_empty()
+            && targets.iter().all(|t| {
+                self.song
+                    .tracks
+                    .get(t.track as usize)
+                    .and_then(|tr| tr.clips.get(t.clip as usize))
+                    .is_some_and(|c| c.muted)
+            })
+    }
+
+    /// FIXME #80: clip 内 `notes` (index) が **全て** muted なら `true` (空 / 非 MIDI は `false`)。
+    /// `q` の note mute toggle 方向決定用。
+    pub fn all_notes_muted(&self, target: ClipRef, notes: &[u32]) -> bool {
+        if notes.is_empty() {
+            return false;
+        }
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return false;
+        };
+        let Some(common::model::ClipContent::Midi(midi)) =
+            self.song.clip_contents.get(&content_id)
+        else {
+            return false;
+        };
+        notes
+            .iter()
+            .all(|&i| midi.notes.get(i as usize).is_some_and(|n| n.muted))
+    }
+
+    /// FIXME #80: clip-level mute (`Clip.muted`) を設定する。MIDI / audio / video / image /
+    /// 字幕 / 歌唱すべての content type 共通の単一 SSoT。`q` ショートカット (`SetClipsMuted`)、
+    /// 各 inspector の "Mute" トグル (`DiscreteClipEdit::Muted` / `TextMuted`)、単発の
+    /// `SetClipMuted` / `SetClipTextMuted` event がすべてここを経由する。変更があれば
+    /// `sync_song_to_plugin_host` で daw_audio へ LoadSong flush し、再生・書き出しに反映する
+    /// (is_dirty もそこで立つ)。
+    fn set_clip_muted(&mut self, target: ClipRef, muted: bool) {
+        if let Some(track) = self.song.tracks.get_mut(target.track as usize)
+            && let Some(clip) = track.clips.get_mut(target.clip as usize)
+            && clip.muted != muted
+        {
+            clip.muted = muted;
+            self.sync_song_to_plugin_host();
+        }
+    }
+
+    /// FIXME #80: clip の `ClipContent::Midi` 内 note (index 指定) の `Note.muted` を一括設定する。
+    /// `selected_notes` と同じ index 空間。linked clip は content (= notes) を共有するので
+    /// mute も linked clip 間で共有される。変更があれば `sync_song_to_plugin_host` で flush
+    /// (sequencer が muted note を skip して再生・書き出しから除外)。
+    fn set_notes_muted(&mut self, target: ClipRef, notes: &[u32], muted: bool) {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        if let Some(common::model::ClipContent::Midi(midi)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            let mut changed = false;
+            for &i in notes {
+                if let Some(n) = midi.notes.get_mut(i as usize)
+                    && n.muted != muted
+                {
+                    n.muted = muted;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.sync_song_to_plugin_host();
+            }
+        }
     }
 
     /// `AudioEvent.stretch_mode` を更新。 `compile_audio_schedule` が
@@ -14519,10 +14642,6 @@ impl AppData {
         self.resync_clip_image_event_edit_buffers(target);
     }
 
-    fn set_clip_image_event_muted(&mut self, target: ClipRef, muted: bool) {
-        self.mutate_image_events_in_clip(target, |e| e.muted = muted);
-    }
-
     /// docs/plan_text_overlay.md §4 P6: image と同 idiom の text event
     /// setter 群。 drag / inspector commit / lane override 経由のいずれも
     /// このパスで TextEvent.field を直接書く。
@@ -14579,10 +14698,6 @@ impl AppData {
         let wrapped =
             ((value + std::f32::consts::PI).rem_euclid(two_pi)) - std::f32::consts::PI;
         self.mutate_text_events_in_clip(target, |e| e.rotation_radians = wrapped);
-    }
-
-    fn set_clip_text_event_muted(&mut self, target: ClipRef, muted: bool) {
-        self.mutate_text_events_in_clip(target, |e| e.muted = muted);
     }
 
     fn set_clip_text_event_content(&mut self, target: ClipRef, value: String) {
@@ -14924,7 +15039,8 @@ impl AppData {
         }
         Some(InspectorTextEventSummary {
             target: cref,
-            muted: event.muted,
+            // FIXME #80: "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
+            muted: clip.muted,
             align: event.align,
             fade_in_curve: event.fade_in_curve,
             fade_out_curve: event.fade_out_curve,
@@ -15854,6 +15970,8 @@ impl AppData {
         let new_length = src_clip.length_beats;
         let content_id = src_clip.content_id;
         let src_color = src_clip.color;
+        // FIXME #80: mute 状態も複製先へ引き継ぐ (color / 声 と同様)。
+        let src_muted = src_clip.muted;
         // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
         let src_speaker = src_clip.speaker_id;
         let src_singer = src_clip.singer_name.clone();
@@ -15871,6 +15989,7 @@ impl AppData {
             notes: Vec::new(),
             color: src_color,
             auto_lipsync: false,
+            muted: src_muted,
             speaker_id: src_speaker,
             singer_name: src_singer,
             style_name: src_style,
@@ -15895,6 +16014,8 @@ impl AppData {
         let new_length = src_clip.length_beats;
         let src_content_id = src_clip.content_id;
         let src_color = src_clip.color;
+        // FIXME #80: mute 状態も複製先へ引き継ぐ。
+        let src_muted = src_clip.muted;
         // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
         let src_speaker = src_clip.speaker_id;
         let src_singer = src_clip.singer_name.clone();
@@ -15913,6 +16034,7 @@ impl AppData {
             notes: Vec::new(),
             color: src_color,
             auto_lipsync: false,
+            muted: src_muted,
             speaker_id: src_speaker,
             singer_name: src_singer,
             style_name: src_style,
@@ -15996,6 +16118,8 @@ impl AppData {
             // source の色を引き継ぐ。
             let content_id = src_clip.content_id;
             let src_color = src_clip.color;
+            // FIXME #80: mute 状態も複製先へ引き継ぐ。
+            let src_muted = src_clip.muted;
             // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
             let src_voice = (
                 src_clip.speaker_id,
@@ -16020,6 +16144,7 @@ impl AppData {
                 notes: Vec::new(),
                 color: src_color,
                 auto_lipsync: false,
+                muted: src_muted,
                 speaker_id: src_voice.0,
                 singer_name: src_voice.1,
                 style_name: src_voice.2,
@@ -16052,6 +16177,8 @@ impl AppData {
             // 独立コピー: content + 名前を fork。色 (per-clip) は source の色を引き継ぐ。
             let src_content_id = src_clip.content_id;
             let src_color = src_clip.color;
+            // FIXME #80: mute 状態も複製先へ引き継ぐ。
+            let src_muted = src_clip.muted;
             // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
             let src_voice = (
                 src_clip.speaker_id,
@@ -16077,6 +16204,7 @@ impl AppData {
                 notes: Vec::new(),
                 color: src_color,
                 auto_lipsync: false,
+                muted: src_muted,
                 speaker_id: src_voice.0,
                 singer_name: src_voice.1,
                 style_name: src_voice.2,
@@ -16165,6 +16293,7 @@ impl AppData {
             notes: Vec::new(),
             color: None,
             auto_lipsync: false,
+            muted: false,
             speaker_id,
             singer_name,
             style_name,
@@ -16361,6 +16490,7 @@ impl AppData {
             pitch,
             velocity: 100,
             lyric: None,
+            muted: false,
         });
         let r = ClipRef {
             track: track_idx,
@@ -20506,7 +20636,8 @@ impl AppData {
         let track = &mut self.song.tracks[target.track as usize];
         // (FIXME #36) 前半は in-place で元 clip の声を保持。 後半 (新 clip) は
         // その声を引き継ぐ。
-        let (src_speaker, src_singer, src_style, src_talk) = {
+        // FIXME #80: 前半は in-place で mute を保持。 後半 (新 clip) も元 clip の mute を引き継ぐ。
+        let (src_speaker, src_singer, src_style, src_talk, src_muted) = {
             let clip_mut = &mut track.clips[target.clip as usize];
             clip_mut.length_beats = front_len;
             clip_mut.content_id = front_content_id;
@@ -20515,6 +20646,7 @@ impl AppData {
                 clip_mut.singer_name.clone(),
                 clip_mut.style_name.clone(),
                 clip_mut.talk,
+                clip_mut.muted,
             )
         };
         let new_clip_id = track.alloc_clip_id();
@@ -20528,6 +20660,7 @@ impl AppData {
             notes: Vec::new(),
             color: src_color,
             auto_lipsync: false,
+            muted: src_muted,
             speaker_id: src_speaker,
             singer_name: src_singer,
             style_name: src_style,
@@ -20779,14 +20912,23 @@ impl AppData {
 
             // (FIXME #36) merged clip は最初 (= 最も早い index = sorted 先頭) の
             // source clip の声を採用 (複数声混在時のポリシー)。 source 削除前に capture。
-            let (glue_speaker, glue_singer, glue_style, glue_talk) = {
+            // FIXME #80: merged clip の mute も代表 (最早) source clip の値を採用 (声と同ポリシー)。
+            let (glue_speaker, glue_singer, glue_style, glue_talk, glue_muted) = {
                 let track = &self.song.tracks[track_idx as usize];
                 refs.iter()
                     .map(|r| r.clip as usize)
                     .min()
                     .and_then(|i| track.clips.get(i))
-                    .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone(), c.talk))
-                    .unwrap_or((0, String::new(), String::new(), None))
+                    .map(|c| {
+                        (
+                            c.speaker_id,
+                            c.singer_name.clone(),
+                            c.style_name.clone(),
+                            c.talk,
+                            c.muted,
+                        )
+                    })
+                    .unwrap_or((0, String::new(), String::new(), None, false))
             };
             // Remove source clips (descending index to keep earlier
             // indices stable).
@@ -20812,6 +20954,7 @@ impl AppData {
                 notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
+                muted: glue_muted,
                 speaker_id: glue_speaker,
                 singer_name: glue_singer,
                 style_name: glue_style,
@@ -21419,6 +21562,7 @@ mod note_duplicate_tests {
             pitch,
             velocity: 100,
             lyric: None,
+            muted: false,
         }
     }
 

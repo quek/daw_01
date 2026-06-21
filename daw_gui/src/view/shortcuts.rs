@@ -61,6 +61,12 @@ pub fn daw_shortcut_map() -> ShortcutMap {
     //   トラック)。 選択トラックではない。
     // text_input フォーカス中 (歌詞 / rename 編集等) は gui_01 が単キーを抑制する。
     m.bind("daw.toggle_track_solo", "S");
+    // FIXME #80: Q キーで clip / note を mute toggle する。対象は文脈で決まる
+    // (root.rs::dispatch_shortcuts): piano roll active = note (選択 note、 無ければ
+    // カーソル直下 note)、 それ以外 = clip (選択 clip、 無ければカーソル直下 clip)。
+    // 選択 / カーソル下のどちらも無ければ no-op。text_input フォーカス中は gui_01 が
+    // 単キーを抑制するので rename / 歌詞編集中は発火しない。
+    m.bind("daw.toggle_mute", "Q");
     // gui_01 piano_roll widget の `take_shortcut("add_note")` 用バインド。
     m.bind("add_note", "Insert");
     // gui_01 #017 (M14 Phase 59): piano_roll で note 1 つ選択中に L で歌詞
