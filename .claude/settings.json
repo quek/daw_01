@@ -73,6 +73,17 @@
           }
         ]
       }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python F:/dev/daw_01/scripts/worktree_remove_cleanup.py",
+            "timeout": 30
+          }
+        ]
+      }
     ]
   }
 }
