@@ -35,6 +35,7 @@ pub enum ClipboardPayload {
     AutomationPoints(Vec<CopiedPoint>),
     AudioEvents(Vec<AudioEvent>),
     Clips(Vec<ClipCopy>),
+    AutomationClips(Vec<AutomationClipCopy>),
     Tracks(Vec<TrackCopy>),
 }
 
@@ -81,6 +82,30 @@ pub struct ClipCopy {
     /// JSON との互換のため serde default (`None`)。
     #[serde(default)]
     pub talk: Option<common::model::TalkParams>,
+}
+
+/// 正規化済みオートメーションクリップ (= lane 内の 1 curve clip)。`start_beat` は
+/// 選択群の最早クリップ start を 0 とした相対拍、`length_beats` は clip 長。`points` は
+/// **clip-local 時間 + target 非依存 normalized 値** (`CopiedPoint` を流用、 paste 先 lane の
+/// `norm_to_plain` で復元) なので、 異なる target の lane に貼っても curve の形を保てる
+/// (= automation point copy と同じ Bitwig 流)。
+///
+/// `source_content_id` は copy 元の `content_id`。 同一 content を共有していた linked clip
+/// 群を **paste 後も互いにリンク** させる dedup キーとしてのみ使う (= song の content を
+/// そのまま流用はしない。 automation 値は target 依存なので、 リンク復元は常に inline
+/// `points` から独立採番する)。 これは MIDI clip paste (`ClipCopy`) が同一プロジェクトで
+/// content_id を流用してソースとリンクするのと異なり、 REAPER / Ableton の envelope
+/// copy 同様「コピー元から切り離した独立コピー」 を作る方針。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationClipCopy {
+    pub start_beat: f64,
+    pub length_beats: f64,
+    /// copy 元 content_id (linked group の内部リンク保持用 dedup キー)。
+    pub source_content_id: ContentId,
+    /// clip-local 時間 + normalized 値の curve 点列 (空 = default_value 引きずりの空 clip)。
+    pub points: Vec<CopiedPoint>,
+    /// 共有名 (`Song.clip_content_names` 由来)。
+    pub name: Option<String>,
 }
 
 /// 正規化済みトラックまるごと。`track` は raw (旧 legacy field は skip_serializing で
@@ -253,6 +278,25 @@ pub fn sanitize_clips(clips: Vec<ClipCopy>) -> Vec<ClipCopy> {
         .collect()
 }
 
+/// 外部 clipboard 由来の `AutomationClipCopy` 群を sanitize。length_beats が非有限/<=0 の
+/// ものは破棄、start_beat 非有限は 0、各 curve 点は `sanitize_points` (time 非有限/負を破棄 +
+/// value_norm を 0..=1 clamp) で掃除する。
+pub fn sanitize_automation_clips(clips: Vec<AutomationClipCopy>) -> Vec<AutomationClipCopy> {
+    clips
+        .into_iter()
+        .filter_map(|mut c| {
+            if !c.length_beats.is_finite() || c.length_beats <= 0.0 {
+                return None;
+            }
+            if !c.start_beat.is_finite() {
+                c.start_beat = 0.0;
+            }
+            c.points = sanitize_points(std::mem::take(&mut c.points));
+            Some(c)
+        })
+        .collect()
+}
+
 /// 外部 clipboard 由来の `TrackCopy` 群を sanitize。各 clip / automation lane clip の
 /// length_beats を検証 (不正は破棄)、volume/pan を clamp、content payload を sanitize する。
 pub fn sanitize_tracks(mut tracks: Vec<TrackCopy>) -> Vec<TrackCopy> {
@@ -371,6 +415,65 @@ mod tests {
         ]);
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].start_beat, 0.0);
+    }
+
+    #[test]
+    fn sanitize_automation_clips_drops_bad_and_cleans_points() {
+        use common::model::ContentId;
+        let pt = |t: f64, v: f32| CopiedPoint {
+            time_beat: t,
+            value_norm: v,
+            curve: AutomationCurve::Linear,
+        };
+        let mk = |len: f64, start: f64, pts: Vec<CopiedPoint>| AutomationClipCopy {
+            start_beat: start,
+            length_beats: len,
+            source_content_id: 0 as ContentId,
+            points: pts,
+            name: None,
+        };
+        let out = sanitize_automation_clips(vec![
+            mk(4.0, 0.0, vec![pt(0.0, 2.0), pt(-1.0, 0.5)]), // valid; point clamp + drop bad time
+            mk(f64::NAN, 0.0, vec![]),                       // NaN length → drop
+            mk(0.0, 0.0, vec![]),                            // zero length → drop
+            mk(2.0, f64::NAN, vec![pt(0.0, 0.5)]),           // NaN start → kept, start reset to 0
+        ]);
+        assert_eq!(out.len(), 2);
+        // first clip: out-of-range value_norm clamped to 1.0, negative-time point dropped.
+        assert_eq!(out[0].points.len(), 1);
+        assert_eq!(out[0].points[0].value_norm, 1.0);
+        // NaN start reset to 0.
+        assert_eq!(out[1].start_beat, 0.0);
+    }
+
+    #[test]
+    fn envelope_roundtrip_automation_clips() {
+        let env = ClipboardEnvelope::new(
+            7,
+            ClipboardPayload::AutomationClips(vec![AutomationClipCopy {
+                start_beat: 1.5,
+                length_beats: 4.0,
+                source_content_id: 9,
+                points: vec![CopiedPoint {
+                    time_beat: 0.0,
+                    value_norm: 0.25,
+                    curve: AutomationCurve::Linear,
+                }],
+                name: Some("Volume curve".to_string()),
+            }]),
+        );
+        let json = env.to_json().unwrap();
+        let back = ClipboardEnvelope::from_json(&json).unwrap();
+        match back.payload {
+            ClipboardPayload::AutomationClips(cs) => {
+                assert_eq!(cs.len(), 1);
+                assert_eq!(cs[0].length_beats, 4.0);
+                assert_eq!(cs[0].source_content_id, 9);
+                assert_eq!(cs[0].points.len(), 1);
+                assert_eq!(cs[0].name.as_deref(), Some("Volume curve"));
+            }
+            _ => panic!("wrong payload variant"),
+        }
     }
 
     #[test]

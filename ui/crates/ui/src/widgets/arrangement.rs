@@ -8307,6 +8307,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     // replace: vec![pressed] (pressed が既に唯一の selection なら同値 → no-op)
                     vec![ad.point]
                 };
+                // 修飾なし単一クリック (= 置き換え選択) では競合する clip 選択も解除して
+                // automation 面を 1 つだけにする (点とクリップが同時に光って混乱するのを
+                // 防ぐ。 lasso / Shift / Ctrl は両面選択を温存するので除外)。
+                if !press_shift && !press_ctrl && !selected_automation_clips.is_empty() {
+                    self.push_edit(make_edit(
+                        ArrangementEditRequest::SelectAutomationClips {
+                            prev: selected_automation_clips.to_vec(),
+                            next: Vec::new(),
+                        },
+                    ));
+                    response.selection_changed = true;
+                }
                 if next != prev {
                     self.push_edit(make_edit(
                         ArrangementEditRequest::SelectAutomationPoints { prev, next },
@@ -8517,6 +8529,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 } else {
                     vec![key]
                 };
+                // 修飾なし単一クリック (= 置き換え選択) では競合する point 選択も解除して
+                // automation 面を 1 つだけにする (点とクリップが同時に光って混乱するのを
+                // 防ぐ。 lasso / Shift / Ctrl は両面選択を温存するので除外)。
+                if !acd.last_shift
+                    && !acd.last_ctrl
+                    && !selected_automation_points.is_empty()
+                {
+                    self.push_edit(make_edit(
+                        ArrangementEditRequest::SelectAutomationPoints {
+                            prev: selected_automation_points.to_vec(),
+                            next: Vec::new(),
+                        },
+                    ));
+                    response.selection_changed = true;
+                }
                 if prev != next {
                     self.push_edit(make_edit(
                         ArrangementEditRequest::SelectAutomationClips { prev, next },
