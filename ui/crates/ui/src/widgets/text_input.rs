@@ -124,6 +124,13 @@ pub struct TextInputResponse {
     /// なかった (`piano_roll` の歌詞 inline 編集で「Enter で commit text を取り出して
     /// `split_into_morae` で分割→次 note へ分配」が必要になり追加)。
     pub committed_text: Option<String>,
+    /// (daw_01 #112) このフレームで rect 外を primary click して focus を失ったか
+    /// (= focus loss commit)。 Enter (`committed`) と区別する: 値編集の caller は
+    /// `committed || blurred` で確定し、 picker 等の検索ボックスは `committed` のみ見て
+    /// blur を無視できる (外 click は picker 自身の dismiss が閉じる)。 **Esc による
+    /// focus 解除では false** (Esc は cancel なので blur に昇格させない)。 blur frame でも
+    /// [`Self::committed_text`] に確定 text を載せる (typing の source-of-truth = buffer)。
+    pub blurred: bool,
     /// (M14 Phase 86 / daw_01 #057) focus 中にこのフレームで ↑ キーが押されたか。
     /// text_input は単一行で ↑↓ を内部利用しないため、 type-ahead picker / combobox 等
     /// 「検索ボックスに focus を保ったまま候補リストの cursor を上下移動したい」 caller に
@@ -171,11 +178,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // Press が rect 外で発生 + 自分が focus を持っていたら自己 blur。
         // これで「外をクリック → 次の入力イベントを待たずに枠線が即座に消える」になる。
-        if pointer.primary_just_pressed && !inside && self.is_focused(wid) {
+        // daw_01 #112: この click 由来の focus loss を `blurred` として Response に載せ、
+        // 値編集 caller が「外 click で確定」できるようにする。 Esc 由来の focus 解除
+        // (下の `escape_pressed` 経路) では blurred を立てない (Esc は cancel)。
+        let blurred = pointer.primary_just_pressed && !inside && self.is_focused(wid);
+        if blurred {
             self.clear_focus_if_focused(wid);
         }
 
-        let was_focused = self.is_focused(wid);
+        // daw_01 #112: blur frame でも frame-start focus に溜まった入力を取りこぼさないよう、
+        // blurred を was_focused に畳んで下の入力処理ブロックを通す。 特に Windows は composition 中の
+        // 外 click で composition を finalize し、 確定 `Ime::Commit` を mouse press と **同 frame** に
+        // 送るため、 ここで処理しないと「変換確定した日本語」が buffer に入らず空/古い値で commit される。
+        // `take_*_if_focused` は committed focus (`self.focused` = frame-start) を見るので、 直上で
+        // pending_focus を clear 済みでも drain できる。
+        let was_focused = self.is_focused(wid) || blurred;
 
         // gained_focus 検知 + 全選択 + buffer_text 初期化 (M14 Phase 59)。
         // click / programmatic focus / `text_input_at_focused` を 1 箇所で処理 (F2 rename 標準挙動)。
@@ -529,10 +546,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.set_typing_focus(true);
         }
 
-        // commit frame では「Enter 押下時点の working buffer の最終値」を返す。
-        // M14 Phase 59: displayed_text は typing 反映後の値 (focus 中 = buffer_text、
-        // 非 focus 中 = text 引数)。 commit 時はこれをそのまま返せば良い。
-        let committed_text = if committed { Some(displayed_text.clone()) } else { None };
+        // commit frame では「確定時点の working buffer の最終値」を返す。 Enter (committed) と
+        // blur (外 click, blurred) は両方 was_focused=true で入力処理を通している (上記 #112) ため、
+        // displayed_text は typing / batched IME を反映した buffer。 そのまま返せばよい。
+        let committed_text =
+            if committed || blurred { Some(displayed_text.clone()) } else { None };
 
         if let Some(t) = new_text {
             let edit = on_change(t);
@@ -543,6 +561,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             focused: was_focused,
             committed,
             committed_text,
+            blurred,
             nav_up,
             nav_down,
         }
@@ -743,6 +762,7 @@ mod tests {
     use daw_ui_platform::PhysicalSize;
     use daw_ui_renderer::{Rect, Scene};
 
+    use super::TextInputResponse;
     use crate::edit::Edit;
     use crate::id::WidgetId;
     use crate::input::FrameInput;
@@ -1578,5 +1598,143 @@ mod tests {
             frame_with_keys(vec![key_pressed(PhysicalKey::Enter)], Modifiers::default()),
         );
         assert!(c, "batched commit 直後の意図的 submit Enter は commit する");
+    }
+
+    // ============================================================================
+    // daw_01 #112: テキスト入力は focus loss (rect 外 click) で確定 (blurred)。
+    // Esc では blurred を立てない (Esc は cancel)。
+    // ============================================================================
+
+    /// widget rect (10,10,200,28) の外 (500,500) を primary press する frame。
+    fn frame_press_outside() -> FrameInput {
+        FrameInput {
+            pointer: PointerFrame {
+                pos: Some((500.0, 500.0)),
+                primary_just_pressed: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// 1 frame 回して TextInputResponse 全体を返す。
+    fn resp_for(
+        host: &mut UiHost<()>,
+        scene: &mut Scene,
+        screen: PhysicalSize,
+        text: &str,
+        input: FrameInput,
+    ) -> TextInputResponse {
+        let captured: Arc<Mutex<TextInputResponse>> =
+            Arc::new(Mutex::new(TextInputResponse::default()));
+        let capt = captured.clone();
+        let mut m = ();
+        host.frame(&mut m, scene, screen, input, |(), ui| {
+            let resp = ui.text_input_at_focused(
+                "ti",
+                Rect { x: 10.0, y: 10.0, w: 200.0, h: 28.0 },
+                text,
+                |_new| Edit::mutate(|()| {}),
+            );
+            *capt.lock().unwrap() = resp;
+        });
+        captured.lock().unwrap().clone()
+    }
+
+    /// type した後 rect 外を click → blurred=true / committed=false、 確定 text は
+    /// controlled `text` 引数ではなく typing の buffer (= on_change を撃たない caller でも確定可)。
+    #[test]
+    fn click_outside_blurs_and_commits_buffer() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // Frame 1: focus + 全選択。
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+        // Frame 2: 'Z' を type (全選択 → "Z")。 buffer_text = "Z"。
+        let _ = run_input_frame(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(
+                vec![key_pressed_text(PhysicalKey::Char('Z'), "Z")],
+                Modifiers::default(),
+            ),
+        );
+        scene.clear();
+        // Frame 3: rect 外 click → blur。 controlled text は "abc" のまま (model に未反映を模擬)。
+        let resp = resp_for(&mut host, &mut scene, screen, "abc", frame_press_outside());
+        assert!(!resp.committed, "外 click は Enter ではないので committed=false");
+        assert!(resp.blurred, "rect 外 click で focus 喪失 → blurred=true");
+        // blur frame は frame-start focus を保持する (batched IME 取りこぼし防止のため was_focused に
+        // blurred を畳む #112)。 実 focus は解放済みで、 次 frame では focused=false になる (下で確認)。
+        assert_eq!(
+            resp.committed_text.as_deref(),
+            Some("Z"),
+            "blur frame の committed_text は typing buffer ('Z')、 controlled text ('abc') ではない"
+        );
+        // 次 frame: click 無しで再描画 → focus は解放済み (blur が pending_focus を clear した)。
+        scene.clear();
+        let next = resp_for(&mut host, &mut scene, screen, "abc", FrameInput::default());
+        assert!(!next.focused, "blur の次 frame では focus が解放されている");
+        assert!(!next.blurred, "click が無ければ blurred は false");
+    }
+
+    /// daw_01 #112 回帰: IME 変換確定 (Ime::Commit) と rect 外 click が **同 frame** に来ても
+    /// (Windows は composition 中の外 click で composition を finalize し、 Commit を mouse press と
+    /// 同 frame に送る)、 確定した日本語が committed_text に載ること。 blur frame で input 処理を
+    /// skip すると確定文字が buffer に取り込まれず空/古いまま commit される regression を防ぐ。
+    #[test]
+    fn batched_ime_commit_with_click_outside_commits_confirmed_text() {
+        use crate::input::ImeEvent;
+
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        // Frame 1: 空文字で focus 取得。
+        run_focus_frame(&mut host, &mut scene, screen, "");
+        scene.clear();
+
+        // Frame 2: Ime::Commit("猫") と rect 外 click を同 frame に投入。
+        let input = FrameInput {
+            ime: vec![ImeEvent::Commit("猫".to_string())],
+            pointer: PointerFrame {
+                pos: Some((500.0, 500.0)),
+                primary_just_pressed: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resp = resp_for(&mut host, &mut scene, screen, "", input);
+        assert!(resp.blurred, "外 click で blurred=true");
+        assert_eq!(
+            resp.committed_text.as_deref(),
+            Some("猫"),
+            "同 frame の batched IME Commit が確定文字として commit される (空/古い値にならない)"
+        );
+    }
+
+    /// Esc は focus を失っても blurred=false (Esc は cancel なので commit に昇格させない)。
+    #[test]
+    fn escape_does_not_set_blurred() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        run_focus_frame(&mut host, &mut scene, screen, "abc");
+        scene.clear();
+        let resp = resp_for(
+            &mut host,
+            &mut scene,
+            screen,
+            "abc",
+            frame_with_keys(vec![key_pressed(PhysicalKey::Escape)], Modifiers::default()),
+        );
+        assert!(!resp.blurred, "Esc 由来の focus 解除は blurred=false");
+        assert!(!resp.committed, "Esc は committed=false");
+        assert!(resp.committed_text.is_none(), "Esc では committed_text は None");
     }
 }

@@ -2688,8 +2688,9 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
                     })
                 },
             );
-            // Enter で確定 → overlay 消去
-            if resp_text.committed {
+            // Enter (committed) でも外クリック (blurred = focus loss) でも確定 → overlay 消去
+            // (daw_01 #112: rename / inspector / 数値欄と同じ focus-loss-commit 契約)。
+            if resp_text.committed || resp_text.blurred {
                 ui.push_edit(Edit::mutate(move |mm: &mut DawModel| {
                     mm.arr_rename_target = None;
                     mm.last_action = format!("arr: Rename {rid} committed");

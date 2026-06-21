@@ -1606,7 +1606,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 })
             },
         );
-        if text_resp.committed {
+        // Enter でも外クリック (blurred = focus loss) でも確定する (daw_01 #112)。
+        if text_resp.committed || text_resp.blurred {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CommitClipTextContentEdit)
             }));
@@ -2140,7 +2141,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     })
                 },
             );
-            if resp.committed {
+            // Enter でも外クリック (blurred = focus loss) でも確定する (daw_01 #112)。
+            if resp.committed || resp.blurred {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::CommitClipTextContentEdit)
                 }));

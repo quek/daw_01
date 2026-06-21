@@ -386,9 +386,7 @@ mod tests {
     fn gen_talk_fixture() {
         use crate::model::{PluginInstance, TextContent, TextEvent};
         use crate::port_config::PortConfig;
-        let mut song = Song::default();
-        song.bpm = 120.0;
-        song.length_beats = 16.0;
+        let mut song = Song { bpm: 120.0, length_beats: 16.0, ..Default::default() };
         let cid = song.alloc_content_id();
         song.clip_contents.insert(
             cid,

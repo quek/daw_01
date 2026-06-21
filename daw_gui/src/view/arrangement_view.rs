@@ -718,7 +718,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     })
                 },
             );
-            if edit_resp.committed {
+            // Enter (committed) でも外クリック (blurred = focus loss) でも確定する。
+            // Esc は root の escape handler が CancelRenameClip を出す (blurred には乗らない)。
+            if edit_resp.committed || edit_resp.blurred {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::CommitRenameClip);
                 }));
@@ -892,7 +894,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     })
                 },
             );
-            if resp.committed {
+            // Enter (committed) でも外クリック (blurred = focus loss) でも確定する。
+            // Esc は root の escape handler が CancelRenameTrack を出す (blurred には乗らない)。
+            if resp.committed || resp.blurred {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::CommitRenameTrack);
                 }));
@@ -927,14 +931,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         })
                     },
                 );
-                // Enter で確定、 または text edit の外をクリックして focus を失ったら確定
-                // (Esc は press 無しなので commit せず、 root の escape handler が cancel する)。
-                let clicked_outside = {
-                    let p = ui.pointer();
-                    p.primary_just_pressed
-                        && p.pos.is_some_and(|(px, py)| !input_rect.contains(px, py))
-                };
-                if r.committed || clicked_outside {
+                // Enter (committed) でも外クリック (blurred = focus loss) でも確定する。
+                // Esc は press 無しなので blurred には乗らず、 root の escape handler が cancel する。
+                // (daw_01 #112: 以前ここで手書きしていた clicked_outside 判定は widget の
+                // `blurred` に一本化。 SSoT で他の rename / inspector / 数値欄と同じ挙動。)
+                if r.committed || r.blurred {
                     ui.push_edit(Edit::mutate(|app: &mut AppData| {
                         app.handle_event(AppEvent::CommitRenameSection);
                     }));

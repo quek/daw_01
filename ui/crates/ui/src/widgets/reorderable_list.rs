@@ -877,7 +877,7 @@ mod tests {
                 |i| if i == expanded { extra_h } else { 0.0 },
                 |_ui, i, rect| {
                     expansion_calls.set(expansion_calls.get() + 1);
-                    expansion_idx.set(i as i64);
+                    expansion_idx.set(i64::try_from(i).unwrap());
                     expansion_y.set(rect.y);
                 },
             );
@@ -885,7 +885,7 @@ mod tests {
 
         // 展開 callback は展開行 (1) で 1 度だけ。
         assert_eq!(expansion_calls.get(), 1, "展開行で expansion が 1 度呼ばれる");
-        assert_eq!(expansion_idx.get(), expanded as i64);
+        assert_eq!(expansion_idx.get(), i64::try_from(expanded).unwrap());
         // 展開領域は row1 の base (top = 1*28 = 28) の直下 (= 28 + row_height 26 = 54)。
         assert!((expansion_y.get() - 54.0).abs() < 0.01, "expansion rect.y = row1底 (got {})", expansion_y.get());
         // row 2 の base top = row0(28) + row1(26+100+2=128) = ... tops[2] = 28 + 128 = 156。
