@@ -729,6 +729,15 @@ pub struct AutomationPointKeyRef {
     pub point_idx: u32,
 }
 
+/// automation lane 上で点とクリップが共存選択されたときに、 copy / cut / delete を
+/// どちらの面に向けるかを決める「最後に選んだ面」 (last-wins) のタグ。
+/// `AppData::last_automation_select` が保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomationSelectSurface {
+    Points,
+    Clips,
+}
+
 /// gui_01 #028: `MoveAutomationPoints` 用の 1 point delta。`value_norm`
 /// は normalized 0..1 (widget が cursor 座標から計算した値)、handler が
 /// `lane.target` を引いて plain 単位に逆変換する。
@@ -1190,6 +1199,12 @@ pub struct AppData {
     /// 毎フレーム `&[AutomationClipKey]` で渡して selected highlight を
     /// 描画させる。 session-only。
     pub selected_automation_clips: Vec<common::model::AutomationClipKey>,
+    /// 直近に確定した automation 選択面 (点 or クリップ)。 点とクリップは共存選択
+    /// できる (lasso は両方拾う) ため、 copy / cut / delete の対象面が曖昧になる。
+    /// 「最後に選んだ面を対象にする」 (last-wins) ためのタイブレーカ。 `None` は
+    /// どちらも未選択 / 初期状態。 session-only。 [[reuse_inspector_idiom]] 同様、
+    /// edit_surface (view) がこの値で点/クリップの優先を解決する。
+    pub last_automation_select: Option<AutomationSelectSurface>,
     /// Phase 3 (`docs/plan_automation.md` §10): 選択中の automation point。
     /// gui_01 #033 で widget 側の lasso 矩形選択が landing するまで空のまま
     /// だが、 copy / paste / quantize / delete のハンドラは selection を
@@ -2105,6 +2120,7 @@ impl AppData {
             expanded_automation_tracks: std::collections::HashSet::new(),
             master_row_automation_expanded: false,
             selected_automation_clips: Vec::new(),
+            last_automation_select: None,
             selected_automation_points: Vec::new(),
             last_touched_param: None,
             recording_mode: common::model::RecordingMode::default(),
@@ -5828,9 +5844,17 @@ impl AppData {
                 self.delete_automation_clips(&keys)
             }
             AppEvent::SelectAutomationClips { prev: _, next } => {
+                // 直近に選択した automation 面を記録 (= 点とクリップが共存選択された
+                // ときの copy/cut/delete 対象を「最後に選んだ面」 に決める last-wins)。
+                if !next.is_empty() {
+                    self.last_automation_select = Some(AutomationSelectSurface::Clips);
+                }
                 self.selected_automation_clips = next;
             }
             AppEvent::SelectAutomationPoints { prev: _, next } => {
+                if !next.is_empty() {
+                    self.last_automation_select = Some(AutomationSelectSurface::Points);
+                }
                 self.selected_automation_points = next;
             }
             AppEvent::QuantizeSelectedAutomationPoints(div) => {
@@ -10690,6 +10714,7 @@ impl AppData {
                 point_idx: i,
             })
             .collect();
+        self.last_automation_select = Some(AutomationSelectSurface::Points);
         self.sync_song_to_plugin_host();
         count
     }
@@ -10947,6 +10972,154 @@ impl AppData {
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
             self.selected_notes.clear();
+            self.sync_song_to_plugin_host();
+        }
+        pasted
+    }
+
+    // -------- automation clip clipboard (オートメーションクリップの copy / cut / paste) --------
+
+    /// 選択中 automation clip 群を clipboard envelope (`ClipboardPayload::AutomationClips`)
+    /// JSON に。 最早 clip start を `start_beat` 0 とした相対で正規化、 curve 点は lane の
+    /// `target` を引いて **clip-local 時間 + normalized 値** (`CopiedPoint`) で serialize する
+    /// (= automation point copy と同じ idiom、 target が違う lane に貼っても shape を温存)。
+    /// `source_content_id` を保持して linked group を paste 後も保つ。 戻り値は `(json, count)`、
+    /// 選択無し / 解決失敗なら `None`。
+    pub fn copy_automation_clips_clip(&self) -> Option<(String, usize)> {
+        if self.selected_automation_clips.is_empty() {
+            return None;
+        }
+        let mut resolved = Vec::new();
+        for k in &self.selected_automation_clips {
+            let Some(lane) = self.song.automation_lane_by_key(k.track, k.lane) else {
+                continue;
+            };
+            let Some(clip) = lane.clip_by_id(k.clip) else {
+                continue;
+            };
+            resolved.push((lane.target.clone(), clip.clone()));
+        }
+        if resolved.is_empty() {
+            return None;
+        }
+        let earliest = resolved
+            .iter()
+            .map(|(_, c)| c.start_beat)
+            .fold(f64::INFINITY, f64::min);
+        let base = if earliest.is_finite() { earliest } else { 0.0 };
+        let mut out = Vec::with_capacity(resolved.len());
+        for (target, clip) in &resolved {
+            let points: Vec<crate::clipboard::CopiedPoint> =
+                match self.song.clip_contents.get(&clip.content_id) {
+                    Some(common::model::ClipContent::Automation(a)) => a
+                        .points
+                        .iter()
+                        .map(|p| crate::clipboard::CopiedPoint {
+                            time_beat: p.time_beat,
+                            value_norm: common::automation::plain_to_norm(target, p.value),
+                            curve: p.curve,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+            let name = self.song.clip_content_names.get(&clip.content_id).cloned();
+            out.push(crate::clipboard::AutomationClipCopy {
+                start_beat: clip.start_beat - base,
+                length_beats: clip.length_beats,
+                source_content_id: clip.content_id,
+                points,
+                name,
+            });
+        }
+        let count = out.len();
+        let json = crate::clipboard::ClipboardEnvelope::new(
+            self.song.project_id,
+            crate::clipboard::ClipboardPayload::AutomationClips(out),
+        )
+        .to_json()?;
+        Some((json, count))
+    }
+
+    /// `AutomationClipCopy` 群を「マウス下の automation lane」(`lane_key`) の `at_beat`
+    /// (song-absolute, snap 済) を基準に貼る。 各 clip の相対 `start_beat` を加算して
+    /// `start_beat` 昇順 insert、 curve は paste 先 lane の `target` で norm→plain 復元する
+    /// (= 独立 content を新規採番。 同一 `source_content_id` を共有していた clip 群は同じ
+    /// 新 content を指して内部リンクを保つ)。 貼った clip 群を新選択にする。 戻り値は挿入数。
+    pub fn paste_automation_clips_at(
+        &mut self,
+        clips: Vec<crate::clipboard::AutomationClipCopy>,
+        lane_key: common::model::AutomationLaneKey,
+        at_beat: f64,
+    ) -> usize {
+        if clips.is_empty() {
+            return 0;
+        }
+        let Some(lane) = self.song.automation_lane_by_key(lane_key.track, lane_key.lane) else {
+            self.status_message = "貼り付け先の automation lane がありません".to_string();
+            return 0;
+        };
+        let target = lane.target.clone();
+        self.push_undo_snapshot();
+        // 同一 source content_id は 1 度だけ採番して dedup (= linked group を paste 後も保つ)。
+        let mut content_remap: std::collections::HashMap<
+            common::model::ContentId,
+            common::model::ContentId,
+        > = std::collections::HashMap::new();
+        let mut new_keys: Vec<common::model::AutomationClipKey> = Vec::new();
+        for cc in &clips {
+            let content_id = if let Some(&id) = content_remap.get(&cc.source_content_id) {
+                id
+            } else {
+                let mut points: Vec<common::model::AutomationPoint> = cc
+                    .points
+                    .iter()
+                    .map(|p| common::model::AutomationPoint {
+                        time_beat: p.time_beat.max(0.0),
+                        value: common::automation::norm_to_plain(&target, p.value_norm),
+                        curve: p.curve,
+                    })
+                    .collect();
+                points.sort_by(|a, b| a.time_beat.total_cmp(&b.time_beat));
+                let content = common::model::ClipContent::Automation(
+                    common::model::AutomationContent { points },
+                );
+                let id = self
+                    .song
+                    .alloc_content(content, cc.name.clone().unwrap_or_default());
+                content_remap.insert(cc.source_content_id, id);
+                id
+            };
+            let Some(lane) = self
+                .song
+                .automation_lane_by_key_mut(lane_key.track, lane_key.lane)
+            else {
+                continue;
+            };
+            let new_id = lane.alloc_clip_id();
+            let start_beat = (at_beat + cc.start_beat).max(0.0);
+            let new_clip = common::model::AutomationClip {
+                id: new_id,
+                name: String::new(),
+                start_beat,
+                length_beats: cc.length_beats,
+                content_id,
+            };
+            let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
+            lane.clips.insert(pos, new_clip);
+            new_keys.push(common::model::AutomationClipKey {
+                track: lane_key.track,
+                lane: lane_key.lane,
+                clip: new_id,
+            });
+        }
+        let pasted = new_keys.len();
+        if pasted > 0 {
+            self.selected_automation_clips = new_keys;
+            // 貼ったばかりの clip を直後の copy/cut/delete 対象にする: 競合する点選択を
+            // 解除し (paste_clips_at が selected_notes を clear するのと同じ)、 last-wins も
+            // clip 側に倒す。
+            self.selected_automation_points.clear();
+            self.last_automation_select = Some(AutomationSelectSurface::Clips);
             self.sync_song_to_plugin_host();
         }
         pasted
@@ -11212,6 +11385,7 @@ impl AppData {
         }
         if !new_keys.is_empty() {
             self.selected_automation_clips = new_keys;
+            self.last_automation_select = Some(AutomationSelectSurface::Clips);
             self.sync_song_to_plugin_host();
         }
     }
@@ -11237,6 +11411,7 @@ impl AppData {
         }
         if !new_keys.is_empty() {
             self.selected_automation_clips = new_keys;
+            self.last_automation_select = Some(AutomationSelectSurface::Clips);
             self.sync_song_to_plugin_host();
         }
     }

@@ -252,9 +252,22 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Redo)));
             });
             m.item("Delete", |ui| {
+                // 各 delete は対象が非空のときだけ発火する。 handle_event は undoable
+                // event ごとに無条件で undo snapshot を積む (= 空選択でも no-op snapshot
+                // が 1 つ積まれ「Ctrl+Z が効かない」 ように見える) ため、 ここで空判定を
+                // かけて 1 メニュー Delete = 実選択分だけの undo step に抑える。
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::DeleteSelectedNotes);
-                    app.handle_event(AppEvent::DeleteSelectedClip);
+                    if !app.selected_notes.is_empty() {
+                        app.handle_event(AppEvent::DeleteSelectedNotes);
+                    }
+                    if !app.selected_automation_clips.is_empty() {
+                        app.handle_event(AppEvent::DeleteAutomationClips {
+                            keys: app.selected_automation_clips.clone(),
+                        });
+                    }
+                    if app.selected_clip.is_some() || !app.selected_clips.is_empty() {
+                        app.handle_event(AppEvent::DeleteSelectedClip);
+                    }
                 }));
             });
         });
@@ -288,6 +301,17 @@ enum EditSurface {
 
 /// ポインタ面 → 選択優先順 で対象面を決める。
 fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface> {
+    // automation の点とクリップは共存選択できる (lasso は両方拾う / 点を選んでから
+    // クリップを選ぶ等)。 両方選択されているときは「最後に選んだ面」 (last-wins) を
+    // copy / cut / delete の対象にする。 = クリップのみ選択、 または 点も在るが直近の
+    // 選択がクリップなら clip 面を優先 (= ユーザーが「クリップを選択して Del」 した
+    // のに残存点が消える、 を防ぐ)。
+    let auto_prefer_clips = !app.selected_automation_clips.is_empty()
+        && (app.selected_automation_points.is_empty()
+            || matches!(
+                app.last_automation_select,
+                Some(crate::app::AutomationSelectSurface::Clips)
+            ));
     // 1. ポインタが乗っている面を最優先。
     if is_pianoroll_active {
         return Some(if app.audio_editor_clip.is_some() {
@@ -297,13 +321,20 @@ fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface>
         });
     }
     if app.arrange_hovered_automation_lane.is_some() {
+        // automation lane 上: last-wins で clip が勝つなら clip 面、 それ以外は点面
+        // (点が選択されていればその点、 何も無ければ hover-delete 文脈で点面)。
+        if auto_prefer_clips {
+            return Some(EditSurface::AutomationClips);
+        }
         return Some(EditSurface::AutomationPoints);
     }
     // 2. ポインタがどの編集面でもない → 選択集合の非空優先順。
     if app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty() {
         return Some(EditSurface::AudioEvents);
     }
-    if !app.selected_automation_points.is_empty() {
+    // 点が選択されていても last-wins でクリップが勝つなら点面に入れない
+    // (下流の automation clip 分岐へ落とす)。
+    if !app.selected_automation_points.is_empty() && !auto_prefer_clips {
         return Some(EditSurface::AutomationPoints);
     }
     if !app.selected_notes.is_empty() {
@@ -341,7 +372,10 @@ fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edi
             .copy_points_clip()
             .map(|(j, c)| (j, c, "オートメーションポイント")),
         EditSurface::Clips => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
-        EditSurface::AutomationClips | EditSurface::Tracks | EditSurface::Sections => None,
+        EditSurface::AutomationClips => app
+            .copy_automation_clips_clip()
+            .map(|(j, c)| (j, c, "オートメーションクリップ")),
+        EditSurface::Tracks | EditSurface::Sections => None,
     };
     if let Some((json, count, label)) = synced {
         ui.set_clipboard_text(json);
@@ -351,19 +385,11 @@ fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edi
         }));
         return;
     }
-    match surface {
-        EditSurface::Tracks => {
-            let ids = app.selected_track_ids.clone();
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.copy_tracks(ids);
-            }));
-        }
-        EditSurface::AutomationClips => {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.status_message = "オートメーションクリップの copy は未対応".to_string();
-            }));
-        }
-        _ => {}
+    if matches!(surface, EditSurface::Tracks) {
+        let ids = app.selected_track_ids.clone();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.copy_tracks(ids);
+        }));
     }
 }
 
@@ -381,7 +407,10 @@ fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edit
             .copy_points_clip()
             .map(|(j, c)| (j, c, "オートメーションポイント")),
         EditSurface::Clips => app.copy_clips_clip().map(|(j, c)| (j, c, "クリップ")),
-        EditSurface::AutomationClips | EditSurface::Tracks | EditSurface::Sections => None,
+        EditSurface::AutomationClips => app
+            .copy_automation_clips_clip()
+            .map(|(j, c)| (j, c, "オートメーションクリップ")),
+        EditSurface::Tracks | EditSurface::Sections => None,
     };
     if let Some((json, count, label)) = synced {
         ui.set_clipboard_text(json);
@@ -392,6 +421,9 @@ fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edit
                 points: app.selected_automation_points.clone(),
             },
             EditSurface::Clips => AppEvent::DeleteSelectedClip,
+            EditSurface::AutomationClips => AppEvent::DeleteAutomationClips {
+                keys: app.selected_automation_clips.clone(),
+            },
             _ => return,
         };
         let label = label.to_string();
@@ -401,19 +433,11 @@ fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edit
         }));
         return;
     }
-    match surface {
-        EditSurface::Tracks => {
-            let ids = app.selected_track_ids.clone();
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.cut_tracks(ids);
-            }));
-        }
-        EditSurface::AutomationClips => {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.status_message = "オートメーションクリップの cut は未対応".to_string();
-            }));
-        }
-        _ => {}
+    if matches!(surface, EditSurface::Tracks) {
+        let ids = app.selected_track_ids.clone();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.cut_tracks(ids);
+        }));
     }
 }
 
@@ -497,6 +521,25 @@ fn paste_from_clipboard(
             }
             paste_noop(ui);
         }
+        P::AutomationClips(clips) => {
+            // automation clip は「マウス下の automation lane」へ、 hover 拍を基準に貼る
+            // (= automation point paste と同じく lane + beat が揃ったときのみ)。
+            if let (Some(lane), Some(at)) = (
+                app.arrange_hovered_automation_lane,
+                app.arrangement_hover_beat,
+            ) {
+                let clips = crate::clipboard::sanitize_automation_clips(clips);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let n = app.paste_automation_clips_at(clips, lane, at);
+                    if n > 0 {
+                        app.status_message =
+                            format!("貼り付け: {n} オートメーションクリップ");
+                    }
+                }));
+                return;
+            }
+            paste_noop(ui);
+        }
         P::Tracks(tracks) => {
             if !is_pianoroll_active
                 && let Some(above) = app.arrange_hovered_track
@@ -548,6 +591,9 @@ fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<E
         Some(EditSurface::AutomationPoints) => auto_points
             .clone()
             .map(|points| AppEvent::DeleteAutomationPoints { points }),
+        Some(EditSurface::AutomationClips) => auto_clips
+            .clone()
+            .map(|keys| AppEvent::DeleteAutomationClips { keys }),
         _ => None,
     };
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -903,6 +949,8 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             //   1 回目 = lane の全ポイント
             //   2 回目 (全ポイント選択済 or ポイント無し) = lane の全 automation clip
             //   3 回目 (全 clip 選択済 or clip 無し)     = 曲全体の全 (通常) クリップ
+            // tier2 で点とクリップが両方選択された状態になるが、 直近選択 (= clip) が
+            // last-wins で copy/cut/delete の対象になる (edit_surface 参照)。
             let all_points = app.all_automation_points_in_lane(lane);
             let points_done = all_points.is_empty()
                 || (app.selected_automation_points.len() == all_points.len() && {
