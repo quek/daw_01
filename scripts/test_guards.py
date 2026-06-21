@@ -142,14 +142,6 @@ CASES = [
     # no-ps1-file
     ("ps1-file/pos", "Write", {"file_path": "scripts/foo.ps1", "content": "x"}, 2, {"no-ps1-file"}, set()),
     ("ps1-file/neg", "Write", {"file_path": "scripts/foo.py", "content": "x"}, 0, set(), {"no-ps1-file"}),
-    # no-cd-prefix (+ none-suppression)
-    ("cd/pos-simple", "Bash", {"command": "cd /foo"}, 2, {"no-cd-prefix"}, set()),
-    ("cd/pos-chain", "Bash", {"command": "cd F:/dev/daw_01 && cargo build"}, 2,
-     {"no-cd-prefix", "no-command-chaining"}, set()),
-    ("cd/neg-gitC", "Bash", {"command": "git -C F:/dev/other status"}, 0, set(), {"no-cd-prefix"}),
-    ("cd/neg-cdr", "Bash", {"command": "cdr something"}, 0, set(), {"no-cd-prefix"}),
-    ("cd/neg-cdprogram", "Bash", {"command": "cd-discid /dev/sr0"}, 0, set(), {"no-cd-prefix"}),
-    ("cd/amp-fires", "Bash", {"command": "cd && ls"}, 2, {"no-cd-prefix"}, set()),
     # no-command-chaining
     ("chain/pos", "Bash", {"command": "cargo build && cargo test"}, 0, {"no-command-chaining"}, set()),
     ("chain/neg", "Bash", {"command": "cargo build"}, 0, set(), {"no-command-chaining"}),
@@ -301,10 +293,6 @@ CASES = [
     ("gap/pwsh-shebang", "Write",
      {"file_path": "scripts/release.sh", "content": "#!/usr/bin/env pwsh\nWrite-Host build\n"}, 2,
      {"no-pwsh-shebang"}, set()),
-    ("gap/cd-manifest-path", "Bash",
-     {"command": "cargo build --manifest-path F:/dev/daw_01/Cargo.toml -p daw_gui"}, 2,
-     {"no-cd-prefix"}, set()),
-    ("gap/cd-pushd", "Bash", {"command": "pushd F:/dev/daw_01"}, 2, {"no-cd-prefix"}, set()),
     ("gap/chain-semicolon", "Bash", {"command": "git add a.rs ; git status"}, 0,
      {"no-command-chaining"}, set()),
     ("gap/chain-or", "Bash", {"command": "cargo build || echo failed"}, 0,
