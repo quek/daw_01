@@ -1139,9 +1139,21 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // (bottom panel) は同時には開かないので順番でも実用 OK。
     // plugin picker / send picker が開いている間は escape を消費しない
     // (= track_picker / plugin_picker の modal が close_on_escape で閉じる)。
+    //
+    // FIXME #84: piano_roll の歌詞 inline 編集中も escape を消費しない。 この
+    // `dispatch_shortcuts` は `bottom_panel::draw` (= piano_roll widget) より前に走るため、
+    // ここで `take_shortcut("escape")` を消費すると widget の歌詞キャンセルハンドラ
+    // (piano_roll.rs) に escape が届かず、 代わりに下の選択解除 branch が走って編集中
+    // clip が deselect → MIDI エディタが空表示になってしまう。 編集中はここで消費せず
+    // widget に委ねる (widget が `take_shortcut("escape")` で歌詞編集を cancel する)。
+    // 条件は piano_roll_view が実際に走る状況 (Piano Roll タブ + Audio Editor 非表示) に
+    // 一致させる (`app.piano_roll_lyric_editing` 単独だと stale-true で誤委譲しうる)。
+    let pianoroll_lyric_editing =
+        app.bottom_panel == 1 && app.audio_editor_clip.is_none() && app.piano_roll_lyric_editing;
     if !app.is_plugin_picker_open
         && !app.is_font_picker_open
         && app.send_picker.is_none()
+        && !pianoroll_lyric_editing
         && ui.take_shortcut("escape")
     {
         if app.track_rename_id.is_some() {
@@ -1181,5 +1193,111 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 app.handle_event(AppEvent::CloseHelp)
             }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use common::protocol::MainToChild;
+    use daw_ui_core::{FrameInput, UiHost};
+    use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+    use daw_ui_renderer::Scene;
+    use tokio::sync::mpsc;
+
+    use crate::app::ClipRef;
+    use crate::dispatcher::{
+        BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
+    };
+
+    fn build_app() -> AppData {
+        let (audio_tx, _audio_rx) = mpsc::unbounded_channel::<MainToChild>();
+        let (plugin_tx, _plugin_rx) = mpsc::unbounded_channel::<MainToChild>();
+        let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
+        let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
+        AppData::new(
+            audio_tx,
+            plugin_tx,
+            None,
+            None,
+            event_dispatcher,
+            job_dispatcher,
+            None,
+            None,
+        )
+    }
+
+    /// Esc 押下 1 フレームを `dispatch_shortcuts` に通し、 push された Edit を app に適用する。
+    /// `UiHost::no_redraw()` の default binding は "escape" = Escape を含むので、
+    /// Escape KeyEvent を渡すと frame 頭で "escape" shortcut が pending に積まれる。
+    fn dispatch_escape(app: &mut AppData) {
+        let mut host: UiHost<AppData> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 1280, height: 720 };
+        let bottom_rect = Rect { x: 0.0, y: 400.0, w: 1280.0, h: 320.0 };
+        let input = FrameInput {
+            keyboard: vec![KeyEvent {
+                state: ElementState::Pressed,
+                text: None,
+                physical_key: PhysicalKey::Escape,
+            }],
+            ..FrameInput::default()
+        };
+        let edits = host.frame_to_edits(app, &mut scene, screen, input, |app, ui| {
+            dispatch_shortcuts(app, ui, bottom_rect);
+        });
+        for e in edits {
+            e.apply(app);
+        }
+    }
+
+    /// FIXME #84: piano_roll の歌詞 inline 編集中の Esc は global の `dispatch_shortcuts`
+    /// で消費されず piano_roll widget に委ねられる。 ここで消費 (選択解除) されると
+    /// 編集中 clip が deselect → MIDI エディタが空表示になる回帰を防ぐ。
+    #[test]
+    fn escape_during_lyric_edit_is_not_consumed_by_global_dispatch() {
+        let mut app = build_app();
+        app.bottom_panel = 1; // Piano Roll タブ
+        app.piano_roll_lyric_editing = true; // 歌詞編集中
+        app.selected_notes = vec![1];
+        dispatch_escape(&mut app);
+        assert_eq!(
+            app.selected_notes,
+            vec![1],
+            "歌詞編集中の Esc は global dispatch で消費されず note 選択は維持される",
+        );
+    }
+
+    /// 対の保証: 歌詞編集中でなければ Esc は従来どおり global dispatch が消費して
+    /// note 選択を解除する (既存挙動を壊していない)。
+    #[test]
+    fn escape_clears_note_selection_when_not_lyric_editing() {
+        let mut app = build_app();
+        app.bottom_panel = 1;
+        app.piano_roll_lyric_editing = false; // 非編集
+        app.selected_notes = vec![1];
+        dispatch_escape(&mut app);
+        assert!(
+            app.selected_notes.is_empty(),
+            "非編集時の Esc は従来どおり note 選択を解除する",
+        );
+    }
+
+    /// Audio Editor が開いている間は piano_roll widget が走らないので、 歌詞フラグが
+    /// stale-true でも委譲してはならない (= Esc が宙に浮く)。 ガードの
+    /// `audio_editor_clip.is_none()` 項が効いて、 Esc は従来どおり Audio Editor を閉じる。
+    #[test]
+    fn escape_closes_audio_editor_even_if_lyric_flag_is_stale() {
+        let mut app = build_app();
+        app.bottom_panel = 1;
+        app.piano_roll_lyric_editing = true; // stale-true を想定
+        app.audio_editor_clip = Some(ClipRef { track: 0, clip: 0 });
+        dispatch_escape(&mut app);
+        assert!(
+            app.audio_editor_clip.is_none(),
+            "Audio Editor 表示中の Esc は歌詞フラグに関わらず Audio Editor を閉じる",
+        );
     }
 }
