@@ -20,16 +20,20 @@
 #   --merged-tip <sha>  remove the worktree whose HEAD == <sha>. No-op if none.
 #   --all               remove EVERY worktree under .claude/worktrees whose branch
 #                       is fully merged into main AND does not sit at main's
-#                       current tip. The "merged" test is `merge-base --is-ancestor
-#                       <branch> main`; for a merged branch that is ALWAYS equal to
-#                       its tip, so a "tip != merge-base" gate (the old logic) is
-#                       self-contradictory and matched nothing. We instead exclude
-#                       only `tip == main HEAD` (a fresh or fast-forward worktree we
-#                       cannot tell apart from active) -- target those with --name.
+#                       current tip. "Merged" (see branch_merged_into_main) means
+#                       the branch has NO unique non-merge commit AND adds no net
+#                       content over main -- so it catches the merge-flow leftover
+#                       (tip is a "merge main into feature" commit, unreachable from
+#                       main yet carrying no unique work; the old --is-ancestor test
+#                       wrongly skipped these) WITHOUT deleting a branch that holds
+#                       real committed work. We still exclude `tip == main HEAD` (a
+#                       fresh or fast-forward worktree we cannot tell apart from
+#                       active) -- target those with --name.
 # Safety (skipped only with --force):
 #   * target must live under <repo>/.claude/worktrees/ (never the main worktree).
 #   * branch must be fully merged into main (no unmerged work lost).
-#   * working tree must be clean (no uncommitted tracked changes).
+#   * working tree must be clean: no uncommitted tracked changes, and no unsaved
+#     gitignored/untracked deliverables except the regenerable target/ & third_party/.
 set -uo pipefail
 
 # ---- args ------------------------------------------------------------------
@@ -54,8 +58,12 @@ mkdir -p "$repo/target"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$logfile"; }
 
-# Absolute MSYS path, trailing slash stripped, for stable comparison.
-norm() { cygpath -u "$1" 2>/dev/null | sed 's:/*$::'; }
+# Absolute path, trailing slash stripped, for stable comparison. cygpath ships
+# only with Cygwin/MSYS2/Git-for-Windows; on stock Linux/macOS/CI it is absent, so
+# fall back to the raw path (git already reports POSIX-style absolute paths there).
+# Without this fallback every norm() returns "" off-Windows, collapsing every path
+# comparison and making the whole script non-functional (fails safe, but broken).
+norm() { local p; p="$(cygpath -u "$1" 2>/dev/null)"; [ -n "$p" ] || p="$1"; printf '%s' "$p" | sed 's:/*$::'; }
 
 # 0 (true) if the worktree at git-reported path $1 is still registered. Avoids a
 # `git ... | grep` pipe so `set -o pipefail` + SIGPIPE can't abort the script.
@@ -65,6 +73,29 @@ _still_registered() {
     case "$line" in "worktree $p") return 0;; esac
   done < <(git -C "$repo" worktree list --porcelain 2>/dev/null)
   return 1
+}
+
+# 0 (true) if removing branch $1 loses no committed work that is not already in
+# main. TWO conditions, both required:
+#   (1) `git rev-list --no-merges main..$1` is EMPTY -- the branch has no UNIQUE
+#       NON-merge commit. This is the load-bearing guard: a bare tree/content test
+#       is NOT enough, because a branch that commits work and then reverts it (the
+#       add-then-undo / spike-then-revert / WIP-undo flow) nets to an empty tree
+#       yet holds real commits that exist ONLY on this branch -- deleting it with
+#       `branch -D` would orphan them (gc-bound data loss). The merge-flow leftover
+#       passes because its ONLY unique commit is the "merge main into feature"
+#       merge itself (excluded by --no-merges; its non-merge work already landed in
+#       main). NOTE: this is reachability-based, so squash/cherry-picked work
+#       (distinct SHA) is conservatively KEPT -- same as the old --is-ancestor.
+#   (2) `git diff --quiet main...$1` (three-dot) is EMPTY -- the branch adds no net
+#       content over main. Catches an evil merge whose extra content is carried
+#       only by a merge commit, which (1) does not inspect.
+# Any git error (bad ref / no merge-base) -> non-zero -> treated as NOT merged.
+branch_merged_into_main() {
+  local b="$1"
+  [ -n "$b" ] || return 1
+  [ -z "$(git -C "$repo" rev-list --no-merges "main..$b" 2>/dev/null)" ] || return 1
+  git -C "$repo" diff --quiet "main...$b" 2>/dev/null
 }
 
 # Kill the processes that typically hold a worktree dir open (only on --force).
@@ -77,7 +108,12 @@ kill_holders() {
 }
 
 # ---- worktree enumeration --------------------------------------------------
-# Emit one TAB-separated row per worktree: <path>\t<head>\t<branch>\t<locked>
+# Emit one row per worktree, fields separated by US (0x1f, \037): a NON-whitespace
+# delimiter is REQUIRED -- with a tab, `read`'s IFS-whitespace splitting collapses
+# adjacent tabs and drops empty fields, so a DETACHED worktree (empty branch field)
+# would shift `locked` into `branch`, defeating both the detached-HEAD and
+# locked-skip guards in remove_one. US preserves empty fields exactly.
+# Row layout: <path>\037<head>\037<branch>\037<locked>
 list_worktrees() {
   git -C "$repo" worktree list --porcelain 2>/dev/null | awk -v RS='' '
     {
@@ -89,7 +125,7 @@ list_worktrees() {
         else if (lines[i] ~ /^branch /) { b=substr(lines[i],8); sub(/^refs\/heads\//,"",b) }
         else if (lines[i] ~ /^locked/)  { locked=1 }
       }
-      if (p!="") printf "%s\t%s\t%s\t%s\n", p, h, b, locked
+      if (p!="") printf "%s\037%s\037%s\037%s\n", p, h, b, locked
     }'
 }
 
@@ -109,11 +145,17 @@ remove_one() {
 
   if [ "$o_force" -ne 1 ]; then
     if [ -z "$branch" ]; then log "SKIP (detached HEAD, use --force): $wt"; return; fi
-    if ! git -C "$repo" merge-base --is-ancestor "$branch" main 2>/dev/null; then
+    if ! branch_merged_into_main "$branch"; then
       log "SKIP (branch '$branch' not merged into main): $wt"; return
     fi
-    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
-      log "SKIP (uncommitted changes, use --force): $wt"; return
+    # `--ignored` so unsaved gitignored deliverables (e.g. the project's untracked
+    # docs/FIXME.md backlog, scratch design notes) also block a non-force removal --
+    # plain `git status --porcelain` hides them and the dir would be deleted with
+    # the notes inside. Exclude only known-regenerable ignored trees: target/ (build
+    # cache) and third_party/ (vendored ffmpeg, a real copy restorable via
+    # `make fetch-ffmpeg`); those are always present and must not block every removal.
+    if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null | grep -vE '^!! (target|third_party)/')" ]; then
+      log "SKIP (uncommitted or unsaved gitignored changes, use --force): $wt"; return
     fi
   fi
 
@@ -135,13 +177,13 @@ remove_one() {
   fi
   [ -e "$wt" ] && log "  NOTE: deregistered, but an empty dir remains (a process holds it open); it will clear on its own. ($wt)"
 
-  # Delete the now-unreferenced branch.
+  # Delete the now-unreferenced branch. We only reach here after either --force or
+  # a confirmed branch_merged_into_main (no unique non-merge commit), so `branch -D`
+  # orphans nothing real. Plain `branch -d` would WRONGLY refuse the merge-flow
+  # leftover (tip is a "merge main into feature" commit, unreachable from main), so
+  # use -D unconditionally -- the predicate, not git's -d check, is the safety net.
   if [ -n "$branch" ]; then
-    if [ "$o_force" -eq 1 ]; then
-      git -C "$repo" branch -D "$branch" >/dev/null 2>&1 && log "  deleted branch '$branch'" || log "  NOTE: branch '$branch' not deleted; kept"
-    else
-      git -C "$repo" branch -d "$branch" >/dev/null 2>&1 && log "  deleted branch '$branch'" || log "  NOTE: branch '$branch' not fully merged?; kept"
-    fi
+    git -C "$repo" branch -D "$branch" >/dev/null 2>&1 && log "  deleted branch '$branch'" || log "  NOTE: branch '$branch' not deleted; kept"
   fi
   log "REMOVED: $wt"
 }
@@ -149,13 +191,13 @@ remove_one() {
 # ---- select targets --------------------------------------------------------
 wtroot_n="$(norm "$wtroot")"
 matched=0
-while IFS=$'\t' read -r p h b lk; do
+while IFS=$'\037' read -r p h b lk; do
   [ -n "$p" ] || continue
   pn="$(norm "$p")"
   if [ "$o_all" -eq 1 ]; then
     case "$pn/" in "$wtroot_n"/*) : ;; *) continue;; esac
     [ -n "$b" ] || continue
-    git -C "$repo" merge-base --is-ancestor "$b" main 2>/dev/null || continue  # fully merged
+    branch_merged_into_main "$b" || continue  # content-merged (subsumes is-ancestor; catches merge-flow leftover)
     tip="$(git -C "$repo" rev-parse "$b" 2>/dev/null || true)"
     mainhead="$(git -C "$repo" rev-parse main 2>/dev/null || true)"
     [ -n "$tip" ] && [ -n "$mainhead" ] || continue

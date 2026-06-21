@@ -106,6 +106,11 @@ worktree-rm:
 	@[ -n "$(NAME)" ] || { echo "usage: make worktree-rm NAME=<worktree-name> [FORCE=1]"; exit 1; }
 	$(BASH) "$(CLEANUP_WT)" --name "$(NAME)" $(if $(FORCE),--force,)
 
-# マージ済み (merge commit 経由で main に入り、tip != main HEAD) worktree を全部削除する。
+# マージ済み worktree を全部削除する。判定 (branch_merged_into_main): branch 固有の
+# 非マージコミットが無い (rev-list --no-merges main..branch が空) かつ main に対する正味
+# 差分が無い (git diff --quiet main...branch)。これで tip が「main を feature に merge」
+# したコミット (= --is-ancestor では未マージ扱いになるマージフローの残骸) を拾いつつ、
+# 作業をコミットして revert しただけの net-zero ブランチ (固有コミットを持つ) は誤削除しない。
+# tip == main HEAD (fresh/ff) は active と区別不能なので除外し --name 用。
 worktree-rm-merged:
 	$(BASH) "$(CLEANUP_WT)" --all
