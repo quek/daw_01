@@ -1,0 +1,10 @@
+# Claude Code が新しい worktree (--worktree / EnterWorktree / subagent / desktop 並列) を
+# 作るとき、main checkout から「gitignore されているファイル」を自動コピーする設定。
+# .gitignore 構文で書き、gitignore されていて かつ ここに match したものだけがコピーされる。
+#
+# /third_party/ は .gitignore 済みの vendored ffmpeg (BtbN n7.1 win64 LGPL shared)。
+# これを auto-copy することで、fresh worktree での `make fetch-ffmpeg` 手作業が不要になる。
+# 実コピーなので junction は作られない (CLAUDE.md の junction 禁止と整合)。
+# 注意: worktree ごとに ffmpeg 実体 (数十 MB) が複製される。
+# 参考: https://code.claude.com/docs/en/worktrees
+/third_party/
