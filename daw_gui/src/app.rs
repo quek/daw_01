@@ -1033,14 +1033,41 @@ pub struct PendingClipFxBounce {
 
 /// `Z` キーの段階ズームが復元用に積む arrangement の view 状態スナップショット。
 /// `X` (= `ArrangeZoomBack`) が pop して 1 段ずつ巻き戻す。 縦ズームは
-/// `track_row_overrides` を書き換えるので、 per-track override も一緒に捕まえる。
-#[derive(Clone)]
+/// `track_row_overrides` / `automation_lane_row_overrides` を書き換えるので、
+/// per-track / per-lane override も一緒に捕まえる。 `PartialEq` は「ユーザーが
+/// Z の後で手動ズーム / スクロールしたか」 (= 段階ズームの仕切り直し判定) に使う。
+#[derive(Clone, PartialEq)]
 pub(crate) struct ArrangeViewSnapshot {
     zoom_x: f32,
     scroll_beat: f32,
     row_h: f32,
     track_top: f32,
     row_overrides: std::collections::HashMap<u32, u16>,
+    lane_row_overrides: std::collections::HashMap<common::model::AutomationLaneKey, u16>,
+}
+
+/// `Z` 段階ズームが「同じ対象に対する連続押下か」 を判定するための選択シグネチャ。
+/// 選択面 (通常 clip / primary clip / automation clip) のいずれかが変わったら別対象
+/// とみなして段階を 0 (横ズーム) に戻す。
+#[derive(Clone, PartialEq)]
+pub(crate) struct ZoomSelectionSig {
+    clips: Vec<common::model::ClipKey>,
+    clip: Option<common::model::ClipKey>,
+    automation: Vec<common::model::AutomationClipKey>,
+    /// 対象面 (通常 clip / automation clip)。 選択集合が同じでも対象面が変われば
+    /// (= ポインタが clip レーン ⇄ automation レーンへ移動) 仕切り直す。
+    target_automation: bool,
+}
+
+/// `Z` 段階ズームの現在のアンカー。 直近の Z が「どの選択」を「どの view 状態」に
+/// 適用したか + 何段進んだか (`stage`: 1=横適用済 / 2=横+縦適用済) を保持する。
+/// 次の Z で選択シグネチャが変わる or `applied_view` と現在 view が食い違う
+/// (= ユーザーが手動で動かした) なら段階 0 から仕切り直す。
+#[derive(Clone)]
+pub(crate) struct ArrangeZoomAnchor {
+    sig: ZoomSelectionSig,
+    applied_view: ArrangeViewSnapshot,
+    stage: u8,
 }
 
 /// 進行中 export の現在フェーズ + 進捗。`AppData::export_stage` が単一の真実源で、
@@ -1438,6 +1465,23 @@ pub struct AppData {
     /// 2 回目 push で縦ズーム前の view を積む。 `X` が pop して 1 段ずつ戻し、
     /// 空になったら全体フィットに落ちる。 load / new / recovery で clear。
     pub(crate) arrange_zoom_history: Vec<ArrangeViewSnapshot>,
+    /// FIXME #86: `Z` 段階ズームの現在アンカー (直近 Z が適用した選択 + view + 段数)。
+    /// 次の Z で選択 or view が食い違えば段階 0 (横) から仕切り直す。 session-only。
+    pub(crate) arrange_zoom_anchor: Option<ArrangeZoomAnchor>,
+    /// FIXME #86: automation lane の行高 session override (= `Z` 縦ズームで選択
+    /// automation clip のレーンを画面いっぱいに拡大した一時値。 model の
+    /// `AutomationLane.height_px` は保存対象なので汚さず、 これで上書き表示する)。
+    /// 該当 lane の splitter resize (`set_lane_height`) と `X` (zoom back) で解除。
+    /// `track_row_overrides` の lane 版。 session-only (save / Undo 対象外)。
+    pub automation_lane_row_overrides:
+        std::collections::HashMap<common::model::AutomationLaneKey, u16>,
+    /// FIXME #86: primary 選択 automation clip のレーンの「実描画 content-Y 上端」
+    /// (= scroll 空間の絶対 y、 `arrange_track_top` をこれにすればレーンが viewport
+    /// 上端に来る)。 arrangement view が毎フレーム widget の実 `automation_lane_rects`
+    /// から算出してここに格納し、 `Z` 縦ズームがレイアウトを複製せず参照する。
+    /// 選択 automation clip 無し / レーンが画面外なら `None`。 session-only。
+    pub arrange_primary_lane_content_top:
+        Option<(common::model::AutomationLaneKey, f32)>,
     /// FIXME #16: arrangement の track header 幅 (px、 default 160.0)。 header と
     /// lanes の境界 (右端 splitter) drag で gui_01 arrangement widget が
     /// `SetHeaderW` を発火 → `SetArrangeHeaderW` 経由でここを更新する。 widget は
@@ -2146,6 +2190,9 @@ impl AppData {
             selected_clips: Vec::new(),
             selected_notes: Vec::new(),
             arrange_zoom_history: Vec::new(),
+            arrange_zoom_anchor: None,
+            automation_lane_row_overrides: std::collections::HashMap::new(),
+            arrange_primary_lane_content_top: None,
             arrange_hover_content: None,
             arrange_dragging_track_volume: None,
             arrange_hovered_automation_lane: None,
@@ -3287,8 +3334,11 @@ impl AppData {
         // pending の再生成を無効化する (= 既存 clip をそのまま温存)。
         self.cancel_pending_lipsync_regen();
         // FIXME #34: `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
-        // 別 project に持ち越さない。
+        // 別 project に持ち越さない。 FIXME #86: 段階ズームのアンカーと lane 高
+        // override も旧 project の lane key を指すので一緒に破棄。
         self.arrange_zoom_history.clear();
+        self.arrange_zoom_anchor = None;
+        self.automation_lane_row_overrides.clear();
     }
 
     fn undo(&mut self) {
@@ -4009,10 +4059,11 @@ pub enum AppEvent {
     /// song-absolute 解決済みの beat を渡すので、handler は set-playhead + seek/play のみ。
     PlayFromCursor { beat: f64 },
     ToggleLoop,
-    /// `R` キー: 選択中 clip(s) の bounding range を loop 範囲に設定して
-    /// loop ON + 再生開始。 既に loop ON かつ範囲が選択 clip と一致するなら
-    /// loop を OFF にする (再生は維持)。 選択 clip が無ければ no-op。
-    LoopSelectedClipToggle,
+    /// `R` キー: 選択素材の bounding range を loop 範囲に設定して loop ON + 再生開始。
+    /// 既に loop ON かつ範囲が一致するなら loop を OFF にする (再生は維持)。 選択が
+    /// 無ければ no-op。 `automation` は対象面 (通常 clip / automation clip) を root の
+    /// `edit_surface` arbiter が解決した結果 (= Del/Cut と同じ last-selection-wins)。
+    LoopSelectedClipToggle { automation: bool },
     /// Transport BPM 入力欄の文字列が変わった (commit ではなく途中入力)。
     /// Undo 対象外。
     BpmEditChanged(String),
@@ -4868,10 +4919,13 @@ pub enum AppEvent {
     /// piano_roll は selected_clip のノート bbox に、arrangement は全 clip に fit。
     FitPianoRollToClip,
     FitArrangeToContent,
-    /// `Z` キー: 選択中の clip への段階ズーム。 1 回目で横ズーム、 2 回目で縦
-    /// ズーム (primary clip の track を viewport いっぱいに)、 3 回目以降は no-op。
-    /// 各段で適用前の view を履歴に積む (`zoom_arrange_to_selected_clip`)。
-    ZoomArrangeToSelectedClip,
+    /// `Z` キー: 選択素材への段階ズーム。 1 回目で横ズーム、 2 回目で縦ズーム
+    /// (automation clip ならレーンを viewport 高いっぱいに拡大、 通常 clip なら
+    /// その track 群を viewport に収める)、 3 回目以降は no-op。 選択 / view 変化で
+    /// 段階を仕切り直す。 `automation` は対象面 (通常 clip / automation clip) を root
+    /// の `edit_surface` arbiter が解決した結果 (= Del/Cut と同じ last-selection-wins、
+    /// 「MIDI clip を選んでも残存 automation 選択へズームしてしまう」 を防ぐ)。
+    ZoomArrangeToSelectedClip { automation: bool },
     /// `X` キー (arrangement): ズーム履歴を 1 段戻す。 履歴が空なら全体フィット
     /// (`fit_arrange_to_content`)。 piano roll 側の `X` は引き続き
     /// `FitPianoRollToClip`。
@@ -5676,8 +5730,8 @@ impl AppData {
                 }
                 self.preview_note = next;
             }
-            AppEvent::LoopSelectedClipToggle => {
-                self.loop_selected_clip_toggle();
+            AppEvent::LoopSelectedClipToggle { automation } => {
+                self.loop_selected_clip_toggle(automation);
             }
             AppEvent::BpmEditChanged(s) => {
                 self.bpm_edit_text = s;
@@ -7226,8 +7280,8 @@ impl AppData {
             AppEvent::FitArrangeToContent => {
                 self.fit_arrange_to_content();
             }
-            AppEvent::ZoomArrangeToSelectedClip => {
-                self.zoom_arrange_to_selected_clip();
+            AppEvent::ZoomArrangeToSelectedClip { automation } => {
+                self.zoom_arrange_to_selected_clip(automation);
             }
             AppEvent::ArrangeZoomBack => {
                 self.arrange_zoom_back();
@@ -8859,15 +8913,16 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// `R` キー: 選択中 clip(s) の bounding range (= 最小 `start_beat` 〜
-    /// 最大 `start_beat + length_beats`) を loop 範囲に設定し、 loop ON +
-    /// 再生開始。 既に loop ON かつ現在の loop 範囲が同じ bounding range
-    /// と一致するなら loop を OFF にする (再生は維持)。
+    /// `R` キー: 選択素材の bounding range (= 最小 `start_beat` 〜 最大
+    /// `start_beat + length_beats`) を loop 範囲に設定し、 loop ON + 再生開始。
+    /// 既に loop ON かつ現在の loop 範囲が同じ bounding range と一致するなら
+    /// loop を OFF にする (再生は維持)。
     ///
-    /// 「選択 clip」 は `selected_clips` を優先し、空なら `selected_clip`
-    /// (単数 fallback) を使う。 両方とも空 / 全 ref が無効なら no-op。
-    fn loop_selected_clip_toggle(&mut self) {
-        let Some((start, end)) = self.selected_clips_range() else {
+    /// 対象面 (`automation`) は root の `edit_surface` arbiter が解決した結果。
+    /// その面の選択素材の bounding span を `arrange_selection_beat_span` で取る。
+    /// 解決できなければ no-op。
+    fn loop_selected_clip_toggle(&mut self, automation: bool) {
+        let Some((start, end)) = self.arrange_selection_beat_span(automation) else {
             return;
         };
 
@@ -8889,40 +8944,6 @@ impl AppData {
         if !self.is_playing {
             self.play();
         }
-    }
-
-    /// 選択中 clip 群の bounding beat range を返す。 `selected_clips` を
-    /// 優先し、空なら `selected_clip` を 1 件として扱う。 全 ref が
-    /// 無効 (track / clip が見つからない) or 長さ 0 の場合は `None`。
-    fn selected_clips_range(&self) -> Option<(f64, f64)> {
-        let refs: Vec<ClipRef> = if !self.selected_clips.is_empty() {
-            self.selected_clip_refs()
-        } else if let Some(r) = self.selected_clip_ref() {
-            vec![r]
-        } else {
-            return None;
-        };
-
-        let mut min_start = f64::INFINITY;
-        let mut max_end = f64::NEG_INFINITY;
-        for r in &refs {
-            let Some(track) = self.song.tracks.get(r.track as usize) else {
-                continue;
-            };
-            let Some(clip) = track.clips.get(r.clip as usize) else {
-                continue;
-            };
-            let s = clip.start_beat;
-            let e = clip.start_beat + clip.length_beats;
-            if s < min_start {
-                min_start = s;
-            }
-            if e > max_end {
-                max_end = e;
-            }
-        }
-
-        (min_start.is_finite() && max_end > min_start).then_some((min_start, max_end))
     }
 
     // -------- Track operations ---------------------------------------------
@@ -10203,6 +10224,10 @@ impl AppData {
     /// gui_01 #030 (M14 Phase 63n-5): lane 高さ drag。`next_px` は
     /// widget 側で min/max に clamp 済なのでそのまま反映。
     fn set_lane_height(&mut self, track_id: u32, lane_id: u32, next_px: u16) {
+        // ユーザーが明示的に lane を resize した = `Z` 縦ズームの一時拡大 (session
+        // override) を破棄して model 高さに制御を戻す (FIXME #86)。
+        self.automation_lane_row_overrides
+            .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
         if let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) {
             lane.height_px = next_px;
             // 高さは描画状態のみで再生に影響しないが、 Song 構造の
@@ -13979,24 +14004,35 @@ impl AppData {
             .song
             .tracks
             .iter()
-            .filter(|t| {
-                let mut cursor = t.parent_group_id;
-                let mut hops = 0u8;
-                while let Some(pid) = cursor {
-                    if self.collapsed_groups.contains(&pid) {
-                        return false;
-                    }
-                    hops += 1;
-                    if hops > 32 {
-                        break;
-                    }
-                    cursor = self.song.track_by_id(pid).and_then(|t| t.parent_group_id);
-                }
-                true
-            })
+            .filter(|t| !self.is_hidden_under_collapsed_group(t.id))
             .count();
+        // FIXME #86: 展開中の automation lane も viewport を占める行なので、 行数に
+        // 数え、 後で各 lane を同じ fit 行高へ scale する。 数えないと (旧挙動) lane
+        // ぶんの高さが余計に積まれて content が溢れ、 かつ lane は model height_px の
+        // ままなので「track だけ縮んで automation レーンが高いまま」 になる (ユーザー報告)。
+        // master 行 (`MASTER_TRACK_ID`) の song_lanes も同様。 collapsed track / collapsed
+        // automation / 非 visible lane は widget が描かないので除外。
+        let mut fit_lane_keys: Vec<common::model::AutomationLaneKey> = Vec::new();
+        for t in &self.song.tracks {
+            if self.is_hidden_under_collapsed_group(t.id)
+                || !self.expanded_automation_tracks.contains(&t.id)
+            {
+                continue;
+            }
+            for l in t.automation_lanes.iter().filter(|l| l.visible) {
+                fit_lane_keys.push(common::model::AutomationLaneKey { track: t.id, lane: l.id });
+            }
+        }
+        if self.master_row_automation_expanded {
+            for l in self.song.song_lanes.iter().filter(|l| l.visible) {
+                fit_lane_keys.push(common::model::AutomationLaneKey {
+                    track: common::model::MASTER_TRACK_ID,
+                    lane: l.id,
+                });
+            }
+        }
         // +1 は master 行 (widget が visible_tracks[0] に常時 prepend する)。
-        let row_count = (visible_track_count + 1).max(1);
+        let row_count = (visible_track_count + fit_lane_keys.len() + 1).max(1);
 
         let (min_beat, max_beat) = self
             .song
@@ -14017,118 +14053,237 @@ impl AppData {
         self.arrange_zoom_x = (f64::from(canvas_w) / span_beats).clamp(2.0, 400.0) as f32;
         let row_h = (canvas_h / row_count as f32).clamp(16.0, 96.0);
         self.arrange_track_row_h = row_h;
-        // 「全 track を上端から収める」 のが fit の定義なので:
+        // 「全 track / lane を上端から収める」 のが fit の定義なので:
         //   - 縦スクロールを 0 に戻す (怠ると row 高だけ縮んで track_top が残り、
         //     全 track が viewport 上方へ押し出されて見えなくなる = ユーザー報告のバグ)。
         //   - per-track 行高 override を消す (= row_h は uniform 前提で算出している。
         //     override が残ると 1 track が巨大化して他が画面外に押し出される)。
-        //   - `Z` の段階ズーム履歴をリセット (= 明示的な fit はズーム状態の終端。
-        //     残すと fit 後の `X` が古いズームへ巻き戻って状態が食い違う)。
+        //   - `Z` の段階ズーム履歴 / アンカーをリセット (= 明示的な fit はズーム状態の
+        //     終端。 残すと fit 後の `X` が古いズームへ巻き戻って状態が食い違う)。
+        //   - FIXME #86: automation lane も同じ fit 行高へ scale する session override を
+        //     張り直す (model height_px は保存対象なので汚さない)。 これで「track だけ
+        //     縮んで automation レーンが高いまま」 を解消。 Z 拡大の残り override も
+        //     ここで上書きされる。 splitter resize / fresh Z で個別に解除される。
         self.arrange_track_top = 0.0;
         self.track_row_overrides.clear();
         self.arrange_zoom_history.clear();
+        self.arrange_zoom_anchor = None;
+        self.automation_lane_row_overrides.clear();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let lane_px = (row_h.round() as u16).max(1);
+        for k in fit_lane_keys {
+            self.automation_lane_row_overrides.insert(k, lane_px);
+        }
     }
 
-    /// `Z` キーの段階ズーム (FIXME #34)。
-    /// - 1 回目: 選択中の clip (複数選択ならその bounding beat span) を arrangement
-    ///   幅いっぱいに **横ズーム** (`arrange_zoom_x` / `arrange_scroll_beat`)。
-    /// - 2 回目: primary 選択 clip の track を viewport いっぱいに **縦ズーム**
-    ///   (その track の row 高 override を lanes 高に設定 + その track 上端へ scroll)。
-    ///   縦位置は widget が返した実 `track_header_rects` 由来の
-    ///   `arrange_primary_track_content_top` を使うのでレイアウトを複製しない。
+    /// `Z` キーの段階ズーム (FIXME #34 / #86)。 選択素材 (通常 clip + automation
+    /// clip) を arrangement に framing する。
+    /// - 1 回目: bounding beat span を幅いっぱいに **横ズーム**。
+    /// - 2 回目: **縦ズーム**。 automation clip を選んでいればその primary レーンを
+    ///   viewport の高さいっぱいに拡大 + 上端へ scroll (`automation_lane_row_overrides`
+    ///   の session override)。 そうでなければ選択 clip の track 群を viewport に収める。
     /// - 3 回目以降: 何もしない (横+縦ズーム済み)。
+    ///
+    /// **仕切り直し (FIXME #86)**: 直近 Z 以降に選択が変わった or ユーザーが手動で
+    /// ズーム / スクロールした (= `arrange_zoom_anchor.applied_view` と現在 view が
+    /// 食い違う) ときは段階を 0 に戻し、 新しい選択へ横ズームし直す。 これにより
+    /// 「別 clip を選んで Z → その clip にズーム」「マウスでズームを変えた後の Z →
+    /// 取り直し」 が成立する。
     ///
     /// 各段で適用前の view を `arrange_zoom_history` に積み、 `X`
     /// (`arrange_zoom_back`) が 1 段ずつ巻き戻す。
-    fn zoom_arrange_to_selected_clip(&mut self) {
-        match self.arrange_zoom_history.len() {
-            // ---- 1 回目: 横ズーム ----
-            0 => {
-                let Some((min_start, max_end)) = self.selected_clips_beat_span() else {
-                    return;
-                };
-                let (canvas_w, _) = self.last_arrange_canvas_size;
-                if canvas_w < 16.0 {
-                    return;
-                }
-                let snap = self.capture_arrange_view();
-                self.arrange_zoom_history.push(snap);
-                let span = max_end - min_start;
-                // clip が canvas 幅の ~92% を占めるよう左右に proportional padding
-                // (短い clip でも極端に拡大しすぎないよう最小 0.5 beat)。
-                let pad = (span * 0.04).max(0.5);
-                self.arrange_scroll_beat = (min_start - pad).max(0.0) as f32;
-                self.arrange_zoom_x =
-                    (f64::from(canvas_w) / (span + pad * 2.0)).clamp(2.0, 400.0) as f32;
-            }
-            // ---- 2 回目: 縦ズーム (選択 clip のある全 track を viewport に収める) ----
-            1 => {
-                let lanes_h = self.last_arrange_canvas_size.1;
-                if lanes_h < 16.0 {
-                    return;
-                }
-                let Some((v_min, v_max)) = self.selected_tracks_visible_index_span() else {
-                    return;
-                };
-                let snap = self.capture_arrange_view();
-                self.arrange_zoom_history.push(snap);
-                // override を消して uniform 行高にし、 選択 track の index 範囲が
-                // viewport いっぱいになる row 高を全 track へ。 master 行 (render 先頭、
-                // 行高 override 無し) を +1 として数え、 先頭の選択 track 上端へ scroll。
-                // uniform 化により縦レイアウトが index で正確に決まる (= widget の実
-                // rect を引かずに済む。 automation lane 展開時のみ近似)。
-                let rows = (v_max - v_min + 1) as f32;
-                let row_h = (lanes_h / rows).clamp(16.0, 2000.0);
-                self.track_row_overrides.clear();
-                self.arrange_track_row_h = row_h;
-                self.arrange_track_top = ((v_min + 1) as f32) * row_h;
-            }
-            // ---- 3 回目以降: 既に横+縦ズーム済み ----
-            _ => {}
+    fn zoom_arrange_to_selected_clip(&mut self, automation: bool) {
+        let sig = self.current_zoom_selection_sig(automation);
+        // 直近アンカーと同じ選択 + view が手付かずなら段階を継続、 それ以外は仕切り直し。
+        let stage = match self.arrange_zoom_anchor.take() {
+            Some(a) if a.sig == sig && self.arrange_view_matches(&a.applied_view) => a.stage,
+            _ => 0,
+        };
+        let new_stage = match stage {
+            0 => self.zoom_arrange_horizontal(automation).then_some(1),
+            1 => self.zoom_arrange_vertical(automation).then_some(2),
+            // 既に横+縦ズーム済み: view を変えずアンカーだけ維持。
+            _ => Some(stage),
+        };
+        if let Some(stage) = new_stage {
+            self.arrange_zoom_anchor = Some(ArrangeZoomAnchor {
+                sig,
+                applied_view: self.capture_arrange_view(),
+                stage,
+            });
+        }
+        // new_stage == None: 適用不能 (選択無し等)。 アンカーは None のまま (= 次も仕切り直し)。
+    }
+
+    /// `Z` 1 段目: 対象面 (`automation`) の選択素材の bounding beat span を幅いっぱいに
+    /// 横ズーム。 適用したら `true`、 選択無し / canvas 過小なら `false` (view 不変)。
+    fn zoom_arrange_horizontal(&mut self, automation: bool) -> bool {
+        let Some((min_start, max_end)) = self.arrange_selection_beat_span(automation) else {
+            return false;
+        };
+        let (canvas_w, _) = self.last_arrange_canvas_size;
+        if canvas_w < 16.0 {
+            return false;
+        }
+        // fresh な横ズームは新しい zoom セッションの起点。 前セッションの lane 拡大
+        // (一時 override) を破棄してから snapshot を撮る — snapshot に古い拡大を
+        // 持ち越さないことで、 後で `X` / fit したとき automation レーンだけ高いまま
+        // 残るのを防ぐ (FIXME #86)。 override は lane-fill 中だけ存在する一時状態。
+        self.automation_lane_row_overrides.clear();
+        let snap = self.capture_arrange_view();
+        self.arrange_zoom_history.push(snap);
+        let span = max_end - min_start;
+        // clip が canvas 幅の ~92% を占めるよう左右に proportional padding
+        // (短い clip でも極端に拡大しすぎないよう最小 0.5 beat)。
+        let pad = (span * 0.04).max(0.5);
+        self.arrange_scroll_beat = (min_start - pad).max(0.0) as f32;
+        self.arrange_zoom_x =
+            (f64::from(canvas_w) / (span + pad * 2.0)).clamp(2.0, 400.0) as f32;
+        true
+    }
+
+    /// `Z` 2 段目: 縦ズーム。 automation clip 選択時は primary レーンを viewport
+    /// いっぱいに拡大 (lane height override) + 上端へ scroll、 それ以外は選択 track
+    /// 群を viewport に収める。 適用したら `true`、 lanes 過小 / 対象解決不能なら
+    /// `false` (view 不変)。
+    fn zoom_arrange_vertical(&mut self, automation: bool) -> bool {
+        let lanes_h = self.last_arrange_canvas_size.1;
+        if lanes_h < 16.0 {
+            return false;
+        }
+        // 対象面が automation clip なら、 そのレーンを viewport 高いっぱいに拡大する
+        // (= MIDI track の縦ズームの「レーン版」)。 primary レーンの実 content-Y は
+        // view が widget の実 rect から算出済 (`arrange_primary_lane_content_top`)。
+        if automation
+            && let Some((lane_key, content_top)) = self.arrange_primary_lane_content_top
+            && self
+                .selected_automation_clips
+                .iter()
+                .any(|k| k.lane_key() == lane_key)
+        {
+            let snap = self.capture_arrange_view();
+            self.arrange_zoom_history.push(snap);
+            // レーン高 = viewport 高 (u16 へ saturating)。 レーンより上の行高は
+            // 変わらないので content_top はそのままレーン上端の絶対 y。
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let lane_px = lanes_h.clamp(16.0, f32::from(u16::MAX)) as u16;
+            self.automation_lane_row_overrides.insert(lane_key, lane_px);
+            self.arrange_track_top = content_top.max(0.0);
+            return true;
+        }
+        // 通常 clip 選択: 選択 track 群が viewport いっぱいになるよう uniform 行高 +
+        // 先頭行へ scroll (master 行を行 0 とする統一行 index 空間)。
+        let Some((r_min, r_max)) = self.selected_tracks_visible_row_span(automation) else {
+            return false;
+        };
+        let snap = self.capture_arrange_view();
+        self.arrange_zoom_history.push(snap);
+        let rows = (r_max - r_min + 1) as f32;
+        let row_h = (lanes_h / rows).clamp(16.0, 2000.0);
+        self.track_row_overrides.clear();
+        self.arrange_track_row_h = row_h;
+        self.arrange_track_top = (r_min as f32) * row_h;
+        true
+    }
+
+    /// `Z` 段階ズームの選択シグネチャ (通常 clip 群 / primary clip / automation clip 群
+    /// / 対象面)。 これが変わると別対象とみなして段階 0 (横ズーム) から仕切り直す。
+    fn current_zoom_selection_sig(&self, automation: bool) -> ZoomSelectionSig {
+        ZoomSelectionSig {
+            clips: self.selected_clips.clone(),
+            clip: self.selected_clip,
+            automation: self.selected_automation_clips.clone(),
+            target_automation: automation,
         }
     }
 
-    /// 選択 clip のある track 群の、 可視 track 並び (collapsed group 配下を除外
-    /// = widget の `is_visible_track` と一致) における index 範囲 `(min, max)`。
-    /// 選択無し / どれも不可視なら `None`。 縦ズームの「収める範囲」 算出に使う。
-    fn selected_tracks_visible_index_span(&self) -> Option<(usize, usize)> {
-        let mut track_ids: std::collections::HashSet<u32> =
-            self.selected_clips.iter().map(|k| k.track_id).collect();
-        if track_ids.is_empty()
-            && let Some(k) = self.selected_clip
-        {
-            track_ids.insert(k.track_id);
+    /// 現在の arrangement view が `snap` と一致するか (= 直近 Z 以降ユーザーが手動で
+    /// ズーム / スクロール / 行高変更をしていないか)。 段階ズームの仕切り直し判定に使う。
+    fn arrange_view_matches(&self, snap: &ArrangeViewSnapshot) -> bool {
+        self.capture_arrange_view() == *snap
+    }
+
+    /// 対象面 (`automation`) の選択素材が乗っている track 群の、 arrangement の可視行
+    /// 並びにおける行 index 範囲 `(min, max)`。 行 0 は常時先頭に描かれる master 行、
+    /// 行 `n` (n>=1) は可視 track の `n-1` 番目 (collapsed group 配下は除外 = widget の
+    /// `is_visible_track` と一致)。 master 行に乗る automation clip
+    /// (`AutomationClipKey.track == MASTER_TRACK_ID`) は行 0 に対応する。 選択無し /
+    /// どれも不可視なら `None`。 縦ズーム (automation はレーン拡大不能時の fallback、
+    /// clip は track 群を収める) の「収める行範囲」 算出に使う。
+    fn selected_tracks_visible_row_span(&self, automation: bool) -> Option<(usize, usize)> {
+        // 対象 track id を対象面の選択から集める。 master 行 automation clip は
+        // song.tracks に無いので別フラグで持つ。
+        let mut track_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut include_master = false;
+        if automation {
+            for k in &self.selected_automation_clips {
+                if k.track == common::model::MASTER_TRACK_ID {
+                    include_master = true;
+                } else {
+                    track_ids.insert(k.track);
+                }
+            }
+        } else {
+            track_ids.extend(self.selected_clips.iter().map(|k| k.track_id));
+            if track_ids.is_empty()
+                && let Some(k) = self.selected_clip
+            {
+                track_ids.insert(k.track_id);
+            }
         }
-        if track_ids.is_empty() {
+        if track_ids.is_empty() && !include_master {
             return None;
         }
-        let (mut v_min, mut v_max) = (usize::MAX, 0usize);
-        let mut vi = 0usize;
+        let (mut r_min, mut r_max) = (usize::MAX, 0usize);
+        if include_master {
+            r_min = 0;
+            r_max = 0;
+        }
+        // 行 0 = master、 可視 track の i 番目は行 i+1。
+        let mut vi = 1usize;
         for t in &self.song.tracks {
             if self.is_hidden_under_collapsed_group(t.id) {
                 continue;
             }
             if track_ids.contains(&t.id) {
-                v_min = v_min.min(vi);
-                v_max = v_max.max(vi);
+                r_min = r_min.min(vi);
+                r_max = r_max.max(vi);
             }
             vi += 1;
         }
-        (v_min != usize::MAX).then_some((v_min, v_max))
+        (r_min != usize::MAX).then_some((r_min, r_max))
     }
 
-    /// 選択 clip 群 (空なら primary 単独) の bounding beat 範囲。 解決不能 / 退化
-    /// (長さ 0) なら `None`。
-    fn selected_clips_beat_span(&self) -> Option<(f64, f64)> {
-        let mut keys = self.selected_clips.clone();
-        if keys.is_empty() {
-            keys.extend(self.selected_clip);
-        }
+    /// 対象面 (`automation`) の選択素材の bounding beat 範囲。 通常 clip と automation
+    /// clip は直交して共存選択できる (他 DAW 互換) ため、 `Z`/`R` は union ではなく
+    /// root の `edit_surface` arbiter が選んだ **片面のみ** を対象にする (last-selection
+    /// -wins、 = 「MIDI clip を選んだのに残存 automation 選択へズームしてしまう」 を防ぐ)。
+    /// 解決不能 / 退化 (長さ 0) なら `None`。 `Z` 横ズームと `R` loop が共有する。
+    fn arrange_selection_beat_span(&self, automation: bool) -> Option<(f64, f64)> {
         let (mut min_start, mut max_end) = (f64::INFINITY, f64::NEG_INFINITY);
-        for key in keys {
-            if let Some(clip) = self.clip_at(key) {
-                min_start = min_start.min(clip.start_beat);
-                max_end = max_end.max(clip.start_beat + clip.length_beats);
+        if automation {
+            // automation clip: lane (track / master) を解決して span を畳み込む。
+            for &k in &self.selected_automation_clips {
+                if let Some(clip) = self
+                    .song
+                    .automation_lane_by_key(k.track, k.lane)
+                    .and_then(|lane| lane.clip_by_id(k.clip))
+                {
+                    min_start = min_start.min(clip.start_beat);
+                    max_end = max_end.max(clip.start_beat + clip.length_beats);
+                }
+            }
+        } else {
+            // 通常 clip: selected_clips 優先、 空なら primary selected_clip 単独。
+            let mut clip_keys = self.selected_clips.clone();
+            if clip_keys.is_empty() {
+                clip_keys.extend(self.selected_clip);
+            }
+            for key in clip_keys {
+                if let Some(clip) = self.clip_at(key) {
+                    min_start = min_start.min(clip.start_beat);
+                    max_end = max_end.max(clip.start_beat + clip.length_beats);
+                }
             }
         }
         (min_start.is_finite() && max_end > min_start).then_some((min_start, max_end))
@@ -14142,6 +14297,7 @@ impl AppData {
             row_h: self.arrange_track_row_h,
             track_top: self.arrange_track_top,
             row_overrides: self.track_row_overrides.clone(),
+            lane_row_overrides: self.automation_lane_row_overrides.clone(),
         }
     }
 
@@ -14154,9 +14310,12 @@ impl AppData {
             self.arrange_track_row_h = v.row_h;
             self.arrange_track_top = v.track_top;
             self.track_row_overrides = v.row_overrides;
+            self.automation_lane_row_overrides = v.lane_row_overrides;
         } else {
             self.fit_arrange_to_content();
         }
+        // 1 段戻したら段階ズームのアンカーは無効 (次の Z は仕切り直し)。
+        self.arrange_zoom_anchor = None;
     }
 
     fn set_clip_positions(&mut self, entries: &[(ClipRef, u32, f64)]) {

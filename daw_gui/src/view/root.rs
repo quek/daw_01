@@ -623,6 +623,20 @@ fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<E
 /// `bottom_rect` は piano_roll active 判定用。マウスが bottom_panel 領域内 + Piano Roll
 /// タブが選択中なら G/X/1/2/3 を piano_roll 系に流す。それ以外は arrange 系。
 fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect) {
+    // 編集面 arbiter (clipboard / delete / `Z` zoom / `R` loop が共有)。 関数冒頭で
+    // 1 度算出し、 先頭の `R` ブロックから末尾の全選択ブロックまで全シーケンスで使う。
+    // `is_pianoroll_active`: マウスが bottom_panel 内 + Piano Roll タブ選択中か。
+    let pointer_in_bottom = ui
+        .pointer()
+        .pos
+        .is_some_and(|(px, py)| bottom_rect.contains(px, py));
+    let is_pianoroll_active = app.bottom_panel == 1 && pointer_in_bottom;
+    let surface = edit_surface(app, is_pianoroll_active);
+    // FIXME #86: `Z` 段階ズーム / `R` loop の対象面 (通常 clip / automation clip) は
+    // copy / cut / delete と同じ `edit_surface` arbiter で解決する (last-selection-wins)。
+    // これで「MIDI clip を選んでも残存 automation 選択へズームしてしまう」 を防ぐ。
+    let zoom_automation = matches!(surface, Some(EditSurface::AutomationClips));
+
     // ----- Transport -----
     if ui.take_shortcut("daw.play_toggle") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
@@ -635,8 +649,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
     if ui.take_shortcut("daw.loop_selected_clip") {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.handle_event(AppEvent::LoopSelectedClipToggle)
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::LoopSelectedClipToggle {
+                automation: zoom_automation,
+            })
         }));
     }
     // Phase 7 B5 (`docs/plan_scale.html` §5.3): Shift+P で選択 clip の
@@ -729,13 +745,8 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // (grill-me 2026-06-11)。copy / cut / paste / delete が同じ arbiter を共有。
     // text_input focus 中は gui_01 が cut/copy/paste/delete を自動 suppress するので
     // typing guard は不要。
-    // (`is_pianoroll_active` は以降の grid snap / fit / 全選択ブロックでも使う。)
-    let pointer_in_bottom = ui
-        .pointer()
-        .pos
-        .is_some_and(|(px, py)| bottom_rect.contains(px, py));
-    let is_pianoroll_active = app.bottom_panel == 1 && pointer_in_bottom;
-    let surface = edit_surface(app, is_pianoroll_active);
+    // (`is_pianoroll_active` / `surface` / `zoom_automation` は関数冒頭で算出済 —
+    // `R` loop が先頭ブロックで使うため。)
 
     // FIXME #44: f キー。カーソル直下の拍 (song-absolute) を現在の snap 設定で吸着して
     // プレイヘッドを移動し再生する。piano_roll active ならピアノロールの hover (song-raw)、
@@ -811,7 +822,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.zoom_selected_clip") {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             if !is_pianoroll_active {
-                app.handle_event(AppEvent::ZoomArrangeToSelectedClip);
+                app.handle_event(AppEvent::ZoomArrangeToSelectedClip {
+                    automation: zoom_automation,
+                });
             }
         }));
     }

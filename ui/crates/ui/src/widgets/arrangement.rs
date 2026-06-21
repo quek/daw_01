@@ -967,6 +967,12 @@ pub struct ArrangementResponse {
     /// (`clip_rects` / `automation_point_rects` と同 pattern)。 collapsed group / hidden lane / 完全
     /// off-screen の clip は除外。
     pub automation_clip_rects: Vec<(AutomationClipKey, Rect)>,
+    /// daw_01 #086: 全 visible automation lane の行 rect (= `for_each_visible_lane` の `body_rect`、
+    /// lanes pane 内の縦 `[lane_y, lane_y + height_px)`)。 `automation_clip_rects` と同 semantics
+    /// (描画順、 collapsed group / hidden lane / 完全 off-screen は除外)。 caller (daw_01) は `Z`
+    /// 縦ズームで「選択 automation clip のレーンを画面いっぱいに framing」 する際の実 y 位置として使う
+    /// (= レイアウトを複製せず widget の実 rect を SSoT にする)。
+    pub automation_lane_rects: Vec<(AutomationLaneKey, Rect)>,
     /// M14 Phase 63n-3 (#028): drag 中の automation clip kind (`Some` なら lane 内 clip drag セッション
     /// 進行中)。 既存 `dragging` (MIDI clip 用) と直交、 同 frame 内で両方 `Some` にならない (排他)。
     pub dragging_automation_clip: Option<ClipDragKind>,
@@ -1023,6 +1029,7 @@ impl Default for ArrangementResponse {
             dragging_track_volume: None,
             automation_point_rects: Vec::new(),
             automation_clip_rects: Vec::new(),
+            automation_lane_rects: Vec::new(),
             dragging_automation_clip: None,
             automation_lasso_active: false,
             hovered_automation_lane: None,
@@ -9812,6 +9819,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     return;
                 }
                 let track_id = visible_tracks[t_idx].id;
+                // daw_01 #086: lane の実行 rect (= body_rect そのもの) を毎 frame 返す。
+                // Z 縦ズームがレイアウトを複製せず lane の実 y を引けるようにする。
+                response.automation_lane_rects.push((
+                    AutomationLaneKey { track: track_id, lane: lane.id },
+                    body_rect,
+                ));
                 let beat_to_px = f64::from(body_rect.w) / view.len_beats.max(1e-6);
                 let pad = style.automation_clip_v_pad_px;
                 let clip_y = body_rect.y + pad;

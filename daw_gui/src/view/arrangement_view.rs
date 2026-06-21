@@ -342,6 +342,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 t,
                 &app.song,
                 &refcount_by_content,
+                &app.automation_lane_row_overrides,
                 &|tgt| app.plugin_param_range(t.id, tgt),
             ),
             // gui_01 #031 (M14 Phase 63n-6): 個別 track row 高さ override。
@@ -514,8 +515,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // `Some(...)` を渡す idiom (= None は本機能未使用時用)。
     let master_row_lanes = build_arrangement_lanes_from_slice(
         &app.song.song_lanes,
+        common::model::MASTER_TRACK_ID,
         &app.song,
         &refcount_by_content,
+        &app.automation_lane_row_overrides,
         &|_| None,
     );
     let master_row = daw_ui_core::ArrangementMasterRow {
@@ -578,6 +581,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     if hover_lane != app.arrange_hovered_automation_lane {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.arrange_hovered_automation_lane = hover_lane;
+        }));
+    }
+
+    // FIXME #86: primary 選択 automation clip のレーンの「実描画 content-Y 上端」を
+    // widget の実 lane rect から算出して次フレームへ mirror。 `Z` 縦ズームがレイアウトを
+    // 複製せず「レーンを viewport 上端へ」 scroll する基準にする (lanes pane 上端 =
+    // `area.y + RULER_H`、 content 絶対 y = 現 scroll + 画面オフセット)。 変化時のみ Edit。
+    let lanes_pane_top = area.y + RULER_H;
+    let cur_track_top = app.arrange_track_top;
+    let primary_lane_top = app.selected_automation_clips.last().and_then(|k| {
+        let lane_key = k.lane_key();
+        resp.automation_lane_rects.iter().find_map(|(rk, rect)| {
+            (rk.track == lane_key.track && rk.lane == lane_key.lane)
+                .then_some((lane_key, cur_track_top + (rect.y - lanes_pane_top)))
+        })
+    });
+    if primary_lane_top != app.arrange_primary_lane_content_top {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.arrange_primary_lane_content_top = primary_lane_top;
         }));
     }
 
@@ -2108,9 +2130,17 @@ fn build_arrangement_automation_lanes(
     track: &common::model::Track,
     song: &common::model::Song,
     refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
+    lane_height_overrides: &std::collections::HashMap<common::model::AutomationLaneKey, u16>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
 ) -> Vec<ArrangementAutomationLane> {
-    build_arrangement_lanes_from_slice(&track.automation_lanes, song, refcount_by_content, range_of)
+    build_arrangement_lanes_from_slice(
+        &track.automation_lanes,
+        track.id,
+        song,
+        refcount_by_content,
+        lane_height_overrides,
+        range_of,
+    )
 }
 
 /// gui_01 #034 (Phase 63n-10): `Track.automation_lanes` でも `Song.song_lanes`
@@ -2118,8 +2148,10 @@ fn build_arrangement_automation_lanes(
 /// 由来かに関わらず、 同じ idiom で widget input を組み立てる。
 fn build_arrangement_lanes_from_slice(
     lanes: &[common::model::AutomationLane],
+    track_id: u32,
     song: &common::model::Song,
     refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
+    lane_height_overrides: &std::collections::HashMap<common::model::AutomationLaneKey, u16>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
 ) -> Vec<ArrangementAutomationLane> {
     lanes
@@ -2181,7 +2213,15 @@ fn build_arrangement_lanes_from_slice(
                 color: display.color,
                 enabled: lane.enabled,
                 visible: lane.visible,
-                height_px: lane.height_px,
+                // FIXME #86: `Z` 縦ズームの一時拡大 (session override) があればそれを、
+                // 無ければ model の保存高さを使う (override は描画のみ・save 非対象)。
+                height_px: lane_height_overrides
+                    .get(&common::model::AutomationLaneKey {
+                        track: track_id,
+                        lane: lane.id,
+                    })
+                    .copied()
+                    .unwrap_or(lane.height_px),
                 default_value_norm,
                 clips,
             }
