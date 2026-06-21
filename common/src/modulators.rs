@@ -11,7 +11,7 @@
 
 use crate::model::{
     LfoConfig, LfoShape, ModRate, ModSourceKind, MsegConfig, MsegPlayMode, MsegPoint, RandomConfig,
-    RandomMode, RetriggerMode, StepsConfig, StepsDirection,
+    RetriggerMode, StepsConfig, StepsDirection,
 };
 
 use std::f64::consts::TAU;
@@ -125,12 +125,15 @@ fn eval_random(c: &RandomConfig, song_beat: f64, song_secs: f64) -> f32 {
     let step = cp.floor();
     let frac = (cp - step) as f32;
     let a = random_unit(c.seed, step as i64);
-    let v = match c.mode {
-        RandomMode::SampleHold => a,
-        RandomMode::Smooth => {
-            let b = random_unit(c.seed, step as i64 + 1);
-            lerp(a, b, smoothstep(frac))
-        }
+    // Bitwig 流 Stepped↔Smoothed 連続モーフ: smooth=0 で完全階段 (S&H = `a`)、
+    // smooth=1 で隣接 step を smoothstep 補間、 中間は両者を lerp。
+    let smooth = c.smooth.clamp(0.0, 1.0);
+    let v = if smooth <= 0.0 {
+        a
+    } else {
+        let b = random_unit(c.seed, step as i64 + 1);
+        let interp = lerp(a, b, smoothstep(frac));
+        lerp(a, interp, smooth)
     };
     v.clamp(0.0, 1.0)
 }
@@ -151,6 +154,23 @@ fn step_index(direction: StepsDirection, k: i64, n: usize) -> usize {
             if kk < n { kk } else { period as usize - kk }
         }
     }
+}
+
+/// Steps の現在アクティブな step index (UI の走査ハイライト用)。 `eval_steps` の
+/// index 計算と同一ロジック (direction / PingPong period を反映)。
+#[inline]
+pub fn steps_active_index(c: &StepsConfig, song_beat: f64, song_secs: f64) -> usize {
+    let n = c.values.len();
+    if n == 0 {
+        return 0;
+    }
+    let count = match c.direction {
+        StepsDirection::PingPong if n > 1 => 2 * n - 2,
+        _ => n,
+    };
+    let pos = cycle_pos(&c.rate, song_beat, song_secs, &c.retrigger).rem_euclid(1.0);
+    let k = (pos * count as f64).floor() as i64;
+    step_index(c.direction, k, n)
 }
 
 #[inline]
@@ -320,7 +340,7 @@ mod tests {
     fn random_は同beatで再現し別seedで別値() {
         let mk = |seed| RandomConfig {
             rate: sync_quarter(),
-            mode: RandomMode::SampleHold,
+            smooth: 0.0,
             seed,
             retrigger: RetriggerMode::FreeRun,
         };
@@ -332,29 +352,52 @@ mod tests {
     }
 
     #[test]
-    fn random_sample_holdはstep内一定smoothは補間() {
+    fn random_steppedはstep内一定smoothedは補間() {
+        // smooth=0 (完全 stepped = S&H)。
         let sh = RandomConfig {
             rate: sync_quarter(),
-            mode: RandomMode::SampleHold,
+            smooth: 0.0,
             seed: 7,
             retrigger: RetriggerMode::FreeRun,
         };
         // 同じ step (beat 0.1 と 0.9 は period=1 beat の step 0) → 同値。
         let v1 = generator_scalar(&ModSourceKind::Random(sh), 0.1, 0.0).unwrap();
         let v2 = generator_scalar(&ModSourceKind::Random(sh), 0.9, 0.0).unwrap();
-        assert_eq!(v1, v2, "S&H は step 内一定");
+        assert_eq!(v1, v2, "stepped (smooth=0) は step 内一定");
         // step 境界の値そのもの (frac=0)。
         let edge = generator_scalar(&ModSourceKind::Random(sh), 0.0, 0.0).unwrap();
         assert_eq!(edge, random_unit(7, 0));
-        // Smooth は step 始点で a、 次 step 始点で b。
-        let smooth = RandomConfig {
-            mode: RandomMode::Smooth,
-            ..sh
-        };
+        // smooth=1 は step 始点で a、 次 step 始点で b。
+        let smooth = RandomConfig { smooth: 1.0, ..sh };
         let s0 = generator_scalar(&ModSourceKind::Random(smooth), 0.0, 0.0).unwrap();
         let s1 = generator_scalar(&ModSourceKind::Random(smooth), 1.0, 0.0).unwrap();
         assert!((s0 - random_unit(7, 0)).abs() < 1e-6);
         assert!((s1 - random_unit(7, 1)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn random_smoothは0と1の中間で按分() {
+        let seed = 7;
+        let base = RandomConfig {
+            rate: sync_quarter(),
+            smooth: 0.0,
+            seed,
+            retrigger: RetriggerMode::FreeRun,
+        };
+        // step 中央 (frac=0.5) で stepped=a、 fully-smoothed=lerp(a,b,smoothstep(0.5))。
+        let beat = 0.5;
+        let stepped = generator_scalar(&ModSourceKind::Random(base), beat, 0.0).unwrap();
+        let smoothed =
+            generator_scalar(&ModSourceKind::Random(RandomConfig { smooth: 1.0, ..base }), beat, 0.0)
+                .unwrap();
+        let mid =
+            generator_scalar(&ModSourceKind::Random(RandomConfig { smooth: 0.5, ..base }), beat, 0.0)
+                .unwrap();
+        // 中間 morph は両端の中点 (lerp(stepped, smoothed, 0.5))。
+        assert!(
+            (mid - 0.5 * (stepped + smoothed)).abs() < 1e-6,
+            "smooth=0.5 は stepped と smoothed の中点 (stepped={stepped} smoothed={smoothed} mid={mid})"
+        );
     }
 
     #[test]

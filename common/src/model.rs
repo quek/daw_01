@@ -2767,24 +2767,14 @@ impl Default for LfoConfig {
     }
 }
 
-/// Random の補間モード。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode,
-)]
-pub enum RandomMode {
-    /// step 間を線形補間 (滑らかな乱数)。
-    #[default]
-    Smooth,
-    /// 階段状 (sample & hold)。
-    SampleHold,
-}
-
 /// 乱数変調器。 `seed` を保存し `hash(seed, step)` の純関数にして **オフライン再現**
 /// を保証する (Vital は mt19937 をグローバル seed で非再現、 plan §0)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct RandomConfig {
     pub rate: ModRate,
-    pub mode: RandomMode,
+    /// Bitwig の Stepped↔Smoothed 連続モーフ。 `0.0` = 完全階段 (sample & hold)、
+    /// `1.0` = 隣接 step を smoothstep 補間 (滑らかな乱数)、 中間は両者の lerp。
+    pub smooth: f32,
     /// 決定論のための seed (source 作成時に採番・保存。 UI で re-roll 可)。
     pub seed: u64,
     pub retrigger: RetriggerMode,
@@ -2794,7 +2784,8 @@ impl Default for RandomConfig {
     fn default() -> Self {
         Self {
             rate: ModRate::default(),
-            mode: RandomMode::Smooth,
+            // 既定は完全 smoothed (旧 RandomMode::Smooth 相当)。
+            smooth: 1.0,
             seed: 0,
             retrigger: RetriggerMode::FreeRun,
         }

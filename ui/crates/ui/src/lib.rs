@@ -70,6 +70,7 @@ pub use widgets::ruler_ops::{
     compute_loop_drag_endpoints, loop_band_hit_kind,
 };
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
+pub use widgets::modulator_editor::{MsegAction, MsegEditorResponse, MsegEditorStyle, MsegNode};
 pub use widgets::channel_fader_meter::ChannelFaderMeterResponse;
 pub use widgets::checkbox::CheckboxResponse;
 pub use widgets::color_picker::{ColorPickerResponse, ColorPickerStyle};
