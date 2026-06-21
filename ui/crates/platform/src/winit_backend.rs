@@ -107,6 +107,14 @@ impl WindowBackend for WinitWindow {
         self.inner.set_cursor(map_cursor(cursor));
     }
 
+    fn set_cursor_position(&self, x: f32, y: f32) {
+        use winit::dpi::PhysicalPosition as WinitPos;
+        // best-effort: 未対応プラットフォームでは Err になるが致命的でないので握りつぶす。
+        let _ = self
+            .inner
+            .set_cursor_position(WinitPos::new(f64::from(x), f64::from(y)));
+    }
+
     fn set_ime_allowed(&self, allowed: bool) {
         self.inner.set_ime_allowed(allowed);
     }

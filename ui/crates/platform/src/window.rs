@@ -53,6 +53,11 @@ pub trait WindowBackend: HasWindowHandle + HasDisplayHandle {
     /// マウスカーソル形状を変更。
     fn set_cursor(&self, cursor: CursorIcon);
 
+    /// マウスカーソルを物理ピクセル位置へワープする (ウィンドウ client 座標)。
+    /// ノート作成ドラッグでカーソルをノート右端へ移動する等に使う (Ableton Live 流)。
+    /// 既定実装は no-op (embedded host / 非 winit backend / 未対応プラットフォーム)。
+    fn set_cursor_position(&self, _x: f32, _y: f32) {}
+
     /// IME (input method editor) を有効化/無効化する。
     /// text_input が focus を取ったとき `true`、focus を失ったとき `false` を呼ぶ想定。
     fn set_ime_allowed(&self, allowed: bool);

@@ -169,6 +169,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // on Draw で widget の drag preview pitch も最寄り in-scale に snap。
         // Fold mode / scale = None / Snap on Draw OFF では無関係。
         snap_pitch_during_drag: app.snap_on_draw,
+        // FIXME #82: 新規 note の既定長 = 直近に描いた / 選択した note 長 (last_note_duration_beats)。
+        // Insert と「空白ダブルクリックで即放し」 がこの長さを使う。 ダブルクリックを放さず
+        // ドラッグしたときは widget がドラッグ長を優先する (Bitwig 流)。
+        default_note_len_beats: app.last_note_duration_beats,
     };
     // FIXME #20: 鍵盤のオクターブラベル (C5 / root) のコントラストは widget 側の
     // label 色を背景 (key fill / overlay) の輝度に応じて自動反転させる必要があり
@@ -190,7 +194,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         clip: target.clip,
                         // widget は song-absolute → model は clip-local (FIXME #3)。
                         start_beat: n.start_beat - clip_start_beat,
-                        duration: app.last_note_duration_beats,
+                        // FIXME #82: widget が決めた長さ (Insert/即放し=既定長、 ドラッグ=ドラッグ長)
+                        // を尊重する。 旧 last_note_duration_beats 固定は widget の長さを捨てていた。
+                        duration: n.len_beats,
                         pitch: n.pitch,
                     });
                 })
@@ -350,36 +356,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
-    // 空白上 dbl-click → AddNote (snap_choice / Alt 押下を尊重)。
-    if let Some((px, py)) = ui.take_double_click_in_rect(grid_rect)
-        && note_hit(&widget_notes, view, grid_rect, px, py, resize_handle_px).is_none()
-    {
-        let beat_to_px = grid_rect.w as f64 / view.len_beats.max(1e-6);
-        let pitch_to_px = grid_rect.h / view.pitch_visible.max(1e-6);
-        let beat_raw = view.start_beat + (px - grid_rect.x) as f64 / beat_to_px;
-        let cfg = snap::piano_roll_snap_config(app);
-        let alt = ui.pointer().modifiers.alt;
-        let snapped_beat = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x).max(0.0);
-        let pitch_raw = view.pitch_top - (py - grid_rect.y) / pitch_to_px;
-        // ceil(): 描画式 `y = grid.y + (pitch_top - pitch) * pt` の逆関数。
-        // round() だと判定領域が視覚行の半行ぶん上にずれて、行下半クリックが 1 下に化ける。
-        let pitch = (pitch_raw.ceil() as i32).clamp(0, 127) as u8;
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::AddNote {
-                track: target.track,
-                clip: target.clip,
-                // song-absolute snap → clip-local (FIXME #3)。
-                start_beat: snapped_beat - clip_start_beat,
-                duration: app.last_note_duration_beats,
-                pitch,
-            });
-        }));
-    }
+    // FIXME #82: 空白上の note 作成 (ダブルクリック + 放さずドラッグで長さ決定、Bitwig 流) は
+    // widget 側に一本化した (`take_double_click_press_in_rect` → NoteCreateSession → `Add`)。
+    // 旧 release ベース `take_double_click_in_rect` の AddNote はここから撤去 (press を放さず
+    // ドラッグを捕捉できないため)。 widget の `Add` request は make_edit で AddNote に変換され、
+    // `n.len_beats` (ドラッグ長 or 既定長) を尊重する。
 
-    // wheel handler — note drag 中は無効
+    // wheel handler — note drag / 作成 (FIXME #82) 中は無効
     // 一般的な DAW (Ableton Live / Reaper) 流: Ctrl=横ズーム, Alt=縦ズーム,
     // Shift=横スクロール, plain=ピッチスクロール (上下)。
-    if resp.dragging.is_none() {
+    if resp.dragging.is_none() && !resp.creating {
         let pointer = ui.pointer();
         if let Some((px, py)) = pointer.pos
             && grid_rect.contains(px, py)

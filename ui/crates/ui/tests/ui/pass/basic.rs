@@ -170,6 +170,8 @@ fn main() {
                 snap_pitch_during_drag: false,
                 // M14 Phase 124 / daw_01 #100: subdivision interval も Option<f64> (Copy) で no-Clone 互換。
                 sub_grid_interval_beats: None,
+                // FIXME #82: 新規 note の既定長 (f64、 no-Clone 互換)。
+                default_note_len_beats: 1.0,
             };
             let style = PianoRollStyle::default();
             let _ = ui.piano_roll(
