@@ -550,8 +550,9 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
 
         // ---- text input mode (editing) の内蔵 delegate ----
         // `was_editing` が true なら inner `text_input_at_focused` を描画 (= focus 取得 + 全選択)。
-        // commit (Enter) で `committed_text` を parse + clamp + `on_change` 発火、 editing 解除。
-        // focus loss (Esc / outside click) で editing 解除 (= 静かに rollback)。
+        // daw_01 #112「テキスト入力は focus loss で確定」: commit (Enter) と blur (外 click) の
+        // どちらでも `committed_text` を parse + clamp + `on_change` 発火して editing 解除。
+        // Esc のみ確定せず rollback (= inner_resp.focused=false かつ committed/blurred でない経路)。
         if was_editing {
             let value_str = format_value(value, format);
             // inner text_input の id は outer id を hash 化した seed で unique 化 (= `Clone` 要求回避)。
@@ -566,8 +567,8 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 },
             );
 
-            // commit 時 (Enter) の確定 text を取得して parse + clamp + on_change 発火。
-            if inner_resp.committed
+            // 確定 (Enter / 外 click による blur) の text を parse + clamp + on_change 発火。
+            if (inner_resp.committed || inner_resp.blurred)
                 && let Some(text) = &inner_resp.committed_text
                 && let Some(parsed) = parse_value(text, format)
             {
@@ -586,7 +587,8 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 state.editing = false;
             }
 
-            // focus loss 検出 (= Esc / 外 click)。 inner_resp.focused が false なら editing 終了。
+            // 残りの focus loss (= Esc) は確定せず editing 終了 (rollback)。 上の commit/blur 分岐で
+            // 既に editing=false でも冪等。
             if !inner_resp.focused {
                 let state: &mut ScrubableNumberState = self.widget_state(wid);
                 state.editing = false;

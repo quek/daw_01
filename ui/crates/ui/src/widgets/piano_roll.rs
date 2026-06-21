@@ -2531,7 +2531,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         |_new_text| Edit::mutate(|_: &mut M| {}),
                     );
 
-                    if resp.committed {
+                    // daw_01 #112「テキスト入力は focus loss で確定」: Enter (committed) と
+                    // 外 click (blurred) のどちらでも歌詞を確定する。 違いは確定後の遷移で、
+                    // Enter は分配先の次 note へ編集を継続、 外 click はその場で編集終了。
+                    // Esc (= committed/blurred でない focus loss) のみ破棄。
+                    if resp.committed || resp.blurred {
                         let committed_text = resp.committed_text.unwrap_or_default();
                         let morae: Vec<String> = if committed_text.is_empty() {
                             // 空文字 commit → 起点 note の歌詞を None に (= 削除)
@@ -2556,26 +2560,32 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         if !updates.is_empty() {
                             self.push_edit(make_edit(PianoRollEditRequest::SetLyrics(updates)));
                         }
-                        // 次 note へ移動 (= 分配し終わった先の note id、無ければ None)
-                        let all_sorted =
-                            collect_next_notes_for_lyric(notes, edit_id, usize::MAX);
-                        let next_id = all_sorted.get(target_ids.len()).copied();
-                        self.widget_state::<PianoRollState>(wid).lyric_editing = next_id;
-                        lyric_editing = next_id;
-                        // selection も自動追従 (daw_01 UI が同期、note 強調が次 note へ)
-                        if let Some(nid) = next_id
-                            && selected != [nid].as_slice()
-                        {
-                            let prev = selected.to_vec();
-                            self.push_edit(make_edit(PianoRollEditRequest::Select {
-                                prev,
-                                next: vec![nid],
-                            }));
-                            response.selection_changed = true;
+                        if resp.committed {
+                            // Enter: 分配し終わった先の note へ移動して編集継続。
+                            let all_sorted =
+                                collect_next_notes_for_lyric(notes, edit_id, usize::MAX);
+                            let next_id = all_sorted.get(target_ids.len()).copied();
+                            self.widget_state::<PianoRollState>(wid).lyric_editing = next_id;
+                            lyric_editing = next_id;
+                            // selection も自動追従 (daw_01 UI が同期、note 強調が次 note へ)
+                            if let Some(nid) = next_id
+                                && selected != [nid].as_slice()
+                            {
+                                let prev = selected.to_vec();
+                                self.push_edit(make_edit(PianoRollEditRequest::Select {
+                                    prev,
+                                    next: vec![nid],
+                                }));
+                                response.selection_changed = true;
+                            }
+                        } else {
+                            // 外 click (blur): 現 note の歌詞を確定して編集終了 (次 note へは進まない)。
+                            self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+                            lyric_editing = None;
                         }
                     } else if !resp.focused {
-                        // Esc 検出 (or 外 click による blur): text_input が
-                        // clear_focus_if_focused → 次 frame で resp.focused = false。
+                        // Esc 検出: text_input が clear_focus_if_focused →
+                        // 次 frame で resp.focused = false かつ committed/blurred でない。破棄。
                         self.widget_state::<PianoRollState>(wid).lyric_editing = None;
                         lyric_editing = None;
                     }
