@@ -1211,6 +1211,11 @@ pub struct AppData {
     /// 入力として動くので先行実装する。 widget からは
     /// `SelectAutomationPoints` (#033) で上書き。 session-only。
     pub selected_automation_points: Vec<AutomationPointKeyRef>,
+    /// FIXME #81: inline 数値入力中の automation point (`Some` のとき
+    /// `arrangement_view` が当該 point の rect に `text_input_at_focused`
+    /// overlay を出す)。session-only / Undo・save 対象外。点をダブルクリック
+    /// で `Some`、 確定 (Enter) / blur / Esc で `None`。
+    pub editing_automation_point: Option<AutomationPointKeyRef>,
     /// gui_01 #028 §7.3: 最後にユーザーが触った parameter。`A` キー
     /// shortcut で「対応 lane を所有 track に追加」 する source。
     /// session-only (起動 None、Undo / save 対象外)。
@@ -1384,6 +1389,11 @@ pub struct AppData {
     /// 同じ「1 drag = 1 undo step」 経路 (gesture begin で 1 snapshot) に乗せる。
     /// session-only (`arrange_hover_content` と同 idiom)。
     pub arrange_dragging_track_volume: Option<u32>,
+    /// FIXME #81: レーンヘッダの default value scrubable がドラッグ / テキスト編集中の
+    /// lane (`Some` の間 1 つだけ)。`inspector_scrub_active` と同 idiom で、 active 立ち上がり
+    /// で `BeginInspectorScrub` (= Song snapshot)、 立ち下がりで `EndInspectorScrub` を発火し、
+    /// 一連の `SetLaneDefault` を undo 1 step に bracket する。session-only。
+    pub arrange_default_scrub_active: Option<common::model::AutomationLaneKey>,
     /// 鍵盤レーン click のプレビュー発音中の `(track_id, pitch)` (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 widget の
     /// `PianoRollResponse::keyboard_active_pitch` を前フレーム値と差分して
@@ -2133,6 +2143,7 @@ impl AppData {
             selected_automation_clips: Vec::new(),
             last_automation_select: None,
             selected_automation_points: Vec::new(),
+            editing_automation_point: None,
             last_touched_param: None,
             recording_mode: common::model::RecordingMode::default(),
             metronome_enabled: false,
@@ -2159,6 +2170,7 @@ impl AppData {
             arrange_zoom_history: Vec::new(),
             arrange_hover_content: None,
             arrange_dragging_track_volume: None,
+            arrange_default_scrub_active: None,
             arrange_hovered_automation_lane: None,
             bottom_panel: 0,
             piano_roll_lyric_editing: false,
@@ -3515,6 +3527,9 @@ impl AppData {
                 | AppEvent::AddAutomationPoint { .. }
                 | AppEvent::MoveAutomationPoints { .. }
                 | AppEvent::DeleteAutomationPoints { .. }
+                // FIXME #81: inline 数値入力の確定 1 件は discrete commit なので
+                // Undo step 化 (`BeginEditAutomationPointValue` は session-only で除外)。
+                | AppEvent::SetAutomationPointValue { .. }
                 | AppEvent::SetAutomationCurveType { .. }
                 | AppEvent::MoveAutomationClips { .. }
                 | AppEvent::CloneAutomationClipsLinked { .. }
@@ -4167,6 +4182,20 @@ pub enum AppEvent {
     /// 相当) で運ぶ。
     DeleteAutomationPoints {
         points: Vec<AutomationPointKeyRef>,
+    },
+    /// FIXME #81: 既存 point 上の dblclick → その point の値の **inline 数値入力**
+    /// を開始する。session-only (undo 対象外)。`editing_automation_point` を
+    /// セットするだけで、 描画は `arrangement_view` が `automation_point_rects`
+    /// から rect を引いて `text_input_at_focused` overlay を出す。
+    BeginEditAutomationPointValue {
+        key: AutomationPointKeyRef,
+    },
+    /// FIXME #81: inline 数値入力の確定 → 1 point の `value` を **plain 単位の
+    /// 絶対値** で上書き (時間 = `time_beat` は不変、 sort 不要)。Undo step 化
+    /// (構造変化系)。`MoveAutomationPoints` (norm delta) と異なり absolute plain。
+    SetAutomationPointValue {
+        key: AutomationPointKeyRef,
+        value: f64,
     },
     /// 右クリック popup → curve type 選択 → 1 point の `curve` 更新。
     /// `prev` / `next` は Undo 構築用に両方持たせる (gui_01 §11.4 と
@@ -5810,6 +5839,17 @@ impl AppData {
             }
             AppEvent::DeleteAutomationPoints { points } => {
                 self.delete_automation_points(&points)
+            }
+            AppEvent::BeginEditAutomationPointValue { key } => {
+                // session-only: 該当 point が存在するときだけ編集開始 (race で
+                // 既に消えていれば no-op)。
+                if self.automation_point_value(&key).is_some() {
+                    self.editing_automation_point = Some(key);
+                }
+            }
+            AppEvent::SetAutomationPointValue { key, value } => {
+                self.set_automation_point_value(&key, value);
+                self.editing_automation_point = None;
             }
             AppEvent::SetAutomationCurveType {
                 track_id,
@@ -10339,6 +10379,44 @@ impl AppData {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
+        }
+        self.sync_song_to_plugin_host();
+    }
+
+    /// FIXME #81: point の現在値 (plain 単位) を読む。inline 数値入力の prefill /
+    /// 編集開始可否判定に使う。master row (`MASTER_TRACK_ID`) lane も
+    /// `automation_lane_by_key` が解決する。
+    pub(crate) fn automation_point_value(&self, key: &AutomationPointKeyRef) -> Option<f64> {
+        let lane = self
+            .song
+            .automation_lane_by_key(key.track_id, key.lane_id)?;
+        let clip = lane.clip_by_id(key.clip_id)?;
+        let content = self.song.clip_contents.get(&clip.content_id)?;
+        let pts = content.automation_points()?;
+        pts.get(key.point_idx as usize).map(|p| p.value)
+    }
+
+    /// FIXME #81: point の値を **plain 単位の絶対値**で上書き (inline 数値入力の確定)。
+    /// `value` は呼び出し側 (`arrangement_view`) で表示単位レンジに clamp +
+    /// `from_display` 済の plain。時間 (`time_beat`) は変えないので sort 順は不変。
+    fn set_automation_point_value(&mut self, key: &AutomationPointKeyRef, value: f64) {
+        let Some(lane) = self
+            .song
+            .automation_lane_by_key(key.track_id, key.lane_id)
+        else {
+            return;
+        };
+        let Some(clip) = lane.clip_by_id(key.clip_id) else {
+            return;
+        };
+        let content_id = clip.content_id;
+        let Some(common::model::ClipContent::Automation(a)) =
+            self.song.clip_contents.get_mut(&content_id)
+        else {
+            return;
+        };
+        if let Some(p) = a.points.get_mut(key.point_idx as usize) {
+            p.value = value;
         }
         self.sync_song_to_plugin_host();
     }

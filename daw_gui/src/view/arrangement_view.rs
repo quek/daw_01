@@ -11,8 +11,8 @@ use daw_ui_core::{
     ArrangementClip, ArrangementClipAudioEdit, ArrangementCurveKind, ArrangementEditRequest,
     ArrangementStyle, ArrangementTrack, ArrangementView, AutomationClipKey,
     AutomationLaneKey, ChannelLayout, ClipKey, ColorPickerStyle, Edit, FadeCurve as WidgetFadeCurve,
-    FadeEdge, MeterScale, SampleSlices, ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource,
-    WaveformStyle, WaveformView,
+    FadeEdge, MeterScale, SampleSlices, ScrubableNumberStyle,
+    ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView,
 };
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
@@ -800,6 +800,201 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
     }
 
+    // ===== FIXME #81: automation 値の数値入力 overlay 群 =====
+    // widget は heavy 内で text_input / scrubable を出せないので、 widget が返す rect /
+    // drag info を使って daw_01 が heavy の外で描く (clip rename / 歌詞編集と同 idiom)。
+    // 値の表示/解釈は `automation_value` (人間可読単位 SSoT) を 1 経路で使う。
+
+    // (a) 編集中 point の inline 数値入力欄 (点をダブルクリックで開始)。
+    if let Some(edit_key) = app.editing_automation_point {
+        let point_rect = resp
+            .automation_point_rects
+            .iter()
+            .find(|(k, _)| {
+                k.clip.track == edit_key.track_id
+                    && k.clip.lane == edit_key.lane_id
+                    && k.clip.clip == edit_key.clip_id
+                    && k.point_idx == edit_key.point_idx
+            })
+            .map(|(_, r)| *r);
+        let lane_target = app
+            .song
+            .automation_lane_by_key(edit_key.track_id, edit_key.lane_id)
+            .map(|l| l.target.clone());
+        if let (Some(rect), Some(target)) = (point_rect, lane_target) {
+            let plugin_range = app.plugin_param_range(edit_key.track_id, &target);
+            let desc = crate::automation_value::automation_value_display(&target, plugin_range);
+            let cur = app.automation_point_value(&edit_key).unwrap_or(0.0);
+            let prefill = desc.format_number(cur);
+            // 点 dot (8px) より広い入力欄を、 点の少し上に center 配置。
+            let field_w = 60.0_f32;
+            let input_rect = Rect {
+                x: rect.x + rect.w * 0.5 - field_w * 0.5,
+                y: (rect.y - 22.0).max(area.y),
+                w: field_w,
+                h: 18.0,
+            };
+            let edit_resp = ui.text_input_at_focused(
+                (
+                    "automation_point_value",
+                    edit_key.track_id,
+                    edit_key.lane_id,
+                    edit_key.clip_id,
+                    edit_key.point_idx,
+                ),
+                input_rect,
+                &prefill,
+                |_new| Edit::mutate(|_| {}),
+            );
+            if edit_resp.committed || edit_resp.blurred {
+                // Enter / 外クリックで確定。 数値が読めれば plain で上書き、 読めなければ
+                // 値は変えずに編集終了。
+                let text = edit_resp.committed_text.unwrap_or_default();
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    if let Some(plain) = desc.parse_to_plain(&text) {
+                        app.handle_event(AppEvent::SetAutomationPointValue {
+                            key: edit_key,
+                            value: plain,
+                        });
+                    } else {
+                        app.editing_automation_point = None;
+                    }
+                }));
+            } else if !edit_resp.focused {
+                // Esc / focus 喪失 (commit でない) → キャンセル。
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.editing_automation_point = None;
+                }));
+            }
+        } else {
+            // 点が画面外 / 削除済 → 編集状態を破棄。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.editing_automation_point = None;
+            }));
+        }
+    }
+
+    // (b) 各 lane のデフォルト値を BPM 風 scrubable_number で編集 (旧スライダー帯を置換、
+    // ドラッグスクラブ + クリックで数値タイプ)。
+    for (lane_key, rect) in &resp.automation_lane_default_rects {
+        let lk = *lane_key;
+        let model_key = common::model::AutomationLaneKey {
+            track: lk.track,
+            lane: lk.lane,
+        };
+        let Some(target) = app
+            .song
+            .automation_lane_by_key(lk.track, lk.lane)
+            .map(|l| l.target.clone())
+        else {
+            continue;
+        };
+        let default_value = app
+            .song
+            .automation_lane_by_key(lk.track, lk.lane)
+            .map_or(0.0, |l| l.default_value);
+        let plugin_range = app.plugin_param_range(lk.track, &target);
+        let desc = crate::automation_value::automation_value_display(&target, plugin_range);
+        let display_value = (desc.to_display)(default_value);
+        let span = (desc.range.1 - desc.range.0).abs();
+        // 256 px ドラッグで表示レンジ全体 (BPM 1 px = 0.5 BPM 相当の感覚)。
+        #[allow(clippy::cast_possible_truncation)]
+        let sensitivity = ((span / 256.0).max(1e-4)) as f32;
+        let style = ScrubableNumberStyle {
+            bg_color: Color { r: 0.12, g: 0.13, b: 0.16, a: 1.0 },
+            bg_color_hovered: Color { r: 0.16, g: 0.17, b: 0.21, a: 1.0 },
+            bg_color_dragging: Color { r: 0.20, g: 0.32, b: 0.42, a: 1.0 },
+            text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+            border: Color { r: 0.30, g: 0.33, b: 0.40, a: 1.0 },
+            border_width: 1.0,
+            radius: 3.0,
+            font_size: 11.0,
+            sensitivity,
+            range: Some(desc.range),
+        };
+        let target_for_change = target.clone();
+        let resp_s = ui.scrubable_number_at(
+            ("automation_lane_default", lk.track, lk.lane),
+            *rect,
+            display_value,
+            // dblclick reset = 現値 (= no-op、 意図しないリセットを避ける)。
+            display_value,
+            desc.format,
+            &style,
+            "LaneDefault",
+            move |display_v| {
+                let target = target_for_change.clone();
+                Edit::mutate(move |app: &mut AppData| {
+                    let plain = (desc.from_display)(display_v.clamp(desc.range.0, desc.range.1));
+                    let norm = common::automation::plain_to_norm(&target, plain);
+                    app.handle_event(AppEvent::SetLaneDefault {
+                        track_id: lk.track,
+                        lane_id: lk.lane,
+                        prev_norm: norm,
+                        next_norm: norm,
+                    });
+                })
+            },
+            None,
+            None,
+        );
+        // undo bracket: drag / text 編集の active edge で BeginInspectorScrub (= Song snapshot)
+        // / EndInspectorScrub を発火し、 一連の SetLaneDefault を undo 1 step にまとめる
+        // (scrub_field と同 idiom)。
+        let active = resp_s.dragging || resp_s.editing_text;
+        let was_active = app.arrange_default_scrub_active == Some(model_key);
+        if active && !was_active {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.arrange_default_scrub_active = Some(model_key);
+                app.handle_event(AppEvent::BeginInspectorScrub);
+            }));
+        } else if !active && was_active {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.arrange_default_scrub_active = None;
+                app.handle_event(AppEvent::EndInspectorScrub);
+            }));
+        }
+    }
+
+    // (c) point drag 中の現値表示 (人間可読単位、 カーソル近傍)。
+    if let Some(drag) = resp.automation_point_drag
+        && let Some(target) = app
+            .song
+            .automation_lane_by_key(drag.key.clip.track, drag.key.clip.lane)
+            .map(|l| l.target.clone())
+    {
+        let plugin_range = app.plugin_param_range(drag.key.clip.track, &target);
+        let desc = crate::automation_value::automation_value_display(&target, plugin_range);
+        let plain = common::automation::norm_to_plain(&target, drag.value_norm);
+        let text = desc.format_with_unit(plain);
+        let (cx, cy) = drag.cursor;
+        let pad = 4.0_f32;
+        #[allow(clippy::cast_precision_loss)]
+        let w = (text.chars().count() as f32) * 7.0 + pad * 2.0;
+        let label_rect = Rect {
+            x: cx + 10.0,
+            y: (cy - 20.0).max(area.y),
+            w,
+            h: 16.0,
+        };
+        ui.push_rect(RectCommand {
+            rect: label_rect,
+            fill: Color { r: 0.08, g: 0.09, b: 0.11, a: 0.92 },
+            border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+            border_width: 1.0,
+            radius: [3.0; 4],
+            clip_rect: None,
+        });
+        ui.label_at(
+            "automation_point_drag_readout",
+            &text,
+            label_rect.x + pad,
+            label_rect.y + 2.0,
+            11.0,
+            Color { r: 0.95, g: 0.96, b: 0.98, a: 1.0 },
+        );
+    }
+
     // gui_01 #028 (M14 Phase 63n-3): automation clip 上の右クリック →
     // Make Unique / Delete。 ただし上で point popup を先に register してい
     // て、 同 frame で右クリックが **point rect 上** だったら clip popup の
@@ -1373,18 +1568,6 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                 });
             })
         }
-        // lane header default slider drag (live preview + release 確定)。
-        // prev / next は normalized、handler 側で plain 化。
-        ArrangementEditRequest::SetLaneDefault { lane, prev, next } => {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetLaneDefault {
-                    track_id: lane.track,
-                    lane_id: lane.lane,
-                    prev_norm: prev,
-                    next_norm: next,
-                });
-            })
-        }
         ArrangementEditRequest::DeleteLane(lane) => {
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::DeleteLane {
@@ -1432,6 +1615,20 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                 value_norm,
             });
         }),
+        // FIXME #81: 既存 point 上の dblclick → 値の数値入力を開始 (inline overlay は
+        // ループ後段で automation_point_rects を引いて出す)。
+        ArrangementEditRequest::DoubleClickAutomationPoint(key) => {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::BeginEditAutomationPointValue {
+                    key: crate::app::AutomationPointKeyRef {
+                        track_id: key.clip.track,
+                        lane_id: key.clip.lane,
+                        clip_id: key.clip.clip,
+                        point_idx: key.point_idx,
+                    },
+                });
+            })
+        }
         // point drag release。同 frame 内 valid な point_idx を gui_01
         // から受け、handler 側で sort 維持しつつ更新。
         ArrangementEditRequest::MoveAutomationPoints(widget_deltas) => {
