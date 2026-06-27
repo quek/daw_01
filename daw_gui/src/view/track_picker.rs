@@ -10,19 +10,19 @@
 
 use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 
-const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
+const COLOR_TEXT: Color = theme::TEXT;
 
 const PANEL_W: f32 = 420.0;
 const PANEL_H: f32 = 420.0;
 const TITLE_H: f32 = 36.0;
 
 const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.6 },
-    panel_bg: Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 },
+    overlay_color: theme::BACKDROP,
+    panel_bg: theme::PANEL,
     panel_radius: 6.0,
     close_on_outside_click: true,
     close_on_escape: true,
@@ -31,9 +31,9 @@ const MODAL_STYLE: ModalStyle = ModalStyle {
 const LIST_STYLE: ListViewStyle = ListViewStyle {
     row_height: 26.0,
     row_gap: 2.0,
-    row_bg: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    row_bg_hover: Color { r: 0.27, g: 0.27, b: 0.32, a: 1.0 },
-    row_bg_selected: Color { r: 0.32, g: 0.55, b: 0.85, a: 1.0 },
+    row_bg: theme::PANEL_RAISED,
+    row_bg_hover: theme::CONTROL_HOVER,
+    row_bg_selected: theme::ACCENT,
     radius: 3.0,
 };
 
@@ -109,7 +109,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 None,
                 &LIST_STYLE,
                 |ui, entry, i, row_rect, is_selected| {
-                    let name_color = if is_selected { Color::WHITE } else { COLOR_TEXT };
+                    let name_color = if is_selected { theme::TEXT_ON_ACCENT } else { COLOR_TEXT };
                     ui.label_at(
                         ("sp_row_name", i),
                         &entry.1,

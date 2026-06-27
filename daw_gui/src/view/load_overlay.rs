@@ -6,14 +6,16 @@
 
 use daw_ui_core::Ui;
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::AppData;
 
-const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 0.94 };
-const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const BAR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.13, a: 1.0 };
-const BAR_FILL: Color = Color { r: 0.36, g: 0.62, b: 0.92, a: 1.0 };
+// 上端中央に浮く非モーダルの progress カード (elevation 2)。 軽く透過させて下の
+// 内容を見せるため、 PANEL_RAISED に元の alpha 0.94 を保持する。
+const BG: Color = theme::PANEL_RAISED.with_alpha(0.94);
+const TEXT: Color = theme::TEXT;
+const BAR_BG: Color = theme::INSET_BG;
+const BAR_FILL: Color = theme::ACCENT;
 
 const SAVE_LABEL: &str = "\u{4fdd}\u{5b58}\u{4e2d}\u{2026}"; // 保存中…
 

@@ -12,7 +12,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect};
+use daw_ui_renderer::{theme, Color, GlyphArea, LineBatch, LineSegment, Rect};
 
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
@@ -48,9 +48,9 @@ pub struct TimeRulerStyle {
 impl Default for TimeRulerStyle {
     fn default() -> Self {
         Self {
-            bg: Color::rgb(0.13, 0.14, 0.17),
-            tick_color: Color::rgb(0.55, 0.60, 0.68),
-            label_color: Color::rgb(0.85, 0.88, 0.92),
+            bg: theme::HEADER,
+            tick_color: theme::TEXT_DIM,
+            label_color: theme::TEXT_DIM,
             bar_tick_height: 12.0,
             beat_tick_height: 5.0,
             min_label_spacing_px: 60.0,
@@ -78,8 +78,8 @@ pub struct BarBeatGridStyle {
 impl Default for BarBeatGridStyle {
     fn default() -> Self {
         Self {
-            bar_color: Color::rgba(1.0, 1.0, 1.0, 0.18),
-            beat_color: Color::rgba(1.0, 1.0, 1.0, 0.07),
+            bar_color: theme::GRID_LINE_STRONG,
+            beat_color: theme::GRID_LINE,
             bar_line_width: 1.0,
             beat_line_width: 1.0,
             min_beat_line_px: 4.0,

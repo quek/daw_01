@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use daw_ui_core::{FrameInput, LevelMeterStyle, MeterBallistic, MeterScale, UiHost};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, OffscreenRenderer, Rect, Scene};
+use daw_ui_renderer::{OffscreenRenderer, Rect, Scene};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let width: u32 = 260;
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut host: UiHost<()> = UiHost::no_redraw();
     let mut scene = Scene::new();
-    scene.clear_color = Color::rgb(0.16, 0.17, 0.20).to_wgpu();
+    scene.clear_color = daw_ui_renderer::theme::PANEL.to_wgpu();
     let screen = PhysicalSize { width, height };
 
     host.frame_to_edits(

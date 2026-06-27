@@ -8,12 +8,12 @@
 //!
 //! これで「press inside → 少しドリフト → release inside」を取りこぼさない。
 
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{theme, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
-use crate::ui::{Ui, lerp_color};
+use crate::ui::Ui;
 
 /// rect 内のテキスト水平揃え (`button_at_clicked_sized_aligned` 用)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -156,14 +156,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             align as u8,
         ));
         self.with_widget_node(wid, input_hash, |ui| {
-            let base = Color::rgb(0.18, 0.20, 0.26);
-            let hover = Color::rgb(0.24, 0.27, 0.34);
-            let press = Color::rgb(0.32, 0.55, 0.85);
+            let base = theme::CONTROL;
+            let hover = theme::CONTROL_HOVER;
+            let press = theme::ACCENT;
 
             let fill = if visual_pressed {
                 press
             } else if inside {
-                lerp_color(base, hover, 0.85)
+                base.lerp(hover, 0.85)
             } else {
                 base
             };
@@ -171,7 +171,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             ui.push_rect(RectCommand {
                 rect,
                 fill,
-                border: Color::rgb(0.35, 0.38, 0.45),
+                border: theme::BORDER,
                 border_width: 1.0,
                 radius: [6.0; 4],
                 clip_rect: None,
@@ -204,7 +204,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: ty,
                 font_size,
                 line_height: line_h,
-                color: Color::rgb(0.95, 0.95, 0.97),
+                color: theme::TEXT,
                 clip_rect: truncated.then_some(rect),
                 ..GlyphArea::default()
             });

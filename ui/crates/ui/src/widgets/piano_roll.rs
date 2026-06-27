@@ -41,7 +41,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use daw_ui_platform::CursorIcon;
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -627,76 +627,79 @@ impl Default for PianoRollStyle {
             // 明るくなる (鍵盤と逆) symptom があった。Live / Cubase / Reaper 慣習に合わせる。
             // 階層: ruler_bg(0.13) < velocity_lane_bg(0.16) < bg(0.18) < keyboard_bg(0.22)
             // → grid (note 配置領域) が最も明るく、 周辺 panel が段階的に暗い。
-            bg: Color::rgb(0.18, 0.19, 0.22),
-            keyboard_bg: Color::rgb(0.22, 0.23, 0.26),
+            bg: theme::PANEL_RAISED,
+            keyboard_bg: theme::PANEL_RAISED,
+            // white_key / black_key は物理ピアノ鍵盤のメタファ。 寒色 dark テーマには白鍵に
+            // 充てる明 surface token が無いため、 意図的な literal のまま残す (token 化しない)。
             white_key: Color::rgb(0.92, 0.93, 0.95),
             black_key: Color::rgb(0.10, 0.11, 0.13),
-            // src-over 合成で黒鍵 row ≈ (0.135, 0.143, 0.165)、 bg との差 0.045〜0.055。
-            black_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.25),
-            bar_line: Color::rgba(1.0, 1.0, 1.0, 0.30),
-            beat_line: Color::rgba(1.0, 1.0, 1.0, 0.12),
+            // src-over 合成で黒鍵 row を bg より暗く。
+            black_row_overlay: theme::BACKDROP.with_alpha(0.25),
+            bar_line: theme::GRID_LINE_STRONG,
+            beat_line: theme::GRID_LINE,
             bar_line_width_px: 1.5,
             beat_line_width_px: 1.0,
-            // M14 Phase 124 / daw_01 #100: subdivision 線は beat_line (alpha 0.12) より淡く。
-            sub_line: Color::rgba(1.0, 1.0, 1.0, 0.06),
+            // M14 Phase 124 / daw_01 #100: subdivision 線は beat_line より淡く。
+            sub_line: theme::GRID_LINE.with_alpha(0.04),
             sub_line_width_px: 1.0,
             note_fill_fn: default_velocity_color,
             note_border_radius_px: 1.5,
-            note_muted_hatch_color: Color::rgba(0.0, 0.0, 0.0, 0.40),
+            note_muted_hatch_color: theme::BACKDROP.with_alpha(0.40),
             note_muted_hatch_spacing_px: 5.0,
             note_muted_hatch_width_px: 1.0,
-            note_selected_fill: Color::rgb(1.0, 0.85, 0.30),
-            note_selected_border: Color::rgb(1.0, 1.0, 1.0),
+            note_selected_fill: theme::SELECTION_WARM,
+            // 選択ノードのリングは velocity 着色されたノート上で確実に立つ意図的な pure-white。
+            note_selected_border: Color::WHITE,
             note_selected_border_w: 2.0,
             note_selected_pad_px: 2.0,
             // M14 Phase 83 / daw_01 #054: copy ghost は move ghost (黄) と区別する緑系
             // (arrangement の clone linked ghost と同系統)。
-            note_clone_ghost_fill: Color::rgba(0.30, 0.85, 0.45, 0.85),
-            note_clone_ghost_border: Color::rgb(0.55, 1.0, 0.70),
+            note_clone_ghost_fill: theme::GHOST_LINKED.with_alpha(0.85),
+            note_clone_ghost_border: theme::GHOST_LINKED,
             resize_handle_px: 4.0,
-            c_label_color: Color::rgb(0.30, 0.30, 0.35),
+            c_label_color: theme::TEXT_FAINT,
             c_label_font_px: 11.0,
             // M9 Phase 45c: playhead / velocity lane defaults
             // playhead は bar_line (白 alpha 0.3) と紛れないよう強い赤系 + 太め
-            playhead_color: Color::rgb(1.0, 0.25, 0.10),
+            playhead_color: theme::PLAYHEAD,
             playhead_width_px: 2.5,
-            velocity_lane_bg: Color::rgb(0.16, 0.17, 0.20),
-            velocity_bar_color: Color::rgb(0.50, 0.65, 0.85),
+            velocity_lane_bg: theme::PANEL,
+            velocity_bar_color: theme::ACCENT,
             velocity_bar_width_px: 3.0,
-            lyric_color: Color::rgb(0.10, 0.10, 0.15),
+            lyric_color: theme::TEXT_ON_BRIGHT,
             // M14 Phase 59: MAX cap (実 font_size = note_h * 0.75 で note 高さスケール)。
             // 旧 9.0 固定 → 24.0 max にして zoom in 時の readable 化。
             lyric_font_px: 24.0,
             // M14 Phase 59 / daw_01 #017: 歌詞編集 (L キー) shortcut。caller が `bind("L")` する想定。
             lyric_edit_shortcut: Some("piano_roll.edit_lyric"),
             // M13 Phase 55: ruler 領域 (`view.ruler_h > 0` のときのみ描画)
-            ruler_bg: Color::rgb(0.13, 0.14, 0.17),
-            ruler_label_color: Color::rgb(0.85, 0.88, 0.92),
+            ruler_bg: theme::HEADER,
+            ruler_label_color: theme::TEXT_DIM,
             // M14 Phase 69 / daw_01 #041: arrangement と同 default 値 (cyan ~0.20 alpha 帯 + 不透明 handle)。
-            loop_band: Color::rgba(0.50, 0.85, 1.0, 0.20),
-            loop_handle: Color::rgb(0.50, 0.85, 1.0),
+            loop_band: theme::LOOP_BAND.with_alpha(0.20),
+            loop_handle: theme::LOOP_BAND,
             loop_handle_w: 2.0,
             // M14 Phase 70 / daw_01 #042 + 70a (follow-up): Bitwig 風 warm-yellow tint (root 行)
             // + 黒 dim (out 行)。 alpha は daw_01 実機 smoke test (#042 follow-up) で「白鍵 row 上
             // の root tint が見えない / 黒鍵 row との dim 差が 0.015 で out 認識が立たない」 指摘
             // を受けて引き上げ済。 control: dark theme (widget bg 0.18、 黒鍵 row ≈ 0.135) で
             // 「在ることが分かる」 を最低基準にする。 alpha 0.18 / 0.32 だと不可視レベル。
-            root_row_overlay: Color::rgba(1.0, 0.80, 0.30, 0.32),
+            root_row_overlay: theme::SELECTION_WARM.with_alpha(0.32),
             // out_of_scale_row_overlay: alpha 0.50 で 黒鍵 row との差が ≈ 0.045 に拡大、 dim 認識成立。
-            out_of_scale_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.50),
+            out_of_scale_row_overlay: theme::BACKDROP.with_alpha(0.50),
             // 鍵盤レーンラベル色: root は warm-yellow を強調 (0.95, 0.78, 0.40)、 in-scale は Fold
             // mode で全行に label が出るため keyboard_bg (0.22) 上で読める明度 (0.78〜0.85)、
             // out-of-scale は dim (0.45 程度、 Highlight mode で root 行以外の label 描画は v0 では
             // 出ないが、 将来「全 12 行 label」 拡張用に予約)。
-            root_label_fg: Color::rgb(0.95, 0.78, 0.40),
-            in_scale_label_fg: Color::rgb(0.78, 0.80, 0.85),
-            out_of_scale_label_fg: Color::rgb(0.45, 0.45, 0.50),
+            root_label_fg: theme::SELECTION_WARM,
+            in_scale_label_fg: theme::TEXT_DIM,
+            out_of_scale_label_fg: theme::TEXT_FAINT,
             // M14 Phase 117 / daw_01 #093: 鍵盤ラベルの auto-contrast (default on)。 両極は white 鍵
             // (0.92) / black 鍵 (0.10) / warm cream root 行のいずれでも WCAG コントラスト比が十分立つ
             // near-black / near-white。
             label_auto_contrast: true,
-            label_fg_dark: Color::rgb(0.13, 0.13, 0.16),
-            label_fg_light: Color::rgb(0.93, 0.94, 0.97),
+            label_fg_dark: theme::TEXT_ON_BRIGHT,
+            label_fg_light: theme::TEXT,
         }
     }
 }

@@ -19,7 +19,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{theme, Rect, RectCommand};
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
@@ -218,9 +218,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // ---- 4. scrollbar 描画 (track + thumb)。drag hit-test と同一 thumb rect を使う ----
         if let Some(thumb) = v_thumb_rect {
-            let track_color = Color::rgba(1.0, 1.0, 1.0, 0.04);
-            let thumb_color = Color::rgba(0.7, 0.75, 0.85, 0.55);
-            let thumb_hover = Color::rgba(0.85, 0.90, 1.00, 0.80);
+            let track_color = theme::GRID_LINE.with_alpha(0.04);
+            let thumb_color = theme::GRID_LINE.with_alpha(0.55);
+            let thumb_hover = theme::GRID_LINE.with_alpha(0.80);
             self.push_rect(RectCommand::uniform_radius(v_track_rect, track_color, 2.0));
             let hovered = pointer.pos.is_some_and(|(px, py)| thumb.contains(px, py));
             self.push_rect(RectCommand::uniform_radius(
@@ -230,9 +230,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             ));
         }
         if let Some(thumb) = h_thumb_rect {
-            let track_color = Color::rgba(1.0, 1.0, 1.0, 0.04);
-            let thumb_color = Color::rgba(0.7, 0.75, 0.85, 0.55);
-            let thumb_hover = Color::rgba(0.85, 0.90, 1.00, 0.80);
+            let track_color = theme::GRID_LINE.with_alpha(0.04);
+            let thumb_color = theme::GRID_LINE.with_alpha(0.55);
+            let thumb_hover = theme::GRID_LINE.with_alpha(0.80);
             self.push_rect(RectCommand::uniform_radius(h_track_rect, track_color, 2.0));
             let hovered = pointer.pos.is_some_and(|(px, py)| thumb.contains(px, py));
             self.push_rect(RectCommand::uniform_radius(

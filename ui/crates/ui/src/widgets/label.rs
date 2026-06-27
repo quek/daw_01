@@ -1,6 +1,6 @@
 //! `label` ウィジェット — テキスト 1 行を表示するだけ。
 
-use daw_ui_renderer::{Color, GlyphArea, Rect};
+use daw_ui_renderer::{theme, Color, GlyphArea, Rect};
 
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
@@ -110,7 +110,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: y,
                 font_size,
                 line_height: line_h,
-                color: Color::rgb(0.92, 0.92, 0.94),
+                color: theme::TEXT,
                 clip_rect: None,
                 ..GlyphArea::default()
             });

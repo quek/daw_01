@@ -14,13 +14,13 @@
 
 use daw_ui_core::{Edit, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::{AppData, AppEvent, ExportStage};
 
-const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const BAR_BG: Color = Color { r: 0.12, g: 0.13, b: 0.16, a: 1.0 };
-const BAR_FILL: Color = Color { r: 0.40, g: 0.70, b: 0.95, a: 1.0 };
+const COLOR_TEXT: Color = theme::TEXT;
+const BAR_BG: Color = theme::INSET_BG;
+const BAR_FILL: Color = theme::ACCENT;
 
 const PANEL_W: f32 = 420.0;
 const PANEL_H: f32 = 150.0;
@@ -29,8 +29,8 @@ const BTN_H: f32 = 28.0;
 const BTN_W: f32 = 110.0;
 
 const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.6 },
-    panel_bg: Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 },
+    overlay_color: theme::BACKDROP,
+    panel_bg: theme::PANEL,
     panel_radius: 6.0,
     close_on_outside_click: false,
     close_on_escape: false,

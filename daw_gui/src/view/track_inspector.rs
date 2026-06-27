@@ -8,7 +8,7 @@ use daw_ui_core::{
     Edit, MsegAction, MsegEditorStyle, MsegNode, ReorderableListEditRequest, ReorderableListStyle,
     ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::{
     text_num_to_builtin, AppData, AppEvent, ClipRef, ColorPickerTarget, DiscreteClipEdit,
@@ -18,12 +18,12 @@ use crate::view::modulation::{self as mod_widget, build_mod, scrub_field_mod, Mo
 use crate::view::track_color;
 use common::model::{AutomationTarget, FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
 
-const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
-const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const ROW_BG: Color = Color { r: 0.20, g: 0.20, b: 0.24, a: 1.0 };
-const ROW_BG_HOVER: Color = Color { r: 0.24, g: 0.24, b: 0.30, a: 1.0 };
-const ROW_BG_DRAGGING: Color = Color { r: 0.30, g: 0.40, b: 0.55, a: 0.85 };
-const DROP_INDICATOR: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
+const BG: Color = theme::PANEL;
+const TEXT: Color = theme::TEXT;
+const ROW_BG: Color = theme::PANEL_RAISED;
+const ROW_BG_HOVER: Color = theme::CONTROL_HOVER;
+const ROW_BG_DRAGGING: Color = theme::ACCENT.with_alpha(0.85);
+const DROP_INDICATOR: Color = theme::LOOP_BAND;
 
 // Audio event toggle (Reverse / Muted) 用 style。 mixer_strips の
 // STYLE_MUTE / STYLE_SOLO とほぼ同じだが、 inspector 側に独立して定義
@@ -31,13 +31,13 @@ const DROP_INDICATOR: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
 // 優先)。 hint band は無し (= 単純トグル) にして、 文字 + ON/OFF 色だけで
 // 状態を伝える。
 const TOGGLE_AUDIO_BASE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.42, g: 0.55, b: 0.78, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::ACCENT,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
     font_size: 12.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
@@ -45,24 +45,26 @@ const TOGGLE_AUDIO_BASE: ToggleButtonStyle = ToggleButtonStyle {
 // 1 個のボタン)。 ON 状態は arrangement lane 行のヘッダ色 (薄い藤色) と
 // 揃えて「この field は lane 駆動中」 を視覚化。
 const TOGGLE_IMAGE_AUTOMATE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
+    off_color: theme::CONTROL,
+    // ON 色は arrangement automation lane ヘッダの「薄い藤色」に揃えた専用色。theme に
+    // automation-lane purple の token が無いので一点物としてベタ書きを残す (FIXME #88)。
     on_color: Color { r: 0.78, g: 0.55, b: 0.85, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
     font_size: 11.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
 // Group Transform の scrubable_number base style。 sensitivity / range は param
 // 別に上書きする。 ドラッグで連続変化 / click で text 入力 / dblclick で reset。
 const SCRUB_STYLE_GROUP: ScrubableNumberStyle = ScrubableNumberStyle {
-    bg_color: Color { r: 0.16, g: 0.17, b: 0.21, a: 1.0 },
-    bg_color_hovered: Color { r: 0.20, g: 0.21, b: 0.26, a: 1.0 },
-    bg_color_dragging: Color { r: 0.20, g: 0.32, b: 0.42, a: 1.0 },
+    bg_color: theme::INSET_BG,
+    bg_color_hovered: theme::CONTROL,
+    bg_color_dragging: theme::ACCENT,
     text_color: TEXT,
-    border: Color { r: 0.32, g: 0.35, b: 0.42, a: 1.0 },
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 3.0,
     font_size: 11.0,
@@ -282,16 +284,19 @@ fn mod_rate_control(
 
 // FIXME #56: モジュレーター用グラフィカルエディタの色味。
 const MOD_EDITOR_STYLE: MsegEditorStyle = MsegEditorStyle {
-    bg: Color { r: 0.10, g: 0.11, b: 0.13, a: 1.0 },
-    grid: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.06 },
-    line_color: Color { r: 0.42, g: 0.85, b: 0.95, a: 1.0 },
+    bg: theme::INSET_BG,
+    grid: theme::GRID_LINE.with_alpha(0.06),
+    line_color: theme::CURVE,
     line_width_px: 2.0,
-    node_color: Color { r: 0.95, g: 0.97, b: 1.0, a: 1.0 },
+    node_color: theme::TEXT,
+    // node の hover (淡黄) / drag (珊瑚) は curve エディタ固有の操作中アフォーダンス。
+    // 中立な hover/drag マーカー token が無いので一点物としてベタ書きを残す (FIXME #88)。
     node_hover_color: Color { r: 1.0, g: 1.0, b: 0.6, a: 1.0 },
     node_drag_color: Color { r: 0.95, g: 0.45, b: 0.4, a: 1.0 },
     node_radius_px: 5.0,
-    tension_color: Color { r: 0.42, g: 0.85, b: 0.95, a: 0.7 },
-    cursor_color: Color { r: 1.0, g: 0.85, b: 0.35, a: 0.85 },
+    // tension は line_color と同 hue の半透明版なので CURVE 由来で揃える。
+    tension_color: theme::CURVE.with_alpha(0.7),
+    cursor_color: theme::PLAYHEAD.with_alpha(0.85),
 };
 
 /// グラフィカルエディタのカーブ描画高さ (px)。
@@ -1130,7 +1135,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "inspector_color_swatch_fill",
             swatch,
             fill,
-            Color { r: 0.45, g: 0.48, b: 0.55, a: 1.0 },
+            theme::BORDER,
             1.0,
             4.0,
         );
