@@ -2845,6 +2845,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 muted: false,
             };
             self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
+            // (FIXME #92) 入力完了後、 press 時に既定長ノートの右端へ warp した
+            // カーソルを元のクリック位置へ戻す (warp しっぱなしだと「ノートの右端のまま」
+            // 残り、 次操作の起点が分かりにくいという要望)。 warp は y を変えない
+            // (press 時 `warp_cursor(warp_x, py)`) ので、 復帰先 y は anchor_mouse.1
+            // (= press y) をそのまま再利用する (press_y を別フィールドで複製しない = SSoT)。
+            self.warp_cursor(nc.press_x, nc.anchor_mouse.1);
         }
 
         // ----- loop drag release → SetLoopRange (M14 Phase 69 / daw_01 #041) -----
@@ -4741,6 +4747,116 @@ mod tests {
         assert!(
             (len - 2.0).abs() < 1e-9,
             "len=2.0 (右端が cursor beat 3.0、start 1.0)、got {len}"
+        );
+    }
+
+    /// (FIXME #92) ノート作成 (ダブルクリック → ドラッグ → release) を完了したら、 press 時に
+    /// 右端へ warp したカーソルを **元のクリック位置へ戻す**。 「いまはノートの右端のままになって
+    /// いる」 という要望の修正。 warp の OS flush は `frame()` でのみ起きる (run_frame =
+    /// frame_to_edits は副作用を発火しない) ので `set_cursor_pos_request` を capture し、
+    /// press 位置 (200,100) への復帰が release frame で起きることを検証する。
+    /// test_view: snap OFF / 4 拍 / grid 800px → 1 beat = 200px、 default = 1.0。
+    /// press x=200 (beat 1.0) → warp 先 = 右端 beat 2.0 = x400。 release で (200,100) へ復帰。
+    #[test]
+    fn note_create_release_warps_cursor_back_to_press_position() {
+        let warps: Arc<std::sync::Mutex<Vec<(f32, f32)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warps_clone = Arc::clone(&warps);
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        host.set_cursor_pos_request = Some(Box::new(move |x, y| {
+            warps_clone.lock().unwrap().push((x, y));
+        }));
+        let mut model = TestModel::new(vec![]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        // warp flush を走らせるため frame_to_edits ではなく frame() を回す local helper。
+        let run = |host: &mut UiHost<TestModel>, model: &mut TestModel, input: FrameInput| {
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 800, height: 400 };
+            host.frame(model, &mut scene, screen, input, |_, ui| {
+                let d = make_dispatch();
+                let sel: Vec<NoteId> = vec![];
+                let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            });
+        };
+
+        // Frame 1: 1 度目 click (release) → last_click 記録。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((200.0, 100.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Frame 2: 2 度目 press → 作成 session 開始 + press 時 warp で右端 (400,100) へ。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((200.0, 100.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            warps.lock().unwrap().as_slice(),
+            &[(400.0, 100.0)],
+            "press で既定長ノートの右端 (400,100) へ warp"
+        );
+        // Frame 3: warp 着地 (cursor が右端 anchor x400 へ)。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((400.0, 100.0)),
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Frame 4: 右へドラッグ (cursor x600 = beat 3.0、held)。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((600.0, 100.0)),
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Frame 5: release → Add 発行 + カーソルを元のクリック位置 (200,100) へ戻す。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((600.0, 100.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(model.last_request, Some(RequestKind::Add), "release で Add 発行");
+        assert_eq!(
+            warps.lock().unwrap().as_slice(),
+            &[(400.0, 100.0), (200.0, 100.0)],
+            "press で右端へ warp → release で元のクリック位置 (200,100) へ復帰"
         );
     }
 
