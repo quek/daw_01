@@ -8,9 +8,7 @@
 //! - 再構築判定は `generation: u64` のみ
 //! を CI レベルで固定する役目。
 
-use daw_ui_core::{
-    PointerFrame, SampleSlices, UiHost, WaveformSource, WaveformStyle, WaveformView,
-};
+use daw_ui_core::{SampleSlices, UiHost, WaveformSource, WaveformStyle, WaveformView};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Rect, Scene};
 

@@ -6,9 +6,9 @@
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    AutomationClipKey, ClipKey, ColorPickerStyle, Edit, Note, NoteId, PianoRollEditRequest,
-    PianoRollStyle, PianoRollView, PointerFrame, ReorderableListEditRequest, ReorderableListStyle,
-    ScrubableNumberFormat, ScrubableNumberStyle, UiHost,
+    AutomationClipKey, ClipKey, ColorPickerStyle, Edit, Note, NoteId, NoteStyle,
+    PianoRollEditRequest, PianoRollStyle, PianoRollView, ReorderableListEditRequest,
+    ReorderableListStyle, ScrubableNumberFormat, ScrubableNumberStyle, UiHost,
 };
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Color, Rect, Scene};
@@ -193,6 +193,7 @@ fn main() {
                             velocity: 96,
                             lyric: None,
                             muted: false,
+                            style: NoteStyle::default(),
                         };
                     }),
                     PianoRollEditRequest::Delete(_) => Edit::mutate(|_m: &mut Model| {}),

@@ -8,18 +8,21 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    Edit, MoveDelta, Note, PianoRollEditRequest, PianoRollScale, PianoRollScaleMode,
-    PianoRollStyle, PianoRollView, ResizeDelta, ToggleButtonStyle, Ui, note_hit,
+    ButtonTextAlign, Edit, MoveDelta, Note, NoteStyle, PianoRollEditRequest, PianoRollScale,
+    PianoRollScaleMode, PianoRollStyle, PianoRollView, ResizeDelta, ToggleButtonStyle, Ui, note_hit,
 };
-use daw_ui_renderer::{theme, Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ClipRef};
 use crate::view::snap::{self, SNAP_LABELS};
+use crate::view::track_color;
 
 const KEYBOARD_W: f32 = 56.0;
 const VEL_LANE_H: f32 = 60.0;
 const RULER_H: f32 = 20.0;
 const TOOLBAR_H: f32 = 24.0;
+/// FIXME #93: 複数クリップ同時表示時に右側へ出す legend パネルの幅 (px)。
+const LEGEND_W: f32 = 152.0;
 
 const COLOR_HINT: Color = theme::TEXT_DIM;
 
@@ -37,7 +40,7 @@ const SNAP_TOGGLE_STYLE: ToggleButtonStyle = ToggleButtonStyle {
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 上部 24 px を Snap toolbar に。残りを widget 本体 (body) に渡す。
     let toolbar_rect = Rect { x: area.x, y: area.y, w: area.w, h: TOOLBAR_H };
-    let body = Rect {
+    let body_full = Rect {
         x: area.x,
         y: area.y + TOOLBAR_H,
         w: area.w,
@@ -45,25 +48,51 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     };
     draw_snap_toolbar(app, ui, toolbar_rect);
 
-    let Some(target) = app.selected_clip_ref() else {
-        // クリップ未選択時のプレースホルダ。 widget が走らないので、 もし歌詞編集
-        // mirror が残っていたら false に戻す (FIXME #84、 stale-true で Esc が widget へ
-        // 委ねられ続けて消える事故を防ぐ)。
+    // FIXME #93: 選択された MIDI クリップを **全部同時表示** する。対象 (target) クリップ =
+    // 新規ノートの所属先・凡例で強調される行 = 選択 anchor (`pianoroll_target_clip`、SSoT)。
+    // 表示クリップが無ければ placeholder。
+    let shown = app.shown_pianoroll_clips();
+    let Some(target) = app.pianoroll_target_clip() else {
+        // 表示する MIDI クリップが無い (未選択 or 非 MIDI のみ) ときのプレースホルダ。
+        // widget が走らないので、 もし歌詞編集 mirror が残っていたら false に戻す
+        // (FIXME #84、 stale-true で Esc が widget へ委ねられ続けて消える事故を防ぐ)。
         if app.piano_roll_lyric_editing {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.piano_roll_lyric_editing = false;
             }));
         }
-        ui.panel("pr_bg_empty", body, theme::PANEL, 0.0);
+        ui.panel("pr_bg_empty", body_full, theme::PANEL, 0.0);
         ui.label_at(
             "pr_no_clip",
             "(\u{30af}\u{30ea}\u{30c3}\u{30d7}\u{304c}\u{9078}\u{629e}\u{3055}\u{308c}\u{3066}\u{3044}\u{307e}\u{305b}\u{3093})",
-            body.x + 12.0,
-            body.y + 12.0,
+            body_full.x + 12.0,
+            body_full.y + 12.0,
             12.0,
             COLOR_HINT,
         );
         return;
+    };
+    // FIXME #93: 複数表示 (2 つ以上) のとき右側に legend パネル (色 / 名前 / 対象 / ロック)
+    // を出し、widget 本体 (`body`) をその分狭める。単一表示は body 全幅 = 既存レイアウト不変。
+    let multi = shown.len() >= 2;
+    let (body, legend_rect) = if multi {
+        let lw = LEGEND_W.min(body_full.w * 0.4);
+        (
+            Rect {
+                x: body_full.x,
+                y: body_full.y,
+                w: (body_full.w - lw).max(0.0),
+                h: body_full.h,
+            },
+            Some(Rect {
+                x: body_full.x + body_full.w - lw,
+                y: body_full.y,
+                w: lw,
+                h: body_full.h,
+            }),
+        )
+    } else {
+        (body_full, None)
     };
 
     // widget が ruler / velocity lane を内蔵 (M13 Phase 55 で ruler 追加)、
@@ -93,7 +122,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
-    let widget_notes = build_widget_notes(app, target);
+    // FIXME #93: 表示集合 (shown) が変わったら共有 viewport (`multi_clip_view`) を union-fit し
+    // 直す。clip key 列を `multi_clip_view_key` と比較し、違えば 1 度だけ再 fit を要求する
+    // (= multi viewport 初期化の唯一の owner = SSoT。Ctrl+Click での集合変更にも追従)。
+    if multi {
+        let keys: Vec<common::model::ClipKey> =
+            shown.iter().filter_map(|r| app.clip_key_of(*r)).collect();
+        if app.multi_clip_view_key != keys {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.multi_clip_view_key = keys.clone();
+                app.handle_event(AppEvent::FitPianoRollToClip);
+            }));
+        }
+    }
+
+    // FIXME #93: dim は **トラック基準** (対象クリップのトラック以外を淡色)。
+    let widget_notes = build_widget_notes(app, &shown, Some(target.track));
     let zoom_x = app.pianoroll_zoom_x().max(4.0);
     let zoom_y = app.pianoroll_zoom_y().max(6.0);
     let loop_range = if app.song.loop_end_beat > app.song.loop_start_beat {
@@ -149,11 +193,33 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         h.finish()
     };
 
+    // FIXME #93: 複数表示は song-absolute scroll (`multi_clip_view`)、左下限は最早クリップ開始拍。
+    // 単一表示は従来どおり clip-local scroll + 対象クリップ開始位置 (regression なし)。
+    let (view_start_beat, view_min_start) = if multi {
+        let earliest = shown
+            .iter()
+            .filter_map(|r| {
+                app.song
+                    .tracks
+                    .get(r.track as usize)
+                    .and_then(|t| t.clips.get(r.clip as usize))
+                    .map(|c| c.start_beat)
+            })
+            .fold(f64::INFINITY, f64::min);
+        let earliest = if earliest.is_finite() { earliest } else { 0.0 };
+        (f64::from(app.pianoroll_scroll_beat()), earliest)
+    } else {
+        (
+            f64::from(app.pianoroll_scroll_beat()) + clip_start_beat,
+            clip_start_beat,
+        )
+    };
+
     let view = PianoRollView {
-        // song-absolute = clip-local scroll + clip 開始位置 (FIXME #3)。
-        start_beat: app.pianoroll_scroll_beat() as f64 + clip_start_beat,
-        // FIXME #89: 左へスクロールできる下限 = clip 開始拍 (= pianoroll_scroll_beat >= 0)。
-        min_start_beat: clip_start_beat,
+        // FIXME #3/#93: song-absolute 左端 (単一 = clip-local scroll + clip 開始、複数 = 絶対 scroll)。
+        start_beat: view_start_beat,
+        // FIXME #89/#93: 左へスクロールできる下限 (単一 = clip 開始、複数 = 最早クリップ開始)。
+        min_start_beat: view_min_start,
         len_beats: (grid_rect.w / zoom_x) as f64,
         pitch_top: app.pianoroll_top_pitch() as f32,
         pitch_visible: grid_h / zoom_y,
@@ -190,6 +256,20 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let style = PianoRollStyle::default();
     let resize_handle_px = style.resize_handle_px;
 
+    // FIXME #93: 各表示クリップ (clip_slot 順) の song-absolute 開始拍。make_edit が widget の
+    // song-absolute 座標を「その note の所属クリップの clip-local」へ戻す (per-note offset) のに使う。
+    let clip_starts: Vec<f64> = shown
+        .iter()
+        .map(|r| {
+            app.song
+                .tracks
+                .get(r.track as usize)
+                .and_then(|t| t.clips.get(r.clip as usize))
+                .map(|c| c.start_beat)
+                .unwrap_or(0.0)
+        })
+        .collect();
+
     let make_edit = move |req: PianoRollEditRequest| -> Edit<AppData> {
         match req {
             PianoRollEditRequest::Add(notes) => {
@@ -217,10 +297,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 })
             }
             PianoRollEditRequest::Move(deltas) => {
-                // d.3 = next_start_beat は song-absolute → clip-local へ (FIXME #3)。
+                // d.3 = next_start_beat は song-absolute → 各 note の所属クリップの clip-local へ
+                // (FIXME #3/#93)。clip_slot は packed id (d.0) 上位 8 bit。d.0 は packed のまま通し、
+                // handler が decode して正しいクリップの note に書き戻す。
                 let entries: Vec<(u32, f64, u8)> = deltas
                     .iter()
-                    .map(|d: &MoveDelta| (d.0, d.3 - clip_start_beat, d.4))
+                    .map(|d: &MoveDelta| {
+                        let off = clip_starts
+                            .get(AppData::note_id_clip_slot(d.0))
+                            .copied()
+                            .unwrap_or(0.0);
+                        (d.0, d.3 - off, d.4)
+                    })
                     .collect();
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetNotePositions(entries.clone()));
@@ -229,20 +317,34 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // gui_01 #054: Ctrl+drag コピー。Move と同形 payload だが、元 note を
             // 据え置いて複製を new 位置へ置く (CopyNotes handler が deep clone)。
             PianoRollEditRequest::Copy(deltas) => {
-                // d.3 = next_start_beat は song-absolute → clip-local へ (FIXME #3)。
+                // d.3 = next_start_beat は song-absolute → 各 note の所属クリップの clip-local へ
+                // (FIXME #3/#93)。コピー元と同じクリップ内に複製する (handler が decode して同 clip へ)。
                 let entries: Vec<(u32, f64, u8)> = deltas
                     .iter()
-                    .map(|d: &MoveDelta| (d.0, d.3 - clip_start_beat, d.4))
+                    .map(|d: &MoveDelta| {
+                        let off = clip_starts
+                            .get(AppData::note_id_clip_slot(d.0))
+                            .copied()
+                            .unwrap_or(0.0);
+                        (d.0, d.3 - off, d.4)
+                    })
                     .collect();
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::CopyNotes(entries.clone()));
                 })
             }
             PianoRollEditRequest::Resize(deltas) => {
-                // d.3 = next_start_beat は song-absolute → clip-local。d.4 = len は不変 (FIXME #3)。
+                // d.3 = next_start_beat は song-absolute → 各 note の所属クリップの clip-local。
+                // d.4 = len は不変 (FIXME #3/#93)。d.0 は packed のまま handler が decode する。
                 let entries: Vec<(u32, f64, f64)> = deltas
                     .iter()
-                    .map(|d: &ResizeDelta| (d.0, d.3 - clip_start_beat, d.4))
+                    .map(|d: &ResizeDelta| {
+                        let off = clip_starts
+                            .get(AppData::note_id_clip_slot(d.0))
+                            .copied()
+                            .unwrap_or(0.0);
+                        (d.0, d.3 - off, d.4)
+                    })
                     .collect();
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ResizeNotes(entries.clone()));
@@ -316,6 +418,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &style,
         make_edit,
     );
+
+    // FIXME #93: 複数表示時のみ右側に凡例パネル (色 swatch / クリップ名 / 対象切替 /
+    // ロックトグル) を描画。単一表示は legend_rect = None で従来レイアウト不変。
+    if let Some(legend_rect) = legend_rect {
+        draw_legend(app, ui, legend_rect, &shown, target);
+    }
 
     // FIXME #84: 歌詞 inline 編集中フラグを app に mirror する。 root.rs の
     // `dispatch_shortcuts` は piano_roll widget より前に走って `take_shortcut("escape")`
@@ -547,35 +655,208 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     );
 }
 
-/// `daw_ui_core::Note` 形式に変換 (毎フレーム alloc、widget 内 cached で性能 OK)。
-/// v6 linked clip: notes は `Song.clip_contents` 経由で lookup。 共有 clip
-/// 群はすべて同じ notes を見る。
-fn build_widget_notes(app: &AppData, target: ClipRef) -> Vec<Note> {
-    let Some(track) = app.song.tracks.get(target.track as usize) else {
-        return Vec::new();
-    };
-    let Some(clip) = track.clips.get(target.clip as usize) else {
-        return Vec::new();
-    };
-    app.song
-        .clip_notes(clip)
-        .iter()
-        .enumerate()
-        .map(|(i, n)| Note {
-            id: i as u32,
-            // song-absolute 化: clip-local note + clip 開始位置 (FIXME #3)。
-            start_beat: n.start_beat + clip.start_beat,
-            len_beats: n.duration_beats,
-            pitch: n.pitch,
-            velocity: n.velocity,
-            lyric: n
-                .lyric
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(Arc::from),
-            // FIXME #80: note mute (dim + 斜線ハッチ表示)。`Note.muted` をそのまま渡す。
-            muted: n.muted,
-        })
-        .collect()
+/// FIXME #93: 複数表示時に右側へ出す凡例パネル。各行 = **1 トラック** = [色 swatch][トラック名][L ロック]。
+/// トラック行クリックで対象 (target) をそのトラックの (表示中) クリップへ切替、L トグルでそのトラックの
+/// ロック (参照専用) を反転。対象トラックの行は左端 accent バー + 通常文字色で強調 (非対象は淡色)。
+/// ノート色・dim もトラック基準なので整合する (REAPER / Cakewalk のトラックペイン流)。`target` は
+/// 描画中の対象クリップ (その `.track` が対象トラック)。
+fn draw_legend(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    rect: Rect,
+    shown: &[ClipRef],
+    target: ClipRef,
+) {
+    ui.panel("pr_legend_bg", rect, theme::HEADER, 0.0);
+    let pad = 6.0;
+    let row_h = 28.0;
+    let gap = 4.0;
+    // パネル見出し (表示トラック)。
+    ui.label_at(
+        "pr_legend_title",
+        "\u{8868}\u{793a}\u{30c8}\u{30e9}\u{30c3}\u{30af}",
+        rect.x + pad,
+        rect.y + pad,
+        11.0,
+        COLOR_HINT,
+    );
+    // 表示中クリップが乗っている **トラック** を初出順に列挙 (同じトラックの複数クリップは 1 行)。
+    let mut track_indices: Vec<u32> = Vec::new();
+    for &r in shown {
+        if !track_indices.contains(&r.track) {
+            track_indices.push(r.track);
+        }
+    }
+    let mut y = rect.y + pad + 18.0;
+    for (row_i, &ti) in track_indices.iter().enumerate() {
+        if y + row_h > rect.y + rect.h {
+            break;
+        }
+        let Some(track) = app.song.tracks.get(ti as usize) else {
+            continue;
+        };
+        let track_id = track.id;
+        let is_target = ti == target.track;
+        let locked = app.is_pianoroll_track_locked(track_id);
+        // 対象切替先 = このトラックの代表クリップ (anchor がこのトラックなら anchor、 でなければ
+        // このトラックの最初の表示クリップ)。target_clip は anchor なので legend 切替で動く。
+        let rep_key = if ti == target.track {
+            app.clip_key_of(target)
+        } else {
+            shown
+                .iter()
+                .copied()
+                .find(|r| r.track == ti)
+                .and_then(|r| app.clip_key_of(r))
+        };
+        let row = Rect {
+            x: rect.x + pad,
+            y,
+            w: (rect.w - pad * 2.0).max(0.0),
+            h: row_h,
+        };
+        // 行背景 (対象トラック = accent wash で薄く強調)。
+        ui.panel(
+            ("pr_legend_row", row_i),
+            row,
+            if is_target {
+                theme::ACCENT_WASH
+            } else {
+                theme::PANEL_RAISED
+            },
+            4.0,
+        );
+        // 対象トラック行の左端 accent バー。
+        if is_target {
+            ui.push_rect(RectCommand::uniform_radius(
+                Rect { x: row.x, y: row.y, w: 3.0, h: row.h },
+                theme::ACCENT,
+                1.5,
+            ));
+        }
+        // 色 swatch (= トラック実効色)。
+        let color = track_color::to_renderer(track_color::effective_track_color(track));
+        ui.push_rect(RectCommand {
+            rect: Rect {
+                x: row.x + 8.0,
+                y: row.y + (row.h - 13.0) * 0.5,
+                w: 13.0,
+                h: 13.0,
+            },
+            fill: color,
+            border: theme::BORDER,
+            border_width: 1.0,
+            radius: [3.0; 4],
+            clip_rect: None,
+        });
+        // ロックトグル (右端、トラック単位)。
+        let lock_w = 26.0;
+        let lock_rect = Rect {
+            x: row.x + row.w - lock_w - 4.0,
+            y: row.y + 4.0,
+            w: lock_w,
+            h: row.h - 8.0,
+        };
+        ui.toggle_button_at(
+            ("pr_legend_lock", row_i),
+            "L",
+            lock_rect,
+            locked,
+            &SNAP_TOGGLE_STYLE,
+            move |_| {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::TogglePianoRollTrackLock(track_id));
+                })
+            },
+        );
+        // トラック名 (クリック = 対象トラック切替)。swatch と lock の間の領域。
+        let name_x = row.x + 26.0;
+        let name_rect = Rect {
+            x: name_x,
+            y: row.y,
+            w: (lock_rect.x - name_x - 4.0).max(10.0),
+            h: row.h,
+        };
+        // 透明ヒット (空テキストの button) でクリックを拾い、テキストは下で label 描画する
+        // (button の中央寄せ固定文字でなく ellipsis 付き左寄せラベルを出すため)。
+        if ui.button_at_clicked_sized_aligned(
+            ("pr_legend_name", row_i),
+            "",
+            name_rect,
+            12.0,
+            ButtonTextAlign::Left,
+        ) && let Some(k) = rep_key
+        {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetPianoRollTargetClip(k));
+            }));
+        }
+        let label = track.name.clone();
+        let text_color = if is_target {
+            theme::TEXT
+        } else {
+            theme::TEXT_DIM
+        };
+        let label_rect = Rect {
+            x: name_rect.x + 4.0,
+            y: name_rect.y + (name_rect.h - 12.0) * 0.5,
+            w: (name_rect.w - 8.0).max(8.0),
+            h: 14.0,
+        };
+        ui.label_at_clipped(("pr_legend_name_label", row_i), &label, label_rect, 12.0, text_color);
+        y += row_h + gap;
+    }
+}
+
+/// FIXME #93: 表示対象クリップ群 (`shown`) の note を **すべて** `daw_ui_core::Note` に変換する。
+/// 各 note の id は packed global id (`AppData::pack_note_id(clip_slot, index)`) で複数クリップでも
+/// 衝突しない。**色はそのクリップが乗っている _トラック_ の実効色** (`effective_track_color`、凡例が
+/// トラック単位なのでノートもトラック色)、非対象 _トラック_ のノートは `dimmed`、ロック中トラックの
+/// ノートは `locked` (widget 側で hit-test 除外)。`target_track` = 編集対象クリップのトラック index。
+/// 毎フレーム alloc だが widget 内 cached で性能 OK。v6 linked clip の notes は
+/// `Song.clip_contents` 経由で lookup する。
+fn build_widget_notes(app: &AppData, shown: &[ClipRef], target_track: Option<u32>) -> Vec<Note> {
+    let mut out: Vec<Note> = Vec::new();
+    for (clip_slot, &r) in shown.iter().enumerate() {
+        let Some(track) = app.song.tracks.get(r.track as usize) else {
+            continue;
+        };
+        let Some(clip) = track.clips.get(r.clip as usize) else {
+            continue;
+        };
+        let color = track_color::to_renderer(track_color::effective_track_color(track));
+        // トラック基準の dim: 編集対象トラック以外のノートを淡色に。
+        let dimmed = Some(r.track) != target_track;
+        let locked = app.is_pianoroll_clip_locked(r);
+        let clip_start = clip.start_beat;
+        for (i, n) in app.song.clip_notes(clip).iter().enumerate() {
+            out.push(Note {
+                id: AppData::pack_note_id(clip_slot, i),
+                // song-absolute 化: clip-local note + clip 開始位置 (FIXME #3)。
+                start_beat: n.start_beat + clip_start,
+                len_beats: n.duration_beats,
+                pitch: n.pitch,
+                velocity: n.velocity,
+                lyric: n.lyric.as_deref().filter(|s| !s.is_empty()).map(Arc::from),
+                // FIXME #80: note mute (dim + 斜線ハッチ表示)。`Note.muted` をそのまま渡す。
+                muted: n.muted,
+                style: NoteStyle {
+                    color: Some(color),
+                    dimmed,
+                    locked,
+                },
+            });
+        }
+    }
+    // widget の `note_hit` は note が start_beat 昇順ソート済を仮定して二分探索する。
+    // 複数クリップは時間的に交錯するので、id (= 所属 / index) を保ったまま (start_beat, id)
+    // で安定ソートする。id は配列順でなく packed 値なので decode に影響しない。
+    out.sort_by(|a, b| {
+        a.start_beat
+            .partial_cmp(&b.start_beat)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+    out
 }
 

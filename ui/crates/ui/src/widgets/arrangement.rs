@@ -8755,7 +8755,29 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let prev = selected_clips.to_vec();
             let next: Vec<ClipKey> =
                 if let Some((hit_key, _)) = clip_hit(&visible_tracks, &press_tops, view, lanes, cx, cy, style.resize_handle_px) {
-                    vec![hit_key]
+                    // daw_01 #93: clip click も **modifier-aware** に (track header の SelectTrack /
+                    // 9.x 系 marquee と同 idiom)。旧実装は常に `vec![hit_key]` (Single 置換) で、
+                    // Ctrl+click で複数クリップを選べなかった (multi-clip piano roll の前提が崩れていた)。
+                    //   - Ctrl  = Toggle (XOR: 選択に居れば外し、 居なければ末尾 = anchor として足す)
+                    //   - Shift = Union  (足すだけ、 既存ぶんは末尾へ繰り上げて anchor に)
+                    //   - 無修飾 = Single (置換)
+                    // anchor は常に末尾 (caller の `SetClipSelection` が `next.last()` を anchor にする)。
+                    if pointer.modifiers.ctrl {
+                        let mut n = prev.clone();
+                        if let Some(pos) = n.iter().position(|k| *k == hit_key) {
+                            n.remove(pos);
+                        } else {
+                            n.push(hit_key);
+                        }
+                        n
+                    } else if pointer.modifiers.shift {
+                        let mut n = prev.clone();
+                        n.retain(|k| *k != hit_key);
+                        n.push(hit_key);
+                        n
+                    } else {
+                        vec![hit_key]
+                    }
                 } else {
                     Vec::new()
                 };
@@ -15357,6 +15379,55 @@ mod tests {
             (300.0, 15.0),
         );
         assert_eq!(select_count, 0, "clip 上 Ctrl+Shift drag は clone であって marquee 不発");
+    }
+
+    /// daw_01 #93: clip の上の **Ctrl+click** (動かさない) は Toggle で multi-select。press==release
+    /// (dist<4px) なので clip drag は短 click に格下げされ、 修飾 (Ctrl) を見て prev に hit clip を XOR
+    /// する。 旧実装は常に置換で Ctrl+click 複数選択ができず、 multi-clip piano roll の前提が崩れていた。
+    #[test]
+    fn arrangement_ctrl_click_clip_toggles_selection() {
+        let tracks = marquee_tracks();
+        let ctrl =
+            daw_ui_platform::Modifiers { ctrl: true, ..daw_ui_platform::Modifiers::empty() };
+        // prev [A]、 B (px 500, y15) を Ctrl+click → [A,B] (B が anchor=末尾)、 move しない。
+        let (count, next, moves) =
+            run_marquee(&tracks, test_view(), &[ck(100)], ctrl, (500.0, 15.0), (500.0, 15.0));
+        assert_eq!(moves, 0, "Ctrl+click は clip move を発火しない");
+        assert_eq!(count, 1, "Ctrl+click で SelectClips 1 回");
+        assert_eq!(
+            next,
+            Some(vec![ck(100), ck(101)]),
+            "Ctrl+click: [A] に B を toggle 追加 (anchor=末尾)"
+        );
+
+        // もう一度 prev [A,B] で B を Ctrl+click → 外れて [A]。
+        let (count2, next2, _) = run_marquee(
+            &tracks,
+            test_view(),
+            &[ck(100), ck(101)],
+            ctrl,
+            (500.0, 15.0),
+            (500.0, 15.0),
+        );
+        assert_eq!(count2, 1);
+        assert_eq!(next2, Some(vec![ck(100)]), "再 Ctrl+click: [A,B] から B を toggle 除去");
+    }
+
+    /// daw_01 #93: 無修飾 click は従来どおり Single (置換) のまま (回帰防止)。
+    #[test]
+    fn arrangement_plain_click_clip_replaces_selection() {
+        let tracks = marquee_tracks();
+        let (count, next, moves) = run_marquee(
+            &tracks,
+            test_view(),
+            &[ck(100)],
+            daw_ui_platform::Modifiers::empty(),
+            (500.0, 15.0),
+            (500.0, 15.0),
+        );
+        assert_eq!(moves, 0);
+        assert_eq!(count, 1);
+        assert_eq!(next, Some(vec![ck(101)]), "無修飾 click は B 単体に置換");
     }
 
     /// 空き zone の sub-4px 無修飾 press+release (同フレーム) は marquee zero-rect REPLACE で
