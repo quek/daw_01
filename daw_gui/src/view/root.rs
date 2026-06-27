@@ -11,8 +11,8 @@ use daw_ui_renderer::{theme, Rect};
 use crate::app::{AppData, AppEvent};
 use crate::view::{
     arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
-    font_picker, load_overlay, plugin_picker, recovery_modal, snap, status_bar, track_inspector,
-    track_picker, transport,
+    font_picker, load_overlay, plugin_picker, recovery_modal, shortcuts_help, snap, status_bar,
+    track_inspector, track_picker, transport,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -129,6 +129,10 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
 
     // Overlay: WAV / Video export 中の進捗 + Cancel。app.export_stage を監視。
     export_overlay::draw(app, ui, screen);
+
+    // Overlay: F1 ショートカット / マウス操作一覧 (FIXME #91)。app.is_help_open と
+    // 同期。最前面に出すため他の modal / overlay より後に描く。
+    shortcuts_help::draw(app, ui, screen);
 }
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。

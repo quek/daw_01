@@ -18,6 +18,7 @@ pub mod recovery_modal;
 pub mod root;
 pub mod runner;
 pub mod shortcuts;
+pub mod shortcuts_help;
 pub mod snap;
 pub mod status_bar;
 pub mod track_color;

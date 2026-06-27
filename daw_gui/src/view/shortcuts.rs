@@ -1,118 +1,180 @@
-//! daw_01 用の shortcut binding。
+//! daw_01 のキーボードショートカット定義 (SSoT)。
 //!
-//! `ShortcutMap::with_default_bindings()` がベース (undo / redo / cut / copy / paste /
-//! select_all / save / save_as / open / new / delete / escape / tab_next / tab_prev /
-//! focus_up / focus_down / focus_left / focus_right) を提供する。
+//! 全ショートカットは [`SHORTCUTS`] テーブル 1 箇所で `(name, keys, category,
+//! description)` を宣言する。実際のキー登録 ([`daw_shortcut_map`]) と F1 の一覧
+//! オーバーレイ (`shortcuts_help`) は **どちらもこのテーブルから派生** する
+//! (FIXME #91)。将来キーバインドを設定可能にする際もこのテーブルが入口になる。
 //!
-//! 本モジュールはこれに DAW 固有の binding を追加する:
-//! - `daw.play_toggle` = Space
-//! - `daw.toggle_loop` = P
-//! - `daw.synthesize_vocal` = V
-//! - `daw.export_wav` = Ctrl+E
-//! - `daw.toggle_help` = F1
+//! `Ui::take_shortcut(name)` で root 末尾 (`root.rs::dispatch_shortcuts`) から拾って
+//! AppEvent に変換する。`name` の文字列はそのまま `take_shortcut` の引数になるので
+//! 変更しないこと (例: `select_all` / `delete` / `cut` / `copy` / `paste` /
+//! `piano_roll.edit_lyric` は `is_typing_only_shortcut` が名前で判定する)。
 //!
-//! `Ui::take_shortcut(name)` で root 末尾から拾って AppEvent に変換する。
-//!
-//! NOTE: `gui_01` の `Shortcut::parse` は `/` 等の punctuation を受理しない
-//! (alphanumeric / 特殊キー / F1-F24 のみ)。旧 `Shift+/` バインドは F1 で代替。
+//! NOTE: `Shortcut::parse` が受理するキー表記は alphanumeric / 特殊キー / F1-F24 /
+//! 記号 11 種 (`/` `;` `,` `.` `-` `=` `[` `]` `\` `'` `` ` ``)。`+` は区切り文字。
 
 use daw_ui_core::ShortcutMap;
 
+/// 一覧オーバーレイのカテゴリ。表示はこの enum 単位でグルーピングする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutCategory {
+    File,
+    Edit,
+    Transport,
+    Track,
+    ClipNote,
+    Automation,
+    GridView,
+    AudioEditor,
+    Help,
+}
+
+impl ShortcutCategory {
+    /// 一覧の見出しに使う日本語ラベル。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::File => "ファイル",
+            Self::Edit => "編集",
+            Self::Transport => "再生",
+            Self::Track => "トラック",
+            Self::ClipNote => "クリップ・ノート",
+            Self::Automation => "オートメーション",
+            Self::GridView => "グリッド・表示",
+            Self::AudioEditor => "オーディオエディタ",
+            Self::Help => "ヘルプ",
+        }
+    }
+}
+
+/// キーボードショートカット 1 件の定義 (SSoT)。
+pub struct ShortcutDef {
+    /// `take_shortcut` で使うシンボル名。
+    pub name: &'static str,
+    /// 割り当てキー。先頭が主表記、以降は alias (例: redo は Ctrl+Shift+Z / Ctrl+Y)。
+    pub keys: &'static [&'static str],
+    pub category: ShortcutCategory,
+    /// 一覧に出す日本語説明。文脈で挙動が変わるものは括弧で補足する。
+    pub description: &'static str,
+    /// `true` のものは一覧に出さない (開発用など)。キー登録はされる。
+    pub hidden: bool,
+}
+
+/// 全キーボードショートカット。カテゴリ順 = 一覧の表示順。
+///
+/// ここに 1 行足すだけで「キー登録」と「F1 一覧」の両方に反映される。
+pub static SHORTCUTS: &[ShortcutDef] = &[
+    // ----- ファイル -----
+    ShortcutDef { name: "new", keys: &["Ctrl+N"], category: ShortcutCategory::File, description: "新規プロジェクト", hidden: false },
+    ShortcutDef { name: "open", keys: &["Ctrl+O"], category: ShortcutCategory::File, description: "プロジェクトを開く", hidden: false },
+    ShortcutDef { name: "save", keys: &["Ctrl+S"], category: ShortcutCategory::File, description: "保存", hidden: false },
+    ShortcutDef { name: "save_as", keys: &["Ctrl+Shift+S"], category: ShortcutCategory::File, description: "名前を付けて保存", hidden: false },
+    ShortcutDef { name: "daw.export_wav", keys: &["Ctrl+E"], category: ShortcutCategory::File, description: "WAV 書き出し", hidden: false },
+    // ----- 編集 -----
+    ShortcutDef { name: "undo", keys: &["Ctrl+Z"], category: ShortcutCategory::Edit, description: "元に戻す", hidden: false },
+    ShortcutDef { name: "redo", keys: &["Ctrl+Shift+Z", "Ctrl+Y"], category: ShortcutCategory::Edit, description: "やり直し", hidden: false },
+    ShortcutDef { name: "cut", keys: &["Ctrl+X"], category: ShortcutCategory::Edit, description: "カット (選択中の面)", hidden: false },
+    ShortcutDef { name: "copy", keys: &["Ctrl+C"], category: ShortcutCategory::Edit, description: "コピー (選択中の面)", hidden: false },
+    ShortcutDef { name: "paste", keys: &["Ctrl+V"], category: ShortcutCategory::Edit, description: "ペースト", hidden: false },
+    ShortcutDef { name: "select_all", keys: &["Ctrl+A"], category: ShortcutCategory::Edit, description: "すべて選択 (文脈依存)", hidden: false },
+    ShortcutDef { name: "delete", keys: &["Delete"], category: ShortcutCategory::Edit, description: "削除 (選択中の面)", hidden: false },
+    ShortcutDef { name: "escape", keys: &["Esc"], category: ShortcutCategory::Edit, description: "閉じる / 選択解除 / 編集をキャンセル", hidden: false },
+    ShortcutDef { name: "tab_next", keys: &["Tab"], category: ShortcutCategory::Edit, description: "次の入力欄へ", hidden: false },
+    ShortcutDef { name: "tab_prev", keys: &["Shift+Tab"], category: ShortcutCategory::Edit, description: "前の入力欄へ", hidden: false },
+    // ----- 再生 -----
+    ShortcutDef { name: "daw.play_toggle", keys: &["Space"], category: ShortcutCategory::Transport, description: "再生 / 停止", hidden: false },
+    ShortcutDef { name: "daw.toggle_loop", keys: &["P"], category: ShortcutCategory::Transport, description: "ループ ON / OFF", hidden: false },
+    ShortcutDef { name: "daw.loop_selected_clip", keys: &["R"], category: ShortcutCategory::Transport, description: "選択クリップの範囲をループして再生 (再押下で解除)", hidden: false },
+    ShortcutDef { name: "daw.play_from_cursor", keys: &["F"], category: ShortcutCategory::Transport, description: "カーソル位置から再生 (Alt で吸着なし)", hidden: false },
+    // ----- トラック -----
+    ShortcutDef { name: "daw.add_track", keys: &["Ctrl+T"], category: ShortcutCategory::Track, description: "トラックを追加", hidden: false },
+    ShortcutDef { name: "daw.group_tracks", keys: &["Ctrl+G"], category: ShortcutCategory::Track, description: "選択トラックをグループ化", hidden: false },
+    ShortcutDef { name: "daw.ungroup_tracks", keys: &["Alt+G"], category: ShortcutCategory::Track, description: "グループを解除", hidden: false },
+    ShortcutDef { name: "daw.toggle_track_solo", keys: &["S"], category: ShortcutCategory::Track, description: "カーソル直下のトラックをソロ切替", hidden: false },
+    ShortcutDef { name: "daw.toggle_mute", keys: &["Q"], category: ShortcutCategory::Track, description: "選択/カーソル下のクリップ・ノートをミュート切替", hidden: false },
+    // ----- クリップ・ノート -----
+    ShortcutDef { name: "daw.duplicate_clip_shared", keys: &["D"], category: ShortcutCategory::ClipNote, description: "クリップを複製 (共有)。ノート選択中はノート複製", hidden: false },
+    ShortcutDef { name: "daw.duplicate_clip_unique", keys: &["Alt+D"], category: ShortcutCategory::ClipNote, description: "クリップを複製 (独立コピー)", hidden: false },
+    ShortcutDef { name: "daw.split_clip_at_cursor", keys: &["E"], category: ShortcutCategory::ClipNote, description: "カーソル位置でクリップを分割", hidden: false },
+    ShortcutDef { name: "daw.split_clip_at_cursor_no_snap", keys: &["Alt+E"], category: ShortcutCategory::ClipNote, description: "クリップを分割 (スナップ無効)", hidden: false },
+    ShortcutDef { name: "daw.glue_selected_clips", keys: &["J"], category: ShortcutCategory::ClipNote, description: "選択した隣接クリップを 1 つに結合", hidden: false },
+    ShortcutDef { name: "daw.rename_clip", keys: &["F2"], category: ShortcutCategory::ClipNote, description: "クリップ / トラック名を変更", hidden: false },
+    ShortcutDef { name: "daw.select_linked_clips", keys: &["Shift+L"], category: ShortcutCategory::ClipNote, description: "同じ内容のリンククリップをまとめて選択", hidden: false },
+    ShortcutDef { name: "daw.quantize_pitches_to_scale", keys: &["Shift+P"], category: ShortcutCategory::ClipNote, description: "選択ノートの音程をスケールに補正", hidden: false },
+    ShortcutDef { name: "add_note", keys: &["Insert"], category: ShortcutCategory::ClipNote, description: "ノートを追加 (ピアノロール)", hidden: false },
+    ShortcutDef { name: "piano_roll.edit_lyric", keys: &["L"], category: ShortcutCategory::ClipNote, description: "歌詞を編集 (ピアノロールでノート 1 つ選択中)", hidden: false },
+    // ----- オートメーション -----
+    ShortcutDef { name: "daw.add_automation_from_last_touched", keys: &["A"], category: ShortcutCategory::Automation, description: "最後に触れたパラメータのレーンを追加", hidden: false },
+    // ----- グリッド・表示 -----
+    ShortcutDef { name: "daw.toggle_snap", keys: &["G"], category: ShortcutCategory::GridView, description: "グリッドスナップ ON / OFF", hidden: false },
+    ShortcutDef { name: "daw.fit_view", keys: &["X"], category: ShortcutCategory::GridView, description: "表示をフィット (直前のズームへ)", hidden: false },
+    ShortcutDef { name: "daw.zoom_selected_clip", keys: &["Z"], category: ShortcutCategory::GridView, description: "選択クリップへ段階ズーム (アレンジ)", hidden: false },
+    ShortcutDef { name: "daw.narrow_grid", keys: &["1"], category: ShortcutCategory::GridView, description: "グリッドを細かく", hidden: false },
+    ShortcutDef { name: "daw.widen_grid", keys: &["2"], category: ShortcutCategory::GridView, description: "グリッドを粗く", hidden: false },
+    ShortcutDef { name: "daw.toggle_triplet", keys: &["3"], category: ShortcutCategory::GridView, description: "三連符グリッド ON / OFF", hidden: false },
+    // ----- オーディオエディタ -----
+    ShortcutDef { name: "daw.duplicate_audio_event", keys: &["Ctrl+D"], category: ShortcutCategory::AudioEditor, description: "オーディオイベントを複製", hidden: false },
+    ShortcutDef { name: "daw.next_audio_event", keys: &["Ctrl+]"], category: ShortcutCategory::AudioEditor, description: "次のオーディオイベントへ", hidden: false },
+    ShortcutDef { name: "daw.prev_audio_event", keys: &["Ctrl+["], category: ShortcutCategory::AudioEditor, description: "前のオーディオイベントへ", hidden: false },
+    // ----- ヘルプ -----
+    ShortcutDef { name: "daw.toggle_help", keys: &["F1"], category: ShortcutCategory::Help, description: "このショートカット一覧を開く / 閉じる", hidden: false },
+    // ----- 開発用 (一覧には出さない) -----
+    ShortcutDef { name: "debug_overlay_toggle", keys: &["Ctrl+F1"], category: ShortcutCategory::Help, description: "デバッグオーバーレイ", hidden: true },
+    // NOTE: `daw.synthesize_vocal` (旧 V) は PR-V4 で builtin VOICEVOX plugin の
+    // 自動 synth に置き換わり dispatch から削除された。死蔵 bind なのでこのテーブルにも
+    // 載せない (= キー登録もしない)。再 synth は notes を編集すれば自動 trigger される。
+];
+
+/// [`SHORTCUTS`] から実際の `ShortcutMap` を構築する。
 #[must_use]
 pub fn daw_shortcut_map() -> ShortcutMap {
-    let mut m = ShortcutMap::with_default_bindings();
-    m.bind("daw.play_toggle", "Space");
-    m.bind("daw.toggle_loop", "P");
-    // 選択 clip の bounding range を loop に設定して loop ON + 再生開始。
-    // 再押下で範囲一致 + loop ON なら loop OFF にトグル (Reaper 流の
-    // "Loop to selected items" を 1 キーに集約したもの)。
-    m.bind("daw.loop_selected_clip", "R");
-    m.bind("daw.synthesize_vocal", "V");
-    m.bind("daw.export_wav", "Ctrl+E");
-    m.bind("daw.toggle_help", "F1");
-    // FIXME #44: f キーでカーソル直下の拍 (song-absolute, 現在の snap 設定で吸着) へ
-    // プレイヘッドを移動して再生。再生中は seek してシームレスに継続、停止中はその位置
-    // から再生開始。root.rs::dispatch_shortcuts でアレンジ / piano_roll の hover 位置を
-    // 解決して発火 (どちらの grid 外でも no-op)。text_input フォーカス中は gui_01 が
-    // 単キーを抑制する。
-    m.bind("daw.play_from_cursor", "F");
-    // Ableton Live 互換: Ctrl+G で選択トラック群をグループ化、
-    // Alt+G で解除。 G 単独は元の grid snap toggle のまま。
-    m.bind("daw.group_tracks", "Ctrl+G");
-    m.bind("daw.ungroup_tracks", "Alt+G");
-    // Ctrl+T で新規トラックを末尾に追加 (旧 +Vocal/+Inst ボタンの代替)。
-    m.bind("daw.add_track", "Ctrl+T");
-    // Grid snap (G キー) / auto-fit zoom (X キー)。focus 中の text_input 無効時のみ発火。
-    m.bind("daw.toggle_snap", "G");
-    m.bind("daw.fit_view", "X");
-    // Z キー: 選択中 clip を arrangement timeline に水平 framing する
-    // (Ableton "Zoom to Selection" 相当)。 X (= 全 clip auto-fit) の選択 clip
-    // 限定版。 複数選択時はその bounding beat span に合わせる。
-    m.bind("daw.zoom_selected_clip", "Z");
-    // Ableton Live 互換 (modifier 無し版): 1=Narrow, 2=Widen, 3=Toggle Triplet。
-    m.bind("daw.narrow_grid", "1");
-    m.bind("daw.widen_grid", "2");
-    m.bind("daw.toggle_triplet", "3");
-    // S キーで track を solo toggle する (mixer / arrangement の S ボタンと同じ
-    // ToggleTrackSolo を発火)。 対象 track は文脈で決まる (root.rs::dispatch_shortcuts):
-    // - FIXME #19: piano roll active のときは編集中 clip の所属 track。
-    // - FIXME #68: アレンジ / mixer では pointer 直下のトラック (= マウスが
-    //   ヘッダ列・クリップレーン・ミキサーストリップのどこにあっても、 その
-    //   トラック)。 選択トラックではない。
-    // text_input フォーカス中 (歌詞 / rename 編集等) は gui_01 が単キーを抑制する。
-    m.bind("daw.toggle_track_solo", "S");
-    // FIXME #80: Q キーで clip / note を mute toggle する。対象は文脈で決まる
-    // (root.rs::dispatch_shortcuts): piano roll active = note (選択 note、 無ければ
-    // カーソル直下 note)、 それ以外 = clip (選択 clip、 無ければカーソル直下 clip)。
-    // 選択 / カーソル下のどちらも無ければ no-op。text_input フォーカス中は gui_01 が
-    // 単キーを抑制するので rename / 歌詞編集中は発火しない。
-    m.bind("daw.toggle_mute", "Q");
-    // gui_01 piano_roll widget の `take_shortcut("add_note")` 用バインド。
-    m.bind("add_note", "Insert");
-    // gui_01 #017 (M14 Phase 59): piano_roll で note 1 つ選択中に L で歌詞
-    // 編集モード起動。 修飾なし shortcut だが widget 側で `is_typing_only`
-    // 扱いされるので、 編集中の text_input 入力中は 'l' 文字として届く。
-    m.bind("piano_roll.edit_lyric", "L");
-    // gui_01 #019: 選択中 clip の末尾直後にコピー生成。
-    // - D: 共有コピー (linked clip、 source content を共有)
-    // - Alt+D: 独立コピー (notes を deep clone + 新 ContentId)
-    // text_input フォーカス中は無効 (gui_01 が自動処理)。
-    m.bind("daw.duplicate_clip_shared", "D");
-    m.bind("daw.duplicate_clip_unique", "Alt+D");
-    // Phase 1 PR7 (`docs/plan_audio_clip.md` §3.3 / §14): clip kind に
-    // 関係なく MIDI / Audio / Vocal すべての clip に対して動く。
-    // - E: cursor (= マウスホバー位置) で選択 clip を 2 つに split (snap 適用)
-    // - Alt+E: 同上だが snap 一時無効
-    // - J: 選択中の隣接 clip を 1 つに glue (Consolidate)
-    // gui_01 #028 §7.3: `A` キーで last-touched parameter の lane を
-    // 所有 track に追加 (Bitwig / Live 流の last-touched workflow)。
-    // text_input フォーカス中は gui_01 が自動 skip するので、 編集中に
-    // `a` を打っても発火しない。
-    m.bind("daw.add_automation_from_last_touched", "A");
-    m.bind("daw.split_clip_at_cursor", "E");
-    m.bind("daw.split_clip_at_cursor_no_snap", "Alt+E");
-    m.bind("daw.glue_selected_clips", "J");
-    // 選択中 clip を inline rename (track rename の clip 版)。 F2 は DAW 慣習
-    // (Bitwig / Live / REAPER)。 text_input フォーカス中は gui_01 が shortcut
-    // を抑制するので、 rename 編集中に F2 を打っても再発火しない。
-    m.bind("daw.rename_clip", "F2");
-    // 共有を一括選択: selected clip と同じ content_id の linked clip group を
-    // まとめて選択 (`docs/plan_clip_shared_name.md` §2)。 右クリックメニューと
-    // 同等。 rename 編集中は除外 (root.rs::dispatch_shortcuts で gate)。
-    m.bind("daw.select_linked_clips", "Shift+L");
-    // Phase 7 B5 (`docs/plan_scale.html` §5.3): 選択 clip の note pitch を
-    // 最寄りの in-scale pitch に一括補正。 Bitwig の "Quantize Pitches" 相当。
-    // selected_notes が空のときは clip 全 note、 そうでなければ選択 note のみ。
-    m.bind("daw.quantize_pitches_to_scale", "Shift+P");
-    // Phase 2 PR-D 段階 1: Audio Editor で開いている clip 内 event を
-    // Duplicate (spec §3.10.2 の `Ctrl+D`)。 root.rs::dispatch_shortcuts
-    // で `audio_editor_clip is Some` のときだけ消費するよう gate。
-    m.bind("daw.duplicate_audio_event", "Ctrl+D");
-    // PR-D 段階 2: Audio Editor 内で multi-event clip の event 選択を
-    // 移動する keyboard navigation (= Inspector / overlay highlight が
-    // 当該 event に追従)。 Ctrl+] / Ctrl+[ で next / prev (Bitwig clip
-    // navigation を参考)。 audio_editor_clip is Some 時のみ消費。
-    m.bind("daw.next_audio_event", "Ctrl+]");
-    m.bind("daw.prev_audio_event", "Ctrl+[");
+    let mut m = ShortcutMap::new();
+    for def in SHORTCUTS {
+        for &key in def.keys {
+            m.bind(def.name, key);
+        }
+    }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 全エントリのキー表記が parse 可能で、`daw_shortcut_map` が panic せず
+    /// 全 (name, key) を登録する。`bind` 内の `Shortcut::parse` は不正表記で panic
+    /// するので、この呼び出し自体が parse の網羅検証になる。
+    #[test]
+    fn daw_shortcut_map_binds_every_entry() {
+        let m = daw_shortcut_map();
+        let expected: usize = SHORTCUTS.iter().map(|d| d.keys.len()).sum();
+        assert_eq!(m.iter().count(), expected, "全 (name, key) が登録される");
+    }
+
+    /// 異なる name が同じキー表記を共有していない (先勝ちで片方が死ぬのを防ぐ)。
+    #[test]
+    fn no_two_shortcuts_share_a_key() {
+        let mut seen = std::collections::HashSet::new();
+        for def in SHORTCUTS {
+            for &key in def.keys {
+                assert!(seen.insert(key), "キー {key:?} が重複している ({})", def.name);
+            }
+        }
+    }
+
+    /// 主要な既存バインドが維持されている回帰確認 (テーブル化で漏れていないか)。
+    #[test]
+    fn well_known_bindings_present() {
+        let m = daw_shortcut_map();
+        let names: std::collections::HashSet<&str> = m.iter().map(|(_, n)| *n).collect();
+        for name in [
+            "undo", "redo", "save", "select_all", "delete", "escape",
+            "daw.play_toggle", "daw.toggle_help", "daw.duplicate_clip_shared",
+            "add_note", "piano_roll.edit_lyric",
+        ] {
+            assert!(names.contains(name), "{name} が登録されていない");
+        }
+        // 死蔵 bind は登録しない。
+        assert!(!names.contains("daw.synthesize_vocal"), "死蔵 V bind を復活させない");
+    }
 }
