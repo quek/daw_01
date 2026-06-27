@@ -1,4 +1,4 @@
-//! GPU 映像効果 実行基盤 (FIXME #54 / docs/plan_video_fx.md §1, §8)。
+//! GPU 映像効果 実行基盤 (docs/plan_video_fx.md §1, §8)。
 //!
 //! [`common::video_fx`] の宣言的カタログ ([`VideoFxDef`]) を受け取り、トラックの
 //! 合成画 (1 枚の RGBA `TextureHandle`) にチェーン順で WGSL fragment パスを
@@ -227,7 +227,7 @@ pub fn resolve_track_effects(
     )
 }
 
-/// FIXME #54 Wave1: マスター映像チェーン（`Song.master_fx_chain` の映像 device）を解決する。
+/// マスター映像チェーン（`Song.master_fx_chain` の映像 device）を解決する。
 /// automation / 変調は master 流儀の `song_lanes` / `song_mod_routings`（`song_lanes` と同じ
 /// 「master 固有データは Song 直下」）。全トラック合成後の master canvas 1 枚へ作用する。
 #[must_use]
@@ -246,7 +246,7 @@ pub fn resolve_master_effects(
     )
 }
 
-/// トラックの配置 [`GroupTransform`] を解決する（無ければ `None`）。FIXME #54 Wave3:
+/// トラックの配置 [`GroupTransform`] を解決する（無ければ `None`）。
 /// 「動かす変形」をチェーン上の Transform device に一本化。device が刺さっている
 /// トラックだけ（立ち絵 group も通常トラックも）変換が効く（device を抜けば変換なし）。
 /// 値・automation・変調は purpose-built な [`GroupTransform`] 系（`group_active_transform`、
@@ -309,7 +309,7 @@ pub struct VideoFxEngine {
     common: Option<CommonGpu>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     pool: HashMap<(u32, u32), SizePool>,
-    /// FIXME #54 Wave4: 効果シェーダの `P.time`（秒）。ノイズ/スキャンライン/時間系効果の
+    /// 効果シェーダの `P.time`（秒）。ノイズ/スキャンライン/時間系効果の
     /// アニメに使う。preview/export 一致のため wall-clock でなく song 時間（playhead_beat ×
     /// 60/bpm）を caller が毎 frame [`set_time`](Self::set_time) で渡す。
     current_time: f32,
@@ -329,7 +329,7 @@ impl VideoFxEngine {
         Self::default()
     }
 
-    /// FIXME #54 Wave4: 効果シェーダの `P.time`（秒）を設定する。caller が毎 frame、
+    /// 効果シェーダの `P.time`（秒）を設定する。caller が毎 frame、
     /// 合成（`apply_chain`）の前に song 時間（`playhead_beat * 60/bpm`）を渡す。
     /// preview/export で同じ song 時間を渡せば時間系効果も一致する。
     pub fn set_time(&mut self, secs: f32) {

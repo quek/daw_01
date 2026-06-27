@@ -482,7 +482,7 @@ fn pr_view(snap: SnapConfig) -> PianoRollView {
         scale: None,
         snap_pitch_during_drag: false,
         sub_grid_interval_beats: None,
-        // FIXME #82: alt-drag (既存 note resize) test では note 作成しないので任意 (1 拍)。
+        // alt-drag (既存 note resize) test では note 作成しないので任意 (1 拍)。
         default_note_len_beats: 1.0,
     }
 }

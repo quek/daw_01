@@ -82,7 +82,7 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// `WindowBackend::set_cursor` をラップ。`new` 直接呼び出しでは `None` (no-op)。
     /// `pub(crate)` は他 widget の `#[cfg(test)]` で cursor 検証 mock を直接 inject するため。
     pub(crate) set_cursor_request: Option<Box<dyn Fn(CursorIcon) + Send + Sync>>,
-    /// (FIXME #82) cursor 位置を OS に warp させる callback。`with_window` 経由で
+    /// cursor 位置を OS に warp させる callback。`with_window` 経由で
     /// `WindowBackend::set_cursor_position` をラップ。`new` 直接呼び出しでは `None` (no-op)。
     pub(crate) set_cursor_pos_request: Option<Box<dyn Fn(f32, f32) + Send + Sync>>,
     /// **(M15)** focus 中 text_input の document snapshot を OS text store (TSF) に publish する
@@ -128,7 +128,7 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// M9 Phase 41b: 今フレームに `Ui::set_cursor` で要求された cursor (last call wins)。
     /// `frame()` 末尾で `set_cursor_request` callback に flush され、None にリセットされる。
     transient_cursor: Option<CursorIcon>,
-    /// (FIXME #82) 今フレームに `Ui::warp_cursor` で要求された cursor 位置 (物理 px、last call wins)。
+    /// 今フレームに `Ui::warp_cursor` で要求された cursor 位置 (物理 px、last call wins)。
     /// `frame()` 末尾で `set_cursor_pos_request` callback に flush され、None にリセットされる。
     transient_cursor_pos: Option<(f32, f32)>,
     /// M9 Phase 43: 直近フレームの統計 (debug overlay 表示用)。`frame_to_edits` 末尾で更新。
@@ -313,7 +313,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let win_for_edits = window;
         let mut host = Self::new(move || win_for_redraw.request_redraw());
         host.set_cursor_request = Some(Box::new(move |c| win_for_cursor.set_cursor(c)));
-        // (FIXME #82) cursor 位置 warp (ノート作成で右端へ移動)。
+        // cursor 位置 warp (ノート作成で右端へ移動)。
         host.set_cursor_pos_request =
             Some(Box::new(move |x, y| win_for_cursor_pos.set_cursor_position(x, y)));
         // M15: TSF text store の publish / IME 編集 drain を window backend に橋渡し。
@@ -427,7 +427,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             req(c);
         }
 
-        // (FIXME #82) cursor 位置 warp flush (Ui::warp_cursor で要求された位置を OS に伝える)。
+        // cursor 位置 warp flush (Ui::warp_cursor で要求された位置を OS に伝える)。
         if let Some((x, y)) = self.transient_cursor_pos.take()
             && let Some(req) = self.set_cursor_pos_request.as_ref()
         {
@@ -569,7 +569,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // M9 P1-4: ダブルクリック判定。primary_just_released で前回 click との時間/位置 diff を見て、
         // threshold 内なら `pending_double_click` を Some に立てる。同 frame 内で
         // `Ui::take_double_click_in_rect(rect)` が rect.contains で 1 度だけ消費する。
-        // (FIXME #82) press ベースの double-click 検出。release ベース (下) と独立で、かつ
+        // press ベースの double-click 検出。release ベース (下) と独立で、かつ
         // `last_click` を **変更しない** (read-only)。 double-click の 2 度目の press フレームで
         // Some を立て、piano_roll widget が `take_double_click_press_in_rect` で消費して
         // 「ダブルクリックのボタンを放さずに drag → note 長を決める」セッションを開始する
@@ -881,7 +881,7 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// このフレーム末尾に OS に伝える cursor (last call wins)。
     /// `Ui::set_cursor` で書き、`UiHost::frame` 末尾で `set_cursor_request` callback に流す。
     pub(crate) pending_cursor: &'a mut Option<CursorIcon>,
-    /// (FIXME #82) このフレーム末尾に OS に warp させる cursor 位置 (物理 px、last call wins)。
+    /// このフレーム末尾に OS に warp させる cursor 位置 (物理 px、last call wins)。
     /// `Ui::warp_cursor` で書き、`UiHost::frame` 末尾で `set_cursor_pos_request` callback に流す。
     pub(crate) pending_cursor_pos: &'a mut Option<(f32, f32)>,
     // ---- M9 Phase 43 debug stats ----
@@ -895,7 +895,7 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// このフレームで double-click が判定されていれば release 位置 (primary_just_released
     /// の座標)。`take_double_click_in_rect(rect)` が rect.contains で 1 度だけ消費する。
     pub(crate) pending_double_click: &'a mut Option<(f32, f32)>,
-    /// (FIXME #82) このフレームで「double-click の 2 度目の press」が判定されていれば press 位置。
+    /// このフレームで「double-click の 2 度目の press」が判定されていれば press 位置。
     /// `take_double_click_press_in_rect(rect)` が rect.contains で 1 度だけ消費する。
     /// release ベースの `pending_double_click` と独立 (押下のまま drag を始める用)。
     pub(crate) pending_double_click_press: &'a mut Option<(f32, f32)>,
@@ -1361,7 +1361,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         *self.pending_cursor = Some(cursor);
     }
 
-    /// (FIXME #82) このフレーム末尾に OS カーソルを `(x, y)` (物理 px、ウィンドウ client 座標) へ
+    /// このフレーム末尾に OS カーソルを `(x, y)` (物理 px、ウィンドウ client 座標) へ
     /// warp 要求する。同フレーム内で複数回呼ばれた場合は **last call wins**。
     ///
     /// `WindowBackend::set_cursor_position` callback が registered されていなければ no-op
@@ -1488,7 +1488,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
     }
 
-    /// (FIXME #82) `rect` 内で発生した「double-click の 2 度目の press」を 1 度だけ消費する。
+    /// `rect` 内で発生した「double-click の 2 度目の press」を 1 度だけ消費する。
     ///
     /// `take_double_click_in_rect` の **press ベース** 版。 直前の click から
     /// `UiHost::set_double_click_threshold` (default 400ms / 5px) 内に再度 **press** され、
@@ -3413,7 +3413,7 @@ mod tests {
         });
     }
 
-    /// (FIXME #82) press ベース double-click: 1 度目 click (release) の直後に同位置で press すると
+    /// press ベース double-click: 1 度目 click (release) の直後に同位置で press すると
     /// `take_double_click_press_in_rect` が Some を返す (放さず drag を始める起点)。
     #[test]
     fn take_double_click_press_in_rect_detects_second_press() {
@@ -3440,7 +3440,7 @@ mod tests {
         });
     }
 
-    /// (FIXME #82) press ベース検出は release ベースを壊さない: 同じ double-click で
+    /// press ベース検出は release ベースを壊さない: 同じ double-click で
     /// `take_double_click_in_rect` (release) も従来どおり成立する (arrangement 等の既存利用を保護)。
     /// = press 検出が `last_click` を消費しない (additive・非破壊) ことの回帰防止。
     #[test]

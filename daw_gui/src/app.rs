@@ -120,7 +120,7 @@ pub enum PluginCategory {
     Instrument,
     Fx,
     MidiFx,
-    /// FIXME #54: 内蔵 GPU 映像効果 (`builtin.video.*`、feature `video-effect`)。
+    /// 内蔵 GPU 映像効果 (`builtin.video.*`、feature `video-effect`)。
     /// GUI 描画パスで処理する device。チェーンに刺さるが audio バスは素通り。
     Video,
 }
@@ -129,7 +129,7 @@ impl PluginCategory {
     pub fn from_features(features: &[String]) -> Self {
         let has = |k: &str| features.iter().any(|f| f == k);
         if has("video-effect") {
-            // FIXME #54: 映像効果は audio/note の前に判定 (排他)。
+            // 映像効果は audio/note の前に判定 (排他)。
             Self::Video
         } else if has("note-effect") {
             Self::MidiFx
@@ -162,7 +162,7 @@ fn port_config_of(e: &common::plugin_db::PluginEntry) -> common::port_config::Po
         has_note_output: e.has_note_output,
         has_audio_output: e.has_audio_output,
         has_audio_input: e.has_audio_input,
-        // FIXME #54: 内蔵映像効果のみ video ports を持つ。
+        // 内蔵映像効果のみ video ports を持つ。
         has_video_input: e.has_video_input,
         has_video_output: e.has_video_output,
     }
@@ -206,7 +206,7 @@ impl PluginPickEntry {
 pub struct ChainEntry {
     pub device_index: u32,
     pub plugin_name: String,
-    /// FIXME #78: チェーン行ボタンの分岐用。 埋め込み GUI (editor window) を持つ
+    /// チェーン行ボタンの分岐用。 埋め込み GUI (editor window) を持つ
     /// plugin か (`PluginParamList` の `has_embedded_gui`、 未受信は楽観的に true)。
     pub has_embedded_gui: bool,
     /// この device が内蔵映像 FX (= `ports.is_video()`) か。 映像 FX は専用の
@@ -224,14 +224,14 @@ impl ChainEntry {
         self.device_index
     }
 
-    /// FIXME #78: チェーン行ボタンが「埋め込み GUI window を開く」 のではなく
+    /// チェーン行ボタンが「埋め込み GUI window を開く」 のではなく
     /// 「インライン param パネルをトグルする」 種類か。 映像 FX / VOICEVOX /
     /// 埋め込み GUI を持たないが param がある plugin が該当。
     pub fn shows_param_panel(&self) -> bool {
         self.is_video || self.is_voicevox || (!self.has_embedded_gui && self.has_params)
     }
 
-    /// FIXME #78: チェーン行にボタンを出すか。 GUI も param パネルも無い device
+    /// チェーン行にボタンを出すか。 GUI も param パネルも無い device
     /// (= Silence 等の no-op builtin) はボタンを出さない。
     pub fn shows_button(&self) -> bool {
         (self.has_embedded_gui && !self.is_video) || self.shows_param_panel()
@@ -254,7 +254,7 @@ pub struct InspectorAudioEventSummary {
     pub stretch_mode: common::model::StretchMode,
     pub fade_in_curve: common::model::FadeCurve,
     pub fade_out_curve: common::model::FadeCurve,
-    // FIXME #15: scrubable_number に表示する現値 (= first event 代表値)。
+    // scrubable_number に表示する現値 (= first event 代表値)。
     pub gain_db: f32,
     pub pan: f32,
     pub pitch_semitones: f32,
@@ -288,7 +288,7 @@ pub struct InspectorImageEventSummary {
     pub h_automated: bool,
     pub opacity_automated: bool,
     pub rotation_automated: bool,
-    // FIXME #15: scrubable_number に表示する現値 (= first event 代表値)。
+    // scrubable_number に表示する現値 (= first event 代表値)。
     // rotation は radians 保持 (view が degree 表示に変換)。
     pub x: f32,
     pub y: f32,
@@ -305,7 +305,7 @@ pub struct InspectorImageEventSummary {
 /// docs/plan_text_overlay.md §4 P5: text inspector の編集対象 numeric
 /// field 列挙。 image inspector が field 毎に個別 `SetClipImage*` event を
 /// 持つのに対し、 text は 23 field と多いため `SetClipTextNumField` 1 event と
-/// `TextNumField` discriminator で集約する。 FIXME #15 で inspector の数値
+/// `TextNumField` discriminator で集約する。 inspector の数値
 /// 入力は scrubable_number 化され、 on_change が直接 `SetClipTextNumField` を
 /// 発火する (= 旧 `ClipTextNumEditChanged` / `CommitClipTextNumEdit` の
 /// buffer 経路は撤去)。
@@ -376,7 +376,7 @@ pub fn text_num_to_builtin(field: TextNumField) -> Option<common::model::TextBui
     })
 }
 
-/// FIXME #15 (`docs/plan_inspector_scrub.md`): inspector の scrubable_number
+/// inspector の scrubable_number
 /// で drag / text 編集中の field を識別する key。 group transform の
 /// `group_scrub_active: Option<GroupTransformParam>` と同 idiom で、 各
 /// scrubable の active edge を検知して `BeginInspectorScrub` /
@@ -398,14 +398,14 @@ pub enum InspectorScrubField {
     ImageFadeIn,
     ImageFadeOut,
     Text(TextNumField),
-    /// FIXME #54 Wave4: 内蔵映像 FX param scrub（device_index, param_id 単位で
+    /// 内蔵映像 FX param scrub（device_index, param_id 単位で
     /// drag stroke を undo 1 step に bracket する）。
     VideoFx { device_index: u32, param_id: u32 },
-    /// FIXME #78: 汎用 plugin param scrub (「⚙」パネル、device_index, param_id 単位)。
+    /// 汎用 plugin param scrub (「⚙」パネル、device_index, param_id 単位)。
     PluginParam { device_index: u32, param_id: u32 },
 }
 
-/// docs/plan_modulation.md §9 / FIXME #56: one row of the inspector
+/// docs/plan_modulation.md §9: one row of the inspector
 /// modulation-source rack. `kind` を clone 保持し、 UI が種別別 (follower / LFO /
 /// Random / MSEG / Steps) のエディタを出す。
 #[derive(Debug, Clone)]
@@ -413,14 +413,14 @@ pub struct ModSourceRow {
     pub id: u32,
     pub color: [f32; 3],
     /// Live scalar (`0..=1`) from the polled `mod_scalars` plane — follower env
-    /// または generator 値 (engine が全種別を publish、 FIXME #56)。
+    /// または generator 値 (engine が全種別を publish)。
     pub scalar: f32,
-    /// 変調器種別 + 設定。FIXME #56: follower の tap_point (PreFx/PostFx/PostFader、
+    /// 変調器種別 + 設定。follower の tap_point (PreFx/PostFx/PostFader、
     /// docs/plan_modulation_followups.md §1) は `EnvelopeFollower { tap }` 内に内包。
     pub kind: common::model::ModSourceKind,
 }
 
-/// `AddModSource` で作る変調器の種別タグ (FIXME #56)。
+/// `AddModSource` で作る変調器の種別タグ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModSourceKindTag {
     Follower,
@@ -430,7 +430,7 @@ pub enum ModSourceKindTag {
     Steps,
 }
 
-/// generator (LFO/Random/MSEG/Steps) 設定の編集 (consolidated event、 FIXME #56)。
+/// generator (LFO/Random/MSEG/Steps) 設定の編集 (consolidated event)。
 /// follower の track/attack/release/tap は既存の専用 event を使う。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModSourceEdit {
@@ -485,7 +485,7 @@ pub enum ModControlDomain {
     /// dB↔frac 写像で橋渡しする。model depth は従来どおり線形 (volume/2) 空間に
     /// 留まる (engine の `fill_track_param_ramps` がその空間で消費するため)。
     FaderDb(daw_ui_core::MeterScale),
-    /// FIXME #54 Wave4: 映像 FX param。表示は実レンジ (`min`..`max`、`log` なら対数)、
+    /// 映像 FX param。表示は実レンジ (`min`..`max`、`log` なら対数)、
     /// model は正規化 0..=1 (`PluginParam` は `plain==norm` なので model==norm)。
     /// `to_model` = 実値→norm、`to_display` = norm→実値 ([`common::video_fx::ParamKind`]
     /// と同写像)。インスペクタの video FX param スクラブ + per-control 変調で使う。
@@ -579,7 +579,7 @@ pub struct InspectorTextEventSummary {
     pub fade_in_curve: common::model::FadeCurve,
     pub fade_out_curve: common::model::FadeCurve,
     pub automated: std::collections::HashSet<common::model::TextBuiltinParam>,
-    /// FIXME #15: scrubable_number に表示する現値の供給源 (= first event
+    /// scrubable_number に表示する現値の供給源 (= first event
     /// snapshot)。 `text_num_field_value` で field 毎の f64 を取り出す
     /// (Rotation は degree に変換)。
     pub event: common::model::TextEvent,
@@ -588,7 +588,7 @@ pub struct InspectorTextEventSummary {
 }
 
 impl InspectorTextEventSummary {
-    /// FIXME #15: scrubable_number の `value` 引数に渡す現値を field 毎に
+    /// scrubable_number の `value` 引数に渡す現値を field 毎に
     /// 取り出す。 Rotation は内部 radians を degree に変換して返す
     /// (= 旧 text_input が degree 表示だったのと整合、 on_change で
     /// radians に戻す)。
@@ -597,7 +597,7 @@ impl InspectorTextEventSummary {
     }
 }
 
-/// FIXME #15 / #46: `TextEvent` 1 つから `TextNumField` の現値 (f64) を取り出す。
+/// `TextEvent` 1 つから `TextNumField` の現値 (f64) を取り出す。
 /// `InspectorTextEventSummary::text_num_field_value` (= アンカー代表値) と
 /// inspector の mixed 畳み込み (`inspector_text_num_folded`、 = 他クリップの event)
 /// の両方から使う single source。 Rotation は内部 radians を degree に変換。
@@ -665,7 +665,7 @@ pub struct SendPickerState {
     pub src_track_id: u32,
 }
 
-/// FIXME #55: どの種類の export がレンジピッカーを開いたか。 ピッカー確定後に
+/// どの種類の export がレンジピッカーを開いたか。 ピッカー確定後に
 /// 元の export action へ戻るための分岐に使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportRangeKind {
@@ -675,7 +675,7 @@ pub enum ExportRangeKind {
     Mp4,
 }
 
-/// FIXME #55: Export WAV / Video の前に出すレンジピッカーモーダルの状態。
+/// Export WAV / Video の前に出すレンジピッカーモーダルの状態。
 /// `Some` の間だけ `export_range_modal` が描画され、 下の UI 操作をブロック
 /// する。 Ardour / REAPER の time-selection export に倣い、 ユーザーが書き出す
 /// 時間範囲を **拍 (beat)** で選ぶ。 拍は song の native 単位なので audio
@@ -689,12 +689,12 @@ pub struct ExportRangePicker {
     pub end_beat: f64,
     /// 確定後に戻る export 種別。
     pub kind: ExportRangeKind,
-    /// FIXME #79: video export の出力解像度 `(width, height)`。 picker を開いた
+    /// video export の出力解像度 `(width, height)`。 picker を開いた
     /// 時点で `Song.video_resolution` を seed し、 dropdown で変更する。 確定時に
     /// `RenderConfig.output_resolution` へ渡る per-export override (Song /
     /// preview には永続しない)。 `Wav` では未使用。
     pub resolution: (u32, u32),
-    /// FIXME #79: video export の出力フレームレート。 picker を開いた時点で
+    /// video export の出力フレームレート。 picker を開いた時点で
     /// `Song.video_framerate` を seed し、 dropdown で変更する。 `Wav` では未使用。
     pub framerate: f32,
 }
@@ -713,7 +713,7 @@ pub struct ClipRef {
 pub enum ColorPickerTarget {
     Track(u32),
     Clip(ClipRef),
-    /// FIXME #53: Arranger セクション帯の色。
+    /// Arranger セクション帯の色。
     Section(u32),
 }
 
@@ -786,7 +786,7 @@ pub struct GroupTransformInspectorSummary {
     pub transform: common::model::GroupTransform,
 }
 
-/// FIXME #54 Wave4: 開いている内蔵映像 FX param パネルのデータ（inspector が
+/// 開いている内蔵映像 FX param パネルのデータ（inspector が
 /// scrubable_number 行に展開する）。`def` はカタログ定義、`values` は `def.params`
 /// 同順の現在実値（lane default_value or manifest default を実レンジへ展開）。
 #[derive(Clone)]
@@ -797,7 +797,7 @@ pub struct VideoFxParamsInspector {
     pub values: Vec<f32>,
 }
 
-/// FIXME #78: 埋め込み GUI を持たない plugin の「⚙」インライン param パネルの
+/// 埋め込み GUI を持たない plugin の「⚙」インライン param パネルの
 /// read snapshot。 `open_plugin_params` が cursor track の device を指すとき
 /// `inspector_plugin_params()` が返す。 VOICEVOX builtin は `voice` に device
 /// 既定の声を、 汎用 plugin は `params` に編集可能な param 行を載せる。
@@ -979,14 +979,14 @@ pub const ARRANGE_PX_PER_BEAT: f32 = 24.0;
 pub const ARRANGE_TRACK_HEIGHT: f32 = 88.0;
 pub const DEFAULT_NOTE_DURATION: f64 = 0.25;
 pub const DEFAULT_CLIP_LENGTH: f64 = 4.0;
-/// FIXME #55: export レンジの最小幅 (拍)。 start == end の縮退で 0 フレームの
+/// export レンジの最小幅 (拍)。 start == end の縮退で 0 フレームの
 /// 出力を作らないよう、 end は常に start + これ以上に保つ。
 pub const MIN_EXPORT_RANGE_BEATS: f64 = 0.25;
 /// 鍵盤レーン click のプレビュー発音 velocity (MIDI 0..=127、 固定値)。
 /// gui_01 #055: widget は押下 pitch のみ返すので velocity は daw_01 側で固定。
 const PREVIEW_VELOCITY: u8 = 100;
 
-/// FIXME #60: パニックボタンで `MainToChild::Panic`（master declick）を送ってから
+/// パニックボタンで `MainToChild::Panic`（master declick）を送ってから
 /// `ReinitAllPlugins` を送るまでの遅延。 audio engine が次の buffer で declick を
 /// 開始し fade-out（5ms）し切るまで（= buffer 1 個分 + 5ms ≒ 最大数十 ms）master
 /// が 0 になるのを待ってから plugin を mix から外す。 80ms あれば大きめの buffer
@@ -1008,7 +1008,7 @@ pub const MIN_AUDIO_EDITOR_VIEW_LEN_BEATS: f64 = 1.0 / 64.0;
 /// `source_path` は完了時に AudioSource として登録するときの
 /// `AudioSourcePath` (= ProjectRelative or Absolute、 outpath が
 /// `<project_dir>/bounce/...` か `bounce_cache/...` かで決まる)。
-/// FIXME #42: bounce の 2 モード。 完了 handler はこれで分岐する。
+/// bounce の 2 モード。 完了 handler はこれで分岐する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BounceMode {
     /// 音源/synth の素の音 (= insert FX 抜き) を **同じクリップに置換**。
@@ -1020,7 +1020,7 @@ pub enum BounceMode {
 
 #[derive(Debug, Clone)]
 pub struct PendingClipFxBounce {
-    /// FIXME #42: In Place (同位置置換) か With FX (新トラック) か。
+    /// In Place (同位置置換) か With FX (新トラック) か。
     pub mode: BounceMode,
     pub source_track: u32,
     pub source_clip: u32,
@@ -1088,7 +1088,7 @@ pub enum ExportStage {
     VideoRender { done: u64, total: u64 },
 }
 
-/// FIXME #55: a WAV export held while plugins reinitialise — `(path,
+/// a WAV export held while plugins reinitialise — `(path,
 /// range_frames, write_mod_sidecar)`. See [`AppData::pending_export`].
 pub type PendingExport = (std::path::PathBuf, Option<(u64, u64)>, bool);
 
@@ -1163,31 +1163,31 @@ pub struct AppData {
     /// clip is split. Falls back to the existing `selected_clips`
     /// when no clip is under the cursor.
     pub arrangement_hover_clip: Option<ClipRef>,
-    /// FIXME #33: ポインタ下のトラック id (`ArrangementResponse.hovered_track` の
+    /// ポインタ下のトラック id (`ArrangementResponse.hovered_track` の
     /// mirror)。トラック paste の挿入先 (= マウス下トラックの直上) に使う。
     /// `arrangement_view::draw` が毎フレーム更新。ヘッダ列・クリップレーンどちらの
     /// 上でも同じトラック行を返す。
     pub arrange_hovered_track: Option<u32>,
-    /// FIXME #68: ミキサーでポインタ直下の strip の track id。`mixer_strips::draw`
+    /// ミキサーでポインタ直下の strip の track id。`mixer_strips::draw`
     /// が毎フレーム更新 (arrangement の `arrange_hovered_track` と同 idiom)。S キーで
     /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master
     /// strip は solo を持たないので None 扱い。
     pub mixer_hovered_track: Option<u32>,
-    /// FIXME #33: ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
+    /// ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
     /// ノート paste の配置位置に使う。`piano_roll_view::draw` が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。
     pub pianoroll_hover_beat: Option<f64>,
-    /// FIXME #44: ピアノロール grid 上のポインタ拍を **song-absolute かつ snap なし**
+    /// ピアノロール grid 上のポインタ拍を **song-absolute かつ snap なし**
     /// (= clip_start_beat を引く前の生 beat) で mirror。`f` キー (PlayFromCursor) は
     /// song-absolute の grid で snap する必要があるため、`pianoroll_hover_beat`
     /// (clip-local snap 済) とは別に保持する。grid 外 / 非 piano-roll は `None`。
     pub pianoroll_hover_beat_song_raw: Option<f64>,
-    /// FIXME #80: ピアノロール grid 上のポインタ直下の note index (= clip 内 notes Vec の
+    /// ピアノロール grid 上のポインタ直下の note index (= clip 内 notes Vec の
     /// index、`selected_notes` と同空間)。`q` キーで「選択が無ければカーソル直下 note を
     /// mute」する対象解決に使う。`piano_roll_view::draw` が `note_hit` で毎フレーム更新、
     /// grid 外 / note 外 / 非 piano-roll は `None`。
     pub pianoroll_hover_note: Option<u32>,
-    /// FIXME #33: view 層が OS clipboard へ書く保留テキスト。トラック copy/cut は
+    /// view 層が OS clipboard へ書く保留テキスト。トラック copy/cut は
     /// plugin state 収集が非同期 (`on_all_states_from_child`、Ui 非保持) なので、
     /// そこで serialize した envelope JSON をここに積み、`dispatch_shortcuts` が
     /// 毎フレーム drain して `Ui::set_clipboard_text` する。
@@ -1199,7 +1199,7 @@ pub struct AppData {
     /// arrangement) からは `selected_tracks: &[u32]` として渡す。 id
     /// ベース (Track::id) で持ち、 track 並び替えでも安定。
     pub selected_track_ids: Vec<u32>,
-    /// FIXME #53: 選択中の Arranger セクション id 集合 (`selected_track_ids` と同 idiom、
+    /// 選択中の Arranger セクション id 集合 (`selected_track_ids` と同 idiom、
     /// 末尾 = anchor)。 gui_01 の `SelectSection` で更新、 帯のハイライト + キーボード Delete
     /// の対象。 section を選ぶと他面 (clip/note/track) の選択はクリアして Delete の曖昧さを避ける。
     pub selected_section_ids: Vec<u32>,
@@ -1238,7 +1238,7 @@ pub struct AppData {
     /// 入力として動くので先行実装する。 widget からは
     /// `SelectAutomationPoints` (#033) で上書き。 session-only。
     pub selected_automation_points: Vec<AutomationPointKeyRef>,
-    /// FIXME #81: inline 数値入力中の automation point (`Some` のとき
+    /// inline 数値入力中の automation point (`Some` のとき
     /// `arrangement_view` が当該 point の rect に `text_input_at_focused`
     /// overlay を出す)。session-only / Undo・save 対象外。点をダブルクリック
     /// で `Some`、 確定 (Enter) / blur / Esc で `None`。
@@ -1351,7 +1351,7 @@ pub struct AppData {
         (u32, u32),
         Vec<common::protocol::PluginParamInfo>,
     >,
-    /// FIXME #78: `(track_id, slot)` ごとに plugin が埋め込み GUI (editor window)
+    /// `(track_id, slot)` ごとに plugin が埋め込み GUI (editor window)
     /// を持つか (`PluginParamList` で host が `gui_is_embed_supported` を通知)。
     /// チェーン行のボタン分岐に使う: GUI あり = 「GUI」 で window を開く、 なし =
     /// 「⚙」 でインライン param パネルをトグル。 plugin_params と同じ寿命・同じ箇所
@@ -1410,13 +1410,13 @@ pub struct AppData {
     /// 使う。 `None` = clip 領域 / lane 外。 1 フレーム遅延だが pointer は
     /// 瞬間移動しないので実用上問題なし (= `arrange_hover_content` と同 idiom)。
     pub arrange_hovered_automation_lane: Option<common::model::AutomationLaneKey>,
-    /// FIXME #74: arrangement ヘッダのトラック音量スライダを drag 中のトラック id
+    /// arrangement ヘッダのトラック音量スライダを drag 中のトラック id
     /// (`ArrangementResponse.dragging_track_volume` を前フレーム値として mirror)。
     /// None↔Some の edge で `ParamGestureBegin`/`End` を発火し、 mixer フェーダーと
     /// 同じ「1 drag = 1 undo step」 経路 (gesture begin で 1 snapshot) に乗せる。
     /// session-only (`arrange_hover_content` と同 idiom)。
     pub arrange_dragging_track_volume: Option<u32>,
-    /// FIXME #81: レーンヘッダの default value scrubable がドラッグ / テキスト編集中の
+    /// レーンヘッダの default value scrubable がドラッグ / テキスト編集中の
     /// lane (`Some` の間 1 つだけ)。`inspector_scrub_active` と同 idiom で、 active 立ち上がり
     /// で `BeginInspectorScrub` (= Song snapshot)、 立ち下がりで `EndInspectorScrub` を発火し、
     /// 一連の `SetLaneDefault` を undo 1 step に bracket する。session-only。
@@ -1437,7 +1437,7 @@ pub struct AppData {
     /// session-only ミラーで、 `piano_roll_view::draw` が毎フレーム `resp.lyric_editing`
     /// から更新する (project save には含めない)。
     ///
-    /// 用途は root.rs の Esc dispatch との調停 (FIXME #84)。 `dispatch_shortcuts` は
+    /// 用途は root.rs の Esc dispatch との調停。 `dispatch_shortcuts` は
     /// piano_roll widget より前に走って `take_shortcut("escape")` を消費するため、
     /// このミラーが立っている間は Esc を消費せず widget に委ねる (widget 側が歌詞編集を
     /// キャンセルする)。 ミラーは 1 frame 遅延だが、 編集モードは L 押下〜Esc 押下まで
@@ -1463,7 +1463,7 @@ pub struct AppData {
     /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
     /// 系操作で「マウス位置を cursor として使う」 ために保持する。
     pub audio_editor_hover_beat_in_clip: Option<f64>,
-    /// FIXME #87: Audio Editor の表示状態を **クリップごと** (`ClipKey`) に記憶する
+    /// Audio Editor の表示状態を **クリップごと** (`ClipKey`) に記憶する
     /// (Ableton Live / Bitwig 流)。 entry が無い (= 初回) クリップは
     /// `open_audio_editor` がクリップ全長を見せる初期 view を入れる。 値域は
     /// `audio_editor_view_state` / `set_audio_editor_*` 経由で読み書きし、 描画前に
@@ -1480,44 +1480,44 @@ pub struct AppData {
     /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
     /// default は `ARRANGE_TRACK_HEIGHT`。
     pub arrange_track_row_h: f32,
-    /// FIXME #34: `Z` キーの段階ズーム履歴。 1 回目 push で横ズーム前の view、
+    /// `Z` キーの段階ズーム履歴。 1 回目 push で横ズーム前の view、
     /// 2 回目 push で縦ズーム前の view を積む。 `X` が pop して 1 段ずつ戻し、
     /// 空になったら全体フィットに落ちる。 load / new / recovery で clear。
     pub(crate) arrange_zoom_history: Vec<ArrangeViewSnapshot>,
-    /// FIXME #86: `Z` 段階ズームの現在アンカー (直近 Z が適用した選択 + view + 段数)。
+    /// `Z` 段階ズームの現在アンカー (直近 Z が適用した選択 + view + 段数)。
     /// 次の Z で選択 or view が食い違えば段階 0 (横) から仕切り直す。 session-only。
     pub(crate) arrange_zoom_anchor: Option<ArrangeZoomAnchor>,
-    /// FIXME #86: automation lane の行高 session override (= `Z` 縦ズームで選択
+    /// automation lane の行高 session override (= `Z` 縦ズームで選択
     /// automation clip のレーンを画面いっぱいに拡大した一時値。 model の
     /// `AutomationLane.height_px` は保存対象なので汚さず、 これで上書き表示する)。
     /// 該当 lane の splitter resize (`set_lane_height`) と `X` (zoom back) で解除。
     /// `track_row_overrides` の lane 版。 session-only (save / Undo 対象外)。
     pub automation_lane_row_overrides:
         std::collections::HashMap<common::model::AutomationLaneKey, u16>,
-    /// FIXME #86: primary 選択 automation clip のレーンの「実描画 content-Y 上端」
+    /// primary 選択 automation clip のレーンの「実描画 content-Y 上端」
     /// (= scroll 空間の絶対 y、 `arrange_track_top` をこれにすればレーンが viewport
     /// 上端に来る)。 arrangement view が毎フレーム widget の実 `automation_lane_rects`
     /// から算出してここに格納し、 `Z` 縦ズームがレイアウトを複製せず参照する。
     /// 選択 automation clip 無し / レーンが画面外なら `None`。 session-only。
     pub arrange_primary_lane_content_top:
         Option<(common::model::AutomationLaneKey, f32)>,
-    /// FIXME #16: arrangement の track header 幅 (px、 default 160.0)。 header と
+    /// arrangement の track header 幅 (px、 default 160.0)。 header と
     /// lanes の境界 (右端 splitter) drag で gui_01 arrangement widget が
     /// `SetHeaderW` を発火 → `SetArrangeHeaderW` 経由でここを更新する。 widget は
     /// 毎フレーム `view.header_w` としてこの値を読む。 session-only (= save /
     /// Undo 対象外、 `arrange_track_row_h` と同じ扱い)。
     pub arrange_header_w: f32,
-    /// FIXME #23: inspector の param セクション (title 下〜chain 上) の実描画高さ
+    /// inspector の param セクション (title 下〜chain 上) の実描画高さ
     /// (px)。 immediate-mode なので「前フレームに測った高さ」を `scroll_area` の
     /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。
     /// session-only (save / Undo 対象外)。
     pub inspector_body_h: f32,
-    /// FIXME #78: チェーン行アコーディオンで開いているデバイスの param パネル実高さ
+    /// チェーン行アコーディオンで開いているデバイスの param パネル実高さ
     /// (px、 前フレーム測定値)。 `reorderable_list_expandable` の `row_extra_h` に渡して
     /// 開いた行の直下に確保する展開高に使う (lag-by-one、 `inspector_body_h` と同 idiom)。
     /// session-only。
     pub inspector_device_panel_h: f32,
-    /// FIXME #87: ピアノロールの表示状態を **クリップごと** (`ClipKey`) に記憶する
+    /// ピアノロールの表示状態を **クリップごと** (`ClipKey`) に記憶する
     /// (Ableton Live / Bitwig 流)。 旧来のフラットな `pianoroll_zoom_x` 等は撤去し、
     /// `selected_clip` (= 現在ピアノロールで開いているクリップの `ClipKey`) で引く
     /// accessor (`pianoroll_zoom_x()` / `pianoroll_zoom_y()` / `pianoroll_top_pitch()` /
@@ -1526,15 +1526,15 @@ pub struct AppData {
     /// `ViewState.piano_roll_views` として永続化される。
     pub piano_roll_views:
         std::collections::HashMap<common::model::ClipKey, common::model::PianoRollViewState>,
-    /// FIXME #93: **複数クリップ同時表示**中の共有 viewport (song-absolute scroll)。
+    /// **複数クリップ同時表示**中の共有 viewport (song-absolute scroll)。
     /// 単一表示は per-clip 永続 `piano_roll_views` を使うが、複数表示は表示クリップ集合に
     /// 依存する 1 つの transient viewport を使う (非永続)。`multi_clip_view_key` と組で持ち、
     /// 表示クリップ集合が変わったら union bbox に再 fit する。
     pub multi_clip_view: common::model::PianoRollViewState,
-    /// FIXME #93: `multi_clip_view` がどの表示クリップ集合 (`shown_pianoroll_clips` の
+    /// `multi_clip_view` がどの表示クリップ集合 (`shown_pianoroll_clips` の
     /// `ClipKey` 列) に対して fit 済かを記録。draw でこれと現在の集合が違えば再 fit。
     pub multi_clip_view_key: Vec<common::model::ClipKey>,
-    /// FIXME #93: ピアノロールで「ロック (参照専用)」にした **トラック** (track id)。lock された
+    /// ピアノロールで「ロック (参照専用)」にした **トラック** (track id)。lock された
     /// トラックの (表示中) note は淡色ゴーストで描画され、hit-test / 選択 / 編集から除外される。
     /// 凡例がトラック単位なのでロックもトラック単位 (そのトラックの表示クリップ全部に効く)。
     /// session 内 transient (非永続)。legend のロックトグルで増減。
@@ -1575,12 +1575,12 @@ pub struct AppData {
     ///   間 (= まだ一度も play していない or stop 済みで restore 完了) は
     ///   stop() は何もしない。
     pub playback_origin_beat: Option<f32>,
-    /// FIXME #60: パニックボタンが立てる「遅延 reinit」 の起点時刻。 `Some` の間、
+    /// パニックボタンが立てる「遅延 reinit」 の起点時刻。 `Some` の間、
     /// `on_tick` が [`PANIC_REINIT_DELAY`] 経過で `ReinitAllPlugins` を plugin host
     /// に送って `None` に戻す。 master の declick フェードアウト完了後に plugin の
     /// detach を起こすための遅延（段差クリック回避、 [`Self::panic`] 参照）。
     pub panic_reinit_due: Option<std::time::Instant>,
-    /// FIXME #60: パニックの declick が「ミュート解除待ち」 か。 `panic` で `true`、
+    /// パニックの declick が「ミュート解除待ち」 か。 `panic` で `true`、
     /// `ReinitAllPlugins` の完了通知 `PluginsReinitDone` を受けた時に engine へ
     /// `PanicRelease` を送って `false` に戻す。 ミュート解除を reinit 完了に結び
     /// つけるためのフラグ（[`Self::panic`] 参照）。
@@ -1607,7 +1607,7 @@ pub struct AppData {
     /// 呼ばれる度 (絞り込み再計算 / モーダル open / rescan 完了) に 0 にリセット。
     pub plugin_picker_cursor: usize,
 
-    // -------- Font picker (Text クリップのフォント選択, FIXME #25) ----------
+    // -------- Font picker (Text クリップのフォント選択) ----------
     /// `available_font_families()` で列挙したシステムフォント名 (キャッシュ)。
     /// 初回 open 時に background thread で 1 度だけ読む (~20-860ms)。
     pub font_picker_families: Vec<String>,
@@ -1635,7 +1635,7 @@ pub struct AppData {
     /// 間は新規 request を発行するときに即時 `RequestAllStates` を送る。
     /// 詳細は [`PendingStateRequest`] / [`DeferredEdit`]。
     pub pending_state_queue: VecDeque<PendingStateRequest>,
-    /// FIXME #64: いま in-flight な `RequestAllStates` (plugin-state round-trip) を
+    /// いま in-flight な `RequestAllStates` (plugin-state round-trip) を
     /// 送った時刻。 `dispatch_front_state_request` が送信の瞬間に `Some(now)` を立て、
     /// `on_all_states_from_child` で応答が来たら `None` に戻す (後続 request が
     /// あれば dispatch が再武装する)。 plugin host が crash でなく **hang** した
@@ -1666,21 +1666,21 @@ pub struct AppData {
     /// 配置。 path / source_track / source_clip は IPC echo back と
     /// pending entry を identifier 照合するために保持。
     pub pending_clip_fx_bounce: Option<PendingClipFxBounce>,
-    /// FIXME #42: 歌唱クリップ bounce の合成待ち。`PrepareVocalSynth` を送って
+    /// 歌唱クリップ bounce の合成待ち。`PrepareVocalSynth` を送って
     /// `VocalSynthReady` を待つ間 `Some((target, mode))` を退避し、 ready 受信で
     /// `start_clip_bounce` を呼ぶ。歌唱以外の bounce では使わない。
     pub pending_vocal_synth_bounce: Option<(ClipRef, BounceMode)>,
-    /// FIXME #31: which (track, slot) plugin editors are currently open. The
+    /// which (track, slot) plugin editors are currently open. The
     /// editor *windows* are now created and owned by the plugin-host process
     /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
     /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
     /// it's a plain id set — the window FFI lives in the plugin-host process.
     pub open_plugin_guis: std::collections::HashSet<(u32, u32)>,
-    /// FIXME #54 Wave4: 内蔵映像 FX は plugin window を持たないので、チェーン行の "GUI"
+    /// 内蔵映像 FX は plugin window を持たないので、チェーン行の "GUI"
     /// ボタンはインスペクタ内のパラメータ調整パネルを開く。`Some((track_id, device_index))`
     /// で 1 つだけ開く（別の FX の GUI を押すと切り替わる）。cursor track 以外に切り替えたら閉じる。
     pub open_video_fx_params: Option<(u32, u32)>,
-    /// FIXME #78: 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
+    /// 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
     /// CLAP・VST3) の「⚙」ボタンで開くインライン param パネル。 `open_video_fx_params`
     /// と同 idiom: `Some((track_id, device_index))` で 1 つだけ、 cursor track 以外
     /// では非表示、 device 削除で同トラックなら閉じる。
@@ -1719,8 +1719,8 @@ pub struct AppData {
     // -------- Background workers --------
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
     /// プロジェクトロード時の audio / image background decode の staging。
-    /// `Some` の間は streaming load 進行中 (= 再生 gate + 進捗 overlay 表示、
-    /// FIXME #24)。 `begin_asset_decode` で `Some`、 全件取り込みで `None`。
+    /// `Some` の間は streaming load 進行中 (= 再生 gate + 進捗 overlay 表示)。
+    /// `begin_asset_decode` で `Some`、 全件取り込みで `None`。
     pub asset_decode: Option<Arc<Mutex<AssetDecodeStaging>>>,
     /// 進捗 overlay 用 (done, total)。 draw で Mutex を取らずに済むよう
     /// `on_asset_decode_tick` がプレーン値で更新する。 `None` = 非表示。
@@ -1731,7 +1731,7 @@ pub struct AppData {
     /// VOICEVOX engine `/singers` の結果。 起動時に background thread が
     /// `AppEvent::SingersLoaded` で投入する。 engine 未起動 / fetch 失敗時は
     /// 空のまま (Clip Inspector の声 dropdown は焼き込み声名 + 「取得中…」表示)。
-    /// (FIXME #36) Clip Inspector の 2 段 dropdown (キャラ→style) が直接読む。
+    /// Clip Inspector の 2 段 dropdown (キャラ→style) が直接読む。
     pub singers: Vec<common::voicevox::VoiceVoxSinger>,
     /// (talk) VOICEVOX engine `/speakers` の結果 (`docs/plan_voicevox_talk.md` §4)。
     /// Text clip の talk 声 dropdown (キャラ→talk style) が直接読む。sing の `singers`
@@ -1751,18 +1751,18 @@ pub struct AppData {
     /// bump し、`mark_lipsync_dirty` が timer thread に値を渡す。timer 発火時に
     /// 値が一致していれば (= それ以降変更なし) 再生成する (rapid 編集を coalesce)。
     pub lipsync_gen: u64,
-    /// FIXME #90: 口パク (lip-sync) 背景生成が in-flight な出力先 (口 track id) の集合。
+    /// 口パク (lip-sync) 背景生成が in-flight な出力先 (口 track id) の集合。
     /// `regenerate_lipsync_for_track` の spawn 時に insert、`LipsyncGenerated` 受信で remove。
     /// クリップ上スピナー / 全体オーバーレイ「口パク生成中」の駆動に使う (派生 UI 状態、非保存)。
     pub lipsync_inflight: std::collections::HashSet<u32>,
-    /// FIXME #90: builtin VOICEVOX (歌唱/読み上げ) 合成の per-plugin 状態。key = host plugin_id。
+    /// builtin VOICEVOX (歌唱/読み上げ) 合成の per-plugin 状態。key = host plugin_id。
     /// `VoicevoxSynthStatus` IPC で更新。`busy` = 合成中、`failing_since = Some` は直近 HTTP が
     /// 失敗中 (= engine 未起動/起動途中)。一定時間 (= `VOICEVOX_ENGINE_WARNING`) 続いたら
     /// engine 未接続警告へ切り替える。plugin unload (`SlotPluginUnloadedFromChild`) で entry を消す。
     pub voicevox_synth_status: std::collections::HashMap<u32, VocalSynthStatus>,
-    /// FIXME #90: スピナー回転位相の基準時刻 (construction で固定、単調増加)。
+    /// スピナー回転位相の基準時刻 (construction で固定、単調増加)。
     pub anim_epoch: std::time::Instant,
-    /// FIXME #90: 現フレームの時刻。`render_frame` 冒頭で 1 度設定し、その frame の
+    /// 現フレームの時刻。`render_frame` 冒頭で 1 度設定し、その frame の
     /// overlay / clip スピナー / engine 未接続判定がすべて**同じ時刻**を読むことで、
     /// 「スピナー描画」と「再描画を続けるか (`voicevox_animating`)」の判定が 5s 境界で
     /// 食い違わないようにする (= 警告へ切り替わる frame を確実に 1 枚描く)。
@@ -1808,13 +1808,13 @@ pub struct AppData {
     /// (毎フレーム `Some` を渡すと outside-click で閉じても翌フレーム再 open するため)。
     pub clip_create_menu_open: bool,
 
-    /// FIXME #53: Arranger セクション帯の右クリックメニュー stash `(section_id, 右クリック pos)`。
+    /// Arranger セクション帯の右クリックメニュー stash `(section_id, 右クリック pos)`。
     /// `SecondaryClickSection` 受信で set、 overlay が pos にメニュー (ループ / 帯削除 /
     /// 範囲削除) を描画、 on_select で `None` に戻す (`clip_create_menu` と同 idiom)。
     pub section_menu: Option<(u32, (f32, f32))>,
     /// 上記セクションメニューの 1-shot open trigger (`clip_create_menu_open` と同 idiom)。
     pub section_menu_open: bool,
-    /// FIXME #53: inline 改名中のセクション id (`track_rename_id` の section 版)。`Some` の間、
+    /// inline 改名中のセクション id (`track_rename_id` の section 版)。`Some` の間、
     /// arrangement view が該当帯 rect に text_input を重ねる。
     pub section_rename_id: Option<u32>,
     /// 上記改名の編集中文字列。
@@ -1834,7 +1834,7 @@ pub struct AppData {
     /// は「未ロード」 (= 起動直後 / clip 未選択)。 編集 buffer の中身が
     /// この target の現値と整合する保証はないが (= ユーザー入力中はズレる)、
     /// commit / resync で必ず書き戻す。
-    /// FIXME #15: audio / image inspector の数値 field は scrubable_number
+    /// audio / image inspector の数値 field は scrubable_number
     /// (drag + type) 化されたため、 個別の名前付き edit-buffer
     /// (`clip_gain_db_edit_text` 等 / `clip_image_*_edit_text`) は撤去
     /// (scrubable が編集状態を自前で内包)。 `clip_edit_buffer_target` は
@@ -1847,7 +1847,7 @@ pub struct AppData {
     /// 一連の操作を undo 1 step に bracket するための tracker（`None` = idle）。
     pub group_scrub_active: Option<common::model::GroupTransformParam>,
 
-    /// FIXME #15 (`docs/plan_inspector_scrub.md`): audio / image / text
+    /// audio / image / text
     /// inspector の scrubable_number で drag / text 編集中の field。 drag・
     /// 編集の開始/終了 edge を検知して `BeginInspectorScrub` /
     /// `EndInspectorScrub` を発火し、 一連の操作を undo 1 step に bracket
@@ -1865,7 +1865,7 @@ pub struct AppData {
     /// depth on the control's target. `None` ⇒ controls show existing routings
     /// (entries + live tick) but aren't editable. session-only (not persisted).
     pub armed_mod_source: Option<u32>,
-    /// FIXME #56: the set of `ModSource`s whose inspector row is **expanded** to its
+    /// the set of `ModSource`s whose inspector row is **expanded** to its
     /// full Bitwig 風グラフィカルエディタ (MSEG curve canvas / Steps grid / LFO·Random
     /// preview + 全コントロール). **Multi-expand** — 複数同時に開ける (Bitwig 同様)。
     /// chevron クリックで toggle。 session-only (not persisted)。
@@ -1899,24 +1899,24 @@ pub struct AppData {
     pub pending_video_export: Option<std::path::PathBuf>,
     /// 自動レンダリングした音声 temp WAV。video export 完了後に削除する。
     pub export_temp_wav: Option<std::path::PathBuf>,
-    /// FIXME #55: video export 待ちの **拍** レンジ `(start_beat, end_beat)`。
+    /// video export 待ちの **拍** レンジ `(start_beat, end_beat)`。
     /// `pending_video_export` と対で立ち、 `ExportWavComplete` で video render を
     /// 始めるときに `RenderConfig::with_range_beats` へ渡す (音声 temp WAV も
     /// 同じ窓に trim 済みなので A/V が揃う)。 `None` = 全曲。
     pub pending_video_export_range: Option<(f64, f64)>,
-    /// FIXME #79: video export 待ちの出力解像度 `(w, h)` と fps。
+    /// video export 待ちの出力解像度 `(w, h)` と fps。
     /// `pending_video_export` と対で立ち、 `ExportWavComplete` で video render を
     /// 始めるときに `RenderConfig::with_output_resolution` / `with_output_framerate`
     /// へ渡す per-export override (= export ダイアログで選んだ値。 Song / preview
     /// には永続しない)。 `None` = video export 待ちでない (= プロジェクト値を使用)。
     pub pending_video_export_dims: Option<((u32, u32), f32)>,
-    /// FIXME #55: a WAV export request held while the plugin host reinitialises
+    /// a WAV export request held while the plugin host reinitialises
     /// all plugins (deactivate→activate) for a clean offline cold render. Set by
     /// [`Self::begin_wav_export`] (which sends `ReinitAllPlugins`); fired
     /// as `MainToChild::ExportWav` on `AppEvent::PluginsReinitDone`. Tuple is
     /// `(path, range_frames, write_mod_sidecar)`.
     pub pending_export: Option<PendingExport>,
-    /// FIXME #55: Export WAV / Video のレンジピッカーモーダルの状態。 `Some` の
+    /// Export WAV / Video のレンジピッカーモーダルの状態。 `Some` の
     /// 間だけ `export_range_modal` を描画してレンジ確定を待つ。 確定後は元の
     /// export action (file dialog) を `kind` に応じて起動する。 `None` = 非表示。
     pub export_range_picker: Option<ExportRangePicker>,
@@ -1924,7 +1924,7 @@ pub struct AppData {
     /// docs/plan_text_overlay.md §4 P5: text inspector の文字列 edit buffer。
     /// `text` / `font_family` は文字列 field なので text_input のまま
     /// standalone (= scrubable 化されない)。 Enter / focus 喪失で
-    /// `CommitClipText{Content,FontFamily}Edit` を発火。 FIXME #15 で
+    /// `CommitClipText{Content,FontFamily}Edit` を発火。
     /// 25 numeric field は scrubable_number 化され、 `clip_text_num_edits`
     /// HashMap は撤去 (scrubable が編集状態を自前で内包)。
     pub clip_text_content_edit_text: String,
@@ -1980,7 +1980,7 @@ pub struct AppData {
     /// (`dirty_guard_modal`)。 `Some(action)` の間モーダルが開き、 「保存」
     /// 「保存しない」「キャンセル」 を選ばせる。 保存 / 破棄が済んでから
     /// `action` を実行する。 `request_guarded_action` で is_dirty なら立てる。
-    /// FIXME #63: 旧 `show_close_confirm` (bool, 終了専用) を一般化した。
+    /// 旧 `show_close_confirm` (bool, 終了専用) を一般化した。
     pub dirty_guard: Option<DirtyGuardAction>,
     /// Runner が毎フレーム監視し、 `true` になったら cleanup して
     /// event loop を抜ける終了フラグ。 not-dirty close / 「保存せず終了」 /
@@ -1991,9 +1991,9 @@ pub struct AppData {
     /// `Some(action)`。 `on_all_states_from_child` で save が完了
     /// (is_dirty=false) したら `action` を実行する。 save 試行が終われば
     /// (= pending Save が消えれば) クリアする (後続の手動 save が誤って
-    /// action を実行しないように)。 FIXME #63: 旧 `quit_after_save` を一般化。
+    /// action を実行しないように)。 旧 `quit_after_save` を一般化。
     pub guard_after_save: Option<DirtyGuardAction>,
-    /// FIXME #63: plugin-state round-trip (`pending_state_queue` の Save /
+    /// plugin-state round-trip (`pending_state_queue` の Save /
     /// Deferred edit / Copy) が in-flight の間にガード操作 (New / Open /
     /// Open Recent / 終了) が要求されたとき、 queue が drain するまで保留する操作。
     /// round-trip 完了処理は `self.song` を変更し得る (Deferred edit は track 削除等、
@@ -2106,15 +2106,15 @@ impl raw_window_handle::HasDisplayHandle for Win32Parent {
 pub enum FileDialogKind {
     /// プロジェクト (.daw) を開く。
     OpenProject,
-    /// video export の mp4 出力先 (Windows のみ到達)。 FIXME #55: レンジ
-    /// ピッカーで選んだ書き出し窓 (拍)。 `None` = 全曲。 FIXME #79: 出力解像度
+    /// video export の mp4 出力先 (Windows のみ到達)。 レンジ
+    /// ピッカーで選んだ書き出し窓 (拍)。 `None` = 全曲。 出力解像度
     /// `(w, h)` と fps (= picker で選んだ per-export override)。
     ExportMp4 {
         range_beats: Option<(f64, f64)>,
         resolution: (u32, u32),
         framerate: f32,
     },
-    /// WAV 書き出し。 FIXME #55: レンジピッカーで選んだ書き出し窓 (sample
+    /// WAV 書き出し。 レンジピッカーで選んだ書き出し窓 (sample
     /// frame; beat→frame 変換済み)。 `None` = 全曲。
     ExportWav {
         range: Option<(u64, u64)>,
@@ -2161,7 +2161,7 @@ impl AppData {
             tracks: vec![track_with(|t| t.name = "Track 1".into())],
             ..Song::default()
         };
-        // FIXME #33: 起動時の初期プロジェクトにも安定 project_id を採番する
+        // 起動時の初期プロジェクトにも安定 project_id を採番する
         // (clipboard の同一プロジェクト判定用)。
         song.ensure_project_id();
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
@@ -2413,7 +2413,7 @@ impl AppData {
         // 同期されるので、 初回のみここで初期化する。
         let mut app = app;
         app.init_recent_labels();
-        // FIXME #29: cache が旧 port-probe 版 (PluginEntry の 3 bool 未取得) なら、
+        // cache が旧 port-probe 版 (PluginEntry の 3 bool 未取得) なら、
         // 起動時に 1 回だけ自動で再 probe (rescan) して port 構成を埋める。 production
         // (app_dirs=Some) のみ — test は app_dirs=None なので実システム scan を避ける。
         if app.app_dirs.is_some()
@@ -2543,7 +2543,7 @@ impl AppData {
         depth
     }
 
-    /// FIXME #72: `(track, target)` の built-in コントロールが mixer / arrangement で
+    /// `(track, target)` の built-in コントロールが mixer / arrangement で
     /// **表示すべき値**を返す。 再生中に enabled かつ現在 recording 対象でない
     /// automation lane があれば playhead 位置の curve 値 (= audio engine の
     /// `fill_track_param_ramps` と同じ read-mode 解決)、 それ以外 (停止中 / lane 無し
@@ -2645,7 +2645,7 @@ impl AppData {
                     } else {
                         t.name.clone()
                     },
-                    // FIXME #72: 再生中はオートメーション lane の playhead 値を表示
+                    // 再生中はオートメーション lane の playhead 値を表示
                     // (= audio と一致してフェーダー / パンノブが動く)。 停止中・非
                     // automation・書き込み中は静的値。
                     volume: self.live_param_value(
@@ -2852,7 +2852,7 @@ impl AppData {
     /// `ModSource` (Bitwig 流の per-source 色)。source の `mod_sources` 内位置から
     /// 固定パレットを引く (id でなく位置 = 追加順に色が回る)。
     pub fn mod_source_color(&self, source_id: u32) -> [f32; 3] {
-        // FIXME #56: 色は `ModSource.color` が SSoT (作成時に palette から割当)。
+        // 色は `ModSource.color` が SSoT (作成時に palette から割当)。
         self.song
             .mod_sources
             .iter()
@@ -3080,7 +3080,7 @@ impl AppData {
         Some(InspectorAudioEventSummary {
             target: cref,
             reversed: event.reversed,
-            // FIXME #80: "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
+            // "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
             muted: clip.muted,
             stretch_mode: event.stretch_mode,
             fade_in_curve: event.fade_in_curve,
@@ -3151,7 +3151,7 @@ impl AppData {
         };
         Some(InspectorImageEventSummary {
             target: cref,
-            // FIXME #80: "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
+            // "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
             muted: clip.muted,
             fade_in_curve: event.fade_in_curve,
             fade_out_curve: event.fade_out_curve,
@@ -3299,7 +3299,7 @@ impl AppData {
             .enumerate()
             .map(|(i, p)| {
                 let device_index = i as u32;
-                // FIXME #78: 埋め込み GUI の有無。 builtin (VOICEVOX / Silence) は
+                // 埋め込み GUI の有無。 builtin (VOICEVOX / Silence) は
                 // 規定で持たないので format から即断 (= PluginParamList 到着前でも
                 // 正しく「Par」routing)。 外部 CLAP・VST3 は host の通知
                 // (`slot_has_gui`)、 未受信 (load 直後) は楽観的に true で「GUI」のまま。
@@ -3385,7 +3385,7 @@ impl AppData {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.is_dirty = false;
-        // FIXME #35: load / new / recovery では直前に sync_song_to_plugin_host が
+        // load / new / recovery では直前に sync_song_to_plugin_host が
         // 走り、 口パク binding を持つ project だと mark_lipsync_dirty が 400ms
         // debounce で自動再生成をスケジュールする。 保存ファイル内の口パク clip は
         // 既に authoritative なので、 ここで再生成すると mouth clip が新しい
@@ -3394,8 +3394,8 @@ impl AppData {
         // 再計算は source 編集時だけに限定したいので、 baseline 確定と同時に
         // pending の再生成を無効化する (= 既存 clip をそのまま温存)。
         self.cancel_pending_lipsync_regen();
-        // FIXME #34: `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
-        // 別 project に持ち越さない。 FIXME #86: 段階ズームのアンカーと lane 高
+        // `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
+        // 別 project に持ち越さない。 段階ズームのアンカーと lane 高
         // override も旧 project の lane key を指すので一緒に破棄。
         self.arrange_zoom_history.clear();
         self.arrange_zoom_anchor = None;
@@ -3493,7 +3493,7 @@ impl AppData {
     fn is_undoable(event: &AppEvent) -> bool {
         matches!(
             event,
-            // FIXME #63: `New` はここに **入れない**。 New は直前に
+            // `New` はここに **入れない**。 New は直前に
             // `dirty_guard` 確認を挟むため、 dispatch 時に is_dirty を
             // clobber すると clean な project でも常にダイアログが出てしまう。
             // また `action_new` が `reset_saved_baseline` で undo/redo を破棄する
@@ -3514,7 +3514,7 @@ impl AppData {
                 | AppEvent::DuplicateClipsUnique(_)
                 | AppEvent::CloneClipsLinked(_)
                 | AppEvent::CloneClipsIndependent(_)
-                // FIXME #66: clip drag move。 widget は commit-by-release
+                // clip drag move。 widget は commit-by-release
                 // (drag 中は overlay 描画のみ、 release frame で `MoveClips`
                 // → `SetClipPositions` を 1 件発火) なので、 1 drag = 1 undo
                 // step になる。 兄弟の Clone*/MoveAutomationClips と同列。
@@ -3524,7 +3524,7 @@ impl AppData {
                 | AppEvent::GlueSelectedClips
                 | AppEvent::SetClipReversed { .. }
                 | AppEvent::SetClipMuted { .. }
-                // FIXME #80: clip / note mute トグルは 1 操作 = 1 undo step。
+                // clip / note mute トグルは 1 操作 = 1 undo step。
                 | AppEvent::SetClipsMuted { .. }
                 | AppEvent::SetNotesMuted { .. }
                 // ResetTrackClipColors は discrete な一括編集なので undoable。
@@ -3536,7 +3536,7 @@ impl AppData {
                 // 「picker session 先頭で 1 回 / discrete edit は毎回」 だけ
                 // snapshot する (image PiP drag と同思想)。
                 | AppEvent::SetClipStretchMode { .. }
-                // FIXME #15: inspector の数値 field は scrubable_number 化され、
+                // inspector の数値 field は scrubable_number 化され、
                 // SetClipGainDb / Pan / Pitch / FadeIn/OutBeats は drag 中 per-
                 // frame 発火するため **非 undoable**。 drag / text 編集 stroke は
                 // `BeginInspectorScrub` (1 snapshot) で 1 undo step に bracket する。
@@ -3562,14 +3562,14 @@ impl AppData {
                 | AppEvent::AutoFadeSelectedClips
                 | AppEvent::AutoCrossfadeSelectedClips
                 | AppEvent::ToggleClipReversed(_)
-                // FIXME #42: BounceClipInPlace は async 化したので非 undoable。
+                // BounceClipInPlace は async 化したので非 undoable。
                 // 完了 handler (handle_bounce_clip_fx_complete) が成功時のみ 1 回
                 // push_undo_snapshot する (With FX と同じ。 dispatch 時 auto-push は
                 // IPC 往復前なので二重スナップ + 失敗時 spurious を生む)。
                 | AppEvent::SetClipGainDbBatch(_)
                 | AppEvent::SetClipFadeBeatsBatch(_)
                 | AppEvent::SetClipFadeCurveBatch(_)
-                // FIXME #46: discrete トグル/ドロップダウンの一括適用 = 1 undo step。
+                // discrete トグル/ドロップダウンの一括適用 = 1 undo step。
                 | AppEvent::BroadcastDiscreteClipEdit { .. }
                 | AppEvent::DuplicateAudioEditorEvent
                 | AppEvent::SetAudioEventStart { .. }
@@ -3614,7 +3614,7 @@ impl AppData {
                 | AppEvent::AddAutomationPoint { .. }
                 | AppEvent::MoveAutomationPoints { .. }
                 | AppEvent::DeleteAutomationPoints { .. }
-                // FIXME #81: inline 数値入力の確定 1 件は discrete commit なので
+                // inline 数値入力の確定 1 件は discrete commit なので
                 // Undo step 化 (`BeginEditAutomationPointValue` は session-only で除外)。
                 | AppEvent::SetAutomationPointValue { .. }
                 | AppEvent::SetAutomationCurveType { .. }
@@ -3644,7 +3644,7 @@ impl AppData {
         )
     }
 
-    /// FIXME #33: 選択中ノートを clipboard envelope (`ClipboardPayload::Notes`) JSON に。
+    /// 選択中ノートを clipboard envelope (`ClipboardPayload::Notes`) JSON に。
     /// 何も copy できない (選択無し / クリップ未選択 / シリアライズ失敗) 場合は `None`。
     /// 戻り値は `(json, note_count)`。status_message は `&self` を保つため呼び出し側で書く。
     /// 時間は選択群の最早 start を 0 とした相対に正規化する (paste でマウス拍に置く)。
@@ -3682,7 +3682,7 @@ impl AppData {
         Some((json, count))
     }
 
-    /// FIXME #33: ノート群を「編集中クリップ (`selected_clip`)」の `at_beat`
+    /// ノート群を「編集中クリップ (`selected_clip`)」の `at_beat`
     /// (clip-local 拍) に貼る。`notes` は最早=0 正規化済み相対 → 各 `start_beat += at_beat`。
     /// 値域は呼び出し側で sanitize 済み。貼った note 群を新選択にする。戻り値は挿入数。
     pub fn paste_notes_at(&mut self, mut notes: Vec<Note>, at_beat: f64) -> usize {
@@ -3716,10 +3716,10 @@ impl AppData {
             new_indices.push(dest.len() as u32);
             dest.push(src.clone());
         }
-        // FIXME #83: 貼り付けた note を勝者として重なり解消。選択は remap で追従。
+        // 貼り付けた note を勝者として重なり解消。選択は remap で追従。
         let remap = resolve_note_overlaps(dest, &new_indices);
         let local_sel = remap_indices(&remap, &new_indices);
-        // FIXME #93: selected_notes は packed note id。貼り付け先 (anchor) clip の slot で pack。
+        // selected_notes は packed note id。貼り付け先 (anchor) clip の slot で pack。
         self.selected_notes = self.pack_clip_selection(r, &local_sel);
         self.sync_song_to_plugin_host();
         count
@@ -3750,7 +3750,7 @@ impl AppData {
     /// (`is_undoable` で `SetNoteVelocities` を許可)。 sync_song_to_plugin_host
     /// は最後に 1 度だけ呼ぶ (毎 note 同期は無駄)。
     fn set_note_velocities(&mut self, updates: &[(u32, u8)]) {
-        // FIXME #93: packed id を所属クリップごとに分配し velocity を書く。複数クリップに
+        // packed id を所属クリップごとに分配し velocity を書く。複数クリップに
         // 跨る選択の velocity lane drag をまとめて反映 (velocity 変更は重なりを生まない)。
         let mut changed = false;
         self.for_each_note_clip_group(
@@ -3774,7 +3774,7 @@ impl AppData {
     }
 
     fn quantize_selected_notes(&mut self, div: u8) {
-        // FIXME #93: 選択 (packed) を所属クリップごとに分配し、各クリップ内 clip-local start を
+        // 選択 (packed) を所属クリップごとに分配し、各クリップ内 clip-local start を
         // 量子化。重なりは edit_clip_notes が解消し選択 (packed) を remap で追従。
         if self.selected_notes.is_empty() {
             return;
@@ -3855,7 +3855,7 @@ pub fn compute_slot_reconcile_actions(
     // 1 chain 分の reconcile。 track / master を同じロジックで処理する。
     let mut reconcile_chain =
         |track_id: u32, devices: &[common::model::PluginInstance]| {
-            // FIXME #54: 内蔵映像効果は plugin_host の host slot ではない (GUI 描画 device)。
+            // 内蔵映像効果は plugin_host の host slot ではない (GUI 描画 device)。
             // 「host slot を持つ index 集合」= **映像でない** device の index。これにより
             // 映像 device は LoadSlot されず、 また音声 device 削除で映像 device が同 index に
             // ずれ込んでも、 古い host slot は (この集合に無いので) RemoveSlot される。
@@ -3883,7 +3883,7 @@ pub fn compute_slot_reconcile_actions(
 
             // (2) Song にあるが host に無い、 もしくは plugin_id_str が違う index → LoadSlot
             for (i, inst) in devices.iter().enumerate() {
-                // FIXME #54: 映像 device は plugin_host に load しない。
+                // 映像 device は plugin_host に load しない。
                 if inst.ports.is_video() {
                     continue;
                 }
@@ -3939,7 +3939,7 @@ pub enum PendingStateRequest {
     /// state を Song に書き込んでから [`AppData::push_undo_snapshot`]
     /// を呼ぶことで、 削除直前の knob 値等を Undo で復元できる。
     Deferred(DeferredEdit),
-    /// FIXME #33: トラック copy (Ctrl+C)。state 書き戻し後の live song から
+    /// トラック copy (Ctrl+C)。state 書き戻し後の live song から
     /// 該当トラックを最新 plugin state 込みで serialize して
     /// `pending_clipboard_write` に積むだけ (Song 不変)。**undo snapshot は積まない**
     /// (copy は履歴を汚さない) ので `Deferred` とは別 variant にする。
@@ -3956,13 +3956,13 @@ pub enum DeferredEdit {
     /// 単一デバイスチェーン: `Track.devices` / `master_fx_chain` の指定 index の
     /// device を `Vec::remove` する (役割別 slot 区分は撤廃)。
     RemoveDevice { track_id: u32, index: u32 },
-    /// FIXME #33: トラック cut (Ctrl+X)。最新 plugin state 込みで serialize して
+    /// トラック cut (Ctrl+X)。最新 plugin state 込みで serialize して
     /// `pending_clipboard_write` に積んでから各トラックを削除する。`Deferred` 経由なので
     /// 削除前に undo snapshot が積まれ、Ctrl+Z 1 回で復元できる。
     CutTracks { track_ids: Vec<u32> },
 }
 
-/// FIXME #90: builtin VOICEVOX (歌唱/読み上げ) 合成の 1 plugin 分の状態。
+/// builtin VOICEVOX (歌唱/読み上げ) 合成の 1 plugin 分の状態。
 /// `AppData.voicevox_synth_status` に key=plugin_id で保持する。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VocalSynthStatus {
@@ -3973,7 +3973,7 @@ pub struct VocalSynthStatus {
     pub failing_since: Option<std::time::Instant>,
 }
 
-/// FIXME #90: 合成が `failing` のまま継続したとき「engine に接続できません」へ切り替える
+/// 合成が `failing` のまま継続したとき「engine に接続できません」へ切り替える
 /// までの猶予。engine 起動 (boot) に数秒かかるので、その間は「合成中」に見せる。
 pub const VOICEVOX_ENGINE_WARNING: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -4089,7 +4089,7 @@ mod lipsync_merge_tests {
     }
 }
 
-/// FIXME #63: 未保存変更がある状態で「現在のプロジェクトを破棄する操作」 を
+/// 未保存変更がある状態で「現在のプロジェクトを破棄する操作」 を
 /// 行おうとしたとき、 ガードモーダル (`dirty_guard_modal`) で保存確認を挟んでから
 /// 実行する操作の種類。 終了 (`Quit`、 旧 close 確認) と、 New / Open /
 /// Open Recent を一本化する (= 同じ「破棄する前に確認」 セマンティクス)。
@@ -4134,18 +4134,18 @@ pub enum AppEvent {
     /// ガードモーダルで「キャンセル」 (Esc / 外クリック / ✕ 含む)。
     /// 操作を取りやめてアプリに戻る。
     DirtyGuardCancel,
-    /// FIXME #27: 別の daw_gui を起動しようとした (single-instance)。 2 つ目の
+    /// 別の daw_gui を起動しようとした (single-instance)。 2 つ目の
     /// プロセスが既存インスタンスにこれを送って前面化を要求する。 window 操作
     /// なので runner の `user_event` が直接処理し、 `handle_event` には届かない。
     RaiseMainWindow,
     Play,
     Stop,
     PlayToggle,
-    /// FIXME #60: パニック — 鳴っている全ての音を即座に止める transport ボタン。
+    /// パニック — 鳴っている全ての音を即座に止める transport ボタン。
     /// 再生中なら transport stop し、全 plugin を deactivate→activate で
     /// 再初期化する（WAV 書き出しと同じ `ReinitAllPlugins` 機構を流用）。
     Panic,
-    /// FIXME #44: `f` キー。カーソル直下の拍 (song-absolute, 現在の snap 設定で吸着済)
+    /// `f` キー。カーソル直下の拍 (song-absolute, 現在の snap 設定で吸着済)
     /// へプレイヘッドを移動して再生する。再生中は seek してシームレスに継続、停止中は
     /// その位置から再生開始。view 層 (`dispatch_shortcuts`) が snap / ルーティング /
     /// song-absolute 解決済みの beat を渡すので、handler は set-playhead + seek/play のみ。
@@ -4201,7 +4201,7 @@ pub enum AppEvent {
     /// the new group is inserted just *before* the highest-positioned
     /// selected track (= 一番上の選択 track の直前 / 子の上にヘッダー)。
     /// `track_ids` must be non-empty — Live forbids empty groups and so
-    /// do we. FIXME #13 (plan_group_nesting): only the *selection roots*
+    /// do we. only the *selection roots*
     /// (tracks whose `parent_group_id` is not itself in the selection)
     /// are re-parented, so a selected group keeps its own children and
     /// nesting is preserved (depth unbounded) instead of being flattened.
@@ -4294,14 +4294,14 @@ pub enum AppEvent {
     DeleteAutomationPoints {
         points: Vec<AutomationPointKeyRef>,
     },
-    /// FIXME #81: 既存 point 上の dblclick → その point の値の **inline 数値入力**
+    /// 既存 point 上の dblclick → その point の値の **inline 数値入力**
     /// を開始する。session-only (undo 対象外)。`editing_automation_point` を
     /// セットするだけで、 描画は `arrangement_view` が `automation_point_rects`
     /// から rect を引いて `text_input_at_focused` overlay を出す。
     BeginEditAutomationPointValue {
         key: AutomationPointKeyRef,
     },
-    /// FIXME #81: inline 数値入力の確定 → 1 point の `value` を **plain 単位の
+    /// inline 数値入力の確定 → 1 point の `value` を **plain 単位の
     /// 絶対値** で上書き (時間 = `time_beat` は不変、 sort 不要)。Undo step 化
     /// (構造変化系)。`MoveAutomationPoints` (norm delta) と異なり absolute plain。
     SetAutomationPointValue {
@@ -4397,12 +4397,12 @@ pub enum AppEvent {
     /// 既に独立 clip の場合は status_message で通知。MIDI clip 用
     /// `MakeClipUnique(ClipRef)` と同 idiom の lane 版。
     MakeAutomationClipUnique(common::model::AutomationClipKey),
-    /// FIXME #21: D shortcut: 選択中の automation clip 群をまとめて共有コピー。
+    /// D shortcut: 選択中の automation clip 群をまとめて共有コピー。
     /// MIDI 用 `DuplicateClipsShared` の automation lane 版。 選択ブロック span
     /// だけ後ろにずらして複製し、 新 key 群を `selected_automation_clips` に
     /// 上書きする (D 連打で後方連鎖)。
     DuplicateAutomationClipsShared(Vec<common::model::AutomationClipKey>),
-    /// FIXME #21: Alt+D shortcut: 選択中の automation clip 群をまとめて独立コピー
+    /// Alt+D shortcut: 選択中の automation clip 群をまとめて独立コピー
     /// (content を deep clone + 新 ContentId)。 配置・選択は shared 版と同じ。
     DuplicateAutomationClipsUnique(Vec<common::model::AutomationClipKey>),
     /// gui_01 #028 §7.3: parameter touch 通知。inspector の knob drag /
@@ -4464,7 +4464,7 @@ pub enum AppEvent {
     /// preview drag 終了（非 undoable、begin に snapshot あり）。
     EndGroupTransformDrag,
 
-    /// FIXME #15 (`docs/plan_inspector_scrub.md`): audio / image / text
+    /// audio / image / text
     /// inspector の scrubable_number で drag / text 編集を開始した瞬間に
     /// 発火する marker。 handler 本体は no-op、 `is_undoable` に含まれる
     /// ので handle_event 冒頭の auto push_undo_snapshot だけが効き、 drag
@@ -4512,7 +4512,7 @@ pub enum AppEvent {
     /// docs/plan_text_overlay.md §4 P5: text inspector の編集パス。
     /// Mute / Text content / Font family は string-shaped で個別 event、
     /// 23 numeric field + 2 fade beats は `SetClipTextNumField` 1 event で
-    /// `TextNumField` discriminator dispatch する。 FIXME #15 で数値入力は
+    /// `TextNumField` discriminator dispatch する。 数値入力は
     /// scrubable_number 化され、 on_change が直接 `SetClipTextNumField` を
     /// 発火 (= 旧 buffer 経路 `ClipTextNumEditChanged` / `CommitClipTextNumEdit`
     /// は撤去)。 lane override 経由でも同様、 lane が effective なら
@@ -4524,7 +4524,7 @@ pub enum AppEvent {
     SetClipTextFadeInCurve { target: ClipRef, curve: common::model::FadeCurve },
     SetClipTextFadeOutCurve { target: ClipRef, curve: common::model::FadeCurve },
 
-    /// FIXME #15: text inspector の scrubable_number on_change から発火
+    /// text inspector の scrubable_number on_change から発火
     /// (drag 中 per-frame / text commit)。 `set_clip_text_num_field` で
     /// `value` (= Rotation は radians) を clamp + 全 TextEvent に書く。
     /// 非 undoable (= drag stroke を `Begin/EndInspectorScrub` で bracket)。
@@ -4537,7 +4537,7 @@ pub enum AppEvent {
 
     /// 選択中 text clip の `TextEvent` 現値から文字列 edit buffer
     /// (content / font_family) を再生成。 inspector が clip 切替 / Undo /
-    /// Redo の効果を反映するときに呼ぶ。 FIXME #15 で 25 numeric field は
+    /// Redo の効果を反映するときに呼ぶ。 25 numeric field は
     /// scrubable_number 化され現値を summary から直接読むため、 数値 buffer
     /// の再生成は不要になった。
     ResyncClipTextEditBuffers(ClipRef),
@@ -4659,13 +4659,13 @@ pub enum AppEvent {
     RenameTrackChanged(String),
     CommitRenameTrack,
     CancelRenameTrack,
-    /// FIXME #53: Arranger セクション帯の改名 (track rename の section 版)。帯名ダブルクリック
+    /// Arranger セクション帯の改名 (track rename の section 版)。帯名ダブルクリック
     /// またはメニュー「改名」で開始、 帯 rect に inline text_input を重ねる。
     BeginRenameSection(u32),
     RenameSectionChanged(String),
     CommitRenameSection,
     CancelRenameSection,
-    /// FIXME #53: セクション帯の色変更 (color_picker の live drag で発火)。 SetTrackColor と
+    /// セクション帯の色変更 (color_picker の live drag で発火)。 SetTrackColor と
     /// 同様、 非 undoable で各 arm が snapshot_for_color_edit を呼ぶ。
     SetSectionColor { id: u32, color: [f32; 3] },
     /// clip rename (track rename の clip 版)。 右クリックメニュー "Rename"
@@ -4729,7 +4729,7 @@ pub enum AppEvent {
     /// `event_length_beats` を追従させる (Bitwig spec §3.2)。 gui_01
     /// `ResizeClipDelta` の `next_start` / `next_len` 両方をそのまま流す。
     ///
-    /// FIXME #61: `stretch == false` は **trim** (= 再生範囲を変える。 audio は
+    /// `stretch == false` は **trim** (= 再生範囲を変える。 audio は
     /// source 窓と event 長を lockstep、 MIDI は clip 長で note を gate)、
     /// `stretch == true` は **time-stretch** (= 内容を新長さに伸縮。 audio は
     /// source 窓固定で event 長のみ変更し render が stretch_ratio で warp、 MIDI は
@@ -4746,13 +4746,13 @@ pub enum AppEvent {
     SetClipPositions(Vec<(ClipRef, u32, f64)>),
     CreateClip { track: u32, start_beat: f64 },
     DeleteSelectedClip,
-    /// FIXME #21: 選択中の clip 群をまとめて共有コピー (linked clip) する
+    /// 選択中の clip 群をまとめて共有コピー (linked clip) する
     /// (D shortcut / `docs/plan_clip_share_clone.md` §3.2)。 選択ブロック全体の
     /// span だけ後ろにずらして相対位置を保ったまま複製し (Ctrl+drag と同じ
     /// セマンティクス)、 複製を選択集合にする。 単一 clip では span = clip 長で
     /// 旧 `DuplicateClipShared` と完全一致。 source の `content_id` を流用。
     DuplicateClipsShared(Vec<ClipRef>),
-    /// FIXME #21: 選択中の clip 群をまとめて独立コピー (deep clone + 新 ContentId)
+    /// 選択中の clip 群をまとめて独立コピー (deep clone + 新 ContentId)
     /// する (Alt+D shortcut / §3.3)。 配置・選択は `DuplicateClipsShared` と同じ。
     DuplicateClipsUnique(Vec<ClipRef>),
     /// arrangement Ctrl+drag → release の結果。 各 entry は `(source ClipRef,
@@ -4803,12 +4803,12 @@ pub enum AppEvent {
         clip_ref: ClipRef,
         lyrics: Vec<(u32, Option<String>)>,
     },
-    /// FIXME #93: 複数表示ピアノロールの凡例 (legend) で対象 (target) クリップを切り替える。
+    /// 複数表示ピアノロールの凡例 (legend) で対象 (target) クリップを切り替える。
     /// `selected_clip` (anchor) をこの clip にするだけ (選択集合 `selected_clips` は不変、
     /// `shown_pianoroll_clips` の順序 = packed id slot も不変なので `selected_notes` は維持)。
     /// 新規ノートの所属先・凡例強調がこの clip になる。選択集合に居ない key なら no-op。
     SetPianoRollTargetClip(common::model::ClipKey),
-    /// FIXME #93: 凡例で **トラック** の「ロック (参照専用)」を反転。ロック中はそのトラックの
+    /// 凡例で **トラック** の「ロック (参照専用)」を反転。ロック中はそのトラックの
     /// 表示 note を widget が hit 除外し、編集 handler も飛ばす (淡色のまま掴めない)。非永続。
     TogglePianoRollTrackLock(u32),
 
@@ -4829,7 +4829,7 @@ pub enum AppEvent {
     /// / `nav_down`) で発火し、 Enter で `plugin_picker_visible.get(cursor)` を確定する。
     MovePluginPickerCursor(i32),
 
-    // -------- Font picker (Text クリップのフォント選択, FIXME #25) ----------
+    // -------- Font picker (Text クリップのフォント選択) ----------
     /// inspector の Font ボタンで発火。anchor の text クリップを対象に取り、
     /// 元フォントを退避してフォントピッカー modal を開く。初回は background で
     /// システムフォントを列挙する。
@@ -4848,20 +4848,20 @@ pub enum AppEvent {
     /// background のフォント列挙完了。
     FontFamiliesLoaded(Vec<String>),
 
-    /// FIXME #24: プロジェクトロードの background asset decode が 1 件完了する
+    /// プロジェクトロードの background asset decode が 1 件完了する
     /// たびに発火。 staging を caches へ流し込み、 全件完了で gate を外す。
     AssetDecodeTick,
 
-    /// FIXME #26 Phase B: 再スキャンの VST3 note-effect probe 進捗 (done, total)。
+    /// 再スキャンの VST3 note-effect probe 進捗 (done, total)。
     /// load_overlay に「プラグイン走査中 done/total」を出す。
     RescanProgress { done: usize, total: usize },
 
     /// 単一デバイスチェーン: `device_index` でアドレスする (役割別 slot 区分撤廃)。
     ToggleSlotGui { index: u32 },
-    /// FIXME #54 Wave4: 内蔵映像 FX の param 調整パネルから 1 param を編集。
+    /// 内蔵映像 FX の param 調整パネルから 1 param を編集。
     /// `value_real` は表示の実レンジ値 → lane の保存値 (0..=1) へ逆写像して格納。
     SetVideoFxParam { device_index: u32, param_id: u32, value_real: f32 },
-    /// FIXME #78: 埋め込み GUI を持たない plugin の「⚙」インライン param パネルで
+    /// 埋め込み GUI を持たない plugin の「⚙」インライン param パネルで
     /// param を 1 つ編集。 `value_real` は表示の実レンジ値 → host が送った
     /// `PluginParamInfo` の min/max で lane `default_value` (0..=1) へ逆写像。
     /// scrubable の per-frame 発火なので **非 undoable** (`BeginInspectorScrub`
@@ -4880,12 +4880,12 @@ pub enum AppEvent {
         port: u8,
         source: Option<u32>,
     },
-    /// docs/plan_modulation.md §9 / FIXME #56: create a project-level `ModSource`
+    /// docs/plan_modulation.md §9: create a project-level `ModSource`
     /// of the given kind, owned by the cursor track. follower は cursor track を tap。
     AddModSource { kind: ModSourceKindTag },
     /// remove the `ModSource` with id `id` and every `ModRouting` referencing it.
     RemoveModSource { id: u32 },
-    /// FIXME #56: generator (LFO/Random/MSEG/Steps) 設定の編集 (consolidated)。
+    /// generator (LFO/Random/MSEG/Steps) 設定の編集 (consolidated)。
     EditModSource { id: u32, edit: ModSourceEdit },
     /// **lane 非依存** (`docs/plan_modulation_routing_redesign.md` §5): add a
     /// `ModRouting` on track `track_id` (`MASTER_TRACK_ID` → `song_mod_routings`)
@@ -5004,7 +5004,7 @@ pub enum AppEvent {
     SetArrangeScroll(f32),
     SetArrangeZoom(f32),
     SetArrangeTrackRowH(f32),
-    /// FIXME #16: arrangement の track header 幅を更新 (gui_01 widget の右端
+    /// arrangement の track header 幅を更新 (gui_01 widget の右端
     /// splitter drag が発火)。 handler 側で 80..480 px に clamp。 session-only。
     SetArrangeHeaderW(f32),
     SetPianoRollScrollX(f32),
@@ -5111,9 +5111,9 @@ pub enum AppEvent {
     /// `generation` は spawn 時点の `lipsync_gen` snapshot。 HTTP 完了が遅延して
     /// いる間に別 project を開く (= `reset_saved_baseline` が gen を bump) と、
     /// この古い結果を別 project に適用して spurious dirty を生むため、 handler は
-    /// `generation == lipsync_gen` のときだけ反映する (FIXME #35、 debounce
+    /// `generation == lipsync_gen` のときだけ反映する (debounce
     /// leg `LipsyncDebounceFired` と対称)。
-    /// FIXME #90: 成功/失敗/空に関わらず **常に** 発行する。handler は generation に
+    /// 成功/失敗/空に関わらず **常に** 発行する。handler は generation に
     /// 関わらず `target_track_id` を `lipsync_inflight` から外し (= クリップ上スピナー /
     /// 全体オーバーレイの「口パク生成中」を解除)、その後 generation 一致 & `clips` 非空の
     /// ときだけ口 track へ反映する。`target_track_id` は spawn 時に解決済の出力先 track id。
@@ -5139,7 +5139,7 @@ pub enum AppEvent {
     /// 立てた timer thread が送る。`lipsync_gen` と一致するときだけ
     /// (= それ以降変更なし) 全 bound vocal track を再生成する。Undo 対象外。
     LipsyncDebounceFired(u64),
-    /// (FIXME #36) Clip Inspector の 2 段 dropdown で選択された声を、 対象
+    /// Clip Inspector の 2 段 dropdown で選択された声を、 対象
     /// clip (stable `ClipKey`) に焼き込む。 builtin へ再 flush して新しい声で
     /// 再合成する。
     SetClipVoice {
@@ -5148,7 +5148,7 @@ pub enum AppEvent {
         singer_name: String,
         style_name: String,
     },
-    /// (FIXME #36) Clip Inspector の「再取得」ボタン。 VOICEVOX `/singers` を
+    /// Clip Inspector の「再取得」ボタン。 VOICEVOX `/singers` を
     /// 再取得して声 dropdown を更新する (新規キャラ導入時)。
     RefetchSingers,
     /// (talk) VOICEVOX engine `/speakers` の取得結果 (`docs/plan_voicevox_talk.md` §4)。
@@ -5164,7 +5164,7 @@ pub enum AppEvent {
         param: TalkParamKind,
         value: f32,
     },
-    /// FIXME #90: plugin host の builtin VOICEVOX が報告する歌唱/読み上げ合成の状態遷移。
+    /// plugin host の builtin VOICEVOX が報告する歌唱/読み上げ合成の状態遷移。
     /// `busy` = 合成中、`failing` = 直近 HTTP 試行が失敗 (engine 未起動/起動途中)。
     /// `voicevox_synth_status` map を更新して、クリップ上スピナー + 全体オーバーレイ +
     /// engine 未接続警告を駆動する。派生 UI 状態なので Undo 対象外。
@@ -5175,7 +5175,7 @@ pub enum AppEvent {
     },
 
     // -------- WAV export -------------------------------------------------
-    /// File → Export WAV...: open the FIXME #55 range picker (default窓 = 全曲)。
+    /// File → Export WAV...: open the range picker (default窓 = 全曲)。
     /// 確定で `ConfirmExportRange` → file dialog → freewheel render。
     ExportWav,
     /// daw_audio の offline WAV render 完了通知。`cancelled` はユーザー中断
@@ -5186,11 +5186,11 @@ pub enum AppEvent {
     /// (sample 数)。`export_stage` を `AudioRender` に更新して進捗オーバーレイに
     /// 反映する。標準 WAV export / video export 前段のどちらでも来る。非 undoable。
     ExportWavProgress { done: u64, total: u64 },
-    /// FIXME #55: the plugin host finished reinitialising all plugins for an
+    /// the plugin host finished reinitialising all plugins for an
     /// offline cold render → send the stashed `ExportWav` now (clean state).
     PluginsReinitDone,
 
-    // -------- Export range picker (FIXME #55) ----------------------------
+    // -------- Export range picker ----------------------------
     /// レンジピッカーの開始拍を更新 (scrubable_number から)。 end 未満 / 0 以上に
     /// clamp。
     SetExportRangeStart(f64),
@@ -5199,11 +5199,11 @@ pub enum AppEvent {
     SetExportRangeEnd(f64),
     /// レンジピッカーを「全曲」 (start=0, end=length_beats) に戻す。
     ResetExportRange,
-    /// FIXME #79: video export の出力解像度 `(width, height)` を更新 (dropdown
+    /// video export の出力解像度 `(width, height)` を更新 (dropdown
     /// から)。 picker が開いている間だけ有効。 per-export override で Song /
     /// preview には反映しない。
     SetExportResolution(u32, u32),
-    /// FIXME #79: video export の出力フレームレートを更新 (dropdown から)。
+    /// video export の出力フレームレートを更新 (dropdown から)。
     SetExportFramerate(f32),
     /// レンジピッカーを確定し、 `kind` に応じた export action (file dialog) を
     /// 起動する。 picker は閉じる。
@@ -5328,10 +5328,10 @@ pub enum AppEvent {
 
     /// Background mp4 render at `output_path`, optionally muxing the
     /// PCM Float32 WAV at `audio_wav` as an AAC stream. v12
-    /// (`docs/plan_video.md` P8). FIXME #55: `range_beats` restricts the
+    /// (`docs/plan_video.md` P8). `range_beats` restricts the
     /// rendered window to `[start_beat, end_beat)` (`None` = whole song);
     /// the muxed `audio_wav` is already trimmed to the same window.
-    /// FIXME #79: `dims` = picker で選んだ出力解像度 `(w, h)` と fps の
+    /// `dims` = picker で選んだ出力解像度 `(w, h)` と fps の
     /// per-export override (`None` = プロジェクト値)。
     ExportMp4 {
         output_path: PathBuf,
@@ -5381,16 +5381,16 @@ pub enum AppEvent {
     /// 走査する flag。
     SetClipReversed { target: ClipRef, reversed: bool },
 
-    /// FIXME #80: clip 全体の mute を設定 (`Clip.muted` = clip-level mute の SSoT)。
+    /// clip 全体の mute を設定 (`Clip.muted` = clip-level mute の SSoT)。
     /// 旧 (v26 以前) は per-event `AudioEvent.muted` を立てていたが、v27 で `Clip.muted` に
     /// 一本化したので audio inspector の "Mute" トグルもここを設定する。track-mute とは独立。
     SetClipMuted { target: ClipRef, muted: bool },
 
-    /// FIXME #80: 複数 clip の mute を一括設定 (= `q` ショートカットで選択 clip / カーソル
+    /// 複数 clip の mute を一括設定 (= `q` ショートカットで選択 clip / カーソル
     /// 直下 clip を toggle した結果)。各 target の `Clip.muted` に `muted` を設定する。
     SetClipsMuted { targets: Vec<ClipRef>, muted: bool },
 
-    /// FIXME #80/#93: 表示中ピアノロールの note 群 (**packed note id**) の `Note.muted` を
+    /// 表示中ピアノロールの note 群 (**packed note id**) の `Note.muted` を
     /// 一括設定 (= `q` で選択 note / カーソル直下 note を toggle した結果)。packed id は
     /// 所属クリップを内包するので複数クリップに跨る選択も正しく mute できる。linked clip は
     /// content 共有なので mute も共有される。
@@ -5411,14 +5411,14 @@ pub enum AppEvent {
     SetClipStretchMode { target: ClipRef, mode: common::model::StretchMode },
 
     // ---- Audio event 数値 field 編集 (Phase 2 PR2) ----------------------
-    /// FIXME #15: audio / image inspector が `clip_edit_buffer_target` を
+    /// audio / image inspector が `clip_edit_buffer_target` を
     /// `target` に同期するために発火する純 sync marker。 数値 field は
     /// scrubable_number 化され現値を summary から直接読むため buffer 再生成
     /// は不要だが、 text section と共有する `clip_edit_buffer_target` を
     /// 正しい clip に向けておくために残す。 `is_undoable` ではない。
     ResyncClipEditBuffers(ClipRef),
 
-    /// FIXME #15: scrubable_number の on_change が発火する programmatic な
+    /// scrubable_number の on_change が発火する programmatic な
     /// field 設定 (drag 中 per-frame / text commit)。 全 event に broadcast
     /// (`SetClipReversed` 等と同じ semantics)。 非 undoable (= drag stroke
     /// を `Begin/EndInspectorScrub` で 1 undo step に bracket)。
@@ -5444,7 +5444,7 @@ pub enum AppEvent {
     /// scrubable_number on_change から / preview drag handle / JS test API
     /// 経由)。 全 ImageEvent に broadcast。 各値は仕様に従って clamp:
     /// x/y/w/h は [0.0, 1.0]、 opacity も [0.0, 1.0]、 rotation は
-    /// `-π..=π` で wrap (= 360° 連続入力可)。 FIXME #15: inspector の
+    /// `-π..=π` で wrap (= 360° 連続入力可)。 inspector の
     /// scrubable 化で `ClipImage*EditChanged` / `CommitClipImage*Edit` は
     /// 撤去 (drag stroke を `Begin/EndInspectorScrub` で bracket)。
     SetClipImageX { target: ClipRef, value: f32 },
@@ -5518,7 +5518,7 @@ pub enum AppEvent {
         error: Option<String>,
         frames: u64,
     },
-    /// FIXME #42: plugin host から歌唱合成完了 (or timeout) 通知。`pending_vocal_synth_bounce`
+    /// plugin host から歌唱合成完了 (or timeout) 通知。`pending_vocal_synth_bounce`
     /// があれば歌唱 bounce の offline render (`start_clip_bounce`) を開始する。
     VocalSynthReady {
         plugin_id: u32,
@@ -5535,7 +5535,7 @@ pub enum AppEvent {
     SetClipFadeBeatsBatch(Vec<(ClipRef, FadeEdgeKind, f64)>),
     /// `(target, edge, curve)` 列で fade curve を一括設定。
     SetClipFadeCurveBatch(Vec<(ClipRef, FadeEdgeKind, common::model::FadeCurve)>),
-    /// FIXME #46: inspector のトグル / ドロップダウン (= discrete undoable 編集) を
+    /// inspector のトグル / ドロップダウン (= discrete undoable 編集) を
     /// 複数選択クリップへ一括適用する。 単発イベントをループで撃つと is_undoable の
     /// auto-push で N スナップになるため、 これ 1 つで 1 スナップにまとめ、 handler 内で
     /// per-clip setter (variant-safe) をループする。
@@ -5665,7 +5665,7 @@ pub enum FadeEdgeKind {
     Out,
 }
 
-/// FIXME #46: [`AppEvent::BroadcastDiscreteClipEdit`] が運ぶ discrete inspector 編集の
+/// [`AppEvent::BroadcastDiscreteClipEdit`] が運ぶ discrete inspector 編集の
 /// 種別。 per-clip setter (`set_clip_*`) は対象 `ClipContent` variant 違いで no-op に
 /// なる (variant-safe) ので、 broadcast 先に種別違いのクリップが混ざっても安全
 /// (= その field を持つクリップにだけ適用される)。
@@ -5732,8 +5732,8 @@ impl AppData {
                     // 強制解除する) を動かす。`on_tick` の本体は is_playing で
                     // 内部ガードされ、export 中は engine へ何も送らない (無害)。
                     | AppEvent::Tick { .. }
-                    // FIXME #64 review: `PluginsReinitDone` は **export 自身の**
-                    // ハンドシェイク返信 (FIXME #55: ReinitAllPlugins の応答)。
+                    // `PluginsReinitDone` は **export 自身の**
+                    // ハンドシェイク返信 (ReinitAllPlugins の応答)。
                     // begin_wav_export が export_stage を立てた *後* に
                     // ReinitAllPlugins を送るので、この応答は必ず export 中に
                     // 到着する。これを gate で drop すると `ExportWav` が永遠に発射されず
@@ -5759,11 +5759,11 @@ impl AppData {
 
         if Self::is_undoable(&event) {
             self.push_undo_snapshot();
-            // FIXME #40: undoable な discrete edit はすべてここで dirty を立てる。
+            // undoable な discrete edit はすべてここで dirty を立てる。
             // `is_dirty` の真値は `song != saved_song` (recompute_dirty) だが、
             // それを再評価するトリガ (sticky flag) を各ハンドラが手で立てる方式
             // だと立て忘れが起きる (= `set_clip_voice` が声/スタイル変更で dirty に
-            // しなかった、FIXME #40 の症状)。undo snapshot を積むのと同じ単一
+            // しなかった症状)。undo snapshot を積むのと同じ単一
             // チョークポイントで dirty を立てれば、undo 対象 = 編集 = dirty が
             // 一致し、新しい discrete edit を is_undoable に追加するだけで dirty も
             // 自動で付く。no-op edit (値が変わらない) で over-mark しても、runner
@@ -5773,12 +5773,12 @@ impl AppData {
         }
 
         match event {
-            // FIXME #63: New / Open は現在のプロジェクトを破棄するので、 dirty なら
+            // New / Open は現在のプロジェクトを破棄するので、 dirty なら
             // 先に保存確認ダイアログを挟む (clean なら即実行)。
             AppEvent::New => self.request_guarded_action(DirtyGuardAction::New),
             AppEvent::Open => self.request_guarded_action(DirtyGuardAction::Open),
             AppEvent::Save => {
-                // FIXME #63: ガード確認中 / 保存後アクション待ち中 / queue drain 待ち中は
+                // ガード確認中 / 保存後アクション待ち中 / queue drain 待ち中は
                 // 手動保存を無視する。 この間に別経路の保存を走らせると pending_state_queue
                 // に余分な Save が積まれ、 続く New/Open が project を破壊しうる (guard_save が
                 // 発行する保存に一本化する)。 finish_save の再保存ループは begin_save 直呼び
@@ -5805,7 +5805,7 @@ impl AppData {
                     // その変更を写した autosave (sidecar / session recovery file) を
                     // 消してから操作を実行する。 残すと、 同じ file を開き直したとき /
                     // 次回起動時に recovery 機構が「破棄したはずの変更を復元しますか？」
-                    // と聞いてしまう (FIXME #63 実機検証で発覚)。
+                    // と聞いてしまう (実機検証で発覚)。
                     self.discard_current_autosave();
                     self.perform_guard_action(action);
                 }
@@ -5915,7 +5915,7 @@ impl AppData {
                 self.set_note_velocities(&updates);
             }
             AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
-            // FIXME #27: 前面化は runner の user_event が window へ直接行うため、
+            // 前面化は runner の user_event が window へ直接行うため、
             // ここには届かない。 match 網羅のための no-op。
             AppEvent::RaiseMainWindow => {}
             AppEvent::GroupSelectedTracks { track_ids } => {
@@ -6098,7 +6098,7 @@ impl AppData {
                 self.set_group_transform_field(track_id, param, value);
             }
             AppEvent::EndGroupTransformDrag => {}
-            // FIXME #15: inspector scrubable_number の drag / text 編集
+            // inspector scrubable_number の drag / text 編集
             // stroke を 1 undo step に bracket。 Begin は is_undoable 経由で
             // snapshot を 1 個取る (本体 no-op)、 End は snapshotless。
             AppEvent::BeginInspectorScrub => {}
@@ -6141,7 +6141,7 @@ impl AppData {
                 target,
                 display_name,
             } => {
-                // FIXME #74: built-in トラックコントロール (Volume / Pan / SendGain)
+                // built-in トラックコントロール (Volume / Pan / SendGain)
                 // の drag は gesture 先頭で 1 回だけ Song snapshot を取り、 「1 drag =
                 // 1 undo step」 にする (`BeginInspectorScrub` と同 idiom)。 per-frame に
                 // 発火する `SetTrackVolume` / `SetTrackPan` / `SetSendGain` 自体は
@@ -6321,7 +6321,7 @@ impl AppData {
                 self.is_help_open = false;
             }
             AppEvent::OpenRecent(path) => {
-                // FIXME #63: Open Recent も「プロジェクトを開く」 = 現プロジェクト破棄
+                // Open Recent も「プロジェクトを開く」 = 現プロジェクト破棄
                 // なので dirty なら保存確認を挟む。
                 self.request_guarded_action(DirtyGuardAction::OpenPath(path));
             }
@@ -6439,7 +6439,7 @@ impl AppData {
             }
             AppEvent::SetNoteSelection(targets) => {
                 self.selected_notes = targets;
-                // FIXME #93: last (anchor) は packed note id。所属クリップを decode し、
+                // last (anchor) は packed note id。所属クリップを decode し、
                 // (1) **そのクリップを対象 (target) に切替** — 非対象クリップのノートを掴むと編集対象が
                 //     そちらへ移る (plan §D/E。selected_clips は不変なので slot/selected_notes は維持)、
                 // (2) 既定 note 長をそのクリップから引く。
@@ -6749,7 +6749,7 @@ impl AppData {
                 }
             }
             AppEvent::SetExportResolution(w, h) => {
-                // FIXME #79: dropdown はプリセット (全て偶数・正値) しか出さないが、
+                // dropdown はプリセット (全て偶数・正値) しか出さないが、
                 // 念のため 0 を弾く (encoder は w/h != 0 を要求)。
                 if let Some(p) = self.export_range_picker.as_mut()
                     && w > 0
@@ -6934,11 +6934,11 @@ impl AppData {
                 propagate_clip_color(&mut self.song.tracks, target, color);
             }
             AppEvent::SetClipMuted { target, muted } => {
-                // FIXME #80: clip-level mute の SSoT (`Clip.muted`)。 content type を問わない。
+                // clip-level mute の SSoT (`Clip.muted`)。 content type を問わない。
                 self.set_clip_muted(target, muted);
             }
             AppEvent::SetClipsMuted { targets, muted } => {
-                // FIXME #80: `q` で選択 clip / カーソル直下 clip を一括 toggle した結果。
+                // `q` で選択 clip / カーソル直下 clip を一括 toggle した結果。
                 let mut changed = false;
                 for target in targets {
                     if let Some(track) = self.song.tracks.get_mut(target.track as usize)
@@ -6954,14 +6954,14 @@ impl AppData {
                 }
             }
             AppEvent::SetNotesMuted { notes, muted } => {
-                // FIXME #80/#93: `q` で選択 note / カーソル直下 note (packed id) を一括 toggle。
+                // `q` で選択 note / カーソル直下 note (packed id) を一括 toggle。
                 self.set_notes_muted(&notes, muted);
             }
             AppEvent::SetClipStretchMode { target, mode } => {
                 self.set_clip_audio_event_stretch_mode(target, mode);
             }
             AppEvent::ResyncClipEditBuffers(target) => {
-                // FIXME #15: 数値 buffer は撤去済み。 text section と共有する
+                // 数値 buffer は撤去済み。 text section と共有する
                 // `clip_edit_buffer_target` を target に向ける純 sync。
                 self.clip_edit_buffer_target = Some(target);
             }
@@ -7042,7 +7042,7 @@ impl AppData {
                 self.end_text_pip_drag_recording();
             }
             AppEvent::SetClipTextMuted { target, muted } => {
-                // FIXME #80: 字幕 clip mute も clip-level `Clip.muted` に一本化。
+                // 字幕 clip mute も clip-level `Clip.muted` に一本化。
                 self.set_clip_muted(target, muted);
             }
             AppEvent::SetClipTextContent { target, value } => {
@@ -7143,7 +7143,7 @@ impl AppData {
                 );
             }
             AppEvent::VocalSynthReady { plugin_id } => {
-                // FIXME #42: 歌唱合成完了 (or timeout) 通知。 同時 bounce は 1 件なので
+                // 歌唱合成完了 (or timeout) 通知。 同時 bounce は 1 件なので
                 // plugin_id は echo back 用。 pending があれば offline render を開始する。
                 let _ = plugin_id;
                 if let Some((target, mode)) = self.pending_vocal_synth_bounce.take() {
@@ -7180,13 +7180,13 @@ impl AppData {
                 }
             }
             AppEvent::BroadcastDiscreteClipEdit { targets, edit } => {
-                // FIXME #46: discrete トグル/ドロップダウンを選択全クリップへ一括適用。
+                // discrete トグル/ドロップダウンを選択全クリップへ一括適用。
                 // 1 イベント = 1 undo snapshot (is_undoable)、 ここで per-clip setter を
                 // ループする。 各 setter は variant-safe なので種別違いは no-op。
                 for &t in &targets {
                     match edit {
                         DiscreteClipEdit::Reversed(v) => self.set_clip_audio_event_reversed(t, v),
-                        // FIXME #80: inspector の "Mute" トグルも clip-level `Clip.muted` に一本化。
+                        // inspector の "Mute" トグルも clip-level `Clip.muted` に一本化。
                         DiscreteClipEdit::Muted(v) => self.set_clip_muted(t, v),
                         DiscreteClipEdit::StretchMode(m) => {
                             self.set_clip_audio_event_stretch_mode(t, m);
@@ -7207,7 +7207,7 @@ impl AppData {
                                 }
                             }
                         },
-                        // FIXME #80: 字幕 inspector の "Mute" も clip-level `Clip.muted` に一本化。
+                        // 字幕 inspector の "Mute" も clip-level `Clip.muted` に一本化。
                         DiscreteClipEdit::TextMuted(v) => self.set_clip_muted(t, v),
                         DiscreteClipEdit::TextAlign(a) => self.set_clip_text_event_align(t, a),
                         DiscreteClipEdit::TextFadeCurve(edge, c) => match edge {
@@ -7224,7 +7224,7 @@ impl AppData {
                 self.action_glue_selected_clips();
             }
             AppEvent::PluginsReinitDone => {
-                // FIXME #55: plugins are now reinitialised to a clean state —
+                // plugins are now reinitialised to a clean state —
                 // fire the stashed offline export. (If nothing is pending, a
                 // stray reply; ignore.)
                 if let Some((path, range, write_mod_sidecar)) = self.pending_export.take() {
@@ -7234,7 +7234,7 @@ impl AppData {
                         write_mod_sidecar,
                     });
                 }
-                // FIXME #60: a panic's reinit just completed — release the audio
+                // a panic's reinit just completed — release the audio
                 // engine's master declick hold so it fades back in over a now
                 // clean (silent) mix. Coupling the un-mute to the real reinit
                 // completion (not a timer) is what keeps a stalled GUI thread or
@@ -7276,10 +7276,10 @@ impl AppData {
                 self.export_progress_at = None;
                 self.export_stage = None;
                 if let Some(mp4_path) = self.pending_video_export.take() {
-                    // FIXME #55: 音声と同じ拍範囲で video を render する (= 全曲
+                    // 音声と同じ拍範囲で video を render する (= 全曲
                     // なら None)。 取り出して消費。
                     let range_beats = self.pending_video_export_range.take();
-                    // FIXME #79: picker で選んだ出力解像度 / fps の per-export
+                    // picker で選んだ出力解像度 / fps の per-export
                     // override。 None (= 旧経路) なら action_export_mp4 が
                     // プロジェクト値にフォールバックする。
                     let dims = self.pending_video_export_dims.take();
@@ -7334,14 +7334,14 @@ impl AppData {
                     "VOICEVOX singers loaded"
                 );
                 self.singers = singers;
-                // (FIXME #36) Clip Inspector の 2 段 dropdown は `singers` を
+                // Clip Inspector の 2 段 dropdown は `singers` を
                 // 直接読む (キャラ→style の階層が要るので flat cache は持たない)。
             }
             AppEvent::LipsyncGenerated { vocal_track_id, target_track_id, bpm, clips, generation } => {
-                // FIXME #90: 成功/失敗/空に関わらず in-flight 解除 (= スピナーを止める)。
+                // 成功/失敗/空に関わらず in-flight 解除 (= スピナーを止める)。
                 // generation が古くても (project 切替後でも) 必ず外す。
                 self.lipsync_inflight.remove(&target_track_id);
-                // FIXME #35: spawn 後に project が切り替わった (reset_saved_baseline
+                // spawn 後に project が切り替わった (reset_saved_baseline
                 // が gen を bump した) 古い結果は捨てる。 適用すると別 project の口
                 // track を作り直して spurious dirty になる。 debounce leg と同 idiom。
                 if generation == self.lipsync_gen && !clips.is_empty() {
@@ -7585,7 +7585,7 @@ impl AppData {
         // 別プロジェクト (空) に切り替えるので現プロジェクトの plugin / editor を破棄。
         self.teardown_all_loaded_plugins();
         let mut song = Song::default();
-        // FIXME #33: New プロジェクトに新しい project_id を採番 (clipboard の
+        // New プロジェクトに新しい project_id を採番 (clipboard の
         // 同一プロジェクト判定用、別 New 同士は別プロジェクト扱いになる)。
         song.ensure_project_id();
         Self::migrate_legacy_vocal_tracks(&mut song);
@@ -7595,7 +7595,7 @@ impl AppData {
         self.collapsed_groups.clear();
         self.selected_clip = None;
         self.selected_notes.clear();
-        // FIXME #87: 新規プロジェクトでは前プロジェクトの per-clip view を漏らさずクリア
+        // 新規プロジェクトでは前プロジェクトの per-clip view を漏らさずクリア
         // (globals は現状維持 = 従来挙動)。`None` 経路 = action_open_path の旧ファイルと同じ。
         self.restore_view_state(None);
         self.resize_track_peak_display();
@@ -7636,7 +7636,7 @@ impl AppData {
     /// 仕様で skip。 decode 失敗は warn ログのみ (= waveform が出ないだけで
     /// 他機能は動く defensive)。
     /// プロジェクトの audio / image source を **background スレッドで** decode
-    /// し、 caches へ逐次取り込む (FIXME #24 / `docs/plan_progress_streaming.md`)。
+    /// し、 caches へ逐次取り込む (/ `docs/plan_progress_streaming.md`)。
     /// 旧 `decode_*_sources_into_cache` は GUI スレッドで同期 decode し UI を
     /// 固めていた。 本関数は構造の swap 後に呼ばれ、 work-list を作って 1 本の
     /// thread で順次 decode、 1 件ごとに `AssetDecodeTick` を発火して `on_asset_
@@ -7788,7 +7788,7 @@ impl AppData {
                 self.restore_plugin_from_song(&song);
                 self.song = song;
                 self.file_path = Some(path.clone());
-                // FIXME #24: audio / image source の decode は重いので background
+                // audio / image source の decode は重いので background
                 // スレッドへ。 構造は既に swap 済みなので即操作可、 波形 / 画像は
                 // streaming で順次出る (begin_asset_decode → AssetDecodeTick)。
                 self.begin_asset_decode();
@@ -7796,7 +7796,7 @@ impl AppData {
                 self.collapsed_groups.clear();
                 self.selected_clip = None;
                 self.selected_notes.clear();
-                // FIXME #87: 保存済みの表示状態 (ズーム / スクロール / per-clip view / 選択
+                // 保存済みの表示状態 (ズーム / スクロール / per-clip view / 選択
                 // クリップ) を復元。`None` (旧ファイル / view 未保存) なら per-clip map をクリア
                 // するだけで globals は現状維持 = 従来の fit-to-content 挙動。
                 self.restore_view_state(view);
@@ -7933,7 +7933,7 @@ impl AppData {
             }
         };
 
-        // FIXME #87: autosave も表示状態を同梱する (= ダーティでなくても view が
+        // autosave も表示状態を同梱する (= ダーティでなくても view が
         // 永続化される → スクロール/ズーム変更が `*` を立てずに次回 open で復元される)。
         let view = self.snapshot_view_state();
         match common::project::save_project(&autosave_path, &self.song, Some(&view)) {
@@ -7983,7 +7983,7 @@ impl AppData {
         self.last_autosave = std::time::Instant::now();
     }
 
-    /// FIXME #63: ダーティーガードで「保存せず続行/終了」 (discard) を選んだとき、
+    /// ダーティーガードで「保存せず続行/終了」 (discard) を選んだとき、
     /// 破棄する **現プロジェクト** の autosave を消す。 `maybe_autosave` が書く 2 箇所
     /// (file_path Some なら sidecar、 加えて session recovery file) を両方消し、
     /// `recovery_candidates` からも除く。 これをしないと、 同じ file を開き直したとき
@@ -8049,14 +8049,14 @@ impl AppData {
         self.restore_plugin_from_song(&song);
         self.song = song;
         self.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
-        // FIXME #24: recovery 復元も load path と同じく background streaming
+        // recovery 復元も load path と同じく background streaming
         // decode へ。 file_path を先にセット済みなので ProjectRelative も解決可。
         self.begin_asset_decode();
         self.selected_track_ids.clear();
         self.collapsed_groups.clear();
         self.selected_clip = None;
         self.selected_notes.clear();
-        // FIXME #87: recovery も表示状態 + 選択クリップを復元 (autosave が view を書いている)。
+        // recovery も表示状態 + 選択クリップを復元 (autosave が view を書いている)。
         self.restore_view_state(view);
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
@@ -8207,7 +8207,7 @@ impl AppData {
             match action {
                 SlotReconcileAction::RemoveSlot { track_id, index } => {
                     tracing::info!(track_id, index, "reconcile: removing extra host device");
-                    // FIXME #31: close the editor before removing (see
+                    // close the editor before removing (see
                     // remove_device_inner for the ordering rationale).
                     self.cleanup_slot_gui(track_id, index);
                     self.send_plugin(MainToChild::RemoveSlotPlugin {
@@ -8346,7 +8346,7 @@ impl AppData {
             to_send.push((common::model::MASTER_TRACK_ID, i as u32, p.clone()));
         }
         for (track, index, inst) in to_send {
-            // FIXME #54: 内蔵映像効果は GUI 描画 device。plugin_host に load しない
+            // 内蔵映像効果は GUI 描画 device。plugin_host に load しない
             // (該当 builtin 無し)。engine は未登録 index を skip する (= 音声素通り)。
             if inst.ports.is_video() {
                 continue;
@@ -8367,7 +8367,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #33: 指定 track id 群の devices だけを plugin host に `SetSlotPlugin` で
+    /// 指定 track id 群の devices だけを plugin host に `SetSlotPlugin` で
     /// 実体化する (paste したトラックの plugin を state 込みで新インスタンス化)。
     /// [`Self::restore_plugin_from_song`] の track 限定版。`self.song` を読むため
     /// to_send を先に owned で確保してから送る (borrow 回避)。
@@ -8385,7 +8385,7 @@ impl AppData {
             }
         }
         for (track, index, inst) in to_send {
-            // FIXME #54: 内蔵映像効果は plugin_host に load しない (GUI 描画 device)。
+            // 内蔵映像効果は plugin_host に load しない (GUI 描画 device)。
             if inst.ports.is_video() {
                 continue;
             }
@@ -8414,12 +8414,12 @@ impl AppData {
     }
 
     /// ウィンドウを閉じる要求 (`WindowEvent::CloseRequested`) のエントリ。
-    /// FIXME #63 で New / Open と一本化したガードの「終了」 ケース。
+    /// New / Open と一本化したガードの「終了」 ケース。
     pub fn request_close(&mut self) {
         self.request_guarded_action(DirtyGuardAction::Quit);
     }
 
-    /// FIXME #63: 現在のプロジェクトを破棄する操作 (終了 / New / Open /
+    /// 現在のプロジェクトを破棄する操作 (終了 / New / Open /
     /// Open Recent) のエントリ。 未保存変更があれば確認モーダルを開き、
     /// 無ければ即 `action` を実行する。 ふつうの DAW と同じく「破棄する前に
     /// 保存するか確認」 する。
@@ -8653,7 +8653,7 @@ impl AppData {
     /// 反映済みであり、 この送信より後の変更は host では `RequestAllStates` の後に
     /// 処理されるため、 返る state は必ず「今 live にある配置」 と一致する。
     fn dispatch_front_state_request(&mut self) {
-        // FIXME #64 review: plugin host が居ない (crash 後 respawn 断念 = crash-loop
+        // plugin host が居ない (crash 後 respawn 断念 = crash-loop
         // 上限 / supervisor 無し / respawn 失敗) と RequestAllStates は届かず応答も
         // 永久に来ない。 一方 enqueue gate は接続状態でなく `song_has_plugin()`
         // (model 上 plugin が在るか) なので、 この degraded 状態でも round-trip が
@@ -8682,7 +8682,7 @@ impl AppData {
             }
         }
         self.send_plugin(MainToChild::RequestAllStates);
-        // FIXME #64: この瞬間から応答 (AllStatesReceived) までを on_tick の watchdog
+        // この瞬間から応答 (AllStatesReceived) までを on_tick の watchdog
         // が監視する。 host が hang して応答が来ないと永久ロックになるため。
         self.state_request_sent_at = Some(std::time::Instant::now());
     }
@@ -8716,7 +8716,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #64: plugin-state round-trip (`RequestAllStates` → `AllStatesReceived`)
+    /// plugin-state round-trip (`RequestAllStates` → `AllStatesReceived`)
     /// の hang watchdog。 `on_tick` (33ms / ~30Hz の playhead poll、 plugin host
     /// とは独立した daw_audio 由来なので host が hang しても発火し続ける) から毎回
     /// 呼ばれる。 応答が一定時間来なければ round-trip を破棄して脱出口を作る。
@@ -8730,7 +8730,7 @@ impl AppData {
     /// 数秒で済む。 30 秒を超えるのは実質 hang のみ (= 誤発火しない一方、 永久
     /// ロックよりは遥かに短く脱出できる)。
     pub fn poll_state_roundtrip_watchdog(&mut self, now: std::time::Instant) {
-        // FIXME #64 review: export 進行中は handle_event の gate (`Tick` のみ
+        // export 進行中は handle_event の gate (`Tick` のみ
         // whitelist) が `AllStatesReceived` を drop するので、 この間は応答が来ても
         // round-trip は完了し得ない。 deadline を進めると、 export 開始直前に
         // armed だった round-trip を「hang した」と誤判定して、 実際には応答が
@@ -8778,7 +8778,7 @@ impl AppData {
     }
 
     /// plugin state 取得待ちで save が非同期進行中か (= queue に Save あり)。
-    /// FIXME #24: この間 load_overlay が「保存中…」インジケータを出す
+    /// この間 load_overlay が「保存中…」インジケータを出す
     /// (= 非ブロック、 編集は続行可)。
     pub(crate) fn is_async_save_pending(&self) -> bool {
         self.pending_state_queue
@@ -8826,7 +8826,7 @@ impl AppData {
             ),
             None => (Vec::new(), Vec::new()),
         };
-        // FIXME #87: 現在の表示状態を同梱して保存する (snapshot は楽曲のみ凍結、
+        // 現在の表示状態を同梱して保存する (snapshot は楽曲のみ凍結、
         // view は presentation なので保存実行時の live を採るので十分)。
         let view = self.snapshot_view_state();
         match common::project::save_project(&path, &snapshot, Some(&view)) {
@@ -8937,7 +8937,7 @@ impl AppData {
             self.status_message = "書き出し中は再生できません".into();
             return;
         }
-        // FIXME #24: プロジェクトロードの asset decode 中は音声がまだ揃って
+        // プロジェクトロードの asset decode 中は音声がまだ揃って
         // いないので再生を gate して queue する (load 完了で on_asset_decode_tick
         // が flush)。
         if self.asset_decode.is_some() {
@@ -8972,7 +8972,7 @@ impl AppData {
         self.is_playing = true;
     }
 
-    /// FIXME #50: プレイヘッドを `beat` に置き、「停止で戻るホーム」 (`playback_origin_beat`)
+    /// プレイヘッドを `beat` に置き、「停止で戻るホーム」 (`playback_origin_beat`)
     /// も同位置へ更新し、audio engine へ SeekTo を送る。 ruler click (arrangement /
     /// piano_roll / audio_editor) と `f` キーから共通で呼ぶ唯一の seek 経路 (= 「停止 =
     /// 最後に意図的に置いた位置に戻る」 の SSoT)。 再生中でも home を更新するので、
@@ -8987,11 +8987,11 @@ impl AppData {
         self.send_audio(MainToChild::SeekTo { samples });
     }
 
-    /// FIXME #44: `f` キーの実体。 snap 済 song-absolute beat へプレイヘッドを置き
+    /// `f` キーの実体。 snap 済 song-absolute beat へプレイヘッドを置き
     /// (`seek_playhead_to`: home も更新 + SeekTo)、停止中は `play()` を呼んでその位置から
     /// 再生開始する (play() の export / asset / plugin ゲートと playback_origin_beat capture を
     /// 継承するため body を再実装しない)。 再生中は `play()`/`stop()` を呼ばずシームレスに
-    /// 継続する (FIXME #50: home は `seek_playhead_to` が更新済なので Stop はこの位置へ戻る)。
+    /// 継続する (home は `seek_playhead_to` が更新済なので Stop はこの位置へ戻る)。
     fn action_play_from_cursor(&mut self, beat: f64) {
         self.seek_playhead_to(beat);
         if !self.is_playing {
@@ -9049,7 +9049,7 @@ impl AppData {
         self.sync_recording_lanes_with_audio();
     }
 
-    /// FIXME #60: パニック — 鳴っている全ての音を即座に止める。
+    /// パニック — 鳴っている全ての音を即座に止める。
     ///
     /// 1. 再生中なら [`Self::stop`] で transport を止める（sequencer note-off を
     ///    flush、audio clip / metronome を停止、playhead を開始位置へ戻す）。
@@ -9160,7 +9160,7 @@ impl AppData {
         ));
     }
 
-    // -------- FIXME #33: track clipboard --------
+    // -------- track clipboard --------
 
     /// Ctrl+C (トラック面)。plugin があれば最新 state を取ってから serialize する
     /// ため deferred、無ければ即時。copy は Song 不変なので undo を積まない。
@@ -9661,7 +9661,7 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// FIXME #53: セクション帯の inline 改名を開始する (現在名を編集バッファに seed)。
+    /// セクション帯の inline 改名を開始する (現在名を編集バッファに seed)。
     fn begin_rename_section(&mut self, id: u32) {
         let Some(name) = self.song.sections.iter().find(|s| s.id == id).map(|s| s.name.clone())
         else {
@@ -9671,7 +9671,7 @@ impl AppData {
         self.section_rename_id = Some(id);
     }
 
-    /// FIXME #53: セクション帯の改名を確定する (空名は無視)。
+    /// セクション帯の改名を確定する (空名は無視)。
     fn commit_rename_section(&mut self) {
         let Some(id) = self.section_rename_id else {
             return;
@@ -9764,9 +9764,9 @@ impl AppData {
         }
     }
 
-    // ===== FIXME #90: VOICEVOX 生成状態の可視化 ==========================
+    // ===== VOICEVOX 生成状態の可視化 ==========================
 
-    /// FIXME #90: `VoicevoxSynthStatus` IPC handler。per-plugin の busy/failing を更新する。
+    /// `VoicevoxSynthStatus` IPC handler。per-plugin の busy/failing を更新する。
     /// failing の立上りで `failing_since` を記録 (継続中は維持)、成功で None。idle かつ
     /// 非failing の entry は掃除して `voicevox_any_generating` 等の判定を軽く保つ。
     fn apply_voicevox_synth_status(&mut self, plugin_id: u32, busy: bool, failing: bool) {
@@ -9786,7 +9786,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #90: track が持つ builtin VOICEVOX device の host plugin_id (= load 済なら)。
+    /// track が持つ builtin VOICEVOX device の host plugin_id (= load 済なら)。
     /// `sync_vocal_metadata` の lookup と同じ (device 実在 → loaded_slots で plugin_id)。
     pub fn voicevox_plugin_id_for_track(&self, track: &common::model::Track) -> Option<u32> {
         let device_index = track.devices.iter().position(|d| {
@@ -9798,7 +9798,7 @@ impl AppData {
             .map(|s| s.plugin_id)
     }
 
-    /// FIXME #90: track の歌唱/読み上げ WAV 合成が進行中か (= 所属 builtin VOICEVOX が busy)。
+    /// track の歌唱/読み上げ WAV 合成が進行中か (= 所属 builtin VOICEVOX が busy)。
     pub fn track_wav_synthesizing(&self, track_id: u32) -> bool {
         let Some(track) = self.song.tracks.iter().find(|t| t.id == track_id) else {
             return false;
@@ -9809,18 +9809,18 @@ impl AppData {
         self.voicevox_synth_status.get(&pid).is_some_and(|s| s.busy)
     }
 
-    /// FIXME #90: 出力先 (口 track) が口パク再生成中か。
+    /// 出力先 (口 track) が口パク再生成中か。
     pub fn lipsync_target_generating(&self, track_id: u32) -> bool {
         self.lipsync_inflight.contains(&track_id)
     }
 
-    /// FIXME #90: いずれかの VOICEVOX 生成 (WAV 合成 / 口パク) が進行中か。
+    /// いずれかの VOICEVOX 生成 (WAV 合成 / 口パク) が進行中か。
     pub fn voicevox_any_generating(&self) -> bool {
         !self.lipsync_inflight.is_empty()
             || self.voicevox_synth_status.values().any(|s| s.busy)
     }
 
-    /// FIXME #90: WAV 合成中の vocal track 数 (= 全体オーバーレイの「残り N」)。
+    /// WAV 合成中の vocal track 数 (= 全体オーバーレイの「残り N」)。
     /// track→plugin_id を直接引く (track_wav_synthesizing の id 再 find を避け O(tracks²) 回避)。
     pub fn voicevox_synth_busy_count(&self) -> usize {
         self.song
@@ -9833,7 +9833,7 @@ impl AppData {
             .count()
     }
 
-    /// FIXME #90: engine 未接続警告を出すべきか (= busy のまま failing が閾値以上継続)。
+    /// engine 未接続警告を出すべきか (= busy のまま failing が閾値以上継続)。
     /// engine boot (数秒) の間は failing でも警告せず「合成中」に見せ、閾値超過で切り替える。
     pub fn voicevox_engine_unreachable(&self, now: std::time::Instant) -> bool {
         self.voicevox_synth_status.values().any(|s| {
@@ -9843,7 +9843,7 @@ impl AppData {
         })
     }
 
-    /// FIXME #90: スピナーを回し続ける (= 連続再描画を要求する) べきか。engine 未接続が
+    /// スピナーを回し続ける (= 連続再描画を要求する) べきか。engine 未接続が
     /// 確定したら static 警告にして再描画を止める (CPU spin させない)。
     pub fn voicevox_animating(&self, now: std::time::Instant) -> bool {
         self.voicevox_any_generating() && !self.voicevox_engine_unreachable(now)
@@ -9911,7 +9911,7 @@ impl AppData {
                         pitch: n.pitch,
                         velocity: n.velocity,
                         lyric: n.lyric.clone().unwrap_or_default(),
-                        // (FIXME #36) builtin が clip 単位で声を分けるための
+                        // builtin が clip 単位で声を分けるための
                         // grouping key + per-clip 歌唱 speaker (0 = builtin 側で
                         // DEFAULT_SINGER_ID にフォールバック)。
                         clip_id: clip.id,
@@ -10043,12 +10043,12 @@ impl AppData {
             return;
         }
         self.ensure_voicevox_engine();
-        // FIXME #90: 出力先 (口 track) を in-flight に登録 = クリップ上スピナー +
+        // 出力先 (口 track) を in-flight に登録 = クリップ上スピナー +
         // 全体オーバーレイ「口パク生成中」を点灯。完了イベントで必ず外す。
         self.lipsync_inflight.insert(target_id);
         // spawn 時点の世代を snapshot し、 結果と一緒に返す。 HTTP が遅延して
         // いる間に project が切り替わる (reset_saved_baseline が gen を bump) と
-        // handler 側で破棄される (FIXME #35)。
+        // handler 側で破棄される。
         let generation = self.lipsync_gen;
         let target_track_id = target_id;
         let proxy = self.event_proxy.clone();
@@ -10086,7 +10086,7 @@ impl AppData {
                     }
                 }
             }
-            // FIXME #90: 成功/失敗/空に関わらず **必ず** 送る。handler が
+            // 成功/失敗/空に関わらず **必ず** 送る。handler が
             // `lipsync_inflight` から target を外してスピナーを止める。clips が空なら
             // (= 全 HTTP 失敗) handler 側で「既存 clip を温存」して反映だけスキップする。
             proxy.send(AppEvent::LipsyncGenerated {
@@ -10255,7 +10255,7 @@ impl AppData {
     /// counter を bump するだけで、 既にスケジュール済みの `LipsyncDebounceFired`
     /// は世代不一致になり handler 側で no-op になる (新しい timer は spawn しない)。
     /// `reset_saved_baseline` (= load / new / recovery) から呼び、 開いた直後の
-    /// spurious dirty (FIXME #35) を防ぐ。
+    /// spurious dirty を防ぐ。
     fn cancel_pending_lipsync_regen(&mut self) {
         self.lipsync_gen = self.lipsync_gen.wrapping_add(1);
     }
@@ -10281,10 +10281,10 @@ impl AppData {
     fn action_add_instrument_track(&mut self) {
         let id = self.song.alloc_track_id();
         let index = self.song.tracks.len() + 1;
-        // FIXME #33: 挿入位置は「選択中で最上段の track の直上」 (純ロジックは
+        // 挿入位置は「選択中で最上段の track の直上」 (純ロジックは
         // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
         let insert_at = add_track_insert_index(&self.song.tracks, &self.selected_track_ids);
-        // FIXME #49: 新 track は挿入位置の基準 track (= 最上段の選択) と同じグループ
+        // 新 track は挿入位置の基準 track (= 最上段の選択) と同じグループ
         // 階層に入れる (parent_group_id を継承)。基準が無い (= 選択無しで末尾挿入、
         // insert_at == tracks.len()) ときだけ master 直下 (None)。基準がグループ (子持ち)
         // でも「同じ階層 = 兄弟」になる (parent_group_id 継承がそのまま兄弟化する)。
@@ -10305,7 +10305,7 @@ impl AppData {
     }
 
     // ----------------------------------------------------------------
-    // FIXME #53: Arranger セクション (曲のパート) の編集ハンドラ。gui_01 M14 Phase 127 の
+    // Arranger セクション (曲のパート) の編集ハンドラ。gui_01 M14 Phase 127 の
     // 帯操作 emit を受けて適用する。undo は全て push_undo_snapshot (Song 丸ごと clone) で
     // Ctrl+Z 復帰可能。
     //
@@ -10400,7 +10400,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #53: gui_01 の `SelectSection { id, modifier }` を解決してセクション選択集合を
+    /// gui_01 の `SelectSection { id, modifier }` を解決してセクション選択集合を
     /// 更新する (`SelectModifier` は track header click と同 idiom、 末尾 = anchor)。 section を
     /// 選んだ時点で clip / note / track 等の他面選択をクリアし、 キーボード Delete が曖昧に
     /// ならないようにする (section は `edit_surface` の最低優先なので、 他選択が残っていると
@@ -10447,7 +10447,7 @@ impl AppData {
         self.selected_track_ids.clear();
     }
 
-    /// FIXME #53: 選択中のセクション帯を削除する (帯のみ・内容温存、 キーボード Delete から)。
+    /// 選択中のセクション帯を削除する (帯のみ・内容温存、 キーボード Delete から)。
     pub(crate) fn apply_delete_selected_sections(&mut self) {
         if self.selected_section_ids.is_empty() {
             return;
@@ -10507,7 +10507,7 @@ impl AppData {
     /// widget 側で min/max に clamp 済なのでそのまま反映。
     fn set_lane_height(&mut self, track_id: u32, lane_id: u32, next_px: u16) {
         // ユーザーが明示的に lane を resize した = `Z` 縦ズームの一時拡大 (session
-        // override) を破棄して model 高さに制御を戻す (FIXME #86)。
+        // override) を破棄して model 高さに制御を戻す。
         self.automation_lane_row_overrides
             .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
         if let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) {
@@ -10633,7 +10633,7 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// FIXME #81: point の現在値 (plain 単位) を読む。inline 数値入力の prefill /
+    /// point の現在値 (plain 単位) を読む。inline 数値入力の prefill /
     /// 編集開始可否判定に使う。master row (`MASTER_TRACK_ID`) lane も
     /// `automation_lane_by_key` が解決する。
     pub(crate) fn automation_point_value(&self, key: &AutomationPointKeyRef) -> Option<f64> {
@@ -10646,7 +10646,7 @@ impl AppData {
         pts.get(key.point_idx as usize).map(|p| p.value)
     }
 
-    /// FIXME #81: point の値を **plain 単位の絶対値**で上書き (inline 数値入力の確定)。
+    /// point の値を **plain 単位の絶対値**で上書き (inline 数値入力の確定)。
     /// `value` は呼び出し側 (`arrangement_view`) で表示単位レンジに clamp +
     /// `from_display` 済の plain。時間 (`time_beat`) は変えないので sort 順は不変。
     fn set_automation_point_value(&mut self, key: &AutomationPointKeyRef, value: f64) {
@@ -10964,7 +10964,7 @@ impl AppData {
         Some((json, count))
     }
 
-    /// FIXME #33: `CopiedPoint` 群を「マウス下の automation lane」の `song_beat`
+    /// `CopiedPoint` 群を「マウス下の automation lane」の `song_beat`
     /// (song-absolute 拍) を含む automation clip に貼る。clip が無い (レーンの空き)
     /// なら no-op + status。`song_beat - clip.start` を clip-local anchor とし、各 point の
     /// 相対 `time_beat` を加算。value は lane.target に応じ norm→plain 復元して sort 維持
@@ -11064,7 +11064,7 @@ impl AppData {
         count
     }
 
-    // -------- FIXME #33: audio event clipboard --------
+    // -------- audio event clipboard --------
 
     /// オーディオエディタで選択中のイベントを clipboard envelope
     /// (`ClipboardPayload::AudioEvents`) JSON に。最早 start を 0 とした相対に正規化。
@@ -11162,7 +11162,7 @@ impl AppData {
         count
     }
 
-    // -------- FIXME #33: clip clipboard --------
+    // -------- clip clipboard --------
 
     /// 選択中クリップ群を clipboard envelope (`ClipboardPayload::Clips`) JSON に。
     /// 最上段トラックを `track_offset` 0、最早 start を `start_beat` 0 とした相対で
@@ -11205,12 +11205,12 @@ impl AppData {
                 length_beats: c.length_beats,
                 color: c.color,
                 auto_lipsync: c.auto_lipsync,
-                // (FIXME #80) clip-level mute も clipboard へ。
+                // clip-level mute も clipboard へ。
                 muted: c.muted,
                 content_id: c.content_id,
                 content,
                 name,
-                // (FIXME #36) per-clip 声を clipboard へ。
+                // per-clip 声を clipboard へ。
                 speaker_id: c.speaker_id,
                 singer_name: c.singer_name.clone(),
                 style_name: c.style_name.clone(),
@@ -11299,9 +11299,9 @@ impl AppData {
                 notes: Vec::new(),
                 color: cc.color,
                 auto_lipsync: cc.auto_lipsync,
-                // (FIXME #80) clipboard の clip-level mute を paste 先 clip へ引き継ぐ。
+                // clipboard の clip-level mute を paste 先 clip へ引き継ぐ。
                 muted: cc.muted,
-                // (FIXME #36) clipboard の per-clip 声を paste 先 clip へ引き継ぐ。
+                // clipboard の per-clip 声を paste 先 clip へ引き継ぐ。
                 speaker_id: cc.speaker_id,
                 singer_name: cc.singer_name.clone(),
                 style_name: cc.style_name.clone(),
@@ -11708,7 +11708,7 @@ impl AppData {
         })
     }
 
-    /// FIXME #21: 選択 automation clip 群をまとめて共有複製 (D shortcut)。 選択
+    /// 選択 automation clip 群をまとめて共有複製 (D shortcut)。 選択
     /// ブロック span だけ後ろにずらして複製し、 複製群を選択にする (連打で後方連鎖)。
     fn duplicate_automation_clips_shared(&mut self, sources: &[common::model::AutomationClipKey]) {
         let Some(offset) = self.automation_block_span(sources) else {
@@ -11735,7 +11735,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #21: 選択 automation clip 群をまとめて独立複製 (Alt+D shortcut)。
+    /// 選択 automation clip 群をまとめて独立複製 (Alt+D shortcut)。
     fn duplicate_automation_clips_unique(&mut self, sources: &[common::model::AutomationClipKey]) {
         let Some(offset) = self.automation_block_span(sources) else {
             return;
@@ -12290,7 +12290,7 @@ impl AppData {
     pub fn inspector_group_transform_summary(
         &self,
     ) -> Option<GroupTransformInspectorSummary> {
-        // FIXME #54 Wave4: Transform もチェーン行の "GUI" ボタンでトグル開閉する（他 FX と統一、
+        // Transform もチェーン行の "GUI" ボタンでトグル開閉する（他 FX と統一、
         // 出っぱなしにしない）。開いている device が cursor track の Transform 配置 device の
         // ときだけ Group Transform セクションを出す。
         let (open_track, open_idx) = self.open_video_fx_params?;
@@ -12316,7 +12316,7 @@ impl AppData {
         })
     }
 
-    /// FIXME #54 Wave4: 開いている映像 FX param パネル（`open_video_fx_params`）が cursor
+    /// 開いている映像 FX param パネル（`open_video_fx_params`）が cursor
     /// track と一致するとき、その device の def + 各 param の現在実値を返す。inspector が
     /// scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
     pub fn inspector_video_fx_params(&self) -> Option<VideoFxParamsInspector> {
@@ -12361,7 +12361,7 @@ impl AppData {
         Some(VideoFxParamsInspector { track_id, device_index, def, values })
     }
 
-    /// FIXME #54 Wave4: 内蔵映像 FX param を 1 つ編集（パネルの scrubable から）。値の SSoT は
+    /// 内蔵映像 FX param を 1 つ編集（パネルの scrubable から）。値の SSoT は
     /// `PluginParam` lane の `default_value`（0..=1 norm、`video_fx` モジュール doc）。lane が
     /// 無ければ値保持用（`visible=false`・curve 無し）を作る。master は `song_lanes`。
     fn set_video_fx_param(&mut self, device_index: u32, param_id: u32, value_real: f32) {
@@ -12414,7 +12414,7 @@ impl AppData {
         });
     }
 
-    /// FIXME #78: 汎用 plugin の「Par」インライン param パネルの read snapshot。
+    /// 汎用 plugin の「Par」インライン param パネルの read snapshot。
     /// `open_plugin_params` が cursor track の device を指し、 host から param 一覧が
     /// 届いているときに、 lane default_value を実レンジ化した編集可能な param 行を返す。
     /// VOICEVOX / 字幕 builtin は host param を持たず、 専用セクション (Clip Voice /
@@ -12499,7 +12499,7 @@ impl AppData {
         })
     }
 
-    /// FIXME #78: 「Par」パネルが開いている device の plugin_id (cursor track 上)。
+    /// 「Par」パネルが開いている device の plugin_id (cursor track 上)。
     /// VOICEVOX / 字幕 など専用セクションを持つ builtin の Par 開閉判定に使う。
     fn open_param_panel_plugin_id(&self) -> Option<&str> {
         let (track_id, idx) = self.open_plugin_params?;
@@ -12512,19 +12512,19 @@ impl AppData {
             .map(|d| d.plugin_id.as_str())
     }
 
-    /// FIXME #78: VOICEVOX builtin の「Par」パネルが開いているか (= Clip Voice /
+    /// VOICEVOX builtin の「Par」パネルが開いているか (= Clip Voice /
     /// Talk セクションを Par パネルとして描画する gate)。
     pub fn voicevox_param_panel_open(&self) -> bool {
         self.open_param_panel_plugin_id() == Some(common::plugin_db::BUILTIN_ID_VOICEVOX)
     }
 
-    /// FIXME #78: 字幕 builtin の「Par」パネルが開いているか (= Text Event
+    /// 字幕 builtin の「Par」パネルが開いているか (= Text Event
     /// セクションを Par パネルとして描画する gate)。
     pub fn subtitle_param_panel_open(&self) -> bool {
         self.open_param_panel_plugin_id() == Some(common::plugin_db::SUBTITLE_ID)
     }
 
-    /// FIXME #78: 汎用 plugin param を 1 つ編集 (「⚙」パネルの scrubable から)。 値の
+    /// 汎用 plugin param を 1 つ編集 (「⚙」パネルの scrubable から)。 値の
     /// SSoT は `PluginParam` lane の `default_value` (0..=1 norm)。 実レンジ↔norm は
     /// host が送った `PluginParamInfo` の min/max。 lane が無ければ値保持用
     /// (`visible=false`) を作る。 master は `song_lanes`。 音への反映 (host push) は
@@ -12731,7 +12731,7 @@ impl AppData {
                 self.plugin_tx = None;
                 self.pending_plugin_loads.clear();
                 self.loaded_slots.clear();
-                // FIXME #63/#64: plugin state 取得待ちの round-trip はもう完了しない
+                // plugin state 取得待ちの round-trip はもう完了しない
                 // (host 消滅で AllStatesReceived が来ない)。 stale な queue / 保留ガードを
                 // 破棄して GUI の恒久ロックを防ぐ。 hang watchdog (`abort_state_roundtrip`)
                 // と同じ脱出処理に一本化する。
@@ -13102,7 +13102,7 @@ impl AppData {
             tracing::warn!(?child_ids, "group request: stale track id, abort");
             return;
         }
-        // FIXME #13 (plan_group_nesting): selection-root rule。 選択集合のうち、
+        // selection-root rule。 選択集合のうち、
         // 親 (`parent_group_id`) が同じ選択集合に **含まれていない** トラック
         // (= 最上位) だけを新グループへ付け替える。 グループとその子を一緒に
         // 選んだ場合、 子は元のグループに残り、 内側グループの階層が平坦化しない
@@ -13163,7 +13163,7 @@ impl AppData {
         });
         // Repoint every selection-root track's parent to the new group.
         // 子孫 (= 親が選択集合内のトラック) は元の親に残すことで、 内側
-        // グループの入れ子が保たれる (FIXME #13)。
+        // グループの入れ子が保たれる。
         for &cid in &roots {
             if let Some(t) = self.song.track_by_id_mut(cid) {
                 t.parent_group_id = Some(group_id);
@@ -13580,11 +13580,11 @@ impl AppData {
             lyric: None,
             muted: false,
         });
-        // FIXME #83: ステップ入力した note を勝者として重なり解消。
+        // ステップ入力した note を勝者として重なり解消。
         let remap = resolve_note_overlaps(notes, &[new_idx]);
         let selected = remap_indices(&remap, &[new_idx]);
         let next_cursor = cursor + step;
-        // FIXME #93: selected_notes は packed note id。入力先 (target) clip の slot で pack。
+        // selected_notes は packed note id。入力先 (target) clip の slot で pack。
         self.selected_notes = self.pack_clip_selection(target, &selected);
         self.step_cursor_beat = next_cursor;
         self.sync_song_to_plugin_host();
@@ -13757,7 +13757,7 @@ impl AppData {
             ..Default::default()
         };
         track.clips.push(new_clip);
-        // content_name は **明示 rename 専用** (FIXME #69)。 ここで自動名
+        // content_name は **明示 rename 専用**。 ここで自動名
         // ("Recorded N") を入れると、 後でノートに歌詞が付いたとき明示名優先
         // ルールで歌詞を隠してしまう (= ⑤⑦ の再来)。 生成クリップは
         // `create_clip` と同様 **無名** で作り、 表示名は歌詞 / 本文から導出する
@@ -13886,12 +13886,12 @@ impl AppData {
         self.selected_clip.and_then(|k| self.clip_ref_of(k))
     }
 
-    // -------- FIXME #87: per-clip piano roll / audio editor view 状態 --------
+    // -------- per-clip piano roll / audio editor view 状態 --------
 
     /// 現在ピアノロールで開いている (= 選択 anchor) クリップの表示状態。
     /// entry が無ければ `PianoRollViewState::default()` (= 64/14/84/0)。
     pub fn piano_roll_view_state(&self) -> common::model::PianoRollViewState {
-        // FIXME #93: 複数表示は共有 viewport (`multi_clip_view`、song-absolute scroll)、
+        // 複数表示は共有 viewport (`multi_clip_view`、song-absolute scroll)、
         // 単一は per-clip 永続 state (clip-local scroll) を返す。
         if self.shown_pianoroll_clips().len() >= 2 {
             self.multi_clip_view
@@ -13902,7 +13902,7 @@ impl AppData {
         }
     }
 
-    /// piano roll view を可変で得る。FIXME #93: 複数表示中は共有 transient viewport
+    /// piano roll view を可変で得る。複数表示中は共有 transient viewport
     /// (`multi_clip_view`、song-absolute scroll、非永続) を返し、単一表示は per-clip 永続 state
     /// (`piano_roll_views[anchor]`、無ければ default 挿入) を返す。読み出し (`piano_roll_view_state`)
     /// と同じ分岐 (`shown_pianoroll_clips().len() >= 2`) を使い、scroll/zoom/top_pitch の編集が
@@ -13949,7 +13949,7 @@ impl AppData {
         self.audio_editor_view_state().len_beats
     }
 
-    /// FIXME #87: 現在の表示状態 (ズーム / スクロール / 行高 / スナップ等 + per-clip view) を
+    /// 現在の表示状態 (ズーム / スクロール / 行高 / スナップ等 + per-clip view) を
     /// `ViewState` にスナップショットする。 save / autosave 時に呼ぶ。 per-clip map は
     /// 現存しないクリップの orphan entry を GC して書き出す。
     pub fn snapshot_view_state(&self) -> common::model::ViewState {
@@ -14002,7 +14002,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #87: load 時に `ViewState` を AppData へ流し込む。 別プロジェクトの per-clip
+    /// load 時に `ViewState` を AppData へ流し込む。 別プロジェクトの per-clip
     /// view が漏れないよう **必ず先に map をクリア**。 `None` (旧ファイル / view 未保存) なら
     /// globals は現状維持 (= 従来の fit-to-content / 既定値挙動)。 全値を有効域へ clamp して
     /// 壊れた / 古い保存値を吸収する。
@@ -14062,7 +14062,7 @@ impl AppData {
             .collect()
     }
 
-    /// FIXME #93: ピアノロールに同時表示する MIDI クリップ群を順序付きで返す
+    /// ピアノロールに同時表示する MIDI クリップ群を順序付きで返す
     /// (`selected_clips` を `ClipRef` 解決 → MIDI のみ filter)。anchor (`selected_clip`) は
     /// `selected_clips` の末尾なので、末尾要素 = 新規ノートの所属先 (= 対象/target クリップ)。
     /// `selected_clips` が空の単一選択経路では `selected_clip` にフォールバックする。
@@ -14088,7 +14088,7 @@ impl AppData {
         out
     }
 
-    /// FIXME #93: 現在の対象 (target) クリップ = 新規ノートの所属先・凡例で強調される行。
+    /// 現在の対象 (target) クリップ = 新規ノートの所属先・凡例で強調される行。
     /// SSoT は選択 anchor (`selected_clip`)。anchor が表示 MIDI クリップ集合に含まれていれば
     /// それを、含まれなければ末尾 (= 旧挙動) を返す。表示 MIDI クリップが無いときは `None`。
     /// **target を切り替えても `shown_pianoroll_clips` の順序 (= packed id の clip_slot) は
@@ -14105,7 +14105,7 @@ impl AppData {
         shown.last().copied()
     }
 
-    /// FIXME #93: piano_roll widget へ渡す **グローバル note id**。
+    /// piano_roll widget へ渡す **グローバル note id**。
     /// 上位 8 bit = `clip_slot` (`shown_pianoroll_clips()` 内の位置 0..=255)、
     /// 下位 24 bit = clip 内 note index (0..=16M)。複数クリップ重畳表示で id 衝突を防ぐ。
     #[must_use]
@@ -14113,7 +14113,7 @@ impl AppData {
         ((clip_slot as u32) << 24) | (note_index as u32 & 0x00FF_FFFF)
     }
 
-    /// FIXME #93: packed note id の上位 8 bit (= clip_slot) だけを取り出す。view 層が
+    /// packed note id の上位 8 bit (= clip_slot) だけを取り出す。view 層が
     /// song-absolute → clip-local 変換で「その note の所属クリップ」を引くのに使う
     /// (bit レイアウトを `pack_note_id` と 1 箇所に集約する)。
     #[must_use]
@@ -14121,13 +14121,13 @@ impl AppData {
         (id >> 24) as usize
     }
 
-    /// FIXME #93: packed note id の下位 24 bit (= clip 内 note index)。
+    /// packed note id の下位 24 bit (= clip 内 note index)。
     #[must_use]
     pub fn note_id_local_index(id: u32) -> usize {
         (id & 0x00FF_FFFF) as usize
     }
 
-    /// FIXME #93: `resolve_note_overlaps` がクリップ `slot` に返した remap を、packed な
+    /// `resolve_note_overlaps` がクリップ `slot` に返した remap を、packed な
     /// `selected_notes` のうち当該クリップ部分にだけ適用する (他クリップは不変)。
     /// `remap[old_local] = Some(new_local)` は追従、None / 範囲外は選択から落とす。
     fn remap_packed_selection_for_clip(&mut self, slot: usize, remap: &[Option<u32>]) {
@@ -14145,7 +14145,7 @@ impl AppData {
         self.selected_notes = out;
     }
 
-    /// FIXME #93: クリップ `slot` (= `r`) の notes に `f` を適用 (local index ベースで編集し、
+    /// クリップ `slot` (= `r`) の notes に `f` を適用 (local index ベースで編集し、
     /// 重なり解決の勝者にする local index 群を返す) → `resolve_note_overlaps` で同ピッチ
     /// 重なりを解消 → packed `selected_notes` の当該クリップ部分を remap、という複数クリップ
     /// note 編集の共通基盤。snap 等の immutable 計算は呼び出し側で済ませて `f` に閉じ込める。
@@ -14163,7 +14163,7 @@ impl AppData {
         self.remap_packed_selection_for_clip(slot, &remap);
     }
 
-    /// FIXME #93: クリップの song-absolute 開始拍。clip-local note ⇄ song-absolute 変換の
+    /// クリップの song-absolute 開始拍。clip-local note ⇄ song-absolute 変換の
     /// 唯一のオフセット (範囲外は 0)。
     #[must_use]
     pub fn clip_start_beat_of(&self, r: ClipRef) -> f64 {
@@ -14175,7 +14175,7 @@ impl AppData {
             .unwrap_or(0.0)
     }
 
-    /// FIXME #93: packed note id を持つ `entries` を **所属クリップ (clip_slot) ごと** に
+    /// packed note id を持つ `entries` を **所属クリップ (clip_slot) ごと** に
     /// グルーピングし、各クリップで `per_clip(self, slot, ClipRef, &[(local_index, payload)])` を
     /// 呼ぶ。範囲外 slot / ロック中クリップは飛ばす (ロックは widget が hit 除外済だが二重防御)。
     /// payload は handler ごとに異なる (移動=(beat,pitch)、リサイズ=(beat,len)、velocity=u8、
@@ -14204,7 +14204,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #93: packed note id を `(ClipRef, clip 内 index)` に分解。`shown` は
+    /// packed note id を `(ClipRef, clip 内 index)` に分解。`shown` は
     /// `shown_pianoroll_clips()` の結果 (呼び出し側で 1 度作って使い回す)。`clip_slot` が
     /// 範囲外なら `None`。
     #[must_use]
@@ -14214,14 +14214,14 @@ impl AppData {
         shown.get(clip_slot).copied().map(|r| (r, note_index))
     }
 
-    /// FIXME #93: 単発デコード (内部で `shown_pianoroll_clips()` を 1 度計算)。多数の id を
+    /// 単発デコード (内部で `shown_pianoroll_clips()` を 1 度計算)。多数の id を
     /// 捌くハンドラでは `shown` を 1 度作って `decode_note_id_in` を使う (再計算を避ける)。
     #[must_use]
     pub fn decode_note_id(&self, id: u32) -> Option<(ClipRef, usize)> {
         Self::decode_note_id_in(&self.shown_pianoroll_clips(), id)
     }
 
-    /// FIXME #93: クリップ `r` 内の local note index 群を、現在の表示集合 (`shown_pianoroll_clips`)
+    /// クリップ `r` 内の local note index 群を、現在の表示集合 (`shown_pianoroll_clips`)
     /// における **packed note id** に変換する。新規ノート (add / paste / step 入力) の結果選択を
     /// packed 化する共通基盤。`r` が表示集合に無ければ slot 0 (= 単一表示と byte 互換) に倒す。
     fn pack_clip_selection(&self, r: ClipRef, locals: &[u32]) -> Vec<u32> {
@@ -14236,7 +14236,7 @@ impl AppData {
             .collect()
     }
 
-    /// FIXME #93: そのクリップが乗っている **トラック** がピアノロールで「ロック (参照専用)」
+    /// そのクリップが乗っている **トラック** がピアノロールで「ロック (参照専用)」
     /// かどうか。ロックはトラック単位 (凡例がトラック単位なので)。
     pub fn is_pianoroll_clip_locked(&self, r: ClipRef) -> bool {
         self.song
@@ -14245,12 +14245,12 @@ impl AppData {
             .is_some_and(|t| self.locked_pr_tracks.contains(&t.id))
     }
 
-    /// FIXME #93: トラック id がピアノロールでロック中か (凡例のロックトグル状態表示用)。
+    /// トラック id がピアノロールでロック中か (凡例のロックトグル状態表示用)。
     pub fn is_pianoroll_track_locked(&self, track_id: u32) -> bool {
         self.locked_pr_tracks.contains(&track_id)
     }
 
-    /// FIXME #93: 凡例から対象 (target) クリップを切り替える。anchor (`selected_clip`) を
+    /// 凡例から対象 (target) クリップを切り替える。anchor (`selected_clip`) を
     /// `key` にするだけで、選択集合 (`selected_clips`) は変えない (= `shown_pianoroll_clips`
     /// の順序 = packed id slot 不変 → `selected_notes` 維持)。新規ノートの所属先・凡例強調が
     /// この clip になる。集合に居ない / 単一表示で anchor と異なる key は no-op。track も追従。
@@ -14266,7 +14266,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #93: 凡例から **トラック** のロック (参照専用) を反転。非永続な view 状態
+    /// 凡例から **トラック** のロック (参照専用) を反転。非永続な view 状態
     /// (`locked_pr_tracks`)。ロック中はそのトラックの表示 note を widget が hit 除外し、
     /// 編集 handler も飛ばす (`for_each_note_clip_group` / `is_pianoroll_clip_locked`)。
     fn toggle_pianoroll_track_lock(&mut self, track_id: u32) {
@@ -14275,11 +14275,11 @@ impl AppData {
         }
     }
 
-    /// FIXME #46: inspector の編集対象クリップ群。 複数選択 (`selected_clips`) 全体を
+    /// inspector の編集対象クリップ群。 複数選択 (`selected_clips`) 全体を
     /// 編集対象にする。 アンカー (`selected_clip`) は `select_clip` / `set_clip_selection`
     /// の構築上 `selected_clips` の末尾にいるので別途足す必要はない。 `selected_clips`
     /// が空 (= 単一選択経路のみ) のときだけ `selected_clip` にフォールバックする。
-    /// FIXME #46: inspector 編集対象クリップを **alloc せず** 順に渡す。 `selected_clips`
+    /// inspector 編集対象クリップを **alloc せず** 順に渡す。 `selected_clips`
     /// 全体 (空なら `selected_clip` 単体) を走査する。 mixed 検出 (`inspector_fold`) は
     /// 毎フレーム全 field で呼ばれるので、 Vec を作らないこの基盤を使う。
     fn for_each_inspector_target(&self, mut f: impl FnMut(ClipRef)) {
@@ -14302,7 +14302,7 @@ impl AppData {
         refs
     }
 
-    /// FIXME #46: 編集対象クリップ各々に `extract` を適用し、 値が全て一致すれば
+    /// 編集対象クリップ各々に `extract` を適用し、 値が全て一致すれば
     /// `Some(値)`、 割れていれば `None` (= mixed) を返す。 `extract` が `None` を返す
     /// クリップ (= その field を持たない種別) は無視する。 表示中の section のアンカーは
     /// 必ずその種別なので、 表示中 field では `None` == mixed と解釈できる。 毎フレーム
@@ -14326,7 +14326,7 @@ impl AppData {
     }
 
     /// `target` clip の first `ImageEvent` に `f` を適用 (image clip でなければ `None`)。
-    /// FIXME #46 の mixed 畳み込み (`inspector_fold`) 用 accessor。
+    /// mixed 畳み込み (`inspector_fold`) 用 accessor。
     pub fn image_first_event<R>(
         &self,
         target: ClipRef,
@@ -14383,7 +14383,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #46: text num field を `inspector_target_refs` 全体で畳む (mixed 検出)。
+    /// text num field を `inspector_target_refs` 全体で畳む (mixed 検出)。
     pub fn inspector_text_num_folded(&self, field: TextNumField) -> Option<f64> {
         self.inspector_fold(|a, t| a.text_first_event(t, |e| text_event_num_value(e, field)))
     }
@@ -14417,7 +14417,7 @@ impl AppData {
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
         }
-        // FIXME #87: per-clip view を記憶するので、初めて開くクリップ (= entry 無し)
+        // per-clip view を記憶するので、初めて開くクリップ (= entry 無し)
         // のときだけ auto-fit する。 既に記憶があれば draw が `piano_roll_views` を
         // 読んで前回の zoom/scroll を復元する (= 再選択で view が飛ばない)。 明示的な
         // 再 fit は `X` キー / Fit ボタン (`FitPianoRollToClip`)。
@@ -14439,7 +14439,7 @@ impl AppData {
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
         }
-        // FIXME #87: 初回 (entry 無し) のみ fit。 記憶があれば復元 (select_clip と同方針)。
+        // 初回 (entry 無し) のみ fit。 記憶があれば復元 (select_clip と同方針)。
         if let Some(p) = primary
             && !self.piano_roll_views.contains_key(&p)
         {
@@ -14500,8 +14500,8 @@ impl AppData {
         self.selected_clips = keys;
     }
 
-    /// Ctrl+A (ピアノロール): **表示中の全 MIDI クリップ** の全ノートを packed note id で返す
-    /// (FIXME #93)。各 id = `pack_note_id(clip_slot, local_index)`。ロック中クリップは選択対象に
+    /// Ctrl+A (ピアノロール): **表示中の全 MIDI クリップ** の全ノートを packed note id で返す。
+    /// 各 id = `pack_note_id(clip_slot, local_index)`。ロック中クリップは選択対象に
     /// しない (掴めないので除外)。表示クリップが無ければ空。
     pub fn all_shown_pianoroll_note_ids(&self) -> Vec<u32> {
         let shown = self.shown_pianoroll_clips();
@@ -14640,7 +14640,7 @@ impl AppData {
     /// を立てて return → piano_roll が初めて描画され grid_size が確定したフレームの
     /// Edit 内で再実行される (初回 fit 喪失バグの修正、 [piano_roll_view::draw] 参照)。
     fn fit_piano_roll_to_clip(&mut self) {
-        // FIXME #93: 表示中の **全 MIDI クリップ** の note bbox を union して zoom/scroll/pitch を
+        // 表示中の **全 MIDI クリップ** の note bbox を union して zoom/scroll/pitch を
         // 算出する。複数表示は song-absolute (note.start + clip.start_beat) で集計し共有 transient
         // viewport (`multi_clip_view`) に書く。単一表示は clip-local (= 旧挙動) で per-clip 永続
         // view に書く (regression なし)。scroll の座標系は read accessor (`piano_roll_view_state`)
@@ -14718,7 +14718,7 @@ impl AppData {
 
     /// 親 group chain のいずれかが `collapsed_groups` に含まれる (= 折り畳まれた
     /// group の配下で hide される) か。 arrangement widget の `is_visible_track`
-    /// と同じ判定を daw_01 側で行い、 mixer の strip 折り畳み (FIXME #7) が
+    /// と同じ判定を daw_01 側で行い、 mixer の strip 折り畳み が
     /// arrangement と同じ可視集合を共有する (`collapsed_groups` が SSoT)。
     /// 32 hop で cycle 安全。
     pub fn is_hidden_under_collapsed_group(&self, track_id: u32) -> bool {
@@ -14758,7 +14758,7 @@ impl AppData {
             .iter()
             .filter(|t| !self.is_hidden_under_collapsed_group(t.id))
             .count();
-        // FIXME #86: 展開中の automation lane も viewport を占める行なので、 行数に
+        // 展開中の automation lane も viewport を占める行なので、 行数に
         // 数え、 後で各 lane を同じ fit 行高へ scale する。 数えないと (旧挙動) lane
         // ぶんの高さが余計に積まれて content が溢れ、 かつ lane は model height_px の
         // ままなので「track だけ縮んで automation レーンが高いまま」 になる (ユーザー報告)。
@@ -14812,7 +14812,7 @@ impl AppData {
         //     override が残ると 1 track が巨大化して他が画面外に押し出される)。
         //   - `Z` の段階ズーム履歴 / アンカーをリセット (= 明示的な fit はズーム状態の
         //     終端。 残すと fit 後の `X` が古いズームへ巻き戻って状態が食い違う)。
-        //   - FIXME #86: automation lane も同じ fit 行高へ scale する session override を
+        //   - automation lane も同じ fit 行高へ scale する session override を
         //     張り直す (model height_px は保存対象なので汚さない)。 これで「track だけ
         //     縮んで automation レーンが高いまま」 を解消。 Z 拡大の残り override も
         //     ここで上書きされる。 splitter resize / fresh Z で個別に解除される。
@@ -14828,7 +14828,7 @@ impl AppData {
         }
     }
 
-    /// `Z` キーの段階ズーム (FIXME #34 / #86)。 選択素材 (通常 clip + automation
+    /// `Z` キーの段階ズーム。 選択素材 (通常 clip + automation
     /// clip) を arrangement に framing する。
     /// - 1 回目: bounding beat span を幅いっぱいに **横ズーム**。
     /// - 2 回目: **縦ズーム**。 automation clip を選んでいればその primary レーンを
@@ -14836,7 +14836,7 @@ impl AppData {
     ///   の session override)。 そうでなければ選択 clip の track 群を viewport に収める。
     /// - 3 回目以降: 何もしない (横+縦ズーム済み)。
     ///
-    /// **仕切り直し (FIXME #86)**: 直近 Z 以降に選択が変わった or ユーザーが手動で
+    /// **仕切り直し**: 直近 Z 以降に選択が変わった or ユーザーが手動で
     /// ズーム / スクロールした (= `arrange_zoom_anchor.applied_view` と現在 view が
     /// 食い違う) ときは段階を 0 に戻し、 新しい選択へ横ズームし直す。 これにより
     /// 「別 clip を選んで Z → その clip にズーム」「マウスでズームを変えた後の Z →
@@ -14880,7 +14880,7 @@ impl AppData {
         // fresh な横ズームは新しい zoom セッションの起点。 前セッションの lane 拡大
         // (一時 override) を破棄してから snapshot を撮る — snapshot に古い拡大を
         // 持ち越さないことで、 後で `X` / fit したとき automation レーンだけ高いまま
-        // 残るのを防ぐ (FIXME #86)。 override は lane-fill 中だけ存在する一時状態。
+        // 残るのを防ぐ。 override は lane-fill 中だけ存在する一時状態。
         self.automation_lane_row_overrides.clear();
         let snap = self.capture_arrange_view();
         self.arrange_zoom_history.push(snap);
@@ -15054,7 +15054,7 @@ impl AppData {
     }
 
     /// `X` キー (arrangement)。 ズーム履歴があれば 1 段戻し、 無ければ全体フィット
-    /// (= 「前のズームに戻る、 無ければ全体フィット」、 FIXME #34)。
+    /// (= 「前のズームに戻る、 無ければ全体フィット」)。
     fn arrange_zoom_back(&mut self) {
         if let Some(v) = self.arrange_zoom_history.pop() {
             self.arrange_zoom_x = v.zoom_x;
@@ -15167,7 +15167,7 @@ impl AppData {
     /// source の events を fade / gain / pan / pitch_ratio で mix した
     /// snapshot のみ。 plugin 効果込みの bounce は spec §3.8 "Bounce"
     /// (= 新 Clip + 新 track) で別 PR。
-    /// FIXME #42: bounce 用に「対象クリップの 1 トラックだけ」を残した Song を組む。
+    /// bounce 用に「対象クリップの 1 トラックだけ」を残した Song を組む。
     /// 他トラック・`master_fx_chain`・group/send/sidechain 参照を全て落とすので、engine の
     /// offline render はそのトラック単独の音だけを焼く (= clip isolate、 他トラックが
     /// 混ざらない)。`bypass_inserts == true` (Bounce In Place) のとき、残すトラックの
@@ -15195,7 +15195,7 @@ impl AppData {
         Some(isolated)
     }
 
-    /// FIXME #42: bounce 出力 WAV の path と `AudioSourcePath` を決める。保存済み
+    /// bounce 出力 WAV の path と `AudioSourcePath` を決める。保存済み
     /// project は `<dir>/bounce/<name>[_fx]_<ts>.wav`、未保存は bounce_cache (save 時に
     /// `migrate_unsaved_bounce_sources_into` が project へ移動 + ProjectRelative 化)。
     /// With FX は suffix `_fx` で In Place と区別する。失敗時は status_message を立てて `None`。
@@ -15248,7 +15248,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #42: bounce のトリガ共通処理。対象クリップ 1 トラックだけを isolate した
+    /// bounce のトリガ共通処理。対象クリップ 1 トラックだけを isolate した
     /// song を engine に LoadSong し、offline render を要求する。In Place は insert FX を
     /// バイパス (port 中和)、With FX は insert FX を通す。結果は完了通知 handler
     /// (`handle_bounce_clip_fx_complete`) が mode に応じて「同位置置換」/「新トラック +
@@ -15321,13 +15321,13 @@ impl AppData {
         self.status_message = format!("{label}: '{clip_name}' を render 中...");
     }
 
-    /// FIXME #42: In Place = 音源/synth の素の音 (insert FX 抜き) を engine offline
+    /// In Place = 音源/synth の素の音 (insert FX 抜き) を engine offline
     /// render で焼き、**同じクリップに置換** (async)。歌唱の合成待ちは `request_bounce` 経由。
     fn bounce_clip_in_place(&mut self, target: ClipRef) {
         self.request_bounce(target, BounceMode::InPlace);
     }
 
-    /// FIXME #42: track の builtin VOICEVOX device の host plugin_id を `loaded_slots`
+    /// track の builtin VOICEVOX device の host plugin_id を `loaded_slots`
     /// から引く (`sync_vocal_metadata` と同じ解決)。device 未挿入 / plugin_id 未確定
     /// (load 完了通知前) なら `None`。
     fn vocal_builtin_plugin_id(&self, track: &common::model::Track) -> Option<u32> {
@@ -15340,7 +15340,7 @@ impl AppData {
             .map(|s| s.plugin_id)
     }
 
-    /// FIXME #42: bounce の入口。歌唱トラックは合成が非同期 HTTP で走り、 offline render が
+    /// bounce の入口。歌唱トラックは合成が非同期 HTTP で走り、 offline render が
     /// 合成完了前に終わると無音になるため、 metadata を flush して `PrepareVocalSynth` を
     /// 送り、 plugin host の `VocalSynthReady`（builtin の synth 世代が最新メタデータまで
     /// 進んだ通知）を待ってから `start_clip_bounce` する。歌唱以外 (Audio / 通常 MIDI)、
@@ -15373,7 +15373,7 @@ impl AppData {
     /// IPC 経由で freewheel render 完了通知待ち)。 完了通知の handler
     /// (`handle_bounce_clip_fx_complete`) 内で Undo snapshot を 1 回だけ
     /// 取る。 既に bounce 進行中なら重複 request を拒否。
-    /// FIXME #42: With FX = 音源/synth + そのトラックの insert FX を engine offline
+    /// With FX = 音源/synth + そのトラックの insert FX を engine offline
     /// render で焼き、**新トラックに複製** + 元トラック自動ミュート (非破壊・二重再生
     /// 回避、async)。対象クリップ 1 トラックだけを isolate するので他トラックは混ざらない
     /// (旧実装は時間範囲の全ミックスを焼くバグがあった)。歌唱の合成待ちは `request_bounce` 経由。
@@ -15502,7 +15502,7 @@ impl AppData {
                     ..Default::default()
                 });
 
-                // FIXME #42: 二重再生回避のため元トラックを自動ミュート。 別 SetTrackMuted は
+                // 二重再生回避のため元トラックを自動ミュート。 別 SetTrackMuted は
                 // 不要 (下の sync_song_to_plugin_host が muted=true 込みの full song を LoadSong)。
                 if let Some(src) = self.song.tracks.get_mut(source_track as usize) {
                     src.muted = true;
@@ -15516,7 +15516,7 @@ impl AppData {
                 );
             }
             BounceMode::InPlace => {
-                // FIXME #42: 元クリップの content を bounce 結果 (single audio event) に
+                // 元クリップの content を bounce 結果 (single audio event) に
                 // 置換 (= flat 化)。 同 content_id を共有する linked clip も追従する。
                 let content_id = self
                     .song
@@ -15565,7 +15565,7 @@ impl AppData {
         self.mutate_audio_events_in_clip(target, |e| e.reversed = reversed);
     }
 
-    /// FIXME #80: `targets` の clip が **全て** muted なら `true` (空なら `false`)。`q` の
+    /// `targets` の clip が **全て** muted なら `true` (空なら `false`)。`q` の
     /// toggle 方向決定用 (全 muted → unmute、 1 つでも非 muted → 全 mute)。
     pub fn all_clips_muted(&self, targets: &[ClipRef]) -> bool {
         !targets.is_empty()
@@ -15578,10 +15578,10 @@ impl AppData {
             })
     }
 
-    /// FIXME #80: clip 内 `notes` (index) が **全て** muted なら `true` (空 / 非 MIDI は `false`)。
+    /// clip 内 `notes` (index) が **全て** muted なら `true` (空 / 非 MIDI は `false`)。
     /// `q` の note mute toggle 方向決定用。
     pub fn all_notes_muted(&self, notes: &[u32]) -> bool {
-        // FIXME #93: `notes` は packed note id。各 id を所属クリップへ decode し、 そのクリップの
+        // `notes` は packed note id。各 id を所属クリップへ decode し、 そのクリップの
         // 当該 note が muted か見る (toggle 方向 = 「全部 muted なら unmute」 を複数クリップ跨ぎで判定)。
         if notes.is_empty() {
             return false;
@@ -15600,7 +15600,7 @@ impl AppData {
         })
     }
 
-    /// FIXME #80: clip-level mute (`Clip.muted`) を設定する。MIDI / audio / video / image /
+    /// clip-level mute (`Clip.muted`) を設定する。MIDI / audio / video / image /
     /// 字幕 / 歌唱すべての content type 共通の単一 SSoT。`q` ショートカット (`SetClipsMuted`)、
     /// 各 inspector の "Mute" トグル (`DiscreteClipEdit::Muted` / `TextMuted`)、単発の
     /// `SetClipMuted` / `SetClipTextMuted` event がすべてここを経由する。変更があれば
@@ -15616,12 +15616,12 @@ impl AppData {
         }
     }
 
-    /// FIXME #80: clip の `ClipContent::Midi` 内 note (index 指定) の `Note.muted` を一括設定する。
+    /// clip の `ClipContent::Midi` 内 note (index 指定) の `Note.muted` を一括設定する。
     /// `selected_notes` と同じ index 空間。linked clip は content (= notes) を共有するので
     /// mute も linked clip 間で共有される。変更があれば `sync_song_to_plugin_host` で flush
     /// (sequencer が muted note を skip して再生・書き出しから除外)。
     fn set_notes_muted(&mut self, notes: &[u32], muted: bool) {
-        // FIXME #93: `notes` は packed note id。所属クリップごとに分配し、各クリップの
+        // `notes` は packed note id。所属クリップごとに分配し、各クリップの
         // 当該 note の mute を設定する (locked クリップは for_each_note_clip_group が除外)。
         let mut changed = false;
         self.for_each_note_clip_group(
@@ -15676,7 +15676,7 @@ impl AppData {
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
-    /// FIXME #15: audio inspector の数値 field は scrubable_number 化され
+    /// audio inspector の数値 field は scrubable_number 化され
     /// 現値を summary から直接読むため、 専用 edit buffer は撤去。 この関数
     /// は text section と共有する `clip_edit_buffer_target` を current audio
     /// clip に同期する純 marker (= 多数の audio 編集パス / song 差し替えから
@@ -15997,7 +15997,7 @@ impl AppData {
         self.set_clip_text_event_font_family(target, value);
     }
 
-    // -------- Font picker (FIXME #25) -------------------------------------
+    // -------- Font picker -------------------------------------
 
     /// 編集対象 text クリップの現在のフォント名 (先頭 event)。text クリップで
     /// なければ `None`。
@@ -16127,7 +16127,7 @@ impl AppData {
 
     /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo / lane
     /// override 変化等で文字列 edit buffer (content / font_family) を current
-    /// TextEvent の値で再構築。 FIXME #15: 25 numeric field は scrubable_number
+    /// TextEvent の値で再構築。 25 numeric field は scrubable_number
     /// 化され現値を summary から直接読むため、 数値 buffer の再生成は不要に
     /// なった。 target が Text variant でないなら文字列 buffer を空にして
     /// `clip_edit_buffer_target` を `None`。
@@ -16175,7 +16175,7 @@ impl AppData {
         }
         Some(InspectorTextEventSummary {
             target: cref,
-            // FIXME #80: "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
+            // "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
             muted: clip.muted,
             align: event.align,
             fade_in_curve: event.fade_in_curve,
@@ -16216,7 +16216,7 @@ impl AppData {
         self.mutate_image_events_in_clip(target, |e| e.fade_out_curve = curve);
     }
 
-    /// FIXME #15: image inspector の数値 field は scrubable_number 化され
+    /// image inspector の数値 field は scrubable_number 化され
     /// 現値を summary から直接読むため、 専用 edit buffer は撤去。 この関数
     /// は text section と共有する `clip_edit_buffer_target` を current image
     /// clip に同期する純 marker (= image 編集パス各所から呼ばれる)。 target
@@ -16262,7 +16262,7 @@ impl AppData {
         )
     }
 
-    /// FIXME #93: ピアノロール対象 (= MIDI content) クリップか。歌唱 (VOICEVOX) クリップも
+    /// ピアノロール対象 (= MIDI content) クリップか。歌唱 (VOICEVOX) クリップも
     /// MIDI content なので true (歌詞付き note としてピアノロールに出る)。範囲外 / 非 MIDI は false。
     pub fn is_midi_clip(&self, target: ClipRef) -> bool {
         let Some(track) = self.song.tracks.get(target.track as usize) else {
@@ -16293,7 +16293,7 @@ impl AppData {
         }
         self.audio_editor_clip = Some(target);
         self.bottom_panel = 1;
-        // FIXME #87: per-clip 記憶。 初回 (entry 無し) のクリップだけ「全体表示」の初期 view を
+        // per-clip 記憶。 初回 (entry 無し) のクリップだけ「全体表示」の初期 view を
         // 入れる。 既に記憶があればその view を復元 (= map をそのまま読む)。
         let Some(key) = self.clip_key_of(target) else { return };
         if !self.audio_editor_views.contains_key(&key) {
@@ -16314,7 +16314,7 @@ impl AppData {
     }
 
     fn close_audio_editor(&mut self) {
-        // FIXME #87: view 状態は `audio_editor_views` に残す (= 次回 open で復元)。
+        // view 状態は `audio_editor_views` に残す (= 次回 open で復元)。
         self.audio_editor_clip = None;
         self.audio_editor_selected_events.clear();
         self.audio_editor_hover_beat_in_clip = None;
@@ -16853,11 +16853,11 @@ impl AppData {
     /// 配列範囲外) ので、 単純な後方スライドのみ。
     ///
     /// 右端 trim (delta_start == 0): length_beats を変え、 audio event は
-    /// `source_end_frames` を event 長に **lockstep** させる (FIXME #61。 旧実装は
+    /// `source_end_frames` を event 長に **lockstep** させる (旧実装は
     /// event 長を clamp するだけで source 窓を動かさず、 波形が clip 幅に
     /// rubber-band されて「見た目だけ伸縮・音は range」 という矛盾になっていた)。
     ///
-    /// FIXME #61: `stretch == true` (Shift + 端 drag) は trim ではなく
+    /// `stretch == true` (Shift + 端 drag) は trim ではなく
     /// **time-stretch** (= 内容を新 clip 長に伸縮)。 `stretch_clip_content` 参照。
     fn resize_clip(
         &mut self,
@@ -16884,7 +16884,7 @@ impl AppData {
         };
         let delta_start = new_start_beat - prev_start_beat;
 
-        // FIXME #61: Shift + 端 drag = time-stretch。 content を新 clip 長に
+        // Shift + 端 drag = time-stretch。 content を新 clip 長に
         // 伸縮し (audio は source 窓固定で event 長変更 + Raw→Stretch 昇格、
         // MIDI は note を比例 scale)、 trim とは別経路で処理する。
         if stretch {
@@ -16917,7 +16917,7 @@ impl AppData {
             }
         }
 
-        // FIXME #6: overlay clip (image / video / text) は「clip 長 = 表示長」が
+        // overlay clip (image / video / text) は「clip 長 = 表示長」が
         // 不変条件。 Audio/Midi では no-op、 overlay の末尾 event だけ新 clip 長
         // まで extend する (extend-only / idempotent / linked clip 安全)。
         if let Some(content) = self.song.clip_contents.get_mut(&content_id) {
@@ -16927,7 +16927,7 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// FIXME #61: trim (= 再生範囲を変える) の 1 audio event 分の追従。 source 窓
+    /// trim (= 再生範囲を変える) の 1 audio event 分の追従。 source 窓
     /// (`source_start/end_frames`) と event 長 (`event_length_beats`) を
     /// **lockstep** させる (= 現在の frames-per-beat 比を保ったまま窓を動かす)。
     /// これで (a) 右端を縮めると source_end も縮んで波形が crop 表示になり、
@@ -17017,7 +17017,7 @@ impl AppData {
             .min(source_frames);
     }
 
-    /// FIXME #61: Shift + 端 drag = time-stretch。 clip 内容を新 clip 長に伸縮する。
+    /// Shift + 端 drag = time-stretch。 clip 内容を新 clip 長に伸縮する。
     /// audio は source 窓 (`source_start/end_frames`) を **固定**して event 長のみ
     /// 変え (engine が `stretch_ratio = native/event 長` で warp 再生)、 Raw は
     /// pitch 保持の `Stretch` (granular) へ昇格 (= ピッチ保持が既定)。 MIDI は
@@ -17137,9 +17137,9 @@ impl AppData {
         let new_length = src_clip.length_beats;
         let content_id = src_clip.content_id;
         let src_color = src_clip.color;
-        // FIXME #80: mute 状態も複製先へ引き継ぐ (color / 声 と同様)。
+        // mute 状態も複製先へ引き継ぐ (color / 声 と同様)。
         let src_muted = src_clip.muted;
-        // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
+        // per-clip 声を複製先へ引き継ぐ。
         let src_speaker = src_clip.speaker_id;
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
@@ -17181,9 +17181,9 @@ impl AppData {
         let new_length = src_clip.length_beats;
         let src_content_id = src_clip.content_id;
         let src_color = src_clip.color;
-        // FIXME #80: mute 状態も複製先へ引き継ぐ。
+        // mute 状態も複製先へ引き継ぐ。
         let src_muted = src_clip.muted;
-        // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
+        // per-clip 声を複製先へ引き継ぐ。
         let src_speaker = src_clip.speaker_id;
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
@@ -17210,7 +17210,7 @@ impl AppData {
         Some(ClipRef { track: source.track, clip: new_idx })
     }
 
-    /// FIXME #21: 選択 clip 群をまとめて共有複製 (D shortcut)。 選択ブロック span
+    /// 選択 clip 群をまとめて共有複製 (D shortcut)。 選択ブロック span
     /// だけ後ろにずらして相対位置を保ったまま複製し (Ctrl+drag と同じセマンティ
     /// クス)、 複製群を選択にする。 D 連打で後方連鎖する。
     fn duplicate_clips_shared(&mut self, sources: &[ClipRef]) {
@@ -17239,7 +17239,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #21: 選択 clip 群をまとめて独立複製 (Alt+D shortcut)。 配置・選択は
+    /// 選択 clip 群をまとめて独立複製 (Alt+D shortcut)。 配置・選択は
     /// `duplicate_clips_shared` と同じ、 各 clip の content を独立化する点が違う。
     fn duplicate_clips_unique(&mut self, sources: &[ClipRef]) {
         let Some(offset) = self.clip_block_span(sources) else {
@@ -17285,9 +17285,9 @@ impl AppData {
             // source の色を引き継ぐ。
             let content_id = src_clip.content_id;
             let src_color = src_clip.color;
-            // FIXME #80: mute 状態も複製先へ引き継ぐ。
+            // mute 状態も複製先へ引き継ぐ。
             let src_muted = src_clip.muted;
-            // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
+            // per-clip 声を複製先へ引き継ぐ。
             let src_voice = (
                 src_clip.speaker_id,
                 src_clip.singer_name.clone(),
@@ -17344,9 +17344,9 @@ impl AppData {
             // 独立コピー: content + 名前を fork。色 (per-clip) は source の色を引き継ぐ。
             let src_content_id = src_clip.content_id;
             let src_color = src_clip.color;
-            // FIXME #80: mute 状態も複製先へ引き継ぐ。
+            // mute 状態も複製先へ引き継ぐ。
             let src_muted = src_clip.muted;
-            // (FIXME #36) per-clip 声を複製先へ引き継ぐ。
+            // per-clip 声を複製先へ引き継ぐ。
             let src_voice = (
                 src_clip.speaker_id,
                 src_clip.singer_name.clone(),
@@ -17430,7 +17430,7 @@ impl AppData {
         };
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
-        // (FIXME #36) vocal track の新規 clip は声を引き継ぐ: 同トラックの
+        // vocal track の新規 clip は声を引き継ぐ: 同トラックの
         // 直前 (= start_beat 最大の既存) clip の声、 無ければアプリ既定
         // (中国うさぎ ノーマル)。 非 vocal track では声は未設定 (0)。
         let (speaker_id, singer_name, style_name) =
@@ -17601,7 +17601,7 @@ impl AppData {
                 "対象 note は既に in-scale です".to_string();
             return;
         }
-        // FIXME #83: pitch 補正で異なる pitch が同一 pitch に丸まると同一ピッチの
+        // pitch 補正で異なる pitch が同一 pitch に丸まると同一ピッチの
         // 重なりが生じ得るので、補正した note を勝者として重なり解消する。
         let winners: Vec<u32> = snaps.iter().map(|&(i, _)| i).collect();
         let mut remap: Option<Vec<Option<u32>>> = None;
@@ -17668,14 +17668,14 @@ impl AppData {
             lyric: None,
             muted: false,
         });
-        // FIXME #83: 追加した note を勝者として同一ピッチの重なりを解消。
+        // 追加した note を勝者として同一ピッチの重なりを解消。
         let remap = resolve_note_overlaps(notes, &[new_idx]);
         let selected = remap_indices(&remap, &[new_idx]);
         let r = ClipRef {
             track: track_idx,
             clip: clip_idx,
         };
-        // FIXME #93: 新規ノートは「対象クリップ」(= anchor) へ入る。anchor をこのクリップに
+        // 新規ノートは「対象クリップ」(= anchor) へ入る。anchor をこのクリップに
         // 揃えるが、複数選択 (selected_clips) は **縮小しない** (複数同時表示を保持)。対象が
         // まだ選択集合に無ければ追加する (他クリップは残す)。
         if let Some(key) = self.clip_key_of(r) {
@@ -17684,14 +17684,14 @@ impl AppData {
                 self.selected_clips.push(key);
             }
         }
-        // FIXME #93: 選択は packed note id。対象クリップの clip_slot (= shown 内位置) で pack。
+        // 選択は packed note id。対象クリップの clip_slot (= shown 内位置) で pack。
         self.selected_notes = self.pack_clip_selection(r, &selected);
         self.last_note_duration_beats = duration;
         self.sync_song_to_plugin_host();
     }
 
     fn set_note_positions(&mut self, entries: &[(u32, f64, u8)]) {
-        // FIXME #93: entries の `u32` は packed note id (clip_slot|local index)。所属クリップ
+        // entries の `u32` は packed note id (clip_slot|local index)。所属クリップ
         // ごとに分配し、各クリップ内 local index で位置を書き換える。`beat` は view が既に
         // 各 note の所属クリップ clip-local に戻している (per-note offset)。
         let snap_on_draw = self.snap_on_draw;
@@ -17717,7 +17717,7 @@ impl AppData {
                         (local, beat, new_pitch)
                     })
                     .collect();
-                // FIXME #83: 移動した note を勝者として重なり解消。既存選択 (packed) を
+                // 移動した note を勝者として重なり解消。既存選択 (packed) を
                 // edit_clip_notes が当該クリップ分だけ remap で追従させる。
                 app.edit_clip_notes(slot, r, move |notes| {
                     let mut winners = Vec::with_capacity(snapped.len());
@@ -17736,14 +17736,14 @@ impl AppData {
     }
 
     fn resize_notes(&mut self, entries: &[(u32, f64, f64)]) {
-        // FIXME #93: packed id を所属クリップごとに分配してリサイズ。`start` は view が
+        // packed id を所属クリップごとに分配してリサイズ。`start` は view が
         // 各 note の所属クリップ clip-local に戻している。
         self.for_each_note_clip_group(
             entries.iter().map(|&(id, start, dur)| (id, (start, dur))),
             |app, slot, r, items| {
                 let updates: Vec<(usize, f64, f64)> =
                     items.iter().map(|&(local, (s, d))| (local, s, d)).collect();
-                // FIXME #83: リサイズした note を勝者として重なり解消。既存選択 (packed) は
+                // リサイズした note を勝者として重なり解消。既存選択 (packed) は
                 // edit_clip_notes が remap で追従。
                 app.edit_clip_notes(slot, r, move |notes| {
                     let mut winners = Vec::with_capacity(updates.len());
@@ -17769,7 +17769,7 @@ impl AppData {
     /// 複製を新しい選択にする (連打で後方へ連鎖)。selected_clip 無し /
     /// 選択空 / clip 解決失敗なら no-op。
     fn duplicate_selected_notes(&mut self) {
-        // FIXME #93: 選択 (packed) を所属クリップごとに複製。各クリップ内でその選択分の
+        // 選択 (packed) を所属クリップごとに複製。各クリップ内でその選択分の
         // beat span ぶん後ろへずらす (元は据え置き)。新しい選択 = 全クリップの複製 (packed)。
         if self.selected_notes.is_empty() {
             return;
@@ -17785,7 +17785,7 @@ impl AppData {
                 {
                     let new_ids = duplicate_notes_into(notes, &locals);
                     if !new_ids.is_empty() {
-                        // FIXME #83: 複製を勝者として重なり解消 (元と密接な複製は元を据え置く)。
+                        // 複製を勝者として重なり解消 (元と密接な複製は元を据え置く)。
                         let remap = resolve_note_overlaps(notes, &new_ids);
                         for nid in remap_indices(&remap, &new_ids) {
                             new_selection.push(Self::pack_note_id(slot, nid as usize));
@@ -17804,7 +17804,7 @@ impl AppData {
     /// new_start_beat, new_pitch)]。各 source を deep clone して指定位置へ配置し
     /// (元は据え置き)、複製を新選択にする。selected_clip 無し / 該当 index 無しなら no-op。
     fn copy_notes(&mut self, entries: &[(u32, f64, u8)]) {
-        // FIXME #93: packed id を所属クリップごとに分配し、各 source を同じクリップ内へ複製。
+        // packed id を所属クリップごとに分配し、各 source を同じクリップ内へ複製。
         // 新しい選択 = 全クリップの複製 (packed で再構成)。`beat` は view が clip-local 化済。
         let mut new_selection: Vec<u32> = Vec::new();
         self.for_each_note_clip_group(
@@ -17819,7 +17819,7 @@ impl AppData {
                 {
                     let new_ids = copy_notes_into(notes, &local_entries);
                     if !new_ids.is_empty() {
-                        // FIXME #83: コピーを勝者として重なり解消。複製の local id を packed 化。
+                        // コピーを勝者として重なり解消。複製の local id を packed 化。
                         let remap = resolve_note_overlaps(notes, &new_ids);
                         for nid in remap_indices(&remap, &new_ids) {
                             new_selection.push(Self::pack_note_id(slot, nid as usize));
@@ -17852,14 +17852,14 @@ impl AppData {
             return;
         };
         note.duration_beats = new_duration;
-        // FIXME #83: リサイズした note を勝者として重なり解消。既存選択は remap で追従。
+        // リサイズした note を勝者として重なり解消。既存選択は remap で追従。
         let remap = resolve_note_overlaps(notes, &[note_idx]);
         let sel = std::mem::take(&mut self.selected_notes);
         self.selected_notes = remap_indices(&remap, &sel);
         self.sync_song_to_plugin_host();    }
 
     fn delete_selected_notes(&mut self) {
-        // FIXME #93: 選択 (packed) を所属クリップごとに分配し、各クリップ内で index 降順に
+        // 選択 (packed) を所属クリップごとに分配し、各クリップ内で index 降順に
         // remove (削除で後続 index がずれない)。複数クリップに跨る選択をまとめて消す。
         if self.selected_notes.is_empty() {
             return;
@@ -17884,7 +17884,7 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// (FIXME #36) per-clip 声を設定。 Clip Inspector の 2 段 dropdown から
+    /// per-clip 声を設定。 Clip Inspector の 2 段 dropdown から
     /// `SetClipVoice` 経由で呼ばれる。 stable `ClipKey` で対象 clip を引き、
     /// 声 3 値を焼き込んで builtin へ再 flush (= 新しい声で再合成)。
     fn set_clip_voice(
@@ -17963,7 +17963,7 @@ impl AppData {
         self.mark_lipsync_dirty();
     }
 
-    /// (FIXME #36) VOICEVOX engine が ready になったら `/singers` を取得して
+    /// VOICEVOX engine が ready になったら `/singers` を取得して
     /// `SingersLoaded` を発行する (既存の死に配線を初めて発火させる)。 engine
     /// 起動 (`ensure_voicevox_engine`) と「再取得」(`RefetchSingers`) から呼ぶ。
     /// background thread (= ready 待ち + blocking HTTP) で走らせる。
@@ -18027,7 +18027,7 @@ impl AppData {
     // -------- Plugin GUI bridge --------------------------------------------
 
     fn on_gui_opened(&mut self, _track: u32, _index: u32, _width: u32, _height: u32) {
-        // FIXME #31: the editor window is created, sized, and owned by the
+        // the editor window is created, sized, and owned by the
         // plugin-host process. daw_gui only records open state (done in
         // `open_slot_gui` when the request is sent), so there's nothing to do
         // on the opened confirmation. Plugin-initiated resize is likewise
@@ -18251,7 +18251,7 @@ impl AppData {
         // slot 単位 cache からも、 同 plugin_id を持つ entry を retain で外す。
         self.loaded_slots
             .retain(|_, info| info.plugin_id != plugin_id);
-        // FIXME #90: builtin VOICEVOX が外れたら合成状態 entry も消す (busy のまま残ると
+        // builtin VOICEVOX が外れたら合成状態 entry も消す (busy のまま残ると
         // overlay / スピナーが消えない)。plugin host の deactivate も idle を報告するが二重防御。
         self.voicevox_synth_status.remove(&plugin_id);
         // PR3.3: drop the latency entry for the destroyed plugin and
@@ -18313,7 +18313,7 @@ impl AppData {
         let Some(track_id) = self.cursor_track_id() else {
             return;
         };
-        // FIXME #54 Wave4: 内蔵映像 FX は plugin window を持たない。"GUI" ボタンは
+        // 内蔵映像 FX は plugin window を持たない。"GUI" ボタンは
         // インスペクタ内のパラメータ調整パネルをトグルする (plugin window は開かない)。
         // Transform も同様にトグル開閉 (開くと Group Transform セクションが出る。出っぱなしにしない)。
         let device = self
@@ -18337,7 +18337,7 @@ impl AppData {
             };
             return; // 映像 device は plugin window を持たない。
         }
-        // FIXME #78: 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
+        // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
         // CLAP・VST3) は editor window を開けない。 代わりにインスペクタ内の汎用
         // param パネル (`open_plugin_params`) をトグルする。 builtin は format から
         // 即断 (PluginParamList 到着前でも正しく分岐)、 外部 plugin は host の
@@ -18360,7 +18360,7 @@ impl AppData {
             return;
         }
         // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
-        // FIXME #31: open 状態は open_plugin_guis (id set) で追跡。実 window は
+        // open 状態は open_plugin_guis (id set) で追跡。実 window は
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
         // B 側に破棄させ、SlotGuiClosed の受信で set から除去する。
         if self.open_plugin_guis.contains(&(track_id, index)) {
@@ -18394,7 +18394,7 @@ impl AppData {
                     .and_then(|t| self.slot_ref_name(t, index))
                     .unwrap_or_else(|| "(unknown)".into())
             };
-            // FIXME #31: the editor's top-level window is created by the
+            // the editor's top-level window is created by the
             // plugin-host process (so JUCE cascade sub-menus work). daw_gui
             // only records open state and passes the window title.
             //
@@ -18714,7 +18714,7 @@ impl AppData {
             })
     }
 
-    /// FIXME #56: generator (LFO/Random/MSEG/Steps) 設定の編集。`scrub` は連続
+    /// generator (LFO/Random/MSEG/Steps) 設定の編集。`scrub` は連続
     /// ドラッグ系 (per-frame の recompile を避け dirty のみ、 drag-end で sync)。
     fn edit_mod_source(&mut self, id: u32, edit: ModSourceEdit) {
         use common::model::ModSourceKind;
@@ -18983,7 +18983,7 @@ impl AppData {
     }
 
     fn set_mod_source_tap_point(&mut self, id: u32, tap_point: common::model::TapPoint) {
-        // FIXME #56: tap は EnvelopeFollower{tap} 内に内包 (generator には無い)。
+        // tap は EnvelopeFollower{tap} 内に内包 (generator には無い)。
         // dbfed6c の 3 段 TapPoint (PreFx/PostFx/PostFader) をそのまま設定。
         if let Some((tap, _)) = self.mod_source_follower_mut(id) {
             tap.tap_point = tap_point;
@@ -19039,7 +19039,7 @@ impl AppData {
     /// device を `Vec::remove` する。host への RemoveSlotPlugin + GUI cleanup +
     /// cache 削除 + 後続 index shift を行う。
     fn remove_device_inner(&mut self, track_id: u32, index: u32) {
-        // **GUI lifecycle** (FIXME #31): close the editor BEFORE removing the
+        // **GUI lifecycle**: close the editor BEFORE removing the
         // plugin. cleanup_slot_gui sends CloseSlotGui so the plugin-host tears
         // the editor window down while the plugin is still at this index —
         // after RemoveSlotPlugin the chain shifts (Vec::remove), so a
@@ -19047,12 +19047,12 @@ impl AppData {
         // also closes the editor by stable plugin id as a backstop, and shifts
         // the remaining open-state keys to match the new chain indices.
         self.cleanup_slot_gui(track_id, index);
-        // FIXME #54 Wave4: 開いている映像 FX param パネルが同トラックなら閉じる
+        // 開いている映像 FX param パネルが同トラックなら閉じる
         // (削除で device index がずれて別 device を指すのを防ぐ)。
         if self.open_video_fx_params.is_some_and(|(t, _)| t == track_id) {
             self.open_video_fx_params = None;
         }
-        // FIXME #78: 汎用 param パネルも同様に閉じる。
+        // 汎用 param パネルも同様に閉じる。
         if self.open_plugin_params.is_some_and(|(t, _)| t == track_id) {
             self.open_plugin_params = None;
         }
@@ -19097,7 +19097,7 @@ impl AppData {
         {
             track.source = InstrumentSource::None;
         }
-        // FIXME #54 Wave3: Transform 配置 device を外したら group_transform を消す
+        // Transform 配置 device を外したら group_transform を消す
         // (device-gate で配置は即無効になるが、残すと ensure_ids が次回ロードで device を
         // 再生成してしまう)。同 track に別の Transform device が残っていれば保持。
         if track_id != common::model::MASTER_TRACK_ID
@@ -19142,7 +19142,7 @@ impl AppData {
         for (idx, v) in pmoves {
             self.plugin_params.insert((track_id, idx), v);
         }
-        // slot_has_gui (FIXME #78): plugin_params と同じ index シフト。
+        // slot_has_gui: plugin_params と同じ index シフト。
         let mut gmoves: Vec<(u32, bool)> = Vec::new();
         self.slot_has_gui.retain(|&(t, idx), v| {
             if t == track_id && idx > index {
@@ -19159,7 +19159,7 @@ impl AppData {
 
     /// `(track_id, device_index)` のプラグイン GUI を閉じ、 同 track の後続
     /// device (= `idx > index`) の open-state key を 1 つずつ前にずらす
-    /// (`Vec::remove` 後の chain index と整合させるため)。 FIXME #31: 実 window
+    /// (`Vec::remove` 後の chain index と整合させるため)。 実 window
     /// は plugin-host プロセス所有なので、 破棄は `CloseSlotGui` を送って B 側に
     /// 行わせる。 RemoveSlotPlugin / RemoveTrack も B 側で window を破棄するので
     /// 二重でも idempotent。
@@ -19200,7 +19200,7 @@ impl AppData {
     /// queue に後続がある場合は次の `RequestAllStates` を改めて発行し、
     /// 連続 deferred edit が個別に最新 state を捕まえられるようにする。
     fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
-        // FIXME #64: in-flight だった round-trip の応答が来た。 watchdog の deadline を
+        // in-flight だった round-trip の応答が来た。 watchdog の deadline を
         // 解除する。 この後 queue に後続があれば dispatch_front_state_request が再武装する。
         self.state_request_sent_at = None;
         // live song の plugin state を最新化する (= dirty 判定の整合と、
@@ -19261,7 +19261,7 @@ impl AppData {
                 self.execute_deferred_edit(edit);
             }
             PendingStateRequest::CopyToClipboard { track_ids } => {
-                // FIXME #33: copy は Song 不変なので undo を積まない。最新 state
+                // copy は Song 不変なので undo を積まない。最新 state
                 // 込みで serialize して pending_clipboard_write に積むだけ。
                 self.copy_tracks_inner(&track_ids);
             }
@@ -19275,7 +19275,7 @@ impl AppData {
         if !self.pending_state_queue.is_empty() {
             self.dispatch_front_state_request();
         } else if let Some(action) = self.guard_pending_action.take() {
-            // FIXME #63: round-trip が全て drain した。 in-flight 中に保留していた
+            // round-trip が全て drain した。 in-flight 中に保留していた
             // ガード操作 (New/Open/Open Recent/終了) を、 deferred edit / save 反映後の
             // **最新 dirty 状態で再評価** する (= clean なら実行、 dirty なら確認モーダル)。
             // queue は空なので破壊操作も安全に走る。
@@ -19305,7 +19305,7 @@ impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
     fn on_tick(&mut self, playhead_samples: u64, peak_l_raw: f32, peak_r_raw: f32) {
-        // FIXME #60: パニックの遅延 reinit を発火する。 master の declick フェード
+        // パニックの遅延 reinit を発火する。 master の declick フェード
         // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を
         // 送ることで、 plugin を mix から外す detach が master ミュート後に起き、
         // 段差クリック (「ビープ」) を出さずに reverb tail / 全 plugin 状態をクリア
@@ -19336,7 +19336,7 @@ impl AppData {
                 "音声エンジンが応答しないため書き出しを中止しました".into(),
             );
         }
-        // FIXME #64: plugin host が crash でなく hang した場合 (プロセス・パイプは
+        // plugin host が crash でなく hang した場合 (プロセス・パイプは
         // 生存のまま state_save 等で停止) は ChildDisconnected も発火せず、
         // RequestAllStates の応答が永久に来ない。 すると pending_state_queue が
         // drain せず保存 / New / Open / Open Recent / 終了(✕) が恒久ロックする
@@ -19353,7 +19353,7 @@ impl AppData {
             )
             .map(|b| b as f32)
         };
-        // FIXME #41 (A1): 曲末に達したら engine の auto-stop (engine.rs の
+        // 曲末に達したら engine の auto-stop (engine.rs の
         // `song_ended` 判定で playing=false) に合わせて GUI 側 transport も止め、
         // 再生開始位置 (origin) へ戻す。Tick は playing 状態を運ばないので、engine
         // と同一の `song_ended` 述語 (= 停止境界がサンプル単位で一致) を使って GUI
@@ -19409,7 +19409,7 @@ impl AppData {
             let _inserted = self.record_automation_points_for_tick(f64::from(ph));
         }
 
-        // FIXME #31: the plugin editor's ✕ is now handled inside the
+        // the plugin editor's ✕ is now handled inside the
         // plugin-host process (its WNDPROC), which tears the GUI down and
         // sends `SlotGuiClosed` back. daw_gui no longer polls a local
         // close flag here.
@@ -19783,7 +19783,7 @@ impl AppData {
     fn resync_song_edit_texts(&mut self) {
         self.bpm_edit_text = format!("{:.1}", self.song.bpm);
         self.time_sig_num_edit_text = self.song.time_sig.0.to_string();
-        // FIXME #15: clip 数値 field は scrubable_number 化され専用 buffer は
+        // clip 数値 field は scrubable_number 化され専用 buffer は
         // 撤去。 共有 `clip_edit_buffer_target` だけ song 差し替え (open / new
         // / undo / redo) に追従させる。 selected_clip が image / text の場合は
         // 次フレームの view 側 target 不一致検知で正しい resync が走るため、
@@ -19850,7 +19850,7 @@ impl AppData {
             self.song.tracks[track_idx].devices.len() as u32
         };
 
-        // FIXME #54: 内蔵映像効果は GUI 描画パスで処理する device。plugin_host に
+        // 内蔵映像効果は GUI 描画パスで処理する device。plugin_host に
         // load せず (load_builtin に該当無し)、モデルへ append するだけ。engine の
         // `process_track_owned` は `slot_to_plugin_id` 未登録の index を skip し
         // (= 音声バス素通り)、append は既存 device の index をずらさないので
@@ -19885,7 +19885,7 @@ impl AppData {
             let track = &mut self.song.tracks[track_idx];
             let added_transform = new_device.plugin_id == common::video_fx::TRANSFORM_ID;
             track.devices.push(new_device);
-            // FIXME #54 Wave3: Transform 配置 device を刺したら group_transform を有効化
+            // Transform 配置 device を刺したら group_transform を有効化
             // (resolve_track_transform は device-gate + group_transform 値。未初期化なら
             // identity 配置で no-op になり、inspector で編集を始められない)。
             if added_transform && track.group_transform.is_none() {
@@ -19898,7 +19898,7 @@ impl AppData {
             // legacy migration (`migrate_legacy_vocal_tracks`) の入力として残す。
             // それ以外の device を挿しても既存の vocal 状態は変えない。
             if is_voicevox {
-                // (FIXME #36) 声は per-clip (`Clip::speaker_id`)。 トラックは
+                // 声は per-clip (`Clip::speaker_id`)。 トラックは
                 // 「VOICEVOX で鳴らす」 印 (unit marker) のみ持つ。
                 track.source = InstrumentSource::Vocal;
             }
@@ -19953,7 +19953,7 @@ impl AppData {
                 }
             }
         });
-        // (FIXME #36) engine が立ち上がる (or 既に起動中) のと並行して
+        // engine が立ち上がる (or 既に起動中) のと並行して
         // /singers を取得し、 Clip Inspector の声 dropdown を埋める。
         self.spawn_fetch_singers();
         // (talk) /speakers (talk 声一覧) も取得し、 Text clip Inspector の talk 声
@@ -19972,7 +19972,7 @@ impl AppData {
         let proxy = self.event_proxy.clone();
         std::thread::spawn(move || match common::plugin_db::scan_system() {
             Ok(mut db) => {
-                // FIXME #29: VST3 / CLAP とも descriptor からは port 構成が分からない
+                // VST3 / CLAP とも descriptor からは port 構成が分からない
                 // (VST3 は category tag 無し、 CLAP は feature に note 出力の有無が無い)。
                 // 各プラグインを使い捨て probe プロセスで起動して note in/out・audio out
                 // を読み、 PluginEntry の 3 bool (capability の SSoT) を更新する。 probe
@@ -20009,7 +20009,7 @@ impl AppData {
                 if total > 0 {
                     proxy.send(AppEvent::RescanProgress { done: total, total });
                 }
-                // FIXME #29 Step 7: probe 済みを示す版を立てる (起動時の自動再 probe 判定用)。
+                // probe 済みを示す版を立てる (起動時の自動再 probe 判定用)。
                 db.port_probe_version = common::plugin_db::PORT_PROBE_VERSION;
                 if let Some(cache) = common::plugin_db::default_cache_path()
                     && let Err(e) = db.save_to_file(&cache)
@@ -20034,7 +20034,7 @@ impl AppData {
 
     fn finish_rescan(&mut self) {
         self.is_rescanning = false;
-        // 走査進捗 overlay を消す (FIXME #26 Phase B)。
+        // 走査進捗 overlay を消す (Phase B)。
         self.load_progress = None;
         let Some(new_db) = self.rescan_result.lock().ok().and_then(|mut g| g.take()) else {
             return;
@@ -20318,7 +20318,7 @@ impl AppData {
     }
 
     fn refresh_picker_visible(&mut self) {
-        // master bus は audio FX と **映像効果** を持てる (FIXME #54 Wave1: master 映像
+        // master bus は audio FX と **映像効果** を持てる (Wave1: master 映像
         // チェーン = master_fx_chain の video device を最終合成 1 枚に apply_chain)。master
         // 選択中は FX / Video のみ出す (instrument / midi-fx は master に挿せない)。通常
         // トラックは全カテゴリ混合で見せ、種別は選択時に features から自動振り分け。
@@ -20364,7 +20364,7 @@ impl AppData {
             .unwrap_or_else(|| plugin_id.to_string())
     }
 
-    /// FIXME #55: レンジピッカーを開くときの既定範囲 (拍)。 ループ範囲が設定
+    /// レンジピッカーを開くときの既定範囲 (拍)。 ループ範囲が設定
     /// されていれば (`loop_end_beat > loop_start_beat`) それを既定にし、 無ければ
     /// 全曲 (0..length_beats) にフォールバックする。 ループ範囲は `Song` が所有する
     /// SSoT (`common/src/model.rs`) で、 transport の再生ループと同じ値を使う
@@ -20380,7 +20380,7 @@ impl AppData {
         (start, end.max(start + MIN_EXPORT_RANGE_BEATS))
     }
 
-    /// FIXME #55: Export WAV / Video を押したときに、 まず書き出す **時間範囲**
+    /// Export WAV / Video を押したときに、 まず書き出す **時間範囲**
     /// (拍) を選ぶレンジピッカーモーダルを開く。 デフォルト窓は `default_export_range`
     /// = ループ範囲 (設定されていれば) / 無ければ全曲。 確定 (`ConfirmExportRange`)
     /// で `kind` に応じた既存の export action (file dialog) を起動する。 Ardour /
@@ -20401,14 +20401,14 @@ impl AppData {
             start_beat,
             end_beat,
             kind,
-            // FIXME #79: 既定はプロジェクト現在値 (= 1920x1080 / 30)。 dropdown で
+            // 既定はプロジェクト現在値 (= 1920x1080 / 30)。 dropdown で
             // 変更した値は per-export override として確定時に運ばれる。
             resolution: self.song.video_resolution,
             framerate: self.song.video_framerate,
         });
     }
 
-    /// FIXME #55: レンジピッカー確定。 選んだ拍範囲を kind に応じて変換し、 元の
+    /// レンジピッカー確定。 選んだ拍範囲を kind に応じて変換し、 元の
     /// export action を起動する。 「全曲」 (start=0, end=length) のときは範囲なし
     /// (`None`) として従来どおり全曲を書き出す。
     fn confirm_export_range(&mut self) {
@@ -20431,7 +20431,7 @@ impl AppData {
                 );
             }
             ExportRangeKind::Mp4 => {
-                // FIXME #79: picker で選んだ出力解像度 / fps を後段へ運ぶ。
+                // picker で選んだ出力解像度 / fps を後段へ運ぶ。
                 let resolution = picker.resolution;
                 let framerate = picker.framerate;
                 #[cfg(windows)]
@@ -20446,7 +20446,7 @@ impl AppData {
         }
     }
 
-    /// FIXME #55: 拍範囲 → sample frame 範囲。 audio engine と同じ式・同じ
+    /// 拍範囲 → sample frame 範囲。 audio engine と同じ式・同じ
     /// sample rate (`common::audio_bridge::SAMPLE_RATE`、 AudioSession に渡す値)
     /// で換算するので、 daw_audio 側 `run_export` の `samples_per_beat` と完全に
     /// 一致する (bounce の `clip_range_to_frames` と同じ SSoT)。
@@ -20459,7 +20459,7 @@ impl AppData {
         (s, e)
     }
 
-    /// FIXME #55: begin an offline WAV export the right way — stop playback,
+    /// begin an offline WAV export the right way — stop playback,
     /// push the latest song + offline render mode, then **reinitialise every
     /// plugin** (deactivate→activate) for a clean cold render before the render
     /// runs. The actual `ExportWav` is sent on `AppEvent::PluginsReinitDone`
@@ -21101,7 +21101,7 @@ impl AppData {
     /// 自動レンダリング（daw_audio の freewheel）し、完了（`ExportWavComplete`）
     /// 後に video export して mux する（`action_export_mp4`）。旧仕様の「音声
     /// WAV を別途選ばせる 2 つ目のダイアログ」 は廃止。
-    /// FIXME #55: `range_beats` はレンジピッカーで確定した書き出し窓 (拍)。
+    /// `range_beats` はレンジピッカーで確定した書き出し窓 (拍)。
     /// `None` = 全曲。 二重起動ガードはピッカーを開く時点 (`open_export_range_picker`)
     /// で済んでいるが、 ピッカー表示中に状態が変わる経路は無いので念のため残す。
     #[cfg(windows)]
@@ -21141,7 +21141,7 @@ impl AppData {
     /// `ExportMp4PathChosen` で保存先が確定したときの video export 後段。 旧
     /// `action_open_export_mp4_dialog` が dialog の戻り値で同期に走らせていた
     /// 「音声を temp WAV へ自動レンダリング → 完了後に video export + mux」 を、
-    /// dialog 別スレッド化に伴いここへ移設した。 FIXME #55: `range_beats` は
+    /// dialog 別スレッド化に伴いここへ移設した。 `range_beats` は
     /// 書き出し窓 (拍)。 音声 temp WAV はこの窓に trim して書き、 video render も
     /// 同じ窓で回す (`pending_video_export_range` 経由) ので A/V が揃う。
     fn action_begin_export_mp4(
@@ -21163,7 +21163,7 @@ impl AppData {
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
         self.pending_video_export = Some(output_path);
         self.pending_video_export_range = range_beats;
-        // FIXME #79: 音声 render 完了後に始める video render へ、 picker で選んだ
+        // 音声 render 完了後に始める video render へ、 picker で選んだ
         // 出力解像度 / fps を per-export override として持ち越す。
         self.pending_video_export_dims = Some((resolution, framerate));
         self.export_temp_wav = Some(temp_wav.clone());
@@ -21173,7 +21173,7 @@ impl AppData {
         self.export_progress_at = Some(std::time::Instant::now());
         self.status_message = "音声をレンダリング中...".into();
         // 音声も video と同じ窓で freewheel render (beat→frame は audio engine と
-        // 同じ式)。 `None` で全曲。 FIXME #55: stop → reinit plugins → ExportWav
+        // 同じ式)。 `None` で全曲。 stop → reinit plugins → ExportWav
         // (begin_wav_export 経由)。 video render が `.modenv` sidecar を sample して
         // modulation を再現するので、 ここだけ sidecar を書く。
         let range = range_beats.map(|(s, e)| self.export_beats_to_frames(s, e));
@@ -21294,7 +21294,7 @@ impl AppData {
                 // の入力 gate / 再生抑止も video と同様に効く。
                 self.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
                 self.export_progress_at = Some(std::time::Instant::now());
-                // FIXME #55: standalone WAV export — stop → reinit plugins →
+                // standalone WAV export — stop → reinit plugins →
                 // (on PluginsReinitDone) ExportWav。begin_wav_export が再生停止 /
                 // LoadSong / SetRenderMode(Offline) / 全 plugin 再初期化を行う。
                 // modulation は音に焼き込み済みなので `.modenv` sidecar は書かない。
@@ -21363,7 +21363,7 @@ impl AppData {
         output_path: PathBuf,
         audio_wav: Option<PathBuf>,
         range_beats: Option<(f64, f64)>,
-        // FIXME #79: picker で選んだ出力解像度 / fps の per-export override。
+        // picker で選んだ出力解像度 / fps の per-export override。
         // `None` ならプロジェクト値 (`Song.video_resolution` / `video_framerate`) を使う。
         dims: Option<((u32, u32), f32)>,
     ) {
@@ -21385,9 +21385,9 @@ impl AppData {
         self.export_stage = Some(ExportStage::VideoRender { done: 0, total: 0 });
         self.status_message = format!("Video export 開始: {}", output_path.display());
         std::thread::spawn(move || {
-            // FIXME #55: video の render 窓も拍範囲に合わせる (audio temp WAV は
+            // video の render 窓も拍範囲に合わせる (audio temp WAV は
             // 既に同じ窓に trim 済み → frame 0 で A/V が揃う)。
-            // FIXME #79: per-export override を分解 (None ならビルダーに None を渡し、
+            // per-export override を分解 (None ならビルダーに None を渡し、
             // RenderConfig が resolved_* で song 値へフォールバックする)。
             let (override_res, override_fps) = match dims {
                 Some((res, fps)) => (Some(res), Some(fps)),
@@ -21889,9 +21889,9 @@ impl AppData {
         // (length / content_id rewritten), and a new clip for the
         // back half is appended on the same track.
         let track = &mut self.song.tracks[target.track as usize];
-        // (FIXME #36) 前半は in-place で元 clip の声を保持。 後半 (新 clip) は
+        // 前半は in-place で元 clip の声を保持。 後半 (新 clip) は
         // その声を引き継ぐ。
-        // FIXME #80: 前半は in-place で mute を保持。 後半 (新 clip) も元 clip の mute を引き継ぐ。
+        // 前半は in-place で mute を保持。 後半 (新 clip) も元 clip の mute を引き継ぐ。
         let (src_speaker, src_singer, src_style, src_talk, src_muted) = {
             let clip_mut = &mut track.clips[target.clip as usize];
             clip_mut.length_beats = front_len;
@@ -22155,7 +22155,7 @@ impl AppData {
                 GlueKind::Midi => {
                     let mut notes = frags.midi_notes;
                     notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-                    // FIXME #83: glue で別 clip 由来の同一ピッチ note が時間的に
+                    // glue で別 clip 由来の同一ピッチ note が時間的に
                     // 重なり得るので、全 note を勝者として重なりを解消する。
                     let all: Vec<u32> = (0..notes.len() as u32).collect();
                     resolve_note_overlaps(&mut notes, &all);
@@ -22169,9 +22169,9 @@ impl AppData {
                     .set_content_name(new_content_id, combined_name.clone());
             }
 
-            // (FIXME #36) merged clip は最初 (= 最も早い index = sorted 先頭) の
+            // merged clip は最初 (= 最も早い index = sorted 先頭) の
             // source clip の声を採用 (複数声混在時のポリシー)。 source 削除前に capture。
-            // FIXME #80: merged clip の mute も代表 (最早) source clip の値を採用 (声と同ポリシー)。
+            // merged clip の mute も代表 (最早) source clip の値を採用 (声と同ポリシー)。
             let (glue_speaker, glue_singer, glue_style, glue_talk, glue_muted) = {
                 let track = &self.song.tracks[track_idx as usize];
                 refs.iter()
@@ -22321,7 +22321,7 @@ mod image_drop_target_tests {
     }
 }
 
-/// FIXME #61: time-stretch で clip-local の (start, len) を新 clip 長へ写像する
+/// time-stretch で clip-local の (start, len) を新 clip 長へ写像する
 /// ピュア関数。 固定端 pivot (右端 drag = 左端固定 / 左端 drag = 右端固定) で
 /// 絶対 beat 上を `factor = new_len/prev_len` で scale し、 新 clip-local へ戻す。
 /// `prev_len <= 0` は identity (退化保護)。 audio event / MIDI note 共通。
@@ -22470,12 +22470,12 @@ mod trim_audio_event_tests {
     }
 }
 
-/// FIXME #33: 新規 track の挿入 index を決めるピュアロジック。 選択中の track が
+/// 新規 track の挿入 index を決めるピュアロジック。 選択中の track が
 /// 1 つ以上あれば「最上段 (= `tracks` 内 index 最小) の選択の **直上**」、無ければ末尾。
 /// 複数選択でも一番上を基準にすることで選択のかたまりを割らない。
 /// `selected` 内の stale id (= `tracks` に存在しない) は `position()` が `None` を
 /// 返すので自然に無視され、 全部 stale なら末尾に fallback する。
-/// (FIXME #30 の「最下段の直後」から、ユーザー指定で「最上段の直上」へ変更。)
+/// (の「最下段の直後」から、ユーザー指定で「最上段の直上」へ変更。)
 fn add_track_insert_index(tracks: &[Track], selected: &[u32]) -> usize {
     selected
         .iter()
@@ -22484,7 +22484,7 @@ fn add_track_insert_index(tracks: &[Track], selected: &[u32]) -> usize {
         .unwrap_or(tracks.len())
 }
 
-/// FIXME #53: 新規 Arranger セクションの既定名。Intro/Aメロ/サビ… を巡回し、
+/// 新規 Arranger セクションの既定名。Intro/Aメロ/サビ… を巡回し、
 /// それを超えたら `Part N` に連番フォールバック。
 fn section_default_name(index: usize) -> String {
     const NAMES: [&str; 7] = ["Intro", "Aメロ", "Bメロ", "サビ", "間奏", "Cメロ", "アウトロ"];
@@ -22494,7 +22494,7 @@ fn section_default_name(index: usize) -> String {
         .unwrap_or_else(|| format!("Part {}", index + 1))
 }
 
-/// FIXME #53: 新規 Arranger セクションの既定色 (パレットを巡回)。
+/// 新規 Arranger セクションの既定色 (パレットを巡回)。
 fn section_default_color(index: usize) -> [f32; 3] {
     const PALETTE: [[f32; 3]; 7] = [
         [0.35, 0.55, 0.85],
@@ -22650,7 +22650,7 @@ fn copy_notes_into(notes: &mut Vec<Note>, entries: &[(u32, f64, u8)]) -> Vec<u32
     (base..base + count).collect()
 }
 
-/// FIXME #83: 同一ピッチの MIDI ノートが時間的に重ならない不変条件を強制する
+/// 同一ピッチの MIDI ノートが時間的に重ならない不変条件を強制する
 /// (Bitwig / Ableton 流、`docs/plan_fixme_83_note_overlap.md`)。
 ///
 /// `winners` = 直前に追加 / 移動 / サイズ変更 / コピーされたノートの index (= 衝突時に
@@ -22659,7 +22659,7 @@ fn copy_notes_into(notes: &mut Vec<Note>, entries: &[(u32, f64, u8)]) -> Vec<u32
 /// - loser が winner より前に始まる → loser 末尾を winner 開始でトリム
 ///   (末尾重なり + 中央挿入 = truncate-not-split、自動分割しない)
 /// - loser 先頭が winner に覆われ後半が残る → loser 開始を winner 終端へ前送りし後半を残す
-///   (REAPER 流の非破壊的挙動、FIXME #83 で user 採用)
+///   (REAPER 流の非破壊的挙動、user 採用)
 ///
 /// winner 同士の重なり (時間 / ピッチ量子化・glue で発生し得る) は pitch ごとに start 昇順で
 /// 「後から始まる方が勝ち、前のノート末尾をトリム」で解消する (move / copy 等の並進操作では
@@ -22755,7 +22755,7 @@ fn resolve_note_overlaps(notes: &mut Vec<Note>, winners: &[u32]) -> Vec<Option<u
                 }
             } else {
                 // loser 先頭が winner に覆われ後半が we を超える → 開始を we へ前送り
-                // して後半を残す (REAPER 流、FIXME #83 user 採用)。
+                // して後半を残す (REAPER 流、user 採用)。
                 let new_dur = be - we;
                 if new_dur <= EPS {
                     deleted[b] = true;
@@ -23063,7 +23063,7 @@ mod note_duplicate_tests {
 
 #[cfg(test)]
 mod note_overlap_tests {
-    // FIXME #83: resolve_note_overlaps の純ロジック検証
+    // resolve_note_overlaps の純ロジック検証
     // (docs/plan_fixme_83_note_overlap.md)。
     use super::{remap_indices, resolve_note_overlaps};
     use common::model::Note;
@@ -23222,7 +23222,7 @@ mod note_overlap_tests {
     }
 }
 
-/// FIXME #93: 複数クリップ同時表示の packed note id 契約 (= cross-clip 編集の根幹)。
+/// 複数クリップ同時表示の packed note id 契約 (= cross-clip 編集の根幹)。
 /// id = `(clip_slot << 24) | (local_index & 0x00FF_FFFF)`。view が widget へ渡す id と
 /// handler が decode する id がこの 1 つの bit レイアウトを共有することで、 異なるクリップの
 /// note が衝突せず、 decode で正しいクリップ・正しい local index に解決される。
@@ -23426,7 +23426,7 @@ type DecodedImage = (
     (u32, u32, std::sync::Arc<Vec<u8>>),
 );
 
-/// FIXME #24: background asset decode の中間バッファ。 decode スレッドが結果を
+/// background asset decode の中間バッファ。 decode スレッドが結果を
 /// push + `done` を進め、 GUI スレッドの `on_asset_decode_tick` が caches へ排出
 /// する。
 #[derive(Default)]
@@ -23492,7 +23492,7 @@ mod plugin_category_tests {
             // 未分類 (主カテゴリ無し / 空) は FX チェーンへ倒す。
             (&[], PluginCategory::Fx),
             (&["reverb"], PluginCategory::Fx),
-            // FIXME #54: video-effect は最優先で映像カテゴリへ (排他)。
+            // video-effect は最優先で映像カテゴリへ (排他)。
             (&["video-effect", "video-color"], PluginCategory::Video),
             (&["video-effect"], PluginCategory::Video),
         ];

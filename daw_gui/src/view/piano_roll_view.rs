@@ -21,7 +21,7 @@ const KEYBOARD_W: f32 = 56.0;
 const VEL_LANE_H: f32 = 60.0;
 const RULER_H: f32 = 20.0;
 const TOOLBAR_H: f32 = 24.0;
-/// FIXME #93: 複数クリップ同時表示時に右側へ出す legend パネルの幅 (px)。
+/// 複数クリップ同時表示時に右側へ出す legend パネルの幅 (px)。
 const LEGEND_W: f32 = 152.0;
 
 const COLOR_HINT: Color = theme::TEXT_DIM;
@@ -48,14 +48,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     };
     draw_snap_toolbar(app, ui, toolbar_rect);
 
-    // FIXME #93: 選択された MIDI クリップを **全部同時表示** する。対象 (target) クリップ =
+    // 選択された MIDI クリップを **全部同時表示** する。対象 (target) クリップ =
     // 新規ノートの所属先・凡例で強調される行 = 選択 anchor (`pianoroll_target_clip`、SSoT)。
     // 表示クリップが無ければ placeholder。
     let shown = app.shown_pianoroll_clips();
     let Some(target) = app.pianoroll_target_clip() else {
         // 表示する MIDI クリップが無い (未選択 or 非 MIDI のみ) ときのプレースホルダ。
         // widget が走らないので、 もし歌詞編集 mirror が残っていたら false に戻す
-        // (FIXME #84、 stale-true で Esc が widget へ委ねられ続けて消える事故を防ぐ)。
+        // (stale-true で Esc が widget へ委ねられ続けて消える事故を防ぐ)。
         if app.piano_roll_lyric_editing {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.piano_roll_lyric_editing = false;
@@ -72,7 +72,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
         return;
     };
-    // FIXME #93: 複数表示 (2 つ以上) のとき右側に legend パネル (色 / 名前 / 対象 / ロック)
+    // 複数表示 (2 つ以上) のとき右側に legend パネル (色 / 名前 / 対象 / ロック)
     // を出し、widget 本体 (`body`) をその分狭める。単一表示は body 全幅 = 既存レイアウト不変。
     let multi = shown.len() >= 2;
     let (body, legend_rect) = if multi {
@@ -122,7 +122,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
-    // FIXME #93: 表示集合 (shown) が変わったら共有 viewport (`multi_clip_view`) を union-fit し
+    // 表示集合 (shown) が変わったら共有 viewport (`multi_clip_view`) を union-fit し
     // 直す。clip key 列を `multi_clip_view_key` と比較し、違えば 1 度だけ再 fit を要求する
     // (= multi viewport 初期化の唯一の owner = SSoT。Ctrl+Click での集合変更にも追従)。
     if multi {
@@ -136,7 +136,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
-    // FIXME #93: dim は **トラック基準** (対象クリップのトラック以外を淡色)。
+    // dim は **トラック基準** (対象クリップのトラック以外を淡色)。
     let widget_notes = build_widget_notes(app, &shown, Some(target.track));
     let zoom_x = app.pianoroll_zoom_x().max(4.0);
     let zoom_y = app.pianoroll_zoom_y().max(6.0);
@@ -150,7 +150,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // が変わらないため、 piano_roll が安定して編集できる)。 scale_changes が
     // 空 / 該当 event 無し / selected_clip None なら view.scale = None で旧
     // 挙動互換 (= 機能 OFF、 既存 .daw file の regression なし)。
-    // FIXME #3: piano roll を song-absolute 座標系に統一する。clip.start_beat を
+    // piano roll を song-absolute 座標系に統一する。clip.start_beat を
     // 唯一の絶対オフセット SSoT とし、view 入口で加算 (ruler/grid/playhead/loop が
     // 曲の絶対小節位置を表示)、note の model 書き戻し出口で減算する (note は共有
     // content のため clip-local 保持)。playhead/loop は元々 song-global なので
@@ -173,7 +173,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         },
     });
 
-    // FIXME #10 (plan_clip_label_cache): widget の note キャッシュ無効化キー。
+    // widget の note キャッシュ無効化キー。
     // 旧実装は `pianoroll_notes_generation` を 12 箇所で手動 += 1 しており、 新しい
     // note 編集経路を足して bump を書き忘れると編集が画面に出ない取りこぼしが
     // 起きた。 widget へ渡す `widget_notes` の内容そのものを hash し、 note が
@@ -193,7 +193,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         h.finish()
     };
 
-    // FIXME #93: 複数表示は song-absolute scroll (`multi_clip_view`)、左下限は最早クリップ開始拍。
+    // 複数表示は song-absolute scroll (`multi_clip_view`)、左下限は最早クリップ開始拍。
     // 単一表示は従来どおり clip-local scroll + 対象クリップ開始位置 (regression なし)。
     let (view_start_beat, view_min_start) = if multi {
         let earliest = shown
@@ -216,9 +216,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     };
 
     let view = PianoRollView {
-        // FIXME #3/#93: song-absolute 左端 (単一 = clip-local scroll + clip 開始、複数 = 絶対 scroll)。
+        // song-absolute 左端 (単一 = clip-local scroll + clip 開始、複数 = 絶対 scroll)。
         start_beat: view_start_beat,
-        // FIXME #89/#93: 左へスクロールできる下限 (単一 = clip 開始、複数 = 最早クリップ開始)。
+        // 左へスクロールできる下限 (単一 = clip 開始、複数 = 最早クリップ開始)。
         min_start_beat: view_min_start,
         len_beats: (grid_rect.w / zoom_x) as f64,
         pitch_top: app.pianoroll_top_pitch() as f32,
@@ -231,7 +231,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         bpm: app.song.bpm,
         time_sig: app.song.time_sig,
         snap: snap::piano_roll_snap_config(app),
-        // (FIXME #38) 3 段目グリッド (スナップ細分線) の線間隔 (拍)。
+        // 3 段目グリッド (スナップ細分線) の線間隔 (拍)。
         // `None` = subdivision なし (拍以上に粗いスナップ / OFF)。
         sub_grid_interval_beats: snap::subgrid_interval_beats(
             snap::piano_roll_snap_config(app),
@@ -243,12 +243,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // on Draw で widget の drag preview pitch も最寄り in-scale に snap。
         // Fold mode / scale = None / Snap on Draw OFF では無関係。
         snap_pitch_during_drag: app.snap_on_draw,
-        // FIXME #82: 新規 note の既定長 = 直近に描いた / 選択した note 長 (last_note_duration_beats)。
+        // 新規 note の既定長 = 直近に描いた / 選択した note 長 (last_note_duration_beats)。
         // Insert と「空白ダブルクリックで即放し」 がこの長さを使う。 ダブルクリックを放さず
         // ドラッグしたときは widget がドラッグ長を優先する (Bitwig 流)。
         default_note_len_beats: app.last_note_duration_beats,
     };
-    // FIXME #20: 鍵盤のオクターブラベル (C5 / root) のコントラストは widget 側の
+    // 鍵盤のオクターブラベル (C5 / root) のコントラストは widget 側の
     // label 色を背景 (key fill / overlay) の輝度に応じて自動反転させる必要があり
     // (Fold モードは白鍵/黒鍵を跨いで label が出るため単一色では不可)、 daw_01 から
     // 静的色を渡すだけでは解決しない。 gui_01 に WCAG auto-contrast 適用を要望済
@@ -256,7 +256,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let style = PianoRollStyle::default();
     let resize_handle_px = style.resize_handle_px;
 
-    // FIXME #93: 各表示クリップ (clip_slot 順) の song-absolute 開始拍。make_edit が widget の
+    // 各表示クリップ (clip_slot 順) の song-absolute 開始拍。make_edit が widget の
     // song-absolute 座標を「その note の所属クリップの clip-local」へ戻す (per-note offset) のに使う。
     let clip_starts: Vec<f64> = shown
         .iter()
@@ -280,9 +280,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.handle_event(AppEvent::AddNote {
                         track: target.track,
                         clip: target.clip,
-                        // widget は song-absolute → model は clip-local (FIXME #3)。
+                        // widget は song-absolute → model は clip-local。
                         start_beat: n.start_beat - clip_start_beat,
-                        // FIXME #82: widget が決めた長さ (Insert/即放し=既定長、 ドラッグ=ドラッグ長)
+                        // widget が決めた長さ (Insert/即放し=既定長、 ドラッグ=ドラッグ長)
                         // を尊重する。 旧 last_note_duration_beats 固定は widget の長さを捨てていた。
                         duration: n.len_beats,
                         pitch: n.pitch,
@@ -297,8 +297,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 })
             }
             PianoRollEditRequest::Move(deltas) => {
-                // d.3 = next_start_beat は song-absolute → 各 note の所属クリップの clip-local へ
-                // (FIXME #3/#93)。clip_slot は packed id (d.0) 上位 8 bit。d.0 は packed のまま通し、
+                // d.3 = next_start_beat は song-absolute → 各 note の所属クリップの clip-local へ。
+                // clip_slot は packed id (d.0) 上位 8 bit。d.0 は packed のまま通し、
                 // handler が decode して正しいクリップの note に書き戻す。
                 let entries: Vec<(u32, f64, u8)> = deltas
                     .iter()
@@ -317,8 +317,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // gui_01 #054: Ctrl+drag コピー。Move と同形 payload だが、元 note を
             // 据え置いて複製を new 位置へ置く (CopyNotes handler が deep clone)。
             PianoRollEditRequest::Copy(deltas) => {
-                // d.3 = next_start_beat は song-absolute → 各 note の所属クリップの clip-local へ
-                // (FIXME #3/#93)。コピー元と同じクリップ内に複製する (handler が decode して同 clip へ)。
+                // d.3 = next_start_beat は song-absolute → 各 note の所属クリップの clip-local へ。
+                // コピー元と同じクリップ内に複製する (handler が decode して同 clip へ)。
                 let entries: Vec<(u32, f64, u8)> = deltas
                     .iter()
                     .map(|d: &MoveDelta| {
@@ -335,7 +335,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }
             PianoRollEditRequest::Resize(deltas) => {
                 // d.3 = next_start_beat は song-absolute → 各 note の所属クリップの clip-local。
-                // d.4 = len は不変 (FIXME #3/#93)。d.0 は packed のまま handler が decode する。
+                // d.4 = len は不変。d.0 は packed のまま handler が decode する。
                 let entries: Vec<(u32, f64, f64)> = deltas
                     .iter()
                     .map(|d: &ResizeDelta| {
@@ -380,7 +380,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // continuation frame で逐次発火する seek 要求。 arrangement と同形で
             // `AppData::seek_playhead_to` に集約 (playhead 更新 + SeekTo)。 clip 内
             // clamp は意図的に行わない (= song-global で自由に動かせる)。
-            // FIXME #50: seek_playhead_to は「停止で戻るホーム」も更新する。
+            // seek_playhead_to は「停止で戻るホーム」も更新する。
             PianoRollEditRequest::SetPlayheadBeat(beat) => {
                 Edit::mutate(move |app: &mut AppData| {
                     app.seek_playhead_to(beat);
@@ -394,7 +394,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.handle_event(AppEvent::SetLoopRange { start, end });
                 })
             }
-            // FIXME #89: edge auto-scroll の横スクロール (delta 拍)。widget は clip 相対オフセットを
+            // edge auto-scroll の横スクロール (delta 拍)。widget は clip 相対オフセットを
             // 知らないので delta で渡る → ここで `pianoroll_scroll_beat` に加算 (handler が `>= 0` clamp)。
             PianoRollEditRequest::ScrollByBeats(by) => Edit::mutate(move |app: &mut AppData| {
                 // f64 で加算してから 1 度だけ f32 に丸める (精度保持)。handler が `>= 0` clamp する。
@@ -402,7 +402,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 let next = (f64::from(app.pianoroll_scroll_beat()) + by) as f32;
                 app.handle_event(AppEvent::SetPianoRollScrollX(next));
             }),
-            // FIXME #89: edge auto-scroll の縦 (pitch) スクロール (絶対 top_pitch、widget が clamp 済)。
+            // edge auto-scroll の縦 (pitch) スクロール (絶対 top_pitch、widget が clamp 済)。
             PianoRollEditRequest::SetTopPitch(p) => Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetPianoRollTopPitch(p));
             }),
@@ -419,13 +419,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         make_edit,
     );
 
-    // FIXME #93: 複数表示時のみ右側に凡例パネル (色 swatch / クリップ名 / 対象切替 /
+    // 複数表示時のみ右側に凡例パネル (色 swatch / クリップ名 / 対象切替 /
     // ロックトグル) を描画。単一表示は legend_rect = None で従来レイアウト不変。
     if let Some(legend_rect) = legend_rect {
         draw_legend(app, ui, legend_rect, &shown, target);
     }
 
-    // FIXME #84: 歌詞 inline 編集中フラグを app に mirror する。 root.rs の
+    // 歌詞 inline 編集中フラグを app に mirror する。 root.rs の
     // `dispatch_shortcuts` は piano_roll widget より前に走って `take_shortcut("escape")`
     // を消費してしまうため、 編集中は app 側フラグを見て Esc を消費させず widget に委ねる
     // (= widget が歌詞編集を 1 frame で cancel)。 変化したフレームだけ Edit を発行する
@@ -449,8 +449,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
-    // FIXME #33: ノート paste の配置位置。grid 上のポインタを **clip-local** snapped
-    // beat にして毎フレーム mirror。`view.start_beat` は song-absolute (FIXME #3) なので、
+    // ノート paste の配置位置。grid 上のポインタを **clip-local** snapped
+    // beat にして毎フレーム mirror。`view.start_beat` は song-absolute なので、
     // dbl-click の AddNote (`snapped_beat - clip_start_beat`) と同様に clip_start_beat を
     // 引いて clip-local に変換する (paste_notes_at は clip-local 前提)。grid 外は None。
     let hover_beat: Option<f64> = ui.pointer().pos.and_then(|(px, py)| {
@@ -464,7 +464,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let snapped = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x());
         Some(snapped - clip_start_beat)
     });
-    // FIXME #44: f キー用に **song-absolute かつ snap なし** の生 beat も mirror する
+    // f キー用に **song-absolute かつ snap なし** の生 beat も mirror する
     // (clip_start_beat を引く前。snap は dispatch 側で live Alt 付きで song-absolute grid
     // に対して行う)。clip_start_beat が snap unit の倍数でなくても、ruler が見せる
     // song-absolute grid 線にプレイヘッドが乗るようにするため、clip-local の
@@ -484,7 +484,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.pianoroll_hover_beat_song_raw = hover_beat_song_raw;
         }));
     }
-    // FIXME #80: q キー (選択が無ければカーソル直下 note を mute) 用に、ポインタ直下の
+    // q キー (選択が無ければカーソル直下 note を mute) 用に、ポインタ直下の
     // note index (= clip 内 notes Vec の index、`selected_notes` と同空間) を毎フレーム mirror。
     // grid 外 / note 外は None。widget の `note_hit` を流用して drag hit-test と同じ判定にする。
     let hover_note: Option<u32> = ui.pointer().pos.and_then(|(px, py)| {
@@ -496,13 +496,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
-    // FIXME #82: 空白上の note 作成 (ダブルクリック + 放さずドラッグで長さ決定、Bitwig 流) は
+    // 空白上の note 作成 (ダブルクリック + 放さずドラッグで長さ決定、Bitwig 流) は
     // widget 側に一本化した (`take_double_click_press_in_rect` → NoteCreateSession → `Add`)。
     // 旧 release ベース `take_double_click_in_rect` の AddNote はここから撤去 (press を放さず
     // ドラッグを捕捉できないため)。 widget の `Add` request は make_edit で AddNote に変換され、
     // `n.len_beats` (ドラッグ長 or 既定長) を尊重する。
 
-    // wheel handler — note drag / 作成 (FIXME #82) 中は無効
+    // wheel handler — note drag / 作成中は無効
     // 一般的な DAW (Ableton Live / Reaper) 流: Ctrl=横ズーム, Alt=縦ズーム,
     // Shift=横スクロール, plain=ピッチスクロール (上下)。
     if resp.dragging.is_none() && !resp.creating {
@@ -655,7 +655,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     );
 }
 
-/// FIXME #93: 複数表示時に右側へ出す凡例パネル。各行 = **1 トラック** = [色 swatch][トラック名][L ロック]。
+/// 複数表示時に右側へ出す凡例パネル。各行 = **1 トラック** = [色 swatch][トラック名][L ロック]。
 /// トラック行クリックで対象 (target) をそのトラックの (表示中) クリップへ切替、L トグルでそのトラックの
 /// ロック (参照専用) を反転。対象トラックの行は左端 accent バー + 通常文字色で強調 (非対象は淡色)。
 /// ノート色・dim もトラック基準なので整合する (REAPER / Cakewalk のトラックペイン流)。`target` は
@@ -808,7 +808,7 @@ fn draw_legend(
     }
 }
 
-/// FIXME #93: 表示対象クリップ群 (`shown`) の note を **すべて** `daw_ui_core::Note` に変換する。
+/// 表示対象クリップ群 (`shown`) の note を **すべて** `daw_ui_core::Note` に変換する。
 /// 各 note の id は packed global id (`AppData::pack_note_id(clip_slot, index)`) で複数クリップでも
 /// 衝突しない。**色はそのクリップが乗っている _トラック_ の実効色** (`effective_track_color`、凡例が
 /// トラック単位なのでノートもトラック色)、非対象 _トラック_ のノートは `dimmed`、ロック中トラックの
@@ -832,13 +832,13 @@ fn build_widget_notes(app: &AppData, shown: &[ClipRef], target_track: Option<u32
         for (i, n) in app.song.clip_notes(clip).iter().enumerate() {
             out.push(Note {
                 id: AppData::pack_note_id(clip_slot, i),
-                // song-absolute 化: clip-local note + clip 開始位置 (FIXME #3)。
+                // song-absolute 化: clip-local note + clip 開始位置。
                 start_beat: n.start_beat + clip_start,
                 len_beats: n.duration_beats,
                 pitch: n.pitch,
                 velocity: n.velocity,
                 lyric: n.lyric.as_deref().filter(|s| !s.is_empty()).map(Arc::from),
-                // FIXME #80: note mute (dim + 斜線ハッチ表示)。`Note.muted` をそのまま渡す。
+                // note mute (dim + 斜線ハッチ表示)。`Note.muted` をそのまま渡す。
                 muted: n.muted,
                 style: NoteStyle {
                     color: Some(color),

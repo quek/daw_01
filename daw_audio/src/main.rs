@@ -131,7 +131,7 @@ async fn recv_loop(
                     .store(PlaybackCommand::Stop as u8, Ordering::Release);
             }
             Ok(MainToChild::Panic) => {
-                // FIXME #60: arm the master declick. The CPAL callback consumes
+                // arm the master declick. The CPAL callback consumes
                 // this edge flag, fades the master out and holds at zero until
                 // `PanicRelease`, so the imminent `ReinitAllPlugins` (which yanks
                 // every plugin out of the mix) doesn't produce a step click.
@@ -139,7 +139,7 @@ async fn recv_loop(
                 shared.panic_declick.store(true, Ordering::Release);
             }
             Ok(MainToChild::PanicRelease) => {
-                // FIXME #60: the plugin reinit finished — release the declick
+                // the plugin reinit finished — release the declick
                 // hold so the master fades back in over a now-silent mix.
                 tracing::info!("received PanicRelease (declick fade-in)");
                 shared.panic_release.store(true, Ordering::Release);
@@ -148,11 +148,11 @@ async fn recv_loop(
                 shared.looping.store(b, Ordering::Release);
             }
             Ok(MainToChild::SeekTo { samples }) => {
-                // FIXME #41: playhead を IPC 受信スレッドから直接書かない。
+                // playhead を IPC 受信スレッドから直接書かない。
                 // audio thread も buffer 末で playhead を store するため、両者が
                 // 同一 atomic を別スレッドから書く race になり、Stop 直後の開始
                 // 位置への巻き戻しが in-flight buffer の advance に上書きされて
-                // 停止位置から再生されるバグ (= FIXME #41) を生む。seek 要求は
+                // 停止位置から再生されるバグを生む。seek 要求は
                 // pending_seek に積み、audio thread が process_buffer 冒頭で
                 // swap 消費して playhead に反映する (playhead の writer を audio
                 // thread 単独に保つ)。ruler click / Stop 復帰の双方ともこの経路。
@@ -217,7 +217,7 @@ async fn recv_loop(
             Ok(MainToChild::ClosePluginShmem { plugin_id }) => {
                 let _ = cmd_tx.send(engine::AudioCommand::ClosePluginShmem { plugin_id });
             }
-            // FIXME #32: a chain reorder re-keys `slot_to_plugin_id` so each
+            // a chain reorder re-keys `slot_to_plugin_id` so each
             // slot resolves to its moved plugin. Sent to the audio engine in
             // addition to the plugin host (and a `LoadSong` that rebuilds the
             // processing order). Atomic re-key on the audio thread; see
@@ -449,7 +449,7 @@ async fn recv_loop(
                 let out_tx_clone = out_tx.clone();
                 let out_tx_progress = out_tx.clone();
                 let sample_rate = session_sample_rate;
-                // FIXME #55: by the time this thread runs, the GUI has stopped
+                // by the time this thread runs, the GUI has stopped
                 // playback and reinitialised every plugin (deactivate→activate)
                 // for a clean cold start. The export thread waits for the live
                 // CPAL callback to park, then freewheels and reports progress.
@@ -486,7 +486,7 @@ async fn recv_loop(
                                     .send(ChildToMain::ExportWavProgress { done, total });
                             }
                         };
-                        // FIXME #55: user export range walks cold from the range
+                        // user export range walks cold from the range
                         // start (matches Play-from-here); full export walks 0..len.
                         let span = match range {
                             Some((start, end)) => export::RenderSpan::RangeCold { start, end },
@@ -684,7 +684,7 @@ async fn recv_loop(
             | Ok(MainToChild::CloseSlotGui { .. })
             | Ok(MainToChild::SetRenderMode(_))
             | Ok(MainToChild::SetBuiltinPluginNoteMetadata { .. })
-            // FIXME #42: 歌唱合成は plugin host が担うので audio engine は無視。
+            // 歌唱合成は plugin host が担うので audio engine は無視。
             | Ok(MainToChild::PrepareVocalSynth { .. })
             | Ok(MainToChild::CloseWorkerPool) => {}
             Err(e) => {
@@ -877,7 +877,7 @@ fn build_stream(
     // touched outside the audio thread.
     let mut local = LocalState::new(max_frames, cmd_rx, engine_shared);
 
-    // FIXME #60: panic-button master declick. `MainToChild::Panic` sets
+    // panic-button master declick. `MainToChild::Panic` sets
     // `shared.panic_declick`; the callback consumes that edge and fades the
     // master out, then HOLDS it at zero until `MainToChild::PanicRelease`
     // (`shared.panic_release`) arrives — which daw_gui sends only once the
@@ -918,7 +918,7 @@ fn build_stream(
 
                 let gain = f32::from_bits(master_gain.load(Ordering::Relaxed));
 
-                // FIXME #60: consume the panic edge to (re)start the master
+                // consume the panic edge to (re)start the master
                 // declick envelope at sample 0 of this buffer.
                 if shared.panic_declick.swap(false, Ordering::AcqRel) {
                     declick_t = Some(0);
@@ -987,7 +987,7 @@ fn build_stream(
     Ok(stream)
 }
 
-/// FIXME #60: master gain multiplier for the panic declick envelope at sample
+/// master gain multiplier for the panic declick envelope at sample
 /// offset `t` (samples since the panic was armed):
 /// `fade_out` (1 → 0) → hold (0, until `released_at` is set) → fade-in (0 → 1
 /// over `fade_in`, starting at `released_at`) → done (1). The master is faded to
@@ -1062,7 +1062,7 @@ mod tests {
         assert_eq!(block_peaks_stereo(&data, 2), (0.2, 0.5));
     }
 
-    // FIXME #60: panic declick envelope (fade_out=4, fade_in=4), hold-until-release.
+    // panic declick envelope (fade_out=4, fade_in=4), hold-until-release.
     #[test]
     fn panic_declick_envelope_phases() {
         let (fo, fi) = (4u64, 4u64);

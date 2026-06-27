@@ -20,7 +20,7 @@
 //!   Edit 適用 1 frame 遅延の visual 揺れを抑える。
 //! - reorder logic は arrangement の `compute_reorder_target_index` / `apply_reorder` を再利用。
 //!
-//! ## 行内アコーディオン展開 (daw_01 FIXME #78)
+//! ## 行内アコーディオン展開 (daw_01)
 //!
 //! [`Ui::reorderable_list_expandable`] は各 row の **直下に可変高の展開領域** を持てる。
 //! `row_extra_h(i)` が row `i` の展開高 (`0.0` = 折りたたみ) を返し、`expansion(ui, i, rect)` が
@@ -158,7 +158,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         )
     }
 
-    /// 各 row の **直下に可変高の展開領域** を持てる reorderable list (FIXME #78、行内アコーディオン)。
+    /// 各 row の **直下に可変高の展開領域** を持てる reorderable list (行内アコーディオン)。
     ///
     /// - `row_extra_h(i)`: row `i` の展開高 (px)。`0.0` で折りたたみ。
     /// - `expansion(ui, i, rect)`: row `i` の展開領域 (`rect` は base row の直下、高さ
@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(calls.get(), 0, "空 list で row callback は 0 回");
     }
 
-    /// FIXME #78: 行内アコーディオン。 1 行を展開すると、 その行の直下に展開領域が描かれ、
+    /// 行内アコーディオン。 1 行を展開すると、 その行の直下に展開領域が描かれ、
     /// 後続行が `row_extra_h` 分だけ下にずれる (= 可変行高 layout)。
     #[test]
     fn expandable_row_pushes_later_rows_down_and_calls_expansion() {

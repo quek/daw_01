@@ -1,4 +1,4 @@
-// clip 表示ラベル導出の AppData-driven JS smoke test (FIXME #69)。
+// clip 表示ラベル導出の AppData-driven JS smoke test。
 // `daw_gui --script` で headless 実行。 exit code 0 で pass。
 //
 // 検証: 歌詞付き MIDI クリップ (Bell トラックの「あかねに」 = 20260512.daw の

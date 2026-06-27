@@ -1,6 +1,6 @@
 //! Plugin-host-owned Win32 top-level window that hosts a plugin's editor.
 //!
-//! FIXME #31: Previously daw_gui (the GUI process) created the editor's
+//! Previously daw_gui (the GUI process) created the editor's
 //! container window and handed its HWND across IPC, so the plugin editor was
 //! a child window whose top-level ancestor lived in *another process*. JUCE
 //! plugins (e.g. Scaler 2) gate cascade sub-menus on

@@ -1,4 +1,4 @@
-//! FIXME #89: ドラッグ端オートスクロール (edge auto-scroll) の純粋ロジック。
+//! ドラッグ端オートスクロール (edge auto-scroll) の純粋ロジック。
 //!
 //! arrangement / piano_roll の drag 中、ポインタが表示領域の端 hot-zone に入ったとき、その frame で
 //! view が動くべき content px を軸ごとに返す。速度は zone 内の近接度に線形比例 (zone 境界で 0、端で

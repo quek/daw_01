@@ -1,5 +1,5 @@
 //! プロジェクトロード / 非同期保存の進捗を画面上端中央に出す **非ブロック**
-//! overlay (FIXME #24 / `docs/plan_progress_streaming.md`)。modal ではないので
+//! overlay (`docs/plan_progress_streaming.md`)。modal ではないので
 //! 構造の操作 (スクロール / 編集) はそのまま続けられる。
 //! - ロード中 (`load_progress == Some`): determinate バー (done/total)。
 //! - 非同期保存中 (`is_async_save_pending`): indeterminate (「保存中…」のみ)。

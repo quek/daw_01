@@ -309,7 +309,7 @@ fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
     track_id
 }
 
-/// FIXME #24 回帰: Save が **slot 削除の Deferred edit が in-flight 中** に enqueue
+/// 回帰: Save が **slot 削除の Deferred edit が in-flight 中** に enqueue
 /// されたとき、 その save の凍結 snapshot は「削除が反映された後」 の layout で
 /// 取られなければならない (= co-temporal snapshot)。
 ///
@@ -433,7 +433,7 @@ fn save_and_quit_clean_sets_should_quit() {
 /// 「保存して終了」 で plugin state 待ちの間に編集が入った場合、 co-temporal
 /// snapshot は編集前なのでこの保存に編集は含まれない。 finish_save は should_quit を
 /// 立てず、 残った編集を確定するため再保存を enqueue して終了意図を維持する
-/// (= FIXME #24 redesign の回帰修正: 旧コードは intent を捨ててアプリが閉じも
+/// (= redesign の回帰修正: 旧コードは intent を捨ててアプリが閉じも
 /// 保存もしない状態になっていた)。
 #[test]
 fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {

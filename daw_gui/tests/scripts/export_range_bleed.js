@@ -1,4 +1,4 @@
-// FIXME #55: headless export-range "head bleed" harness.
+// headless export-range "head bleed" harness.
 //   --arg play=1|0    roll the transport past bar 3.1 before exporting
 //                     (reproduces a synth holding a LIVE voice). default 1.
 //   --arg reinit=1|0  reinit (deactivate→activate) all plugins before export

@@ -120,7 +120,7 @@ const STYLE_SEND_PREPOST: ToggleButtonStyle = ToggleButtonStyle {
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     ui.panel("mixer_bg", area, COLOR_BG, 0.0);
 
-    // FIXME #68: S キーで「マウス直下のストリップ」を solo するため、 各 strip の
+    // S キーで「マウス直下のストリップ」を solo するため、 各 strip の
     // rect にポインタ当たり判定をして hover track を求める (arrangement の
     // `arrange_hovered_track` と同 idiom)。 layout を持つこの draw が唯一の算出点
     // (SSoT)。 master strip は solo を持たないので対象外 (= None のまま)。
@@ -146,7 +146,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let (returns, normals): (Vec<_>, Vec<_>) =
         mix.iter().partition(|e| e.is_return && !e.is_group);
 
-    // FIXME #7: 折り畳まれた group の配下 strip は隠す (arrangement と同じ
+    // 折り畳まれた group の配下 strip は隠す (arrangement と同じ
     // `collapsed_groups` を参照 = SSoT 共有)。x レイアウト / content_w が
     // filter 後の index に揃うよう、 並べる前に除外する。group strip 自身は
     // (自分の祖先に collapsed が無い限り) 残り、 disclosure ▶/▼ を出す。
@@ -253,7 +253,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         false,
     );
 
-    // FIXME #68: 算出した hover track を AppData に反映 (変化時のみ Edit、
+    // 算出した hover track を AppData に反映 (変化時のみ Edit、
     // arrange_hovered_track と同じ diff-guard)。 dispatch_shortcuts が S キーで読む。
     if app.mixer_hovered_track != hovered_strip {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -270,7 +270,7 @@ fn draw_track_strip(
     entry: &crate::app::TrackMixEntry,
     rect: Rect,
 ) {
-    // FIXME #5: グループ強調の色ハイライト (旧 COLOR_GROUP_BG 青 tint) は撤去。
+    // グループ強調の色ハイライト (旧 COLOR_GROUP_BG 青 tint) は撤去。
     // グループ識別は構造手掛かり ("↳" depth prefix + 折り畳み) だけで担い、
     // 背景は通常 strip と同じ neutral に統一する。
     let bg = COLOR_STRIP_BG;
@@ -281,7 +281,7 @@ fn draw_track_strip(
         entry.name.clone()
     };
     let track_id = entry.track_id;
-    // FIXME #7: group strip は折り畳み disclosure を出す。collapsed 状態は
+    // group strip は折り畳み disclosure を出す。collapsed 状態は
     // arrangement と共通の collapsed_groups を引く。
     let group_collapsed = if entry.is_group {
         Some(app.collapsed_groups.contains(&track_id))
@@ -380,7 +380,7 @@ fn draw_strip(
     color: Option<Color>,
     track_idx: u32,
     is_master: bool,
-    // FIXME #7: group strip のとき `Some(collapsed)` を渡すと、 名前左に折り畳み
+    // group strip のとき `Some(collapsed)` を渡すと、 名前左に折り畳み
     // disclosure ▶/▼ を描き、 click で `collapsed_groups` を toggle する
     // (arrangement と同じ SSoT)。 非 group (通常 track / return / master) は `None`。
     group_collapsed: Option<bool>,
@@ -415,7 +415,7 @@ fn draw_strip(
     let pad = 6.0;
     let mut y = rect.y + pad;
 
-    // 名前 (FIXME #7: group strip は左に折り畳み disclosure ▶/▼ を置く)
+    // 名前 (group strip は左に折り畳み disclosure ▶/▼ を置く)
     let name_x = if let Some(collapsed) = group_collapsed {
         let tri = if collapsed { "\u{25b6}" } else { "\u{25bc}" }; // ▶ 折り畳み / ▼ 展開
         let disc_w = 14.0;
@@ -445,7 +445,7 @@ fn draw_strip(
         name_x,
         y,
         11.0,
-        // FIXME #14 (plan_mixer_name_contrast): 全トラック名を明色で描画。 旧 dim
+        // 全トラック名を明色で描画。 旧 dim
         // (COLOR_TEXT) は暗 strip 背景に対しコントラスト不足で読みにくかった。
         COLOR_TEXT,
     );
@@ -532,7 +532,7 @@ fn draw_strip(
     let track_idx_for_vol = track_idx;
     let is_master_for_vol = is_master;
     let fader_label: &'static str = if is_master_for_vol { "Master Volume" } else { "Track Volume" };
-    // FIXME #1 (gui_01 #083): fader ハンドル・L/R メーター・dB 目盛り・0dB 線・
+    // fader ハンドル・L/R メーター・dB 目盛り・0dB 線・
     // peak を「ただ一つの dB→ピクセル y 写像」から配置する単一 widget に統一。
     // group rect (group_w = FADER_W + METER_GAP + METER_SCALE_W = 55) を渡すと
     // widget が内部で fader 列 (fader_w) と meter 列に分割し、両者の高さ写像が
@@ -699,7 +699,7 @@ fn draw_sends_section(
                 send_idx: send_idx as u8,
             }),
         ));
-        // FIXME #72: 再生中は SendGain オートメーションの playhead 値に追従させる
+        // 再生中は SendGain オートメーションの playhead 値に追従させる
         // (volume / pan と同 idiom)。 停止中・非 automation・書き込み中は send.gain。
         let live_gain = app.live_param_value(
             src_track,

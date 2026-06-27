@@ -1,4 +1,4 @@
-// FIXME #83: MIDI ノート非重なりの AppData-driven JS smoke test。
+// MIDI ノート非重なりの AppData-driven JS smoke test。
 // `daw_gui --script` で headless 実行。exit code 0 で pass。
 //
 // 純ロジック (resolve_note_overlaps) は app.rs の単体テストで検証済。ここでは

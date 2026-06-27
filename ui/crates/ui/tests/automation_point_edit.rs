@@ -53,9 +53,9 @@ struct ObsModel {
     curve_param_events: Vec<(AutomationPointKey, SetAutomationCurveParamKind, f32, f32)>,
     /// M14 Phase 99 (#071): 観測した `SecondaryClickEmpty` の (track, beat, pos) 列。
     secondary_empty: Vec<(u32, f64, (f32, f32))>,
-    /// FIXME #81: 観測した `DoubleClickAutomationPoint` (= 値の数値入力開始) の key 列。
+    /// 観測した `DoubleClickAutomationPoint` (= 値の数値入力開始) の key 列。
     dbl_click_points: Vec<AutomationPointKey>,
-    /// FIXME #81: 観測した `automation_lane_default_rects` (lane header の default 値フィールド rect)。
+    /// 観測した `automation_lane_default_rects` (lane header の default 値フィールド rect)。
     default_rects: Vec<(AutomationLaneKey, Rect)>,
 }
 
@@ -327,7 +327,7 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
                         mm.secondary_empty.push((track, beat, pos));
                     })
                 }
-                // FIXME #81: 既存 point 上の dblclick → 値の数値入力開始。
+                // 既存 point 上の dblclick → 値の数値入力開始。
                 ArrangementEditRequest::DoubleClickAutomationPoint(k) => {
                     Edit::mutate(move |mm: &mut ObsModel| {
                         mm.dbl_click_points.push(k);
@@ -339,7 +339,7 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
         // automation_point_rects を観測 (毎 frame、 caller が context_menu_for で popup anchor 用に使う)
         let rects = resp.automation_point_rects.clone();
         let lasso_active = resp.automation_lasso_active;
-        // FIXME #81: lane header の default 値フィールド rect を観測。
+        // lane header の default 値フィールド rect を観測。
         let default_rects = resp.automation_lane_default_rects.clone();
         ui.push_edit(Edit::mutate(move |mm: &mut ObsModel| {
             mm.point_rects = rects;
@@ -463,7 +463,7 @@ fn lane_body_double_click_emits_add_automation_point() {
     assert!((value_norm - 0.5).abs() < 0.05, "value_norm ≈ 0.5、 actual {value_norm}");
 }
 
-/// FIXME #81: 既存 point の **上**での dblclick は `DoubleClickAutomationPoint` を発火し、
+/// 既存 point の **上**での dblclick は `DoubleClickAutomationPoint` を発火し、
 /// 新規点追加 (`AddAutomationPoint`) は発火しない (widget 内 priority: point hit > clip body)。
 #[test]
 fn dblclick_on_existing_point_emits_double_click_not_add() {
@@ -516,7 +516,7 @@ fn dblclick_on_existing_point_emits_double_click_not_add() {
     );
 }
 
-/// FIXME #81: lane header が default 値の数値入力フィールド rect を `automation_lane_default_rects`
+/// lane header が default 値の数値入力フィールド rect を `automation_lane_default_rects`
 /// で公開する (caller がここに scrubable_number_at を overlay する)。 lane 高さ 60px はフィールドを
 /// 載せられるので Some。
 #[test]

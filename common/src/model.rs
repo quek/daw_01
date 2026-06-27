@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 use crate::plugin_format::PluginFormat;
 use crate::scale::ScaleChange;
 
-/// `28` ビュー状態の保存 (FIXME #87): `ProjectFile.view: Option<ViewState>` 追加。
+/// `28` ビュー状態の保存: `ProjectFile.view: Option<ViewState>` 追加。
 /// ズーム / スクロール / 行高 / スナップ設定等の表示状態を `Song` の **兄弟**として
 /// 同梱する (= Song / IPC は無改変、`ViewState` は serde 専用で IPC を渡らない)。
 /// piano roll / audio editor は per-clip (`ClipKey` keyed) 記憶。旧ファイルは
 /// `#[serde(default)]` で `view == None` → 従来どおり fit-to-content にフォールバック。
 ///
-/// `27` クリップ / ノートのミュート (FIXME #80): `Clip.muted: bool` (= 全 content type
+/// `27` クリップ / ノートのミュート: `Clip.muted: bool` (= 全 content type
 /// 共通の clip-level mute の SSoT) と `Note.muted: bool` (note 単位 mute) が追加される。
 /// `true` の clip / note は再生 / 書き出しから除外され、GUI は dim + 斜線ハッチで表示する。
 /// `q` ショートカットと inspector の "Mute" トグルが SSoT としてここを読み書きする。v26
@@ -30,7 +30,7 @@ use crate::scale::ScaleChange;
 /// to_subtitle_device`、version-gate)。新規 .daw は migration 対象外なので「喋るが
 /// 映さない」(VOICEVOX device のみ) を表現できる。
 ///
-/// `24` プロジェクト識別子 (`docs/plan_fixme_33_clipboard.md`, FIXME #33):
+/// `24` プロジェクト識別子 (`docs/plan_fixme_33_clipboard.md`):
 /// `Song.project_id: u64` が追加される。New で 1 度採番し Save/Load で保持する
 /// document 固有の安定 ID で、クリップボード round-trip 時に「同一プロジェクト由来か」を
 /// 判定して clip/track paste のリンク共有 (同一) / 独立コピー (別) を分岐する。v23 `.daw`
@@ -75,7 +75,7 @@ use crate::scale::ScaleChange;
 /// backfill される (共有 content は最初に見た非空名を採用)。
 /// See `docs/plan_clip_shared_name.md`.
 ///
-/// `25` 映像 Transform device (FIXME #54 Wave3): 「動かす変形」をチェーン上の
+/// `25` 映像 Transform device: 「動かす変形」をチェーン上の
 /// `builtin.video.transform` 配置 device に一本化。値・automation・変調は既存
 /// `GroupTransform` 系のまま (破壊的な値 migration 無し)。`ensure_ids` が旧
 /// `group_transform` 持ちトラックに Transform device を補い (idempotent)、
@@ -207,7 +207,7 @@ pub mod base64_opt {
 pub struct ProjectFile {
     pub version: u32,
     pub song: Song,
-    /// v28 (FIXME #87): GUI の表示状態 (ズーム / スクロール / 行高 / スナップ等)。
+    /// v28: GUI の表示状態 (ズーム / スクロール / 行高 / スナップ等)。
     /// `Song` の兄弟として同梱し、開き直しで「閉じたときの見た目」を復元する。
     /// `None` = 旧ファイル / view 未保存 → loader 側で fit-to-content にフォールバック。
     /// **serde 専用** (= `bincode::Encode/Decode` を付けない) で IPC を渡らないことを
@@ -216,7 +216,7 @@ pub struct ProjectFile {
     pub view: Option<ViewState>,
 }
 
-/// FIXME #87: piano roll 1 クリップ分の表示状態。`AppData.piano_roll_views`
+/// piano roll 1 クリップ分の表示状態。`AppData.piano_roll_views`
 /// (live SSoT) と `ViewState.piano_roll_views` (永続化) の両方で `ClipKey` 単位に
 /// 保持する。`Default` は `AppData::new` / `fit_piano_roll_to_clip` の既定と一致。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -242,7 +242,7 @@ impl Default for PianoRollViewState {
     }
 }
 
-/// FIXME #87: audio editor 1 クリップ分の表示状態 (clip-relative beats)。
+/// audio editor 1 クリップ分の表示状態 (clip-relative beats)。
 /// `len_beats == 0.0` は「未設定」扱い (= クリップ全体表示にフォールバック)。
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct AudioEditorViewState {
@@ -252,7 +252,7 @@ pub struct AudioEditorViewState {
     pub len_beats: f64,
 }
 
-/// FIXME #87: プロジェクトに同梱する GUI 表示状態のスナップショット。
+/// プロジェクトに同梱する GUI 表示状態のスナップショット。
 /// `AppData` (live SSoT) から save 時に `snapshot_view_state` で作り、load 時に
 /// `restore_view_state` で流し込む。**serde 専用** (bincode derive 無し) ＝ IPC を渡らない。
 /// `ClipKey` は struct で JSON の map key にできないため、per-clip view は
@@ -310,7 +310,7 @@ pub struct ViewState {
     pub audio_editor_views: Vec<(ClipKey, AudioEditorViewState)>,
 }
 
-/// FIXME #53 (`docs/plan_arranger_track.md`): Arranger セクション (曲のパート =
+/// Arranger セクション (曲のパート =
 /// Intro / Aメロ / サビ …)。全トラックを縦断する時間レンジ + 名前 + 色で、`Song.sections`
 /// に保持する。位置 (`start_beat`) が並び順の SSoT (別途 order index は持たない)。
 /// `start_beat` 昇順・互いに非交差 (重複なし、隙間は許容) を `Song::normalize_sections`
@@ -472,13 +472,13 @@ pub struct Song {
     /// 直列 process する。 旧 file は `#[serde(default)]` で空 Vec に forward-migrate。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub master_fx_chain: Vec<PluginInstance>,
-    /// v24 (FIXME #33): プロジェクト固有の安定 ID。New で 1 度採番、Save/Load で保持。
+    /// v24: プロジェクト固有の安定 ID。New で 1 度採番、Save/Load で保持。
     /// クリップボード round-trip で「同一プロジェクト由来か」を判定し、clip/track paste の
     /// リンク共有 (同一) / 独立コピー (別) を分岐する。`0` は未採番 sentinel —
     /// load 時に `0` なら `Song::ensure_project_id` が採番する (旧 file forward-migration)。
     #[serde(default)]
     pub project_id: u64,
-    /// FIXME #53 (`docs/plan_arranger_track.md`): 曲のパートを表す Arranger セクション。
+    /// 曲のパートを表す Arranger セクション。
     /// `start_beat` 昇順・互いに非交差 (重複なし、隙間は許容) の invariant を
     /// `normalize_sections` で保つ。旧 file は空 Vec で forward-migrate。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -609,7 +609,7 @@ impl Song {
         id
     }
 
-    /// FIXME #53: allocate a new stable `Section` id, bumping `next_section_id`。
+    /// allocate a new stable `Section` id, bumping `next_section_id`。
     /// `0` は "未採番" sentinel なので最低 `1` から返す。
     pub fn alloc_section_id(&mut self) -> u32 {
         let id = self.next_section_id.max(1);
@@ -625,7 +625,7 @@ impl Song {
         id
     }
 
-    /// FIXME #53: `sections` の invariant を回復する: `start_beat` 昇順、互いに非交差
+    /// `sections` の invariant を回復する: `start_beat` 昇順、互いに非交差
     /// (重複なし、隙間は許容)、`len_beats > 0`。セクションを追加 / 移動 / リサイズした
     /// あとに呼ぶ。重複は「先に始まる方を優先」 (= 後発の `start_beat` を直前 section の
     /// `end_beat` までクランプして隙間化) して解消し、長さが `0` 以下になった section は
@@ -648,7 +648,7 @@ impl Song {
         self.sections.retain(|s| s.len_beats > f64::EPSILON);
     }
 
-    /// FIXME #53 (`docs/plan_arranger_track.md` §3.2): タイムライン全体の ripple シフト。
+    /// タイムライン全体の ripple シフト。
     /// `from_beat` 以降の全ての時間位置を `delta` だけずらす (結果は `0.0` 以上に clamp)。
     /// 破壊的セクション移動の close (`delta < 0` = 範囲を詰める) / open (`delta > 0` =
     /// 範囲を空ける) プリミティブ。 対象は全トラックの clip 位置、各トラックと `song_lanes`
@@ -692,7 +692,7 @@ impl Song {
         self.normalize_sections();
     }
 
-    /// FIXME #53 (`docs/plan_arranger_track.md` §3.3): セクション帯を `dest_start` へ
+    /// セクション帯を `dest_start` へ
     /// 破壊的に移動し、 曲構成を組み替える (Studio One 流の能動アレンジャー)。 帯の範囲
     /// `[a, b)` 内の全トラック clip + automation + `song_lanes` automation + `scale_changes`
     /// を帯と一緒に取り出し、 `[a,b)` を ripple-close で詰め、 `dest_start` に ripple-open で
@@ -833,7 +833,7 @@ impl Song {
         true
     }
 
-    /// FIXME #53 (`docs/plan_arranger_track.md` §3.3): セクション帯を `dest_start` に複製
+    /// セクション帯を `dest_start` に複製
     /// 挿入する (Ctrl+drag、 ripple-insert)。 範囲 `[a,b)` 内の clip / automation を **linked**
     /// (= `content_id` 共有、 REAPER pooled idiom) で複製し、 clip id だけ新規採番。 `dest_start`
     /// 以降を `len` ぶん右へ ripple して空けてから複製を落とす。 元の content は残す。 新しい
@@ -956,7 +956,7 @@ impl Song {
         Some(new_id)
     }
 
-    /// FIXME #53: セクション帯だけ削除する (内容は温存、 Studio One の Backspace 相当)。
+    /// セクション帯だけ削除する (内容は温存、 Studio One の Backspace 相当)。
     /// 削除できたら `true`。
     pub fn delete_section(&mut self, section_id: u32) -> bool {
         let before = self.sections.len();
@@ -964,7 +964,7 @@ impl Song {
         self.sections.len() != before
     }
 
-    /// FIXME #53 (`docs/plan_arranger_track.md` §3.3): セクションの**時間範囲ごと**削除して
+    /// セクションの**時間範囲ごと**削除して
     /// 詰める (Studio One の "Delete Range" 相当、 破壊的)。 境界を分割してから範囲内の全
     /// content を消し、 `[a,b)` を ripple-close で詰める。 削除できたら `true`。
     pub fn delete_section_range(&mut self, section_id: u32) -> bool {
@@ -996,7 +996,7 @@ impl Song {
         true
     }
 
-    /// FIXME #53 (`docs/plan_arranger_track.md` §3.2): 全トラック clip / track automation clip /
+    /// 全トラック clip / track automation clip /
     /// `song_lanes` clip のうち `beat` を**厳密にまたぐ** (`start < beat < start+len`) ものを
     /// 2 つに分割する。 左 clip は元 `content_id` を保持して長さを `beat` まで詰め (= content の
     /// 先頭部分のみ再生)、 右 clip は `cut = beat - start` ぶん左シフトした **fork content** を
@@ -1083,7 +1083,7 @@ impl Song {
         }
     }
 
-    /// FIXME #53: `content_id` の content を clip-local で `cut` 左シフトした新 content を
+    /// `content_id` の content を clip-local で `cut` 左シフトした新 content を
     /// 採番して返す (clip 分割の右側用)。 元 content は不変 (pooled 共有のため)。 linked clip
     /// 名も引き継ぐ。
     fn fork_content_shifted_left(&mut self, content_id: ContentId, cut: f64) -> ContentId {
@@ -1097,7 +1097,7 @@ impl Song {
         new_id
     }
 
-    /// FIXME #53: clip content を clip-local で `cut` 拍ぶん左へずらす。 `cut` より前で完全に
+    /// clip content を clip-local で `cut` 拍ぶん左へずらす。 `cut` より前で完全に
     /// 終わる event/note/point は落とし、 `cut` をまたぐものは先頭 `0` にクランプして長さを
     /// 詰める。 audio は trim 分を `source_start_frames` に按分換算して進める (非ストレッチ前提の
     /// 線形近似)。 automation は `cut` 前の point を落とす (境界値の補間 point 挿入は次段)。
@@ -1246,7 +1246,7 @@ impl Song {
     /// loaded song — value-range sanity, content / source migration, stable
     /// ids, and sort order — so `project::load`'s return value is always
     /// self-consistent regardless of how the file was produced. Idempotent.
-    /// v24 (FIXME #33): `project_id == 0` (未採番 / 旧 file / `Song::default`) なら
+    /// v24: `project_id == 0` (未採番 / 旧 file / `Song::default`) なら
     /// 新規採番する。既に非 0 なら触らない (idempotent) ので、New で採番済みの song に
     /// `normalize_after_load` を再走させても上書きしない。uuid v4 の下位 64bit を使う
     /// (別起動・別マシンでも衝突しない。`0` sentinel は引き直す)。
@@ -1272,7 +1272,7 @@ impl Song {
         self.ensure_overlay_event_coverage();
     }
 
-    /// FIXME #6: overlay clip (image / video / text) は「clip 長 = 表示長」が
+    /// overlay clip (image / video / text) は「clip 長 = 表示長」が
     /// 不変条件。 単一 (または末尾) の event がその clip 長に届かないと、 clip
     /// 範囲内でも event 範囲を抜けて途中で消える (= clip を伸ばしたが event が
     /// 追従していない既存 .daw を自動修復する)。
@@ -1409,7 +1409,7 @@ impl Song {
             p.migrate_legacy_aux();
         }
 
-        // FIXME #54 Wave3 (v25): 旧 `group_transform` を持つトラックにチェーン上の
+        // (v25): 旧 `group_transform` を持つトラックにチェーン上の
         // Transform 配置 device を補う。これで「動かす変形」がチェーンの 1 device
         // として現れ、`resolve_track_transform` の device-gate で効く（device を抜けば
         // 変換が無効）。値・automation・変調は GroupTransform 系のまま（破壊的な値
@@ -2362,7 +2362,7 @@ pub struct Send {
 pub enum InstrumentSource {
     #[default]
     None,
-    /// (FIXME #36) 「このトラックは VOICEVOX builtin で歌わせる」印。
+    /// 「このトラックは VOICEVOX builtin で歌わせる」印。
     /// 声 (singer + style) は per-clip (`Clip::speaker_id` 等) が SSoT で、
     /// トラックは声を持たない unit marker。旧プロジェクト
     /// (`Vocal { speaker_id, style_name }`) は `project::load` の JSON
@@ -2450,7 +2450,7 @@ impl Default for GroupTransform {
 }
 
 impl Track {
-    /// (FIXME #36) このトラックが VOICEVOX で歌う vocal トラックか。 SSoT は
+    /// このトラックが VOICEVOX で歌う vocal トラックか。 SSoT は
     /// 「builtin VOICEVOX device を実際に持つか」。 旧 `InstrumentSource::Vocal`
     /// marker は device 挿入と別管理で out-of-sync になり得る (旧プロジェクトで
     /// source=None + device の実例あり) ため、 装置の実在を真実として判定する。
@@ -2714,7 +2714,7 @@ fn default_mod_color() -> [f32; 3] {
 
 /// 共有モジュレーション源 (1 source → 多 params、 plan Q2)。 `Song.mod_sources`
 /// が route の唯一の所有者。 `id` で `ModRouting.source_id` から参照される。
-/// FIXME #56: envelope follower 専用から **generator 種別** (`kind`) へ一般化。
+/// envelope follower 専用から **generator 種別** (`kind`) へ一般化。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ModSource {
     /// 安定 id。 `0` は "未採番" sentinel、 `ensure_ids` が採番。
@@ -2795,8 +2795,8 @@ pub struct ModRouting {
 // Generator modulators (LFO / Random / MSEG / Steps) — docs/plan_fixme_56_modulators.md
 // =====================================================================
 //
-// `ModSource` を envelope follower 専用から **generator 種別** へ一般化する
-// (FIXME #56)。envelope follower は audio 入力に依存し engine ring が `env` を
+// `ModSource` を envelope follower 専用から **generator 種別** へ一般化する。
+// envelope follower は audio 入力に依存し engine ring が `env` を
 // 算出するが、generator (LFO/Random/MSEG/Steps) は **`song_beat` の純粋関数** で
 // audio に依存しない。よって ring 不要・状態レス・全経路 (RT preview / 音声書き出し
 // / video export) で同一関数 → drift ゼロ・bounce 完全再現。評価は
@@ -3141,7 +3141,7 @@ impl PluginInstance {
     }
 }
 
-/// serde `skip_serializing_if` 用: `u32` が 0 か。`Clip::speaker_id` (FIXME #36)
+/// serde `skip_serializing_if` 用: `u32` が 0 か。`Clip::speaker_id`
 /// の「未採番は serialize しない」に使う。
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
@@ -3227,7 +3227,7 @@ pub struct Clip {
     /// v20 files forward-migrate to `false`。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_lipsync: bool,
-    /// (FIXME #80) clip 全体のミュート (= MIDI / audio / video / image / 字幕 / 歌唱
+    /// clip 全体のミュート (= MIDI / audio / video / image / 字幕 / 歌唱
     /// すべての content type 共通の clip-level mute の SSoT)。`true` で再生・書き出しから
     /// この clip を除外し、GUI は dim + 斜線ハッチで「ミュート中」を表示する。`q`
     /// ショートカット (選択 clip / カーソル直下 clip を toggle) と各 content inspector の
@@ -3237,7 +3237,7 @@ pub struct Clip {
     /// `false` に forward-migrate。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub muted: bool,
-    /// (FIXME #36) この clip の VOICEVOX 歌唱声 = `/frame_synthesis` の speaker
+    /// この clip の VOICEVOX 歌唱声 = `/frame_synthesis` の speaker
     /// (= `/singers` の歌唱 style id)。clip 単位で独立・焼き込み (前の clip の
     /// 声を後で変えても後続に波及しない)。`0` = 未採番 (= 合成時に
     /// `voicevox::DEFAULT_SINGER_ID` へフォールバック)。vocal track 上の MIDI
@@ -3245,12 +3245,12 @@ pub struct Clip {
     /// `project::load` の migration で旧トラック声を焼き込む。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub speaker_id: u32,
-    /// (FIXME #36) 表示用キャラ名 (例: "中国うさぎ")。`/singers` 未取得でも
+    /// 表示用キャラ名 (例: "中国うさぎ")。`/singers` 未取得でも
     /// inspector が現在の声を出せるよう焼き込む。空なら一覧取得後に
     /// `speaker_id` から逆引きして埋める。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub singer_name: String,
-    /// (FIXME #36) 表示用スタイル名 (例: "ノーマル" / "へろへろ")。同上。
+    /// 表示用スタイル名 (例: "ノーマル" / "へろへろ")。同上。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub style_name: String,
     /// (talk) VOICEVOX 読み上げの全体スケール (話速/音高/抑揚/音量)。
@@ -3311,7 +3311,7 @@ impl Default for ClipContent {
 }
 
 impl ClipContent {
-    /// FIXME #6: overlay content (image / video / text) の末尾 (`event_start`
+    /// overlay content (image / video / text) の末尾 (`event_start`
     /// 最大) event を、 その end が `clip_length_beats` に届くよう extend する
     /// (extend-only)。 単一 event なら clip 全長を覆い「clip 長 = 表示長」を保証。
     /// 縮めはしない (linked clip / `event > clip` の無害な不整合や多 event の
@@ -4109,7 +4109,7 @@ pub struct Note {
     pub velocity: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lyric: Option<String>,
-    /// (FIXME #80) note 単位のミュート。`true` でこの note を再生・書き出しから除外し
+    /// note 単位のミュート。`true` でこの note を再生・書き出しから除外し
     /// (歌唱 note も含む)、piano roll は dim + 斜線ハッチで「ミュート中」を表示する。`q`
     /// ショートカット (選択 note / カーソル直下 note を toggle) が読み書きする。linked clip は
     /// content (= notes) を共有するので、note mute も linked clip 間で共有される。v26 以前は
@@ -4555,7 +4555,7 @@ mod tests {
         serde_json::from_str(&json).unwrap()
     }
 
-    // ---- FIXME #53: Arranger Section model ----
+    // ---- Arranger Section model ----
 
     fn mk_section(id: u32, start: f64, len: f64) -> Section {
         Section {
@@ -4857,7 +4857,7 @@ mod tests {
 
     #[test]
     fn ensure_image_video_event_coverage_extends_short_event() {
-        // FIXME #6: clip=48 / image event=32 → event を 48 まで extend して
+        // clip=48 / image event=32 → event を 48 まで extend して
         // clip 範囲内で途中消失しないようにする (= 既存 .daw の load 修復)。
         let mut song = Song::default();
         let cid = song.alloc_content_id();
@@ -4936,7 +4936,7 @@ mod tests {
 
     #[test]
     fn ensure_overlay_event_coverage_extends_text_clip() {
-        // FIXME #6 (Text 版): クレジット text clip @0+48 だが event_length=4 →
+        // (Text 版): クレジット text clip @0+48 だが event_length=4 →
         // bar2 (beat4) で event 範囲を抜けて消える。event を 48 まで extend する。
         let mut song = Song::default();
         let cid = song.alloc_content_id();
@@ -5423,14 +5423,14 @@ mod tests {
         // Pinning the constant catches accidental rollback. See
         // `docs/plan_linear_chain.md`. v24 adds `Song.project_id`
         // (`docs/plan_fixme_33_clipboard.md`, clipboard same-project detection).
-        // v25 (FIXME #54 Wave3): 旧 `group_transform` 持ちトラックに `builtin.video.transform`
+        // v25: 旧 `group_transform` 持ちトラックに `builtin.video.transform`
         // 配置 device を `ensure_ids` で補う (additive、値 migration 無し)。
         // v26 (`docs/plan_voicevox_talk.md`): `Clip.talk` 追加 + テキストオーバーレイ表示が
         // `builtin.video.subtitle` device gate になり、v25 以前は load 時に Text 持ち
         // トラックへ字幕デバイスを auto-insert (`project::migrate_text_overlay_to_subtitle_device`)。
-        // v27 (FIXME #80): `Clip.muted` / `Note.muted` 追加 (clip / note mute の SSoT)、v26 以前の
+        // v27: `Clip.muted` / `Note.muted` 追加 (clip / note mute の SSoT)、v26 以前の
         // per-event mute は `project::migrate_per_event_mute_to_clip_mute` で `Clip.muted` へ畳み込む。
-        // v28 (FIXME #87): `ProjectFile.view: Option<ViewState>` 追加 (= ズーム/スクロール等の
+        // v28: `ProjectFile.view: Option<ViewState>` 追加 (= ズーム/スクロール等の
         // 表示状態を Song の兄弟として同梱)。Song / IPC は無改変、旧ファイルは `#[serde(default)]`
         // で `view == None` に forward-migrate (migration 関数不要)。
         assert_eq!(CURRENT_VERSION, 28);
@@ -5438,7 +5438,7 @@ mod tests {
 
     #[test]
     fn v25_ensure_ids_adds_transform_device_for_group_transform_tracks() {
-        // FIXME #54 Wave3: 旧 group_transform 持ちトラックは ensure_ids で Transform
+        // 旧 group_transform 持ちトラックは ensure_ids で Transform
         // 配置 device を 1 つ得る (idempotent: 2 回呼んでも 1 つ)。group_transform 無しは付かない。
         let mut song = Song {
             tracks: vec![

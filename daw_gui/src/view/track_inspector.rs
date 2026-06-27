@@ -47,7 +47,7 @@ const TOGGLE_AUDIO_BASE: ToggleButtonStyle = ToggleButtonStyle {
 const TOGGLE_IMAGE_AUTOMATE: ToggleButtonStyle = ToggleButtonStyle {
     off_color: theme::CONTROL,
     // ON 色は arrangement automation lane ヘッダの「薄い藤色」に揃えた専用色。theme に
-    // automation-lane purple の token が無いので一点物としてベタ書きを残す (FIXME #88)。
+    // automation-lane purple の token が無いので一点物としてベタ書きを残す。
     on_color: Color { r: 0.78, g: 0.55, b: 0.85, a: 1.0 },
     border: theme::BORDER,
     border_width: 1.0,
@@ -72,7 +72,7 @@ const SCRUB_STYLE_GROUP: ScrubableNumberStyle = ScrubableNumberStyle {
     range: None,
 };
 
-/// FIXME #15 (`docs/plan_inspector_scrub.md`): audio / image / text inspector
+/// audio / image / text inspector
 /// の数値 field を 1 行ぶん描く共通 helper。 `ui.scrubable_number_at` を呼び、
 /// on_change で `make_event(v)` が返す `AppEvent` を全 event に broadcast、
 /// drag / text 編集の開始・終了 edge で `BeginInspectorScrub` /
@@ -92,7 +92,7 @@ fn scrub_field(
     scrub_key: InspectorScrubField,
     make_event: impl Fn(ClipRef, f64) -> AppEvent + Clone + Send + Sync + 'static,
 ) {
-    // FIXME #46: 複数選択時は inspector_target_refs 全体へ broadcast する。 値が
+    // 複数選択時は inspector_target_refs 全体へ broadcast する。 値が
     // 割れている field は `value == None` で渡され、 placeholder「—」を表示 (編集
     // 開始で base = default に戻る)。 `mutate_*_events_in_clip` は variant-safe なので、
     // broadcast 先に種別違いのクリップが混ざっても no-op で安全 (= その field を
@@ -155,7 +155,7 @@ fn scrub_field(
     }
 }
 
-/// FIXME #15: audio / image / text inspector の scrubable_number base style。
+/// audio / image / text inspector の scrubable_number base style。
 /// sensitivity / range は field 別に上書きする (= Group Transform と同 idiom、
 /// `SCRUB_STYLE_GROUP` を共有)。
 const SCRUB_STYLE_INSPECTOR: ScrubableNumberStyle = SCRUB_STYLE_GROUP;
@@ -229,7 +229,7 @@ fn image_source_label(src: &common::model::ImageSource) -> String {
         .to_string()
 }
 
-// FIXME #56: generator の rate (tempo 同期 division か Free Hz) 選択肢。
+// generator の rate (tempo 同期 division か Free Hz) 選択肢。
 const MOD_RATE_DIVS: [(&str, u32, u32); 9] = [
     ("1/16", 1, 16),
     ("1/8T", 1, 12),
@@ -282,7 +282,7 @@ fn mod_rate_control(
     }
 }
 
-// FIXME #56: モジュレーター用グラフィカルエディタの色味。
+// モジュレーター用グラフィカルエディタの色味。
 const MOD_EDITOR_STYLE: MsegEditorStyle = MsegEditorStyle {
     bg: theme::INSET_BG,
     grid: theme::GRID_LINE.with_alpha(0.06),
@@ -290,7 +290,7 @@ const MOD_EDITOR_STYLE: MsegEditorStyle = MsegEditorStyle {
     line_width_px: 2.0,
     node_color: theme::TEXT,
     // node の hover (淡黄) / drag (珊瑚) は curve エディタ固有の操作中アフォーダンス。
-    // 中立な hover/drag マーカー token が無いので一点物としてベタ書きを残す (FIXME #88)。
+    // 中立な hover/drag マーカー token が無いので一点物としてベタ書きを残す。
     node_hover_color: Color { r: 1.0, g: 1.0, b: 0.6, a: 1.0 },
     node_drag_color: Color { r: 0.95, g: 0.45, b: 0.4, a: 1.0 },
     node_radius_px: 5.0,
@@ -496,7 +496,7 @@ fn mod_retrigger_toggle(
     );
 }
 
-/// FIXME #56 (Bitwig 同等): モジュレーションラックを **スクロール viewport の top-down
+/// モジュレーションラックを **スクロール viewport の top-down
 /// フロー** で描く (旧: 下端 pinned・2 個 cap)。各ソースは折りたたみ行で、クリックで
 /// クリックで大きなグラフィカルエディタに展開する (`app.expanded_mod_sources`、 複数同時可)。
 /// 戻り値は描画後の `y`。
@@ -1148,7 +1148,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     y += 28.0;
 
-    // ---- FIXME #23: param セクションを縦スクロール領域に収める --------------
+    // ---- param セクションを縦スクロール領域に収める --------------
     // title 下〜area 下端を param viewport (上、 scroll) と chain band (下、 pinned)
     // に分割する。 param の実高さは前フレーム測定値 (`inspector_body_h`、
     // immediate-mode の lag-by-one) を content_size に使い、 viewport = content と
@@ -1160,7 +1160,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let body_top = y;
     let max_param_h = (area.y + area.h - body_top - CHAIN_MIN_H).max(0.0);
     let content_h = app.inspector_body_h.max(1.0);
-    // FIXME #78: param viewport の高さは **常に最大** に固定する。 旧実装は
+    // param viewport の高さは **常に最大** に固定する。 旧実装は
     // `content_h.min(max_param_h)` で content に追従させていたため、 device の
     // 「Par」パラメータパネルを開くと content_h が増えて viewport が伸び、
     // chain band (= Par ボタン) が下にずれて「押した瞬間ボタンが動く / 表示して
@@ -1216,7 +1216,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &TOGGLE_AUDIO_BASE,
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
-                    // FIXME #46: 選択全クリップへ一括 (variant-safe broadcast)。
+                    // 選択全クリップへ一括 (variant-safe broadcast)。
                     app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
                         targets: app.inspector_target_refs(),
                         edit: DiscreteClipEdit::Reversed(new_rev),
@@ -1895,7 +1895,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += input_h + 12.0;
     }
 
-    // ---- Plugin chain + 行内アコーディオン (FIXME #78) -----------------
+    // ---- Plugin chain + 行内アコーディオン -----------------
     // チェーン (プラグイン一覧) を viewport 内に出し、 各行の Par で開いたデバイスの
     // param パネルを **その行の直下** に展開する (`reorderable_list_expandable`)。 開いた
     // 行だけ `row_extra_h > 0` → expansion クロージャが呼ばれ、 中の各 section gate が
@@ -2161,7 +2161,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += 8.0;
     }
 
-    // FIXME #54 Wave4: 内蔵映像 FX のパラメータ調整パネル（チェーン行の "GUI" ボタンで開閉）。
+    // 内蔵映像 FX のパラメータ調整パネル（チェーン行の "GUI" ボタンで開閉）。
     // 各 param を scrubable_number で実レンジ表示 + per-control 変調（Ranged domain で kick→効果）。
     // 値の SSoT は PluginParam lane の default_value（`SetVideoFxParam` が格納）。
     if let Some(view) = app.inspector_video_fx_params() {
@@ -2237,7 +2237,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         y += 8.0;
     }
 
-    // ---- Plugin param panel (FIXME #78) -----------------------------------
+    // ---- Plugin param panel -----------------------------------
     // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し CLAP・VST3) の
     // チェーン行「Par」ボタンで開閉。 VOICEVOX は device 既定の声 (キャラ→スタイル)
     // を、 汎用 plugin は param を scrubable_number で実レンジ編集する。 値の SSoT は
@@ -2334,7 +2334,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ---- Text Event section (`docs/plan_text_overlay.md` §4 P5 + P5.B) --
     // selected_clip が `ClipContent::Text` のとき、 first event の全 field
     // (text / font / align / 23 numeric + 2 fade beats / fade curves / mute)
-    // を expose。 FIXME #15: numeric field は scrubable_number 化され、
+    // を expose。 numeric field は scrubable_number 化され、
     // on_change が `TextNumField` discriminator 付き `SetClipTextNumField` を
     // 直接 dispatch する (drag / type 両対応、 undo は Begin/EndInspectorScrub)。
     //
@@ -2347,7 +2347,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .selected_clip_ref()
         .and_then(|r| app.song.tracks.get(r.track as usize))
         .is_some_and(common::model::Track::has_subtitle_device);
-    // FIXME #78: 字幕 device の「Par」を押したときだけ Text Event 欄を出す
+    // 字幕 device の「Par」を押したときだけ Text Event 欄を出す
     // (= 専用欄を常時表示せず Par パネルに集約)。
     if text_track_has_subtitle
         && app.subtitle_param_panel_open()
@@ -2427,7 +2427,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         y += input_h + 4.0;
 
-        // Font family: ボタンで font picker を開く (FIXME #25)。ラベルは現在の
+        // Font family: ボタンで font picker を開く。ラベルは現在の
         // フォント (空 = デフォルト)。検索付きモーダルで選び、 ↑↓ / ホバーで
         // キャンバスにライブプレビューされる。
         ui.label_at(
@@ -2489,7 +2489,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         y += input_h + 8.0;
 
-        // FIXME #15: 23 numeric rows + 2 fade beats を 1 closure 化した helper。
+        // 23 numeric rows + 2 fade beats を 1 closure 化した helper。
         // 各行を scrubable_number 化し (= 1 箇所変更で 25 行全部が drag 対応)、
         // `scrub_field` で drag / text 編集を undo 1 step に bracket する。
         // automate 「A」 トグルは従来どおり共存。 値源は summary の first event
@@ -2699,7 +2699,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 描画しない (track 0 を誤対象にしない)。
     let cursor_idx = app.cursor_track_index();
 
-    // (FIXME #36) Clip Voice 編集: 選択中の clip が vocal track 上の MIDI clip の
+    // Clip Voice 編集: 選択中の clip が vocal track 上の MIDI clip の
     // とき、 キャラ ▼ → スタイル ▼ の 2 段 dropdown で per-clip 声を選ぶ。
     // 声は per-clip (`Clip::speaker_id`) が SSoT、 SetClipVoice で焼き込む。
     if app.voicevox_param_panel_open()
@@ -3121,7 +3121,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
-    // ---- 親グループ (Parent) の編集 UI はインスペクタから撤去した (FIXME #39) ----
+    // ---- 親グループ (Parent) の編集 UI はインスペクタから撤去した ----
     // 親子 (グループ階層) の編集はアレンジビューでのトラックドラッグ
     // (`ArrangementEditRequest::SetTrackParent`) 一本に統一する。階層は
     // アレンジの入れ子インデントで可視化されるので、同じ概念をインスペクタの
@@ -3132,7 +3132,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ---- 口パク (lip-sync) 出力先 binding ----------------------------
     // Vocal track のみ。生成した口画像 ImageEvent を焼き込む先の口 track
     // (立ち絵 group の子 image track) を選ぶ。設定で再生成が走る。
-    // FIXME #78: VOICEVOX device の「Par」を押したときだけ出す (= 専用欄を常時
+    // VOICEVOX device の「Par」を押したときだけ出す (= 専用欄を常時
     // 表示せず Par パネルに集約。声 / 話速 / 口パク先をまとめて 1 箇所で編集)。
     if app.voicevox_param_panel_open()
         && let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i))
@@ -3312,14 +3312,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
-    // FIXME #56: Modulation rack を scroll viewport 末尾に置く (top-down フロー、
+    // Modulation rack を scroll viewport 末尾に置く (top-down フロー、
     // 展開で 1 個を大きなグラフィカルエディタに、ソース数無制限・スクロール)。
     y += 10.0;
     y = draw_modulation_rack(app, ui, area, pad, y);
 
     measured_body_h.set(y - (body_top - scroll_off.1));
     });
-    // FIXME #23: 測定した param 実高さを次フレーム用に保存 (変化時のみ edit を積む)。
+    // 測定した param 実高さを次フレーム用に保存 (変化時のみ edit を積む)。
     let measured = measured_body_h.get();
     if (app.inspector_body_h - measured).abs() > 0.5 {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -3328,7 +3328,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
     // chain band (下端 pinned): sidechain / modulation / 下端ボタン。 chain list 本体と
     // 各デバイスの param パネルは viewport 内のアコーディオン (上の
-    // reorderable_list_expandable、 FIXME #78) に移動した。
+    // reorderable_list_expandable) に移動した。
     let btns_h = 26.0;
     let btns_y = area.y + area.h - btns_h - pad;
 

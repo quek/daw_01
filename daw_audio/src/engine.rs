@@ -83,7 +83,7 @@ pub enum AudioCommand {
     /// Drop a previously-opened plugin shmem mapping. Triggered on
     /// RemoveSlotPlugin / RemoveTrack from the GUI side.
     ClosePluginShmem { plugin_id: u32 },
-    /// FIXME #32: atomically re-key `slot_to_plugin_id` for a chain reorder.
+    /// atomically re-key `slot_to_plugin_id` for a chain reorder.
     /// `moves` is the complete `(old_index, new_index)` permutation of
     /// `track`'s loaded plugins (see `MainToChild::ReorderChain`). Only the
     /// device-index KEYS move — the plugin ids and their `plugin_refs` are
@@ -146,10 +146,10 @@ pub struct SharedState {
     /// Last published playhead in samples. Mirrored to shmem for the GUI
     /// playhead cursor. **書き込みは audio thread (`process_buffer`) 単独**。
     /// IPC スレッドは seek を `pending_seek` に積むだけで、ここを直接書かない
-    /// (FIXME #41: 直接書くと buffer 末の advance store と race して、Stop 直後
+    /// (直接書くと buffer 末の advance store と race して、Stop 直後
     /// に停止位置へ巻き戻る = 開始位置に戻らないバグになる)。
     pub playhead: AtomicU64,
-    /// FIXME #41: GUI からの `SeekTo` 要求を audio thread に渡す single-writer
+    /// GUI からの `SeekTo` 要求を audio thread に渡す single-writer
     /// チャネル。IPC 受信スレッドが目標サンプル位置を `store`、audio thread が
     /// `process_buffer` 冒頭で `swap` 消費して `playhead` に反映する。これにより
     /// `playhead` の writer を audio thread 単独に保ち、停止/seek の競合を排除する。
@@ -169,13 +169,13 @@ pub struct SharedState {
     /// `render_metronome` で読む。 false なら click 生成を skip (= 無音)。
     /// 起動時 default false。
     pub metronome_enabled: AtomicBool,
-    /// FIXME #60: パニックボタンの declick トリガ。 IPC スレッドが
+    /// パニックボタンの declick トリガ。 IPC スレッドが
     /// `MainToChild::Panic` で `true` を store、 CPAL コールバックが各 buffer 頭で
     /// `swap(false)` して master を fade-out → hold へ入れる。 panic が全 plugin を
     /// mix から外す瞬間の段差クリックを、 master を先にフェードミュートして隠す
     /// ための edge フラグ。
     pub panic_declick: AtomicBool,
-    /// FIXME #60: declick の hold を解除して fade-in へ移すトリガ。 daw_gui が
+    /// declick の hold を解除して fade-in へ移すトリガ。 daw_gui が
     /// `ReinitAllPlugins` の完了 (`PluginsReinitDone`) を確認してから
     /// `MainToChild::PanicRelease` で `true` を store する。 これで master の
     /// ミュート解除を「固定タイマー」 ではなく「reinit が実際に終わった瞬間」 に
@@ -246,7 +246,7 @@ pub struct EngineShared {
     /// and abort (deleting the partial WAV) when set. Raised by
     /// `MainToChild::CancelExport` (= the progress overlay's Cancel button).
     pub export_cancel: AtomicBool,
-    /// FIXME #55: set `true` by the CPAL callback once it observes
+    /// set `true` by the CPAL callback once it observes
     /// `export_running` and parks (writes silence, skips dispatch); set `false`
     /// on any normal (non-parked) buffer. The export thread sets
     /// `export_running` then waits for this to go `true` before it dispatches,
@@ -540,7 +540,7 @@ impl LocalState {
                         (**self.shared.slot_to_plugin_id.load()).clone();
                     if let Some(stale) = new_slot.insert((track, index), plugin_id)
                         && stale != plugin_id
-                        // FIXME #31: only drop the displaced plugin from
+                        // only drop the displaced plugin from
                         // plugin_refs if it isn't still mapped at ANOTHER index.
                         // On a live move the displaced plugin keeps being
                         // processed at its new device index (its OpenPluginShmem
@@ -746,7 +746,7 @@ impl LocalState {
             return;
         }
 
-        // FIXME #41: GUI からの seek 要求を audio thread 単独 writer として
+        // GUI からの seek 要求を audio thread 単独 writer として
         // `playhead` に反映する。IPC スレッドが `playhead` を直接書くと、下の
         // buffer 末 advance store と同一 atomic を別スレッドから書く race になり、
         // Stop 直後 (in-flight buffer がまだ playing で advance する瞬間) に開始
@@ -768,7 +768,7 @@ impl LocalState {
                 self.playing = true;
                 // Play は **現在の playhead からそのまま再生する** (頭出しは
                 // しない)。「どこから再生するか」「停止でどこへ戻すか」は GUI 側
-                // が所有する (FIXME #41 のモデル A = Pro Tools / Ableton 流の
+                // が所有する (モデル A = Pro Tools / Ableton 流の
                 // 「停止すると再生を押した位置に戻る」)。GUI は play() 時の
                 // playhead を origin として記録し、stop() で SeekTo を送って
                 // engine カーソルを origin に揃える。engine はその SeekTo
@@ -890,7 +890,7 @@ impl LocalState {
             // param modulation, reusing the buffer (no per-buffer alloc). The
             // EnvelopeFollow nodes for THIS buffer run post-dispatch, so param
             // events see the prior buffer's env — a ~1-buffer (block-rate) lag.
-            // FIXME #56: follower の env (= 前 buffer 値、 上記の lag) に加え、
+            // follower の env (= 前 buffer 値、 上記の lag) に加え、
             // generator (LFO/Random/MSEG/Steps) は `song_beat`/`song_secs` から
             // この buffer の値を直接算出する (状態レス・lag なし、 決定論)。
             self.mod_scalars_snapshot.clear();
@@ -1046,7 +1046,7 @@ impl LocalState {
             // docs/plan_modulation.md §4.2: publish each ModSource's envelope
             // follower scalar (block-rate, `env` after this buffer) so the GUI
             // poller can apply visual/param modulation. Atomic stores, RT-safe.
-            // FIXME #56: follower は env、 generator は song 位置から直接算出して publish。
+            // follower は env、 generator は song 位置から直接算出して publish。
             let pub_song_secs = playhead as f64 / sample_rate as f64;
             for (slot, (fs, kind)) in self
                 .cached_schedule
@@ -1679,7 +1679,7 @@ fn any_tap_at(song: &Song, track_id: u32, want: common::model::TapPoint) -> bool
         .chain(song.master_fx_chain.iter())
         .flat_map(|p| p.aux_inputs.iter().flatten())
         .any(|r| hit(&r.tap))
-        // FIXME #56: generator (LFO/Random/MSEG/Steps) は tap を持たない。 follower のみ走査。
+        // generator (LFO/Random/MSEG/Steps) は tap を持たない。 follower のみ走査。
         || song
             .mod_sources
             .iter()

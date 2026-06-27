@@ -44,7 +44,7 @@ const LIST_STYLE: ListViewStyle = ListViewStyle {
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // is_plugin_picker_open を modal 可視性の SSoT にする。 選択時 (Ctrl 以外) は
     // select_plugin_from_db が flag=false にするので、 ここで modal を閉じる
-    // (= 選択したら閉じる、 FIXME #26)。 Ctrl 選択は flag=true のままなので開いた
+    // (= 選択したら閉じる)。 Ctrl 選択は flag=true のままなので開いた
     // まま連続追加できる。
     if app.is_plugin_picker_open && !ui.is_modal_open("plugin_picker") {
         ui.open_modal("plugin_picker");
@@ -144,7 +144,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 && let Some(target) = app.plugin_picker_visible.get(app.plugin_picker_cursor)
             {
                 let id = target.id.clone();
-                // 修飾キー (FIXME #26): Ctrl=開いたまま連続追加 / Shift=GUI を開かない。
+                // 修飾キー: Ctrl=開いたまま連続追加 / Shift=GUI を開かない。
                 let m = ui.pointer().modifiers;
                 let keep_open = m.ctrl;
                 let open_gui = !m.shift;
@@ -253,7 +253,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 && let Some(target) = visible.get(idx)
             {
                 let id = target.id.clone();
-                // 修飾キー (FIXME #26): Ctrl=開いたまま連続追加 / Shift=GUI を開かない。
+                // 修飾キー: Ctrl=開いたまま連続追加 / Shift=GUI を開かない。
                 let m = ui.pointer().modifiers;
                 let keep_open = m.ctrl;
                 let open_gui = !m.shift;

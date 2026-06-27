@@ -1705,7 +1705,7 @@ fn log_note_ports(plugin: *const clap_plugin, get_ext: GetExtFn) {
     tracing::info!(inputs, outputs, "note-ports");
 }
 
-/// FIXME #29: CLAP プラグインを一時 instantiate して note-ports / audio-ports
+/// CLAP プラグインを一時 instantiate して note-ports / audio-ports
 /// extension から port 構成を読む。 daw_plugin_host の `--probe-clap` one-shot
 /// モードから呼ばれる。 CLAP descriptor の feature には note 出力の有無が無い
 /// (`note-effect` 等の文字列があるだけ) ため、 dual-role (note 出力する instrument、

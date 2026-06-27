@@ -84,17 +84,17 @@ pub struct Note {
     pub pitch: u8,
     pub velocity: u8,
     pub lyric: Option<Arc<str>>,
-    /// FIXME #80 (daw_01): note がミュート中なら `true`。 widget は note fill を暗く沈め
+    /// note がミュート中なら `true`。 widget は note fill を暗く沈め
     /// (`muted_dim_fill`)、 斜線ハッチを重ねて「再生されない」 を示す。 caller は
     /// `Note.muted` をそのまま渡す。 `false` のとき描画は既存と完全一致。
     pub muted: bool,
-    /// FIXME #93 (daw_01): 複数クリップ同時表示でのノート毎の描画 / インタラクション属性。
+    /// 複数クリップ同時表示でのノート毎の描画 / インタラクション属性。
     /// `NoteStyle::default()` (= `color: None` / 非 dim / 非 locked) のとき描画と hit-test は
     /// 既存と完全一致するので、単一クリップ表示や examples は default のままで挙動が変わらない。
     pub style: NoteStyle,
 }
 
-/// FIXME #93 (daw_01): 複数クリップ同時ピアノロール編集での、ノート毎の描画 / インタラクション属性。
+/// 複数クリップ同時ピアノロール編集での、ノート毎の描画 / インタラクション属性。
 ///
 /// 既存 (単一クリップ) 挙動は `NoteStyle::default()` (全フィールド既定) で完全に再現されるため、
 /// 新フィールドを意識しない caller / examples は default を渡せばよい。
@@ -400,14 +400,14 @@ pub struct PianoRollView {
     /// widget 内 (`px_per_interval < 6px` で自動的に 2 段に落ちる)。 線色・幅は
     /// [`PianoRollStyle::sub_line`] / [`PianoRollStyle::sub_line_width_px`]。
     pub sub_grid_interval_beats: Option<f64>,
-    /// (FIXME #82) 新規 note の **既定長** (拍)。 (a) Insert shortcut、 (b) 空白ダブルクリック
+    /// 新規 note の **既定長** (拍)。 (a) Insert shortcut、 (b) 空白ダブルクリック
     /// 作成で **ドラッグせず即放し** したときの note 長に使う。 caller (daw_01) は
     /// `last_note_duration_beats` (= 直近に描いた / 選択した note の長さ) を渡す = Bitwig の
     /// 「直前にドラッグした長さがそのクリップの新既定になる」 挙動を SSoT 1 本で実現する。
     /// ダブルクリック作成でボタンを放さず左右ドラッグしたときは、 ドラッグ長 (snap 済み右端 −
     /// start) が優先され、 この既定長は使われない。 値は widget 側で `0.0625` (1/16) 下限に clamp。
     pub default_note_len_beats: f64,
-    /// (FIXME #89) `start_beat` が左へスクロールできる下限 (song-absolute 拍)。daw_01 では編集対象 clip の
+    /// `start_beat` が左へスクロールできる下限 (song-absolute 拍)。daw_01 では編集対象 clip の
     /// 開始拍 (= `pianoroll_scroll_beat >= 0` を絶対拍に直したもの)。edge auto-scroll が左端で view を
     /// この値で clamp し、「実際に適用される scroll 量」 を正しく算出して掴んでいる対象を追従させる
     /// (caller の `SetPianoRollScrollX(_.max(0))` clamp と一致させ、anchor が過剰 shift して対象が
@@ -464,13 +464,13 @@ pub enum PianoRollEditRequest {
     /// 計算 (「release で grid に飛ぶ」 不整合を構造的に回避)。
     /// arrangement `ArrangementEditRequest::SetLoopRange` と完全同形。
     SetLoopRange { start: f64, end: f64 },
-    /// (FIXME #89) edge auto-scroll による横スクロール要求 (delta、拍)。drag 中にポインタが grid 左右端の
+    /// edge auto-scroll による横スクロール要求 (delta、拍)。drag 中にポインタが grid 左右端の
     /// hot-zone に入った frame で発火する。caller は `pianoroll_scroll_beat` に delta を加算し `>= 0` に
     /// clamp する (= `SetPianoRollScrollX(scroll + by)`)。clip 相対オフセットを widget が知らずに済むよう
     /// 絶対値でなく delta で渡す。arrangement は絶対 `SetScrollX` を持つが piano roll の scroll は clip
     /// 相対なので delta 形にする。
     ScrollByBeats(f64),
-    /// (FIXME #89) edge auto-scroll による縦 (pitch) スクロール要求 (絶対 top_pitch)。drag 中にポインタが
+    /// edge auto-scroll による縦 (pitch) スクロール要求 (絶対 top_pitch)。drag 中にポインタが
     /// grid 上下端の hot-zone に入った frame で発火する。widget が `11..=127` を考慮した clamp 後の値を
     /// 送る (caller の `SetPianoRollTopPitch` handler も同 clamp)。`SetPianoRollScrollX` と同じく view 層が
     /// `SetPianoRollTopPitch` に変換する。
@@ -515,7 +515,7 @@ pub struct PianoRollResponse {
     /// 独立 (鍵盤 press は note drag を開始しない)。caller は前フレーム値との差分で note-on/off を
     /// 導出する (`None→Some`=on / `Some(a)→Some(b)`=off+on / `Some→None`=off)。
     pub keyboard_active_pitch: Option<u8>,
-    /// (FIXME #82) 空白ダブルクリック作成 session が active か (押下のまま drag で長さ決定中)。
+    /// 空白ダブルクリック作成 session が active か (押下のまま drag で長さ決定中)。
     /// `true` のとき作成プレビューが grid に出ており、release で `Add` 発行。 caller は `dragging`
     /// と同様に「drag/作成中は wheel zoom/scroll を無効化」する判断に使う。
     pub creating: bool,
@@ -557,10 +557,10 @@ pub struct PianoRollStyle {
     pub sub_line_width_px: f32,
     pub note_fill_fn: NoteFillFn,
     pub note_border_radius_px: f32,
-    /// FIXME #80 (daw_01): muted note に重ねる斜線ハッチの色 (半透明)。default は
+    /// muted note に重ねる斜線ハッチの色 (半透明)。default は
     /// 半透明黒 `rgba(0,0,0,0.40)`。`Note.muted == true` のときのみ描画。
     pub note_muted_hatch_color: Color,
-    /// FIXME #80 (daw_01): muted note ハッチの線間隔 (px、default 5.0) と線幅 (px、default 1.0)。
+    /// muted note ハッチの線間隔 (px、default 5.0) と線幅 (px、default 1.0)。
     /// note は clip より小さいので clip ハッチより密にする。
     pub note_muted_hatch_spacing_px: f32,
     pub note_muted_hatch_width_px: f32,
@@ -657,7 +657,7 @@ pub fn default_velocity_color(velocity: u8) -> Color {
     Color::rgba(0.35 + t * 0.35, 0.55 + t * 0.30, 0.85 + t * 0.10, 1.0)
 }
 
-/// FIXME #93 (daw_01): クリップ基底色 `base` を velocity で陰影付けする (hue は保ち明度のみ変える)。
+/// クリップ基底色 `base` を velocity で陰影付けする (hue は保ち明度のみ変える)。
 /// 低 velocity ほど暗く (係数 0.55..1.0)。`NoteStyle::color = Some` の note に使う。
 /// alpha は `base` を維持。`note_fill_fn` (velocity → 青の濃淡) のクリップ色版に相当。
 #[must_use]
@@ -667,7 +667,7 @@ pub fn shade_by_velocity(base: Color, velocity: u8) -> Color {
     Color::rgba(base.r * k, base.g * k, base.b * k, base.a)
 }
 
-/// FIXME #93: `color` を背景 `bg` 側へ `amount` (0..1) だけ寄せて淡色化する (lerp)。
+/// `color` を背景 `bg` 側へ `amount` (0..1) だけ寄せて淡色化する (lerp)。
 /// `amount=0` で `color` のまま、`1` で `bg`。非対象 (dimmed) / lock クリップの note を
 /// 沈めて対象クリップを際立たせるのに使う。alpha は不透明 (`bg` 上の grid 線が透けないよう) に保つ。
 #[must_use]
@@ -681,7 +681,7 @@ pub fn dim_toward(color: Color, bg: Color, amount: f32) -> Color {
     )
 }
 
-/// FIXME #93: note の最終 fill を決める (color/dim/lock/mute を統合)。`draw_notes` と
+/// note の最終 fill を決める (color/dim/lock/mute を統合)。`draw_notes` と
 /// `draw_velocity_lane` が共有して描画一致を保証する。`bg` は dim の寄せ先 (grid 背景)。
 #[must_use]
 fn note_fill_color(note: &Note, note_fill_fn: NoteFillFn, bg: Color) -> Color {
@@ -1036,7 +1036,7 @@ fn note_hit_in(
     let mut hit_inside = false;
     let mut hit_edge_dist = f32::INFINITY;
     for note in visible {
-        // FIXME #93 (daw_01): lock されたクリップの note は参照専用ゴースト = hit-test から
+        // lock されたクリップの note は参照専用ゴースト = hit-test から
         // 除外して掴めなくする (描画はされる)。hover カーソルも note_hit_in 共有なので一致する。
         if note.style.locked {
             continue;
@@ -1245,17 +1245,17 @@ struct NoteDragSession {
     last_ctrl: bool,
 }
 
-/// (FIXME #82) 空白ダブルクリック作成で「ドラッグした」と判定する左右いずれかの最小移動量 (px)。
+/// 空白ダブルクリック作成で「ドラッグした」と判定する左右いずれかの最小移動量 (px)。
 /// これ未満は jitter とみなし既定長で作成 (note_drag の short-click 閾値 4px と同値)。
 /// 左方向も対象 (左ドラッグで既定長より短く作るとき右へ振る手間を不要にする)。
 const NOTE_CREATE_DRAG_PX: f32 = 4.0;
 
-/// (FIXME #82) ドラッグで決める note 長の下限 (拍)。snap unit 無効時の floor。
+/// ドラッグで決める note 長の下限 (拍)。snap unit 無効時の floor。
 /// daw_01 add_note 側が更に `0.0625` (1/16) に clamp するが、 widget preview と commit を
 /// 一致させるため widget でも下限を設ける (resize の `0.05` floor と同値)。
 const NOTE_CREATE_MIN_LEN: f64 = 0.05;
 
-/// (FIXME #82) 空白ダブルクリック作成 session (Bitwig 流の「ダブルクリックのボタンを放さず
+/// 空白ダブルクリック作成 session (Bitwig 流の「ダブルクリックのボタンを放さず
 /// 左右ドラッグで note 長を決める」)。
 ///
 /// `take_double_click_press_in_rect` が返した「2 度目の press」 が空白 grid 上だったときに開始。
@@ -1410,7 +1410,7 @@ fn fold_piano_roll_note_hash(notes: &[Note]) -> u64 {
         h = h.wrapping_mul(PRIME);
         h ^= u64::from(n.velocity);
         h = h.wrapping_mul(PRIME);
-        // FIXME #80: mute 状態を cache key に含めて、 mute トグルで note レイヤの
+        // mute 状態を cache key に含めて、 mute トグルで note レイヤの
         // dim + 斜線ハッチ再描画が即時反映されるようにする。
         h ^= u64::from(n.muted);
         h = h.wrapping_mul(PRIME);
@@ -1448,15 +1448,15 @@ pub(crate) struct PianoRollState {
     /// `true`、release で `false`。grid の note drag とは独立 (領域が x で排他)。押下中の pitch は
     /// 毎フレーム pointer.y から計算するので held 値は持たず、「press 開始が鍵盤か」だけを track する。
     keyboard_pressing: bool,
-    /// (FIXME #82) 空白ダブルクリック作成 session (押下のまま drag で note 長を決める)。
+    /// 空白ダブルクリック作成 session (押下のまま drag で note 長を決める)。
     /// 2 度目の press で `Some`、release で `take` して 1 個の `Add` を発行 → `None`。
     note_create: Option<NoteCreateSession>,
-    /// (FIXME #89) edge auto-scroll の pitch (縦) 方向の端数アキュムレータ (semitone)。
+    /// edge auto-scroll の pitch (縦) 方向の端数アキュムレータ (semitone)。
     /// top_pitch は u8 なので sub-semitone のスクロールを表現できない。drag 中に毎フレーム
     /// `dy_px * pitch_per_px` を貯め、|累積| ≥ 1 で整数 semitone ぶん `SetTopPitch` を発火する
     /// (= zone 内側ほどゆっくり、外側ほど速く滑らかにスクロール)。縦 zone を外れた frame で 0 に reset。
     edge_pitch_accum: f32,
-    /// (FIXME #89) edge auto-scroll の移動量ゲート用 press 位置。press からの移動が `ACTIVATE_PX`
+    /// edge auto-scroll の移動量ゲート用 press 位置。press からの移動が `ACTIVATE_PX`
     /// 以上のときのみ端スクロールを許可し、端近くの note を click-and-hold しただけで view が動くのを防ぐ。
     edge_scroll_press: Option<(f32, f32)>,
 }
@@ -1510,7 +1510,7 @@ fn drag_preview_geometry(
     }
 }
 
-/// (FIXME #82) note_create session の現在の `(start_beat, len_beats, pitch)` を計算
+/// note_create session の現在の `(start_beat, len_beats, pitch)` を計算
 /// (drag preview と release commit で共有 = 描画と確定が必ず一致)。
 ///
 /// **モデル: 既定長ノートの「右端」を掴んで動かす相対 resize** (Ableton Live / ダブルクリックで
@@ -1811,7 +1811,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let zoom_x_px_per_beat: f32 = (1.0 / beat_per_px) as f32;
         let pitch_per_px = view.pitch_visible / grid.h.max(1.0);
 
-        // ----- (FIXME #82) 空白ダブルクリック作成 press の検出 -----
+        // ----- 空白ダブルクリック作成 press の検出 -----
         // 「double-click の 2 度目の press」が空白 grid 上 (note_hit なし) なら note 作成 session を
         // 開始する。press 即時に取るので、このままボタンを放さず drag すれば長さを決められる
         // (Bitwig 流「continue to hold the mouse down, and then drag left or right to ... lengthen」)。
@@ -1837,7 +1837,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let geom = RowGeometry::compute(view, grid);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let pitch = (geom.y_to_pitch_f(py).ceil() as i32).clamp(0, 127) as u8;
-            // (FIXME #82) warp 先 = 既定長ノートの右端の screen x (Ableton Live 流)。
+            // warp 先 = 既定長ノートの右端の screen x (Ableton Live 流)。
             // カーソルをここへ動かし、 anchor をここに置く = カーソル＝掴んでいる右端が一致。
             let default_len = view.default_note_len_beats.max(0.0625);
             #[allow(clippy::cast_possible_truncation)]
@@ -1956,7 +1956,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     nd.last_mouse = (px, py);
                 }
             }
-            // (FIXME #82) note_create continuation。 まず warp 着地判定: press_x → anchor (右端) の
+            // note_create continuation。 まず warp 着地判定: press_x → anchor (右端) の
             // 中点をカーソルが越えたら settled。 settled までは last_mouse を更新せず anchor のまま
             // 保持する (warp の非同期ジャンプ由来の `PointerMoved` を長さに混入させない = ドラッグ
             // 開始直後の一瞬の最短化を防ぐ)。 settled 後は note_drag と同じ winit release-frame 巻き
@@ -2025,7 +2025,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- FIXME #89: ドラッグ端オートスクロール (piano roll) ----
+        // ---- ドラッグ端オートスクロール (piano roll) ----
         // drag 中、pointer が grid 端の hot-zone に入ったら view を自動スクロールし、掴んでいる対象が
         // カーソルに追従し続ける。横 (beat) は `ScrollByBeats` delta、縦 (pitch) は `SetTopPitch` 絶対値
         // (top_pitch は u8 なので端数を `edge_pitch_accum` に貯めて整数 semitone 単位で発火)。note drag /
@@ -2202,7 +2202,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let state: &mut PianoRollState = self.widget_state(wid);
             state.velocity_drag.clone()
         };
-        // (FIXME #82) note_create overlay 用 clone と release 用 take。
+        // note_create overlay 用 clone と release 用 take。
         let note_create_session: Option<NoteCreateSession> = {
             let state: &mut PianoRollState = self.widget_state(wid);
             state.note_create
@@ -2308,7 +2308,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
         response.dragging = drag_session.as_ref().map(|nd| nd.kind);
         response.velocity_dragging = velocity_drag_session.is_some();
-        // (FIXME #82) 作成 session 中は creating=true (caller の wheel 無効化用)。
+        // 作成 session 中は creating=true (caller の wheel 無効化用)。
         response.creating = note_create_session.is_some();
         // (M14 Phase 84 / daw_01 #055) 鍵盤レーン press 中の pitch を held-value で返す。
         // session 中 (press 開始が kbd) かつ まだ押下中 (primary_pressed) かつ pointer が kbd 内の
@@ -2327,7 +2327,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // hover_cursor、その他 widget 内は Default に明示 reset で stale cursor を防ぐ)。
         // winit は state-full なので set_cursor を呼ばないと前フレームの形状が残る (ui.rs:999)。
         if response.creating {
-            // (FIXME #82) 作成中は右端を伸ばす操作なので EwResize (resize と同じ)。
+            // 作成中は右端を伸ばす操作なので EwResize (resize と同じ)。
             self.set_cursor(CursorIcon::EwResize);
         } else if response.dragging.is_some() {
             let cursor = match response.dragging {
@@ -2365,7 +2365,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let marquee_press = if !editing_mode
             && pointer.primary_just_pressed
             && !pointer.modifiers.alt
-            // (FIXME #82) この press が「ダブルクリック作成」 のものなら marquee を起動しない
+            // この press が「ダブルクリック作成」 のものなら marquee を起動しない
             // (作成 session が press を所有。 二重所有を防ぐ load-bearing gate)。
             && note_create_press.is_none()
             && let Some((px, py)) = pointer.pos
@@ -2392,7 +2392,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             || drag_release.is_some()
             || velocity_drag_release.is_some()
             || marquee_active
-            // (FIXME #82) 作成 release frame は Add で新規 note を選択するので、 ここで
+            // 作成 release frame は Add で新規 note を選択するので、 ここで
             // 空白 click 扱いして selection clear を emit しない (二重 emit 抑制)。
             || note_create_release.is_some()
         {
@@ -2545,7 +2545,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let loop_handle_color = style.loop_handle;
         let loop_handle_w = style.loop_handle_w;
 
-        // (FIXME #82) note_create preview: 作成中 note の rect (drag preview と同じ helper で
+        // note_create preview: 作成中 note の rect (drag preview と同じ helper で
         // 長さ確定値を計算 → grid clamp)。session 不在なら None。色は resize ghost (selected) と同じ。
         let note_create_preview: Option<Rect> = note_create_session.map(|nc| {
             let (start_beat, len_beats, pitch) =
@@ -2627,7 +2627,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     drag_overlay_min_len,
                 );
             }
-            // (FIXME #82) note_create preview (作成中の note を selection ghost 色で描画)。
+            // note_create preview (作成中の note を selection ghost 色で描画)。
             if let Some(r) = note_create_preview {
                 let x_left = r.x.max(grid.x);
                 let x_right = (r.x + r.w).min(grid.x + grid.w);
@@ -2729,7 +2729,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
             // note id は user 側で next_note_id を bump して上書き。
             // ここでは placeholder id=0 で渡す (user は make_edit closure 内で bump 済 id を使う)。
-            // (FIXME #82) 長さは caller の既定長 (= last_note_duration_beats) に統一。 旧 0.5 固定だと
+            // 長さは caller の既定長 (= last_note_duration_beats) に統一。 旧 0.5 固定だと
             // 直前にドラッグ / resize した長さが Insert に反映されず一貫性が無かった。 下限 1/16。
             let new_note = Note {
                 id: 0,
@@ -2903,7 +2903,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ----- (FIXME #82) note_create release → Add 発行 (作成 + 長さ確定を 1 undo step に) -----
+        // ----- note_create release → Add 発行 (作成 + 長さ確定を 1 undo step に) -----
         // overlay と同じ `note_create_geometry` で長さを確定 (描画と commit の一致)。 ドラッグせず
         // 即放しなら既定長、 ドラッグしていれば pointer 追従長。 id=0 placeholder (caller が採番)。
         // daw_01 は `n.len_beats` を尊重して AddNote { duration } に変換する (旧: last_note_duration_beats
@@ -2922,7 +2922,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 style: NoteStyle::default(),
             };
             self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
-            // (FIXME #92) 入力完了後、 press 時に既定長ノートの右端へ warp した
+            // 入力完了後、 press 時に既定長ノートの右端へ warp した
             // カーソルを元のクリック位置へ戻す (warp しっぱなしだと「ノートの右端のまま」
             // 残り、 次操作の起点が分かりにくいという要望)。 warp は y を変えない
             // (press 時 `warp_cursor(warp_x, py)`) ので、 復帰先 y は anchor_mouse.1
@@ -2957,7 +2957,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let drag_rect = drag.rect();
                 let mut inside: Vec<NoteId> = Vec::new();
                 for n in visible {
-                    // FIXME #93 (daw_01): lock クリップの note は marquee 矩形選択からも除外。
+                    // lock クリップの note は marquee 矩形選択からも除外。
                     if n.style.locked {
                         continue;
                     }
@@ -3441,7 +3441,7 @@ fn draw_notes<M: ?Sized + 'static>(
             w: x_right - x_left,
             h: y_bot - y_top,
         };
-        // FIXME #93/#80 (daw_01): クリップ色 (色 None なら velocity 色) → dim/lock 沈め → mute 沈め。
+        // クリップ色 (色 None なら velocity 色) → dim/lock 沈め → mute 沈め。
         let fill = note_fill_color(note, note_fill_fn, bg);
         hctx.push_rect(note_rect_command(clipped, fill, radius_px));
         if note.muted {
@@ -3634,7 +3634,7 @@ fn draw_velocity_lane<M: ?Sized + 'static>(
         if cx + half_w < vel_area.x || cx - half_w > vel_area.x + vel_area.w {
             continue;
         }
-        // FIXME #93 (daw_01): bar はそのクリップの色 (色 None なら従来の velocity_bar_color)。
+        // bar はそのクリップの色 (色 None なら従来の velocity_bar_color)。
         // バー高さが既に velocity を表すので velocity 陰影は掛けず、dim/lock のみ反映。
         let bar_fill = match n.style.color {
             Some(c) if n.style.locked => dim_toward(c, style.velocity_lane_bg, 0.72),
@@ -3768,7 +3768,7 @@ mod tests {
 
     #[test]
     fn note_hit_excludes_locked_note() {
-        // FIXME #93 (daw_01): lock されたクリップの note は描画されても hit-test から除外され、
+        // lock されたクリップの note は描画されても hit-test から除外され、
         // 中央 (通常なら Move hit) でも掴めない (参照専用ゴースト)。
         let (mut notes, view, grid) = make_test_setup();
         notes[0].style.locked = true;
@@ -4097,7 +4097,7 @@ mod tests {
         last_set_lyrics: Option<Vec<(NoteId, Option<String>)>>,
         /// (M14 Phase 61d / daw_01 #012) 最後に Add request で渡された note の pitch。
         last_added_pitch: Option<u8>,
-        /// (FIXME #82) 最後に Add request で渡された note の `(start_beat, len_beats)`。
+        /// 最後に Add request で渡された note の `(start_beat, len_beats)`。
         last_added: Option<(f64, f64)>,
         /// (M14 Phase 64 / daw_01 #018) 最後に発行された `SetVelocity` の内容。
         last_set_velocity: Option<Vec<VelocityUpdate>>,
@@ -4106,9 +4106,9 @@ mod tests {
         playhead_beats: Vec<f64>,
         /// (M14 Phase 69 / daw_01 #041) 最後に発行された `SetLoopRange { start, end }`。
         last_set_loop_range: Option<(f64, f64)>,
-        /// (FIXME #89) edge auto-scroll で発行された全 `ScrollByBeats` の delta 列。
+        /// edge auto-scroll で発行された全 `ScrollByBeats` の delta 列。
         scroll_by_beats: Vec<f64>,
-        /// (FIXME #89) edge auto-scroll で発行された全 `SetTopPitch` の値列。
+        /// edge auto-scroll で発行された全 `SetTopPitch` の値列。
         top_pitch_sets: Vec<u8>,
     }
 
@@ -4579,7 +4579,7 @@ mod tests {
         assert_eq!(model.last_request, Some(RequestKind::Move), "release で Move 発行");
     }
 
-    // -------- (FIXME #89) ドラッグ端オートスクロール --------
+    // -------- ドラッグ端オートスクロール --------
 
     /// note Move drag 中、ポインタが grid 右端 hot-zone に入ると `ScrollByBeats(>0)` が発火し、
     /// 中央では発火しない。test_view: 4 拍 × 800px = 200px/拍、zone=28px (default)。
@@ -4740,7 +4740,7 @@ mod tests {
         );
     }
 
-    // -------- (FIXME #82) 空白ダブルクリック作成 (放さずドラッグで長さ決定、Bitwig 流) --------
+    // -------- 空白ダブルクリック作成 (放さずドラッグで長さ決定、Bitwig 流) --------
 
     /// ダブルクリックの 2 度目の press でカーソルが既定長ノートの右端へ warp し、 そのまま右へ
     /// ドラッグ → 右端が cursor に追従し、 release で `Add` を発行する (cursor＝右端モデル)。
@@ -4845,7 +4845,7 @@ mod tests {
         );
     }
 
-    /// (FIXME #92) ノート作成 (ダブルクリック → ドラッグ → release) を完了したら、 press 時に
+    /// ノート作成 (ダブルクリック → ドラッグ → release) を完了したら、 press 時に
     /// 右端へ warp したカーソルを **元のクリック位置へ戻す**。 「いまはノートの右端のままになって
     /// いる」 という要望の修正。 warp の OS flush は `frame()` でのみ起きる (run_frame =
     /// frame_to_edits は副作用を発火しない) ので `set_cursor_pos_request` を capture し、
@@ -4956,7 +4956,7 @@ mod tests {
     }
 
     /// warp 着地後、右へ振らずそのまま左へドラッグするだけで既定長より短いノートを作れる
-    /// (= cursor＝右端なので右端を左へ動かす = 短縮、 一度右に振る必要がない、FIXME #82 follow-up)。
+    /// (= cursor＝右端なので右端を左へ動かす = 短縮、 一度右に振る必要がない)。
     /// press x=400 (beat 2.0 = start、default 1.0 → warp 先 = 右端 beat 3.0 = x600 = anchor)。
     /// warp 着地後 cursor を x500 (beat 2.5) へ左ドラッグ → 右端 beat 2.5 → len = 2.5−2.0 = 0.5
     /// (既定 1.0 より短い)。
@@ -7175,7 +7175,7 @@ mod tests {
         );
     }
 
-    /// FIXME #80: mute トグルで note cache (dim + 斜線ハッチ) が再描画されるよう、
+    /// mute トグルで note cache (dim + 斜線ハッチ) が再描画されるよう、
     /// `muted` が hash に効くことを保証する (cache 無効化の回帰防止)。
     #[test]
     fn fold_piano_roll_note_hash_changes_on_muted() {

@@ -1,4 +1,4 @@
-//! FIXME #86: arrangement の「選択素材へのズーム / ループ」 (`Z` / `R`) が
+//! arrangement の「選択素材へのズーム / ループ」 (`Z` / `R`) が
 //! automation clip を第一級の選択面として扱うことの回帰テスト。
 //!
 //! automation clip は通常 clip (`selected_clips`) と直交した独立選択集合

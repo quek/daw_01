@@ -145,7 +145,7 @@ impl DecodedFrame {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ActiveVideoFrame {
     pub video_source_id: VideoSourceId,
-    /// FIXME #54: この動画フレームを持つ track id (映像効果チェーンの解決に使う、
+    /// この動画フレームを持つ track id (映像効果チェーンの解決に使う、
     /// `ActiveImageFrame::owning_track_id` と対)。
     pub owning_track_id: u32,
     pub source_micros: u64,
@@ -381,7 +381,7 @@ impl VideoPlaybackEngine {
             }
             let mut track_emitted = false;
             for clip in &track.clips {
-                // FIXME #80: muted clip は video composite から除外する (黒/下層が出る)。
+                // muted clip は video composite から除外する (黒/下層が出る)。
                 if clip.muted {
                     continue;
                 }
@@ -460,7 +460,7 @@ impl VideoPlaybackEngine {
                 continue;
             }
             for clip in &track.clips {
-                // FIXME #80: muted clip は video composite から除外する。
+                // muted clip は video composite から除外する。
                 if clip.muted {
                     continue;
                 }

@@ -101,7 +101,7 @@ pub fn arrange_snap_config(app: &AppData) -> SnapConfig {
     }
 }
 
-/// (FIXME #38) ピアノロール 3 段目グリッド (スナップ細分線) の「線間隔 (拍)」を返す。
+/// ピアノロール 3 段目グリッド (スナップ細分線) の「線間隔 (拍)」を返す。
 /// `None` = subdivision なし (snap OFF / 拍以上に粗いスナップ)。
 ///
 /// gui_01 の `bar_beat_grid` には「1 拍あたり分割数」ではなく **線間隔 (interval_beats)**
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(mode_to_choice(SnapMode::Adaptive), Some(16));
     }
 
-    // ---- FIXME #38: subgrid_interval_beats ----
+    // ---- subgrid_interval_beats ----
 
     fn cfg(mode: SnapMode) -> SnapConfig {
         SnapConfig {

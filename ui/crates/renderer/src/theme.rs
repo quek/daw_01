@@ -1,4 +1,4 @@
-//! テーマ — UI クローム色の **Single Source of Truth** (FIXME #88)。
+//! テーマ — UI クローム色の **Single Source of Truth**。
 //!
 //! 以前は色が `daw_gui/src/view/*` の file-local `const COLOR_*` と
 //! `ui/crates/ui/src/widgets/*` の `*Style::Default` に **約 250 箇所ベタ書き** され、

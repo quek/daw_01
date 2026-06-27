@@ -1,4 +1,4 @@
-//! VOICEVOX 合成結果 (WAV bytes) の **永続コンテンツアドレスキャッシュ** (FIXME #77)。
+//! VOICEVOX 合成結果 (WAV bytes) の **永続コンテンツアドレスキャッシュ**。
 //!
 //! 歌唱 wav は `build_sing_query(notes, bpm)` が作る query JSON + singer_id の、
 //! 読み上げ wav は `(text, speaker_id, TalkParams)` の **純粋関数**。 同じ内容なら

@@ -166,7 +166,7 @@ pub struct ArrangementClip {
     /// hover 由来で毎フレーム変わるため widget は viewport_key (cache key) には含めず、 cached 外の
     /// overlay で毎フレーム描画する (selection overlay と同 idiom)。
     pub in_active_group: bool,
-    /// FIXME #80 (daw_01): clip がミュート中なら `true`。 widget は fill alpha を落として
+    /// clip がミュート中なら `true`。 widget は fill alpha を落として
     /// 暗く沈め (`muted_dim_fill`)、 45° の斜線ハッチを重ねて「再生されない」 を示す
     /// (REAPER / Ableton 流)。 caller (daw_01) は `Clip.muted` をそのまま渡す。
     /// `false` のとき描画は既存と完全一致。
@@ -277,7 +277,7 @@ pub struct AutomationPointKey {
     pub point_idx: u32,
 }
 
-/// FIXME #81: point drag 中の **live 値** (caller がカーソル近くに現値を数値表示する用)。
+/// point drag 中の **live 値** (caller がカーソル近くに現値を数値表示する用)。
 /// `value_norm` は drag 中の正規化値 (release commit と同じ式で算出)、 `cursor` は ghost dot の
 /// 画面座標 (caller はここから少しオフセットして readout を描く)。
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -523,7 +523,7 @@ pub struct ResizeClipDelta {
     pub prev_len: f64,
     pub next_start: f64,
     pub next_len: f64,
-    /// FIXME #61: Shift 修飾で開始した端 drag は **time-stretch** (= 内容を
+    /// Shift 修飾で開始した端 drag は **time-stretch** (= 内容を
     /// 新しい長さに伸縮)、 無印は **trim** (= 再生範囲を変える)。 geometry
     /// (`next_start` / `next_len`) は両者同一で、 解釈だけ caller (daw_01) が
     /// 分岐する。 `Ableton` 流 (plain=trim / Shift=stretch)。
@@ -789,7 +789,7 @@ pub enum ArrangementEditRequest {
     /// M14 Phase 63n-2 (#028): lane header の `👁` icon click。 caller は `lane.visible = visible`
     /// を保存する。 `visible = false` で lane 行は描画しない + 高さに含めない (= 隣 lane が詰める)。
     SetLaneVisible { lane: AutomationLaneKey, visible: bool },
-    // FIXME #81: 旧 `SetLaneDefault { lane, prev, next }` (slider 帯 drag) は廃止。 default value は
+    // 旧 `SetLaneDefault { lane, prev, next }` (slider 帯 drag) は廃止。 default value は
     // caller (daw_01) が lane header の数値入力フィールド (`automation_lane_default_rects`) に
     // scrubable_number_at を overlay して直接 `AppEvent::SetLaneDefault` を発火する。
     /// M14 Phase 63n-5 (#030): lane 下端 splitter (高さ ±`automation_lane_resize_handle_px` の hot zone)
@@ -820,7 +820,7 @@ pub enum ArrangementEditRequest {
         time_beat: f64,
         value_norm: f32,
     },
-    /// FIXME #81: 既存 point の **上**での dblclick (= 値の数値入力開始)。 widget は値編集 UI を
+    /// 既存 point の **上**での dblclick (= 値の数値入力開始)。 widget は値編集 UI を
     /// 持たない (heavy 内で text_input 不可) ので、 caller (daw_01) が `automation_point_rects` で
     /// 当該 point の rect を引き、 その位置に inline 数値入力 overlay (`text_input_at_focused`) を
     /// 出す入口として使う。 dblclick が既存 point に当たらなければ従来どおり `AddAutomationPoint` /
@@ -1012,7 +1012,7 @@ pub struct ArrangementResponse {
     /// と同じ「毎フレーム算出の hover state」 idiom)。 section は ruler と track lanes の中間 lane なので
     /// clip / automation lane とは y 領域が排他 (同時に複数 hover しない)。
     pub hovered_section: Option<u32>,
-    /// FIXME #067: ポインタが今 hover している Arranger section の zone (Move / ResizeLeft / ResizeRight)。
+    /// ポインタが今 hover している Arranger section の zone (Move / ResizeLeft / ResizeRight)。
     /// clip の `hovered_zone` と同 idiom で widget 内の cursor 設定が読む (帯端 hover で `EwResize`、 帯中央
     /// hover で `Move`)。 これが無いと section 帯はクリップと違い resize ハンドルの ↔ カーソルが出ず、 端を
     /// 掴んでリサイズできることが discoverable でなかった (= ユーザ報告「Aメロの端でカーソルが矢印にならない」)。
@@ -1025,13 +1025,13 @@ pub struct ArrangementResponse {
     /// semantics、 描画順 = 左から右)。 caller が `context_menu_for(rect, ...)` で右クリックメニューを
     /// 重ねる用 (`SecondaryClickSection` の `pos` と併用可)。 完全 off-screen (beat 範囲外) の section は除外。
     pub section_rects: Vec<(u32, Rect)>,
-    /// FIXME #81: 各 visible automation lane の **デフォルト値フィールド** rect
+    /// 各 visible automation lane の **デフォルト値フィールド** rect
     /// (lane header 内、`automation_lane_header_layout` の `default_field_rect`)。
     /// caller (daw_01) はここに `scrubable_number_at` を overlay して default 値を
     /// ドラッグ/数値入力で編集する (旧スライダー帯は廃止)。 `automation_point_rects`
     /// と同 semantics (描画順 = 上から下、 hidden / collapsed / 行高不足の lane は除外)。
     pub automation_lane_default_rects: Vec<(AutomationLaneKey, Rect)>,
-    /// FIXME #81: point drag セッション進行中の live 値 (`Some` のとき caller は
+    /// point drag セッション進行中の live 値 (`Some` のとき caller は
     /// `cursor` 近傍に `value_norm` を人間可読単位で表示する)。 release frame では `None`。
     pub automation_point_drag: Option<AutomationPointDragInfo>,
 }
@@ -1095,13 +1095,13 @@ pub struct ArrangementStyle {
     pub clip_border: Color,
     pub clip_border_w: f32,
     pub clip_radius: f32,
-    /// FIXME #80 (daw_01): muted clip に重ねる斜線ハッチの色 (半透明)。default は暗い
+    /// muted clip に重ねる斜線ハッチの色 (半透明)。default は暗い
     /// 半透明黒 `rgba(0,0,0,0.34)`。`ArrangementClip.muted == true` のときのみ描画。
     pub clip_muted_hatch_color: Color,
-    /// FIXME #80 (daw_01): muted ハッチ線の間隔 (px、default 7.0) と線幅 (px、default 1.5)。
+    /// muted ハッチ線の間隔 (px、default 7.0) と線幅 (px、default 1.5)。
     pub clip_muted_hatch_spacing_px: f32,
     pub clip_muted_hatch_width_px: f32,
-    /// FIXME #73: clip / automation point の **drag ゴースト** (drag 中の半透明
+    /// clip / automation point の **drag ゴースト** (drag 中の半透明
     /// プレビュー) のハイライト塗り色。 かつては選択中 clip 本体の fill にも使って
     /// いたが、 黄色など同系色の clip だと「選択 = 黄塗り」 が clip 本来の色と衝突して
     /// 選択状態が判別できなかった (#73)。 選択表示は fill を潰さず `push_selection_ring`
@@ -1109,7 +1109,7 @@ pub struct ArrangementStyle {
     pub clip_selected_fill: Color,
     /// 選択リングの **外側 (明)** 線。 暗い lane 背景に対して光る。
     pub clip_selected_border: Color,
-    /// 選択リングの **内側 (暗)** 線 (FIXME #73)。 黄 / 白など明るい fill に対して
+    /// 選択リングの **内側 (暗)** 線。 黄 / 白など明るい fill に対して
     /// コントラストする。 `clip_selected_border` (明) と対で、 fill 色に依らず
     /// どんな clip でも選択枠が視認できる 2 重リングを成す。
     pub clip_selected_border_inner: Color,
@@ -1302,7 +1302,7 @@ pub struct ArrangementStyle {
     /// 渡すのみ。 MIDI `DoubleClickEmpty` は caller が len を決める idiom だが、 lane は zoom / snap に
     /// 合わせた賢い default を widget 側で持てる余地があるため style 経由で expose (#029 §A 参照)。
     pub automation_clip_default_len_beats: f64,
-    /// FIXME #81: lane header の default value 数値入力フィールドの縦幅 (px)。 default 18.0
+    /// lane header の default value 数値入力フィールドの縦幅 (px)。 default 18.0
     /// (旧スライダー帯 `automation_default_band_h` を置換、 scrubable_number_at が読める高さ)。
     pub automation_default_field_h: f32,
     /// M14 Phase 63n-5 (#030): lane 下端 splitter drag の hot zone 高さ (px)。 default 4.0。
@@ -1403,7 +1403,7 @@ impl Default for ArrangementStyle {
             clip_selected_fill: theme::SELECTION_WARM,
             // 選択リングは任意色の clip 上で確実に立つ意図的な pure-white (token 化しない)。
             clip_selected_border: Color::WHITE,
-            // FIXME #73: 選択リング内側の暗線。 明るい fill (黄 / 白) でも枠が見える。
+            // 選択リング内側の暗線。 明るい fill (黄 / 白) でも枠が見える。
             clip_selected_border_inner: theme::TEXT_ON_BRIGHT,
             clip_selected_border_w: 2.0,
             clip_text_color: theme::TEXT,
@@ -1983,7 +1983,7 @@ fn section_hit(
     hit
 }
 
-/// FIXME #067: cursor が strictly どの section 帯の **内側** (in-rect) にあるかを返す。 `section_hit` と
+/// cursor が strictly どの section 帯の **内側** (in-rect) にあるかを返す。 `section_hit` と
 /// 違い resize handle の外側拡張 (`±resize_handle_px`) を **一切含めない**。 dblclick rename / 右クリック
 /// メニューは「帯そのもの」 を対象にする **point gesture** で、 帯の外側 (隣の空きレーン) で発火しては
 /// いけない (帯のすぐ隣の空白を dblclick すると隣 section の rename になっていた bug)。 Move/Resize の
@@ -2006,7 +2006,7 @@ fn section_at_inrect(
     })
 }
 
-/// FIXME #067: clip / section の drag zone (`ClipDragKind`) を cursor 形状へ写す共通マップ
+/// clip / section の drag zone (`ClipDragKind`) を cursor 形状へ写す共通マップ
 /// (中央 Move → `Move`、 端 Resize → `EwResize`)。 clip drag / clip hover / section drag / section hover の
 /// 4 経路が同じ写像を共有する (= 端を掴んでリサイズできることを ↔ カーソルで discoverable にする)。
 fn drag_kind_cursor(kind: ClipDragKind) -> CursorIcon {
@@ -2829,7 +2829,7 @@ pub(crate) struct ArrangementState {
     /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
     /// `Toggle` modifier では update しない、 `Single` / `RangeFromAnchor` で update。
     selection_anchor: Option<u32>,
-    /// FIXME #89: edge auto-scroll の移動量ゲート用 press 位置 (primary press 時の screen pos)。
+    /// edge auto-scroll の移動量ゲート用 press 位置 (primary press 時の screen pos)。
     /// 端スクロールは「press からここまでの移動が `ACTIVATE_PX` 以上」 のときのみ発火させ、端近くの
     /// clip を click-and-hold しただけで view が動くのを防ぐ (実 DAW は実ドラッグで初めて端スクロール)。
     edge_scroll_press: Option<(f32, f32)>,
@@ -2917,7 +2917,7 @@ fn compute_audio_drag_outcome(
     }
 }
 
-/// FIXME #89: arrangement の active drag session について edge auto-scroll の有効軸
+/// arrangement の active drag session について edge auto-scroll の有効軸
 /// `(enable_x, enable_y)` を返す。`None` = auto-scroll 非対象 (local 操作 / drag 無し)。
 /// 横 = 時間軸 (beat)、縦 = track 方向 (track_top)。clip resize や section / ruler は横のみ、
 /// track 並べ替えは縦のみ。
@@ -2953,7 +2953,7 @@ fn arrangement_edge_scroll_axes(state: &ArrangementState) -> Option<(bool, bool)
     None
 }
 
-/// FIXME #89: active drag session の anchor を実スクロール px ぶん逆方向に shift して、掴んでいる
+/// active drag session の anchor を実スクロール px ぶん逆方向に shift して、掴んでいる
 /// 対象がカーソルに追従し続けるようにする (= content space delta)。相対 delta で位置を決める session
 /// (clip / section / automation point/clip / lasso) のみ対象。track 並べ替え (live 行 top 再解決) と
 /// ruler の loop/playhead (絶対 px→beat 再解決) は自動追従するので shift しない。`dy` は縦スクロール
@@ -3358,7 +3358,7 @@ fn draw_section_band<M: ?Sized + 'static>(
 ) {
     let fill = Color::rgb(color_rgb[0], color_rgb[1], color_rgb[2]);
     push_filled_rect(hctx, r, fill);
-    // FIXME #73: 選択帯は fill 色に依らず見える 2 重リング (clip と同 idiom、 帯は
+    // 選択帯は fill 色に依らず見える 2 重リング (clip と同 idiom、 帯は
     // 角丸 0)。 非選択は neutral な 1px 枠。 これで白 / 黄の section でも選択が判別できる。
     if selected {
         push_selection_ring(hctx, r, style, 0.0, Some(r));
@@ -3399,7 +3399,7 @@ fn push_section_border<M: ?Sized + 'static>(
     });
 }
 
-/// FIXME #73: 選択枠を fill 色に依存せず描く 2 重リング。 clip / video clip /
+/// 選択枠を fill 色に依存せず描く 2 重リング。 clip / video clip /
 /// section 帯の選択表示に共通で使う。 呼び出し側は fill を **clip 本来の色**で
 /// 描き、 ここは枠だけを重ねる: 外側の明線 (`clip_selected_border`) が暗い lane
 /// 背景に、 内側の暗線 (`clip_selected_border_inner`) が黄 / 白など明るい fill に
@@ -3558,10 +3558,10 @@ fn draw_sections_lane<M: ?Sized + 'static>(
 ///
 /// 描画順:
 /// 1. base fill: 常に `clip.color` (未指定 None なら `video_clip_loading` =
-///    letterbox の黒帯背景としても兼用)。 FIXME #73: 選択でも fill は潰さない。
+///    letterbox の黒帯背景としても兼用)。 選択でも fill は潰さない。
 /// 2. thumbnail = Some なら aspect-fit (黒帯 letterbox) で texture overlay (`HeavyCtx::push_textured_quad`)
 /// 3. name + (share clip なら) link glyph 描画 (`draw_clip_label`、 audio 経路と共通)
-/// 4. selected なら `push_selection_ring` の 2 重リング (明 + 暗) を最後に重ねる (FIXME #73)
+/// 4. selected なら `push_selection_ring` の 2 重リング (明 + 暗) を最後に重ねる
 ///
 /// M14 Phase 108 (daw_01 #080): share マーク (⇌) は「content 共有」 の意味で track kind と直交するため、
 /// video clip でも `share_group_color.is_some()` で link glyph を描く。
@@ -3582,11 +3582,11 @@ fn draw_video_clip<M: ?Sized + 'static>(
     // letterbox / loading 背景 `video_clip_loading` を使う (= 既存の非 share video clip と互換)。
     // thumbnail があればその上に aspect-fit で texture を重ねる (fill は letterbox の黒帯として残る)。
     // リンク識別は ⇌ glyph + #068 hover 強調が担う (track kind に依らず share マークが出る、 #080 不変)。
-    // FIXME #73: fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
+    // fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
     // `push_selection_ring` の 2 重リングで示し、 選択時は本体 border を消して
     // リングへ一本化する (黄 clip でも選択が判別できる)。
     let base_fill = clip.color.unwrap_or(style.video_clip_loading);
-    // FIXME #80 (daw_01): muted video clip も fill を暗く沈める。
+    // muted video clip も fill を暗く沈める。
     let fill = if clip.muted { muted_dim_fill(base_fill) } else { base_fill };
     let (border, border_w) = if selected {
         (Color::TRANSPARENT, 0.0)
@@ -3618,7 +3618,7 @@ fn draw_video_clip<M: ?Sized + 'static>(
             rotation_pivot: None,
         });
     }
-    // FIXME #80 (daw_01): muted は thumbnail の上に斜線ハッチを重ねる (label の下)。
+    // muted は thumbnail の上に斜線ハッチを重ねる (label の下)。
     if clip.muted {
         push_muted_hatch(
             hctx,
@@ -3631,7 +3631,7 @@ fn draw_video_clip<M: ?Sized + 'static>(
     }
     // name + (share clip なら) link glyph。 thumbnail の **後** に描くので texture の上に乗る。
     draw_clip_label(hctx, r, &clip.name, has_link, text_color, style);
-    // FIXME #73: 選択枠は最後に重ねて thumbnail / label の上に乗せる。
+    // 選択枠は最後に重ねて thumbnail / label の上に乗せる。
     if selected {
         push_selection_ring(hctx, r, style, style.clip_radius, Some(lanes));
     }
@@ -3660,12 +3660,12 @@ fn draw_clip<M: ?Sized + 'static>(
     // selected は selection 色を最優先 (link glyph の有無に依らず)。 `share_group_color` は #086 で
     // 役割を「リンク識別」 に絞り、 fill / border を一切上書きしない (= ⇌ glyph + #068 hover 強調
     // 専用)。 これにより「clip で色を選べば共有クリップ全部がその色になる」「トラックに揃えれば
-    // その色になる」 が成立する (#019/#022 で hue fill が `color` を握り潰していた FIXME #8 の解消)。
-    // FIXME #73: fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
+    // その色になる」 が成立する (#019/#022 で hue fill が `color` を握り潰していた問題の解消)。
+    // fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
     // `push_selection_ring` の 2 重リングで示し、 選択時は本体 border を消して
     // リングへ一本化する (黄 clip でも選択が判別できる)。
     let base_fill = clip.color.unwrap_or(style.clip_default_fill);
-    // FIXME #80 (daw_01): muted clip は fill を暗く沈めて「再生されない」 を示す。
+    // muted clip は fill を暗く沈めて「再生されない」 を示す。
     let fill = if clip.muted { muted_dim_fill(base_fill) } else { base_fill };
     let (border, border_w) = if selected {
         (Color::TRANSPARENT, 0.0)
@@ -3683,7 +3683,7 @@ fn draw_clip<M: ?Sized + 'static>(
         radius: [style.clip_radius; 4],
         clip_rect: Some(lanes),
     });
-    // FIXME #80 (daw_01): muted は斜線ハッチを fill の上・label の下に重ねる (label は読める)。
+    // muted は斜線ハッチを fill の上・label の下に重ねる (label は読める)。
     if clip.muted {
         push_muted_hatch(
             hctx,
@@ -3699,7 +3699,7 @@ fn draw_clip<M: ?Sized + 'static>(
     // ロジックは video 経路と共通の `draw_clip_label` に集約 (M14 Phase 108、 daw_01 #080)。
     let has_link = clip.share_group_color.is_some();
     draw_clip_label(hctx, r, &clip.name, has_link, text_color, style);
-    // FIXME #73: 選択枠を最後に重ねる (label の上、 clip 本来の色 fill の上)。
+    // 選択枠を最後に重ねる (label の上、 clip 本来の色 fill の上)。
     if selected {
         push_selection_ring(hctx, r, style, style.clip_radius, Some(lanes));
     }
@@ -4153,7 +4153,7 @@ fn draw_audio_drag_ghost<M: ?Sized + 'static>(
 /// `header_rect.w < style.automation_lane_header_min_w_px` の極狭幅では `None` (描画 + hit 共に skip)。
 /// icon は描画 push_text の `(left, top)` と一致した正方形 rect (icon_size 角)、 hit zone は
 /// 同 rect で `Rect::contains` 判定で OK (描画と hit の SSoT)。 `default_field_rect` は
-/// header 行高に余裕がある場合のみ `Some` (FIXME #81: 旧スライダー帯を数値入力フィールドに置換)。
+/// header 行高に余裕がある場合のみ `Some` (旧スライダー帯を数値入力フィールドに置換)。
 #[derive(Clone, Copy, Debug)]
 pub struct AutomationLaneHeaderLayout {
     /// `★`/`☆` icon (lane.enabled 切替用、 click で `SetLaneEnabled`)。
@@ -4166,7 +4166,7 @@ pub struct AutomationLaneHeaderLayout {
     pub mute_icon_rect: Rect,
     /// `✕` icon (lane 削除、 click で `DeleteLane`)。
     pub delete_icon_rect: Rect,
-    /// FIXME #81: default value の **数値入力フィールド** rect (旧 horizontal slider 帯を置換)。
+    /// default value の **数値入力フィールド** rect (旧 horizontal slider 帯を置換)。
     /// caller (daw_01) がここに `scrubable_number_at` を overlay して default 値を編集する。
     /// header 行高が icon 行 + フィールドを載せられない場合は `None` (= 極狭 lane では非表示)。
     pub default_field_rect: Option<Rect>,
@@ -4203,7 +4203,7 @@ pub fn automation_lane_header_layout(
     let mute_icon_rect = Rect { x: mute_x, y: cy, w: icon_size, h: icon_size };
     let delete_icon_rect = Rect { x: delete_x, y: cy, w: icon_size, h: icon_size };
 
-    // FIXME #81: default value 数値入力フィールド (旧スライダー帯を置換)。 caller が
+    // default value 数値入力フィールド (旧スライダー帯を置換)。 caller が
     // scrubable_number_at を overlay できる読める高さ。 header 行下端から pad だけ上、
     // icon 行 (cy + icon_size) より下にフィールドが収まるなら Some。
     let field_h = style.automation_default_field_h;
@@ -5192,7 +5192,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
     // ---- header: ★ icon label slider 帯 👁▣✕ (描画 + Phase 63n-2 hit-test 対応) ----
     // M14 Phase 63n-2 (#028): 描画と hit-test の SSoT を `automation_lane_header_layout` に集約。
     // header_rect.w が極狭の場合 (`< automation_lane_header_min_w_px`) は layout が `None` で描画 skip。
-    // FIXME #70: curve line / point dot の色は「lane.color 直塗り」 をやめ、 clip ごとに実際の
+    // curve line / point dot の色は「lane.color 直塗り」 をやめ、 clip ごとに実際の
     // `fill` 輝度から白/黒 neutral を auto-contrast する (= clip 名 `clip_text_color_for` と同 SSoT)。
     // 黄など明るい識別色でも常にコントラストを確保する狙い。 実際の色決定は下の clip ループ内
     // (fill 確定後) で行う。 header の icon glyph 色は従来どおり `lane.color` を直接使う。
@@ -5239,7 +5239,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             clip_rect: Some(label_clip),
             ..GlyphArea::default()
         });
-        // FIXME #81: default value はレーンヘッダの数値入力フィールド (`default_field_rect`) を
+        // default value はレーンヘッダの数値入力フィールド (`default_field_rect`) を
         // caller が scrubable_number_at で overlay する (= 旧スライダー帯描画は廃止)。 widget は
         // ここで何も描かない (フィールドの bg / 値は overlay 側が持つ)。 本体の水平ガイド線
         // (下記 default_value_norm 位置) は残す (default 値の視覚位置の手がかり)。
@@ -5264,7 +5264,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
 
     // ---- body 背景 (header と区切り線) ----
     push_filled_rect(hctx, body_rect, style.automation_lane_bg);
-    // default_value 水平線。 FIXME #81: point dot と同じ **縦 padding スケール** で描く
+    // default_value 水平線。 point dot と同じ **縦 padding スケール** で描く
     // (= clip_rect の `[body.y+pad, body.y+H-pad]`、 5221 と SSoT)。 旧実装は body 全高を使って
     // いたため、 同じ値でも point とガイド線が `pad*(2v-1)` だけ縦にずれていた (user 報告)。
     let default_pad = style.automation_clip_v_pad_px;
@@ -5386,7 +5386,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             });
         }
 
-        // FIXME #70: curve line / point dot を背景輝度から白/黒 neutral で auto-contrast する。
+        // curve line / point dot を背景輝度から白/黒 neutral で auto-contrast する。
         // enabled lane は実際に塗った `fill` (selected = 黄不透明 / 非選択 = lane.color alpha 0.20 を
         // lane_bg と合成) の実効輝度から `pick_contrast` で line / dot fill 色を選び、 dot の枠は
         // その逆色にして「line から浮いた node」 として常に縁が見えるようにする。 disabled lane は
@@ -5724,7 +5724,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     clip_hit(&visible_tracks, &press_tops, view, lanes, px, py, style.resize_handle_px)
                 && (!shift
                     || ctrl
-                    // FIXME #61: 左右端 grip は Shift = time-stretch を許可
+                    // 左右端 grip は Shift = time-stretch を許可
                     // (clip 本体 Move の Shift は従来どおり選択へ fall through)。
                     || matches!(kind, ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight))
             {
@@ -6015,7 +6015,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                     press_lane_button =
                                         Some(ArrangementEditRequest::DeleteLane(lane_key));
                                 }
-                                // FIXME #81: default value フィールドの press は caller の
+                                // default value フィールドの press は caller の
                                 // scrubable_number_at overlay が直接処理する (widget 内 band drag は廃止)。
                             }
                             break;
@@ -6576,7 +6576,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- FIXME #89: ドラッグ端オートスクロール ----
+        // ---- ドラッグ端オートスクロール ----
         // drag 中、pointer が lanes 端の hot-zone に入ったら view を自動スクロールし、掴んでいる対象が
         // カーソルに追従し続ける (実 DAW 標準)。横 (beat) と縦 (track_top) の両軸。relative-delta で
         // 位置を決める session (clip / section / automation point/clip / lasso / clip marquee) は実
@@ -6665,7 +6665,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // FIXME #81: default value の per-frame 編集は caller の scrubable_number_at overlay が担う
+        // default value の per-frame 編集は caller の scrubable_number_at overlay が担う
         // (旧 band drag の per-frame SetLaneDefault emit は廃止)。
 
         // M14 Phase 63n-5 (#030): automation_lane_resize_drag の per-frame live update。
@@ -7115,7 +7115,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && arranger_lane_h > 0.0
             && arranger_rect.contains(cx, cy)
         {
-            // FIXME #067: hover の zone (Move/Resize) も保持して cursor を駆動する (id だけ捨てない)。
+            // hover の zone (Move/Resize) も保持して cursor を駆動する (id だけ捨てない)。
             if let Some((id, kind)) =
                 section_hit(sections, arranger_rect, view, cx, cy, style.resize_handle_px)
             {
@@ -7166,7 +7166,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let dragging_kind = response
             .dragging
             .or(automation_clip_drag_session.as_ref().map(|acd| acd.kind))
-            // FIXME #067: section の Move/Resize drag 中も clip と同じ cursor (Move / EwResize)。
+            // section の Move/Resize drag 中も clip と同じ cursor (Move / EwResize)。
             // clip drag と section drag は y 領域排他なので同時に Some にならない。
             .or(response.dragging_section);
         if header_resize_active {
@@ -7182,7 +7182,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         } else if let Some(zone) = response.hovered_zone {
             self.set_cursor(drag_kind_cursor(zone));
         } else if let Some(zone) = response.hovered_section_zone {
-            // FIXME #067: section 帯の hover も clip と同 idiom — 端 (Resize zone) で EwResize、
+            // section 帯の hover も clip と同 idiom — 端 (Resize zone) で EwResize、
             // 中央 (Move zone) で Move。 帯端を掴んでリサイズできることを ↔ カーソルで示す。
             self.set_cursor(drag_kind_cursor(zone));
         } else if let Some((cx, cy)) = pointer.pos
@@ -7233,7 +7233,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 style.resize_handle_px,
             )
         {
-            // FIXME #70: automation clip も MIDI clip と同様に端で EwResize / 本体で Move を出す。
+            // automation clip も MIDI clip と同様に端で EwResize / 本体で Move を出す。
             // press 側は `automation_clip_zone_at` で resize/move を既に判定して clip drag を起動して
             // いるが、 hover cursor だけ未配線で「端でカーソルが左右矢印にならない」 状態だった。
             // lane/row/header splitter の resize hover はこの上で先に判定済なので、 角の競合は
@@ -8806,7 +8806,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         //   - clip の **Move zone** + Shift+!Ctrl → marquee (NEW)。 plain Move / Ctrl(+Shift) clone /
         //                                           Shift+resize time-stretch とは排他。
         //   - clip の resize handle / その他      → marquee 不可 (time-stretch・clone・move に譲る)。
-        // この zone 判定は press 側 clip_drag gate (#021 の `(!shift||ctrl)` / FIXME #61 の resize) と
+        // この zone 判定は press 側 clip_drag gate (#021 の `(!shift||ctrl)` / resize) と
         // 鏡像で、 marquee に入る press は press 側で clip_drag session を **起動しない** ものに限られる。
         // 二重防御として下の no-session ガード (全 session None) でも弾く。 automation lane は lasso が
         // 所有するため `!press_in_automation_lane` で除外 (no_session は `automation_lasso_drag` を
@@ -9213,7 +9213,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ---- M14 Phase 127 (daw_01 #105): Arranger レーンの double-click ----
         //  - section 帯上 (in-rect) → `BeginRenameSection` (帯名 dblclick で改名開始、 `BeginRenameTrack` と同 idiom)
         //  - 空きレーン (帯の外、 隣接する resize ハンドル拡張部も含む) → `CreateSection` (既定長 1 bar)
-        // FIXME #067: rename 判定は `section_hit` (resize ハンドルを ±px 外側拡張) でなく `section_at_inrect`
+        // rename 判定は `section_hit` (resize ハンドルを ±px 外側拡張) でなく `section_at_inrect`
         // (帯内のみ) を使う。 拡張ハンドルは drag の掴みやすさ用で、 「帯のすぐ隣の空白」 の dblclick を
         // 隣 section の rename に化けさせていた。 帯外の dblclick は空きレーン扱いで CreateSection に回る。
         if arranger_lane_h > 0.0
@@ -9237,7 +9237,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // ---- M14 Phase 127 (daw_01 #105): Arranger レーンの secondary (右) click ----
         // section 帯上 (in-rect) のみ `SecondaryClickSection { id, pos }` を発火 (caller が `pos` に
         // コンテキストメニューを開く、 `SecondaryClickEmpty` と同 idiom)。 空きレーン上の右クリックは no-op。
-        // FIXME #067: dblclick rename と同じく point gesture なので `section_at_inrect` (帯内のみ) を使う。
+        // dblclick rename と同じく point gesture なので `section_at_inrect` (帯内のみ) を使う。
         // resize ハンドル拡張 (`section_hit`) だと帯のすぐ隣の空白の右クリックで隣 section のメニューが出る。
         if arranger_lane_h > 0.0
             && let Some((cx, cy)) = self.take_secondary_press_in_rect(arranger_rect)
@@ -9275,7 +9275,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 cy,
                 style,
             ) {
-                // FIXME #81: 既存 point の上での dblclick → 値の数値入力を開始 (新規点追加より優先)。
+                // 既存 point の上での dblclick → 値の数値入力を開始 (新規点追加より優先)。
                 // caller (daw_01) が automation_point_rects で rect を引いて inline 数値入力 overlay を出す。
                 self.push_edit(make_edit(ArrangementEditRequest::DoubleClickAutomationPoint(
                     pt_key,
@@ -9852,7 +9852,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
 
-        // ---- FIXME #81: automation_lane_default_rects を毎 frame 積む ----
+        // ---- automation_lane_default_rects を毎 frame 積む ----
         // 各 visible lane header の default value 数値入力フィールド rect (= caller が
         // scrubable_number_at を overlay する位置)。 master row (synthetic track) の lane も
         // `visible_tracks[t_idx].id == MASTER_TRACK_ID` で含まれる。 行高不足で field rect が
@@ -9882,7 +9882,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             },
         );
 
-        // ---- FIXME #81: point drag 中の live 値を response に乗せる ----
+        // ---- point drag 中の live 値を response に乗せる ----
         // overlay ghost (上の cached 外描画) と同じ式で next_value / cursor を算出し、 caller が
         // カーソル近傍に現値を人間可読単位で表示できるようにする。 release frame は session が
         // take 済 (None) になるので、 ここは drag 継続中のみ Some。
@@ -11543,7 +11543,7 @@ mod tests {
         );
     }
 
-    /// FIXME #067: `section_at_inrect` は帯の **内側のみ** を返し、 resize handle の外側拡張
+    /// `section_at_inrect` は帯の **内側のみ** を返し、 resize handle の外側拡張
     /// (`±resize_handle_px`) を含めない。 帯のすぐ隣の空白の dblclick / 右クリックを隣 section の
     /// rename / メニューに化けさせない (= `section_hit` との決定的な差)。
     #[test]
@@ -11659,7 +11659,7 @@ mod tests {
 
     /// M14 Phase 114 (daw_01 #086): audio share clip (`share_group_color = Some`) は `clip.color` を
     /// fill の唯一 source にする (hue fill を撤去)。 「clip で色を選べば共有 clip 全部がその色になる」
-    /// (FIXME #8) の核心。 border も neutral `clip_border`、 共有は ⇌ glyph でのみ識別。
+    /// の核心。 border も neutral `clip_border`、 共有は ⇌ glyph でのみ識別。
     #[test]
     fn audio_share_clip_uses_color_fill_not_hue() {
         let style = ArrangementStyle::default();
@@ -11870,7 +11870,7 @@ mod tests {
         );
     }
 
-    /// 選択中かつ active group の member は、 selection リング (FIXME #73) が active
+    /// 選択中かつ active group の member は、 selection リング が active
     /// overlay の **後** に描画されて優先される (#068 の「選択中 member は選択枠優先」)。
     #[test]
     fn selection_fill_drawn_after_active_overlay() {
@@ -12018,7 +12018,7 @@ mod tests {
     }
 
     /// selected な video share clip: fill は clip 本来の色のまま、 選択は 2 重リング
-    /// (FIXME #73) で示す。 link glyph は #022 どおり selected でも描く。 base +
+    /// で示す。 link glyph は #022 どおり selected でも描く。 base +
     /// selection overlay の 2 回描画で glyph は 2 個。
     #[test]
     fn selected_video_share_clip_keeps_link_glyph() {
@@ -12032,7 +12032,7 @@ mod tests {
                 r.border == style.clip_selected_border
                     && (r.border_width - style.clip_selected_border_w).abs() < 1e-3
             }),
-            "selected video clip は selection リング (明枠) を描く (FIXME #73)"
+            "selected video clip は selection リング (明枠) を描く"
         );
         assert_eq!(
             link_glyph_count(&scene, &style),
@@ -12378,7 +12378,7 @@ mod tests {
         );
     }
 
-    /// FIXME #70: automation curve line / point dot を背景輝度から白/黒 neutral で auto-contrast する。
+    /// automation curve line / point dot を背景輝度から白/黒 neutral で auto-contrast する。
     /// (1) 非選択 enabled lane (= lane.color alpha 0.20 を暗い lane_bg と合成 → 暗い実効 fill) では
     ///     line / point fill = 明色 (clip_text_color)、 point 枠 = 暗色 (clip_text_color_dark)。
     /// (2) 選択 clip (= clip_selected_fill の明るい黄 fill) では line / point fill = 暗色、 枠 = 明色。
@@ -12499,7 +12499,7 @@ mod tests {
         );
     }
 
-    /// FIXME #70: automation clip の左右端 hover で `EwResize`、 本体中央 hover で `Move` cursor を出す
+    /// automation clip の左右端 hover で `EwResize`、 本体中央 hover で `Move` cursor を出す
     /// (MIDI clip と対称、 press 側 `automation_clip_zone_at` の resize/move 判定に hover cursor を配線)。
     #[test]
     fn automation_clip_edge_hover_sets_ew_resize_cursor() {

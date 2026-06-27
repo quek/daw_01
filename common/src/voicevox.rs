@@ -104,7 +104,7 @@ pub const DEFAULT_TALK_SPEAKER_ID: u32 = 3;
 /// (2026-06-20、 実機 27 トラック曲で発覚)。engine 不在 (= 接続拒否) は timeout を
 /// 待たず即 Err になるので、 長め設定でも engine-down 時のリトライは遅くならない。
 const SYNTH_HTTP_TIMEOUT_SECS: u64 = 120;
-/// (FIXME #36) `DEFAULT_SINGER_ID` の表示用キャラ名 / スタイル名。新規 vocal
+/// `DEFAULT_SINGER_ID` の表示用キャラ名 / スタイル名。新規 vocal
 /// clip で声が未設定のときの既定表示、 旧プロジェクト migration で名前が
 /// 欠落しているときのフォールバックに使う。
 pub const DEFAULT_SINGER_NAME: &str = "中国うさぎ";
@@ -122,7 +122,7 @@ pub(crate) const REST_FRAMES: u32 = 10;
 // Public API
 // ---------------------------------------------------------------------------
 
-// NOTE (FIXME #77): 旧 `synthesize_song` + in-memory `VoiceVoxCache` は撤去した。
+// NOTE: 旧 `synthesize_song` + in-memory `VoiceVoxCache` は撤去した。
 // 合成は `daw_plugin_host` の builtin plugin が `synthesize_notes_for_builtin` /
 // `synthesize_talk_for_builtin` 経由で行い、 結果は `voicevox_cache`
 // (`VoiceVoxDiskCache`) で per-user global に永続化する。
@@ -133,7 +133,7 @@ pub(crate) const REST_FRAMES: u32 = 10;
 
 /// 既に組み立て済みの sing query JSON を `frame_synthesis` に流して WAV bytes を
 /// 得る (`build_sing_query` → 本関数 の 2 段)。 caller が query を先に作るのは
-/// キャッシュキー (= query 内容 + singer) を HTTP 前に計算するため (FIXME #77)。
+/// キャッシュキー (= query 内容 + singer) を HTTP 前に計算するため。
 fn sing_query_to_wav(
     client: &reqwest::blocking::Client,
     query_json: &str,
@@ -313,7 +313,7 @@ pub fn synthesize_talk_for_builtin(
     scales: &TalkParams,
 ) -> Result<(Vec<f32>, u32)> {
     anyhow::ensure!(!text.is_empty(), "synthesize_talk_for_builtin called with empty text");
-    // FIXME #77: 永続キャッシュ (text + talk speaker + scales)。 再オープンで
+    // 永続キャッシュ (text + talk speaker + scales)。 再オープンで
     // 読み上げを再合成しない。
     let cache = crate::voicevox_cache::VoiceVoxDiskCache::production();
     let cache_key = crate::voicevox_cache::key_for_talk(text, speaker_id, scales);
@@ -563,7 +563,7 @@ pub fn synthesize_notes_for_builtin(
         !notes.is_empty(),
         "synthesize_notes_for_builtin called with no notes"
     );
-    // (FIXME #36) speaker_id 0 = 未設定 → DEFAULT_SINGER_ID (歌唱可能 style) へ
+    // speaker_id 0 = 未設定 → DEFAULT_SINGER_ID (歌唱可能 style) へ
     // フォールバック。 旧プロジェクトの clip は声未焼き込み (0) で来るため、 0 を
     // そのまま frame_synthesis に渡すと 500 Internal Server Error になる。
     let speaker_id = if speaker_id != 0 {
@@ -574,7 +574,7 @@ pub fn synthesize_notes_for_builtin(
     let model_notes: Vec<Note> = notes.iter().map(|n| n.to_model_note()).collect();
     let query_json = build_sing_query(&model_notes, bpm);
 
-    // FIXME #77: 永続コンテンツアドレスキャッシュ。 query 内容 (= 歌詞 / pitch /
+    // 永続コンテンツアドレスキャッシュ。 query 内容 (= 歌詞 / pitch /
     // frame / bpm が畳み込み済) + singer が同じなら、 HTTP 合成を丸ごと skip して
     // 保存済 WAV を返す。 プロジェクト再オープンで全曲を再合成しないための要。
     let cache = crate::voicevox_cache::VoiceVoxDiskCache::production();

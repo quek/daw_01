@@ -380,7 +380,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
     // it indexes both `follower_slots` and `AudioBridge::mod_scalars`.
     // Coefficients are baked here (recompile-time) so the RT path never
     // derives them (§10).
-    // FIXME #56: `follower_slots` は全 `ModSource` と 1:1 (slot 順 = source 位置 =
+    // `follower_slots` は全 `ModSource` と 1:1 (slot 順 = source 位置 =
     // `AudioBridge::mod_scalars` index)。envelope follower の slot は EnvelopeFollow
     // node が `env` を駆動するが、generator (LFO/Random/MSEG/Steps) の slot は inert
     // で、 engine が `common::modulators::generator_scalar` を `song_beat` から評価して

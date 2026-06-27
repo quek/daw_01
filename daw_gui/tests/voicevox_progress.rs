@@ -1,4 +1,4 @@
-//! FIXME #90: VOICEVOX wav 合成 / 口パク生成の進行状態可視化の回帰テスト。
+//! VOICEVOX wav 合成 / 口パク生成の進行状態可視化の回帰テスト。
 //!
 //! 検証する `AppData` 状態機械:
 //! - `VoicevoxSynthStatus` IPC → `voicevox_synth_status` map の busy/failing 更新、

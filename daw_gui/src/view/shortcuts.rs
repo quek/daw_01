@@ -2,8 +2,8 @@
 //!
 //! 全ショートカットは [`SHORTCUTS`] テーブル 1 箇所で `(name, keys, category,
 //! description)` を宣言する。実際のキー登録 ([`daw_shortcut_map`]) と F1 の一覧
-//! オーバーレイ (`shortcuts_help`) は **どちらもこのテーブルから派生** する
-//! (FIXME #91)。将来キーバインドを設定可能にする際もこのテーブルが入口になる。
+//! オーバーレイ (`shortcuts_help`) は **どちらもこのテーブルから派生** する。
+//! 将来キーバインドを設定可能にする際もこのテーブルが入口になる。
 //!
 //! `Ui::take_shortcut(name)` で root 末尾 (`root.rs::dispatch_shortcuts`) から拾って
 //! AppEvent に変換する。`name` の文字列はそのまま `take_shortcut` の引数になるので

@@ -1,4 +1,4 @@
-//! FIXME #54 / docs/plan_video_fx.md: GPU 効果実行基盤 ([`daw_gui::video_fx::VideoFxEngine`])
+//! docs/plan_video_fx.md: GPU 効果実行基盤 ([`daw_gui::video_fx::VideoFxEngine`])
 //! の end-to-end pixel verify。
 //!
 //! gui_01 #111 の interop primitive (`raw_texture` / `create_render_target`) の上に daw_01 が組んだ

@@ -42,14 +42,14 @@ use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
 
 use crate::widgets::heavy::HeavyCtx;
 
-/// (FIXME #80 / daw_01) muted な clip / note の塗り色。fill の alpha を落として lane 背景を
+/// muted な clip / note の塗り色。fill の alpha を落として lane 背景を
 /// 透過させ、暗く沈める (REAPER / Ableton 流)。clip rect / note rect 共通で使う。
 #[must_use]
 pub(crate) fn muted_dim_fill(c: Color) -> Color {
     Color { a: c.a * 0.42, ..c }
 }
 
-/// (FIXME #80 / daw_01) muted な矩形に 45°(`╱`) の斜線ハッチを重ねる。線は rect の上下端を
+/// muted な矩形に 45°(`╱`) の斜線ハッチを重ねる。線は rect の上下端を
 /// 結ぶ平行線群 (`x + y = const`) を `spacing_px` 間隔で生成し、`scissor` で rect 内だけに
 /// clip する (x が rect 外に伸びても scissor が切る)。clip / note 共通。
 pub(crate) fn push_muted_hatch<M: ?Sized + 'static>(

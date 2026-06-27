@@ -22,7 +22,7 @@ use crate::builtin;
 use crate::clap_plugin::ClapPlugin;
 use crate::vst3_plugin::Vst3Plugin;
 
-/// FIXME #90: builtin VOICEVOX の合成スレッドが状態遷移時に呼ぶ reporter。
+/// builtin VOICEVOX の合成スレッドが状態遷移時に呼ぶ reporter。
 /// `(busy, failing)` を受け、plugin host が `PluginEvent::VoicevoxSynthStatus` に変換して
 /// daw_gui へ送る (= クリップ上スピナー / 全体オーバーレイ / engine 未接続警告の駆動)。
 /// `busy` = いま合成中、`failing` = 直近の HTTP 試行が失敗 (engine 未起動/起動途中)。
@@ -210,7 +210,7 @@ pub trait LoadedPlugin: Send {
     /// no-op because their tails are already flushed by the `deactivate` /
     /// `stop_processing` half of a reinit cycle. Called (in addition to the
     /// deactivate→activate cycle) when force-silencing every plugin — export
-    /// cold render (FIXME #55) and the panic button (FIXME #60) — because a
+    /// cold render and the panic button — because a
     /// deactivate→activate alone does not reliably zero a CLAP reverb's
     /// internal feedback-delay network.
     fn reset(&mut self) {}
@@ -312,7 +312,7 @@ pub trait LoadedPlugin: Send {
     ) {
     }
 
-    /// FIXME #42: builtin VOICEVOX の歌唱合成の `(queued_gen, done_gen)` 世代カウンタを
+    /// builtin VOICEVOX の歌唱合成の `(queued_gen, done_gen)` 世代カウンタを
     /// 返す (それ以外の plugin は `None`)。 plugin host が歌唱 bounce の前に、
     /// `set_note_metadata` が増やした `queued_gen` まで synth thread が `done_gen` を
     /// 進める (= 最新メタデータの合成完了) のを待つために使う。 stale な synth_result を
@@ -321,7 +321,7 @@ pub trait LoadedPlugin: Send {
         None
     }
 
-    /// FIXME #90: builtin VOICEVOX の合成状態 (busy / failing) を daw_gui へ継続報告する
+    /// builtin VOICEVOX の合成状態 (busy / failing) を daw_gui へ継続報告する
     /// callback を仕込む。plugin host が load 後 (plugin_id 確定後) に 1 度設定し、以後
     /// synth thread が状態遷移ごとに呼ぶ。builtin VOICEVOX 以外は no-op。
     fn set_voicevox_status_reporter(&mut self, _reporter: VoicevoxStatusReporter) {}

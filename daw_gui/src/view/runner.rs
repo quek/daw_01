@@ -786,7 +786,7 @@ impl ApplicationHandler<AppEvent> for Runner {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         let Some(state) = self.state.as_mut() else { return };
-        // FIXME #27: 別インスタンスが起動を試み、 既存 (= この) ウィンドウへ
+        // 別インスタンスが起動を試み、 既存 (= この) ウィンドウへ
         // 前面化を要求してきた。 window 操作なので AppData ではなく runner が
         // 直接処理する: 最小化なら復元してフォアグラウンドへ。
         if matches!(event, AppEvent::RaiseMainWindow) {
@@ -856,7 +856,7 @@ impl Runner {
 
         let Some(state) = self.state.as_mut() else { return false };
         let now = Instant::now();
-        // FIXME #90: この frame の overlay / clip スピナー / engine 未接続判定が
+        // この frame の overlay / clip スピナー / engine 未接続判定が
         // すべて同じ時刻を読むよう、frame 冒頭で 1 度だけ確定する (5s 境界の食い違い回避)。
         state.app.frame_now = now;
         let dt = now.duration_since(self.last_tick);
@@ -1011,7 +1011,7 @@ impl Runner {
             (false, None) => {}
         }
 
-        // FIXME #90: 再生中に加え、VOICEVOX 合成/口パク生成中も連続再描画を要求して
+        // 再生中に加え、VOICEVOX 合成/口パク生成中も連続再描画を要求して
         // クリップ上スピナー + 全体オーバーレイを回す。engine 未接続が確定したら
         // `voicevox_animating` が false を返すので static 警告表示で再描画は止まる
         // (CPU/GPU を回し続けない)。overlay 描画と同じ `now` (= frame_now) を使う。
@@ -1141,7 +1141,7 @@ impl Runner {
                         }
                     }
                     // Transform box drag begin（clip drag が始まらなかったときのみ）。
-                    // FIXME #54 Wave3: 選択中トラックに Transform 配置 device が刺さって
+                    // 選択中トラックに Transform 配置 device が刺さって
                     // いれば対象（立ち絵 group も通常トラックも）。base group_transform は
                     // device 追加時に materialize 済なので overlay と同じ effective transform
                     // で hit-test する（枠が出れば必ず掴める）。
@@ -1381,7 +1381,7 @@ impl Runner {
             }
         }
 
-        // FIXME #54 Wave2 (plan_video_fx §3): 動画フレーム / PiP 画像 / テキストを
+        // 動画フレーム / PiP 画像 / テキストを
         // **owning track ごと** に 1 枚の RGBA「トラック合成画」へ集約する。各 track の
         // 視覚アイテムを bucket に集め、track 順 (= z 順) に 1 TrackComposite として
         // preview に渡す。立ち絵 group の子画像は親 group の bucket へ吸収 (approach X)。
@@ -1479,7 +1479,7 @@ impl Runner {
         let mut composites: Vec<crate::group_compose::TrackComposite> = Vec::new();
         for track in state.app.song.tracks.iter().rev() {
             let items = buckets.remove(&track.id).unwrap_or_default();
-            // FIXME #54 Wave3: 配置 transform は **どのトラックでも** Transform device から
+            // 配置 transform は **どのトラックでも** Transform device から
             // 解決（立ち絵 group も通常トラックも統一）。device が無ければ None = identity 配置。
             let transform = crate::video_fx::resolve_track_transform(
                 &state.app.song,
@@ -1505,12 +1505,12 @@ impl Runner {
                 selected,
             });
         }
-        // FIXME #54 Wave4: 時間系効果（ノイズ/スキャンライン等）の `P.time`（秒）。
+        // 時間系効果（ノイズ/スキャンライン等）の `P.time`（秒）。
         // preview/export 一致のため wall-clock でなく song 時間（playhead_beat × 60/bpm）。
         let bpm = state.app.song.bpm.max(1.0) as f64;
         preview.fx_engine.set_time((playhead_beat * 60.0 / bpm) as f32);
         preview.set_track_composites(composites);
-        // FIXME #54 Wave1: マスター映像チェーン（master_fx_chain の映像 device）を解決して渡す。
+        // マスター映像チェーン（master_fx_chain の映像 device）を解決して渡す。
         // 空でなければ preview が全トラック合成画を master canvas 1 枚に集約してから適用する。
         preview.set_master_fx(crate::video_fx::resolve_master_effects(
             &state.app.song,

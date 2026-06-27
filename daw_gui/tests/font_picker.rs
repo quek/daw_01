@@ -1,5 +1,5 @@
 //! Integration test: フォントピッカーの絞り込み + デフォルト行 + カーソル
-//! (FIXME #25 / `docs/plan_font_picker.md`)。
+//! (`docs/plan_font_picker.md`)。
 //!
 //! 検証する model 操作:
 //! - `FontFamiliesLoaded` で visible 構築、 先頭にデフォルト行 (`""`)

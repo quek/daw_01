@@ -1,4 +1,4 @@
-//! clip 表示ラベル導出の AppData-driven JS smoke test (FIXME #69)。
+//! clip 表示ラベル導出の AppData-driven JS smoke test。
 //!
 //! flow:
 //! 1. `tests/scripts/clip_label_display_smoke.js` を `daw_gui --script` で実行

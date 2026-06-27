@@ -265,7 +265,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // 素 drag / 単発 click: Started + Continuing で連続 seek
             // (= Stop 中も Play 中も即座にプレイカーソル移動 + IPC SeekTo)。
             // arrangement / piano_roll と同形で `AppData::seek_playhead_to` に集約。
-            // FIXME #50: seek_playhead_to は「停止で戻るホーム」も更新する。
+            // seek_playhead_to は「停止で戻るホーム」も更新する。
             if drag.kind != DragKind::Released {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.seek_playhead_to(cur_beat);

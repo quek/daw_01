@@ -1,4 +1,4 @@
-//! FIXME #55: Export WAV / Video の前に出す「書き出し範囲」 ピッカーモーダル。
+//! Export WAV / Video の前に出す「書き出し範囲」 ピッカーモーダル。
 //!
 //! Ardour / REAPER の time-selection export に倣い、 書き出す時間範囲を選ぶ。
 //! 表示/入力は 1-based **小節.拍** (例 "3.1") だが、 内部値は song の native 単位
@@ -23,7 +23,7 @@ const COLOR_HINT: Color = theme::TEXT_DIM;
 
 const PANEL_W: f32 = 380.0;
 const PANEL_H: f32 = 210.0;
-/// FIXME #79: Mp4 は範囲に加えて解像度 / fps の dropdown 行を最下段に持つので背が高い。
+/// Mp4 は範囲に加えて解像度 / fps の dropdown 行を最下段に持つので背が高い。
 /// dropdown の popup は panel 下端より下 (= 暗転 overlay、 widget 無し) に開くため、
 /// ボタン行を dropdown 行の **上** に置く (popup と button の z / 入力衝突を構造的に回避)。
 const PANEL_H_MP4: f32 = 220.0;
@@ -60,7 +60,7 @@ const SCRUB_STYLE: ScrubableNumberStyle = ScrubableNumberStyle {
     range: None,
 };
 
-/// FIXME #79: video export の出力解像度プリセット (label, width, height)。 すべて
+/// video export の出力解像度プリセット (label, width, height)。 すべて
 /// 偶数 (H.264 yuv420p は幅・高さが偶数必須)。 dropdown の closed 表示と選択肢の
 /// 両方に使う。 既定 (= プロジェクト現在値 1920x1080) は `RES_DEFAULT_IDX`。
 const RES_PRESETS: &[(&str, u32, u32)] = &[
@@ -75,7 +75,7 @@ const RES_PRESETS: &[(&str, u32, u32)] = &[
 /// FHD の `RES_PRESETS` index。 picker 値が一覧に無い (理論上のみ) ときの fallback。
 const RES_DEFAULT_IDX: usize = 2;
 
-/// FIXME #79: video export の出力フレームレートプリセット (label, fps)。 整数のみ。
+/// video export の出力フレームレートプリセット (label, fps)。 整数のみ。
 const FPS_PRESETS: &[(&str, f32)] = &[
     ("24", 24.0),
     ("25", 25.0),
@@ -103,7 +103,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let end_beat = picker.end_beat;
     // dblclick リセット時の default: 開始=曲頭(0)、 終了=曲末(length_beats)。
     let song_len = app.song.length_beats;
-    // FIXME #79: Mp4 のときだけ出力解像度 / fps の dropdown を出す。 値は picker が
+    // Mp4 のときだけ出力解像度 / fps の dropdown を出す。 値は picker が
     // 保持する per-export override (open 時に Song から seed 済み)。
     let is_mp4 = matches!(kind, ExportRangeKind::Mp4);
     let resolution = picker.resolution;
@@ -184,7 +184,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             }
 
             // ---- ボタン行 (右: Export / 左: キャンセル) ----
-            // FIXME #79: Mp4 は dropdown 行を最下段に置く (popup が panel 下端より下の
+            // Mp4 は dropdown 行を最下段に置く (popup が panel 下端より下の
             // 暗転領域に開けるよう、 button より下に widget を置かない)。 ボタンは終了行
             // の直下に上げる。 Wav は従来どおり panel 最下部。
             let btn_y = if is_mp4 {
@@ -213,7 +213,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 }));
             }
 
-            // ---- FIXME #79: 出力解像度 / fps (Mp4 のみ、 最下段に side-by-side) ----
+            // ---- 出力解像度 / fps (Mp4 のみ、 最下段に side-by-side) ----
             // dropdown を最後に描く + panel 下端 (widget 無し) に popup を開かせるので、
             // popup と他 widget の z / 入力衝突が起きない。 popup は modal の z 上で出る
             // (modal body と同じ popup_buffer の後方 = 最前面)。

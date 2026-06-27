@@ -71,7 +71,7 @@ pub fn pitch_ratio_for(
     }
 }
 
-/// FIXME #61 (clip time-stretch): clip 伸縮量 = source の native 再生長 (秒) /
+/// clip 伸縮量 = source の native 再生長 (秒) /
 /// event の配置長 (秒、 nominal bpm 基準) の比。 `1.0` で trim 相当 (= source を
 /// そのまま native rate で再生)、 `< 1.0` で event slot の方が長い → source を
 /// 引き伸ばす (slow)、 `> 1.0` で event slot が短い → 詰める (fast)。 engine SR に
@@ -186,7 +186,7 @@ mod tests {
         assert!((r - 1.0).abs() < 1e-9);
     }
 
-    // ---- stretch_ratio_for (FIXME #61) ----
+    // ---- stretch_ratio_for ----
 
     #[test]
     fn stretch_ratio_native_equals_event_is_unity() {

@@ -6,7 +6,7 @@ use daw_ui_renderer::{theme, Color, Rect};
 use crate::app::AppData;
 
 const COLOR_BG: Color = theme::HEADER;
-// FIXME #52: 旧 dim グレー (0.65/0.68/0.72) はコントラスト不足だったため primary
+// 旧 dim グレー (0.65/0.68/0.72) はコントラスト不足だったため primary
 // (= 他 view と同じ body text) に統一。MIDI/file ラベルの可読性を上げる。
 const COLOR_TEXT: Color = theme::TEXT;
 // status_message は成功/通知系の緑 = semantic PLAY (status success)。

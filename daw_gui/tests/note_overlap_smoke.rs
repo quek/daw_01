@@ -1,4 +1,4 @@
-//! FIXME #83: MIDI ノート非重なり解消の AppData-driven JS smoke test。
+//! MIDI ノート非重なり解消の AppData-driven JS smoke test。
 //!
 //! flow:
 //! 1. `tests/scripts/note_overlap_smoke.js` を `daw_gui --script` で実行

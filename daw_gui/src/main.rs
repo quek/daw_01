@@ -140,7 +140,7 @@ fn main() -> Result<()> {
 
     let cli = parse_args()?;
 
-    // FIXME #27: 対話 GUI は single-instance。 2 つ目の起動は既存ウィンドウを
+    // 対話 GUI は single-instance。 2 つ目の起動は既存ウィンドウを
     // 前面化して即終了する。 --script (WAV 書き出し) / --smoke-test[-text] (CI
     // 検証) は対象外 — 開発インスタンスを開いたまま並行実行できる必要があるため。
     // bootstrap_subprocess (子プロセス起動 / audio device open) より前に弾く。
@@ -256,7 +256,7 @@ fn run_gui(
             spawn_midi_input(proxy.clone());
             spawn_incoming_bridge(incoming_rx, proxy.clone());
 
-            // FIXME #27: primary インスタンスは、 2 つ目の起動からの前面化要求を
+            // primary インスタンスは、 2 つ目の起動からの前面化要求を
             // 待つ listener を立てる (event 受信 → RaiseMainWindow を event loop へ)。
             // smoke-test / script モードはゲート対象外なので primary フラグは立たない。
             if singleton_primary {

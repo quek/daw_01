@@ -59,7 +59,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     draw_menu_bar(app, ui, menu_rect);
     transport::draw(app, ui, transport_rect);
 
-    // FIXME #22: inspector を左カラムにフル高さで配置し、 その右で arrangement
+    // inspector を左カラムにフル高さで配置し、 その右で arrangement
     // (上) と bottom_panel (= mixer / piano_roll / audio editor、 下) を縦分割する。
     // 旧レイアウト (inspector は上ペイン内の左帯、 bottom panel は全幅) から
     // 「左=inspector フル高 / 右上=arrangement / 右下=bottom panel」 へ再編。
@@ -108,10 +108,10 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // Modal: font picker (Text クリップのフォント選択)。is_font_picker_open と同期。
     font_picker::draw(app, ui, screen);
 
-    // 非ブロック overlay: プロジェクトロードの進捗 (FIXME #24)。
+    // 非ブロック overlay: プロジェクトロードの進捗。
     load_overlay::draw(app, ui, screen);
 
-    // 非ブロック overlay: VOICEVOX wav 合成 / 口パク生成の進行状態 (FIXME #90)。
+    // 非ブロック overlay: VOICEVOX wav 合成 / 口パク生成の進行状態。
     voicevox_overlay::draw(app, ui, screen);
 
     // Modal: send 宛先トラックピッカー。app.send_picker == Some(..) のとき開く。
@@ -123,17 +123,17 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
 
     // Modal: 未保存変更ありで「プロジェクトを破棄する操作」 (終了 / New /
     // Open / Open Recent) をしようとしたときの「保存して続行 / 保存せず続行 /
-    // キャンセル」 確認 (FIXME #63)。 app.dirty_guard を監視。
+    // キャンセル」 確認。 app.dirty_guard を監視。
     dirty_guard_modal::draw(app, ui, screen);
 
-    // Modal: 書き出し範囲ピッカー (FIXME #55)。app.export_range_picker == Some の
+    // Modal: 書き出し範囲ピッカー。app.export_range_picker == Some の
     // とき開く。 export 実行前なので export_overlay より前に描いてよい。
     export_range_modal::draw(app, ui, screen);
 
     // Overlay: WAV / Video export 中の進捗 + Cancel。app.export_stage を監視。
     export_overlay::draw(app, ui, screen);
 
-    // Overlay: F1 ショートカット / マウス操作一覧 (FIXME #91)。app.is_help_open と
+    // Overlay: F1 ショートカット / マウス操作一覧。app.is_help_open と
     // 同期。最前面に出すため他の modal / overlay より後に描く。
     shortcuts_help::draw(app, ui, screen);
 }
@@ -291,7 +291,7 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
     });
 }
 
-/// FIXME #33: clipboard / delete 操作の対象面。ポインタが乗っている編集面を最優先し、
+/// clipboard / delete 操作の対象面。ポインタが乗っている編集面を最優先し、
 /// どの面でもなければ選択集合の非空優先順 (= 既存 Delete と同順) で決まる。
 /// copy / cut / paste / delete が共有する単一 arbiter (grill-me 2026-06-11)。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -302,7 +302,7 @@ enum EditSurface {
     AutomationClips,
     Clips,
     Tracks,
-    /// FIXME #53: Arranger セクション帯 (選択中なら Delete で帯削除)。
+    /// Arranger セクション帯 (選択中なら Delete で帯削除)。
     Sections,
 }
 
@@ -357,7 +357,7 @@ fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface>
     if !app.selected_track_ids.is_empty() {
         return Some(EditSurface::Tracks);
     }
-    // FIXME #53: section は最低優先 (他面が空のときだけ Delete 対象)。 section 選択時は
+    // section は最低優先 (他面が空のときだけ Delete 対象)。 section 選択時は
     // apply_select_section が他面選択をクリアするので通常ここに到達する。
     if !app.selected_section_ids.is_empty() {
         return Some(EditSurface::Sections);
@@ -576,7 +576,7 @@ fn paste_noop(ui: &mut Ui<'_, AppData>) {
 /// (audio event > automation point > note > automation clip > clip) で削除。後者は従来の
 /// 挙動そのままで回帰しない。
 fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
-    // FIXME #53: section が対象面なら選択帯を削除して終わり (帯のみ・内容温存)。
+    // section が対象面なら選択帯を削除して終わり (帯のみ・内容温存)。
     if matches!(surface, Some(EditSurface::Sections)) {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.apply_delete_selected_sections();
@@ -639,7 +639,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         .is_some_and(|(px, py)| bottom_rect.contains(px, py));
     let is_pianoroll_active = app.bottom_panel == 1 && pointer_in_bottom;
     let surface = edit_surface(app, is_pianoroll_active);
-    // FIXME #86: `Z` 段階ズーム / `R` loop の対象面 (通常 clip / automation clip) は
+    // `Z` 段階ズーム / `R` loop の対象面 (通常 clip / automation clip) は
     // copy / cut / delete と同じ `edit_surface` arbiter で解決する (last-selection-wins)。
     // これで「MIDI clip を選んでも残存 automation 選択へズームしてしまう」 を防ぐ。
     let zoom_automation = matches!(surface, Some(EditSurface::AutomationClips));
@@ -747,7 +747,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::Redo)
         }));
     }
-    // ----- Clipboard / Delete (FIXME #33: 統一 arbiter) -----
+    // ----- Clipboard / Delete (統一 arbiter) -----
     // ポインタが乗っている編集面 → なければ選択優先順、で対象面を一意に決める
     // (grill-me 2026-06-11)。copy / cut / paste / delete が同じ arbiter を共有。
     // text_input focus 中は gui_01 が cut/copy/paste/delete を自動 suppress するので
@@ -755,7 +755,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // (`is_pianoroll_active` / `surface` / `zoom_automation` は関数冒頭で算出済 —
     // `R` loop が先頭ブロックで使うため。)
 
-    // FIXME #44: f キー。カーソル直下の拍 (song-absolute) を現在の snap 設定で吸着して
+    // f キー。カーソル直下の拍 (song-absolute) を現在の snap 設定で吸着して
     // プレイヘッドを移動し再生する。piano_roll active ならピアノロールの hover (song-raw)、
     // それ以外はアレンジの hover (raw) を使い、view 層でここで snap + routing を解決して
     // song-absolute beat にする。どちらの grid 外でも hover は None なので no-op。
@@ -863,16 +863,16 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
-    // ----- Track solo (S): FIXME #19 (piano roll) + FIXME #68 (arrangement / mixer) -----
+    // ----- Track solo (S): piano roll + arrangement / mixer -----
     // S キーで「マウス直下のトラック」を solo toggle する (mixer / arrangement の
     // S ボタンと同じ ToggleTrackSolo を発火)。 対象 track は pointer の位置で決まる:
     // - piano roll active (= pointer が bottom panel 内 + Piano Roll タブ。 audio
     //   editor は MIDI 編集文脈ではないので除外): 編集中 clip の所属 track
     //   (ClipRef.track は index なので id へ解決)。
     // - mixer (= pointer が bottom panel 内 + Mixer タブ): マウス直下のストリップ
-    //   (`mixer_hovered_track`、 FIXME #68)。 master strip / strip 外は None で no-op。
+    //   (`mixer_hovered_track`)。 master strip / strip 外は None で no-op。
     // - それ以外 (= pointer がアレンジ上): マウス直下のトラック
-    //   (`arrange_hovered_track`、 FIXME #33)。 ヘッダ列でもクリップレーン上でも
+    //   (`arrange_hovered_track`)。 ヘッダ列でもクリップレーン上でも
     //   同じトラック行を返し、 ruler / master 行 / トラック外は None で no-op。
     //   いずれも選択トラックではなく「カーソルがあるトラック」を solo する。
     // text_input focus 中は gui_01 が単キーを抑制するので rename / 歌詞編集中は発火しない。
@@ -897,7 +897,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
 
-    // ----- Mute (Q): FIXME #80 -----
+    // ----- Mute (Q) -----
     // 「選択中のものがあればそれらを、 無ければマウスカーソル直下のものを」 mute toggle。
     // 対象は文脈で決まる:
     // - piano roll active (= bottom panel が piano roll タブ + pointer が bottom 内、 ただし
@@ -910,7 +910,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // text_input フォーカス中は gui_01 が単キーを抑制する。
     if ui.take_shortcut("daw.toggle_mute") {
         if is_pianoroll_active && app.audio_editor_clip.is_none() {
-            // FIXME #93: note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
+            // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
             // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、
             // ここで単一 anchor clip に縛らない (複数クリップ同時 mute を保つ)。
             let notes: Vec<u32> = if !app.selected_notes.is_empty() {
@@ -1015,7 +1015,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
 
-    // ----- Clip duplicate (gui_01 #019 / FIXME #21) -----
+    // ----- Clip duplicate (gui_01 #019) -----
     // D / Alt+D で選択中 clip 群をまとめて共有/独立コピー。 選択ブロック全体の
     // span だけ後ろにずらして相対位置を保ったまま複製する (REAPER / Ableton の
     // Ctrl+D 流、 Ctrl+drag と同じセマンティクス)。 複製は全選択になり連打で
@@ -1061,7 +1061,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // rename は単一対象なので selected_clip (= 末尾カーソル clip) を使う。
     // 選択 clip が無ければ no-op。 text_input focus 中は gui_01 が shortcut を
     // 抑制するので rename 編集中の F2 は発火しない。
-    // FIXME #18: clip が選択されていれば clip rename、 そうでなければ
+    // clip が選択されていれば clip rename、 そうでなければ
     // (track header のみ選択 / フォーカス時) cursor track の名前を rename。
     // どちらも単一対象 (selected_clip = 末尾カーソル clip、 track は
     // cursor_track_index)。 track header の double-click が効かない場面でも
@@ -1160,7 +1160,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // plugin picker / send picker が開いている間は escape を消費しない
     // (= track_picker / plugin_picker の modal が close_on_escape で閉じる)。
     //
-    // FIXME #84: piano_roll の歌詞 inline 編集中も escape を消費しない。 この
+    // piano_roll の歌詞 inline 編集中も escape を消費しない。 この
     // `dispatch_shortcuts` は `bottom_panel::draw` (= piano_roll widget) より前に走るため、
     // ここで `take_shortcut("escape")` を消費すると widget の歌詞キャンセルハンドラ
     // (piano_roll.rs) に escape が届かず、 代わりに下の選択解除 branch が走って編集中
@@ -1273,7 +1273,7 @@ mod tests {
         }
     }
 
-    /// FIXME #84: piano_roll の歌詞 inline 編集中の Esc は global の `dispatch_shortcuts`
+    /// piano_roll の歌詞 inline 編集中の Esc は global の `dispatch_shortcuts`
     /// で消費されず piano_roll widget に委ねられる。 ここで消費 (選択解除) されると
     /// 編集中 clip が deselect → MIDI エディタが空表示になる回帰を防ぐ。
     #[test]

@@ -88,8 +88,8 @@ pub enum ChildToMain {
     /// The plugin host finished reinitialising (deactivate→activate) every
     /// plugin — reply to `MainToChild::ReinitAllPlugins`. The reinit forces a
     /// clean state even for plugins that ignore CLAP `reset()` (e.g. VCV Rack 2
-    /// holding a live voice). For an offline export (FIXME #55) the host waits
-    /// for this before sending `ExportWav`; for the panic button (FIXME #60) it
+    /// holding a live voice). For an offline export the host waits
+    /// for this before sending `ExportWav`; for the panic button it
     /// is fire-and-forget (the host ignores the reply when no export is queued).
     PluginsReinitDone,
     /// Offline plugin-FX bounce finished (or failed). Mirror of
@@ -105,7 +105,7 @@ pub enum ChildToMain {
         error: Option<String>,
         frames: u64,
     },
-    /// FIXME #42: builtin VOICEVOX の歌唱合成が `MainToChild::PrepareVocalSynth`
+    /// builtin VOICEVOX の歌唱合成が `MainToChild::PrepareVocalSynth`
     /// で要求した世代まで完了した (or タイムアウトした) ことを daw_gui に通知する。
     /// daw_gui は `pending_vocal_synth_bounce` が一致すれば歌唱 bounce の offline
     /// render を開始する。 `plugin_id` は要求を echo back する builtin の host id。
@@ -204,7 +204,7 @@ pub enum ChildToMain {
         index: u32,
         plugin_id: u32,
         params: Vec<PluginParamInfo>,
-        /// FIXME #78: この plugin が埋め込み GUI (editor window) を持つか
+        /// この plugin が埋め込み GUI (editor window) を持つか
         /// (`LoadedPlugin::gui_is_embed_supported`)。 daw_gui はチェーン行の
         /// ボタンを分岐する: GUI あり = editor window を開く「GUI」、 なし =
         /// インライン param パネルをトグルする「⚙」。 builtin (VOICEVOX /
@@ -243,7 +243,7 @@ pub enum ChildToMain {
         index: u32,
         param_id: u32,
     },
-    /// FIXME #90: builtin VOICEVOX plugin の歌唱/読み上げ合成スレッドの状態遷移。
+    /// builtin VOICEVOX plugin の歌唱/読み上げ合成スレッドの状態遷移。
     /// `busy` = いま合成中 (= `queued_gen > done_gen`)、`failing` = 直近の HTTP 試行が
     /// 失敗した (= engine 未起動/起動途中で接続できない)。daw_gui がこれを per-plugin に
     /// 集約し、クリップ上スピナー + 全体オーバーレイ + engine 未接続警告を出す。
@@ -331,14 +331,14 @@ pub enum MainToChild {
     Ack,
     Play,
     Stop,
-    /// FIXME #60: パニックボタン — master 出力を declick フェードで一瞬ミュート
+    /// パニックボタン — master 出力を declick フェードで一瞬ミュート
     /// する。 panic は直後に（master がミュートされてから）`ReinitAllPlugins` を
     /// 送るので、 全 plugin を mix から外す瞬間の段差クリックがフェードで隠れる。
     /// audio engine は master を fade-out して **`PanicRelease` が来るまで 0 で
     /// hold** する（plugin-host hang 用に数秒の安全 auto-release あり）。transport
     /// の Stop とは独立。
     Panic,
-    /// FIXME #60: パニックの declick hold を解除して fade-in に移す。 daw_gui が
+    /// パニックの declick hold を解除して fade-in に移す。 daw_gui が
     /// `ReinitAllPlugins` の完了通知 `PluginsReinitDone` を受けてから送る。 master
     /// のミュート解除を「reinit が実際に終わった瞬間」 に結びつけることで、 GUI
     /// メインスレッド stall や巨大 reinit でも plugin が mix に残ったまま master が
@@ -355,7 +355,7 @@ pub enum MainToChild {
     /// `range`:
     /// - `None` — full-song export (frame 0 → `length_beats` + tail).
     /// - `Some((start_frame, end_frame))` — render only that frame window
-    ///   (FIXME #55, user-chosen export range). The render walks the song
+    ///   (user-chosen export range). The render walks the song
     ///   **from `start_frame`** (cold start), so audio whose note began
     ///   before `start_frame` (e.g. a VOICEVOX phrase still ringing, a held
     ///   note) is *not* retriggered — the result matches pressing Play at
@@ -373,7 +373,7 @@ pub enum MainToChild {
         /// standalone WAV export has the modulation already baked into the
         /// audio, so it passes `false` and doesn't litter the user's folder
         /// with a file nothing reads. The GUI sets `true` only for the
-        /// video-export temp WAV (FIXME #55 follow-up).
+        /// video-export temp WAV.
         write_mod_sidecar: bool,
     },
     /// Abort the in-flight offline render (= `ExportWav`). daw_audio sets
@@ -394,9 +394,9 @@ pub enum MainToChild {
     ///
     /// Two callers share this single operation (SSoT for "force all plugins to
     /// silence / clean state"):
-    /// - FIXME #55: sent **before** `ExportWav` (for a user range / cold
+    /// - sent **before** `ExportWav` (for a user range / cold
     ///   render) so an offline cold render starts from a clean state.
-    /// - FIXME #60: the transport **panic button** — kills stuck voices /
+    /// - the transport **panic button** — kills stuck voices /
     ///   reverb tails / held preview notes immediately. Fire-and-forget.
     ReinitAllPlugins,
     /// Offline-render a clip range with the **full plugin chain** (= post-FX)
@@ -436,7 +436,7 @@ pub enum MainToChild {
         /// IPC 専用 (= 全プロセス同時 rebuild) なので bincode 後方互換は不要。
         talk: Vec<crate::plugin_metadata::TalkMetadata>,
     },
-    /// FIXME #42: 歌唱 bounce の前に builtin VOICEVOX の合成完了を要求する。 直前に
+    /// 歌唱 bounce の前に builtin VOICEVOX の合成完了を要求する。 直前に
     /// 送った `SetBuiltinPluginNoteMetadata` の世代まで synth が終わったら plugin host が
     /// `ChildToMain::VocalSynthReady` を返す (非同期 HTTP 合成が offline render より
     /// 遅れて無音になるのを防ぐ)。 `plugin_id` は対象 builtin の host id。
@@ -571,7 +571,7 @@ pub enum MainToChild {
         track: u32,
         index: u32,
     },
-    /// FIXME #32: apply an arbitrary chain reorder as a glitch-free **live
+    /// apply an arbitrary chain reorder as a glitch-free **live
     /// move**. `moves` is the COMPLETE new layout of `track`'s chain: one
     /// `(old_index, new_index)` per loaded plugin (including
     /// `old_index == new_index` for ones that did not move), where
@@ -609,7 +609,7 @@ pub enum MainToChild {
     /// loaded plugin. Used for project save.
     RequestAllStates,
     // --- GUI management ----------------------------------------------
-    /// Open the plugin editor. FIXME #31: the editor's top-level window is
+    /// Open the plugin editor. The editor's top-level window is
     /// now created and owned by the plugin-host process (on its plugin-main
     /// thread), NOT by daw_gui. That makes the editor's `GA_ROOTOWNER`
     /// resolve into the plugin-host process so JUCE's

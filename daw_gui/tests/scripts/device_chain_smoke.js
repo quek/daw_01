@@ -8,7 +8,7 @@
 //
 // 役割判定はしない (engine は port を順に直結するだけ)。ここで検証するのは
 // 「チェーンの並び順」と「各 device の port 構成」が load を通して保たれること。
-// FIXME #32 (D&D 並び替え / 音追従) の回帰 — device の欠落・並び崩れ・port 喪失 —
+// (D&D 並び替え / 音追従) の回帰 — device の欠落・並び崩れ・port 喪失 —
 // を CI で即検出する。plugin / VST3 不要 (ports を JSON に直接書く)。
 //
 // port = (note_in, note_out, audio_out, audio_in)。

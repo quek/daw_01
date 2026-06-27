@@ -46,8 +46,8 @@ const WM_COMMAND_WAKE: u32 = WM_APP + 1;
 #[derive(Debug, Clone)]
 pub enum PluginEvent {
     /// Every plugin reinitialised (deactivate→activate) to a clean state
-    /// (reply to `PluginCommand::ReinitAllPlugins` — export prep FIXME #55 or
-    /// the panic button FIXME #60). `From<PluginEvent>` maps to
+    /// (reply to `PluginCommand::ReinitAllPlugins` — export prep or
+    /// the panic button). `From<PluginEvent>` maps to
     /// `ChildToMain::PluginsReinitDone`.
     PluginsReinitDone,
     SlotGuiOpened {
@@ -60,12 +60,12 @@ pub enum PluginEvent {
         track: u32,
         index: u32,
     },
-    /// FIXME #42: builtin VOICEVOX の歌唱合成が要求世代まで完了 (or timeout) した。
+    /// builtin VOICEVOX の歌唱合成が要求世代まで完了 (or timeout) した。
     /// `From<PluginEvent> for ChildToMain` が `ChildToMain::VocalSynthReady` に変換。
     VocalSynthReady {
         plugin_id: u32,
     },
-    /// FIXME #90: builtin VOICEVOX の synth thread の状態遷移 (busy / failing)。
+    /// builtin VOICEVOX の synth thread の状態遷移 (busy / failing)。
     /// `set_voicevox_status_reporter` で仕込んだ callback が任意スレッドから emit する。
     /// `ChildToMain::VoicevoxSynthStatus` に変換して daw_gui へ継続報告する。
     VoicevoxSynthStatus {
@@ -315,7 +315,7 @@ fn republish_entry_slot(
 enum PluginCommand {
     /// Reinitialise (deactivate→activate) every loaded plugin to a clean
     /// state, then reply `PluginEvent::PluginsReinitDone`. Shared by export
-    /// prep (FIXME #55) and the panic button (FIXME #60).
+    /// prep and the panic button.
     ReinitAllPlugins,
     SetSlotPlugin {
         track: u32,
@@ -329,7 +329,7 @@ enum PluginCommand {
         track: u32,
         index: u32,
     },
-    /// FIXME #42: 歌唱 bounce 用に、 `plugin_id` の builtin VOICEVOX の合成が
+    /// 歌唱 bounce 用に、 `plugin_id` の builtin VOICEVOX の合成が
     /// (直前の metadata flush 世代まで) 完了するのを待って `PluginEvent::VocalSynthReady`
     /// を emit する。 plugin-main が builtin の世代 Arc を見て poll thread を spawn する。
     PrepareVocalSynth {
@@ -440,7 +440,7 @@ async fn main() -> Result<()> {
     let _log_guard = common::logging::init_tracing_for("daw_plugin_host");
     tracing::info!("daw_plugin_host started");
 
-    // FIXME #26/#29: one-shot VST3 port-probe モード。 daw_gui の rescan が VST3
+    // one-shot VST3 port-probe モード。 daw_gui の rescan が VST3
     // ごとにこのプロセスを使い捨てで起動し (プロセス隔離 + caller 側 timeout)、
     // bus 構成から port 構成 (note in/out・audio out) を得る。 plugin の instantiate
     // を別プロセスへ押し込むことで、 壊れた / ハングする VST3 がスキャン本体を
@@ -463,7 +463,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // FIXME #29: one-shot CLAP port-probe モード。 VST3 と対称 (--probe-vst3 と
+    // one-shot CLAP port-probe モード。 VST3 と対称 (--probe-vst3 と
     // 同じ行形式・同じ失敗時無出力)。 CLAP descriptor の feature には note 出力の
     // 有無が無いので、 dual-role 検出には instance 生成後の note-ports/audio-ports
     // query が要る。
@@ -628,7 +628,7 @@ fn plugin_main_loop(
     let plugin_registry: PluginRegistry =
         Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
 
-    // FIXME #31: plugin editor windows are now owned by THIS process. Each
+    // plugin editor windows are now owned by THIS process. Each
     // open editor has a host-created top-level window (`EditorWindow`) keyed
     // by (track, index). Created/destroyed only on this (plugin-main) thread.
     let mut editor_windows: HashMap<(u32, u32), editor_window::EditorWindow> =
@@ -782,9 +782,9 @@ fn plugin_main_loop(
                     //     processing state — filters / delay lines / reverb
                     //     tails — that a deactivate→activate alone leaves intact
                     //     for a CLAP reverb's internal feedback-delay network
-                    //     (FIXME #60 実機: パニック後もテイルが鳴り続けた).
-                    // Shared by export prep (FIXME #55, clean cold render) and
-                    // the panic button (FIXME #60, kill all sound now). Same
+                    //     (実機: パニック後もテイルが鳴り続けた).
+                    // Shared by export prep (clean cold render) and
+                    // the panic button (kill all sound now). Same
                     // safety contract
                     // as plugin teardown: detach from the registry so workers
                     // skip these instances, `quiesce` to drain in-flight
@@ -992,7 +992,7 @@ fn plugin_main_loop(
                         teardown_plugin(old);
                     }
                     if let Some(pid) = old_pid {
-                        // FIXME #31: 旧 plugin の editor window が開いていたら、
+                        // 旧 plugin の editor window が開いていたら、
                         // teardown (gui_destroy) の後に container を破棄する。
                         // stable plugin id で照合 (slot ずれ耐性) + SlotGuiClosed 通知。
                         destroy_editor_windows_where(
@@ -1114,7 +1114,7 @@ fn plugin_main_loop(
                                         "plugin enumerated params"
                                     );
                                 }
-                                // FIXME #78: 埋め込み GUI の有無を一緒に通知。
+                                // 埋め込み GUI の有無を一緒に通知。
                                 // daw_gui がチェーン行ボタン (GUI window vs
                                 // インライン param パネル) を分岐する判断材料。
                                 let has_embedded_gui =
@@ -1126,7 +1126,7 @@ fn plugin_main_loop(
                                     params,
                                     has_embedded_gui,
                                 });
-                                // FIXME #90: builtin VOICEVOX なら合成状態 reporter を仕込む。
+                                // builtin VOICEVOX なら合成状態 reporter を仕込む。
                                 // synth thread が busy/failing 遷移ごとに呼び、daw_gui へ継続
                                 // 報告する (= クリップ上スピナー + 全体オーバーレイ + engine
                                 // 未接続警告)。voicevox_synth_progress().is_some() = builtin
@@ -1227,7 +1227,7 @@ fn plugin_main_loop(
                     }
 
                     if let Some(pid) = removed_pid {
-                        // FIXME #31: destroy this plugin's editor window (if
+                        // destroy this plugin's editor window (if
                         // open) after gui_destroy. Match by STABLE plugin id,
                         // not by (track, index): the plugin's index may have
                         // shifted while the editor was open (a lower-index
@@ -1444,7 +1444,7 @@ fn plugin_main_loop(
                     plugin_lookup.retain(|&(t, _), _| t != track);
                     loaded_id_for_slot.retain(|&(t, _), _| t != track);
                     loaded_meta_for_slot.retain(|&(t, _), _| t != track);
-                    // FIXME #31: destroy this track's editor windows after the
+                    // destroy this track's editor windows after the
                     // plugins' gui_destroy above, and notify daw_gui for each.
                     destroy_editor_windows_where(
                         &mut editor_windows,
@@ -1537,7 +1537,7 @@ fn plugin_main_loop(
                     });
                 }
                 PluginCommand::PrepareVocalSynth { plugin_id } => {
-                    // FIXME #42: 歌唱 bounce の前に合成完了を保証する。 plugin_id の builtin
+                    // 歌唱 bounce の前に合成完了を保証する。 plugin_id の builtin
                     // VOICEVOX の (queued, done) 世代 Arc を取り出し、 直前 flush 世代まで
                     // done になるのを別 thread で poll して VocalSynthReady を emit する
                     // (非同期 HTTP 合成が offline render より遅れて無音になるのを防ぐ)。
@@ -1580,7 +1580,7 @@ fn plugin_main_loop(
             }
         }
 
-        // FIXME #31: drain plugin-initiated resize requests. The host
+        // drain plugin-initiated resize requests. The host
         // callback (CLAP request_resize / VST3 resizeView) ran on this
         // thread and queued (track, index, w, h); resize the owning editor
         // window then tell the plugin to lay out into the new client size.
@@ -1591,12 +1591,12 @@ fn plugin_main_loop(
             resize_gui(&mut tracks, track, index, w, h);
         }
 
-        // FIXME #31: handle plugin-initiated closes (CLAP `closed`).
+        // handle plugin-initiated closes (CLAP `closed`).
         while let Ok((track, index)) = gui_close_rx.try_recv() {
             close_slot_gui(&mut tracks, &mut editor_windows, track, index, &evt_tx);
         }
 
-        // FIXME #31: handle editor windows the user closed via the window's
+        // handle editor windows the user closed via the window's
         // ✕ (WNDPROC flipped the close flag). Tear the GUI down in the
         // spec-correct order (plugin.gui_destroy → DestroyWindow) and notify
         // daw_gui so it clears its open-GUI state.
@@ -1627,7 +1627,7 @@ fn plugin_main_loop(
     if let Some(pool) = worker_pool.take() {
         pool.shutdown();
     }
-    // FIXME #31: tear down plugins first (`tracks.shutdown()` calls
+    // tear down plugins first (`tracks.shutdown()` calls
     // `gui_destroy` = view.removed() on each plugin), THEN destroy the
     // editor windows. Reversing the order would DestroyWindow a container
     // whose plugin child is still attached.
@@ -1750,7 +1750,7 @@ fn collect_all_states(handle: &mut TracksHandle) -> Vec<SlotState> {
     out
 }
 
-/// FIXME #31: open the plugin editor inside a top-level window THIS process
+/// open the plugin editor inside a top-level window THIS process
 /// owns (created on the plugin-main thread). On success the `EditorWindow` is
 /// stored in `editor_windows` keyed by (track, index). On any failure the
 /// plugin GUI and the (local) window are torn down before returning, so the
@@ -1843,7 +1843,7 @@ fn open_gui(
         }
     }
 
-    // FIXME #31: re-query the size AFTER attach/show. Some VST3 editors
+    // re-query the size AFTER attach/show. Some VST3 editors
     // (e.g. Arturia Analog Lab) report 0×0 (or a placeholder) from `getSize`
     // BEFORE the view is attached, and only return the real editor size once
     // attached to a parent. If we sized the container from the pre-attach
@@ -1888,7 +1888,7 @@ fn pump_pending_messages() {
     }
 }
 
-/// FIXME #31: close the editor for (track, index): tear the plugin GUI down
+/// close the editor for (track, index): tear the plugin GUI down
 /// (`gui_hide` → `gui_destroy` = view.removed()) BEFORE destroying the
 /// host-owned container window, then notify daw_gui so it clears its
 /// open-GUI state. Idempotent — missing plugin and/or missing window are
@@ -1910,7 +1910,7 @@ fn close_slot_gui(
     let _ = evt_tx.send(PluginEvent::SlotGuiClosed { track, index });
 }
 
-/// FIXME #31: destroy every editor window matching `pred` (used on plugin
+/// destroy every editor window matching `pred` (used on plugin
 /// removal, matched by STABLE `plugin_id` so a window isn't orphaned when the
 /// plugin's index shifted while open) and notify daw_gui with each window's
 /// (track, index) key so it clears its open-GUI state. The plugin's own

@@ -1,4 +1,4 @@
-//! FIXME #29: プラグインの port 構成。 capability（生成器/音源/エフェクト/映像効果）の
+//! プラグインの port 構成。 capability（生成器/音源/エフェクト/映像効果）の
 //! **Single Source of Truth** となる bool 群を運ぶ。
 //!
 //! probe subprocess（`daw_plugin_host --probe-vst3` / `--probe-clap`）が
@@ -6,7 +6,7 @@
 //! [`PortConfig::parse_line`] で復元して `PluginEntry` の bool に格納する。
 //! VST3 / CLAP どちらの probe も同じ型・同じ行形式を使う（DRY）。
 //!
-//! FIXME #54 / docs/plan_video_fx.md: 内蔵映像効果用に `has_video_input` /
+//! 内蔵映像効果用に `has_video_input` /
 //! `has_video_output` を追加。映像 device は GUI 描画パスで処理されるため、
 //! audio engine / plugin host から見ると `slot_to_plugin_id` 未登録の index で、
 //! `process_track_owned` がそのまま skip する (= 音声バスを素通り)。
@@ -37,18 +37,18 @@ pub struct PortConfig {
     /// audio_in を持たず audio_out を持つ = 音源、audio_in を持つ = エフェクト。
     #[serde(default)]
     pub has_audio_input: bool,
-    /// FIXME #54: 映像 (RGBA テクスチャ) 入力ポートを持つ。内蔵映像効果
+    /// 映像 (RGBA テクスチャ) 入力ポートを持つ。内蔵映像効果
     /// (`builtin.video.*`) はこれと [`has_video_output`](Self::has_video_output)
     /// の両方を立て、audio/note 系は全て false にする。
     #[serde(default)]
     pub has_video_input: bool,
-    /// FIXME #54: 映像 (RGBA テクスチャ) 出力ポートを持つ。
+    /// 映像 (RGBA テクスチャ) 出力ポートを持つ。
     #[serde(default)]
     pub has_video_output: bool,
 }
 
 impl PortConfig {
-    /// FIXME #54: 映像 device か (映像 in/out のいずれかを持つ)。GUI 描画パスで
+    /// 映像 device か (映像 in/out のいずれかを持つ)。GUI 描画パスで
     /// 処理する device の判定 (audio engine / plugin host はこれを load しない)。
     #[must_use]
     pub fn is_video(&self) -> bool {
@@ -148,7 +148,7 @@ mod tests {
                 has_video_input: false,
                 has_video_output: false,
             },
-            // FIXME #54: 純映像 device (note/audio 全 false、video in/out)。
+            // 純映像 device (note/audio 全 false、video in/out)。
             PortConfig {
                 has_note_input: false,
                 has_note_output: false,

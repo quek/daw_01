@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use crate::model::{CURRENT_VERSION, ProjectFile, Song, ViewState};
 
 /// Result of `load_project`: the normalized song plus the optional GUI view
-/// state (FIXME #87). `view` is `None` for legacy files / files saved without
+/// state. `view` is `None` for legacy files / files saved without
 /// view state — callers fall back to their default (fit-to-content) behavior.
 #[derive(Debug, Clone)]
 pub struct LoadedProject {
@@ -30,7 +30,7 @@ pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
     save_project(path, song, None)
 }
 
-/// Save a project, optionally embedding GUI view state (FIXME #87). `view` is
+/// Save a project, optionally embedding GUI view state. `view` is
 /// written as `ProjectFile.view` (a sibling of `song`), so the Song / IPC
 /// layout is untouched. Atomic write via tmp → rename.
 pub fn save_project(
@@ -72,7 +72,7 @@ pub fn save_project(
     Ok(())
 }
 
-/// (FIXME #36) 旧 `InstrumentSource::Vocal { speaker_id, style_name }`
+/// 旧 `InstrumentSource::Vocal { speaker_id, style_name }`
 /// (= JSON object `{"Vocal": {...}}`) を unit `Vocal` (= JSON string
 /// `"Vocal"`) へ移行し、 旧トラック声をそのトラックの全 clip に焼き込む。
 /// 声は per-clip (`Clip::speaker_id` 等) が SSoT になったため。
@@ -168,7 +168,7 @@ fn migrate_text_overlay_to_subtitle_device(song: &mut Song) {
     }
 }
 
-/// (v27) per-event mute → clip-level mute 統合 (FIXME #80)。v26 以前は clip の mute を
+/// (v27) per-event mute → clip-level mute 統合。v26 以前は clip の mute を
 /// audio / image / video / text event の `muted` フラグ (inspector の "Mute" トグルが clip 内
 /// 全 event を mute) で表現していた。v27 で `Clip.muted` を SSoT に一本化したので、旧プロジェクトの
 /// 「event が muted な content」を `Clip.muted = true` へ畳み込み、event 側の `muted` は false に戻す。
@@ -225,14 +225,14 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     Ok(load_project(path)?.song)
 }
 
-/// Load a project including optional GUI view state (FIXME #87). The returned
+/// Load a project including optional GUI view state. The returned
 /// `song` is fully normalized (same as `load`); `view` is `None` for legacy
 /// files / files saved without view state.
 pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     let path = path.as_ref();
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    // (FIXME #36) per-clip 声移行: 旧 `InstrumentSource::Vocal { speaker_id,
+    // per-clip 声移行: 旧 `InstrumentSource::Vocal { speaker_id,
     // style_name }` (JSON object) を unit `Vocal` (JSON string) に変換し、
     // 旧トラック声をそのトラックの全 clip へ焼き込んでから deserialize する
     // (= 本 deserialize は unit `Vocal` だけ見れば良い、 声は per-clip が SSoT)。
@@ -274,7 +274,7 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     // 対象外 = 「喋るが映さない」を温存。
     if project.version < CURRENT_VERSION {
         migrate_text_overlay_to_subtitle_device(&mut song);
-        // (v27 FIXME #80) 旧 per-event mute を `Clip.muted` へ畳み込む。
+        // (v27) 旧 per-event mute を `Clip.muted` へ畳み込む。
         migrate_per_event_mute_to_clip_mute(&mut song);
     }
     // Re-establish every invariant the codebase assumes about a loaded
@@ -303,7 +303,7 @@ mod tests {
     use crate::model::{AudioEditorViewState, ClipKey, PianoRollViewState, ViewState};
     use tempfile::tempdir;
 
-    /// FIXME #87: per-clip view + globals を含む代表的な `ViewState`。
+    /// per-clip view + globals を含む代表的な `ViewState`。
     fn sample_view_state() -> ViewState {
         ViewState {
             arrange_zoom_x: 37.5,
@@ -344,7 +344,7 @@ mod tests {
         }
     }
 
-    /// FIXME #87: ViewState は save_project → load_project で完全に往復する。
+    /// ViewState は save_project → load_project で完全に往復する。
     #[test]
     fn save_project_roundtrips_view_state() {
         let dir = tempdir().unwrap();
@@ -359,7 +359,7 @@ mod tests {
         );
     }
 
-    /// FIXME #87: `view` キーを持たない旧ファイルは `view == None` で読め、
+    /// `view` キーを持たない旧ファイルは `view == None` で読め、
     /// 従来挙動 (fit-to-content) にフォールバックできる。
     #[test]
     fn legacy_file_loads_with_none_view() {
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(loaded.view, None);
     }
 
-    /// FIXME #87: 旧 `save` (= `save_project(.., None)` への委譲) は view を書かない。
+    /// 旧 `save` (= `save_project(.., None)` への委譲) は view を書かない。
     #[test]
     fn plain_save_writes_no_view() {
         let dir = tempdir().unwrap();
@@ -417,7 +417,7 @@ mod tests {
         song
     }
 
-    /// FIXME #80 (v27): event 単位 mute だった clip を `Clip.muted` へ畳み込み、
+    /// (v27): event 単位 mute だった clip を `Clip.muted` へ畳み込み、
     /// event 側の `muted` を false に戻す。
     #[test]
     fn migrate_per_event_mute_folds_into_clip_and_clears_event() {
@@ -437,7 +437,7 @@ mod tests {
         assert!(!t.events[0].muted, "畳み込み後は event.muted = false に戻る");
     }
 
-    /// FIXME #80: 元々 mute されていない clip は migration で変化しない。
+    /// 元々 mute されていない clip は migration で変化しない。
     #[test]
     fn migrate_per_event_mute_leaves_unmuted_clip_untouched() {
         let mut song = song_with_one_text_clip();
@@ -559,7 +559,7 @@ mod tests {
         let song = Song::default();
         save(&path, &song).unwrap();
         let mut loaded = load(&path).unwrap();
-        // v24 (FIXME #33): default の project_id は 0 (未採番)。save は 0 のまま書き、
+        // v24: default の project_id は 0 (未採番)。save は 0 のまま書き、
         // load が `ensure_project_id` で採番するので loaded.project_id != 0。それ以外は
         // 一致するはず。project_id を 0 に戻してから残りを比較する。
         assert_ne!(loaded.project_id, 0, "load で project_id が採番される");
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn migrate_old_vocal_source_bakes_voice_into_clips() {
-        // (FIXME #36) 旧形式: track.source = {"Vocal": {speaker_id, style_name}}、
+        // 旧形式: track.source = {"Vocal": {speaker_id, style_name}}、
         // clip は声フィールド無し。 migration は source を unit "Vocal" に変換し、
         // 旧トラック声を全 clip へ焼き込む (新形式 clip = 既に speaker_id 持ちは尊重)。
         let mut value = serde_json::json!({
@@ -888,7 +888,7 @@ mod tests {
     fn load_v23_assigns_project_id_and_persists() {
         // v23 saves had no `project_id`. Loading must succeed and assign a fresh
         // non-zero id (`ensure_project_id`), and re-saving must persist it so the
-        // next load returns the SAME id (`docs/plan_fixme_33_clipboard.md`, FIXME #33).
+        // next load returns the SAME id (`docs/plan_fixme_33_clipboard.md`).
         let dir = tempdir().unwrap();
         let path = dir.path().join("v23.daw");
         let v23_json = r#"{

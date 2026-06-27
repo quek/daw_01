@@ -10,5 +10,5 @@
 # in-process libav (rsmpeg) shared FFmpeg build (BtbN n7.1 lgpl-shared).
 # Too large for git; fetched per machine. See docs/plan_video_export_libav.md.
 /third_party/
-# 個人用 FIXME リスト (編集禁止の作業メモ)。マシン固有なので追跡しない。
-/docs/FIXME.md
+# 個人用バックログ r.md (編集禁止の作業メモ)。マシン固有なので追跡しない。
+/r.md

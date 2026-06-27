@@ -8,7 +8,7 @@
 //!    ことを assert する (役割判定はしない)
 //! 3. exit code 0 で pass、 JS error で 1
 //!
-//! plugin / VST3 不要 (ports を JSON に直接書く) なので外部依存なし。FIXME #32 の
+//! plugin / VST3 不要 (ports を JSON に直接書く) なので外部依存なし。
 //! 「D&D で並び替えできない / 音が追従しない」系の回帰 (チェーンの並び・port 喪失)
 //! を CI で即検出する。
 

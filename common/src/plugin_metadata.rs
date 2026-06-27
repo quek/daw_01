@@ -57,14 +57,14 @@ pub struct NoteMetadata {
     /// note's lyric" (= sustained tail) or "no lyric" depending on
     /// context. Other builtins ignore this.
     pub lyric: String,
-    /// (FIXME #36) Stable `Clip::id` (track 内一意) of the clip this note
+    /// Stable `Clip::id` (track 内一意) of the clip this note
     /// belongs to. The VOICEVOX builtin groups the flushed metadata by
     /// `clip_id` so each clip is synthesised with its own `speaker_id`
     /// (= per-clip voice), then concatenates the per-clip WAVs into one
     /// buffer. Other builtins ignore this.
     #[serde(default)]
     pub clip_id: u32,
-    /// (FIXME #36) Per-clip VOICEVOX singing voice = `/frame_synthesis`
+    /// Per-clip VOICEVOX singing voice = `/frame_synthesis`
     /// style id (from `/singers`). `0` = unset → the builtin falls back to
     /// `common::voicevox::DEFAULT_SINGER_ID`. All notes of one clip carry
     /// the same value. Other builtins ignore this.

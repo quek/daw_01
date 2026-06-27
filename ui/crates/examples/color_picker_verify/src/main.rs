@@ -2,7 +2,7 @@
 //! **headless 動作 assert + 視覚 PNG** を 1 プロセスで自己検証する (実機 window を user に頼まない、
 //! gui_01 方針: OffscreenRenderer + UiHost::no_redraw で自分で確認)。
 //!
-//! 検証 1 (FIXME #9 の核心): 背景に arrangement の clip drag と同じ primitive
+//! 検証 1 の核心: 背景に arrangement の clip drag と同じ primitive
 //! `take_drag_rect_in_rect` を置き、 (control) picker を開かずに press すると背景は drag を掴む
 //! (`Some`)、 (masked) picker を開いてから同じ press では背景は inert (`None`) で picker が drag を
 //! 捕捉する (`picked == Some`)、 という対比で「picker open 中は背景の SV/Hue ドラッグ press が下の
@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("  picker PNG saved to {}", out_path.display());
     if pass {
-        println!("[PASS] capturing modal blocks background drag while picker captures it (FIXME #9 解消)");
+        println!("[PASS] capturing modal blocks background drag while picker captures it");
         Ok(())
     } else {
         Err("[FAIL] #087 verification failed".into())

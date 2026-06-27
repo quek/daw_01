@@ -1,4 +1,4 @@
-//! FIXME #33: 統一クリップボード envelope。
+//! 統一クリップボード envelope。
 //!
 //! cut/copy/paste の全対象 (ノート / オートメーションの点 / オーディオイベント /
 //! クリップ / トラック) を 1 つの型タグ付き envelope に入れ、OS クリップボードへ
@@ -60,7 +60,7 @@ pub struct ClipCopy {
     pub length_beats: f64,
     pub color: Option<[f32; 3]>,
     pub auto_lipsync: bool,
-    /// (FIXME #80) clip-level mute。 paste 先 clip へ引き継ぐ。 旧 clipboard JSON
+    /// clip-level mute。 paste 先 clip へ引き継ぐ。 旧 clipboard JSON
     /// との互換のため serde default (`false`)。
     #[serde(default)]
     pub muted: bool,
@@ -70,7 +70,7 @@ pub struct ClipCopy {
     pub content: ClipContent,
     /// 共有名 (`Song.clip_content_names` 由来)。
     pub name: Option<String>,
-    /// (FIXME #36) per-clip VOICEVOX 声。 paste 先 clip へ引き継ぐ。 旧 clipboard
+    /// per-clip VOICEVOX 声。 paste 先 clip へ引き継ぐ。 旧 clipboard
     /// JSON との互換のため serde default (0 / 空)。
     #[serde(default)]
     pub speaker_id: u32,

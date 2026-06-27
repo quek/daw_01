@@ -704,7 +704,7 @@ fn create_instance<I: Interface>(
     unsafe { ComPtr::<I>::from_raw(obj as *mut I) }
 }
 
-/// FIXME #26/#29: VST3 のクラスを一時 instantiate して bus 構成から **port 構成**
+/// VST3 のクラスを一時 instantiate して bus 構成から **port 構成**
 /// (note 入力 / note 出力 / audio 出力の有無) を読む。 daw_plugin_host の
 /// `--probe-vst3` one-shot モードから呼ばれる。 VST3 規格には note-effect の
 /// category tag が無く、 bus 構成でしか判別できない (`ivstaudioprocessor.h`

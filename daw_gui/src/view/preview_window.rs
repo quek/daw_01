@@ -60,7 +60,7 @@ pub struct PreviewWindowState {
         common::model::ImageSourceId,
         (TextureHandle, u32, u32),
     >,
-    /// FIXME #54 Wave2 (plan_video_fx §3): トラック合成画リスト。runner が毎 frame
+    /// トラック合成画リスト。runner が毎 frame
     /// 構築し、bottom→top (track z 順) に並ぶ。各 `TrackComposite` は 1 トラックの
     /// 動画 / PiP 画像 / テキストを `items` に持ち、`render_placeholder` が:
     /// - 効果も配置 transform も無ければ items を直接描く (plain track の fast-path)、
@@ -69,7 +69,7 @@ pub struct PreviewWindowState {
     ///
     /// 空 = placeholder text を表示。旧 `composite_layers`/`group_layers`/`text_layers` を統合。
     pub track_composites: Vec<crate::group_compose::TrackComposite>,
-    /// FIXME #54 Wave1: マスター映像チェーン（`Song.master_fx_chain` の映像 device を
+    /// マスター映像チェーン（`Song.master_fx_chain` の映像 device を
     /// 解決した実効効果）。空でなければ `render_placeholder` が全トラック合成画を project
     /// 解像度の master canvas 1 枚に集約 → これをチェーン順 `apply_chain` → screen へ配置。
     /// runner が毎 frame `set_master_fx` で更新。
@@ -97,7 +97,7 @@ pub struct PreviewWindowState {
     /// preview window がリサイズされても画像 PiP の aspect ratio は
     /// project resolution に固定される (= 動画と同じ aspect-fit 動作)。
     pub project_resolution: (u32, u32),
-    /// FIXME #54 / docs/plan_video_fx.md: トラック映像効果の GPU 実行基盤。
+    /// docs/plan_video_fx.md: トラック映像効果の GPU 実行基盤。
     /// `render_placeholder` が composite layer / group layer の texture へ
     /// チェーン順適用する (pipeline cache + ping-pong pool を frame 跨ぎ保持)。
     pub fx_engine: crate::video_fx::VideoFxEngine,
@@ -124,7 +124,7 @@ pub struct CompositeLayer {
     pub height: u32,
     pub alpha: f32,
     pub pip_rect: Option<(f32, f32, f32, f32)>,
-    /// FIXME #54: この layer の owning track の映像効果チェーン (解決済み実効値)。
+    /// この layer の owning track の映像効果チェーン (解決済み実効値)。
     /// 描画時に `texture` へチェーン順適用してから push する。空なら効果なし。
     /// 通常運用 (1 トラック 1 視覚内容) では「トラック合成画に適用」(§3) と一致する。
     pub fx: Vec<crate::video_fx::ResolvedEffect>,
@@ -355,7 +355,7 @@ impl PreviewWindowState {
         self.track_composites.clear();
     }
 
-    /// FIXME #54 Wave2: トラック合成画リストを毎 frame 更新。runner が
+    /// トラック合成画リストを毎 frame 更新。runner が
     /// `render_placeholder` の前に bottom→top (track z 順) で渡す。旧
     /// `set_composite_layers`/`set_group_layers`/`set_text_layers` を統合。
     pub fn set_track_composites(
@@ -365,7 +365,7 @@ impl PreviewWindowState {
         self.track_composites = composites;
     }
 
-    /// FIXME #54 Wave1: マスター映像チェーンの解決済み効果を毎 frame 更新（runner）。
+    /// マスター映像チェーンの解決済み効果を毎 frame 更新（runner）。
     /// 空でなければ `render_placeholder` が master canvas 1 枚に集約してから適用する。
     pub fn set_master_fx(&mut self, fx: Vec<crate::video_fx::ResolvedEffect>) {
         self.master_fx = fx;
@@ -392,7 +392,7 @@ impl PreviewWindowState {
     /// at intermediate alphas. Empty layer list falls back to the
     /// P4 placeholder text.
     pub fn render_placeholder(&mut self) {
-        // FIXME #54: 前 frame の効果 target を解放 (前 frame は末尾の render() で sample 済み)。
+        // 前 frame の効果 target を解放 (前 frame は末尾の render() で sample 済み)。
         // これで今 frame の apply_chain が同寸でも別 target を払い出し、レイヤー間衝突を防ぐ
         // (gui_01 CompositePool::end_cycle を render 冒頭で呼ぶのと同 idiom)。
         self.fx_engine.end_frame(&mut self.renderer);
@@ -441,7 +441,7 @@ impl PreviewWindowState {
                 Color::rgb(0.65, 0.7, 0.8),
             ));
         } else {
-            // FIXME #54 Wave2/Wave1: トラック合成画を bottom→top に描く。borrow 分離のため
+            // トラック合成画を bottom→top に描く。borrow 分離のため
             // 一旦 take して iterate。runner が毎 frame 再設定するので take しても問題ない。
             let composites = std::mem::take(&mut self.track_composites);
             let master_fx = std::mem::take(&mut self.master_fx);
@@ -451,7 +451,7 @@ impl PreviewWindowState {
                     self.draw_track_composite(tc, project_box);
                 }
             } else {
-                // FIXME #54 Wave1: master 映像チェーン。全トラック合成画を project 解像度の
+                // master 映像チェーン。全トラック合成画を project 解像度の
                 // master canvas 1 枚に集約 → master fx をチェーン順適用 → screen project_box へ
                 // 配置（export と同一 SSoT）。overlay は UI なので master fx の対象外、合成後に
                 // screen 座標で別途描く。
@@ -508,7 +508,7 @@ impl PreviewWindowState {
         }
     }
 
-    /// FIXME #54 Wave2 (plan_video_fx §3): 1 トラック合成画を描く。効果も配置
+    /// 1 トラック合成画を描く。効果も配置
     /// transform も無ければ items を直接 screen px へ描く (plain track の fast-path =
     /// 現状維持・クリスプ・無コスト)。さもなくば items を canvas へ 1 枚合成 →
     /// track 効果チェーンを `apply_chain` → 配置 transform (identity = canvas 全体 /

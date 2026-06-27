@@ -149,7 +149,7 @@ remove_one() {
       log "SKIP (branch '$branch' not merged into main): $wt"; return
     fi
     # `--ignored` so unsaved gitignored deliverables (e.g. the project's untracked
-    # docs/FIXME.md backlog, scratch design notes) also block a non-force removal --
+    # r.md backlog, scratch design notes) also block a non-force removal --
     # plain `git status --porcelain` hides them and the dir would be deleted with
     # the notes inside. Exclude only known-regenerable ignored trees: target/ (build
     # cache) and third_party/ (vendored ffmpeg, a real copy restorable via

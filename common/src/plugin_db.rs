@@ -46,7 +46,7 @@ pub struct PluginEntry {
     /// descriptors (e.g. VCV Rack's `rack` / `rack.fx` / `rack.generator`,
     /// or a VST3 vendor shipping several classes in one DLL).
     pub descriptor_index: u32,
-    /// FIXME #29: ポート構成（capability の **Single Source of Truth**）。
+    /// ポート構成（capability の **Single Source of Truth**）。
     /// `note 入力`を持つ（= MIDI/note を受け取れる）。probe で確定。
     /// 旧 cache（フィールド無し）は `#[serde(default)]` で `false` に load される
     /// (= 起動時 [`PluginDatabase::needs_port_probe`] が rescan を促す)。
@@ -65,20 +65,20 @@ pub struct PluginEntry {
     /// 旧 cache は `#[serde(default)]` で `false`、`PORT_PROBE_VERSION` bump で再 probe。
     #[serde(default)]
     pub has_audio_input: bool,
-    /// FIXME #54: 映像 (RGBA テクスチャ) 入力ポートを持つ。内蔵映像効果
+    /// 映像 (RGBA テクスチャ) 入力ポートを持つ。内蔵映像効果
     /// (`builtin.video.*`) のみ true。外部 CLAP/VST3 は probe で常に false。
     #[serde(default)]
     pub has_video_input: bool,
-    /// FIXME #54: 映像 (RGBA テクスチャ) 出力ポートを持つ。
+    /// 映像 (RGBA テクスチャ) 出力ポートを持つ。
     #[serde(default)]
     pub has_video_output: bool,
 }
 
-/// FIXME #29 / v23: port 構成 probe スキーマの現行版。 `PluginEntry` に記録する
+/// v23: port 構成 probe スキーマの現行版。 `PluginEntry` に記録する
 /// port bool (note in/out・audio out/**in**) の取得方法・意味づけを変えたら上げる。
 /// cache の `port_probe_version` がこれ未満なら、 起動時に再 probe (rescan) する。
 /// v23: `has_audio_input` を追加したので 1 → 2 (= 既存 cache を再 probe させる)。
-/// FIXME #54: `has_video_input`/`has_video_output` を追加し probe 行を 6 キー化したので
+/// `has_video_input`/`has_video_output` を追加し probe 行を 6 キー化したので
 /// 2 → 3 (= 旧 4-キー probe 結果の cache を再 probe させ、外部 plugin の video=false を確定)。
 pub const PORT_PROBE_VERSION: u32 = 3;
 
@@ -89,7 +89,7 @@ pub struct PluginDatabase {
     /// "rescan if older than X" heuristics in the future.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scanned_at: Option<u64>,
-    /// FIXME #29: `PluginEntry` の port 構成 (3 bool) を probe で埋めた版
+    /// `PluginEntry` の port 構成 (3 bool) を probe で埋めた版
     /// ([`PORT_PROBE_VERSION`])。 古い cache (フィールド無し) は `#[serde(default)]`
     /// で 0 に load され、 [`PluginDatabase::needs_port_probe`] が再 probe を促す。
     #[serde(default)]
@@ -102,7 +102,7 @@ impl PluginDatabase {
         self.entries.iter().find(|e| e.id == id)
     }
 
-    /// FIXME #29: 起動時に port 構成の再 probe (= rescan) が要るか。 cache が旧版
+    /// 起動時に port 構成の再 probe (= rescan) が要るか。 cache が旧版
     /// ([`PORT_PROBE_VERSION`] 未満) で、 かつ probe 対象 (VST3/CLAP) を 1 つ以上
     /// 持つときだけ true。 builtin のみ / 空 DB では促さない (probe する物が無い)。
     #[must_use]
@@ -299,7 +299,7 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             has_video_output: true,
         },
     ];
-    // FIXME #54 / docs/plan_video_fx.md §9: 内蔵映像効果 (`builtin.video.*`) を
+    // docs/plan_video_fx.md §9: 内蔵映像効果 (`builtin.video.*`) を
     // SSoT (`crate::video_fx` カタログ) から列挙する。映像 device は GUI 描画パスで
     // 処理されるため audio/note port は全 false、video in/out を立てる。これにより
     // engine の `process_track_owned` は `slot_to_plugin_id` 未登録の index として
@@ -406,7 +406,7 @@ pub fn scan_system() -> Result<PluginDatabase> {
     Ok(PluginDatabase {
         entries,
         scanned_at: Some(now_secs()),
-        // FIXME #29: scan_system は port を probe しない (GUI の rescan thread が
+        // scan_system は port を probe しない (GUI の rescan thread が
         // probe 後に PORT_PROBE_VERSION を立てる)。 ここでは 0 = 未 probe。
         port_probe_version: 0,
     })
@@ -497,7 +497,7 @@ fn scan_one_file(path: &Path) -> Result<Vec<PluginEntry>> {
             tracing::warn!(index = i, path = %path.display(), "descriptor with empty id, skipping");
             continue;
         }
-        // FIXME #29: CLAP descriptor には port 有無が無いので、 ここでは feature 由来の
+        // CLAP descriptor には port 有無が無いので、 ここでは feature 由来の
         // 保守的暫定値。 正確な port 構成は CLAP probe (Step 5 の rescan) が上書きする。
         let features = read_feature_list(desc.features, path);
         let has_note_eff = features.iter().any(|f| f == "note-effect");

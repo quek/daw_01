@@ -1,4 +1,4 @@
-//! FIXME #87: ズーム / スクロール位置のプロジェクト保存 — AppData 側の回帰テスト。
+//! ズーム / スクロール位置のプロジェクト保存 — AppData 側の回帰テスト。
 //!
 //! 検証する挙動:
 //! - **per-clip 記憶**: ピアノロールの zoom はクリップごとに独立して覚えられ、別クリップを
@@ -55,7 +55,7 @@ fn build_two_clip_app() -> (AppData, UnboundedReceiver<MainToChild>) {
     (app, rx)
 }
 
-/// FIXME #87: ピアノロールの zoom はクリップごとに独立して記憶され、別クリップへ漏れず、
+/// ピアノロールの zoom はクリップごとに独立して記憶され、別クリップへ漏れず、
 /// 再選択で前回値が復元される。
 #[test]
 fn piano_roll_zoom_is_remembered_per_clip() {
@@ -79,7 +79,7 @@ fn piano_roll_zoom_is_remembered_per_clip() {
     assert_eq!(app.pianoroll_zoom_x(), 120.0, "A 再選択で zoom 120 が復元される");
 }
 
-/// FIXME #87: 表示状態 (globals + per-clip view) が snapshot → restore で完全往復する。
+/// 表示状態 (globals + per-clip view) が snapshot → restore で完全往復する。
 #[test]
 fn view_state_snapshot_restore_roundtrips() {
     let (mut app, _rx) = build_two_clip_app();
@@ -129,7 +129,7 @@ fn view_state_snapshot_restore_roundtrips() {
     assert_eq!(app.selected_clips, vec![key_a]);
 }
 
-/// FIXME #87: `restore_view_state(None)` (= 旧ファイル) は per-clip map をクリアしつつ
+/// `restore_view_state(None)` (= 旧ファイル) は per-clip map をクリアしつつ
 /// globals は触らない (= 従来の fit-to-content / 既定値挙動にフォールバック)。
 #[test]
 fn restore_none_clears_per_clip_but_keeps_globals() {

@@ -260,7 +260,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if just_opening {
             // daw_01 #087: capture_input = true の「真のモーダル」 (#065) で開く。 開いている間
             // panel 外の pointer / keyboard が background widget (arrangement 等) に届かず、
-            // SV 矩形 / Hue バーのドラッグが下の clip を一切動かさない (FIXME #9 の解消)。 panel 外
+            // SV 矩形 / Hue バーのドラッグが下の clip を一切動かさない。 panel 外
             // click は従来どおり popup_layer の outside-click 検出で dismiss する (capture でも
             // close 判定は生 pointer で行う #065 仕様)。
             self.open_popup_inner(pid, panel, true, true);

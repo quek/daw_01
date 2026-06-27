@@ -60,11 +60,11 @@ fn model_curve_from_widget(c: WidgetFadeCurve) -> common::model::FadeCurve {
     }
 }
 
-// FIXME #16: track header 幅は固定定数ではなく `AppData.arrange_header_w` を SSoT
+// track header 幅は固定定数ではなく `AppData.arrange_header_w` を SSoT
 // とし (default 160.0)、 gui_01 widget の右端 splitter drag で可変。
 const RULER_H: f32 = 20.0;
 const TOOLBAR_H: f32 = 24.0;
-/// FIXME #53: Arranger レーン (曲のパート帯) の高さ (px)。ルーラー直下に確保。
+/// Arranger レーン (曲のパート帯) の高さ (px)。ルーラー直下に確保。
 const SECTION_LANE_H: f32 = 18.0;
 const COLOR_TOOLBAR_BG: Color = theme::HEADER;
 
@@ -269,7 +269,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     // gui_01 #068: アクティブな共有グループ member なら true。
                     // widget が selection とは別レイヤで hue glow + 太枠を描く。
                     in_active_group: active_groups.contains(&c.content_id),
-                    // FIXME #80: clip mute (dim + 斜線ハッチ表示)。`Clip.muted` をそのまま渡す。
+                    // clip mute (dim + 斜線ハッチ表示)。`Clip.muted` をそのまま渡す。
                     muted: c.muted,
                     // gui_01 #025 (M14 Phase 63k): audio clip のとき first event の
                     // 値を渡して widget に dB handle / fade 角 grip / envelope を
@@ -381,8 +381,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     } else {
         None
     };
-    // data_generation: widget の glyph キャッシュ無効化キー。 FIXME #10
-    // (plan_clip_label_cache): 旧実装は track 名の **長さ** と clip **数** しか
+    // data_generation: widget の glyph キャッシュ無効化キー。
+    // 旧実装は track 名の **長さ** と clip **数** しか
     // 見ておらず、 clip 名 (content_name) の変更でキャッシュが無効化されず rename が
     // 画面に出ない (再起動で直る) バグがあった。 手書きの因子 allowlist をやめ、
     // widget へ渡す `tracks` の **描画内容そのもの** (track 名 / clip 表示ラベル /
@@ -408,7 +408,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 c.id.hash(&mut h);
                 c.name.hash(&mut h);
                 c.in_active_group.hash(&mut h);
-                // FIXME #80: mute 状態変化で heavy cache を無効化する。
+                // mute 状態変化で heavy cache を無効化する。
                 c.muted.hash(&mut h);
                 c.share_group_color.map(f32::to_bits).hash(&mut h);
                 if let Some(col) = c.color {
@@ -442,7 +442,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         bpm: app.song.bpm,
         time_sig: app.song.time_sig,
         snap: snap::arrange_snap_config(app),
-        // FIXME #53: Arranger レーン高 (px)。ルーラー直下に確保し、gui_01 が
+        // Arranger レーン高 (px)。ルーラー直下に確保し、gui_01 が
         // `draw_sections_lane` で色帯 + 名前を描く。曲のパート (Intro/Aメロ/サビ…) を
         // ダブルクリック生成・ドラッグ移動・端リサイズ・Alt複製できる。
         arranger_lane_h: SECTION_LANE_H,
@@ -469,7 +469,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // Master 行ラベルは別フィールド (track_text_size 追従外、 gui_01 #076 nit) なので
         // 同値に揃え、 通常トラック名と視覚的に一致させる。
         master_row_label_size: 11.0,
-        // FIXME #17: group のネスト 1 段あたりの header インデント量を gui_01 default
+        // group のネスト 1 段あたりの header インデント量を gui_01 default
         // (16.0) の半分にして、 深いネストでも track 名 + M/S/R ボタンの幅を確保する。
         indent_px: 8.0,
         ..ArrangementStyle::default()
@@ -529,7 +529,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         height_px_override: None,
     };
 
-    // FIXME #53: Song.sections を gui_01 の SectionView へ mirror (name は Arc<str> 化)。
+    // Song.sections を gui_01 の SectionView へ mirror (name は Arc<str> 化)。
     // 描画は `ArrangementView.arranger_lane_h > 0` のときのみ (現状 0.0 = gui_01 の
     // lane 描画配線待ち、 data は渡しておく)。
     let sections_view: Vec<daw_ui_core::SectionView> = app
@@ -586,7 +586,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
-    // FIXME #86: primary 選択 automation clip のレーンの「実描画 content-Y 上端」を
+    // primary 選択 automation clip のレーンの「実描画 content-Y 上端」を
     // widget の実 lane rect から算出して次フレームへ mirror。 `Z` 縦ズームがレイアウトを
     // 複製せず「レーンを viewport 上端へ」 scroll する基準にする (lanes pane 上端 =
     // `area.y + RULER_H`、 content 絶対 y = 現 scroll + 画面オフセット)。 変化時のみ Edit。
@@ -605,7 +605,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
 
-    // FIXME #74: arrangement ヘッダのトラック音量スライダ drag を mixer フェーダーと
+    // arrangement ヘッダのトラック音量スライダ drag を mixer フェーダーと
     // 同じ gesture 経路に乗せ、 「1 drag = 1 undo step」 にする。 widget が返す
     // `dragging_track_volume` (drag 中のトラック id) を前フレーム値と差分し、
     // None→Some で `ParamGestureBegin` (gesture 先頭で 1 snapshot)、 Some→None で
@@ -721,7 +721,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         draw_audio_clip_value_overlay(app, ui, *clip_key, *rect);
         draw_midi_clip_notes(app, ui, *clip_key, *rect, lanes_x, is_selected, &style);
 
-        // FIXME #90: VOICEVOX 生成中マーカー。歌唱/読み上げトラックが合成中なら
+        // VOICEVOX 生成中マーカー。歌唱/読み上げトラックが合成中なら
         // そのトラックの全 clip に、口パク再生成中なら口 track の auto_lipsync clip に、
         // 右上角へ回転スピナーを出す (= このクリップはまだ最新を反映していない の合図)。
         draw_clip_synth_spinner(app, ui, *clip_key, *rect);
@@ -829,7 +829,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
     }
 
-    // ===== FIXME #81: automation 値の数値入力 overlay 群 =====
+    // ===== automation 値の数値入力 overlay 群 =====
     // widget は heavy 内で text_input / scrubable を出せないので、 widget が返す rect /
     // drag info を使って daw_01 が heavy の外で描く (clip rename / 歌詞編集と同 idiom)。
     // 値の表示/解釈は `automation_value` (人間可読単位 SSoT) を 1 経路で使う。
@@ -1138,7 +1138,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 引き直す (= scroll off で rect が無ければ picker を閉じる)。`picked` を
     // live で model に反映 (open 中 widget 側は current を無視するので flicker
     // しない)、`dismissed` で target を None に戻す。
-    // FIXME #53: セクション帯の inline 改名。section_rename_id の帯 rect に text_input を重ねる
+    // セクション帯の inline 改名。section_rename_id の帯 rect に text_input を重ねる
     // (track rename と同 idiom)。Enter で commit、 Esc は root の escape handler が CancelRenameSection。
     if let Some(rename_id) = app.section_rename_id {
         for (sid, rect) in &resp.section_rects {
@@ -1306,7 +1306,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         None
     });
-    // FIXME #33: トラック paste の挿入先 (= マウス下トラックの直上)。ヘッダ列でも
+    // トラック paste の挿入先 (= マウス下トラックの直上)。ヘッダ列でも
     // クリップレーン上でも効くよう、X はアレンジ全幅 (`area`)、Y は実 header rect で
     // 判定する (hover_clip と同じ Y-only 手法、master 行 / ruler 上は None)。
     let hovered_track_id: Option<u32> = ui.pointer().pos.and_then(|(px, py)| {
@@ -1368,7 +1368,7 @@ fn render_clip_create_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
     );
 }
 
-/// FIXME #53: Arranger セクション帯の右クリックメニュー。`SecondaryClickSection` で stash した
+/// Arranger セクション帯の右クリックメニュー。`SecondaryClickSection` で stash した
 /// `(section_id, pos)` を使い、 毎フレーム `ui.context_menu_at` で pos にメニューを描画する
 /// (`render_clip_create_menu_overlay` と同 idiom)。 項目: このセクションをループ / 帯のみ削除 /
 /// 範囲ごと削除。 選択で stash を `None` に戻す。
@@ -1489,14 +1489,14 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
         // gui_01 #024 (resolved): ruler click / drag で発火する seek 要求。
         // GUI 側 playhead_beat 更新 + audio engine への SeekTo IPC を
         // `AppData::seek_playhead_to` に集約 (= Stop 中も Play 中も click 位置に飛ぶ)。
-        // FIXME #50: seek_playhead_to は「停止で戻るホーム」も同位置に更新するので、
+        // seek_playhead_to は「停止で戻るホーム」も同位置に更新するので、
         // 再生中にルーラーで置き直して停止すると新しい位置へ戻る。
         ArrangementEditRequest::SetPlayheadBeat(beat) => {
             Edit::mutate(move |app: &mut AppData| {
                 app.seek_playhead_to(beat);
             })
         }
-        // FIXME #53: Arranger セクション (曲のパート) 編集。gui_01 M14 Phase 127 が帯の
+        // Arranger セクション (曲のパート) 編集。gui_01 M14 Phase 127 が帯の
         // 操作を高レベル意図として emit し、daw_01 が適用する。破壊的フルスコープリフロー
         // (境界での clip 分割 + ripple) は `docs/plan_arranger_track.md` §3 の次段で実装。
         ArrangementEditRequest::CreateSection { start, len } => {
@@ -1648,7 +1648,7 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                 value_norm,
             });
         }),
-        // FIXME #81: 既存 point 上の dblclick → 値の数値入力を開始 (inline overlay は
+        // 既存 point 上の dblclick → 値の数値入力を開始 (inline overlay は
         // ループ後段で automation_point_rects を引いて出す)。
         ArrangementEditRequest::DoubleClickAutomationPoint(key) => {
             Edit::mutate(move |app: &mut AppData| {
@@ -1890,7 +1890,7 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             // (b) parent_group_id を新親に書き換え (c) anchor_after の
             // 直後 (None で先頭) に insert。
             Edit::mutate(move |app: &mut AppData| {
-                // FIXME #39: インスペクタの Parent dropdown (undo 可能だった) を
+                // インスペクタの Parent dropdown (undo 可能だった) を
                 // 撤去し、reparent の唯一経路がこの drag になった。能力後退を
                 // 避けるため undo を回復する。remove 前に song 全体を 1 snapshot
                 // 取り、複数 track の reparent + reorder をまとめて 1 undo step に
@@ -2115,7 +2115,7 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
         ArrangementEditRequest::SetTrackRowH(h) => Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::SetArrangeTrackRowH(h));
         }),
-        // FIXME #16: header / lanes 境界 splitter drag。 widget が per-frame で raw px
+        // header / lanes 境界 splitter drag。 widget が per-frame で raw px
         // `next` を emit、 handler が 80..480 に clamp して `arrange_header_w` を更新
         // → 次フレーム widget が `view.header_w` として読み連動伸縮。 `prev` は
         // undo 用 anchor だが header 幅は session-only なので無視。
@@ -2291,13 +2291,13 @@ fn lyric_clip_label(
 ///
 /// 明示名 (rename) を歌詞より優先するのは DAW 標準の挙動 (REAPER / Ardour 等で
 /// ユーザーが付けた名前は常に表示され、 本文 / 歌詞は **名前を付けていない**
-/// クリップの既定表示)。 旧版 (FIXME ⑤⑦) は逆に内容優先だったが、 これは
+/// クリップの既定表示)。 旧版は逆に内容優先だったが、 これは
 /// 録音クリップの自動名 ("Recorded N") が歌詞を隠す問題への対症療法であり、
 /// 「Bell トラックの歌詞付きクリップを rename しても歌詞のまま変わらない」
-/// (FIXME #69) を生んでいた。 根本原因 = content_name が自動名と明示名を混在
+/// を生んでいた。 根本原因 = content_name が自動名と明示名を混在
 /// させていたこと。 自動名の書き込み元 (録音の `ensure_midi_clip_at_playhead`)
 /// を断ち content_name を **明示 rename 専用** にしたので、 明示名が空でない
-/// なら必ずユーザーの意図 = 最優先で正しい。 ⑤⑦ の目的 (自動名が歌詞を隠さ
+/// なら必ずユーザーの意図 = 最優先で正しい。 旧版の目的 (自動名が歌詞を隠さ
 /// ない) も「自動名がそもそも入らない」 ことで保たれる。
 ///
 /// Text クリップは rename が本文 (`set_clip_text_event_content`) を書き換える
@@ -2421,7 +2421,7 @@ fn build_arrangement_lanes_from_slice(
                 color: display.color,
                 enabled: lane.enabled,
                 visible: lane.visible,
-                // FIXME #86: `Z` 縦ズームの一時拡大 (session override) があればそれを、
+                // `Z` 縦ズームの一時拡大 (session override) があればそれを、
                 // 無ければ model の保存高さを使う (override は描画のみ・save 非対象)。
                 height_px: lane_height_overrides
                     .get(&common::model::AutomationLaneKey {
@@ -2706,10 +2706,10 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// FIXME #90: VOICEVOX 生成中クリップの右上スピナー
+// VOICEVOX 生成中クリップの右上スピナー
 // ---------------------------------------------------------------------------
 
-/// FIXME #90: VOICEVOX 生成中のクリップ右上角に回転スピナーを重ねる。
+/// VOICEVOX 生成中のクリップ右上角に回転スピナーを重ねる。
 ///
 /// 歌唱/読み上げトラックが合成中ならそのトラックの全 clip に、口パク再生成中なら
 /// 出力先 (口) track の `auto_lipsync` clip に出す。印が消える = そのクリップが最新を
@@ -3114,7 +3114,7 @@ fn draw_midi_clip_notes(
     let row_h = (view_rect.h / pitch_span).max(1.0);
 
     // ノート色は固定値ではなく、clip の **実 fill 背景** の輝度から auto-contrast で
-    // 選ぶ (FIXME #57: 旧固定 light-cyan / dark-blue が selected の黄背景や custom 色
+    // 選ぶ (旧固定 light-cyan / dark-blue が selected の黄背景や custom 色
     // clip でコントラスト不足だった)。背景 fill は widget が実際に塗る色と完全一致
     // させる: selected は `clip_selected_fill` 最優先 (`draw_clip` lines 3418-3423)、
     // 非 selected は clip の **effective 色** (個別上書き or トラック色継承、SSoT は
@@ -3185,7 +3185,7 @@ mod tests {
         Rect { x: 0.0, y, w: 100.0, h }
     }
 
-    /// クリップ表示名の導出優先順位 (FIXME #69): Text 本文 → 明示名 (rename) →
+    /// クリップ表示名の導出優先順位: Text 本文 → 明示名 (rename) →
     /// ノート歌詞 (start_beat 順) → 無名 (空)。 明示名は歌詞より優先される
     /// (ユーザーが付けた名前は常に表示、 歌詞は無名クリップの既定表示)。
     #[test]
@@ -3226,7 +3226,7 @@ mod tests {
         // 編集するので本文が名前。 レガシーで "Title" 等が残っていても本文が出る)。
         song.set_content_name(2, "MyName".into());
         assert_eq!(&*clip_display_label(&text_clip, &song), "Hello");
-        // 明示名優先 (FIXME #69): 歌詞付き MIDI クリップ (Bell トラックの
+        // 明示名優先: 歌詞付き MIDI クリップ (Bell トラックの
         // 「あかねに」 等) でも、 ユーザーが付けた明示名があれば歌詞より優先して
         // それを表示する (DAW 標準挙動)。 名前を付けても歌詞のまま変わらなかった
         // 不具合の回帰テスト。

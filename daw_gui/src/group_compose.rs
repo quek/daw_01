@@ -21,7 +21,7 @@ use crate::video_fx::{VideoFxEngine, VideoFxRenderer};
 
 /// 1 トラックの合成画に積む 1 アイテム。座標は合成キャンバス（= project
 /// resolution、transform 拡大時は supersample 後）内の normalized 0..1。
-/// FIXME #54 Wave2: 立ち絵 group の子パーツも、通常トラックの動画フレーム /
+/// 立ち絵 group の子パーツも、通常トラックの動画フレーム /
 /// PiP 画像 / テキストも、すべてこの型で「トラック合成画」へ積む（SSoT）。
 #[derive(Debug, Clone)]
 pub enum CompositeItem {
@@ -358,7 +358,7 @@ impl CanvasMap {
 }
 
 /// `src` を `canvas` に aspect-fit（レターボックス）した **normalized 0..1** rect を返す。
-/// FIXME #54 Wave2: 動画フレームをトラック合成キャンバス内に収めるのに使う（PiP 画像は
+/// 動画フレームをトラック合成キャンバス内に収めるのに使う（PiP 画像は
 /// 既に normalized なので不要）。`canvas`/`src` は px 寸法。
 #[must_use]
 pub fn aspect_fit_norm(canvas: (f32, f32), src: (f32, f32)) -> (f32, f32, f32, f32) {
@@ -395,7 +395,7 @@ pub fn group_composite_canvas(proj: (u32, u32), t: &GroupTransform) -> (u32, u32
     (w, h)
 }
 
-/// FIXME #54 Wave2 (plan_video_fx §3): 1 [`TrackComposite`] を `scene` に描く
+/// 1 [`TrackComposite`] を `scene` に描く
 /// **preview / export 共通の SSoT 経路**。
 ///
 /// - `is_passthrough`（効果も配置 transform も無い plain track）: items を `project_box`
@@ -583,7 +583,7 @@ pub(crate) fn push_text_glyph(
         shadow_offset_px: (tf.shadow_offset_px.0 * font_scale, tf.shadow_offset_px.1 * font_scale),
         shadow_blur_px: tf.shadow_blur_px * font_scale,
         rotation_radians: tf.rotation_radians,
-        // FIXME #28: box 内アライメント (実 glyph 幅でレンダラが配置)。
+        // box 内アライメント (実 glyph 幅でレンダラが配置)。
         box_width: Some(rw),
         box_height: Some(rh),
         align_h: crate::text_compose::halign_for(tf.align),

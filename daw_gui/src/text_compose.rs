@@ -62,7 +62,7 @@ pub struct ActiveTextFrame {
     /// Bottom-up draw order。 caller がこれで video / image / text を
     /// interleave して higher track を front に置く。
     pub z_index: u32,
-    /// FIXME #54 Wave2: この text event の owning track id。トラック合成画へ
+    /// この text event の owning track id。トラック合成画へ
     /// 振り分ける（同一トラックの動画 / PiP / テキストを 1 枚へ）ために使う。
     pub owning_track_id: u32,
 }
@@ -157,7 +157,7 @@ pub fn active_text_sources_at(
     out
 }
 
-/// FIXME #28: `common::model::TextAlign` を gui_01 renderer の `HAlign` へ写す
+/// `common::model::TextAlign` を gui_01 renderer の `HAlign` へ写す
 /// **唯一の変換点**。 preview (`preview_window`) と export (`render_video`) の
 /// 双方がこれを使う。 揃え計算は box (`GlyphArea.box_width` + `align_h`) を渡して
 /// レンダラが実 glyph 幅で行うので、 daw_01 側に文字幅推定は持たない (旧

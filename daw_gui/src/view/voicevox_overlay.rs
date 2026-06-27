@@ -1,4 +1,4 @@
-//! FIXME #90: VOICEVOX の wav 合成 / 口パク生成の進行状態を見せる **非ブロック**
+//! VOICEVOX の wav 合成 / 口パク生成の進行状態を見せる **非ブロック**
 //! overlay (画面上端中央)。`load_overlay` と同じ idiom (= modal でない、操作を妨げない)。
 //!
 //! - WAV 合成中 (= builtin VOICEVOX が busy なトラックあり) → 回転スピナー +
@@ -20,7 +20,7 @@ use daw_ui_renderer::{Color, Rect, theme};
 
 use crate::app::AppData;
 
-// FIXME #88 テーマ SSoT に準拠 (call site で Color::rgb ベタ書きしない)。load_overlay と
+// テーマ SSoT に準拠 (call site で Color::rgb ベタ書きしない)。load_overlay と
 // 同じ非モーダル progress カード idiom: elevation-2 の PANEL_RAISED を alpha 0.94 で透過。
 const OVERLAY_BG: Color = theme::PANEL_RAISED.with_alpha(0.94);
 /// クリップ上バッジの暗い scrim。どのクリップ色 (明/暗) の上でも前景スピナーを浮かせる。
@@ -40,7 +40,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     if app.voicevox_synth_status.is_empty() && app.lipsync_inflight.is_empty() {
         return;
     }
-    // FIXME #90: render_frame が frame 冒頭で確定した時刻を使う (= 再描画継続判定
+    // render_frame が frame 冒頭で確定した時刻を使う (= 再描画継続判定
     // `voicevox_animating` と同じ now を読み、5s 境界での食い違いを防ぐ)。
     let now = app.frame_now;
     let unreachable = app.voicevox_engine_unreachable(now);

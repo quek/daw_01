@@ -125,7 +125,7 @@ impl PianoRollModel {
             // M14 Phase 124 / daw_01 #100: 3 段目 subdivision グリッド (1/16 = 0.25 拍間隔) を
             // demo 表示。 daw_01 では snap 値から `piano_roll_subgrid_interval` で算出して渡す想定。
             sub_grid_interval_beats: Some(0.25),
-            // FIXME #82: Insert / 空白ダブルクリック即放しの既定 note 長。 demo は固定 0.5、
+            // Insert / 空白ダブルクリック即放しの既定 note 長。 demo は固定 0.5、
             // daw_01 では last_note_duration_beats を渡す (直前ドラッグ長が次の既定になる)。
             default_note_len_beats: 0.5,
         }
@@ -843,7 +843,7 @@ impl App {
                                     format!("loop range → ({start:.3}, {end:.3}) beat");
                             })
                         }
-                        // (FIXME #89) edge auto-scroll: 横 delta 拍 / 縦 絶対 top_pitch を model に反映。
+                        // edge auto-scroll: 横 delta 拍 / 縦 絶対 top_pitch を model に反映。
                         PianoRollEditRequest::ScrollByBeats(by) => {
                             Edit::mutate(move |m: &mut PianoRollModel| {
                                 m.view_start_beat = (m.view_start_beat + by).max(0.0);

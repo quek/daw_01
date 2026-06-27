@@ -61,7 +61,7 @@ pub enum RenderSpan {
     /// Full-song export: write (and walk) `0..song_length`. (`ExportWav`
     /// with `range = None`.)
     Full,
-    /// User export range (FIXME #55): write `[start, end)` and walk **from
+    /// User export range: write `[start, end)` and walk **from
     /// `start`** (cold). Audio whose note began before `start` (e.g. a
     /// VOICEVOX phrase, a held note) is therefore *not* retriggered — the
     /// result matches pressing Play at `start`. Plugin tails start dry.
@@ -170,7 +170,7 @@ pub fn run_export(
     // `export_running` after this returns (on every path, including an early
     // bail above). We only read `export_cancel` here.
     //
-    // FIXME #55: `export_running` is already set (by the recv loop), so wait for
+    // `export_running` is already set (by the recv loop), so wait for
     // the live CPAL callback to actually park before we touch the shared
     // plugin-host worker slots. Otherwise a CPAL buffer that was mid-
     // `process_buffer` when the flag flipped would dispatch to the same worker
@@ -347,7 +347,7 @@ fn render_loop(
 
         // docs/plan_modulation.md §5: snapshot the prev buffer's follower envs
         // (slot order) so audio-param modulation renders into the WAV too.
-        // FIXME #56: follower は env、 generator は song 位置から直接算出 (live と同経路)。
+        // follower は env、 generator は song 位置から直接算出 (live と同経路)。
         let export_song_secs = playhead as f64 / sample_rate as f64;
         mod_scalars_snapshot.clear();
         for (fs, kind) in schedule
@@ -452,7 +452,7 @@ fn render_loop(
         // `mod_scalars`) keyed by the block beat.
         if env_sidecar.n_sources > 0 {
             env_sidecar.beats.push(playhead_beats as f32);
-            // FIXME #56: follower は env、 generator は song 位置から算出して焼き込む
+            // follower は env、 generator は song 位置から算出して焼き込む
             // (render_video は sidecar を sample するだけで全種別を再現)。
             for (fs, kind) in schedule
                 .follower_slots

@@ -1,4 +1,4 @@
-//! FIXME #64: plugin host が crash でなく **hang** した (プロセス・パイプは生存の
+//! plugin host が crash でなく **hang** した (プロセス・パイプは生存の
 //! まま `state_save` 等で停止) とき、 `RequestAllStates` の応答 (`AllStatesReceived`)
 //! が永久に来ず、 `pending_state_queue` が drain しないため保存 / New / Open /
 //! Open Recent / 終了(✕) が恒久ロックする。 `ChildDisconnected` も発火しないので
@@ -329,7 +329,7 @@ fn watchdog_does_not_fire_after_roundtrip_completes() {
 }
 
 /// review finding (export gate): `PluginsReinitDone` は export 自身のハンドシェイク
-/// 返信 (FIXME #55 の ReinitAllPlugins 応答) なのに、 export gate
+/// 返信 (ReinitAllPlugins 応答) なのに、 export gate
 /// (handle_event 冒頭) の whitelist から漏れていて drop されていた。 begin_wav_export は
 /// export_stage を立てた *後* に ReinitAllPlugins を送るので、 この応答は必ず
 /// export 中に到着する。 drop されると stashed `ExportWav` が永遠に発射されず、 GUI 実機

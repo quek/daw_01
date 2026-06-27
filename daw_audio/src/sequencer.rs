@@ -142,7 +142,7 @@ pub fn collect_events_for_buffer(
             .unwrap_or(&[]);
         let clip_note_count = notes.len() as u32;
 
-        // FIXME #80: muted clip は全 note を skip (note_id 通し番号は維持して
+        // muted clip は全 note を skip (note_id 通し番号は維持して
         // builtin VOICEVOX 側の note_id 対応がずれないよう base は加算する)。
         if clip.muted {
             note_id_base += clip_note_count;
@@ -164,7 +164,7 @@ pub fn collect_events_for_buffer(
 
         for (note_idx, note) in notes.iter().enumerate() {
             let note_id = note_id_base + note_idx as u32;
-            // FIXME #80: muted note は On/Off を一切 emit しない (On を出さないので
+            // muted note は On/Off を一切 emit しない (On を出さないので
             // stuck note にならない)。note_id 通し番号は enumerate で維持される。
             if note.muted {
                 continue;
@@ -251,7 +251,7 @@ pub fn collect_events_for_buffer(
     // 通し index) と event_id (= high band) は衝突しない。
     if track.is_voicevox_vocal() {
         for clip in &track.clips {
-            // FIXME #80: muted な Text(読み上げ) clip は talk note_on を発火しない。
+            // muted な Text(読み上げ) clip は talk note_on を発火しない。
             if clip.muted {
                 continue;
             }
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(active, vec![60]);
     }
 
-    /// FIXME #80: muted clip は note イベントを 1 つも emit しない。
+    /// muted clip は note イベントを 1 つも emit しない。
     #[test]
     fn muted_clip_emits_no_note_events() {
         let mut song = one_note_song(0.0, 1.0, 60);
@@ -405,7 +405,7 @@ mod tests {
         assert!(active.is_empty());
     }
 
-    /// FIXME #80: muted note を skip しても、 同 clip 内の sibling note の `note_id`
+    /// muted note を skip しても、 同 clip 内の sibling note の `note_id`
     /// (= enumerate 通し index) はずれない (builtin VOICEVOX の note_id ↔ 合成 wav
     /// frame offset 対応を壊さないための不変条件)。
     #[test]

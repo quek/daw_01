@@ -136,7 +136,7 @@ const STYLE_PLAY: ToggleButtonStyle = ToggleButtonStyle {
     on_text_color: None,
 };
 
-/// FIXME #60 / #76: パニックボタンのスタイル。 momentary（toggle ではない）ので
+/// パニックボタンのスタイル。 momentary（toggle ではない）ので
 /// `toggle_button_at` に `value=false` を渡し、 常に off_color が効く。 #76 で配置を
 /// 一番右へ移し、 背景を他の transport ボタンと同じ中立色 (`{0.22,0.22,0.26}`、 Play /
 /// Loop / Metronome の off 時と同一) に揃えた。 旧「常時赤 + label "Panic"」 の強い
@@ -575,7 +575,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 「選択トラックを Ctrl+G でまとめる」フローのみ提供する
     // (空のグループは意味がないため)。
 
-    // Playhead 位置 (text)。FIXME #4: 普通の DAW と同じく音楽的位置 (bar.beat.sub)
+    // Playhead 位置 (text)。普通の DAW と同じく音楽的位置 (bar.beat.sub)
     // と絶対時間 (分:秒.ms) を併記する。SSoT は app.playhead_beat 一本で、
     // bar.beat は time_sig、time は bpm から導出 (両表示が同じ source、かつ
     // bar 番号はアレンジ / piano-roll ルーラと一致する)。
@@ -603,7 +603,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         TEXT,
     );
 
-    // FIXME #76: Panic ボタンは transport バーの **一番右** に右端揃えで固定配置する
+    // Panic ボタンは transport バーの **一番右** に右端揃えで固定配置する
     // (running `x` を使わず area 右端から逆算するので、 左側に何ボタンが増減しても常に
     // 右端に張り付く)。 ラベルは "!"、 背景は他ボタンと同じ中立色 (STYLE_PANIC)。
     // click で `AppEvent::Panic` を発火 (再生停止 + 全 plugin 再初期化)。

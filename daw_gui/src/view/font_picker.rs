@@ -1,5 +1,5 @@
 //! Font picker (modal overlay)。Text クリップのフォントを「プラグインピッカーと
-//! 同じように」検索付きモーダルで選ぶ (FIXME #25 / `docs/plan_font_picker.md`)。
+//! 同じように」検索付きモーダルで選ぶ (`docs/plan_font_picker.md`)。
 //!
 //! plugin_picker.rs を下敷きにしつつ、 **各行をそのフォント自身で描画**するため
 //! row callback で `ui.push_text(GlyphArea { font_family: Some(name), .. })` を呼ぶ

@@ -49,7 +49,7 @@ pub struct RenderConfig<'a> {
     /// Average AAC audio bitrate. 192 kbit/s is the YouTube / SoundCloud
     /// upload sweet spot for music.
     pub audio_bitrate: u32,
-    /// FIXME #55: user-chosen export window in **beats**, `(start_beat,
+    /// user-chosen export window in **beats**, `(start_beat,
     /// end_beat)`. `None` = whole song (frame 0 → `length_beats`). When
     /// `Some`, the frame loop renders only `[start_beat, end_beat)`, with
     /// the first output frame mapped to `start_beat`. The muxed
@@ -57,14 +57,14 @@ pub struct RenderConfig<'a> {
     /// audio export writes only its requested frame range starting at
     /// sample 0), so video and audio stay aligned at output frame 0.
     pub range_beats: Option<(f64, f64)>,
-    /// FIXME #79: per-export output resolution `(width, height)` chosen in the
+    /// per-export output resolution `(width, height)` chosen in the
     /// export dialog. `None` = use the project canvas (`Song.video_resolution`).
     /// When `Some`, the `OffscreenRenderer` composites directly at this size, so
     /// clips are aspect-fit (letterboxed) onto the chosen canvas with no extra
     /// resample — identical to changing the project canvas, but ephemeral (the
     /// project / preview are left untouched).
     pub output_resolution: Option<(u32, u32)>,
-    /// FIXME #79: per-export output frame rate chosen in the export dialog.
+    /// per-export output frame rate chosen in the export dialog.
     /// `None` = use the project frame rate (`Song.video_framerate`). The frame
     /// loop steps at this rate (one composited frame per output tick), so it is
     /// purely an output-timeline parameter — audio (beat→sample) is unaffected
@@ -97,35 +97,35 @@ impl<'a> RenderConfig<'a> {
         self
     }
 
-    /// FIXME #55: restrict the rendered window to `[start_beat, end_beat)`.
+    /// restrict the rendered window to `[start_beat, end_beat)`.
     /// `None` renders the whole song (default).
     pub fn with_range_beats(mut self, range: Option<(f64, f64)>) -> Self {
         self.range_beats = range;
         self
     }
 
-    /// FIXME #79: override the output resolution for this export. `None` keeps
+    /// override the output resolution for this export. `None` keeps
     /// the project canvas (`Song.video_resolution`).
     pub fn with_output_resolution(mut self, resolution: Option<(u32, u32)>) -> Self {
         self.output_resolution = resolution;
         self
     }
 
-    /// FIXME #79: override the output frame rate for this export. `None` keeps
+    /// override the output frame rate for this export. `None` keeps
     /// the project frame rate (`Song.video_framerate`).
     pub fn with_output_framerate(mut self, framerate: Option<f32>) -> Self {
         self.output_framerate = framerate;
         self
     }
 
-    /// FIXME #79: the effective output resolution — the per-export override if
+    /// the effective output resolution — the per-export override if
     /// set, else the project canvas. SSoT for "what size this export encodes at".
     #[must_use]
     pub fn resolved_resolution(&self) -> (u32, u32) {
         self.output_resolution.unwrap_or(self.song.video_resolution)
     }
 
-    /// FIXME #79: the effective output frame rate — the per-export override if
+    /// the effective output frame rate — the per-export override if
     /// set, else the project frame rate.
     #[must_use]
     pub fn resolved_framerate(&self) -> f32 {
@@ -159,7 +159,7 @@ pub fn render_mp4_cancellable(
     crate::import_video::ensure_mf_startup_pub()
         .map_err(|e| format!("MFStartup: {e}"))?;
 
-    // FIXME #79: output dims/fps come from the per-export override (export
+    // output dims/fps come from the per-export override (export
     // dialog) when set, else the project canvas (`Song`). The OffscreenRenderer
     // composites directly at `out_w x out_h`, so a chosen size just re-letterboxes
     // the clips onto that canvas (no extra resample).
@@ -314,7 +314,7 @@ pub fn render_mp4_cancellable(
     // BGRA8 with avcodec + swscale. Replaces the MF SW decode + ffmpeg.exe
     // fallback, which silently dropped 10-bit video in the export's SW path.
     let mut decoder = crate::libav_decoder::LibavVideoDecoder::new();
-    // FIXME #55: render only the chosen beat window (default = whole song).
+    // render only the chosen beat window (default = whole song).
     // `start_beat` becomes output frame 0; the audio WAV muxed in is already
     // trimmed to the same window starting at its own sample 0, so A/V stay
     // aligned. Clamp into [0, length_beats] and require end > start (the GUI
@@ -360,7 +360,7 @@ pub fn render_mp4_cancellable(
         .and_then(|p| common::mod_sidecar::ModEnvSidecar::read(&p).ok())
         .unwrap_or_default();
     let mut mod_scalars_buf: Vec<f32> = Vec::new();
-    // FIXME #54: トラック映像効果の GPU 実行基盤 (preview と同一の VideoFxEngine)。
+    // トラック映像効果の GPU 実行基盤 (preview と同一の VideoFxEngine)。
     // pipeline cache + ping-pong pool を frame 跨ぎ保持。export 終了で offscreen
     // と共に drop (= pool target も解放)。
     let mut fx_engine = crate::video_fx::VideoFxEngine::new();
@@ -529,13 +529,13 @@ fn build_frame_scene(
     out_h: u32,
     scene: &mut Scene,
 ) {
-    // FIXME #54: 前 frame の効果 target を解放 (前 frame は submit_readback で sample 済み)。
+    // 前 frame の効果 target を解放 (前 frame は submit_readback で sample 済み)。
     // 今 frame の apply_chain が同寸でも別 target を払い出し、レイヤー間衝突を防ぐ。
     fx_engine.end_frame(offscreen);
-    // FIXME #54 Wave4: 時間系効果の P.time（秒）。preview と同じ song 時間（playhead_beat ×
+    // 時間系効果の P.time（秒）。preview と同じ song 時間（playhead_beat ×
     // 60/bpm）を渡して時間系効果も一致させる。
     fx_engine.set_time((playhead_beat * 60.0 / f64::from(song.bpm.max(1.0))) as f32);
-    // FIXME #54 Wave2 (plan_video_fx §3): 動画 / PiP 画像 / テキストを owning track
+    // 動画 / PiP 画像 / テキストを owning track
     // ごとに 1 枚へ合成する (preview と同一の per-track composite。byte parity)。各 track の
     // 視覚アイテムを bucket に集め、track 順 (z 順) に共通の composite_and_place で描く。
     use crate::group_compose::CompositeItem;
@@ -629,7 +629,7 @@ fn build_frame_scene(
         if items.is_empty() {
             continue; // export は overlay 不要なので空 bucket は skip。
         }
-        // FIXME #54 Wave3: 配置 transform は Transform device から解決（preview と同一 SSoT）。
+        // 配置 transform は Transform device から解決（preview と同一 SSoT）。
         let transform = crate::video_fx::resolve_track_transform(song, track, playhead_beat, mod_scalars);
         let fx = crate::video_fx::resolve_track_effects(song, track, playhead_beat, mod_scalars);
         let tc = crate::group_compose::TrackComposite {
@@ -649,7 +649,7 @@ fn build_frame_scene(
         );
     }
 
-    // FIXME #54 Wave1: マスター映像チェーン。全トラック合成後の scene を 1 枚の master
+    // マスター映像チェーン。全トラック合成後の scene を 1 枚の master
     // canvas へ集約 → master fx をチェーン順適用 → scene を master 1 quad で置換（preview と
     // 同一 SSoT）。空なら何もしない。
     let master_fx = crate::video_fx::resolve_master_effects(song, playhead_beat, mod_scalars);
@@ -693,7 +693,7 @@ fn resolve_video_source_path(
 mod tests {
     use super::*;
 
-    /// FIXME #79: the export output dims/fps default to the project canvas, but
+    /// the export output dims/fps default to the project canvas, but
     /// a per-export override (export dialog) wins when set. This is the SSoT the
     /// render loop reads — project values stay untouched (ephemeral override).
     #[test]
@@ -856,7 +856,7 @@ mod tests {
         assert_eq!(md.codec, "h264");
     }
 
-    /// FIXME #79: the per-export output resolution + fps override must propagate
+    /// the per-export output resolution + fps override must propagate
     /// all the way through the OffscreenRenderer + encoder into the actual mp4 —
     /// output dimensions equal the override (1280x720), NOT the project canvas
     /// (320x240), and the higher fps (60) yields ~double the frame count. This is

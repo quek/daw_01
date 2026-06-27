@@ -41,7 +41,7 @@ fn view_with(mode: PianoRollScaleMode) -> PianoRollView {
         snap_pitch_during_drag: false,
         // scale label snapshot 用の focused fixture なので subdivision は OFF。
         sub_grid_interval_beats: None,
-        // FIXME #82: snapshot 用 fixture では note 作成しないので任意 (1 拍)。
+        // snapshot 用 fixture では note 作成しないので任意 (1 拍)。
         default_note_len_beats: 1.0,
     }
 }

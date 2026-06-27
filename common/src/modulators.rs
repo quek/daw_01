@@ -1,4 +1,4 @@
-//! Generator modulator evaluation (LFO / Random / MSEG / Steps) — FIXME #56.
+//! Generator modulator evaluation (LFO / Random / MSEG / Steps).
 //!
 //! `docs/plan_fixme_56_modulators.md`. これらは envelope follower と違い **audio
 //! 入力に依存せず `song_beat` (と Free Hz 用の `song_secs`) の純粋関数** で出力する。

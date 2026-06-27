@@ -1,4 +1,4 @@
-//! 内蔵 GPU 映像効果フレームワーク (FIXME #54 / docs/plan_video_fx.md §1)。
+//! 内蔵 GPU 映像効果フレームワーク (docs/plan_video_fx.md §1)。
 //!
 //! 各効果 = **WGSL fragment パス列 + 宣言的パラメータ表** (ISF/OBS 流)。本モジュールは
 //! その **宣言的 Single Source of Truth** で、以下が参照する:
@@ -116,7 +116,7 @@ pub enum ParamKind {
         unit: Unit,
     },
     /// 対数連続値（`min`/`max` は **正の実レンジ**、正規化は log 空間）。スケール系
-    /// （0.1..10 で 0.5 = 等倍）のように乗法的な param 用。FIXME #54 Wave3: Transform
+    /// （0.1..10 で 0.5 = 等倍）のように乗法的な param 用。Transform
     /// device の ScaleX/Y が既存 GroupTransform と同じ log 正規化を保つため
     /// （[`crate::automation`] の plain_to_norm log 写像と一致、automation curve drift なし）。
     LogScalar {
@@ -819,7 +819,7 @@ fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
     needs_history: false,
 };
 
-/// Transform（座標変換）。FIXME #54 Wave3 / plan_video_fx §5: 「動かす変形」をチェーン上の
+/// Transform（座標変換）。plan_video_fx §5: 「動かす変形」をチェーン上の
 /// 1 device として刺せるようにする。**GPU シェーダパスも video param も持たない**マーカー
 /// device で、効果実行基盤は apply_chain に流さない。値（位置/スケール/回転/アンカー/不透明度）の
 /// SSoT は purpose-built な [`GroupTransform`](crate::model::GroupTransform)（log スケール・AE 流

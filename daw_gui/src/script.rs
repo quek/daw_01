@@ -355,7 +355,7 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             js_string!("exportWav"),
             2,
         )
-        // ----- FIXME #55 headless export-range test harness ----------------
+        // ----- headless export-range test harness ----------------
         .function(
             NativeFunction::from_fn_ptr(daw_load_song_file),
             js_string!("loadSongFile"),
@@ -649,7 +649,7 @@ fn daw_export_wav(
         h.drain_pending_for(Duration::from_millis(50));
         let _ = h.bootstrap.audio_tx.send(MainToChild::ExportWav {
             path: PathBuf::from(path_str),
-            // scripting API は全曲 export (FIXME #55 のレンジは GUI 専用)。
+            // scripting API は全曲 export (レンジ指定は GUI 専用)。
             range: None,
             // standalone WAV (video render なし) なので modulation sidecar は不要。
             write_mod_sidecar: false,
@@ -675,7 +675,7 @@ fn daw_export_wav(
 /// like the GUI's File→Open: deserialize, populate the plugin DB, instantiate
 /// every plugin (`SetSlotPlugin`), and push the song + project_dir to the audio
 /// engine. Lets an automated test drive the *real* project (real plugins) with
-/// no human operating the GUI (FIXME #55 export-bleed regression harness).
+/// no human operating the GUI (export-bleed regression harness).
 fn daw_load_song_file(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let path_str = String::try_from_js(args.get_or_undefined(0), ctx)?;
     let path = PathBuf::from(&path_str);
@@ -743,7 +743,7 @@ fn daw_reinit_for_export(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -
 }
 
 /// `daw.exportWavRange(path, startFrame, endFrame, timeoutMs)` — offline export
-/// of a sample-frame range (the FIXME #55 cold range, GUI's
+/// of a sample-frame range (the cold range, GUI's
 /// `MainToChild::ExportWav { range: Some(..) }`), driven headlessly.
 fn daw_export_wav_range(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let path_str = String::try_from_js(args.get_or_undefined(0), ctx)?;
@@ -887,7 +887,7 @@ fn daw_inspect_song_json(
 /// `daw.clipDisplayLabel(refJson)` — return the **rendered** clip label
 /// (`clip_display_label` の結果) for `{track, clip}` indices. `inspectSongJson`
 /// が返す `content_name` (= モデルの明示名) と違い、 Text 本文 / 歌詞 / 明示名の
-/// 導出後の **画面に出る文字列** を返す。 FIXME #69 (歌詞付きクリップを rename
+/// 導出後の **画面に出る文字列** を返す。 (歌詞付きクリップを rename
 /// しても歌詞のまま) の回帰を headless で検証するための hook。 存在しない
 /// track / clip は空文字。
 fn daw_clip_display_label(

@@ -21,7 +21,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const CHILD_CREATION_FLAGS: u32 = if cfg!(debug_assertions) { 0 } else { CREATE_NO_WINDOW };
 
-/// FIXME #26/#29: daw_plugin_host を `--probe-vst3` / `--probe-clap` 使い捨て
+/// daw_plugin_host を `--probe-vst3` / `--probe-clap` 使い捨て
 /// プロセスとして起動し、 プラグインの port 構成 (note in/out・audio out) を読む。
 /// **sync** (= rescan の std::thread から呼ぶので tokio Command は使わない)。
 /// timeout (= ハングするプラグイン) / spawn 失敗 / 異常終了 / parse 失敗はすべて
