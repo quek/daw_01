@@ -4,7 +4,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::model::{CURRENT_VERSION, ProjectFile, Song};
+use crate::model::{CURRENT_VERSION, ProjectFile, Song, ViewState};
+
+/// Result of `load_project`: the normalized song plus the optional GUI view
+/// state (FIXME #87). `view` is `None` for legacy files / files saved without
+/// view state — callers fall back to their default (fit-to-content) behavior.
+#[derive(Debug, Clone)]
+pub struct LoadedProject {
+    pub song: Song,
+    pub view: Option<ViewState>,
+}
 
 /// Oldest project-file version `load` will accept. Versions below this
 /// (currently `1` = the retired row-based format) are rejected with a
@@ -15,7 +24,20 @@ use crate::model::{CURRENT_VERSION, ProjectFile, Song};
 /// existing data.
 const MIN_LOADABLE_VERSION: u32 = 2;
 
+/// Save without GUI view state (legacy callers / tests / headless `--script`).
+/// Delegates to `save_project` with `view = None`.
 pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
+    save_project(path, song, None)
+}
+
+/// Save a project, optionally embedding GUI view state (FIXME #87). `view` is
+/// written as `ProjectFile.view` (a sibling of `song`), so the Song / IPC
+/// layout is untouched. Atomic write via tmp → rename.
+pub fn save_project(
+    path: impl AsRef<Path>,
+    song: &Song,
+    view: Option<&ViewState>,
+) -> Result<()> {
     let path = path.as_ref();
     let tmp = tmp_path(path);
 
@@ -27,6 +49,7 @@ pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
     let project = ProjectFile {
         version: CURRENT_VERSION,
         song,
+        view: view.cloned(),
     };
     let json = serde_json::to_string_pretty(&project)
         .context("failed to serialize project to JSON")?;
@@ -196,7 +219,16 @@ fn migrate_per_event_mute_to_clip_mute(song: &mut Song) {
     }
 }
 
+/// Load just the song (legacy callers / tests / headless `--script`).
+/// Delegates to `load_project` and drops the view state.
 pub fn load(path: impl AsRef<Path>) -> Result<Song> {
+    Ok(load_project(path)?.song)
+}
+
+/// Load a project including optional GUI view state (FIXME #87). The returned
+/// `song` is fully normalized (same as `load`); `view` is `None` for legacy
+/// files / files saved without view state.
+pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     let path = path.as_ref();
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -234,6 +266,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
             "loaded legacy project file; missing fields filled with serde defaults"
         );
     }
+    let view = project.view;
     let mut song = project.song;
     // (v26) 旧プロジェクト (= device-gated text overlay 以前) の Text 持ちトラックへ
     // 字幕デバイスを補い、表示を保つ。normalize の前に挿すことで、追加 device も
@@ -252,7 +285,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     // automation-point sort invariants. Idempotent — safe if a caller
     // (e.g. `daw_gui::app::open_project`) re-runs it.
     song.normalize_after_load();
-    Ok(song)
+    Ok(LoadedProject { song, view })
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -267,7 +300,84 @@ mod tests {
     use crate::model::{
         Clip, ClipContent, InstrumentSource, MidiContent, Note, TextContent, TextEvent, Track,
     };
+    use crate::model::{AudioEditorViewState, ClipKey, PianoRollViewState, ViewState};
     use tempfile::tempdir;
+
+    /// FIXME #87: per-clip view + globals を含む代表的な `ViewState`。
+    fn sample_view_state() -> ViewState {
+        ViewState {
+            arrange_zoom_x: 37.5,
+            arrange_scroll_beat: 12.0,
+            arrange_track_top: 48.0,
+            arrange_track_row_h: 72.0,
+            arrange_header_w: 200.0,
+            track_row_overrides: [(1u32, 64u16), (3, 120)].into_iter().collect(),
+            expanded_automation_tracks: vec![2, 5],
+            master_row_automation_expanded: true,
+            arrange_snap_enabled: false,
+            arrange_snap_choice: 4,
+            pianoroll_snap_enabled: true,
+            pianoroll_snap_choice: 2,
+            piano_roll_fold: true,
+            snap_on_draw: true,
+            snap_live_input: false,
+            bottom_panel: 1,
+            selected_clip: Some(ClipKey { track_id: 2, clip_id: 1 }),
+            selected_clips: vec![
+                ClipKey { track_id: 1, clip_id: 1 },
+                ClipKey { track_id: 2, clip_id: 1 },
+            ],
+            piano_roll_views: vec![
+                (
+                    ClipKey { track_id: 1, clip_id: 1 },
+                    PianoRollViewState { zoom_x: 120.0, zoom_y: 22.0, top_pitch: 72, scroll_beat: 3.0 },
+                ),
+                (
+                    ClipKey { track_id: 2, clip_id: 1 },
+                    PianoRollViewState { zoom_x: 16.0, zoom_y: 8.0, top_pitch: 96, scroll_beat: 0.0 },
+                ),
+            ],
+            audio_editor_views: vec![(
+                ClipKey { track_id: 3, clip_id: 7 },
+                AudioEditorViewState { start_beat: 1.5, len_beats: 8.0 },
+            )],
+        }
+    }
+
+    /// FIXME #87: ViewState は save_project → load_project で完全に往復する。
+    #[test]
+    fn save_project_roundtrips_view_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("with_view.daw");
+        let view = sample_view_state();
+        save_project(&path, &Song::default(), Some(&view)).unwrap();
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(
+            loaded.view.as_ref(),
+            Some(&view),
+            "view state が save/load で完全往復する"
+        );
+    }
+
+    /// FIXME #87: `view` キーを持たない旧ファイルは `view == None` で読め、
+    /// 従来挙動 (fit-to-content) にフォールバックできる。
+    #[test]
+    fn legacy_file_loads_with_none_view() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.daw");
+        write_project_with_version(&path, &Song::default(), CURRENT_VERSION);
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.view, None);
+    }
+
+    /// FIXME #87: 旧 `save` (= `save_project(.., None)` への委譲) は view を書かない。
+    #[test]
+    fn plain_save_writes_no_view() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("no_view.daw");
+        save(&path, &Song::default()).unwrap();
+        assert_eq!(load_project(&path).unwrap().view, None);
+    }
 
     /// version `v` の project file を `path` に書く (song は Rust で組んで serialize)。
     /// device-gated text overlay 移行 (v26) の version-gate を試すための helper。
@@ -700,6 +810,7 @@ mod tests {
         let future = ProjectFile {
             version: CURRENT_VERSION + 1,
             song: Song::default(),
+            view: None,
         };
         fs::write(&path, serde_json::to_string(&future).unwrap()).unwrap();
 

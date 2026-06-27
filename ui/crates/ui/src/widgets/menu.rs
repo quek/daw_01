@@ -12,7 +12,7 @@
 //!
 //! `Ui::dropdown` は別 file (`widgets/dropdown.rs`)。
 
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
 
 use crate::input::PointerFrame;
 use crate::ui::Ui;
@@ -90,8 +90,8 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
     // 背景パネル
     ui.push_rect(RectCommand {
         rect: popup_rect,
-        fill: Color::rgb(0.10, 0.11, 0.13),
-        border: Color::rgb(0.30, 0.33, 0.39),
+        fill: theme::PANEL,
+        border: theme::BORDER,
         border_width: 1.0,
         radius: [4.0; 4],
         clip_rect: None,
@@ -111,7 +111,7 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
         if hovered {
             ui.push_rect(RectCommand {
                 rect: item_rect,
-                fill: Color::rgb(0.32, 0.55, 0.85),
+                fill: theme::ACCENT,
                 border: Color::TRANSPARENT,
                 border_width: 0.0,
                 radius: [2.0; 4],
@@ -124,7 +124,7 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
             top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
             font_size: MENU_FONT,
             line_height: MENU_FONT * 1.2,
-            color: Color::rgb(0.92, 0.92, 0.94),
+            color: theme::TEXT,
             clip_rect: None,
             ..GlyphArea::default()
         });
@@ -253,15 +253,15 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
     // 背景パネル
     ui.push_rect(RectCommand {
         rect: popup_rect,
-        fill: Color::rgb(0.10, 0.11, 0.13),
-        border: Color::rgb(0.30, 0.33, 0.39),
+        fill: theme::PANEL,
+        border: theme::BORDER,
         border_width: 1.0,
         radius: [4.0; 4],
         clip_rect: None,
     });
 
     let mut return_action: Option<MenuItemAction<'a, M>> = None;
-    let arrow_color = Color::rgb(0.65, 0.68, 0.74);
+    let arrow_color = theme::TEXT_DIM;
     let entries_len = entries.len();
 
     // 兄弟 sub-popup 排他 (daw_01 #037 fix): hover している item を loop 前に確定し、
@@ -309,7 +309,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
         if hovered && item_enabled {
             ui.push_rect(RectCommand {
                 rect: item_rect,
-                fill: Color::rgb(0.32, 0.55, 0.85),
+                fill: theme::ACCENT,
                 border: Color::TRANSPARENT,
                 border_width: 0.0,
                 radius: [2.0; 4],
@@ -318,9 +318,9 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
         }
         // text 色: enabled なら通常色、disabled なら灰色
         let text_color = if item_enabled {
-            Color::rgb(0.92, 0.92, 0.94)
+            theme::TEXT
         } else {
-            Color::rgb(0.50, 0.52, 0.56)
+            theme::TEXT_FAINT
         };
         ui.push_text(GlyphArea {
             text: label.into(),
@@ -508,7 +508,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 背景バー
         self.push_rect(RectCommand {
             rect,
-            fill: Color::rgb(0.13, 0.14, 0.17),
+            fill: theme::HEADER,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
@@ -567,7 +567,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if hovered_idx == Some(i) || is_open {
                 self.push_rect(RectCommand {
                     rect: label_rect,
-                    fill: Color::rgb(0.20, 0.23, 0.28),
+                    fill: theme::CONTROL_HOVER,
                     border: Color::TRANSPARENT,
                     border_width: 0.0,
                     radius: [2.0; 4],
@@ -580,7 +580,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: label_rect.y + (label_rect.h - MENU_FONT * 1.2) * 0.5,
                 font_size: MENU_FONT,
                 line_height: MENU_FONT * 1.2,
-                color: Color::rgb(0.92, 0.94, 0.97),
+                color: theme::TEXT,
                 clip_rect: None,
                 ..GlyphArea::default()
             });

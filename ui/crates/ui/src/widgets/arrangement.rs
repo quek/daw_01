@@ -21,7 +21,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use daw_ui_platform::{CursorIcon, Modifiers};
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand, TextureHandle, TexturedQuad};
+use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand, TextureHandle, TexturedQuad};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -1347,152 +1347,155 @@ impl Default for ArrangementStyle {
     #[allow(clippy::too_many_lines)]
     fn default() -> Self {
         let mute_button = ToggleButtonStyle {
-            off_color: Color::rgb(0.18, 0.20, 0.24),
-            on_color: Color::rgb(0.55, 0.18, 0.18),
-            border: Color::rgb(0.30, 0.32, 0.36),
+            off_color: theme::CONTROL,
+            on_color: theme::RECORD,
+            border: theme::BORDER,
             border_width: 1.0,
             radius: 3.0,
             font_size: 11.0,
-            text_color: Color::rgb(0.95, 0.95, 0.97),
+            text_color: theme::TEXT,
             on_text_color: None,
         };
         let solo_button = ToggleButtonStyle {
-            off_color: Color::rgb(0.18, 0.20, 0.24),
-            on_color: Color::rgb(0.55, 0.50, 0.18),
-            border: Color::rgb(0.30, 0.32, 0.36),
+            off_color: theme::CONTROL,
+            on_color: theme::SOLO,
+            border: theme::BORDER,
             border_width: 1.0,
             radius: 3.0,
             font_size: 11.0,
-            text_color: Color::rgb(0.95, 0.95, 0.97),
+            text_color: theme::TEXT,
             on_text_color: None,
         };
         // M14 Phase 68 (#040): R button (Record-arm)。 active = 鮮やかな赤、
         // off = mute / solo と同 neutral 灰。
         let armed_button = ToggleButtonStyle {
-            off_color: Color::rgb(0.18, 0.20, 0.24),
-            on_color: Color::rgb(0.65, 0.18, 0.18),
-            border: Color::rgb(0.30, 0.32, 0.36),
+            off_color: theme::CONTROL,
+            on_color: theme::RECORD,
+            border: theme::BORDER,
             border_width: 1.0,
             radius: 3.0,
             font_size: 11.0,
-            text_color: Color::rgb(0.95, 0.95, 0.97),
+            text_color: theme::TEXT,
             on_text_color: None,
         };
         Self {
-            bg: Color::rgb(0.10, 0.11, 0.13),
-            header_bg: Color::rgb(0.14, 0.15, 0.18),
+            bg: theme::WINDOW_BG,
+            header_bg: theme::HEADER,
             track_color_strip_w: 4.0,
-            ruler_bg: Color::rgb(0.16, 0.17, 0.20),
-            // M14 Phase 72 (#044): 暗青で audio bg (rgb(0.10, 0.11, 0.13)) と視覚区別。
-            track_background_video: Color::rgb(0.13, 0.14, 0.18),
-            // M14 Phase 72 (#044): 暗グレーで「loading 中」 を控えめに表現。
-            video_clip_loading: Color::rgb(0.18, 0.18, 0.20),
-            bar_line: Color::rgba(1.0, 1.0, 1.0, 0.30),
-            beat_line: Color::rgba(1.0, 1.0, 1.0, 0.10),
+            ruler_bg: theme::HEADER,
+            // M14 Phase 72 (#044): 暗青で audio bg と視覚区別 (elevation-1 surface)。
+            track_background_video: theme::PANEL,
+            // M14 Phase 72 (#044): 中立灰で「loading 中」 を控えめに表現。
+            video_clip_loading: theme::CONTROL,
+            bar_line: theme::GRID_LINE_STRONG,
+            beat_line: theme::GRID_LINE,
             bar_line_width_px: 1.5,
             beat_line_width_px: 1.0,
-            lane_line: Color::rgba(0.0, 0.0, 0.0, 0.55),
+            lane_line: theme::GRID_LINE,
             lane_line_width_px: 1.0,
-            clip_default_fill: Color::rgb(0.18, 0.40, 0.65),
-            clip_border: Color::rgb(0.30, 0.55, 0.78),
+            clip_default_fill: theme::CLIP_DEFAULT,
+            clip_border: theme::CLIP_DEFAULT_BORDER,
             clip_border_w: 1.0,
             clip_radius: 3.0,
-            clip_muted_hatch_color: Color::rgba(0.0, 0.0, 0.0, 0.34),
+            clip_muted_hatch_color: theme::BACKDROP.with_alpha(0.34),
             clip_muted_hatch_spacing_px: 7.0,
             clip_muted_hatch_width_px: 1.5,
-            clip_selected_fill: Color::rgb(1.0, 0.85, 0.30),
-            clip_selected_border: Color::rgb(1.0, 1.0, 1.0),
+            clip_selected_fill: theme::SELECTION_WARM,
+            // 選択リングは任意色の clip 上で確実に立つ意図的な pure-white (token 化しない)。
+            clip_selected_border: Color::WHITE,
             // FIXME #73: 選択リング内側の暗線。 明るい fill (黄 / 白) でも枠が見える。
-            clip_selected_border_inner: Color::rgb(0.06, 0.06, 0.09),
+            clip_selected_border_inner: theme::TEXT_ON_BRIGHT,
             clip_selected_border_w: 2.0,
-            clip_text_color: Color::rgb(0.95, 0.95, 0.97),
+            clip_text_color: theme::TEXT,
             // M14 Phase 89 (daw_01 #060): auto-contrast の暗文字プール (旧 selected ハードコード値)。
-            clip_text_color_dark: Color::rgb(0.10, 0.10, 0.15),
+            clip_text_color_dark: theme::TEXT_ON_BRIGHT,
             clip_auto_contrast_text: true,
             clip_text_size: 11.0,
-            track_selected_bg: Color::rgb(0.20, 0.24, 0.32),
-            track_text_color: Color::rgb(0.92, 0.92, 0.94),
+            // 選択トラックは行全体 (header + lanes) を塗るため、 full ACCENT だと clip を
+            // 塗り潰す。 PANEL_RAISED を ACCENT 方向へ少しだけブレンドした控えめな選択ブルー。
+            track_selected_bg: theme::PANEL_RAISED.lerp(theme::ACCENT, 0.22),
+            track_text_color: theme::TEXT,
             track_text_size: 12.0,
-            playhead_color: Color::rgb(1.0, 0.25, 0.10),
+            playhead_color: theme::PLAYHEAD,
             playhead_width_px: 2.5,
-            loop_band: Color::rgba(0.50, 0.85, 1.0, 0.20),
-            loop_handle: Color::rgb(0.50, 0.85, 1.0),
+            loop_band: theme::LOOP_BAND.with_alpha(0.20),
+            loop_handle: theme::LOOP_BAND,
             loop_handle_w: 2.0,
-            arranger_lane_bg: Color::rgb(0.14, 0.15, 0.18),
-            arranger_label_color: Color::rgb(0.70, 0.72, 0.78),
-            arranger_preview_fill: Color::rgba(0.85, 0.88, 0.95, 0.25),
+            arranger_lane_bg: theme::HEADER,
+            arranger_label_color: theme::TEXT_DIM,
+            arranger_preview_fill: theme::ACCENT.with_alpha(0.25),
             resize_handle_px: 4.0,
             mute_button,
             solo_button,
             armed_button,
-            reorder_drop_indicator: Color::rgb(0.50, 0.85, 1.0),
+            reorder_drop_indicator: theme::LOOP_BAND,
             reorder_drop_indicator_h: 2.0,
             reorder_drag_alpha: 0.6,
             // indicator と同系 (シアン) を低 alpha で。 group 行に薄く乗せて nest 先を示す。
-            reorder_group_highlight: Color::rgba(0.50, 0.85, 1.0, 0.22),
+            reorder_group_highlight: theme::ACCENT.with_alpha(0.22),
             track_volume_band_h: 4.0,
-            track_volume_band_track: Color::rgba(0.0, 0.0, 0.0, 0.45),
-            track_volume_band_fill: Color::rgb(0.95, 0.95, 0.97),
-            ruler_label_color: Color::rgb(0.85, 0.88, 0.92),
+            track_volume_band_track: theme::BACKDROP.with_alpha(0.45),
+            track_volume_band_fill: theme::ACCENT,
+            ruler_label_color: theme::TEXT_DIM,
             indent_px: 16.0,
-            disclosure_color: Color::rgb(0.85, 0.88, 0.92),
+            disclosure_color: theme::TEXT_DIM,
             // M14 Phase 63e (#019): clone ghost (Ctrl / Ctrl+Shift) — 緑系 / 橙系で 3 種視覚区別。
             // selected fill (黄系 = (1.0, 0.85, 0.30)) と色相を分けて drag 中に「同じ ghost
             // にしか見えない」 状態を回避。
-            clip_clone_linked_fill: Color::rgba(0.40, 0.85, 0.55, 0.55),
-            clip_clone_linked_border: Color::rgb(0.55, 1.0, 0.70),
-            clip_clone_indep_fill: Color::rgba(1.0, 0.65, 0.30, 0.55),
-            clip_clone_indep_border: Color::rgb(1.0, 0.80, 0.45),
+            clip_clone_linked_fill: theme::GHOST_LINKED.with_alpha(0.55),
+            clip_clone_linked_border: theme::GHOST_LINKED,
+            clip_clone_indep_fill: theme::GHOST_INDEPENDENT.with_alpha(0.55),
+            clip_clone_indep_border: theme::GHOST_INDEPENDENT,
             clip_clone_badge_size: 11.0,
-            clip_clone_badge_color: Color::rgb(0.10, 0.10, 0.12),
+            clip_clone_badge_color: theme::TEXT_ON_BRIGHT,
             // M14 Phase 114 (#086): share_group_color の hue 値で塗る挙動を撤去したため、 共有マークは
             // link glyph (⇌) + 下記 active 強調のみ。
             share_group_link_glyph: '⇌',
             // M14 Phase 96 (daw_01 #068) / Phase 114 (#086): active group 強調 — identity-neutral な
             // bright cool white。 border は clip_selected_border_w (2.0) より太い 2.5、 glow wash は名前
             // 可読性を保つ 0.22 alpha。 selection の黄塗りとは別レイヤの「明度上げ + 明るい中立枠」。
-            share_group_active_color: Color::rgb(0.93, 0.96, 1.0),
+            share_group_active_color: theme::TEXT,
             share_group_active_border_w: 2.5,
             share_group_active_glow_alpha: 0.22,
             // M14 Phase 63k (#025): audio clip 編集 default — Bitwig spec §3.5/§3.6 と整合。
             // dB handle: 半透明白の細線、 ±4 px hit 帯、 端から 24 px margin、 0.25 dB/px、 ±24 dB 範囲。
             // fade 角: 12×12 grip、 半透明白の envelope 線。 sticky 閾値 10 px (要望文 §3.2)。
-            audio_db_handle_color: Color::rgba(1.0, 1.0, 1.0, 0.55),
+            audio_db_handle_color: theme::TEXT.with_alpha(0.55),
             audio_db_handle_width_px: 1.5,
             audio_db_handle_band_h: 8.0,
             audio_db_handle_x_margin: 24.0,
             audio_db_pixels_per_db: 0.25,
             audio_db_range_db: 24.0,
             audio_fade_corner_size_px: 12.0,
-            audio_fade_overlay_color: Color::rgba(1.0, 1.0, 1.0, 0.65),
+            audio_fade_overlay_color: theme::TEXT.with_alpha(0.65),
             audio_fade_overlay_width_px: 1.0,
             audio_min_clip_w_for_handles_px: 32.0,
             audio_fade_sticky_threshold_px: 10.0,
             audio_ghost_label_size: 11.0,
-            audio_ghost_label_color: Color::rgb(0.95, 0.95, 0.97),
+            audio_ghost_label_color: theme::TEXT,
             // M14 Phase 63n-1 (#028): automation lane defaults — Bitwig "Volume" lane の見た目に近づける。
             automation_lane_header_min_w_px: 80.0,
-            automation_lane_bg: Color::rgb(0.08, 0.09, 0.11),
-            automation_lane_disabled_color: Color::rgba(0.55, 0.56, 0.60, 0.65),
+            automation_lane_bg: theme::WINDOW_BG,
+            automation_lane_disabled_color: theme::TEXT_DIM.with_alpha(0.65),
             automation_curve_line_width_px: 1.5,
             automation_point_radius_px: 4.0,
             // M14 Phase 63n-9 (#033): tension/bend handle はオレンジ系 (lane.color の青/橙 と差別化、
             // 「触ると curve param が変わる handle」 を user に明示)、 size は selection dot と同 4.0。
             automation_curve_param_handle_radius_px: 4.0,
-            automation_curve_param_handle_fill: Color::rgb(1.0, 0.85, 0.30),
-            automation_curve_param_handle_border: Color::rgb(0.10, 0.10, 0.12),
+            automation_curve_param_handle_fill: theme::SELECTION_WARM,
+            automation_curve_param_handle_border: theme::TEXT_ON_BRIGHT,
             automation_curve_param_handle_offset_px: 10.0,
-            automation_curve_param_preview_color: Color::rgb(1.0, 0.85, 0.30),
+            automation_curve_param_preview_color: theme::SELECTION_WARM,
             // M14 Phase 63n-8 (#033): selected point は半径 +25% (= 通常 4 → 5)、 fill / border 共に白で
             // 「明らかに大きく / 明るく見える」 を実現 (daw_01 #033 §D 仕様)。 lane disabled でも色維持。
             automation_point_radius_selected_px: 5.0,
-            automation_point_selected_fill: Color::rgb(1.0, 1.0, 1.0),
-            automation_point_selected_border: Color::rgb(1.0, 1.0, 1.0),
+            automation_point_selected_fill: theme::TEXT,
+            automation_point_selected_border: theme::TEXT,
             // M14 Phase 63n-8 (#033): lasso 矩形は cyan 系で MIDI rect_select (= 既存 cyan rect select) と
             // 視覚的に共通の言語、 ただし fill alpha 12% で透明感を強め overlay と分かりやすく。
-            automation_lasso_fill: Color::rgba(0.40, 0.85, 1.0, 0.12),
-            automation_lasso_border: Color::rgba(0.40, 0.85, 1.0, 0.60),
-            automation_default_line_color: Color::rgba(1.0, 1.0, 1.0, 0.18),
+            automation_lasso_fill: theme::ACCENT.with_alpha(0.12),
+            automation_lasso_border: theme::ACCENT.with_alpha(0.60),
+            automation_default_line_color: theme::GRID_LINE.with_alpha(0.18),
             automation_default_line_width_px: 1.0,
             automation_clip_v_pad_px: 6.0,
             automation_clip_default_len_beats: 4.0,
@@ -1503,11 +1506,11 @@ impl Default for ArrangementStyle {
             automation_lane_max_height_px: 2000,
             automation_disclosure_size: 12.0,
             automation_lane_icon_size: 12.0,
-            automation_lane_text_color: Color::rgb(0.92, 0.92, 0.94),
+            automation_lane_text_color: theme::TEXT,
             // M14 Phase 63n-10 (#034): master row default (neutral gray + track と同 font / 色)。
-            master_row_color: Color::rgb(0.45, 0.45, 0.48),
+            master_row_color: theme::CONTROL_ACTIVE,
             master_row_label_size: 12.0,
-            master_row_label_color: Color::rgb(0.95, 0.95, 0.97),
+            master_row_label_color: theme::TEXT,
         }
     }
 }
@@ -5400,7 +5403,7 @@ fn draw_automation_lane<M: ?Sized + 'static>(
             (neutral, neutral, edge)
         } else {
             let dc = style.automation_lane_disabled_color;
-            (dc, dc, Color { r: 1.0, g: 1.0, b: 1.0, a: 0.4 })
+            (dc, dc, theme::TEXT.with_alpha(0.4))
         };
 
         // curve flatten (clip 内描画域 = clip_rect 全体)。 caller の screen-wide な beat_to_px
@@ -7669,7 +7672,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 hctx.push_rect(RectCommand {
                     rect: Rect { x: px - r, y: py - r, w: r * 2.0, h: r * 2.0 },
                     fill: style_copy.clip_selected_fill,
-                    border: Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                    border: theme::TEXT,
                     border_width: 1.5,
                     radius: [r; 4],
                     clip_rect: Some(pd.body_rect_anchor),

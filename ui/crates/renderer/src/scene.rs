@@ -58,6 +58,42 @@ impl Color {
             a: f64::from(self.a),
         }
     }
+
+    /// 同じ RGB で alpha だけ差し替えた色。半透明 wash / overlay を **元トークンから派生**
+    /// させ、値の再宣言 (SSoT 破り) を避けるためのヘルパ。
+    #[must_use]
+    pub const fn with_alpha(self, a: f32) -> Self {
+        Self { r: self.r, g: self.g, b: self.b, a }
+    }
+
+    /// `self` と `other` を `t` (0.0..=1.0) で線形補間する (RGBA 各成分)。
+    /// `t=0` で `self`、`t=1` で `other`。hover/pressed 等の派生状態を
+    /// token から計算するのに使う ([`lighten`](Self::lighten) / [`darken`](Self::darken))。
+    #[must_use]
+    pub fn lerp(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let m = |a: f32, b: f32| a + (b - a) * t;
+        Self {
+            r: m(self.r, other.r),
+            g: m(self.g, other.g),
+            b: m(self.b, other.b),
+            a: m(self.a, other.a),
+        }
+    }
+
+    /// 白方向へ `t` だけ lerp (RGB のみ持ち上げ、alpha 保持)。hover 状態の標準導出。
+    #[must_use]
+    pub fn lighten(self, t: f32) -> Self {
+        let lit = Self::WHITE.with_alpha(self.a);
+        self.lerp(lit, t)
+    }
+
+    /// 黒方向へ `t` だけ lerp (RGB のみ落とし、alpha 保持)。pressed 状態の標準導出。
+    #[must_use]
+    pub fn darken(self, t: f32) -> Self {
+        let dark = Self::BLACK.with_alpha(self.a);
+        self.lerp(dark, t)
+    }
 }
 
 /// 物理ピクセル単位の矩形。
@@ -483,7 +519,7 @@ pub struct Scene {
 impl Scene {
     pub fn new() -> Self {
         Self {
-            clear_color: wgpu::Color { r: 0.05, g: 0.05, b: 0.06, a: 1.0 },
+            clear_color: crate::theme::WINDOW_BG.to_wgpu(),
             primitives: Vec::new(),
             popup_primitives: Vec::new(),
         }

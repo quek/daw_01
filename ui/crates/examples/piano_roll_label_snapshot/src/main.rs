@@ -16,7 +16,7 @@ use daw_ui_core::{
     UiHost,
 };
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, OffscreenRenderer, Rect, Scene};
+use daw_ui_renderer::{OffscreenRenderer, Rect, Scene};
 
 const MAJOR_MASK: u16 = 0b0000_1010_1011_0101;
 
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut host: UiHost<()> = UiHost::no_redraw();
     let mut scene = Scene::new();
-    scene.clear_color = Color::rgb(0.10, 0.11, 0.13).to_wgpu();
+    scene.clear_color = daw_ui_renderer::theme::WINDOW_BG.to_wgpu();
     let screen = PhysicalSize { width, height };
 
     let style = PianoRollStyle::default();

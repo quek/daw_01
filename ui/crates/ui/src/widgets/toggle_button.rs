@@ -8,12 +8,12 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
-use crate::ui::{Ui, lerp_color};
+use crate::ui::Ui;
 
 /// `toggle_button_at` の永続状態 (button / checkbox と同形)。
 #[derive(Debug, Default)]
@@ -49,13 +49,13 @@ pub struct ToggleButtonStyle {
 impl Default for ToggleButtonStyle {
     fn default() -> Self {
         Self {
-            off_color: Color::rgb(0.18, 0.20, 0.26),
-            on_color: Color::rgb(0.32, 0.55, 0.85),
-            border: Color::rgb(0.35, 0.38, 0.45),
+            off_color: theme::CONTROL,
+            on_color: theme::ACCENT,
+            border: theme::BORDER,
             border_width: 1.0,
             radius: 6.0,
             font_size: 14.0,
-            text_color: Color::rgb(0.95, 0.95, 0.97),
+            text_color: theme::TEXT,
             on_text_color: None,
         }
     }
@@ -164,8 +164,8 @@ fn draw_toggle_button<M: ?Sized + 'static>(
 ) {
     // 背景色: value で off/on を選び、hover で明るく、press で暗く。
     let base = if value { style.on_color } else { style.off_color };
-    let hover_c = lerp_color(base, Color::rgb(1.0, 1.0, 1.0), 0.10);
-    let press_c = lerp_color(base, Color::rgb(0.0, 0.0, 0.0), 0.20);
+    let hover_c = base.lighten(0.10);
+    let press_c = base.darken(0.20);
 
     let fill = if pressed {
         press_c

@@ -10,13 +10,13 @@ use common::model::{AutomationTarget, MASTER_TRACK_ID, RecordingMode};
 use daw_ui_core::{
     Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 use crate::view::param_gesture::push_param_gesture_edges;
 
-const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 1.0 };
-const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
+const BG: Color = theme::HEADER;
+const TEXT: Color = theme::TEXT;
 
 const TS_DEN_ITEMS: &[&str] = &["2", "4", "8", "16"];
 
@@ -26,11 +26,11 @@ const TS_DEN_ITEMS: &[&str] = &["2", "4", "8", "16"];
 /// drag 中の hint band 風に bg_color_dragging が transport の overall
 /// オレンジ tinge に合うよう薄橙系を選ぶ。
 const SCRUB_STYLE_BPM: ScrubableNumberStyle = ScrubableNumberStyle {
-    bg_color: Color { r: 0.13, g: 0.13, b: 0.18, a: 1.0 },
-    bg_color_hovered: Color { r: 0.18, g: 0.18, b: 0.23, a: 1.0 },
+    bg_color: theme::INSET_BG,
+    bg_color_hovered: theme::CONTROL,
     bg_color_dragging: Color { r: 0.45, g: 0.30, b: 0.20, a: 1.0 },
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    text_color: theme::TEXT,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 3.0,
     font_size: 13.0,
@@ -43,11 +43,11 @@ const SCRUB_STYLE_BPM: ScrubableNumberStyle = ScrubableNumberStyle {
 /// `Integer` で int 切り捨て)。 これで 10 px drag = 1 拍子変化、 ユーザーの
 /// 慎重さが必要な操作 (= 拍子変更は楽曲の構造変化なので飛ばすと混乱)。
 const SCRUB_STYLE_TSIG_NUM: ScrubableNumberStyle = ScrubableNumberStyle {
-    bg_color: Color { r: 0.13, g: 0.13, b: 0.18, a: 1.0 },
-    bg_color_hovered: Color { r: 0.18, g: 0.18, b: 0.23, a: 1.0 },
+    bg_color: theme::INSET_BG,
+    bg_color_hovered: theme::CONTROL,
     bg_color_dragging: Color { r: 0.45, g: 0.30, b: 0.20, a: 1.0 },
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    text_color: theme::TEXT,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 3.0,
     font_size: 13.0,
@@ -84,13 +84,13 @@ static REC_LABELS: LazyLock<Vec<&'static str>> =
 /// 切り替え)。 STYLE_REC_MODE (橙、 automation recording) と意図的に
 /// 区別 (= MIDI 録音は別概念)。
 const STYLE_RECORD: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.85, g: 0.20, b: 0.20, a: 1.0 },
-    border: Color { r: 0.45, g: 0.30, b: 0.30, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::RECORD,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
     font_size: 12.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
@@ -98,13 +98,13 @@ const STYLE_RECORD: ToggleButtonStyle = ToggleButtonStyle {
 /// → on_color (橙) + 下端の hint band で「writing」 状態を強調する。
 /// Bitwig の Touch/Latch/Write ボタンに準拠 (Read 含めて 4 つすべて同 style)。
 const STYLE_REC_MODE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.85, g: 0.45, b: 0.18, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::RECORD_ARM,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
     font_size: 12.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
@@ -112,13 +112,13 @@ const STYLE_REC_MODE: ToggleButtonStyle = ToggleButtonStyle {
 /// off 時は灰。 record (赤) / automation (橙) と意味的に区別する。 font_size は
 /// 矢印 glyph ⟳ が button (28 px) 内で視認できるよう 16 に拡張。
 const STYLE_LOOP: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.25, g: 0.55, b: 0.85, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::ACCENT,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
     font_size: 16.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
@@ -126,13 +126,13 @@ const STYLE_LOOP: ToggleButtonStyle = ToggleButtonStyle {
 /// 灰。 業界標準の transport LED idiom に従う (= Ableton / Bitwig / Reaper)。
 /// label は active 時 ■ (stop)、 inactive 時 ▶ (play) で切り替え。
 const STYLE_PLAY: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.30, g: 0.70, b: 0.35, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::PLAY,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
     font_size: 16.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
@@ -143,13 +143,13 @@ const STYLE_PLAY: ToggleButtonStyle = ToggleButtonStyle {
 /// 強調をやめ、 ラベルも "!" に圧縮して corner に控えめに置く。 on_color は momentary
 /// ゆえ実描画されないが style 自己整合のため中立の明色にする。
 const STYLE_PANIC: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.30, g: 0.30, b: 0.36, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::CONTROL_ACTIVE,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
     font_size: 16.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
@@ -159,14 +159,14 @@ const STYLE_PANIC: ToggleButtonStyle = ToggleButtonStyle {
 /// / automation (橙) と意味的に区別。 label は ♬ (16 分音符 ×2、 細かい beat 感)。
 /// gui_01 #051 (state-dependent text color) landing で実現。
 const STYLE_CLICK: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.95, g: 0.85, b: 0.25, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::SOLO,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
     font_size: 16.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
-    on_text_color: Some(Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 }),
+    text_color: theme::TEXT,
+    on_text_color: Some(theme::TEXT_ON_BRIGHT),
 };
 
 fn ts_den_to_index(den: u8) -> usize {

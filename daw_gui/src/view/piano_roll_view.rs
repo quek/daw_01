@@ -11,7 +11,7 @@ use daw_ui_core::{
     Edit, MoveDelta, Note, PianoRollEditRequest, PianoRollScale, PianoRollScaleMode,
     PianoRollStyle, PianoRollView, ResizeDelta, ToggleButtonStyle, Ui, note_hit,
 };
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::{AppData, AppEvent, ClipRef};
 use crate::view::snap::{self, SNAP_LABELS};
@@ -21,17 +21,16 @@ const VEL_LANE_H: f32 = 60.0;
 const RULER_H: f32 = 20.0;
 const TOOLBAR_H: f32 = 24.0;
 
-const COLOR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
-const COLOR_HINT: Color = Color { r: 0.55, g: 0.58, b: 0.65, a: 1.0 };
+const COLOR_HINT: Color = theme::TEXT_DIM;
 
 const SNAP_TOGGLE_STYLE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.30, g: 0.50, b: 0.70, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::ACCENT,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 3.0,
     font_size: 12.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
@@ -55,7 +54,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 app.piano_roll_lyric_editing = false;
             }));
         }
-        ui.panel("pr_bg_empty", body, COLOR_BG, 0.0);
+        ui.panel("pr_bg_empty", body, theme::PANEL, 0.0);
         ui.label_at(
             "pr_no_clip",
             "(\u{30af}\u{30ea}\u{30c3}\u{30d7}\u{304c}\u{9078}\u{629e}\u{3055}\u{308c}\u{3066}\u{3044}\u{307e}\u{305b}\u{3093})",
@@ -95,8 +94,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 
     let widget_notes = build_widget_notes(app, target);
-    let zoom_x = app.pianoroll_zoom_x.max(4.0);
-    let zoom_y = app.pianoroll_zoom_y.max(6.0);
+    let zoom_x = app.pianoroll_zoom_x().max(4.0);
+    let zoom_y = app.pianoroll_zoom_y().max(6.0);
     let loop_range = if app.song.loop_end_beat > app.song.loop_start_beat {
         Some((app.song.loop_start_beat, app.song.loop_end_beat))
     } else {
@@ -152,11 +151,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     let view = PianoRollView {
         // song-absolute = clip-local scroll + clip 開始位置 (FIXME #3)。
-        start_beat: app.pianoroll_scroll_beat as f64 + clip_start_beat,
+        start_beat: app.pianoroll_scroll_beat() as f64 + clip_start_beat,
         // FIXME #89: 左へスクロールできる下限 = clip 開始拍 (= pianoroll_scroll_beat >= 0)。
         min_start_beat: clip_start_beat,
         len_beats: (grid_rect.w / zoom_x) as f64,
-        pitch_top: app.pianoroll_top_pitch as f32,
+        pitch_top: app.pianoroll_top_pitch() as f32,
         pitch_visible: grid_h / zoom_y,
         keyboard_w: KEYBOARD_W,
         notes_generation,
@@ -298,7 +297,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             PianoRollEditRequest::ScrollByBeats(by) => Edit::mutate(move |app: &mut AppData| {
                 // f64 で加算してから 1 度だけ f32 に丸める (精度保持)。handler が `>= 0` clamp する。
                 #[allow(clippy::cast_possible_truncation)]
-                let next = (f64::from(app.pianoroll_scroll_beat) + by) as f32;
+                let next = (f64::from(app.pianoroll_scroll_beat()) + by) as f32;
                 app.handle_event(AppEvent::SetPianoRollScrollX(next));
             }),
             // FIXME #89: edge auto-scroll の縦 (pitch) スクロール (絶対 top_pitch、widget が clamp 済)。
@@ -354,7 +353,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let beat_raw = view.start_beat + (px - grid_rect.x) as f64 / beat_to_px;
         let cfg = snap::piano_roll_snap_config(app);
         let alt = ui.pointer().modifiers.alt;
-        let snapped = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x);
+        let snapped = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x());
         Some(snapped - clip_start_beat)
     });
     // FIXME #44: f キー用に **song-absolute かつ snap なし** の生 beat も mirror する
@@ -405,8 +404,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         {
             let (sx, sy) = pointer.scroll_delta;
             if sy.abs() > 0.001 || sx.abs() > 0.001 {
-                let scroll_beat = app.pianoroll_scroll_beat;
-                let top_pitch = app.pianoroll_top_pitch as i32;
+                let scroll_beat = app.pianoroll_scroll_beat();
+                let top_pitch = app.pianoroll_top_pitch() as i32;
                 let modifiers = pointer.modifiers;
                 if modifiers.ctrl {
                     // Ctrl+wheel: 横ズーム。マウス位置の拍を anchor として保持する
@@ -464,7 +463,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 /// 配置: [Snap toggle][snap unit dropdown][Fit] [Fold][Snap on Draw]。
 /// Fold / Snap on Draw は Phase 7 B5 (Scale &amp; Root)。
 fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
-    ui.panel("pr_toolbar_bg", rect, COLOR_BG, 0.0);
+    ui.panel("pr_toolbar_bg", rect, theme::HEADER, 0.0);
 
     let pad = 6.0;
     let h = 18.0;

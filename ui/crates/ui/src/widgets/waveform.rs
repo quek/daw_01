@@ -12,7 +12,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
@@ -134,10 +134,10 @@ pub struct WaveformStyle {
 impl Default for WaveformStyle {
     fn default() -> Self {
         Self {
-            fg: Color::rgb(0.55, 0.78, 0.95),
-            fg_clipped: Color::rgb(0.95, 0.45, 0.40),
+            fg: theme::WAVEFORM,
+            fg_clipped: theme::WAVEFORM_PEAK,
             fill: None,
-            baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.10)),
+            baseline: Some(theme::GRID_LINE.with_alpha(0.10)),
             channel_layout: ChannelLayout::Stack,
             render_mode: WaveformRenderMode::PeakLines,
             line_width_px: 1.0,

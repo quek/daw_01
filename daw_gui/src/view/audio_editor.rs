@@ -19,13 +19,13 @@ use daw_ui_core::{
     ChannelLayout, DragKind, Edit, SampleSlices, TimeDisplay, TimeMapping, TimeRulerStyle, Ui,
     ViewportState1D, WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView, WidgetId,
 };
-use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
+use daw_ui_renderer::{theme, Color, LineBatch, LineSegment, Rect};
 
 use crate::app::{AppData, AppEvent, AudioEventTrimSide, MIN_AUDIO_EDITOR_VIEW_LEN_BEATS};
 
-const BG: Color = Color { r: 0.10, g: 0.11, b: 0.13, a: 1.0 };
-const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const GHOST: Color = Color { r: 0.95, g: 0.78, b: 0.31, a: 0.85 };
+const BG: Color = theme::PANEL;
+const TEXT: Color = theme::TEXT;
+const GHOST: Color = theme::SELECTION_WARM.with_alpha(0.85);
 
 /// common な mono / stereo source 用の borrowed-plane スタック配列サイズ。
 /// channel 数がこれ以下なら event ループ内の毎フレーム `Vec` 確保を消せる。
@@ -157,15 +157,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // を発火する。 描画前に clamp し直して視覚的に無効値を防ぐ (= clip
     // が縮んだ等で view が clip 外に飛び出すケース)。
     let total_beats = clip.length_beats.max(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS);
-    let view_len_beats = if app.audio_editor_view_len_beats > 0.0 {
-        app.audio_editor_view_len_beats
+    let view_len_beats = if app.audio_editor_view_len_beats() > 0.0 {
+        app.audio_editor_view_len_beats()
             .clamp(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, total_beats)
     } else {
         total_beats
     };
     let max_view_start = (total_beats - view_len_beats).max(0.0);
     let view_start_beat = app
-        .audio_editor_view_start_beat
+        .audio_editor_view_start_beat()
         .clamp(0.0, max_view_start);
 
     // ----- Ruler (MIDI エディタ同様、 song 全体の絶対 bar 番号を表示) -
@@ -218,8 +218,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 };
                 ui.push_rect(daw_ui_renderer::RectCommand {
                     rect: band,
-                    fill: Color::rgba(0.30, 0.85, 0.95, 0.18),
-                    border: Color::rgba(0.30, 0.85, 0.95, 0.55),
+                    fill: theme::LOOP_BAND.with_alpha(0.18),
+                    border: theme::LOOP_BAND.with_alpha(0.55),
                     border_width: 1.0,
                     radius: [0.0; 4],
                     clip_rect: Some(ruler_rect),
@@ -453,15 +453,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         };
         let is_selected = selected_set.contains(&idx);
         let fg = if is_selected {
-            Color::rgba(0.65, 0.95, 1.0, 0.95)
+            theme::WAVEFORM_SEL.with_alpha(0.95)
         } else {
-            Color::rgba(0.45, 0.70, 0.85, 0.85)
+            theme::WAVEFORM.with_alpha(0.85)
         };
         let style = WaveformStyle {
             fg,
-            fg_clipped: Color::rgb(0.95, 0.45, 0.40),
+            fg_clipped: theme::WAVEFORM_PEAK,
             fill: None,
-            baseline: Some(Color::rgba(1.0, 1.0, 1.0, 0.15)),
+            baseline: Some(theme::GRID_LINE.with_alpha(0.15)),
             channel_layout: ChannelLayout::Stack,
             render_mode: WaveformRenderMode::Auto,
             line_width_px: 1.0,
@@ -478,7 +478,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 上下左右を marker。 push_rect で半透明帯にしても良いが、
         // border の方が波形を遮らない。
         if is_selected {
-            let border_color = Color::rgba(0.95, 0.78, 0.31, 0.85);
+            let border_color = theme::SELECTION_WARM.with_alpha(0.85);
             ui.push_lines(LineBatch {
                 segments: Arc::from(vec![
                     // top
@@ -770,7 +770,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         {
             let norm = (in_clip - view_start_beat) / view_len_beats;
             let x = wf_area.x + norm as f32 * wf_area.w;
-            let color = Color::rgba(1.0, 0.55, 0.20, 0.9);
+            let color = theme::PLAYHEAD.with_alpha(0.9);
             ui.push_lines(LineBatch {
                 segments: std::sync::Arc::from(vec![LineSegment {
                     a: [x, wf_area.y],

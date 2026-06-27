@@ -1,15 +1,16 @@
 //! 画面下端のステータスバー: ファイルパス / MIDI 入力 / status_message。
 
 use daw_ui_core::Ui;
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::AppData;
 
-const COLOR_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
+const COLOR_BG: Color = theme::HEADER;
 // FIXME #52: 旧 dim グレー (0.65/0.68/0.72) はコントラスト不足だったため primary
-// (= 他 view と同じ 0.92/0.93/0.96) に統一。MIDI/file ラベルの可読性を上げる。
-const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const COLOR_MSG: Color = Color { r: 0.55, g: 0.85, b: 0.55, a: 1.0 };
+// (= 他 view と同じ body text) に統一。MIDI/file ラベルの可読性を上げる。
+const COLOR_TEXT: Color = theme::TEXT;
+// status_message は成功/通知系の緑 = semantic PLAY (status success)。
+const COLOR_MSG: Color = theme::PLAY;
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     ui.panel("status_bg", area, COLOR_BG, 0.0);
