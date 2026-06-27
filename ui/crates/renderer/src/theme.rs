@@ -31,29 +31,29 @@ use crate::Color;
 // ===== 面 (elevation: 暗→明で奥行きを表現) =====
 
 /// アプリの最下層 = window/surface clear。全 panel が浮いて見える真の床。
-pub const WINDOW_BG: Color = Color::rgb(0.055, 0.062, 0.075);
+pub const WINDOW_BG: Color = Color::rgb(0.035, 0.040, 0.050);
 /// 彫り込まれた窪み (text/number 入力欄・dropdown 本体・meter track・溝)。panel より一段沈む。
-pub const INSET_BG: Color = Color::rgb(0.050, 0.057, 0.072);
+pub const INSET_BG: Color = Color::rgb(0.028, 0.033, 0.043);
 /// クロームのバー類 (transport / snap toolbar / timeline ruler / menu bar / tab bar / track header)。
-pub const HEADER: Color = Color::rgb(0.072, 0.080, 0.098);
+pub const HEADER: Color = Color::rgb(0.048, 0.054, 0.067);
 /// elevation-1: 主要 panel / strip 本体 / modal / sidebar / menu popup。
-pub const PANEL: Color = Color::rgb(0.092, 0.101, 0.122);
+pub const PANEL: Color = Color::rgb(0.063, 0.070, 0.086);
 /// elevation-2: list-row 静止・note-grid 基底・keyboard panel・master strip。panel より +0.03 luma。
-pub const PANEL_RAISED: Color = Color::rgb(0.122, 0.133, 0.158);
+pub const PANEL_RAISED: Color = Color::rgb(0.086, 0.095, 0.115);
 
 // ===== コントロール (ボタン / トグルの面) =====
 
 /// button / toggle の idle (OFF) 塗り。panel_raised から明確に持ち上がる汎用インタラクション面。
-pub const CONTROL: Color = Color::rgb(0.150, 0.163, 0.193);
+pub const CONTROL: Color = Color::rgb(0.110, 0.121, 0.146);
 /// button / toggle / row の hover 塗り (= `CONTROL.lighten(0.06)` 相当を token 化)。
-pub const CONTROL_HOVER: Color = Color::rgb(0.192, 0.208, 0.245);
+pub const CONTROL_HOVER: Color = Color::rgb(0.145, 0.158, 0.188);
 /// 非意味的トグルの ON 塗り (色付き状態は `ACCENT` / semantic token を使う)。最も明るい中立面。
-pub const CONTROL_ACTIVE: Color = Color::rgb(0.225, 0.243, 0.288);
+pub const CONTROL_ACTIVE: Color = Color::rgb(0.175, 0.190, 0.225);
 
 // ===== 枠線 =====
 
 /// 汎用 1px の control / panel / field 枠。寒色寄りで低コントラストな締め。
-pub const BORDER: Color = Color::rgb(0.205, 0.223, 0.265);
+pub const BORDER: Color = Color::rgb(0.165, 0.180, 0.215);
 /// focus / open 状態の明るい枠 (accent 派生)。focused input・dropdown・split handle・drop indicator。
 pub const BORDER_FOCUS: Color = Color::rgb(0.34, 0.58, 0.98);
 
