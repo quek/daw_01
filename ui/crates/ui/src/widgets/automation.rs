@@ -15,7 +15,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -40,12 +40,12 @@ pub struct AutomationCurveStyle {
 impl Default for AutomationCurveStyle {
     fn default() -> Self {
         Self {
-            line_color: Color::rgb(0.42, 0.85, 0.95),
+            line_color: theme::CURVE,
             line_width_px: 2.0,
-            node_color: Color::rgb(0.95, 0.97, 1.00),
+            node_color: theme::TEXT,
             node_radius_px: 5.0,
-            node_hover_color: Color::rgb(1.0, 1.0, 0.6),
-            node_drag_color: Color::rgb(0.95, 0.45, 0.40),
+            node_hover_color: theme::SELECTION_WARM,
+            node_drag_color: theme::WAVEFORM_PEAK,
             max_segment_px: 2.0,
         }
     }

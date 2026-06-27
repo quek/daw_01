@@ -14,7 +14,7 @@ use daw_ui_core::{
     FadeEdge, MeterScale, SampleSlices, ScrubableNumberStyle,
     ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView,
 };
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget, FadeEdgeKind};
 use crate::view::track_color;
@@ -66,16 +66,16 @@ const RULER_H: f32 = 20.0;
 const TOOLBAR_H: f32 = 24.0;
 /// FIXME #53: Arranger レーン (曲のパート帯) の高さ (px)。ルーラー直下に確保。
 const SECTION_LANE_H: f32 = 18.0;
-const COLOR_TOOLBAR_BG: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
+const COLOR_TOOLBAR_BG: Color = theme::HEADER;
 
 const SNAP_TOGGLE_STYLE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.30, g: 0.50, b: 0.70, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::ACCENT,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 3.0,
     font_size: 12.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
@@ -459,7 +459,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // gui_01 default の鮮やかな色 (share L=0.55 / selected yellow) に戻し、
     // 文字色は widget が背景に応じて自動で可読化する。
     let style = ArrangementStyle {
-        audio_db_handle_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        // 完全透明で dB handle line の描画だけ抑制する (hit zone は色非依存)。
+        // どのテーマ token も「不可視」を表さないので literal (= TRANSPARENT) を維持。
+        audio_db_handle_color: Color::TRANSPARENT,
         // トラックヘッダのトラック名フォントサイズ (gui_01 #076 Phase 105 で track 名
         // + group disclosure ▶/▼ が track_text_size に追従)。 widget default 12.0 より
         // 小さくして 160px 幅 header に長い名前を収めやすく。
@@ -923,11 +925,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         #[allow(clippy::cast_possible_truncation)]
         let sensitivity = ((span / 256.0).max(1e-4)) as f32;
         let style = ScrubableNumberStyle {
-            bg_color: Color { r: 0.12, g: 0.13, b: 0.16, a: 1.0 },
-            bg_color_hovered: Color { r: 0.16, g: 0.17, b: 0.21, a: 1.0 },
+            bg_color: theme::INSET_BG,
+            bg_color_hovered: theme::CONTROL,
+            // drag 中の hint band (= transport の BPM scrubable と同じく
+            // bg_color_dragging は文脈固有の deliberate な一点もの)。 ここは
+            // automation lane を示す控えめな blue tint で、 ACCENT の electric
+            // azure とは別物なので literal を維持。
             bg_color_dragging: Color { r: 0.20, g: 0.32, b: 0.42, a: 1.0 },
-            text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
-            border: Color { r: 0.30, g: 0.33, b: 0.40, a: 1.0 },
+            text_color: theme::TEXT,
+            border: theme::BORDER,
             border_width: 1.0,
             radius: 3.0,
             font_size: 11.0,
@@ -1001,8 +1007,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         };
         ui.push_rect(RectCommand {
             rect: label_rect,
-            fill: Color { r: 0.08, g: 0.09, b: 0.11, a: 0.92 },
-            border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+            fill: theme::PANEL.with_alpha(0.92),
+            border: theme::BORDER,
             border_width: 1.0,
             radius: [3.0; 4],
             clip_rect: None,
@@ -1013,7 +1019,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             label_rect.x + pad,
             label_rect.y + 2.0,
             11.0,
-            Color { r: 0.95, g: 0.96, b: 0.98, a: 1.0 },
+            theme::TEXT,
         );
     }
 
@@ -1179,7 +1185,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "arr_file_drop_hint",
             canvas_area,
             Color::TRANSPARENT,
-            Color::rgb(0.55, 0.85, 0.95),
+            theme::LOOP_BAND,
             2.0,
             0.0,
         );
@@ -2828,17 +2834,18 @@ fn draw_audio_clip_waveform(
         len_samples: view_len_samples,
         vertical_gain: 1.0,
     };
-    // 選択 clip 背景は黄色 (clip_selected_fill = rgb(1.0, 0.85, 0.30)) なので、
-    // 通常時の水色波形だと視認性が悪い。 選択時は濃紺に切り替える。
+    // 波形 fg はテーマの WAVEFORM / WAVEFORM_SEL token を使う (選択時は明るい
+    // 方の WAVEFORM_SEL、 選択 clip の warm 背景に対するコントラストはテーマ側で
+    // 担保)。 clip したピークは選択状態に依らず WAVEFORM_PEAK。
     let (fg, fg_clipped) = if is_selected {
         (
-            Color::rgba(0.05, 0.10, 0.25, 0.95),
-            Color::rgb(0.55, 0.05, 0.05),
+            theme::WAVEFORM_SEL.with_alpha(0.95),
+            theme::WAVEFORM_PEAK,
         )
     } else {
         (
-            Color::rgba(0.55, 0.85, 0.95, 0.85),
-            Color::rgb(0.95, 0.45, 0.40),
+            theme::WAVEFORM.with_alpha(0.85),
+            theme::WAVEFORM_PEAK,
         )
     };
     let style = WaveformStyle {
@@ -2908,7 +2915,7 @@ fn draw_audio_clip_value_overlay(
     }
 
     // 描画位置: clip rect の右下 (= name は左上、 重ならないように)。
-    let text_color = Color::rgba(0.85, 0.92, 1.0, 0.85);
+    let text_color = theme::TEXT.with_alpha(0.85);
     let font_size = 9.0;
     let pad = 3.0;
     let mut x_right = clip_rect.x + clip_rect.w - pad;
@@ -3067,8 +3074,8 @@ fn draw_midi_clip_notes(
     // custom 色) には白寄りを選ぶ。WCAG relative luminance 閾値 (≈0.179) で分岐。
     let base_fill = daw_ui_core::color::pick_contrast(
         effective_bg,
-        Color::rgba(0.96, 0.97, 1.0, 1.0),
-        Color::rgba(0.06, 0.07, 0.12, 1.0),
+        theme::TEXT,
+        theme::TEXT_ON_BRIGHT,
     );
 
     let clip_len_beats = clip.length_beats.max(0.0001) as f32;

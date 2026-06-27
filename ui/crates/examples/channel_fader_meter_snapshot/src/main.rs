@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut host: UiHost<()> = UiHost::no_redraw();
     let mut scene = Scene::new();
-    scene.clear_color = Color::rgb(0.16, 0.17, 0.20).to_wgpu();
+    scene.clear_color = daw_ui_renderer::theme::PANEL.to_wgpu();
     let screen = PhysicalSize { width, height };
 
     host.frame_to_edits(

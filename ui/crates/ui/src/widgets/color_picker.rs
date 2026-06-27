@@ -22,7 +22,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
@@ -58,8 +58,8 @@ pub struct ColorPickerStyle {
 impl Default for ColorPickerStyle {
     fn default() -> Self {
         Self {
-            background: Color::rgb(0.16, 0.17, 0.20),
-            border: Color::rgb(0.35, 0.38, 0.45),
+            background: theme::PANEL,
+            border: theme::BORDER,
             border_width: 1.0,
             radius: 6.0,
             padding: 8.0,
@@ -70,7 +70,7 @@ impl Default for ColorPickerStyle {
             hue_bar_w: 16.0,
             gap: 8.0,
             preview_h: 18.0,
-            selector: Color::WHITE,
+            selector: theme::TEXT,
         }
     }
 }

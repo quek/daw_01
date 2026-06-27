@@ -5,17 +5,18 @@
 
 use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::{AppData, AppEvent, PluginCategory};
 
-const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
+const COLOR_TEXT: Color = theme::TEXT;
+// プラグイン種別タグ / format ラベルの色分け (楽器=緑 / FX=青 / MIDI=橙 / 映像=紫)。
+// theme に「プラグイン分類タグ」専用 token が無いため、 一意の category accent として
+// 固有色を残す (選択行では TEXT_ON_ACCENT に潰す)。
 const COLOR_TEXT_FORMAT: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
-// 種別タグの色分け (楽器 / FX / MIDI)。 選択行は白に潰す。
 const COLOR_TAG_INST: Color = Color { r: 0.58, g: 0.85, b: 0.55, a: 1.0 };
 const COLOR_TAG_FX: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
 const COLOR_TAG_MIDI: Color = Color { r: 0.95, g: 0.74, b: 0.45, a: 1.0 };
-/// FIXME #54: 内蔵映像効果タグ色 (紫系、audio/midi と区別)。
 const COLOR_TAG_VIDEO: Color = Color { r: 0.80, g: 0.62, b: 0.95, a: 1.0 };
 
 const PANEL_W: f32 = 520.0;
@@ -24,8 +25,8 @@ const TITLE_H: f32 = 36.0;
 const SEARCH_H: f32 = 26.0;
 
 const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.6 },
-    panel_bg: Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 },
+    overlay_color: theme::BACKDROP,
+    panel_bg: theme::PANEL,
     panel_radius: 6.0,
     close_on_outside_click: true,
     close_on_escape: true,
@@ -34,9 +35,9 @@ const MODAL_STYLE: ModalStyle = ModalStyle {
 const LIST_STYLE: ListViewStyle = ListViewStyle {
     row_height: 26.0,
     row_gap: 2.0,
-    row_bg: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    row_bg_hover: Color { r: 0.27, g: 0.27, b: 0.32, a: 1.0 },
-    row_bg_selected: Color { r: 0.32, g: 0.55, b: 0.85, a: 1.0 },
+    row_bg: theme::PANEL_RAISED,
+    row_bg_hover: theme::CONTROL_HOVER,
+    row_bg_selected: theme::ACCENT,
     radius: 3.0,
 };
 
@@ -195,7 +196,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     // を青、 vendor を dim グレーで区別。 選択時は format の青と背景
                     // 青が同化して読めなくなるため白で潰す。
                     let (name_color, vendor_color, format_color) = if is_selected {
-                        (Color::WHITE, Color::WHITE, Color::WHITE)
+                        (
+                            theme::TEXT_ON_ACCENT,
+                            theme::TEXT_ON_ACCENT,
+                            theme::TEXT_ON_ACCENT,
+                        )
                     } else {
                         (COLOR_TEXT, COLOR_TEXT, COLOR_TEXT_FORMAT)
                     };
@@ -225,7 +230,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     );
                     // 種別タグ (楽器 / FX / MIDI): 混合リストで選ぶ前に行き先が分かる。
                     let tag_color = if is_selected {
-                        Color::WHITE
+                        theme::TEXT_ON_ACCENT
                     } else {
                         match entry.category {
                             PluginCategory::Instrument => COLOR_TAG_INST,
