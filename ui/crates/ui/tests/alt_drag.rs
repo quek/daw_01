@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use daw_ui_core::{
     ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    Edit, FrameInput, MoveClipDelta, MoveDelta, Note, PianoRollEditRequest, PianoRollStyle,
+    Edit, FrameInput, MoveClipDelta, MoveDelta, Note, NoteStyle, PianoRollEditRequest, PianoRollStyle,
     PianoRollView, PointerFrame, SnapConfig, SnapMode, TrackKind, UiHost,
 };
 use daw_ui_platform::{Modifiers, PhysicalSize};
@@ -457,6 +457,7 @@ fn pr_model() -> PrModel {
         velocity: 100,
         lyric: None,
         muted: false,
+        style: NoteStyle::default(),
     };
     PrModel { notes: vec![note], selected: vec![42], last_move: None }
 }

@@ -910,22 +910,22 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // text_input フォーカス中は gui_01 が単キーを抑制する。
     if ui.take_shortcut("daw.toggle_mute") {
         if is_pianoroll_active && app.audio_editor_clip.is_none() {
-            if let Some(clip) = app.selected_clip_ref() {
-                let notes: Vec<u32> = if !app.selected_notes.is_empty() {
-                    app.selected_notes.clone()
-                } else {
-                    app.pianoroll_hover_note.into_iter().collect()
-                };
-                if !notes.is_empty() {
-                    let new_muted = !app.all_notes_muted(clip, &notes);
-                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetNotesMuted {
-                            clip,
-                            notes,
-                            muted: new_muted,
-                        });
-                    }));
-                }
+            // FIXME #93: note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
+            // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、
+            // ここで単一 anchor clip に縛らない (複数クリップ同時 mute を保つ)。
+            let notes: Vec<u32> = if !app.selected_notes.is_empty() {
+                app.selected_notes.clone()
+            } else {
+                app.pianoroll_hover_note.into_iter().collect()
+            };
+            if !notes.is_empty() {
+                let new_muted = !app.all_notes_muted(&notes);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetNotesMuted {
+                        notes,
+                        muted: new_muted,
+                    });
+                }));
             }
         } else {
             let targets: Vec<crate::app::ClipRef> = if is_pianoroll_active {
@@ -960,7 +960,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
                 app.handle_event(AppEvent::SetAudioEditorEventSelection(indices.clone()));
             }));
         } else if is_pianoroll_active {
-            let ids = app.all_note_ids_in_selected_clip();
+            let ids = app.all_shown_pianoroll_note_ids();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetNoteSelection(ids.clone()));
             }));

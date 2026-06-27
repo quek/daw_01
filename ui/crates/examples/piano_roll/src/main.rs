@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use daw_ui_core::{
-    Edit, InputAccumulator, MoveDelta, Note, NoteId, PianoRollEditRequest, PianoRollResponse,
+    Edit, InputAccumulator, MoveDelta, Note, NoteId, NoteStyle, PianoRollEditRequest,
+    PianoRollResponse,
     PianoRollStyle, PianoRollView, ResizeDelta, SnapConfig, UiHost, VelocityUpdate, hash_inputs,
 };
 use daw_ui_platform::{
@@ -147,6 +148,7 @@ fn generate_notes(count: usize) -> Vec<Note> {
                 velocity: 96,
                 lyric: None,
                 muted: false,
+                style: NoteStyle::default(),
             })
             .collect();
     }
@@ -181,7 +183,7 @@ fn generate_notes(count: usize) -> Vec<Note> {
         } else {
             None
         };
-        notes.push(Note { id: i as NoteId, start_beat, len_beats, pitch, velocity, lyric, muted: false });
+        notes.push(Note { id: i as NoteId, start_beat, len_beats, pitch, velocity, lyric, muted: false, style: NoteStyle::default() });
     }
     notes.sort_by(|a, b| a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal));
     notes
@@ -1000,7 +1002,7 @@ mod tests {
     use daw_ui_core::Edit;
 
     fn note(id: NoteId, start: f64, len: f64, pitch: u8) -> Note {
-        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None, muted: false }
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None, muted: false, style: NoteStyle::default() }
     }
 
     #[test]

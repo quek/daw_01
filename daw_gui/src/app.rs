@@ -1526,6 +1526,19 @@ pub struct AppData {
     /// `ViewState.piano_roll_views` として永続化される。
     pub piano_roll_views:
         std::collections::HashMap<common::model::ClipKey, common::model::PianoRollViewState>,
+    /// FIXME #93: **複数クリップ同時表示**中の共有 viewport (song-absolute scroll)。
+    /// 単一表示は per-clip 永続 `piano_roll_views` を使うが、複数表示は表示クリップ集合に
+    /// 依存する 1 つの transient viewport を使う (非永続)。`multi_clip_view_key` と組で持ち、
+    /// 表示クリップ集合が変わったら union bbox に再 fit する。
+    pub multi_clip_view: common::model::PianoRollViewState,
+    /// FIXME #93: `multi_clip_view` がどの表示クリップ集合 (`shown_pianoroll_clips` の
+    /// `ClipKey` 列) に対して fit 済かを記録。draw でこれと現在の集合が違えば再 fit。
+    pub multi_clip_view_key: Vec<common::model::ClipKey>,
+    /// FIXME #93: ピアノロールで「ロック (参照専用)」にした **トラック** (track id)。lock された
+    /// トラックの (表示中) note は淡色ゴーストで描画され、hit-test / 選択 / 編集から除外される。
+    /// 凡例がトラック単位なのでロックもトラック単位 (そのトラックの表示クリップ全部に効く)。
+    /// session 内 transient (非永続)。legend のロックトグルで増減。
+    pub locked_pr_tracks: std::collections::HashSet<u32>,
     /// FL Studio の smart length 互換: 直近に作成 / リサイズ / クリック選択した
     /// ノートの長さ (拍)。次の新規追加時のデフォルト長として使う。session 内
     /// in-memory のみ、永続化はしない。`add_note` / `resize_notes` /
@@ -2253,6 +2266,9 @@ impl AppData {
             inspector_body_h: 800.0,
             inspector_device_panel_h: 0.0,
             piano_roll_views: std::collections::HashMap::new(),
+            multi_clip_view: common::model::PianoRollViewState::default(),
+            multi_clip_view_key: Vec::new(),
+            locked_pr_tracks: std::collections::HashSet::new(),
             last_note_duration_beats: DEFAULT_NOTE_DURATION,
             preview_note: None,
             pianoroll_snap_enabled: true,
@@ -3702,7 +3718,9 @@ impl AppData {
         }
         // FIXME #83: 貼り付けた note を勝者として重なり解消。選択は remap で追従。
         let remap = resolve_note_overlaps(dest, &new_indices);
-        self.selected_notes = remap_indices(&remap, &new_indices);
+        let local_sel = remap_indices(&remap, &new_indices);
+        // FIXME #93: selected_notes は packed note id。貼り付け先 (anchor) clip の slot で pack。
+        self.selected_notes = self.pack_clip_selection(r, &local_sel);
         self.sync_song_to_plugin_host();
         count
     }
@@ -3732,49 +3750,55 @@ impl AppData {
     /// (`is_undoable` で `SetNoteVelocities` を許可)。 sync_song_to_plugin_host
     /// は最後に 1 度だけ呼ぶ (毎 note 同期は無駄)。
     fn set_note_velocities(&mut self, updates: &[(u32, u8)]) {
-        let Some(r) = self.selected_clip_ref() else {
-            return;
-        };
-        let Some(notes) = self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        else {
-            return;
-        };
+        // FIXME #93: packed id を所属クリップごとに分配し velocity を書く。複数クリップに
+        // 跨る選択の velocity lane drag をまとめて反映 (velocity 変更は重なりを生まない)。
         let mut changed = false;
-        for (note_idx, vel) in updates {
-            if let Some(note) = notes.get_mut(*note_idx as usize) {
-                note.velocity = *vel;
-                changed = true;
-            }
-        }
+        self.for_each_note_clip_group(
+            updates.iter().map(|&(id, vel)| (id, vel)),
+            |app, _slot, r, items| {
+                if let Some(notes) =
+                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                {
+                    for &(local, vel) in items {
+                        if let Some(note) = notes.get_mut(local) {
+                            note.velocity = vel;
+                            changed = true;
+                        }
+                    }
+                }
+            },
+        );
         if changed {
             self.sync_song_to_plugin_host();
         }
     }
 
     fn quantize_selected_notes(&mut self, div: u8) {
-        let Some(r) = self.selected_clip_ref() else {
+        // FIXME #93: 選択 (packed) を所属クリップごとに分配し、各クリップ内 clip-local start を
+        // 量子化。重なりは edit_clip_notes が解消し選択 (packed) を remap で追従。
+        if self.selected_notes.is_empty() {
             return;
-        };
-        let div = div.max(1) as f64;
-        let snap = |b: f64| (b * div).round() / div;
-        let selected = self.selected_notes.clone();
-        let Some(notes) = self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        else {
-            return;
-        };
-        for &i in &selected {
-            if let Some(n) = notes.get_mut(i as usize) {
-                n.start_beat = snap(n.start_beat).max(0.0);
-            }
         }
-        // FIXME #83: 量子化で同一ピッチが同点に丸まる重なりを解消。選択は remap で追従。
-        let remap = resolve_note_overlaps(notes, &selected);
-        self.selected_notes = remap_indices(&remap, &selected);
-        self.sync_song_to_plugin_host();    }
+        let div = div.max(1) as f64;
+        let selected = self.selected_notes.clone();
+        self.for_each_note_clip_group(
+            selected.into_iter().map(|id| (id, ())),
+            |app, slot, r, items| {
+                let locals: Vec<usize> = items.iter().map(|&(local, ())| local).collect();
+                app.edit_clip_notes(slot, r, move |notes| {
+                    let mut winners = Vec::with_capacity(locals.len());
+                    for local in locals {
+                        if let Some(n) = notes.get_mut(local) {
+                            n.start_beat = ((n.start_beat * div).round() / div).max(0.0);
+                            winners.push(local as u32);
+                        }
+                    }
+                    winners
+                });
+            },
+        );
+        self.sync_song_to_plugin_host();
+    }
 
     fn resize_track_peak_display(&mut self) {
         let n = self.song.tracks.len();
@@ -4779,6 +4803,14 @@ pub enum AppEvent {
         clip_ref: ClipRef,
         lyrics: Vec<(u32, Option<String>)>,
     },
+    /// FIXME #93: 複数表示ピアノロールの凡例 (legend) で対象 (target) クリップを切り替える。
+    /// `selected_clip` (anchor) をこの clip にするだけ (選択集合 `selected_clips` は不変、
+    /// `shown_pianoroll_clips` の順序 = packed id slot も不変なので `selected_notes` は維持)。
+    /// 新規ノートの所属先・凡例強調がこの clip になる。選択集合に居ない key なら no-op。
+    SetPianoRollTargetClip(common::model::ClipKey),
+    /// FIXME #93: 凡例で **トラック** の「ロック (参照専用)」を反転。ロック中はそのトラックの
+    /// 表示 note を widget が hit 除外し、編集 handler も飛ばす (淡色のまま掴めない)。非永続。
+    TogglePianoRollTrackLock(u32),
 
     // -------- Plugin picker / chain ---------------------------------------
     OpenPluginPicker,
@@ -5358,11 +5390,11 @@ pub enum AppEvent {
     /// 直下 clip を toggle した結果)。各 target の `Clip.muted` に `muted` を設定する。
     SetClipsMuted { targets: Vec<ClipRef>, muted: bool },
 
-    /// FIXME #80: ある clip 内の note 群 (index 指定) の `Note.muted` を一括設定
-    /// (= `q` で選択 note / カーソル直下 note を toggle した結果)。linked clip は content
-    /// 共有なので mute も共有される。
+    /// FIXME #80/#93: 表示中ピアノロールの note 群 (**packed note id**) の `Note.muted` を
+    /// 一括設定 (= `q` で選択 note / カーソル直下 note を toggle した結果)。packed id は
+    /// 所属クリップを内包するので複数クリップに跨る選択も正しく mute できる。linked clip は
+    /// content 共有なので mute も共有される。
     SetNotesMuted {
-        clip: ClipRef,
         notes: Vec<u32>,
         muted: bool,
     },
@@ -6407,16 +6439,25 @@ impl AppData {
             }
             AppEvent::SetNoteSelection(targets) => {
                 self.selected_notes = targets;
-                if let Some(&last_idx) = self.selected_notes.last()
-                    && let Some(r) = self.selected_clip_ref()
-                    && let Some(note) = self
+                // FIXME #93: last (anchor) は packed note id。所属クリップを decode し、
+                // (1) **そのクリップを対象 (target) に切替** — 非対象クリップのノートを掴むと編集対象が
+                //     そちらへ移る (plan §D/E。selected_clips は不変なので slot/selected_notes は維持)、
+                // (2) 既定 note 長をそのクリップから引く。
+                if let Some(&last) = self.selected_notes.last()
+                    && let Some((r, local)) = self.decode_note_id(last)
+                {
+                    if let Some(key) = self.clip_key_of(r) {
+                        self.set_pianoroll_target_clip(key);
+                    }
+                    if let Some(dur) = self
                         .song
                         .tracks
                         .get(r.track as usize)
                         .and_then(|t| t.clips.get(r.clip as usize))
-                        .and_then(|c| c.notes.get(last_idx as usize))
-                {
-                    self.last_note_duration_beats = note.duration_beats.max(0.0625);
+                        .and_then(|c| self.song.clip_notes(c).get(local).map(|n| n.duration_beats))
+                    {
+                        self.last_note_duration_beats = dur.max(0.0625);
+                    }
                 }
             }
             AppEvent::DeleteSelectedNotes => self.delete_selected_notes(),
@@ -6424,6 +6465,12 @@ impl AppData {
             AppEvent::CopyNotes(entries) => self.copy_notes(&entries),
             AppEvent::SetNoteLyrics { clip_ref, lyrics } => {
                 self.set_note_lyrics(clip_ref, &lyrics);
+            }
+            AppEvent::SetPianoRollTargetClip(key) => {
+                self.set_pianoroll_target_clip(key);
+            }
+            AppEvent::TogglePianoRollTrackLock(track_id) => {
+                self.toggle_pianoroll_track_lock(track_id);
             }
             AppEvent::OpenPluginPicker => {
                 self.plugin_picker_query.clear();
@@ -6906,9 +6953,9 @@ impl AppData {
                     self.sync_song_to_plugin_host();
                 }
             }
-            AppEvent::SetNotesMuted { clip, notes, muted } => {
-                // FIXME #80: `q` で選択 note / カーソル直下 note を一括 toggle した結果。
-                self.set_notes_muted(clip, &notes, muted);
+            AppEvent::SetNotesMuted { notes, muted } => {
+                // FIXME #80/#93: `q` で選択 note / カーソル直下 note (packed id) を一括 toggle。
+                self.set_notes_muted(&notes, muted);
             }
             AppEvent::SetClipStretchMode { target, mode } => {
                 self.set_clip_audio_event_stretch_mode(target, mode);
@@ -13537,7 +13584,8 @@ impl AppData {
         let remap = resolve_note_overlaps(notes, &[new_idx]);
         let selected = remap_indices(&remap, &[new_idx]);
         let next_cursor = cursor + step;
-        self.selected_notes = selected;
+        // FIXME #93: selected_notes は packed note id。入力先 (target) clip の slot で pack。
+        self.selected_notes = self.pack_clip_selection(target, &selected);
         self.step_cursor_beat = next_cursor;
         self.sync_song_to_plugin_host();
     }
@@ -13843,14 +13891,26 @@ impl AppData {
     /// 現在ピアノロールで開いている (= 選択 anchor) クリップの表示状態。
     /// entry が無ければ `PianoRollViewState::default()` (= 64/14/84/0)。
     pub fn piano_roll_view_state(&self) -> common::model::PianoRollViewState {
-        self.selected_clip
-            .and_then(|k| self.piano_roll_views.get(&k).copied())
-            .unwrap_or_default()
+        // FIXME #93: 複数表示は共有 viewport (`multi_clip_view`、song-absolute scroll)、
+        // 単一は per-clip 永続 state (clip-local scroll) を返す。
+        if self.shown_pianoroll_clips().len() >= 2 {
+            self.multi_clip_view
+        } else {
+            self.selected_clip
+                .and_then(|k| self.piano_roll_views.get(&k).copied())
+                .unwrap_or_default()
+        }
     }
 
-    /// 選択 anchor クリップの piano roll view を可変で得る (無ければ default を挿入)。
-    /// 選択クリップが無いときは `None` (= 書き込み先が無いので no-op)。
+    /// piano roll view を可変で得る。FIXME #93: 複数表示中は共有 transient viewport
+    /// (`multi_clip_view`、song-absolute scroll、非永続) を返し、単一表示は per-clip 永続 state
+    /// (`piano_roll_views[anchor]`、無ければ default 挿入) を返す。読み出し (`piano_roll_view_state`)
+    /// と同じ分岐 (`shown_pianoroll_clips().len() >= 2`) を使い、scroll/zoom/top_pitch の編集が
+    /// 表示と同じ viewport に書かれることを保証する。選択クリップが無いときは `None` (no-op)。
     fn piano_roll_view_entry(&mut self) -> Option<&mut common::model::PianoRollViewState> {
+        if self.shown_pianoroll_clips().len() >= 2 {
+            return Some(&mut self.multi_clip_view);
+        }
         let key = self.selected_clip?;
         Some(self.piano_roll_views.entry(key).or_default())
     }
@@ -14000,6 +14060,219 @@ impl AppData {
             .iter()
             .filter_map(|k| self.clip_ref_of(*k))
             .collect()
+    }
+
+    /// FIXME #93: ピアノロールに同時表示する MIDI クリップ群を順序付きで返す
+    /// (`selected_clips` を `ClipRef` 解決 → MIDI のみ filter)。anchor (`selected_clip`) は
+    /// `selected_clips` の末尾なので、末尾要素 = 新規ノートの所属先 (= 対象/target クリップ)。
+    /// `selected_clips` が空の単一選択経路では `selected_clip` にフォールバックする。
+    /// **この順序が packed note id の `clip_slot` の SSoT** (`decode_note_id` と必ず一致させる)。
+    #[must_use]
+    pub fn shown_pianoroll_clips(&self) -> Vec<ClipRef> {
+        let mut out = Vec::new();
+        if self.selected_clips.is_empty() {
+            if let Some(r) = self.selected_clip_ref()
+                && self.is_midi_clip(r)
+            {
+                out.push(r);
+            }
+        } else {
+            for k in &self.selected_clips {
+                if let Some(r) = self.clip_ref_of(*k)
+                    && self.is_midi_clip(r)
+                {
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    /// FIXME #93: 現在の対象 (target) クリップ = 新規ノートの所属先・凡例で強調される行。
+    /// SSoT は選択 anchor (`selected_clip`)。anchor が表示 MIDI クリップ集合に含まれていれば
+    /// それを、含まれなければ末尾 (= 旧挙動) を返す。表示 MIDI クリップが無いときは `None`。
+    /// **target を切り替えても `shown_pianoroll_clips` の順序 (= packed id の clip_slot) は
+    /// 変わらない** ので、target 変更で `selected_notes` を clear する必要はない (anchor の
+    /// ポインタが動くだけ)。
+    #[must_use]
+    pub fn pianoroll_target_clip(&self) -> Option<ClipRef> {
+        let shown = self.shown_pianoroll_clips();
+        if let Some(a) = self.selected_clip_ref()
+            && shown.contains(&a)
+        {
+            return Some(a);
+        }
+        shown.last().copied()
+    }
+
+    /// FIXME #93: piano_roll widget へ渡す **グローバル note id**。
+    /// 上位 8 bit = `clip_slot` (`shown_pianoroll_clips()` 内の位置 0..=255)、
+    /// 下位 24 bit = clip 内 note index (0..=16M)。複数クリップ重畳表示で id 衝突を防ぐ。
+    #[must_use]
+    pub fn pack_note_id(clip_slot: usize, note_index: usize) -> u32 {
+        ((clip_slot as u32) << 24) | (note_index as u32 & 0x00FF_FFFF)
+    }
+
+    /// FIXME #93: packed note id の上位 8 bit (= clip_slot) だけを取り出す。view 層が
+    /// song-absolute → clip-local 変換で「その note の所属クリップ」を引くのに使う
+    /// (bit レイアウトを `pack_note_id` と 1 箇所に集約する)。
+    #[must_use]
+    pub fn note_id_clip_slot(id: u32) -> usize {
+        (id >> 24) as usize
+    }
+
+    /// FIXME #93: packed note id の下位 24 bit (= clip 内 note index)。
+    #[must_use]
+    pub fn note_id_local_index(id: u32) -> usize {
+        (id & 0x00FF_FFFF) as usize
+    }
+
+    /// FIXME #93: `resolve_note_overlaps` がクリップ `slot` に返した remap を、packed な
+    /// `selected_notes` のうち当該クリップ部分にだけ適用する (他クリップは不変)。
+    /// `remap[old_local] = Some(new_local)` は追従、None / 範囲外は選択から落とす。
+    fn remap_packed_selection_for_clip(&mut self, slot: usize, remap: &[Option<u32>]) {
+        let mut out = Vec::with_capacity(self.selected_notes.len());
+        for &packed in &self.selected_notes {
+            if Self::note_id_clip_slot(packed) == slot {
+                let local = Self::note_id_local_index(packed);
+                if let Some(Some(new_local)) = remap.get(local) {
+                    out.push(Self::pack_note_id(slot, *new_local as usize));
+                }
+            } else {
+                out.push(packed);
+            }
+        }
+        self.selected_notes = out;
+    }
+
+    /// FIXME #93: クリップ `slot` (= `r`) の notes に `f` を適用 (local index ベースで編集し、
+    /// 重なり解決の勝者にする local index 群を返す) → `resolve_note_overlaps` で同ピッチ
+    /// 重なりを解消 → packed `selected_notes` の当該クリップ部分を remap、という複数クリップ
+    /// note 編集の共通基盤。snap 等の immutable 計算は呼び出し側で済ませて `f` に閉じ込める。
+    fn edit_clip_notes(&mut self, slot: usize, r: ClipRef, f: impl FnOnce(&mut Vec<Note>) -> Vec<u32>) {
+        let remap = {
+            let Some(notes) = self
+                .song
+                .notes_in_clip_mut(r.track as usize, r.clip as usize)
+            else {
+                return;
+            };
+            let winners = f(notes);
+            resolve_note_overlaps(notes, &winners)
+        };
+        self.remap_packed_selection_for_clip(slot, &remap);
+    }
+
+    /// FIXME #93: クリップの song-absolute 開始拍。clip-local note ⇄ song-absolute 変換の
+    /// 唯一のオフセット (範囲外は 0)。
+    #[must_use]
+    pub fn clip_start_beat_of(&self, r: ClipRef) -> f64 {
+        self.song
+            .tracks
+            .get(r.track as usize)
+            .and_then(|t| t.clips.get(r.clip as usize))
+            .map(|c| c.start_beat)
+            .unwrap_or(0.0)
+    }
+
+    /// FIXME #93: packed note id を持つ `entries` を **所属クリップ (clip_slot) ごと** に
+    /// グルーピングし、各クリップで `per_clip(self, slot, ClipRef, &[(local_index, payload)])` を
+    /// 呼ぶ。範囲外 slot / ロック中クリップは飛ばす (ロックは widget が hit 除外済だが二重防御)。
+    /// payload は handler ごとに異なる (移動=(beat,pitch)、リサイズ=(beat,len)、velocity=u8、
+    /// 削除/複製=`()` 等)。複数クリップ note 編集 handler の共通ディスパッチ。slot 昇順で適用
+    /// するので、各クリップ内 index ベースの remove も安定する。
+    fn for_each_note_clip_group<T>(
+        &mut self,
+        entries: impl IntoIterator<Item = (u32, T)>,
+        mut per_clip: impl FnMut(&mut Self, usize, ClipRef, &[(usize, T)]),
+    ) {
+        let shown = self.shown_pianoroll_clips();
+        let mut groups: std::collections::BTreeMap<usize, Vec<(usize, T)>> =
+            std::collections::BTreeMap::new();
+        for (id, payload) in entries {
+            groups
+                .entry(Self::note_id_clip_slot(id))
+                .or_default()
+                .push((Self::note_id_local_index(id), payload));
+        }
+        for (slot, items) in groups {
+            let Some(&r) = shown.get(slot) else { continue };
+            if self.is_pianoroll_clip_locked(r) {
+                continue;
+            }
+            per_clip(self, slot, r, &items);
+        }
+    }
+
+    /// FIXME #93: packed note id を `(ClipRef, clip 内 index)` に分解。`shown` は
+    /// `shown_pianoroll_clips()` の結果 (呼び出し側で 1 度作って使い回す)。`clip_slot` が
+    /// 範囲外なら `None`。
+    #[must_use]
+    pub fn decode_note_id_in(shown: &[ClipRef], id: u32) -> Option<(ClipRef, usize)> {
+        let clip_slot = (id >> 24) as usize;
+        let note_index = (id & 0x00FF_FFFF) as usize;
+        shown.get(clip_slot).copied().map(|r| (r, note_index))
+    }
+
+    /// FIXME #93: 単発デコード (内部で `shown_pianoroll_clips()` を 1 度計算)。多数の id を
+    /// 捌くハンドラでは `shown` を 1 度作って `decode_note_id_in` を使う (再計算を避ける)。
+    #[must_use]
+    pub fn decode_note_id(&self, id: u32) -> Option<(ClipRef, usize)> {
+        Self::decode_note_id_in(&self.shown_pianoroll_clips(), id)
+    }
+
+    /// FIXME #93: クリップ `r` 内の local note index 群を、現在の表示集合 (`shown_pianoroll_clips`)
+    /// における **packed note id** に変換する。新規ノート (add / paste / step 入力) の結果選択を
+    /// packed 化する共通基盤。`r` が表示集合に無ければ slot 0 (= 単一表示と byte 互換) に倒す。
+    fn pack_clip_selection(&self, r: ClipRef, locals: &[u32]) -> Vec<u32> {
+        let slot = self
+            .shown_pianoroll_clips()
+            .iter()
+            .position(|s| *s == r)
+            .unwrap_or(0);
+        locals
+            .iter()
+            .map(|&l| Self::pack_note_id(slot, l as usize))
+            .collect()
+    }
+
+    /// FIXME #93: そのクリップが乗っている **トラック** がピアノロールで「ロック (参照専用)」
+    /// かどうか。ロックはトラック単位 (凡例がトラック単位なので)。
+    pub fn is_pianoroll_clip_locked(&self, r: ClipRef) -> bool {
+        self.song
+            .tracks
+            .get(r.track as usize)
+            .is_some_and(|t| self.locked_pr_tracks.contains(&t.id))
+    }
+
+    /// FIXME #93: トラック id がピアノロールでロック中か (凡例のロックトグル状態表示用)。
+    pub fn is_pianoroll_track_locked(&self, track_id: u32) -> bool {
+        self.locked_pr_tracks.contains(&track_id)
+    }
+
+    /// FIXME #93: 凡例から対象 (target) クリップを切り替える。anchor (`selected_clip`) を
+    /// `key` にするだけで、選択集合 (`selected_clips`) は変えない (= `shown_pianoroll_clips`
+    /// の順序 = packed id slot 不変 → `selected_notes` 維持)。新規ノートの所属先・凡例強調が
+    /// この clip になる。集合に居ない / 単一表示で anchor と異なる key は no-op。track も追従。
+    fn set_pianoroll_target_clip(&mut self, key: common::model::ClipKey) {
+        // 凡例は常に表示集合内のクリップしか出さないが、stale 入力に備えて検証する。
+        let in_set = self.selected_clips.contains(&key) || self.selected_clip == Some(key);
+        if !in_set {
+            return;
+        }
+        self.selected_clip = Some(key);
+        if let Some(r) = self.clip_ref_of(key) {
+            self.select_track(r.track);
+        }
+    }
+
+    /// FIXME #93: 凡例から **トラック** のロック (参照専用) を反転。非永続な view 状態
+    /// (`locked_pr_tracks`)。ロック中はそのトラックの表示 note を widget が hit 除外し、
+    /// 編集 handler も飛ばす (`for_each_note_clip_group` / `is_pianoroll_clip_locked`)。
+    fn toggle_pianoroll_track_lock(&mut self, track_id: u32) {
+        if !self.locked_pr_tracks.remove(&track_id) {
+            self.locked_pr_tracks.insert(track_id);
+        }
     }
 
     /// FIXME #46: inspector の編集対象クリップ群。 複数選択 (`selected_clips`) 全体を
@@ -14227,24 +14500,26 @@ impl AppData {
         self.selected_clips = keys;
     }
 
-    /// Ctrl+A (ピアノロール): `selected_clip` の MIDI 全ノート id を返す
-    /// (id = clip 内 notes Vec の index)。 非 MIDI / 未選択なら空。
-    pub fn all_note_ids_in_selected_clip(&self) -> Vec<u32> {
-        let Some(target) = self.selected_clip_ref() else {
-            return Vec::new();
-        };
-        let Some(track) = self.song.tracks.get(target.track as usize) else {
-            return Vec::new();
-        };
-        let Some(clip) = track.clips.get(target.clip as usize) else {
-            return Vec::new();
-        };
-        match self.song.clip_contents.get(&clip.content_id) {
-            Some(common::model::ClipContent::Midi(midi)) => {
-                (0..midi.notes.len() as u32).collect()
+    /// Ctrl+A (ピアノロール): **表示中の全 MIDI クリップ** の全ノートを packed note id で返す
+    /// (FIXME #93)。各 id = `pack_note_id(clip_slot, local_index)`。ロック中クリップは選択対象に
+    /// しない (掴めないので除外)。表示クリップが無ければ空。
+    pub fn all_shown_pianoroll_note_ids(&self) -> Vec<u32> {
+        let shown = self.shown_pianoroll_clips();
+        let mut out = Vec::new();
+        for (slot, &r) in shown.iter().enumerate() {
+            if self.is_pianoroll_clip_locked(r) {
+                continue;
             }
-            _ => Vec::new(),
+            let Some(track) = self.song.tracks.get(r.track as usize) else {
+                continue;
+            };
+            let Some(clip) = track.clips.get(r.clip as usize) else {
+                continue;
+            };
+            let n = self.song.clip_notes(clip).len();
+            out.extend((0..n).map(|local| Self::pack_note_id(slot, local)));
         }
+        out
     }
 
     /// Ctrl+A (オーディオエディタ): 開いている clip の全 audio event index
@@ -14365,40 +14640,67 @@ impl AppData {
     /// を立てて return → piano_roll が初めて描画され grid_size が確定したフレームの
     /// Edit 内で再実行される (初回 fit 喪失バグの修正、 [piano_roll_view::draw] 参照)。
     fn fit_piano_roll_to_clip(&mut self) {
-        let Some(target) = self.selected_clip_ref() else { return };
-        let Some(key) = self.clip_key_of(target) else { return };
-        let Some(track) = self.song.tracks.get(target.track as usize) else { return };
-        let Some(clip) = track.clips.get(target.clip as usize) else { return };
+        // FIXME #93: 表示中の **全 MIDI クリップ** の note bbox を union して zoom/scroll/pitch を
+        // 算出する。複数表示は song-absolute (note.start + clip.start_beat) で集計し共有 transient
+        // viewport (`multi_clip_view`) に書く。単一表示は clip-local (= 旧挙動) で per-clip 永続
+        // view に書く (regression なし)。scroll の座標系は read accessor (`piano_roll_view_state`)
+        // と view (`view_start_beat`) の multi/single 分岐に一致させる。
+        let shown = self.shown_pianoroll_clips();
+        if shown.is_empty() {
+            return;
+        }
         let (grid_w, grid_h) = self.last_pianoroll_grid_size;
         if grid_w < 16.0 || grid_h < 16.0 {
             self.pending_pianoroll_fit = true;
             return;
         }
+        let multi = shown.len() >= 2;
 
-        let notes = self.song.clip_notes(clip);
-        // FIXME #87: fit 結果は per-clip view (`piano_roll_views[key]`) に書く。
-        let fitted = if notes.is_empty() {
+        let mut min_beat = f64::INFINITY;
+        let mut max_beat = f64::NEG_INFINITY;
+        let mut min_pitch = u8::MAX;
+        let mut max_pitch = u8::MIN;
+        let mut note_count = 0usize;
+        // notes ゼロのとき用に clip 群の span (single = clip 長、multi = clip 群 union)。
+        let mut union_start = f64::INFINITY;
+        let mut union_end = f64::NEG_INFINITY;
+        for &r in &shown {
+            let Some(track) = self.song.tracks.get(r.track as usize) else {
+                continue;
+            };
+            let Some(clip) = track.clips.get(r.clip as usize) else {
+                continue;
+            };
+            let offset = if multi { clip.start_beat } else { 0.0 };
+            union_start = union_start.min(offset);
+            union_end = union_end.max(offset + clip.length_beats);
+            for n in self.song.clip_notes(clip) {
+                note_count += 1;
+                let s = n.start_beat + offset;
+                min_beat = min_beat.min(s);
+                max_beat = max_beat.max(s + n.duration_beats);
+                min_pitch = min_pitch.min(n.pitch);
+                max_pitch = max_pitch.max(n.pitch);
+            }
+        }
+
+        let fitted = if note_count == 0 {
+            let start = if union_start.is_finite() { union_start } else { 0.0 };
+            let span = if union_end > union_start {
+                union_end - union_start
+            } else {
+                1.0
+            }
+            .max(1.0);
             common::model::PianoRollViewState {
-                scroll_beat: 0.0,
-                zoom_x: (grid_w / clip.length_beats.max(1.0) as f32).clamp(8.0, 400.0),
+                scroll_beat: start.max(0.0) as f32,
+                zoom_x: (f64::from(grid_w) / span).clamp(8.0, 400.0) as f32,
                 top_pitch: 84,
                 zoom_y: 14.0,
             }
         } else {
-            let min_beat = notes
-                .iter()
-                .map(|n| n.start_beat)
-                .fold(f64::INFINITY, f64::min);
-            let max_beat = notes
-                .iter()
-                .map(|n| n.start_beat + n.duration_beats)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let min_pitch = notes.iter().map(|n| n.pitch).min().unwrap_or(60);
-            let max_pitch = notes.iter().map(|n| n.pitch).max().unwrap_or(60);
-
             let span_beats = (max_beat - min_beat + 2.0).max(1.0);
             let span_pitch = (i32::from(max_pitch) - i32::from(min_pitch) + 4).max(4);
-
             common::model::PianoRollViewState {
                 scroll_beat: (min_beat - 1.0).max(0.0) as f32,
                 zoom_x: (f64::from(grid_w) / span_beats).clamp(8.0, 400.0) as f32,
@@ -14406,7 +14708,12 @@ impl AppData {
                 zoom_y: (grid_h / span_pitch as f32).clamp(6.0, 40.0),
             }
         };
-        self.piano_roll_views.insert(key, fitted);
+
+        if multi {
+            self.multi_clip_view = fitted;
+        } else if let Some(key) = self.selected_clip {
+            self.piano_roll_views.insert(key, fitted);
+        }
     }
 
     /// 親 group chain のいずれかが `collapsed_groups` に含まれる (= 折り畳まれた
@@ -15273,27 +15580,24 @@ impl AppData {
 
     /// FIXME #80: clip 内 `notes` (index) が **全て** muted なら `true` (空 / 非 MIDI は `false`)。
     /// `q` の note mute toggle 方向決定用。
-    pub fn all_notes_muted(&self, target: ClipRef, notes: &[u32]) -> bool {
+    pub fn all_notes_muted(&self, notes: &[u32]) -> bool {
+        // FIXME #93: `notes` は packed note id。各 id を所属クリップへ decode し、 そのクリップの
+        // 当該 note が muted か見る (toggle 方向 = 「全部 muted なら unmute」 を複数クリップ跨ぎで判定)。
         if notes.is_empty() {
             return false;
         }
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return false;
-        };
-        let Some(common::model::ClipContent::Midi(midi)) =
-            self.song.clip_contents.get(&content_id)
-        else {
-            return false;
-        };
-        notes
-            .iter()
-            .all(|&i| midi.notes.get(i as usize).is_some_and(|n| n.muted))
+        let shown = self.shown_pianoroll_clips();
+        notes.iter().all(|&id| {
+            let Some((r, local)) = Self::decode_note_id_in(&shown, id) else {
+                return false;
+            };
+            self.song
+                .tracks
+                .get(r.track as usize)
+                .and_then(|t| t.clips.get(r.clip as usize))
+                .and_then(|c| self.song.clip_notes(c).get(local).map(|n| n.muted))
+                .unwrap_or(false)
+        })
     }
 
     /// FIXME #80: clip-level mute (`Clip.muted`) を設定する。MIDI / audio / video / image /
@@ -15316,31 +15620,29 @@ impl AppData {
     /// `selected_notes` と同じ index 空間。linked clip は content (= notes) を共有するので
     /// mute も linked clip 間で共有される。変更があれば `sync_song_to_plugin_host` で flush
     /// (sequencer が muted note を skip して再生・書き出しから除外)。
-    fn set_notes_muted(&mut self, target: ClipRef, notes: &[u32], muted: bool) {
-        let Some(content_id) = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.content_id)
-        else {
-            return;
-        };
-        if let Some(common::model::ClipContent::Midi(midi)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            let mut changed = false;
-            for &i in notes {
-                if let Some(n) = midi.notes.get_mut(i as usize)
-                    && n.muted != muted
+    fn set_notes_muted(&mut self, notes: &[u32], muted: bool) {
+        // FIXME #93: `notes` は packed note id。所属クリップごとに分配し、各クリップの
+        // 当該 note の mute を設定する (locked クリップは for_each_note_clip_group が除外)。
+        let mut changed = false;
+        self.for_each_note_clip_group(
+            notes.iter().map(|&id| (id, ())),
+            |app, _slot, r, items| {
+                if let Some(clip_notes) =
+                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
                 {
-                    n.muted = muted;
-                    changed = true;
+                    for &(local, ()) in items {
+                        if let Some(n) = clip_notes.get_mut(local)
+                            && n.muted != muted
+                        {
+                            n.muted = muted;
+                            changed = true;
+                        }
+                    }
                 }
-            }
-            if changed {
-                self.sync_song_to_plugin_host();
-            }
+            },
+        );
+        if changed {
+            self.sync_song_to_plugin_host();
         }
     }
 
@@ -15957,6 +16259,21 @@ impl AppData {
         matches!(
             self.song.clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Audio(_))
+        )
+    }
+
+    /// FIXME #93: ピアノロール対象 (= MIDI content) クリップか。歌唱 (VOICEVOX) クリップも
+    /// MIDI content なので true (歌詞付き note としてピアノロールに出る)。範囲外 / 非 MIDI は false。
+    pub fn is_midi_clip(&self, target: ClipRef) -> bool {
+        let Some(track) = self.song.tracks.get(target.track as usize) else {
+            return false;
+        };
+        let Some(clip) = track.clips.get(target.clip as usize) else {
+            return false;
+        };
+        matches!(
+            self.song.clip_contents.get(&clip.content_id),
+            Some(common::model::ClipContent::Midi(_))
         )
     }
 
@@ -17358,144 +17675,164 @@ impl AppData {
             track: track_idx,
             clip: clip_idx,
         };
+        // FIXME #93: 新規ノートは「対象クリップ」(= anchor) へ入る。anchor をこのクリップに
+        // 揃えるが、複数選択 (selected_clips) は **縮小しない** (複数同時表示を保持)。対象が
+        // まだ選択集合に無ければ追加する (他クリップは残す)。
         if let Some(key) = self.clip_key_of(r) {
             self.selected_clip = Some(key);
             if !self.selected_clips.contains(&key) {
-                self.selected_clips = vec![key];
+                self.selected_clips.push(key);
             }
         }
-        self.selected_notes = selected;
+        // FIXME #93: 選択は packed note id。対象クリップの clip_slot (= shown 内位置) で pack。
+        self.selected_notes = self.pack_clip_selection(r, &selected);
         self.last_note_duration_beats = duration;
-        self.sync_song_to_plugin_host();    }
+        self.sync_song_to_plugin_host();
+    }
 
     fn set_note_positions(&mut self, entries: &[(u32, f64, u8)]) {
-        let Some(r) = self.selected_clip_ref() else {
-            return;
-        };
-        // Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw を note 移動
-        // (y-drag で pitch 変更) にも適用。 borrow checker のため snap 計算は
-        // immutable phase で済ませる。 Fold mode のときは widget が既に
-        // in-scale pitch を push しているので idempotent (snap が no-op)。
-        let snapped: Vec<(u32, f64, u8)> = if self.snap_on_draw {
-            let clip_start_beat = self
-                .song
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
-                .map(|c| c.start_beat)
-                .unwrap_or(0.0);
-            entries
-                .iter()
-                .map(|&(idx, beat, pitch)| {
-                    let global_beat = clip_start_beat + beat.max(0.0);
-                    let new_pitch = self
-                        .song
-                        .scale_at(global_beat)
-                        .map(|sc| sc.snap(pitch))
-                        .unwrap_or(pitch);
-                    (idx, beat, new_pitch)
-                })
-                .collect()
-        } else {
-            entries.to_vec()
-        };
-        let winners: Vec<u32> = snapped.iter().map(|&(idx, _, _)| idx).collect();
-        let Some(notes) = self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        else {
-            return;
-        };
-        for &(idx, beat, pitch) in &snapped {
-            let Some(note) = notes.get_mut(idx as usize) else {
-                continue;
-            };
-            note.start_beat = beat.max(0.0);
-            note.pitch = pitch;
-        }
-        // FIXME #83: 移動した note を勝者として重なり解消。既存選択 (未選択 note を
-        // 単独ドラッグした場合は winners と一致しない) を remap で追従させる。
-        let remap = resolve_note_overlaps(notes, &winners);
-        let sel = std::mem::take(&mut self.selected_notes);
-        self.selected_notes = remap_indices(&remap, &sel);
-        self.sync_song_to_plugin_host();    }
+        // FIXME #93: entries の `u32` は packed note id (clip_slot|local index)。所属クリップ
+        // ごとに分配し、各クリップ内 local index で位置を書き換える。`beat` は view が既に
+        // 各 note の所属クリップ clip-local に戻している (per-note offset)。
+        let snap_on_draw = self.snap_on_draw;
+        self.for_each_note_clip_group(
+            entries.iter().map(|&(id, beat, pitch)| (id, (beat, pitch))),
+            |app, slot, r, items| {
+                // Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw を note 移動
+                // (y-drag で pitch 変更) にも適用。snap 計算は immutable phase で済ませる。
+                // Fold mode のときは widget が既に in-scale pitch を push しているので
+                // idempotent。各 note の所属クリップ (`r`) の start_beat で song-absolute 化する。
+                let clip_start = app.clip_start_beat_of(r);
+                let snapped: Vec<(usize, f64, u8)> = items
+                    .iter()
+                    .map(|&(local, (beat, pitch))| {
+                        let new_pitch = if snap_on_draw {
+                            app.song
+                                .scale_at(clip_start + beat.max(0.0))
+                                .map(|sc| sc.snap(pitch))
+                                .unwrap_or(pitch)
+                        } else {
+                            pitch
+                        };
+                        (local, beat, new_pitch)
+                    })
+                    .collect();
+                // FIXME #83: 移動した note を勝者として重なり解消。既存選択 (packed) を
+                // edit_clip_notes が当該クリップ分だけ remap で追従させる。
+                app.edit_clip_notes(slot, r, move |notes| {
+                    let mut winners = Vec::with_capacity(snapped.len());
+                    for (local, beat, pitch) in snapped {
+                        if let Some(note) = notes.get_mut(local) {
+                            note.start_beat = beat.max(0.0);
+                            note.pitch = pitch;
+                            winners.push(local as u32);
+                        }
+                    }
+                    winners
+                });
+            },
+        );
+        self.sync_song_to_plugin_host();
+    }
 
     fn resize_notes(&mut self, entries: &[(u32, f64, f64)]) {
-        let Some(r) = self.selected_clip_ref() else {
-            return;
-        };
-        let winners: Vec<u32> = entries.iter().map(|&(idx, _, _)| idx).collect();
-        let Some(notes) = self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        else {
-            return;
-        };
-        for &(idx, start, duration) in entries {
-            let Some(note) = notes.get_mut(idx as usize) else {
-                continue;
-            };
-            note.start_beat = start.max(0.0);
-            note.duration_beats = duration.max(0.0625);
-        }
-        // FIXME #83: リサイズした note を勝者として重なり解消。既存選択 (未選択 note の
-        // 端を単独ドラッグした場合は winners と一致しない) を remap で追従させる。
-        let remap = resolve_note_overlaps(notes, &winners);
-        let sel = std::mem::take(&mut self.selected_notes);
-        self.selected_notes = remap_indices(&remap, &sel);
+        // FIXME #93: packed id を所属クリップごとに分配してリサイズ。`start` は view が
+        // 各 note の所属クリップ clip-local に戻している。
+        self.for_each_note_clip_group(
+            entries.iter().map(|&(id, start, dur)| (id, (start, dur))),
+            |app, slot, r, items| {
+                let updates: Vec<(usize, f64, f64)> =
+                    items.iter().map(|&(local, (s, d))| (local, s, d)).collect();
+                // FIXME #83: リサイズした note を勝者として重なり解消。既存選択 (packed) は
+                // edit_clip_notes が remap で追従。
+                app.edit_clip_notes(slot, r, move |notes| {
+                    let mut winners = Vec::with_capacity(updates.len());
+                    for (local, start, duration) in updates {
+                        if let Some(note) = notes.get_mut(local) {
+                            note.start_beat = start.max(0.0);
+                            note.duration_beats = duration.max(0.0625);
+                            winners.push(local as u32);
+                        }
+                    }
+                    winners
+                });
+            },
+        );
         if let Some(&(_, _, duration)) = entries.last() {
             self.last_note_duration_beats = duration.max(0.0625);
         }
-        self.sync_song_to_plugin_host();    }
+        self.sync_song_to_plugin_host();
+    }
 
     /// ピアノロールで選択中ノート (`selected_notes`) を複製する (D キー)。
     /// 複製は選択範囲の beat span ぶん後ろにずらし、元ノートは据え置き、
     /// 複製を新しい選択にする (連打で後方へ連鎖)。selected_clip 無し /
     /// 選択空 / clip 解決失敗なら no-op。
     fn duplicate_selected_notes(&mut self) {
-        let Some(r) = self.selected_clip_ref() else {
+        // FIXME #93: 選択 (packed) を所属クリップごとに複製。各クリップ内でその選択分の
+        // beat span ぶん後ろへずらす (元は据え置き)。新しい選択 = 全クリップの複製 (packed)。
+        if self.selected_notes.is_empty() {
             return;
-        };
+        }
         let selected: Vec<u32> = self.selected_notes.clone();
-        if selected.is_empty() {
-            return;
+        let mut new_selection: Vec<u32> = Vec::new();
+        self.for_each_note_clip_group(
+            selected.into_iter().map(|id| (id, ())),
+            |app, slot, r, items| {
+                let locals: Vec<u32> = items.iter().map(|&(local, ())| local as u32).collect();
+                if let Some(notes) =
+                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                {
+                    let new_ids = duplicate_notes_into(notes, &locals);
+                    if !new_ids.is_empty() {
+                        // FIXME #83: 複製を勝者として重なり解消 (元と密接な複製は元を据え置く)。
+                        let remap = resolve_note_overlaps(notes, &new_ids);
+                        for nid in remap_indices(&remap, &new_ids) {
+                            new_selection.push(Self::pack_note_id(slot, nid as usize));
+                        }
+                    }
+                }
+            },
+        );
+        if !new_selection.is_empty() {
+            self.selected_notes = new_selection;
+            self.sync_song_to_plugin_host();
         }
-        let Some(notes) = self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        else {
-            return;
-        };
-        let new_ids = duplicate_notes_into(notes, &selected);
-        if new_ids.is_empty() {
-            return;
-        }
-        // FIXME #83: 複製を勝者として重なり解消 (元と密接な複製は元を据え置く)。
-        let remap = resolve_note_overlaps(notes, &new_ids);
-        self.selected_notes = remap_indices(&remap, &new_ids);
-        self.sync_song_to_plugin_host();    }
+    }
 
     /// gui_01 #054 (Ctrl+drag コピー): `entries` = [(source note index,
     /// new_start_beat, new_pitch)]。各 source を deep clone して指定位置へ配置し
     /// (元は据え置き)、複製を新選択にする。selected_clip 無し / 該当 index 無しなら no-op。
     fn copy_notes(&mut self, entries: &[(u32, f64, u8)]) {
-        let Some(r) = self.selected_clip_ref() else {
-            return;
-        };
-        let Some(notes) = self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        else {
-            return;
-        };
-        let new_ids = copy_notes_into(notes, entries);
-        if new_ids.is_empty() {
-            return;
+        // FIXME #93: packed id を所属クリップごとに分配し、各 source を同じクリップ内へ複製。
+        // 新しい選択 = 全クリップの複製 (packed で再構成)。`beat` は view が clip-local 化済。
+        let mut new_selection: Vec<u32> = Vec::new();
+        self.for_each_note_clip_group(
+            entries.iter().map(|&(id, beat, pitch)| (id, (beat, pitch))),
+            |app, slot, r, items| {
+                let local_entries: Vec<(u32, f64, u8)> = items
+                    .iter()
+                    .map(|&(local, (beat, pitch))| (local as u32, beat, pitch))
+                    .collect();
+                if let Some(notes) =
+                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                {
+                    let new_ids = copy_notes_into(notes, &local_entries);
+                    if !new_ids.is_empty() {
+                        // FIXME #83: コピーを勝者として重なり解消。複製の local id を packed 化。
+                        let remap = resolve_note_overlaps(notes, &new_ids);
+                        for nid in remap_indices(&remap, &new_ids) {
+                            new_selection.push(Self::pack_note_id(slot, nid as usize));
+                        }
+                    }
+                }
+            },
+        );
+        if !new_selection.is_empty() {
+            self.selected_notes = new_selection;
+            self.sync_song_to_plugin_host();
         }
-        // FIXME #83: コピーを勝者として重なり解消。選択は remap で追従。
-        let remap = resolve_note_overlaps(notes, &new_ids);
-        self.selected_notes = remap_indices(&remap, &new_ids);
-        self.sync_song_to_plugin_host();    }
+    }
 
     fn resize_note(
         &mut self,
@@ -17522,26 +17859,30 @@ impl AppData {
         self.sync_song_to_plugin_host();    }
 
     fn delete_selected_notes(&mut self) {
-        let Some(r) = self.selected_clip_ref() else {
-            return;
-        };
+        // FIXME #93: 選択 (packed) を所属クリップごとに分配し、各クリップ内で index 降順に
+        // remove (削除で後続 index がずれない)。複数クリップに跨る選択をまとめて消す。
         if self.selected_notes.is_empty() {
             return;
         }
-        let mut indices = std::mem::take(&mut self.selected_notes);
-        indices.sort_unstable_by(|a, b| b.cmp(a));
-        if let Some(notes) = self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        {
-            for i in &indices {
-                let i = *i as usize;
-                if i < notes.len() {
-                    notes.remove(i);
+        let ids = std::mem::take(&mut self.selected_notes);
+        self.for_each_note_clip_group(
+            ids.into_iter().map(|id| (id, ())),
+            |app, _slot, r, items| {
+                let mut locals: Vec<usize> = items.iter().map(|&(local, ())| local).collect();
+                locals.sort_unstable_by(|a, b| b.cmp(a));
+                if let Some(notes) =
+                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                {
+                    for i in locals {
+                        if i < notes.len() {
+                            notes.remove(i);
+                        }
+                    }
                 }
-            }
-        }
-        self.sync_song_to_plugin_host();    }
+            },
+        );
+        self.sync_song_to_plugin_host();
+    }
 
     /// (FIXME #36) per-clip 声を設定。 Clip Inspector の 2 段 dropdown から
     /// `SetClipVoice` 経由で呼ばれる。 stable `ClipKey` で対象 clip を引き、
@@ -22878,6 +23219,82 @@ mod note_overlap_tests {
         assert_eq!(remap, vec![None, Some(0), Some(1)]);
         // 旧 selection [0,2] → 0 は削除で消え、2 は 1 へ。
         assert_eq!(remap_indices(&remap, &[0, 2]), vec![1]);
+    }
+}
+
+/// FIXME #93: 複数クリップ同時表示の packed note id 契約 (= cross-clip 編集の根幹)。
+/// id = `(clip_slot << 24) | (local_index & 0x00FF_FFFF)`。view が widget へ渡す id と
+/// handler が decode する id がこの 1 つの bit レイアウトを共有することで、 異なるクリップの
+/// note が衝突せず、 decode で正しいクリップ・正しい local index に解決される。
+#[cfg(test)]
+mod multiclip_pianoroll_id_tests {
+    use super::{AppData, ClipRef};
+
+    fn cr(track: u32, clip: u32) -> ClipRef {
+        ClipRef { track, clip }
+    }
+
+    #[test]
+    fn pack_decode_round_trip() {
+        for &(slot, idx) in &[
+            (0usize, 0usize),
+            (0, 5),
+            (1, 0),
+            (3, 42),
+            (255, 0x00FF_FFFF),
+        ] {
+            let packed = AppData::pack_note_id(slot, idx);
+            assert_eq!(AppData::note_id_clip_slot(packed), slot, "slot={slot} idx={idx}");
+            assert_eq!(AppData::note_id_local_index(packed), idx, "slot={slot} idx={idx}");
+        }
+    }
+
+    #[test]
+    fn pack_masks_index_to_24_bits() {
+        // 24 bit を超える index は下位 24 bit に丸め、 slot ビットを侵食しない。
+        let packed = AppData::pack_note_id(2, 0x0100_0000 + 7); // (2^24 + 7)
+        assert_eq!(AppData::note_id_clip_slot(packed), 2);
+        assert_eq!(AppData::note_id_local_index(packed), 7);
+    }
+
+    #[test]
+    fn slot_zero_packed_equals_local_index() {
+        // 単一クリップ (slot 0) では packed id == local index = 旧単一表示と byte 互換。
+        for idx in [0usize, 1, 100, 0x00FF_FFFF] {
+            assert_eq!(AppData::pack_note_id(0, idx), idx as u32);
+        }
+    }
+
+    #[test]
+    fn decode_routes_to_correct_clip_by_slot() {
+        // shown = [A(slot0), B(slot1), C(slot2)]。上位 8 bit が所属クリップを決める。
+        let shown = [cr(0, 0), cr(1, 2), cr(0, 5)];
+        assert_eq!(
+            AppData::decode_note_id_in(&shown, AppData::pack_note_id(0, 3)),
+            Some((cr(0, 0), 3))
+        );
+        assert_eq!(
+            AppData::decode_note_id_in(&shown, AppData::pack_note_id(1, 9)),
+            Some((cr(1, 2), 9))
+        );
+        assert_eq!(
+            AppData::decode_note_id_in(&shown, AppData::pack_note_id(2, 0)),
+            Some((cr(0, 5), 0))
+        );
+    }
+
+    #[test]
+    fn decode_out_of_range_slot_is_none() {
+        // shown に存在しない slot は None (= 集合縮小 / ロック後の stale id を握り潰す)。
+        let shown = [cr(0, 0), cr(1, 1)];
+        assert_eq!(
+            AppData::decode_note_id_in(&shown, AppData::pack_note_id(2, 0)),
+            None
+        );
+        assert_eq!(
+            AppData::decode_note_id_in(&shown, AppData::pack_note_id(255, 5)),
+            None
+        );
     }
 }
 

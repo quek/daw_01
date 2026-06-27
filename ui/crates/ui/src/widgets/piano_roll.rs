@@ -88,6 +88,28 @@ pub struct Note {
     /// (`muted_dim_fill`)、 斜線ハッチを重ねて「再生されない」 を示す。 caller は
     /// `Note.muted` をそのまま渡す。 `false` のとき描画は既存と完全一致。
     pub muted: bool,
+    /// FIXME #93 (daw_01): 複数クリップ同時表示でのノート毎の描画 / インタラクション属性。
+    /// `NoteStyle::default()` (= `color: None` / 非 dim / 非 locked) のとき描画と hit-test は
+    /// 既存と完全一致するので、単一クリップ表示や examples は default のままで挙動が変わらない。
+    pub style: NoteStyle,
+}
+
+/// FIXME #93 (daw_01): 複数クリップ同時ピアノロール編集での、ノート毎の描画 / インタラクション属性。
+///
+/// 既存 (単一クリップ) 挙動は `NoteStyle::default()` (全フィールド既定) で完全に再現されるため、
+/// 新フィールドを意識しない caller / examples は default を渡せばよい。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NoteStyle {
+    /// note の基底色。`Some(c)` = `c` を velocity で陰影付け (`shade_by_velocity`) して描画
+    /// (複数クリップをクリップ色で塗り分ける)。`None` = 既存どおり `PianoRollStyle::note_fill_fn`
+    /// (velocity → Color) を使う。
+    pub color: Option<Color>,
+    /// 対象 (target/active) でない background クリップの note。fill を grid 背景側へ寄せて
+    /// 淡色表示し、対象クリップを際立たせる。`muted` とは独立レイヤ (両方立てば二重に沈む)。
+    pub dimmed: bool,
+    /// lock されたクリップの note。描画はされるが **hit-test (`note_hit`) / marquee 選択から
+    /// 除外**され掴めない (参照専用ゴースト)。`dimmed` より強く沈める。
+    pub locked: bool,
 }
 
 /// move helper の delta タプル: (id, prev_start_beat, prev_pitch, next_start_beat, next_pitch)。
@@ -635,6 +657,53 @@ pub fn default_velocity_color(velocity: u8) -> Color {
     Color::rgba(0.35 + t * 0.35, 0.55 + t * 0.30, 0.85 + t * 0.10, 1.0)
 }
 
+/// FIXME #93 (daw_01): クリップ基底色 `base` を velocity で陰影付けする (hue は保ち明度のみ変える)。
+/// 低 velocity ほど暗く (係数 0.55..1.0)。`NoteStyle::color = Some` の note に使う。
+/// alpha は `base` を維持。`note_fill_fn` (velocity → 青の濃淡) のクリップ色版に相当。
+#[must_use]
+pub fn shade_by_velocity(base: Color, velocity: u8) -> Color {
+    let t = f32::from(velocity) / 127.0;
+    let k = 0.55 + t * 0.45;
+    Color::rgba(base.r * k, base.g * k, base.b * k, base.a)
+}
+
+/// FIXME #93: `color` を背景 `bg` 側へ `amount` (0..1) だけ寄せて淡色化する (lerp)。
+/// `amount=0` で `color` のまま、`1` で `bg`。非対象 (dimmed) / lock クリップの note を
+/// 沈めて対象クリップを際立たせるのに使う。alpha は不透明 (`bg` 上の grid 線が透けないよう) に保つ。
+#[must_use]
+pub fn dim_toward(color: Color, bg: Color, amount: f32) -> Color {
+    let a = amount.clamp(0.0, 1.0);
+    Color::rgba(
+        color.r + (bg.r - color.r) * a,
+        color.g + (bg.g - color.g) * a,
+        color.b + (bg.b - color.b) * a,
+        color.a,
+    )
+}
+
+/// FIXME #93: note の最終 fill を決める (color/dim/lock/mute を統合)。`draw_notes` と
+/// `draw_velocity_lane` が共有して描画一致を保証する。`bg` は dim の寄せ先 (grid 背景)。
+#[must_use]
+fn note_fill_color(note: &Note, note_fill_fn: NoteFillFn, bg: Color) -> Color {
+    let base = match note.style.color {
+        Some(c) => shade_by_velocity(c, note.velocity),
+        None => note_fill_fn(note.velocity),
+    };
+    // lock は dim より強く沈める (参照専用を明示)、次いで非対象 dimmed。
+    let base = if note.style.locked {
+        dim_toward(base, bg, 0.72)
+    } else if note.style.dimmed {
+        dim_toward(base, bg, 0.48)
+    } else {
+        base
+    };
+    if note.muted {
+        crate::widgets::muted_dim_fill(base)
+    } else {
+        base
+    }
+}
+
 impl Default for PianoRollStyle {
     fn default() -> Self {
         Self {
@@ -967,6 +1036,11 @@ fn note_hit_in(
     let mut hit_inside = false;
     let mut hit_edge_dist = f32::INFINITY;
     for note in visible {
+        // FIXME #93 (daw_01): lock されたクリップの note は参照専用ゴースト = hit-test から
+        // 除外して掴めなくする (描画はされる)。hover カーソルも note_hit_in 共有なので一致する。
+        if note.style.locked {
+            continue;
+        }
         let Some(kind) = note_zone_at(note, view, grid, cx, cy, edge) else {
             continue;
         };
@@ -2506,6 +2580,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     view_copy,
                     grid,
                     style_copy.note_fill_fn,
+                    style_copy.bg,
                     style_copy.note_border_radius_px,
                     style_copy.note_muted_hatch_color,
                     style_copy.note_muted_hatch_spacing_px,
@@ -2664,6 +2739,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 velocity: 96,
                 lyric: None,
                 muted: false,
+                style: NoteStyle::default(),
             };
             self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
         }
@@ -2843,6 +2919,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 velocity: 100,
                 lyric: None,
                 muted: false,
+                style: NoteStyle::default(),
             };
             self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
             // (FIXME #92) 入力完了後、 press 時に既定長ノートの右端へ warp した
@@ -2880,6 +2957,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let drag_rect = drag.rect();
                 let mut inside: Vec<NoteId> = Vec::new();
                 for n in visible {
+                    // FIXME #93 (daw_01): lock クリップの note は marquee 矩形選択からも除外。
+                    if n.style.locked {
+                        continue;
+                    }
                     let r = note_to_rect(n, view, grid);
                     if rects_intersect(r, drag_rect) {
                         inside.push(n.id);
@@ -3339,6 +3420,7 @@ fn draw_notes<M: ?Sized + 'static>(
     view: PianoRollView,
     grid: Rect,
     note_fill_fn: NoteFillFn,
+    bg: Color,
     radius_px: f32,
     muted_hatch_color: Color,
     muted_hatch_spacing_px: f32,
@@ -3359,13 +3441,8 @@ fn draw_notes<M: ?Sized + 'static>(
             w: x_right - x_left,
             h: y_bot - y_top,
         };
-        // FIXME #80 (daw_01): muted note は fill を暗く沈め、斜線ハッチを重ねる。
-        let base = note_fill_fn(note.velocity);
-        let fill = if note.muted {
-            crate::widgets::muted_dim_fill(base)
-        } else {
-            base
-        };
+        // FIXME #93/#80 (daw_01): クリップ色 (色 None なら velocity 色) → dim/lock 沈め → mute 沈め。
+        let fill = note_fill_color(note, note_fill_fn, bg);
         hctx.push_rect(note_rect_command(clipped, fill, radius_px));
         if note.muted {
             crate::widgets::push_muted_hatch(
@@ -3557,6 +3634,14 @@ fn draw_velocity_lane<M: ?Sized + 'static>(
         if cx + half_w < vel_area.x || cx - half_w > vel_area.x + vel_area.w {
             continue;
         }
+        // FIXME #93 (daw_01): bar はそのクリップの色 (色 None なら従来の velocity_bar_color)。
+        // バー高さが既に velocity を表すので velocity 陰影は掛けず、dim/lock のみ反映。
+        let bar_fill = match n.style.color {
+            Some(c) if n.style.locked => dim_toward(c, style.velocity_lane_bg, 0.72),
+            Some(c) if n.style.dimmed => dim_toward(c, style.velocity_lane_bg, 0.48),
+            Some(c) => c,
+            None => style.velocity_bar_color,
+        };
         hctx.push_rect(RectCommand {
             rect: Rect {
                 x: cx - half_w,
@@ -3564,7 +3649,7 @@ fn draw_velocity_lane<M: ?Sized + 'static>(
                 w: style.velocity_bar_width_px,
                 h: bar_h,
             },
-            fill: style.velocity_bar_color,
+            fill: bar_fill,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
@@ -3589,7 +3674,7 @@ mod tests {
     use daw_ui_renderer::Scene;
 
     fn note(id: NoteId, start: f64, len: f64, pitch: u8) -> Note {
-        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None, muted: false }
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None, muted: false, style: NoteStyle::default() }
     }
 
     fn test_view() -> PianoRollView {
@@ -3679,6 +3764,16 @@ mod tests {
         let (notes, view, grid) = make_test_setup();
         let hit = note_hit(&notes, view, grid, 200.0, 102.0, 4.0);
         assert_eq!(hit, Some((0, NoteDragKind::Move)));
+    }
+
+    #[test]
+    fn note_hit_excludes_locked_note() {
+        // FIXME #93 (daw_01): lock されたクリップの note は描画されても hit-test から除外され、
+        // 中央 (通常なら Move hit) でも掴めない (参照専用ゴースト)。
+        let (mut notes, view, grid) = make_test_setup();
+        notes[0].style.locked = true;
+        let hit = note_hit(&notes, view, grid, 200.0, 102.0, 4.0);
+        assert_eq!(hit, None, "lock note は中央でも hit しない");
     }
 
     #[test]
@@ -5609,6 +5704,7 @@ mod tests {
             velocity: 0,
             lyric: None,
             muted: false,
+            style: NoteStyle::default(),
         }];
         let (rects_off, _) = count_rects_with_view(v_off, &n_zero);
         let (rects_on, _) = count_rects_with_view(v_on, &n_zero);
@@ -6130,8 +6226,8 @@ mod tests {
         let mut host: UiHost<TestModel> = UiHost::no_redraw();
         // note 1: velocity 64, note 2: velocity 127
         let mut model = TestModel::new(vec![
-            Note { id: 1, start_beat: 0.5, len_beats: 0.5, pitch: 60, velocity: 64, lyric: None, muted: false },
-            Note { id: 2, start_beat: 1.0, len_beats: 0.5, pitch: 60, velocity: 127, lyric: None, muted: false },
+            Note { id: 1, start_beat: 0.5, len_beats: 0.5, pitch: 60, velocity: 64, lyric: None, muted: false, style: NoteStyle::default() },
+            Note { id: 2, start_beat: 1.0, len_beats: 0.5, pitch: 60, velocity: 127, lyric: None, muted: false, style: NoteStyle::default() },
         ]);
         model.selected = vec![1, 2];
         let mut view = test_view();
@@ -6862,6 +6958,7 @@ mod tests {
             velocity: 96,
             lyric: Some(Arc::from("x")),
             muted: false,
+            style: NoteStyle::default(),
         }]);
         model.selected = vec![0];
         let view = test_view();
@@ -6904,6 +7001,7 @@ mod tests {
             velocity: 96,
             lyric: Some(Arc::from("x")),
             muted: false,
+            style: NoteStyle::default(),
         }]);
         model.selected = vec![0];
         let view = test_view();
@@ -7024,7 +7122,7 @@ mod tests {
     // 化、 (6) lyric Arc identity の振る舞い (同 Arc clone は同 hash、 別 Arc::from は別 hash)。
 
     fn note_with_velocity(id: NoteId, start: f64, len: f64, pitch: u8, vel: u8) -> Note {
-        Note { id, start_beat: start, len_beats: len, pitch, velocity: vel, lyric: None, muted: false }
+        Note { id, start_beat: start, len_beats: len, pitch, velocity: vel, lyric: None, muted: false, style: NoteStyle::default() }
     }
 
     #[test]
@@ -7101,6 +7199,7 @@ mod tests {
             velocity: 96,
             lyric: Some(Arc::clone(&shared)),
             muted: false,
+            style: NoteStyle::default(),
         };
         let n1_dup = Note { lyric: Some(Arc::clone(&shared)), ..n1.clone() };
         // 同 Arc::clone → 同 pointer → 同 hash
@@ -7827,6 +7926,7 @@ mod tests {
             velocity: 96,
             lyric: None,
             muted: false,
+            style: NoteStyle::default(),
         }]);
         let view = test_view(); // scale = None
         let style = PianoRollStyle::default();
@@ -7892,6 +7992,7 @@ mod tests {
             velocity: 96,
             lyric: None,
             muted: false,
+            style: NoteStyle::default(),
         }]);
         let view = PianoRollView {
             scale: Some(scale_c_major(PianoRollScaleMode::Fold)),
