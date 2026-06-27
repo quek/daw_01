@@ -22,6 +22,13 @@ use crate::builtin;
 use crate::clap_plugin::ClapPlugin;
 use crate::vst3_plugin::Vst3Plugin;
 
+/// FIXME #90: builtin VOICEVOX の合成スレッドが状態遷移時に呼ぶ reporter。
+/// `(busy, failing)` を受け、plugin host が `PluginEvent::VoicevoxSynthStatus` に変換して
+/// daw_gui へ送る (= クリップ上スピナー / 全体オーバーレイ / engine 未接続警告の駆動)。
+/// `busy` = いま合成中、`failing` = 直近の HTTP 試行が失敗 (engine 未起動/起動途中)。
+/// 任意スレッド (= builtin の synth thread) から呼ばれるので `Send + Sync`。
+pub type VoicevoxStatusReporter = Box<dyn Fn(bool, bool) + Send + Sync>;
+
 /// One MIDI-style transition pushed into the next `process()` call.
 ///
 /// `note_id` (PR-V2.4) is the **stable per-note identifier** used to look
@@ -313,6 +320,11 @@ pub trait LoadedPlugin: Send {
     fn voicevox_synth_progress(&self) -> Option<(Arc<AtomicU64>, Arc<AtomicU64>)> {
         None
     }
+
+    /// FIXME #90: builtin VOICEVOX の合成状態 (busy / failing) を daw_gui へ継続報告する
+    /// callback を仕込む。plugin host が load 後 (plugin_id 確定後) に 1 度設定し、以後
+    /// synth thread が状態遷移ごとに呼ぶ。builtin VOICEVOX 以外は no-op。
+    fn set_voicevox_status_reporter(&mut self, _reporter: VoicevoxStatusReporter) {}
 
     // --- embedded Win32 GUI (plugin-main thread) ------------------------
     //

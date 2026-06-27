@@ -231,6 +231,12 @@ cargo test --workspace
 - **配置・操作性は build/clippy/test をすり抜ける**: §6 の自動検証では**絶対に分からない**。 必ず実機で
   目視する (できれば自分で起動)。 数値計算が合っていても描画結果がズレ/重なり/はみ出すことがある
   (`feedback_verify_actual_content`)。
+- **可変背景の上に標識を描くならコントラストを保証する** (`feedback_ui_indicator_contrast_on_variable_bg`):
+  クリップ色 / トラック色 / 波形の上に出すスピナー / バッジ / ドット / オーバーレイは、固定の白 (near-white)
+  や黒 (near-black) 単色だと **明クリップ上で白が・暗クリップ上で黒が沈んで見えない**。 暗い半透明バッキング
+  チップ + 明色標識 (idiom: `voicevox_overlay::draw_spinner_badge`) / 対比色の輪郭 / 背景輝度からの
+  auto-contrast のいずれかでコントラストを保証し、 **明るいクリップと暗いクリップの両方で目視** する
+  (`track_color` の明色プリセットで 1 つ着色して確認)。 color / contrast も build/clippy/test をすり抜ける。
 - **「上/下/近く/見づらい/やりにくい」等の配置 feedback は、 まず描画コードの y フロー・領域分割を Read してから直す**。
   どの領域 (scroll viewport / pinned band) のどの `y` に出ているかを特定してから動かす。
 

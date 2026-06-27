@@ -37,7 +37,7 @@ use common::voicevox::{
     BuiltinNoteSpec, BuiltinSynthOutput, synthesize_notes_for_builtin, synthesize_talk_for_builtin,
 };
 
-use crate::plugin_instance::{AuxInputBuf, LoadedPlugin, TimedNoteEvent};
+use crate::plugin_instance::{AuxInputBuf, LoadedPlugin, TimedNoteEvent, VoicevoxStatusReporter};
 
 /// `VoicevoxBuiltin` の persistent state (project file に bincode で埋め込み)。
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -174,6 +174,11 @@ pub struct VoicevoxBuiltin {
     /// 歌唱 bounce は `done >= queued` になるまで待って「最新メタデータの合成完了」を
     /// 保証する (stale な synth_result を完了と誤認しない)。
     synth_done_gen: Arc<AtomicU64>,
+    /// FIXME #90: synth thread の状態遷移 (busy / failing) を daw_gui へ報告する callback。
+    /// plugin host が load 後に `set_voicevox_status_reporter` で 1 度仕込む。synth thread は
+    /// このスロットを `lock()` して遷移時のみ呼ぶ (頻度は数秒に 1 回程度で Mutex で十分)。
+    /// `deactivate` 時の idle 報告にも使う (busy のまま overlay が残らないよう)。
+    status_reporter: Arc<Mutex<Option<VoicevoxStatusReporter>>>,
 
     // --- process state (audio thread) -----------------------------------
     /// 再生中 voice 群 (PR-V2.4)。 note_on で push、 wav 終端で自動 drain、
@@ -199,8 +204,33 @@ impl VoicevoxBuiltin {
             synth_result: Arc::new(ArcSwapOption::from(None)),
             synth_queued_gen: Arc::new(AtomicU64::new(0)),
             synth_done_gen: Arc::new(AtomicU64::new(0)),
+            status_reporter: Arc::new(Mutex::new(None)),
             active_voices: Vec::new(),
             was_playing: false,
+        }
+    }
+
+    /// FIXME #90: `status_reporter` が在れば `(busy, failing)` を報告する (= deactivate 時の
+    /// idle 報告などスレッド外から呼ぶ用、dedup なし)。
+    fn report_synth_status(reporter: &Mutex<Option<VoicevoxStatusReporter>>, busy: bool, failing: bool) {
+        if let Ok(g) = reporter.lock()
+            && let Some(r) = g.as_ref()
+        {
+            r(busy, failing);
+        }
+    }
+
+    /// FIXME #90: synth thread 用の dedup 付き状態報告。`last` と一致するときは送らない
+    /// (= 遷移時のみ daw_gui へ通知して無駄な IPC を避ける)。
+    fn synth_report(
+        reporter: &Mutex<Option<VoicevoxStatusReporter>>,
+        last: &mut Option<(bool, bool)>,
+        busy: bool,
+        failing: bool,
+    ) {
+        if *last != Some((busy, failing)) {
+            *last = Some((busy, failing));
+            Self::report_synth_status(reporter, busy, failing);
         }
     }
 
@@ -228,6 +258,8 @@ impl VoicevoxBuiltin {
         // 「retry pending」 にする。
         let coalesce = Arc::new(Mutex::new(None::<SynthJob>));
         let coalesce_recv = Arc::clone(&coalesce);
+        // FIXME #90: 合成状態 (busy / failing) を daw_gui へ報告する slot。
+        let status_reporter = Arc::clone(&self.status_reporter);
 
         let spawn_result = std::thread::Builder::new()
             .name("voicevox-builtin-synth".into())
@@ -245,6 +277,15 @@ impl VoicevoxBuiltin {
                 // 処理 thread: poll で coalesce slot を取り出して synth。
                 // 真面目に condvar するほどのレイテンシ要求は無い (歌詞編集
                 // から数百 ms ずれて synth 開始でも user 知覚しない)。
+                //
+                // FIXME #90: busy/failing の遷移時のみ daw_gui へ報告する (`synth_report`
+                // が dedup)。退出 (shutdown / sender drop) 時の idle 報告は
+                // `stop_synth_thread` が join 後に行う (= ここの `return` パスは必ず
+                // stop_synth_thread 経由)。`failing` は **成功するまで sticky** に保つ:
+                // synth 開始時は「直前の failing を維持」して報告するので、engine 未起動で
+                // 1.5s ごとに retry しても failing_since がリセットされず、daw_gui 側で 5s
+                // 閾値が貯まって「engine 未接続」警告に切り替わる。
+                let mut last_status: Option<(bool, bool)> = None;
                 let mut retry_after = std::time::Instant::now();
                 loop {
                     // shutdown 通知が来ていれば即 exit (= engine 未起動で
@@ -290,12 +331,18 @@ impl VoicevoxBuiltin {
                     {
                         result_arc.store(None);
                         done_gen.store(job.generation, Ordering::SeqCst);
+                        // 歌唱/読み上げ無し = 何も合成しない = idle。
+                        Self::synth_report(&status_reporter, &mut last_status, false, false);
                         continue;
                     }
                     // synth (= blocking HTTP) に入る直前に shutdown を再確認。
                     if shutdown.load(Ordering::SeqCst) {
                         return;
                     }
+                    // FIXME #90: ここから blocking HTTP 合成に入る = busy。failing は直前値を
+                    // 維持する (retry でリセットしない = engine 未起動で警告が貯まるように)。
+                    let prev_failing = last_status.is_some_and(|(_, f)| f);
+                    Self::synth_report(&status_reporter, &mut last_status, true, prev_failing);
                     // (FIXME #36) clip ごとに自分の speaker で合成し、 各 clip の
                     // mono WAV を **song-absolute なサンプル位置** に配置した 1 本の
                     // バッファを作る (clip 間のギャップ = 無音、 旧 single-WAV と同じ
@@ -412,6 +459,9 @@ impl VoicevoxBuiltin {
                             error = ?e,
                             "VoicevoxBuiltin: synth failed (engine 起動済? localhost:50021)"
                         );
+                        // FIXME #90: HTTP 失敗 = busy のまま failing。daw_gui は failing が
+                        // 一定時間続いたら「engine に接続できません」へ切り替える。
+                        Self::synth_report(&status_reporter, &mut last_status, true, true);
                         // engine 起動中で接続失敗の可能性が高いので、 job を
                         // coalesce slot に戻して 1.5s 後に retry (clip の 1 つでも
                         // 失敗したら job 全体を再試行 = 部分結果は保存しない)。
@@ -426,6 +476,11 @@ impl VoicevoxBuiltin {
                     } else if placed.is_empty() {
                         result_arc.store(None);
                         done_gen.store(job.generation, Ordering::SeqCst);
+                        // 合成は走ったが配置結果なし = 完了 (idle)。次 job が無ければ報告。
+                        let pending = coalesce.lock().map(|s| s.is_some()).unwrap_or(false);
+                        if !pending {
+                            Self::synth_report(&status_reporter, &mut last_status, false, false);
+                        }
                     } else {
                         // track 長 = max(placement + WAV 長)。 clip 間ギャップは 0 (無音)。
                         let total = placed
@@ -455,6 +510,12 @@ impl VoicevoxBuiltin {
                             speaker_groups = placed.len(),
                             "VoicevoxBuiltin: synth complete (per-speaker-group, song-absolute)"
                         );
+                        // FIXME #90: 合成完了 = idle。連続 flush で次 job が coalesce slot に
+                        // 既にあるなら busy のまま (= 報告しない、dedup で次 job 開始時に維持)。
+                        let pending = coalesce.lock().map(|s| s.is_some()).unwrap_or(false);
+                        if !pending {
+                            Self::synth_report(&status_reporter, &mut last_status, false, false);
+                        }
                     }
                 }
             });
@@ -488,6 +549,10 @@ impl VoicevoxBuiltin {
             // main thread 上にあるので audio thread から呼ばれることはない。
             let _ = handle.join();
         }
+        // FIXME #90: 停止したら必ず idle を報告する。 busy のまま deactivate
+        // (= export reinit / unload) すると daw_gui の overlay / clip スピナーが
+        // 残り続けるため。 GUI 側でも plugin unload で entry を消すが (二重防御)。
+        Self::report_synth_status(&self.status_reporter, false, false);
     }
 }
 
@@ -783,6 +848,18 @@ impl LoadedPlugin for VoicevoxBuiltin {
             Arc::clone(&self.synth_queued_gen),
             Arc::clone(&self.synth_done_gen),
         ))
+    }
+
+    /// FIXME #90: daw_gui への合成状態報告 callback を仕込む。plugin host が load 後に
+    /// 1 度設定し、以後 synth thread が busy/failing 遷移ごとに呼ぶ。設定直後に現在状態
+    /// (= queued>done なら busy) を 1 度 push して、 既に走っている synth を取りこぼさない。
+    fn set_voicevox_status_reporter(&mut self, reporter: VoicevoxStatusReporter) {
+        let busy = self.synth_queued_gen.load(Ordering::SeqCst)
+            > self.synth_done_gen.load(Ordering::SeqCst);
+        reporter(busy, false);
+        if let Ok(mut g) = self.status_reporter.lock() {
+            *g = Some(reporter);
+        }
     }
 
     // --- Embedded GUI (PR-V2.4 で speaker picker / progress bar) -----------
