@@ -157,15 +157,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // を発火する。 描画前に clamp し直して視覚的に無効値を防ぐ (= clip
     // が縮んだ等で view が clip 外に飛び出すケース)。
     let total_beats = clip.length_beats.max(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS);
-    let view_len_beats = if app.audio_editor_view_len_beats > 0.0 {
-        app.audio_editor_view_len_beats
+    let view_len_beats = if app.audio_editor_view_len_beats() > 0.0 {
+        app.audio_editor_view_len_beats()
             .clamp(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, total_beats)
     } else {
         total_beats
     };
     let max_view_start = (total_beats - view_len_beats).max(0.0);
     let view_start_beat = app
-        .audio_editor_view_start_beat
+        .audio_editor_view_start_beat()
         .clamp(0.0, max_view_start);
 
     // ----- Ruler (MIDI エディタ同様、 song 全体の絶対 bar 番号を表示) -
