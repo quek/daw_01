@@ -16,22 +16,16 @@ use std::time::Duration;
 
 use daw_ui_core::Ui;
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{Color, Rect, theme};
 
 use crate::app::AppData;
 
-const BG: Color = Color { r: 0.16, g: 0.16, b: 0.20, a: 0.94 };
-const BG_WARN: Color = Color { r: 0.24, g: 0.15, b: 0.10, a: 0.96 };
-const TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const SPINNER: Color = Color { r: 0.45, g: 0.72, b: 0.95, a: 1.0 };
-const WARN: Color = Color { r: 0.97, g: 0.74, b: 0.30, a: 1.0 };
-const WARN_SUB: Color = Color { r: 0.80, g: 0.64, b: 0.44, a: 1.0 };
-
-/// `draw_spinner_badge` のバッキングチップ (暗・半透明) と前景スピナー (明) の色。
-/// 可変背景 (クリップ色・波形) 上でも、暗チップが明背景から、明スピナーが暗チップから
-/// 浮くので **どのクリップ色でもコントラストが保証**される。
-const BADGE_BG: Color = Color { r: 0.05, g: 0.05, b: 0.08, a: 0.66 };
-const BADGE_SPINNER: Color = Color { r: 0.97, g: 0.98, b: 1.0, a: 1.0 };
+// FIXME #88 テーマ SSoT に準拠 (call site で Color::rgb ベタ書きしない)。load_overlay と
+// 同じ非モーダル progress カード idiom: elevation-2 の PANEL_RAISED を alpha 0.94 で透過。
+const OVERLAY_BG: Color = theme::PANEL_RAISED.with_alpha(0.94);
+/// クリップ上バッジの暗い scrim。どのクリップ色 (明/暗) の上でも前景スピナーを浮かせる。
+/// BACKDROP (寒色の暗幕) を小バッジ向けに少し濃くする。
+const BADGE_BG: Color = theme::BACKDROP.with_alpha(0.74);
 
 /// スピナー 1 回転の周期。
 pub const SPINNER_PERIOD: Duration = Duration::from_millis(900);
@@ -93,33 +87,35 @@ fn draw_progress_panel(
     let h = PAD * 2.0 + n * LINE_H;
     let x = ((screen.width as f32) - PANEL_W) * 0.5;
     let y = base_y;
-    ui.panel("vox_overlay_bg", Rect { x, y, w: PANEL_W, h }, BG, 6.0);
+    ui.panel("vox_overlay_bg", Rect { x, y, w: PANEL_W, h }, OVERLAY_BG, 6.0);
 
     let spin_cx = x + PAD + 9.0;
     let spin_cy = y + h * 0.5;
-    draw_spinner(ui, "vox_overlay_spin", spin_cx, spin_cy, 9.0, phase, SPINNER);
+    // 進捗系インタラクションは accent (= theme で progress fill に統一)。暗カード上なので可視。
+    draw_spinner(ui, "vox_overlay_spin", spin_cx, spin_cy, 9.0, phase, theme::ACCENT);
 
     let text_x = x + PAD + 28.0;
     let mut ty = y + PAD;
     for (i, line) in lines.iter().enumerate() {
-        ui.label_at(("vox_overlay_line", i), line, text_x, ty, FONT, TEXT);
+        ui.label_at(("vox_overlay_line", i), line, text_x, ty, FONT, theme::TEXT);
         ty += LINE_H;
     }
 }
 
-/// engine 未接続の static 警告パネル (amber)。再描画は止まっているので回転なし。
+/// engine 未接続の static 警告パネル。再描画は止まっているので回転なし。面は寒色 panel の
+/// まま、警告は theme の warning-yellow (`SOLO`) のドット + 見出しで伝える (彩度は機能色だけ)。
 fn draw_warning_panel(ui: &mut Ui<'_, AppData>, screen: PhysicalSize, base_y: f32) {
     let h = PAD * 2.0 + 2.0 * LINE_H;
     let x = ((screen.width as f32) - PANEL_W) * 0.5;
     let y = base_y;
-    ui.panel("vox_overlay_bg", Rect { x, y, w: PANEL_W, h }, BG_WARN, 6.0);
+    ui.panel("vox_overlay_bg", Rect { x, y, w: PANEL_W, h }, OVERLAY_BG, 6.0);
 
-    // 静的な amber ドット (= 警告アイコン代わり、font glyph 非依存)。
+    // 静的な警告ドット (= アイコン代わり、font glyph 非依存)。
     let dot_r = 5.0;
     ui.panel(
         "vox_overlay_warn_dot",
         Rect { x: x + PAD + 9.0 - dot_r, y: y + PAD + dot_r, w: dot_r * 2.0, h: dot_r * 2.0 },
-        WARN,
+        theme::SOLO,
         dot_r,
     );
 
@@ -130,7 +126,7 @@ fn draw_warning_panel(ui: &mut Ui<'_, AppData>, screen: PhysicalSize, base_y: f3
         text_x,
         y + PAD,
         FONT,
-        WARN,
+        theme::SOLO,
     );
     ui.label_at(
         "vox_overlay_warn_sub",
@@ -138,7 +134,7 @@ fn draw_warning_panel(ui: &mut Ui<'_, AppData>, screen: PhysicalSize, base_y: f3
         text_x,
         y + PAD + LINE_H,
         FONT,
-        WARN_SUB,
+        theme::TEXT_DIM,
     );
 }
 
@@ -197,7 +193,8 @@ pub fn draw_spinner_badge(
         BADGE_BG,
         chip, // radius = 半径 → 円
     );
-    draw_spinner(ui, id, cx, cy, radius, phase, BADGE_SPINNER);
+    // 暗チップの上は最大コントラストの crisp near-white (theme token) で、どのクリップ色でも視認。
+    draw_spinner(ui, id, cx, cy, radius, phase, theme::TEXT_ON_ACCENT);
 }
 
 /// 経過時間 → スピナー位相 `[0,1)`。`period` で 1 回転。純関数 (テスト可能)。
