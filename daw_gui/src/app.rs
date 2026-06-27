@@ -1463,15 +1463,13 @@ pub struct AppData {
     /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
     /// 系操作で「マウス位置を cursor として使う」 ために保持する。
     pub audio_editor_hover_beat_in_clip: Option<f64>,
-    /// Audio Editor の表示開始位置 (clip 始端からの offset、 beats 単位)。
-    /// `OpenAudioEditor` で 0 にリセット、 wheel scroll / Ctrl+wheel zoom で
-    /// 更新。 view 範囲は `[view_start_beat, view_start_beat + view_len_beats]`
-    /// で、 0 ≤ view_start ≤ clip.length - view_len をホスト側で clamp。
-    pub audio_editor_view_start_beat: f64,
-    /// Audio Editor の表示 span (beats 単位)。 `OpenAudioEditor` で
-    /// `clip.length_beats` にリセット (= 全体表示)。 Ctrl+wheel で zoom
-    /// 倍率変更、 最小 `MIN_AUDIO_EDITOR_VIEW_LEN_BEATS` で clamp。
-    pub audio_editor_view_len_beats: f64,
+    /// FIXME #87: Audio Editor の表示状態を **クリップごと** (`ClipKey`) に記憶する
+    /// (Ableton Live / Bitwig 流)。 entry が無い (= 初回) クリップは
+    /// `open_audio_editor` がクリップ全長を見せる初期 view を入れる。 値域は
+    /// `audio_editor_view_state` / `set_audio_editor_*` 経由で読み書きし、 描画前に
+    /// clip 長で clamp する。 `ViewState.audio_editor_views` として永続化される。
+    pub audio_editor_views:
+        std::collections::HashMap<common::model::ClipKey, common::model::AudioEditorViewState>,
     pub arrange_zoom_x: f32,
     pub arrange_scroll_beat: f32,
     /// arrangement の縦 scroll offset (px、 smooth)。 `0.0` で first track
@@ -1519,10 +1517,16 @@ pub struct AppData {
     /// 開いた行の直下に確保する展開高に使う (lag-by-one、 `inspector_body_h` と同 idiom)。
     /// session-only。
     pub inspector_device_panel_h: f32,
-    pub pianoroll_zoom_x: f32,
-    pub pianoroll_zoom_y: f32,
-    pub pianoroll_top_pitch: u8,
-    pub pianoroll_scroll_beat: f32,    /// FL Studio の smart length 互換: 直近に作成 / リサイズ / クリック選択した
+    /// FIXME #87: ピアノロールの表示状態を **クリップごと** (`ClipKey`) に記憶する
+    /// (Ableton Live / Bitwig 流)。 旧来のフラットな `pianoroll_zoom_x` 等は撤去し、
+    /// `selected_clip` (= 現在ピアノロールで開いているクリップの `ClipKey`) で引く
+    /// accessor (`pianoroll_zoom_x()` / `pianoroll_zoom_y()` / `pianoroll_top_pitch()` /
+    /// `pianoroll_scroll_beat()`) に一本化した (= 重複所有を作らない、 SSoT)。 entry が
+    /// 無い (= 初回選択) クリップは `select_clip` が `fit_piano_roll_to_clip` で埋める。
+    /// `ViewState.piano_roll_views` として永続化される。
+    pub piano_roll_views:
+        std::collections::HashMap<common::model::ClipKey, common::model::PianoRollViewState>,
+    /// FL Studio の smart length 互換: 直近に作成 / リサイズ / クリック選択した
     /// ノートの長さ (拍)。次の新規追加時のデフォルト長として使う。session 内
     /// in-memory のみ、永続化はしない。`add_note` / `resize_notes` /
     /// `SetNoteSelection` ハンドラで更新。
@@ -2224,8 +2228,7 @@ impl AppData {
             audio_editor_clip: None,
             audio_editor_selected_events: Vec::new(),
             audio_editor_hover_beat_in_clip: None,
-            audio_editor_view_start_beat: 0.0,
-            audio_editor_view_len_beats: 0.0,
+            audio_editor_views: std::collections::HashMap::new(),
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
             arrange_scroll_beat: 0.0,
             arrange_track_top: 0.0,
@@ -2233,10 +2236,8 @@ impl AppData {
             arrange_header_w: 160.0,
             inspector_body_h: 800.0,
             inspector_device_panel_h: 0.0,
-            pianoroll_zoom_x: 64.0,
-            pianoroll_zoom_y: 14.0,
-            pianoroll_top_pitch: 84, // C6
-            pianoroll_scroll_beat: 0.0,            last_note_duration_beats: DEFAULT_NOTE_DURATION,
+            piano_roll_views: std::collections::HashMap::new(),
+            last_note_duration_beats: DEFAULT_NOTE_DURATION,
             preview_note: None,
             pianoroll_snap_enabled: true,
             pianoroll_snap_choice: crate::view::snap::CHOICE_PIANOROLL_DEFAULT,
@@ -6437,16 +6438,24 @@ impl AppData {
                 self.arrange_zoom_x = zoom.clamp(2.0, 400.0);
             }
             AppEvent::SetPianoRollScrollX(scroll) => {
-                self.pianoroll_scroll_beat = scroll.max(0.0);
+                if let Some(v) = self.piano_roll_view_entry() {
+                    v.scroll_beat = scroll.max(0.0);
+                }
             }
             AppEvent::SetPianoRollTopPitch(p) => {
-                self.pianoroll_top_pitch = p.clamp(11, 127);
+                if let Some(v) = self.piano_roll_view_entry() {
+                    v.top_pitch = p.clamp(11, 127);
+                }
             }
             AppEvent::SetPianoRollZoomX(zoom) => {
-                self.pianoroll_zoom_x = zoom.clamp(8.0, 400.0);
+                if let Some(v) = self.piano_roll_view_entry() {
+                    v.zoom_x = zoom.clamp(8.0, 400.0);
+                }
             }
             AppEvent::SetPianoRollZoomY(zoom) => {
-                self.pianoroll_zoom_y = zoom.clamp(6.0, 40.0);
+                if let Some(v) = self.piano_roll_view_entry() {
+                    v.zoom_y = zoom.clamp(6.0, 40.0);
+                }
             }
             AppEvent::SetLoopRange { start, end } => {
                 self.set_loop_range(start, end);
@@ -7484,6 +7493,9 @@ impl AppData {
         self.collapsed_groups.clear();
         self.selected_clip = None;
         self.selected_notes.clear();
+        // FIXME #87: 新規プロジェクトでは前プロジェクトの per-clip view を漏らさずクリア
+        // (globals は現状維持 = 従来挙動)。`None` 経路 = action_open_path の旧ファイルと同じ。
+        self.restore_view_state(None);
         self.resize_track_peak_display();
         // sync 前に migrated vocal track の builtin VOICEVOX を SetSlotPlugin
         // で plugin host に load 要求する (= restore_plugin_from_song と同
@@ -7660,8 +7672,9 @@ impl AppData {
             );
             return;
         }
-        match common::project::load(&path) {
-            Ok(mut song) => {
+        match common::project::load_project(&path) {
+            Ok(loaded) => {
+                let (mut song, view) = (loaded.song, loaded.view);
                 tracing::info!(path = %path.display(), "loaded project");
                 song.ensure_ids();
                 Self::migrate_legacy_vocal_tracks(&mut song);
@@ -7681,6 +7694,14 @@ impl AppData {
                 self.collapsed_groups.clear();
                 self.selected_clip = None;
                 self.selected_notes.clear();
+                // FIXME #87: 保存済みの表示状態 (ズーム / スクロール / per-clip view / 選択
+                // クリップ) を復元。`None` (旧ファイル / view 未保存) なら per-clip map をクリア
+                // するだけで globals は現状維持 = 従来の fit-to-content 挙動。
+                self.restore_view_state(view);
+                // 復元した選択クリップのトラックを追従選択 (= select_clip と同じ文脈復元)。
+                if let Some(r) = self.selected_clip_ref() {
+                    self.select_track(r.track);
+                }
                 self.resize_track_peak_display();
                 self.sync_song_to_plugin_host();
                 self.resync_song_edit_texts();
@@ -7810,7 +7831,10 @@ impl AppData {
             }
         };
 
-        match common::project::save(&autosave_path, &self.song) {
+        // FIXME #87: autosave も表示状態を同梱する (= ダーティでなくても view が
+        // 永続化される → スクロール/ズーム変更が `*` を立てずに次回 open で復元される)。
+        let view = self.snapshot_view_state();
+        match common::project::save_project(&autosave_path, &self.song, Some(&view)) {
             Ok(()) => {
                 tracing::info!(path = %autosave_path.display(), "autosaved");
                 self.last_autosave = std::time::Instant::now();
@@ -7909,7 +7933,7 @@ impl AppData {
     /// なら元 `<x>.daw` を file_path にセット、 recovery_dir 内 (`<uuid>.autosave.daw`)
     /// なら file_path = None (新規プロジェクト扱い、 ユーザーが Save As)。
     fn restore_recovery(&mut self, autosave_path: PathBuf) {
-        let Ok(mut song) = common::project::load(&autosave_path) else {
+        let Ok(loaded) = common::project::load_project(&autosave_path) else {
             tracing::error!(
                 path = %autosave_path.display(),
                 "failed to load recovery file"
@@ -7918,6 +7942,7 @@ impl AppData {
                 format!("復元失敗: {}", autosave_path.display());
             return;
         };
+        let (mut song, view) = (loaded.song, loaded.view);
         song.ensure_ids();
         self.restore_plugin_from_song(&song);
         self.song = song;
@@ -7929,6 +7954,11 @@ impl AppData {
         self.collapsed_groups.clear();
         self.selected_clip = None;
         self.selected_notes.clear();
+        // FIXME #87: recovery も表示状態 + 選択クリップを復元 (autosave が view を書いている)。
+        self.restore_view_state(view);
+        if let Some(r) = self.selected_clip_ref() {
+            self.select_track(r.track);
+        }
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         self.resync_song_edit_texts();
@@ -8694,7 +8724,10 @@ impl AppData {
             ),
             None => (Vec::new(), Vec::new()),
         };
-        match common::project::save(&path, &snapshot) {
+        // FIXME #87: 現在の表示状態を同梱して保存する (snapshot は楽曲のみ凍結、
+        // view は presentation なので保存実行時の live を採るので十分)。
+        let view = self.snapshot_view_state();
+        match common::project::save_project(&path, &snapshot, Some(&view)) {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "saved project");
                 // serialize 成功 → 破壊的 migration を確定する。 まず snapshot 由来の
@@ -13660,6 +13693,161 @@ impl AppData {
         self.selected_clip.and_then(|k| self.clip_ref_of(k))
     }
 
+    // -------- FIXME #87: per-clip piano roll / audio editor view 状態 --------
+
+    /// 現在ピアノロールで開いている (= 選択 anchor) クリップの表示状態。
+    /// entry が無ければ `PianoRollViewState::default()` (= 64/14/84/0)。
+    pub fn piano_roll_view_state(&self) -> common::model::PianoRollViewState {
+        self.selected_clip
+            .and_then(|k| self.piano_roll_views.get(&k).copied())
+            .unwrap_or_default()
+    }
+
+    /// 選択 anchor クリップの piano roll view を可変で得る (無ければ default を挿入)。
+    /// 選択クリップが無いときは `None` (= 書き込み先が無いので no-op)。
+    fn piano_roll_view_entry(&mut self) -> Option<&mut common::model::PianoRollViewState> {
+        let key = self.selected_clip?;
+        Some(self.piano_roll_views.entry(key).or_default())
+    }
+
+    /// ピアノロール横ズーム (px/beat)。view 層はこの accessor 経由で読む。
+    pub fn pianoroll_zoom_x(&self) -> f32 {
+        self.piano_roll_view_state().zoom_x
+    }
+    /// ピアノロール縦ズーム (px/semitone)。
+    pub fn pianoroll_zoom_y(&self) -> f32 {
+        self.piano_roll_view_state().zoom_y
+    }
+    /// ピアノロール表示上端ピッチ (MIDI note)。
+    pub fn pianoroll_top_pitch(&self) -> u8 {
+        self.piano_roll_view_state().top_pitch
+    }
+    /// ピアノロール横スクロール (clip-local beats)。
+    pub fn pianoroll_scroll_beat(&self) -> f32 {
+        self.piano_roll_view_state().scroll_beat
+    }
+
+    /// 現在 Audio Editor で開いているクリップの表示状態 (`audio_editor_clip` で解決)。
+    /// entry が無ければ default (`{0,0}` = 「未設定」、view 側でクリップ全長表示に倒れる)。
+    pub fn audio_editor_view_state(&self) -> common::model::AudioEditorViewState {
+        self.audio_editor_clip
+            .and_then(|r| self.clip_key_of(r))
+            .and_then(|k| self.audio_editor_views.get(&k).copied())
+            .unwrap_or_default()
+    }
+    /// Audio Editor 表示開始位置 (clip-relative beats)。
+    pub fn audio_editor_view_start_beat(&self) -> f64 {
+        self.audio_editor_view_state().start_beat
+    }
+    /// Audio Editor 表示 span (beats、`0.0` = クリップ全体)。
+    pub fn audio_editor_view_len_beats(&self) -> f64 {
+        self.audio_editor_view_state().len_beats
+    }
+
+    /// FIXME #87: 現在の表示状態 (ズーム / スクロール / 行高 / スナップ等 + per-clip view) を
+    /// `ViewState` にスナップショットする。 save / autosave 時に呼ぶ。 per-clip map は
+    /// 現存しないクリップの orphan entry を GC して書き出す。
+    pub fn snapshot_view_state(&self) -> common::model::ViewState {
+        let mut expanded: Vec<u32> = self.expanded_automation_tracks.iter().copied().collect();
+        expanded.sort_unstable();
+        let mut piano_roll_views: Vec<(common::model::ClipKey, common::model::PianoRollViewState)> =
+            self.piano_roll_views
+                .iter()
+                .filter(|(k, _)| self.clip_ref_of(**k).is_some())
+                .map(|(k, v)| (*k, *v))
+                .collect();
+        piano_roll_views.sort_by_key(|(k, _)| (k.track_id, k.clip_id));
+        let mut audio_editor_views: Vec<(
+            common::model::ClipKey,
+            common::model::AudioEditorViewState,
+        )> = self
+            .audio_editor_views
+            .iter()
+            .filter(|(k, _)| self.clip_ref_of(**k).is_some())
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        audio_editor_views.sort_by_key(|(k, _)| (k.track_id, k.clip_id));
+        common::model::ViewState {
+            arrange_zoom_x: self.arrange_zoom_x,
+            arrange_scroll_beat: self.arrange_scroll_beat,
+            arrange_track_top: self.arrange_track_top,
+            arrange_track_row_h: self.arrange_track_row_h,
+            arrange_header_w: self.arrange_header_w,
+            track_row_overrides: self.track_row_overrides.clone(),
+            expanded_automation_tracks: expanded,
+            master_row_automation_expanded: self.master_row_automation_expanded,
+            arrange_snap_enabled: self.arrange_snap_enabled,
+            arrange_snap_choice: self.arrange_snap_choice,
+            pianoroll_snap_enabled: self.pianoroll_snap_enabled,
+            pianoroll_snap_choice: self.pianoroll_snap_choice,
+            piano_roll_fold: self.piano_roll_fold,
+            snap_on_draw: self.snap_on_draw,
+            snap_live_input: self.snap_live_input,
+            bottom_panel: self.bottom_panel,
+            // 開いていたクリップを復元できるよう選択も保存 (現存クリップのみ)。
+            selected_clip: self.selected_clip.filter(|k| self.clip_ref_of(*k).is_some()),
+            selected_clips: self
+                .selected_clips
+                .iter()
+                .copied()
+                .filter(|k| self.clip_ref_of(*k).is_some())
+                .collect(),
+            piano_roll_views,
+            audio_editor_views,
+        }
+    }
+
+    /// FIXME #87: load 時に `ViewState` を AppData へ流し込む。 別プロジェクトの per-clip
+    /// view が漏れないよう **必ず先に map をクリア**。 `None` (旧ファイル / view 未保存) なら
+    /// globals は現状維持 (= 従来の fit-to-content / 既定値挙動)。 全値を有効域へ clamp して
+    /// 壊れた / 古い保存値を吸収する。
+    pub fn restore_view_state(&mut self, view: Option<common::model::ViewState>) {
+        self.piano_roll_views.clear();
+        self.audio_editor_views.clear();
+        let Some(v) = view else { return };
+        let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
+        self.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);
+        self.arrange_scroll_beat = v.arrange_scroll_beat.max(0.0);
+        self.arrange_track_top = v.arrange_track_top.max(0.0);
+        self.arrange_track_row_h = v.arrange_track_row_h.clamp(16.0, 2000.0);
+        self.arrange_header_w = v.arrange_header_w.clamp(80.0, 480.0);
+        self.track_row_overrides = v
+            .track_row_overrides
+            .into_iter()
+            .map(|(k, h)| (k, h.max(16)))
+            .collect();
+        self.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
+        self.master_row_automation_expanded = v.master_row_automation_expanded;
+        self.arrange_snap_enabled = v.arrange_snap_enabled;
+        self.arrange_snap_choice = v.arrange_snap_choice.min(max_choice);
+        self.pianoroll_snap_enabled = v.pianoroll_snap_enabled;
+        self.pianoroll_snap_choice = v.pianoroll_snap_choice.min(max_choice);
+        self.piano_roll_fold = v.piano_roll_fold;
+        self.snap_on_draw = v.snap_on_draw;
+        self.snap_live_input = v.snap_live_input;
+        self.bottom_panel = v.bottom_panel;
+        // 開いていたクリップ選択を復元 (現存しない stale key は除外)。 これでピアノロールが
+        // 開き直し直後に「前回編集していたクリップ」をその per-clip view で表示する。
+        self.selected_clips = v
+            .selected_clips
+            .into_iter()
+            .filter(|k| self.clip_ref_of(*k).is_some())
+            .collect();
+        self.selected_clip = v.selected_clip.filter(|k| self.clip_ref_of(*k).is_some());
+        for (k, mut pv) in v.piano_roll_views {
+            pv.zoom_x = pv.zoom_x.clamp(8.0, 400.0);
+            pv.zoom_y = pv.zoom_y.clamp(6.0, 40.0);
+            pv.top_pitch = pv.top_pitch.clamp(11, 127);
+            pv.scroll_beat = pv.scroll_beat.max(0.0);
+            self.piano_roll_views.insert(k, pv);
+        }
+        for (k, mut av) in v.audio_editor_views {
+            av.start_beat = av.start_beat.max(0.0);
+            av.len_beats = av.len_beats.max(0.0);
+            self.audio_editor_views.insert(k, av);
+        }
+    }
+
     /// 選択集合 (`selected_clips`) を現在の `ClipRef` 群へ解決 (解決でき
     /// ない stale key は除外)。 owned `Vec` を返す。
     pub fn selected_clip_refs(&self) -> Vec<ClipRef> {
@@ -13811,9 +13999,13 @@ impl AppData {
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
         }
-        // クリップが新しく primary になったらピアノロールを auto-fit。
-        // 同 clip 再選択でも fit し直す (ノート編集で範囲が変わることがある)。
-        if primary.is_some() {
+        // FIXME #87: per-clip view を記憶するので、初めて開くクリップ (= entry 無し)
+        // のときだけ auto-fit する。 既に記憶があれば draw が `piano_roll_views` を
+        // 読んで前回の zoom/scroll を復元する (= 再選択で view が飛ばない)。 明示的な
+        // 再 fit は `X` キー / Fit ボタン (`FitPianoRollToClip`)。
+        if let Some(p) = primary
+            && !self.piano_roll_views.contains_key(&p)
+        {
             self.fit_piano_roll_to_clip();
         }
     }
@@ -13829,7 +14021,10 @@ impl AppData {
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
         }
-        if primary.is_some() {
+        // FIXME #87: 初回 (entry 無し) のみ fit。 記憶があれば復元 (select_clip と同方針)。
+        if let Some(p) = primary
+            && !self.piano_roll_views.contains_key(&p)
+        {
             self.fit_piano_roll_to_clip();
         }
     }
@@ -14026,6 +14221,7 @@ impl AppData {
     /// Edit 内で再実行される (初回 fit 喪失バグの修正、 [piano_roll_view::draw] 参照)。
     fn fit_piano_roll_to_clip(&mut self) {
         let Some(target) = self.selected_clip_ref() else { return };
+        let Some(key) = self.clip_key_of(target) else { return };
         let Some(track) = self.song.tracks.get(target.track as usize) else { return };
         let Some(clip) = track.clips.get(target.clip as usize) else { return };
         let (grid_w, grid_h) = self.last_pianoroll_grid_size;
@@ -14035,12 +14231,14 @@ impl AppData {
         }
 
         let notes = self.song.clip_notes(clip);
-        if notes.is_empty() {
-            self.pianoroll_scroll_beat = 0.0;
-            self.pianoroll_zoom_x =
-                (grid_w / clip.length_beats.max(1.0) as f32).clamp(8.0, 400.0);
-            self.pianoroll_top_pitch = 84;
-            self.pianoroll_zoom_y = 14.0;
+        // FIXME #87: fit 結果は per-clip view (`piano_roll_views[key]`) に書く。
+        let fitted = if notes.is_empty() {
+            common::model::PianoRollViewState {
+                scroll_beat: 0.0,
+                zoom_x: (grid_w / clip.length_beats.max(1.0) as f32).clamp(8.0, 400.0),
+                top_pitch: 84,
+                zoom_y: 14.0,
+            }
         } else {
             let min_beat = notes
                 .iter()
@@ -14056,11 +14254,15 @@ impl AppData {
             let span_beats = (max_beat - min_beat + 2.0).max(1.0);
             let span_pitch = (i32::from(max_pitch) - i32::from(min_pitch) + 4).max(4);
 
-            self.pianoroll_scroll_beat = (min_beat - 1.0).max(0.0) as f32;
-            self.pianoroll_zoom_x = (f64::from(grid_w) / span_beats).clamp(8.0, 400.0) as f32;
-            self.pianoroll_top_pitch = (i32::from(max_pitch) + 2).clamp(11, 127) as u8;
-            self.pianoroll_zoom_y = (grid_h / span_pitch as f32).clamp(6.0, 40.0);
-        }    }
+            common::model::PianoRollViewState {
+                scroll_beat: (min_beat - 1.0).max(0.0) as f32,
+                zoom_x: (f64::from(grid_w) / span_beats).clamp(8.0, 400.0) as f32,
+                top_pitch: (i32::from(max_pitch) + 2).clamp(11, 127) as u8,
+                zoom_y: (grid_h / span_pitch as f32).clamp(6.0, 40.0),
+            }
+        };
+        self.piano_roll_views.insert(key, fitted);
+    }
 
     /// 親 group chain のいずれかが `collapsed_groups` に含まれる (= 折り畳まれた
     /// group の配下で hide される) か。 arrangement widget の `is_visible_track`
@@ -15629,42 +15831,56 @@ impl AppData {
         }
         self.audio_editor_clip = Some(target);
         self.bottom_panel = 1;
-        // 開いた clip 全体を見せる初期 view (= 既存挙動と等価)。 wheel
-        // scroll / Ctrl+wheel zoom で以降は view_start / view_len を変更。
-        let len_beats = self
-            .song
-            .tracks
-            .get(target.track as usize)
-            .and_then(|t| t.clips.get(target.clip as usize))
-            .map_or(0.0, |c| c.length_beats);
-        self.audio_editor_view_start_beat = 0.0;
-        self.audio_editor_view_len_beats = len_beats.max(0.0);
+        // FIXME #87: per-clip 記憶。 初回 (entry 無し) のクリップだけ「全体表示」の初期 view を
+        // 入れる。 既に記憶があればその view を復元 (= map をそのまま読む)。
+        let Some(key) = self.clip_key_of(target) else { return };
+        if !self.audio_editor_views.contains_key(&key) {
+            let len_beats = self
+                .song
+                .tracks
+                .get(target.track as usize)
+                .and_then(|t| t.clips.get(target.clip as usize))
+                .map_or(0.0, |c| c.length_beats);
+            self.audio_editor_views.insert(
+                key,
+                common::model::AudioEditorViewState {
+                    start_beat: 0.0,
+                    len_beats: len_beats.max(0.0),
+                },
+            );
+        }
     }
 
     fn close_audio_editor(&mut self) {
+        // FIXME #87: view 状態は `audio_editor_views` に残す (= 次回 open で復元)。
         self.audio_editor_clip = None;
         self.audio_editor_selected_events.clear();
         self.audio_editor_hover_beat_in_clip = None;
-        self.audio_editor_view_start_beat = 0.0;
-        self.audio_editor_view_len_beats = 0.0;
     }
 
     /// Audio Editor 水平 scroll: `view_start_beat` を `[0, total - view_len]`
     /// で clamp。 `audio_editor_clip` が None / clip が解決できない場合は no-op。
     fn set_audio_editor_scroll(&mut self, new_start: f64) {
         let Some(target) = self.audio_editor_clip else { return };
-        let Some(clip) = self
+        let Some(key) = self.clip_key_of(target) else { return };
+        let Some(total) = self
             .song
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.length_beats.max(0.0))
         else {
             return;
         };
-        let total = clip.length_beats.max(0.0);
-        let view_len = self.audio_editor_view_len_beats.max(0.0).min(total);
+        // entry 無し = まだ全体表示 → view_len は total 扱い。
+        let view_len = self
+            .audio_editor_views
+            .get(&key)
+            .map_or(total, |v| v.len_beats)
+            .max(0.0)
+            .min(total);
         let max_start = (total - view_len).max(0.0);
-        self.audio_editor_view_start_beat = new_start.clamp(0.0, max_start);
+        self.audio_editor_views.entry(key).or_default().start_beat = new_start.clamp(0.0, max_start);
     }
 
     /// Audio Editor zoom: `view_start_beat` + `view_len_beats` を一括設定。
@@ -15672,19 +15888,21 @@ impl AppData {
     /// `view_start` は `[0, clip.length - view_len]` で clamp。
     fn set_audio_editor_zoom(&mut self, new_start: f64, new_len: f64) {
         let Some(target) = self.audio_editor_clip else { return };
-        let Some(clip) = self
+        let Some(key) = self.clip_key_of(target) else { return };
+        let Some(total) = self
             .song
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.length_beats.max(0.0))
         else {
             return;
         };
-        let total = clip.length_beats.max(0.0);
         let len = new_len.clamp(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, total.max(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS));
         let max_start = (total - len).max(0.0);
-        self.audio_editor_view_start_beat = new_start.clamp(0.0, max_start);
-        self.audio_editor_view_len_beats = len;
+        let entry = self.audio_editor_views.entry(key).or_default();
+        entry.start_beat = new_start.clamp(0.0, max_start);
+        entry.len_beats = len;
     }
 
     /// PR-D 段階 1: Audio Editor で開いている clip + 選択中 event を

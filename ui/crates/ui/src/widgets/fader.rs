@@ -17,7 +17,7 @@
 use std::hash::Hash;
 use std::time::Instant;
 
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -483,8 +483,8 @@ fn draw_fader<M: ?Sized + 'static>(
     // 背景パネル (列全体)
     ui.push_rect(RectCommand {
         rect: col,
-        fill: Color::rgb(0.10, 0.11, 0.13),
-        border: Color::rgb(0.25, 0.28, 0.33),
+        fill: theme::PANEL,
+        border: theme::BORDER,
         border_width: 1.0,
         radius: [4.0; 4],
         clip_rect: None,
@@ -495,7 +495,7 @@ fn draw_fader<M: ?Sized + 'static>(
     // 細い track
     ui.push_rect(RectCommand {
         rect: track,
-        fill: Color::rgb(0.18, 0.20, 0.24),
+        fill: theme::INSET_BG,
         border: Color::TRANSPARENT,
         border_width: 0.0,
         radius: [3.0; 4],
@@ -512,7 +512,7 @@ fn draw_fader<M: ?Sized + 'static>(
                 w: track.w,
                 h: filled_h,
             },
-            fill: Color::rgb(0.32, 0.55, 0.85),
+            fill: theme::ACCENT,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [3.0; 4],
@@ -520,7 +520,8 @@ fn draw_fader<M: ?Sized + 'static>(
         });
     }
 
-    // thumb: flat な水平バー (border / shadow なし、Ableton 系ミニマル)
+    // thumb: flat な水平バー (border / shadow なし、Ableton 系ミニマル)。
+    // bright-neutral な可動ハンドル surface に当たる theme token が無いため literal 維持。
     let base = Color::rgb(0.78, 0.82, 0.90);
     let press = Color::rgb(0.95, 0.97, 1.00);
     let thumb_fill = if dragging || hovered(thumb, pointer) {
@@ -636,6 +637,8 @@ fn draw_fader_modulation_overlay<M: ?Sized + 'static>(
     if !entries.is_empty() || live_value.is_some() || edit_color.is_some() {
         ui.push_rect(RectCommand {
             rect: Rect { x: track_x - 2.0, y: base_y - 0.5, w: track_w + 4.0, h: 1.0 },
+            // modulation base 位置の中立マーカー線。 modulation 専用マーカーの theme token が
+            // 無いため literal 維持。
             fill: Color::rgba(0.70, 0.70, 0.75, 0.9),
             border: Color::TRANSPARENT,
             border_width: 0.0,
@@ -649,6 +652,8 @@ fn draw_fader_modulation_overlay<M: ?Sized + 'static>(
         let ly = y_of(lv as f32);
         ui.push_rect(RectCommand {
             rect: Rect { x: track_x - 3.0, y: ly - 1.0, w: track_w + 6.0, h: 2.0 },
+            // modulation の live 出力値マーク (amber)。 modulation-live indicator 用の theme
+            // token が無いため literal 維持 (knob と共通の amber)。
             fill: Color::rgba(1.0, 0.85, 0.30, 0.95),
             border: Color::TRANSPARENT,
             border_width: 0.0,

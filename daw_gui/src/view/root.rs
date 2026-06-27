@@ -6,7 +6,7 @@
 
 use daw_ui_core::{Edit, Orientation, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Rect};
 
 use crate::app::{AppData, AppEvent};
 use crate::view::{
@@ -35,7 +35,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     ui.panel(
         "root_bg",
         Rect { x: 0.0, y: 0.0, w: sw, h: sh },
-        Color::rgb(0.10, 0.10, 0.12),
+        theme::WINDOW_BG,
         0.0,
     );
 
@@ -761,7 +761,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         let alt = ui.pointer().modifiers.alt;
         let target_beat = if is_pianoroll_active {
             app.pianoroll_hover_beat_song_raw.map(|raw| {
-                snap::piano_roll_snap_config(app).snap_beat(raw, alt, app.pianoroll_zoom_x)
+                snap::piano_roll_snap_config(app).snap_beat(raw, alt, app.pianoroll_zoom_x())
             })
         } else {
             app.arrangement_hover_beat_raw.map(|raw| {

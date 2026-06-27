@@ -12,12 +12,12 @@ use std::f32::consts::PI;
 use std::hash::Hash;
 use std::time::Instant;
 
-use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
-use crate::ui::{Ui, hovered, lerp_color};
+use crate::ui::{Ui, hovered};
 use crate::widgets::scrubable_number::{ModEntry, Modulation};
 
 /// ダブルクリック判定の時間しきい値 (ms)。
@@ -380,13 +380,13 @@ fn draw_knob<M: ?Sized + 'static>(
     // Ableton 流: dark gray の円 + 円周上に cyan の arc。インジケータ線なし。
     // arc は -150° (7時) から value_angle までを円周 (radius = r) 上に描画。
     // 下の 60° (5時 → 7時 経由 6時) は 300° sweep 範囲外で arc は届かない (= "切れている")。
-    let base = Color::rgb(0.22, 0.24, 0.28);
-    let hover_c = Color::rgb(0.28, 0.30, 0.34);
-    let press_c = Color::rgb(0.32, 0.40, 0.52);
+    let base = theme::CONTROL;
+    let hover_c = theme::CONTROL_HOVER;
+    let press_c = theme::ACCENT;
     let bg_fill = if dragging {
         press_c
     } else if hovered(rect, pointer) {
-        lerp_color(base, hover_c, 0.85)
+        base.lerp(hover_c, 0.85)
     } else {
         base
     };
@@ -394,7 +394,7 @@ fn draw_knob<M: ?Sized + 'static>(
     ui.push_rect(RectCommand {
         rect: circle_rect,
         fill: bg_fill,
-        border: Color::rgb(0.40, 0.43, 0.47),
+        border: theme::BORDER,
         border_width: 1.0,
         radius: [r; 4],
         clip_rect: None,
@@ -413,8 +413,8 @@ fn draw_knob<M: ?Sized + 'static>(
     // 300° / 2° = 150 segments per knob、毎フレーム計算でも軽量。
     let step = 2.0_f32 * PI / 180.0;
     let arc_radius = r;
-    let active_color = Color::rgb(0.42, 0.85, 0.95);
-    let inactive_color = Color::rgb(0.32, 0.34, 0.38);
+    let active_color = theme::ACCENT;
+    let inactive_color = theme::INSET_BG;
 
     let mut active: Vec<LineSegment> = Vec::new();
     let mut a0 = start_angle;
@@ -460,6 +460,8 @@ fn draw_knob<M: ?Sized + 'static>(
     let indicator = LineSegment {
         a: [cx, cy],
         b: [cx + dx * r, cy + dy * r],
+        // knob の値を指す明るい中立ポインタ (物理的なつまみ指針)。 bright-neutral な
+        // 可動ハンドル surface に当たる theme token が無いため literal 維持。
         color: Color::rgb(0.95, 0.97, 1.00),
     };
     ui.push_lines(LineBatch {
@@ -593,6 +595,8 @@ fn draw_knob_modulation_overlay<M: ?Sized + 'static>(
             segments: vec![LineSegment {
                 a: [cx + dx * r_in, cy + dy * r_in],
                 b: [cx + dx * r, cy + dy * r],
+                // modulation の live 出力値マーク (amber、 base 白指針と区別)。 modulation-live
+                // indicator 用の theme token が無いため literal 維持。
                 color: Color::rgb(1.0, 0.85, 0.30),
             }]
             .into(),

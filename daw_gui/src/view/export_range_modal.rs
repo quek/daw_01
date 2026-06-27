@@ -14,12 +14,12 @@
 
 use daw_ui_core::{Edit, ModalStyle, ScrubableNumberFormat, ScrubableNumberStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::{AppData, AppEvent, ExportRangeKind};
 
-const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
-const COLOR_HINT: Color = Color { r: 0.62, g: 0.65, b: 0.72, a: 1.0 };
+const COLOR_TEXT: Color = theme::TEXT;
+const COLOR_HINT: Color = theme::TEXT_DIM;
 
 const PANEL_W: f32 = 380.0;
 const PANEL_H: f32 = 210.0;
@@ -35,8 +35,8 @@ const BTN_H: f32 = 28.0;
 const BTN_W: f32 = 110.0;
 
 const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.6 },
-    panel_bg: Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 },
+    overlay_color: theme::BACKDROP,
+    panel_bg: theme::PANEL,
     panel_radius: 6.0,
     close_on_outside_click: false,
     close_on_escape: false,
@@ -46,11 +46,13 @@ const MODAL_STYLE: ModalStyle = ModalStyle {
 /// `1 px drag で 0.25 拍`。 clamp は handler 側 SSoT なので widget range は緩く
 /// 0..=大きな上限 (実 song 長は handler が clamp する)。
 const SCRUB_STYLE: ScrubableNumberStyle = ScrubableNumberStyle {
-    bg_color: Color { r: 0.12, g: 0.13, b: 0.17, a: 1.0 },
-    bg_color_hovered: Color { r: 0.17, g: 0.18, b: 0.23, a: 1.0 },
+    bg_color: theme::INSET_BG,
+    bg_color_hovered: theme::CONTROL,
+    // scrub drag 中の active feedback。 muted blue band (bright ACCENT より沈める意図) で、
+    // 一致する opaque token が無いため固有色を残す (transport の dragging tinge と同方針)。
     bg_color_dragging: Color { r: 0.20, g: 0.32, b: 0.45, a: 1.0 },
     text_color: COLOR_TEXT,
-    border: Color { r: 0.32, g: 0.35, b: 0.42, a: 1.0 },
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 3.0,
     font_size: 13.0,

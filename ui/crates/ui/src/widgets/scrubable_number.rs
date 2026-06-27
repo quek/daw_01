@@ -21,7 +21,7 @@
 use std::hash::Hash;
 use std::time::Instant;
 
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -83,11 +83,11 @@ pub struct ScrubableNumberStyle {
 impl Default for ScrubableNumberStyle {
     fn default() -> Self {
         Self {
-            bg_color: Color::rgb(0.10, 0.11, 0.13),
-            bg_color_hovered: Color::rgb(0.13, 0.14, 0.17),
-            bg_color_dragging: Color::rgb(0.20, 0.30, 0.42),
-            text_color: Color::rgb(0.92, 0.92, 0.94),
-            border: Color::rgb(0.30, 0.33, 0.39),
+            bg_color: theme::INSET_BG,
+            bg_color_hovered: theme::INSET_BG.lighten(0.06),
+            bg_color_dragging: theme::ACCENT,
+            text_color: theme::TEXT,
+            border: theme::BORDER,
             border_width: 1.0,
             radius: 3.0,
             font_size: 14.0,
@@ -811,6 +811,8 @@ fn draw_modulation_overlay<M: ?Sized + 'static>(
     if !entries.is_empty() || live_value.is_some() || edit_color.is_some() {
         ui.push_rect(RectCommand {
             rect: Rect { x: base_x - 0.5, y: strip_y - 1.0, w: 1.0, h: strip_h + 2.0 },
+            // modulation base 位置の中立マーカー線。 modulation 専用マーカーの theme token が
+            // 無いため literal 維持。
             fill: Color::rgba(0.70, 0.70, 0.75, 0.85),
             border: Color::TRANSPARENT,
             border_width: 0.0,
@@ -824,6 +826,8 @@ fn draw_modulation_overlay<M: ?Sized + 'static>(
         let lx = value_to_x(lv);
         ui.push_rect(RectCommand {
             rect: Rect { x: lx - 0.75, y: strip_y - 2.0, w: 1.5, h: strip_h + 4.0 },
+            // modulation の live 出力値 tick (明るい縦線)。 modulation-live indicator 用の
+            // theme token が無いため literal 維持。
             fill: Color::rgba(0.98, 0.98, 1.0, 0.95),
             border: Color::TRANSPARENT,
             border_width: 0.0,

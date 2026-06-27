@@ -19,7 +19,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -65,16 +65,16 @@ pub struct MsegEditorStyle {
 impl Default for MsegEditorStyle {
     fn default() -> Self {
         Self {
-            bg: Color::rgb(0.10, 0.11, 0.13),
-            grid: Color { r: 1.0, g: 1.0, b: 1.0, a: 0.06 },
-            line_color: Color::rgb(0.42, 0.85, 0.95),
+            bg: theme::INSET_BG,
+            grid: theme::GRID_LINE,
+            line_color: theme::CURVE,
             line_width_px: 2.0,
-            node_color: Color::rgb(0.95, 0.97, 1.00),
-            node_hover_color: Color::rgb(1.0, 1.0, 0.6),
-            node_drag_color: Color::rgb(0.95, 0.45, 0.40),
+            node_color: theme::TEXT,
+            node_hover_color: theme::SELECTION_WARM,
+            node_drag_color: theme::WAVEFORM_PEAK,
             node_radius_px: 5.0,
-            tension_color: Color { r: 0.42, g: 0.85, b: 0.95, a: 0.7 },
-            cursor_color: Color { r: 1.0, g: 0.85, b: 0.35, a: 0.85 },
+            tension_color: theme::SELECTION_WARM.with_alpha(0.7),
+            cursor_color: theme::SELECTION_WARM.with_alpha(0.85),
         }
     }
 }
@@ -460,7 +460,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 if Some(i) == current {
                     ui.push_rect(RectCommand {
                         rect: Rect { x, y: rect.y, w: cell, h: rect.h },
-                        fill: Color { r: 1.0, g: 0.85, b: 0.35, a: 0.16 },
+                        fill: theme::SELECTION_WARM.with_alpha(0.16),
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [0.0; 4],

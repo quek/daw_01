@@ -41,7 +41,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use daw_ui_platform::CursorIcon;
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -627,76 +627,79 @@ impl Default for PianoRollStyle {
             // 明るくなる (鍵盤と逆) symptom があった。Live / Cubase / Reaper 慣習に合わせる。
             // 階層: ruler_bg(0.13) < velocity_lane_bg(0.16) < bg(0.18) < keyboard_bg(0.22)
             // → grid (note 配置領域) が最も明るく、 周辺 panel が段階的に暗い。
-            bg: Color::rgb(0.18, 0.19, 0.22),
-            keyboard_bg: Color::rgb(0.22, 0.23, 0.26),
+            bg: theme::PANEL_RAISED,
+            keyboard_bg: theme::PANEL_RAISED,
+            // white_key / black_key は物理ピアノ鍵盤のメタファ。 寒色 dark テーマには白鍵に
+            // 充てる明 surface token が無いため、 意図的な literal のまま残す (token 化しない)。
             white_key: Color::rgb(0.92, 0.93, 0.95),
             black_key: Color::rgb(0.10, 0.11, 0.13),
-            // src-over 合成で黒鍵 row ≈ (0.135, 0.143, 0.165)、 bg との差 0.045〜0.055。
-            black_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.25),
-            bar_line: Color::rgba(1.0, 1.0, 1.0, 0.30),
-            beat_line: Color::rgba(1.0, 1.0, 1.0, 0.12),
+            // src-over 合成で黒鍵 row を bg より暗く。
+            black_row_overlay: theme::BACKDROP.with_alpha(0.25),
+            bar_line: theme::GRID_LINE_STRONG,
+            beat_line: theme::GRID_LINE,
             bar_line_width_px: 1.5,
             beat_line_width_px: 1.0,
-            // M14 Phase 124 / daw_01 #100: subdivision 線は beat_line (alpha 0.12) より淡く。
-            sub_line: Color::rgba(1.0, 1.0, 1.0, 0.06),
+            // M14 Phase 124 / daw_01 #100: subdivision 線は beat_line より淡く。
+            sub_line: theme::GRID_LINE.with_alpha(0.04),
             sub_line_width_px: 1.0,
             note_fill_fn: default_velocity_color,
             note_border_radius_px: 1.5,
-            note_muted_hatch_color: Color::rgba(0.0, 0.0, 0.0, 0.40),
+            note_muted_hatch_color: theme::BACKDROP.with_alpha(0.40),
             note_muted_hatch_spacing_px: 5.0,
             note_muted_hatch_width_px: 1.0,
-            note_selected_fill: Color::rgb(1.0, 0.85, 0.30),
-            note_selected_border: Color::rgb(1.0, 1.0, 1.0),
+            note_selected_fill: theme::SELECTION_WARM,
+            // 選択ノードのリングは velocity 着色されたノート上で確実に立つ意図的な pure-white。
+            note_selected_border: Color::WHITE,
             note_selected_border_w: 2.0,
             note_selected_pad_px: 2.0,
             // M14 Phase 83 / daw_01 #054: copy ghost は move ghost (黄) と区別する緑系
             // (arrangement の clone linked ghost と同系統)。
-            note_clone_ghost_fill: Color::rgba(0.30, 0.85, 0.45, 0.85),
-            note_clone_ghost_border: Color::rgb(0.55, 1.0, 0.70),
+            note_clone_ghost_fill: theme::GHOST_LINKED.with_alpha(0.85),
+            note_clone_ghost_border: theme::GHOST_LINKED,
             resize_handle_px: 4.0,
-            c_label_color: Color::rgb(0.30, 0.30, 0.35),
+            c_label_color: theme::TEXT_FAINT,
             c_label_font_px: 11.0,
             // M9 Phase 45c: playhead / velocity lane defaults
             // playhead は bar_line (白 alpha 0.3) と紛れないよう強い赤系 + 太め
-            playhead_color: Color::rgb(1.0, 0.25, 0.10),
+            playhead_color: theme::PLAYHEAD,
             playhead_width_px: 2.5,
-            velocity_lane_bg: Color::rgb(0.16, 0.17, 0.20),
-            velocity_bar_color: Color::rgb(0.50, 0.65, 0.85),
+            velocity_lane_bg: theme::PANEL,
+            velocity_bar_color: theme::ACCENT,
             velocity_bar_width_px: 3.0,
-            lyric_color: Color::rgb(0.10, 0.10, 0.15),
+            lyric_color: theme::TEXT_ON_BRIGHT,
             // M14 Phase 59: MAX cap (実 font_size = note_h * 0.75 で note 高さスケール)。
             // 旧 9.0 固定 → 24.0 max にして zoom in 時の readable 化。
             lyric_font_px: 24.0,
             // M14 Phase 59 / daw_01 #017: 歌詞編集 (L キー) shortcut。caller が `bind("L")` する想定。
             lyric_edit_shortcut: Some("piano_roll.edit_lyric"),
             // M13 Phase 55: ruler 領域 (`view.ruler_h > 0` のときのみ描画)
-            ruler_bg: Color::rgb(0.13, 0.14, 0.17),
-            ruler_label_color: Color::rgb(0.85, 0.88, 0.92),
+            ruler_bg: theme::HEADER,
+            ruler_label_color: theme::TEXT_DIM,
             // M14 Phase 69 / daw_01 #041: arrangement と同 default 値 (cyan ~0.20 alpha 帯 + 不透明 handle)。
-            loop_band: Color::rgba(0.50, 0.85, 1.0, 0.20),
-            loop_handle: Color::rgb(0.50, 0.85, 1.0),
+            loop_band: theme::LOOP_BAND.with_alpha(0.20),
+            loop_handle: theme::LOOP_BAND,
             loop_handle_w: 2.0,
             // M14 Phase 70 / daw_01 #042 + 70a (follow-up): Bitwig 風 warm-yellow tint (root 行)
             // + 黒 dim (out 行)。 alpha は daw_01 実機 smoke test (#042 follow-up) で「白鍵 row 上
             // の root tint が見えない / 黒鍵 row との dim 差が 0.015 で out 認識が立たない」 指摘
             // を受けて引き上げ済。 control: dark theme (widget bg 0.18、 黒鍵 row ≈ 0.135) で
             // 「在ることが分かる」 を最低基準にする。 alpha 0.18 / 0.32 だと不可視レベル。
-            root_row_overlay: Color::rgba(1.0, 0.80, 0.30, 0.32),
+            root_row_overlay: theme::SELECTION_WARM.with_alpha(0.32),
             // out_of_scale_row_overlay: alpha 0.50 で 黒鍵 row との差が ≈ 0.045 に拡大、 dim 認識成立。
-            out_of_scale_row_overlay: Color::rgba(0.0, 0.0, 0.0, 0.50),
+            out_of_scale_row_overlay: theme::BACKDROP.with_alpha(0.50),
             // 鍵盤レーンラベル色: root は warm-yellow を強調 (0.95, 0.78, 0.40)、 in-scale は Fold
             // mode で全行に label が出るため keyboard_bg (0.22) 上で読める明度 (0.78〜0.85)、
             // out-of-scale は dim (0.45 程度、 Highlight mode で root 行以外の label 描画は v0 では
             // 出ないが、 将来「全 12 行 label」 拡張用に予約)。
-            root_label_fg: Color::rgb(0.95, 0.78, 0.40),
-            in_scale_label_fg: Color::rgb(0.78, 0.80, 0.85),
-            out_of_scale_label_fg: Color::rgb(0.45, 0.45, 0.50),
+            root_label_fg: theme::SELECTION_WARM,
+            in_scale_label_fg: theme::TEXT_DIM,
+            out_of_scale_label_fg: theme::TEXT_FAINT,
             // M14 Phase 117 / daw_01 #093: 鍵盤ラベルの auto-contrast (default on)。 両極は white 鍵
             // (0.92) / black 鍵 (0.10) / warm cream root 行のいずれでも WCAG コントラスト比が十分立つ
             // near-black / near-white。
             label_auto_contrast: true,
-            label_fg_dark: Color::rgb(0.13, 0.13, 0.16),
-            label_fg_light: Color::rgb(0.93, 0.94, 0.97),
+            label_fg_dark: theme::TEXT_ON_BRIGHT,
+            label_fg_light: theme::TEXT,
         }
     }
 }
@@ -2680,6 +2683,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 muted: false,
             };
             self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
+            // (FIXME #92) 入力完了後、 press 時に既定長ノートの右端へ warp した
+            // カーソルを元のクリック位置へ戻す (warp しっぱなしだと「ノートの右端のまま」
+            // 残り、 次操作の起点が分かりにくいという要望)。 warp は y を変えない
+            // (press 時 `warp_cursor(warp_x, py)`) ので、 復帰先 y は anchor_mouse.1
+            // (= press y) をそのまま再利用する (press_y を別フィールドで複製しない = SSoT)。
+            self.warp_cursor(nc.press_x, nc.anchor_mouse.1);
         }
 
         // ----- loop drag release → SetLoopRange (M14 Phase 69 / daw_01 #041) -----
@@ -4398,6 +4407,116 @@ mod tests {
         assert!(
             (len - 2.0).abs() < 1e-9,
             "len=2.0 (右端が cursor beat 3.0、start 1.0)、got {len}"
+        );
+    }
+
+    /// (FIXME #92) ノート作成 (ダブルクリック → ドラッグ → release) を完了したら、 press 時に
+    /// 右端へ warp したカーソルを **元のクリック位置へ戻す**。 「いまはノートの右端のままになって
+    /// いる」 という要望の修正。 warp の OS flush は `frame()` でのみ起きる (run_frame =
+    /// frame_to_edits は副作用を発火しない) ので `set_cursor_pos_request` を capture し、
+    /// press 位置 (200,100) への復帰が release frame で起きることを検証する。
+    /// test_view: snap OFF / 4 拍 / grid 800px → 1 beat = 200px、 default = 1.0。
+    /// press x=200 (beat 1.0) → warp 先 = 右端 beat 2.0 = x400。 release で (200,100) へ復帰。
+    #[test]
+    fn note_create_release_warps_cursor_back_to_press_position() {
+        let warps: Arc<std::sync::Mutex<Vec<(f32, f32)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warps_clone = Arc::clone(&warps);
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        host.set_cursor_pos_request = Some(Box::new(move |x, y| {
+            warps_clone.lock().unwrap().push((x, y));
+        }));
+        let mut model = TestModel::new(vec![]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        // warp flush を走らせるため frame_to_edits ではなく frame() を回す local helper。
+        let run = |host: &mut UiHost<TestModel>, model: &mut TestModel, input: FrameInput| {
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 800, height: 400 };
+            host.frame(model, &mut scene, screen, input, |_, ui| {
+                let d = make_dispatch();
+                let sel: Vec<NoteId> = vec![];
+                let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            });
+        };
+
+        // Frame 1: 1 度目 click (release) → last_click 記録。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((200.0, 100.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Frame 2: 2 度目 press → 作成 session 開始 + press 時 warp で右端 (400,100) へ。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((200.0, 100.0)),
+                    primary_just_pressed: true,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            warps.lock().unwrap().as_slice(),
+            &[(400.0, 100.0)],
+            "press で既定長ノートの右端 (400,100) へ warp"
+        );
+        // Frame 3: warp 着地 (cursor が右端 anchor x400 へ)。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((400.0, 100.0)),
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Frame 4: 右へドラッグ (cursor x600 = beat 3.0、held)。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((600.0, 100.0)),
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Frame 5: release → Add 発行 + カーソルを元のクリック位置 (200,100) へ戻す。
+        run(
+            &mut host,
+            &mut model,
+            FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((600.0, 100.0)),
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(model.last_request, Some(RequestKind::Add), "release で Add 発行");
+        assert_eq!(
+            warps.lock().unwrap().as_slice(),
+            &[(400.0, 100.0), (200.0, 100.0)],
+            "press で右端へ warp → release で元のクリック位置 (200,100) へ復帰"
         );
     }
 

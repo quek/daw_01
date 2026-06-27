@@ -5,7 +5,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{theme, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
@@ -37,14 +37,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // 1. 本体描画 (現在値の表示 + 三角アロー)
         let bg_fill = if inside {
-            Color::rgb(0.18, 0.20, 0.24)
+            theme::INSET_BG.lighten(0.06)
         } else {
-            Color::rgb(0.12, 0.13, 0.16)
+            theme::INSET_BG
         };
         let border = if already_open {
-            Color::rgb(0.55, 0.78, 0.95)
+            theme::BORDER_FOCUS
         } else {
-            Color::rgb(0.30, 0.33, 0.39)
+            theme::BORDER
         };
         self.push_rect(RectCommand {
             rect,
@@ -63,7 +63,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: rect.y + (rect.h - DROPDOWN_FONT * 1.2) * 0.5,
                 font_size: DROPDOWN_FONT,
                 line_height: DROPDOWN_FONT * 1.2,
-                color: Color::rgb(0.92, 0.92, 0.94),
+                color: theme::TEXT,
                 clip_rect: None,
                 ..GlyphArea::default()
             });
@@ -73,7 +73,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let arrow_x = rect.x + rect.w - DROPDOWN_ARROW_W * 0.5;
         let arrow_y = rect.y + rect.h * 0.5;
         let arrow_size = 4.0;
-        let arrow_color = Color::rgb(0.75, 0.78, 0.85);
+        let arrow_color = theme::TEXT_DIM;
         self.push_lines(LineBatch {
             segments: vec![
                 LineSegment {
