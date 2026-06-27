@@ -36,7 +36,7 @@
 use std::cell::Cell;
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -73,11 +73,11 @@ impl Default for ReorderableListStyle {
         Self {
             row_height: 26.0,
             row_gap: 2.0,
-            row_bg: Color::rgb(0.13, 0.14, 0.18),
-            row_bg_hover: Color::rgb(0.18, 0.20, 0.26),
-            row_bg_selected: Color::rgb(0.32, 0.55, 0.85),
-            row_bg_dragging: Color::rgba(0.30, 0.40, 0.55, 0.85),
-            drop_indicator_color: Color::rgb(0.32, 0.55, 0.85),
+            row_bg: theme::PANEL_RAISED,
+            row_bg_hover: theme::CONTROL_HOVER,
+            row_bg_selected: theme::ACCENT,
+            row_bg_dragging: theme::ACCENT.with_alpha(0.85),
+            drop_indicator_color: theme::LOOP_BAND,
             drop_indicator_h: 2.0,
             radius: 2.0,
             drag_handle_w: 0.0,

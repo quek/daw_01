@@ -13,11 +13,11 @@
 
 use daw_ui_core::{Edit, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
+use daw_ui_renderer::{theme, Color, Rect};
 
 use crate::app::{AppData, AppEvent, DirtyGuardAction};
 
-const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
+const COLOR_TEXT: Color = theme::TEXT;
 
 const PANEL_W: f32 = 460.0;
 const PANEL_H: f32 = 176.0;
@@ -30,8 +30,8 @@ const BTN_W: f32 = 116.0;
 const BTN_GAP: f32 = 8.0;
 
 const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.6 },
-    panel_bg: Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 },
+    overlay_color: theme::BACKDROP,
+    panel_bg: theme::PANEL,
     panel_radius: 6.0,
     close_on_outside_click: true,
     close_on_escape: true,

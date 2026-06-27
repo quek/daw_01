@@ -2417,16 +2417,6 @@ pub(crate) fn hovered(rect: Rect, pointer: PointerFrame) -> bool {
     rect.contains(px, py)
 }
 
-/// 色のヘルパ。
-pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
-    Color {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        a: a.a + (b.a - a.a) * t,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
