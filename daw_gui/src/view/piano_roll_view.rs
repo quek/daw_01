@@ -95,8 +95,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 
     let widget_notes = build_widget_notes(app, target);
-    let zoom_x = app.pianoroll_zoom_x.max(4.0);
-    let zoom_y = app.pianoroll_zoom_y.max(6.0);
+    let zoom_x = app.pianoroll_zoom_x().max(4.0);
+    let zoom_y = app.pianoroll_zoom_y().max(6.0);
     let loop_range = if app.song.loop_end_beat > app.song.loop_start_beat {
         Some((app.song.loop_start_beat, app.song.loop_end_beat))
     } else {
@@ -152,9 +152,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     let view = PianoRollView {
         // song-absolute = clip-local scroll + clip 開始位置 (FIXME #3)。
-        start_beat: app.pianoroll_scroll_beat as f64 + clip_start_beat,
+        start_beat: app.pianoroll_scroll_beat() as f64 + clip_start_beat,
         len_beats: (grid_rect.w / zoom_x) as f64,
-        pitch_top: app.pianoroll_top_pitch as f32,
+        pitch_top: app.pianoroll_top_pitch() as f32,
         pitch_visible: grid_h / zoom_y,
         keyboard_w: KEYBOARD_W,
         notes_generation,
@@ -340,7 +340,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let beat_raw = view.start_beat + (px - grid_rect.x) as f64 / beat_to_px;
         let cfg = snap::piano_roll_snap_config(app);
         let alt = ui.pointer().modifiers.alt;
-        let snapped = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x);
+        let snapped = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x());
         Some(snapped - clip_start_beat)
     });
     // FIXME #44: f キー用に **song-absolute かつ snap なし** の生 beat も mirror する
@@ -391,8 +391,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         {
             let (sx, sy) = pointer.scroll_delta;
             if sy.abs() > 0.001 || sx.abs() > 0.001 {
-                let scroll_beat = app.pianoroll_scroll_beat;
-                let top_pitch = app.pianoroll_top_pitch as i32;
+                let scroll_beat = app.pianoroll_scroll_beat();
+                let top_pitch = app.pianoroll_top_pitch() as i32;
                 let modifiers = pointer.modifiers;
                 if modifiers.ctrl {
                     // Ctrl+wheel: 横ズーム。マウス位置の拍を anchor として保持する

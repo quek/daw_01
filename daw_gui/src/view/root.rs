@@ -760,7 +760,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         let alt = ui.pointer().modifiers.alt;
         let target_beat = if is_pianoroll_active {
             app.pianoroll_hover_beat_song_raw.map(|raw| {
-                snap::piano_roll_snap_config(app).snap_beat(raw, alt, app.pianoroll_zoom_x)
+                snap::piano_roll_snap_config(app).snap_beat(raw, alt, app.pianoroll_zoom_x())
             })
         } else {
             app.arrangement_hover_beat_raw.map(|raw| {
