@@ -27,6 +27,12 @@ const SPINNER: Color = Color { r: 0.45, g: 0.72, b: 0.95, a: 1.0 };
 const WARN: Color = Color { r: 0.97, g: 0.74, b: 0.30, a: 1.0 };
 const WARN_SUB: Color = Color { r: 0.80, g: 0.64, b: 0.44, a: 1.0 };
 
+/// `draw_spinner_badge` のバッキングチップ (暗・半透明) と前景スピナー (明) の色。
+/// 可変背景 (クリップ色・波形) 上でも、暗チップが明背景から、明スピナーが暗チップから
+/// 浮くので **どのクリップ色でもコントラストが保証**される。
+const BADGE_BG: Color = Color { r: 0.05, g: 0.05, b: 0.08, a: 0.66 };
+const BADGE_SPINNER: Color = Color { r: 0.97, g: 0.98, b: 1.0, a: 1.0 };
+
 /// スピナー 1 回転の周期。
 pub const SPINNER_PERIOD: Duration = Duration::from_millis(900);
 
@@ -168,6 +174,30 @@ pub fn draw_spinner(
             dot_r,
         );
     }
+}
+
+/// 可変背景 (クリップ色・トラック色・波形) の上に出すスピナー。固定単色を直接
+/// 重ねると明クリップ上で白が・暗クリップ上で黒が沈むため、**暗い半透明バッキング
+/// チップを敷いてから明色スピナーを重ね**、どのクリップ色でもコントラストを保証する
+/// (= over-clip 標識の idiom。新規の clip 上インジケータはこれを流用すること、
+/// `feedback_ui_indicator_contrast_on_variable_bg`)。`radius` はスピナー半径、チップは
+/// それより一回り大きい円。
+pub fn draw_spinner_badge(
+    ui: &mut Ui<'_, AppData>,
+    id: impl std::hash::Hash + Copy,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    phase: f32,
+) {
+    let chip = radius + 3.0;
+    ui.panel(
+        (id, "badge_chip"),
+        Rect { x: cx - chip, y: cy - chip, w: chip * 2.0, h: chip * 2.0 },
+        BADGE_BG,
+        chip, // radius = 半径 → 円
+    );
+    draw_spinner(ui, id, cx, cy, radius, phase, BADGE_SPINNER);
 }
 
 /// 経過時間 → スピナー位相 `[0,1)`。`period` で 1 回転。純関数 (テスト可能)。

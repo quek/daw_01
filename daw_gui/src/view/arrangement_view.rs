@@ -2703,9 +2703,6 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
 // FIXME #90: VOICEVOX 生成中クリップの右上スピナー
 // ---------------------------------------------------------------------------
 
-/// 生成中マーカーのスピナー色 (= どのクリップ色の上でも視認できる near-white)。
-const SPINNER_CLIP_COLOR: Color = Color { r: 0.96, g: 0.98, b: 1.0, a: 0.95 };
-
 /// FIXME #90: VOICEVOX 生成中のクリップ右上角に回転スピナーを重ねる。
 ///
 /// 歌唱/読み上げトラックが合成中ならそのトラックの全 clip に、口パク再生成中なら
@@ -2721,7 +2718,8 @@ fn draw_clip_synth_spinner(
     if app.voicevox_synth_status.is_empty() && app.lipsync_inflight.is_empty() {
         return;
     }
-    if clip_rect.w < 28.0 || clip_rect.h < 16.0 {
+    // バッジ (チップ+スピナー) が名前/枠に被らない最小サイズ。狭い/低い clip は省略。
+    if clip_rect.w < 30.0 || clip_rect.h < 24.0 {
         return;
     }
     let wav = app.track_wav_synthesizing(clip_key.track);
@@ -2740,17 +2738,18 @@ fn draw_clip_synth_spinner(
         app.frame_now.duration_since(app.anim_epoch),
         super::voicevox_overlay::SPINNER_PERIOD,
     );
+    // バッジ (暗チップ + 明スピナー) で、明/暗どのクリップ色でもコントラスト保証。
     let r = 6.0;
-    let cx = clip_rect.x + clip_rect.w - (r + 5.0);
-    let cy = clip_rect.y + (r + 4.0);
-    super::voicevox_overlay::draw_spinner(
+    let chip = r + 3.0;
+    let cx = clip_rect.x + clip_rect.w - (chip + 2.0);
+    let cy = clip_rect.y + chip + 2.0;
+    super::voicevox_overlay::draw_spinner_badge(
         ui,
         (b"vox_clip_spin", clip_key.track, clip_key.clip),
         cx,
         cy,
         r,
         phase,
-        SPINNER_CLIP_COLOR,
     );
 }
 
