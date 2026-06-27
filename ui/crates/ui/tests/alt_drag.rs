@@ -464,6 +464,7 @@ fn pr_model() -> PrModel {
 fn pr_view(snap: SnapConfig) -> PianoRollView {
     PianoRollView {
         start_beat: 0.0,
+        min_start_beat: 0.0,
         // keyboard_w = 0 にして grid.w == WIDGET_RECT.w。 zoom 64 → len_beats = 800/64 = 12.5。
         len_beats: f64::from(WIDGET_RECT.w / ZOOM_X_PX_PER_BEAT),
         pitch_top: 72.0,

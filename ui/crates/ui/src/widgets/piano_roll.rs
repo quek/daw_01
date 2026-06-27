@@ -385,6 +385,12 @@ pub struct PianoRollView {
     /// ダブルクリック作成でボタンを放さず左右ドラッグしたときは、 ドラッグ長 (snap 済み右端 −
     /// start) が優先され、 この既定長は使われない。 値は widget 側で `0.0625` (1/16) 下限に clamp。
     pub default_note_len_beats: f64,
+    /// (FIXME #89) `start_beat` が左へスクロールできる下限 (song-absolute 拍)。daw_01 では編集対象 clip の
+    /// 開始拍 (= `pianoroll_scroll_beat >= 0` を絶対拍に直したもの)。edge auto-scroll が左端で view を
+    /// この値で clamp し、「実際に適用される scroll 量」 を正しく算出して掴んでいる対象を追従させる
+    /// (caller の `SetPianoRollScrollX(_.max(0))` clamp と一致させ、anchor が過剰 shift して対象が
+    /// 飛ぶのを防ぐ)。clip 概念の無い context (example / test) では `0.0`。
+    pub min_start_beat: f64,
 }
 
 /// piano roll が user に発行する Edit 要求の種別。
@@ -436,6 +442,17 @@ pub enum PianoRollEditRequest {
     /// 計算 (「release で grid に飛ぶ」 不整合を構造的に回避)。
     /// arrangement `ArrangementEditRequest::SetLoopRange` と完全同形。
     SetLoopRange { start: f64, end: f64 },
+    /// (FIXME #89) edge auto-scroll による横スクロール要求 (delta、拍)。drag 中にポインタが grid 左右端の
+    /// hot-zone に入った frame で発火する。caller は `pianoroll_scroll_beat` に delta を加算し `>= 0` に
+    /// clamp する (= `SetPianoRollScrollX(scroll + by)`)。clip 相対オフセットを widget が知らずに済むよう
+    /// 絶対値でなく delta で渡す。arrangement は絶対 `SetScrollX` を持つが piano roll の scroll は clip
+    /// 相対なので delta 形にする。
+    ScrollByBeats(f64),
+    /// (FIXME #89) edge auto-scroll による縦 (pitch) スクロール要求 (絶対 top_pitch)。drag 中にポインタが
+    /// grid 上下端の hot-zone に入った frame で発火する。widget が `11..=127` を考慮した clamp 後の値を
+    /// 送る (caller の `SetPianoRollTopPitch` handler も同 clamp)。`SetPianoRollScrollX` と同じく view 層が
+    /// `SetPianoRollTopPitch` に変換する。
+    SetTopPitch(u8),
 }
 
 /// `Ui::piano_roll` の戻り値。app 側で connection / hover state の表示に使う。
@@ -1357,6 +1374,14 @@ pub(crate) struct PianoRollState {
     /// (FIXME #82) 空白ダブルクリック作成 session (押下のまま drag で note 長を決める)。
     /// 2 度目の press で `Some`、release で `take` して 1 個の `Add` を発行 → `None`。
     note_create: Option<NoteCreateSession>,
+    /// (FIXME #89) edge auto-scroll の pitch (縦) 方向の端数アキュムレータ (semitone)。
+    /// top_pitch は u8 なので sub-semitone のスクロールを表現できない。drag 中に毎フレーム
+    /// `dy_px * pitch_per_px` を貯め、|累積| ≥ 1 で整数 semitone ぶん `SetTopPitch` を発火する
+    /// (= zone 内側ほどゆっくり、外側ほど速く滑らかにスクロール)。縦 zone を外れた frame で 0 に reset。
+    edge_pitch_accum: f32,
+    /// (FIXME #89) edge auto-scroll の移動量ゲート用 press 位置。press からの移動が `ACTIVATE_PX`
+    /// 以上のときのみ端スクロールを許可し、端近くの note を click-and-hold しただけで view が動くのを防ぐ。
+    edge_scroll_press: Option<(f32, f32)>,
 }
 
 // ============================================================
@@ -1920,6 +1945,143 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 && !pointer.primary_just_released
             {
                 pd.last_mouse_x = px;
+            }
+        }
+
+        // ---- FIXME #89: ドラッグ端オートスクロール (piano roll) ----
+        // drag 中、pointer が grid 端の hot-zone に入ったら view を自動スクロールし、掴んでいる対象が
+        // カーソルに追従し続ける。横 (beat) は `ScrollByBeats` delta、縦 (pitch) は `SetTopPitch` 絶対値
+        // (top_pitch は u8 なので端数を `edge_pitch_accum` に貯めて整数 semitone 単位で発火)。note drag /
+        // create は相対 delta なので実スクロール px ぶん anchor を逆 shift して追従させる。ruler の
+        // loop/playhead は絶対 px→beat 再解決で自動追従するため shift しない。`request_redraw` で次フレーム
+        // を確保し、カーソルを端で止めたままでもスクロール継続させる。
+        if pointer.primary_pressed && !pointer.primary_just_released {
+            // 移動量ゲート: press からの移動が ACTIVATE_PX 以上のときのみ端スクロールを許可。
+            let moved_enough = {
+                let state: &mut PianoRollState = self.widget_state(wid);
+                if pointer.primary_just_pressed {
+                    state.edge_scroll_press = pointer.pos;
+                    // 新しい drag の開始で pitch アキュムレータをリセット (前 drag の端数が
+                    // 残って次 drag 初回フレームで pitch がジャンプするのを防ぐ)。
+                    state.edge_pitch_accum = 0.0;
+                }
+                let gate = crate::widgets::edge_scroll::ACTIVATE_PX;
+                matches!((state.edge_scroll_press, pointer.pos),
+                    (Some(p), Some(c)) if (c.0 - p.0).powi(2) + (c.1 - p.1).powi(2) >= gate * gate)
+            };
+            let axes: Option<(bool, bool)> = if moved_enough {
+                let state: &mut PianoRollState = self.widget_state(wid);
+                if let Some(nd) = state.note_drag.as_ref() {
+                    Some(match nd.kind {
+                        NoteDragKind::Move => (true, true), // 移動は横 + 縦 (pitch)。
+                        NoteDragKind::ResizeLeft | NoteDragKind::ResizeRight => (true, false),
+                    })
+                } else if state.note_create.as_ref().is_some_and(|nc| nc.warp_settled)
+                    || state.loop_drag.is_some()
+                    || state.playhead_drag.is_some()
+                {
+                    // 新規作成 (warp 着地後) / ruler の loop / playhead: いずれも横軸のみ。
+                    Some((true, false))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let drag_rect_wid = wid.child(b"rect_select");
+            let marquee_active = moved_enough
+                && axes.is_none()
+                && {
+                    let st: &mut crate::widgets::drag_rect::DragRectState =
+                        self.widget_state(drag_rect_wid);
+                    st.drag_start.is_some()
+                };
+            if let Some((ax, ay)) = axes.or_else(|| marquee_active.then_some((true, true))) {
+                let cfg = crate::widgets::edge_scroll::EdgeScrollCfg::default();
+                let (dx, dy) = crate::widgets::edge_scroll::edge_scroll_delta(
+                    pointer.pos,
+                    grid,
+                    cfg,
+                    ax,
+                    ay,
+                );
+                // 横: view を min_start_beat で clamp して **実際に適用される** delta 拍を求める
+                // (arrangement と同パターン)。view 層の `SetPianoRollScrollX(_.max(0))` clamp と一致し、
+                // 左端で anchor が要求 px 分だけ過剰 shift して対象が飛ぶ runaway を防ぐ。
+                // `applied_beat_px` は beat (横) 軸の anchor 補正量 (単位は px)。
+                let (scroll_by_beats, applied_beat_px) = if dx == 0.0 || beat_per_px <= 1e-6 {
+                    (0.0, 0.0)
+                } else {
+                    let new_start =
+                        (view.start_beat + f64::from(dx) * beat_per_px).max(view.min_start_beat);
+                    let actual = new_start - view.start_beat;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let px = (actual / beat_per_px) as f32;
+                    (actual, px)
+                };
+                // 縦 pitch: 端数を accum に貯め整数 semitone 単位で SetTopPitch。
+                let mut new_top_pitch: Option<u8> = None;
+                let mut applied_pitch_px = 0.0_f32;
+                {
+                    let state: &mut PianoRollState = self.widget_state(wid);
+                    if dy != 0.0 && pitch_per_px > 1e-6 {
+                        let px_per_semitone = 1.0 / pitch_per_px;
+                        state.edge_pitch_accum += dy * pitch_per_px; // 下=正 (lower pitch へ)。
+                        #[allow(clippy::cast_possible_truncation)]
+                        let step = state.edge_pitch_accum.trunc();
+                        if step != 0.0 {
+                            state.edge_pitch_accum -= step;
+                            // 下スクロール (step > 0) = lower pitch を出す = top_pitch 減。
+                            let cur = view.pitch_top;
+                            let next = (cur - step).clamp(11.0, 127.0);
+                            let applied = cur - next;
+                            if applied != 0.0 {
+                                #[allow(
+                                    clippy::cast_possible_truncation,
+                                    clippy::cast_sign_loss
+                                )]
+                                let next_u = next.round() as u8;
+                                new_top_pitch = Some(next_u);
+                                applied_pitch_px = applied * px_per_semitone;
+                            }
+                        }
+                    } else {
+                        // 縦 zone 外の frame は accum をリセット (stale 防止)。
+                        state.edge_pitch_accum = 0.0;
+                    }
+                }
+                let scrolled_x = scroll_by_beats != 0.0;
+                if scrolled_x {
+                    self.push_edit(make_edit(PianoRollEditRequest::ScrollByBeats(
+                        scroll_by_beats,
+                    )));
+                }
+                if let Some(p) = new_top_pitch {
+                    self.push_edit(make_edit(PianoRollEditRequest::SetTopPitch(p)));
+                }
+                if scrolled_x || new_top_pitch.is_some() {
+                    if marquee_active {
+                        let st: &mut crate::widgets::drag_rect::DragRectState =
+                            self.widget_state(drag_rect_wid);
+                        if let Some(s) = st.drag_start.as_mut() {
+                            s.0 -= applied_beat_px;
+                            s.1 -= applied_pitch_px;
+                        }
+                    } else {
+                        let state: &mut PianoRollState = self.widget_state(wid);
+                        if let Some(nd) = state.note_drag.as_mut() {
+                            nd.anchor_mouse.0 -= applied_beat_px;
+                            nd.anchor_mouse.1 -= applied_pitch_px;
+                        }
+                        if let Some(nc) = state.note_create.as_mut() {
+                            // 新規作成は横のみ。anchor と warp 判定基準 press_x を同 shift。
+                            nc.anchor_mouse.0 -= applied_beat_px;
+                            nc.press_x -= applied_beat_px;
+                        }
+                        // loop/playhead: 絶対 px→beat 再解決で自動追従 → shift 不要。
+                    }
+                    self.request_redraw();
+                }
             }
         }
 
@@ -3424,6 +3586,7 @@ mod tests {
     fn test_view() -> PianoRollView {
         PianoRollView {
             start_beat: 0.0,
+            min_start_beat: 0.0,
             len_beats: 4.0,
             pitch_top: 72.0,
             pitch_visible: 24.0,
@@ -3839,6 +4002,10 @@ mod tests {
         playhead_beats: Vec<f64>,
         /// (M14 Phase 69 / daw_01 #041) 最後に発行された `SetLoopRange { start, end }`。
         last_set_loop_range: Option<(f64, f64)>,
+        /// (FIXME #89) edge auto-scroll で発行された全 `ScrollByBeats` の delta 列。
+        scroll_by_beats: Vec<f64>,
+        /// (FIXME #89) edge auto-scroll で発行された全 `SetTopPitch` の値列。
+        top_pitch_sets: Vec<u8>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3853,6 +4020,8 @@ mod tests {
         SetVelocity,
         SetPlayheadBeat,
         SetLoopRange,
+        ScrollByBeats,
+        SetTopPitch,
     }
 
     impl TestModel {
@@ -3869,6 +4038,8 @@ mod tests {
                 last_set_velocity: None,
                 playhead_beats: Vec::new(),
                 last_set_loop_range: None,
+                scroll_by_beats: Vec::new(),
+                top_pitch_sets: Vec::new(),
             }
         }
     }
@@ -3948,6 +4119,14 @@ mod tests {
                         m.last_set_loop_range = Some((start, end));
                     })
                 }
+                PianoRollEditRequest::ScrollByBeats(by) => Edit::mutate(move |m: &mut TestModel| {
+                    m.last_request = Some(RequestKind::ScrollByBeats);
+                    m.scroll_by_beats.push(by);
+                }),
+                PianoRollEditRequest::SetTopPitch(p) => Edit::mutate(move |m: &mut TestModel| {
+                    m.last_request = Some(RequestKind::SetTopPitch);
+                    m.top_pitch_sets.push(p);
+                }),
             }
         }
     }
@@ -4294,6 +4473,167 @@ mod tests {
             );
         });
         assert_eq!(model.last_request, Some(RequestKind::Move), "release で Move 発行");
+    }
+
+    // -------- (FIXME #89) ドラッグ端オートスクロール --------
+
+    /// note Move drag 中、ポインタが grid 右端 hot-zone に入ると `ScrollByBeats(>0)` が発火し、
+    /// 中央では発火しない。test_view: 4 拍 × 800px = 200px/拍、zone=28px (default)。
+    #[test]
+    fn piano_roll_edge_autoscroll_horizontal_on_note_drag() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let run = |host: &mut UiHost<TestModel>, model: &mut TestModel, pos, pressed, just_pressed| {
+            let input = FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_pressed: just_pressed,
+                    primary_pressed: pressed,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            };
+            run_frame(host, model, input, |ui| {
+                let sel: Vec<NoteId> = vec![];
+                let _ = ui.piano_roll("pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
+            });
+        };
+        // press at note 中央 → Move 開始 (中央なので scroll 不発)。
+        run(&mut host, &mut model, (300.0, 200.0), true, true);
+        assert!(model.scroll_by_beats.is_empty(), "press frame は中央なので scroll 不発");
+        // 中央で continuation → scroll 不発。
+        run(&mut host, &mut model, (400.0, 200.0), true, false);
+        assert!(model.scroll_by_beats.is_empty(), "中央 drag は scroll 不発");
+        // 右端 hot-zone で continuation → 前方 (拍増) へ ScrollByBeats。
+        run(&mut host, &mut model, (795.0, 200.0), true, false);
+        assert_eq!(model.scroll_by_beats.len(), 1, "右端 drag で ScrollByBeats 1 件");
+        assert!(
+            model.scroll_by_beats[0] > 0.0,
+            "右端 = 前方 (拍増) へスクロール: got {}",
+            model.scroll_by_beats[0]
+        );
+    }
+
+    /// note Move drag 中、ポインタが grid 下端 hot-zone に入ると `SetTopPitch` が発火し、より低い
+    /// pitch (top_pitch 減) を露出する。test_view: pitch_visible=24 / grid h=400 = 0.06 semitone/px。
+    #[test]
+    fn piano_roll_edge_autoscroll_vertical_on_note_drag() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(0, 1.0, 1.0, 60)]);
+        let view = test_view(); // pitch_top = 72
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let run = |host: &mut UiHost<TestModel>, model: &mut TestModel, pos, just_pressed| {
+            let input = FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_pressed: just_pressed,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            };
+            run_frame(host, model, input, |ui| {
+                let sel: Vec<NoteId> = vec![];
+                let _ = ui.piano_roll("pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
+            });
+        };
+        // press at note 中央 → Move 開始。
+        run(&mut host, &mut model, (300.0, 200.0), true);
+        assert!(model.top_pitch_sets.is_empty(), "press frame は scroll 不発");
+        // 下端 hot-zone で continuation → 1 semitone ぶん下へ (top_pitch 減)。
+        run(&mut host, &mut model, (300.0, 399.0), false);
+        assert_eq!(model.top_pitch_sets.len(), 1, "下端 drag で SetTopPitch 1 件");
+        assert!(
+            model.top_pitch_sets[0] < 72,
+            "下端 = より低い pitch を露出 (top_pitch 減): got {}",
+            model.top_pitch_sets[0]
+        );
+    }
+
+    /// 端近くの note を click-and-hold (移動 < ACTIVATE_PX) しても端スクロールしない。実ドラッグ
+    /// (ACTIVATE_PX 以上の移動) で初めて発火する (端の clip / note クリックで view が飛ぶのを防ぐ)。
+    /// note を start 3.5 拍 (x≈700) に置き、右端 hot-zone (x≈775) でクリック保持 → 動くまで不発。
+    #[test]
+    fn piano_roll_edge_autoscroll_gated_by_movement() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        let mut model = TestModel::new(vec![note(0, 3.5, 0.4, 60)]); // x ≈ 700..780 (右端寄り)
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let run = |host: &mut UiHost<TestModel>, model: &mut TestModel, pos, just_pressed| {
+            let input = FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_pressed: just_pressed,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            };
+            run_frame(host, model, input, |ui| {
+                let sel: Vec<NoteId> = vec![];
+                let _ = ui.piano_roll("pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
+            });
+        };
+        // press on the note 内、右端 hot-zone (x=775)。
+        run(&mut host, &mut model, (775.0, 200.0), true);
+        // 同位置で保持 (移動 0px) → ゲートで不発。
+        run(&mut host, &mut model, (775.0, 200.0), false);
+        assert!(
+            model.scroll_by_beats.is_empty(),
+            "click-and-hold (未移動) では端スクロール不発: got {:?}",
+            model.scroll_by_beats
+        );
+        // ACTIVATE_PX 以上 (15px) 動かす → 実ドラッグ判定 → 端スクロール発火。
+        run(&mut host, &mut model, (790.0, 200.0), false);
+        assert!(
+            !model.scroll_by_beats.is_empty(),
+            "ACTIVATE_PX 以上動かしたら端スクロール発火"
+        );
+    }
+
+    /// 既に左端 (start_beat == min_start_beat == 0) のとき、左端 hot-zone へドラッグしても scroll は
+    /// floor で clamp され 0 件 = 発火しない。これが効かないと anchor が要求 px 分だけ過剰 shift し続け、
+    /// 掴んだ note が画面外へ飛ぶ runaway になる (review CRITICAL)。
+    #[test]
+    fn piano_roll_edge_autoscroll_clamps_at_left_floor() {
+        let mut host: UiHost<TestModel> = UiHost::no_redraw();
+        // note を左端寄り (start 0.0, x≈0..100) に置く。test_view は start_beat=0=min_start_beat。
+        let mut model = TestModel::new(vec![note(0, 0.0, 0.5, 60)]);
+        let view = test_view();
+        let style = PianoRollStyle::default();
+        let notes_clone = model.notes.clone();
+        let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 };
+        let run = |host: &mut UiHost<TestModel>, model: &mut TestModel, pos, just_pressed| {
+            let input = FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_pressed: just_pressed,
+                    primary_pressed: true,
+                    ..PointerFrame::default()
+                },
+                ..Default::default()
+            };
+            run_frame(host, model, input, |ui| {
+                let sel: Vec<NoteId> = vec![];
+                let _ = ui.piano_roll("pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
+            });
+        };
+        // press on the note body (x=40)、release せず左端 zone (x=3) までドラッグ。
+        run(&mut host, &mut model, (40.0, 200.0), true);
+        run(&mut host, &mut model, (3.0, 200.0), false);
+        assert!(
+            model.scroll_by_beats.is_empty(),
+            "左端 floor では左スクロール不発 (clamp): got {:?}",
+            model.scroll_by_beats
+        );
     }
 
     // -------- (FIXME #82) 空白ダブルクリック作成 (放さずドラッグで長さ決定、Bitwig 流) --------

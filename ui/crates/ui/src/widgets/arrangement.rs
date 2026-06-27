@@ -2826,6 +2826,10 @@ pub(crate) struct ArrangementState {
     /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
     /// `Toggle` modifier では update しない、 `Single` / `RangeFromAnchor` で update。
     selection_anchor: Option<u32>,
+    /// FIXME #89: edge auto-scroll の移動量ゲート用 press 位置 (primary press 時の screen pos)。
+    /// 端スクロールは「press からここまでの移動が `ACTIVATE_PX` 以上」 のときのみ発火させ、端近くの
+    /// clip を click-and-hold しただけで view が動くのを防ぐ (実 DAW は実ドラッグで初めて端スクロール)。
+    edge_scroll_press: Option<(f32, f32)>,
 }
 
 /// M14 Phase 63k (#025): audio_drag の commit / overlay で共有する計算結果。
@@ -2907,6 +2911,67 @@ fn compute_audio_drag_outcome(
                 }
             }
         }
+    }
+}
+
+/// FIXME #89: arrangement の active drag session について edge auto-scroll の有効軸
+/// `(enable_x, enable_y)` を返す。`None` = auto-scroll 非対象 (local 操作 / drag 無し)。
+/// 横 = 時間軸 (beat)、縦 = track 方向 (track_top)。clip resize や section / ruler は横のみ、
+/// track 並べ替えは縦のみ。
+fn arrangement_edge_scroll_axes(state: &ArrangementState) -> Option<(bool, bool)> {
+    if let Some(nd) = state.clip_drag.as_ref() {
+        // Move は横 + 縦 (track 跨ぎ)、 Resize は横のみ (縦に動かさない)。
+        return Some(match nd.kind {
+            ClipDragKind::Move => (true, true),
+            ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => (true, false),
+        });
+    }
+    if state.section_drag.is_some() {
+        return Some((true, false)); // section (リージョン) は arranger lane 上の横移動のみ。
+    }
+    if state.automation_point_drag.is_some() {
+        return Some((true, false)); // automation point: 横 (time)。縦は値で scroll 軸でない。
+    }
+    if let Some(acd) = state.automation_clip_drag.as_ref() {
+        return Some(match acd.kind {
+            ClipDragKind::Move => (true, true), // lane 跨ぎ move は縦も。
+            ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => (true, false),
+        });
+    }
+    if state.automation_lasso_drag.is_some() {
+        return Some((true, true)); // automation 範囲選択は両軸。
+    }
+    if state.track_reorder.is_some() {
+        return Some((false, true)); // track 並べ替えは縦のみ (横は indent 相対)。
+    }
+    if state.loop_drag.is_some() || state.playhead_drag.is_some() {
+        return Some((true, false)); // ruler の loop / playhead seek は横のみ。
+    }
+    None
+}
+
+/// FIXME #89: active drag session の anchor を実スクロール px ぶん逆方向に shift して、掴んでいる
+/// 対象がカーソルに追従し続けるようにする (= content space delta)。相対 delta で位置を決める session
+/// (clip / section / automation point/clip / lasso) のみ対象。track 並べ替え (live 行 top 再解決) と
+/// ruler の loop/playhead (絶対 px→beat 再解決) は自動追従するので shift しない。`dy` は縦スクロール
+/// 非対象 session では 0 が渡る (= 無害)。
+fn arrangement_compensate_anchor(state: &mut ArrangementState, dx: f32, dy: f32) {
+    if let Some(nd) = state.clip_drag.as_mut() {
+        nd.anchor_mouse.0 -= dx;
+        nd.anchor_mouse.1 -= dy;
+    }
+    if let Some(sd) = state.section_drag.as_mut() {
+        sd.anchor_mouse.0 -= dx;
+    }
+    if let Some(ad) = state.automation_point_drag.as_mut() {
+        ad.anchor_mouse.0 -= dx;
+    }
+    if let Some(acd) = state.automation_clip_drag.as_mut() {
+        acd.anchor_mouse.0 -= dx;
+    }
+    if let Some(ls) = state.automation_lasso_drag.as_mut() {
+        ls.anchor.0 -= dx;
+        ls.anchor.1 -= dy;
     }
 }
 
@@ -6505,6 +6570,95 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let delta =
                     curve_param_delta_from_dy(dy, cd.effective_lane_height_px, cd.last_alt);
                 cd.preview_value = (cd.anchor_value + delta).clamp(-1.0, 1.0);
+            }
+        }
+
+        // ---- FIXME #89: ドラッグ端オートスクロール ----
+        // drag 中、pointer が lanes 端の hot-zone に入ったら view を自動スクロールし、掴んでいる対象が
+        // カーソルに追従し続ける (実 DAW 標準)。横 (beat) と縦 (track_top) の両軸。relative-delta で
+        // 位置を決める session (clip / section / automation point/clip / lasso / clip marquee) は実
+        // スクロール px ぶん anchor を逆方向に shift して追従させる (= content space delta)。track 並べ
+        // 替え (live 行 top 再解決) と ruler の loop/playhead (絶対 px→beat 再解決) は anchor shift 不要。
+        // カーソルを端で止めたままでもスクロール継続するよう `request_redraw` で次フレームを確保する。
+        if pointer.primary_pressed && !pointer.primary_just_released {
+            // 移動量ゲート: press からの移動が ACTIVATE_PX 以上のときのみ端スクロールを許可
+            // (click-and-hold で view が飛ぶのを防ぐ)。press frame で press 位置を記録。
+            let moved_enough = {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                if pointer.primary_just_pressed {
+                    state.edge_scroll_press = pointer.pos;
+                }
+                let gate = crate::widgets::edge_scroll::ACTIVATE_PX;
+                matches!((state.edge_scroll_press, pointer.pos),
+                    (Some(p), Some(c)) if (c.0 - p.0).powi(2) + (c.1 - p.1).powi(2) >= gate * gate)
+            };
+            let axes = if moved_enough {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                arrangement_edge_scroll_axes(state)
+            } else {
+                None
+            };
+            let drag_rect_wid = wid.child(b"rect_select");
+            let marquee_active = moved_enough
+                && axes.is_none()
+                && {
+                    let st: &mut crate::widgets::drag_rect::DragRectState =
+                        self.widget_state(drag_rect_wid);
+                    st.drag_start.is_some()
+                };
+            // clip marquee (空き lanes の rect-select) は両軸。
+            if let Some((ax, ay)) = axes.or_else(|| marquee_active.then_some((true, true))) {
+                let cfg = crate::widgets::edge_scroll::EdgeScrollCfg::default();
+                let (dx, dy) = crate::widgets::edge_scroll::edge_scroll_delta(
+                    pointer.pos,
+                    lanes,
+                    cfg,
+                    ax,
+                    ay,
+                );
+                if dx != 0.0 || dy != 0.0 {
+                    // 実際に適用された scroll 量 (px) を求め、その分だけ anchor を逆 shift する。
+                    let mut applied_beat_px = 0.0_f32;
+                    let mut applied_track_px = 0.0_f32;
+                    if dx != 0.0 && beat_per_px > 1e-6 {
+                        let new_start =
+                            (view.start_beat + f64::from(dx) * beat_per_px).max(0.0);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let adx = ((new_start - view.start_beat) / beat_per_px) as f32;
+                        if adx != 0.0 {
+                            applied_beat_px = adx;
+                            self.push_edit(make_edit(ArrangementEditRequest::SetScrollX(
+                                new_start,
+                            )));
+                        }
+                    }
+                    if dy != 0.0 {
+                        // 縦 scroll は既存 SetTrackTop と同じく下限 0 のみ (上限 clamp は handler 非対象、
+                        // wheel 挙動と互換)。
+                        let new_top = (view.track_top + dy).max(0.0);
+                        let ady = new_top - view.track_top;
+                        if ady != 0.0 {
+                            applied_track_px = ady;
+                            self.push_edit(make_edit(ArrangementEditRequest::SetTrackTop(
+                                new_top,
+                            )));
+                        }
+                    }
+                    if applied_beat_px != 0.0 || applied_track_px != 0.0 {
+                        if marquee_active {
+                            let st: &mut crate::widgets::drag_rect::DragRectState =
+                                self.widget_state(drag_rect_wid);
+                            if let Some(s) = st.drag_start.as_mut() {
+                                s.0 -= applied_beat_px;
+                                s.1 -= applied_track_px;
+                            }
+                        } else {
+                            let st: &mut ArrangementState = self.widget_state(wid);
+                            arrangement_compensate_anchor(st, applied_beat_px, applied_track_px);
+                        }
+                        self.request_redraw();
+                    }
+                }
             }
         }
 

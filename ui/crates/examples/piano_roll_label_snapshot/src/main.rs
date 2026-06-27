@@ -23,6 +23,7 @@ const MAJOR_MASK: u16 = 0b0000_1010_1011_0101;
 fn view_with(mode: PianoRollScaleMode) -> PianoRollView {
     PianoRollView {
         start_beat: 0.0,
+        min_start_beat: 0.0,
         len_beats: 4.0,
         // C3 (48) 〜 C5 (72) の 2 octave。 root=C なので C3/C4/C5 行に "Cn" ラベルが出る。
         pitch_top: 72.0,

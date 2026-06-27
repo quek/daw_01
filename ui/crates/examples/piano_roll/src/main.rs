@@ -95,6 +95,7 @@ impl PianoRollModel {
     fn view(&self) -> PianoRollView {
         PianoRollView {
             start_beat: self.view_start_beat,
+            min_start_beat: 0.0, // clip 概念無し (raw note 編集) → 下限 0。
             len_beats: self.view_len_beats,
             pitch_top: self.pitch_top,
             pitch_visible: self.pitch_visible,
@@ -838,6 +839,17 @@ impl App {
                                 m.loop_range = Some((start, end));
                                 m.last_action =
                                     format!("loop range → ({start:.3}, {end:.3}) beat");
+                            })
+                        }
+                        // (FIXME #89) edge auto-scroll: 横 delta 拍 / 縦 絶対 top_pitch を model に反映。
+                        PianoRollEditRequest::ScrollByBeats(by) => {
+                            Edit::mutate(move |m: &mut PianoRollModel| {
+                                m.view_start_beat = (m.view_start_beat + by).max(0.0);
+                            })
+                        }
+                        PianoRollEditRequest::SetTopPitch(p) => {
+                            Edit::mutate(move |m: &mut PianoRollModel| {
+                                m.pitch_top = f32::from(p);
                             })
                         }
                     },
