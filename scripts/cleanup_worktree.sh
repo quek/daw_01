@@ -75,27 +75,36 @@ _still_registered() {
   return 1
 }
 
-# 0 (true) if removing branch $1 loses no committed work that is not already in
-# main. TWO conditions, both required:
-#   (1) `git rev-list --no-merges main..$1` is EMPTY -- the branch has no UNIQUE
-#       NON-merge commit. This is the load-bearing guard: a bare tree/content test
-#       is NOT enough, because a branch that commits work and then reverts it (the
-#       add-then-undo / spike-then-revert / WIP-undo flow) nets to an empty tree
-#       yet holds real commits that exist ONLY on this branch -- deleting it with
-#       `branch -D` would orphan them (gc-bound data loss). The merge-flow leftover
-#       passes because its ONLY unique commit is the "merge main into feature"
-#       merge itself (excluded by --no-merges; its non-merge work already landed in
-#       main). NOTE: this is reachability-based, so squash/cherry-picked work
-#       (distinct SHA) is conservatively KEPT -- same as the old --is-ancestor.
-#   (2) `git diff --quiet main...$1` (three-dot) is EMPTY -- the branch adds no net
-#       content over main. Catches an evil merge whose extra content is carried
-#       only by a merge commit, which (1) does not inspect.
-# Any git error (bad ref / no merge-base) -> non-zero -> treated as NOT merged.
+# 0 (true) if removing branch $1 loses no committed work that is not already in main.
+# Test: `git cherry main $1` emits NO '+' line. git cherry walks every NON-MERGE commit
+# unique to $1 (i.e. in main..$1) and compares it to main BY PATCH-ID, marking it '-'
+# when an equivalent patch is already in main and '+' when it is not.
+#   * No '+' line  => every unique commit's CONTENT is in main, so deleting the branch
+#     orphans nothing. This is what lets squash / rebase / cherry-pick landings (a new
+#     SHA on main) count as merged. The old reachability test
+#     (`rev-list --no-merges main..$1` empty) reported those as UNMERGED -- which is
+#     why recover-fixme-79 (landed on main as 54186f5, patch-identical to the branch's
+#     2f9fb0c) was wrongly KEPT. Patch-id catches it.
+#   * Any '+' line => a unique commit has no patch twin in main -> NOT merged -> kept.
+#     This is the load-bearing safety guard and it is EXACT for the add-then-revert /
+#     spike-then-undo / WIP-undo flow: that branch's unique ADD commit has no patch in
+#     main, so it shows '+' and the branch is KEPT (a bare net-zero TREE test would
+#     wrongly delete it and gc-orphan the commits).
+# git cherry IGNORES merge commits, so a "merge main into feature" tip is a no-op --
+# exactly the merge-flow leftover the previous three-dot content guard mis-handled.
+# Caveat: content introduced ONLY by an evil merge (hand-edited into a merge commit,
+# never separately committed, never on main) is invisible to patch-id. This repo lands
+# work via squash / ff / ordinary merges and never hand-edits merges, so the test is
+# exact here; --force stays the escape hatch regardless.
+# Any git error (bad ref / no merge-base) -> non-zero substitution -> treated as NOT merged.
 branch_merged_into_main() {
-  local b="$1"
+  local b="$1" cherry
   [ -n "$b" ] || return 1
-  [ -z "$(git -C "$repo" rev-list --no-merges "main..$b" 2>/dev/null)" ] || return 1
-  git -C "$repo" diff --quiet "main...$b" 2>/dev/null
+  cherry="$(git -C "$repo" cherry main "$b" 2>/dev/null)" || return 1
+  case "$cherry" in
+    *'+ '*) return 1 ;;   # a unique non-merge commit has no patch-id twin in main
+    *)      return 0 ;;   # no '+' line: all unique work already in main (or none)
+  esac
 }
 
 # Kill the processes that typically hold a worktree dir open (only on --force).
@@ -151,10 +160,16 @@ remove_one() {
     # `--ignored` so unsaved gitignored deliverables (e.g. the project's untracked
     # r.md backlog, scratch design notes) also block a non-force removal --
     # plain `git status --porcelain` hides them and the dir would be deleted with
-    # the notes inside. Exclude only known-regenerable ignored trees: target/ (build
-    # cache) and third_party/ (vendored ffmpeg, a real copy restorable via
-    # `make fetch-ffmpeg`); those are always present and must not block every removal.
-    if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null | grep -vE '^!! (target|third_party)/')" ]; then
+    # the notes inside. Exclude the known-regenerable / machine-local ignored entries
+    # that are ALWAYS present in every worktree (so they must never block a removal):
+    #   * target/ build caches -- including NESTED ones such as ui/target/, hence the
+    #     (.*/)? prefix (a bare `target/` anchor missed ui/target/ and skipped every wt).
+    #   * third_party/ (vendored ffmpeg, a real copy restorable via `make fetch-ffmpeg`).
+    #   * .claude/settings.local.json -- the gitignored, harness-synced per-machine
+    #     permissions allowlist. It exists in EVERY worktree, so without this exclusion
+    #     `--all` always finds a "leftover" and skips every worktree (the bug behind
+    #     "make worktree-rm-merged したけど消えなかった"). It is config, not a deliverable.
+    if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null | grep -vE '^!! ((.*/)?target/|third_party/|\.claude/settings\.local\.json$)')" ]; then
       log "SKIP (uncommitted or unsaved gitignored changes, use --force): $wt"; return
     fi
   fi

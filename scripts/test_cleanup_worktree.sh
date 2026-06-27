@@ -12,10 +12,13 @@
 #   merged detection : A ancestor-merged, B merge-flow leftover (the motivating
 #                      fix), C unmerged, G add-then-revert net-zero (MUST be kept:
 #                      net tree is empty but the commits live only on the branch),
-#                      H squash-merged (conservatively kept).
+#                      H squash-merged (now detected via patch-id -> removed, with a
+#                      data-loss guard that the squashed content survives in main).
 #   --all gates       : D tip==main HEAD excluded, E dirty (tracked) skipped,
 #                      I_notes dirty gitignored deliverable skipped, I_target dirty
 #                      regenerable-ignored (target/) NOT a blocker -> removed,
+#                      I_local machine-local config (.claude/settings.local.json,
+#                      present in EVERY real worktree) NOT a blocker -> removed,
 #                      F orphan (no merge-base) kept, L locked skipped.
 #   remove_one guards : --name on unmerged (merge guard, the most-used path),
 #                      --path outside .claude/worktrees (location guard),
@@ -67,9 +70,16 @@ C0="$(git -C "$scratch" rev-parse HEAD)"
 
 # .gitignore on main (so checked-out branches inherit it) for the gitignored-clean
 # scenarios. notes.md = a precious untracked deliverable; target/ + third_party/ =
-# regenerable trees the clean guard must NOT treat as blocking.
-printf 'notes.md\ntarget/\nthird_party/\n' > "$scratch/.gitignore"
-git -C "$scratch" add .gitignore
+# regenerable trees the clean guard must NOT treat as blocking; .claude/settings.local.json
+# = harness-synced per-machine config that must not block either.
+# We ALSO track a real file under .claude/ (mirroring the repo's .claude/settings.json):
+# without a tracked sibling, git collapses an all-ignored dir to "!! .claude/" instead
+# of reporting "!! .claude/settings.local.json", and the I_local scenario would not
+# exercise the actual path the exclusion regex matches.
+printf 'notes.md\ntarget/\nthird_party/\n.claude/settings.local.json\n' > "$scratch/.gitignore"
+mkdir -p "$scratch/.claude"
+printf '{}\n' > "$scratch/.claude/settings.json"
+git -C "$scratch" add .gitignore .claude/settings.json
 git -C "$scratch" commit -q -m "add .gitignore"
 GI="$(git -C "$scratch" rev-parse HEAD)"
 
@@ -127,8 +137,11 @@ git -C "$scratch" commit -q -m "G remove big.rs (shelve/revert)"
 git -C "$scratch" checkout -q main
 
 # Scenario H "squash-merged": single-commit feature squashed into main (distinct
-# SHA on main). featH's commit is unique by SHA so it is conservatively KEPT
-# (same as the old --is-ancestor); documents the deliberate false-negative.
+# SHA on main). featH's commit is unique by SHA but PATCH-IDENTICAL to main's squash
+# commit, so `git cherry main featH` marks it '-' (already in main) -> branch_merged
+# is true -> --all REMOVES it. This is the patch-id upgrade: the old reachability test
+# conservatively kept it. We additionally assert the squashed content survives in main
+# so the removal proves it is non-destructive, not just permissive.
 git -C "$scratch" checkout -q -b featH "$GI"
 cm s "S1" "S1 squashed work"
 git -C "$scratch" checkout -q main
@@ -136,10 +149,14 @@ git -C "$scratch" merge -q --squash featH >/dev/null 2>&1
 git -C "$scratch" commit -q -m "squash featH into main"
 git -C "$scratch" checkout -q main
 
-# Scenarios I_notes / I_target: content-merged (ancestor) clean-of-tracked-changes
-# branches; difference is purely the gitignored content placed in the worktree.
+# Scenarios I_notes / I_target / I_local: content-merged (ancestor) clean-of-tracked-
+# changes branches; difference is purely the gitignored content placed in the worktree.
+# I_local pins the .claude/settings.local.json exclusion: that harness-synced per-machine
+# permissions file exists in EVERY real worktree, so before the fix it made --all skip
+# every worktree ("make worktree-rm-merged したけど消えなかった").
 git -C "$scratch" branch ignNotes "$GI"
 git -C "$scratch" branch ignTarget "$GI"
+git -C "$scratch" branch ignLocal "$GI"
 
 # Scenario L "locked": content-merged + clean, but git-locked. Expect: --all skips.
 git -C "$scratch" branch lockL "$GI"
@@ -170,6 +187,7 @@ git -C "$scratch" worktree add -q "$(wt G)" netG
 git -C "$scratch" worktree add -q "$(wt H)" featH
 git -C "$scratch" worktree add -q "$(wt I_notes)" ignNotes
 git -C "$scratch" worktree add -q "$(wt I_target)" ignTarget
+git -C "$scratch" worktree add -q "$(wt I_local)" ignLocal
 git -C "$scratch" worktree add -q "$(wt L)" lockL
 git -C "$scratch" worktree add -q "$scratch/outside_dir" outsideBr
 git -C "$scratch" worktree add -q --detach "$(wt DET)" main
@@ -178,6 +196,8 @@ printf 'dirty\n' >> "$(wt E)/base"                 # E: uncommitted TRACKED chan
 printf 'precious notes\n' > "$(wt I_notes)/notes.md"   # I_notes: gitignored deliverable
 mkdir -p "$(wt I_target)/target"
 printf 'cache\n' > "$(wt I_target)/target/out.bin"     # I_target: regenerable ignored only
+mkdir -p "$(wt I_local)/.claude"
+printf '{}\n' > "$(wt I_local)/.claude/settings.local.json"  # I_local: machine-local config only
 printf 'det work\n' > "$(wt DET)/det.txt"              # DET: commit unique to detached HEAD
 git -C "$(wt DET)" add det.txt
 git -C "$(wt DET)" commit -q -m "detached unique work"
@@ -199,9 +219,13 @@ wt_present "$(wt F)"  && pass "F orphan kept"                        || die "F o
 wt_present "$(wt G)"  && pass "G netzero-revert kept (regression)"   || die "G netzero-revert WRONGLY removed (DATA LOSS)"
 { branch_exists netG && commit_reachable "$G_ADD" netG; } \
                       && pass "G unique commit still reachable"      || die "G unique commit ORPHANED (DATA LOSS)"
-wt_present "$(wt H)"  && pass "H squash-merged conservatively kept"  || die "H squash-merged WRONGLY removed"
+wt_gone    "$(wt H)"  && pass "H squash-merged removed (patch-id)"   || die "H squash-merged NOT removed (patch-id regression)"
+! branch_exists featH && pass "H branch deleted"                     || die "H branch survived"
+[ "$(git -C "$scratch" show main:s 2>/dev/null)" = "S1" ] \
+                      && pass "H squashed content survives in main"  || die "H squashed content MISSING from main (DATA LOSS)"
 wt_present "$(wt I_notes)"  && pass "I_notes dirty-gitignored kept"  || die "I_notes WRONGLY removed (lost notes.md)"
 wt_gone    "$(wt I_target)" && pass "I_target (only target/) removed" || die "I_target NOT removed (regenerable ignored should not block)"
+wt_gone    "$(wt I_local)"  && pass "I_local (only .claude/settings.local.json) removed" || die "I_local NOT removed (machine-local config should not block)"
 wt_present "$(wt L)"  && pass "L locked kept"                        || die "L locked WRONGLY removed"
 
 # ---- remove_one guards via targeted modes ----------------------------------
