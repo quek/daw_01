@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 use crate::plugin_format::PluginFormat;
 use crate::scale::ScaleChange;
 
+/// `28` ビュー状態の保存 (FIXME #87): `ProjectFile.view: Option<ViewState>` 追加。
+/// ズーム / スクロール / 行高 / スナップ設定等の表示状態を `Song` の **兄弟**として
+/// 同梱する (= Song / IPC は無改変、`ViewState` は serde 専用で IPC を渡らない)。
+/// piano roll / audio editor は per-clip (`ClipKey` keyed) 記憶。旧ファイルは
+/// `#[serde(default)]` で `view == None` → 従来どおり fit-to-content にフォールバック。
+///
 /// `27` クリップ / ノートのミュート (FIXME #80): `Clip.muted: bool` (= 全 content type
 /// 共通の clip-level mute の SSoT) と `Note.muted: bool` (note 単位 mute) が追加される。
 /// `true` の clip / note は再生 / 書き出しから除外され、GUI は dim + 斜線ハッチで表示する。
@@ -158,7 +164,7 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 27;
+pub const CURRENT_VERSION: u32 = 28;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -201,6 +207,107 @@ pub mod base64_opt {
 pub struct ProjectFile {
     pub version: u32,
     pub song: Song,
+    /// v28 (FIXME #87): GUI の表示状態 (ズーム / スクロール / 行高 / スナップ等)。
+    /// `Song` の兄弟として同梱し、開き直しで「閉じたときの見た目」を復元する。
+    /// `None` = 旧ファイル / view 未保存 → loader 側で fit-to-content にフォールバック。
+    /// **serde 専用** (= `bincode::Encode/Decode` を付けない) で IPC を渡らないことを
+    /// 型レベルで保証する (`ViewState` 参照)。
+    #[serde(default)]
+    pub view: Option<ViewState>,
+}
+
+/// FIXME #87: piano roll 1 クリップ分の表示状態。`AppData.piano_roll_views`
+/// (live SSoT) と `ViewState.piano_roll_views` (永続化) の両方で `ClipKey` 単位に
+/// 保持する。`Default` は `AppData::new` / `fit_piano_roll_to_clip` の既定と一致。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PianoRollViewState {
+    /// 横ズーム (px / beat)。clamp 8..=400。
+    pub zoom_x: f32,
+    /// 縦ズーム (px / semitone)。clamp 6..=40。
+    pub zoom_y: f32,
+    /// 表示上端のピッチ (MIDI note)。clamp 11..=127。
+    pub top_pitch: u8,
+    /// 横スクロール (clip-local beats、`>= 0`)。
+    pub scroll_beat: f32,
+}
+
+impl Default for PianoRollViewState {
+    fn default() -> Self {
+        Self {
+            zoom_x: 64.0,
+            zoom_y: 14.0,
+            top_pitch: 84, // C6
+            scroll_beat: 0.0,
+        }
+    }
+}
+
+/// FIXME #87: audio editor 1 クリップ分の表示状態 (clip-relative beats)。
+/// `len_beats == 0.0` は「未設定」扱い (= クリップ全体表示にフォールバック)。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct AudioEditorViewState {
+    /// 表示開始位置 (clip 始端からの offset、beats)。
+    pub start_beat: f64,
+    /// 表示 span (beats)。`0.0` = クリップ全体。
+    pub len_beats: f64,
+}
+
+/// FIXME #87: プロジェクトに同梱する GUI 表示状態のスナップショット。
+/// `AppData` (live SSoT) から save 時に `snapshot_view_state` で作り、load 時に
+/// `restore_view_state` で流し込む。**serde 専用** (bincode derive 無し) ＝ IPC を渡らない。
+/// `ClipKey` は struct で JSON の map key にできないため、per-clip view は
+/// `Vec<(ClipKey, _)>` で持つ。各フィールドは `#[serde(default)]` で前方互換。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ViewState {
+    // ---- Arrangement (タイムラインは曲に 1 つ = グローバル) ----
+    #[serde(default)]
+    pub arrange_zoom_x: f32,
+    #[serde(default)]
+    pub arrange_scroll_beat: f32,
+    #[serde(default)]
+    pub arrange_track_top: f32,
+    #[serde(default)]
+    pub arrange_track_row_h: f32,
+    #[serde(default)]
+    pub arrange_header_w: f32,
+    /// per-track の行高 override (track_id → px)。
+    #[serde(default)]
+    pub track_row_overrides: HashMap<u32, u16>,
+    /// automation lane を展開中の track_id (順序非依存、save 時に sort)。
+    #[serde(default)]
+    pub expanded_automation_tracks: Vec<u32>,
+    #[serde(default)]
+    pub master_row_automation_expanded: bool,
+    // ---- Snap / grid / piano roll モード ----
+    #[serde(default)]
+    pub arrange_snap_enabled: bool,
+    #[serde(default)]
+    pub arrange_snap_choice: u8,
+    #[serde(default)]
+    pub pianoroll_snap_enabled: bool,
+    #[serde(default)]
+    pub pianoroll_snap_choice: u8,
+    #[serde(default)]
+    pub piano_roll_fold: bool,
+    #[serde(default)]
+    pub snap_on_draw: bool,
+    #[serde(default)]
+    pub snap_live_input: bool,
+    // ---- 下部パネル ----
+    #[serde(default)]
+    pub bottom_panel: u8,
+    // ---- クリップ選択 (= 開き直したとき「編集していたクリップ」を復元する) ----
+    /// 選択 anchor (= ピアノロール / インスペクタが表示するクリップ)。
+    #[serde(default)]
+    pub selected_clip: Option<ClipKey>,
+    /// 選択集合。
+    #[serde(default)]
+    pub selected_clips: Vec<ClipKey>,
+    // ---- per-clip view (Ableton Live / Bitwig 流) ----
+    #[serde(default)]
+    pub piano_roll_views: Vec<(ClipKey, PianoRollViewState)>,
+    #[serde(default)]
+    pub audio_editor_views: Vec<(ClipKey, AudioEditorViewState)>,
 }
 
 /// FIXME #53 (`docs/plan_arranger_track.md`): Arranger セクション (曲のパート =
@@ -5226,6 +5333,7 @@ mod tests {
         let pf = ProjectFile {
             version: CURRENT_VERSION,
             song: Song::default(),
+            view: None,
         };
         assert_eq!(json_roundtrip(&pf), pf);
     }
@@ -5322,7 +5430,10 @@ mod tests {
         // トラックへ字幕デバイスを auto-insert (`project::migrate_text_overlay_to_subtitle_device`)。
         // v27 (FIXME #80): `Clip.muted` / `Note.muted` 追加 (clip / note mute の SSoT)、v26 以前の
         // per-event mute は `project::migrate_per_event_mute_to_clip_mute` で `Clip.muted` へ畳み込む。
-        assert_eq!(CURRENT_VERSION, 27);
+        // v28 (FIXME #87): `ProjectFile.view: Option<ViewState>` 追加 (= ズーム/スクロール等の
+        // 表示状態を Song の兄弟として同梱)。Song / IPC は無改変、旧ファイルは `#[serde(default)]`
+        // で `view == None` に forward-migrate (migration 関数不要)。
+        assert_eq!(CURRENT_VERSION, 28);
     }
 
     #[test]
