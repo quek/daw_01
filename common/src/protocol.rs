@@ -243,16 +243,6 @@ pub enum ChildToMain {
         index: u32,
         param_id: u32,
     },
-    /// FIXME #90: builtin VOICEVOX plugin の歌唱/読み上げ合成スレッドの状態遷移。
-    /// `busy` = いま合成中 (= `queued_gen > done_gen`)、`failing` = 直近の HTTP 試行が
-    /// 失敗した (= engine 未起動/起動途中で接続できない)。daw_gui がこれを per-plugin に
-    /// 集約し、クリップ上スピナー + 全体オーバーレイ + engine 未接続警告を出す。
-    /// bounce 用の one-shot `VocalSynthReady` とは別系統 (こちらは継続的に状態変化を報告)。
-    VoicevoxSynthStatus {
-        plugin_id: u32,
-        busy: bool,
-        failing: bool,
-    },
 }
 
 /// Phase 2 (`docs/plan_automation.md` §7.5): 1 parameter のメタデータ。
@@ -716,14 +706,6 @@ mod tests {
             cancelled: false,
         };
         assert_eq!(roundtrip(&failed), failed);
-    }
-
-    #[test]
-    fn child_to_main_voicevox_synth_status_roundtrip() {
-        for (busy, failing) in [(false, false), (true, false), (true, true)] {
-            let msg = ChildToMain::VoicevoxSynthStatus { plugin_id: 7, busy, failing };
-            assert_eq!(roundtrip(&msg), msg);
-        }
     }
 
     #[test]

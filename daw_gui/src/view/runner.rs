@@ -856,9 +856,6 @@ impl Runner {
 
         let Some(state) = self.state.as_mut() else { return false };
         let now = Instant::now();
-        // FIXME #90: この frame の overlay / clip スピナー / engine 未接続判定が
-        // すべて同じ時刻を読むよう、frame 冒頭で 1 度だけ確定する (5s 境界の食い違い回避)。
-        state.app.frame_now = now;
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
 
@@ -1011,11 +1008,7 @@ impl Runner {
             (false, None) => {}
         }
 
-        // FIXME #90: 再生中に加え、VOICEVOX 合成/口パク生成中も連続再描画を要求して
-        // クリップ上スピナー + 全体オーバーレイを回す。engine 未接続が確定したら
-        // `voicevox_animating` が false を返すので static 警告表示で再描画は止まる
-        // (CPU/GPU を回し続けない)。overlay 描画と同じ `now` (= frame_now) を使う。
-        state.app.is_playing || state.app.voicevox_animating(now)
+        state.app.is_playing
     }
 
     /// docs/plan_video.md P4: handle a WindowEvent dispatched against

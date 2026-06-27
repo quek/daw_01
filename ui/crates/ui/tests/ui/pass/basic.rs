@@ -148,6 +148,7 @@ fn main() {
             // M9 Phase 41e: piano_roll widget が non-Clone Model でコンパイルする。
             let view = PianoRollView {
                 start_beat: 0.0,
+                min_start_beat: 0.0,
                 len_beats: 4.0,
                 pitch_top: 72.0,
                 pitch_visible: 24.0,
@@ -205,6 +206,9 @@ fn main() {
                     // non-Clone Model で `make_edit` を組み立てられることを担保。
                     PianoRollEditRequest::SetPlayheadBeat(_) => Edit::mutate(|_m: &mut Model| {}),
                     PianoRollEditRequest::SetLoopRange { .. } => Edit::mutate(|_m: &mut Model| {}),
+                    // FIXME #89: edge auto-scroll の 2 variant も non-Clone Model で組み立て可能を担保。
+                    PianoRollEditRequest::ScrollByBeats(_) => Edit::mutate(|_m: &mut Model| {}),
+                    PianoRollEditRequest::SetTopPitch(_) => Edit::mutate(|_m: &mut Model| {}),
                 },
             );
             // M9 Phase 45e: arrangement widget が non-Clone Model でコンパイルする。

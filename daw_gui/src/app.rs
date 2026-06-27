@@ -1738,22 +1738,6 @@ pub struct AppData {
     /// bump し、`mark_lipsync_dirty` が timer thread に値を渡す。timer 発火時に
     /// 値が一致していれば (= それ以降変更なし) 再生成する (rapid 編集を coalesce)。
     pub lipsync_gen: u64,
-    /// FIXME #90: 口パク (lip-sync) 背景生成が in-flight な出力先 (口 track id) の集合。
-    /// `regenerate_lipsync_for_track` の spawn 時に insert、`LipsyncGenerated` 受信で remove。
-    /// クリップ上スピナー / 全体オーバーレイ「口パク生成中」の駆動に使う (派生 UI 状態、非保存)。
-    pub lipsync_inflight: std::collections::HashSet<u32>,
-    /// FIXME #90: builtin VOICEVOX (歌唱/読み上げ) 合成の per-plugin 状態。key = host plugin_id。
-    /// `VoicevoxSynthStatus` IPC で更新。`busy` = 合成中、`failing_since = Some` は直近 HTTP が
-    /// 失敗中 (= engine 未起動/起動途中)。一定時間 (= `VOICEVOX_ENGINE_WARNING`) 続いたら
-    /// engine 未接続警告へ切り替える。plugin unload (`SlotPluginUnloadedFromChild`) で entry を消す。
-    pub voicevox_synth_status: std::collections::HashMap<u32, VocalSynthStatus>,
-    /// FIXME #90: スピナー回転位相の基準時刻 (construction で固定、単調増加)。
-    pub anim_epoch: std::time::Instant,
-    /// FIXME #90: 現フレームの時刻。`render_frame` 冒頭で 1 度設定し、その frame の
-    /// overlay / clip スピナー / engine 未接続判定がすべて**同じ時刻**を読むことで、
-    /// 「スピナー描画」と「再描画を続けるか (`voicevox_animating`)」の判定が 5s 境界で
-    /// 食い違わないようにする (= 警告へ切り替わる frame を確実に 1 枚描く)。
-    pub frame_now: std::time::Instant,
     pub is_rescanning: bool,
     pub status_message: String,
 
@@ -2314,10 +2298,6 @@ impl AppData {
             child_disconnect_log: Vec::new(),
             voicevox_launch_attempted: false,
             lipsync_gen: 0,
-            lipsync_inflight: std::collections::HashSet::new(),
-            voicevox_synth_status: std::collections::HashMap::new(),
-            anim_epoch: std::time::Instant::now(),
-            frame_now: std::time::Instant::now(),
             is_rescanning: false,
             status_message: String::new(),
             track_rename_id: None,
@@ -3938,21 +3918,6 @@ pub enum DeferredEdit {
     CutTracks { track_ids: Vec<u32> },
 }
 
-/// FIXME #90: builtin VOICEVOX (歌唱/読み上げ) 合成の 1 plugin 分の状態。
-/// `AppData.voicevox_synth_status` に key=plugin_id で保持する。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct VocalSynthStatus {
-    /// いま合成中か (= plugin host の `queued_gen > done_gen`)。
-    pub busy: bool,
-    /// 直近 HTTP 試行が失敗してから (= engine 未接続/起動途中) の起点。成功で `None`。
-    /// `Some` のまま `VOICEVOX_ENGINE_WARNING` 経過 = engine 未接続として警告に切替。
-    pub failing_since: Option<std::time::Instant>,
-}
-
-/// FIXME #90: 合成が `failing` のまま継続したとき「engine に接続できません」へ切り替える
-/// までの猶予。engine 起動 (boot) に数秒かかるので、その間は「合成中」に見せる。
-pub const VOICEVOX_ENGINE_WARNING: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// 口パク (lip-sync) 背景ジョブの 1 vocal clip 分の結果。`query_phonemes` の
 /// 出力と、生成先 clip の配置情報 (start / length / earliest note) をまとめて
 /// main thread へ渡す (`AppEvent::LipsyncGenerated`)。docs/plan_pakupaku.md §7。
@@ -5081,13 +5046,8 @@ pub enum AppEvent {
     /// この古い結果を別 project に適用して spurious dirty を生むため、 handler は
     /// `generation == lipsync_gen` のときだけ反映する (FIXME #35、 debounce
     /// leg `LipsyncDebounceFired` と対称)。
-    /// FIXME #90: 成功/失敗/空に関わらず **常に** 発行する。handler は generation に
-    /// 関わらず `target_track_id` を `lipsync_inflight` から外し (= クリップ上スピナー /
-    /// 全体オーバーレイの「口パク生成中」を解除)、その後 generation 一致 & `clips` 非空の
-    /// ときだけ口 track へ反映する。`target_track_id` は spawn 時に解決済の出力先 track id。
     LipsyncGenerated {
         vocal_track_id: u32,
-        target_track_id: u32,
         bpm: f32,
         clips: Vec<LipsyncClipResult>,
         generation: u64,
@@ -5131,15 +5091,6 @@ pub enum AppEvent {
         clip: common::model::ClipKey,
         param: TalkParamKind,
         value: f32,
-    },
-    /// FIXME #90: plugin host の builtin VOICEVOX が報告する歌唱/読み上げ合成の状態遷移。
-    /// `busy` = 合成中、`failing` = 直近 HTTP 試行が失敗 (engine 未起動/起動途中)。
-    /// `voicevox_synth_status` map を更新して、クリップ上スピナー + 全体オーバーレイ +
-    /// engine 未接続警告を駆動する。派生 UI 状態なので Undo 対象外。
-    VoicevoxSynthStatus {
-        plugin_id: u32,
-        busy: bool,
-        failing: bool,
     },
 
     // -------- WAV export -------------------------------------------------
@@ -7290,19 +7241,13 @@ impl AppData {
                 // (FIXME #36) Clip Inspector の 2 段 dropdown は `singers` を
                 // 直接読む (キャラ→style の階層が要るので flat cache は持たない)。
             }
-            AppEvent::LipsyncGenerated { vocal_track_id, target_track_id, bpm, clips, generation } => {
-                // FIXME #90: 成功/失敗/空に関わらず in-flight 解除 (= スピナーを止める)。
-                // generation が古くても (project 切替後でも) 必ず外す。
-                self.lipsync_inflight.remove(&target_track_id);
+            AppEvent::LipsyncGenerated { vocal_track_id, bpm, clips, generation } => {
                 // FIXME #35: spawn 後に project が切り替わった (reset_saved_baseline
                 // が gen を bump した) 古い結果は捨てる。 適用すると別 project の口
                 // track を作り直して spurious dirty になる。 debounce leg と同 idiom。
-                if generation == self.lipsync_gen && !clips.is_empty() {
+                if generation == self.lipsync_gen {
                     self.apply_lipsync_generated(vocal_track_id, bpm, clips);
                 }
-            }
-            AppEvent::VoicevoxSynthStatus { plugin_id, busy, failing } => {
-                self.apply_voicevox_synth_status(plugin_id, busy, failing);
             }
             AppEvent::SetLipsyncTarget { track, target } => {
                 self.set_lipsync_target(track, target);
@@ -9717,91 +9662,6 @@ impl AppData {
         }
     }
 
-    // ===== FIXME #90: VOICEVOX 生成状態の可視化 ==========================
-
-    /// FIXME #90: `VoicevoxSynthStatus` IPC handler。per-plugin の busy/failing を更新する。
-    /// failing の立上りで `failing_since` を記録 (継続中は維持)、成功で None。idle かつ
-    /// 非failing の entry は掃除して `voicevox_any_generating` 等の判定を軽く保つ。
-    fn apply_voicevox_synth_status(&mut self, plugin_id: u32, busy: bool, failing: bool) {
-        let now = std::time::Instant::now();
-        let entry = self
-            .voicevox_synth_status
-            .entry(plugin_id)
-            .or_insert(VocalSynthStatus { busy: false, failing_since: None });
-        entry.busy = busy;
-        if failing {
-            entry.failing_since.get_or_insert(now);
-        } else {
-            entry.failing_since = None;
-        }
-        if !entry.busy && entry.failing_since.is_none() {
-            self.voicevox_synth_status.remove(&plugin_id);
-        }
-    }
-
-    /// FIXME #90: track が持つ builtin VOICEVOX device の host plugin_id (= load 済なら)。
-    /// `sync_vocal_metadata` の lookup と同じ (device 実在 → loaded_slots で plugin_id)。
-    pub fn voicevox_plugin_id_for_track(&self, track: &common::model::Track) -> Option<u32> {
-        let device_index = track.devices.iter().position(|d| {
-            d.format == PluginFormat::Builtin
-                && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
-        })?;
-        self.loaded_slots
-            .get(&(track.id, device_index as u32))
-            .map(|s| s.plugin_id)
-    }
-
-    /// FIXME #90: track の歌唱/読み上げ WAV 合成が進行中か (= 所属 builtin VOICEVOX が busy)。
-    pub fn track_wav_synthesizing(&self, track_id: u32) -> bool {
-        let Some(track) = self.song.tracks.iter().find(|t| t.id == track_id) else {
-            return false;
-        };
-        let Some(pid) = self.voicevox_plugin_id_for_track(track) else {
-            return false;
-        };
-        self.voicevox_synth_status.get(&pid).is_some_and(|s| s.busy)
-    }
-
-    /// FIXME #90: 出力先 (口 track) が口パク再生成中か。
-    pub fn lipsync_target_generating(&self, track_id: u32) -> bool {
-        self.lipsync_inflight.contains(&track_id)
-    }
-
-    /// FIXME #90: いずれかの VOICEVOX 生成 (WAV 合成 / 口パク) が進行中か。
-    pub fn voicevox_any_generating(&self) -> bool {
-        !self.lipsync_inflight.is_empty()
-            || self.voicevox_synth_status.values().any(|s| s.busy)
-    }
-
-    /// FIXME #90: WAV 合成中の vocal track 数 (= 全体オーバーレイの「残り N」)。
-    /// track→plugin_id を直接引く (track_wav_synthesizing の id 再 find を避け O(tracks²) 回避)。
-    pub fn voicevox_synth_busy_count(&self) -> usize {
-        self.song
-            .tracks
-            .iter()
-            .filter(|t| {
-                self.voicevox_plugin_id_for_track(t)
-                    .is_some_and(|pid| self.voicevox_synth_status.get(&pid).is_some_and(|s| s.busy))
-            })
-            .count()
-    }
-
-    /// FIXME #90: engine 未接続警告を出すべきか (= busy のまま failing が閾値以上継続)。
-    /// engine boot (数秒) の間は failing でも警告せず「合成中」に見せ、閾値超過で切り替える。
-    pub fn voicevox_engine_unreachable(&self, now: std::time::Instant) -> bool {
-        self.voicevox_synth_status.values().any(|s| {
-            s.busy
-                && s.failing_since
-                    .is_some_and(|t| now.duration_since(t) >= VOICEVOX_ENGINE_WARNING)
-        })
-    }
-
-    /// FIXME #90: スピナーを回し続ける (= 連続再描画を要求する) べきか。engine 未接続が
-    /// 確定したら static 警告にして再描画を止める (CPU spin させない)。
-    pub fn voicevox_animating(&self, now: std::time::Instant) -> bool {
-        self.voicevox_any_generating() && !self.voicevox_engine_unreachable(now)
-    }
-
     /// PR-V3: track.source = Vocal で instrument に builtin VOICEVOX が
     /// load されている全 track の clip notes を `NoteMetadata` 配列に
     /// 変換し、 plugin host に `SetBuiltinPluginNoteMetadata` で送る。
@@ -9996,14 +9856,10 @@ impl AppData {
             return;
         }
         self.ensure_voicevox_engine();
-        // FIXME #90: 出力先 (口 track) を in-flight に登録 = クリップ上スピナー +
-        // 全体オーバーレイ「口パク生成中」を点灯。完了イベントで必ず外す。
-        self.lipsync_inflight.insert(target_id);
         // spawn 時点の世代を snapshot し、 結果と一緒に返す。 HTTP が遅延して
         // いる間に project が切り替わる (reset_saved_baseline が gen を bump) と
         // handler 側で破棄される (FIXME #35)。
         let generation = self.lipsync_gen;
-        let target_track_id = target_id;
         let proxy = self.event_proxy.clone();
         std::thread::spawn(move || {
             let mut clips = Vec::with_capacity(snaps.len() + talk_snaps.len());
@@ -10039,16 +9895,15 @@ impl AppData {
                     }
                 }
             }
-            // FIXME #90: 成功/失敗/空に関わらず **必ず** 送る。handler が
-            // `lipsync_inflight` から target を外してスピナーを止める。clips が空なら
-            // (= 全 HTTP 失敗) handler 側で「既存 clip を温存」して反映だけスキップする。
-            proxy.send(AppEvent::LipsyncGenerated {
-                vocal_track_id,
-                target_track_id,
-                bpm,
-                clips,
-                generation,
-            });
+            // 全 clip が失敗したら既存 clip を温存 (transient な engine 落ち対策)。
+            if !clips.is_empty() {
+                proxy.send(AppEvent::LipsyncGenerated {
+                    vocal_track_id,
+                    bpm,
+                    clips,
+                    generation,
+                });
+            }
         });
     }
 
@@ -17910,9 +17765,6 @@ impl AppData {
         // slot 単位 cache からも、 同 plugin_id を持つ entry を retain で外す。
         self.loaded_slots
             .retain(|_, info| info.plugin_id != plugin_id);
-        // FIXME #90: builtin VOICEVOX が外れたら合成状態 entry も消す (busy のまま残ると
-        // overlay / スピナーが消えない)。plugin host の deactivate も idle を報告するが二重防御。
-        self.voicevox_synth_status.remove(&plugin_id);
         // PR3.3: drop the latency entry for the destroyed plugin and
         // recompute every track's total since the chain shape changed.
         self.plugin_latencies.remove(&plugin_id);

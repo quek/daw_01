@@ -11,6 +11,7 @@ pub mod checkbox;
 pub mod color_picker;
 pub mod drag_in_rect;
 pub mod drag_rect;
+pub(crate) mod edge_scroll;
 pub mod dropdown;
 pub mod fader;
 pub mod heavy;

@@ -12,7 +12,7 @@ use crate::app::{AppData, AppEvent};
 use crate::view::{
     arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
     font_picker, load_overlay, plugin_picker, recovery_modal, snap, status_bar, track_inspector,
-    track_picker, transport, voicevox_overlay,
+    track_picker, transport,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -110,9 +110,6 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
 
     // 非ブロック overlay: プロジェクトロードの進捗 (FIXME #24)。
     load_overlay::draw(app, ui, screen);
-
-    // 非ブロック overlay: VOICEVOX wav 合成 / 口パク生成の進行状態 (FIXME #90)。
-    voicevox_overlay::draw(app, ui, screen);
 
     // Modal: send 宛先トラックピッカー。app.send_picker == Some(..) のとき開く。
     track_picker::draw(app, ui, screen);

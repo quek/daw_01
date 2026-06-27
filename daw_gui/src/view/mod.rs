@@ -24,4 +24,3 @@ pub mod track_color;
 pub mod track_inspector;
 pub mod track_picker;
 pub mod transport;
-pub mod voicevox_overlay;

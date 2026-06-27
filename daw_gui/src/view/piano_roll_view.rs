@@ -152,6 +152,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let view = PianoRollView {
         // song-absolute = clip-local scroll + clip 開始位置 (FIXME #3)。
         start_beat: app.pianoroll_scroll_beat() as f64 + clip_start_beat,
+        // FIXME #89: 左へスクロールできる下限 = clip 開始拍 (= pianoroll_scroll_beat >= 0)。
+        min_start_beat: clip_start_beat,
         len_beats: (grid_rect.w / zoom_x) as f64,
         pitch_top: app.pianoroll_top_pitch() as f32,
         pitch_visible: grid_h / zoom_y,
@@ -290,6 +292,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     app.handle_event(AppEvent::SetLoopRange { start, end });
                 })
             }
+            // FIXME #89: edge auto-scroll の横スクロール (delta 拍)。widget は clip 相対オフセットを
+            // 知らないので delta で渡る → ここで `pianoroll_scroll_beat` に加算 (handler が `>= 0` clamp)。
+            PianoRollEditRequest::ScrollByBeats(by) => Edit::mutate(move |app: &mut AppData| {
+                // f64 で加算してから 1 度だけ f32 に丸める (精度保持)。handler が `>= 0` clamp する。
+                #[allow(clippy::cast_possible_truncation)]
+                let next = (f64::from(app.pianoroll_scroll_beat()) + by) as f32;
+                app.handle_event(AppEvent::SetPianoRollScrollX(next));
+            }),
+            // FIXME #89: edge auto-scroll の縦 (pitch) スクロール (絶対 top_pitch、widget が clamp 済)。
+            PianoRollEditRequest::SetTopPitch(p) => Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::SetPianoRollTopPitch(p));
+            }),
         }
     };
 
