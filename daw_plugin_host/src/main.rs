@@ -65,6 +65,14 @@ pub enum PluginEvent {
     VocalSynthReady {
         plugin_id: u32,
     },
+    /// FIXME #90: builtin VOICEVOX の synth thread の状態遷移 (busy / failing)。
+    /// `set_voicevox_status_reporter` で仕込んだ callback が任意スレッドから emit する。
+    /// `ChildToMain::VoicevoxSynthStatus` に変換して daw_gui へ継続報告する。
+    VoicevoxSynthStatus {
+        plugin_id: u32,
+        busy: bool,
+        failing: bool,
+    },
     SlotPluginLoaded {
         track: u32,
         index: u32,
@@ -154,6 +162,9 @@ impl From<PluginEvent> for ChildToMain {
             }
             PluginEvent::VocalSynthReady { plugin_id } => {
                 ChildToMain::VocalSynthReady { plugin_id }
+            }
+            PluginEvent::VoicevoxSynthStatus { plugin_id, busy, failing } => {
+                ChildToMain::VoicevoxSynthStatus { plugin_id, busy, failing }
             }
             PluginEvent::PluginsReinitDone => ChildToMain::PluginsReinitDone,
             PluginEvent::SlotPluginLoaded {
@@ -1115,6 +1126,28 @@ fn plugin_main_loop(
                                     params,
                                     has_embedded_gui,
                                 });
+                                // FIXME #90: builtin VOICEVOX なら合成状態 reporter を仕込む。
+                                // synth thread が busy/failing 遷移ごとに呼び、daw_gui へ継続
+                                // 報告する (= クリップ上スピナー + 全体オーバーレイ + engine
+                                // 未接続警告)。voicevox_synth_progress().is_some() = builtin
+                                // VOICEVOX 判定 (それ以外は default no-op なので Box を作らない)。
+                                if unsafe { (*p).voicevox_synth_progress().is_some() } {
+                                    let evt = evt_tx.clone();
+                                    let pid = new_plugin_id;
+                                    unsafe {
+                                        (*p).set_voicevox_status_reporter(Box::new(
+                                            move |busy, failing| {
+                                                let _ = evt.send(
+                                                    PluginEvent::VoicevoxSynthStatus {
+                                                        plugin_id: pid,
+                                                        busy,
+                                                        failing,
+                                                    },
+                                                );
+                                            },
+                                        ));
+                                    }
+                                }
                             }
                         }
                         Err(e) => {

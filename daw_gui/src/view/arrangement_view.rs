@@ -719,6 +719,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         draw_audio_clip_value_overlay(app, ui, *clip_key, *rect);
         draw_midi_clip_notes(app, ui, *clip_key, *rect, lanes_x, is_selected, &style);
 
+        // FIXME #90: VOICEVOX 生成中マーカー。歌唱/読み上げトラックが合成中なら
+        // そのトラックの全 clip に、口パク再生成中なら口 track の auto_lipsync clip に、
+        // 右上角へ回転スピナーを出す (= このクリップはまだ最新を反映していない の合図)。
+        draw_clip_synth_spinner(app, ui, *clip_key, *rect);
+
         // clip rename mode 中はこの clip rect の上端に text_input を重ね描き。
         // track rename と同 idiom (text_input_at_focused が click で focus 取得、
         // Enter commit / Esc は root の escape handler が CancelRenameClip 発行)。
@@ -2692,6 +2697,61 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
             app.handle_event(AppEvent::FitArrangeToContent);
         })
     });
+}
+
+// ---------------------------------------------------------------------------
+// FIXME #90: VOICEVOX 生成中クリップの右上スピナー
+// ---------------------------------------------------------------------------
+
+/// 生成中マーカーのスピナー色 (= どのクリップ色の上でも視認できる near-white)。
+const SPINNER_CLIP_COLOR: Color = Color { r: 0.96, g: 0.98, b: 1.0, a: 0.95 };
+
+/// FIXME #90: VOICEVOX 生成中のクリップ右上角に回転スピナーを重ねる。
+///
+/// 歌唱/読み上げトラックが合成中ならそのトラックの全 clip に、口パク再生成中なら
+/// 出力先 (口) track の `auto_lipsync` clip に出す。印が消える = そのクリップが最新を
+/// 反映した、の合図 (grill-me 確定)。rect が小さい (zoom out) ときは名前/枠に被るので省略する。
+fn draw_clip_synth_spinner(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    clip_key: ClipKey,
+    clip_rect: Rect,
+) {
+    // idle フレーム (生成なし) は per-clip の track 探索を一切しない。
+    if app.voicevox_synth_status.is_empty() && app.lipsync_inflight.is_empty() {
+        return;
+    }
+    if clip_rect.w < 28.0 || clip_rect.h < 16.0 {
+        return;
+    }
+    let wav = app.track_wav_synthesizing(clip_key.track);
+    let lip = app.lipsync_target_generating(clip_key.track)
+        && app
+            .song
+            .tracks
+            .iter()
+            .find(|t| t.id == clip_key.track)
+            .and_then(|t| t.clips.iter().find(|c| c.id == clip_key.clip))
+            .is_some_and(|c| c.auto_lipsync);
+    if !wav && !lip {
+        return;
+    }
+    let phase = super::voicevox_overlay::spinner_phase(
+        app.frame_now.duration_since(app.anim_epoch),
+        super::voicevox_overlay::SPINNER_PERIOD,
+    );
+    let r = 6.0;
+    let cx = clip_rect.x + clip_rect.w - (r + 5.0);
+    let cy = clip_rect.y + (r + 4.0);
+    super::voicevox_overlay::draw_spinner(
+        ui,
+        (b"vox_clip_spin", clip_key.track, clip_key.clip),
+        cx,
+        cy,
+        r,
+        phase,
+        SPINNER_CLIP_COLOR,
+    );
 }
 
 // ---------------------------------------------------------------------------

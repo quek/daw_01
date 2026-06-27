@@ -393,6 +393,9 @@ fn spawn_incoming_bridge(
                 ChildToMain::VocalSynthReady { plugin_id } => {
                     Some(AppEvent::VocalSynthReady { plugin_id })
                 }
+                ChildToMain::VoicevoxSynthStatus { plugin_id, busy, failing } => {
+                    Some(AppEvent::VoicevoxSynthStatus { plugin_id, busy, failing })
+                }
                 ChildToMain::Hello { .. } => None,
                 // Phase 2 (`docs/plan_automation.md` §7.5): plugin の
                 // parameter 一覧 / touch / value change を AppEvent に
