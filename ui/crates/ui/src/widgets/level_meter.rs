@@ -25,7 +25,7 @@
 use std::hash::Hash;
 use std::time::Instant;
 
-use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
@@ -168,21 +168,21 @@ pub struct LevelMeterStyle {
 impl Default for LevelMeterStyle {
     fn default() -> Self {
         Self {
-            bg: Color::rgb(0.08, 0.09, 0.11),
-            low: Color::rgb(0.30, 0.85, 0.35),
-            mid: Color::rgb(0.95, 0.85, 0.30),
-            high: Color::rgb(0.95, 0.55, 0.25),
-            clip: Color::rgb(0.95, 0.30, 0.30),
-            peak_hold_color: Color::rgb(0.95, 0.97, 1.0),
+            bg: theme::INSET_BG,
+            low: theme::METER_GREEN,
+            mid: theme::METER_YELLOW,
+            high: theme::METER_ORANGE,
+            clip: theme::METER_RED,
+            peak_hold_color: theme::TEXT,
             db_range: (-60.0, 6.0),
             peak_hold_ms: PEAK_HOLD_DEFAULT_MS,
             scale: None,
             peak_readout: false,
-            scale_text_color: Color::rgba(0.74, 0.78, 0.84, 0.95),
-            scale_tick_color: Color::rgba(0.66, 0.70, 0.77, 0.95),
-            scale_zero_color: Color::rgb(0.90, 0.92, 0.98),
-            peak_readout_color: Color::rgb(0.86, 0.89, 0.94),
-            peak_readout_over_color: Color::rgb(0.95, 0.35, 0.32),
+            scale_text_color: theme::TEXT_DIM.with_alpha(0.95),
+            scale_tick_color: theme::TEXT_DIM.with_alpha(0.95),
+            scale_zero_color: theme::TEXT,
+            peak_readout_color: theme::TEXT,
+            peak_readout_over_color: theme::METER_RED,
         }
     }
 }
@@ -336,7 +336,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.push_rect(RectCommand {
             rect,
             fill: style.bg,
-            border: Color::rgb(0.20, 0.22, 0.26),
+            border: theme::BORDER,
             border_width: 1.0,
             radius: [2.0; 4],
             clip_rect: None,
@@ -512,7 +512,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let chip_x = rect.x + ((rect.w - chip_w).max(0.0)) * 0.5;
         self.push_rect(RectCommand {
             rect: Rect { x: chip_x, y: rect.y + 1.0, w: chip_w, h: READOUT_H },
-            fill: Color::rgba(0.0, 0.0, 0.0, 0.78),
+            fill: theme::BACKDROP.with_alpha(0.78),
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [2.0; 4],

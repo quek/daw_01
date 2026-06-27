@@ -4,7 +4,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 
 use crate::id::WidgetId;
 use crate::ui::{Ui, hovered, pressed_inside};
@@ -108,11 +108,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let pressed = pressed_inside(handle_hit, pointer);
         let hover = hovered(handle_hit, pointer);
         let fill = if pressed {
-            Color::rgb(0.55, 0.78, 0.95)
+            theme::BORDER_FOCUS
         } else if hover {
-            Color::rgb(0.35, 0.40, 0.48)
+            theme::BORDER.lighten(0.15)
         } else {
-            Color::rgb(0.25, 0.28, 0.33)
+            theme::BORDER
         };
         self.push_rect(RectCommand {
             rect: handle,

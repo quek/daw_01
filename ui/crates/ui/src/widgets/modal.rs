@@ -15,7 +15,7 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::ui::Ui;
@@ -39,8 +39,8 @@ pub struct ModalStyle {
 impl Default for ModalStyle {
     fn default() -> Self {
         Self {
-            overlay_color: Color::rgba(0.0, 0.0, 0.0, 0.6),
-            panel_bg: Color::rgb(0.14, 0.15, 0.18),
+            overlay_color: theme::BACKDROP,
+            panel_bg: theme::PANEL,
             panel_radius: 6.0,
             close_on_outside_click: true,
             close_on_escape: true,

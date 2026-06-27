@@ -16,7 +16,7 @@
 use std::hash::Hash;
 
 use daw_ui_platform::{ElementState, PhysicalKey};
-use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -641,11 +641,11 @@ fn draw_text_input<M: ?Sized + 'static>(
     preedit: &str,
 ) {
     // 背景。
-    let bg_fill = Color::rgb(0.08, 0.09, 0.11);
+    let bg_fill = theme::INSET_BG;
     let border = if focused {
-        Color::rgb(0.55, 0.78, 0.95)
+        theme::BORDER_FOCUS
     } else {
-        Color::rgb(0.30, 0.33, 0.39)
+        theme::BORDER
     };
     ui.push_rect(RectCommand {
         rect,
@@ -684,8 +684,8 @@ fn draw_text_input<M: ?Sized + 'static>(
         let sel_w = sel_hi_w - sel_lo_w;
         ui.push_rect(RectCommand {
             rect: Rect { x: sel_x, y: ty, w: sel_w, h: line_h },
-            fill: Color::rgba(0.30, 0.50, 0.85, 0.45),
-            border: Color::rgba(0.0, 0.0, 0.0, 0.0),
+            fill: theme::ACCENT.with_alpha(0.45),
+            border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
             clip_rect: Some(rect),
@@ -712,7 +712,7 @@ fn draw_text_input<M: ?Sized + 'static>(
             top: ty,
             font_size,
             line_height: line_h,
-            color: Color::rgb(0.92, 0.92, 0.94),
+            color: theme::TEXT,
             clip_rect: None,
             ..GlyphArea::default()
         });
@@ -726,6 +726,8 @@ fn draw_text_input<M: ?Sized + 'static>(
             segments: vec![LineSegment {
                 a: [pre_x, underline_y],
                 b: [pre_x + preedit_w, underline_y],
+                // IME composition (preedit) 専用の下線マーカー。 警告色でも選択色でもない
+                // composition affordance で、 対応する theme token が無いため literal 維持。
                 color: Color::rgb(0.95, 0.85, 0.55),
             }]
             .into(),
@@ -743,7 +745,7 @@ fn draw_text_input<M: ?Sized + 'static>(
             segments: vec![LineSegment {
                 a: [cursor_x, cursor_y],
                 b: [cursor_x, cursor_y + cursor_h],
-                color: Color::rgb(0.95, 0.97, 1.0),
+                color: theme::TEXT,
             }]
             .into(),
             line_width_px: 1.5,

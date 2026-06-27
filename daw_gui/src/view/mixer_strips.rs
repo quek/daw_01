@@ -13,7 +13,7 @@ use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, MeterScale, ToggleButto
 use crate::view::modulation::{build_mod, push_mod_drag_resync};
 use crate::view::param_gesture::push_param_gesture_edges;
 use crate::view::track_color;
-use daw_ui_renderer::{Color, Rect, RectCommand};
+use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ModControlDomain};
 
@@ -55,31 +55,37 @@ const COLOR_STRIP_W: f32 = 4.0;
 /// 「＋ Return」 ボタンの高さ (returns 帯の上端に置く)。
 const ADD_RETURN_H: f32 = 22.0;
 
-const COLOR_BG: Color = Color { r: 0.13, g: 0.13, b: 0.15, a: 1.0 };
-const COLOR_STRIP_BG: Color = Color { r: 0.18, g: 0.18, b: 0.22, a: 1.0 };
+/// mixer ビューの最下層 backdrop (= strip が浮く床)。strip 本体 = PANEL より
+/// 一段沈める必要があるので view base の WINDOW_BG を使う。
+const COLOR_BG: Color = theme::WINDOW_BG;
+/// 通常 track strip 本体 (elevation-1 = theme の "strip body")。
+const COLOR_STRIP_BG: Color = theme::PANEL;
 /// Return strip — 緑寄りの tint で、 通常 track / group bus とも別物だと
 /// 一目で分かるようにする (Ableton の return track 列のメタファ)。
+/// theme に return 帯専用の surface token は無いので one-off リテラルを維持。
 const COLOR_RETURN_BG: Color = Color { r: 0.18, g: 0.28, b: 0.22, a: 1.0 };
-/// returns 帯と通常帯を分ける縦 divider の色。
+/// returns 帯と通常帯を分ける縦 divider の色。COLOR_RETURN_BG と対の緑系
+/// 一点物で theme token が無いためリテラルを維持。
 const COLOR_RETURN_DIVIDER: Color = Color { r: 0.30, g: 0.40, b: 0.32, a: 1.0 };
-const COLOR_MASTER_BG: Color = Color { r: 0.22, g: 0.22, b: 0.28, a: 1.0 };
-const COLOR_TEXT: Color = Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 };
+/// master strip 本体 (elevation-2 = theme の "master strip")。
+const COLOR_MASTER_BG: Color = theme::PANEL_RAISED;
+const COLOR_TEXT: Color = theme::TEXT;
 /// Mute active 時の背景色 (= 業界標準の赤)。 旧 hint band 色を on_color に昇格
 /// (gui_01 #052 で hint_band 廃止 → ON は背景色のみで表現する idiom に統一)。
-const COLOR_MUTE_ACTIVE: Color = Color { r: 0.86, g: 0.27, b: 0.27, a: 1.0 };
+const COLOR_MUTE_ACTIVE: Color = theme::RECORD;
 /// Solo active 時の背景色 (= 業界標準の黄)。 同様に旧 hint band 色を on_color に昇格。
-const COLOR_SOLO_ACTIVE: Color = Color { r: 0.90, g: 0.78, b: 0.31, a: 1.0 };
+const COLOR_SOLO_ACTIVE: Color = theme::SOLO;
 /// 黄背景 (Solo) と組み合わせる黒文字 (= 白文字では視認性低い、 STYLE_CLICK と同 idiom)。
-const COLOR_TEXT_BLACK: Color = Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 };
+const COLOR_TEXT_BLACK: Color = theme::TEXT_ON_BRIGHT;
 
 const TOGGLE_BUTTON_BASE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: Color { r: 0.22, g: 0.22, b: 0.26, a: 1.0 },
-    on_color: Color { r: 0.30, g: 0.30, b: 0.36, a: 1.0 },
-    border: Color { r: 0.35, g: 0.38, b: 0.45, a: 1.0 },
+    off_color: theme::CONTROL,
+    on_color: theme::CONTROL_ACTIVE,
+    border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
     font_size: 12.0,
-    text_color: Color { r: 0.92, g: 0.93, b: 0.96, a: 1.0 },
+    text_color: theme::TEXT,
     on_text_color: None,
 };
 
@@ -103,9 +109,9 @@ const STYLE_SEND_MUTE: ToggleButtonStyle = ToggleButtonStyle {
     ..TOGGLE_BUTTON_BASE
 };
 
-/// Pre/Post 切替トグル。 PreFader のとき on_color (青系) で強調する。
+/// Pre/Post 切替トグル。 PreFader のとき on_color (accent) で強調する。
 const STYLE_SEND_PREPOST: ToggleButtonStyle = ToggleButtonStyle {
-    on_color: Color { r: 0.32, g: 0.55, b: 0.85, a: 1.0 },
+    on_color: theme::ACCENT,
     font_size: SEND_PREPOST_FONT,
     ..TOGGLE_BUTTON_BASE
 };

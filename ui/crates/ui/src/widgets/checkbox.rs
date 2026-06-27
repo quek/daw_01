@@ -5,12 +5,12 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{theme, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
-use crate::ui::{Ui, lerp_color};
+use crate::ui::Ui;
 
 /// checkbox の永続状態 (button と同形式)。
 #[derive(Debug, Default)]
@@ -124,24 +124,24 @@ fn draw_checkbox<M: ?Sized + 'static>(
     let box_y = rect.y + (rect.h - BOX_SIZE) * 0.5;
     let box_rect = Rect { x: rect.x, y: box_y, w: BOX_SIZE, h: BOX_SIZE };
 
-    let base = Color::rgb(0.10, 0.11, 0.13);
-    let hover_c = Color::rgb(0.18, 0.20, 0.24);
-    let press_c = Color::rgb(0.32, 0.55, 0.85);
-    let checked_c = Color::rgb(0.32, 0.55, 0.85);
+    let base = theme::CONTROL;
+    let hover_c = theme::CONTROL_HOVER;
+    let press_c = theme::ACCENT;
+    let checked_c = theme::ACCENT;
 
     let bg_fill = if checked {
         checked_c
     } else if pressed {
         press_c
     } else if hovered {
-        lerp_color(base, hover_c, 0.85)
+        base.lerp(hover_c, 0.85)
     } else {
         base
     };
     let border_c = if hovered || checked {
-        Color::rgb(0.55, 0.62, 0.74)
+        theme::BORDER_FOCUS
     } else {
-        Color::rgb(0.35, 0.38, 0.45)
+        theme::BORDER
     };
 
     ui.push_rect(RectCommand {
@@ -162,7 +162,7 @@ fn draw_checkbox<M: ?Sized + 'static>(
         let p1 = [cx + s * 0.22, cy + s * 0.50];
         let p2 = [cx + s * 0.42, cy + s * 0.72];
         let p3 = [cx + s * 0.78, cy + s * 0.30];
-        let check_color = Color::rgb(0.95, 0.97, 1.0);
+        let check_color = theme::TEXT_ON_ACCENT;
         ui.push_lines(LineBatch {
             segments: vec![
                 LineSegment { a: p1, b: p2, color: check_color },
@@ -186,7 +186,7 @@ fn draw_checkbox<M: ?Sized + 'static>(
             top: ty,
             font_size,
             line_height: line_h,
-            color: Color::rgb(0.92, 0.92, 0.94),
+            color: theme::TEXT,
             clip_rect: None,
             ..GlyphArea::default()
         });

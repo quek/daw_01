@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("row3 = {:?}", chosen.1);
 
     let mut scene = Scene::new();
-    scene.clear_color = Color::rgb(0.08, 0.09, 0.11).to_wgpu();
+    scene.clear_color = daw_ui_renderer::theme::WINDOW_BG.to_wgpu();
 
     let fonts: [Option<&str>; 3] = [None, Some(&chosen.0), Some(&chosen.1)];
     for (i, font) in fonts.iter().enumerate() {
