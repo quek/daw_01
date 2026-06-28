@@ -300,7 +300,7 @@ mod tests {
     use crate::model::{
         Clip, ClipContent, InstrumentSource, MidiContent, Note, TextContent, TextEvent, Track,
     };
-    use crate::model::{AudioEditorViewState, ClipKey, PianoRollViewState, ViewState};
+    use crate::model::{AudioEditorViewState, ClipKey, FollowMode, PianoRollViewState, ViewState};
     use tempfile::tempdir;
 
     /// per-clip view + globals を含む代表的な `ViewState`。
@@ -314,6 +314,7 @@ mod tests {
             track_row_overrides: [(1u32, 64u16), (3, 120)].into_iter().collect(),
             expanded_automation_tracks: vec![2, 5],
             master_row_automation_expanded: true,
+            arrange_follow: FollowMode::Page,
             arrange_snap_enabled: false,
             arrange_snap_choice: 4,
             pianoroll_snap_enabled: true,

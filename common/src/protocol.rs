@@ -134,6 +134,12 @@ pub enum ChildToMain {
         plugin_id: u32,
         shmem_id: String,
         state_load_error: Option<String>,
+        /// パラアウト (docs/plan_paraout.md): how many `is_main=false` audio
+        /// output ports this plugin declared (0 for the common single-out
+        /// case). The GUI caches it to know how many child tracks to create on
+        /// "explode" and how many routing rows to show. CLAP only (VST3 /
+        /// builtin report 0).
+        aux_output_count: u8,
     },
     /// Reply to `RequestSlotState`. `None` = plugin unavailable or state
     /// extension missing.

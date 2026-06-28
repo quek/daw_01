@@ -86,6 +86,7 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.toggle_loop", keys: &["P"], category: ShortcutCategory::Transport, description: "ループ ON / OFF", hidden: false },
     ShortcutDef { name: "daw.loop_selected_clip", keys: &["R"], category: ShortcutCategory::Transport, description: "選択クリップの範囲をループして再生 (再押下で解除)", hidden: false },
     ShortcutDef { name: "daw.play_from_cursor", keys: &["F"], category: ShortcutCategory::Transport, description: "カーソル位置から再生 (Alt で吸着なし)", hidden: false },
+    ShortcutDef { name: "daw.cycle_arrange_follow", keys: &["Alt+F"], category: ShortcutCategory::Transport, description: "再生追従スクロール: OFF → 連続 → ページ を循環", hidden: false },
     // ----- トラック -----
     ShortcutDef { name: "daw.add_track", keys: &["Ctrl+T"], category: ShortcutCategory::Track, description: "トラックを追加", hidden: false },
     ShortcutDef { name: "daw.group_tracks", keys: &["Ctrl+G"], category: ShortcutCategory::Track, description: "選択トラックをグループ化", hidden: false },

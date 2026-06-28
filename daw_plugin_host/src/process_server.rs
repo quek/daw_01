@@ -710,6 +710,13 @@ fn run_worker(
         for flag in &mut pd.aux_in_active {
             *flag = 0;
         }
+        // パラアウト (docs/plan_paraout.md): clear aux_out_active up front so a
+        // failed / skipped process() (or a plugin that dropped an aux port on
+        // rescan) never leaves a stale "active" flag for the engine to read.
+        // The process_ok block below re-asserts it per declared port.
+        for flag in &mut pd.aux_out_active {
+            *flag = 0;
+        }
 
         let transport = crate::plugin_instance::TransportContext::from_process_data(pd);
         // builtin / Rust 製 plugin が process() で panic すると unwind が
@@ -759,6 +766,24 @@ fn run_worker(
                 pd.buffer_out[1][..n].copy_from_slice(&out_r[..n]);
             } else {
                 pd.buffer_out[1][..n].fill(0.0);
+            }
+
+            // パラアウト (docs/plan_paraout.md): copy each declared aux output
+            // port into pd.buffer_aux_out so the audio engine's
+            // `NodeOp::ParallelOutTap` can route it to its destination track,
+            // same buffer (zero latency). Mono aux ports duplicate L→R. Ports
+            // the plugin doesn't declare return None ⇒ aux_out_active stays 0
+            // (cleared above) and the engine never reads them.
+            for port in 0..common::process_data::MAX_AUX_OUT {
+                let Some(aux_l) = plugin.aux_output_buffer(port, 0) else {
+                    continue;
+                };
+                let aux_r = plugin
+                    .aux_output_buffer(port, 1)
+                    .unwrap_or(aux_l);
+                pd.buffer_aux_out[port][0][..n].copy_from_slice(&aux_l[..n]);
+                pd.buffer_aux_out[port][1][..n].copy_from_slice(&aux_r[..n]);
+                pd.aux_out_active[port] = 1;
             }
 
             // Drain plugin output events back into the shmem.

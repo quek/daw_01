@@ -794,6 +794,13 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
 
+    // Alt+F: 再生追従スクロールの方式を循環 (OFF → 連続 → ページ)。
+    if ui.take_shortcut("daw.cycle_arrange_follow") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::CycleArrangeFollow);
+        }));
+    }
+
     // トラック copy/cut の非同期結果 (plugin state 収集後) を OS clipboard へ flush。
     if let Some(text) = app.pending_clipboard_write.clone() {
         ui.set_clipboard_text(text);

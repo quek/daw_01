@@ -146,6 +146,7 @@ fn fake_plugin_loaded(
         // テストは state 復元 path をシミュレートしない (= initial_state =
         // None でロードしたのと等価)。
         state_load_error: None,
+        aux_output_count: 0,
     });
 }
 

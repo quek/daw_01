@@ -1282,17 +1282,45 @@ pub fn process_track_owned(
     // to overwrite. PR2 phase 1 keeps "group ignores its own clips /
     // instrument" semantics; phase 5 will switch to Reaper's folder
     // model where the group's own clips also feed the post-fx mix.
-    let has_children = song
-        .map(|s| s.tracks.iter().any(|t| t.parent_group_id == Some(song_track.id)))
-        .unwrap_or(false);
-    if has_children {
-        scratch.track_l[..n].fill(0.0);
-        scratch.track_r[..n].fill(0.0);
-        scratch.peak_l = 0.0;
-        scratch.peak_r = 0.0;
-        scratch.effective_mute = false;
-        return;
-    }
+    // パラアウト (docs/plan_paraout.md) + pass-1 bus classification.
+    // A group / return / parallel-out-dest track is summed + FX'd in pass 2
+    // (`run_group_fx_chain`), so it must NOT run its device chain here in pass 1
+    // — doing so would double-process stateful FX (a return's delay / reverb
+    // would advance at 2× and any aux-dest EQ would see a spurious silent
+    // block). This also fixes a latent bug where returns (incoming sends, no
+    // children) were not skipped before paraout existed.
+    //
+    // EXCEPTION — group-with-instrument: a group whose own device chain has a
+    // routed aux output (a multi-out instrument feeding child tracks that sum
+    // back into it). Its **instrument prefix** `[0..split]` runs here in pass 1
+    // to produce the track's own main signal AND fill `buffer_aux_out` for the
+    // children; the **suffix FX** `[split..]` + strip run in pass 2 on the
+    // summed bus (own main + children). `device_end` bounds the pass-1 device
+    // loop; `skip_strip` defers the volume/pan strip + pre-fader/pre-fx
+    // snapshots to pass 2.
+    let (device_end, skip_strip) = match song {
+        Some(s) => {
+            let id = song_track.id;
+            let has_children = s.track_has_children(id);
+            let split = song_track.paraout_split_device();
+            if has_children && split.is_some() {
+                (split.unwrap_or(0) as usize, true)
+            } else if has_children
+                || s.track_receives_send(id)
+                || s.track_receives_paraout(id)
+            {
+                scratch.track_l[..n].fill(0.0);
+                scratch.track_r[..n].fill(0.0);
+                scratch.peak_l = 0.0;
+                scratch.peak_r = 0.0;
+                scratch.effective_mute = false;
+                return;
+            } else {
+                (song_track.devices.len(), false)
+            }
+        }
+        None => (song_track.devices.len(), false),
+    };
 
     // ---- Sequencer: assemble this buffer's MIDI bus ----
     scratch.midi_bus_a.clear();
@@ -1373,13 +1401,18 @@ pub fn process_track_owned(
 
     // docs/plan_modulation_followups.md §1: snapshot the **pre-FX** signal (the
     // raw audio clip / input before the device chain) for any PreFx tap / mod
-    // source. Guarded so untouched tracks skip the memcpy — RT-safe.
-    if song.is_some_and(|s| track_needs_prefx_snapshot(s, track_id)) {
+    // source. Guarded so untouched tracks skip the memcpy — RT-safe. For a
+    // group-with-instrument prefix (`skip_strip`) the meaningful pre-FX tap is
+    // the summed bus before the suffix FX, captured in pass 2
+    // (`run_group_fx_chain`), so skip the pass-1 capture here.
+    if !skip_strip && song.is_some_and(|s| track_needs_prefx_snapshot(s, track_id)) {
         scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
     }
 
-    for i in 0..song_track.devices.len() {
+    // パラアウト: a group-with-instrument runs only its prefix `[0..device_end]`
+    // in pass 1; a leaf runs its whole chain (`device_end == devices.len()`).
+    for i in 0..device_end {
         // chain map の key は (track_id, device_index)。 song.tracks の Vec
         // position に依存しないので、 group 化や drag&drop reorder で track
         // index が shift しても plugin lookup が壊れない。
@@ -1478,6 +1511,25 @@ pub fn process_track_owned(
                 }
             }
         }
+    }
+
+    // パラアウト (docs/plan_paraout.md): a parallel-out source's pass-1 work
+    // ends here — its output buses are in `buffer_aux_out` (and, for 楽器兼バス
+    // mode, its main signal in `track_l/r`). The children sum + suffix FX +
+    // strip all run in pass 2 (`Mix`/`MixAdditive` → `ProcessGroupFx`), so do
+    // NOT apply the pre-fader snapshot / strip / mute here.
+    if skip_strip {
+        // 全部子 (`paraout_main_to_child`): the instrument's MAIN output goes to
+        // its OWN child track (port 0 → `buffer_aux_out[0]`), so clear it from
+        // the parent's scratch — the parent's clearing `Mix` then sums only the
+        // children. 楽器兼バス mode (port 0 unrouted) keeps main for `MixAdditive`.
+        if song_track.paraout_main_to_child() {
+            scratch.track_l[..n].fill(0.0);
+            scratch.track_r[..n].fill(0.0);
+            scratch.peak_l = 0.0;
+            scratch.peak_r = 0.0;
+        }
+        return;
     }
 
     // ---- Pre-fader send tap ----
@@ -1746,13 +1798,26 @@ pub fn execute_schedule_post_dispatch(
                 srcs,
                 dst: BufRef::TrackScratch(target_idx),
             } => {
-                mix_into_track_scratch(scratch, *target_idx as usize, srcs, n);
+                mix_into_track_scratch(scratch, *target_idx as usize, srcs, n, true);
             }
             NodeOp::Mix {
                 srcs,
                 dst: BufRef::Master,
             } => {
                 mix_into_master(scratch, srcs, master_l, master_r, n);
+            }
+            // パラアウト (docs/plan_paraout.md): a group-with-instrument's
+            // children are summed **on top of** its own instrument output
+            // (already in scratch from the pass-1 prefix), so we accumulate
+            // instead of clearing. dst is always its own TrackScratch.
+            NodeOp::MixAdditive {
+                srcs,
+                dst: BufRef::TrackScratch(target_idx),
+            } => {
+                mix_into_track_scratch(scratch, *target_idx as usize, srcs, n, false);
+            }
+            NodeOp::MixAdditive { .. } => {
+                // Only TrackScratch dsts are ever emitted for MixAdditive.
             }
             NodeOp::Mix {
                 dst:
@@ -1767,7 +1832,10 @@ pub fn execute_schedule_post_dispatch(
                 // Pre*Scratch is never emitted (those are written by
                 // ProcessTrack), but the arm keeps the match exhaustive.
             }
-            NodeOp::ProcessGroupFx { track_idx } => {
+            NodeOp::ProcessGroupFx {
+                track_idx,
+                start_device,
+            } => {
                 let Some(track) = song.tracks.get(*track_idx as usize) else {
                     continue;
                 };
@@ -1791,6 +1859,7 @@ pub fn execute_schedule_post_dispatch(
                     current_bpm,
                     playhead_beats,
                     looping,
+                    *start_device,
                 );
             }
             NodeOp::ApplyDelay {
@@ -1857,6 +1926,48 @@ pub fn execute_schedule_post_dispatch(
                 pd.aux_in_active[port] = 1;
             }
 
+            NodeOp::ParallelOutTap {
+                src_track,
+                src_device,
+                port,
+                dst_track,
+            } => {
+                // パラアウト (docs/plan_paraout.md): read the source plugin's aux
+                // output `port` (`pd.buffer_aux_out[port]`, written by
+                // daw_plugin_host during the source plugin's pass-1 process) and
+                // **accumulate** it into the destination track's input scratch.
+                // The mirror of `SidechainTap`: same `(track_id, device_index)`
+                // slot keying for the source plugin; the dst is a scratch index.
+                // Emitted after the dst's clearing `Mix`, before its
+                // `ProcessGroupFx`, so the dst track's FX process the routed
+                // signal. RT path: skip silently on any miss.
+                let port = *port as usize;
+                if port >= common::process_data::MAX_AUX_OUT {
+                    continue;
+                }
+                let Some(&plugin_id) = slot_to_plugin_id.get(&(*src_track, *src_device)) else {
+                    continue;
+                };
+                let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
+                    continue;
+                };
+                let pd = plugin_ref.data();
+                // The plugin host marks the port active only when the plugin
+                // actually declared (and wrote) this aux output; an unrouted /
+                // absent port stays silent (industry-standard behaviour).
+                if pd.aux_out_active[port] == 0 {
+                    continue;
+                }
+                let Some(target) = scratch.get_mut(*dst_track as usize) else {
+                    continue;
+                };
+                let copy_n = n.min(target.track_l.len()).min(target.track_r.len());
+                for i in 0..copy_n {
+                    target.track_l[i] += pd.buffer_aux_out[port][0][i];
+                    target.track_r[i] += pd.buffer_aux_out[port][1][i];
+                }
+            }
+
             NodeOp::MixSend {
                 src,
                 dst,
@@ -1919,11 +2030,16 @@ fn mix_into_track_scratch(
     target_idx: usize,
     srcs: &[(BufRef, f32)],
     n: usize,
+    // `true` clears `dst` first (normal group / return Mix). `false`
+    // accumulates on top of whatever is already there (パラアウト
+    // group-with-instrument: keep the instrument's own main output written by
+    // the pass-1 prefix before summing the children).
+    clear: bool,
 ) {
     if target_idx >= scratch.len() {
         return;
     }
-    {
+    if clear {
         let target = &mut scratch[target_idx];
         target.track_l[..n].fill(0.0);
         target.track_r[..n].fill(0.0);
@@ -2176,13 +2292,20 @@ fn run_group_fx_chain(
     // group fx の transport snapshot (= 積分済み拍位置 + 実 loop トグル)。
     playhead_beats: f64,
     looping: bool,
+    // パラアウト (docs/plan_paraout.md): first device index to run. `0` for a
+    // pure group / return (whole chain is bus FX). For a group-with-instrument
+    // it's the prefix split point — the instrument `[0..start_device]` ran in
+    // pass 1, so here we run only the suffix FX `[start_device..]` on the bus.
+    start_device: u32,
 ) {
     let n = frames as usize;
     let track_id = song_track.id;
 
     // docs/plan_modulation_followups.md §1: a group's pre-FX signal = the summed
     // children before its own device chain. Capture for any PreFx tap / mod
-    // source (guarded — untouched groups skip the memcpy).
+    // source (guarded — untouched groups skip the memcpy). For a
+    // group-with-instrument this is the summed bus *before the suffix FX* (the
+    // instrument prefix already ran), which is the right pre-FX tap point.
     if track_needs_prefx_snapshot(song, track_id) {
         scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
         scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
@@ -2194,7 +2317,9 @@ fn run_group_fx_chain(
     // bus signal into any device that takes audio in, dispatch, then write the
     // audio out back (replace when the device has an audio input = effect, add
     // when it has none = pure source). MIDI ports are irrelevant on a bus.
-    for i in 0..song_track.devices.len() {
+    // パラアウト: skip the instrument prefix `[0..start_device]` (already run in
+    // pass 1) — run only the suffix FX.
+    for i in start_device as usize..song_track.devices.len() {
         let ports = song_track.devices[i].ports;
         if !ports.has_audio_output {
             // No audio output (e.g. a pure MIDI effect) — nothing to contribute

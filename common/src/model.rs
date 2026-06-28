@@ -252,6 +252,25 @@ pub struct AudioEditorViewState {
     pub len_beats: f64,
 }
 
+/// 再生中にアレンジビューがプレイヘッドを追従スクロールする方式 (Ableton の
+/// Follow Behavior 相当)。`Alt+F` で `Off → Scroll → Page → Off` と循環し、
+/// トランスポートのドロップダウンでも直接選べる。`AppData` (live SSoT) が保持し、
+/// `ViewState` でプロジェクト単位に保存する (snap 設定と同じ idiom、IPC は渡らない)。
+/// 再生中にユーザーが手動で横スクロール / ズームすると `Off` に落ちる
+/// (ユーザー選択の挙動)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FollowMode {
+    /// 追従しない。
+    Off,
+    /// 連続スクロール: プレイヘッドを画面中央に固定し、背景を滑らかに流す
+    /// (Logic / Pro Tools 風、Ableton の "Scroll")。新規 / 旧 .daw の既定。
+    #[default]
+    Scroll,
+    /// ページめくり: プレイヘッドが可視右端を越えたらビューを 1 ページ進め、
+    /// プレイヘッドを左端から再び走らせる (Ableton の "Page")。
+    Page,
+}
+
 /// プロジェクトに同梱する GUI 表示状態のスナップショット。
 /// `AppData` (live SSoT) から save 時に `snapshot_view_state` で作り、load 時に
 /// `restore_view_state` で流し込む。**serde 専用** (bincode derive 無し) ＝ IPC を渡らない。
@@ -278,6 +297,10 @@ pub struct ViewState {
     pub expanded_automation_tracks: Vec<u32>,
     #[serde(default)]
     pub master_row_automation_expanded: bool,
+    /// 再生中プレイヘッド追従スクロールの方式 (Alt+F で循環)。旧 .daw は
+    /// フィールド欠落 → `FollowMode::default()` (= Page) で読まれる。
+    #[serde(default)]
+    pub arrange_follow: FollowMode,
     // ---- Snap / grid / piano roll モード ----
     #[serde(default)]
     pub arrange_snap_enabled: bool,
@@ -1472,23 +1495,35 @@ impl Song {
                 }
             }
             // v23: 役割別 3 chain は単一 `devices` に統合済み。各 device の
-            // aux_inputs tap の source_track を 1 ループで remap する。
+            // aux_inputs tap の source_track / aux_outputs の dest_track を
+            // 1 ループで remap する (パラアウト dest も sentinel→新 id に追従)。
             for p in track.devices.iter_mut() {
                 for route in p.aux_inputs.iter_mut().flatten() {
                     if let Some(&new_id) = id_remap.get(&route.tap.source_track) {
                         route.tap.source_track = new_id;
                     }
                 }
+                for route in p.aux_outputs.iter_mut().flatten() {
+                    if let Some(&new_id) = id_remap.get(&route.dest_track) {
+                        route.dest_track = new_id;
+                    }
+                }
             }
         }
 
-        // master bus の fx chain も track fx_chain と同じく aux_inputs tap を
-        // remap する。 master fx が他 track を sidechain source に取るケースに備える
-        // (track ループ内 closure は loop scope なので再利用不可、 ここで open-code)。
+        // master bus の fx chain も track fx_chain と同じく aux_inputs tap /
+        // aux_outputs dest を remap する。 master fx が他 track を sidechain
+        // source に取る / パラアウト先に取るケースに備える (track ループ内
+        // closure は loop scope なので再利用不可、 ここで open-code)。
         for p in self.master_fx_chain.iter_mut() {
             for route in p.aux_inputs.iter_mut().flatten() {
                 if let Some(&new_id) = id_remap.get(&route.tap.source_track) {
                     route.tap.source_track = new_id;
+                }
+            }
+            for route in p.aux_outputs.iter_mut().flatten() {
+                if let Some(&new_id) = id_remap.get(&route.dest_track) {
+                    route.dest_track = new_id;
                 }
             }
         }
@@ -1654,6 +1689,39 @@ impl Song {
             hops += 1;
         }
         false
+    }
+
+    /// True if any track points at `track_id` as its parent group (= it acts
+    /// as a group / folder bus). RT-safe scan, no alloc.
+    pub fn track_has_children(&self, track_id: u32) -> bool {
+        self.tracks.iter().any(|t| t.parent_group_id == Some(track_id))
+    }
+
+    /// True if any track has an enabled aux send whose destination is
+    /// `track_id` (= it acts as a return bus). RT-safe scan, no alloc.
+    pub fn track_receives_send(&self, track_id: u32) -> bool {
+        self.tracks
+            .iter()
+            .any(|t| t.sends.iter().any(|s| s.dest_track_id == track_id))
+    }
+
+    /// パラアウト (`docs/plan_paraout.md`): true if any plugin (on any track or
+    /// the master fx chain) routes one of its aux outputs to `track_id` (= it
+    /// acts as a parallel-out destination bus). RT-safe scan, no alloc. Such a
+    /// track is summed + FX'd in pass 2 (`run_group_fx_chain`), so the audio
+    /// engine skips its own device chain in pass 1 (like a group / return) to
+    /// avoid double-processing stateful FX.
+    pub fn track_receives_paraout(&self, track_id: u32) -> bool {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.devices.iter())
+            .chain(self.master_fx_chain.iter())
+            .any(|p| {
+                p.aux_outputs
+                    .iter()
+                    .flatten()
+                    .any(|r| r.dest_track == track_id)
+            })
     }
 
     /// Allocate a fresh `ContentId`, bumping the song-level counter.
@@ -2472,6 +2540,39 @@ impl Track {
         })
     }
 
+    /// パラアウト (`docs/plan_paraout.md`): the device-chain split point for a
+    /// **group-with-instrument** track. `Some(k)` when at least one device has
+    /// a routed aux output (= this track is a parallel-out source); `k` is the
+    /// index **one past** the last such device. The audio engine runs the
+    /// "instrument prefix" `devices[0..k]` in pass 1 (producing the main signal
+    /// and the aux outputs) and the "bus FX suffix" `devices[k..]` in pass 2 on
+    /// the summed bus (own main plus routed children). `None` when no device
+    /// routes an aux output (a plain leaf / pure group). Derived purely from the
+    /// explicit routing data (`aux_outputs`), never a role heuristic.
+    pub fn paraout_split_device(&self) -> Option<u32> {
+        let mut last: Option<u32> = None;
+        for (i, d) in self.devices.iter().enumerate() {
+            if d.aux_outputs.iter().any(Option::is_some) {
+                last = Some(i as u32);
+            }
+        }
+        last.map(|i| i + 1)
+    }
+
+    /// パラアウト (`docs/plan_paraout.md`): true if this track's instrument
+    /// routes its **main** output (parallel-out port 0) to a child track. When
+    /// true the parent is a "pure splitter": its main signal goes to its own
+    /// child (the first part / Out 1), so the engine must NOT keep main in the
+    /// parent's scratch — the parent sums ALL children via a clearing `Mix`.
+    /// When false (port 0 unrouted) the parent keeps its main as its own bus
+    /// signal and sums children on top (instrument-bus, `MixAdditive`). Decided
+    /// purely from explicit routing data (`aux_outputs[0]`), no role heuristic.
+    pub fn paraout_main_to_child(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|d| matches!(d.aux_outputs.first(), Some(Some(_))))
+    }
+
     /// Allocate a new stable clip id, bumping the per-track counter.
     pub fn alloc_clip_id(&mut self) -> u32 {
         let id = self.next_clip_id.max(1);
@@ -2643,6 +2744,24 @@ impl AuxInputRoute {
         Self {
             tap: AudioTap::post_fader(source_track),
         }
+    }
+}
+
+/// Consumer B: プラグイン aux **出力** ルート (パラアウト、`docs/plan_paraout.md`)。
+/// `AuxInputRoute` の対称。プラグインの `is_main=false` な出力ポート 1 本を
+/// どのトラックへ流すかを表す。`PluginInstance::aux_outputs[port_idx]` に格納し、
+/// `daw_plugin_host` が `pd.buffer_aux_out[port]` に書いた音を engine の
+/// `NodeOp::ParallelOutTap` が `dest_track` の入力へ加算する。サイドチェインと
+/// 違いタップ点 (PreFx/PostFx/PostFader) は無い (出力は常に dest の入力へ入る)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct AuxOutputRoute {
+    /// この aux 出力ポートの行き先 `Track::id`。
+    pub dest_track: u32,
+}
+
+impl AuxOutputRoute {
+    pub fn to_track(dest_track: u32) -> Self {
+        Self { dest_track }
     }
 }
 
@@ -3094,6 +3213,24 @@ pub struct PluginInstance {
     /// ためで、 設定値に意味は無い (= migrate 後 drain される)。
     #[serde(default, rename = "sidechain_sources", skip_serializing)]
     pub legacy_aux_sources: Vec<Option<u32>>,
+    /// Consumer B (パラアウト、 docs/plan_paraout.md): aux **出力**ポートごとの
+    /// ルート。 各 entry は plugin の `is_main=false` aux output port index →
+    /// `AuxOutputRoute { dest_track }`。 `None` (or 不足 index) はそのポートを
+    /// どこにも流さない (= 業界標準: 未振分け aux 出力は無音)。 `Vec` 長 = user が
+    /// 配線した aux port 数 (plugin の実 port 数より短くてよい)。 旧 file には
+    /// 無いので `#[serde(default)]` で forward-migrate (空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aux_outputs: Vec<Option<AuxOutputRoute>>,
+    /// パラアウト (docs/plan_paraout.md): how many `is_main=false` audio output
+    /// ports this plugin actually declares (reported by the plugin host at load
+    /// via `SlotPluginLoaded`, cached here so it survives reorder and is known
+    /// on project reopen). The GUI uses it to know how many child tracks to
+    /// create on "explode" and how many routing rows to show. `0` = the common
+    /// single-output plugin. Distinct from `aux_outputs.len()` (= how many
+    /// ports the user has wired). daw_audio ignores it (it routes via
+    /// `aux_outputs` + the plugin host's `aux_out_active`).
+    #[serde(default)]
+    pub aux_output_count: u8,
     /// v23: この device の port 構成。役割導出の入力。
     #[serde(default)]
     pub ports: crate::port_config::PortConfig,
@@ -3107,6 +3244,8 @@ impl PluginInstance {
             state: None,
             aux_inputs: Vec::new(),
             legacy_aux_sources: Vec::new(),
+            aux_outputs: Vec::new(),
+            aux_output_count: 0,
             ports: crate::port_config::PortConfig::default(),
         }
     }
@@ -3122,6 +3261,8 @@ impl PluginInstance {
             state: None,
             aux_inputs: Vec::new(),
             legacy_aux_sources: Vec::new(),
+            aux_outputs: Vec::new(),
+            aux_output_count: 0,
             ports,
         }
     }
@@ -5102,6 +5243,121 @@ mod tests {
             bass.devices[0].aux_inputs,
             vec![Some(AuxInputRoute::post_fader(new_kick_id))],
             "aux_inputs tap pointing at sentinel must be remapped to the new id"
+        );
+    }
+
+    /// パラアウト (docs/plan_paraout.md): a plugin's `aux_outputs` destination
+    /// pointing at a sentinel id (0) must be remapped by `ensure_ids` to the
+    /// child's freshly assigned id — the symmetric counterpart of the
+    /// `aux_inputs` remap above. Without this, a saved project's parallel-out
+    /// routing breaks the moment ids are rebased on load.
+    #[test]
+    fn ensure_ids_remaps_aux_outputs_dest() {
+        use crate::plugin_format::PluginFormat;
+
+        let mut song = Song {
+            bpm: 120.0,
+            time_sig: (4, 4),
+            length_beats: 64.0,
+            tracks: vec![
+                Track {
+                    id: 0, // sentinel — becomes the new child id
+                    name: "Snare".into(),
+                    ..Track::default()
+                },
+                Track {
+                    id: 1,
+                    name: "Drums".into(),
+                    devices: vec![PluginInstance {
+                        // aux output routed at Snare (sentinel id 0)
+                        aux_outputs: vec![Some(AuxOutputRoute::to_track(0))],
+                        aux_output_count: 1,
+                        ..PluginInstance::with_ports(
+                            "test.drum_sampler".into(),
+                            PluginFormat::Clap,
+                            crate::port_config::PortConfig::default(),
+                        )
+                    }],
+                    ..Track::default()
+                },
+            ],
+            next_track_id: 2,
+            ..Song::default()
+        };
+
+        song.ensure_ids();
+
+        let snare_id = song.tracks[0].id;
+        assert_ne!(snare_id, 0, "ensure_ids should replace sentinel id 0");
+        assert_eq!(
+            song.tracks[1].devices[0].aux_outputs,
+            vec![Some(AuxOutputRoute::to_track(snare_id))],
+            "aux_outputs dest pointing at sentinel must be remapped to the new id"
+        );
+    }
+
+    /// パラアウト (docs/plan_paraout.md): aux_outputs / aux_output_count は JSON
+    /// (セーブファイル) と bincode (IPC) の両方で往復しても保持される。 None
+    /// (未振分けポート) を挟んだ疎なルートも壊れないこと。
+    #[test]
+    fn plugin_instance_aux_outputs_survive_json_and_bincode_round_trip() {
+        use crate::plugin_format::PluginFormat;
+
+        let inst = PluginInstance {
+            aux_outputs: vec![
+                Some(AuxOutputRoute::to_track(7)),
+                None,
+                Some(AuxOutputRoute::to_track(9)),
+            ],
+            aux_output_count: 3,
+            ..PluginInstance::new("test.drum_sampler".into(), PluginFormat::Clap)
+        };
+
+        // JSON (save file)
+        let via_json = json_roundtrip(&inst);
+        assert_eq!(via_json.aux_outputs, inst.aux_outputs);
+        assert_eq!(via_json.aux_output_count, 3);
+
+        // bincode (IPC)
+        let cfg = bincode::config::standard();
+        let bytes = bincode::encode_to_vec(&inst, cfg).unwrap();
+        let (via_bincode, _): (PluginInstance, usize) =
+            bincode::decode_from_slice(&bytes, cfg).unwrap();
+        assert_eq!(via_bincode.aux_outputs, inst.aux_outputs);
+        assert_eq!(via_bincode.aux_output_count, 3);
+    }
+
+    /// パラアウト (docs/plan_paraout.md): aux_outputs / aux_output_count フィールドを
+    /// 持たない旧セーブファイルは `#[serde(default)]` で空にフォワード migrate
+    /// される (機能追加前の .daw が壊れない)。
+    #[test]
+    fn plugin_instance_without_aux_output_fields_forward_migrates_to_empty() {
+        use crate::plugin_format::PluginFormat;
+
+        // aux_outputs を持つ instance を JSON 化 → aux_output 系キーを削除して
+        // 旧形式を模し → deserialize で空に migrate されることを確認。
+        let inst = PluginInstance {
+            aux_outputs: vec![Some(AuxOutputRoute::to_track(7))],
+            aux_output_count: 2,
+            ..PluginInstance::new("test.drum_sampler".into(), PluginFormat::Clap)
+        };
+        let mut v = serde_json::to_value(&inst).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        assert!(
+            obj.contains_key("aux_outputs"),
+            "non-empty aux_outputs must serialize (skip_serializing_if guards only the empty case)"
+        );
+        obj.remove("aux_outputs");
+        obj.remove("aux_output_count");
+
+        let migrated: PluginInstance = serde_json::from_value(v).unwrap();
+        assert!(
+            migrated.aux_outputs.is_empty(),
+            "missing aux_outputs field must forward-migrate to empty"
+        );
+        assert_eq!(
+            migrated.aux_output_count, 0,
+            "missing aux_output_count field must forward-migrate to 0"
         );
     }
 

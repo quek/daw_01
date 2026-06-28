@@ -18,6 +18,11 @@ use daw_ui_renderer::Rect;
 use crate::id::WidgetId;
 
 /// popup が現在 open している間 `UiHost` に保持される情報。
+// modal / capture_input / capture_keyboard / dismiss_on_outside_click は、 それぞれ
+// 独立した popup 挙動フラグ (close 抑制 / pointer mask / keyboard mask / 外クリック
+// close)。 `Ui` struct (ui.rs) の transient bool 群と同じく、 state machine 化は
+// オーバーヘッド過大なので clippy::struct_excessive_bools を allow する。
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
 pub struct PopupOpenState {
     /// popup を開く起点となった矩形 (例: menu_bar の "File" ボタン)。

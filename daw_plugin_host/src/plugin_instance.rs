@@ -232,6 +232,23 @@ pub trait LoadedPlugin: Send {
     /// Planar output. `None` means "no such channel" (e.g. mono plugin
     /// queried for channel 1).
     fn output_buffer(&self, channel: usize) -> Option<&[f32]>;
+    /// パラアウト (`docs/plan_paraout.md`): planar **aux** output for the
+    /// `is_main=false` output port `port` (declaration order, port 0 first),
+    /// channel `channel`. `None` = no such aux port / channel; the process
+    /// server then marks `pd.aux_out_active[port] = 0` so the audio engine
+    /// skips it. Default returns `None` for backends without parallel-out
+    /// support (VST3 / builtin / silence); only the CLAP backend overrides it.
+    fn aux_output_buffer(&self, _port: usize, _channel: usize) -> Option<&[f32]> {
+        None
+    }
+    /// パラアウト (`docs/plan_paraout.md`): how many `is_main=false` output
+    /// ports this plugin declared (capped at `MAX_AUX_OUT`). Reported to the
+    /// GUI via `SlotPluginLoaded` so it knows how many child tracks to create
+    /// on "explode" and how many routing rows to show. Default `0` for
+    /// backends without parallel-out support (VST3 / builtin / silence).
+    fn aux_output_port_count(&self) -> usize {
+        0
+    }
     /// Moves MIDI-style events emitted during the previous `process()`
     /// into `out`, draining the plugin's buffer in place (pre-allocated
     /// capacity preserved).

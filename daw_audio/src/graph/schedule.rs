@@ -50,14 +50,33 @@ pub enum NodeOp {
     /// track's scratch (`BufRef::TrackScratch(track_idx)`).
     ProcessTrack { track_idx: u32 },
 
-    /// PR2: process a `kind == Group` track's audio FX chain on its
-    /// already-summed input scratch.
-    ProcessGroupFx { track_idx: u32 },
+    /// PR2: process a group / return / bus track's audio FX chain on its
+    /// already-summed input scratch, then apply its strip.
+    ///
+    /// `start_device` = the first index in `Track.devices` to run. `0` for a
+    /// pure group / return (its whole chain is bus FX). For a **パラアウト
+    /// group-with-instrument** (`docs/plan_paraout.md`) the instrument prefix
+    /// `[0..start_device]` already ran in pass 1 (`process_track_owned`,
+    /// producing the main signal + aux outputs), so this op runs only the
+    /// suffix FX `[start_device..]` on the summed bus (instrument main +
+    /// children) — that's how "the instrument track's own FX process the whole
+    /// kit" is realised.
+    ProcessGroupFx { track_idx: u32, start_device: u32 },
 
-    /// Mix `srcs` into `dst` with per-source linear gain. PR1 emits a
-    /// single `Mix { dst: Master, ... }` at the end; PR2 also emits
-    /// `Mix { dst: TrackScratch(group_idx), ... }` for group inputs.
+    /// Mix `srcs` into `dst` with per-source linear gain (clearing `dst`
+    /// first). PR1 emits a single `Mix { dst: Master, ... }` at the end; PR2
+    /// also emits `Mix { dst: TrackScratch(group_idx), ... }` for group inputs.
     Mix {
+        srcs: Vec<(BufRef, f32)>,
+        dst: BufRef,
+    },
+
+    /// パラアウト (`docs/plan_paraout.md`): like `Mix` but **accumulates** into
+    /// `dst` instead of clearing it. Used for a group-with-instrument track
+    /// whose own instrument output is already sitting in its scratch (written
+    /// by the pass-1 prefix): the children are summed *on top* of it before the
+    /// suffix FX run. A clearing `Mix` would wipe the instrument's main signal.
+    MixAdditive {
         srcs: Vec<(BufRef, f32)>,
         dst: BufRef,
     },
@@ -99,6 +118,25 @@ pub enum NodeOp {
         dst: BufRef,
         src_track_idx: u32,
         send_idx: u8,
+    },
+
+    /// パラアウト (`docs/plan_paraout.md`): copy the plugin at
+    /// `(src_track, src_device)`'s aux **output** port `port`
+    /// (`pd.buffer_aux_out[port]`, written by daw_plugin_host during the
+    /// source plugin's pass-1 `process()`) **into** `dst_track`'s input
+    /// scratch (`+=`, accumulating after the dst's clearing `Mix`). The mirror
+    /// of `SidechainTap`: same `(track, device_index)` slot keying (the
+    /// runtime `plugin_id` is resolved via `slot_to_plugin_id` at dispatch),
+    /// but the data flows plugin-out → track-in instead of track-out →
+    /// plugin-in. Emitted **before** the dst bus's `ProcessGroupFx` so the
+    /// dst track's FX process the routed signal. Zero latency: the source
+    /// plugin ran in pass 1, so `buffer_aux_out` is settled by the time this
+    /// post-dispatch op reads it.
+    ParallelOutTap {
+        src_track: u32,
+        src_device: u32,
+        port: u8,
+        dst_track: u32,
     },
 
     /// docs/plan_modulation.md §3: advance the envelope follower for

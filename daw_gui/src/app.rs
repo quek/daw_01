@@ -655,6 +655,24 @@ pub struct SidechainSourceChoice {
     pub track_id: Option<u32>,
 }
 
+/// パラアウト (docs/plan_paraout.md): one inspector row group per chain device
+/// that declares `is_main=false` audio outputs (`aux_output_count > 0`). The
+/// inspector shows an "explode" button (auto-create child tracks) plus a
+/// per-port destination dropdown. `routes[port]` = the current
+/// `PluginInstance::aux_outputs[port]` destination track id (`None` = unrouted
+/// = silent, the industry-standard default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelOutputEntry {
+    pub track_id: u32,
+    pub device_index: u32,
+    pub plugin_name: String,
+    pub aux_output_count: u8,
+    pub routes: Vec<Option<u32>>,
+    /// True once at least one aux output is routed (so the inspector shows the
+    /// per-port dropdowns instead of just the explode button).
+    pub exploded: bool,
+}
+
 /// 「＋ Send」 ボタンで開く宛先トラックピッカーの状態。 plugin_picker の
 /// `is_plugin_picker_open` と同 idiom で、 開いている間 `Some(..)` を保持し、
 /// `src_track_id` (= send 元) を覚えておく。 track_picker.rs がこれを見て
@@ -1472,6 +1490,11 @@ pub struct AppData {
         std::collections::HashMap<common::model::ClipKey, common::model::AudioEditorViewState>,
     pub arrange_zoom_x: f32,
     pub arrange_scroll_beat: f32,
+    /// 再生中プレイヘッド追従スクロールの方式 (Off / Scroll / Page、 `Alt+F` で循環)。
+    /// `ViewState` でプロジェクト単位に保存 (snap 設定と同じ idiom)。 再生中に
+    /// ユーザーが手動で横スクロール / ズームすると `Off` に落ちる (ユーザー選択)。
+    /// `on_tick` が再生中のみこの mode に応じて `arrange_scroll_beat` を更新する。
+    pub arrange_follow: common::model::FollowMode,
     /// arrangement の縦 scroll offset (px、 smooth)。 `0.0` で first track
     /// が lanes 上端、 wheel scroll で増減。 widget 側で `SetTrackTop` を
     /// 発火するので handler がここに書き込む。 overscroll (lanes 領域
@@ -2280,6 +2303,7 @@ impl AppData {
             audio_editor_views: std::collections::HashMap::new(),
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
             arrange_scroll_beat: 0.0,
+            arrange_follow: common::model::FollowMode::default(),
             arrange_track_top: 0.0,
             arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
             arrange_header_w: 160.0,
@@ -2797,6 +2821,54 @@ impl AppData {
             );
         }
         entries
+    }
+
+    /// パラアウト (docs/plan_paraout.md): one entry per chain device on the
+    /// cursor track that declares `is_main=false` audio outputs
+    /// (`aux_output_count > 0`). Drives the inspector's "Parallel Out" section
+    /// (explode button + per-port destination dropdowns). Master fx are
+    /// skipped — the grouped explode model needs the source to be a real track
+    /// (master has no `parent_group_id` children). Mirrors `sidechain_entries`.
+    pub fn parallel_output_entries(&self) -> Vec<ParallelOutputEntry> {
+        // Only non-master tracks can be a grouped paraout source.
+        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+            return Vec::new();
+        }
+        let Some(track) = self
+            .cursor_track_index()
+            .and_then(|i| self.song.tracks.get(i))
+        else {
+            return Vec::new();
+        };
+        let track_id = track.id;
+        track
+            .devices
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.aux_output_count > 0)
+            .map(|(i, p)| {
+                let count = p.aux_output_count as usize;
+                // Normalize routes to length `count` (model Vec may be shorter
+                // when only some ports are wired).
+                let routes: Vec<Option<u32>> = (0..count)
+                    .map(|port| {
+                        p.aux_outputs
+                            .get(port)
+                            .and_then(|o| o.as_ref())
+                            .map(|r| r.dest_track)
+                    })
+                    .collect();
+                let exploded = routes.iter().any(Option::is_some);
+                ParallelOutputEntry {
+                    track_id,
+                    device_index: i as u32,
+                    plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+                    aux_output_count: p.aux_output_count,
+                    routes,
+                    exploded,
+                }
+            })
+            .collect()
     }
 
     /// Sidechain source picker choices: "—" (None) followed by every
@@ -3533,6 +3605,9 @@ impl AppData {
             // ので、 ここで積む undo snapshot はどのみち捨てられる (= dead だった)。
             AppEvent::AddInstrumentTrack
                 | AppEvent::GroupSelectedTracks { .. }
+                // パラアウト展開は子トラックを作る構造編集なので 1 操作 = 1 undo。
+                // (SetParallelOutputRoute は SetSidechainSource と同じく非 undoable。)
+                | AppEvent::ExplodeParallelOut { .. }
                 | AppEvent::SetTrackParent { .. }
                 | AppEvent::SetLipsyncTarget { .. }
                 | AppEvent::SetMouthMapSlot { .. }
@@ -5063,6 +5138,25 @@ pub enum AppEvent {
         port: u8,
         source: Option<u32>,
     },
+    /// パラアウト (docs/plan_paraout.md): one-click "explode" — auto-create a
+    /// child track per `is_main=false` output port of the plugin at
+    /// `(track_id, device_index)`, group them under the source track, and wire
+    /// each aux output to its new child. The source track becomes a
+    /// group-with-instrument bus (its own main + the children sum through its
+    /// FX/fader). Idempotent: ports already routed to a live track are kept.
+    ExplodeParallelOut {
+        track_id: u32,
+        device_index: u32,
+    },
+    /// パラアウト: route a single aux output port to a destination track (or
+    /// `None` = unrouted = silent). Used by the inspector's per-port dropdown
+    /// for re-adjustment after (or instead of) explode.
+    SetParallelOutputRoute {
+        track_id: u32,
+        device_index: u32,
+        port: u8,
+        dest: Option<u32>,
+    },
     /// docs/plan_modulation.md §9: create a project-level `ModSource`
     /// of the given kind, owned by the cursor track. follower は cursor track を tap。
     AddModSource { kind: ModSourceKindTag },
@@ -5155,6 +5249,10 @@ pub enum AppEvent {
         /// に挿さっているので「load 失敗」 ではなく「設定が復元されなかった」
         /// 旨を status_message でユーザーに伝える (silent corruption 防止)。
         state_load_error: Option<String>,
+        /// パラアウト (docs/plan_paraout.md): この plugin が宣言した
+        /// `is_main=false` audio 出力ポート数 (0 = 通常の単一出力)。GUI が
+        /// 「パラアウト展開」 で作る子トラック数 / ルーティング行数に使う。
+        aux_output_count: u8,
     },
     /// plugin_host が plugin destroy したことの通知。 `track_plugin_ids`
     /// から該当 plugin_id を取り除き、 もし audio engine 側で未削除
@@ -5186,6 +5284,9 @@ pub enum AppEvent {
     // -------- Scroll / zoom -----------------------------------------------
     SetArrangeScroll(f32),
     SetArrangeZoom(f32),
+    /// 再生追従スクロールの方式を `Off → Scroll → Page → Off` と循環
+    /// (`Alt+F` / トランスポートの追従ボタン、クリックごとに切替)。
+    CycleArrangeFollow,
     SetArrangeTrackRowH(f32),
     /// arrangement の track header 幅を更新 (gui_01 widget の右端
     /// splitter drag が発火)。 handler 側で 80..480 px に clamp。 session-only。
@@ -6717,7 +6818,10 @@ impl AppData {
             }
             AppEvent::SetArrangeScroll(scroll) => {
                 self.arrange_scroll_beat = scroll.max(0.0);
+                // 再生中の手動横スクロールは追従を解除する (ユーザー選択の挙動)。
+                self.cancel_follow_on_manual_view_change();
             }
+            AppEvent::CycleArrangeFollow => self.cycle_arrange_follow(),
             AppEvent::SetArrangeTrackRowH(h) => {
                 // 上限は viewport 高に近いところまで広げる (1 トラックを画面いっぱいに
                 // 表示できるようにする)。 viewport 高はここでは未知なので大きめに取り、
@@ -6733,6 +6837,8 @@ impl AppData {
             }
             AppEvent::SetArrangeZoom(zoom) => {
                 self.arrange_zoom_x = zoom.clamp(2.0, 400.0);
+                // 再生中の手動ズームは追従を解除する (ユーザー選択の挙動)。
+                self.cancel_follow_on_manual_view_change();
             }
             AppEvent::SetPianoRollScrollX(scroll) => {
                 if let Some(v) = self.piano_roll_view_entry() {
@@ -6771,6 +6877,20 @@ impl AppData {
             }
             AppEvent::RemoveDevice { index } => {
                 self.remove_device(index);
+            }
+            AppEvent::ExplodeParallelOut {
+                track_id,
+                device_index,
+            } => {
+                self.explode_parallel_out(track_id, device_index);
+            }
+            AppEvent::SetParallelOutputRoute {
+                track_id,
+                device_index,
+                port,
+                dest,
+            } => {
+                self.set_parallel_output_route(track_id, device_index, port, dest);
             }
             AppEvent::SetSidechainSource {
                 track_id,
@@ -6845,8 +6965,8 @@ impl AppData {
             AppEvent::GuiClosedFromChild { track, index } => {
                 self.on_gui_closed(track, index);
             }
-            AppEvent::SlotPluginLoadedFromChild { track, index, id, name, plugin_id, shmem_id, state_load_error } => {
-                self.on_plugin_loaded_from_child(track, index, id, name, plugin_id, shmem_id, state_load_error);
+            AppEvent::SlotPluginLoadedFromChild { track, index, id, name, plugin_id, shmem_id, state_load_error, aux_output_count } => {
+                self.on_plugin_loaded_from_child(track, index, id, name, plugin_id, shmem_id, state_load_error, aux_output_count);
             }
             AppEvent::SlotPluginUnloadedFromChild { plugin_id } => {
                 self.on_plugin_unloaded_from_child(plugin_id);
@@ -14311,6 +14431,7 @@ impl AppData {
         common::model::ViewState {
             arrange_zoom_x: self.arrange_zoom_x,
             arrange_scroll_beat: self.arrange_scroll_beat,
+            arrange_follow: self.arrange_follow,
             arrange_track_top: self.arrange_track_top,
             arrange_track_row_h: self.arrange_track_row_h,
             arrange_header_w: self.arrange_header_w,
@@ -14349,6 +14470,7 @@ impl AppData {
         let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
         self.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);
         self.arrange_scroll_beat = v.arrange_scroll_beat.max(0.0);
+        self.arrange_follow = v.arrange_follow;
         self.arrange_track_top = v.arrange_track_top.max(0.0);
         self.arrange_track_row_h = v.arrange_track_row_h.clamp(16.0, 2000.0);
         self.arrange_header_w = v.arrange_header_w.clamp(80.0, 480.0);
@@ -15076,9 +15198,83 @@ impl AppData {
         false
     }
 
+    /// 追従方式の status_message 用ラベル (Alt+F / ドロップダウンの可視フィードバック)。
+    fn follow_mode_label(mode: common::model::FollowMode) -> &'static str {
+        use common::model::FollowMode;
+        match mode {
+            FollowMode::Off => "追従スクロール: OFF",
+            FollowMode::Scroll => "追従スクロール: 連続",
+            FollowMode::Page => "追従スクロール: ページめくり",
+        }
+    }
+
+    /// 再生追従スクロールの新しい `arrange_scroll_beat` を計算する純関数 (テスト可能)。
+    /// `scroll` は現在の左端拍、 `visible_beats` は可視拍数 (canvas_w / zoom)、
+    /// `playhead` は現在の再生位置 (拍)。 view を動かす必要が無ければ `None`。
+    ///
+    /// - `Page`: プレイヘッドが可視範囲 `[scroll, scroll+visible)` の外 (右端到達 or
+    ///   逆方向シーク / ループ折返し) なら、 プレイヘッドが左端に来るようページめくり。
+    ///   範囲内なら据え置き (= Ableton "Page" の「据え置き + 1 ページジャンプ」)。
+    /// - `Scroll`: プレイヘッドを画面中央に固定 (`scroll = playhead - visible/2`、
+    ///   曲頭付近は 0 で頭打ち)。 微小変化は無視して無駄な再描画を避ける。
+    /// - `Off`: 常に `None`。
+    fn follow_scroll_beat(
+        mode: common::model::FollowMode,
+        playhead: f32,
+        scroll: f32,
+        visible_beats: f32,
+    ) -> Option<f32> {
+        use common::model::FollowMode;
+        if visible_beats <= 0.0 {
+            return None;
+        }
+        match mode {
+            FollowMode::Off => None,
+            FollowMode::Page => {
+                let right = scroll + visible_beats;
+                (playhead >= right || playhead < scroll).then(|| playhead.max(0.0))
+            }
+            FollowMode::Scroll => {
+                let target = (playhead - visible_beats * 0.5).max(0.0);
+                // 1/1000 拍未満の揺れでは動かさない (毎 tick の無駄な scroll 更新を避ける)。
+                ((target - scroll).abs() > 1e-3).then_some(target)
+            }
+        }
+    }
+
+    /// 追従方式を直接設定する (トランスポートのドロップダウン)。
+    fn set_arrange_follow(&mut self, mode: common::model::FollowMode) {
+        self.arrange_follow = mode;
+        self.status_message = Self::follow_mode_label(mode).into();
+    }
+
+    /// `Alt+F`: 追従方式を `Off → Scroll → Page → Off` と循環する。
+    fn cycle_arrange_follow(&mut self) {
+        use common::model::FollowMode;
+        let next = match self.arrange_follow {
+            FollowMode::Off => FollowMode::Scroll,
+            FollowMode::Scroll => FollowMode::Page,
+            FollowMode::Page => FollowMode::Off,
+        };
+        self.set_arrange_follow(next);
+    }
+
+    /// 再生中にユーザーが手動でアレンジビューを動かしたら追従を解除する
+    /// (ユーザー選択: 手動スクロール / ズームで Follow OFF)。 停止中は no-op
+    /// (追従は再生中のみ作用するので、 停止中の view 操作で状態を変える必要がない。
+    /// これで「停止中にスクロール → 再生で追従再開」 が成立する)。
+    fn cancel_follow_on_manual_view_change(&mut self) {
+        if self.is_playing {
+            self.arrange_follow = common::model::FollowMode::Off;
+        }
+    }
+
     /// 全 track の全 clip が arrangement canvas に収まるよう zoom_x / scroll_beat /
     /// track_row_h を自動調整する。clip 0 個なら song.length_beats でフォールバック。
     fn fit_arrange_to_content(&mut self) {
+        // X (fit) は明示的な view 操作なので再生中は追従を解除する (= follow が
+        // 次 tick で fit を上書きして戻すのを防ぐ)。
+        self.cancel_follow_on_manual_view_change();
         let (canvas_w, canvas_h) = self.last_arrange_canvas_size;
         if canvas_w < 16.0 || canvas_h < 16.0 {
             return;
@@ -15181,6 +15377,8 @@ impl AppData {
     /// 各段で適用前の view を `arrange_zoom_history` に積み、 `X`
     /// (`arrange_zoom_back`) が 1 段ずつ巻き戻す。
     fn zoom_arrange_to_selected_clip(&mut self, automation: bool) {
+        // Z (zoom-to-selection) は明示的な view 操作なので再生中は追従を解除する。
+        self.cancel_follow_on_manual_view_change();
         let sig = self.current_zoom_selection_sig(automation);
         // 直近アンカーと同じ選択 + view が手付かずなら段階を継続、 それ以外は仕切り直し。
         let stage = match self.arrange_zoom_anchor.take() {
@@ -15392,6 +15590,8 @@ impl AppData {
     /// `X` キー (arrangement)。 ズーム履歴があれば 1 段戻し、 無ければ全体フィット
     /// (= 「前のズームに戻る、 無ければ全体フィット」)。
     fn arrange_zoom_back(&mut self) {
+        // X (zoom back / fit) は明示的な view 操作なので再生中は追従を解除する。
+        self.cancel_follow_on_manual_view_change();
         if let Some(v) = self.arrange_zoom_history.pop() {
             self.arrange_zoom_x = v.zoom_x;
             self.arrange_scroll_beat = v.scroll_beat;
@@ -18394,6 +18594,10 @@ impl AppData {
         // ユーザーには「設定が復元されなかった」 ことを status_message で
         // 知らせて、 必要なら再 load / preset 適用してもらう。
         state_load_error: Option<String>,
+        // パラアウト (docs/plan_paraout.md): plugin が宣言した aux 出力ポート数。
+        // 再構築する PluginInstance に焼き込み、インスペクタの「パラアウト展開」
+        // / ルーティング行が使う。
+        aux_output_count: u8,
     ) {
         // SSoT (code review 2026-06-06): audio engine に `ProcessData` shmem を
         // 開かせる。 incoming bridge の stale clone ではなく、 respawn で
@@ -18444,13 +18648,14 @@ impl AppData {
         // PR4.5 sidechain wiring preservation: when a plugin finishes
         // loading via SlotPluginLoaded, we replace the existing
         // PluginInstance with a fresh one carrying the resolved id +
-        // saved state, but **must preserve `aux_inputs`** —
-        // otherwise wiring set by the user (or loaded from a saved .daw
-        // file) gets clobbered to `Vec::new()` here, which then
-        // (a) makes the inspector dropdown display "—" instead of the
-        //     wired source track, and (b) propagates to daw_audio via
-        //     the next LoadSong, killing the SidechainTap in
-        //     `compile_schedule`.
+        // saved state, but **must preserve `aux_inputs` and
+        // `aux_outputs`** — otherwise wiring set by the user (or loaded
+        // from a saved .daw file) gets clobbered to `Vec::new()` here,
+        // which then (a) makes the inspector dropdown display "—" instead
+        // of the wired source / destination track, and (b) propagates to
+        // daw_audio via the next LoadSong, killing the SidechainTap /
+        // ParallelOutTap in `compile_schedule`. パラアウト
+        // (docs/plan_paraout.md) も sidechain と同じく再ロードで生存させる。
         let chain: Option<&mut Vec<common::model::PluginInstance>> =
             if track_id == common::model::MASTER_TRACK_ID {
                 Some(&mut self.song.master_fx_chain)
@@ -18467,13 +18672,25 @@ impl AppData {
             return;
         };
         let i = index as usize;
-        let (existing_state, format, existing_aux, existing_ports) = chain
+        let (existing_state, format, existing_aux, existing_aux_out, existing_ports) = chain
             .get(i)
-            .map(|p| (p.state.clone(), p.format, p.aux_inputs.clone(), p.ports))
-            .unwrap_or((None, PluginFormat::Clap, Vec::new(), Default::default()));
+            .map(|p| {
+                (
+                    p.state.clone(),
+                    p.format,
+                    p.aux_inputs.clone(),
+                    p.aux_outputs.clone(),
+                    p.ports,
+                )
+            })
+            .unwrap_or((None, PluginFormat::Clap, Vec::new(), Vec::new(), Default::default()));
         let inst = common::model::PluginInstance {
             state: existing_state,
             aux_inputs: existing_aux,
+            aux_outputs: existing_aux_out,
+            // パラアウト: the just-loaded plugin's authoritative aux output port
+            // count (overrides whatever the DB / previous instance had).
+            aux_output_count,
             ..common::model::PluginInstance::with_ports(
                 id,
                 format,
@@ -18989,6 +19206,118 @@ impl AppData {
         // Phase 1: UI は常に PostFader タップを張る (旧 sidechain と同挙動)。
         // Pre/PostFx トグルは Phase 6 で追加する (docs/plan_modulation.md §9)。
         inst.aux_inputs[port_idx] = source.map(common::model::AuxInputRoute::post_fader);
+        self.sync_song_to_plugin_host();
+    }
+
+    /// パラアウト (docs/plan_paraout.md): route one aux output `port` of the
+    /// plugin at `(track_id, device_index)` to `dest` (or `None` = unrouted).
+    /// Mirror of `set_sidechain_source` (aux_outputs instead of aux_inputs).
+    /// Used by the inspector dropdown for re-adjustment; not auto-undoable
+    /// (matches sidechain), but marks dirty + recompiles via
+    /// `sync_song_to_plugin_host`.
+    fn set_parallel_output_route(
+        &mut self,
+        track_id: u32,
+        device_index: u32,
+        port: u8,
+        dest: Option<u32>,
+    ) {
+        let inst = if track_id == common::model::MASTER_TRACK_ID {
+            self.song.master_fx_chain.get_mut(device_index as usize)
+        } else {
+            let Some(track) = self.song.track_by_id_mut(track_id) else {
+                return;
+            };
+            track.devices.get_mut(device_index as usize)
+        };
+        let Some(inst) = inst else { return };
+        let port_idx = port as usize;
+        if inst.aux_outputs.len() <= port_idx {
+            inst.aux_outputs.resize(port_idx + 1, None);
+        }
+        inst.aux_outputs[port_idx] = dest.map(common::model::AuxOutputRoute::to_track);
+        self.sync_song_to_plugin_host();
+    }
+
+    /// パラアウト (docs/plan_paraout.md): one-click "explode" of a multi-out
+    /// plugin. For each `is_main=false` output port the plugin declares, create
+    /// a child track parented to the source track and wire the aux output to
+    /// it. The source track thereby becomes a group-with-instrument bus: its
+    /// own main signal + the children sum through its FX / fader to the master.
+    /// Idempotent — a port already routed to a still-existing track is kept (so
+    /// re-clicking only fills gaps, never duplicates). Undo snapshot + dirty
+    /// are taken at the dispatch choke point (`is_undoable`), so this only
+    /// mutates the model and syncs.
+    fn explode_parallel_out(&mut self, track_id: u32, device_index: u32) {
+        // The grouped explode model needs the source to be a real track
+        // (master has no `parent_group_id` children).
+        if track_id == common::model::MASTER_TRACK_ID {
+            return;
+        }
+        let Some(src) = self.song.track_by_id(track_id) else {
+            return;
+        };
+        let Some(inst) = src.devices.get(device_index as usize) else {
+            return;
+        };
+        let count = inst.aux_output_count as usize;
+        if count == 0 {
+            return;
+        }
+        let src_name = src.name.clone();
+        // Snapshot the current routes + the set of live track ids so the loop
+        // below can keep valid existing routes without re-borrowing `self.song`
+        // while it allocates ids / inserts tracks.
+        let existing: Vec<Option<u32>> = (0..count)
+            .map(|port| {
+                inst.aux_outputs
+                    .get(port)
+                    .and_then(|o| o.as_ref())
+                    .map(|r| r.dest_track)
+            })
+            .collect();
+        let live_ids: std::collections::HashSet<u32> =
+            self.song.tracks.iter().map(|t| t.id).collect();
+
+        let mut routes: Vec<Option<common::model::AuxOutputRoute>> = vec![None; count];
+        let mut new_children: Vec<common::model::Track> = Vec::new();
+        for (port, existing_dest) in existing.iter().enumerate() {
+            // Keep an already-wired route if its destination still exists.
+            if let Some(dest) = existing_dest
+                && live_ids.contains(dest)
+            {
+                routes[port] = Some(common::model::AuxOutputRoute::to_track(*dest));
+                continue;
+            }
+            let child_id = self.song.alloc_track_id();
+            let name = format!("{src_name} Out {}", port + 1);
+            new_children.push(track_with(|t| {
+                t.id = child_id;
+                t.name = name;
+                t.parent_group_id = Some(track_id);
+            }));
+            routes[port] = Some(common::model::AuxOutputRoute::to_track(child_id));
+        }
+
+        // Insert the new children right after the source track so they appear
+        // grouped under it in the arrangement.
+        let insert_at = self
+            .song
+            .track_index_by_id(track_id)
+            .map(|i| i + 1)
+            .unwrap_or(self.song.tracks.len());
+        for (k, child) in new_children.into_iter().enumerate() {
+            self.song.tracks.insert(insert_at + k, child);
+        }
+
+        // Wire the source plugin's aux outputs to the (new or kept) children.
+        if let Some(track) = self.song.track_by_id_mut(track_id)
+            && let Some(inst) = track.devices.get_mut(device_index as usize)
+        {
+            inst.aux_outputs = routes;
+        }
+
+        self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
     }
 
@@ -19718,6 +20047,26 @@ impl AppData {
         // 引き続き送る (= GUI 表示の権威と engine state を分離)。
         if self.is_playing && next_beat != self.playhead_beat {
             self.playhead_beat = next_beat;
+        }
+
+        // 再生追従スクロール (Alt+F で off/scroll/page)。 playhead 反映直後に follow
+        // mode に応じて arrange_scroll_beat を更新する。 canvas 幅は前フレーム描画値
+        // (last_arrange_canvas_size.0)。 手動スクロール / ズームで follow が Off に落ちる
+        // のは各 view 操作 handler 側 (cancel_follow_on_manual_view_change)。 follow が
+        // 直接 arrange_scroll_beat を書く (= SetArrangeScroll event を経由しない) ので
+        // 自分自身で Off に落ちることはない。
+        if self.is_playing
+            && let Some(ph) = self.playhead_beat
+        {
+            let visible_beats = self.last_arrange_canvas_size.0 / self.arrange_zoom_x.max(1.0);
+            if let Some(new_scroll) = Self::follow_scroll_beat(
+                self.arrange_follow,
+                ph,
+                self.arrange_scroll_beat,
+                visible_beats,
+            ) {
+                self.arrange_scroll_beat = new_scroll.max(0.0);
+            }
         }
 
         // Phase 4 Step C: recording tick。 is_playing 中で recording_mode が
@@ -22654,6 +23003,52 @@ mod image_drop_target_tests {
         // track が 0 本 → 何を指しても新規 track。
         assert_eq!(resolve_image_drop_target(Some(0), 0), None);
         assert_eq!(resolve_image_drop_target(None, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod follow_scroll_tests {
+    use super::AppData;
+    use common::model::FollowMode;
+
+    /// 再生追従スクロールの scroll_beat 計算 (純関数)。Page のページめくり境界、
+    /// Scroll の中央固定 + 頭打ち、Off / 可視幅 0 の退化を 1 表で網羅する。
+    #[test]
+    fn follow_scroll_beat_pages_and_centers() {
+        // (mode, playhead, scroll, visible_beats, expected_new_scroll)
+        let cases = [
+            // Off は常に view を動かさない。
+            (FollowMode::Off, 100.0_f32, 0.0_f32, 16.0_f32, None),
+            // Page: 可視範囲 [scroll, scroll+visible) 内なら据え置き。
+            (FollowMode::Page, 0.0, 0.0, 16.0, None),
+            (FollowMode::Page, 8.0, 0.0, 16.0, None),
+            // Page: 右端 (= scroll+visible) 到達でプレイヘッドを左端へページめくり。
+            (FollowMode::Page, 16.0, 0.0, 16.0, Some(16.0)),
+            (FollowMode::Page, 20.0, 0.0, 16.0, Some(20.0)),
+            // Page: 逆方向 (playhead < scroll、シーク / ループ折返し) も左端へ。
+            (FollowMode::Page, 4.0, 16.0, 16.0, Some(4.0)),
+            // Scroll: プレイヘッドを中央へ (playhead - visible/2)。
+            (FollowMode::Scroll, 100.0, 0.0, 16.0, Some(92.0)),
+            (FollowMode::Scroll, 10.0, 0.0, 16.0, Some(2.0)),
+            // Scroll: 曲頭付近 (playhead < visible/2) は 0 で頭打ち → 据え置き。
+            (FollowMode::Scroll, 4.0, 0.0, 16.0, None),
+            // 可視幅 0 / 負は計算不能 → None (0 除算を避ける)。
+            (FollowMode::Page, 100.0, 0.0, 0.0, None),
+            (FollowMode::Scroll, 100.0, 0.0, 0.0, None),
+        ];
+        for (mode, ph, scroll, vis, expected) in cases {
+            let got = AppData::follow_scroll_beat(mode, ph, scroll, vis);
+            match (got, expected) {
+                (None, None) => {}
+                (Some(g), Some(e)) => assert!(
+                    (g - e).abs() < 1e-4,
+                    "mode={mode:?} ph={ph} scroll={scroll} vis={vis}: got {g}, want {e}"
+                ),
+                _ => panic!(
+                    "mode={mode:?} ph={ph} scroll={scroll} vis={vis}: got {got:?}, want {expected:?}"
+                ),
+            }
+        }
     }
 }
 

@@ -136,6 +136,7 @@ fn fake_plugin_loaded(
         plugin_id,
         shmem_id: String::new(),
         state_load_error: None,
+        aux_output_count: 0,
     });
 }
 
