@@ -162,6 +162,21 @@ pub struct ClapPlugin {
     aux_input_buffers: Vec<Vec<Vec<f32>>>,
     /// Per-aux-port channel pointer scratch (filled each `process` call).
     aux_input_ptrs: Vec<Vec<*mut f32>>,
+    /// パラアウト (`docs/plan_paraout.md`): per-aux-**output**-port channel
+    /// counts in the plugin's declared order. Length capped at `MAX_AUX_OUT`.
+    /// Empty when the plugin has no `is_main=false` output ports. Symmetric to
+    /// `aux_input_channels`.
+    aux_output_channels: Vec<u32>,
+    /// Planar buffers the plugin writes its aux outputs into (outer = aux port
+    /// idx, middle = channel, inner = per-frame f32). The process server reads
+    /// these back into `pd.buffer_aux_out` after `process()`.
+    aux_output_buffers: Vec<Vec<Vec<f32>>>,
+    /// Per-aux-output-port channel pointer scratch (rebuilt each `process`).
+    aux_output_ptrs: Vec<Vec<*mut f32>>,
+    /// Pre-allocated `clap_audio_buffer` array for the output side, reused
+    /// every buffer (= main output first, then each aux output port). Mirrors
+    /// `process_input_bufs` on the input side so the RT path never allocates.
+    process_output_bufs: Vec<clap_audio_buffer>,
     /// DLL handle. Declared LAST so `FreeLibrary` runs after every other
     /// field's Drop. See struct doc-comment for the full sequence.
     _library: Library,
@@ -299,10 +314,12 @@ impl ClapPlugin {
         let input_channels = query_port_channel_count(plugin_ptr, get_ext, true);
         let output_channels = query_output_channel_count(plugin_ptr, get_ext);
         let aux_input_channels = query_aux_input_channels(plugin_ptr, get_ext);
+        let aux_output_channels = query_aux_output_channels(plugin_ptr, get_ext);
         tracing::info!(
             input_channels,
             output_channels,
             aux_input_count = aux_input_channels.len(),
+            aux_output_count = aux_output_channels.len(),
             "plugin audio channel count"
         );
 
@@ -380,6 +397,10 @@ impl ClapPlugin {
             process_input_bufs: Vec::new(),
             aux_input_buffers: Vec::new(),
             aux_input_ptrs: Vec::new(),
+            aux_output_channels,
+            aux_output_buffers: Vec::new(),
+            aux_output_ptrs: Vec::new(),
+            process_output_bufs: Vec::new(),
             params_ext,
         };
         // `docs/plan_modulation_routing_redesign.md` §4: cache param min/max/
@@ -664,11 +685,31 @@ impl ClapPlugin {
             .iter()
             .map(|&ch_count| vec![std::ptr::null_mut(); ch_count as usize])
             .collect();
+        // パラアウト (docs/plan_paraout.md): allocate planar buffers for each
+        // aux output port (symmetric to aux inputs) so the plugin has stable
+        // storage to write its `is_main=false` outputs into; the process
+        // server reads them back into `pd.buffer_aux_out`.
+        self.aux_output_buffers = self
+            .aux_output_channels
+            .iter()
+            .map(|&ch_count| {
+                (0..ch_count as usize)
+                    .map(|_| vec![0.0f32; max_frames as usize])
+                    .collect()
+            })
+            .collect();
+        self.aux_output_ptrs = self
+            .aux_output_channels
+            .iter()
+            .map(|&ch_count| vec![std::ptr::null_mut(); ch_count as usize])
+            .collect();
         // Phase 5 follow-up review: process() で毎 buffer 確保していた
         // `Vec<clap_audio_buffer>` を pre-allocate して reuse 化。 capacity =
-        // 1 (main) + aux port 数。
+        // 1 (main) + aux port 数 (input / output 双方)。
         self.process_input_bufs =
             Vec::with_capacity(1 + self.aux_input_channels.len());
+        self.process_output_bufs =
+            Vec::with_capacity(1 + self.aux_output_channels.len());
         tracing::info!(sample_rate, max_frames, "plugin activated");
         Ok(())
     }
@@ -744,6 +785,9 @@ impl ClapPlugin {
         self.active = false;
         self.output_buffers.clear();
         self.output_ptrs.clear();
+        // パラアウト: free the aux output planar storage (mirror main output).
+        self.aux_output_buffers.clear();
+        self.aux_output_ptrs.clear();
     }
 
     /// CLAP `clap_plugin.reset()` — clear the plugin's audio processing state
@@ -934,6 +978,14 @@ impl ClapPlugin {
         for i in 0..self.output_buffers.len() {
             self.output_ptrs[i] = self.output_buffers[i].as_mut_ptr();
         }
+        // パラアウト (docs/plan_paraout.md): refresh aux output channel pointers
+        // (storage pre-allocated on activate) so the plugin writes its
+        // `is_main=false` outputs into our buffers, read back afterwards.
+        for (port_idx, port_bufs) in self.aux_output_buffers.iter_mut().enumerate() {
+            for (ch, ptr) in self.aux_output_ptrs[port_idx].iter_mut().enumerate() {
+                *ptr = port_bufs[ch].as_mut_ptr();
+            }
+        }
 
         // PR4 sidechain: build the full clap_audio_buffer array — main
         // input first (matching CLAP convention that port 0 is main),
@@ -961,13 +1013,29 @@ impl ClapPlugin {
                 constant_mask: 0,
             });
         }
-        let mut audio_out = clap_audio_buffer {
-            data32: self.output_ptrs.as_mut_ptr(),
-            data64: std::ptr::null_mut(),
-            channel_count: self.output_channels,
-            latency: 0,
-            constant_mask: 0,
-        };
+        // パラアウト (docs/plan_paraout.md): build the full output
+        // clap_audio_buffer array — main output first (CLAP port 0 = main),
+        // then each aux output port — mirroring the input side. Reuses the
+        // pre-allocated `process_output_bufs` (RT-safe: clear + push only).
+        self.process_output_bufs.clear();
+        if self.output_channels > 0 {
+            self.process_output_bufs.push(clap_audio_buffer {
+                data32: self.output_ptrs.as_mut_ptr(),
+                data64: std::ptr::null_mut(),
+                channel_count: self.output_channels,
+                latency: 0,
+                constant_mask: 0,
+            });
+        }
+        for port_idx in 0..self.aux_output_channels.len() {
+            self.process_output_bufs.push(clap_audio_buffer {
+                data32: self.aux_output_ptrs[port_idx].as_mut_ptr(),
+                data64: std::ptr::null_mut(),
+                channel_count: self.aux_output_channels[port_idx],
+                latency: 0,
+                constant_mask: 0,
+            });
+        }
 
         // Build the time-ascending merge order over note + param events.
         // CLAP requires `in_events` sorted by `header.time`; notes and params
@@ -1039,10 +1107,13 @@ impl ClapPlugin {
                 self.process_input_bufs.len() as u32,
             )
         };
-        let (audio_outputs, audio_outputs_count) = if self.output_channels == 0 {
+        let (audio_outputs, audio_outputs_count) = if self.process_output_bufs.is_empty() {
             (std::ptr::null_mut(), 0)
         } else {
-            (&raw mut audio_out, 1)
+            (
+                self.process_output_bufs.as_mut_ptr(),
+                self.process_output_bufs.len() as u32,
+            )
         };
 
         // Phase 5 Step 5.3 (`docs/plan_automation.md` §10): build
@@ -1077,6 +1148,44 @@ impl ClapPlugin {
 
     pub fn output_buffer(&self, channel: usize) -> Option<&[f32]> {
         self.output_buffers.get(channel).map(Vec::as_slice)
+    }
+
+    /// パラアウト (docs/plan_paraout.md): planar output buffer for parallel-out
+    /// `port`, `channel`. **Port 0 is the plugin's MAIN output bus** (the first
+    /// "part"); ports `1..` are its `is_main=false` aux buses. This lets
+    /// "explode" split EVERY output — including main — into its own child track
+    /// (a multi-out drum like MDrummer puts each part on its own bus, main
+    /// included). Filled by the plugin during the previous `process()`. `None`
+    /// = no such port / channel. The process server reads these into
+    /// `pd.buffer_aux_out` (so `buffer_aux_out[0]` carries the main bus).
+    pub fn aux_output_buffer(&self, port: usize, channel: usize) -> Option<&[f32]> {
+        // Single-output plugins have no parallel-out ports (port 0 = main is
+        // only exposed for splitting when there's ≥1 aux bus). Skip so the
+        // process server doesn't needlessly copy main into buffer_aux_out[0].
+        if self.aux_output_channels.is_empty() {
+            return None;
+        }
+        if port == 0 {
+            self.output_buffers.get(channel).map(Vec::as_slice)
+        } else {
+            self.aux_output_buffers
+                .get(port - 1)
+                .and_then(|p| p.get(channel))
+                .map(Vec::as_slice)
+        }
+    }
+
+    /// パラアウト (docs/plan_paraout.md): number of parallel-out ports =
+    /// `1 (main) + aux bus count`, capped at `MAX_AUX_OUT`. Only multi-output
+    /// plugins (≥1 aux bus) get paraout — a single-output plugin has nothing to
+    /// split, so it reports 0 (no "explode" button). Reported to the GUI.
+    pub fn aux_output_port_count(&self) -> usize {
+        let aux = self.aux_output_channels.len();
+        if aux == 0 {
+            0
+        } else {
+            (1 + aux).min(common::process_data::MAX_AUX_OUT)
+        }
     }
 
     /// Loads a plugin in the file. If `target_id` is non-empty, selects that
@@ -1571,6 +1680,49 @@ fn query_aux_input_channels(plugin: *const clap_plugin, get_ext: GetExtFn) -> Ve
     aux
 }
 
+/// パラアウト (`docs/plan_paraout.md`): enumerate the plugin's `is_main=false`
+/// **output** ports and return their channel counts in declaration order.
+/// Capped at `common::process_data::MAX_AUX_OUT` (extras logged + ignored).
+/// Returns an empty Vec for plugins without aux outputs (the common single-out
+/// instrument / effect case). Symmetric to `query_aux_input_channels` — the
+/// only difference is `is_input = false`.
+fn query_aux_output_channels(plugin: *const clap_plugin, get_ext: GetExtFn) -> Vec<u32> {
+    let ext_ptr =
+        unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
+    if ext_ptr.is_null() {
+        return Vec::new();
+    }
+    let ext = unsafe { &*ext_ptr };
+    let Some(count_fn) = ext.count else {
+        return Vec::new();
+    };
+    let Some(get) = ext.get else {
+        return Vec::new();
+    };
+    let port_count = unsafe { count_fn(plugin, false) };
+    let mut aux: Vec<u32> = Vec::new();
+    for i in 0..port_count {
+        let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
+        let ok = unsafe { get(plugin, i, false, info.as_mut_ptr()) };
+        if !ok {
+            continue;
+        }
+        let info = unsafe { info.assume_init() };
+        if info.flags & CLAP_AUDIO_PORT_IS_MAIN == 0 {
+            if aux.len() >= common::process_data::MAX_AUX_OUT {
+                tracing::warn!(
+                    port_index = i,
+                    cap = common::process_data::MAX_AUX_OUT,
+                    "plugin declared more aux output ports than the host caps to"
+                );
+                break;
+            }
+            aux.push(info.channel_count);
+        }
+    }
+    aux
+}
+
 /// Queries the plugin's first audio port in the given direction. `is_input`
 /// selects input vs output ports. Returns `0` when the plugin declares no
 /// port of that direction (e.g. instrument with no audio input, or pure
@@ -1884,6 +2036,12 @@ impl LoadedPlugin for ClapPlugin {
 
     fn output_buffer(&self, channel: usize) -> Option<&[f32]> {
         self.output_buffer(channel)
+    }
+    fn aux_output_buffer(&self, port: usize, channel: usize) -> Option<&[f32]> {
+        self.aux_output_buffer(port, channel)
+    }
+    fn aux_output_port_count(&self) -> usize {
+        self.aux_output_port_count()
     }
 
     fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>) {

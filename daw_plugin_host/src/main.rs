@@ -81,6 +81,7 @@ pub enum PluginEvent {
         plugin_id: u32,
         shmem_id: String,
         state_load_error: Option<String>,
+        aux_output_count: u8,
     },
     SlotPluginState {
         track: u32,
@@ -175,6 +176,7 @@ impl From<PluginEvent> for ChildToMain {
                 plugin_id,
                 shmem_id,
                 state_load_error,
+                aux_output_count,
             } => ChildToMain::SlotPluginLoaded {
                 track,
                 index,
@@ -183,6 +185,7 @@ impl From<PluginEvent> for ChildToMain {
                 plugin_id,
                 shmem_id,
                 state_load_error,
+                aux_output_count,
             },
             PluginEvent::SlotPluginState { track, index, data } => {
                 ChildToMain::SlotPluginState { track, index, data }
@@ -623,7 +626,10 @@ fn plugin_main_loop(
     // for an already-loaded device (= 2nd LoadSong of the same project).
     // Without re-emitting, daw_gui's `pending_plugin_loads` never clears
     // and queued Play (`pending_play`) can never fire — playback freezes.
-    let mut loaded_meta_for_slot: HashMap<(u32, u32), (String, String)> =
+    // (id, name, aux_output_count) cached per slot so the dedup branch can
+    // re-emit SlotPluginLoaded with the same metadata (パラアウト: incl. the
+    // aux output count) on a 2nd LoadSong of the same project.
+    let mut loaded_meta_for_slot: HashMap<(u32, u32), (String, String, u8)> =
         HashMap::new();
     let plugin_registry: PluginRegistry =
         Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
@@ -878,7 +884,7 @@ fn plugin_main_loop(
                             id = %plugin_id,
                             "SetSlotPlugin: same plugin already loaded, re-emitting SlotPluginLoaded"
                         );
-                        if let (Some(&new_plugin_id), Some((cached_id, cached_name))) = (
+                        if let (Some(&new_plugin_id), Some((cached_id, cached_name, cached_aux_out))) = (
                             plugin_lookup.get(&(track, index)),
                             loaded_meta_for_slot.get(&(track, index)),
                         ) {
@@ -892,6 +898,7 @@ fn plugin_main_loop(
                                 name: cached_name.clone(),
                                 plugin_id: new_plugin_id,
                                 shmem_id,
+                                aux_output_count: *cached_aux_out,
                                 // 同 plugin の re-emit path。 state_load
                                 // を呼んでいないので error は常に None。
                                 state_load_error: None,
@@ -1008,6 +1015,11 @@ fn plugin_main_loop(
                     //     start_processing 含む)。
                     let loaded_id = plugin.id().to_string();
                     let loaded_name = plugin.name().to_string();
+                    // パラアウト (docs/plan_paraout.md): capture the aux output
+                    // port count now, before `plugin` is moved into the chain,
+                    // so SlotPluginLoaded can tell the GUI how many child tracks
+                    // to make on "explode".
+                    let loaded_aux_out_count = plugin.aux_output_port_count().min(u8::MAX as usize) as u8;
                     let sr = session.sample_rate;
                     let mf = session.max_frames;
                     tracks.mutate(|t| {
@@ -1032,7 +1044,7 @@ fn plugin_main_loop(
                             // emit するためのキャッシュ。
                             loaded_meta_for_slot.insert(
                                 (track, index),
-                                (loaded_id.clone(), loaded_name.clone()),
+                                (loaded_id.clone(), loaded_name.clone(), loaded_aux_out_count),
                             );
 
                             // Install 直後の plugin pointer を short-lived な
@@ -1081,6 +1093,7 @@ fn plugin_main_loop(
                                 plugin_id: new_plugin_id,
                                 shmem_id,
                                 state_load_error,
+                                aux_output_count: loaded_aux_out_count,
                             });
                             // PR3.3: activate 直後 (CLAP `[main-thread &
                             // active]` / VST3 `[UI-thread & Setup Done]`
@@ -1256,7 +1269,7 @@ fn plugin_main_loop(
                             u32,
                             u32,
                             Option<String>,
-                            Option<(String, String)>,
+                            Option<(String, String, u8)>,
                             Option<editor_window::EditorWindow>,
                         );
                         let mut remapped: Vec<IdxBookkeeping> = Vec::new();
@@ -1371,7 +1384,7 @@ fn plugin_main_loop(
                             u32,
                             u32,
                             Option<String>,
-                            Option<(String, String)>,
+                            Option<(String, String, u8)>,
                             Option<editor_window::EditorWindow>,
                         );
                         let mut remapped: Vec<IdxBookkeeping> = Vec::new();

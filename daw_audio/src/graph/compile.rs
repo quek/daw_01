@@ -112,6 +112,45 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         }
     }
 
+    // ---- パラアウト (docs/plan_paraout.md): gather incoming aux outputs per
+    // destination. `incoming_paraout[dest_id]` = list of (source track id,
+    // source device index, aux out port) for every plugin aux output routed at
+    // `dest_id`. The source key is a **track id** (master fx → MASTER_TRACK_ID)
+    // because the engine resolves the source plugin via `slot_to_plugin_id`.
+    // Bounded by `MAX_AUX_OUT` (the engine only fills that many aux out ports).
+    // A track with ≥1 incoming paraout acts as a bus (summed + FX'd in pass 2),
+    // exactly like a group / return; routes to a missing dest are dropped
+    // (tolerant, like dangling sidechain / send). No DAG edge is added: the
+    // source plugin's aux output is produced in pass 1 (`buffer_aux_out`) and
+    // consumed in pass 2, so pass 1 always precedes the read — which is also
+    // why a group-with-instrument (A sums children B/C while B/C read A's aux)
+    // is NOT a cycle.
+    let mut incoming_paraout: HashMap<u32, Vec<(u32, u32, u8)>> = HashMap::new();
+    {
+        let mut gather = |chain: &[common::model::PluginInstance], src_track_id: u32| {
+            for (dev_idx, p) in chain.iter().enumerate() {
+                for (port, route_opt) in p
+                    .aux_outputs
+                    .iter()
+                    .take(common::process_data::MAX_AUX_OUT)
+                    .enumerate()
+                {
+                    let Some(route) = route_opt else { continue };
+                    if id_to_idx.contains_key(&route.dest_track) {
+                        incoming_paraout
+                            .entry(route.dest_track)
+                            .or_default()
+                            .push((src_track_id, dev_idx as u32, port as u8));
+                    }
+                }
+            }
+        };
+        for t in &song.tracks {
+            gather(&t.devices, t.id);
+        }
+        gather(&song.master_fx_chain, common::model::MASTER_TRACK_ID);
+    }
+
     // ---- detect cycles in path_latency dependency graph ----
     //
     // `compute_path_latency` recurses through:
@@ -210,25 +249,70 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         // plugin's `pd.buffer_aux_in[port]` shmem region.
         emit_aux_input_taps(&track.devices, track.id, &id_to_idx, &mut nodes);
 
-        // A track is a "bus" if it has children (a group) and/or has
-        // incoming sends (a return). Either way it sums its inputs into
-        // its own scratch and runs its fx chain + strip via
-        // ProcessGroupFx, rather than rendering its own clips / instrument
-        // (Ableton return-track semantics — same as a group's own content
-        // currently being unused). A track with neither is a plain leaf.
-        if is_group.contains(&track.id) || incoming_sends.contains_key(&track.id) {
-            // Sum children (unity gain) into this bus's scratch. The Mix
-            // clears its dst first, so a pure return (no children) starts
-            // from silence before its sends accumulate on top.
+        // A track is a "bus" if it has children (a group), incoming sends
+        // (a return), or incoming paraout (a parallel-out destination).
+        // Either way it sums its inputs into its own scratch and runs its fx
+        // chain + strip via ProcessGroupFx, rather than rendering its own
+        // clips / instrument as a leaf (Ableton return-track semantics). A
+        // track with none of these is a plain leaf.
+        let is_bus = is_group.contains(&track.id)
+            || incoming_sends.contains_key(&track.id)
+            || incoming_paraout.contains_key(&track.id);
+        if is_bus {
+            // パラアウト (docs/plan_paraout.md): a group track whose own device
+            // chain routes an aux output is a parallel-out **source**. Its
+            // instrument prefix `[0..split]` runs in pass 1 (`process_track_owned`)
+            // producing every output bus; the suffix FX `[split..]` run in pass 2
+            // on the summed bus. Two sub-modes, by where the MAIN output (port 0)
+            // goes:
+            //  - 全部子 (`paraout_main_to_child`, `aux_outputs[0] = Some`): main
+            //    goes to its own child track too, so the parent keeps NO own
+            //    signal — a clearing `Mix` sums ALL children (parent = pure bus).
+            //  - 楽器兼バス (port 0 unrouted): the parent keeps its own main (e.g.
+            //    the kick) in scratch and sums children on top via `MixAdditive`.
+            // A pure group / return / paraout-dest bus (no instrument) clears +
+            // sums the whole chain (`start_device = 0`).
+            let split = track.paraout_split_device();
+            let group_with_instrument = is_group.contains(&track.id) && split.is_some();
+            let start_device = if group_with_instrument {
+                split.unwrap_or(0)
+            } else {
+                0
+            };
+
             let kids = children_of.get(&track.id).cloned().unwrap_or_default();
             let srcs: Vec<(BufRef, f32)> = kids
                 .into_iter()
                 .map(|c| (BufRef::TrackScratch(c), 1.0))
                 .collect();
-            nodes.push(NodeOp::Mix {
-                srcs,
-                dst: BufRef::TrackScratch(track_idx),
-            });
+            if group_with_instrument && !track.paraout_main_to_child() {
+                // 楽器兼バス: keep the parent's own main, add children on top.
+                nodes.push(NodeOp::MixAdditive {
+                    srcs,
+                    dst: BufRef::TrackScratch(track_idx),
+                });
+            } else {
+                // 全部子 / pure group / return / paraout-dest: clear + sum.
+                nodes.push(NodeOp::Mix {
+                    srcs,
+                    dst: BufRef::TrackScratch(track_idx),
+                });
+            }
+            // パラアウト: accumulate each plugin aux output routed INTO this
+            // track on top of the children. The source plugin's aux output is
+            // produced in pass 1, so this tap (pass 2) always sees settled
+            // data — zero latency. `src_track` is a track id (slot lookup),
+            // `dst_track` is this bus's scratch **index**.
+            if let Some(edges) = incoming_paraout.get(&track.id) {
+                for &(src_track_id, src_device, port) in edges {
+                    nodes.push(NodeOp::ParallelOutTap {
+                        src_track: src_track_id,
+                        src_device,
+                        port,
+                        dst_track: track_idx,
+                    });
+                }
+            }
             // Accumulate each incoming send on top, tapping the source's
             // post- or pre-fader buffer. The gain is applied live by the
             // engine (`MixSend`), not baked here.
@@ -246,7 +330,10 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
                     });
                 }
             }
-            nodes.push(NodeOp::ProcessGroupFx { track_idx });
+            nodes.push(NodeOp::ProcessGroupFx {
+                track_idx,
+                start_device,
+            });
         } else {
             // Leaf track: full chain handled by ProcessTrack op.
             nodes.push(NodeOp::ProcessTrack { track_idx });
@@ -307,42 +394,81 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
         );
     }
 
-    // 既存の nodes を線形に走査し、 Mix を見つけたらその直前に
+    // パラアウト独立 dest の PDC fan-in (docs/plan_paraout.md): plugin の aux
+    // 出力を「自分の子でない」 track へ振った独立トポロジでは、 dest の path
+    // latency に source の path latency を取り込む (sidechain / send と同じ。
+    // dest の入力 = source の aux なので、 source が遅れる分 dest も遅れる)。
+    // 子 dest (group-with-instrument の子) は group fan-in 済み + 循環になるので
+    // 除外する。 `reported` は既に path_latency[dest] に含まれるので
+    // `max(existing, source_latency + dest.reported)` で更新 (= max(a,b)+c の
+    // 分配律)。 健全な (非循環) paraout chain は深さ <= n で必ず収束するので
+    // bounded fixpoint で回す。 相互 paraout (A.aux→D かつ D.aux→A — ParallelOutTap
+    // は dep edge を張らないので既存の cycle 検出を通り抜ける病的ケース) でも n 回で
+    // 打ち切り、 path_latency の発散 (= 際限ない DelayLine 確保 / ハング) を防ぐ。
+    for _ in 0..n {
+        let mut changed = false;
+        for (dest_id, edges) in &incoming_paraout {
+            let Some(&d_idx) = id_to_idx.get(dest_id) else {
+                continue;
+            };
+            let dest = &song.tracks[d_idx as usize];
+            for &(src_id, _, _) in edges {
+                if dest.parent_group_id == Some(src_id) {
+                    continue; // 子 dest は group fan-in 済み (循環回避)
+                }
+                let Some(&s_idx) = id_to_idx.get(&src_id) else {
+                    continue;
+                };
+                let cand = path_latency[s_idx as usize]
+                    .saturating_add(dest.reported_latency_samples);
+                if cand > path_latency[d_idx as usize] {
+                    path_latency[d_idx as usize] = cand;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // 既存の nodes を線形に走査し、 Mix / MixAdditive を見つけたらその直前に
     // `ApplyDelay` を挿入する。 in-place 操作よりも build-from-scratch
     // の方が境界条件が単純なので、 一度別 Vec に組み直す。
     let mut delay_lines: Vec<DelayLine> = Vec::new();
     let mut nodes_with_pdc: Vec<NodeOp> = Vec::with_capacity(nodes.len() + n);
     for op in nodes.into_iter() {
-        if let NodeOp::Mix { ref srcs, .. } = op {
-            // この Mix の入力中で最大の path latency を求める。
-            let max_path = srcs
-                .iter()
-                .filter_map(|(b, _)| match b {
-                    BufRef::TrackScratch(i) => Some(path_latency[*i as usize]),
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0);
-            // 各 src を必要なら `ApplyDelay` で max に揃える。
-            for (b, _) in srcs.iter() {
-                let BufRef::TrackScratch(i) = b else {
-                    continue;
-                };
-                let this = path_latency[*i as usize];
-                if this < max_path {
-                    let comp = max_path - this;
+        match &op {
+            // clearing Mix: 全 src を最大 path latency に揃える。
+            NodeOp::Mix { srcs, .. } => {
+                emit_mix_src_alignment(srcs, &path_latency, &mut delay_lines, &mut nodes_with_pdc);
+            }
+            // パラアウト MixAdditive (docs/plan_paraout.md): 子 (srcs) を揃える
+            // のに加え、 dst (= group-with-instrument 自身の scratch にある prefix
+            // main、 相対 latency 0) も子の最大 path latency 分だけ遅らせて揃える。
+            // これをしないと、 子に latency 持ちプラグインがあるときキック (main)
+            // とスネア等 (子経由) がサンプルずれる。 子の ApplyDelay と dst の
+            // ApplyDelay を MixAdditive の直前に積むので、 加算時には両者が揃う。
+            NodeOp::MixAdditive {
+                srcs,
+                dst: BufRef::TrackScratch(a_idx),
+            } => {
+                let max_path =
+                    emit_mix_src_alignment(srcs, &path_latency, &mut delay_lines, &mut nodes_with_pdc);
+                if max_path > 0 {
                     let line_idx = delay_lines.len() as u32;
-                    // DelayLine.step は `delay <= capacity - 1` を要求
-                    // (`delay_line.rs:55-56` の clamp ロジック)。 補償量
-                    // ちょうどを返すために capacity = comp + 1。
-                    delay_lines.push(DelayLine::with_capacity((comp as usize) + 1));
+                    delay_lines.push(DelayLine::with_capacity((max_path as usize) + 1));
                     nodes_with_pdc.push(NodeOp::ApplyDelay {
-                        buf: BufRef::TrackScratch(*i),
+                        buf: BufRef::TrackScratch(*a_idx),
                         line_idx,
-                        frames: comp,
+                        frames: max_path,
                     });
                 }
             }
+            NodeOp::MixAdditive { .. } => {
+                // MixAdditive の dst は compile が常に TrackScratch で emit する。
+            }
+            _ => {}
         }
         nodes_with_pdc.push(op);
     }
@@ -610,6 +736,48 @@ fn compute_path_latency(
     let total = max_input.saturating_add(track.reported_latency_samples);
     cache[idx as usize] = total;
     total
+}
+
+/// PDC helper: emit an `ApplyDelay` for every `TrackScratch` src whose path
+/// latency is below the mix's max, so all srcs line up at the mix point.
+/// Returns the max path latency over the srcs — `MixAdditive` uses it to also
+/// align the dst's own pre-existing signal (the パラアウト instrument main,
+/// `docs/plan_paraout.md`). Shared by the `Mix` and `MixAdditive` arms of the
+/// PDC pass so the two stay in lock-step.
+fn emit_mix_src_alignment(
+    srcs: &[(BufRef, f32)],
+    path_latency: &[u32],
+    delay_lines: &mut Vec<DelayLine>,
+    out: &mut Vec<NodeOp>,
+) -> u32 {
+    let max_path = srcs
+        .iter()
+        .filter_map(|(b, _)| match b {
+            BufRef::TrackScratch(i) => Some(path_latency[*i as usize]),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    for (b, _) in srcs.iter() {
+        let BufRef::TrackScratch(i) = b else {
+            continue;
+        };
+        let this = path_latency[*i as usize];
+        if this < max_path {
+            let comp = max_path - this;
+            let line_idx = delay_lines.len() as u32;
+            // DelayLine.step は `delay <= capacity - 1` を要求
+            // (`delay_line.rs:55-56` の clamp ロジック)。 補償量ちょうどを
+            // 返すために capacity = comp + 1。
+            delay_lines.push(DelayLine::with_capacity((comp as usize) + 1));
+            out.push(NodeOp::ApplyDelay {
+                buf: BufRef::TrackScratch(*i),
+                line_idx,
+                frames: comp,
+            });
+        }
+    }
+    max_path
 }
 
 #[cfg(test)]
@@ -949,7 +1117,7 @@ mod tests {
         let has_group_fx = sched
             .nodes
             .iter()
-            .any(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 0 }));
+            .any(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 0, .. }));
         assert!(has_group_fx, "track 1 must be treated as a group");
         let has_process_track_0 = sched
             .nodes
@@ -1150,7 +1318,9 @@ mod tests {
                 }
                 NodeOp::ProcessGroupFx { .. }
                 | NodeOp::SidechainTap { .. }
-                | NodeOp::MixSend { .. } => {
+                | NodeOp::MixSend { .. }
+                | NodeOp::MixAdditive { .. }
+                | NodeOp::ParallelOutTap { .. } => {
                     // この test では未使用
                 }
                 NodeOp::Mix {
@@ -1830,7 +2000,7 @@ mod tests {
         let reverb_fx = sched
             .nodes
             .iter()
-            .position(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 1 }))
+            .position(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 1, .. }))
             .expect("Reverb ProcessGroupFx");
 
         assert!(
@@ -2070,6 +2240,346 @@ mod tests {
         assert!(
             mixsend < apply,
             "the send must read the source before the master dry-delay mutates it"
+        );
+    }
+
+    // ---- パラアウト (docs/plan_paraout.md) ----
+
+    /// パラアウト 全部子 (docs/plan_paraout.md): a multi-out instrument on track
+    /// A (id 1) routes EVERY output to a child — port 0 (MAIN) → 子2 (id 2),
+    /// aux bus 0 (port 1) → 子3 (id 3) — both parenting back to A. A becomes a
+    /// **pure bus** (keeps no own main); 子2/子3 are **paraout-dest buses**, no cycle:
+    ///  - per port: a `ParallelOutTap` (port 0 = main, port 1.. = aux buses)
+    ///  - A: a **clearing** `Mix` into its own scratch (no own main to keep) +
+    ///    `ProcessGroupFx { start_device: split }` (suffix FX only)
+    ///  - A must NOT emit `MixAdditive` (nothing of its own to preserve)
+    ///  - children processed before A sums them
+    #[test]
+    fn paraout_all_children_clears_main_and_taps_every_port() {
+        use common::model::{AuxOutputRoute, PluginInstance};
+        use common::plugin_format::PluginFormat;
+
+        let song = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Drums".into();
+                    t.devices = vec![PluginInstance {
+                        // port 0 (main) → 子2, port 1 (aux bus 0) → 子3 = 全部子
+                        aux_outputs: vec![
+                            Some(AuxOutputRoute::to_track(2)),
+                            Some(AuxOutputRoute::to_track(3)),
+                        ],
+                        aux_output_count: 2,
+                        ..PluginInstance::with_ports(
+                            "test.drum_sampler".into(),
+                            PluginFormat::Clap,
+                            instrument_ports(),
+                        )
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Kick".into();
+                    t.parent_group_id = Some(1);
+                }),
+                track(|t| {
+                    t.id = 3;
+                    t.name = "Snare".into();
+                    t.parent_group_id = Some(1);
+                }),
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).expect("全部子 must not cycle");
+
+        // (a) ParallelOutTap per port: main(port0) → 子2(idx1), aux0(port1) → 子3(idx2).
+        assert!(
+            sched.nodes.iter().any(|op| matches!(
+                op,
+                NodeOp::ParallelOutTap { src_track: 1, src_device: 0, port: 0, dst_track: 1 }
+            )),
+            "expected ParallelOutTap main(port0) → 子2(idx1); nodes={:?}",
+            sched.nodes
+        );
+        assert!(
+            sched.nodes.iter().any(|op| matches!(
+                op,
+                NodeOp::ParallelOutTap { src_track: 1, src_device: 0, port: 1, dst_track: 2 }
+            )),
+            "expected ParallelOutTap aux0(port1) → 子3(idx2)"
+        );
+
+        // (b) 全部子: A clears + sums ALL children via a clearing Mix (main went
+        //     to 子2 via port 0), running suffix FX from the split (device 1).
+        let sum_mix = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::Mix { dst: BufRef::TrackScratch(0), .. }))
+            .expect("全部子 A must use a clearing Mix into its own scratch");
+        assert!(
+            sched
+                .nodes
+                .iter()
+                .any(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 0, start_device: 1 })),
+            "A's suffix FX must start at the split (device 1); nodes={:?}",
+            sched.nodes
+        );
+        // (c) A keeps no own main, so it must NOT use MixAdditive.
+        assert!(
+            !sched.nodes.iter().any(|op| matches!(op, NodeOp::MixAdditive { .. })),
+            "全部子 A must not emit MixAdditive (main went to 子2 via port 0)"
+        );
+
+        // (d) children's bus FX run before A sums them.
+        let b_fx = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 1, .. }))
+            .expect("子2 ProcessGroupFx");
+        let c_fx = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 2, .. }))
+            .expect("子3 ProcessGroupFx");
+        assert!(
+            b_fx < sum_mix && c_fx < sum_mix,
+            "children must be processed before A's clearing Mix sums them"
+        );
+
+        // (e) A's clearing Mix carries both children.
+        let srcs = sched
+            .nodes
+            .iter()
+            .find_map(|op| match op {
+                NodeOp::Mix { dst: BufRef::TrackScratch(0), srcs } => Some(srcs.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let idxs: Vec<u32> = srcs
+            .iter()
+            .map(|(b, _)| match b {
+                BufRef::TrackScratch(i) => *i,
+                o => panic!("unexpected Mix src {o:?}"),
+            })
+            .collect();
+        assert!(
+            idxs.contains(&1) && idxs.contains(&2),
+            "A must sum children 子2(1) and 子3(2); got {idxs:?}"
+        );
+    }
+
+    /// Independent-topology paraout: A (id 1) routes an aux output to D (id 4)
+    /// which is NOT a child of A (D → master directly). A stays a plain leaf
+    /// (`ProcessTrack`, full chain), D becomes a paraout-dest bus, and the tap
+    /// flows A.aux → D. No cycle, no MixAdditive (A has no children).
+    #[test]
+    fn paraout_independent_dest_keeps_source_a_leaf() {
+        use common::model::{AuxOutputRoute, PluginInstance};
+        use common::plugin_format::PluginFormat;
+
+        let song = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Drums".into();
+                    t.devices = vec![PluginInstance {
+                        aux_outputs: vec![Some(AuxOutputRoute::to_track(4))],
+                        aux_output_count: 1,
+                        ..PluginInstance::with_ports(
+                            "test.drum_sampler".into(),
+                            PluginFormat::Clap,
+                            instrument_ports(),
+                        )
+                    }];
+                }),
+                track(|t| {
+                    t.id = 4;
+                    t.name = "Snare".into();
+                }),
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).expect("independent paraout must not cycle");
+
+        // A (idx 0) is a plain leaf: ProcessTrack, no MixAdditive.
+        assert!(
+            sched
+                .nodes
+                .iter()
+                .any(|op| matches!(op, NodeOp::ProcessTrack { track_idx: 0 })),
+            "source A must remain a leaf (ProcessTrack); nodes={:?}",
+            sched.nodes
+        );
+        assert!(
+            !sched.nodes.iter().any(|op| matches!(op, NodeOp::MixAdditive { .. })),
+            "no MixAdditive when the source has no children"
+        );
+        // D (idx 1) is a paraout-dest bus receiving A's aux.
+        assert!(
+            sched.nodes.iter().any(|op| matches!(
+                op,
+                NodeOp::ParallelOutTap { src_track: 1, src_device: 0, port: 0, dst_track: 1 }
+            )),
+            "expected ParallelOutTap A.dev0.port0 → D(idx1); nodes={:?}",
+            sched.nodes
+        );
+        assert!(
+            sched
+                .nodes
+                .iter()
+                .any(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 1, start_device: 0 })),
+            "D must run as a bus (ProcessGroupFx start_device 0)"
+        );
+    }
+
+    /// パラアウト PDC 楽器兼バス (docs/plan_paraout.md): main を親に残す
+    /// (port 0 unrouted) group-with-instrument で子に latency 持ちプラグインが
+    /// あると、 MixAdditive の直前に「A の main (dst scratch、 prefix 後で相対 0)」
+    /// と latency の小さい子を最大 path latency に揃える `ApplyDelay` が入る。
+    /// これが無いとキック (main) とスネア (子経由) がサンプルずれる。 emit を検証
+    /// (ApplyDelay handler の数値正しさは既存の
+    /// `pdc_two_track_impulse_aligns_at_master_with_loaded_latency_plugin` が担保)。
+    #[test]
+    fn paraout_instrument_bus_pdc_aligns_main_and_children() {
+        use common::model::{AuxOutputRoute, PluginInstance};
+        use common::plugin_format::PluginFormat;
+
+        let song = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Drums".into();
+                    t.devices = vec![PluginInstance {
+                        // port 0 (main) unrouted = 楽器兼バス (the kick stays on A);
+                        // aux bus 0/1 (port 1/2) → 子2/子3.
+                        aux_outputs: vec![
+                            None,
+                            Some(AuxOutputRoute::to_track(2)),
+                            Some(AuxOutputRoute::to_track(3)),
+                        ],
+                        aux_output_count: 3,
+                        ..PluginInstance::with_ports(
+                            "test.drum_sampler".into(),
+                            PluginFormat::Clap,
+                            instrument_ports(),
+                        )
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "Snare".into();
+                    t.parent_group_id = Some(1);
+                    t.reported_latency_samples = 100; // 子に latency 持ち FX
+                }),
+                track(|t| {
+                    t.id = 3;
+                    t.name = "HiHat".into();
+                    t.parent_group_id = Some(1);
+                    // latency なし
+                }),
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).expect("must compile");
+
+        let add_mix = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::MixAdditive { dst: BufRef::TrackScratch(0), .. }))
+            .expect("A MixAdditive");
+
+        // A の main (idx0) を子の max latency (100) に揃える ApplyDelay が
+        // MixAdditive の直前に在る。
+        assert!(
+            sched.nodes[..add_mix].iter().any(|op| matches!(
+                op,
+                NodeOp::ApplyDelay { buf: BufRef::TrackScratch(0), frames: 100, .. }
+            )),
+            "A's instrument main must be delayed 100 to align with the latent child; nodes={:?}",
+            sched.nodes
+        );
+        // latency の無い子 HiHat (idx2) も 100 揃え。
+        assert!(
+            sched.nodes[..add_mix].iter().any(|op| matches!(
+                op,
+                NodeOp::ApplyDelay { buf: BufRef::TrackScratch(2), frames: 100, .. }
+            )),
+            "HiHat (no latency) must be delayed 100 to align with Snare; nodes={:?}",
+            sched.nodes
+        );
+        // latency 持ちの Snare (idx1) は max なので揃え不要 (ApplyDelay 無し)。
+        assert!(
+            !sched.nodes[..add_mix].iter().any(|op| matches!(
+                op,
+                NodeOp::ApplyDelay { buf: BufRef::TrackScratch(1), .. }
+            )),
+            "Snare (the max-latency child) needs no compensating delay"
+        );
+    }
+
+    /// パラアウト独立 dest の PDC fan-in (docs/plan_paraout.md): source A の aux を
+    /// 子でない D へ振ると、 D の path latency に A の latency が乗り、 master で
+    /// 他トラックと揃う。 fan-in が無いと D が二重遅延 (= A.aux で既に遅れている
+    /// のに更に PDC で遅らされる) になる。
+    #[test]
+    fn paraout_independent_dest_pdc_fans_in_source_latency() {
+        use common::model::{AuxOutputRoute, PluginInstance};
+        use common::plugin_format::PluginFormat;
+
+        let song = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Drums".into();
+                    t.reported_latency_samples = 100; // source に latency
+                    t.devices = vec![PluginInstance {
+                        aux_outputs: vec![Some(AuxOutputRoute::to_track(4))],
+                        aux_output_count: 1,
+                        ..PluginInstance::with_ports(
+                            "test.drum_sampler".into(),
+                            PluginFormat::Clap,
+                            instrument_ports(),
+                        )
+                    }];
+                }),
+                track(|t| {
+                    t.id = 4;
+                    t.name = "Snare".into(); // 独立 dest (A の子でない)、 latency なし
+                }),
+                track(|t| {
+                    t.id = 5;
+                    t.name = "Dry".into(); // 整合相手、 latency なし
+                }),
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song).expect("must compile");
+
+        let master_mix = sched
+            .nodes
+            .iter()
+            .position(|op| matches!(op, NodeOp::Mix { dst: BufRef::Master, .. }))
+            .expect("master Mix");
+
+        // D (idx1) は A.aux (100 遅れ) を受けるので path latency 100。 master で
+        // 余計な ApplyDelay は入らない (既に max)。
+        assert!(
+            !sched.nodes[..master_mix].iter().any(|op| matches!(
+                op,
+                NodeOp::ApplyDelay { buf: BufRef::TrackScratch(1), .. }
+            )),
+            "independent dest D already carries source latency; must not be delayed again; nodes={:?}",
+            sched.nodes
+        );
+        // Dry (idx2, latency 0) は master で 100 揃え (A/D が 100 で max)。
+        assert!(
+            sched.nodes[..master_mix].iter().any(|op| matches!(
+                op,
+                NodeOp::ApplyDelay { buf: BufRef::TrackScratch(2), frames: 100, .. }
+            )),
+            "the dry track must be delayed 100 to align with the paraout chain (A+D); nodes={:?}",
+            sched.nodes
         );
     }
 }

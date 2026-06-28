@@ -198,6 +198,7 @@ impl ScriptHost {
                 plugin_id,
                 shmem_id,
                 state_load_error,
+                aux_output_count,
             } => {
                 // script 専用 bookkeeping (deviceChain 等が参照)。
                 self.plugin_to_track.insert(*plugin_id, *track);
@@ -219,6 +220,7 @@ impl ScriptHost {
                     plugin_id: *plugin_id,
                     shmem_id: shmem_id.clone(),
                     state_load_error: state_load_error.clone(),
+                    aux_output_count: *aux_output_count,
                 });
             }
             ChildToMain::SlotPluginUnloaded { plugin_id } => {

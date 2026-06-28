@@ -329,6 +329,7 @@ fn spawn_incoming_bridge(
                     plugin_id,
                     shmem_id,
                     state_load_error,
+                    aux_output_count,
                 } => {
                     // SSoT: `OpenPluginShmem` は AppData が live な
                     // `self.audio_tx` (respawn で差し替わる側) から送る。
@@ -344,6 +345,7 @@ fn spawn_incoming_bridge(
                         plugin_id,
                         shmem_id,
                         state_load_error,
+                        aux_output_count,
                     })
                 }
                 ChildToMain::SlotPluginState { .. } => None,

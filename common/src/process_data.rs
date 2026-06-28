@@ -20,6 +20,14 @@ pub const MAX_EVENTS: usize = 256;
 /// extra slot (= 2) to leave room for plugins that expose 2 separate
 /// keying inputs without a host upgrade.
 pub const MAX_AUX_IN: usize = 2;
+/// パラアウト (`docs/plan_paraout.md`): how many `is_main=false` aux **output**
+/// ports per plugin the host reserves shmem for. 16 covers a full multi-out
+/// drum instrument (MeldaProduction MDrummer = main + 15 stereo part buses;
+/// VCV Rack; Battery / Geist); plugins that declare more have the extras
+/// ignored (the host warns at load). Symmetric to `MAX_AUX_IN`. Cost:
+/// `16 * 2ch * 1024f * 4B = 128 KB`/plugin (妥当)。 Bumping this is an ABI
+/// break (shmem layout) → `cargo build --workspace`.
+pub const MAX_AUX_OUT: usize = 16;
 
 #[repr(C)]
 pub struct ProcessData {
@@ -61,6 +69,20 @@ pub struct ProcessData {
     /// data layout for shmem). Sum: `MAX_AUX_IN * sizeof(u8) + pad`
     /// reaches the next u32 boundary.
     pub _pad_aux: [u8; 2],
+    /// パラアウト (`docs/plan_paraout.md`): planar f32 aux **output** audio
+    /// (port × channel × frame). Written by `daw_plugin_host` after
+    /// `plugin.process()` — each `is_main=false` output port the plugin
+    /// declared is copied here. The audio engine's `NodeOp::ParallelOutTap`
+    /// handler then mixes a routed port into its destination track's input
+    /// (post-dispatch, same buffer = zero latency). Symmetric to
+    /// `buffer_aux_in`.
+    pub buffer_aux_out: [[[f32; MAX_FRAMES]; MAX_CHANNELS]; MAX_AUX_OUT],
+    /// 1 = the plugin declared this aux output port (host filled
+    /// `buffer_aux_out[port]` this buffer); 0 = no such port (engine must
+    /// not read it). Set by `daw_plugin_host` from the CLAP `audio_ports`
+    /// scan. `MAX_AUX_OUT * sizeof(u8) = 4` already lands on a u32 boundary,
+    /// so no trailing pad is needed before `bpm`.
+    pub aux_out_active: [u8; MAX_AUX_OUT],
     /// Phase 5 Step 5.3 (`docs/plan_automation.md` §10): CLAP plugin の
     /// `clap_event_transport` 構築に使う song-level transport state。
     /// daw_audio が buffer 頭で song 情報から populate。 plugin host は
@@ -155,6 +177,8 @@ impl ProcessData {
             buffer_aux_in: [[[0.0; MAX_FRAMES]; MAX_CHANNELS]; MAX_AUX_IN],
             aux_in_active: [0; MAX_AUX_IN],
             _pad_aux: [0; 2],
+            buffer_aux_out: [[[0.0; MAX_FRAMES]; MAX_CHANNELS]; MAX_AUX_OUT],
+            aux_out_active: [0; MAX_AUX_OUT],
             bpm: 120.0,
             tsig_num: 4,
             tsig_denom: 4,

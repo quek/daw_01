@@ -3348,6 +3348,141 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         18.0 + 4.0 + visible_rows as f32 * (row_h + row_gap) + 6.0
     };
 
+    // ---- パラアウト (Parallel Out) section (docs/plan_paraout.md) ----------
+    // Above the sidechain section. Per multi-out plugin: an "explode" button
+    // (auto-create + group child tracks) and, once exploded, a per-port
+    // destination dropdown. Capped like sidechain; excess rows overflow (the
+    // inspector has no internal scroll yet).
+    const PO_ROW_CAP: usize = 5;
+    let po_entries = app.parallel_output_entries();
+    let po_total_rows: usize = po_entries
+        .iter()
+        .map(|e| 1 + if e.exploded { e.aux_output_count as usize } else { 0 })
+        .sum();
+    let po_section_h = if po_entries.is_empty() {
+        0.0
+    } else {
+        let visible = po_total_rows.min(PO_ROW_CAP);
+        18.0 + 4.0 + visible as f32 * (24.0 + 4.0) + 6.0
+    };
+    if !po_entries.is_empty() {
+        let row_h = 24.0;
+        let row_gap = 4.0;
+        let po_header_y = btns_y - sc_section_h - po_section_h;
+        ui.label_at(
+            "inspector_po_label",
+            "Parallel Out",
+            area.x + pad,
+            po_header_y,
+            12.0,
+            TEXT,
+        );
+        let dropdown_w = 140.0;
+        let name_x = area.x + pad;
+        let right_x = area.x + area.w - pad;
+        let choices = app.sidechain_source_choices();
+        let labels: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let mut row_y = po_header_y + 18.0 + 4.0;
+        let mut rows_drawn = 0usize;
+        'po_rows: for (ei, entry) in po_entries.iter().enumerate() {
+            if rows_drawn >= PO_ROW_CAP {
+                break;
+            }
+            let track_id = entry.track_id;
+            let device_index = entry.device_index;
+            // Entry row: plugin name (left) + explode button (right).
+            let btn_w = 64.0;
+            let btn_x = right_x - btn_w;
+            let max_name_chars = ((btn_x - name_x - 8.0) / 7.0) as usize;
+            let n_chars = entry.plugin_name.chars().count();
+            let display_name = if n_chars > max_name_chars && max_name_chars > 3 {
+                let t: String = entry.plugin_name.chars().take(max_name_chars - 1).collect();
+                format!("{t}…")
+            } else {
+                entry.plugin_name.clone()
+            };
+            ui.label_at(
+                ("inspector_po_name", ei),
+                &display_name,
+                name_x,
+                row_y + 6.0,
+                11.0,
+                TEXT,
+            );
+            ui.button_at(
+                ("inspector_po_explode", ei),
+                "展開",
+                Rect {
+                    x: btn_x,
+                    y: row_y,
+                    w: btn_w,
+                    h: row_h,
+                },
+                move || {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::ExplodeParallelOut {
+                            track_id,
+                            device_index,
+                        });
+                    })
+                },
+            );
+            row_y += row_h + row_gap;
+            rows_drawn += 1;
+            // Port rows (only once exploded): "Out N" + destination dropdown.
+            if entry.exploded {
+                for port in 0..entry.aux_output_count as usize {
+                    if rows_drawn >= PO_ROW_CAP {
+                        break 'po_rows;
+                    }
+                    let key = ei * 64 + port;
+                    ui.label_at(
+                        ("inspector_po_outlabel", key),
+                        &format!("Out {}", port + 1),
+                        name_x,
+                        row_y + 6.0,
+                        11.0,
+                        TEXT,
+                    );
+                    let dropdown_x = right_x - dropdown_w;
+                    let selected_idx = match entry.routes.get(port).and_then(|o| *o) {
+                        None => 0,
+                        Some(dest) => choices
+                            .iter()
+                            .position(|c| c.track_id == Some(dest))
+                            .unwrap_or(0),
+                    };
+                    if let Some(picked) = ui.dropdown(
+                        ("inspector_po_dropdown", key),
+                        Rect {
+                            x: dropdown_x,
+                            y: row_y,
+                            w: dropdown_w,
+                            h: row_h,
+                        },
+                        &label_refs,
+                        selected_idx,
+                    ) && let Some(choice) = choices.get(picked)
+                    {
+                        let dest = choice.track_id;
+                        let p = port as u8;
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.handle_event(AppEvent::SetParallelOutputRoute {
+                                track_id,
+                                device_index,
+                                port: p,
+                                dest,
+                            });
+                        }));
+                    }
+                    row_y += row_h + row_gap;
+                    rows_drawn += 1;
+                }
+            }
+        }
+    }
+
     // ---- Sidechain section ------------------------------------------
     // PR4.5 sidechain UI: per-plugin source picker. ECS-flat dropdown per
     // chain row so the user can wire any track's output into the plugin's

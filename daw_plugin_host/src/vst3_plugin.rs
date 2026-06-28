@@ -1424,6 +1424,43 @@ impl LoadedPlugin for Vst3Plugin {
         self.output_buffers.get(channel).map(|v| v.as_slice())
     }
 
+    /// パラアウト (`docs/plan_paraout.md`): expose every output bus as a
+    /// parallel-out port. **Port 0 is the MAIN output bus** (`output_buffers`,
+    /// the first "part"); ports `1..` are the extra (non-main) buses
+    /// (`extra_output_buffers`), which the plugin already writes every
+    /// `process()` (we used to discard them). A multi-out drum like MDrummer
+    /// puts each part on its own bus, main included — so "explode" can split
+    /// all of them into child tracks. Symmetric to `ClapPlugin::aux_output_buffer`.
+    fn aux_output_buffer(&self, port: usize, channel: usize) -> Option<&[f32]> {
+        // Single-output plugins have no parallel-out ports (port 0 = main is
+        // only exposed for splitting when there's ≥1 extra bus). Skip so the
+        // process server doesn't needlessly copy main into buffer_aux_out[0].
+        if self.extra_output_channels.is_empty() {
+            return None;
+        }
+        if port == 0 {
+            self.output_buffers.get(channel).map(|v| v.as_slice())
+        } else {
+            self.extra_output_buffers
+                .get(port - 1)
+                .and_then(|bus| bus.get(channel))
+                .map(|v| v.as_slice())
+        }
+    }
+
+    /// パラアウト: number of parallel-out ports = `1 (main) + extra bus count`,
+    /// capped at `MAX_AUX_OUT`. Only multi-output plugins (≥1 extra bus) get
+    /// paraout; a single-output plugin reports 0 (no "explode"). MDrummer has
+    /// 15 extra buses → 16 ports (main + 15). Reported to the GUI.
+    fn aux_output_port_count(&self) -> usize {
+        let extra = self.extra_output_channels.len();
+        if extra == 0 {
+            0
+        } else {
+            (1 + extra).min(common::process_data::MAX_AUX_OUT)
+        }
+    }
+
     fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>) {
         out.append(&mut self.collected_out_notes);
     }
