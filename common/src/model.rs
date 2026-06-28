@@ -252,6 +252,25 @@ pub struct AudioEditorViewState {
     pub len_beats: f64,
 }
 
+/// 再生中にアレンジビューがプレイヘッドを追従スクロールする方式 (Ableton の
+/// Follow Behavior 相当)。`Alt+F` で `Off → Scroll → Page → Off` と循環し、
+/// トランスポートのドロップダウンでも直接選べる。`AppData` (live SSoT) が保持し、
+/// `ViewState` でプロジェクト単位に保存する (snap 設定と同じ idiom、IPC は渡らない)。
+/// 再生中にユーザーが手動で横スクロール / ズームすると `Off` に落ちる
+/// (ユーザー選択の挙動)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FollowMode {
+    /// 追従しない。
+    Off,
+    /// 連続スクロール: プレイヘッドを画面中央に固定し、背景を滑らかに流す
+    /// (Logic / Pro Tools 風、Ableton の "Scroll")。新規 / 旧 .daw の既定。
+    #[default]
+    Scroll,
+    /// ページめくり: プレイヘッドが可視右端を越えたらビューを 1 ページ進め、
+    /// プレイヘッドを左端から再び走らせる (Ableton の "Page")。
+    Page,
+}
+
 /// プロジェクトに同梱する GUI 表示状態のスナップショット。
 /// `AppData` (live SSoT) から save 時に `snapshot_view_state` で作り、load 時に
 /// `restore_view_state` で流し込む。**serde 専用** (bincode derive 無し) ＝ IPC を渡らない。
@@ -278,6 +297,10 @@ pub struct ViewState {
     pub expanded_automation_tracks: Vec<u32>,
     #[serde(default)]
     pub master_row_automation_expanded: bool,
+    /// 再生中プレイヘッド追従スクロールの方式 (Alt+F で循環)。旧 .daw は
+    /// フィールド欠落 → `FollowMode::default()` (= Page) で読まれる。
+    #[serde(default)]
+    pub arrange_follow: FollowMode,
     // ---- Snap / grid / piano roll モード ----
     #[serde(default)]
     pub arrange_snap_enabled: bool,

@@ -78,6 +78,32 @@ static SCALE_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 static REC_LABELS: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| RECORDING_MODES.iter().map(|(_, l)| *l).collect());
 
+/// 再生追従スクロール (Follow) ボタンのスタイル。色は付けない (ユーザー指定) ＝
+/// 追従中も Off も同じ中立色で、状態は label の記号だけで示す。クリックごとに
+/// Off → 連続 → ページ を循環する (= `Alt+F` と同じ `CycleArrangeFollow`)。
+const STYLE_FOLLOW: ToggleButtonStyle = ToggleButtonStyle {
+    off_color: theme::CONTROL,
+    on_color: theme::CONTROL,
+    border: theme::BORDER,
+    border_width: 1.0,
+    radius: 4.0,
+    font_size: 16.0,
+    text_color: theme::TEXT,
+    on_text_color: None,
+};
+
+/// 追従方式を表す記号 (Follow ボタンの label)。色なしの単色グリフ (ユーザー指定):
+/// ⊘=OFF / ➡=連続スクロール / ⇥=ページめくり (arrow-to-bar = 端でページ送り)。
+/// いずれもカラー絵文字でない (VS16 を付けない) ので単色描画される。
+fn follow_glyph(mode: common::model::FollowMode) -> &'static str {
+    use common::model::FollowMode;
+    match mode {
+        FollowMode::Off => "\u{2298}",    // ⊘
+        FollowMode::Scroll => "\u{27A1}", // ➡ (VS16 無し = 単色)
+        FollowMode::Page => "\u{21E5}",   // ⇥
+    }
+}
+
 /// Phase 7 B4 Step C/D (2026-05-13): MIDI Record toggle button のスタイル。
 /// active 時 record red (= 業界標準) + hint band で「録音中」 を強調。
 /// count-in 中も同 active state で描画 (label 側で「Count-in...」 表示と
@@ -422,6 +448,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleLoop)),
     );
     x += loop_w + 12.0;
+
+    // 再生追従スクロール (Follow): クリックごとに Off → 連続 → ページ を循環する
+    // (= Alt+F と同じ CycleArrangeFollow)。状態は label の単色記号だけで示し、色は
+    // 付けない (ユーザー指定)。Loop の隣に置き再生のまとまりにする。再生中に手動で
+    // 横スクロール / ズームすると app 側で自動的に Off へ落ちる。
+    let follow_w = 36.0;
+    ui.toggle_button_at(
+        "transport_follow",
+        follow_glyph(app.arrange_follow),
+        Rect { x, y: cy, w: follow_w, h: bh },
+        false, // 色を付けない (ユーザー指定) ので active 強調はしない
+        &STYLE_FOLLOW,
+        |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CycleArrangeFollow)),
+    );
+    x += follow_w + 12.0;
 
     // Phase 4 (`docs/plan_automation.md` §6): automation recording mode
     // 4 択 (Read / Touch / Latch / Write) を dropdown 化。 排他選択なので
