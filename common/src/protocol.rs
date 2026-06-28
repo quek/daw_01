@@ -313,6 +313,10 @@ pub struct AudioSession {
     pub shmem_id: String,
     pub request_sem_id: String,
     pub ready_sem_id: String,
+    /// resource monitor の `MetricsBridge` shmem os_id
+    /// (`metrics_bridge::metrics_shmem_id(pid)`)。 daw_audio / daw_plugin_host
+    /// がこれで `MetricsBridgeHandle::open` し、 DSP load / per-plugin CPU を publish。
+    pub metrics_shmem_id: String,
     pub sample_rate: u32,
     pub max_frames: u32,
     pub channels: u16,

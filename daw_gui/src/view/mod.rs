@@ -15,6 +15,7 @@ pub mod piano_roll_view;
 pub mod plugin_picker;
 pub mod preview_window;
 pub mod recovery_modal;
+pub mod resource_monitor;
 pub mod root;
 pub mod runner;
 pub mod shortcuts;

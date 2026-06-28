@@ -862,6 +862,12 @@ impl Runner {
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
 
+        // resource monitor (r.md #3): frame 時間の EMA から GUI FPS を AppData へ。
+        // status bar 常駐メーターと詳細パネルが読む。
+        let fps_sample = common::metrics_bridge::fps_from_dt(dt.as_secs_f32());
+        state.app.metrics.fps =
+            common::metrics_bridge::ema(state.app.metrics.fps, fps_sample, 0.1);
+
         // Diagnostic: emit a summary every 30 render frames so we can
         // see whether the main thread loop matches worker decode
         // throughput. If main fps drops below 10, the user's "0.25x"

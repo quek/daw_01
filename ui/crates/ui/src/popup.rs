@@ -32,6 +32,11 @@ pub struct PopupOpenState {
     /// する)。`open_popup` 経由の menu / dropdown / context_menu は `false` (= 従来どおり
     /// 「panel の裏に隠れた widget だけ」を抑制)。`Ui::open_modal` 経由の dialog だけ `true`。
     pub capture_input: bool,
+    /// resource monitor (r.md #3): `capture_input == true` のうち keyboard / shortcut も
+    /// 遮断するか。 `true` = 真のモーダル (dialog / color_picker)、 `false` = pointer だけ
+    /// masking して keyboard は background に通す overlay panel (= Performance パネル。
+    /// 再生継続のため Space 等を効かせる)。 `capture_input == false` のときは無関係。
+    pub capture_keyboard: bool,
     /// M14 Phase 95 (daw_01 #066): panel (anchor) 外 click で popup を auto-close するか。
     /// `true` (default) は menu / dropdown / 通常 modal の従来挙動 (外 click で閉じる)。
     /// `false` の間は外 click で閉じず、 modal なら click を consume するだけ (= Cancel ボタン等で

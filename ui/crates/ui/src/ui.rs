@@ -627,6 +627,12 @@ impl<M: ?Sized + 'static> UiHost<M> {
             .open_popups
             .values()
             .any(|s| s.modal && s.capture_input);
+        // resource monitor (r.md #3): keyboard 遮断は capture_keyboard も要求する
+        // (= overlay panel は pointer だけ mask、 Space 等の shortcut は background に通す)。
+        let modal_capturing_keyboard = self
+            .open_popups
+            .values()
+            .any(|s| s.modal && s.capture_input && s.capture_keyboard);
         let effective_pointer = if modal_capturing { masked_pointer(pointer) } else { pointer };
 
         let mut ui = Ui {
@@ -636,6 +642,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pointer: effective_pointer,
             pointer_raw: pointer,
             modal_capturing,
+            modal_capturing_keyboard,
             keyboard_events: &mut keyboard_events,
             ime_events: &mut ime_events,
             cursor,
@@ -795,6 +802,10 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// いるか (frame 頭に確定)。`true` の間、background widget への pointer / keyboard 入力を
     /// 遮断する (= 真のモーダル)。
     pub(crate) modal_capturing: bool,
+    /// resource monitor (r.md #3): `modal_capturing` のうち keyboard も遮断するか
+    /// (capture_keyboard==true な真のモーダルが開いている)。 overlay panel は false なので
+    /// pointer は mask されても shortcut (Space 等) は background に通る。
+    pub(crate) modal_capturing_keyboard: bool,
     /// このフレーム分のキー入力イベント (フォーカスを持つ widget が消費する)。
     keyboard_events: &'a mut Vec<KeyEvent>,
     /// このフレーム分の IME イベント (フォーカスを持つ widget が消費する)。
@@ -982,7 +993,34 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 「panel の裏に隠れた widget だけ抑制」)。画面全体の入力遮断 (真のモーダル) が要るのは
     /// dialog だけなので、それは [`Ui::open_modal`] (= `capture_input == true`) を使う。
     pub fn open_popup(&mut self, id: impl std::hash::Hash, anchor: Rect, modal: bool) {
-        self.open_popup_inner(id, anchor, modal, false);
+        self.open_popup_inner(id, anchor, modal, false, false);
+    }
+
+    /// resource monitor (r.md #3): 非モーダルな overlay panel を開く。 pointer は
+    /// masking する (panel 上の click が背後の widget に突き抜けない) が、 keyboard /
+    /// shortcut は background に通す (= Space 再生等が効く)。 暗転 backdrop も描かない
+    /// (描画は呼び出し側の `popup_layer` 内に委ねる)。 Performance パネル等の「再生を
+    /// 止めず最前面に重ねる panel」用。 panel 外 click / Esc で閉じる挙動は menu と同じ。
+    /// anchor は呼び出し側が `update_popup_anchor(("overlay", id), panel_rect)` で更新する。
+    pub fn open_overlay(&mut self, id: impl std::hash::Hash) {
+        self.open_popup_inner(
+            ("overlay", &id),
+            Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            true,
+            true,
+            false,
+        );
+    }
+
+    /// overlay panel を閉じる。
+    pub fn close_overlay(&mut self, id: impl std::hash::Hash) {
+        self.close_popup(("overlay", &id));
+    }
+
+    /// overlay panel が開いているか。
+    #[must_use]
+    pub fn is_overlay_open(&self, id: impl std::hash::Hash) -> bool {
+        self.is_popup_open(("overlay", &id))
     }
 
     /// M14 Phase 94 (daw_01 #065): `capture_input` を指定して popup を開く内部 API。
@@ -994,6 +1032,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         anchor: Rect,
         modal: bool,
         capture_input: bool,
+        capture_keyboard: bool,
     ) {
         let wid = WidgetId::ROOT.child((b"popup", &id));
         let prev_focus = self.pending_focus;
@@ -1007,6 +1046,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 modal,
                 prev_focus,
                 capture_input,
+                capture_keyboard,
                 dismiss_on_outside_click: true,
             },
         );
@@ -1199,7 +1239,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// keyboard / shortcut / focus 入力を遮断すべきか。`drawing_in_popup == true` (= modal の
     /// body / 内部 internal traversal は別 API) では遮断しない。
     fn keyboard_blocked_by_modal(&self) -> bool {
-        self.modal_capturing && !self.drawing_in_popup
+        self.modal_capturing_keyboard && !self.drawing_in_popup
     }
 
     /// pointer が **modal popup の anchor 内** にあり、現在の widget が `drawing_in_popup`

@@ -1591,6 +1591,20 @@ pub struct AppData {
     pub peak_l_norm: f32,
     pub peak_r_norm: f32,
 
+    // -------- Resource monitor (r.md #3) --------
+    /// 集計済みリソース指標 (DSP load / system CPU / fps / xrun / mem)。 poller
+    /// (DSP/xrun/buffer) / sysinfo スレッド (CPU/mem) / runner (fps) が別々に
+    /// 更新し、 status bar 常駐メーターと詳細パネルが読む。
+    pub metrics: common::metrics_bridge::ResourceMetrics,
+    /// MetricsBridge ハンドル (per-plugin CPU の直接読み出し用)。 GUI mode のみ
+    /// `Some`、 script / test は `None`。 詳細パネルが `track_plugin_ids` の
+    /// 各 plugin_id について `plugin_dsp_us` を直接読む。
+    pub metrics_bridge: Option<Arc<common::metrics_bridge::MetricsBridgeHandle>>,
+    /// status bar の常駐メーター表示 on/off (app_config.json で永続化)。
+    pub resource_monitor_enabled: bool,
+    /// 詳細パネルが開いているか (session-only、 Esc / 再クリックで閉じる)。
+    pub resource_panel_open: bool,
+
     // -------- Plugin database / picker --------
     pub plugin_db: Option<Arc<PluginDatabase>>,
     pub plugin_picker_entries: Vec<PluginPickEntry>,
@@ -2295,6 +2309,13 @@ impl AppData {
             peak_r_display: 0.0,
             peak_l_norm: 0.0,
             peak_r_norm: 0.0,
+            metrics: common::metrics_bridge::ResourceMetrics::default(),
+            metrics_bridge: None,
+            resource_monitor_enabled: app_dirs
+                .as_ref()
+                .map(|d| common::app_config::load(d.app_config()).resource_monitor_enabled)
+                .unwrap_or(true),
+            resource_panel_open: false,
             plugin_db,
             plugin_picker_entries,
             plugin_picker_visible: Vec::new(),
@@ -5230,6 +5251,24 @@ pub enum AppEvent {
     /// scalars (indexed by `ModSource` position), polled ~30Hz from
     /// `AudioBridge::mod_scalars`. Drives visual modulation each frame.
     ModScalarsTick(Vec<f32>),
+    /// resource monitor (r.md #3): poller が ~30Hz で読む全体メトリクス
+    /// (DSP load peak/avg、 xrun 累積、 buffer 長 / sample rate)。
+    MetricsTick {
+        dsp_load_peak: f32,
+        dsp_load_avg: f32,
+        xrun_count: u64,
+        buffer_frames: u32,
+        sample_rate: u32,
+    },
+    /// resource monitor (r.md #3): sysinfo スレッドが ~1Hz で読む system 指標
+    /// (daw_01 3 プロセス合計の CPU% と常駐メモリ MB)。
+    SystemMetricsTick { cpu: f32, mem_mb: f32 },
+    /// resource monitor (r.md #3): status bar 常駐メーターの表示 on/off を
+    /// トグルし app_config.json に保存 (View メニュー / ショートカット)。
+    ToggleResourceMonitor,
+    /// resource monitor (r.md #3): 詳細パネルの開閉トグル (status bar クリック /
+    /// Esc / ショートカット)。
+    ToggleResourcePanel,
 
     // -------- Aux send / return ------------------------------------------
     /// master 直下 (`parent_group_id = None`) の通常 track を 1 本作り
@@ -6857,6 +6896,38 @@ impl AppData {
             }
             AppEvent::TrackPeaksTick(peaks) => {
                 self.on_track_peaks_tick(&peaks);
+            }
+            AppEvent::MetricsTick {
+                dsp_load_peak,
+                dsp_load_avg,
+                xrun_count,
+                buffer_frames,
+                sample_rate,
+            } => {
+                self.metrics.dsp_load_peak = dsp_load_peak;
+                self.metrics.dsp_load_avg = dsp_load_avg;
+                self.metrics.xrun_count = xrun_count;
+                self.metrics.buffer_frames = buffer_frames;
+                self.metrics.sample_rate = sample_rate;
+            }
+            AppEvent::SystemMetricsTick { cpu, mem_mb } => {
+                self.metrics.system_cpu = cpu;
+                self.metrics.memory_mb = mem_mb;
+            }
+            AppEvent::ToggleResourceMonitor => {
+                self.resource_monitor_enabled = !self.resource_monitor_enabled;
+                // app_config.json に永続化 (プロジェクト非依存の UI 設定)。
+                if let Some(dirs) = &self.app_dirs {
+                    let cfg = common::app_config::AppConfig {
+                        resource_monitor_enabled: self.resource_monitor_enabled,
+                    };
+                    if let Err(e) = common::app_config::save(dirs.app_config(), &cfg) {
+                        tracing::warn!(error = ?e, "failed to save app_config");
+                    }
+                }
+            }
+            AppEvent::ToggleResourcePanel => {
+                self.resource_panel_open = !self.resource_panel_open;
             }
             AppEvent::ModScalarsTick(scalars) => {
                 // docs/plan_modulation.md §4.2: snapshot the latest follower
@@ -23666,7 +23737,7 @@ mod master_fx_tests {
     }
 }
 
-fn resolve_plugin_name(plugin_db: &Option<Arc<PluginDatabase>>, plugin_id: &str) -> String {
+pub(crate) fn resolve_plugin_name(plugin_db: &Option<Arc<PluginDatabase>>, plugin_id: &str) -> String {
     plugin_db
         .as_deref()
         .and_then(|db| db.find_by_id(plugin_id))

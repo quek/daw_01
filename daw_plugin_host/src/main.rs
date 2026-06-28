@@ -744,6 +744,7 @@ fn plugin_main_loop(
                     match process_server::WorkerPool::open(
                         n_workers,
                         &worker_bridge_shmem_id,
+                        &session.metrics_shmem_id,
                         &wake_event_names,
                         &done_event_names,
                         Arc::clone(&plugin_registry),

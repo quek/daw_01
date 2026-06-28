@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use common::audio_bridge::AudioBridgeHandle;
+use common::metrics_bridge::MetricsBridgeHandle;
 use common::protocol::ChildToMain;
 use tokio::sync::mpsc::UnboundedReceiver;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -211,6 +212,7 @@ fn run_gui(
         .take_incoming_rx()
         .expect("Bootstrap.incoming_rx already taken");
     let bridge = Arc::clone(&bootstrap.bridge);
+    let metrics = Arc::clone(&bootstrap.metrics);
     let job = Arc::clone(&bootstrap.job);
     let plugin_db = bootstrap.plugin_db.clone();
     let supervisor = Arc::clone(&bootstrap.supervisor);
@@ -240,7 +242,7 @@ fn run_gui(
                 Arc::new(WinitDispatcher::new(proxy.clone()));
             let job_dispatcher: Arc<dyn daw_gui::dispatcher::JobDispatcher> =
                 Arc::new(Win32JobDispatcher::new(job));
-            let app = AppData::new(
+            let mut app = AppData::new(
                 audio_tx,
                 plugin_tx,
                 None,
@@ -250,8 +252,12 @@ fn run_gui(
                 Some(supervisor),
                 app_dirs.clone(),
             );
+            // resource monitor (r.md #3): per-plugin CPU の直接読み出し用に
+            // MetricsBridge ハンドルを AppData へ持たせる。
+            app.metrics_bridge = Some(Arc::clone(&metrics));
 
-            spawn_playhead_poller(bridge, proxy.clone());
+            spawn_playhead_poller(bridge, Arc::clone(&metrics), proxy.clone());
+            spawn_resource_sysinfo_poller(proxy.clone());
             spawn_autosave_timer(proxy.clone());
             spawn_midi_input(proxy.clone());
             spawn_incoming_bridge(incoming_rx, proxy.clone());
@@ -489,7 +495,11 @@ fn spawn_autosave_timer(proxy: EventLoopProxy<AppEvent>) {
     });
 }
 
-fn spawn_playhead_poller(bridge: Arc<AudioBridgeHandle>, proxy: EventLoopProxy<AppEvent>) {
+fn spawn_playhead_poller(
+    bridge: Arc<AudioBridgeHandle>,
+    metrics: Arc<MetricsBridgeHandle>,
+    proxy: EventLoopProxy<AppEvent>,
+) {
     std::thread::spawn(move || {
         let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
         let mut mod_buf: Vec<f32> = Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES);
@@ -527,6 +537,59 @@ fn spawn_playhead_poller(bridge: Arc<AudioBridgeHandle>, proxy: EventLoopProxy<A
             // alloc 回数自体は不変。 30Hz の background thread なので無害)。
             if proxy
                 .send_event(AppEvent::TrackPeaksTick(std::mem::take(&mut peaks_buf)))
+                .is_err()
+            {
+                break;
+            }
+            // resource monitor (r.md #3): DSP load (peak は swap でリセット) /
+            // xrun / buffer を同じ 30Hz tick で読み UI へ流す。
+            let (buffer_frames, sample_rate) = metrics.buffer_info();
+            if proxy
+                .send_event(AppEvent::MetricsTick {
+                    dsp_load_peak: metrics.take_dsp_load_peak(),
+                    dsp_load_avg: metrics.dsp_load_avg(),
+                    xrun_count: metrics.xrun_count(),
+                    buffer_frames,
+                    sample_rate,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// resource monitor (r.md #3): daw_01 セッション (daw_gui + 子プロセス群) の
+/// system CPU% と常駐メモリを sysinfo で ~1Hz ポーリングし UI へ流す。 DSP load
+/// とは別物の「アプリ全体の重さ」。 RT パス外の専用スレッド。
+fn spawn_resource_sysinfo_poller(proxy: EventLoopProxy<AppEvent>) {
+    std::thread::spawn(move || {
+        let self_pid = sysinfo::get_current_pid().ok();
+        let mut sys = sysinfo::System::new();
+        loop {
+            std::thread::sleep(Duration::from_millis(1000));
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            let Some(self_pid) = self_pid else {
+                continue;
+            };
+            // 自プロセス + その子 (daw_audio / daw_plugin_host / VOICEVOX engine)
+            // を合算 = daw_01 セッション全体の負荷。
+            let mut cpu = 0.0f32;
+            let mut mem_bytes = 0u64;
+            for proc in sys.processes().values() {
+                if proc.pid() == self_pid || proc.parent() == Some(self_pid) {
+                    cpu += proc.cpu_usage();
+                    mem_bytes += proc.memory();
+                }
+            }
+            // sysinfo の cpu_usage は 1 コア = 100%。 システム全体に対する % へ正規化。
+            let n_cpus = sys.cpus().len().max(1) as f32;
+            if proxy
+                .send_event(AppEvent::SystemMetricsTick {
+                    cpu: cpu / n_cpus,
+                    mem_mb: mem_bytes as f32 / (1024.0 * 1024.0),
+                })
                 .is_err()
             {
                 break;

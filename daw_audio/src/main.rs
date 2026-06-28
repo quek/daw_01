@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 static GLOBAL: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 use common::audio_bridge::AudioBridgeHandle;
 use common::meter::compute_block_peak;
+use common::metrics_bridge::MetricsBridgeHandle;
 use common::protocol::{ChildKind, ChildToMain, MainToChild};
 use common::wire::{read_msg, write_msg};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -50,6 +51,12 @@ async fn main() -> Result<()> {
     let bridge = Arc::new(
         AudioBridgeHandle::open(&session.shmem_id).context("failed to open audio shmem")?,
     );
+    // resource monitor (r.md #3): DSP load / xrun / buffer 情報を publish する
+    // 共有メモリ。 daw_gui が create したものを open する。
+    let metrics = Arc::new(
+        MetricsBridgeHandle::open(&session.metrics_shmem_id)
+            .context("failed to open metrics shmem")?,
+    );
 
     let shared = Arc::new(SharedState::new());
     // Engine resources shared between the CPAL closure and (in A3) the
@@ -70,6 +77,7 @@ async fn main() -> Result<()> {
         Arc::clone(&shared),
         Arc::clone(&engine_shared),
         Arc::clone(&bridge),
+        Arc::clone(&metrics),
         Arc::clone(&master_gain),
         session.sample_rate,
         cmd_rx,
@@ -813,6 +821,7 @@ fn start_output_stream(
     shared: Arc<SharedState>,
     engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
+    metrics: Arc<MetricsBridgeHandle>,
     master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<engine::AudioCommand>,
@@ -850,6 +859,7 @@ fn start_output_stream(
         shared,
         engine_shared,
         bridge,
+        metrics,
         master_gain,
         session_sample_rate,
         cmd_rx,
@@ -866,6 +876,7 @@ fn build_stream(
     shared: Arc<SharedState>,
     engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
+    metrics: Arc<MetricsBridgeHandle>,
     master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<engine::AudioCommand>,
@@ -898,11 +909,17 @@ fn build_stream(
     let declick_max_hold = sr64 * 2; // 2 s safety: auto-release if no reply
     let mut declick_t: Option<u64> = None;
     let mut declick_released_at: Option<u64> = None;
+    // resource monitor (r.md #3): DSP load average の EMA 状態。 callback 間で保持。
+    let mut dsp_load_ema: f32 = 0.0;
 
     let stream = device
         .build_output_stream(
             config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                // resource monitor (r.md #3): callback 全体の処理時間を測る。
+                // plugin 処理は worker pool でブロッキング同期されるため、 この
+                // 区間に plugin 負荷が含まれる。 `Instant::now()` は RT 許容。
+                let cb_start = std::time::Instant::now();
                 let frames = (data.len() / channels_usize).min(max_frames);
 
                 local.process_buffer(&shared, &bridge, session_sample_rate, frames);
@@ -979,6 +996,23 @@ fn build_stream(
 
                 let (peak_l, peak_r) = block_peaks_stereo(data, channels_usize);
                 bridge.set_peaks(peak_l, peak_r);
+
+                // resource monitor (r.md #3): DSP load を publish。 load =
+                // 処理時間 ÷ バッファ周期。 peak は直近窓の worst-case (GUI が
+                // swap でリセット)、 avg は EMA。 load>1.0 は dropout として記録。
+                let elapsed = cb_start.elapsed().as_secs_f32();
+                let load =
+                    common::metrics_bridge::dsp_load(elapsed, frames as u32, session_sample_rate);
+                metrics.observe_dsp_load_peak(load);
+                dsp_load_ema = common::metrics_bridge::ema(dsp_load_ema, load, 0.1);
+                metrics.set_dsp_load_avg(dsp_load_ema);
+                metrics.set_buffer_info(frames as u32, session_sample_rate);
+                // xrun は再生中のみカウントする。 停止中 (無音) の callback 処理時間
+                // スパイク (起動直後の cold start / OS scheduling jitter) は実際の
+                // 音切れではないため除外する (`local.playing` = 今 buffer が rolling か)。
+                if load > 1.0 && local.playing {
+                    metrics.add_xrun();
+                }
             },
             |err| tracing::error!(?err, "audio stream error"),
             None,

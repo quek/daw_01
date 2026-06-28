@@ -53,6 +53,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::Result;
+use common::metrics_bridge::MetricsBridgeHandle;
 use common::plugin_ref::open_named_event;
 use common::process_data::{Event, EventKind};
 use common::worker_bridge::{MAX_WORKERS, WorkerBridge, WorkerBridgeHandle};
@@ -337,6 +338,7 @@ impl WorkerPool {
     pub fn open(
         n_workers: u32,
         worker_bridge_shmem_id: &str,
+        metrics_shmem_id: &str,
         wake_event_names: &[String],
         done_event_names: &[String],
         registry: PluginRegistry,
@@ -362,6 +364,9 @@ impl WorkerPool {
         );
 
         let bridge = Arc::new(WorkerBridgeHandle::open(worker_bridge_shmem_id)?);
+        // resource monitor (r.md #3): per-plugin の process() 時間を publish する
+        // 共有メモリ。 各 worker が clone を持ち、 process() 後に store する。
+        let metrics = Arc::new(MetricsBridgeHandle::open(metrics_shmem_id)?);
         let shutdown = Arc::new(AtomicBool::new(false));
         let dispatch = Arc::new(DispatchCounter::new());
         let mut workers = Vec::with_capacity(n_workers as usize);
@@ -374,6 +379,7 @@ impl WorkerPool {
             wake_events.push(wake);
 
             let bridge_w = Arc::clone(&bridge);
+            let metrics_w = Arc::clone(&metrics);
             let shutdown_w = Arc::clone(&shutdown);
             let registry_w = Arc::clone(&registry);
             let dispatch_w = Arc::clone(&dispatch);
@@ -388,7 +394,8 @@ impl WorkerPool {
                 .name(format!("plugin-worker-{i}"))
                 .spawn(move || {
                     run_worker(
-                        idx, bridge_w, shutdown_w, registry_w, dispatch_w, wake_s, done_s, ring,
+                        idx, bridge_w, metrics_w, shutdown_w, registry_w, dispatch_w, wake_s,
+                        done_s, ring,
                     )
                 })?;
             workers.push(handle);
@@ -515,6 +522,7 @@ impl Drop for WorkerPool {
 fn run_worker(
     idx: u32,
     bridge: Arc<WorkerBridgeHandle>,
+    metrics: Arc<MetricsBridgeHandle>,
     shutdown: Arc<AtomicBool>,
     registry: PluginRegistry,
     dispatch: Arc<DispatchCounter>,
@@ -710,6 +718,7 @@ fn run_worker(
         // 永久 hang する (DispatchGuard は当 buffer の quiesce しか救えない)。
         // catch_unwind で unwind を止め worker thread を生かす。 C/C++ plugin
         // の例外はそもそも Rust panic として unwind しないので対象は builtin。
+        let proc_start = std::time::Instant::now();
         let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             plugin.process(
                 frames,
@@ -734,6 +743,11 @@ fn run_worker(
                 false
             }
         };
+        // resource monitor (r.md #3): per-plugin の process() 時間 (μs) を publish。
+        // panic / err でも計測区間は有効なので worst-case 把握のため常に store。
+        // `Instant::now`/`elapsed` は RT 許容、 store は lock-free。
+        let proc_us = u32::try_from(proc_start.elapsed().as_micros()).unwrap_or(u32::MAX);
+        metrics.set_plugin_dsp_us(plugin_id, proc_us);
         if process_ok {
             // Copy output audio into the shmem.
             if let Some(out_l) = plugin.output_buffer(0) {

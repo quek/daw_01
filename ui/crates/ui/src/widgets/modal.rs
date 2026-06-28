@@ -56,7 +56,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M14 Phase 94 (daw_01 #065): dialog は `capture_input = true` (真のモーダル) で開く。
         // = 開いた次フレームから panel 外の全 widget への pointer / keyboard 入力が遮断される。
         // menu / dropdown / context_menu (`open_popup`, capture_input = false) とはここで区別する。
-        self.open_popup_inner(("modal", &id), Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, true, true);
+        self.open_popup_inner(
+            ("modal", &id),
+            Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            true,
+            true,
+            true,
+        );
     }
 
     /// modal を閉じる。`on_close` Edit は呼び出し側責任 (modal 関数経由で発火させる場合は
@@ -287,6 +293,54 @@ mod tests {
             still_open.set(ui.is_modal_open("dlg"));
         });
         assert!(!still_open.get());
+    }
+
+    #[test]
+    fn overlay_masks_pointer_but_passes_keyboard_shortcuts() {
+        // resource monitor (r.md #3): open_overlay は pointer を masking する
+        // (panel 上クリックが背後の widget に突き抜けない) が、 keyboard / shortcut は
+        // background に通す (Space 等の再生操作が効く)。 open_modal (真のモーダル、
+        // keyboard も遮断) との差はこの 1 点。
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 800, height: 600 };
+
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.open_overlay("perf");
+        });
+
+        // Esc キー + pointer click を background widget へ流す。
+        let esc = KeyEvent {
+            state: ElementState::Pressed,
+            text: None,
+            physical_key: PhysicalKey::Escape,
+        };
+        let click = PointerFrame {
+            pos: Some((10.0, 10.0)),
+            primary_just_pressed: true,
+            ..PointerFrame::default()
+        };
+        let shortcut_seen = Cell::new(false);
+        let pointer_pos_seen = Cell::new(true);
+        host.frame_to_edits(
+            &(),
+            &mut scene,
+            screen,
+            FrameInput { keyboard: vec![esc], pointer: click, ..Default::default() },
+            |(), ui| {
+                // background (popup_layer の外) が shortcut / pointer を読む。
+                shortcut_seen.set(ui.take_shortcut("escape"));
+                pointer_pos_seen.set(ui.pointer().pos.is_some());
+            },
+        );
+        assert!(
+            shortcut_seen.get(),
+            "overlay 中も background の shortcut (Esc) は効く = keyboard pass (Space 再生継続)"
+        );
+        assert!(
+            !pointer_pos_seen.get(),
+            "overlay 中は background の pointer が masked = panel 上クリックが突き抜けない"
+        );
     }
 
     #[test]

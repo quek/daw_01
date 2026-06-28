@@ -263,7 +263,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // SV 矩形 / Hue バーのドラッグが下の clip を一切動かさない。 panel 外
             // click は従来どおり popup_layer の outside-click 検出で dismiss する (capture でも
             // close 判定は生 pointer で行う #065 仕様)。
-            self.open_popup_inner(pid, panel, true, true);
+            self.open_popup_inner(pid, panel, true, true, true);
         }
         self.update_popup_anchor(pid, panel);
 

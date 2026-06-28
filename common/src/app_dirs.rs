@@ -65,6 +65,12 @@ impl AppDirs {
         self.root.join("window_state.json")
     }
 
+    /// `<root>\app_config.json` — プロジェクト非依存のアプリ全体設定
+    /// (resource monitor の常駐表示 on/off など)。
+    pub fn app_config(&self) -> PathBuf {
+        self.root.join("app_config.json")
+    }
+
     /// `<root>\logs\` — 各プロセスの日次ローテーション tracing ログ置き場。
     /// release で windows-subsystem 化 (コンソール無し) しても、 ここに
     /// `<process>.YYYY-MM-DD` が常時書かれる。 docs/plan_icon_and_console.md (#48)。

@@ -11,8 +11,8 @@ use daw_ui_renderer::{theme, Rect};
 use crate::app::{AppData, AppEvent};
 use crate::view::{
     arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
-    font_picker, load_overlay, plugin_picker, recovery_modal, shortcuts_help, snap, status_bar,
-    track_inspector, track_picker, transport, voicevox_overlay,
+    font_picker, load_overlay, plugin_picker, recovery_modal, resource_monitor, shortcuts_help,
+    snap, status_bar, track_inspector, track_picker, transport, voicevox_overlay,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -100,6 +100,10 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     );
 
     status_bar::draw(app, ui, status_rect);
+
+    // resource monitor (r.md #3): 詳細パネル (non-modal overlay)。 開いている時だけ
+    // 描画する。 modal より前に呼ぶので、 modal が出れば自然に隠れる (意図どおり)。
+    resource_monitor::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
     // Modal: plugin picker。draw 関数内で modal の open/close を app.is_plugin_picker_open
     // と同期させる (常時呼び、内部で is_modal_open / open_modal を管理)。
@@ -285,6 +289,18 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             m.item("Toggle Video Preview", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::TogglePreviewWindow)
+                }));
+            });
+            // resource monitor (r.md #3): status bar 常駐メーターの on/off (永続化)
+            // と、 詳細パネルの開閉。
+            m.item("Toggle Resource Monitor", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleResourceMonitor)
+                }));
+            });
+            m.item("Performance Panel", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleResourcePanel)
                 }));
             });
         });
@@ -1198,6 +1214,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CloseAudioEditor)
             }));
+        } else if app.resource_panel_open {
+            // resource monitor (r.md #3): 詳細パネルが開いていれば Esc で閉じる
+            // (rename / audio editor の後、 選択解除より優先)。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleResourcePanel)
+            }));
         } else if !app.selected_clips.is_empty()
             || app.selected_clip.is_some()
             || !app.selected_notes.is_empty()
@@ -1324,6 +1346,23 @@ mod tests {
         assert!(
             app.audio_editor_clip.is_none(),
             "Audio Editor 表示中の Esc は歌詞フラグに関わらず Audio Editor を閉じる",
+        );
+    }
+
+    /// resource monitor (r.md #3) 詳細パネルが開いている間の Esc はパネルを
+    /// 閉じ、 選択は維持する (audio editor の後、 選択解除より優先 = 2 段階で
+    /// 次の Esc が選択解除に回る)。
+    #[test]
+    fn escape_closes_resource_panel_before_clearing_selection() {
+        let mut app = build_app();
+        app.resource_panel_open = true;
+        app.selected_notes = vec![1];
+        dispatch_escape(&mut app);
+        assert!(!app.resource_panel_open, "Esc は開いている詳細パネルを閉じる");
+        assert_eq!(
+            app.selected_notes,
+            vec![1],
+            "パネルを閉じる Esc は選択を解除しない",
         );
     }
 }

@@ -1,3 +1,4 @@
+pub mod app_config;
 pub mod app_dirs;
 pub mod audio_bridge;
 pub mod audio_render;
@@ -5,6 +6,7 @@ pub mod automation;
 pub mod clap_scan;
 pub mod logging;
 pub mod meter;
+pub mod metrics_bridge;
 pub mod mod_sidecar;
 pub mod model;
 pub mod modulators;

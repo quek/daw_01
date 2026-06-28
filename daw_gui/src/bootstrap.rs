@@ -16,6 +16,7 @@ use anyhow::{Context as _, Result};
 use common::audio_bridge::{
     AudioBridgeHandle, CHANNELS, MAX_FRAMES, SAMPLE_RATE, ready_sem_id, request_sem_id, shmem_id,
 };
+use common::metrics_bridge::{MetricsBridgeHandle, metrics_shmem_id};
 use common::pipe::pipe_path;
 use common::plugin_db::PluginDatabase;
 use common::protocol::{AudioSession, ChildKind, ChildToMain, MainToChild};
@@ -46,6 +47,10 @@ pub struct Bootstrap {
     /// Audio shmem ハンドル。 audio_bridge::AudioBridgeHandle は playhead /
     /// peak meter 等の state を保持する shared memory region を参照する。
     pub bridge: Arc<AudioBridgeHandle>,
+    /// resource monitor (r.md #3) の MetricsBridge ハンドル。 DSP load / xrun /
+    /// per-plugin CPU を daw_audio / daw_plugin_host が書き、 poller と AppData
+    /// (per-plugin 直接読み) が読む。
+    pub metrics: Arc<MetricsBridgeHandle>,
     /// VOICEVOX engine 等の子プロセスを kill-on-close するための Job Object。
     pub job: Arc<JobHandle>,
     /// 起動時に読み込んだ plugin database (CLAP / VST3 enumeration)。
@@ -198,12 +203,20 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         shmem_id: shmem_id(pid),
         request_sem_id: request_sem_id(pid),
         ready_sem_id: ready_sem_id(pid),
+        metrics_shmem_id: metrics_shmem_id(pid),
         sample_rate: SAMPLE_RATE,
         max_frames: MAX_FRAMES,
         channels: CHANNELS as u16,
     };
     let bridge = Arc::new(
         AudioBridgeHandle::create(&session.shmem_id).context("failed to create audio shmem")?,
+    );
+    // resource monitor (r.md #3): DSP load / xrun / per-plugin CPU を集約する
+    // 共有メモリ。 daw_gui (親) が create し、 daw_audio / daw_plugin_host が
+    // session.metrics_shmem_id 経由で open する。
+    let metrics = Arc::new(
+        MetricsBridgeHandle::create(&session.metrics_shmem_id)
+            .context("failed to create metrics shmem")?,
     );
     let request_sem = Semaphore::create(&session.request_sem_id, 0, 2)
         .context("failed to create request semaphore")?;
@@ -264,6 +277,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         plugin_tx,
         incoming_rx: Some(incoming_rx),
         bridge,
+        metrics,
         job,
         plugin_db,
         rt,
