@@ -106,11 +106,13 @@ worktree-rm:
 	@[ -n "$(NAME)" ] || { echo "usage: make worktree-rm NAME=<worktree-name> [FORCE=1]"; exit 1; }
 	$(BASH) "$(CLEANUP_WT)" --name "$(NAME)" $(if $(FORCE),--force,)
 
-# マージ済み worktree を全部削除する。判定 (branch_merged_into_main): branch 固有の
-# 非マージコミットが無い (rev-list --no-merges main..branch が空) かつ main に対する正味
-# 差分が無い (git diff --quiet main...branch)。これで tip が「main を feature に merge」
-# したコミット (= --is-ancestor では未マージ扱いになるマージフローの残骸) を拾いつつ、
-# 作業をコミットして revert しただけの net-zero ブランチ (固有コミットを持つ) は誤削除しない。
-# tip == main HEAD (fresh/ff) は active と区別不能なので除外し --name 用。
+# マージ済み worktree を全部削除する。判定 (branch_merged_into_main): git cherry main
+# branch が '+' 行を出さない = branch 固有の非マージコミットが全て main に patch-id 一致
+# (squash/rebase/ff/通常 merge を網羅)。作業をコミットして revert しただけの net-zero
+# ブランチ (固有コミットが '+' で残る) は誤削除しない。tip == main HEAD のマージ完了
+# worktree (`git push . branch:main` で feature tip がそのまま main HEAD になる統合フローの
+# 結果) も削除対象 — これが「マージしたのに消えない」の正体だった。未保存/dirty/locked は
+# remove_one のガードが守る。さらに git 登録が外れた空ディレクトリ
+# (.claude/worktrees/<dir>) も掃除する (prune_orphan_dirs)。
 worktree-rm-merged:
 	$(BASH) "$(CLEANUP_WT)" --all

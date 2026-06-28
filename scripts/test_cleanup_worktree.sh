@@ -14,12 +14,16 @@
 #                      net tree is empty but the commits live only on the branch),
 #                      H squash-merged (now detected via patch-id -> removed, with a
 #                      data-loss guard that the squashed content survives in main).
-#   --all gates       : D tip==main HEAD excluded, E dirty (tracked) skipped,
-#                      I_notes dirty gitignored deliverable skipped, I_target dirty
-#                      regenerable-ignored (target/) NOT a blocker -> removed,
-#                      I_local machine-local config (.claude/settings.local.json,
-#                      present in EVERY real worktree) NOT a blocker -> removed,
-#                      F orphan (no merge-base) kept, L locked skipped.
+#   --all gates       : D tip==main HEAD merged REMOVED (clean; 2026-06-28 policy --
+#                      indistinguishable from a fresh worktree, user chose to remove),
+#                      E dirty (tracked) skipped, I_notes dirty gitignored deliverable
+#                      skipped, I_target dirty regenerable-ignored (target/) NOT a
+#                      blocker -> removed, I_local machine-local config
+#                      (.claude/settings.local.json, present in EVERY real worktree)
+#                      NOT a blocker -> removed, F orphan (no merge-base) kept,
+#                      L locked skipped.
+#   orphan dirs       : ORPH_EMPTY deregistered empty dir pruned by --all,
+#                      ORPH_FULL deregistered non-empty dir kept (may hold work).
 #   remove_one guards : --name on unmerged (merge guard, the most-used path),
 #                      --path outside .claude/worktrees (location guard),
 #                      --path the main worktree (main-worktree guard),
@@ -172,8 +176,9 @@ git -C "$scratch" branch 0 main
 git -C "$scratch" branch outsideBr "$GI"
 
 # Scenario D "fresh-at-head": branch == main HEAD. Created LAST, after every commit
-# to main, so its tip really is main HEAD. Expect: --all keeps (tip==main HEAD
-# gate), --name removes.
+# to main, so its tip really is main HEAD. Indistinguishable by git content from a
+# done-but-merged worktree at HEAD (resource-monitor's situation); per the 2026-06-28
+# policy choice ("clean なら一括でも消す") Expect: --all REMOVES it (clean + merged).
 git -C "$scratch" branch freshD main
 
 # ---- materialize worktrees -------------------------------------------------
@@ -203,6 +208,13 @@ git -C "$(wt DET)" add det.txt
 git -C "$(wt DET)" commit -q -m "detached unique work"
 git -C "$scratch" worktree lock "$(wt L)"
 
+# Orphan leftover dirs under .claude/worktrees that git does NOT track as worktrees
+# (an earlier remove/prune lost its rmdir race, leaving the dir behind). --all's
+# prune_orphan_dirs must rmdir an EMPTY one and KEEP a non-empty one (may hold work).
+mkdir -p "$(wt ORPH_EMPTY)"
+mkdir -p "$(wt ORPH_FULL)"
+printf 'leftover\n' > "$(wt ORPH_FULL)/keep.txt"
+
 # ---- act: make worktree-rm-merged (--all, non-force) -----------------------
 echo "== run: cleanup_worktree.sh --all =="
 run_cleanup --all
@@ -213,7 +225,8 @@ wt_gone    "$(wt B)"  && pass "B mergeflow-merged removed (FIX)"     || die "B m
 ! branch_exists featB && pass "B branch deleted"                     || die "B branch survived"
 wt_present "$(wt C)"  && pass "C unmerged kept"                      || die "C unmerged WRONGLY removed (DATA LOSS)"
 branch_exists featC   && pass "C branch kept"                        || die "C branch wrongly deleted"
-wt_present "$(wt D)"  && pass "D fresh-at-head kept by --all"        || die "D fresh-at-head wrongly removed"
+wt_gone    "$(wt D)"  && pass "D fresh-at-head removed by --all (clean+merged)" || die "D fresh-at-head NOT removed (policy: clean at main HEAD is removed)"
+! branch_exists freshD && pass "D branch deleted"                    || die "D branch survived"
 wt_present "$(wt E)"  && pass "E dirty(tracked)-merged kept"         || die "E dirty-merged WRONGLY removed (DATA LOSS)"
 wt_present "$(wt F)"  && pass "F orphan kept"                        || die "F orphan WRONGLY removed (DATA LOSS)"
 wt_present "$(wt G)"  && pass "G netzero-revert kept (regression)"   || die "G netzero-revert WRONGLY removed (DATA LOSS)"
@@ -227,6 +240,8 @@ wt_present "$(wt I_notes)"  && pass "I_notes dirty-gitignored kept"  || die "I_n
 wt_gone    "$(wt I_target)" && pass "I_target (only target/) removed" || die "I_target NOT removed (regenerable ignored should not block)"
 wt_gone    "$(wt I_local)"  && pass "I_local (only .claude/settings.local.json) removed" || die "I_local NOT removed (machine-local config should not block)"
 wt_present "$(wt L)"  && pass "L locked kept"                        || die "L locked WRONGLY removed"
+wt_gone    "$(wt ORPH_EMPTY)" && pass "empty orphan dir pruned"      || die "empty orphan dir NOT pruned (空ディレクトリ residue)"
+wt_present "$(wt ORPH_FULL)"  && pass "non-empty orphan dir kept"    || die "non-empty orphan dir WRONGLY pruned (may hold unsaved work)"
 
 # ---- remove_one guards via targeted modes ----------------------------------
 echo "== run: cleanup_worktree.sh --name C (unmerged, targeted) =="
@@ -248,10 +263,14 @@ run_cleanup --path "$(wt DET)"
 wt_present "$(wt DET)" && pass "detached worktree kept (detached-HEAD guard + US parse)" || die "detached worktree WRONGLY removed (DATA LOSS; tab-collapse regression?)"
 
 # ---- positive paths: --name and --force ------------------------------------
-echo "== run: cleanup_worktree.sh --name D =="
-run_cleanup --name D
-wt_gone "$(wt D)" && pass "D removed by --name"   || die "D NOT removed by --name"
-! branch_exists freshD && pass "D branch deleted" || die "D branch survived"
+# D (fresh-at-head) is already gone via --all now, so the non-force --name removal
+# positive is exercised on a freshly-made merged+clean worktree M instead.
+echo "== run: cleanup_worktree.sh --name M (merged-clean, non-force removal) =="
+git -C "$scratch" branch nameM "$GI"               # ancestor of main -> merged + clean
+git -C "$scratch" worktree add -q "$(wt M)" nameM
+run_cleanup --name M
+wt_gone "$(wt M)" && pass "M merged removed by --name (non-force)" || die "M merged NOT removed by --name"
+! branch_exists nameM && pass "M branch deleted by --name"        || die "M branch survived --name"
 
 echo "== run: cleanup_worktree.sh --name C --force (force bypasses merge guard) =="
 run_cleanup --name C --force

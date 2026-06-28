@@ -19,16 +19,21 @@
 #   --path <path>       remove the worktree at <path>.
 #   --merged-tip <sha>  remove the worktree whose HEAD == <sha>. No-op if none.
 #   --all               remove EVERY worktree under .claude/worktrees whose branch
-#                       is fully merged into main AND does not sit at main's
-#                       current tip. "Merged" (see branch_merged_into_main) means
-#                       the branch has NO unique non-merge commit AND adds no net
+#                       is fully merged into main. "Merged" (see branch_merged_into_main)
+#                       means the branch has NO unique non-merge commit AND adds no net
 #                       content over main -- so it catches the merge-flow leftover
 #                       (tip is a "merge main into feature" commit, unreachable from
-#                       main yet carrying no unique work; the old --is-ancestor test
-#                       wrongly skipped these) WITHOUT deleting a branch that holds
-#                       real committed work. We still exclude `tip == main HEAD` (a
-#                       fresh or fast-forward worktree we cannot tell apart from
-#                       active) -- target those with --name.
+#                       main yet carrying no unique work) WITHOUT deleting a branch that
+#                       holds real committed work. This INCLUDES a worktree whose tip ==
+#                       main HEAD: landing a feature via `git push . <branch>:main`
+#                       leaves the feature tip AT main HEAD, and that is precisely the
+#                       "I merged it but worktree-rm-merged won't delete it" case. The
+#                       remove_one guards (clean tree + unlocked, unless --force) keep an
+#                       active or dirty worktree safe; a clean one at main HEAD has
+#                       nothing to lose and is recreated with one command. --all ALSO
+#                       prunes leftover EMPTY .claude/worktrees/<dir> directories that
+#                       git already deregistered (prune_orphan_dirs) -- the
+#                       "空ディレクトリが残る" symptom.
 # Safety (skipped only with --force):
 #   * target must live under <repo>/.claude/worktrees/ (never the main worktree).
 #   * branch must be fully merged into main (no unmerged work lost).
@@ -138,6 +143,37 @@ list_worktrees() {
     }'
 }
 
+# Remove leftover .claude/worktrees/<dir> entries that git no longer tracks as a
+# worktree. They appear when an earlier `worktree remove`/`prune` deregistered the
+# worktree but its rmdir lost a race to a holder process, leaving only the now-empty
+# dir. Every git-driven path above (list_worktrees -> remove_one) is blind to these,
+# so they pile up forever -- the "空ディレクトリがいっぱい残る" symptom. We rmdir ONLY
+# empty orphans: a non-empty one might hold unsaved work, so we keep it and warn.
+# rmdir (never rm -rf) does NOT descend a reparse point, so a stray junction is
+# unlinked, never followed (no vendored-ffmpeg hazard).
+prune_orphan_dirs() {
+  [ -d "$wtroot" ] || return 0
+  local registered=$'\n' p _h _b _lk dir dn
+  while IFS=$'\037' read -r p _h _b _lk; do
+    [ -n "$p" ] || continue
+    registered="$registered$(norm "$p")"$'\n'
+  done < <(list_worktrees)
+
+  for dir in "$wtroot"/*/; do
+    [ -d "$dir" ] || continue          # no glob match -> literal, skipped here
+    dir="${dir%/}"
+    dn="$(norm "$dir")"
+    case "$registered" in *$'\n'"$dn"$'\n'*) continue;; esac   # still a live worktree
+    if rmdir "$dir" 2>/dev/null; then
+      log "pruned deregistered empty worktree dir: $dn"
+    elif [ -n "$(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
+      log "SKIP (deregistered dir not empty -- may hold unsaved work; inspect): $dn"
+    else
+      log "NOTE (deregistered empty dir held open; clears when the holder exits): $dn"
+    fi
+  done
+}
+
 remove_one() {
   local wtpath="$1" branch="$3" locked="$4"
   local wt; wt="$(norm "$wtpath")"
@@ -212,11 +248,13 @@ while IFS=$'\037' read -r p h b lk; do
   if [ "$o_all" -eq 1 ]; then
     case "$pn/" in "$wtroot_n"/*) : ;; *) continue;; esac
     [ -n "$b" ] || continue
-    branch_merged_into_main "$b" || continue  # content-merged (subsumes is-ancestor; catches merge-flow leftover)
-    tip="$(git -C "$repo" rev-parse "$b" 2>/dev/null || true)"
-    mainhead="$(git -C "$repo" rev-parse main 2>/dev/null || true)"
-    [ -n "$tip" ] && [ -n "$mainhead" ] || continue
-    [ "$tip" != "$mainhead" ] || continue                            # at main HEAD -> fresh/ff, use --name
+    # content-merged: subsumes is-ancestor AND catches the merge-flow leftover whose
+    # tip sits AT main HEAD (the `git push . <branch>:main` landing -- the exact
+    # "merged but worktree-rm-merged won't delete it" case). We no longer exclude
+    # tip == main HEAD; remove_one's clean+unlocked guards (unless --force) keep an
+    # active or dirty worktree safe, and a clean fresh worktree at main HEAD has
+    # nothing to lose and is one command to recreate.
+    branch_merged_into_main "$b" || continue
     matched=1; remove_one "$p" "$h" "$b" "$lk"
   elif [ -n "$o_tip" ]; then
     case "$pn/" in "$wtroot_n"/*) : ;; *) continue;; esac
@@ -227,6 +265,10 @@ while IFS=$'\037' read -r p h b lk; do
     [ "$pn" = "$(norm "$wtroot/$o_name")" ] && { matched=1; remove_one "$p" "$h" "$b" "$lk"; }
   fi
 done < <(list_worktrees)
+
+# Sweep deregistered leftover dirs (the git-driven loop above never sees them, so they
+# accumulate as the "空ディレクトリが残る" symptom). --all only: targeted modes name one dir.
+[ "$o_all" -eq 1 ] && prune_orphan_dirs
 
 if [ "$matched" -eq 0 ]; then
   if [ "$o_all" -eq 1 ]; then log "no fully-merged worktrees to remove"
