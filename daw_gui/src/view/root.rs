@@ -1129,6 +1129,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::ToggleHelp)
         }));
     }
+    // ----- ビデオプレビューウィンドウ (F12) -----
+    if ui.take_shortcut("daw.toggle_preview_window") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::TogglePreviewWindow)
+        }));
+    }
     // Phase 2 PR-D 段階 1: Audio Editor 開いているとき Ctrl+D で
     // 選択中 event を Duplicate。 audio_editor_clip is None のときは
     // 消費しない (= 既存 D / Alt+D の clip duplicate と紛らわしくない
