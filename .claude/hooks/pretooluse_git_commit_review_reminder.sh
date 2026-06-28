@@ -4,15 +4,7 @@
 #   (2) do a 同件 (sibling-occurrence) check -- when this is a bug fix, search for
 #       the SAME root cause elsewhere and fix the whole class in this commit, not
 #       just the reported instance. A standing discipline done by default, without
-#       the user having to ask "同件チェックは?", and
-#   (3) after committing to main, confirm the release build is green by READING
-#       target/release-build.log -- the post-commit git hook starts a detached
-#       (nohup) build that normally survives the Bash-tool commit and finishes
-#       ("[post-commit] release build OK <sha>"). Only run
-#       `cargo build --release -p daw_gui -p daw_audio -p daw_plugin_host` by hand
-#       when the log shows the build was killed mid-flight (start line but no
-#       OK/FAILED and no cargo/rustc running) or FAILED. Blindly re-running it
-#       just duplicates the hook's build (redundant, contends on the target lock).
+#       the user having to ask "同件チェックは?".
 #
 # review/SKILL.md states "コミット前に自動で実行される想定" but no automation
 # existed in daw_01 until this hook (gui_01 already had the equivalent:
@@ -35,6 +27,6 @@ INPUT=$(cat)
 # is cheap, a missed one is not.
 if printf '%s' "$INPUT" | grep -qiE 'git( +-C +[^ "]+)? +commit'; then
   cat <<'JSON'
-{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "REMINDER (commit 前に未実行の項目を完了させること。この session で済んでいれば無視して続行):\n1) /review skill: RT-audio 安全性 (ホットパスのヒープ確保 / ロック / I/O 禁止)・パフォーマンス (描画ループ / 毎フレーム計算)・FFI / セキュリティ整合性 (ポインタ・整数キャスト・エラー握りつぶし) を確認。skill: F:/dev/daw_01/.claude/skills/review/SKILL.md\n2) 同件チェック (この commit が bug fix の場合・必須): 同じ root cause の同種箇所が他に無いか grep/検索で全件洗い出し、見つけたら同じ commit で class ごと修正する。1 件だけ直して報告しない。ユーザーに促される前に既定で行うこと。\n3) commit 後 (main の場合・必須): release build の green を確認する。post-commit hook が nohup で detached build を起動し target/release-build.log に追記する。**まず log を読む**: 当該 SHA の [post-commit] release build OK 行があれば green 確定で手動 build は不要 (鵜呑みで cargo build --release を重ねると hook と同一 target を奪い合う冗長な二重ビルド)。log が start 行だけで OK/FAILED が無く cargo/rustc プロセスも無い (= build が途中で殺された) か、release build FAILED / target/.release-build-failed marker がある時に限り、cargo build --release -p daw_gui -p daw_audio -p daw_plugin_host を自分で回して green にする。\n\nこのリマインダーは .claude/hooks/pretooluse_git_commit_review_reminder.sh が出力しています。"}}
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "REMINDER (commit 前に未実行の項目を完了させること。この session で済んでいれば無視して続行):\n1) /review skill: RT-audio 安全性 (ホットパスのヒープ確保 / ロック / I/O 禁止)・パフォーマンス (描画ループ / 毎フレーム計算)・FFI / セキュリティ整合性 (ポインタ・整数キャスト・エラー握りつぶし) を確認。skill: F:/dev/daw_01/.claude/skills/review/SKILL.md\n2) 同件チェック (この commit が bug fix の場合・必須): 同じ root cause の同種箇所が他に無いか grep/検索で全件洗い出し、見つけたら同じ commit で class ごと修正する。1 件だけ直して報告しない。ユーザーに促される前に既定で行うこと。\n\nこのリマインダーは .claude/hooks/pretooluse_git_commit_review_reminder.sh が出力しています。"}}
 JSON
 fi

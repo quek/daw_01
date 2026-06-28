@@ -170,8 +170,7 @@ PreToolUse hook。従来はメモリを hook 化するのに bespoke スクリ�
   - JSON 解析が要る → Python: `guard_engine.py` (ルール DB) / `reflect.py` (hits/metrics 解析 +
     ルール再シリアライズ) / `log_metric.py` (Windows パスの `\` を含む JSON 出力) /
     `check_destructive_delete.py` (security block・確実な command 抽出 + `\b` 正規表現)。
-  - JSON 不要 (テキスト/git/build) → bash: `release_build_bg.sh` / `cleanup_worktree.sh` /
-    `.githooks/**`。新規 .ps1 は guard が block する。
+  - JSON 不要 (テキスト/git/build) → bash: `cleanup_worktree.sh` 等。新規 .ps1 は guard が block する。
 - AHE hook (PreToolUse / PostToolUse / Stop) は **`.claude/settings.json`** に集約する。
   このファイルは git 追跡対象なので、新規 worktree でも何もせず hook が有効になる。
 - `.claude/settings.local.json` は **マシン固有 permissions allowlist 専用** に残す
@@ -179,10 +178,6 @@ PreToolUse hook。従来はメモリを hook 化するのに bespoke スクリ�
 - hook を追加したくなったら必ず `settings.json` 側に追加すること。
   `settings.local.json` に hook を書くと、harness の同期次第で worktree に伝わらず
   AHE ループが片肺になる。
-- **例外: release-build-on-commit は git-native hook (`.githooks/post-commit`)**。
-  AHE 系の「観測」hook と違い、これは commit の起動手段すべて（手動・`!`・Bash ツール）で
-  発火する必要があるため、Claude-Code の PostToolUse（Bash ツールしか拾えない）ではなく
-  git hook に置く。`core.hooksPath = .githooks` で tracked・worktree 共通。
 - `.claude/settings.json` の編集は harness の auto-mode classifier に self-modification として
   ブロックされる。settings.json の hook を増減したいときはユーザーに依頼すること。
 

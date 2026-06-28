@@ -301,9 +301,6 @@ git commit -m "<日本語メッセージ>"
 - コミットメッセージは日本語。テストと実装を 1 コミットにまとめる。警告を残さない
 - コマンドを `&&`/`;` で連結しない (`feedback_no_command_chaining`)。作業ディレクトリに `cd`/`--manifest-path`
   を付けない (`feedback_no_cd_prefix`)
-- **commit 後は必ず `cargo build --workspace --release`** で green を確認
-  (`feedback_release_build_after_commit` — post-commit hook が background build、`target/.release-build-failed`
-  があれば即修正)
 - commit を細かく割りすぎない (`feedback_dont_split_commits_too_finely`)
 
 ## テストが間違っていると気づいた場合
