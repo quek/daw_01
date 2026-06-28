@@ -1755,6 +1755,12 @@ pub struct AppData {
     /// `regenerate_lipsync_for_track` の spawn 時に insert、`LipsyncGenerated` 受信で remove。
     /// クリップ上スピナー / 全体オーバーレイ「口パク生成中」の駆動に使う (派生 UI 状態、非保存)。
     pub lipsync_inflight: std::collections::HashSet<u32>,
+    /// 口パク再生成の入力 fingerprint。target (口) track id → 最後に再生成を
+    /// 発注した時点の入力ハッシュ (`lipsync_input_fingerprint`)。`LipsyncDebounceFired`
+    /// で現在値と比較し、入力 (notes / 歌詞 / bpm / mouth_map / binding / clip 位置) が
+    /// 変わった target だけ再生成する。track rename / 色 / mute / volume 等、口パク
+    /// 出力に無関係な編集では fingerprint が変わらず再生成をスキップする (派生状態、非保存)。
+    pub lipsync_fingerprints: std::collections::HashMap<u32, u64>,
     /// builtin VOICEVOX (歌唱/読み上げ) 合成の per-plugin 状態。key = host plugin_id。
     /// `VoicevoxSynthStatus` IPC で更新。`busy` = 合成中、`failing_since = Some` は直近 HTTP が
     /// 失敗中 (= engine 未起動/起動途中)。一定時間 (= `VOICEVOX_ENGINE_WARNING`) 続いたら
@@ -2331,6 +2337,7 @@ impl AppData {
             voicevox_launch_attempted: false,
             lipsync_gen: 0,
             lipsync_inflight: std::collections::HashSet::new(),
+            lipsync_fingerprints: std::collections::HashMap::new(),
             voicevox_synth_status: std::collections::HashMap::new(),
             anim_epoch: std::time::Instant::now(),
             frame_now: std::time::Instant::now(),
@@ -3394,6 +3401,11 @@ impl AppData {
         // 再計算は source 編集時だけに限定したいので、 baseline 確定と同時に
         // pending の再生成を無効化する (= 既存 clip をそのまま温存)。
         self.cancel_pending_lipsync_regen();
+        // 保存ファイル内の口パク clip は既に authoritative。 その clip を生成した
+        // 入力 (notes / 歌詞 / bpm / mouth_map / binding) を fingerprint のベースライン
+        // として記録し、開いた直後の非入力編集 (track rename 等) で口パクが再生成
+        // されないようにする (= `LipsyncDebounceFired` が fingerprint 一致でスキップ)。
+        self.seed_lipsync_fingerprints();
         // `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
         // 別 project に持ち越さない。 段階ズームのアンカーと lane 高
         // override も旧 project の lane key を指すので一緒に破棄。
@@ -4086,6 +4098,156 @@ mod lipsync_merge_tests {
     fn adjacent_same_image_coalesced() {
         let m = merge_lipsync_events_by_priority(vec![(0.0, 1.0, 5, 0), (1.0, 2.0, 5, 1)]);
         assert_eq!(m, vec![(0.0, 2.0, 5)]);
+    }
+}
+
+#[cfg(test)]
+mod lipsync_fingerprint_tests {
+    //! `lipsync_input_fingerprint` が「口パク出力に影響する入力が変わったときだけ」
+    //! 変化することを保証する。報告バグ (背景 track の rename で口パクが再生成
+    //! される) の回帰ガード + 入力フィールド選択の精度ガード。
+    use super::{AppData, track_with};
+    use common::model::{Clip, ClipContent, MidiContent, MouthMap, Note, Song};
+
+    const MOUTH_TRACK_ID: u32 = 2;
+
+    fn note(pitch: u8, vel: u8, start: f64, dur: f64, lyric: &str) -> Note {
+        Note {
+            start_beat: start,
+            duration_beats: dur,
+            pitch,
+            velocity: vel,
+            lyric: Some(lyric.to_string()),
+            muted: false,
+        }
+    }
+
+    /// vocal track (id 1) → 口 track (id 2)。vocal に notes 入り MIDI clip、
+    /// 口 track に mouth_map を設定した最小構成。
+    fn base_song() -> Song {
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Midi(MidiContent {
+                notes: vec![note(60, 100, 0.0, 1.0, "ら")],
+            }),
+        );
+        let vocal = track_with(|t| {
+            t.id = 1;
+            t.lipsync_target_track = Some(MOUTH_TRACK_ID);
+            t.clips = vec![Clip {
+                id: 1,
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cid,
+                ..Default::default()
+            }];
+        });
+        let mouth = track_with(|t| {
+            t.id = MOUTH_TRACK_ID;
+            t.mouth_map = Some(MouthMap {
+                a: 10,
+                ..Default::default()
+            });
+        });
+        song.tracks.push(vocal);
+        song.tracks.push(mouth);
+        song
+    }
+
+    fn fp(song: &Song) -> u64 {
+        AppData::lipsync_input_fingerprint(song, MOUTH_TRACK_ID)
+    }
+
+    fn first_note(song: &mut Song, f: impl FnOnce(&mut Note)) {
+        let cid = song.tracks[0].clips[0].content_id;
+        match song.clip_contents.get_mut(&cid) {
+            Some(ClipContent::Midi(m)) => f(&mut m.notes[0]),
+            _ => panic!("expected midi content"),
+        }
+    }
+
+    #[test]
+    fn rename_any_track_keeps_fingerprint() {
+        // 報告バグ: 背景 (口) track の rename で口パクが再生成されていた。
+        let song = base_song();
+        let before = fp(&song);
+        let mut renamed = song.clone();
+        renamed.tracks[0].name = "vocal renamed".to_string();
+        renamed.tracks[1].name = "background renamed".to_string();
+        assert_eq!(fp(&renamed), before, "rename は口パク入力ではない");
+    }
+
+    #[test]
+    fn velocity_and_mute_keep_fingerprint() {
+        // phoneme query が読まないフィールド (velocity / muted) は再生成不要。
+        let song = base_song();
+        let before = fp(&song);
+        let mut edited = song.clone();
+        first_note(&mut edited, |n| {
+            n.velocity = 1;
+            n.muted = true;
+        });
+        assert_eq!(fp(&edited), before);
+    }
+
+    #[test]
+    fn note_pitch_changes_fingerprint() {
+        let song = base_song();
+        let before = fp(&song);
+        let mut edited = song.clone();
+        first_note(&mut edited, |n| n.pitch = 62);
+        assert_ne!(fp(&edited), before);
+    }
+
+    #[test]
+    fn lyric_changes_fingerprint() {
+        let song = base_song();
+        let before = fp(&song);
+        let mut edited = song.clone();
+        first_note(&mut edited, |n| n.lyric = Some("み".to_string()));
+        assert_ne!(fp(&edited), before);
+    }
+
+    #[test]
+    fn note_timing_changes_fingerprint() {
+        let song = base_song();
+        let before = fp(&song);
+        let mut edited = song.clone();
+        first_note(&mut edited, |n| n.start_beat = 0.5);
+        assert_ne!(fp(&edited), before);
+    }
+
+    #[test]
+    fn clip_move_changes_fingerprint() {
+        let song = base_song();
+        let before = fp(&song);
+        let mut edited = song.clone();
+        edited.tracks[0].clips[0].start_beat = 8.0;
+        assert_ne!(fp(&edited), before);
+    }
+
+    #[test]
+    fn mouth_map_change_changes_fingerprint() {
+        let song = base_song();
+        let before = fp(&song);
+        let mut edited = song.clone();
+        edited.tracks[1].mouth_map = Some(MouthMap {
+            a: 10,
+            i: 11,
+            ..Default::default()
+        });
+        assert_ne!(fp(&edited), before);
+    }
+
+    #[test]
+    fn bpm_change_changes_fingerprint() {
+        let song = base_song();
+        let before = fp(&song);
+        let mut edited = song.clone();
+        edited.bpm += 10.0;
+        assert_ne!(fp(&edited), before);
     }
 }
 
@@ -7372,6 +7534,13 @@ impl AppData {
                     targets.sort_unstable();
                     targets.dedup();
                     for target in targets {
+                        // 入力 (notes / 歌詞 / bpm / mouth_map / binding / clip 位置) が
+                        // 前回の再生成時から変わっていなければスキップ。track rename / 色 /
+                        // mute / volume 等の非入力編集による無駄な再生成を防ぐ。
+                        let fp = Self::lipsync_input_fingerprint(&self.song, target);
+                        if self.lipsync_fingerprints.get(&target) == Some(&fp) {
+                            continue;
+                        }
                         if let Some(src_id) = self
                             .song
                             .tracks
@@ -9963,18 +10132,115 @@ impl AppData {
         }
     }
 
+    /// `target` (口 track) の口パク出力を決定する入力すべての 64-bit fingerprint。
+    /// `regenerate_lipsync_for_track` が phoneme query / `build_mouth_events` に渡す
+    /// 入力と **厳密に一致** させる (= ここに含めた値が変わったときだけ再生成が要る):
+    ///
+    /// - song の `bpm`
+    /// - `target` の `mouth_map` (7 slot の `ImageSourceId`)
+    /// - `target` を出力先にする全ソーストラックの **並び順 (priority)** と、各 clip の
+    ///   `start_beat` / `length_beats`、および
+    ///     - sing clip: notes の `start_beat` / `duration_beats` / `pitch` / `lyric`
+    ///       (= `build_sing_query` が読むフィールド。`velocity` / `muted` は phoneme へ
+    ///       影響しないので **含めない**)
+    ///     - talk clip: 先頭の非空 `TextEvent` の `text` / `event_start_in_clip_beats`、
+    ///       および clip の `speaker_id` / `talk.speed_scale` (= `query_talk_phonemes` が
+    ///       phoneme 長に使う値。pitch / intonation / volume は無関係なので含めない)
+    ///
+    /// track 名 / 色 / mute / volume / plugin 等の **非入力** は含めないので、それらの
+    /// 編集では fingerprint が不変 → `LipsyncDebounceFired` が再生成をスキップする。
+    /// 走査順は下の `regenerate_lipsync_for_track` の snap 収集ループと一致させること。
+    fn lipsync_input_fingerprint(song: &common::model::Song, target_id: u32) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        song.bpm.to_bits().hash(&mut h);
+        if let Some(t) = song.tracks.iter().find(|t| t.id == target_id)
+            && let Some(m) = &t.mouth_map
+        {
+            [m.a, m.i, m.u, m.e, m.o, m.n, m.closed].hash(&mut h);
+        }
+        for (idx, src) in song.tracks.iter().enumerate() {
+            if src.lipsync_target_track != Some(target_id) {
+                continue;
+            }
+            (idx as u32).hash(&mut h); // priority (= トラック並び順)
+            // snap を生成する clip (notes 有り / 非空 text 有り) だけが出力に効く。
+            // `regenerate_lipsync_for_track` の収集と同条件で、その clip の位置と
+            // 内容のみをハッシュする (= 非対象 clip の移動では fingerprint 不変)。
+            for clip in &src.clips {
+                let content = song.clip_contents.get(&clip.content_id);
+                if let Some(notes) = content.and_then(|c| c.notes()).filter(|n| !n.is_empty()) {
+                    // sing: clip 位置 + build_sing_query が読む note フィールドのみ。
+                    clip.start_beat.to_bits().hash(&mut h);
+                    clip.length_beats.to_bits().hash(&mut h);
+                    for n in notes {
+                        n.start_beat.to_bits().hash(&mut h);
+                        n.duration_beats.to_bits().hash(&mut h);
+                        n.pitch.hash(&mut h);
+                        n.lyric.hash(&mut h);
+                    }
+                } else if let Some(ev) = content
+                    .and_then(|c| c.text_events())
+                    .and_then(|events| events.iter().find(|e| !e.text.is_empty()))
+                {
+                    // talk: clip 位置 + 先頭の非空 TextEvent + 声 + 話速のみ。
+                    clip.start_beat.to_bits().hash(&mut h);
+                    clip.length_beats.to_bits().hash(&mut h);
+                    ev.text.hash(&mut h);
+                    ev.event_start_in_clip_beats.to_bits().hash(&mut h);
+                    clip.speaker_id.hash(&mut h);
+                    clip.talk
+                        .unwrap_or_default()
+                        .speed_scale
+                        .to_bits()
+                        .hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    }
+
+    /// 全 target (口) track の現在の入力 fingerprint を記録する。load 直後に呼び、
+    /// 保存済み口パク clip を生成した入力をベースライン化することで、開いた直後の
+    /// 非入力編集 (track rename 等) で口パクが再生成されないようにする。
+    fn seed_lipsync_fingerprints(&mut self) {
+        self.lipsync_fingerprints.clear();
+        let mut targets: Vec<u32> = self
+            .song
+            .tracks
+            .iter()
+            .filter_map(|t| t.lipsync_target_track)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        for target in targets {
+            let fp = Self::lipsync_input_fingerprint(&self.song, target);
+            self.lipsync_fingerprints.insert(target, fp);
+        }
+    }
+
     /// 口パク (lip-sync) を再生成する (docs/plan_pakupaku.md §7)。`vocal_track_id`
     /// の各 clip の notes を snapshot し、背景スレッドで `query_phonemes`
     /// (`sing_frame_audio_query` のみ) を叩いて結果を `AppEvent::LipsyncGenerated`
     /// で main thread へ返す。binding (`lipsync_target_track`) 未設定 / 口 track の
     /// `mouth_map` 未設定 / notes を持つ clip 無し のときは no-op。歌唱のみ (Q6)。
     pub fn regenerate_lipsync_for_track(&mut self, vocal_track_id: u32) {
-        let Some(vocal) = self.song.tracks.iter().find(|t| t.id == vocal_track_id) else {
+        let Some(target_id) = self
+            .song
+            .tracks
+            .iter()
+            .find(|t| t.id == vocal_track_id)
+            .and_then(|t| t.lipsync_target_track)
+        else {
             return;
         };
-        let Some(target_id) = vocal.lipsync_target_track else {
-            return;
-        };
+        // この target の現在の入力 fingerprint をベースラインとして記録する。
+        // `LipsyncDebounceFired` はこの値と現在値を比べ、変化した target だけ
+        // 再生成する (= rename 等の非入力編集では再生成しない)。直接呼び出し
+        // (binding / mouth_map 変更) はここで必ず最新値へ更新されるので、直後の
+        // debounce 発火は fingerprint 一致で二重再生成にならない。
+        let fp = Self::lipsync_input_fingerprint(&self.song, target_id);
+        self.lipsync_fingerprints.insert(target_id, fp);
         // 口 track が存在し mouth_map が設定済みか (= 生成する意味があるか)。
         let configured = self.song.tracks.iter().any(|t| {
             t.id == target_id && t.mouth_map.as_ref().is_some_and(|m| m.is_configured())
@@ -9987,8 +10253,7 @@ impl AppData {
         // (talk) target 中心: 出力先が `target_id` の **全ソーストラック** をまとめて
         // 再生成する (`docs/plan_voicevox_talk.md`)。トラック並び順 index を priority に
         // し、apply 側で重なりを上位優先で解決する。各 clip は notes (歌唱) があれば sing、
-        // 無く Text なら talk として扱う。`vocal` (trigger) は target 解決にのみ使用。
-        let _ = &vocal;
+        // 無く Text なら talk として扱う。
         let mut snaps: Vec<(f64, f64, f64, u32, Vec<common::model::Note>)> = Vec::new();
         let mut talk_snaps: Vec<(f64, f64, f64, u32, String, u32, common::model::TalkParams)> =
             Vec::new();
