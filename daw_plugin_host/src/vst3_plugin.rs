@@ -19,6 +19,7 @@
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
@@ -48,7 +49,7 @@ use vst3::{
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent};
 use crate::vst3_events::{Vst3InEventList, Vst3OutEventList};
 use crate::vst3_host::{Vst3ComponentHandler, Vst3HostApp, Vst3PlugFrame};
-use crate::vst3_params::Vst3InParamChanges;
+use crate::vst3_params::{GuiParamEditQueue, Vst3InParamChanges};
 use crate::vst3_stream::{Vst3ReadStream, Vst3WriteStream};
 
 /// A loaded VST3 plugin (the IComponent + the associated IEditController
@@ -147,6 +148,16 @@ pub struct Vst3Plugin {
     /// Pre-allocated scratch holding `param_events` with all `Mod` offsets
     /// folded into absolute `Value`s, handed to `set_changes` each `process()`.
     folded_param_events: Vec<crate::plugin_instance::TimedParamEvent>,
+    /// r.md #4: bridges GUI parameter edits (the controller's `performEdit`)
+    /// to the audio processor. The producer end lives in `Vst3ComponentHandler`
+    /// (UI thread); `process()` drains this shared end into `gui_edit_scratch`
+    /// and folds the edits into `inputParameterChanges` so a knob turn reaches
+    /// the DSP even when no automation lane drives that param.
+    gui_param_edits: Arc<GuiParamEditQueue>,
+    /// Pre-allocated scratch for `gui_param_edits.drain_latest` (last value per
+    /// edited param this buffer). Cleared and refilled every `process()`; sized
+    /// for the distinct params a user could realistically edit between buffers.
+    gui_edit_scratch: Vec<(u32, f64)>,
     /// Set by `process()` (RT thread) when the param-change pool overflowed
     /// (> capacity distinct params in one buffer; extra param events dropped).
     /// Logged once from `stop_processing()` (RT-external) so the hot path never
@@ -275,7 +286,14 @@ impl Vst3Plugin {
 
         // Build the host objects.
         let host_app = ComWrapper::new(Vst3HostApp::new());
-        let component_handler = ComWrapper::new(Vst3ComponentHandler::new(callbacks.clone()));
+        // r.md #4: the GUI→DSP parameter-edit bridge. The component handler
+        // (UI thread) pushes `performEdit`s here; `process()` (audio thread)
+        // drains them into the processor's `inputParameterChanges`.
+        let gui_param_edits = Arc::new(GuiParamEditQueue::new());
+        let component_handler = ComWrapper::new(Vst3ComponentHandler::new(
+            callbacks.clone(),
+            gui_param_edits.clone(),
+        ));
         let plug_frame = ComWrapper::new(Vst3PlugFrame::new(callbacks.clone()));
 
         // initialize(component, IHostApplication*)
@@ -414,7 +432,12 @@ impl Vst3Plugin {
             out_event_list: ComWrapper::new(Vst3OutEventList::new()),
             in_param_changes: ComWrapper::new(Vst3InParamChanges::new()),
             param_mod_base: std::collections::HashMap::new(),
-            folded_param_events: Vec::with_capacity(256),
+            // common::process_data::MAX_EVENTS (256) automation/mod events +
+            // up to 64 folded-in GUI edits (r.md #4) → never reallocs on the
+            // RT path (`gui_edit_scratch` is capped at 64 distinct params).
+            folded_param_events: Vec::with_capacity(256 + 64),
+            gui_param_edits,
+            gui_edit_scratch: Vec::with_capacity(64),
             param_pool_overflowed: AtomicBool::new(false),
             #[cfg(debug_assertions)]
             process_status_err: std::sync::atomic::AtomicI32::new(kResultOk),
@@ -1116,6 +1139,16 @@ impl LoadedPlugin for Vst3Plugin {
                 "VST3 param changes pool overflow (>64 distinct params/buffer); extra dropped"
             );
         }
+        // r.md #4: GUI→DSP edit ring overflowed (a knob was turned faster than
+        // `process()` drained, or while the engine wasn't processing). Benign —
+        // the trailing edits of a drag re-deliver the final value — but worth a
+        // one-shot note. Off the RT path, like the pool-overflow flag above.
+        if self.gui_param_edits.take_overflowed() {
+            tracing::warn!(
+                plugin = %self.name,
+                "VST3 GUI parameter-edit ring overflow; some intermediate edits dropped"
+            );
+        }
         #[cfg(debug_assertions)]
         {
             let status = self.process_status_err.swap(kResultOk, Ordering::Relaxed);
@@ -1216,8 +1249,25 @@ impl LoadedPlugin for Vst3Plugin {
         // `base + offset` に畳んで絶対値として送る (VST3 は normalized 0..=1 なので
         // `amount == offset`)。base は last-set 値キャッシュ (`param_mod_base`)。
         use crate::plugin_instance::ParamEventKind;
+
+        // r.md #4: drain GUI-originated parameter edits — the VST3 controller's
+        // `performEdit`, queued by `Vst3ComponentHandler` on the UI thread — and
+        // feed them to the processor at sample offset 0. The edit controller and
+        // the audio processor are decoupled in VST3, so without the host carrying
+        // the edit across, the DSP never sees a knob turn and the sound doesn't
+        // change for any param no automation lane is driving. Collapsed to the
+        // last value per param (only the final knob position matters).
+        self.gui_edit_scratch.clear();
+        self.gui_param_edits.drain_latest(&mut self.gui_edit_scratch);
+
         // Pre-pass: refresh base cache from this buffer's absolute Value events
-        // (unstable time sort ⇒ update before reading).
+        // (unstable time sort ⇒ update before reading). GUI edits are absolute
+        // values too, so they update the base for any `Mod` folding below.
+        for &(id, val) in &self.gui_edit_scratch {
+            if let Some(slot) = self.param_mod_base.get_mut(&id) {
+                *slot = val;
+            }
+        }
         for ev in param_events {
             if ev.kind == ParamEventKind::Value
                 && let Some(slot) = self.param_mod_base.get_mut(&ev.param_id)
@@ -1226,6 +1276,18 @@ impl LoadedPlugin for Vst3Plugin {
             }
         }
         self.folded_param_events.clear();
+        // GUI edits first, at sample offset 0, so a non-automated knob turn
+        // reaches the DSP. Any automation events for the same param follow in
+        // ascending time order, so each param's value-queue offsets stay
+        // non-decreasing (a VST3 `IParamValueQueue` requirement).
+        for &(id, val) in &self.gui_edit_scratch {
+            self.folded_param_events.push(crate::plugin_instance::TimedParamEvent {
+                time: 0,
+                param_id: id,
+                value: val,
+                kind: ParamEventKind::Value,
+            });
+        }
         for ev in param_events {
             match ev.kind {
                 ParamEventKind::Value => self.folded_param_events.push(*ev),
