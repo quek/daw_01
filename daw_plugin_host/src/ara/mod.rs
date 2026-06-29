@@ -17,3 +17,4 @@ pub mod document;
 pub mod extension;
 pub mod host_controllers;
 pub mod session;
+pub mod vst3_ara;

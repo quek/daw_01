@@ -19,16 +19,15 @@ use std::ffi::CString;
 
 use anyhow::{Context, Result};
 use ara_sys::{
-    ARAAudioModificationRef, ARAAudioSourceHostRef, ARAAudioSourceRef, ARAFactory,
-    ARAMusicalContextRef, ARAPlaybackRegionRef, ARARegionSequenceRef,
+    ARAAudioModificationRef, ARAAudioSourceHostRef, ARAAudioSourceRef, ARADocumentControllerRef,
+    ARAFactory, ARAMusicalContextRef, ARAPlaybackRegionRef, ARAPlugInExtensionInstance,
+    ARARegionSequenceRef,
 };
-use clap_sys::plugin::clap_plugin;
 use common::protocol::{AraClipSpec, AraSourceSpec};
 
 use crate::ara::audio_source::AraAudioSourceHost;
-use crate::ara::clap_ara;
 use crate::ara::document::AraDocumentController;
-use crate::ara::extension::{AraPlugInExtension, HOST_ASSIGNED_ROLES, HOST_KNOWN_ROLES};
+use crate::ara::extension::AraPlugInExtension;
 
 // The clip/source spec is defined once in `common::protocol`
 // ([`AraClipSpec`] / [`AraSourceSpec`]) since it crosses the IPC boundary; this
@@ -58,21 +57,26 @@ pub struct AraSession {
 }
 
 impl AraSession {
-    /// Build the ARA model graph for `plugin` and bind it for playback rendering.
+    /// Build the ARA model graph for a loaded plug-in and bind it for playback
+    /// rendering. `bind` performs the companion-API-specific instance binding
+    /// (CLAP / VST3) given the freshly created document controller ref.
     ///
     /// # Safety
-    /// `plugin` and `factory` must be valid and belong to the same loaded,
-    /// inactive ARA-capable CLAP plug-in. The plug-in must remain loaded for the
+    /// `factory` must be valid and belong to the loaded, inactive ARA-capable
+    /// plug-in that `bind` binds. The plug-in must remain loaded for the
     /// session's lifetime.
-    pub unsafe fn setup(
-        plugin: *const clap_plugin,
+    pub unsafe fn setup<F>(
         factory: *const ARAFactory,
         clips: &[AraClipSpec],
-    ) -> Result<Self> {
+        bind: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(ARADocumentControllerRef) -> Option<*const ARAPlugInExtensionInstance>,
+    {
         let controller = unsafe { AraDocumentController::create(factory, None) }?;
 
         controller.begin_editing();
-        let result = unsafe { Self::build_graph(&controller, plugin, clips) };
+        let result = unsafe { Self::build_graph(&controller, clips, bind) };
         controller.end_editing();
 
         match result {
@@ -99,16 +103,19 @@ impl AraSession {
 
     /// Inner graph construction, run inside the begin/end editing bracket.
     /// Returns the context/sequence refs, owned sources, and bound extension.
-    unsafe fn build_graph(
+    unsafe fn build_graph<F>(
         controller: &AraDocumentController,
-        plugin: *const clap_plugin,
         clips: &[AraClipSpec],
+        bind: F,
     ) -> Result<(
         ARAMusicalContextRef,
         ARARegionSequenceRef,
         Vec<OwnedAraSource>,
         AraPlugInExtension,
-    )> {
+    )>
+    where
+        F: FnOnce(ARADocumentControllerRef) -> Option<*const ARAPlugInExtensionInstance>,
+    {
         let musical_context = controller
             .create_musical_context(std::ptr::null_mut(), 0)
             .context("plug-in returned null musical context")?;
@@ -122,16 +129,10 @@ impl AraSession {
         }
 
         // Bind must happen before the plug-in is activated; the instance is still
-        // inactive here. We assign the playback-renderer (+ editor) roles.
-        let instance_ptr = unsafe {
-            clap_ara::bind_to_document(
-                plugin,
-                controller.controller_ref(),
-                HOST_KNOWN_ROLES,
-                HOST_ASSIGNED_ROLES,
-            )
-        }
-        .context("CLAP ARA bind_to_document_controller returned null")?;
+        // inactive here. The caller's closure performs the companion-API-specific
+        // bind (CLAP / VST3) with the host's known/assigned roles.
+        let instance_ptr = bind(controller.controller_ref())
+            .context("ARA bind_to_document_controller returned null")?;
         let extension = unsafe { AraPlugInExtension::from_instance_ptr(instance_ptr) }
             .context("null ARA plug-in extension instance")?;
 

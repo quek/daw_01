@@ -160,6 +160,9 @@ pub struct Vst3ClassEntry {
     /// Zero-based index within the factory's class list — informational
     /// only; we always load by CID.
     pub descriptor_index: u32,
+    /// (r.md #5 ARA2) Whether a paired `ARA::IMainFactory` class (same name)
+    /// exists in this binary — i.e. the plug-in supports ARA.
+    pub is_ara: bool,
 }
 
 impl Vst3ClassEntry {
@@ -177,6 +180,12 @@ impl Vst3ClassEntry {
             // to the audio-effect bucket so the picker's effect filter
             // catches it.
             out.push("audio-effect".into());
+        }
+        if self.is_ara {
+            // r.md #5: VST3 exposes no feature list, so normalise ARA support to
+            // the same tag CLAP uses (`ara:supported`) — `PluginEntry::is_ara`
+            // then derives uniformly for both formats.
+            out.push("ara:supported".into());
         }
         out
     }
@@ -257,6 +266,23 @@ fn scan_one_vst3_file(bundle_path: &Path, dll_path: &Path) -> Result<Vec<Vst3Cla
         // cap the pre-allocation so we don't trigger an allocation bomb.
         const MAX_CLASSES: i32 = 4096;
         let mut out = Vec::with_capacity(count.clamp(0, MAX_CLASSES) as usize);
+
+        // (r.md #5 ARA2) First pass: collect the names of `ARA::IMainFactory`
+        // classes. Their presence means the binary supports ARA; ARAVST3.h pairs
+        // the main factory to the audio-module class of the same name.
+        let mut ara_class_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for i in 0..count {
+            let mut info = std::mem::MaybeUninit::<PClassInfo>::zeroed();
+            if unsafe { factory.getClassInfo(i, info.as_mut_ptr()) } != kResultOk {
+                continue;
+            }
+            let info = unsafe { info.assume_init() };
+            if c_array_to_string(&info.category) == "ARA Main Factory Class" {
+                ara_class_names.insert(c_array_to_string(&info.name));
+            }
+        }
+
         for i in 0..count {
             let mut info = std::mem::MaybeUninit::<PClassInfo>::zeroed();
             let res = unsafe { factory.getClassInfo(i, info.as_mut_ptr()) };
@@ -288,6 +314,7 @@ fn scan_one_vst3_file(bundle_path: &Path, dll_path: &Path) -> Result<Vec<Vst3Cla
                 (String::new(), String::new(), String::new())
             };
 
+            let is_ara = ara_class_names.contains(&name);
             out.push(Vst3ClassEntry {
                 bundle_path: bundle_path.to_path_buf(),
                 cid_hex,
@@ -296,6 +323,7 @@ fn scan_one_vst3_file(bundle_path: &Path, dll_path: &Path) -> Result<Vec<Vst3Cla
                 version,
                 subcategories,
                 descriptor_index: i as u32,
+                is_ara,
             });
         }
         Ok(out)

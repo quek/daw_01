@@ -78,6 +78,13 @@ pub struct Vst3Plugin {
     /// drop. `false` for single-component plugins.
     controller_separate: bool,
 
+    /// (r.md #5 ARA2) ARA session bound to this instance, if any. Dropped before
+    /// the component is released (its drop calls back into this plug-in).
+    ara: Option<crate::ara::session::AraSession>,
+    /// Last activate params, kept so ARA setup — which must bind before
+    /// `setActive` — can deactivate → bind → reactivate.
+    last_activate: Option<(f64, u32, u32)>,
+
     // --- Audio processing state ----------------------------------------
     active: bool,
     processing: bool,
@@ -390,6 +397,8 @@ impl Vst3Plugin {
             _host_app: host_app,
             _component_handler: component_handler,
             controller_separate,
+            ara: None,
+            last_activate: None,
             active: false,
             processing: false,
             input_channels,
@@ -796,6 +805,15 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
 
 impl Drop for Vst3Plugin {
     fn drop(&mut self) {
+        // (r.md #5 ARA2) Tear down the ARA session before releasing the
+        // component — its drop issues destroy calls back into this plug-in.
+        // Deactivate first so detaching its playback regions is valid.
+        if self.ara.is_some() {
+            if self.active {
+                self.deactivate();
+            }
+            self.ara = None;
+        }
         if self.gui_attached.get()
             && let Some(view) = self.view.as_ref()
         {
@@ -837,6 +855,69 @@ impl LoadedPlugin for Vst3Plugin {
 
     fn format(&self) -> PluginFormat {
         PluginFormat::Vst3
+    }
+
+    fn setup_ara(
+        &mut self,
+        clips: &[common::protocol::AraClipSpec],
+        archive: Option<&[u8]>,
+    ) -> Result<bool> {
+        let factory =
+            match unsafe { crate::ara::vst3_ara::ara_factory_from_component(&self.component) } {
+                Some(factory) => factory,
+                None => return Ok(false),
+            };
+        // ARA binding must precede setActive, and detaching regions requires the
+        // instance inactive, so deactivate around the (re)build then restore.
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        self.ara = None; // drop any prior session while inactive
+        let component = self.component.clone();
+        let session = unsafe {
+            crate::ara::session::AraSession::setup(factory, clips, |document_controller| {
+                crate::ara::vst3_ara::bind(
+                    &component,
+                    document_controller,
+                    crate::ara::extension::HOST_KNOWN_ROLES,
+                    crate::ara::extension::HOST_ASSIGNED_ROLES,
+                )
+            })
+        };
+        if was_active
+            && let Some((sample_rate, min_frames, max_frames)) = restore
+        {
+            self.activate(sample_rate, min_frames, max_frames)?;
+        }
+        let session = session?;
+        if let Some(archive) = archive.filter(|a| !a.is_empty()) {
+            session.restore_archive(archive);
+        }
+        self.ara = Some(session);
+        Ok(true)
+    }
+
+    fn clear_ara(&mut self) {
+        if self.ara.is_none() {
+            return;
+        }
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        self.ara = None;
+        if was_active
+            && let Some((sample_rate, min_frames, max_frames)) = restore
+        {
+            let _ = self.activate(sample_rate, min_frames, max_frames);
+        }
+    }
+
+    fn store_ara_archive(&self) -> Option<Vec<u8>> {
+        self.ara.as_ref().and_then(|session| session.store_archive())
     }
 
     /// VST3 param 一覧を `IEditController` から列挙。 VST3 の param は仕様上
@@ -892,8 +973,11 @@ impl LoadedPlugin for Vst3Plugin {
         out
     }
 
-    fn activate(&mut self, sample_rate: f64, _min_frames: u32, max_frames: u32) -> Result<()> {
+    fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()> {
         anyhow::ensure!(!self.active, "VST3 plugin already active");
+        // (r.md #5 ARA2) remember params so ARA setup can deactivate → bind →
+        // reactivate (ARA binding must precede setActive).
+        self.last_activate = Some((sample_rate, min_frames, max_frames));
 
         // 1. Negotiate speaker arrangements for each bus (MVP: stereo).
         let stereo: SpeakerArrangement = SpeakerArr::kStereo;

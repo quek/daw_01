@@ -1792,8 +1792,17 @@ impl ClapPlugin {
             self.deactivate();
         }
         self.ara = None; // drop any prior session while inactive
-        let session =
-            unsafe { crate::ara::session::AraSession::setup(self.plugin, factory, clips) };
+        let plugin = self.plugin;
+        let session = unsafe {
+            crate::ara::session::AraSession::setup(factory, clips, |document_controller| {
+                crate::ara::clap_ara::bind_to_document(
+                    plugin,
+                    document_controller,
+                    crate::ara::extension::HOST_KNOWN_ROLES,
+                    crate::ara::extension::HOST_ASSIGNED_ROLES,
+                )
+            })
+        };
         if was_active
             && let Some((sample_rate, min_frames, max_frames)) = restore
         {
