@@ -694,6 +694,9 @@ async fn recv_loop(
             | Ok(MainToChild::SetBuiltinPluginNoteMetadata { .. })
             // 歌唱合成は plugin host が担うので audio engine は無視。
             | Ok(MainToChild::PrepareVocalSynth { .. })
+            // ARA (r.md #5) は plugin host 専用なので audio engine は無視。
+            | Ok(MainToChild::SetupAraDocument { .. })
+            | Ok(MainToChild::ClearAraDocument { .. })
             | Ok(MainToChild::CloseWorkerPool) => {}
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");

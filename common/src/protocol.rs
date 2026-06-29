@@ -311,7 +311,41 @@ pub struct SlotState {
     pub track: u32,
     pub index: u32,
     pub data: Option<Vec<u8>>,
+    /// (r.md #5 ARA2) ARA document archive for this device, if it is an ARA
+    /// plug-in with a live session. Collected alongside `data` on project save
+    /// and stored into `PluginInstance.ara_archive`.
+    pub ara_archive: Option<Vec<u8>>,
     pub error: Option<String>,
+}
+
+/// Audio data for one ARA audio source (r.md #5). The host (daw_gui) resolves
+/// the track's audio clips into these before sending `SetupAraDocument`:
+/// `ProjectRelative` / `Absolute` sources become an absolute [`AraSourceSpec::WavFile`]
+/// path, while generated / bounced in-memory audio is sent as interleaved PCM.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub enum AraSourceSpec {
+    /// Decode this absolute WAV path inside the plugin host (on demand).
+    WavFile(std::path::PathBuf),
+    /// Already-decoded interleaved f32 PCM (`channel_count`-interleaved).
+    Pcm {
+        samples: Vec<f32>,
+        sample_rate: f64,
+        channel_count: u32,
+    },
+}
+
+/// One audio clip exposed to an ARA plug-in: its source plus where it sits on
+/// the song timeline and which slice of the source is audible. Times are in
+/// seconds; with no time-stretch the modification and playback durations match.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct AraClipSpec {
+    pub source: AraSourceSpec,
+    /// Unique, save/restore-stable id for the source within the document.
+    pub persistent_id: String,
+    pub start_in_playback_seconds: f64,
+    pub duration_in_playback_seconds: f64,
+    pub start_in_modification_seconds: f64,
+    pub duration_in_modification_seconds: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -665,6 +699,30 @@ pub enum MainToChild {
     /// Drop the `ProcessData` mapping for `plugin_id` after the plugin
     /// instance is being torn down.
     ClosePluginShmem { plugin_id: u32 },
+    /// (r.md #5 ARA2) Build/replace the ARA document for the ARA-capable plugin
+    /// at `track`/`index`: expose `clips` as ARA audio sources + playback
+    /// regions and bind the instance for playback rendering. daw_audio ignores
+    /// this (plugin-host only). Sent by daw_gui when an ARA device's track audio
+    /// clips change.
+    SetupAraDocument {
+        track: u32,
+        index: u32,
+        clips: Vec<AraClipSpec>,
+        /// Project tempo (bpm) and time signature (numerator, denominator). Fed
+        /// into the ARA musical context so the plug-in's editor grid / bar lines
+        /// align to the song instead of a hard-coded default. (r.md #5)
+        bpm: f64,
+        time_sig: (u16, u16),
+        /// Prior ARA edit archive to restore after (re)building the document
+        /// (from `PluginInstance.ara_archive`). `None` for a fresh document.
+        archive: Option<Vec<u8>>,
+    },
+    /// (r.md #5 ARA2) Tear down the ARA document/session for `track`/`index`
+    /// (e.g. the ARA device was removed). daw_audio ignores this.
+    ClearAraDocument {
+        track: u32,
+        index: u32,
+    },
 }
 
 #[cfg(test)]
@@ -756,12 +814,14 @@ mod tests {
                     track: 0,
                     index: 1,
                     data: Some(vec![1, 2, 3, 4]),
+                    ara_archive: None,
                     error: None,
                 },
                 SlotState {
                     track: 3,
                     index: 4,
                     data: None,
+                    ara_archive: None,
                     error: Some("state save failed".to_string()),
                 },
             ],

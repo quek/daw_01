@@ -136,6 +136,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "ara-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen 0.71.1",
+]
+
+[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1606,11 +1613,13 @@ name = "daw_plugin_host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ara-sys",
  "arc-swap",
  "bincode",
  "clap-sys",
  "com-scrape-types",
  "common",
+ "hound",
  "libloading",
  "tokio",
  "tracing",

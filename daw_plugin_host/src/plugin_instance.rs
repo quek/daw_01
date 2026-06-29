@@ -343,6 +343,49 @@ pub trait LoadedPlugin: Send {
     /// synth thread が状態遷移ごとに呼ぶ。builtin VOICEVOX 以外は no-op。
     fn set_voicevox_status_reporter(&mut self, _reporter: VoicevoxStatusReporter) {}
 
+    /// (r.md #5 ARA2) If this plug-in is ARA-capable, create its ARA document
+    /// controller and bind the instance for playback rendering (empty model).
+    /// Returns `Ok(true)` when bound, `Ok(false)` for non-ARA plug-ins (default).
+    /// MUST be called once at load, **before** the first `activate` / state load
+    /// / GUI creation, as the ARA spec requires.
+    fn bind_ara_if_capable(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// (r.md #5 ARA2) Update the bound ARA document to expose `clips` as audio
+    /// sources + playback regions and (if `archive` is given) restore prior
+    /// edits. No-op returning `Ok(false)` when the instance is not ARA-bound.
+    fn setup_ara(
+        &mut self,
+        _clips: &[common::protocol::AraClipSpec],
+        _bpm: f64,
+        _time_sig: (u16, u16),
+        _archive: Option<&[u8]>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// (r.md #5 ARA2) Tear down this instance's ARA session, if any.
+    fn clear_ara(&mut self) {}
+
+    /// (r.md #5 ARA2) Drive the bound ARA document's deferred work / analysis.
+    /// Called periodically by the plugin-main thread (ARA requires the host to
+    /// pump `notifyModelUpdates` while not editing); no-op for non-ARA instances.
+    fn notify_ara_model_updates(&self) {}
+
+    /// (r.md #5 ARA2) Whether this instance currently holds a live ARA session.
+    /// Lets the plugin-main thread run its `notifyModelUpdates` timer only while
+    /// at least one ARA document is loaded.
+    fn has_ara_session(&self) -> bool {
+        false
+    }
+
+    /// (r.md #5 ARA2) Serialise this instance's ARA edit state for project save,
+    /// or `None` if it is not an ARA instance / has no live session.
+    fn store_ara_archive(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     // --- embedded Win32 GUI (plugin-main thread) ------------------------
     //
     // Methods match the existing CLAP `Plugin` inherent impl so the trait

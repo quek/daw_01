@@ -3234,6 +3234,12 @@ pub struct PluginInstance {
     /// v23: この device の port 構成。役割導出の入力。
     #[serde(default)]
     pub ports: crate::port_config::PortConfig,
+    /// (r.md #5 ARA2) ARA ドキュメントアーカイブ = プラグインがシリアライズした
+    /// 編集状態 (Melodyne のピッチ修正等)。ホストが instance ごとに保持し、
+    /// プロジェクトには base64 で保存、ロード時にプラグインへ送り返して編集を
+    /// 復元する。`state` (CLAP/VST3 own state) とは独立。
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "base64_opt")]
+    pub ara_archive: Option<Vec<u8>>,
 }
 
 impl PluginInstance {
@@ -3247,6 +3253,7 @@ impl PluginInstance {
             aux_outputs: Vec::new(),
             aux_output_count: 0,
             ports: crate::port_config::PortConfig::default(),
+            ara_archive: None,
         }
     }
 
@@ -3264,6 +3271,7 @@ impl PluginInstance {
             aux_outputs: Vec::new(),
             aux_output_count: 0,
             ports,
+            ara_archive: None,
         }
     }
 

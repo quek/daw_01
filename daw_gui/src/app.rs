@@ -1120,6 +1120,13 @@ pub struct AppData {
     /// sources are decoded twice (once per process) to keep IPC lean
     /// (`docs/plan_audio_clip.md` §6.1 / §8.3).
     pub audio_source_cache: AudioSourceCache,
+    /// (r.md #5 ARA2) Last ARA clip-spec set sent to the plugin host per
+    /// `(track_id, device_index)`. `SetupAraDocument` is sent only when an ARA
+    /// device's track audio clips actually change — rebuilding the ARA document
+    /// deactivates/reactivates the plug-in, so it must not happen on every song
+    /// sync. Slots that disappear (device removed / no longer ARA) get
+    /// `ClearAraDocument`.
+    ara_doc_cache: std::collections::HashMap<(u32, u32), Vec<common::protocol::AraClipSpec>>,
     /// Video thumbnail RGBA8 staging area, keyed by `VideoSourceId`.
     /// Populated by `action_import_video` (P3.4); drained by the
     /// runner (P3.5) which calls `Renderer::create_texture` +
@@ -2239,6 +2246,7 @@ impl AppData {
             song,
             file_path: None,
             audio_source_cache: AudioSourceCache::new(),
+            ara_doc_cache: std::collections::HashMap::new(),
             video_thumbnail_rgba: std::collections::HashMap::new(),
             pending_thumbnail_uploads: Vec::new(),
             video_texture_cache: std::collections::HashMap::new(),
@@ -7910,8 +7918,140 @@ impl AppData {
         // 既存 vocal block (= track.instrument is None の旧 project) には
         // 影響しない (= sync_vocal_metadata 内で format check で skip)。
         self.sync_vocal_metadata();
+        // (r.md #5 ARA2) ARA device を持つトラックの audio クリップを ARA document
+        // として plugin host に公開する (差分があるときだけ送信)。
+        self.sync_ara_documents();
         // 口パク自動再生成 (binding 済み vocal track のみ、debounce 付き)。
         self.mark_lipsync_dirty();
+    }
+
+    /// (r.md #5 ARA2) Expose each ARA-capable device's track audio clips to the
+    /// plug-in as an ARA document. Diffs against [`Self::ara_doc_cache`] so
+    /// `SetupAraDocument` (which reinitialises the plug-in) is sent only when the
+    /// resolved clip set changes, and `ClearAraDocument` for slots no longer ARA.
+    fn sync_ara_documents(&mut self) {
+        let Some(db) = self.plugin_db.clone() else {
+            self.clear_all_ara_documents();
+            return;
+        };
+        let project_dir: Option<PathBuf> = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let bpm = f64::from(self.song.bpm).max(1.0);
+
+        // Resolve the current ARA clip set for every ARA device slot.
+        let mut live: std::collections::HashMap<(u32, u32), Vec<common::protocol::AraClipSpec>> =
+            std::collections::HashMap::new();
+        for track in &self.song.tracks {
+            for (index, device) in track.devices.iter().enumerate() {
+                if !db.find_by_id(&device.plugin_id).is_some_and(|entry| entry.is_ara()) {
+                    continue;
+                }
+                let clips = self.collect_ara_clips_for_track(track, project_dir.as_deref(), bpm);
+                live.insert((track.id, index as u32), clips);
+            }
+        }
+
+        // Compute the diff against the cache before any &mut self send.
+        let to_send: Vec<((u32, u32), Vec<common::protocol::AraClipSpec>)> = live
+            .iter()
+            .filter(|(key, clips)| self.ara_doc_cache.get(*key) != Some(*clips))
+            .map(|(key, clips)| (*key, clips.clone()))
+            .collect();
+        let stale: Vec<(u32, u32)> = self
+            .ara_doc_cache
+            .keys()
+            .filter(|key| !live.contains_key(*key))
+            .copied()
+            .collect();
+
+        self.ara_doc_cache = live;
+        for ((track, index), clips) in to_send {
+            // Restore any saved ARA edits for this device alongside the rebuild.
+            let archive = self
+                .song
+                .tracks
+                .iter()
+                .find(|t| t.id == track)
+                .and_then(|t| t.devices.get(index as usize))
+                .and_then(|d| d.ara_archive.clone());
+            self.send_plugin(MainToChild::SetupAraDocument {
+                track,
+                index,
+                clips,
+                bpm,
+                time_sig: (self.song.time_sig.0 as u16, self.song.time_sig.1 as u16),
+                archive,
+            });
+        }
+        for (track, index) in stale {
+            self.send_plugin(MainToChild::ClearAraDocument { track, index });
+        }
+    }
+
+    /// Send `ClearAraDocument` for every cached ARA slot and empty the cache.
+    fn clear_all_ara_documents(&mut self) {
+        let stale: Vec<(u32, u32)> = self.ara_doc_cache.keys().copied().collect();
+        self.ara_doc_cache.clear();
+        for (track, index) in stale {
+            self.send_plugin(MainToChild::ClearAraDocument { track, index });
+        }
+    }
+
+    /// (r.md #5 ARA2) Resolve a track's audio clips into ARA clip specs. Times
+    /// convert from beats to seconds (ARA playback time is in seconds); the
+    /// source slice maps 1:1 without time-stretch. File sources resolve to an
+    /// absolute path; `Generated` (no on-disk file) is skipped for now.
+    fn collect_ara_clips_for_track(
+        &self,
+        track: &common::model::Track,
+        project_dir: Option<&Path>,
+        bpm: f64,
+    ) -> Vec<common::protocol::AraClipSpec> {
+        use common::model::{AudioSourcePath, ClipContent};
+        let mut out = Vec::new();
+        for clip in &track.clips {
+            let Some(ClipContent::Audio(audio)) = self.song.clip_contents.get(&clip.content_id)
+            else {
+                continue;
+            };
+            for (event_index, event) in audio.events.iter().enumerate() {
+                let Some(source) = self.song.audio_sources.get(&event.source_id) else {
+                    continue;
+                };
+                let abs = match &source.path {
+                    AudioSourcePath::Absolute(p) => p.clone(),
+                    AudioSourcePath::ProjectRelative(rel) => match project_dir {
+                        Some(dir) => dir.join(rel),
+                        None => continue,
+                    },
+                    AudioSourcePath::Generated { .. } => continue,
+                };
+                let sample_rate = f64::from(source.sample_rate).max(1.0);
+                let start_in_modification = event.source_start_frames as f64 / sample_rate;
+                let duration_in_modification = event
+                    .source_end_frames
+                    .saturating_sub(event.source_start_frames)
+                    as f64
+                    / sample_rate;
+                let start_in_playback =
+                    (clip.start_beat + event.event_start_in_clip_beats) * 60.0 / bpm;
+                out.push(common::protocol::AraClipSpec {
+                    source: common::protocol::AraSourceSpec::WavFile(abs),
+                    persistent_id: format!(
+                        "{}:{}:{event_index}",
+                        event.source_id, clip.id
+                    ),
+                    start_in_playback_seconds: start_in_playback,
+                    // No time-stretch (v1): playback duration == source slice.
+                    duration_in_playback_seconds: duration_in_modification,
+                    start_in_modification_seconds: start_in_modification,
+                    duration_in_modification_seconds: duration_in_modification,
+                });
+            }
+        }
+        out
     }
 
     /// v23 (review fix): `ports` が default (全 false) の device を plugin DB
@@ -8987,6 +9127,13 @@ impl AppData {
             };
             if let Some(p) = chain.get_mut(s.index as usize) {
                 p.state = s.data.clone();
+                // (r.md #5 ARA2) Only overwrite the ARA archive when the plug-in
+                // actually produced one; a non-ARA device or a not-yet-bound
+                // session reports None, and we must not wipe a previously-saved
+                // archive in that case.
+                if s.ara_archive.is_some() {
+                    p.ara_archive = s.ara_archive.clone();
+                }
             }
         }
     }
@@ -18708,6 +18855,15 @@ impl AppData {
         //     従来この add path だけ audio 再 sync が欠落しており、 save 等 次の
         //     sync_song_to_plugin_host まで signal に反映されなかった (= bug)。
         // (2) GUI 自動 open を frame loop に queue する。
+        // (r.md #5 ARA2) A (re)loaded plug-in at this slot is a brand-new
+        // instance with an empty ARA document, even if the slot's clip set is
+        // unchanged (e.g. the user re-inserted the same ARA plug-in). The ARA
+        // sync cache is keyed by (track, index) + clip set, so without dropping
+        // the cached entry here the next sync sees "no change" and never sends
+        // `SetupAraDocument` to the new instance — leaving it with no regions, so
+        // it renders silence and its empty playback renderer stalls the engine.
+        self.ara_doc_cache.remove(&(track_id, index));
+
         // pending_play flush より前に sync し、 Play 待ち再生も最新 schedule で開始させる。
         if self.pending_added_plugin_finalize.remove(&(track_id, index)) {
             self.sync_song_to_plugin_host();
@@ -20728,6 +20884,11 @@ impl AppData {
         self.plugin_db = Some(new_db);
         self.rebuild_picker_entries();
         self.refresh_picker_visible();
+        // (r.md #5 ARA2) A rescan can reclassify an already-loaded plug-in as
+        // ARA-capable (e.g. a cache that predated ARA detection). Re-resolve ARA
+        // documents so such a plug-in gets its `SetupAraDocument` now instead of
+        // only on the next song edit.
+        self.sync_ara_documents();
     }
 
     // -------- Mixer --------------------------------------------------------

@@ -79,6 +79,13 @@ pub struct Vst3Plugin {
     /// drop. `false` for single-component plugins.
     controller_separate: bool,
 
+    /// (r.md #5 ARA2) ARA session bound to this instance, if any. Dropped before
+    /// the component is released (its drop calls back into this plug-in).
+    ara: Option<crate::ara::session::AraSession>,
+    /// Last activate params, kept so ARA setup — which must bind before
+    /// `setActive` — can deactivate → bind → reactivate.
+    last_activate: Option<(f64, u32, u32)>,
+
     // --- Audio processing state ----------------------------------------
     active: bool,
     processing: bool,
@@ -408,6 +415,8 @@ impl Vst3Plugin {
             _host_app: host_app,
             _component_handler: component_handler,
             controller_separate,
+            ara: None,
+            last_activate: None,
             active: false,
             processing: false,
             input_channels,
@@ -819,6 +828,15 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
 
 impl Drop for Vst3Plugin {
     fn drop(&mut self) {
+        // (r.md #5 ARA2) Tear down the ARA session before releasing the
+        // component — its drop issues destroy calls back into this plug-in.
+        // Deactivate first so detaching its playback regions is valid.
+        if self.ara.is_some() {
+            if self.active {
+                self.deactivate();
+            }
+            self.ara = None;
+        }
         if self.gui_attached.get()
             && let Some(view) = self.view.as_ref()
         {
@@ -860,6 +878,91 @@ impl LoadedPlugin for Vst3Plugin {
 
     fn format(&self) -> PluginFormat {
         PluginFormat::Vst3
+    }
+
+    fn bind_ara_if_capable(&mut self) -> Result<bool> {
+        let factory =
+            match unsafe { crate::ara::vst3_ara::ara_factory_from_component(&self.component) } {
+                Some(factory) => factory,
+                None => return Ok(false),
+            };
+        let component = self.component.clone();
+        let session = unsafe {
+            crate::ara::session::AraSession::create(factory, |document_controller| {
+                crate::ara::vst3_ara::bind(
+                    &component,
+                    document_controller,
+                    crate::ara::extension::HOST_KNOWN_ROLES,
+                    crate::ara::extension::HOST_ASSIGNED_ROLES,
+                )
+            })
+        }?;
+        self.ara = Some(session);
+        Ok(true)
+    }
+
+    fn setup_ara(
+        &mut self,
+        clips: &[common::protocol::AraClipSpec],
+        bpm: f64,
+        time_sig: (u16, u16),
+        archive: Option<&[u8]>,
+    ) -> Result<bool> {
+        if self.ara.is_none() {
+            return Ok(false);
+        }
+        // set_clips / region detach require the instance inactive; deactivate
+        // around the update, then restore. The bind already happened at load.
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        if let Some(session) = self.ara.as_mut() {
+            session.set_clips(clips, bpm, time_sig);
+        }
+        if let Some(archive) = archive.filter(|a| !a.is_empty())
+            && let Some(session) = self.ara.as_ref()
+        {
+            session.restore_archive(archive);
+        }
+        if was_active
+            && let Some((sample_rate, min_frames, max_frames)) = restore
+        {
+            self.activate(sample_rate, min_frames, max_frames)?;
+        }
+        Ok(true)
+    }
+
+    fn clear_ara(&mut self) {
+        if self.ara.is_none() {
+            return;
+        }
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        self.ara = None;
+        if was_active
+            && let Some((sample_rate, min_frames, max_frames)) = restore
+        {
+            let _ = self.activate(sample_rate, min_frames, max_frames);
+        }
+    }
+
+    fn notify_ara_model_updates(&self) {
+        if let Some(session) = self.ara.as_ref() {
+            session.notify_model_updates();
+        }
+    }
+
+    fn has_ara_session(&self) -> bool {
+        self.ara.is_some()
+    }
+
+    fn store_ara_archive(&self) -> Option<Vec<u8>> {
+        self.ara.as_ref().and_then(|session| session.store_archive())
     }
 
     /// VST3 param 一覧を `IEditController` から列挙。 VST3 の param は仕様上
@@ -915,8 +1018,11 @@ impl LoadedPlugin for Vst3Plugin {
         out
     }
 
-    fn activate(&mut self, sample_rate: f64, _min_frames: u32, max_frames: u32) -> Result<()> {
+    fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()> {
         anyhow::ensure!(!self.active, "VST3 plugin already active");
+        // (r.md #5 ARA2) remember params so ARA setup can deactivate → bind →
+        // reactivate (ARA binding must precede setActive).
+        self.last_activate = Some((sample_rate, min_frames, max_frames));
 
         // 1. Negotiate speaker arrangements for each bus (MVP: stereo).
         let stereo: SpeakerArrangement = SpeakerArr::kStereo;
@@ -1397,13 +1503,19 @@ impl LoadedPlugin for Vst3Plugin {
             i32::from(transport.tsig_num.max(1));
         self.process_context.timeSigDenominator =
             i32::from(transport.tsig_denom.max(1));
-        // VST3 spec: `TSamples` は i64 absolute sample position。
-        // playhead_samples は u64 だが通常使用範囲では i64 に収まる
-        // (= 2^63-1 sample @ 96 kHz で約 3 千年)。 saturating で防御。
-        let playhead_i64 = i64::try_from(transport.playhead_samples)
-            .unwrap_or(i64::MAX);
-        self.process_context.projectTimeSamples = playhead_i64;
-        self.process_context.continousTimeSamples = playhead_i64;
+        // VST3 spec: `projectTimeSamples` is the song-relative sample position.
+        // The engine doesn't populate `ProcessData::steady_time` (it stays 0), so
+        // `transport.playhead_samples` is unusable here — deriving the sample
+        // position from the authoritative `song_pos_beats` keeps it consistent
+        // with `projectTimeMusic` and with the ARA playback regions (whose
+        // playback times daw_gui also derives from beats via the song tempo).
+        // Without this, ARA plug-ins (Melodyne) see a frozen position 0 and
+        // render the region's first frame forever (a constant tone), instead of
+        // following the transport. saturating cast guards a pathological value.
+        let song_pos_samples =
+            (song_pos_beats * 60.0 / bpm_f * self.sample_rate).max(0.0) as i64;
+        self.process_context.projectTimeSamples = song_pos_samples;
+        self.process_context.continousTimeSamples = song_pos_samples;
         self.process_context.projectTimeMusic = song_pos_beats;
         self.process_context.barPositionMusic = bar_start_beats;
         self.process_context.cycleStartMusic = transport.loop_start_beats;
@@ -1652,6 +1764,13 @@ impl LoadedPlugin for Vst3Plugin {
         // into_raw — setFrame does addRef internally so ownership is balanced.
         let _ = unsafe { ComPtr::<vst3::Steinberg::IPlugFrame>::from_raw(frame_ptr) };
         self.view = Some(view);
+        // (r.md #5 ARA2) The editor view now exists — push the current ARA
+        // selection so the plug-in's editor displays the track's regions. ARA
+        // requires this on (re-)opening the view; doing it only at document
+        // setup (before the view existed) left Melodyne's timeline empty.
+        if let Some(session) = self.ara.as_ref() {
+            session.notify_editor_selection();
+        }
         Ok(())
     }
 

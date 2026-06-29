@@ -73,6 +73,13 @@ pub struct ClapPlugin {
     _host: Box<Host>,
     /// Stable `clap_plugin_descriptor.id` of the loaded descriptor.
     id: String,
+    /// (r.md #5 ARA2) ARA session bound to this instance, if any. Holds the ARA
+    /// document controller + bound extension; dropped before the instance is
+    /// destroyed (its drop issues destroy calls back into this plug-in).
+    ara: Option<crate::ara::session::AraSession>,
+    /// Last successful `activate` params, kept so ARA setup — which must bind
+    /// before activation — can deactivate → bind → reactivate around the build.
+    last_activate: Option<(f64, u32, u32)>,
     name: String,
     path: PathBuf,
     active: bool,
@@ -365,6 +372,8 @@ impl ClapPlugin {
             plugin: plugin_ptr,
             _host: host,
             id,
+            ara: None,
+            last_activate: None,
             name,
             path: path.to_path_buf(),
             active: false,
@@ -659,6 +668,7 @@ impl ClapPlugin {
             "plugin.activate returned false"
         );
         self.active = true;
+        self.last_activate = Some((sample_rate, min_frames, max_frames));
         self.input_buffers = (0..self.input_channels as usize)
             .map(|_| vec![0.0f32; max_frames as usize])
             .collect();
@@ -1465,8 +1475,8 @@ unsafe extern "C" fn collect_out_note_try_push(
 /// transport (= we set song_pos_* to the buffer-start values); CLAP
 /// plugins increment internally for sub-buffer interpolation.
 ///
-/// `song_pos_beats` = playhead_samples * bpm / (60 * SR) * (1 << 31)
-/// `song_pos_seconds` = playhead_samples / SR * (1 << 31)
+/// `song_pos_beats` = transport.song_pos_beats * (1 << 31)
+/// `song_pos_seconds` = song_pos_beats * 60 / bpm * (1 << 31)
 /// `bar_start` / `bar_number`: compute current bar index from beats
 /// using tsig_num (= beats_per_bar). Bar start in beats is
 /// `bar_number * tsig_num` (= integer beats since song start).
@@ -1485,16 +1495,18 @@ fn build_clap_transport_event(
     _frames: u32,
 ) -> clap_event_transport {
     let bpm = f64::from(transport.bpm).max(1.0);
-    let sample_rate = f64::from(transport.sample_rate).max(1.0);
-    let playhead_samples = transport.playhead_samples as f64;
-    // seconds は sample 由来 (= テンポ非依存で正確)。
-    // 非有限 (NaN / inf) を `as i64` すると未規定 / saturate になり下流の
-    // bar 計算も汚染するので、 bar_number の clamp と同様 0 に倒す。
-    let song_pos_seconds_f64 = sanitize_pos(playhead_samples / sample_rate);
     // beats は daw_audio が tempo automation を積分した真の拍位置を使う
     // (= `samples × bpm` の一定テンポ逆算は廃止)。 これで途中でテンポが
     // 変わった曲でも plugin が正しい拍 / 小節位置を見る。
     let song_pos_beats_f64 = sanitize_pos(transport.song_pos_beats);
+    // seconds も拍位置から導出する。 engine は `ProcessData::steady_time`
+    // (= `transport.playhead_samples`) を設定せず 0 固定なので、 sample 由来の
+    // seconds (`playhead_samples / SR`) は常に 0 になってしまう。 `song_pos_beats`
+    // から `* 60 / bpm` で曲頭からの秒位置を得る (一定テンポでは厳密、 テンポ
+    // automation 中も拍位置と整合)。 ARA plug-in はこの seconds で再生リージョンを
+    // 引くため、 0 固定だと VST3 の projectTimeSamples と同様にリージョン位置が
+    // 固着して無音になる。 非有限は `sanitize_pos` で 0 に倒す。
+    let song_pos_seconds_f64 = sanitize_pos(song_pos_beats_f64 * 60.0 / bpm);
     let song_pos_beats: i64 = (song_pos_beats_f64 * CLAP_BEATTIME_FACTOR as f64) as i64;
     let song_pos_seconds: i64 = (song_pos_seconds_f64 * CLAP_SECTIME_FACTOR as f64) as i64;
     let tsig_num = transport.tsig_num.max(1) as f64;
@@ -1758,8 +1770,103 @@ fn query_port_channel_count(
     unsafe { info.assume_init() }.channel_count
 }
 
+impl ClapPlugin {
+    /// (r.md #5 ARA2) Inherent ARA bind at load (before the first activate /
+    /// state load / GUI). The `LoadedPlugin` trait method forwards here. Returns
+    /// `Ok(false)` when this descriptor exposes no ARA factory.
+    pub fn bind_ara_if_capable(&mut self) -> Result<bool> {
+        let id = CString::new(self.id.as_str()).context("plugin id has interior NUL")?;
+        let factory =
+            match unsafe { crate::ara::clap_ara::ara_factory_for_plugin(&*self.entry, &id) } {
+                Some(factory) => factory,
+                None => return Ok(false),
+            };
+        let plugin = self.plugin;
+        let session = unsafe {
+            crate::ara::session::AraSession::create(factory, |document_controller| {
+                crate::ara::clap_ara::bind_to_document(
+                    plugin,
+                    document_controller,
+                    crate::ara::extension::HOST_KNOWN_ROLES,
+                    crate::ara::extension::HOST_ASSIGNED_ROLES,
+                )
+            })
+        }?;
+        self.ara = Some(session);
+        Ok(true)
+    }
+
+    /// (r.md #5 ARA2) Inherent ARA clip update; the `LoadedPlugin` trait method
+    /// forwards here. No-op (`Ok(false)`) when the instance is not ARA-bound.
+    pub fn setup_ara(
+        &mut self,
+        clips: &[common::protocol::AraClipSpec],
+        bpm: f64,
+        time_sig: (u16, u16),
+        archive: Option<&[u8]>,
+    ) -> Result<bool> {
+        if self.ara.is_none() {
+            return Ok(false);
+        }
+        // set_clips / region detach require the instance inactive; deactivate
+        // around the update, then restore the prior activation state. The bind
+        // itself already happened at load (`bind_ara_if_capable`).
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        if let Some(session) = self.ara.as_mut() {
+            session.set_clips(clips, bpm, time_sig);
+        }
+        if let Some(archive) = archive.filter(|a| !a.is_empty())
+            && let Some(session) = self.ara.as_ref()
+        {
+            session.restore_archive(archive);
+        }
+        if was_active
+            && let Some((sample_rate, min_frames, max_frames)) = restore
+        {
+            self.activate(sample_rate, min_frames, max_frames)?;
+        }
+        Ok(true)
+    }
+
+    /// (r.md #5 ARA2) Inherent ARA teardown; forwarded by the trait method.
+    pub fn clear_ara(&mut self) {
+        if self.ara.is_none() {
+            return;
+        }
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        self.ara = None;
+        if was_active
+            && let Some((sample_rate, min_frames, max_frames)) = restore
+        {
+            let _ = self.activate(sample_rate, min_frames, max_frames);
+        }
+    }
+
+    /// (r.md #5 ARA2) Serialise the current ARA session's edit state, if any.
+    pub fn store_ara_archive(&self) -> Option<Vec<u8>> {
+        self.ara.as_ref().and_then(|session| session.store_archive())
+    }
+}
+
 impl Drop for ClapPlugin {
     fn drop(&mut self) {
+        // Tear down the ARA session (if any) before the instance is destroyed —
+        // its drop issues destroy calls back into this plug-in. Deactivate first
+        // so detaching its playback regions is valid.
+        if self.ara.is_some() {
+            if self.active {
+                self.deactivate();
+            }
+            self.ara = None;
+        }
         // Tear down GUI resources first so plugin.destroy sees a clean state.
         self.gui_destroy();
         unsafe {
@@ -2010,6 +2117,38 @@ impl LoadedPlugin for ClapPlugin {
         self.deactivate();
     }
 
+    fn bind_ara_if_capable(&mut self) -> Result<bool> {
+        self.bind_ara_if_capable()
+    }
+
+    fn setup_ara(
+        &mut self,
+        clips: &[common::protocol::AraClipSpec],
+        bpm: f64,
+        time_sig: (u16, u16),
+        archive: Option<&[u8]>,
+    ) -> Result<bool> {
+        self.setup_ara(clips, bpm, time_sig, archive)
+    }
+
+    fn clear_ara(&mut self) {
+        self.clear_ara();
+    }
+
+    fn notify_ara_model_updates(&self) {
+        if let Some(session) = self.ara.as_ref() {
+            session.notify_model_updates();
+        }
+    }
+
+    fn has_ara_session(&self) -> bool {
+        self.ara.is_some()
+    }
+
+    fn store_ara_archive(&self) -> Option<Vec<u8>> {
+        self.store_ara_archive()
+    }
+
     fn start_processing(&mut self) -> Result<()> {
         self.start_processing()
     }
@@ -2171,8 +2310,10 @@ mod tests {
         let ev = build_clap_transport_event(&ctx(), 256);
         let expected = (999.0_f64 * CLAP_BEATTIME_FACTOR as f64) as i64;
         assert_eq!(ev.song_pos_beats, expected);
-        // seconds は sample 由来 (= テンポ非依存で正確)、 1 秒。
-        let expected_sec = (1.0_f64 * CLAP_SECTIME_FACTOR as f64) as i64;
+        // seconds も song_pos_beats から導出する (engine が steady_time を設定せず
+        // playhead_samples=0 のため sample 由来は使えない)。 999 拍 ÷ (120bpm/60)
+        // = 499.5 秒。
+        let expected_sec = (999.0_f64 * 60.0 / 120.0 * CLAP_SECTIME_FACTOR as f64) as i64;
         assert_eq!(ev.song_pos_seconds, expected_sec);
         assert_eq!(ev.tempo, 120.0);
         assert_ne!(ev.flags & CLAP_TRANSPORT_IS_PLAYING, 0);
