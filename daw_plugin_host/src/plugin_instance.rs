@@ -358,6 +358,8 @@ pub trait LoadedPlugin: Send {
     fn setup_ara(
         &mut self,
         _clips: &[common::protocol::AraClipSpec],
+        _bpm: f64,
+        _time_sig: (u16, u16),
         _archive: Option<&[u8]>,
     ) -> Result<bool> {
         Ok(false)
@@ -365,6 +367,18 @@ pub trait LoadedPlugin: Send {
 
     /// (r.md #5 ARA2) Tear down this instance's ARA session, if any.
     fn clear_ara(&mut self) {}
+
+    /// (r.md #5 ARA2) Drive the bound ARA document's deferred work / analysis.
+    /// Called periodically by the plugin-main thread (ARA requires the host to
+    /// pump `notifyModelUpdates` while not editing); no-op for non-ARA instances.
+    fn notify_ara_model_updates(&self) {}
+
+    /// (r.md #5 ARA2) Whether this instance currently holds a live ARA session.
+    /// Lets the plugin-main thread run its `notifyModelUpdates` timer only while
+    /// at least one ARA document is loaded.
+    fn has_ara_session(&self) -> bool {
+        false
+    }
 
     /// (r.md #5 ARA2) Serialise this instance's ARA edit state for project save,
     /// or `None` if it is not an ARA instance / has no live session.

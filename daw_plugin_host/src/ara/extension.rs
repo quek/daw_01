@@ -6,11 +6,10 @@
 //! rendering during playback / export. The editor-view and editor-renderer
 //! roles (preview audio, plug-in GUI) are wired in later steps.
 
-use core::ptr;
-
 use ara_sys::{
     ARAPlaybackRegionRef, ARAPlugInExtensionInstance, ARAPlugInInstanceRoleFlags,
-    kARAEditorRendererRole, kARAEditorViewRole, kARAPlaybackRendererRole,
+    ARARegionSequenceRef, ARAViewSelection, kARAEditorRendererRole, kARAEditorViewRole,
+    kARAPlaybackRendererRole,
 };
 
 /// Roles this host can drive for an ARA instance: render song playback, render
@@ -39,7 +38,7 @@ impl AraPlugInExtension {
             return None;
         }
         Some(Self {
-            instance: unsafe { ptr::read_unaligned(instance) },
+            instance: unsafe { crate::ara::read_versioned(instance) },
         })
     }
 
@@ -58,7 +57,7 @@ impl AraPlugInExtension {
         if interface.is_null() {
             return;
         }
-        let table = unsafe { ptr::read_unaligned(interface) };
+        let table = unsafe { crate::ara::read_versioned(interface) };
         if let Some(add) = table.addPlaybackRegion {
             unsafe { add(renderer, region) };
         }
@@ -72,9 +71,103 @@ impl AraPlugInExtension {
         if interface.is_null() {
             return;
         }
-        let table = unsafe { ptr::read_unaligned(interface) };
+        let table = unsafe { crate::ara::read_versioned(interface) };
         if let Some(remove) = table.removePlaybackRegion {
             unsafe { remove(renderer, region) };
         }
+    }
+
+    /// Assign a playback region to this instance's **editor** renderer. This is
+    /// what makes the region's audio appear (and be previewable) in the plug-in's
+    /// editor — without it the editor (e.g. Melodyne's timeline) stays empty even
+    /// though playback rendering works. Same threading rules as
+    /// [`Self::add_playback_region`].
+    pub fn editor_add_playback_region(&self, region: ARAPlaybackRegionRef) {
+        let interface = self.instance.editorRendererInterface;
+        let renderer = self.instance.editorRendererRef;
+        if interface.is_null() {
+            return;
+        }
+        let table = unsafe { crate::ara::read_versioned(interface) };
+        if let Some(add) = table.addPlaybackRegion {
+            unsafe { add(renderer, region) };
+        }
+    }
+
+    /// Remove a region from the editor renderer (same rules as
+    /// [`Self::editor_add_playback_region`]).
+    pub fn editor_remove_playback_region(&self, region: ARAPlaybackRegionRef) {
+        let interface = self.instance.editorRendererInterface;
+        let renderer = self.instance.editorRendererRef;
+        if interface.is_null() {
+            return;
+        }
+        let table = unsafe { crate::ara::read_versioned(interface) };
+        if let Some(remove) = table.removePlaybackRegion {
+            unsafe { remove(renderer, region) };
+        }
+    }
+
+    /// Assign a region sequence (track) to the editor renderer. Some plug-ins
+    /// populate their editor by sequence rather than by individual region, so we
+    /// assign both. Same threading rules as [`Self::add_playback_region`].
+    pub fn editor_add_region_sequence(&self, sequence: ARARegionSequenceRef) {
+        let interface = self.instance.editorRendererInterface;
+        let renderer = self.instance.editorRendererRef;
+        if interface.is_null() {
+            return;
+        }
+        let table = unsafe { crate::ara::read_versioned(interface) };
+        if let Some(add) = table.addRegionSequence {
+            unsafe { add(renderer, sequence) };
+        }
+    }
+
+    /// Remove a region sequence from the editor renderer.
+    pub fn editor_remove_region_sequence(&self, sequence: ARARegionSequenceRef) {
+        let interface = self.instance.editorRendererInterface;
+        let renderer = self.instance.editorRendererRef;
+        if interface.is_null() {
+            return;
+        }
+        let table = unsafe { crate::ara::read_versioned(interface) };
+        if let Some(remove) = table.removeRegionSequence {
+            unsafe { remove(renderer, sequence) };
+        }
+    }
+
+    /// Tell the plug-in's editor view which regions / region sequences are
+    /// selected. Plug-ins like Melodyne show an **empty** editor until they
+    /// receive a selection, so the host pushes the current document as the
+    /// selection. The ref arrays only need to live for the duration of the call
+    /// (the plug-in copies what it keeps). `time_range = NULL` = whole timeline.
+    pub fn notify_selection(
+        &self,
+        regions: &[ARAPlaybackRegionRef],
+        sequences: &[ARARegionSequenceRef],
+    ) {
+        let interface = self.instance.editorViewInterface;
+        let view = self.instance.editorViewRef;
+        if interface.is_null() {
+            return;
+        }
+        let table = unsafe { crate::ara::read_versioned(interface) };
+        let Some(notify) = table.notifySelection else {
+            return;
+        };
+        let selection = ARAViewSelection {
+            structSize: core::mem::size_of::<ARAViewSelection>(),
+            playbackRegionRefsCount: regions.len(),
+            playbackRegionRefs: regions.as_ptr(),
+            regionSequenceRefsCount: sequences.len(),
+            regionSequenceRefs: sequences.as_ptr(),
+            timeRange: core::ptr::null(),
+        };
+        unsafe { notify(view, &selection) };
+    }
+
+    /// Whether the editor-renderer role was assigned to this instance.
+    pub fn has_editor_renderer(&self) -> bool {
+        !self.instance.editorRendererInterface.is_null()
     }
 }

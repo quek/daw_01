@@ -7980,6 +7980,8 @@ impl AppData {
                 track,
                 index,
                 clips,
+                bpm,
+                time_sig: (self.song.time_sig.0 as u16, self.song.time_sig.1 as u16),
                 archive,
             });
         }
@@ -18853,6 +18855,15 @@ impl AppData {
         //     従来この add path だけ audio 再 sync が欠落しており、 save 等 次の
         //     sync_song_to_plugin_host まで signal に反映されなかった (= bug)。
         // (2) GUI 自動 open を frame loop に queue する。
+        // (r.md #5 ARA2) A (re)loaded plug-in at this slot is a brand-new
+        // instance with an empty ARA document, even if the slot's clip set is
+        // unchanged (e.g. the user re-inserted the same ARA plug-in). The ARA
+        // sync cache is keyed by (track, index) + clip set, so without dropping
+        // the cached entry here the next sync sees "no change" and never sends
+        // `SetupAraDocument` to the new instance — leaving it with no regions, so
+        // it renders silence and its empty playback renderer stalls the engine.
+        self.ara_doc_cache.remove(&(track_id, index));
+
         // pending_play flush より前に sync し、 Play 待ち再生も最新 schedule で開始させる。
         if self.pending_added_plugin_finalize.remove(&(track_id, index)) {
             self.sync_song_to_plugin_host();
@@ -20873,6 +20884,11 @@ impl AppData {
         self.plugin_db = Some(new_db);
         self.rebuild_picker_entries();
         self.refresh_picker_visible();
+        // (r.md #5 ARA2) A rescan can reclassify an already-loaded plug-in as
+        // ARA-capable (e.g. a cache that predated ARA detection). Re-resolve ARA
+        // documents so such a plug-in gets its `SetupAraDocument` now instead of
+        // only on the next song edit.
+        self.sync_ara_documents();
     }
 
     // -------- Mixer --------------------------------------------------------

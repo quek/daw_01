@@ -20,13 +20,14 @@ use ara_sys::{
     ARAAPIGeneration, ARAAssertFunction, ARAAudioModificationHostRef,
     ARAAudioModificationProperties, ARAAudioModificationRef, ARAAudioSourceHostRef,
     ARAAudioSourceProperties, ARAAudioSourceRef, ARABool, ARAChannelCount,
-    ARADocumentControllerInterface, ARADocumentControllerRef, ARADocumentProperties, ARAFactory,
+    ARADocumentControllerHostInstance, ARADocumentControllerInterface, ARADocumentControllerRef,
+    ARADocumentProperties, ARAFactory,
     ARAInterfaceConfiguration, ARAMusicalContextHostRef, ARAMusicalContextProperties,
     ARAMusicalContextRef, ARAPlaybackRegionHostRef, ARAPlaybackRegionProperties,
     ARAPlaybackRegionRef, ARARegionSequenceHostRef, ARARegionSequenceProperties,
     ARARegionSequenceRef, ARASampleCount, ARASampleRate, ARATimeDuration, ARATimePosition,
     kARAAPIGeneration_2_0_Final, kARAAPIGeneration_2_3_Final, kARAChannelArrangementUndefined,
-    kARAPlaybackTransformationNoChanges,
+    kARAContentUpdateEverythingChanged, kARAPlaybackTransformationNoChanges,
 };
 
 use crate::ara::host_controllers;
@@ -46,6 +47,12 @@ pub struct AraDocumentController {
     /// Copy of the plug-in's document controller vtable (fn pointers stay valid
     /// while the plug-in is loaded).
     interface: ARADocumentControllerInterface,
+    /// The host controller table handed to `createDocumentControllerWithDocument`.
+    /// ARA requires it (and everything it points to) to stay valid until the
+    /// document controller is destroyed — the plug-in keeps the pointer, not a
+    /// copy — so it is boxed and owned here, dropped only after
+    /// `destroyDocumentController` runs (Drop body precedes field drops).
+    _host_instance: Box<ARADocumentControllerHostInstance>,
 }
 
 impl AraDocumentController {
@@ -64,8 +71,10 @@ impl AraDocumentController {
         let api_generation = choose_api_generation(fac)?;
 
         // The assert function indirection must outlive uninitializeARA(); a
-        // 'static NULL (= no debug callback) satisfies that for release hosts.
-        static ARA_ASSERT: ARAAssertFunction = None;
+        // 'static satisfies that. Providing a real callback (rather than NULL)
+        // means an ARA contract violation surfaces as a logged diagnosis instead
+        // of the plug-in dereferencing a null assert handler and crashing.
+        static ARA_ASSERT: ARAAssertFunction = Some(ara_assert_callback);
         let config = ARAInterfaceConfiguration {
             structSize: core::mem::size_of::<ARAInterfaceConfiguration>(),
             desiredApiGeneration: api_generation,
@@ -74,6 +83,7 @@ impl AraDocumentController {
         let initialize = fac
             .initializeARAWithConfiguration
             .context("ARAFactory.initializeARAWithConfiguration is null")?;
+        crate::ara::trace(&format!("document.create: initializeARA (api gen {api_generation})"));
         unsafe { initialize(&config) };
 
         // From here on ARA is initialised, so any early return must uninitialise
@@ -88,13 +98,24 @@ impl AraDocumentController {
             }
         };
 
-        let host_instance = host_controllers::host_instance();
+        // Boxed so its address stays stable and outlives the call: ARA requires
+        // the host instance (and the interfaces it points to) to remain valid
+        // until the document controller is destroyed — the plug-in keeps this
+        // pointer, not a copy (ARAInterface.h: "must remain valid until all
+        // plug-in document controllers created with this struct have been
+        // destroyed"). A stack local here dangles after `create` returns and the
+        // plug-in crashes on the first model call (e.g. createMusicalContext).
+        // Hand the plug-in's own factory document-archive id to the host
+        // instance so our ArchivingController can return it from
+        // `getDocumentArchiveID` (ARA requires a non-null, non-empty id — the
+        // plug-in asserts on it during analysis).
+        let host_instance = Box::new(host_controllers::host_instance(fac.documentArchiveID));
         let properties = ARADocumentProperties {
             structSize: core::mem::size_of::<ARADocumentProperties>(),
             name: document_name.map_or(ptr::null(), |n| n.as_ptr().cast()),
         };
 
-        let instance_ptr = unsafe { create_controller(&host_instance, &properties) };
+        let instance_ptr = unsafe { create_controller(host_instance.as_ref(), &properties) };
         let Some(instance) = (unsafe { instance_ptr.as_ref() }) else {
             if let Some(uninit) = fac.uninitializeARA {
                 unsafe { uninit() };
@@ -107,12 +128,14 @@ impl AraDocumentController {
             !instance.documentControllerInterface.is_null(),
             "document controller instance has null interface"
         );
-        let interface = unsafe { ptr::read_unaligned(instance.documentControllerInterface) };
+        let interface = unsafe { crate::ara::read_versioned(instance.documentControllerInterface) };
+        crate::ara::trace("document.create: document controller ready");
 
         Ok(Self {
             factory,
             controller_ref,
             interface,
+            _host_instance: host_instance,
         })
     }
 
@@ -191,6 +214,26 @@ impl Drop for AraDocumentController {
     }
 }
 
+/// ARA assert callback (`ARAAssertFunction`). The plug-in calls this on a
+/// detected host programming error (invalid argument / state / thread); we log
+/// the category and diagnosis crash-proof so a contract violation is visible.
+unsafe extern "C" fn ara_assert_callback(
+    category: ara_sys::ARAAssertCategory,
+    _problematic_argument: *const core::ffi::c_void,
+    diagnosis: *const core::ffi::c_char,
+) {
+    let detail = if diagnosis.is_null() {
+        String::from("(null)")
+    } else {
+        unsafe { CStr::from_ptr(diagnosis) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    crate::ara::trace(&format!(
+        "!!! ARA ASSERT category={category} diagnosis={detail}"
+    ));
+}
+
 /// Negotiates the highest ARA API generation supported by both the plug-in and
 /// this host, erroring if the supported ranges do not overlap.
 fn choose_api_generation(factory: &ARAFactory) -> Result<ARAAPIGeneration> {
@@ -235,6 +278,23 @@ impl AraDocumentController {
     pub fn destroy_musical_context(&self, context: ARAMusicalContextRef) {
         if let Some(destroy) = self.interface.destroyMusicalContext {
             unsafe { destroy(self.controller_ref, context) };
+        }
+    }
+
+    /// Tell the plug-in the musical context content (tempo / bar signatures we
+    /// serve via the ContentAccess controller) changed, so it re-reads it. Used
+    /// to push the real song tempo after the context was created with a
+    /// placeholder. Must be called inside an editing bracket.
+    pub fn update_musical_context_content(&self, context: ARAMusicalContextRef) {
+        if let Some(update) = self.interface.updateMusicalContextContent {
+            unsafe {
+                update(
+                    self.controller_ref,
+                    context,
+                    ptr::null(),
+                    kARAContentUpdateEverythingChanged.0,
+                );
+            }
         }
     }
 
@@ -300,6 +360,53 @@ impl AraDocumentController {
         if let Some(set) = self.interface.enableAudioSourceSamplesAccess {
             unsafe { set(self.controller_ref, source, ARABool::from(enable)) };
         }
+    }
+
+    /// Explicitly ask the plug-in to analyse `source` for every content type it
+    /// can analyse (`ARAFactory::analyzeableContentTypes`). Without this a plug-in
+    /// is free to **postpone analysis indefinitely** (ARAInterface.h), which is
+    /// exactly what Melodyne does when driven head-less / without its editor —
+    /// leaving it nothing to render (silence). Call after sample access is
+    /// enabled, on the model thread, outside an editing cycle. The plug-in reads
+    /// samples on a background thread and reports completion via the
+    /// ModelUpdateController during `notify_model_updates`.
+    pub fn request_audio_source_content_analysis(&self, source: ARAAudioSourceRef) {
+        let Some(request) = self.interface.requestAudioSourceContentAnalysis else {
+            return;
+        };
+        let Some(fac) = (unsafe { self.factory.as_ref() }) else {
+            return;
+        };
+        let count = fac.analyzeableContentTypesCount;
+        let types = fac.analyzeableContentTypes;
+        if count == 0 || types.is_null() {
+            return;
+        }
+        unsafe { request(self.controller_ref, source, count, types) };
+        crate::ara::trace(&format!(
+            "ARA: requested content analysis ({count} content types)"
+        ));
+    }
+
+    /// Whether the plug-in's current license permits analysing its analyzeable
+    /// content types and rendering with no playback transformation — i.e. the
+    /// capabilities we use. `None` if the plug-in doesn't expose the call.
+    /// Returns `Some(false)` when the plug-in is loaded but not licensed for
+    /// these tasks (e.g. PACE/iLok authorization unavailable), which makes it
+    /// render silence. `run_dialog` asks the plug-in to pop its activation UI.
+    pub fn is_licensed_for_capabilities(&self, run_dialog: bool) -> Option<bool> {
+        let check = self.interface.isLicensedForCapabilities?;
+        let fac = unsafe { self.factory.as_ref() }?;
+        let result = unsafe {
+            check(
+                self.controller_ref,
+                ARABool::from(run_dialog),
+                fac.analyzeableContentTypesCount,
+                fac.analyzeableContentTypes,
+                kARAPlaybackTransformationNoChanges.0,
+            )
+        };
+        Some(result != 0)
     }
 
     pub fn destroy_audio_source(&self, source: ARAAudioSourceRef) {

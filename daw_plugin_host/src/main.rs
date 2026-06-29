@@ -32,8 +32,8 @@ use tokio::sync::mpsc as tmpsc;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, PostThreadMessageW,
-    TranslateMessage, WM_APP,
+    DispatchMessageW, GetMessageW, KillTimer, MSG, PM_REMOVE, PeekMessageW, PostThreadMessageW,
+    SetTimer, TranslateMessage, WM_APP, WM_TIMER,
 };
 
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, load_plugin};
@@ -41,6 +41,12 @@ use crate::plugin_instance::{HostCallbacks, LoadedPlugin, load_plugin};
 /// Custom Win32 message id used to wake the plugin-main thread's `GetMessage`
 /// loop after a command has been pushed into the mpsc queue.
 const WM_COMMAND_WAKE: u32 = WM_APP + 1;
+
+/// (r.md #5 ARA2) Thread-timer id + interval used by the plugin-main thread to
+/// pump every loaded ARA document's `notifyModelUpdates` (which ARA requires the
+/// host to call periodically so the plug-in can finish background analysis).
+const ARA_NOTIFY_TIMER_ID: usize = 1;
+const ARA_NOTIFY_TIMER_MS: u32 = 30;
 
 /// Track-and-device-index-addressed events pushed from the plugin-main thread
 /// (or its CLAP callbacks) to the IPC sender.
@@ -359,6 +365,8 @@ enum PluginCommand {
         track: u32,
         index: u32,
         clips: Vec<common::protocol::AraClipSpec>,
+        bpm: f64,
+        time_sig: (u16, u16),
         archive: Option<Vec<u8>>,
     },
     /// (r.md #5 ARA2) Tear down the ARA session for the plugin at `track`/`index`.
@@ -499,6 +507,31 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // one-shot ARA bring-up self-test (r.md #5). Loads a plug-in and runs the
+    // exact load-time ARA sequence (factory → document controller → model graph
+    // → bind) on a dedicated thread, mirroring the plugin-main thread (no COM
+    // init, no message pump — neither is used during ARA bring-up). Each step is
+    // flushed to stdout, so a plug-in segfault pinpoints the exact crashing call
+    // (the last printed line) without an interactive round-trip — unlike the
+    // rolling `non_blocking` log, which loses in-flight lines on a hard crash.
+    // Exits immediately; never reaches the IPC handshake. An optional 4th arg is
+    // a WAV path attached as a clip to exercise the audio-source/region path.
+    if std::env::args().nth(1).as_deref() == Some("--ara-selftest") {
+        let path = std::env::args().nth(2).context("--ara-selftest needs <path>")?;
+        let target_id = std::env::args().nth(3).unwrap_or_default();
+        let wav = std::env::args().nth(4);
+        let joined = std::thread::spawn(move || {
+            ara_selftest(std::path::Path::new(&path), &target_id, wav.as_deref())
+        })
+        .join();
+        match joined {
+            Ok(Ok(())) => println!("ara-selftest: SUCCESS"),
+            Ok(Err(e)) => println!("ara-selftest: ERROR {e:#}"),
+            Err(_) => println!("ara-selftest: PANIC on worker thread"),
+        }
+        return Ok(());
+    }
+
     let pipe_name = std::env::args()
         .nth(1)
         .context("expected pipe name as first argument")?;
@@ -520,6 +553,197 @@ async fn main() -> Result<()> {
     plugin_thread.shutdown();
     tracing::info!("daw_plugin_host exiting");
     Ok(())
+}
+
+/// Headless ARA bring-up self-test (see the `--ara-selftest` dispatch in
+/// [`main`]). Runs the same calls the `SetSlotPlugin` handler makes at load
+/// time, with synchronous stdout tracing so the crashing step is visible even
+/// on a hard plug-in segfault.
+fn ara_selftest(path: &std::path::Path, target_id: &str, wav: Option<&str>) -> Result<()> {
+    use std::io::Write;
+    let step = |msg: &str| {
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "ara-selftest: {msg}");
+        let _ = out.flush();
+    };
+
+    let format = if path.extension().and_then(|e| e.to_str()) == Some("clap") {
+        PluginFormat::Clap
+    } else {
+        PluginFormat::Vst3
+    };
+    step(&format!("loading {} as {format:?} (target_id={target_id:?})", path.display()));
+    let mut plugin = load_plugin(format, path, target_id, HostCallbacks::noop())
+        .context("load_plugin failed")?;
+    step("loaded ok; calling bind_ara_if_capable");
+    let bound = plugin
+        .bind_ara_if_capable()
+        .context("bind_ara_if_capable failed")?;
+    step(&format!("bind_ara_if_capable returned {bound}"));
+    if bound {
+        let clips: Vec<common::protocol::AraClipSpec> = match wav {
+            Some(w) => {
+                step(&format!("building clip from {w}"));
+                vec![common::protocol::AraClipSpec {
+                    source: common::protocol::AraSourceSpec::WavFile(std::path::PathBuf::from(w)),
+                    persistent_id: "ara-selftest-source-1".to_string(),
+                    start_in_playback_seconds: 0.0,
+                    duration_in_playback_seconds: 10.0,
+                    start_in_modification_seconds: 0.0,
+                    duration_in_modification_seconds: 10.0,
+                }]
+            }
+            None => Vec::new(),
+        };
+        step(&format!("calling setup_ara with {} clip(s)", clips.len()));
+        let _ = plugin.setup_ara(&clips, 120.0, (4, 4), None);
+        step("setup_ara returned");
+
+        // Activate AFTER the ARA bind + region setup (ARA requires bind before
+        // the first activate; addPlaybackRegion requires the instance inactive),
+        // mirroring the real engine's install_plugin. Without this the render
+        // loop below calls process() on an inactive plug-in and only ever sees
+        // silence — a test artifact, not the real render behaviour.
+        match plugin.activate(48_000.0, 64, 512) {
+            Ok(()) => step("plugin activated"),
+            Err(e) => step(&format!("activate failed: {e:#}")),
+        }
+        let _ = plugin.start_processing();
+
+        // (r.md #5 ARA2) Render repro: a render thread drives process() (exclusive
+        // `&mut *ptr`, like a worker-pool thread) while this thread pumps
+        // `notifyModelUpdates` (like plugin-main). Reports process() count, the
+        // analysis sample-reads, and the output peak (non-zero = real render).
+        if wav.is_some() {
+            ara_render_concurrency_test(&mut plugin, &step);
+        }
+    }
+    step("dropping plugin (teardown)");
+    drop(plugin);
+    step("teardown complete");
+    Ok(())
+}
+
+/// Headless reproduction of the ARA realtime-render concurrency: a render thread
+/// drives `process()` (exclusive `&mut`, like a worker-pool thread) while the
+/// caller's thread pumps `notifyModelUpdates` (like plugin-main). Reports if
+/// `process()` stalls (the symptom seen with Melodyne).
+fn ara_render_concurrency_test(plugin: &mut Box<dyn LoadedPlugin>, step: &dyn Fn(&str)) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    // Raw pointer shared by both threads — the exact aliasing the real host has
+    // (worker `&mut *ptr` for process vs plugin-main `&*ptr` for notify).
+    struct SendPtr(*mut (dyn LoadedPlugin + 'static));
+    unsafe impl Send for SendPtr {}
+    let ptr: *mut (dyn LoadedPlugin + 'static) = &mut **plugin;
+
+    let render_count = Arc::new(AtomicU64::new(0));
+    let in_process = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    // Max abs output sample seen, in micro-units (peak * 1e6) — non-zero means
+    // Melodyne actually rendered audio for the region.
+    let peak_micros = Arc::new(AtomicU64::new(0));
+
+    let render_ptr = SendPtr(ptr);
+    let rc = Arc::clone(&render_count);
+    let ip = Arc::clone(&in_process);
+    let st = Arc::clone(&stop);
+    let pk = Arc::clone(&peak_micros);
+    let render = std::thread::spawn(move || {
+        let render_ptr = render_ptr;
+        let sr = 48_000u32;
+        let frames = 512u32;
+        let silence = vec![0.0f32; frames as usize];
+        let input: Vec<&[f32]> = vec![&silence, &silence];
+        let mut playhead = 0u64;
+        while !st.load(Ordering::Relaxed) {
+            let transport = crate::plugin_instance::TransportContext {
+                bpm: 120.0,
+                sample_rate: sr,
+                // Mimic the real engine: `ProcessData::steady_time` is never set
+                // (stays 0), so `playhead_samples` is 0 and the true position
+                // lives in `song_pos_beats` (which advances + loops with the
+                // song). This is exactly the condition that froze ARA render.
+                playhead_samples: 0,
+                song_pos_beats: playhead as f64 * 120.0 / (60.0 * f64::from(sr)),
+                tsig_num: 4,
+                tsig_denom: 4,
+                is_playing: true,
+                is_looping: false,
+                loop_start_beats: 0.0,
+                loop_end_beats: 0.0,
+            };
+            ip.store(true, Ordering::SeqCst);
+            let _ = unsafe { (*render_ptr.0).process(frames, &[], &[], &input, &[], &transport) };
+            ip.store(false, Ordering::SeqCst);
+            // Scan main-output channels for the peak (proves real rendering).
+            let mut m = 0.0f32;
+            for ch in 0..2 {
+                if let Some(out) = unsafe { (*render_ptr.0).output_buffer(ch) } {
+                    for &s in out.iter().take(frames as usize) {
+                        m = m.max(s.abs());
+                    }
+                }
+            }
+            pk.fetch_max((m * 1_000_000.0) as u64, Ordering::Relaxed);
+            rc.fetch_add(1, Ordering::SeqCst);
+            playhead += u64::from(frames);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+
+    // This thread = plugin-main: pump notify every ~30 ms and watch the render
+    // counter. ~500 rounds * 30 ms ≈ 15 s.
+    let mut last = 0u64;
+    let mut stalled_rounds = 0u32;
+    let mut hung = false;
+    for round in 0..500u32 {
+        unsafe { (*ptr).notify_ara_model_updates() };
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let now = render_count.load(Ordering::SeqCst);
+        if now == last {
+            stalled_rounds += 1;
+            // ~100 rounds * 30 ms ≈ 3 s with no progress = a real stall.
+            if stalled_rounds >= 100 {
+                step(&format!(
+                    "RENDER STALLED: process() count stuck at {now} (in_process={}) after round {round}",
+                    in_process.load(Ordering::SeqCst)
+                ));
+                hung = true;
+                break;
+            }
+        } else {
+            stalled_rounds = 0;
+            last = now;
+        }
+        if round % 50 == 0 {
+            let reads = crate::ara::host_controllers::AUDIO_READ_SAMPLES_CALLS
+                .load(Ordering::Relaxed);
+            step(&format!(
+                "render progress: {now} process() calls, {reads} analysis sample-reads (round {round})"
+            ));
+        }
+    }
+    let reads = crate::ara::host_controllers::AUDIO_READ_SAMPLES_CALLS.load(Ordering::Relaxed);
+    let peak = peak_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    if !hung {
+        step(&format!(
+            "render OK: {} process() calls, {reads} analysis sample-reads, output peak={peak:.4}, no stall",
+            render_count.load(Ordering::SeqCst)
+        ));
+    } else {
+        step(&format!("(at stall: {reads} sample-reads, output peak={peak:.4})"));
+    }
+    stop.store(true, Ordering::SeqCst);
+    // If process() is hung the render thread can't observe `stop`; don't block
+    // teardown on its join in that case.
+    if hung {
+        step("(render thread left detached — process() is stuck)");
+        std::mem::forget(render);
+    } else {
+        let _ = render.join();
+    }
 }
 
 // --- PluginThread wrapper --------------------------------------------------
@@ -726,6 +950,15 @@ fn plugin_main_loop(
     };
 
     tracing::info!("plugin-main thread running");
+
+    // (r.md #5 ARA2) The plugin-main thread pumps every live ARA document's
+    // `notifyModelUpdates` from a thread timer (hwnd = None → WM_TIMER posts to
+    // this thread's queue, waking the `GetMessageW` loop). ARA requires periodic
+    // pumping so the plug-in can finish background analysis; without it Melodyne
+    // renders silence. The timer is started/stopped to match whether any ARA
+    // session is loaded, so a project with no ARA plug-ins never wakes this
+    // thread needlessly.
+    let mut ara_timer_active = false;
 
     loop {
         loop {
@@ -1507,9 +1740,9 @@ fn plugin_main_loop(
                     };
                     let _ = evt_tx.send(PluginEvent::SlotPluginState { track, index, data });
                 }
-                PluginCommand::SetupAraDocument { track, index, clips, archive } => {
+                PluginCommand::SetupAraDocument { track, index, clips, bpm, time_sig, archive } => {
                     match tracks.plugin_at_mut(track, index) {
-                        Some(plugin) => match plugin.setup_ara(&clips, archive.as_deref()) {
+                        Some(plugin) => match plugin.setup_ara(&clips, bpm, time_sig, archive.as_deref()) {
                             Ok(true) => {
                                 tracing::info!(track, index, n = clips.len(), "ARA document set up");
                             }
@@ -1674,19 +1907,41 @@ fn plugin_main_loop(
             close_slot_gui(&mut tracks, &mut editor_windows, track, index, &evt_tx);
         }
 
+        // (r.md #5 ARA2) Match the ARA notify timer to the current ARA-session
+        // population: start it when the first ARA document loads, stop it when
+        // the last unloads — derived from live state so it tracks every add /
+        // remove path without per-handler bookkeeping.
+        let want_ara_timer = tracks.has_any_ara_session();
+        if want_ara_timer && !ara_timer_active {
+            unsafe { SetTimer(None, ARA_NOTIFY_TIMER_ID, ARA_NOTIFY_TIMER_MS, None) };
+            ara_timer_active = true;
+        } else if !want_ara_timer && ara_timer_active {
+            let _ = unsafe { KillTimer(None, ARA_NOTIFY_TIMER_ID) };
+            ara_timer_active = false;
+        }
+
         unsafe {
             let mut msg = MSG::default();
             let ret = GetMessageW(&mut msg, Some(HWND(std::ptr::null_mut())), 0, 0);
             if ret.0 <= 0 {
                 break;
             }
-            if msg.message != WM_COMMAND_WAKE {
+            if msg.message == WM_TIMER && msg.wParam.0 == ARA_NOTIFY_TIMER_ID {
+                // (r.md #5 ARA2) Pump every ARA document's deferred analysis /
+                // model updates. A NULL-hwnd WM_TIMER isn't dispatched to a
+                // WNDPROC, so it must be handled here directly.
+                tracks.mutate(|t| t.notify_ara_model_updates());
+            } else if msg.message != WM_COMMAND_WAKE {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
     }
 
+    // (r.md #5 ARA2) stop the ARA notify timer before tearing down.
+    if ara_timer_active {
+        let _ = unsafe { KillTimer(None, ARA_NOTIFY_TIMER_ID) };
+    }
     // worker pool を先に shutdown して、 worker thread が止まってから
     // plugin を drop する。 順序を逆にすると UAF。
     if let Some(pool) = worker_pool.take() {
@@ -2098,9 +2353,9 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(track, index, "received RequestSlotState");
             plugin.send(PluginCommand::RequestSlotState { track, index });
         }
-        MainToChild::SetupAraDocument { track, index, clips, archive } => {
-            tracing::info!(track, index, n = clips.len(), has_archive = archive.is_some(), "received SetupAraDocument");
-            plugin.send(PluginCommand::SetupAraDocument { track, index, clips, archive });
+        MainToChild::SetupAraDocument { track, index, clips, bpm, time_sig, archive } => {
+            tracing::info!(track, index, n = clips.len(), bpm, has_archive = archive.is_some(), "received SetupAraDocument");
+            plugin.send(PluginCommand::SetupAraDocument { track, index, clips, bpm, time_sig, archive });
         }
         MainToChild::ClearAraDocument { track, index } => {
             tracing::info!(track, index, "received ClearAraDocument");
@@ -2335,6 +2590,26 @@ impl Tracks {
     ) -> Option<&mut (dyn LoadedPlugin + '_)> {
         self.chains.get_mut(&track_id).and_then(|c| c.plugin_at_mut(index))
     }
+
+    /// (r.md #5 ARA2) Pump every loaded plug-in's ARA document. ARA requires the
+    /// host to call `notifyModelUpdates` periodically (while not editing) so the
+    /// plug-in can finish background analysis; the plugin-main thread calls this
+    /// from a Win32 timer. No-op for non-ARA plug-ins.
+    fn notify_ara_model_updates(&mut self) {
+        for chain in self.chains.values_mut() {
+            for device in &mut chain.devices {
+                device.notify_ara_model_updates();
+            }
+        }
+    }
+
+    /// (r.md #5 ARA2) Whether any loaded plug-in currently holds an ARA session
+    /// (gates the plugin-main thread's `notifyModelUpdates` timer).
+    fn has_any_ara_session(&self) -> bool {
+        self.chains
+            .values()
+            .any(|c| c.devices.iter().any(|d| d.has_ara_session()))
+    }
 }
 
 /// 全 track の signal chain を持つ RAII owner。 mutation は `mutate`
@@ -2362,6 +2637,11 @@ impl TracksHandle {
         index: u32,
     ) -> Option<&mut (dyn LoadedPlugin + '_)> {
         self.tracks.plugin_at_mut(track, index)
+    }
+
+    /// (r.md #5 ARA2) Whether any loaded plug-in holds an ARA session.
+    fn has_any_ara_session(&self) -> bool {
+        self.tracks.has_any_ara_session()
     }
 
     /// 内部 `Tracks` に `f` を適用する。 process_server の worker pool

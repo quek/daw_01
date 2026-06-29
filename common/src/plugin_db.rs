@@ -104,7 +104,11 @@ impl PluginEntry {
 /// v23: `has_audio_input` を追加したので 1 → 2 (= 既存 cache を再 probe させる)。
 /// `has_video_input`/`has_video_output` を追加し probe 行を 6 キー化したので
 /// 2 → 3 (= 旧 4-キー probe 結果の cache を再 probe させ、外部 plugin の video=false を確定)。
-pub const PORT_PROBE_VERSION: u32 = 3;
+/// (r.md #5 ARA2) scan に ARA 検出 (CLAP `ara:supported` feature / VST3 `ARA Main
+/// Factory Class` ペアリング) を追加したので 3 → 4 (= 旧 cache を再スキャンさせ、
+/// 既存プラグインに `ara:supported` を付与する。これが無いと `is_ara()` が false の
+/// ままで `sync_ara_documents` が `SetupAraDocument` を送らず ARA が無音になる)。
+pub const PORT_PROBE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginDatabase {

@@ -1799,6 +1799,8 @@ impl ClapPlugin {
     pub fn setup_ara(
         &mut self,
         clips: &[common::protocol::AraClipSpec],
+        bpm: f64,
+        time_sig: (u16, u16),
         archive: Option<&[u8]>,
     ) -> Result<bool> {
         if self.ara.is_none() {
@@ -1813,7 +1815,7 @@ impl ClapPlugin {
             self.deactivate();
         }
         if let Some(session) = self.ara.as_mut() {
-            session.set_clips(clips);
+            session.set_clips(clips, bpm, time_sig);
         }
         if let Some(archive) = archive.filter(|a| !a.is_empty())
             && let Some(session) = self.ara.as_ref()
@@ -2120,13 +2122,25 @@ impl LoadedPlugin for ClapPlugin {
     fn setup_ara(
         &mut self,
         clips: &[common::protocol::AraClipSpec],
+        bpm: f64,
+        time_sig: (u16, u16),
         archive: Option<&[u8]>,
     ) -> Result<bool> {
-        self.setup_ara(clips, archive)
+        self.setup_ara(clips, bpm, time_sig, archive)
     }
 
     fn clear_ara(&mut self) {
         self.clear_ara();
+    }
+
+    fn notify_ara_model_updates(&self) {
+        if let Some(session) = self.ara.as_ref() {
+            session.notify_model_updates();
+        }
+    }
+
+    fn has_ara_session(&self) -> bool {
+        self.ara.is_some()
     }
 
     fn store_ara_archive(&self) -> Option<Vec<u8>> {

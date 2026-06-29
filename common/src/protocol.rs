@@ -708,6 +708,11 @@ pub enum MainToChild {
         track: u32,
         index: u32,
         clips: Vec<AraClipSpec>,
+        /// Project tempo (bpm) and time signature (numerator, denominator). Fed
+        /// into the ARA musical context so the plug-in's editor grid / bar lines
+        /// align to the song instead of a hard-coded default. (r.md #5)
+        bpm: f64,
+        time_sig: (u16, u16),
         /// Prior ARA edit archive to restore after (re)building the document
         /// (from `PluginInstance.ara_archive`). `None` for a fresh document.
         archive: Option<Vec<u8>>,

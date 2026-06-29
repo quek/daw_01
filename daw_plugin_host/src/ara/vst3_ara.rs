@@ -135,8 +135,10 @@ pub unsafe fn ara_factory_from_component(
     component: &ComPtr<IComponent>,
 ) -> Option<*const ARAFactory> {
     let entry = component.cast::<IPlugInEntryPoint>()?;
+    tracing::info!("VST3 ARA: IPlugInEntryPoint cast ok; calling getFactory");
     let ptr = entry.as_ptr();
     let factory = unsafe { ((*(*ptr).vtbl).get_factory)(ptr) };
+    tracing::info!(factory = ?factory, "VST3 ARA: getFactory returned");
     (!factory.is_null()).then_some(factory)
 }
 
@@ -154,6 +156,7 @@ pub unsafe fn bind(
     assigned_roles: ARAPlugInInstanceRoleFlags,
 ) -> Option<*const ARAPlugInExtensionInstance> {
     let entry = component.cast::<IPlugInEntryPoint2>()?;
+    tracing::info!("VST3 ARA: IPlugInEntryPoint2 cast ok; calling bindToDocumentControllerWithRoles");
     let ptr = entry.as_ptr();
     let instance = unsafe {
         ((*(*ptr).vtbl).bind_to_document_controller_with_roles)(
@@ -163,5 +166,6 @@ pub unsafe fn bind(
             assigned_roles,
         )
     };
+    tracing::info!(instance = ?instance, "VST3 ARA: bindToDocumentControllerWithRoles returned");
     (!instance.is_null()).then_some(instance)
 }

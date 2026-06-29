@@ -881,6 +881,8 @@ impl LoadedPlugin for Vst3Plugin {
     fn setup_ara(
         &mut self,
         clips: &[common::protocol::AraClipSpec],
+        bpm: f64,
+        time_sig: (u16, u16),
         archive: Option<&[u8]>,
     ) -> Result<bool> {
         if self.ara.is_none() {
@@ -894,7 +896,7 @@ impl LoadedPlugin for Vst3Plugin {
             self.deactivate();
         }
         if let Some(session) = self.ara.as_mut() {
-            session.set_clips(clips);
+            session.set_clips(clips, bpm, time_sig);
         }
         if let Some(archive) = archive.filter(|a| !a.is_empty())
             && let Some(session) = self.ara.as_ref()
@@ -924,6 +926,16 @@ impl LoadedPlugin for Vst3Plugin {
         {
             let _ = self.activate(sample_rate, min_frames, max_frames);
         }
+    }
+
+    fn notify_ara_model_updates(&self) {
+        if let Some(session) = self.ara.as_ref() {
+            session.notify_model_updates();
+        }
+    }
+
+    fn has_ara_session(&self) -> bool {
+        self.ara.is_some()
     }
 
     fn store_ara_archive(&self) -> Option<Vec<u8>> {
@@ -1429,13 +1441,19 @@ impl LoadedPlugin for Vst3Plugin {
             i32::from(transport.tsig_num.max(1));
         self.process_context.timeSigDenominator =
             i32::from(transport.tsig_denom.max(1));
-        // VST3 spec: `TSamples` は i64 absolute sample position。
-        // playhead_samples は u64 だが通常使用範囲では i64 に収まる
-        // (= 2^63-1 sample @ 96 kHz で約 3 千年)。 saturating で防御。
-        let playhead_i64 = i64::try_from(transport.playhead_samples)
-            .unwrap_or(i64::MAX);
-        self.process_context.projectTimeSamples = playhead_i64;
-        self.process_context.continousTimeSamples = playhead_i64;
+        // VST3 spec: `projectTimeSamples` is the song-relative sample position.
+        // The engine doesn't populate `ProcessData::steady_time` (it stays 0), so
+        // `transport.playhead_samples` is unusable here — deriving the sample
+        // position from the authoritative `song_pos_beats` keeps it consistent
+        // with `projectTimeMusic` and with the ARA playback regions (whose
+        // playback times daw_gui also derives from beats via the song tempo).
+        // Without this, ARA plug-ins (Melodyne) see a frozen position 0 and
+        // render the region's first frame forever (a constant tone), instead of
+        // following the transport. saturating cast guards a pathological value.
+        let song_pos_samples =
+            (song_pos_beats * 60.0 / bpm_f * self.sample_rate).max(0.0) as i64;
+        self.process_context.projectTimeSamples = song_pos_samples;
+        self.process_context.continousTimeSamples = song_pos_samples;
         self.process_context.projectTimeMusic = song_pos_beats;
         self.process_context.barPositionMusic = bar_start_beats;
         self.process_context.cycleStartMusic = transport.loop_start_beats;
@@ -1684,6 +1702,13 @@ impl LoadedPlugin for Vst3Plugin {
         // into_raw — setFrame does addRef internally so ownership is balanced.
         let _ = unsafe { ComPtr::<vst3::Steinberg::IPlugFrame>::from_raw(frame_ptr) };
         self.view = Some(view);
+        // (r.md #5 ARA2) The editor view now exists — push the current ARA
+        // selection so the plug-in's editor displays the track's regions. ARA
+        // requires this on (re-)opening the view; doing it only at document
+        // setup (before the view existed) left Melodyne's timeline empty.
+        if let Some(session) = self.ara.as_ref() {
+            session.notify_editor_selection();
+        }
         Ok(())
     }
 

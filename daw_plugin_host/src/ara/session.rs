@@ -20,14 +20,15 @@ use std::ffi::CString;
 use anyhow::{Context, Result};
 use ara_sys::{
     ARAAudioModificationRef, ARAAudioSourceHostRef, ARAAudioSourceRef, ARADocumentControllerRef,
-    ARAFactory, ARAMusicalContextRef, ARAPlaybackRegionRef, ARAPlugInExtensionInstance,
-    ARARegionSequenceRef,
+    ARAFactory, ARAMusicalContextHostRef, ARAMusicalContextRef, ARAPlaybackRegionRef,
+    ARAPlugInExtensionInstance, ARARegionSequenceRef,
 };
 use common::protocol::{AraClipSpec, AraSourceSpec};
 
 use crate::ara::audio_source::AraAudioSourceHost;
 use crate::ara::document::AraDocumentController;
 use crate::ara::extension::AraPlugInExtension;
+use crate::ara::host_controllers::AraMusicalContextHost;
 
 // The clip/source spec is defined once in `common::protocol`
 // ([`AraClipSpec`] / [`AraSourceSpec`]) since it crosses the IPC boundary; this
@@ -49,6 +50,11 @@ struct OwnedAraSource {
 /// drop before `controller`, whose `Drop` destroys the document controller and
 /// uninitialises ARA last.
 pub struct AraSession {
+    /// Host-side tempo / bar signature served to the plug-in via the
+    /// ContentAccess controller. Boxed so its address (the
+    /// `ARAMusicalContextHostRef` the plug-in holds) stays stable; updated in
+    /// place by [`Self::set_musical_context`].
+    musical_context_host: Box<AraMusicalContextHost>,
     musical_context: ARAMusicalContextRef,
     region_sequence: ARARegionSequenceRef,
     sources: Vec<OwnedAraSource>,
@@ -76,22 +82,38 @@ impl AraSession {
     {
         let controller = unsafe { AraDocumentController::create(factory, None) }?;
 
+        // Box the host's tempo/bar model first: its address is the opaque
+        // `ARAMusicalContextHostRef` the plug-in keeps and passes back to our
+        // ContentAccess controller, so it must be stable and outlive the
+        // musical context.
+        let mut musical_context_host = Box::new(AraMusicalContextHost::default());
+        let musical_context_host_ref =
+            std::ptr::from_mut(musical_context_host.as_mut()) as ARAMusicalContextHostRef;
+
         controller.begin_editing();
         let musical_context = controller
-            .create_musical_context(std::ptr::null_mut(), 0)
+            .create_musical_context(musical_context_host_ref, 0)
             .context("plug-in returned null musical context")?;
         let region_sequence = controller
             .create_region_sequence(std::ptr::null_mut(), 0, musical_context)
             .context("plug-in returned null region sequence")?;
         controller.end_editing();
+        crate::ara::trace("session.create: model graph built; binding instance");
 
         // Bind while the instance is still inactive (before its first activate).
         let instance_ptr = bind(controller.controller_ref())
             .context("ARA bind_to_document_controller returned null")?;
         let extension = unsafe { AraPlugInExtension::from_instance_ptr(instance_ptr) }
             .context("null ARA plug-in extension instance")?;
+        crate::ara::trace(&format!(
+            "session.create: instance bound; playback_renderer={}, editor_renderer={}, isLicensed={:?}",
+            extension.has_playback_renderer(),
+            extension.has_editor_renderer(),
+            controller.is_licensed_for_capabilities(false),
+        ));
 
         Ok(Self {
+            musical_context_host,
             musical_context,
             region_sequence,
             sources: Vec::new(),
@@ -107,12 +129,22 @@ impl AraSession {
     /// The caller must ensure the plug-in is **inactive** — ARA's
     /// `addPlaybackRegion` / `removePlaybackRegion` (and detaching regions before
     /// destroying them) require it.
-    pub fn set_clips(&mut self, clips: &[AraClipSpec]) {
+    pub fn set_clips(&mut self, clips: &[AraClipSpec], bpm: f64, time_sig: (u16, u16)) {
         // Detach + destroy the current sources / regions, freeing their host data.
         for owned in &self.sources {
             self.extension.remove_playback_region(owned.region_ref);
         }
         self.controller.begin_editing();
+        // Update the musical context to the real song tempo / time signature so
+        // the plug-in's editor grid (bars/beats) aligns to the project instead of
+        // the placeholder created at bind time. The content controller reads
+        // these from the boxed host model, so update it then tell the plug-in to
+        // re-read via updateMusicalContextContent.
+        self.musical_context_host.seconds_per_quarter = 60.0 / bpm.max(1.0);
+        self.musical_context_host.bar_numerator = i32::from(time_sig.0.max(1));
+        self.musical_context_host.bar_denominator = i32::from(time_sig.1.max(1));
+        self.controller
+            .update_musical_context_content(self.musical_context);
         for owned in &self.sources {
             self.controller.destroy_playback_region(owned.region_ref);
             self.controller.destroy_audio_modification(owned.modification_ref);
@@ -138,11 +170,48 @@ impl AraSession {
         for owned in &new_sources {
             self.controller
                 .enable_audio_source_samples_access(owned.source_ref, true);
+            // Force analysis now; otherwise the plug-in may postpone it forever
+            // (no editor / head-less), leaving nothing to render.
+            self.controller
+                .request_audio_source_content_analysis(owned.source_ref);
         }
         for owned in &new_sources {
             self.extension.add_playback_region(owned.region_ref);
         }
         self.sources = new_sources;
+
+        // Note: we deliberately do NOT assign regions/sequences to the *editor*
+        // renderer here. That renderer is for transient preview audio and the
+        // plug-in asserts its preview-region list stays empty otherwise
+        // (Melodyne: `getPlaybackRegionsForPreview()->getCount()` must be 0).
+        // What populates the editor's timeline is the editor-view *selection*,
+        // pushed below and re-pushed when the editor view opens.
+        self.notify_editor_selection();
+    }
+
+    /// Drive the plug-in's deferred model work / analysis. ARA requires the host
+    /// to call this periodically while not editing — it is the only point at
+    /// which the plug-in may progress background analysis and flush pending
+    /// model-update notifications. Skipping it leaves e.g. Melodyne's audio
+    /// analysis unfinished, so playback rendering produces silence.
+    pub fn notify_model_updates(&self) {
+        self.controller.notify_model_updates();
+    }
+
+    /// Tell the plug-in's editor view which regions / sequences are selected, so
+    /// its editor displays them. ARA requires this whenever the plug-in view is
+    /// (re-)opened (ARAInterface.h: "the host should send an update of the
+    /// selection when (re-)opening an ARA plug-in view"), so the GUI path calls
+    /// this right after creating the editor view — without it Melodyne's timeline
+    /// stays empty even though playback renders.
+    pub fn notify_editor_selection(&self) {
+        if self.sources.is_empty() {
+            return;
+        }
+        let region_refs: Vec<ARAPlaybackRegionRef> =
+            self.sources.iter().map(|o| o.region_ref).collect();
+        self.extension
+            .notify_selection(&region_refs, &[self.region_sequence]);
     }
 
     /// Serialise the plug-in's ARA edit state for project save.
