@@ -3813,7 +3813,14 @@ impl Default for AudioEvent {
             pan: 0.0,
             pitch_semitones: 0.0,
             formant_semitones: 0.0,
-            stretch_mode: StretchMode::Raw,
+            // 新規 audio clip は既定で tempo 追従 (= MIDI clip と同じく
+            // project bpm 変更に拍を固定して伸縮、 ピッチ保持の granular)。
+            // ワンショット等で追従させたくない場合は inspector の
+            // stretch-mode セレクタで Raw に切り替える (= Bitwig Raw /
+            // Ableton Warp-off 相当)。 enum `StretchMode::#[default]` は
+            // Raw のまま (= このフィールドの deserialize default には
+            // 使われず、 保存済みプロジェクトの mode は格納値を維持)。
+            stretch_mode: StretchMode::Stretch,
             fade_in_beats: 0.0,
             fade_out_beats: 0.0,
             fade_in_curve: FadeCurve::Linear,

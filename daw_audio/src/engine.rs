@@ -352,18 +352,24 @@ pub struct LocalState {
     /// 再生できないので song.bpm で linear 推定)。 初期値 `u64::MAX` は
     /// 「未確定」 (= 最初の buffer は必ず seek 扱いで初期化される)。
     pub last_known_playhead: u64,
-    /// Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio
-    /// (= current_bpm / song.bpm)。 audio_clip_renderer の granular_sample_at
-    /// で grain の source 内 offset を計算するときに使う。 instantaneous な
-    /// tempo_ratio を直接使うと、 buffer 越しに tempo が変わったとき
-    /// `grain_source_offset = k * HOP * tempo_ratio` が past grain でも更新
-    /// されてしまい、 grain 中で source pos が discontinuous → click。
-    /// LP smoothing で per-buffer の `Δtempo_ratio` を小さく抑え、 active
-    /// grain (= life 2*HOP ~ 1024 samples ≒ 1 buffer @ 512) 内での source
-    /// pos jump を低減する。 完全な stateful grain-trigger lock-in は別 phase
-    /// (= per-event state 必要、 worker pool に &mut を通す refactor が要)。
-    /// 初期値 1.0 (= nominal)、 LP coef は process_buffer で `~50ms TC` 相当。
-    pub granular_tempo_smoothed: f64,
+    /// Phase 5 follow-up (granular DSP click 抑制): LP smoothed **絶対**
+    /// `current_bpm` (= SongTempo curve eval 後の現テンポ、 単位は BPM)。
+    /// audio_clip_renderer の Stretch mode (granular_sample_at) が
+    /// `tempo_follow_ratio(stretch_ratio, smoothed_current_bpm, nominal_bpm)`
+    /// で source 進度を求めるのに使う。 nominal_bpm は per-event の compile時
+    /// song.bpm なので、 base bpm を変えても (= song.bpm 自身が動いても)
+    /// `smoothed_current_bpm / nominal_bpm` が正しく追従する (= 旧実装は
+    /// `current_bpm / song.bpm` を平滑化していて base bpm 変更に追従しなかった、
+    /// r.md #6)。 instantaneous な bpm を直接使うと buffer 越しに tempo が
+    /// 変わったとき `grain_source_offset = k * HOP * ratio` が past grain でも
+    /// 更新され grain 中で source pos が discontinuous → click。 LP smoothing で
+    /// per-buffer の Δbpm を抑え、 active grain (= life 2*HOP ~ 1024 samples ≒
+    /// 1 buffer @ 512) 内の source pos jump を低減する。 完全な stateful
+    /// grain-trigger lock-in は別 phase (= per-event state 必要、 worker pool に
+    /// &mut を通す refactor が要)。 Repitch / Slice は instant `current_bpm` を
+    /// 使う (= 追随性優先)。 初期値 120.0 BPM、 LP coef は process_buffer で
+    /// `~50ms TC` 相当。
+    pub smoothed_current_bpm: f64,
     /// Phase 7 B3 (2026-05-13): metronome click voice 状態 (mono single-voice、
     /// per-buffer で beat 境界を検出して trigger、 sine + linear envelope decay)。
     /// `Some` なら active (= まだ decay 中)、 `None` なら idle。 連続 beat で
@@ -423,7 +429,7 @@ impl LocalState {
             playing: false,
             playhead_beats: 0.0,
             last_known_playhead: u64::MAX,
-            granular_tempo_smoothed: 1.0,
+            smoothed_current_bpm: 120.0,
             metronome_voice: None,
             cmd_rx,
             shared,
@@ -848,26 +854,31 @@ impl LocalState {
         // plugin transport の IS_LOOP_ACTIVE / looping field に渡す。
         // (buffer 冒頭で snapshot 済の `looping` ローカルを使う。)
 
-        // Phase 5 follow-up (granular DSP click 抑制): tempo_ratio (= current /
-        // nominal) を LP smoothing して granular_sample_at に渡す。 nominal =
-        // song.bpm (= compile 時に event.nominal_bpm にコピーされる shared
-        // 値)。 song = None なら ratio = 1.0 (= 安全な nominal)。 LP coef は
-        // ~50ms time constant 相当の固定値 (buffer = 11.6 ms @ 44100/512 で
-        // coef ~ 0.3)、 完全な per-event grain-trigger lock-in 無しでも
-        // 一般的な tempo curve では click が顕著に低減する。
-        let target_granular_ratio = song_ref
-            .map(|s| f64::from(current_bpm) / f64::from(s.bpm.max(1.0)))
-            .unwrap_or(1.0);
+        // Phase 5 follow-up (granular DSP click 抑制) / r.md #6 (base bpm follow):
+        // **絶対** current_bpm を LP smoothing して Stretch granular path に渡す。
+        // render 側は `tempo_follow_ratio(stretch_ratio, smoothed_current_bpm,
+        // nominal_bpm)` で source 進度を出す。 nominal は per-event の compile時
+        // song.bpm なので、 base bpm を変えても (= song.bpm が動いても) 追従する
+        // (= 旧実装は `current_bpm / song.bpm` を平滑化しており、 song.bpm 自身が
+        // 動くと比が 1.0 に戻って base bpm 変更に追従しなかった)。 song = None なら
+        // 安全な 120 BPM。 LP coef は ~50ms time constant 相当の固定値 (buffer =
+        // 11.6 ms @ 44100/512 で coef ~ 0.3)、 完全な per-event grain-trigger
+        // lock-in 無しでも一般的な tempo 変化では click が顕著に低減する。
+        let target_current_bpm = if song_ref.is_some() {
+            f64::from(current_bpm)
+        } else {
+            120.0
+        };
         // Play edge 検出 (= last_known_playhead != playhead で seek) と同 frame
         // で smoothed を target に snap-reset し、 旧 tempo 履歴を持ち越さない。
         // これで Stop → 別位置から Play した直後でも granular が新 tempo に
         // 即座に追随する (= LP lag を抑える)。
         if playhead != self.last_known_playhead {
-            self.granular_tempo_smoothed = target_granular_ratio;
+            self.smoothed_current_bpm = target_current_bpm;
         } else {
             const GRANULAR_LP_COEF: f64 = 0.3;
-            self.granular_tempo_smoothed +=
-                GRANULAR_LP_COEF * (target_granular_ratio - self.granular_tempo_smoothed);
+            self.smoothed_current_bpm +=
+                GRANULAR_LP_COEF * (target_current_bpm - self.smoothed_current_bpm);
         }
 
         if let Some(song) = song_ref {
@@ -928,7 +939,7 @@ impl LocalState {
                     recording_lanes,
                     current_bpm,
                     self.playhead_beats,
-                    self.granular_tempo_smoothed,
+                    self.smoothed_current_bpm,
                     looping,
                     &self.mod_scalars_snapshot,
                 );
@@ -961,7 +972,7 @@ impl LocalState {
                         recording_lanes,
                         current_bpm,
                         self.playhead_beats,
-                        self.granular_tempo_smoothed,
+                        self.smoothed_current_bpm,
                         looping,
                         &self.mod_scalars_snapshot,
                     );
@@ -1257,12 +1268,12 @@ pub fn process_track_owned(
     // playhead。 collect_events_for_buffer に渡して beat-domain で note 配置
     // を判定する。 変動 tempo でも note 位置が正しく追随する。
     playhead_beats: f64,
-    // Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio
-    // (= current_bpm / song.bpm)。 audio_clip_renderer::render_audio_events
-    // に渡して、 Stretch mode の granular sampler が source 内 offset を
-    // 計算するときの ratio として使う。 LocalState 側で per-buffer に
-    // 1-pole LP で更新される値。
-    granular_tempo_smoothed: f64,
+    // Phase 5 follow-up (granular DSP click 抑制) / r.md #6: LP smoothed な
+    // **絶対** current_bpm (BPM 単位)。 audio_clip_renderer::render_audio_events
+    // に渡して、 Stretch mode が `tempo_follow_ratio(stretch_ratio,
+    // smoothed_current_bpm, nominal_bpm)` で source 進度を計算するのに使う。
+    // LocalState 側で per-buffer に 1-pole LP で更新される値。
+    smoothed_current_bpm: f64,
     // user の loop button 実状態 (= `shared.looping`)。 set_pd_transport に渡す。
     looping: bool,
     // docs/plan_modulation.md §5: per-`ModSource` follower scalars (block-rate
@@ -1386,7 +1397,7 @@ pub fn process_track_owned(
             current_bpm,
             sample_rate,
             frames,
-            granular_tempo_smoothed,
+            smoothed_current_bpm,
         );
     }
     // PR4.5 sidechain plugin-internal alignment: main 信号を遅延させて sidechain

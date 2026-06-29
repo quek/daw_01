@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use common::audio_render::{fade_envelope, pitch_ratio_for, stretch_ratio_for};
+use common::audio_render::{fade_envelope, pitch_ratio_for, stretch_ratio_for, tempo_follow_ratio};
 use common::model::{
     AudioSourceId, AudioSourcePath, ClipContent, FadeCurve, Song, StretchMode,
 };
@@ -357,12 +357,13 @@ pub fn render_audio_events(
     current_bpm: f32,
     sample_rate: u32,
     frames: u32,
-    // Phase 5 follow-up (granular DSP click 抑制): LP smoothed tempo_ratio
-    // (= current_bpm / song.bpm)。 audio thread が per-buffer に 1-pole LP
-    // 更新した値で、 Stretch mode の granular_sample_at に渡す。 Repitch /
-    // Raw / Slice mode は instantaneous な per-event `tempo_ratio` を使う
-    // (= pitch / slice trigger の追随性を優先)。
-    granular_tempo_smoothed: f64,
+    // Phase 5 follow-up (granular DSP click 抑制) / r.md #6: LP smoothed な
+    // **絶対** current_bpm (BPM 単位)。 audio thread が per-buffer に 1-pole LP
+    // 更新した値で、 Stretch mode が `tempo_follow_ratio(stretch_ratio,
+    // smoothed_current_bpm, nominal_bpm)` を計算するのに渡す。 Repitch / Raw /
+    // Slice mode は instantaneous な `current_bpm` を使う (= pitch / slice
+    // trigger の追随性を優先)。
+    smoothed_current_bpm: f64,
 ) {
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
@@ -410,18 +411,24 @@ pub fn render_audio_events(
             continue;
         }
 
-        // Phase 5 follow-up (audio clip tempo follow): Repitch mode は
-        // tempo 比でレートをスケール (= vinyl 流)、 他 mode は不変。
-        let tempo_ratio = if event.nominal_bpm > 0.0 {
-            f64::from(current_bpm) / f64::from(event.nominal_bpm)
-        } else {
-            1.0
-        };
+        // Phase 5 follow-up (audio clip tempo follow) / r.md #6: source 進度 =
+        // 手動 stretch_ratio × tempo 追従比 (current_bpm / nominal_bpm)。 この 2 つを
+        // 掛けると clip は拍数固定のまま tempo に追従して伸縮する (= MIDI 流)。
+        // Stretch (granular) は click 抑制のため smoothed bpm、 Repitch / Slice は
+        // pitch / slice trigger の追随性優先で instant bpm を使う。 nominal_bpm は
+        // per-event の compile時 song.bpm なので、 base bpm を変えても追従する
+        // (= 旧実装の Stretch は current/song.bpm 駆動で、 song.bpm 自身が動くと
+        // 比が 1.0 に戻り base bpm 変更に追従しなかった)。
+        let nominal_bpm = f64::from(event.nominal_bpm);
+        let follow_instant =
+            tempo_follow_ratio(event.stretch_ratio, f64::from(current_bpm), nominal_bpm);
+        let follow_smoothed =
+            tempo_follow_ratio(event.stretch_ratio, smoothed_current_bpm, nominal_bpm);
         let effective_pitch_ratio = match event.stretch_mode {
-            // Repitch (tape 式) は clip 長 stretch も再生速度に乗る
-            // (= pitch も一緒に変わる)。 Raw は stretch_ratio を無視 (= 時間操作
-            // しない定義、 native rate で trim/cut)。
-            StretchMode::Repitch => event.pitch_ratio * tempo_ratio * event.stretch_ratio,
+            // Repitch (tape 式) は clip 長 stretch + tempo 追従が再生速度に乗る
+            // (= pitch も一緒に変わる、 vinyl 流)。 Raw は stretch_ratio / tempo を
+            // 無視 (= 時間操作しない定義、 native rate で trim/cut)。
+            StretchMode::Repitch => event.pitch_ratio * follow_instant,
             _ => event.pitch_ratio,
         };
 
@@ -508,18 +515,18 @@ pub fn render_audio_events(
             let (s_l, s_r) = match event.stretch_mode {
                 StretchMode::Stretch => granular_sample_at(
                     event_local,
-                    // clip 長 stretch を tempo-follow と乗算合成。
-                    // grain hop が stretch_ratio で伸縮 → source を event 長に
+                    // grain hop が follow_smoothed で伸縮 → source を event 長に
                     // 充填 (= pitch 保持の time-stretch、 ピッチ保持が既定)。
-                    // Phase 5 follow-up (click 抑制): per-event の instant
-                    // tempo_ratio ではなく LP smoothed 版を渡す。 nominal_bpm
-                    // == song.bpm の前提下で `granular_tempo_smoothed` =
-                    // `current_bpm / song.bpm` の LP smoothed 値、 即 ratio
-                    // と一致する。 buffer 境界の Δratio が抑制され、 grain
-                    // life (= ~2*HOP samples) 内での source pos jump が
-                    // 小さくなる (= click 振幅低減)。 完全 click-free には
-                    // per-event grain-trigger lock-in が必要 (= 別 phase)。
-                    granular_tempo_smoothed * event.stretch_ratio,
+                    // follow_smoothed = stretch_ratio × (smoothed_current_bpm /
+                    // nominal_bpm) なので clip 長 stretch + tempo 追従を乗算合成。
+                    // Phase 5 follow-up (click 抑制): instant ではなく LP smoothed
+                    // bpm 駆動で buffer 境界の Δratio が抑えられ、 grain life
+                    // (= ~2*HOP samples) 内の source pos jump が小さくなる (= click
+                    // 振幅低減)。 r.md #6: nominal_bpm 基準なので base bpm 変更にも
+                    // 追従する (= 旧実装は current/song.bpm 駆動で追従しなかった)。
+                    // 完全 click-free には per-event grain-trigger lock-in が必要
+                    // (= 別 phase)。
+                    follow_smoothed,
                     l_plane,
                     r_plane,
                     event.source_start_frames,
@@ -529,8 +536,8 @@ pub fn render_audio_events(
                 ),
                 StretchMode::Slice => slice_sample_at(
                     event_local,
-                    // slice 配置にも clip 長 stretch を合成。
-                    tempo_ratio * event.stretch_ratio,
+                    // slice 配置にも clip 長 stretch + tempo 追従を合成 (instant)。
+                    follow_instant,
                     l_plane,
                     r_plane,
                     event.source_start_frames,
@@ -590,9 +597,10 @@ pub fn render_audio_events(
 /// - 50% overlap (= hop = len / 2)、 Hann window で 2 grain 和が常時 1.0
 /// - linear interpolation 無し (= source 整数 index 直読、 grain 内 pitch
 ///   不変なので aliasing 影響小)
-/// - tempo_ratio は caller 側で LP smoothing 済 (= LocalState の
-///   `granular_tempo_smoothed`)。 buffer 境界での tempo 変化はここに来た
-///   時点で per-buffer 0.3 coef の 1-pole LP で抑えられている。 grain life
+/// - 渡される `tempo_ratio` (= caller の `follow_smoothed` = stretch_ratio ×
+///   smoothed_current_bpm / nominal_bpm) は LP smoothing 済 (= LocalState の
+///   `smoothed_current_bpm` を per-buffer に 1-pole LP した値)。 buffer 境界での
+///   tempo 変化はここに来た時点で 0.3 coef の LP で抑えられている。 grain life
 ///   (= ~2*HOP samples ≒ 1 buffer @ 512) 中の Δratio は十分小さく、 通常
 ///   tempo curve では click が顕著に抑制される
 /// - reversed なら source を末尾から読む
