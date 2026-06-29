@@ -1475,8 +1475,8 @@ unsafe extern "C" fn collect_out_note_try_push(
 /// transport (= we set song_pos_* to the buffer-start values); CLAP
 /// plugins increment internally for sub-buffer interpolation.
 ///
-/// `song_pos_beats` = playhead_samples * bpm / (60 * SR) * (1 << 31)
-/// `song_pos_seconds` = playhead_samples / SR * (1 << 31)
+/// `song_pos_beats` = transport.song_pos_beats * (1 << 31)
+/// `song_pos_seconds` = song_pos_beats * 60 / bpm * (1 << 31)
 /// `bar_start` / `bar_number`: compute current bar index from beats
 /// using tsig_num (= beats_per_bar). Bar start in beats is
 /// `bar_number * tsig_num` (= integer beats since song start).
@@ -1495,16 +1495,18 @@ fn build_clap_transport_event(
     _frames: u32,
 ) -> clap_event_transport {
     let bpm = f64::from(transport.bpm).max(1.0);
-    let sample_rate = f64::from(transport.sample_rate).max(1.0);
-    let playhead_samples = transport.playhead_samples as f64;
-    // seconds は sample 由来 (= テンポ非依存で正確)。
-    // 非有限 (NaN / inf) を `as i64` すると未規定 / saturate になり下流の
-    // bar 計算も汚染するので、 bar_number の clamp と同様 0 に倒す。
-    let song_pos_seconds_f64 = sanitize_pos(playhead_samples / sample_rate);
     // beats は daw_audio が tempo automation を積分した真の拍位置を使う
     // (= `samples × bpm` の一定テンポ逆算は廃止)。 これで途中でテンポが
     // 変わった曲でも plugin が正しい拍 / 小節位置を見る。
     let song_pos_beats_f64 = sanitize_pos(transport.song_pos_beats);
+    // seconds も拍位置から導出する。 engine は `ProcessData::steady_time`
+    // (= `transport.playhead_samples`) を設定せず 0 固定なので、 sample 由来の
+    // seconds (`playhead_samples / SR`) は常に 0 になってしまう。 `song_pos_beats`
+    // から `* 60 / bpm` で曲頭からの秒位置を得る (一定テンポでは厳密、 テンポ
+    // automation 中も拍位置と整合)。 ARA plug-in はこの seconds で再生リージョンを
+    // 引くため、 0 固定だと VST3 の projectTimeSamples と同様にリージョン位置が
+    // 固着して無音になる。 非有限は `sanitize_pos` で 0 に倒す。
+    let song_pos_seconds_f64 = sanitize_pos(song_pos_beats_f64 * 60.0 / bpm);
     let song_pos_beats: i64 = (song_pos_beats_f64 * CLAP_BEATTIME_FACTOR as f64) as i64;
     let song_pos_seconds: i64 = (song_pos_seconds_f64 * CLAP_SECTIME_FACTOR as f64) as i64;
     let tsig_num = transport.tsig_num.max(1) as f64;
@@ -2308,8 +2310,10 @@ mod tests {
         let ev = build_clap_transport_event(&ctx(), 256);
         let expected = (999.0_f64 * CLAP_BEATTIME_FACTOR as f64) as i64;
         assert_eq!(ev.song_pos_beats, expected);
-        // seconds は sample 由来 (= テンポ非依存で正確)、 1 秒。
-        let expected_sec = (1.0_f64 * CLAP_SECTIME_FACTOR as f64) as i64;
+        // seconds も song_pos_beats から導出する (engine が steady_time を設定せず
+        // playhead_samples=0 のため sample 由来は使えない)。 999 拍 ÷ (120bpm/60)
+        // = 499.5 秒。
+        let expected_sec = (999.0_f64 * 60.0 / 120.0 * CLAP_SECTIME_FACTOR as f64) as i64;
         assert_eq!(ev.song_pos_seconds, expected_sec);
         assert_eq!(ev.tempo, 120.0);
         assert_ne!(ev.flags & CLAP_TRANSPORT_IS_PLAYING, 0);
