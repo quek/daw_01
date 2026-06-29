@@ -10,6 +10,7 @@
 //! audio thread is single-threaded so there is no real sharing.
 
 use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use com_scrape_types::Class;
 use vst3::ComWrapper;
@@ -210,6 +211,105 @@ impl IParameterChangesTrait for Vst3InParamChanges {
     }
 }
 
+// --- GUI parameter-edit bridge (r.md #4) -----------------------------------
+
+/// Capacity of the GUI→audio parameter-edit ring. A human turning a knob
+/// emits at most ~120 `performEdit`s/sec and `process()` drains every audio
+/// buffer (~10 ms), so a handful of slots would do; 512 is far beyond any
+/// realistic burst between two `process()` calls.
+const GUI_PARAM_EDIT_CAP: usize = 512;
+
+/// Lock-free SPSC ring buffer carrying VST3 GUI parameter edits — the edit
+/// controller's `IComponentHandler::performEdit(param_id, normalized_value)` —
+/// from the controller's UI thread to the audio `process()` thread.
+///
+/// VST3 splits a plugin into an **edit controller** (the GUI) and an **audio
+/// processor** (the DSP) that do not talk to each other; carrying a parameter
+/// edit from the controller to the processor (via the next `process()`'s
+/// `inputParameterChanges`) is the *host's* job. Without this bridge, turning a
+/// knob updates the GUI but never reaches the DSP, so the sound does not change
+/// for any parameter that isn't already driven by an automation lane — exactly
+/// the r.md #4 symptom (CLAP plugins are unaffected: their GUI and DSP are one
+/// instance, so the edit is internal). Automation lane values arrive on a
+/// separate path (`Vst3InParamChanges::set_changes`); this queue is purely the
+/// GUI→DSP bridge.
+///
+/// Single producer (the controller calls `performEdit` on one UI thread),
+/// single consumer-at-a-time (the worker pool serializes `process()` per
+/// plugin). `push` only writes `head` + slots; `drain_latest` only writes
+/// `tail`; the Acquire/Release pair orders the slot writes against the reads.
+/// On overflow the incoming edit is dropped and a flag is raised (logged
+/// off-RT) — benign because the consumer drains far faster than a human edits,
+/// so during playback the ring never approaches full and the final value of a
+/// drag is always delivered.
+pub struct GuiParamEditQueue {
+    buf: [UnsafeCell<(u32, f64)>; GUI_PARAM_EDIT_CAP],
+    /// Next slot the producer will write (only the producer stores this).
+    head: AtomicUsize,
+    /// Next slot the consumer will read (only the consumer stores this).
+    tail: AtomicUsize,
+    /// Raised by `push` when the ring was full; surfaced off-RT by
+    /// `take_overflowed` (a best-effort diagnostic, `Relaxed` suffices).
+    overflowed: AtomicBool,
+}
+
+// SAFETY: shared across the producer (UI thread) and consumer (audio thread)
+// only through the atomic head/tail; the `UnsafeCell` slots are written by the
+// producer and read by the consumer with Acquire/Release establishing the
+// happens-before, and the two never touch the same slot concurrently.
+unsafe impl Send for GuiParamEditQueue {}
+unsafe impl Sync for GuiParamEditQueue {}
+
+impl GuiParamEditQueue {
+    pub fn new() -> Self {
+        Self {
+            buf: std::array::from_fn(|_| UnsafeCell::new((0, 0.0))),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            overflowed: AtomicBool::new(false),
+        }
+    }
+
+    /// Producer: enqueue one `(param_id, normalized_value)` edit. Called on the
+    /// controller's UI thread. Drops (and flags) the edit if the ring is full.
+    pub fn push(&self, param_id: u32, value: f64) {
+        let head = self.head.load(Ordering::Relaxed);
+        let next = (head + 1) % GUI_PARAM_EDIT_CAP;
+        if next == self.tail.load(Ordering::Acquire) {
+            self.overflowed.store(true, Ordering::Relaxed);
+            return;
+        }
+        unsafe { *self.buf[head].get() = (param_id, value) };
+        self.head.store(next, Ordering::Release);
+    }
+
+    /// Consumer: drain all pending edits into `out`, collapsing to the LAST
+    /// value per `param_id` (only the final knob position matters; the
+    /// intermediate values of a drag are redundant). `out` is the caller's
+    /// pre-allocated scratch and must be cleared before the call; draining
+    /// never allocates as long as `out` has capacity for the distinct params
+    /// edited this buffer (realistically one). Called on the audio thread.
+    pub fn drain_latest(&self, out: &mut Vec<(u32, f64)>) {
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        while tail != head {
+            let (id, val) = unsafe { *self.buf[tail].get() };
+            if let Some(slot) = out.iter_mut().find(|(eid, _)| *eid == id) {
+                slot.1 = val;
+            } else if out.len() < out.capacity() {
+                out.push((id, val));
+            }
+            tail = (tail + 1) % GUI_PARAM_EDIT_CAP;
+        }
+        self.tail.store(tail, Ordering::Release);
+    }
+
+    /// Take-and-clear the overflow flag for an off-RT diagnostic log.
+    pub fn take_overflowed(&self) -> bool {
+        self.overflowed.swap(false, Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +372,37 @@ mod tests {
         let overflow = changes.set_changes(&events);
         assert!(overflow);
         assert_eq!(unsafe { *changes.used.get() }, MAX_PARAM_QUEUES);
+    }
+
+    #[test]
+    fn gui_param_edits_drain_keeps_last_value_per_param() {
+        let q = GuiParamEditQueue::new();
+        q.push(10, 0.1);
+        q.push(20, 0.9);
+        q.push(10, 0.5); // a later edit to param 10 ...
+        q.push(10, 0.7); // ... and a later one still — only the last survives.
+        let mut out = Vec::with_capacity(8);
+        q.drain_latest(&mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.iter().find(|(id, _)| *id == 10).unwrap().1, 0.7);
+        assert_eq!(out.iter().find(|(id, _)| *id == 20).unwrap().1, 0.9);
+        // Ring is drained: a second drain into a fresh buffer adds nothing.
+        out.clear();
+        q.drain_latest(&mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn gui_param_edits_overflow_drops_and_flags() {
+        let q = GuiParamEditQueue::new();
+        // One slot is always left empty (full vs empty disambiguation), so
+        // CAP-1 edits fit without overflow.
+        for i in 0..(GUI_PARAM_EDIT_CAP as u32 - 1) {
+            q.push(i, 0.0);
+        }
+        assert!(!q.take_overflowed());
+        q.push(9999, 1.0); // ring full → dropped + flagged.
+        assert!(q.take_overflowed());
+        assert!(!q.take_overflowed()); // flag cleared by take.
     }
 }

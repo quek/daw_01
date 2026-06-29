@@ -13,6 +13,7 @@
 //!   so we can route plugin-initiated resize requests back to daw_gui.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use com_scrape_types::Class;
 use vst3::Steinberg::{
@@ -24,6 +25,7 @@ use vst3::Steinberg::{
 };
 
 use crate::plugin_instance::HostCallbacks;
+use crate::vst3_params::GuiParamEditQueue;
 
 // --- IHostApplication ------------------------------------------------------
 
@@ -79,11 +81,21 @@ impl IHostApplicationTrait for Vst3HostApp {
 
 pub struct Vst3ComponentHandler {
     callbacks: HostCallbacks,
+    /// Bridges GUI parameter edits to the audio processor (r.md #4). The VST3
+    /// edit controller (this handler's caller) and the audio processor are
+    /// decoupled, so `performEdit` must hand the value to the processor via the
+    /// next `process()`'s `inputParameterChanges` — this queue carries it
+    /// across to the audio thread. Shared (`Arc`) with the owning `Vst3Plugin`,
+    /// which drains it in `process()`.
+    gui_param_edits: Arc<GuiParamEditQueue>,
 }
 
 impl Vst3ComponentHandler {
-    pub fn new(callbacks: HostCallbacks) -> Self {
-        Self { callbacks }
+    pub fn new(callbacks: HostCallbacks, gui_param_edits: Arc<GuiParamEditQueue>) -> Self {
+        Self {
+            callbacks,
+            gui_param_edits,
+        }
     }
 }
 
@@ -102,10 +114,16 @@ impl IComponentHandlerTrait for Vst3ComponentHandler {
     }
 
     unsafe fn performEdit(&self, id: ParamID, value_normalized: ParamValue) -> tresult {
-        // plugin GUI 内での param 値変更。 daw_gui の plugin_param_values
-        // cache を更新し、 automation lane の現在値 source にする。 VST3 の
-        // 値は常に normalized [0,1]。
+        // plugin GUI 内での param 値変更。 VST3 の値は常に normalized [0,1]。
+        // (1) daw_gui に転送して plugin_param_values cache を更新し、
+        //     automation lane の現在値 source / last-touched に使う。
         (self.callbacks.on_param_value)(id, value_normalized);
+        // (2) audio processor へ橋渡しする (r.md #4)。 VST3 は edit controller
+        //     (この GUI) と audio processor (DSP) が分離していて互いに通信し
+        //     ないので、 host がこの編集を次の process() の
+        //     inputParameterChanges に載せない限り音は変わらない。 この push が
+        //     audio thread (Vst3Plugin::process の drain) へ値を渡す。
+        self.gui_param_edits.push(id, value_normalized);
         kResultOk
     }
 
