@@ -5,11 +5,13 @@ edition.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+ara-sys = { path = "../ara-sys" }
 anyhow.workspace = true
 arc-swap.workspace = true
 bincode.workspace = true
 clap-sys.workspace = true
 com-scrape-types.workspace = true
+hound.workspace = true
 libloading.workspace = true
 tokio.workspace = true
 tracing.workspace = true

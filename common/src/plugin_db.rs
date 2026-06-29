@@ -74,6 +74,30 @@ pub struct PluginEntry {
     pub has_video_output: bool,
 }
 
+/// CLAP ARA companion-API の feature タグ (ARACLAP.h の
+/// `CLAP_PLUGIN_FEATURE_ARA_SUPPORTED` / `_ARA_REQUIRED`)。CLAP は descriptor の
+/// features にこれを載せる。VST3 には feature list の概念が無いので、scan が ARA
+/// factory を検出したとき同タグを features へ正規化して push する。これにより
+/// [`PluginEntry::is_ara`] が CLAP / VST3 を区別なく `features` から派生できる。
+pub const CLAP_FEATURE_ARA_SUPPORTED: &str = "ara:supported";
+pub const CLAP_FEATURE_ARA_REQUIRED: &str = "ara:required";
+
+impl PluginEntry {
+    /// ARA (Audio Random Access) 対応プラグインか。`features` を SSoT に派生する
+    /// ので専用フィールド・cache 変更は不要。CLAP は descriptor features の公式
+    /// タグ、VST3 は scan が ARA factory 検出時に同タグを push 済み。
+    pub fn is_ara(&self) -> bool {
+        self.features
+            .iter()
+            .any(|f| f == CLAP_FEATURE_ARA_SUPPORTED || f == CLAP_FEATURE_ARA_REQUIRED)
+    }
+
+    /// ARA 必須 (非 ARA ロードを受け付けない) プラグインか。`is_ara` の部分集合。
+    pub fn ara_required(&self) -> bool {
+        self.features.iter().any(|f| f == CLAP_FEATURE_ARA_REQUIRED)
+    }
+}
+
 /// v23: port 構成 probe スキーマの現行版。 `PluginEntry` に記録する
 /// port bool (note in/out・audio out/**in**) の取得方法・意味づけを変えたら上げる。
 /// cache の `port_probe_version` がこれ未満なら、 起動時に再 probe (rescan) する。

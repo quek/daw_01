@@ -343,6 +343,17 @@ pub trait LoadedPlugin: Send {
     /// synth thread が状態遷移ごとに呼ぶ。builtin VOICEVOX 以外は no-op。
     fn set_voicevox_status_reporter(&mut self, _reporter: VoicevoxStatusReporter) {}
 
+    /// (r.md #5 ARA2) Set up an ARA document for this instance: expose `clips`
+    /// as ARA audio sources + playback regions and bind the instance for
+    /// playback rendering, replacing any prior ARA session. Returns `Ok(true)`
+    /// when ARA was set up, `Ok(false)` for non-ARA plug-ins (default).
+    fn setup_ara(&mut self, _clips: &[common::protocol::AraClipSpec]) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// (r.md #5 ARA2) Tear down this instance's ARA session, if any.
+    fn clear_ara(&mut self) {}
+
     // --- embedded Win32 GUI (plugin-main thread) ------------------------
     //
     // Methods match the existing CLAP `Plugin` inherent impl so the trait

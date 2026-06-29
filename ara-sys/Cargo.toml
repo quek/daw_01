@@ -1,0 +1,18 @@
+[package]
+name = "ara-sys"
+description = "Vendored Rust bindings to the ARA (Audio Random Access) C API — host subset. Pure type definitions (no linked library); ARA is dispatched entirely through plug-in-provided function-pointer tables."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Regenerate src/bindings.rs from vendor/ARA_API/ARAInterface.h via bindgen.
+# Dev-only and requires libclang at build time. Normal builds (and CI / fresh
+# machines / Linux) compile the committed src/bindings.rs and need no libclang.
+#   LIBCLANG_PATH=<...> cargo build -p ara-sys --features regen
+regen = ["dep:bindgen"]
+
+[build-dependencies]
+bindgen = { version = "0.71", optional = true }

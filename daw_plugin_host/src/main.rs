@@ -2,6 +2,7 @@
 // まま (standalone 起動時に stdout/tracing が見える)。 docs/plan_icon_and_console.md (#48)。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ara;
 mod builtin;
 mod clap_host;
 mod clap_plugin;
@@ -349,6 +350,18 @@ enum PluginCommand {
         track: u32,
     },
     RequestSlotState {
+        track: u32,
+        index: u32,
+    },
+    /// (r.md #5 ARA2) Build/replace the ARA document for the plugin at
+    /// `track`/`index` from `clips`, binding it for playback rendering.
+    SetupAraDocument {
+        track: u32,
+        index: u32,
+        clips: Vec<common::protocol::AraClipSpec>,
+    },
+    /// (r.md #5 ARA2) Tear down the ARA session for the plugin at `track`/`index`.
+    ClearAraDocument {
         track: u32,
         index: u32,
     },
@@ -1484,6 +1497,34 @@ fn plugin_main_loop(
                     };
                     let _ = evt_tx.send(PluginEvent::SlotPluginState { track, index, data });
                 }
+                PluginCommand::SetupAraDocument { track, index, clips } => {
+                    match tracks.plugin_at_mut(track, index) {
+                        Some(plugin) => match plugin.setup_ara(&clips) {
+                            Ok(true) => {
+                                tracing::info!(track, index, n = clips.len(), "ARA document set up");
+                            }
+                            Ok(false) => {
+                                tracing::warn!(
+                                    track,
+                                    index,
+                                    "SetupAraDocument: plugin is not ARA-capable, ignoring"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(error = ?e, track, index, "ARA setup failed");
+                            }
+                        },
+                        None => {
+                            tracing::warn!(track, index, "SetupAraDocument: no plugin at slot");
+                        }
+                    }
+                }
+                PluginCommand::ClearAraDocument { track, index } => {
+                    if let Some(plugin) = tracks.plugin_at_mut(track, index) {
+                        plugin.clear_ara();
+                        tracing::info!(track, index, "ARA document cleared");
+                    }
+                }
                 PluginCommand::RequestAllStates => {
                     let entries = collect_all_states(&mut tracks);
                     let _ = evt_tx.send(PluginEvent::AllPluginStates { entries });
@@ -2045,6 +2086,14 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::RequestSlotState { track, index } => {
             tracing::info!(track, index, "received RequestSlotState");
             plugin.send(PluginCommand::RequestSlotState { track, index });
+        }
+        MainToChild::SetupAraDocument { track, index, clips } => {
+            tracing::info!(track, index, n = clips.len(), "received SetupAraDocument");
+            plugin.send(PluginCommand::SetupAraDocument { track, index, clips });
+        }
+        MainToChild::ClearAraDocument { track, index } => {
+            tracing::info!(track, index, "received ClearAraDocument");
+            plugin.send(PluginCommand::ClearAraDocument { track, index });
         }
         MainToChild::RequestAllStates => {
             tracing::info!("received RequestAllStates");

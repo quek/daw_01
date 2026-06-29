@@ -5,6 +5,7 @@ members = [
     "daw_gui",
     "daw_audio",
     "daw_plugin_host",
+    "ara-sys",
     # UI ライブラリ (旧 gui_01 / daw-ui)。daw_01/ui/ に統合 (subtree merge, 履歴保持)。
     "ui/crates/platform",
     "ui/crates/renderer",

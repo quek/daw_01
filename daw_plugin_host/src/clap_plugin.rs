@@ -73,6 +73,13 @@ pub struct ClapPlugin {
     _host: Box<Host>,
     /// Stable `clap_plugin_descriptor.id` of the loaded descriptor.
     id: String,
+    /// (r.md #5 ARA2) ARA session bound to this instance, if any. Holds the ARA
+    /// document controller + bound extension; dropped before the instance is
+    /// destroyed (its drop issues destroy calls back into this plug-in).
+    ara: Option<crate::ara::session::AraSession>,
+    /// Last successful `activate` params, kept so ARA setup — which must bind
+    /// before activation — can deactivate → bind → reactivate around the build.
+    last_activate: Option<(f64, u32, u32)>,
     name: String,
     path: PathBuf,
     active: bool,
@@ -365,6 +372,8 @@ impl ClapPlugin {
             plugin: plugin_ptr,
             _host: host,
             id,
+            ara: None,
+            last_activate: None,
             name,
             path: path.to_path_buf(),
             active: false,
@@ -659,6 +668,7 @@ impl ClapPlugin {
             "plugin.activate returned false"
         );
         self.active = true;
+        self.last_activate = Some((sample_rate, min_frames, max_frames));
         self.input_buffers = (0..self.input_channels as usize)
             .map(|_| vec![0.0f32; max_frames as usize])
             .collect();
@@ -1758,8 +1768,67 @@ fn query_port_channel_count(
     unsafe { info.assume_init() }.channel_count
 }
 
+impl ClapPlugin {
+    /// (r.md #5 ARA2) Inherent ARA setup; the `LoadedPlugin` trait method
+    /// forwards here (inherent method resolution wins). Returns `Ok(false)`
+    /// when this descriptor exposes no ARA factory.
+    pub fn setup_ara(&mut self, clips: &[common::protocol::AraClipSpec]) -> Result<bool> {
+        let id = CString::new(self.id.as_str()).context("plugin id has interior NUL")?;
+        let factory =
+            match unsafe { crate::ara::clap_ara::ara_factory_for_plugin(&*self.entry, &id) } {
+                Some(factory) => factory,
+                None => return Ok(false),
+            };
+        // ARA bind must precede activation, and detaching regions requires the
+        // instance to be inactive, so deactivate around the (re)build, then
+        // restore the prior activation state.
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        self.ara = None; // drop any prior session while inactive
+        let session =
+            unsafe { crate::ara::session::AraSession::setup(self.plugin, factory, clips) };
+        if was_active
+            && let Some((sample_rate, min_frames, max_frames)) = restore
+        {
+            self.activate(sample_rate, min_frames, max_frames)?;
+        }
+        self.ara = Some(session?);
+        Ok(true)
+    }
+
+    /// (r.md #5 ARA2) Inherent ARA teardown; forwarded by the trait method.
+    pub fn clear_ara(&mut self) {
+        if self.ara.is_none() {
+            return;
+        }
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        self.ara = None;
+        if was_active
+            && let Some((sample_rate, min_frames, max_frames)) = restore
+        {
+            let _ = self.activate(sample_rate, min_frames, max_frames);
+        }
+    }
+}
+
 impl Drop for ClapPlugin {
     fn drop(&mut self) {
+        // Tear down the ARA session (if any) before the instance is destroyed —
+        // its drop issues destroy calls back into this plug-in. Deactivate first
+        // so detaching its playback regions is valid.
+        if self.ara.is_some() {
+            if self.active {
+                self.deactivate();
+            }
+            self.ara = None;
+        }
         // Tear down GUI resources first so plugin.destroy sees a clean state.
         self.gui_destroy();
         unsafe {
@@ -2008,6 +2077,14 @@ impl LoadedPlugin for ClapPlugin {
 
     fn deactivate(&mut self) {
         self.deactivate();
+    }
+
+    fn setup_ara(&mut self, clips: &[common::protocol::AraClipSpec]) -> Result<bool> {
+        self.setup_ara(clips)
+    }
+
+    fn clear_ara(&mut self) {
+        self.clear_ara();
     }
 
     fn start_processing(&mut self) -> Result<()> {
