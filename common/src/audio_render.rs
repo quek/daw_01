@@ -96,6 +96,31 @@ pub fn stretch_ratio_for(
     native_secs / event_secs
 }
 
+/// source 進度 = clip の手動 `stretch_ratio` (= [`stretch_ratio_for`]、 nominal
+/// bpm 基準の native長/配置長) × tempo 追従比 (`current_bpm / nominal_bpm`)。
+/// この 2 つを掛けると、 clip は **拍数を固定したまま** tempo 変化に追従して
+/// 伸縮する (= MIDI clip と同じ挙動: project tempo が変わると実時間長が変わる)。
+///
+/// 数式上、 `event_length_beats` が固定なら、 この戻り値は nominal_bpm の取り方に
+/// **不変**:
+/// `stretch_ratio * current/nominal = (native_secs * nominal / (elb*60)) *
+/// current/nominal = native_secs * current / (elb*60)`。
+/// よって schedule の再コンパイル (= nominal_bpm が現 song.bpm に更新され、
+/// stretch_ratio も同時に再算出される) を跨いでも追従結果が一致する。
+///
+/// `current_bpm` は呼び出し側で、 Stretch (granular) は LP smoothed な値 (=
+/// click 抑制、 grain source jump 抑制)、 Repitch / Slice は instant な値 (=
+/// pitch / slice trigger の追随性優先) を渡す。 `nominal_bpm <= 0` は退化入力と
+/// して `stretch_ratio` を素通し (= 追従なし) する defensive。 RT path で呼ばれる
+/// ので alloc / panic free。
+#[inline]
+pub fn tempo_follow_ratio(stretch_ratio: f64, current_bpm: f64, nominal_bpm: f64) -> f64 {
+    if nominal_bpm <= 0.0 {
+        return stretch_ratio;
+    }
+    stretch_ratio * (current_bpm / nominal_bpm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +249,61 @@ mod tests {
         assert!((stretch_ratio_for(48_000, 0, 2.0, 120.0) - 1.0).abs() < 1e-9);
         assert!((stretch_ratio_for(48_000, 48_000, 0.0, 120.0) - 1.0).abs() < 1e-9);
         assert!((stretch_ratio_for(48_000, 48_000, 2.0, 0.0) - 1.0).abs() < 1e-9);
+    }
+
+    // ---- tempo_follow_ratio ----
+
+    #[test]
+    fn tempo_follow_ratio_cases() {
+        // (stretch_ratio, current_bpm, nominal_bpm, expected)
+        let cases = [
+            (1.0, 120.0, 120.0, 1.0),  // current == nominal → 追従なし、 native rate
+            (1.0, 240.0, 120.0, 2.0),  // 倍テンポ → source 倍速で進む (= 同じ拍に収める)
+            (1.0, 60.0, 120.0, 0.5),   // 半テンポ → source 半速
+            (0.5, 240.0, 120.0, 1.0),  // 手動 stretch 0.5 × 追従 2.0 = 1.0 (乗算合成)
+            (2.0, 90.0, 180.0, 1.0),   // 手動 2.0 × 追従 0.5
+            (1.0, 140.0, 0.0, 1.0),    // nominal=0 は退化 → stretch_ratio 素通し
+        ];
+        for (stretch, current, nominal, expected) in cases {
+            let got = tempo_follow_ratio(stretch, current, nominal);
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "stretch={stretch} current={current} nominal={nominal} got={got} want={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn tempo_follow_spans_fixed_beats_across_tempo() {
+        // MIDI 流の不変条件: import 時に event_length_beats = native長(拍) で置いた
+        // clip は、 どの current_bpm でも source 全体がちょうど beat window に収まる
+        // (= advance_ratio × window_secs == native_secs)。 これが「拍数を固定して
+        // tempo に追従する」 の数学的定義。 nominal の取り方 (import時 vs 再コンパイル時)
+        // に依らず成立することも検証する。
+        let native_frames = 96_000u64; // 2.0 s @ 48k
+        let sr = 48_000u32;
+        let native_secs = native_frames as f64 / f64::from(sr);
+        // (nominal_bpm = clip 取り込み時テンポ, current_bpm = 再生時テンポ)
+        let cases = [
+            (120.0f32, 120.0f64),
+            (120.0, 140.0),
+            (120.0, 90.0),
+            (90.0, 174.0),
+            (174.0, 100.0),
+        ];
+        for (nominal_bpm, current_bpm) in cases {
+            // import path (app.rs frames_to_beats) と同じ: 配置拍 = native秒 × bpm/60。
+            let event_length_beats = native_secs * f64::from(nominal_bpm) / 60.0;
+            let manual = stretch_ratio_for(native_frames, sr, event_length_beats, nominal_bpm);
+            // 取り込み直後は手動 stretch なし → 比 1.0。
+            assert!((manual - 1.0).abs() < 1e-9, "manual={manual}");
+            let advance = tempo_follow_ratio(manual, current_bpm, f64::from(nominal_bpm));
+            let window_secs = event_length_beats * 60.0 / current_bpm;
+            assert!(
+                (advance * window_secs - native_secs).abs() < 1e-6,
+                "nominal={nominal_bpm} current={current_bpm} advance={advance} \
+                 window_secs={window_secs} native_secs={native_secs}"
+            );
+        }
     }
 }

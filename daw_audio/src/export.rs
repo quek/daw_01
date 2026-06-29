@@ -340,10 +340,13 @@ fn render_loop(
         let playhead_beats = playhead as f64 * song.bpm as f64
             / (60.0 * sample_rate as f64);
 
-        // Phase 5 follow-up (granular DSP click 抑制): offline export は constant
-        // song.bpm で freewheel するので tempo_ratio は常に 1.0 (= nominal)。
-        // LP smoothing も不要 (= 過渡応答が無い、 click 源も無い)。
-        const GRANULAR_TEMPO_SMOOTHED_FREEWHEEL: f64 = 1.0;
+        // Phase 5 follow-up (granular DSP click 抑制) / r.md #6: offline export は
+        // constant song.bpm で freewheel するので smoothed_current_bpm = song.bpm
+        // (= LP smoothing 不要、 過渡応答も click 源も無い)。 render 側 Stretch は
+        // tempo_follow_ratio(stretch_ratio, song.bpm, nominal_bpm) で source 進度を
+        // 出すので、 import 後に bpm を変えてから export すると (= nominal != song.bpm)
+        // 追従して伸縮した結果が WAV に焼かれる (= 旧実装は 1.0 固定で追従しなかった)。
+        let smoothed_current_bpm_freewheel = f64::from(song.bpm);
 
         // docs/plan_modulation.md §5: snapshot the prev buffer's follower envs
         // (slot order) so audio-param modulation renders into the WAV too.
@@ -379,7 +382,7 @@ fn render_loop(
                 &empty_recording_lanes,
                 song.bpm,
                 playhead_beats,
-                GRANULAR_TEMPO_SMOOTHED_FREEWHEEL,
+                smoothed_current_bpm_freewheel,
                 // export (freewheel render) は loop しない。
                 false,
                 &mod_scalars_snapshot,
@@ -412,7 +415,7 @@ fn render_loop(
                     &empty_recording_lanes,
                     song.bpm,
                     playhead_beats,
-                    GRANULAR_TEMPO_SMOOTHED_FREEWHEEL,
+                    smoothed_current_bpm_freewheel,
                     // export (freewheel render) は loop しない。
                     false,
                     &mod_scalars_snapshot,
