@@ -955,6 +955,15 @@ fn plugin_main_loop(
                             continue;
                         }
                     };
+                    // (r.md #5 ARA2) Bind ARA before the first state load /
+                    // activate / GUI creation, as the ARA spec requires. No-op
+                    // for non-ARA plug-ins; the document's audio is attached
+                    // later via SetupAraDocument (set_clips). The ARA editor view
+                    // is available once bound, so opening the device GUI shows
+                    // the plug-in's ARA editor (e.g. Melodyne).
+                    if let Err(e) = plugin.bind_ara_if_capable() {
+                        tracing::error!(error = ?e, track, index, "ARA bind at load failed");
+                    }
                     // Phase 6 review (silent corruption fix): state_load
                     // 失敗を `tracing::error!` だけで握りつぶしていたので、
                     // ユーザーは saved project を開いて plugin が default

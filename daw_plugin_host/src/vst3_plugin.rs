@@ -857,27 +857,15 @@ impl LoadedPlugin for Vst3Plugin {
         PluginFormat::Vst3
     }
 
-    fn setup_ara(
-        &mut self,
-        clips: &[common::protocol::AraClipSpec],
-        archive: Option<&[u8]>,
-    ) -> Result<bool> {
+    fn bind_ara_if_capable(&mut self) -> Result<bool> {
         let factory =
             match unsafe { crate::ara::vst3_ara::ara_factory_from_component(&self.component) } {
                 Some(factory) => factory,
                 None => return Ok(false),
             };
-        // ARA binding must precede setActive, and detaching regions requires the
-        // instance inactive, so deactivate around the (re)build then restore.
-        let was_active = self.active;
-        let restore = self.last_activate;
-        if was_active {
-            self.deactivate();
-        }
-        self.ara = None; // drop any prior session while inactive
         let component = self.component.clone();
         let session = unsafe {
-            crate::ara::session::AraSession::setup(factory, clips, |document_controller| {
+            crate::ara::session::AraSession::create(factory, |document_controller| {
                 crate::ara::vst3_ara::bind(
                     &component,
                     document_controller,
@@ -885,17 +873,39 @@ impl LoadedPlugin for Vst3Plugin {
                     crate::ara::extension::HOST_ASSIGNED_ROLES,
                 )
             })
-        };
+        }?;
+        self.ara = Some(session);
+        Ok(true)
+    }
+
+    fn setup_ara(
+        &mut self,
+        clips: &[common::protocol::AraClipSpec],
+        archive: Option<&[u8]>,
+    ) -> Result<bool> {
+        if self.ara.is_none() {
+            return Ok(false);
+        }
+        // set_clips / region detach require the instance inactive; deactivate
+        // around the update, then restore. The bind already happened at load.
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        if let Some(session) = self.ara.as_mut() {
+            session.set_clips(clips);
+        }
+        if let Some(archive) = archive.filter(|a| !a.is_empty())
+            && let Some(session) = self.ara.as_ref()
+        {
+            session.restore_archive(archive);
+        }
         if was_active
             && let Some((sample_rate, min_frames, max_frames)) = restore
         {
             self.activate(sample_rate, min_frames, max_frames)?;
         }
-        let session = session?;
-        if let Some(archive) = archive.filter(|a| !a.is_empty()) {
-            session.restore_archive(archive);
-        }
-        self.ara = Some(session);
         Ok(true)
     }
 

@@ -343,11 +343,18 @@ pub trait LoadedPlugin: Send {
     /// synth thread が状態遷移ごとに呼ぶ。builtin VOICEVOX 以外は no-op。
     fn set_voicevox_status_reporter(&mut self, _reporter: VoicevoxStatusReporter) {}
 
-    /// (r.md #5 ARA2) Set up an ARA document for this instance: expose `clips`
-    /// as ARA audio sources + playback regions, bind the instance for playback
-    /// rendering, and (if `archive` is given) restore prior edits. Replaces any
-    /// existing ARA session. Returns `Ok(true)` when ARA was set up, `Ok(false)`
-    /// for non-ARA plug-ins (default).
+    /// (r.md #5 ARA2) If this plug-in is ARA-capable, create its ARA document
+    /// controller and bind the instance for playback rendering (empty model).
+    /// Returns `Ok(true)` when bound, `Ok(false)` for non-ARA plug-ins (default).
+    /// MUST be called once at load, **before** the first `activate` / state load
+    /// / GUI creation, as the ARA spec requires.
+    fn bind_ara_if_capable(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// (r.md #5 ARA2) Update the bound ARA document to expose `clips` as audio
+    /// sources + playback regions and (if `archive` is given) restore prior
+    /// edits. No-op returning `Ok(false)` when the instance is not ARA-bound.
     fn setup_ara(
         &mut self,
         _clips: &[common::protocol::AraClipSpec],

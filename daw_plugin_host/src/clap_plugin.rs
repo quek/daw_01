@@ -1769,32 +1769,19 @@ fn query_port_channel_count(
 }
 
 impl ClapPlugin {
-    /// (r.md #5 ARA2) Inherent ARA setup; the `LoadedPlugin` trait method
-    /// forwards here (inherent method resolution wins). Returns `Ok(false)`
-    /// when this descriptor exposes no ARA factory.
-    pub fn setup_ara(
-        &mut self,
-        clips: &[common::protocol::AraClipSpec],
-        archive: Option<&[u8]>,
-    ) -> Result<bool> {
+    /// (r.md #5 ARA2) Inherent ARA bind at load (before the first activate /
+    /// state load / GUI). The `LoadedPlugin` trait method forwards here. Returns
+    /// `Ok(false)` when this descriptor exposes no ARA factory.
+    pub fn bind_ara_if_capable(&mut self) -> Result<bool> {
         let id = CString::new(self.id.as_str()).context("plugin id has interior NUL")?;
         let factory =
             match unsafe { crate::ara::clap_ara::ara_factory_for_plugin(&*self.entry, &id) } {
                 Some(factory) => factory,
                 None => return Ok(false),
             };
-        // ARA bind must precede activation, and detaching regions requires the
-        // instance to be inactive, so deactivate around the (re)build, then
-        // restore the prior activation state.
-        let was_active = self.active;
-        let restore = self.last_activate;
-        if was_active {
-            self.deactivate();
-        }
-        self.ara = None; // drop any prior session while inactive
         let plugin = self.plugin;
         let session = unsafe {
-            crate::ara::session::AraSession::setup(factory, clips, |document_controller| {
+            crate::ara::session::AraSession::create(factory, |document_controller| {
                 crate::ara::clap_ara::bind_to_document(
                     plugin,
                     document_controller,
@@ -1802,19 +1789,42 @@ impl ClapPlugin {
                     crate::ara::extension::HOST_ASSIGNED_ROLES,
                 )
             })
-        };
+        }?;
+        self.ara = Some(session);
+        Ok(true)
+    }
+
+    /// (r.md #5 ARA2) Inherent ARA clip update; the `LoadedPlugin` trait method
+    /// forwards here. No-op (`Ok(false)`) when the instance is not ARA-bound.
+    pub fn setup_ara(
+        &mut self,
+        clips: &[common::protocol::AraClipSpec],
+        archive: Option<&[u8]>,
+    ) -> Result<bool> {
+        if self.ara.is_none() {
+            return Ok(false);
+        }
+        // set_clips / region detach require the instance inactive; deactivate
+        // around the update, then restore the prior activation state. The bind
+        // itself already happened at load (`bind_ara_if_capable`).
+        let was_active = self.active;
+        let restore = self.last_activate;
+        if was_active {
+            self.deactivate();
+        }
+        if let Some(session) = self.ara.as_mut() {
+            session.set_clips(clips);
+        }
+        if let Some(archive) = archive.filter(|a| !a.is_empty())
+            && let Some(session) = self.ara.as_ref()
+        {
+            session.restore_archive(archive);
+        }
         if was_active
             && let Some((sample_rate, min_frames, max_frames)) = restore
         {
             self.activate(sample_rate, min_frames, max_frames)?;
         }
-        let session = session?;
-        // Restore prior ARA edits (Melodyne pitch edits etc.) onto the freshly
-        // built model graph, if the project carried an archive for this slot.
-        if let Some(archive) = archive.filter(|a| !a.is_empty()) {
-            session.restore_archive(archive);
-        }
-        self.ara = Some(session);
         Ok(true)
     }
 
@@ -2101,6 +2111,10 @@ impl LoadedPlugin for ClapPlugin {
 
     fn deactivate(&mut self) {
         self.deactivate();
+    }
+
+    fn bind_ara_if_capable(&mut self) -> Result<bool> {
+        self.bind_ara_if_capable()
     }
 
     fn setup_ara(

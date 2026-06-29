@@ -57,86 +57,92 @@ pub struct AraSession {
 }
 
 impl AraSession {
-    /// Build the ARA model graph for a loaded plug-in and bind it for playback
-    /// rendering. `bind` performs the companion-API-specific instance binding
-    /// (CLAP / VST3) given the freshly created document controller ref.
+    /// Create the ARA document controller and bind the plug-in instance for
+    /// playback rendering, starting with an empty model (no audio yet). `bind`
+    /// performs the companion-API-specific instance binding (CLAP / VST3).
+    ///
+    /// Per the ARA spec the bind must precede the instance's **first** `activate`
+    /// / state load / GUI creation, so this runs at load time, before the host
+    /// activates the plug-in. Audio is attached later via [`Self::set_clips`]
+    /// (which only edits the model + renderer, never re-binds).
     ///
     /// # Safety
-    /// `factory` must be valid and belong to the loaded, inactive ARA-capable
+    /// `factory` must be valid and belong to the loaded, not-yet-activated
     /// plug-in that `bind` binds. The plug-in must remain loaded for the
     /// session's lifetime.
-    pub unsafe fn setup<F>(
-        factory: *const ARAFactory,
-        clips: &[AraClipSpec],
-        bind: F,
-    ) -> Result<Self>
+    pub unsafe fn create<F>(factory: *const ARAFactory, bind: F) -> Result<Self>
     where
         F: FnOnce(ARADocumentControllerRef) -> Option<*const ARAPlugInExtensionInstance>,
     {
         let controller = unsafe { AraDocumentController::create(factory, None) }?;
 
         controller.begin_editing();
-        let result = unsafe { Self::build_graph(&controller, clips, bind) };
-        controller.end_editing();
-
-        match result {
-            Ok((musical_context, region_sequence, sources, extension)) => {
-                // Enable sample access after editing (MiniHost order), then hand
-                // every region to the renderer so playback produces edited audio.
-                for owned in &sources {
-                    controller.enable_audio_source_samples_access(owned.source_ref, true);
-                }
-                for owned in &sources {
-                    extension.add_playback_region(owned.region_ref);
-                }
-                Ok(Self {
-                    musical_context,
-                    region_sequence,
-                    sources,
-                    extension,
-                    controller,
-                })
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Inner graph construction, run inside the begin/end editing bracket.
-    /// Returns the context/sequence refs, owned sources, and bound extension.
-    unsafe fn build_graph<F>(
-        controller: &AraDocumentController,
-        clips: &[AraClipSpec],
-        bind: F,
-    ) -> Result<(
-        ARAMusicalContextRef,
-        ARARegionSequenceRef,
-        Vec<OwnedAraSource>,
-        AraPlugInExtension,
-    )>
-    where
-        F: FnOnce(ARADocumentControllerRef) -> Option<*const ARAPlugInExtensionInstance>,
-    {
         let musical_context = controller
             .create_musical_context(std::ptr::null_mut(), 0)
             .context("plug-in returned null musical context")?;
         let region_sequence = controller
             .create_region_sequence(std::ptr::null_mut(), 0, musical_context)
             .context("plug-in returned null region sequence")?;
+        controller.end_editing();
 
-        let mut sources = Vec::with_capacity(clips.len());
-        for clip in clips {
-            sources.push(unsafe { build_source(controller, region_sequence, clip) }?);
-        }
-
-        // Bind must happen before the plug-in is activated; the instance is still
-        // inactive here. The caller's closure performs the companion-API-specific
-        // bind (CLAP / VST3) with the host's known/assigned roles.
+        // Bind while the instance is still inactive (before its first activate).
         let instance_ptr = bind(controller.controller_ref())
             .context("ARA bind_to_document_controller returned null")?;
         let extension = unsafe { AraPlugInExtension::from_instance_ptr(instance_ptr) }
             .context("null ARA plug-in extension instance")?;
 
-        Ok((musical_context, region_sequence, sources, extension))
+        Ok(Self {
+            musical_context,
+            region_sequence,
+            sources: Vec::new(),
+            extension,
+            controller,
+        })
+    }
+
+    /// Replace the document's audio sources / playback regions to match `clips`.
+    /// Best-effort: a clip whose source can't be decoded is skipped (logged) so
+    /// one bad source doesn't drop the rest.
+    ///
+    /// The caller must ensure the plug-in is **inactive** — ARA's
+    /// `addPlaybackRegion` / `removePlaybackRegion` (and detaching regions before
+    /// destroying them) require it.
+    pub fn set_clips(&mut self, clips: &[AraClipSpec]) {
+        // Detach + destroy the current sources / regions, freeing their host data.
+        for owned in &self.sources {
+            self.extension.remove_playback_region(owned.region_ref);
+        }
+        self.controller.begin_editing();
+        for owned in &self.sources {
+            self.controller.destroy_playback_region(owned.region_ref);
+            self.controller.destroy_audio_modification(owned.modification_ref);
+            self.controller.destroy_audio_source(owned.source_ref);
+        }
+        self.sources = Vec::new();
+
+        let mut new_sources = Vec::with_capacity(clips.len());
+        for clip in clips {
+            match unsafe { build_source(&self.controller, self.region_sequence, clip) } {
+                Ok(source) => new_sources.push(source),
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        id = %clip.persistent_id,
+                        "ARA: skipping clip with unreadable source"
+                    );
+                }
+            }
+        }
+        self.controller.end_editing();
+
+        for owned in &new_sources {
+            self.controller
+                .enable_audio_source_samples_access(owned.source_ref, true);
+        }
+        for owned in &new_sources {
+            self.extension.add_playback_region(owned.region_ref);
+        }
+        self.sources = new_sources;
     }
 
     /// Serialise the plug-in's ARA edit state for project save.
