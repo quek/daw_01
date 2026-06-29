@@ -7968,7 +7968,20 @@ impl AppData {
 
         self.ara_doc_cache = live;
         for ((track, index), clips) in to_send {
-            self.send_plugin(MainToChild::SetupAraDocument { track, index, clips });
+            // Restore any saved ARA edits for this device alongside the rebuild.
+            let archive = self
+                .song
+                .tracks
+                .iter()
+                .find(|t| t.id == track)
+                .and_then(|t| t.devices.get(index as usize))
+                .and_then(|d| d.ara_archive.clone());
+            self.send_plugin(MainToChild::SetupAraDocument {
+                track,
+                index,
+                clips,
+                archive,
+            });
         }
         for (track, index) in stale {
             self.send_plugin(MainToChild::ClearAraDocument { track, index });
@@ -9112,6 +9125,13 @@ impl AppData {
             };
             if let Some(p) = chain.get_mut(s.index as usize) {
                 p.state = s.data.clone();
+                // (r.md #5 ARA2) Only overwrite the ARA archive when the plug-in
+                // actually produced one; a non-ARA device or a not-yet-bound
+                // session reports None, and we must not wipe a previously-saved
+                // archive in that case.
+                if s.ara_archive.is_some() {
+                    p.ara_archive = s.ara_archive.clone();
+                }
             }
         }
     }

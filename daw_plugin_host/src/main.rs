@@ -359,6 +359,7 @@ enum PluginCommand {
         track: u32,
         index: u32,
         clips: Vec<common::protocol::AraClipSpec>,
+        archive: Option<Vec<u8>>,
     },
     /// (r.md #5 ARA2) Tear down the ARA session for the plugin at `track`/`index`.
     ClearAraDocument {
@@ -1497,9 +1498,9 @@ fn plugin_main_loop(
                     };
                     let _ = evt_tx.send(PluginEvent::SlotPluginState { track, index, data });
                 }
-                PluginCommand::SetupAraDocument { track, index, clips } => {
+                PluginCommand::SetupAraDocument { track, index, clips, archive } => {
                     match tracks.plugin_at_mut(track, index) {
-                        Some(plugin) => match plugin.setup_ara(&clips) {
+                        Some(plugin) => match plugin.setup_ara(&clips, archive.as_deref()) {
                             Ok(true) => {
                                 tracing::info!(track, index, n = clips.len(), "ARA document set up");
                             }
@@ -1797,6 +1798,7 @@ fn collect_all_states(handle: &mut TracksHandle) -> Vec<SlotState> {
                     track: track_id,
                     index,
                     data,
+                    ara_archive: plugin.store_ara_archive(),
                     error,
                 });
             }
@@ -2087,9 +2089,9 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
             tracing::info!(track, index, "received RequestSlotState");
             plugin.send(PluginCommand::RequestSlotState { track, index });
         }
-        MainToChild::SetupAraDocument { track, index, clips } => {
-            tracing::info!(track, index, n = clips.len(), "received SetupAraDocument");
-            plugin.send(PluginCommand::SetupAraDocument { track, index, clips });
+        MainToChild::SetupAraDocument { track, index, clips, archive } => {
+            tracing::info!(track, index, n = clips.len(), has_archive = archive.is_some(), "received SetupAraDocument");
+            plugin.send(PluginCommand::SetupAraDocument { track, index, clips, archive });
         }
         MainToChild::ClearAraDocument { track, index } => {
             tracing::info!(track, index, "received ClearAraDocument");

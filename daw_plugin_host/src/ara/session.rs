@@ -137,6 +137,21 @@ impl AraSession {
 
         Ok((musical_context, region_sequence, sources, extension))
     }
+
+    /// Serialise the plug-in's ARA edit state for project save.
+    pub fn store_archive(&self) -> Option<Vec<u8>> {
+        self.controller.store_objects_to_archive()
+    }
+
+    /// Restore ARA edit state (from a prior [`Self::store_archive`]) onto the
+    /// already-built model graph. Bracketed in an editing session, as ARA 2
+    /// requires for `restoreObjectsFromArchive`.
+    pub fn restore_archive(&self, archive: &[u8]) -> bool {
+        self.controller.begin_editing();
+        let ok = self.controller.restore_objects_from_archive(archive);
+        self.controller.end_editing();
+        ok
+    }
 }
 
 /// Create one source → modification → playback region chain for a clip.

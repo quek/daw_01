@@ -110,35 +110,99 @@ static AUDIO_ACCESS_IFACE: ARAAudioAccessControllerInterface = ARAAudioAccessCon
     destroyAudioReader: Some(audio_access_destroy_reader),
 };
 
-// --- Archiving controller (stub until the persistence step) ----------------
+// --- Archiving controller --------------------------------------------------
+
+/// Maximum ARA archive the host will buffer (32 MiB). Guards against a
+/// pathological plug-in growing the writer without bound.
+const MAX_ARA_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Host writer behind an `ARAArchiveWriterHostRef`. The plug-in serialises its
+/// edit state by calling `writeBytesToArchive`, possibly out of order (ARA
+/// permits rewinding to patch chunk headers), so the buffer grows and zero-fills
+/// gaps as needed.
+#[derive(Default)]
+pub struct AraArchiveWriter {
+    pub data: Vec<u8>,
+}
+
+impl AraArchiveWriter {
+    fn write_at(&mut self, position: usize, src: &[u8]) -> bool {
+        let Some(end) = position.checked_add(src.len()) else {
+            return false;
+        };
+        if end > MAX_ARA_ARCHIVE_BYTES {
+            return false;
+        }
+        if self.data.len() < end {
+            self.data.resize(end, 0);
+        }
+        self.data[position..end].copy_from_slice(src);
+        true
+    }
+}
+
+/// Host reader behind an `ARAArchiveReaderHostRef` during restore. Owns a copy
+/// of the archive so its lifetime is independent of the caller's buffer.
+pub struct AraArchiveReader {
+    data: Vec<u8>,
+}
+
+impl AraArchiveReader {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+}
 
 unsafe extern "C" fn archiving_get_size(
     _controller: ARAArchivingControllerHostRef,
-    _reader: ARAArchiveReaderHostRef,
+    reader: ARAArchiveReaderHostRef,
 ) -> ARASize {
-    0
+    unsafe { reader.cast::<AraArchiveReader>().as_ref() }.map_or(0, |r| r.data.len())
 }
 
 unsafe extern "C" fn archiving_read_bytes(
     _controller: ARAArchivingControllerHostRef,
-    _reader: ARAArchiveReaderHostRef,
-    _position: ARASize,
-    _length: ARASize,
-    _buffer: *mut ARAByte,
+    reader: ARAArchiveReaderHostRef,
+    position: ARASize,
+    length: ARASize,
+    buffer: *mut ARAByte,
 ) -> ARABool {
-    tracing::warn!("ARA archiving read invoked before persistence is implemented");
-    ARA_FALSE
+    let Some(reader) = (unsafe { reader.cast::<AraArchiveReader>().as_ref() }) else {
+        return ARA_FALSE;
+    };
+    if buffer.is_null() {
+        return ARA_FALSE;
+    }
+    let Some(end) = position.checked_add(length) else {
+        return ARA_FALSE;
+    };
+    if end > reader.data.len() {
+        return ARA_FALSE; // reading past the archive end is a programming error
+    }
+    let dst = unsafe { core::slice::from_raw_parts_mut(buffer, length) };
+    dst.copy_from_slice(&reader.data[position..end]);
+    ARA_TRUE
 }
 
 unsafe extern "C" fn archiving_write_bytes(
     _controller: ARAArchivingControllerHostRef,
-    _writer: ARAArchiveWriterHostRef,
-    _position: ARASize,
-    _length: ARASize,
-    _buffer: *const ARAByte,
+    writer: ARAArchiveWriterHostRef,
+    position: ARASize,
+    length: ARASize,
+    buffer: *const ARAByte,
 ) -> ARABool {
-    tracing::warn!("ARA archiving write invoked before persistence is implemented");
-    ARA_FALSE
+    let Some(writer) = (unsafe { writer.cast::<AraArchiveWriter>().as_mut() }) else {
+        return ARA_FALSE;
+    };
+    if buffer.is_null() {
+        return ARA_FALSE;
+    }
+    let src = unsafe { core::slice::from_raw_parts(buffer, length) };
+    if writer.write_at(position, src) {
+        ARA_TRUE
+    } else {
+        ARA_FALSE
+    }
 }
 
 unsafe extern "C" fn archiving_notify_archiving_progress(

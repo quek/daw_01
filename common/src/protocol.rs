@@ -311,6 +311,10 @@ pub struct SlotState {
     pub track: u32,
     pub index: u32,
     pub data: Option<Vec<u8>>,
+    /// (r.md #5 ARA2) ARA document archive for this device, if it is an ARA
+    /// plug-in with a live session. Collected alongside `data` on project save
+    /// and stored into `PluginInstance.ara_archive`.
+    pub ara_archive: Option<Vec<u8>>,
     pub error: Option<String>,
 }
 
@@ -704,6 +708,9 @@ pub enum MainToChild {
         track: u32,
         index: u32,
         clips: Vec<AraClipSpec>,
+        /// Prior ARA edit archive to restore after (re)building the document
+        /// (from `PluginInstance.ara_archive`). `None` for a fresh document.
+        archive: Option<Vec<u8>>,
     },
     /// (r.md #5 ARA2) Tear down the ARA document/session for `track`/`index`
     /// (e.g. the ARA device was removed). daw_audio ignores this.
@@ -802,12 +809,14 @@ mod tests {
                     track: 0,
                     index: 1,
                     data: Some(vec![1, 2, 3, 4]),
+                    ara_archive: None,
                     error: None,
                 },
                 SlotState {
                     track: 3,
                     index: 4,
                     data: None,
+                    ara_archive: None,
                     error: Some("state save failed".to_string()),
                 },
             ],

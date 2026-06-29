@@ -344,15 +344,26 @@ pub trait LoadedPlugin: Send {
     fn set_voicevox_status_reporter(&mut self, _reporter: VoicevoxStatusReporter) {}
 
     /// (r.md #5 ARA2) Set up an ARA document for this instance: expose `clips`
-    /// as ARA audio sources + playback regions and bind the instance for
-    /// playback rendering, replacing any prior ARA session. Returns `Ok(true)`
-    /// when ARA was set up, `Ok(false)` for non-ARA plug-ins (default).
-    fn setup_ara(&mut self, _clips: &[common::protocol::AraClipSpec]) -> Result<bool> {
+    /// as ARA audio sources + playback regions, bind the instance for playback
+    /// rendering, and (if `archive` is given) restore prior edits. Replaces any
+    /// existing ARA session. Returns `Ok(true)` when ARA was set up, `Ok(false)`
+    /// for non-ARA plug-ins (default).
+    fn setup_ara(
+        &mut self,
+        _clips: &[common::protocol::AraClipSpec],
+        _archive: Option<&[u8]>,
+    ) -> Result<bool> {
         Ok(false)
     }
 
     /// (r.md #5 ARA2) Tear down this instance's ARA session, if any.
     fn clear_ara(&mut self) {}
+
+    /// (r.md #5 ARA2) Serialise this instance's ARA edit state for project save,
+    /// or `None` if it is not an ARA instance / has no live session.
+    fn store_ara_archive(&self) -> Option<Vec<u8>> {
+        None
+    }
 
     // --- embedded Win32 GUI (plugin-main thread) ------------------------
     //

@@ -1772,7 +1772,11 @@ impl ClapPlugin {
     /// (r.md #5 ARA2) Inherent ARA setup; the `LoadedPlugin` trait method
     /// forwards here (inherent method resolution wins). Returns `Ok(false)`
     /// when this descriptor exposes no ARA factory.
-    pub fn setup_ara(&mut self, clips: &[common::protocol::AraClipSpec]) -> Result<bool> {
+    pub fn setup_ara(
+        &mut self,
+        clips: &[common::protocol::AraClipSpec],
+        archive: Option<&[u8]>,
+    ) -> Result<bool> {
         let id = CString::new(self.id.as_str()).context("plugin id has interior NUL")?;
         let factory =
             match unsafe { crate::ara::clap_ara::ara_factory_for_plugin(&*self.entry, &id) } {
@@ -1795,7 +1799,13 @@ impl ClapPlugin {
         {
             self.activate(sample_rate, min_frames, max_frames)?;
         }
-        self.ara = Some(session?);
+        let session = session?;
+        // Restore prior ARA edits (Melodyne pitch edits etc.) onto the freshly
+        // built model graph, if the project carried an archive for this slot.
+        if let Some(archive) = archive.filter(|a| !a.is_empty()) {
+            session.restore_archive(archive);
+        }
+        self.ara = Some(session);
         Ok(true)
     }
 
@@ -1815,6 +1825,11 @@ impl ClapPlugin {
         {
             let _ = self.activate(sample_rate, min_frames, max_frames);
         }
+    }
+
+    /// (r.md #5 ARA2) Serialise the current ARA session's edit state, if any.
+    pub fn store_ara_archive(&self) -> Option<Vec<u8>> {
+        self.ara.as_ref().and_then(|session| session.store_archive())
     }
 }
 
@@ -2079,12 +2094,20 @@ impl LoadedPlugin for ClapPlugin {
         self.deactivate();
     }
 
-    fn setup_ara(&mut self, clips: &[common::protocol::AraClipSpec]) -> Result<bool> {
-        self.setup_ara(clips)
+    fn setup_ara(
+        &mut self,
+        clips: &[common::protocol::AraClipSpec],
+        archive: Option<&[u8]>,
+    ) -> Result<bool> {
+        self.setup_ara(clips, archive)
     }
 
     fn clear_ara(&mut self) {
         self.clear_ara();
+    }
+
+    fn store_ara_archive(&self) -> Option<Vec<u8>> {
+        self.store_ara_archive()
     }
 
     fn start_processing(&mut self) -> Result<()> {

@@ -149,6 +149,30 @@ impl AraDocumentController {
             unsafe { notify(self.controller_ref) };
         }
     }
+
+    /// Serialise the plug-in's edit state (audio modifications etc.) to an ARA
+    /// archive. Call outside an editing session. `None` if the plug-in has no
+    /// archiving support or the store failed.
+    pub fn store_objects_to_archive(&self) -> Option<Vec<u8>> {
+        let store = self.interface.storeObjectsToArchive?;
+        let mut writer = host_controllers::AraArchiveWriter::default();
+        let writer_ref = ptr::from_mut(&mut writer) as ara_sys::ARAArchiveWriterHostRef;
+        let ok = unsafe { store(self.controller_ref, writer_ref, ptr::null()) };
+        (ok != 0).then_some(writer.data)
+    }
+
+    /// Restore plug-in edit state from an ARA archive. Call inside an editing
+    /// session, after the matching model objects (sources / modifications with
+    /// the archived persistent ids) have been re-created.
+    pub fn restore_objects_from_archive(&self, archive: &[u8]) -> bool {
+        let Some(restore) = self.interface.restoreObjectsFromArchive else {
+            return false;
+        };
+        let mut reader = host_controllers::AraArchiveReader::new(archive.to_vec());
+        let reader_ref = ptr::from_mut(&mut reader) as ara_sys::ARAArchiveReaderHostRef;
+        let ok = unsafe { restore(self.controller_ref, reader_ref, ptr::null()) };
+        ok != 0
+    }
 }
 
 impl Drop for AraDocumentController {
