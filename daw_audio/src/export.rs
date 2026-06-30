@@ -116,8 +116,11 @@ pub fn run_export(
     // before `path` is moved into the WAV writer below.
     let sidecar_path = common::mod_sidecar::ModEnvSidecar::sidecar_path(&path);
     let n_tracks = song.tracks.len().min(MAX_TRACKS);
-    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
-    let song_length_samples = (song.length_beats * samples_per_beat).max(0.0) as u64;
+    // A2 (r.md #8): tempo automation を持つ曲も再生と同じ尺で焼くため、 song body の
+    // sample 長は SongTempo カーブを積分して求める (constant-bpm なら従来の線形
+    // `length_beats * 60*SR/bpm` と一致)。
+    let song_length_samples =
+        common::automation::beats_to_samples(&song, sample_rate, song.length_beats);
     let tail_max_samples = u64::from(sample_rate) * TAIL_MAX_SECONDS;
 
     // `write_*` = the window written to the WAV; `walk_start` = where the
@@ -328,6 +331,10 @@ fn render_loop(
     // retriggered). Samples before `write_start` are rendered but not written.
     let mut frames_written: u64 = 0;
     let mut playhead: u64 = walk_start;
+    // A2 (r.md #8): beat 累算器。 live engine と同じく buffer 毎に current_bpm で
+    // integrate して進める (= sample↔beat 対応が tempo automation に追従)。 曲中から
+    // 始まる range 書き出しは walk_start に対応する beat で seed する。
+    let mut playhead_beats = common::automation::samples_to_beats(song, sample_rate, walk_start);
     while playhead < total_samples {
         // User abort (`MainToChild::CancelExport`). Checked before any
         // work this buffer so the render stops promptly; `run_export`
@@ -358,21 +365,14 @@ fn render_loop(
             (u32, common::model::AutomationTarget),
         > = std::collections::HashSet::new();
 
-        // Phase 5 follow-up (MIDI tempo follow): offline export は constant
-        // song.bpm で freewheel するので、 playhead_beats を sample-domain
-        // から linear 換算で求める (= playhead * bpm / (60 * SR))。 SongTempo
-        // lane を offline export で評価して time-stretch するのは別 phase
-        // のスコープ。
-        let playhead_beats = playhead as f64 * song.bpm as f64
-            / (60.0 * sample_rate as f64);
-
-        // Phase 5 follow-up (granular DSP click 抑制) / r.md #6: offline export は
-        // constant song.bpm で freewheel するので smoothed_current_bpm = song.bpm
-        // (= LP smoothing 不要、 過渡応答も click 源も無い)。 render 側 Stretch は
-        // tempo_follow_ratio(stretch_ratio, song.bpm, nominal_bpm) で source 進度を
-        // 出すので、 import 後に bpm を変えてから export すると (= nominal != song.bpm)
-        // 追従して伸縮した結果が WAV に焼かれる (= 旧実装は 1.0 固定で追従しなかった)。
-        let smoothed_current_bpm_freewheel = f64::from(song.bpm);
+        // A2 (r.md #8): 当該 buffer の effective tempo を SongTempo カーブから取り、
+        // live 再生と同じ sample↔beat 対応にする。 `playhead_beats` は buffer 毎に
+        // この bpm で integrate される累算器 (seed は walk_start、 advance はループ末尾)。
+        // render 側 Stretch は tempo_follow_ratio(stretch_ratio, current_bpm,
+        // nominal_bpm) で source 進度を出すので、 tempo automation 中の伸縮も再生と
+        // 一致して WAV に焼かれる (= 旧実装は constant song.bpm で曲を早切りしていた)。
+        let smoothed_current_bpm_freewheel =
+            f64::from(common::automation::evaluate_song_tempo(song, playhead_beats));
 
         // docs/plan_modulation.md §5: snapshot the prev buffer's follower envs
         // (slot order) so audio-param modulation renders into the WAV too.
@@ -527,6 +527,12 @@ fn render_loop(
         }
 
         playhead += frames as u64;
+        // A2 (r.md #8): beat 累算器を当該 buffer の tempo で進める (live engine の
+        // buffer 末 `playhead_beats += n*bpm/(60*SR)` と同一式)。
+        if sample_rate > 0 {
+            playhead_beats +=
+                frames as f64 * smoothed_current_bpm_freewheel / (60.0 * f64::from(sample_rate));
+        }
 
         // Report song-body render progress to the host (the caller's
         // sender throttles the actual IPC send). `done` caps at

@@ -1,0 +1,97 @@
+# r.md #8 — 後フェーズ送り / 手ぬき実装 監査 (最終形までの実装計画)
+
+「最終形まで実装する。フェーズ分けをしない」(CLAUDE.md) に違反して **後回し・手ぬきになっている箇所** を、
+全クレートを**コメントだけでなく実コードのロジックから**監査した結果。各項目は周辺コードを Read して裏取り済み。
+stale なだけ (= 実は実装済み) のマーカーは除外し、**現在の納品済み挙動が壊れている / no-op な物のみ**を載せる。
+
+監査範囲: `common/` `daw_audio/` `daw_plugin_host/` `daw_gui/` `ui/crates/{platform,renderer,ui}`
+(examples / tests / benches / 生成バインディングは対象外)。
+
+---
+
+## 横断テーマ (個別項目の背後にある構造的欠陥)
+
+1. **サンプルレートが 48000 固定の前提** — engine / plugin activation / GUI の拍計算が全て
+   `audio_bridge::SAMPLE_RATE = 48000` を SSoT にしているが、CPAL デバイスは native default で開く。
+   非48kHz デバイスで全体が誤ピッチ・誤テンポ。VOICEVOX 未リサンプルも同根。
+2. **テンポオートメーション (SongTempo lane) が live のみ尊重、オフライン全経路で無視** —
+   WAV/動画 export・MIDI export・動画 event の尺マップ・loop wrap 推定。再生と書き出しが一致しない。
+3. **plugin param の automation / modulation 配線が track FX 止まり** — group/master FX、lane 既定値、
+   MIDI Learn 注入、block-rate 階段、実名表示が未完。
+
+---
+
+## A. 正しさ (出力が間違う) — 最優先
+
+| # | file:line | 手ぬき | 最終形 | sev | effort |
+|---|---|---|---|---|---|
+| A1 | daw_audio/main.rs:82,950,1037 / common/audio_bridge.rs:6 / daw_gui/bootstrap.rs:207 | session SR が 48000 ハードコード。device は native rate で再生、突き合わせ無し・resample 無し → 非48kHzで全体誤ピッチ/誤テンポ | device native rate を SSoT 化 (daw_audio が device rate を採用し GUI/plugin/voicevox へ伝播)。const は fallback に降格 | correctness | M-L |
+| A2 | daw_audio/export.rs:366 | WAV/動画 export が constant `song.bpm` で freewheel、tempo lane 無視 (live は engine.rs:864 で `evaluate_song_tempo`) | export walk も per-buffer `evaluate_song_tempo` で可変 sample↔beat 積分 | correctness | M |
+| A3 | daw_gui/midi_export.rs:8 | MIDI export が tempo 1個 (曲頭 bpm) のみ + CC/PitchBend 欠落 | SongTempo curve を tick 列の複数 tempo event に展開、CC/PitchBend も SMF 化 | correctness | M |
+| A4 | common/model.rs:3966 | 動画 event の source↔尺マップが tempo 変化を無視 (CFR 前提) | tempo 積分した beat→source-time マップ | correctness | M |
+| A5 | daw_gui/app.rs:21091 | send 削除時に後続 `SendGain{send_idx}` automation lane を reindex せず stale index 参照 | send 削除に追従し後続 lane の send_idx を詰める | correctness | M |
+| A6 | daw_gui/app.rs:13608 | touched plugin param / send から作る automation lane の既定値が 0.0 固定 | IPC で現在値を引いて lane 既定値に入れる | correctness | M |
+| A7 | common/model.rs:3805 | VFR 動画を nominal FPS の CFR とみなしフレームタイミングがドリフト | per-frame PTS を尊重 | correctness | M |
+| A8 | common/scale.rs:148 | 異名同音を `#` 固定。フラット系キーで音名誤り (Bb→A#) | key(root+scale) に応じ `#`/`b` を選ぶ enharmonic spelling | user可視 | M |
+| A9 | daw_plugin_host/builtin/voicevox.rs:689 | 合成 wav 常に 48000Hz を device 出力へ 1:1 mix (resample 無し) → A1 と合わせ非48kで誤ピッチ | 合成 wav SR と session SR を resample 整合 (A1 で session=device rate 化後に必須) | correctness | M |
+| A10 | daw_audio/engine.rs:1180 | loop wrap 時の playhead_beats が constant bpm 線形推定 (tempo automation 下で微小ズレ) | loop start beat を SongTempo lane から正確逆算 | 低 | S |
+
+## B. UI にあるのに no-op / 未完の機能
+
+| # | file:line | 手ぬき | 最終形 | sev | effort |
+|---|---|---|---|---|---|
+| B1 | common/model.rs:3860 / daw_audio/audio_clip_renderer.rs:546 | `StretchMode::Slice` が inspector で選べるが onset 検出がワークスペースに無く `onsets` 常に空 → Raw 等価に退化 (Stretch 均一伸縮は実装済) | onset/transient 検出を実装し `onsets` 充填、拍ロックスライス再生 | user可視 | L |
+| B2 | daw_gui/app.rs:14179 | MIDI Learn → PluginParam bind は永続化+status 出すが CC 受信は warn のみで音に出ない (注入未実装) | RT-safe IPC で audio→plugin host に CLAP_EVENT_PARAM_VALUE / IParameterChanges 注入 | user可視 | L |
+| B3 | daw_audio/engine.rs:1677,2382 | group/master FX の param **automation** (`fill_pd_param_events` 不呼出) と **modulation** (空 `&[]` mod_scalars) が未配線。track FX のみ動く。master fx automation lane を持つ data model も無い | master fx automation lane を data model 追加 + group/master process へ mod_scalars snapshot plumbing | user可視 | M |
+| B4 | daw_audio/automation.rs:133 | plugin param automation が block-rate (frame0 で1回 push)。builtin Vol/Pan は per-sample → 速い automation で zipper | sub-buffer (64frame 刻み等) で複数 push_param し sample-accurate 化 | user可視 | M |
+| B5 | daw_gui/app.rs:20330 | automation 録音中、対応 lane/clip が無い gesture を silently skip (Bitwig 流 auto-create 無し) → 無反応 | 録音対象に lane/clip が無ければ自動生成 | user可視 | M |
+| B6 | daw_gui/app.rs:923 | PluginParam の表示名が `format!("Param {id}")` (実名解決経路なし) | IPC param 名 cache を引いて実名表示 | user可視(低) | M |
+| B7 | daw_plugin_host/builtin/voicevox.rs:866 | builtin VOICEVOX に埋め込み GUI 無し (speaker picker / 合成進捗バーをエディタ窓から開けない) | speaker 選択 + 進捗バーの埋め込み GUI 実装 | user可視 | L |
+| B8 | daw_gui/app.rs:19419,639 | sidechain/aux 入力が常に PostFader 固定 + aux port 0 のみ露出 (Pre/PostFx 切替・複数 port 未配線) | inspector に Pre/PostFx タップ切替 + 全 aux port 行展開 | user可視(低) | M |
+| B9 | common/video_fx.rs:56 | 映像効果 Time/Feedback (echo/残像) が enum/label/`needs_history`/WGSL 規約まで宣言済だが実 effect ゼロ | feedback/history ターゲット経路を稼働させ echo/trail 効果実装 | 低 | M |
+| B10 | daw_gui/view/modulation.rs:155 | text の W/H が modulation target 不可 (image W/H は可、非対称) | TextBuiltin に W/H を追加し image と対称化 | user可視(低) | M |
+| B11 | daw_gui/app.rs:3081 / common | follower→SongTempo/TimeSig の song-level modulation を engine が消費せず silent | engine + export bake が song-level modulation を消費し tempo 変調可能化 | user可視(低) | L |
+| B12 | common/model.rs:3864 | warp-marker (`beat_markers`) が生成UI も消費経路も無い dead field。非均一 time-stretch サブ機能未着手 | warp-marker 編集 UI + 非均一 stretch 消費 | 低 | M |
+| B13 | daw_gui/view/audio_editor.rs:353 | Audio Editor の Alt+wheel が当面 no-op (vertical gain zoom 予約) | vertical gain zoom 等を割当 | 低 | S |
+
+## C. プラグインホスト忠実度 (VST3/CLAP/DPI)
+
+| # | file:line | 手ぬき | 最終形 | sev | effort |
+|---|---|---|---|---|---|
+| C1 | daw_plugin_host/main.rs:2124, vst3_plugin.rs:1800 | プラグイン GUI の DPI scale を 1.0 固定 (GetDpiForWindow 未照会、VST3 IPlugViewContentScaleSupport skip) → HiDPI で極小/ぼやけ | host HWND の DPI を query し CLAP gui.set_scale / VST3 setContentScaleFactor に渡す | user可視 | M |
+| C2 | daw_plugin_host/vst3_host.rs:67 | IHostApplication::createInstance が kNotImplemented で IMessage/IAttributeList 提供せず → processor↔controller messaging 使う VST3 が状態同期不可 | IMessage/IAttributeList の host 実装提供 | correctness | M |
+| C3 | daw_plugin_host/vst3_host.rs:135 | restartComponent をログのみで無視 (kLatencyChanged/kParamValuesChanged/kReloadComponent/kIoChanged) | flags を見て deactivate→activate / latency 再query / param 再列挙 | correctness | M |
+| C4 | daw_plugin_host/vst3_plugin.rs:542 | 3ch 以上のバスを全て stereo fallback (コメントは surround と不一致) | チャンネル数に応じた正確な SpeakerArrangement (5.1/7.1) | 低 | M |
+| C5 | daw_plugin_host/vst3_plugin.rs:1588 | process() 非OK status の記録/警告が debug ビルド限定 → 納品物で診断ゼロ | release でも RT 安全に atomic 記録→off-RT で1回ログ | 低 | S |
+| C6 | daw_plugin_host/clap_host.rs:167 | gui_request_show/hide が常に false で無視 | 該当エディタ窓を SetForegroundWindow / hide へ配線 | 低 | S |
+
+## D. RT安全 / perf
+
+| # | file:line | 手ぬき | 最終形 | sev | effort |
+|---|---|---|---|---|---|
+| D1 | daw_audio/graph/compile.rs:42 | routing schedule の compile (Vec/HashMap alloc) が RT audio callback 上で song 編集着地時に走る (`TODO(PR3)`)。clip-render schedule では既に main.rs `publish_schedule` で off-thread ArcSwap 済 — routing だけ取り残し | routing も GUI/IPC スレッドで compile→ArcSwap publish、RT は load のみ | RT | M |
+| D2 | daw_gui/app.rs:3720 | automation 編集の Undo が一律 Song 全体 snapshot (snapshotless 先送り) | 差分 (prev/next) ベース snapshotless undo | perf(低) | L |
+| D3 | daw_gui/view/arrangement_view.rs:185 | 毎フレーム `Vec<ArrangementTrack>` を全 track×clip 再確保 (name Arc::from、nested collect) | AppData に Arc<str> 保持し rename 時のみ再生成 | perf | M |
+| D4 | daw_gui/view/arrangement_view.rs:2450 | lane label の SendGain/PluginParam 枝だけ毎フレーム `format!`+Arc::from | lane id→label キャッシュ、target 変更時のみ再生成 | perf(低) | M |
+
+## E. プラットフォーム / IME / メーター (軽微)
+
+| # | file:line | 手ぬき | 最終形 | sev | effort |
+|---|---|---|---|---|---|
+| E1 | ui/platform/src/tsf/text_store.rs:478 | GetACPFromPoint (TSF 逆 hit-test) が常に TS_E_NOLAYOUT → MS-IME のポイント再変換等が効かない | CaretResolver に座標→ACP 逆引き実装 | user可視(IME) | M |
+| E2 | ui/platform/src/winit_backend.rs:526 | CursorIcon::Hidden を Default で代用 (カーソル消えない) | window.set_cursor_visible(false) を配線 | user可視 | S |
+| E3 | ui/platform/src/winit_backend.rs:364 | マウス Back/Forward を Other(0xffff) に畳む (両方衝突) | Back/Forward を専用 variant にマップ | 低 | S |
+| E4 | ui/ui/src/widgets/level_meter.rs:8 | MeterBallistic::Vu が単一対称指数平滑で IEC 60268-17 弾道 (300ms 積分 + overshoot) でない → Rms とほぼ同等 | dt 駆動で上昇/下降時定数分離 + overshoot の真の VU 弾道 | user可視(限定) | M |
+| E5 | daw_audio/audio_clip_renderer.rs:641 | granular Stretch の tempo 変化時残留 click (LP smoothing の partial mitigation) | per-event grain-trigger lock-in で buffer 跨ぎ source position 固定 | 低 | L |
+
+## F. クリーンアップ (挙動でなく dead/stale)
+
+- `daw_gui/view/preview_window.rs:121` `CompositeLayer` (約20行) は crate 内で一度も構築されないデッドコード。`:136` の「rotation 未対応」コメントは**誤り** (実際は `group_compose.rs` が rotation_radians+pivot を正しく渡し回転は動作)。削除。
+- stale な Phase-N コメント群 (実は実装済み): `common/automation.rs:34` (Phase2 = `*_ranged` 済)、`common/audio_render.rs` (granular/slice DSP 実装済)、`model.rs:2769` PreFx (配線済)、`protocol.rs:231` PluginParamValueChanged (Phase4 で消費)、ui `ui.rs:1801` / `event.rs:157` (配線済) — コメントを現状に更新。
+- `daw_plugin_host/builtin/voicevox.rs:115` の note_offsets コメント陳腐化 (実際は process():657 で参照)。
+
+## Out-of-scope (納品済み機能の手ぬきではない別スコープ未着手 — 今回は対象外候補)
+
+audio 入力録音 (SetTrackArmed) / 非Windows build / WAV 以外の audio import (mp3/flac) / animated GIF・APNG・SVG・RAW import /
+baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAccess の tempo-map / i18n /
+動画 export の perf パイプライン化 (encode readback 先読み・libav decode 統一) / surround (>stereo)。

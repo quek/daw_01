@@ -149,6 +149,11 @@ pub struct PianoRollScale {
     pub in_scale_mask: u16,
     /// 表示モード。 Highlight は行リスト不変 + 背景 tint、 Fold は in-scale 行のみで構成。
     pub mode: PianoRollScaleMode,
+    /// このキーで音名を flat 表記 (Db/Eb/Gb/Ab/Bb) にするか。 caller (daw_01) が
+    /// `common::scale::prefers_flats(root, scale)` で五度圏から決めて渡す。 鍵盤
+    /// ラベル / root 表示の異名同音綴りに使い、 Bb メジャーの root を `A#` でなく
+    /// `Bb` と綴る。 例 / chromatic 文脈や調号が曖昧なスケールでは `false` (sharp 既定)。
+    pub prefer_flats: bool,
 }
 
 /// (M14 Phase 70 / daw_01 #042) `PianoRollScale.mode` の取り得る値。
@@ -963,14 +968,25 @@ impl RowGeometry {
     }
 }
 
-/// (M14 Phase 70 / daw_01 #042) pitch class (0..=11) → 表記文字列 (sharp 固定 v0)。
-/// `0 = C、 1 = C#、 ... 11 = B`。 enharmonic spelling (Db / Eb / 等) は将来 caller-side カスタム
-/// API で対応する scope 外 (conversation #042 §4 参照)。
+/// (M14 Phase 70 / daw_01 #042) pitch class (0..=11) → 音名 (sharp 表記)。
+/// `0 = C、 1 = C#、 ... 11 = B`。 キーの調号に応じた異名同音綴り (Db / Eb 等) は
+/// [`pitch_class_name_spelled`] を使う (`PianoRollScale.prefer_flats` 経由)。
 #[must_use]
 pub fn pitch_class_name(pc: u8) -> &'static str {
-    const NAMES: [&str; 12] =
+    pitch_class_name_spelled(pc, false)
+}
+
+/// pitch class (0..=11) → 音名。 `prefer_flats` で flat 表記 (Db/Eb/Gb/Ab/Bb) と
+/// sharp 表記 (C#/D#/F#/G#/A#) を切り替える (= キーの調号に追従した異名同音綴り)。
+/// 白鍵 (C D E F G A B) はどちらでも同じ。
+#[must_use]
+pub fn pitch_class_name_spelled(pc: u8, prefer_flats: bool) -> &'static str {
+    const SHARP: [&str; 12] =
         ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-    NAMES[(pc % 12) as usize]
+    const FLAT: [&str; 12] =
+        ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+    let i = (pc % 12) as usize;
+    if prefer_flats { FLAT[i] } else { SHARP[i] }
 }
 
 /// 内部 helper: cursor 位置がこの note のどの zone (Move / ResizeLeft / ResizeRight)
@@ -3289,7 +3305,7 @@ fn draw_grid_background<M: ?Sized + 'static>(
             // Label: 全 in-scale 行に
             if geom.row_h >= 8.0 {
                 let pc = pitch % 12;
-                let name = pitch_class_name(pc);
+                let name = pitch_class_name_spelled(pc, scale.is_some_and(|s| s.prefer_flats));
                 let is_root = Some(pc) == root_pc_opt;
                 let (text, fallback) = if is_root {
                     let octave = (i32::from(pitch) / 12) - 1;
@@ -3369,7 +3385,8 @@ fn draw_grid_background<M: ?Sized + 'static>(
                     // Highlight mode: root pitch class のオクターブだけ label
                     if pitch % 12 == root_pc {
                         let octave = (pitch_i / 12) - 1;
-                        let name = pitch_class_name(root_pc);
+                        let name =
+                            pitch_class_name_spelled(root_pc, scale.is_some_and(|s| s.prefer_flats));
                         // M14 Phase 117 (daw_01 #093): Highlight mode の root 行は常に root_row_overlay
                         // 重畳 (warm cream)。 その実効背景で auto-contrast → warm-on-warm 潰れを解消。
                         let color = keyboard_label_color(
@@ -7588,12 +7605,12 @@ mod tests {
     const MAJOR_MASK: u16 = 0b0000_1010_1011_0101;
 
     fn scale_c_major(mode: PianoRollScaleMode) -> PianoRollScale {
-        PianoRollScale { root: 0, in_scale_mask: MAJOR_MASK, mode }
+        PianoRollScale { root: 0, in_scale_mask: MAJOR_MASK, mode, prefer_flats: false }
     }
 
     fn scale_d_major(mode: PianoRollScaleMode) -> PianoRollScale {
         // D Major: 同 mask、 root = D (pc 2)。 in-scale = D, E, F#, G, A, B, C# (pitch class 2,4,6,7,9,11,1)。
-        PianoRollScale { root: 2, in_scale_mask: MAJOR_MASK, mode }
+        PianoRollScale { root: 2, in_scale_mask: MAJOR_MASK, mode, prefer_flats: false }
     }
 
     #[test]

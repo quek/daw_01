@@ -9898,14 +9898,26 @@ impl AppData {
                 Some(old) if same_project && self.song.track_by_id(old).is_some() => Some(old),
                 _ => drop_parent,
             };
+            // A5 sibling (r.md #8): send を間引いたら、 旧→新 index map を作って
+            // cloned track の SendGain automation lane を追従させる (消えた send の
+            // lane は除去、 移動した send は新 index へ貼り替え)。
+            let mut survivor_new_idx: Vec<Option<u8>> = Vec::with_capacity(t.sends.len());
+            let mut next_new = 0u8;
             t.sends.retain_mut(|s| {
-                if let Some(&new) = track_remap.get(&s.dest_track_id) {
+                let survives = if let Some(&new) = track_remap.get(&s.dest_track_id) {
                     s.dest_track_id = new;
                     true
                 } else {
                     same_project && self.song.track_by_id(s.dest_track_id).is_some()
-                }
+                };
+                survivor_new_idx.push(survives.then(|| {
+                    let ni = next_new;
+                    next_new += 1;
+                    ni
+                }));
+                survives
             });
+            t.reindex_send_gain_lanes(&survivor_new_idx);
             for dev in &mut t.devices {
                 for slot in &mut dev.aux_inputs {
                     if let Some(route) = slot {
@@ -21087,22 +21099,14 @@ impl AppData {
     }
 
     /// `track_id` の `sends[send_idx]` を削除。 構造変化 → full-song resend。
-    /// 後続 send の index がずれるが、 resend で schedule が新 index で
-    /// 再 compile されるため問題ない。 なお in-flight な automation lane が
-    /// `SendGain { send_idx }` を target にしている場合、 その lane の参照は
-    /// 旧 index のまま残る — 本タスクでは lane の reindex は行わない (= 別
-    /// タスク。 当面は stale lane を許容、 schedule 側は範囲外 send_idx を
-    /// 無視する)。
+    /// `SendGain` automation lane も `Song::remove_track_send` が追従させる
+    /// (消した send の lane は除去、 後続 index を 1 つ詰める。 怠ると lane が別 send を
+    /// 変調する / 範囲外を指す。 r.md #8 A5)。
     fn remove_send(&mut self, track_id: u32, send_idx: usize) {
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
-            return;
-        };
-        if send_idx >= t.sends.len() {
-            return;
+        if self.song.remove_track_send(track_id, send_idx) {
+            self.sync_song_to_plugin_host();
+            tracing::info!(track_id, send_idx, "removed send");
         }
-        t.sends.remove(send_idx);
-        self.sync_song_to_plugin_host();
-        tracing::info!(track_id, send_idx, "removed send");
     }
 
     /// `track_id` の `sends[send_idx].mode` を設定。 tap 位置 (pre/post) は

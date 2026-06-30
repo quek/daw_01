@@ -37,7 +37,7 @@ fn view_with(mode: PianoRollScaleMode) -> PianoRollView {
         time_sig: (4, 4),
         snap: SnapConfig::DEFAULT,
         loop_range: None,
-        scale: Some(PianoRollScale { root: 0, in_scale_mask: MAJOR_MASK, mode }),
+        scale: Some(PianoRollScale { root: 0, in_scale_mask: MAJOR_MASK, mode, prefer_flats: false }),
         snap_pitch_during_drag: false,
         // scale label snapshot 用の focused fixture なので subdivision は OFF。
         sub_grid_interval_beats: None,

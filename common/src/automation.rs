@@ -511,6 +511,53 @@ pub fn evaluate_song_tempo(song: &Song, beat: f64) -> f32 {
     song.bpm
 }
 
+/// SongTempo カーブを積分して、 song の beat 位置 `target_beat` が出力 sample
+/// 何個目に当たるかを返す。 constant-bpm なら `target_beat * 60*SR/bpm` に一致。
+/// オフライン書き出し (WAV / 動画) が、 tempo automation を持つ曲を **再生と同じ
+/// 尺** で焼くために使う (live engine は buffer 毎に integrate する。 これはその
+/// オフライン等価)。 1/64 拍刻みで数値積分する **off-RT 専用** (audio callback から
+/// 呼ばない — ループ回数が target_beat に比例する)。
+#[must_use]
+pub fn beats_to_samples(song: &Song, sample_rate: u32, target_beat: f64) -> u64 {
+    if target_beat <= 0.0 || sample_rate == 0 {
+        return 0;
+    }
+    let sr = f64::from(sample_rate);
+    let mut beat = 0.0_f64;
+    let mut samples = 0.0_f64;
+    const STEP: f64 = 1.0 / 64.0;
+    while beat < target_beat {
+        // evaluate_song_tempo は [1, 1000] に clamp 済 (0 除算なし)。
+        let bpm = f64::from(evaluate_song_tempo(song, beat));
+        let dbeat = STEP.min(target_beat - beat);
+        samples += dbeat * 60.0 * sr / bpm;
+        beat += dbeat;
+    }
+    samples.round() as u64
+}
+
+/// [`beats_to_samples`] の逆: 出力 sample `target_sample` の song beat 位置を、
+/// tempo カーブを積分して返す。 曲中から始まる range 書き出しで beat 累算器の初期値
+/// を求めるのに使う。 off-RT 専用。
+#[must_use]
+pub fn samples_to_beats(song: &Song, sample_rate: u32, target_sample: u64) -> f64 {
+    if target_sample == 0 || sample_rate == 0 {
+        return 0.0;
+    }
+    let sr = f64::from(sample_rate);
+    let target = target_sample as f64;
+    let mut beat = 0.0_f64;
+    let mut samples = 0.0_f64;
+    let chunk = (sr / 64.0).max(1.0);
+    while samples < target {
+        let bpm = f64::from(evaluate_song_tempo(song, beat));
+        let dsamp = chunk.min(target - samples);
+        beat += dsamp * bpm / (60.0 * sr);
+        samples += dsamp;
+    }
+    beat
+}
+
 /// Find the `AutomationClip` whose half-open range
 /// `[start_beat, start_beat + length_beats)` contains `song_beat`.
 /// Returns the *first* match — overlapping clips on the same lane are
@@ -1110,6 +1157,36 @@ mod tests {
         let song = song_with_tempo_curve(60.0, 180.0, 4.0);
         let v = evaluate_song_tempo(&song, 2.0);
         assert!((v - 120.0).abs() < 0.01, "expected ~120 at beat 2, got {v}");
+    }
+
+    /// constant bpm では beats↔samples は線形で round-trip する (export が
+    /// tempo 無し曲で従来挙動と一致することの保証)。
+    #[test]
+    fn beats_to_samples_constant_bpm_is_linear_and_round_trips() {
+        let song = crate::model::Song { bpm: 120.0, ..crate::model::Song::default() };
+        // 4 beats @ 120 bpm @ 48k = 4 * 0.5s * 48000 = 96000 samples。
+        assert_eq!(beats_to_samples(&song, 48000, 4.0), 96000);
+        assert_eq!(beats_to_samples(&song, 48000, 0.0), 0);
+        let b = samples_to_beats(&song, 48000, 96000);
+        assert!((b - 4.0).abs() < 1e-2, "round-trip beat got {b}");
+    }
+
+    /// tempo ramp を持つ曲は積分された (= 平均テンポが遅いほど長い) sample 数になる。
+    /// 60→180 bpm linear over 4 beats: ∫ 60/bpm(b) db = 2 ln 3 秒 ≈ 2.1972s。
+    /// @48k ≈ 105466 samples で、 constant-120 推定 (96000) を上回る (= 旧 export が
+    /// 曲を早切りしていたぶん)。 これが A2「export がテンポオートメーションを焼く」の核。
+    #[test]
+    fn beats_to_samples_integrates_tempo_ramp() {
+        let song = song_with_tempo_curve(60.0, 180.0, 4.0);
+        let s = beats_to_samples(&song, 48000, 4.0);
+        let analytic = (2.0 * 3.0_f64.ln() * 48000.0).round() as i64; // ≈ 105466
+        assert!(
+            (s as i64 - analytic).abs() < 300,
+            "integrated {s} vs analytic {analytic}"
+        );
+        assert!(s > 96_000, "ramp should exceed constant-120 estimate, got {s}");
+        let b = samples_to_beats(&song, 48000, s);
+        assert!((b - 4.0).abs() < 0.05, "round-trip beat got {b}");
     }
 
     /// curve 範囲外 (= clip 外) は `lane.default_value` = 120.0 を返す。

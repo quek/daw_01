@@ -171,6 +171,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         } else {
             PianoRollScaleMode::Highlight
         },
+        prefer_flats: common::scale::prefers_flats(sc.root, sc.scale),
     });
 
     // widget の note キャッシュ無効化キー。

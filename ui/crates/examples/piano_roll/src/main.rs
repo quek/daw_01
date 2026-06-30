@@ -682,6 +682,7 @@ impl App {
                                 root: 0,
                                 in_scale_mask: MAJOR_MASK,
                                 mode: daw_ui_core::PianoRollScaleMode::Highlight,
+                                prefer_flats: false,
                             }),
                             Some(sc) => match sc.mode {
                                 daw_ui_core::PianoRollScaleMode::Highlight => {
@@ -704,6 +705,7 @@ impl App {
                                 root: 0,
                                 in_scale_mask: MAJOR_MASK,
                                 mode: daw_ui_core::PianoRollScaleMode::Highlight,
+                                prefer_flats: false,
                             });
                         let new_root = (cur.root + 1) % 12;
                         m.scale = Some(daw_ui_core::PianoRollScale { root: new_root, ..cur });

@@ -145,23 +145,65 @@ impl Scale {
     ];
 }
 
-/// ピッチクラス (0..=11) → 英語音名。 # / b の選択は当面 # 固定 (= 異名同音は
-/// 統一表記)。 UI で表示する root 名はこの関数を経由する。
+/// ピッチクラス (0..=11) → 英語音名 (sharp 表記)。 キー文脈が無い (chromatic /
+/// 調性 OFF) ときの既定。 キーが分かる場面では [`pitch_class_name_in_key`] を使い、
+/// flat 系キーで `Bb` / `Eb` 等を正しく綴る。
 pub const fn pitch_class_name(pc: u8) -> &'static str {
-    match pc % 12 {
-        0 => "C",
-        1 => "C#",
-        2 => "D",
-        3 => "D#",
-        4 => "E",
-        5 => "F",
-        6 => "F#",
-        7 => "G",
-        8 => "G#",
-        9 => "A",
-        10 => "A#",
-        11 => "B",
-        _ => unreachable!(),
+    PITCH_NAMES_SHARP[(pc % 12) as usize]
+}
+
+const PITCH_NAMES_SHARP: [&str; 12] =
+    ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const PITCH_NAMES_FLAT: [&str; 12] =
+    ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+
+/// このキー (root + scale) が音名表記で flat を好むか。 五度圏上の調号で決める:
+/// 各スケールを「相対メジャー」 (church mode / 主要 minor) の調号に従わせ、
+/// メジャー tonic の五度圏位置 `(tonic*7) mod 12` が 7..=11 (= flat 側) なら true。
+/// 対称・非調性・綴りが曖昧なスケール (WholeTone / Diminished / exotic) は慣習どおり
+/// sharp を既定にして `false`。
+#[must_use]
+pub fn prefers_flats(root: u8, scale: Scale) -> bool {
+    // scale tonic に足して相対メジャー tonic を得る半音数。
+    let to_major: i32 = match scale {
+        Scale::Major | Scale::MajorPentatonic | Scale::HarmonicMajor => 0,
+        Scale::Dorian => 10,
+        Scale::Phrygian => 8,
+        Scale::Lydian => 7,
+        Scale::Mixolydian => 5,
+        Scale::NaturalMinor
+        | Scale::MinorPentatonic
+        | Scale::Blues
+        | Scale::HarmonicMinor
+        | Scale::MelodicMinor => 3,
+        Scale::Locrian => 1,
+        // 調性中心が曖昧 / 対称スケールは sharp 既定。
+        Scale::WholeTone
+        | Scale::Diminished
+        | Scale::HalfWholeDim
+        | Scale::Chromatic
+        | Scale::DoubleHarmonic
+        | Scale::LydianDominant
+        | Scale::PhrygianDominant
+        | Scale::HungarianMinor
+        | Scale::Japanese
+        | Scale::Custom(_) => return false,
+    };
+    let major_root = (i32::from(root) + to_major).rem_euclid(12) as u32;
+    // 相対メジャーの五度圏位置。 0..=6 = sharp 側 (C, G, D, A, E, B, F#)、
+    // 7..=11 = flat 側 (Db, Ab, Eb, Bb, F)。
+    (major_root * 7) % 12 > 6
+}
+
+/// ピッチクラス (0..=11) → キー文脈に応じた英語音名。 [`prefers_flats`] が真なら
+/// flat 表記 (`Db` / `Bb` 等)、 偽なら sharp 表記。 UI の root / 音名表示はこの関数を
+/// 経由して、 例えば Bb メジャーで root を `A#` でなく `Bb` と綴る。
+#[must_use]
+pub fn pitch_class_name_in_key(pc: u8, root: u8, scale: Scale) -> &'static str {
+    if prefers_flats(root, scale) {
+        PITCH_NAMES_FLAT[(pc % 12) as usize]
+    } else {
+        PITCH_NAMES_SHARP[(pc % 12) as usize]
     }
 }
 
@@ -356,6 +398,53 @@ mod tests {
         assert_eq!(pitch_class_name(1), "C#");
         assert_eq!(pitch_class_name(11), "B");
         assert_eq!(pitch_class_name(12), "C"); // overflow safe via % 12
+    }
+
+    #[test]
+    fn prefers_flats_follows_circle_of_fifths() {
+        // (root, scale, expected_prefers_flats)
+        let cases = [
+            (0, Scale::Major, false),  // C major: 0 accidentals → sharp 既定
+            (7, Scale::Major, false),  // G major: 1 sharp
+            (2, Scale::Major, false),  // D major: 2 sharps
+            (11, Scale::Major, false), // B major: 5 sharps
+            (6, Scale::Major, false),  // F#/Gb major: tie → F# (sharp 慣習)
+            (5, Scale::Major, true),   // F major: 1 flat
+            (10, Scale::Major, true),  // Bb major: 2 flats
+            (3, Scale::Major, true),   // Eb major: 3 flats
+            (1, Scale::Major, true),   // Db major: 5 flats (C# は 7 sharp で非慣習)
+            (9, Scale::NaturalMinor, false), // A minor → C major: 0 accidentals
+            (4, Scale::NaturalMinor, false), // E minor → G major: 1 sharp
+            (2, Scale::NaturalMinor, true),  // D minor → F major: 1 flat
+            (7, Scale::NaturalMinor, true),  // G minor → Bb major: 2 flats
+            // 対称・非調性は常に sharp 既定。
+            (5, Scale::WholeTone, false),
+            (10, Scale::Diminished, false),
+            (1, Scale::Chromatic, false),
+            (3, Scale::Custom(0xABC), false),
+        ];
+        for (root, scale, expected) in cases {
+            assert_eq!(
+                prefers_flats(root, scale),
+                expected,
+                "root={root} scale={scale:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pitch_class_name_in_key_spells_flat_keys() {
+        // Bb major (root=10): root は A# でなく Bb、 4th(Eb) も flat 綴り。
+        assert_eq!(pitch_class_name_in_key(10, 10, Scale::Major), "Bb");
+        assert_eq!(pitch_class_name_in_key(3, 10, Scale::Major), "Eb");
+        // C major (root=0): sharp 既定 (黒鍵は #)。
+        assert_eq!(pitch_class_name_in_key(10, 0, Scale::Major), "A#");
+        assert_eq!(pitch_class_name_in_key(1, 0, Scale::Major), "C#");
+        // D minor (root=2) は flat 側 → Bb。
+        assert_eq!(pitch_class_name_in_key(10, 2, Scale::NaturalMinor), "Bb");
+        // 白鍵はどちらの綴りでも同じ。
+        assert_eq!(pitch_class_name_in_key(0, 10, Scale::Major), "C");
+        assert_eq!(pitch_class_name_in_key(4, 10, Scale::Major), "E");
     }
 
     #[test]

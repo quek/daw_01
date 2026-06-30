@@ -2040,6 +2040,37 @@ impl Song {
             .and_then(|c| c.notes_mut())
     }
 
+    /// `track_id` の `sends[send_idx]` を削除し、 その track の SendGain automation
+    /// lane を追従させる (消した send を狙う lane は除去、 後続 index は 1 つ詰める)。
+    /// これを怠ると lane が「別の send」 を変調したり範囲外 index を指す (r.md #8 A5)。
+    /// 削除成功で `true`、 track 不在 / 範囲外なら `false`。
+    pub fn remove_track_send(&mut self, track_id: u32, send_idx: usize) -> bool {
+        let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return false;
+        };
+        if send_idx >= t.sends.len() {
+            return false;
+        }
+        t.sends.remove(send_idx);
+        // 旧 index → 新 index: 消した index は None、 それより後ろは 1 つ前へ詰まる。
+        let old_to_new: Vec<Option<u8>> = (0..=t.sends.len())
+            .map(|i| {
+                if i == send_idx {
+                    None
+                } else if i > send_idx {
+                    Some((i - 1) as u8)
+                } else {
+                    Some(i as u8)
+                }
+            })
+            .collect();
+        let dropped = t.reindex_send_gain_lanes(&old_to_new);
+        if dropped {
+            self.gc_clip_contents();
+        }
+        true
+    }
+
     /// Drop `clip_contents` entries that no clip references. Called
     /// before save so disk files stay tidy. In-memory we keep zero-ref
     /// entries around briefly (e.g. between a delete and the next
@@ -2584,6 +2615,34 @@ impl Default for GroupTransform {
 }
 
 impl Track {
+    /// SendGain automation lane の `send_idx` を、 `sends` の index 変化に追従させる。
+    /// `old_to_new[i]` = 旧 index `i` の send の新 index (`None` = その send は消えた)。
+    /// 消えた send を狙う lane は除去、 移動した send を狙う lane は新 index に貼り替える。
+    /// send 削除 / paste で sends を間引いたとき、 lane が別 send を変調する・範囲外を
+    /// 指すのを防ぐ (r.md #8 A5)。 戻り値 = lane を 1 つ以上除去したか (caller の gc 判断用)。
+    pub fn reindex_send_gain_lanes(&mut self, old_to_new: &[Option<u8>]) -> bool {
+        let mut dropped = false;
+        self.automation_lanes.retain_mut(|lane| {
+            if let AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx }) =
+                &mut lane.target
+            {
+                match old_to_new.get(*send_idx as usize).copied().flatten() {
+                    Some(ni) => {
+                        *send_idx = ni;
+                        true
+                    }
+                    None => {
+                        dropped = true;
+                        false
+                    }
+                }
+            } else {
+                true
+            }
+        });
+        dropped
+    }
+
     /// このトラックが VOICEVOX で歌う vocal トラックか。 SSoT は
     /// 「builtin VOICEVOX device を実際に持つか」。 旧 `InstrumentSource::Vocal`
     /// marker は device 挿入と別管理で out-of-sync になり得る (旧プロジェクトで
@@ -6256,6 +6315,86 @@ mod tests {
         });
         song.gc_clip_contents();
         assert!(song.clip_contents.contains_key(&cid));
+    }
+
+    /// r.md #8 A5: send の index 変化に SendGain lane が追従する (消えた send の
+    /// lane は除去、 後続は新 index に貼り替え)。 paste path もこの helper を共有。
+    #[test]
+    fn reindex_send_gain_lanes_drops_removed_and_shifts_later() {
+        let send_lane = |idx: u8| {
+            AutomationLane::new(
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx: idx }),
+                1.0,
+            )
+        };
+        let mut t = Track {
+            automation_lanes: vec![
+                send_lane(0),
+                send_lane(1),
+                send_lane(2),
+                AutomationLane::new(
+                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+                    1.0,
+                ),
+            ],
+            ..Track::default()
+        };
+        // 旧 index 1 を削除: [Some(0), None, Some(1)]。
+        assert!(t.reindex_send_gain_lanes(&[Some(0), None, Some(1)]));
+        let targets: Vec<_> = t.automation_lanes.iter().map(|l| l.target.clone()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx: 0 }),
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx: 1 }),
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+            ],
+            "SendGain{{1}} 除去、 {{2}}→{{1}}、 {{0}}/Volume 据置"
+        );
+    }
+
+    /// r.md #8 A5: `Song::remove_track_send` が send を消して SendGain lane を追従。
+    #[test]
+    fn remove_track_send_follows_send_gain_lanes() {
+        let send_lane = |idx: u8| {
+            AutomationLane::new(
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx: idx }),
+                1.0,
+            )
+        };
+        let mk_send = |dest: u32| crate::model::Send {
+            dest_track_id: dest,
+            gain: 1.0,
+            mode: crate::model::SendMode::PostFader,
+            enabled: true,
+        };
+        let mut song = Song::default();
+        song.tracks.push(Track {
+            id: 42,
+            sends: vec![mk_send(1), mk_send(2), mk_send(3)],
+            automation_lanes: vec![send_lane(0), send_lane(1), send_lane(2)],
+            ..Track::default()
+        });
+        // send index 1 (dest 2) を削除。
+        assert!(song.remove_track_send(42, 1));
+        let t = song.track_by_id(42).unwrap();
+        assert_eq!(t.sends.len(), 2);
+        assert_eq!(t.sends[0].dest_track_id, 1);
+        assert_eq!(t.sends[1].dest_track_id, 3);
+        let idxs: Vec<u8> = t
+            .automation_lanes
+            .iter()
+            .filter_map(|l| match l.target {
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx }) => {
+                    Some(send_idx)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(idxs, vec![0, 1], "send 0 据置 + 旧 send 2 が新 index 1 へ");
+        // 範囲外 / 不在 track は false (no-op)。
+        assert!(!song.remove_track_send(42, 99));
+        assert!(!song.remove_track_send(999, 0));
     }
 
     #[test]
