@@ -5,12 +5,12 @@
 //!
 //! `midly = "0.5"` の `Smf::save` を使用、 `MidiContent` (ClipContent::Midi)
 //! を持つ clip だけを events に変換。 audio clip / automation clip は出力
-//! 対象外 (skip)。 minimum スコープ: NoteOn / NoteOff のみ (CC / Pitch
-//! Bend は本フェーズ範囲外、 Phase 7+ で MIDI input event 拡張時に追加)。
+//! 対象外 (skip)。 daw_01 の MIDI clip は note のみ保持 (CC / Pitch Bend を
+//! model が持たない) ので NoteOn / NoteOff のみ出力する。
 //!
-//! tempo は SongTempo automation lane を考慮せず曲頭の `song.bpm` 1 つで
-//! 出力 (= SMF spec 上 tempo events は track 0 内 delta-tick 順で複数置ける
-//! が、 daw_01 の SongTempo curve を tick 列に展開する処理は別 phase)。
+//! tempo は SongTempo automation curve を tick 列に展開して track 0 に複数の
+//! Tempo meta event として書く (A3 r.md #8)。 curve が無ければ曲頭 `song.bpm`
+//! 1 つ。 SMF は step tempo のみなので ramp/bezier は一定解像度の階段近似で出力。
 
 use std::fs::File;
 use std::path::Path;
@@ -56,36 +56,74 @@ pub fn export_midi(song: &Song, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// SMF track 0: tempo + time_sig + EndOfTrack。 全 delta = 0 (= 曲頭で立てる)。
-/// daw_01 の SongTempo automation curve は本フェーズでは展開しない (= 曲頭
-/// `song.bpm` 1 つだけ書く)、 将来的には curve sample 列を tick 単位で
-/// MetaMessage::Tempo として並べるが minimum scope 外。
+/// SMF track 0: tempo curve + time_sig + EndOfTrack。 SongTempo automation を
+/// tick 位置付きの複数 Tempo meta に展開する (A3 r.md #8)。
 fn build_meta_track(song: &Song) -> Vec<TrackEvent<'static>> {
-    let mut events: Vec<TrackEvent<'static>> = Vec::new();
-    // Tempo: 1 quarter note の microseconds = 60_000_000 / bpm。
-    let bpm = song.bpm.max(1.0);
-    let tempo_us = (60_000_000.0_f64 / f64::from(bpm)).round() as u32;
-    events.push(TrackEvent {
-        delta: u28::from(0u32),
-        kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(tempo_us))),
-    });
-    // TimeSignature(numerator, denominator_log2, clocks_per_click, 32nd_per_quarter)。
-    // SMF spec の `denominator` は 2^denom_log2 を意味する (= 4 → 2、 8 → 3)。
+    // (tick, MetaMessage) を集約して tick 順 delta-encode する (build_midi_track と同形)。
+    let mut metas: Vec<(u32, MetaMessage)> = Vec::new();
+
+    // TimeSignature: 曲頭 (tick 0)。 SMF の denominator は 2^log2 (4 → 2、 8 → 3)。
     let denom_log2 = denom_to_log2(song.time_sig.1);
-    events.push(TrackEvent {
-        delta: u28::from(0u32),
-        kind: TrackEventKind::Meta(MetaMessage::TimeSignature(
-            song.time_sig.0,
-            denom_log2,
-            24, // metronome clocks per click (24 = standard MIDI default)
-            8,  // 32nd notes per quarter (= 8、 業界標準)
-        )),
-    });
+    metas.push((
+        0,
+        MetaMessage::TimeSignature(song.time_sig.0, denom_log2, 24, 8),
+    ));
+
+    // Tempo: SongTempo curve を展開した各 breakpoint。
+    for (tick, bpm) in tempo_breakpoints(song) {
+        let tempo_us = (60_000_000.0_f64 / f64::from(bpm.max(1.0))).round() as u32;
+        metas.push((tick, MetaMessage::Tempo(u24::from(tempo_us))));
+    }
+
+    // 同 tick では Tempo を TimeSignature より先に (DAW 慣習)。
+    metas.sort_by_key(|(t, m)| (*t, matches!(m, MetaMessage::TimeSignature(..)) as u8));
+
+    let mut events: Vec<TrackEvent<'static>> = Vec::new();
+    let mut last_tick = 0u32;
+    for (tick, m) in metas {
+        let delta = tick.saturating_sub(last_tick);
+        last_tick = tick;
+        events.push(TrackEvent {
+            delta: u28::from(delta),
+            kind: TrackEventKind::Meta(m),
+        });
+    }
     events.push(TrackEvent {
         delta: u28::from(0u32),
         kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
     });
     events
+}
+
+/// SongTempo curve を `(tick, bpm)` の breakpoint 列に展開する。 lane が無ければ
+/// 曲頭 `song.bpm` の 1 点。 SMF は step tempo のみなので、 ramp/bezier は 1/8 拍
+/// 解像度でサンプルし bpm が 0.05 超変わるたびに breakpoint を置く (= 階段近似)。
+fn tempo_breakpoints(song: &Song) -> Vec<(u32, f32)> {
+    let has_tempo_lane = song.song_lanes.iter().any(|l| {
+        l.enabled && matches!(l.target, common::model::AutomationTarget::SongTempo)
+    });
+    if !has_tempo_lane {
+        return vec![(0, song.bpm)];
+    }
+    let mut out: Vec<(u32, f32)> = Vec::new();
+    // 曲本体 [0, length_beats) を走査 (end_beat は半開区間で除外 = automation clip
+    // [..,end) の外に出て default へ revert する spurious な末尾 event を避ける)。
+    let end_beat = song.length_beats.max(1.0);
+    const STEP_BEATS: f64 = 0.125; // 1/8 note
+    let mut beat = 0.0_f64;
+    let mut prev_bpm = f32::NAN;
+    while beat < end_beat {
+        let bpm = common::automation::evaluate_song_tempo(song, beat);
+        if prev_bpm.is_nan() || (bpm - prev_bpm).abs() > 0.05 {
+            out.push((beat_to_tick(beat), bpm));
+            prev_bpm = bpm;
+        }
+        beat += STEP_BEATS;
+    }
+    if out.is_empty() {
+        out.push((0, song.bpm));
+    }
+    out
 }
 
 /// daw_01 track から MIDI events を build。 MIDI clip (`ClipContent::Midi`) が
@@ -180,7 +218,10 @@ fn denom_to_log2(denom: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::{Clip, ClipContent, MidiContent, Note, Song};
+    use common::model::{
+        AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint,
+        AutomationTarget, Clip, ClipContent, MidiContent, Note, Song,
+    };
 
     fn note(pitch: u8, vel: u8, start: f64, dur: f64) -> Note {
         Note {
@@ -207,6 +248,70 @@ mod tests {
         // track 0 = meta + EndOfTrack (3 events: tempo, timesig, EOT)。
         assert_eq!(parsed.tracks.len(), 1);
         assert_eq!(parsed.tracks[0].len(), 3);
+    }
+
+    /// A3 (r.md #8): SongTempo curve を複数の Tempo meta event に展開する
+    /// (旧実装は曲頭 bpm の 1 つだけで、 テンポオートメーションを書き出せなかった)。
+    #[test]
+    fn tempo_curve_exports_multiple_tempo_events() {
+        let mut song = Song {
+            bpm: 60.0,
+            length_beats: 4.0,
+            ..Song::default()
+        };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint {
+                        time_beat: 0.0,
+                        value: 60.0,
+                        curve: AutomationCurve::Linear,
+                    },
+                    AutomationPoint {
+                        time_beat: 4.0,
+                        value: 120.0,
+                        curve: AutomationCurve::Linear,
+                    },
+                ],
+            }),
+        );
+        song.song_lanes.push(AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "tempo".into(),
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cid,
+            }],
+            ..AutomationLane::new(AutomationTarget::SongTempo, 60.0)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tempo.mid");
+        export_midi(&song, &path).unwrap();
+        let parsed_raw = std::fs::read(&path).unwrap();
+        let parsed = Smf::parse(&parsed_raw).unwrap();
+        let tempos: Vec<u32> = parsed.tracks[0]
+            .iter()
+            .filter_map(|e| match e.kind {
+                TrackEventKind::Meta(MetaMessage::Tempo(us)) => Some(us.as_int()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tempos.len() > 5,
+            "tempo ramp は多数の Tempo event を出すべき, got {}",
+            tempos.len()
+        );
+        // 先頭 = 60bpm (1_000_000us)、 末尾 ≈ 120bpm (500_000us)。
+        assert_eq!(tempos.first().copied(), Some(1_000_000), "head tempo = 60bpm");
+        assert!(
+            tempos.last().copied().unwrap() <= 510_000,
+            "tail tempo ≈ 120bpm, got {:?}",
+            tempos.last()
+        );
     }
 
     #[test]
