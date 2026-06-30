@@ -13601,9 +13601,9 @@ impl AppData {
     }
 
     /// `AddAutomationFromLastTouched` の補助。target の現在値を plain
-    /// 単位で取得 (lane.default_value 初期化用)。 track-builtin は
-    /// track の strip 値、 plugin param は 0.0 (Phase 2 で IPC lookup)、
-    /// song-level は `song.bpm` / `song.time_sig.0`。
+    /// 単位で取得 (lane.default_value 初期化用)。 track-builtin は track の strip 値、
+    /// send gain は `track.sends[idx].gain`、 plugin param は `current_plain_value`
+    /// の cache (A6 r.md #8)、 song-level は `song.bpm` / `song.time_sig.0`。
     fn lane_default_for_target(&self, touched: &TouchedParam) -> f64 {
         use common::model::{AutomationTarget, TrackBuiltinParam};
         match &touched.target {
@@ -13621,10 +13621,18 @@ impl AppData {
                             0.0
                         }
                     }
-                    TrackBuiltinParam::SendGain { .. } => 0.0,
+                    // A6 (r.md #8): send gain の現在値は model にある。
+                    TrackBuiltinParam::SendGain { send_idx } => track
+                        .sends
+                        .get(*send_idx as usize)
+                        .map_or(0.0, |s| f64::from(s.gain)),
                 }
             }
-            AutomationTarget::PluginParam { .. } => 0.0,
+            // A6 (r.md #8): plugin param は GUI の現在値 cache を引く
+            // (`current_plain_value` が `plugin_param_values` から解決)。
+            AutomationTarget::PluginParam { .. } => self
+                .current_plain_value(touched.track_id, &touched.target)
+                .unwrap_or(0.0),
             AutomationTarget::SongTempo => f64::from(self.song.bpm),
             AutomationTarget::SongTimeSigNumerator => f64::from(self.song.time_sig.0),
             // Image PiP default: 同 track の最初の image clip の first
