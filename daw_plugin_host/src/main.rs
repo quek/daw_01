@@ -907,6 +907,9 @@ fn plugin_main_loop(
     // C6 (r.md #8): plugin-initiated GUI show/hide (CLAP request_show/hide)。
     // `(track, index, show)`。 plugin-main loop が所有 editor 窓を前面化 / 隠す。
     let (gui_show_tx, mut gui_show_rx) = tmpsc::unbounded_channel::<(u32, u32, bool)>();
+    // C3 (r.md #8): plugin-initiated restartComponent (VST3)。 `(track, index, flags)`。
+    // loop が該当 plugin だけを安全に reinit する (他 plugin は乱さない)。
+    let (gui_restart_tx, mut gui_restart_rx) = tmpsc::unbounded_channel::<(u32, u32, i32)>();
 
     // Per-(track, index) host callbacks: each loaded plugin captures its
     // (track, index) so the async CLAP callback (request_resize / closed)
@@ -934,6 +937,12 @@ fn plugin_main_loop(
             let tx = gui_show_tx.clone();
             Arc::new(move || {
                 let _ = tx.send((track, index, false));
+            })
+        },
+        on_restart_component: {
+            let tx = gui_restart_tx.clone();
+            Arc::new(move |flags: i32| {
+                let _ = tx.send((track, index, flags));
             })
         },
         // VST3 param gesture (IComponentHandler::beginEdit/performEdit/endEdit)。
@@ -1943,6 +1952,69 @@ fn plugin_main_loop(
                     win.hide();
                 }
             }
+        }
+
+        // C3 (r.md #8): plugin が restartComponent で re-activate / I/O / latency 変更を
+        // 要求。 ReinitAllPlugins と同じ安全契約 (registry detach → worker quiesce →
+        // this-thread mutate → republish) を該当 1 plugin に適用し、 他 plugin は乱さ
+        // ない。 latency 変更は再 query して PluginLatencyChanged を再 emit する。
+        while let Ok((track, index, flags)) = gui_restart_rx.try_recv() {
+            // VST3 RestartFlags (ivstcomponent.h): kReloadComponent=1<<3 /
+            // kIoChanged=1<<4 / kLatencyChanged=1<<6 が再 activate を要する。
+            const VST3_REACTIVATE: i32 = (1 << 3) | (1 << 4) | (1 << 6);
+            if flags & VST3_REACTIVATE == 0 {
+                continue;
+            }
+            let Some(&pid) = plugin_lookup.get(&(track, index)) else {
+                continue;
+            };
+            let saved = plugin_registry
+                .load()
+                .get(pid as usize)
+                .and_then(|o| o.as_ref())
+                .map(|e| (e.plugin.0, e.process_data, e.track, e.index));
+            let Some((ptr, pd, etrack, eindex)) = saved else {
+                continue;
+            };
+            // (1) detach so workers skip it, (2) drain in-flight dispatch.
+            publish_plugin_registry(&plugin_registry, pid, None);
+            if let Some(pool) = worker_pool.as_ref() {
+                pool.quiesce();
+            }
+            // (3) full lifecycle reset on this (plugin-main) thread.
+            let mut new_latency = None;
+            if let Some(chain) = tracks.tracks.chains.get_mut(&track)
+                && let Some(plugin) = chain.devices.get_mut(index as usize)
+            {
+                plugin.stop_processing();
+                plugin.deactivate();
+                if let Err(e) =
+                    plugin.activate(f64::from(session.sample_rate), 64, session.max_frames)
+                {
+                    tracing::error!(error = ?e, track, index, "restartComponent reinit: activate failed");
+                }
+                if let Err(e) = plugin.start_processing() {
+                    tracing::error!(error = ?e, "restartComponent reinit: start_processing failed");
+                }
+                plugin.reset();
+                new_latency = Some(plugin.query_latency());
+            }
+            // (4) republish (Box address unchanged → PluginPtr stays valid).
+            publish_plugin_registry(
+                &plugin_registry,
+                pid,
+                Some(PluginEntry {
+                    plugin: PluginPtr(ptr),
+                    process_data: pd,
+                    track: etrack,
+                    index: eindex,
+                }),
+            );
+            // (5) latency 再 emit (kLatencyChanged の主目的)。
+            if let Some(samples) = new_latency {
+                let _ = evt_tx.send(PluginEvent::PluginLatencyChanged { plugin_id: pid, samples });
+            }
+            tracing::info!(track, index, flags, "restartComponent: reinitialised plugin");
         }
 
         // handle editor windows the user closed via the window's

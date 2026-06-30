@@ -350,6 +350,9 @@ impl IComponentHandlerTrait for Vst3ComponentHandler {
             }
         }
         tracing::info!(flags, ?kinds, "VST3 plugin requested restartComponent");
+        // C3 (r.md #8): re-activate / I/O / latency 変更を plugin-main loop に通知し、
+        // 該当 plugin を安全に reinit + latency 再 query させる。
+        (self.callbacks.on_restart_component)(flags);
         kResultOk
     }
 }

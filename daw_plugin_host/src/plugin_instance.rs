@@ -111,6 +111,10 @@ pub struct HostCallbacks {
     /// SetForegroundWindow / hide する (旧実装は常に false で無視)。
     pub on_request_show: Arc<dyn Fn() + Send + Sync>,
     pub on_request_hide: Arc<dyn Fn() + Send + Sync>,
+    /// VST3 `IComponentHandler::restartComponent(flags)` (C3 / r.md #8): plugin が
+    /// re-activate / I/O / latency 変更を要求。 host は該当 plugin を安全に reinit
+    /// (deactivate→activate→reset) + latency 再 query する。
+    pub on_restart_component: Arc<dyn Fn(i32) + Send + Sync>,
     /// VST3 only: plugin GUI で param を触り始めた (`IComponentHandler::
     /// beginEdit`)。 引数は param_id。 daw_gui の last-touched workflow
     /// (`A` キー) の起点。 CLAP は out_events 経由なのでこれを使わない
@@ -134,6 +138,7 @@ impl HostCallbacks {
             on_closed: Arc::new(|| {}),
             on_request_show: Arc::new(|| {}),
             on_request_hide: Arc::new(|| {}),
+            on_restart_component: Arc::new(|_| {}),
             on_param_gesture_begin: Arc::new(|_| {}),
             on_param_value: Arc::new(|_, _| {}),
             on_param_gesture_end: Arc::new(|_| {}),
