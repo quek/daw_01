@@ -643,6 +643,9 @@ pub struct SidechainEntry {
     pub device_index: u32,
     pub plugin_name: String,
     pub current_source: Option<u32>,
+    /// aux_inputs[0] の現 tap point (B8 / r.md #8: inspector で編集可能化)。
+    /// route 未設定は `PostFader` 既定。
+    pub current_tap_point: common::model::TapPoint,
 }
 
 /// Sidechain source picker choice: `None` = "—" (disconnected),
@@ -2807,6 +2810,12 @@ impl AppData {
                     .first()
                     .and_then(|o| o.as_ref())
                     .map(|r| r.tap.source_track),
+                current_tap_point: p
+                    .aux_inputs
+                    .first()
+                    .and_then(|o| o.as_ref())
+                    .map(|r| r.tap.tap_point)
+                    .unwrap_or_default(),
             })
             .collect();
         // PR4.5 diagnostic: if any chain plugin has a non-empty

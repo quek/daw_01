@@ -3518,13 +3518,24 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let dropdown_w = 140.0;
         let name_x = area.x + pad;
         let dropdown_x = area.x + area.w - pad - dropdown_w;
+        // B8 (r.md #8): tap point (Pre-FX/Post-FX/Post-Fdr) selector を source
+        // dropdown の左に置く。 SetAuxInputTapPoint setter は既存だが従来 UI 未配線
+        // (= PostFader 固定だった)。
+        const SC_TAP_POINTS: [common::model::TapPoint; 3] = [
+            common::model::TapPoint::PreFx,
+            common::model::TapPoint::PostFx,
+            common::model::TapPoint::PostFader,
+        ];
+        let sc_tap_labels = ["Pre-FX", "Post-FX", "Post-Fdr"];
+        let tap_w = 64.0;
+        let tap_x = dropdown_x - tap_w - 6.0;
         for (i, entry) in sc_entries.iter().take(visible_rows).enumerate() {
             // Truncate plugin name visually if it's too long for the
             // available left half — gui_01 doesn't auto-clip, so we
             // budget by char count (rough; mono font assumption). Use
             // `chars().take()` for UTF-8 safety: byte-slicing would panic
             // on multi-byte boundaries (Japanese / fancy plugin names).
-            let max_name_chars = ((dropdown_x - name_x - 8.0) / 7.0) as usize;
+            let max_name_chars = ((tap_x - name_x - 8.0) / 7.0).max(0.0) as usize;
             let n_chars = entry.plugin_name.chars().count();
             let display_name = if n_chars > max_name_chars && max_name_chars > 3 {
                 let truncated: String =
@@ -3570,6 +3581,30 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         device_index,
                         port: 0,
                         source: new_source,
+                    });
+                }));
+            }
+            // B8 (r.md #8): tap point selector (source の左)。 port 0 のみ
+            // (multi-port は aux_input_count IPC が要る follow-up、 稀なので保留)。
+            let tap_sel = SC_TAP_POINTS
+                .iter()
+                .position(|t| *t == entry.current_tap_point)
+                .unwrap_or(2);
+            if let Some(picked) = ui.dropdown(
+                ("inspector_sc_tap", i),
+                Rect { x: tap_x, y: row_y, w: tap_w, h: row_h },
+                &sc_tap_labels,
+                tap_sel,
+            ) && let Some(&tp) = SC_TAP_POINTS.get(picked)
+            {
+                let track_id = entry.track_id;
+                let device_index = entry.device_index;
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetAuxInputTapPoint {
+                        track_id,
+                        device_index,
+                        port: 0,
+                        tap_point: tp,
                     });
                 }));
             }
