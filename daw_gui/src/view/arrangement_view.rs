@@ -182,13 +182,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             set
         };
 
-    // TODO(perf, 優先度中): この `tracks: Vec<ArrangementTrack>` は毎フレーム
-    // 全 track × 全 clip ぶん再確保している (track/clip name の `Arc::from`、
-    // nested `Vec` collect)。 name は rename 時しか変わらないので、 理想は
-    // AppData 側で `Arc<str>` を保持し rename 時のみ作り直す形。 ただし
-    // AppData (app.rs) の変更が要るため本ファイル単独では入れられない (別タスク)。
-    // 本ファイル内で消せる重複 (clip 単位の `clip_contents` 二重 lookup) は
-    // 下の clip `.map` で `content` を 1 度引いて使い回す形に済ませた。
+    // D3/D4: track/clip 名は編集時しか変わらないので、 AppData 側の `Arc<str>`
+    // キャッシュ (`song_epoch` 世代キー) から clone する。 毎フレーム全 track×clip
+    // ぶんの `Arc::from` / `clip_display_label` (歌詞連結を含む) 再確保を解消
+    // (`AppData::arrangement_labels`)。 clip 単位の `clip_contents` 二重 lookup は
+    // 下の clip `.map` で `content` を 1 度引いて使い回す形に済ませてある。
+    let labels = app.arrangement_labels();
     let tracks: Vec<ArrangementTrack> = app
         .song
         .tracks
@@ -213,7 +212,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             } else {
                 daw_ui_core::widgets::arrangement::TrackKind::Audio
             },
-            name: Arc::from(t.name.as_str()),
+            name: labels
+                .track_names
+                .get(&t.id)
+                .cloned()
+                .unwrap_or_else(|| Arc::from(t.name.as_str())),
             muted: t.muted,
             solo: t.solo,
             armed: t.armed,
@@ -241,7 +244,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     // 共有名) を最優先し、 名前が無ければノートの歌詞 (VOICEVOX
                     // 歌唱) を連結、 どれも無ければ無名 (空)。 同 content を共有
                     // する linked clip は同じ表示名になる。 詳細は clip_display_label。
-                    name: clip_display_label(c, &app.song),
+                    name: labels
+                        .content_labels
+                        .get(&c.content_id)
+                        .cloned()
+                        .unwrap_or_else(|| clip_display_label(c, &app.song)),
                     // v18 (`docs/plan_track_clip_color.md`): clip は effective
                     // 色 (個別上書き or トラック色継承) で塗る。共有 clip
                     // (refcount >= 2) では widget が `share_group_color` (hue) を

@@ -1113,9 +1113,31 @@ pub enum ExportStage {
 /// range_frames, write_mod_sidecar)`. See [`AppData::pending_export`].
 pub type PendingExport = (std::path::PathBuf, Option<(u64, u64)>, bool);
 
+/// D3/D4: arrangement build のラベルキャッシュ。 `arrangement_view` の build は
+/// 毎フレーム全 track×clip ぶん track 名 `Arc::from` と `clip_display_label`
+/// (= `Arc::from` + 歌詞連結) を呼び再確保していた。 名前は編集時しか変わらない
+/// ので、 `song_epoch` が進んだとき (= undo 境界をまたぐ編集) だけ作り直し、
+/// 通常フレームは `Arc` の clone (refcount bump) で済ませる。 `clip_display_label`
+/// は `clip.content_id` のみに依存するので content 単位で 1 回だけ算出する。
+#[derive(Default)]
+pub(crate) struct ArrLabelCache {
+    /// このキャッシュ内容が対応する `AppData::song_epoch`。 一致する間は再計算しない。
+    epoch: u64,
+    pub(crate) track_names: std::collections::HashMap<u32, std::sync::Arc<str>>,
+    pub(crate) content_labels:
+        std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
+}
+
 pub struct AppData {
     // -------- Song / file --------
     pub song: Song,
+    /// D3/D4: song を変更する編集 (undo snapshot / undo / redo / new・open) ごとに
+    /// 進むカウンタ。 `arr_label_cache` の世代キー。 song 自体に持たせると bincode
+    /// 往復で増えてしまうので AppData 側 (= 非永続) に置く。
+    pub(crate) song_epoch: u64,
+    /// D3/D4: track/clip 名の `Arc<str>` キャッシュ ([`ArrLabelCache`])。 view から
+    /// (`&self`) 更新するので `RefCell`。 AppData は GUI メインスレッド専有なので可。
+    pub(crate) arr_label_cache: std::cell::RefCell<ArrLabelCache>,
     pub file_path: Option<PathBuf>,
     /// Decoded sample buffers for `Song.audio_sources`, keyed by
     /// `AudioSourceId`. Filled lazily on import (Phase 1 PR3). The
@@ -2256,6 +2278,10 @@ impl AppData {
 
         let app = Self {
             song,
+            // 1 始まりで cache (Default epoch 0) と必ず不一致にし、初回 build で
+            // 一度 regenerate させる (= load 直後・無編集でもキャッシュが効く)。
+            song_epoch: 1,
+            arr_label_cache: std::cell::RefCell::default(),
             sample_rate,
             file_path: None,
             audio_source_cache: AudioSourceCache::new(),
@@ -3531,6 +3557,35 @@ impl AppData {
         }
         self.undo_stack.push_back(self.song.clone());
         self.redo_stack.clear();
+        // D3/D4: 編集境界。 arrangement ラベルキャッシュを次フレームで作り直させる。
+        self.song_epoch = self.song_epoch.wrapping_add(1);
+    }
+
+    /// D3/D4: arrangement build 用ラベルキャッシュ ([`ArrLabelCache`])。 `song_epoch`
+    /// が進んでいれば全 track 名 + content ラベルを 1 度だけ作り直し、 通常フレームは
+    /// 同一 `Arc<str>` の clone (refcount bump) を返す。 `clip_display_label` は
+    /// `clip.content_id` のみに依存するので content_id 単位で 1 回だけ算出する
+    /// (linked clip は同一ラベルを共有)。
+    pub(crate) fn arrangement_labels(&self) -> std::cell::Ref<'_, ArrLabelCache> {
+        {
+            let mut cache = self.arr_label_cache.borrow_mut();
+            if cache.epoch != self.song_epoch {
+                cache.track_names.clear();
+                cache.content_labels.clear();
+                for t in &self.song.tracks {
+                    cache
+                        .track_names
+                        .insert(t.id, std::sync::Arc::from(t.name.as_str()));
+                    for c in &t.clips {
+                        cache.content_labels.entry(c.content_id).or_insert_with(|| {
+                            crate::view::arrangement_view::clip_display_label(c, &self.song)
+                        });
+                    }
+                }
+                cache.epoch = self.song_epoch;
+            }
+        }
+        self.arr_label_cache.borrow()
     }
 
     /// `is_dirty` を「保存時点の内容との差分」から再計算する (SSoT)。
@@ -3549,6 +3604,8 @@ impl AppData {
     /// (save は履歴を残したいので別扱い: `saved_song` 更新のみ。)
     fn reset_saved_baseline(&mut self) {
         self.saved_song = self.song.clone();
+        // D3/D4: New / Open / Restore は song を丸ごと差し替える。 ラベルキャッシュ無効化。
+        self.song_epoch = self.song_epoch.wrapping_add(1);
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.is_dirty = false;
@@ -3593,6 +3650,8 @@ impl AppData {
     }
 
     fn after_undo_redo(&mut self) {
+        // D3/D4: undo/redo は song を丸ごと差し替える。 ラベルキャッシュを無効化。
+        self.song_epoch = self.song_epoch.wrapping_add(1);
         // selected_clip が undo 後も存在するなら維持、消えていれば None。
         // (常に None にすると undo のたびにピアノロールがプレースホルダに戻ってしまう)
         // stable ClipKey 保持なので並べ替え / undo を跨いでも追従する。 clip が
