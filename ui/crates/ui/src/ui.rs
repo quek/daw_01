@@ -2239,6 +2239,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         anchor_byte: usize,
         cursor_byte: usize,
         caret: Rect,
+        // E1 (r.md #8): 各文字境界の `(x, byte)` (caret と同座標系)。`GetACPFromPoint` の
+        // 逆 hit-test 用。空なら store は layout 無し扱い。
+        char_boundaries: Vec<(f32, usize)>,
     ) {
         if self.keyboard_blocked_by_modal() {
             return;
@@ -2247,6 +2250,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             text: text.to_string(),
             selection: (anchor_byte, cursor_byte),
             caret_rect: RectPx { x: caret.x, y: caret.y, w: caret.w, h: caret.h },
+            char_boundaries,
         });
     }
 

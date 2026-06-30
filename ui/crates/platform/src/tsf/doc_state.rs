@@ -62,6 +62,9 @@ pub struct DocState {
     sel_reversed: bool,
     /// 候補ウィンドウ配置用 caret rect (物理 px)。
     caret: RectPx,
+    /// 各文字境界の `(x, byte)` (caret と同座標系 = client 物理 px)。`GetACPFromPoint` の
+    /// 逆 hit-test 用 (E1 / r.md #8)。空 = layout 無し → `acp_from_x` は None。
+    char_boundaries: Vec<(f32, usize)>,
     /// text field が focus 中で publish されているか (false = store 空 = IME 非アクティブ)。
     active: bool,
 
@@ -106,6 +109,7 @@ impl DocState {
             }
             self.sel = 0..0;
             self.sel_reversed = false;
+            self.char_boundaries.clear();
             return;
         };
 
@@ -134,6 +138,7 @@ impl DocState {
         self.sel = new_sel;
         self.sel_reversed = reversed;
         self.caret = doc.caret_rect;
+        self.char_boundaries.clone_from(&doc.char_boundaries);
 
         let was_active = self.active;
         self.active = true;
@@ -165,6 +170,29 @@ impl DocState {
     #[must_use]
     pub fn caret(&self) -> RectPx {
         self.caret
+    }
+
+    /// E1 (r.md #8): client 座標 `x` (caret と同座標系 = 物理 px) に最も近い文字エッジの ACP を
+    /// 返す。`GetACPFromPoint` の逆 hit-test。文字境界が未測定 (layout 無し) なら `None`
+    /// (store は `TS_E_NOLAYOUT` を返す)。`x` が文字 `i` の span `[b[i].x, b[i+1].x)` にあれば、
+    /// span 中点との前後で近い側のエッジ byte を ACP 化して返す。範囲外は端へ clamp。
+    #[must_use]
+    pub fn acp_from_x(&self, x: f32) -> Option<i32> {
+        let b = &self.char_boundaries;
+        if b.len() < 2 {
+            return None; // 文字 0 個 / 未測定 = layout 無し。
+        }
+        if x <= b[0].0 {
+            return Some(self.map.byte_to_acp(b[0].1) as i32);
+        }
+        for w in b.windows(2) {
+            if x < w[1].0 {
+                let mid = (w[0].0 + w[1].0) * 0.5;
+                let byte = if x < mid { w[0].1 } else { w[1].1 };
+                return Some(self.map.byte_to_acp(byte) as i32);
+            }
+        }
+        Some(self.map.byte_to_acp(b[b.len() - 1].1) as i32)
     }
 
     /// UTF-16 unit 数 (= `GetEndACP`)。
@@ -273,6 +301,7 @@ mod tests {
             text: text.to_string(),
             selection: sel,
             caret_rect: RectPx::default(),
+            char_boundaries: Vec::new(),
         }
     }
 
@@ -400,5 +429,31 @@ mod tests {
                 new_cursor: 2,
             }]
         );
+    }
+
+    /// E1 (r.md #8): `acp_from_x` が点を最近接文字エッジの ACP に写すこと。
+    #[test]
+    fn acp_from_x_maps_point_to_nearest_char_edge() {
+        let mut st = DocState::new();
+        // "abc" (ASCII なので byte == ACP)。境界 x: a=[0,10) b=[10,20) c=[20,30)。
+        let mut d = doc("abc", (0, 0));
+        d.char_boundaries = vec![(0.0, 0), (10.0, 1), (20.0, 2), (30.0, 3)];
+        st.publish(Some(&d));
+
+        assert_eq!(st.acp_from_x(-5.0), Some(0), "左端より左 → 先頭");
+        assert_eq!(st.acp_from_x(3.0), Some(0), "a 前半 → a 左エッジ");
+        assert_eq!(st.acp_from_x(7.0), Some(1), "a 後半 → a 右エッジ");
+        assert_eq!(st.acp_from_x(18.0), Some(2), "b 後半 → b 右エッジ");
+        assert_eq!(st.acp_from_x(100.0), Some(3), "右端より右 → 末尾");
+    }
+
+    /// 文字境界が無い (layout 無し / 非 focus) なら `acp_from_x` は None (= store は NOLAYOUT)。
+    #[test]
+    fn acp_from_x_without_layout_is_none() {
+        let mut st = DocState::new();
+        st.publish(Some(&doc("abc", (0, 0)))); // char_boundaries 空。
+        assert_eq!(st.acp_from_x(5.0), None);
+        st.publish(None); // focus 喪失。
+        assert_eq!(st.acp_from_x(5.0), None);
     }
 }

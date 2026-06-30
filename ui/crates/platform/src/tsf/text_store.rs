@@ -23,7 +23,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::UI::TextServices::*;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::*;
@@ -472,11 +472,26 @@ impl ITextStoreACP_Impl for DocumentStore_Impl {
     fn GetACPFromPoint(
         &self,
         _vcview: u32,
-        _ptscreen: *const POINT,
+        ptscreen: *const POINT,
         _dwflags: u32,
     ) -> Result<i32> {
-        // P3: CaretResolver の逆 hit-test。P1 は未対応。
-        Err(TS_E_NOLAYOUT.into())
+        // E1 (r.md #8): 逆 hit-test (screen point → ACP)。MS-IME マウス再変換が、
+        // 右クリック位置の文字を特定するのに使う。
+        if ptscreen.is_null() {
+            return Err(TS_E_NOLAYOUT.into());
+        }
+        // screen → client (= doc の caret / char_boundaries と同座標系)。
+        let mut pt = unsafe { *ptscreen };
+        unsafe {
+            let _ = ScreenToClient(self.hwnd, &raw mut pt);
+        }
+        // 文字境界から最近接エッジの ACP。文字境界が未測定 (= layout 無し / 非 focus) なら
+        // `acp_from_x` が None → TS_E_NOLAYOUT (IME は再変換を諦める)。
+        self.shared
+            .doc
+            .borrow()
+            .acp_from_x(pt.x as f32)
+            .ok_or_else(|| TS_E_NOLAYOUT.into())
     }
 
     fn GetTextExt(

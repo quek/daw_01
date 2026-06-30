@@ -28,6 +28,11 @@ pub struct TextDocument {
     pub selection: (usize, usize),
     /// IME 候補ウィンドウ配置用の caret rect (物理 px、`request_ime` / `set_ime_cursor_area` と同座標系)。
     pub caret_rect: RectPx,
+    /// 各文字境界の `(x, byte_offset)` (x は `caret_rect.x` と同座標系 = client 物理 px)。
+    /// 文字 `i` は `[char_boundaries[i].0, char_boundaries[i+1].0)` を占める。先頭 = テキスト左端
+    /// (byte 0)、末尾 = テキスト右端 (byte len)。`GetACPFromPoint` の逆 hit-test (点→ACP) に使う
+    /// (E1 / r.md #8: MS-IME マウス再変換)。空 = layout 無し → store は `TS_E_NOLAYOUT` を返す。
+    pub char_boundaries: Vec<(f32, usize)>,
 }
 
 /// OS IME (TSF) → widget へ返す編集。byte offset は **直近 publish した [`TextDocument::text`]** に対する。

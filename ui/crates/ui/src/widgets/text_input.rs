@@ -536,11 +536,29 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // M15: text store (TSF) に text + selection + caret を publish。rtry のまぜ書き
             // GetText / MS-IME 再変換がアプリのテキストを読めるようにする。preedit 中は selection
             // を collapse 済みなので displayed の cursor/anchor をそのまま渡す。
+            // E1 (r.md #8): 各文字境界の (x, byte) を測って publish。GetACPFromPoint の
+            // 逆 hit-test (点→ACP、MS-IME マウス再変換) に使う。caret_x と同じ
+            // `rect.x + pad_x + 累積幅` 座標系。1 文字ずつ累積するので kerning は無視するが
+            // (O(n)、focused field のみ)、再変換の単語選択には十分。
+            let char_boundaries = {
+                let mut bounds = Vec::with_capacity(displayed_text.len() + 1);
+                let mut x = rect.x + pad_x;
+                let mut byte = 0usize;
+                bounds.push((x, byte));
+                let mut buf = [0u8; 4];
+                for c in displayed_text.chars() {
+                    x += self.measure_text(c.encode_utf8(&mut buf), font_size);
+                    byte += c.len_utf8();
+                    bounds.push((x, byte));
+                }
+                bounds
+            };
             self.publish_text_document(
                 &displayed_text,
                 anchor_byte_for_draw,
                 cursor_byte_for_draw,
                 caret,
+                char_boundaries,
             );
             // M8 Phase 30: typing 中フラグを立てて、修飾なし shortcut の global 発動を抑制可能に。
             self.set_typing_focus(true);
