@@ -843,6 +843,81 @@ pub const TRANSFORM_ID: &str = "builtin.video.transform";
 
 /// 内蔵映像効果の正準リスト (ピッカ表示順)。Transform を先頭に置く（配置の基本）、
 /// 以降は色補正 → ブラー/シャープ → 歪み → スタイライズ → キーイング → ノイズ の順。
+/// ストロボ (B9 / r.md #8)。★ P.time 駆動で rate Hz の明滅 (duty=点灯比、
+/// depth=消灯時の明るさ)。 音反応で rate を動かすとビート同期ストロボ。
+const STROBE: VideoFxDef = VideoFxDef {
+    id: "builtin.video.strobe",
+    name: "Strobe",
+    category: VideoFxCategory::Time,
+    params: &[
+        VideoFxParam {
+            id: 0,
+            key: "rate",
+            name: "Rate",
+            kind: ParamKind::Scalar { min: 0.5, max: 30.0, default: 6.0, unit: Unit::None },
+        },
+        VideoFxParam {
+            id: 1,
+            key: "duty",
+            name: "Duty",
+            kind: ParamKind::Scalar { min: 0.05, max: 0.95, default: 0.5, unit: Unit::None },
+        },
+        VideoFxParam {
+            id: 2,
+            key: "depth",
+            name: "Depth",
+            kind: ParamKind::Scalar { min: 0.0, max: 1.0, default: 0.0, unit: Unit::None },
+        },
+    ],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    // rate Hz で位相を回し、 phase<duty を点灯 (1.0)、 以上を depth (消灯時明るさ)。
+    let phase = fract(P.time * P.rate);
+    let lit = select(P.depth, 1.0, phase < P.duty);
+    return vec4<f32>(src.rgb * lit, src.a);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
+/// 時間ワブル (B9 / r.md #8)。★ P.time 駆動の正弦 UV 変位でゆらぎ (speed=速さ、
+/// amount=px 振幅)。 音反応で amount を動かすと揺れ幅が脈動。
+const TIME_WOBBLE: VideoFxDef = VideoFxDef {
+    id: "builtin.video.time_wobble",
+    name: "Time Wobble",
+    category: VideoFxCategory::Time,
+    params: &[
+        VideoFxParam {
+            id: 0,
+            key: "speed",
+            name: "Speed",
+            kind: ParamKind::Scalar { min: 0.0, max: 20.0, default: 4.0, unit: Unit::None },
+        },
+        VideoFxParam {
+            id: 1,
+            key: "amount",
+            name: "Amount",
+            kind: ParamKind::Scalar { min: 0.0, max: 80.0, default: 12.0, unit: Unit::Px },
+        },
+    ],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    let off = vec2<f32>(
+        sin(P.time * P.speed + uv.y * 18.0) * P.amount * P.texel.x,
+        cos(P.time * P.speed * 0.8 + uv.x * 18.0) * P.amount * P.texel.y,
+    );
+    return sample(uv + off);
+}
+"#,
+    }],
+    needs_history: false,
+};
+
 static BUILTIN_VIDEO_FX: &[VideoFxDef] = &[
     TRANSFORM,
     // 色補正 / グレード
@@ -867,6 +942,10 @@ static BUILTIN_VIDEO_FX: &[VideoFxDef] = &[
     CHROMA_KEY,
     // ノイズ / 質感
     FILM_GRAIN,
+    // 時間系 (B9 / r.md #8)。 feedback (history) 系は engine 側の前フレーム texture
+    // 配線が別途必要なため Time 系のみ。
+    STROBE,
+    TIME_WOBBLE,
 ];
 
 /// 内蔵映像効果の正準リストを返す。`plugin_db::builtin_descriptors` /
