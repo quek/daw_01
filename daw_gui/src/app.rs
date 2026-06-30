@@ -5938,6 +5938,10 @@ pub enum AppEvent {
     /// 同 source + 同パラメータ。 clip.length_beats が足りなければ自動
     /// で伸ばす。 selection は新 event に移る。
     DuplicateAudioEditorEvent,
+    /// B12 (r.md #8): 選択オーディオクリップを auto-warp。 transient を検出し拍
+    /// グリッド (16th) に snap した warp markers を生成、 該当 event を Stretch
+    /// mode に切替える。 audio 以外の選択 / 未 decode は no-op。
+    AutoWarpSelectedClip,
 
     // ---- Audio Editor event 単位編集 (Phase 2 PR-D 段階 3) -----------
     /// Audio Editor で event の clip 内 start position を変更
@@ -7533,6 +7537,11 @@ impl AppData {
             }
             AppEvent::DuplicateAudioEditorEvent => {
                 self.duplicate_audio_editor_event();
+            }
+            AppEvent::AutoWarpSelectedClip => {
+                if let Some(target) = self.selected_clip_ref() {
+                    self.auto_warp_clip(target);
+                }
             }
             AppEvent::SetAudioEventStart { clip, event_idx, new_start_beats } => {
                 self.set_audio_event_start(clip, event_idx, new_start_beats);
@@ -16531,6 +16540,96 @@ impl AppData {
         // 走らせ slice の trigger 位置を埋める (検出済 / 非 Slice は何もしない)。
         if mode == common::model::StretchMode::Slice {
             self.detect_onsets_for_clip(target);
+        }
+    }
+
+    /// B12 (r.md #8): 選択 audio clip の transient を検出し beat grid (16th) に snap
+    /// した warp markers を生成する (auto-warp、 Ableton 流)。 onset は B1 と同じ
+    /// `detect_onsets`、 grid 整列は純関数 `warp_markers_from_onsets`。 warp が効くよう
+    /// 該当 event を `Stretch` mode に切替える。 transient が無い event は markers 空
+    /// (= uniform stretch のまま)。 OFF-RT。 buffer 未 decode の event は skip。
+    fn auto_warp_clip(&mut self, target: ClipRef) {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        let n_events = match self.song.clip_contents.get(&content_id) {
+            Some(common::model::ClipContent::Audio(a)) => a.events.len(),
+            _ => return,
+        };
+        let indices = self.audio_event_target_indices(target, n_events);
+
+        // Phase A: 対象 event の source range + 配置 beat 長 (immutable borrow)。
+        let mut jobs: Vec<(usize, common::model::AudioSourceId, u64, u64, f64)> = Vec::new();
+        if let Some(common::model::ClipContent::Audio(a)) =
+            self.song.clip_contents.get(&content_id)
+        {
+            for &i in &indices {
+                if let Some(e) = a.events.get(i) {
+                    jobs.push((
+                        i,
+                        e.source_id,
+                        e.source_start_frames,
+                        e.source_end_frames,
+                        e.event_length_beats,
+                    ));
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+
+        // Phase B: onset 検出 → grid snap warp markers (OFF-RT)。
+        let mut results: Vec<(usize, Vec<common::model::BeatMarker>)> = Vec::new();
+        for (i, source_id, start, end, length_beats) in jobs {
+            let Some(buf) = self.audio_source_cache.get(source_id) else {
+                continue;
+            };
+            let s = start.min(buf.frames) as usize;
+            let e = end.min(buf.frames) as usize;
+            let source_len = end.saturating_sub(start);
+            let mono = buf.downmix_mono(s, e);
+            if mono.is_empty() || source_len == 0 || length_beats <= 0.0 {
+                continue;
+            }
+            let onsets = common::onset::detect_onsets(&mono, buf.sample_rate, 0.5);
+            let markers = common::audio_render::warp_markers_from_onsets(
+                &onsets,
+                start,
+                source_len,
+                length_beats,
+                4,
+            );
+            // anchor 2 件のみ = transient 無し → 空で uniform stretch を維持。
+            results.push((i, if markers.len() > 2 { markers } else { Vec::new() }));
+        }
+
+        // Phase C: 書き戻し (warp 有効 event は Stretch mode へ) + engine 再 sync。
+        let mut warped = 0usize;
+        let mut changed = false;
+        if let Some(common::model::ClipContent::Audio(a)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for (i, markers) in results {
+                if let Some(ev) = a.events.get_mut(i) {
+                    if !markers.is_empty() {
+                        ev.stretch_mode = common::model::StretchMode::Stretch;
+                        warped += 1;
+                    }
+                    ev.beat_markers = markers;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.status_message = format!("Auto-Warp: {warped} event を beat grid に整列");
+            self.sync_song_to_plugin_host();
         }
     }
 

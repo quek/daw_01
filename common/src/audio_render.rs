@@ -154,6 +154,56 @@ pub fn warp_source_frame(event_beat: f64, markers: &[BeatMarker]) -> Option<f64>
     }
 }
 
+/// B12 (r.md #8): onset (source frame) を beat grid に snap した warp markers に
+/// 変換する (auto-warp の core)。 各 onset の uniform 配置 beat
+/// (`onset / source_len × length_beats`) を `1/grid` に量子化 (grid=4 で 16th note)
+/// し source↔beat を pin する。 先頭 (beat 0) / 末尾 (`length_beats`) の anchor を
+/// 必ず含め、 `locked_beat` が厳密増加するよう間引く (warp の monotonic 前提)。 退化
+/// 入力 (source_len / grid / length 0) や transient が全て grid 上で潰れる場合は
+/// anchor 2 件のみ → caller は「warp 不要 = uniform」 とみなせる。 純関数 (off-RT)。
+pub fn warp_markers_from_onsets(
+    onsets: &[u64],
+    source_start: u64,
+    source_len: u64,
+    length_beats: f64,
+    grid: u32,
+) -> Vec<BeatMarker> {
+    let end_frame = source_start.saturating_add(source_len);
+    let end_beat = length_beats.max(0.0);
+    let mut markers = vec![BeatMarker {
+        source_frame: source_start,
+        locked_beat: 0.0,
+    }];
+    if source_len == 0 || length_beats <= 0.0 || grid == 0 {
+        markers.push(BeatMarker {
+            source_frame: end_frame,
+            locked_beat: end_beat,
+        });
+        return markers;
+    }
+    let g = f64::from(grid);
+    let mut last_beat = 0.0_f64;
+    for &onset_rel in onsets {
+        if onset_rel == 0 || onset_rel >= source_len {
+            continue;
+        }
+        let b_uniform = onset_rel as f64 / source_len as f64 * length_beats;
+        let b_snapped = (b_uniform * g).round() / g;
+        if b_snapped > last_beat + 1e-6 && b_snapped < end_beat - 1e-6 {
+            markers.push(BeatMarker {
+                source_frame: source_start + onset_rel,
+                locked_beat: b_snapped,
+            });
+            last_beat = b_snapped;
+        }
+    }
+    markers.push(BeatMarker {
+        source_frame: end_frame,
+        locked_beat: end_beat,
+    });
+    markers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +239,35 @@ mod tests {
         // 同 locked_beat の 2 marker (退化) を補間に使うと None → uniform fallback。
         let markers = [bm(0, 1.0), bm(100, 1.0)];
         assert_eq!(warp_source_frame(1.0, &markers), None);
+    }
+
+    #[test]
+    fn warp_markers_from_onsets_snaps_to_grid_monotonic() {
+        // source_len=48000, length_beats=4, grid=4 (16th)。 onset 12000 → beat 1.0、
+        // 18500 → ≈1.54 → snap 1.5、 30000 → beat 2.5。
+        let onsets = [0u64, 12_000, 18_500, 30_000];
+        let m = warp_markers_from_onsets(&onsets, 0, 48_000, 4.0, 4);
+        let beats: Vec<f64> = m.iter().map(|x| x.locked_beat).collect();
+        assert_eq!(m.first().unwrap().locked_beat, 0.0);
+        assert_eq!(m.last().unwrap().locked_beat, 4.0);
+        assert_eq!(m.last().unwrap().source_frame, 48_000);
+        // 厳密増加 (warp の monotonic 前提)。
+        assert!(beats.windows(2).all(|w| w[1] > w[0]), "monotonic: {beats:?}");
+        // 量子化先 1.0/1.5/2.5、 source_frame は onset 実値を保持。
+        assert!(m.iter().any(|x| (x.locked_beat - 1.0).abs() < 1e-9 && x.source_frame == 12_000));
+        assert!(m.iter().any(|x| (x.locked_beat - 1.5).abs() < 1e-9 && x.source_frame == 18_500));
+        assert!(m.iter().any(|x| (x.locked_beat - 2.5).abs() < 1e-9 && x.source_frame == 30_000));
+    }
+
+    #[test]
+    fn warp_markers_from_onsets_degenerate_is_anchors_only() {
+        // transient 無し (onset[0]=0 のみ) → anchor 2 件 (caller は uniform とみなす)。
+        let m = warp_markers_from_onsets(&[0], 100, 48_000, 4.0, 4);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].source_frame, 100);
+        assert_eq!(m[1].source_frame, 48_100);
+        // 退化入力 (source_len 0) も anchor 2 件。
+        assert_eq!(warp_markers_from_onsets(&[1, 2], 0, 0, 4.0, 4).len(), 2);
     }
 
     // ---- fade_envelope ----

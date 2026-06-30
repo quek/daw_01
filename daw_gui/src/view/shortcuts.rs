@@ -118,6 +118,7 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.duplicate_audio_event", keys: &["Ctrl+D"], category: ShortcutCategory::AudioEditor, description: "オーディオイベントを複製", hidden: false },
     ShortcutDef { name: "daw.next_audio_event", keys: &["Ctrl+]"], category: ShortcutCategory::AudioEditor, description: "次のオーディオイベントへ", hidden: false },
     ShortcutDef { name: "daw.prev_audio_event", keys: &["Ctrl+["], category: ShortcutCategory::AudioEditor, description: "前のオーディオイベントへ", hidden: false },
+    ShortcutDef { name: "daw.auto_warp_clip", keys: &["Alt+W"], category: ShortcutCategory::AudioEditor, description: "選択オーディオクリップを自動ワープ (transient を拍グリッドに整列)", hidden: false },
     // ----- ヘルプ -----
     ShortcutDef { name: "daw.toggle_help", keys: &["F1"], category: ShortcutCategory::Help, description: "このショートカット一覧を開く / 閉じる", hidden: false },
     // ----- 開発用 (一覧には出さない) -----

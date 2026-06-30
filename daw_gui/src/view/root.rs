@@ -1182,6 +1182,13 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::SelectAudioEditorEvent(prev))
         }));
     }
+    // B12 (r.md #8): 選択オーディオクリップを auto-warp (transient を拍グリッドに整列)。
+    // arrangement / audio editor どちらの選択でも可 (handler が audio 以外は no-op)。
+    if ui.take_shortcut("daw.auto_warp_clip") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::AutoWarpSelectedClip)
+        }));
+    }
     // modal が開いている間は escape を消費しない (modal 側で close する)。
     // 優先度: track rename → clip rename → Audio Editor close → CloseHelp。
     // rename (track header / clip rect の inline text_input) と Audio Editor
