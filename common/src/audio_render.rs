@@ -204,6 +204,62 @@ pub fn warp_markers_from_onsets(
     markers
 }
 
+/// 手動 warp marker 編集の許容下限ギャップ (locked_beat)。 `warp_source_frame` は
+/// 同 `locked_beat` セグメントを退化 (None) 扱いするので、 隣接 marker は最低この差を保つ。
+pub const WARP_MARKER_MIN_GAP: f64 = 1e-4;
+
+/// B12-manual (r.md #8): warp marker `idx` の出力位置 (`locked_beat`) を手動で動かす。
+/// `source_frame` は据え置き (= その source 位置を新しい output beat に pin し直す = stretch)。
+/// `warp_source_frame` の前提 (locked_beat 厳密増加) を壊さないよう、 隣接 marker の間
+/// (`±WARP_MARKER_MIN_GAP`) に clamp する (端 marker は外側に自由)。 純関数 (off-RT、 test 可能)。
+pub fn move_warp_marker(markers: &mut [BeatMarker], idx: usize, new_locked_beat: f64) {
+    if idx >= markers.len() {
+        return;
+    }
+    let lo = if idx > 0 {
+        markers[idx - 1].locked_beat + WARP_MARKER_MIN_GAP
+    } else {
+        f64::NEG_INFINITY
+    };
+    let hi = if idx + 1 < markers.len() {
+        markers[idx + 1].locked_beat - WARP_MARKER_MIN_GAP
+    } else {
+        f64::INFINITY
+    };
+    // 隣接が極端に近い退化ケース (lo > hi) は中点に置いて順序を保つ (clamp の panic 回避)。
+    markers[idx].locked_beat = if lo > hi {
+        (lo + hi) * 0.5
+    } else {
+        new_locked_beat.clamp(lo, hi)
+    };
+}
+
+/// B12-manual (r.md #8): warp marker を追加する。 `locked_beat` 昇順を保って挿入し、 挿入位置の
+/// `BeatMarker` index を返す (`None` = 既存 marker と locked_beat が近すぎる退化で skip)。
+pub fn add_warp_marker(
+    markers: &mut Vec<BeatMarker>,
+    source_frame: u64,
+    locked_beat: f64,
+) -> Option<usize> {
+    if markers
+        .iter()
+        .any(|m| (m.locked_beat - locked_beat).abs() < WARP_MARKER_MIN_GAP)
+    {
+        return None;
+    }
+    let pos = markers.partition_point(|m| m.locked_beat < locked_beat);
+    markers.insert(pos, BeatMarker { source_frame, locked_beat });
+    Some(pos)
+}
+
+/// B12-manual (r.md #8): warp marker `idx` を削除する (範囲外は no-op)。 markers が 2 件未満に
+/// なれば `warp_source_frame` は None を返し uniform stretch に degrade する (= warp 解除)。
+pub fn delete_warp_marker(markers: &mut Vec<BeatMarker>, idx: usize) {
+    if idx < markers.len() {
+        markers.remove(idx);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +295,54 @@ mod tests {
         // 同 locked_beat の 2 marker (退化) を補間に使うと None → uniform fallback。
         let markers = [bm(0, 1.0), bm(100, 1.0)];
         assert_eq!(warp_source_frame(1.0, &markers), None);
+    }
+
+    #[test]
+    fn move_warp_marker_clamps_between_neighbors_and_keeps_strict_order() {
+        let mut m = vec![bm(0, 0.0), bm(1000, 1.0), bm(2000, 2.0)];
+        // 中間 marker を 1.5 へ (隣接 0.0/2.0 内) → 許容、 source_frame 据え置き。
+        move_warp_marker(&mut m, 1, 1.5);
+        assert!((m[1].locked_beat - 1.5).abs() < 1e-9);
+        assert_eq!(m[1].source_frame, 1000);
+        // 末尾を 5.0 へ (next 無し = 自由)。
+        move_warp_marker(&mut m, 2, 5.0);
+        assert!((m[2].locked_beat - 5.0).abs() < 1e-9);
+        // 中間を末尾超え 9.0 へ → next(5.0) 手前に clamp。
+        move_warp_marker(&mut m, 1, 9.0);
+        assert!(m[1].locked_beat < m[2].locked_beat);
+        // 先頭を -3.0 へ (prev 無し = 自由)。
+        move_warp_marker(&mut m, 0, -3.0);
+        assert!((m[0].locked_beat - (-3.0)).abs() < 1e-9);
+        // warp_source_frame の前提 = locked_beat 厳密増加を維持。
+        for w in m.windows(2) {
+            assert!(w[0].locked_beat < w[1].locked_beat, "locked_beat 厳密増加");
+        }
+    }
+
+    #[test]
+    fn add_warp_marker_inserts_sorted_and_skips_degenerate() {
+        let mut m = vec![bm(0, 0.0), bm(2000, 2.0)];
+        assert_eq!(add_warp_marker(&mut m, 1000, 1.0), Some(1));
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1].source_frame, 1000);
+        // 既存と同 locked_beat (退化) は skip → warp_source_frame None 回避。
+        assert_eq!(add_warp_marker(&mut m, 1500, 1.0), None);
+        assert_eq!(m.len(), 3);
+        for w in m.windows(2) {
+            assert!(w[0].locked_beat < w[1].locked_beat);
+        }
+    }
+
+    #[test]
+    fn delete_warp_marker_removes_and_degrades_to_uniform() {
+        let mut m = vec![bm(0, 0.0), bm(1000, 1.0), bm(2000, 2.0)];
+        delete_warp_marker(&mut m, 1);
+        assert_eq!(m.len(), 2);
+        delete_warp_marker(&mut m, 5); // 範囲外 no-op。
+        assert_eq!(m.len(), 2);
+        delete_warp_marker(&mut m, 0);
+        // 1 件 → warp_source_frame は None (uniform fallback = warp 解除)。
+        assert_eq!(warp_source_frame(0.5, &m), None);
     }
 
     #[test]
