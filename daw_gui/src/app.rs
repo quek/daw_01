@@ -4173,7 +4173,7 @@ pub fn compute_slot_reconcile_actions(
                     track_id,
                     index,
                     plugin_id_str: inst.plugin_id.clone(),
-                    initial_state: inst.state.clone(),
+                    initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
                 });
             }
         };
@@ -8217,7 +8217,7 @@ impl AppData {
                 .iter()
                 .find(|t| t.id == track)
                 .and_then(|t| t.devices.get(index as usize))
-                .and_then(|d| d.ara_archive.clone());
+                .and_then(|d| d.ara_archive.as_deref().map(<[u8]>::to_vec));
             self.send_plugin(MainToChild::SetupAraDocument {
                 track,
                 index,
@@ -9119,7 +9119,7 @@ impl AppData {
                 format: entry.format,
                 path: entry.path.clone(),
                 plugin_id: entry.id.clone(),
-                initial_state: inst.state.clone(),
+                initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
             });
         }
     }
@@ -9157,7 +9157,7 @@ impl AppData {
                 format: entry.format,
                 path: entry.path.clone(),
                 plugin_id: entry.id.clone(),
-                initial_state: inst.state.clone(),
+                initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
             });
         }
     }
@@ -9383,13 +9383,13 @@ impl AppData {
                 continue;
             };
             if let Some(p) = chain.get_mut(s.index as usize) {
-                p.state = s.data.clone();
+                p.state = s.data.clone().map(std::sync::Arc::from);
                 // (r.md #5 ARA2) Only overwrite the ARA archive when the plug-in
                 // actually produced one; a non-ARA device or a not-yet-bound
                 // session reports None, and we must not wipe a previously-saved
                 // archive in that case.
                 if s.ara_archive.is_some() {
-                    p.ara_archive = s.ara_archive.clone();
+                    p.ara_archive = s.ara_archive.clone().map(std::sync::Arc::from);
                 }
             }
         }

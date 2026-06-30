@@ -172,31 +172,40 @@ pub const CURRENT_VERSION: u32 = 28;
 /// any zero-valued `content_id` on load.
 pub type ContentId = u32;
 
-/// Serde adapter for `Option<Vec<u8>>` that writes binary data as base64 in
+/// Serde adapter for `Option<Arc<[u8]>>` that writes binary data as base64 in
 /// JSON (and other human-readable formats). Bincode bypasses this and uses
 /// native length-prefixed bytes via the `Encode`/`Decode` derives.
+///
+/// D2 (r.md #8): bulk binary フィールド (plugin `state` / `ara_archive`) は
+/// `Arc<[u8]>` で保持する。 これらは undo の編集対象ではない (= 同じ bytes が
+/// 全 undo snapshot で共有可能) ので、 `push_undo_snapshot` の `Song::clone` が
+/// MB 級の plugin/ARA データを毎回コピーする代わりに refcount bump で済む。
+/// wire 形式は base64 文字列 (serde) / length-prefixed bytes (bincode の
+/// `Arc<[u8]>` impl は内側 slice をそのまま符号化) のまま不変なので、 既存
+/// プロジェクト / IPC との互換は保たれる。
 pub mod base64_opt {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
+    use std::sync::Arc;
 
     pub fn serialize<S: Serializer>(
-        bytes: &Option<Vec<u8>>,
+        bytes: &Option<Arc<[u8]>>,
         ser: S,
     ) -> Result<S::Ok, S::Error> {
         match bytes {
-            Some(b) => ser.serialize_some(&STANDARD.encode(b)),
+            Some(b) => ser.serialize_some(&STANDARD.encode(b.as_ref())),
             None => ser.serialize_none(),
         }
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         de: D,
-    ) -> Result<Option<Vec<u8>>, D::Error> {
+    ) -> Result<Option<Arc<[u8]>>, D::Error> {
         let s: Option<String> = Option::deserialize(de)?;
         match s {
             Some(s) => STANDARD
                 .decode(s.as_bytes())
-                .map(Some)
+                .map(|v| Some(Arc::from(v)))
                 .map_err(serde::de::Error::custom),
             None => Ok(None),
         }
@@ -3321,7 +3330,10 @@ pub struct PluginInstance {
         skip_serializing_if = "Option::is_none",
         with = "base64_opt"
     )]
-    pub state: Option<Vec<u8>>,
+    /// D2 (r.md #8): `Arc<[u8]>` で保持し undo snapshot 間で共有 (= `Song::clone`
+    /// が plugin state を毎回コピーしない)。 plugin が serialize した不透明 state で
+    /// undo の編集対象ではないので共有して安全。
+    pub state: Option<std::sync::Arc<[u8]>>,
     /// Consumer A (旧 sidechain、 docs/plan_modulation.md §1): aux 入力ポート
     /// ごとのルート。 各 entry は plugin の `is_main=false` aux input port
     /// index → `AudioTap`。 `None` (or 不足 index) はそのポートを無音に。
@@ -3364,7 +3376,9 @@ pub struct PluginInstance {
     /// プロジェクトには base64 で保存、ロード時にプラグインへ送り返して編集を
     /// 復元する。`state` (CLAP/VST3 own state) とは独立。
     #[serde(default, skip_serializing_if = "Option::is_none", with = "base64_opt")]
-    pub ara_archive: Option<Vec<u8>>,
+    /// D2 (r.md #8): `Arc<[u8]>` で保持し undo snapshot 間で共有 (Melodyne 等の
+    /// ARA アーカイブは MB 級で undo の編集対象でないため)。
+    pub ara_archive: Option<std::sync::Arc<[u8]>>,
 }
 
 impl PluginInstance {

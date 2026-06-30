@@ -176,20 +176,18 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
   `ArrLabelCache` (`song_epoch` 世代キー) に持たせ通常フレームは `Arc` clone で済ませる。 epoch は
   push_undo_snapshot / undo-redo / reset_saved_baseline で進み、 ラベルを変える編集は is_undoable
   経由で auto-push に乗るので追従。 出力同一 (perf のみ、 commit `2395d3e`)。
+- **D2 実装済** — 全 Song snapshot undo (`push_undo_snapshot` の `song.clone()`) の clone コスト
+  支配項だった bulk binary field を `Arc<[u8]>` 化し snapshot 間で共有: plugin `state` (CLAP/VST3
+  own state) + `ara_archive` (Melodyne 等 ARA、MB 級)。 これらは undo の編集対象ではない (= 同一
+  bytes を全 snapshot で共有可能) ので、 編集ごとの MB 級コピーが refcount bump になる。 metadata
+  (notes/clips/automation) は従来通り deep-clone (KB 級で安価かつ undo 対象なので版が必要)。
+  serialize 形式は不変 (serde は `base64_opt` adapter を `Arc<[u8]>` 対応に更新し base64 文字列のまま、
+  bincode は `Arc<[u8]>` を内側 slice と同一 length-prefixed で符号化) なので既存プロジェクト /
+  IPC 互換。 model↔protocol 境界 (IPC は `Vec<u8>` のまま) で `as_deref().map(to_vec)` /
+  `map(Arc::from)` 変換。 round-trip test (json + bincode) + script smoke + clippy 全 green。
 
 ### 据え置き (理由付き — 上流 infra 待ち / 著者既定の deferral / unmeasured perf / 視覚 focused)
 
-- **D2 — 現状維持と確定 (correct な critical system を unmeasured perf で書き換えない)** —
-  全 Song snapshot undo は**完全・正しく動作**しており 手ぬき/未実装ではない (= r.md #8 が狙う
-  「後回しの手ぬき」 ではなく、 設計選択として完成形)。 clone コストの支配項は metadata でなく
-  bulk field (plugin `state: Option<Vec<u8>>`、 Melodyne 等の `ara_archive: Option<Vec<u8>>`)。
-  ただし (1) 実セッションでの hitch は**未実測**、 (2) command/diff undo への全面書き換えは全
-  undoable 経路を触り undo バグ = **データ損失級のリスク**、 (3) bulk field の Arc 共有化は
-  serialize 形式変更 = **既存プロジェクト互換のリスク**。 unmeasured な perf のために correct な
-  critical system を書き換える / 直列化を変えるのは anti-best-practice なので**実装しない**。
-  *将来 perf が実測で問題化したら*、 低リスクな targeted fix = bulk field (state / ara_archive)
-  を `Arc<[u8]>` 化して snapshot 間で共有 (これらは undo の編集対象でないので undo 意味論は不変、
-  command-pattern 全書き換えより遥かに安全) を first choice とする。
 - **D4 — 「やらない」 と確定 (premature optimization)** — lane label の per-frame
   `Arc::from` は ≤ 可視 lane 数の短い alloc で、 同 build fn (`build_arrangement_lanes_from_slice`)
   が immediate-mode で毎フレーム確保する clips / points `Vec` (automation データ量比例の固有

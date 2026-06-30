@@ -133,7 +133,7 @@ fn initial_state_propagates_to_load_action() {
     // ことを確認 (= Undo で knob 値復元の根幹)。
     let track_id = 14;
     let mut inst = make_instance("p.synth");
-    inst.state = Some(vec![1, 2, 3, 4]);
+    inst.state = Some(vec![1, 2, 3, 4].into());
     let song = make_song_with_one_track(track_id, vec![inst]);
     let loaded_slots = HashMap::new();
 
