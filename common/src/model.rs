@@ -2825,7 +2825,8 @@ impl Track {
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Encode, Decode,
 )]
 pub enum TapPoint {
-    /// device chain 適用前の素の音 (新スナップショット点、 Phase 6 で実装)。
+    /// device chain 適用前の素の音 (`pre_fx_l/r` snapshot として捕捉。
+    /// engine.rs `resolve_tap_buf` / `any_pre_fx_tap` が消費)。
     PreFx,
     /// device chain 適用後・ fader 前 (`PreFaderScratch`)。
     PostFx,

@@ -12,8 +12,9 @@
 //!   (Raw / Repitch、 sample-rate 比 + pitch 比)
 //!
 //! どちらも RT path で呼ばれることを想定し allocation / panic free。
-//! Stretch / Slice モードは Phase 1 fallback で Raw 同等の挙動を返す
-//! (本実装は Phase 3+)。
+//! `Stretch` / `Slice` の time-stretch 本体は daw_audio
+//! `audio_clip_renderer.rs` の `granular_sample_at` / `slice_sample_at` が担う。
+//! ここ ([`pitch_ratio_for`]) は両モードで sr 補正のみ返す (= repitch しない)。
 
 use crate::model::{FadeCurve, StretchMode};
 
@@ -43,8 +44,8 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
 /// 1 output frame あたりの source frame 進度 (= linear interp の lookup
 /// step)。 `Raw` は単純な sample-rate 補正、 `Repitch` は SR 比 ×
 /// pitch 比 (タープ式の "tape pitch" 挙動)。 `Stretch` / `Slice` は
-/// Phase 1 では Raw 同等で fallback (= pitch も SR 比のみ)、 Phase 3+
-/// で granular / chunk crossfade に置き換え予定。
+/// sr 比のみ返す (= repitch しない)。 time-stretch 本体は daw_audio
+/// `audio_clip_renderer.rs` の granular / slice 再生が別途担う。
 ///
 /// 単位: `output_frame_at_engine_sr * pitch_ratio = source_frame_at_event_local`。
 /// Reverse は別経路 (caller 側で `source_len - 1 - source_pos` する)
@@ -65,8 +66,8 @@ pub fn pitch_ratio_for(
     match stretch_mode {
         StretchMode::Raw => sr_factor,
         StretchMode::Repitch => sr_factor * pitch_factor,
-        // Phase 1 fallback: Stretch / Slice は Raw 同等。 Phase 3+ で
-        // granular / phase vocoder / chunk + crossfade に置き換え。
+        // Stretch / Slice は sr 補正のみ (repitch しない)。 time-stretch 本体は
+        // daw_audio audio_clip_renderer.rs の granular_sample_at / slice_sample_at。
         StretchMode::Stretch | StretchMode::Slice => sr_factor,
     }
 }

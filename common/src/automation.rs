@@ -29,10 +29,11 @@ use std::collections::HashMap;
 // ここに集める。
 
 /// Plain (target's native unit) → normalized 0..=1。
-/// `PluginParam` の正規化は plugin の `min_value` / `max_value` を使う
-/// のが正確だが、 Phase 1 では IPC で param info を送る経路がまだない
-/// ので `clamp(0,1)` の placeholder。Phase 2 で
-/// `AppData.plugin_params` lookup に置換する。
+/// `PluginParam` の実 min/max を使う range-aware 正規化は [`plain_to_norm_ranged`]
+/// (range を渡す daw_gui の `plugin_params` cache 経路) が担う。 こちらの引数なし版は
+/// `plugin_range = None` を渡すので `PluginParam` は `clamp(0,1)` のまま — これは
+/// plugin param を normalize しない audio engine 経路の意図的挙動 (placeholder では
+/// ない。 r.md #8 F: 旧「Phase 2 で置換」コメントは `_ranged` 実装済で stale だった)。
 pub fn plain_to_norm(target: &AutomationTarget, plain: f64) -> f32 {
     plain_to_norm_ranged(target, plain, None)
 }
