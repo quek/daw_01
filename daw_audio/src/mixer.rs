@@ -19,6 +19,11 @@ pub const MAX_EVENTS: usize = common::process_data::MAX_EVENTS;
 /// reported latency.
 const INPUT_DELAY_PREALLOC_SAMPLES: usize = 48_000;
 
+/// E5 (r.md #8): 1 track が同時に持てる granular grain-lock-in ring の数 (= track 内
+/// audio event の最大 index)。 これを超える index の event は lock 無し (= 従来の LP
+/// smoothing 挙動) に degrade する。 1 track に数百 clip は実用上稀なので 256 で足りる。
+const MAX_GRANULAR_EVENTS_PER_TRACK: usize = 256;
+
 #[repr(align(64))]
 pub struct TrackScratch {
     /// Per-track audio output (left). Reduced into the master bus after
@@ -45,6 +50,11 @@ pub struct TrackScratch {
     /// input_delay_per_track[track_idx] + 1` (DelayLine spec requires
     /// capacity ≥ delay + 1).
     pub input_delay_line: DelayLine,
+    /// E5 (r.md #8): track 内 event ごとの granular grain-lock-in ring (添字 = event の
+    /// schedule 順 index)。 `render_audio_events` が Stretch mode の grain offset を trigger 時に
+    /// 固定するのに使い、 tempo 変化での source position 跳び (= click) を防ぐ。 起動時に
+    /// `MAX_GRANULAR_EVENTS_PER_TRACK` ぶん pre-alloc し RT で再確保しない。
+    pub granular_rings: Vec<crate::audio_clip_renderer::GrainLockRing>,
     /// Per-sample volume gain ramp for the buffer about to be processed.
     /// `MAX_FRAMES` long, allocated once at construction and overwritten
     /// in place every buffer by `fill_track_param_ramps`. The fx-chain
@@ -95,6 +105,7 @@ impl TrackScratch {
             // real plugin's reported latency; the refresh path still grows it
             // for the pathological >1 s case (which no real plugin hits).
             input_delay_line: DelayLine::with_capacity(INPUT_DELAY_PREALLOC_SAMPLES),
+            granular_rings: vec![[(u64::MAX, 0); 8]; MAX_GRANULAR_EVENTS_PER_TRACK],
             volume_per_sample: vec![1.0; MAX_FRAMES],
             pan_per_sample: vec![0.0; MAX_FRAMES],
             pre_fader_l: vec![0.0; MAX_FRAMES],

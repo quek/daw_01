@@ -410,6 +410,11 @@ pub fn render_audio_events(
     // Slice mode は instantaneous な `current_bpm` を使う (= pitch / slice
     // trigger の追随性を優先)。
     smoothed_current_bpm: f64,
+    // E5 (r.md #8): per-track の granular grain-trigger lock-in ring 群 (event 単位)。
+    // track 内 event を schedule 順に enumerate した index で引く。 Stretch mode の
+    // granular_sample_at に &mut で渡し、 grain offset を trigger 時に固定して tempo 変化での
+    // click を防ぐ。 容量を超える index の event は lock 無し (= 従来挙動) に degrade。
+    granular_rings: &mut [GrainLockRing],
 ) {
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
@@ -419,10 +424,16 @@ pub fn render_audio_events(
     let buf_end_beats =
         playhead_beats + f64::from(frames) / samples_per_beat;
 
+    // E5 (r.md #8): track 内 event を schedule 順に数える安定 index (lock-in ring の添字)。
+    // track_idx filter 後・overlap skip 前に増やすので、 同じ event は buffer を跨いで同じ
+    // index になる (seek / schedule 変化は ring 側の grain-k 不一致で自己無効化)。
+    let mut track_event_seq = 0usize;
     for event in &renderer.schedule {
         if event.track_idx != track_idx {
             continue;
         }
+        let ring_idx = track_event_seq;
+        track_event_seq += 1;
         // schedule is sorted by start_beat ascending; early-out once we
         // pass the buffer end.
         if event.start_beat >= buf_end_beats {
@@ -527,6 +538,10 @@ pub fn render_audio_events(
         let pan_l = pan_rad.cos();
         let pan_r = pan_rad.sin();
 
+        // E5 (r.md #8): この event の granular lock-in ring (index 超過は None = lock 無しに
+        // degrade)。 sample loop の granular_sample_at へ毎サンプル reborrow で渡す。
+        let mut lock_ring = granular_rings.get_mut(ring_idx);
+
         for i in buf_off_start..buf_off_end {
             // event_local = sample offset since event.start_beat。 i は buffer
             // 内 offset、 buffer 開始は playhead_beats、 event 開始は
@@ -581,6 +596,7 @@ pub fn render_audio_events(
                     &event.beat_markers,
                     samples_per_beat,
                     event.reversed,
+                    lock_ring.as_deref_mut(),
                 ),
                 StretchMode::Slice => slice_sample_at(
                     event_local,
@@ -661,6 +677,14 @@ pub fn render_audio_events(
 /// 一般的 tempo curve の click を低減する partial mitigation。
 ///
 /// RT 安全: heap 確保なし、 浮動小数演算のみ。
+/// E5 (r.md #8): per-event grain-trigger lock-in ring。 uniform-stretch の grain `k` の
+/// source offset を **trigger 時の値に固定**するため、 `(k, offset)` を `k % len` slot に
+/// 記録する。 後続 buffer で tempo_ratio が変わっても同じ grain は記録済 offset を再利用し、
+/// source position の跳び (= click) を防ぐ。 slot の `k` 不一致 (seek / schedule 変化で grain
+/// 列がずれた) は自動で recompute される。 50% overlap で同時 active grain は 2 個なので 8 slot
+/// あれば retire まで上書きされない。
+pub type GrainLockRing = [(u64, u64); 8];
+
 #[allow(clippy::too_many_arguments)]
 fn granular_sample_at(
     event_local: u64,
@@ -675,6 +699,10 @@ fn granular_sample_at(
     beat_markers: &[common::model::BeatMarker],
     samples_per_beat: f64,
     reversed: bool,
+    // E5 (r.md #8): uniform-stretch grain offset の lock-in ring。 Some なら grain k の
+    // source offset を trigger 時の値に固定 (tempo 変化での source position 跳び = click を
+    // 防ぐ)。 warp path (markers) は beat の決定論関数なので不使用。 None で従来挙動。
+    mut lock_ring: Option<&mut GrainLockRing>,
 ) -> (f32, f32) {
     /// grain hop (sample 単位)。 ~12 ms @ 44.1 kHz。 短すぎると metallic、
     /// 長すぎると transient が smear する。 512 で MVP 適正。
@@ -716,7 +744,21 @@ fn granular_sample_at(
                 None => (grain_start_out as f64 * tempo_ratio).max(0.0) as u64,
             }
         } else {
-            (grain_start_out as f64 * tempo_ratio).max(0.0) as u64
+            // E5: uniform stretch。 lock_ring があれば grain k の source offset を **trigger 時の
+            // 値に固定** する。 tempo_ratio は buffer ごとに変わりうる (tempo automation) ので、
+            // 同じ grain を後続 buffer で recompute すると source position が跳んで click になる。
+            let recomputed = (grain_start_out as f64 * tempo_ratio).max(0.0) as u64;
+            if let Some(ring) = lock_ring.as_deref_mut() {
+                let slot = (k as usize) % ring.len();
+                if ring[slot].0 == k {
+                    ring[slot].1
+                } else {
+                    ring[slot] = (k, recomputed);
+                    recomputed
+                }
+            } else {
+                recomputed
+            }
         };
         let source_pos_in_event = grain_source_offset + in_grain;
         if source_pos_in_event >= source_len {
@@ -861,4 +903,64 @@ fn slice_sample_at(
     let s_l = l_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
     let s_r = r_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
     (s_l, s_r)
+}
+
+/// E5 (r.md #8): granular grain-trigger lock-in。 grain の source offset が trigger 時の値に
+/// 固定され、 後続 buffer で tempo_ratio が変わっても再計算されない (= tempo 変化での source
+/// position 跳び = click を防ぐ) ことを検証する。
+#[cfg(test)]
+mod e5_lockin_tests {
+    use super::*;
+
+    const HOP: u64 = 512; // GRAIN_HOP_SAMPLES と一致 (granular_sample_at 内 const)。
+
+    fn call(el: u64, ratio: f64, ring: Option<&mut GrainLockRing>) {
+        let plane = vec![0.0f32; 200_000];
+        let _ = granular_sample_at(
+            el, ratio, &plane, &plane, 0, 200_000, 200_000, &[], 512.0, false, ring,
+        );
+    }
+
+    #[test]
+    fn grain_offset_is_locked_at_trigger_not_recomputed() {
+        let mut ring: GrainLockRing = [(u64::MAX, 0); 8];
+        let k = 3u64;
+        let event_local = k * HOP + HOP / 2; // grain k が active (mid-window)。
+        let slot = (k as usize) % ring.len();
+
+        // trigger (ratio 1.0): grain k の offset = k*HOP*1.0 が記録される。
+        call(event_local, 1.0, Some(&mut ring));
+        assert_eq!(ring[slot].0, k, "grain k が ring に記録される");
+        let locked = ring[slot].1;
+        assert_eq!(locked, k * HOP, "trigger offset = k*HOP*1.0");
+
+        // 同じ出力位置で tempo_ratio を倍にしても offset は固定 (recompute なら k*HOP*2.0)。
+        call(event_local, 2.0, Some(&mut ring));
+        assert_eq!(
+            ring[slot].1, locked,
+            "grain offset は trigger 時に lock され tempo 変化で再計算されない"
+        );
+    }
+
+    #[test]
+    fn stale_slot_is_overwritten_for_a_new_grain() {
+        // seek 相当: 同じ slot に別 grain (k+8) が来たら k 不一致で現 ratio で上書き (自己無効化)。
+        let mut ring: GrainLockRing = [(u64::MAX, 0); 8];
+        let k = 3u64;
+        let slot = (k as usize) % ring.len();
+        call(k * HOP + HOP / 2, 1.0, Some(&mut ring));
+        assert_eq!(ring[slot], (k, k * HOP));
+
+        let k2 = k + 8; // 同じ slot (k2 % 8 == k % 8)。
+        call(k2 * HOP + HOP / 2, 3.0, Some(&mut ring));
+        assert_eq!(ring[slot].0, k2, "k 不一致の slot は新 grain で上書きされる");
+        assert_eq!(ring[slot].1, k2 * HOP * 3, "上書きは現 ratio で recompute");
+    }
+
+    #[test]
+    fn none_ring_keeps_legacy_recompute_path() {
+        // lock_ring=None は従来挙動 (毎回 recompute) で panic しない。
+        call(3 * HOP + HOP / 2, 1.0, None);
+        call(3 * HOP + HOP / 2, 2.0, None);
+    }
 }

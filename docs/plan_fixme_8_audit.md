@@ -130,6 +130,13 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
   (非 feedback 効果は入力 texture を dummy = シェーダ未宣言で無視)。 **2 フレーム readback test
   (frame2 = black 入力でも前フレームの red trail が残る) で lifecycle を自動検証済 (green)** —
   「安定 chain_key + 永続 target が要るため別経路」 の著者既定 deferral を解消。
+- **E5 実装済** — granular grain-trigger lock-in。 uniform-stretch の grain `k` の source offset
+  を **trigger 時の値に固定** する per-event ring (`GrainLockRing`、 TrackScratch に
+  `MAX_GRANULAR_EVENTS_PER_TRACK` ぶん pre-alloc) を導入し、 後続 buffer で tempo_ratio が変化
+  しても再計算しない (= tempo automation 中の source position 跳び = click を防ぐ)。 slot の
+  grain-k 不一致 (seek / schedule 変化) は自己無効化。 RT alloc 無し (pre-alloc + array 添字)。
+  **unit test で「tempo を倍にしても grain offset が trigger 値に固定」 + slot 上書き + None
+  経路を検証 (green)**、 既存 granular 66 test に regression 無し。 著者既定の「別 phase」 deferral を解消。
 
 ### 据え置き (理由付き — 上流 infra 待ち / 著者既定の deferral / unmeasured perf / 視覚 focused)
 
@@ -138,8 +145,6 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
 - **E1** — TSF text store は caret 位置のみ保持し per-char layout を持たない (= M3 残の
   glyph-layout 配線)。 真の逆 hit-test には layout が必須で、 caret 単独の近似は IME 自身の
   fallback より悪化する。 **上流 infra 待ち**。
-- **E5** — granular grain-trigger lock-in は per-event の source-position accumulator
-  (再生跨ぎ状態) を要する stateful DSP。 現状は LP smoothing で緩和済 (低優先)。
 - **D2** — undo の全 Song snapshot → 差分化は全 undoable action を触る大 refactor。 現行
   snapshot undo は正しく動作 (perf低)。
 - **D3/D4** — per-frame の track/clip 名 `Arc::from` / lane label `format!` は小 alloc
