@@ -143,11 +143,19 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
     `repitch_source_pos`) で contiguous 再生は ratio を積分・seek は再 anchor。 Raw は ratio 一定なので
     積分値 = 従来式で byte 同一。 unit test で連続積分 / seek 再 anchor / Raw 一致を検証 (green)。
     Slice は離散 slice を native rate 再生なので非該当。
+- **B7 解決 (実装不要と判明)** — 監査時は「builtin にエディタ窓 GUI 無し = stub」 と挙げたが、
+  調査の結果 **機能は既に daw_gui の native UI に在る**: 声選択 = `track_inspector` の per-clip
+  voice picker (`Clip::speaker_id` SSoT / `SetClipVoice` / `app.singers` 一覧)、 合成進捗 =
+  clip スピナー + 全体オーバーレイ (`voicevox_synth_status`)。 builtin (≠ 3rd-party CLAP/VST3) は
+  設定をホスト native UI に統合する方が SSoT 一貫。 別エディタ窓に speaker picker / progress を
+  重複実装するのは反 SSoT。 よって `gui_is_embed_supported=false` + gui_* no-op が**最終形**
+  (旧 `bail!("PR-V2.4 予定")` を「意図的に GUI 無し」 の文書化 no-op に是正、 unused `bail` 除去)。
 
 ### 据え置き (理由付き — 上流 infra 待ち / 著者既定の deferral / unmeasured perf / 視覚 focused)
 
-- **B7 (VOICEVOX 埋込 GUI) / B12 (手動ワープ編集)** — waveform / preview 上の視覚 UI 操作が
-  中核。 focused 実装 + 視覚 sign-off 要 (inspector 層は配置手戻りの実績あり、 blind 実装回避)。
+- **B12 (手動ワープ編集)** — model 層 (move/add/delete_warp_marker) は実装済・テスト緑
+  (commit `cd14c7d`)。 残りの UI (warped 波形表示 + marker drag/add/delete) は audio editor の
+  視覚操作が中核 + `app.rs` の AppEvent/handler 配線が要る (= 視覚 sign-off 要)。
 - **E1** — TSF text store は caret 位置のみ保持し per-char layout を持たない (= M3 残の
   glyph-layout 配線)。 真の逆 hit-test には layout が必須で、 caret 単独の近似は IME 自身の
   fallback より悪化する。 **上流 infra 待ち**。

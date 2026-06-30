@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use bincode::{Decode, Encode};
 use common::plugin_db::BUILTIN_ID_VOICEVOX;
@@ -886,13 +886,24 @@ impl LoadedPlugin for VoicevoxBuiltin {
         }
     }
 
-    // --- Embedded GUI (PR-V2.4 で speaker picker / progress bar) -----------
+    // --- Embedded GUI: 意図的に持たない (r.md #8 B7 = no-op が最終形) ---------
+    // builtin VOICEVOX は専用エディタ窓 GUI を実装しない。 3rd-party CLAP/VST3 と違い、
+    // builtin の設定はホスト (daw_gui) の native UI に統合されている方が SSoT で一貫する:
+    //   - 声 (speaker/style) 選択: track_inspector の per-clip voice picker
+    //     (`Clip::speaker_id` が SSoT、 `SetClipVoice` で焼き込み、 `app.singers` の一覧)。
+    //   - 合成進捗/状態: daw_gui の clip スピナー + 全体オーバーレイ
+    //     (`voicevox_synth_status`、 `VoicevoxSynthStatus` IPC)。
+    // よって別エディタ窓に speaker picker / progress bar を重複実装しない (= 機能は既に
+    // native UI にあり editor 窓 GUI は不要)。 `gui_is_embed_supported=false` を返すので
+    // ホストはエディタ窓を開かず、 以降の gui_* は呼ばれない (呼ばれても benign no-op)。
     fn gui_is_embed_supported(&self) -> bool {
         false
     }
 
     fn gui_create_embedded(&mut self) -> Result<()> {
-        bail!("VoicevoxBuiltin: GUI 未実装 (PR-V2.4 予定)")
+        // 設計上 GUI を持たない (上記)。 supported=false なので到達しないが、 到達しても
+        // エラーにせず no-op 成功 (ホスト側の defensive 呼び出しを壊さない)。
+        Ok(())
     }
 
     fn gui_get_size(&self) -> Option<(u32, u32)> {
@@ -908,7 +919,8 @@ impl LoadedPlugin for VoicevoxBuiltin {
     }
 
     fn gui_set_parent_hwnd(&self, _hwnd: u64) -> Result<()> {
-        bail!("VoicevoxBuiltin: GUI 未実装")
+        // 設計上 GUI 窓を持たない (gui_is_embed_supported=false)。 benign no-op。
+        Ok(())
     }
 
     fn gui_show(&self) -> Result<bool> {
