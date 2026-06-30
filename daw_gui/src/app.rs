@@ -6180,9 +6180,15 @@ impl AppData {
             AppEvent::SetSongBpmFromScrub(next) => {
                 let clamped = next.clamp(1.0, 400.0);
                 if (self.song.bpm - clamped).abs() > f32::EPSILON {
+                    let old_bpm = self.song.bpm;
                     self.song.bpm = clamped;
                     self.bpm_edit_text = format!("{:.1}", clamped);
-                    self.send_audio(MainToChild::SetSongBpm { bpm: clamped });
+                    // Raw audio clip を秒固定スケール (r.md #7)。Raw clip があれば
+                    // LoadSong (decode 再利用で軽量) で再生 window を追従させ、
+                    // 無ければ従来の軽量 SetSongBpm で済ます。
+                    if !self.rescale_raw_clips_for_bpm_change(old_bpm, clamped) {
+                        self.send_audio(MainToChild::SetSongBpm { bpm: clamped });
+                    }
                     // Phase 6 review (dirty flag fix): scrub 中の連続 commit
                     // は Undo step を増やさない方針なので `push_undo_snapshot`
                     // は呼ばないが、 `is_dirty` は立てる。 立てないと autosave
@@ -14160,11 +14166,15 @@ impl AppData {
                 self.set_track_pan(track_id, pan);
             }
             common::model::BindingTarget::SongTempo => {
-                // CC 0..127 → 60..180 BPM linear。 SetSongBpm 軽量 IPC で
-                // audio engine の song.bpm を即時更新 (= LoadSong 不要)。
+                // CC 0..127 → 60..180 BPM linear。 Raw audio clip を秒固定スケール
+                // (r.md #7)。Raw clip があれば LoadSong (decode 再利用で軽量) で
+                // 再生 window を追従、無ければ軽量 SetSongBpm で即時更新。
                 let bpm = (60.0 + v_norm * 120.0).clamp(1.0, 400.0);
+                let old_bpm = self.song.bpm;
                 self.song.bpm = bpm;
-                self.send_audio(MainToChild::SetSongBpm { bpm });
+                if !self.rescale_raw_clips_for_bpm_change(old_bpm, bpm) {
+                    self.send_audio(MainToChild::SetSongBpm { bpm });
+                }
             }
             common::model::BindingTarget::PluginParam {
                 track,
@@ -20627,6 +20637,22 @@ impl AppData {
         true
     }
 
+    /// `song.bpm` を変更した後に呼ぶ共通処理。Raw audio clip を「実時間 (秒)
+    /// 固定」で BPM 比にスケールし (r.md #7 — Ableton Warp-off 相当: Raw は source
+    /// を元速度で鳴らすので tempo が変わるとグリッド上の拍長が変わる)、Raw clip が
+    /// あった場合は audio engine に `LoadSong` を送って再生 window を秒固定で追従
+    /// させ `true` を返す。`LoadSong` は source 不変なので decode 再利用で軽量
+    /// (re-decode は走らない)。Raw clip が無ければ `false` を返し、呼び出し側の
+    /// 軽量 `SetSongBpm` に委ねる。
+    fn rescale_raw_clips_for_bpm_change(&mut self, old_bpm: f32, new_bpm: f32) -> bool {
+        if !self.song.rescale_raw_clips_for_bpm(old_bpm, new_bpm) {
+            return false;
+        }
+        let song = self.song.clone();
+        self.send_audio(MainToChild::LoadSong(song));
+        true
+    }
+
     /// BPM 入力欄を Enter で commit。 parse 成功なら 1.0..=400.0 に clamp して
     /// `song.bpm` に反映、 parse 失敗なら現値を維持。 どちらも edit_text を
     /// formatted な現値 (`"{:.1}"`) に書き戻して表示を整える。
@@ -20634,7 +20660,11 @@ impl AppData {
         if let Ok(v) = self.bpm_edit_text.trim().parse::<f32>() {
             let clamped = v.clamp(1.0, 400.0);
             if (self.song.bpm - clamped).abs() > f32::EPSILON {
+                let old_bpm = self.song.bpm;
                 self.song.bpm = clamped;
+                // Raw audio clip を秒固定スケール (r.md #7)。LoadSong は直後の
+                // sync_song_to_plugin_host が送るので、ここでは model 更新のみ。
+                self.song.rescale_raw_clips_for_bpm(old_bpm, clamped);
                 self.sync_song_to_plugin_host();
             }
         }

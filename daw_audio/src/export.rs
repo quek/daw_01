@@ -273,6 +273,32 @@ fn render_loop(
 
     let any_solo = song.tracks.iter().any(|t| t.solo);
 
+    // Ensure every audio source is decoded before the offline walk. The
+    // background decode worker (r.md #7) may not have finished, and the
+    // per-buffer `audio_clip_renderer.load()` below would otherwise render an
+    // undecoded source as silence. Export / bounce is freewheel, so a
+    // synchronous full compile here is appropriate; it reuses already-decoded
+    // buffers and publishes the full renderer for the live load to pick up.
+    {
+        let prev = engine_shared.audio_clip_renderer.load();
+        let prev_ref: &crate::audio_clip_renderer::AudioClipRenderer = &prev;
+        if crate::audio_clip_renderer::has_undecoded_sources(song, prev_ref) {
+            let project_dir = engine_shared
+                .project_dir
+                .load()
+                .as_ref()
+                .map(|a| (**a).clone());
+            let full = crate::audio_clip_renderer::compile_audio_schedule(
+                song,
+                Some(prev_ref),
+                project_dir.as_deref(),
+                sample_rate,
+                true,
+            );
+            engine_shared.audio_clip_renderer.store(Arc::new(full));
+        }
+    }
+
     // Compile the routing schedule once for the whole render — same
     // structure as the live audio thread's `cached_schedule`. PDC
     // compensation (`ApplyDelay`), group buses (`Mix → TrackScratch`)

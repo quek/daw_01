@@ -261,6 +261,18 @@ pub struct EngineShared {
     /// overlap the current playhead range. Empty until imports start
     /// landing.
     pub audio_clip_renderer: ArcSwap<AudioClipRenderer>,
+    /// Monotonic schedule version, bumped on every `LoadSong`. The background
+    /// decode worker stamps each job with the generation at dispatch and only
+    /// publishes its fully-decoded renderer if this is still current, so a slow
+    /// decode for a superseded song can't clobber a newer schedule
+    /// (r.md #7 decode 再設計 B)。
+    pub schedule_generation: AtomicU64,
+    /// Guards publication of a freshly compiled `audio_clip_renderer` so a slow
+    /// background decode for an older generation can't clobber a newer one
+    /// (closes the TOCTOU between the generation re-check and the `ArcSwap`
+    /// store). Holds the highest generation published so far. Off the audio
+    /// thread — the CPAL callback never takes this lock (r.md #7 B)。
+    pub last_published_generation: std::sync::Mutex<u64>,
     /// Current project directory, used to resolve
     /// `AudioSourcePath::ProjectRelative`. `None` for unsaved projects
     /// — `ProjectRelative` paths fail to resolve in that state and the
@@ -291,6 +303,8 @@ impl EngineShared {
             export_cancel: AtomicBool::new(false),
             live_parked: AtomicBool::new(false),
             audio_clip_renderer: ArcSwap::from_pointee(AudioClipRenderer::empty()),
+            schedule_generation: AtomicU64::new(0),
+            last_published_generation: std::sync::Mutex::new(0),
             project_dir: ArcSwapOption::empty(),
             preroll_total_samples: AtomicU64::new(0),
             preroll_remaining_samples: AtomicU64::new(0),
