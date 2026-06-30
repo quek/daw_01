@@ -583,12 +583,11 @@ pub struct MidiBinding {
     pub target: BindingTarget,
 }
 
-/// Phase 7 B1-M Step 2-4 (2026-05-13): MIDI Learn の bind 先。 段階 2 で
-/// TrackVolume / TrackPan / SongTempo の 3 種、 段階 4 で PluginParam を
-/// 追加。 `PluginParam` の actual injection (= GUI → audio thread → plugin
-/// host → IParameterChanges で plugin に送信) は IPC + RT 安全性整備が
-/// 大規模なため extended scope (別フェーズ)、 段階 4 では「データ型 +
-/// tracing 経由の警告」 のみで bind だけは可能。
+/// MIDI Learn の bind 先。 TrackVolume / TrackPan / SongTempo / PluginParam。
+/// CC 受信時は `apply_midi_value_to_target` が各 target に値を反映する
+/// (PluginParam は param range で value_real に変換し inspector knob と同じ
+/// lane-default 経路で plugin host へ、 r.md #8 B2)。 transport の Learn button が
+/// 「直近に触った param」 を bind する (touch + learn)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub enum BindingTarget {
     /// `Track.volume` (0.0..=1.0、 CC 0..127 を linear マップ)。
@@ -599,15 +598,15 @@ pub enum BindingTarget {
     /// curve とは独立 (= curve がある場合は curve が優先、 CC は base bpm を
     /// 動かすイメージ)。
     SongTempo,
-    /// Phase 7 B1-M Step 4: plugin parameter bind。 `track` / `slot` で
-    /// plugin instance を特定、 `param_id` は format ごと (CLAP `clap_id` /
-    /// VST3 `ParamID`)。 actual な injection は extended scope (= GUI →
-    /// audio thread → plugin host への RT-safe IPC + IParameterChanges /
-    /// CLAP_EVENT_PARAM_VALUE injection)。 段階 4 では bind data の永続化
-    /// と GUI side `apply_midi_value_to_target` での tracing log まで。
+    /// plugin parameter bind (r.md #8 B2)。 `track` + `device_index` で
+    /// linear device chain 上の plugin instance を特定 (`AutomationTarget::
+    /// PluginParam` と同じ addressing)、 `param_id` は format ごと
+    /// (CLAP `clap_id` / VST3 `ParamID`)。 CC 受信時は `apply_midi_value_to_target`
+    /// が param range で value_real に変換し、 inspector knob と同じ lane-default
+    /// 経路で plugin host へ反映する。
     PluginParam {
         track: u32,
-        slot: crate::protocol::PluginSlot,
+        device_index: u32,
         param_id: u32,
     },
 }

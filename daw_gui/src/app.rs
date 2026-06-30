@@ -13254,10 +13254,25 @@ impl AppData {
     /// (`visible=false`) を作る。 master は `song_lanes`。 音への反映 (host push) は
     /// scrub 終端で inspector が `sync_song_to_plugin_host` を呼ぶ (RT 安全)。
     fn set_plugin_param(&mut self, device_index: u32, param_id: u32, value_real: f64) {
-        use common::model::{AutomationLane, AutomationTarget};
         let Some(track_id) = self.cursor_track_id() else {
             return;
         };
+        self.set_plugin_param_on_track(track_id, device_index, param_id, value_real);
+    }
+
+    /// `set_plugin_param` の track 明示版 (B2 / r.md #8): inspector knob は
+    /// cursor track、 MIDI Learn binding は binding の `track` を渡す。 plugin
+    /// param の値を lane `default_value` に書き (= host が daw_audio 経由で読む
+    /// SSoT)、 `last_touched_param` を更新する。 host への push は caller 責務
+    /// (drag 終端 / CC 受信ごとに `sync_song_to_plugin_host`)。
+    fn set_plugin_param_on_track(
+        &mut self,
+        track_id: u32,
+        device_index: u32,
+        param_id: u32,
+        value_real: f64,
+    ) {
+        use common::model::{AutomationLane, AutomationTarget};
         let Some(info) = self
             .plugin_params
             .get(&(track_id, device_index))
@@ -14178,6 +14193,36 @@ impl AppData {
         }
     }
 
+    /// MIDI Learn button (transport) が bind する target を決める (B2 / r.md #8、
+    /// touch + learn)。 直近に触った param (`last_touched_param`) が bind 可能
+    /// (PluginParam / track Volume / Pan) ならそれを優先、 無ければ選択 track の
+    /// Volume に fallback。
+    pub fn midi_learn_binding_target(
+        &self,
+        armed_track: Option<u32>,
+    ) -> Option<common::model::BindingTarget> {
+        use common::model::{AutomationTarget, BindingTarget, TrackBuiltinParam};
+        if let Some(tp) = &self.last_touched_param {
+            match tp.target {
+                AutomationTarget::PluginParam { device_index, param_id, .. } => {
+                    return Some(BindingTarget::PluginParam {
+                        track: tp.track_id,
+                        device_index,
+                        param_id,
+                    });
+                }
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => {
+                    return Some(BindingTarget::TrackVolume(tp.track_id));
+                }
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => {
+                    return Some(BindingTarget::TrackPan(tp.track_id));
+                }
+                _ => {}
+            }
+        }
+        armed_track.map(BindingTarget::TrackVolume)
+    }
+
     /// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn 経路 + 通常 lookup 経路。
     /// `midi_learn_target` Some なら新規 binding 追加 (= 同じ
     /// `(channel, controller)` 既存 entry は replace、 1 度の CC 受信で None
@@ -14254,26 +14299,25 @@ impl AppData {
             }
             common::model::BindingTarget::PluginParam {
                 track,
-                slot,
+                device_index,
                 param_id,
             } => {
-                // Phase 7 B1-M Step 4 (2026-05-13): bind データは永続化されて
-                // いるが、 actual な injection (= GUI → audio thread → plugin
-                // host で IParameterChanges / CLAP_EVENT_PARAM_VALUE 送信) は
-                // extended scope (別フェーズ = plan_b1_vst3_completion.md
-                // 参照)。 RT-safe IPC + audio thread への queue + plugin
-                // host での event injection が必要なため。 現状は bind 完了
-                // は status_message に表示されるが、 CC 受信時は warning log
-                // のみで音には反映されない。 user に「bind 自体は保存される
-                // が CC 受信は次フェーズで動く」 を可視化。
-                tracing::warn!(
-                    track,
-                    ?slot,
+                // B2 (r.md #8): CC → plugin param。 param range で CC 0..1 を実
+                // value_real (min..max) に変換し、 inspector knob と同じ lane-
+                // default 経路 (`set_plugin_param_on_track`) で更新 → host へ再
+                // sync して音に反映。 range 未取得 (host が PluginParamList 未送)
+                // は 0..1 を plain とみなす best-effort。
+                let target = common::model::AutomationTarget::PluginParam {
+                    device_index,
                     param_id,
-                    cc_norm = v_norm,
-                    "MIDI binding to PluginParam is stored but injection \
-                     is not yet implemented (extended scope)"
-                );
+                    legacy_slot: None,
+                };
+                let value_real = match self.plugin_param_range(track, &target) {
+                    Some((min, max)) => min + f64::from(v_norm) * (max - min),
+                    None => f64::from(v_norm),
+                };
+                self.set_plugin_param_on_track(track, device_index, param_id, value_real);
+                self.sync_song_to_plugin_host();
             }
         }
     }

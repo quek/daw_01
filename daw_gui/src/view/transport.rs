@@ -579,12 +579,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 「現在 user 操作待ちの mode」 強調)。
     let learn_w = 90.0;
     let learn_active = app.midi_learn_target.is_some();
+    let armed_track_for_learn = app.selected_track_ids.first().copied();
+    // B2 (r.md #8): touch + learn。 直近に触った param が bind 可能なら
+    // (PluginParam / Volume / Pan) それを、 無ければ選択 track の Volume を learn。
+    let learn_target = app.midi_learn_binding_target(armed_track_for_learn);
     let learn_label = if learn_active {
         "Learning..."
     } else {
-        "Learn Vol"
+        match learn_target {
+            Some(common::model::BindingTarget::PluginParam { .. }) => "Learn Param",
+            Some(common::model::BindingTarget::TrackPan(_)) => "Learn Pan",
+            _ => "Learn Vol",
+        }
     };
-    let armed_track_for_learn = app.selected_track_ids.first().copied();
     ui.toggle_button_at(
         "transport_midi_learn",
         learn_label,
@@ -595,10 +602,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             Edit::mutate(move |app: &mut AppData| {
                 if app.midi_learn_target.is_some() {
                     app.handle_event(AppEvent::CancelMidiLearn);
-                } else if let Some(track_id) = armed_track_for_learn {
-                    app.handle_event(AppEvent::StartMidiLearn(
-                        common::model::BindingTarget::TrackVolume(track_id),
-                    ));
+                } else if let Some(target) = learn_target {
+                    app.handle_event(AppEvent::StartMidiLearn(target));
                 }
             })
         },
