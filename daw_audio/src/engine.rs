@@ -414,6 +414,12 @@ pub struct LocalState {
     /// Last `Arc<Song>` we compiled the schedule from, kept alive so
     /// pointer equality is meaningful across buffers.
     pub cached_song: Option<Arc<Song>>,
+    /// (A10 r.md #8) cached_song の SongTempo curve を積分した beat↔sample map。
+    /// seek / loop-wrap で playhead を sample→beat に戻すとき、 constant-bpm 線形推定
+    /// でなくこの map で tempo automation を honor する。 `refresh_schedule` が song
+    /// 変化時に再構築 (compile と同経路、 edit-time のみ)。 lookup は O(log n)・
+    /// alloc/lock 無で RT 安全。
+    pub tempo_map: common::tempo_map::TempoMap,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -450,6 +456,8 @@ impl LocalState {
             cached_schedule: Schedule::empty(),
             mod_scalars_snapshot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
             cached_song: None,
+            // 初期は default song (= constant 120bpm)。 seek/loop-wrap は線形に縮退。
+            tempo_map: common::tempo_map::TempoMap::from_song(&Song::default()),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
@@ -488,6 +496,9 @@ impl LocalState {
                 }
             }
             self.cached_song = Some(Arc::clone(song_arc));
+            // A10 (r.md #8): tempo map を song 変化時に再構築 (seek / loop-wrap で
+            // playhead を tempo automation に沿って sample→beat 逆算するため)。
+            self.tempo_map = common::tempo_map::TempoMap::from_song(song_arc.as_ref());
             // PR4.5 sidechain plugin-internal alignment: ensure each
             // TrackScratch's input_delay_line has enough capacity for the
             // newly compiled schedule. Reallocates only when capacity needs
@@ -831,14 +842,11 @@ impl LocalState {
         // 過去の tempo 履歴を再生できないので、 song.bpm を constant とした
         // linear 推定で playhead_beats を再初期化する。
         if playhead != self.last_known_playhead {
-            let song_bpm =
-                song_ref.map(|s| s.bpm.max(1.0)).unwrap_or(120.0) as f64;
-            let sr = sample_rate as f64;
-            self.playhead_beats = if sr > 0.0 {
-                playhead as f64 * song_bpm / (60.0 * sr)
-            } else {
-                0.0
-            };
+            // A10 (r.md #8): seek 着地点の beat を tempo map で正確に逆算する
+            // (旧 constant-bpm 線形推定は tempo automation 中に着地 beat がズレた)。
+            // map は cached_song から構築済 (song=None / 起動直後は default 120bpm map
+            // = 線形に縮退)。
+            self.playhead_beats = self.tempo_map.samples_to_beat(playhead, sample_rate);
         }
         // 今 buffer の effective bpm を SongTempo lane から評価する。
         // song = None なら 120.0 default、 SongTempo lane 無しなら song.bpm。
@@ -1179,10 +1187,10 @@ impl LocalState {
                     // current_bpm を constant とした linear 推定で OK (= tempo
                     // automation 中の loop boundary は MVP scope 外で、 通常
                     // の constant tempo loop なら精度問題なし)。
-                    if sr > 0.0 {
-                        self.playhead_beats =
-                            new_ph as f64 * f64::from(current_bpm) / (60.0 * sr);
-                    }
+                    // A10 (r.md #8): loop start の beat も tempo map で正確に逆算
+                    // (旧 constant current_bpm 線形推定は tempo automation 中の loop
+                    // boundary でズレた)。
+                    self.playhead_beats = self.tempo_map.samples_to_beat(new_ph, sample_rate);
                 } else {
                     self.playing = false;
                     shared
