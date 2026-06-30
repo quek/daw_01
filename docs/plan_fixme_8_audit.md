@@ -95,3 +95,44 @@ stale なだけ (= 実は実装済み) のマーカーは除外し、**現在の
 audio 入力録音 (SetTrackArmed) / 非Windows build / WAV 以外の audio import (mp3/flac) / animated GIF・APNG・SVG・RAW import /
 baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAccess の tempo-map / i18n /
 動画 export の perf パイプライン化 (encode readback 先読み・libav decode 統一) / surround (>stereo)。
+
+## 実装状況 (r.md #8 — branch feat/r-md-8、計 40 commits、全 compile/clippy/test green)
+
+各項目を実装 or 文書化された据え置き (理由付き) で終端した。
+
+- **A 全件 (A1-A10) 実装済** — 出力の正しさ。 hardware-SR 追従 + `TempoMap` SSoT で
+  tempo automation を export / MIDI export / video sync / seek-loop が一貫尊重。
+- **C 全件 (C1-C6) 実装済** — plugin GUI DPI-aware (CLAP reorder + VST3
+  `setContentScaleFactor`) / IMessage+IAttributeList COM / restartComponent (named-bit
+  diag + 該当 plugin の安全な targeted reinit + latency 再 emit) / surround
+  SpeakerArrangement / release diagnostics / CLAP gui show-hide。
+- **E2/E3/E4 実装済** — cursor-hide / mouse Back-Forward / IEC 60268-17 VU 弾道。
+- **F 実装済** — CompositeLayer dead code 削除 + 全 stale「Phase N 未実装」コメントを
+  コード確認の上で是正。
+- **B1-B6 / B8 / B10-B13 実装済** — Slice onset 検出 (`common::onset`、 test) / MIDI Learn
+  実動化 (注入 + touch&learn + legacy slot migration) / group 変調 / param block-rate /
+  録音 lane / 実 plugin param 名 / sidechain tap point UI / song-level tempo 変調 /
+  warp marker (granular consume + auto-warp `Alt+W`、 test) / 他。
+- **B9 (time) 実装済** — Strobe / Time Wobble (catalog WGSL test green)。
+
+### 据え置き (理由付き — 上流 infra 待ち / 著者既定の deferral / unmeasured perf / 視覚 focused)
+
+- **B9 (feedback)** — echo/残像トレイル系は `apply_chain` が「安定 chain_key + 永続
+  target が要るため別経路 (後続実装)」 と**著者自身が明示 deferral** 済み。 engine の
+  prior-frame texture 配線 (binding + persistent target + history() injection) を要する
+  framework 機能。
+- **B7 (VOICEVOX 埋込 GUI) / B12 (手動ワープ編集)** — waveform / preview 上の視覚 UI 操作が
+  中核。 focused 実装 + 視覚 sign-off 要 (inspector 層は配置手戻りの実績あり、 blind 実装回避)。
+- **E1** — TSF text store は caret 位置のみ保持し per-char layout を持たない (= M3 残の
+  glyph-layout 配線)。 真の逆 hit-test には layout が必須で、 caret 単独の近似は IME 自身の
+  fallback より悪化する。 **上流 infra 待ち**。
+- **E5** — granular grain-trigger lock-in は per-event の source-position accumulator
+  (再生跨ぎ状態) を要する stateful DSP。 現状は LP smoothing で緩和済 (低優先)。
+- **D1** — routing compile の off-thread 化。 alloc は**稀な edit-buffer 上のみ**
+  (steady-state でない、 既存コメントが容認する設計) + delay-line resize が別 RT alloc
+  として残るため zero-RT-alloc は単独では達成不可。 低価値 structural として据え置き。
+- **D2** — undo の全 Song snapshot → 差分化は全 undoable action を触る大 refactor。 現行
+  snapshot undo は正しく動作 (perf低)。
+- **D3/D4** — per-frame の track/clip 名 `Arc::from` / lane label `format!` は小 alloc
+  (実測 frame-drop 無し)。 cache は immutable view 中の build を mutable 経路へ移す必要があり、
+  unmeasured perf に複雑さを足す premature optimization のため据え置き (best-practice 判断)。
