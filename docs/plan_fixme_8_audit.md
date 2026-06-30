@@ -192,6 +192,14 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
   PluginParam 名も intern。 icon_glyph / color は安価な定数なので live。 出力同一 (perf のみ)。
   `ArrLabelCache` 全面 cache (song_epoch + `PluginParamList` 世代の無効化 + free-fn 配線) より
   局所・低リスクで同じ「per-frame alloc ゼロ」 を達成。
+  - **同件 (sibling-occurrence)**: arrangement build の per-frame `Arc::from(&str)` は他に
+    section ruler 名 / automation clip 名 (= `song.content_name`) にも残っていた (D3 が track/clip
+    名で潰した class の漏れ)。 どちらも user 編集可能で intern 不可なので、 D3 と同じ `ArrLabelCache`
+    (`song_epoch` 世代キー) に `section_names` / `content_names` を足して clone 化。 無効化は
+    `CommitRenameSection` / `CommitRenameClip` (is_undoable → song_epoch++) で追従。 引数が clippy
+    `too_many_arguments` に達したため context refs を `LaneBuildData` struct に束ねた。 これで
+    arrangement build の per-frame 名前 alloc class (track/clip/lane/section/automation-clip) は
+    全て cache or intern 済。
 
 ### 監査の終端
 
