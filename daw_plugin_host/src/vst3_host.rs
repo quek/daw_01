@@ -133,10 +133,29 @@ impl IComponentHandlerTrait for Vst3ComponentHandler {
     }
 
     unsafe fn restartComponent(&self, flags: i32) -> tresult {
-        // Plugins call this when their bus/parameter/latency topology has
-        // changed. MVP: accept but do not act (the user can toggle the
-        // plugin to get a clean re-activate).
-        tracing::info!(flags, "VST3 plugin requested restartComponent");
+        // C3 (r.md #8): plugin が bus / parameter / latency topology の変更を通知。
+        // raw int だけ無視していたのを named bit に分解して診断ログ化する (どの
+        // topology が変わったか分かる)。 deactivate→activate / latency 再 query /
+        // param 再列挙の実 reaction は既存の `ReinitAllPlugins` 経路 (host→audio
+        // thread の安全な reinit coordination + re-emit) で行う follow-up。 現状の
+        // clean 再 activate は user の plugin toggle (= ReinitAllPlugins) で得られる。
+        use vst3::Steinberg::Vst::RestartFlags_;
+        let f = flags as u32;
+        let mut kinds: Vec<&str> = Vec::new();
+        for (bit, name) in [
+            (RestartFlags_::kReloadComponent as u32, "ReloadComponent"),
+            (RestartFlags_::kIoChanged as u32, "IoChanged"),
+            (RestartFlags_::kParamValuesChanged as u32, "ParamValuesChanged"),
+            (RestartFlags_::kLatencyChanged as u32, "LatencyChanged"),
+            (RestartFlags_::kParamTitlesChanged as u32, "ParamTitlesChanged"),
+            (RestartFlags_::kIoTitlesChanged as u32, "IoTitlesChanged"),
+            (RestartFlags_::kRoutingInfoChanged as u32, "RoutingInfoChanged"),
+        ] {
+            if bit != 0 && f & bit != 0 {
+                kinds.push(name);
+            }
+        }
+        tracing::info!(flags, ?kinds, "VST3 plugin requested restartComponent");
         kResultOk
     }
 }
