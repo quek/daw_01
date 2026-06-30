@@ -39,11 +39,12 @@ pub enum GraphError {
 /// master). Tracks without a `parent_group_id` feed the master bus
 /// directly.
 ///
-/// TODO(PR3): 現状この setup コードは RT スレッド (audio callback) 上で
-/// `Engine::refresh_schedule` 経由で実行される。 内部で `Vec` / `HashMap`
-/// 等の heap 確保を伴うため、 編集着地のタイミングでバッファに glitch が
-/// 乗りうる **既知の制約**。 PR3 で `ArcSwap` publish に切り替え、 compile を
-/// off-thread (GUI / 非 RT スレッド) 化して RT パスからこの alloc を除去する。
+/// この compile は `Vec` / `HashMap` の heap 確保を伴うが、 **off-RT で実行される**:
+/// 呼び出し元は `main.rs::publish_routing` (receive / decode スレッド) と `export.rs`
+/// のみ。 RT パス (audio callback) は D1 (r.md #8) で wait-free SPSC (`rtrb`) 経由に
+/// pre-compiled な `CompiledRouting { song, schedule, tempo_map }` を pop して swap-in
+/// するだけになり、 この alloc は RT から完全に消えた (`Engine::refresh_schedule` 参照)。
+/// (旧 `TODO(PR3)`: かつては `refresh_schedule` が RT 上でこれを呼んでいた = D1 で解消済)
 pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, GraphError> {
     let n = song.tracks.len();
     if n == 0 {
