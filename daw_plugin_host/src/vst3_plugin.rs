@@ -540,10 +540,17 @@ fn arrangement_for_bus(
     if res != kResultOk {
         return fallback;
     }
+    // C4 (r.md #8): channel 数に応じた正確な SpeakerArrangement (旧実装は 3ch 以上を
+    // 全て stereo fallback していてコメントの surround 記述と不一致だった)。 標準
+    // surround config をマップ、 非標準 (5/7/9+) のみ fallback。
     match info.channelCount {
         0 => 0,
         1 => SpeakerArr::kMono,
         2 => SpeakerArr::kStereo,
+        3 => SpeakerArr::k30Cine, // L R C
+        4 => SpeakerArr::k40Music, // quad: L R Ls Rs
+        6 => SpeakerArr::k51, // 5.1: L R C Lfe Ls Rs
+        8 => SpeakerArr::k71Cine, // 7.1
         _ => fallback,
     }
 }
