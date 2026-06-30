@@ -20363,9 +20363,9 @@ impl AppData {
     /// Touch mode は active のみ、 Latch / Write は active ∪ latched (latched は
     /// `ParamGestureBegin` 時に再生中なら自動で insert 済)。
     ///
-    /// 戻り値は今 tick で insert した点の総数 (= 0 なら sync skip)。 lane / clip
-    /// が見つからない gesture は silently skip (= MVP: lane / clip は事前に user
-    /// が作成する。 Bitwig 流 auto-create は Step C follow-up)。
+    /// 戻り値は今 tick で insert した点の総数 (= 0 なら sync skip)。 lane / clip が
+    /// 見つからない gesture は `ensure_recording_lane_clip` で自動生成してから記録する
+    /// (B5 r.md #8: Bitwig 流 auto-create。 旧実装は silently skip で「録音しても無反応」)。
     fn record_automation_points_for_tick(&mut self, playhead_beat: f64) -> usize {
         // recording_mode = Read でも image / text PiP drag 中だけは continue
         // (= 「停止中の drag が AE/Premiere 流の auto-keyframe を打つ」
@@ -20418,7 +20418,11 @@ impl AppData {
             let (clip_start, content_id) =
                 match self.find_recording_lane(track_id, &target, playhead_beat) {
                     Some(ids) => ids,
-                    None => continue,
+                    // B5 (r.md #8): lane / clip が無ければ自動生成して記録 (旧 silently skip)。
+                    None => match self.ensure_recording_lane_clip(track_id, &target, playhead_beat) {
+                        Some(ids) => ids,
+                        None => continue,
+                    },
                 };
             // AutomationPoint は clip-local 時間で保存するので、 playhead から
             // clip.start_beat を引いて local 化する。
@@ -20430,6 +20434,103 @@ impl AppData {
             }
         }
         inserted
+    }
+
+    /// B5 (r.md #8): recording 中に対象 lane / clip が無ければ自動生成する
+    /// (Bitwig 流 auto-create)。 lane が無ければ `lane_default_for_target` の値で
+    /// 作り、 playhead を含む clip が無ければ playhead (floor) から曲末まで覆う clip を
+    /// 1 本足す。 戻り値 = `(clip.start_beat, content_id)`。 track 不在で作れなければ None。
+    fn ensure_recording_lane_clip(
+        &mut self,
+        track_id: u32,
+        target: &common::model::AutomationTarget,
+        playhead_beat: f64,
+    ) -> Option<(f64, common::model::ContentId)> {
+        use common::model::{AutomationClip, AutomationContent, AutomationLane, ClipContent};
+        let is_song_level = matches!(
+            target,
+            common::model::AutomationTarget::SongTempo
+                | common::model::AutomationTarget::SongTimeSigNumerator
+        );
+        let default_value = self.lane_default_for_target(&TouchedParam {
+            track_id,
+            target: target.clone(),
+            display_name: String::new(),
+            touched_at: std::time::Instant::now(),
+        });
+        let content_id = self.song.alloc_content_id();
+        self.song
+            .clip_contents
+            .insert(content_id, ClipContent::Automation(AutomationContent::default()));
+        let clip_start = playhead_beat.floor().max(0.0);
+        let clip_len = (self.song.length_beats - clip_start).max(4.0);
+        if is_song_level {
+            self.master_row_automation_expanded = true;
+            if let Some(lane) = self.song.song_lanes.iter_mut().find(|l| &l.target == target) {
+                lane.enabled = true;
+                let cid = lane.next_clip_id;
+                lane.next_clip_id += 1;
+                lane.clips.push(AutomationClip {
+                    id: cid,
+                    name: "Rec".into(),
+                    start_beat: clip_start,
+                    length_beats: clip_len,
+                    content_id,
+                });
+            } else {
+                let lid = self.song.alloc_song_lane_id();
+                self.song.song_lanes.push(AutomationLane {
+                    id: lid,
+                    target: target.clone(),
+                    default_value,
+                    enabled: true,
+                    visible: true,
+                    height_px: 60,
+                    clips: vec![AutomationClip {
+                        id: 1,
+                        name: "Rec".into(),
+                        start_beat: clip_start,
+                        length_beats: clip_len,
+                        content_id,
+                    }],
+                    next_clip_id: 2,
+                });
+            }
+        } else {
+            self.expanded_automation_tracks.insert(track_id);
+            let track = self.song.track_by_id_mut(track_id)?;
+            if let Some(lane) = track.automation_lanes.iter_mut().find(|l| &l.target == target) {
+                lane.enabled = true;
+                let cid = lane.next_clip_id;
+                lane.next_clip_id += 1;
+                lane.clips.push(AutomationClip {
+                    id: cid,
+                    name: "Rec".into(),
+                    start_beat: clip_start,
+                    length_beats: clip_len,
+                    content_id,
+                });
+            } else {
+                let lid = track.alloc_lane_id();
+                track.automation_lanes.push(AutomationLane {
+                    id: lid,
+                    target: target.clone(),
+                    default_value,
+                    enabled: true,
+                    visible: true,
+                    height_px: 60,
+                    clips: vec![AutomationClip {
+                        id: 1,
+                        name: "Rec".into(),
+                        start_beat: clip_start,
+                        length_beats: clip_len,
+                        content_id,
+                    }],
+                    next_clip_id: 2,
+                });
+            }
+        }
+        Some((clip_start, content_id))
     }
 
     /// Phase 4 Step C-2: GUI の currently recording set (= active ∪ latched
