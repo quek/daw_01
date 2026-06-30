@@ -3435,6 +3435,38 @@ impl AppData {
         }
     }
 
+    /// B12-manual (r.md #8): `audio_editor_clip` の `event_idx` 番目 AudioEvent の
+    /// `beat_markers` に `f` を適用する (= warp marker 手動編集)。 `mutate_audio_events_in_clip`
+    /// と違い選択ではなく特定 event を対象にする (marker drag/add/delete は対象 event が確定して
+    /// いるため)。 適用したら plugin host へ song を sync。 戻り値 = 実際に適用したか。
+    fn mutate_warp_markers<F>(&mut self, event_idx: usize, f: F) -> bool
+    where
+        F: FnOnce(&mut Vec<common::model::BeatMarker>),
+    {
+        let Some(target) = self.audio_editor_clip else {
+            return false;
+        };
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return false;
+        };
+        if let Some(common::model::ClipContent::Audio(audio)) =
+            self.song.clip_contents.get_mut(&content_id)
+            && let Some(event) = audio.events.get_mut(event_idx)
+        {
+            f(&mut event.beat_markers);
+            self.sync_song_to_plugin_host();
+            true
+        } else {
+            false
+        }
+    }
+
     /// `target` clip が `ClipContent::Image` の場合、 全 ImageEvent に
     /// `f` を適用する (= image clip は audio_editor のような per-event
     /// 選択 UI を持たないので broadcast 固定)。 戻り値は「実際に何らか
@@ -3808,6 +3840,14 @@ impl AppData {
                 | AppEvent::DuplicateAudioEditorEvent
                 | AppEvent::SetAudioEventStart { .. }
                 | AppEvent::SetAudioEventTrim { .. }
+                // B12: warp 編集 (auto-warp / 手動 marker 編集) は beat_markers を
+                // 変更する song edit。 auto_warp_clip / mutate_warp_markers は手動
+                // push_undo しないので auto-push 経路でまとめて 1 undo step にする。
+                // marker drag は release で 1 回だけ発火するので各ジェスチャ = 1 step。
+                | AppEvent::AutoWarpSelectedClip
+                | AppEvent::MoveWarpMarker { .. }
+                | AppEvent::AddWarpMarker { .. }
+                | AppEvent::DeleteWarpMarker { .. }
                 | AppEvent::AddAudioEventFromFile { .. }
                 | AppEvent::DeleteAudioEditorSelection
                 | AppEvent::ImportAudio { .. }
@@ -6002,6 +6042,28 @@ pub enum AppEvent {
     /// mode に切替える。 audio 以外の選択 / 未 decode は no-op。
     AutoWarpSelectedClip,
 
+    // ---- B12-manual (r.md #8): warp marker 手動編集 (audio editor) -----------
+    /// Audio Editor で warp marker `marker_idx` の出力位置 (`locked_beat`、 event-local
+    /// 拍) を `new_locked_beat` へ動かす (= ドラッグ)。 `source_frame` は据え置きで
+    /// stretch。 `audio_editor_clip` の `event_idx` 番目 event を対象。 隣接 marker 間に
+    /// clamp (`common::audio_render::move_warp_marker`)。 範囲外 / 非 audio は no-op。
+    MoveWarpMarker {
+        event_idx: usize,
+        marker_idx: usize,
+        new_locked_beat: f64,
+    },
+    /// Audio Editor で warp marker を追加 (= 波形ダブルクリック)。 `source_frame` (source 内
+    /// frame) を `locked_beat` (event-local 拍) に pin。 `locked_beat` 昇順を保って挿入、
+    /// 退化 (同拍) は skip。 `audio_editor_clip` の `event_idx` 番目 event を対象。
+    AddWarpMarker {
+        event_idx: usize,
+        source_frame: u64,
+        locked_beat: f64,
+    },
+    /// Audio Editor で warp marker `marker_idx` を削除 (= 右クリック / Alt+クリック)。
+    /// 2 件未満になれば warp は uniform に degrade。 `audio_editor_clip` の `event_idx` 番目。
+    DeleteWarpMarker { event_idx: usize, marker_idx: usize },
+
     // ---- Audio Editor event 単位編集 (Phase 2 PR-D 段階 3) -----------
     /// Audio Editor で event の clip 内 start position を変更
     /// (= 中央 drag 移動)。 `clip` の `event_idx` 番目の event の
@@ -7601,6 +7663,21 @@ impl AppData {
                 if let Some(target) = self.selected_clip_ref() {
                     self.auto_warp_clip(target);
                 }
+            }
+            AppEvent::MoveWarpMarker { event_idx, marker_idx, new_locked_beat } => {
+                self.mutate_warp_markers(event_idx, |m| {
+                    common::audio_render::move_warp_marker(m, marker_idx, new_locked_beat);
+                });
+            }
+            AppEvent::AddWarpMarker { event_idx, source_frame, locked_beat } => {
+                self.mutate_warp_markers(event_idx, |m| {
+                    common::audio_render::add_warp_marker(m, source_frame, locked_beat);
+                });
+            }
+            AppEvent::DeleteWarpMarker { event_idx, marker_idx } => {
+                self.mutate_warp_markers(event_idx, |m| {
+                    common::audio_render::delete_warp_marker(m, marker_idx);
+                });
             }
             AppEvent::SetAudioEventStart { clip, event_idx, new_start_beats } => {
                 self.set_audio_event_start(clip, event_idx, new_start_beats);

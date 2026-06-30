@@ -426,38 +426,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             .saturating_sub(event.source_start_frames)
             .max(1);
 
-        // visible-portion を source frames にマップ。 evt_x_*_clamped は
-        // [0, 1] 内の view 内 ratio。 event の clip 内範囲は
-        // event_start..event_start+event_length。 view の clip 内範囲は
-        // view_start_beat..view_start_beat+view_len_beats。 両者の交差を
-        // event-local 比率に直して event_len_frames に掛ける。
-        let event_len_beats_safe = event.event_length_beats.max(1e-9);
-        let event_view_start_beat =
-            event.event_start_in_clip_beats.max(view_start_beat);
-        let event_view_end_beat = (event.event_start_in_clip_beats
-            + event.event_length_beats)
-            .min(view_start_beat + view_len_beats);
-        let visible_start_in_event =
-            (event_view_start_beat - event.event_start_in_clip_beats).max(0.0);
-        let visible_len_in_event =
-            (event_view_end_beat - event_view_start_beat).max(0.0);
-        let src_visible_start_frames = event.source_start_frames
-            + ((visible_start_in_event / event_len_beats_safe)
-                * event_len_frames as f64) as u64;
-        let src_visible_len_frames = ((visible_len_in_event / event_len_beats_safe)
-            * event_len_frames as f64) as u64;
-
-        let source = WaveformSource {
-            samples: SampleSlices::Planar(planes_borrowed),
-            valid_len: buffer.frames as usize,
-            generation: event.source_id as u64,
-            sample_rate: buffer.sample_rate,
-        };
-        let view = WaveformView {
-            start_sample: src_visible_start_frames,
-            len_samples: src_visible_len_frames.max(1),
-            vertical_gain: app.audio_editor_vertical_gain,
-        };
         let is_selected = selected_set.contains(&idx);
         let fg = if is_selected {
             theme::WAVEFORM_SEL.with_alpha(0.95)
@@ -473,13 +441,123 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             render_mode: WaveformRenderMode::Auto,
             line_width_px: 1.0,
         };
-        let _ = ui.waveform(
-            ("audio_editor_wf", clip.id, idx),
-            event_rect,
-            source,
-            view,
-            style,
-        );
+
+        let markers = event.beat_markers.as_slice();
+        if markers.len() >= 2 {
+            // ----- B12-manual: 非均一 warp の区分線形波形描画 -----
+            // playback (`common::audio_render::warp_source_frame`) と同じ区分線形
+            // 写像で各 marker 区間を個別の linear `ui.waveform` として描く。 区間内
+            // は線形なので ui.waveform をそのまま流用でき、 全体で warp 形状 (= 実際
+            // に再生される source 位置) を反映する。 境界点 = (clip 相対 beat, source
+            // frame)。 端 (event-local 0 / event_length) が marker で覆われない場合は
+            // `warp_source_frame` で外挿し source frame を [0, buffer.frames] に clamp。
+            let src_max = buffer.frames as f64;
+            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(markers.len() + 2);
+            if markers[0].locked_beat > 1e-9 {
+                let sf = common::audio_render::warp_source_frame(0.0, markers)
+                    .unwrap_or(event.source_start_frames as f64)
+                    .clamp(0.0, src_max);
+                pts.push((event.event_start_in_clip_beats, sf));
+            }
+            for m in markers {
+                pts.push((
+                    event.event_start_in_clip_beats + m.locked_beat,
+                    (m.source_frame as f64).clamp(0.0, src_max),
+                ));
+            }
+            if markers[markers.len() - 1].locked_beat < event.event_length_beats - 1e-9 {
+                let sf =
+                    common::audio_render::warp_source_frame(event.event_length_beats, markers)
+                        .unwrap_or(event.source_end_frames as f64)
+                        .clamp(0.0, src_max);
+                pts.push((
+                    event.event_start_in_clip_beats + event.event_length_beats,
+                    sf,
+                ));
+            }
+            let view_end_beat = view_start_beat + view_len_beats;
+            for (seg_i, w) in pts.windows(2).enumerate() {
+                let (b0, sf0) = w[0];
+                let (b1, sf1) = w[1];
+                let seg_beats = b1 - b0;
+                if seg_beats <= 1e-9 {
+                    continue;
+                }
+                // 区間 [b0, b1] (clip 相対 beat) を view にクリップ。
+                let vis_start = b0.max(view_start_beat);
+                let vis_end = b1.min(view_end_beat);
+                if vis_end <= vis_start {
+                    continue;
+                }
+                let nx0 = ((vis_start - view_start_beat) / view_len_beats) as f32;
+                let nx1 = ((vis_end - view_start_beat) / view_len_beats) as f32;
+                let seg_rect = Rect {
+                    x: wf_area.x + nx0 * wf_area.w,
+                    y: wf_area.y,
+                    w: ((nx1 - nx0) * wf_area.w).max(1.0),
+                    h: wf_area.h,
+                };
+                // 区間内は linear: 可視 beat 範囲を source frame に線形写像。
+                let f0 = (vis_start - b0) / seg_beats;
+                let f1 = (vis_end - b0) / seg_beats;
+                let src_a = sf0 + (sf1 - sf0) * f0;
+                let src_b = sf0 + (sf1 - sf0) * f1;
+                let view = WaveformView {
+                    start_sample: src_a.min(src_b).max(0.0) as u64,
+                    len_samples: ((src_b - src_a).abs() as u64).max(1),
+                    vertical_gain: app.audio_editor_vertical_gain,
+                };
+                let source = WaveformSource {
+                    samples: SampleSlices::Planar(planes_borrowed),
+                    valid_len: buffer.frames as usize,
+                    generation: event.source_id as u64,
+                    sample_rate: buffer.sample_rate,
+                };
+                let _ = ui.waveform(
+                    ("audio_editor_wf_seg", clip.id, idx, seg_i),
+                    seg_rect,
+                    source,
+                    view,
+                    style,
+                );
+            }
+        } else {
+            // uniform stretch / raw: 従来の単一 linear 波形。
+            // visible-portion を source frames にマップ。 evt_x_*_clamped は
+            // [0, 1] 内の view 内 ratio。 event-local 比率に直して
+            // event_len_frames に掛ける。
+            let event_len_beats_safe = event.event_length_beats.max(1e-9);
+            let event_view_start_beat = event.event_start_in_clip_beats.max(view_start_beat);
+            let event_view_end_beat = (event.event_start_in_clip_beats
+                + event.event_length_beats)
+                .min(view_start_beat + view_len_beats);
+            let visible_start_in_event =
+                (event_view_start_beat - event.event_start_in_clip_beats).max(0.0);
+            let visible_len_in_event = (event_view_end_beat - event_view_start_beat).max(0.0);
+            let src_visible_start_frames = event.source_start_frames
+                + ((visible_start_in_event / event_len_beats_safe) * event_len_frames as f64)
+                    as u64;
+            let src_visible_len_frames = ((visible_len_in_event / event_len_beats_safe)
+                * event_len_frames as f64) as u64;
+            let source = WaveformSource {
+                samples: SampleSlices::Planar(planes_borrowed),
+                valid_len: buffer.frames as usize,
+                generation: event.source_id as u64,
+                sample_rate: buffer.sample_rate,
+            };
+            let view = WaveformView {
+                start_sample: src_visible_start_frames,
+                len_samples: src_visible_len_frames.max(1),
+                vertical_gain: app.audio_editor_vertical_gain,
+            };
+            let _ = ui.waveform(
+                ("audio_editor_wf", clip.id, idx),
+                event_rect,
+                source,
+                view,
+                style,
+            );
+        }
 
         // Selection border (= 選択中のみ視認できる枠)。 1 px 太い線で
         // 上下左右を marker。 push_rect で半透明帯にしても良いが、
@@ -513,6 +591,49 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         color: border_color,
                     },
                 ]),
+                line_width_px: 1.5,
+                clip_rect: Some(wf_area),
+            });
+        }
+
+        // ----- B12-manual: warp marker 描画 + 手動編集 -----
+        // 各 marker を locked_beat の x に縦線で描く。 可変な波形/背景上でも
+        // 視認できるよう暗い backing line (太) + 明色 (細) の 2 層
+        // (`feedback_ui_indicator_contrast_on_variable_bg`)。 x は draw と
+        // 下記 hit-test で共有 (DRY)。
+        let marker_xs: Vec<(usize, f32)> = event
+            .beat_markers
+            .iter()
+            .enumerate()
+            .map(|(mi, m)| {
+                let clip_beat = event.event_start_in_clip_beats + m.locked_beat;
+                let x = wf_area.x + ((clip_beat - view_start_beat) / beats_per_px) as f32;
+                (mi, x)
+            })
+            .filter(|&(_, x)| x >= wf_area.x - 0.5 && x <= wf_area.x + wf_area.w + 0.5)
+            .collect();
+        if !marker_xs.is_empty() {
+            let mut backing: Vec<LineSegment> = Vec::with_capacity(marker_xs.len());
+            let mut bright: Vec<LineSegment> = Vec::with_capacity(marker_xs.len());
+            for &(_, x) in &marker_xs {
+                backing.push(LineSegment {
+                    a: [x, event_rect.y],
+                    b: [x, event_rect.y + event_rect.h],
+                    color: theme::WINDOW_BG.with_alpha(0.65),
+                });
+                bright.push(LineSegment {
+                    a: [x, event_rect.y],
+                    b: [x, event_rect.y + event_rect.h],
+                    color: theme::LOOP_BAND.with_alpha(0.92),
+                });
+            }
+            ui.push_lines(LineBatch {
+                segments: Arc::from(backing),
+                line_width_px: 3.0,
+                clip_rect: Some(wf_area),
+            });
+            ui.push_lines(LineBatch {
+                segments: Arc::from(bright),
                 line_width_px: 1.5,
                 clip_rect: Some(wf_area),
             });
@@ -608,16 +729,99 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             }
         }
 
+        // warp marker drag (移動) / Alt+click (削除)。 center_band より先に
+        // 登録し、 narrow hit rect で press を先取りする (= marker 上の press は
+        // marker が、 それ以外は center が取る)。 trim grip より後なので端
+        // marker は trim に譲る。 release は 1 回だけなので各ジェスチャ = 1 undo。
+        for &(marker_idx, mx) in &marker_xs {
+            let hit = Rect {
+                x: mx - 5.0,
+                y: event_rect.y,
+                w: 10.0,
+                h: event_rect.h,
+            };
+            let Some(drag) = ui.take_drag_in_rect(
+                ("audio_editor_warp_marker", clip_id, idx, marker_idx),
+                hit,
+            ) else {
+                continue;
+            };
+            if drag.start_modifiers.alt {
+                // Alt+click = この marker を削除。
+                if drag.kind == DragKind::Started {
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::DeleteWarpMarker {
+                            event_idx: idx,
+                            marker_idx,
+                        });
+                    }));
+                }
+            } else if drag.kind == DragKind::Continuing {
+                // ghost: 現在ポインタ位置に縦線。
+                let gx = drag.current.0;
+                ui.push_lines(LineBatch {
+                    segments: Arc::from(vec![LineSegment {
+                        a: [gx, event_rect.y],
+                        b: [gx, event_rect.y + event_rect.h],
+                        color: theme::LOOP_BAND.with_alpha(0.6),
+                    }]),
+                    line_width_px: 1.5,
+                    clip_rect: Some(wf_area),
+                });
+            } else if drag.kind == DragKind::Released {
+                // release x → event-local beat (clip 相対 - event 開始)。
+                let clip_beat =
+                    view_start_beat + (drag.current.0 - wf_area.x) as f64 * beats_per_px;
+                let new_local = (clip_beat - event.event_start_in_clip_beats)
+                    .clamp(0.0, event.event_length_beats);
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::MoveWarpMarker {
+                        event_idx: idx,
+                        marker_idx,
+                        new_locked_beat: new_local,
+                    });
+                }));
+            }
+        }
+
         // 中央 drag。 plain = 移動 (start = 単一選択、 continuing = ghost、
         // released = SetAudioEventStart commit)。 Shift = 選択トグル
-        // (move せず、 Started で 1 度だけ集合に add/remove)。
+        // (move せず、 Started で 1 度だけ集合に add/remove)。 Alt = ここに
+        // warp marker 追加 (marker 以外の波形上 Alt+click)。
         if center_band.w > 0.0
             && let Some(drag) =
                 ui.take_drag_in_rect(("audio_editor_move", clip_id, idx), center_band)
         {
             let dx = drag.delta.0;
             let kind = drag.kind;
-            if drag.start_modifiers.shift {
+            if drag.start_modifiers.alt {
+                // Alt+click on waveform (marker 以外) = press 位置に warp marker
+                // 追加。 source frame = 現在の warp 曲線上の source (= 既存曲線に
+                // pin して追加 → ドラッグで再 warp)。 marker < 2 (uniform) は線形近似。
+                if kind == DragKind::Started {
+                    let clip_beat =
+                        view_start_beat + (drag.anchor.0 - wf_area.x) as f64 * beats_per_px;
+                    let local = (clip_beat - event.event_start_in_clip_beats)
+                        .clamp(0.0, event.event_length_beats);
+                    let src = common::audio_render::warp_source_frame(local, &event.beat_markers)
+                        .unwrap_or_else(|| {
+                            let len = event
+                                .source_end_frames
+                                .saturating_sub(event.source_start_frames)
+                                as f64;
+                            event.source_start_frames as f64
+                                + (local / event.event_length_beats.max(1e-9)) * len
+                        });
+                    let source_frame = src.max(0.0) as u64;
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::AddWarpMarker {
+                            event_idx: idx,
+                            source_frame,
+                            locked_beat: local,
+                        });
+                    }));
+                }
+            } else if drag.start_modifiers.shift {
                 if kind == DragKind::Started {
                     let mut next = app.audio_editor_selected_events.clone();
                     if let Some(p) = next.iter().position(|&i| i == idx) {

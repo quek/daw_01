@@ -159,12 +159,21 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
   exact、 proportional の kerning 精緻化は glyph-layout 経由の follow-up)。 `acp_from_x` の
   点→エッジ写像 + layout 無し None を unit test (platform 17 tests green)。 実機 MS-IME 再変換は
   user 確認。
+- **B12 (手動ワープ編集) 実装済** — model 層 (`move`/`add`/`delete_warp_marker`、 commit `cd14c7d`)
+  に続き UI を配線。 audio editor が **≥2 marker の event を区分線形 warped 波形**で描く: 各 marker 区間
+  を linear `ui.waveform` として連結 = playback の `warp_source_frame` と同一写像 (区間端は marker、
+  端外は外挿線上なので線形 interp が一致)。 marker を locked_beat の x に縦線描画 (可変背景でも視認
+  できるよう暗 backing + 明 `LOOP_BAND` の 2 層、 `feedback_ui_indicator_contrast_on_variable_bg`)。
+  ジェスチャ: marker drag = 移動 (release で 1 回 `MoveWarpMarker` → 1 undo)、 Alt+click on marker =
+  `DeleteWarpMarker`、 Alt+click on 波形 = `AddWarpMarker` (source は現在の warp 曲線上に pin → ドラッグ
+  で再 warp)。 marker hit rect を trim grip の後・center band の前に登録して優先順を確定。 3 AppEvent +
+  handler + `mutate_warp_markers` (sync_song_to_plugin_host で daw_audio へ伝播、 既存 `SetAudioEventStart`
+  と同経路) を app.rs に追加。 **warp 編集全体 (auto-warp `Alt+W` 含む) を `is_undoable` に登録**
+  (sibling-occurrence: auto-warp が従来 undo 不可だった gap も是正)。 build/clippy/test green、
+  視覚 sign-off は user。
 
 ### 据え置き (理由付き — 上流 infra 待ち / 著者既定の deferral / unmeasured perf / 視覚 focused)
 
-- **B12 (手動ワープ編集)** — model 層 (move/add/delete_warp_marker) は実装済・テスト緑
-  (commit `cd14c7d`)。 残りの UI (warped 波形表示 + marker drag/add/delete) は audio editor の
-  視覚操作が中核 + `app.rs` の AppEvent/handler 配線が要る (= 視覚 sign-off 要)。
 - **D2** — undo の全 Song snapshot → 差分化は全 undoable action を触る大 refactor。 現行
   snapshot undo は正しく動作 (perf低)。
 - **D3/D4** — per-frame の track/clip 名 `Arc::from` / lane label `format!` は小 alloc
