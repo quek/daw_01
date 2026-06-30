@@ -3860,9 +3860,14 @@ pub struct VideoSource {
     pub width: u32,
     pub height: u32,
     /// Frames per second as reported by the decoder (= source FPS, not
-    /// project FPS). Used for thumbnail seek and frame timing. Variable
-    /// framerate (VFR) sources report their nominal FPS here; MVP
-    /// assumes CFR.
+    /// project FPS)。 **メタデータ専用** (import 時に記録、 情報表示・診断用)。
+    /// フレーム選択は frame index でなく source の microsecond timestamp
+    /// (`VideoEvent.source_*_micros` → MF / libav の **time-based seek**) で行い、
+    /// decoder が PTS で正しいフレームを返すため、 VFR ソースでもフレームタイミングは
+    /// 正しい (= この nominal FPS には依存しない)。 出力 export の刻みは別途
+    /// `Song.video_framerate` (constant output FPS) を使う。
+    /// (r.md #8 A7: コードを辿ると frame timing は時間ベースで VFR-correct。 旧
+    /// 「MVP assumes CFR」 コメントは誤解だったので訂正。)
     pub framerate: f32,
     /// Total duration in microseconds (= libav `AV_TIME_BASE` units).
     pub duration_micros: u64,
