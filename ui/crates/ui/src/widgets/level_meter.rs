@@ -5,7 +5,8 @@
 //!
 //! - `MeterBallistic::Peak`: そのフレームの peak をそのまま表示 + peak hold (~1 sec)
 //! - `MeterBallistic::Rms`: 移動平均 (window) で滑らかに表示
-//! - `MeterBallistic::Vu`: 300ms 上昇 / 300ms 下降の VU 風 (簡易実装)
+//! - `MeterBallistic::Vu`: IEC 60268-17 風 VU 弾道 (2 次系、 ~300ms 立ち上がり +
+//!   ~1.5% overshoot、 dt 駆動で frame-rate 非依存)
 //!
 //! audio thread 連携は library 責務外。利用者が audio buffer から L/R peak を抽出して
 //! 毎フレーム渡す (CLAUDE.md L44 audio・IPC 不混入の原則)。
@@ -32,6 +33,11 @@ use crate::ui::Ui;
 
 const RMS_WINDOW: usize = 32;
 const PEAK_HOLD_DEFAULT_MS: u128 = 1500;
+
+/// VU ballistic (E4 / r.md #8): IEC 60268-17 風 2 次系の自然角周波数 (≈300ms
+/// 立ち上がり) と減衰比 (overshoot ≈1.5%)。
+const VU_OMEGA: f32 = std::f32::consts::TAU / 0.3;
+const VU_ZETA: f32 = 0.8;
 
 /// `scale = Some` 時、 L バーの **左** に確保する tick 用ガター幅 (px)。
 const SCALE_TICK_GUTTER_W: f32 = 6.0;
@@ -195,7 +201,11 @@ pub(crate) struct ChannelMeter {
     peak_hold_ts: Option<Instant>,
     rms_window: [f32; RMS_WINDOW],
     rms_idx: usize,
+    // VU ballistic (E4 / r.md #8): IEC 60268-17 風の 2 次系 (位置 + 速度) を dt
+    // 駆動で積分する。 旧実装は frame-rate 依存の対称指数平滑だった。
     vu_smoothed: f32,
+    vu_velocity: f32,
+    last_update: Option<Instant>,
 }
 
 impl Default for ChannelMeter {
@@ -207,6 +217,8 @@ impl Default for ChannelMeter {
             rms_window: [0.0; RMS_WINDOW],
             rms_idx: 0,
             vu_smoothed: 0.0,
+            vu_velocity: 0.0,
+            last_update: None,
         }
     }
 }
@@ -234,8 +246,20 @@ impl ChannelMeter {
         self.rms_idx = (self.rms_idx + 1) % RMS_WINDOW;
         let rms = (self.rms_window.iter().sum::<f32>() / RMS_WINDOW as f32).sqrt();
 
-        // vu (300ms 移動平均風: 0.95 重み付け)
-        self.vu_smoothed = self.vu_smoothed * 0.95 + abs * 0.05;
+        // VU ballistic (E4 / r.md #8): IEC 60268-17 の真の弾道に近づける。 旧実装は
+        // frame-rate 依存の対称指数平滑 (≈ RMS) だった。 2 次系
+        // `accel = ω²(in − x) − 2ζω·vel` を dt 駆動 semi-implicit Euler で積分する。
+        // ω = 2π/0.3 (≈300ms 立ち上がり)、 ζ = 0.8 (overshoot ≈1.5%)。 dt は描画間隔
+        // から実測 (frame-rate 非依存)、 数値発散防止に clamp。
+        let dt = self
+            .last_update
+            .map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32())
+            .clamp(0.0, 0.05);
+        self.last_update = Some(now);
+        let accel = VU_OMEGA * VU_OMEGA * (abs - self.vu_smoothed)
+            - 2.0 * VU_ZETA * VU_OMEGA * self.vu_velocity;
+        self.vu_velocity += accel * dt;
+        self.vu_smoothed = (self.vu_smoothed + self.vu_velocity * dt).max(0.0);
 
         let display = match ballistic {
             MeterBallistic::Peak => self.peak,
