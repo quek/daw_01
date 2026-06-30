@@ -371,8 +371,19 @@ fn render_loop(
         // render 側 Stretch は tempo_follow_ratio(stretch_ratio, current_bpm,
         // nominal_bpm) で source 進度を出すので、 tempo automation 中の伸縮も再生と
         // 一致して WAV に焼かれる (= 旧実装は constant song.bpm で曲を早切りしていた)。
-        let smoothed_current_bpm_freewheel =
+        // B11 (r.md #8): export も再生と同じく song-level tempo modulation
+        // (LFO/Random/MSEG/follower → SongTempo) を base tempo に焼く。
+        // `mod_scalars_snapshot` は前 iteration 値 (engine と同じ 1-buffer lag)。
+        // SongTempo target の song_mod_routing が無ければ offset 0 = no-op。
+        let base_bpm_freewheel =
             f64::from(common::automation::evaluate_song_tempo(song, playhead_beats));
+        let smoothed_current_bpm_freewheel = common::automation::apply_modulation_with_scalars(
+            song,
+            &common::model::AutomationTarget::SongTempo,
+            base_bpm_freewheel,
+            &song.song_mod_routings,
+            &mod_scalars_snapshot,
+        );
 
         // docs/plan_modulation.md §5: snapshot the prev buffer's follower envs
         // (slot order) so audio-param modulation renders into the WAV too.

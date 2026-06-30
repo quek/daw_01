@@ -869,7 +869,22 @@ impl LocalState {
         ));
         let current_bpm: f32 = match song_ref {
             Some(s) if tempo_recording => s.bpm,
-            Some(s) => common::automation::evaluate_song_tempo(s, self.playhead_beats),
+            Some(s) => {
+                let base = common::automation::evaluate_song_tempo(s, self.playhead_beats);
+                // B11 (r.md #8): song-level modulation (LFO/Random/MSEG/follower →
+                // `SongTempo`) を base tempo に適用。 `mod_scalars_snapshot` は前
+                // buffer 値 (followers は元々 1-buffer lag、 generator も 1 buffer
+                // 遅延だが tempo は緩慢なので可聴影響なし)。 `SongTempo` を target に
+                // する song_mod_routing が無ければ offset 0 = no-op。 RT-safe
+                // (fill_track_param_ramps と同じ apply_modulation_with_scalars)。
+                common::automation::apply_modulation_with_scalars(
+                    s,
+                    &common::model::AutomationTarget::SongTempo,
+                    f64::from(base),
+                    &s.song_mod_routings,
+                    &self.mod_scalars_snapshot,
+                ) as f32
+            }
             None => 120.0,
         };
         // user の loop button 実状態 (= engine が実際に wrap する条件)。

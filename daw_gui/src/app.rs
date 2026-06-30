@@ -3129,11 +3129,11 @@ impl AppData {
     /// transform; plugin params per device; image / text builtins when the
     /// track owns such clips.
     ///
-    /// NOTE: song-level targets (tempo / time-sig) are intentionally **excluded**:
-    /// the audio engine's `evaluate_song_tempo` reads only lane curves + `song.bpm`
-    /// and never consumes `song_mod_routings`, so follower→tempo modulation would be
-    /// a silent no-op. Tempo can still be *automated* via lanes. (Re-add once the
-    /// engine + export bake consume song-level modulation.)
+    /// MASTER cursor は song-level target (`SongTempo`) を返す: engine の
+    /// `current_bpm` と export が `song_mod_routings` → `SongTempo` を消費する
+    /// (r.md #8 B11、 follower/LFO → tempo 変調)。 `SongTimeSigNumerator` は離散値で
+    /// 連続変調が無意味なため除外。 通常 track は builtin / group transform / plugin
+    /// param / image / text builtin を所有状況に応じて返す。
     pub fn cursor_modulatable_targets(&self) -> Vec<common::model::AutomationTarget> {
         use common::model::{
             AutomationTarget as AT, GroupTransformParam as GP, ImageBuiltinParam as IB,
@@ -3141,6 +3141,9 @@ impl AppData {
         };
         let mut out: Vec<AT> = Vec::new();
         if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
+            // B11 (r.md #8): song-level tempo modulation を master cursor の mod
+            // picker に出す (engine + export が SongTempo を消費するようになった)。
+            out.push(AT::SongTempo);
             return out;
         }
         let Some(track) = self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) else {
