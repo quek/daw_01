@@ -307,7 +307,7 @@ fn render_loop(
     // compensation (`ApplyDelay`), group buses (`Mix → TrackScratch`)
     // and SidechainTap all live in here; without using it the export
     // would silently bypass PR3 PDC and mis-render group hierarchies.
-    let mut schedule = compile_schedule(song)
+    let mut schedule = compile_schedule(song, sample_rate)
         .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
 
     // docs/plan_modulation.md §7: bake each `ModSource`'s follower envelope per

@@ -130,14 +130,14 @@ struct Voice {
     #[allow(dead_code)]
     note_id: u32,
     samples: Arc<Vec<f32>>,
-    /// synth wav の sample_rate。 PR-V2.4 polish の linear resample 実装で
-    /// 出力 sample_rate とのミスマッチ補正に使う予定 (現状 mix は等倍)。
-    #[allow(dead_code)]
+    /// synth wav の sample_rate。 出力デバイスレート (`VoicevoxBuiltin.sample_rate`)
+    /// と異なるとき process() が linear resample する (A9 r.md #8)。
     sample_rate: u32,
     velocity: f32,
-    /// 次に samples から read する位置 (samples の絶対 index、
-    /// `synth_offset` を起点に毎フレーム +1 する)。
-    cursor: usize,
+    /// 次に samples から read する**分数**位置 (samples の絶対 index、
+    /// `synth_offset` を起点に出力 frame ごとに `sample_rate / host_sample_rate`
+    /// ずつ前進)。 分数なのは出力レートと合成レートが違うとき resample するため。
+    cursor: f64,
 }
 
 pub struct VoicevoxBuiltin {
@@ -678,7 +678,7 @@ impl LoadedPlugin for VoicevoxBuiltin {
                     samples: Arc::clone(&res.samples),
                     sample_rate: res.sample_rate,
                     velocity: velocity as f32,
-                    cursor: synth_offset,
+                    cursor: synth_offset as f64,
                 };
                 self.active_voices.clear();
                 self.active_voices.push(voice);
@@ -686,12 +686,14 @@ impl LoadedPlugin for VoicevoxBuiltin {
             // note_off は無視。
         }
 
-        // active voices ごとに audio を mix。 sample_rate ミスマッチは
-        // 現状 resample しない (PR-V2.4 polish で linear resample 予定)。
-        // 出力 buffer は max_frames で確保しているが、 frames > max_frames
-        // でも panic しないよう out 側 capacity でもクランプする (Silence
-        // path と同様)。
+        // active voices ごとに audio を mix。 合成 wav (voice.sample_rate) を出力
+        // デバイスレート (self.sample_rate) へ linear resample する (A9 r.md #8):
+        // レート一致時は ratio=1.0・frac=0 で従来の等倍 copy と一致し、 非48kHz
+        // デバイスでは正ピッチ・正テンポで鳴る。 出力 buffer は max_frames で確保して
+        // いるが、 frames > max_frames でも panic しないよう out 側 capacity でも
+        // クランプする。 RT 安全: alloc / lock なし、 分数 cursor の前進のみ。
         let out_max = self.out_l.len().min(self.out_r.len());
+        let host_sr = self.sample_rate;
         let mut i = 0usize;
         while i < self.active_voices.len() {
             let drop = {
@@ -701,15 +703,37 @@ impl LoadedPlugin for VoicevoxBuiltin {
                 // 正規化されている。 ここで更に 127 で割ると 0.0062 倍
                 // (約 -44 dB) になり「とても小さい」 という症状になる。
                 let amp = voice.velocity.clamp(0.0, 1.0);
-                let remaining = voice.samples.len().saturating_sub(voice.cursor);
-                let copy_n = remaining.min(frames_usize).min(out_max);
-                for k in 0..copy_n {
-                    let s = voice.samples[voice.cursor + k] * amp;
+                // ratio = 合成レート / 出力レート (= 出力 1 frame あたり source を
+                // 何 sample 進めるか)。 host_sr=0 (未 activate) は 1.0 fallback。
+                let ratio = if host_sr > 0.0 {
+                    f64::from(voice.sample_rate) / host_sr
+                } else {
+                    1.0
+                };
+                let src_len = voice.samples.len();
+                let out_n = frames_usize.min(out_max);
+                let mut produced = 0usize;
+                for k in 0..out_n {
+                    let pos = voice.cursor + k as f64 * ratio;
+                    let i0 = pos.floor() as usize;
+                    if i0 >= src_len {
+                        break;
+                    }
+                    let frac = (pos - i0 as f64) as f32;
+                    // 末尾サンプルは次が無いので自身を hold (端の補間を安定化)。
+                    let s1 = if i0 + 1 < src_len {
+                        voice.samples[i0 + 1]
+                    } else {
+                        voice.samples[i0]
+                    };
+                    let s = (voice.samples[i0] * (1.0 - frac) + s1 * frac) * amp;
                     self.out_l[k] += s;
                     self.out_r[k] += s;
+                    produced = k + 1;
                 }
-                voice.cursor += copy_n;
-                voice.cursor >= voice.samples.len()
+                voice.cursor += produced as f64 * ratio;
+                // source 末尾に達したら drop。
+                voice.cursor.floor() as usize >= src_len
             };
             if drop {
                 self.active_voices.swap_remove(i);
@@ -1074,11 +1098,46 @@ mod tests {
         // out_l に値が乗っていることを確認 (= sample[0] = 0.0 はゼロだが
         // sample[1] 以降は非ゼロ)。
         assert!(p.out_l[1..64].iter().any(|&v| v != 0.0));
-        // voice が cursor を進めていること。
-        assert_eq!(p.active_voices[0].cursor, 64);
+        // voice が cursor を進めていること (ratio 1.0 → 64.0)。
+        assert_eq!(p.active_voices[0].cursor, 64.0);
         // 次 process で残り 64 frame 流して voice 終了。
         p.process(64, &[], &[], &[], &[], &transport).unwrap();
         assert!(p.active_voices.is_empty());
+        p.deactivate();
+    }
+
+    /// A9 (r.md #8): 合成 wav (48000Hz) を非48kHz 出力デバイス (24000Hz) へ
+    /// linear resample する。 ratio=2.0 → 出力 1 frame で source を 2 sample 消費し、
+    /// 整数位置なので frac=0 → out_l[k] = samples[2k]。 非48kHz で正ピッチに鳴る要。
+    #[test]
+    fn voice_resamples_to_host_rate() {
+        let mut p = VoicevoxBuiltin::new();
+        p.activate(24_000.0, 0, 256).unwrap();
+        let samples: Vec<f32> = (0..256).map(|i| i as f32).collect();
+        let mut offsets = HashMap::new();
+        offsets.insert(0, 0);
+        p.synth_result.store(Some(Arc::new(SynthResult {
+            samples: Arc::new(samples),
+            sample_rate: 48_000,
+            note_offsets: Arc::new(offsets),
+        })));
+        let events = vec![TimedNoteEvent {
+            time: 0,
+            event: crate::plugin_instance::NoteTransition::On { note_id: 0, key: 60, velocity: 127.0 },
+        }];
+        let transport = crate::plugin_instance::TransportContext::from_process_data(
+            &common::process_data::ProcessData::empty(),
+        );
+        p.process(64, &events, &[], &[], &[], &transport).unwrap();
+        // ratio 2.0 → 64 frame で source を 128 sample 消費。
+        assert!(
+            (p.active_voices[0].cursor - 128.0).abs() < 1e-9,
+            "cursor={}",
+            p.active_voices[0].cursor
+        );
+        // 出力 frame k = source pos 2k (整数 → frac 0 → samples[2k] = 2k)。
+        assert!((p.out_l[1] - 2.0).abs() < 1e-4, "out_l[1]={}", p.out_l[1]);
+        assert!((p.out_l[10] - 20.0).abs() < 1e-4, "out_l[10]={}", p.out_l[10]);
         p.deactivate();
     }
 }

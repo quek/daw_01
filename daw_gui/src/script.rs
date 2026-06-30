@@ -130,6 +130,8 @@ impl ScriptHost {
             None,
             // production と同じ実データディレクトリ (= 既存挙動を維持)。
             common::app_dirs::AppDirs::production(),
+            // (A1 r.md #8) bootstrap が解決したデバイス実レート。
+            bootstrap.sample_rate,
         );
         Self {
             bootstrap,

@@ -62,6 +62,7 @@ fn build_app() -> (AppData, UnboundedReceiver<MainToChild>) {
         None,
         // app_dirs: None = 永続化なし。 実 %LOCALAPPDATA%/daw_01/recent*.json を汚染しない。
         None,
+        48_000, // (A1 r.md #8) test sample rate
     );
     (app, plugin_rx)
 }

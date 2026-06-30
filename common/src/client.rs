@@ -6,7 +6,11 @@ use crate::wire::{read_msg, write_msg};
 
 /// Opens the named pipe, performs the handshake, and returns the open
 /// client handle for continued communication.
-pub async fn perform_handshake(pipe_name: &str, kind: ChildKind) -> Result<NamedPipeClient> {
+pub async fn perform_handshake(
+    pipe_name: &str,
+    kind: ChildKind,
+    device_sample_rate: Option<u32>,
+) -> Result<NamedPipeClient> {
     let mut client = ClientOptions::new()
         .open(pipe_name)
         .with_context(|| format!("failed to open pipe {pipe_name}"))?;
@@ -14,6 +18,7 @@ pub async fn perform_handshake(pipe_name: &str, kind: ChildKind) -> Result<Named
     let hello = ChildToMain::Hello {
         kind,
         pid: std::process::id(),
+        device_sample_rate,
     };
     write_msg(&mut client, &hello).await?;
     tracing::info!(?hello, "sent Hello");

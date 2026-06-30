@@ -44,7 +44,7 @@ pub enum GraphError {
 /// 等の heap 確保を伴うため、 編集着地のタイミングでバッファに glitch が
 /// 乗りうる **既知の制約**。 PR3 で `ArcSwap` publish に切り替え、 compile を
 /// off-thread (GUI / 非 RT スレッド) 化して RT パスからこの alloc を除去する。
-pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
+pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, GraphError> {
     let n = song.tracks.len();
     if n == 0 {
         return Ok(Schedule {
@@ -524,7 +524,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             common::model::ModSourceKind::EnvelopeFollower { tap, follower } => {
                 follower_slots.push(super::follower::FollowerSlot::from_config(
                     follower,
-                    common::audio_bridge::SAMPLE_RATE,
+                    sample_rate,
                 ));
                 // docs/plan_modulation.md §6: tap_point で source buffer を解決。
                 // dangling source は follower node を emit しない (scalar は 0 のまま)。
@@ -539,7 +539,7 @@ pub fn compile_schedule(song: &Song) -> Result<Schedule, GraphError> {
             _ => {
                 follower_slots.push(super::follower::FollowerSlot::from_config(
                     &common::model::FollowerConfig::default(),
-                    common::audio_bridge::SAMPLE_RATE,
+                    sample_rate,
                 ));
             }
         }
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn empty_song_compiles_to_master_only_mix() {
         let song = Song::default();
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
         assert_eq!(sched.nodes.len(), 1);
         match &sched.nodes[0] {
             NodeOp::Mix { dst, srcs } => {
@@ -864,7 +864,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
         // Depth ordering is stable for a flat song, so ProcessTrack ops
         // appear in reverse-track-order (depth=0 group is just descending
         // index order); both ways the Mix at the end carries both refs.
@@ -925,7 +925,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         // Expect (in some order): two leaf ProcessTrack (kick, snare),
         // group's Mix-into-self + ProcessGroupFx, lead ProcessTrack, then
@@ -1038,7 +1038,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         let audio_pos = sched
             .nodes
@@ -1091,7 +1091,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule(&song, 48_000).err(), Some(GraphError::Cycle));
     }
 
     #[test]
@@ -1111,7 +1111,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
         // Track 1 should emit Mix → TrackScratch(0) + ProcessGroupFx(0),
         // not ProcessTrack(0).
         let has_group_fx = sched
@@ -1139,7 +1139,7 @@ mod tests {
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&song).err(),
+            compile_schedule(&song, 48_000).err(),
             Some(GraphError::DanglingReference(99))
         );
     }
@@ -1172,7 +1172,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         // (a) DelayLine が 1 本以上、 capacity ≥ 100 で確保されている。
         assert!(
@@ -1277,7 +1277,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let mut sched = compile_schedule(&song).unwrap();
+        let mut sched = compile_schedule(&song, 48_000).unwrap();
 
         // Track ごとに「ロードされた plugin」 を持たせる。 production の
         // CLAP/VST3 と違って format-agnostic な test stub だが、
@@ -1514,7 +1514,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         // (a) SidechainTap が emit されている。
         let tap_idx = sched
@@ -1586,7 +1586,7 @@ mod tests {
             }],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         let tap_idx = sched
             .nodes
@@ -1681,7 +1681,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         // Master Mix の input は (TrackScratch(0), TrackScratch(1)) の 2 本。
         // path_latency(A=0) = 100, path_latency(B=1) = 100 + 50 = 150 になっている
@@ -1787,7 +1787,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         assert_eq!(
             sched.input_delay_per_track.len(),
@@ -1844,7 +1844,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         // path_latency は instrument の sidechain も拾う (= 100 + 0 = 100)
         // ので master mix の sibling alignment は機能する。
@@ -1894,7 +1894,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule(&song, 48_000).err(), Some(GraphError::Cycle));
     }
 
     /// 同じく compile-level test: `sidechain_sources` の対象 track が
@@ -1923,7 +1923,7 @@ mod tests {
             })],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
         assert!(
             !sched
                 .nodes
@@ -1960,7 +1960,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         // Vocal is a leaf → ProcessTrack(0). Reverb has an incoming send,
         // so it is a bus → Mix(clear) + MixSend + ProcessGroupFx(1).
@@ -2061,7 +2061,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
         assert!(
             sched.nodes.iter().any(|op| matches!(
                 op,
@@ -2093,7 +2093,7 @@ mod tests {
             })],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule(&song, 48_000).err(), Some(GraphError::Cycle));
     }
 
     #[test]
@@ -2125,7 +2125,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule(&song, 48_000).err(), Some(GraphError::Cycle));
     }
 
     #[test]
@@ -2145,7 +2145,7 @@ mod tests {
             })],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
         assert!(
             !sched
                 .nodes
@@ -2193,7 +2193,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).unwrap();
+        let sched = compile_schedule(&song, 48_000).unwrap();
 
         let master_mix = sched
             .nodes
@@ -2291,7 +2291,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).expect("全部子 must not cycle");
+        let sched = compile_schedule(&song, 48_000).expect("全部子 must not cycle");
 
         // (a) ParallelOutTap per port: main(port0) → 子2(idx1), aux0(port1) → 子3(idx2).
         assert!(
@@ -2400,7 +2400,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).expect("independent paraout must not cycle");
+        let sched = compile_schedule(&song, 48_000).expect("independent paraout must not cycle");
 
         // A (idx 0) is a plain leaf: ProcessTrack, no MixAdditive.
         assert!(
@@ -2481,7 +2481,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).expect("must compile");
+        let sched = compile_schedule(&song, 48_000).expect("must compile");
 
         let add_mix = sched
             .nodes
@@ -2554,7 +2554,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song).expect("must compile");
+        let sched = compile_schedule(&song, 48_000).expect("must compile");
 
         let master_mix = sched
             .nodes

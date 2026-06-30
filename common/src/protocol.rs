@@ -50,6 +50,13 @@ pub enum ChildToMain {
     Hello {
         kind: ChildKind,
         pid: u32,
+        /// (A1 r.md #8) daw_audio がオープン予定の出力デバイスの実サンプルレート
+        /// (Hz)。 親 (daw_gui) はこれを `AudioSession.sample_rate` の SSoT にし、
+        /// engine / plugin activation / GUI 拍計算 / VOICEVOX 合成へ伝播する
+        /// (= エンジンはハードウェアのレートで動く)。 device を持たない plugin_host は
+        /// `None`、 query 失敗時も `None` (親は `audio_bridge::DEFAULT_SAMPLE_RATE`
+        /// へ fallback)。
+        device_sample_rate: Option<u32>,
     },
     /// 子プロセスとの IPC pipe が切断された (= 子プロセスが exit、 panic、
     /// あるいは bincode decode 失敗で receive loop が終了した)。 daw_gui
@@ -789,6 +796,7 @@ mod tests {
         let msg = ChildToMain::Hello {
             kind: ChildKind::Audio,
             pid: 12345,
+            device_sample_rate: Some(44_100),
         };
         assert_eq!(roundtrip(&msg), msg);
     }

@@ -216,6 +216,8 @@ fn run_gui(
     let job = Arc::clone(&bootstrap.job);
     let plugin_db = bootstrap.plugin_db.clone();
     let supervisor = Arc::clone(&bootstrap.supervisor);
+    // (A1 r.md #8) bootstrap が解決したデバイス実レート (Copy なので closure へ move)。
+    let sample_rate = bootstrap.sample_rate;
 
     // 前回終了時の window geometry を復元。 存在しなければ default (1280×800)。
     // 位置は physical (= screen 座標)、 サイズは logical (= DPI 差吸収) で保存。
@@ -251,6 +253,7 @@ fn run_gui(
                 job_dispatcher,
                 Some(supervisor),
                 app_dirs.clone(),
+                sample_rate,
             );
             // resource monitor (r.md #3): per-plugin CPU の直接読み出し用に
             // MetricsBridge ハンドルを AppData へ持たせる。

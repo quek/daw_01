@@ -1698,6 +1698,10 @@ pub struct AppData {
     /// spawn + handshake + Session/OpenWorkerPool 再送し、 新 tx で
     /// `audio_tx` / `plugin_tx` を差し替える。
     pub supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
+    /// (A1 r.md #8) オーディオセッションの実サンプルレート (= daw_audio が報告した
+    /// デバイス実レート、 `bootstrap.sample_rate`)。 拍↔sample 変換 (seek / export
+    /// range / clip 尺) はこの値を使い、 engine と一致させる。 session-only。
+    pub sample_rate: u32,
     /// 直近の child 切断時刻 (kind 別)。短時間に閾値以上切断したら crash-loop と
     /// 判断して自動 respawn を止める (= 落ちるプラグインを抱えたプロジェクトで
     /// respawn→reload→再 crash の無限ループに陥り GUI が固まるのを防ぐ)。session-only。
@@ -2206,6 +2210,8 @@ impl AppData {
         voicevox_job: Arc<dyn JobDispatcher>,
         supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
         app_dirs: Option<common::app_dirs::AppDirs>,
+        // (A1 r.md #8) 解決済みデバイス実サンプルレート (= bootstrap.sample_rate)。
+        sample_rate: u32,
     ) -> Self {
         let mut song = Song {
             tracks: vec![track_with(|t| t.name = "Track 1".into())],
@@ -2244,6 +2250,7 @@ impl AppData {
 
         let app = Self {
             song,
+            sample_rate,
             file_path: None,
             audio_source_cache: AudioSourceCache::new(),
             ara_doc_cache: std::collections::HashMap::new(),
@@ -9541,7 +9548,7 @@ impl AppData {
         let beat = beat.max(0.0);
         self.playhead_beat = Some(beat as f32);
         self.playback_origin_beat = Some(beat as f32);
-        let sr = common::audio_bridge::SAMPLE_RATE as f64;
+        let sr = self.sample_rate as f64;
         let bpm = self.song.bpm.max(1.0) as f64;
         let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
         self.send_audio(MainToChild::SeekTo { samples });
@@ -9591,7 +9598,7 @@ impl AppData {
         // play していない) なら playhead は触らない。
         if let Some(origin) = self.playback_origin_beat.take() {
             self.playhead_beat = Some(origin);
-            let sr = common::audio_bridge::SAMPLE_RATE as f64;
+            let sr = self.sample_rate as f64;
             let bpm = self.song.bpm.max(1.0) as f64;
             let samples = (origin as f64 * 60.0 / bpm * sr).max(0.0) as u64;
             self.send_audio(MainToChild::SeekTo { samples });
@@ -14492,7 +14499,7 @@ impl AppData {
             }
             let beats_per_bar = f64::from(self.song.time_sig.0.max(1));
             let preroll_beats = f64::from(bars) * beats_per_bar;
-            let sr = f64::from(common::audio_bridge::SAMPLE_RATE);
+            let sr = f64::from(self.sample_rate);
             let bpm = f64::from(self.song.bpm.max(1.0));
             let preroll_samples =
                 (preroll_beats * 60.0 / bpm * sr).round().max(0.0) as u64;
@@ -16027,7 +16034,7 @@ impl AppData {
             self.status_message = "Bounce: audio / MIDI / 歌唱クリップのみ対象です".into();
             return;
         }
-        let engine_sr = common::audio_bridge::SAMPLE_RATE;
+        let engine_sr = self.sample_rate;
         let bpm = self.song.bpm.max(1.0) as f64;
         let samples_per_beat = engine_sr as f64 * 60.0 / bpm;
         let start_frame = (clip.start_beat * samples_per_beat).max(0.0) as u64;
@@ -16181,7 +16188,7 @@ impl AppData {
         // 1 完了 = 1 Undo step として snapshot を取る。
         self.push_undo_snapshot();
 
-        let engine_sr = common::audio_bridge::SAMPLE_RATE;
+        let engine_sr = self.sample_rate;
         // 採番した new_source_id を `audio_sources` に登録。 path は
         // `pending.source_path` (= ProjectRelative or Absolute、 確定済)。
         let new_source = common::model::AudioSource {
@@ -20238,7 +20245,7 @@ impl AppData {
         } else {
             common::timing::playhead_to_beat(
                 Some(&self.song),
-                common::audio_bridge::SAMPLE_RATE,
+                self.sample_rate,
                 playhead_samples,
             )
             .map(|b| b as f32)
@@ -20256,7 +20263,7 @@ impl AppData {
             && playhead_samples != u64::MAX
             && common::timing::song_ended(
                 Some(&self.song),
-                common::audio_bridge::SAMPLE_RATE,
+                self.sample_rate,
                 playhead_samples,
             )
         {
@@ -21374,11 +21381,11 @@ impl AppData {
     }
 
     /// 拍範囲 → sample frame 範囲。 audio engine と同じ式・同じ
-    /// sample rate (`common::audio_bridge::SAMPLE_RATE`、 AudioSession に渡す値)
+    /// sample rate (`self.sample_rate`、 AudioSession に渡す値)
     /// で換算するので、 daw_audio 側 `run_export` の `samples_per_beat` と完全に
     /// 一致する (bounce の `clip_range_to_frames` と同じ SSoT)。
     fn export_beats_to_frames(&self, start_beat: f64, end_beat: f64) -> (u64, u64) {
-        let sr = f64::from(common::audio_bridge::SAMPLE_RATE);
+        let sr = f64::from(self.sample_rate);
         let bpm = f64::from(self.song.bpm).max(f64::EPSILON);
         let spb = sr * 60.0 / bpm;
         let s = (start_beat * spb).max(0.0) as u64;

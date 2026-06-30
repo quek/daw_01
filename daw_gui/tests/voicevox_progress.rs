@@ -38,6 +38,7 @@ fn build_app() -> (AppData, UnboundedReceiver<MainToChild>) {
         job_dispatcher,
         None,
         None,
+        48_000, // (A1 r.md #8) test sample rate
     );
     (app, plugin_rx)
 }

@@ -1281,6 +1281,7 @@ mod tests {
             job_dispatcher,
             None,
             None,
+            common::audio_bridge::DEFAULT_SAMPLE_RATE,
         )
     }
 

@@ -180,7 +180,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     };
     if ruler_rect.w > 0.0 && view_len_beats > 0.0 {
         let mapping = TimeMapping {
-            sample_rate: common::audio_bridge::SAMPLE_RATE as f64,
+            sample_rate: app.sample_rate as f64,
             tempo_bpm: app.song.bpm as f64,
             time_sig: app.song.time_sig,
             display: TimeDisplay::BarBeat,

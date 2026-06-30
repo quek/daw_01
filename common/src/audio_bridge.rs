@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use shared_memory::{Shmem, ShmemConf};
 
-pub const SAMPLE_RATE: u32 = 48000;
+/// (A1 r.md #8) フォールバック既定サンプルレート。 通常はランタイムで
+/// `AudioSession.sample_rate` = デバイス実レート (daw_audio が Hello で報告) が
+/// SSoT で、 この const はデバイス query 失敗時の保険値としてのみ使う。
+pub const DEFAULT_SAMPLE_RATE: u32 = 48000;
 pub const MAX_FRAMES: u32 = 1024;
 pub const CHANNELS: u32 = 2;
 pub const SAMPLE_BUFFER_LEN: usize = (MAX_FRAMES * CHANNELS) as usize;

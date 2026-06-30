@@ -113,6 +113,7 @@ fn build_app() -> (
         None,
         // app_dirs: None = 永続化なし。 実 %LOCALAPPDATA%/daw_01/recent*.json を汚染しない。
         None,
+        48_000, // (A1 r.md #8) test sample rate
     );
     (app, audio_rx, plugin_rx, event_dispatcher)
 }

@@ -48,6 +48,7 @@ fn build_app(app_dirs: Option<AppDirs>) -> (AppData, UnboundedReceiver<MainToChi
         job_dispatcher,
         None,
         app_dirs,
+        48_000, // (A1 r.md #8) test sample rate
     );
     (app, plugin_rx)
 }

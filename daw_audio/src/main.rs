@@ -33,6 +33,19 @@ mod sequencer;
 
 use engine::{EngineShared, LocalState, PlaybackCommand, SharedState};
 
+/// A1 (r.md #8): 出力ストリームを開く前にデフォルト出力デバイスの実サンプルレートを
+/// 問い合わせる (stream は開かない)。 Hello で親へ報告し、 session.sample_rate の SSoT に
+/// する → engine / plugin / GUI / VOICEVOX が全てハードウェアのレートで揃う。 デバイス
+/// 無し / query 失敗時は `None` (親が `audio_bridge::DEFAULT_SAMPLE_RATE` へ fallback)。
+/// 後で `start_output_stream` が同じ `default_output_config` で stream を開くので、
+/// 報告値と実ストリームのレートは一致する。
+fn query_default_output_sample_rate() -> Option<u32> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let device = cpal::default_host().default_output_device()?;
+    let config = device.default_output_config().ok()?;
+    Some(config.sample_rate().0)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _log_guard = common::logging::init_tracing_for("daw_audio");
@@ -42,8 +55,11 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("expected pipe name as first argument")?;
 
-    let mut pipe = common::client::perform_handshake(&pipe_name, ChildKind::Audio).await?;
-    tracing::info!("daw_audio handshake complete");
+    // A1 (r.md #8): デバイス実レートを Hello で親へ報告 → session.sample_rate の SSoT。
+    let device_sample_rate = query_default_output_sample_rate();
+    let mut pipe =
+        common::client::perform_handshake(&pipe_name, ChildKind::Audio, device_sample_rate).await?;
+    tracing::info!(?device_sample_rate, "daw_audio handshake complete");
 
     let session = common::client::read_session(&mut pipe).await?;
     tracing::info!(?session, "audio session ready");

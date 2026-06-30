@@ -467,7 +467,7 @@ impl LocalState {
     /// last call. Heap allocation is concentrated here (called only on
     /// edit-time transitions) so the steady-state RT path stays free of
     /// `Vec` growth.
-    fn refresh_schedule(&mut self, current_song: Option<&Arc<Song>>) {
+    fn refresh_schedule(&mut self, current_song: Option<&Arc<Song>>, sample_rate: u32) {
         let need_refresh = match (&self.cached_song, current_song) {
             (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
             (None, Some(_)) => true,
@@ -477,7 +477,7 @@ impl LocalState {
             return;
         }
         if let Some(song_arc) = current_song {
-            match compile_schedule(song_arc.as_ref()) {
+            match compile_schedule(song_arc.as_ref(), sample_rate) {
                 Ok(s) => self.cached_schedule = s,
                 Err(e) => {
                     // Routing is broken (cycle / dangling parent_group_id);
@@ -695,7 +695,7 @@ impl LocalState {
         // so the master mix step sees the right node order. `refresh_schedule`
         // is a no-op when the song Arc hasn't changed.
         let song_snapshot = shared.song.load();
-        self.refresh_schedule(song_snapshot.as_ref());
+        self.refresh_schedule(song_snapshot.as_ref(), sample_rate);
 
         let n = frames;
         self.master_l[..n].fill(0.0);
@@ -2646,7 +2646,7 @@ mod sidechain_tests {
             ],
             ..Song::default()
         };
-        let mut schedule = compile_schedule(&song).unwrap();
+        let mut schedule = compile_schedule(&song, 48_000).unwrap();
         assert!(schedule.nodes.iter().any(|op| matches!(op, NodeOp::SidechainTap { .. })));
 
         const FRAMES: usize = 64;

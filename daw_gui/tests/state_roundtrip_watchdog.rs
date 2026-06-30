@@ -70,6 +70,7 @@ fn build_app_with_audio() -> (
         None,
         // app_dirs: None = 永続化なし。
         None,
+        48_000, // (A1 r.md #8) test sample rate
     );
     (app, plugin_rx, audio_rx)
 }

@@ -543,7 +543,10 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("expected pipe name as first argument")?;
 
-    let mut pipe = common::client::perform_handshake(&pipe_name, ChildKind::PluginHost).await?;
+    // plugin_host は出力デバイスを持たないので device_sample_rate は None。
+    // session.sample_rate は daw_audio の報告値が SSoT (A1 r.md #8)。
+    let mut pipe =
+        common::client::perform_handshake(&pipe_name, ChildKind::PluginHost, None).await?;
     tracing::info!("daw_plugin_host handshake complete");
 
     let session = common::client::read_session(&mut pipe).await?;

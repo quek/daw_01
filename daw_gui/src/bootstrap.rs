@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use common::audio_bridge::{
-    AudioBridgeHandle, CHANNELS, MAX_FRAMES, SAMPLE_RATE, ready_sem_id, request_sem_id, shmem_id,
+    AudioBridgeHandle, CHANNELS, DEFAULT_SAMPLE_RATE, MAX_FRAMES, ready_sem_id, request_sem_id,
+    shmem_id,
 };
 use common::metrics_bridge::{MetricsBridgeHandle, metrics_shmem_id};
 use common::pipe::pipe_path;
@@ -47,6 +48,10 @@ pub struct Bootstrap {
     /// Audio shmem ハンドル。 audio_bridge::AudioBridgeHandle は playhead /
     /// peak meter 等の state を保持する shared memory region を参照する。
     pub bridge: Arc<AudioBridgeHandle>,
+    /// (A1 r.md #8) 解決済みオーディオセッションのサンプルレート (= daw_audio が Hello で
+    /// 報告したデバイス実レート、 query 失敗時は `DEFAULT_SAMPLE_RATE`)。 GUI の拍↔sample
+    /// 変換 (seek / export range / clip 尺) はこの値を使い、 engine と一致させる。
+    pub sample_rate: u32,
     /// resource monitor (r.md #3) の MetricsBridge ハンドル。 DSP load / xrun /
     /// per-plugin CPU を daw_audio / daw_plugin_host が書き、 poller と AppData
     /// (per-plugin 直接読み) が読む。
@@ -199,12 +204,15 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
     let rt = Runtime::new().context("failed to create tokio runtime")?;
 
     let pid = std::process::id();
-    let session = AudioSession {
+    // A1 (r.md #8): sample_rate は暫定 (DEFAULT)。 daw_audio が Hello で報告する
+    // デバイス実レートで spawn_and_handshake 後に上書きする (= エンジンはハード
+    // ウェアのレートで動く)。 shmem_id 等は sample_rate 非依存なのでここで確定。
+    let mut session = AudioSession {
         shmem_id: shmem_id(pid),
         request_sem_id: request_sem_id(pid),
         ready_sem_id: ready_sem_id(pid),
         metrics_shmem_id: metrics_shmem_id(pid),
-        sample_rate: SAMPLE_RATE,
+        sample_rate: DEFAULT_SAMPLE_RATE,
         max_frames: MAX_FRAMES,
         channels: CHANNELS as u16,
     };
@@ -232,8 +240,14 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         create_worker_event_pairs(pid, n_workers)?;
     tracing::info!(n_workers, "created plugin worker pool handles");
 
-    let (audio_child, plugin_child, mut audio_server, mut plugin_server) =
+    let (audio_child, plugin_child, mut audio_server, mut plugin_server, audio_device_sr) =
         rt.block_on(spawn_and_handshake(&job))?;
+    // A1 (r.md #8): daw_audio が報告したデバイス実レートを session の SSoT にする。
+    // 報告無し (query 失敗) なら DEFAULT_SAMPLE_RATE のまま。
+    if let Some(sr) = audio_device_sr.filter(|&s| s > 0) {
+        session.sample_rate = sr;
+    }
+    tracing::info!(sample_rate = session.sample_rate, "resolved audio session sample rate");
 
     rt.block_on(async {
         write_msg(&mut audio_server, &MainToChild::Session(session.clone())).await?;
@@ -277,6 +291,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         plugin_tx,
         incoming_rx: Some(incoming_rx),
         bridge,
+        sample_rate: session.sample_rate,
         metrics,
         job,
         plugin_db,
@@ -358,7 +373,7 @@ fn create_worker_event_pairs(
 
 async fn spawn_and_handshake(
     job: &JobHandle,
-) -> Result<(Child, Child, NamedPipeServer, NamedPipeServer)> {
+) -> Result<(Child, Child, NamedPipeServer, NamedPipeServer, Option<u32>)> {
     let pid = std::process::id();
     let audio_pipe = pipe_path(pid, ChildKind::Audio);
     let plugin_pipe = pipe_path(pid, ChildKind::PluginHost);
@@ -385,8 +400,14 @@ async fn spawn_and_handshake(
     let (plugin_hello, plugin_server) = plugin_result;
     tracing::info!(?audio_hello, "audio handshake complete");
     tracing::info!(?plugin_hello, "plugin_host handshake complete");
+    // A1 (r.md #8): daw_audio が Hello で報告したデバイス実レートを取り出す
+    // (= session.sample_rate の SSoT)。 plugin_host の Hello は None。
+    let audio_device_sr = match &audio_hello {
+        ChildToMain::Hello { device_sample_rate, .. } => *device_sample_rate,
+        _ => None,
+    };
 
-    Ok((audio_child, plugin_child, audio_server, plugin_server))
+    Ok((audio_child, plugin_child, audio_server, plugin_server, audio_device_sr))
 }
 
 async fn handshake(
