@@ -103,40 +103,10 @@ pub struct PreviewWindowState {
     pub fx_engine: crate::video_fx::VideoFxEngine,
 }
 
-/// One textured layer in the preview composite. The runner builds a
-/// `Vec<CompositeLayer>` ordered bottom→top each frame; the render
-/// pass calls `push_textured_quad` in that order so gui_01's
-/// call-order interleave lays the top track / crossfade-target on
-/// top.
-///
-/// `pip_rect` (docs/plan_image_overlay.md §P3) selects between two
-/// placement modes:
-/// - `None` — aspect-fit letterbox over the entire preview window
-///   (= the video clip default behaviour, unchanged from pre-P3).
-/// - `Some((x, y, w, h))` — normalized 0-1 PiP rect; the renderer
-///   maps `(x, y, w, h)` to screen px and draws the layer at exactly
-///   that sub-rect of the preview surface, regardless of aspect.
-///   Used by `ClipContent::Image` for ロゴ / ジャケット overlays.
-#[derive(Debug, Clone)]
-pub struct CompositeLayer {
-    pub texture: TextureHandle,
-    pub width: u32,
-    pub height: u32,
-    pub alpha: f32,
-    pub pip_rect: Option<(f32, f32, f32, f32)>,
-    /// この layer の owning track の映像効果チェーン (解決済み実効値)。
-    /// 描画時に `texture` へチェーン順適用してから push する。空なら効果なし。
-    /// 通常運用 (1 トラック 1 視覚内容) では「トラック合成画に適用」(§3) と一致する。
-    pub fx: Vec<crate::video_fx::ResolvedEffect>,
-    /// v15 (`docs/plan_image_automation.md` rotation): rect 中心を旋回
-    /// 中心とする 2D 回転 (radians、 clockwise positive)。 PiP layer (=
-    /// `pip_rect = Some`) でのみ意味を持ち、 video aspect-fit layer は
-    /// 常に `0.0`。 `gui_01 #047` (`TexturedQuad.rotation_radians`)
-    /// landing 後に `push_textured_quad` に渡す。 現状の wgpu pipeline
-    /// は rotation 未対応のため値は保持のみ、 描画は axis-aligned で
-    /// 走る。
-    pub rotation_radians: f32,
-}
+// (r.md #8 F) 旧 `CompositeLayer` struct はここで定義のみで crate 内で一度も構築
+// されないデッドコードだった (実際の preview 合成は `group_compose.rs` が担い、
+// rotation_radians + rotation_pivot を `TexturedQuad` に正しく渡して回転も動作する)。
+// 「wgpu pipeline は rotation 未対応」 のコメントは誤りだったので struct ごと削除。
 
 impl PreviewWindowState {
     /// Create the OS window + wgpu Renderer. `initial_size` is taken
