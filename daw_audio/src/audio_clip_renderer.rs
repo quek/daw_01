@@ -113,6 +113,10 @@ pub struct RenderedEvent {
     /// `onsets[i] / tempo_ratio` で出力 sample 位置にマップされる。 Slice 以外
     /// の mode では参照されない。 通常 ~10..100 件の小さな Vec。
     pub onsets: Vec<u64>,
+    /// Warp markers (`AudioEvent.beat_markers` の clone、 `locked_beat` 昇順・
+    /// dedup 済)。 Stretch mode の granular render が `warp_source_frame` で
+    /// 非一様タイムストレッチに使う (r.md #8 B12)。 < 2 件なら uniform stretch。
+    pub beat_markers: Vec<common::model::BeatMarker>,
 }
 
 /// Wait-free snapshot of "what audio events should the audio thread
@@ -331,6 +335,11 @@ pub fn compile_audio_schedule(
                 let mut onsets_sorted = event.onsets.clone();
                 onsets_sorted.sort_unstable();
                 onsets_sorted.dedup();
+                // B12 (r.md #8): warp markers を locked_beat 昇順 + dedup して保持
+                // (warp_source_frame は sorted・non-degenerate を前提)。
+                let mut warp_markers = event.beat_markers.clone();
+                warp_markers.sort_by(|a, b| a.locked_beat.total_cmp(&b.locked_beat));
+                warp_markers.dedup_by(|a, b| (a.locked_beat - b.locked_beat).abs() < 1e-9);
                 schedule.push(RenderedEvent {
                     track_idx,
                     clip_idx,
@@ -351,6 +360,7 @@ pub fn compile_audio_schedule(
                     reversed: event.reversed,
                     stretch_mode: event.stretch_mode,
                     onsets: onsets_sorted,
+                    beat_markers: warp_markers,
                 });
             }
         }
@@ -568,6 +578,8 @@ pub fn render_audio_events(
                     event.source_start_frames,
                     event.source_end_frames,
                     buffer.frames,
+                    &event.beat_markers,
+                    samples_per_beat,
                     event.reversed,
                 ),
                 StretchMode::Slice => slice_sample_at(
@@ -658,6 +670,10 @@ fn granular_sample_at(
     source_start: u64,
     source_end: u64,
     buffer_frames: u64,
+    // B12 (r.md #8): warp markers (空 or <2 なら uniform stretch) + その beat 換算用
+    // samples_per_beat (= current_bpm 基準、 render loop と同値)。
+    beat_markers: &[common::model::BeatMarker],
+    samples_per_beat: f64,
     reversed: bool,
 ) -> (f32, f32) {
     /// grain hop (sample 単位)。 ~12 ms @ 44.1 kHz。 短すぎると metallic、
@@ -690,8 +706,18 @@ fn granular_sample_at(
         if in_grain >= GRAIN_LEN_SAMPLES {
             continue;
         }
-        // grain の source 内 offset (= 出力時刻 × tempo_ratio)。
-        let grain_source_offset = (grain_start_out as f64 * tempo_ratio).max(0.0) as u64;
+        // grain の source 内 offset。 warp markers (≥2) があれば event-local beat
+        // (= grain_start_out / samples_per_beat) を warp_source_frame で source
+        // frame に写す非一様 stretch、 無ければ uniform (× tempo_ratio)。
+        let grain_source_offset = if beat_markers.len() >= 2 && samples_per_beat > 0.0 {
+            let event_beat = grain_start_out as f64 / samples_per_beat;
+            match common::audio_render::warp_source_frame(event_beat, beat_markers) {
+                Some(sf) => (sf - source_start as f64).max(0.0) as u64,
+                None => (grain_start_out as f64 * tempo_ratio).max(0.0) as u64,
+            }
+        } else {
+            (grain_start_out as f64 * tempo_ratio).max(0.0) as u64
+        };
         let source_pos_in_event = grain_source_offset + in_grain;
         if source_pos_in_event >= source_len {
             continue;

@@ -16,7 +16,7 @@
 //! `audio_clip_renderer.rs` の `granular_sample_at` / `slice_sample_at` が担う。
 //! ここ ([`pitch_ratio_for`]) は両モードで sr 補正のみ返す (= repitch しない)。
 
-use crate::model::{FadeCurve, StretchMode};
+use crate::model::{BeatMarker, FadeCurve, StretchMode};
 
 /// Fade envelope at frame offset `t` (frames since fade start). Output
 /// is in `0..=1`. `fade_len == 0` or `t >= fade_len` で 1.0 (= 完全
@@ -122,9 +122,74 @@ pub fn tempo_follow_ratio(stretch_ratio: f64, current_bpm: f64, nominal_bpm: f64
     stretch_ratio * (current_bpm / nominal_bpm)
 }
 
+/// Warp marker (r.md #8 B12) による非一様タイムストレッチの source 写像。
+/// event-local beat `event_beat` に対応する source frame を、 warp markers
+/// (`locked_beat` 昇順・dedup 済を前提) の区分線形補間で返す。 marker 範囲外は
+/// 端セグメントの傾きで外挿する (Ableton warp 同様)。 markers が 2 個未満 /
+/// 補間に使うセグメントが退化 (同 `locked_beat`) の場合は `None` (caller は
+/// uniform stretch に fallback)。 純関数 (granular render と検算で共有する SSoT)。
+pub fn warp_source_frame(event_beat: f64, markers: &[BeatMarker]) -> Option<f64> {
+    if markers.len() < 2 {
+        return None;
+    }
+    // 区分線形補間 (退化セグメント = 同 locked_beat は None)。
+    let lerp = |a: &BeatMarker, b: &BeatMarker| -> Option<f64> {
+        let db = b.locked_beat - a.locked_beat;
+        if db.abs() < 1e-12 {
+            return None;
+        }
+        let slope = (b.source_frame as f64 - a.source_frame as f64) / db;
+        Some(a.source_frame as f64 + slope * (event_beat - a.locked_beat))
+    };
+    let n = markers.len();
+    if event_beat <= markers[0].locked_beat {
+        lerp(&markers[0], &markers[1]) // 先頭セグメントの傾きで外挿
+    } else if event_beat >= markers[n - 1].locked_beat {
+        lerp(&markers[n - 2], &markers[n - 1]) // 末尾セグメントの傾きで外挿
+    } else {
+        let i = markers
+            .partition_point(|m| m.locked_beat <= event_beat)
+            .saturating_sub(1);
+        lerp(&markers[i], &markers[i + 1])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bm(source_frame: u64, locked_beat: f64) -> BeatMarker {
+        BeatMarker { source_frame, locked_beat }
+    }
+
+    #[test]
+    fn warp_source_frame_piecewise_linear_with_extrapolation() {
+        // <2 markers → None (uniform fallback)。
+        assert_eq!(warp_source_frame(1.0, &[]), None);
+        assert_eq!(warp_source_frame(1.0, &[bm(0, 0.0)]), None);
+
+        // 非一様: 0..2 beat が steep (0→88200)、 2..4 beat が shallow (88200→132300)。
+        let markers = [bm(0, 0.0), bm(88_200, 2.0), bm(132_300, 4.0)];
+        let approx = |got: Option<f64>, want: f64| {
+            let g = got.expect("Some");
+            assert!((g - want).abs() < 1e-6, "got {g} want {want}");
+        };
+        approx(warp_source_frame(0.0, &markers), 0.0); // 先頭 marker
+        approx(warp_source_frame(1.0, &markers), 44_100.0); // 第1セグメント中点
+        approx(warp_source_frame(2.0, &markers), 88_200.0); // 中間 marker
+        approx(warp_source_frame(3.0, &markers), 110_250.0); // 第2セグメント中点
+        approx(warp_source_frame(4.0, &markers), 132_300.0); // 末尾 marker
+        // 範囲外は端セグメント傾きで外挿 (先頭 44100/beat、 末尾 22050/beat)。
+        approx(warp_source_frame(-1.0, &markers), -44_100.0);
+        approx(warp_source_frame(5.0, &markers), 154_350.0);
+    }
+
+    #[test]
+    fn warp_source_frame_degenerate_segment_is_none() {
+        // 同 locked_beat の 2 marker (退化) を補間に使うと None → uniform fallback。
+        let markers = [bm(0, 1.0), bm(100, 1.0)];
+        assert_eq!(warp_source_frame(1.0, &markers), None);
+    }
 
     // ---- fade_envelope ----
 
