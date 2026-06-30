@@ -65,10 +65,13 @@ impl AudioSourceBuffer {
 /// から per-buffer sample 換算する。 これにより SongTempo curve に追随して
 /// audio clip が:
 /// - **trigger 位置が beat 単位で固定** (= 過去 tempo 履歴に依存しない)
-/// - **Repitch mode: 再生速度が tempo 比 (= current_bpm/nominal_bpm) で
-///   スケール**、 pitch も同時に変わる (vinyl 流)
-/// - **Raw / Stretch / Slice mode: 再生速度は固定**、 ただし beat-domain
-///   end で clip がカットされる場合あり (= raw 仕様、 stretch 実装は別 phase)
+/// - **Repitch: 再生速度が tempo 比 (current_bpm/nominal_bpm) でスケール**、
+///   pitch も同時に変わる (vinyl 流)
+/// - **Stretch: granular time-stretch が tempo に追従** (pitch 保持、
+///   `granular_sample_at`)
+/// - **Slice: onset slicing が tempo に追従** (`slice_sample_at`、 onset 自動検出は
+///   r.md #8 B1)
+/// - **Raw: native rate 再生**、 BPM 変更時は clip 窓を秒固定で再スケール (r.md #7)
 pub struct RenderedEvent {
     pub track_idx: usize,
     pub clip_idx: usize,
@@ -543,8 +546,8 @@ pub fn render_audio_events(
             // - Stretch: granular synthesis で pitch を保持しつつ tempo に
             //   追随 (= grain hop を tempo_ratio でスケール、 各 grain は
             //   native rate で再生 = pitch 不変)
-            // - Slice: transient slicing 未実装、 Raw と同じ挙動 (= 別 phase で
-            //   onset 検出 + slice-based 再生に拡張予定)
+            // - Slice: transient slicing。 onset (event.onsets) を slice trigger に
+            //   slice_sample_at が tempo 追従再生 (= onset 自動検出は r.md #8 B1 で実装)
             let (s_l, s_r) = match event.stretch_mode {
                 StretchMode::Stretch => granular_sample_at(
                     event_local,
