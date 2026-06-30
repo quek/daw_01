@@ -12,17 +12,22 @@
 //! - `Vst3PlugFrame` — receives `resizeView` from the editor's `IPlugView`
 //!   so we can route plugin-initiated resize requests back to daw_gui.
 
-use std::ffi::c_void;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::ffi::{CStr, c_char, c_void};
+use std::sync::{Arc, Mutex};
 
 use com_scrape_types::Class;
 use vst3::Steinberg::{
-    IPlugFrame, IPlugFrameTrait, IPlugView, TUID, ViewRect, kNotImplemented, kResultOk, tresult,
+    FIDString, IPlugFrame, IPlugFrameTrait, IPlugView, TUID, ViewRect, kInvalidArgument,
+    kNotImplemented, kResultFalse, kResultOk, tresult,
     Vst::{
-        IComponentHandler, IComponentHandlerTrait, IHostApplication, IHostApplicationTrait,
-        ParamID, ParamValue, String128,
+        IAttributeList, IAttributeListTrait, IComponentHandler, IComponentHandlerTrait,
+        IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait, ParamID, ParamValue,
+        String128, TChar,
     },
 };
+use vst3::Steinberg::Vst::IAttributeList_::AttrID;
+use vst3::{ComWrapper, Interface};
 
 use crate::plugin_instance::HostCallbacks;
 use crate::vst3_params::GuiParamEditQueue;
@@ -66,14 +71,203 @@ impl IHostApplicationTrait for Vst3HostApp {
 
     unsafe fn createInstance(
         &self,
-        _cid: *mut TUID,
+        cid: *mut TUID,
         _iid: *mut TUID,
-        _obj: *mut *mut c_void,
+        obj: *mut *mut c_void,
     ) -> tresult {
-        // MVP: we do not provide `IMessage` / `IAttributeList`. Plugins that
-        // strictly need them (e.g. inter-component messaging) will get
-        // kNotImplemented; most simple instruments / effects are fine.
+        // C2 (r.md #8): processor↔controller messaging を使う VST3 のため host が
+        // IMessage / IAttributeList を生成する。 plugin は
+        // createInstance(IMessage::IID, IMessage::IID, &obj) で IMessage を要求し、
+        // IAttributeList はその IMessage が getAttributes で内包する。 旧実装は
+        // kNotImplemented で messaging plugin が状態同期不能だった。 返す pointer は
+        // refcount を caller へ transfer (into_raw)。
+        if cid.is_null() || obj.is_null() {
+            return kInvalidArgument;
+        }
+        // TUID ([i8;16]) と Interface::IID ([u8;16]) は同じ 16 byte を表すので byte 比較。
+        let cid_bytes: [u8; 16] = std::mem::transmute(*cid);
+        if cid_bytes == IMessage::IID
+            && let Some(ptr) = ComWrapper::new(Vst3Message::new()).to_com_ptr::<IMessage>()
+        {
+            *obj = ptr.into_raw().cast::<c_void>();
+            return kResultOk;
+        }
+        if cid_bytes == IAttributeList::IID
+            && let Some(ptr) =
+                ComWrapper::new(Vst3AttributeList::default()).to_com_ptr::<IAttributeList>()
+        {
+            *obj = ptr.into_raw().cast::<c_void>();
+            return kResultOk;
+        }
         kNotImplemented
+    }
+}
+
+// --- IMessage / IAttributeList (C2 / r.md #8) ------------------------------
+//
+// processor↔controller messaging 用に host が提供する COM オブジェクト。 messaging は
+// component / controller 間の単一スレッドなので Mutex contention は無いが、 ComWrapper
+// の Send/Sync 境界を満たすため interior mutability に Mutex を使う。
+
+/// `IAttributeList` の 1 attribute。
+enum AttrValue {
+    Int(i64),
+    Float(f64),
+    /// UTF-16 (TChar)、 null 終端なしで保持。
+    Str(Vec<u16>),
+    Bin(Vec<u8>),
+}
+
+/// `AttrID` (C string) を所有 key 化する。
+unsafe fn attr_key(id: AttrID) -> Vec<u8> {
+    if id.is_null() {
+        Vec::new()
+    } else {
+        CStr::from_ptr(id).to_bytes().to_vec()
+    }
+}
+
+#[derive(Default)]
+pub struct Vst3AttributeList {
+    attrs: Mutex<HashMap<Vec<u8>, AttrValue>>,
+}
+
+impl Class for Vst3AttributeList {
+    type Interfaces = (IAttributeList,);
+}
+
+impl IAttributeListTrait for Vst3AttributeList {
+    unsafe fn setInt(&self, id: AttrID, value: i64) -> tresult {
+        self.attrs.lock().unwrap().insert(attr_key(id), AttrValue::Int(value));
+        kResultOk
+    }
+    unsafe fn getInt(&self, id: AttrID, value: *mut i64) -> tresult {
+        if value.is_null() {
+            return kInvalidArgument;
+        }
+        match self.attrs.lock().unwrap().get(&attr_key(id)) {
+            Some(AttrValue::Int(v)) => {
+                *value = *v;
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+    unsafe fn setFloat(&self, id: AttrID, value: f64) -> tresult {
+        self.attrs.lock().unwrap().insert(attr_key(id), AttrValue::Float(value));
+        kResultOk
+    }
+    unsafe fn getFloat(&self, id: AttrID, value: *mut f64) -> tresult {
+        if value.is_null() {
+            return kInvalidArgument;
+        }
+        match self.attrs.lock().unwrap().get(&attr_key(id)) {
+            Some(AttrValue::Float(v)) => {
+                *value = *v;
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+    unsafe fn setString(&self, id: AttrID, string: *const TChar) -> tresult {
+        let mut v = Vec::new();
+        if !string.is_null() {
+            let mut p = string;
+            while *p != 0 {
+                v.push(*p);
+                p = p.add(1);
+            }
+        }
+        self.attrs.lock().unwrap().insert(attr_key(id), AttrValue::Str(v));
+        kResultOk
+    }
+    unsafe fn getString(&self, id: AttrID, string: *mut TChar, size_in_bytes: u32) -> tresult {
+        if string.is_null() {
+            return kInvalidArgument;
+        }
+        let map = self.attrs.lock().unwrap();
+        let Some(AttrValue::Str(v)) = map.get(&attr_key(id)) else {
+            return kResultFalse;
+        };
+        // size_in_bytes / 2 = TChar 容量、 末尾 null 用に 1 残す。
+        let cap = (size_in_bytes as usize / 2).saturating_sub(1);
+        let n = v.len().min(cap);
+        for (i, &ch) in v.iter().take(n).enumerate() {
+            *string.add(i) = ch;
+        }
+        *string.add(n) = 0;
+        kResultOk
+    }
+    unsafe fn setBinary(&self, id: AttrID, data: *const c_void, size_in_bytes: u32) -> tresult {
+        let bytes = if data.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(data.cast::<u8>(), size_in_bytes as usize).to_vec()
+        };
+        self.attrs.lock().unwrap().insert(attr_key(id), AttrValue::Bin(bytes));
+        kResultOk
+    }
+    unsafe fn getBinary(
+        &self,
+        id: AttrID,
+        data: *mut *const c_void,
+        size_in_bytes: *mut u32,
+    ) -> tresult {
+        if data.is_null() || size_in_bytes.is_null() {
+            return kInvalidArgument;
+        }
+        let map = self.attrs.lock().unwrap();
+        let Some(AttrValue::Bin(v)) = map.get(&attr_key(id)) else {
+            return kResultFalse;
+        };
+        // messaging は単一スレッドで caller は即座に読むので、 lock 解放後も HashMap
+        // が所有する Vec への pointer は次の mutate まで有効。
+        *data = v.as_ptr().cast::<c_void>();
+        *size_in_bytes = v.len() as u32;
+        kResultOk
+    }
+}
+
+/// `IMessage` — message id + 内包する `IAttributeList`。
+pub struct Vst3Message {
+    id: Mutex<Vec<u8>>,
+    attrs: ComWrapper<Vst3AttributeList>,
+}
+
+impl Vst3Message {
+    fn new() -> Self {
+        Self {
+            id: Mutex::new(vec![0]),
+            attrs: ComWrapper::new(Vst3AttributeList::default()),
+        }
+    }
+}
+
+impl Class for Vst3Message {
+    type Interfaces = (IMessage,);
+}
+
+impl IMessageTrait for Vst3Message {
+    unsafe fn getMessageID(&self) -> FIDString {
+        // 内部 buffer への non-owning pointer (setMessageID まで有効)。
+        self.id.lock().unwrap().as_ptr().cast::<c_char>()
+    }
+    unsafe fn setMessageID(&self, id: FIDString) {
+        let bytes = if id.is_null() {
+            vec![0]
+        } else {
+            let mut b = CStr::from_ptr(id).to_bytes().to_vec();
+            b.push(0);
+            b
+        };
+        *self.id.lock().unwrap() = bytes;
+    }
+    unsafe fn getAttributes(&self) -> *mut IAttributeList {
+        // VST3 convention: non-owning (message が attr list を所有)。
+        match self.attrs.as_com_ref::<IAttributeList>() {
+            Some(r) => r.as_ptr(),
+            None => std::ptr::null_mut(),
+        }
     }
 }
 
