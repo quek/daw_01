@@ -2456,16 +2456,45 @@ struct LaneDisplay {
     color: Color,
 }
 
-/// `AutomationTarget` ごとの label / icon / 識別色。 label は `Arc::from` で都度
-/// 生成する。 **これは意図的** (r.md #8 D4): arrangement の widget input は
-/// immediate-mode で毎フレーム作り直す設計で、 各 lane の clips / points `Vec`
-/// 確保 (= automation データ量に比例する固有コスト) が支配的。 lane 数ぶんの短い
-/// label alloc (≤ 可視 lane 数、 大半は定数文字列) はその固有コストに対して
-/// 無視できる。 D3 がキャッシュ化した `clip_display_label` は歌詞連結という重い
-/// 文字列構築 × 多数 clip だったので別物。 ここを `ArrLabelCache` 化しても
-/// song_epoch に加え `PluginParamList` (= param 名) 世代の無効化 + free-fn への
-/// cache 配線が要るだけで、 上記固有コストに埋もれる微差しか減らない
-/// (= premature optimization) ため、 KISS を選び据え置かず「やらない」 と確定。
+thread_local! {
+    /// D4 (r.md #8): lane label の per-frame `Arc::from` 解消用 intern テーブル。
+    /// lane label は target ごとにほぼ不変 (定数文字列 / send_idx / plugin param 名)
+    /// なので内容で intern し、 2 フレーム目以降は `Arc` clone (refcount bump) で返す。
+    /// UI スレッド専有なので thread_local。 key 集合は lane label の種類数で有界。
+    static LANE_LABEL_INTERN: std::cell::RefCell<std::collections::HashMap<Box<str>, Arc<str>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// SendGain "Send N" を send_idx で intern (format! は miss 時のみ実行)。
+    static SEND_LABEL_INTERN: std::cell::RefCell<std::collections::HashMap<u8, Arc<str>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `&str` を intern して `Arc<str>` を返す (hit 時 alloc 無し)。 定数 label /
+/// plugin param 名に使う。
+fn intern_label(s: &str) -> Arc<str> {
+    LANE_LABEL_INTERN.with(|c| {
+        let mut m = c.borrow_mut();
+        if let Some(a) = m.get(s) {
+            return a.clone();
+        }
+        let a: Arc<str> = Arc::from(s);
+        m.insert(Box::from(s), a.clone());
+        a
+    })
+}
+
+/// SendGain lane の "Send N" label を send_idx で intern。
+fn intern_send_label(send_idx: u8) -> Arc<str> {
+    SEND_LABEL_INTERN.with(|c| {
+        c.borrow_mut()
+            .entry(send_idx)
+            .or_insert_with(|| Arc::from(format!("Send {}", send_idx + 1)))
+            .clone()
+    })
+}
+
+/// `AutomationTarget` ごとの label / icon / 識別色。 label は上記 thread_local で
+/// intern 済の `Arc<str>` (= per-frame の `Arc::from` / `format!` 無し、 r.md #8 D4)。
+/// icon_glyph / color は安価な定数なので live 計算。
 fn lane_target_display(
     target: &common::model::AutomationTarget,
     plugin_param_name: Option<&str>,
@@ -2473,23 +2502,23 @@ fn lane_target_display(
     use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
     match target {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => LaneDisplay {
-            label: Arc::from("Volume"),
+            label: intern_label("Volume"),
             icon_glyph: 'V',
             color: Color::rgb(0.42, 0.78, 0.95),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => LaneDisplay {
-            label: Arc::from("Pan"),
+            label: intern_label("Pan"),
             icon_glyph: 'P',
             color: Color::rgb(0.55, 0.92, 0.55),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => LaneDisplay {
-            label: Arc::from("Mute"),
+            label: intern_label("Mute"),
             icon_glyph: 'M',
             color: Color::rgb(0.92, 0.45, 0.40),
         },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx }) => {
             LaneDisplay {
-                label: Arc::from(format!("Send {}", send_idx + 1)),
+                label: intern_send_label(*send_idx),
                 icon_glyph: 'S',
                 color: Color::rgb(0.85, 0.75, 0.40),
             }
@@ -2497,52 +2526,52 @@ fn lane_target_display(
         AutomationTarget::PluginParam { param_id, .. } => LaneDisplay {
             // B6 (r.md #8): host から PluginParamList 受領済なら実 param 名
             // (`plugin_param_name`)、 未受領なら generic「Param N」。
-            label: Arc::from(match plugin_param_name {
-                Some(name) => name.to_string(),
-                None => format!("Param {param_id}"),
-            }),
+            label: match plugin_param_name {
+                Some(name) => intern_label(name),
+                None => intern_label(&format!("Param {param_id}")),
+            },
             icon_glyph: 'F',
             color: Color::rgb(0.78, 0.55, 0.92),
         },
         AutomationTarget::SongTempo => LaneDisplay {
-            label: Arc::from("Tempo"),
+            label: intern_label("Tempo"),
             icon_glyph: 'T',
             color: Color::rgb(0.95, 0.85, 0.55),
         },
         AutomationTarget::SongTimeSigNumerator => LaneDisplay {
-            label: Arc::from("Time Sig"),
+            label: intern_label("Time Sig"),
             icon_glyph: 'T',
             color: Color::rgb(0.95, 0.85, 0.55),
         },
         // Image PiP field の lane。 色は image track の clip 背景色系
         // (薄い藤色) で統一、 icon は field 名の頭文字。
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::X) => LaneDisplay {
-            label: Arc::from("Image X"),
+            label: intern_label("Image X"),
             icon_glyph: 'X',
             color: Color::rgb(0.90, 0.65, 0.85),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y) => LaneDisplay {
-            label: Arc::from("Image Y"),
+            label: intern_label("Image Y"),
             icon_glyph: 'Y',
             color: Color::rgb(0.90, 0.65, 0.85),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::W) => LaneDisplay {
-            label: Arc::from("Image W"),
+            label: intern_label("Image W"),
             icon_glyph: 'W',
             color: Color::rgb(0.85, 0.65, 0.90),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::H) => LaneDisplay {
-            label: Arc::from("Image H"),
+            label: intern_label("Image H"),
             icon_glyph: 'H',
             color: Color::rgb(0.85, 0.65, 0.90),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity) => LaneDisplay {
-            label: Arc::from("Image Opacity"),
+            label: intern_label("Image Opacity"),
             icon_glyph: 'O',
             color: Color::rgb(0.92, 0.78, 0.70),
         },
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation) => LaneDisplay {
-            label: Arc::from("Image Rotation"),
+            label: intern_label("Image Rotation"),
             icon_glyph: 'R',
             color: Color::rgb(0.75, 0.92, 0.92),
         },
@@ -2576,7 +2605,7 @@ fn lane_target_display(
                 T::ShadowBlur => ("Text Sh Blur", 'B', Color::rgb(0.60, 0.55, 0.50)),
             };
             LaneDisplay {
-                label: Arc::from(label),
+                label: intern_label(label),
                 icon_glyph: icon,
                 color,
             }
@@ -2595,7 +2624,7 @@ fn lane_target_display(
                 G::Opacity => ("Group Opacity", 'O', Color::rgb(0.70, 0.80, 0.92)),
             };
             LaneDisplay {
-                label: Arc::from(label),
+                label: intern_label(label),
                 icon_glyph: icon,
                 color,
             }

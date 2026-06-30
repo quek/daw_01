@@ -185,13 +185,16 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
   bincode は `Arc<[u8]>` を内側 slice と同一 length-prefixed で符号化) なので既存プロジェクト /
   IPC 互換。 model↔protocol 境界 (IPC は `Vec<u8>` のまま) で `as_deref().map(to_vec)` /
   `map(Arc::from)` 変換。 round-trip test (json + bincode) + script smoke + clippy 全 green。
+- **D4 実装済** — lane label の per-frame `Arc::from` / `format!` を thread_local intern で解消。
+  lane label は target ごとにほぼ不変 (定数文字列 / send_idx / plugin param 名) なので内容で intern し、
+  2 フレーム目以降は `Arc<str>` clone (refcount bump) で返す (`intern_label` / `intern_send_label`、
+  key 集合は lane label 種類数で有界)。 定数 label と SendGain (send_idx キー) は alloc ゼロ、
+  PluginParam 名も intern。 icon_glyph / color は安価な定数なので live。 出力同一 (perf のみ)。
+  `ArrLabelCache` 全面 cache (song_epoch + `PluginParamList` 世代の無効化 + free-fn 配線) より
+  局所・低リスクで同じ「per-frame alloc ゼロ」 を達成。
 
-### 据え置き (理由付き — 上流 infra 待ち / 著者既定の deferral / unmeasured perf / 視覚 focused)
+### 監査の終端
 
-- **D4 — 「やらない」 と確定 (premature optimization)** — lane label の per-frame
-  `Arc::from` は ≤ 可視 lane 数の短い alloc で、 同 build fn (`build_arrangement_lanes_from_slice`)
-  が immediate-mode で毎フレーム確保する clips / points `Vec` (automation データ量比例の固有
-  コスト) に埋もれる。 D3 と違い重い計算 (歌詞連結) も多数性も無い。 `ArrLabelCache` 化は
-  song_epoch + `PluginParamList` (= param 名) 世代の無効化 + free-fn への cache 配線が要るだけで
-  上記固有コストに対し微差しか減らないため、 KISS を選び実装しない。 code comment も
-  TODO → 確定判断に是正済 (SSoT)。
+r.md #8 監査 34 項目すべて **実装 / 解決済** (据え置き無し)。 B7 のみ「builtin に専用エディタ
+GUI を意図的に持たない (機能は daw_gui native UI に統合)」 という設計確定での解決。 GUI / 可聴系
+(B12 warp 編集 / B9 映像効果 / E1 IME / D1・E5・Repitch の再生) は実機 sign-off を user に依頼。
