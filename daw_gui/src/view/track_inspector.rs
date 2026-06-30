@@ -972,13 +972,15 @@ fn draw_modulation_rack(
         } // end `if expanded`
 
         // --- このソースが駆動している routing をソース直下に表示 (畳んでも見える) ---
-        for (tid, target, _label, routings) in &mod_routings {
+        for (tid, target, label, routings) in &mod_routings {
             for (rsid, depth, bipolar) in routings {
                 if *rsid != sid {
                     continue;
                 }
                 let row_y = y;
-                let tlabel = crate::app::automation_target_display_name(target);
+                // B6 (r.md #8): cursor_mod_routings が解決済みの track-aware label
+                // (実 plugin param 名) を再利用する (再 derive しない)。
+                let tlabel = label;
                 ui.label_at(
                     ("inspector_mod_rt_lbl", route_i),
                     &format!("\u{2192} {tlabel}"),
@@ -1066,8 +1068,14 @@ fn draw_modulation_rack(
                 if already {
                     continue;
                 }
-                add_labels
-                    .push(format!("\u{2192} {}", crate::app::automation_target_display_name(&target)));
+                // B6 (r.md #8): add-route dropdown も実 plugin param 名で表示。
+                add_labels.push(format!(
+                    "\u{2192} {}",
+                    app.automation_target_label(
+                        app.cursor_track_id().unwrap_or(common::model::MASTER_TRACK_ID),
+                        &target,
+                    )
+                ));
                 add_payload.push(target);
             }
             if add_labels.len() > 1 {

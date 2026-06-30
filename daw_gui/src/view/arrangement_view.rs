@@ -344,6 +344,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 &refcount_by_content,
                 &app.automation_lane_row_overrides,
                 &|tgt| app.plugin_param_range(t.id, tgt),
+                &|tgt| app.plugin_param_name(t.id, tgt),
             ),
             // gui_01 #031 (M14 Phase 63n-6): 個別 track row 高さ override。
             // None なら global `view.track_row_h` (= Alt+wheel で動く既存値) を
@@ -521,6 +522,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &app.song,
         &refcount_by_content,
         &app.automation_lane_row_overrides,
+        &|_| None,
         &|_| None,
     );
     let master_row = daw_ui_core::ArrangementMasterRow {
@@ -2340,6 +2342,7 @@ fn build_arrangement_automation_lanes(
     refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
     lane_height_overrides: &std::collections::HashMap<common::model::AutomationLaneKey, u16>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
+    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<String>,
 ) -> Vec<ArrangementAutomationLane> {
     build_arrangement_lanes_from_slice(
         &track.automation_lanes,
@@ -2348,6 +2351,7 @@ fn build_arrangement_automation_lanes(
         refcount_by_content,
         lane_height_overrides,
         range_of,
+        param_name_of,
     )
 }
 
@@ -2361,11 +2365,13 @@ fn build_arrangement_lanes_from_slice(
     refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
     lane_height_overrides: &std::collections::HashMap<common::model::AutomationLaneKey, u16>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
+    param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<String>,
 ) -> Vec<ArrangementAutomationLane> {
     lanes
         .iter()
         .map(|lane| {
-            let display = lane_target_display(&lane.target);
+            let param_name = param_name_of(&lane.target);
+            let display = lane_target_display(&lane.target, param_name.as_deref());
             // docs/plan_modulation_followups.md §2: plugin param lanes normalize
             // against the plugin's real min/max (else the curve saturates at the
             // top for params whose range isn't 0..=1).
@@ -2453,7 +2459,10 @@ struct LaneDisplay {
 /// 持たせ、 lane の追加 / 削除 / target 変更時のみ再生成すれば消せる。
 /// 現状は lane 数が少なく実害が無いため未着手 (キャッシュ導入は AppData の
 /// 変更が要るので別タスク)。
-fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay {
+fn lane_target_display(
+    target: &common::model::AutomationTarget,
+    plugin_param_name: Option<&str>,
+) -> LaneDisplay {
     use common::model::{AutomationTarget, ImageBuiltinParam, TrackBuiltinParam};
     match target {
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => LaneDisplay {
@@ -2479,8 +2488,12 @@ fn lane_target_display(target: &common::model::AutomationTarget) -> LaneDisplay 
             }
         }
         AutomationTarget::PluginParam { param_id, .. } => LaneDisplay {
-            // Phase 2 で IPC param info を受けたら "Cutoff (Serum)" 等に書き換え。
-            label: Arc::from(format!("Param {}", param_id)),
+            // B6 (r.md #8): host から PluginParamList 受領済なら実 param 名
+            // (`plugin_param_name`)、 未受領なら generic「Param N」。
+            label: Arc::from(match plugin_param_name {
+                Some(name) => name.to_string(),
+                None => format!("Param {param_id}"),
+            }),
             icon_glyph: 'F',
             color: Color::rgb(0.78, 0.55, 0.92),
         },

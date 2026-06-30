@@ -2959,7 +2959,7 @@ impl AppData {
                 out.push((
                     track_id,
                     r.target.clone(),
-                    automation_target_display_name(&r.target),
+                    self.automation_target_label(track_id, &r.target),
                     vec![entry],
                 ));
             }
@@ -3010,6 +3010,40 @@ impl AppData {
         let params = self.plugin_params.get(&(track_id, *device_index))?;
         let info = params.iter().find(|p| p.id == *param_id)?;
         (info.max_value > info.min_value).then_some((info.min_value, info.max_value))
+    }
+
+    /// `PluginParam` target の実 param 名を `plugin_params` cache
+    /// `(track_id, device_index)` から引く (B6 / r.md #8)。 非 plugin target /
+    /// host が `PluginParamList` 未送 / 空名 は `None` (caller が generic 名へ
+    /// fallback)。 arrangement lane header の `param_name_of` closure と
+    /// `automation_target_label` の SSoT。
+    pub fn plugin_param_name(
+        &self,
+        track_id: u32,
+        target: &common::model::AutomationTarget,
+    ) -> Option<String> {
+        let common::model::AutomationTarget::PluginParam { device_index, param_id, .. } = target
+        else {
+            return None;
+        };
+        let info = self
+            .plugin_params
+            .get(&(track_id, *device_index))?
+            .iter()
+            .find(|p| p.id == *param_id)?;
+        (!info.name.is_empty()).then(|| info.name.clone())
+    }
+
+    /// `automation_target_display_name` の track-aware 版 (B6 / r.md #8)。
+    /// `PluginParam` は実 param 名 (`plugin_param_name`) を、 解決できなければ
+    /// generic「Param N」を返す。 status_message / clip 名 / mod routing 表示用。
+    pub fn automation_target_label(
+        &self,
+        track_id: u32,
+        target: &common::model::AutomationTarget,
+    ) -> String {
+        self.plugin_param_name(track_id, target)
+            .unwrap_or_else(|| automation_target_display_name(target))
     }
 
     pub fn inspector_mod_data(
@@ -11174,7 +11208,7 @@ impl AppData {
         };
         let target = lane.target.clone();
         lane.default_value = common::automation::norm_to_plain(&target, next_norm);
-        let display_name = automation_target_display_name(&target);
+        let display_name = self.automation_target_label(track_id, &target);
         self.last_touched_param = Some(TouchedParam {
             track_id,
             target,
@@ -12511,13 +12545,22 @@ impl AppData {
                 common::model::AutomationContent::default(),
             ),
         );
+        // B6 (r.md #8): clip 名に実 param 名を使うため、 mut borrow を取る前に
+        // immutable borrow で target を取り出し track-aware label を解決する。
+        let Some(target) = self
+            .song
+            .automation_lane_by_key(lane_key.track, lane_key.lane)
+            .map(|l| l.target.clone())
+        else {
+            return;
+        };
+        let display = self.automation_target_label(lane_key.track, &target);
         let Some(lane) = self
             .song
             .automation_lane_by_key_mut(lane_key.track, lane_key.lane)
         else {
             return;
         };
-        let display = automation_target_display_name(&lane.target);
         let clip_id = lane.alloc_clip_id();
         let new_clip = common::model::AutomationClip {
             id: clip_id,
