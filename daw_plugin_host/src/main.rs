@@ -904,6 +904,9 @@ fn plugin_main_loop(
     // embedded GUIs this is rare (we own the window), but routing it through
     // the loop keeps the editor-window map and daw_gui's open set consistent.
     let (gui_close_tx, mut gui_close_rx) = tmpsc::unbounded_channel::<(u32, u32)>();
+    // C6 (r.md #8): plugin-initiated GUI show/hide (CLAP request_show/hide)。
+    // `(track, index, show)`。 plugin-main loop が所有 editor 窓を前面化 / 隠す。
+    let (gui_show_tx, mut gui_show_rx) = tmpsc::unbounded_channel::<(u32, u32, bool)>();
 
     // Per-(track, index) host callbacks: each loaded plugin captures its
     // (track, index) so the async CLAP callback (request_resize / closed)
@@ -919,6 +922,18 @@ fn plugin_main_loop(
             let tx = gui_close_tx.clone();
             Arc::new(move || {
                 let _ = tx.send((track, index));
+            })
+        },
+        on_request_show: {
+            let tx = gui_show_tx.clone();
+            Arc::new(move || {
+                let _ = tx.send((track, index, true));
+            })
+        },
+        on_request_hide: {
+            let tx = gui_show_tx.clone();
+            Arc::new(move || {
+                let _ = tx.send((track, index, false));
             })
         },
         // VST3 param gesture (IComponentHandler::beginEdit/performEdit/endEdit)。
@@ -1916,6 +1931,18 @@ fn plugin_main_loop(
         // handle plugin-initiated closes (CLAP `closed`).
         while let Ok((track, index)) = gui_close_rx.try_recv() {
             close_slot_gui(&mut tracks, &mut editor_windows, track, index, &evt_tx);
+        }
+
+        // C6 (r.md #8): plugin-initiated GUI show/hide (CLAP request_show/hide)。
+        // 所有する editor 窓を前面化 / 隠す。
+        while let Ok((track, index, show)) = gui_show_rx.try_recv() {
+            if let Some(win) = editor_windows.get(&(track, index)) {
+                if show {
+                    win.set_foreground();
+                } else {
+                    win.hide();
+                }
+            }
         }
 
         // handle editor windows the user closed via the window's

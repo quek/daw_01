@@ -164,14 +164,23 @@ unsafe extern "C" fn gui_request_resize(
     true
 }
 
-unsafe extern "C" fn gui_request_show(_host: *const clap_host) -> bool {
-    // Plugin is asking the host to bring the GUI to front. MVP: ignore.
-    false
+unsafe extern "C" fn gui_request_show(host: *const clap_host) -> bool {
+    // C6 (r.md #8): plugin が GUI を前面化要求。 host 所有の editor 窓を
+    // SetForegroundWindow する (callback → channel → plugin-main loop)。
+    let Some(this) = (unsafe { Host::from_clap(host) }) else {
+        return false;
+    };
+    (this.callbacks.on_request_show)();
+    true
 }
 
-unsafe extern "C" fn gui_request_hide(_host: *const clap_host) -> bool {
-    // Plugin is asking the host to hide the GUI. MVP: ignore.
-    false
+unsafe extern "C" fn gui_request_hide(host: *const clap_host) -> bool {
+    // C6 (r.md #8): plugin が GUI を隠す要求。 host 所有の editor 窓を hide する。
+    let Some(this) = (unsafe { Host::from_clap(host) }) else {
+        return false;
+    };
+    (this.callbacks.on_request_hide)();
+    true
 }
 
 unsafe extern "C" fn gui_closed(host: *const clap_host, was_destroyed: bool) {
