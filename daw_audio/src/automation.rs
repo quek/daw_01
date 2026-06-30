@@ -162,7 +162,6 @@ pub fn fill_pd_param_events(
     if samples_per_beat <= 0.0 {
         return;
     }
-    let beat = playhead as f64 / samples_per_beat;
     for lane in &track.automation_lanes {
         if !lane.enabled {
             continue;
@@ -188,11 +187,30 @@ pub fn fill_pd_param_events(
             }
             _ => continue,
         };
-        // base = lane curve 値 (絶対値)。モジュレーションは下で正規化オフセットを
+        // automation curve 値 (絶対値)。モジュレーションは下で正規化オフセットを
         // ParamMod として別送する (`docs/plan_modulation_routing_redesign.md` §3.2)
-        // ので、CLAP modulatable param では automation(base) を破壊せず非破壊に乗る。
-        let base = lane_value_at(lane, &song.clip_contents, beat);
-        pd.push_param(0, param_id, base);
+        // ので、CLAP modulatable param では automation を破壊せず非破壊に乗る。
+        //
+        // B4 (r.md #8): sub-buffer (64 frame 刻み) で curve をサンプルし、 値が変わる
+        // たびに frame offset 付きで push_param する (= sample-accurate)。 旧実装は
+        // frame 0 の 1 回のみで、 速い automation が階段状 (zipper) になっていた。
+        // 静的セグメントは値不変なので 1 event に縮退 (events_in=256 を無駄に食わない)。
+        // push_param は満杯時 drop のみ (panic なし) なので RT 安全。
+        const SUB_FRAMES: u32 = 64;
+        let mut f = 0u32;
+        let mut last_v = f64::NAN;
+        loop {
+            let beat_at_f = (playhead + u64::from(f)) as f64 / samples_per_beat;
+            let v = lane_value_at(lane, &song.clip_contents, beat_at_f);
+            if last_v.is_nan() || (v - last_v).abs() > 1e-6 {
+                pd.push_param(f, param_id, v);
+                last_v = v;
+            }
+            if f + SUB_FRAMES >= frames {
+                break;
+            }
+            f += SUB_FRAMES;
+        }
     }
 
     // docs/plan_modulation_routing_redesign.md §3.2: この device の plugin param を
@@ -553,6 +571,35 @@ mod tests {
             t.next_lane_id = 2;
         }));
         song
+    }
+
+    /// B4 (r.md #8): ramping plugin-param lane を 512-frame buffer で fill すると、
+    /// frame 0 の 1 event でなく sub-buffer (64 刻み) の複数 event が出る
+    /// (= sample-accurate、 速い automation の zipper 解消)。
+    #[test]
+    fn fill_pd_param_events_sub_samples_changing_curve() {
+        let song = one_plugin_param_lane_song();
+        let mut pd = ProcessData::empty();
+        let empty = empty_recording_lanes();
+        fill_pd_param_events(&mut pd, &song, 7, 0, SR, 120.0, 0, 512, &empty, &[]);
+        assert!(
+            pd.n_events_in > 1,
+            "ramp は sub-buffer で複数 event を出すべき, got {}",
+            pd.n_events_in
+        );
+        // 全 event が param_id 5、 frame offset 単調増加、 値は ramp に沿って増加。
+        let mut last_time = 0u32;
+        for i in 0..pd.n_events_in as usize {
+            let e = &pd.events_in[i];
+            assert_eq!(e.param_id, 5);
+            if i > 0 {
+                assert!(e.time > last_time, "frame offset 単調増加");
+            }
+            last_time = e.time;
+        }
+        assert!(pd.events_in[0].value >= 0.25 - 1e-6);
+        let last = pd.events_in[(pd.n_events_in - 1) as usize].value;
+        assert!(last > pd.events_in[0].value, "ramp で値が増加");
     }
 
     /// Phase 4 Step C-2 (plugin param 版) 回帰: recording 中 (Touch/Latch/Write)
