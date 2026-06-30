@@ -25,6 +25,31 @@ pub struct AudioSourceBuffer {
     pub samples: Vec<Vec<f32>>,
 }
 
+impl AudioSourceBuffer {
+    /// Mono downmix of frames `[start, end)` (clamped to the buffer),
+    /// averaging all channels. OFF-RT analysis helper (e.g. onset detection
+    /// for `StretchMode::Slice`). Empty channel set / empty range → empty Vec.
+    pub fn downmix_mono(&self, start: usize, end: usize) -> Vec<f32> {
+        let ch = self.samples.len();
+        if ch == 0 || end <= start {
+            return Vec::new();
+        }
+        let mut mono = vec![0.0f32; end - start];
+        for plane in &self.samples {
+            for (out, sample_idx) in (start..end).enumerate() {
+                if let Some(&s) = plane.get(sample_idx) {
+                    mono[out] += s;
+                }
+            }
+        }
+        let inv = 1.0 / ch as f32;
+        for m in &mut mono {
+            *m *= inv;
+        }
+        mono
+    }
+}
+
 #[derive(Default)]
 pub struct AudioSourceCache {
     map: HashMap<AudioSourceId, Arc<AudioSourceBuffer>>,

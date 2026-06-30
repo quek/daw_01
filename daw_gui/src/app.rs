@@ -16471,6 +16471,83 @@ impl AppData {
         mode: common::model::StretchMode,
     ) {
         self.mutate_audio_events_in_clip(target, |e| e.stretch_mode = mode);
+        // B1 (r.md #8): Slice へ切替時、 onsets 未検出の event に transient 検出を
+        // 走らせ slice の trigger 位置を埋める (検出済 / 非 Slice は何もしない)。
+        if mode == common::model::StretchMode::Slice {
+            self.detect_onsets_for_clip(target);
+        }
+    }
+
+    /// B1 (r.md #8): Slice 切替時に GUI decoded buffer から transient を検出して
+    /// `AudioEvent.onsets` (= slice trigger 位置、 `source_start_frames` 起点 0
+    /// base、 `slice_sample_at` の contract に一致) を埋める。 既に onsets を持つ
+    /// event は前回検出 / 将来の user 編集を尊重して skip。 OFF-RT (buffer を 1 回
+    /// scan)。 buffer 未 decode の event は skip (= 空 onsets で Raw 等価のまま)。
+    fn detect_onsets_for_clip(&mut self, target: ClipRef) {
+        let Some(content_id) = self
+            .song
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        let n_events = match self.song.clip_contents.get(&content_id) {
+            Some(common::model::ClipContent::Audio(a)) => a.events.len(),
+            _ => return,
+        };
+        let indices = self.audio_event_target_indices(target, n_events);
+
+        // Phase A: 検出対象 (onsets 空) の event index + source range を集める
+        // (immutable borrow)。
+        let mut jobs: Vec<(usize, common::model::AudioSourceId, u64, u64)> = Vec::new();
+        if let Some(common::model::ClipContent::Audio(a)) =
+            self.song.clip_contents.get(&content_id)
+        {
+            for &i in &indices {
+                if let Some(e) = a.events.get(i)
+                    && e.onsets.is_empty()
+                {
+                    jobs.push((i, e.source_id, e.source_start_frames, e.source_end_frames));
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+
+        // Phase B: decoded buffer を mono downmix して OFF-RT 検出。
+        let mut results: Vec<(usize, Vec<u64>)> = Vec::new();
+        for (i, source_id, start, end) in jobs {
+            let Some(buf) = self.audio_source_cache.get(source_id) else {
+                continue;
+            };
+            let start = start.min(buf.frames) as usize;
+            let end = end.min(buf.frames) as usize;
+            let mono = buf.downmix_mono(start, end);
+            if mono.is_empty() {
+                continue;
+            }
+            let onsets = common::onset::detect_onsets(&mono, buf.sample_rate, 0.5);
+            results.push((i, onsets));
+        }
+
+        // Phase C: onsets を書き戻し audio engine へ再 sync (mutable borrow)。
+        let mut changed = false;
+        if let Some(common::model::ClipContent::Audio(a)) =
+            self.song.clip_contents.get_mut(&content_id)
+        {
+            for (i, onsets) in results {
+                if let Some(e) = a.events.get_mut(i) {
+                    e.onsets = onsets;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.sync_song_to_plugin_host();
+        }
     }
 
     fn set_clip_audio_event_gain_db(&mut self, target: ClipRef, gain_db: f32) {

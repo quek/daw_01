@@ -10,6 +10,7 @@ pub mod metrics_bridge;
 pub mod mod_sidecar;
 pub mod model;
 pub mod modulators;
+pub mod onset;
 pub mod lipsync;
 pub mod plugin_db;
 pub mod plugin_format;

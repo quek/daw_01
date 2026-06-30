@@ -3922,8 +3922,10 @@ pub struct AudioEvent {
     pub reversed: bool,
     pub muted: bool,
 
-    /// Auto-detected transient frames (sample units). Phase 4+; empty
-    /// in Phase 1.
+    /// Auto-detected transient frame positions (`source_start_frames` 起点、
+    /// `StretchMode::Slice` の slice trigger 位置)。 Slice 切替時に daw_gui が
+    /// `common::onset::detect_onsets` で検出して埋める (r.md #8 B1)。 空 = 未検出で
+    /// source 全体が 1 slice (= Raw 等価)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub onsets: Vec<u64>,
     /// User-placed beat markers for `StretchMode::Stretch`. Phase 3+;
