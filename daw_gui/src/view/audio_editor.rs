@@ -351,8 +351,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         }));
                     }
                 } else if m.alt {
-                    // Alt+wheel: 当面 no-op (将来 vertical_gain zoom 等に
-                    // 割り当て可能、 spec 確定後に拡張)。
+                    // B13 (r.md #8): Alt+wheel = 波形の縦 gain zoom (振幅表示の拡大率)。
+                    // 描画スケールのみで model / 音声には非影響。 0.25..16x に clamp。
+                    let factor = (((sx + sy) as f64) * 0.01).exp() as f32;
+                    if (factor - 1.0).abs() > 1e-6 {
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.audio_editor_vertical_gain =
+                                (app.audio_editor_vertical_gain * factor).clamp(0.25, 16.0);
+                        }));
+                    }
                 } else {
                     // 素 wheel / Shift+wheel: 水平 scroll。 piano_roll と
                     // 同じ符号 (wheel up = view_start 減少 = timeline 左へ)。
@@ -449,7 +456,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let view = WaveformView {
             start_sample: src_visible_start_frames,
             len_samples: src_visible_len_frames.max(1),
-            vertical_gain: 1.0,
+            vertical_gain: app.audio_editor_vertical_gain,
         };
         let is_selected = selected_set.contains(&idx);
         let fg = if is_selected {

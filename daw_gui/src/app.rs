@@ -1488,6 +1488,9 @@ pub struct AppData {
     /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
     /// 系操作で「マウス位置を cursor として使う」 ために保持する。
     pub audio_editor_hover_beat_in_clip: Option<f64>,
+    /// (B13 r.md #8) Audio Editor の波形 縦 gain (振幅表示の拡大率)。 Alt+wheel で
+    /// 増減。 session-only (描画スケールのみ、 model / 音声には非影響)。
+    pub audio_editor_vertical_gain: f32,
     /// Audio Editor の表示状態を **クリップごと** (`ClipKey`) に記憶する
     /// (Ableton Live / Bitwig 流)。 entry が無い (= 初回) クリップは
     /// `open_audio_editor` がクリップ全長を見せる初期 view を入れる。 値域は
@@ -2316,6 +2319,7 @@ impl AppData {
             audio_editor_selected_events: Vec::new(),
             audio_editor_hover_beat_in_clip: None,
             audio_editor_views: std::collections::HashMap::new(),
+            audio_editor_vertical_gain: 1.0,
             arrange_zoom_x: ARRANGE_PX_PER_BEAT,
             arrange_scroll_beat: 0.0,
             arrange_follow: common::model::FollowMode::default(),
