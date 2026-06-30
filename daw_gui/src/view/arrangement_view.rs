@@ -2456,16 +2456,16 @@ struct LaneDisplay {
     color: Color,
 }
 
-/// `AutomationTarget` ごとの label / icon / 識別色。 label 文字列は
-/// `Arc::from` で都度生成 (per-frame だが lane 数は片手で数える程度なので
-/// allocation コストは無視できる)。
-///
-/// TODO(perf, 優先度低): `SendGain` / `PluginParam` 枝だけは `format!` +
-/// `Arc::from` を毎フレーム走らせている。 lane 構成 (= target 集合) は通常
-/// 変化しないので、 AppData 側に「lane id → 表示 label」 の小キャッシュを
-/// 持たせ、 lane の追加 / 削除 / target 変更時のみ再生成すれば消せる。
-/// 現状は lane 数が少なく実害が無いため未着手 (キャッシュ導入は AppData の
-/// 変更が要るので別タスク)。
+/// `AutomationTarget` ごとの label / icon / 識別色。 label は `Arc::from` で都度
+/// 生成する。 **これは意図的** (r.md #8 D4): arrangement の widget input は
+/// immediate-mode で毎フレーム作り直す設計で、 各 lane の clips / points `Vec`
+/// 確保 (= automation データ量に比例する固有コスト) が支配的。 lane 数ぶんの短い
+/// label alloc (≤ 可視 lane 数、 大半は定数文字列) はその固有コストに対して
+/// 無視できる。 D3 がキャッシュ化した `clip_display_label` は歌詞連結という重い
+/// 文字列構築 × 多数 clip だったので別物。 ここを `ArrLabelCache` 化しても
+/// song_epoch に加え `PluginParamList` (= param 名) 世代の無効化 + free-fn への
+/// cache 配線が要るだけで、 上記固有コストに埋もれる微差しか減らない
+/// (= premature optimization) ため、 KISS を選び据え置かず「やらない」 と確定。
 fn lane_target_display(
     target: &common::model::AutomationTarget,
     plugin_param_name: Option<&str>,
