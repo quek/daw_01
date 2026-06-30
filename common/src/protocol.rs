@@ -334,18 +334,46 @@ pub enum AraSourceSpec {
     },
 }
 
-/// One audio clip exposed to an ARA plug-in: its source plus where it sits on
-/// the song timeline and which slice of the source is audible. Times are in
-/// seconds; with no time-stretch the modification and playback durations match.
+/// Timeline placement + stretch of one ARA playback region, in seconds. Shared
+/// by [`AraClipSpec`] (the full clip spec, with source, used to build a
+/// document) and [`AraRegionUpdate`] (a lightweight property update matched by
+/// id). The *modification* range is the audible source slice — fixed, since the
+/// source audio never changes; the *playback* range is where that slice sits on
+/// the song timeline. When `time_stretch` is set the plug-in maps the
+/// modification slice onto a different playback duration (pitch-preserving),
+/// otherwise the two durations are kept equal (Raw — no transformation).
+#[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
+pub struct AraRegionPlacement {
+    pub start_in_playback_seconds: f64,
+    pub duration_in_playback_seconds: f64,
+    pub start_in_modification_seconds: f64,
+    pub duration_in_modification_seconds: f64,
+    /// Enable `kARAPlaybackTransformationTimestretch` on the region. `false` =
+    /// playback duration equals modification duration (Raw / no stretch).
+    pub time_stretch: bool,
+}
+
+/// One audio clip exposed to an ARA plug-in: its source plus its placement on
+/// the song timeline. The host (daw_gui) resolves a track's audio clips into
+/// these before sending `SetupAraDocument`.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct AraClipSpec {
     pub source: AraSourceSpec,
     /// Unique, save/restore-stable id for the source within the document.
     pub persistent_id: String,
-    pub start_in_playback_seconds: f64,
-    pub duration_in_playback_seconds: f64,
-    pub start_in_modification_seconds: f64,
-    pub duration_in_modification_seconds: f64,
+    pub placement: AraRegionPlacement,
+}
+
+/// A lightweight update of an existing ARA playback region's placement, matched
+/// to its region by `persistent_id`. Sent via `UpdateAraRegions` when only the
+/// timeline placement / stretch of already-present clips changed (manual
+/// edge-drag, tempo change, clip move) so the plug-in can
+/// `updatePlaybackRegionProperties` in place instead of rebuilding the whole
+/// document (which would interrupt playback).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct AraRegionUpdate {
+    pub persistent_id: String,
+    pub placement: AraRegionPlacement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -722,6 +750,17 @@ pub enum MainToChild {
     ClearAraDocument {
         track: u32,
         index: u32,
+    },
+    /// (r.md #7 ARA2) Update only the playback-region placements of an existing
+    /// ARA document (matched by `persistent_id`) without rebuilding it. Sent by
+    /// daw_gui when the clip *set* is unchanged but a clip's timeline placement /
+    /// stretch changed (edge-drag, tempo change, move) — the plug-in updates its
+    /// regions in place via `updatePlaybackRegionProperties`, which (unlike
+    /// add/removePlaybackRegion) is safe while rendering. daw_audio ignores this.
+    UpdateAraRegions {
+        track: u32,
+        index: u32,
+        regions: Vec<AraRegionUpdate>,
     },
 }
 

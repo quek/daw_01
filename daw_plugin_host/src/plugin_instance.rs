@@ -365,6 +365,13 @@ pub trait LoadedPlugin: Send {
         Ok(false)
     }
 
+    /// (r.md #7 ARA2) Update only the placement / stretch of the bound ARA
+    /// document's existing regions (matched by `persistent_id`), without
+    /// rebuilding. Unlike `setup_ara` this needs no deactivate —
+    /// `updatePlaybackRegionProperties` is safe while the plug-in renders — so it
+    /// is the live tempo / edge-drag follow path. No-op for non-ARA instances.
+    fn update_ara_regions(&self, _regions: &[common::protocol::AraRegionUpdate]) {}
+
     /// (r.md #5 ARA2) Tear down this instance's ARA session, if any.
     fn clear_ara(&mut self) {}
 

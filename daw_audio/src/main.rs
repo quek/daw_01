@@ -697,6 +697,7 @@ async fn recv_loop(
             // ARA (r.md #5) は plugin host 専用なので audio engine は無視。
             | Ok(MainToChild::SetupAraDocument { .. })
             | Ok(MainToChild::ClearAraDocument { .. })
+            | Ok(MainToChild::UpdateAraRegions { .. })
             | Ok(MainToChild::CloseWorkerPool) => {}
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");

@@ -374,6 +374,13 @@ enum PluginCommand {
         track: u32,
         index: u32,
     },
+    /// (r.md #7 ARA2) Update existing ARA regions' placement / stretch in place
+    /// (no rebuild), matched by `persistent_id`. Safe while rendering.
+    UpdateAraRegions {
+        track: u32,
+        index: u32,
+        regions: Vec<common::protocol::AraRegionUpdate>,
+    },
     RequestAllStates,
     OpenSlotGui {
         track: u32,
@@ -587,10 +594,13 @@ fn ara_selftest(path: &std::path::Path, target_id: &str, wav: Option<&str>) -> R
                 vec![common::protocol::AraClipSpec {
                     source: common::protocol::AraSourceSpec::WavFile(std::path::PathBuf::from(w)),
                     persistent_id: "ara-selftest-source-1".to_string(),
-                    start_in_playback_seconds: 0.0,
-                    duration_in_playback_seconds: 10.0,
-                    start_in_modification_seconds: 0.0,
-                    duration_in_modification_seconds: 10.0,
+                    placement: common::protocol::AraRegionPlacement {
+                        start_in_playback_seconds: 0.0,
+                        duration_in_playback_seconds: 10.0,
+                        start_in_modification_seconds: 0.0,
+                        duration_in_modification_seconds: 10.0,
+                        time_stretch: false,
+                    },
                 }]
             }
             None => Vec::new(),
@@ -1768,6 +1778,17 @@ fn plugin_main_loop(
                         tracing::info!(track, index, "ARA document cleared");
                     }
                 }
+                PluginCommand::UpdateAraRegions { track, index, regions } => {
+                    match tracks.plugin_at_mut(track, index) {
+                        Some(plugin) => {
+                            plugin.update_ara_regions(&regions);
+                            tracing::info!(track, index, n = regions.len(), "ARA regions updated");
+                        }
+                        None => {
+                            tracing::warn!(track, index, "UpdateAraRegions: no plugin at slot");
+                        }
+                    }
+                }
                 PluginCommand::RequestAllStates => {
                     let entries = collect_all_states(&mut tracks);
                     let _ = evt_tx.send(PluginEvent::AllPluginStates { entries });
@@ -2360,6 +2381,10 @@ fn handle_main_to_child(msg: MainToChild, plugin: &PluginThreadSender) {
         MainToChild::ClearAraDocument { track, index } => {
             tracing::info!(track, index, "received ClearAraDocument");
             plugin.send(PluginCommand::ClearAraDocument { track, index });
+        }
+        MainToChild::UpdateAraRegions { track, index, regions } => {
+            tracing::info!(track, index, n = regions.len(), "received UpdateAraRegions");
+            plugin.send(PluginCommand::UpdateAraRegions { track, index, regions });
         }
         MainToChild::RequestAllStates => {
             tracing::info!("received RequestAllStates");

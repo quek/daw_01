@@ -7953,12 +7953,44 @@ impl AppData {
             }
         }
 
-        // Compute the diff against the cache before any &mut self send.
-        let to_send: Vec<((u32, u32), Vec<common::protocol::AraClipSpec>)> = live
-            .iter()
-            .filter(|(key, clips)| self.ara_doc_cache.get(*key) != Some(*clips))
-            .map(|(key, clips)| (*key, clips.clone()))
-            .collect();
+        /// Two resolved ARA clip sets have the same regions (same persistent_id
+        /// and source, in order) — only their placement / stretch may differ, so
+        /// the slot can be updated in place instead of rebuilt.
+        fn ara_same_clip_set(
+            a: &[common::protocol::AraClipSpec],
+            b: &[common::protocol::AraClipSpec],
+        ) -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.persistent_id == y.persistent_id && x.source == y.source)
+        }
+        fn ara_region_update_of(
+            clip: &common::protocol::AraClipSpec,
+        ) -> common::protocol::AraRegionUpdate {
+            common::protocol::AraRegionUpdate {
+                persistent_id: clip.persistent_id.clone(),
+                placement: clip.placement,
+            }
+        }
+
+        // Diff against the cache (before any &mut self send), splitting changes
+        // into in-place region updates and full rebuilds. A slot whose clip set
+        // is unchanged but whose placement / stretch differs is updated via
+        // `UpdateAraRegions` — `updatePlaybackRegionProperties` is safe while
+        // rendering, so live tempo / edge-drag follow doesn't interrupt playback.
+        // A slot that is new or whose clip set changed is rebuilt.
+        let mut rebuilds: Vec<((u32, u32), Vec<common::protocol::AraClipSpec>)> = Vec::new();
+        let mut updates: Vec<((u32, u32), Vec<common::protocol::AraRegionUpdate>)> = Vec::new();
+        for (key, clips) in &live {
+            match self.ara_doc_cache.get(key) {
+                Some(prev) if prev == clips => {}
+                Some(prev) if ara_same_clip_set(prev, clips) => {
+                    updates.push((*key, clips.iter().map(ara_region_update_of).collect()));
+                }
+                _ => rebuilds.push((*key, clips.clone())),
+            }
+        }
         let stale: Vec<(u32, u32)> = self
             .ara_doc_cache
             .keys()
@@ -7967,7 +7999,7 @@ impl AppData {
             .collect();
 
         self.ara_doc_cache = live;
-        for ((track, index), clips) in to_send {
+        for ((track, index), clips) in rebuilds {
             // Restore any saved ARA edits for this device alongside the rebuild.
             let archive = self
                 .song
@@ -7984,6 +8016,9 @@ impl AppData {
                 time_sig: (self.song.time_sig.0 as u16, self.song.time_sig.1 as u16),
                 archive,
             });
+        }
+        for ((track, index), regions) in updates {
+            self.send_plugin(MainToChild::UpdateAraRegions { track, index, regions });
         }
         for (track, index) in stale {
             self.send_plugin(MainToChild::ClearAraDocument { track, index });
@@ -8037,17 +8072,29 @@ impl AppData {
                     / sample_rate;
                 let start_in_playback =
                     (clip.start_beat + event.event_start_in_clip_beats) * 60.0 / bpm;
+                // Raw plays the slice natively (no stretch): playback duration ==
+                // modification duration. Every other mode follows the clip's
+                // timeline length, so the playback duration is the event's beat
+                // span in seconds (event_length_beats × 60/bpm) and the plug-in
+                // pitch-preservingly time-stretches the slice onto it. Manual
+                // edge-drag changes event_length_beats; a tempo change changes
+                // bpm — both flow through here (mirrors #6 for non-ARA audio).
+                let time_stretch = event.stretch_mode != common::model::StretchMode::Raw;
+                let duration_in_playback = if time_stretch {
+                    event.event_length_beats * 60.0 / bpm
+                } else {
+                    duration_in_modification
+                };
                 out.push(common::protocol::AraClipSpec {
                     source: common::protocol::AraSourceSpec::WavFile(abs),
-                    persistent_id: format!(
-                        "{}:{}:{event_index}",
-                        event.source_id, clip.id
-                    ),
-                    start_in_playback_seconds: start_in_playback,
-                    // No time-stretch (v1): playback duration == source slice.
-                    duration_in_playback_seconds: duration_in_modification,
-                    start_in_modification_seconds: start_in_modification,
-                    duration_in_modification_seconds: duration_in_modification,
+                    persistent_id: format!("{}:{}:{event_index}", event.source_id, clip.id),
+                    placement: common::protocol::AraRegionPlacement {
+                        start_in_playback_seconds: start_in_playback,
+                        duration_in_playback_seconds: duration_in_playback,
+                        start_in_modification_seconds: start_in_modification,
+                        duration_in_modification_seconds: duration_in_modification,
+                        time_stretch,
+                    },
                 });
             }
         }
