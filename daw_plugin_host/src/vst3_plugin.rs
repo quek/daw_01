@@ -175,7 +175,8 @@ pub struct Vst3Plugin {
     /// a non-OK status, logged once (with the status) from `stop_processing()`.
     /// Same flag idiom as `param_pool_overflowed` so a misbehaving plugin can't
     /// flood the log every buffer.
-    #[cfg(debug_assertions)]
+    /// C5 (r.md #8): release でも記録する (atomic store は RT 安全、 log は
+    /// stop_processing で off-RT に 1 回)。 旧 debug 限定では納品物の診断がゼロだった。
     process_status_err: std::sync::atomic::AtomicI32,
     /// Transport / timing block the plugin reads via `ProcessData.processContext`.
     /// Several instruments (SynthMaster 3, some Arturia products) stay silent
@@ -448,7 +449,6 @@ impl Vst3Plugin {
             gui_param_edits,
             gui_edit_scratch: Vec::with_capacity(64),
             param_pool_overflowed: AtomicBool::new(false),
-            #[cfg(debug_assertions)]
             process_status_err: std::sync::atomic::AtomicI32::new(kResultOk),
             process_context: unsafe { std::mem::zeroed() },
             render_mode: RenderMode::Realtime,
@@ -1261,7 +1261,6 @@ impl LoadedPlugin for Vst3Plugin {
                 "VST3 GUI parameter-edit ring overflow; some intermediate edits dropped"
             );
         }
-        #[cfg(debug_assertions)]
         {
             let status = self.process_status_err.swap(kResultOk, Ordering::Relaxed);
             if status != kResultOk {
@@ -1585,11 +1584,11 @@ impl LoadedPlugin for Vst3Plugin {
             processContext: &mut self.process_context,
         };
         let status = unsafe { self.audio.process(&mut data) };
-        #[cfg(debug_assertions)]
         if status != kResultOk {
+            // C5 (r.md #8): release でも記録 (旧 debug 限定 → 納品物の診断ゼロ)。
             // Record (don't log) here: `format!` would heap-allocate on the RT
             // thread and an unhappy plugin returns non-OK every buffer. The
-            // actual warning fires once from `stop_processing()`.
+            // actual warning fires once (off-RT) from `stop_processing()`.
             self.process_status_err.store(status, Ordering::Relaxed);
         }
 
