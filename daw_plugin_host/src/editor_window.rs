@@ -36,7 +36,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SW_HIDE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WM_CLOSE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::core::PCWSTR;
+
+/// C1 (r.md #8): HWND の DPI scale (= `GetDpiForWindow` / 96)。 取得失敗 (dpi 0) や
+/// 非 HiDPI は 1.0。 plugin の `gui.set_scale` / VST3 `setContentScaleFactor` に渡し、
+/// HiDPI で editor が極小 / ぼやけるのを防ぐ。
+#[must_use]
+pub fn window_dpi_scale(hwnd_u64: u64) -> f64 {
+    let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 {
+        1.0
+    } else {
+        f64::from(dpi) / 96.0
+    }
+}
 
 static CLASS_ATOM: OnceLock<u16> = OnceLock::new();
 // Win32 stores only a pointer into its class table, so the class-name buffer

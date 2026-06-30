@@ -31,7 +31,8 @@ use common::vst3_scan::{c_array_to_string, tuid_to_hex};
 use vst3::{
     ComPtr, ComWrapper, Interface,
     Steinberg::{
-        FUnknown, IBStream, IPlugView, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
+        FUnknown, IBStream, IPlugView, IPlugViewContentScaleSupport,
+        IPlugViewContentScaleSupportTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
         IPluginFactoryTrait, PClassInfo, TUID, ViewRect, kNotImplemented, kPlatformTypeHWND,
         kResultOk, kResultTrue,
         Vst::{
@@ -1796,10 +1797,19 @@ impl LoadedPlugin for Vst3Plugin {
         Some((w, h))
     }
 
-    fn gui_set_scale(&self, _scale: f64) -> Result<bool> {
-        // MVP: skip IPlugViewContentScaleSupport; most plugins handle DPI
-        // themselves when running at 1.0.
-        Ok(false)
+    fn gui_set_scale(&self, scale: f64) -> Result<bool> {
+        // C1 (r.md #8): IPlugViewContentScaleSupport を実装する plugin に DPI scale を
+        // 渡す (旧実装は skip で 1.0 固定 → HiDPI でぼやけ)。 非対応 plugin (cast 失敗)
+        // は自前で DPI を扱うので false (= host no-op) を返す。
+        let Some(view) = self.view.as_ref() else {
+            return Ok(false);
+        };
+        let Some(scale_support) = view.cast::<IPlugViewContentScaleSupport>() else {
+            return Ok(false);
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let res = unsafe { scale_support.setContentScaleFactor(scale as f32) };
+        Ok(res == kResultOk)
     }
 
     fn gui_can_resize(&self) -> bool {

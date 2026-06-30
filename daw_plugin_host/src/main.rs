@@ -2124,12 +2124,6 @@ fn open_gui(
     // before show.
     plugin.gui_create_embedded()?;
 
-    // MVP: hardcode scale = 1.0. A DPI-aware version would query
-    // `GetDpiForWindow` on the host HWND.
-    if let Err(e) = plugin.gui_set_scale(1.0) {
-        tracing::warn!(error = ?e, "gui.set_scale failed (ignored)");
-    }
-
     let resizable = plugin.gui_can_resize();
     // Default to a sane size when the pre-attach query is missing or 0×0
     // (some VST3 editors only know their size after `attached`). Attaching
@@ -2155,6 +2149,22 @@ fn open_gui(
             return Err(anyhow::anyhow!("create editor window: {e}"));
         }
     };
+
+    // C1 (r.md #8): host HWND の DPI を query して set_scale に渡す (旧 hardcode 1.0
+    // → HiDPI で editor が極小/ぼやけ)。 DPI は window 作成後でないと取れないので、
+    // spec の create→set_scale→get_size→set_parent のうち set_scale をここ (window
+    // 作成後・set_parent 前) で行う。 DPI-aware plugin は scale 反映後に get_size が
+    // 変わるので再 query して container を physical size に合わせる。 scale==1.0
+    // (標準 DPI) は従来どおり no-op。
+    let dpi_scale = editor_window::window_dpi_scale(editor.hwnd_u64());
+    if let Err(e) = plugin.gui_set_scale(dpi_scale) {
+        tracing::warn!(error = ?e, scale = dpi_scale, "gui.set_scale failed (ignored)");
+    }
+    if (dpi_scale - 1.0).abs() > f64::EPSILON
+        && let Some((sw, sh)) = plugin.gui_get_size().filter(|&(w, h)| w > 0 && h > 0)
+    {
+        editor.set_client_size(sw, sh);
+    }
 
     if let Err(e) = plugin.gui_set_parent_hwnd(editor.hwnd_u64()) {
         // `editor` drops here → DestroyWindow. Attach failed so the plugin's
