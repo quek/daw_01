@@ -474,6 +474,7 @@ fn render_loop(
             playhead_beats,
             // export (freewheel render) は loop しない。
             false,
+            &mod_scalars_snapshot,
         );
 
         // docs/plan_modulation.md §7: record this buffer's follower envelopes

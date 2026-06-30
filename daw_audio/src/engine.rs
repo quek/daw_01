@@ -1026,6 +1026,7 @@ impl LocalState {
                 current_bpm,
                 self.playhead_beats,
                 looping,
+                &self.mod_scalars_snapshot,
             );
 
             // master bus fx chain。 全 track mix 後・metronome 前に直列 process
@@ -1810,6 +1811,9 @@ pub fn execute_schedule_post_dispatch(
     // group fx の transport snapshot 用 (= 積分済み拍位置 + 実 loop トグル)。
     playhead_beats: f64,
     looping: bool,
+    // B3 (r.md #8): group fx の PluginParam follower 変調 snapshot (track fx と同じ
+    // `mod_scalars_snapshot`)。 post-dispatch 段への plumbing。 空なら変調なし。
+    mod_scalars: &[f32],
 ) {
     // `nodes` の不変参照と `delay_lines` の可変参照を同時に取りたい
     // (ApplyDelay で line を引きながら nodes を回すため)。 `Schedule`
@@ -1892,6 +1896,7 @@ pub fn execute_schedule_post_dispatch(
                     current_bpm,
                     playhead_beats,
                     looping,
+                    mod_scalars,
                     *start_device,
                 );
             }
@@ -2325,6 +2330,8 @@ fn run_group_fx_chain(
     // group fx の transport snapshot (= 積分済み拍位置 + 実 loop トグル)。
     playhead_beats: f64,
     looping: bool,
+    // B3 (r.md #8): group fx PluginParam の follower 変調 snapshot。
+    mod_scalars: &[f32],
     // パラアウト (docs/plan_paraout.md): first device index to run. `0` for a
     // pure group / return (whole chain is bus FX). For a group-with-instrument
     // it's the prefix split point — the instrument `[0..start_device]` ran in
@@ -2376,7 +2383,7 @@ fn run_group_fx_chain(
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
         set_pd_transport(pd, Some(song), current_bpm, playhead_beats, looping);
-        // Phase 2b: group fx 宛 PluginParam automation。
+        // Phase 2b: group fx 宛 PluginParam automation + B3 (r.md #8) follower 変調。
         crate::automation::fill_pd_param_events(
             pd,
             song,
@@ -2387,9 +2394,10 @@ fn run_group_fx_chain(
             playhead,
             frames,
             recording_lanes,
-            // group/master fx の param follower 変調は follow-up (post-dispatch
-            // 段でのスナップショット plumbing 未配線)。 track param 変調が主用途。
-            &[],
+            // B3 (r.md #8): group fx PluginParam の follower 変調 snapshot を渡す
+            // (post-dispatch 段へ plumbing 済)。 master fx は automation lane の
+            // data model が無く未対応 (= 別 follow-up)。
+            mod_scalars,
         );
         if ports.has_audio_input {
             pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
@@ -2696,6 +2704,7 @@ mod sidechain_tests {
             song.bpm,
             0.0,
             false,
+            &[],
         );
 
         for i in 0..FRAMES {
