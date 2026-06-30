@@ -1126,6 +1126,12 @@ pub(crate) struct ArrLabelCache {
     pub(crate) track_names: std::collections::HashMap<u32, std::sync::Arc<str>>,
     pub(crate) content_labels:
         std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
+    /// D4 同件: section ruler / automation clip も同じ per-frame `Arc::from(&str)`
+    /// だった。 user 編集可能 (= intern 不可・無制限成長する) なので track/clip 名と
+    /// 同じ `song_epoch` 世代キャッシュで持つ。
+    pub(crate) section_names: std::collections::HashMap<u32, std::sync::Arc<str>>,
+    pub(crate) content_names:
+        std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
 }
 
 pub struct AppData {
@@ -3604,6 +3610,8 @@ impl AppData {
             if cache.epoch != self.song_epoch {
                 cache.track_names.clear();
                 cache.content_labels.clear();
+                cache.section_names.clear();
+                cache.content_names.clear();
                 for t in &self.song.tracks {
                     cache
                         .track_names
@@ -3613,6 +3621,17 @@ impl AppData {
                             crate::view::arrangement_view::clip_display_label(c, &self.song)
                         });
                     }
+                }
+                // D4 同件: section ruler / automation clip ラベルも世代キャッシュ。
+                for s in &self.song.sections {
+                    cache
+                        .section_names
+                        .insert(s.id, std::sync::Arc::from(s.name.as_str()));
+                }
+                for (cid, name) in &self.song.clip_content_names {
+                    cache
+                        .content_names
+                        .insert(*cid, std::sync::Arc::from(name.as_str()));
                 }
                 cache.epoch = self.song_epoch;
             }

@@ -188,6 +188,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (`AppData::arrangement_labels`)。 clip 単位の `clip_contents` 二重 lookup は
     // 下の clip `.map` で `content` を 1 度引いて使い回す形に済ませてある。
     let labels = app.arrangement_labels();
+    // D4 同件: lane build の context refs を束ねる (clippy too_many_arguments 回避)。
+    let lane_build_data = LaneBuildData {
+        song: &app.song,
+        refcount_by_content: &refcount_by_content,
+        lane_height_overrides: &app.automation_lane_row_overrides,
+        content_names: &labels.content_names,
+    };
     let tracks: Vec<ArrangementTrack> = app
         .song
         .tracks
@@ -347,9 +354,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             automation_lanes_collapsed: !app.expanded_automation_tracks.contains(&t.id),
             automation_lanes: build_arrangement_automation_lanes(
                 t,
-                &app.song,
-                &refcount_by_content,
-                &app.automation_lane_row_overrides,
+                lane_build_data,
                 &|tgt| app.plugin_param_range(t.id, tgt),
                 &|tgt| app.plugin_param_name(t.id, tgt),
             ),
@@ -526,9 +531,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let master_row_lanes = build_arrangement_lanes_from_slice(
         &app.song.song_lanes,
         common::model::MASTER_TRACK_ID,
-        &app.song,
-        &refcount_by_content,
-        &app.automation_lane_row_overrides,
+        lane_build_data,
         &|_| None,
         &|_| None,
     );
@@ -547,7 +550,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .iter()
         .map(|s| daw_ui_core::SectionView {
             id: s.id,
-            name: std::sync::Arc::from(s.name.as_str()),
+            name: labels
+                .section_names
+                .get(&s.id)
+                .cloned()
+                .unwrap_or_else(|| std::sync::Arc::from(s.name.as_str())),
             color: s.color,
             start_beat: s.start_beat,
             len_beats: s.len_beats,
@@ -2343,20 +2350,28 @@ pub(crate) fn clip_display_label(
 /// Phase 1 は track-builtin Volume / Pan / Mute のみ実装。 Plugin
 /// param / Song-level (tempo / time_sig) は Phase 2+ で IPC 経由の
 /// param info を受け取れるようになってから extend する。
+/// lane build の context (song + 各 lookup 表)。 引数を束ねて clippy
+/// `too_many_arguments` を避けつつ、 body は destructure で従来通り使う。
+/// `range_of` / `param_name_of` は track ごとに t.id を捕捉する closure なので
+/// struct には入れず直接渡す。
+#[derive(Clone, Copy)]
+struct LaneBuildData<'a> {
+    song: &'a common::model::Song,
+    refcount_by_content: &'a std::collections::HashMap<common::model::ContentId, usize>,
+    lane_height_overrides: &'a std::collections::HashMap<common::model::AutomationLaneKey, u16>,
+    content_names: &'a std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
+}
+
 fn build_arrangement_automation_lanes(
     track: &common::model::Track,
-    song: &common::model::Song,
-    refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
-    lane_height_overrides: &std::collections::HashMap<common::model::AutomationLaneKey, u16>,
+    data: LaneBuildData<'_>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
     param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<String>,
 ) -> Vec<ArrangementAutomationLane> {
     build_arrangement_lanes_from_slice(
         &track.automation_lanes,
         track.id,
-        song,
-        refcount_by_content,
-        lane_height_overrides,
+        data,
         range_of,
         param_name_of,
     )
@@ -2368,12 +2383,16 @@ fn build_arrangement_automation_lanes(
 fn build_arrangement_lanes_from_slice(
     lanes: &[common::model::AutomationLane],
     track_id: u32,
-    song: &common::model::Song,
-    refcount_by_content: &std::collections::HashMap<common::model::ContentId, usize>,
-    lane_height_overrides: &std::collections::HashMap<common::model::AutomationLaneKey, u16>,
+    data: LaneBuildData<'_>,
     range_of: &dyn Fn(&common::model::AutomationTarget) -> Option<(f64, f64)>,
     param_name_of: &dyn Fn(&common::model::AutomationTarget) -> Option<String>,
 ) -> Vec<ArrangementAutomationLane> {
+    let LaneBuildData {
+        song,
+        refcount_by_content,
+        lane_height_overrides,
+        content_names,
+    } = data;
     lanes
         .iter()
         .map(|lane| {
@@ -2409,7 +2428,10 @@ fn build_arrangement_lanes_from_slice(
                         id: c.id,
                         start_beat: c.start_beat,
                         len_beats: c.length_beats,
-                        name: Arc::from(song.content_name(c.content_id)),
+                        name: content_names
+                            .get(&c.content_id)
+                            .cloned()
+                            .unwrap_or_else(|| Arc::from(song.content_name(c.content_id))),
                         points,
                         // Phase 6 review perf: 旧 `clip_content_refcount`
                         // (= 全 clip scan, automation lane で N²) を draw 冒頭で
