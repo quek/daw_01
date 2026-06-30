@@ -1784,6 +1784,72 @@ impl Song {
     /// (sentinel) and ensures every referenced `content_id` has an
     /// entry in `clip_contents` (creating an empty one if missing —
     /// shouldn't happen in practice but keeps the invariant cheap).
+    /// project BPM が `old_bpm` → `new_bpm` に変わったとき、`StretchMode::Raw`
+    /// の audio clip を「実時間 (秒) 固定」で tempo に追従させる。Raw は source を
+    /// 元速度で鳴らす定義 (= Ableton Warp-off / Bitwig Raw) なので、tempo が変わると
+    /// 拍数で測った長さが変わる: BPM を倍にすると同じ秒数が倍の拍を占めるので、
+    /// グリッド上で 2 倍の長さに伸びる (`r.md` #7)。Stretch / Repitch / Slice は
+    /// 拍固定 (granular / tape で追従) なので対象外。
+    ///
+    /// 対象は「参照する `ClipContent::Audio` の **全 event が Raw**」な clip のみ。
+    /// その content の event 拍量 (`event_start_in_clip_beats` / `event_length_beats`
+    /// / fade) と、参照する各 clip の `length_beats` を `new_bpm / old_bpm` 倍する。
+    /// `Clip.start_beat` は拍位置に固定 (= テンポを変えても同じ小節から始まり、右へ
+    /// 伸びる)。content は pool 共有なので一度だけスケールし、参照する全 linked clip
+    /// の length をスケールする (audio clip は track 上にのみ置かれるので
+    /// automation_lanes / song_lanes は走査不要)。
+    ///
+    /// 秒固定の数学的定義: `secs = beats * 60 / bpm` を不変に保つ ⟺
+    /// `beats_new = beats_old * (new_bpm / old_bpm)`。退化入力 (bpm <= 0 / 非有限 /
+    /// 比 1.0) は no-op。Raw clip を 1 つ以上スケールしたら `true` を返す
+    /// (= 呼び出し側が再生 window 追従のため再 compile を送る合図)。
+    pub fn rescale_raw_clips_for_bpm(&mut self, old_bpm: f32, new_bpm: f32) -> bool {
+        if old_bpm <= 0.0 || new_bpm <= 0.0 || !old_bpm.is_finite() || !new_bpm.is_finite() {
+            return false;
+        }
+        let ratio = f64::from(new_bpm) / f64::from(old_bpm);
+        if (ratio - 1.0).abs() < f64::EPSILON {
+            return false;
+        }
+        // 1. Raw content (= 非空かつ全 event が Raw な Audio content) の event 拍量を
+        //    秒固定スケール。pool 走査なので共有 content も一度だけ。Raw と判定した
+        //    content の id を集めて、後段の clip 長スケールに使う。
+        let mut raw_content_ids: std::collections::HashSet<ContentId> =
+            std::collections::HashSet::new();
+        for (&cid, content) in self.clip_contents.iter_mut() {
+            let ClipContent::Audio(audio) = content else {
+                continue;
+            };
+            if audio.events.is_empty()
+                || !audio
+                    .events
+                    .iter()
+                    .all(|e| e.stretch_mode == StretchMode::Raw)
+            {
+                continue;
+            }
+            for event in &mut audio.events {
+                event.event_start_in_clip_beats *= ratio;
+                event.event_length_beats *= ratio;
+                event.fade_in_beats *= ratio;
+                event.fade_out_beats *= ratio;
+            }
+            raw_content_ids.insert(cid);
+        }
+        if raw_content_ids.is_empty() {
+            return false;
+        }
+        // 2. Raw content を参照する clip の length_beats をスケール (start_beat は固定)。
+        for track in &mut self.tracks {
+            for clip in &mut track.clips {
+                if raw_content_ids.contains(&clip.content_id) {
+                    clip.length_beats *= ratio;
+                }
+            }
+        }
+        true
+    }
+
     pub fn ensure_clip_contents(&mut self) {
         // Collect all live content_ids first so we can bump the counter
         // above the highest one before allocating new ids for sentinels.
@@ -6423,6 +6489,156 @@ mod tests {
         let video: ClipContent = serde_json::from_str(video_json).unwrap();
         assert!(matches!(audio, ClipContent::Audio(_)));
         assert!(matches!(video, ClipContent::Video(_)));
+    }
+
+    // ---- rescale_raw_clips_for_bpm (r.md #7) ----
+
+    fn rescale_event(mode: StretchMode, start: f64, len: f64) -> AudioEvent {
+        AudioEvent {
+            source_id: 1,
+            event_start_in_clip_beats: start,
+            event_length_beats: len,
+            source_start_frames: 0,
+            source_end_frames: 48_000,
+            stretch_mode: mode,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.25,
+            ..Default::default()
+        }
+    }
+
+    /// 1 track / 1 clip の Song を組み立て、(song, content_id) を返す。clip は
+    /// `start_beat` / `length_beats` に置かれ、与えた `events` の content を参照する。
+    fn rescale_song(events: Vec<AudioEvent>, start_beat: f64, length_beats: f64) -> (Song, ContentId) {
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents
+            .insert(cid, ClipContent::Audio(AudioContent { events }));
+        song.tracks = vec![Track {
+            id: 1,
+            clips: vec![Clip {
+                id: 1,
+                start_beat,
+                length_beats,
+                content_id: cid,
+                ..Default::default()
+            }],
+            next_clip_id: 2,
+            ..Track::default()
+        }];
+        (song, cid)
+    }
+
+    #[test]
+    fn rescale_raw_doubles_length_on_bpm_double() {
+        // Raw clip を BPM 120 → 240 (ratio 2.0)。event / clip の拍量は秒固定で 2 倍、
+        // clip.start_beat は拍固定。
+        let (mut song, cid) = rescale_song(vec![rescale_event(StretchMode::Raw, 1.0, 4.0)], 8.0, 4.0);
+        song.rescale_raw_clips_for_bpm(120.0, 240.0);
+        let ClipContent::Audio(a) = &song.clip_contents[&cid] else {
+            panic!("audio");
+        };
+        let ev = &a.events[0];
+        assert_eq!(ev.event_start_in_clip_beats, 2.0);
+        assert_eq!(ev.event_length_beats, 8.0);
+        assert_eq!(ev.fade_in_beats, 1.0);
+        assert_eq!(ev.fade_out_beats, 0.5);
+        let clip = &song.tracks[0].clips[0];
+        assert_eq!(clip.start_beat, 8.0, "start は拍固定");
+        assert_eq!(clip.length_beats, 8.0);
+    }
+
+    #[test]
+    fn rescale_raw_halves_length_on_bpm_half() {
+        let (mut song, cid) = rescale_song(vec![rescale_event(StretchMode::Raw, 2.0, 4.0)], 0.0, 4.0);
+        song.rescale_raw_clips_for_bpm(120.0, 60.0);
+        let ClipContent::Audio(a) = &song.clip_contents[&cid] else {
+            panic!("audio");
+        };
+        assert_eq!(a.events[0].event_length_beats, 2.0);
+        assert_eq!(a.events[0].event_start_in_clip_beats, 1.0);
+        assert_eq!(song.tracks[0].clips[0].length_beats, 2.0);
+    }
+
+    #[test]
+    fn rescale_leaves_non_raw_modes_untouched() {
+        // Stretch / Repitch / Slice は拍固定。一切変えない。
+        for mode in [StretchMode::Stretch, StretchMode::Repitch, StretchMode::Slice] {
+            let (mut song, cid) = rescale_song(vec![rescale_event(mode, 1.0, 4.0)], 0.0, 4.0);
+            song.rescale_raw_clips_for_bpm(120.0, 240.0);
+            let ClipContent::Audio(a) = &song.clip_contents[&cid] else {
+                panic!("audio");
+            };
+            assert_eq!(a.events[0].event_length_beats, 4.0, "{mode:?} 不変");
+            assert_eq!(a.events[0].event_start_in_clip_beats, 1.0, "{mode:?} 不変");
+            assert_eq!(song.tracks[0].clips[0].length_beats, 4.0, "{mode:?} 不変");
+        }
+    }
+
+    #[test]
+    fn rescale_skips_mixed_mode_content() {
+        // Raw と Stretch が混在する content は「全 event が Raw」でないので
+        // content / clip ともに据え置き (event 単位でなく clip 単位の判定)。
+        let (mut song, cid) = rescale_song(
+            vec![
+                rescale_event(StretchMode::Raw, 0.0, 2.0),
+                rescale_event(StretchMode::Stretch, 2.0, 2.0),
+            ],
+            0.0,
+            4.0,
+        );
+        song.rescale_raw_clips_for_bpm(120.0, 240.0);
+        let ClipContent::Audio(a) = &song.clip_contents[&cid] else {
+            panic!("audio");
+        };
+        assert_eq!(a.events[0].event_length_beats, 2.0);
+        assert_eq!(a.events[1].event_length_beats, 2.0);
+        assert_eq!(song.tracks[0].clips[0].length_beats, 4.0);
+    }
+
+    #[test]
+    fn rescale_shared_content_scales_once_all_clips() {
+        // 同一 Raw content を 2 clip が共有。content events は一度だけスケールされ、
+        // 参照する両 clip の length がスケールされる (start は各々固定)。
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Audio(AudioContent {
+                events: vec![rescale_event(StretchMode::Raw, 0.0, 4.0)],
+            }),
+        );
+        song.tracks = vec![Track {
+            id: 1,
+            clips: vec![
+                Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id: cid, ..Default::default() },
+                Clip { id: 2, start_beat: 16.0, length_beats: 4.0, content_id: cid, ..Default::default() },
+            ],
+            next_clip_id: 3,
+            ..Track::default()
+        }];
+        song.rescale_raw_clips_for_bpm(100.0, 150.0); // ratio 1.5
+        let ClipContent::Audio(a) = &song.clip_contents[&cid] else {
+            panic!("audio");
+        };
+        assert_eq!(a.events[0].event_length_beats, 6.0);
+        assert_eq!(song.tracks[0].clips[0].length_beats, 6.0);
+        assert_eq!(song.tracks[0].clips[1].length_beats, 6.0);
+        assert_eq!(song.tracks[0].clips[1].start_beat, 16.0, "start は拍固定");
+    }
+
+    #[test]
+    fn rescale_degenerate_inputs_are_noop() {
+        for (old, new) in [(0.0f32, 240.0f32), (120.0, 0.0), (f32::NAN, 240.0), (120.0, 120.0)] {
+            let (mut song, cid) = rescale_song(vec![rescale_event(StretchMode::Raw, 1.0, 4.0)], 0.0, 4.0);
+            song.rescale_raw_clips_for_bpm(old, new);
+            let ClipContent::Audio(a) = &song.clip_contents[&cid] else {
+                panic!("audio");
+            };
+            assert_eq!(a.events[0].event_length_beats, 4.0, "old={old} new={new}");
+            assert_eq!(a.events[0].event_start_in_clip_beats, 1.0, "old={old} new={new}");
+            assert_eq!(song.tracks[0].clips[0].length_beats, 4.0, "old={old} new={new}");
+        }
     }
 
     #[test]

@@ -196,9 +196,16 @@ pub fn decode_wav(path: &Path) -> Result<AudioSourceBuffer> {
 /// schedule. Sorted by `start_frame` ascending so the render loop can
 /// short-circuit once `start_frame >= buf_end`.
 ///
-/// Decode is synchronous on the caller (the IPC receive loop in Phase 1).
-/// Phase 2 moves decode to a background thread so >100 MB samples don't
-/// stall the receive loop.
+/// **Source reuse (r.md #7 decode 再設計 A):** `prev` is the live renderer
+/// (or `None`). Any source already decoded there is `Arc`-cloned instead of
+/// re-decoded, so a re-compile from a BPM change / edit / scrub does **zero**
+/// WAV decoding and never stalls the caller.
+///
+/// **`decode_missing` (B):** when `true`, sources absent from `prev` are
+/// decoded synchronously (used by the background decode worker and offline
+/// export). When `false`, they are skipped — their events drop out of the
+/// schedule (= momentarily silent) until the worker fills them in. This is the
+/// fast, non-blocking path the IPC receive loop takes on `LoadSong`.
 ///
 /// PR-V4: `AudioSourcePath::Generated` 経路 (= 旧 VOICEVOX `SetGenerated
 /// Audio` 経由で渡される generated buffer の参照) は廃止。 VOICEVOX 合成
@@ -207,8 +214,10 @@ pub fn decode_wav(path: &Path) -> Result<AudioSourceBuffer> {
 /// warn ログ + skip (= silent な audio として再生される)。
 pub fn compile_audio_schedule(
     song: &Song,
+    prev: Option<&AudioClipRenderer>,
     project_dir: Option<&Path>,
     engine_sample_rate: u32,
+    decode_missing: bool,
 ) -> AudioClipRenderer {
     let mut sources: HashMap<AudioSourceId, Arc<AudioSourceBuffer>> = HashMap::new();
     if engine_sample_rate == 0 || song.bpm <= 0.0 {
@@ -218,8 +227,22 @@ pub fn compile_audio_schedule(
     // 保持するので、 compile-time に samples_per_beat 換算は不要。 fade /
     // 範囲は beat のまま、 nominal_bpm = song.bpm を per-event に控える。
 
-    // -- Resolve every AudioSource into a decoded buffer (or skip on error) --
+    // -- Resolve every AudioSource into a decoded buffer ----------------------
     for (&id, source) in &song.audio_sources {
+        // (A) reuse an already-decoded buffer from the live renderer. Source ids
+        //     are stable and never recycled, so a matching id is the same file —
+        //     no re-decode needed (r.md #7 decode 再設計 A)。
+        if let Some(prev) = prev
+            && let Some(buf) = prev.sources.get(&id)
+        {
+            sources.insert(id, Arc::clone(buf));
+            continue;
+        }
+        // (B) not cached: decode now only if asked. Otherwise leave it out — its
+        //     events drop from the schedule until a later full compile fills it.
+        if !decode_missing {
+            continue;
+        }
         let buffer = match &source.path {
             AudioSourcePath::ProjectRelative(rel) => {
                 let Some(dir) = project_dir else {
@@ -338,6 +361,16 @@ pub fn compile_audio_schedule(
         "compiled audio schedule"
     );
     AudioClipRenderer { schedule, sources }
+}
+
+/// Does `song` reference any file-backed `AudioSource` that `renderer` has not
+/// decoded yet? `true` ⇒ the background decode worker must run a full compile to
+/// fill them in. `Generated` sources are excluded (never decoded here).
+pub fn has_undecoded_sources(song: &Song, renderer: &AudioClipRenderer) -> bool {
+    song.audio_sources.iter().any(|(id, source)| {
+        !matches!(source.path, AudioSourcePath::Generated { .. })
+            && !renderer.sources.contains_key(id)
+    })
 }
 
 /// Mix every audio event for `track_idx` into `track_l/track_r` for the

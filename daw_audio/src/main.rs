@@ -101,6 +101,20 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Background decode worker (r.md #7 decode 再設計 B): keeps large WAV
+    // decodes off the tokio receive loop. The receive loop publishes a
+    // reuse-only partial schedule instantly (zero decode), then hands the song
+    // here for full decode of any newly-added source.
+    let (decode_tx, decode_rx) = std::sync::mpsc::channel::<DecodeJob>();
+    {
+        let engine_shared = Arc::clone(&engine_shared);
+        let sr = session.sample_rate;
+        std::thread::Builder::new()
+            .name("audio-decode".to_string())
+            .spawn(move || decode_worker_loop(decode_rx, engine_shared, sr))
+            .context("failed to spawn audio decode worker")?;
+    }
+
     recv_loop(
         read_half,
         shared,
@@ -109,12 +123,82 @@ async fn main() -> Result<()> {
         session.sample_rate,
         cmd_tx,
         out_tx,
+        decode_tx,
     )
     .await;
     tracing::info!("daw_audio exiting");
     Ok(())
 }
 
+/// A request for the background decode worker: fully (re)compile the audio
+/// schedule for `song`, decoding any source not already cached in the live
+/// renderer. `generation` is the schedule version at dispatch — the worker
+/// drops its result if a newer `LoadSong` has bumped it, so a slow decode can't
+/// clobber a fresher schedule (r.md #7 decode 再設計 B)。
+struct DecodeJob {
+    song: Arc<common::model::Song>,
+    project_dir: Option<std::path::PathBuf>,
+    generation: u64,
+}
+
+/// Background decode worker loop. Owns a dedicated std::thread so large WAV
+/// decodes never stall the tokio IPC receive loop. Coalesces queued jobs to the
+/// newest (so a burst of imports doesn't decode intermediate states), reuses
+/// already-decoded buffers from the live renderer, decodes only the missing
+/// sources, and publishes the full renderer via `ArcSwap` — but only while its
+/// generation is still current.
+fn decode_worker_loop(
+    rx: std::sync::mpsc::Receiver<DecodeJob>,
+    engine_shared: Arc<EngineShared>,
+    session_sample_rate: u32,
+) {
+    while let Ok(mut job) = rx.recv() {
+        // Coalesce to the newest queued song so a flurry of imports/edits only
+        // decodes the final state, not every intermediate one.
+        while let Ok(newer) = rx.try_recv() {
+            job = newer;
+        }
+        if job.generation != engine_shared.schedule_generation.load(Ordering::Acquire) {
+            continue; // superseded before we started
+        }
+        let prev = engine_shared.audio_clip_renderer.load();
+        let prev_ref: &audio_clip_renderer::AudioClipRenderer = &prev;
+        let full = audio_clip_renderer::compile_audio_schedule(
+            &job.song,
+            Some(prev_ref),
+            job.project_dir.as_deref(),
+            session_sample_rate,
+            true,
+        );
+        // Publish only if no newer schedule has landed while we decoded
+        // (mutex-guarded so the generation check and the store are atomic).
+        publish_schedule(&engine_shared, job.generation, full);
+    }
+}
+
+/// Publish a freshly compiled renderer for `generation`, but only if no newer
+/// schedule has already been published. Serializes the receive loop's reuse-only
+/// partial and the decode worker's full renderer through a mutex so a slow
+/// decode for generation N can't clobber a newer N+1 that landed during the
+/// decode (the bare `schedule_generation` re-check has a TOCTOU window between
+/// its load and the `store`). Off the audio thread — the CPAL callback only ever
+/// `load()`s the `ArcSwap`, never this mutex (r.md #7 B)。
+fn publish_schedule(
+    engine_shared: &EngineShared,
+    generation: u64,
+    renderer: audio_clip_renderer::AudioClipRenderer,
+) {
+    let mut last = engine_shared
+        .last_published_generation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if generation >= *last {
+        engine_shared.audio_clip_renderer.store(Arc::new(renderer));
+        *last = generation;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn recv_loop(
     mut pipe: ReadHalf<NamedPipeClient>,
     shared: Arc<SharedState>,
@@ -123,6 +207,7 @@ async fn recv_loop(
     session_sample_rate: u32,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
     out_tx: tokio::sync::mpsc::UnboundedSender<ChildToMain>,
+    decode_tx: std::sync::mpsc::Sender<DecodeJob>,
 ) {
     loop {
         match read_msg::<_, MainToChild>(&mut pipe).await {
@@ -173,22 +258,45 @@ async fn recv_loop(
                 // これで下流の divisor (samples_per_beat 等) が NaN / 0 /
                 // 負値で壊れない。 idempotent。
                 song.sanitize_ranges();
-                // PR6: AudioClipRenderer を再 build (WAV decode + event
-                // schedule flatten)。 LoadSong は IPC 受信スレッドから
-                // 呼ばれるので decode はここで synchronous (Phase 2 で
-                // background 化、 docs/plan_audio_clip.md §11)。
                 let project_dir_g = engine_shared.project_dir.load();
                 let project_dir: Option<std::path::PathBuf> =
                     project_dir_g.as_ref().map(|arc| (**arc).clone());
-                let renderer = audio_clip_renderer::compile_audio_schedule(
+                // Bump the schedule version so any in-flight decode for an older
+                // song is discarded when it tries to publish (r.md #7 B)。
+                let generation = engine_shared
+                    .schedule_generation
+                    .fetch_add(1, Ordering::AcqRel)
+                    + 1;
+                let song = Arc::new(song);
+                // Phase 1: publish a reuse-only schedule synchronously. Sources
+                // already decoded in the live renderer are Arc-cloned (no
+                // decode), so BPM change / edit / scrub re-compile with zero
+                // decode and never block the receive loop. Sources not yet
+                // decoded are left out — their events stay silent until the
+                // worker fills them in.
+                let prev = engine_shared.audio_clip_renderer.load();
+                let prev_ref: &audio_clip_renderer::AudioClipRenderer = &prev;
+                let partial = audio_clip_renderer::compile_audio_schedule(
                     &song,
+                    Some(prev_ref),
                     project_dir.as_deref(),
                     session_sample_rate,
+                    false,
                 );
-                engine_shared
-                    .audio_clip_renderer
-                    .store(Arc::new(renderer));
-                shared.song.store(Some(Arc::new(song)));
+                let needs_decode =
+                    audio_clip_renderer::has_undecoded_sources(&song, &partial);
+                publish_schedule(&engine_shared, generation, partial);
+                shared.song.store(Some(Arc::clone(&song)));
+                // Phase 2: hand off to the background worker for full decode of
+                // any missing source. Skipped when everything was reusable
+                // (= BPM change / edit / scrub → decode ゼロ で即完結)。
+                if needs_decode {
+                    let _ = decode_tx.send(DecodeJob {
+                        song,
+                        project_dir,
+                        generation,
+                    });
+                }
             }
             Ok(MainToChild::SetMasterGain(g)) => {
                 let clamped = g.clamp(0.0, 1.0);
