@@ -493,7 +493,7 @@ pub(crate) fn composite_and_place<R: VideoFxRenderer>(
     let handle = if tc.fx.is_empty() {
         handle
     } else {
-        fx_engine.apply_chain(renderer, handle, cw, ch, &tc.fx)
+        fx_engine.apply_chain(renderer, handle, cw, ch, &tc.fx, u64::from(tc.track_id))
     };
     match tc.transform {
         Some(t) => {

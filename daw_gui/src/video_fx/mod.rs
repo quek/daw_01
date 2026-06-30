@@ -28,7 +28,26 @@ use std::collections::HashMap;
 
 use common::automation;
 use common::model::{AutomationLane, AutomationTarget, GroupTransform, ModRouting, Song, Track};
-use common::video_fx::{PassKind, VideoFxCategory, VideoFxDef, def_by_id};
+use common::video_fx::{PassKind, VideoFxCategory, VideoFxDef, VideoFxPass, def_by_id};
+
+/// chain_key for the master fx chain (track chains use the track id, which is a
+/// `u32` and never collides with this reserved value). B9 feedback / r.md #8.
+pub const MASTER_CHAIN_KEY: u64 = u64::MAX;
+
+/// 内部用パススルー効果。feedback chain の末で「今フレーム出力」を per-chain の前フレーム
+/// target へ退避 (blit) するのに使う (effect は src をそのまま返す)。`pipeline_for` は
+/// `&'static VideoFxDef` を要求するので const で持つ。
+static HISTORY_BLIT_FX: VideoFxDef = VideoFxDef {
+    id: "builtin.video.__history_blit",
+    name: "History Blit",
+    category: VideoFxCategory::Time,
+    params: &[],
+    passes: &[VideoFxPass {
+        kind: PassKind::Simple,
+        wgsl: "fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> { return src; }",
+    }],
+    needs_history: false,
+};
 use daw_ui_renderer::{OffscreenRenderer, Renderer, TextureHandle};
 
 use daw_ui_platform::WinitWindow;
@@ -300,6 +319,18 @@ struct SizePool {
     targets: Vec<PoolTarget>,
 }
 
+/// feedback (history) チェーンの前フレーム出力を保持する永続 target (B9 feedback / r.md #8)。
+/// pool と違い `end_frame` で解放せず frame を跨いで生き残る (= 残像の蓄積元)。`apply_chain`
+/// が chain 末で今フレームの出力をここへ退避し、次フレームの `history(uv)` がこれを読む。
+/// `idle` は連続未使用 frame 数 (使われなくなった chain の target を `end_frame` で破棄)。
+struct HistoryTarget {
+    handle: TextureHandle,
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    idle: u32,
+}
+
 /// 効果実行基盤。pipeline cache + sampler + bind group layout + target pool を所有。
 /// preview / export がそれぞれ 1 つ持つ (renderer に紐づくライフサイクル)。caller は frame ごとに
 /// [`VideoFxEngine::end_frame`] を 1 回呼んで in_use を解放する (= gui_01 の `end_cycle` 相当)。
@@ -309,6 +340,9 @@ pub struct VideoFxEngine {
     common: Option<CommonGpu>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     pool: HashMap<(u32, u32), SizePool>,
+    /// chain_key (= track id / master) ごとの前フレーム出力 target (feedback history)。
+    /// `apply_chain` が needs_history チェーンで維持・bind する (B9 feedback / r.md #8)。
+    history_targets: HashMap<u64, HistoryTarget>,
     /// 効果シェーダの `P.time`（秒）。ノイズ/スキャンライン/時間系効果の
     /// アニメに使う。preview/export 一致のため wall-clock でなく song 時間（playhead_beat ×
     /// 60/bpm）を caller が毎 frame [`set_time`](Self::set_time) で渡す。
@@ -343,6 +377,9 @@ impl VideoFxEngine {
             for t in sp.targets {
                 r.fx_destroy_texture(t.handle);
             }
+        }
+        for (_, ht) in self.history_targets.drain() {
+            r.fx_destroy_texture(ht.handle);
         }
         self.pipelines.clear();
     }
@@ -385,6 +422,21 @@ impl VideoFxEngine {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // binding 3 = 前フレーム出力 (feedback history)。`needs_history` 効果が
+                    // `history(uv)` で読む (B9 feedback / r.md #8)。それ以外の効果は宣言
+                    // しないので未使用 (wgpu はレイアウトの未使用 binding を許容)。bind group
+                    // は常にこの binding を埋める (history 効果は前フレーム target、それ以外は
+                    // 入力 texture を dummy として)。
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
                         },
                         count: None,
                     },
@@ -502,6 +554,19 @@ impl VideoFxEngine {
             }
         }
         self.pool.retain(|_, sp| !sp.targets.is_empty());
+
+        // feedback history targets: apply_chain が今 frame 使ったものは idle=0 に戻る。
+        // 連続 MAX_IDLE frame 使われなかった chain (= もう存在しない track / feedback 効果が
+        // 外された) の前フレーム target を破棄して VRAM を解放する。
+        self.history_targets.retain(|_, ht| {
+            ht.idle += 1;
+            if ht.idle > MAX_IDLE {
+                r.fx_destroy_texture(ht.handle);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// `src` (トラック合成画) に `chain` をチェーン順 (ping-pong) で適用し、結果の
@@ -517,15 +582,20 @@ impl VideoFxEngine {
         width: u32,
         height: u32,
         chain: &[ResolvedEffect],
+        // 前フレーム target を引く安定キー (track id / [`MASTER_CHAIN_KEY`])。feedback
+        // (history) チェーンのみ参照 (B9 feedback / r.md #8)。
+        chain_key: u64,
     ) -> TextureHandle {
-        // 実行可能パスを平坦化。Simple と SeparableBlur (H/V) は共に 1-in-1-out なので
+        // 実行可能パスを平坦化。Simple / SeparableBlur (H/V) / History は全て 1-in-1-out なので
         // 同じ ping-pong 経路で実行できる (assemble_module がパス種別ごとに WGSL を生成)。
-        // History は前フレーム出力を読む 2 入力パスで、安定 chain_key + 永続 target が要るため
-        // 別経路 (後続実装)。
+        // History パスは binding 3 (前フレーム出力) を `history(uv)` で読む。
         let mut passes: Vec<(&'static VideoFxDef, usize, &[f32])> = Vec::new();
         for eff in chain {
             for (pi, pass) in eff.def.passes.iter().enumerate() {
-                if matches!(pass.kind, PassKind::Simple | PassKind::SeparableBlur { .. }) {
+                if matches!(
+                    pass.kind,
+                    PassKind::Simple | PassKind::SeparableBlur { .. } | PassKind::History
+                ) {
                     passes.push((eff.def, pi, &eff.params));
                 }
             }
@@ -535,6 +605,16 @@ impl VideoFxEngine {
         }
 
         let format = r.fx_format();
+        // feedback (history) チェーンなら per-chain の前フレーム target を確保 (無ければ作成、
+        // 寸法変化で作り直し)。History パスはこの target を `history(uv)` で読み、chain 末で
+        // 今フレーム出力をここへ退避する。それ以外のチェーンでは binding 3 は入力 texture を
+        // dummy として埋める (シェーダが binding 3 を宣言しないので無視される)。
+        let needs_hist = chain.iter().any(|e| e.def.needs_history);
+        let hist_view = if needs_hist {
+            Some(self.ensure_history_target(r, chain_key, width, height, format))
+        } else {
+            None
+        };
         // この呼び出し専用の出力 target を確保 (frame 内 in_use で他レイヤーと分離)。単一パスは
         // 1 枚、複数パスは ping-pong 用に 2 枚。返した handle は end_frame まで上書きされないので、
         // 遅延描画 (frame 末に 1 回 render) でも同寸の他レイヤーと衝突しない。
@@ -579,6 +659,9 @@ impl VideoFxEngine {
                 return src;
             };
             let in_view = in_tex.create_view(&wgpu::TextureViewDescriptor::default());
+            // binding 3 = 前フレーム出力。feedback チェーンは前フレーム target、それ以外は
+            // 入力 texture を dummy として埋める (シェーダ未宣言なので無視される)。
+            let b3_view = hist_view.as_ref().unwrap_or(&in_view);
 
             let ubuf =
                 make_uniform_buffer(&device, def, params, resolution, texel, self.current_time);
@@ -597,6 +680,10 @@ impl VideoFxEngine {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: ubuf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(b3_view),
                     },
                 ],
             });
@@ -627,8 +714,98 @@ impl VideoFxEngine {
             use_t0 = !use_t0;
         }
 
+        // feedback: 今フレームの最終出力を前フレーム target へ退避 (= 次フレームの
+        // `history(uv)`)。History パスは上のループで OLD content を読み終えており、同一
+        // encoder 内なので pass 間 barrier 後にここで安全に上書きできる。passthrough
+        // pipeline で blit する (binding 3 は使わないので final 自身を dummy に埋める)。
+        if let Some(hist_view) = &hist_view
+            && let Some(final_tex) = r.fx_raw_texture(input).cloned()
+        {
+            let final_view = final_tex.create_view(&wgpu::TextureViewDescriptor::default());
+            let blit_pipeline = self.pipeline_for(&device, &HISTORY_BLIT_FX, 0, format);
+            let blit_ubuf = make_uniform_buffer(
+                &device,
+                &HISTORY_BLIT_FX,
+                &[],
+                resolution,
+                texel,
+                self.current_time,
+            );
+            let blit_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("video_fx history blit"),
+                layout: &self.ensure_common(&device).layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&final_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: blit_ubuf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&final_view),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("video_fx history blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: hist_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&blit_pipeline);
+            pass.set_bind_group(0, &blit_bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
         queue.submit(std::iter::once(encoder.finish()));
         input
+    }
+
+    /// feedback chain の前フレーム target を取得 (無ければ作成、寸法変化で作り直し)。今 frame
+    /// 使われたので `idle` を 0 に戻す。返り値はサンプル (history) / 描画 (blit 退避) 兼用 view。
+    fn ensure_history_target<R: VideoFxRenderer>(
+        &mut self,
+        r: &mut R,
+        chain_key: u64,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> wgpu::TextureView {
+        let recreate = self
+            .history_targets
+            .get(&chain_key)
+            .is_none_or(|ht| ht.width != width || ht.height != height);
+        if recreate {
+            if let Some(old) = self.history_targets.remove(&chain_key) {
+                r.fx_destroy_texture(old.handle);
+            }
+            let (handle, view) = r.fx_create_render_target(width, height, format);
+            self.history_targets
+                .insert(chain_key, HistoryTarget { handle, view, width, height, idle: 0 });
+        }
+        let ht = self
+            .history_targets
+            .get_mut(&chain_key)
+            .expect("history target just ensured");
+        ht.idle = 0;
+        ht.view.clone()
     }
 }
 
@@ -755,12 +932,33 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
 "#
             )
         }
-        // Simple / History は effect-body を呼ぶ標準 trailer (History は executor 未配線だが、
-        // 型網羅のため body 経路で組む)。
-        PassKind::Simple | PassKind::History => {
+        // Simple は effect-body をそのまま呼ぶ標準 trailer。
+        PassKind::Simple => {
             let body = def.passes[pass].wgsl;
             format!(
                 r#"
+{body}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {{
+    return effect(in.uv, sample(in.uv));
+}}
+"#
+            )
+        }
+        // History は前フレーム出力 (binding 3) を `history(uv)` で読めるよう、binding 宣言と
+        // ヘルパを effect-body の前に注入する (B9 feedback / r.md #8)。executor は apply_chain で
+        // この binding に per-chain の前フレーム target を bind し、chain 末で出力を退避する。
+        PassKind::History => {
+            let body = def.passes[pass].wgsl;
+            format!(
+                r#"
+@group(0) @binding(3) var hist_tex: texture_2d<f32>;
+
+fn history(uv: vec2<f32>) -> vec4<f32> {{
+    return textureSampleLevel(hist_tex, src_samp, uv, 0.0);
+}}
+
 {body}
 
 @fragment

@@ -656,7 +656,14 @@ fn build_frame_scene(
     if !master_fx.is_empty() {
         match offscreen.composite_scene_to_texture(scene, out_w, out_h) {
             Ok(handle) => {
-                let handle = fx_engine.apply_chain(offscreen, handle, out_w, out_h, &master_fx);
+                let handle = fx_engine.apply_chain(
+                    offscreen,
+                    handle,
+                    out_w,
+                    out_h,
+                    &master_fx,
+                    crate::video_fx::MASTER_CHAIN_KEY,
+                );
                 scene.primitives.clear();
                 scene.push_textured_quad(TexturedQuad {
                     rect: Rect::new(0.0, 0.0, out_w as f32, out_h as f32),

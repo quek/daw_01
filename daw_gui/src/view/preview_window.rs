@@ -441,8 +441,14 @@ impl PreviewWindowState {
                 }
                 match self.renderer.composite_scene_to_texture(&content, pw, ph) {
                     Ok(handle) => {
-                        let handle =
-                            self.fx_engine.apply_chain(&mut self.renderer, handle, pw, ph, &master_fx);
+                        let handle = self.fx_engine.apply_chain(
+                            &mut self.renderer,
+                            handle,
+                            pw,
+                            ph,
+                            &master_fx,
+                            crate::video_fx::MASTER_CHAIN_KEY,
+                        );
                         self.scene.push_textured_quad(TexturedQuad {
                             rect: daw_ui_renderer::Rect::new(
                                 project_box.0,

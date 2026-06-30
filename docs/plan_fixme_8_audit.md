@@ -123,10 +123,16 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
   起動時に事前確保し PDC/sidechain alignment の RT realloc を除去。 `rt-assert` 下の
   `assert_no_alloc` で「install が RT 上で alloc/free ゼロ」を証明 (logic + alloc-proof test green)。
 
-- **B9 (feedback)** — echo/残像トレイル系は `apply_chain` が「安定 chain_key + 永続
-  target が要るため別経路 (後続実装)」 と**著者自身が明示 deferral** 済み。 engine の
-  prior-frame texture 配線 (binding + persistent target + history() injection) を要する
-  framework 機能。
+- **B9 (feedback) 実装済** — Echo Trails (残像トレイル)。 executor に per-chain の前フレーム
+  target (`history_targets`) を新設し、 `apply_chain(chain_key)` で feedback chain のみ維持。
+  History パスは bind group 3 = 前フレーム target を `history(uv)` で sample、 chain 末で今フレーム
+  出力を passthrough blit で退避 (= 次フレームの history)。 binding 3 は全 bind group が埋める
+  (非 feedback 効果は入力 texture を dummy = シェーダ未宣言で無視)。 **2 フレーム readback test
+  (frame2 = black 入力でも前フレームの red trail が残る) で lifecycle を自動検証済 (green)** —
+  「安定 chain_key + 永続 target が要るため別経路」 の著者既定 deferral を解消。
+
+### 据え置き (理由付き — 上流 infra 待ち / 著者既定の deferral / unmeasured perf / 視覚 focused)
+
 - **B7 (VOICEVOX 埋込 GUI) / B12 (手動ワープ編集)** — waveform / preview 上の視覚 UI 操作が
   中核。 focused 実装 + 視覚 sign-off 要 (inspector 層は配置手戻りの実績あり、 blind 実装回避)。
 - **E1** — TSF text store は caret 位置のみ保持し per-char layout を持たない (= M3 残の

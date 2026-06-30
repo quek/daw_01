@@ -918,6 +918,45 @@ fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
     needs_history: false,
 };
 
+/// フィードバック残像トレイル (echo)。前フレーム出力 (`history(uv)`) を `decay` 倍して
+/// 現フレームに `max` 合成 → 動く被写体が発光の尾を引く。`needs_history` を見て executor が
+/// per-chain の前フレーム target を維持・bind する (B9 feedback / r.md #8)。
+const ECHO_TRAILS: VideoFxDef = VideoFxDef {
+    id: "builtin.video.echo_trails",
+    name: "Echo Trails",
+    category: VideoFxCategory::Time,
+    params: &[
+        VideoFxParam {
+            id: 0,
+            key: "decay",
+            name: "Decay",
+            kind: ParamKind::Scalar { min: 0.0, max: 0.99, default: 0.88, unit: Unit::None },
+        },
+        VideoFxParam {
+            id: 1,
+            key: "mix",
+            name: "Mix",
+            kind: ParamKind::Scalar { min: 0.0, max: 1.0, default: 1.0, unit: Unit::None },
+        },
+    ],
+    passes: &[VideoFxPass {
+        kind: PassKind::History,
+        wgsl: r#"
+fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
+    // 前フレーム出力を decay 倍した残像。
+    let prev = history(uv);
+    let trail_rgb = prev.rgb * P.decay;
+    let trail_a = prev.a * P.decay;
+    // 現フレームと残像を max 合成 (発光の尾)。
+    let echoed_rgb = max(src.rgb, trail_rgb);
+    let echoed_a = max(src.a, trail_a);
+    return vec4<f32>(mix(src.rgb, echoed_rgb, P.mix), mix(src.a, echoed_a, P.mix));
+}
+"#,
+    }],
+    needs_history: true,
+};
+
 static BUILTIN_VIDEO_FX: &[VideoFxDef] = &[
     TRANSFORM,
     // 色補正 / グレード
@@ -942,10 +981,11 @@ static BUILTIN_VIDEO_FX: &[VideoFxDef] = &[
     CHROMA_KEY,
     // ノイズ / 質感
     FILM_GRAIN,
-    // 時間系 (B9 / r.md #8)。 feedback (history) 系は engine 側の前フレーム texture
-    // 配線が別途必要なため Time 系のみ。
+    // 時間系 (B9 / r.md #8)。 feedback (history) 系は executor が per-chain の前フレーム
+    // target を維持して `history(uv)` に bind する (B9 feedback、 下記 ECHO_TRAILS)。
     STROBE,
     TIME_WOBBLE,
+    ECHO_TRAILS,
 ];
 
 /// 内蔵映像効果の正準リストを返す。`plugin_db::builtin_descriptors` /
