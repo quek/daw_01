@@ -104,7 +104,14 @@ impl WindowBackend for WinitWindow {
     }
 
     fn set_cursor(&self, cursor: CursorIcon) {
-        self.inner.set_cursor(map_cursor(cursor));
+        // E2 (r.md #8): `Hidden` は winit では cursor 形状でなく visibility の別 API。
+        // それ以外は visible に戻してから形状を設定する。
+        if cursor == CursorIcon::Hidden {
+            self.inner.set_cursor_visible(false);
+        } else {
+            self.inner.set_cursor_visible(true);
+            self.inner.set_cursor(map_cursor(cursor));
+        }
     }
 
     fn set_cursor_position(&self, x: f32, y: f32) {
@@ -360,9 +367,12 @@ pub fn map_button(b: WinitMouseBtn) -> MouseButton {
         WinitMouseBtn::Left => MouseButton::Left,
         WinitMouseBtn::Right => MouseButton::Right,
         WinitMouseBtn::Middle => MouseButton::Middle,
+        // E3 (r.md #8): Back / Forward を専用 variant に (旧実装は両方 Other(0xffff)
+        // に畳んで区別不能だった)。 winit 0.30 の MouseButton は Other(u16) が
+        // catch-all なのでこの match は exhaustive。
+        WinitMouseBtn::Back => MouseButton::Back,
+        WinitMouseBtn::Forward => MouseButton::Forward,
         WinitMouseBtn::Other(n) => MouseButton::Other(n),
-        // Back / Forward は Other に畳む (M1)
-        _ => MouseButton::Other(0xffff),
     }
 }
 
@@ -523,7 +533,8 @@ fn tsf_hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
 
 fn map_cursor(c: CursorIcon) -> WinitCursor {
     match c {
-        // Hidden は visibility 制御だが winit の API は別経路なので Default で代用 (M1)
+        // Hidden は set_cursor 側で set_cursor_visible(false) として処理する (E2)。
+        // ここへ来るのは visible path なので Default 形状にしておく。
         CursorIcon::Default | CursorIcon::Hidden => WinitCursor::Default,
         CursorIcon::Pointer => WinitCursor::Pointer,
         CursorIcon::Text => WinitCursor::Text,

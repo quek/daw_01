@@ -23,6 +23,10 @@ pub enum MouseButton {
     Left,
     Right,
     Middle,
+    /// サイドボタン「戻る」 (E3 / r.md #8: 旧実装は Forward と衝突し Other(0xffff))。
+    Back,
+    /// サイドボタン「進む」。
+    Forward,
     Other(u16),
 }
 
