@@ -32,7 +32,7 @@ use common::worker_bridge::WorkerBridgeHandle;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::audio_worker::AudioWorkerPool;
-use crate::graph::{BufRef, NodeOp, Schedule, compile_schedule};
+use crate::graph::{BufRef, NodeOp, Schedule};
 use crate::mixer::TrackScratch;
 use crate::sequencer::{NoteTransition, TimedNoteEvent, collect_events_for_buffer};
 
@@ -318,6 +318,21 @@ impl Default for EngineShared {
     }
 }
 
+/// Off-thread-compiled routing snapshot handed to the RT audio thread (D1 /
+/// PR3). `compile_schedule` + `TempoMap::from_song` (both heap-allocating) run
+/// on the receive loop / decode thread, not the audio callback. The song +
+/// schedule + tempo map are bundled into one `Arc` and published via
+/// [`EngineShared::pending_routing`]; the audio thread swaps it in with no
+/// allocation. The superseded snapshot is shipped back to the off-thread
+/// compiler via the recycle SPSC (`LocalState::routing_recycle_tx`) so its
+/// `Drop` (free) also runs off the audio thread — the RT path neither allocates
+/// nor frees on an edit.
+pub struct CompiledRouting {
+    pub song: Arc<Song>,
+    pub schedule: Schedule,
+    pub tempo_map: common::tempo_map::TempoMap,
+}
+
 /// Audio-thread-private engine state. Lives in the CPAL closure for the
 /// whole stream lifetime.
 /// Phase 7 B3 (2026-05-13): メトロノーム click voice (sine + linear envelope
@@ -398,6 +413,17 @@ pub struct LocalState {
     pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<AudioCommand>,
     /// Resources shared with the (future) export thread.
     pub shared: Arc<EngineShared>,
+    /// SPSC carrying freshly off-thread-compiled `CompiledRouting` snapshots
+    /// from the receive loop to the audio thread (D1 / PR3). The audio thread
+    /// `pop`s the newest (wait-free, no alloc — the value moves out of the
+    /// pre-allocated ring slot, so there is no `Arc` box to free either) and
+    /// swaps it into `cached_*`.
+    pub routing_rx: rtrb::Consumer<CompiledRouting>,
+    /// SPSC to ship superseded `CompiledRouting` snapshots back to the receive
+    /// loop for disposal (D1 / PR3). The audio thread `push`es the old snapshot
+    /// here (wait-free, no alloc) when it swaps in a newer one; the receive loop
+    /// `pop`s and drops them, so the `Drop` (free) runs off the audio thread.
+    pub routing_recycle_tx: rtrb::Producer<CompiledRouting>,
     /// Cached routing schedule. Recompiled (heap alloc) only when
     /// `cached_song` is `Arc::ptr_eq`-different from the current song
     /// snapshot, i.e. on user edits — not on every audio buffer. PR3
@@ -440,6 +466,8 @@ impl LocalState {
         max_frames: usize,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<AudioCommand>,
         shared: Arc<EngineShared>,
+        routing_rx: rtrb::Consumer<CompiledRouting>,
+        routing_recycle_tx: rtrb::Producer<CompiledRouting>,
     ) -> Self {
         let scratch = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
         Self {
@@ -453,6 +481,8 @@ impl LocalState {
             metronome_voice: None,
             cmd_rx,
             shared,
+            routing_rx,
+            routing_recycle_tx,
             cached_schedule: Schedule::empty(),
             mod_scalars_snapshot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
             cached_song: None,
@@ -471,55 +501,63 @@ impl LocalState {
         }
     }
 
-    /// Refresh `cached_schedule` if the snapshot Arc changed since the
-    /// last call. Heap allocation is concentrated here (called only on
-    /// edit-time transitions) so the steady-state RT path stays free of
-    /// `Vec` growth.
-    fn refresh_schedule(&mut self, current_song: Option<&Arc<Song>>, sample_rate: u32) {
-        let need_refresh = match (&self.cached_song, current_song) {
-            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
-            (None, Some(_)) => true,
-            _ => false,
-        };
-        if !need_refresh {
-            return;
+    /// Install the latest off-thread-compiled routing, if one was published
+    /// since the last buffer (D1 / PR3). The heap allocation that used to live
+    /// here — `compile_schedule` + `TempoMap::from_song` — now runs on the
+    /// receive loop / decode thread (`publish_routing`); this method only
+    /// *swaps* the pre-built `Schedule` / `TempoMap` / song `Arc` in (moves, no
+    /// allocation) and ships the superseded snapshot back via the recycle SPSC
+    /// so its `Drop` (free) also runs off the audio thread. The RT path neither
+    /// allocates nor frees on an edit.
+    fn refresh_schedule(&mut self) {
+        // Drain the forward ring, keeping only the newest snapshot. The value
+        // moves out of the pre-allocated ring slot — no allocation and no `Arc`
+        // box to free. Any intermediate snapshots the audio thread skipped past
+        // are recycled off-thread (their `Drop` must not run on the callback).
+        let mut newest: Option<CompiledRouting> = None;
+        while let Ok(snapshot) = self.routing_rx.pop() {
+            if let Some(skipped) = newest.replace(snapshot) {
+                let _ = self.routing_recycle_tx.push(skipped);
+            }
         }
-        if let Some(song_arc) = current_song {
-            match compile_schedule(song_arc.as_ref(), sample_rate) {
-                Ok(s) => self.cached_schedule = s,
-                Err(e) => {
-                    // Routing is broken (cycle / dangling parent_group_id);
-                    // fall back to the empty schedule (silent master) so
-                    // the user sees the problem rather than mysterious audio.
-                    tracing::warn!(?e, "graph compile failed; master goes silent");
-                    self.cached_schedule = Schedule::empty();
-                }
+        let Some(new) = newest else {
+            return;
+        };
+        let old_schedule = std::mem::replace(&mut self.cached_schedule, new.schedule);
+        let old_tempo = std::mem::replace(&mut self.tempo_map, new.tempo_map);
+        let old_song = self.cached_song.replace(new.song);
+
+        // PR4.5 sidechain plugin-internal alignment: ensure each TrackScratch's
+        // input_delay_line has enough capacity for the freshly installed
+        // schedule. Pre-allocated to `INPUT_DELAY_PREALLOC_SAMPLES` in
+        // `TrackScratch::new`, so this loop never reallocates for any real
+        // plugin's latency; the grow path remains only for the pathological
+        // >1 s case (which no real plugin hits). DelayLine.step_in_place clamps
+        // `delay >= cap` to `cap - 1`, so capacity must be `delay + 1`.
+        for (i, &delay) in self.cached_schedule.input_delay_per_track.iter().enumerate() {
+            if i >= self.scratch.len() {
+                break;
             }
-            self.cached_song = Some(Arc::clone(song_arc));
-            // A10 (r.md #8): tempo map を song 変化時に再構築 (seek / loop-wrap で
-            // playhead を tempo automation に沿って sample→beat 逆算するため)。
-            self.tempo_map = common::tempo_map::TempoMap::from_song(song_arc.as_ref());
-            // PR4.5 sidechain plugin-internal alignment: ensure each
-            // TrackScratch's input_delay_line has enough capacity for the
-            // newly compiled schedule. Reallocates only when capacity needs
-            // to grow (and only at edit-time, never in the RT buffer
-            // dispatch). DelayLine.step_in_place clamps `delay >= cap`
-            // requests to `cap - 1`, so capacity must be `delay + 1`.
-            for (i, &delay) in self
-                .cached_schedule
-                .input_delay_per_track
-                .iter()
-                .enumerate()
-            {
-                if i >= self.scratch.len() {
-                    break;
-                }
-                let need_cap = delay as usize + 1;
-                if delay > 0 && self.scratch[i].input_delay_line.capacity() < need_cap {
-                    self.scratch[i].input_delay_line =
-                        crate::graph::DelayLine::with_capacity(need_cap);
-                }
+            let need_cap = delay as usize + 1;
+            if delay > 0 && self.scratch[i].input_delay_line.capacity() < need_cap {
+                self.scratch[i].input_delay_line =
+                    crate::graph::DelayLine::with_capacity(need_cap);
             }
+        }
+
+        // Recycle the superseded snapshot off the audio thread. The very first
+        // install has no prior song; its old schedule/tempo are the empty/
+        // default initial values (no heap), cheap to drop here.
+        if let Some(old_song) = old_song {
+            let recycled = CompiledRouting {
+                song: old_song,
+                schedule: old_schedule,
+                tempo_map: old_tempo,
+            };
+            // If the recycle ring is somehow full (a burst the receive loop
+            // hasn't drained — not reachable with human-paced edits), drop here
+            // as a last resort rather than leak.
+            let _ = self.routing_recycle_tx.push(recycled);
         }
     }
 
@@ -705,8 +743,13 @@ impl LocalState {
         // Refresh the cached routing schedule before the dispatch starts
         // so the master mix step sees the right node order. `refresh_schedule`
         // is a no-op when the song Arc hasn't changed.
-        let song_snapshot = shared.song.load();
-        self.refresh_schedule(song_snapshot.as_ref(), sample_rate);
+        self.refresh_schedule();
+        // The song now travels with the routing snapshot installed above, so the
+        // RT reads it from `cached_song` (consistent with `cached_schedule`)
+        // rather than re-loading the separately-published `shared.song`. The
+        // `Arc` clone is a wait-free refcount bump (no heap), releasing the
+        // borrow so the hot path can still take `&mut self` below.
+        let song_snapshot = self.cached_song.clone();
 
         let n = frames;
         self.master_l[..n].fill(0.0);
@@ -2958,5 +3001,141 @@ mod send_tests {
         let other = &song.tracks[2];
         let other_excluded = any_solo && !other.solo && !song.ancestor_soloed(other.id);
         assert!(other_excluded, "unrelated track is silenced while a group is soloed");
+    }
+}
+
+/// D1 / PR3: off-thread routing publish → wait-free RT install → off-thread
+/// recycle. Verifies the audio thread picks up the newest schedule, hands the
+/// superseded one back for disposal, coalesces bursts, and (under `rt-assert`)
+/// performs the install with zero allocation/free on the audio thread.
+#[cfg(test)]
+mod routing_publish_tests {
+    use super::*;
+    use crate::graph::compile_schedule;
+    use common::model::{Song, Track};
+
+    fn track(id: u32) -> Track {
+        // See `sidechain_tests::track` for why a default + mutate (not a struct
+        // literal) is required here.
+        let mut t = Track::default();
+        t.id = id;
+        t
+    }
+
+    fn make_routing(song: &Arc<Song>) -> CompiledRouting {
+        CompiledRouting {
+            song: Arc::clone(song),
+            schedule: compile_schedule(song, 48_000).unwrap(),
+            tempo_map: common::tempo_map::TempoMap::from_song(song),
+        }
+    }
+
+    /// A `LocalState` plus the off-thread ends of the forward + recycle rings,
+    /// so a test can publish snapshots and inspect what got recycled.
+    fn harness() -> (
+        LocalState,
+        rtrb::Producer<CompiledRouting>,
+        rtrb::Consumer<CompiledRouting>,
+    ) {
+        let shared = Arc::new(EngineShared::new());
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (routing_tx, routing_rx) = rtrb::RingBuffer::new(8);
+        let (recycle_tx, recycle_rx) = rtrb::RingBuffer::new(8);
+        let local = LocalState::new(
+            common::process_data::MAX_FRAMES,
+            cmd_rx,
+            shared,
+            routing_rx,
+            recycle_tx,
+        );
+        (local, routing_tx, recycle_rx)
+    }
+
+    #[test]
+    fn refresh_installs_published_routing_and_recycles_the_old() {
+        let (mut local, mut routing_tx, mut recycle_rx) = harness();
+
+        let mut s1 = Song::default();
+        s1.tracks.push(track(1));
+        s1.tracks.push(track(2));
+        let s1 = Arc::new(s1);
+        routing_tx.push(make_routing(&s1)).unwrap();
+
+        local.refresh_schedule();
+        assert!(
+            local.cached_song.as_ref().is_some_and(|s| Arc::ptr_eq(s, &s1)),
+            "first publish installs its song"
+        );
+        // First install has no predecessor → nothing recycled.
+        assert!(recycle_rx.pop().is_err());
+
+        let mut s2 = Song::default();
+        s2.tracks.push(track(7));
+        let s2 = Arc::new(s2);
+        routing_tx.push(make_routing(&s2)).unwrap();
+
+        local.refresh_schedule();
+        assert!(
+            local.cached_song.as_ref().is_some_and(|s| Arc::ptr_eq(s, &s2)),
+            "second publish installs its song"
+        );
+        // The superseded snapshot (s1) is handed back for off-thread disposal.
+        let recycled = recycle_rx.pop().expect("old routing recycled off-thread");
+        assert!(Arc::ptr_eq(&recycled.song, &s1));
+    }
+
+    #[test]
+    fn refresh_coalesces_a_burst_to_newest_and_recycles_intermediates() {
+        let (mut local, mut routing_tx, mut recycle_rx) = harness();
+        let songs: Vec<Arc<Song>> = (0..3)
+            .map(|i| {
+                let mut s = Song::default();
+                s.tracks.push(track(i + 1));
+                Arc::new(s)
+            })
+            .collect();
+        for s in &songs {
+            routing_tx.push(make_routing(s)).unwrap();
+        }
+        // One refresh drains all three: installs the last, recycles the two it
+        // skipped past. (The first install has no predecessor of its own.)
+        local.refresh_schedule();
+        assert!(
+            local
+                .cached_song
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &songs[2]))
+        );
+        let mut recycled = 0;
+        while recycle_rx.pop().is_ok() {
+            recycled += 1;
+        }
+        assert_eq!(recycled, 2, "the two skipped snapshots are recycled off-thread");
+    }
+
+    /// Proof of the D1 invariant: a steady-state install allocates and frees
+    /// nothing on the audio thread. Requires the `rt-assert` allocator hook.
+    #[cfg(feature = "rt-assert")]
+    #[test]
+    fn refresh_schedule_does_not_allocate_on_the_audio_thread() {
+        let (mut local, mut routing_tx, _recycle_rx) = harness();
+
+        let mut s1 = Song::default();
+        s1.tracks.push(track(1));
+        let s1 = Arc::new(s1);
+        routing_tx.push(make_routing(&s1)).unwrap();
+        local.refresh_schedule(); // warm up (first install, no recycle)
+
+        let mut s2 = Song::default();
+        s2.tracks.push(track(1));
+        s2.tracks.push(track(2));
+        let s2 = Arc::new(s2);
+        routing_tx.push(make_routing(&s2)).unwrap();
+
+        // Steady-state install: pop the newest, swap the cached fields, push the
+        // old to the recycle ring — all wait-free, no alloc, no free.
+        assert_no_alloc::assert_no_alloc(|| {
+            local.refresh_schedule();
+        });
     }
 }

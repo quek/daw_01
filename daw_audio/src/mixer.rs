@@ -13,6 +13,12 @@ use crate::sequencer::{PerTrackState, TimedNoteEvent};
 pub const MAX_FRAMES: usize = common::process_data::MAX_FRAMES;
 pub const MAX_EVENTS: usize = common::process_data::MAX_EVENTS;
 
+/// Pre-allocated capacity (samples per channel) for each track's input delay
+/// line, so PDC / sidechain alignment never reallocates on the audio thread
+/// (D1 / PR3). 48000 = 1 s at 48 kHz — comfortably above any real plugin's
+/// reported latency.
+const INPUT_DELAY_PREALLOC_SAMPLES: usize = 48_000;
+
 #[repr(align(64))]
 pub struct TrackScratch {
     /// Per-track audio output (left). Reduced into the master bus after
@@ -83,7 +89,12 @@ impl TrackScratch {
             peak_l: 0.0,
             peak_r: 0.0,
             effective_mute: false,
-            input_delay_line: DelayLine::with_capacity(0),
+            // D1 / PR3: pre-allocate the sidechain/PDC input delay ring so the
+            // `refresh_schedule` alignment step never reallocates on the audio
+            // thread. `INPUT_DELAY_PREALLOC_SAMPLES` (1 s @ 48 kHz) is above any
+            // real plugin's reported latency; the refresh path still grows it
+            // for the pathological >1 s case (which no real plugin hits).
+            input_delay_line: DelayLine::with_capacity(INPUT_DELAY_PREALLOC_SAMPLES),
             volume_per_sample: vec![1.0; MAX_FRAMES],
             pan_per_sample: vec![0.0; MAX_FRAMES],
             pre_fader_l: vec![0.0; MAX_FRAMES],

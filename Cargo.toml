@@ -46,6 +46,9 @@ libloading = "0.8"
 midir = "0.10"
 midly = "0.5"
 rfd = "0.15"
+# wait-free SPSC ring for the RT audio thread to hand superseded routing
+# schedules back to the off-thread compiler for disposal (D1: zero RT alloc/free).
+rtrb = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shared_memory = "0.12"

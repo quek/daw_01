@@ -114,8 +114,14 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
   録音 lane / 実 plugin param 名 / sidechain tap point UI / song-level tempo 変調 /
   warp marker (granular consume + auto-warp `Alt+W`、 test) / 他。
 - **B9 (time) 実装済** — Strobe / Time Wobble (catalog WGSL test green)。
-
-### 据え置き (理由付き — 上流 infra 待ち / 著者既定の deferral / unmeasured perf / 視覚 focused)
+- **D1 実装済** — routing schedule の compile (Vec/HashMap alloc) + `TempoMap::from_song` を
+  RT audio callback から完全に追い出した (engine.rs の `TODO(PR3)` 解消)。 receive loop /
+  decode スレッドで `CompiledRouting {song, schedule, tempo_map}` を compile し、 wait-free
+  SPSC (`rtrb`) で audio thread へ forward。 RT は ring から **owned 値を pop して swap-in
+  するだけ** (alloc 無し、 Arc box も無いので free 無し)。 差し替えた古い snapshot は recycle
+  SPSC で受信ループへ送り返し、 `Drop` (free) も RT 外で走る。 scratch `input_delay_line` も
+  起動時に事前確保し PDC/sidechain alignment の RT realloc を除去。 `rt-assert` 下の
+  `assert_no_alloc` で「install が RT 上で alloc/free ゼロ」を証明 (logic + alloc-proof test green)。
 
 - **B9 (feedback)** — echo/残像トレイル系は `apply_chain` が「安定 chain_key + 永続
   target が要るため別経路 (後続実装)」 と**著者自身が明示 deferral** 済み。 engine の
@@ -128,9 +134,6 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
   fallback より悪化する。 **上流 infra 待ち**。
 - **E5** — granular grain-trigger lock-in は per-event の source-position accumulator
   (再生跨ぎ状態) を要する stateful DSP。 現状は LP smoothing で緩和済 (低優先)。
-- **D1** — routing compile の off-thread 化。 alloc は**稀な edit-buffer 上のみ**
-  (steady-state でない、 既存コメントが容認する設計) + delay-line resize が別 RT alloc
-  として残るため zero-RT-alloc は単独では達成不可。 低価値 structural として据え置き。
 - **D2** — undo の全 Song snapshot → 差分化は全 undoable action を触る大 refactor。 現行
   snapshot undo は正しく動作 (perf低)。
 - **D3/D4** — per-frame の track/clip 名 `Arc::from` / lane label `format!` は小 alloc

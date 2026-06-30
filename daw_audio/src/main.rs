@@ -89,6 +89,19 @@ async fn main() -> Result<()> {
     let (cmd_tx, cmd_rx) =
         tokio::sync::mpsc::unbounded_channel::<engine::AudioCommand>();
 
+    // D1 / PR3: wait-free SPSC for the audio thread to hand superseded routing
+    // snapshots back to the receive loop for disposal, so neither the off-thread
+    // `compile_schedule` (alloc) nor the old snapshot's `Drop` (free) runs on the
+    // audio callback. 64 slots is far above the edits-between-drains a human can
+    // produce; the receive loop drains it on every command.
+    let (routing_recycle_tx, routing_recycle_rx) =
+        rtrb::RingBuffer::<engine::CompiledRouting>::new(64);
+    // Forward ring: the receive loop pushes freshly off-thread-compiled routing
+    // here, the audio thread pops the newest. Small — the audio thread drains it
+    // every buffer, so it never holds more than the edits landed in one ~10 ms
+    // window.
+    let (routing_tx, routing_rx) = rtrb::RingBuffer::<engine::CompiledRouting>::new(8);
+
     let _stream = start_output_stream(
         Arc::clone(&shared),
         Arc::clone(&engine_shared),
@@ -97,6 +110,8 @@ async fn main() -> Result<()> {
         Arc::clone(&master_gain),
         session.sample_rate,
         cmd_rx,
+        routing_rx,
+        routing_recycle_tx,
     )
     .context("failed to start audio stream")?;
     tracing::info!("audio stream running");
@@ -140,6 +155,8 @@ async fn main() -> Result<()> {
         cmd_tx,
         out_tx,
         decode_tx,
+        routing_tx,
+        routing_recycle_rx,
     )
     .await;
     tracing::info!("daw_audio exiting");
@@ -214,6 +231,41 @@ fn publish_schedule(
     }
 }
 
+/// Compile the routing schedule + tempo map for `song` **off the audio thread**
+/// and publish them (bundled with the song) into `EngineShared::pending_routing`
+/// for the RT thread to swap in with zero allocation (D1 / PR3 — the alloc that
+/// used to run in `LocalState::refresh_schedule` on the audio callback). Also
+/// refreshes the separately-published `shared.song` that off-thread readers
+/// (preview helpers, `update_song_track`) consult. A `compile_schedule` failure
+/// falls back to an empty schedule (silent master) so a broken graph is audible
+/// as silence rather than mysterious audio — mirroring the old RT-side behavior.
+fn publish_routing(
+    routing_tx: &mut rtrb::Producer<engine::CompiledRouting>,
+    shared: &engine::SharedState,
+    song: Arc<common::model::Song>,
+    sample_rate: u32,
+) {
+    let schedule = match crate::graph::compile_schedule(&song, sample_rate) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(?e, "graph compile failed; master goes silent");
+            crate::graph::Schedule::empty()
+        }
+    };
+    let tempo_map = common::tempo_map::TempoMap::from_song(&song);
+    // Off-thread readers (preview / update_song_track) see the song here.
+    shared.song.store(Some(Arc::clone(&song)));
+    // Hand the freshly compiled routing to the audio thread. If the ring is full
+    // (the audio thread hasn't drained — not reachable at human edit rates), the
+    // snapshot is dropped here and the previous routing stays in effect until the
+    // next edit, rather than blocking.
+    if let Err(rtrb::PushError::Full(_dropped)) =
+        routing_tx.push(engine::CompiledRouting { song, schedule, tempo_map })
+    {
+        tracing::warn!("routing ring full; schedule update deferred to next edit");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn recv_loop(
     mut pipe: ReadHalf<NamedPipeClient>,
@@ -224,8 +276,17 @@ async fn recv_loop(
     cmd_tx: tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
     out_tx: tokio::sync::mpsc::UnboundedSender<ChildToMain>,
     decode_tx: std::sync::mpsc::Sender<DecodeJob>,
+    mut routing_tx: rtrb::Producer<engine::CompiledRouting>,
+    mut routing_recycle_rx: rtrb::Consumer<engine::CompiledRouting>,
 ) {
     loop {
+        // D1 / PR3: dispose routing snapshots the audio thread superseded, so
+        // their `Drop` (free) runs here, off the audio callback. Drained on
+        // every message; snapshots only accumulate while the user is editing,
+        // which is exactly when messages keep arriving.
+        while let Ok(old) = routing_recycle_rx.pop() {
+            drop(old);
+        }
         match read_msg::<_, MainToChild>(&mut pipe).await {
             Ok(MainToChild::Play) => {
                 tracing::info!("received Play");
@@ -302,7 +363,10 @@ async fn recv_loop(
                 let needs_decode =
                     audio_clip_renderer::has_undecoded_sources(&song, &partial);
                 publish_schedule(&engine_shared, generation, partial);
-                shared.song.store(Some(Arc::clone(&song)));
+                // D1 / PR3: compile the routing schedule + tempo map off the
+                // audio thread and publish for wait-free pickup (this also
+                // refreshes `shared.song`).
+                publish_routing(&mut routing_tx, &shared, Arc::clone(&song), session_sample_rate);
                 // Phase 2: hand off to the background worker for full decode of
                 // any missing source. Skipped when everything was reusable
                 // (= BPM change / edit / scrub → decode ゼロ で即完結)。
@@ -362,28 +426,28 @@ async fn recv_loop(
             // index 解釈していて、 GUI 側との順序ずれで違う track を操作する
             // race リスクがあった。 id lookup で stable 化。
             Ok(MainToChild::SetTrackVolume { track, volume }) => {
-                update_song_track(&shared, |s| {
+                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.volume = volume.clamp(0.0, 1.0);
                     }
                 });
             }
             Ok(MainToChild::SetTrackPan { track, pan }) => {
-                update_song_track(&shared, |s| {
+                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.pan = pan.clamp(-1.0, 1.0);
                     }
                 });
             }
             Ok(MainToChild::SetTrackMuted { track, muted }) => {
-                update_song_track(&shared, |s| {
+                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.muted = muted;
                     }
                 });
             }
             Ok(MainToChild::SetTrackSolo { track, solo }) => {
-                update_song_track(&shared, |s| {
+                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.solo = solo;
                     }
@@ -397,7 +461,7 @@ async fn recv_loop(
                 // Realtime aux-send level. Same lightweight clone-mutate-
                 // store path as SetTrackVolume — the MixSend op re-reads
                 // this live (ramped) without recompiling the schedule.
-                update_song_track(&shared, |s| {
+                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track)
                         && let Some(send) = t.sends.get_mut(send_idx as usize)
                     {
@@ -410,7 +474,7 @@ async fn recv_loop(
                 send_idx,
                 enabled,
             }) => {
-                update_song_track(&shared, |s| {
+                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track)
                         && let Some(send) = t.sends.get_mut(send_idx as usize)
                     {
@@ -423,7 +487,7 @@ async fn recv_loop(
                 // 録音書き込み自体は GUI process で行うため audio thread 側
                 // は schema 一貫性のために値を持つだけ。 将来の audio input
                 // 録音で audio thread 側書き込みに使う想定。
-                update_song_track(&shared, |s| {
+                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.armed = armed;
                     }
@@ -435,13 +499,13 @@ async fn recv_loop(
                 // mutate → store の atomic publish。 BPM scrub drag 中の毎
                 // frame 入力で audio engine が即時追随する。
                 let clamped = bpm.clamp(1.0, 400.0);
-                update_song_track(&shared, |s| {
+                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
                     s.bpm = clamped;
                 });
             }
             Ok(MainToChild::SetSongTimeSigNumerator { num }) => {
                 let clamped = num.clamp(1, 32);
-                update_song_track(&shared, |s| {
+                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
                     s.time_sig.0 = clamped;
                 });
             }
@@ -905,8 +969,12 @@ fn preview_track_index(shared: &Arc<engine::SharedState>, track_id: u32) -> Opti
         .filter(|&i| i < engine::MAX_TRACKS)
 }
 
-fn update_song_track<F>(shared: &Arc<engine::SharedState>, f: F)
-where
+fn update_song_track<F>(
+    shared: &Arc<engine::SharedState>,
+    routing_tx: &mut rtrb::Producer<engine::CompiledRouting>,
+    sample_rate: u32,
+    f: F,
+) where
     F: FnOnce(&mut common::model::Song),
 {
     let snapshot = shared.song.load();
@@ -915,7 +983,9 @@ where
     };
     let mut next = song.clone();
     f(&mut next);
-    shared.song.store(Some(Arc::new(next)));
+    // D1 / PR3: republish the routing (schedule compiled off the audio thread)
+    // so the edit reaches the RT via the forward ring, not an RT-side recompile.
+    publish_routing(routing_tx, shared, Arc::new(next), sample_rate);
 }
 
 /// Open the per-plugin `ProcessData` shmem and ship a `PluginRef` to the
@@ -945,6 +1015,7 @@ fn handle_open_plugin_shmem(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_output_stream(
     shared: Arc<SharedState>,
     engine_shared: Arc<EngineShared>,
@@ -953,6 +1024,8 @@ fn start_output_stream(
     master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<engine::AudioCommand>,
+    routing_rx: rtrb::Consumer<engine::CompiledRouting>,
+    routing_recycle_tx: rtrb::Producer<engine::CompiledRouting>,
 ) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
@@ -991,6 +1064,8 @@ fn start_output_stream(
         master_gain,
         session_sample_rate,
         cmd_rx,
+        routing_rx,
+        routing_recycle_tx,
     )?;
     stream.play().context("failed to start stream")?;
     Ok(stream)
@@ -1008,13 +1083,16 @@ fn build_stream(
     master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<engine::AudioCommand>,
+    routing_rx: rtrb::Consumer<engine::CompiledRouting>,
+    routing_recycle_tx: rtrb::Producer<engine::CompiledRouting>,
 ) -> Result<cpal::Stream> {
     let channels_usize = channels as usize;
     let max_frames = common::process_data::MAX_FRAMES;
     // `LocalState` is the CPAL closure's exclusive heap. It holds
     // master_l/r and the per-track scratch — pre-allocated here, never
     // touched outside the audio thread.
-    let mut local = LocalState::new(max_frames, cmd_rx, engine_shared);
+    let mut local =
+        LocalState::new(max_frames, cmd_rx, engine_shared, routing_rx, routing_recycle_tx);
 
     // panic-button master declick. `MainToChild::Panic` sets
     // `shared.panic_declick`; the callback consumes that edge and fades the
