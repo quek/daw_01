@@ -152,10 +152,9 @@ pub(crate) fn push_mod_drag_resync(
 /// `scrub_field` の `scrub_key` から modulation target と表示↔model 変換を導く。
 /// `None` = 変調対象でない field (clip-level gain / pan / pitch / fade 等)。
 /// per-control 対象は **`cursor_modulatable_targets` と同集合**に厳密に揃える
-/// (ラックで見えない/外せない routing を作らないため)。text は X/Y/Opacity/
-/// Rotation/FontSize のみ対象 — text W/H・色・outline・shadow は
-/// `cursor_modulatable_targets` の TextBuiltin 集合に含まれないので **意図的に除外**
-/// (image は W/H も対象だが text W/H はラック側が未対応なので非対称は許容)。
+/// (ラックで見えない/外せない routing を作らないため)。text は X/Y/W/H/Opacity/
+/// Rotation/FontSize が対象 (B10 r.md #8: text_compose の resolve_norm が W/H にも
+/// modulation を適用しているので image と対称化。 色・outline・shadow は引き続き対象外)。
 pub(crate) fn scrub_field_mod(
     scrub_key: InspectorScrubField,
 ) -> Option<(AutomationTarget, ModControlDomain)> {
@@ -170,6 +169,8 @@ pub(crate) fn scrub_field_mod(
         F::ImageRotation => (AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation), true),
         F::Text(TextNumField::X) => (AutomationTarget::TextBuiltin(TextBuiltinParam::X), false),
         F::Text(TextNumField::Y) => (AutomationTarget::TextBuiltin(TextBuiltinParam::Y), false),
+        F::Text(TextNumField::W) => (AutomationTarget::TextBuiltin(TextBuiltinParam::W), false),
+        F::Text(TextNumField::H) => (AutomationTarget::TextBuiltin(TextBuiltinParam::H), false),
         F::Text(TextNumField::Opacity) => {
             (AutomationTarget::TextBuiltin(TextBuiltinParam::Opacity), false)
         }

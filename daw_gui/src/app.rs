@@ -3138,7 +3138,9 @@ impl AppData {
                 .is_some_and(|cc| cc.text_events().is_some())
         });
         if has_text {
-            for p in [TX::X, TX::Y, TX::Opacity, TX::Rotation, TX::FontSize] {
+            // B10 (r.md #8): image と対称化 — text W/H も modulation 対象
+            // (text_compose の resolve_norm が W/H にも変調を適用済)。
+            for p in [TX::X, TX::Y, TX::W, TX::H, TX::Opacity, TX::Rotation, TX::FontSize] {
                 out.push(AT::TextBuiltin(p));
             }
         }
