@@ -1480,6 +1480,7 @@ pub fn process_track_owned(
             frames,
             smoothed_current_bpm,
             &mut scratch.granular_rings,
+            &mut scratch.repitch_accum,
         );
     }
     // PR4.5 sidechain plugin-internal alignment: main 信号を遅延させて sidechain

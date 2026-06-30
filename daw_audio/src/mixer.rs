@@ -55,6 +55,13 @@ pub struct TrackScratch {
     /// 固定するのに使い、 tempo 変化での source position 跳び (= click) を防ぐ。 起動時に
     /// `MAX_GRANULAR_EVENTS_PER_TRACK` ぶん pre-alloc し RT で再確保しない。
     pub granular_rings: Vec<crate::audio_clip_renderer::GrainLockRing>,
+    /// E5 sibling (r.md #8): Repitch (tape) mode の **連続 source 位置 accumulator** (event 単位、
+    /// 添字 = granular_rings と同じ event index)。 `(last_event_local, accumulated_source_pos)`。
+    /// Repitch は `event_local × ratio` で絶対位置を毎 buffer 再計算していたため tempo automation
+    /// で ratio が変わると位置が跳んで click した (jump 量は event_local に比例 = granular より
+    /// 重症)。 contiguous 再生では ratio を積分 (= 連続)、 seek/schedule 変化 (event_local 不連続)
+    /// では再 anchor して click を防ぐ。 `u64::MAX` = 未初期化。
+    pub repitch_accum: Vec<(u64, f64)>,
     /// Per-sample volume gain ramp for the buffer about to be processed.
     /// `MAX_FRAMES` long, allocated once at construction and overwritten
     /// in place every buffer by `fill_track_param_ramps`. The fx-chain
@@ -106,6 +113,7 @@ impl TrackScratch {
             // for the pathological >1 s case (which no real plugin hits).
             input_delay_line: DelayLine::with_capacity(INPUT_DELAY_PREALLOC_SAMPLES),
             granular_rings: vec![[(u64::MAX, 0); 8]; MAX_GRANULAR_EVENTS_PER_TRACK],
+            repitch_accum: vec![(u64::MAX, 0.0); MAX_GRANULAR_EVENTS_PER_TRACK],
             volume_per_sample: vec![1.0; MAX_FRAMES],
             pan_per_sample: vec![0.0; MAX_FRAMES],
             pre_fader_l: vec![0.0; MAX_FRAMES],

@@ -137,6 +137,12 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
   grain-k 不一致 (seek / schedule 変化) は自己無効化。 RT alloc 無し (pre-alloc + array 添字)。
   **unit test で「tempo を倍にしても grain offset が trigger 値に固定」 + slot 上書き + None
   経路を検証 (green)**、 既存 granular 66 test に regression 無し。 著者既定の「別 phase」 deferral を解消。
+  - **同件 (sibling-occurrence): Repitch (tape) mode 実装済** — `_ => source_pos = event_local ×
+    effective_pitch_ratio` も同 root cause (tempo 変化で絶対位置が跳ぶ click、 jump 量は event_local
+    比例で granular より重症)。 per-event の連続 source 位置 accumulator (`repitch_accum`、 同 index、
+    `repitch_source_pos`) で contiguous 再生は ratio を積分・seek は再 anchor。 Raw は ratio 一定なので
+    積分値 = 従来式で byte 同一。 unit test で連続積分 / seek 再 anchor / Raw 一致を検証 (green)。
+    Slice は離散 slice を native rate 再生なので非該当。
 
 ### 据え置き (理由付き — 上流 infra 待ち / 著者既定の deferral / unmeasured perf / 視覚 focused)
 

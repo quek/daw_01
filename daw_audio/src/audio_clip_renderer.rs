@@ -393,6 +393,22 @@ pub fn has_undecoded_sources(song: &Song, renderer: &AudioClipRenderer) -> bool 
 /// instrument plugin's audio output is preserved (= Bitwig Hybrid Track:
 /// audio clip output bypasses the instrument and joins the FX chain
 /// input alongside it, see §13 Q6).
+/// E5 sibling (r.md #8): Repitch (tape) mode の連続 source 位置を 1 sample ぶん進める。
+/// `state = (last_event_local, accumulated_source_pos)`。 contiguous 再生 (`event_local ==
+/// last + 1`) では `ratio` を積分 (= 位置が連続) し、 tempo automation で ratio が変わっても
+/// 絶対位置が跳ばない。 不連続 (seek / schedule 変化 / 初回 `last == u64::MAX`) では現 ratio で
+/// `event_local × ratio` に再 anchor する。 Raw mode は ratio 一定なので積分値は
+/// `event_local × ratio` に一致し従来挙動と byte 同一。
+fn repitch_source_pos(state: &mut (u64, f64), event_local: u64, ratio: f64) -> f64 {
+    if state.0 != u64::MAX && state.0.wrapping_add(1) == event_local {
+        state.1 += ratio;
+    } else {
+        state.1 = event_local as f64 * ratio;
+    }
+    state.0 = event_local;
+    state.1
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_audio_events(
     renderer: &AudioClipRenderer,
@@ -415,6 +431,10 @@ pub fn render_audio_events(
     // granular_sample_at に &mut で渡し、 grain offset を trigger 時に固定して tempo 変化での
     // click を防ぐ。 容量を超える index の event は lock 無し (= 従来挙動) に degrade。
     granular_rings: &mut [GrainLockRing],
+    // E5 sibling (r.md #8): Repitch (tape) mode の連続 source 位置 accumulator (event 単位、
+    // granular_rings と同じ index)。 `(last_event_local, accumulated_source)`。 tempo 変化で
+    // 位置が跳ぶ click を防ぐ (granular の lock-in と同 root cause)。
+    repitch_accum: &mut [(u64, f64)],
 ) {
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
@@ -541,6 +561,8 @@ pub fn render_audio_events(
         // E5 (r.md #8): この event の granular lock-in ring (index 超過は None = lock 無しに
         // degrade)。 sample loop の granular_sample_at へ毎サンプル reborrow で渡す。
         let mut lock_ring = granular_rings.get_mut(ring_idx);
+        // E5 sibling: Repitch の連続 source 位置 accumulator (同 event index)。
+        let mut repitch_state = repitch_accum.get_mut(ring_idx);
 
         for i in buf_off_start..buf_off_end {
             // event_local = sample offset since event.start_beat。 i は buffer
@@ -611,9 +633,19 @@ pub fn render_audio_events(
                     event.reversed,
                 ),
                 _ => {
-                    // Source position with linear interpolation. effective_pitch_ratio
-                    // は Repitch mode で tempo ratio スケール済、 他 mode は不変。
-                    let source_pos = event_local as f64 * effective_pitch_ratio;
+                    // Source position with linear interpolation. effective_pitch_ratio は
+                    // Repitch mode で tempo ratio スケール済 (tempo automation で変動)、 Raw は
+                    // 不変。 E5 sibling (r.md #8): 連続 accumulator で源位置を積分し、 tempo 変化で
+                    // `event_local × ratio` の絶対値が跳ぶ click を防ぐ (jump 量は event_local に
+                    // 比例 = granular より重症)。 contiguous 再生では ratio を積分、 seek/schedule
+                    // 変化 (event_local 不連続) では現 ratio で再 anchor。 Raw は ratio 一定なので
+                    // 積分値 = `event_local × ratio` で従来と一致 (無害)。 容量超過 event は None で degrade。
+                    let source_pos = match repitch_state.as_deref_mut() {
+                        Some(state) => {
+                            repitch_source_pos(state, event_local, effective_pitch_ratio)
+                        }
+                        None => event_local as f64 * effective_pitch_ratio,
+                    };
                     let source_pos = if event.reversed {
                         source_len as f64 - 1.0 - source_pos
                     } else {
@@ -962,5 +994,38 @@ mod e5_lockin_tests {
         // lock_ring=None は従来挙動 (毎回 recompute) で panic しない。
         call(3 * HOP + HOP / 2, 1.0, None);
         call(3 * HOP + HOP / 2, 2.0, None);
+    }
+
+    #[test]
+    fn repitch_integrates_position_continuously_across_tempo_change() {
+        // E5 sibling: contiguous 再生で ratio を積分 → tempo 変化でも位置が連続 (跳ばない)。
+        let mut state = (u64::MAX, 0.0);
+        for el in 0..4u64 {
+            let p = repitch_source_pos(&mut state, el, 1.0);
+            assert!((p - el as f64).abs() < 1e-9, "ratio 1.0 で 位置 == event_local");
+        }
+        // event_local 4 で ratio が 2.0 に変化 (tempo automation)。 連続なので 3.0 + 2.0 = 5.0。
+        // 旧実装の `event_local × ratio` なら 4×2 = 8.0 に跳ぶ (= click)。
+        let p4 = repitch_source_pos(&mut state, 4, 2.0);
+        assert!((p4 - 5.0).abs() < 1e-9, "連続積分 3.0+2.0=5.0 で跳ばない、 got {p4}");
+        let p5 = repitch_source_pos(&mut state, 5, 2.0);
+        assert!((p5 - 7.0).abs() < 1e-9, "5.0+2.0=7.0");
+
+        // seek (event_local 不連続) → 現 ratio で再 anchor (event_local × ratio)。
+        let p_seek = repitch_source_pos(&mut state, 100, 2.0);
+        assert!((p_seek - 200.0).abs() < 1e-9, "seek は現 ratio で再 anchor 100×2=200");
+    }
+
+    #[test]
+    fn repitch_constant_ratio_matches_legacy_formula() {
+        // Raw 相当 (ratio 一定) では積分値 == event_local × ratio (従来挙動と byte 一致)。
+        let mut state = (u64::MAX, 0.0);
+        for el in 0..10u64 {
+            let p = repitch_source_pos(&mut state, el, 1.5);
+            assert!(
+                (p - el as f64 * 1.5).abs() < 1e-9,
+                "constant ratio は el×1.5、 got {p} at el={el}"
+            );
+        }
     }
 }
