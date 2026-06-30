@@ -951,6 +951,12 @@ impl LoadedPlugin for Vst3Plugin {
         }
     }
 
+    fn update_ara_regions(&self, regions: &[common::protocol::AraRegionUpdate]) {
+        if let Some(session) = self.ara.as_ref() {
+            session.update_regions(regions);
+        }
+    }
+
     fn notify_ara_model_updates(&self) {
         if let Some(session) = self.ara.as_ref() {
             session.notify_model_updates();

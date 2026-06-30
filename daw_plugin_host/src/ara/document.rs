@@ -24,10 +24,12 @@ use ara_sys::{
     ARADocumentProperties, ARAFactory,
     ARAInterfaceConfiguration, ARAMusicalContextHostRef, ARAMusicalContextProperties,
     ARAMusicalContextRef, ARAPlaybackRegionHostRef, ARAPlaybackRegionProperties,
-    ARAPlaybackRegionRef, ARARegionSequenceHostRef, ARARegionSequenceProperties,
+    ARAPlaybackRegionRef, ARAPlaybackTransformationFlags, ARARegionSequenceHostRef,
+    ARARegionSequenceProperties,
     ARARegionSequenceRef, ARASampleCount, ARASampleRate, ARATimeDuration, ARATimePosition,
     kARAAPIGeneration_2_0_Final, kARAAPIGeneration_2_3_Final, kARAChannelArrangementUndefined,
     kARAContentUpdateEverythingChanged, kARAPlaybackTransformationNoChanges,
+    kARAPlaybackTransformationTimestretch,
 };
 
 use crate::ara::host_controllers;
@@ -137,6 +139,16 @@ impl AraDocumentController {
             interface,
             _host_instance: host_instance,
         })
+    }
+
+    /// Playback transformations the plug-in's factory advertises. A region may
+    /// only enable a subset of these, so the host uses it to gate time-stretch.
+    /// Reads the retained factory pointer (validated non-null at `create`),
+    /// defaulting to no flags if it is somehow null.
+    pub fn supported_playback_transformation_flags(&self) -> ARAPlaybackTransformationFlags {
+        unsafe { self.factory.as_ref() }
+            .map(|f| f.supportedPlaybackTransformationFlags)
+            .unwrap_or(0)
     }
 
     /// Opaque controller ref for model-graph calls (audio sources, regions, …).
@@ -439,10 +451,12 @@ impl AraDocumentController {
     }
 
     /// Create a playback region mapping a slice of the modification's audio onto
-    /// the song timeline (seconds). This uses no transformation (no
-    /// time-stretch), so the caller must pass equal modification / playback
-    /// durations. The region sequence carries the musical context (the
-    /// deprecated per-region context field is left null).
+    /// the song timeline (seconds). `time_stretch` enables
+    /// `kARAPlaybackTransformationTimestretch`, letting the playback duration
+    /// differ from the modification duration (pitch-preserving stretch); when
+    /// false the caller must pass equal durations (Raw). The region sequence
+    /// carries the musical context (the deprecated per-region context field is
+    /// left null).
     #[allow(clippy::too_many_arguments)]
     pub fn create_playback_region(
         &self,
@@ -453,26 +467,99 @@ impl AraDocumentController {
         duration_in_modification: ARATimeDuration,
         start_in_playback: ARATimePosition,
         duration_in_playback: ARATimeDuration,
+        time_stretch: bool,
     ) -> Option<ARAPlaybackRegionRef> {
         let create = self.interface.createPlaybackRegion?;
-        let properties = ARAPlaybackRegionProperties {
-            structSize: core::mem::size_of::<ARAPlaybackRegionProperties>(),
-            transformationFlags: kARAPlaybackTransformationNoChanges.0,
-            startInModificationTime: start_in_modification,
-            durationInModificationTime: duration_in_modification,
-            startInPlaybackTime: start_in_playback,
-            durationInPlaybackTime: duration_in_playback,
-            musicalContextRef: ptr::null_mut(),
-            regionSequenceRef: region_sequence,
-            name: ptr::null(),
-            color: ptr::null(),
-        };
+        let properties = playback_region_properties(
+            region_sequence,
+            start_in_modification,
+            duration_in_modification,
+            start_in_playback,
+            duration_in_playback,
+            time_stretch,
+        );
         Some(unsafe { create(self.controller_ref, modification, host_ref, &properties) })
+    }
+
+    /// Update an existing playback region's placement / stretch in place
+    /// (`updatePlaybackRegionProperties`). All properties are re-specified, per
+    /// the ARA contract that the host always supplies the full set and the
+    /// plug-in works out what changed. Unlike create/destroy or
+    /// add/removePlaybackRegion (which require the instance inactive), this is
+    /// safe while the plug-in renders — the caller brackets it in
+    /// begin/endEditing, which the plug-in uses for render-thread
+    /// synchronisation — so it is the path for live tempo / edge-drag follow
+    /// without rebuilding the document.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_playback_region_properties(
+        &self,
+        region: ARAPlaybackRegionRef,
+        region_sequence: ARARegionSequenceRef,
+        start_in_modification: ARATimePosition,
+        duration_in_modification: ARATimeDuration,
+        start_in_playback: ARATimePosition,
+        duration_in_playback: ARATimeDuration,
+        time_stretch: bool,
+    ) {
+        let Some(update) = self.interface.updatePlaybackRegionProperties else {
+            return;
+        };
+        let properties = playback_region_properties(
+            region_sequence,
+            start_in_modification,
+            duration_in_modification,
+            start_in_playback,
+            duration_in_playback,
+            time_stretch,
+        );
+        unsafe { update(self.controller_ref, region, &properties) };
     }
 
     pub fn destroy_playback_region(&self, region: ARAPlaybackRegionRef) {
         if let Some(destroy) = self.interface.destroyPlaybackRegion {
             unsafe { destroy(self.controller_ref, region) };
         }
+    }
+}
+
+/// Build the shared ARA playback-region properties. `time_stretch` selects the
+/// transformation: when set, the modification slice maps onto a (possibly
+/// different) playback duration via `kARAPlaybackTransformationTimestretch`;
+/// otherwise the region is left untransformed (`NoChanges`, durations must
+/// match). Used by both create and update so the two never drift apart.
+fn playback_region_properties(
+    region_sequence: ARARegionSequenceRef,
+    start_in_modification: ARATimePosition,
+    duration_in_modification: ARATimeDuration,
+    start_in_playback: ARATimePosition,
+    duration_in_playback: ARATimeDuration,
+    time_stretch: bool,
+) -> ARAPlaybackRegionProperties {
+    // With the time-stretch flag off, ARA requires the host to keep playback and
+    // modification durations equal ("If disabled, the host must always specify
+    // the same duration in modification and playback time") — the plug-in
+    // ignores the distinction. Clamp here so a non-stretching region (Raw, or a
+    // plug-in that does not advertise time-stretch) is always spec-correct
+    // regardless of the playback duration the caller computed.
+    let duration_in_playback = if time_stretch {
+        duration_in_playback
+    } else {
+        duration_in_modification
+    };
+    ARAPlaybackRegionProperties {
+        structSize: core::mem::size_of::<ARAPlaybackRegionProperties>(),
+        transformationFlags: if time_stretch {
+            kARAPlaybackTransformationTimestretch.0
+        } else {
+            kARAPlaybackTransformationNoChanges.0
+        },
+        startInModificationTime: start_in_modification,
+        durationInModificationTime: duration_in_modification,
+        startInPlaybackTime: start_in_playback,
+        durationInPlaybackTime: duration_in_playback,
+        musicalContextRef: ptr::null_mut(),
+        regionSequenceRef: region_sequence,
+        name: ptr::null(),
+        color: ptr::null(),
     }
 }

@@ -21,9 +21,10 @@ use anyhow::{Context, Result};
 use ara_sys::{
     ARAAudioModificationRef, ARAAudioSourceHostRef, ARAAudioSourceRef, ARADocumentControllerRef,
     ARAFactory, ARAMusicalContextHostRef, ARAMusicalContextRef, ARAPlaybackRegionRef,
-    ARAPlugInExtensionInstance, ARARegionSequenceRef,
+    ARAPlaybackTransformationFlags, ARAPlugInExtensionInstance, ARARegionSequenceRef,
+    kARAPlaybackTransformationTimestretch,
 };
-use common::protocol::{AraClipSpec, AraSourceSpec};
+use common::protocol::{AraClipSpec, AraRegionUpdate, AraSourceSpec};
 
 use crate::ara::audio_source::AraAudioSourceHost;
 use crate::ara::document::AraDocumentController;
@@ -36,6 +37,9 @@ use crate::ara::host_controllers::AraMusicalContextHost;
 
 /// A host model source + its plug-in-side refs, owned for the session's life.
 struct OwnedAraSource {
+    /// Stable id (matches `AraClipSpec::persistent_id`) so `update_regions` can
+    /// find this region when only its placement changed.
+    persistent_id: String,
     /// Boxed so its address is stable — it backs the `ARAAudioSourceHostRef`
     /// the plug-in hands to our AudioAccess controller in `readAudioSamples`.
     _host: Box<AraAudioSourceHost>,
@@ -60,6 +64,10 @@ pub struct AraSession {
     sources: Vec<OwnedAraSource>,
     extension: AraPlugInExtension,
     controller: AraDocumentController,
+    /// Playback transformations the plug-in advertises (`ARAFactory`). We enable
+    /// time-stretch on a region only if the factory lists it (ARA requires the
+    /// region's `transformationFlags` to be a subset of the supported set).
+    supported_transformation_flags: ARAPlaybackTransformationFlags,
 }
 
 impl AraSession {
@@ -81,6 +89,10 @@ impl AraSession {
         F: FnOnce(ARADocumentControllerRef) -> Option<*const ARAPlugInExtensionInstance>,
     {
         let controller = unsafe { AraDocumentController::create(factory, None) }?;
+        // The plug-in advertises which playback transformations it can perform;
+        // we must not enable time-stretch on a region unless it is listed here.
+        // Read via the controller, which owns the factory pointer it validated.
+        let supported_transformation_flags = controller.supported_playback_transformation_flags();
 
         // Box the host's tempo/bar model first: its address is the opaque
         // `ARAMusicalContextHostRef` the plug-in keeps and passes back to our
@@ -119,6 +131,7 @@ impl AraSession {
             sources: Vec::new(),
             extension,
             controller,
+            supported_transformation_flags,
         })
     }
 
@@ -152,9 +165,13 @@ impl AraSession {
         }
         self.sources = Vec::new();
 
+        let supports_timestretch = self.supports_timestretch();
         let mut new_sources = Vec::with_capacity(clips.len());
         for clip in clips {
-            match unsafe { build_source(&self.controller, self.region_sequence, clip) } {
+            let time_stretch = clip.placement.time_stretch && supports_timestretch;
+            match unsafe {
+                build_source(&self.controller, self.region_sequence, clip, time_stretch)
+            } {
                 Ok(source) => new_sources.push(source),
                 Err(e) => {
                     tracing::warn!(
@@ -228,6 +245,48 @@ impl AraSession {
         self.controller.end_editing();
         ok
     }
+
+    /// Update the placement / stretch of already-present regions in place,
+    /// matched by `persistent_id`, without rebuilding the document. Safe while
+    /// the plug-in renders: `updatePlaybackRegionProperties` only re-states
+    /// region properties (not renderer assignment) and is bracketed in
+    /// begin/endEditing, which the plug-in uses for render-thread sync. Ids not
+    /// currently present are ignored (a clip-set change goes through
+    /// [`Self::set_clips`] instead).
+    pub fn update_regions(&self, updates: &[AraRegionUpdate]) {
+        if updates.is_empty() {
+            return;
+        }
+        let supports_timestretch = self.supports_timestretch();
+        self.controller.begin_editing();
+        for upd in updates {
+            let Some(owned) = self
+                .sources
+                .iter()
+                .find(|o| o.persistent_id == upd.persistent_id)
+            else {
+                continue;
+            };
+            let p = &upd.placement;
+            self.controller.update_playback_region_properties(
+                owned.region_ref,
+                self.region_sequence,
+                p.start_in_modification_seconds,
+                p.duration_in_modification_seconds,
+                p.start_in_playback_seconds,
+                p.duration_in_playback_seconds,
+                p.time_stretch && supports_timestretch,
+            );
+        }
+        self.controller.end_editing();
+    }
+
+    /// Whether the plug-in advertises the time-stretch playback transformation.
+    /// Regions only get `kARAPlaybackTransformationTimestretch` when this holds;
+    /// otherwise the host must keep modification and playback durations equal.
+    fn supports_timestretch(&self) -> bool {
+        self.supported_transformation_flags & kARAPlaybackTransformationTimestretch.0 != 0
+    }
 }
 
 /// Create one source → modification → playback region chain for a clip.
@@ -235,6 +294,7 @@ unsafe fn build_source(
     controller: &AraDocumentController,
     region_sequence: ARARegionSequenceRef,
     clip: &AraClipSpec,
+    time_stretch: bool,
 ) -> Result<OwnedAraSource> {
     let host = Box::new(match &clip.source {
         AraSourceSpec::WavFile(path) => AraAudioSourceHost::from_wav_file(path)?,
@@ -279,14 +339,16 @@ unsafe fn build_source(
             modification_ref,
             std::ptr::null_mut(),
             region_sequence,
-            clip.start_in_modification_seconds,
-            clip.duration_in_modification_seconds,
-            clip.start_in_playback_seconds,
-            clip.duration_in_playback_seconds,
+            clip.placement.start_in_modification_seconds,
+            clip.placement.duration_in_modification_seconds,
+            clip.placement.start_in_playback_seconds,
+            clip.placement.duration_in_playback_seconds,
+            time_stretch,
         )
         .context("plug-in returned null playback region")?;
 
     Ok(OwnedAraSource {
+        persistent_id: clip.persistent_id.clone(),
         _host: host,
         source_ref,
         modification_ref,
