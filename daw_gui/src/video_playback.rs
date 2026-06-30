@@ -361,6 +361,10 @@ impl VideoPlaybackEngine {
         if bpm <= 0.0 {
             return Vec::new();
         }
+        // A4 (r.md #8): tempo automation がある曲は映像 source 時間 (秒) を tempo
+        // 積分で求める (= 映像が音とズレない)。 constant 曲は従来の高速 60/bpm 経路。
+        let tempo_map = song_tempo_map_if_automated(song);
+        let playhead_secs = tempo_map.as_ref().map(|m| m.beat_to_seconds(playhead_beat));
         let mut out: Vec<ActiveVideoFrame> = Vec::new();
         // `song.tracks[0]` is the top of the arrangement, so iterating
         // `.rev()` yields bottom-most → topmost. Each video track gets
@@ -410,7 +414,13 @@ impl VideoPlaybackEngine {
                     }
                     let event_progress_beats =
                         clip_local - event.event_start_in_clip_beats;
-                    let event_progress_secs = event_progress_beats * 60.0 / bpm;
+                    let event_progress_secs = match (&tempo_map, playhead_secs) {
+                        (Some(m), Some(ph_secs)) => {
+                            let event_start = clip_start + event.event_start_in_clip_beats;
+                            (ph_secs - m.beat_to_seconds(event_start)).max(0.0)
+                        }
+                        _ => event_progress_beats * 60.0 / bpm,
+                    };
                     let event_progress_micros =
                         (event_progress_secs * 1_000_000.0).round() as u64;
                     let source_micros = event
@@ -452,6 +462,9 @@ impl VideoPlaybackEngine {
         if bpm <= 0.0 {
             return None;
         }
+        // A4 (r.md #8): tempo automation 時は映像 source 時間を tempo 積分で求める。
+        let tempo_map = song_tempo_map_if_automated(song);
+        let playhead_secs = tempo_map.as_ref().map(|m| m.beat_to_seconds(playhead_beat));
         for track in &song.tracks {
             // v16: TrackKind 廃止後は「video_events を持つ clip がある
             // track」 が visual composite に参加する。 `content.video
@@ -489,7 +502,13 @@ impl VideoPlaybackEngine {
                     }
                     let event_progress_beats =
                         clip_local - event.event_start_in_clip_beats;
-                    let event_progress_secs = event_progress_beats * 60.0 / bpm;
+                    let event_progress_secs = match (&tempo_map, playhead_secs) {
+                        (Some(m), Some(ph_secs)) => {
+                            let event_start = clip_start + event.event_start_in_clip_beats;
+                            (ph_secs - m.beat_to_seconds(event_start)).max(0.0)
+                        }
+                        _ => event_progress_beats * 60.0 / bpm,
+                    };
                     let event_progress_micros =
                         (event_progress_secs * 1_000_000.0).round() as u64;
                     let source_micros = event
@@ -739,6 +758,17 @@ impl Default for VideoPlaybackEngine {
 /// `common::audio_render::fade_envelope` (the audio sibling), so
 /// crossfade visuals stay in step with the audio engine's gain
 /// envelope when the user fades both halves of a clip together.
+/// tempo automation (SongTempo lane) があれば `TempoMap` を build する (= 映像
+/// source 時間を tempo 積分で求めて音とズレないようにする、 A4 r.md #8)。 無ければ
+/// `None` で constant bpm の高速経路を使う。 build は O(song length) だが tempo
+/// automation を持つ曲のみ (一般の constant 曲は無コスト)。
+fn song_tempo_map_if_automated(song: &Song) -> Option<common::tempo_map::TempoMap> {
+    let automated = song.song_lanes.iter().any(|l| {
+        l.enabled && matches!(l.target, common::model::AutomationTarget::SongTempo)
+    });
+    automated.then(|| common::tempo_map::TempoMap::from_song(song))
+}
+
 fn event_alpha(event: &VideoEvent, clip_local_beat: f64) -> f32 {
     let event_local = clip_local_beat - event.event_start_in_clip_beats;
     if event_local < 0.0 {
@@ -1426,8 +1456,9 @@ fn read_one_frame(
 mod tests {
     use super::*;
     use common::model::{
-        Clip, ClipContent, Song, VideoContent, VideoEvent,
-        VideoSource, VideoSourcePath,
+        AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint,
+        AutomationTarget, Clip, ClipContent, Song, VideoContent, VideoEvent, VideoSource,
+        VideoSourcePath,
     };
 
     fn song_with_video_clip(bpm: f32, video_source_id: VideoSourceId) -> Song {
@@ -1487,6 +1518,45 @@ mod tests {
         assert!(VideoPlaybackEngine::active_source_at(&song, 0.0).is_none());
         // playhead after clip end
         assert!(VideoPlaybackEngine::active_source_at(&song, 100.0).is_none());
+    }
+
+    /// r.md #8 A4: tempo automation 下では映像 source 時間が tempo 積分で進む
+    /// (= 一定 bpm 換算の `progress*60/bpm` とズレ、 映像が音と同期し続ける)。
+    #[test]
+    fn active_source_at_honors_tempo_automation() {
+        // base 60bpm の video clip (clip/event は beat 4 始まり) に、 60→180 linear
+        // の SongTempo lane [0,12) を載せる。 beat 4..8 は 100..140 bpm。
+        let mut song = song_with_video_clip(60.0, 1);
+        song.length_beats = 12.0;
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint { time_beat: 0.0, value: 60.0, curve: AutomationCurve::Linear },
+                    AutomationPoint { time_beat: 12.0, value: 180.0, curve: AutomationCurve::Linear },
+                ],
+            }),
+        );
+        song.song_lanes.push(AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "t".into(),
+                start_beat: 0.0,
+                length_beats: 12.0,
+                content_id: cid,
+            }],
+            ..AutomationLane::new(AutomationTarget::SongTempo, 60.0)
+        });
+        let (_id, micros) = VideoPlaybackEngine::active_source_at(&song, 8.0).unwrap();
+        let secs = micros as f64 / 1_000_000.0;
+        // 期待値 = tempo 積分した beat 4→8 の実時間。
+        let m = common::tempo_map::TempoMap::from_song(&song);
+        let expected = m.beat_to_seconds(8.0) - m.beat_to_seconds(4.0);
+        assert!((secs - expected).abs() < 0.02, "secs={secs} expected={expected}");
+        // 一定 60bpm 換算 (4 拍 = 4.0s) より明確に短い (テンポが速いので)。
+        assert!(secs < 3.5, "tempo-integrated should beat constant-60 (4.0s), got {secs}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub mod protocol;
 pub mod recent;
 pub mod recovery;
 pub mod scale;
+pub mod tempo_map;
 pub mod timing;
 pub mod track_params;
 pub mod video_fx;
