@@ -201,6 +201,24 @@ baseview backend / runtime テーマ / ARA Playback controller / ARA ContentAcce
     arrangement build の per-frame 名前 alloc class (track/clip/lane/section/automation-clip) は
     全て cache or intern 済。
 
+### 再監査 (2 周目: 監査の網羅性確認)
+
+「goal 到達か」の確認として cut-corner マーカーを全 sweep + 手動確認:
+- **actionable マーカーはゼロ** — `todo!()` / `unimplemented!()` / `FIXME` / `TODO(...)` は
+  vendored ffmpeg binding を除き 0 件。
+- **stale コメント是正** — `compile_schedule` に `TODO(PR3)` (RT 上で compile して glitch、
+  PR3 で off-thread 化予定) が残っていたが D1 で解消済だった → 実態に是正 (F bucket と同 class)。
+- **未着手機能を実装 = master fx (master bus の EQ/limiter 等) の param 自動化 + 変調** —
+  `process_master_fx_chain` が `fill_pd_param_events` を呼ばず「master fx param automation は
+  将来機能」 と据え置かれていた。 data model (`song_lanes` = 自動化、 `song_mod_routings` = 変調)
+  は既存だったので、 engine 配線 + UI 配線で track/group fx と同等に実装: (1) engine =
+  `fill_pd_param_events(MASTER_TRACK_ID)` が `song_lanes` / `song_mod_routings` を解決 +
+  `process_master_fx_chain` が呼ぶ。 (2) UI = `add_automation_from_last_touched` の song-level 判定に
+  `MASTER_TRACK_ID` を追加 (touch → 自動化) + `cursor_modulatable_targets` に master fx PluginParam
+  を追加 (変調ターゲット) + master row の lane 名/range を MASTER で解決。 engine unit test green。
+- vst3 の非-HWND fallback「MVP 未対応」 コメントは Windows では非発生 (全 VST3 が HWND 対応) の
+  descriptive comment で cut-corner ではない → 変更なし。
+
 ### 監査の終端
 
 r.md #8 監査 34 項目すべて **実装 / 解決済** (据え置き無し)。 B7 のみ「builtin に専用エディタ

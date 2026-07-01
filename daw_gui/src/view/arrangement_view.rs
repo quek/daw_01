@@ -528,12 +528,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // session state、 negation で widget 側 `automation_lanes_collapsed` に
     // map)。 song_lanes が空でも master_row 自体は表示するため、 常に
     // `Some(...)` を渡す idiom (= None は本機能未使用時用)。
+    // r.md #8 再監査: master row の lane には master fx (`master_fx_chain`) の
+    // PluginParam も含まれるので、 range / param 名を MASTER_TRACK_ID で解決する
+    // (SongTempo/TimeSig は非 PluginParam なので両クロージャとも None を返す)。
     let master_row_lanes = build_arrangement_lanes_from_slice(
         &app.song.song_lanes,
         common::model::MASTER_TRACK_ID,
         lane_build_data,
-        &|_| None,
-        &|_| None,
+        &|tgt| app.plugin_param_range(common::model::MASTER_TRACK_ID, tgt),
+        &|tgt| app.plugin_param_name(common::model::MASTER_TRACK_ID, tgt),
     );
     let master_row = daw_ui_core::ArrangementMasterRow {
         automation_lanes_collapsed: !app.master_row_automation_expanded,

@@ -155,14 +155,26 @@ pub fn fill_pd_param_events(
     if frames == 0 || bpm <= 0.0 || sample_rate == 0 {
         return;
     }
-    let Some(track) = song.tracks.iter().find(|t| t.id == track_id) else {
-        return;
+    // master fx (`MASTER_TRACK_ID`) は Track ではないので automation は `song_lanes`、
+    // 変調は `song_mod_routings` (Song 直下の song/master-level store) から引く。 それ
+    // 以外は通常 track。 `song_lanes` に混在する SongTempo/TimeSig lane は下の
+    // PluginParam フィルタで自然に skip される。 (r.md #8 再監査: master fx 自動化/変調)
+    let (lanes, mod_routings): (
+        &[common::model::AutomationLane],
+        &[common::model::ModRouting],
+    ) = if track_id == common::model::MASTER_TRACK_ID {
+        (&song.song_lanes, &song.song_mod_routings)
+    } else {
+        let Some(track) = song.tracks.iter().find(|t| t.id == track_id) else {
+            return;
+        };
+        (&track.automation_lanes, &track.mod_routings)
     };
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(bpm);
     if samples_per_beat <= 0.0 {
         return;
     }
-    for lane in &track.automation_lanes {
+    for lane in lanes {
         if !lane.enabled {
             continue;
         }
@@ -218,7 +230,7 @@ pub fn fill_pd_param_events(
     // 送る。**lane の有無に関わらず** (= lane-free モジュレーション)。plugin_host が
     // per-format に CLAP `param_mod` / 合成へ変換する。follower が 0 に戻った時も
     // offset 0 を送って mod を解除するため、毎バッファ無条件に emit する。
-    for (i, r) in track.mod_routings.iter().enumerate() {
+    for (i, r) in mod_routings.iter().enumerate() {
         let AutomationTarget::PluginParam { device_index: d, param_id, .. } = &r.target else {
             continue;
         };
@@ -226,11 +238,10 @@ pub fn fill_pd_param_events(
             continue;
         }
         // 同一 target は 1 度だけ (先行する同 target routing があれば skip)。
-        if track.mod_routings[..i].iter().any(|p| p.target == r.target) {
+        if mod_routings[..i].iter().any(|p| p.target == r.target) {
             continue;
         }
-        let offset =
-            modulation_offset_norm_with_scalars(song, &r.target, &track.mod_routings, mod_scalars);
+        let offset = modulation_offset_norm_with_scalars(song, &r.target, mod_routings, mod_scalars);
         pd.push_param_mod(0, *param_id, f64::from(offset));
     }
 }
@@ -628,5 +639,75 @@ mod tests {
         rec.insert((track_id, target));
         fill_pd_param_events(&mut pd2, &song, track_id, 0, SR, 120.0, 0, 64, &rec, &[]);
         assert_eq!(pd2.n_events_in, 0, "recording lane curve must be suppressed");
+    }
+
+    /// r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam automation は
+    /// track ではなく `song_lanes` から引く。 track を 1 つも持たない song の
+    /// song_lanes に置いた PluginParam lane が `fill_pd_param_events(MASTER_TRACK_ID,
+    /// device_index)` で適用されること (= master fx 自動化) を検証。
+    #[test]
+    fn fill_pd_param_events_master_fx_reads_song_lanes() {
+        let mut song = Song { bpm: 120.0, ..Song::default() };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint { time_beat: 0.0, value: 0.25, curve: AutomationCurve::Linear },
+                    AutomationPoint { time_beat: 4.0, value: 0.75, curve: AutomationCurve::Linear },
+                ],
+            }),
+        );
+        let target = AutomationTarget::PluginParam { device_index: 0, param_id: 5, legacy_slot: None };
+        let lane = AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "m".into(),
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: cid,
+            }],
+            next_clip_id: 2,
+            ..AutomationLane::new(target, 0.5)
+        };
+        song.song_lanes = vec![lane];
+        // MASTER_TRACK_ID の track は存在しない → song_lanes 経由で解決するはず。
+        let mut pd = ProcessData::empty();
+        let empty = empty_recording_lanes();
+        fill_pd_param_events(
+            &mut pd,
+            &song,
+            common::model::MASTER_TRACK_ID,
+            0,
+            SR,
+            120.0,
+            0,
+            64,
+            &empty,
+            &[],
+        );
+        assert_eq!(pd.n_events_in, 1, "master fx PluginParam lane (song_lanes) must apply");
+        assert_eq!(pd.events_in[0].param_id, 5);
+        assert!(
+            (pd.events_in[0].value - 0.25).abs() < 1e-6,
+            "curve value at beat 0 should be 0.25, got {}",
+            pd.events_in[0].value
+        );
+        // 別 device_index (別 master fx) には適用されない。
+        let mut pd2 = ProcessData::empty();
+        fill_pd_param_events(
+            &mut pd2,
+            &song,
+            common::model::MASTER_TRACK_ID,
+            1,
+            SR,
+            120.0,
+            0,
+            64,
+            &empty,
+            &[],
+        );
+        assert_eq!(pd2.n_events_in, 0, "device_index 1 の master fx には lane が無い");
     }
 }

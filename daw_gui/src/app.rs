@@ -3176,6 +3176,22 @@ impl AppData {
             // B11 (r.md #8): song-level tempo modulation を master cursor の mod
             // picker に出す (engine + export が SongTempo を消費するようになった)。
             out.push(AT::SongTempo);
+            // r.md #8 再監査: master fx (`master_fx_chain`) の PluginParam も変調
+            // ターゲットに出す (engine の `process_master_fx_chain` が
+            // `song_mod_routings` を `fill_pd_param_events(MASTER_TRACK_ID)` で消費)。
+            for (di, _dev) in self.song.master_fx_chain.iter().enumerate() {
+                if let Some(params) =
+                    self.plugin_params.get(&(common::model::MASTER_TRACK_ID, di as u32))
+                {
+                    for p in params {
+                        out.push(AT::PluginParam {
+                            device_index: di as u32,
+                            param_id: p.id,
+                            legacy_slot: None,
+                        });
+                    }
+                }
+            }
             return out;
         }
         let Some(track) = self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) else {
@@ -13745,11 +13761,13 @@ impl AppData {
         // Phase 5 Step 5.1 (gui_01 #034): song-level target は master row の
         // `song_lanes` に追加 (= track 紐付け無し)。 TrackBuiltin / PluginParam
         // は従来通り該当 track の automation_lanes に追加。
+        // r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam も master row の
+        // `song_lanes` に置く (master は Track ではないので track_by_id で引けない)。
         let is_song_level = matches!(
             touched.target,
             common::model::AutomationTarget::SongTempo
                 | common::model::AutomationTarget::SongTimeSigNumerator
-        );
+        ) || touched.track_id == common::model::MASTER_TRACK_ID;
         // song-level でない場合のみ touched track が削除済か検査。
         if !is_song_level && self.song.track_by_id(touched.track_id).is_none() {
             self.last_touched_param = None;
@@ -20877,11 +20895,13 @@ impl AppData {
         playhead_beat: f64,
     ) -> Option<(f64, common::model::ContentId)> {
         use common::model::{AutomationClip, AutomationContent, AutomationLane, ClipContent};
+        // r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam も `song_lanes` に
+        // 記録する (master は Track ではない)。 add_automation_from_last_touched と同 class。
         let is_song_level = matches!(
             target,
             common::model::AutomationTarget::SongTempo
                 | common::model::AutomationTarget::SongTimeSigNumerator
-        );
+        ) || track_id == common::model::MASTER_TRACK_ID;
         let default_value = self.lane_default_for_target(&TouchedParam {
             track_id,
             target: target.clone(),
@@ -21140,20 +21160,24 @@ impl AppData {
     ) -> Option<(f64, common::model::ContentId)> {
         // Phase 5: SongTempo / SongTimeSigNumerator は song_lanes を参照、
         // track_id は ignore (= song-level lane は track に紐付かない)。
-        let lane = match target {
+        // r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam lane も
+        // song_lanes に居るので song-level 扱い (master は Track ではない)。
+        let is_song_level = matches!(
+            target,
             common::model::AutomationTarget::SongTempo
-            | common::model::AutomationTarget::SongTimeSigNumerator => self
-                .song
+                | common::model::AutomationTarget::SongTimeSigNumerator
+        ) || track_id == common::model::MASTER_TRACK_ID;
+        let lane = if is_song_level {
+            self.song
                 .song_lanes
                 .iter()
-                .find(|l| l.enabled && l.target == *target)?,
-            _ => {
-                let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
-                track
-                    .automation_lanes
-                    .iter()
-                    .find(|l| l.enabled && l.target == *target)?
-            }
+                .find(|l| l.enabled && l.target == *target)?
+        } else {
+            let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
+            track
+                .automation_lanes
+                .iter()
+                .find(|l| l.enabled && l.target == *target)?
         };
         let clip = lane.clips.iter().find(|c| {
             playhead_beat >= c.start_beat && playhead_beat < c.start_beat + c.length_beats

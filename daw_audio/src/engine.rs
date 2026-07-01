@@ -1104,6 +1104,9 @@ impl LocalState {
                 current_bpm,
                 self.playhead_beats,
                 looping,
+                playhead,
+                recording_lanes,
+                &self.mod_scalars_snapshot,
             );
 
             // Phase 7 B3 (2026-05-13): metronome click を master mix に追加。
@@ -1742,8 +1745,10 @@ pub fn reduce_master(
 /// idiom: plugin は `(MASTER_TRACK_ID, device_index)` keying で worker pool
 /// 経由 dispatch し、 in-place で `master_l/r` を上書きする。
 ///
-/// master fx param automation は現状 song に target lane が無いので
-/// `fill_pd_param_events` は呼ばない (= 呼んでも no-op、 将来機能)。
+/// master fx param automation / 変調 (r.md #8): master 固有データ (`song_lanes` の
+/// PluginParam lane + `song_mod_routings`) を `fill_pd_param_events(MASTER_TRACK_ID, i)`
+/// で適用する (= track / group fx と同一経路)。 `recording_lanes` / `mod_scalars` /
+/// `playhead` (sample) はそのために追加。
 /// RT 規約: ヒープ確保 / lock / I/O なし。 buffer は呼び出し側が事前確保した
 /// `master_l/r` と plugin 側 ProcessData shmem のみを使う。
 #[allow(clippy::too_many_arguments)]
@@ -1761,6 +1766,9 @@ pub fn process_master_fx_chain(
     current_bpm: f32,
     playhead_beats: f64,
     looping: bool,
+    playhead: u64,
+    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    mod_scalars: &[f32],
 ) {
     let n = frames as usize;
     let Some(ws) = worker_sync else { return };
@@ -1780,6 +1788,23 @@ pub fn process_master_fx_chain(
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
         set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
+        // master fx param automation (`song_lanes` の PluginParam lane) + 変調
+        // (`song_mod_routings`) を MASTER_TRACK_ID 経路で適用 (r.md #8、 track/group
+        // fx と同一 idiom)。 song が None の export path 等では skip。
+        if let Some(song) = song {
+            crate::automation::fill_pd_param_events(
+                pd,
+                song,
+                common::model::MASTER_TRACK_ID,
+                i as u32,
+                sample_rate,
+                current_bpm,
+                playhead,
+                frames,
+                recording_lanes,
+                mod_scalars,
+            );
+        }
         pd.buffer_in[0][..n].copy_from_slice(&master_l[..n]);
         pd.buffer_in[1][..n].copy_from_slice(&master_r[..n]);
         if let Err(_e) = ws.dispatch(plugin_id) {
