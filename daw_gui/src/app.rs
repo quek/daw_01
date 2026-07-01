@@ -21297,16 +21297,19 @@ impl AppData {
     /// `song.bpm` を変更した後に呼ぶ共通処理。Raw audio clip を「実時間 (秒)
     /// 固定」で BPM 比にスケールし (r.md #7 — Ableton Warp-off 相当: Raw は source
     /// を元速度で鳴らすので tempo が変わるとグリッド上の拍長が変わる)、Raw clip が
-    /// あった場合は audio engine に `LoadSong` を送って再生 window を秒固定で追従
-    /// させ `true` を返す。`LoadSong` は source 不変なので decode 再利用で軽量
-    /// (re-decode は走らない)。Raw clip が無ければ `false` を返し、呼び出し側の
-    /// 軽量 `SetSongBpm` に委ねる。
+    /// あった場合は host への `LoadSong` を **coalesce 予約** (`pending_host_sync`) して
+    /// `true` を返す。 呼び出し元は scrub-drag (`SetSongBpmFromScrub`) と MIDI CC
+    /// (`SongTempo` binding) の hot path で、 即時 `LoadSong` だと毎 tick flood する
+    /// ため (H2 同件)、 runner の frame flush に集約する。`LoadSong` は source 不変
+    /// なので decode 再利用で軽量 (re-decode は走らない)。Raw clip が無ければ `false`
+    /// を返し、呼び出し側の軽量 `SetSongBpm` に委ねる。
     fn rescale_raw_clips_for_bpm_change(&mut self, old_bpm: f32, new_bpm: f32) -> bool {
         if !self.song.rescale_raw_clips_for_bpm(old_bpm, new_bpm) {
             return false;
         }
-        let song = self.song.clone();
-        self.send_audio(MainToChild::LoadSong(song));
+        // H2 同件: 毎 CC / 毎 scrub tick の full LoadSong flood を避け、 runner の
+        // frame flush (`flush_pending_host_sync`) に 1 frame 1 回へ集約する。
+        self.pending_host_sync = true;
         true
     }
 
