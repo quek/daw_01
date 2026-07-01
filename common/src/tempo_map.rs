@@ -15,6 +15,11 @@ use crate::model::Song;
 /// breakpoints (~75 KB) while resolving typical tempo ramps smoothly.
 const STEP_BEATS: f64 = 1.0 / 16.0;
 
+/// `from_song` が table を張る最大拍数。 破損 / 悪意ある project の巨大 or 非有限
+/// `length_beats` で `steps` が overflow → `Vec::with_capacity` が OOM/panic する
+/// のを防ぐ hard cap (r.md #8 L9)。 1M beat ≒ 200 BPM で ~83 時間 = 現実の曲の遥か上。
+const MAX_TABLE_BEATS: f64 = 1_000_000.0;
+
 /// Beat→seconds lookup table for one song's tempo curve.
 pub struct TempoMap {
     /// Cumulative elapsed seconds at breakpoint `i` (= beat `i * STEP_BEATS`).
@@ -29,7 +34,11 @@ impl TempoMap {
     /// Constant-bpm songs reduce to a uniform `60/bpm` per beat (= linear).
     #[must_use]
     pub fn from_song(song: &Song) -> Self {
-        let end_beat = song.length_beats.max(1.0);
+        let end_beat = if song.length_beats.is_finite() {
+            song.length_beats.clamp(1.0, MAX_TABLE_BEATS)
+        } else {
+            1.0
+        };
         let steps = (end_beat / STEP_BEATS).ceil() as usize;
         let mut secs = Vec::with_capacity(steps + 1);
         secs.push(0.0);

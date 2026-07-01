@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use common::model::{ImageSourceId, Song, VideoSourceId, VideoSourcePath};
+use common::tempo_map::TempoMap;
 use daw_ui_renderer::{OffscreenRenderer, Rect, Scene, TextureHandle, TexturedQuad};
 
 use crate::video_playback::VideoPlaybackEngine;
@@ -327,7 +328,12 @@ pub fn render_mp4_cancellable(
         }
         None => (0.0, cfg.song.length_beats),
     };
-    let window_seconds = beat_to_seconds(end_beat - start_beat, cfg.song.bpm);
+    // M2 (r.md #8): frame↔beat は tempo automation を積分する `TempoMap` で写像する
+    // (audio export・preview と同一)。 constant-bpm 換算のままだと SongTempo curve の
+    // ある曲で映像が tempo 積分済みの audio から drift する (A/V desync)。
+    let tempo_map = TempoMap::from_song(cfg.song);
+    let start_secs = tempo_map.beat_to_seconds(start_beat);
+    let window_seconds = tempo_map.beat_to_seconds(end_beat) - start_secs;
     let total_frames = (window_seconds * f64::from(framerate)).ceil() as u64;
     let mut scene = Scene::new();
     // Opaque black backdrop — matches the pre-P2 CPU path (= the canvas
@@ -376,7 +382,7 @@ pub fn render_mp4_cancellable(
         // Output frame 0 maps to `start_beat` (= the window origin), so a
         // range export starts compositing at the chosen position.
         let frame_seconds = frame_index as f64 / f64::from(framerate);
-        let playhead_beat = start_beat + seconds_to_beat(frame_seconds, cfg.song.bpm);
+        let playhead_beat = tempo_map.seconds_to_beat(start_secs + frame_seconds);
         // docs/plan_modulation.md §7: sample the baked follower envelopes at
         // this frame's beat (step / sample-and-hold), same composition as live.
         mod_sidecar.sample_at(playhead_beat, &mut mod_scalars_buf);
@@ -494,16 +500,6 @@ fn push_wav_audio(
 pub struct RenderStats {
     pub frames_written: u64,
     pub output_path: PathBuf,
-}
-
-#[inline]
-fn beat_to_seconds(beats: f64, bpm: f32) -> f64 {
-    beats * 60.0 / f64::from(bpm)
-}
-
-#[inline]
-fn seconds_to_beat(seconds: f64, bpm: f32) -> f64 {
-    seconds * f64::from(bpm) / 60.0
 }
 
 /// Build the `Scene` for one playhead beat by walking active video +

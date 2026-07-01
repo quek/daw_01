@@ -41,8 +41,12 @@ pub fn fill_track_param_ramps(
     song: Option<&Song>,
     track_idx: u32,
     sample_rate: u32,
-    bpm: f32,
-    playhead: u64,
+    // M5 (r.md #8 再監査): automation lookup beat は transport の積分済
+    // `playhead_beats` を anchor に、 buffer 内は `current_bpm` で advance する
+    // (SongTempo automation を尊重、 A10 と同経路)。 定 tempo では従来の
+    // `(playhead + i)/samples_per_beat` と bit 同一。
+    current_bpm: f64,
+    playhead_beats: f64,
     frames: u32,
     volume_per_sample: &mut [f32],
     pan_per_sample: &mut [f32],
@@ -72,11 +76,11 @@ pub fn fill_track_param_ramps(
         return;
     };
     let track_id = track.id;
-    if bpm <= 0.0 || sample_rate == 0 {
+    if current_bpm <= 0.0 || sample_rate == 0 {
         return;
     }
-    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(bpm);
-    if samples_per_beat <= 0.0 {
+    let beats_per_frame = current_bpm / (60.0 * f64::from(sample_rate));
+    if beats_per_frame <= 0.0 {
         return;
     }
 
@@ -100,7 +104,7 @@ pub fn fill_track_param_ramps(
             return;
         }
         for (i, slot) in buf.iter_mut().enumerate().take(frames) {
-            let beat = (playhead + i as u64) as f64 / samples_per_beat;
+            let beat = playhead_beats + i as f64 * beats_per_frame;
             let base = match lane {
                 Some(l) => lane_value_at(l, &song.clip_contents, beat),
                 None => f64::from(track_const),
@@ -144,15 +148,19 @@ pub fn fill_pd_param_events(
     track_id: u32,
     device_index: u32,
     sample_rate: u32,
-    bpm: f32,
-    playhead: u64,
+    // M5 (r.md #8 再監査): transport の積分済 `playhead_beats` を anchor に
+    // buffer 内は `current_bpm` で advance (SongTempo automation 尊重、 A10 同経路)。
+    // track/group/master 全経路で同じ引数を渡すので、 旧実装の「master=current_bpm /
+    // track・group=song.bpm」 の不一致も解消。 定 tempo では従来式と bit 同一。
+    current_bpm: f64,
+    playhead_beats: f64,
     frames: u32,
     recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
     // docs/plan_modulation.md §5: follower scalars (block-rate snapshot) so
     // PluginParam lanes with `mod_routings` get modulated. Empty = none.
     mod_scalars: &[f32],
 ) {
-    if frames == 0 || bpm <= 0.0 || sample_rate == 0 {
+    if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
     }
     // master fx (`MASTER_TRACK_ID`) は Track ではないので automation は `song_lanes`、
@@ -170,8 +178,8 @@ pub fn fill_pd_param_events(
         };
         (&track.automation_lanes, &track.mod_routings)
     };
-    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(bpm);
-    if samples_per_beat <= 0.0 {
+    let beats_per_frame = current_bpm / (60.0 * f64::from(sample_rate));
+    if beats_per_frame <= 0.0 {
         return;
     }
     for lane in lanes {
@@ -212,7 +220,7 @@ pub fn fill_pd_param_events(
         let mut f = 0u32;
         let mut last_v = f64::NAN;
         loop {
-            let beat_at_f = (playhead + u64::from(f)) as f64 / samples_per_beat;
+            let beat_at_f = playhead_beats + f64::from(f) * beats_per_frame;
             let v = lane_value_at(lane, &song.clip_contents, beat_at_f);
             if last_v.is_nan() || (v - last_v).abs() > 1e-6 {
                 pd.push_param(f, param_id, v);
@@ -330,7 +338,7 @@ mod tests {
         let mut vol = vec![0.0_f32; 8];
         let mut pan = vec![0.5_f32; 8];
         let empty = empty_recording_lanes();
-        fill_track_param_ramps(None, 0, SR, 120.0, 0, 8, &mut vol, &mut pan, &empty, &[]);
+        fill_track_param_ramps(None, 0, SR, 120.0, 0.0, 8, &mut vol, &mut pan, &empty, &[]);
         assert!(vol.iter().all(|&v| (v - 1.0).abs() < 1e-6));
         assert!(pan.iter().all(|&p| p.abs() < 1e-6));
     }
@@ -355,7 +363,7 @@ mod tests {
             0,
             SR,
             120.0,
-            0,
+            0.0,
             16,
             &mut vol,
             &mut pan,
@@ -380,7 +388,7 @@ mod tests {
             0,
             SR,
             120.0,
-            0,
+            0.0,
             16,
             &mut vol,
             &mut pan,
@@ -406,7 +414,7 @@ mod tests {
             0,
             SR,
             120.0,
-            48_000,
+            2.0,
             4,
             &mut vol,
             &mut pan,
@@ -431,7 +439,7 @@ mod tests {
             0,
             SR,
             120.0,
-            0,
+            0.0,
             4,
             &mut vol,
             &mut pan,
@@ -460,7 +468,7 @@ mod tests {
             0,
             SR,
             120.0,
-            240_000,
+            10.0,
             4,
             &mut vol,
             &mut pan,
@@ -497,7 +505,7 @@ mod tests {
             0,
             SR,
             120.0,
-            48_000,
+            2.0,
             4,
             &mut vol,
             &mut pan,
@@ -529,7 +537,7 @@ mod tests {
             0,
             SR,
             120.0,
-            48_000,
+            2.0,
             4,
             &mut vol,
             &mut pan,
@@ -592,7 +600,7 @@ mod tests {
         let song = one_plugin_param_lane_song();
         let mut pd = ProcessData::empty();
         let empty = empty_recording_lanes();
-        fill_pd_param_events(&mut pd, &song, 7, 0, SR, 120.0, 0, 512, &empty, &[]);
+        fill_pd_param_events(&mut pd, &song, 7, 0, SR, 120.0, 0.0, 512, &empty, &[]);
         assert!(
             pd.n_events_in > 1,
             "ramp は sub-buffer で複数 event を出すべき, got {}",
@@ -629,7 +637,7 @@ mod tests {
         // Not recording: the curve value is pushed as a ParamValue event (read).
         let mut pd = ProcessData::empty();
         let empty = empty_recording_lanes();
-        fill_pd_param_events(&mut pd, &song, track_id, 0, SR, 120.0, 0, 64, &empty, &[]);
+        fill_pd_param_events(&mut pd, &song, track_id, 0, SR, 120.0, 0.0, 64, &empty, &[]);
         assert_eq!(pd.n_events_in, 1, "read mode must push the curve value");
 
         // Recording: the lane is skipped, so no curve event overwrites the
@@ -637,7 +645,7 @@ mod tests {
         let mut pd2 = ProcessData::empty();
         let mut rec = std::collections::HashSet::new();
         rec.insert((track_id, target));
-        fill_pd_param_events(&mut pd2, &song, track_id, 0, SR, 120.0, 0, 64, &rec, &[]);
+        fill_pd_param_events(&mut pd2, &song, track_id, 0, SR, 120.0, 0.0, 64, &rec, &[]);
         assert_eq!(pd2.n_events_in, 0, "recording lane curve must be suppressed");
     }
 
@@ -682,7 +690,7 @@ mod tests {
             0,
             SR,
             120.0,
-            0,
+            0.0,
             64,
             &empty,
             &[],
@@ -703,7 +711,7 @@ mod tests {
             1,
             SR,
             120.0,
-            0,
+            0.0,
             64,
             &empty,
             &[],

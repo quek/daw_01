@@ -2053,6 +2053,11 @@ pub struct AppData {
     pub recent_saved_labels: Vec<String>,
 
     pub is_dirty: bool,
+    /// H2 (r.md #8): MIDI-CC → plugin param 等、 1 frame に多数届き得る realtime
+    /// edit の plugin-host 再 sync を **1 frame 1 回に coalesce** するフラグ。 handler
+    /// が立て、 runner が frame ごとに `flush_pending_host_sync` で消費する
+    /// (毎 CC の full LoadSong flood = stutter/dropout を防ぐ)。
+    pub pending_host_sync: bool,
     pub last_autosave: std::time::Instant,
     /// Crash-recovery session id (uuid v4)。 起動時に AppData::new で 1 回生成、
     /// 未保存プロジェクトの autosave file 名 (`<id>.autosave.daw`) と
@@ -2493,6 +2498,7 @@ impl AppData {
             recent_files_labels: Vec::new(),
             recent_saved_labels: Vec::new(),
             is_dirty: false,
+            pending_host_sync: false,
             last_autosave: std::time::Instant::now(),
             recovery_session_id: common::recovery::new_session_id(),
             recovery_candidates,
@@ -8131,6 +8137,14 @@ impl AppData {
         };
         if let Err(e) = tx.send(msg) {
             tracing::error!(error = %e, "failed to enqueue plugin command");
+        }
+    }
+
+    /// H2 (r.md #8): frame ごとに 1 回呼ばれ、 pending な realtime edit
+    /// (MIDI-CC → plugin param 等) の plugin-host 再 sync を coalesce して flush する。
+    pub(crate) fn flush_pending_host_sync(&mut self) {
+        if std::mem::take(&mut self.pending_host_sync) {
+            self.sync_song_to_plugin_host();
         }
     }
 
@@ -14403,6 +14417,7 @@ impl AppData {
                         track: tp.track_id,
                         device_index,
                         param_id,
+                        legacy_slot: None,
                     });
                 }
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => {
@@ -14495,6 +14510,7 @@ impl AppData {
                 track,
                 device_index,
                 param_id,
+                ..
             } => {
                 // B2 (r.md #8): CC → plugin param。 param range で CC 0..1 を実
                 // value_real (min..max) に変換し、 inspector knob と同じ lane-
@@ -14511,7 +14527,11 @@ impl AppData {
                     None => f64::from(v_norm),
                 };
                 self.set_plugin_param_on_track(track, device_index, param_id, value_real);
-                self.sync_song_to_plugin_host();
+                // H2 (r.md #8): 毎 CC で full LoadSong を送ると knob sweep で IPC が
+                // flood して stutter/dropout する。 pending flag を立て runner が frame
+                // ごとに 1 回だけ sync する (inspector drag の is_dragging coalesce と
+                // 同思想。 realtime 応答は frame rate = 十分)。
+                self.pending_host_sync = true;
             }
         }
     }
@@ -20902,18 +20922,67 @@ impl AppData {
             common::model::AutomationTarget::SongTempo
                 | common::model::AutomationTarget::SongTimeSigNumerator
         ) || track_id == common::model::MASTER_TRACK_ID;
+        // L8 (r.md #8): track 不在なら content_id を alloc する前に return する
+        // (orphan AutomationContent leak を防ぐ)。 song-level は track 不要。
+        if !is_song_level && self.song.track_by_id(track_id).is_none() {
+            return None;
+        }
         let default_value = self.lane_default_for_target(&TouchedParam {
             track_id,
             target: target.clone(),
             display_name: String::new(),
             touched_at: std::time::Instant::now(),
         });
-        let content_id = self.song.alloc_content_id();
-        self.song
-            .clip_contents
-            .insert(content_id, ClipContent::Automation(AutomationContent::default()));
         let clip_start = playhead_beat.floor().max(0.0);
-        let clip_len = (self.song.length_beats - clip_start).max(4.0);
+        // M6 (r.md #8): 既存 lane の clip 配置を content alloc の前に読む (borrow 分離)。
+        // (a) clip_start を含む clip があれば **再利用** (重複 clip を作らない)、
+        // (b) 無ければ clip_start より後の最近接 clip 開始 (無ければ song 末尾) までに
+        //     length を制限する (前方の既存 clip と重なる clip を作らない)。
+        let (reuse, next_clip_start) = {
+            let lanes: &[AutomationLane] = if is_song_level {
+                &self.song.song_lanes
+            } else {
+                self.song
+                    .track_by_id(track_id)
+                    .map(|t| t.automation_lanes.as_slice())
+                    .unwrap_or(&[])
+            };
+            match lanes.iter().find(|l| &l.target == target) {
+                Some(l) => {
+                    let reuse = l
+                        .clips
+                        .iter()
+                        .find(|c| {
+                            clip_start >= c.start_beat
+                                && clip_start < c.start_beat + c.length_beats
+                        })
+                        .map(|c| (c.start_beat, c.content_id));
+                    let next = l
+                        .clips
+                        .iter()
+                        .map(|c| c.start_beat)
+                        .filter(|&s| s > clip_start)
+                        .fold(f64::INFINITY, f64::min);
+                    (reuse, next)
+                }
+                None => (None, f64::INFINITY),
+            }
+        };
+        if let Some(reuse) = reuse {
+            return Some(reuse);
+        }
+        let clip_len = if next_clip_start.is_finite() {
+            (next_clip_start - clip_start).max(0.0)
+        } else {
+            (self.song.length_beats - clip_start).max(4.0)
+        };
+        // L11 (r.md #8): alloc_content で content + 表示名 "Rec" を同時登録する。
+        // 旧実装は AutomationClip.name="Rec" を設定していたが、 arrangement view は
+        // content_name(content_id) を描くので "Rec" が表示されなかった。
+        let content_id = self.song.alloc_content(
+            ClipContent::Automation(AutomationContent::default()),
+            "Rec".into(),
+        );
         if is_song_level {
             self.master_row_automation_expanded = true;
             if let Some(lane) = self.song.song_lanes.iter_mut().find(|l| &l.target == target) {

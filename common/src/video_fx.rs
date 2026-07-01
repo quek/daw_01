@@ -945,8 +945,12 @@ const ECHO_TRAILS: VideoFxDef = VideoFxDef {
 fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
     // 前フレーム出力を decay 倍した残像。
     let prev = history(uv);
-    let trail_rgb = prev.rgb * P.decay;
-    let trail_a = prev.a * P.decay;
+    // frame-rate 非依存の減衰 (r.md #8 M4): decay は 60fps 基準値。 song 時間 Δt
+    // (P.dt) で正規化し、 preview (可変 fps) と export (固定 fps)、 負荷変動でも
+    // 残像の「時間あたり減衰」を一致させる。
+    let d = pow(P.decay, P.dt * 60.0);
+    let trail_rgb = prev.rgb * d;
+    let trail_a = prev.a * d;
     // 現フレームと残像を max 合成 (発光の尾)。
     let echoed_rgb = max(src.rgb, trail_rgb);
     let echoed_a = max(src.a, trail_a);

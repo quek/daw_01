@@ -1959,62 +1959,87 @@ fn plugin_main_loop(
         // this-thread mutate → republish) を該当 1 plugin に適用し、 他 plugin は乱さ
         // ない。 latency 変更は再 query して PluginLatencyChanged を再 emit する。
         while let Ok((track, index, flags)) = gui_restart_rx.try_recv() {
-            // VST3 RestartFlags (ivstcomponent.h): kReloadComponent=1<<3 /
-            // kIoChanged=1<<4 / kLatencyChanged=1<<6 が再 activate を要する。
-            const VST3_REACTIVATE: i32 = (1 << 3) | (1 << 4) | (1 << 6);
-            if flags & VST3_REACTIVATE == 0 {
+            // VST3 RestartFlags の反応 (r.md #8 C3 + code-review 再修正):
+            //   kReloadComponent=1 / kIoChanged=2 → component の完全な再 activate
+            //     (deactivate→activate) が必要。
+            //   kLatencyChanged=8 → **latency の再 query のみ**。 ここで
+            //     deactivate→activate すると多くの VST3 (Melda 等) が activate の
+            //     たびに kLatencyChanged を再送 → 無限 reinit ループ (plugin が
+            //     detach され続け GUI が開けず・音が壊れる。 実機で 10k+ reinit/97s
+            //     を観測)。 spec 上も latency 変更に component reload は不要。
+            //   kParamTitlesChanged=16 / kNoteExpressionChanged=64 等の cosmetic は無視。
+            use vst3::Steinberg::Vst::RestartFlags_;
+            const VST3_REACTIVATE: i32 =
+                RestartFlags_::kReloadComponent | RestartFlags_::kIoChanged;
+            let needs_reinit = flags & VST3_REACTIVATE != 0;
+            let latency_changed = flags & RestartFlags_::kLatencyChanged != 0;
+            if !needs_reinit && !latency_changed {
                 continue;
             }
             let Some(&pid) = plugin_lookup.get(&(track, index)) else {
                 continue;
             };
-            let saved = plugin_registry
-                .load()
-                .get(pid as usize)
-                .and_then(|o| o.as_ref())
-                .map(|e| (e.plugin.0, e.process_data, e.track, e.index));
-            let Some((ptr, pd, etrack, eindex)) = saved else {
-                continue;
-            };
-            // (1) detach so workers skip it, (2) drain in-flight dispatch.
-            publish_plugin_registry(&plugin_registry, pid, None);
-            if let Some(pool) = worker_pool.as_ref() {
-                pool.quiesce();
-            }
-            // (3) full lifecycle reset on this (plugin-main) thread.
             let mut new_latency = None;
-            if let Some(chain) = tracks.tracks.chains.get_mut(&track)
-                && let Some(plugin) = chain.devices.get_mut(index as usize)
-            {
-                plugin.stop_processing();
-                plugin.deactivate();
-                if let Err(e) =
-                    plugin.activate(f64::from(session.sample_rate), 64, session.max_frames)
+            if needs_reinit {
+                // ReinitAllPlugins と同じ安全契約 (registry detach → worker quiesce →
+                // this-thread mutate → republish) を該当 1 plugin に適用。 activate が
+                // kLatencyChanged を再送しても次 iteration の latency-only 経路に落ちる
+                // ので reinit ループにならない。
+                let saved = plugin_registry
+                    .load()
+                    .get(pid as usize)
+                    .and_then(|o| o.as_ref())
+                    .map(|e| (e.plugin.0, e.process_data, e.track, e.index));
+                let Some((ptr, pd, etrack, eindex)) = saved else {
+                    continue;
+                };
+                // (1) detach so workers skip it, (2) drain in-flight dispatch.
+                publish_plugin_registry(&plugin_registry, pid, None);
+                if let Some(pool) = worker_pool.as_ref() {
+                    pool.quiesce();
+                }
+                // (3) full lifecycle reset on this (plugin-main) thread.
+                if let Some(chain) = tracks.tracks.chains.get_mut(&track)
+                    && let Some(plugin) = chain.devices.get_mut(index as usize)
                 {
-                    tracing::error!(error = ?e, track, index, "restartComponent reinit: activate failed");
+                    plugin.stop_processing();
+                    plugin.deactivate();
+                    if let Err(e) =
+                        plugin.activate(f64::from(session.sample_rate), 64, session.max_frames)
+                    {
+                        tracing::error!(error = ?e, track, index, "restartComponent reinit: activate failed");
+                    }
+                    if let Err(e) = plugin.start_processing() {
+                        tracing::error!(error = ?e, "restartComponent reinit: start_processing failed");
+                    }
+                    plugin.reset();
+                    new_latency = Some(plugin.query_latency());
                 }
-                if let Err(e) = plugin.start_processing() {
-                    tracing::error!(error = ?e, "restartComponent reinit: start_processing failed");
+                // (4) republish (Box address unchanged → PluginPtr stays valid).
+                publish_plugin_registry(
+                    &plugin_registry,
+                    pid,
+                    Some(PluginEntry {
+                        plugin: PluginPtr(ptr),
+                        process_data: pd,
+                        track: etrack,
+                        index: eindex,
+                    }),
+                );
+                tracing::info!(track, index, flags, "restartComponent: reinitialised plugin");
+            } else if latency_changed {
+                // kLatencyChanged のみ: reinit せず latency を再 query するだけ
+                // (無限ループ回避)。 plugin は active のままなので query 可能。
+                if let Some(chain) = tracks.tracks.chains.get_mut(&track)
+                    && let Some(plugin) = chain.devices.get_mut(index as usize)
+                {
+                    new_latency = Some(plugin.query_latency());
                 }
-                plugin.reset();
-                new_latency = Some(plugin.query_latency());
             }
-            // (4) republish (Box address unchanged → PluginPtr stays valid).
-            publish_plugin_registry(
-                &plugin_registry,
-                pid,
-                Some(PluginEntry {
-                    plugin: PluginPtr(ptr),
-                    process_data: pd,
-                    track: etrack,
-                    index: eindex,
-                }),
-            );
-            // (5) latency 再 emit (kLatencyChanged の主目的)。
+            // latency 再 emit (reinit 後 / kLatencyChanged の PDC 更新)。
             if let Some(samples) = new_latency {
                 let _ = evt_tx.send(PluginEvent::PluginLatencyChanged { plugin_id: pid, samples });
             }
-            tracing::info!(track, index, flags, "restartComponent: reinitialised plugin");
         }
 
         // handle editor windows the user closed via the window's

@@ -933,6 +933,9 @@ impl Runner {
 
         let screen = state.renderer.size();
         state.scene.clear();
+        // H2 (r.md #8): coalesce した plugin-host 再 sync を frame 1 回 flush する
+        // (MIDI-CC 等が 1 frame に多数届いても full LoadSong は 1 回に抑える)。
+        state.app.flush_pending_host_sync();
         let input = state.input.take_input();
 
         state.ui.frame(

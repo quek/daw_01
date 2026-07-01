@@ -38,6 +38,9 @@ const PEAK_HOLD_DEFAULT_MS: u128 = 1500;
 /// 立ち上がり) と減衰比 (overshoot ≈1.5%)。
 const VU_OMEGA: f32 = std::f32::consts::TAU / 0.3;
 const VU_ZETA: f32 = 0.8;
+/// VU 2 次系を semi-implicit Euler で積分する際の固定 sub-step (秒)。 安定限界
+/// (この ω/ζ で ~0.0459s) に十分な余裕。 大 dt はこの刻みに分割して発散を防ぐ (M4→E4)。
+const VU_MAX_STEP: f32 = 0.01;
 
 /// `scale = Some` 時、 L バーの **左** に確保する tick 用ガター幅 (px)。
 const SCALE_TICK_GUTTER_W: f32 = 6.0;
@@ -254,12 +257,22 @@ impl ChannelMeter {
         let dt = self
             .last_update
             .map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32())
-            .clamp(0.0, 0.05);
+            .clamp(0.0, 0.25);
         self.last_update = Some(now);
-        let accel = VU_OMEGA * VU_OMEGA * (abs - self.vu_smoothed)
-            - 2.0 * VU_ZETA * VU_OMEGA * self.vu_velocity;
-        self.vu_velocity += accel * dt;
-        self.vu_smoothed = (self.vu_smoothed + self.vu_velocity * dt).max(0.0);
+        // semi-implicit Euler の安定限界はこの 2 次系 (ω≈20.94, ζ=0.8) で
+        // dt<~0.0459 s。 大 dt (低フレームレート) をそのまま積分すると発散する
+        // ため、 固定 sub-step に分割して積分する。 こうすると発振せず、 かつ
+        // frame-rate 非依存の正しい時定数を保つ (旧実装は 0.05 に clamp するだけで、
+        // 上限が安定限界を超えており、 持続的に ≤~21fps だと発振→NaN で張り付いた)。
+        let mut remaining = dt;
+        while remaining > 0.0 {
+            let step = remaining.min(VU_MAX_STEP);
+            let accel = VU_OMEGA * VU_OMEGA * (abs - self.vu_smoothed)
+                - 2.0 * VU_ZETA * VU_OMEGA * self.vu_velocity;
+            self.vu_velocity += accel * step;
+            self.vu_smoothed = (self.vu_smoothed + self.vu_velocity * step).max(0.0);
+            remaining -= step;
+        }
 
         let display = match ballistic {
             MeterBallistic::Peak => self.peak,

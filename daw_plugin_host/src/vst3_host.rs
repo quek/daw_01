@@ -189,6 +189,11 @@ impl IAttributeListTrait for Vst3AttributeList {
         let Some(AttrValue::Str(v)) = map.get(&attr_key(id)) else {
             return kResultFalse;
         };
+        // 末尾 null (1 TChar = 2 bytes) すら入らない buffer には書かない
+        // (`*string.add(0) = 0` が 0/1-byte buffer で OOB になるのを防ぐ)。
+        if (size_in_bytes as usize) < 2 {
+            return kInvalidArgument;
+        }
         // size_in_bytes / 2 = TChar 容量、 末尾 null 用に 1 残す。
         let cap = (size_in_bytes as usize / 2).saturating_sub(1);
         let n = v.len().min(cap);

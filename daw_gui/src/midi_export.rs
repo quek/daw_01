@@ -71,7 +71,11 @@ fn build_meta_track(song: &Song) -> Vec<TrackEvent<'static>> {
 
     // Tempo: SongTempo curve を展開した各 breakpoint。
     for (tick, bpm) in tempo_breakpoints(song) {
-        let tempo_us = (60_000_000.0_f64 / f64::from(bpm.max(1.0))).round() as u32;
+        // `u24::from` は下位 24bit マスクの lossy 変換なので、 u24 上限
+        // (16_777_215 = 約 3.58 BPM) を超える低速テンポは飽和させる (旧実装は
+        // 1 BPM = 60_000_000 が ~6.2 BPM に化けていた)。
+        let tempo_us = ((60_000_000.0_f64 / f64::from(bpm.max(1.0))).round() as u32)
+            .min(0x00FF_FFFF);
         metas.push((tick, MetaMessage::Tempo(u24::from(tempo_us))));
     }
 

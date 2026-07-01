@@ -550,7 +550,7 @@ fn arrangement_for_bus(
         3 => SpeakerArr::k30Cine, // L R C
         4 => SpeakerArr::k40Music, // quad: L R Ls Rs
         6 => SpeakerArr::k51, // 5.1: L R C Lfe Ls Rs
-        8 => SpeakerArr::k71Cine, // 7.1
+        8 => SpeakerArr::k71Music, // 7.1 (side surround — 音楽制作で一般的な layout)
         _ => fallback,
     }
 }
@@ -1046,10 +1046,10 @@ impl LoadedPlugin for Vst3Plugin {
         // MSoundFactory は main + sidechain + sub) で arrangement 不整合に
         // なり、 plugin が処理を停止していた。
         //
-        // 各 bus の channel count を `getBusInfo` で query → mono なら
-        // kMono、 2 なら kStereo、 4 以上なら kStereoSurround (落とせる範囲で
-        // 近似)。 plugin が拒否 (kResultFalse) した場合はそのまま続行 — 多くの
-        // plugin は内部で best-effort fallback する。
+        // 各 bus の channel count を `getBusInfo` で query → `arrangement_for_bus`
+        // が標準 layout (mono / stereo / 3.0 / quad / 5.1 / 7.1) にマップし、
+        // 非標準 ch 数のみ stereo fallback。 plugin が拒否 (kResultFalse) した
+        // 場合はそのまま続行 — 多くの plugin は内部で best-effort fallback する。
         let in_arr_count = unsafe {
             self.component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput)
         };

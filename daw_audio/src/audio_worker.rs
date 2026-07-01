@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering,
 };
 use std::thread::JoinHandle;
 
@@ -62,7 +62,6 @@ pub struct DispatchShared {
     pub master_r_base: AtomicPtr<f32>,
     pub master_len: AtomicU32,
     pub sample_rate: AtomicU32,
-    pub playhead: AtomicU64,
     pub frames: AtomicU32,
     pub playing: AtomicU8,
     pub any_solo: AtomicU8,
@@ -125,7 +124,6 @@ impl DispatchShared {
             master_r_base: AtomicPtr::new(std::ptr::null_mut()),
             master_len: AtomicU32::new(0),
             sample_rate: AtomicU32::new(48_000),
-            playhead: AtomicU64::new(0),
             frames: AtomicU32::new(0),
             playing: AtomicU8::new(0),
             any_solo: AtomicU8::new(0),
@@ -217,7 +215,6 @@ impl AudioWorkerPool {
         master_l: &mut [f32],
         master_r: &mut [f32],
         sample_rate: u32,
-        playhead: u64,
         frames: u32,
         playing: bool,
         any_solo: bool,
@@ -278,7 +275,6 @@ impl AudioWorkerPool {
             .master_len
             .store(master_l.len() as u32, Ordering::Release);
         self.shared.sample_rate.store(sample_rate, Ordering::Release);
-        self.shared.playhead.store(playhead, Ordering::Release);
         self.shared.frames.store(frames, Ordering::Release);
         self.shared
             .playing
@@ -443,7 +439,6 @@ fn run_work_loop(shared: &DispatchShared) {
     let worker_syncs_base = shared.worker_syncs_base.load(Ordering::Acquire);
     let n_worker_syncs = shared.n_worker_syncs.load(Ordering::Acquire);
     let sample_rate = shared.sample_rate.load(Ordering::Acquire);
-    let playhead = shared.playhead.load(Ordering::Acquire);
     let frames = shared.frames.load(Ordering::Acquire);
     let playing = shared.playing.load(Ordering::Acquire) != 0;
     let any_solo = shared.any_solo.load(Ordering::Acquire) != 0;
@@ -567,7 +562,6 @@ fn run_work_loop(shared: &DispatchShared) {
             audio_renderer,
             worker_sync,
             sample_rate,
-            playhead,
             frames,
             playing,
             Some(song),

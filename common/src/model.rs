@@ -615,8 +615,15 @@ pub enum BindingTarget {
     /// 経路で plugin host へ反映する。
     PluginParam {
         track: u32,
+        #[serde(default)]
         device_index: u32,
         param_id: u32,
+        /// v22 以前 migration 用 (deserialize 専用)。 旧 save は `slot: PluginSlot`
+        /// を持つ。 `Song::ensure_ids` が flatten 前に device_index へ写像する
+        /// (r.md #8 M7: 旧 project の PluginParam binding があると device_index 欠落で
+        /// project 全体の deserialize が失敗していたのを是正)。
+        #[serde(default, rename = "slot", skip_serializing)]
+        legacy_slot: Option<crate::protocol::PluginSlot>,
     },
 }
 
@@ -1424,6 +1431,36 @@ impl Song {
         // 単一 `devices` へ平坦化し、automation lane の旧 slot を device_index へ
         // 写像する。新形式 (devices 既存) は no-op。pass 1/2 の前に実行する必要が
         // ある (pass 2 の sidechain remap は `devices` を走査するため)。
+        //
+        // M7 (r.md #8): BindingTarget::PluginParam の旧 `slot` を device_index へ
+        // 写像する。 flatten が legacy 3-split を消費する **前** に行う (automation
+        // lane の legacy_slot は flatten 内で処理される)。 新形式 (legacy_slot=None)
+        // は no-op。 旧 project の PluginParam MIDI binding が device_index 欠落で
+        // deserialize 全体を落としていたのを是正。
+        for binding in &mut self.midi_bindings {
+            let BindingTarget::PluginParam {
+                track,
+                device_index,
+                legacy_slot,
+                ..
+            } = &mut binding.target
+            else {
+                continue;
+            };
+            let Some(slot) = legacy_slot.take() else {
+                continue;
+            };
+            if let Some(t) = self.tracks.iter().find(|t| t.id == *track) {
+                use crate::protocol::PluginSlot;
+                let n_midi = t.legacy_midi_fx_chain.len() as u32;
+                let has_inst = t.legacy_instrument.is_some() as u32;
+                *device_index = match slot {
+                    PluginSlot::MidiFx(i) => i,
+                    PluginSlot::Instrument => n_midi,
+                    PluginSlot::Fx(i) => n_midi + has_inst + i,
+                };
+            }
+        }
         for track in &mut self.tracks {
             track.flatten_legacy_devices();
         }
@@ -6416,6 +6453,39 @@ mod tests {
         // 範囲外 / 不在 track は false (no-op)。
         assert!(!song.remove_track_send(42, 99));
         assert!(!song.remove_track_send(999, 0));
+    }
+
+    /// r.md #8 M7: 旧 project (v22) の PluginParam MIDI binding は `slot` を持つ。
+    /// device_index に `#[serde(default)]` + legacy_slot (`rename="slot"`) を付けたので、
+    /// 旧 JSON が deserialize 失敗せず legacy_slot に載る (= 旧実装では project 全体が
+    /// load 不能になっていたのを是正)。 新形式・bincode 往復 (IPC) も維持。
+    #[test]
+    fn binding_target_plugin_param_legacy_slot_compat() {
+        use crate::protocol::PluginSlot;
+        // 旧 JSON: device_index の代わりに slot。
+        let json = r#"{"PluginParam":{"track":3,"slot":{"Fx":1},"param_id":7}}"#;
+        let bt: BindingTarget = serde_json::from_str(json).expect("旧 slot 形式が load できる");
+        assert_eq!(
+            bt,
+            BindingTarget::PluginParam {
+                track: 3,
+                device_index: 0, // 未 migration (ensure_ids が解決)
+                param_id: 7,
+                legacy_slot: Some(PluginSlot::Fx(1)),
+            }
+        );
+        // 新 JSON (device_index) も従来どおり load。
+        let json_new = r#"{"PluginParam":{"track":1,"device_index":2,"param_id":5}}"#;
+        let bt2: BindingTarget = serde_json::from_str(json_new).unwrap();
+        assert!(matches!(
+            bt2,
+            BindingTarget::PluginParam { device_index: 2, legacy_slot: None, .. }
+        ));
+        // bincode 往復 (IPC 経路): legacy_slot=None で round-trip 一致。
+        let cfg = bincode::config::standard();
+        let bytes = bincode::encode_to_vec(bt2, cfg).unwrap();
+        let (back, _): (BindingTarget, usize) = bincode::decode_from_slice(&bytes, cfg).unwrap();
+        assert_eq!(bt2, back);
     }
 
     #[test]

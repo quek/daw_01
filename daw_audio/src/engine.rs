@@ -546,8 +546,10 @@ impl LocalState {
         }
 
         // Recycle the superseded snapshot off the audio thread. The very first
-        // install has no prior song; its old schedule/tempo are the empty/
-        // default initial values (no heap), cheap to drop here.
+        // install has no prior song; its old schedule is empty and its old tempo
+        // map is the tiny default (a ~17-entry `Vec<f64>`), so this is a one-time
+        // drop on the first buffer at stream startup (before playback), not a
+        // steady-state RT free. Every subsequent install recycles off-thread.
         if let Some(old_song) = old_song {
             let recycled = CompiledRouting {
                 song: old_song,
@@ -1011,7 +1013,6 @@ impl LocalState {
                     &mut self.master_l[..n],
                     &mut self.master_r[..n],
                     sample_rate,
-                    playhead,
                     n as u32,
                     playing,
                     any_solo,
@@ -1043,7 +1044,6 @@ impl LocalState {
                         Some(audio_renderer),
                         worker_sync,
                         sample_rate,
-                        playhead,
                         n as u32,
                         playing,
                         Some(song),
@@ -1104,7 +1104,6 @@ impl LocalState {
                 current_bpm,
                 self.playhead_beats,
                 looping,
-                playhead,
                 recording_lanes,
                 &self.mod_scalars_snapshot,
             );
@@ -1337,7 +1336,6 @@ pub fn process_track_owned(
     audio_renderer: Option<&AudioClipRenderer>,
     worker_sync: Option<&WorkerSyncRef>,
     sample_rate: u32,
-    playhead: u64,
     frames: u32,
     playing: bool,
     song: Option<&Song>,
@@ -1529,21 +1527,13 @@ pub fn process_track_owned(
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
         set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
-        if let Some(song) = song {
-            crate::automation::fill_pd_param_events(
-                pd,
-                song,
-                track_id,
-                i as u32,
-                sample_rate,
-                song.bpm,
-                playhead,
-                frames,
-                recording_lanes,
-                mod_scalars,
-            );
-        }
         // ---- inputs: device の port を持つものだけ現在のバスを渡す ----
+        // M1 (r.md #8): note を param automation より **先に** push する。 B4 の
+        // sub-buffer param automation は events_in (MAX_EVENTS=256) を最大
+        // frames/64 event/lane 消費するので、 param を先に積むと大量 automation 時に
+        // 後続の NoteOff が溢れて drop → ハングノートになる。 note を先に確保すれば
+        // 溢れるのは automation 側だけ (= 音は詰まらず automation が step するのみ)。
+        // plugin host は event を time 順に sort するので発音順序は不変。
         if ports.has_note_input {
             for ev in &scratch.midi_bus_a {
                 match ev.event {
@@ -1555,6 +1545,20 @@ pub fn process_track_owned(
                     }
                 }
             }
+        }
+        if let Some(song) = song {
+            crate::automation::fill_pd_param_events(
+                pd,
+                song,
+                track_id,
+                i as u32,
+                sample_rate,
+                f64::from(current_bpm),
+                playhead_beats,
+                frames,
+                recording_lanes,
+                mod_scalars,
+            );
         }
         if ports.has_audio_input {
             pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
@@ -1667,8 +1671,8 @@ pub fn process_track_owned(
         song,
         track_idx,
         sample_rate,
-        current_bpm,
-        playhead,
+        f64::from(current_bpm),
+        playhead_beats,
         frames,
         &mut scratch.volume_per_sample,
         &mut scratch.pan_per_sample,
@@ -1747,8 +1751,7 @@ pub fn reduce_master(
 ///
 /// master fx param automation / 変調 (r.md #8): master 固有データ (`song_lanes` の
 /// PluginParam lane + `song_mod_routings`) を `fill_pd_param_events(MASTER_TRACK_ID, i)`
-/// で適用する (= track / group fx と同一経路)。 `recording_lanes` / `mod_scalars` /
-/// `playhead` (sample) はそのために追加。
+/// で適用する (= track / group fx と同一経路)。 `recording_lanes` / `mod_scalars` を追加。
 /// RT 規約: ヒープ確保 / lock / I/O なし。 buffer は呼び出し側が事前確保した
 /// `master_l/r` と plugin 側 ProcessData shmem のみを使う。
 #[allow(clippy::too_many_arguments)]
@@ -1766,7 +1769,6 @@ pub fn process_master_fx_chain(
     current_bpm: f32,
     playhead_beats: f64,
     looping: bool,
-    playhead: u64,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     mod_scalars: &[f32],
 ) {
@@ -1798,8 +1800,8 @@ pub fn process_master_fx_chain(
                 common::model::MASTER_TRACK_ID,
                 i as u32,
                 sample_rate,
-                current_bpm,
-                playhead,
+                f64::from(current_bpm),
+                playhead_beats,
                 frames,
                 recording_lanes,
                 mod_scalars,
@@ -1973,7 +1975,6 @@ pub fn execute_schedule_post_dispatch(
                     slot_to_plugin_id,
                     worker_sync,
                     sample_rate,
-                    playhead,
                     frames,
                     playing,
                     any_solo,
@@ -2406,7 +2407,6 @@ fn run_group_fx_chain(
     slot_to_plugin_id: &HashMap<(u32, u32), u32>,
     worker_sync: Option<&WorkerSyncRef>,
     sample_rate: u32,
-    playhead: u64,
     frames: u32,
     playing: bool,
     any_solo: bool,
@@ -2475,8 +2475,8 @@ fn run_group_fx_chain(
             track_id,
             i as u32,
             sample_rate,
-            song.bpm,
-            playhead,
+            f64::from(current_bpm),
+            playhead_beats,
             frames,
             recording_lanes,
             // B3 (r.md #8): group fx PluginParam の follower 変調 snapshot を渡す
@@ -2538,8 +2538,8 @@ fn run_group_fx_chain(
         Some(song),
         track_idx,
         sample_rate,
-        song.bpm,
-        playhead,
+        f64::from(current_bpm),
+        playhead_beats,
         frames,
         &mut scratch.volume_per_sample,
         &mut scratch.pan_per_sample,

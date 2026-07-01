@@ -347,6 +347,10 @@ pub struct VideoFxEngine {
     /// アニメに使う。preview/export 一致のため wall-clock でなく song 時間（playhead_beat ×
     /// 60/bpm）を caller が毎 frame [`set_time`](Self::set_time) で渡す。
     current_time: f32,
+    /// 前 frame からの Δtime（秒、song 時間）。[`set_time`] が差分から算出。
+    /// feedback 効果 (Echo Trails) の減衰を frame-rate 非依存にするため
+    /// `pow(decay, dt * 60)` で使う (r.md #8 M4)。seek/jump は clamp でガード。
+    frame_dt: f32,
 }
 
 /// device に紐づく共有リソース (sampler + bind group layout)。
@@ -367,6 +371,10 @@ impl VideoFxEngine {
     /// 合成（`apply_chain`）の前に song 時間（`playhead_beat * 60/bpm`）を渡す。
     /// preview/export で同じ song 時間を渡せば時間系効果も一致する。
     pub fn set_time(&mut self, secs: f32) {
+        // Echo Trails 等 feedback 効果の減衰を frame-rate 非依存にするための Δtime
+        // (r.md #8 M4)。seek/jump/逆再生を [0, 0.1s] に clamp (巨大 dt で trail が
+        // 一気に飛ぶ / 負値で増幅するのを防ぐ)。
+        self.frame_dt = (secs - self.current_time).clamp(0.0, 0.1);
         self.current_time = secs;
     }
 
@@ -664,7 +672,7 @@ impl VideoFxEngine {
             let b3_view = hist_view.as_ref().unwrap_or(&in_view);
 
             let ubuf =
-                make_uniform_buffer(&device, def, params, resolution, texel, self.current_time);
+                make_uniform_buffer(&device, def, params, resolution, texel, self.current_time, self.frame_dt);
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(def.id),
                 layout: &self.ensure_common(&device).layout,
@@ -730,6 +738,7 @@ impl VideoFxEngine {
                 resolution,
                 texel,
                 self.current_time,
+                self.frame_dt,
             );
             let blit_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("video_fx history blit"),
@@ -819,11 +828,13 @@ fn make_uniform_buffer(
     resolution: [f32; 2],
     texel: [f32; 2],
     time: f32,
+    dt: f32,
 ) -> wgpu::Buffer {
     let mut data: Vec<f32> = Vec::with_capacity(8 + def.params.len() + 3);
     data.extend_from_slice(&[resolution[0], resolution[1], texel[0], texel[1]]);
     data.push(time); // P.time（秒）。ノイズ/スキャンライン等の時間系効果用。
-    data.extend_from_slice(&[0.0, 0.0, 0.0]); // pad0..2 (prelude を 8 float = 32B に)
+    data.push(dt); // P.dt（秒）。feedback 減衰の frame-rate 正規化用 (r.md #8 M4)。
+    data.extend_from_slice(&[0.0, 0.0]); // pad1..2 (prelude を 8 float = 32B に)
     for (i, _p) in def.params.iter().enumerate() {
         data.push(params.get(i).copied().unwrap_or(0.0));
     }
@@ -864,7 +875,7 @@ pub fn assemble_module(def: &VideoFxDef, pass: usize) -> String {
     resolution: vec2<f32>,
     texel: vec2<f32>,
     time: f32,
-    _pad0: f32,
+    dt: f32,
     _pad1: f32,
     _pad2: f32,
 {param_fields}{tail_fields}}};
