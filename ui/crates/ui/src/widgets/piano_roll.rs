@@ -2481,7 +2481,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let sub_grid_key: u64 = view.sub_grid_interval_beats.map_or(0, f64::to_bits);
         let viewport_key = (
             (
-                b"piano_roll_widget_v3" as &[u8],
+                b"piano_roll_widget_v4" as &[u8],
                 view.start_beat.to_bits(),
                 view.len_beats.to_bits(),
                 view.pitch_top.to_bits(),
@@ -2502,6 +2502,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 ),
             ),
             internal_note_hash,
+            // cached primitives は絶対座標で再生されるため widget 位置も key に
+            // 含める — 「サイズ不変で位置だけ動く」 layout 変化で旧座標に描かれる
+            // のを防ぐ (arrangement viewport_key と同 class の同件)。
+            (grid.x.to_bits(), grid.y.to_bits()),
         );
 
         // M13 Phase 55: library `time_ruler` / `bar_beat_grid` を呼ぶための共通 mapping。

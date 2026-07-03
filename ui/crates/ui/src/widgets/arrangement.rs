@@ -2839,6 +2839,11 @@ pub(crate) struct ArrangementState {
     /// 端スクロールは「press からここまでの移動が `ACTIVATE_PX` 以上」 のときのみ発火させ、端近くの
     /// clip を click-and-hold しただけで view が動くのを防ぐ (実 DAW は実ドラッグで初めて端スクロール)。
     edge_scroll_press: Option<(f32, f32)>,
+    /// 直近 primary press 時の modifier snapshot。 track header の SelectTrack
+    /// (release frame で確定する click) が読む — release frame の `pointer.modifiers`
+    /// 生読みは「ModifiersChanged が MouseInput(Released) より先に届く」 race で
+    /// Ctrl/Shift+click が Single に化ける (drag session の `last_*` と同 class)。
+    press_modifiers: Modifiers,
 }
 
 /// M14 Phase 63k (#025): audio_drag の commit / overlay で共有する計算結果。
@@ -5702,6 +5707,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let in_ruler = ruler.contains(px, py);
             let shift = pointer.modifiers.shift;
             let ctrl = pointer.modifiers.ctrl;
+            // release frame で確定する click 系 (track header SelectTrack) 用の
+            // press 時 modifier snapshot (`press_modifiers` doc 参照)。
+            {
+                let state: &mut ArrangementState = self.widget_state(wid);
+                state.press_modifiers = pointer.modifiers;
+            }
 
             // M14 Phase 63n-5 (#030): lane 下端 splitter hit (= body x range × lane bottom edge ±handle)
             // を **最優先** で判定。 hit したら resize drag session を起動して以降の press logic を skip
@@ -9920,8 +9931,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // RangeFromAnchor (Shift) → anchor から visible 列の連続範囲。 anchor が None なら Single 同等。
         // Toggle (Ctrl) → tid を selected に対して toggle、 anchor 更新しない。
         if let Some(tid) = clicked_track_for_select {
-            let shift = pointer.modifiers.shift;
-            let ctrl = pointer.modifiers.ctrl;
+            // press 時 snapshot を真値にする (release frame の生読みは
+            // ModifiersChanged 先行 race で Ctrl/Shift+click が Single に化ける、
+            // clip 短クリックの `last_ctrl`/`last_shift` と同 class)。
+            let (shift, ctrl) = {
+                let state: &ArrangementState = self.widget_state(wid);
+                (state.press_modifiers.shift, state.press_modifiers.ctrl)
+            };
             let modifier = if shift {
                 SelectModifier::RangeFromAnchor
             } else if ctrl {
