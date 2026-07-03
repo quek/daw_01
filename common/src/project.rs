@@ -24,6 +24,15 @@ pub struct LoadedProject {
 /// existing data.
 const MIN_LOADABLE_VERSION: u32 = 2;
 
+/// v26 で `builtin.video.subtitle` device が text overlay の表示ゲートになった
+/// (`docs/plan_voicevox_talk.md` §6)。`migrate_text_overlay_to_subtitle_device` は
+/// このバージョン未満の保存ファイルにだけ適用する。
+const SUBTITLE_DEVICE_VERSION: u32 = 26;
+
+/// v27 で `Clip.muted` / `Note.muted` が mute の SSoT になった。
+/// `migrate_per_event_mute_to_clip_mute` はこのバージョン未満の保存ファイルにだけ適用する。
+const CLIP_MUTE_VERSION: u32 = 27;
+
 /// Save without GUI view state (legacy callers / tests / headless `--script`).
 /// Delegates to `save_project` with `view = None`.
 pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
@@ -137,9 +146,9 @@ fn migrate_vocal_source_to_clips(value: &mut serde_json::Value) {
 /// v25 以前は `ClipContent::Text` がトラック非依存で常時 overlay 表示されていた。
 /// v26 で `builtin.video.subtitle` device が表示ゲートになったため、旧プロジェクトの
 /// 「Text clip を 1 つ以上持つトラック」へ字幕デバイスを auto-insert して見た目を保つ。
-/// idempotent (既に字幕デバイスを持つトラックは no-op)。**version-gate 前提** — 新規
+/// idempotent (既に字幕デバイスを持つトラックは no-op)。**version-gate 前提** — v26 以降の
 /// プロジェクトには適用しない (= ユーザーが字幕デバイスを抜いた「喋るが映さない」
-/// トラックを誤って表示化しない)。caller が `project.version < CURRENT_VERSION` で gate。
+/// トラックを誤って表示化しない)。caller が `project.version < SUBTITLE_DEVICE_VERSION` で gate。
 fn migrate_text_overlay_to_subtitle_device(song: &mut Song) {
     use crate::model::ClipContent;
     // clip_contents は tracks と別 borrow になるので、Text な content_id を先に集める。
@@ -173,8 +182,8 @@ fn migrate_text_overlay_to_subtitle_device(song: &mut Song) {
 /// 全 event を mute) で表現していた。v27 で `Clip.muted` を SSoT に一本化したので、旧プロジェクトの
 /// 「event が muted な content」を `Clip.muted = true` へ畳み込み、event 側の `muted` は false に戻す。
 /// 共有 content (linked clip) は 1 度 false 化すれば全 clip に効く。idempotent。**version-gate 前提** —
-/// 新規 (v27) プロジェクトの event.muted は触らない (将来 per-event mute UI 用に温存)。caller が
-/// `project.version < CURRENT_VERSION` で gate。
+/// v27 以降のプロジェクトの event.muted は触らない (将来 per-event mute UI 用に温存)。caller が
+/// `project.version < CLIP_MUTE_VERSION` で gate。
 fn migrate_per_event_mute_to_clip_mute(song: &mut Song) {
     use crate::model::{ClipContent, ContentId};
     // content_id 単位で「event が 1 つでも muted だったか」を判定しつつ event.muted を false に戻す。
@@ -268,13 +277,20 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     }
     let view = project.view;
     let mut song = project.song;
+    // 各 migration は「その挙動が導入されたバージョン」未満のファイルにだけ適用する。
+    // `< CURRENT_VERSION` で gate すると、version を bump するたびに一つ前のバージョンで
+    // 保存されたファイルへ migration が誤再適用される (例: v26 で字幕デバイスを意図的に
+    // 抜いた「喋るが映さない」トラックが load のたびに再表示化される)。
+    //
     // (v26) 旧プロジェクト (= device-gated text overlay 以前) の Text 持ちトラックへ
     // 字幕デバイスを補い、表示を保つ。normalize の前に挿すことで、追加 device も
-    // 他 device と同じ正規化 (aux migration 等) を通る。新規 (version == CURRENT) は
-    // 対象外 = 「喋るが映さない」を温存。
-    if project.version < CURRENT_VERSION {
+    // 他 device と同じ正規化 (aux migration 等) を通る。
+    if project.version < SUBTITLE_DEVICE_VERSION {
         migrate_text_overlay_to_subtitle_device(&mut song);
-        // (v27) 旧 per-event mute を `Clip.muted` へ畳み込む。
+    }
+    // (v27) 旧 per-event mute を `Clip.muted` へ畳み込む。v27 以降の `event.muted` は
+    // 温存 (将来の per-event mute UI 用)。
+    if project.version < CLIP_MUTE_VERSION {
         migrate_per_event_mute_to_clip_mute(&mut song);
     }
     // Re-establish every invariant the codebase assumes about a loaded

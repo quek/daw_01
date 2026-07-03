@@ -466,10 +466,32 @@ fn handle_preview_drag(
             let new_rotation = drag.start_rotation_radians
                 + (cur_angle - drag.start_cursor_angle);
             // 値が変わったときだけ発火 (= 0.001 rad ≒ 0.057° 未満は skip)。
+            // Move/Resize と同じく **model の現値** と比較する (drag 開始値と
+            // 比較すると静止カーソルでも同値イベントを再発火し続ける)。
             // 同 idiom で image / text どちらかの SetClip*Rotation を撃つ。
-            let cur_rot = drag.start_rotation_radians;
+            let kind = preview_drag_target_kind(app, drag.target);
+            let cur_rot = {
+                let content = app
+                    .song
+                    .tracks
+                    .get(drag.target.track as usize)
+                    .and_then(|t| t.clips.get(drag.target.clip as usize))
+                    .and_then(|c| app.song.clip_contents.get(&c.content_id));
+                match content {
+                    Some(c) if matches!(kind, PreviewDragTargetKind::Text) => c
+                        .text_events()
+                        .and_then(|ev| ev.first())
+                        .map(|ev| ev.rotation_radians),
+                    Some(c) => c
+                        .image_events()
+                        .and_then(|ev| ev.first())
+                        .map(|ev| ev.rotation_radians),
+                    None => None,
+                }
+                .unwrap_or(drag.start_rotation_radians)
+            };
             if (new_rotation - cur_rot).abs() > 1e-3 {
-                let ev = match preview_drag_target_kind(app, drag.target) {
+                let ev = match kind {
                     PreviewDragTargetKind::Text => AppEvent::SetClipTextRotation {
                         target: drag.target,
                         value: new_rotation,
@@ -1515,9 +1537,13 @@ impl Runner {
             });
         }
         // 時間系効果（ノイズ/スキャンライン等）の `P.time`（秒）。
-        // preview/export 一致のため wall-clock でなく song 時間（playhead_beat × 60/bpm）。
-        let bpm = state.app.song.bpm.max(1.0) as f64;
-        preview.fx_engine.set_time((playhead_beat * 60.0 / bpm) as f32);
+        // preview/export 一致のため wall-clock でなく song 時間。 tempo automation
+        // がある曲は積分写像 (constant-bpm 線形だと export = TempoMap 積分と
+        // 効果進行がズレる。 映像 source 時間の A4 と同じ扱い)。
+        preview.fx_engine.set_time(common::tempo_map::song_beat_to_seconds(
+            &state.app.song,
+            playhead_beat,
+        ) as f32);
         preview.set_track_composites(composites);
         // マスター映像チェーン（master_fx_chain の映像 device）を解決して渡す。
         // 空でなければ preview が全トラック合成画を master canvas 1 枚に集約してから適用する。

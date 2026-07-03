@@ -463,10 +463,14 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
 
         // ---- 表示値の決定 ----
         // base 数値テキスト: reset > base scrub (depth-edit gesture 中は抑止) > value。
+        // drag 分岐は `DRAG_THRESHOLD_PX` 超のみ (= doc の「合成 >= 4px → scrub 開始」)。
+        // gate しないと click-to-edit の手ぶれ 1-3px でも per-frame on_change が発火し、
+        // short-click release は Undoable wrap を skip するため undo 不能な値変化が残る。
         let displayed_value = if reset_fired {
             default_value
         } else if let (Some(anchor), Some((px, py))) = (drag_anchor, pointer.pos)
             && !anchor.depth_drag
+            && drag_distance >= DRAG_THRESHOLD_PX
         {
             clamp_opt(raw_drag_value(anchor, px, py, style.sensitivity), style.range)
         } else {
@@ -474,8 +478,10 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         };
 
         // depth 値 (= modulation 帯 + on_mod_change): depth-edit gesture drag 中のみ更新。
+        // base と同じく閾値 gate (release 側の `dist >= DRAG_THRESHOLD_PX` と対)。
         let displayed_depth = if let (Some(anchor), Some((px, py))) = (drag_anchor, pointer.pos)
             && anchor.depth_drag
+            && drag_distance >= DRAG_THRESHOLD_PX
         {
             clamp_opt(raw_drag_value(anchor, px, py, depth_sens), depth_range)
         } else {
@@ -572,11 +578,8 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 && let Some(text) = &inner_resp.committed_text
                 && let Some(parsed) = parse_value(text, format)
             {
-                let final_value = if let Some((min, max)) = style.range {
-                    parsed.clamp(min, max)
-                } else {
-                    parsed
-                };
+                // clamp_opt と同じ防御 (反転 / 非有限 range で panic しない)。
+                let final_value = clamp_opt(parsed, style.range);
                 if (final_value - value).abs() > f64::EPSILON {
                     self.push_edit(on_change.clone()(final_value));
                 }
@@ -712,11 +715,13 @@ fn raw_drag_value(anchor: DragAnchor, px: f32, py: f32, sensitivity: f32) -> f64
     anchor.value + f64::from(delta_px) * f64::from(sensitivity) * f64::from(scale)
 }
 
-/// `Some(range)` のとき clamp、 `None` でそのまま。
+/// `Some(range)` かつ `min <= max` のとき clamp、 それ以外 (`None` / 反転 bound / 非有限 bound) は
+/// そのまま素通し。 `f64::clamp` は `min > max` や NaN bound で **panic** するため、 caller の range
+/// 取り違えで widget を crash させないよう防御する (knob.rs の同名 helper と同仕様)。
 fn clamp_opt(v: f64, range: Option<(f64, f64)>) -> f64 {
     match range {
-        Some((min, max)) => v.clamp(min, max),
-        None => v,
+        Some((min, max)) if min <= max => v.clamp(min, max),
+        _ => v,
     }
 }
 

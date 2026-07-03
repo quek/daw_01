@@ -190,6 +190,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             n.pitch.hash(&mut h);
             n.velocity.hash(&mut h);
             n.lyric.hash(&mut h);
+            // cached 層の描画が依存する表示状態も key に含める (correct-by-
+            // construction)。 抜けると対象トラック切替 (dimmed) / L ロック /
+            // トラック色変更 / mute が stale 描画になる (widget 側 fold と対)。
+            n.muted.hash(&mut h);
+            n.style.dimmed.hash(&mut h);
+            n.style.locked.hash(&mut h);
+            if let Some(c) = n.style.color {
+                c.r.to_bits().hash(&mut h);
+                c.g.to_bits().hash(&mut h);
+                c.b.to_bits().hash(&mut h);
+                c.a.to_bits().hash(&mut h);
+            }
         }
         h.finish()
     };

@@ -474,6 +474,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 if let Some(s) = clipboard_write {
                     self.set_clipboard_text(s);
                 }
+            } else {
+                // (review) guard は「次に割れて届く 1 frame」 限定。 無入力 frame で
+                // 必ず false に落とす — 落とさないと、 Enter を伴わない IME 確定
+                // (マウス候補クリック / 自動確定) の後、 何秒後でも最初の submit
+                // Enter / Esc が 1 回無視される。
+                let state: &mut TextInputState = self.widget_state(wid);
+                state.composing_last_frame = false;
             }
         }
         if escape_pressed {

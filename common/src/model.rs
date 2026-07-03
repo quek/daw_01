@@ -1520,6 +1520,52 @@ impl Song {
             self.next_track_id = 1;
         }
 
+        // Phase 5: song-level lane の id も同様に採番。 sentinel (0) のみ
+        // 上書き、 既存非 0 id は触らず counter を bump するだけ。
+        // (review) id_remap guard より **前** に置く — sentinel track が無い通常
+        // ロードでも lane / mod_source の採番・counter 正規化は必要。
+        for lane in &mut self.song_lanes {
+            if lane.id == 0 {
+                let new_id = self.next_song_lane_id.max(1);
+                self.next_song_lane_id = new_id + 1;
+                lane.id = new_id;
+            } else if lane.id >= self.next_song_lane_id {
+                self.next_song_lane_id = lane.id + 1;
+            }
+            // lane 内 clip ids も担保 (Track の ensure_lane_ids 同 idiom、
+            // ただし song_lanes は track field を持たないので per-lane で展開)
+            for clip in &mut lane.clips {
+                if clip.id == 0 {
+                    let new_id = lane.next_clip_id.max(1);
+                    lane.next_clip_id = new_id + 1;
+                    clip.id = new_id;
+                } else if clip.id >= lane.next_clip_id {
+                    lane.next_clip_id = clip.id + 1;
+                }
+            }
+            if lane.next_clip_id == 0 {
+                lane.next_clip_id = 1;
+            }
+        }
+        if self.next_song_lane_id == 0 {
+            self.next_song_lane_id = 1;
+        }
+
+        // docs/plan_modulation.md §8: mod_source id も song_lanes と同様に採番。
+        // sentinel (0) のみ上書き、 既存非 0 id は触らず counter を bump する。
+        for ms in &mut self.mod_sources {
+            if ms.id == 0 {
+                let new_id = self.next_mod_source_id.max(1);
+                self.next_mod_source_id = new_id + 1;
+                ms.id = new_id;
+            } else if ms.id >= self.next_mod_source_id {
+                self.next_mod_source_id = ms.id + 1;
+            }
+        }
+        if self.next_mod_source_id == 0 {
+            self.next_mod_source_id = 1;
+        }
+
         // Pass 2: patch every reference to a remapped id. Multi-sentinel
         // cases (= more than one track started with id 0) collapse to the
         // *last* remap entry inserted for key 0 above, which is fine for
@@ -1584,49 +1630,6 @@ impl Song {
             }
         }
 
-        // Phase 5: song-level lane の id も同様に採番。 sentinel (0) のみ
-        // 上書き、 既存非 0 id は触らず counter を bump するだけ。
-        for lane in &mut self.song_lanes {
-            if lane.id == 0 {
-                let new_id = self.next_song_lane_id.max(1);
-                self.next_song_lane_id = new_id + 1;
-                lane.id = new_id;
-            } else if lane.id >= self.next_song_lane_id {
-                self.next_song_lane_id = lane.id + 1;
-            }
-            // lane 内 clip ids も担保 (Track の ensure_lane_ids 同 idiom、
-            // ただし song_lanes は track field を持たないので per-lane で展開)
-            for clip in &mut lane.clips {
-                if clip.id == 0 {
-                    let new_id = lane.next_clip_id.max(1);
-                    lane.next_clip_id = new_id + 1;
-                    clip.id = new_id;
-                } else if clip.id >= lane.next_clip_id {
-                    lane.next_clip_id = clip.id + 1;
-                }
-            }
-            if lane.next_clip_id == 0 {
-                lane.next_clip_id = 1;
-            }
-        }
-        if self.next_song_lane_id == 0 {
-            self.next_song_lane_id = 1;
-        }
-
-        // docs/plan_modulation.md §8: mod_source id も song_lanes と同様に採番。
-        // sentinel (0) のみ上書き、 既存非 0 id は触らず counter を bump する。
-        for ms in &mut self.mod_sources {
-            if ms.id == 0 {
-                let new_id = self.next_mod_source_id.max(1);
-                self.next_mod_source_id = new_id + 1;
-                ms.id = new_id;
-            } else if ms.id >= self.next_mod_source_id {
-                self.next_mod_source_id = ms.id + 1;
-            }
-        }
-        if self.next_mod_source_id == 0 {
-            self.next_mod_source_id = 1;
-        }
     }
 
     pub fn track_index_by_id(&self, track_id: u32) -> Option<usize> {

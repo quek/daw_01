@@ -263,6 +263,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if pointer.primary_just_pressed
             && let Some((px, py)) = pointer.pos
             && rect.contains(px, py)
+            // scrollbar 帯 (右端 SCROLLBAR_W) は reorder press の対象外 —
+            // thumb ドラッグが Reorder Edit を併発する (list_view と同基準、 review)。
+            && px < rect.x + row_visible_w
             && row_total_h > 0.0
         {
             let in_handle = if style.drag_handle_w <= 0.0 {

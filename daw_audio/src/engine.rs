@@ -576,12 +576,14 @@ impl LocalState {
                     bridge,
                     worker_syncs,
                 } => {
-                    let n = worker_syncs.len() as u32;
+                    let n_sync_slots = worker_syncs.len() as u32;
                     self.shared.worker_bridge.store(Some(Arc::new(bridge)));
                     self.shared.worker_syncs.store(Arc::new(worker_syncs));
-                    // Spawn the audio-engine worker pool to fan
-                    // per-track work out 1:1 against the plugin host.
-                    match AudioWorkerPool::new(n) {
+                    // Spawn the audio-engine worker pool sized to the sync
+                    // slots (master owns slot 0, worker i owns slot i+1) so
+                    // every concurrent runner has a dedicated plugin-host
+                    // handshake pair.
+                    match AudioWorkerPool::new(n_sync_slots) {
                         Ok(pool) => {
                             self.shared.worker_pool.store(Some(Arc::new(pool)));
                         }
@@ -591,7 +593,7 @@ impl LocalState {
                         }
                     }
                     tracing::info!(
-                        n_workers = self.shared.worker_syncs.load().len(),
+                        n_sync_slots = self.shared.worker_syncs.load().len(),
                         "audio engine bound to plugin-host worker pool"
                     );
                 }
@@ -1079,7 +1081,6 @@ impl LocalState {
                 n as u32,
                 playing,
                 any_solo,
-                playhead,
                 recording_lanes,
                 current_bpm,
                 self.playhead_beats,
@@ -1892,7 +1893,6 @@ pub fn execute_schedule_post_dispatch(
     frames: u32,
     playing: bool,
     any_solo: bool,
-    playhead: u64,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     current_bpm: f32,
     // group fx の transport snapshot 用 (= 積分済み拍位置 + 実 loop トグル)。
@@ -2119,7 +2119,7 @@ pub fn execute_schedule_post_dispatch(
                     *send_idx,
                     sample_rate,
                     current_bpm,
-                    playhead,
+                    playhead_beats,
                     any_solo,
                     recording_lanes,
                     n,
@@ -2247,7 +2247,10 @@ fn mix_send_into_track_scratch(
     send_idx: u8,
     sample_rate: u32,
     bpm: f32,
-    playhead: u64,
+    // 積分済み拍位置 (buffer 先頭)。 旧実装は絶対 sample 位置を現在 bpm で線形
+    // 換算しており、 SongTempo automation 中は SendGain lane が誤った beat で
+    // 読まれた (M5 の beat-domain 移行から漏れていた同件、 review)。
+    playhead_beats: f64,
     any_solo: bool,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     n: usize,
@@ -2296,8 +2299,8 @@ fn mix_send_into_track_scratch(
             .iter()
             .find(|l| l.enabled && l.target == target)
     };
-    let samples_per_beat = if bpm > 0.0 && sample_rate > 0 {
-        f64::from(sample_rate) * 60.0 / f64::from(bpm)
+    let beats_per_frame = if bpm > 0.0 && sample_rate > 0 {
+        f64::from(bpm) / (60.0 * f64::from(sample_rate))
     } else {
         0.0
     };
@@ -2323,9 +2326,11 @@ fn mix_send_into_track_scratch(
         .min(dst_scratch.track_l.len())
         .min(dst_scratch.track_r.len());
 
-    if let (Some(lane), true) = (lane, samples_per_beat > 0.0) {
+    if let (Some(lane), true) = (lane, beats_per_frame > 0.0) {
         for i in 0..n {
-            let beat = (playhead + i as u64) as f64 / samples_per_beat;
+            // `fill_track_param_ramps` / `fill_pd_param_events` と同じ積分済み
+            // anchor + per-frame 増分 (M5 の beat-domain 統一)。
+            let beat = playhead_beats + i as f64 * beats_per_frame;
             let g = common::automation::lane_value_at(lane, &song.clip_contents, beat) as f32;
             dst_scratch.track_l[i] += src_l[i] * g;
             dst_scratch.track_r[i] += src_r[i] * g;
@@ -2784,7 +2789,6 @@ mod sidechain_tests {
             FRAMES as u32,
             true,
             false,
-            0,
             &std::collections::HashSet::new(),
             song.bpm,
             0.0,
@@ -2858,7 +2862,7 @@ mod send_tests {
         }
         let empty = empty_lanes();
         mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, false, &empty, FRAMES,
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0.0, false, &empty, FRAMES,
         );
         for i in 0..FRAMES {
             let want_l = 1.0 + (i as f32) * 0.1 * 0.5;
@@ -2879,7 +2883,7 @@ mod send_tests {
         }
         let empty = empty_lanes();
         mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, false, &empty, FRAMES,
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0.0, false, &empty, FRAMES,
         );
         for i in 0..FRAMES {
             assert_eq!(scratch[1].track_l[i], 3.0, "disabled send must not change dst");
@@ -2898,7 +2902,7 @@ mod send_tests {
         }
         let empty = empty_lanes();
         mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, false, &empty, FRAMES,
+            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0.0, false, &empty, FRAMES,
         );
         for i in 0..FRAMES {
             assert_eq!(
@@ -2923,7 +2927,7 @@ mod send_tests {
             scratch[0].track_l[0] = 0.5;
             let empty = empty_lanes();
             mix_send_into_track_scratch(
-                &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0, true, &empty, FRAMES,
+                &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0.0, true, &empty, FRAMES,
             );
             scratch[1].track_l[0]
         };
@@ -2961,7 +2965,7 @@ mod send_tests {
         }
         let empty = empty_lanes();
         mix_send_into_track_scratch(
-            &mut scratch, 1, 0, true, &song, 0, 0, 48_000, 120.0, 0, false, &empty, FRAMES,
+            &mut scratch, 1, 0, true, &song, 0, 0, 48_000, 120.0, 0.0, false, &empty, FRAMES,
         );
         for i in 0..FRAMES {
             assert!(

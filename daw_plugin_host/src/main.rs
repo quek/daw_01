@@ -321,6 +321,52 @@ fn republish_entry_slot(
     publish_plugin_registry(registry, plugin_id, Some(entry));
 }
 
+/// ロード済み plugin を deactivate し得る in-place 操作 (restartComponent reinit /
+/// `setup_ara` / `clear_ara`) の共通安全契約: registry detach → worker quiesce →
+/// `mutate` (plugin-main thread) → republish。これを踏まないと worker が
+/// `process()` 実行中の同一インスタンスを deactivate してしまう (`&mut`
+/// エイリアシング UB + CLAP の「processing 中の deactivate 禁止」違反)。
+///
+/// `mutate(published)` の `published` は「registry に載っていた (= active &
+/// processing で worker から見えていた)」こと。stop/start_processing の対は
+/// published のときだけ必要 (未 publish の plugin は worker に触られない)。
+/// republish は Box アドレス不変 (chains 内で動かない) を前提に旧 entry を
+/// そのまま戻す。
+fn with_plugin_quiesced<R>(
+    registry: &PluginRegistry,
+    worker_pool: Option<&process_server::WorkerPool>,
+    plugin_id: Option<u32>,
+    mutate: impl FnOnce(bool) -> R,
+) -> R {
+    let saved = plugin_id.and_then(|pid| {
+        registry
+            .load()
+            .get(pid as usize)
+            .and_then(|o| o.as_ref())
+            .map(|e| (pid, e.plugin.0, e.process_data, e.track, e.index))
+    });
+    if let Some((pid, ..)) = saved {
+        publish_plugin_registry(registry, pid, None);
+        if let Some(pool) = worker_pool {
+            pool.quiesce();
+        }
+    }
+    let out = mutate(saved.is_some());
+    if let Some((pid, ptr, pd, track, index)) = saved {
+        publish_plugin_registry(
+            registry,
+            pid,
+            Some(PluginEntry {
+                plugin: PluginPtr(ptr),
+                process_data: pd,
+                track,
+                index,
+            }),
+        );
+    }
+    out
+}
+
 /// Commands processed serially on the plugin-main thread.
 enum PluginCommand {
     /// Reinitialise (deactivate→activate) every loaded plugin to a clean
@@ -1778,32 +1824,59 @@ fn plugin_main_loop(
                     let _ = evt_tx.send(PluginEvent::SlotPluginState { track, index, data });
                 }
                 PluginCommand::SetupAraDocument { track, index, clips, bpm, time_sig, archive } => {
-                    match tracks.plugin_at_mut(track, index) {
-                        Some(plugin) => match plugin.setup_ara(&clips, bpm, time_sig, archive.as_deref()) {
-                            Ok(true) => {
-                                tracing::info!(track, index, n = clips.len(), "ARA document set up");
+                    // setup_ara は内部で deactivate→activate するので、 worker と
+                    // 競合しないよう restartComponent (C3) と同じ quiesce 契約に載せる。
+                    let pid = plugin_lookup.get(&(track, index)).copied();
+                    with_plugin_quiesced(&plugin_registry, worker_pool.as_ref(), pid, |published| {
+                        match tracks.plugin_at_mut(track, index) {
+                            Some(plugin) => {
+                                if published {
+                                    plugin.stop_processing();
+                                }
+                                match plugin.setup_ara(&clips, bpm, time_sig, archive.as_deref()) {
+                                    Ok(true) => {
+                                        tracing::info!(track, index, n = clips.len(), "ARA document set up");
+                                    }
+                                    Ok(false) => {
+                                        tracing::warn!(
+                                            track,
+                                            index,
+                                            "SetupAraDocument: plugin is not ARA-capable, ignoring"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = ?e, track, index, "ARA setup failed");
+                                    }
+                                }
+                                if published
+                                    && let Err(e) = plugin.start_processing()
+                                {
+                                    tracing::error!(error = ?e, track, index, "SetupAraDocument: start_processing failed");
+                                }
                             }
-                            Ok(false) => {
-                                tracing::warn!(
-                                    track,
-                                    index,
-                                    "SetupAraDocument: plugin is not ARA-capable, ignoring"
-                                );
+                            None => {
+                                tracing::warn!(track, index, "SetupAraDocument: no plugin at slot");
                             }
-                            Err(e) => {
-                                tracing::error!(error = ?e, track, index, "ARA setup failed");
-                            }
-                        },
-                        None => {
-                            tracing::warn!(track, index, "SetupAraDocument: no plugin at slot");
                         }
-                    }
+                    });
                 }
                 PluginCommand::ClearAraDocument { track, index } => {
-                    if let Some(plugin) = tracks.plugin_at_mut(track, index) {
-                        plugin.clear_ara();
-                        tracing::info!(track, index, "ARA document cleared");
-                    }
+                    // clear_ara も deactivate→activate を伴うので同じ quiesce 契約。
+                    let pid = plugin_lookup.get(&(track, index)).copied();
+                    with_plugin_quiesced(&plugin_registry, worker_pool.as_ref(), pid, |published| {
+                        if let Some(plugin) = tracks.plugin_at_mut(track, index) {
+                            if published {
+                                plugin.stop_processing();
+                            }
+                            plugin.clear_ara();
+                            if published
+                                && let Err(e) = plugin.start_processing()
+                            {
+                                tracing::error!(error = ?e, track, index, "ClearAraDocument: start_processing failed");
+                            }
+                            tracing::info!(track, index, "ARA document cleared");
+                        }
+                    });
                 }
                 PluginCommand::UpdateAraRegions { track, index, regions } => {
                     match tracks.plugin_at_mut(track, index) {
@@ -1982,51 +2055,34 @@ fn plugin_main_loop(
             let mut new_latency = None;
             if needs_reinit {
                 // ReinitAllPlugins と同じ安全契約 (registry detach → worker quiesce →
-                // this-thread mutate → republish) を該当 1 plugin に適用。 activate が
-                // kLatencyChanged を再送しても次 iteration の latency-only 経路に落ちる
-                // ので reinit ループにならない。
-                let saved = plugin_registry
-                    .load()
-                    .get(pid as usize)
-                    .and_then(|o| o.as_ref())
-                    .map(|e| (e.plugin.0, e.process_data, e.track, e.index));
-                let Some((ptr, pd, etrack, eindex)) = saved else {
-                    continue;
-                };
-                // (1) detach so workers skip it, (2) drain in-flight dispatch.
-                publish_plugin_registry(&plugin_registry, pid, None);
-                if let Some(pool) = worker_pool.as_ref() {
-                    pool.quiesce();
-                }
-                // (3) full lifecycle reset on this (plugin-main) thread.
-                if let Some(chain) = tracks.tracks.chains.get_mut(&track)
-                    && let Some(plugin) = chain.devices.get_mut(index as usize)
-                {
-                    plugin.stop_processing();
-                    plugin.deactivate();
-                    if let Err(e) =
-                        plugin.activate(f64::from(session.sample_rate), 64, session.max_frames)
+                // this-thread mutate → republish = `with_plugin_quiesced`) を該当
+                // 1 plugin に適用。 activate が kLatencyChanged を再送しても次
+                // iteration の latency-only 経路に落ちるので reinit ループにならない。
+                // registry 未掲載 (published=false) なら reinit 対象外 (旧実装の
+                // `continue` と同義で何もしない)。
+                with_plugin_quiesced(&plugin_registry, worker_pool.as_ref(), Some(pid), |published| {
+                    if !published {
+                        return;
+                    }
+                    // full lifecycle reset on this (plugin-main) thread.
+                    if let Some(chain) = tracks.tracks.chains.get_mut(&track)
+                        && let Some(plugin) = chain.devices.get_mut(index as usize)
                     {
-                        tracing::error!(error = ?e, track, index, "restartComponent reinit: activate failed");
+                        plugin.stop_processing();
+                        plugin.deactivate();
+                        if let Err(e) =
+                            plugin.activate(f64::from(session.sample_rate), 64, session.max_frames)
+                        {
+                            tracing::error!(error = ?e, track, index, "restartComponent reinit: activate failed");
+                        }
+                        if let Err(e) = plugin.start_processing() {
+                            tracing::error!(error = ?e, "restartComponent reinit: start_processing failed");
+                        }
+                        plugin.reset();
+                        new_latency = Some(plugin.query_latency());
                     }
-                    if let Err(e) = plugin.start_processing() {
-                        tracing::error!(error = ?e, "restartComponent reinit: start_processing failed");
-                    }
-                    plugin.reset();
-                    new_latency = Some(plugin.query_latency());
-                }
-                // (4) republish (Box address unchanged → PluginPtr stays valid).
-                publish_plugin_registry(
-                    &plugin_registry,
-                    pid,
-                    Some(PluginEntry {
-                        plugin: PluginPtr(ptr),
-                        process_data: pd,
-                        track: etrack,
-                        index: eindex,
-                    }),
-                );
-                tracing::info!(track, index, flags, "restartComponent: reinitialised plugin");
+                    tracing::info!(track, index, flags, "restartComponent: reinitialised plugin");
+                });
             } else if latency_changed {
                 // kLatencyChanged のみ: reinit せず latency を再 query するだけ
                 // (無限ループ回避)。 plugin は active のままなので query 可能。

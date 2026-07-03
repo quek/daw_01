@@ -263,23 +263,12 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Redo)));
             });
             m.item("Delete", |ui| {
-                // 各 delete は対象が非空のときだけ発火する。 handle_event は undoable
-                // event ごとに無条件で undo snapshot を積む (= 空選択でも no-op snapshot
-                // が 1 つ積まれ「Ctrl+Z が効かない」 ように見える) ため、 ここで空判定を
-                // かけて 1 メニュー Delete = 実選択分だけの undo step に抑える。
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    if !app.selected_notes.is_empty() {
-                        app.handle_event(AppEvent::DeleteSelectedNotes);
-                    }
-                    if !app.selected_automation_clips.is_empty() {
-                        app.handle_event(AppEvent::DeleteAutomationClips {
-                            keys: app.selected_automation_clips.clone(),
-                        });
-                    }
-                    if app.selected_clip.is_some() || !app.selected_clips.is_empty() {
-                        app.handle_event(AppEvent::DeleteSelectedClip);
-                    }
-                }));
+                // キーボード Delete と同じ単一 arbiter (`edit_surface` → last-wins →
+                // `delete_for_surface`) を使う。 旧実装は notes + automation clip +
+                // clip を無条件連続発火する別ロジックで、 対象決定規則が 2 系統に
+                // 割れていた (SSoT 崩れ)。 menu 上の pointer は編集面に乗らないので
+                // is_pianoroll_active=false で選択集合ベースの解決になる。
+                delete_for_surface(app, ui, edit_surface(app, false));
             });
         });
         mb.menu("View", |m| {
@@ -322,19 +311,16 @@ enum EditSurface {
     Sections,
 }
 
-/// ポインタ面 → 選択優先順 で対象面を決める。
+/// ポインタ面 → last-wins → 選択優先順 で対象面を決める。
 fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface> {
-    // automation の点とクリップは共存選択できる (lasso は両方拾う / 点を選んでから
-    // クリップを選ぶ等)。 両方選択されているときは「最後に選んだ面」 (last-wins) を
-    // copy / cut / delete の対象にする。 = クリップのみ選択、 または 点も在るが直近の
-    // 選択がクリップなら clip 面を優先 (= ユーザーが「クリップを選択して Del」 した
-    // のに残存点が消える、 を防ぐ)。
+    use crate::app::EditSelectSurface as S;
+    // 選択集合は面を跨いで共存できる (lasso は automation の点とクリップを両方拾う、
+    // clip 選択は automation 選択を消さない)。 複数が非空のときは「最後に選んだ面」
+    // (last-wins、 `AppData::last_edit_select`) を copy / cut / delete の対象にする
+    // (= 「クリップを選択して Del したのに残存点が消える」 #071 の面跨ぎ一般化)。
     let auto_prefer_clips = !app.selected_automation_clips.is_empty()
         && (app.selected_automation_points.is_empty()
-            || matches!(
-                app.last_automation_select,
-                Some(crate::app::AutomationSelectSurface::Clips)
-            ));
+            || app.last_edit_select == Some(S::AutomationClips));
     // 1. ポインタが乗っている面を最優先。
     if is_pianoroll_active {
         return Some(if app.audio_editor_clip.is_some() {
@@ -351,23 +337,39 @@ fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface>
         }
         return Some(EditSurface::AutomationPoints);
     }
-    // 2. ポインタがどの編集面でもない → 選択集合の非空優先順。
-    if app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty() {
+    // 2. ポインタがどの編集面でもない → 「最後に選んだ面」 がまだ非空ならそれ。
+    let audio_events =
+        app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty();
+    let notes = !app.selected_notes.is_empty();
+    let points = !app.selected_automation_points.is_empty();
+    let auto_clips = !app.selected_automation_clips.is_empty();
+    // 安価な空判定 (selected_clip_refs() は Vec を確保するので避ける)。
+    let clips = app.selected_clip.is_some() || !app.selected_clips.is_empty();
+    let last_wins = match app.last_edit_select {
+        Some(S::AudioEvents) if audio_events => Some(EditSurface::AudioEvents),
+        Some(S::Notes) if notes => Some(EditSurface::Notes),
+        Some(S::AutomationPoints) if points => Some(EditSurface::AutomationPoints),
+        Some(S::AutomationClips) if auto_clips => Some(EditSurface::AutomationClips),
+        Some(S::Clips) if clips => Some(EditSurface::Clips),
+        _ => None,
+    };
+    if let Some(surface) = last_wins {
+        return Some(surface);
+    }
+    // 3. タグの面が空 (削除済み等) → 選択集合の非空優先順 (従来順)。
+    if audio_events {
         return Some(EditSurface::AudioEvents);
     }
-    // 点が選択されていても last-wins でクリップが勝つなら点面に入れない
-    // (下流の automation clip 分岐へ落とす)。
-    if !app.selected_automation_points.is_empty() && !auto_prefer_clips {
+    if points {
         return Some(EditSurface::AutomationPoints);
     }
-    if !app.selected_notes.is_empty() {
+    if notes {
         return Some(EditSurface::Notes);
     }
-    // 安価な空判定 (selected_clip_refs() は Vec を確保するので避ける)。
-    if app.selected_clip.is_some() || !app.selected_clips.is_empty() {
+    if clips {
         return Some(EditSurface::Clips);
     }
-    if !app.selected_automation_clips.is_empty() {
+    if auto_clips {
         return Some(EditSurface::AutomationClips);
     }
     if !app.selected_track_ids.is_empty() {
@@ -588,15 +590,21 @@ fn paste_noop(ui: &mut Ui<'_, AppData>) {
     }));
 }
 
-/// Delete: ポインタが乗っている面の選択を最優先で削除、無ければ既存の選択優先順
-/// (audio event > automation point > note > automation clip > clip) で削除。後者は従来の
-/// 挙動そのままで回帰しない。
+/// Delete: `edit_surface` が解決した面 (ポインタ面 → last-wins → 選択優先順) の
+/// 選択を削除。 fallback の優先順 (audio event > automation point > note >
+/// automation clip > clip) は surface が解決しなかったときの従来挙動。
 fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
     // section が対象面なら選択帯を削除して終わり (帯のみ・内容温存)。
     if matches!(surface, Some(EditSurface::Sections)) {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.apply_delete_selected_sections();
         }));
+        return;
+    }
+    // 何も選択が無い (edit_surface が None) なら no-op。 無条件で
+    // DeleteSelectedClip を発火すると空選択でも undo snapshot が積まれ
+    // redo 履歴が破棄される (copy/cut の early return と同じ gate)。
+    if surface.is_none() {
         return;
     }
     let audio_event_selected =
@@ -617,8 +625,12 @@ fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<E
         Some(EditSurface::AutomationClips) => auto_clips
             .clone()
             .map(|keys| AppEvent::DeleteAutomationClips { keys }),
+        // last-wins が clip 面を選んだときは、 残存 automation 点があっても
+        // クリップ削除に直行する (下の優先順 fallback を踏ませない)。
+        Some(EditSurface::Clips) => Some(AppEvent::DeleteSelectedClip),
         _ => None,
     };
+    let has_clips = app.selected_clip.is_some() || !app.selected_clips.is_empty();
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         if let Some(ev) = pointer_pick {
             app.handle_event(ev);
@@ -632,7 +644,8 @@ fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<E
             app.handle_event(AppEvent::DeleteSelectedNotes);
         } else if let Some(keys) = auto_clips {
             app.handle_event(AppEvent::DeleteAutomationClips { keys });
-        } else {
+        } else if has_clips {
+            // 非空判定付き (空選択の no-op snapshot + redo 破棄を避ける)。
             app.handle_event(AppEvent::DeleteSelectedClip);
         }
     }));

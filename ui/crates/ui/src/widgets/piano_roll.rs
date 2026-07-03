@@ -913,8 +913,12 @@ impl RowGeometry {
         let above_idx = self.fold_rows.iter().position(|&p| p < pitch);
         match above_idx {
             None => {
-                // 全 in-scale が pitch 以下 (= 自身がほぼ最上端より上)、 row 0 の少し上に描画
-                let y = self.grid_y - self.row_h * 0.25;
+                // 全 in-scale が pitch **以上** (= 自身が最下行より下)。 最下行の
+                // 少し下 (境界を跨いで半行) に描画 — 上端ケース `Some(0)` と対称。
+                // 旧実装は row 0 の上に置いており、 下へスクロールアウトした note が
+                // grid 最上部に出現 + そこで hit していた (review)。
+                let y = self.grid_y + self.fold_rows.len() as f32 * self.row_h
+                    - self.row_h * 0.25;
                 (y, (self.row_h * 0.5 - 1.0).max(2.0))
             }
             Some(0) => {
@@ -1021,9 +1025,18 @@ fn note_zone_at(
 
     Some(if short_note && in_rect {
         NoteDragKind::Move
-    } else if near_left && (!in_rect || cx - r.x < edge) {
+    } else if !in_rect {
+        // rect 外 (外側拡張ハンドル) は「rect のどちら側か」で決める。 near_left
+        // 先行評価だと幅 < edge の極短 note で右外側帯 [r.x+r.w, r.x+edge) が
+        // ResizeLeft に化ける (review — doc の「外側は左右それぞれの端」 と整合)。
+        if cx < r.x {
+            NoteDragKind::ResizeLeft
+        } else {
+            NoteDragKind::ResizeRight
+        }
+    } else if near_left {
         NoteDragKind::ResizeLeft
-    } else if near_right && (!in_rect || (r.x + r.w) - cx < edge) {
+    } else if near_right {
         NoteDragKind::ResizeRight
     } else {
         NoteDragKind::Move
@@ -1403,15 +1416,18 @@ fn compute_note_drag_beat_delta(
 
 /// M14 Phase 61b (#011): arrangement と同根。 caller の `notes_generation` は note 数や編集
 /// epoch のみで bump しがちで、 個別 note の `(id, start_beat, len_beats, pitch, velocity,
-/// lyric)` 変化が漏れると drag 残像が発生する。 widget 内部で全 visible note を fold して
-/// viewport_key に追加する (caller boilerplate 強要回避、 `feedback_pursue_best_practice`)。
+/// style)` 変化が漏れると drag 残像 / stale な dim・lock・色が発生する。 widget 内部で全
+/// visible note を fold して viewport_key に追加する (caller boilerplate 強要回避、
+/// `feedback_pursue_best_practice`)。
 ///
-/// `lyric: Option<Arc<str>>` は **identity hash** (`Arc::as_ptr`) で扱う。 daw_01 VOICEVOX
-/// 歌詞編集の `SetLyrics` は `Arc::from(...)` で新規作成するので pointer が変われば cache
-/// 無効化が走る。 「同 string を別 Arc で持つ」 caller には不正確だが、 daw_01 は `Arc::clone`
-/// で共有するので問題なし (実需要が出たら中身 hash に切替、 follow-up)。
+/// fold するのは **cached 層 (`draw_notes`) が実際に描画へ使う field だけ**。 `lyric` は
+/// 含めない: 歌詞は cache の外の `draw_lyrics` が毎フレーム描画するので key に不要で、
+/// さらに caller (daw_gui) は `Option<Arc<str>>` を毎フレーム `Arc::from` で再構築するため
+/// identity (ptr) hash は「内容不変でも毎フレーム key が変わる」= cache を恒常 miss させて
+/// 大規模クリップの背景全再描画を毎フレーム走らせてしまう。 歌詞の内容変化は caller の
+/// `notes_generation` (内容 hash) が担う。
 ///
-/// 5000 note × 6 fold step = ~5μs @ 4GHz、 16ms 予算の 0.03%。
+/// 5000 note × 8 fold step = ~7μs @ 4GHz、 16ms 予算の 0.05%。
 fn fold_piano_roll_note_hash(notes: &[Note]) -> u64 {
     const PRIME: u64 = 0x100_0000_01B3; // FNV-1a 64bit prime
     let mut h: u64 = 0xCBF2_9CE4_8422_2325; // FNV-1a 64bit offset basis
@@ -1426,12 +1442,17 @@ fn fold_piano_roll_note_hash(notes: &[Note]) -> u64 {
         h = h.wrapping_mul(PRIME);
         h ^= u64::from(n.velocity);
         h = h.wrapping_mul(PRIME);
-        // mute 状態を cache key に含めて、 mute トグルで note レイヤの
-        // dim + 斜線ハッチ再描画が即時反映されるようにする。
-        h ^= u64::from(n.muted);
+        // mute / dim / lock / クリップ色は cached 層の note fill 描画の入力なので
+        // fold する (トグルや対象クリップ切替が scroll 等の別 invalidation を
+        // 待たず即時反映されるように)。
+        h ^= u64::from(n.muted)
+            | (u64::from(n.style.dimmed) << 1)
+            | (u64::from(n.style.locked) << 2);
         h = h.wrapping_mul(PRIME);
-        if let Some(s) = &n.lyric {
-            h ^= Arc::as_ptr(s).cast::<()>() as usize as u64;
+        if let Some(c) = n.style.color {
+            h ^= (u64::from(c.r.to_bits()) << 32) | u64::from(c.g.to_bits());
+            h = h.wrapping_mul(PRIME);
+            h ^= (u64::from(c.b.to_bits()) << 32) | u64::from(c.a.to_bits());
             h = h.wrapping_mul(PRIME);
         }
     }
@@ -1642,10 +1663,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 編集中 (typing_focus = true) は shortcut layer を素通りして text_input に届く
         // (= `'l'` 文字としてタイプ可能)。take_shortcut は frame 頭の typing_lock 判定後
         // pending_shortcuts に積まれた name を引くので、編集中は false を返す。
+        // 選択条件 (`selected.len() == 1`) を `take_shortcut` より **先** に評価する —
+        // 逆順だと条件を満たさない instance が L を黙って消費し、 同 frame の後続
+        // instance (条件を満たす方) から shortcut を奪う (review)。
         if lyric_editing.is_none()
+            && selected.len() == 1
             && let Some(name) = style.lyric_edit_shortcut
             && self.take_shortcut(name)
-            && selected.len() == 1
         {
             lyric_editing = Some(selected[0]);
             // 編集モードに入る瞬間、stale な note_drag セッションを clear (drag 中に L
@@ -2818,8 +2842,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // 絶対位置 snap (overlay と一貫)。
             let beat_delta =
                 compute_note_drag_beat_delta(&nd, raw, &view.snap, zoom_x_px_per_beat);
-            #[allow(clippy::cast_possible_truncation)]
-            let pitch_delta = (-(dy * pitch_per_px)).round() as i32;
+            // pitch も overlay と同一 helper で確定する。 Fold mode では 1 行 =
+            // 1 scale degree なので、 ここだけ半音換算 (dy × pitch_per_px) にすると
+            // ghost で見た位置と別の pitch に commit してしまう。
+            let pitch_delta = compute_pitch_drag_delta(view, grid, dy);
             let min_len = if view.snap.is_active(release_alt) {
                 view.snap.beat_unit(zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
             } else {
@@ -3560,7 +3586,10 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
             border: style.note_selected_border,
             border_width: style.note_selected_border_w,
             radius: [3.0; 4],
-            clip_rect: None,
+            // grid で clip する — 他 pass (draw_notes / drag preview / lyrics) は
+            // 全て clamp/clip 済みで、 ここだけ無 clip だと視界端の選択 note の
+            // ハイライトが keyboard / ruler / velocity lane にはみ出す (review)。
+            clip_rect: Some(grid),
         });
     }
 }
@@ -7205,31 +7234,59 @@ mod tests {
         );
     }
 
+    /// (review) lyric は cached 層 (`draw_notes`) で描かない (`draw_lyrics` は
+    /// cache 外) ため fold hash に **含めない**。 旧実装の Arc ptr hash は caller
+    /// (daw_gui) が毎フレーム新規 `Arc::from` を作るせいで恒常 cache miss を
+    /// 起こしていた。 別 Arc / 別内容でも hash 不変 = cache が保たれることを固定する。
     #[test]
-    fn fold_piano_roll_note_hash_lyric_arc_identity() {
-        let shared: Arc<str> = Arc::from("a");
+    fn fold_piano_roll_note_hash_ignores_lyric() {
         let n1 = Note {
             id: 0,
             start_beat: 0.0,
             len_beats: 1.0,
             pitch: 60,
             velocity: 96,
-            lyric: Some(Arc::clone(&shared)),
+            lyric: Some(Arc::<str>::from("a")),
             muted: false,
             style: NoteStyle::default(),
         };
-        let n1_dup = Note { lyric: Some(Arc::clone(&shared)), ..n1.clone() };
-        // 同 Arc::clone → 同 pointer → 同 hash
+        // 別 Arc (毎フレーム再生成相当) でも同 hash。
+        let n2 = Note { lyric: Some(Arc::<str>::from("a")), ..n1.clone() };
         assert_eq!(
             fold_piano_roll_note_hash(std::slice::from_ref(&n1)),
-            fold_piano_roll_note_hash(std::slice::from_ref(&n1_dup)),
-        );
-        // 別 Arc::from(同 string) → 別 pointer → 別 hash (daw_01 SetLyrics は新規 Arc::from で
-        // この振る舞いに依存して cache invalidate する)。
-        let n2 = Note { lyric: Some(Arc::<str>::from("a")), ..n1.clone() };
-        assert_ne!(
-            fold_piano_roll_note_hash(std::slice::from_ref(&n1)),
             fold_piano_roll_note_hash(std::slice::from_ref(&n2)),
+        );
+        // 内容が変わっても cached 層は影響を受けないので同 hash (歌詞の描画は
+        // cache 外 pass が毎フレーム反映する)。
+        let n3 = Note { lyric: Some(Arc::<str>::from("b")), ..n1.clone() };
+        assert_eq!(
+            fold_piano_roll_note_hash(std::slice::from_ref(&n1)),
+            fold_piano_roll_note_hash(std::slice::from_ref(&n3)),
+        );
+    }
+
+    /// style (dimmed / locked / color) は cached 層の `note_fill_color` に効くので
+    /// hash に含まれる (対象トラック切替 / L ロック / トラック色変更の stale 防止)。
+    #[test]
+    fn fold_piano_roll_note_hash_changes_on_style() {
+        let base = vec![note(0, 0.0, 1.0, 60)];
+        let mut dimmed = note(0, 0.0, 1.0, 60);
+        dimmed.style.dimmed = true;
+        assert_ne!(
+            fold_piano_roll_note_hash(&base),
+            fold_piano_roll_note_hash(std::slice::from_ref(&dimmed)),
+        );
+        let mut locked = note(0, 0.0, 1.0, 60);
+        locked.style.locked = true;
+        assert_ne!(
+            fold_piano_roll_note_hash(&base),
+            fold_piano_roll_note_hash(std::slice::from_ref(&locked)),
+        );
+        let mut colored = note(0, 0.0, 1.0, 60);
+        colored.style.color = Some(daw_ui_renderer::Color::rgb(0.9, 0.2, 0.1));
+        assert_ne!(
+            fold_piano_roll_note_hash(&base),
+            fold_piano_roll_note_hash(std::slice::from_ref(&colored)),
         );
     }
 

@@ -35,6 +35,13 @@ const MODAL_STYLE: ModalStyle = ModalStyle {
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     if !app.show_recovery_modal {
+        // 「復元」/「破棄」ボタンは Edit 経由で app flag だけ落とすので、 modal の
+        // close はここで同期する (export_overlay と同 idiom)。 これを怠ると、 最後の
+        // 候補を処理した次フレームから `ui.modal()` が呼ばれなくなり、 open_popups に
+        // 残った capturing modal が全入力 (マウス+キーボード) を永久遮断する。
+        if ui.is_modal_open("recovery") {
+            ui.close_modal("recovery");
+        }
         return;
     }
     if !ui.is_modal_open("recovery") {

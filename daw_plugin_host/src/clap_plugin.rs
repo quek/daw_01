@@ -1050,9 +1050,12 @@ impl ClapPlugin {
         // Build the time-ascending merge order over note + param events.
         // CLAP requires `in_events` sorted by `header.time`; notes and params
         // are each sorted within their own stream but interleave by time, so
-        // we stable-merge them here. `sort_by_key` is stable, so notes keep
-        // their relative order ahead of params at the same `time`. In-place
-        // sort of a pre-allocated buffer ⇒ no heap alloc on the RT path.
+        // we merge them here. NB: stable `sort_by_key` allocates a scratch
+        // buffer above ~20 elements (std doc: "allocates temporary storage")
+        // — an RT violation — so we use non-allocating `sort_unstable_by_key`
+        // with the composite key (time, stream, idx), which reproduces the
+        // stable order exactly (same time ⇒ Note < Param < ParamMod, then
+        // push order within each stream).
         self.event_order.clear();
         for (idx, e) in self.pending_events.iter().enumerate() {
             self.event_order.push(EventOrderRef {
@@ -1075,7 +1078,8 @@ impl ClapPlugin {
                 idx: idx as u32,
             });
         }
-        self.event_order.sort_by_key(|r| r.time);
+        self.event_order
+            .sort_unstable_by_key(|r| (r.time, r.stream, r.idx));
 
         // Phase 2b: note + param (+ param_mod) events を 1 view にまとめて
         // vtable に渡す。 EventListView は process() の lifetime 内だけ存続する
@@ -1363,6 +1367,11 @@ unsafe extern "C" fn collect_out_note_try_push(
     }
     match header.type_ {
         t if t == CLAP_EVENT_NOTE_ON => {
+            // FFI 安全 (GESTURE_BEGIN と同 idiom): malformed event に備えて
+            // `header.size` を検証してから構造体全体を deref する (OOB read 防御)。
+            if header.size < std::mem::size_of::<clap_event_note>() as u32 {
+                return true;
+            }
             let note = unsafe { &*(event as *const clap_event_note) };
             let note_id = note.note_id.max(0) as u32;
             let transition = NoteTransition::On {
@@ -1372,10 +1381,18 @@ unsafe extern "C" fn collect_out_note_try_push(
             };
             if !collector.notes.is_null() {
                 let out = unsafe { &mut *collector.notes };
-                out.push(TimedNoteEvent { time: header.time, event: transition });
+                // RT 安全: 事前確保 capacity を超える push は realloc になる。
+                // 溢れた note flood は param 系 collector と同じく drop する。
+                if out.len() < out.capacity() {
+                    out.push(TimedNoteEvent { time: header.time, event: transition });
+                }
             }
         }
         t if t == CLAP_EVENT_NOTE_OFF => {
+            // FFI 安全 (NOTE_ON と同じ): size 検証 → deref。
+            if header.size < std::mem::size_of::<clap_event_note>() as u32 {
+                return true;
+            }
             let note = unsafe { &*(event as *const clap_event_note) };
             let note_id = note.note_id.max(0) as u32;
             let transition = NoteTransition::Off {
@@ -1384,7 +1401,9 @@ unsafe extern "C" fn collect_out_note_try_push(
             };
             if !collector.notes.is_null() {
                 let out = unsafe { &mut *collector.notes };
-                out.push(TimedNoteEvent { time: header.time, event: transition });
+                if out.len() < out.capacity() {
+                    out.push(TimedNoteEvent { time: header.time, event: transition });
+                }
             }
         }
         t if t == CLAP_EVENT_PARAM_GESTURE_BEGIN => {
@@ -1454,6 +1473,10 @@ unsafe extern "C" fn collect_out_note_try_push(
             }
         }
         t if t == CLAP_EVENT_PARAM_VALUE => {
+            // FFI 安全 (GESTURE_BEGIN と同 idiom): size 検証 → deref。
+            if header.size < std::mem::size_of::<clap_event_param_value>() as u32 {
+                return true;
+            }
             let pv = unsafe { &*(event as *const clap_event_param_value) };
             if !collector.param_values.is_null() {
                 let out = unsafe { &mut *collector.param_values };
@@ -1557,8 +1580,10 @@ fn build_clap_transport_event(
 
 /// Phase 2b: 1 buffer 分の note + param event を 1 つの list として
 /// plugin に渡すための view。 `process()` のローカル変数として作られ、
-/// Which pre-allocated stream an [`EventOrderRef`] indexes into.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Which pre-allocated stream an [`EventOrderRef`] indexes into. `Ord` は
+/// merge sort の複合キー用 — 同 `time` では宣言順 (Note → Param → ParamMod)
+/// が CLAP へ提示される順序になる。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum EventStream {
     Note,
     Param,
@@ -1686,7 +1711,9 @@ fn query_aux_input_channels(plugin: *const clap_plugin, get_ext: GetExtFn) -> Ve
                 );
                 break;
             }
-            aux.push(info.channel_count);
+            // VST3 側と同じく host の per-port channel 上限に clamp する
+            // (shmem aux buffer は MAX_CHANNELS plane しか持たない。 review)。
+            aux.push(info.channel_count.min(common::process_data::MAX_CHANNELS as u32));
         }
     }
     aux
@@ -1729,7 +1756,8 @@ fn query_aux_output_channels(plugin: *const clap_plugin, get_ext: GetExtFn) -> V
                 );
                 break;
             }
-            aux.push(info.channel_count);
+            // aux input 側と同じ per-port channel clamp (review)。
+            aux.push(info.channel_count.min(common::process_data::MAX_CHANNELS as u32));
         }
     }
     aux

@@ -392,10 +392,20 @@ async fn spawn_and_handshake(
     let plugin_child = crate::subprocess::spawn_sibling("daw_plugin_host", [&plugin_pipe])?;
     job.assign(&plugin_child)?;
 
-    let (audio_result, plugin_result) = tokio::try_join!(
-        handshake(audio_server, ChildKind::Audio),
-        handshake(plugin_server, ChildKind::PluginHost),
-    )?;
+    // respawn 側 (5s timeout) と同様、 handshake 前に子が crash / hang すると
+    // ここが無限ブロックし GUI が起動しないまま固まる。 初回起動は AV スキャン
+    // 等で respawn より遅くなり得るので余裕を持った 15s にする。
+    let (audio_result, plugin_result) = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        async {
+            tokio::try_join!(
+                handshake(audio_server, ChildKind::Audio),
+                handshake(plugin_server, ChildKind::PluginHost),
+            )
+        },
+    )
+    .await
+    .context("initial handshake timed out (child process died before handshake?)")??;
     let (audio_hello, audio_server) = audio_result;
     let (plugin_hello, plugin_server) = plugin_result;
     tracing::info!(?audio_hello, "audio handshake complete");

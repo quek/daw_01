@@ -3105,7 +3105,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 w: area.w - pad * 2.0 - 48.0,
                 h: 20.0,
             };
-            ui.scrubable_number_at(
+            let resp = ui.scrubable_number_at(
                 ("inspector_talk_scale", label),
                 input_rect,
                 val,
@@ -3125,6 +3125,23 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 None,
                 None,
             );
+            // 他の inspector 数値 field (`scrub_field`) と同じ Begin/End bracket
+            // で 1 drag = 1 undo step にする — これが無いと talk 4 項目だけ
+            // Ctrl+Z で戻せない (review)。
+            let scrub_key = crate::app::InspectorScrubField::Talk(kind);
+            let active = resp.dragging || resp.editing_text;
+            let was_active = app.inspector_scrub_active == Some(scrub_key);
+            if active && !was_active {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.inspector_scrub_active = Some(scrub_key);
+                    app.handle_event(AppEvent::BeginInspectorScrub);
+                }));
+            } else if !active && was_active {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.inspector_scrub_active = None;
+                    app.handle_event(AppEvent::EndInspectorScrub);
+                }));
+            }
             y += 24.0;
         }
     }

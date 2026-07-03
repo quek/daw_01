@@ -70,8 +70,10 @@ release: fetch-ffmpeg
 run-release: release
 	cargo run -p daw_gui --release
 
+# daw_gui/script を有効化して --script 系 smoke テスト (required-features 宣言済み) も
+# 含めて全件回す。素の `cargo test --workspace` はそれらをスキップして green のまま。
 test: fetch-ffmpeg
-	cargo test --workspace
+	cargo test --workspace --features daw_gui/script
 
 clippy:
 	cargo clippy --workspace -- -D warnings

@@ -63,7 +63,12 @@ impl Vst3ParamValueQueue {
 
     fn push(&self, sample_offset: i32, value: f64) {
         let points = unsafe { &mut *self.points.get() };
-        points.push((sample_offset, value));
+        // RT 安全: 事前確保 capacity (64) を超える push は realloc になる。
+        // 1 buffer に 64 点超の同一 param 自動化点は drop (CLAP collector /
+        // process_server の append と同じ invariant、 review)。
+        if points.len() < points.capacity() {
+            points.push((sample_offset, value));
+        }
     }
 
     fn id_value(&self) -> u32 {

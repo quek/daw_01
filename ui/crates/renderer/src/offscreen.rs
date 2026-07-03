@@ -716,18 +716,39 @@ impl OffscreenRenderer {
             Some(idx) => wgpu::PollType::Wait { submission_index: Some(idx), timeout: None },
             None => wgpu::PollType::wait_indefinitely(),
         };
-        self.device
-            .poll(poll)
-            .map_err(|e| RenderError::SurfaceUnavailable(format!("offscreen poll: {e:?}")))?;
+        // (review) エラー経路でも slot を pool へ返す。 rx/submission は take 済み +
+        // in_flight を true のまま return すると、 その slot は二度と再利用されず
+        // (acquire は !in_flight のみ選ぶ)、 token も consume 済みで回収不能 —
+        // デバイスエラーが一過性で export が続くと ring がフレーム毎に成長する。
+        // staging は map 状態が不定 (map_async pending / mapped) の可能性がある
+        // ので新品に差し替えてから返す (旧 buffer は deferred destruction で安全に
+        // 落ち、 遅延 callback は drop 済み receiver へ送られ無視される —
+        // `clear_readback_cache` と同じ性質)。
+        let recycle_on_error = |slots: &mut Vec<ReadbackSlot>, device: &wgpu::Device| {
+            let s = &mut slots[slot];
+            s.staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("daw-ui offscreen readback"),
+                size: u64::from(s.padded) * u64::from(s.height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            s.in_flight = false;
+        };
+        if let Err(e) = self.device.poll(poll) {
+            recycle_on_error(&mut self.readback.slots, &self.device);
+            return Err(RenderError::SurfaceUnavailable(format!("offscreen poll: {e:?}")));
+        }
         // wgpu 29 `PollType::Wait` は「指定 submission の完了 **と** その callback の呼び出し」 まで
         // block する保証があるので、 poll が Ok を返した時点でこの slot の map_async callback は既に
         // 発火済 = `recv()` は即座に返る (block しない)。 この poll → recv の順序依存は崩さないこと。
-        rx.ok_or_else(|| {
-            RenderError::SurfaceUnavailable("finish_readback: missing map channel".to_string())
-        })?
-        .recv()
-        .map_err(|e| RenderError::SurfaceUnavailable(format!("offscreen recv: {e:?}")))?
-        .map_err(|e| RenderError::SurfaceUnavailable(format!("offscreen map_async: {e:?}")))?;
+        let map_result = rx
+            .ok_or_else(|| "finish_readback: missing map channel".to_string())
+            .and_then(|rx| rx.recv().map_err(|e| format!("offscreen recv: {e:?}")))
+            .and_then(|r| r.map_err(|e| format!("offscreen map_async: {e:?}")));
+        if let Err(msg) = map_result {
+            recycle_on_error(&mut self.readback.slots, &self.device);
+            return Err(RenderError::SurfaceUnavailable(msg));
+        }
 
         // `pack_unpadded` が `staging.unmap()` するまで in_flight=true を保つ (= 下の解放を unmap
         // より前に並べ替えると、 map 中の buffer を acquire が再払い出ししてしまう)。

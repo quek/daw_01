@@ -52,3 +52,43 @@ embed-resource = "3"
 
 [dev-dependencies]
 tempfile = "3"
+
+# --script (JS driver) を起動する smoke テストは script feature 付きの bin が前提。
+# required-features で宣言しないと、default ビルドの `cargo test --workspace` が
+# 「--script requires --features script」で必ず落ちる。`make test` が
+# `--features daw_gui/script` を付けて全件実行する (Makefile が SSoT)。
+[[test]]
+name = "clip_label_display_smoke"
+required-features = ["script"]
+
+[[test]]
+name = "clip_rename_smoke"
+required-features = ["script"]
+
+[[test]]
+name = "device_chain_smoke"
+required-features = ["script"]
+
+[[test]]
+name = "note_overlap_smoke"
+required-features = ["script"]
+
+[[test]]
+name = "pdc_real_vst3"
+required-features = ["script"]
+
+[[test]]
+name = "scale_smoke"
+required-features = ["script"]
+
+[[test]]
+name = "sidechain_real_vst3"
+required-features = ["script"]
+
+[[test]]
+name = "split_glue_smoke"
+required-features = ["script"]
+
+[[test]]
+name = "split_glue_video_smoke"
+required-features = ["script"]

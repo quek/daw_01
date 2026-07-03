@@ -690,7 +690,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }));
             } else if kind == DragKind::Continuing {
                 push_trim_ghost(ui, event_rect, wf_area, dx, true);
-            } else if kind == DragKind::Released {
+            } else if kind == DragKind::Released && dx.abs() >= 1.0 {
+                // 0px release (= grip を click しただけ) は no-op trim を commit
+                // しない (undo 汚染 + 再同期を避ける。 実 drag は 1px から反映)。
                 let dbeats = (dx as f64) * beats_per_px;
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetAudioEventTrim {
@@ -716,7 +718,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }));
             } else if kind == DragKind::Continuing {
                 push_trim_ghost(ui, event_rect, wf_area, dx, false);
-            } else if kind == DragKind::Released {
+            } else if kind == DragKind::Released && dx.abs() >= 1.0 {
+                // 0px release (= grip を click しただけ) は no-op trim を commit
+                // しない (undo 汚染 + 再同期を避ける。 実 drag は 1px から反映)。
                 let dbeats = (dx as f64) * beats_per_px;
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetAudioEventTrim {
@@ -839,7 +843,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }));
             } else if kind == DragKind::Continuing && dx.abs() > 1.0 {
                 push_move_ghost(ui, event_rect, wf_area, dx);
-            } else if kind == DragKind::Released {
+            } else if kind == DragKind::Released && dx.abs() >= 4.0 {
+                // 4px 未満は click (選択のみ) に格下げ — delta≈0 の
+                // SetAudioEventStart を commit すると選択クリックのたびに
+                // undo snapshot + redo 破棄 + 不要な plugin-host 再同期が走る
+                // (ui/CLAUDE.md の Move 4px jitter 閾値ガイド、 review)。
                 let dbeats = (dx as f64) * beats_per_px;
                 let original_start = event.event_start_in_clip_beats;
                 let new_start = (original_start + dbeats).max(0.0);

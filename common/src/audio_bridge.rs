@@ -7,7 +7,10 @@ use shared_memory::{Shmem, ShmemConf};
 /// `AudioSession.sample_rate` = デバイス実レート (daw_audio が Hello で報告) が
 /// SSoT で、 この const はデバイス query 失敗時の保険値としてのみ使う。
 pub const DEFAULT_SAMPLE_RATE: u32 = 48000;
-pub const MAX_FRAMES: u32 = 1024;
+/// 1 バッファの最大 frame 数。 SSoT は `process_data::MAX_FRAMES` (プラグイン
+/// process shmem のバッファ次元) — audio bridge 側の u32 view として re-export。
+/// 二重定義で乖離すると RT パスの `assert!(frames <= MAX_FRAMES)` が panic する。
+pub const MAX_FRAMES: u32 = crate::process_data::MAX_FRAMES as u32;
 pub const CHANNELS: u32 = 2;
 pub const SAMPLE_BUFFER_LEN: usize = (MAX_FRAMES * CHANNELS) as usize;
 /// Hard cap for the per-track peak meter ring in shmem. Tracks beyond this

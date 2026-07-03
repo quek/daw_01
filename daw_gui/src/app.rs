@@ -403,6 +403,8 @@ pub enum InspectorScrubField {
     VideoFx { device_index: u32, param_id: u32 },
     /// 汎用 plugin param scrub (「⚙」パネル、device_index, param_id 単位)。
     PluginParam { device_index: u32, param_id: u32 },
+    /// talk 読み上げスケール (話速/音高/抑揚/音量) の scrub。
+    Talk(TalkParamKind),
 }
 
 /// docs/plan_modulation.md §9: one row of the inspector
@@ -750,12 +752,19 @@ pub struct AutomationPointKeyRef {
     pub point_idx: u32,
 }
 
-/// automation lane 上で点とクリップが共存選択されたときに、 copy / cut / delete を
-/// どちらの面に向けるかを決める「最後に選んだ面」 (last-wins) のタグ。
-/// `AppData::last_automation_select` が保持する。
+/// 直交して共存できる選択集合 (audio event / note / automation point /
+/// automation clip / clip) に効く copy / cut / delete の対象面を決める
+/// 「最後に選んだ面」 (last-wins) のタグ。 `AppData::last_edit_select` が保持し、
+/// 各選択 setter が「選択が非空になったとき」 に更新する (空クリアでは面は
+/// 移らない)。 固定 type 優先順位 tier だと「クリップを選択して Del したのに
+/// 残存 automation 点が消える」 (#071) が面跨ぎで再発するため、 選択の時系列を
+/// 単一 SSoT で追う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutomationSelectSurface {
-    Points,
+pub enum EditSelectSurface {
+    AudioEvents,
+    Notes,
+    AutomationPoints,
+    AutomationClips,
     Clips,
 }
 
@@ -1045,11 +1054,28 @@ pub struct PendingClipFxBounce {
     pub mode: BounceMode,
     pub source_track: u32,
     pub source_clip: u32,
+    /// 完了時に song を書き換える対象の stable id。 `source_track` / `source_clip`
+    /// は bounce 開始時の index で IPC echo の照合専用 — bounce 中の編集 (トラック
+    /// 削除 / 並べ替え / クリップ移動) で stale になり得るため、 song の書き換え
+    /// (WithFx の元トラック mute / InPlace の content 置換) はこちらで解決する。
+    pub source_track_id: u32,
+    pub source_content_id: common::model::ContentId,
     pub out_path: PathBuf,
     pub source_path: common::model::AudioSourcePath,
     pub clip_name: String,
     pub clip_length_beats: f64,
     pub start_beat: f64,
+}
+
+/// 歌唱 bounce の合成待ち (`PrepareVocalSynth` → `VocalSynthReady`) の退避 entry。
+/// 待ち中の編集で clip index が動いても正しい clip へ bounce できるよう stable id
+/// で保持し、 `VocalSynthReady` 受信時に現在の `ClipRef` へ解決してから
+/// `start_clip_bounce` する。
+#[derive(Debug, Clone, Copy)]
+pub struct PendingVocalSynthBounce {
+    pub track_id: u32,
+    pub clip_id: u32,
+    pub mode: BounceMode,
 }
 
 /// `Z` キーの段階ズームが復元用に積む arrangement の view 状態スナップショット。
@@ -1282,12 +1308,13 @@ pub struct AppData {
     /// 毎フレーム `&[AutomationClipKey]` で渡して selected highlight を
     /// 描画させる。 session-only。
     pub selected_automation_clips: Vec<common::model::AutomationClipKey>,
-    /// 直近に確定した automation 選択面 (点 or クリップ)。 点とクリップは共存選択
-    /// できる (lasso は両方拾う) ため、 copy / cut / delete の対象面が曖昧になる。
-    /// 「最後に選んだ面を対象にする」 (last-wins) ためのタイブレーカ。 `None` は
-    /// どちらも未選択 / 初期状態。 session-only。 [[reuse_inspector_idiom]] 同様、
-    /// edit_surface (view) がこの値で点/クリップの優先を解決する。
-    pub last_automation_select: Option<AutomationSelectSurface>,
+    /// 直近に確定した編集面 (clip / automation 点 / automation クリップ / note /
+    /// audio event)。 これらは共存選択できる (lasso は点とクリップを両方拾う、
+    /// clip 選択は automation 選択を消さない) ため、 copy / cut / delete の対象面が
+    /// 曖昧になる。 「最後に選んだ面を対象にする」 (last-wins、 #071) ための
+    /// タイブレーカ。 `None` は初期状態。 session-only。 edit_surface (view) が
+    /// この値で対象面を解決する。
+    pub last_edit_select: Option<EditSelectSurface>,
     /// Phase 3 (`docs/plan_automation.md` §10): 選択中の automation point。
     /// gui_01 #033 で widget 側の lasso 矩形選択が landing するまで空のまま
     /// だが、 copy / paste / quantize / delete のハンドラは selection を
@@ -1749,9 +1776,9 @@ pub struct AppData {
     /// pending entry を identifier 照合するために保持。
     pub pending_clip_fx_bounce: Option<PendingClipFxBounce>,
     /// 歌唱クリップ bounce の合成待ち。`PrepareVocalSynth` を送って
-    /// `VocalSynthReady` を待つ間 `Some((target, mode))` を退避し、 ready 受信で
-    /// `start_clip_bounce` を呼ぶ。歌唱以外の bounce では使わない。
-    pub pending_vocal_synth_bounce: Option<(ClipRef, BounceMode)>,
+    /// `VocalSynthReady` を待つ間 stable id を退避し、 ready 受信で現在位置へ
+    /// 解決して `start_clip_bounce` を呼ぶ。歌唱以外の bounce では使わない。
+    pub pending_vocal_synth_bounce: Option<PendingVocalSynthBounce>,
     /// which (track, slot) plugin editors are currently open. The
     /// editor *windows* are now created and owned by the plugin-host process
     /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
@@ -1782,13 +1809,14 @@ pub struct AppData {
     /// is queued so the audio engine doesn't dispatch silent buffers for
     /// tracks whose plugins are still being loaded.
     pub pending_plugin_loads: std::collections::HashSet<(u32, u32)>,
-    /// ユーザーが plugin picker で手動追加した plugin の集合。load 完了
-    /// (`on_plugin_loaded_from_child`) で consume し、(1) daw_audio へ `LoadSong` を
-    /// 再送して新 plugin を signal path に入れ、(2) GUI 自動 open を `gui_open_requests`
-    /// に queue する。`select_plugin_from_db` で (track_id, device_index) を積む。
+    /// ユーザーが plugin picker で手動追加した plugin の集合 (値 = GUI 自動 open
+    /// するか)。load 完了 (`on_plugin_loaded_from_child`) で consume し、(1) daw_audio
+    /// へ `LoadSong` を再送して新 plugin を signal path に入れ (Shift 追加でも必須)、
+    /// (2) 値が true なら GUI 自動 open を `gui_open_requests` に queue する。
+    /// `select_plugin_from_db` で (track_id, device_index) を積む。
     /// プロジェクト読込時の一斉復元では積まれない (= project-open 時の初回 LoadSong が
     /// 全 chain を渡すので per-plugin の再 sync は不要、 GUI も自動 open しない)。
-    pending_added_plugin_finalize: std::collections::HashSet<(u32, u32)>,
+    pending_added_plugin_finalize: std::collections::HashMap<(u32, u32), bool>,
     /// load 完了して「いま開く」段になった GUI auto-open 要求の queue。runner の
     /// frame loop が `drain_pending_gui_opens` で消費し `open_slot_gui` を呼ぶ。
     /// handle_event (IPC 受信) から直接 window を作らず frame loop へ 1 フレーム
@@ -2319,7 +2347,7 @@ impl AppData {
             expanded_automation_tracks: std::collections::HashSet::new(),
             master_row_automation_expanded: false,
             selected_automation_clips: Vec::new(),
-            last_automation_select: None,
+            last_edit_select: None,
             selected_automation_points: Vec::new(),
             editing_automation_point: None,
             last_touched_param: None,
@@ -2426,7 +2454,7 @@ impl AppData {
             track_peak_display: initial_peak_display,
             mod_scalars: Vec::new(),
             pending_plugin_loads: std::collections::HashSet::new(),
-            pending_added_plugin_finalize: std::collections::HashSet::new(),
+            pending_added_plugin_finalize: std::collections::HashMap::new(),
             gui_open_requests: Vec::new(),
             pending_play: false,
             rescan_result: Arc::new(Mutex::new(None)),
@@ -3599,6 +3627,11 @@ impl AppData {
     /// picker が開いていない discrete edit (= 「トラック色に戻す」 reset 等) は
     /// 毎回 snapshot する。
     fn snapshot_for_color_edit(&mut self) {
+        // (review) 色変更は is_undoable 非登録 (per-drag coalesce のためここで
+        // snapshot する) なので、 チョークポイントの dirty arming も通らない。
+        // 色だけの変更が保存確認なしに失われないようここで立てる (under-mark は
+        // 自己補正されない — recompute_dirty は is_dirty=true のときしか走らない)。
+        self.is_dirty = true;
         if self.color_picker_target.is_some() {
             if !self.color_picker_session_dirty {
                 self.push_undo_snapshot();
@@ -3741,6 +3774,26 @@ impl AppData {
         self.selected_notes.clear();
         // audio event の選択 index も同様に undo でずれるため clear。
         self.audio_editor_selected_events.clear();
+        // (review) automation point 選択 (`point_idx` positional) と inline 編集中
+        // point も undo でずれるため clear (notes / audio events と同じ扱い)。
+        self.selected_automation_points.clear();
+        self.editing_automation_point = None;
+        // audio_editor_clip は index ベース ClipRef。 undo で track/clip が詰まる
+        // と別 clip を編集してしまうので、 解決不能 / 非 audio になったら閉じる。
+        if let Some(r) = self.audio_editor_clip {
+            let still_audio = self
+                .song
+                .tracks
+                .get(r.track as usize)
+                .and_then(|t| t.clips.get(r.clip as usize))
+                .and_then(|c| self.song.clip_contents.get(&c.content_id))
+                .is_some_and(|c| {
+                    matches!(c, common::model::ClipContent::Audio(_))
+                });
+            if !still_audio {
+                self.close_audio_editor();
+            }
+        }
         self.track_rename_id = None;
         self.track_rename_text.clear();
         self.section_rename_id = None;
@@ -6578,16 +6631,16 @@ impl AppData {
                 self.delete_automation_clips(&keys)
             }
             AppEvent::SelectAutomationClips { prev: _, next } => {
-                // 直近に選択した automation 面を記録 (= 点とクリップが共存選択された
-                // ときの copy/cut/delete 対象を「最後に選んだ面」 に決める last-wins)。
+                // 直近に選択した編集面を記録 (= 共存選択されたときの
+                // copy/cut/delete 対象を「最後に選んだ面」 に決める last-wins)。
                 if !next.is_empty() {
-                    self.last_automation_select = Some(AutomationSelectSurface::Clips);
+                    self.last_edit_select = Some(EditSelectSurface::AutomationClips);
                 }
                 self.selected_automation_clips = next;
             }
             AppEvent::SelectAutomationPoints { prev: _, next } => {
                 if !next.is_empty() {
-                    self.last_automation_select = Some(AutomationSelectSurface::Points);
+                    self.last_edit_select = Some(EditSelectSurface::AutomationPoints);
                 }
                 self.selected_automation_points = next;
             }
@@ -6721,6 +6774,14 @@ impl AppData {
             }
             AppEvent::ParamGestureEnd { track_id, target } => {
                 self.active_param_gestures.remove(&(track_id, target.clone()));
+                // (review) BPM scrub の hot path は軽量 SetSongBpm のみで、 plugin
+                // host 側の BPM 消費者 (VOICEVOX 合成 metadata / ARA placement /
+                // lipsync) が古い BPM のまま残る。 gesture 終端で 1 回だけ full
+                // sync を frame flush に予約して追従させる (Enter commit 経路
+                // `commit_bpm_edit` と同じ最終状態にする)。
+                if matches!(&target, common::model::AutomationTarget::SongTempo) {
+                    self.pending_host_sync = true;
+                }
                 // Phase 4 Step C: Touch mode の場合、 release で recording 完全停止 →
                 // recording_last_beat からも 該当 entry を消す (= 次の gesture begin
                 // で改めて throttle 開始)。 Latch / Write は stop まで latched 継続
@@ -6912,6 +6973,8 @@ impl AppData {
             AppEvent::RemoveMidiBinding(idx) => {
                 if idx < self.song.midi_bindings.len() {
                     self.song.midi_bindings.remove(idx);
+                    // `midi_bindings` は永続 field (非 undoable 経路なのでここで dirty)。
+                    self.is_dirty = true;
                 }
             }
             AppEvent::MidiInputOpened(name) => {
@@ -6980,6 +7043,9 @@ impl AppData {
             }
             AppEvent::SetNoteSelection(targets) => {
                 self.selected_notes = targets;
+                if !self.selected_notes.is_empty() {
+                    self.last_edit_select = Some(EditSelectSurface::Notes);
+                }
                 // last (anchor) は packed note id。所属クリップを decode し、
                 // (1) **そのクリップを対象 (target) に切替** — 非対象クリップのノートを掴むと編集対象が
                 //     そちらへ移る (plan §D/E。selected_clips は不変なので slot/selected_notes は維持)、
@@ -7690,6 +7756,9 @@ impl AppData {
             }
             AppEvent::SelectAudioEditorEvent(idx) => {
                 self.audio_editor_selected_events = idx.into_iter().collect();
+                if !self.audio_editor_selected_events.is_empty() {
+                    self.last_edit_select = Some(EditSelectSurface::AudioEvents);
+                }
             }
             AppEvent::SetAudioEditorEventSelection(indices) => {
                 self.set_audio_editor_event_selection(indices);
@@ -7757,9 +7826,28 @@ impl AppData {
             AppEvent::VocalSynthReady { plugin_id } => {
                 // 歌唱合成完了 (or timeout) 通知。 同時 bounce は 1 件なので
                 // plugin_id は echo back 用。 pending があれば offline render を開始する。
+                // 合成待ち中の編集で index が動いていても stable id で現在位置へ解決する。
                 let _ = plugin_id;
-                if let Some((target, mode)) = self.pending_vocal_synth_bounce.take() {
-                    self.start_clip_bounce(target, mode);
+                if let Some(p) = self.pending_vocal_synth_bounce.take() {
+                    let resolved = self
+                        .song
+                        .tracks
+                        .iter()
+                        .position(|t| t.id == p.track_id)
+                        .and_then(|ti| {
+                            self.song.tracks[ti]
+                                .clips
+                                .iter()
+                                .position(|c| c.id == p.clip_id)
+                                .map(|ci| ClipRef { track: ti as u32, clip: ci as u32 })
+                        });
+                    match resolved {
+                        Some(target) => self.start_clip_bounce(target, p.mode),
+                        None => {
+                            self.status_message =
+                                "Bounce: 対象クリップが消えたため中止しました".into();
+                        }
+                    }
                 }
             }
             AppEvent::SetClipGainDbBatch(entries) => {
@@ -7958,6 +8046,12 @@ impl AppData {
                 // track を作り直して spurious dirty になる。 debounce leg と同 idiom。
                 if generation == self.lipsync_gen && !clips.is_empty() {
                     self.apply_lipsync_generated(vocal_track_id, bpm, clips);
+                } else if generation == self.lipsync_gen {
+                    // 空 = 全 query 失敗 (engine 起動中等。 ソース無しは spawn 前に
+                    // return 済み)。 発注時に記録した fingerprint を rollback して、
+                    // 次の debounce で自動リトライさせる (残すと「最新」扱いになり
+                    // 入力を変えるまで口パクが欠けたまま再生成されない)。
+                    self.lipsync_fingerprints.remove(&target_track_id);
                 }
             }
             AppEvent::VoicevoxSynthStatus { plugin_id, busy, failing } => {
@@ -8852,6 +8946,11 @@ impl AppData {
         };
         let (mut song, view) = (loaded.song, loaded.view);
         song.ensure_ids();
+        // 別プロジェクトへの丸ごと差し替えなので、現プロジェクトの plugin と
+        // 開いている editor window を先に全て破棄する (action_open_path /
+        // action_new と同じ teardown。 これが無いと「plugin 入り project を開いた
+        // 直後の復元」 で旧 plugin 実体・editor 窓・GUI cache が残る)。
+        self.teardown_all_loaded_plugins();
         self.restore_plugin_from_song(&song);
         self.song = song;
         self.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
@@ -11624,6 +11723,11 @@ impl AppData {
                 }
             }
         }
+        // (review) point_idx は positional なので削除で全 index がずれる。 残すと
+        // 次の Del / Cut が詰め後の別の点を破壊する (`delete_selected_notes` の
+        // `mem::take` と同じ後始末)。 inline 編集中の点も同様に無効化する。
+        self.selected_automation_points.clear();
+        self.editing_automation_point = None;
         self.sync_song_to_plugin_host();
     }
 
@@ -11980,7 +12084,7 @@ impl AppData {
                 point_idx: i,
             })
             .collect();
-        self.last_automation_select = Some(AutomationSelectSurface::Points);
+        self.last_edit_select = Some(EditSelectSurface::AutomationPoints);
         self.sync_song_to_plugin_host();
         count
     }
@@ -12385,7 +12489,7 @@ impl AppData {
             // 解除し (paste_clips_at が selected_notes を clear するのと同じ)、 last-wins も
             // clip 側に倒す。
             self.selected_automation_points.clear();
-            self.last_automation_select = Some(AutomationSelectSurface::Clips);
+            self.last_edit_select = Some(EditSelectSurface::AutomationClips);
             self.sync_song_to_plugin_host();
         }
         pasted
@@ -12651,7 +12755,7 @@ impl AppData {
         }
         if !new_keys.is_empty() {
             self.selected_automation_clips = new_keys;
-            self.last_automation_select = Some(AutomationSelectSurface::Clips);
+            self.last_edit_select = Some(EditSelectSurface::AutomationClips);
             self.sync_song_to_plugin_host();
         }
     }
@@ -12677,7 +12781,7 @@ impl AppData {
         }
         if !new_keys.is_empty() {
             self.selected_automation_clips = new_keys;
-            self.last_automation_select = Some(AutomationSelectSurface::Clips);
+            self.last_edit_select = Some(EditSelectSurface::AutomationClips);
             self.sync_song_to_plugin_host();
         }
     }
@@ -13684,6 +13788,19 @@ impl AppData {
                 tracing::warn!("daw_plugin_host child disconnected");
             }
         }
+        // (review) bounce 進行中の crash では BounceClipFxComplete / VocalSynthReady
+        // が永遠に来ない。 pending を放置すると以後の bounce が全て「既に bounce 中」
+        // で拒否され、 audio 側は isolated song のまま残る。 abort_audio_export と
+        // 同型の脱出口 (どちらの子の crash でも安全に解除できる)。
+        if self.pending_clip_fx_bounce.take().is_some()
+            || self.pending_vocal_synth_bounce.take().is_some()
+        {
+            self.send_plugin(MainToChild::SetRenderMode(
+                common::protocol::RenderMode::Realtime,
+            ));
+            self.restore_engine_song_after_bounce();
+            export_aborted = true;
+        }
 
         // 中止した書き出しがあれば status に併記する suffix。
         let export_suffix = if export_aborted {
@@ -14455,6 +14572,8 @@ impl AppData {
                 controller,
                 target,
             });
+            // `midi_bindings` は永続 field (非 undoable 経路なのでここで dirty)。
+            self.is_dirty = true;
             self.status_message =
                 format!("MIDI bind: CC {controller} (ch {channel}) → {target:?}");
             return;
@@ -14502,9 +14621,15 @@ impl AppData {
                 let bpm = (60.0 + v_norm * 120.0).clamp(1.0, 400.0);
                 let old_bpm = self.song.bpm;
                 self.song.bpm = bpm;
+                // `bpm` は永続 field (非 undoable 経路なのでここで dirty)。
+                self.is_dirty = true;
                 if !self.rescale_raw_clips_for_bpm_change(old_bpm, bpm) {
                     self.send_audio(MainToChild::SetSongBpm { bpm });
                 }
+                // plugin host 側の BPM 消費者 (VOICEVOX metadata / ARA / lipsync)
+                // へも追従させる。 毎 CC の full LoadSong flood を避けるため
+                // frame flush に coalesce (H2 と同 idiom)。
+                self.pending_host_sync = true;
             }
             common::model::BindingTarget::PluginParam {
                 track,
@@ -14803,6 +14928,11 @@ impl AppData {
         if self.midi_recording || self.midi_recording_pending {
             return;
         }
+        // (review) 録音 take を 1 undo step にする。 `MidiNoteOn` / 録音 point
+        // 挿入は per-event で snapshot しない (is_undoable 外) ので、 ここで
+        // 1 回だけ積む — これが無いと Ctrl+Z が「録音 + 直前の別編集」 を
+        // まとめて巻き戻す。
+        self.push_undo_snapshot();
         self.midi_recording_active_notes.clear();
         let bars = self.count_in_bars;
         self.metronome_enabled_pre_recording = Some(self.metronome_enabled);
@@ -15409,6 +15539,9 @@ impl AppData {
         self.selected_clips = keys;
         self.selected_clip = primary;
         self.selected_notes.clear();
+        if primary.is_some() {
+            self.last_edit_select = Some(EditSelectSurface::Clips);
+        }
         self.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
@@ -15431,6 +15564,9 @@ impl AppData {
         self.selected_clips = keys;
         self.selected_clip = primary;
         self.selected_notes.clear();
+        if primary.is_some() {
+            self.last_edit_select = Some(EditSelectSurface::Clips);
+        }
         self.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
@@ -15465,6 +15601,9 @@ impl AppData {
         if all.is_empty() {
             return;
         }
+        // 冪等 early-return より前に last-wins 面だけは更新する (既に全選択でも
+        // 「Ctrl+A = クリップ面を選んだ」 という意図は確定している)。
+        self.last_edit_select = Some(EditSelectSurface::Clips);
         // 既に全選択なら冪等 (集合一致を順序非依存で判定)。
         if self.selected_clips.len() == all.len() {
             let cur: std::collections::HashSet<common::model::ClipKey> =
@@ -15485,6 +15624,9 @@ impl AppData {
         let key = self.clip_key_of(r);
         self.selected_clip = key;
         self.selected_clips = key.into_iter().collect();
+        if key.is_some() {
+            self.last_edit_select = Some(EditSelectSurface::Clips);
+        }
     }
 
     /// 新規 clip 群 (`ClipRef`) を選択集合にする (anchor = 末尾、 view ジャンプ
@@ -15493,6 +15635,9 @@ impl AppData {
         let keys: Vec<common::model::ClipKey> =
             refs.iter().filter_map(|r| self.clip_key_of(*r)).collect();
         self.selected_clip = keys.last().copied();
+        if self.selected_clip.is_some() {
+            self.last_edit_select = Some(EditSelectSurface::Clips);
+        }
         self.selected_clips = keys;
     }
 
@@ -16337,6 +16482,7 @@ impl AppData {
         let Some(track) = self.song.tracks.get(target.track as usize) else {
             return;
         };
+        let source_track_id = track.id;
         let Some(clip) = track.clips.get(target.clip as usize).cloned() else {
             return;
         };
@@ -16369,6 +16515,8 @@ impl AppData {
             mode,
             source_track: target.track,
             source_clip: target.clip,
+            source_track_id,
+            source_content_id: clip.content_id,
             out_path: out_path.clone(),
             source_path,
             clip_name: clip_name.clone(),
@@ -16425,14 +16573,20 @@ impl AppData {
             return;
         }
         // 歌唱トラック + builtin plugin_id 解決済み → 合成完了を待ってから render。
-        let vocal_plugin_id = self
+        // 待ち中の編集で index が動いても追跡できるよう stable id で退避する。
+        let vocal = self
             .song
             .tracks
             .get(target.track as usize)
             .filter(|t| t.is_voicevox_vocal())
-            .and_then(|t| self.vocal_builtin_plugin_id(t));
-        if let Some(plugin_id) = vocal_plugin_id {
-            self.pending_vocal_synth_bounce = Some((target, mode));
+            .and_then(|t| {
+                let plugin_id = self.vocal_builtin_plugin_id(t)?;
+                let clip_id = t.clips.get(target.clip as usize)?.id;
+                Some((plugin_id, t.id, clip_id))
+            });
+        if let Some((plugin_id, track_id, clip_id)) = vocal {
+            self.pending_vocal_synth_bounce =
+                Some(PendingVocalSynthBounce { track_id, clip_id, mode });
             self.sync_vocal_metadata();
             self.send_plugin(common::protocol::MainToChild::PrepareVocalSynth { plugin_id });
             self.status_message = "Bounce: 歌唱を合成中...".into();
@@ -16455,10 +16609,20 @@ impl AppData {
         self.request_bounce(target, BounceMode::WithFx);
     }
 
+    /// bounce 失敗時に、 `start_clip_bounce` が `LoadSong(isolated)` で退避させた
+    /// audio engine の song を full song へ戻す (`EndDrag` と同じ直接 LoadSong)。
+    /// song 自体は無変更なので `sync_song_to_plugin_host` (is_dirty / vocal / ARA
+    /// 派生同期つき) は使わない。 これを怠ると失敗後の再生が isolate された
+    /// 1 トラックのみになる。
+    fn restore_engine_song_after_bounce(&mut self) {
+        let song = self.song.clone();
+        self.send_audio(MainToChild::LoadSong(song));
+    }
+
     /// PR-C: BounceClipFxOnline 完了通知の処理。 SetRenderMode(Realtime)
     /// で bookend 解除、 success なら新 audio source + 新 track + 新
-    /// audio clip を配置 + Undo snapshot。 失敗時は status_message のみ
-    /// (= pending クリア + 残骸ファイル削除)。
+    /// audio clip を配置 + Undo snapshot。 失敗時は pending クリア + 残骸
+    /// ファイル削除 + full song 再 LoadSong (= engine の isolated song を復元)。
     fn handle_bounce_clip_fx_complete(
         &mut self,
         path: PathBuf,
@@ -16467,12 +16631,12 @@ impl AppData {
         error: Option<String>,
         frames: u64,
     ) {
-        // bookend を Realtime に戻す (= 失敗時も忘れず)。
-        self.send_plugin(MainToChild::SetRenderMode(
-            common::protocol::RenderMode::Realtime,
-        ));
-
         let Some(pending) = self.pending_clip_fx_bounce.take() else {
+            // 対応する pending が無い completion (respawn 後の残骸等)。 render mode
+            // だけ防御的に Realtime へ戻す。
+            self.send_plugin(MainToChild::SetRenderMode(
+                common::protocol::RenderMode::Realtime,
+            ));
             tracing::warn!("BounceClipFxComplete with no pending bounce; ignoring");
             return;
         };
@@ -16486,17 +16650,40 @@ impl AppData {
                 source_clip,
                 "BounceClipFxComplete identifier mismatch with pending; ignoring"
             );
+            // 進行中の本命 bounce の追跡 (と Offline render mode) は壊さない。
+            self.pending_clip_fx_bounce = Some(pending);
             return;
         }
+        // bookend を Realtime に戻す (= 失敗時も忘れず)。
+        self.send_plugin(MainToChild::SetRenderMode(
+            common::protocol::RenderMode::Realtime,
+        ));
+        let label = match pending.mode {
+            BounceMode::InPlace => "Bounce In Place",
+            BounceMode::WithFx => "Bounce (with FX)",
+        };
         if let Some(err) = error {
-            self.status_message = format!("Bounce (with FX) 失敗: {err}");
+            self.status_message = format!("{label} 失敗: {err}");
             let _ = std::fs::remove_file(&path);
+            self.restore_engine_song_after_bounce();
             return;
         }
         if frames == 0 {
             self.status_message =
-                "Bounce (with FX): render 結果が空です (= silence のみ?)".into();
+                format!("{label}: render 結果が空です (= silence のみ?)");
             let _ = std::fs::remove_file(&path);
+            self.restore_engine_song_after_bounce();
+            return;
+        }
+        // InPlace の置換対象 content が bounce 中の編集で消えていたら結果を破棄
+        // (index でなく stable id で判定。 別クリップを誤置換しない)。
+        if pending.mode == BounceMode::InPlace
+            && !self.song.clip_contents.contains_key(&pending.source_content_id)
+        {
+            self.status_message =
+                "Bounce In Place: 対象クリップが消えたため結果を破棄しました".into();
+            let _ = std::fs::remove_file(&path);
+            self.restore_engine_song_after_bounce();
             return;
         }
 
@@ -16578,7 +16765,14 @@ impl AppData {
 
                 // 二重再生回避のため元トラックを自動ミュート。 別 SetTrackMuted は
                 // 不要 (下の sync_song_to_plugin_host が muted=true 込みの full song を LoadSong)。
-                if let Some(src) = self.song.tracks.get_mut(source_track as usize) {
+                // index は bounce 中の編集で stale になり得るので stable id で解決する
+                // (削除済みなら skip = 二重再生の危険自体が無い)。
+                if let Some(src) = self
+                    .song
+                    .tracks
+                    .iter_mut()
+                    .find(|t| t.id == pending.source_track_id)
+                {
                     src.muted = true;
                 }
 
@@ -16592,14 +16786,10 @@ impl AppData {
             BounceMode::InPlace => {
                 // 元クリップの content を bounce 結果 (single audio event) に
                 // 置換 (= flat 化)。 同 content_id を共有する linked clip も追従する。
-                let content_id = self
-                    .song
-                    .tracks
-                    .get(source_track as usize)
-                    .and_then(|t| t.clips.get(source_clip as usize))
-                    .map(|c| c.content_id);
-                if let Some(cid) = content_id
-                    && let Some(content) = self.song.clip_contents.get_mut(&cid)
+                // 対象は bounce 開始時に捕捉した stable な content id (index 経由の
+                // 再解決は bounce 中の編集でずれる)。 存在は上で検証済み。
+                if let Some(content) =
+                    self.song.clip_contents.get_mut(&pending.source_content_id)
                 {
                     *content = common::model::ClipContent::Audio(common::model::AudioContent {
                         events: vec![new_event],
@@ -17885,6 +18075,9 @@ impl AppData {
         let mut seen = std::collections::HashSet::new();
         let deduped: Vec<usize> = indices.into_iter().filter(|i| seen.insert(*i)).collect();
         self.audio_editor_selected_events = deduped;
+        if !self.audio_editor_selected_events.is_empty() {
+            self.last_edit_select = Some(EditSelectSurface::AudioEvents);
+        }
     }
 
     /// Audio Editor で選択中の全 event を削除 (= Delete key、 複数選択
@@ -19423,9 +19616,13 @@ impl AppData {
         self.ara_doc_cache.remove(&(track_id, index));
 
         // pending_play flush より前に sync し、 Play 待ち再生も最新 schedule で開始させる。
-        if self.pending_added_plugin_finalize.remove(&(track_id, index)) {
+        // Shift 追加 (open_gui=false) でも audio 再 sync は必須 — 無いと次の無関係な
+        // sync まで新 plugin が schedule に入らない (review 修正)。
+        if let Some(open_gui) = self.pending_added_plugin_finalize.remove(&(track_id, index)) {
             self.sync_song_to_plugin_host();
-            self.gui_open_requests.push((track_id, index));
+            if open_gui {
+                self.gui_open_requests.push((track_id, index));
+            }
         }
 
         // A7: this load is done. If Play was queued waiting for the
@@ -19836,16 +20033,33 @@ impl AppData {
         for (to, v) in new_params {
             self.plugin_params.insert((track_id, to), v);
         }
-        // (review) automation lanes are addressed by device index
+        // (review) automation lanes / mod routings are addressed by device index
         // (`AutomationTarget::PluginParam { device_index, .. }`) and are
-        // persisted to the project. Re-point each matching lane old→new so the
+        // persisted to the project. Re-point each matching target old→new so the
         // moved plugin keeps its automation — otherwise the plugin that took
         // its old index gets driven by it (audible wrong audio that also
         // survives reload).
         if track_id == common::model::MASTER_TRACK_ID {
             Self::remap_lane_slots(&mut self.song.song_lanes, &moves);
+            for r in &mut self.song.song_mod_routings {
+                Self::remap_plugin_param_device_index(&mut r.target, &moves);
+            }
         } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
             Self::remap_lane_slots(&mut t.automation_lanes, &moves);
+            for r in &mut t.mod_routings {
+                Self::remap_plugin_param_device_index(&mut r.target, &moves);
+            }
+        }
+        // MIDI Learn binding も (track, device_index) addressing (song-level list)。
+        for b in &mut self.song.midi_bindings {
+            if let common::model::BindingTarget::PluginParam { track, device_index, .. } =
+                &mut b.target
+                && *track == track_id
+                && let Some(&(_, new_index)) =
+                    moves.iter().find(|(from, _)| *from == *device_index)
+            {
+                *device_index = new_index;
+            }
         }
         // Plugin host re-keys its live chain + editor windows + worker registry;
         // the audio engine atomically re-keys slot_to_plugin_id. Both get the
@@ -19869,23 +20083,21 @@ impl AppData {
         moves: &[(u32, u32)],
     ) {
         for lane in lanes.iter_mut() {
-            if let common::model::AutomationTarget::PluginParam {
-                device_index,
-                param_id,
-                ..
-            } = &lane.target
-            {
-                let (old_index, param_id) = (*device_index, *param_id);
-                if let Some(&(_, new_index)) =
-                    moves.iter().find(|(from, _)| *from == old_index)
-                {
-                    lane.target = common::model::AutomationTarget::PluginParam {
-                        device_index: new_index,
-                        param_id,
-                        legacy_slot: None,
-                    };
-                }
-            }
+            Self::remap_plugin_param_device_index(&mut lane.target, moves);
+        }
+    }
+
+    /// `AutomationTarget::PluginParam { device_index }` 1 件を `moves`
+    /// (old→new) で貼り替える。 automation lane / mod routing 共通の素片。
+    fn remap_plugin_param_device_index(
+        target: &mut common::model::AutomationTarget,
+        moves: &[(u32, u32)],
+    ) {
+        if let common::model::AutomationTarget::PluginParam { device_index, .. } = target
+            && let Some(&(_, new_index)) =
+                moves.iter().find(|(from, _)| *from == *device_index)
+        {
+            *device_index = new_index;
         }
     }
 
@@ -20416,7 +20628,9 @@ impl AppData {
 
     /// 単一デバイスチェーン: `Track.devices` / `master_fx_chain` の指定 index の
     /// device を `Vec::remove` する。host への RemoveSlotPlugin + GUI cleanup +
-    /// cache 削除 + 後続 index shift を行う。
+    /// cache 削除 + 後続 index shift + device_index addressing の参照
+    /// (automation lane / mod routing / MIDI binding) の追従 + LoadSong flush
+    /// を行う。
     fn remove_device_inner(&mut self, track_id: u32, index: u32) {
         // **GUI lifecycle**: close the editor BEFORE removing the
         // plugin. cleanup_slot_gui sends CloseSlotGui so the plugin-host tears
@@ -20489,6 +20703,69 @@ impl AppData {
         {
             track.group_transform = None;
         }
+        // (review) device_index addressing の参照 (automation lane / mod routing /
+        // MIDI binding) を詰め後の index へ追従させる (apply_chain_reorder の
+        // remap と対になる削除版)。
+        self.remap_device_refs_after_remove(track_id, index);
+        // song 更新を engine へ flush (= schedule から削除 device の dispatch を
+        // 落とす)。 これが無いと次の編集まで stale schedule のまま destroyed
+        // plugin へ dispatch し続け、 remap した lane も engine へ届かない。
+        self.sync_song_to_plugin_host();
+    }
+
+    /// device を `Vec::remove` した後、 その track の device_index addressing の
+    /// 参照を追従させる: 削除 device を指す automation lane / mod routing /
+    /// MIDI binding は丸ごと削除 (残すと詰めで隣にずれた device を誤駆動)、
+    /// それより後ろを指すものは 1 つ前へ詰める。 point / clip 選択は stable な
+    /// lane_id 参照なので、 lane 削除後は dangling 解決 (= None) で無害に落ちる。
+    fn remap_device_refs_after_remove(&mut self, track_id: u32, removed_index: u32) {
+        // 戻り値 = 残すか。 残す場合は index を in-place で詰める。
+        fn retarget(
+            target: &mut common::model::AutomationTarget,
+            removed_index: u32,
+        ) -> bool {
+            if let common::model::AutomationTarget::PluginParam { device_index, .. } =
+                target
+            {
+                if *device_index == removed_index {
+                    return false;
+                }
+                if *device_index > removed_index {
+                    *device_index -= 1;
+                }
+            }
+            true
+        }
+        if track_id == common::model::MASTER_TRACK_ID {
+            self.song
+                .song_lanes
+                .retain_mut(|l| retarget(&mut l.target, removed_index));
+            self.song
+                .song_mod_routings
+                .retain_mut(|r| retarget(&mut r.target, removed_index));
+        } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
+            t.automation_lanes
+                .retain_mut(|l| retarget(&mut l.target, removed_index));
+            t.mod_routings
+                .retain_mut(|r| retarget(&mut r.target, removed_index));
+        }
+        self.song.midi_bindings.retain_mut(|b| {
+            let common::model::BindingTarget::PluginParam { track, device_index, .. } =
+                &mut b.target
+            else {
+                return true;
+            };
+            if *track != track_id {
+                return true;
+            }
+            if *device_index == removed_index {
+                return false;
+            }
+            if *device_index > removed_index {
+                *device_index -= 1;
+            }
+            true
+        });
     }
 
     /// device を index で `Vec::remove` した後、`loaded_slots` / `plugin_params`
@@ -21436,12 +21713,12 @@ impl AppData {
         let is_video = ports.is_video();
         if !is_video {
             self.track_pending_load(track_id, dest_index);
-            // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync + GUI 自動
-            // open する (project-load の一斉復元はこの集合に積まれない)。 Shift
-            // (open_gui=false) のときは GUI 自動 open を抑止 (ロードはする)。
-            if open_gui {
-                self.pending_added_plugin_finalize.insert((track_id, dest_index));
-            }
+            // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync +
+            // (open_gui なら) GUI 自動 open する (project-load の一斉復元はこの
+            // 集合に積まれない)。 Shift (open_gui=false) でも sync は必要なので
+            // 常に積み、 auto-open だけ値で分岐する。
+            self.pending_added_plugin_finalize
+                .insert((track_id, dest_index), open_gui);
             self.send_plugin(MainToChild::SetSlotPlugin {
                 track: track_id,
                 index: dest_index,
@@ -21864,6 +22141,8 @@ impl AppData {
         };
         t.armed = !t.armed;
         let armed = t.armed;
+        // `armed` は永続 field。 mute / solo と同じく dirty を立てる。
+        self.is_dirty = true;
         let msg = MainToChild::SetTrackArmed { track: track_id, armed };
         self.send_audio(msg);
     }

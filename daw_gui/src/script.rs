@@ -123,7 +123,13 @@ impl ScriptHost {
             None,
             None,
             RecordingDispatcher::new(),
-            Arc::new(NoopJobDispatcher),
+            // (review) script mode でも VOICEVOX engine の lazy spawn は起きる
+            // (loadSongFile → 歌唱合成)。 Noop だと Job Object 未登録で script
+            // プロセス終了後に engine が zombie 化するので production と同じ
+            // dispatcher を渡す。
+            Arc::new(crate::dispatcher::Win32JobDispatcher::new(Arc::clone(
+                &bootstrap.job,
+            ))),
             // script mode は同 process 内の bootstrap が握る supervisor を
             // 渡しても安全だが、 script 中に子プロセスが死ぬケースは
             // テスト・録画用途では発生しない前提なので None で十分。

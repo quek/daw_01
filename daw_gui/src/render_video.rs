@@ -396,6 +396,7 @@ pub fn render_mp4_cancellable(
             &mut video_textures,
             &image_textures,
             playhead_beat,
+            start_secs + frame_seconds,
             &mod_scalars_buf,
             out_w,
             out_h,
@@ -520,6 +521,7 @@ fn build_frame_scene(
     video_textures: &mut HashMap<VideoSourceId, (TextureHandle, u32, u32)>,
     image_textures: &HashMap<ImageSourceId, (TextureHandle, u32, u32)>,
     playhead_beat: f64,
+    playhead_secs: f64,
     mod_scalars: &[f32],
     out_w: u32,
     out_h: u32,
@@ -528,9 +530,9 @@ fn build_frame_scene(
     // 前 frame の効果 target を解放 (前 frame は submit_readback で sample 済み)。
     // 今 frame の apply_chain が同寸でも別 target を払い出し、レイヤー間衝突を防ぐ。
     fx_engine.end_frame(offscreen);
-    // 時間系効果の P.time（秒）。preview と同じ song 時間（playhead_beat ×
-    // 60/bpm）を渡して時間系効果も一致させる。
-    fx_engine.set_time((playhead_beat * 60.0 / f64::from(song.bpm.max(1.0))) as f32);
+    // 時間系効果の P.time（秒）。preview と同じ song 時間 (tempo 積分済み、
+    // caller の frame→秒がそのまま真値) を渡して時間系効果も一致させる。
+    fx_engine.set_time(playhead_secs as f32);
     // 動画 / PiP 画像 / テキストを owning track
     // ごとに 1 枚へ合成する (preview と同一の per-track composite。byte parity)。各 track の
     // 視覚アイテムを bucket に集め、track 順 (z 順) に共通の composite_and_place で描く。

@@ -188,6 +188,23 @@ impl InputAccumulator {
                 self.pending_file_drops.push(path.clone());
                 self.hovering_files.clear();
             }
+            AppEvent::Focus(false) => {
+                // (review) focus 喪失 (Alt+Tab 等) 時、 winit (Windows) は
+                // WM_CAPTURECHANGED で capture を捨てるだけで合成 Release を
+                // 送らない。 押下状態を残すと (a) release-event 依存の drag
+                // (fader / knob / scrub / scroll 等) が貼り付いたまま、 (b) 復帰後の
+                // 最初の press が `!primary_pressed` gate で just_pressed に
+                // ならず初回クリックが失われる。 押下中なら合成 release を
+                // 積んでから状態を落とす (egui 等と同じ対処)。
+                if self.primary_pressed {
+                    self.pending_just_released = true;
+                }
+                self.primary_pressed = false;
+                if self.secondary_pressed {
+                    self.pending_secondary_just_released = true;
+                }
+                self.secondary_pressed = false;
+            }
             _ => {}
         }
     }

@@ -1074,6 +1074,17 @@ fn compute_blur_kernel(sigma: f32) -> ([f32; 3], [f32; 3]) {
         }
         weights[2] = w_combined;
     }
+    // (review) shader は 5-tap (center + ±2 pair、 ±4 texel) 固定なので、 全範囲
+    // (-radius..=radius) で正規化したままだと sigma > ~1.3 で有効重み和 < 1 になり
+    // shadow が「ぼけずに薄くなる」 (blur_px=30 で 2 pass 後 ≈0.13 まで減光)。
+    // 5-tap がカバーする範囲だけで再正規化して減光を消す (blur 半径が ~4-5px で
+    // 頭打ちになる制限は残る — それ以上は tap 数可変 / downsample 多段が必要)。
+    let covered = weights[0] + 2.0 * (weights[1] + weights[2]);
+    if covered > 0.0 {
+        weights[0] /= covered;
+        weights[1] /= covered;
+        weights[2] /= covered;
+    }
     (weights, offsets)
 }
 
@@ -1109,6 +1120,20 @@ mod tests {
         // weights normalized to sum near 1.0 (after summing center + 2 * paired)
         let sum = w[0] + 2.0 * w[1] + 2.0 * w[2];
         assert!((sum - 1.0).abs() < 0.05, "weights sum ≈ 1.0, got {sum}");
+    }
+
+    /// (review) 大 sigma でも 5-tap の有効重み和が 1 のまま (= shadow が blur 量に
+    /// 比例して減光しない)。 旧実装は全範囲正規化のため sigma=10 で和 ≈0.36 だった。
+    #[test]
+    fn blur_kernel_large_sigma_stays_normalized() {
+        for sigma in [2.0_f32, 5.0, 10.0, 30.0] {
+            let (w, _) = compute_blur_kernel(sigma);
+            let sum = w[0] + 2.0 * w[1] + 2.0 * w[2];
+            assert!(
+                (sum - 1.0).abs() < 1e-3,
+                "sigma={sigma}: weights sum ≈ 1.0, got {sum}"
+            );
+        }
     }
 
     /// outline 付き (= effect path) で font だけ違う 2 area を作る helper。

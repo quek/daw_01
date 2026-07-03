@@ -1785,9 +1785,11 @@ fn audio_grip_hit_in_lanes(
     let visible_idx = track_index_from_y(cy, lanes.y, tops)?;
     let track = visible_tracks.get(visible_idx)?;
     let row_top = tops[visible_idx];
+    // 描画 (draw_clip_audio_overlay) と同じ per-track 実効行高で判定する。
+    let row_h = effective_track_row_h(track, view.track_row_h);
     let mut hit: Option<(ClipKey, AudioGripHit)> = None;
     for clip in &track.clips {
-        if let Some(zone) = audio_grip_hit(row_top, view.track_row_h, clip, view, lanes, cx, cy, style) {
+        if let Some(zone) = audio_grip_hit(row_top, row_h, clip, view, lanes, cx, cy, style) {
             hit = Some((ClipKey { track: track.id, clip: clip.id }, zone));
         }
     }
@@ -1866,16 +1868,20 @@ pub fn clip_hit(
     let visible_idx = track_index_from_y(cy, lanes.y, tops)?;
     let track = visible_tracks.get(visible_idx)?;
     let row_top = tops[visible_idx];
+    // 描画 (draw_clips) と同じ per-track 実効行高で判定する。 global
+    // `view.track_row_h` のままだと、 行を太らせた track のクリップ下部が
+    // 「描画されているのに掴めない」 (marquee 起動 / dblclick で重複生成) になる。
+    let row_h = effective_track_row_h(track, view.track_row_h);
     let mut hit: Option<(ClipKey, ClipDragKind)> = None;
     let mut hit_inside = false;
     let mut hit_edge_dist = f32::INFINITY;
     for clip in &track.clips {
         let Some(kind) =
-            clip_zone_at(row_top, view.track_row_h, clip, view, lanes, cx, cy, resize_handle_px)
+            clip_zone_at(row_top, row_h, clip, view, lanes, cx, cy, resize_handle_px)
         else {
             continue;
         };
-        let r = clip_to_rect(row_top, view.track_row_h, clip, view, lanes);
+        let r = clip_to_rect(row_top, row_h, clip, view, lanes);
         let inside = cx >= r.x && cx < r.x + r.w;
         // resize edge への水平距離 (Move は当該 cursor 位置 = 距離 0 扱い)。
         let edge_x = match kind {
@@ -3000,6 +3006,33 @@ fn compute_clip_drag_beat_delta(
     snapped_pivot - pivot
 }
 
+/// clip Move の track 移動量 (visible 行数)。 press 時と現在の pointer y をそれぞれ
+/// `tops` (可変行高の prefix sum) 上の visible 行 index に解決して差を取る。
+/// overlay (drag ghost) と release commit が共有する。
+///
+/// 旧実装の「`dy / view.track_row_h` の均一換算」は per-track 行高 override /
+/// automation lane 展開で行高が非等間隔になると、 カーソルの指す行と別の行に
+/// ghost / commit が着地していた (automation clip drag の y→lane 解決と非対称)。
+/// lanes 外へはみ出した y は端の行に clamp (従来の clamp 挙動を維持)。
+fn compute_clip_drag_track_delta(nd: &ClipDragSession, tops: &[f32]) -> i32 {
+    let idx_at = |y: f32| -> Option<usize> {
+        if tops.len() < 2 {
+            return None;
+        }
+        if y < tops[0] {
+            return Some(0);
+        }
+        // tops は単調増加。 y >= tops[last] は最終行に clamp。
+        let i = tops.partition_point(|&t| t <= y);
+        Some((i - 1).min(tops.len() - 2))
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    match (idx_at(nd.anchor_mouse.1), idx_at(nd.last_mouse.1)) {
+        (Some(pressed), Some(current)) => current as i32 - pressed as i32,
+        _ => 0,
+    }
+}
+
 /// daw_01 #071: automation clip drag の snap 適用済 beat delta (`compute_clip_drag_beat_delta` の
 /// automation 版)。 pivot = `anchors[0]` (= 掴んだ clip) の編集対象端の絶対位置を snap して差分を返す
 /// (絶対位置 snap、 overlay と release commit が共有して描画 / commit を完全一致させる)。
@@ -3059,12 +3092,32 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
     for t in tracks {
         h ^= u64::from(t.id);
         h = h.wrapping_mul(PRIME);
+        // per-track 行高 override (review): cached 層の全 y 配置が依存する。 抜けると
+        // 行リサイズ drag 中に cached (クリップ / 行背景 / grid) が古い位置で凍る
+        // (lane.height_px は fold 済みなのに row_h だけ欠けていた非対称)。
+        h ^= t.row_h.map_or(u64::MAX, u64::from);
+        h = h.wrapping_mul(PRIME);
         for c in &t.clips {
             h ^= u64::from(c.id);
             h = h.wrapping_mul(PRIME);
             h ^= c.start_beat.to_bits();
             h = h.wrapping_mul(PRIME);
             h ^= c.len_beats.to_bits();
+            h = h.wrapping_mul(PRIME);
+            // muted は cached 内の fill dim + 斜線ハッチ描画に効く (review — widget 契約
+            // #011 「clip 個別変化は widget が吸収」 に合わせ caller hash に頼らない)。
+            h ^= u64::from(c.muted);
+            h = h.wrapping_mul(PRIME);
+            // video thumbnail の decode 完了 (None→Some) / 差し替えを検知 (review)。
+            // handle raw 値 + サイズで十分 (内容は immutable texture)。
+            let thumb_marker = c.thumbnail.map_or(u64::MAX, |(handle, w, hgt)| {
+                let mut a: u64 = 0x7157_B00B_5EED_F00D;
+                a ^= u64::from(handle.raw_id().get());
+                a = a.wrapping_mul(PRIME);
+                a ^= (u64::from(w) << 32) | u64::from(hgt);
+                a
+            });
+            h ^= thumb_marker;
             h = h.wrapping_mul(PRIME);
             // name: Arc<str> の ptr で簡易検知 (refcount bump は同 ptr、 rename / replace で
             // new Arc → ptr 変化)。 内容 hash は O(n) で過剰、 ptr 比較で十分。
@@ -3848,15 +3901,21 @@ fn drag_preview_geometry(
     kind: ClipDragKind,
     beat_delta: f64,
     track_delta: i32,
+    min_idx: usize,
     n_tracks: usize,
     min_len: f64,
 ) -> (f64, f64, usize) {
     match kind {
         ClipDragKind::Move => {
             let new_start = (anchor.start_beat + beat_delta).max(0.0);
+            // `min_idx` = master row があれば 1 (release commit の `min_idx_i32` と
+            // 同じ下限)。 揃えないと最上端で preview が master 行に ghost を描き
+            // preview ≠ commit になる (review — overlay/commit 完全一致の原則)。
             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-            let new_idx = (anchor.track_index as i32 + track_delta)
-                .clamp(0, (n_tracks.saturating_sub(1)) as i32);
+            let new_idx = (anchor.track_index as i32 + track_delta).clamp(
+                min_idx as i32,
+                ((n_tracks.saturating_sub(1)) as i32).max(min_idx as i32),
+            );
             #[allow(clippy::cast_sign_loss)]
             let new_idx_u = new_idx.max(0) as usize;
             (new_start, anchor.len_beats, new_idx_u)
@@ -3879,6 +3938,7 @@ fn drag_preview_geometry(
 fn draw_drag_preview<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     nd: &ClipDragSession,
+    visible_tracks: &[ArrangementTrack],
     tops: &[f32],
     view: ArrangementView,
     lanes: Rect,
@@ -3903,9 +3963,14 @@ fn draw_drag_preview<M: ?Sized + 'static>(
         (style.clip_selected_fill, style.clip_selected_border, None)
     };
 
+    // master row prepend 済みなら drop 先下限は 1 (release commit と同じ guard)。
+    let min_idx = usize::from(
+        visible_tracks.first().is_some_and(|t| t.id == MASTER_TRACK_ID),
+    );
     for a in &nd.anchors {
-        let (start, len, new_idx) =
-            drag_preview_geometry(*a, nd.kind, beat_delta, track_delta, n_tracks, min_len);
+        let (start, len, new_idx) = drag_preview_geometry(
+            *a, nd.kind, beat_delta, track_delta, min_idx, n_tracks, min_len,
+        );
         let preview_clip = ArrangementClip {
             id: a.key.clip,
             start_beat: start,
@@ -3927,7 +3992,11 @@ fn draw_drag_preview<M: ?Sized + 'static>(
         let Some(row_top) = tops.get(new_idx).copied() else {
             continue;
         };
-        let r = clip_to_rect(row_top, view.track_row_h, &preview_clip, view, lanes);
+        // ghost も drop 先 track の per-track 実効行高で描く (commit 後の実描画と一致)。
+        let ghost_row_h = visible_tracks
+            .get(new_idx)
+            .map_or(view.track_row_h, |t| effective_track_row_h(t, view.track_row_h));
+        let r = clip_to_rect(row_top, ghost_row_h, &preview_clip, view, lanes);
         if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
             continue;
         }
@@ -4696,9 +4765,12 @@ fn collect_points_in_rect(
     view: ArrangementView,
     lanes: Rect,
     rect: Rect,
+    style: &ArrangementStyle,
 ) -> Vec<AutomationPointKey> {
-    // 描画と同じ縦 padding (= `automation_clip_v_pad_px` default 6.0、 `draw_automation_lane` SSoT)。
-    const PAD: f32 = 6.0;
+    // 描画と同じ縦 padding (`draw_automation_lane` / `automation_point_at` と同じく
+    // `style.automation_clip_v_pad_px` を参照。 定数 fork だと style 変更時に
+    // lasso の点中心座標だけ描画とずれる、 review)。
+    let pad: f32 = style.automation_clip_v_pad_px;
     let beat_to_px = f64::from(lanes.w) / view.len_beats.max(1e-6);
     let mut out: Vec<AutomationPointKey> = Vec::new();
     for (i, t) in visible_tracks.iter().enumerate() {
@@ -4714,8 +4786,8 @@ fn collect_points_in_rect(
             }
             let lh = f32::from(lane.height_px);
             // 描画と同じ縦 padding 適用 (`draw_automation_lane` SSoT)。
-            let clip_y = lane_y + PAD;
-            let clip_h = (lh - PAD * 2.0).max(2.0);
+            let clip_y = lane_y + pad;
+            let clip_h = (lh - pad * 2.0).max(2.0);
             for c in &lane.clips {
                 for (p_idx, p) in c.points.iter().enumerate() {
                     let abs_beat = c.start_beat + p.time_beat;
@@ -4880,7 +4952,8 @@ fn automation_clip_at(
 /// M14 Phase 63n-3 (#028): lane body 内の automation clip 上で hit する
 /// `(AutomationClipKey, ClipDragKind, clip_rect, body_rect)` を返す。
 /// `clip_zone_at` と完全同 仕様: clip rect 左右 edge から内外 ±`edge` px が Resize、 内側中央が Move、
-/// 短 clip (`r.w <= edge * 2`) は rect 内全 Move (rect 外側のみ resize)。 後勝ち順 (描画順と整合)。
+/// 短 clip (`r.w <= edge * 2`) は rect 内全 Move (rect 外側のみ resize)。 隣接 clip の共有境界は
+/// `clip_hit` / `section_hit` と同じ 2-tier in-rect 優先 (同 tier は edge 距離、 同距離は後勝ち)。
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn automation_clip_zone_at(
@@ -4900,6 +4973,11 @@ pub fn automation_clip_zone_at(
         return None;
     }
     let mut hit: Option<(AutomationClipKey, ClipDragKind, Rect, Rect)> = None;
+    // `clip_hit` / `section_hit` と同じ 2-tier in-rect 優先 (隣接 clip の共有境界で
+    // 右端 resize が後続の外側拡張 ResizeLeft に奪われる既知バグクラスの同件、
+    // review — ui/CLAUDE.md 「左右端 resize ハンドル widget は 2-tier 踏襲」)。
+    let mut hit_inside = false;
+    let mut hit_edge_dist = f32::INFINITY;
     for_each_visible_lane(
         visible_tracks,
         tops,
@@ -4937,19 +5015,46 @@ pub fn automation_clip_zone_at(
                 let short_clip = r.w <= edge * 2.0;
                 let kind = if short_clip && in_rect {
                     ClipDragKind::Move
-                } else if near_left && (!in_rect || cx - r.x < edge) {
+                } else if !in_rect {
+                    // rect 外 (外側拡張ハンドル) は rect のどちら側かで決める
+                    // (piano_roll `note_zone_in` と同修正 — 極短 clip の右外側帯が
+                    // ResizeLeft に化けないように)。
+                    if cx < r.x {
+                        ClipDragKind::ResizeLeft
+                    } else {
+                        ClipDragKind::ResizeRight
+                    }
+                } else if near_left {
                     ClipDragKind::ResizeLeft
-                } else if near_right && (!in_rect || (r.x + r.w) - cx < edge) {
+                } else if near_right {
                     ClipDragKind::ResizeRight
                 } else {
                     ClipDragKind::Move
                 };
+                let edge_x = match kind {
+                    ClipDragKind::ResizeLeft => r.x,
+                    ClipDragKind::ResizeRight => r.x + r.w,
+                    ClipDragKind::Move => cx,
+                };
+                let dist = (cx - edge_x).abs();
+                // in-rect は outer に無条件で勝つ。 同 tier は近い edge 優先
+                // (同距離は後勝ち = 描画順で前面)。
+                let better = if in_rect == hit_inside {
+                    dist <= hit_edge_dist
+                } else {
+                    in_rect
+                };
+                if !better {
+                    continue;
+                }
                 let key = AutomationClipKey {
                     track: track_id,
                     lane: lane.id,
                     clip: clip.id,
                 };
                 hit = Some((key, kind, r, body_rect));
+                hit_inside = in_rect;
+                hit_edge_dist = dist;
             }
         },
     );
@@ -5699,7 +5804,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         AudioGripHit::FadeCornerIn => AudioDragKind::FadeIn,
                         AudioGripHit::FadeCornerOut => AudioDragKind::FadeOut,
                     };
-                    let r_anchor = clip_to_rect(press_tops[t_idx], view.track_row_h, c, view, lanes);
+                    let r_anchor = clip_to_rect(
+                        press_tops[t_idx],
+                        effective_track_row_h(t, view.track_row_h),
+                        c,
+                        view,
+                        lanes,
+                    );
                     // Gain は常に vertical lock 確定 (横 drag は無視)、 Fade は press 時 `None` で
                     // sticky direction 待ち (continuation で閾値超えた方向に lock)。
                     let locked_horizontal = match kind {
@@ -5914,9 +6025,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         w: (header_pane.w - indent).max(2.0),
                         h: view.track_row_h,
                     };
-                    let band_h = if matches!(t.kind, TrackKind::Video) {
+                    let band_h = if matches!(t.kind, TrackKind::Video) || t.id == MASTER_TRACK_ID
+                    {
                         // M14 Phase 72 (#044): video track では volume slider band を非表示
                         // (volume / pan は video には意味を持たない、 instrument / fx_chain と同様)。
+                        // master row も描画側 (`header_row_layout(row, 0.0)`) と揃えて band 無し —
+                        // 揃えないと不可視の volume drag が起動して
+                        // `SetTrackVolume{track:MASTER}` を emit + カーソルが EwResize 化 (review)。
                         0.0
                     } else {
                         style.track_volume_band_h
@@ -6820,7 +6935,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         } else {
             None
         };
-        let (clip_drag_release, clip_short_click_pos): (Option<ClipDragSession>, Option<(f32, f32)>) =
+        // 短 click 化時は session の careful-update modifier (`last_ctrl` / `last_shift`)
+        // も一緒に持ち回す — release frame の `pointer.modifiers` 生読みは
+        // 「ModifiersChanged が Released より先に届く」 race で Ctrl/Shift+click が
+        // Single に化ける (automation clip の demote と同 pattern、 review)。
+        #[allow(clippy::type_complexity)]
+        let (clip_drag_release, clip_short_click_pos): (
+            Option<ClipDragSession>,
+            Option<((f32, f32), bool, bool)>,
+        ) =
             if let Some(nd) = clip_drag_release_raw {
                 let dx = nd.last_mouse.0 - nd.anchor_mouse.0;
                 let dy = nd.last_mouse.1 - nd.anchor_mouse.1;
@@ -6837,7 +6960,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let is_move = matches!(nd.kind, ClipDragKind::Move);
                 let demote = is_move && !nd.last_alt && dist < 4.0;
                 if demote {
-                    (None, Some(nd.last_mouse))
+                    (None, Some((nd.last_mouse, nd.last_ctrl, nd.last_shift)))
                 } else {
                     (Some(nd), None)
                 }
@@ -7048,12 +7171,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // drag overlay delta (last_mouse ベース、release と一貫)。
         // M14 Phase 63j (#024): `beat_per_px` / `zoom_x_px_per_beat` は関数頭で計算済 (press 振り分けの
         // playhead seek snap でも使うため)。 ここでは shadow せず再利用する。
-        let row_per_px = 1.0_f32 / view.track_row_h.max(1.0);
         let clip_drag_overlay: Option<(ClipDragSession, f64, i32)> = clip_drag_session
             .as_ref()
             .map(|nd| {
                 let dx = nd.last_mouse.0 - nd.anchor_mouse.0;
-                let dy = nd.last_mouse.1 - nd.anchor_mouse.1;
                 let raw = f64::from(dx) * beat_per_px;
                 // **絶対位置 snap** (= Cubase / Live と同じ「nearest grid alignment」 動作):
                 // anchor 0 の編集対象端 (Move=start / ResizeRight=end / ResizeLeft=start) の絶対位置を
@@ -7068,8 +7189,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     &view.snap,
                     zoom_x_px_per_beat,
                 );
-                #[allow(clippy::cast_possible_truncation)]
-                let track_delta = (dy * row_per_px).round() as i32;
+                // track 方向は y→visible 行 index 解決の差 (per-track 行高 / lane 展開対応)。
+                let track_delta = compute_clip_drag_track_delta(nd, &press_tops);
                 (nd.clone(), beat_delta, track_delta)
             });
 
@@ -7260,7 +7381,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // (旧 `selected_track.unwrap_or(u32::MAX)` の単一 u32 に対し、 multi-select は集合 hash)。
         // 加えて parent_id / depth / collapsed の構成変化は data_generation で caller 責務 (group
         // 構成変化は track 構成変化と同義、 caller が data_generation を bump する前提)。
-        let internal_clip_hash = fold_arrangement_clip_hash(tracks);
+        // (review) fold は caller slice でなく **visible_tracks** (= collapsed subtree
+        // 除外 + synthetic master prepend 済み) を対象にする。 旧実装は master row
+        // (song_lanes) が hash 対象外で、 テンポ等の master automation 編集・折り畳み・
+        // 高さ変更が cached 層で stale になっていた (cached は master 行も描く)。
+        let internal_clip_hash = fold_arrangement_clip_hash(&visible_tracks);
         let selected_tracks_hash: u64 = selected_tracks.iter().fold(0xCBF2_9CE4_8422_2325_u64, |a, &x| {
             a.wrapping_mul(0x100_0000_01B3).wrapping_add(u64::from(x))
         });
@@ -7279,7 +7404,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         );
         let viewport_key = (
             (
-                b"arrangement_widget_v6" as &[u8],
+                b"arrangement_widget_v7" as &[u8],
                 rect.w.to_bits(),
                 rect.h.to_bits(),
                 view.start_beat.to_bits(),
@@ -7296,6 +7421,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             (view.bpm.to_bits(), u32::from(view.time_sig.0), u32::from(view.time_sig.1)),
             internal_clip_hash,
             selected_automation_clips_hash,
+            // (review) cached primitives は絶対座標で再生されるため、 widget の
+            // 位置 (rect.x/y) と arranger lane 高さ (lanes.y のオフセット成分) も
+            // key に含める — 「サイズ不変で位置 / lane 高さだけ変わる」 layout
+            // 変化で旧座標に描かれるのを correct-by-construction で防ぐ。
+            (rect.x.to_bits(), rect.y.to_bits(), view.arranger_lane_h.to_bits()),
         );
 
         // M14 Phase 63c (#016): SetTrackParent に統合した結果、 release frame の optimistic
@@ -7499,7 +7629,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     let view_end_for_audio = view_copy.start_beat + view_copy.len_beats;
                     for (i, t) in tracks_owned.iter().enumerate() {
                         let row_top = tops_owned_for_heavy[i];
-                        if row_top + view_copy.track_row_h < lanes.y || row_top > lanes.y + lanes.h {
+                        // draw_clips と同じ per-track 実効行高 (culling / rect の両方)。
+                        let row_h = effective_track_row_h(t, view_copy.track_row_h);
+                        if row_top + row_h < lanes.y || row_top > lanes.y + lanes.h {
                             continue;
                         }
                         for c in &t.clips {
@@ -7510,7 +7642,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             if end < view_copy.start_beat || c.start_beat > view_end_for_audio {
                                 continue;
                             }
-                            let r = clip_to_rect(row_top, view_copy.track_row_h, c, view_copy, lanes);
+                            let r = clip_to_rect(row_top, row_h, c, view_copy, lanes);
                             if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
                                 continue;
                             }
@@ -7627,6 +7759,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 draw_drag_preview(
                     hctx,
                     &nd,
+                    &tracks_owned,
                     &tops_owned_for_heavy,
                     view_copy,
                     lanes,
@@ -8166,7 +8299,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let release_alt = nd.last_alt;
             let (beat_delta, track_delta): (f64, i32) = {
                 let dx = nd.last_mouse.0 - nd.anchor_mouse.0;
-                let dy = nd.last_mouse.1 - nd.anchor_mouse.1;
                 let raw = f64::from(dx) * beat_per_px;
                 // 絶対位置 snap (overlay と一貫)。 詳細は `compute_clip_drag_beat_delta` を参照。
                 let snapped = compute_clip_drag_beat_delta(
@@ -8175,8 +8307,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     &view.snap,
                     zoom_x_px_per_beat,
                 );
-                #[allow(clippy::cast_possible_truncation)]
-                let td = (dy * row_per_px).round() as i32;
+                // track 方向は y→visible 行 index 解決の差 (per-track 行高 / lane 展開対応、
+                // overlay と同 helper)。
+                let td = compute_clip_drag_track_delta(&nd, &press_tops);
                 (snapped, td)
             };
             let min_len = if view.snap.is_active(release_alt) {
@@ -8471,8 +8604,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
             } else {
                 // lasso の点中心 hit 判定 (visible_tracks + visible lane scope)
-                let inside =
-                    collect_points_in_rect(&visible_tracks, &press_tops, view, lanes, lasso_rect);
+                let inside = collect_points_in_rect(
+                    &visible_tracks,
+                    &press_tops,
+                    view,
+                    lanes,
+                    lasso_rect,
+                    style,
+                );
                 if ls.start_modifiers.shift {
                     // union (prev order を保持 + lasso 由来の新規だけ append)
                     let mut out = prev.clone();
@@ -8749,7 +8888,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
 
         // ---- short click on lanes (drag<16px) → SelectClips ----
-        if let Some((cx, cy)) = clip_short_click_pos
+        if let Some(((cx, cy), click_ctrl, click_shift)) = clip_short_click_pos
             && lanes.contains(cx, cy)
         {
             let prev = selected_clips.to_vec();
@@ -8762,7 +8901,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     //   - Shift = Union  (足すだけ、 既存ぶんは末尾へ繰り上げて anchor に)
                     //   - 無修飾 = Single (置換)
                     // anchor は常に末尾 (caller の `SetClipSelection` が `next.last()` を anchor にする)。
-                    if pointer.modifiers.ctrl {
+                    // modifier は session の careful-update 値 (release frame の生読みは race)。
+                    if click_ctrl {
                         let mut n = prev.clone();
                         if let Some(pos) = n.iter().position(|k| *k == hit_key) {
                             n.remove(pos);
@@ -8770,7 +8910,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             n.push(hit_key);
                         }
                         n
-                    } else if pointer.modifiers.shift {
+                    } else if click_shift {
                         let mut n = prev.clone();
                         n.retain(|k| *k != hit_key);
                         n.push(hit_key);
@@ -8966,8 +9106,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let mut inside: Vec<ClipKey> = Vec::new();
                 for (i, t) in visible_tracks.iter().enumerate() {
                     let row_top = press_tops[i];
+                    // 描画と同じ per-track 実効行高で交差判定する。
+                    let row_h = effective_track_row_h(t, view.track_row_h);
                     for c in &t.clips {
-                        let r = clip_to_rect(row_top, view.track_row_h, c, view, lanes);
+                        let r = clip_to_rect(row_top, row_h, c, view, lanes);
                         if rects_intersect(r, drag_rect) {
                             inside.push(ClipKey { track: t.id, clip: c.id });
                         }
@@ -9746,11 +9888,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
                 // SelectTrack トリガ: row 内 release + button_zones / disclosure いずれにも非 hit。
                 // catch-all は modifier-aware SelectTrack の元データを蓄えるだけ (発行は loop 後)。
+                // lane disclosure (`+`/`-`) と volume band も除外する — 除外しないと
+                // toggle / volume drag の release が SelectTrack を併発し、 multi-select が
+                // 単一選択に潰れる (master 分岐は除外済みで通常 track だけ漏れていた、 review)。
                 if pointer.primary_just_released
                     && let Some((rx, ry)) = pointer.pos
                     && row.contains(rx, ry)
                     && !button_zones.iter().any(|b| b.contains(rx, ry))
                     && !(is_group && disclosure_rect.contains(rx, ry))
+                    && (t.automation_lanes.is_empty()
+                        || !layout.lane_disc_rect.contains(rx, ry))
+                    && !layout.volume_band.is_some_and(|b| b.contains(rx, ry))
                 {
                     clicked_track_for_select = Some(t.id);
                 }
@@ -10753,7 +10901,7 @@ mod tests {
             len_beats: 2.0,
             track_index: 0,
         };
-        let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::Move, 1.5, 5, 3, 0.05);
+        let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::Move, 1.5, 5, 0, 3, 0.05);
         assert!((s - 5.5).abs() < 1e-9);
         assert!((l - 2.0).abs() < 1e-9);
         // 0 + 5 = 5 → clamped to 2 (tracks=3 → max idx = 2)
@@ -11205,7 +11353,7 @@ mod tests {
             track_index: 1,
         };
         let (s, l, idx) =
-            drag_preview_geometry(anchor, ClipDragKind::ResizeLeft, 10.0, 0, 4, 0.05);
+            drag_preview_geometry(anchor, ClipDragKind::ResizeLeft, 10.0, 0, 0, 4, 0.05);
         // max_start = 4 + 2 - 0.05 = 5.95 → new_start clamped to 5.95
         // actual_delta = 5.95 - 4 = 1.95 → new_len = 2 - 1.95 = 0.05
         assert!((s - 5.95).abs() < 1e-6);

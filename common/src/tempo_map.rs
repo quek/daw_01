@@ -20,6 +20,23 @@ const STEP_BEATS: f64 = 1.0 / 16.0;
 /// のを防ぐ hard cap (r.md #8 L9)。 1M beat ≒ 200 BPM で ~83 時間 = 現実の曲の遥か上。
 const MAX_TABLE_BEATS: f64 = 1_000_000.0;
 
+/// Song beat → song 秒の便宜関数。 `SongTempo` automation lane があれば
+/// [`TempoMap`] を積分して写像し、 無ければ constant-bpm 換算の高速経路
+/// (table 構築なし)。 per-frame 呼び出し想定 — automation を持つ曲のみ
+/// O(song length) の build が走る (video_playback の per-frame 経路と同じ
+/// 受容コスト)。 毎 frame 多数回呼ぶ場合は `TempoMap` を手で持ち回ること。
+#[must_use]
+pub fn song_beat_to_seconds(song: &Song, beat: f64) -> f64 {
+    let automated = song.song_lanes.iter().any(|l| {
+        l.enabled && matches!(l.target, crate::model::AutomationTarget::SongTempo)
+    });
+    if automated {
+        TempoMap::from_song(song).beat_to_seconds(beat)
+    } else {
+        beat * 60.0 / f64::from(song.bpm.max(1.0))
+    }
+}
+
 /// Beat→seconds lookup table for one song's tempo curve.
 pub struct TempoMap {
     /// Cumulative elapsed seconds at breakpoint `i` (= beat `i * STEP_BEATS`).

@@ -145,10 +145,23 @@ fn build_midi_track(song: &Song, track: &common::model::Track) -> Option<Vec<Tra
             continue;
         };
         has_any_midi = true;
+        // 再生 (daw_audio/src/sequencer.rs) と同じ 4 ゲート: muted clip / muted
+        // note / On が clip 範囲内 / Off を clip 末端で clamp。 これが無いと
+        // 「聞こえないはずのノート」 が SMF に入り、 トリムした clip もフル尺で出る。
+        if clip.muted || clip.length_beats <= 0.0 {
+            continue;
+        }
+        let clip_end_beats = clip.start_beat + clip.length_beats;
         for note in &midi.notes {
-            // clip-local beat → song-domain beat → tick。
+            if note.muted || note.duration_beats <= 0.0 {
+                continue;
+            }
+            if note.start_beat < 0.0 || note.start_beat >= clip.length_beats {
+                continue;
+            }
+            // clip-local beat → song-domain beat → tick。 Off は clip 末端 clamp。
             let on_beat = clip.start_beat + note.start_beat;
-            let off_beat = on_beat + note.duration_beats;
+            let off_beat = (on_beat + note.duration_beats).min(clip_end_beats);
             let on_tick = beat_to_tick(on_beat);
             let off_tick = beat_to_tick(off_beat).max(on_tick + 1);
             events.push((

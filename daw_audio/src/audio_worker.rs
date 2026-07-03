@@ -159,9 +159,18 @@ pub struct AudioWorkerPool {
 }
 
 impl AudioWorkerPool {
-    /// Spawn `n_workers` worker threads + create the wake/all_done
-    /// events. Each worker idles on its dedicated wake event.
-    pub fn new(n_workers: u32) -> Result<Self> {
+    /// Create a pool sized to `n_sync_slots` (= the number of
+    /// `WorkerSyncRef` handshake pairs with the plugin host). Each
+    /// concurrent runner owns exactly one sync slot for the whole
+    /// dispatch: the master (which joins the work loop from
+    /// `dispatch_and_wait`) owns slot 0, worker thread `i` owns slot
+    /// `i + 1` — so `n_sync_slots - 1` worker threads are spawned.
+    /// Sharing a slot between two concurrent runners is not allowed:
+    /// the wake/done events are auto-reset, so overlapping `dispatch()`
+    /// calls on one slot collapse SetEvent pairs and either deadlock the
+    /// audio callback or feed a plugin stale buffers.
+    pub fn new(n_sync_slots: u32) -> Result<Self> {
+        let n_workers = n_sync_slots.saturating_sub(1);
         let shared = Arc::new(DispatchShared::new());
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -179,9 +188,11 @@ impl AudioWorkerPool {
             let shared_w = Arc::clone(&shared);
             let shutdown_w = Arc::clone(&shutdown);
             let all_done_w = all_done;
+            // Worker i owns sync slot i+1 (slot 0 is the master's).
+            let sync_slot = i + 1;
             let handle = std::thread::Builder::new()
                 .name(format!("audio-worker-{i}"))
-                .spawn(move || run_worker(shared_w, shutdown_w, wake, all_done_w))?;
+                .spawn(move || run_worker(shared_w, shutdown_w, wake, all_done_w, sync_slot))?;
             workers.push(handle);
         }
 
@@ -346,14 +357,17 @@ impl AudioWorkerPool {
             }
         }
 
-        // Master joins the work-stealing loop too. This way machines
-        // with n_workers == 0 / 1 still make progress and we get the
-        // full physical-core throughput.
-        run_work_loop(&self.shared);
+        // Master joins the work-stealing loop too (as sync slot 0). This
+        // way machines with 1 sync slot (= zero workers) still make
+        // progress and we get the full physical-core throughput.
+        run_work_loop(&self.shared, 0);
 
-        // Wait for the last worker to flag completion.
-        unsafe {
-            WaitForSingleObject(self.all_done.0, INFINITE);
+        // Wait for the last worker to flag completion. With zero workers
+        // nobody signals all_done — the master already did all the work.
+        if n_workers > 0 {
+            unsafe {
+                WaitForSingleObject(self.all_done.0, INFINITE);
+            }
         }
     }
 
@@ -398,6 +412,7 @@ fn run_worker(
     shutdown: Arc<AtomicBool>,
     wake: SendableHandle,
     all_done: SendableHandle,
+    sync_slot: usize,
 ) {
     boost_thread_priority("audio worker");
     // Join "Pro Audio" so MMCSS keeps this thread on the priority-class
@@ -414,7 +429,7 @@ fn run_worker(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
-        run_work_loop(&shared);
+        run_work_loop(&shared, sync_slot);
         // Last worker out signals completion.
         if shared.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             unsafe {
@@ -425,8 +440,10 @@ fn run_worker(
 }
 
 /// Pull tracks off `next_track` until `n_tracks`, calling
-/// `process_track_owned` for each.
-fn run_work_loop(shared: &DispatchShared) {
+/// `process_track_owned` for each. `sync_slot` is this runner's dedicated
+/// index into `worker_syncs` (master = 0, worker i = i + 1) — see
+/// [`AudioWorkerPool::new`] for why slots must not be shared.
+fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
     let n_tracks = shared.n_tracks.load(Ordering::Acquire);
     if n_tracks == 0 {
         return;
@@ -528,11 +545,13 @@ fn run_work_loop(shared: &DispatchShared) {
         // Per-track scratch is exclusive to this dispatch via the
         // claim-by-index counter above.
         let scratch = unsafe { &mut *scratch_base.add(track_idx as usize) };
-        // Every audio worker has its own WorkerSyncRef (1:1 paired
-        // with a plugin-host worker). Master uses worker_syncs[0]
-        // when it joins the work loop.
-        let ws_idx = (track_idx as usize) % worker_syncs.len().max(1);
-        let worker_sync = worker_syncs.get(ws_idx);
+        // This runner's dedicated WorkerSyncRef (1:1 paired with a
+        // plugin-host worker): master = slot 0, worker i = slot i+1.
+        // Never select by track index — with work stealing, two runners
+        // would then use one slot concurrently and the auto-reset
+        // wake/done handshake collapses (deadlocked callback / stale
+        // plugin buffers).
+        let worker_sync = worker_syncs.get(sync_slot);
 
         let Some(song) = song else { continue };
         let Some(song_track) = song.tracks.get(track_idx as usize) else {

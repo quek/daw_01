@@ -27,8 +27,8 @@ const EVICT_AFTER_FRAMES: u64 = 300;
 
 use crate::scene::GlyphArea;
 
-/// (text, font_size, line_height) を hash した cache key。
-fn buffer_key(area: &GlyphArea) -> u64 {
+/// (text, font_size, line_height, font, wrap size) を hash した cache key。
+fn buffer_key(area: &GlyphArea, wrap_w: f32, wrap_h: f32) -> u64 {
     let mut h = DefaultHasher::new();
     area.text.hash(&mut h);
     // f32 はそのまま hash 不可なので bit 表現で。
@@ -37,6 +37,13 @@ fn buffer_key(area: &GlyphArea) -> u64 {
     // M14 Phase 121 (daw_01 #096): font も cache identity の一部。 同 text+size でも font 違いは
     // 別 buffer にしないと、 先に焼いた font の buffer が後の area に化ける (cache collision)。
     area.resolved_font_family().hash(&mut h);
+    // (review) 折り返し幅 (`set_size` に渡す screen size) も identity の一部。
+    // 抜けると window resize 後も旧幅で折り返し続け、 composite pass (group
+    // サイズを screen として渡す) と base pass (surface サイズ) が同一 buffer を
+    // 共有して stale な wrap レイアウトになる。 旧サイズの entry は eviction で
+    // 自然回収される。
+    wrap_w.to_bits().hash(&mut h);
+    wrap_h.to_bits().hash(&mut h);
     h.finish()
 }
 
@@ -188,7 +195,10 @@ impl GlyphPipeline {
         screen: PhysicalSize,
     ) {
         // 1) 各 GlyphArea のキーを計算 (2 度目の lookup を避けるため Vec に保存)。
-        let keys: Vec<u64> = glyph_areas.iter().map(buffer_key).collect();
+        let keys: Vec<u64> = glyph_areas
+            .iter()
+            .map(|a| buffer_key(a, screen.width as f32, screen.height as f32))
+            .collect();
 
         // 2) cache に entry が無ければ新規作成、あれば last_seen_frame だけ更新。
         //    text 自体は key の一部なので、key 一致 = text 一致 → set_text 不要。
@@ -309,28 +319,28 @@ mod tests {
     fn buffer_key_same_input_same_key() {
         let a = area("hello", 14.0, 18.0);
         let b = area("hello", 14.0, 18.0);
-        assert_eq!(buffer_key(&a), buffer_key(&b));
+        assert_eq!(buffer_key(&a, 800.0, 600.0), buffer_key(&b, 800.0, 600.0));
     }
 
     #[test]
     fn buffer_key_text_diff() {
         let a = area("hello", 14.0, 18.0);
         let b = area("world", 14.0, 18.0);
-        assert_ne!(buffer_key(&a), buffer_key(&b));
+        assert_ne!(buffer_key(&a, 800.0, 600.0), buffer_key(&b, 800.0, 600.0));
     }
 
     #[test]
     fn buffer_key_font_size_diff() {
         let a = area("same", 14.0, 18.0);
         let b = area("same", 16.0, 18.0);
-        assert_ne!(buffer_key(&a), buffer_key(&b));
+        assert_ne!(buffer_key(&a, 800.0, 600.0), buffer_key(&b, 800.0, 600.0));
     }
 
     #[test]
     fn buffer_key_line_height_diff() {
         let a = area("same", 14.0, 18.0);
         let b = area("same", 14.0, 20.0);
-        assert_ne!(buffer_key(&a), buffer_key(&b));
+        assert_ne!(buffer_key(&a, 800.0, 600.0), buffer_key(&b, 800.0, 600.0));
     }
 
     /// M14 Phase 121 (daw_01 #096): 同 text+size+line_height でも font 違いは別 key
@@ -341,7 +351,7 @@ mod tests {
         let mut b = area("same", 14.0, 18.0);
         a.font_family = Some("Arial".into());
         b.font_family = Some("Times New Roman".into());
-        assert_ne!(buffer_key(&a), buffer_key(&b));
+        assert_ne!(buffer_key(&a, 800.0, 600.0), buffer_key(&b, 800.0, 600.0));
     }
 
     /// `None` と `Some(DEFAULT_FONT_FAMILY)` は同じ font に解決されるので **同じ key** にする
@@ -351,10 +361,10 @@ mod tests {
         let a = area("same", 14.0, 18.0); // font_family: None
         let mut b = area("same", 14.0, 18.0);
         b.font_family = Some(DEFAULT_FONT_FAMILY.into());
-        assert_eq!(buffer_key(&a), buffer_key(&b));
+        assert_eq!(buffer_key(&a, 800.0, 600.0), buffer_key(&b, 800.0, 600.0));
         // `Some("")` も default 扱い (daw_01 の "" = default 慣習)。
         let mut c = area("same", 14.0, 18.0);
         c.font_family = Some("".into());
-        assert_eq!(buffer_key(&a), buffer_key(&c));
+        assert_eq!(buffer_key(&a, 800.0, 600.0), buffer_key(&c, 800.0, 600.0));
     }
 }

@@ -222,6 +222,22 @@ struct SharedSlot {
     handle: HANDLE,
 }
 
+impl Drop for SharedSlot {
+    fn drop(&mut self) {
+        // (review) `CreateSharedHandle` の NT handle は COM 参照カウントと独立で、
+        // owner が CloseHandle しない限りプロセス生存中リークし、 参照先 texture の
+        // GPU メモリもピン留めされ得る (MF→libav fallback で `readers.remove()`
+        // されたときに顕在)。 wgpu の import 側は open 時に独自参照を持つので、
+        // ここで閉じても imported texture は無効にならない。 texture / mutex の
+        // COM 解放 (自動 Drop) とは独立に handle だけ閉じる。
+        if !self.handle.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
 /// Per-source pool of `PREVIEW_RING_SIZE` `SharedSlot`s. Allocated
 /// lazily on first HW decode (= `write_to_shared_pool`), reused for
 /// every subsequent frame for the same `VideoSourceId`. Dropped only

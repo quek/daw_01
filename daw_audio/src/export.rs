@@ -416,7 +416,11 @@ fn render_loop(
                 any_solo,
                 &schedule.input_delay_per_track,
                 &empty_recording_lanes,
-                song.bpm,
+                // live 側 (engine.rs `current_bpm`) と同じ effective tempo を渡す。
+                // base `song.bpm` を渡すと、 event 収集窓 (frames×bpm/(60·SR)) と
+                // ループ末尾の beat 累算 (effective tempo) が乖離し、 tempo
+                // automation 中の書き出しでノートが欠落 / 二重発音する。
+                smoothed_current_bpm_freewheel as f32,
                 playhead_beats,
                 smoothed_current_bpm_freewheel,
                 // export (freewheel render) は loop しない。
@@ -448,7 +452,8 @@ fn render_loop(
                     any_solo,
                     input_delay,
                     &empty_recording_lanes,
-                    song.bpm,
+                    // dispatch 側と同じ理由で effective tempo (live と同一)。
+                    smoothed_current_bpm_freewheel as f32,
                     playhead_beats,
                     smoothed_current_bpm_freewheel,
                     // export (freewheel render) は loop しない。
@@ -477,9 +482,9 @@ fn render_loop(
             frames as u32,
             true,
             any_solo,
-            playhead,
             &empty_recording_lanes,
-            song.bpm,
+            // dispatch 側と同じ理由で effective tempo (live と同一)。
+            smoothed_current_bpm_freewheel as f32,
             playhead_beats,
             // export (freewheel render) は loop しない。
             false,
