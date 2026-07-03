@@ -34,12 +34,22 @@ UI ライブラリ daw-ui は `ui/` に統合済み (旧 sibling repo gui_01)。
 
 ## Development Workflow
 
+**Makefile が SSoT。素の `cargo build --workspace` / `cargo test --workspace` は直接使わない**
+(ui/crates/examples/* の自動テスト0個の crate まで毎回フルビルド+リンクする無駄が生じる。
+2026-07-03 に発覚: このセクションが素の cargo コマンドを指示していたせいで、Claude 自身も
+毎回 `--workspace` を使い、Makefile 側の scoping 最適化が実質使われていなかった)。
+
 ```bash
-cargo build --workspace
-cargo run -p daw_gui            # GUI 起動（Audio/Plugin プロセスを子プロセスとして起動）
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
+make build       # 実行 3 exe (daw_gui/daw_audio/daw_plugin_host) をビルド (debug)
+make run         # daw_gui をビルド × 起動 (Audio/Plugin プロセスを子プロセスとして起動)
+make test        # テストを持つ package のみ実行 (TEST_PKGS、examples 等 #[test]0個は除外)
+make clippy      # clippy をエラー扱いで (--workspace、examples のコンパイル検証も兼ねる)
+make check       # cargo check --workspace (型検査のみ、ビルド不要)
 ```
+
+特定 crate/test だけを素早く確認したいときは `cargo check -p <crate>` /
+`cargo test -p <crate> --test <name>` 等のピンポイント指定を使ってよい (これは Makefile の
+scoping と矛盾しない、むしろ更に絞り込む方向)。避けるべきは `--workspace` の無条件多用。
 
 ### vendored FFmpeg（fresh machine / 手動 worktree で必須）
 

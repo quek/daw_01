@@ -209,7 +209,7 @@ dependencies = [
  "enumflags2",
  "futures-channel",
  "futures-util",
- "rand 0.9.4",
+ "rand",
  "raw-window-handle",
  "serde",
  "serde_repr",
@@ -579,7 +579,7 @@ dependencies = [
  "num_enum",
  "paste",
  "portable-atomic",
- "rand 0.9.4",
+ "rand",
  "regress",
  "rustc-hash 2.1.2",
  "ryu-js",
@@ -936,11 +936,11 @@ dependencies = [
  "clap-sys",
  "dirs",
  "hound",
+ "libc",
  "libloading",
  "reqwest",
  "serde",
  "serde_json",
- "shared_memory",
  "tempfile",
  "tokio",
  "tracing",
@@ -1306,36 +1306,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daw-ui-example-arrangement-group-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
-name = "daw-ui-example-arrangement-section-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
-name = "daw-ui-example-arrangement-share-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
 name = "daw-ui-example-automation"
 version = "0.1.0"
 dependencies = [
@@ -1343,34 +1313,6 @@ dependencies = [
  "daw-ui-platform",
  "daw-ui-renderer",
  "winit",
-]
-
-[[package]]
-name = "daw-ui-example-channel-fader-meter-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
-name = "daw-ui-example-color-picker-verify"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
-name = "daw-ui-example-composite-validation"
-version = "0.1.0"
-dependencies = [
- "daw-ui-renderer",
- "png 0.17.16",
 ]
 
 [[package]]
@@ -1389,46 +1331,8 @@ version = "0.1.0"
 dependencies = [
  "daw-ui-platform",
  "daw-ui-renderer",
- "png 0.17.16",
+ "png 0.18.1",
  "raw-window-handle",
-]
-
-[[package]]
-name = "daw-ui-example-fader-modulation-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
-name = "daw-ui-example-font-picker-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
-name = "daw-ui-example-knob-modulation-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
-name = "daw-ui-example-meter-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
 ]
 
 [[package]]
@@ -1452,16 +1356,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daw-ui-example-piano-roll-label-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
 name = "daw-ui-example-sample-edit-ops"
 version = "0.1.0"
 dependencies = [
@@ -1482,32 +1376,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daw-ui-example-scrubable-number-modulation-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
-name = "daw-ui-example-text-align-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
-name = "daw-ui-example-text-effect-overlay-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-renderer",
- "png 0.17.16",
-]
-
-[[package]]
 name = "daw-ui-example-text-input-ime"
 version = "0.1.0"
 dependencies = [
@@ -1515,16 +1383,6 @@ dependencies = [
  "daw-ui-platform",
  "daw-ui-renderer",
  "winit",
-]
-
-[[package]]
-name = "daw-ui-example-track-header-snapshot"
-version = "0.1.0"
-dependencies = [
- "daw-ui-core",
- "daw-ui-platform",
- "daw-ui-renderer",
- "png 0.17.16",
 ]
 
 [[package]]
@@ -2701,7 +2559,7 @@ version = "0.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "189d0897e4cbe8c75efedf3502c18c887b05046e59d28404d4d8e46cbc4d1e86"
 dependencies = [
- "memoffset 0.9.1",
+ "memoffset",
 ]
 
 [[package]]
@@ -3021,15 +2879,6 @@ dependencies = [
 
 [[package]]
 name = "memoffset"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aa361d4faea93603064a027415f07bd8e1d5c88c9fbf68bf56a285428fd79ce"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
-name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
@@ -3200,19 +3049,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
-]
-
-[[package]]
-name = "nix"
-version = "0.23.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f3790c00a0150112de0f4cd161e3d7fc4b2d8a5542ffc35f099a2562aecb35c"
-dependencies = [
- "bitflags 1.3.2",
- "cc",
- "cfg-if",
- "libc",
- "memoffset 0.6.5",
 ]
 
 [[package]]
@@ -4056,33 +3892,12 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
-dependencies = [
- "libc",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
- "rand_chacha 0.9.0",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand_chacha"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.6.4",
+ "rand_chacha",
+ "rand_core",
 ]
 
 [[package]]
@@ -4092,16 +3907,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand_core"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
-dependencies = [
- "getrandom 0.2.17",
+ "rand_core",
 ]
 
 [[package]]
@@ -4719,19 +4525,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
-]
-
-[[package]]
-name = "shared_memory"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba8593196da75d9dc4f69349682bd4c2099f8cde114257d1ef7ef1b33d1aba54"
-dependencies = [
- "cfg-if",
- "libc",
- "nix",
- "rand 0.8.6",
- "win-sys",
 ]
 
 [[package]]
@@ -5534,7 +5327,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
- "memoffset 0.9.1",
+ "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
 ]
@@ -6177,15 +5970,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "win-sys"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b7b128a98c1cfa201b09eb49ba285887deb3cbe7466a98850eb1adabb452be5"
-dependencies = [
- "windows 0.34.0",
-]
-
-[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6215,19 +5999,6 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
-
-[[package]]
-name = "windows"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45296b64204227616fdbf2614cefa4c236b98ee64dfaaaa435207ed99fe7829f"
-dependencies = [
- "windows_aarch64_msvc 0.34.0",
- "windows_i686_gnu 0.34.0",
- "windows_i686_msvc 0.34.0",
- "windows_x86_64_gnu 0.34.0",
- "windows_x86_64_msvc 0.34.0",
-]
 
 [[package]]
 name = "windows"
@@ -6534,12 +6305,6 @@ checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
 
 [[package]]
 name = "windows_aarch64_msvc"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17cffbe740121affb56fad0fc0e421804adf0ae00891205213b5cecd30db881d"
-
-[[package]]
-name = "windows_aarch64_msvc"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e08e8864a60f06ef0d0ff4ba04124db8b0fb3be5776a5cd47641e942e58c4d43"
@@ -6555,12 +6320,6 @@ name = "windows_aarch64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
-
-[[package]]
-name = "windows_i686_gnu"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2564fde759adb79129d9b4f54be42b32c89970c18ebf93124ca8870a498688ed"
 
 [[package]]
 name = "windows_i686_gnu"
@@ -6588,12 +6347,6 @@ checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
 
 [[package]]
 name = "windows_i686_msvc"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cd9d32ba70453522332c14d38814bceeb747d80b3958676007acadd7e166956"
-
-[[package]]
-name = "windows_i686_msvc"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44d840b6ec649f480a41c8d80f9c65108b92d89345dd94027bfe06ac444d1060"
@@ -6609,12 +6362,6 @@ name = "windows_i686_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
-
-[[package]]
-name = "windows_x86_64_gnu"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfce6deae227ee8d356d19effc141a509cc503dfd1f850622ec4b0f84428e1f4"
 
 [[package]]
 name = "windows_x86_64_gnu"
@@ -6651,12 +6398,6 @@ name = "windows_x86_64_gnullvm"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
-
-[[package]]
-name = "windows_x86_64_msvc"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d19538ccc21819d01deaf88d6a17eae6596a12e9aafdbb97916fb49896d89de9"
 
 [[package]]
 name = "windows_x86_64_msvc"

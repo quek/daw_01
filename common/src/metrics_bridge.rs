@@ -13,8 +13,9 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
-use shared_memory::{Shmem, ShmemConf};
+use anyhow::Result;
+
+use crate::shmem::NamedShmem;
 
 /// per-plugin メトリクススロットのハードキャップ。 `plugin_id` は plugin
 /// registry の Vec インデックス (`MAX_TRACKS` = 32 × 妥当な device 数)。 この id
@@ -56,16 +57,12 @@ impl MetricsBridge {
 
 /// Owning handle to the metrics shared memory region.
 pub struct MetricsBridgeHandle {
-    shmem: Shmem,
+    shmem: NamedShmem,
 }
 
 impl MetricsBridgeHandle {
     pub fn create(os_id: &str) -> Result<Self> {
-        let shmem = ShmemConf::new()
-            .size(MetricsBridge::SIZE)
-            .os_id(os_id)
-            .create()
-            .with_context(|| format!("failed to create metrics shmem {os_id}"))?;
+        let shmem = NamedShmem::create(os_id, MetricsBridge::SIZE)?;
         // Zero-initialise: every atomic starts at 0 (= 0.0 load, 0 xrun, idle
         // plugins) before any reader polls.
         unsafe { std::ptr::write_bytes(shmem.as_ptr(), 0, MetricsBridge::SIZE) };
@@ -73,16 +70,7 @@ impl MetricsBridgeHandle {
     }
 
     pub fn open(os_id: &str) -> Result<Self> {
-        let shmem = ShmemConf::new()
-            .os_id(os_id)
-            .open()
-            .with_context(|| format!("failed to open metrics shmem {os_id}"))?;
-        anyhow::ensure!(
-            shmem.len() >= MetricsBridge::SIZE,
-            "metrics shmem too small: {} < {}",
-            shmem.len(),
-            MetricsBridge::SIZE
-        );
+        let shmem = NamedShmem::open(os_id, MetricsBridge::SIZE)?;
         Ok(Self { shmem })
     }
 

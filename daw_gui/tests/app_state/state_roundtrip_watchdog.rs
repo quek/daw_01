@@ -8,100 +8,30 @@
 //! 送信時刻から一定時間応答が無ければ queue を破棄し、 保留中のガード操作を捨てて
 //! 脱出口を作ることを検証する。 経過時間は `now` 引数で注入する (実時間に依存しない)。
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::plugin_db::{PluginDatabase, PluginEntry};
-use common::plugin_format::PluginFormat;
 use common::protocol::MainToChild;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, ExportStage};
-use daw_gui::dispatcher::{
-    BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
-};
 
-fn make_plugin_db() -> Arc<PluginDatabase> {
-    Arc::new(PluginDatabase {
-        entries: vec![PluginEntry {
-            id: "test.synth".into(),
-            format: PluginFormat::Clap,
-            name: "Test Synth".into(),
-            vendor: "Test".into(),
-            version: "1.0".into(),
-            features: vec!["instrument".into()],
-            path: "C:/fake/synth.clap".into(),
-            descriptor_index: 0,
-            has_note_input: true,
-            has_note_output: false,
-            has_audio_output: true,
-            has_audio_input: false,
-            has_video_input: false,
-            has_video_output: false,
-        }],
-        scanned_at: None,
-        port_probe_version: 0,
-    })
-}
+use super::support::{self, drain, load_instrument};
 
+/// 旧独立バイナリ時代のシグネチャを保つ thin adapter (audio_rx はここで drop)。
 fn build_app() -> (AppData, UnboundedReceiver<MainToChild>) {
     let (app, plugin_rx, _audio_rx) = build_app_with_audio();
     (app, plugin_rx)
 }
 
 /// `build_app` と同じだが audio 側 receiver も返す (ExportWav の発射検証用)。
+/// 戻り順が support::build_app と違う (plugin が先) のは旧シグネチャの保存。
 fn build_app_with_audio() -> (
     AppData,
     UnboundedReceiver<MainToChild>,
     UnboundedReceiver<MainToChild>,
 ) {
-    let (audio_tx, audio_rx) = mpsc::unbounded_channel();
-    let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
-    let event_dispatcher = RecordingDispatcher::new();
-    let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
-    let event_dispatcher_dyn: Arc<dyn BackgroundDispatcher> = event_dispatcher.clone();
-    let app = AppData::new(
-        audio_tx,
-        plugin_tx,
-        None,
-        Some(make_plugin_db()),
-        event_dispatcher_dyn,
-        job_dispatcher,
-        None,
-        // app_dirs: None = 永続化なし。
-        None,
-        48_000, // (A1 r.md #8) test sample rate
-    );
+    let (app, audio_rx, plugin_rx, _dispatcher) = support::build_app();
     (app, plugin_rx, audio_rx)
-}
-
-fn drain<T>(rx: &mut UnboundedReceiver<T>) -> Vec<T> {
-    let mut v = Vec::new();
-    while let Ok(msg) = rx.try_recv() {
-        v.push(msg);
-    }
-    v
-}
-
-fn load_instrument(app: &mut AppData) {
-    let track_id = app.song.tracks[0].id;
-    app.handle_event(AppEvent::SelectTrack(0));
-    app.handle_event(AppEvent::OpenPluginPicker);
-    app.handle_event(AppEvent::SelectPluginFromDb {
-        id: "test.synth".into(),
-        keep_open: false,
-        open_gui: true,
-    });
-    app.handle_event(AppEvent::SlotPluginLoadedFromChild {
-        track: track_id,
-        index: 0,
-        id: "test.synth".into(),
-        name: "Test Synth".into(),
-        plugin_id: 100,
-        shmem_id: String::new(),
-        state_load_error: None,
-        aux_output_count: 0,
-    });
 }
 
 /// 過去に始まった round-trip として watchdog を発火させる「未来」時刻。

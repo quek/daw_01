@@ -10,135 +10,16 @@
 //! が再発行され、 2 回目の `AllStatesReceived` で 2 件目が実行されることを
 //! 検証する。
 
-use std::sync::Arc;
-
-use common::plugin_db::{PluginDatabase, PluginEntry};
-use common::plugin_format::PluginFormat;
 use common::protocol::MainToChild;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, PendingStateRequest};
-use daw_gui::dispatcher::{
-    BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
-};
 
-fn make_plugin_db() -> Arc<PluginDatabase> {
-    Arc::new(PluginDatabase {
-        entries: vec![
-            PluginEntry {
-                id: "test.synth".into(),
-                format: PluginFormat::Clap,
-                name: "Test Synth".into(),
-                vendor: "Test".into(),
-                version: "1.0".into(),
-                features: vec!["instrument".into()],
-                path: "C:/fake/synth.clap".into(),
-                descriptor_index: 0,
-                has_note_input: true,
-                has_note_output: false,
-                has_audio_output: true,
-                // instrument: audio を生成するだけ → audio 入力なし。
-                has_audio_input: false,
-                has_video_input: false,
-                has_video_output: false,
-            },
-            PluginEntry {
-                id: "test.bitcrush".into(),
-                format: PluginFormat::Clap,
-                name: "Test Bitcrush".into(),
-                vendor: "Test".into(),
-                version: "1.0".into(),
-                features: vec!["audio-effect".into()],
-                path: "C:/fake/bitcrush.clap".into(),
-                descriptor_index: 0,
-                has_note_input: false,
-                has_note_output: false,
-                has_audio_output: true,
-                // audio-effect: audio を加工する → audio 入力あり。
-                has_audio_input: true,
-                has_video_input: false,
-                has_video_output: false,
-            },
-            PluginEntry {
-                id: "test.delay".into(),
-                format: PluginFormat::Clap,
-                name: "Test Delay".into(),
-                vendor: "Test".into(),
-                version: "1.0".into(),
-                features: vec!["audio-effect".into()],
-                path: "C:/fake/delay.clap".into(),
-                descriptor_index: 0,
-                has_note_input: false,
-                has_note_output: false,
-                has_audio_output: true,
-                // audio-effect: audio を加工する → audio 入力あり。
-                has_audio_input: true,
-                has_video_input: false,
-                has_video_output: false,
-            },
-        ],
-        scanned_at: None,
-        port_probe_version: 0,
-    })
-}
-
-fn build_app() -> (
-    AppData,
-    UnboundedReceiver<MainToChild>,
-    UnboundedReceiver<MainToChild>,
-    Arc<RecordingDispatcher>,
-) {
-    let (audio_tx, audio_rx) = mpsc::unbounded_channel();
-    let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
-    let event_dispatcher = RecordingDispatcher::new();
-    let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
-    let event_dispatcher_dyn: Arc<dyn BackgroundDispatcher> = event_dispatcher.clone();
-    let app = AppData::new(
-        audio_tx,
-        plugin_tx,
-        None,
-        Some(make_plugin_db()),
-        event_dispatcher_dyn,
-        job_dispatcher,
-        None,
-        // app_dirs: None = 永続化なし。 実 %LOCALAPPDATA%/daw_01/recent*.json を汚染しない。
-        None,
-        48_000, // (A1 r.md #8) test sample rate
-    );
-    (app, audio_rx, plugin_rx, event_dispatcher)
-}
-
-fn drain<T>(rx: &mut UnboundedReceiver<T>) -> Vec<T> {
-    let mut v = Vec::new();
-    while let Ok(msg) = rx.try_recv() {
-        v.push(msg);
-    }
-    v
-}
+use super::support::{build_app, drain, fake_plugin_loaded};
 
 fn has_pending_save(app: &AppData) -> bool {
     app.pending_state_queue
         .iter()
         .any(|r| matches!(r, PendingStateRequest::Save { .. }))
-}
-
-fn fake_plugin_loaded(
-    app: &mut AppData,
-    track_id: u32,
-    index: u32,
-    id: &str,
-    plugin_id: u32,
-) {
-    app.handle_event(AppEvent::SlotPluginLoadedFromChild {
-        track: track_id,
-        index,
-        id: id.into(),
-        name: id.into(),
-        plugin_id,
-        shmem_id: String::new(),
-        state_load_error: None,
-        aux_output_count: 0,
-    });
 }
 
 #[test]

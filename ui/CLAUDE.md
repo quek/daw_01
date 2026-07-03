@@ -23,8 +23,8 @@ crates/examples/  (mixer / waveform_validation 等) -- 動作確認サンプル
 ## Development Workflow
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+make build                            # ルート Makefile が SSoT (実行 3 exe)
+make test                             # テストを持つ package のみ (TEST_PKGS)
 cargo clippy --workspace --tests -- -D warnings
 cargo run --bin mixer                 # mixer 動作確認
 cargo run --bin waveform_validation   # 波形 UI 動作確認

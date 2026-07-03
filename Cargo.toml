@@ -41,6 +41,13 @@ hound = "3"
 # image の hard dep なので残る)。arboard 経由の image エッジは bmp 等を独立に
 # 有効化しており avif を引かないので、この絞り込みは安全に効く。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "tga", "gif"] }
+# ui/crates/examples/* が各自 `png = "0.17"` を直接指定しており、image (0.25) が推移的に
+# 解決する png 0.18.1 と2バージョン重複コンパイルされていた (cargo tree --duplicates で確認)。
+# この定義に揃えて統一する (現消費者は embedded_host のみ)。
+# 注: daw_gui の [build-dependencies] ico (#47 アプリアイコン生成) は内部で png ^0.17 を
+# 固定要求しており、ico 自身の Cargo.toml 由来で workspace.dependencies からは制御できない。
+# 統一後も ico 経由の png 0.17.16 は1個だけ残る (影響は縮小のみ、完全ゼロ化ではない)。
+png = "0.18"
 cpal = "0.15"
 libloading = "0.8"
 midir = "0.10"
@@ -51,7 +58,6 @@ rfd = "0.15"
 rtrb = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-shared_memory = "0.12"
 # resource monitor (r.md #3): システム CPU / メモリを 3 プロセス分ポーリング。
 # cross-platform (Linux 配慮) で、 daw_gui の UI 側スレッドからのみ使う (RT パス外)。
 sysinfo = "0.33"
@@ -68,7 +74,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2.5"
 reqwest = { version = "0.12", features = ["blocking"] }
 vst3 = "0.3"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D10", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_Storage_Xps", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D10", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_Storage_Xps", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 # UI ライブラリ (旧 gui_01)。統合により ../gui_01/crates/* → ui/crates/* へ。
 # この 3 定義が daw_gui と ui/crates 内部の両方の解決元 (単一定義)。
 daw-ui-platform = { path = "ui/crates/platform" }

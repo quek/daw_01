@@ -312,40 +312,27 @@ const EMPTY_EVENT: Event = Event {
 
 #[cfg(windows)]
 mod shmem_handle {
-    use anyhow::{Context, Result};
-    use shared_memory::{Shmem, ShmemConf};
+    use anyhow::Result;
 
     use super::ProcessData;
+    use crate::shmem::NamedShmem;
 
     /// Owning handle to a `ProcessData` shared memory region. The audio
     /// engine creates it; the plugin host opens it by the same id.
     pub struct ProcessDataHandle {
-        shmem: Shmem,
+        shmem: NamedShmem,
     }
 
     impl ProcessDataHandle {
         pub fn create(os_id: &str) -> Result<Self> {
-            let shmem = ShmemConf::new()
-                .size(std::mem::size_of::<ProcessData>())
-                .os_id(os_id)
-                .create()
-                .with_context(|| format!("failed to create shmem {os_id}"))?;
+            let shmem = NamedShmem::create(os_id, std::mem::size_of::<ProcessData>())?;
             // Zero the region so the reading side never sees uninit memory.
             unsafe { std::ptr::write_bytes(shmem.as_ptr(), 0, std::mem::size_of::<ProcessData>()) };
             Ok(Self { shmem })
         }
 
         pub fn open(os_id: &str) -> Result<Self> {
-            let shmem = ShmemConf::new()
-                .os_id(os_id)
-                .open()
-                .with_context(|| format!("failed to open shmem {os_id}"))?;
-            anyhow::ensure!(
-                shmem.len() >= std::mem::size_of::<ProcessData>(),
-                "shmem too small for ProcessData: {} < {}",
-                shmem.len(),
-                std::mem::size_of::<ProcessData>()
-            );
+            let shmem = NamedShmem::open(os_id, std::mem::size_of::<ProcessData>())?;
             Ok(Self { shmem })
         }
 

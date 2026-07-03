@@ -2,10 +2,39 @@
 
 .DEFAULT_GOAL := release
 
+# --- TMP/TEMP の書き戻し (Claude Code の Git Bash → MSYS2 make 対策、2026-07-03 発覚) ---
+# Git for Windows の bash から MSYS2 の make を起動すると、msys-2.0.dll ランタイム差で
+# recipe 環境が HOME/MSYSTEM/PATH/SYSTEMDRIVE/SYSTEMROOT/TERM/WINDIR の 7 変数まで scrub
+# され TMP/TEMP が消える。native な cargo / テスト exe は GetTempPath が SYSTEMROOT
+# (C:\WINDOWS) へ fallback し、tempfile を使うテスト 51 件が PermissionDenied で全滅する。
+# 欠落時のみ workspace 内の target/tmp を割り当てて export する (user profile の推測は
+# しない — この文脈の HOME は /home/<user> = C:\msys64\home\<user> で実在しない)。
+# 通常のシェルでは TMP 定義済みなので素通り、Linux は SYSTEMROOT が無いのでブロックごと
+# 素通り。MSYS2 sh は native 子プロセスへの exec 時に TMP/TEMP を Windows 形式へ自動変換する。
+ifdef SYSTEMROOT
+ifeq ($(origin TMP),undefined)
+TMP := $(CURDIR)/target/tmp
+TEMP := $(TMP)
+export TMP TEMP
+$(shell mkdir -p "$(TMP)")
+endif
+endif
+
 # 実行に必要な 3 つの exe (= runtime product)。ui/crates/examples/* (daw-ui-example-*) は
 # 実行に不要なので build / run / release / run-release では作らない (FIXME #65)。examples も
-# コンパイル検証したい test / clippy / check は --workspace のまま残す。
+# コンパイル検証したい clippy / check は --workspace のまま残す。
 RUN_PKGS := -p daw_gui -p daw_audio -p daw_plugin_host
+
+# `cargo test` は #[test] が 0 個の [[bin]] target でもビルド + リンクを必ず行う。
+# ui/crates/examples/* は winit/wgpu 一式に依存する手動デモで、#[test] を持つのは piano_roll と
+# sample_edit_ops の 2 crate のみ (他は自動テスト 0、check/clippy の --workspace が引き続き
+# コンパイル検証を担う)。実際にテストを持つ package だけを明示列挙する。
+# common / daw-ui-platform / daw-ui-renderer は RUN_PKGS には無いが実テストを持つので必須
+# (欠かすとカバレッジが静かに落ちる)。ara-sys は #[test] 0 個なので対象外。
+# 新規 member 追加/初めて #[test] を足すときはこの列挙も更新すること。
+TEST_PKGS := -p common -p daw_gui -p daw_audio -p daw_plugin_host \
+             -p daw-ui-platform -p daw-ui-renderer -p daw-ui-core \
+             -p daw-ui-example-piano-roll -p daw-ui-example-sample-edit-ops
 
 # ---- vendored FFmpeg (third_party/ffmpeg は gitignore、各マシンで fetch) ----
 # ABI は avcodec-61 / avformat-61 / avutil-59 / swscale-8 / swresample-5 (= ffmpeg 7.1)
@@ -23,7 +52,7 @@ help:
 	@echo "  make run           daw_gui をビルド × 起動 (debug)"
 	@echo "  make release       実行 3 exe (daw_gui/daw_audio/daw_plugin_host) を release ビルド"
 	@echo "  make run-release   daw_gui をビルド × 起動 (release)"
-	@echo "  make test          workspace 全テスト"
+	@echo "  make test          テストを持つ package のみ実行 (TEST_PKGS、#[test]0個の examples 等は除外)"
 	@echo "  make clippy        clippy をエラー扱いで走らせる"
 	@echo "  make check         cargo check (ビルド不要、型検査のみ)"
 	@echo "  make fmt           cargo fmt"
@@ -71,9 +100,13 @@ run-release: release
 	cargo run -p daw_gui --release
 
 # daw_gui/script を有効化して --script 系 smoke テスト (required-features 宣言済み) も
-# 含めて全件回す。素の `cargo test --workspace` はそれらをスキップして green のまま。
-test: fetch-ffmpeg
-	cargo test --workspace --features daw_gui/script
+# 含めて全件回す。TEST_PKGS 以外 (#[test] 0 個の examples + ara-sys) はスキップする。
+# build 依存は必須: script smoke は実 daw_gui.exe を spawn し、それが daw_audio.exe /
+# daw_plugin_host.exe を子プロセス起動する。`cargo test` はこれら runtime バイナリの
+# 生成を保証しない (テストハーネス版のみ) ので、クリーンな target では build なしだと
+# 「daw_audio.exe が見つかりません」で落ちる (2026-07-03 の cargo clean 後に発覚)。
+test: build
+	cargo test $(TEST_PKGS) --features daw_gui/script
 
 clippy:
 	cargo clippy --workspace -- -D warnings

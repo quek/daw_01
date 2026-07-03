@@ -3,91 +3,21 @@
 //! する流れを検証する。 failure 通知 (= `SlotPluginLoadFailed`) が来ない
 //! と pending stuck で再生不能になる A8 の core 動作。
 
-use std::sync::Arc;
-
-use common::plugin_db::{PluginDatabase, PluginEntry};
-use common::plugin_format::PluginFormat;
 use common::protocol::MainToChild;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{AppData, AppEvent};
-use daw_gui::dispatcher::{
-    BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
-};
 
-fn make_plugin_db() -> Arc<PluginDatabase> {
-    Arc::new(PluginDatabase {
-        entries: vec![
-            PluginEntry {
-                id: "test.synth".into(),
-                format: PluginFormat::Clap,
-                name: "Test Synth".into(),
-                vendor: "Test".into(),
-                version: "1.0".into(),
-                features: vec!["instrument".into()],
-                path: "C:/fake/synth.clap".into(),
-                descriptor_index: 0,
-                has_note_input: true,
-                has_note_output: false,
-                has_audio_output: true,
-                // instrument: audio を生成するだけ → audio 入力なし。
-                has_audio_input: false,
-                has_video_input: false,
-                has_video_output: false,
-            },
-            PluginEntry {
-                id: "test.fx".into(),
-                format: PluginFormat::Clap,
-                name: "Test FX".into(),
-                vendor: "Test".into(),
-                version: "1.0".into(),
-                features: vec!["audio-effect".into()],
-                path: "C:/fake/fx.clap".into(),
-                descriptor_index: 0,
-                has_note_input: false,
-                has_note_output: false,
-                has_audio_output: true,
-                // audio-effect: audio を加工する → audio 入力あり。
-                has_audio_input: true,
-                has_video_input: false,
-                has_video_output: false,
-            },
-        ],
-        scanned_at: None,
-        port_probe_version: 0,
-    })
-}
+use super::support::{self, drain};
 
+/// 旧独立バイナリ時代のシグネチャを保つ thin adapter (dispatcher はここで drop)。
 fn build_app() -> (
     AppData,
     UnboundedReceiver<MainToChild>, // audio_rx
     UnboundedReceiver<MainToChild>, // plugin_rx
 ) {
-    let (audio_tx, audio_rx) = mpsc::unbounded_channel();
-    let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
-    let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
-    let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
-    let app = AppData::new(
-        audio_tx,
-        plugin_tx,
-        None,
-        Some(make_plugin_db()),
-        event_dispatcher,
-        job_dispatcher,
-        None,
-        // app_dirs: None = 永続化なし。 実 %LOCALAPPDATA%/daw_01/recent*.json を汚染しない。
-        None,
-        48_000, // (A1 r.md #8) test sample rate
-    );
+    let (app, audio_rx, plugin_rx, _dispatcher) = support::build_app();
     (app, audio_rx, plugin_rx)
-}
-
-fn drain<T>(rx: &mut UnboundedReceiver<T>) -> Vec<T> {
-    let mut v = Vec::new();
-    while let Ok(msg) = rx.try_recv() {
-        v.push(msg);
-    }
-    v
 }
 
 /// 単一 pending → 失敗通知 1 回 → pending 解放 + queue Play flush。

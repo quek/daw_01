@@ -16,5 +16,5 @@ path = "src/main.rs"
 [dependencies]
 daw-ui-platform.workspace = true
 daw-ui-renderer.workspace = true
-png = "0.17"
+png.workspace = true
 raw-window-handle = "0.6.2"

@@ -14,7 +14,6 @@ libloading.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-shared_memory.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -24,6 +23,10 @@ vst3.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+# shmem.rs の POSIX 実装 (shm_open/mmap)。Windows ビルドでは一切引かれない。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -28,7 +28,7 @@ use common::protocol::{ChildToMain, MainToChild};
 
 use crate::app::{AppData, AppEvent, ClipRef};
 use crate::bootstrap::Bootstrap;
-use crate::dispatcher::{NoopJobDispatcher, RecordingDispatcher};
+use crate::dispatcher::RecordingDispatcher;
 
 thread_local! {
     /// Running script の host state。 `run_scripted` が `Some(...)` をセットし、

@@ -10,83 +10,18 @@
 //! - `DirtyGuardSave` (非同期): plugin 有り project は plugin state 取得
 //!   (`AllStatesReceived`) を待ってから保存 → 操作実行
 
-use std::sync::Arc;
-
-use common::plugin_db::{PluginDatabase, PluginEntry};
-use common::plugin_format::PluginFormat;
 use common::protocol::MainToChild;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction};
-use daw_gui::dispatcher::{
-    BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
-};
 
-fn make_plugin_db() -> Arc<PluginDatabase> {
-    Arc::new(PluginDatabase {
-        entries: vec![PluginEntry {
-            id: "test.synth".into(),
-            format: PluginFormat::Clap,
-            name: "Test Synth".into(),
-            vendor: "Test".into(),
-            version: "1.0".into(),
-            features: vec!["instrument".into()],
-            path: "C:/fake/synth.clap".into(),
-            descriptor_index: 0,
-            has_note_input: true,
-            has_note_output: false,
-            has_audio_output: true,
-            // instrument: audio を生成するだけ → audio 入力なし。
-            has_audio_input: false,
-            has_video_input: false,
-            has_video_output: false,
-        }],
-        scanned_at: None,
-        port_probe_version: 0,
-    })
-}
+use super::support::{self, load_instrument};
 
+/// 旧 dirty_guard.rs 独立バイナリ時代のシグネチャを保つ thin adapter。
+/// audio_rx をここで drop する (= closed channel で走る) のも旧挙動の保存。
 fn build_app() -> (AppData, UnboundedReceiver<MainToChild>) {
-    let (audio_tx, _audio_rx) = mpsc::unbounded_channel();
-    let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
-    let event_dispatcher = RecordingDispatcher::new();
-    let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
-    let event_dispatcher_dyn: Arc<dyn BackgroundDispatcher> = event_dispatcher.clone();
-    let app = AppData::new(
-        audio_tx,
-        plugin_tx,
-        None,
-        Some(make_plugin_db()),
-        event_dispatcher_dyn,
-        job_dispatcher,
-        None,
-        // app_dirs: None = 永続化なし。 実 %LOCALAPPDATA%/daw_01/recent*.json を汚染しない。
-        None,
-        48_000, // (A1 r.md #8) test sample rate
-    );
+    let (app, _audio_rx, plugin_rx, _dispatcher) = support::build_app();
     (app, plugin_rx)
-}
-
-fn load_instrument(app: &mut AppData) {
-    let track_id = app.song.tracks[0].id;
-    app.handle_event(AppEvent::SelectTrack(0));
-    app.handle_event(AppEvent::OpenPluginPicker);
-    app.handle_event(AppEvent::SelectPluginFromDb {
-        id: "test.synth".into(),
-        keep_open: false,
-        open_gui: true,
-    });
-    app.handle_event(AppEvent::SlotPluginLoadedFromChild {
-        track: track_id,
-        // 単一デバイスチェーン: picker は末尾 append、 空チェーンなので index 0。
-        index: 0,
-        id: "test.synth".into(),
-        name: "Test Synth".into(),
-        plugin_id: 100,
-        shmem_id: String::new(),
-        state_load_error: None,
-        aux_output_count: 0,
-    });
 }
 
 // ---------------------------------------------------------------------------

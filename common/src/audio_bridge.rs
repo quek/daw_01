@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
-use shared_memory::{Shmem, ShmemConf};
+use anyhow::Result;
+
+use crate::shmem::NamedShmem;
 
 /// (A1 r.md #8) フォールバック既定サンプルレート。 通常はランタイムで
 /// `AudioSession.sample_rate` = デバイス実レート (daw_audio が Hello で報告) が
@@ -70,16 +71,12 @@ impl AudioBridge {
 
 /// Owning handle to the audio shared memory region.
 pub struct AudioBridgeHandle {
-    shmem: Shmem,
+    shmem: NamedShmem,
 }
 
 impl AudioBridgeHandle {
     pub fn create(os_id: &str) -> Result<Self> {
-        let shmem = ShmemConf::new()
-            .size(AudioBridge::SIZE)
-            .os_id(os_id)
-            .create()
-            .with_context(|| format!("failed to create shmem {os_id}"))?;
+        let shmem = NamedShmem::create(os_id, AudioBridge::SIZE)?;
         // Zero-initialize so the AtomicU32 starts at 0 and samples are silent.
         unsafe { std::ptr::write_bytes(shmem.as_ptr(), 0, AudioBridge::SIZE) };
         let handle = Self { shmem };
@@ -90,16 +87,7 @@ impl AudioBridgeHandle {
     }
 
     pub fn open(os_id: &str) -> Result<Self> {
-        let shmem = ShmemConf::new()
-            .os_id(os_id)
-            .open()
-            .with_context(|| format!("failed to open shmem {os_id}"))?;
-        anyhow::ensure!(
-            shmem.len() >= AudioBridge::SIZE,
-            "shmem too small: {} < {}",
-            shmem.len(),
-            AudioBridge::SIZE
-        );
+        let shmem = NamedShmem::open(os_id, AudioBridge::SIZE)?;
         Ok(Self { shmem })
     }
 

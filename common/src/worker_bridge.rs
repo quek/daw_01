@@ -38,22 +38,18 @@ impl WorkerBridge {
 
 #[cfg(windows)]
 mod shmem_handle {
-    use anyhow::{Context, Result};
-    use shared_memory::{Shmem, ShmemConf};
+    use anyhow::Result;
 
     use super::WorkerBridge;
+    use crate::shmem::NamedShmem;
 
     pub struct WorkerBridgeHandle {
-        shmem: Shmem,
+        shmem: NamedShmem,
     }
 
     impl WorkerBridgeHandle {
         pub fn create(os_id: &str) -> Result<Self> {
-            let shmem = ShmemConf::new()
-                .size(std::mem::size_of::<WorkerBridge>())
-                .os_id(os_id)
-                .create()
-                .with_context(|| format!("failed to create worker_bridge shmem {os_id}"))?;
+            let shmem = NamedShmem::create(os_id, std::mem::size_of::<WorkerBridge>())?;
             // The shmem view is backed by `MapViewOfFile`, which returns a
             // pointer aligned to at least 64 KiB (the system allocation
             // granularity). That trivially satisfies `WorkerBridge`'s
@@ -77,16 +73,7 @@ mod shmem_handle {
         }
 
         pub fn open(os_id: &str) -> Result<Self> {
-            let shmem = ShmemConf::new()
-                .os_id(os_id)
-                .open()
-                .with_context(|| format!("failed to open worker_bridge shmem {os_id}"))?;
-            anyhow::ensure!(
-                shmem.len() >= std::mem::size_of::<WorkerBridge>(),
-                "worker_bridge shmem too small: {} < {}",
-                shmem.len(),
-                std::mem::size_of::<WorkerBridge>()
-            );
+            let shmem = NamedShmem::open(os_id, std::mem::size_of::<WorkerBridge>())?;
             // `MapViewOfFile` aligns the view to the 64 KiB system allocation
             // granularity, which covers `WorkerBridge`'s 4-byte alignment.
             debug_assert!(
