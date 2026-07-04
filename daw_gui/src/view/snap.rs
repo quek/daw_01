@@ -85,19 +85,19 @@ pub fn mode_to_choice(mode: SnapMode) -> Option<u8> {
 
 pub fn piano_roll_snap_config(app: &AppData) -> SnapConfig {
     SnapConfig {
-        mode: choice_to_mode(app.pianoroll_snap_choice),
-        enabled: app.pianoroll_snap_enabled,
+        mode: choice_to_mode(app.ui_prefs.pianoroll_snap_choice),
+        enabled: app.ui_prefs.pianoroll_snap_enabled,
         min_beat_unit: 1.0 / 128.0,
-        time_sig: app.song.time_sig,
+        time_sig: app.song_doc.song().time_sig,
     }
 }
 
 pub fn arrange_snap_config(app: &AppData) -> SnapConfig {
     SnapConfig {
-        mode: choice_to_mode(app.arrange_snap_choice),
-        enabled: app.arrange_snap_enabled,
+        mode: choice_to_mode(app.ui_prefs.arrange_snap_choice),
+        enabled: app.ui_prefs.arrange_snap_enabled,
         min_beat_unit: 1.0 / 128.0,
-        time_sig: app.song.time_sig,
+        time_sig: app.song_doc.song().time_sig,
     }
 }
 

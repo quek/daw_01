@@ -24,7 +24,7 @@ use common::model::{
 };
 use common::plugin_db::PluginDatabase;
 use common::plugin_format::PluginFormat;
-use common::protocol::{MainToChild, SlotState};
+use common::protocol::{AudioCommand, PluginCommand, SlotState};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::audio_source_cache::AudioSourceCache;
@@ -35,10 +35,10 @@ use crate::import_audio;
 /// テスト可能な enum で表現する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackRemovalIpc {
-    /// daw_audio engine に `MainToChild::ClosePluginShmem { plugin_id }`
+    /// daw_audio engine に `AudioCommand::ClosePluginShmem { device_id }`
     /// を送る (use-after-free deadlock 防止のため RemoveTrack より先)。
-    CloseAudioShmem { plugin_id: u32 },
-    /// daw_plugin_host に `MainToChild::RemoveTrack { track }` を送る
+    CloseAudioShmem { device_id: u64 },
+    /// daw_plugin_host に `PluginCommand::RemoveTrack { track_id }` を送る
     /// (plugin chain の proper teardown)。
     RemoveTrackFromPluginHost { track_id: u32 },
 }
@@ -49,7 +49,7 @@ pub struct TrackMixEntry {
     /// peak display lookup) 用。 IPC / AppEvent では track_id を使うこと
     /// (= Phase 6 review で SSOT 違反を解消、 reorder race 防止)。
     pub index: u32,
-    /// stable な Track::id。 mixer strip → AppEvent → MainToChild まで
+    /// stable な Track::id。 mixer strip → AppEvent → AudioCommand まで
     /// 一貫してこれで track を識別する。
     pub track_id: u32,
     pub name: String,
@@ -929,8 +929,11 @@ pub fn automation_target_display_name(
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => "Volume".into(),
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan) => "Pan".into(),
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => "Mute".into(),
-        AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx }) => {
-            format!("Send {}", send_idx + 1)
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_id, .. }) => {
+            // v29: 安定 send id (1 始まり)。 位置ベースの連番表示は S3b で
+            // 「track の sends 内位置」 を引く形に戻す予定 (ここは song 非依存
+            // の pure label なので id をそのまま出す)。
+            format!("Send {send_id}")
         }
         AutomationTarget::PluginParam { param_id, .. } => format!("Param {param_id}"),
         AutomationTarget::SongTempo => "Tempo".into(),
@@ -1016,7 +1019,7 @@ pub const MIN_EXPORT_RANGE_BEATS: f64 = 0.25;
 /// gui_01 #055: widget は押下 pitch のみ返すので velocity は daw_01 側で固定。
 const PREVIEW_VELOCITY: u8 = 100;
 
-/// パニックボタンで `MainToChild::Panic`（master declick）を送ってから
+/// パニックボタンで `AudioCommand::Panic`（master declick）を送ってから
 /// `ReinitAllPlugins` を送るまでの遅延。 audio engine が次の buffer で declick を
 /// 開始し fade-out（5ms）し切るまで（= buffer 1 個分 + 5ms ≒ 最大数十 ms）master
 /// が 0 になるのを待ってから plugin を mix から外す。 80ms あれば大きめの buffer
@@ -1029,8 +1032,8 @@ const PANIC_REINIT_DELAY: std::time::Duration = std::time::Duration::from_millis
 pub const MIN_AUDIO_EDITOR_VIEW_LEN_BEATS: f64 = 1.0 / 64.0;
 
 /// Phase 2 PR-C: 進行中の plugin-FX bounce の追跡 entry。
-/// `MainToChild::BounceClipFxOnline` 発火時に `AppData::pending_clip_fx_bounce
-/// = Some(...)` でセット、 `ChildToMain::BounceClipFxComplete` 受信で
+/// `AudioCommand::BounceClipFxOnline` 発火時に `AppData::pending_clip_fx_bounce
+/// = Some(...)` でセット、 `AudioEvent::BounceClipFxComplete` 受信で
 /// 完了処理 (= 新 audio source + 新 track + 新 Clip 配置) → `None` に戻す。
 /// `path` / `source_track` / `source_clip` は IPC echo back と pending entry
 /// の identifier 照合に使う。 `clip_name` / `clip_length_beats` /
@@ -1160,1014 +1163,10 @@ pub(crate) struct ArrLabelCache {
         std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
 }
 
-pub struct AppData {
-    // -------- Song / file --------
-    pub song: Song,
-    /// D3/D4: song を変更する編集 (undo snapshot / undo / redo / new・open) ごとに
-    /// 進むカウンタ。 `arr_label_cache` の世代キー。 song 自体に持たせると bincode
-    /// 往復で増えてしまうので AppData 側 (= 非永続) に置く。
-    pub(crate) song_epoch: u64,
-    /// D3/D4: track/clip 名の `Arc<str>` キャッシュ ([`ArrLabelCache`])。 view から
-    /// (`&self`) 更新するので `RefCell`。 AppData は GUI メインスレッド専有なので可。
-    pub(crate) arr_label_cache: std::cell::RefCell<ArrLabelCache>,
-    pub file_path: Option<PathBuf>,
-    /// Decoded sample buffers for `Song.audio_sources`, keyed by
-    /// `AudioSourceId`. Filled lazily on import (Phase 1 PR3). The
-    /// audio engine maintains its own independent cache — file-backed
-    /// sources are decoded twice (once per process) to keep IPC lean
-    /// (`docs/plan_audio_clip.md` §6.1 / §8.3).
-    pub audio_source_cache: AudioSourceCache,
-    /// (r.md #5 ARA2) Last ARA clip-spec set sent to the plugin host per
-    /// `(track_id, device_index)`. `SetupAraDocument` is sent only when an ARA
-    /// device's track audio clips actually change — rebuilding the ARA document
-    /// deactivates/reactivates the plug-in, so it must not happen on every song
-    /// sync. Slots that disappear (device removed / no longer ARA) get
-    /// `ClearAraDocument`.
-    ara_doc_cache: std::collections::HashMap<(u32, u32), Vec<common::protocol::AraClipSpec>>,
-    /// Video thumbnail RGBA8 staging area, keyed by `VideoSourceId`.
-    /// Populated by `action_import_video` (P3.4); drained by the
-    /// runner (P3.5) which calls `Renderer::create_texture` +
-    /// `upload_texture_rgba` and inserts the resulting `TextureHandle`
-    /// into [`Self::video_texture_cache`]. After a successful upload
-    /// the entry here is dropped (= the texture lives in GPU memory).
-    /// `(width, height, rgba)`; rgba length is `width * height * 4`.
-    pub video_thumbnail_rgba:
-        std::collections::HashMap<common::model::VideoSourceId, (u32, u32, std::sync::Arc<Vec<u8>>)>,
-    /// `VideoSourceId`s queued for GPU texture upload. The runner
-    /// drains this each frame.
-    pub pending_thumbnail_uploads: Vec<common::model::VideoSourceId>,
-    /// GPU-side video thumbnail textures keyed by `VideoSourceId`.
-    /// Written by the runner (P3.5) after a successful texture upload;
-    /// read by `arrangement_view.rs` (P3.6) and passed to
-    /// `ArrangementClip.thumbnail`.
-    pub video_texture_cache:
-        std::collections::HashMap<common::model::VideoSourceId, daw_ui_renderer::TextureHandle>,
-    /// v13 (`docs/plan_image_overlay.md` §P2): Image BGRA8 staging
-    /// area, keyed by `ImageSourceId`. Populated by
-    /// `action_import_image`; drained by the runner (P3) which calls
-    /// `Renderer::create_texture_bgra` + `upload_texture_bgra` and
-    /// inserts the resulting `TextureHandle` into
-    /// [`Self::image_texture_cache`]. After upload the entry here is
-    /// dropped (= the texture lives in GPU memory). `(width, height,
-    /// bgra)`; bgra length is `width * height * 4`.
-    pub image_source_bgra: std::collections::HashMap<
-        common::model::ImageSourceId,
-        (u32, u32, std::sync::Arc<Vec<u8>>),
-    >,
-    /// v13: `ImageSourceId`s queued for GPU texture upload. Drained by
-    /// the runner each frame.
-    pub pending_image_uploads: Vec<common::model::ImageSourceId>,
-    /// v13: GPU-side image textures keyed by `ImageSourceId`. Written
-    /// by the runner after upload, read by `preview_window.rs`
-    /// composite pass and `arrangement_view.rs` thumbnail rendering.
-    pub image_texture_cache: std::collections::HashMap<
-        common::model::ImageSourceId,
-        daw_ui_renderer::TextureHandle,
-    >,
-    /// docs/plan_video.md P4: video preview window の表示フラグ。 menu
-    /// "View → Video Preview" / shortcut で toggle、 runner が毎フレーム
-    /// この値を見て第二 winit::Window を create / destroy する。 false で
-    /// 起動するので video import 前は preview は出ない (= MV 開始時は
-    /// preview 不要、 user が import 後に明示的に開く)。
-    pub preview_window_visible: bool,
-    /// Snapped mouse hover beat inside the arrangement canvas. `None`
-    /// outside the canvas. `arrangement_view::draw` updates it every
-    /// frame using the current `SnapConfig`. Used by Split (E) so the
-    /// split lands at the user's pointer (REAPER edit-cursor flavour)
-    /// instead of the playhead (`docs/plan_audio_clip.md` §3.3).
-    pub arrangement_hover_beat: Option<f64>,
-    /// Same as above but **without** snap applied. Used by Alt+E
-    /// (split with snap temporarily disabled).
-    pub arrangement_hover_beat_raw: Option<f64>,
-    /// `(track, clip)` index pair for the clip the mouse is currently
-    /// over (or `None` outside any clip). Lets Split work without an
-    /// explicit selection — hover over a clip, press `E`, and that
-    /// clip is split. Falls back to the existing `selected_clips`
-    /// when no clip is under the cursor.
-    pub arrangement_hover_clip: Option<ClipRef>,
-    /// ポインタ下のトラック id (`ArrangementResponse.hovered_track` の
-    /// mirror)。トラック paste の挿入先 (= マウス下トラックの直上) に使う。
-    /// `arrangement_view::draw` が毎フレーム更新。ヘッダ列・クリップレーンどちらの
-    /// 上でも同じトラック行を返す。
-    pub arrange_hovered_track: Option<u32>,
-    /// ミキサーでポインタ直下の strip の track id。`mixer_strips::draw`
-    /// が毎フレーム更新 (arrangement の `arrange_hovered_track` と同 idiom)。S キーで
-    /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master
-    /// strip は solo を持たないので None 扱い。
-    pub mixer_hovered_track: Option<u32>,
-    /// ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
-    /// ノート paste の配置位置に使う。`piano_roll_view::draw` が毎フレーム更新、
-    /// grid 外 / 非 piano-roll は `None`。
-    pub pianoroll_hover_beat: Option<f64>,
-    /// ピアノロール grid 上のポインタ拍を **song-absolute かつ snap なし**
-    /// (= clip_start_beat を引く前の生 beat) で mirror。`f` キー (PlayFromCursor) は
-    /// song-absolute の grid で snap する必要があるため、`pianoroll_hover_beat`
-    /// (clip-local snap 済) とは別に保持する。grid 外 / 非 piano-roll は `None`。
-    pub pianoroll_hover_beat_song_raw: Option<f64>,
-    /// ピアノロール grid 上のポインタ直下の note index (= clip 内 notes Vec の
-    /// index、`selected_notes` と同空間)。`q` キーで「選択が無ければカーソル直下 note を
-    /// mute」する対象解決に使う。`piano_roll_view::draw` が `note_hit` で毎フレーム更新、
-    /// grid 外 / note 外 / 非 piano-roll は `None`。
-    pub pianoroll_hover_note: Option<u32>,
-    /// view 層が OS clipboard へ書く保留テキスト。トラック copy/cut は
-    /// plugin state 収集が非同期 (`on_all_states_from_child`、Ui 非保持) なので、
-    /// そこで serialize した envelope JSON をここに積み、`dispatch_shortcuts` が
-    /// 毎フレーム drain して `Ui::set_clipboard_text` する。
-    pub pending_clipboard_write: Option<String>,
-
-    // -------- Selection --------
-    /// Track multi-selection (Ableton Live / Reaper 互換)。 末尾要素 =
-    /// 「最後にクリックした anchor」 = カーソル相当。 widget 側 (gui_01
-    /// arrangement) からは `selected_tracks: &[u32]` として渡す。 id
-    /// ベース (Track::id) で持ち、 track 並び替えでも安定。
-    pub selected_track_ids: Vec<u32>,
-    /// 選択中の Arranger セクション id 集合 (`selected_track_ids` と同 idiom、
-    /// 末尾 = anchor)。 gui_01 の `SelectSection` で更新、 帯のハイライト + キーボード Delete
-    /// の対象。 section を選ぶと他面 (clip/note/track) の選択はクリアして Delete の曖昧さを避ける。
-    pub selected_section_ids: Vec<u32>,
-    /// 折り畳み中の group track id 集合。 group 自身が `kind == Group`
-    /// (= 子を持つ) かつこの set に含まれていれば子孫の row を hide。
-    pub collapsed_groups: std::collections::HashSet<u32>,
-    /// gui_01 #028 (M14 Phase 63n-1): automation lane 群を **展開中** の
-    /// track id 集合 (Bitwig 流: 既定は折り畳み)。 含まれない track の
-    /// `automation_lanes_collapsed = true` を widget へ渡す。 ▶/▼ click
-    /// で `ToggleTrackAutomationCollapsed` イベント経由に insert/remove。
-    /// プロジェクト保存対象ではない (= session-only): UI 状態は再起動で
-    /// 既定 (全 collapsed) に戻る。
-    pub expanded_automation_tracks: std::collections::HashSet<u32>,
-    /// gui_01 #034 (Phase 63n-10): master row の automation 展開状態。
-    /// `expanded_automation_tracks` と直交した 1 bool で持つ (= track id
-    /// 集合に MASTER_TRACK_ID を入れる方式は sentinel が混ざって SSoT が
-    /// 曖昧、 master 専用 field の方が intent が明瞭)。 起動時 false、
-    /// `ToggleTrackAutomationCollapsed { track_id: MASTER_TRACK_ID }` で flip。
-    /// session-only / Undo / save 対象外。
-    pub master_row_automation_expanded: bool,
-    /// gui_01 #028 (M14 Phase 63n-3): 選択中の automation clip。 MIDI
-    /// clip 用 `selected_clips` と直交 (= 同時に両方を持てる、 他 DAW
-    /// 互換)。 widget の `SelectAutomationClips` で上書き、 widget へは
-    /// 毎フレーム `&[AutomationClipKey]` で渡して selected highlight を
-    /// 描画させる。 session-only。
-    pub selected_automation_clips: Vec<common::model::AutomationClipKey>,
-    /// 直近に確定した編集面 (clip / automation 点 / automation クリップ / note /
-    /// audio event)。 これらは共存選択できる (lasso は点とクリップを両方拾う、
-    /// clip 選択は automation 選択を消さない) ため、 copy / cut / delete の対象面が
-    /// 曖昧になる。 「最後に選んだ面を対象にする」 (last-wins、 #071) ための
-    /// タイブレーカ。 `None` は初期状態。 session-only。 edit_surface (view) が
-    /// この値で対象面を解決する。
-    pub last_edit_select: Option<EditSelectSurface>,
-    /// Phase 3 (`docs/plan_automation.md` §10): 選択中の automation point。
-    /// gui_01 #033 で widget 側の lasso 矩形選択が landing するまで空のまま
-    /// だが、 copy / paste / quantize / delete のハンドラは selection を
-    /// 入力として動くので先行実装する。 widget からは
-    /// `SelectAutomationPoints` (#033) で上書き。 session-only。
-    pub selected_automation_points: Vec<AutomationPointKeyRef>,
-    /// inline 数値入力中の automation point (`Some` のとき
-    /// `arrangement_view` が当該 point の rect に `text_input_at_focused`
-    /// overlay を出す)。session-only / Undo・save 対象外。点をダブルクリック
-    /// で `Some`、 確定 (Enter) / blur / Esc で `None`。
-    pub editing_automation_point: Option<AutomationPointKeyRef>,
-    /// gui_01 #028 §7.3: 最後にユーザーが触った parameter。`A` キー
-    /// shortcut で「対応 lane を所有 track に追加」 する source。
-    /// session-only (起動 None、Undo / save 対象外)。
-    pub last_touched_param: Option<TouchedParam>,
-    /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode。
-    /// transport bar の 4 way toggle (Read / Touch / Latch / Write) で切替。
-    /// session-only / Undo 対象外 (= 起動時 `Read`、 project 保存対象外)。
-    /// 起動時の値は Bitwig / Ableton Live / Reaper と同じく `Read`。
-    /// Phase 4 Step C+ で audio thread もこの値を読んで recording lane の
-    /// curve eval をバイパスし、 GUI からの knob 値を `playhead_beat`
-    /// 起点に point として書き込む。
-    pub recording_mode: common::model::RecordingMode,
-    /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 transport bar の
-    /// toggle button で切り替え、 `AppEvent::SetMetronomeEnabled(bool)` で
-    /// 更新 → `MainToChild::SetMetronomeEnabled(bool)` を audio に送信。
-    /// audio thread は内蔵 click 音 (sine + linear envelope decay、 accent:
-    /// downbeat 880Hz / 他 440Hz) を master mix に重ねる。 起動時 default
-    /// false。 session-only (project save には含めない)。
-    pub metronome_enabled: bool,
-    /// Phase 7 B4 Step D (2026-05-13): MIDI 録音中 flag。 Record toggle ON
-    /// で true、 Stop / OFF で false。 true のとき handle_midi_note_on/off
-    /// は armed track の MIDI clip に書き込む (= 既存 step-input mode は
-    /// midi_recording == false のときのみ動作)。 session-only / Undo 対象外。
-    pub midi_recording: bool,
-    /// Phase 7 B4 Step C (2026-05-13): count-in 中で「0 拍到達まで preroll
-    /// 待ち」 状態。 `start_recording` で `count_in_bars > 0` なら true、
-    /// audio engine の `preroll_remaining_samples` mirror が 0 に達したら
-    /// `on_tick` が `midi_recording_pending → midi_recording` 遷移させる。
-    /// metronome は pending 中だけ強制 ON で click guide を流す。
-    pub midi_recording_pending: bool,
-    /// Phase 7 B4 Step C (2026-05-13): count-in bars (0 / 1 / 2)。 transport
-    /// bar の dropdown で設定、 default 0。 session-only state。
-    pub count_in_bars: u8,
-    /// Phase 7 B4 Step D (2026-05-13): 直近 note_on の `(track_id, key) →
-    /// start_beat`。 note_off 受信時に start_beat 取り出して `length_beats =
-    /// playhead - start` を確定する。 stop / midi_recording 解除で clear。
-    pub midi_recording_active_notes:
-        std::collections::HashMap<(u32, u8), f64>,
-    /// Phase 7 B4 Step C (2026-05-13): count-in 開始前の metronome_enabled
-    /// 状態 snapshot。 count-in 中だけ強制 ON にし、 `stop_recording` 時に
-    /// 元の値へ戻す (= user の「click off」 設定を尊重しつつ count-in 中は
-    /// guide が聞こえる)。 None なら recording 開始前 = 復元不要。
-    pub metronome_enabled_pre_recording: Option<bool>,
-    /// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn の bind 待ち target。
-    /// `Some` なら次に来る MIDI CC をこの target に bind (= `Song.midi_bindings`
-    /// に追加 + None に戻す)。 `None` (default) なら CC は既存 binding lookup
-    /// で target に値を流す (= 通常モード)。 transport bar の「MIDI Learn」
-    /// button で `StartMidiLearn(target)` 経由で Some 化、 `CancelMidiLearn`
-    /// or 1 度の CC 受信 (= bind 確定) で None に戻る。
-    pub midi_learn_target: Option<common::model::BindingTarget>,
-    /// Phase 4 Step B (`docs/plan_automation.md` §6): 現在 user が触っている
-    /// (= dragging) parameter の集合。 mixer / inspector / lane default knob
-    /// の press で insert、 release で remove。 plugin GUI 経由の gesture も
-    /// CLAP `CLAP_EVENT_PARAM_GESTURE_BEGIN/END` IPC からここに反映する
-    /// (Phase 2c の `PluginParamTouchedFromChild` は begin のみ送るので
-    /// end の IPC 追加は Step B follow-up)。 session-only / Undo 対象外。
-    /// Step C で audio thread はこの set を読んで該当 lane の curve eval
-    /// を bypass する。 `latched_param_gestures` (= Latch mode 用に保持する
-    /// "1 度触れた parameter") と組み合わせて、 Read/Touch/Latch/Write の
-    /// 4 mode の挙動差を audio thread 側で実現する。
-    pub active_param_gestures:
-        std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    /// Phase 4 Step C (`docs/plan_automation.md` §6): `Latch` / `Write` mode
-    /// で「再生中に 1 度でも触れた parameter」 を transport stop まで保持する
-    /// set。 `ParamGestureBegin` が `is_playing == true` 中に発火すると
-    /// 即時 insert され、 `stop()` で clear される。 `Touch` mode では使われ
-    /// ない (= active_param_gestures だけが「現在 recording 中」 を意味する)。
-    /// audio thread への通知は active ∪ latched の和集合を毎 tick 送る (Step
-    /// C-2 で IPC `SetRecordingLanes` が landing したら lock-free 化、 当面
-    /// は per-tick LoadSong で済ます)。 session-only / Undo 対象外。
-    pub latched_param_gestures:
-        std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    /// Phase 4 Step C: parameter ごとの「直近 record した beat」 を保持する
-    /// throttle 用 map。 audio bridge tick は ~60Hz、 BPM=120 で 1/64 beat
-    /// は ~31ms。 同 tick 内で同じ playhead に何度も point insert しない
-    /// よう、 `playhead - last_beat >= 1/64` のときだけ insert する。
-    /// `stop()` で clear。 session-only / Undo 対象外。
-    pub recording_last_beat:
-        std::collections::HashMap<(u32, common::model::AutomationTarget), f64>,
-    /// Phase 4 Step C-2: 直近 `MainToChild::SetRecordingLanes` で audio thread
-    /// に送った recording lane set のスナップショット。 GUI の currently
-    /// recording set (= active ∪ latched, mode 依存) と diff を取って、 変化
-    /// したときだけ IPC を送信する。 LoadSong は set が「縮んだ」 (= 1 度
-    /// recording 終了した lane が出た) ときに送る (= audio thread が curve
-    /// eval に戻るときに最新 points を読ませる)。 session-only / Undo 対象外。
-    pub last_sent_recording_lanes:
-        std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    /// Phase 4 Step C-3 (`docs/plan_automation.md` §6): plugin GUI で knob 値が
-    /// 変更されるたびに `PluginParamValueChangedFromChild` で受け取る最新値の
-    /// cache。 `(track_id, slot, param_id) -> plain value`。 audio bridge tick
-    /// で `current_plain_value(PluginParam)` がここから plain 値を引いて
-    /// `AutomationPoint` を生成する。 session-only / Undo 対象外。 plugin
-    /// reload で古い entry が残るが、 lane.target も同 plugin_id を持つので
-    /// stale 値が誤って record されるリスクは低い (= 念のため Step C-3
-    /// follow-up で plugin unload 時に該当 entry を消す)。
-    pub plugin_param_values: std::collections::HashMap<
-        (u32, u32, u32),
-        f64,
-    >,
-    /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
-    /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
-    /// くるたびに上書き。 `(track_id, slot)` で identify、 Parameter
-    /// Picker (Phase 3+) / lane の label 解決 / norm↔plain 変換に
-    /// 使う。 session-only (save 対象外、 plugin reload で再取得)。
-    pub plugin_params: std::collections::HashMap<
-        (u32, u32),
-        Vec<common::protocol::PluginParamInfo>,
-    >,
-    /// `(track_id, slot)` ごとに plugin が埋め込み GUI (editor window)
-    /// を持つか (`PluginParamList` で host が `gui_is_embed_supported` を通知)。
-    /// チェーン行のボタン分岐に使う: GUI あり = 「GUI」 で window を開く、 なし =
-    /// 「⚙」 でインライン param パネルをトグル。 plugin_params と同じ寿命・同じ箇所
-    /// (insert / reorder / remove / clear) で維持する。
-    pub slot_has_gui: std::collections::HashMap<(u32, u32), bool>,
-    /// gui_01 #031 (M14 Phase 63n-6): track ごとの row 高さ override。
-    /// `Some(px)` で個別 track 高さ、`None` (= map に entry なし) で
-    /// global default `arrange_track_row_h` を使う。 widget の Alt+drag
-    /// or 下端 splitter drag で `SetSingleTrackRowH` 発火 → ここに反映。
-    /// Alt+wheel は引き続き global を変える (`SetTrackRowH`)。
-    /// session-only (= save / Undo 対象外、 必要になったら `Track.row_h`
-    /// として model 化する)。
-    pub track_row_overrides: std::collections::HashMap<u32, u16>,
-    /// `track_id → 現在ロード済の plugin_id 列`。 plugin_host から
-    /// `SlotPluginLoaded` を受信したときに register、 `SlotPluginUnloaded`
-    /// で drain。 `RemoveTrack` を plugin_host に送る前に audio engine
-    /// に直接 `ClosePluginShmem` を発射して plugin_refs / slot_to_plugin_id
-    /// を空にし、 plugin destroy 中の use-after-free (`pd.prepare()` で
-    /// unmapped shmem を踏む → audio worker が AV で silent terminate
-    /// → all_done 永久 wait) を防ぐ。 daw_gui が plugin_id を保持する
-    /// ための単一 source of truth。
-    pub track_plugin_ids: std::collections::HashMap<u32, Vec<u32>>,
-    /// `(track_id, device_index)` → 現在 plugin_host に load されている
-    /// plugin の情報。 Undo/Redo の reconcile (`reconcile_plugins_with_song`)
-    /// で「Song の各 device の plugin が host 側と一致しているか」 を device
-    /// 粒度で diff するために使う。 [`Self::track_plugin_ids`] が track
-    /// 単位の plugin_id 集合だけを持つのに対し、 こちらは device ごとの
-    /// 詳細 (どの index にどの plugin string id) まで track する。
-    ///
-    /// 更新タイミング: `SlotPluginLoaded` 受信時に insert、
-    /// `SlotPluginUnloaded` 受信時に reverse-lookup retain、
-    /// 削除系編集の `_inner` 関数内で track / device index 単位で remove。
-    pub loaded_slots: std::collections::HashMap<(u32, u32), LoadedSlotInfo>,
-    /// PR3.3 PDC: `plugin_id → reported latency samples`。 plugin_host から
-    /// `ChildToMain::PluginLatencyChanged` を受信して更新、
-    /// `SlotPluginUnloaded` で drop。 各 track の累積 latency は
-    /// `track_plugin_ids[track_id].iter().map(|pid| plugin_latencies[pid]).sum()`
-    /// で計算して `Track::reported_latency_samples` に書く。 これが
-    /// `LoadSong` で daw_audio に渡って `compile_schedule` の PDC 補償に
-    /// 反映される (chain 内の plugin が直列に latency を加算する Ardour 流)。
-    pub plugin_latencies: std::collections::HashMap<u32, u32>,
-    /// 選択 anchor (= 末尾)。 stable `ClipKey` (track_id + clip_id) 保持で
-    /// 並べ替え / undo を跨いでも壊れない。 index 解決は `selected_clip_ref()`。
-    pub selected_clip: Option<common::model::ClipKey>,
-    /// 選択集合。 stable `ClipKey` 保持。 index 解決は `selected_clip_refs()`。
-    pub selected_clips: Vec<common::model::ClipKey>,
-    pub selected_notes: Vec<u32>,
-    /// gui_01 #068: 前フレームに arrangement でホバーされた clip の
-    /// `content_id` (= 連動ハイライトの active group 計算に使う held-value)。
-    /// widget の `ArrangementResponse.hovered_clip` を毎フレーム解決して
-    /// 保持する。 session-only。
-    pub arrange_hover_content: Option<common::model::ContentId>,
-    /// gui_01 #090: ポインタが今乗っている automation lane の key
-    /// (`ArrangementResponse.hovered_automation_lane` を毎フレーム mirror)。
-    /// Ctrl+A の「lane の全ポイント選択 → 全クリップへ段階拡大」振り分けに
-    /// 使う。 `None` = clip 領域 / lane 外。 1 フレーム遅延だが pointer は
-    /// 瞬間移動しないので実用上問題なし (= `arrange_hover_content` と同 idiom)。
-    pub arrange_hovered_automation_lane: Option<common::model::AutomationLaneKey>,
-    /// arrangement ヘッダのトラック音量スライダを drag 中のトラック id
-    /// (`ArrangementResponse.dragging_track_volume` を前フレーム値として mirror)。
-    /// None↔Some の edge で `ParamGestureBegin`/`End` を発火し、 mixer フェーダーと
-    /// 同じ「1 drag = 1 undo step」 経路 (gesture begin で 1 snapshot) に乗せる。
-    /// session-only (`arrange_hover_content` と同 idiom)。
-    pub arrange_dragging_track_volume: Option<u32>,
-    /// レーンヘッダの default value scrubable がドラッグ / テキスト編集中の
-    /// lane (`Some` の間 1 つだけ)。`inspector_scrub_active` と同 idiom で、 active 立ち上がり
-    /// で `BeginInspectorScrub` (= Song snapshot)、 立ち下がりで `EndInspectorScrub` を発火し、
-    /// 一連の `SetLaneDefault` を undo 1 step に bracket する。session-only。
-    pub arrange_default_scrub_active: Option<common::model::AutomationLaneKey>,
-    /// 鍵盤レーン click のプレビュー発音中の `(track_id, pitch)` (gui_01 #055,
-    /// `docs/plan_pianoroll_keyboard_preview.md`)。 widget の
-    /// `PianoRollResponse::keyboard_active_pitch` を前フレーム値と差分して
-    /// note-on/off を導出するための held-value。 押下開始した track id を pitch
-    /// と一緒に持つことで、 note-off を必ず note-on と同じ track へ送る
-    /// (glissando / release で stuck note を防ぐ)。 `None` で発音なし。
-    /// session-only (project save には含めない)。
-    pub preview_note: Option<(u32, u8)>,
-
-    // -------- View state --------
-    pub bottom_panel: u8,
-    /// piano_roll widget が歌詞 inline 編集 (gui_01 #017、 note 上の L キー編集) の
-    /// text_input overlay を出している間 `true`。 widget 内部状態 (`PianoRollState`) の
-    /// session-only ミラーで、 `piano_roll_view::draw` が毎フレーム `resp.lyric_editing`
-    /// から更新する (project save には含めない)。
-    ///
-    /// 用途は root.rs の Esc dispatch との調停。 `dispatch_shortcuts` は
-    /// piano_roll widget より前に走って `take_shortcut("escape")` を消費するため、
-    /// このミラーが立っている間は Esc を消費せず widget に委ねる (widget 側が歌詞編集を
-    /// キャンセルする)。 ミラーは 1 frame 遅延だが、 編集モードは L 押下〜Esc 押下まで
-    /// 複数フレーム持続するので調停に支障はない。
-    pub piano_roll_lyric_editing: bool,
-    /// `Some(target)` で Audio Editor (= clip ダブルクリックで開く波形
-    /// 編集 view) が開いている。 bottom_panel の Piano Roll タブが
-    /// audio_editor view に切り替わる (`docs/plan_audio_clip.md` §3.10
-    /// 「piano_roll の領域を流用」)。 `None` なら通常の Piano Roll が
-    /// 表示される。 audio clip ダブルクリックで `Some` 化、 Esc / Audio
-    /// Editor close で `None` に戻る。
-    pub audio_editor_clip: Option<ClipRef>,
-    /// Audio Editor で選択中の event index 群 (`audio_editor_clip` の clip
-    /// 内 events Vec への index)。 複数選択対応: click = 単一、 Shift+click =
-    /// トグル、 空き領域 drag = 矩形選択、 Ctrl+A = 全選択。 空 Vec で
-    /// 「未選択」。 anchor (= Inspector / footer / nav の代表) は last()
-    /// (= `audio_editor_anchor_event`)。 編集 (gain/pan/fade 等) は選択集合
-    /// 全体に broadcast (`audio_event_target_indices`)。 close で clear、
-    /// undo でも clear (index は容易にずれるため、 ノート選択と同方針)。
-    pub audio_editor_selected_events: Vec<usize>,
-    /// Audio Editor 内のマウス hover 位置を clip 内 beat (clip 始端 = 0)
-    /// に変換した値。 audio_editor.rs が毎フレーム push、 マウスが
-    /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
-    /// 系操作で「マウス位置を cursor として使う」 ために保持する。
-    pub audio_editor_hover_beat_in_clip: Option<f64>,
-    /// (B13 r.md #8) Audio Editor の波形 縦 gain (振幅表示の拡大率)。 Alt+wheel で
-    /// 増減。 session-only (描画スケールのみ、 model / 音声には非影響)。
-    pub audio_editor_vertical_gain: f32,
-    /// Audio Editor の表示状態を **クリップごと** (`ClipKey`) に記憶する
-    /// (Ableton Live / Bitwig 流)。 entry が無い (= 初回) クリップは
-    /// `open_audio_editor` がクリップ全長を見せる初期 view を入れる。 値域は
-    /// `audio_editor_view_state` / `set_audio_editor_*` 経由で読み書きし、 描画前に
-    /// clip 長で clamp する。 `ViewState.audio_editor_views` として永続化される。
-    pub audio_editor_views:
-        std::collections::HashMap<common::model::ClipKey, common::model::AudioEditorViewState>,
-    pub arrange_zoom_x: f32,
-    pub arrange_scroll_beat: f32,
-    /// 再生中プレイヘッド追従スクロールの方式 (Off / Scroll / Page、 `Alt+F` で循環)。
-    /// `ViewState` でプロジェクト単位に保存 (snap 設定と同じ idiom)。 再生中に
-    /// ユーザーが手動で横スクロール / ズームすると `Off` に落ちる (ユーザー選択)。
-    /// `on_tick` が再生中のみこの mode に応じて `arrange_scroll_beat` を更新する。
-    pub arrange_follow: common::model::FollowMode,
-    /// arrangement の縦 scroll offset (px、 smooth)。 `0.0` で first track
-    /// が lanes 上端、 wheel scroll で増減。 widget 側で `SetTrackTop` を
-    /// 発火するので handler がここに書き込む。 overscroll (lanes 領域
-    /// 外への描画) の scissor は widget 側 (gui_01 #048) の責務。
-    pub arrange_track_top: f32,
-    /// arrangement の 1 track row 高さ (px)。Alt+wheel で 16..96 に縦ズーム。
-    /// default は `ARRANGE_TRACK_HEIGHT`。
-    pub arrange_track_row_h: f32,
-    /// `Z` キーの段階ズーム履歴。 1 回目 push で横ズーム前の view、
-    /// 2 回目 push で縦ズーム前の view を積む。 `X` が pop して 1 段ずつ戻し、
-    /// 空になったら全体フィットに落ちる。 load / new / recovery で clear。
-    pub(crate) arrange_zoom_history: Vec<ArrangeViewSnapshot>,
-    /// `Z` 段階ズームの現在アンカー (直近 Z が適用した選択 + view + 段数)。
-    /// 次の Z で選択 or view が食い違えば段階 0 (横) から仕切り直す。 session-only。
-    pub(crate) arrange_zoom_anchor: Option<ArrangeZoomAnchor>,
-    /// automation lane の行高 session override (= `Z` 縦ズームで選択
-    /// automation clip のレーンを画面いっぱいに拡大した一時値。 model の
-    /// `AutomationLane.height_px` は保存対象なので汚さず、 これで上書き表示する)。
-    /// 該当 lane の splitter resize (`set_lane_height`) と `X` (zoom back) で解除。
-    /// `track_row_overrides` の lane 版。 session-only (save / Undo 対象外)。
-    pub automation_lane_row_overrides:
-        std::collections::HashMap<common::model::AutomationLaneKey, u16>,
-    /// primary 選択 automation clip のレーンの「実描画 content-Y 上端」
-    /// (= scroll 空間の絶対 y、 `arrange_track_top` をこれにすればレーンが viewport
-    /// 上端に来る)。 arrangement view が毎フレーム widget の実 `automation_lane_rects`
-    /// から算出してここに格納し、 `Z` 縦ズームがレイアウトを複製せず参照する。
-    /// 選択 automation clip 無し / レーンが画面外なら `None`。 session-only。
-    pub arrange_primary_lane_content_top:
-        Option<(common::model::AutomationLaneKey, f32)>,
-    /// arrangement の track header 幅 (px、 default 160.0)。 header と
-    /// lanes の境界 (右端 splitter) drag で gui_01 arrangement widget が
-    /// `SetHeaderW` を発火 → `SetArrangeHeaderW` 経由でここを更新する。 widget は
-    /// 毎フレーム `view.header_w` としてこの値を読む。 session-only (= save /
-    /// Undo 対象外、 `arrange_track_row_h` と同じ扱い)。
-    pub arrange_header_w: f32,
-    /// inspector の param セクション (title 下〜chain 上) の実描画高さ
-    /// (px)。 immediate-mode なので「前フレームに測った高さ」を `scroll_area` の
-    /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。
-    /// session-only (save / Undo 対象外)。
-    pub inspector_body_h: f32,
-    /// チェーン行アコーディオンで開いているデバイスの param パネル実高さ
-    /// (px、 前フレーム測定値)。 `reorderable_list_expandable` の `row_extra_h` に渡して
-    /// 開いた行の直下に確保する展開高に使う (lag-by-one、 `inspector_body_h` と同 idiom)。
-    /// session-only。
-    pub inspector_device_panel_h: f32,
-    /// ピアノロールの表示状態を **クリップごと** (`ClipKey`) に記憶する
-    /// (Ableton Live / Bitwig 流)。 旧来のフラットな `pianoroll_zoom_x` 等は撤去し、
-    /// `selected_clip` (= 現在ピアノロールで開いているクリップの `ClipKey`) で引く
-    /// accessor (`pianoroll_zoom_x()` / `pianoroll_zoom_y()` / `pianoroll_top_pitch()` /
-    /// `pianoroll_scroll_beat()`) に一本化した (= 重複所有を作らない、 SSoT)。 entry が
-    /// 無い (= 初回選択) クリップは `select_clip` が `fit_piano_roll_to_clip` で埋める。
-    /// `ViewState.piano_roll_views` として永続化される。
-    pub piano_roll_views:
-        std::collections::HashMap<common::model::ClipKey, common::model::PianoRollViewState>,
-    /// **複数クリップ同時表示**中の共有 viewport (song-absolute scroll)。
-    /// 単一表示は per-clip 永続 `piano_roll_views` を使うが、複数表示は表示クリップ集合に
-    /// 依存する 1 つの transient viewport を使う (非永続)。`multi_clip_view_key` と組で持ち、
-    /// 表示クリップ集合が変わったら union bbox に再 fit する。
-    pub multi_clip_view: common::model::PianoRollViewState,
-    /// `multi_clip_view` がどの表示クリップ集合 (`shown_pianoroll_clips` の
-    /// `ClipKey` 列) に対して fit 済かを記録。draw でこれと現在の集合が違えば再 fit。
-    pub multi_clip_view_key: Vec<common::model::ClipKey>,
-    /// ピアノロールで「ロック (参照専用)」にした **トラック** (track id)。lock された
-    /// トラックの (表示中) note は淡色ゴーストで描画され、hit-test / 選択 / 編集から除外される。
-    /// 凡例がトラック単位なのでロックもトラック単位 (そのトラックの表示クリップ全部に効く)。
-    /// session 内 transient (非永続)。legend のロックトグルで増減。
-    pub locked_pr_tracks: std::collections::HashSet<u32>,
-    /// FL Studio の smart length 互換: 直近に作成 / リサイズ / クリック選択した
-    /// ノートの長さ (拍)。次の新規追加時のデフォルト長として使う。session 内
-    /// in-memory のみ、永続化はしない。`add_note` / `resize_notes` /
-    /// `SetNoteSelection` ハンドラで更新。
-    pub last_note_duration_beats: f64,
-
-    // -------- Grid snap state --------
-    /// piano_roll の Snap on/off (Snap toggle / `G` キー)。
-    pub pianoroll_snap_enabled: bool,
-    /// `view::snap::SNAP_LABELS` の index。`view::snap::choice_to_mode` で SnapMode に変換。
-    pub pianoroll_snap_choice: u8,
-    pub arrange_snap_enabled: bool,
-    pub arrange_snap_choice: u8,
-    /// auto-fit (`X` キー / `Fit` ボタン / SelectClip 経由) で参照する piano_roll
-    /// grid 領域サイズ (px)。`view::root` / `view::bottom_panel` が piano_roll タブ
-    /// 描画時に毎フレーム書き込む。0 は「未測定」フラグ扱い (auto-fit を skip)。
-    pub last_pianoroll_grid_size: (f32, f32),
-    /// piano_roll がまだ一度も描画されていない (= `last_pianoroll_grid_size` 未測定)
-    /// 状態で auto-fit が要求された場合に立つフラグ。 初回描画で grid_size が
-    /// 確定したフレームの Edit 内で消費 → `fit_piano_roll_to_clip` を再実行する。
-    /// これが無いと「Piano Roll タブ未表示で clip を選択 → タブを開いても fit
-    /// されない、 2 回目以降のみ fit」 という初回 fit 喪失バグになる。
-    pub pending_pianoroll_fit: bool,
-    /// 同様に arrangement の lanes 領域サイズ (px)。
-    pub last_arrange_canvas_size: (f32, f32),
-
-    // -------- Playback / metering --------
-    pub is_playing: bool,
-    pub is_looping: bool,
-    pub playhead_beat: Option<f32>,
-    /// Pro Tools 流の「Stop で再生開始位置に戻す」 用、 直前の play()
-    /// 開始時点の playhead を保持。 stop() で playhead_beat に書き戻し
-    /// + SeekTo IPC で audio engine も同位置にリセットする。 None の
-    ///   間 (= まだ一度も play していない or stop 済みで restore 完了) は
-    ///   stop() は何もしない。
-    pub playback_origin_beat: Option<f32>,
-    /// パニックボタンが立てる「遅延 reinit」 の起点時刻。 `Some` の間、
-    /// `on_tick` が [`PANIC_REINIT_DELAY`] 経過で `ReinitAllPlugins` を plugin host
-    /// に送って `None` に戻す。 master の declick フェードアウト完了後に plugin の
-    /// detach を起こすための遅延（段差クリック回避、 [`Self::panic`] 参照）。
-    pub panic_reinit_due: Option<std::time::Instant>,
-    /// パニックの declick が「ミュート解除待ち」 か。 `panic` で `true`、
-    /// `ReinitAllPlugins` の完了通知 `PluginsReinitDone` を受けた時に engine へ
-    /// `PanicRelease` を送って `false` に戻す。 ミュート解除を reinit 完了に結び
-    /// つけるためのフラグ（[`Self::panic`] 参照）。
-    pub panic_release_pending: bool,
-    pub master_gain: f32,
-    pub peak_l_display: f32,
-    pub peak_r_display: f32,
-    pub peak_l_norm: f32,
-    pub peak_r_norm: f32,
-
-    // -------- Resource monitor (r.md #3) --------
-    /// 集計済みリソース指標 (DSP load / system CPU / fps / xrun / mem)。 poller
-    /// (DSP/xrun/buffer) / sysinfo スレッド (CPU/mem) / runner (fps) が別々に
-    /// 更新し、 status bar 常駐メーターと詳細パネルが読む。
-    pub metrics: common::metrics_bridge::ResourceMetrics,
-    /// MetricsBridge ハンドル (per-plugin CPU の直接読み出し用)。 GUI mode のみ
-    /// `Some`、 script / test は `None`。 詳細パネルが `track_plugin_ids` の
-    /// 各 plugin_id について `plugin_dsp_us` を直接読む。
-    pub metrics_bridge: Option<Arc<common::metrics_bridge::MetricsBridgeHandle>>,
-    /// status bar の常駐メーター表示 on/off (app_config.json で永続化)。
-    pub resource_monitor_enabled: bool,
-    /// 詳細パネルが開いているか (session-only、 Esc / 再クリックで閉じる)。
-    pub resource_panel_open: bool,
-
-    // -------- Plugin database / picker --------
-    pub plugin_db: Option<Arc<PluginDatabase>>,
-    pub plugin_picker_entries: Vec<PluginPickEntry>,
-    pub plugin_picker_visible: Vec<PluginPickEntry>,
-    /// プラグインピッカーの検索ボックスに入力中の絞り込みクエリ。
-    /// 1 文字毎に [`AppEvent::SetPluginPickerQuery`] で更新し、
-    /// [`AppData::refresh_picker_visible`] で subsequence マッチに使う。
-    pub plugin_picker_query: String,
-    pub is_plugin_picker_open: bool,
-    /// 検索結果リスト ([`plugin_picker_visible`]) 内のカーソル位置 (0-based)。
-    /// `text_input` focus 中の ↑↓ (gui_01 #057 / Phase 86 `TextInputResponse::nav_up/nav_down`)
-    /// で [`AppEvent::MovePluginPickerCursor`] を発火して移動し、 Enter で
-    /// `plugin_picker_visible.get(cursor)` を確定する。 `refresh_picker_visible` が
-    /// 呼ばれる度 (絞り込み再計算 / モーダル open / rescan 完了) に 0 にリセット。
-    pub plugin_picker_cursor: usize,
-
-    // -------- Font picker (Text クリップのフォント選択) ----------
-    /// `available_font_families()` で列挙したシステムフォント名 (キャッシュ)。
-    /// 初回 open 時に background thread で 1 度だけ読む (~20-860ms)。
-    pub font_picker_families: Vec<String>,
-    /// 検索 + デフォルト行で絞り込んだ表示用リスト。先頭 `""` = renderer
-    /// default (=「デフォルト」行)。
-    pub font_picker_visible: Vec<String>,
-    pub font_picker_query: String,
-    pub font_picker_cursor: usize,
-    pub is_font_picker_open: bool,
-    /// background のフォント列挙が走行中。
-    pub font_picker_loading: bool,
-    /// 編集対象の text クリップ (open 時に anchor から確定)。
-    pub font_picker_target: Option<ClipRef>,
-    /// open 時の元フォント。cancel / commit の undo 復元元。
-    pub font_picker_restore: String,
-
-    /// 「＋ Send」 ボタンで開く宛先トラックピッカーの状態。 `Some` の間
-    /// modal が開いており、 宛先選択 or 閉じる操作で `None` に戻る。
-    /// plugin picker の `is_plugin_picker_open` と同 idiom。
-    pub send_picker: Option<SendPickerState>,
-
-    // -------- Save flow / IPC --------
-    /// `RequestAllStates` を発行した順に保持するキュー。 front が現在 in-flight
-    /// の request、 後続は先行 request の応答後に順次 dispatch される。 空の
-    /// 間は新規 request を発行するときに即時 `RequestAllStates` を送る。
-    /// 詳細は [`PendingStateRequest`] / [`DeferredEdit`]。
-    pub pending_state_queue: VecDeque<PendingStateRequest>,
-    /// いま in-flight な `RequestAllStates` (plugin-state round-trip) を
-    /// 送った時刻。 `dispatch_front_state_request` が送信の瞬間に `Some(now)` を立て、
-    /// `on_all_states_from_child` で応答が来たら `None` に戻す (後続 request が
-    /// あれば dispatch が再武装する)。 plugin host が crash でなく **hang** した
-    /// (プロセス・パイプは生存のまま `state_save` 等で停止) 場合は
-    /// `ChildDisconnected` も発火せず `AllStatesReceived` が永久に来ないので、
-    /// `pending_state_queue` が drain せず保存 / New / Open / Open Recent / 終了(✕)
-    /// が恒久ロックする (#63 のダーティーガードが round-trip 完了を待つため)。
-    /// `on_tick` の watchdog がこの時刻からの無応答経過を見て round-trip を破棄し、
-    /// 脱出口を作る (export watchdog と同型)。 `None` = round-trip 非進行。
-    state_request_sent_at: Option<std::time::Instant>,
-    pub audio_tx: Option<UnboundedSender<MainToChild>>,
-    pub plugin_tx: Option<UnboundedSender<MainToChild>>,
-    /// 子プロセス自動再起動 supervisor (`bootstrap::ChildSupervisor`)。
-    /// production (GUI mode) では `Some`、 script / test 経路では `None`。
-    /// `ChildDisconnected` event 受信時に `respawn(kind)` で新 child を
-    /// spawn + handshake + Session/OpenWorkerPool 再送し、 新 tx で
-    /// `audio_tx` / `plugin_tx` を差し替える。
-    pub supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
-    /// (A1 r.md #8) オーディオセッションの実サンプルレート (= daw_audio が報告した
-    /// デバイス実レート、 `bootstrap.sample_rate`)。 拍↔sample 変換 (seek / export
-    /// range / clip 尺) はこの値を使い、 engine と一致させる。 session-only。
-    pub sample_rate: u32,
-    /// 直近の child 切断時刻 (kind 別)。短時間に閾値以上切断したら crash-loop と
-    /// 判断して自動 respawn を止める (= 落ちるプラグインを抱えたプロジェクトで
-    /// respawn→reload→再 crash の無限ループに陥り GUI が固まるのを防ぐ)。session-only。
-    pub child_disconnect_log: Vec<(common::protocol::ChildKind, std::time::Instant)>,
-
-    /// Phase 2 PR-C: plugin-FX bounce が進行中なら `Some`。 `None` で
-    /// 新規 bounce を受け付ける。 同時 1 件のみ。 `MainToChild::
-    /// BounceClipFxOnline` 発火時に `Some` 化、 `ChildToMain::
-    /// BounceClipFxComplete` 受信で `None` に戻す + 新 track / 新 clip
-    /// 配置。 path / source_track / source_clip は IPC echo back と
-    /// pending entry を identifier 照合するために保持。
-    pub pending_clip_fx_bounce: Option<PendingClipFxBounce>,
-    /// 歌唱クリップ bounce の合成待ち。`PrepareVocalSynth` を送って
-    /// `VocalSynthReady` を待つ間 stable id を退避し、 ready 受信で現在位置へ
-    /// 解決して `start_clip_bounce` を呼ぶ。歌唱以外の bounce では使わない。
-    pub pending_vocal_synth_bounce: Option<PendingVocalSynthBounce>,
-    /// which (track, slot) plugin editors are currently open. The
-    /// editor *windows* are now created and owned by the plugin-host process
-    /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
-    /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
-    /// it's a plain id set — the window FFI lives in the plugin-host process.
-    pub open_plugin_guis: std::collections::HashSet<(u32, u32)>,
-    /// 内蔵映像 FX は plugin window を持たないので、チェーン行の "GUI"
-    /// ボタンはインスペクタ内のパラメータ調整パネルを開く。`Some((track_id, device_index))`
-    /// で 1 つだけ開く（別の FX の GUI を押すと切り替わる）。cursor track 以外に切り替えたら閉じる。
-    pub open_video_fx_params: Option<(u32, u32)>,
-    /// 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
-    /// CLAP・VST3) の「⚙」ボタンで開くインライン param パネル。 `open_video_fx_params`
-    /// と同 idiom: `Some((track_id, device_index))` で 1 つだけ、 cursor track 以外
-    /// では非表示、 device 削除で同トラックなら閉じる。
-    pub open_plugin_params: Option<(u32, u32)>,
-
-    // -------- Mixer --------
-    pub track_peak_display: Vec<(f32, f32)>,
-    /// docs/plan_modulation.md §4.2: latest envelope-follower scalars from the
-    /// audio engine, indexed by `ModSource` position in `Song::mod_sources`.
-    /// Refreshed each ~30Hz `ModScalarsTick`; read by the compose paths via
-    /// `mod_scalar_for_source` when applying modulation to params.
-    pub mod_scalars: Vec<f32>,
-
-    // -------- Plugin load tracking (A7 race-condition fix) -----------
-    /// `(track, device_index)` pairs we've sent `SetSlotPlugin` for but
-    /// haven't yet received `SlotPluginLoaded` back. While non-empty, Play
-    /// is queued so the audio engine doesn't dispatch silent buffers for
-    /// tracks whose plugins are still being loaded.
-    pub pending_plugin_loads: std::collections::HashSet<(u32, u32)>,
-    /// ユーザーが plugin picker で手動追加した plugin の集合 (値 = GUI 自動 open
-    /// するか)。load 完了 (`on_plugin_loaded_from_child`) で consume し、(1) daw_audio
-    /// へ `LoadSong` を再送して新 plugin を signal path に入れ (Shift 追加でも必須)、
-    /// (2) 値が true なら GUI 自動 open を `gui_open_requests` に queue する。
-    /// `select_plugin_from_db` で (track_id, device_index) を積む。
-    /// プロジェクト読込時の一斉復元では積まれない (= project-open 時の初回 LoadSong が
-    /// 全 chain を渡すので per-plugin の再 sync は不要、 GUI も自動 open しない)。
-    pending_added_plugin_finalize: std::collections::HashMap<(u32, u32), bool>,
-    /// load 完了して「いま開く」段になった GUI auto-open 要求の queue。runner の
-    /// frame loop が `drain_pending_gui_opens` で消費し `open_slot_gui` を呼ぶ。
-    /// handle_event (IPC 受信) から直接 window を作らず frame loop へ 1 フレーム
-    /// 遅延させる seam (headless test は frame loop を回さない → window を作らない)。
-    gui_open_requests: Vec<(u32, u32)>,
-    /// `play()` was called while `pending_plugin_loads` was non-empty;
-    /// re-fire it once the last `SlotPluginLoaded` arrives.
-    pub pending_play: bool,
-
-    // -------- Background workers --------
-    pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
-    /// プロジェクトロード時の audio / image background decode の staging。
-    /// `Some` の間は streaming load 進行中 (= 再生 gate + 進捗 overlay 表示)。
-    /// `begin_asset_decode` で `Some`、 全件取り込みで `None`。
-    pub asset_decode: Option<Arc<Mutex<AssetDecodeStaging>>>,
-    /// 進捗 overlay 用 (done, total)。 draw で Mutex を取らずに済むよう
-    /// `on_asset_decode_tick` がプレーン値で更新する。 `None` = 非表示。
-    pub load_progress: Option<(usize, usize)>,
-    /// 進捗 overlay のラベル (ロード / 走査で文言が違う)。`load_progress` が
-    /// `Some` のときだけ使われる。
-    pub load_progress_label: &'static str,
-    /// VOICEVOX engine `/singers` の結果。 起動時に background thread が
-    /// `AppEvent::SingersLoaded` で投入する。 engine 未起動 / fetch 失敗時は
-    /// 空のまま (Clip Inspector の声 dropdown は焼き込み声名 + 「取得中…」表示)。
-    /// Clip Inspector の 2 段 dropdown (キャラ→style) が直接読む。
-    pub singers: Vec<common::voicevox::VoiceVoxSinger>,
-    /// (talk) VOICEVOX engine `/speakers` の結果 (`docs/plan_voicevox_talk.md` §4)。
-    /// Text clip の talk 声 dropdown (キャラ→talk style) が直接読む。sing の `singers`
-    /// (= `/singers`) とは別 id 空間。engine 起動時に background thread が
-    /// `AppEvent::SpeakersLoaded` で投入。未取得なら焼き込み声名 + 「取得中…」表示。
-    pub talk_speakers: Vec<common::voicevox::VoiceVoxSinger>,
-    /// VOICEVOX engine の auto-kill 用 Job dispatcher。
-    /// production は `Win32JobDispatcher` (`JobHandle::assign_std` ラップ)、
-    /// test は `NoopJobDispatcher`。 trait DI により AppData::new の
-    /// 引数は OS-API 抽象だけで完結する。
-    pub voicevox_job: Arc<dyn JobDispatcher>,
-    /// VOICEVOX engine 起動を 1 度だけ trigger するためのフラグ。 lazy 起動:
-    /// 起動時 auto-launch せず、 Vocal track 選択 / Synth ボタン押下等で初めて
-    /// `ensure_voicevox_engine()` が `true` にして background spawn する。
-    pub voicevox_launch_attempted: bool,
-    /// 口パク (lip-sync) 自動再生成の debounce 用世代カウンタ。song 変更で
-    /// bump し、`mark_lipsync_dirty` が timer thread に値を渡す。timer 発火時に
-    /// 値が一致していれば (= それ以降変更なし) 再生成する (rapid 編集を coalesce)。
-    pub lipsync_gen: u64,
-    /// 口パク (lip-sync) 背景生成が in-flight な出力先 (口 track id) の集合。
-    /// `regenerate_lipsync_for_track` の spawn 時に insert、`LipsyncGenerated` 受信で remove。
-    /// クリップ上スピナー / 全体オーバーレイ「口パク生成中」の駆動に使う (派生 UI 状態、非保存)。
-    pub lipsync_inflight: std::collections::HashSet<u32>,
-    /// 口パク再生成の入力 fingerprint。target (口) track id → 最後に再生成を
-    /// 発注した時点の入力ハッシュ (`lipsync_input_fingerprint`)。`LipsyncDebounceFired`
-    /// で現在値と比較し、入力 (notes / 歌詞 / bpm / mouth_map / binding / clip 位置) が
-    /// 変わった target だけ再生成する。track rename / 色 / mute / volume 等、口パク
-    /// 出力に無関係な編集では fingerprint が変わらず再生成をスキップする (派生状態、非保存)。
-    pub lipsync_fingerprints: std::collections::HashMap<u32, u64>,
-    /// builtin VOICEVOX (歌唱/読み上げ) 合成の per-plugin 状態。key = host plugin_id。
-    /// `VoicevoxSynthStatus` IPC で更新。`busy` = 合成中、`failing_since = Some` は直近 HTTP が
-    /// 失敗中 (= engine 未起動/起動途中)。一定時間 (= `VOICEVOX_ENGINE_WARNING`) 続いたら
-    /// engine 未接続警告へ切り替える。plugin unload (`SlotPluginUnloadedFromChild`) で entry を消す。
-    pub voicevox_synth_status: std::collections::HashMap<u32, VocalSynthStatus>,
-    /// スピナー回転位相の基準時刻 (construction で固定、単調増加)。
-    pub anim_epoch: std::time::Instant,
-    /// 現フレームの時刻。`render_frame` 冒頭で 1 度設定し、その frame の
-    /// overlay / clip スピナー / engine 未接続判定がすべて**同じ時刻**を読むことで、
-    /// 「スピナー描画」と「再描画を続けるか (`voicevox_animating`)」の判定が 5s 境界で
-    /// 食い違わないようにする (= 警告へ切り替わる frame を確実に 1 枚描く)。
-    pub frame_now: std::time::Instant,
-    pub is_rescanning: bool,
-    pub status_message: String,
-
-    /// rename 中の track の **安定 ID** (positional index ではない)。 index で持つと
-    /// track の reorder / delete で別 track に rename がすり替わる SSoT 違反になる
-    /// (2026-06-09 の「最上段だけ rename できない / フリーズ」バグの原因)。 None で非 rename。
-    pub track_rename_id: Option<u32>,
-    pub track_rename_text: String,
-
-    /// 編集中の clip rename。 `Some` のとき該当 clip rect に inline
-    /// text_input を重ね描きする (track rename の clip 版)。 `ClipRef` は
-    /// index ベースなので rename mode 中の track/clip reorder は track
-    /// rename と同様に想定しない。
-    pub clip_rename: Option<ClipRef>,
-    pub clip_rename_text: String,
-
-    /// v18 (`docs/plan_track_clip_color.md`): color_picker (gui_01 #058) の
-    /// 開いている編集対象。`None` で非表示。`open_color_picker` で `Some` に、
-    /// picker の `dismissed` で `None` に戻す。
-    pub color_picker_target: Option<ColorPickerTarget>,
-    /// color_picker overlay の anchor 矩形 (popup を出す基準位置)。開いた場所
-    /// (右クリックした header / clip rect、inspector のスウォッチ rect) を保持し、
-    /// どの view から開いても同じ位置に popup が出るようにする。
-    pub color_picker_anchor: Option<daw_ui_renderer::Rect>,
-    /// color_picker session 中に既に undo snapshot を取ったか。`open_color_picker`
-    /// で `false` にリセットし、最初の色変更 (`SetTrackColor`/`SetClipColor`) で
-    /// 1 度だけ snapshot を取って `true` にする。これで「drag 開始〜終了」 が
-    /// 1 undo step にまとまり、 変更しないまま閉じても dead step が増えない。
-    pub color_picker_session_dirty: bool,
-
-    /// gui_01 #071: 空きレーン右クリック (`ArrangementEditRequest::SecondaryClickEmpty`)
-    /// で開く clip 生成コンテキストメニューの stash。`Some((track_id, snap 済み beat,
-    /// 右クリック viewport pos))` の間、毎フレーム `ui.context_menu_at` で `pos` に
-    /// メニューを描画する (color_picker overlay と同 idiom)。on_select (= Text クリップ
-    /// 生成) で `None` に戻す。
-    pub clip_create_menu: Option<(u32, f64, (f32, f32))>,
-    /// 上記メニューの 1-shot open trigger。`SecondaryClickEmpty` 受信 Edit で `true` に
-    /// し、overlay が `open_at = Some(pos)` を 1 フレームだけ渡したら `false` に戻す
-    /// (毎フレーム `Some` を渡すと outside-click で閉じても翌フレーム再 open するため)。
-    pub clip_create_menu_open: bool,
-
-    /// Arranger セクション帯の右クリックメニュー stash `(section_id, 右クリック pos)`。
-    /// `SecondaryClickSection` 受信で set、 overlay が pos にメニュー (ループ / 帯削除 /
-    /// 範囲削除) を描画、 on_select で `None` に戻す (`clip_create_menu` と同 idiom)。
-    pub section_menu: Option<(u32, (f32, f32))>,
-    /// 上記セクションメニューの 1-shot open trigger (`clip_create_menu_open` と同 idiom)。
-    pub section_menu_open: bool,
-    /// inline 改名中のセクション id (`track_rename_id` の section 版)。`Some` の間、
-    /// arrangement view が該当帯 rect に text_input を重ねる。
-    pub section_rename_id: Option<u32>,
-    /// 上記改名の編集中文字列。
-    pub section_rename_text: String,
-
-    /// Transport BPM 入力欄の編集中文字列。 commit (Enter) で parse + clamp +
-    /// `song.bpm` に反映、 song を切り替える際 (open / new / undo / redo) は
-    /// `resync_song_edit_texts` で formatted な現値に書き戻す。
-    pub bpm_edit_text: String,
-    /// Transport time_sig numerator 入力欄の編集中文字列。 同上。
-    pub time_sig_num_edit_text: String,
-
-    // ---- Audio event 数値 field 編集 buffer (Phase 2 PR2) ---------------
-    /// 現 buffer がどの clip 用にロードされているか。 `selected_clip` が
-    /// 変わったら view 側が `AppEvent::ResyncClipEditBuffers(target)` を
-    /// 発火して `resync_clip_audio_event_edit_buffers` で再生成。 `None`
-    /// は「未ロード」 (= 起動直後 / clip 未選択)。 編集 buffer の中身が
-    /// この target の現値と整合する保証はないが (= ユーザー入力中はズレる)、
-    /// commit / resync で必ず書き戻す。
-    /// audio / image inspector の数値 field は scrubable_number
-    /// (drag + type) 化されたため、 個別の名前付き edit-buffer
-    /// (`clip_gain_db_edit_text` 等 / `clip_image_*_edit_text`) は撤去
-    /// (scrubable が編集状態を自前で内包)。 `clip_edit_buffer_target` は
-    /// content / font_family 文字列 buffer の resync 判定に引き続き使う。
-    pub clip_edit_buffer_target: Option<ClipRef>,
-
-    /// v19 (`docs/plan_tachie_group_transform.md` §5.5): inspector の
-    /// scrubable_number で transform を drag / text 編集中の param。drag・編集の
-    /// 開始/終了 edge を検知して `BeginGroupTransformDrag` / `End` を発火し、
-    /// 一連の操作を undo 1 step に bracket するための tracker（`None` = idle）。
-    pub group_scrub_active: Option<common::model::GroupTransformParam>,
-
-    /// audio / image / text
-    /// inspector の scrubable_number で drag / text 編集中の field。 drag・
-    /// 編集の開始/終了 edge を検知して `BeginInspectorScrub` /
-    /// `EndInspectorScrub` を発火し、 一連の操作を undo 1 step に bracket
-    /// する tracker（`None` = idle）。 group_scrub_active と同 idiom。
-    pub inspector_scrub_active: Option<InspectorScrubField>,
-    /// docs/plan_modulation.md §3: true while an envelope-follower attack /
-    /// release scrub is being dragged. The scrub mutates the value + marks
-    /// dirty each frame but defers the (recompiling) `sync_song_to_plugin_host`
-    /// to the drag-end edge, avoiding a per-frame LoadSong storm.
-    pub mod_follower_scrub_active: bool,
-    /// docs/plan_modulation_routing_redesign.md §6: the `ModSource` currently
-    /// **armed** for assignment (Bitwig 流). `Some(id)` ⇒ every modulatable
-    /// inspector param control shows depth-drag edit mode (`scrubable_number_at`
-    /// の `Modulation::edit`); dragging a control assigns / sets that source's
-    /// depth on the control's target. `None` ⇒ controls show existing routings
-    /// (entries + live tick) but aren't editable. session-only (not persisted).
-    pub armed_mod_source: Option<u32>,
-    /// the set of `ModSource`s whose inspector row is **expanded** to its
-    /// full Bitwig 風グラフィカルエディタ (MSEG curve canvas / Steps grid / LFO·Random
-    /// preview + 全コントロール). **Multi-expand** — 複数同時に開ける (Bitwig 同様)。
-    /// chevron クリックで toggle。 session-only (not persisted)。
-    pub expanded_mod_sources: std::collections::HashSet<u32>,
-    /// The `(track_id, target)` whose per-control modulation depth drag is in
-    /// progress (gui_01 `mod_dragging`), or `None`. Keyed by **track + target**
-    /// (not target alone) because the mixer draws the same target — e.g.
-    /// `TrackBuiltin(Pan)` — on every strip; a target-only key would make all of
-    /// them fight over one flag and fire a host resync every frame during any one
-    /// drag. Each control reacts only to *its own* drag edge, deferring the host
-    /// resync to that control's drag-end. session-only.
-    pub mod_depth_scrub_active: Option<(u32, common::model::AutomationTarget)>,
-
-    /// 進行中 export の現在フェーズ + 進捗 ([`ExportStage`])。音声 freewheel
-    /// (標準 WAV export / video 前段) は daw_audio の `ExportWavProgress`、映像
-    /// render (video 後段) は daw_gui の `ExportProgress` で更新。`None` = export
-    /// 非実行。進捗オーバーレイ表示・入力 gate・再生抑止の単一真実源。
-    pub export_stage: Option<ExportStage>,
-    /// 音声 freewheel フェーズ (`AudioRender`) の最後に進捗が動いた時刻。export
-    /// 開始時と各 `ExportWavProgress` で更新する。`on_tick` の watchdog が、
-    /// daw_audio が（crash でなく）hang して完了通知も進捗も来ない状態を検出して
-    /// overlay を強制解除するために使う（永久ロック防止）。`None` = 音声 render 非実行。
-    pub export_progress_at: Option<std::time::Instant>,
-    /// 実行中 export のキャンセルフラグ。UI の Cancel ボタンで `true` にすると
-    /// render loop が次フレームで中断し出力を破棄する。`None` = export 非実行。
-    pub export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// 1 ステップ video export 中、 音声レンダリング完了待ちの mp4 出力先。
-    /// export ダイアログで mp4 を選ぶ → 音声を temp WAV へ自動レンダリング →
-    /// `ExportWavComplete` でこの mp4 へ video export（+ WAV mux）を開始する。
-    /// `None` = 音声レンダリング待ちでない。
-    pub pending_video_export: Option<std::path::PathBuf>,
-    /// 自動レンダリングした音声 temp WAV。video export 完了後に削除する。
-    pub export_temp_wav: Option<std::path::PathBuf>,
-    /// video export 待ちの **拍** レンジ `(start_beat, end_beat)`。
-    /// `pending_video_export` と対で立ち、 `ExportWavComplete` で video render を
-    /// 始めるときに `RenderConfig::with_range_beats` へ渡す (音声 temp WAV も
-    /// 同じ窓に trim 済みなので A/V が揃う)。 `None` = 全曲。
-    pub pending_video_export_range: Option<(f64, f64)>,
-    /// video export 待ちの出力解像度 `(w, h)` と fps。
-    /// `pending_video_export` と対で立ち、 `ExportWavComplete` で video render を
-    /// 始めるときに `RenderConfig::with_output_resolution` / `with_output_framerate`
-    /// へ渡す per-export override (= export ダイアログで選んだ値。 Song / preview
-    /// には永続しない)。 `None` = video export 待ちでない (= プロジェクト値を使用)。
-    pub pending_video_export_dims: Option<((u32, u32), f32)>,
-    /// a WAV export request held while the plugin host reinitialises
-    /// all plugins (deactivate→activate) for a clean offline cold render. Set by
-    /// [`Self::begin_wav_export`] (which sends `ReinitAllPlugins`); fired
-    /// as `MainToChild::ExportWav` on `AppEvent::PluginsReinitDone`. Tuple is
-    /// `(path, range_frames, write_mod_sidecar)`.
-    pub pending_export: Option<PendingExport>,
-    /// Export WAV / Video のレンジピッカーモーダルの状態。 `Some` の
-    /// 間だけ `export_range_modal` を描画してレンジ確定を待つ。 確定後は元の
-    /// export action (file dialog) を `kind` に応じて起動する。 `None` = 非表示。
-    pub export_range_picker: Option<ExportRangePicker>,
-
-    /// docs/plan_text_overlay.md §4 P5: text inspector の文字列 edit buffer。
-    /// `text` / `font_family` は文字列 field なので text_input のまま
-    /// standalone (= scrubable 化されない)。 Enter / focus 喪失で
-    /// `CommitClipText{Content,FontFamily}Edit` を発火。
-    /// 25 numeric field は scrubable_number 化され、 `clip_text_num_edits`
-    /// HashMap は撤去 (scrubable が編集状態を自前で内包)。
-    pub clip_text_content_edit_text: String,
-    pub clip_text_font_family_edit_text: String,
-
-    pub undo_stack: VecDeque<Song>,
-    pub redo_stack: VecDeque<Song>,
-    /// 最後に save / load / recovery / new した時点の Song 内容 (= dirty 判定の
-    /// SSoT)。 `is_dirty` は本質的に `self.song != self.saved_song` の派生で、
-    /// Undo/Redo で内容がこのベースラインに戻れば自動で clean になり、 タイトルの
-    /// `*` が消える (`recompute_dirty` / `reset_saved_baseline` 参照)。
-    saved_song: Song,
-
-    pub is_help_open: bool,
-
-    /// per-user データディレクトリ (recent / recent_saved / recovery /
-    /// window_state の永続化先) の **Single Source of Truth**。 production は
-    /// `AppDirs::production()` (= `%LOCALAPPDATA%/daw_01/`)、 test は
-    /// `AppDirs::under(tempdir)` か `None`。 `None` は「永続化しない」 を
-    /// 意味し、 実ユーザー状態を汚染しない (= dispatcher と同じ DI パターン)。
-    pub app_dirs: Option<common::app_dirs::AppDirs>,
-    /// 「最近開いたファイル」 (= Open ダイアログ / OpenRecent 経由で読み込んだ
-    /// .daw)。 File メニュー「Open Recent ►」 に表示。 永続化先は
-    /// `app_dirs.recent()` (= `%LOCALAPPDATA%/daw_01/recent.json`)。
-    pub recent_files: common::recent::RecentFiles,
-    /// 「最近保存したファイル」 (= Save / Save As で書き込んだ先)。 File
-    /// メニュー「Recently Saved ►」 に表示。 永続化先は
-    /// `app_dirs.recent_saved()` (= `%LOCALAPPDATA%/daw_01/recent_saved.json`)。
-    /// 開いた履歴と分離して「保存先だけ覚えておく」 UX を提供する。
-    pub recent_saved: common::recent::RecentFiles,
-    /// `recent_files` の filename だけ抽出したキャッシュ。 gui_01 `menu_bar`
-    /// API が label に `&'a str` を要求し、 'a が `Ui` の borrow 寿命
-    /// (= `&AppData` の寿命) と一致するため、 label 文字列も AppData 内に
-    /// 持っておく必要がある。 frame 内で `&app.recent_files_labels[i]` を
-    /// 渡せば lifetime が解決する。 `push_recent` / load 時に更新。
-    pub recent_files_labels: Vec<String>,
-    /// `recent_saved` の filename キャッシュ。 同じ理由。
-    pub recent_saved_labels: Vec<String>,
-
-    pub is_dirty: bool,
-    /// H2 (r.md #8): MIDI-CC → plugin param 等、 1 frame に多数届き得る realtime
-    /// edit の plugin-host 再 sync を **1 frame 1 回に coalesce** するフラグ。 handler
-    /// が立て、 runner が frame ごとに `flush_pending_host_sync` で消費する
-    /// (毎 CC の full LoadSong flood = stutter/dropout を防ぐ)。
-    pub pending_host_sync: bool,
-    pub last_autosave: std::time::Instant,
-    /// Crash-recovery session id (uuid v4)。 起動時に AppData::new で 1 回生成、
-    /// 未保存プロジェクトの autosave file 名 (`<id>.autosave.daw`) と
-    /// `on_shutdown` での cleanup target に使う。
-    pub recovery_session_id: String,
-    /// 起動時 recovery_dir scan + Open 時 sidecar 検出で蓄積される復元候補。
-    /// `recovery_modal` が空でない間 modal を出す。
-    pub recovery_candidates: Vec<PathBuf>,
-    /// `recovery_candidates` を modal に出すかどうか (Dismiss で false)。
-    pub show_recovery_modal: bool,
-    /// 未保存変更がある状態で「現在のプロジェクトを破棄する操作」 (= 終了 /
-    /// New / Open / Open Recent) を行おうとしたとき表示する確認モーダル
-    /// (`dirty_guard_modal`)。 `Some(action)` の間モーダルが開き、 「保存」
-    /// 「保存しない」「キャンセル」 を選ばせる。 保存 / 破棄が済んでから
-    /// `action` を実行する。 `request_guarded_action` で is_dirty なら立てる。
-    /// 旧 `show_close_confirm` (bool, 終了専用) を一般化した。
-    pub dirty_guard: Option<DirtyGuardAction>,
-    /// Runner が毎フレーム監視し、 `true` になったら cleanup して
-    /// event loop を抜ける終了フラグ。 not-dirty close / 「保存せず終了」 /
-    /// 保存完了 (sync or async) のいずれかで立つ。
-    pub should_quit: bool,
-    /// ガードモーダルで「保存して続行」 を選んだが plugin state 取得待ちで
-    /// save が非同期 (`PendingStateRequest::Save`) になっている間
-    /// `Some(action)`。 `on_all_states_from_child` で save が完了
-    /// (is_dirty=false) したら `action` を実行する。 save 試行が終われば
-    /// (= pending Save が消えれば) クリアする (後続の手動 save が誤って
-    /// action を実行しないように)。 旧 `quit_after_save` を一般化。
-    pub guard_after_save: Option<DirtyGuardAction>,
-    /// plugin-state round-trip (`pending_state_queue` の Save /
-    /// Deferred edit / Copy) が in-flight の間にガード操作 (New / Open /
-    /// Open Recent / 終了) が要求されたとき、 queue が drain するまで保留する操作。
-    /// round-trip 完了処理は `self.song` を変更し得る (Deferred edit は track 削除等、
-    /// Save 完了は dirty を下ろす) ので、 その最中に破壊操作を走らせると保存待ちの
-    /// 編集が別 project に誤適用される / clean 判定が陳腐化する。 queue 完了時に
-    /// `recompute_dirty` してから **再評価** する (= clean なら実行、 dirty なら確認)。
-    pub guard_pending_action: Option<DirtyGuardAction>,
-    pub is_dragging: bool,
-    pub midi_input_label: String,
-
-    pub step_cursor_beat: f64,
-    pub step_size_beats: f64,
-
-    /// Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw toggle。 ON のとき
-    /// piano_roll で note 追加時の pitch を `Song.scale_at(beat).snap(pitch)` で
-    /// in-scale に寄せる。 piano_roll header の toggle で切替、 session-only
-    /// state (project save しない)。 Highlight mode が前提 (Fold mode は
-    /// widget 側で既に in-scale pitch を push する)。
-    pub snap_on_draw: bool,
-    /// Phase 7 B5 (`docs/plan_scale.html` §4.4): piano_roll が Fold mode か。
-    /// `true` で out-of-scale 行を非表示 (Ableton K キー Fold to Scale 相当)、
-    /// `false` で Highlight mode (root 行強調 + in-scale 通常 + out 行 dim)。
-    /// piano_roll snap toolbar の「Fold」 toggle で切替、 session-only state。
-    /// `Song.scale_changes` が空のときは `view.scale = None` で機能 OFF。
-    pub piano_roll_fold: bool,
-    /// Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input toggle。 ON
-    /// のとき MIDI 録音中の note_on pitch を `Song.scale_at(playhead).snap(pitch)`
-    /// で in-scale に寄せる。 transport bar の toggle で切替、 session-only
-    /// state。 step input (recording 停止中の MIDI input) には適用しない
-    /// (= pitch を「聞いて」 決める用途、 Cubase / Bitwig も同方針)。
-    pub snap_live_input: bool,
-
-    /// Windows: main window の `HWND` (`with_owner_window` と同じ isize 表現)。
-    /// runner が window 生成直後にセットする。 native file save dialog を
-    /// background thread で **owner-modal** に開くための parent handle に使う
-    /// (`action_open_export_mp4_dialog`)。 None = まだ window 未生成 / 非対応。
-    #[cfg(windows)]
-    pub main_window_hwnd: Option<isize>,
-    /// video export の保存先選択 dialog (background thread) が開いている間 true。
-    /// 二重起動防止。 `FileDialogResult { kind: ExportMp4 }` 受信でクリアする。
-    pub export_dialog_open: bool,
-    /// Save As dialog (background thread) が開いている間 true。 二重起動防止に加え、
-    /// ガードの「保存して続行」 が新規 project で Save As を非同期に開いたとき、
-    /// dialog 解決後 (`SaveAsResolved`) の begin_save 完了で action を実行するよう
-    /// `guard_after_save` を立てる判定に使う。 `SaveAsResolved` 受信でクリアする。
-    pub save_as_dialog_open: bool,
-
-    /// 背景スレッド (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX
-    /// 合成 / plugin DB rescan) からメインスレッドへ `AppEvent` を送るための
-    /// dispatcher。 production は `WinitDispatcher` (winit `EventLoopProxy`
-    /// ラップ)、 test は `RecordingDispatcher` (Mutex<Vec> に蓄積)。
-    pub event_proxy: Arc<dyn BackgroundDispatcher>,
-}
+pub use crate::state::{
+    AppData, EditScope, IpcState, MediaState, RecordingState, SelectionState, SongDoc,
+    StreamGesture, TransportState, UiEphemeral, UiPrefs, VoicevoxState,
+};
 
 /// Windows native file dialog (rfd) を background thread で **owner-modal** に
 /// 開くための parent window ラッパー。 `rfd::FileDialog::set_parent` は
@@ -2268,8 +1267,8 @@ impl AppData {
     // 7-arg 閾値を超えるが、 composition root の性質上自然なので allow。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        audio_tx: UnboundedSender<MainToChild>,
-        plugin_tx: UnboundedSender<MainToChild>,
+        audio_tx: UnboundedSender<AudioCommand>,
+        plugin_tx: UnboundedSender<PluginCommand>,
         // 将来的な auto-select 用に予約。現在は song に反映していない。
         _clap_plugin_path: Option<PathBuf>,
         plugin_db: Option<Arc<PluginDatabase>>,
@@ -2316,237 +1315,242 @@ impl AppData {
             .unwrap_or_default();
 
         let app = Self {
-            song,
-            // 1 始まりで cache (Default epoch 0) と必ず不一致にし、初回 build で
-            // 一度 regenerate させる (= load 直後・無編集でもキャッシュが効く)。
-            song_epoch: 1,
-            arr_label_cache: std::cell::RefCell::default(),
-            sample_rate,
-            file_path: None,
-            audio_source_cache: AudioSourceCache::new(),
-            ara_doc_cache: std::collections::HashMap::new(),
-            video_thumbnail_rgba: std::collections::HashMap::new(),
-            pending_thumbnail_uploads: Vec::new(),
-            video_texture_cache: std::collections::HashMap::new(),
-            image_source_bgra: std::collections::HashMap::new(),
-            pending_image_uploads: Vec::new(),
-            image_texture_cache: std::collections::HashMap::new(),
-            preview_window_visible: false,
-            arrangement_hover_beat: None,
-            arrangement_hover_beat_raw: None,
-            arrangement_hover_clip: None,
-            arrange_hovered_track: None,
-            mixer_hovered_track: None,
-            pianoroll_hover_beat: None,
-            pianoroll_hover_beat_song_raw: None,
-            pianoroll_hover_note: None,
-            pending_clipboard_write: None,
-            selected_track_ids: Vec::new(),
-            selected_section_ids: Vec::new(),
-            collapsed_groups: std::collections::HashSet::new(),
-            expanded_automation_tracks: std::collections::HashSet::new(),
-            master_row_automation_expanded: false,
-            selected_automation_clips: Vec::new(),
-            last_edit_select: None,
-            selected_automation_points: Vec::new(),
-            editing_automation_point: None,
-            last_touched_param: None,
-            recording_mode: common::model::RecordingMode::default(),
-            metronome_enabled: false,
-            midi_recording: false,
-            midi_recording_pending: false,
-            count_in_bars: 0,
-            midi_recording_active_notes: std::collections::HashMap::new(),
-            metronome_enabled_pre_recording: None,
-            midi_learn_target: None,
-            active_param_gestures: std::collections::HashSet::new(),
-            latched_param_gestures: std::collections::HashSet::new(),
-            recording_last_beat: std::collections::HashMap::new(),
-            last_sent_recording_lanes: std::collections::HashSet::new(),
-            plugin_param_values: std::collections::HashMap::new(),
-            plugin_params: std::collections::HashMap::new(),
-            slot_has_gui: std::collections::HashMap::new(),
-            track_row_overrides: std::collections::HashMap::new(),
-            track_plugin_ids: std::collections::HashMap::new(),
-            loaded_slots: std::collections::HashMap::new(),
-            plugin_latencies: std::collections::HashMap::new(),
-            selected_clip: None,
-            selected_clips: Vec::new(),
-            selected_notes: Vec::new(),
-            arrange_zoom_history: Vec::new(),
-            arrange_zoom_anchor: None,
-            automation_lane_row_overrides: std::collections::HashMap::new(),
-            arrange_primary_lane_content_top: None,
-            arrange_hover_content: None,
-            arrange_dragging_track_volume: None,
-            arrange_default_scrub_active: None,
-            arrange_hovered_automation_lane: None,
-            bottom_panel: 0,
-            piano_roll_lyric_editing: false,
-            audio_editor_clip: None,
-            audio_editor_selected_events: Vec::new(),
-            audio_editor_hover_beat_in_clip: None,
-            audio_editor_views: std::collections::HashMap::new(),
-            audio_editor_vertical_gain: 1.0,
-            arrange_zoom_x: ARRANGE_PX_PER_BEAT,
-            arrange_scroll_beat: 0.0,
-            arrange_follow: common::model::FollowMode::default(),
-            arrange_track_top: 0.0,
-            arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
-            arrange_header_w: 160.0,
-            inspector_body_h: 800.0,
-            inspector_device_panel_h: 0.0,
-            piano_roll_views: std::collections::HashMap::new(),
-            multi_clip_view: common::model::PianoRollViewState::default(),
-            multi_clip_view_key: Vec::new(),
-            locked_pr_tracks: std::collections::HashSet::new(),
-            last_note_duration_beats: DEFAULT_NOTE_DURATION,
-            preview_note: None,
-            pianoroll_snap_enabled: true,
-            pianoroll_snap_choice: crate::view::snap::CHOICE_PIANOROLL_DEFAULT,
-            arrange_snap_enabled: true,
-            arrange_snap_choice: crate::view::snap::CHOICE_ARRANGE_DEFAULT,
-            last_pianoroll_grid_size: (0.0, 0.0),
-            pending_pianoroll_fit: false,
-            last_arrange_canvas_size: (0.0, 0.0),
-            is_playing: false,
-            is_looping: false,
-            playhead_beat: None,
-            playback_origin_beat: None,
-            panic_reinit_due: None,
-            panic_release_pending: false,
-            master_gain: 1.0,
-            peak_l_display: 0.0,
-            peak_r_display: 0.0,
-            peak_l_norm: 0.0,
-            peak_r_norm: 0.0,
-            metrics: common::metrics_bridge::ResourceMetrics::default(),
-            metrics_bridge: None,
-            resource_monitor_enabled: app_dirs
-                .as_ref()
-                .map(|d| common::app_config::load(d.app_config()).resource_monitor_enabled)
-                .unwrap_or(true),
-            resource_panel_open: false,
-            plugin_db,
-            plugin_picker_entries,
-            plugin_picker_visible: Vec::new(),
-            plugin_picker_query: String::new(),
-            is_plugin_picker_open: false,
-            plugin_picker_cursor: 0,
-            font_picker_families: Vec::new(),
-            font_picker_visible: Vec::new(),
-            font_picker_query: String::new(),
-            font_picker_cursor: 0,
-            is_font_picker_open: false,
-            font_picker_loading: false,
-            font_picker_target: None,
-            font_picker_restore: String::new(),
-            send_picker: None,
-            pending_state_queue: VecDeque::new(),
-            state_request_sent_at: None,
-            audio_tx: Some(audio_tx),
-            plugin_tx: Some(plugin_tx),
-            pending_clip_fx_bounce: None,
-            pending_vocal_synth_bounce: None,
-            open_plugin_guis: std::collections::HashSet::new(),
-            open_video_fx_params: None,
-            open_plugin_params: None,
-            track_peak_display: initial_peak_display,
-            mod_scalars: Vec::new(),
-            pending_plugin_loads: std::collections::HashSet::new(),
-            pending_added_plugin_finalize: std::collections::HashMap::new(),
-            gui_open_requests: Vec::new(),
-            pending_play: false,
-            rescan_result: Arc::new(Mutex::new(None)),
-            asset_decode: None,
-            load_progress: None,
-            load_progress_label: "",
-            singers: Vec::new(),
-            talk_speakers: Vec::new(),
-            voicevox_job,
-            supervisor,
-            child_disconnect_log: Vec::new(),
-            voicevox_launch_attempted: false,
-            lipsync_gen: 0,
-            lipsync_inflight: std::collections::HashSet::new(),
-            lipsync_fingerprints: std::collections::HashMap::new(),
-            voicevox_synth_status: std::collections::HashMap::new(),
-            anim_epoch: std::time::Instant::now(),
-            frame_now: std::time::Instant::now(),
-            is_rescanning: false,
-            status_message: String::new(),
-            track_rename_id: None,
-            color_picker_target: None,
-            color_picker_anchor: None,
-            color_picker_session_dirty: false,
-            clip_create_menu: None,
-            clip_create_menu_open: false,
-            section_menu: None,
-            section_menu_open: false,
-            section_rename_id: None,
-            section_rename_text: String::new(),
-            track_rename_text: String::new(),
-            clip_rename: None,
-            clip_rename_text: String::new(),
-            bpm_edit_text: format!("{initial_bpm:.1}"),
-            time_sig_num_edit_text: initial_time_sig_num.to_string(),
-            clip_edit_buffer_target: None,
-            clip_text_content_edit_text: String::new(),
-            clip_text_font_family_edit_text: String::new(),
-            group_scrub_active: None,
-            inspector_scrub_active: None,
-            mod_follower_scrub_active: false,
-            armed_mod_source: None,
-            expanded_mod_sources: std::collections::HashSet::new(),
-            mod_depth_scrub_active: None,
-            export_stage: None,
-            export_progress_at: None,
-            export_cancel: None,
-            pending_video_export: None,
-            export_temp_wav: None,
-            pending_video_export_range: None,
-            pending_video_export_dims: None,
-            pending_export: None,
-            export_range_picker: None,
-            undo_stack: VecDeque::new(),
-            redo_stack: VecDeque::new(),
-            // 実値は new 末尾で `app.saved_song = app.song.clone()` に上書き
-            // する (初期 song は 1 track 持ちで Song::default と異なるため、
-            // ここで default を入れたままだと起動直後に spurious dirty になる)。
-            saved_song: Song::default(),
-            is_help_open: false,
-            app_dirs,
-            recent_files,
-            recent_saved,
-            // 初期 label cache は new() の末尾でまとめて初期化する。 Self
-            // literal の途中で他 field を参照できないので、 一旦 empty で
-            // 構築し、 caller 側で `init_recent_labels` を呼ばずに済むよう
-            // make_app! / fn new の末尾で埋める (= line ~810 付近の
-            // 「app.init_recent_labels()」 を見よ)。
-            recent_files_labels: Vec::new(),
-            recent_saved_labels: Vec::new(),
-            is_dirty: false,
-            pending_host_sync: false,
-            last_autosave: std::time::Instant::now(),
-            recovery_session_id: common::recovery::new_session_id(),
-            recovery_candidates,
-            show_recovery_modal,
-            dirty_guard: None,
-            should_quit: false,
-            guard_after_save: None,
-            guard_pending_action: None,
-            is_dragging: false,
-            midi_input_label: String::new(),
-            step_cursor_beat: 0.0,
-            step_size_beats: DEFAULT_NOTE_DURATION,
-            snap_on_draw: false,
-            snap_live_input: false,
-            piano_roll_fold: false,
-            export_dialog_open: false,
-            save_as_dialog_open: false,
-            #[cfg(windows)]
-            main_window_hwnd: None,
-            event_proxy,
+            song_doc: SongDoc::new(song),
+            transport: TransportState {
+                metronome_enabled: false,
+                is_playing: false,
+                is_looping: false,
+                playhead_beat: None,
+                playback_origin_beat: None,
+                panic_reinit_due: None,
+                panic_release_pending: false,
+                master_gain: 1.0,
+                peak_l_display: 0.0,
+                peak_r_display: 0.0,
+                peak_l_norm: 0.0,
+                peak_r_norm: 0.0,
+                track_peak_display: initial_peak_display,
+                mod_scalars: Vec::new(),
+                pending_play: false,
+                export_stage: None,
+                export_progress_at: None,
+                export_cancel: None,
+                pending_video_export: None,
+                export_temp_wav: None,
+                pending_video_export_range: None,
+                pending_video_export_dims: None,
+                pending_export: None,
+            },
+            selection: SelectionState {
+                selected_track_ids: Vec::new(),
+                selected_section_ids: Vec::new(),
+                selected_automation_clips: Vec::new(),
+                last_edit_select: None,
+                selected_automation_points: Vec::new(),
+                selected_clip: None,
+                selected_clips: Vec::new(),
+                selected_notes: Vec::new(),
+                audio_editor_selected_events: Vec::new(),
+            },
+            ipc: IpcState {
+                sample_rate,
+                ara_doc_cache: std::collections::HashMap::new(),
+                ara_pcm_materialized: std::collections::HashMap::new(),
+                plugin_param_values: std::collections::HashMap::new(),
+                plugin_params: std::collections::HashMap::new(),
+                slot_has_gui: std::collections::HashMap::new(),
+                track_plugin_ids: std::collections::HashMap::new(),
+                loaded_slots: std::collections::HashMap::new(),
+                plugin_latencies: std::collections::HashMap::new(),
+                metrics: common::metrics_bridge::ResourceMetrics::default(),
+                metrics_bridge: None,
+                plugin_db,
+                pending_state_queue: VecDeque::new(),
+                state_request_sent_at: None,
+                audio_tx: Some(audio_tx),
+                plugin_tx: Some(plugin_tx),
+                pending_clip_fx_bounce: None,
+                pending_vocal_synth_bounce: None,
+                open_plugin_guis: std::collections::HashSet::new(),
+                pending_plugin_loads: std::collections::HashMap::new(),
+                next_plugin_load_generation: 0,
+                pending_added_plugin_finalize: std::collections::HashMap::new(),
+                gui_open_requests: Vec::new(),
+                rescan_result: Arc::new(Mutex::new(None)),
+                supervisor,
+                child_disconnect_log: Vec::new(),
+                is_rescanning: false,
+                pending_host_sync: false,
+                event_proxy,
+            },
+            voicevox: VoicevoxState {
+                singers: Vec::new(),
+                talk_speakers: Vec::new(),
+                voicevox_job,
+                voicevox_launch_attempted: false,
+                lipsync_gen: 0,
+                lipsync_inflight: std::collections::HashSet::new(),
+                lipsync_fingerprints: std::collections::HashMap::new(),
+                voicevox_synth_status: std::collections::HashMap::new(),
+            },
+            media: MediaState {
+                audio_source_cache: AudioSourceCache::new(),
+                video_thumbnail_rgba: std::collections::HashMap::new(),
+                pending_thumbnail_uploads: Vec::new(),
+                image_source_bgra: std::collections::HashMap::new(),
+                pending_image_uploads: Vec::new(),
+                asset_decode: None,
+                load_progress: None,
+                load_progress_label: "",
+            },
+            recording: RecordingState {
+                recording_mode: common::model::RecordingMode::default(),
+                midi_recording: false,
+                midi_recording_pending: false,
+                count_in_bars: 0,
+                midi_recording_active_notes: std::collections::HashMap::new(),
+                metronome_enabled_pre_recording: None,
+                midi_learn_target: None,
+                active_param_gestures: std::collections::HashSet::new(),
+                latched_param_gestures: std::collections::HashSet::new(),
+                recording_last_beat: std::collections::HashMap::new(),
+                last_sent_recording_lanes: std::collections::HashSet::new(),
+                preview_note: None,
+                midi_input_label: String::new(),
+                step_cursor_beat: 0.0,
+                step_size_beats: DEFAULT_NOTE_DURATION,
+                snap_live_input: false,
+            },
+            ui_prefs: UiPrefs {
+                preview_window_visible: false,
+                collapsed_groups: std::collections::HashSet::new(),
+                expanded_automation_tracks: std::collections::HashSet::new(),
+                master_row_automation_expanded: false,
+                track_row_overrides: std::collections::HashMap::new(),
+                automation_lane_row_overrides: std::collections::HashMap::new(),
+                bottom_panel: 0,
+                audio_editor_views: std::collections::HashMap::new(),
+                audio_editor_vertical_gain: 1.0,
+                arrange_zoom_x: ARRANGE_PX_PER_BEAT,
+                arrange_scroll_beat: 0.0,
+                arrange_follow: common::model::FollowMode::default(),
+                arrange_track_top: 0.0,
+                arrange_track_row_h: ARRANGE_TRACK_HEIGHT,
+                arrange_header_w: 160.0,
+                piano_roll_views: std::collections::HashMap::new(),
+                multi_clip_view: common::model::PianoRollViewState::default(),
+                multi_clip_view_key: Vec::new(),
+                locked_pr_tracks: std::collections::HashSet::new(),
+                last_note_duration_beats: DEFAULT_NOTE_DURATION,
+                pianoroll_snap_enabled: true,
+                pianoroll_snap_choice: crate::view::snap::CHOICE_PIANOROLL_DEFAULT,
+                arrange_snap_enabled: true,
+                arrange_snap_choice: crate::view::snap::CHOICE_ARRANGE_DEFAULT,
+                resource_monitor_enabled: app_dirs
+                    .as_ref()
+                    .map(|d| common::app_config::load(d.app_config()).resource_monitor_enabled)
+                    .unwrap_or(true),
+                is_help_open: false,
+                app_dirs,
+                recent_files,
+                recent_saved,
+                // 初期 label cache は new() の末尾でまとめて初期化する。 Self
+                // literal の途中で他 field を参照できないので、 一旦 empty で
+                // 構築し、 caller 側で `init_recent_labels` を呼ばずに済むよう
+                // make_app! / fn new の末尾で埋める (= line ~810 付近の
+                // 「app.init_recent_labels()」 を見よ)。
+                recent_files_labels: Vec::new(),
+                recent_saved_labels: Vec::new(),
+                snap_on_draw: false,
+                piano_roll_fold: false,
+            },
+            ui_ephemeral: UiEphemeral {
+                arr_label_cache: std::cell::RefCell::default(),
+                video_texture_cache: std::collections::HashMap::new(),
+                image_texture_cache: std::collections::HashMap::new(),
+                arrangement_hover_beat: None,
+                arrangement_hover_beat_raw: None,
+                arrangement_hover_clip: None,
+                arrange_hovered_track: None,
+                mixer_hovered_track: None,
+                pianoroll_hover_beat: None,
+                pianoroll_hover_beat_song_raw: None,
+                pianoroll_hover_note: None,
+                pending_clipboard_write: None,
+                editing_automation_point: None,
+                last_touched_param: None,
+                arrange_zoom_history: Vec::new(),
+                arrange_zoom_anchor: None,
+                arrange_primary_lane_content_top: None,
+                arrange_hover_content: None,
+                arrange_dragging_track_volume: None,
+                arrange_default_scrub_active: None,
+                arrange_hovered_automation_lane: None,
+                piano_roll_lyric_editing: false,
+                audio_editor_clip: None,
+                audio_editor_hover_beat_in_clip: None,
+                inspector_body_h: 800.0,
+                inspector_device_panel_h: 0.0,
+                last_pianoroll_grid_size: (0.0, 0.0),
+                pending_pianoroll_fit: false,
+                last_arrange_canvas_size: (0.0, 0.0),
+                resource_panel_open: false,
+                plugin_picker_entries,
+                plugin_picker_visible: Vec::new(),
+                plugin_picker_query: String::new(),
+                is_plugin_picker_open: false,
+                plugin_picker_cursor: 0,
+                font_picker_families: Vec::new(),
+                font_picker_visible: Vec::new(),
+                font_picker_query: String::new(),
+                font_picker_cursor: 0,
+                is_font_picker_open: false,
+                font_picker_loading: false,
+                font_picker_target: None,
+                font_picker_restore: String::new(),
+                send_picker: None,
+                open_video_fx_params: None,
+                open_plugin_params: None,
+                anim_epoch: std::time::Instant::now(),
+                frame_now: std::time::Instant::now(),
+                status_message: String::new(),
+                track_rename_id: None,
+                color_picker_target: None,
+                color_picker_anchor: None,
+                color_picker_session_dirty: false,
+                clip_create_menu: None,
+                clip_create_menu_open: false,
+                section_menu: None,
+                section_menu_open: false,
+                section_rename_id: None,
+                section_rename_text: String::new(),
+                track_rename_text: String::new(),
+                clip_rename: None,
+                clip_rename_text: String::new(),
+                bpm_edit_text: format!("{initial_bpm:.1}"),
+                time_sig_num_edit_text: initial_time_sig_num.to_string(),
+                clip_edit_buffer_target: None,
+                clip_text_content_edit_text: String::new(),
+                clip_text_font_family_edit_text: String::new(),
+                group_scrub_active: None,
+                inspector_scrub_active: None,
+                mod_follower_scrub_active: false,
+                armed_mod_source: None,
+                expanded_mod_sources: std::collections::HashSet::new(),
+                mod_depth_scrub_active: None,
+                export_range_picker: None,
+                recovery_candidates,
+                show_recovery_modal,
+                dirty_guard: None,
+                should_quit: false,
+                guard_after_save: None,
+                guard_pending_action: None,
+                is_dragging: false,
+                export_dialog_open: false,
+                save_as_dialog_open: false,
+                #[cfg(windows)]
+                main_window_hwnd: None,
+            },
         };
         // recent_files / recent_saved の path 列から filename label cache を
         // 1 回構築。 push_recent / push_recent_saved 経由の更新でも自動的に
@@ -2556,18 +1560,16 @@ impl AppData {
         // cache が旧 port-probe 版 (PluginEntry の 3 bool 未取得) なら、
         // 起動時に 1 回だけ自動で再 probe (rescan) して port 構成を埋める。 production
         // (app_dirs=Some) のみ — test は app_dirs=None なので実システム scan を避ける。
-        if app.app_dirs.is_some()
+        if app.ui_prefs.app_dirs.is_some()
             && app
-                .plugin_db
+                .ipc.plugin_db
                 .as_ref()
                 .is_some_and(|db| db.needs_port_probe())
         {
             tracing::info!("plugin cache predates port-probe; auto-rescanning to fill port info");
             app.begin_rescan();
         }
-        // 起動直後の song (1 track 持ち) を保存ベースラインに確定する。
-        // is_dirty は literal で false 初期化済 (song == saved_song)。
-        app.saved_song = app.song.clone();
+        // 起動直後は clean (SongDoc::new が saved_epoch = edit_epoch で構築)。
         app
     }
 
@@ -2577,14 +1579,14 @@ impl AppData {
     /// 「カーソル相当」 = `selected_track_ids` の末尾要素。 `None` の
     /// ときは選択ゼロ (まだ何もクリックしていない / 全 track 削除直後)。
     pub fn cursor_track_id(&self) -> Option<u32> {
-        self.selected_track_ids.last().copied()
+        self.selection.selected_track_ids.last().copied()
     }
 
     /// カーソル track の `song.tracks` 内 index。 selection は id ベース
     /// なので、 track 並び替え後でも index は再評価される。
     pub fn cursor_track_index(&self) -> Option<usize> {
         let id = self.cursor_track_id()?;
-        self.song.tracks.iter().position(|t| t.id == id)
+        self.song_doc.song().tracks.iter().position(|t| t.id == id)
     }
 
     /// 単一カーソル選択にする。 multi-select を使う UI 側からは
@@ -2594,8 +1596,8 @@ impl AppData {
     /// dead_code を許容。
     #[allow(dead_code)]
     pub fn set_cursor_track_index(&mut self, idx: usize) {
-        if let Some(t) = self.song.tracks.get(idx) {
-            self.selected_track_ids = vec![t.id];
+        if let Some(t) = self.song_doc.song().tracks.get(idx) {
+            self.selection.selected_track_ids = vec![t.id];
         }
     }
 
@@ -2603,14 +1605,14 @@ impl AppData {
     /// at it via `parent_group_id`. The role is purely derived — there
     /// is no `Track::kind` field. SSOT (CLAUDE.md).
     pub fn is_group_track(&self, track_id: u32) -> bool {
-        crate::group_compose::is_group_track(&self.song, track_id)
+        crate::group_compose::is_group_track(&self.song_doc.song(), track_id)
     }
 
     /// A track acts as a "return" iff at least one other track has a
     /// `Send` whose `dest_track_id` points at it. Purely derived (no
     /// `Track::kind`), mirroring `is_group_track`. SSOT (CLAUDE.md).
     pub fn is_return_track(&self, track_id: u32) -> bool {
-        self.song
+        self.song_doc.song()
             .tracks
             .iter()
             .flat_map(|t| t.sends.iter())
@@ -2640,7 +1642,7 @@ impl AppData {
                 if !seen.insert(cur) {
                     continue;
                 }
-                if let Some(t) = self.song.track_by_id(cur) {
+                if let Some(t) = self.song_doc.song().track_by_id(cur) {
                     for s in &t.sends {
                         stack.push(s.dest_track_id);
                     }
@@ -2648,7 +1650,7 @@ impl AppData {
             }
             false
         };
-        self.song
+        self.song_doc.song()
             .tracks
             .iter()
             .enumerate()
@@ -2678,7 +1680,7 @@ impl AppData {
             if hops > 32 {
                 break;
             }
-            cursor = self.song.track_by_id(pid).and_then(|t| t.parent_group_id);
+            cursor = self.song_doc.song().track_by_id(pid).and_then(|t| t.parent_group_id);
         }
         depth
     }
@@ -2703,19 +1705,19 @@ impl AppData {
         target: &common::model::AutomationTarget,
         fallback: f32,
     ) -> f32 {
-        if !self.is_playing {
+        if !self.transport.is_playing {
             return fallback;
         }
         // `currently_recording_lanes` と同じ判定の single-key 版: 当該 param を
         // 書き込み中なら lane を読まず手動値を返す (audio thread に送る
         // `recording_lanes` と同集合 = UI と audio が drift しない)。
         let key = (track.id, target.clone());
-        let recording = self.recording_mode != common::model::RecordingMode::Read
-            && (self.active_param_gestures.contains(&key)
+        let recording = self.recording.recording_mode != common::model::RecordingMode::Read
+            && (self.recording.active_param_gestures.contains(&key)
                 || (matches!(
-                    self.recording_mode,
+                    self.recording.recording_mode,
                     common::model::RecordingMode::Latch | common::model::RecordingMode::Write
-                ) && self.latched_param_gestures.contains(&key)));
+                ) && self.recording.latched_param_gestures.contains(&key)));
         if recording {
             return fallback;
         }
@@ -2726,8 +1728,8 @@ impl AppData {
         else {
             return fallback;
         };
-        let beat = f64::from(self.playhead_beat.unwrap_or(0.0));
-        common::automation::lane_value_at(lane, &self.song.clip_contents, beat) as f32
+        let beat = f64::from(self.transport.playhead_beat.unwrap_or(0.0));
+        common::automation::lane_value_at(lane, &self.song_doc.song().clip_contents, beat) as f32
     }
 
     pub fn track_mix(&self) -> Vec<TrackMixEntry> {
@@ -2736,7 +1738,7 @@ impl AppData {
         // `compute_track_depth(t)` (= O(depth) parent chain walk) を呼び、
         // 合計 O(N²) per frame だった。 大型 song で 60fps drop。
         // 単一 pass で is_group_set / depths を batch 計算して O(N) に。
-        let n_tracks = self.song.tracks.len();
+        let n_tracks = self.song_doc.song().tracks.len();
         let mut is_group_set: std::collections::HashSet<u32> =
             std::collections::HashSet::with_capacity(n_tracks);
         // リターン判定も同 pass で batch 集計 (= is_group と同 idiom)。
@@ -2745,7 +1747,7 @@ impl AppData {
             std::collections::HashSet::with_capacity(n_tracks);
         let mut id_to_parent: std::collections::HashMap<u32, Option<u32>> =
             std::collections::HashMap::with_capacity(n_tracks);
-        for t in &self.song.tracks {
+        for t in &self.song_doc.song().tracks {
             id_to_parent.insert(t.id, t.parent_group_id);
             if let Some(pid) = t.parent_group_id {
                 is_group_set.insert(pid);
@@ -2771,12 +1773,12 @@ impl AppData {
             }
             depth
         };
-        self.song
+        self.song_doc.song()
             .tracks
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let (l, r) = self.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0));
+                let (l, r) = self.transport.track_peak_display.get(i).copied().unwrap_or((0.0, 0.0));
                 TrackMixEntry {
                     index: i as u32,
                     track_id: t.id,
@@ -2816,7 +1818,7 @@ impl AppData {
     }
 
     pub fn selected_track_label(&self) -> String {
-        let n_selected = self.selected_track_ids.len();
+        let n_selected = self.selection.selected_track_ids.len();
         if n_selected > 1 {
             return format!("{n_selected} tracks selected");
         }
@@ -2825,7 +1827,7 @@ impl AppData {
         }
         match self.cursor_track_index() {
             Some(idx) => self
-                .song
+                .song_doc.song()
                 .tracks
                 .get(idx)
                 .map(|t| {
@@ -2854,11 +1856,11 @@ impl AppData {
         // master 選択時は track Vec ではなく Song.master_fx_chain を対象にする。
         let (track_id, devices): (u32, &[common::model::PluginInstance]) =
             if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-                (common::model::MASTER_TRACK_ID, &self.song.master_fx_chain)
+                (common::model::MASTER_TRACK_ID, &self.song_doc.song().master_fx_chain)
             } else {
                 let Some(track) = self
                     .cursor_track_index()
-                    .and_then(|i| self.song.tracks.get(i))
+                    .and_then(|i| self.song_doc.song().tracks.get(i))
                 else {
                     return Vec::new();
                 };
@@ -2870,7 +1872,7 @@ impl AppData {
             .map(|(i, p)| SidechainEntry {
                 track_id,
                 device_index: i as u32,
-                plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+                plugin_name: resolve_plugin_name(&self.ipc.plugin_db, &p.plugin_id),
                 current_source: p
                     .aux_inputs
                     .first()
@@ -2930,7 +1932,7 @@ impl AppData {
         }
         let Some(track) = self
             .cursor_track_index()
-            .and_then(|i| self.song.tracks.get(i))
+            .and_then(|i| self.song_doc.song().tracks.get(i))
         else {
             return Vec::new();
         };
@@ -2956,7 +1958,7 @@ impl AppData {
                 ParallelOutputEntry {
                     track_id,
                     device_index: i as u32,
-                    plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+                    plugin_name: resolve_plugin_name(&self.ipc.plugin_db, &p.plugin_id),
                     aux_output_count: p.aux_output_count,
                     routes,
                     exploded,
@@ -2975,7 +1977,7 @@ impl AppData {
         // トラック) のソースだけ列挙する。`enumerate()` の index はグローバル位置の
         // ままなので `mod_scalars` lookup は正しい (follower plane はグローバル順)。
         let owner = self.cursor_track_id();
-        self.song
+        self.song_doc.song()
             .mod_sources
             .iter()
             .enumerate()
@@ -2983,7 +1985,7 @@ impl AppData {
             .map(|(i, m)| ModSourceRow {
                 id: m.id,
                 color: m.color,
-                scalar: self.mod_scalars.get(i).copied().unwrap_or(0.0),
+                scalar: self.transport.mod_scalars.get(i).copied().unwrap_or(0.0),
                 kind: m.kind.clone(),
             })
             .collect()
@@ -2994,7 +1996,7 @@ impl AppData {
     /// track, including itself: the follower is control-rate, not a feedback
     /// loop).
     pub fn mod_source_track_choices(&self) -> Vec<(u32, String)> {
-        self.song
+        self.song_doc.song()
             .tracks
             .iter()
             .map(|t| (t.id, t.name.clone()))
@@ -3012,9 +2014,9 @@ impl AppData {
     ) -> Vec<(u32, common::model::AutomationTarget, String, Vec<(u32, f32, bool)>)> {
         let (track_id, routings) =
             if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-                (common::model::MASTER_TRACK_ID, &self.song.song_mod_routings)
+                (common::model::MASTER_TRACK_ID, &self.song_doc.song().song_mod_routings)
             } else {
-                match self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) {
+                match self.cursor_track_index().and_then(|i| self.song_doc.song().tracks.get(i)) {
                     Some(t) => (t.id, &t.mod_routings),
                     None => return Vec::new(),
                 }
@@ -3047,7 +2049,7 @@ impl AppData {
     /// 固定パレットを引く (id でなく位置 = 追加順に色が回る)。
     pub fn mod_source_color(&self, source_id: u32) -> [f32; 3] {
         // 色は `ModSource.color` が SSoT (作成時に palette から割当)。
-        self.song
+        self.song_doc.song()
             .mod_sources
             .iter()
             .find(|m| m.id == source_id)
@@ -3078,11 +2080,15 @@ impl AppData {
         track_id: u32,
         target: &common::model::AutomationTarget,
     ) -> Option<(f64, f64)> {
-        let common::model::AutomationTarget::PluginParam { device_index, param_id, .. } = target
+        let common::model::AutomationTarget::PluginParam { device_id, param_id, .. } = target
         else {
             return None;
         };
-        let params = self.plugin_params.get(&(track_id, *device_index))?;
+        // v29: target は安定 device_id。 positional cache
+        // (`plugin_params`) へは逆引きで繋ぐ (S3b で cache 自体を id 化)。
+        let _ = track_id;
+        let (t, device_index) = find_device_by_id(&self.song_doc.song(), *device_id)?;
+        let params = self.ipc.plugin_params.get(&(t, device_index))?;
         let info = params.iter().find(|p| p.id == *param_id)?;
         (info.max_value > info.min_value).then_some((info.min_value, info.max_value))
     }
@@ -3097,13 +2103,15 @@ impl AppData {
         track_id: u32,
         target: &common::model::AutomationTarget,
     ) -> Option<String> {
-        let common::model::AutomationTarget::PluginParam { device_index, param_id, .. } = target
+        let common::model::AutomationTarget::PluginParam { device_id, param_id, .. } = target
         else {
             return None;
         };
+        let _ = track_id;
+        let (t, device_index) = find_device_by_id(&self.song_doc.song(), *device_id)?;
         let info = self
-            .plugin_params
-            .get(&(track_id, *device_index))?
+            .ipc.plugin_params
+            .get(&(t, device_index))?
             .iter()
             .find(|p| p.id == *param_id)?;
         (!info.name.is_empty()).then(|| info.name.clone())
@@ -3130,9 +2138,9 @@ impl AppData {
     ) -> InspectorModData {
         let routings: &[common::model::ModRouting] =
             if track_id == common::model::MASTER_TRACK_ID {
-                &self.song.song_mod_routings
+                &self.song_doc.song().song_mod_routings
             } else {
-                match self.song.tracks.iter().find(|t| t.id == track_id) {
+                match self.song_doc.song().tracks.iter().find(|t| t.id == track_id) {
                     Some(t) => &t.mod_routings,
                     None => return InspectorModData::default(),
                 }
@@ -3163,14 +2171,14 @@ impl AppData {
             let color = self.mod_source_color(r.source_id);
             let depth_display = reach_depth(r.depth);
             entries.push((color, depth_display));
-            if Some(r.source_id) == self.armed_mod_source {
+            if Some(r.source_id) == self.ui_ephemeral.armed_mod_source {
                 armed = Some((color, depth_display, r.source_id));
             }
         }
         // Armed source with no routing yet on this target → editable from depth 0
         // (first drag creates the routing).
         if armed.is_none()
-            && let Some(sid) = self.armed_mod_source
+            && let Some(sid) = self.ui_ephemeral.armed_mod_source
         {
             armed = Some((self.mod_source_color(sid), 0.0, sid));
         }
@@ -3178,11 +2186,11 @@ impl AppData {
         // modulated value equals the base and the tick is redundant noise).
         let live_display = (!entries.is_empty()).then(|| {
             let live_model = common::automation::apply_modulation_with_scalars(
-                &self.song,
+                &self.song_doc.song(),
                 target,
                 model_base,
                 routings,
-                &self.mod_scalars,
+                &self.transport.mod_scalars,
             );
             domain.to_display(target, live_model)
         });
@@ -3213,14 +2221,15 @@ impl AppData {
             // r.md #8 再監査: master fx (`master_fx_chain`) の PluginParam も変調
             // ターゲットに出す (engine の `process_master_fx_chain` が
             // `song_mod_routings` を `fill_pd_param_events(MASTER_TRACK_ID)` で消費)。
-            for (di, _dev) in self.song.master_fx_chain.iter().enumerate() {
+            for (di, dev) in self.song_doc.song().master_fx_chain.iter().enumerate() {
                 if let Some(params) =
-                    self.plugin_params.get(&(common::model::MASTER_TRACK_ID, di as u32))
+                    self.ipc.plugin_params.get(&(common::model::MASTER_TRACK_ID, di as u32))
                 {
                     for p in params {
                         out.push(AT::PluginParam {
-                            device_index: di as u32,
+                            device_id: dev.id,
                             param_id: p.id,
+                            legacy_device_index: None,
                             legacy_slot: None,
                         });
                     }
@@ -3228,7 +2237,7 @@ impl AppData {
             }
             return out;
         }
-        let Some(track) = self.cursor_track_index().and_then(|i| self.song.tracks.get(i)) else {
+        let Some(track) = self.cursor_track_index().and_then(|i| self.song_doc.song().tracks.get(i)) else {
             return out;
         };
         out.push(AT::TrackBuiltin(TB::Volume));
@@ -3241,19 +2250,20 @@ impl AppData {
                 out.push(AT::GroupTransform(p));
             }
         }
-        for (di, _dev) in track.devices.iter().enumerate() {
-            if let Some(params) = self.plugin_params.get(&(track.id, di as u32)) {
+        for (di, dev) in track.devices.iter().enumerate() {
+            if let Some(params) = self.ipc.plugin_params.get(&(track.id, di as u32)) {
                 for p in params {
                     out.push(AT::PluginParam {
-                        device_index: di as u32,
+                        device_id: dev.id,
                         param_id: p.id,
+                        legacy_device_index: None,
                         legacy_slot: None,
                     });
                 }
             }
         }
         let has_image = track.clips.iter().any(|c| {
-            self.song
+            self.song_doc.song()
                 .clip_contents
                 .get(&c.content_id)
                 .is_some_and(|cc| cc.image_events().is_some())
@@ -3264,7 +2274,7 @@ impl AppData {
             }
         }
         let has_text = track.clips.iter().any(|c| {
-            self.song
+            self.song_doc.song()
                 .clip_contents
                 .get(&c.content_id)
                 .is_some_and(|cc| cc.text_events().is_some())
@@ -3281,12 +2291,12 @@ impl AppData {
 
     pub fn sidechain_source_choices(&self) -> Vec<SidechainSourceChoice> {
         let cursor_id = self.cursor_track_id();
-        let mut choices: Vec<SidechainSourceChoice> = Vec::with_capacity(self.song.tracks.len() + 1);
+        let mut choices: Vec<SidechainSourceChoice> = Vec::with_capacity(self.song_doc.song().tracks.len() + 1);
         choices.push(SidechainSourceChoice {
             label: "—".into(),
             track_id: None,
         });
-        for t in &self.song.tracks {
+        for t in &self.song_doc.song().tracks {
             if Some(t.id) == cursor_id {
                 continue;
             }
@@ -3308,10 +2318,10 @@ impl AppData {
     /// view は first event を「代表値」 として見せれば編集後に整合が取れる。
     pub fn inspector_audio_event_summary(&self) -> Option<InspectorAudioEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.song.tracks.get(cref.track as usize)?;
+        let track = self.song_doc.song().tracks.get(cref.track as usize)?;
         let clip = track.clips.get(cref.clip as usize)?;
         let common::model::ClipContent::Audio(audio) =
-            self.song.clip_contents.get(&clip.content_id)?
+            self.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
             return None;
         };
@@ -3320,7 +2330,7 @@ impl AppData {
         // multi-event clip でも個別 event を編集可能。 audio_editor が
         // 閉じている / 別 clip を開いている / 選択中 event idx が範囲外
         // なら first event (= Phase 2 PR1-3 と同じ既存挙動)。
-        let event_idx = if self.audio_editor_clip == Some(cref) {
+        let event_idx = if self.ui_ephemeral.audio_editor_clip == Some(cref) {
             self.audio_editor_anchor_event().unwrap_or(0)
         } else {
             0
@@ -3350,11 +2360,11 @@ impl AppData {
     /// shortcut handler 経由で呼ばれて `SelectAudioEditorEvent` の
     /// 引数を組み立てる用。
     pub fn next_audio_editor_event_idx(&self, delta: i32) -> Option<usize> {
-        let target = self.audio_editor_clip?;
-        let track = self.song.tracks.get(target.track as usize)?;
+        let target = self.ui_ephemeral.audio_editor_clip?;
+        let track = self.song_doc.song().tracks.get(target.track as usize)?;
         let clip = track.clips.get(target.clip as usize)?;
         let common::model::ClipContent::Audio(audio) =
-            self.song.clip_contents.get(&clip.content_id)?
+            self.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
             return None;
         };
@@ -3371,7 +2381,7 @@ impl AppData {
     /// Audio Editor の選択 anchor (= Inspector / footer / nav の代表 event
     /// index)。 選択集合の last (= 最後に選択した event)。 空なら None。
     pub fn audio_editor_anchor_event(&self) -> Option<usize> {
-        self.audio_editor_selected_events.last().copied()
+        self.selection.audio_editor_selected_events.last().copied()
     }
 
     /// `selected_clip` が `ClipContent::Image` の clip を指していて、
@@ -3385,10 +2395,10 @@ impl AppData {
     /// のみ snapshot に乗せる)。
     pub fn inspector_image_event_summary(&self) -> Option<InspectorImageEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.song.tracks.get(cref.track as usize)?;
+        let track = self.song_doc.song().tracks.get(cref.track as usize)?;
         let clip = track.clips.get(cref.clip as usize)?;
         let common::model::ClipContent::Image(image) =
-            self.song.clip_contents.get(&clip.content_id)?
+            self.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
             return None;
         };
@@ -3430,11 +2440,11 @@ impl AppData {
     /// 引数 `n_events` は当該 ClipContent::Audio の events 長 (= 呼び出し
     /// 前に immutable get で取得)。
     fn audio_event_target_indices(&self, target: ClipRef, n_events: usize) -> Vec<usize> {
-        if self.audio_editor_clip == Some(target)
-            && !self.audio_editor_selected_events.is_empty()
+        if self.ui_ephemeral.audio_editor_clip == Some(target)
+            && !self.selection.audio_editor_selected_events.is_empty()
         {
             let mut v: Vec<usize> = self
-                .audio_editor_selected_events
+                .selection.audio_editor_selected_events
                 .iter()
                 .copied()
                 .filter(|&i| i < n_events)
@@ -3460,7 +2470,7 @@ impl AppData {
         F: FnMut(&mut common::model::AudioEvent),
     {
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -3468,7 +2478,7 @@ impl AppData {
         else {
             return false;
         };
-        let n_events = match self.song.clip_contents.get(&content_id) {
+        let n_events = match self.song_doc.song().clip_contents.get(&content_id) {
             Some(common::model::ClipContent::Audio(a)) => a.events.len(),
             _ => return false,
         };
@@ -3476,19 +2486,24 @@ impl AppData {
         if indices.is_empty() {
             return false;
         }
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            for &i in &indices {
-                if let Some(event) = audio.events.get_mut(i) {
-                    f(event);
+        let applied = self.edit_song(|song| {
+            if let Some(common::model::ClipContent::Audio(audio)) =
+                song.clip_contents.get_mut(&content_id)
+            {
+                for &i in &indices {
+                    if let Some(event) = audio.events.get_mut(i) {
+                        f(event);
+                    }
                 }
+                true
+            } else {
+                false
             }
+        }) == Some(true);
+        if applied {
             self.sync_song_to_plugin_host();
-            true
-        } else {
-            false
         }
+        applied
     }
 
     /// B12-manual (r.md #8): `audio_editor_clip` の `event_idx` 番目 AudioEvent の
@@ -3499,11 +2514,11 @@ impl AppData {
     where
         F: FnOnce(&mut Vec<common::model::BeatMarker>),
     {
-        let Some(target) = self.audio_editor_clip else {
+        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
             return false;
         };
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -3511,16 +2526,21 @@ impl AppData {
         else {
             return false;
         };
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
-            && let Some(event) = audio.events.get_mut(event_idx)
-        {
-            f(&mut event.beat_markers);
+        let applied = self.edit_song(|song| {
+            if let Some(common::model::ClipContent::Audio(audio)) =
+                song.clip_contents.get_mut(&content_id)
+                && let Some(event) = audio.events.get_mut(event_idx)
+            {
+                f(&mut event.beat_markers);
+                true
+            } else {
+                false
+            }
+        }) == Some(true);
+        if applied {
             self.sync_song_to_plugin_host();
-            true
-        } else {
-            false
         }
+        applied
     }
 
     /// `target` clip が `ClipContent::Image` の場合、 全 ImageEvent に
@@ -3533,7 +2553,7 @@ impl AppData {
         F: FnMut(&mut common::model::ImageEvent),
     {
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -3541,19 +2561,21 @@ impl AppData {
         else {
             return false;
         };
-        if let Some(common::model::ClipContent::Image(image)) =
-            self.song.clip_contents.get_mut(&content_id)
-        {
-            if image.events.is_empty() {
-                return false;
+        self.edit_song(|song| {
+            if let Some(common::model::ClipContent::Image(image)) =
+                song.clip_contents.get_mut(&content_id)
+            {
+                if image.events.is_empty() {
+                    return false;
+                }
+                for event in &mut image.events {
+                    f(event);
+                }
+                true
+            } else {
+                false
             }
-            for event in &mut image.events {
-                f(event);
-            }
-            true
-        } else {
-            false
-        }
+        }) == Some(true)
     }
 
     /// 単一デバイスチェーン (`docs/plan_linear_chain.md` §5): `Track.devices`
@@ -3565,12 +2587,12 @@ impl AppData {
         };
         let devices: &[common::model::PluginInstance] =
             if track_id == common::model::MASTER_TRACK_ID {
-                &self.song.master_fx_chain
+                &self.song_doc.song().master_fx_chain
             } else {
                 let Some(idx) = self.cursor_track_index() else {
                     return Vec::new();
                 };
-                let Some(track) = self.song.tracks.get(idx) else {
+                let Some(track) = self.song_doc.song().tracks.get(idx) else {
                     return Vec::new();
                 };
                 track.devices.as_slice()
@@ -3586,19 +2608,19 @@ impl AppData {
                 // (`slot_has_gui`)、 未受信 (load 直後) は楽観的に true で「GUI」のまま。
                 let has_embedded_gui = p.format != PluginFormat::Builtin
                     && self
-                        .slot_has_gui
+                        .ipc.slot_has_gui
                         .get(&(track_id, device_index))
                         .copied()
                         .unwrap_or(true);
                 let has_params = self
-                    .plugin_params
+                    .ipc.plugin_params
                     .get(&(track_id, device_index))
                     .is_some_and(|v| !v.is_empty());
                 let is_voicevox = p.format == PluginFormat::Builtin
                     && p.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX;
                 ChainEntry {
                     device_index,
-                    plugin_name: resolve_plugin_name(&self.plugin_db, &p.plugin_id),
+                    plugin_name: resolve_plugin_name(&self.ipc.plugin_db, &p.plugin_id),
                     has_embedded_gui,
                     is_video: p.ports.is_video(),
                     is_voicevox,
@@ -3617,42 +2639,13 @@ impl AppData {
         target: ColorPickerTarget,
         anchor: daw_ui_renderer::Rect,
     ) {
-        self.color_picker_target = Some(target);
-        self.color_picker_anchor = Some(anchor);
-        self.color_picker_session_dirty = false;
-    }
-
-    /// color_picker の色変更 (`SetTrackColor`/`SetClipColor`) 用の undo snapshot。
-    /// picker session 中は session 先頭 (まだ dirty でない) で 1 回だけ、
-    /// picker が開いていない discrete edit (= 「トラック色に戻す」 reset 等) は
-    /// 毎回 snapshot する。
-    fn snapshot_for_color_edit(&mut self) {
-        // (review) 色変更は is_undoable 非登録 (per-drag coalesce のためここで
-        // snapshot する) なので、 チョークポイントの dirty arming も通らない。
-        // 色だけの変更が保存確認なしに失われないようここで立てる (under-mark は
-        // 自己補正されない — recompute_dirty は is_dirty=true のときしか走らない)。
-        self.is_dirty = true;
-        if self.color_picker_target.is_some() {
-            if !self.color_picker_session_dirty {
-                self.push_undo_snapshot();
-                self.color_picker_session_dirty = true;
-            }
-        } else {
-            self.push_undo_snapshot();
-        }
+        self.ui_ephemeral.color_picker_target = Some(target);
+        self.ui_ephemeral.color_picker_anchor = Some(anchor);
+        // picker session 全体を 1 undo step に bracket する (dismiss で end)。
+        self.song_doc.begin_gesture();
     }
 
     // -------- Undo/Redo ----------------------------------------------------
-
-    pub(crate) fn push_undo_snapshot(&mut self) {
-        if self.undo_stack.len() >= UNDO_LIMIT {
-            self.undo_stack.pop_front();
-        }
-        self.undo_stack.push_back(self.song.clone());
-        self.redo_stack.clear();
-        // D3/D4: 編集境界。 arrangement ラベルキャッシュを次フレームで作り直させる。
-        self.song_epoch = self.song_epoch.wrapping_add(1);
-    }
 
     /// D3/D4: arrangement build 用ラベルキャッシュ ([`ArrLabelCache`])。 `song_epoch`
     /// が進んでいれば全 track 名 + content ラベルを 1 度だけ作り直し、 通常フレームは
@@ -3661,60 +2654,42 @@ impl AppData {
     /// (linked clip は同一ラベルを共有)。
     pub(crate) fn arrangement_labels(&self) -> std::cell::Ref<'_, ArrLabelCache> {
         {
-            let mut cache = self.arr_label_cache.borrow_mut();
-            if cache.epoch != self.song_epoch {
+            let mut cache = self.ui_ephemeral.arr_label_cache.borrow_mut();
+            if cache.epoch != self.song_doc.edit_epoch() {
                 cache.track_names.clear();
                 cache.content_labels.clear();
                 cache.section_names.clear();
                 cache.content_names.clear();
-                for t in &self.song.tracks {
+                for t in &self.song_doc.song().tracks {
                     cache
                         .track_names
                         .insert(t.id, std::sync::Arc::from(t.name.as_str()));
                     for c in &t.clips {
                         cache.content_labels.entry(c.content_id).or_insert_with(|| {
-                            crate::view::arrangement_view::clip_display_label(c, &self.song)
+                            crate::view::arrangement_view::clip_display_label(c, &self.song_doc.song())
                         });
                     }
                 }
                 // D4 同件: section ruler / automation clip ラベルも世代キャッシュ。
-                for s in &self.song.sections {
+                for s in &self.song_doc.song().sections {
                     cache
                         .section_names
                         .insert(s.id, std::sync::Arc::from(s.name.as_str()));
                 }
-                for (cid, name) in &self.song.clip_content_names {
+                for (cid, name) in &self.song_doc.song().clip_content_names {
                     cache
                         .content_names
                         .insert(*cid, std::sync::Arc::from(name.as_str()));
                 }
-                cache.epoch = self.song_epoch;
+                cache.epoch = self.song_doc.edit_epoch();
             }
         }
-        self.arr_label_cache.borrow()
+        self.ui_ephemeral.arr_label_cache.borrow()
     }
 
-    /// `is_dirty` を「保存時点の内容との差分」から再計算する (SSoT)。
-    /// 編集 / Undo / Redo は sticky に `is_dirty = true` を立てるだけで、
-    /// 実際に保存状態へ戻ったか否かはここで内容比較して確定する。 タイトル
-    /// 描画 (runner) が毎フレーム is_dirty が立っているときだけ本関数を呼ぶ
-    /// ので、 clean な間は比較ゼロ・dirty な間も 1 フレーム 1 回に収まる。
-    /// snapshot 方式の Undo なので index 比較より内容比較の方が頑健
-    /// (相殺編集 / redo で保存点を通り越す / stack トリミング を正しく判定)。
-    pub(crate) fn recompute_dirty(&mut self) {
-        self.is_dirty = self.song != self.saved_song;
-    }
-
-    /// New / Open / Restore 時に呼ぶ。 現在の song を保存ベースラインに確定し、
-    /// 別プロジェクトの Undo/Redo 履歴を破棄して clean 状態にする。
-    /// (save は履歴を残したいので別扱い: `saved_song` 更新のみ。)
-    fn reset_saved_baseline(&mut self) {
-        self.saved_song = self.song.clone();
-        // D3/D4: New / Open / Restore は song を丸ごと差し替える。 ラベルキャッシュ無効化。
-        self.song_epoch = self.song_epoch.wrapping_add(1);
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        self.is_dirty = false;
+    /// New / Open / Restore 時、 `SongDoc::replace_song` の直後に呼ぶ
+    /// (履歴破棄 / clean 化 / epoch bump は replace_song 側が担う)。
+    fn after_song_replaced(&mut self) {
         // load / new / recovery では直前に sync_song_to_plugin_host が
         // 走り、 口パク binding を持つ project だと mark_lipsync_dirty が 400ms
         // debounce で自動再生成をスケジュールする。 保存ファイル内の口パク clip は
@@ -3732,61 +2707,56 @@ impl AppData {
         // `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
         // 別 project に持ち越さない。 段階ズームのアンカーと lane 高
         // override も旧 project の lane key を指すので一緒に破棄。
-        self.arrange_zoom_history.clear();
-        self.arrange_zoom_anchor = None;
-        self.automation_lane_row_overrides.clear();
+        self.ui_ephemeral.arrange_zoom_history.clear();
+        self.ui_ephemeral.arrange_zoom_anchor = None;
+        self.ui_prefs.automation_lane_row_overrides.clear();
     }
 
     fn undo(&mut self) {
-        let Some(prev) = self.undo_stack.pop_back() else {
+        if !self.song_doc.undo() {
             return;
-        };
-        let current = std::mem::replace(&mut self.song, prev);
-        self.redo_stack.push_back(current);
+        }
         self.after_undo_redo();
     }
 
     fn redo(&mut self) {
-        let Some(next) = self.redo_stack.pop_back() else {
+        if !self.song_doc.redo() {
             return;
-        };
-        let current = std::mem::replace(&mut self.song, next);
-        self.undo_stack.push_back(current);
+        }
         self.after_undo_redo();
     }
 
     fn after_undo_redo(&mut self) {
-        // D3/D4: undo/redo は song を丸ごと差し替える。 ラベルキャッシュを無効化。
-        self.song_epoch = self.song_epoch.wrapping_add(1);
+        // (epoch bump / gesture chain 切断は SongDoc::undo/redo が実施済み。)
         // selected_clip が undo 後も存在するなら維持、消えていれば None。
         // (常に None にすると undo のたびにピアノロールがプレースホルダに戻ってしまう)
         // stable ClipKey 保持なので並べ替え / undo を跨いでも追従する。 clip が
         // 削除されて解決できない key のみ落とす。
-        if let Some(k) = self.selected_clip
+        if let Some(k) = self.selection.selected_clip
             && self.clip_at(k).is_none()
         {
-            self.selected_clip = None;
+            self.selection.selected_clip = None;
         }
-        let mut keys = std::mem::take(&mut self.selected_clips);
+        let mut keys = std::mem::take(&mut self.selection.selected_clips);
         keys.retain(|k| self.clip_at(*k).is_some());
-        self.selected_clips = keys;
+        self.selection.selected_clips = keys;
         // note の index は undo で容易にずれるため、安全側で clear する。
-        self.selected_notes.clear();
+        self.selection.selected_notes.clear();
         // audio event の選択 index も同様に undo でずれるため clear。
-        self.audio_editor_selected_events.clear();
+        self.selection.audio_editor_selected_events.clear();
         // (review) automation point 選択 (`point_idx` positional) と inline 編集中
         // point も undo でずれるため clear (notes / audio events と同じ扱い)。
-        self.selected_automation_points.clear();
-        self.editing_automation_point = None;
+        self.selection.selected_automation_points.clear();
+        self.ui_ephemeral.editing_automation_point = None;
         // audio_editor_clip は index ベース ClipRef。 undo で track/clip が詰まる
         // と別 clip を編集してしまうので、 解決不能 / 非 audio になったら閉じる。
-        if let Some(r) = self.audio_editor_clip {
+        if let Some(r) = self.ui_ephemeral.audio_editor_clip {
             let still_audio = self
-                .song
+                .song_doc.song()
                 .tracks
                 .get(r.track as usize)
                 .and_then(|t| t.clips.get(r.clip as usize))
-                .and_then(|c| self.song.clip_contents.get(&c.content_id))
+                .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
                 .is_some_and(|c| {
                     matches!(c, common::model::ClipContent::Audio(_))
                 });
@@ -3794,28 +2764,28 @@ impl AppData {
                 self.close_audio_editor();
             }
         }
-        self.track_rename_id = None;
-        self.track_rename_text.clear();
-        self.section_rename_id = None;
-        self.section_rename_text.clear();
+        self.ui_ephemeral.track_rename_id = None;
+        self.ui_ephemeral.track_rename_text.clear();
+        self.ui_ephemeral.section_rename_id = None;
+        self.ui_ephemeral.section_rename_text.clear();
         // 削除/undo で消えた section id を選択から除外。
-        self.selected_section_ids
-            .retain(|id| self.song.sections.iter().any(|s| s.id == *id));
-        self.clip_rename = None;
-        self.clip_rename_text.clear();
+        self.selection.selected_section_ids
+            .retain(|id| self.song_doc.song().sections.iter().any(|s| s.id == *id));
+        self.ui_ephemeral.clip_rename = None;
+        self.ui_ephemeral.clip_rename_text.clear();
         // selected_track_ids: undo で track が消えていたら除外。 残りが
         // 空なら「最後の track をカーソル」 にフォールバック (UI が
         // 完全選択ゼロでフリーズしないため)。
         let live_ids: std::collections::HashSet<u32> =
-            self.song.tracks.iter().map(|t| t.id).collect();
-        self.selected_track_ids.retain(|id| live_ids.contains(id));
-        if self.selected_track_ids.is_empty()
-            && let Some(last) = self.song.tracks.last()
+            self.song_doc.song().tracks.iter().map(|t| t.id).collect();
+        self.selection.selected_track_ids.retain(|id| live_ids.contains(id));
+        if self.selection.selected_track_ids.is_empty()
+            && let Some(last) = self.song_doc.song().tracks.last()
         {
-            self.selected_track_ids.push(last.id);
+            self.selection.selected_track_ids.push(last.id);
         }
         // collapsed_groups も track が消えていたら除外。
-        self.collapsed_groups.retain(|id| live_ids.contains(id));
+        self.ui_prefs.collapsed_groups.retain(|id| live_ids.contains(id));
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         // Undo / Redo は plugin_host / audio engine の plugin
@@ -3840,177 +2810,6 @@ impl AppData {
         );
         self.resync_song_edit_texts();    }
 
-    /// `handle_event` の冒頭で push_undo_snapshot を auto する対象 event。
-    ///
-    /// **plugin が削除される event (`DeleteTrack` / `UngroupTracks` /
-    /// `RemoveSlot`) はここに含めない**。 これらは dispatcher 側で
-    /// `RequestAllStates` を経由してから push_undo_snapshot するため、
-    /// auto push と重複してしまう。 plugin state 同期付き Undo の
-    /// 詳細は [`PendingStateRequest`] / [`DeferredEdit`] を参照。
-    fn is_undoable(event: &AppEvent) -> bool {
-        matches!(
-            event,
-            // `New` はここに **入れない**。 New は直前に
-            // `dirty_guard` 確認を挟むため、 dispatch 時に is_dirty を
-            // clobber すると clean な project でも常にダイアログが出てしまう。
-            // また `action_new` が `reset_saved_baseline` で undo/redo を破棄する
-            // ので、 ここで積む undo snapshot はどのみち捨てられる (= dead だった)。
-            AppEvent::AddInstrumentTrack
-                | AppEvent::GroupSelectedTracks { .. }
-                // パラアウト展開は子トラックを作る構造編集なので 1 操作 = 1 undo。
-                // (SetParallelOutputRoute は SetSidechainSource と同じく非 undoable。)
-                | AppEvent::ExplodeParallelOut { .. }
-                | AppEvent::SetTrackParent { .. }
-                | AppEvent::SetLipsyncTarget { .. }
-                | AppEvent::SetMouthMapSlot { .. }
-                | AppEvent::RemoveLastTrack
-                | AppEvent::CommitRenameTrack
-                | AppEvent::CommitRenameSection
-                | AppEvent::CommitRenameClip
-                | AppEvent::CreateClip { .. }
-                | AppEvent::ResizeClip { .. }
-                | AppEvent::DeleteSelectedClip
-                | AppEvent::DuplicateClipsShared(_)
-                | AppEvent::DuplicateClipsUnique(_)
-                | AppEvent::CloneClipsLinked(_)
-                | AppEvent::CloneClipsIndependent(_)
-                // clip drag move。 widget は commit-by-release
-                // (drag 中は overlay 描画のみ、 release frame で `MoveClips`
-                // → `SetClipPositions` を 1 件発火) なので、 1 drag = 1 undo
-                // step になる。 兄弟の Clone*/MoveAutomationClips と同列。
-                | AppEvent::SetClipPositions(_)
-                | AppEvent::MakeClipUnique(_)
-                | AppEvent::SplitClipAtPlayhead { .. }
-                | AppEvent::GlueSelectedClips
-                | AppEvent::SetClipReversed { .. }
-                | AppEvent::SetClipMuted { .. }
-                // clip / note mute トグルは 1 操作 = 1 undo step。
-                | AppEvent::SetClipsMuted { .. }
-                | AppEvent::SetNotesMuted { .. }
-                // ResetTrackClipColors は discrete な一括編集なので undoable。
-                // (SetTrackColor / SetClipColor は picker live drag のため非 undoable)
-                | AppEvent::ResetTrackClipColors { .. }
-                // 注: SetTrackColor / SetClipColor は is_undoable に **入れない**。
-                // color_picker の live drag で毎フレーム発火するため、 ここで
-                // 毎回 snapshot すると undo 履歴が溢れる。 代わりに各 arm が
-                // 「picker session 先頭で 1 回 / discrete edit は毎回」 だけ
-                // snapshot する (image PiP drag と同思想)。
-                | AppEvent::SetClipStretchMode { .. }
-                // inspector の数値 field は scrubable_number 化され、
-                // SetClipGainDb / Pan / Pitch / FadeIn/OutBeats は drag 中 per-
-                // frame 発火するため **非 undoable**。 drag / text 編集 stroke は
-                // `BeginInspectorScrub` (1 snapshot) で 1 undo step に bracket する。
-                | AppEvent::SetClipFadeInCurve { .. }
-                | AppEvent::SetClipFadeOutCurve { .. }
-                | AppEvent::BeginImagePiPDrag
-                | AppEvent::BeginGroupTransformDrag
-                | AppEvent::BeginInspectorScrub
-                | AppEvent::BeginTextPiPDrag
-                | AppEvent::CommitClipTextContentEdit
-                | AppEvent::CommitClipTextFontFamilyEdit
-                | AppEvent::SetClipTextMuted { .. }
-                | AppEvent::SetClipTextAlign { .. }
-                | AppEvent::SetClipTextFadeInCurve { .. }
-                | AppEvent::SetClipTextFadeOutCurve { .. }
-                // EndImagePiPDrag は非 undoable (begin 側に snapshot あり)
-                // 注: SetClipImage{X,Y,W,H,Opacity} は preview drag で
-                // 毎フレーム発火するので非 undoable。 drag begin の
-                // BeginImagePiPDrag 1 個で 1 snapshot を取り、 drag 中
-                // の連続更新は同 step 内に集約する。 inspector の数値
-                // 入力 commit は CommitClipImage*Edit が undoable なので
-                // 1 commit = 1 step を維持。
-                | AppEvent::AutoFadeSelectedClips
-                | AppEvent::AutoCrossfadeSelectedClips
-                | AppEvent::ToggleClipReversed(_)
-                // BounceClipInPlace は async 化したので非 undoable。
-                // 完了 handler (handle_bounce_clip_fx_complete) が成功時のみ 1 回
-                // push_undo_snapshot する (With FX と同じ。 dispatch 時 auto-push は
-                // IPC 往復前なので二重スナップ + 失敗時 spurious を生む)。
-                | AppEvent::SetClipGainDbBatch(_)
-                | AppEvent::SetClipFadeBeatsBatch(_)
-                | AppEvent::SetClipFadeCurveBatch(_)
-                // discrete トグル/ドロップダウンの一括適用 = 1 undo step。
-                | AppEvent::BroadcastDiscreteClipEdit { .. }
-                | AppEvent::DuplicateAudioEditorEvent
-                | AppEvent::SetAudioEventStart { .. }
-                | AppEvent::SetAudioEventTrim { .. }
-                // B12: warp 編集 (auto-warp / 手動 marker 編集) は beat_markers を
-                // 変更する song edit。 auto_warp_clip / mutate_warp_markers は手動
-                // push_undo しないので auto-push 経路でまとめて 1 undo step にする。
-                // marker drag は release で 1 回だけ発火するので各ジェスチャ = 1 step。
-                | AppEvent::AutoWarpSelectedClip
-                | AppEvent::MoveWarpMarker { .. }
-                | AppEvent::AddWarpMarker { .. }
-                | AppEvent::DeleteWarpMarker { .. }
-                | AppEvent::AddAudioEventFromFile { .. }
-                | AppEvent::DeleteAudioEditorSelection
-                | AppEvent::ImportAudio { .. }
-                | AppEvent::ImportVideo { .. }
-                | AppEvent::ImportImage { .. }
-                | AppEvent::AddTextClipAt { .. }
-                | AppEvent::AddNote { .. }
-                | AppEvent::ResizeNote { .. }
-                | AppEvent::ResizeNotes(_)
-                | AppEvent::SetNotePositions(_)
-                | AppEvent::DeleteSelectedNotes
-                | AppEvent::DuplicateSelectedNotes
-                | AppEvent::CopyNotes(_)
-                | AppEvent::SetNoteLyrics { .. }
-                | AppEvent::SetNoteVelocities(_)
-                | AppEvent::SetClipVoice { .. }
-                | AppEvent::QuantizeSelectedNotes(_)
-                | AppEvent::SelectPluginFromDb { .. }
-                | AppEvent::CommitBpmEdit
-                | AppEvent::CommitTimeSigNumEdit
-                | AppEvent::SetSongTimeSigDenominator(_)
-                // gui_01 #028 (Phase 63n-1/-2/-3): automation lane / point / clip 編集。
-                // SetLaneDefault / SetLaneEnabled / SetLaneVisible 等の knob / toggle 系
-                // は drag 中の連続発火 (live preview) を考慮すると個別に Undo step 化
-                // するのは UX 過多なので、 構造変化系 (lane add / delete / clip 追加削除
-                // / point 追加削除 / curve type 変更) のみ undoable に登録する。
-                // SetLaneDefault と SetAutomationCurveType は { prev, next } を持つので
-                // 後で snapshotless Undo に置換できるが、 当面は Song snapshot 経由。
-                | AppEvent::AddAutomationFromLastTouched
-                | AppEvent::AddImageAutomationLane { .. }
-                | AppEvent::RemoveImageAutomationLane { .. }
-                | AppEvent::AddTextAutomationLane { .. }
-                | AppEvent::RemoveTextAutomationLane { .. }
-                | AppEvent::AddGroupAutomationLane { .. }
-                | AppEvent::RemoveGroupAutomationLane { .. }
-                | AppEvent::CreateAutomationClip { .. }
-                | AppEvent::DeleteLane { .. }
-                | AppEvent::AddAutomationPoint { .. }
-                | AppEvent::MoveAutomationPoints { .. }
-                | AppEvent::DeleteAutomationPoints { .. }
-                // inline 数値入力の確定 1 件は discrete commit なので
-                // Undo step 化 (`BeginEditAutomationPointValue` は session-only で除外)。
-                | AppEvent::SetAutomationPointValue { .. }
-                | AppEvent::SetAutomationCurveType { .. }
-                | AppEvent::MoveAutomationClips { .. }
-                | AppEvent::CloneAutomationClipsLinked { .. }
-                | AppEvent::CloneAutomationClipsIndependent { .. }
-                | AppEvent::ResizeAutomationClips { .. }
-                | AppEvent::DeleteAutomationClips { .. }
-                | AppEvent::MakeAutomationClipUnique(_)
-                | AppEvent::DuplicateAutomationClipsShared(_)
-                | AppEvent::DuplicateAutomationClipsUnique(_)
-                // Phase 3: point quantize は構造変化系として Undo step
-                // 化。 SelectAutomationPoints は session-only なので除外。
-                | AppEvent::QuantizeSelectedAutomationPoints(_)
-                // gui_01 #033 Phase 63n-9: tension/bend handle drag は
-                // release frame の 1 件のみ発火 (widget 内仕様、 連続発火
-                // による Undo 履歴爆発はない)。 値 1 件で point の curve
-                // を上書きする structural change なので Undo step 化。
-                | AppEvent::SetAutomationCurveBezierTension { .. }
-                | AppEvent::SetAutomationCurveExponentialBend { .. }
-                // Phase 7 B5 (`docs/plan_scale.html`): scale event 編集と
-                // pitch quantize は構造変化系として Undo step 化。 Snap on
-                // Draw / Snap Live Input toggle は session-only で除外。
-                | AppEvent::SetScaleAtPlayhead { .. }
-                | AppEvent::ClearScaleChanges
-                | AppEvent::QuantizePitchesToScale(_)
-        )
-    }
 
     /// 選択中ノートを clipboard envelope (`ClipboardPayload::Notes`) JSON に。
     /// 何も copy できない (選択無し / クリップ未選択 / シリアライズ失敗) 場合は `None`。
@@ -4018,14 +2817,14 @@ impl AppData {
     /// 時間は選択群の最早 start を 0 とした相対に正規化する (paste でマウス拍に置く)。
     pub fn copy_notes_clip(&self) -> Option<(String, usize)> {
         let r = self.selected_clip_ref()?;
-        if self.selected_notes.is_empty() {
+        if self.selection.selected_notes.is_empty() {
             return None;
         }
-        let track = self.song.tracks.get(r.track as usize)?;
+        let track = self.song_doc.song().tracks.get(r.track as usize)?;
         let clip = track.clips.get(r.clip as usize)?;
-        let notes = self.song.clip_notes(clip);
+        let notes = self.song_doc.song().clip_notes(clip);
         let mut copied: Vec<Note> = self
-            .selected_notes
+            .selection.selected_notes
             .iter()
             .filter_map(|i| notes.get(*i as usize).cloned())
             .collect();
@@ -4043,7 +2842,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song.project_id,
+            self.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::Notes(copied),
         )
         .to_json()?;
@@ -4058,37 +2857,29 @@ impl AppData {
             return 0;
         }
         let Some(r) = self.selected_clip_ref() else {
-            self.status_message = "貼り付け先のクリップが選択されていません".to_string();
+            self.ui_ephemeral.status_message = "貼り付け先のクリップが選択されていません".to_string();
             return 0;
         };
-        // 貼り付け先 clip が実在しなければ spurious な undo snapshot を積まない。
-        if self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-            .is_none()
-        {
-            return 0;
-        }
         let anchor = at_beat.max(0.0);
-        self.push_undo_snapshot();
         let count = notes.len();
-        let Some(dest) = self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        else {
+        // 貼り付け先 clip が実在しなければ (edit 前に判定して) spurious な
+        // undo snapshot を積まない。
+        let Some(local_sel) = self.edit_song(|song| {
+            let dest = song.notes_in_clip_mut(r.track as usize, r.clip as usize)?;
+            let mut new_indices = Vec::with_capacity(notes.len());
+            for src in &mut notes {
+                src.start_beat += anchor;
+                new_indices.push(dest.len() as u32);
+                dest.push(src.clone());
+            }
+            // 貼り付けた note を勝者として重なり解消。選択は remap で追従。
+            let remap = resolve_note_overlaps(dest, &new_indices);
+            Some(remap_indices(&remap, &new_indices))
+        }).flatten() else {
             return 0;
         };
-        let mut new_indices = Vec::with_capacity(notes.len());
-        for src in &mut notes {
-            src.start_beat += anchor;
-            new_indices.push(dest.len() as u32);
-            dest.push(src.clone());
-        }
-        // 貼り付けた note を勝者として重なり解消。選択は remap で追従。
-        let remap = resolve_note_overlaps(dest, &new_indices);
-        let local_sel = remap_indices(&remap, &new_indices);
         // selected_notes は packed note id。貼り付け先 (anchor) clip の slot で pack。
-        self.selected_notes = self.pack_clip_selection(r, &local_sel);
+        self.selection.selected_notes = self.pack_clip_selection(r, &local_sel);
         self.sync_song_to_plugin_host();
         count
     }
@@ -4097,17 +2888,19 @@ impl AppData {
         let Some(r) = self.selected_clip_ref() else {
             return;
         };
-        let Some(notes) = self
-            .song
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        else {
-            return;
-        };
-        let Some(note) = notes.get_mut(note_idx as usize) else {
-            return;
-        };
-        note.velocity = velocity;
-        self.sync_song_to_plugin_host();
+        let changed = self.edit_song(|song| {
+            let Some(notes) = song.notes_in_clip_mut(r.track as usize, r.clip as usize) else {
+                return false;
+            };
+            let Some(note) = notes.get_mut(note_idx as usize) else {
+                return false;
+            };
+            note.velocity = velocity;
+            true
+        }) == Some(true);
+        if changed {
+            self.sync_song_to_plugin_host();
+        }
     }
 
     /// gui_01 #018 (M14 Phase 64): velocity lane drag の release frame で
@@ -4124,16 +2917,18 @@ impl AppData {
         self.for_each_note_clip_group(
             updates.iter().map(|&(id, vel)| (id, vel)),
             |app, _slot, r, items| {
-                if let Some(notes) =
-                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
-                {
-                    for &(local, vel) in items {
-                        if let Some(note) = notes.get_mut(local) {
-                            note.velocity = vel;
-                            changed = true;
+                app.edit_song(|song| {
+                    if let Some(notes) =
+                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    {
+                        for &(local, vel) in items {
+                            if let Some(note) = notes.get_mut(local) {
+                                note.velocity = vel;
+                                changed = true;
+                            }
                         }
                     }
-                }
+                });
             },
         );
         if changed {
@@ -4144,11 +2939,11 @@ impl AppData {
     fn quantize_selected_notes(&mut self, div: u8) {
         // 選択 (packed) を所属クリップごとに分配し、各クリップ内 clip-local start を
         // 量子化。重なりは edit_clip_notes が解消し選択 (packed) を remap で追従。
-        if self.selected_notes.is_empty() {
+        if self.selection.selected_notes.is_empty() {
             return;
         }
         let div = div.max(1) as f64;
-        let selected = self.selected_notes.clone();
+        let selected = self.selection.selected_notes.clone();
         self.for_each_note_clip_group(
             selected.into_iter().map(|id| (id, ())),
             |app, slot, r, items| {
@@ -4169,8 +2964,79 @@ impl AppData {
     }
 
     fn resize_track_peak_display(&mut self) {
-        let n = self.song.tracks.len();
-        self.track_peak_display.resize(n, (0.0, 0.0));
+        let n = self.song_doc.song().tracks.len();
+        self.transport.track_peak_display.resize(n, (0.0, 0.0));
+    }
+}
+
+/// v29 機械適応 helper: 安定 `device_id` (`PluginInstance::id`) を、 GUI の
+/// 既存ロジックが使う旧 `(track_id, device_index)` 座標へ逆引きする。
+/// track 内 device は `(Track::id, Vec index)`、 master bus の device は
+/// `(MASTER_TRACK_ID, master_fx_chain の Vec index)`。 見つからなければ
+/// `None` (= 削除済み device への stale event 等は呼び出し側で無視する)。
+///
+/// S3b で選択/参照ロジック自体を id 化するまでの橋渡し
+/// (`docs/plan_arch_refactor.md` §1)。
+pub fn find_device_by_id(
+    song: &common::model::Song,
+    device_id: u64,
+) -> Option<(u32, u32)> {
+    if device_id == 0 {
+        return None;
+    }
+    for t in &song.tracks {
+        if let Some(i) = t.devices.iter().position(|d| d.id == device_id) {
+            return Some((t.id, i as u32));
+        }
+    }
+    if let Some(i) = song
+        .master_fx_chain
+        .iter()
+        .position(|d| d.id == device_id)
+    {
+        return Some((common::model::MASTER_TRACK_ID, i as u32));
+    }
+    None
+}
+
+/// 逆方向: 旧 `(track_id, device_index)` 座標から安定 `device_id` を引く。
+/// IPC 送信サイト (SetSlotPlugin / RemoveSlotPlugin / GUI open 等) が
+/// positional な GUI 内部状態から protocol の id addressing へ変換するのに
+/// 使う。 `track_id == MASTER_TRACK_ID` は `master_fx_chain` を見る。
+/// device が存在しない / id 未採番 (0) なら `None`。
+pub fn device_id_at(
+    song: &common::model::Song,
+    track_id: u32,
+    device_index: u32,
+) -> Option<u64> {
+    let devices: &[common::model::PluginInstance] =
+        if track_id == common::model::MASTER_TRACK_ID {
+            &song.master_fx_chain
+        } else {
+            song.tracks
+                .iter()
+                .find(|t| t.id == track_id)
+                .map(|t| t.devices.as_slice())?
+        };
+    devices
+        .get(device_index as usize)
+        .map(|d| d.id)
+        .filter(|&id| id != 0)
+}
+
+/// v29 機械適応 helper: `(track_idx, clip_idx)` の MIDI content を引く
+/// (`Song::notes_in_clip_mut` の content 版)。 note 追加サイトが
+/// `MidiContent::alloc_note_id()` で安定 id を採番できるように allocator
+/// ごと返す。
+pub(crate) fn midi_content_in_clip_mut(
+    song: &mut Song,
+    track_idx: usize,
+    clip_idx: usize,
+) -> Option<&mut MidiContent> {
+    let content_id = song.tracks.get(track_idx)?.clips.get(clip_idx)?.content_id;
+    match song.clip_contents.get_mut(&content_id) {
+        Some(ClipContent::Midi(m)) => Some(m),
+        _ => None,
     }
 }
 
@@ -4179,8 +3045,10 @@ impl AppData {
 /// `loaded_slots` の値: 1 つの (track, device_index) ペアに対する load 情報。
 #[derive(Debug, Clone)]
 pub struct LoadedSlotInfo {
-    /// session-unique numeric plugin id (= plugin_host が割り当てる u32)。
-    pub plugin_id: u32,
+    /// v29: 安定 device id (`PluginInstance::id`)。 旧 session-unique な
+    /// `plugin_id: u32` (plugin_host 採番) は廃止され、 host 側 addressing
+    /// もこの id 一本 (`docs/plan_arch_refactor.md` §1)。
+    pub device_id: u64,
     /// stable string id (= `PluginInstance::plugin_id` と同じ値)。
     /// reconcile の device-level diff で「Song と host で同じ plugin が
     /// 居るか」 を判定するキー。
@@ -4194,10 +3062,10 @@ pub struct LoadedSlotInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SlotReconcileAction {
     /// host にあるが Song に無い device を host から消す
-    /// (= `MainToChild::RemoveSlotPlugin` 相当)。
+    /// (= `PluginCommand::RemoveSlotPlugin` 相当)。
     RemoveSlot { track_id: u32, index: u32 },
     /// Song にあるが host に無い、 もしくは plugin_id_str が違う device を
-    /// (再) load する (= `MainToChild::SetSlotPlugin` 相当)。 caller が
+    /// (再) load する (= `PluginCommand::SetSlotPlugin` 相当)。 caller が
     /// `plugin_db` から format / path を解決して IPC を組み立てる。
     LoadSlot {
         track_id: u32,
@@ -4302,6 +3170,9 @@ pub enum PendingStateRequest {
     Save {
         path: PathBuf,
         snapshot: Option<Box<Song>>,
+        /// snapshot を凍結した瞬間の `edit_epoch` (dirty 判定: finish_save が
+        /// 「round-trip 中に live へ編集が入ったか」 を epoch 差で判定する)。
+        snap_epoch: u64,
     },
     /// plugin が **削除される** 編集操作の Undo snapshot 作成。
     /// state を Song に書き込んでから [`AppData::push_undo_snapshot`]
@@ -4469,6 +3340,7 @@ mod lipsync_fingerprint_tests {
 
     fn note(pitch: u8, vel: u8, start: f64, dur: f64, lyric: &str) -> Note {
         Note {
+            id: 0,
             start_beat: start,
             duration_beats: dur,
             pitch,
@@ -4487,6 +3359,7 @@ mod lipsync_fingerprint_tests {
             cid,
             ClipContent::Midi(MidiContent {
                 notes: vec![note(60, 100, 0.0, 1.0, "ら")],
+                next_note_id: 2,
             }),
         );
         let vocal = track_with(|t| {
@@ -4691,14 +3564,13 @@ pub enum AppEvent {
     /// に clamp 済前提だが defensive で再 clamp。 `bpm_edit_text` も同期して
     /// text input mode の表示を追随させる。 Undo 対象外 (= 連続発火、
     /// release edge の ParamGestureEnd で 1 step Undo 化を別途検討)。
-    /// 軽量 IPC `MainToChild::SetSongBpm` で audio engine 即時反映。
+    /// 軽量 IPC `AudioCommand::SetSongBpm` で audio engine 即時反映。
     SetSongBpmFromScrub(f32),
     /// Phase 5 Step 5.1 follow-up: TimeSig numerator scrub。 1..=32 clamp、
-    /// `time_sig_num_edit_text` 同期、 軽量 IPC `MainToChild::SetSongTimeSigNumerator`。
+    /// `time_sig_num_edit_text` 同期、 軽量 IPC `AudioCommand::SetSongTimeSigNumerator`。
     SetSongTimeSigNumFromScrub(u8),
     Undo,
     Redo,
-    PushUndoSnapshot,
     QuantizeSelectedNotes(u8),
     /// 鍵盤レーン click のピッチプレビュー (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 piano_roll_view が毎フレーム
@@ -5063,7 +3935,7 @@ pub enum AppEvent {
     /// transport 4 way toggle。 session-only / Undo 対象外。
     SetRecordingMode(common::model::RecordingMode),
     /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 transport bar の toggle
-    /// で発火、 `AppData.metronome_enabled` を更新 + `MainToChild::Set
+    /// で発火、 `AppData.metronome_enabled` を更新 + `AudioCommand::Set
     /// MetronomeEnabled(bool)` を audio に送信。 session-only / Undo 対象外。
     SetMetronomeEnabled(bool),
     /// Phase 7 B4 Step C/D (2026-05-13): MIDI 録音 toggle。 Record button
@@ -5097,17 +3969,14 @@ pub enum AppEvent {
     /// 受信。 plugin_params にキャッシュ。 plugin reload / `params.changed`
     /// 経由で送られるたびに上書き。
     PluginParamListFromChild {
-        track: u32,
-        index: u32,
-        plugin_id: u32,
+        device_id: u64,
         params: Vec<common::protocol::PluginParamInfo>,
         has_embedded_gui: bool,
     },
     /// Phase 2: plugin GUI で knob touch (CLAP gesture begin / VST3
     /// beginEdit)。 last_touched_param を plugin param で更新する。
     PluginParamTouchedFromChild {
-        track: u32,
-        index: u32,
+        device_id: u64,
         param_id: u32,
         display_name: String,
     },
@@ -5115,8 +3984,7 @@ pub enum AppEvent {
     /// / VST3 performEdit)。 Phase 2 では cache 用、 Phase 4 で recording
     /// mode の point 生成 source。
     PluginParamValueChangedFromChild {
-        track: u32,
-        index: u32,
+        device_id: u64,
         param_id: u32,
         value: f64,
     },
@@ -5125,8 +3993,7 @@ pub enum AppEvent {
     /// 対応 PluginParam target を remove する (= Touch mode の recording
     /// 停止 + audio bypass 解除)。
     PluginParamGestureEndFromChild {
-        track: u32,
-        index: u32,
+        device_id: u64,
         param_id: u32,
     },
     /// 子プロセス (daw_audio / daw_plugin_host) が exit したことを
@@ -5487,21 +4354,19 @@ pub enum AppEvent {
 
     // -------- IPC events from plugin_host ---------------------------------
     Tick { samples: u64, peak_l: f32, peak_r: f32, preroll: u64 },
-    GuiOpenedFromChild { track: u32, index: u32, width: u32, height: u32 },
-    GuiClosedFromChild { track: u32, index: u32 },
+    GuiOpenedFromChild { device_id: u64, width: u32, height: u32 },
+    GuiClosedFromChild { device_id: u64 },
     SlotPluginLoadedFromChild {
-        track: u32,
-        index: u32,
+        /// v29: 安定 device id (`PluginInstance::id`)。 handler 側で
+        /// `find_device_by_id` により (track_id, index) へ逆引きして既存
+        /// bookkeeping (loaded_slots 等) に繋ぐ。
+        device_id: u64,
         id: String,
         name: String,
-        /// plugin_host が割り振った session-unique な plugin instance id。
-        /// daw_gui 側は `track_plugin_ids` に登録して、 後続の delete /
-        /// ungroup で先に ClosePluginShmem を audio に直接送るのに使う。
-        plugin_id: u32,
         /// `ProcessData` shared memory の名前。 audio engine に
         /// `OpenPluginShmem` を送るのに使う。 SSoT: incoming bridge が
         /// stale な audio_tx clone を握る代わりに、 ここまで運んで AppData
-        /// が live な `self.audio_tx` (respawn で差し替わる側) から送る。
+        /// が live な `self.ipc.audio_tx` (respawn で差し替わる側) から送る。
         shmem_id: String,
         /// saved state を `state_load(&bytes)` で復元しようとして失敗した
         /// 場合の理由文字列。 `None` = state_load が呼ばれなかった
@@ -5513,30 +4378,43 @@ pub enum AppEvent {
         /// `is_main=false` audio 出力ポート数 (0 = 通常の単一出力)。GUI が
         /// 「パラアウト展開」 で作る子トラック数 / ルーティング行数に使う。
         aux_output_count: u8,
+        /// v29: `SetSlotPlugin` の要求世代 echo。 最新世代のみ受理する
+        /// (A→B 連続差し替えの stale 応答 race 対策)。
+        generation: u64,
     },
     /// plugin_host が plugin destroy したことの通知。 `track_plugin_ids`
-    /// から該当 plugin_id を取り除き、 もし audio engine 側で未削除
+    /// から該当 device_id を取り除き、 もし audio engine 側で未削除
     /// (= daw_gui が直接 ClosePluginShmem を先送りしていない経路で
     /// 来た場合) なら ClosePluginShmem を audio に転送する。
     SlotPluginUnloadedFromChild {
-        plugin_id: u32,
+        device_id: u64,
     },
     /// plugin_host で `SetSlotPlugin` の load が失敗した通知。
     /// `pending_plugin_loads` から該当 entry を解放し、 status_message に
     /// エラー表示、 `pending_play` が立っていれば flush する。
     SlotPluginLoadFailedFromChild {
-        track: u32,
-        index: u32,
+        device_id: u64,
         plugin_id: String,
         reason: String,
+        /// v29: 要求世代 echo (最新世代のみ受理)。
+        generation: u64,
     },
     /// PR3.3: plugin_host から forward された 「plugin が報告した latency」 通知。
     /// `plugin_latencies` に積んで track の累積 latency を再計算、 song を
     /// 更新して LoadSong を daw_audio に再送 (compile_schedule で PDC 反映)。
     PluginLatencyChangedFromChild {
-        plugin_id: u32,
+        device_id: u64,
         samples: u32,
     },
+    /// (v29 `docs/plan_arch_refactor.md` §4) worker dispatch が timeout し、
+    /// audio engine が該当 device を quarantine した (無音バイパス)。
+    /// status_message でユーザーに可視化する。
+    PluginUnresponsive {
+        device_id: u64,
+    },
+    /// (v29) worker pool 全体の完了待ちが timeout = plugin_host 応答不能。
+    /// plugin_host の respawn 経路 (`handle_child_disconnected`) に乗せる。
+    WorkerPoolStalled,
     AllStatesReceived(Vec<SlotState>),
     RescanPluginDb,
     PluginDbRescanCompleted,
@@ -5603,7 +4481,7 @@ pub enum AppEvent {
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
     /// Phase 7 B4 (2026-05-13): track Record-arm を toggle。 業界標準どおり
-    /// caller 側で前状態を反転、 audio engine には `MainToChild::SetTrackArmed`
+    /// caller 側で前状態を反転、 audio engine には `AudioCommand::SetTrackArmed`
     /// で確定値を送る。 session-only / Undo 対象外 (= 業界標準は arm を Undo
     /// 履歴に積まない、 mute / solo と同 idiom)。
     ToggleTrackArmed(u32),
@@ -5649,11 +4527,11 @@ pub enum AppEvent {
     /// は routing graph に影響するので 構造変化 → full-song resend。
     SetSendMode { track_id: u32, send_idx: usize, mode: SendMode },
     /// `track_id` の `sends[send_idx].gain` を設定 (clamp 0..2) + realtime
-    /// `MainToChild::SetSendGain` を送る。 SetTrackVolume と同 idiom、
+    /// `AudioCommand::SetSendGain` を送る。 SetTrackVolume と同 idiom、
     /// full-song resend しない (= drag 中の高頻度更新)。
     SetSendGain { track_id: u32, send_idx: usize, gain: f32 },
     /// `track_id` の `sends[send_idx].enabled` を設定 + realtime
-    /// `MainToChild::SetSendEnabled` を送る。 full-song resend しない。
+    /// `AudioCommand::SetSendEnabled` を送る。 full-song resend しない。
     SetSendEnabled { track_id: u32, send_idx: usize, enabled: bool },
     /// 宛先トラックピッカーを開く (= send 元 = `src_track_id`)。
     OpenSendPicker { src_track_id: u32 },
@@ -5731,7 +4609,7 @@ pub enum AppEvent {
     /// `voicevox_synth_status` map を更新して、クリップ上スピナー + 全体オーバーレイ +
     /// engine 未接続警告を駆動する。派生 UI 状態なので Undo 対象外。
     VoicevoxSynthStatus {
-        plugin_id: u32,
+        device_id: u64,
         busy: bool,
         failing: bool,
     },
@@ -6065,7 +4943,7 @@ pub enum AppEvent {
     // ---- Bounce (with FX) — Phase 2 PR-C --------------------------------
     /// audio clip を **plugin chain 込み** で render し、 結果を **新 track**
     /// に新 audio clip として配置 (`docs/plan_audio_followup.md` PR-C)。
-    /// async (= IPC freewheel render → ChildToMain::BounceClipFxComplete)。
+    /// async (= IPC freewheel render → AudioEvent::BounceClipFxComplete)。
     /// `is_undoable` には入れず、 完了通知 handler 内で
     /// `push_undo_snapshot` を明示呼び出し (= 1 完了 = 1 Undo step)。
     BounceClipWithFx(ClipRef),
@@ -6083,7 +4961,7 @@ pub enum AppEvent {
     /// plugin host から歌唱合成完了 (or timeout) 通知。`pending_vocal_synth_bounce`
     /// があれば歌唱 bounce の offline render (`start_clip_bounce`) を開始する。
     VocalSynthReady {
-        plugin_id: u32,
+        device_id: u64,
     },
 
     // ---- multi-clip drag batch (Phase 2 PR-B) ---------------------------
@@ -6281,6 +5159,9 @@ impl AppData {
     /// AppEvent dispatcher。view から `Edit::mutate` 経由で、background thread
     /// から `EventLoopProxy<AppEvent>` 経由で呼ばれる。
     pub fn handle_event(&mut self, event: AppEvent) {
+        // この event の ambient undo scope を確定する (1 event 内の複数 edit_song は
+        // 1 undo step に squash、 Begin*/End* gesture 中は drag 全体で 1 step)。
+        self.song_doc.begin_event();
         // Video export 中（音声 freewheel → 映像 render）は、export フロー自身の
         // inbound event 以外をすべて drop し、song / transport / plugin を mutate
         // させない。危険な window は音声 freewheel（offline mode）: ここで song を
@@ -6291,7 +5172,7 @@ impl AppData {
         //   - MIDI ハードウェア入力スレッド（`midi.rs` dispatch → proxy.send_event で
         //     MidiNoteOn / MidiControlChange を直送）。export 中のライブ MIDI / CC
         //     (MIDI Learn 経由で TrackVolume 等) が offline render を乱すのを防ぐ。
-        //   - IPC bridge（ChildToMain → AppEvent）。
+        //   - IPC bridge（AudioEvent / PluginEvent → AppEvent）。
         // これらは背景スレッド発の AppEvent で、main window の widget 入力ではないため
         // gui_01 #065（true modal の pointer/keyboard masking）では遮断できない。
         // main window 上の UI（fader / menu / arrangement 等）の視覚的遮断は #065 の
@@ -6302,7 +5183,7 @@ impl AppData {
         //   ExportProgress / ExportFinished … background render thread からの進捗/完了
         //   CancelExport … modal の Cancel ボタン（plugin GUI 等の別 OS window 経由の
         //   close は handle_event を通らないので on_tick 側で別 gate）
-        if self.pending_video_export.is_some() || self.export_stage.is_some() {
+        if self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some() {
             let allow = matches!(
                 event,
                 AppEvent::ExportWavComplete { .. }
@@ -6345,21 +5226,6 @@ impl AppData {
             }
         }
 
-        if Self::is_undoable(&event) {
-            self.push_undo_snapshot();
-            // undoable な discrete edit はすべてここで dirty を立てる。
-            // `is_dirty` の真値は `song != saved_song` (recompute_dirty) だが、
-            // それを再評価するトリガ (sticky flag) を各ハンドラが手で立てる方式
-            // だと立て忘れが起きる (= `set_clip_voice` が声/スタイル変更で dirty に
-            // しなかった症状)。undo snapshot を積むのと同じ単一
-            // チョークポイントで dirty を立てれば、undo 対象 = 編集 = dirty が
-            // 一致し、新しい discrete edit を is_undoable に追加するだけで dirty も
-            // 自動で付く。no-op edit (値が変わらない) で over-mark しても、runner
-            // が毎フレーム recompute_dirty で `song == saved_song` を見て clean に
-            // 戻すので spurious な '*' は出ない (= 過剰 set は自己補正される)。
-            self.is_dirty = true;
-        }
-
         match event {
             // New / Open は現在のプロジェクトを破棄するので、 dirty なら
             // 先に保存確認ダイアログを挟む (clean なら即実行)。
@@ -6371,24 +5237,24 @@ impl AppData {
                 // に余分な Save が積まれ、 続く New/Open が project を破壊しうる (guard_save が
                 // 発行する保存に一本化する)。 finish_save の再保存ループは begin_save 直呼び
                 // なのでこの gate を通らない。
-                if self.dirty_guard.is_none()
-                    && self.guard_after_save.is_none()
-                    && self.guard_pending_action.is_none()
+                if self.ui_ephemeral.dirty_guard.is_none()
+                    && self.ui_ephemeral.guard_after_save.is_none()
+                    && self.ui_ephemeral.guard_pending_action.is_none()
                 {
                     self.action_save();
                 }
             }
             AppEvent::SaveAs => {
-                if self.dirty_guard.is_none()
-                    && self.guard_after_save.is_none()
-                    && self.guard_pending_action.is_none()
+                if self.ui_ephemeral.dirty_guard.is_none()
+                    && self.ui_ephemeral.guard_after_save.is_none()
+                    && self.ui_ephemeral.guard_pending_action.is_none()
                 {
                     self.action_save_as();
                 }
             }
             AppEvent::DirtyGuardSave => self.guard_save(),
             AppEvent::DirtyGuardDiscard => {
-                if let Some(action) = self.dirty_guard.take() {
+                if let Some(action) = self.ui_ephemeral.dirty_guard.take() {
                     // 「保存せず続行/終了」 = 現プロジェクトの未保存変更を破棄する。
                     // その変更を写した autosave (sidecar / session recovery file) を
                     // 消してから操作を実行する。 残すと、 同じ file を開き直したとき /
@@ -6399,7 +5265,7 @@ impl AppData {
                 }
             }
             AppEvent::DirtyGuardCancel => {
-                self.dirty_guard = None;
+                self.ui_ephemeral.dirty_guard = None;
             }
             AppEvent::Play => {
                 self.play();
@@ -6408,7 +5274,7 @@ impl AppData {
                 self.stop();
             }
             AppEvent::PlayToggle => {
-                if self.is_playing {
+                if self.transport.is_playing {
                     self.stop();
                 } else {
                     self.play();
@@ -6429,14 +5295,14 @@ impl AppData {
                 // reorder race-free な addressing (audio 側で index に再解決)。
                 // 対象 track が存在しない / pitch=None なら next=None (= 発音停止)。
                 let next = pitch
-                    .and_then(|p| self.song.tracks.get(track_idx as usize).map(|t| (t.id, p)));
-                for action in diff_preview(self.preview_note, next) {
+                    .and_then(|p| self.song_doc.song().tracks.get(track_idx as usize).map(|t| (t.id, p)));
+                for action in diff_preview(self.recording.preview_note, next) {
                     match action {
                         PreviewAction::NoteOff { track_id, pitch } => {
-                            self.send_audio(MainToChild::PreviewNoteOff { track_id, pitch });
+                            self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
                         }
                         PreviewAction::NoteOn { track_id, pitch } => {
-                            self.send_audio(MainToChild::PreviewNoteOn {
+                            self.send_audio(AudioCommand::PreviewNoteOn {
                                 track_id,
                                 pitch,
                                 velocity: PREVIEW_VELOCITY,
@@ -6444,49 +5310,45 @@ impl AppData {
                         }
                     }
                 }
-                self.preview_note = next;
+                self.recording.preview_note = next;
             }
             AppEvent::LoopSelectedClipToggle { automation } => {
                 self.loop_selected_clip_toggle(automation);
             }
             AppEvent::BpmEditChanged(s) => {
-                self.bpm_edit_text = s;
+                self.ui_ephemeral.bpm_edit_text = s;
             }
             AppEvent::CommitBpmEdit => {
                 self.commit_bpm_edit();
             }
             AppEvent::SetSongBpmFromScrub(next) => {
                 let clamped = next.clamp(1.0, 400.0);
-                if (self.song.bpm - clamped).abs() > f32::EPSILON {
-                    let old_bpm = self.song.bpm;
-                    self.song.bpm = clamped;
-                    self.bpm_edit_text = format!("{:.1}", clamped);
+                if (self.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
+                    let old_bpm = self.song_doc.song().bpm;
+                    // scrub の連続 commit は stream gesture で 1 undo step に
+                    // squash する (dirty / autosave は epoch bump が担う)。
+                    let scope = self.song_doc.stream_scope(StreamGesture::BpmScrub);
+                    self.song_doc.edit(scope, |song| song.bpm = clamped);
+                    self.ui_ephemeral.bpm_edit_text = format!("{:.1}", clamped);
                     // Raw audio clip を秒固定スケール (r.md #7)。Raw clip があれば
                     // LoadSong (decode 再利用で軽量) で再生 window を追従させ、
                     // 無ければ従来の軽量 SetSongBpm で済ます。
                     if !self.rescale_raw_clips_for_bpm_change(old_bpm, clamped) {
-                        self.send_audio(MainToChild::SetSongBpm { bpm: clamped });
+                        self.send_audio(AudioCommand::SetSongBpm { bpm: clamped });
                     }
-                    // Phase 6 review (dirty flag fix): scrub 中の連続 commit
-                    // は Undo step を増やさない方針なので `push_undo_snapshot`
-                    // は呼ばないが、 `is_dirty` は立てる。 立てないと autosave
-                    // が走らず、 BPM scrub だけで crash した場合に変更が消える
-                    // (= silent data loss)。
-                    self.is_dirty = true;
                 }
             }
             AppEvent::SetSongTimeSigNumFromScrub(next) => {
                 let clamped = next.clamp(1, 32);
-                if self.song.time_sig.0 != clamped {
-                    self.song.time_sig.0 = clamped;
-                    self.time_sig_num_edit_text = clamped.to_string();
-                    self.send_audio(MainToChild::SetSongTimeSigNumerator { num: clamped });
-                    // 上と同じ理由で autosave 用に dirty flag を立てる。
-                    self.is_dirty = true;
+                if self.song_doc.song().time_sig.0 != clamped {
+                    let scope = self.song_doc.stream_scope(StreamGesture::TimeSigScrub);
+                    self.song_doc.edit(scope, |song| song.time_sig.0 = clamped);
+                    self.ui_ephemeral.time_sig_num_edit_text = clamped.to_string();
+                    self.send_audio(AudioCommand::SetSongTimeSigNumerator { num: clamped });
                 }
             }
             AppEvent::TimeSigNumEditChanged(s) => {
-                self.time_sig_num_edit_text = s;
+                self.ui_ephemeral.time_sig_num_edit_text = s;
             }
             AppEvent::CommitTimeSigNumEdit => {
                 self.commit_time_sig_num_edit();
@@ -6496,9 +5358,6 @@ impl AppData {
             }
             AppEvent::Undo => self.undo(),
             AppEvent::Redo => self.redo(),
-            AppEvent::PushUndoSnapshot => {
-                self.push_undo_snapshot();
-            }
             AppEvent::QuantizeSelectedNotes(div) => {
                 self.quantize_selected_notes(div);
             }
@@ -6519,10 +5378,10 @@ impl AppData {
                 // gui_01 #034 (Phase 63n-10): master row の expansion は
                 // 通常 track の set とは別 SSoT。
                 if track_id == common::model::MASTER_TRACK_ID {
-                    self.master_row_automation_expanded =
-                        !self.master_row_automation_expanded;
-                } else if !self.expanded_automation_tracks.insert(track_id) {
-                    self.expanded_automation_tracks.remove(&track_id);
+                    self.ui_prefs.master_row_automation_expanded =
+                        !self.ui_prefs.master_row_automation_expanded;
+                } else if !self.ui_prefs.expanded_automation_tracks.insert(track_id) {
+                    self.ui_prefs.expanded_automation_tracks.remove(&track_id);
                 }
             }
             AppEvent::SetLaneEnabled {
@@ -6555,7 +5414,7 @@ impl AppData {
                 prev_px: _,
                 next_px,
             } => {
-                self.track_row_overrides.insert(track_id, next_px);
+                self.ui_prefs.track_row_overrides.insert(track_id, next_px);
             }
             AppEvent::AddAutomationPoint {
                 track_id,
@@ -6574,12 +5433,12 @@ impl AppData {
                 // session-only: 該当 point が存在するときだけ編集開始 (race で
                 // 既に消えていれば no-op)。
                 if self.automation_point_value(&key).is_some() {
-                    self.editing_automation_point = Some(key);
+                    self.ui_ephemeral.editing_automation_point = Some(key);
                 }
             }
             AppEvent::SetAutomationPointValue { key, value } => {
                 self.set_automation_point_value(&key, value);
-                self.editing_automation_point = None;
+                self.ui_ephemeral.editing_automation_point = None;
             }
             AppEvent::SetAutomationCurveType {
                 track_id,
@@ -6634,15 +5493,15 @@ impl AppData {
                 // 直近に選択した編集面を記録 (= 共存選択されたときの
                 // copy/cut/delete 対象を「最後に選んだ面」 に決める last-wins)。
                 if !next.is_empty() {
-                    self.last_edit_select = Some(EditSelectSurface::AutomationClips);
+                    self.selection.last_edit_select = Some(EditSelectSurface::AutomationClips);
                 }
-                self.selected_automation_clips = next;
+                self.selection.selected_automation_clips = next;
             }
             AppEvent::SelectAutomationPoints { prev: _, next } => {
                 if !next.is_empty() {
-                    self.last_edit_select = Some(EditSelectSurface::AutomationPoints);
+                    self.selection.last_edit_select = Some(EditSelectSurface::AutomationPoints);
                 }
-                self.selected_automation_points = next;
+                self.selection.selected_automation_points = next;
             }
             AppEvent::QuantizeSelectedAutomationPoints(div) => {
                 self.quantize_selected_automation_points(div);
@@ -6655,7 +5514,7 @@ impl AppData {
                 target,
                 display_name,
             } => {
-                self.last_touched_param = Some(TouchedParam {
+                self.ui_ephemeral.last_touched_param = Some(TouchedParam {
                     track_id,
                     target,
                     display_name,
@@ -6713,7 +5572,7 @@ impl AppData {
                 self.end_image_pip_drag_recording();
             }
             AppEvent::SetRecordingMode(mode) => {
-                self.recording_mode = mode;
+                self.recording.recording_mode = mode;
                 self.sync_recording_lanes_with_audio();
             }
             AppEvent::SetMetronomeEnabled(enabled) => {
@@ -6721,14 +5580,14 @@ impl AppData {
                 // 次 buffer から `render_metronome` の有無を切り替える (= 無効
                 // 時は mix step 自体 skip = CPU 0)。 GUI 側は transport bar の
                 // toggle UI 更新のみ。
-                self.metronome_enabled = enabled;
-                self.send_audio(MainToChild::SetMetronomeEnabled(enabled));
+                self.transport.metronome_enabled = enabled;
+                self.send_audio(AudioCommand::SetMetronomeEnabled(enabled));
             }
             AppEvent::ToggleMidiRecording => {
                 self.toggle_midi_recording();
             }
             AppEvent::SetCountInBars(bars) => {
-                self.count_in_bars = bars.min(2);
+                self.recording.count_in_bars = bars.min(2);
             }
             AppEvent::ParamGestureBegin {
                 track_id,
@@ -6746,25 +5605,26 @@ impl AppData {
                 // ならない。 `PluginParam` は値が Song snapshot に入らない (plugin 内部
                 // 状態) ので除外、 `SongTempo` / `TimeSig` は transport 側の commit
                 // ベース undo に委ねる。
-                if matches!(target, common::model::AutomationTarget::TrackBuiltin(_)) {
-                    self.push_undo_snapshot();
-                }
-                self.active_param_gestures.insert((track_id, target.clone()));
+                // fader/knob drag 全体を 1 undo step に bracket する (最初の
+                // song 編集が snapshot を積む。 PluginParam のように song を
+                // 変えない gesture では undo step は増えない)。
+                self.song_doc.begin_gesture();
+                self.recording.active_param_gestures.insert((track_id, target.clone()));
                 // Phase 4 Step C: Latch / Write mode で 再生中の gesture begin は
                 // latched_param_gestures にも入れる。 stop まで「触れた事実」 を
                 // 保持し、 release 後も curve 上書きを継続する。 Touch mode では
                 // latched は使わない (= release で recording 完全停止)。
                 if matches!(
-                    self.recording_mode,
+                    self.recording.recording_mode,
                     common::model::RecordingMode::Latch | common::model::RecordingMode::Write
-                ) && self.is_playing
+                ) && self.transport.is_playing
                 {
-                    self.latched_param_gestures.insert((track_id, target.clone()));
+                    self.recording.latched_param_gestures.insert((track_id, target.clone()));
                 }
                 // `TouchParam` を発火し続けるより、 gesture begin で `last_touched_param`
                 // を更新する idiom に統一する。 (= drag 開始の瞬間が touch、 drag 中
                 // の値変化は touch を再発火しない)
-                self.last_touched_param = Some(TouchedParam {
+                self.ui_ephemeral.last_touched_param = Some(TouchedParam {
                     track_id,
                     target,
                     display_name,
@@ -6773,53 +5633,61 @@ impl AppData {
                 self.sync_recording_lanes_with_audio();
             }
             AppEvent::ParamGestureEnd { track_id, target } => {
-                self.active_param_gestures.remove(&(track_id, target.clone()));
+                self.recording.active_param_gestures.remove(&(track_id, target.clone()));
+                if self.recording.active_param_gestures.is_empty() {
+                    self.song_doc.end_gesture();
+                }
                 // (review) BPM scrub の hot path は軽量 SetSongBpm のみで、 plugin
                 // host 側の BPM 消費者 (VOICEVOX 合成 metadata / ARA placement /
                 // lipsync) が古い BPM のまま残る。 gesture 終端で 1 回だけ full
                 // sync を frame flush に予約して追従させる (Enter commit 経路
                 // `commit_bpm_edit` と同じ最終状態にする)。
                 if matches!(&target, common::model::AutomationTarget::SongTempo) {
-                    self.pending_host_sync = true;
+                    self.ipc.pending_host_sync = true;
                 }
                 // Phase 4 Step C: Touch mode の場合、 release で recording 完全停止 →
                 // recording_last_beat からも 該当 entry を消す (= 次の gesture begin
                 // で改めて throttle 開始)。 Latch / Write は stop まで latched 継続
                 // なので last_beat も保持する (= 連続 record)。
-                if self.recording_mode == common::model::RecordingMode::Touch {
-                    self.recording_last_beat.remove(&(track_id, target));
+                if self.recording.recording_mode == common::model::RecordingMode::Touch {
+                    self.recording.recording_last_beat.remove(&(track_id, target));
                 }
                 self.sync_recording_lanes_with_audio();
             }
             AppEvent::PluginParamListFromChild {
-                track,
-                index,
-                plugin_id: _,
+                device_id,
                 params,
                 has_embedded_gui,
             } => {
-                self.plugin_params.insert((track, index), params);
-                self.slot_has_gui.insert((track, index), has_embedded_gui);
+                // v29: device_id → 旧 (track_id, index) 座標へ逆引きして
+                // 既存の positional cache に繋ぐ (S3b で cache 自体を id 化)。
+                if let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) {
+                    self.ipc.plugin_params.insert((track, index), params);
+                    self.ipc.slot_has_gui.insert((track, index), has_embedded_gui);
+                }
             }
             AppEvent::PluginParamTouchedFromChild {
-                track,
-                index,
+                device_id,
                 param_id,
                 display_name,
             } => {
+                let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) else {
+                    return; // 削除済み device の stale event
+                };
                 // Phase 2c: host から来る `display_name` は placeholder
                 // (= "Param N")。 `plugin_params` cache から param の
                 // 本来の name を引いて上書きする。 cache に該当 entry
                 // がなければ host から送られてきた placeholder をそのまま。
                 let resolved_name = self
-                    .plugin_params
+                    .ipc.plugin_params
                     .get(&(track, index))
                     .and_then(|params| params.iter().find(|p| p.id == param_id))
                     .map(|info| info.name.clone())
                     .unwrap_or(display_name);
                 let target = common::model::AutomationTarget::PluginParam {
-                    device_index: index,
+                    device_id,
                     param_id,
+                    legacy_device_index: None,
                     legacy_slot: None,
                 };
                 // Phase 4 Step C-3: ParamGestureBegin として同経路で active /
@@ -6832,8 +5700,7 @@ impl AppData {
                 });
             }
             AppEvent::PluginParamValueChangedFromChild {
-                track,
-                index,
+                device_id,
                 param_id,
                 value,
             } => {
@@ -6841,24 +5708,26 @@ impl AppData {
                 // device_index, param_id) cache に保存。
                 // `current_plain_value(PluginParam)` が record tick でこの値を
                 // read して point を生成する。
-                self.plugin_param_values
-                    .insert((track, index, param_id), value);
+                if let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) {
+                    self.ipc.plugin_param_values
+                        .insert((track, index, param_id), value);
+                }
             }
             AppEvent::ChildDisconnected { kind } => {
                 self.handle_child_disconnected(kind);
             }
-            AppEvent::PluginParamGestureEndFromChild {
-                track,
-                index,
-                param_id,
-            } => {
+            AppEvent::PluginParamGestureEndFromChild { device_id, param_id } => {
+                let Some((track, _index)) = find_device_by_id(&self.song_doc.song(), device_id) else {
+                    return;
+                };
                 // Phase 4 Step C-3: plugin GUI knob release。 mixer の
                 // ParamGestureEnd と同経路に流す (= active_param_gestures
                 // から remove + sync_recording_lanes_with_audio で bypass
                 // 解除)。
                 let target = common::model::AutomationTarget::PluginParam {
-                    device_index: index,
+                    device_id,
                     param_id,
+                    legacy_device_index: None,
                     legacy_slot: None,
                 };
                 self.handle_event(AppEvent::ParamGestureEnd {
@@ -6887,40 +5756,41 @@ impl AppData {
                 self.begin_rename_track(track_id);
             }
             AppEvent::RenameTrackChanged(text) => {
-                self.track_rename_text = text;
+                self.ui_ephemeral.track_rename_text = text;
             }
             AppEvent::CommitRenameTrack => self.commit_rename_track(),
             AppEvent::CancelRenameTrack => {
-                self.track_rename_id = None;
-                self.track_rename_text.clear();
+                self.ui_ephemeral.track_rename_id = None;
+                self.ui_ephemeral.track_rename_text.clear();
             }
             AppEvent::BeginRenameSection(id) => self.begin_rename_section(id),
-            AppEvent::RenameSectionChanged(text) => self.section_rename_text = text,
+            AppEvent::RenameSectionChanged(text) => self.ui_ephemeral.section_rename_text = text,
             AppEvent::CommitRenameSection => self.commit_rename_section(),
             AppEvent::CancelRenameSection => {
-                self.section_rename_id = None;
-                self.section_rename_text.clear();
+                self.ui_ephemeral.section_rename_id = None;
+                self.ui_ephemeral.section_rename_text.clear();
             }
             AppEvent::SetSectionColor { id, color } => {
-                self.snapshot_for_color_edit();
-                if let Some(s) = self.song.sections.iter_mut().find(|s| s.id == id) {
-                    s.color = color;
-                }
+                self.edit_song(|song| {
+                    if let Some(s) = song.sections.iter_mut().find(|s| s.id == id) {
+                        s.color = color;
+                    }
+                });
             }
             AppEvent::BeginRenameClip(target) => self.begin_rename_clip(target),
             AppEvent::RenameClipChanged(text) => {
-                self.clip_rename_text = text;
+                self.ui_ephemeral.clip_rename_text = text;
             }
             AppEvent::CommitRenameClip => self.commit_rename_clip(),
             AppEvent::CancelRenameClip => {
-                self.clip_rename = None;
-                self.clip_rename_text.clear();
+                self.ui_ephemeral.clip_rename = None;
+                self.ui_ephemeral.clip_rename_text.clear();
             }
             AppEvent::ToggleHelp => {
-                self.is_help_open = !self.is_help_open;
+                self.ui_prefs.is_help_open = !self.ui_prefs.is_help_open;
             }
             AppEvent::CloseHelp => {
-                self.is_help_open = false;
+                self.ui_prefs.is_help_open = false;
             }
             AppEvent::OpenRecent(path) => {
                 // Open Recent も「プロジェクトを開く」 = 現プロジェクト破棄
@@ -6937,15 +5807,15 @@ impl AppData {
                 self.discard_recovery(path);
             }
             AppEvent::RecoveryDismiss => {
-                self.show_recovery_modal = false;
+                self.ui_ephemeral.show_recovery_modal = false;
             }
             AppEvent::BeginDrag => {
-                self.is_dragging = true;
+                self.ui_ephemeral.is_dragging = true;
             }
             AppEvent::EndDrag => {
-                self.is_dragging = false;
-                let song = self.song.clone();
-                self.send_audio(MainToChild::LoadSong(song));
+                self.ui_ephemeral.is_dragging = false;
+                let song = self.song_doc.song().clone();
+                self.send_audio(AudioCommand::LoadSong(song));
             }
             AppEvent::MidiNoteOn { pitch, velocity } => {
                 self.handle_midi_note_on(pitch, velocity);
@@ -6962,30 +5832,28 @@ impl AppData {
                 self.handle_midi_control_change(channel, controller, value);
             }
             AppEvent::StartMidiLearn(target) => {
-                self.midi_learn_target = Some(target);
-                self.status_message =
+                self.recording.midi_learn_target = Some(target);
+                self.ui_ephemeral.status_message =
                     "MIDI Learn: 次の CC を bind します...".to_string();
             }
             AppEvent::CancelMidiLearn => {
-                self.midi_learn_target = None;
-                self.status_message = "MIDI Learn cancel".to_string();
+                self.recording.midi_learn_target = None;
+                self.ui_ephemeral.status_message = "MIDI Learn cancel".to_string();
             }
             AppEvent::RemoveMidiBinding(idx) => {
-                if idx < self.song.midi_bindings.len() {
-                    self.song.midi_bindings.remove(idx);
-                    // `midi_bindings` は永続 field (非 undoable 経路なのでここで dirty)。
-                    self.is_dirty = true;
+                if idx < self.song_doc.song().midi_bindings.len() {
+                    self.edit_song(|song| song.midi_bindings.remove(idx));
                 }
             }
             AppEvent::MidiInputOpened(name) => {
                 let label = name.clone().unwrap_or_default();
-                self.midi_input_label = label.clone();
+                self.recording.midi_input_label = label.clone();
                 if name.is_some() {
-                    self.status_message = format!("MIDI 入力: {label}");
+                    self.ui_ephemeral.status_message = format!("MIDI 入力: {label}");
                 }
             }
             AppEvent::SelectBottomPanel(p) => {
-                self.bottom_panel = p;
+                self.ui_prefs.bottom_panel = p;
             }
             AppEvent::SelectClip { target, additive } => {
                 self.select_clip(target, additive);
@@ -6997,9 +5865,9 @@ impl AppData {
                 self.select_all_clips();
             }
             AppEvent::ClearSelection => {
-                self.selected_clip = None;
-                self.selected_clips.clear();
-                self.selected_notes.clear();
+                self.selection.selected_clip = None;
+                self.selection.selected_clips.clear();
+                self.selection.selected_notes.clear();
             }
             AppEvent::SelectLinkedClips(target) => {
                 self.select_linked_clips(target);
@@ -7022,7 +5890,7 @@ impl AppData {
             AppEvent::SelectNote { note, additive } => {
                 self.select_note(note, additive);
             }
-            AppEvent::ClearNoteSelection => self.selected_notes.clear(),
+            AppEvent::ClearNoteSelection => self.selection.selected_notes.clear(),
             AppEvent::AddNote {
                 track,
                 clip,
@@ -7042,28 +5910,28 @@ impl AppData {
                 self.resize_notes(&entries);
             }
             AppEvent::SetNoteSelection(targets) => {
-                self.selected_notes = targets;
-                if !self.selected_notes.is_empty() {
-                    self.last_edit_select = Some(EditSelectSurface::Notes);
+                self.selection.selected_notes = targets;
+                if !self.selection.selected_notes.is_empty() {
+                    self.selection.last_edit_select = Some(EditSelectSurface::Notes);
                 }
                 // last (anchor) は packed note id。所属クリップを decode し、
                 // (1) **そのクリップを対象 (target) に切替** — 非対象クリップのノートを掴むと編集対象が
                 //     そちらへ移る (plan §D/E。selected_clips は不変なので slot/selected_notes は維持)、
                 // (2) 既定 note 長をそのクリップから引く。
-                if let Some(&last) = self.selected_notes.last()
+                if let Some(&last) = self.selection.selected_notes.last()
                     && let Some((r, local)) = self.decode_note_id(last)
                 {
                     if let Some(key) = self.clip_key_of(r) {
                         self.set_pianoroll_target_clip(key);
                     }
                     if let Some(dur) = self
-                        .song
+                        .song_doc.song()
                         .tracks
                         .get(r.track as usize)
                         .and_then(|t| t.clips.get(r.clip as usize))
-                        .and_then(|c| self.song.clip_notes(c).get(local).map(|n| n.duration_beats))
+                        .and_then(|c| self.song_doc.song().clip_notes(c).get(local).map(|n| n.duration_beats))
                     {
-                        self.last_note_duration_beats = dur.max(0.0625);
+                        self.ui_prefs.last_note_duration_beats = dur.max(0.0625);
                     }
                 }
             }
@@ -7080,30 +5948,30 @@ impl AppData {
                 self.toggle_pianoroll_track_lock(track_id);
             }
             AppEvent::OpenPluginPicker => {
-                self.plugin_picker_query.clear();
+                self.ui_ephemeral.plugin_picker_query.clear();
                 self.refresh_picker_visible();
-                self.is_plugin_picker_open = true;
+                self.ui_ephemeral.is_plugin_picker_open = true;
             }
             AppEvent::ClosePluginPicker => {
-                self.is_plugin_picker_open = false;
-                self.plugin_picker_query.clear();
+                self.ui_ephemeral.is_plugin_picker_open = false;
+                self.ui_ephemeral.plugin_picker_query.clear();
             }
             AppEvent::SetPluginPickerQuery(query) => {
-                self.plugin_picker_query = query;
+                self.ui_ephemeral.plugin_picker_query = query;
                 self.refresh_picker_visible();
             }
             AppEvent::MovePluginPickerCursor(delta) => {
-                let len = self.plugin_picker_visible.len();
+                let len = self.ui_ephemeral.plugin_picker_visible.len();
                 if len > 0 {
-                    let new = (self.plugin_picker_cursor as i32 + delta)
+                    let new = (self.ui_ephemeral.plugin_picker_cursor as i32 + delta)
                         .clamp(0, len as i32 - 1) as usize;
-                    self.plugin_picker_cursor = new;
+                    self.ui_ephemeral.plugin_picker_cursor = new;
                 }
             }
             AppEvent::OpenFontPicker => self.open_font_picker(),
             AppEvent::CloseFontPicker => self.close_font_picker(),
             AppEvent::SetFontPickerQuery(query) => {
-                self.font_picker_query = query;
+                self.ui_ephemeral.font_picker_query = query;
                 self.refresh_font_picker_visible();
             }
             AppEvent::MoveFontPickerCursor(delta) => self.move_font_picker_cursor(delta),
@@ -7112,8 +5980,8 @@ impl AppData {
             AppEvent::FontFamiliesLoaded(families) => self.on_font_families_loaded(families),
             AppEvent::AssetDecodeTick => self.on_asset_decode_tick(),
             AppEvent::RescanProgress { done, total } => {
-                self.load_progress = Some((done, total));
-                self.load_progress_label = "プラグインを走査中";
+                self.media.load_progress = Some((done, total));
+                self.media.load_progress_label = "プラグインを走査中";
             }
             AppEvent::RescanPluginDb => {
                 self.begin_rescan();
@@ -7122,7 +5990,7 @@ impl AppData {
                 self.finish_rescan();
             }
             AppEvent::SetArrangeScroll(scroll) => {
-                self.arrange_scroll_beat = scroll.max(0.0);
+                self.ui_prefs.arrange_scroll_beat = scroll.max(0.0);
                 // 再生中の手動横スクロールは追従を解除する (ユーザー選択の挙動)。
                 self.cancel_follow_on_manual_view_change();
             }
@@ -7133,15 +6001,15 @@ impl AppData {
                 // 実描画時は area.h と min を取って絶対に visible 数 0 にならない構造で
                 // 描画側 (`tracks_visible = ((area.h - RULER_H) / row_h).max(1.0)`) が
                 // 吸収する。
-                self.arrange_track_row_h = h.clamp(16.0, 2000.0);
+                self.ui_prefs.arrange_track_row_h = h.clamp(16.0, 2000.0);
             }
             AppEvent::SetArrangeHeaderW(w) => {
                 // track 名が読める下限と lanes を潰さない上限で clamp。 widget は
                 // 毎フレーム `view.header_w` としてこの値を読むので即反映される。
-                self.arrange_header_w = w.clamp(80.0, 480.0);
+                self.ui_prefs.arrange_header_w = w.clamp(80.0, 480.0);
             }
             AppEvent::SetArrangeZoom(zoom) => {
-                self.arrange_zoom_x = zoom.clamp(2.0, 400.0);
+                self.ui_prefs.arrange_zoom_x = zoom.clamp(2.0, 400.0);
                 // 再生中の手動ズームは追従を解除する (ユーザー選択の挙動)。
                 self.cancel_follow_on_manual_view_change();
             }
@@ -7239,7 +6107,7 @@ impl AppData {
             AppEvent::SetModSourceTapPoint { id, tap_point } => {
                 self.set_mod_source_tap_point(id, tap_point)
             }
-            AppEvent::SetArmedModSource(id) => self.armed_mod_source = id,
+            AppEvent::SetArmedModSource(id) => self.ui_ephemeral.armed_mod_source = id,
             AppEvent::SetAuxInputTapPoint {
                 track_id,
                 device_index,
@@ -7257,35 +6125,58 @@ impl AppData {
                 // midi_recording_pending == true かつ preroll == 0 なら、
                 // midi_recording に昇格して以後の MIDI input を armed track に
                 // 書き込む。
-                if self.midi_recording_pending && preroll == 0 {
-                    self.midi_recording_pending = false;
-                    self.midi_recording = true;
+                if self.recording.midi_recording_pending && preroll == 0 {
+                    self.recording.midi_recording_pending = false;
+                    self.recording.midi_recording = true;
                 }
                 let _ = preroll;  // 上で消費
                 self.on_tick(samples, peak_l, peak_r);
             }
-            AppEvent::GuiOpenedFromChild { track, index, width, height } => {
-                self.on_gui_opened(track, index, width, height);
+            AppEvent::GuiOpenedFromChild { device_id, width, height } => {
+                self.on_gui_opened(device_id, width, height);
             }
-            AppEvent::GuiClosedFromChild { track, index } => {
-                self.on_gui_closed(track, index);
+            AppEvent::GuiClosedFromChild { device_id } => {
+                self.on_gui_closed(device_id);
             }
-            AppEvent::SlotPluginLoadedFromChild { track, index, id, name, plugin_id, shmem_id, state_load_error, aux_output_count } => {
-                self.on_plugin_loaded_from_child(track, index, id, name, plugin_id, shmem_id, state_load_error, aux_output_count);
+            AppEvent::SlotPluginLoadedFromChild { device_id, id, name, shmem_id, state_load_error, aux_output_count, generation } => {
+                self.on_plugin_loaded_from_child(device_id, id, name, shmem_id, state_load_error, aux_output_count, generation);
             }
-            AppEvent::SlotPluginUnloadedFromChild { plugin_id } => {
-                self.on_plugin_unloaded_from_child(plugin_id);
+            AppEvent::SlotPluginUnloadedFromChild { device_id } => {
+                self.on_plugin_unloaded_from_child(device_id);
             }
             AppEvent::SlotPluginLoadFailedFromChild {
-                track,
-                index,
+                device_id,
                 plugin_id,
                 reason,
+                generation,
             } => {
-                self.on_plugin_load_failed_from_child(track, index, plugin_id, reason);
+                self.on_plugin_load_failed_from_child(device_id, plugin_id, reason, generation);
             }
-            AppEvent::PluginLatencyChangedFromChild { plugin_id, samples } => {
-                self.on_plugin_latency_changed(plugin_id, samples);
+            AppEvent::PluginLatencyChangedFromChild { device_id, samples } => {
+                self.on_plugin_latency_changed(device_id, samples);
+            }
+            AppEvent::PluginUnresponsive { device_id } => {
+                // (v29 §4) dispatch timeout → 該当 device は quarantine 済み。
+                // どの plugin かを可視化する (解除は respawn / 再ロード)。
+                let name = self
+                    .song_doc.song()
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.devices.iter())
+                    .chain(self.song_doc.song().master_fx_chain.iter())
+                    .find(|d| d.id == device_id)
+                    .map(|d| d.plugin_id.clone())
+                    .unwrap_or_else(|| format!("device {device_id}"));
+                self.ui_ephemeral.status_message = format!(
+                    "プラグイン {name} が応答しません — 一時的にバイパスしました \
+                     (plugin_host 再起動 or 再ロードで復帰)"
+                );
+            }
+            AppEvent::WorkerPoolStalled => {
+                // (v29 §4) pool 全体の stall = plugin_host 応答不能と解釈し、
+                // 既存の respawn + state restore 経路に乗せる。
+                tracing::error!("worker pool stalled; treating as plugin_host death");
+                self.handle_child_disconnected(common::protocol::ChildKind::PluginHost);
             }
             AppEvent::AllStatesReceived(entries) => {
                 self.on_all_states_from_child(entries);
@@ -7297,18 +6188,21 @@ impl AppData {
                 self.set_track_pan(track, pan);
             }
             AppEvent::SetTrackColor { track, color } => {
-                self.snapshot_for_color_edit();
-                if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track) {
-                    t.color = color;
-                }
+                self.edit_song(|song| {
+                    if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track) {
+                        t.color = color;
+                    }
+                });
             }
             AppEvent::ResetTrackClipColors { track } => {
                 // 全 clip の上書きを外す (= track 色継承)。undo は is_undoable で取得済。
-                if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track) {
-                    for clip in &mut t.clips {
-                        clip.color = None;
+                self.edit_song(|song| {
+                    if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track) {
+                        for clip in &mut t.clips {
+                            clip.color = None;
+                        }
                     }
-                }
+                });
             }
             AppEvent::ToggleTrackMute(track) => {
                 self.toggle_track_mute(track);
@@ -7329,22 +6223,22 @@ impl AppData {
                 buffer_frames,
                 sample_rate,
             } => {
-                self.metrics.dsp_load_peak = dsp_load_peak;
-                self.metrics.dsp_load_avg = dsp_load_avg;
-                self.metrics.xrun_count = xrun_count;
-                self.metrics.buffer_frames = buffer_frames;
-                self.metrics.sample_rate = sample_rate;
+                self.ipc.metrics.dsp_load_peak = dsp_load_peak;
+                self.ipc.metrics.dsp_load_avg = dsp_load_avg;
+                self.ipc.metrics.xrun_count = xrun_count;
+                self.ipc.metrics.buffer_frames = buffer_frames;
+                self.ipc.metrics.sample_rate = sample_rate;
             }
             AppEvent::SystemMetricsTick { cpu, mem_mb } => {
-                self.metrics.system_cpu = cpu;
-                self.metrics.memory_mb = mem_mb;
+                self.ipc.metrics.system_cpu = cpu;
+                self.ipc.metrics.memory_mb = mem_mb;
             }
             AppEvent::ToggleResourceMonitor => {
-                self.resource_monitor_enabled = !self.resource_monitor_enabled;
+                self.ui_prefs.resource_monitor_enabled = !self.ui_prefs.resource_monitor_enabled;
                 // app_config.json に永続化 (プロジェクト非依存の UI 設定)。
-                if let Some(dirs) = &self.app_dirs {
+                if let Some(dirs) = &self.ui_prefs.app_dirs {
                     let cfg = common::app_config::AppConfig {
-                        resource_monitor_enabled: self.resource_monitor_enabled,
+                        resource_monitor_enabled: self.ui_prefs.resource_monitor_enabled,
                     };
                     if let Err(e) = common::app_config::save(dirs.app_config(), &cfg) {
                         tracing::warn!(error = ?e, "failed to save app_config");
@@ -7352,13 +6246,13 @@ impl AppData {
                 }
             }
             AppEvent::ToggleResourcePanel => {
-                self.resource_panel_open = !self.resource_panel_open;
+                self.ui_ephemeral.resource_panel_open = !self.ui_ephemeral.resource_panel_open;
             }
             AppEvent::ModScalarsTick(scalars) => {
                 // docs/plan_modulation.md §4.2: snapshot the latest follower
                 // scalars (already attack/release-smoothed by the engine — no
                 // extra GUI smoothing). Zero-copy: move the polled Vec in.
-                self.mod_scalars = scalars;
+                self.transport.mod_scalars = scalars;
             }
             AppEvent::AddReturnTrack => {
                 self.action_add_return_track();
@@ -7379,37 +6273,37 @@ impl AppData {
                 self.set_send_enabled(track_id, send_idx, enabled);
             }
             AppEvent::OpenSendPicker { src_track_id } => {
-                self.send_picker = Some(SendPickerState { src_track_id });
+                self.ui_ephemeral.send_picker = Some(SendPickerState { src_track_id });
             }
             AppEvent::CloseSendPicker => {
-                self.send_picker = None;
+                self.ui_ephemeral.send_picker = None;
             }
             AppEvent::ExportWav => {
                 self.open_export_range_picker(ExportRangeKind::Wav);
             }
             AppEvent::SetExportRangeStart(beat) => {
-                if let Some(p) = self.export_range_picker.as_mut() {
+                if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
                     // start は [0, end) に clamp。 end と等しくなる入力は拒否
                     // (end より僅かに手前へ)。
                     p.start_beat = beat.clamp(0.0, (p.end_beat - MIN_EXPORT_RANGE_BEATS).max(0.0));
                 }
             }
             AppEvent::SetExportRangeEnd(beat) => {
-                if let Some(p) = self.export_range_picker.as_mut() {
-                    let max = self.song.length_beats.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
+                if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
+                    let max = self.song_doc.song().length_beats.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
                     p.end_beat = beat.clamp(p.start_beat + MIN_EXPORT_RANGE_BEATS, max);
                 }
             }
             AppEvent::ResetExportRange => {
-                if let Some(p) = self.export_range_picker.as_mut() {
+                if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
                     p.start_beat = 0.0;
-                    p.end_beat = self.song.length_beats.max(MIN_EXPORT_RANGE_BEATS);
+                    p.end_beat = self.song_doc.song().length_beats.max(MIN_EXPORT_RANGE_BEATS);
                 }
             }
             AppEvent::SetExportResolution(w, h) => {
                 // dropdown はプリセット (全て偶数・正値) しか出さないが、
                 // 念のため 0 を弾く (encoder は w/h != 0 を要求)。
-                if let Some(p) = self.export_range_picker.as_mut()
+                if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut()
                     && w > 0
                     && h > 0
                 {
@@ -7417,7 +6311,7 @@ impl AppData {
                 }
             }
             AppEvent::SetExportFramerate(fps) => {
-                if let Some(p) = self.export_range_picker.as_mut()
+                if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut()
                     && fps > 0.0
                 {
                     p.framerate = fps;
@@ -7427,8 +6321,8 @@ impl AppData {
                 self.confirm_export_range();
             }
             AppEvent::CancelExportRange => {
-                self.export_range_picker = None;
-                self.status_message = "Export をキャンセルしました".into();
+                self.ui_ephemeral.export_range_picker = None;
+                self.ui_ephemeral.status_message = "Export をキャンセルしました".into();
             }
             AppEvent::ExportMidi => {
                 self.action_export_midi();
@@ -7445,7 +6339,7 @@ impl AppData {
                 #[cfg(not(windows))]
                 {
                     let _ = (paths, target_beat);
-                    self.status_message =
+                    self.ui_ephemeral.status_message =
                         "Video import は Windows 専用 (WMF 経由) です".into();
                 }
             }
@@ -7454,7 +6348,7 @@ impl AppData {
                 self.action_open_import_video_dialog();
                 #[cfg(not(windows))]
                 {
-                    self.status_message =
+                    self.ui_ephemeral.status_message =
                         "Video import は Windows 専用 (WMF 経由) です".into();
                 }
             }
@@ -7468,8 +6362,8 @@ impl AppData {
                 self.add_text_clip_to_track(track, start_beat);
             }
             AppEvent::TogglePreviewWindow => {
-                self.preview_window_visible = !self.preview_window_visible;
-                self.status_message = if self.preview_window_visible {
+                self.ui_prefs.preview_window_visible = !self.ui_prefs.preview_window_visible;
+                self.ui_ephemeral.status_message = if self.ui_prefs.preview_window_visible {
                     "Video preview: 表示".into()
                 } else {
                     "Video preview: 非表示".into()
@@ -7480,7 +6374,7 @@ impl AppData {
                 self.open_export_range_picker(ExportRangeKind::Mp4);
                 #[cfg(not(windows))]
                 {
-                    self.status_message =
+                    self.ui_ephemeral.status_message =
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
             }
@@ -7488,22 +6382,22 @@ impl AppData {
                 self.handle_file_dialog_result(kind, paths);
             }
             AppEvent::SaveAsResolved { path } => {
-                self.save_as_dialog_open = false;
+                self.ui_ephemeral.save_as_dialog_open = false;
                 let Some(path) = path else {
                     // Save As キャンセル → 「保存して続行」 の保留操作を取り消し、
                     // アプリに留まる (旧同期フローの「何もしない」 と同義)。
-                    self.guard_after_save = None;
+                    self.ui_ephemeral.guard_after_save = None;
                     return;
                 };
                 if let Some(dir) = path.parent()
                     && let Err(e) = std::fs::create_dir_all(dir)
                 {
-                    self.status_message = format!(
+                    self.ui_ephemeral.status_message = format!(
                         "プロジェクトフォルダの作成に失敗: {} ({e})",
                         dir.display()
                     );
                     // 保存できないなら操作を実行しない (データ損失回避)。
-                    self.guard_after_save = None;
+                    self.ui_ephemeral.guard_after_save = None;
                     return;
                 }
                 self.begin_save(path);
@@ -7511,10 +6405,10 @@ impl AppData {
                 // 同期保存して is_dirty が下りるので即実行。 plugin 有りは
                 // has_pending_save が立ち、 on_all_states 完了ハンドラ (既存) が実行
                 // する。
-                if self.guard_after_save.is_some()
-                    && !self.is_dirty
+                if self.ui_ephemeral.guard_after_save.is_some()
+                    && !self.song_doc.is_dirty()
                     && !self.has_pending_save()
-                    && let Some(action) = self.guard_after_save.take()
+                    && let Some(action) = self.ui_ephemeral.guard_after_save.take()
                 {
                     self.perform_guard_action(action);
                 }
@@ -7525,7 +6419,7 @@ impl AppData {
                 #[cfg(not(windows))]
                 {
                     let _ = (output_path, audio_wav, range_beats, dims);
-                    self.status_message =
+                    self.ui_ephemeral.status_message =
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
             }
@@ -7534,44 +6428,44 @@ impl AppData {
                 // どちらでも来る。stage が AudioRender でない (= export 非実行 or
                 // 既に映像フェーズ) なら stale とみなして無視する (overlay の
                 // 亡霊化を防ぐ)。
-                if matches!(self.export_stage, Some(ExportStage::AudioRender { .. })) {
-                    self.export_stage = Some(ExportStage::AudioRender { done, total });
+                if matches!(self.transport.export_stage, Some(ExportStage::AudioRender { .. })) {
+                    self.transport.export_stage = Some(ExportStage::AudioRender { done, total });
                     // watchdog: 進捗が来ている間は生存とみなしてタイマーをリセット。
-                    self.export_progress_at = Some(std::time::Instant::now());
+                    self.transport.export_progress_at = Some(std::time::Instant::now());
                 }
             }
             AppEvent::ExportProgress { done, total } => {
-                self.export_stage = Some(ExportStage::VideoRender { done, total });
+                self.transport.export_stage = Some(ExportStage::VideoRender { done, total });
             }
             AppEvent::ExportFinished { result } => {
-                self.export_stage = None;
-                self.export_cancel = None;
+                self.transport.export_stage = None;
+                self.transport.export_cancel = None;
                 // 自動レンダリングした音声 temp WAV を削除。
-                if let Some(wav) = self.export_temp_wav.take() {
+                if let Some(wav) = self.transport.export_temp_wav.take() {
                     let _ = std::fs::remove_file(&wav);
                 }
                 match result {
                     Ok(path) => {
-                        self.status_message =
+                        self.ui_ephemeral.status_message =
                             format!("Video export 完了: {}", path.display());
                     }
                     Err(e) if e == "export cancelled" => {
-                        self.status_message =
+                        self.ui_ephemeral.status_message =
                             "Video export をキャンセルしました".into();
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "export failed");
-                        self.status_message = format!("Video export 失敗: {e}");
+                        self.ui_ephemeral.status_message = format!("Video export 失敗: {e}");
                     }
                 }
             }
-            AppEvent::CancelExport => match self.export_stage {
+            AppEvent::CancelExport => match self.transport.export_stage {
                 // 映像フェーズは daw_gui プロセス内の render thread。in-process の
                 // atomic flag で次フレーム中断させる。
                 Some(ExportStage::VideoRender { .. }) => {
-                    if let Some(flag) = &self.export_cancel {
+                    if let Some(flag) = &self.transport.export_cancel {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        self.status_message = "Video export をキャンセル中...".into();
+                        self.ui_ephemeral.status_message = "Video export をキャンセル中...".into();
                     }
                 }
                 // 音声 freewheel は daw_audio プロセス。IPC で cancel を送り、
@@ -7579,8 +6473,8 @@ impl AppData {
                 // { error: None, cancelled: true }` が返る (cancel は typed flag で
                 // 伝わる)。標準 WAV export / video 前段のどちらでも有効。
                 Some(ExportStage::AudioRender { .. }) => {
-                    self.send_audio(MainToChild::CancelExport);
-                    self.status_message = "書き出しをキャンセル中...".into();
+                    self.send_audio(AudioCommand::CancelExport);
+                    self.ui_ephemeral.status_message = "書き出しをキャンセル中...".into();
                 }
                 None => {}
             },
@@ -7588,8 +6482,7 @@ impl AppData {
                 self.set_clip_audio_event_reversed(target, reversed);
             }
             AppEvent::SetClipColor { target, color } => {
-                self.snapshot_for_color_edit();
-                propagate_clip_color(&mut self.song.tracks, target, color);
+                self.edit_song(|song| propagate_clip_color(&mut song.tracks, target, color));
             }
             AppEvent::SetClipMuted { target, muted } => {
                 // clip-level mute の SSoT (`Clip.muted`)。 content type を問わない。
@@ -7597,16 +6490,19 @@ impl AppData {
             }
             AppEvent::SetClipsMuted { targets, muted } => {
                 // `q` で選択 clip / カーソル直下 clip を一括 toggle した結果。
-                let mut changed = false;
-                for target in targets {
-                    if let Some(track) = self.song.tracks.get_mut(target.track as usize)
-                        && let Some(clip) = track.clips.get_mut(target.clip as usize)
-                        && clip.muted != muted
-                    {
-                        clip.muted = muted;
-                        changed = true;
+                let changed = self.edit_song(|song| {
+                    let mut changed = false;
+                    for target in targets {
+                        if let Some(track) = song.tracks.get_mut(target.track as usize)
+                            && let Some(clip) = track.clips.get_mut(target.clip as usize)
+                            && clip.muted != muted
+                        {
+                            clip.muted = muted;
+                            changed = true;
+                        }
                     }
-                }
+                    changed
+                }) == Some(true);
                 if changed {
                     self.sync_song_to_plugin_host();
                 }
@@ -7621,7 +6517,7 @@ impl AppData {
             AppEvent::ResyncClipEditBuffers(target) => {
                 // 数値 buffer は撤去済み。 text section と共有する
                 // `clip_edit_buffer_target` を target に向ける純 sync。
-                self.clip_edit_buffer_target = Some(target);
+                self.ui_ephemeral.clip_edit_buffer_target = Some(target);
             }
             AppEvent::SetClipGainDb { target, gain_db } => {
                 self.set_clip_audio_event_gain_db(target, gain_db);
@@ -7722,10 +6618,10 @@ impl AppData {
                 self.set_clip_text_num_field(target, field, value);
             }
             AppEvent::ClipTextContentEditChanged(s) => {
-                self.clip_text_content_edit_text = s;
+                self.ui_ephemeral.clip_text_content_edit_text = s;
             }
             AppEvent::ClipTextFontFamilyEditChanged(s) => {
-                self.clip_text_font_family_edit_text = s;
+                self.ui_ephemeral.clip_text_font_family_edit_text = s;
             }
             AppEvent::CommitClipTextContentEdit => {
                 self.commit_clip_text_content_edit();
@@ -7755,9 +6651,9 @@ impl AppData {
                 self.set_audio_editor_zoom(view_start_beat, view_len_beats);
             }
             AppEvent::SelectAudioEditorEvent(idx) => {
-                self.audio_editor_selected_events = idx.into_iter().collect();
-                if !self.audio_editor_selected_events.is_empty() {
-                    self.last_edit_select = Some(EditSelectSurface::AudioEvents);
+                self.selection.audio_editor_selected_events = idx.into_iter().collect();
+                if !self.selection.audio_editor_selected_events.is_empty() {
+                    self.selection.last_edit_select = Some(EditSelectSurface::AudioEvents);
                 }
             }
             AppEvent::SetAudioEditorEventSelection(indices) => {
@@ -7823,19 +6719,19 @@ impl AppData {
                     frames,
                 );
             }
-            AppEvent::VocalSynthReady { plugin_id } => {
+            AppEvent::VocalSynthReady { device_id } => {
                 // 歌唱合成完了 (or timeout) 通知。 同時 bounce は 1 件なので
-                // plugin_id は echo back 用。 pending があれば offline render を開始する。
+                // device_id は echo back 用。 pending があれば offline render を開始する。
                 // 合成待ち中の編集で index が動いていても stable id で現在位置へ解決する。
-                let _ = plugin_id;
-                if let Some(p) = self.pending_vocal_synth_bounce.take() {
+                let _ = device_id;
+                if let Some(p) = self.ipc.pending_vocal_synth_bounce.take() {
                     let resolved = self
-                        .song
+                        .song_doc.song()
                         .tracks
                         .iter()
                         .position(|t| t.id == p.track_id)
                         .and_then(|ti| {
-                            self.song.tracks[ti]
+                            self.song_doc.song().tracks[ti]
                                 .clips
                                 .iter()
                                 .position(|c| c.id == p.clip_id)
@@ -7844,7 +6740,7 @@ impl AppData {
                     match resolved {
                         Some(target) => self.start_clip_bounce(target, p.mode),
                         None => {
-                            self.status_message =
+                            self.ui_ephemeral.status_message =
                                 "Bounce: 対象クリップが消えたため中止しました".into();
                         }
                     }
@@ -7927,8 +6823,8 @@ impl AppData {
                 // plugins are now reinitialised to a clean state —
                 // fire the stashed offline export. (If nothing is pending, a
                 // stray reply; ignore.)
-                if let Some((path, range, write_mod_sidecar)) = self.pending_export.take() {
-                    self.send_audio(MainToChild::ExportWav {
+                if let Some((path, range, write_mod_sidecar)) = self.transport.pending_export.take() {
+                    self.send_audio(AudioCommand::ExportWav {
                         path,
                         range,
                         write_mod_sidecar,
@@ -7942,9 +6838,9 @@ impl AppData {
                 // `panic_reinit_due.is_none()` so a rapid second panic (whose
                 // reinit is still queued for `on_tick`) doesn't release early on
                 // the previous reinit's reply — the newer reinit's reply will.
-                if self.panic_release_pending && self.panic_reinit_due.is_none() {
-                    self.panic_release_pending = false;
-                    self.send_audio(MainToChild::PanicRelease);
+                if self.transport.panic_release_pending && self.transport.panic_reinit_due.is_none() {
+                    self.transport.panic_release_pending = false;
+                    self.send_audio(AudioCommand::PanicRelease);
                 }
             }
             AppEvent::ExportWavComplete { error, cancelled } => {
@@ -7954,8 +6850,8 @@ impl AppData {
                 // や、daw_audio の二重起動ガードが弾いた reject 完了が、走行中 export の
                 // overlay / plugin render mode / status を壊すのを防ぐ。正規完了は
                 // 標準 WAV / video 前段とも export_stage=AudioRender なので素通りする。
-                if !matches!(self.export_stage, Some(ExportStage::AudioRender { .. }))
-                    && self.pending_video_export.is_none()
+                if !matches!(self.transport.export_stage, Some(ExportStage::AudioRender { .. }))
+                    && self.transport.pending_video_export.is_none()
                 {
                     tracing::warn!(
                         ?error,
@@ -7966,31 +6862,31 @@ impl AppData {
                 }
                 // Either way, hand the plugins back to realtime mode
                 // (we set Offline before triggering the export).
-                self.send_plugin(MainToChild::SetRenderMode(
+                self.send_plugin(PluginCommand::SetRenderMode(
                     common::protocol::RenderMode::Realtime,
                 ));
                 // 音声 freewheel フェーズ終了。overlay の AudioRender 状態を
                 // 必ずクリアする（標準 WAV はこれで overlay が閉じ、video 後段は
                 // この後 `action_export_mp4` が VideoRender を再設定する）。
                 // watchdog 用の進捗タイムスタンプも落とす。
-                self.export_progress_at = None;
-                self.export_stage = None;
-                if let Some(mp4_path) = self.pending_video_export.take() {
+                self.transport.export_progress_at = None;
+                self.transport.export_stage = None;
+                if let Some(mp4_path) = self.transport.pending_video_export.take() {
                     // 音声と同じ拍範囲で video を render する (= 全曲
                     // なら None)。 取り出して消費。
-                    let range_beats = self.pending_video_export_range.take();
+                    let range_beats = self.transport.pending_video_export_range.take();
                     // picker で選んだ出力解像度 / fps の per-export
                     // override。 None (= 旧経路) なら action_export_mp4 が
                     // プロジェクト値にフォールバックする。
-                    let dims = self.pending_video_export_dims.take();
+                    let dims = self.transport.pending_video_export_dims.take();
                     if cancelled {
                         // 前段（音声）でキャンセル → video export 全体を中止し、
                         // 映像 render には進まない。
-                        if let Some(t) = self.export_temp_wav.take() {
+                        if let Some(t) = self.transport.export_temp_wav.take() {
                             let _ = std::fs::remove_file(&t);
                         }
                         let _ = (mp4_path, range_beats, dims);
-                        self.status_message = "Video export をキャンセルしました".into();
+                        self.ui_ephemeral.status_message = "Video export をキャンセルしました".into();
                     } else {
                         // 1 ステップ video export の音声レンダリング完了 → video
                         // export を開始（音声失敗時は映像のみで続行）。
@@ -8000,15 +6896,15 @@ impl AppData {
                                     error = %err,
                                     "audio render for video export failed; video-only"
                                 );
-                                self.status_message = format!(
+                                self.ui_ephemeral.status_message = format!(
                                     "音声レンダリング失敗 ({err}); 映像のみで書き出します"
                                 );
-                                if let Some(t) = self.export_temp_wav.take() {
+                                if let Some(t) = self.transport.export_temp_wav.take() {
                                     let _ = std::fs::remove_file(&t);
                                 }
                                 None
                             }
-                            None => self.export_temp_wav.clone(),
+                            None => self.transport.export_temp_wav.clone(),
                         };
                         #[cfg(windows)]
                         self.action_export_mp4(mp4_path, wav, range_beats, dims);
@@ -8016,11 +6912,11 @@ impl AppData {
                         let _ = (mp4_path, wav, range_beats, dims);
                     }
                 } else if cancelled {
-                    self.status_message = "WAV 書き出しをキャンセルしました".into();
+                    self.ui_ephemeral.status_message = "WAV 書き出しをキャンセルしました".into();
                 } else if let Some(err) = error {
-                    self.status_message = format!("WAV 書き出し失敗: {err}");
+                    self.ui_ephemeral.status_message = format!("WAV 書き出し失敗: {err}");
                 } else {
-                    self.status_message = "WAV 書き出し完了".to_string();
+                    self.ui_ephemeral.status_message = "WAV 書き出し完了".to_string();
                 }
             }
             // PR-V4: SynthesizeVocal / VocalSynthCompleted は削除済。
@@ -8033,29 +6929,29 @@ impl AppData {
                     count = singers.len(),
                     "VOICEVOX singers loaded"
                 );
-                self.singers = singers;
+                self.voicevox.singers = singers;
                 // Clip Inspector の 2 段 dropdown は `singers` を
                 // 直接読む (キャラ→style の階層が要るので flat cache は持たない)。
             }
             AppEvent::LipsyncGenerated { vocal_track_id, target_track_id, bpm, clips, generation } => {
                 // 成功/失敗/空に関わらず in-flight 解除 (= スピナーを止める)。
                 // generation が古くても (project 切替後でも) 必ず外す。
-                self.lipsync_inflight.remove(&target_track_id);
+                self.voicevox.lipsync_inflight.remove(&target_track_id);
                 // spawn 後に project が切り替わった (reset_saved_baseline
                 // が gen を bump した) 古い結果は捨てる。 適用すると別 project の口
                 // track を作り直して spurious dirty になる。 debounce leg と同 idiom。
-                if generation == self.lipsync_gen && !clips.is_empty() {
+                if generation == self.voicevox.lipsync_gen && !clips.is_empty() {
                     self.apply_lipsync_generated(vocal_track_id, bpm, clips);
-                } else if generation == self.lipsync_gen {
+                } else if generation == self.voicevox.lipsync_gen {
                     // 空 = 全 query 失敗 (engine 起動中等。 ソース無しは spawn 前に
                     // return 済み)。 発注時に記録した fingerprint を rollback して、
                     // 次の debounce で自動リトライさせる (残すと「最新」扱いになり
                     // 入力を変えるまで口パクが欠けたまま再生成されない)。
-                    self.lipsync_fingerprints.remove(&target_track_id);
+                    self.voicevox.lipsync_fingerprints.remove(&target_track_id);
                 }
             }
-            AppEvent::VoicevoxSynthStatus { plugin_id, busy, failing } => {
-                self.apply_voicevox_synth_status(plugin_id, busy, failing);
+            AppEvent::VoicevoxSynthStatus { device_id, busy, failing } => {
+                self.apply_voicevox_synth_status(device_id, busy, failing);
             }
             AppEvent::SetLipsyncTarget { track, target } => {
                 self.set_lipsync_target(track, target);
@@ -8064,13 +6960,13 @@ impl AppData {
                 self.set_mouth_map_slot(track, shape, source_id);
             }
             AppEvent::LipsyncDebounceFired(generation) => {
-                if generation == self.lipsync_gen {
+                if generation == self.voicevox.lipsync_gen {
                     // (talk) regen は target 中心 (= その口 track を出力先にする全ソースを
                     // まとめて再生成) なので、口 track ごとに 1 回だけ呼べば足りる。同じ
                     // target を複数ソースぶん呼ぶと全ソース regen が重複するため、出力先
                     // track 単位で dedup し代表ソースを 1 つ渡す。
                     let mut targets: Vec<u32> = self
-                        .song
+                        .song_doc.song()
                         .tracks
                         .iter()
                         .filter_map(|t| t.lipsync_target_track)
@@ -8081,12 +6977,12 @@ impl AppData {
                         // 入力 (notes / 歌詞 / bpm / mouth_map / binding / clip 位置) が
                         // 前回の再生成時から変わっていなければスキップ。track rename / 色 /
                         // mute / volume 等の非入力編集による無駄な再生成を防ぐ。
-                        let fp = Self::lipsync_input_fingerprint(&self.song, target);
-                        if self.lipsync_fingerprints.get(&target) == Some(&fp) {
+                        let fp = Self::lipsync_input_fingerprint(&self.song_doc.song(), target);
+                        if self.voicevox.lipsync_fingerprints.get(&target) == Some(&fp) {
                             continue;
                         }
                         if let Some(src_id) = self
-                            .song
+                            .song_doc.song()
                             .tracks
                             .iter()
                             .find(|t| t.lipsync_target_track == Some(target))
@@ -8105,7 +7001,7 @@ impl AppData {
             }
             AppEvent::SpeakersLoaded(speakers) => {
                 tracing::info!(count = speakers.len(), "VOICEVOX talk speakers loaded");
-                self.talk_speakers = speakers;
+                self.voicevox.talk_speakers = speakers;
             }
             AppEvent::RefetchSpeakers => {
                 self.spawn_fetch_speakers();
@@ -8114,46 +7010,46 @@ impl AppData {
                 self.set_clip_talk_param(clip, param, value);
             }
             AppEvent::SetPianoRollSnapEnabled(b) => {
-                self.pianoroll_snap_enabled = b;
+                self.ui_prefs.pianoroll_snap_enabled = b;
             }
             AppEvent::SetPianoRollSnapChoice(c) => {
-                self.pianoroll_snap_choice = clamp_snap_choice(c);
+                self.ui_prefs.pianoroll_snap_choice = clamp_snap_choice(c);
             }
             AppEvent::SetArrangeSnapEnabled(b) => {
-                self.arrange_snap_enabled = b;
+                self.ui_prefs.arrange_snap_enabled = b;
             }
             AppEvent::SetArrangeSnapChoice(c) => {
-                self.arrange_snap_choice = clamp_snap_choice(c);
+                self.ui_prefs.arrange_snap_choice = clamp_snap_choice(c);
             }
             AppEvent::TogglePianoRollSnap => {
-                self.pianoroll_snap_enabled = !self.pianoroll_snap_enabled;
+                self.ui_prefs.pianoroll_snap_enabled = !self.ui_prefs.pianoroll_snap_enabled;
             }
             AppEvent::ToggleArrangeSnap => {
-                self.arrange_snap_enabled = !self.arrange_snap_enabled;
+                self.ui_prefs.arrange_snap_enabled = !self.ui_prefs.arrange_snap_enabled;
             }
             AppEvent::NarrowPianoRollGrid => {
-                self.pianoroll_snap_choice =
-                    crate::view::snap::narrow_choice(self.pianoroll_snap_choice);
+                self.ui_prefs.pianoroll_snap_choice =
+                    crate::view::snap::narrow_choice(self.ui_prefs.pianoroll_snap_choice);
             }
             AppEvent::NarrowArrangeGrid => {
-                self.arrange_snap_choice =
-                    crate::view::snap::narrow_choice(self.arrange_snap_choice);
+                self.ui_prefs.arrange_snap_choice =
+                    crate::view::snap::narrow_choice(self.ui_prefs.arrange_snap_choice);
             }
             AppEvent::WidenPianoRollGrid => {
-                self.pianoroll_snap_choice =
-                    crate::view::snap::widen_choice(self.pianoroll_snap_choice);
+                self.ui_prefs.pianoroll_snap_choice =
+                    crate::view::snap::widen_choice(self.ui_prefs.pianoroll_snap_choice);
             }
             AppEvent::WidenArrangeGrid => {
-                self.arrange_snap_choice =
-                    crate::view::snap::widen_choice(self.arrange_snap_choice);
+                self.ui_prefs.arrange_snap_choice =
+                    crate::view::snap::widen_choice(self.ui_prefs.arrange_snap_choice);
             }
             AppEvent::TogglePianoRollTriplet => {
-                self.pianoroll_snap_choice =
-                    crate::view::snap::toggle_triplet_choice(self.pianoroll_snap_choice);
+                self.ui_prefs.pianoroll_snap_choice =
+                    crate::view::snap::toggle_triplet_choice(self.ui_prefs.pianoroll_snap_choice);
             }
             AppEvent::ToggleArrangeTriplet => {
-                self.arrange_snap_choice =
-                    crate::view::snap::toggle_triplet_choice(self.arrange_snap_choice);
+                self.ui_prefs.arrange_snap_choice =
+                    crate::view::snap::toggle_triplet_choice(self.ui_prefs.arrange_snap_choice);
             }
             AppEvent::FitPianoRollToClip => {
                 self.fit_piano_roll_to_clip();
@@ -8186,20 +7082,25 @@ impl AppData {
                 self.set_scale_at_playhead(root, scale);
             }
             AppEvent::ClearScaleChanges => {
-                self.song.scale_changes.clear();
+                self.edit_song(|song| song.scale_changes.clear());
             }
             AppEvent::QuantizePitchesToScale(target) => {
                 self.quantize_pitches_to_scale(target);
             }
             AppEvent::ToggleSnapOnDraw => {
-                self.snap_on_draw = !self.snap_on_draw;
+                self.ui_prefs.snap_on_draw = !self.ui_prefs.snap_on_draw;
             }
             AppEvent::ToggleSnapLiveInput => {
-                self.snap_live_input = !self.snap_live_input;
+                self.recording.snap_live_input = !self.recording.snap_live_input;
             }
             AppEvent::ToggleFoldToScale => {
-                self.piano_roll_fold = !self.piano_roll_fold;
+                self.ui_prefs.piano_roll_fold = !self.ui_prefs.piano_roll_fold;
             }
+        }
+        // edit_song が export 中拒否を予約していたら status に表示する
+        // (song 凍結の単一保証点は SongDoc::edit、 旧 allow-list gate の置換)。
+        if let Some(msg) = self.song_doc.take_rejection() {
+            self.ui_ephemeral.status_message = msg.into();
         }
     }
 }
@@ -8212,9 +7113,9 @@ fn clamp_snap_choice(c: u8) -> u8 {
 impl AppData {
     // -------- IPC -----------------------------------------------------------
 
-    pub(crate) fn send_audio(&self, msg: MainToChild) {
+    pub(crate) fn send_audio(&self, msg: AudioCommand) {
         tracing::info!(?msg, "sending to audio");
-        let Some(tx) = self.audio_tx.as_ref() else {
+        let Some(tx) = self.ipc.audio_tx.as_ref() else {
             tracing::warn!("audio sender is not configured");
             return;
         };
@@ -8223,9 +7124,9 @@ impl AppData {
         }
     }
 
-    fn send_plugin(&self, msg: MainToChild) {
+    fn send_plugin(&self, msg: PluginCommand) {
         tracing::info!(?msg, "sending to plugin_host");
-        let Some(tx) = self.plugin_tx.as_ref() else {
+        let Some(tx) = self.ipc.plugin_tx.as_ref() else {
             tracing::warn!("plugin sender is not configured");
             return;
         };
@@ -8237,14 +7138,13 @@ impl AppData {
     /// H2 (r.md #8): frame ごとに 1 回呼ばれ、 pending な realtime edit
     /// (MIDI-CC → plugin param 等) の plugin-host 再 sync を coalesce して flush する。
     pub(crate) fn flush_pending_host_sync(&mut self) {
-        if std::mem::take(&mut self.pending_host_sync) {
+        if std::mem::take(&mut self.ipc.pending_host_sync) {
             self.sync_song_to_plugin_host();
         }
     }
 
     pub(crate) fn sync_song_to_plugin_host(&mut self) {
-        self.is_dirty = true;
-        if self.is_dragging {
+        if self.ui_ephemeral.is_dragging {
             return;
         }
         // v23 (review fix #4/#5/#6): daw_audio は各 device の役割を `ports` から
@@ -8260,12 +7160,12 @@ impl AppData {
         // 送れば audio side の LoadSong handler 内で project_dir が
         // 既に最新になっている。
         let project_dir: Option<PathBuf> = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
-        self.send_audio(MainToChild::SetProjectDir(project_dir));
-        let song = self.song.clone();
-        self.send_audio(MainToChild::LoadSong(song));
+        self.send_audio(AudioCommand::SetProjectDir(project_dir));
+        let song = self.song_doc.song().clone();
+        self.send_audio(AudioCommand::LoadSong(song));
         // PR-V3: vocal track が builtin VOICEVOX を instrument に持つ場合、
         // notes / bpm 変更を plugin に flush して背景 synth を trigger。
         // 既存 vocal block (= track.instrument is None の旧 project) には
@@ -8283,32 +7183,41 @@ impl AppData {
     /// `SetupAraDocument` (which reinitialises the plug-in) is sent only when the
     /// resolved clip set changes, and `ClearAraDocument` for slots no longer ARA.
     fn sync_ara_documents(&mut self) {
-        let Some(db) = self.plugin_db.clone() else {
+        let Some(db) = self.ipc.plugin_db.clone() else {
             self.clear_all_ara_documents();
             return;
         };
         let project_dir: Option<PathBuf> = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
-        let bpm = f64::from(self.song.bpm).max(1.0);
+        let bpm = f64::from(self.song_doc.song().bpm).max(1.0);
 
-        // Resolve the current ARA clip set for every ARA device slot.
-        let mut live: std::collections::HashMap<(u32, u32), Vec<common::protocol::AraClipSpec>> =
+        // (v29 §2) ARA track が参照する in-memory (`Generated`) source を
+        // 先に WAV へ materialize する (旧 `AraSourceSpec::Pcm` の置換)。
+        // collect (下の &self ループ) が `ara_pcm_materialized` から path を
+        // 引けるように、 &mut self が要るこの pre-pass で済ませる。
+        self.materialize_generated_sources_for_ara(&db);
+
+        // Resolve the current ARA clip set for every ARA device (v29:
+        // 安定 device_id keyed)。
+        let mut live: std::collections::HashMap<u64, Vec<common::protocol::AraClipSpec>> =
             std::collections::HashMap::new();
-        for track in &self.song.tracks {
-            for (index, device) in track.devices.iter().enumerate() {
-                if !db.find_by_id(&device.plugin_id).is_some_and(|entry| entry.is_ara()) {
+        for track in &self.song_doc.song().tracks {
+            for device in track.devices.iter() {
+                if device.id == 0
+                    || !db.find_by_id(&device.plugin_id).is_some_and(|entry| entry.is_ara())
+                {
                     continue;
                 }
                 let clips = self.collect_ara_clips_for_track(track, project_dir.as_deref(), bpm);
-                live.insert((track.id, index as u32), clips);
+                live.insert(device.id, clips);
             }
         }
 
         /// Two resolved ARA clip sets have the same regions (same persistent_id
         /// and source, in order) — only their placement / stretch may differ, so
-        /// the slot can be updated in place instead of rebuilt.
+        /// the device can be updated in place instead of rebuilt.
         fn ara_same_clip_set(
             a: &[common::protocol::AraClipSpec],
             b: &[common::protocol::AraClipSpec],
@@ -8316,7 +7225,7 @@ impl AppData {
             a.len() == b.len()
                 && a.iter()
                     .zip(b)
-                    .all(|(x, y)| x.persistent_id == y.persistent_id && x.source == y.source)
+                    .all(|(x, y)| x.persistent_id == y.persistent_id && x.source_wav == y.source_wav)
         }
         fn ara_region_update_of(
             clip: &common::protocol::AraClipSpec,
@@ -8328,15 +7237,15 @@ impl AppData {
         }
 
         // Diff against the cache (before any &mut self send), splitting changes
-        // into in-place region updates and full rebuilds. A slot whose clip set
+        // into in-place region updates and full rebuilds. A device whose clip set
         // is unchanged but whose placement / stretch differs is updated via
         // `UpdateAraRegions` — `updatePlaybackRegionProperties` is safe while
         // rendering, so live tempo / edge-drag follow doesn't interrupt playback.
-        // A slot that is new or whose clip set changed is rebuilt.
-        let mut rebuilds: Vec<((u32, u32), Vec<common::protocol::AraClipSpec>)> = Vec::new();
-        let mut updates: Vec<((u32, u32), Vec<common::protocol::AraRegionUpdate>)> = Vec::new();
+        // A device that is new or whose clip set changed is rebuilt.
+        let mut rebuilds: Vec<(u64, Vec<common::protocol::AraClipSpec>)> = Vec::new();
+        let mut updates: Vec<(u64, Vec<common::protocol::AraRegionUpdate>)> = Vec::new();
         for (key, clips) in &live {
-            match self.ara_doc_cache.get(key) {
+            match self.ipc.ara_doc_cache.get(key) {
                 Some(prev) if prev == clips => {}
                 Some(prev) if ara_same_clip_set(prev, clips) => {
                     updates.push((*key, clips.iter().map(ara_region_update_of).collect()));
@@ -8344,47 +7253,152 @@ impl AppData {
                 _ => rebuilds.push((*key, clips.clone())),
             }
         }
-        let stale: Vec<(u32, u32)> = self
-            .ara_doc_cache
+        let stale: Vec<u64> = self
+            .ipc.ara_doc_cache
             .keys()
             .filter(|key| !live.contains_key(*key))
             .copied()
             .collect();
 
-        self.ara_doc_cache = live;
-        for ((track, index), clips) in rebuilds {
+        self.ipc.ara_doc_cache = live;
+        for (device_id, clips) in rebuilds {
             // Restore any saved ARA edits for this device alongside the rebuild.
             let archive = self
-                .song
+                .song_doc.song()
                 .tracks
                 .iter()
-                .find(|t| t.id == track)
-                .and_then(|t| t.devices.get(index as usize))
+                .flat_map(|t| t.devices.iter())
+                .find(|d| d.id == device_id)
                 .and_then(|d| d.ara_archive.as_deref().map(<[u8]>::to_vec));
-            self.send_plugin(MainToChild::SetupAraDocument {
-                track,
-                index,
+            self.send_plugin(PluginCommand::SetupAraDocument {
+                device_id,
                 clips,
                 bpm,
-                time_sig: (self.song.time_sig.0 as u16, self.song.time_sig.1 as u16),
+                time_sig: (self.song_doc.song().time_sig.0 as u16, self.song_doc.song().time_sig.1 as u16),
                 archive,
             });
         }
-        for ((track, index), regions) in updates {
-            self.send_plugin(MainToChild::UpdateAraRegions { track, index, regions });
+        for (device_id, regions) in updates {
+            self.send_plugin(PluginCommand::UpdateAraRegions { device_id, regions });
         }
-        for (track, index) in stale {
-            self.send_plugin(MainToChild::ClearAraDocument { track, index });
+        for device_id in stale {
+            self.send_plugin(PluginCommand::ClearAraDocument { device_id });
         }
     }
 
-    /// Send `ClearAraDocument` for every cached ARA slot and empty the cache.
+    /// Send `ClearAraDocument` for every cached ARA device and empty the cache.
     fn clear_all_ara_documents(&mut self) {
-        let stale: Vec<(u32, u32)> = self.ara_doc_cache.keys().copied().collect();
-        self.ara_doc_cache.clear();
-        for (track, index) in stale {
-            self.send_plugin(MainToChild::ClearAraDocument { track, index });
+        let stale: Vec<u64> = self.ipc.ara_doc_cache.keys().copied().collect();
+        self.ipc.ara_doc_cache.clear();
+        for device_id in stale {
+            self.send_plugin(PluginCommand::ClearAraDocument { device_id });
         }
+    }
+
+    /// (v29 §2) 旧 `AraSourceSpec::Pcm` の置換: ARA device を持つ track の
+    /// audio event が参照する `AudioSourcePath::Generated` (in-memory) source
+    /// を、 app cache dir (`<app_dirs.root>/ara_pcm/ara_pcm_<hash>.wav`) へ
+    /// interleaved f32 WAV として書き出し、 path を
+    /// `ara_pcm_materialized` に登録する。 既に登録済み / ファイル既存なら
+    /// no-op (Generated source は immutable)。 decoded buffer が GUI cache に
+    /// 無い source は書けないので skip (= 従来どおり ARA に出さない)。
+    ///
+    /// 呼び出しは UI thread の song-sync 経路 (非 RT)。 1 source につき
+    /// 1 回限りの書き出しなので同期で書く (bounce 済み in-memory audio が
+    /// wire を渡って 16MB 上限を破る旧設計の置換、 `docs/plan_arch_refactor.md` §2)。
+    fn materialize_generated_sources_for_ara(&mut self, db: &PluginDatabase) {
+        use common::model::{AudioSourcePath, ClipContent};
+        // 対象: ARA device を持つ track の audio event が参照する Generated source。
+        let mut todo: Vec<common::model::AudioSourceId> = Vec::new();
+        for track in &self.song_doc.song().tracks {
+            let has_ara = track
+                .devices
+                .iter()
+                .any(|d| db.find_by_id(&d.plugin_id).is_some_and(|e| e.is_ara()));
+            if !has_ara {
+                continue;
+            }
+            for clip in &track.clips {
+                let Some(ClipContent::Audio(audio)) =
+                    self.song_doc.song().clip_contents.get(&clip.content_id)
+                else {
+                    continue;
+                };
+                for event in &audio.events {
+                    let Some(source) = self.song_doc.song().audio_sources.get(&event.source_id) else {
+                        continue;
+                    };
+                    if matches!(source.path, AudioSourcePath::Generated { .. })
+                        && !self.ipc.ara_pcm_materialized.contains_key(&event.source_id)
+                    {
+                        todo.push(event.source_id);
+                    }
+                }
+            }
+        }
+        todo.sort_unstable();
+        todo.dedup();
+        for source_id in todo {
+            if let Err(e) = self.materialize_generated_source(source_id) {
+                tracing::warn!(source_id, error = %e, "ARA: failed to materialize generated source");
+            }
+        }
+    }
+
+    /// 1 つの Generated source を WAV に書き出して `ara_pcm_materialized` に
+    /// 登録する。 buffer 未 decode / app_dirs 無しは Err。
+    fn materialize_generated_source(
+        &mut self,
+        source_id: common::model::AudioSourceId,
+    ) -> anyhow::Result<()> {
+        use std::hash::Hasher as _;
+        let Some(buffer) = self.media.audio_source_cache.get(source_id) else {
+            anyhow::bail!("generated source {source_id} has no decoded buffer in the GUI cache");
+        };
+        let Some(dirs) = self.ui_prefs.app_dirs.as_ref() else {
+            anyhow::bail!("app data dir unavailable");
+        };
+        // content hash (FNV-1a 相当は std に無いので DefaultHasher で代用 —
+        // ファイル名の安定性は「同 session 同 content で同名」 が要件)。
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write_u32(buffer.sample_rate);
+        hasher.write_u16(buffer.channels);
+        hasher.write_u64(buffer.frames);
+        for plane in &buffer.samples {
+            for &s in plane {
+                hasher.write_u32(s.to_bits());
+            }
+        }
+        let hash = hasher.finish();
+        let dir = dirs.root().join("ara_pcm");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("ara_pcm_{hash:016x}.wav"));
+        if !path.exists() {
+            let spec = hound::WavSpec {
+                channels: buffer.channels.max(1),
+                sample_rate: buffer.sample_rate.max(1),
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec)?;
+            let frames = buffer.frames as usize;
+            let channels = buffer.samples.len().max(1);
+            for frame in 0..frames {
+                for ch in 0..channels {
+                    let s = buffer
+                        .samples
+                        .get(ch)
+                        .and_then(|plane| plane.get(frame))
+                        .copied()
+                        .unwrap_or(0.0);
+                    writer.write_sample(s)?;
+                }
+            }
+            writer.finalize()?;
+            tracing::info!(source_id, path = %path.display(), "ARA: materialized generated source to WAV");
+        }
+        self.ipc.ara_pcm_materialized.insert(source_id, path);
+        Ok(())
     }
 
     /// (r.md #5 ARA2) Resolve a track's audio clips into ARA clip specs. Times
@@ -8400,12 +7414,12 @@ impl AppData {
         use common::model::{AudioSourcePath, ClipContent};
         let mut out = Vec::new();
         for clip in &track.clips {
-            let Some(ClipContent::Audio(audio)) = self.song.clip_contents.get(&clip.content_id)
+            let Some(ClipContent::Audio(audio)) = self.song_doc.song().clip_contents.get(&clip.content_id)
             else {
                 continue;
             };
             for (event_index, event) in audio.events.iter().enumerate() {
-                let Some(source) = self.song.audio_sources.get(&event.source_id) else {
+                let Some(source) = self.song_doc.song().audio_sources.get(&event.source_id) else {
                     continue;
                 };
                 let abs = match &source.path {
@@ -8414,7 +7428,16 @@ impl AppData {
                         Some(dir) => dir.join(rel),
                         None => continue,
                     },
-                    AudioSourcePath::Generated { .. } => continue,
+                    // (v29 §2) in-memory audio は wire に載せず、 事前に
+                    // `materialize_generated_sources_for_ara` が書き出した
+                    // WAV path を渡す (未 materialize = decoded buffer 無し
+                    // は従来どおり skip)。
+                    AudioSourcePath::Generated { .. } => {
+                        match self.ipc.ara_pcm_materialized.get(&event.source_id) {
+                            Some(p) => p.clone(),
+                            None => continue,
+                        }
+                    }
                 };
                 let sample_rate = f64::from(source.sample_rate).max(1.0);
                 let start_in_modification = event.source_start_frames as f64 / sample_rate;
@@ -8439,7 +7462,7 @@ impl AppData {
                     duration_in_modification
                 };
                 out.push(common::protocol::AraClipSpec {
-                    source: common::protocol::AraSourceSpec::WavFile(abs),
+                    source_wav: abs,
                     persistent_id: format!("{}:{}:{event_index}", event.source_id, clip.id),
                     placement: common::protocol::AraRegionPlacement {
                         start_in_playback_seconds: start_in_playback,
@@ -8460,23 +7483,40 @@ impl AppData {
     /// 無音になる。既に解決済み (= いずれかの port が true) の device は触らない
     /// (= picker 追加 / SlotPluginLoaded backfill 済みは no-op、DB 不在も保持)。
     fn resolve_default_device_ports(&mut self) {
-        let Some(db) = self.plugin_db.clone() else {
+        let Some(db) = self.ipc.plugin_db.clone() else {
             return;
         };
         let default_ports = common::port_config::PortConfig::default();
-        let resolve = |devices: &mut [common::model::PluginInstance]| {
-            for d in devices.iter_mut() {
-                if d.ports == default_ports
-                    && let Some(entry) = db.find_by_id(&d.plugin_id)
-                {
-                    d.ports = port_config_of(entry);
-                }
-            }
+        // 先に読みだけで解決の要否を判定する (steady state では bool 比較のみ)。
+        // 解決は「ユーザー編集」ではない正規化なので normalize (undo 履歴に
+        // 入れない。 epoch は進む = 子プロセス sync は走り、 2 周目は
+        // ports != default で no-op に収束する)。
+        let needs = {
+            let song = self.song_doc.song();
+            song.tracks
+                .iter()
+                .flat_map(|t| t.devices.iter())
+                .chain(song.master_fx_chain.iter())
+                .any(|d| d.ports == default_ports && db.find_by_id(&d.plugin_id).is_some())
         };
-        for track in self.song.tracks.iter_mut() {
-            resolve(&mut track.devices);
+        if !needs {
+            return;
         }
-        resolve(&mut self.song.master_fx_chain);
+        self.song_doc.normalize(|song| {
+            let mut resolve = |devices: &mut [common::model::PluginInstance]| {
+                for d in devices.iter_mut() {
+                    if d.ports == default_ports
+                        && let Some(entry) = db.find_by_id(&d.plugin_id)
+                    {
+                        d.ports = port_config_of(entry);
+                    }
+                }
+            };
+            for track in song.tracks.iter_mut() {
+                resolve(&mut track.devices);
+            }
+            resolve(&mut song.master_fx_chain);
+        });
     }
 
     // -------- File ----------------------------------------------------------
@@ -8489,12 +7529,12 @@ impl AppData {
         // 同一プロジェクト判定用、別 New 同士は別プロジェクト扱いになる)。
         song.ensure_project_id();
         Self::migrate_legacy_vocal_tracks(&mut song);
-        self.song = song;
-        self.file_path = None;
-        self.selected_track_ids.clear();
-        self.collapsed_groups.clear();
-        self.selected_clip = None;
-        self.selected_notes.clear();
+        self.song_doc.replace_song(song);
+        self.song_doc.file_path = None;
+        self.selection.selected_track_ids.clear();
+        self.ui_prefs.collapsed_groups.clear();
+        self.selection.selected_clip = None;
+        self.selection.selected_notes.clear();
         // 新規プロジェクトでは前プロジェクトの per-clip view を漏らさずクリア
         // (globals は現状維持 = 従来挙動)。`None` 経路 = action_open_path の旧ファイルと同じ。
         self.restore_view_state(None);
@@ -8502,14 +7542,14 @@ impl AppData {
         // sync 前に migrated vocal track の builtin VOICEVOX を SetSlotPlugin
         // で plugin host に load 要求する (= restore_plugin_from_song と同
         // 経路、 起動直後の Song::default のみ self を持つので clone 経由)。
-        let song_snapshot = self.song.clone();
+        let song_snapshot = self.song_doc.song().clone();
         self.restore_plugin_from_song(&song_snapshot);
         self.sync_song_to_plugin_host();
         self.resync_song_edit_texts();
         // 新規プロジェクトを clean (= '*' 無し) で開始し、 旧プロジェクトの
         // Undo/Redo 履歴を破棄する (sync_song_to_plugin_host が is_dirty を
         // 立てるので、 ここで baseline 確定して打ち消す)。
-        self.reset_saved_baseline();
+        self.after_song_replaced();
         tracing::info!("new project");
     }
 
@@ -8522,8 +7562,8 @@ impl AppData {
         );
     }
 
-    /// Phase 6 review fix: project load 直後に `self.song.audio_sources` 全件
-    /// を WAV decode して `self.audio_source_cache` に詰める。 旧コードでは
+    /// Phase 6 review fix: project load 直後に `self.song_doc.song().audio_sources` 全件
+    /// を WAV decode して `self.media.audio_source_cache` に詰める。 旧コードでは
     /// この path が欠落していて、 saved project を開いた audio clip の波形が
     /// 表示されなかった (= `arrangement_view::draw_audio_clip_waveform` で
     /// `audio_source_cache.get(event.source_id) → None`)。 import 経由 (=
@@ -8531,7 +7571,7 @@ impl AppData {
     /// が即 decode + cache 投入していたので、 そちらだけ波形が出るという
     /// intermittent な見え方になっていた。
     ///
-    /// caller は `self.file_path` と `self.song` をセット済の前提。
+    /// caller は `self.song_doc.file_path` と `self.song_doc.song()` をセット済の前提。
     /// ProjectRelative は file_path.parent() で resolve、 Generated は廃止
     /// 仕様で skip。 decode 失敗は warn ログのみ (= waveform が出ないだけで
     /// 他機能は動く defensive)。
@@ -8547,14 +7587,14 @@ impl AppData {
         // file_path = None (= 未保存 project の sidecar 復元) の場合、
         // ProjectRelative は resolve できないので skip。
         let project_dir: Option<PathBuf> = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
         // 未 cache の audio source だけ work-list に (idempotent)。
         let mut audio_jobs: Vec<(common::model::AudioSourceId, PathBuf)> = Vec::new();
-        for (&source_id, source) in &self.song.audio_sources {
-            if self.audio_source_cache.contains(source_id) {
+        for (&source_id, source) in &self.song_doc.song().audio_sources {
+            if self.media.audio_source_cache.contains(source_id) {
                 continue;
             }
             let abs = match &source.path {
@@ -8570,8 +7610,8 @@ impl AppData {
         }
         // 未 staging の image source。
         let mut image_jobs: Vec<(common::model::ImageSourceId, PathBuf)> = Vec::new();
-        for (&source_id, source) in &self.song.image_sources {
-            if self.image_source_bgra.contains_key(&source_id) {
+        for (&source_id, source) in &self.song_doc.song().image_sources {
+            if self.media.image_source_bgra.contains_key(&source_id) {
                 continue;
             }
             let abs = match &source.path {
@@ -8586,14 +7626,14 @@ impl AppData {
 
         let total = audio_jobs.len() + image_jobs.len();
         if total == 0 {
-            self.asset_decode = None;
+            self.media.asset_decode = None;
             return;
         }
         let staging = Arc::new(Mutex::new(AssetDecodeStaging { total, ..Default::default() }));
-        self.asset_decode = Some(Arc::clone(&staging));
-        self.load_progress = Some((0, total));
-        self.load_progress_label = "プロジェクトを読込中";
-        let proxy = self.event_proxy.clone();
+        self.media.asset_decode = Some(Arc::clone(&staging));
+        self.media.load_progress = Some((0, total));
+        self.media.load_progress_label = "プロジェクトを読込中";
+        let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             for (id, abs) in audio_jobs {
                 let decoded = crate::import_audio::decode_wav(&abs)
@@ -8627,7 +7667,7 @@ impl AppData {
     /// 溜まった結果を self caches へ流し込み (= 該当 clip の波形 / 画像が描画
     /// 開始)、 全件完了で gate を外して queue 中の Play を流す。
     fn on_asset_decode_tick(&mut self) {
-        let Some(staging) = self.asset_decode.clone() else {
+        let Some(staging) = self.media.asset_decode.clone() else {
             return;
         };
         let (audio, image, done, total) = {
@@ -8642,24 +7682,24 @@ impl AppData {
             )
         };
         for (id, buf) in audio {
-            self.audio_source_cache.insert(id, buf);
+            self.media.audio_source_cache.insert(id, buf);
         }
         for (id, (w, h, bytes)) in image {
-            self.image_source_bgra.insert(id, (w, h, bytes));
-            self.pending_image_uploads.push(id);
+            self.media.image_source_bgra.insert(id, (w, h, bytes));
+            self.media.pending_image_uploads.push(id);
         }
         if done >= total {
             tracing::info!(total, "asset decode complete");
-            self.asset_decode = None;
-            self.load_progress = None;
+            self.media.asset_decode = None;
+            self.media.load_progress = None;
             // 読込完了 → gate していた Play を流す (plugin gate が残っていれば
             // play() が再 queue する)。
-            if self.pending_play {
-                self.pending_play = false;
+            if self.transport.pending_play {
+                self.transport.pending_play = false;
                 self.play();
             }
         } else {
-            self.load_progress = Some((done, total));
+            self.media.load_progress = Some((done, total));
         }
     }
 
@@ -8668,7 +7708,7 @@ impl AppData {
         // Recursive open を防ぐ: autosave file を直接開いた場合は弾く
         // (RecoveryRestore で開くべきもの)。
         if common::recovery::is_autosave_file(&path) {
-            self.status_message = format!(
+            self.ui_ephemeral.status_message = format!(
                 "autosave ファイルは Recovery modal から復元してください: {}",
                 path.display()
             );
@@ -8686,16 +7726,16 @@ impl AppData {
                 // いた回帰の修正 (load 成功後・新 plugin load 前に実行)。
                 self.teardown_all_loaded_plugins();
                 self.restore_plugin_from_song(&song);
-                self.song = song;
-                self.file_path = Some(path.clone());
+                self.song_doc.replace_song(song);
+                self.song_doc.file_path = Some(path.clone());
                 // audio / image source の decode は重いので background
                 // スレッドへ。 構造は既に swap 済みなので即操作可、 波形 / 画像は
                 // streaming で順次出る (begin_asset_decode → AssetDecodeTick)。
                 self.begin_asset_decode();
-                self.selected_track_ids.clear();
-                self.collapsed_groups.clear();
-                self.selected_clip = None;
-                self.selected_notes.clear();
+                self.selection.selected_track_ids.clear();
+                self.ui_prefs.collapsed_groups.clear();
+                self.selection.selected_clip = None;
+                self.selection.selected_notes.clear();
                 // 保存済みの表示状態 (ズーム / スクロール / per-clip view / 選択
                 // クリップ) を復元。`None` (旧ファイル / view 未保存) なら per-clip map をクリア
                 // するだけで globals は現状維持 = 従来の fit-to-content 挙動。
@@ -8709,12 +7749,12 @@ impl AppData {
                 self.resync_song_edit_texts();
                 // load した内容を新しい保存ベースラインに確定し、 前プロジェクトの
                 // Undo/Redo 履歴を破棄する (reset_saved_baseline 内で is_dirty=false)。
-                self.reset_saved_baseline();
+                self.after_song_replaced();
                 // sidecar 検出: 前回のセッションが正常終了せず、 同 file の
                 // autosave が残っているなら recovery modal に追加。 ユーザーが
                 // 「復元」 で sidecar に切り替えられる。
                 let sidecar = common::recovery::sidecar_for(&path);
-                if sidecar.exists() && !self.recovery_candidates.contains(&sidecar) {
+                if sidecar.exists() && !self.ui_ephemeral.recovery_candidates.contains(&sidecar) {
                     // sidecar が .daw より新しいときだけ復元候補に出す。 古い
                     // (= 保存後の消し損ね / unclean exit 残骸) は stale なので
                     // 提示せず掃除する (delete-on-save の取りこぼし救済)。
@@ -8723,8 +7763,8 @@ impl AppData {
                             sidecar = %sidecar.display(),
                             "sidecar autosave detected on open (newer than saved file)"
                         );
-                        self.recovery_candidates.push(sidecar);
-                        self.show_recovery_modal = true;
+                        self.ui_ephemeral.recovery_candidates.push(sidecar);
+                        self.ui_ephemeral.show_recovery_modal = true;
                     } else {
                         tracing::info!(
                             sidecar = %sidecar.display(),
@@ -8737,7 +7777,7 @@ impl AppData {
             }
             Err(e) => {
                 tracing::error!(error = ?e, path = %path.display(), "failed to load project");
-                self.status_message = format!("Open 失敗: {e:#}");
+                self.ui_ephemeral.status_message = format!("Open 失敗: {e:#}");
             }
         }
     }
@@ -8764,19 +7804,19 @@ impl AppData {
     /// 復元するため、 同時に label cache も復元したい。 caller (= bootstrap)
     /// が `app.init_recent_labels()` を 1 回呼ぶ。
     pub fn init_recent_labels(&mut self) {
-        self.recent_files_labels =
-            Self::rebuild_recent_labels(&self.recent_files.paths);
-        self.recent_saved_labels =
-            Self::rebuild_recent_labels(&self.recent_saved.paths);
+        self.ui_prefs.recent_files_labels =
+            Self::rebuild_recent_labels(&self.ui_prefs.recent_files.paths);
+        self.ui_prefs.recent_saved_labels =
+            Self::rebuild_recent_labels(&self.ui_prefs.recent_saved.paths);
     }
 
     /// 「最近開いたファイル」 履歴に追加。 `recent.json` に永続化。
     fn push_recent(&mut self, path: PathBuf) {
-        self.recent_files.push(path);
-        self.recent_files_labels =
-            Self::rebuild_recent_labels(&self.recent_files.paths);
-        if let Some(disk) = self.app_dirs.as_ref().map(|d| d.recent())
-            && let Err(e) = common::recent::save(&disk, &self.recent_files)
+        self.ui_prefs.recent_files.push(path);
+        self.ui_prefs.recent_files_labels =
+            Self::rebuild_recent_labels(&self.ui_prefs.recent_files.paths);
+        if let Some(disk) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recent())
+            && let Err(e) = common::recent::save(&disk, &self.ui_prefs.recent_files)
         {
             tracing::warn!(
                 error = ?e,
@@ -8790,11 +7830,11 @@ impl AppData {
     /// 開いた履歴 (`recent_files`) と完全に独立。 Save / Save As の両 path
     /// で実 file 書き込み成功後に呼ぶ。
     fn push_recent_saved(&mut self, path: PathBuf) {
-        self.recent_saved.push(path);
-        self.recent_saved_labels =
-            Self::rebuild_recent_labels(&self.recent_saved.paths);
-        if let Some(disk) = self.app_dirs.as_ref().map(|d| d.recent_saved())
-            && let Err(e) = common::recent::save(&disk, &self.recent_saved)
+        self.ui_prefs.recent_saved.push(path);
+        self.ui_prefs.recent_saved_labels =
+            Self::rebuild_recent_labels(&self.ui_prefs.recent_saved.paths);
+        if let Some(disk) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recent_saved())
+            && let Err(e) = common::recent::save(&disk, &self.ui_prefs.recent_saved)
         {
             tracing::warn!(
                 error = ?e,
@@ -8805,19 +7845,19 @@ impl AppData {
     }
 
     fn maybe_autosave(&mut self) {
-        if !self.is_dirty {
+        if !self.song_doc.is_dirty() {
             return;
         }
-        if self.last_autosave.elapsed() < std::time::Duration::from_secs(60) {
+        if self.song_doc.last_autosave.elapsed() < std::time::Duration::from_secs(60) {
             return;
         }
 
         // 保存先決定: file_path Some なら sidecar、 None なら recovery_dir。
-        let autosave_path = match self.file_path.as_ref() {
+        let autosave_path = match self.song_doc.file_path.as_ref() {
             Some(orig) => common::recovery::sidecar_for(orig),
             None => {
                 let Some(dir) =
-                    self.app_dirs.as_ref().map(|d| d.recovery_dir())
+                    self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir())
                 else {
                     // 永続化先未設定 (= test 等)。 未保存 project の autosave は skip。
                     return;
@@ -8828,7 +7868,7 @@ impl AppData {
                 }
                 common::recovery::recovery_path_for_session(
                     &dir,
-                    &self.recovery_session_id,
+                    &self.song_doc.recovery_session_id,
                 )
             }
         };
@@ -8836,10 +7876,10 @@ impl AppData {
         // autosave も表示状態を同梱する (= ダーティでなくても view が
         // 永続化される → スクロール/ズーム変更が `*` を立てずに次回 open で復元される)。
         let view = self.snapshot_view_state();
-        match common::project::save_project(&autosave_path, &self.song, Some(&view)) {
+        match common::project::save_project(&autosave_path, &self.song_doc.song(), Some(&view)) {
             Ok(()) => {
                 tracing::info!(path = %autosave_path.display(), "autosaved");
-                self.last_autosave = std::time::Instant::now();
+                self.song_doc.last_autosave = std::time::Instant::now();
             }
             Err(e) => {
                 tracing::warn!(
@@ -8858,10 +7898,10 @@ impl AppData {
     /// 「save より古い」 候補が出ず、 保存内容を巻き戻すリスクを断つ。
     fn clear_stale_autosave_after_save(&mut self, saved_path: &Path) {
         let mut stale: Vec<PathBuf> = vec![common::recovery::sidecar_for(saved_path)];
-        if let Some(dir) = self.app_dirs.as_ref().map(|d| d.recovery_dir()) {
+        if let Some(dir) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir()) {
             stale.push(common::recovery::recovery_path_for_session(
                 &dir,
-                &self.recovery_session_id,
+                &self.song_doc.recovery_session_id,
             ));
         }
         for p in stale {
@@ -8877,10 +7917,10 @@ impl AppData {
                     ),
                 }
             }
-            self.recovery_candidates.retain(|c| c != &p);
+            self.ui_ephemeral.recovery_candidates.retain(|c| c != &p);
         }
         // 次の autosave までの 60s タイマーを reset (= save 直後に即書き戻さない)。
-        self.last_autosave = std::time::Instant::now();
+        self.song_doc.last_autosave = std::time::Instant::now();
     }
 
     /// ダーティーガードで「保存せず続行/終了」 (discard) を選んだとき、
@@ -8893,13 +7933,13 @@ impl AppData {
     /// untitled = file_path None も session file だけ掃除する)。
     fn discard_current_autosave(&mut self) {
         let mut stale: Vec<PathBuf> = Vec::new();
-        if let Some(orig) = self.file_path.as_ref() {
+        if let Some(orig) = self.song_doc.file_path.as_ref() {
             stale.push(common::recovery::sidecar_for(orig));
         }
-        if let Some(dir) = self.app_dirs.as_ref().map(|d| d.recovery_dir()) {
+        if let Some(dir) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir()) {
             stale.push(common::recovery::recovery_path_for_session(
                 &dir,
-                &self.recovery_session_id,
+                &self.song_doc.recovery_session_id,
             ));
         }
         for p in stale {
@@ -8916,7 +7956,7 @@ impl AppData {
                     ),
                 }
             }
-            self.recovery_candidates.retain(|c| c != &p);
+            self.ui_ephemeral.recovery_candidates.retain(|c| c != &p);
         }
     }
 
@@ -8940,7 +7980,7 @@ impl AppData {
                 path = %autosave_path.display(),
                 "failed to load recovery file"
             );
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 format!("復元失敗: {}", autosave_path.display());
             return;
         };
@@ -8952,15 +7992,15 @@ impl AppData {
         // 直後の復元」 で旧 plugin 実体・editor 窓・GUI cache が残る)。
         self.teardown_all_loaded_plugins();
         self.restore_plugin_from_song(&song);
-        self.song = song;
-        self.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
+        self.song_doc.replace_song(song);
+        self.song_doc.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
         // recovery 復元も load path と同じく background streaming
         // decode へ。 file_path を先にセット済みなので ProjectRelative も解決可。
         self.begin_asset_decode();
-        self.selected_track_ids.clear();
-        self.collapsed_groups.clear();
-        self.selected_clip = None;
-        self.selected_notes.clear();
+        self.selection.selected_track_ids.clear();
+        self.ui_prefs.collapsed_groups.clear();
+        self.selection.selected_clip = None;
+        self.selection.selected_notes.clear();
         // recovery も表示状態 + 選択クリップを復元 (autosave が view を書いている)。
         self.restore_view_state(view);
         if let Some(r) = self.selected_clip_ref() {
@@ -8970,14 +8010,14 @@ impl AppData {
         self.sync_song_to_plugin_host();
         self.resync_song_edit_texts();
         // 復元した内容を新しい保存ベースラインに確定し、 履歴を破棄する。
-        self.reset_saved_baseline();
+        self.after_song_replaced();
         let _ = std::fs::remove_file(&autosave_path);
-        self.recovery_candidates.retain(|p| p != &autosave_path);
-        if self.recovery_candidates.is_empty() {
-            self.show_recovery_modal = false;
+        self.ui_ephemeral.recovery_candidates.retain(|p| p != &autosave_path);
+        if self.ui_ephemeral.recovery_candidates.is_empty() {
+            self.ui_ephemeral.show_recovery_modal = false;
         }
         tracing::info!(
-            recovered_to = ?self.file_path,
+            recovered_to = ?self.song_doc.file_path,
             "recovery restored"
         );
     }
@@ -8991,9 +8031,9 @@ impl AppData {
                 "failed to remove recovery file"
             );
         }
-        self.recovery_candidates.retain(|p| p != &autosave_path);
-        if self.recovery_candidates.is_empty() {
-            self.show_recovery_modal = false;
+        self.ui_ephemeral.recovery_candidates.retain(|p| p != &autosave_path);
+        if self.ui_ephemeral.recovery_candidates.is_empty() {
+            self.ui_ephemeral.show_recovery_modal = false;
         }
     }
 
@@ -9002,10 +8042,10 @@ impl AppData {
     /// recovery file が無ければ no-op。 削除失敗は warn でログのみ。
     pub fn on_shutdown(&self) {
         // 自セッションの recovery_dir file
-        if let Some(dir) = self.app_dirs.as_ref().map(|d| d.recovery_dir()) {
+        if let Some(dir) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir()) {
             let p = common::recovery::recovery_path_for_session(
                 &dir,
-                &self.recovery_session_id,
+                &self.song_doc.recovery_session_id,
             );
             if p.exists()
                 && let Err(e) = std::fs::remove_file(&p)
@@ -9018,7 +8058,7 @@ impl AppData {
             }
         }
         // sidecar (file_path が Some なら)
-        if let Some(orig) = self.file_path.as_ref() {
+        if let Some(orig) = self.song_doc.file_path.as_ref() {
             let side = common::recovery::sidecar_for(orig);
             if side.exists()
                 && let Err(e) = std::fs::remove_file(&side)
@@ -9066,9 +8106,9 @@ impl AppData {
         // 1 つでも残っている track id (= host 側 plugin chain がまだ
         // ある) を見れば判定できる。
         let song_track_ids: std::collections::HashSet<u32> =
-            self.song.tracks.iter().map(|t| t.id).collect();
+            self.song_doc.song().tracks.iter().map(|t| t.id).collect();
         let stale_track_ids: std::collections::HashSet<u32> = self
-            .loaded_slots
+            .ipc.loaded_slots
             .keys()
             .map(|(tid, _)| *tid)
             .filter(|tid| !song_track_ids.contains(tid))
@@ -9083,31 +8123,37 @@ impl AppData {
             // `delete_track` と同じ IPC 順序: audio engine に
             // ClosePluginShmem を先送りしてから plugin_host に
             // RemoveTrack。
-            if let Some(plugin_ids) = self.track_plugin_ids.remove(&track_id) {
-                for pid in plugin_ids {
-                    self.send_audio(MainToChild::ClosePluginShmem { plugin_id: pid });
+            let device_ids = self.ipc.track_plugin_ids.remove(&track_id);
+            if let Some(ref device_ids) = device_ids {
+                for &device_id in device_ids {
+                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
                 }
             }
-            self.send_plugin(MainToChild::RemoveTrack { track: track_id });
+            self.send_plugin(PluginCommand::RemoveTrack { track_id });
             // host から消す track の pending load / GUI window / slot
-            // cache も掃除。
-            self.pending_plugin_loads.retain(|(t, _)| *t != track_id);
-            self.loaded_slots.retain(|(t, _), _| *t != track_id);
-            self.open_plugin_guis.retain(|&(t, _)| t != track_id);
+            // cache も掃除。 pending は device_id keyed なので、 その track の
+            // device 集合 (= track_plugin_ids に登録済みだったもの) で落とす。
+            if let Some(device_ids) = device_ids {
+                for device_id in device_ids {
+                    self.ipc.pending_plugin_loads.remove(&device_id);
+                }
+            }
+            self.ipc.loaded_slots.retain(|(t, _), _| *t != track_id);
+            self.ipc.open_plugin_guis.retain(|&(t, _)| t != track_id);
         }
 
         // Phase B: 各 track の slot 列を diff。 純粋関数で action 列を
         // 計算し、 順に IPC を dispatch する (test しやすさのため切り出し)。
-        let Some(db) = self.plugin_db.clone() else {
+        let Some(db) = self.ipc.plugin_db.clone() else {
             // plugin DB が未ロードなら SetSlotPlugin の組み立て不可。
             // RemoveSlotPlugin 単体は db 不要だが、 Phase B はまとめて
             // skip する (= db ロード待ち)。
-            if !self.song.tracks.is_empty() {
+            if !self.song_doc.song().tracks.is_empty() {
                 tracing::warn!("reconcile: plugin database not loaded; phase B skipped");
             }
             return;
         };
-        let actions = compute_slot_reconcile_actions(&self.song, &self.loaded_slots);
+        let actions = compute_slot_reconcile_actions(&self.song_doc.song(), &self.ipc.loaded_slots);
         for action in actions {
             match action {
                 SlotReconcileAction::RemoveSlot { track_id, index } => {
@@ -9115,12 +8161,15 @@ impl AppData {
                     // close the editor before removing (see
                     // remove_device_inner for the ordering rationale).
                     self.cleanup_slot_gui(track_id, index);
-                    self.send_plugin(MainToChild::RemoveSlotPlugin {
-                        track: track_id,
-                        index,
-                    });
-                    self.loaded_slots.remove(&(track_id, index));
-                    self.pending_plugin_loads.remove(&(track_id, index));
+                    // v29: host にあるが Song に無い device なので、 song から
+                    // id を引けない。 host 側の実 device id は loaded_slots が
+                    // 持っている (= SlotPluginLoaded で登録済み)。
+                    if let Some(info) = self.ipc.loaded_slots.remove(&(track_id, index)) {
+                        self.send_plugin(PluginCommand::RemoveSlotPlugin {
+                            device_id: info.device_id,
+                        });
+                        self.ipc.pending_plugin_loads.remove(&info.device_id);
+                    }
                 }
                 SlotReconcileAction::LoadSlot {
                     track_id,
@@ -9137,20 +8186,31 @@ impl AppData {
                         );
                         continue;
                     };
+                    // v29: Song 側 device の安定 id でアドレスする。
+                    let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, index) else {
+                        tracing::error!(
+                            track_id,
+                            index,
+                            "reconcile: song device has no stable id (unallocated?)"
+                        );
+                        continue;
+                    };
                     tracing::info!(
                         track_id,
                         index,
+                        device_id,
                         plugin_id = %plugin_id_str,
                         "reconcile: loading device from song"
                     );
-                    self.track_pending_load(track_id, index);
-                    self.send_plugin(MainToChild::SetSlotPlugin {
-                        track: track_id,
-                        index,
+                    let generation = self.track_pending_load(device_id);
+                    self.send_plugin(PluginCommand::SetSlotPlugin {
+                        device_id,
+                        track_id,
                         format: entry.format,
                         path: entry.path.clone(),
                         plugin_id: entry.id.clone(),
                         initial_state,
+                        generation,
                     });
                 }
             }
@@ -9167,37 +8227,45 @@ impl AppData {
     /// 既に instrument が居る vocal track (= 既に PR-V3 前段で auto-load
     /// 済 or 手動で plugin を入れた) は touch しない。 idempotent。
     fn migrate_legacy_vocal_tracks(song: &mut Song) {
-        for track in &mut song.tracks {
+        // v29: 追加 device に Song allocator で安定 id を振るため、 tracks を
+        // index で回す (`&mut song.tracks` の iter 中は `song.alloc_device_id`
+        // の全体借用が取れない)。
+        for ti in 0..song.tracks.len() {
             // 単一デバイスチェーン: 旧 `instrument.is_none()` は「チェーンに音源
             // が無い」と等価。音源 = MIDI から audio を生む device (note_in +
             // audio_out) を 1 つも持たないなら legacy vocal とみなす (役割判定はせず
             // port を直接見る)。
-            let has_sound_source = track
+            let has_sound_source = song.tracks[ti]
                 .devices
                 .iter()
                 .any(|p| p.ports.has_note_input && p.ports.has_audio_output);
             let is_legacy_vocal = matches!(
-                track.source,
+                song.tracks[ti].source,
                 common::model::InstrumentSource::Vocal
             ) && !has_sound_source;
             if !is_legacy_vocal {
                 continue;
             }
+            let device_id = song.alloc_device_id();
+            let track = &mut song.tracks[ti];
             // builtin VOICEVOX は純粋音源 (note_in + audio_out)。チェーン末尾に
             // 追加する (位置で音源として導出される)。
-            track.devices.push(common::model::PluginInstance::with_ports(
-                common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
-                PluginFormat::Builtin,
-                common::port_config::PortConfig {
-                    has_note_input: true,
-                    has_note_output: false,
-                    has_audio_output: true,
-                    // 音源 (audio を生成、加工はしない) なので audio 入力なし。
-                    has_audio_input: false,
-                    has_video_input: false,
-                    has_video_output: false,
-                },
-            ));
+            track.devices.push(common::model::PluginInstance {
+                id: device_id,
+                ..common::model::PluginInstance::with_ports(
+                    common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
+                    PluginFormat::Builtin,
+                    common::port_config::PortConfig {
+                        has_note_input: true,
+                        has_note_output: false,
+                        has_audio_output: true,
+                        // 音源 (audio を生成、加工はしない) なので audio 入力なし。
+                        has_audio_input: false,
+                        has_video_input: false,
+                        has_video_output: false,
+                    },
+                )
+            });
             tracing::info!(
                 track_id = track.id,
                 track_name = %track.name,
@@ -9214,25 +8282,25 @@ impl AppData {
     /// `MASTER_TRACK_ID` の RemoveTrack で同様に片付く。最後に GUI 側 cache を全消去。
     fn teardown_all_loaded_plugins(&mut self) {
         let track_ids: std::collections::HashSet<u32> =
-            self.loaded_slots.keys().map(|(t, _)| *t).collect();
+            self.ipc.loaded_slots.keys().map(|(t, _)| *t).collect();
         for track_id in track_ids {
-            if let Some(plugin_ids) = self.track_plugin_ids.remove(&track_id) {
-                for pid in plugin_ids {
-                    self.send_audio(MainToChild::ClosePluginShmem { plugin_id: pid });
+            if let Some(device_ids) = self.ipc.track_plugin_ids.remove(&track_id) {
+                for device_id in device_ids {
+                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
                 }
             }
-            self.send_plugin(MainToChild::RemoveTrack { track: track_id });
+            self.send_plugin(PluginCommand::RemoveTrack { track_id });
         }
-        self.loaded_slots.clear();
-        self.open_plugin_guis.clear();
-        self.plugin_params.clear();
-        self.slot_has_gui.clear();
-        self.pending_plugin_loads.clear();
-        self.pending_added_plugin_finalize.clear();
+        self.ipc.loaded_slots.clear();
+        self.ipc.open_plugin_guis.clear();
+        self.ipc.plugin_params.clear();
+        self.ipc.slot_has_gui.clear();
+        self.ipc.pending_plugin_loads.clear();
+        self.ipc.pending_added_plugin_finalize.clear();
     }
 
     pub(crate) fn restore_plugin_from_song(&mut self, song: &Song) {
-        let Some(db) = self.plugin_db.clone() else {
+        let Some(db) = self.ipc.plugin_db.clone() else {
             tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
         };
@@ -9260,28 +8328,35 @@ impl AppData {
                 tracing::error!(id = %inst.plugin_id, track, index, "plugin id not in database");
                 continue;
             };
-            self.track_pending_load(track, index);
-            self.send_plugin(MainToChild::SetSlotPlugin {
-                track,
-                index,
+            // v29: 安定 device id でアドレスする。 0 (未採番) は ensure_ids
+            // 前の song が漏れてきた設計バグなので error に出して skip。
+            if inst.id == 0 {
+                tracing::error!(id = %inst.plugin_id, track, index, "device id unallocated; skipping SetSlotPlugin");
+                continue;
+            }
+            let generation = self.track_pending_load(inst.id);
+            self.send_plugin(PluginCommand::SetSlotPlugin {
+                device_id: inst.id,
+                track_id: track,
                 format: entry.format,
                 path: entry.path.clone(),
                 plugin_id: entry.id.clone(),
                 initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
+                generation,
             });
         }
     }
 
     /// 指定 track id 群の devices だけを plugin host に `SetSlotPlugin` で
     /// 実体化する (paste したトラックの plugin を state 込みで新インスタンス化)。
-    /// [`Self::restore_plugin_from_song`] の track 限定版。`self.song` を読むため
+    /// [`Self::restore_plugin_from_song`] の track 限定版。`self.song_doc.song()` を読むため
     /// to_send を先に owned で確保してから送る (borrow 回避)。
     fn restore_plugins_for_tracks(&mut self, track_ids: &[u32]) {
-        let Some(db) = self.plugin_db.clone() else {
+        let Some(db) = self.ipc.plugin_db.clone() else {
             return;
         };
         let mut to_send: Vec<(u32, u32, common::model::PluginInstance)> = Vec::new();
-        for track in self.song.tracks.iter() {
+        for track in self.song_doc.song().tracks.iter() {
             if !track_ids.contains(&track.id) {
                 continue;
             }
@@ -9298,20 +8373,25 @@ impl AppData {
                 tracing::error!(id = %inst.plugin_id, track, index, "pasted plugin id not in database");
                 continue;
             };
-            self.track_pending_load(track, index);
-            self.send_plugin(MainToChild::SetSlotPlugin {
-                track,
-                index,
+            if inst.id == 0 {
+                tracing::error!(id = %inst.plugin_id, track, index, "pasted device id unallocated; skipping SetSlotPlugin");
+                continue;
+            }
+            let generation = self.track_pending_load(inst.id);
+            self.send_plugin(PluginCommand::SetSlotPlugin {
+                device_id: inst.id,
+                track_id: track,
                 format: entry.format,
                 path: entry.path.clone(),
                 plugin_id: entry.id.clone(),
                 initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
+                generation,
             });
         }
     }
 
     fn action_save(&mut self) {
-        if let Some(path) = self.file_path.clone() {
+        if let Some(path) = self.song_doc.file_path.clone() {
             self.begin_save(path);
         } else {
             self.action_save_as();
@@ -9331,26 +8411,26 @@ impl AppData {
     pub fn request_guarded_action(&mut self, action: DirtyGuardAction) {
         // 既に終了確定 / 保存後アクション待ち / queue drain 待ち / モーダル表示中
         // なら、 連打で多重に処理しない (= 二重操作の無視 / ユーザーの判断待ち)。
-        if self.should_quit
-            || self.guard_after_save.is_some()
-            || self.guard_pending_action.is_some()
-            || self.dirty_guard.is_some()
+        if self.ui_ephemeral.should_quit
+            || self.ui_ephemeral.guard_after_save.is_some()
+            || self.ui_ephemeral.guard_pending_action.is_some()
+            || self.ui_ephemeral.dirty_guard.is_some()
         {
             return;
         }
         // plugin-state round-trip (Save / Deferred edit / Copy) が in-flight の間は、
-        // self.song も dirty 判定も確定していない (Deferred edit は完了時に track を
+        // self.song_doc.song() も dirty 判定も確定していない (Deferred edit は完了時に track を
         // 削除する等)。 確認モーダルを出さず、 破壊操作も走らせず、 queue が drain
         // したら最新状態で **再評価** する (= `on_all_states_from_child` 末尾)。
         // 出してしまうと: ① 保存完了で clean 化した後も「未保存です」 と聞く stale
-        // 表示、 ② Deferred edit (track 削除等) 完了前に self.song を差し替えると、
+        // 表示、 ② Deferred edit (track 削除等) 完了前に self.song_doc.song() を差し替えると、
         // pending な編集が別 project に誤適用されデータ破壊、 になる。
-        if !self.pending_state_queue.is_empty() {
-            self.guard_pending_action = Some(action);
+        if !self.ipc.pending_state_queue.is_empty() {
+            self.ui_ephemeral.guard_pending_action = Some(action);
             return;
         }
-        if self.is_dirty {
-            self.dirty_guard = Some(action);
+        if self.song_doc.is_dirty() {
+            self.ui_ephemeral.dirty_guard = Some(action);
         } else {
             self.perform_guard_action(action);
         }
@@ -9359,24 +8439,24 @@ impl AppData {
     /// ガード確認を抜けた (= 保存済 / 破棄選択 / clean) あとに、 保留していた
     /// 操作を実際に実行する。
     fn perform_guard_action(&mut self, action: DirtyGuardAction) {
-        // データ破壊ガード: New / Open / OpenPath は self.song / file_path を
+        // データ破壊ガード: New / Open / OpenPath は self.song_doc.song() / file_path を
         // 破壊的に差し替える。 pending_state_queue に未完了 round-trip
         // (Save / Deferred edit / Copy) が残っている間に実行すると、 その完了処理が
         // 「差し替え後の song」 を「差し替え前に捕まえた path / track_id」 で扱い、
         // 別 project を上書き / 別 project の track を削除して破壊する。 queue が
         // drain するまで保留し、 完了ハンドラ (`on_all_states_from_child` 末尾) が
         // queue 空の状態で再評価する。 (Quit は song を触らないので保留不要。)
-        if !self.pending_state_queue.is_empty()
+        if !self.ipc.pending_state_queue.is_empty()
             && matches!(
                 action,
                 DirtyGuardAction::New | DirtyGuardAction::Open | DirtyGuardAction::OpenPath(_)
             )
         {
-            self.guard_pending_action = Some(action);
+            self.ui_ephemeral.guard_pending_action = Some(action);
             return;
         }
         match action {
-            DirtyGuardAction::Quit => self.should_quit = true,
+            DirtyGuardAction::Quit => self.ui_ephemeral.should_quit = true,
             DirtyGuardAction::New => self.action_new(),
             DirtyGuardAction::Open => self.action_open(),
             DirtyGuardAction::OpenPath(path) => self.action_open_path(path),
@@ -9392,24 +8472,24 @@ impl AppData {
     /// - Save As ダイアログをキャンセルした (保存されず pending も無い) →
     ///   何もしない (モーダルは閉じてアプリに留まる)
     fn guard_save(&mut self) {
-        let Some(action) = self.dirty_guard.take() else {
+        let Some(action) = self.ui_ephemeral.dirty_guard.take() else {
             return;
         };
         self.action_save();
-        if !self.is_dirty {
+        if !self.song_doc.is_dirty() {
             self.perform_guard_action(action);
         } else if self.has_pending_save() {
-            self.guard_after_save = Some(action);
-        } else if self.save_as_dialog_open {
+            self.ui_ephemeral.guard_after_save = Some(action);
+        } else if self.ui_ephemeral.save_as_dialog_open {
             // dialog をキャンセルしたら `SaveAsResolved` 側でこの intent を取り消す。
-            self.guard_after_save = Some(action);
+            self.ui_ephemeral.guard_after_save = Some(action);
         }
     }
 
     /// `pending_state_queue` に未処理の `Save` request が残っているか。
     /// 非同期保存 (plugin state 取得待ち) の in-flight 判定に使う。
     fn has_pending_save(&self) -> bool {
-        self.pending_state_queue
+        self.ipc.pending_state_queue
             .iter()
             .any(|r| matches!(r, PendingStateRequest::Save { .. }))
     }
@@ -9426,10 +8506,10 @@ impl AppData {
     /// の input 欄問題) を同時に解消する。 仕様書:
     /// `docs/plan_audio_clip.md` §5 / §13 Q2。
     fn action_save_as(&mut self) {
-        if self.save_as_dialog_open {
+        if self.ui_ephemeral.save_as_dialog_open {
             return;
         }
-        self.save_as_dialog_open = true;
+        self.ui_ephemeral.save_as_dialog_open = true;
         let dialog = rfd::FileDialog::new()
             .add_filter("daw", &["daw"])
             .set_title("プロジェクト名 / 保存先を選択 (フォルダは自動作成されます)");
@@ -9439,8 +8519,8 @@ impl AppData {
         // 導出があるので generic helper ではなく専用 worker。 最終 .daw path を
         // `SaveAsResolved` で返し、 GUI スレッドで create_dir_all + begin_save する。
         #[cfg(windows)]
-        let parent_hwnd = self.main_window_hwnd;
-        let proxy = self.event_proxy.clone();
+        let parent_hwnd = self.ui_ephemeral.main_window_hwnd;
+        let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             #[cfg(windows)]
             let dialog = match parent_hwnd {
@@ -9486,19 +8566,17 @@ impl AppData {
     /// `RequestAllStates` を発行する意味が無いので、 deferred / save の
     /// dispatcher は plugin なしを早期判定して即時実行に切り替える。
     fn song_has_plugin(&self) -> bool {
-        !self.song.master_fx_chain.is_empty()
-            || self.song.tracks.iter().any(|t| !t.devices.is_empty())
+        !self.song_doc.song().master_fx_chain.is_empty()
+            || self.song_doc.song().tracks.iter().any(|t| !t.devices.is_empty())
     }
 
     /// `AllPluginStates` で受け取った各 plugin の state を `Song` の
     /// 対応する `PluginInstance::state` に書き戻す。 save flow と Undo
     /// snapshot deferred path の両方で呼ばれる共通 helper。
     ///
-    /// `track` の検索は Vec position ではなく **`Track::id` 一致** で
-    /// 行う。 plugin_host は SlotState の `track` を `Track::id` で
-    /// 詰める仕様 (PR2.1)。 旧実装は `tracks.get_mut(s.track as usize)`
-    /// と Vec index で検索していたが、 deferred path で track が再
-    /// 並び替わっていると壊れるため改めた。
+    /// v29: SlotState は安定 `device_id` keyed。 track/master のどの位置に
+    /// 居ても id 一致で書き戻すので、 deferred path で並びが変わっていても
+    /// 壊れない (`docs/plan_arch_refactor.md` §1)。
     fn apply_plugin_states_to(song: &mut Song, states: &[SlotState]) {
         for s in states {
             // Phase 6 review (silent corruption fix): plugin_host が
@@ -9509,36 +8587,29 @@ impl AppData {
             // のエントリは skip して既存 state を保つ。
             if s.error.is_some() {
                 tracing::warn!(
-                    track = s.track,
-                    index = s.index,
+                    device_id = s.device_id,
                     error = s.error.as_deref(),
                     "apply_plugin_states: state save errored, preserving previous state",
                 );
                 continue;
             }
-            // 単一デバイスチェーン: master は `master_fx_chain`、 通常 track は
-            // `devices` に flat な device index で書き戻す。
-            let chain = if s.track == common::model::MASTER_TRACK_ID {
-                Some(&mut song.master_fx_chain)
-            } else {
-                song.tracks
-                    .iter_mut()
-                    .find(|t| t.id == s.track)
-                    .map(|t| &mut t.devices)
-            };
-            let Some(chain) = chain else {
-                tracing::warn!(track = s.track, index = s.index, "apply_plugin_states: track id not found");
+            let device = song
+                .tracks
+                .iter_mut()
+                .flat_map(|t| t.devices.iter_mut())
+                .chain(song.master_fx_chain.iter_mut())
+                .find(|d| d.id == s.device_id);
+            let Some(p) = device else {
+                tracing::warn!(device_id = s.device_id, "apply_plugin_states: device id not found");
                 continue;
             };
-            if let Some(p) = chain.get_mut(s.index as usize) {
-                p.state = s.data.clone().map(std::sync::Arc::from);
-                // (r.md #5 ARA2) Only overwrite the ARA archive when the plug-in
-                // actually produced one; a non-ARA device or a not-yet-bound
-                // session reports None, and we must not wipe a previously-saved
-                // archive in that case.
-                if s.ara_archive.is_some() {
-                    p.ara_archive = s.ara_archive.clone().map(std::sync::Arc::from);
-                }
+            p.state = s.data.clone().map(std::sync::Arc::from);
+            // (r.md #5 ARA2) Only overwrite the ARA archive when the plug-in
+            // actually produced one; a non-ARA device or a not-yet-bound
+            // session reports None, and we must not wipe a previously-saved
+            // archive in that case.
+            if s.ara_archive.is_some() {
+                p.ara_archive = s.ara_archive.clone().map(std::sync::Arc::from);
             }
         }
     }
@@ -9549,8 +8620,8 @@ impl AppData {
     /// IPC は発行しない (= 先行 request の応答処理時に次の `RequestAllStates`
     /// が改めて送られる、 [`AppData::on_all_states_from_child`] 参照)。
     fn enqueue_state_request(&mut self, req: PendingStateRequest) {
-        let was_idle = self.pending_state_queue.is_empty();
-        self.pending_state_queue.push_back(req);
+        let was_idle = self.ipc.pending_state_queue.is_empty();
+        self.ipc.pending_state_queue.push_back(req);
         if was_idle {
             self.dispatch_front_state_request();
         }
@@ -9571,32 +8642,37 @@ impl AppData {
         // (model 上 plugin が在るか) なので、 この degraded 状態でも round-trip が
         // 積まれてしまう。 30s watchdog を待たせるのは無駄なので、 host 不在を
         // 検知したら即 round-trip を破棄して脱出する (待っても完了し得ない)。
-        if self.plugin_tx.is_none() {
+        if self.ipc.plugin_tx.is_none() {
             tracing::warn!(
                 "plugin host unavailable; aborting state round-trip immediately (no host to answer)"
             );
             self.abort_state_roundtrip();
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "プラグインホストが応答しないため保存/操作を中止しました（オートセーブは保持されています）"
                     .into();
             return;
         }
         let needs_snapshot = matches!(
-            self.pending_state_queue.front(),
+            self.ipc.pending_state_queue.front(),
             Some(PendingStateRequest::Save { snapshot: None, .. })
         );
         if needs_snapshot {
-            let snap = Box::new(self.song.clone());
-            if let Some(PendingStateRequest::Save { snapshot, .. }) =
-                self.pending_state_queue.front_mut()
+            let snap = Box::new(self.song_doc.song().clone());
+            let epoch = self.song_doc.edit_epoch();
+            if let Some(PendingStateRequest::Save {
+                snapshot,
+                snap_epoch,
+                ..
+            }) = self.ipc.pending_state_queue.front_mut()
             {
                 *snapshot = Some(snap);
+                *snap_epoch = epoch;
             }
         }
-        self.send_plugin(MainToChild::RequestAllStates);
+        self.send_plugin(PluginCommand::RequestAllStates);
         // この瞬間から応答 (AllStatesReceived) までを on_tick の watchdog
         // が監視する。 host が hang して応答が来ないと永久ロックになるため。
-        self.state_request_sent_at = Some(std::time::Instant::now());
+        self.ipc.state_request_sent_at = Some(std::time::Instant::now());
     }
 
     /// in-flight な plugin-state round-trip を強制的に破棄する。 plugin host が
@@ -9615,11 +8691,11 @@ impl AppData {
     /// いない状態で project を差し替えると未保存変更を失う / 別 project を破壊する
     /// ため (autosave があるのでデータ自体は失われない)。
     fn abort_state_roundtrip(&mut self) {
-        self.pending_state_queue.clear();
-        self.state_request_sent_at = None;
+        self.ipc.pending_state_queue.clear();
+        self.ipc.state_request_sent_at = None;
         // 両方とも無条件に take する (`||` の短絡で 2 つ目が消えないように)。
-        let had_after_save = self.guard_after_save.take().is_some();
-        let had_pending = self.guard_pending_action.take().is_some();
+        let had_after_save = self.ui_ephemeral.guard_after_save.take().is_some();
+        let had_pending = self.ui_ephemeral.guard_pending_action.take().is_some();
         if had_after_save || had_pending {
             tracing::warn!(
                 "aborted an in-flight plugin-state round-trip; \
@@ -9649,11 +8725,11 @@ impl AppData {
         // gate に食われただけの save を中止してしまう。 gate と同条件の間は watchdog を
         // 止め、 export 後 (gate 解除後) に再評価する (応答が来ない真の hang なら、
         // gate 解除後に改めて閾値超過で発火する)。
-        if self.export_stage.is_some() || self.pending_video_export.is_some() {
+        if self.transport.export_stage.is_some() || self.transport.pending_video_export.is_some() {
             return;
         }
         const STATE_ROUNDTRIP_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
-        let Some(since) = self.state_request_sent_at else {
+        let Some(since) = self.ipc.state_request_sent_at else {
             return;
         };
         if now.saturating_duration_since(since) <= STATE_ROUNDTRIP_WATCHDOG {
@@ -9664,7 +8740,7 @@ impl AppData {
             "plugin-state round-trip stalled past watchdog timeout; aborting (host hang?)"
         );
         self.abort_state_roundtrip();
-        self.status_message =
+        self.ui_ephemeral.status_message =
             "プラグインが応答しないため保存/操作を中止しました（オートセーブは保持されています）"
                 .into();
     }
@@ -9678,22 +8754,27 @@ impl AppData {
             // plugin が無ければ state 収集 (RequestAllStates) は不要。 今の live を
             // そのまま凍結して即 serialize する。 cache migration は finish_save 内で
             // 行う (= live と snapshot の両方に適用、 file_path は成功時のみ確定)。
-            let snapshot = Box::new(self.song.clone());
-            self.finish_save(snapshot, path);
+            let snap_epoch = self.song_doc.edit_epoch();
+            let snapshot = Box::new(self.song_doc.song().clone());
+            self.finish_save(snapshot, path, snap_epoch);
             return;
         }
         // plugin 有り: snapshot は **state 収集を始める瞬間** に取る (co-temporal)。
         // ここでは None で積み、 dispatch_front_state_request が RequestAllStates を
         // 送るその瞬間に live を凍結する。 こうすると snapshot の plugin slot 配置と、
         // 返ってくる state の配置が一致し、 待機中の slot 削除等による誤適用が消える。
-        self.enqueue_state_request(PendingStateRequest::Save { path, snapshot: None });
+        self.enqueue_state_request(PendingStateRequest::Save {
+            path,
+            snapshot: None,
+            snap_epoch: 0,
+        });
     }
 
     /// plugin state 取得待ちで save が非同期進行中か (= queue に Save あり)。
     /// この間 load_overlay が「保存中…」インジケータを出す
     /// (= 非ブロック、 編集は続行可)。
     pub(crate) fn is_async_save_pending(&self) -> bool {
-        self.pending_state_queue
+        self.ipc.pending_state_queue
             .iter()
             .any(|r| matches!(r, PendingStateRequest::Save { .. }))
     }
@@ -9728,7 +8809,7 @@ impl AppData {
     /// (旧契約)、 audio engine へ新 project_dir + song を流す。 saved baseline = snapshot、
     /// `is_dirty` は live と snapshot の差で再計算する (state 待ちの間の編集が live に
     /// あれば dirty)。
-    fn finish_save(&mut self, mut snapshot: Box<Song>, path: PathBuf) {
+    fn finish_save(&mut self, mut snapshot: Box<Song>, path: PathBuf, snap_epoch: u64) {
         // serialize する snapshot の path を ProjectRelative に書き換え、 実ファイル
         // 移動の plan を取る (= ここでは I/O しない、 破棄しても無害)。
         let (audio_moves, bounce_moves) = match path.parent() {
@@ -9750,24 +8831,33 @@ impl AppData {
                 // dedup、 live 固有 source があれば move)。
                 if let Err(e) = import_audio::commit_migration(&audio_moves) {
                     tracing::warn!(error = ?e, "samples/ への移行確定で一部失敗");
-                    self.status_message =
+                    self.ui_ephemeral.status_message =
                         format!("Audio sources の samples/ 移行で一部失敗: {e}");
                 }
                 if let Err(e) = import_audio::commit_migration(&bounce_moves) {
                     tracing::warn!(error = ?e, "bounce/ への移行確定で一部失敗");
-                    self.status_message =
+                    self.ui_ephemeral.status_message =
                         format!("Audio sources の bounce/ 移行で一部失敗: {e}");
                 }
+                // round-trip 中に live へ編集が入ったかを epoch 差で先に記録する
+                // (下の live migration は「保存完了処理の正規化」 で epoch を進める
+                // ため、 記録後に行う)。
+                let edited_since_snapshot = self.song_doc.edit_epoch() != snap_epoch;
                 if let Some(dir) = path.parent() {
-                    Self::migrate_unsaved_sources(&mut self.song, dir, &mut self.status_message);
+                    let mut status = std::mem::take(&mut self.ui_ephemeral.status_message);
+                    self.song_doc
+                        .normalize(|song| Self::migrate_unsaved_sources(song, dir, &mut status));
+                    self.ui_ephemeral.status_message = status;
                 }
                 // serialize 成功時のみ file_path を確定する (旧契約)。
-                self.file_path = Some(path.clone());
-                // saved baseline = 直列化した snapshot そのもの。 save 後も Undo
-                // できるよう履歴は残す (= reset_saved_baseline は使わない)。
-                self.saved_song = *snapshot;
-                // live が snapshot から乖離している (state 待ち中の編集) なら dirty。
-                self.recompute_dirty();
+                self.song_doc.file_path = Some(path.clone());
+                // 保存が現在の live 内容を含む (= round-trip 中の編集なし) なら
+                // clean。 編集が入っていれば dirty のまま (下の guard_after_save
+                // 再保存 loop が残りを確定する)。 save 後も Undo できるよう履歴は
+                // 残す (replace_song は使わない)。
+                if !edited_since_snapshot {
+                    self.song_doc.mark_saved();
+                }
                 // 保存成功後、 この project の autosave (sidecar + 未保存→Save As
                 // 用の session recovery file) を削除する。 save 後の .daw が
                 // authoritative なので、 古い autosave が残ると unclean exit 後の
@@ -9794,9 +8884,9 @@ impl AppData {
                     ),
                 }
                 // この session で既に modal 候補に入っていた場合も除く。
-                self.recovery_candidates.retain(|p| p != &sidecar);
-                if self.recovery_candidates.is_empty() {
-                    self.show_recovery_modal = false;
+                self.ui_ephemeral.recovery_candidates.retain(|p| p != &sidecar);
+                if self.ui_ephemeral.recovery_candidates.is_empty() {
+                    self.ui_ephemeral.show_recovery_modal = false;
                 }
                 // 「最近開いたファイル」 にも入れる (= save した file は次回
                 // 開きたい候補なので、 user 期待としては自然)。 さらに
@@ -9810,29 +8900,29 @@ impl AppData {
                 // SetProjectDir → LoadSong)。 live (snapshot ではない) を送るのは、 audio
                 // が反映すべきは再生対象の working state だから。
                 let project_dir: Option<PathBuf> = path.parent().map(Path::to_path_buf);
-                self.send_audio(MainToChild::SetProjectDir(project_dir));
-                let song = self.song.clone();
-                self.send_audio(MainToChild::LoadSong(song));
+                self.send_audio(AudioCommand::SetProjectDir(project_dir));
+                let song = self.song_doc.song().clone();
+                self.send_audio(AudioCommand::LoadSong(song));
                 // 「保存して続行」: この保存は成功した。 plugin state 待ちの間に live へ
                 // 編集が入って dirty なら (co-temporal snapshot は編集前で凍結されている
                 // ため、 その編集はこの保存に含まれない)、 残りを確定するため同じ path へ
                 // 再保存して保留操作を維持する。 clean なら保留操作 (終了 / New / Open)
                 // を実行する。 save 成功が分かるこの場所で判定するので、 失敗時の無限
                 // 再保存ループに陥らない。
-                if self.guard_after_save.is_some() {
-                    if self.is_dirty {
+                if self.ui_ephemeral.guard_after_save.is_some() {
+                    if self.song_doc.is_dirty() {
                         self.begin_save(path);
-                    } else if let Some(action) = self.guard_after_save.take() {
+                    } else if let Some(action) = self.ui_ephemeral.guard_after_save.take() {
                         self.perform_guard_action(action);
                     }
                 }
             }
             Err(e) => {
                 tracing::error!(error = ?e, path = %path.display(), "failed to save project");
-                self.status_message = format!("保存に失敗しました: {e}");
+                self.ui_ephemeral.status_message = format!("保存に失敗しました: {e}");
                 // 保存失敗 → 操作を実行しない (データ損失回避)。 保留操作はクリアして、
                 // state 待ちのたびに再保存が走り続ける無限ループを防ぐ。
-                self.guard_after_save = None;
+                self.ui_ephemeral.guard_after_save = None;
             }
         }
     }
@@ -9845,16 +8935,16 @@ impl AppData {
         // 独立だが、 混乱を避けて export 全体で一律に止める）。標準 WAV export も
         // `export_stage` が立つので同じ gate で止まる（旧構造では WAV export 中に
         // 再生できてしまい render を壊しえた）。
-        if self.pending_video_export.is_some() || self.export_stage.is_some() {
-            self.status_message = "書き出し中は再生できません".into();
+        if self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some() {
+            self.ui_ephemeral.status_message = "書き出し中は再生できません".into();
             return;
         }
         // プロジェクトロードの asset decode 中は音声がまだ揃って
         // いないので再生を gate して queue する (load 完了で on_asset_decode_tick
         // が flush)。
-        if self.asset_decode.is_some() {
-            self.pending_play = true;
-            self.status_message = "プロジェクト読込中...".into();
+        if self.media.asset_decode.is_some() {
+            self.transport.pending_play = true;
+            self.ui_ephemeral.status_message = "プロジェクト読込中...".into();
             return;
         }
         // A7: if any plugin is still in the SetSlotPlugin →
@@ -9863,11 +8953,11 @@ impl AppData {
         // track starts on the same buffer once registration completes.
         // Without this the just-loaded tracks render silent for the
         // first few buffers / first loop.
-        if !self.pending_plugin_loads.is_empty() {
-            self.pending_play = true;
-            self.status_message = format!(
+        if !self.ipc.pending_plugin_loads.is_empty() {
+            self.transport.pending_play = true;
+            self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
-                self.pending_plugin_loads.len()
+                self.ipc.pending_plugin_loads.len()
             );
             return;
         }
@@ -9879,9 +8969,9 @@ impl AppData {
         // Pro Tools 流の「Stop で開始位置に戻る」 用に、 実際の再生
         // 開始時の playhead を保存。 ruler クリック等で playhead を
         // 移動してから play した場合は、 その位置が origin になる。
-        self.playback_origin_beat = Some(self.playhead_beat.unwrap_or(0.0));
-        self.send_audio(MainToChild::Play);
-        self.is_playing = true;
+        self.transport.playback_origin_beat = Some(self.transport.playhead_beat.unwrap_or(0.0));
+        self.send_audio(AudioCommand::Play);
+        self.transport.is_playing = true;
     }
 
     /// プレイヘッドを `beat` に置き、「停止で戻るホーム」 (`playback_origin_beat`)
@@ -9891,12 +8981,12 @@ impl AppData {
     /// 再生中に置き直して停止すると新しい位置へ戻る。 `beat` は呼び出し側で snap 済を渡す。
     pub(crate) fn seek_playhead_to(&mut self, beat: f64) {
         let beat = beat.max(0.0);
-        self.playhead_beat = Some(beat as f32);
-        self.playback_origin_beat = Some(beat as f32);
-        let sr = self.sample_rate as f64;
-        let bpm = self.song.bpm.max(1.0) as f64;
+        self.transport.playhead_beat = Some(beat as f32);
+        self.transport.playback_origin_beat = Some(beat as f32);
+        let sr = self.ipc.sample_rate as f64;
+        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
         let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
-        self.send_audio(MainToChild::SeekTo { samples });
+        self.send_audio(AudioCommand::SeekTo { samples });
     }
 
     /// `f` キーの実体。 snap 済 song-absolute beat へプレイヘッドを置き
@@ -9906,54 +8996,61 @@ impl AppData {
     /// 継続する (home は `seek_playhead_to` が更新済なので Stop はこの位置へ戻る)。
     fn action_play_from_cursor(&mut self, beat: f64) {
         self.seek_playhead_to(beat);
-        if !self.is_playing {
+        if !self.transport.is_playing {
             self.play();
         }
     }
 
-    /// A7: register a `(track, device_index)` we just sent `SetSlotPlugin`
+    /// A7: register a `device_id` we are about to send `SetSlotPlugin`
     /// for, and — if playback is currently running — pause it until the
     /// last `SlotPluginLoaded` arrives. Without the pause, plugins loaded
     /// while playing render silent until the audio engine's
     /// `OpenPluginShmem` register catches up (typically several buffers
     /// or a loop wrap behind).
-    fn track_pending_load(&mut self, track: u32, index: u32) {
-        if self.pending_plugin_loads.is_empty() && self.is_playing {
-            self.send_audio(MainToChild::Stop);
-            self.is_playing = false;
-            self.pending_play = true;
+    ///
+    /// v29: 要求 generation を採番して返す (呼び出し側は `SetSlotPlugin`
+    /// に載せる)。 応答 (`SlotPluginLoaded` / `SlotPluginLoadFailed`) は
+    /// この generation と一致するものだけ受理される (stale 応答 race guard)。
+    fn track_pending_load(&mut self, device_id: u64) -> u64 {
+        if self.ipc.pending_plugin_loads.is_empty() && self.transport.is_playing {
+            self.send_audio(AudioCommand::Stop);
+            self.transport.is_playing = false;
+            self.transport.pending_play = true;
         }
-        self.pending_plugin_loads.insert((track, index));
-        if self.pending_play {
-            self.status_message = format!(
+        self.ipc.next_plugin_load_generation = self.ipc.next_plugin_load_generation.wrapping_add(1).max(1);
+        let generation = self.ipc.next_plugin_load_generation;
+        self.ipc.pending_plugin_loads.insert(device_id, generation);
+        if self.transport.pending_play {
+            self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
-                self.pending_plugin_loads.len()
+                self.ipc.pending_plugin_loads.len()
             );
         }
+        generation
     }
 
     fn stop(&mut self) {
-        self.send_audio(MainToChild::Stop);
-        self.is_playing = false;
+        self.send_audio(AudioCommand::Stop);
+        self.transport.is_playing = false;
         // Pro Tools 流: 停止時に playhead を「再生開始位置」 (= 直前の
         // play() 呼び出し時点の playhead) に戻す。 GUI 側 playhead_beat
         // の即時上書きと、 audio engine への SeekTo IPC を 1 セットで
         // 実行する。 後者を送らないと on_tick が直近サンプル位置を返し
         // て GUI 側の戻し操作を打ち消す。 origin が None (= まだ一度も
         // play していない) なら playhead は触らない。
-        if let Some(origin) = self.playback_origin_beat.take() {
-            self.playhead_beat = Some(origin);
-            let sr = self.sample_rate as f64;
-            let bpm = self.song.bpm.max(1.0) as f64;
+        if let Some(origin) = self.transport.playback_origin_beat.take() {
+            self.transport.playhead_beat = Some(origin);
+            let sr = self.ipc.sample_rate as f64;
+            let bpm = self.song_doc.song().bpm.max(1.0) as f64;
             let samples = (origin as f64 * 60.0 / bpm * sr).max(0.0) as u64;
-            self.send_audio(MainToChild::SeekTo { samples });
+            self.send_audio(AudioCommand::SeekTo { samples });
         }
         // Phase 4 Step C: recording session を transport stop でクローズ。
         // Latch / Write の latched set + per-param 直近 record 位置を全て
         // clear。 これで次の Play 時には latched / last_beat が空からスタート、
         // touching しない limit 何も record されない (Touch / Latch / Write 共通)。
-        self.latched_param_gestures.clear();
-        self.recording_last_beat.clear();
+        self.recording.latched_param_gestures.clear();
+        self.recording.recording_last_beat.clear();
         // Phase 4 Step C-2: audio thread の recording bypass を解除 +
         // 最新 song を送る (= curve eval に戻る瞬間に正しい point sequence
         // が反映される)。 currently_recording_lanes は !is_playing なので
@@ -9989,21 +9086,21 @@ impl AppData {
     /// master が戻る（クリック / reverb tail 復活）ことを防ぐ。engine 側にも
     /// plugin-host hang 用の安全 auto-release がある。
     fn panic(&mut self) {
-        if self.pending_video_export.is_some() || self.export_stage.is_some() {
+        if self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some() {
             return;
         }
-        if self.is_playing {
+        if self.transport.is_playing {
             self.stop();
         }
-        self.send_audio(MainToChild::Panic);
-        self.panic_reinit_due = Some(std::time::Instant::now());
-        self.panic_release_pending = true;
-        self.status_message = "パニック: 全ての音を停止しました".into();
+        self.send_audio(AudioCommand::Panic);
+        self.transport.panic_reinit_due = Some(std::time::Instant::now());
+        self.transport.panic_release_pending = true;
+        self.ui_ephemeral.status_message = "パニック: 全ての音を停止しました".into();
     }
 
     fn toggle_loop(&mut self) {
-        self.is_looping = !self.is_looping;
-        self.send_audio(MainToChild::SetLoop(self.is_looping));
+        self.transport.is_looping = !self.transport.is_looping;
+        self.send_audio(AudioCommand::SetLoop(self.transport.is_looping));
     }
 
     fn set_loop_range(&mut self, start: f64, end: f64) {
@@ -10012,8 +9109,8 @@ impl AppData {
         } else {
             (0.0, 0.0)
         };
-        self.song.loop_start_beat = start;
-        self.song.loop_end_beat = end;
+        self.edit_song(|song| song.loop_start_beat = start);
+        self.edit_song(|song| song.loop_end_beat = end);
         self.sync_song_to_plugin_host();
     }
 
@@ -10031,21 +9128,21 @@ impl AppData {
         };
 
         const EPS: f64 = 1e-9;
-        let same_range = (self.song.loop_start_beat - start).abs() < EPS
-            && (self.song.loop_end_beat - end).abs() < EPS;
+        let same_range = (self.song_doc.song().loop_start_beat - start).abs() < EPS
+            && (self.song_doc.song().loop_end_beat - end).abs() < EPS;
 
-        if self.is_looping && same_range {
-            self.is_looping = false;
-            self.send_audio(MainToChild::SetLoop(false));
+        if self.transport.is_looping && same_range {
+            self.transport.is_looping = false;
+            self.send_audio(AudioCommand::SetLoop(false));
             return;
         }
 
         self.set_loop_range(start, end);
-        if !self.is_looping {
-            self.is_looping = true;
-            self.send_audio(MainToChild::SetLoop(true));
+        if !self.transport.is_looping {
+            self.transport.is_looping = true;
+            self.send_audio(AudioCommand::SetLoop(true));
         }
-        if !self.is_playing {
+        if !self.transport.is_playing {
             self.play();
         }
     }
@@ -10059,11 +9156,10 @@ impl AppData {
     /// knob 値が復元される。 plugin 無しの song は即時実行 (= state を
     /// 取りに行く相手が居ない)。
     fn delete_track(&mut self, idx: u32) {
-        let Some(track_id) = self.song.tracks.get(idx as usize).map(|t| t.id) else {
+        let Some(track_id) = self.song_doc.song().tracks.get(idx as usize).map(|t| t.id) else {
             return;
         };
         if !self.song_has_plugin() {
-            self.push_undo_snapshot();
             self.delete_track_inner(track_id);
             return;
         }
@@ -10094,7 +9190,6 @@ impl AppData {
             return;
         }
         if !self.song_has_plugin() {
-            self.push_undo_snapshot();
             self.cut_tracks_inner(&track_ids);
             return;
         }
@@ -10107,8 +9202,8 @@ impl AppData {
     /// `pending_clipboard_write` に積む (view が次フレーム OS clipboard へ flush)。
     fn copy_tracks_inner(&mut self, track_ids: &[u32]) {
         if let Some((json, count)) = self.serialize_tracks_to_envelope(track_ids) {
-            self.pending_clipboard_write = Some(json);
-            self.status_message = format!("コピー: {count} トラック");
+            self.ui_ephemeral.pending_clipboard_write = Some(json);
+            self.ui_ephemeral.status_message = format!("コピー: {count} トラック");
         }
     }
 
@@ -10116,8 +9211,8 @@ impl AppData {
     /// undo snapshot 済み (deferred 経由 or 即時 fallback)。group は subtree 一括削除。
     fn cut_tracks_inner(&mut self, track_ids: &[u32]) {
         if let Some((json, count)) = self.serialize_tracks_to_envelope(track_ids) {
-            self.pending_clipboard_write = Some(json);
-            self.status_message = format!("カット: {count} トラック");
+            self.ui_ephemeral.pending_clipboard_write = Some(json);
+            self.ui_ephemeral.status_message = format!("カット: {count} トラック");
         }
         for &id in track_ids {
             self.delete_track_inner(id);
@@ -10129,7 +9224,7 @@ impl AppData {
     /// inline 同梱 (別プロジェクト独立復元用)。`state` は呼び出し時点で最新化済み前提。
     fn serialize_tracks_to_envelope(&self, track_ids: &[u32]) -> Option<(String, usize)> {
         let mut out: Vec<crate::clipboard::TrackCopy> = Vec::new();
-        for t in self.song.tracks.iter() {
+        for t in self.song_doc.song().tracks.iter() {
             if !track_ids.contains(&t.id) {
                 continue;
             }
@@ -10146,12 +9241,12 @@ impl AppData {
             for cid in cids {
                 if seen.insert(cid) {
                     let content = self
-                        .song
+                        .song_doc.song()
                         .clip_contents
                         .get(&cid)
                         .cloned()
                         .unwrap_or_default();
-                    let name = self.song.clip_content_names.get(&cid).cloned();
+                    let name = self.song_doc.song().clip_content_names.get(&cid).cloned();
                     contents.push(crate::clipboard::ContentEntry {
                         content_id: cid,
                         content,
@@ -10170,7 +9265,7 @@ impl AppData {
         }
         let count = out.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song.project_id,
+            self.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::Tracks(out),
         )
         .to_json()?;
@@ -10193,15 +9288,15 @@ impl AppData {
             return 0;
         }
         tracks.sort_by_key(|t| t.order);
-        let same_project = src_pid == self.song.project_id;
+        let Some((n, new_ids)) = self.edit_song(|song| {
+        let same_project = src_pid == song.project_id;
 
-        self.push_undo_snapshot();
 
         // 1) 新 track id を全件先に採番し old→new remap を作る (集合内参照解決用)。
         let mut track_remap: std::collections::HashMap<u32, u32> =
             std::collections::HashMap::new();
         for tc in &tracks {
-            let new_id = self.song.alloc_track_id();
+            let new_id = song.alloc_track_id();
             track_remap.insert(tc.track.id, new_id);
         }
 
@@ -10220,10 +9315,10 @@ impl AppData {
                     continue;
                 }
                 let new_cid =
-                    if same_project && self.song.clip_contents.contains_key(&ce.content_id) {
+                    if same_project && song.clip_contents.contains_key(&ce.content_id) {
                         ce.content_id
                     } else {
-                        self.song
+                        song
                             .alloc_content(ce.content.clone(), ce.name.clone().unwrap_or_default())
                     };
                 content_remap.insert(ce.content_id, new_cid);
@@ -10231,14 +9326,12 @@ impl AppData {
         }
 
         // 3) drop 先の親 group context と挿入 index (above_track の直上)。
-        let drop_parent = self
-            .song
+        let drop_parent = song
             .track_by_id(above_track)
             .and_then(|t| t.parent_group_id);
-        let insert_idx = self
-            .song
+        let insert_idx = song
             .track_index_by_id(above_track)
-            .unwrap_or(self.song.tracks.len());
+            .unwrap_or(song.tracks.len());
 
         // 4) 各 track を組み立て (参照 remap + content remap)。
         let mut built: Vec<common::model::Track> = Vec::with_capacity(tracks.len());
@@ -10247,36 +9340,77 @@ impl AppData {
             t.id = *track_remap.get(&tc.track.id).unwrap();
             t.parent_group_id = match t.parent_group_id {
                 Some(old) if track_remap.contains_key(&old) => Some(track_remap[&old]),
-                Some(old) if same_project && self.song.track_by_id(old).is_some() => Some(old),
+                Some(old) if same_project && song.track_by_id(old).is_some() => Some(old),
                 _ => drop_parent,
             };
-            // A5 sibling (r.md #8): send を間引いたら、 旧→新 index map を作って
-            // cloned track の SendGain automation lane を追従させる (消えた send の
-            // lane は除去、 移動した send は新 index へ貼り替え)。
-            let mut survivor_new_idx: Vec<Option<u8>> = Vec::with_capacity(t.sends.len());
-            let mut next_new = 0u8;
+            // A5 sibling (r.md #8) / v29: send を間引いたら、 消えた send の
+            // SendGain automation lane / mod routing を除去する。 生き残った
+            // send は安定 id ごと clone されるので lane は自動で追従する
+            // (旧 positional 版の「後続 index 詰め」= reindex_send_gain_lanes
+            // は id 化で不要になり model から削除済み)。
+            let mut removed_send_ids: Vec<u32> = Vec::new();
             t.sends.retain_mut(|s| {
                 let survives = if let Some(&new) = track_remap.get(&s.dest_track_id) {
                     s.dest_track_id = new;
                     true
                 } else {
-                    same_project && self.song.track_by_id(s.dest_track_id).is_some()
+                    same_project && song.track_by_id(s.dest_track_id).is_some()
                 };
-                survivor_new_idx.push(survives.then(|| {
-                    let ni = next_new;
-                    next_new += 1;
-                    ni
-                }));
+                if !survives {
+                    removed_send_ids.push(s.id);
+                }
                 survives
             });
-            t.reindex_send_gain_lanes(&survivor_new_idx);
+            if !removed_send_ids.is_empty() {
+                let is_removed_send_gain = |target: &common::model::AutomationTarget| {
+                    matches!(
+                        target,
+                        common::model::AutomationTarget::TrackBuiltin(
+                            common::model::TrackBuiltinParam::SendGain { send_id, .. }
+                        ) if removed_send_ids.contains(send_id)
+                    )
+                };
+                t.automation_lanes
+                    .retain(|l| !is_removed_send_gain(&l.target));
+                t.mod_routings.retain(|r| !is_removed_send_gain(&r.target));
+            }
+            // v29: device の安定 id は Song-global unique が不変条件。 clone
+            // した devices の id を再採番し、 track 内 automation lane /
+            // mod routing の PluginParam 参照を新 id へ貼り替える (元 track と
+            // 重複 id のままだと find_device_by_id が元 device に解決して
+            // しまい、 paste 側の param 系イベントが誤配される)。
+            {
+                let mut device_remap: std::collections::HashMap<u64, u64> =
+                    std::collections::HashMap::new();
+                for dev in &mut t.devices {
+                    let new_id = song.alloc_device_id();
+                    if dev.id != 0 {
+                        device_remap.insert(dev.id, new_id);
+                    }
+                    dev.id = new_id;
+                }
+                let remap_target = |target: &mut common::model::AutomationTarget| {
+                    if let common::model::AutomationTarget::PluginParam { device_id, .. } =
+                        target
+                        && let Some(&nid) = device_remap.get(device_id)
+                    {
+                        *device_id = nid;
+                    }
+                };
+                for lane in &mut t.automation_lanes {
+                    remap_target(&mut lane.target);
+                }
+                for r in &mut t.mod_routings {
+                    remap_target(&mut r.target);
+                }
+            }
             for dev in &mut t.devices {
                 for slot in &mut dev.aux_inputs {
                     if let Some(route) = slot {
                         let old = route.tap.source_track;
                         if let Some(&new) = track_remap.get(&old) {
                             route.tap.source_track = new;
-                        } else if !(same_project && self.song.track_by_id(old).is_some()) {
+                        } else if !(same_project && song.track_by_id(old).is_some()) {
                             // dangling after paste: drop the route (keep tap_point
                             // intact when the source survives).
                             *slot = None;
@@ -10286,7 +9420,7 @@ impl AppData {
             }
             t.lipsync_target_track = match t.lipsync_target_track {
                 Some(old) if track_remap.contains_key(&old) => Some(track_remap[&old]),
-                Some(old) if same_project && self.song.track_by_id(old).is_some() => Some(old),
+                Some(old) if same_project && song.track_by_id(old).is_some() => Some(old),
                 _ => None,
             };
             for c in &mut t.clips {
@@ -10307,18 +9441,22 @@ impl AppData {
         // 5) above_track の直上に order 昇順を維持して連続挿入。
         let n = built.len();
         for (off, t) in built.into_iter().enumerate() {
-            self.song
+            song
                 .tracks
-                .insert((insert_idx + off).min(self.song.tracks.len()), t);
+                .insert((insert_idx + off).min(song.tracks.len()), t);
         }
         // 6) 選択を新 track 群に + plugin host へ各 device を SetSlotPlugin で実体化
         //    (sync_song_to_plugin_host = LoadSong は audio 専属で plugin host では no-op
         //    なので、 plugin の実体化には restore が別途必要。state 込みで新インスタンス化)。
-        let new_ids: Vec<u32> = tracks
-            .iter()
-            .filter_map(|tc| track_remap.get(&tc.track.id).copied())
-            .collect();
-        self.selected_track_ids = new_ids.clone();
+            let new_ids: Vec<u32> = tracks
+                .iter()
+                .filter_map(|tc| track_remap.get(&tc.track.id).copied())
+                .collect();
+            (n, new_ids)
+        }) else {
+            return 0;
+        };
+        self.selection.selected_track_ids = new_ids.clone();
         self.restore_plugins_for_tracks(&new_ids);
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
@@ -10330,11 +9468,11 @@ impl AppData {
     /// 側で `push_undo_snapshot` 済みである前提なので、 ここでは push
     /// しない。
     fn delete_track_inner(&mut self, track_id: u32) {
-        let Some(idx) = self.song.track_index_by_id(track_id) else {
+        let Some(idx) = self.song_doc.song().track_index_by_id(track_id) else {
             return;
         };
         let idx = idx as u32;
-        if idx as usize >= self.song.tracks.len() {
+        if idx as usize >= self.song_doc.song().tracks.len() {
             return;
         }
 
@@ -10344,11 +9482,11 @@ impl AppData {
         // subtree of stable ids, then resolve them to current indices
         // and remove from highest to lowest so earlier indices stay
         // valid during the loop.
-        let target_id = self.song.tracks[idx as usize].id;
+        let target_id = self.song_doc.song().tracks[idx as usize].id;
         let subtree_ids = self.collect_track_subtree_ids(target_id);
         let mut subtree_idxs: Vec<u32> = subtree_ids
             .iter()
-            .filter_map(|id| self.song.track_index_by_id(*id))
+            .filter_map(|id| self.song_doc.song().track_index_by_id(*id))
             .map(|i| i as u32)
             .collect();
         subtree_idxs.sort_unstable();
@@ -10363,17 +9501,17 @@ impl AppData {
         let mut snapshots: Vec<(u32, common::model::Track)> =
             Vec::with_capacity(subtree_idxs.len());
         for &i in subtree_idxs.iter().rev() {
-            let removed_id = self.song.tracks[i as usize].id;
-            let snapshot = self.song.tracks[i as usize].clone();
+            let removed_id = self.song_doc.song().tracks[i as usize].id;
+            let snapshot = self.song_doc.song().tracks[i as usize].clone();
             #[cfg(windows)]
             {
-                self.open_plugin_guis.retain(|&(t, _)| t != removed_id);
+                self.ipc.open_plugin_guis.retain(|&(t, _)| t != removed_id);
             }
             // slot cache からも削除する track 由来の entry を外す。
             // SlotPluginUnloaded event の到着待ち race を狭めて、
             // reconcile が stale entry を見ないようにする防御的 cleanup。
-            self.loaded_slots.retain(|(t, _), _| *t != removed_id);
-            self.song.tracks.remove(i as usize);
+            self.ipc.loaded_slots.retain(|(t, _), _| *t != removed_id);
+            self.edit_song(|song| song.tracks.remove(i as usize));
             snapshots.push((removed_id, snapshot));
         }
         // (b) LoadSong で audio engine を新 schedule に
@@ -10385,41 +9523,41 @@ impl AppData {
         // memory を読み AV → silent terminate → all_done 永久 wait
         // を防ぐため。
         for (removed_id, _snapshot) in snapshots {
-            if let Some(pids) = self.track_plugin_ids.remove(&removed_id) {
-                for pid in pids {
-                    self.send_audio(MainToChild::ClosePluginShmem { plugin_id: pid });
+            if let Some(device_ids) = self.ipc.track_plugin_ids.remove(&removed_id) {
+                for device_id in device_ids {
+                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
                 }
             }
-            self.send_plugin(MainToChild::RemoveTrack { track: removed_id });
+            self.send_plugin(PluginCommand::RemoveTrack { track_id: removed_id });
         }
 
         // selected_clip / selected_clips は stable ClipKey 保持なので、 残った
         // track の index shift には自動追従する (再マッピング不要)。 ただし
         // 削除された track を指す key は解決不能になるので、 set / anchor 双方
         // から落とす (after_undo_redo / action_remove_last_track と同方針)。
-        let mut keys = std::mem::take(&mut self.selected_clips);
+        let mut keys = std::mem::take(&mut self.selection.selected_clips);
         keys.retain(|k| self.clip_at(*k).is_some());
-        self.selected_clips = keys;
-        if let Some(k) = self.selected_clip
+        self.selection.selected_clips = keys;
+        if let Some(k) = self.selection.selected_clip
             && self.clip_at(k).is_none()
         {
-            self.selected_clip = None;
-            self.selected_notes.clear();
+            self.selection.selected_clip = None;
+            self.selection.selected_notes.clear();
         }
 
         // selected_track_ids: subtree に含まれていた id を全て除外。
         // 残りが空なら直近の生存 track にフォールバック (UI 完全選択
         // ゼロを避ける)。
         let subtree_ids_set: std::collections::HashSet<u32> = subtree_ids.iter().copied().collect();
-        self.selected_track_ids
+        self.selection.selected_track_ids
             .retain(|id| !subtree_ids_set.contains(id));
-        if self.selected_track_ids.is_empty()
-            && let Some(t) = self.song.tracks.last()
+        if self.selection.selected_track_ids.is_empty()
+            && let Some(t) = self.song_doc.song().tracks.last()
         {
-            self.selected_track_ids.push(t.id);
+            self.selection.selected_track_ids.push(t.id);
         }
         // collapsed_groups からも消えた id を除外。
-        self.collapsed_groups
+        self.ui_prefs.collapsed_groups
             .retain(|id| !subtree_ids_set.contains(id));
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
@@ -10436,7 +9574,7 @@ impl AppData {
         let mut hops = 0;
         while !frontier.is_empty() {
             hops += 1;
-            if hops > self.song.tracks.len() + 1 {
+            if hops > self.song_doc.song().tracks.len() + 1 {
                 tracing::error!(
                     root_id,
                     "collect_track_subtree_ids: cycle detected, aborting BFS"
@@ -10445,7 +9583,7 @@ impl AppData {
             }
             let mut next = Vec::new();
             for &pid in &frontier {
-                for t in &self.song.tracks {
+                for t in &self.song_doc.song().tracks {
                     if t.parent_group_id == Some(pid) && !result.contains(&t.id) {
                         result.push(t.id);
                         next.push(t.id);
@@ -10461,12 +9599,11 @@ impl AppData {
         if a == b {
             return;
         }
-        let n = self.song.tracks.len() as u32;
+        let n = self.song_doc.song().tracks.len() as u32;
         if a >= n || b >= n {
             return;
         }
-        self.push_undo_snapshot();
-        self.song.tracks.swap(a as usize, b as usize);
+        self.edit_song(|song| song.tracks.swap(a as usize, b as usize));
         // PR2.1: plugin_host の chains は `Track::id` ベースなので、
         // Vec position swap は通知不要。 SwapTracks IPC は削除済。
         // selected_clip / selected_clips は stable ClipKey 保持なので、 track の
@@ -10486,14 +9623,13 @@ impl AppData {
         }
         // 並びが変化しない場合は no-op
         let same = order.iter().enumerate().all(|(i, id)| {
-            self.song.tracks.get(i).map(|t| t.id) == Some(*id)
+            self.song_doc.song().tracks.get(i).map(|t| t.id) == Some(*id)
         });
-        if same && order.len() == self.song.tracks.len() {
+        if same && order.len() == self.song_doc.song().tracks.len() {
             return;
         }
-        self.push_undo_snapshot();
         let selected_track_id = self
-            .song
+            .song_doc.song()
             .tracks
             .get(self.cursor_track_index().unwrap_or(0))
             .map(|t| t.id);
@@ -10502,13 +9638,13 @@ impl AppData {
         // (抽出 → 並べ替え → index 逆引き) は不要になった。
 
         // 元順序での index 列を計算 (`order[i]` の id を持つ track の旧 index)。
-        // この `index_order` を `MainToChild::ReorderTracks` で 1 度送り、
+        // この `index_order` で（旧設計では専用 IPC を送っていたが、現行は LoadSong 再送で）
         // plugin host 側で 1 回の `tracks.mutate` (= 1 回の audio thread stop/start)
         // で chains / params / vocal を新順序に並び替える。
         let index_order: Vec<u32> = order
             .iter()
             .filter_map(|id| {
-                self.song
+                self.song_doc.song()
                     .tracks
                     .iter()
                     .position(|t| t.id == *id)
@@ -10517,14 +9653,16 @@ impl AppData {
             .collect();
 
         // song.tracks を新順序に並び替え (= 表示モデル更新)。
-        let mut new_tracks = Vec::with_capacity(self.song.tracks.len());
-        for id in order {
-            if let Some(pos) = self.song.tracks.iter().position(|t| t.id == *id) {
-                new_tracks.push(self.song.tracks.remove(pos));
+        self.edit_song(|song| {
+            let mut new_tracks = Vec::with_capacity(song.tracks.len());
+            for id in order {
+                if let Some(pos) = song.tracks.iter().position(|t| t.id == *id) {
+                    new_tracks.push(song.tracks.remove(pos));
+                }
             }
-        }
-        new_tracks.append(&mut self.song.tracks);
-        self.song.tracks = new_tracks;
+            new_tracks.append(&mut song.tracks);
+            song.tracks = new_tracks;
+        });
 
         // selected_track_ids は id ベースなので、 reorder 後も自動的に
         // 整合 (id は変わらず、 song.tracks の Vec 内 index が変わるだけ
@@ -10546,18 +9684,18 @@ impl AppData {
     /// (gui_01 #016) からは `SelectTrack { next, modifier, .. }` 経由で
     /// `selected_track_ids` を直接書き込む。
     fn select_track(&mut self, idx: u32) {
-        let Some(t) = self.song.tracks.get(idx as usize) else {
+        let Some(t) = self.song_doc.song().tracks.get(idx as usize) else {
             return;
         };
         let id = t.id;
-        if self.selected_track_ids.as_slice() != [id] {
-            self.selected_track_ids = vec![id];
+        if self.selection.selected_track_ids.as_slice() != [id] {
+            self.selection.selected_track_ids = vec![id];
         }
     }
 
     fn begin_rename_track(&mut self, track_id: u32) {
         let Some(name) = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .find(|t| t.id == track_id)
@@ -10565,55 +9703,59 @@ impl AppData {
         else {
             return;
         };
-        self.track_rename_text = name;
-        self.track_rename_id = Some(track_id);
+        self.ui_ephemeral.track_rename_text = name;
+        self.ui_ephemeral.track_rename_id = Some(track_id);
     }
 
     fn commit_rename_track(&mut self) {
-        let Some(track_id) = self.track_rename_id else {
+        let Some(track_id) = self.ui_ephemeral.track_rename_id else {
             return;
         };
-        self.track_rename_id = None;
-        let new_name = self.track_rename_text.trim().to_string();
-        self.track_rename_text.clear();
+        self.ui_ephemeral.track_rename_id = None;
+        let new_name = self.ui_ephemeral.track_rename_text.trim().to_string();
+        self.ui_ephemeral.track_rename_text.clear();
         if new_name.is_empty() {
             return;
         }
-        if let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
-            track.name = new_name;
-        }
+        self.edit_song(|song| {
+            if let Some(track) = song.tracks.iter_mut().find(|t| t.id == track_id) {
+                track.name = new_name;
+            }
+        });
         self.sync_song_to_plugin_host();
     }
 
     /// セクション帯の inline 改名を開始する (現在名を編集バッファに seed)。
     fn begin_rename_section(&mut self, id: u32) {
-        let Some(name) = self.song.sections.iter().find(|s| s.id == id).map(|s| s.name.clone())
+        let Some(name) = self.song_doc.song().sections.iter().find(|s| s.id == id).map(|s| s.name.clone())
         else {
             return;
         };
-        self.section_rename_text = name;
-        self.section_rename_id = Some(id);
+        self.ui_ephemeral.section_rename_text = name;
+        self.ui_ephemeral.section_rename_id = Some(id);
     }
 
     /// セクション帯の改名を確定する (空名は無視)。
     fn commit_rename_section(&mut self) {
-        let Some(id) = self.section_rename_id else {
+        let Some(id) = self.ui_ephemeral.section_rename_id else {
             return;
         };
-        self.section_rename_id = None;
-        let new_name = self.section_rename_text.trim().to_string();
-        self.section_rename_text.clear();
+        self.ui_ephemeral.section_rename_id = None;
+        let new_name = self.ui_ephemeral.section_rename_text.trim().to_string();
+        self.ui_ephemeral.section_rename_text.clear();
         if new_name.is_empty() {
             return;
         }
-        if let Some(s) = self.song.sections.iter_mut().find(|s| s.id == id) {
-            s.name = new_name;
-        }
+        self.edit_song(|song| {
+            if let Some(s) = song.sections.iter_mut().find(|s| s.id == id) {
+                s.name = new_name;
+            }
+        });
     }
 
     fn begin_rename_clip(&mut self, target: ClipRef) {
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -10623,16 +9765,16 @@ impl AppData {
         };
         // 表示されている名前 (= clip_display_label と同じ) を編集開始値にする。
         // Text clip は本文 (= first TextEvent.text) を、 それ以外は content_name を pre-fill。
-        self.clip_rename_text = self
-            .song
+        self.ui_ephemeral.clip_rename_text = self
+            .song_doc.song()
             .clip_contents
             .get(&content_id)
             .and_then(|c| c.text_events())
             .and_then(|events| events.first())
             .map(|ev| ev.text.clone())
             .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| self.song.content_name(content_id).to_string());
-        self.clip_rename = Some(target);
+            .unwrap_or_else(|| self.song_doc.song().content_name(content_id).to_string());
+        self.ui_ephemeral.clip_rename = Some(target);
     }
 
     /// clip rename を確定。 trim 後空文字なら無変更 (track rename と同じ)。
@@ -10642,17 +9784,17 @@ impl AppData {
     /// SSoT (`Song.clip_content_names`) に書くので、 同 content を共有する
     /// linked clip 全部が同時に rename される。
     fn commit_rename_clip(&mut self) {
-        let Some(target) = self.clip_rename else {
+        let Some(target) = self.ui_ephemeral.clip_rename else {
             return;
         };
-        self.clip_rename = None;
-        let new_name = self.clip_rename_text.trim().to_string();
-        self.clip_rename_text.clear();
+        self.ui_ephemeral.clip_rename = None;
+        let new_name = self.ui_ephemeral.clip_rename_text.trim().to_string();
+        self.ui_ephemeral.clip_rename_text.clear();
         if new_name.is_empty() {
             return;
         }
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -10665,12 +9807,12 @@ impl AppData {
         // set_clip_text_event_content が全 event 書換え + edit buffer resync + is_dirty を
         // 行う (inspector の content 編集と同経路)。 非 Text clip は従来どおり content_name。
         if matches!(
-            self.song.clip_contents.get(&content_id),
+            self.song_doc.song().clip_contents.get(&content_id),
             Some(common::model::ClipContent::Text(_))
         ) {
             self.set_clip_text_event_content(target, new_name);
         } else {
-            self.song.set_content_name(content_id, new_name);
+            self.edit_song(|song| song.set_content_name(content_id, new_name));
             // content_name 経路は Song 側 set_content_name が dirty を持たないが、
             // CommitRenameClip は is_undoable なので #40 のチョークポイント
             // (handle_event 冒頭) が既に is_dirty を立てている (= 手動 arm 不要)。
@@ -10678,12 +9820,14 @@ impl AppData {
     }
 
     fn ensure_first_track(&mut self) {
-        if self.song.tracks.is_empty() {
-            let id = self.song.alloc_track_id();
-            self.song.tracks.push(track_with(|t| {
-                t.id = id;
-                t.name = "Track 1".into();
-            }));
+        if self.song_doc.song().tracks.is_empty() {
+            self.edit_song(|song| {
+                let id = song.alloc_track_id();
+                song.tracks.push(track_with(|t| {
+                    t.id = id;
+                    t.name = "Track 1".into();
+                }));
+            });
             self.resize_track_peak_display();
         }
     }
@@ -10693,11 +9837,11 @@ impl AppData {
     /// `VoicevoxSynthStatus` IPC handler。per-plugin の busy/failing を更新する。
     /// failing の立上りで `failing_since` を記録 (継続中は維持)、成功で None。idle かつ
     /// 非failing の entry は掃除して `voicevox_any_generating` 等の判定を軽く保つ。
-    fn apply_voicevox_synth_status(&mut self, plugin_id: u32, busy: bool, failing: bool) {
+    fn apply_voicevox_synth_status(&mut self, device_id: u64, busy: bool, failing: bool) {
         let now = std::time::Instant::now();
         let entry = self
-            .voicevox_synth_status
-            .entry(plugin_id)
+            .voicevox.voicevox_synth_status
+            .entry(device_id)
             .or_insert(VocalSynthStatus { busy: false, failing_since: None });
         entry.busy = busy;
         if failing {
@@ -10706,53 +9850,53 @@ impl AppData {
             entry.failing_since = None;
         }
         if !entry.busy && entry.failing_since.is_none() {
-            self.voicevox_synth_status.remove(&plugin_id);
+            self.voicevox.voicevox_synth_status.remove(&device_id);
         }
     }
 
-    /// track が持つ builtin VOICEVOX device の host plugin_id (= load 済なら)。
-    /// `sync_vocal_metadata` の lookup と同じ (device 実在 → loaded_slots で plugin_id)。
-    pub fn voicevox_plugin_id_for_track(&self, track: &common::model::Track) -> Option<u32> {
+    /// track が持つ builtin VOICEVOX device の安定 device id (= load 済なら)。
+    /// `sync_vocal_metadata` の lookup と同じ (device 実在 → loaded_slots で load 確認)。
+    pub fn voicevox_plugin_id_for_track(&self, track: &common::model::Track) -> Option<u64> {
         let device_index = track.devices.iter().position(|d| {
             d.format == PluginFormat::Builtin
                 && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
         })?;
-        self.loaded_slots
+        self.ipc.loaded_slots
             .get(&(track.id, device_index as u32))
-            .map(|s| s.plugin_id)
+            .map(|s| s.device_id)
     }
 
     /// track の歌唱/読み上げ WAV 合成が進行中か (= 所属 builtin VOICEVOX が busy)。
     pub fn track_wav_synthesizing(&self, track_id: u32) -> bool {
-        let Some(track) = self.song.tracks.iter().find(|t| t.id == track_id) else {
+        let Some(track) = self.song_doc.song().tracks.iter().find(|t| t.id == track_id) else {
             return false;
         };
         let Some(pid) = self.voicevox_plugin_id_for_track(track) else {
             return false;
         };
-        self.voicevox_synth_status.get(&pid).is_some_and(|s| s.busy)
+        self.voicevox.voicevox_synth_status.get(&pid).is_some_and(|s| s.busy)
     }
 
     /// 出力先 (口 track) が口パク再生成中か。
     pub fn lipsync_target_generating(&self, track_id: u32) -> bool {
-        self.lipsync_inflight.contains(&track_id)
+        self.voicevox.lipsync_inflight.contains(&track_id)
     }
 
     /// いずれかの VOICEVOX 生成 (WAV 合成 / 口パク) が進行中か。
     pub fn voicevox_any_generating(&self) -> bool {
-        !self.lipsync_inflight.is_empty()
-            || self.voicevox_synth_status.values().any(|s| s.busy)
+        !self.voicevox.lipsync_inflight.is_empty()
+            || self.voicevox.voicevox_synth_status.values().any(|s| s.busy)
     }
 
     /// WAV 合成中の vocal track 数 (= 全体オーバーレイの「残り N」)。
     /// track→plugin_id を直接引く (track_wav_synthesizing の id 再 find を避け O(tracks²) 回避)。
     pub fn voicevox_synth_busy_count(&self) -> usize {
-        self.song
+        self.song_doc.song()
             .tracks
             .iter()
             .filter(|t| {
                 self.voicevox_plugin_id_for_track(t)
-                    .is_some_and(|pid| self.voicevox_synth_status.get(&pid).is_some_and(|s| s.busy))
+                    .is_some_and(|pid| self.voicevox.voicevox_synth_status.get(&pid).is_some_and(|s| s.busy))
             })
             .count()
     }
@@ -10760,7 +9904,7 @@ impl AppData {
     /// engine 未接続警告を出すべきか (= busy のまま failing が閾値以上継続)。
     /// engine boot (数秒) の間は failing でも警告せず「合成中」に見せ、閾値超過で切り替える。
     pub fn voicevox_engine_unreachable(&self, now: std::time::Instant) -> bool {
-        self.voicevox_synth_status.values().any(|s| {
+        self.voicevox.voicevox_synth_status.values().any(|s| {
             s.busy
                 && s.failing_since
                     .is_some_and(|t| now.duration_since(t) >= VOICEVOX_ENGINE_WARNING)
@@ -10784,12 +9928,12 @@ impl AppData {
     /// 起動 logic を移植 (= localhost:50021 が起動済でなければ自動で
     /// spawn、 builtin plugin の HTTP synth を成功させる前提)。
     pub fn sync_vocal_metadata(&mut self) {
-        let bpm = self.song.bpm;
-        let has_vocal_track = self.song.tracks.iter().any(|t| t.is_voicevox_vocal());
+        let bpm = self.song_doc.song().bpm;
+        let has_vocal_track = self.song_doc.song().tracks.iter().any(|t| t.is_voicevox_vocal());
         if has_vocal_track {
             self.ensure_voicevox_engine();
         }
-        for track in &self.song.tracks {
+        for track in &self.song_doc.song().tracks {
             if !track.is_voicevox_vocal() {
                 continue;
             }
@@ -10801,14 +9945,14 @@ impl AppData {
             }) else {
                 continue;
             };
-            // plugin_id (= u32 host-side id) を loaded_slots から引く。
+            // 安定 device id を loaded_slots から引く (= load 完了確認込み)。
             let Some(slot_info) = self
-                .loaded_slots
+                .ipc.loaded_slots
                 .get(&(track.id, device_index as u32))
             else {
                 continue;
             };
-            let host_plugin_id = slot_info.plugin_id;
+            let host_plugin_id = slot_info.device_id;
 
             // 全 clip の notes を NoteMetadata 配列に flatten。 note_id は
             // (clip-internal index) を「track 内通し番号」 にしないと衝突
@@ -10818,7 +9962,7 @@ impl AppData {
             let mut entries: Vec<common::plugin_metadata::NoteMetadata> = Vec::new();
             for clip in &track.clips {
                 let notes: &[common::model::Note] = self
-                    .song
+                    .song_doc.song()
                     .clip_contents
                     .get(&clip.content_id)
                     .and_then(|c| c.notes())
@@ -10851,7 +9995,7 @@ impl AppData {
             let mut talk: Vec<common::plugin_metadata::TalkMetadata> = Vec::new();
             for clip in &track.clips {
                 let Some(events) = self
-                    .song
+                    .song_doc.song()
                     .clip_contents
                     .get(&clip.content_id)
                     .and_then(|c| c.text_events())
@@ -10878,8 +10022,8 @@ impl AppData {
                     });
                 }
             }
-            self.send_plugin(MainToChild::SetBuiltinPluginNoteMetadata {
-                plugin_id: host_plugin_id,
+            self.send_plugin(PluginCommand::SetBuiltinPluginNoteMetadata {
+                device_id: host_plugin_id,
                 bpm,
                 entries,
                 talk,
@@ -10959,9 +10103,9 @@ impl AppData {
     /// 保存済み口パク clip を生成した入力をベースライン化することで、開いた直後の
     /// 非入力編集 (track rename 等) で口パクが再生成されないようにする。
     fn seed_lipsync_fingerprints(&mut self) {
-        self.lipsync_fingerprints.clear();
+        self.voicevox.lipsync_fingerprints.clear();
         let mut targets: Vec<u32> = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .filter_map(|t| t.lipsync_target_track)
@@ -10969,8 +10113,8 @@ impl AppData {
         targets.sort_unstable();
         targets.dedup();
         for target in targets {
-            let fp = Self::lipsync_input_fingerprint(&self.song, target);
-            self.lipsync_fingerprints.insert(target, fp);
+            let fp = Self::lipsync_input_fingerprint(&self.song_doc.song(), target);
+            self.voicevox.lipsync_fingerprints.insert(target, fp);
         }
     }
 
@@ -10981,7 +10125,7 @@ impl AppData {
     /// `mouth_map` 未設定 / notes を持つ clip 無し のときは no-op。歌唱のみ (Q6)。
     pub fn regenerate_lipsync_for_track(&mut self, vocal_track_id: u32) {
         let Some(target_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .find(|t| t.id == vocal_track_id)
@@ -10994,16 +10138,16 @@ impl AppData {
         // 再生成する (= rename 等の非入力編集では再生成しない)。直接呼び出し
         // (binding / mouth_map 変更) はここで必ず最新値へ更新されるので、直後の
         // debounce 発火は fingerprint 一致で二重再生成にならない。
-        let fp = Self::lipsync_input_fingerprint(&self.song, target_id);
-        self.lipsync_fingerprints.insert(target_id, fp);
+        let fp = Self::lipsync_input_fingerprint(&self.song_doc.song(), target_id);
+        self.voicevox.lipsync_fingerprints.insert(target_id, fp);
         // 口 track が存在し mouth_map が設定済みか (= 生成する意味があるか)。
-        let configured = self.song.tracks.iter().any(|t| {
+        let configured = self.song_doc.song().tracks.iter().any(|t| {
             t.id == target_id && t.mouth_map.as_ref().is_some_and(|m| m.is_configured())
         });
         if !configured {
             return;
         }
-        let bpm = self.song.bpm;
+        let bpm = self.song_doc.song().bpm;
         let lead_in = common::lipsync::lead_in_beats(bpm);
         // (talk) target 中心: 出力先が `target_id` の **全ソーストラック** をまとめて
         // 再生成する (`docs/plan_voicevox_talk.md`)。トラック並び順 index を priority に
@@ -11012,7 +10156,7 @@ impl AppData {
         let mut snaps: Vec<(f64, f64, f64, u32, Vec<common::model::Note>)> = Vec::new();
         let mut talk_snaps: Vec<(f64, f64, f64, u32, String, u32, common::model::TalkParams)> =
             Vec::new();
-        for (idx, src) in self.song.tracks.iter().enumerate() {
+        for (idx, src) in self.song_doc.song().tracks.iter().enumerate() {
             if src.lipsync_target_track != Some(target_id) {
                 continue;
             }
@@ -11020,7 +10164,7 @@ impl AppData {
             for clip in &src.clips {
                 // sing: notes を持つ clip。
                 if let Some(notes) = self
-                    .song
+                    .song_doc.song()
                     .clip_contents
                     .get(&clip.content_id)
                     .and_then(|c| c.notes())
@@ -11041,7 +10185,7 @@ impl AppData {
                 }
                 // talk: Text clip の先頭の非空 TextEvent。
                 if let Some(events) = self
-                    .song
+                    .song_doc.song()
                     .clip_contents
                     .get(&clip.content_id)
                     .and_then(|c| c.text_events())
@@ -11065,13 +10209,13 @@ impl AppData {
         self.ensure_voicevox_engine();
         // 出力先 (口 track) を in-flight に登録 = クリップ上スピナー +
         // 全体オーバーレイ「口パク生成中」を点灯。完了イベントで必ず外す。
-        self.lipsync_inflight.insert(target_id);
+        self.voicevox.lipsync_inflight.insert(target_id);
         // spawn 時点の世代を snapshot し、 結果と一緒に返す。 HTTP が遅延して
         // いる間に project が切り替わる (reset_saved_baseline が gen を bump) と
         // handler 側で破棄される。
-        let generation = self.lipsync_gen;
+        let generation = self.voicevox.lipsync_gen;
         let target_track_id = target_id;
-        let proxy = self.event_proxy.clone();
+        let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             let mut clips = Vec::with_capacity(snaps.len() + talk_snaps.len());
             for (clip_start_beat, clip_len_beats, first_note_local_beat, priority, notes) in snaps {
@@ -11128,104 +10272,108 @@ impl AppData {
         bpm: f32,
         results: Vec<LipsyncClipResult>,
     ) {
-        // HTTP 中に song が変わっている可能性があるため id ベースで再解決。
-        let Some(target_id) = self
-            .song
-            .tracks
-            .iter()
-            .find(|t| t.id == vocal_track_id)
-            .and_then(|t| t.lipsync_target_track)
-        else {
-            return;
-        };
-        let Some(m_idx) = self.song.tracks.iter().position(|t| t.id == target_id) else {
-            return;
-        };
-        let Some(mouth_map) = self.song.tracks[m_idx].mouth_map.clone() else {
-            return;
-        };
-        // 既存の自動生成 clip を全削除 (手編集保持しない)。
-        self.song.tracks[m_idx].clips.retain(|c| !c.auto_lipsync);
-        let res = self.song.video_resolution;
-        // (talk) 全ソースの mouth event を song-absolute (start, end, image_id, priority) に
-        // 展開する。複数ソース (歌唱 Vox / 読み上げ Talk) が同じ口 track を共有しても、
-        // 次の merge で重なりが上位 (priority 小 = 上のトラック) 優先で解決され、口画像が
-        // 二重表示にならない (`docs/plan_voicevox_talk.md`)。
-        let mut spans: Vec<(f64, f64, u32, u32)> = Vec::new();
-        for r in &results {
-            let events = common::lipsync::build_mouth_events(
-                &r.phonemes,
-                &mouth_map,
-                bpm,
-                r.first_note_local_beat,
-                r.clip_len_beats,
-            );
-            for ev in events {
-                let s = r.clip_start_beat + ev.event_start_in_clip_beats;
-                let e = s + ev.event_length_beats;
-                if e > s {
-                    spans.push((s, e, ev.source_id, r.priority));
+        // 口パクは派生データの自動再生成なので undo 履歴に入れない
+        // (normalize)。 epoch は進む = dirty + frame flush の再 sync は走る。
+        self.song_doc.normalize(|song| {
+            // HTTP 中に song が変わっている可能性があるため id ベースで再解決。
+            let Some(target_id) = song
+                .tracks
+                .iter()
+                .find(|t| t.id == vocal_track_id)
+                .and_then(|t| t.lipsync_target_track)
+            else {
+                return;
+            };
+            let Some(m_idx) = song.tracks.iter().position(|t| t.id == target_id) else {
+                return;
+            };
+            let Some(mouth_map) = song.tracks[m_idx].mouth_map.clone() else {
+                return;
+            };
+            // 既存の自動生成 clip を全削除 (手編集保持しない)。
+            song.tracks[m_idx].clips.retain(|c| !c.auto_lipsync);
+            let res = song.video_resolution;
+            // (talk) 全ソースの mouth event を song-absolute (start, end, image_id, priority) に
+            // 展開する。複数ソース (歌唱 Vox / 読み上げ Talk) が同じ口 track を共有しても、
+            // 次の merge で重なりが上位 (priority 小 = 上のトラック) 優先で解決され、口画像が
+            // 二重表示にならない (`docs/plan_voicevox_talk.md`)。
+            let mut spans: Vec<(f64, f64, u32, u32)> = Vec::new();
+            for r in &results {
+                let events = common::lipsync::build_mouth_events(
+                    &r.phonemes,
+                    &mouth_map,
+                    bpm,
+                    r.first_note_local_beat,
+                    r.clip_len_beats,
+                );
+                for ev in events {
+                    let s = r.clip_start_beat + ev.event_start_in_clip_beats;
+                    let e = s + ev.event_length_beats;
+                    if e > s {
+                        spans.push((s, e, ev.source_id, r.priority));
+                    }
                 }
             }
-        }
-        // 上位優先で重なりを解決した非重複 mouth event 列。これを 1 本の auto_lipsync
-        // Image clip にまとめて口 track へ置く (event 間の隙間 = 口画像なし = 自然)。
-        let merged = merge_lipsync_events_by_priority(spans);
-        if !merged.is_empty() {
-            let clip_start = merged.iter().map(|m| m.0).fold(f64::INFINITY, f64::min);
-            let clip_end = merged.iter().map(|m| m.1).fold(f64::NEG_INFINITY, f64::max);
-            let mut events: Vec<common::model::ImageEvent> = Vec::with_capacity(merged.len());
-            for (s, e, img) in merged {
-                let mut ev = common::model::ImageEvent {
-                    source_id: img,
-                    event_start_in_clip_beats: s - clip_start,
-                    event_length_beats: e - s,
-                    ..common::model::ImageEvent::default()
-                };
-                // build_mouth_events は rect を全画面 default で返すので、素材寸法から
-                // aspect-fit rect を計算して上書き (立ち絵の他の子レイヤーと収まりを揃える)。
-                if let Some(src) = self.song.image_sources.get(&img) {
-                    let (x, y, w, h) = aspect_fit_pip_rect(res, (src.width, src.height));
-                    ev.x = x;
-                    ev.y = y;
-                    ev.w = w;
-                    ev.h = h;
+            // 上位優先で重なりを解決した非重複 mouth event 列。これを 1 本の auto_lipsync
+            // Image clip にまとめて口 track へ置く (event 間の隙間 = 口画像なし = 自然)。
+            let merged = merge_lipsync_events_by_priority(spans);
+            if !merged.is_empty() {
+                let clip_start = merged.iter().map(|m| m.0).fold(f64::INFINITY, f64::min);
+                let clip_end = merged.iter().map(|m| m.1).fold(f64::NEG_INFINITY, f64::max);
+                let mut events: Vec<common::model::ImageEvent> = Vec::with_capacity(merged.len());
+                for (s, e, img) in merged {
+                    let mut ev = common::model::ImageEvent {
+                        source_id: img,
+                        event_start_in_clip_beats: s - clip_start,
+                        event_length_beats: e - s,
+                        ..common::model::ImageEvent::default()
+                    };
+                    // build_mouth_events は rect を全画面 default で返すので、素材寸法から
+                    // aspect-fit rect を計算して上書き (立ち絵の他の子レイヤーと収まりを揃える)。
+                    if let Some(src) = song.image_sources.get(&img) {
+                        let (x, y, w, h) = aspect_fit_pip_rect(res, (src.width, src.height));
+                        ev.x = x;
+                        ev.y = y;
+                        ev.w = w;
+                        ev.h = h;
+                    }
+                    events.push(ev);
                 }
-                events.push(ev);
+                let content_id = song.alloc_content(
+                    common::model::ClipContent::Image(common::model::ImageContent { events }),
+                    "口パク".to_string(),
+                );
+                let m = &mut song.tracks[m_idx];
+                let clip_id = m.alloc_clip_id();
+                m.clips.push(Clip {
+                    id: clip_id,
+                    name: String::new(),
+                    start_beat: clip_start,
+                    length_beats: clip_end - clip_start,
+                    content_id,
+                    notes: Vec::new(),
+                    color: None,
+                    auto_lipsync: true,
+                    ..Default::default()
+                });
             }
-            let content_id = self.song.alloc_content(
-                common::model::ClipContent::Image(common::model::ImageContent { events }),
-                "口パク".to_string(),
-            );
-            let m = &mut self.song.tracks[m_idx];
-            let clip_id = m.alloc_clip_id();
-            m.clips.push(Clip {
-                id: clip_id,
-                name: String::new(),
-                start_beat: clip_start,
-                length_beats: clip_end - clip_start,
-                content_id,
-                notes: Vec::new(),
-                color: None,
-                auto_lipsync: true,
-                ..Default::default()
-            });
-        }
-        // 削除した古い clip の content を回収。
-        self.song.gc_clip_contents();
-        self.is_dirty = true;
+            // 削除した古い clip の content を回収。
+            song.gc_clip_contents();
+        });
     }
 
     /// `SetLipsyncTarget` handler。vocal track の出力先 binding を更新し、
     /// 設定時は口パクを再生成する (snapshot は `is_undoable` 経由で handler
     /// 前に取得済み = binding 変更を undo 可能)。
     fn set_lipsync_target(&mut self, track_id: u32, target: Option<u32>) {
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
-            return;
-        };
-        t.lipsync_target_track = target;
-        self.is_dirty = true;
-        if target.is_some() {
+        let applied = self.edit_song(|song| {
+            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return false;
+            };
+            t.lipsync_target_track = target;
+            true
+        }) == Some(true);
+        if applied && target.is_some() {
             self.regenerate_lipsync_for_track(track_id);
         }
     }
@@ -11238,25 +10386,30 @@ impl AppData {
         shape: common::model::MouthShape,
         source_id: common::model::ImageSourceId,
     ) {
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let applied = self.edit_song(|song| {
+            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return false;
+            };
+            let map = t
+                .mouth_map
+                .get_or_insert_with(common::model::MouthMap::default);
+            match shape {
+                common::model::MouthShape::A => map.a = source_id,
+                common::model::MouthShape::I => map.i = source_id,
+                common::model::MouthShape::U => map.u = source_id,
+                common::model::MouthShape::E => map.e = source_id,
+                common::model::MouthShape::O => map.o = source_id,
+                common::model::MouthShape::N => map.n = source_id,
+                common::model::MouthShape::Closed => map.closed = source_id,
+            }
+            true
+        }) == Some(true);
+        if !applied {
             return;
-        };
-        let map = t
-            .mouth_map
-            .get_or_insert_with(common::model::MouthMap::default);
-        match shape {
-            common::model::MouthShape::A => map.a = source_id,
-            common::model::MouthShape::I => map.i = source_id,
-            common::model::MouthShape::U => map.u = source_id,
-            common::model::MouthShape::E => map.e = source_id,
-            common::model::MouthShape::O => map.o = source_id,
-            common::model::MouthShape::N => map.n = source_id,
-            common::model::MouthShape::Closed => map.closed = source_id,
         }
-        self.is_dirty = true;
         // この口 track を出力先にしている vocal track を再生成する。
         let vocal_ids: Vec<u32> = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .filter(|v| v.lipsync_target_track == Some(track_id))
@@ -11277,21 +10430,21 @@ impl AppData {
     /// `reset_saved_baseline` (= load / new / recovery) から呼び、 開いた直後の
     /// spurious dirty を防ぐ。
     fn cancel_pending_lipsync_regen(&mut self) {
-        self.lipsync_gen = self.lipsync_gen.wrapping_add(1);
+        self.voicevox.lipsync_gen = self.voicevox.lipsync_gen.wrapping_add(1);
     }
 
     fn mark_lipsync_dirty(&mut self) {
         if !self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .any(|t| t.lipsync_target_track.is_some())
         {
             return;
         }
-        self.lipsync_gen = self.lipsync_gen.wrapping_add(1);
-        let generation = self.lipsync_gen;
-        let proxy = self.event_proxy.clone();
+        self.voicevox.lipsync_gen = self.voicevox.lipsync_gen.wrapping_add(1);
+        let generation = self.voicevox.lipsync_gen;
+        let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(400));
             proxy.send(AppEvent::LipsyncDebounceFired(generation));
@@ -11299,26 +10452,31 @@ impl AppData {
     }
 
     fn action_add_instrument_track(&mut self) {
-        let id = self.song.alloc_track_id();
-        let index = self.song.tracks.len() + 1;
+        let index = self.song_doc.song().tracks.len() + 1;
         // 挿入位置は「選択中で最上段の track の直上」 (純ロジックは
         // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
-        let insert_at = add_track_insert_index(&self.song.tracks, &self.selected_track_ids);
+        let insert_at = add_track_insert_index(&self.song_doc.song().tracks, &self.selection.selected_track_ids);
         // 新 track は挿入位置の基準 track (= 最上段の選択) と同じグループ
         // 階層に入れる (parent_group_id を継承)。基準が無い (= 選択無しで末尾挿入、
         // insert_at == tracks.len()) ときだけ master 直下 (None)。基準がグループ (子持ち)
         // でも「同じ階層 = 兄弟」になる (parent_group_id 継承がそのまま兄弟化する)。
-        let parent_group_id = self.song.tracks.get(insert_at).and_then(|t| t.parent_group_id);
-        let track = track_with(|t| {
-            t.id = id;
-            t.name = format!("Track {index}");
-            t.source = InstrumentSource::None;
-            t.clips = Vec::new();
-            t.parent_group_id = parent_group_id;
-        });
-        self.song.tracks.insert(insert_at, track);
+        let parent_group_id = self.song_doc.song().tracks.get(insert_at).and_then(|t| t.parent_group_id);
+        let Some(id) = self.edit_song(|song| {
+            let id = song.alloc_track_id();
+            let track = track_with(|t| {
+                t.id = id;
+                t.name = format!("Track {index}");
+                t.source = InstrumentSource::None;
+                t.clips = Vec::new();
+                t.parent_group_id = parent_group_id;
+            });
+            song.tracks.insert(insert_at, track);
+            id
+        }) else {
+            return;
+        };
         // 追加直後はこの新 track を唯一の選択 + カーソルにする (次の操作の対象)。
-        self.selected_track_ids = vec![id];
+        self.selection.selected_track_ids = vec![id];
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         tracing::info!(insert_at, ?parent_group_id, "added instrument track");
@@ -11340,18 +10498,19 @@ impl AppData {
     pub(crate) fn apply_create_section(&mut self, start: f64, len: f64) {
         // len が正のときだけ作成 (NaN / 非正は無視)。
         if len > 0.0 {
-            self.push_undo_snapshot();
-            let id = self.song.alloc_section_id();
-            let n = self.song.sections.len();
-            self.song.sections.push(common::model::Section {
-                id,
-                name: section_default_name(n),
-                color: section_default_color(n),
-                start_beat: start.max(0.0),
-                len_beats: len,
+            self.edit_song(|song| {
+                let id = song.alloc_section_id();
+                let n = song.sections.len();
+                song.sections.push(common::model::Section {
+                    id,
+                    name: section_default_name(n),
+                    color: section_default_color(n),
+                    start_beat: start.max(0.0),
+                    len_beats: len,
+                });
+                song.normalize_sections();
+                tracing::info!(id, start, len, "created arranger section");
             });
-            self.song.normalize_sections();
-            tracing::info!(id, start, len, "created arranger section");
         }
     }
 
@@ -11360,23 +10519,21 @@ impl AppData {
     /// 位置が変わるので `sync_song_to_plugin_host`。 移動が起きなければ undo snapshot を破棄。
     /// （境界をまたぐ clip の分割は `Song::move_section` の次段。）
     pub(crate) fn apply_move_section(&mut self, id: u32, next_start: f64) {
-        self.push_undo_snapshot();
-        if self.song.move_section(id, next_start) {
+        if self.edit_song_checked(|song| song.move_section(id, next_start)) {
             self.sync_song_to_plugin_host();
-        } else {
-            self.undo_stack.pop_back();
         }
     }
 
     /// セクション帯をリサイズする (被覆範囲の再定義、内容は動かさない)。
     pub(crate) fn apply_resize_section(&mut self, id: u32, next_start: f64, next_len: f64) {
         if next_len > 0.0 {
-            self.push_undo_snapshot();
-            if let Some(s) = self.song.sections.iter_mut().find(|s| s.id == id) {
-                s.start_beat = next_start.max(0.0);
-                s.len_beats = next_len;
-            }
-            self.song.normalize_sections();
+            self.edit_song(|song| {
+                if let Some(s) = song.sections.iter_mut().find(|s| s.id == id) {
+                    s.start_beat = next_start.max(0.0);
+                    s.len_beats = next_len;
+                }
+            });
+            self.edit_song(|song| song.normalize_sections());
         }
     }
 
@@ -11384,18 +10541,15 @@ impl AppData {
     /// linked コピーし、 dest 以降を ripple で空けて落とす)。 clip が増えるので
     /// `sync_song_to_plugin_host`。 複製が起きなければ undo snapshot を破棄。
     pub(crate) fn apply_duplicate_section(&mut self, id: u32, dest_start: f64) {
-        self.push_undo_snapshot();
-        if self.song.duplicate_section(id, dest_start).is_some() {
+        if self.edit_song_checked(|song| song.duplicate_section(id, dest_start).is_some()) {
             self.sync_song_to_plugin_host();
-        } else {
-            self.undo_stack.pop_back();
         }
     }
 
     /// 「このセクションをループ」: 帯の範囲を既存ループ領域に設定する (ループの SSoT を駆動、
     /// 二重化しない)。
     pub(crate) fn apply_loop_section(&mut self, id: u32) {
-        if let Some(s) = self.song.sections.iter().find(|s| s.id == id) {
+        if let Some(s) = self.song_doc.song().sections.iter().find(|s| s.id == id) {
             let (start, end) = (s.start_beat, s.end_beat());
             self.handle_event(AppEvent::SetLoopRange { start, end });
         }
@@ -11403,20 +10557,14 @@ impl AppData {
 
     /// 「帯のみ削除」: セクション帯だけ消し、 内容は温存する (Studio One Backspace 相当)。
     pub(crate) fn apply_delete_section_band(&mut self, id: u32) {
-        self.push_undo_snapshot();
-        if !self.song.delete_section(id) {
-            self.undo_stack.pop_back();
-        }
+        self.edit_song_checked(|song| song.delete_section(id));
     }
 
     /// 「範囲ごと削除」: セクションの時間範囲と内容を消して詰める (破壊的、 Delete Range 相当)。
     /// clip が変わるので plugin host へ sync。
     pub(crate) fn apply_delete_section_range(&mut self, id: u32) {
-        self.push_undo_snapshot();
-        if self.song.delete_section_range(id) {
+        if self.edit_song_checked(|song| song.delete_section_range(id)) {
             self.sync_song_to_plugin_host();
-        } else {
-            self.undo_stack.pop_back();
         }
     }
 
@@ -11428,18 +10576,18 @@ impl AppData {
     pub(crate) fn apply_select_section(&mut self, id: u32, modifier: daw_ui_core::SelectModifier) {
         use daw_ui_core::SelectModifier;
         match modifier {
-            SelectModifier::Single => self.selected_section_ids = vec![id],
+            SelectModifier::Single => self.selection.selected_section_ids = vec![id],
             SelectModifier::Toggle => {
-                if let Some(pos) = self.selected_section_ids.iter().position(|&s| s == id) {
-                    self.selected_section_ids.remove(pos);
+                if let Some(pos) = self.selection.selected_section_ids.iter().position(|&s| s == id) {
+                    self.selection.selected_section_ids.remove(pos);
                 } else {
-                    self.selected_section_ids.push(id);
+                    self.selection.selected_section_ids.push(id);
                 }
             }
             SelectModifier::RangeFromAnchor => {
-                let anchor = self.selected_section_ids.last().copied();
+                let anchor = self.selection.selected_section_ids.last().copied();
                 let ordered: Vec<u32> = {
-                    let mut v: Vec<&common::model::Section> = self.song.sections.iter().collect();
+                    let mut v: Vec<&common::model::Section> = self.song_doc.song().sections.iter().collect();
                     v.sort_by(|a, b| {
                         a.start_beat
                             .partial_cmp(&b.start_beat)
@@ -11449,7 +10597,7 @@ impl AppData {
                 };
                 let ai = anchor.and_then(|a| ordered.iter().position(|&x| x == a));
                 let bi = ordered.iter().position(|&x| x == id);
-                self.selected_section_ids = match (ai, bi) {
+                self.selection.selected_section_ids = match (ai, bi) {
                     (Some(ai), Some(bi)) => {
                         let (lo, hi) = if ai <= bi { (ai, bi) } else { (bi, ai) };
                         ordered[lo..=hi].to_vec()
@@ -11459,27 +10607,26 @@ impl AppData {
             }
         }
         // section を選んだら他面の選択を消す (Delete の曖昧さ回避、 §doc 参照)。
-        self.selected_clips.clear();
-        self.selected_clip = None;
-        self.selected_notes.clear();
-        self.selected_automation_clips.clear();
-        self.selected_automation_points.clear();
-        self.selected_track_ids.clear();
+        self.selection.selected_clips.clear();
+        self.selection.selected_clip = None;
+        self.selection.selected_notes.clear();
+        self.selection.selected_automation_clips.clear();
+        self.selection.selected_automation_points.clear();
+        self.selection.selected_track_ids.clear();
     }
 
     /// 選択中のセクション帯を削除する (帯のみ・内容温存、 キーボード Delete から)。
     pub(crate) fn apply_delete_selected_sections(&mut self) {
-        if self.selected_section_ids.is_empty() {
+        if self.selection.selected_section_ids.is_empty() {
             return;
         }
-        self.push_undo_snapshot();
-        let ids = std::mem::take(&mut self.selected_section_ids);
+        let ids = std::mem::take(&mut self.selection.selected_section_ids);
         let mut removed = false;
         for id in ids {
-            removed |= self.song.delete_section(id);
+            removed |= self.song_doc.song().delete_section(id);
         }
         if !removed {
-            self.undo_stack.pop_back();
+            self.song_doc.undo_stack.pop_back();
         }
     }
 
@@ -11488,15 +10635,22 @@ impl AppData {
     // ----------------------------------------------------------------
 
     fn set_lane_enabled(&mut self, track_id: u32, lane_id: u32, enabled: bool) {
-        if let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) {
+        if let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(track_id, lane_id) {
             lane.enabled = enabled;
             self.sync_song_to_plugin_host();
         }
     }
 
     fn set_lane_visible(&mut self, track_id: u32, lane_id: u32, visible: bool) {
-        if let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) {
-            lane.visible = visible;
+        let changed = self.edit_song_checked(|song| {
+            if let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) {
+                lane.visible = visible;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             // visible は再生に影響しないが、Song 構造の変化なので同期。
             self.sync_song_to_plugin_host();
         }
@@ -11508,13 +10662,16 @@ impl AppData {
     /// (lane default knob を回した後 `A` を押すと同 lane が visible
     /// 復活する閉ループ)。
     fn set_lane_default(&mut self, track_id: u32, lane_id: u32, next_norm: f32) {
-        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
+        let Some(Some(target)) = self.edit_song(|song| {
+            let lane = song.automation_lane_by_key_mut(track_id, lane_id)?;
+            let target = lane.target.clone();
+            lane.default_value = common::automation::norm_to_plain(&target, next_norm);
+            Some(target)
+        }) else {
             return;
         };
-        let target = lane.target.clone();
-        lane.default_value = common::automation::norm_to_plain(&target, next_norm);
         let display_name = self.automation_target_label(track_id, &target);
-        self.last_touched_param = Some(TouchedParam {
+        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target,
             display_name,
@@ -11528,10 +10685,17 @@ impl AppData {
     fn set_lane_height(&mut self, track_id: u32, lane_id: u32, next_px: u16) {
         // ユーザーが明示的に lane を resize した = `Z` 縦ズームの一時拡大 (session
         // override) を破棄して model 高さに制御を戻す。
-        self.automation_lane_row_overrides
+        self.ui_prefs.automation_lane_row_overrides
             .remove(&common::model::AutomationLaneKey { track: track_id, lane: lane_id });
-        if let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) {
-            lane.height_px = next_px;
+        let changed = self.edit_song_checked(|song| {
+            if let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) {
+                lane.height_px = next_px;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             // 高さは描画状態のみで再生に影響しないが、 Song 構造の
             // 変化なので同期 (= 他 process が song を読むときに矛盾
             // しないよう)。
@@ -11542,17 +10706,25 @@ impl AppData {
     fn delete_lane(&mut self, track_id: u32, lane_id: u32) {
         // gui_01 #034 (Phase 63n-10): master row sentinel 対応。 song_lanes
         // の方にあれば該当 idx を探して remove、 通常 track なら従来通り。
-        if track_id == common::model::MASTER_TRACK_ID {
-            if let Some(idx) = self.song.song_lanes.iter().position(|l| l.id == lane_id) {
-                self.song.song_lanes.remove(idx);
-                self.sync_song_to_plugin_host();
+        let changed = self.edit_song_checked(|song| {
+            if track_id == common::model::MASTER_TRACK_ID {
+                if let Some(idx) = song.song_lanes.iter().position(|l| l.id == lane_id) {
+                    song.song_lanes.remove(idx);
+                    return true;
+                }
+                false
+            } else if let Some(track) = song.track_by_id_mut(track_id)
+                && let Some(idx) = track.lane_index_by_id(lane_id)
+            {
+                track.automation_lanes.remove(idx);
+                // 共有先のなくなった clip_contents は次の save / GC で
+                // 自動回収。
+                true
+            } else {
+                false
             }
-        } else if let Some(track) = self.song.track_by_id_mut(track_id)
-            && let Some(idx) = track.lane_index_by_id(lane_id)
-        {
-            track.automation_lanes.remove(idx);
-            // 共有先のなくなった clip_contents は次の save / GC で
-            // 自動回収。
+        });
+        if changed {
             self.sync_song_to_plugin_host();
         }
     }
@@ -11567,42 +10739,46 @@ impl AppData {
         time_beat: f64,
         value_norm: f32,
     ) {
-        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
-            return;
-        };
-        let target = lane.target.clone();
-        let Some(clip) = lane.clip_by_id(clip_id) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let plain = common::automation::norm_to_plain(&target, value_norm);
-        let entry = self
-            .song
-            .clip_contents
-            .entry(content_id)
-            .or_insert_with(|| {
+        let changed = self.edit_song_checked(|song| {
+            let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) else {
+                return false;
+            };
+            let target = lane.target.clone();
+            let Some(clip) = lane.clip_by_id(clip_id) else {
+                return false;
+            };
+            let content_id = clip.content_id;
+            let plain = common::automation::norm_to_plain(&target, value_norm);
+            let entry = song.clip_contents.entry(content_id).or_insert_with(|| {
                 common::model::ClipContent::Automation(
                     common::model::AutomationContent::default(),
                 )
             });
-        let points = match entry {
-            common::model::ClipContent::Automation(a) => &mut a.points,
-            _ => {
-                tracing::warn!(
-                    content_id,
-                    "AddAutomationPoint: content variant is not Automation, skipping"
-                );
-                return;
-            }
-        };
-        let new_point = common::model::AutomationPoint {
-            time_beat,
-            value: plain,
-            curve: common::model::AutomationCurve::Linear,
-        };
-        let insert_at = points.partition_point(|p| p.time_beat <= time_beat);
-        points.insert(insert_at, new_point);
-        self.sync_song_to_plugin_host();
+            let content = match entry {
+                common::model::ClipContent::Automation(a) => a,
+                _ => {
+                    tracing::warn!(
+                        content_id,
+                        "AddAutomationPoint: content variant is not Automation, skipping"
+                    );
+                    return false;
+                }
+            };
+            // v29: ドキュメントに入る新規要素は必ず allocator で安定 id を採番。
+            let new_point = common::model::AutomationPoint {
+                id: content.alloc_point_id(),
+                time_beat,
+                value: plain,
+                curve: common::model::AutomationCurve::Linear,
+            };
+            let points = &mut content.points;
+            let insert_at = points.partition_point(|p| p.time_beat <= time_beat);
+            points.insert(insert_at, new_point);
+            true
+        });
+        if changed {
+            self.sync_song_to_plugin_host();
+        }
     }
 
     fn move_automation_points(&mut self, deltas: &[MoveAutomationPointEntry]) {
@@ -11612,44 +10788,45 @@ impl AppData {
         // 各 delta の lane.target を引いて plain 化、同 clip 内の point
         // を一括更新後に sort で昇順を保つ。同一 clip 複数 point は
         // group して 1 度の sort で済ませる。
-        let mut touched: std::collections::HashSet<common::model::ContentId> =
-            std::collections::HashSet::new();
-        for delta in deltas {
-            let Some(lane) = self
-                .song
-                .automation_lane_by_key_mut(delta.key.track_id, delta.key.lane_id)
-            else {
-                continue;
-            };
-            let target = lane.target.clone();
-            let Some(clip) = lane.clip_by_id(delta.key.clip_id) else {
-                continue;
-            };
-            let content_id = clip.content_id;
-            let plain = common::automation::norm_to_plain(&target, delta.next_value_norm);
-            let Some(entry) = self.song.clip_contents.get_mut(&content_id) else {
-                continue;
-            };
-            let common::model::ClipContent::Automation(a) = entry else {
-                continue;
-            };
-            if let Some(p) = a.points.get_mut(delta.key.point_idx as usize) {
-                p.time_beat = delta.next_time_beat;
-                p.value = plain;
-                touched.insert(content_id);
+        self.edit_song(|song| {
+            let mut touched: std::collections::HashSet<common::model::ContentId> =
+                std::collections::HashSet::new();
+            for delta in deltas {
+                let Some(lane) =
+                    song.automation_lane_by_key_mut(delta.key.track_id, delta.key.lane_id)
+                else {
+                    continue;
+                };
+                let target = lane.target.clone();
+                let Some(clip) = lane.clip_by_id(delta.key.clip_id) else {
+                    continue;
+                };
+                let content_id = clip.content_id;
+                let plain = common::automation::norm_to_plain(&target, delta.next_value_norm);
+                let Some(entry) = song.clip_contents.get_mut(&content_id) else {
+                    continue;
+                };
+                let common::model::ClipContent::Automation(a) = entry else {
+                    continue;
+                };
+                if let Some(p) = a.points.get_mut(delta.key.point_idx as usize) {
+                    p.time_beat = delta.next_time_beat;
+                    p.value = plain;
+                    touched.insert(content_id);
+                }
             }
-        }
-        for cid in touched {
-            if let Some(common::model::ClipContent::Automation(a)) =
-                self.song.clip_contents.get_mut(&cid)
-            {
-                a.points.sort_by(|p1, p2| {
-                    p1.time_beat
-                        .partial_cmp(&p2.time_beat)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+            for cid in touched {
+                if let Some(common::model::ClipContent::Automation(a)) =
+                    song.clip_contents.get_mut(&cid)
+                {
+                    a.points.sort_by(|p1, p2| {
+                        p1.time_beat
+                            .partial_cmp(&p2.time_beat)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
             }
-        }
+        });
         self.sync_song_to_plugin_host();
     }
 
@@ -11658,10 +10835,10 @@ impl AppData {
     /// `automation_lane_by_key` が解決する。
     pub(crate) fn automation_point_value(&self, key: &AutomationPointKeyRef) -> Option<f64> {
         let lane = self
-            .song
+            .song_doc.song()
             .automation_lane_by_key(key.track_id, key.lane_id)?;
         let clip = lane.clip_by_id(key.clip_id)?;
-        let content = self.song.clip_contents.get(&clip.content_id)?;
+        let content = self.song_doc.song().clip_contents.get(&clip.content_id)?;
         let pts = content.automation_points()?;
         pts.get(key.point_idx as usize).map(|p| p.value)
     }
@@ -11671,7 +10848,7 @@ impl AppData {
     /// `from_display` 済の plain。時間 (`time_beat`) は変えないので sort 順は不変。
     fn set_automation_point_value(&mut self, key: &AutomationPointKeyRef, value: f64) {
         let Some(lane) = self
-            .song
+            .song_doc.song()
             .automation_lane_by_key(key.track_id, key.lane_id)
         else {
             return;
@@ -11681,7 +10858,7 @@ impl AppData {
         };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Automation(a)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return;
         };
@@ -11702,7 +10879,7 @@ impl AppData {
             Vec<u32>,
         > = std::collections::HashMap::new();
         for k in points {
-            let Some(lane) = self.song.automation_lane_by_key(k.track_id, k.lane_id) else {
+            let Some(lane) = self.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip_id) else {
@@ -11714,7 +10891,7 @@ impl AppData {
             indices.sort_unstable_by(|a, b| b.cmp(a));
             indices.dedup();
             if let Some(common::model::ClipContent::Automation(a)) =
-                self.song.clip_contents.get_mut(&cid)
+                self.song_doc.song().clip_contents.get_mut(&cid)
             {
                 for idx in indices {
                     if (idx as usize) < a.points.len() {
@@ -11726,8 +10903,8 @@ impl AppData {
         // (review) point_idx は positional なので削除で全 index がずれる。 残すと
         // 次の Del / Cut が詰め後の別の点を破壊する (`delete_selected_notes` の
         // `mem::take` と同じ後始末)。 inline 編集中の点も同様に無効化する。
-        self.selected_automation_points.clear();
-        self.editing_automation_point = None;
+        self.selection.selected_automation_points.clear();
+        self.ui_ephemeral.editing_automation_point = None;
         self.sync_song_to_plugin_host();
     }
 
@@ -11739,7 +10916,7 @@ impl AppData {
         point_idx: u32,
         next: common::model::AutomationCurve,
     ) {
-        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
+        let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(track_id, lane_id) else {
             return;
         };
         let Some(clip) = lane.clip_by_id(clip_id) else {
@@ -11747,7 +10924,7 @@ impl AppData {
         };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Automation(a)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return;
         };
@@ -11769,7 +10946,7 @@ impl AppData {
         point_idx: u32,
         next: f32,
     ) {
-        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
+        let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(track_id, lane_id) else {
             return;
         };
         let Some(clip) = lane.clip_by_id(clip_id) else {
@@ -11777,7 +10954,7 @@ impl AppData {
         };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Automation(a)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return;
         };
@@ -11802,7 +10979,7 @@ impl AppData {
         point_idx: u32,
         next: f32,
     ) {
-        let Some(lane) = self.song.automation_lane_by_key_mut(track_id, lane_id) else {
+        let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(track_id, lane_id) else {
             return;
         };
         let Some(clip) = lane.clip_by_id(clip_id) else {
@@ -11810,7 +10987,7 @@ impl AppData {
         };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Automation(a)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return;
         };
@@ -11832,12 +11009,12 @@ impl AppData {
     /// が無いので、 同 frame 内の値ペアで identify)。 同 clip 内に snap
     /// 結果が同位置になる point が複数いれば最初の一致を採用。
     fn quantize_selected_automation_points(&mut self, div: u8) {
-        if self.selected_automation_points.is_empty() {
+        if self.selection.selected_automation_points.is_empty() {
             return;
         }
         let div = div.max(1) as f64;
         let snap = |b: f64| ((b * div).round() / div).max(0.0);
-        let selected = self.selected_automation_points.clone();
+        let selected = self.selection.selected_automation_points.clone();
 
         // `content_id` ごとに、 quantize 対象 idx 群と、 selection lookup 用の
         // `(snapped_time, value)` ペア群を集める。 ペアは selection の現順序
@@ -11858,7 +11035,7 @@ impl AppData {
             ContentBuckets,
         > = std::collections::HashMap::new();
         for k in &selected {
-            let Some(lane) = self.song.automation_lane_by_key(k.track_id, k.lane_id) else {
+            let Some(lane) = self.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip_id) else {
@@ -11866,7 +11043,7 @@ impl AppData {
             };
             let content_id = clip.content_id;
             let Some(common::model::ClipContent::Automation(a)) =
-                self.song.clip_contents.get(&content_id)
+                self.song_doc.song().clip_contents.get(&content_id)
             else {
                 continue;
             };
@@ -11894,7 +11071,7 @@ impl AppData {
                 lookups,
             } = bucket;
             let Some(common::model::ClipContent::Automation(a)) =
-                self.song.clip_contents.get_mut(&content_id)
+                self.song_doc.song().clip_contents.get_mut(&content_id)
             else {
                 continue;
             };
@@ -11925,7 +11102,7 @@ impl AppData {
             }
         }
 
-        self.selected_automation_points = new_selection;
+        self.selection.selected_automation_points = new_selection;
         self.sync_song_to_plugin_host();
     }
 
@@ -11940,20 +11117,20 @@ impl AppData {
     /// 戻り値は `(json, count)`。 何も copy できない (選択無し / lookup
     /// 失敗) 場合は `None`。
     pub fn copy_points_clip(&self) -> Option<(String, usize)> {
-        if self.selected_automation_points.is_empty() {
+        if self.selection.selected_automation_points.is_empty() {
             return None;
         }
         let mut copied: Vec<crate::clipboard::CopiedPoint> =
-            Vec::with_capacity(self.selected_automation_points.len());
-        for k in &self.selected_automation_points {
-            let Some(lane) = self.song.automation_lane_by_key(k.track_id, k.lane_id) else {
+            Vec::with_capacity(self.selection.selected_automation_points.len());
+        for k in &self.selection.selected_automation_points {
+            let Some(lane) = self.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip_id) else {
                 continue;
             };
             let Some(common::model::ClipContent::Automation(a)) =
-                self.song.clip_contents.get(&clip.content_id)
+                self.song_doc.song().clip_contents.get(&clip.content_id)
             else {
                 continue;
             };
@@ -11982,7 +11159,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song.project_id,
+            self.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::AutomationPoints(copied),
         )
         .to_json()?;
@@ -12003,7 +11180,7 @@ impl AppData {
         if points_in.is_empty() {
             return 0;
         }
-        let Some(lane) = self.song.automation_lane_by_key(lane_key.track, lane_key.lane) else {
+        let Some(lane) = self.song_doc.song().automation_lane_by_key(lane_key.track, lane_key.lane) else {
             return 0;
         };
         let target = lane.target.clone();
@@ -12012,7 +11189,7 @@ impl AppData {
             .iter()
             .find(|c| song_beat >= c.start_beat && song_beat < c.start_beat + c.length_beats)
         else {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "貼り付け先の automation clip がありません (レーンの空き)".to_string();
             return 0;
         };
@@ -12025,17 +11202,16 @@ impl AppData {
         let anchor = (song_beat - clip.start_beat).max(0.0);
 
         // dest content が automation でない壊れたモデルなら undo を触る前に bail。
-        if let Some(c) = self.song.clip_contents.get(&content_id)
+        if let Some(c) = self.song_doc.song().clip_contents.get(&content_id)
             && !matches!(c, common::model::ClipContent::Automation(_))
         {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "貼り付け先 clip が automation でない (型不整合)".to_string();
             return 0;
         }
-        self.push_undo_snapshot();
 
         let entry = self
-            .song
+            .song_doc.song()
             .clip_contents
             .entry(content_id)
             .or_insert_with(|| {
@@ -12043,8 +11219,8 @@ impl AppData {
                     common::model::AutomationContent::default(),
                 )
             });
-        let points = match entry {
-            common::model::ClipContent::Automation(a) => &mut a.points,
+        let content = match entry {
+            common::model::ClipContent::Automation(a) => a,
             _ => return 0,
         };
 
@@ -12055,15 +11231,18 @@ impl AppData {
         for src in &points_in {
             let plain = common::automation::norm_to_plain(&target, src.value_norm);
             let t = (src.time_beat + anchor).max(0.0);
+            // v29: 新規 point は allocator で安定 id を採番。
             let new_point = common::model::AutomationPoint {
+                id: content.alloc_point_id(),
                 time_beat: t,
                 value: plain,
                 curve: src.curve,
             };
-            let insert_at = points.partition_point(|p| p.time_beat <= t);
-            points.insert(insert_at, new_point);
+            let insert_at = content.points.partition_point(|p| p.time_beat <= t);
+            content.points.insert(insert_at, new_point);
             inserted_pairs.push((t, plain));
         }
+        let points = &mut content.points;
 
         let new_indices: Vec<u32> = inserted_pairs
             .iter()
@@ -12075,7 +11254,7 @@ impl AppData {
             })
             .collect();
 
-        self.selected_automation_points = new_indices
+        self.selection.selected_automation_points = new_indices
             .into_iter()
             .map(|i| AutomationPointKeyRef {
                 track_id: dest_key.track,
@@ -12084,7 +11263,7 @@ impl AppData {
                 point_idx: i,
             })
             .collect();
-        self.last_edit_select = Some(EditSelectSurface::AutomationPoints);
+        self.selection.last_edit_select = Some(EditSelectSurface::AutomationPoints);
         self.sync_song_to_plugin_host();
         count
     }
@@ -12094,16 +11273,16 @@ impl AppData {
     /// オーディオエディタで選択中のイベントを clipboard envelope
     /// (`ClipboardPayload::AudioEvents`) JSON に。最早 start を 0 とした相対に正規化。
     pub fn copy_events_clip(&self) -> Option<(String, usize)> {
-        let r = self.audio_editor_clip?;
-        if self.audio_editor_selected_events.is_empty() {
+        let r = self.ui_ephemeral.audio_editor_clip?;
+        if self.selection.audio_editor_selected_events.is_empty() {
             return None;
         }
-        let track = self.song.tracks.get(r.track as usize)?;
+        let track = self.song_doc.song().tracks.get(r.track as usize)?;
         let clip = track.clips.get(r.clip as usize)?;
-        let content = self.song.clip_contents.get(&clip.content_id)?;
+        let content = self.song_doc.song().clip_contents.get(&clip.content_id)?;
         let events = content.audio_events()?;
         let mut copied: Vec<AudioEvent> = self
-            .audio_editor_selected_events
+            .selection.audio_editor_selected_events
             .iter()
             .filter_map(|i| events.get(*i).cloned())
             .collect();
@@ -12121,7 +11300,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song.project_id,
+            self.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::AudioEvents(copied),
         )
         .to_json()?;
@@ -12135,12 +11314,12 @@ impl AppData {
         if events.is_empty() {
             return 0;
         }
-        let Some(target) = self.audio_editor_clip else {
-            self.status_message = "貼り付け先のオーディオクリップがありません".to_string();
+        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
+            self.ui_ephemeral.status_message = "貼り付け先のオーディオクリップがありません".to_string();
             return 0;
         };
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -12149,17 +11328,16 @@ impl AppData {
             return 0;
         };
         if !matches!(
-            self.song.clip_contents.get(&content_id),
+            self.song_doc.song().clip_contents.get(&content_id),
             Some(common::model::ClipContent::Audio(_))
         ) {
-            self.status_message = "貼り付け先 clip が audio でない".to_string();
+            self.ui_ephemeral.status_message = "貼り付け先 clip が audio でない".to_string();
             return 0;
         }
         let anchor = at_beat.max(0.0);
-        self.push_undo_snapshot();
         let count = events.len();
         let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return 0;
         };
@@ -12171,17 +11349,17 @@ impl AppData {
             new_indices.push(audio.events.len());
             audio.events.push(e.clone());
         }
-        self.audio_editor_selected_events = new_indices;
+        self.selection.audio_editor_selected_events = new_indices;
         // clip 長が足りなければ拡張 (add_audio_event_from_file と同 idiom)。
-        if let Some(track) = self.song.tracks.get_mut(target.track as usize)
+        if let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize)
             && let Some(clip) = track.clips.get_mut(target.clip as usize)
             && max_end > clip.length_beats
         {
             clip.length_beats = max_end;
         }
-        self.is_dirty = true;
+        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
-        if self.clip_edit_buffer_target == Some(target) {
+        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
         count
@@ -12200,7 +11378,7 @@ impl AppData {
         }
         let mut resolved: Vec<(usize, common::model::Clip)> = Vec::new();
         for r in &refs {
-            if let Some(t) = self.song.tracks.get(r.track as usize)
+            if let Some(t) = self.song_doc.song().tracks.get(r.track as usize)
                 && let Some(c) = t.clips.get(r.clip as usize)
             {
                 resolved.push((r.track as usize, c.clone()));
@@ -12218,12 +11396,12 @@ impl AppData {
         let mut clips = Vec::with_capacity(resolved.len());
         for (ti, c) in &resolved {
             let content = self
-                .song
+                .song_doc.song()
                 .clip_contents
                 .get(&c.content_id)
                 .cloned()
                 .unwrap_or_default();
-            let name = self.song.clip_content_names.get(&c.content_id).cloned();
+            let name = self.song_doc.song().clip_content_names.get(&c.content_id).cloned();
             clips.push(crate::clipboard::ClipCopy {
                 track_offset: (*ti as i64) - (min_track as i64),
                 start_beat: c.start_beat - base,
@@ -12245,7 +11423,7 @@ impl AppData {
         }
         let count = clips.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song.project_id,
+            self.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::Clips(clips),
         )
         .to_json()?;
@@ -12267,22 +11445,21 @@ impl AppData {
         if clips.is_empty() {
             return 0;
         }
-        let Some(anchor_idx) = self.song.track_index_by_id(anchor_track) else {
-            self.status_message = "貼り付け先のトラックがありません".to_string();
+        let Some(anchor_idx) = self.song_doc.song().track_index_by_id(anchor_track) else {
+            self.ui_ephemeral.status_message = "貼り付け先のトラックがありません".to_string();
             return 0;
         };
-        let same_project = src_pid == self.song.project_id;
+        let same_project = src_pid == self.song_doc.song().project_id;
         // 貼り付け対象 (target_idx が範囲内) が 1 件も無ければ undo を積まず return
         // (= spurious な no-op undo step を作らない、paste_notes_at と同方針)。
         let any_valid = clips.iter().any(|cc| {
             let ti = anchor_idx as i64 + cc.track_offset;
-            ti >= 0 && (ti as usize) < self.song.tracks.len()
+            ti >= 0 && (ti as usize) < self.song_doc.song().tracks.len()
         });
         if !any_valid {
-            self.status_message = "貼り付け先のトラックがありません".to_string();
+            self.ui_ephemeral.status_message = "貼り付け先のトラックがありません".to_string();
             return 0;
         }
-        self.push_undo_snapshot();
         // content remap: 同一 source content_id は 1 度だけ採番して dedup する
         // (linked クリップ群を複数貼っても貼り付け後もリンクを保つ)。同一プロジェクト
         // かつ content 現存なら流用 (リンク共有)、それ以外は inline payload から独立採番。
@@ -12293,7 +11470,7 @@ impl AppData {
         let mut new_refs: Vec<ClipRef> = Vec::new();
         for cc in &clips {
             let target_idx = anchor_idx as i64 + cc.track_offset;
-            if target_idx < 0 || target_idx as usize >= self.song.tracks.len() {
+            if target_idx < 0 || target_idx as usize >= self.song_doc.song().tracks.len() {
                 continue;
             }
             let target_idx = target_idx as usize;
@@ -12301,16 +11478,16 @@ impl AppData {
                 new
             } else {
                 let resolved =
-                    if same_project && self.song.clip_contents.contains_key(&cc.content_id) {
+                    if same_project && self.song_doc.song().clip_contents.contains_key(&cc.content_id) {
                         cc.content_id
                     } else {
-                        self.song
+                        self.song_doc.song()
                             .alloc_content(cc.content.clone(), cc.name.clone().unwrap_or_default())
                     };
                 content_remap.insert(cc.content_id, resolved);
                 resolved
             };
-            let Some(to_track) = self.song.tracks.get_mut(target_idx) else {
+            let Some(to_track) = self.song_doc.song().tracks.get_mut(target_idx) else {
                 continue;
             };
             let new_clip_id = to_track.alloc_clip_id();
@@ -12341,7 +11518,7 @@ impl AppData {
         let pasted = new_refs.len();
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
-            self.selected_notes.clear();
+            self.selection.selected_notes.clear();
             self.sync_song_to_plugin_host();
         }
         pasted
@@ -12356,12 +11533,12 @@ impl AppData {
     /// `source_content_id` を保持して linked group を paste 後も保つ。 戻り値は `(json, count)`、
     /// 選択無し / 解決失敗なら `None`。
     pub fn copy_automation_clips_clip(&self) -> Option<(String, usize)> {
-        if self.selected_automation_clips.is_empty() {
+        if self.selection.selected_automation_clips.is_empty() {
             return None;
         }
         let mut resolved = Vec::new();
-        for k in &self.selected_automation_clips {
-            let Some(lane) = self.song.automation_lane_by_key(k.track, k.lane) else {
+        for k in &self.selection.selected_automation_clips {
+            let Some(lane) = self.song_doc.song().automation_lane_by_key(k.track, k.lane) else {
                 continue;
             };
             let Some(clip) = lane.clip_by_id(k.clip) else {
@@ -12380,7 +11557,7 @@ impl AppData {
         let mut out = Vec::with_capacity(resolved.len());
         for (target, clip) in &resolved {
             let points: Vec<crate::clipboard::CopiedPoint> =
-                match self.song.clip_contents.get(&clip.content_id) {
+                match self.song_doc.song().clip_contents.get(&clip.content_id) {
                     Some(common::model::ClipContent::Automation(a)) => a
                         .points
                         .iter()
@@ -12392,7 +11569,7 @@ impl AppData {
                         .collect(),
                     _ => Vec::new(),
                 };
-            let name = self.song.clip_content_names.get(&clip.content_id).cloned();
+            let name = self.song_doc.song().clip_content_names.get(&clip.content_id).cloned();
             out.push(crate::clipboard::AutomationClipCopy {
                 start_beat: clip.start_beat - base,
                 length_beats: clip.length_beats,
@@ -12403,7 +11580,7 @@ impl AppData {
         }
         let count = out.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.song.project_id,
+            self.song_doc.song().project_id,
             crate::clipboard::ClipboardPayload::AutomationClips(out),
         )
         .to_json()?;
@@ -12424,12 +11601,11 @@ impl AppData {
         if clips.is_empty() {
             return 0;
         }
-        let Some(lane) = self.song.automation_lane_by_key(lane_key.track, lane_key.lane) else {
-            self.status_message = "貼り付け先の automation lane がありません".to_string();
+        let Some(lane) = self.song_doc.song().automation_lane_by_key(lane_key.track, lane_key.lane) else {
+            self.ui_ephemeral.status_message = "貼り付け先の automation lane がありません".to_string();
             return 0;
         };
         let target = lane.target.clone();
-        self.push_undo_snapshot();
         // 同一 source content_id は 1 度だけ採番して dedup (= linked group を paste 後も保つ)。
         let mut content_remap: std::collections::HashMap<
             common::model::ContentId,
@@ -12440,10 +11616,14 @@ impl AppData {
             let content_id = if let Some(&id) = content_remap.get(&cc.source_content_id) {
                 id
             } else {
+                // v29: 新規 content の点にも安定 id を採番する (1 始まりの
+                // 連番 = per-content allocator と同じ)。
                 let mut points: Vec<common::model::AutomationPoint> = cc
                     .points
                     .iter()
-                    .map(|p| common::model::AutomationPoint {
+                    .enumerate()
+                    .map(|(i, p)| common::model::AutomationPoint {
+                        id: i as u32 + 1,
                         time_beat: p.time_beat.max(0.0),
                         value: common::automation::norm_to_plain(&target, p.value_norm),
                         curve: p.curve,
@@ -12451,16 +11631,19 @@ impl AppData {
                     .collect();
                 points.sort_by(|a, b| a.time_beat.total_cmp(&b.time_beat));
                 let content = common::model::ClipContent::Automation(
-                    common::model::AutomationContent { points },
+                    common::model::AutomationContent {
+                        next_point_id: points.len() as u32 + 1,
+                        points,
+                    },
                 );
                 let id = self
-                    .song
+                    .song_doc.song()
                     .alloc_content(content, cc.name.clone().unwrap_or_default());
                 content_remap.insert(cc.source_content_id, id);
                 id
             };
             let Some(lane) = self
-                .song
+                .song_doc.song()
                 .automation_lane_by_key_mut(lane_key.track, lane_key.lane)
             else {
                 continue;
@@ -12484,12 +11667,12 @@ impl AppData {
         }
         let pasted = new_keys.len();
         if pasted > 0 {
-            self.selected_automation_clips = new_keys;
+            self.selection.selected_automation_clips = new_keys;
             // 貼ったばかりの clip を直後の copy/cut/delete 対象にする: 競合する点選択を
             // 解除し (paste_clips_at が selected_notes を clear するのと同じ)、 last-wins も
             // clip 側に倒す。
-            self.selected_automation_points.clear();
-            self.last_edit_select = Some(EditSelectSurface::AutomationClips);
+            self.selection.selected_automation_points.clear();
+            self.selection.last_edit_select = Some(EditSelectSurface::AutomationClips);
             self.sync_song_to_plugin_host();
         }
         pasted
@@ -12506,7 +11689,7 @@ impl AppData {
         for d in deltas {
             let mut taken: Option<common::model::AutomationClip> = None;
             if let Some(source_lane) =
-                self.song.automation_lane_by_key_mut(d.from.track, d.from.lane)
+                self.song_doc.song().automation_lane_by_key_mut(d.from.track, d.from.lane)
                 && let Some(idx) = source_lane.clip_index_by_id(d.from.clip)
             {
                 taken = Some(source_lane.clips.remove(idx));
@@ -12514,7 +11697,7 @@ impl AppData {
             let Some(mut clip) = taken else { continue };
             clip.start_beat = d.next_start_beat;
             if let Some(target_lane) = self
-                .song
+                .song_doc.song()
                 .automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
             {
                 let start = clip.start_beat;
@@ -12537,7 +11720,7 @@ impl AppData {
         for d in deltas {
             let template = {
                 let Some(source_lane) =
-                    self.song.automation_lane_by_key(d.from.track, d.from.lane)
+                    self.song_doc.song().automation_lane_by_key(d.from.track, d.from.lane)
                 else {
                     continue;
                 };
@@ -12551,7 +11734,7 @@ impl AppData {
                 )
             };
             let Some(target_lane) = self
-                .song
+                .song_doc.song()
                 .automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
             else {
                 continue;
@@ -12585,7 +11768,7 @@ impl AppData {
         for d in deltas {
             let template = {
                 let Some(source_lane) =
-                    self.song.automation_lane_by_key(d.from.track, d.from.lane)
+                    self.song_doc.song().automation_lane_by_key(d.from.track, d.from.lane)
                 else {
                     continue;
                 };
@@ -12602,7 +11785,7 @@ impl AppData {
             // Midi/Audio/Automation いずれも対応)。content が無い場合は空
             // Automation で作成。
             let cloned_content = self
-                .song
+                .song_doc.song()
                 .clip_contents
                 .get(&template.0)
                 .cloned()
@@ -12611,10 +11794,10 @@ impl AppData {
                         common::model::AutomationContent::default(),
                     )
                 });
-            let new_content_id = self.song.alloc_content_id();
-            self.song.clip_contents.insert(new_content_id, cloned_content);
+            let new_content_id = self.song_doc.song().alloc_content_id();
+            self.edit_song(|song| song.clip_contents.insert(new_content_id, cloned_content));
             let Some(target_lane) = self
-                .song
+                .song_doc.song()
                 .automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
             else {
                 continue;
@@ -12643,7 +11826,7 @@ impl AppData {
         let mut max_end = f64::MIN;
         for &src in sources {
             let Some(clip) = self
-                .song
+                .song_doc.song()
                 .automation_lane_by_key(src.track, src.lane)
                 .and_then(|lane| lane.clip_by_id(src.clip))
             else {
@@ -12663,12 +11846,12 @@ impl AppData {
         new_start_beat: f64,
     ) -> Option<common::model::AutomationClipKey> {
         let (content_id, name, length) = {
-            let lane = self.song.automation_lane_by_key(source.track, source.lane)?;
+            let lane = self.song_doc.song().automation_lane_by_key(source.track, source.lane)?;
             let src_clip = lane.clip_by_id(source.clip)?;
             (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats)
         };
         let lane = self
-            .song
+            .song_doc.song()
             .automation_lane_by_key_mut(source.track, source.lane)?;
         let new_id = lane.alloc_clip_id();
         let new_clip = common::model::AutomationClip {
@@ -12695,12 +11878,12 @@ impl AppData {
         new_start_beat: f64,
     ) -> Option<common::model::AutomationClipKey> {
         let (src_content_id, name, length) = {
-            let lane = self.song.automation_lane_by_key(source.track, source.lane)?;
+            let lane = self.song_doc.song().automation_lane_by_key(source.track, source.lane)?;
             let src_clip = lane.clip_by_id(source.clip)?;
             (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats)
         };
         let cloned_content = self
-            .song
+            .song_doc.song()
             .clip_contents
             .get(&src_content_id)
             .cloned()
@@ -12709,12 +11892,12 @@ impl AppData {
                     common::model::AutomationContent::default(),
                 )
             });
-        let new_content_id = self.song.alloc_content_id();
-        self.song
+        let new_content_id = self.song_doc.song().alloc_content_id();
+        self.song_doc.song()
             .clip_contents
             .insert(new_content_id, cloned_content);
         let lane = self
-            .song
+            .song_doc.song()
             .automation_lane_by_key_mut(source.track, source.lane)?;
         let new_id = lane.alloc_clip_id();
         let new_clip = common::model::AutomationClip {
@@ -12742,7 +11925,7 @@ impl AppData {
         let mut new_keys = Vec::with_capacity(sources.len());
         for &src in sources {
             let Some(new_start) = self
-                .song
+                .song_doc.song()
                 .automation_lane_by_key(src.track, src.lane)
                 .and_then(|lane| lane.clip_by_id(src.clip))
                 .map(|c| c.start_beat + offset)
@@ -12754,8 +11937,8 @@ impl AppData {
             }
         }
         if !new_keys.is_empty() {
-            self.selected_automation_clips = new_keys;
-            self.last_edit_select = Some(EditSelectSurface::AutomationClips);
+            self.selection.selected_automation_clips = new_keys;
+            self.selection.last_edit_select = Some(EditSelectSurface::AutomationClips);
             self.sync_song_to_plugin_host();
         }
     }
@@ -12768,7 +11951,7 @@ impl AppData {
         let mut new_keys = Vec::with_capacity(sources.len());
         for &src in sources {
             let Some(new_start) = self
-                .song
+                .song_doc.song()
                 .automation_lane_by_key(src.track, src.lane)
                 .and_then(|lane| lane.clip_by_id(src.clip))
                 .map(|c| c.start_beat + offset)
@@ -12780,8 +11963,8 @@ impl AppData {
             }
         }
         if !new_keys.is_empty() {
-            self.selected_automation_clips = new_keys;
-            self.last_edit_select = Some(EditSelectSurface::AutomationClips);
+            self.selection.selected_automation_clips = new_keys;
+            self.selection.last_edit_select = Some(EditSelectSurface::AutomationClips);
             self.sync_song_to_plugin_host();
         }
     }
@@ -12792,7 +11975,7 @@ impl AppData {
         }
         for d in deltas {
             let Some(lane) = self
-                .song
+                .song_doc.song()
                 .automation_lane_by_key_mut(d.key.track, d.key.lane)
             else {
                 continue;
@@ -12811,7 +11994,7 @@ impl AppData {
     /// `MakeClipUnique` と同 UX)。
     fn make_automation_clip_unique(&mut self, key: common::model::AutomationClipKey) {
         let content_id = {
-            let Some(lane) = self.song.automation_lane_by_key(key.track, key.lane) else {
+            let Some(lane) = self.song_doc.song().automation_lane_by_key(key.track, key.lane) else {
                 return;
             };
             let Some(clip) = lane.clip_by_id(key.clip) else {
@@ -12819,17 +12002,17 @@ impl AppData {
             };
             clip.content_id
         };
-        if self.song.clip_content_refcount(content_id) <= 1 {
-            self.status_message = "すでに独立 clip です".into();
+        if self.song_doc.song().clip_content_refcount(content_id) <= 1 {
+            self.ui_ephemeral.status_message = "すでに独立 clip です".into();
             return;
         }
-        let Some(cloned_content) = self.song.clip_contents.get(&content_id).cloned()
+        let Some(cloned_content) = self.song_doc.song().clip_contents.get(&content_id).cloned()
         else {
             return;
         };
-        let new_content_id = self.song.alloc_content_id();
-        self.song.clip_contents.insert(new_content_id, cloned_content);
-        if let Some(lane) = self.song.automation_lane_by_key_mut(key.track, key.lane)
+        let new_content_id = self.song_doc.song().alloc_content_id();
+        self.edit_song(|song| song.clip_contents.insert(new_content_id, cloned_content));
+        if let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(key.track, key.lane)
             && let Some(clip) = lane.clip_by_id_mut(key.clip)
         {
             clip.content_id = new_content_id;
@@ -12848,8 +12031,8 @@ impl AppData {
         len_beats: f64,
     ) {
         // 新 ContentId を先に採番 + 空 Automation content を登録。
-        let new_content_id = self.song.alloc_content_id();
-        self.song.clip_contents.insert(
+        let new_content_id = self.song_doc.song().alloc_content_id();
+        self.song_doc.song().clip_contents.insert(
             new_content_id,
             common::model::ClipContent::Automation(
                 common::model::AutomationContent::default(),
@@ -12858,29 +12041,34 @@ impl AppData {
         // B6 (r.md #8): clip 名に実 param 名を使うため、 mut borrow を取る前に
         // immutable borrow で target を取り出し track-aware label を解決する。
         let Some(target) = self
-            .song
+            .song_doc.song()
             .automation_lane_by_key(lane_key.track, lane_key.lane)
             .map(|l| l.target.clone())
         else {
             return;
         };
         let display = self.automation_target_label(lane_key.track, &target);
-        let Some(lane) = self
-            .song
-            .automation_lane_by_key_mut(lane_key.track, lane_key.lane)
-        else {
+        let __applied = self.edit_song_checked(|song| {
+            let Some(lane) = song
+                .automation_lane_by_key_mut(lane_key.track, lane_key.lane)
+            else {
+                return false;
+            };
+            let clip_id = lane.alloc_clip_id();
+            let new_clip = common::model::AutomationClip {
+                id: clip_id,
+                name: format!("{display} curve"),
+                start_beat,
+                length_beats: len_beats,
+                content_id: new_content_id,
+            };
+            let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
+            lane.clips.insert(pos, new_clip);
+            true
+        });
+        if !__applied {
             return;
-        };
-        let clip_id = lane.alloc_clip_id();
-        let new_clip = common::model::AutomationClip {
-            id: clip_id,
-            name: format!("{display} curve"),
-            start_beat,
-            length_beats: len_beats,
-            content_id: new_content_id,
-        };
-        let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
-        lane.clips.insert(pos, new_clip);
+        }
         self.sync_song_to_plugin_host();
     }
 
@@ -12901,12 +12089,12 @@ impl AppData {
     ) {
         use common::model::{AutomationLane, AutomationTarget, ClipContent, ImageBuiltinParam};
         let Some(target_clip) = self.selected_clip_ref() else {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Image Automation: 画像 clip を選択してください".into();
             return;
         };
         let track_id_opt = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target_clip.track as usize)
             .map(|t| t.id);
@@ -12916,7 +12104,7 @@ impl AppData {
         let target = AutomationTarget::ImageBuiltin(field);
 
         // 既存 lane を find。 あれば visible / enabled を true に。
-        if let Some(track) = self.song.track_by_id_mut(track_id)
+        if let Some(track) = self.song_doc.song().track_by_id_mut(track_id)
             && let Some(lane) = track
                 .automation_lanes
                 .iter_mut()
@@ -12924,8 +12112,8 @@ impl AppData {
         {
             lane.visible = true;
             lane.enabled = true;
-            self.expanded_automation_tracks.insert(track_id);
-            self.status_message = format!(
+            self.ui_prefs.expanded_automation_tracks.insert(track_id);
+            self.ui_ephemeral.status_message = format!(
                 "Image Automation lane '{}' は既に存在します",
                 automation_target_display_name(&target)
             );
@@ -12937,11 +12125,11 @@ impl AppData {
         // image event が無ければ field ごとの常識値。 clamp 範囲は field
         // 種別で異なる (x/y/w/h/opacity = [0,1]、 rotation = [-π, π])。
         let default_value: f64 = {
-            let Some(track) = self.song.track_by_id(track_id) else {
+            let Some(track) = self.song_doc.song().track_by_id(track_id) else {
                 return;
             };
             let event = track.clips.iter().find_map(|c| {
-                self.song.clip_contents.get(&c.content_id).and_then(|content| {
+                self.song_doc.song().clip_contents.get(&c.content_id).and_then(|content| {
                     match content {
                         ClipContent::Image(img) => img.events.first(),
                         _ => None,
@@ -12974,23 +12162,29 @@ impl AppData {
             }
         };
 
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
+        let __applied = self.edit_song_checked(|song| {
+            let Some(track) = song.track_by_id_mut(track_id) else {
+                return false;
+            };
+            let lane_id = track.alloc_lane_id();
+            let new_lane = AutomationLane {
+                id: lane_id,
+                target: target.clone(),
+                default_value,
+                enabled: true,
+                visible: true,
+                height_px: 60,
+                clips: Vec::new(),
+                next_clip_id: 1,
+            };
+            track.automation_lanes.push(new_lane);
+            true
+        });
+        if !__applied {
             return;
-        };
-        let lane_id = track.alloc_lane_id();
-        let new_lane = AutomationLane {
-            id: lane_id,
-            target: target.clone(),
-            default_value,
-            enabled: true,
-            visible: true,
-            height_px: 60,
-            clips: Vec::new(),
-            next_clip_id: 1,
-        };
-        track.automation_lanes.push(new_lane);
-        self.expanded_automation_tracks.insert(track_id);
-        self.status_message = format!(
+        }
+        self.ui_prefs.expanded_automation_tracks.insert(track_id);
+        self.ui_ephemeral.status_message = format!(
             "Added image automation lane: {}",
             automation_target_display_name(&target)
         );
@@ -13001,7 +12195,7 @@ impl AppData {
     /// 残っているか。 record_automation_points_for_tick の起動条件で
     /// 「停止中でも image drag 中なら record を回す」 ために使う。
     fn image_pip_drag_active(&self) -> bool {
-        self.active_param_gestures
+        self.recording.active_param_gestures
             .iter()
             .any(|(_, t)| matches!(t, common::model::AutomationTarget::ImageBuiltin(_)))
     }
@@ -13022,7 +12216,7 @@ impl AppData {
         let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
-        let Some(track) = self.song.tracks.get(target_clip.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(target_clip.track as usize) else {
             return;
         };
         let track_id = track.id;
@@ -13043,14 +12237,14 @@ impl AppData {
                 .iter()
                 .any(|l| l.enabled && l.target == target);
             if has_lane {
-                self.active_param_gestures.insert((track_id, target.clone()));
+                self.recording.active_param_gestures.insert((track_id, target.clone()));
                 if matches!(
-                    self.recording_mode,
+                    self.recording.recording_mode,
                     common::model::RecordingMode::Latch
                         | common::model::RecordingMode::Write
-                ) && self.is_playing
+                ) && self.transport.is_playing
                 {
-                    self.latched_param_gestures.insert((track_id, target.clone()));
+                    self.recording.latched_param_gestures.insert((track_id, target.clone()));
                 }
                 seeded.push(target);
             }
@@ -13068,16 +12262,16 @@ impl AppData {
         use common::model::AutomationTarget;
         // image lane gesture だけを掃除 (audio / plugin gesture は残す)。
         let to_remove: Vec<(u32, AutomationTarget)> = self
-            .active_param_gestures
+            .recording.active_param_gestures
             .iter()
             .filter(|(_, t)| matches!(t, AutomationTarget::ImageBuiltin(_)))
             .cloned()
             .collect();
         let any = !to_remove.is_empty();
         for key in to_remove {
-            self.active_param_gestures.remove(&key);
-            if self.recording_mode == common::model::RecordingMode::Touch {
-                self.recording_last_beat.remove(&key);
+            self.recording.active_param_gestures.remove(&key);
+            if self.recording.recording_mode == common::model::RecordingMode::Touch {
+                self.recording.recording_last_beat.remove(&key);
             }
         }
         if any {
@@ -13094,7 +12288,7 @@ impl AppData {
         let Some(target_clip) = self.selected_clip_ref() else {
             return;
         };
-        let Some(track) = self.song.tracks.get(target_clip.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(target_clip.track as usize) else {
             return;
         };
         let track_id = track.id;
@@ -13113,14 +12307,14 @@ impl AppData {
                 .iter()
                 .any(|l| l.enabled && l.target == target);
             if has_lane {
-                self.active_param_gestures.insert((track_id, target.clone()));
+                self.recording.active_param_gestures.insert((track_id, target.clone()));
                 if matches!(
-                    self.recording_mode,
+                    self.recording.recording_mode,
                     common::model::RecordingMode::Latch
                         | common::model::RecordingMode::Write
-                ) && self.is_playing
+                ) && self.transport.is_playing
                 {
-                    self.latched_param_gestures.insert((track_id, target));
+                    self.recording.latched_param_gestures.insert((track_id, target));
                 }
                 seeded = true;
             }
@@ -13136,16 +12330,16 @@ impl AppData {
     fn end_text_pip_drag_recording(&mut self) {
         use common::model::AutomationTarget;
         let to_remove: Vec<(u32, AutomationTarget)> = self
-            .active_param_gestures
+            .recording.active_param_gestures
             .iter()
             .filter(|(_, t)| matches!(t, AutomationTarget::TextBuiltin(_)))
             .cloned()
             .collect();
         let any = !to_remove.is_empty();
         for key in to_remove {
-            self.active_param_gestures.remove(&key);
-            if self.recording_mode == common::model::RecordingMode::Touch {
-                self.recording_last_beat.remove(&key);
+            self.recording.active_param_gestures.remove(&key);
+            if self.recording.recording_mode == common::model::RecordingMode::Touch {
+                self.recording.recording_last_beat.remove(&key);
             }
         }
         if any {
@@ -13159,7 +12353,7 @@ impl AppData {
     /// で `image_pip_drag_active() || text_pip_drag_active()` の OR で
     /// 使う。
     fn text_pip_drag_active(&self) -> bool {
-        self.active_param_gestures
+        self.recording.active_param_gestures
             .iter()
             .any(|(_, t)| matches!(t, common::model::AutomationTarget::TextBuiltin(_)))
     }
@@ -13176,20 +12370,20 @@ impl AppData {
             return;
         };
         let target = AutomationTarget::ImageBuiltin(field);
-        let Some(track) = self.song.tracks.get_mut(target_clip.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get_mut(target_clip.track as usize) else {
             return;
         };
         let before = track.automation_lanes.len();
         track.automation_lanes.retain(|l| l.target != target);
         let removed = before - track.automation_lanes.len();
         if removed == 0 {
-            self.status_message = format!(
+            self.ui_ephemeral.status_message = format!(
                 "Image Automation: {} lane が見つかりません",
                 automation_target_display_name(&target)
             );
             return;
         }
-        self.status_message = format!(
+        self.ui_ephemeral.status_message = format!(
             "Image Automation lane '{}' を削除しました",
             automation_target_display_name(&target)
         );
@@ -13204,19 +12398,19 @@ impl AppData {
     fn add_group_automation_lane(&mut self, param: common::model::GroupTransformParam) {
         use common::model::{AutomationLane, AutomationTarget};
         let Some(track_id) = self.cursor_track_id() else {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Group Transform: group track を選択してください".into();
             return;
         };
         let target = AutomationTarget::GroupTransform(param);
-        if let Some(track) = self.song.track_by_id_mut(track_id)
+        if let Some(track) = self.song_doc.song().track_by_id_mut(track_id)
             && let Some(lane) =
                 track.automation_lanes.iter_mut().find(|l| l.target == target)
         {
             lane.visible = true;
             lane.enabled = true;
-            self.expanded_automation_tracks.insert(track_id);
-            self.status_message = format!(
+            self.ui_prefs.expanded_automation_tracks.insert(track_id);
+            self.ui_ephemeral.status_message = format!(
                 "Group Automation lane '{}' は既に存在します",
                 automation_target_display_name(&target)
             );
@@ -13224,27 +12418,33 @@ impl AppData {
             return;
         }
         let gt = self
-            .song
+            .song_doc.song()
             .track_by_id(track_id)
             .and_then(|t| t.group_transform)
             .unwrap_or_default();
         let default_value = f64::from(group_transform_field(&gt, param));
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
-            return;
-        };
-        let lane_id = track.alloc_lane_id();
-        track.automation_lanes.push(AutomationLane {
-            id: lane_id,
-            target: target.clone(),
-            default_value,
-            enabled: true,
-            visible: true,
-            height_px: 60,
-            clips: Vec::new(),
-            next_clip_id: 1,
+        let __applied = self.edit_song_checked(|song| {
+            let Some(track) = song.track_by_id_mut(track_id) else {
+                return false;
+            };
+            let lane_id = track.alloc_lane_id();
+            track.automation_lanes.push(AutomationLane {
+                id: lane_id,
+                target: target.clone(),
+                default_value,
+                enabled: true,
+                visible: true,
+                height_px: 60,
+                clips: Vec::new(),
+                next_clip_id: 1,
+            });
+            true
         });
-        self.expanded_automation_tracks.insert(track_id);
-        self.status_message = format!(
+        if !__applied {
+            return;
+        }
+        self.ui_prefs.expanded_automation_tracks.insert(track_id);
+        self.ui_ephemeral.status_message = format!(
             "Added group automation lane: {}",
             automation_target_display_name(&target)
         );
@@ -13261,19 +12461,19 @@ impl AppData {
             return;
         };
         let target = AutomationTarget::GroupTransform(param);
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
+        let Some(track) = self.song_doc.song().track_by_id_mut(track_id) else {
             return;
         };
         let before = track.automation_lanes.len();
         track.automation_lanes.retain(|l| l.target != target);
         if before == track.automation_lanes.len() {
-            self.status_message = format!(
+            self.ui_ephemeral.status_message = format!(
                 "Group Automation: {} lane が見つかりません",
                 automation_target_display_name(&target)
             );
             return;
         }
-        self.status_message = format!(
+        self.ui_ephemeral.status_message = format!(
             "Group Automation lane '{}' を削除しました",
             automation_target_display_name(&target)
         );
@@ -13290,21 +12490,27 @@ impl AppData {
         value: f32,
     ) {
         use common::model::GroupTransformParam as G;
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
+        let __applied = self.edit_song_checked(|song| {
+            let Some(track) = song.track_by_id_mut(track_id) else {
+                return false;
+            };
+            let gt = track.group_transform.get_or_insert_with(Default::default);
+            match param {
+                G::X => gt.x = value,
+                G::Y => gt.y = value,
+                G::Rotation => gt.rotation_radians = value,
+                G::ScaleX => gt.scale_x = value,
+                G::ScaleY => gt.scale_y = value,
+                G::AnchorX => gt.anchor_x = value,
+                G::AnchorY => gt.anchor_y = value,
+                G::Opacity => gt.opacity = value,
+            }
+            true
+        });
+        if !__applied {
             return;
-        };
-        let gt = track.group_transform.get_or_insert_with(Default::default);
-        match param {
-            G::X => gt.x = value,
-            G::Y => gt.y = value,
-            G::Rotation => gt.rotation_radians = value,
-            G::ScaleX => gt.scale_x = value,
-            G::ScaleY => gt.scale_y = value,
-            G::AnchorX => gt.anchor_x = value,
-            G::AnchorY => gt.anchor_y = value,
-            G::Opacity => gt.opacity = value,
         }
-        self.last_touched_param = Some(TouchedParam {
+        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target: common::model::AutomationTarget::GroupTransform(param),
             display_name: format!("Group {}", group_param_label(param)),
@@ -13316,7 +12522,7 @@ impl AppData {
     /// video / text 表示 clip を持つ track が 1 つでもある、または既に
     /// `group_transform` データを持つなら true。inspector / 合成の gate。
     pub fn group_has_visual_content(&self, group_track_id: u32) -> bool {
-        crate::group_compose::group_has_visual_content(&self.song, group_track_id)
+        crate::group_compose::group_has_visual_content(&self.song_doc.song(), group_track_id)
     }
 
     /// group inspector 用 summary。cursor track が visual group なら、各 param に
@@ -13327,11 +12533,11 @@ impl AppData {
         // Transform もチェーン行の "GUI" ボタンでトグル開閉する（他 FX と統一、
         // 出っぱなしにしない）。開いている device が cursor track の Transform 配置 device の
         // ときだけ Group Transform セクションを出す。
-        let (open_track, open_idx) = self.open_video_fx_params?;
+        let (open_track, open_idx) = self.ui_ephemeral.open_video_fx_params?;
         if self.cursor_track_id() != Some(open_track) {
             return None;
         }
-        let track = self.song.track_by_id(open_track)?;
+        let track = self.song_doc.song().track_by_id(open_track)?;
         if track.devices.get(open_idx as usize).map(|d| d.plugin_id.as_str())
             != Some(common::video_fx::TRANSFORM_ID)
         {
@@ -13354,12 +12560,12 @@ impl AppData {
     /// track と一致するとき、その device の def + 各 param の現在実値を返す。inspector が
     /// scrubable_number 行に展開する（Group Transform セクションと同 idiom）。
     pub fn inspector_video_fx_params(&self) -> Option<VideoFxParamsInspector> {
-        let (track_id, device_index) = self.open_video_fx_params?;
+        let (track_id, device_index) = self.ui_ephemeral.open_video_fx_params?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
         let def = self
-            .song
+            .song_doc.song()
             .fx_chain_by_track_id(track_id)?
             .get(device_index as usize)
             .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))?;
@@ -13369,19 +12575,23 @@ impl AppData {
         let empty: &[common::model::AutomationLane] = &[];
         let lanes: &[common::model::AutomationLane] =
             if track_id == common::model::MASTER_TRACK_ID {
-                &self.song.song_lanes
+                &self.song_doc.song().song_lanes
             } else {
-                self.song
+                self.song_doc.song()
                     .track_by_id(track_id)
                     .map_or(empty, |t| t.automation_lanes.as_slice())
             };
+        // v29: lane target は安定 device_id。 panel の positional index から
+        // 解決する。
+        let device_id = device_id_at(&self.song_doc.song(), track_id, device_index)?;
         let values: Vec<f32> = def
             .params
             .iter()
             .map(|p| {
                 let target = common::model::AutomationTarget::PluginParam {
-                    device_index,
+                    device_id,
                     param_id: p.id,
+                    legacy_device_index: None,
                     legacy_slot: None,
                 };
                 // base = lane default_value、無ければ manifest default（実レンジ表示）。
@@ -13403,9 +12613,9 @@ impl AppData {
         let Some(track_id) = self.cursor_track_id() else {
             return;
         };
-        // def_by_id は &'static を返すので self.song の借用はここで終わる。
+        // def_by_id は &'static を返すので self.song_doc.song() の借用はここで終わる。
         let Some(def) = self
-            .song
+            .song_doc.song()
             .fx_chain_by_track_id(track_id)
             .and_then(|c| c.get(device_index as usize))
             .and_then(|d| common::video_fx::def_by_id(&d.plugin_id))
@@ -13417,18 +12627,27 @@ impl AppData {
         };
         let display_name = format!("{} {}", def.name, param.name);
         let norm = param.kind.real_to_norm(value_real);
-        let target = AutomationTarget::PluginParam { device_index, param_id, legacy_slot: None };
+        // v29: 安定 device_id で target を組む。
+        let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, device_index) else {
+            return;
+        };
+        let target = AutomationTarget::PluginParam {
+            device_id,
+            param_id,
+            legacy_device_index: None,
+            legacy_slot: None,
+        };
         if track_id == common::model::MASTER_TRACK_ID {
-            if let Some(lane) = self.song.song_lanes.iter_mut().find(|l| l.target == target) {
+            if let Some(lane) = self.song_doc.song().song_lanes.iter_mut().find(|l| l.target == target) {
                 lane.default_value = norm;
             } else {
-                let id = self.song.alloc_song_lane_id();
+                let id = self.song_doc.song().alloc_song_lane_id();
                 let mut lane = AutomationLane::new(target.clone(), norm);
                 lane.id = id;
                 lane.visible = false;
-                self.song.song_lanes.push(lane);
+                self.edit_song(|song| song.song_lanes.push(lane));
             }
-        } else if let Some(track) = self.song.track_by_id_mut(track_id) {
+        } else if let Some(track) = self.song_doc.song().track_by_id_mut(track_id) {
             if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
                 lane.default_value = norm;
             } else {
@@ -13440,7 +12659,7 @@ impl AppData {
             }
         }
         // 「A」キー (last_touched_param) で automation lane を可視化/curve 化できる。
-        self.last_touched_param = Some(TouchedParam {
+        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target,
             display_name,
@@ -13455,29 +12674,31 @@ impl AppData {
     /// Talk / Text Event) が `*_param_panel_open()` gate で Par パネルとして描画される
     /// ので、 ここでは `None` (= 汎用パネルは出さない)。
     pub fn inspector_plugin_params(&self) -> Option<PluginParamsInspector> {
-        let (track_id, device_index) = self.open_plugin_params?;
+        let (track_id, device_index) = self.ui_ephemeral.open_plugin_params?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
         let device = self
-            .song
+            .song_doc.song()
             .fx_chain_by_track_id(track_id)?
             .get(device_index as usize)?;
-        let plugin_name = resolve_plugin_name(&self.plugin_db, &device.plugin_id);
+        let plugin_name = resolve_plugin_name(&self.ipc.plugin_db, &device.plugin_id);
 
         // param 行: lane default_value (無ければ info.default_value を正規化) を
         // 実レンジへ。 HIDDEN は出さない。
         let empty: &[common::model::AutomationLane] = &[];
         let lanes: &[common::model::AutomationLane] =
             if track_id == common::model::MASTER_TRACK_ID {
-                &self.song.song_lanes
+                &self.song_doc.song().song_lanes
             } else {
-                self.song
+                self.song_doc.song()
                     .track_by_id(track_id)
                     .map_or(empty, |t| t.automation_lanes.as_slice())
             };
+        // v29: lane target は安定 device_id で照合する。
+        let device_id = device.id;
         let params: Vec<PluginParamRow> = self
-            .plugin_params
+            .ipc.plugin_params
             .get(&(track_id, device_index))
             .map(|infos| {
                 infos
@@ -13488,8 +12709,9 @@ impl AppData {
                     .map(|p| {
                         let span = p.max_value - p.min_value;
                         let target = common::model::AutomationTarget::PluginParam {
-                            device_index,
+                            device_id,
                             param_id: p.id,
+                            legacy_device_index: None,
                             legacy_slot: None,
                         };
                         let norm = lanes.iter().find(|l| l.target == target).map_or_else(
@@ -13536,11 +12758,11 @@ impl AppData {
     /// 「Par」パネルが開いている device の plugin_id (cursor track 上)。
     /// VOICEVOX / 字幕 など専用セクションを持つ builtin の Par 開閉判定に使う。
     fn open_param_panel_plugin_id(&self) -> Option<&str> {
-        let (track_id, idx) = self.open_plugin_params?;
+        let (track_id, idx) = self.ui_ephemeral.open_plugin_params?;
         if self.cursor_track_id() != Some(track_id) {
             return None;
         }
-        self.song
+        self.song_doc.song()
             .fx_chain_by_track_id(track_id)?
             .get(idx as usize)
             .map(|d| d.plugin_id.as_str())
@@ -13584,7 +12806,7 @@ impl AppData {
     ) {
         use common::model::{AutomationLane, AutomationTarget};
         let Some(info) = self
-            .plugin_params
+            .ipc.plugin_params
             .get(&(track_id, device_index))
             .and_then(|v| v.iter().find(|p| p.id == param_id))
             .cloned()
@@ -13602,18 +12824,27 @@ impl AppData {
         } else {
             ((value_real - info.min_value) / span).clamp(0.0, 1.0)
         };
-        let target = AutomationTarget::PluginParam { device_index, param_id, legacy_slot: None };
+        // v29: 安定 device_id で target を組む。
+        let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, device_index) else {
+            return;
+        };
+        let target = AutomationTarget::PluginParam {
+            device_id,
+            param_id,
+            legacy_device_index: None,
+            legacy_slot: None,
+        };
         if track_id == common::model::MASTER_TRACK_ID {
-            if let Some(lane) = self.song.song_lanes.iter_mut().find(|l| l.target == target) {
+            if let Some(lane) = self.song_doc.song().song_lanes.iter_mut().find(|l| l.target == target) {
                 lane.default_value = norm;
             } else {
-                let id = self.song.alloc_song_lane_id();
+                let id = self.song_doc.song().alloc_song_lane_id();
                 let mut lane = AutomationLane::new(target.clone(), norm);
                 lane.id = id;
                 lane.visible = false;
-                self.song.song_lanes.push(lane);
+                self.edit_song(|song| song.song_lanes.push(lane));
             }
-        } else if let Some(track) = self.song.track_by_id_mut(track_id) {
+        } else if let Some(track) = self.song_doc.song().track_by_id_mut(track_id) {
             if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
                 lane.default_value = norm;
             } else {
@@ -13624,7 +12855,7 @@ impl AppData {
                 track.automation_lanes.push(lane);
             }
         }
-        self.last_touched_param = Some(TouchedParam {
+        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target,
             display_name,
@@ -13643,12 +12874,12 @@ impl AppData {
     ) {
         use common::model::{AutomationLane, AutomationTarget};
         let Some(target_clip) = self.selected_clip_ref() else {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Text Automation: text clip を選択してください".into();
             return;
         };
         let track_id_opt = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target_clip.track as usize)
             .map(|t| t.id);
@@ -13658,7 +12889,7 @@ impl AppData {
         let target = AutomationTarget::TextBuiltin(field);
 
         // 既存 lane があれば visible / enabled だけを true に。
-        if let Some(track) = self.song.track_by_id_mut(track_id)
+        if let Some(track) = self.song_doc.song().track_by_id_mut(track_id)
             && let Some(lane) = track
                 .automation_lanes
                 .iter_mut()
@@ -13666,8 +12897,8 @@ impl AppData {
         {
             lane.visible = true;
             lane.enabled = true;
-            self.expanded_automation_tracks.insert(track_id);
-            self.status_message = format!(
+            self.ui_prefs.expanded_automation_tracks.insert(track_id);
+            self.ui_ephemeral.status_message = format!(
                 "Text Automation lane '{}' は既に存在します",
                 automation_target_display_name(&target)
             );
@@ -13686,22 +12917,28 @@ impl AppData {
         };
         let default_value = self.lane_default_for_target(&touched);
 
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
-            return;
-        };
-        let lane_id = track.alloc_lane_id();
-        track.automation_lanes.push(AutomationLane {
-            id: lane_id,
-            target: target.clone(),
-            default_value,
-            enabled: true,
-            visible: true,
-            height_px: 60,
-            clips: Vec::new(),
-            next_clip_id: 1,
+        let __applied = self.edit_song_checked(|song| {
+            let Some(track) = song.track_by_id_mut(track_id) else {
+                return false;
+            };
+            let lane_id = track.alloc_lane_id();
+            track.automation_lanes.push(AutomationLane {
+                id: lane_id,
+                target: target.clone(),
+                default_value,
+                enabled: true,
+                visible: true,
+                height_px: 60,
+                clips: Vec::new(),
+                next_clip_id: 1,
+            });
+            true
         });
-        self.expanded_automation_tracks.insert(track_id);
-        self.status_message = format!(
+        if !__applied {
+            return;
+        }
+        self.ui_prefs.expanded_automation_tracks.insert(track_id);
+        self.ui_ephemeral.status_message = format!(
             "Added text automation lane: {}",
             automation_target_display_name(&target)
         );
@@ -13720,7 +12957,7 @@ impl AppData {
             return;
         };
         let target = AutomationTarget::TextBuiltin(field);
-        let Some(track) = self.song.tracks.get_mut(target_clip.track as usize)
+        let Some(track) = self.song_doc.song().tracks.get_mut(target_clip.track as usize)
         else {
             return;
         };
@@ -13728,13 +12965,13 @@ impl AppData {
         track.automation_lanes.retain(|l| l.target != target);
         let removed = before - track.automation_lanes.len();
         if removed == 0 {
-            self.status_message = format!(
+            self.ui_ephemeral.status_message = format!(
                 "Text Automation: {} lane が見つかりません",
                 automation_target_display_name(&target)
             );
             return;
         }
-        self.status_message = format!(
+        self.ui_ephemeral.status_message = format!(
             "Text Automation lane '{}' を削除しました",
             automation_target_display_name(&target)
         );
@@ -13755,17 +12992,17 @@ impl AppData {
     /// 操作してもらう方が安全。
     fn handle_child_disconnected(&mut self, kind: common::protocol::ChildKind) {
         use common::protocol::ChildKind;
-        let was_playing = self.is_playing;
-        self.is_playing = false;
-        self.pending_play = false;
-        self.active_param_gestures.clear();
-        self.latched_param_gestures.clear();
+        let was_playing = self.transport.is_playing;
+        self.transport.is_playing = false;
+        self.transport.pending_play = false;
+        self.recording.active_param_gestures.clear();
+        self.recording.latched_param_gestures.clear();
         // 音声 render 中の crash で export を中止したか。respawn 成功時の status に
         // 「書き出しを中止しました」を併記して、中止の事実が上書きで消えないようにする。
         let mut export_aborted = false;
         match kind {
             ChildKind::Audio => {
-                self.audio_tx = None;
+                self.ipc.audio_tx = None;
                 // 音声 render 中の crash なら ExportWavComplete が永遠に来ない。
                 // export を強制終了して overlay / 入力 gate を解除する（解除しないと
                 // GUI が永久ロックする）。AudioRender 中でなければ no-op。中止した
@@ -13777,9 +13014,9 @@ impl AppData {
                 tracing::warn!("daw_audio child disconnected");
             }
             ChildKind::PluginHost => {
-                self.plugin_tx = None;
-                self.pending_plugin_loads.clear();
-                self.loaded_slots.clear();
+                self.ipc.plugin_tx = None;
+                self.ipc.pending_plugin_loads.clear();
+                self.ipc.loaded_slots.clear();
                 // plugin state 取得待ちの round-trip はもう完了しない
                 // (host 消滅で AllStatesReceived が来ない)。 stale な queue / 保留ガードを
                 // 破棄して GUI の恒久ロックを防ぐ。 hang watchdog (`abort_state_roundtrip`)
@@ -13792,10 +13029,10 @@ impl AppData {
         // が永遠に来ない。 pending を放置すると以後の bounce が全て「既に bounce 中」
         // で拒否され、 audio 側は isolated song のまま残る。 abort_audio_export と
         // 同型の脱出口 (どちらの子の crash でも安全に解除できる)。
-        if self.pending_clip_fx_bounce.take().is_some()
-            || self.pending_vocal_synth_bounce.take().is_some()
+        if self.ipc.pending_clip_fx_bounce.take().is_some()
+            || self.ipc.pending_vocal_synth_bounce.take().is_some()
         {
-            self.send_plugin(MainToChild::SetRenderMode(
+            self.send_plugin(PluginCommand::SetRenderMode(
                 common::protocol::RenderMode::Realtime,
             ));
             self.restore_engine_song_after_bounce();
@@ -13816,16 +13053,16 @@ impl AppData {
         const CRASH_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
         const CRASH_LIMIT: usize = 3;
         let now = std::time::Instant::now();
-        self.child_disconnect_log
+        self.ipc.child_disconnect_log
             .retain(|(_, t)| now.duration_since(*t) < CRASH_WINDOW);
-        self.child_disconnect_log.push((kind, now));
+        self.ipc.child_disconnect_log.push((kind, now));
         let recent = self
-            .child_disconnect_log
+            .ipc.child_disconnect_log
             .iter()
             .filter(|(k, _)| *k == kind)
             .count();
         if recent >= CRASH_LIMIT {
-            self.status_message = format!(
+            self.ui_ephemeral.status_message = format!(
                 "{}が繰り返しクラッシュしています — 自動再起動を停止しました。\
                  プロジェクトのプラグインを確認してください{}{}",
                 kind.as_str(),
@@ -13842,8 +13079,8 @@ impl AppData {
 
         // supervisor 経由で respawn を試みる。 supervisor が None
         // (= script / test 経路) なら通知だけで終わる。
-        let Some(supervisor) = self.supervisor.clone() else {
-            self.status_message = format!(
+        let Some(supervisor) = self.ipc.supervisor.clone() else {
+            self.ui_ephemeral.status_message = format!(
                 "{}が切断されました{}{} — supervisor 無効",
                 kind.as_str(),
                 if was_playing { " (再生停止)" } else { "" },
@@ -13851,19 +13088,42 @@ impl AppData {
             );
             return;
         };
-        match supervisor.respawn(kind) {
-            Ok(new_tx) => {
-                match kind {
-                    ChildKind::Audio => self.audio_tx = Some(new_tx),
-                    ChildKind::PluginHost => self.plugin_tx = Some(new_tx),
+        // v29: pipe の型分割に伴い respawn も kind 別 API。 どちらも
+        // worker pool を新世代で mint するので、 生き残っている側の子にも
+        // `CloseWorkerPool` + 新世代 `OpenWorkerPool` を送って pair を
+        // 揃える (旧世代の poisoned pair / stale auto-reset signal を
+        // 名前空間ごと捨てる — `common::plugin_ref` の contract)。
+        let respawn_result: anyhow::Result<()> = match kind {
+            ChildKind::Audio => supervisor.respawn_audio().map(|r| {
+                self.ipc.audio_tx = Some(r.tx);
+                // (v29 §3) 新 Hello の device_sample_rate を採用した session
+                // に合わせて、 GUI 側の拍↔sample 変換の複製も更新する。
+                if self.ipc.sample_rate != r.sample_rate {
+                    tracing::info!(
+                        old = self.ipc.sample_rate,
+                        new = r.sample_rate,
+                        "audio respawn changed the session sample rate"
+                    );
+                    self.ipc.sample_rate = r.sample_rate;
                 }
+                self.send_plugin(common::protocol::PluginCommand::CloseWorkerPool);
+                self.send_plugin(r.pool.to_plugin_cmd());
+            }),
+            ChildKind::PluginHost => supervisor.respawn_plugin().map(|r| {
+                self.ipc.plugin_tx = Some(r.tx);
+                self.send_audio(common::protocol::AudioCommand::CloseWorkerPool);
+                self.send_audio(r.pool.to_audio_cmd());
+            }),
+        };
+        match respawn_result {
+            Ok(()) => {
                 // state restore: project_dir + LoadSong (= sync_song_to
                 // _plugin_host 経路)、 plugin slots は restore_plugin_from
                 // _song で SetSlotPlugin 再送。
-                let song_snapshot = self.song.clone();
+                let song_snapshot = self.song_doc.song().clone();
                 self.restore_plugin_from_song(&song_snapshot);
                 self.sync_song_to_plugin_host();
-                self.status_message = format!(
+                self.ui_ephemeral.status_message = format!(
                     "{}を再起動しました{}{}",
                     kind.as_str(),
                     if was_playing { " (再生は手動で再開してください)" } else { "" },
@@ -13872,20 +13132,33 @@ impl AppData {
                 tracing::info!(?kind, "child respawn + state restore completed");
             }
             Err(e) => {
-                self.status_message = format!(
-                    "{}の再起動に失敗しました: {}{} — アプリ再起動が必要です",
-                    kind.as_str(),
-                    e,
-                    export_suffix
-                );
-                tracing::error!(error = %e, ?kind, "child respawn failed");
+                // (v29 §3) ビルド世代不一致は respawn を繰り返しても直らない。
+                // ユーザー向けに「make build」 を明示し、 これ以上の自動
+                // respawn には入らない (この handler は respawn 失敗時に
+                // 再試行しないので、 メッセージ差し替えだけで終端する)。
+                if e.is::<crate::bootstrap::FingerprintMismatch>() {
+                    self.ui_ephemeral.status_message = format!(
+                        "{} のビルドが古く protocol が一致しません — \
+                         make build を実行してください (daw_audio.exe / daw_plugin_host.exe)",
+                        kind.as_str()
+                    );
+                    tracing::error!(error = %e, ?kind, "child respawn refused: protocol fingerprint mismatch");
+                } else {
+                    self.ui_ephemeral.status_message = format!(
+                        "{}の再起動に失敗しました: {}{} — アプリ再起動が必要です",
+                        kind.as_str(),
+                        e,
+                        export_suffix
+                    );
+                    tracing::error!(error = %e, ?kind, "child respawn failed");
+                }
             }
         }
     }
 
     fn add_automation_from_last_touched(&mut self) {
-        let Some(touched) = self.last_touched_param.clone() else {
-            self.status_message =
+        let Some(touched) = self.ui_ephemeral.last_touched_param.clone() else {
+            self.ui_ephemeral.status_message =
                 "No parameter touched yet — drag any knob first".into();
             return;
         };
@@ -13900,21 +13173,21 @@ impl AppData {
                 | common::model::AutomationTarget::SongTimeSigNumerator
         ) || touched.track_id == common::model::MASTER_TRACK_ID;
         // song-level でない場合のみ touched track が削除済か検査。
-        if !is_song_level && self.song.track_by_id(touched.track_id).is_none() {
-            self.last_touched_param = None;
-            self.status_message =
+        if !is_song_level && self.song_doc.song().track_by_id(touched.track_id).is_none() {
+            self.ui_ephemeral.last_touched_param = None;
+            self.ui_ephemeral.status_message =
                 "Last-touched parameter's track was removed".into();
             return;
         }
         // 既存 lane を find (target 一致)。 master か track かで lookup 経路が分岐。
         let existing_lane_id: Option<u32> = if is_song_level {
-            self.song
+            self.song_doc.song()
                 .song_lanes
                 .iter()
                 .find(|l| l.target == touched.target)
                 .map(|l| l.id)
         } else {
-            self.song
+            self.song_doc.song()
                 .track_by_id(touched.track_id)
                 .and_then(|t| {
                     t.automation_lanes
@@ -13931,17 +13204,17 @@ impl AppData {
                 touched.track_id
             };
             if let Some(lane) =
-                self.song.automation_lane_by_key_mut(lookup_track_id, lane_id)
+                self.song_doc.song().automation_lane_by_key_mut(lookup_track_id, lane_id)
             {
                 lane.visible = true;
                 lane.enabled = true;
             }
             if is_song_level {
-                self.master_row_automation_expanded = true;
+                self.ui_prefs.master_row_automation_expanded = true;
             } else {
-                self.expanded_automation_tracks.insert(touched.track_id);
+                self.ui_prefs.expanded_automation_tracks.insert(touched.track_id);
             }
-            self.status_message = format!(
+            self.ui_ephemeral.status_message = format!(
                 "Automation lane '{}' は既に存在します",
                 touched.display_name
             );
@@ -13951,7 +13224,7 @@ impl AppData {
         // 新規 lane を作成。default_value は target に応じて現在値を引く。
         let default_value = self.lane_default_for_target(&touched);
         if is_song_level {
-            let lane_id = self.song.alloc_song_lane_id();
+            let lane_id = self.song_doc.song().alloc_song_lane_id();
             let new_lane = common::model::AutomationLane {
                 id: lane_id,
                 target: touched.target.clone(),
@@ -13962,27 +13235,33 @@ impl AppData {
                 clips: Vec::new(),
                 next_clip_id: 1,
             };
-            self.song.song_lanes.push(new_lane);
-            self.master_row_automation_expanded = true;
+            self.edit_song(|song| song.song_lanes.push(new_lane));
+            self.ui_prefs.master_row_automation_expanded = true;
         } else {
-            let Some(track) = self.song.track_by_id_mut(touched.track_id) else {
+            let __applied = self.edit_song_checked(|song| {
+                let Some(track) = song.track_by_id_mut(touched.track_id) else {
+                    return false;
+                };
+                let lane_id = track.alloc_lane_id();
+                let new_lane = common::model::AutomationLane {
+                    id: lane_id,
+                    target: touched.target.clone(),
+                    default_value,
+                    enabled: true,
+                    visible: true,
+                    height_px: 60,
+                    clips: Vec::new(),
+                    next_clip_id: 1,
+                };
+                track.automation_lanes.push(new_lane);
+                true
+            });
+            if !__applied {
                 return;
-            };
-            let lane_id = track.alloc_lane_id();
-            let new_lane = common::model::AutomationLane {
-                id: lane_id,
-                target: touched.target.clone(),
-                default_value,
-                enabled: true,
-                visible: true,
-                height_px: 60,
-                clips: Vec::new(),
-                next_clip_id: 1,
-            };
-            track.automation_lanes.push(new_lane);
-            self.expanded_automation_tracks.insert(touched.track_id);
+            }
+            self.ui_prefs.expanded_automation_tracks.insert(touched.track_id);
         }
-        self.status_message = format!(
+        self.ui_ephemeral.status_message = format!(
             "Added automation lane: {}",
             touched.display_name
         );
@@ -13997,7 +13276,7 @@ impl AppData {
         use common::model::{AutomationTarget, TrackBuiltinParam};
         match &touched.target {
             AutomationTarget::TrackBuiltin(param) => {
-                let Some(track) = self.song.track_by_id(touched.track_id) else {
+                let Some(track) = self.song_doc.song().track_by_id(touched.track_id) else {
                     return 0.0;
                 };
                 match param {
@@ -14011,9 +13290,11 @@ impl AppData {
                         }
                     }
                     // A6 (r.md #8): send gain の現在値は model にある。
-                    TrackBuiltinParam::SendGain { send_idx } => track
+                    // v29: 安定 send id 一致で引く。
+                    TrackBuiltinParam::SendGain { send_id, .. } => track
                         .sends
-                        .get(*send_idx as usize)
+                        .iter()
+                        .find(|s| s.id == *send_id)
                         .map_or(0.0, |s| f64::from(s.gain)),
                 }
             }
@@ -14022,18 +13303,18 @@ impl AppData {
             AutomationTarget::PluginParam { .. } => self
                 .current_plain_value(touched.track_id, &touched.target)
                 .unwrap_or(0.0),
-            AutomationTarget::SongTempo => f64::from(self.song.bpm),
-            AutomationTarget::SongTimeSigNumerator => f64::from(self.song.time_sig.0),
+            AutomationTarget::SongTempo => f64::from(self.song_doc.song().bpm),
+            AutomationTarget::SongTimeSigNumerator => f64::from(self.song_doc.song().time_sig.0),
             // Image PiP default: 同 track の最初の image clip の first
             // event 値を初期値に使う。 1 つも image clip が無い (= lane
             // を空 image track で先行追加するケース) は 0.0 fallback。
             AutomationTarget::ImageBuiltin(field) => {
                 use common::model::{ClipContent, ImageBuiltinParam};
-                let Some(track) = self.song.track_by_id(touched.track_id) else {
+                let Some(track) = self.song_doc.song().track_by_id(touched.track_id) else {
                     return 0.0;
                 };
                 let event = track.clips.iter().find_map(|c| {
-                    self.song
+                    self.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
                         .and_then(|content| match content {
@@ -14056,11 +13337,11 @@ impl AppData {
             // ごとの常識値 (色 RGBA は (1,1,1,1) や (0,0,0,1) 等)。
             AutomationTarget::TextBuiltin(field) => {
                 use common::model::{ClipContent, TextBuiltinParam as T};
-                let Some(track) = self.song.track_by_id(touched.track_id) else {
+                let Some(track) = self.song_doc.song().track_by_id(touched.track_id) else {
                     return 0.0;
                 };
                 let event = track.clips.iter().find_map(|c| {
-                    self.song
+                    self.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
                         .and_then(|content| match content {
@@ -14121,7 +13402,7 @@ impl AppData {
             AutomationTarget::GroupTransform(param) => {
                 use common::model::GroupTransformParam as G;
                 let gt = self
-                    .song
+                    .song_doc.song()
                     .track_by_id(touched.track_id)
                     .and_then(|t| t.group_transform)
                     .unwrap_or_default();
@@ -14144,7 +13425,7 @@ impl AppData {
             return;
         }
         for k in keys {
-            let Some(lane) = self.song.automation_lane_by_key_mut(k.track, k.lane) else {
+            let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(k.track, k.lane) else {
                 continue;
             };
             if let Some(idx) = lane.clip_index_by_id(k.clip) {
@@ -14152,7 +13433,7 @@ impl AppData {
             }
         }
         // 選択中だった clip があれば selection からも除く。
-        self.selected_automation_clips
+        self.selection.selected_automation_clips
             .retain(|sel| !keys.iter().any(|k| k == sel));
         self.sync_song_to_plugin_host();
     }
@@ -14170,7 +13451,7 @@ impl AppData {
             }
         }
         // Validate all ids exist before mutating anything.
-        if child_ids.iter().any(|id| self.song.track_by_id(*id).is_none()) {
+        if child_ids.iter().any(|id| self.song_doc.song().track_by_id(*id).is_none()) {
             tracing::warn!(?child_ids, "group request: stale track id, abort");
             return;
         }
@@ -14184,7 +13465,7 @@ impl AppData {
             .iter()
             .copied()
             .filter(|id| {
-                self.song
+                self.song_doc.song()
                     .track_by_id(*id)
                     .and_then(|t| t.parent_group_id)
                     .is_none_or(|pid| !selected.contains(&pid))
@@ -14198,19 +13479,19 @@ impl AppData {
         // Live 互換、 視覚的には「子の上にヘッダー行」。
         let top_child_idx = child_ids
             .iter()
-            .filter_map(|id| self.song.track_index_by_id(*id))
+            .filter_map(|id| self.song_doc.song().track_index_by_id(*id))
             .min()
-            .unwrap_or(self.song.tracks.len());
+            .unwrap_or(self.song_doc.song().tracks.len());
         // Inherit the common parent of the selection if every selected
         // track shared the same `parent_group_id` — preserves Live's
         // behaviour of grouping inside a group keeps you in the parent.
         let common_parent = {
             let first_parent = self
-                .song
+                .song_doc.song()
                 .track_by_id(roots[0])
                 .and_then(|t| t.parent_group_id);
             if roots.iter().all(|id| {
-                self.song
+                self.song_doc.song()
                     .track_by_id(*id)
                     .and_then(|t| t.parent_group_id)
                     == first_parent
@@ -14220,8 +13501,8 @@ impl AppData {
                 None
             }
         };
-        let group_id = self.song.alloc_track_id();
-        let group_index = self.song.tracks.len() + 1;
+        let group_id = self.song_doc.song().alloc_track_id();
+        let group_index = self.song_doc.song().tracks.len() + 1;
         let group_track = track_with(|t| {
             t.id = group_id;
             t.name = format!("Group {group_index}");
@@ -14237,20 +13518,22 @@ impl AppData {
         // 子孫 (= 親が選択集合内のトラック) は元の親に残すことで、 内側
         // グループの入れ子が保たれる。
         for &cid in &roots {
-            if let Some(t) = self.song.track_by_id_mut(cid) {
-                t.parent_group_id = Some(group_id);
-            }
+            self.edit_song(|song| {
+                if let Some(t) = song.track_by_id_mut(cid) {
+                    t.parent_group_id = Some(group_id);
+                }
+            });
         }
         // 仕様 §4: 「一番上の選択 track の直前」 に挿入 (= 子の上に
         // ヘッダー)。 PR2.1 で plugin_host の chains を `Track::id`
         // ベースに改修した結果、 Vec::insert で既存 track の Vec
         // position が shift しても plugin chain の lookup は壊れない
         // (engine の `slot_to_plugin_id` も (track_id, slot) ベース)。
-        let insert_at = top_child_idx.min(self.song.tracks.len());
-        self.song.tracks.insert(insert_at, group_track);
+        let insert_at = top_child_idx.min(self.song_doc.song().tracks.len());
+        self.edit_song(|song| song.tracks.insert(insert_at, group_track));
         // 新規 group track を選択状態に (Live 互換: グループ化直後は
         // 親 group が selection cursor になる)。
-        self.selected_track_ids = vec![group_id];
+        self.selection.selected_track_ids = vec![group_id];
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
         tracing::info!(group_id, ?child_ids, "grouped tracks");
@@ -14270,13 +13553,13 @@ impl AppData {
     ///    unmap する。 (1) で audio 側はもう触らないので安全。
     pub fn plan_track_removal_ipc(
         track_ids: &[u32],
-        track_plugin_ids: &std::collections::HashMap<u32, Vec<u32>>,
+        track_plugin_ids: &std::collections::HashMap<u32, Vec<u64>>,
     ) -> Vec<TrackRemovalIpc> {
         let mut plan = Vec::new();
         for track_id in track_ids {
-            if let Some(pids) = track_plugin_ids.get(track_id) {
-                for pid in pids {
-                    plan.push(TrackRemovalIpc::CloseAudioShmem { plugin_id: *pid });
+            if let Some(device_ids) = track_plugin_ids.get(track_id) {
+                for device_id in device_ids {
+                    plan.push(TrackRemovalIpc::CloseAudioShmem { device_id: *device_id });
                 }
             }
             plan.push(TrackRemovalIpc::RemoveTrackFromPluginHost { track_id: *track_id });
@@ -14298,7 +13581,6 @@ impl AppData {
             return;
         }
         if !self.song_has_plugin() {
-            self.push_undo_snapshot();
             self.action_ungroup_tracks_inner(track_ids);
             return;
         }
@@ -14330,11 +13612,11 @@ impl AppData {
         // 深さ降順 (子から先に処理)。 同階層なら index 大きい方から。
         groups_to_ungroup.sort_by_key(|id| {
             let depth = self
-                .song
+                .song_doc.song()
                 .track_by_id(*id)
                 .map(|t| self.compute_track_depth(t))
                 .unwrap_or(0);
-            (-(depth as i32), -(self.song.track_index_by_id(*id).unwrap_or(0) as i32))
+            (-(depth as i32), -(self.song_doc.song().track_index_by_id(*id).unwrap_or(0) as i32))
         });
 
         // 各 group の plugin chain snapshot を **削除前に** 取得して
@@ -14342,30 +13624,30 @@ impl AppData {
         // remove した後では取得できない。
         let group_snapshots: Vec<(u32, common::model::Track)> = groups_to_ungroup
             .iter()
-            .filter_map(|gid| self.song.track_by_id(*gid).map(|t| (*gid, t.clone())))
+            .filter_map(|gid| self.song_doc.song().track_by_id(*gid).map(|t| (*gid, t.clone())))
             .collect();
 
         let mut new_selection: Vec<u32> = Vec::new();
         for group_id in &groups_to_ungroup {
-            let Some(group_track) = self.song.track_by_id(*group_id) else {
+            let Some(group_track) = self.song_doc.song().track_by_id(*group_id) else {
                 continue;
             };
             let new_parent = group_track.parent_group_id;
-            for t in &mut self.song.tracks {
+            for t in &mut self.song_doc.song().tracks {
                 if t.parent_group_id == Some(*group_id) {
                     t.parent_group_id = new_parent;
                     new_selection.push(t.id);
                 }
             }
-            if let Some(pos) = self.song.tracks.iter().position(|t| t.id == *group_id) {
+            if let Some(pos) = self.song_doc.song().tracks.iter().position(|t| t.id == *group_id) {
                 #[cfg(windows)]
                 {
-                    self.open_plugin_guis.retain(|&(t, _)| t != *group_id);
+                    self.ipc.open_plugin_guis.retain(|&(t, _)| t != *group_id);
                 }
-                self.loaded_slots.retain(|(t, _), _| *t != *group_id);
-                self.song.tracks.remove(pos);
+                self.ipc.loaded_slots.retain(|(t, _), _| *t != *group_id);
+                self.edit_song(|song| song.tracks.remove(pos));
             }
-            self.collapsed_groups.remove(group_id);
+            self.ui_prefs.collapsed_groups.remove(group_id);
         }
 
         // **song update + LoadSong を先に送る** → daw_audio engine が
@@ -14388,16 +13670,16 @@ impl AppData {
         // を dispatch しないようにする。
         let _ = group_snapshots;
         for group_id in &groups_to_ungroup {
-            if let Some(pids) = self.track_plugin_ids.remove(group_id) {
-                for pid in pids {
-                    self.send_audio(MainToChild::ClosePluginShmem { plugin_id: pid });
+            if let Some(device_ids) = self.ipc.track_plugin_ids.remove(group_id) {
+                for device_id in device_ids {
+                    self.send_audio(AudioCommand::ClosePluginShmem { device_id });
                 }
             }
-            self.send_plugin(MainToChild::RemoveTrack { track: *group_id });
+            self.send_plugin(PluginCommand::RemoveTrack { track_id: *group_id });
         }
         // selection: ungroup 後は元 group の子を選択 (Live 互換)。
         if !new_selection.is_empty() {
-            self.selected_track_ids = new_selection;
+            self.selection.selected_track_ids = new_selection;
         }
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
@@ -14415,7 +13697,7 @@ impl AppData {
             return;
         }
         if let Some(pid) = parent_id {
-            if self.song.track_by_id(pid).is_none() {
+            if self.song_doc.song().track_by_id(pid).is_none() {
                 tracing::warn!(track_id, parent_id = pid, "ignored: parent track not found");
                 return;
             }
@@ -14429,18 +13711,18 @@ impl AppData {
                     return;
                 }
                 hops += 1;
-                if hops > self.song.tracks.len() as u32 + 1 {
+                if hops > self.song_doc.song().tracks.len() as u32 + 1 {
                     // Existing graph already has a cycle; abort to avoid an infinite loop.
                     tracing::error!("existing parent chain is cyclic; aborting reparent");
                     return;
                 }
                 cursor = self
-                    .song
+                    .song_doc.song()
                     .track_by_id(c)
                     .and_then(|t| t.parent_group_id);
             }
         }
-        let Some(track) = self.song.track_by_id_mut(track_id) else {
+        let Some(track) = self.song_doc.song().track_by_id_mut(track_id) else {
             tracing::warn!(track_id, "ignored: track not found");
             return;
         };
@@ -14450,12 +13732,12 @@ impl AppData {
     }
 
     fn action_remove_last_track(&mut self) {
-        let len = self.song.tracks.len();
+        let len = self.song_doc.song().tracks.len();
         if len == 0 {
             return;
         }
         // PR2.1: pop() の前に id を保存し、 IPC は id で送る。
-        let Some(removed) = self.song.tracks.pop() else {
+        let Some(removed) = self.song_doc.song().tracks.pop() else {
             return;
         };
         let removed_id = removed.id;
@@ -14467,32 +13749,32 @@ impl AppData {
         );
         #[cfg(windows)]
         {
-            self.open_plugin_guis.retain(|&(t, _)| t != removed_id);
+            self.ipc.open_plugin_guis.retain(|&(t, _)| t != removed_id);
         }
-        self.send_plugin(MainToChild::RemoveTrack { track: removed_id });
+        self.send_plugin(PluginCommand::RemoveTrack { track_id: removed_id });
         // selected_track_ids は id ベース。 削除対象 track id を除外
         // (Vec の index で持つ subtree とは異なり id 直接判定)。 残りが
         // 空なら最後尾にフォールバック。
         let live_ids: std::collections::HashSet<u32> =
-            self.song.tracks.iter().map(|t| t.id).collect();
-        self.selected_track_ids.retain(|id| live_ids.contains(id));
-        if self.selected_track_ids.is_empty()
-            && let Some(t) = self.song.tracks.last()
+            self.song_doc.song().tracks.iter().map(|t| t.id).collect();
+        self.selection.selected_track_ids.retain(|id| live_ids.contains(id));
+        if self.selection.selected_track_ids.is_empty()
+            && let Some(t) = self.song_doc.song().tracks.last()
         {
-            self.selected_track_ids.push(t.id);
+            self.selection.selected_track_ids.push(t.id);
         }
-        self.collapsed_groups.retain(|id| live_ids.contains(id));
+        self.ui_prefs.collapsed_groups.retain(|id| live_ids.contains(id));
         // selected_clips / selected_clip は stable ClipKey 保持。 削除された
         // track の clip を指す選択だけ落とす (track は上で pop 済なので clip_at が
         // 解決できない)。 残りは index 変化に自動追従。
-        let mut keys = std::mem::take(&mut self.selected_clips);
+        let mut keys = std::mem::take(&mut self.selection.selected_clips);
         keys.retain(|k| self.clip_at(*k).is_some());
-        self.selected_clips = keys;
-        if let Some(k) = self.selected_clip
+        self.selection.selected_clips = keys;
+        if let Some(k) = self.selection.selected_clip
             && self.clip_at(k).is_none()
         {
-            self.selected_clip = self.selected_clips.last().copied();
-            self.selected_notes.clear();
+            self.selection.selected_clip = self.selection.selected_clips.last().copied();
+            self.selection.selected_notes.clear();
         }
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
@@ -14503,7 +13785,7 @@ impl AppData {
     /// Phase 7 B4 Step D (2026-05-13): MIDI input note_on dispatcher。
     /// `midi_recording` で arm 録音 path、 そうでなければ既存 step-input mode。
     fn handle_midi_note_on(&mut self, pitch: u8, velocity: u8) {
-        if self.midi_recording {
+        if self.recording.midi_recording {
             self.record_midi_note_on(pitch, velocity);
         } else {
             self.step_input_note_on(pitch, velocity);
@@ -14513,7 +13795,7 @@ impl AppData {
     /// Phase 7 B4 Step D: MIDI input note_off dispatcher。 録音中は length 確定、
     /// step-input mode は no-op (既存挙動)。
     fn handle_midi_note_off(&mut self, pitch: u8) {
-        if self.midi_recording {
+        if self.recording.midi_recording {
             self.record_midi_note_off(pitch);
         }
     }
@@ -14527,13 +13809,14 @@ impl AppData {
         armed_track: Option<u32>,
     ) -> Option<common::model::BindingTarget> {
         use common::model::{AutomationTarget, BindingTarget, TrackBuiltinParam};
-        if let Some(tp) = &self.last_touched_param {
+        if let Some(tp) = &self.ui_ephemeral.last_touched_param {
             match tp.target {
-                AutomationTarget::PluginParam { device_index, param_id, .. } => {
+                AutomationTarget::PluginParam { device_id, param_id, .. } => {
                     return Some(BindingTarget::PluginParam {
                         track: tp.track_id,
-                        device_index,
+                        device_id,
                         param_id,
+                        legacy_device_index: None,
                         legacy_slot: None,
                     });
                 }
@@ -14560,28 +13843,28 @@ impl AppData {
         controller: u8,
         value: u8,
     ) {
-        if let Some(target) = self.midi_learn_target.take() {
+        if let Some(target) = self.recording.midi_learn_target.take() {
             // Learn mode: 既存 同 (channel, controller) を retain で除外 +
             // 新 binding push。 status_message は次 frame の通常 status に上書き
             // されるが「bind 完了」 を一瞬表示。
-            self.song.midi_bindings.retain(|b| {
+            self.song_doc.song().midi_bindings.retain(|b| {
                 !(b.controller == controller && b.channel == channel)
             });
-            self.song.midi_bindings.push(common::model::MidiBinding {
+            self.song_doc.song().midi_bindings.push(common::model::MidiBinding {
                 channel,
                 controller,
                 target,
             });
             // `midi_bindings` は永続 field (非 undoable 経路なのでここで dirty)。
-            self.is_dirty = true;
-            self.status_message =
+            self.song_doc.is_dirty() = true;
+            self.ui_ephemeral.status_message =
                 format!("MIDI bind: CC {controller} (ch {channel}) → {target:?}");
             return;
         }
         // 通常 lookup: 該当 binding 全てに値送信 (= 同 CC を複数 target に
         // bind する usage を許容)。 channel = 16 は any-channel match。
         let targets: Vec<common::model::BindingTarget> = self
-            .song
+            .song_doc.song()
             .midi_bindings
             .iter()
             .filter(|b| {
@@ -14619,21 +13902,21 @@ impl AppData {
                 // (r.md #7)。Raw clip があれば LoadSong (decode 再利用で軽量) で
                 // 再生 window を追従、無ければ軽量 SetSongBpm で即時更新。
                 let bpm = (60.0 + v_norm * 120.0).clamp(1.0, 400.0);
-                let old_bpm = self.song.bpm;
-                self.song.bpm = bpm;
+                let old_bpm = self.song_doc.song().bpm;
+                self.edit_song(|song| song.bpm = bpm);
                 // `bpm` は永続 field (非 undoable 経路なのでここで dirty)。
-                self.is_dirty = true;
+                self.song_doc.is_dirty() = true;
                 if !self.rescale_raw_clips_for_bpm_change(old_bpm, bpm) {
-                    self.send_audio(MainToChild::SetSongBpm { bpm });
+                    self.send_audio(AudioCommand::SetSongBpm { bpm });
                 }
                 // plugin host 側の BPM 消費者 (VOICEVOX metadata / ARA / lipsync)
                 // へも追従させる。 毎 CC の full LoadSong flood を避けるため
                 // frame flush に coalesce (H2 と同 idiom)。
-                self.pending_host_sync = true;
+                self.ipc.pending_host_sync = true;
             }
             common::model::BindingTarget::PluginParam {
                 track,
-                device_index,
+                device_id,
                 param_id,
                 ..
             } => {
@@ -14642,21 +13925,30 @@ impl AppData {
                 // default 経路 (`set_plugin_param_on_track`) で更新 → host へ再
                 // sync して音に反映。 range 未取得 (host が PluginParamList 未送)
                 // は 0..1 を plain とみなす best-effort。
+                // v29: binding は安定 device_id を持つ。 現在位置 (track /
+                // index) へは逆引きで繋ぐ (device 削除済みなら無視)。
+                let Some((resolved_track, device_index)) =
+                    find_device_by_id(&self.song_doc.song(), device_id)
+                else {
+                    return;
+                };
+                let _ = track;
                 let target = common::model::AutomationTarget::PluginParam {
-                    device_index,
+                    device_id,
                     param_id,
+                    legacy_device_index: None,
                     legacy_slot: None,
                 };
-                let value_real = match self.plugin_param_range(track, &target) {
+                let value_real = match self.plugin_param_range(resolved_track, &target) {
                     Some((min, max)) => min + f64::from(v_norm) * (max - min),
                     None => f64::from(v_norm),
                 };
-                self.set_plugin_param_on_track(track, device_index, param_id, value_real);
+                self.set_plugin_param_on_track(resolved_track, device_index, param_id, value_real);
                 // H2 (r.md #8): 毎 CC で full LoadSong を送ると knob sweep で IPC が
                 // flood して stutter/dropout する。 pending flag を立て runner が frame
                 // ごとに 1 回だけ sync する (inspector drag の is_dragging coalesce と
                 // 同思想。 realtime 応答は frame rate = 十分)。
-                self.pending_host_sync = true;
+                self.ipc.pending_host_sync = true;
             }
         }
     }
@@ -14667,12 +13959,12 @@ impl AppData {
         let Some(target) = self.selected_clip_ref() else {
             return;
         };
-        let cursor = self.step_cursor_beat;
-        let step = self.step_size_beats;
+        let cursor = self.recording.step_cursor_beat;
+        let step = self.recording.step_size_beats;
         let target_track_idx = target.track as usize;
         let target_clip_idx = target.clip as usize;
         let Some(clip) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target_track_idx)
             .and_then(|t| t.clips.get(target_clip_idx))
@@ -14684,14 +13976,17 @@ impl AppData {
         } else {
             cursor
         };
-        let Some(notes) = self
-            .song
-            .notes_in_clip_mut(target_track_idx, target_clip_idx)
+        let Some(content) =
+            midi_content_in_clip_mut(&mut self.song_doc.song(), target_track_idx, target_clip_idx)
         else {
             return;
         };
+        // v29: 新規 note は allocator で安定 id を採番する。
+        let note_id = content.alloc_note_id();
+        let notes = &mut content.notes;
         let new_idx = notes.len() as u32;
         notes.push(common::model::Note {
+            id: note_id,
             start_beat: cursor,
             duration_beats: step,
             pitch,
@@ -14704,8 +13999,8 @@ impl AppData {
         let selected = remap_indices(&remap, &[new_idx]);
         let next_cursor = cursor + step;
         // selected_notes は packed note id。入力先 (target) clip の slot で pack。
-        self.selected_notes = self.pack_clip_selection(target, &selected);
-        self.step_cursor_beat = next_cursor;
+        self.selection.selected_notes = self.pack_clip_selection(target, &selected);
+        self.recording.step_cursor_beat = next_cursor;
         self.sync_song_to_plugin_host();
     }
 
@@ -14718,7 +14013,7 @@ impl AppData {
     /// make_unique」 を検討)。
     fn record_midi_note_on(&mut self, pitch: u8, velocity: u8) {
         let playhead =
-            self.playhead_beat.map(f64::from).unwrap_or(0.0);
+            self.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
         if playhead < 0.0 {
             return;
         }
@@ -14726,8 +14021,8 @@ impl AppData {
         // note_off も同じ snap を適用するので、 deterministic snap で
         // (track_id, pitch) lookup が整合する。 step input は別 path
         // (`step_input_note_on`) を経由するのでここの snap は録音時のみ。
-        let pitch = if self.snap_live_input {
-            self.song
+        let pitch = if self.recording.snap_live_input {
+            self.song_doc.song()
                 .scale_at(playhead)
                 .map(|sc| sc.snap(pitch))
                 .unwrap_or(pitch)
@@ -14735,14 +14030,14 @@ impl AppData {
             pitch
         };
         let armed_ids: Vec<u32> = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .filter(|t| t.armed)
             .map(|t| t.id)
             .collect();
         for track_id in armed_ids {
-            self.midi_recording_active_notes
+            self.recording.midi_recording_active_notes
                 .insert((track_id, pitch), playhead);
             self.ensure_midi_clip_at_playhead(track_id, playhead);
             let Some((track_idx, clip_idx)) =
@@ -14751,12 +14046,15 @@ impl AppData {
                 continue;
             };
             let clip_start =
-                self.song.tracks[track_idx].clips[clip_idx].start_beat;
+                self.song_doc.song().tracks[track_idx].clips[clip_idx].start_beat;
             let local_start = playhead - clip_start;
-            if let Some(notes) =
-                self.song.notes_in_clip_mut(track_idx, clip_idx)
+            if let Some(content) =
+                midi_content_in_clip_mut(&mut self.song_doc.song(), track_idx, clip_idx)
             {
-                notes.push(common::model::Note {
+                // v29: 録音で入る note も allocator で安定 id を採番。
+                let note_id = content.alloc_note_id();
+                content.notes.push(common::model::Note {
+                    id: note_id,
                     start_beat: local_start,
                     duration_beats: 0.05,
                     pitch,
@@ -14776,12 +14074,12 @@ impl AppData {
     /// に戻して check)。
     fn record_midi_note_off(&mut self, pitch: u8) {
         let playhead =
-            self.playhead_beat.map(f64::from).unwrap_or(0.0);
+            self.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
         // Phase 7 B5: note_on 側で snap した pitch で active_notes に登録して
         // いるので、 note_off の lookup key も同じ snap を適用。 snap は
         // deterministic なので転調を跨がない note なら lookup は必ず hit する。
-        let pitch = if self.snap_live_input {
-            self.song
+        let pitch = if self.recording.snap_live_input {
+            self.song_doc.song()
                 .scale_at(playhead)
                 .map(|sc| sc.snap(pitch))
                 .unwrap_or(pitch)
@@ -14789,7 +14087,7 @@ impl AppData {
             pitch
         };
         let armed_ids: Vec<u32> = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .filter(|t| t.armed)
@@ -14797,7 +14095,7 @@ impl AppData {
             .collect();
         for track_id in armed_ids {
             let Some(start) = self
-                .midi_recording_active_notes
+                .recording.midi_recording_active_notes
                 .remove(&(track_id, pitch))
             else {
                 continue;
@@ -14808,11 +14106,11 @@ impl AppData {
                 continue;
             };
             let clip_start =
-                self.song.tracks[track_idx].clips[clip_idx].start_beat;
+                self.song_doc.song().tracks[track_idx].clips[clip_idx].start_beat;
             let local_start = start - clip_start;
             let length = (playhead - start).max(0.05);
             if let Some(notes) =
-                self.song.notes_in_clip_mut(track_idx, clip_idx)
+                self.song_doc.song().notes_in_clip_mut(track_idx, clip_idx)
                 && let Some(n) = notes.iter_mut().find(|n| {
                     (n.start_beat - local_start).abs() < 1e-6
                         && n.pitch == pitch
@@ -14833,19 +14131,19 @@ impl AppData {
         playhead: f64,
     ) {
         let Some(track_idx) =
-            self.song.tracks.iter().position(|t| t.id == track_id)
+            self.song_doc.song().tracks.iter().position(|t| t.id == track_id)
         else {
             return;
         };
         // 既存 clip 内ならそのまま。
-        if self.song.tracks[track_idx].clips.iter().any(|c| {
+        if self.song_doc.song().tracks[track_idx].clips.iter().any(|c| {
             playhead >= c.start_beat
                 && playhead < c.start_beat + c.length_beats
         }) {
             return;
         }
         // 末尾の直近 1 beat 以内なら延長。
-        if let Some(clip) = self.song.tracks[track_idx]
+        if let Some(clip) = self.song_doc.song().tracks[track_idx]
             .clips
             .iter_mut()
             .find(|c| {
@@ -14857,14 +14155,15 @@ impl AppData {
             return;
         }
         // 新規 clip 作成。
-        let cid = self.song.alloc_content_id();
-        self.song.clip_contents.insert(
+        let cid = self.song_doc.song().alloc_content_id();
+        self.song_doc.song().clip_contents.insert(
             cid,
             common::model::ClipContent::Midi(common::model::MidiContent {
                 notes: vec![],
+                next_note_id: 1,
             }),
         );
-        let track = &mut self.song.tracks[track_idx];
+        let track = &mut self.song_doc.song().tracks[track_idx];
         let new_clip_id = track.next_clip_id;
         track.next_clip_id += 1;
         let new_clip = common::model::Clip {
@@ -14891,8 +14190,8 @@ impl AppData {
         playhead: f64,
     ) -> Option<(usize, usize)> {
         let track_idx =
-            self.song.tracks.iter().position(|t| t.id == track_id)?;
-        let track = &self.song.tracks[track_idx];
+            self.song_doc.song().tracks.iter().position(|t| t.id == track_id)?;
+        let track = &self.song_doc.song().tracks[track_idx];
         let clip_idx = track.clips.iter().position(|c| {
             playhead >= c.start_beat
                 && playhead < c.start_beat + c.length_beats
@@ -14914,7 +14213,7 @@ impl AppData {
     /// Phase 7 B4 Step C/D: Record toggle button click。 既に recording
     /// (含 pending) なら stop、 idle なら start。
     fn toggle_midi_recording(&mut self) {
-        if self.midi_recording || self.midi_recording_pending {
+        if self.recording.midi_recording || self.recording.midi_recording_pending {
             self.stop_recording();
         } else {
             self.start_recording();
@@ -14925,37 +14224,36 @@ impl AppData {
     /// metronome 強制 ON、 0 なら即時 recording。 いずれも `Play` を audio に
     /// 送る。 metronome の元状態は `metronome_enabled_pre_recording` に snap。
     fn start_recording(&mut self) {
-        if self.midi_recording || self.midi_recording_pending {
+        if self.recording.midi_recording || self.recording.midi_recording_pending {
             return;
         }
         // (review) 録音 take を 1 undo step にする。 `MidiNoteOn` / 録音 point
         // 挿入は per-event で snapshot しない (is_undoable 外) ので、 ここで
         // 1 回だけ積む — これが無いと Ctrl+Z が「録音 + 直前の別編集」 を
         // まとめて巻き戻す。
-        self.push_undo_snapshot();
-        self.midi_recording_active_notes.clear();
-        let bars = self.count_in_bars;
-        self.metronome_enabled_pre_recording = Some(self.metronome_enabled);
+        self.recording.midi_recording_active_notes.clear();
+        let bars = self.recording.count_in_bars;
+        self.recording.metronome_enabled_pre_recording = Some(self.transport.metronome_enabled);
         if bars > 0 {
-            if !self.metronome_enabled {
+            if !self.transport.metronome_enabled {
                 // count-in 強制 ON。 既存 SetMetronomeEnabled handler を
                 // 呼び出して audio engine への IPC 送信もまとめて。
                 self.handle_event(AppEvent::SetMetronomeEnabled(true));
             }
-            let beats_per_bar = f64::from(self.song.time_sig.0.max(1));
+            let beats_per_bar = f64::from(self.song_doc.song().time_sig.0.max(1));
             let preroll_beats = f64::from(bars) * beats_per_bar;
-            let sr = f64::from(self.sample_rate);
-            let bpm = f64::from(self.song.bpm.max(1.0));
+            let sr = f64::from(self.ipc.sample_rate);
+            let bpm = f64::from(self.song_doc.song().bpm.max(1.0));
             let preroll_samples =
                 (preroll_beats * 60.0 / bpm * sr).round().max(0.0) as u64;
-            self.send_audio(MainToChild::StartCountIn {
+            self.send_audio(AudioCommand::StartCountIn {
                 samples: preroll_samples,
             });
-            self.midi_recording_pending = true;
+            self.recording.midi_recording_pending = true;
         } else {
-            self.midi_recording = true;
+            self.recording.midi_recording = true;
         }
-        self.send_audio(MainToChild::Play);
+        self.send_audio(AudioCommand::Play);
     }
 
     /// Phase 7 B4 Step C/D: 録音停止 / cancel。 active_notes 全 clear、
@@ -14963,13 +14261,13 @@ impl AppData {
     /// `StartCountIn { samples: 0 }` で cancel (= count-in 中の stop に対応)。
     fn stop_recording(&mut self) {
         let was_active =
-            self.midi_recording || self.midi_recording_pending;
-        self.midi_recording = false;
-        self.midi_recording_pending = false;
-        self.midi_recording_active_notes.clear();
+            self.recording.midi_recording || self.recording.midi_recording_pending;
+        self.recording.midi_recording = false;
+        self.recording.midi_recording_pending = false;
+        self.recording.midi_recording_active_notes.clear();
         if let Some(prev) =
-            self.metronome_enabled_pre_recording.take()
-            && prev != self.metronome_enabled
+            self.recording.metronome_enabled_pre_recording.take()
+            && prev != self.transport.metronome_enabled
         {
             self.handle_event(AppEvent::SetMetronomeEnabled(prev));
         }
@@ -14977,15 +14275,15 @@ impl AppData {
             // count-in 中の cancel もしくは録音終了。 audio engine 側 preroll
             // を 0 で上書きして count-in 即時終了。 normal 録音終了の場合は
             // preroll は既に 0 なので no-op。
-            self.send_audio(MainToChild::StartCountIn { samples: 0 });
+            self.send_audio(AudioCommand::StartCountIn { samples: 0 });
         }
     }
 
     /// stable `ClipKey` (track_id + clip_id) → 現在の index ベース `ClipRef`。
     /// track / clip が見つからなければ `None` (= 削除済 / undo で消えた)。
     pub fn clip_ref_of(&self, key: common::model::ClipKey) -> Option<ClipRef> {
-        let t_idx = self.song.tracks.iter().position(|t| t.id == key.track_id)?;
-        let c_idx = self.song.tracks[t_idx]
+        let t_idx = self.song_doc.song().tracks.iter().position(|t| t.id == key.track_id)?;
+        let c_idx = self.song_doc.song().tracks[t_idx]
             .clips
             .iter()
             .position(|c| c.id == key.clip_id)?;
@@ -14997,7 +14295,7 @@ impl AppData {
 
     /// index ベース `ClipRef` → stable `ClipKey`。 範囲外なら `None`。
     pub fn clip_key_of(&self, r: ClipRef) -> Option<common::model::ClipKey> {
-        let t = self.song.tracks.get(r.track as usize)?;
+        let t = self.song_doc.song().tracks.get(r.track as usize)?;
         let c = t.clips.get(r.clip as usize)?;
         Some(common::model::ClipKey {
             track_id: t.id,
@@ -15007,7 +14305,7 @@ impl AppData {
 
     /// 選択 anchor (`selected_clip` = 末尾) を現在の `ClipRef` へ解決。
     pub fn selected_clip_ref(&self) -> Option<ClipRef> {
-        self.selected_clip.and_then(|k| self.clip_ref_of(k))
+        self.selection.selected_clip.and_then(|k| self.clip_ref_of(k))
     }
 
     // -------- per-clip piano roll / audio editor view 状態 --------
@@ -15018,10 +14316,10 @@ impl AppData {
         // 複数表示は共有 viewport (`multi_clip_view`、song-absolute scroll)、
         // 単一は per-clip 永続 state (clip-local scroll) を返す。
         if self.shown_pianoroll_clips().len() >= 2 {
-            self.multi_clip_view
+            self.ui_prefs.multi_clip_view
         } else {
-            self.selected_clip
-                .and_then(|k| self.piano_roll_views.get(&k).copied())
+            self.selection.selected_clip
+                .and_then(|k| self.ui_prefs.piano_roll_views.get(&k).copied())
                 .unwrap_or_default()
         }
     }
@@ -15033,10 +14331,10 @@ impl AppData {
     /// 表示と同じ viewport に書かれることを保証する。選択クリップが無いときは `None` (no-op)。
     fn piano_roll_view_entry(&mut self) -> Option<&mut common::model::PianoRollViewState> {
         if self.shown_pianoroll_clips().len() >= 2 {
-            return Some(&mut self.multi_clip_view);
+            return Some(&mut self.ui_prefs.multi_clip_view);
         }
-        let key = self.selected_clip?;
-        Some(self.piano_roll_views.entry(key).or_default())
+        let key = self.selection.selected_clip?;
+        Some(self.ui_prefs.piano_roll_views.entry(key).or_default())
     }
 
     /// ピアノロール横ズーム (px/beat)。view 層はこの accessor 経由で読む。
@@ -15059,9 +14357,9 @@ impl AppData {
     /// 現在 Audio Editor で開いているクリップの表示状態 (`audio_editor_clip` で解決)。
     /// entry が無ければ default (`{0,0}` = 「未設定」、view 側でクリップ全長表示に倒れる)。
     pub fn audio_editor_view_state(&self) -> common::model::AudioEditorViewState {
-        self.audio_editor_clip
+        self.ui_ephemeral.audio_editor_clip
             .and_then(|r| self.clip_key_of(r))
-            .and_then(|k| self.audio_editor_views.get(&k).copied())
+            .and_then(|k| self.ui_prefs.audio_editor_views.get(&k).copied())
             .unwrap_or_default()
     }
     /// Audio Editor 表示開始位置 (clip-relative beats)。
@@ -15077,10 +14375,10 @@ impl AppData {
     /// `ViewState` にスナップショットする。 save / autosave 時に呼ぶ。 per-clip map は
     /// 現存しないクリップの orphan entry を GC して書き出す。
     pub fn snapshot_view_state(&self) -> common::model::ViewState {
-        let mut expanded: Vec<u32> = self.expanded_automation_tracks.iter().copied().collect();
+        let mut expanded: Vec<u32> = self.ui_prefs.expanded_automation_tracks.iter().copied().collect();
         expanded.sort_unstable();
         let mut piano_roll_views: Vec<(common::model::ClipKey, common::model::PianoRollViewState)> =
-            self.piano_roll_views
+            self.ui_prefs.piano_roll_views
                 .iter()
                 .filter(|(k, _)| self.clip_ref_of(**k).is_some())
                 .map(|(k, v)| (*k, *v))
@@ -15090,34 +14388,34 @@ impl AppData {
             common::model::ClipKey,
             common::model::AudioEditorViewState,
         )> = self
-            .audio_editor_views
+            .ui_prefs.audio_editor_views
             .iter()
             .filter(|(k, _)| self.clip_ref_of(**k).is_some())
             .map(|(k, v)| (*k, *v))
             .collect();
         audio_editor_views.sort_by_key(|(k, _)| (k.track_id, k.clip_id));
         common::model::ViewState {
-            arrange_zoom_x: self.arrange_zoom_x,
-            arrange_scroll_beat: self.arrange_scroll_beat,
-            arrange_follow: self.arrange_follow,
-            arrange_track_top: self.arrange_track_top,
-            arrange_track_row_h: self.arrange_track_row_h,
-            arrange_header_w: self.arrange_header_w,
-            track_row_overrides: self.track_row_overrides.clone(),
+            arrange_zoom_x: self.ui_prefs.arrange_zoom_x,
+            arrange_scroll_beat: self.ui_prefs.arrange_scroll_beat,
+            arrange_follow: self.ui_prefs.arrange_follow,
+            arrange_track_top: self.ui_prefs.arrange_track_top,
+            arrange_track_row_h: self.ui_prefs.arrange_track_row_h,
+            arrange_header_w: self.ui_prefs.arrange_header_w,
+            track_row_overrides: self.ui_prefs.track_row_overrides.clone(),
             expanded_automation_tracks: expanded,
-            master_row_automation_expanded: self.master_row_automation_expanded,
-            arrange_snap_enabled: self.arrange_snap_enabled,
-            arrange_snap_choice: self.arrange_snap_choice,
-            pianoroll_snap_enabled: self.pianoroll_snap_enabled,
-            pianoroll_snap_choice: self.pianoroll_snap_choice,
-            piano_roll_fold: self.piano_roll_fold,
-            snap_on_draw: self.snap_on_draw,
-            snap_live_input: self.snap_live_input,
-            bottom_panel: self.bottom_panel,
+            master_row_automation_expanded: self.ui_prefs.master_row_automation_expanded,
+            arrange_snap_enabled: self.ui_prefs.arrange_snap_enabled,
+            arrange_snap_choice: self.ui_prefs.arrange_snap_choice,
+            pianoroll_snap_enabled: self.ui_prefs.pianoroll_snap_enabled,
+            pianoroll_snap_choice: self.ui_prefs.pianoroll_snap_choice,
+            piano_roll_fold: self.ui_prefs.piano_roll_fold,
+            snap_on_draw: self.ui_prefs.snap_on_draw,
+            snap_live_input: self.recording.snap_live_input,
+            bottom_panel: self.ui_prefs.bottom_panel,
             // 開いていたクリップを復元できるよう選択も保存 (現存クリップのみ)。
-            selected_clip: self.selected_clip.filter(|k| self.clip_ref_of(*k).is_some()),
+            selected_clip: self.selection.selected_clip.filter(|k| self.clip_ref_of(*k).is_some()),
             selected_clips: self
-                .selected_clips
+                .selection.selected_clips
                 .iter()
                 .copied()
                 .filter(|k| self.clip_ref_of(*k).is_some())
@@ -15132,57 +14430,57 @@ impl AppData {
     /// globals は現状維持 (= 従来の fit-to-content / 既定値挙動)。 全値を有効域へ clamp して
     /// 壊れた / 古い保存値を吸収する。
     pub fn restore_view_state(&mut self, view: Option<common::model::ViewState>) {
-        self.piano_roll_views.clear();
-        self.audio_editor_views.clear();
+        self.ui_prefs.piano_roll_views.clear();
+        self.ui_prefs.audio_editor_views.clear();
         let Some(v) = view else { return };
         let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
-        self.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);
-        self.arrange_scroll_beat = v.arrange_scroll_beat.max(0.0);
-        self.arrange_follow = v.arrange_follow;
-        self.arrange_track_top = v.arrange_track_top.max(0.0);
-        self.arrange_track_row_h = v.arrange_track_row_h.clamp(16.0, 2000.0);
-        self.arrange_header_w = v.arrange_header_w.clamp(80.0, 480.0);
-        self.track_row_overrides = v
+        self.ui_prefs.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);
+        self.ui_prefs.arrange_scroll_beat = v.arrange_scroll_beat.max(0.0);
+        self.ui_prefs.arrange_follow = v.arrange_follow;
+        self.ui_prefs.arrange_track_top = v.arrange_track_top.max(0.0);
+        self.ui_prefs.arrange_track_row_h = v.arrange_track_row_h.clamp(16.0, 2000.0);
+        self.ui_prefs.arrange_header_w = v.arrange_header_w.clamp(80.0, 480.0);
+        self.ui_prefs.track_row_overrides = v
             .track_row_overrides
             .into_iter()
             .map(|(k, h)| (k, h.max(16)))
             .collect();
-        self.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
-        self.master_row_automation_expanded = v.master_row_automation_expanded;
-        self.arrange_snap_enabled = v.arrange_snap_enabled;
-        self.arrange_snap_choice = v.arrange_snap_choice.min(max_choice);
-        self.pianoroll_snap_enabled = v.pianoroll_snap_enabled;
-        self.pianoroll_snap_choice = v.pianoroll_snap_choice.min(max_choice);
-        self.piano_roll_fold = v.piano_roll_fold;
-        self.snap_on_draw = v.snap_on_draw;
-        self.snap_live_input = v.snap_live_input;
-        self.bottom_panel = v.bottom_panel;
+        self.ui_prefs.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
+        self.ui_prefs.master_row_automation_expanded = v.master_row_automation_expanded;
+        self.ui_prefs.arrange_snap_enabled = v.arrange_snap_enabled;
+        self.ui_prefs.arrange_snap_choice = v.arrange_snap_choice.min(max_choice);
+        self.ui_prefs.pianoroll_snap_enabled = v.pianoroll_snap_enabled;
+        self.ui_prefs.pianoroll_snap_choice = v.pianoroll_snap_choice.min(max_choice);
+        self.ui_prefs.piano_roll_fold = v.piano_roll_fold;
+        self.ui_prefs.snap_on_draw = v.snap_on_draw;
+        self.recording.snap_live_input = v.snap_live_input;
+        self.ui_prefs.bottom_panel = v.bottom_panel;
         // 開いていたクリップ選択を復元 (現存しない stale key は除外)。 これでピアノロールが
         // 開き直し直後に「前回編集していたクリップ」をその per-clip view で表示する。
-        self.selected_clips = v
+        self.selection.selected_clips = v
             .selected_clips
             .into_iter()
             .filter(|k| self.clip_ref_of(*k).is_some())
             .collect();
-        self.selected_clip = v.selected_clip.filter(|k| self.clip_ref_of(*k).is_some());
+        self.selection.selected_clip = v.selected_clip.filter(|k| self.clip_ref_of(*k).is_some());
         for (k, mut pv) in v.piano_roll_views {
             pv.zoom_x = pv.zoom_x.clamp(8.0, 400.0);
             pv.zoom_y = pv.zoom_y.clamp(6.0, 40.0);
             pv.top_pitch = pv.top_pitch.clamp(11, 127);
             pv.scroll_beat = pv.scroll_beat.max(0.0);
-            self.piano_roll_views.insert(k, pv);
+            self.ui_prefs.piano_roll_views.insert(k, pv);
         }
         for (k, mut av) in v.audio_editor_views {
             av.start_beat = av.start_beat.max(0.0);
             av.len_beats = av.len_beats.max(0.0);
-            self.audio_editor_views.insert(k, av);
+            self.ui_prefs.audio_editor_views.insert(k, av);
         }
     }
 
     /// 選択集合 (`selected_clips`) を現在の `ClipRef` 群へ解決 (解決でき
     /// ない stale key は除外)。 owned `Vec` を返す。
     pub fn selected_clip_refs(&self) -> Vec<ClipRef> {
-        self.selected_clips
+        self.selection.selected_clips
             .iter()
             .filter_map(|k| self.clip_ref_of(*k))
             .collect()
@@ -15196,14 +14494,14 @@ impl AppData {
     #[must_use]
     pub fn shown_pianoroll_clips(&self) -> Vec<ClipRef> {
         let mut out = Vec::new();
-        if self.selected_clips.is_empty() {
+        if self.selection.selected_clips.is_empty() {
             if let Some(r) = self.selected_clip_ref()
                 && self.is_midi_clip(r)
             {
                 out.push(r);
             }
         } else {
-            for k in &self.selected_clips {
+            for k in &self.selection.selected_clips {
                 if let Some(r) = self.clip_ref_of(*k)
                     && self.is_midi_clip(r)
                 {
@@ -15257,8 +14555,8 @@ impl AppData {
     /// `selected_notes` のうち当該クリップ部分にだけ適用する (他クリップは不変)。
     /// `remap[old_local] = Some(new_local)` は追従、None / 範囲外は選択から落とす。
     fn remap_packed_selection_for_clip(&mut self, slot: usize, remap: &[Option<u32>]) {
-        let mut out = Vec::with_capacity(self.selected_notes.len());
-        for &packed in &self.selected_notes {
+        let mut out = Vec::with_capacity(self.selection.selected_notes.len());
+        for &packed in &self.selection.selected_notes {
             if Self::note_id_clip_slot(packed) == slot {
                 let local = Self::note_id_local_index(packed);
                 if let Some(Some(new_local)) = remap.get(local) {
@@ -15268,7 +14566,7 @@ impl AppData {
                 out.push(packed);
             }
         }
-        self.selected_notes = out;
+        self.selection.selected_notes = out;
     }
 
     /// クリップ `slot` (= `r`) の notes に `f` を適用 (local index ベースで編集し、
@@ -15278,7 +14576,7 @@ impl AppData {
     fn edit_clip_notes(&mut self, slot: usize, r: ClipRef, f: impl FnOnce(&mut Vec<Note>) -> Vec<u32>) {
         let remap = {
             let Some(notes) = self
-                .song
+                .song_doc.song()
                 .notes_in_clip_mut(r.track as usize, r.clip as usize)
             else {
                 return;
@@ -15293,7 +14591,7 @@ impl AppData {
     /// 唯一のオフセット (範囲外は 0)。
     #[must_use]
     pub fn clip_start_beat_of(&self, r: ClipRef) -> f64 {
-        self.song
+        self.song_doc.song()
             .tracks
             .get(r.track as usize)
             .and_then(|t| t.clips.get(r.clip as usize))
@@ -15365,15 +14663,15 @@ impl AppData {
     /// そのクリップが乗っている **トラック** がピアノロールで「ロック (参照専用)」
     /// かどうか。ロックはトラック単位 (凡例がトラック単位なので)。
     pub fn is_pianoroll_clip_locked(&self, r: ClipRef) -> bool {
-        self.song
+        self.song_doc.song()
             .tracks
             .get(r.track as usize)
-            .is_some_and(|t| self.locked_pr_tracks.contains(&t.id))
+            .is_some_and(|t| self.ui_prefs.locked_pr_tracks.contains(&t.id))
     }
 
     /// トラック id がピアノロールでロック中か (凡例のロックトグル状態表示用)。
     pub fn is_pianoroll_track_locked(&self, track_id: u32) -> bool {
-        self.locked_pr_tracks.contains(&track_id)
+        self.ui_prefs.locked_pr_tracks.contains(&track_id)
     }
 
     /// 凡例から対象 (target) クリップを切り替える。anchor (`selected_clip`) を
@@ -15382,11 +14680,11 @@ impl AppData {
     /// この clip になる。集合に居ない / 単一表示で anchor と異なる key は no-op。track も追従。
     fn set_pianoroll_target_clip(&mut self, key: common::model::ClipKey) {
         // 凡例は常に表示集合内のクリップしか出さないが、stale 入力に備えて検証する。
-        let in_set = self.selected_clips.contains(&key) || self.selected_clip == Some(key);
+        let in_set = self.selection.selected_clips.contains(&key) || self.selection.selected_clip == Some(key);
         if !in_set {
             return;
         }
-        self.selected_clip = Some(key);
+        self.selection.selected_clip = Some(key);
         if let Some(r) = self.clip_ref_of(key) {
             self.select_track(r.track);
         }
@@ -15396,8 +14694,8 @@ impl AppData {
     /// (`locked_pr_tracks`)。ロック中はそのトラックの表示 note を widget が hit 除外し、
     /// 編集 handler も飛ばす (`for_each_note_clip_group` / `is_pianoroll_clip_locked`)。
     fn toggle_pianoroll_track_lock(&mut self, track_id: u32) {
-        if !self.locked_pr_tracks.remove(&track_id) {
-            self.locked_pr_tracks.insert(track_id);
+        if !self.ui_prefs.locked_pr_tracks.remove(&track_id) {
+            self.ui_prefs.locked_pr_tracks.insert(track_id);
         }
     }
 
@@ -15409,12 +14707,12 @@ impl AppData {
     /// 全体 (空なら `selected_clip` 単体) を走査する。 mixed 検出 (`inspector_fold`) は
     /// 毎フレーム全 field で呼ばれるので、 Vec を作らないこの基盤を使う。
     fn for_each_inspector_target(&self, mut f: impl FnMut(ClipRef)) {
-        if self.selected_clips.is_empty() {
+        if self.selection.selected_clips.is_empty() {
             if let Some(r) = self.selected_clip_ref() {
                 f(r);
             }
         } else {
-            for k in &self.selected_clips {
+            for k in &self.selection.selected_clips {
                 if let Some(r) = self.clip_ref_of(*k) {
                     f(r);
                 }
@@ -15459,13 +14757,13 @@ impl AppData {
         f: impl FnOnce(&common::model::ImageEvent) -> R,
     ) -> Option<R> {
         let content_id = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)?
             .clips
             .get(target.clip as usize)?
             .content_id;
-        match self.song.clip_contents.get(&content_id)? {
+        match self.song_doc.song().clip_contents.get(&content_id)? {
             common::model::ClipContent::Image(img) => img.events.first().map(f),
             _ => None,
         }
@@ -15478,13 +14776,13 @@ impl AppData {
         f: impl FnOnce(&common::model::TextEvent) -> R,
     ) -> Option<R> {
         let content_id = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)?
             .clips
             .get(target.clip as usize)?
             .content_id;
-        match self.song.clip_contents.get(&content_id)? {
+        match self.song_doc.song().clip_contents.get(&content_id)? {
             common::model::ClipContent::Text(text) => text.events.first().map(f),
             _ => None,
         }
@@ -15497,13 +14795,13 @@ impl AppData {
         f: impl FnOnce(&common::model::AudioEvent) -> R,
     ) -> Option<R> {
         let content_id = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)?
             .clips
             .get(target.clip as usize)?
             .content_id;
-        match self.song.clip_contents.get(&content_id)? {
+        match self.song_doc.song().clip_contents.get(&content_id)? {
             common::model::ClipContent::Audio(audio) => audio.events.first().map(f),
             _ => None,
         }
@@ -15516,7 +14814,7 @@ impl AppData {
 
     /// stable `ClipKey` → `&Clip` (track_by_id + clip_by_id)。
     pub fn clip_at(&self, key: common::model::ClipKey) -> Option<&common::model::Clip> {
-        self.song
+        self.song_doc.song()
             .track_by_id(key.track_id)
             .and_then(|t| t.clip_by_id(key.clip_id))
     }
@@ -15525,7 +14823,7 @@ impl AppData {
         let Some(key) = self.clip_key_of(target) else {
             return;
         };
-        let mut keys = self.selected_clips.clone();
+        let mut keys = self.selection.selected_clips.clone();
         if additive {
             if let Some(pos) = keys.iter().position(|k| *k == key) {
                 keys.remove(pos);
@@ -15536,13 +14834,13 @@ impl AppData {
             keys = vec![key];
         }
         let primary = keys.last().copied();
-        self.selected_clips = keys;
-        self.selected_clip = primary;
-        self.selected_notes.clear();
+        self.selection.selected_clips = keys;
+        self.selection.selected_clip = primary;
+        self.selection.selected_notes.clear();
         if primary.is_some() {
-            self.last_edit_select = Some(EditSelectSurface::Clips);
+            self.selection.last_edit_select = Some(EditSelectSurface::Clips);
         }
-        self.step_cursor_beat = 0.0;
+        self.recording.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
         }
@@ -15551,7 +14849,7 @@ impl AppData {
         // 読んで前回の zoom/scroll を復元する (= 再選択で view が飛ばない)。 明示的な
         // 再 fit は `X` キー / Fit ボタン (`FitPianoRollToClip`)。
         if let Some(p) = primary
-            && !self.piano_roll_views.contains_key(&p)
+            && !self.ui_prefs.piano_roll_views.contains_key(&p)
         {
             self.fit_piano_roll_to_clip();
         }
@@ -15561,19 +14859,19 @@ impl AppData {
         let keys: Vec<common::model::ClipKey> =
             targets.iter().filter_map(|r| self.clip_key_of(*r)).collect();
         let primary = keys.last().copied();
-        self.selected_clips = keys;
-        self.selected_clip = primary;
-        self.selected_notes.clear();
+        self.selection.selected_clips = keys;
+        self.selection.selected_clip = primary;
+        self.selection.selected_notes.clear();
         if primary.is_some() {
-            self.last_edit_select = Some(EditSelectSurface::Clips);
+            self.selection.last_edit_select = Some(EditSelectSurface::Clips);
         }
-        self.step_cursor_beat = 0.0;
+        self.recording.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip_ref() {
             self.select_track(r.track);
         }
         // 初回 (entry 無し) のみ fit。 記憶があれば復元 (select_clip と同方針)。
         if let Some(p) = primary
-            && !self.piano_roll_views.contains_key(&p)
+            && !self.ui_prefs.piano_roll_views.contains_key(&p)
         {
             self.fit_piano_roll_to_clip();
         }
@@ -15586,7 +14884,7 @@ impl AppData {
     /// anchor (末尾) は inspector 表示用に維持。 selection のみで非 undoable。
     fn select_all_clips(&mut self) {
         let all: Vec<common::model::ClipKey> = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .flat_map(|t| {
@@ -15603,18 +14901,18 @@ impl AppData {
         }
         // 冪等 early-return より前に last-wins 面だけは更新する (既に全選択でも
         // 「Ctrl+A = クリップ面を選んだ」 という意図は確定している)。
-        self.last_edit_select = Some(EditSelectSurface::Clips);
+        self.selection.last_edit_select = Some(EditSelectSurface::Clips);
         // 既に全選択なら冪等 (集合一致を順序非依存で判定)。
-        if self.selected_clips.len() == all.len() {
+        if self.selection.selected_clips.len() == all.len() {
             let cur: std::collections::HashSet<common::model::ClipKey> =
-                self.selected_clips.iter().copied().collect();
+                self.selection.selected_clips.iter().copied().collect();
             if all.iter().all(|k| cur.contains(k)) {
                 return;
             }
         }
-        self.selected_clip = all.last().copied();
-        self.selected_clips = all;
-        self.selected_notes.clear();
+        self.selection.selected_clip = all.last().copied();
+        self.selection.selected_clips = all;
+        self.selection.selected_notes.clear();
     }
 
     /// 単一 clip (新規作成直後の `ClipRef`) を選択集合にする。 ClipRef→ClipKey
@@ -15622,10 +14920,10 @@ impl AppData {
     /// 結果選択用。
     fn set_single_clip_selection(&mut self, r: ClipRef) {
         let key = self.clip_key_of(r);
-        self.selected_clip = key;
-        self.selected_clips = key.into_iter().collect();
+        self.selection.selected_clip = key;
+        self.selection.selected_clips = key.into_iter().collect();
         if key.is_some() {
-            self.last_edit_select = Some(EditSelectSurface::Clips);
+            self.selection.last_edit_select = Some(EditSelectSurface::Clips);
         }
     }
 
@@ -15634,11 +14932,11 @@ impl AppData {
     fn select_new_clips(&mut self, refs: &[ClipRef]) {
         let keys: Vec<common::model::ClipKey> =
             refs.iter().filter_map(|r| self.clip_key_of(*r)).collect();
-        self.selected_clip = keys.last().copied();
-        if self.selected_clip.is_some() {
-            self.last_edit_select = Some(EditSelectSurface::Clips);
+        self.selection.selected_clip = keys.last().copied();
+        if self.selection.selected_clip.is_some() {
+            self.selection.last_edit_select = Some(EditSelectSurface::Clips);
         }
-        self.selected_clips = keys;
+        self.selection.selected_clips = keys;
     }
 
     /// Ctrl+A (ピアノロール): **表示中の全 MIDI クリップ** の全ノートを packed note id で返す。
@@ -15651,13 +14949,13 @@ impl AppData {
             if self.is_pianoroll_clip_locked(r) {
                 continue;
             }
-            let Some(track) = self.song.tracks.get(r.track as usize) else {
+            let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
                 continue;
             };
             let Some(clip) = track.clips.get(r.clip as usize) else {
                 continue;
             };
-            let n = self.song.clip_notes(clip).len();
+            let n = self.song_doc.song().clip_notes(clip).len();
             out.extend((0..n).map(|local| Self::pack_note_id(slot, local)));
         }
         out
@@ -15666,16 +14964,16 @@ impl AppData {
     /// Ctrl+A (オーディオエディタ): 開いている clip の全 audio event index
     /// を返す。 audio_editor_clip が無い / 非 audio なら空。
     pub fn all_audio_event_indices(&self) -> Vec<usize> {
-        let Some(target) = self.audio_editor_clip else {
+        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
             return Vec::new();
         };
-        let Some(track) = self.song.tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
             return Vec::new();
         };
         let Some(clip) = track.clips.get(target.clip as usize) else {
             return Vec::new();
         };
-        match self.song.clip_contents.get(&clip.content_id) {
+        match self.song_doc.song().clip_contents.get(&clip.content_id) {
             Some(common::model::ClipContent::Audio(audio)) => (0..audio.events.len()).collect(),
             _ => Vec::new(),
         }
@@ -15690,12 +14988,12 @@ impl AppData {
         &self,
         lane: common::model::AutomationLaneKey,
     ) -> Vec<AutomationPointKeyRef> {
-        let Some(lane_ref) = self.song.automation_lane_by_key(lane.track, lane.lane) else {
+        let Some(lane_ref) = self.song_doc.song().automation_lane_by_key(lane.track, lane.lane) else {
             return Vec::new();
         };
         let mut out = Vec::new();
         for clip in &lane_ref.clips {
-            let n = match self.song.clip_contents.get(&clip.content_id) {
+            let n = match self.song_doc.song().clip_contents.get(&clip.content_id) {
                 Some(common::model::ClipContent::Automation(a)) => a.points.len(),
                 _ => 0,
             };
@@ -15718,7 +15016,7 @@ impl AppData {
         &self,
         lane: common::model::AutomationLaneKey,
     ) -> Vec<common::model::AutomationClipKey> {
-        let Some(lane_ref) = self.song.automation_lane_by_key(lane.track, lane.lane) else {
+        let Some(lane_ref) = self.song_doc.song().automation_lane_by_key(lane.track, lane.lane) else {
             return Vec::new();
         };
         lane_ref
@@ -15739,7 +15037,7 @@ impl AppData {
     /// `target` を末尾 (= primary) に置いて piano_roll fit 対象を維持する。
     fn select_linked_clips(&mut self, target: ClipRef) {
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -15748,7 +15046,7 @@ impl AppData {
             return;
         };
         let mut linked = Vec::new();
-        for (t_idx, track) in self.song.tracks.iter().enumerate() {
+        for (t_idx, track) in self.song_doc.song().tracks.iter().enumerate() {
             for (c_idx, clip) in track.clips.iter().enumerate() {
                 if clip.content_id == content_id {
                     linked.push(ClipRef {
@@ -15767,7 +15065,7 @@ impl AppData {
         }
         let count = linked.len();
         self.set_clip_selection(linked);
-        self.status_message = if count <= 1 {
+        self.ui_ephemeral.status_message = if count <= 1 {
             "共有クリップはありません (この clip は単独)".to_string()
         } else {
             format!("共有クリップ {count} 個を選択しました")
@@ -15790,9 +15088,9 @@ impl AppData {
         if shown.is_empty() {
             return;
         }
-        let (grid_w, grid_h) = self.last_pianoroll_grid_size;
+        let (grid_w, grid_h) = self.ui_ephemeral.last_pianoroll_grid_size;
         if grid_w < 16.0 || grid_h < 16.0 {
-            self.pending_pianoroll_fit = true;
+            self.ui_ephemeral.pending_pianoroll_fit = true;
             return;
         }
         let multi = shown.len() >= 2;
@@ -15806,7 +15104,7 @@ impl AppData {
         let mut union_start = f64::INFINITY;
         let mut union_end = f64::NEG_INFINITY;
         for &r in &shown {
-            let Some(track) = self.song.tracks.get(r.track as usize) else {
+            let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
                 continue;
             };
             let Some(clip) = track.clips.get(r.clip as usize) else {
@@ -15815,7 +15113,7 @@ impl AppData {
             let offset = if multi { clip.start_beat } else { 0.0 };
             union_start = union_start.min(offset);
             union_end = union_end.max(offset + clip.length_beats);
-            for n in self.song.clip_notes(clip) {
+            for n in self.song_doc.song().clip_notes(clip) {
                 note_count += 1;
                 let s = n.start_beat + offset;
                 min_beat = min_beat.min(s);
@@ -15851,9 +15149,9 @@ impl AppData {
         };
 
         if multi {
-            self.multi_clip_view = fitted;
-        } else if let Some(key) = self.selected_clip {
-            self.piano_roll_views.insert(key, fitted);
+            self.ui_prefs.multi_clip_view = fitted;
+        } else if let Some(key) = self.selection.selected_clip {
+            self.ui_prefs.piano_roll_views.insert(key, fitted);
         }
     }
 
@@ -15864,19 +15162,19 @@ impl AppData {
     /// 32 hop で cycle 安全。
     pub fn is_hidden_under_collapsed_group(&self, track_id: u32) -> bool {
         let mut cursor = self
-            .song
+            .song_doc.song()
             .track_by_id(track_id)
             .and_then(|t| t.parent_group_id);
         let mut hops = 0u8;
         while let Some(pid) = cursor {
-            if self.collapsed_groups.contains(&pid) {
+            if self.ui_prefs.collapsed_groups.contains(&pid) {
                 return true;
             }
             hops += 1;
             if hops > 32 {
                 break;
             }
-            cursor = self.song.track_by_id(pid).and_then(|t| t.parent_group_id);
+            cursor = self.song_doc.song().track_by_id(pid).and_then(|t| t.parent_group_id);
         }
         false
     }
@@ -15927,14 +15225,14 @@ impl AppData {
 
     /// 追従方式を直接設定する (トランスポートのドロップダウン)。
     fn set_arrange_follow(&mut self, mode: common::model::FollowMode) {
-        self.arrange_follow = mode;
-        self.status_message = Self::follow_mode_label(mode).into();
+        self.ui_prefs.arrange_follow = mode;
+        self.ui_ephemeral.status_message = Self::follow_mode_label(mode).into();
     }
 
     /// `Alt+F`: 追従方式を `Off → Scroll → Page → Off` と循環する。
     fn cycle_arrange_follow(&mut self) {
         use common::model::FollowMode;
-        let next = match self.arrange_follow {
+        let next = match self.ui_prefs.arrange_follow {
             FollowMode::Off => FollowMode::Scroll,
             FollowMode::Scroll => FollowMode::Page,
             FollowMode::Page => FollowMode::Off,
@@ -15947,8 +15245,8 @@ impl AppData {
     /// (追従は再生中のみ作用するので、 停止中の view 操作で状態を変える必要がない。
     /// これで「停止中にスクロール → 再生で追従再開」 が成立する)。
     fn cancel_follow_on_manual_view_change(&mut self) {
-        if self.is_playing {
-            self.arrange_follow = common::model::FollowMode::Off;
+        if self.transport.is_playing {
+            self.ui_prefs.arrange_follow = common::model::FollowMode::Off;
         }
     }
 
@@ -15958,7 +15256,7 @@ impl AppData {
         // X (fit) は明示的な view 操作なので再生中は追従を解除する (= follow が
         // 次 tick で fit を上書きして戻すのを防ぐ)。
         self.cancel_follow_on_manual_view_change();
-        let (canvas_w, canvas_h) = self.last_arrange_canvas_size;
+        let (canvas_w, canvas_h) = self.ui_ephemeral.last_arrange_canvas_size;
         if canvas_w < 16.0 || canvas_h < 16.0 {
             return;
         }
@@ -15968,7 +15266,7 @@ impl AppData {
         // ここでも親 chain に collapsed があれば除外して同じ可視集合を数える
         // (`compute_track_depth` と同じ parent_group_id walk、 32 hop で cycle 安全)。
         let visible_track_count = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .filter(|t| !self.is_hidden_under_collapsed_group(t.id))
@@ -15980,9 +15278,9 @@ impl AppData {
         // master 行 (`MASTER_TRACK_ID`) の song_lanes も同様。 collapsed track / collapsed
         // automation / 非 visible lane は widget が描かないので除外。
         let mut fit_lane_keys: Vec<common::model::AutomationLaneKey> = Vec::new();
-        for t in &self.song.tracks {
+        for t in &self.song_doc.song().tracks {
             if self.is_hidden_under_collapsed_group(t.id)
-                || !self.expanded_automation_tracks.contains(&t.id)
+                || !self.ui_prefs.expanded_automation_tracks.contains(&t.id)
             {
                 continue;
             }
@@ -15990,8 +15288,8 @@ impl AppData {
                 fit_lane_keys.push(common::model::AutomationLaneKey { track: t.id, lane: l.id });
             }
         }
-        if self.master_row_automation_expanded {
-            for l in self.song.song_lanes.iter().filter(|l| l.visible) {
+        if self.ui_prefs.master_row_automation_expanded {
+            for l in self.song_doc.song().song_lanes.iter().filter(|l| l.visible) {
                 fit_lane_keys.push(common::model::AutomationLaneKey {
                     track: common::model::MASTER_TRACK_ID,
                     lane: l.id,
@@ -16002,7 +15300,7 @@ impl AppData {
         let row_count = (visible_track_count + fit_lane_keys.len() + 1).max(1);
 
         let (min_beat, max_beat) = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .flat_map(|t| t.clips.iter())
@@ -16012,14 +15310,14 @@ impl AppData {
         let (min_beat, max_beat) = if min_beat.is_finite() {
             (min_beat, max_beat)
         } else {
-            (0.0, self.song.length_beats.max(16.0))
+            (0.0, self.song_doc.song().length_beats.max(16.0))
         };
 
         let span_beats = (max_beat - min_beat + 4.0).max(4.0);
-        self.arrange_scroll_beat = (min_beat - 2.0).max(0.0) as f32;
-        self.arrange_zoom_x = (f64::from(canvas_w) / span_beats).clamp(2.0, 400.0) as f32;
+        self.ui_prefs.arrange_scroll_beat = (min_beat - 2.0).max(0.0) as f32;
+        self.ui_prefs.arrange_zoom_x = (f64::from(canvas_w) / span_beats).clamp(2.0, 400.0) as f32;
         let row_h = (canvas_h / row_count as f32).clamp(16.0, 96.0);
-        self.arrange_track_row_h = row_h;
+        self.ui_prefs.arrange_track_row_h = row_h;
         // 「全 track / lane を上端から収める」 のが fit の定義なので:
         //   - 縦スクロールを 0 に戻す (怠ると row 高だけ縮んで track_top が残り、
         //     全 track が viewport 上方へ押し出されて見えなくなる = ユーザー報告のバグ)。
@@ -16031,15 +15329,15 @@ impl AppData {
         //     張り直す (model height_px は保存対象なので汚さない)。 これで「track だけ
         //     縮んで automation レーンが高いまま」 を解消。 Z 拡大の残り override も
         //     ここで上書きされる。 splitter resize / fresh Z で個別に解除される。
-        self.arrange_track_top = 0.0;
-        self.track_row_overrides.clear();
-        self.arrange_zoom_history.clear();
-        self.arrange_zoom_anchor = None;
-        self.automation_lane_row_overrides.clear();
+        self.ui_prefs.arrange_track_top = 0.0;
+        self.ui_prefs.track_row_overrides.clear();
+        self.ui_ephemeral.arrange_zoom_history.clear();
+        self.ui_ephemeral.arrange_zoom_anchor = None;
+        self.ui_prefs.automation_lane_row_overrides.clear();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let lane_px = (row_h.round() as u16).max(1);
         for k in fit_lane_keys {
-            self.automation_lane_row_overrides.insert(k, lane_px);
+            self.ui_prefs.automation_lane_row_overrides.insert(k, lane_px);
         }
     }
 
@@ -16064,7 +15362,7 @@ impl AppData {
         self.cancel_follow_on_manual_view_change();
         let sig = self.current_zoom_selection_sig(automation);
         // 直近アンカーと同じ選択 + view が手付かずなら段階を継続、 それ以外は仕切り直し。
-        let stage = match self.arrange_zoom_anchor.take() {
+        let stage = match self.ui_ephemeral.arrange_zoom_anchor.take() {
             Some(a) if a.sig == sig && self.arrange_view_matches(&a.applied_view) => a.stage,
             _ => 0,
         };
@@ -16075,7 +15373,7 @@ impl AppData {
             _ => Some(stage),
         };
         if let Some(stage) = new_stage {
-            self.arrange_zoom_anchor = Some(ArrangeZoomAnchor {
+            self.ui_ephemeral.arrange_zoom_anchor = Some(ArrangeZoomAnchor {
                 sig,
                 applied_view: self.capture_arrange_view(),
                 stage,
@@ -16090,7 +15388,7 @@ impl AppData {
         let Some((min_start, max_end)) = self.arrange_selection_beat_span(automation) else {
             return false;
         };
-        let (canvas_w, _) = self.last_arrange_canvas_size;
+        let (canvas_w, _) = self.ui_ephemeral.last_arrange_canvas_size;
         if canvas_w < 16.0 {
             return false;
         }
@@ -16098,15 +15396,15 @@ impl AppData {
         // (一時 override) を破棄してから snapshot を撮る — snapshot に古い拡大を
         // 持ち越さないことで、 後で `X` / fit したとき automation レーンだけ高いまま
         // 残るのを防ぐ。 override は lane-fill 中だけ存在する一時状態。
-        self.automation_lane_row_overrides.clear();
+        self.ui_prefs.automation_lane_row_overrides.clear();
         let snap = self.capture_arrange_view();
-        self.arrange_zoom_history.push(snap);
+        self.ui_ephemeral.arrange_zoom_history.push(snap);
         let span = max_end - min_start;
         // clip が canvas 幅の ~92% を占めるよう左右に proportional padding
         // (短い clip でも極端に拡大しすぎないよう最小 0.5 beat)。
         let pad = (span * 0.04).max(0.5);
-        self.arrange_scroll_beat = (min_start - pad).max(0.0) as f32;
-        self.arrange_zoom_x =
+        self.ui_prefs.arrange_scroll_beat = (min_start - pad).max(0.0) as f32;
+        self.ui_prefs.arrange_zoom_x =
             (f64::from(canvas_w) / (span + pad * 2.0)).clamp(2.0, 400.0) as f32;
         true
     }
@@ -16116,7 +15414,7 @@ impl AppData {
     /// 群を viewport に収める。 適用したら `true`、 lanes 過小 / 対象解決不能なら
     /// `false` (view 不変)。
     fn zoom_arrange_vertical(&mut self, automation: bool) -> bool {
-        let lanes_h = self.last_arrange_canvas_size.1;
+        let lanes_h = self.ui_ephemeral.last_arrange_canvas_size.1;
         if lanes_h < 16.0 {
             return false;
         }
@@ -16124,20 +15422,20 @@ impl AppData {
         // (= MIDI track の縦ズームの「レーン版」)。 primary レーンの実 content-Y は
         // view が widget の実 rect から算出済 (`arrange_primary_lane_content_top`)。
         if automation
-            && let Some((lane_key, content_top)) = self.arrange_primary_lane_content_top
+            && let Some((lane_key, content_top)) = self.ui_ephemeral.arrange_primary_lane_content_top
             && self
-                .selected_automation_clips
+                .selection.selected_automation_clips
                 .iter()
                 .any(|k| k.lane_key() == lane_key)
         {
             let snap = self.capture_arrange_view();
-            self.arrange_zoom_history.push(snap);
+            self.ui_ephemeral.arrange_zoom_history.push(snap);
             // レーン高 = viewport 高 (u16 へ saturating)。 レーンより上の行高は
             // 変わらないので content_top はそのままレーン上端の絶対 y。
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let lane_px = lanes_h.clamp(16.0, f32::from(u16::MAX)) as u16;
-            self.automation_lane_row_overrides.insert(lane_key, lane_px);
-            self.arrange_track_top = content_top.max(0.0);
+            self.ui_prefs.automation_lane_row_overrides.insert(lane_key, lane_px);
+            self.ui_prefs.arrange_track_top = content_top.max(0.0);
             return true;
         }
         // 通常 clip 選択: 選択 track 群が viewport いっぱいになるよう uniform 行高 +
@@ -16146,12 +15444,12 @@ impl AppData {
             return false;
         };
         let snap = self.capture_arrange_view();
-        self.arrange_zoom_history.push(snap);
+        self.ui_ephemeral.arrange_zoom_history.push(snap);
         let rows = (r_max - r_min + 1) as f32;
         let row_h = (lanes_h / rows).clamp(16.0, 2000.0);
-        self.track_row_overrides.clear();
-        self.arrange_track_row_h = row_h;
-        self.arrange_track_top = (r_min as f32) * row_h;
+        self.ui_prefs.track_row_overrides.clear();
+        self.ui_prefs.arrange_track_row_h = row_h;
+        self.ui_prefs.arrange_track_top = (r_min as f32) * row_h;
         true
     }
 
@@ -16159,9 +15457,9 @@ impl AppData {
     /// / 対象面)。 これが変わると別対象とみなして段階 0 (横ズーム) から仕切り直す。
     fn current_zoom_selection_sig(&self, automation: bool) -> ZoomSelectionSig {
         ZoomSelectionSig {
-            clips: self.selected_clips.clone(),
-            clip: self.selected_clip,
-            automation: self.selected_automation_clips.clone(),
+            clips: self.selection.selected_clips.clone(),
+            clip: self.selection.selected_clip,
+            automation: self.selection.selected_automation_clips.clone(),
             target_automation: automation,
         }
     }
@@ -16185,7 +15483,7 @@ impl AppData {
         let mut track_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut include_master = false;
         if automation {
-            for k in &self.selected_automation_clips {
+            for k in &self.selection.selected_automation_clips {
                 if k.track == common::model::MASTER_TRACK_ID {
                     include_master = true;
                 } else {
@@ -16193,9 +15491,9 @@ impl AppData {
                 }
             }
         } else {
-            track_ids.extend(self.selected_clips.iter().map(|k| k.track_id));
+            track_ids.extend(self.selection.selected_clips.iter().map(|k| k.track_id));
             if track_ids.is_empty()
-                && let Some(k) = self.selected_clip
+                && let Some(k) = self.selection.selected_clip
             {
                 track_ids.insert(k.track_id);
             }
@@ -16210,7 +15508,7 @@ impl AppData {
         }
         // 行 0 = master、 可視 track の i 番目は行 i+1。
         let mut vi = 1usize;
-        for t in &self.song.tracks {
+        for t in &self.song_doc.song().tracks {
             if self.is_hidden_under_collapsed_group(t.id) {
                 continue;
             }
@@ -16232,9 +15530,9 @@ impl AppData {
         let (mut min_start, mut max_end) = (f64::INFINITY, f64::NEG_INFINITY);
         if automation {
             // automation clip: lane (track / master) を解決して span を畳み込む。
-            for &k in &self.selected_automation_clips {
+            for &k in &self.selection.selected_automation_clips {
                 if let Some(clip) = self
-                    .song
+                    .song_doc.song()
                     .automation_lane_by_key(k.track, k.lane)
                     .and_then(|lane| lane.clip_by_id(k.clip))
                 {
@@ -16244,9 +15542,9 @@ impl AppData {
             }
         } else {
             // 通常 clip: selected_clips 優先、 空なら primary selected_clip 単独。
-            let mut clip_keys = self.selected_clips.clone();
+            let mut clip_keys = self.selection.selected_clips.clone();
             if clip_keys.is_empty() {
-                clip_keys.extend(self.selected_clip);
+                clip_keys.extend(self.selection.selected_clip);
             }
             for key in clip_keys {
                 if let Some(clip) = self.clip_at(key) {
@@ -16261,12 +15559,12 @@ impl AppData {
     /// 現在の arrangement view 状態を snapshot (ズーム履歴 push 用)。
     fn capture_arrange_view(&self) -> ArrangeViewSnapshot {
         ArrangeViewSnapshot {
-            zoom_x: self.arrange_zoom_x,
-            scroll_beat: self.arrange_scroll_beat,
-            row_h: self.arrange_track_row_h,
-            track_top: self.arrange_track_top,
-            row_overrides: self.track_row_overrides.clone(),
-            lane_row_overrides: self.automation_lane_row_overrides.clone(),
+            zoom_x: self.ui_prefs.arrange_zoom_x,
+            scroll_beat: self.ui_prefs.arrange_scroll_beat,
+            row_h: self.ui_prefs.arrange_track_row_h,
+            track_top: self.ui_prefs.arrange_track_top,
+            row_overrides: self.ui_prefs.track_row_overrides.clone(),
+            lane_row_overrides: self.ui_prefs.automation_lane_row_overrides.clone(),
         }
     }
 
@@ -16275,18 +15573,18 @@ impl AppData {
     fn arrange_zoom_back(&mut self) {
         // X (zoom back / fit) は明示的な view 操作なので再生中は追従を解除する。
         self.cancel_follow_on_manual_view_change();
-        if let Some(v) = self.arrange_zoom_history.pop() {
-            self.arrange_zoom_x = v.zoom_x;
-            self.arrange_scroll_beat = v.scroll_beat;
-            self.arrange_track_row_h = v.row_h;
-            self.arrange_track_top = v.track_top;
-            self.track_row_overrides = v.row_overrides;
-            self.automation_lane_row_overrides = v.lane_row_overrides;
+        if let Some(v) = self.ui_ephemeral.arrange_zoom_history.pop() {
+            self.ui_prefs.arrange_zoom_x = v.zoom_x;
+            self.ui_prefs.arrange_scroll_beat = v.scroll_beat;
+            self.ui_prefs.arrange_track_row_h = v.row_h;
+            self.ui_prefs.arrange_track_top = v.track_top;
+            self.ui_prefs.track_row_overrides = v.row_overrides;
+            self.ui_prefs.automation_lane_row_overrides = v.lane_row_overrides;
         } else {
             self.fit_arrange_to_content();
         }
         // 1 段戻したら段階ズームのアンカーは無効 (次の Z は仕切り直し)。
-        self.arrange_zoom_anchor = None;
+        self.ui_ephemeral.arrange_zoom_anchor = None;
     }
 
     fn set_clip_positions(&mut self, entries: &[(ClipRef, u32, f64)]) {
@@ -16306,7 +15604,7 @@ impl AppData {
         for (source, to_track_id, new_start_beat) in entries {
             let new_start = new_start_beat.max(0.0);
             let Some(source_track_id) = self
-                .song
+                .song_doc.song()
                 .tracks
                 .get(source.track as usize)
                 .map(|t| t.id)
@@ -16314,7 +15612,7 @@ impl AppData {
                 continue;
             };
             if source_track_id == to_track_id {
-                if let Some(track) = self.song.tracks.get_mut(source.track as usize)
+                if let Some(track) = self.song_doc.song().tracks.get_mut(source.track as usize)
                     && let Some(clip) = track.clips.get_mut(source.clip as usize)
                 {
                     clip.start_beat = new_start;
@@ -16322,12 +15620,12 @@ impl AppData {
                 }
             } else {
                 let Some(to_track_idx) =
-                    self.song.track_index_by_id(to_track_id)
+                    self.song_doc.song().track_index_by_id(to_track_id)
                 else {
                     continue;
                 };
                 let Some(removed) =
-                    self.song.tracks.get_mut(source.track as usize).and_then(|t| {
+                    self.song_doc.song().tracks.get_mut(source.track as usize).and_then(|t| {
                         if (source.clip as usize) < t.clips.len() {
                             Some(t.clips.remove(source.clip as usize))
                         } else {
@@ -16337,7 +15635,7 @@ impl AppData {
                 else {
                     continue;
                 };
-                let Some(to_track) = self.song.tracks.get_mut(to_track_idx) else {
+                let Some(to_track) = self.song_doc.song().tracks.get_mut(to_track_idx) else {
                     continue;
                 };
                 let new_clip_id = to_track.alloc_clip_id();
@@ -16349,10 +15647,10 @@ impl AppData {
             }
         }
         // 新 clip 群を stable ClipKey (track.id + clip.id) で選択。
-        self.selected_clips = new_refs
+        self.selection.selected_clips = new_refs
             .iter()
             .filter_map(|(t_idx, c_id)| {
-                let track = self.song.tracks.get(*t_idx as usize)?;
+                let track = self.song_doc.song().tracks.get(*t_idx as usize)?;
                 track
                     .clips
                     .iter()
@@ -16363,7 +15661,7 @@ impl AppData {
                     })
             })
             .collect();
-        self.selected_clip = self.selected_clips.last().copied();
+        self.selection.selected_clip = self.selection.selected_clips.last().copied();
         self.sync_song_to_plugin_host();
     }
 
@@ -16396,8 +15694,8 @@ impl AppData {
     /// 保ったまま ports を空にして dispatch を無害化する。元トラックの mute も解除する
     /// (= 元トラックが with-FX bounce で mute 済みでも isolate render は鳴らす)。
     fn isolated_bounce_song(&self, target: ClipRef, bypass_inserts: bool) -> Option<Song> {
-        let track = self.song.tracks.get(target.track as usize)?;
-        let mut isolated = self.song.clone();
+        let track = self.song_doc.song().tracks.get(target.track as usize)?;
+        let mut isolated = self.song_doc.song().clone();
         isolated.master_fx_chain.clear();
         let mut kept = track.clone();
         kept.parent_group_id = None;
@@ -16438,14 +15736,14 @@ impl AppData {
         };
         let filename = format!("{safe_name}{infix}_{ts:08}.wav");
         let project_dir = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
         match project_dir.as_deref() {
             Some(dir) => {
                 let bounce_dir = dir.join("bounce");
                 if let Err(e) = std::fs::create_dir_all(&bounce_dir) {
-                    self.status_message = format!("Bounce: bounce/ 作成失敗: {e}");
+                    self.ui_ephemeral.status_message = format!("Bounce: bounce/ 作成失敗: {e}");
                     return None;
                 }
                 Some((
@@ -16458,7 +15756,7 @@ impl AppData {
             None => {
                 let cache = import_audio::unsaved_bounce_cache_dir();
                 if let Err(e) = std::fs::create_dir_all(&cache) {
-                    self.status_message = format!("Bounce: bounce_cache/ 作成失敗: {e}");
+                    self.ui_ephemeral.status_message = format!("Bounce: bounce_cache/ 作成失敗: {e}");
                     return None;
                 }
                 let dst = cache.join(&filename);
@@ -16475,34 +15773,34 @@ impl AppData {
     /// 「全く無反応」 を解消)。完了通知の `sync_song_to_plugin_host` が full song を再
     /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
     fn start_clip_bounce(&mut self, target: ClipRef, mode: BounceMode) {
-        if self.pending_clip_fx_bounce.is_some() {
-            self.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
+        if self.ipc.pending_clip_fx_bounce.is_some() {
+            self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
-        let Some(track) = self.song.tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
             return;
         };
         let source_track_id = track.id;
         let Some(clip) = track.clips.get(target.clip as usize).cloned() else {
             return;
         };
-        let clip_name = self.song.content_name(clip.content_id).to_string();
+        let clip_name = self.song_doc.song().content_name(clip.content_id).to_string();
         // bounce 可能なのは Audio / Midi (= 歌唱含む) のみ。Automation/Video/Image/Text は対象外。
         if !matches!(
-            self.song.clip_contents.get(&clip.content_id),
+            self.song_doc.song().clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Midi(_) | common::model::ClipContent::Audio(_))
         ) {
-            self.status_message = "Bounce: audio / MIDI / 歌唱クリップのみ対象です".into();
+            self.ui_ephemeral.status_message = "Bounce: audio / MIDI / 歌唱クリップのみ対象です".into();
             return;
         }
-        let engine_sr = self.sample_rate;
-        let bpm = self.song.bpm.max(1.0) as f64;
+        let engine_sr = self.ipc.sample_rate;
+        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
         let samples_per_beat = engine_sr as f64 * 60.0 / bpm;
         let start_frame = (clip.start_beat * samples_per_beat).max(0.0) as u64;
         let end_frame =
             ((clip.start_beat + clip.length_beats) * samples_per_beat).max(0.0) as u64;
         if end_frame <= start_frame {
-            self.status_message = "Bounce: clip 長が 0 です".into();
+            self.ui_ephemeral.status_message = "Bounce: clip 長が 0 です".into();
             return;
         }
         let Some((out_path, source_path)) = self.bounce_output_path(&clip_name, mode) else {
@@ -16511,7 +15809,7 @@ impl AppData {
         let Some(isolated) = self.isolated_bounce_song(target, mode == BounceMode::InPlace) else {
             return;
         };
-        self.pending_clip_fx_bounce = Some(PendingClipFxBounce {
+        self.ipc.pending_clip_fx_bounce = Some(PendingClipFxBounce {
             mode,
             source_track: target.track,
             source_clip: target.clip,
@@ -16525,11 +15823,11 @@ impl AppData {
         });
         // SetRenderMode(Offline) → LoadSong(isolated) → BounceClipFxOnline。完了通知で
         // Realtime に戻し、sync_song_to_plugin_host が full song を再 LoadSong して復元する。
-        self.send_audio(MainToChild::LoadSong(isolated));
-        self.send_plugin(MainToChild::SetRenderMode(
+        self.send_audio(AudioCommand::LoadSong(isolated));
+        self.send_plugin(PluginCommand::SetRenderMode(
             common::protocol::RenderMode::Offline,
         ));
-        self.send_audio(MainToChild::BounceClipFxOnline {
+        self.send_audio(AudioCommand::BounceClipFxOnline {
             path: out_path,
             source_track: target.track,
             source_clip: target.clip,
@@ -16540,7 +15838,7 @@ impl AppData {
             BounceMode::InPlace => "Bounce In Place",
             BounceMode::WithFx => "Bounce (with FX)",
         };
-        self.status_message = format!("{label}: '{clip_name}' を render 中...");
+        self.ui_ephemeral.status_message = format!("{label}: '{clip_name}' を render 中...");
     }
 
     /// In Place = 音源/synth の素の音 (insert FX 抜き) を engine offline
@@ -16549,17 +15847,17 @@ impl AppData {
         self.request_bounce(target, BounceMode::InPlace);
     }
 
-    /// track の builtin VOICEVOX device の host plugin_id を `loaded_slots`
-    /// から引く (`sync_vocal_metadata` と同じ解決)。device 未挿入 / plugin_id 未確定
+    /// track の builtin VOICEVOX device の安定 device id を `loaded_slots`
+    /// から引く (`sync_vocal_metadata` と同じ解決)。device 未挿入 / load 未確定
     /// (load 完了通知前) なら `None`。
-    fn vocal_builtin_plugin_id(&self, track: &common::model::Track) -> Option<u32> {
+    fn vocal_builtin_plugin_id(&self, track: &common::model::Track) -> Option<u64> {
         let device_index = track.devices.iter().position(|d| {
             d.format == common::plugin_format::PluginFormat::Builtin
                 && d.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
         })?;
-        self.loaded_slots
+        self.ipc.loaded_slots
             .get(&(track.id, device_index as u32))
-            .map(|s| s.plugin_id)
+            .map(|s| s.device_id)
     }
 
     /// bounce の入口。歌唱トラックは合成が非同期 HTTP で走り、 offline render が
@@ -16568,14 +15866,14 @@ impl AppData {
     /// 進んだ通知）を待ってから `start_clip_bounce` する。歌唱以外 (Audio / 通常 MIDI)、
     /// または plugin_id 未確定なら即 `start_clip_bounce`。
     fn request_bounce(&mut self, target: ClipRef, mode: BounceMode) {
-        if self.pending_clip_fx_bounce.is_some() || self.pending_vocal_synth_bounce.is_some() {
-            self.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
+        if self.ipc.pending_clip_fx_bounce.is_some() || self.ipc.pending_vocal_synth_bounce.is_some() {
+            self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
         // 歌唱トラック + builtin plugin_id 解決済み → 合成完了を待ってから render。
         // 待ち中の編集で index が動いても追跡できるよう stable id で退避する。
         let vocal = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .filter(|t| t.is_voicevox_vocal())
@@ -16584,12 +15882,12 @@ impl AppData {
                 let clip_id = t.clips.get(target.clip as usize)?.id;
                 Some((plugin_id, t.id, clip_id))
             });
-        if let Some((plugin_id, track_id, clip_id)) = vocal {
-            self.pending_vocal_synth_bounce =
+        if let Some((device_id, track_id, clip_id)) = vocal {
+            self.ipc.pending_vocal_synth_bounce =
                 Some(PendingVocalSynthBounce { track_id, clip_id, mode });
             self.sync_vocal_metadata();
-            self.send_plugin(common::protocol::MainToChild::PrepareVocalSynth { plugin_id });
-            self.status_message = "Bounce: 歌唱を合成中...".into();
+            self.send_plugin(PluginCommand::PrepareVocalSynth { device_id });
+            self.ui_ephemeral.status_message = "Bounce: 歌唱を合成中...".into();
             return;
         }
         self.start_clip_bounce(target, mode);
@@ -16615,8 +15913,8 @@ impl AppData {
     /// 派生同期つき) は使わない。 これを怠ると失敗後の再生が isolate された
     /// 1 トラックのみになる。
     fn restore_engine_song_after_bounce(&mut self) {
-        let song = self.song.clone();
-        self.send_audio(MainToChild::LoadSong(song));
+        let song = self.song_doc.song().clone();
+        self.send_audio(AudioCommand::LoadSong(song));
     }
 
     /// PR-C: BounceClipFxOnline 完了通知の処理。 SetRenderMode(Realtime)
@@ -16631,10 +15929,10 @@ impl AppData {
         error: Option<String>,
         frames: u64,
     ) {
-        let Some(pending) = self.pending_clip_fx_bounce.take() else {
+        let Some(pending) = self.ipc.pending_clip_fx_bounce.take() else {
             // 対応する pending が無い completion (respawn 後の残骸等)。 render mode
             // だけ防御的に Realtime へ戻す。
-            self.send_plugin(MainToChild::SetRenderMode(
+            self.send_plugin(PluginCommand::SetRenderMode(
                 common::protocol::RenderMode::Realtime,
             ));
             tracing::warn!("BounceClipFxComplete with no pending bounce; ignoring");
@@ -16651,11 +15949,11 @@ impl AppData {
                 "BounceClipFxComplete identifier mismatch with pending; ignoring"
             );
             // 進行中の本命 bounce の追跡 (と Offline render mode) は壊さない。
-            self.pending_clip_fx_bounce = Some(pending);
+            self.ipc.pending_clip_fx_bounce = Some(pending);
             return;
         }
         // bookend を Realtime に戻す (= 失敗時も忘れず)。
-        self.send_plugin(MainToChild::SetRenderMode(
+        self.send_plugin(PluginCommand::SetRenderMode(
             common::protocol::RenderMode::Realtime,
         ));
         let label = match pending.mode {
@@ -16663,13 +15961,13 @@ impl AppData {
             BounceMode::WithFx => "Bounce (with FX)",
         };
         if let Some(err) = error {
-            self.status_message = format!("{label} 失敗: {err}");
+            self.ui_ephemeral.status_message = format!("{label} 失敗: {err}");
             let _ = std::fs::remove_file(&path);
             self.restore_engine_song_after_bounce();
             return;
         }
         if frames == 0 {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 format!("{label}: render 結果が空です (= silence のみ?)");
             let _ = std::fs::remove_file(&path);
             self.restore_engine_song_after_bounce();
@@ -16678,9 +15976,9 @@ impl AppData {
         // InPlace の置換対象 content が bounce 中の編集で消えていたら結果を破棄
         // (index でなく stable id で判定。 別クリップを誤置換しない)。
         if pending.mode == BounceMode::InPlace
-            && !self.song.clip_contents.contains_key(&pending.source_content_id)
+            && !self.song_doc.song().clip_contents.contains_key(&pending.source_content_id)
         {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Bounce In Place: 対象クリップが消えたため結果を破棄しました".into();
             let _ = std::fs::remove_file(&path);
             self.restore_engine_song_after_bounce();
@@ -16688,9 +15986,8 @@ impl AppData {
         }
 
         // 1 完了 = 1 Undo step として snapshot を取る。
-        self.push_undo_snapshot();
 
-        let engine_sr = self.sample_rate;
+        let engine_sr = self.ipc.sample_rate;
         // 採番した new_source_id を `audio_sources` に登録。 path は
         // `pending.source_path` (= ProjectRelative or Absolute、 確定済)。
         let new_source = common::model::AudioSource {
@@ -16698,17 +15995,17 @@ impl AppData {
             sample_rate: engine_sr,
             channels: 2,
             frames,
-            original_bpm: Some(self.song.bpm),
+            original_bpm: Some(self.song_doc.song().bpm),
             root_key: None,
         };
-        let new_source_id = self.song.alloc_audio_source_id();
-        self.song.audio_sources.insert(new_source_id, new_source);
+        let new_source_id = self.song_doc.song().alloc_audio_source_id();
+        self.edit_song(|song| song.audio_sources.insert(new_source_id, new_source));
 
         // decode して audio_source_cache に登録 (= 即時再生で playback
         // できるよう)。 失敗しても tracker 表示等は問題ないので warn だけ。
         match crate::import_audio::decode_wav(&path) {
             Ok(buffer) => {
-                self.audio_source_cache.insert(new_source_id, Arc::new(buffer));
+                self.media.audio_source_cache.insert(new_source_id, Arc::new(buffer));
             }
             Err(e) => {
                 tracing::warn!(
@@ -16720,7 +16017,9 @@ impl AppData {
         }
 
         // 新 Clip / 置換に使う共通 audio event (single-event = bounce 結果は flat な audio)。
+        // v29: 新規 content の単一 event なので id=1 / allocator は 2 から。
         let new_event = AudioEvent {
+            id: 1,
             source_id: new_source_id,
             event_start_in_clip_beats: 0.0,
             event_length_beats: pending.clip_length_beats,
@@ -16732,24 +16031,25 @@ impl AppData {
         match pending.mode {
             BounceMode::WithFx => {
                 // 新 track 作成 (空 plugin chain)。 名前は元 clip 名 + " (FX)"。
-                let new_track_id = self.song.alloc_track_id();
+                let new_track_id = self.song_doc.song().alloc_track_id();
                 let new_track_name = format!("{} (FX)", pending.clip_name);
                 let new_track = track_with(|t| {
                     t.id = new_track_id;
                     t.name = new_track_name.clone();
                     t.clips = Vec::new();
                 });
-                self.song.tracks.push(new_track);
-                let new_track_idx = self.song.tracks.len() - 1;
+                self.edit_song(|song| song.tracks.push(new_track));
+                let new_track_idx = self.song_doc.song().tracks.len() - 1;
 
-                let new_content_id = self.song.alloc_content(
+                let new_content_id = self.song_doc.song().alloc_content(
                     common::model::ClipContent::Audio(common::model::AudioContent {
                         events: vec![new_event],
+                        next_event_id: 2,
                     }),
                     format!("{} (bounced FX)", pending.clip_name),
                 );
 
-                let new_track_mut = &mut self.song.tracks[new_track_idx];
+                let new_track_mut = &mut self.song_doc.song().tracks[new_track_idx];
                 let new_clip_id = new_track_mut.alloc_clip_id();
                 new_track_mut.clips.push(common::model::Clip {
                     id: new_clip_id,
@@ -16768,7 +16068,7 @@ impl AppData {
                 // index は bounce 中の編集で stale になり得るので stable id で解決する
                 // (削除済みなら skip = 二重再生の危険自体が無い)。
                 if let Some(src) = self
-                    .song
+                    .song_doc.song()
                     .tracks
                     .iter_mut()
                     .find(|t| t.id == pending.source_track_id)
@@ -16777,9 +16077,9 @@ impl AppData {
                 }
 
                 self.resize_track_peak_display();
-                self.is_dirty = true;
+                self.song_doc.is_dirty() = true;
                 self.sync_song_to_plugin_host();
-                self.status_message = format!(
+                self.ui_ephemeral.status_message = format!(
                     "Bounce (with FX) 完了: 新トラック '{new_track_name}' を追加 (元トラックはミュート)",
                 );
             }
@@ -16789,15 +16089,16 @@ impl AppData {
                 // 対象は bounce 開始時に捕捉した stable な content id (index 経由の
                 // 再解決は bounce 中の編集でずれる)。 存在は上で検証済み。
                 if let Some(content) =
-                    self.song.clip_contents.get_mut(&pending.source_content_id)
+                    self.song_doc.song().clip_contents.get_mut(&pending.source_content_id)
                 {
                     *content = common::model::ClipContent::Audio(common::model::AudioContent {
                         events: vec![new_event],
+                        next_event_id: 2,
                     });
                 }
-                self.is_dirty = true;
+                self.song_doc.is_dirty() = true;
                 self.sync_song_to_plugin_host();
-                self.status_message = format!("Bounce In Place 完了: '{}'", pending.clip_name);
+                self.ui_ephemeral.status_message = format!("Bounce In Place 完了: '{}'", pending.clip_name);
             }
         }
     }
@@ -16805,13 +16106,13 @@ impl AppData {
     /// `target` clip の first event の `reversed` 値を読む。 audio で
     /// ない / event が空 / 範囲外なら `false`。 メニューの toggle 用。
     fn is_clip_audio_event_reversed(&self, target: ClipRef) -> bool {
-        self.song
+        self.song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
             .and_then(|c| {
                 if let Some(common::model::ClipContent::Audio(audio)) =
-                    self.song.clip_contents.get(&c.content_id)
+                    self.song_doc.song().clip_contents.get(&c.content_id)
                 {
                     audio.events.first().map(|e| e.reversed)
                 } else {
@@ -16834,7 +16135,7 @@ impl AppData {
     pub fn all_clips_muted(&self, targets: &[ClipRef]) -> bool {
         !targets.is_empty()
             && targets.iter().all(|t| {
-                self.song
+                self.song_doc.song()
                     .tracks
                     .get(t.track as usize)
                     .and_then(|tr| tr.clips.get(t.clip as usize))
@@ -16855,11 +16156,11 @@ impl AppData {
             let Some((r, local)) = Self::decode_note_id_in(&shown, id) else {
                 return false;
             };
-            self.song
+            self.song_doc.song()
                 .tracks
                 .get(r.track as usize)
                 .and_then(|t| t.clips.get(r.clip as usize))
-                .and_then(|c| self.song.clip_notes(c).get(local).map(|n| n.muted))
+                .and_then(|c| self.song_doc.song().clip_notes(c).get(local).map(|n| n.muted))
                 .unwrap_or(false)
         })
     }
@@ -16871,7 +16172,7 @@ impl AppData {
     /// `sync_song_to_plugin_host` で daw_audio へ LoadSong flush し、再生・書き出しに反映する
     /// (is_dirty もそこで立つ)。
     fn set_clip_muted(&mut self, target: ClipRef, muted: bool) {
-        if let Some(track) = self.song.tracks.get_mut(target.track as usize)
+        if let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize)
             && let Some(clip) = track.clips.get_mut(target.clip as usize)
             && clip.muted != muted
         {
@@ -16892,7 +16193,7 @@ impl AppData {
             notes.iter().map(|&id| (id, ())),
             |app, _slot, r, items| {
                 if let Some(clip_notes) =
-                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    app.song_doc.song().notes_in_clip_mut(r.track as usize, r.clip as usize)
                 {
                     for &(local, ()) in items {
                         if let Some(n) = clip_notes.get_mut(local)
@@ -16933,7 +16234,7 @@ impl AppData {
     /// (= uniform stretch のまま)。 OFF-RT。 buffer 未 decode の event は skip。
     fn auto_warp_clip(&mut self, target: ClipRef) {
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -16941,7 +16242,7 @@ impl AppData {
         else {
             return;
         };
-        let n_events = match self.song.clip_contents.get(&content_id) {
+        let n_events = match self.song_doc.song().clip_contents.get(&content_id) {
             Some(common::model::ClipContent::Audio(a)) => a.events.len(),
             _ => return,
         };
@@ -16950,7 +16251,7 @@ impl AppData {
         // Phase A: 対象 event の source range + 配置 beat 長 (immutable borrow)。
         let mut jobs: Vec<(usize, common::model::AudioSourceId, u64, u64, f64)> = Vec::new();
         if let Some(common::model::ClipContent::Audio(a)) =
-            self.song.clip_contents.get(&content_id)
+            self.song_doc.song().clip_contents.get(&content_id)
         {
             for &i in &indices {
                 if let Some(e) = a.events.get(i) {
@@ -16971,7 +16272,7 @@ impl AppData {
         // Phase B: onset 検出 → grid snap warp markers (OFF-RT)。
         let mut results: Vec<(usize, Vec<common::model::BeatMarker>)> = Vec::new();
         for (i, source_id, start, end, length_beats) in jobs {
-            let Some(buf) = self.audio_source_cache.get(source_id) else {
+            let Some(buf) = self.media.audio_source_cache.get(source_id) else {
                 continue;
             };
             let s = start.min(buf.frames) as usize;
@@ -16997,7 +16298,7 @@ impl AppData {
         let mut warped = 0usize;
         let mut changed = false;
         if let Some(common::model::ClipContent::Audio(a)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         {
             for (i, markers) in results {
                 if let Some(ev) = a.events.get_mut(i) {
@@ -17011,7 +16312,7 @@ impl AppData {
             }
         }
         if changed {
-            self.status_message = format!("Auto-Warp: {warped} event を beat grid に整列");
+            self.ui_ephemeral.status_message = format!("Auto-Warp: {warped} event を beat grid に整列");
             self.sync_song_to_plugin_host();
         }
     }
@@ -17023,7 +16324,7 @@ impl AppData {
     /// scan)。 buffer 未 decode の event は skip (= 空 onsets で Raw 等価のまま)。
     fn detect_onsets_for_clip(&mut self, target: ClipRef) {
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -17031,7 +16332,7 @@ impl AppData {
         else {
             return;
         };
-        let n_events = match self.song.clip_contents.get(&content_id) {
+        let n_events = match self.song_doc.song().clip_contents.get(&content_id) {
             Some(common::model::ClipContent::Audio(a)) => a.events.len(),
             _ => return,
         };
@@ -17041,7 +16342,7 @@ impl AppData {
         // (immutable borrow)。
         let mut jobs: Vec<(usize, common::model::AudioSourceId, u64, u64)> = Vec::new();
         if let Some(common::model::ClipContent::Audio(a)) =
-            self.song.clip_contents.get(&content_id)
+            self.song_doc.song().clip_contents.get(&content_id)
         {
             for &i in &indices {
                 if let Some(e) = a.events.get(i)
@@ -17058,7 +16359,7 @@ impl AppData {
         // Phase B: decoded buffer を mono downmix して OFF-RT 検出。
         let mut results: Vec<(usize, Vec<u64>)> = Vec::new();
         for (i, source_id, start, end) in jobs {
-            let Some(buf) = self.audio_source_cache.get(source_id) else {
+            let Some(buf) = self.media.audio_source_cache.get(source_id) else {
                 continue;
             };
             let start = start.min(buf.frames) as usize;
@@ -17074,7 +16375,7 @@ impl AppData {
         // Phase C: onsets を書き戻し audio engine へ再 sync (mutable borrow)。
         let mut changed = false;
         if let Some(common::model::ClipContent::Audio(a)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         {
             for (i, onsets) in results {
                 if let Some(e) = a.events.get_mut(i) {
@@ -17114,20 +16415,20 @@ impl AppData {
     /// 呼ばれる)。 target が audio clip を解決できなければ `None` 化する。
     fn resync_clip_audio_event_edit_buffers(&mut self, target: ClipRef) {
         let resolved = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
-            .and_then(|c| self.song.clip_contents.get(&c.content_id))
+            .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
             .is_some_and(|content| matches!(content, common::model::ClipContent::Audio(_)));
-        self.clip_edit_buffer_target = if resolved { Some(target) } else { None };
+        self.ui_ephemeral.clip_edit_buffer_target = if resolved { Some(target) } else { None };
     }
 
     /// `target` clip の length_beats を fade clamp 用に取得する helper。
     /// clip が解決できなければ `None`。
     fn clip_length_beats(&self, target: ClipRef) -> Option<f64> {
         Some(
-            self.song
+            self.song_doc.song()
                 .tracks
                 .get(target.track as usize)?
                 .clips
@@ -17217,7 +16518,7 @@ impl AppData {
         F: FnMut(&mut common::model::TextEvent),
     {
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -17226,7 +16527,7 @@ impl AppData {
             return false;
         };
         if let Some(common::model::ClipContent::Text(t)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         {
             if t.events.is_empty() {
                 return false;
@@ -17275,7 +16576,7 @@ impl AppData {
             // dirty を立てる (= 未保存変更ありとしてタイトルに '*' / autosave 対象)。
             // 表示名は content から導出するので content_name は触らない
             // (デフォルト無名のまま、 clip_display_label が本文を表示)。
-            self.is_dirty = true;
+            self.song_doc.is_dirty() = true;
             // (talk) Text は VOICEVOX トラックでは読み上げ原稿。本文変更を builtin へ
             // 再 flush (= 新テキストで talk 再合成) + 口パク再生成。非 VOICEVOX
             // トラックの Text 編集では sync_vocal_metadata は no-op、debounce も
@@ -17416,7 +16717,7 @@ impl AppData {
         let Some(target) = self.selected_clip_ref() else {
             return;
         };
-        let value = self.clip_text_content_edit_text.clone();
+        let value = self.ui_ephemeral.clip_text_content_edit_text.clone();
         self.set_clip_text_event_content(target, value);
     }
 
@@ -17424,7 +16725,7 @@ impl AppData {
         let Some(target) = self.selected_clip_ref() else {
             return;
         };
-        let value = self.clip_text_font_family_edit_text.clone();
+        let value = self.ui_ephemeral.clip_text_font_family_edit_text.clone();
         self.set_clip_text_event_font_family(target, value);
     }
 
@@ -17433,11 +16734,11 @@ impl AppData {
     /// 編集対象 text クリップの現在のフォント名 (先頭 event)。text クリップで
     /// なければ `None`。
     fn clip_text_font_family(&self, target: ClipRef) -> Option<String> {
-        self.song
+        self.song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
-            .and_then(|c| self.song.clip_contents.get(&c.content_id))
+            .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
             .and_then(|content| content.text_events())
             .and_then(|events| events.first())
             .map(|e| e.font_family.clone())
@@ -17452,21 +16753,21 @@ impl AppData {
         let Some(original) = self.clip_text_font_family(target) else {
             return;
         };
-        self.font_picker_target = Some(target);
-        self.font_picker_restore = original;
-        self.font_picker_query.clear();
-        self.font_picker_cursor = 0;
-        self.is_font_picker_open = true;
+        self.ui_ephemeral.font_picker_target = Some(target);
+        self.ui_ephemeral.font_picker_restore = original;
+        self.ui_ephemeral.font_picker_query.clear();
+        self.ui_ephemeral.font_picker_cursor = 0;
+        self.ui_ephemeral.is_font_picker_open = true;
         self.refresh_font_picker_visible();
         // システムフォント列挙は重い (~20-860ms) ので background で 1 度だけ。
-        if self.font_picker_families.is_empty() && !self.font_picker_loading {
+        if self.ui_ephemeral.font_picker_families.is_empty() && !self.ui_ephemeral.font_picker_loading {
             self.begin_font_load();
         }
     }
 
     fn begin_font_load(&mut self) {
-        self.font_picker_loading = true;
-        let proxy = self.event_proxy.clone();
+        self.ui_ephemeral.font_picker_loading = true;
+        let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             let families = daw_ui_core::available_font_families();
             proxy.send(AppEvent::FontFamiliesLoaded(families));
@@ -17474,86 +16775,85 @@ impl AppData {
     }
 
     fn on_font_families_loaded(&mut self, families: Vec<String>) {
-        self.font_picker_families = families;
-        self.font_picker_loading = false;
+        self.ui_ephemeral.font_picker_families = families;
+        self.ui_ephemeral.font_picker_loading = false;
         self.refresh_font_picker_visible();
     }
 
     fn refresh_font_picker_visible(&mut self) {
-        let query = self.font_picker_query.trim();
+        let query = self.ui_ephemeral.font_picker_query.trim();
         let mut visible: Vec<String> = Vec::new();
         // query が空のときだけ先頭に「デフォルト」行 (`""`) を出す。
         if query.is_empty() {
             visible.push(String::new());
-            visible.extend(self.font_picker_families.iter().cloned());
+            visible.extend(self.ui_ephemeral.font_picker_families.iter().cloned());
         } else {
             visible.extend(
-                self.font_picker_families
+                self.ui_ephemeral.font_picker_families
                     .iter()
                     .filter(|f| crate::fuzzy::subsequence_match(f, query))
                     .cloned(),
             );
         }
-        self.font_picker_visible = visible;
-        self.font_picker_cursor = 0;
+        self.ui_ephemeral.font_picker_visible = visible;
+        self.ui_ephemeral.font_picker_cursor = 0;
     }
 
     fn move_font_picker_cursor(&mut self, delta: i32) {
-        let len = self.font_picker_visible.len();
+        let len = self.ui_ephemeral.font_picker_visible.len();
         if len == 0 {
             return;
         }
-        self.font_picker_cursor =
-            (self.font_picker_cursor as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        self.ui_ephemeral.font_picker_cursor =
+            (self.ui_ephemeral.font_picker_cursor as i32 + delta).clamp(0, len as i32 - 1) as usize;
         self.preview_font_at_cursor();
     }
 
     fn hover_font_in_picker(&mut self, idx: usize) {
         // 既に cursor がそこなら no-op (= hover 中の毎フレーム連発を抑止)。
-        if idx >= self.font_picker_visible.len() || self.font_picker_cursor == idx {
+        if idx >= self.ui_ephemeral.font_picker_visible.len() || self.ui_ephemeral.font_picker_cursor == idx {
             return;
         }
-        self.font_picker_cursor = idx;
+        self.ui_ephemeral.font_picker_cursor = idx;
         self.preview_font_at_cursor();
     }
 
     /// cursor 位置のフォントを編集対象クリップへライブ適用 (非 undo / 非 dirty)。
     /// `""` = renderer default。
     fn preview_font_at_cursor(&mut self) {
-        let Some(target) = self.font_picker_target else {
+        let Some(target) = self.ui_ephemeral.font_picker_target else {
             return;
         };
-        let Some(family) = self.font_picker_visible.get(self.font_picker_cursor).cloned() else {
+        let Some(family) = self.ui_ephemeral.font_picker_visible.get(self.ui_ephemeral.font_picker_cursor).cloned() else {
             return;
         };
         self.set_clip_text_event_font_family(target, family);
     }
 
     fn commit_font_from_picker(&mut self, family: String) {
-        let Some(target) = self.font_picker_target else {
+        let Some(target) = self.ui_ephemeral.font_picker_target else {
             return;
         };
         // 元 → 選択 を 1 undo step にするため、 一旦元へ戻してから snapshot し
         // (= undo 先 = 元フォント)、 選択フォントを適用する (preview で既に選択
         // 値になっていても結果は同じ)。
-        self.set_clip_text_event_font_family(target, self.font_picker_restore.clone());
-        self.push_undo_snapshot();
+        self.set_clip_text_event_font_family(target, self.ui_ephemeral.font_picker_restore.clone());
         self.set_clip_text_event_font_family(target, family);
-        self.is_dirty = true;
+        self.song_doc.is_dirty() = true;
         // commit 経路では close_font_picker (on_close) の restore を no-op 化する
         // ため target を先に落とす。
-        self.font_picker_target = None;
-        self.is_font_picker_open = false;
+        self.ui_ephemeral.font_picker_target = None;
+        self.ui_ephemeral.is_font_picker_open = false;
     }
 
     fn close_font_picker(&mut self) {
         // cancel: preview で変えた font を元へ戻す。commit 済みなら target は
         // None なので no-op。
-        if let Some(target) = self.font_picker_target {
-            self.set_clip_text_event_font_family(target, self.font_picker_restore.clone());
+        if let Some(target) = self.ui_ephemeral.font_picker_target {
+            self.set_clip_text_event_font_family(target, self.ui_ephemeral.font_picker_restore.clone());
         }
-        self.is_font_picker_open = false;
-        self.font_picker_target = None;
+        self.ui_ephemeral.is_font_picker_open = false;
+        self.ui_ephemeral.font_picker_target = None;
     }
 
     /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo / lane
@@ -17564,23 +16864,23 @@ impl AppData {
     /// `clip_edit_buffer_target` を `None`。
     fn resync_clip_text_event_edit_buffers(&mut self, target: ClipRef) {
         let event_snapshot = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
-            .and_then(|c| self.song.clip_contents.get(&c.content_id))
+            .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
             .and_then(|content| content.text_events())
             .and_then(|events| events.first())
             .cloned();
         let Some(ev) = event_snapshot else {
-            self.clip_text_content_edit_text.clear();
-            self.clip_text_font_family_edit_text.clear();
-            self.clip_edit_buffer_target = None;
+            self.ui_ephemeral.clip_text_content_edit_text.clear();
+            self.ui_ephemeral.clip_text_font_family_edit_text.clear();
+            self.ui_ephemeral.clip_edit_buffer_target = None;
             return;
         };
-        self.clip_text_content_edit_text = ev.text.clone();
-        self.clip_text_font_family_edit_text = ev.font_family.clone();
-        self.clip_edit_buffer_target = Some(target);
+        self.ui_ephemeral.clip_text_content_edit_text = ev.text.clone();
+        self.ui_ephemeral.clip_text_font_family_edit_text = ev.font_family.clone();
+        self.ui_ephemeral.clip_edit_buffer_target = Some(target);
     }
 
     /// docs/plan_text_overlay.md §4 P5: text inspector が表示する
@@ -17590,10 +16890,10 @@ impl AppData {
     /// 存在するか。
     pub fn inspector_text_event_summary(&self) -> Option<InspectorTextEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.song.tracks.get(cref.track as usize)?;
+        let track = self.song_doc.song().tracks.get(cref.track as usize)?;
         let clip = track.clips.get(cref.clip as usize)?;
         let common::model::ClipContent::Text(t) =
-            self.song.clip_contents.get(&clip.content_id)?
+            self.song_doc.song().clip_contents.get(&clip.content_id)?
         else {
             return None;
         };
@@ -17654,26 +16954,26 @@ impl AppData {
     /// が image clip を解決できなければ `None` 化する。
     fn resync_clip_image_event_edit_buffers(&mut self, target: ClipRef) {
         let resolved = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
-            .and_then(|c| self.song.clip_contents.get(&c.content_id))
+            .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
             .is_some_and(|content| matches!(content, common::model::ClipContent::Image(_)));
-        self.clip_edit_buffer_target = if resolved { Some(target) } else { None };
+        self.ui_ephemeral.clip_edit_buffer_target = if resolved { Some(target) } else { None };
     }
 
     /// `target` が指す clip が `ClipContent::Image` か。 commit / fade /
     /// mute handler の kind dispatch で使う。 範囲外 / 別 variant は false。
     pub fn is_image_clip(&self, target: ClipRef) -> bool {
-        let Some(track) = self.song.tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
             return false;
         };
         let Some(clip) = track.clips.get(target.clip as usize) else {
             return false;
         };
         matches!(
-            self.song.clip_contents.get(&clip.content_id),
+            self.song_doc.song().clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Image(_))
         )
     }
@@ -17681,14 +16981,14 @@ impl AppData {
     /// audio clip 判定。 `target` が指す clip が `ClipContent::Audio` か。
     /// MIDI / Vocal / 範囲外は false。 Audio Editor の open 判定で使う。
     pub fn is_audio_clip(&self, target: ClipRef) -> bool {
-        let Some(track) = self.song.tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
             return false;
         };
         let Some(clip) = track.clips.get(target.clip as usize) else {
             return false;
         };
         matches!(
-            self.song.clip_contents.get(&clip.content_id),
+            self.song_doc.song().clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Audio(_))
         )
     }
@@ -17696,14 +16996,14 @@ impl AppData {
     /// ピアノロール対象 (= MIDI content) クリップか。歌唱 (VOICEVOX) クリップも
     /// MIDI content なので true (歌詞付き note としてピアノロールに出る)。範囲外 / 非 MIDI は false。
     pub fn is_midi_clip(&self, target: ClipRef) -> bool {
-        let Some(track) = self.song.tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
             return false;
         };
         let Some(clip) = track.clips.get(target.clip as usize) else {
             return false;
         };
         matches!(
-            self.song.clip_contents.get(&clip.content_id),
+            self.song_doc.song().clip_contents.get(&clip.content_id),
             Some(common::model::ClipContent::Midi(_))
         )
     }
@@ -17719,22 +17019,22 @@ impl AppData {
         // 別 clip を開くときは前 clip の選択 index は stale なので clear
         // (同 clip の再 open は選択を保持)。 index ベース選択は context が
         // 変わると意味を失う (= close / undo と同方針)。
-        if self.audio_editor_clip != Some(target) {
-            self.audio_editor_selected_events.clear();
+        if self.ui_ephemeral.audio_editor_clip != Some(target) {
+            self.selection.audio_editor_selected_events.clear();
         }
-        self.audio_editor_clip = Some(target);
-        self.bottom_panel = 1;
+        self.ui_ephemeral.audio_editor_clip = Some(target);
+        self.ui_prefs.bottom_panel = 1;
         // per-clip 記憶。 初回 (entry 無し) のクリップだけ「全体表示」の初期 view を
         // 入れる。 既に記憶があればその view を復元 (= map をそのまま読む)。
         let Some(key) = self.clip_key_of(target) else { return };
-        if !self.audio_editor_views.contains_key(&key) {
+        if !self.ui_prefs.audio_editor_views.contains_key(&key) {
             let len_beats = self
-                .song
+                .song_doc.song()
                 .tracks
                 .get(target.track as usize)
                 .and_then(|t| t.clips.get(target.clip as usize))
                 .map_or(0.0, |c| c.length_beats);
-            self.audio_editor_views.insert(
+            self.ui_prefs.audio_editor_views.insert(
                 key,
                 common::model::AudioEditorViewState {
                     start_beat: 0.0,
@@ -17746,18 +17046,18 @@ impl AppData {
 
     fn close_audio_editor(&mut self) {
         // view 状態は `audio_editor_views` に残す (= 次回 open で復元)。
-        self.audio_editor_clip = None;
-        self.audio_editor_selected_events.clear();
-        self.audio_editor_hover_beat_in_clip = None;
+        self.ui_ephemeral.audio_editor_clip = None;
+        self.selection.audio_editor_selected_events.clear();
+        self.ui_ephemeral.audio_editor_hover_beat_in_clip = None;
     }
 
     /// Audio Editor 水平 scroll: `view_start_beat` を `[0, total - view_len]`
     /// で clamp。 `audio_editor_clip` が None / clip が解決できない場合は no-op。
     fn set_audio_editor_scroll(&mut self, new_start: f64) {
-        let Some(target) = self.audio_editor_clip else { return };
+        let Some(target) = self.ui_ephemeral.audio_editor_clip else { return };
         let Some(key) = self.clip_key_of(target) else { return };
         let Some(total) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -17767,23 +17067,23 @@ impl AppData {
         };
         // entry 無し = まだ全体表示 → view_len は total 扱い。
         let view_len = self
-            .audio_editor_views
+            .ui_prefs.audio_editor_views
             .get(&key)
             .map_or(total, |v| v.len_beats)
             .max(0.0)
             .min(total);
         let max_start = (total - view_len).max(0.0);
-        self.audio_editor_views.entry(key).or_default().start_beat = new_start.clamp(0.0, max_start);
+        self.ui_prefs.audio_editor_views.entry(key).or_default().start_beat = new_start.clamp(0.0, max_start);
     }
 
     /// Audio Editor zoom: `view_start_beat` + `view_len_beats` を一括設定。
     /// `view_len` は `[MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, clip.length]`、
     /// `view_start` は `[0, clip.length - view_len]` で clamp。
     fn set_audio_editor_zoom(&mut self, new_start: f64, new_len: f64) {
-        let Some(target) = self.audio_editor_clip else { return };
+        let Some(target) = self.ui_ephemeral.audio_editor_clip else { return };
         let Some(key) = self.clip_key_of(target) else { return };
         let Some(total) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -17793,7 +17093,7 @@ impl AppData {
         };
         let len = new_len.clamp(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, total.max(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS));
         let max_start = (total - len).max(0.0);
-        let entry = self.audio_editor_views.entry(key).or_default();
+        let entry = self.ui_prefs.audio_editor_views.entry(key).or_default();
         entry.start_beat = new_start.clamp(0.0, max_start);
         entry.len_beats = len;
     }
@@ -17806,13 +17106,13 @@ impl AppData {
     /// clip.length_beats は新 event の終端を超えないように自動拡張。
     /// selection は新 event index に進む。
     fn duplicate_audio_editor_event(&mut self) {
-        let Some(target) = self.audio_editor_clip else {
+        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
             return;
         };
         let Some(idx) = self.audio_editor_anchor_event() else {
             return;
         };
-        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
             return;
         };
         let Some(clip) = track.clips.get_mut(target.clip as usize) else {
@@ -17820,7 +17120,7 @@ impl AppData {
         };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return;
         };
@@ -17842,10 +17142,10 @@ impl AppData {
         if needed > clip.length_beats {
             clip.length_beats = needed;
         }
-        self.audio_editor_selected_events = vec![insert_at];
-        self.is_dirty = true;
+        self.selection.audio_editor_selected_events = vec![insert_at];
+        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
-        if self.clip_edit_buffer_target == Some(target) {
+        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
     }
@@ -17860,7 +17160,7 @@ impl AppData {
         event_idx: usize,
         new_start_beats: f64,
     ) {
-        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
             return;
         };
         let Some(clip) = track.clips.get_mut(target.clip as usize) else {
@@ -17868,7 +17168,7 @@ impl AppData {
         };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return;
         };
@@ -17881,9 +17181,9 @@ impl AppData {
         if needed > clip.length_beats {
             clip.length_beats = needed;
         }
-        self.is_dirty = true;
+        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
-        if self.clip_edit_buffer_target == Some(target) {
+        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
     }
@@ -17893,7 +17193,7 @@ impl AppData {
     /// event_length_beats + source_start_frames を delta で連動)、
     /// `side == Right` で右端 trim (= event_length_beats +
     /// source_end_frames を連動)。 source の sample_rate で
-    /// delta_beats → frames 変換 (bpm = self.song.bpm)。 source 境界
+    /// delta_beats → frames 変換 (bpm = self.song_doc.song().bpm)。 source 境界
     /// (0..total_frames) と event_length_beats > 0 を保つ clamp 込み。
     fn set_audio_event_trim(
         &mut self,
@@ -17902,31 +17202,31 @@ impl AppData {
         side: AudioEventTrimSide,
         delta_beats: f64,
     ) {
-        let bpm = self.song.bpm.max(1.0) as f64;
+        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
         // source 情報を先に snapshot (= 後の mut borrow と分離)。
         let (sr_hz, total_frames) = {
-            let Some(track) = self.song.tracks.get(target.track as usize) else {
+            let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
                 return;
             };
             let Some(clip) = track.clips.get(target.clip as usize) else {
                 return;
             };
             let Some(common::model::ClipContent::Audio(audio)) =
-                self.song.clip_contents.get(&clip.content_id)
+                self.song_doc.song().clip_contents.get(&clip.content_id)
             else {
                 return;
             };
             let Some(event) = audio.events.get(event_idx) else {
                 return;
             };
-            let Some(audio_source) = self.song.audio_sources.get(&event.source_id) else {
+            let Some(audio_source) = self.song_doc.song().audio_sources.get(&event.source_id) else {
                 return;
             };
             (audio_source.sample_rate as f64, audio_source.frames)
         };
         let delta_frames = (delta_beats * 60.0 / bpm * sr_hz).round() as i64;
 
-        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
             return;
         };
         let Some(clip) = track.clips.get_mut(target.clip as usize) else {
@@ -17934,7 +17234,7 @@ impl AppData {
         };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return;
         };
@@ -17988,9 +17288,9 @@ impl AppData {
         if needed > clip.length_beats {
             clip.length_beats = needed;
         }
-        self.is_dirty = true;
+        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
-        if self.clip_edit_buffer_target == Some(target) {
+        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
     }
@@ -18007,32 +17307,32 @@ impl AppData {
         position_in_clip_beats: f64,
     ) {
         if !self.is_audio_clip(target) {
-            self.status_message = "Audio Editor: 対象 clip が audio ではないため event 追加できません".into();
+            self.ui_ephemeral.status_message = "Audio Editor: 対象 clip が audio ではないため event 追加できません".into();
             return;
         }
         let project_dir: Option<PathBuf> = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
         let imported = match import_audio::import_one(&path, project_dir.as_deref()) {
             Ok(i) => i,
             Err(e) => {
-                self.status_message = format!("Audio event 追加 失敗: {}: {e}", path.display());
+                self.ui_ephemeral.status_message = format!("Audio event 追加 失敗: {}: {e}", path.display());
                 return;
             }
         };
-        let bpm = self.song.bpm;
+        let bpm = self.song_doc.song().bpm;
         let length_beats =
             frames_to_beats(imported.buffer.frames, imported.buffer.sample_rate, bpm);
         let display_name = imported.display_name.clone();
 
-        let source_id = self.song.alloc_audio_source_id();
-        self.song.audio_sources.insert(source_id, imported.source);
-        self.audio_source_cache
+        let source_id = self.song_doc.song().alloc_audio_source_id();
+        self.edit_song(|song| song.audio_sources.insert(source_id, imported.source));
+        self.media.audio_source_cache
             .insert(source_id, imported.buffer.clone());
 
         let position = position_in_clip_beats.max(0.0);
-        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
             return;
         };
         let Some(clip) = track.clips.get_mut(target.clip as usize) else {
@@ -18040,7 +17340,7 @@ impl AppData {
         };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return;
         };
@@ -18058,13 +17358,13 @@ impl AppData {
         if needed > clip.length_beats {
             clip.length_beats = needed;
         }
-        self.audio_editor_selected_events = vec![new_idx];
-        self.is_dirty = true;
+        self.selection.audio_editor_selected_events = vec![new_idx];
+        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
-        if self.clip_edit_buffer_target == Some(target) {
+        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
-        self.status_message = format!("Audio event 追加: {display_name}");
+        self.ui_ephemeral.status_message = format!("Audio event 追加: {display_name}");
     }
 
     /// Audio Editor の event 選択集合を `indices` で置き換える。 重複を
@@ -18074,9 +17374,9 @@ impl AppData {
     fn set_audio_editor_event_selection(&mut self, indices: Vec<usize>) {
         let mut seen = std::collections::HashSet::new();
         let deduped: Vec<usize> = indices.into_iter().filter(|i| seen.insert(*i)).collect();
-        self.audio_editor_selected_events = deduped;
-        if !self.audio_editor_selected_events.is_empty() {
-            self.last_edit_select = Some(EditSelectSurface::AudioEvents);
+        self.selection.audio_editor_selected_events = deduped;
+        if !self.selection.audio_editor_selected_events.is_empty() {
+            self.selection.last_edit_select = Some(EditSelectSurface::AudioEvents);
         }
     }
 
@@ -18084,11 +17384,11 @@ impl AppData {
     /// 対応)。 高い index から `remove` して shift を回避。 削除後は
     /// selection を clear。 events が空になっても content は保持。
     fn delete_audio_editor_selection(&mut self) {
-        let Some(target) = self.audio_editor_clip else {
+        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
             return;
         };
         let Some(content_id) = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
@@ -18096,14 +17396,14 @@ impl AppData {
         else {
             return;
         };
-        let mut indices: Vec<usize> = self.audio_editor_selected_events.clone();
+        let mut indices: Vec<usize> = self.selection.audio_editor_selected_events.clone();
         indices.sort_unstable();
         indices.dedup();
         if indices.is_empty() {
             return;
         }
         if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         {
             for &i in indices.iter().rev() {
                 if i < audio.events.len() {
@@ -18113,10 +17413,10 @@ impl AppData {
         } else {
             return;
         }
-        self.audio_editor_selected_events.clear();
-        self.is_dirty = true;
+        self.selection.audio_editor_selected_events.clear();
+        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
-        if self.clip_edit_buffer_target == Some(target) {
+        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
     }
@@ -18126,18 +17426,18 @@ impl AppData {
     /// beats)、 既存値は上書き。 audio 以外の clip (MIDI / Vocal) と
     /// `selected_clip` がない場合は no-op。
     fn auto_fade_selected_clips(&mut self) {
-        let bpm = self.song.bpm.max(1.0) as f64;
+        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
         let auto_fade_beats = 0.004 * bpm / 60.0; // 4 ms 相当
         let mut applied = 0usize;
         // borrow checker: target list を先に固める。
-        let targets: Vec<ClipRef> = if self.selected_clips.is_empty() {
+        let targets: Vec<ClipRef> = if self.selection.selected_clips.is_empty() {
             self.selected_clip_ref().into_iter().collect()
         } else {
             self.selected_clip_refs()
         };
         for target in targets {
             let Some(content_id) = self
-                .song
+                .song_doc.song()
                 .tracks
                 .get(target.track as usize)
                 .and_then(|t| t.clips.get(target.clip as usize))
@@ -18148,7 +17448,7 @@ impl AppData {
             let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
             let fade_beats = auto_fade_beats.min(max_beats);
             if let Some(common::model::ClipContent::Audio(audio)) =
-                self.song.clip_contents.get_mut(&content_id)
+                self.song_doc.song().clip_contents.get_mut(&content_id)
             {
                 for event in &mut audio.events {
                     event.fade_in_beats = fade_beats;
@@ -18160,12 +17460,12 @@ impl AppData {
         if applied > 0 {
             self.sync_song_to_plugin_host();
             // edit buffer (Inspector) も追従させる。
-            if let Some(target) = self.clip_edit_buffer_target {
+            if let Some(target) = self.ui_ephemeral.clip_edit_buffer_target {
                 self.resync_clip_audio_event_edit_buffers(target);
             }
-            self.status_message = format!("Auto-Fade: {applied} 個のクリップに 4 ms fade を適用");
+            self.ui_ephemeral.status_message = format!("Auto-Fade: {applied} 個のクリップに 4 ms fade を適用");
         } else {
-            self.status_message = "Auto-Fade: 選択中の audio clip がありません".into();
+            self.ui_ephemeral.status_message = "Auto-Fade: 選択中の audio clip がありません".into();
         }
     }
 
@@ -18178,20 +17478,20 @@ impl AppData {
     fn auto_crossfade_selected_clips(&mut self) {
         // (track_idx, clip_idx, start_beat, end_beat, content_id) を集める
         let mut entries: Vec<(u32, u32, f64, f64, u32)> = Vec::new();
-        let targets: Vec<ClipRef> = if self.selected_clips.is_empty() {
+        let targets: Vec<ClipRef> = if self.selection.selected_clips.is_empty() {
             self.selected_clip_ref().into_iter().collect()
         } else {
             self.selected_clip_refs()
         };
         for target in &targets {
-            let Some(track) = self.song.tracks.get(target.track as usize) else {
+            let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
                 continue;
             };
             let Some(clip) = track.clips.get(target.clip as usize) else {
                 continue;
             };
             let Some(common::model::ClipContent::Audio(_)) =
-                self.song.clip_contents.get(&clip.content_id)
+                self.song_doc.song().clip_contents.get(&clip.content_id)
             else {
                 continue;
             };
@@ -18204,7 +17504,7 @@ impl AppData {
             ));
         }
         if entries.len() < 2 {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Auto-Crossfade: 隣接判定には audio clip が 2 つ以上必要です".into();
             return;
         }
@@ -18233,7 +17533,7 @@ impl AppData {
             let overlap = (prev_end - next_start).max(0.0);
             // prev clip の末尾 fade_out
             if let Some(common::model::ClipContent::Audio(audio)) =
-                self.song.clip_contents.get_mut(&prev_content)
+                self.song_doc.song().clip_contents.get_mut(&prev_content)
             {
                 for event in &mut audio.events {
                     event.fade_out_beats = overlap.min(event.event_length_beats);
@@ -18241,7 +17541,7 @@ impl AppData {
             }
             // next clip の先頭 fade_in
             if let Some(common::model::ClipContent::Audio(audio)) =
-                self.song.clip_contents.get_mut(&next_content)
+                self.song_doc.song().clip_contents.get_mut(&next_content)
             {
                 for event in &mut audio.events {
                     event.fade_in_beats = overlap.min(event.event_length_beats);
@@ -18251,13 +17551,13 @@ impl AppData {
         }
         if applied > 0 {
             self.sync_song_to_plugin_host();
-            if let Some(target) = self.clip_edit_buffer_target {
+            if let Some(target) = self.ui_ephemeral.clip_edit_buffer_target {
                 self.resync_clip_audio_event_edit_buffers(target);
             }
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 format!("Auto-Crossfade: {applied} ペアに crossfade を適用");
         } else {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Auto-Crossfade: 重なっている隣接ペアがありません".into();
         }
     }
@@ -18302,9 +17602,9 @@ impl AppData {
     ) {
         let new_length_beats = new_length_beats.max(0.0625);
         let new_start_beat = new_start_beat.max(0.0);
-        let bpm = self.song.bpm.max(1.0) as f64;
+        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
         let (content_id, prev_start_beat, prev_length_beats) = {
-            let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+            let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
                 return;
             };
             let Some(clip) = track.clips.get_mut(target.clip as usize) else {
@@ -18337,26 +17637,30 @@ impl AppData {
         // ---- trim (= 再生範囲を変える) ----
         // Snapshot の per-source metadata (event ごとに lookup できるよう
         // immutable borrow を先に切る)。
-        let audio_sources = self.song.audio_sources.clone();
-        if let Some(ClipContent::Audio(audio)) = self.song.clip_contents.get_mut(&content_id) {
-            for event in &mut audio.events {
-                Self::trim_audio_event(
-                    event,
-                    delta_start,
-                    prev_length_beats,
-                    new_length_beats,
-                    bpm,
-                    &audio_sources,
-                );
+        let audio_sources = self.song_doc.song().audio_sources.clone();
+        self.edit_song(|song| {
+            if let Some(ClipContent::Audio(audio)) = song.clip_contents.get_mut(&content_id) {
+                for event in &mut audio.events {
+                    Self::trim_audio_event(
+                        event,
+                        delta_start,
+                        prev_length_beats,
+                        new_length_beats,
+                        bpm,
+                        &audio_sources,
+                    );
+                }
             }
-        }
+        });
 
         // overlay clip (image / video / text) は「clip 長 = 表示長」が
         // 不変条件。 Audio/Midi では no-op、 overlay の末尾 event だけ新 clip 長
         // まで extend する (extend-only / idempotent / linked clip 安全)。
-        if let Some(content) = self.song.clip_contents.get_mut(&content_id) {
-            content.ensure_event_covers_clip(new_length_beats);
-        }
+        self.edit_song(|song| {
+            if let Some(content) = song.clip_contents.get_mut(&content_id) {
+                content.ensure_event_covers_clip(new_length_beats);
+            }
+        });
 
         self.sync_song_to_plugin_host();
     }
@@ -18471,10 +17775,10 @@ impl AppData {
             return;
         }
         // 共有 content は fork してから伸縮 (siblings の length と無関係)。
-        let content_id = if self.song.clip_content_refcount(content_id) > 1 {
-            let new_id = self.song.fork_content(content_id);
+        let content_id = if self.song_doc.song().clip_content_refcount(content_id) > 1 {
+            let new_id = self.song_doc.song().fork_content(content_id);
             if let Some(clip) = self
-                .song
+                .song_doc.song()
                 .tracks
                 .get_mut(target.track as usize)
                 .and_then(|t| t.clips.get_mut(target.clip as usize))
@@ -18486,7 +17790,7 @@ impl AppData {
             content_id
         };
 
-        match self.song.clip_contents.get_mut(&content_id) {
+        match self.song_doc.song().clip_contents.get_mut(&content_id) {
             Some(ClipContent::Audio(audio)) => {
                 for e in &mut audio.events {
                     let (s, l) = stretch_remap(
@@ -18523,9 +17827,11 @@ impl AppData {
             }
             _ => {
                 // overlay / automation は stretch 概念なし → 長さ追従のみ。
-                if let Some(content) = self.song.clip_contents.get_mut(&content_id) {
-                    content.ensure_event_covers_clip(new_len);
-                }
+                self.edit_song(|song| {
+                    if let Some(content) = song.clip_contents.get_mut(&content_id) {
+                        content.ensure_event_covers_clip(new_len);
+                    }
+                });
             }
         }
     }
@@ -18541,7 +17847,7 @@ impl AppData {
         let mut max_end = f64::MIN;
         for &src in sources {
             let Some(clip) = self
-                .song
+                .song_doc.song()
                 .tracks
                 .get(src.track as usize)
                 .and_then(|t| t.clips.get(src.clip as usize))
@@ -18563,7 +17869,7 @@ impl AppData {
         new_start_beat: f64,
     ) -> Option<ClipRef> {
         let src_clip = self
-            .song
+            .song_doc.song()
             .tracks
             .get(source.track as usize)?
             .clips
@@ -18578,7 +17884,7 @@ impl AppData {
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
         let src_talk = src_clip.talk;
-        let track = self.song.tracks.get_mut(source.track as usize)?;
+        let track = self.song_doc.song().tracks.get_mut(source.track as usize)?;
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
@@ -18607,7 +17913,7 @@ impl AppData {
         new_start_beat: f64,
     ) -> Option<ClipRef> {
         let src_clip = self
-            .song
+            .song_doc.song()
             .tracks
             .get(source.track as usize)?
             .clips
@@ -18622,8 +17928,8 @@ impl AppData {
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
         let src_talk = src_clip.talk;
-        let new_content_id = self.song.fork_content(src_content_id);
-        let track = self.song.tracks.get_mut(source.track as usize)?;
+        let new_content_id = self.song_doc.song().fork_content(src_content_id);
+        let track = self.song_doc.song().tracks.get_mut(source.track as usize)?;
         let new_clip_id = track.alloc_clip_id();
         let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
@@ -18654,7 +17960,7 @@ impl AppData {
         let mut new_refs = Vec::with_capacity(sources.len());
         for &src in sources {
             let Some(new_start) = self
-                .song
+                .song_doc.song()
                 .tracks
                 .get(src.track as usize)
                 .and_then(|t| t.clips.get(src.clip as usize))
@@ -18668,7 +17974,7 @@ impl AppData {
         }
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
-            self.selected_notes.clear();
+            self.selection.selected_notes.clear();
             self.sync_song_to_plugin_host();
         }
     }
@@ -18682,7 +17988,7 @@ impl AppData {
         let mut new_refs = Vec::with_capacity(sources.len());
         for &src in sources {
             let Some(new_start) = self
-                .song
+                .song_doc.song()
                 .tracks
                 .get(src.track as usize)
                 .and_then(|t| t.clips.get(src.clip as usize))
@@ -18696,7 +18002,7 @@ impl AppData {
         }
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
-            self.selected_notes.clear();
+            self.selection.selected_notes.clear();
             self.sync_song_to_plugin_host();
         }
     }
@@ -18708,7 +18014,7 @@ impl AppData {
     fn clone_clips_linked(&mut self, entries: &[(ClipRef, u32, f64)]) {
         let mut new_refs = Vec::with_capacity(entries.len());
         for &(source, to_track_id, drop_start) in entries {
-            let Some(track) = self.song.tracks.get(source.track as usize) else {
+            let Some(track) = self.song_doc.song().tracks.get(source.track as usize) else {
                 continue;
             };
             let Some(src_clip) = track.clips.get(source.clip as usize) else {
@@ -18728,10 +18034,10 @@ impl AppData {
                 src_clip.style_name.clone(),
                 src_clip.talk,
             );
-            let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
+            let Some(to_track_idx) = self.song_doc.song().track_index_by_id(to_track_id) else {
                 continue;
             };
-            let Some(to_track) = self.song.tracks.get_mut(to_track_idx) else {
+            let Some(to_track) = self.song_doc.song().tracks.get_mut(to_track_idx) else {
                 continue;
             };
             let new_clip_id = to_track.alloc_clip_id();
@@ -18758,7 +18064,7 @@ impl AppData {
         }
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
-            self.selected_notes.clear();
+            self.selection.selected_notes.clear();
             self.sync_song_to_plugin_host();
         }
     }
@@ -18768,7 +18074,7 @@ impl AppData {
     fn clone_clips_independent(&mut self, entries: &[(ClipRef, u32, f64)]) {
         let mut new_refs = Vec::with_capacity(entries.len());
         for &(source, to_track_id, drop_start) in entries {
-            let Some(track) = self.song.tracks.get(source.track as usize) else {
+            let Some(track) = self.song_doc.song().tracks.get(source.track as usize) else {
                 continue;
             };
             let Some(src_clip) = track.clips.get(source.clip as usize) else {
@@ -18787,11 +18093,11 @@ impl AppData {
                 src_clip.style_name.clone(),
                 src_clip.talk,
             );
-            let new_content_id = self.song.fork_content(src_content_id);
-            let Some(to_track_idx) = self.song.track_index_by_id(to_track_id) else {
+            let new_content_id = self.song_doc.song().fork_content(src_content_id);
+            let Some(to_track_idx) = self.song_doc.song().track_index_by_id(to_track_id) else {
                 continue;
             };
-            let Some(to_track) = self.song.tracks.get_mut(to_track_idx) else {
+            let Some(to_track) = self.song_doc.song().tracks.get_mut(to_track_idx) else {
                 continue;
             };
             let new_clip_id = to_track.alloc_clip_id();
@@ -18818,7 +18124,7 @@ impl AppData {
         }
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
-            self.selected_notes.clear();
+            self.selection.selected_notes.clear();
             self.sync_song_to_plugin_host();
         }
     }
@@ -18826,20 +18132,20 @@ impl AppData {
     /// Make Unique (右クリック): 共有 clip → 独立化。 refcount==1 なら no-op。
     /// §3.6。
     fn make_clip_unique(&mut self, target: ClipRef) {
-        let Some(track) = self.song.tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
             return;
         };
         let Some(clip) = track.clips.get(target.clip as usize) else {
             return;
         };
         let content_id = clip.content_id;
-        if self.song.clip_content_refcount(content_id) <= 1 {
-            self.status_message = "すでに独立 clip です".to_string();
+        if self.song_doc.song().clip_content_refcount(content_id) <= 1 {
+            self.ui_ephemeral.status_message = "すでに独立 clip です".to_string();
             return;
         }
         // content + 名前を fork して独立化 (fork 時点の名前を引き継ぐ)。
-        let new_content_id = self.song.fork_content(content_id);
-        let Some(track) = self.song.tracks.get_mut(target.track as usize) else {
+        let new_content_id = self.song_doc.song().fork_content(content_id);
+        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
             return;
         };
         let Some(clip) = track.clips.get_mut(target.clip as usize) else {
@@ -18847,7 +18153,7 @@ impl AppData {
         };
         clip.content_id = new_content_id;
         self.sync_song_to_plugin_host();
-        self.status_message = "Clip を独立化しました".to_string();
+        self.ui_ephemeral.status_message = "Clip を独立化しました".to_string();
     }
 
     fn create_clip(&mut self, track_idx: u32, start_beat: f64) {
@@ -18855,83 +18161,89 @@ impl AppData {
         // Allocate the shared content slot first so the new clip points
         // at a real entry. Orphan content_ids (if track lookup below
         // fails) get reclaimed by `Song::gc_clip_contents` before save.
-        let content_id = self.song.alloc_content_id();
-        self.song
+        let content_id = self.song_doc.song().alloc_content_id();
+        self.song_doc.song()
             .clip_contents
             .insert(content_id, ClipContent::default());
-        let Some(track) = self.song.tracks.get_mut(track_idx as usize) else {
-            return;
-        };
-        let new_clip_id = track.alloc_clip_id();
-        let new_idx = track.clips.len() as u32;
-        // vocal track の新規 clip は声を引き継ぐ: 同トラックの
-        // 直前 (= start_beat 最大の既存) clip の声、 無ければアプリ既定
-        // (中国うさぎ ノーマル)。 非 vocal track では声は未設定 (0)。
-        let (speaker_id, singer_name, style_name) =
-            if track.is_voicevox_vocal() {
-                track
-                    .clips
-                    .iter()
-                    .filter(|c| c.speaker_id != 0)
-                    .max_by(|a, b| a.start_beat.total_cmp(&b.start_beat))
-                    .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone()))
-                    .unwrap_or_else(|| {
-                        (
-                            common::voicevox::DEFAULT_SINGER_ID,
-                            common::voicevox::DEFAULT_SINGER_NAME.to_string(),
-                            common::voicevox::DEFAULT_STYLE_NAME.to_string(),
-                        )
-                    })
-            } else {
-                (0, String::new(), String::new())
+        let __applied = self.edit_song_checked(|song| {
+            let Some(track) = song.tracks.get_mut(track_idx as usize) else {
+                return false;
             };
-        track.clips.push(Clip {
-            id: new_clip_id,
-            name: String::new(),
-            start_beat,
-            length_beats: DEFAULT_CLIP_LENGTH,
-            content_id,
-            notes: Vec::new(),
-            color: None,
-            auto_lipsync: false,
-            muted: false,
-            speaker_id,
-            singer_name,
-            style_name,
-            // (talk) 新規 clip は読み上げスケール未設定 (= 全既定)。
-            talk: None,
+            let new_clip_id = track.alloc_clip_id();
+            let new_idx = track.clips.len() as u32;
+            // vocal track の新規 clip は声を引き継ぐ: 同トラックの
+            // 直前 (= start_beat 最大の既存) clip の声、 無ければアプリ既定
+            // (中国うさぎ ノーマル)。 非 vocal track では声は未設定 (0)。
+            let (speaker_id, singer_name, style_name) =
+                if track.is_voicevox_vocal() {
+                    track
+                        .clips
+                        .iter()
+                        .filter(|c| c.speaker_id != 0)
+                        .max_by(|a, b| a.start_beat.total_cmp(&b.start_beat))
+                        .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone()))
+                        .unwrap_or_else(|| {
+                            (
+                                common::voicevox::DEFAULT_SINGER_ID,
+                                common::voicevox::DEFAULT_SINGER_NAME.to_string(),
+                                common::voicevox::DEFAULT_STYLE_NAME.to_string(),
+                            )
+                        })
+                } else {
+                    (0, String::new(), String::new())
+                };
+            track.clips.push(Clip {
+                id: new_clip_id,
+                name: String::new(),
+                start_beat,
+                length_beats: DEFAULT_CLIP_LENGTH,
+                content_id,
+                notes: Vec::new(),
+                color: None,
+                auto_lipsync: false,
+                muted: false,
+                speaker_id,
+                singer_name,
+                style_name,
+                // (talk) 新規 clip は読み上げスケール未設定 (= 全既定)。
+                talk: None,
+            });
+            // デフォルトでクリップ名は無し (= content_name 未設定)。 表示名は
+            // arrangement_view::clip_display_label が内容 (Text 本文 / ノート歌詞)
+            // から導出する。 ユーザーが Rename したときだけ明示名が入る。
+            let r = ClipRef {
+                track: track_idx,
+                clip: new_idx,
+            };
+            true
         });
-        // デフォルトでクリップ名は無し (= content_name 未設定)。 表示名は
-        // arrangement_view::clip_display_label が内容 (Text 本文 / ノート歌詞)
-        // から導出する。 ユーザーが Rename したときだけ明示名が入る。
-        let r = ClipRef {
-            track: track_idx,
-            clip: new_idx,
-        };
+        if !__applied {
+            return;
+        }
         self.set_single_clip_selection(r);
-        self.selected_notes.clear();
+        self.selection.selected_notes.clear();
         self.select_track(track_idx);
         self.sync_song_to_plugin_host();
     }
 
     fn delete_selected_clip(&mut self) {
-        if self.selected_clips.is_empty() {
+        if self.selection.selected_clips.is_empty() {
             return;
         }
         // ClipKey → 現在の index ClipRef に解決し、 同 track 内は高 clip index
         // から remove して shift を回避する。
         let mut targets: Vec<ClipRef> = self.selected_clip_refs();
-        self.selected_clips.clear();
+        self.selection.selected_clips.clear();
         targets.sort_by(|a, b| a.track.cmp(&b.track).then(b.clip.cmp(&a.clip)));
         for target in &targets {
-            if let Some(track) = self.song.tracks.get_mut(target.track as usize)
+            if let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize)
                 && (target.clip as usize) < track.clips.len()
             {
                 track.clips.remove(target.clip as usize);
             }
         }
-        self.selected_clip = None;
-        self.selected_notes.clear();
+        self.selection.selected_clip = None;
+        self.selection.selected_notes.clear();
         self.sync_song_to_plugin_host();
     }
 
@@ -18939,10 +18251,10 @@ impl AppData {
 
     fn select_note(&mut self, note: u32, additive: bool) {
         if !additive {
-            self.selected_notes.clear();
+            self.selection.selected_notes.clear();
         }
-        if !self.selected_notes.contains(&note) {
-            self.selected_notes.push(note);
+        if !self.selection.selected_notes.contains(&note) {
+            self.selection.selected_notes.push(note);
         }
     }
 
@@ -18953,13 +18265,13 @@ impl AppData {
     /// `scale_at(playhead)` で見つかる event を update。 plan §4.1 と一致。
     fn set_scale_at_playhead(&mut self, root: u8, scale: common::scale::Scale) {
         let playhead = self
-            .playhead_beat
+            .transport.playhead_beat
             .map(f64::from)
             .unwrap_or(0.0)
             .max(0.0);
         let root = root.min(11);
-        if self.song.scale_changes.is_empty() {
-            self.song.scale_changes.push(common::scale::ScaleChange {
+        if self.song_doc.song().scale_changes.is_empty() {
+            self.song_doc.song().scale_changes.push(common::scale::ScaleChange {
                 beat: 0.0,
                 root,
                 scale,
@@ -18970,15 +18282,17 @@ impl AppData {
         // を update。 playhead 未満の event が無ければ最初の event を update
         // (Cubase Transport の Chord Track edit と同じ idiom)。
         let target_idx = self
-            .song
+            .song_doc.song()
             .scale_changes
             .iter()
             .rposition(|c| c.beat <= playhead)
             .unwrap_or(0);
-        if let Some(ev) = self.song.scale_changes.get_mut(target_idx) {
-            ev.root = root;
-            ev.scale = scale;
-        }
+        self.edit_song(|song| {
+            if let Some(ev) = song.scale_changes.get_mut(target_idx) {
+                ev.root = root;
+                ev.scale = scale;
+            }
+        });
     }
 
     /// `selected_clip` の note の pitch を最寄り in-scale に一括補正。
@@ -18988,12 +18302,12 @@ impl AppData {
         let Some(r) = self.selected_clip_ref() else {
             return;
         };
-        if self.song.scale_changes.is_empty() {
-            self.status_message =
+        if self.song_doc.song().scale_changes.is_empty() {
+            self.ui_ephemeral.status_message =
                 "Scale が設定されていません (Transport bar の Key dropdown で設定)".to_string();
             return;
         }
-        let Some(track) = self.song.tracks.get(r.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
             return;
         };
         let Some(clip) = track.clips.get(r.clip as usize) else {
@@ -19004,9 +18318,9 @@ impl AppData {
         // (= borrow checker 衝突回避)。 `Song::clip_notes` は `Clip` を経由する
         // shared note 取得 helper、 mutable 版は `notes_in_clip_mut`。
         let snaps: Vec<(u32, u8)> = {
-            let notes = self.song.clip_notes(clip);
+            let notes = self.song_doc.song().clip_notes(clip);
             let target_indices: Vec<u32> = match target {
-                QuantizePitchTarget::SelectedNotes => self.selected_notes.clone(),
+                QuantizePitchTarget::SelectedNotes => self.selection.selected_notes.clone(),
                 QuantizePitchTarget::SelectedClipAllNotes => {
                     (0..notes.len() as u32).collect()
                 }
@@ -19017,7 +18331,7 @@ impl AppData {
                     let n = notes.get(i as usize)?;
                     let global_beat = clip_start_beat + n.start_beat;
                     let new_pitch = self
-                        .song
+                        .song_doc.song()
                         .scale_at(global_beat)
                         .map(|sc| sc.snap(n.pitch))
                         .unwrap_or(n.pitch);
@@ -19031,7 +18345,7 @@ impl AppData {
         };
         let count = snaps.len();
         if count == 0 {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "対象 note は既に in-scale です".to_string();
             return;
         }
@@ -19040,7 +18354,7 @@ impl AppData {
         let winners: Vec<u32> = snaps.iter().map(|&(i, _)| i).collect();
         let mut remap: Option<Vec<Option<u32>>> = None;
         if let Some(notes) = self
-            .song
+            .song_doc.song()
             .notes_in_clip_mut(r.track as usize, r.clip as usize)
         {
             for (i, new_pitch) in snaps {
@@ -19051,10 +18365,10 @@ impl AppData {
             remap = Some(resolve_note_overlaps(notes, &winners));
         }
         if let Some(remap) = remap {
-            let sel = std::mem::take(&mut self.selected_notes);
-            self.selected_notes = remap_indices(&remap, &sel);
+            let sel = std::mem::take(&mut self.selection.selected_notes);
+            self.selection.selected_notes = remap_indices(&remap, &sel);
         }
-        self.status_message =
+        self.ui_ephemeral.status_message =
             format!("{count} 件の note を scale に補正しました");
         self.sync_song_to_plugin_host();    }
 
@@ -19071,30 +18385,33 @@ impl AppData {
         // Phase 7 B5 (`docs/plan_scale.html` §5.1): Snap on Draw。
         // scale_changes が空なら scale_at が None → unwrap_or で raw pitch
         // 維持 = 機能 OFF と同じ挙動。
-        let pitch = if self.snap_on_draw {
+        let pitch = if self.ui_prefs.snap_on_draw {
             let clip_start_beat = self
-                .song
+                .song_doc.song()
                 .tracks
                 .get(track_idx as usize)
                 .and_then(|t| t.clips.get(clip_idx as usize))
                 .map(|c| c.start_beat)
                 .unwrap_or(0.0);
             let global_beat = clip_start_beat + start_beat;
-            self.song
+            self.song_doc.song()
                 .scale_at(global_beat)
                 .map(|sc| sc.snap(pitch))
                 .unwrap_or(pitch)
         } else {
             pitch
         };
-        let Some(notes) = self
-            .song
-            .notes_in_clip_mut(track_idx as usize, clip_idx as usize)
+        let Some(content) =
+            midi_content_in_clip_mut(&mut self.song_doc.song(), track_idx as usize, clip_idx as usize)
         else {
             return;
         };
+        // v29: 新規 note は allocator で安定 id を採番する。
+        let note_id = content.alloc_note_id();
+        let notes = &mut content.notes;
         let new_idx = notes.len() as u32;
         notes.push(Note {
+            id: note_id,
             start_beat,
             duration_beats: duration,
             pitch,
@@ -19113,14 +18430,14 @@ impl AppData {
         // 揃えるが、複数選択 (selected_clips) は **縮小しない** (複数同時表示を保持)。対象が
         // まだ選択集合に無ければ追加する (他クリップは残す)。
         if let Some(key) = self.clip_key_of(r) {
-            self.selected_clip = Some(key);
-            if !self.selected_clips.contains(&key) {
-                self.selected_clips.push(key);
+            self.selection.selected_clip = Some(key);
+            if !self.selection.selected_clips.contains(&key) {
+                self.selection.selected_clips.push(key);
             }
         }
         // 選択は packed note id。対象クリップの clip_slot (= shown 内位置) で pack。
-        self.selected_notes = self.pack_clip_selection(r, &selected);
-        self.last_note_duration_beats = duration;
+        self.selection.selected_notes = self.pack_clip_selection(r, &selected);
+        self.ui_prefs.last_note_duration_beats = duration;
         self.sync_song_to_plugin_host();
     }
 
@@ -19128,7 +18445,7 @@ impl AppData {
         // entries の `u32` は packed note id (clip_slot|local index)。所属クリップ
         // ごとに分配し、各クリップ内 local index で位置を書き換える。`beat` は view が既に
         // 各 note の所属クリップ clip-local に戻している (per-note offset)。
-        let snap_on_draw = self.snap_on_draw;
+        let snap_on_draw = self.ui_prefs.snap_on_draw;
         self.for_each_note_clip_group(
             entries.iter().map(|&(id, beat, pitch)| (id, (beat, pitch))),
             |app, slot, r, items| {
@@ -19141,7 +18458,7 @@ impl AppData {
                     .iter()
                     .map(|&(local, (beat, pitch))| {
                         let new_pitch = if snap_on_draw {
-                            app.song
+                            app.song_doc.song()
                                 .scale_at(clip_start + beat.max(0.0))
                                 .map(|sc| sc.snap(pitch))
                                 .unwrap_or(pitch)
@@ -19193,7 +18510,7 @@ impl AppData {
             },
         );
         if let Some(&(_, _, duration)) = entries.last() {
-            self.last_note_duration_beats = duration.max(0.0625);
+            self.ui_prefs.last_note_duration_beats = duration.max(0.0625);
         }
         self.sync_song_to_plugin_host();
     }
@@ -19205,17 +18522,17 @@ impl AppData {
     fn duplicate_selected_notes(&mut self) {
         // 選択 (packed) を所属クリップごとに複製。各クリップ内でその選択分の
         // beat span ぶん後ろへずらす (元は据え置き)。新しい選択 = 全クリップの複製 (packed)。
-        if self.selected_notes.is_empty() {
+        if self.selection.selected_notes.is_empty() {
             return;
         }
-        let selected: Vec<u32> = self.selected_notes.clone();
+        let selected: Vec<u32> = self.selection.selected_notes.clone();
         let mut new_selection: Vec<u32> = Vec::new();
         self.for_each_note_clip_group(
             selected.into_iter().map(|id| (id, ())),
             |app, slot, r, items| {
                 let locals: Vec<u32> = items.iter().map(|&(local, ())| local as u32).collect();
                 if let Some(notes) =
-                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    app.song_doc.song().notes_in_clip_mut(r.track as usize, r.clip as usize)
                 {
                     let new_ids = duplicate_notes_into(notes, &locals);
                     if !new_ids.is_empty() {
@@ -19229,7 +18546,7 @@ impl AppData {
             },
         );
         if !new_selection.is_empty() {
-            self.selected_notes = new_selection;
+            self.selection.selected_notes = new_selection;
             self.sync_song_to_plugin_host();
         }
     }
@@ -19249,7 +18566,7 @@ impl AppData {
                     .map(|&(local, (beat, pitch))| (local as u32, beat, pitch))
                     .collect();
                 if let Some(notes) =
-                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    app.song_doc.song().notes_in_clip_mut(r.track as usize, r.clip as usize)
                 {
                     let new_ids = copy_notes_into(notes, &local_entries);
                     if !new_ids.is_empty() {
@@ -19263,7 +18580,7 @@ impl AppData {
             },
         );
         if !new_selection.is_empty() {
-            self.selected_notes = new_selection;
+            self.selection.selected_notes = new_selection;
             self.sync_song_to_plugin_host();
         }
     }
@@ -19277,7 +18594,7 @@ impl AppData {
     ) {
         let new_duration = new_duration.max(0.0625);
         let Some(notes) = self
-            .song
+            .song_doc.song()
             .notes_in_clip_mut(track_idx as usize, clip_idx as usize)
         else {
             return;
@@ -19288,24 +18605,24 @@ impl AppData {
         note.duration_beats = new_duration;
         // リサイズした note を勝者として重なり解消。既存選択は remap で追従。
         let remap = resolve_note_overlaps(notes, &[note_idx]);
-        let sel = std::mem::take(&mut self.selected_notes);
-        self.selected_notes = remap_indices(&remap, &sel);
+        let sel = std::mem::take(&mut self.selection.selected_notes);
+        self.selection.selected_notes = remap_indices(&remap, &sel);
         self.sync_song_to_plugin_host();    }
 
     fn delete_selected_notes(&mut self) {
         // 選択 (packed) を所属クリップごとに分配し、各クリップ内で index 降順に
         // remove (削除で後続 index がずれない)。複数クリップに跨る選択をまとめて消す。
-        if self.selected_notes.is_empty() {
+        if self.selection.selected_notes.is_empty() {
             return;
         }
-        let ids = std::mem::take(&mut self.selected_notes);
+        let ids = std::mem::take(&mut self.selection.selected_notes);
         self.for_each_note_clip_group(
             ids.into_iter().map(|id| (id, ())),
             |app, _slot, r, items| {
                 let mut locals: Vec<usize> = items.iter().map(|&(local, ())| local).collect();
                 locals.sort_unstable_by(|a, b| b.cmp(a));
                 if let Some(notes) =
-                    app.song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    app.song_doc.song().notes_in_clip_mut(r.track as usize, r.clip as usize)
                 {
                     for i in locals {
                         if i < notes.len() {
@@ -19332,7 +18649,7 @@ impl AppData {
             return;
         };
         let Some(clip) = self
-            .song
+            .song_doc.song()
             .tracks
             .get_mut(r.track as usize)
             .and_then(|t| t.clips.get_mut(r.clip as usize))
@@ -19368,7 +18685,7 @@ impl AppData {
             return;
         };
         let Some(clip) = self
-            .song
+            .song_doc.song()
             .tracks
             .get_mut(r.track as usize)
             .and_then(|t| t.clips.get_mut(r.clip as usize))
@@ -19402,7 +18719,7 @@ impl AppData {
     /// 起動 (`ensure_voicevox_engine`) と「再取得」(`RefetchSingers`) から呼ぶ。
     /// background thread (= ready 待ち + blocking HTTP) で走らせる。
     fn spawn_fetch_singers(&self) {
-        let proxy = self.event_proxy.clone();
+        let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             // engine が ready になるまで待つ (未起動なら timeout で抜ける)。
             common::voicevox_engine::wait_until_ready();
@@ -19418,7 +18735,7 @@ impl AppData {
     /// `SpeakersLoaded` を発行する。engine 起動 (`ensure_voicevox_engine`) と「再取得」
     /// (`RefetchSpeakers`) から呼ぶ。background thread (= ready 待ち + blocking HTTP)。
     fn spawn_fetch_speakers(&self) {
-        let proxy = self.event_proxy.clone();
+        let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             common::voicevox_engine::wait_until_ready();
             let speakers = common::voicevox::fetch_speakers().unwrap_or_else(|e| {
@@ -19435,7 +18752,7 @@ impl AppData {
     /// は `None` に正規化済み (= 歌詞削除)。 clip_ref が無効なら no-op。
     fn set_note_lyrics(&mut self, clip_ref: ClipRef, updates: &[(u32, Option<String>)]) {
         let Some(notes) = self
-            .song
+            .song_doc.song()
             .notes_in_clip_mut(clip_ref.track as usize, clip_ref.clip as usize)
         else {
             return;
@@ -19460,7 +18777,7 @@ impl AppData {
 
     // -------- Plugin GUI bridge --------------------------------------------
 
-    fn on_gui_opened(&mut self, _track: u32, _index: u32, _width: u32, _height: u32) {
+    fn on_gui_opened(&mut self, _device_id: u64, _width: u32, _height: u32) {
         // the editor window is created, sized, and owned by the
         // plugin-host process. daw_gui only records open state (done in
         // `open_slot_gui` when the request is sent), so there's nothing to do
@@ -19468,10 +18785,12 @@ impl AppData {
         // handled entirely in the plugin-host process now.
     }
 
-    fn on_gui_closed(&mut self, track: u32, index: u32) {
+    fn on_gui_closed(&mut self, device_id: u64) {
         // The plugin-host process tore the editor window down (user clicked
         // the window's ✕, or the plugin self-closed). Drop our open-state.
-        self.open_plugin_guis.remove(&(track, index));
+        if let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) {
+            self.ipc.open_plugin_guis.remove(&(track, index));
+        }
     }
 
     // Args mirror the `SlotPluginLoadedFromChild` AppEvent (= the IPC
@@ -19480,11 +18799,9 @@ impl AppData {
     #[allow(clippy::too_many_arguments)]
     fn on_plugin_loaded_from_child(
         &mut self,
-        track_id: u32,
-        index: u32,
+        device_id: u64,
         id: String,
         _name: String,
-        plugin_id: u32,
         shmem_id: String,
         // Phase 6 review (silent corruption fix): plugin_host が saved state
         // を `state_load(&bytes)` で適用しようとして失敗したときの理由。
@@ -19496,39 +18813,63 @@ impl AppData {
         // 再構築する PluginInstance に焼き込み、インスペクタの「パラアウト展開」
         // / ルーティング行が使う。
         aux_output_count: u8,
+        // v29 世代 guard: `SetSlotPlugin` に載せた要求世代の echo。
+        generation: u64,
     ) {
+        // v29 世代 guard (`docs/plan_arch_refactor.md` §7): 最新要求世代の
+        // 応答のみ受理する。 A→B と連続差し替えしたとき、 A の stale 応答が
+        // B を載せた song device を巻き戻すのを防ぐ。 entry が無い (= 既に
+        // 最新世代を処理済み / disconnect で clear 済み) 場合も stale 扱い。
+        match self.ipc.pending_plugin_loads.get(&device_id) {
+            Some(&g) if g == generation => {}
+            latest => {
+                tracing::warn!(
+                    device_id,
+                    generation,
+                    ?latest,
+                    "stale SlotPluginLoaded ignored (generation guard)"
+                );
+                return;
+            }
+        }
+        // v29: 安定 device_id → 旧 (track_id, index) 座標へ逆引きし、 既存の
+        // positional bookkeeping / song 再構築ロジックへ繋ぐ。
+        let coords = find_device_by_id(&self.song_doc.song(), device_id);
+
         // SSoT (code review 2026-06-06): audio engine に `ProcessData` shmem を
         // 開かせる。 incoming bridge の stale clone ではなく、 respawn で
-        // 差し替わる live な `self.audio_tx` から送ることで、 audio respawn
-        // 後にロードした plugin の音が出なくなる bug を防ぐ。
-        self.send_audio(MainToChild::OpenPluginShmem {
-            plugin_id,
-            shmem_id,
-            track: track_id,
-            index,
-        });
+        // 差し替わる live な `self.ipc.audio_tx` から送ることで、 audio respawn
+        // 後にロードした plugin の音が出なくなる bug を防ぐ。 v29: 配置は
+        // daw_audio が Song から解決するので device_id + shmem_id のみ。
+        self.send_audio(AudioCommand::OpenPluginShmem { device_id, shmem_id });
+
+        let Some((track_id, index)) = coords else {
+            // device が song から消えている (load 中に削除された等)。 shmem は
+            // 開いたままでも engine 側は Song に居ない device を schedule しない。
+            // pending だけ解放して終了。
+            self.ipc.pending_plugin_loads.remove(&device_id);
+            tracing::warn!(device_id, %id, "SlotPluginLoaded for a device no longer in the song");
+            return;
+        };
         if let Some(reason) = state_load_error {
             let msg = format!(
                 "Plugin state 復元失敗 (track {track_id} device {index}, id={id}): {reason}"
             );
             tracing::error!(track = track_id, index, %id, %reason, "state_load failed (notified by plugin host)");
-            self.status_message = msg;
+            self.ui_ephemeral.status_message = msg;
         }
-        // PR2.1: ChildToMain `track` is now a `Track::id`. Resolve to
-        // a Vec position only for the local `song.tracks` mutation;
-        // the plugin host stores chains by id directly.
-        // plugin_id を track_plugin_ids に登録 (delete / ungroup 時の
+        // device_id を track_plugin_ids に登録 (delete / ungroup 時の
         // ClosePluginShmem 先送りに使用、 use-after-free deadlock 防止)。
-        let entry = self.track_plugin_ids.entry(track_id).or_default();
-        if !entry.contains(&plugin_id) {
-            entry.push(plugin_id);
+        let entry = self.ipc.track_plugin_ids.entry(track_id).or_default();
+        if !entry.contains(&device_id) {
+            entry.push(device_id);
         }
         // device index 単位での load 状態 cache。 reconcile の device-level diff
         // (Undo で同 track 内の plugin 構成が変化した場合の同期) で参照。
-        self.loaded_slots.insert(
+        self.ipc.loaded_slots.insert(
             (track_id, index),
             LoadedSlotInfo {
-                plugin_id,
+                device_id,
                 plugin_id_str: id.clone(),
             },
         );
@@ -19537,7 +18878,7 @@ impl AppData {
         // resolve ports from the plugin DB (役割導出の入力)。 不在なら既存値を
         // 引き継ぐ (= reconcile 由来の再 load で既存 instance がある場合)。
         let db_ports = self
-            .plugin_db
+            .ipc.plugin_db
             .as_ref()
             .and_then(|db| db.find_by_id(&id).map(port_config_of));
 
@@ -19556,9 +18897,9 @@ impl AppData {
         // (docs/plan_paraout.md) も sidechain と同じく再ロードで生存させる。
         let chain: Option<&mut Vec<common::model::PluginInstance>> =
             if track_id == common::model::MASTER_TRACK_ID {
-                Some(&mut self.song.master_fx_chain)
+                Some(&mut self.song_doc.song().master_fx_chain)
             } else {
-                self.song
+                self.song_doc.song()
                     .tracks
                     .iter_mut()
                     .find(|t| t.id == track_id)
@@ -19583,6 +18924,9 @@ impl AppData {
             })
             .unwrap_or((None, PluginFormat::Clap, Vec::new(), Vec::new(), Default::default()));
         let inst = common::model::PluginInstance {
+            // v29: 安定 device id を必ず引き継ぐ (with_ports は sentinel 0 で
+            // 作るので、 ここで焼き込まないと以後の id addressing が全滅する)。
+            id: device_id,
             state: existing_state,
             aux_inputs: existing_aux,
             aux_outputs: existing_aux_out,
@@ -19609,33 +18953,33 @@ impl AppData {
         // (r.md #5 ARA2) A (re)loaded plug-in at this slot is a brand-new
         // instance with an empty ARA document, even if the slot's clip set is
         // unchanged (e.g. the user re-inserted the same ARA plug-in). The ARA
-        // sync cache is keyed by (track, index) + clip set, so without dropping
+        // sync cache is keyed by device_id + clip set, so without dropping
         // the cached entry here the next sync sees "no change" and never sends
         // `SetupAraDocument` to the new instance — leaving it with no regions, so
         // it renders silence and its empty playback renderer stalls the engine.
-        self.ara_doc_cache.remove(&(track_id, index));
+        self.ipc.ara_doc_cache.remove(&device_id);
 
         // pending_play flush より前に sync し、 Play 待ち再生も最新 schedule で開始させる。
         // Shift 追加 (open_gui=false) でも audio 再 sync は必須 — 無いと次の無関係な
         // sync まで新 plugin が schedule に入らない (review 修正)。
-        if let Some(open_gui) = self.pending_added_plugin_finalize.remove(&(track_id, index)) {
+        if let Some(open_gui) = self.ipc.pending_added_plugin_finalize.remove(&(track_id, index)) {
             self.sync_song_to_plugin_host();
             if open_gui {
-                self.gui_open_requests.push((track_id, index));
+                self.ipc.gui_open_requests.push((track_id, index));
             }
         }
 
         // A7: this load is done. If Play was queued waiting for the
         // last plugin to register on the audio side, fire it now.
-        self.pending_plugin_loads.remove(&(track_id, index));
-        if self.pending_plugin_loads.is_empty() && self.pending_play {
-            self.pending_play = false;
-            self.status_message.clear();
+        self.ipc.pending_plugin_loads.remove(&device_id);
+        if self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play {
+            self.transport.pending_play = false;
+            self.ui_ephemeral.status_message.clear();
             self.play();
-        } else if !self.pending_plugin_loads.is_empty() && self.pending_play {
-            self.status_message = format!(
+        } else if !self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play {
+            self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
-                self.pending_plugin_loads.len()
+                self.ipc.pending_plugin_loads.len()
             );
         }
 
@@ -19662,65 +19006,79 @@ impl AppData {
     /// を表示するだけ。
     fn on_plugin_load_failed_from_child(
         &mut self,
-        track: u32,
-        index: u32,
+        device_id: u64,
         plugin_id: String,
         reason: String,
+        generation: u64,
     ) {
+        // v29 世代 guard: loaded と対称 (最新世代の失敗のみ pending を解放)。
+        match self.ipc.pending_plugin_loads.get(&device_id) {
+            Some(&g) if g == generation => {}
+            latest => {
+                tracing::warn!(
+                    device_id,
+                    generation,
+                    ?latest,
+                    "stale SlotPluginLoadFailed ignored (generation guard)"
+                );
+                return;
+            }
+        }
         tracing::error!(
-            track,
-            index,
+            device_id,
             %plugin_id,
             %reason,
             "plugin load failed (notified by plugin host)"
         );
-        self.pending_plugin_loads.remove(&(track, index));
+        self.ipc.pending_plugin_loads.remove(&device_id);
         // load 失敗時は finalize 予約も取り消す (stale entry が後の project-load で
         // 誤 sync / 誤 open しないように)。
-        self.pending_added_plugin_finalize.remove(&(track, index));
+        if let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) {
+            self.ipc.pending_added_plugin_finalize.remove(&(track, index));
+        }
         // pending_play 解放: A7 と同じロジック (`on_plugin_loaded_from_child`
         // と対称)。 失敗で空になったタイミングで queue Play を flush する。
-        if self.pending_plugin_loads.is_empty() && self.pending_play {
-            self.pending_play = false;
-            self.status_message =
+        if self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play {
+            self.transport.pending_play = false;
+            self.ui_ephemeral.status_message =
                 format!("プラグイン読み込み失敗: {plugin_id} ({reason})");
             self.play();
-        } else if !self.pending_plugin_loads.is_empty() && self.pending_play {
+        } else if !self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play {
             // まだ他の load が走っているなら、 残数表示を更新しつつエラーは
             // 上書き (最新の状況をユーザーに見せる)。
-            self.status_message = format!(
+            self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み失敗: {plugin_id} ({reason}) — 残 {}",
-                self.pending_plugin_loads.len()
+                self.ipc.pending_plugin_loads.len()
             );
         } else {
             // pending_play は立っていない (= 再生中じゃなかった or stop 済) ので
             // 単に status にエラーを出すだけ。
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 format!("プラグイン読み込み失敗: {plugin_id} ({reason})");
         }
     }
 
     /// plugin_host が plugin destroy を完了した通知を受けて、 audio engine
-    /// に `ClosePluginShmem` を送り (SSoT: live な `self.audio_tx` 経由)、
+    /// に `ClosePluginShmem` を送り (SSoT: live な `self.ipc.audio_tx` 経由)、
     /// `track_plugin_ids` 等の daw_gui ローカル状態をクリーンアップする。
-    fn on_plugin_unloaded_from_child(&mut self, plugin_id: u32) {
+    fn on_plugin_unloaded_from_child(&mut self, device_id: u64) {
         // SSoT (code review 2026-06-06): stale な incoming-bridge clone では
         // なく live audio_tx から送る。 respawn 後に dangling shmem 参照が
         // 残るのを防ぐ。
-        self.send_audio(MainToChild::ClosePluginShmem { plugin_id });
-        for entry in self.track_plugin_ids.values_mut() {
-            entry.retain(|p| *p != plugin_id);
+        self.send_audio(AudioCommand::ClosePluginShmem { device_id });
+        for entry in self.ipc.track_plugin_ids.values_mut() {
+            entry.retain(|p| *p != device_id);
         }
-        self.track_plugin_ids.retain(|_, v| !v.is_empty());
-        // slot 単位 cache からも、 同 plugin_id を持つ entry を retain で外す。
-        self.loaded_slots
-            .retain(|_, info| info.plugin_id != plugin_id);
+        self.ipc.track_plugin_ids.retain(|_, v| !v.is_empty());
+        // slot 単位 cache からも、 同 device_id を持つ entry を retain で外す。
+        self.ipc.loaded_slots
+            .retain(|_, info| info.device_id != device_id);
         // builtin VOICEVOX が外れたら合成状態 entry も消す (busy のまま残ると
         // overlay / スピナーが消えない)。plugin host の deactivate も idle を報告するが二重防御。
-        self.voicevox_synth_status.remove(&plugin_id);
+        self.voicevox.voicevox_synth_status.remove(&device_id);
         // PR3.3: drop the latency entry for the destroyed plugin and
         // recompute every track's total since the chain shape changed.
-        self.plugin_latencies.remove(&plugin_id);
+        self.ipc.plugin_latencies.remove(&device_id);
         self.recompute_track_latencies();
     }
 
@@ -19728,8 +19086,8 @@ impl AppData {
     /// owning track's total (sum of all its plugin latencies), and push the
     /// updated `Song` to daw_audio so `compile_schedule` regenerates the
     /// PDC delay lines.
-    fn on_plugin_latency_changed(&mut self, plugin_id: u32, samples: u32) {
-        self.plugin_latencies.insert(plugin_id, samples);
+    fn on_plugin_latency_changed(&mut self, device_id: u64, samples: u32) {
+        self.ipc.plugin_latencies.insert(device_id, samples);
         self.recompute_track_latencies();
     }
 
@@ -19738,12 +19096,12 @@ impl AppData {
     /// if anything changed. No-op when the totals already agree.
     fn recompute_track_latencies(&mut self) {
         let mut changed = false;
-        for (track_id, plugin_ids) in &self.track_plugin_ids {
+        for (track_id, plugin_ids) in &self.ipc.track_plugin_ids {
             let total: u32 = plugin_ids
                 .iter()
-                .map(|pid| self.plugin_latencies.get(pid).copied().unwrap_or(0))
+                .map(|pid| self.ipc.plugin_latencies.get(pid).copied().unwrap_or(0))
                 .sum();
-            if let Some(track) = self.song.track_by_id_mut(*track_id)
+            if let Some(track) = self.song_doc.song().track_by_id_mut(*track_id)
                 && track.reported_latency_samples != total
             {
                 track.reported_latency_samples = total;
@@ -19753,8 +19111,8 @@ impl AppData {
         // Tracks with no loaded plugins should report 0 — clear any stale
         // value (e.g. the last plugin in a track was just removed).
         let track_ids_with_plugins: std::collections::HashSet<u32> =
-            self.track_plugin_ids.keys().copied().collect();
-        for track in &mut self.song.tracks {
+            self.ipc.track_plugin_ids.keys().copied().collect();
+        for track in &mut self.song_doc.song().tracks {
             if !track_ids_with_plugins.contains(&track.id)
                 && track.reported_latency_samples != 0
             {
@@ -19781,7 +19139,7 @@ impl AppData {
         // インスペクタ内のパラメータ調整パネルをトグルする (plugin window は開かない)。
         // Transform も同様にトグル開閉 (開くと Group Transform セクションが出る。出っぱなしにしない)。
         let device = self
-            .song
+            .song_doc.song()
             .fx_chain_by_track_id(track_id)
             .and_then(|chain| chain.get(index as usize));
         // 映像 FX (色補正 / Transform 等) は専用の video_fx パネル。 ただし字幕
@@ -19793,8 +19151,8 @@ impl AppData {
             && d.plugin_id != common::plugin_db::SUBTITLE_ID
         {
             let key = (track_id, index);
-            self.open_plugin_params = None; // 2 種のインライン param パネルは相互排他。
-            self.open_video_fx_params = if self.open_video_fx_params == Some(key) {
+            self.ui_ephemeral.open_plugin_params = None; // 2 種のインライン param パネルは相互排他。
+            self.ui_ephemeral.open_video_fx_params = if self.ui_ephemeral.open_video_fx_params == Some(key) {
                 None
             } else {
                 Some(key)
@@ -19809,14 +19167,14 @@ impl AppData {
         let is_builtin = device.is_some_and(|d| d.format == PluginFormat::Builtin);
         let has_embedded_gui = !is_builtin
             && self
-                .slot_has_gui
+                .ipc.slot_has_gui
                 .get(&(track_id, index))
                 .copied()
                 .unwrap_or(true);
         if !has_embedded_gui {
             let key = (track_id, index);
-            self.open_video_fx_params = None; // 2 種のインライン param パネルは相互排他。
-            self.open_plugin_params = if self.open_plugin_params == Some(key) {
+            self.ui_ephemeral.open_video_fx_params = None; // 2 種のインライン param パネルは相互排他。
+            self.ui_ephemeral.open_plugin_params = if self.ui_ephemeral.open_plugin_params == Some(key) {
                 None
             } else {
                 Some(key)
@@ -19827,8 +19185,10 @@ impl AppData {
         // open 状態は open_plugin_guis (id set) で追跡。実 window は
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
         // B 側に破棄させ、SlotGuiClosed の受信で set から除去する。
-        if self.open_plugin_guis.contains(&(track_id, index)) {
-            self.send_plugin(MainToChild::CloseSlotGui { track: track_id, index });
+        if self.ipc.open_plugin_guis.contains(&(track_id, index)) {
+            if let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, index) {
+                self.send_plugin(PluginCommand::CloseSlotGui { device_id });
+            }
             return;
         }
         self.open_slot_gui(track_id, index);
@@ -19841,17 +19201,17 @@ impl AppData {
     fn open_slot_gui(&mut self, track_id: u32, index: u32) {
         #[cfg(windows)]
         {
-            if self.open_plugin_guis.contains(&(track_id, index)) {
+            if self.ipc.open_plugin_guis.contains(&(track_id, index)) {
                 return;
             }
             let label = if track_id == common::model::MASTER_TRACK_ID {
-                self.song
+                self.song_doc.song()
                     .master_fx_chain
                     .get(index as usize)
                     .map(|p| format!("Master / {}", self.resolve_name(&p.plugin_id)))
                     .unwrap_or_else(|| "Master".into())
             } else {
-                self.song
+                self.song_doc.song()
                     .tracks
                     .iter()
                     .find(|t| t.id == track_id)
@@ -19876,10 +19236,13 @@ impl AppData {
                 };
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
             }
-            self.open_plugin_guis.insert((track_id, index));
-            self.send_plugin(MainToChild::OpenSlotGuiEmbedded {
-                track: track_id,
-                index,
+            let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, index) else {
+                tracing::warn!(track_id, index, "open_slot_gui: no device id at slot");
+                return;
+            };
+            self.ipc.open_plugin_guis.insert((track_id, index));
+            self.send_plugin(PluginCommand::OpenSlotGuiEmbedded {
+                device_id,
                 title: format!("Plugin — {label}"),
             });
         }
@@ -19894,10 +19257,10 @@ impl AppData {
     /// window 生成を handle_event ではなく frame loop に置くことで、frame loop を
     /// 回さない headless test では window を作らない。
     pub(crate) fn drain_pending_gui_opens(&mut self) {
-        if self.gui_open_requests.is_empty() {
+        if self.ipc.gui_open_requests.is_empty() {
             return;
         }
-        for (track_id, index) in std::mem::take(&mut self.gui_open_requests) {
+        for (track_id, index) in std::mem::take(&mut self.ipc.gui_open_requests) {
             self.open_slot_gui(track_id, index);
         }
     }
@@ -19919,12 +19282,12 @@ impl AppData {
         let is_master = self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
         // 対象チェーン (master / track) の現在の device 列と track_id を解決。
         let (track_id, old_devices): (u32, Vec<common::model::PluginInstance>) = if is_master {
-            (common::model::MASTER_TRACK_ID, self.song.master_fx_chain.clone())
+            (common::model::MASTER_TRACK_ID, self.song_doc.song().master_fx_chain.clone())
         } else {
             let Some(track_idx) = self.cursor_track_index() else {
                 return;
             };
-            let Some(track) = self.song.tracks.get(track_idx) else {
+            let Some(track) = self.song_doc.song().tracks.get(track_idx) else {
                 return;
             };
             (track.id, track.devices.clone())
@@ -19946,25 +19309,25 @@ impl AppData {
             }
         }
 
-        // (review) device 貼り替えは 3 プロセスの per-device bookkeeping が
-        // song チェーンと一致している前提。 ロード失敗 / 進行中の plugin が song に
-        // phantom として残ると、 host はその device を持たず ReorderChain を skip
-        // する一方で audio engine / daw_gui は適用し、 (track, index)→plugin が
-        // 恒久的に分岐する。 song チェーンが loaded_slots と完全一致 (= 全 plugin
-        // が 3 プロセスでロード済) のときだけ並び替える (不一致なら snap back)。
+        // (review) daw_gui ローカルの positional cache (loaded_slots 等) の
+        // 貼り替えは song チェーンと一致している前提。 ロード失敗 / 進行中の
+        // plugin が song に phantom として残ると再キーがずれるので、 song
+        // チェーンが loaded_slots と完全一致 (= 全 plugin がロード済) のとき
+        // だけ並び替える (不一致なら snap back)。 v29: プロセス間は device_id
+        // addressing なので host/audio 側の再キーは不要になった。
         let loaded_here = self
-            .loaded_slots
+            .ipc.loaded_slots
             .keys()
             .filter(|(t, _)| *t == track_id)
             .count();
         let fully_loaded = loaded_here == n
             && old_devices.iter().enumerate().all(|(i, inst)| {
-                self.loaded_slots
+                self.ipc.loaded_slots
                     .get(&(track_id, i as u32))
                     .is_some_and(|info| info.plugin_id_str == inst.plugin_id)
             });
         if !fully_loaded {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "プラグインの読み込み中または失敗のため並び替えできません".to_string();
             return;
         }
@@ -19978,8 +19341,8 @@ impl AppData {
 
         // song を書き換え。
         if is_master {
-            self.song.master_fx_chain = new_devices;
-        } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
+            self.edit_song(|song| song.master_fx_chain = new_devices);
+        } else if let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) {
             t.devices = new_devices;
         } else {
             return;
@@ -19993,13 +19356,13 @@ impl AppData {
         self.sync_song_to_plugin_host();
     }
 
-    /// propagate an inspector-chain reorder to the plugin host, the audio
-    /// engine, and our own `(track, device_index)`-keyed caches. `moves` is the
-    /// complete `(old_index, new_index)` permutation for `track_id` (one entry
+    /// re-key our own `(track, device_index)`-keyed caches after an
+    /// inspector-chain reorder. `moves` is the complete
+    /// `(old_index, new_index)` permutation for `track_id` (one entry
     /// per loaded plugin, `from == to` for ones that stayed put). The caller
-    /// has already rewritten `self.song`; this re-keys everything else that is
-    /// addressed by device index so the moved plugins' real processing, editor
-    /// windows, param lists and load-state cache follow the new positions.
+    /// has already rewritten `self.song_doc.song()` and follows up with
+    /// `sync_song_to_plugin_host` (= LoadSong resend) — v29 ではそれだけで
+    /// 3 プロセスの並びが揃う (host は順序を持たない)。
     fn apply_chain_reorder(&mut self, track_id: u32, moves: Vec<(u32, u32)>) {
         // Local caches: remove ALL old keys first (snapshot), then re-insert at
         // the new keys, so a swap (0↔1) can't clobber the second entry.
@@ -20008,97 +19371,38 @@ impl AppData {
         let mut new_params = Vec::new();
         let mut new_has_gui = Vec::new();
         for &(from, to) in &moves {
-            if let Some(v) = self.loaded_slots.remove(&(track_id, from)) {
+            if let Some(v) = self.ipc.loaded_slots.remove(&(track_id, from)) {
                 new_loaded.push((to, v));
             }
-            if self.open_plugin_guis.remove(&(track_id, from)) {
+            if self.ipc.open_plugin_guis.remove(&(track_id, from)) {
                 new_open.push(to);
             }
-            if let Some(v) = self.plugin_params.remove(&(track_id, from)) {
+            if let Some(v) = self.ipc.plugin_params.remove(&(track_id, from)) {
                 new_params.push((to, v));
             }
-            if let Some(v) = self.slot_has_gui.remove(&(track_id, from)) {
+            if let Some(v) = self.ipc.slot_has_gui.remove(&(track_id, from)) {
                 new_has_gui.push((to, v));
             }
         }
         for (to, v) in new_loaded {
-            self.loaded_slots.insert((track_id, to), v);
+            self.ipc.loaded_slots.insert((track_id, to), v);
         }
         for to in new_open {
-            self.open_plugin_guis.insert((track_id, to));
+            self.ipc.open_plugin_guis.insert((track_id, to));
         }
         for (to, v) in new_has_gui {
-            self.slot_has_gui.insert((track_id, to), v);
+            self.ipc.slot_has_gui.insert((track_id, to), v);
         }
         for (to, v) in new_params {
-            self.plugin_params.insert((track_id, to), v);
+            self.ipc.plugin_params.insert((track_id, to), v);
         }
-        // (review) automation lanes / mod routings are addressed by device index
-        // (`AutomationTarget::PluginParam { device_index, .. }`) and are
-        // persisted to the project. Re-point each matching target old→new so the
-        // moved plugin keeps its automation — otherwise the plugin that took
-        // its old index gets driven by it (audible wrong audio that also
-        // survives reload).
-        if track_id == common::model::MASTER_TRACK_ID {
-            Self::remap_lane_slots(&mut self.song.song_lanes, &moves);
-            for r in &mut self.song.song_mod_routings {
-                Self::remap_plugin_param_device_index(&mut r.target, &moves);
-            }
-        } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
-            Self::remap_lane_slots(&mut t.automation_lanes, &moves);
-            for r in &mut t.mod_routings {
-                Self::remap_plugin_param_device_index(&mut r.target, &moves);
-            }
-        }
-        // MIDI Learn binding も (track, device_index) addressing (song-level list)。
-        for b in &mut self.song.midi_bindings {
-            if let common::model::BindingTarget::PluginParam { track, device_index, .. } =
-                &mut b.target
-                && *track == track_id
-                && let Some(&(_, new_index)) =
-                    moves.iter().find(|(from, _)| *from == *device_index)
-            {
-                *device_index = new_index;
-            }
-        }
-        // Plugin host re-keys its live chain + editor windows + worker registry;
-        // the audio engine atomically re-keys slot_to_plugin_id. Both get the
-        // same `moves` payload.
-        self.send_plugin(MainToChild::ReorderChain {
-            track: track_id,
-            moves: moves.clone(),
-        });
-        self.send_audio(MainToChild::ReorderChain {
-            track: track_id,
-            moves,
-        });
-    }
-
-    /// (review) rewrite every `AutomationTarget::PluginParam { device_index }`
-    /// in `lanes` from its old device index to its new one per `moves`. Each
-    /// lane stores the pre-reorder index, and `moves` maps old→new, so a single
-    /// per-lane lookup is collision-free (no shared structure is rekeyed here).
-    fn remap_lane_slots(
-        lanes: &mut [common::model::AutomationLane],
-        moves: &[(u32, u32)],
-    ) {
-        for lane in lanes.iter_mut() {
-            Self::remap_plugin_param_device_index(&mut lane.target, moves);
-        }
-    }
-
-    /// `AutomationTarget::PluginParam { device_index }` 1 件を `moves`
-    /// (old→new) で貼り替える。 automation lane / mod routing 共通の素片。
-    fn remap_plugin_param_device_index(
-        target: &mut common::model::AutomationTarget,
-        moves: &[(u32, u32)],
-    ) {
-        if let common::model::AutomationTarget::PluginParam { device_index, .. } = target
-            && let Some(&(_, new_index)) =
-                moves.iter().find(|(from, _)| *from == *device_index)
-        {
-            *device_index = new_index;
-        }
+        // v29: automation lane / mod routing / MIDI binding の PluginParam は
+        // 安定 `device_id` addressing になったので、 並び替えでの remap は不要
+        // (id は device と一緒に動く)。 旧 `ReorderChain` IPC も廃止 —
+        // plugin_host は順序を持たず (flat HashMap<device_id, ..>)、 audio
+        // engine の処理順は caller が続けて送る LoadSong (=
+        // `sync_song_to_plugin_host`) が Song から compile する
+        // (`docs/plan_arch_refactor.md` §1)。
     }
 
     /// PR4 sidechain: route a track's output into a plugin's `aux_in_port`.
@@ -20117,9 +19421,9 @@ impl AppData {
         // 単一デバイスチェーン: master は master_fx_chain、 通常 track は devices
         // を flat な device index で引く。
         let inst = if track_id == common::model::MASTER_TRACK_ID {
-            self.song.master_fx_chain.get_mut(device_index as usize)
+            self.song_doc.song().master_fx_chain.get_mut(device_index as usize)
         } else {
-            let Some(track) = self.song.track_by_id_mut(track_id) else {
+            let Some(track) = self.song_doc.song().track_by_id_mut(track_id) else {
                 return;
             };
             track.devices.get_mut(device_index as usize)
@@ -20149,9 +19453,9 @@ impl AppData {
         dest: Option<u32>,
     ) {
         let inst = if track_id == common::model::MASTER_TRACK_ID {
-            self.song.master_fx_chain.get_mut(device_index as usize)
+            self.song_doc.song().master_fx_chain.get_mut(device_index as usize)
         } else {
-            let Some(track) = self.song.track_by_id_mut(track_id) else {
+            let Some(track) = self.song_doc.song().track_by_id_mut(track_id) else {
                 return;
             };
             track.devices.get_mut(device_index as usize)
@@ -20180,7 +19484,7 @@ impl AppData {
         if track_id == common::model::MASTER_TRACK_ID {
             return;
         }
-        let Some(src) = self.song.track_by_id(track_id) else {
+        let Some(src) = self.song_doc.song().track_by_id(track_id) else {
             return;
         };
         let Some(inst) = src.devices.get(device_index as usize) else {
@@ -20192,7 +19496,7 @@ impl AppData {
         }
         let src_name = src.name.clone();
         // Snapshot the current routes + the set of live track ids so the loop
-        // below can keep valid existing routes without re-borrowing `self.song`
+        // below can keep valid existing routes without re-borrowing `self.song_doc.song()`
         // while it allocates ids / inserts tracks.
         let existing: Vec<Option<u32>> = (0..count)
             .map(|port| {
@@ -20203,7 +19507,7 @@ impl AppData {
             })
             .collect();
         let live_ids: std::collections::HashSet<u32> =
-            self.song.tracks.iter().map(|t| t.id).collect();
+            self.song_doc.song().tracks.iter().map(|t| t.id).collect();
 
         let mut routes: Vec<Option<common::model::AuxOutputRoute>> = vec![None; count];
         let mut new_children: Vec<common::model::Track> = Vec::new();
@@ -20215,7 +19519,7 @@ impl AppData {
                 routes[port] = Some(common::model::AuxOutputRoute::to_track(*dest));
                 continue;
             }
-            let child_id = self.song.alloc_track_id();
+            let child_id = self.song_doc.song().alloc_track_id();
             let name = format!("{src_name} Out {}", port + 1);
             new_children.push(track_with(|t| {
                 t.id = child_id;
@@ -20228,16 +19532,16 @@ impl AppData {
         // Insert the new children right after the source track so they appear
         // grouped under it in the arrangement.
         let insert_at = self
-            .song
+            .song_doc.song()
             .track_index_by_id(track_id)
             .map(|i| i + 1)
-            .unwrap_or(self.song.tracks.len());
+            .unwrap_or(self.song_doc.song().tracks.len());
         for (k, child) in new_children.into_iter().enumerate() {
-            self.song.tracks.insert(insert_at + k, child);
+            self.edit_song(|song| song.tracks.insert(insert_at + k, child));
         }
 
         // Wire the source plugin's aux outputs to the (new or kept) children.
-        if let Some(track) = self.song.track_by_id_mut(track_id)
+        if let Some(track) = self.song_doc.song().track_by_id_mut(track_id)
             && let Some(inst) = track.devices.get_mut(device_index as usize)
         {
             inst.aux_outputs = routes;
@@ -20253,11 +19557,11 @@ impl AppData {
 
     fn add_mod_source(&mut self, tag: ModSourceKindTag) {
         use common::model::{ModSourceKind, RandomConfig};
-        let id = self.song.alloc_mod_source_id();
+        let id = self.song_doc.song().alloc_mod_source_id();
         // 帰属トラック = カーソルトラック (= このラックを開いているトラック)。以後
         // inspector ではこのトラックの下にだけ列挙される。
         let owner_track_id = self.cursor_track_id().unwrap_or(0);
-        let color = common::model::ModSource::palette_color(self.song.mod_sources.len());
+        let color = common::model::ModSource::palette_color(self.song_doc.song().mod_sources.len());
         let kind = match tag {
             // follower の follow 先は初期 = カーソルトラック。
             ModSourceKindTag::Follower => ModSourceKind::EnvelopeFollower {
@@ -20273,7 +19577,7 @@ impl AppData {
             ModSourceKindTag::Mseg => ModSourceKind::Mseg(Default::default()),
             ModSourceKindTag::Steps => ModSourceKind::Steps(Default::default()),
         };
-        self.song.mod_sources.push(common::model::ModSource {
+        self.song_doc.song().mod_sources.push(common::model::ModSource {
             id,
             owner_track_id,
             color,
@@ -20290,7 +19594,7 @@ impl AppData {
         &mut common::model::AudioTap,
         &mut common::model::FollowerConfig,
     )> {
-        self.song
+        self.song_doc.song()
             .mod_sources
             .iter_mut()
             .find(|m| m.id == id)
@@ -20309,7 +19613,7 @@ impl AppData {
     /// ドラッグ系 (per-frame の recompile を避け dirty のみ、 drag-end で sync)。
     fn edit_mod_source(&mut self, id: u32, edit: ModSourceEdit) {
         use common::model::ModSourceKind;
-        let Some(m) = self.song.mod_sources.iter_mut().find(|m| m.id == id) else {
+        let Some(m) = self.song_doc.song().mod_sources.iter_mut().find(|m| m.id == id) else {
             return;
         };
         let mut scrub = false;
@@ -20428,21 +19732,21 @@ impl AppData {
         // 変更は recompile で engine に反映する。 連続ドラッグ系は per-frame LoadSong
         // を避け dirty のみ (drag-end edge で sync、 follower の attack/release と同流儀)。
         if scrub {
-            self.is_dirty = true;
+            self.song_doc.is_dirty() = true;
         } else {
             self.sync_song_to_plugin_host();
         }
     }
 
     fn remove_mod_source(&mut self, id: u32) {
-        self.song.mod_sources.retain(|m| m.id != id);
+        self.edit_song(|song| song.mod_sources.retain(|m| m.id != id));
         // この source を指す全 routing を掃除 (dangling は scalar 0 になるが、
         // 残すと UI に幽霊 routing が出るので明示削除)。lane 非依存なので
         // Track.mod_routings / Song.song_mod_routings を走査する。
-        for t in &mut self.song.tracks {
+        for t in &mut self.song_doc.song().tracks {
             t.mod_routings.retain(|r| r.source_id != id);
         }
-        self.song.song_mod_routings.retain(|r| r.source_id != id);
+        self.edit_song(|song| song.song_mod_routings.retain(|r| r.source_id != id));
         self.sync_song_to_plugin_host();
     }
 
@@ -20454,9 +19758,9 @@ impl AppData {
         track_id: u32,
     ) -> Option<&mut Vec<common::model::ModRouting>> {
         if track_id == common::model::MASTER_TRACK_ID {
-            Some(&mut self.song.song_mod_routings)
+            Some(&mut self.song_doc.song().song_mod_routings)
         } else {
-            Some(&mut self.song.track_by_id_mut(track_id)?.mod_routings)
+            Some(&mut self.song_doc.song().track_by_id_mut(track_id)?.mod_routings)
         }
     }
 
@@ -20516,7 +19820,7 @@ impl AppData {
         }
         // depth は GUI compose が毎フレーム読む visual-only 値 (Phase 4)。 scrub
         // ドラッグ中の per-frame LoadSong を避け、 dirty マークだけ立てる。
-        self.is_dirty = true;
+        self.song_doc.is_dirty() = true;
     }
 
     fn set_mod_routing_polarity(
@@ -20554,23 +19858,23 @@ impl AppData {
         // 係数は recompile 時に bake される。 scrub ドラッグ中の per-frame
         // LoadSong を避けるため dirty マークのみ。 drag-end に sync する
         // (track_inspector の mod_follower_scrub_active エッジ検出)。
-        self.is_dirty = true;
+        self.song_doc.is_dirty() = true;
     }
 
     fn set_mod_source_release(&mut self, id: u32, ms: f32) {
         if let Some((_, follower)) = self.mod_source_follower_mut(id) {
             follower.release_ms = ms.max(0.0);
         }
-        self.is_dirty = true;
+        self.song_doc.is_dirty() = true;
     }
 
     fn set_mod_follower_scrubbing(&mut self, active: bool) {
         // Drag-end edge (was scrubbing, now not) → recompile the baked follower
         // coefficients once with the final attack/release values.
-        if self.mod_follower_scrub_active && !active {
+        if self.ui_ephemeral.mod_follower_scrub_active && !active {
             self.sync_song_to_plugin_host();
         }
-        self.mod_follower_scrub_active = active;
+        self.ui_ephemeral.mod_follower_scrub_active = active;
     }
 
     fn set_mod_source_tap_point(&mut self, id: u32, tap_point: common::model::TapPoint) {
@@ -20591,9 +19895,9 @@ impl AppData {
         tap_point: common::model::TapPoint,
     ) {
         let inst = if track_id == common::model::MASTER_TRACK_ID {
-            self.song.master_fx_chain.get_mut(device_index as usize)
+            self.song_doc.song().master_fx_chain.get_mut(device_index as usize)
         } else {
-            self.song
+            self.song_doc.song()
                 .track_by_id_mut(track_id)
                 .and_then(|t| t.devices.get_mut(device_index as usize))
         };
@@ -20617,7 +19921,6 @@ impl AppData {
         };
 
         if !self.song_has_plugin() {
-            self.push_undo_snapshot();
             self.remove_device_inner(track_id, index);
             return;
         }
@@ -20642,21 +19945,23 @@ impl AppData {
         self.cleanup_slot_gui(track_id, index);
         // 開いている映像 FX param パネルが同トラックなら閉じる
         // (削除で device index がずれて別 device を指すのを防ぐ)。
-        if self.open_video_fx_params.is_some_and(|(t, _)| t == track_id) {
-            self.open_video_fx_params = None;
+        if self.ui_ephemeral.open_video_fx_params.is_some_and(|(t, _)| t == track_id) {
+            self.ui_ephemeral.open_video_fx_params = None;
         }
         // 汎用 param パネルも同様に閉じる。
-        if self.open_plugin_params.is_some_and(|(t, _)| t == track_id) {
-            self.open_plugin_params = None;
+        if self.ui_ephemeral.open_plugin_params.is_some_and(|(t, _)| t == track_id) {
+            self.ui_ephemeral.open_plugin_params = None;
         }
-        // PR2.1: send `Track::id` to the plugin host.
-        self.send_plugin(MainToChild::RemoveSlotPlugin {
-            track: track_id,
-            index,
-        });
+        // v29: 安定 device id でアドレスする (song からは chain.remove 前の
+        // この時点で引ける)。 video device 等 host に居ないものは host 側が
+        // no-op で無視する。
+        let removed_device_id = device_id_at(&self.song_doc.song(), track_id, index);
+        if let Some(device_id) = removed_device_id {
+            self.send_plugin(PluginCommand::RemoveSlotPlugin { device_id });
+        }
         // cache から該当 entry を即時削除。 SlotPluginUnloaded event 到着前に
         // reconcile が走っても stale entry を見ないようにする防御策。
-        self.loaded_slots.remove(&(track_id, index));
+        self.ipc.loaded_slots.remove(&(track_id, index));
         // index 以降の loaded_slots / plugin_params を 1 つ前へ詰める (Vec::remove
         // 後の device index と整合させる)。open_plugin_guis は cleanup_slot_gui →
         // shift_slot_gui_keys が既に shift 済み。
@@ -20665,9 +19970,9 @@ impl AppData {
         // song を書き換え。master は master_fx_chain、 通常 track は devices。
         let chain: Option<&mut Vec<common::model::PluginInstance>> =
             if track_id == common::model::MASTER_TRACK_ID {
-                Some(&mut self.song.master_fx_chain)
+                Some(&mut self.song_doc.song().master_fx_chain)
             } else {
-                self.song
+                self.song_doc.song()
                     .tracks
                     .iter_mut()
                     .find(|t| t.id == track_id)
@@ -20686,7 +19991,7 @@ impl AppData {
         if track_id != common::model::MASTER_TRACK_ID
             && removed.format == PluginFormat::Builtin
             && removed.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
-            && let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id)
+            && let Some(track) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id)
         {
             track.source = InstrumentSource::None;
         }
@@ -20695,7 +20000,7 @@ impl AppData {
         // 再生成してしまう)。同 track に別の Transform device が残っていれば保持。
         if track_id != common::model::MASTER_TRACK_ID
             && removed.plugin_id == common::video_fx::TRANSFORM_ID
-            && let Some(track) = self.song.tracks.iter_mut().find(|t| t.id == track_id)
+            && let Some(track) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id)
             && !track
                 .devices
                 .iter()
@@ -20703,68 +20008,56 @@ impl AppData {
         {
             track.group_transform = None;
         }
-        // (review) device_index addressing の参照 (automation lane / mod routing /
-        // MIDI binding) を詰め後の index へ追従させる (apply_chain_reorder の
-        // remap と対になる削除版)。
-        self.remap_device_refs_after_remove(track_id, index);
+        // (review) 削除 device を指す参照 (automation lane / mod routing /
+        // MIDI binding) を落とす。 v29: 参照は安定 device_id なので「詰め」は
+        // 不要になり、 dangling id の除去だけ行う。
+        self.remap_device_refs_after_remove(track_id, removed.id);
         // song 更新を engine へ flush (= schedule から削除 device の dispatch を
         // 落とす)。 これが無いと次の編集まで stale schedule のまま destroyed
         // plugin へ dispatch し続け、 remap した lane も engine へ届かない。
         self.sync_song_to_plugin_host();
     }
 
-    /// device を `Vec::remove` した後、 その track の device_index addressing の
-    /// 参照を追従させる: 削除 device を指す automation lane / mod routing /
-    /// MIDI binding は丸ごと削除 (残すと詰めで隣にずれた device を誤駆動)、
-    /// それより後ろを指すものは 1 つ前へ詰める。 point / clip 選択は stable な
-    /// lane_id 参照なので、 lane 削除後は dangling 解決 (= None) で無害に落ちる。
-    fn remap_device_refs_after_remove(&mut self, track_id: u32, removed_index: u32) {
-        // 戻り値 = 残すか。 残す場合は index を in-place で詰める。
-        fn retarget(
-            target: &mut common::model::AutomationTarget,
-            removed_index: u32,
+    /// device を `Vec::remove` した後、 削除 device (安定 id =
+    /// `removed_device_id`) を指す automation lane / mod routing /
+    /// MIDI binding を丸ごと削除する。 v29 で参照が id 化されたので、 旧
+    /// positional 版が行っていた「後続 index の詰め」 は不要になった。
+    /// point / clip 選択は stable な lane_id 参照なので、 lane 削除後は
+    /// dangling 解決 (= None) で無害に落ちる。
+    fn remap_device_refs_after_remove(&mut self, track_id: u32, removed_device_id: u64) {
+        if removed_device_id == 0 {
+            return; // 未採番 device (来ないはず) — 誤って全 lane を消さない
+        }
+        // 戻り値 = 残すか。
+        fn keeps(
+            target: &common::model::AutomationTarget,
+            removed_device_id: u64,
         ) -> bool {
-            if let common::model::AutomationTarget::PluginParam { device_index, .. } =
-                target
-            {
-                if *device_index == removed_index {
-                    return false;
-                }
-                if *device_index > removed_index {
-                    *device_index -= 1;
-                }
-            }
-            true
+            !matches!(
+                target,
+                common::model::AutomationTarget::PluginParam { device_id, .. }
+                    if *device_id == removed_device_id
+            )
         }
         if track_id == common::model::MASTER_TRACK_ID {
-            self.song
+            self.song_doc.song()
                 .song_lanes
-                .retain_mut(|l| retarget(&mut l.target, removed_index));
-            self.song
+                .retain(|l| keeps(&l.target, removed_device_id));
+            self.song_doc.song()
                 .song_mod_routings
-                .retain_mut(|r| retarget(&mut r.target, removed_index));
-        } else if let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) {
+                .retain(|r| keeps(&r.target, removed_device_id));
+        } else if let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) {
             t.automation_lanes
-                .retain_mut(|l| retarget(&mut l.target, removed_index));
+                .retain(|l| keeps(&l.target, removed_device_id));
             t.mod_routings
-                .retain_mut(|r| retarget(&mut r.target, removed_index));
+                .retain(|r| keeps(&r.target, removed_device_id));
         }
-        self.song.midi_bindings.retain_mut(|b| {
-            let common::model::BindingTarget::PluginParam { track, device_index, .. } =
-                &mut b.target
-            else {
-                return true;
-            };
-            if *track != track_id {
-                return true;
-            }
-            if *device_index == removed_index {
-                return false;
-            }
-            if *device_index > removed_index {
-                *device_index -= 1;
-            }
-            true
+        self.song_doc.song().midi_bindings.retain(|b| {
+            !matches!(
+                &b.target,
+                common::model::BindingTarget::PluginParam { device_id, .. }
+                    if *device_id == removed_device_id
+            )
         });
     }
 
@@ -20774,7 +20067,7 @@ impl AppData {
     fn shift_device_caches_after_remove(&mut self, track_id: u32, index: u32) {
         // loaded_slots
         let mut moves: Vec<(u32, LoadedSlotInfo)> = Vec::new();
-        self.loaded_slots.retain(|&(t, idx), v| {
+        self.ipc.loaded_slots.retain(|&(t, idx), v| {
             if t == track_id && idx > index {
                 moves.push((idx - 1, v.clone()));
                 false
@@ -20783,11 +20076,11 @@ impl AppData {
             }
         });
         for (idx, v) in moves {
-            self.loaded_slots.insert((track_id, idx), v);
+            self.ipc.loaded_slots.insert((track_id, idx), v);
         }
         // plugin_params
         let mut pmoves: Vec<(u32, Vec<common::protocol::PluginParamInfo>)> = Vec::new();
-        self.plugin_params.retain(|&(t, idx), v| {
+        self.ipc.plugin_params.retain(|&(t, idx), v| {
             if t == track_id && idx > index {
                 pmoves.push((idx - 1, v.clone()));
                 false
@@ -20796,11 +20089,11 @@ impl AppData {
             }
         });
         for (idx, v) in pmoves {
-            self.plugin_params.insert((track_id, idx), v);
+            self.ipc.plugin_params.insert((track_id, idx), v);
         }
         // slot_has_gui: plugin_params と同じ index シフト。
         let mut gmoves: Vec<(u32, bool)> = Vec::new();
-        self.slot_has_gui.retain(|&(t, idx), v| {
+        self.ipc.slot_has_gui.retain(|&(t, idx), v| {
             if t == track_id && idx > index {
                 gmoves.push((idx - 1, *v));
                 false
@@ -20809,7 +20102,7 @@ impl AppData {
             }
         });
         for (idx, v) in gmoves {
-            self.slot_has_gui.insert((track_id, idx), v);
+            self.ipc.slot_has_gui.insert((track_id, idx), v);
         }
     }
 
@@ -20822,8 +20115,18 @@ impl AppData {
     #[cfg(windows)]
     fn cleanup_slot_gui(&mut self, track_id: u32, index: u32) {
         // open 中なら B に閉じてもらう (= DestroyWindow は plugin-host 側)。
-        if self.open_plugin_guis.remove(&(track_id, index)) {
-            self.send_plugin(MainToChild::CloseSlotGui { track: track_id, index });
+        // v29: device_id addressing。 host 実体の SSoT である loaded_slots を
+        // 優先し (reconcile の「song に無い device」 でも解決できる)、
+        // 無ければ song から引く。
+        if self.ipc.open_plugin_guis.remove(&(track_id, index)) {
+            let device_id = self
+                .ipc.loaded_slots
+                .get(&(track_id, index))
+                .map(|info| info.device_id)
+                .or_else(|| device_id_at(&self.song_doc.song(), track_id, index));
+            if let Some(device_id) = device_id {
+                self.send_plugin(PluginCommand::CloseSlotGui { device_id });
+            }
         }
         self.shift_slot_gui_keys(track_id, index);
     }
@@ -20836,7 +20139,7 @@ impl AppData {
     #[cfg(windows)]
     fn shift_slot_gui_keys(&mut self, track_id: u32, removed_idx: u32) {
         let mut moves: Vec<u32> = self
-            .open_plugin_guis
+            .ipc.open_plugin_guis
             .iter()
             .filter(|&&(t, idx)| t == track_id && idx > removed_idx)
             .map(|&(_, idx)| idx)
@@ -20844,8 +20147,8 @@ impl AppData {
         // 低 index 側を先に詰める (collision-free)。
         moves.sort_unstable();
         for idx in moves {
-            if self.open_plugin_guis.remove(&(track_id, idx)) {
-                self.open_plugin_guis.insert((track_id, idx - 1));
+            if self.ipc.open_plugin_guis.remove(&(track_id, idx)) {
+                self.ipc.open_plugin_guis.insert((track_id, idx - 1));
             }
         }
     }
@@ -20858,13 +20161,14 @@ impl AppData {
     fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
         // in-flight だった round-trip の応答が来た。 watchdog の deadline を
         // 解除する。 この後 queue に後続があれば dispatch_front_state_request が再武装する。
-        self.state_request_sent_at = None;
+        self.ipc.state_request_sent_at = None;
         // live song の plugin state を最新化する (= dirty 判定の整合と、
         // Deferred の Undo snapshot が最新 knob を捕まえるため)。 queue が空
         // だった場合 (= 想定外タイミングの応答) でも害はない。 Save の serialize
         // 対象は live ではなく凍結 snapshot なので、 下の match 内で snapshot 側に
         // も別途適用する。
-        Self::apply_plugin_states_to(&mut self.song, &states);
+        self.song_doc
+            .write_back_plugin_state(|song| Self::apply_plugin_states_to(song, &states));
         // Phase 6 review (silent corruption fix): plugin_host 側で
         // `state_save()` が `Err` を返したエントリは `SlotState.error`
         // 経由で報告される。 旧コードはこれを `.ok().flatten()` で握り
@@ -20884,36 +20188,51 @@ impl AppData {
                 if i > 0 {
                     msg.push_str(", ");
                 }
-                msg.push_str(&format!(
-                    "track {} device {}",
-                    s.track, s.index
-                ));
+                // v29: device_id keyed。 ユーザー向けには (track, device) の
+                // 見える座標に逆引きして表示する (解決不能なら id を出す)。
+                match find_device_by_id(&self.song_doc.song(), s.device_id) {
+                    Some((track, index)) => {
+                        msg.push_str(&format!("track {track} device {index}"));
+                    }
+                    None => {
+                        msg.push_str(&format!("device {}", s.device_id));
+                    }
+                }
             }
             if failed.len() > 3 {
                 msg.push_str(&format!(" ... +{}", failed.len() - 3));
             }
             tracing::error!(failed_count = failed.len(), %msg, "plugin state save failures");
-            self.status_message = msg;
+            self.ui_ephemeral.status_message = msg;
         }
-        let Some(req) = self.pending_state_queue.pop_front() else {
+        let Some(req) = self.ipc.pending_state_queue.pop_front() else {
             return;
         };
         match req {
-            PendingStateRequest::Save { path, snapshot } => {
+            PendingStateRequest::Save {
+                path,
+                snapshot,
+                snap_epoch,
+            } => {
                 // snapshot は dispatch_front_state_request が **この save の
                 // RequestAllStates を送る瞬間** に充填しているはず。 受け取った
                 // states (= その RequestAllStates の応答) はその瞬間の host layout を
                 // 反映するので、 snapshot のスロット配置と一致し、 位置 index 適用でも
                 // 誤適用が起きない。 万一 None (想定外) なら防御的に live を凍結する。
-                let mut snapshot = snapshot.unwrap_or_else(|| Box::new(self.song.clone()));
+                let snap_epoch = if snapshot.is_some() {
+                    snap_epoch
+                } else {
+                    self.song_doc.edit_epoch()
+                };
+                let mut snapshot =
+                    snapshot.unwrap_or_else(|| Box::new(self.song_doc.song().clone()));
                 Self::apply_plugin_states_to(&mut snapshot, &states);
-                self.finish_save(snapshot, path);
+                self.finish_save(snapshot, path, snap_epoch);
             }
             PendingStateRequest::Deferred(edit) => {
                 // ここで初めて Undo snapshot を push する。 Song に
                 // 最新 state が入った状態を捕まえるため (plugin が
                 // 削除される編集を Undo すると knob 値が復元される)。
-                self.push_undo_snapshot();
                 self.execute_deferred_edit(edit);
             }
             PendingStateRequest::CopyToClipboard { track_ids } => {
@@ -20928,9 +20247,9 @@ impl AppData {
         // 新たな front が Save なら、 dispatch_front_state_request が **この瞬間**
         // (= 先行 Deferred が live layout を確定させた直後) に live を凍結するので、
         // その Save の snapshot は返ってくる state と同じ layout になる。
-        if !self.pending_state_queue.is_empty() {
+        if !self.ipc.pending_state_queue.is_empty() {
             self.dispatch_front_state_request();
-        } else if let Some(action) = self.guard_pending_action.take() {
+        } else if let Some(action) = self.ui_ephemeral.guard_pending_action.take() {
             // round-trip が全て drain した。 in-flight 中に保留していた
             // ガード操作 (New/Open/Open Recent/終了) を、 deferred edit / save 反映後の
             // **最新 dirty 状態で再評価** する (= clean なら実行、 dirty なら確認モーダル)。
@@ -20966,11 +20285,11 @@ impl AppData {
         // 送ることで、 plugin を mix から外す detach が master ミュート後に起き、
         // 段差クリック (「ビープ」) を出さずに reverb tail / 全 plugin 状態をクリア
         // する (`Self::panic` 参照)。
-        if let Some(due) = self.panic_reinit_due
+        if let Some(due) = self.transport.panic_reinit_due
             && due.elapsed() >= PANIC_REINIT_DELAY
         {
-            self.panic_reinit_due = None;
-            self.send_plugin(MainToChild::ReinitAllPlugins);
+            self.transport.panic_reinit_due = None;
+            self.send_plugin(PluginCommand::ReinitAllPlugins);
         }
 
         // Export watchdog: daw_audio が crash でなく hang した場合 (進捗 heartbeat も
@@ -20980,8 +20299,8 @@ impl AppData {
         // この閾値を超えるのは実質 hang のみ (長尺 render での誤発火は無い)。
         // VideoRender は daw_gui 内で必ず ExportFinished を返すので対象外。
         const EXPORT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
-        if matches!(self.export_stage, Some(ExportStage::AudioRender { .. }))
-            && let Some(since) = self.export_progress_at
+        if matches!(self.transport.export_stage, Some(ExportStage::AudioRender { .. }))
+            && let Some(since) = self.transport.export_progress_at
             && since.elapsed() > EXPORT_WATCHDOG
         {
             tracing::error!(
@@ -21003,8 +20322,8 @@ impl AppData {
             None
         } else {
             common::timing::playhead_to_beat(
-                Some(&self.song),
-                self.sample_rate,
+                Some(&self.song_doc.song()),
+                self.ipc.sample_rate,
                 playhead_samples,
             )
             .map(|b| b as f32)
@@ -21017,12 +20336,12 @@ impl AppData {
         // のまま playhead が末尾に固着する (既存の不整合)。手動 Stop と同じ
         // stop() を通すので「どんな止まり方でも再生を押した位置へ戻る」が一貫する。
         // loop 中は engine が wrap して止まらないので対象外。
-        if self.is_playing
-            && !self.is_looping
+        if self.transport.is_playing
+            && !self.transport.is_looping
             && playhead_samples != u64::MAX
             && common::timing::song_ended(
-                Some(&self.song),
-                self.sample_rate,
+                Some(&self.song_doc.song()),
+                self.ipc.sample_rate,
                 playhead_samples,
             )
         {
@@ -21036,8 +20355,8 @@ impl AppData {
         // 「Space で停止してもプレイヘッドが元位置に戻らないことがある」 race を
         // 生む。 stop() の SeekTo は engine 側カーソルを次の Play 用に揃えるため
         // 引き続き送る (= GUI 表示の権威と engine state を分離)。
-        if self.is_playing && next_beat != self.playhead_beat {
-            self.playhead_beat = next_beat;
+        if self.transport.is_playing && next_beat != self.transport.playhead_beat {
+            self.transport.playhead_beat = next_beat;
         }
 
         // 再生追従スクロール (Alt+F で off/scroll/page)。 playhead 反映直後に follow
@@ -21046,17 +20365,17 @@ impl AppData {
         // のは各 view 操作 handler 側 (cancel_follow_on_manual_view_change)。 follow が
         // 直接 arrange_scroll_beat を書く (= SetArrangeScroll event を経由しない) ので
         // 自分自身で Off に落ちることはない。
-        if self.is_playing
-            && let Some(ph) = self.playhead_beat
+        if self.transport.is_playing
+            && let Some(ph) = self.transport.playhead_beat
         {
-            let visible_beats = self.last_arrange_canvas_size.0 / self.arrange_zoom_x.max(1.0);
+            let visible_beats = self.ui_ephemeral.last_arrange_canvas_size.0 / self.ui_prefs.arrange_zoom_x.max(1.0);
             if let Some(new_scroll) = Self::follow_scroll_beat(
-                self.arrange_follow,
+                self.ui_prefs.arrange_follow,
                 ph,
-                self.arrange_scroll_beat,
+                self.ui_prefs.arrange_scroll_beat,
                 visible_beats,
             ) {
-                self.arrange_scroll_beat = new_scroll.max(0.0);
+                self.ui_prefs.arrange_scroll_beat = new_scroll.max(0.0);
             }
         }
 
@@ -21078,9 +20397,9 @@ impl AppData {
         // (= 「停止中の drag で現 playhead に keyframe」 を許可。 audio
         // 経路は recording_mode を尊重)。
         let audio_recording =
-            self.is_playing && self.recording_mode != common::model::RecordingMode::Read;
+            self.transport.is_playing && self.recording.recording_mode != common::model::RecordingMode::Read;
         if (audio_recording || image_dragging)
-            && let Some(ph) = self.playhead_beat
+            && let Some(ph) = self.transport.playhead_beat
         {
             let _inserted = self.record_automation_points_for_tick(f64::from(ph));
         }
@@ -21091,12 +20410,12 @@ impl AppData {
         // close flag here.
 
         const RELEASE: f32 = 0.85;
-        let new_l = common::meter::update_peak(self.peak_l_display, peak_l_raw, RELEASE);
-        let new_r = common::meter::update_peak(self.peak_r_display, peak_r_raw, RELEASE);
-        self.peak_l_display = new_l;
-        self.peak_r_display = new_r;
-        self.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_l));
-        self.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_r));
+        let new_l = common::meter::update_peak(self.transport.peak_l_display, peak_l_raw, RELEASE);
+        let new_r = common::meter::update_peak(self.transport.peak_r_display, peak_r_raw, RELEASE);
+        self.transport.peak_l_display = new_l;
+        self.transport.peak_r_display = new_r;
+        self.transport.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_l));
+        self.transport.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_r));
     }
 
     /// Phase 4 Step C: tick ごとの automation recording。 `is_playing` と
@@ -21117,20 +20436,20 @@ impl AppData {
         // 仕様。 audio gesture には影響しない、 drag が active な image /
         // text lane だけが record される)。
         let visual_dragging = self.image_pip_drag_active() || self.text_pip_drag_active();
-        if self.recording_mode == common::model::RecordingMode::Read && !visual_dragging {
+        if self.recording.recording_mode == common::model::RecordingMode::Read && !visual_dragging {
             return 0;
         }
         // active ∪ latched (Touch mode は latched が常に空なので active のみ)。
         let mut recording: Vec<(u32, common::model::AutomationTarget)> = Vec::new();
-        for key in self.active_param_gestures.iter() {
+        for key in self.recording.active_param_gestures.iter() {
             recording.push(key.clone());
         }
         if matches!(
-            self.recording_mode,
+            self.recording.recording_mode,
             common::model::RecordingMode::Latch | common::model::RecordingMode::Write
         ) {
-            for key in self.latched_param_gestures.iter() {
-                if !self.active_param_gestures.contains(key) {
+            for key in self.recording.latched_param_gestures.iter() {
+                if !self.recording.active_param_gestures.contains(key) {
                     recording.push(key.clone());
                 }
             }
@@ -21143,7 +20462,7 @@ impl AppData {
         let mut inserted = 0usize;
         for (track_id, target) in recording {
             let last = self
-                .recording_last_beat
+                .recording.recording_last_beat
                 .get(&(track_id, target.clone()))
                 .copied();
             if let Some(prev) = last
@@ -21173,7 +20492,7 @@ impl AppData {
             // clip.start_beat を引いて local 化する。
             let clip_local_beat = playhead_beat - clip_start;
             if self.insert_recording_point(content_id, clip_local_beat, plain_value) {
-                self.recording_last_beat
+                self.recording.recording_last_beat
                     .insert((track_id, target.clone()), playhead_beat);
                 inserted += 1;
             }
@@ -21201,7 +20520,7 @@ impl AppData {
         ) || track_id == common::model::MASTER_TRACK_ID;
         // L8 (r.md #8): track 不在なら content_id を alloc する前に return する
         // (orphan AutomationContent leak を防ぐ)。 song-level は track 不要。
-        if !is_song_level && self.song.track_by_id(track_id).is_none() {
+        if !is_song_level && self.song_doc.song().track_by_id(track_id).is_none() {
             return None;
         }
         let default_value = self.lane_default_for_target(&TouchedParam {
@@ -21217,9 +20536,9 @@ impl AppData {
         //     length を制限する (前方の既存 clip と重なる clip を作らない)。
         let (reuse, next_clip_start) = {
             let lanes: &[AutomationLane] = if is_song_level {
-                &self.song.song_lanes
+                &self.song_doc.song().song_lanes
             } else {
-                self.song
+                self.song_doc.song()
                     .track_by_id(track_id)
                     .map(|t| t.automation_lanes.as_slice())
                     .unwrap_or(&[])
@@ -21251,50 +20570,52 @@ impl AppData {
         let clip_len = if next_clip_start.is_finite() {
             (next_clip_start - clip_start).max(0.0)
         } else {
-            (self.song.length_beats - clip_start).max(4.0)
+            (self.song_doc.song().length_beats - clip_start).max(4.0)
         };
         // L11 (r.md #8): alloc_content で content + 表示名 "Rec" を同時登録する。
         // 旧実装は AutomationClip.name="Rec" を設定していたが、 arrangement view は
         // content_name(content_id) を描くので "Rec" が表示されなかった。
-        let content_id = self.song.alloc_content(
+        let content_id = self.song_doc.song().alloc_content(
             ClipContent::Automation(AutomationContent::default()),
             "Rec".into(),
         );
         if is_song_level {
-            self.master_row_automation_expanded = true;
-            if let Some(lane) = self.song.song_lanes.iter_mut().find(|l| &l.target == target) {
-                lane.enabled = true;
-                let cid = lane.next_clip_id;
-                lane.next_clip_id += 1;
-                lane.clips.push(AutomationClip {
-                    id: cid,
-                    name: "Rec".into(),
-                    start_beat: clip_start,
-                    length_beats: clip_len,
-                    content_id,
-                });
-            } else {
-                let lid = self.song.alloc_song_lane_id();
-                self.song.song_lanes.push(AutomationLane {
-                    id: lid,
-                    target: target.clone(),
-                    default_value,
-                    enabled: true,
-                    visible: true,
-                    height_px: 60,
-                    clips: vec![AutomationClip {
-                        id: 1,
+            self.ui_prefs.master_row_automation_expanded = true;
+            self.edit_song(|song| {
+                if let Some(lane) = song.song_lanes.iter_mut().find(|l| &l.target == target) {
+                    lane.enabled = true;
+                    let cid = lane.next_clip_id;
+                    lane.next_clip_id += 1;
+                    lane.clips.push(AutomationClip {
+                        id: cid,
                         name: "Rec".into(),
                         start_beat: clip_start,
                         length_beats: clip_len,
                         content_id,
-                    }],
-                    next_clip_id: 2,
-                });
-            }
+                    });
+                } else {
+                    let lid = song.alloc_song_lane_id();
+                    song.song_lanes.push(AutomationLane {
+                        id: lid,
+                        target: target.clone(),
+                        default_value,
+                        enabled: true,
+                        visible: true,
+                        height_px: 60,
+                        clips: vec![AutomationClip {
+                            id: 1,
+                            name: "Rec".into(),
+                            start_beat: clip_start,
+                            length_beats: clip_len,
+                            content_id,
+                        }],
+                        next_clip_id: 2,
+                    });
+                }
+            });
         } else {
-            self.expanded_automation_tracks.insert(track_id);
-            let track = self.song.track_by_id_mut(track_id)?;
+            self.ui_prefs.expanded_automation_tracks.insert(track_id);
+            let track = self.song_doc.song().track_by_id_mut(track_id)?;
             if let Some(lane) = track.automation_lanes.iter_mut().find(|l| &l.target == target) {
                 lane.enabled = true;
                 let cid = lane.next_clip_id;
@@ -21337,17 +20658,17 @@ impl AppData {
     ) -> std::collections::HashSet<(u32, common::model::AutomationTarget)> {
         let mut set: std::collections::HashSet<(u32, common::model::AutomationTarget)> =
             std::collections::HashSet::new();
-        if !self.is_playing || self.recording_mode == common::model::RecordingMode::Read {
+        if !self.transport.is_playing || self.recording.recording_mode == common::model::RecordingMode::Read {
             return set;
         }
-        for k in &self.active_param_gestures {
+        for k in &self.recording.active_param_gestures {
             set.insert(k.clone());
         }
         if matches!(
-            self.recording_mode,
+            self.recording.recording_mode,
             common::model::RecordingMode::Latch | common::model::RecordingMode::Write
         ) {
-            for k in &self.latched_param_gestures {
+            for k in &self.recording.latched_param_gestures {
                 set.insert(k.clone());
             }
         }
@@ -21367,23 +20688,23 @@ impl AppData {
     /// - `SetRecordingMode(_)` handler (mode 変化で latched 寄与が変わる)
     fn sync_recording_lanes_with_audio(&mut self) {
         let next = self.currently_recording_lanes();
-        if next == self.last_sent_recording_lanes {
+        if next == self.recording.last_sent_recording_lanes {
             return;
         }
         let shrunk = self
-            .last_sent_recording_lanes
+            .recording.last_sent_recording_lanes
             .iter()
             .any(|k| !next.contains(k));
         let lanes_vec: Vec<(u32, common::model::AutomationTarget)> =
             next.iter().cloned().collect();
-        self.send_audio(MainToChild::SetRecordingLanes { lanes: lanes_vec });
+        self.send_audio(AudioCommand::SetRecordingLanes { lanes: lanes_vec });
         if shrunk {
             // recording 終了した lane の最新 points を audio thread に流す
             // (= bypass が解除されて curve eval に戻る瞬間に、 record session
             // 中に insert した点列で正しい curve が引かれるよう保証する)。
             self.sync_song_to_plugin_host();
         }
-        self.last_sent_recording_lanes = next;
+        self.recording.last_sent_recording_lanes = next;
     }
 
     /// Phase 4 Step C: target に対応する現在 plain 値を返す。
@@ -21401,14 +20722,14 @@ impl AppData {
         use common::model::{ClipContent, ImageBuiltinParam};
         match target {
             // Phase 5: song-level target は track_id 無関係、 Song の現在値を返す
-            common::model::AutomationTarget::SongTempo => Some(f64::from(self.song.bpm)),
+            common::model::AutomationTarget::SongTempo => Some(f64::from(self.song_doc.song().bpm)),
             common::model::AutomationTarget::SongTimeSigNumerator => {
-                Some(f64::from(self.song.time_sig.0))
+                Some(f64::from(self.song_doc.song().time_sig.0))
             }
             common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Volume,
             ) => self
-                .song
+                .song_doc.song()
                 .tracks
                 .iter()
                 .find(|t| t.id == track_id)
@@ -21416,23 +20737,26 @@ impl AppData {
             common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Pan,
             ) => self
-                .song
+                .song_doc.song()
                 .tracks
                 .iter()
                 .find(|t| t.id == track_id)
                 .map(|t| f64::from(t.pan)),
-            common::model::AutomationTarget::PluginParam { device_index, param_id, .. } => self
-                .plugin_param_values
-                .get(&(track_id, *device_index, *param_id))
-                .copied(),
+            common::model::AutomationTarget::PluginParam { device_id, param_id, .. } => {
+                // v29: 安定 device_id → positional cache key へ逆引き。
+                let (t, device_index) = find_device_by_id(&self.song_doc.song(), *device_id)?;
+                self.ipc.plugin_param_values
+                    .get(&(t, device_index, *param_id))
+                    .copied()
+            }
             // Image PiP: 同 track の first image event の field 値を現在値とする
             // (`docs/plan_image_automation.md` §4)。 drag が ImageEvent.field を
             // 更新 → ここで再読み込み → record_automation_points_for_tick が
             // point を打つ、 という pipeline。
             common::model::AutomationTarget::ImageBuiltin(field) => {
-                let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
+                let track = self.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
                 let event = track.clips.iter().find_map(|c| {
-                    self.song
+                    self.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
                         .and_then(|content| match content {
@@ -21454,9 +20778,9 @@ impl AppData {
             // ため)。
             common::model::AutomationTarget::TextBuiltin(field) => {
                 use common::model::TextBuiltinParam as T;
-                let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
+                let track = self.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
                 let event = track.clips.iter().find_map(|c| {
-                    self.song
+                    self.song_doc.song()
                         .clip_contents
                         .get(&c.content_id)
                         .and_then(|content| match content {
@@ -21514,12 +20838,12 @@ impl AppData {
                 | common::model::AutomationTarget::SongTimeSigNumerator
         ) || track_id == common::model::MASTER_TRACK_ID;
         let lane = if is_song_level {
-            self.song
+            self.song_doc.song()
                 .song_lanes
                 .iter()
                 .find(|l| l.enabled && l.target == *target)?
         } else {
-            let track = self.song.tracks.iter().find(|t| t.id == track_id)?;
+            let track = self.song_doc.song().tracks.iter().find(|t| t.id == track_id)?;
             track
                 .automation_lanes
                 .iter()
@@ -21548,7 +20872,7 @@ impl AppData {
     ) -> bool {
         const THIN_EPSILON_PLAIN: f64 = 0.005;
         let entry = self
-            .song
+            .song_doc.song()
             .clip_contents
             .entry(content_id)
             .or_insert_with(|| {
@@ -21567,7 +20891,7 @@ impl AppData {
         // 録音 gesture 途中で crash しても、 挿入済の点が autosave に
         // 乗るよう dirty を立てる。 GUI tick 経路 (= audio callback で
         // ない) なので bool 書き込みは RT 制約に抵触しない。
-        self.is_dirty = true;
+        self.song_doc.is_dirty() = true;
         true
     }
 
@@ -21581,12 +20905,12 @@ impl AppData {
     /// なので decode 再利用で軽量 (re-decode は走らない)。Raw clip が無ければ `false`
     /// を返し、呼び出し側の軽量 `SetSongBpm` に委ねる。
     fn rescale_raw_clips_for_bpm_change(&mut self, old_bpm: f32, new_bpm: f32) -> bool {
-        if !self.song.rescale_raw_clips_for_bpm(old_bpm, new_bpm) {
+        if !self.song_doc.song().rescale_raw_clips_for_bpm(old_bpm, new_bpm) {
             return false;
         }
         // H2 同件: 毎 CC / 毎 scrub tick の full LoadSong flood を避け、 runner の
         // frame flush (`flush_pending_host_sync`) に 1 frame 1 回へ集約する。
-        self.pending_host_sync = true;
+        self.ipc.pending_host_sync = true;
         true
     }
 
@@ -21594,31 +20918,31 @@ impl AppData {
     /// `song.bpm` に反映、 parse 失敗なら現値を維持。 どちらも edit_text を
     /// formatted な現値 (`"{:.1}"`) に書き戻して表示を整える。
     fn commit_bpm_edit(&mut self) {
-        if let Ok(v) = self.bpm_edit_text.trim().parse::<f32>() {
+        if let Ok(v) = self.ui_ephemeral.bpm_edit_text.trim().parse::<f32>() {
             let clamped = v.clamp(1.0, 400.0);
-            if (self.song.bpm - clamped).abs() > f32::EPSILON {
-                let old_bpm = self.song.bpm;
-                self.song.bpm = clamped;
+            if (self.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
+                let old_bpm = self.song_doc.song().bpm;
+                self.edit_song(|song| song.bpm = clamped);
                 // Raw audio clip を秒固定スケール (r.md #7)。LoadSong は直後の
                 // sync_song_to_plugin_host が送るので、ここでは model 更新のみ。
-                self.song.rescale_raw_clips_for_bpm(old_bpm, clamped);
+                self.edit_song(|song| song.rescale_raw_clips_for_bpm(old_bpm, clamped));
                 self.sync_song_to_plugin_host();
             }
         }
-        self.bpm_edit_text = format!("{:.1}", self.song.bpm);
+        self.ui_ephemeral.bpm_edit_text = format!("{:.1}", self.song_doc.song().bpm);
     }
 
     /// time_sig numerator 入力欄を Enter で commit。 parse 成功なら 1..=32 に
     /// clamp、 失敗なら現値維持。 edit_text は現値の string 表現に書き戻す。
     fn commit_time_sig_num_edit(&mut self) {
-        if let Ok(v) = self.time_sig_num_edit_text.trim().parse::<u8>() {
+        if let Ok(v) = self.ui_ephemeral.time_sig_num_edit_text.trim().parse::<u8>() {
             let clamped = v.clamp(1, 32);
-            if self.song.time_sig.0 != clamped {
-                self.song.time_sig.0 = clamped;
+            if self.song_doc.song().time_sig.0 != clamped {
+                self.edit_song(|song| song.time_sig.0 = clamped);
                 self.sync_song_to_plugin_host();
             }
         }
-        self.time_sig_num_edit_text = self.song.time_sig.0.to_string();
+        self.ui_ephemeral.time_sig_num_edit_text = self.song_doc.song().time_sig.0.to_string();
     }
 
     /// time_sig denominator dropdown で選択された値を反映。 2/4/8/16 以外は無視。
@@ -21627,17 +20951,17 @@ impl AppData {
             tracing::warn!(den, "ignoring invalid time_sig denominator");
             return;
         }
-        if self.song.time_sig.1 != den {
-            self.song.time_sig.1 = den;
+        if self.song_doc.song().time_sig.1 != den {
+            self.edit_song(|song| song.time_sig.1 = den);
             self.sync_song_to_plugin_host();
         }
     }
 
-    /// `self.song` が外部要因 (open / new / undo / redo / autosave 復元 etc.) で
+    /// `self.song_doc.song()` が外部要因 (open / new / undo / redo / autosave 復元 etc.) で
     /// 差し替わった後に、 transport 入力欄の表示文字列を現値に書き戻す。
     fn resync_song_edit_texts(&mut self) {
-        self.bpm_edit_text = format!("{:.1}", self.song.bpm);
-        self.time_sig_num_edit_text = self.song.time_sig.0.to_string();
+        self.ui_ephemeral.bpm_edit_text = format!("{:.1}", self.song_doc.song().bpm);
+        self.ui_ephemeral.time_sig_num_edit_text = self.song_doc.song().time_sig.0.to_string();
         // clip 数値 field は scrubable_number 化され専用 buffer は
         // 撤去。 共有 `clip_edit_buffer_target` だけ song 差し替え (open / new
         // / undo / redo) に追従させる。 selected_clip が image / text の場合は
@@ -21646,15 +20970,15 @@ impl AppData {
         match self.selected_clip_ref() {
             Some(target) => self.resync_clip_audio_event_edit_buffers(target),
             None => {
-                self.clip_edit_buffer_target = None;
+                self.ui_ephemeral.clip_edit_buffer_target = None;
             }
         }
     }
 
     fn set_master_gain(&mut self, gain: f32) {
         let clamped = gain.clamp(0.0, 1.0);
-        self.master_gain = clamped;
-        self.send_audio(MainToChild::SetMasterGain(clamped));
+        self.transport.master_gain = clamped;
+        self.send_audio(AudioCommand::SetMasterGain(clamped));
     }
 
     // -------- Plugin picker -----------------------------------------------
@@ -21668,9 +20992,9 @@ impl AppData {
         // 無修飾 / Shift は選択で閉じる。 Ctrl (keep_open) は開いたまま連続追加
         // できる。
         if !keep_open {
-            self.is_plugin_picker_open = false;
+            self.ui_ephemeral.is_plugin_picker_open = false;
         }
-        let Some(db) = self.plugin_db.clone() else {
+        let Some(db) = self.ipc.plugin_db.clone() else {
             tracing::warn!(id, "plugin_db not available");
             return;
         };
@@ -21697,12 +21021,12 @@ impl AppData {
 
         // 挿入 index = 現在のチェーン長 (= 末尾 append)。
         let dest_index = if is_master {
-            self.song.master_fx_chain.len() as u32
+            self.song_doc.song().master_fx_chain.len() as u32
         } else {
             let Some(track_idx) = self.cursor_track_index() else {
                 return;
             };
-            self.song.tracks[track_idx].devices.len() as u32
+            self.song_doc.song().tracks[track_idx].devices.len() as u32
         };
 
         // 内蔵映像効果は GUI 描画パスで処理する device。plugin_host に
@@ -21710,34 +21034,38 @@ impl AppData {
         // `process_track_owned` は `slot_to_plugin_id` 未登録の index を skip し
         // (= 音声バス素通り)、append は既存 device の index をずらさないので
         // audio 側は完全に不変。param は GUI が automation/変調を評価して描画に使う。
+        // v29: 新規 device の安定 id を Song allocator で採番する
+        // (0 のまま送る/積むのは禁止 — id addressing の根)。
+        let device_id = self.song_doc.song().alloc_device_id();
+
         let is_video = ports.is_video();
         if !is_video {
-            self.track_pending_load(track_id, dest_index);
+            let generation = self.track_pending_load(device_id);
             // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync +
             // (open_gui なら) GUI 自動 open する (project-load の一斉復元はこの
             // 集合に積まれない)。 Shift (open_gui=false) でも sync は必要なので
             // 常に積み、 auto-open だけ値で分岐する。
-            self.pending_added_plugin_finalize
+            self.ipc.pending_added_plugin_finalize
                 .insert((track_id, dest_index), open_gui);
-            self.send_plugin(MainToChild::SetSlotPlugin {
-                track: track_id,
-                index: dest_index,
+            self.send_plugin(PluginCommand::SetSlotPlugin {
+                device_id,
+                track_id,
                 format: entry_format,
                 path,
                 plugin_id: entry_id.clone(),
                 initial_state: None,
+                generation,
             });
         }
 
-        let new_device = common::model::PluginInstance::with_ports(
-            entry_id,
-            entry_format,
-            ports,
-        );
+        let new_device = common::model::PluginInstance {
+            id: device_id,
+            ..common::model::PluginInstance::with_ports(entry_id, entry_format, ports)
+        };
         if is_master {
-            self.song.master_fx_chain.push(new_device);
+            self.edit_song(|song| song.master_fx_chain.push(new_device));
         } else if let Some(track_idx) = self.cursor_track_index() {
-            let track = &mut self.song.tracks[track_idx];
+            let track = &mut self.song_doc.song().tracks[track_idx];
             let added_transform = new_device.plugin_id == common::video_fx::TRANSFORM_ID;
             track.devices.push(new_device);
             // Transform 配置 device を刺したら group_transform を有効化
@@ -21774,11 +21102,11 @@ impl AppData {
     /// engine を落とした場合は手動再起動。 spawn 後の child は
     /// `JobObject` に attach するので daw_gui 終了で auto-kill される。
     fn ensure_voicevox_engine(&mut self) {
-        if self.voicevox_launch_attempted {
+        if self.voicevox.voicevox_launch_attempted {
             return;
         }
-        self.voicevox_launch_attempted = true;
-        let job = Arc::clone(&self.voicevox_job);
+        self.voicevox.voicevox_launch_attempted = true;
+        let job = Arc::clone(&self.voicevox.voicevox_job);
         std::thread::spawn(move || {
             if common::voicevox_engine::is_running() {
                 return;
@@ -21819,12 +21147,12 @@ impl AppData {
     // -------- Plugin DB rescan --------------------------------------------
 
     fn begin_rescan(&mut self) {
-        if self.is_rescanning {
+        if self.ipc.is_rescanning {
             return;
         }
-        self.is_rescanning = true;
-        let slot = Arc::clone(&self.rescan_result);
-        let proxy = self.event_proxy.clone();
+        self.ipc.is_rescanning = true;
+        let slot = Arc::clone(&self.ipc.rescan_result);
+        let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || match common::plugin_db::scan_system() {
             Ok(mut db) => {
                 // VST3 / CLAP とも descriptor からは port 構成が分からない
@@ -21888,14 +21216,14 @@ impl AppData {
     }
 
     fn finish_rescan(&mut self) {
-        self.is_rescanning = false;
+        self.ipc.is_rescanning = false;
         // 走査進捗 overlay を消す (Phase B)。
-        self.load_progress = None;
-        let Some(new_db) = self.rescan_result.lock().ok().and_then(|mut g| g.take()) else {
+        self.media.load_progress = None;
+        let Some(new_db) = self.ipc.rescan_result.lock().ok().and_then(|mut g| g.take()) else {
             return;
         };
         let new_db = Arc::new(new_db);
-        self.plugin_db = Some(new_db);
+        self.ipc.plugin_db = Some(new_db);
         self.rebuild_picker_entries();
         self.refresh_picker_visible();
         // (r.md #5 ARA2) A rescan can reclassify an already-loaded plug-in as
@@ -21908,12 +21236,12 @@ impl AppData {
     // -------- Mixer --------------------------------------------------------
 
     // Phase 6 review (SSOT fix): `track_id` は stable な Track::id。 旧 GUI
-    // 側は Vec index を受け取って `self.song.tracks.get_mut(idx)` していたが、
+    // 側は Vec index を受け取って `self.song_doc.song().tracks.get_mut(idx)` していたが、
     // IPC を通すと audio engine 側の Vec 順序とずれて race を起こすため、
     // ここから IPC まで一貫して id で識別する。
     fn set_track_volume(&mut self, track_id: u32, volume: f32) {
         let v = volume.clamp(0.0, 1.0);
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
         // SetSongBpmFromScrub と同 idiom: 値が実際に変わったときだけ
@@ -21921,13 +21249,13 @@ impl AppData {
         let changed = (t.volume - v).abs() > f32::EPSILON;
         t.volume = v;
         if changed {
-            self.is_dirty = true;
+            self.song_doc.is_dirty() = true;
         }
-        let msg = MainToChild::SetTrackVolume { track: track_id, volume: v };
+        let msg = AudioCommand::SetTrackVolume { track: track_id, volume: v };
         self.send_audio(msg);
         // gui_01 #028 §7.3: knob 操作で last-touched param を更新。
         // `A` キー shortcut の source になる。
-        self.last_touched_param = Some(TouchedParam {
+        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target: common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Volume,
@@ -21939,17 +21267,17 @@ impl AppData {
 
     fn set_track_pan(&mut self, track_id: u32, pan: f32) {
         let p = pan.clamp(-1.0, 1.0);
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
         let changed = (t.pan - p).abs() > f32::EPSILON;
         t.pan = p;
         if changed {
-            self.is_dirty = true;
+            self.song_doc.is_dirty() = true;
         }
-        let msg = MainToChild::SetTrackPan { track: track_id, pan: p };
+        let msg = AudioCommand::SetTrackPan { track: track_id, pan: p };
         self.send_audio(msg);
-        self.last_touched_param = Some(TouchedParam {
+        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target: common::model::AutomationTarget::TrackBuiltin(
                 common::model::TrackBuiltinParam::Pan,
@@ -21969,28 +21297,31 @@ impl AppData {
     fn action_add_return_track(&mut self) {
         // 既存リターン数 + 1 で命名 (= 派生集合の cardinality)。
         let existing_returns = self
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .filter(|t| self.is_return_track(t.id))
             .count();
-        let id = self.song.alloc_track_id();
+        let id = self.song_doc.song().alloc_track_id();
         let track = track_with(|t| {
             t.id = id;
             t.name = format!("Return {}", existing_returns + 1);
             // リターンは master 直下に流す。
             t.parent_group_id = None;
         });
-        self.song.tracks.push(track);
+        self.edit_song(|song| song.tracks.push(track));
         // 選択中 track があれば、 そこから新リターンへ即座に send を 1 本張る
         // (Ableton "Add Return" の即時性)。 選択が無ければ wiring だけ作って
         // ユーザーが後で「＋ Send」 で繋ぐ。 自分自身宛て (= 新リターンが
         // 選択されていた可能性) は意味が無いので除外。
         if let Some(sel_id) = self.cursor_track_id()
             && sel_id != id
-            && let Some(src) = self.song.tracks.iter_mut().find(|t| t.id == sel_id)
+            && let Some(src) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == sel_id)
         {
+            // v29: 新規 send は必ず per-track allocator で安定 id を採番する。
+            let send_id = src.alloc_send_id();
             src.sends.push(common::model::Send {
+                id: send_id,
                 dest_track_id: id,
                 gain: 1.0,
                 mode: SendMode::PostFader,
@@ -22010,34 +21341,54 @@ impl AppData {
         if src_track_id == dest_track_id {
             return;
         }
-        let Some(src) = self.song.tracks.iter_mut().find(|t| t.id == src_track_id) else {
-            return;
-        };
-        src.sends.push(common::model::Send {
-            dest_track_id,
-            gain: 1.0,
-            mode: SendMode::PostFader,
-            enabled: true,
+        let __applied = self.edit_song_checked(|song| {
+            let Some(src) = song.tracks.iter_mut().find(|t| t.id == src_track_id) else {
+                return false;
+            };
+            // v29: 新規 send は必ず per-track allocator で安定 id を採番する。
+            let send_id = src.alloc_send_id();
+            src.sends.push(common::model::Send {
+                id: send_id,
+                dest_track_id,
+                gain: 1.0,
+                mode: SendMode::PostFader,
+                enabled: true,
+            });
+            true
         });
+        if !__applied {
+            return;
+        }
         self.sync_song_to_plugin_host();
         tracing::info!(src_track_id, dest_track_id, "added send");
     }
 
     /// `track_id` の `sends[send_idx]` を削除。 構造変化 → full-song resend。
-    /// `SendGain` automation lane も `Song::remove_track_send` が追従させる
-    /// (消した send の lane は除去、 後続 index を 1 つ詰める。 怠ると lane が別 send を
-    /// 変調する / 範囲外を指す。 r.md #8 A5)。
+    /// v29: UI からは positional index で来るので、 該当 send の安定 id に
+    /// 解決してから `Song::remove_track_send(track_id, send_id)` を呼ぶ
+    /// (SendGain automation lane / mod routing の除去は model 側が id で行う —
+    /// 旧 `reindex_send_gain_lanes` の「後続 index 詰め」 は id 化で消滅)。
     fn remove_send(&mut self, track_id: u32, send_idx: usize) {
-        if self.song.remove_track_send(track_id, send_idx) {
+        let Some(send_id) = self
+            .song_doc.song()
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .and_then(|t| t.sends.get(send_idx))
+            .map(|s| s.id)
+        else {
+            return;
+        };
+        if self.song_doc.song().remove_track_send(track_id, send_id) {
             self.sync_song_to_plugin_host();
-            tracing::info!(track_id, send_idx, "removed send");
+            tracing::info!(track_id, send_idx, send_id, "removed send");
         }
     }
 
     /// `track_id` の `sends[send_idx].mode` を設定。 tap 位置 (pre/post) は
     /// routing graph に影響するので 構造変化 → full-song resend。
     fn set_send_mode(&mut self, track_id: u32, send_idx: usize, mode: SendMode) {
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
         let Some(send) = t.sends.get_mut(send_idx) else {
@@ -22056,7 +21407,7 @@ impl AppData {
     /// 更新して `A` キーで send-gain automation lane を生やせるようにする。
     fn set_send_gain(&mut self, track_id: u32, send_idx: usize, gain: f32) {
         let g = gain.clamp(0.0, 2.0);
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
         let Some(send) = t.sends.get_mut(send_idx) else {
@@ -22065,22 +21416,23 @@ impl AppData {
         let changed = (send.gain - g).abs() > f32::EPSILON;
         send.gain = g;
         if changed {
-            self.is_dirty = true;
+            self.song_doc.is_dirty() = true;
         }
-        // send_idx は u8 (= AutomationTarget / protocol の表現) に収まる範囲
-        // のみ realtime 送信。 256 本以上の send は非現実的だが防衛的に gate。
-        let Ok(send_idx_u8) = u8::try_from(send_idx) else {
-            return;
-        };
-        self.send_audio(MainToChild::SetSendGain {
+        // v29: realtime IPC / automation target は positional index でなく
+        // 安定 send id でアドレスする。
+        let send_id = send.id;
+        self.send_audio(AudioCommand::SetSendGain {
             track: track_id,
-            send_idx: send_idx_u8,
+            send_id,
             gain: g,
         });
-        self.last_touched_param = Some(TouchedParam {
+        self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target: common::model::AutomationTarget::TrackBuiltin(
-                common::model::TrackBuiltinParam::SendGain { send_idx: send_idx_u8 },
+                common::model::TrackBuiltinParam::SendGain {
+                    send_id,
+                    legacy_send_idx: None,
+                },
             ),
             display_name: format!("Send {}", send_idx + 1),
             touched_at: std::time::Instant::now(),
@@ -22090,7 +21442,7 @@ impl AppData {
     /// `sends[send_idx].enabled` を設定 + realtime IPC。 `set_send_gain` と
     /// 同 idiom、 full-song resend しない (= 配線は維持したまま mute)。
     fn set_send_enabled(&mut self, track_id: u32, send_idx: usize, enabled: bool) {
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
         let Some(send) = t.sends.get_mut(send_idx) else {
@@ -22098,62 +21450,78 @@ impl AppData {
         };
         let changed = send.enabled != enabled;
         send.enabled = enabled;
+        let send_id = send.id;
         if changed {
-            self.is_dirty = true;
+            self.song_doc.is_dirty() = true;
         }
-        let Ok(send_idx_u8) = u8::try_from(send_idx) else {
-            return;
-        };
-        self.send_audio(MainToChild::SetSendEnabled {
+        self.send_audio(AudioCommand::SetSendEnabled {
             track: track_id,
-            send_idx: send_idx_u8,
+            send_id,
             enabled,
         });
     }
 
     fn toggle_track_mute(&mut self, track_id: u32) {
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let __applied = self.edit_song_checked(|song| {
+            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return false;
+            };
+            t.muted = !t.muted;
+            let muted = t.muted;
+            // toggle なので値は必ず変化する → autosave 用に dirty を立てる。
+            true
+        });
+        if !__applied {
             return;
-        };
-        t.muted = !t.muted;
-        let muted = t.muted;
-        // toggle なので値は必ず変化する → autosave 用に dirty を立てる。
-        self.is_dirty = true;
-        let msg = MainToChild::SetTrackMuted { track: track_id, muted };
+        }
+        self.song_doc.is_dirty() = true;
+        let msg = AudioCommand::SetTrackMuted { track: track_id, muted };
         self.send_audio(msg);
     }
 
     fn toggle_track_solo(&mut self, track_id: u32) {
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let __applied = self.edit_song_checked(|song| {
+            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return false;
+            };
+            t.solo = !t.solo;
+            let solo = t.solo;
+            // toggle なので値は必ず変化する → autosave 用に dirty を立てる。
+            true
+        });
+        if !__applied {
             return;
-        };
-        t.solo = !t.solo;
-        let solo = t.solo;
-        // toggle なので値は必ず変化する → autosave 用に dirty を立てる。
-        self.is_dirty = true;
-        let msg = MainToChild::SetTrackSolo { track: track_id, solo };
+        }
+        self.song_doc.is_dirty() = true;
+        let msg = AudioCommand::SetTrackSolo { track: track_id, solo };
         self.send_audio(msg);
     }
 
     fn toggle_track_armed(&mut self, track_id: u32) {
-        let Some(t) = self.song.tracks.iter_mut().find(|t| t.id == track_id) else {
+        let __applied = self.edit_song_checked(|song| {
+            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return false;
+            };
+            t.armed = !t.armed;
+            let armed = t.armed;
+            // `armed` は永続 field。 mute / solo と同じく dirty を立てる。
+            true
+        });
+        if !__applied {
             return;
-        };
-        t.armed = !t.armed;
-        let armed = t.armed;
-        // `armed` は永続 field。 mute / solo と同じく dirty を立てる。
-        self.is_dirty = true;
-        let msg = MainToChild::SetTrackArmed { track: track_id, armed };
+        }
+        self.song_doc.is_dirty() = true;
+        let msg = AudioCommand::SetTrackArmed { track: track_id, armed };
         self.send_audio(msg);
     }
 
     fn on_track_peaks_tick(&mut self, peaks: &[(f32, f32)]) {
         const RELEASE: f32 = 0.85;
-        let n = self.song.tracks.len();
-        if self.track_peak_display.len() != n {
-            self.track_peak_display.resize(n, (0.0, 0.0));
+        let n = self.song_doc.song().tracks.len();
+        if self.transport.track_peak_display.len() != n {
+            self.transport.track_peak_display.resize(n, (0.0, 0.0));
         }
-        for (i, d) in self.track_peak_display.iter_mut().enumerate() {
+        for (i, d) in self.transport.track_peak_display.iter_mut().enumerate() {
             let (l, r) = peaks.get(i).copied().unwrap_or((0.0, 0.0));
             d.0 = common::meter::update_peak(d.0, l, RELEASE);
             d.1 = common::meter::update_peak(d.1, r, RELEASE);
@@ -22161,14 +21529,14 @@ impl AppData {
     }
 
     fn rebuild_picker_entries(&mut self) {
-        let Some(db) = self.plugin_db.as_ref() else {
-            self.plugin_picker_entries.clear();
+        let Some(db) = self.ipc.plugin_db.as_ref() else {
+            self.ui_ephemeral.plugin_picker_entries.clear();
             return;
         };
         let mut v: Vec<PluginPickEntry> =
             db.entries.iter().map(PluginPickEntry::from_db_entry).collect();
         v.sort_by_key(|e| e.name.to_lowercase());
-        self.plugin_picker_entries = v;
+        self.ui_ephemeral.plugin_picker_entries = v;
     }
 
     fn refresh_picker_visible(&mut self) {
@@ -22181,9 +21549,9 @@ impl AppData {
         let master = self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
         // 検索クエリ (前後空白を除去)。 空なら (master フィルタを除き) 全件、 非空なら
         // name / vendor のいずれかへの subsequence マッチで AND 絞り込みする。
-        let query = self.plugin_picker_query.trim();
+        let query = self.ui_ephemeral.plugin_picker_query.trim();
         let visible: Vec<PluginPickEntry> = self
-            .plugin_picker_entries
+            .ui_ephemeral.plugin_picker_entries
             .iter()
             .filter(|e| {
                 !master
@@ -22198,14 +21566,14 @@ impl AppData {
             })
             .cloned()
             .collect();
-        self.plugin_picker_visible = visible;
+        self.ui_ephemeral.plugin_picker_visible = visible;
         // 絞り込み再計算後はカーソルを先頭に戻す (要件 7)。 query 変更 / target 切替 /
         // rescan 完了で呼ばれるため、 「絞り込みが変わったら先頭にリセット」 が自然。
-        self.plugin_picker_cursor = 0;
+        self.ui_ephemeral.plugin_picker_cursor = 0;
     }
 
     fn resolve_name(&self, plugin_id: &str) -> String {
-        self.plugin_db
+        self.ipc.plugin_db
             .as_deref()
             .and_then(|db| db.find_by_id(plugin_id))
             .map(|e| {
@@ -22225,10 +21593,10 @@ impl AppData {
     /// (= 「ループしている区間をそのまま書き出す」 という DAW で一般的な既定)。
     /// 末尾は最低 `MIN_EXPORT_RANGE_BEATS` を保証する。
     fn default_export_range(&self) -> (f64, f64) {
-        let (start, end) = if self.song.loop_end_beat > self.song.loop_start_beat {
-            (self.song.loop_start_beat, self.song.loop_end_beat)
+        let (start, end) = if self.song_doc.song().loop_end_beat > self.song_doc.song().loop_start_beat {
+            (self.song_doc.song().loop_start_beat, self.song_doc.song().loop_end_beat)
         } else {
-            (0.0, self.song.length_beats)
+            (0.0, self.song_doc.song().length_beats)
         };
         let start = start.max(0.0);
         (start, end.max(start + MIN_EXPORT_RANGE_BEATS))
@@ -22243,22 +21611,22 @@ impl AppData {
         // video export は実行中だと二重起動できない (旧 action_open_export_mp4_dialog
         // のガードをここへ移設)。
         if matches!(kind, ExportRangeKind::Mp4)
-            && (self.export_stage.is_some()
-                || self.pending_video_export.is_some()
-                || self.export_dialog_open)
+            && (self.transport.export_stage.is_some()
+                || self.transport.pending_video_export.is_some()
+                || self.ui_ephemeral.export_dialog_open)
         {
-            self.status_message = "Video export を実行中です".into();
+            self.ui_ephemeral.status_message = "Video export を実行中です".into();
             return;
         }
         let (start_beat, end_beat) = self.default_export_range();
-        self.export_range_picker = Some(ExportRangePicker {
+        self.ui_ephemeral.export_range_picker = Some(ExportRangePicker {
             start_beat,
             end_beat,
             kind,
             // 既定はプロジェクト現在値 (= 1920x1080 / 30)。 dropdown で
             // 変更した値は per-export override として確定時に運ばれる。
-            resolution: self.song.video_resolution,
-            framerate: self.song.video_framerate,
+            resolution: self.song_doc.song().video_resolution,
+            framerate: self.song_doc.song().video_framerate,
         });
     }
 
@@ -22266,12 +21634,12 @@ impl AppData {
     /// export action を起動する。 「全曲」 (start=0, end=length) のときは範囲なし
     /// (`None`) として従来どおり全曲を書き出す。
     fn confirm_export_range(&mut self) {
-        let Some(picker) = self.export_range_picker.take() else {
+        let Some(picker) = self.ui_ephemeral.export_range_picker.take() else {
             return;
         };
         // start=0 かつ end>=length は全曲とみなす (= None)。 浮動小数の比較は緩く。
         let is_full = picker.start_beat <= f64::EPSILON
-            && picker.end_beat >= self.song.length_beats - f64::EPSILON;
+            && picker.end_beat >= self.song_doc.song().length_beats - f64::EPSILON;
         let range_beats: Option<(f64, f64)> =
             if is_full { None } else { Some((picker.start_beat, picker.end_beat)) };
         match picker.kind {
@@ -22293,7 +21661,7 @@ impl AppData {
                 #[cfg(not(windows))]
                 {
                     let _ = (range_beats, resolution, framerate);
-                    self.status_message =
+                    self.ui_ephemeral.status_message =
                         "Video export は Windows 専用 (WMF 経由) です".into();
                 }
             }
@@ -22301,12 +21669,12 @@ impl AppData {
     }
 
     /// 拍範囲 → sample frame 範囲。 audio engine と同じ式・同じ
-    /// sample rate (`self.sample_rate`、 AudioSession に渡す値)
+    /// sample rate (`self.ipc.sample_rate`、 AudioSession に渡す値)
     /// で換算するので、 daw_audio 側 `run_export` の `samples_per_beat` と完全に
     /// 一致する (bounce の `clip_range_to_frames` と同じ SSoT)。
     fn export_beats_to_frames(&self, start_beat: f64, end_beat: f64) -> (u64, u64) {
-        let sr = f64::from(self.sample_rate);
-        let bpm = f64::from(self.song.bpm).max(f64::EPSILON);
+        let sr = f64::from(self.ipc.sample_rate);
+        let bpm = f64::from(self.song_doc.song().bpm).max(f64::EPSILON);
         let spb = sr * 60.0 / bpm;
         let s = (start_beat * spb).max(0.0) as u64;
         let e = (end_beat * spb).max(0.0) as u64;
@@ -22329,19 +21697,19 @@ impl AppData {
     ) {
         // 書き出しは freewheel render。 再生中なら先に停止する (live dispatch と
         // export dispatch が同じ plugin host worker slot で衝突するのを防ぐ)。
-        if self.is_playing {
+        if self.transport.is_playing {
             self.stop();
         }
         // freewheel 開始前に最新 song snapshot + project_dir を daw_audio へ。
-        let song = self.song.clone();
-        self.send_audio(MainToChild::LoadSong(song));
-        self.send_plugin(MainToChild::SetRenderMode(
+        let song = self.song_doc.song().clone();
+        self.send_audio(AudioCommand::LoadSong(song));
+        self.send_plugin(PluginCommand::SetRenderMode(
             common::protocol::RenderMode::Offline,
         ));
         // 全 plugin を deactivate→activate でクリーンにしてから export する。
         // 完了 (`PluginsReinitDone`) で stashed export を発火。
-        self.pending_export = Some((path, range, write_mod_sidecar));
-        self.send_plugin(MainToChild::ReinitAllPlugins);
+        self.transport.pending_export = Some((path, range, write_mod_sidecar));
+        self.send_plugin(PluginCommand::ReinitAllPlugins);
     }
 
     /// Phase 7 B4 Step E (2026-05-13): File → Export MIDI...
@@ -22420,7 +21788,7 @@ impl AppData {
             return;
         }
         let project_dir: Option<PathBuf> = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
@@ -22428,21 +21796,21 @@ impl AppData {
         // view が計算) を最優先、 None なら cursor_track_index にフォール
         // バック (= File menu / dialog 経由)、 さらに無いときは 0。 範囲外
         // (= track 数を超える) 値は最後の track に clamp。
-        let n_tracks = self.song.tracks.len();
+        let n_tracks = self.song_doc.song().tracks.len();
         let target_track_idx: usize = target_track_idx
             .map(|i| (i as usize).min(n_tracks.saturating_sub(1)))
             .or_else(|| self.cursor_track_index())
             .unwrap_or(0);
         // drag&drop の drop 位置 (`target_beat`) を最優先、 無ければ playhead。
         let start_beat_seed: f64 =
-            target_beat.unwrap_or(self.playhead_beat.unwrap_or(0.0) as f64);
-        if self.song.tracks.is_empty() {
-            self.status_message =
+            target_beat.unwrap_or(self.transport.playhead_beat.unwrap_or(0.0) as f64);
+        if self.song_doc.song().tracks.is_empty() {
+            self.ui_ephemeral.status_message =
                 "Audio import: 配置先のトラックが無いため取り込めません".to_string();
             return;
         }
 
-        let bpm = self.song.bpm;
+        let bpm = self.song_doc.song().bpm;
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut next_start_beat = start_beat_seed.max(0.0);
@@ -22459,11 +21827,13 @@ impl AppData {
             let length_beats =
                 frames_to_beats(imported.buffer.frames, imported.buffer.sample_rate, bpm);
 
-            let source_id = self.song.alloc_audio_source_id();
-            self.song.audio_sources.insert(source_id, imported.source);
-            self.audio_source_cache.insert(source_id, imported.buffer.clone());
+            let source_id = self.song_doc.song().alloc_audio_source_id();
+            self.edit_song(|song| song.audio_sources.insert(source_id, imported.source));
+            self.media.audio_source_cache.insert(source_id, imported.buffer.clone());
 
+            // v29: 新規 content の単一 event なので id=1 / allocator は 2 から。
             let event = AudioEvent {
+                id: 1,
                 source_id,
                 event_start_in_clip_beats: 0.0,
                 event_length_beats: length_beats,
@@ -22471,14 +21841,15 @@ impl AppData {
                 source_end_frames: imported.buffer.frames,
                 ..AudioEvent::default()
             };
-            let content_id = self.song.alloc_content(
+            let content_id = self.song_doc.song().alloc_content(
                 ClipContent::Audio(AudioContent {
                     events: vec![event],
+                    next_event_id: 2,
                 }),
                 imported.display_name.clone(),
             );
 
-            let track = &mut self.song.tracks[target_track_idx];
+            let track = &mut self.song_doc.song().tracks[target_track_idx];
             let new_clip_id = track.alloc_clip_id();
             track.clips.push(Clip {
                 id: new_clip_id,
@@ -22496,11 +21867,11 @@ impl AppData {
         }
 
         if imported_ok > 0 {
-            self.is_dirty = true;
+            self.song_doc.is_dirty() = true;
             self.sync_song_to_plugin_host();
         }
 
-        self.status_message = match (imported_ok, errors.is_empty()) {
+        self.ui_ephemeral.status_message = match (imported_ok, errors.is_empty()) {
             (0, false) => format!("Audio import 失敗: {}", errors.join(" / ")),
             (n, true) => format!("Audio import 完了: {n} ファイル"),
             (n, false) => format!(
@@ -22539,14 +21910,14 @@ impl AppData {
             return;
         }
         let project_dir: Option<PathBuf> = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
         // drag&drop の drop 位置 (`target_beat`) を最優先、 無ければ playhead。
         let start_beat_seed: f64 =
-            target_beat.unwrap_or(self.playhead_beat.unwrap_or(0.0) as f64);
-        let bpm = self.song.bpm;
+            target_beat.unwrap_or(self.transport.playhead_beat.unwrap_or(0.0) as f64);
+        let bpm = self.song_doc.song().bpm;
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut next_start_beat = start_beat_seed.max(0.0);
@@ -22569,17 +21940,17 @@ impl AppData {
             // 1) Register paired audio (if present) before video so we
             //    have the AudioSourceId for the video back-link.
             let audio_source_id = imported.audio.as_ref().map(|audio| {
-                let id = self.song.alloc_audio_source_id();
-                self.song.audio_sources.insert(id, audio.source.clone());
-                self.audio_source_cache.insert(id, audio.buffer.clone());
+                let id = self.song_doc.song().alloc_audio_source_id();
+                self.edit_song(|song| song.audio_sources.insert(id, audio.source.clone()));
+                self.media.audio_source_cache.insert(id, audio.buffer.clone());
                 id
             });
 
             // 2) Register video source with the audio back-link.
-            let video_source_id = self.song.alloc_video_source_id();
+            let video_source_id = self.song_doc.song().alloc_video_source_id();
             let mut vs = imported.video_source;
             vs.audio_source_id = audio_source_id;
-            self.song.video_sources.insert(video_source_id, vs);
+            self.edit_song(|song| song.video_sources.insert(video_source_id, vs));
 
             // 2b) Stash the thumbnail RGBA (if extracted) and queue
             //     a GPU upload. The runner picks this up next frame
@@ -22587,15 +21958,15 @@ impl AppData {
             //     `video_texture_cache` for the arrangement view to
             //     read.
             if let Some(thumb) = imported.thumbnail {
-                self.video_thumbnail_rgba.insert(
+                self.media.video_thumbnail_rgba.insert(
                     video_source_id,
                     (thumb.width, thumb.height, std::sync::Arc::new(thumb.rgba)),
                 );
-                self.pending_thumbnail_uploads.push(video_source_id);
+                self.media.pending_thumbnail_uploads.push(video_source_id);
             }
 
             // 3) Video clip content + auto track.
-            let v_content_id = self.song.alloc_content(
+            let v_content_id = self.song_doc.song().alloc_content(
                 ClipContent::Video(VideoContent {
                     events: vec![VideoEvent {
                         source_id: video_source_id,
@@ -22608,7 +21979,7 @@ impl AppData {
                 }),
                 display_name.clone(),
             );
-            let video_track_id = self.song.alloc_track_id();
+            let video_track_id = self.song_doc.song().alloc_track_id();
             let mut video_track = track_with(|t| {
                 t.id = video_track_id;
                 t.name = format!("{display_name} (Video)");
@@ -22625,7 +21996,7 @@ impl AppData {
                 auto_lipsync: false,
                 ..Default::default()
             });
-            self.song.tracks.push(video_track);
+            self.edit_song(|song| song.tracks.push(video_track));
 
             // 4) Paired audio clip + audio track (only when audio is
             //    present in the source).
@@ -22637,9 +22008,11 @@ impl AppData {
                     audio.buffer.sample_rate,
                     bpm,
                 );
-                let a_content_id = self.song.alloc_content(
+                let a_content_id = self.song_doc.song().alloc_content(
                     ClipContent::Audio(AudioContent {
                         events: vec![AudioEvent {
+                            // v29: 新規 content の単一 event = id 1。
+                            id: 1,
                             source_id: audio_src_id,
                             event_start_in_clip_beats: 0.0,
                             event_length_beats: audio_length_beats,
@@ -22647,10 +22020,11 @@ impl AppData {
                             source_end_frames: audio.buffer.frames,
                             ..AudioEvent::default()
                         }],
+                        next_event_id: 2,
                     }),
                     format!("{display_name} (audio)"),
                 );
-                let audio_track_id = self.song.alloc_track_id();
+                let audio_track_id = self.song_doc.song().alloc_track_id();
                 let mut audio_track = track_with(|t| {
                     t.id = audio_track_id;
                     t.name = format!("{display_name} (Audio)");
@@ -22667,7 +22041,7 @@ impl AppData {
                     auto_lipsync: false,
                     ..Default::default()
                 });
-                self.song.tracks.push(audio_track);
+                self.edit_song(|song| song.tracks.push(audio_track));
             }
 
             next_start_beat += video_length_beats;
@@ -22675,11 +22049,11 @@ impl AppData {
         }
 
         if imported_ok > 0 {
-            self.is_dirty = true;
+            self.song_doc.is_dirty() = true;
             self.sync_song_to_plugin_host();
         }
 
-        self.status_message = match (imported_ok, errors.is_empty()) {
+        self.ui_ephemeral.status_message = match (imported_ok, errors.is_empty()) {
             (0, false) => format!("Video import 失敗: {}", errors.join(" / ")),
             (n, true) => format!("Video import 完了: {n} ファイル (V + A track 追加)"),
             (n, false) => format!(
@@ -22732,7 +22106,7 @@ impl AppData {
             return;
         }
         let project_dir = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
 
@@ -22741,7 +22115,7 @@ impl AppData {
         // 無い下の領域 (= 範囲外 index) や dialog 経由 (None) は従来どおり
         // arrangement 先頭 (index 0) に新規 track を作って貼る。
         let dest_track_idx: Option<usize> =
-            resolve_image_drop_target(target_track_idx, self.song.tracks.len());
+            resolve_image_drop_target(target_track_idx, self.song_doc.song().tracks.len());
 
         // drag&drop の drop 位置 (`target_beat`) を最優先。 無いとき (dialog 経由)
         // は従来挙動: 既存 track に貼るときは playhead を seed に順送り配置
@@ -22750,11 +22124,11 @@ impl AppData {
         let mut next_start_beat = match target_beat {
             Some(b) => b.max(0.0),
             None if dest_track_idx.is_some() => {
-                (self.playhead_beat.unwrap_or(0.0) as f64).max(0.0)
+                (self.transport.playhead_beat.unwrap_or(0.0) as f64).max(0.0)
             }
             None => 0.0_f64,
         };
-        let image_clip_length_beats = (self.song.length_beats * 0.5).max(8.0);
+        let image_clip_length_beats = (self.song_doc.song().length_beats * 0.5).max(8.0);
 
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
@@ -22771,19 +22145,19 @@ impl AppData {
             };
 
             // 1) Register ImageSource + stage BGRA for GPU upload.
-            let image_source_id = self.song.alloc_image_source_id();
-            self.song.image_sources.insert(image_source_id, imported.source);
+            let image_source_id = self.song_doc.song().alloc_image_source_id();
+            self.edit_song(|song| song.image_sources.insert(image_source_id, imported.source));
             let w = imported.bgra.len() as u32;
             let _ = w;
             // bgra length matches width * height * 4 by construction of
             // `import_one_image`; re-fetch dims from the source we just
             // inserted so the staging matches.
-            let src = &self.song.image_sources[&image_source_id];
-            self.image_source_bgra.insert(
+            let src = &self.song_doc.song().image_sources[&image_source_id];
+            self.media.image_source_bgra.insert(
                 image_source_id,
                 (src.width, src.height, std::sync::Arc::new(imported.bgra)),
             );
-            self.pending_image_uploads.push(image_source_id);
+            self.media.pending_image_uploads.push(image_source_id);
 
             // 2) Build the Image clip content. Single ImageEvent
             // covering the whole clip。 デフォルト PiP rect は
@@ -22797,10 +22171,10 @@ impl AppData {
                 .unwrap_or("image")
                 .to_string();
             let (def_x, def_y, def_w, def_h) = aspect_fit_pip_rect(
-                self.song.video_resolution,
+                self.song_doc.song().video_resolution,
                 (src.width, src.height),
             );
-            let i_content_id = self.song.alloc_content(
+            let i_content_id = self.song_doc.song().alloc_content(
                 common::model::ClipContent::Image(common::model::ImageContent {
                     events: vec![common::model::ImageEvent {
                         source_id: image_source_id,
@@ -22824,8 +22198,8 @@ impl AppData {
             let place_idx = match dest_track_idx {
                 Some(idx) => idx,
                 None => {
-                    let image_track_id = self.song.alloc_track_id();
-                    self.song.tracks.insert(
+                    let image_track_id = self.song_doc.song().alloc_track_id();
+                    self.song_doc.song().tracks.insert(
                         0,
                         track_with(|t| {
                             t.id = image_track_id;
@@ -22835,7 +22209,7 @@ impl AppData {
                     0
                 }
             };
-            let track = &mut self.song.tracks[place_idx];
+            let track = &mut self.song_doc.song().tracks[place_idx];
             let i_clip_id = track.alloc_clip_id();
             track.clips.push(Clip {
                 id: i_clip_id,
@@ -22857,7 +22231,7 @@ impl AppData {
         }
 
         if imported_ok > 0 {
-            self.is_dirty = true;
+            self.song_doc.is_dirty() = true;
             // No `sync_song_to_plugin_host` — image clips have no
             // audio engine implications, the daw_audio process never
             // sees them.
@@ -22866,7 +22240,7 @@ impl AppData {
         // `paths.is_empty()` early-returns above, so we know
         // imported_ok + errors.len() >= 1 — the (0, true) "nothing
         // happened" case is unreachable here.
-        self.status_message = match (imported_ok, errors.is_empty()) {
+        self.ui_ephemeral.status_message = match (imported_ok, errors.is_empty()) {
             (0, false) => format!("Image import 失敗: {}", errors.join(" / ")),
             (n, true) => format!("Image import 完了: {n} ファイル"),
             (n, false) => format!(
@@ -22884,13 +22258,13 @@ impl AppData {
     /// 任意の track 上にタイムラインで生成する。 content / styles は inspector、 PiP rect は
     /// preview drag で編集。 clip 長は他 clip 生成 (`create_clip`) と同じ `DEFAULT_CLIP_LENGTH`。
     fn add_text_clip_to_track(&mut self, track_id: u32, start_beat: f64) {
-        let Some(track_idx) = self.song.tracks.iter().position(|t| t.id == track_id) else {
+        let Some(track_idx) = self.song_doc.song().tracks.iter().position(|t| t.id == track_id) else {
             return;
         };
         let start_beat = start_beat.max(0.0);
         let length_beats = DEFAULT_CLIP_LENGTH;
 
-        let content_id = self.song.alloc_content(
+        let content_id = self.song_doc.song().alloc_content(
             common::model::ClipContent::Text(common::model::TextContent {
                 events: vec![common::model::TextEvent {
                     text: "Title".into(),
@@ -22903,7 +22277,7 @@ impl AppData {
             String::new(),
         );
 
-        let track = &mut self.song.tracks[track_idx];
+        let track = &mut self.song_doc.song().tracks[track_idx];
         let clip_id = track.alloc_clip_id();
         let new_clip_idx = track.clips.len() as u32;
         track.clips.push(common::model::Clip {
@@ -22924,11 +22298,11 @@ impl AppData {
             clip: new_clip_idx,
         };
         self.set_single_clip_selection(r);
-        self.selected_notes.clear();
+        self.selection.selected_notes.clear();
         self.select_track(track_idx as u32);
 
-        self.is_dirty = true;
-        self.status_message = "Text clip 追加".into();
+        self.song_doc.is_dirty() = true;
+        self.ui_ephemeral.status_message = "Text clip 追加".into();
         self.sync_song_to_plugin_host();
     }
 
@@ -22965,15 +22339,15 @@ impl AppData {
         resolution: (u32, u32),
         framerate: f32,
     ) {
-        if self.export_stage.is_some()
-            || self.pending_video_export.is_some()
-            || self.export_dialog_open
+        if self.transport.export_stage.is_some()
+            || self.transport.pending_video_export.is_some()
+            || self.ui_ephemeral.export_dialog_open
         {
-            self.status_message = "Video export を実行中です".into();
+            self.ui_ephemeral.status_message = "Video export を実行中です".into();
             return;
         }
         let default_name = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
@@ -22983,8 +22357,8 @@ impl AppData {
             .add_filter("MP4 Video", &["mp4"])
             .set_file_name(&default_name)
             .set_title("Export Video to MP4...");
-        self.export_dialog_open = true;
-        self.status_message = "保存先を選択中...".into();
+        self.ui_ephemeral.export_dialog_open = true;
+        self.ui_ephemeral.status_message = "保存先を選択中...".into();
         self.spawn_file_dialog(
             dialog,
             FileDialogMode::Save,
@@ -23008,24 +22382,24 @@ impl AppData {
         // audio engine が死んでいる (audio_tx=None) と前段の音声 render が
         // start できず ExportWavComplete が来ない → overlay 永久ロック。
         // 開始前にガードする（標準 WAV export と同じ防御）。
-        if self.audio_tx.is_none() {
-            self.status_message =
+        if self.ipc.audio_tx.is_none() {
+            self.ui_ephemeral.status_message =
                 "音声エンジンが利用できないため Video export を開始できません".into();
             return;
         }
         let temp_wav = std::env::temp_dir()
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
-        self.pending_video_export = Some(output_path);
-        self.pending_video_export_range = range_beats;
+        self.transport.pending_video_export = Some(output_path);
+        self.transport.pending_video_export_range = range_beats;
         // 音声 render 完了後に始める video render へ、 picker で選んだ
         // 出力解像度 / fps を per-export override として持ち越す。
-        self.pending_video_export_dims = Some((resolution, framerate));
-        self.export_temp_wav = Some(temp_wav.clone());
+        self.transport.pending_video_export_dims = Some((resolution, framerate));
+        self.transport.export_temp_wav = Some(temp_wav.clone());
         // 前段 = 音声 freewheel。daw_audio の `ExportWavProgress` で determinate
         // 進捗が来る（旧構造では indeterminate「音声レンダリング中」だった）。
-        self.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
-        self.export_progress_at = Some(std::time::Instant::now());
-        self.status_message = "音声をレンダリング中...".into();
+        self.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+        self.transport.export_progress_at = Some(std::time::Instant::now());
+        self.ui_ephemeral.status_message = "音声をレンダリング中...".into();
         // 音声も video と同じ窓で freewheel render (beat→frame は audio engine と
         // 同じ式)。 `None` で全曲。 stop → reinit plugins → ExportWav
         // (begin_wav_export 経由)。 video render が `.modenv` sidecar を sample して
@@ -23044,26 +22418,26 @@ impl AppData {
     /// 実際に中止したら `true`、`AudioRender` 中でなく no-op なら `false` を返す。
     /// 呼び出し側 (`handle_child_disconnected`) が status 文言の組み立てに使う。
     fn abort_audio_export(&mut self, reason: String) -> bool {
-        if !matches!(self.export_stage, Some(ExportStage::AudioRender { .. })) {
+        if !matches!(self.transport.export_stage, Some(ExportStage::AudioRender { .. })) {
             return false;
         }
-        self.export_stage = None;
-        self.export_progress_at = None;
-        self.pending_video_export = None;
-        if let Some(t) = self.export_temp_wav.take() {
+        self.transport.export_stage = None;
+        self.transport.export_progress_at = None;
+        self.transport.pending_video_export = None;
+        if let Some(t) = self.transport.export_temp_wav.take() {
             let _ = std::fs::remove_file(&t);
         }
         // daw_audio がまだ生きている (= watchdog が slow render を hang と誤検出した
         // ケース等) 場合、freewheel を止めて export_running を落とさせる。落とさないと
         // CPAL callback が無音を書き続け「再生しても音が出ない」状態になる。crash 時は
         // 既に audio_tx=None なので send_audio は no-op (= 害なし)。
-        self.send_audio(MainToChild::CancelExport);
+        self.send_audio(AudioCommand::CancelExport);
         // export 開始時に Offline へ切り替えた plugin を Realtime に戻す。plugin
         // host は daw_audio とは別プロセスなので audio 断でも生存している。
-        self.send_plugin(MainToChild::SetRenderMode(
+        self.send_plugin(PluginCommand::SetRenderMode(
             common::protocol::RenderMode::Realtime,
         ));
-        self.status_message = reason;
+        self.ui_ephemeral.status_message = reason;
         true
     }
 
@@ -23082,11 +22456,11 @@ impl AppData {
         kind: FileDialogKind,
     ) {
         #[cfg(windows)]
-        let dialog = match self.main_window_hwnd {
+        let dialog = match self.ui_ephemeral.main_window_hwnd {
             Some(hwnd) => dialog.set_parent(&Win32Parent { hwnd }),
             None => dialog,
         };
-        let proxy = self.event_proxy.clone();
+        let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             let paths: Vec<PathBuf> = match mode {
                 FileDialogMode::Save => dialog.save_file().into_iter().collect(),
@@ -23108,7 +22482,7 @@ impl AppData {
             }
             FileDialogKind::ExportMp4 { range_beats, resolution, framerate } => {
                 // 二重起動ガードを解除し、 Some なら export フロー開始。
-                self.export_dialog_open = false;
+                self.ui_ephemeral.export_dialog_open = false;
                 match paths.into_iter().next() {
                     #[cfg(windows)]
                     Some(output_path) => {
@@ -23117,18 +22491,18 @@ impl AppData {
                     #[cfg(not(windows))]
                     Some(_output_path) => {
                         let _ = (range_beats, resolution, framerate);
-                        self.status_message =
+                        self.ui_ephemeral.status_message =
                             "Video export は Windows 専用 (WMF 経由) です".into();
                     }
                     None => {
-                        self.status_message =
+                        self.ui_ephemeral.status_message =
                             "Video export をキャンセルしました".into();
                     }
                 }
             }
             FileDialogKind::ExportWav { range } => {
                 // dialog が閉じた（確定 or キャンセル）ので二重起動ガードを解除。
-                self.export_dialog_open = false;
+                self.ui_ephemeral.export_dialog_open = false;
                 let Some(path) = paths.into_iter().next() else {
                     return;
                 };
@@ -23136,18 +22510,18 @@ impl AppData {
                 // audio_tx=None) と、ExportWav は send_audio に黙って drop される。
                 // ここで export_stage を立ててしまうと完了通知が永遠に来ず overlay
                 // + 入力 gate で GUI が永久ロックする。先にガードして start しない。
-                if self.audio_tx.is_none() {
-                    self.status_message =
+                if self.ipc.audio_tx.is_none() {
+                    self.ui_ephemeral.status_message =
                         "音声エンジンが利用できないため WAV 書き出しを開始できません".into();
                     return;
                 }
-                self.status_message = "WAV 書き出し中...".to_string();
+                self.ui_ephemeral.status_message = "WAV 書き出し中...".to_string();
                 // 進捗オーバーレイ（modal）を即表示。最初の `ExportWavProgress` が
                 // 来るまでは 0% 表示、以降 daw_audio の freewheel 進捗で更新、
                 // `ExportWavComplete` で None に戻して閉じる。これで WAV export 中
                 // の入力 gate / 再生抑止も video と同様に効く。
-                self.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
-                self.export_progress_at = Some(std::time::Instant::now());
+                self.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+                self.transport.export_progress_at = Some(std::time::Instant::now());
                 // standalone WAV export — stop → reinit plugins →
                 // (on PluginsReinitDone) ExportWav。begin_wav_export が再生停止 /
                 // LoadSong / SetRenderMode(Offline) / 全 plugin 再初期化を行う。
@@ -23158,13 +22532,13 @@ impl AppData {
                 let Some(path) = paths.into_iter().next() else {
                     return;
                 };
-                match crate::midi_export::export_midi(&self.song, &path) {
+                match crate::midi_export::export_midi(&self.song_doc.song(), &path) {
                     Ok(()) => {
-                        self.status_message =
+                        self.ui_ephemeral.status_message =
                             format!("MIDI 書き出し完了: {}", path.display());
                     }
                     Err(e) => {
-                        self.status_message = format!("MIDI 書き出し失敗: {e}");
+                        self.ui_ephemeral.status_message = format!("MIDI 書き出し失敗: {e}");
                         tracing::error!(error = %e, path = %path.display(), "MIDI export failed");
                     }
                 }
@@ -23224,20 +22598,20 @@ impl AppData {
         // 何らかの export が走っている間は再入を弾く。video 後段への chain は
         // `ExportWavComplete` ハンドラが先に `export_stage` を None に戻してから
         // 呼ぶので通る。
-        if self.export_stage.is_some() {
-            self.status_message = "Video export を実行中です".into();
+        if self.transport.export_stage.is_some() {
+            self.ui_ephemeral.status_message = "Video export を実行中です".into();
             return;
         }
         let project_dir = self
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
-        let song = self.song.clone();
-        let proxy = self.event_proxy.clone();
+        let song = self.song_doc.song().clone();
+        let proxy = self.ipc.event_proxy.clone();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.export_cancel = Some(cancel.clone());
-        self.export_stage = Some(ExportStage::VideoRender { done: 0, total: 0 });
-        self.status_message = format!("Video export 開始: {}", output_path.display());
+        self.transport.export_cancel = Some(cancel.clone());
+        self.transport.export_stage = Some(ExportStage::VideoRender { done: 0, total: 0 });
+        self.ui_ephemeral.status_message = format!("Video export 開始: {}", output_path.display());
         std::thread::spawn(move || {
             // video の render 窓も拍範囲に合わせる (audio temp WAV は
             // 既に同じ窓に trim 済み → frame 0 で A/V が揃う)。
@@ -23298,36 +22672,36 @@ impl AppData {
         // event 分割に振り分ける。 Audio Editor が開いていてもマウスが
         // arrangement 上にある場合は通常の clip 分割パスを使う (= ユーザー
         // は arrangement の clip を分割したいのでそのまま流す)。
-        if self.audio_editor_clip.is_some()
-            && self.audio_editor_hover_beat_in_clip.is_some()
+        if self.ui_ephemeral.audio_editor_clip.is_some()
+            && self.ui_ephemeral.audio_editor_hover_beat_in_clip.is_some()
         {
             self.action_split_audio_editor_event_at_cursor();
             return;
         }
 
         let cursor: f64 = if snap {
-            self.arrangement_hover_beat
-                .or(self.arrangement_hover_beat_raw)
-                .or_else(|| self.playhead_beat.map(|b| b as f64))
+            self.ui_ephemeral.arrangement_hover_beat
+                .or(self.ui_ephemeral.arrangement_hover_beat_raw)
+                .or_else(|| self.transport.playhead_beat.map(|b| b as f64))
                 .unwrap_or(-1.0)
         } else {
-            self.arrangement_hover_beat_raw
-                .or(self.arrangement_hover_beat)
-                .or_else(|| self.playhead_beat.map(|b| b as f64))
+            self.ui_ephemeral.arrangement_hover_beat_raw
+                .or(self.ui_ephemeral.arrangement_hover_beat)
+                .or_else(|| self.transport.playhead_beat.map(|b| b as f64))
                 .unwrap_or(-1.0)
         };
         if cursor < 0.0 {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Split: マウスを arrangement に置くか再生中に E を押してください".into();
             return;
         }
         // Build targets list. Prefer hover clip, fall back to selection.
-        let targets: Vec<ClipRef> = if let Some(hover) = self.arrangement_hover_clip {
+        let targets: Vec<ClipRef> = if let Some(hover) = self.ui_ephemeral.arrangement_hover_clip {
             vec![hover]
-        } else if !self.selected_clips.is_empty() {
+        } else if !self.selection.selected_clips.is_empty() {
             self.selected_clip_refs()
         } else {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Split: clip にマウスを乗せるか clip を選択してください".into();
             return;
         };
@@ -23339,16 +22713,16 @@ impl AppData {
             }
         }
         if split_count == 0 {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Split: カーソルが clip 範囲外のため何も分割されませんでした".into();
             return;
         }
         if !new_selection.is_empty() {
             self.select_new_clips(&new_selection);
-            self.selected_notes.clear();
+            self.selection.selected_notes.clear();
         }
-        self.status_message = format!("Split: {split_count} clip を分割しました");
-        self.is_dirty = true;
+        self.ui_ephemeral.status_message = format!("Split: {split_count} clip を分割しました");
+        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
     }
 
@@ -23362,18 +22736,18 @@ impl AppData {
     /// 戻り値は分割成功時 `true`。 cursor が解決できない / event 上に
     /// 乗っていない場合は status_message を出して `false` を返す。
     fn action_split_audio_editor_event_at_cursor(&mut self) -> bool {
-        let Some(target) = self.audio_editor_clip else {
+        let Some(target) = self.ui_ephemeral.audio_editor_clip else {
             return false;
         };
 
         // cursor 位置 (clip 内 beat)。 hover (= マウスが waveform 上)
         // を最優先、 無ければ playhead が clip 内なら playhead を使う。
         let in_clip_beat: Option<f64> = self
-            .audio_editor_hover_beat_in_clip
+            .ui_ephemeral.audio_editor_hover_beat_in_clip
             .or_else(|| {
-                let ph = self.playhead_beat? as f64;
+                let ph = self.transport.playhead_beat? as f64;
                 let clip = self
-                    .song
+                    .song_doc.song()
                     .tracks
                     .get(target.track as usize)?
                     .clips
@@ -23382,7 +22756,7 @@ impl AppData {
                 (in_clip >= 0.0 && in_clip < clip.length_beats).then_some(in_clip)
             });
         let Some(in_clip_beat) = in_clip_beat else {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Split: マウスを Audio Editor の波形上に置くか playhead を clip 内に置いてください"
                     .into();
             return false;
@@ -23390,14 +22764,14 @@ impl AppData {
 
         // event_idx を解決 (= cursor が strict interior に乗っている event)。
         let track = self
-            .song
+            .song_doc.song()
             .tracks
             .get(target.track as usize);
         let clip = track.and_then(|t| t.clips.get(target.clip as usize));
         let Some(clip) = clip else { return false };
         let content_id = clip.content_id;
         let Some(common::model::ClipContent::Audio(audio_ro)) =
-            self.song.clip_contents.get(&content_id)
+            self.song_doc.song().clip_contents.get(&content_id)
         else {
             return false;
         };
@@ -23407,7 +22781,7 @@ impl AppData {
             in_clip_beat > s + 1e-9 && in_clip_beat < s + l - 1e-9
         });
         let Some(event_idx) = event_idx_opt else {
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Split: カーソル位置に分割可能な event がありません".into();
             return false;
         };
@@ -23416,7 +22790,7 @@ impl AppData {
 
         // mut 取り直し → 分割実行。
         let Some(common::model::ClipContent::Audio(audio_mut)) =
-            self.song.clip_contents.get_mut(&content_id)
+            self.song_doc.song().clip_contents.get_mut(&content_id)
         else {
             return false;
         };
@@ -23466,11 +22840,11 @@ impl AppData {
 
         // 選択は後半 event (= ユーザーは「分割直後に新規 event を編集
         // したい」 ことが多い、 Reaper / Bitwig 流)。
-        self.audio_editor_selected_events = vec![event_idx + 1];
-        self.status_message = "Split: event を分割しました".into();
-        self.is_dirty = true;
+        self.selection.audio_editor_selected_events = vec![event_idx + 1];
+        self.ui_ephemeral.status_message = "Split: event を分割しました".into();
+        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
-        if self.clip_edit_buffer_target == Some(target) {
+        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
         }
         true
@@ -23486,7 +22860,7 @@ impl AppData {
         playhead: f64,
         new_selection: &mut Vec<ClipRef>,
     ) -> bool {
-        let Some(track) = self.song.tracks.get(target.track as usize) else {
+        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
             return false;
         };
         let Some(clip) = track.clips.get(target.clip as usize) else {
@@ -23506,8 +22880,8 @@ impl AppData {
         let back_len = clip_len - split_offset;
         let src_content_id = clip.content_id;
         // 名前は content_id 単位 SSoT から取得 (legacy clip.name は v20 で空)。
-        let src_name = self.song.content_name(src_content_id).to_string();
-        let Some(src_content) = self.song.clip_contents.get(&src_content_id).cloned()
+        let src_name = self.song_doc.song().content_name(src_content_id).to_string();
+        let Some(src_content) = self.song_doc.song().clip_contents.get(&src_content_id).cloned()
         else {
             return false;
         };
@@ -23554,12 +22928,21 @@ impl AppData {
                 // always fork here for simplicity (= split always
                 // promotes both halves to fresh ContentIds, which is
                 // safer for shared-clip semantics).
-                let mut front = MidiContent { notes: keep_front };
+                // v29: 両半とも元 content の allocator counter を引き継ぐ
+                // (既存 note id はそのまま持ち出すので、 counter も既存 id を
+                // カバーする値でなければ次の採番が衝突する)。
+                let mut front = MidiContent {
+                    notes: keep_front,
+                    next_note_id: midi.next_note_id,
+                };
                 front.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-                let mut back = MidiContent { notes: back_notes };
+                let mut back = MidiContent {
+                    notes: back_notes,
+                    next_note_id: midi.next_note_id,
+                };
                 back.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-                let front_id = self.song.alloc_content_id();
-                self.song
+                let front_id = self.song_doc.song().alloc_content_id();
+                self.song_doc.song()
                     .clip_contents
                     .insert(front_id, ClipContent::Midi(front));
                 ClipContent::Midi(back)
@@ -23603,10 +22986,17 @@ impl AppData {
                         });
                     }
                 }
-                let front = AudioContent { events: keep_front };
-                let back = AudioContent { events: back_events };
-                let front_id = self.song.alloc_content_id();
-                self.song
+                // v29: split 両半は元 allocator counter を引き継ぐ (上の MIDI と同理)。
+                let front = AudioContent {
+                    events: keep_front,
+                    next_event_id: audio.next_event_id,
+                };
+                let back = AudioContent {
+                    events: back_events,
+                    next_event_id: audio.next_event_id,
+                };
+                let front_id = self.song_doc.song().alloc_content_id();
+                self.song_doc.song()
                     .clip_contents
                     .insert(front_id, ClipContent::Audio(front));
                 ClipContent::Audio(back)
@@ -23661,8 +23051,8 @@ impl AppData {
                 let back = common::model::VideoContent {
                     events: back_events,
                 };
-                let front_id = self.song.alloc_content_id();
-                self.song
+                let front_id = self.song_doc.song().alloc_content_id();
+                self.song_doc.song()
                     .clip_contents
                     .insert(front_id, ClipContent::Video(front));
                 ClipContent::Video(back)
@@ -23705,8 +23095,8 @@ impl AppData {
                 }
                 let front = common::model::ImageContent { events: keep_front };
                 let back = common::model::ImageContent { events: back_events };
-                let front_id = self.song.alloc_content_id();
-                self.song
+                let front_id = self.song_doc.song().alloc_content_id();
+                self.song_doc.song()
                     .clip_contents
                     .insert(front_id, ClipContent::Image(front));
                 ClipContent::Image(back)
@@ -23726,23 +23116,23 @@ impl AppData {
         // Strategy: walk back the last alloc'd id we just inserted.
         // The id list above used `alloc_content_id()` so the most
         // recent one is `next_content_id - 1`.
-        let front_content_id = self.song.next_content_id.saturating_sub(1);
-        let back_content_id = self.song.alloc_content_id();
-        self.song
+        let front_content_id = self.song_doc.song().next_content_id.saturating_sub(1);
+        let back_content_id = self.song_doc.song().alloc_content_id();
+        self.song_doc.song()
             .clip_contents
             .insert(back_content_id, back_content);
         // 両半は元 clip の共有名を引き継ぐ (split は両側を fresh content_id に
         // fork するので、 名前も両方へ複製する)。
         if !src_name.is_empty() {
-            self.song
+            self.song_doc.song()
                 .set_content_name(front_content_id, src_name.clone());
-            self.song.set_content_name(back_content_id, src_name.clone());
+            self.edit_song(|song| song.set_content_name(back_content_id, src_name.clone()));
         }
 
         // Mutate the clip in place: front half stays as `clip`
         // (length / content_id rewritten), and a new clip for the
         // back half is appended on the same track.
-        let track = &mut self.song.tracks[target.track as usize];
+        let track = &mut self.song_doc.song().tracks[target.track as usize];
         // 前半は in-place で元 clip の声を保持。 後半 (新 clip) は
         // その声を引き継ぐ。
         // 前半は in-place で mute を保持。 後半 (新 clip) も元 clip の mute を引き継ぐ。
@@ -23788,10 +23178,10 @@ impl AppData {
     /// rejected with a status message. See `docs/plan_audio_clip.md`
     /// §3.3 / §3.3.2.
     fn action_glue_selected_clips(&mut self) {
-        if self.selected_clips.len() < 2 {
-            self.status_message = format!(
+        if self.selection.selected_clips.len() < 2 {
+            self.ui_ephemeral.status_message = format!(
                 "Glue: 2 つ以上の clip を選択してください (現在 {} 個)",
-                self.selected_clips.len()
+                self.selection.selected_clips.len()
             );
             return;
         }
@@ -23814,14 +23204,14 @@ impl AppData {
             // Sort by start_beat ascending (clip indices may differ).
             refs.sort_by(|a, b| {
                 let ta = self
-                    .song
+                    .song_doc.song()
                     .tracks
                     .get(a.track as usize)
                     .and_then(|t| t.clips.get(a.clip as usize))
                     .map(|c| c.start_beat)
                     .unwrap_or(f64::INFINITY);
                 let tb = self
-                    .song
+                    .song_doc.song()
                     .tracks
                     .get(b.track as usize)
                     .and_then(|t| t.clips.get(b.clip as usize))
@@ -23844,13 +23234,13 @@ impl AppData {
             }
             let mut glue_kind: Option<GlueKind> = None;
             for r in &refs {
-                let Some(track) = self.song.tracks.get(r.track as usize) else {
+                let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
                     continue;
                 };
                 let Some(clip) = track.clips.get(r.clip as usize) else {
                     continue;
                 };
-                let Some(content) = self.song.clip_contents.get(&clip.content_id)
+                let Some(content) = self.song_doc.song().clip_contents.get(&clip.content_id)
                 else {
                     continue;
                 };
@@ -23905,7 +23295,7 @@ impl AppData {
             let mut frags = Fragments::default();
 
             for r in &refs {
-                let Some(track) = self.song.tracks.get(r.track as usize) else {
+                let Some(track) = self.song_doc.song().tracks.get(r.track as usize) else {
                     continue;
                 };
                 let Some(clip) = track.clips.get(r.clip as usize) else {
@@ -23915,11 +23305,11 @@ impl AppData {
                 let e = s + clip.length_beats;
                 if combined_name.is_empty() {
                     combined_name =
-                        self.song.content_name(clip.content_id).to_string();
+                        self.song_doc.song().content_name(clip.content_id).to_string();
                 }
                 combined_start = combined_start.min(s);
                 combined_end = combined_end.max(e);
-                let Some(content) = self.song.clip_contents.get(&clip.content_id)
+                let Some(content) = self.song_doc.song().clip_contents.get(&clip.content_id)
                 else {
                     continue;
                 };
@@ -23995,11 +23385,20 @@ impl AppData {
             // is the common one — but be defensive.)
 
             let combined_len = combined_end - combined_start;
-            let new_content_id = self.song.alloc_content_id();
+            let new_content_id = self.song_doc.song().alloc_content_id();
             let new_content = match glue_kind {
-                GlueKind::Audio => ClipContent::Audio(AudioContent {
-                    events: frags.audio_events,
-                }),
+                GlueKind::Audio => {
+                    // v29: 複数 content 由来の event id は衝突し得るので、
+                    // merged content では振り直す (per-content unique が不変条件)。
+                    let mut events = frags.audio_events;
+                    for (i, e) in events.iter_mut().enumerate() {
+                        e.id = i as u32 + 1;
+                    }
+                    ClipContent::Audio(AudioContent {
+                        next_event_id: events.len() as u32 + 1,
+                        events,
+                    })
+                }
                 GlueKind::Video => ClipContent::Video(common::model::VideoContent {
                     events: frags.video_events,
                 }),
@@ -24013,13 +23412,20 @@ impl AppData {
                     // 重なり得るので、全 note を勝者として重なりを解消する。
                     let all: Vec<u32> = (0..notes.len() as u32).collect();
                     resolve_note_overlaps(&mut notes, &all);
-                    ClipContent::Midi(MidiContent { notes })
+                    // v29: merged content では note id を振り直す (上の Audio と同理)。
+                    for (i, n) in notes.iter_mut().enumerate() {
+                        n.id = i as u32 + 1;
+                    }
+                    ClipContent::Midi(MidiContent {
+                        next_note_id: notes.len() as u32 + 1,
+                        notes,
+                    })
                 }
             };
-            self.song.clip_contents.insert(new_content_id, new_content);
+            self.edit_song(|song| song.clip_contents.insert(new_content_id, new_content));
             // merged clip の名前は content_id 単位 SSoT へ。
             if !combined_name.is_empty() {
-                self.song
+                self.song_doc.song()
                     .set_content_name(new_content_id, combined_name.clone());
             }
 
@@ -24027,7 +23433,7 @@ impl AppData {
             // source clip の声を採用 (複数声混在時のポリシー)。 source 削除前に capture。
             // merged clip の mute も代表 (最早) source clip の値を採用 (声と同ポリシー)。
             let (glue_speaker, glue_singer, glue_style, glue_talk, glue_muted) = {
-                let track = &self.song.tracks[track_idx as usize];
+                let track = &self.song_doc.song().tracks[track_idx as usize];
                 refs.iter()
                     .map(|r| r.clip as usize)
                     .min()
@@ -24045,7 +23451,7 @@ impl AppData {
             };
             // Remove source clips (descending index to keep earlier
             // indices stable).
-            let track = &mut self.song.tracks[track_idx as usize];
+            let track = &mut self.song_doc.song().tracks[track_idx as usize];
             let mut indices: Vec<usize> =
                 refs.iter().map(|r| r.clip as usize).collect();
             indices.sort_unstable();
@@ -24082,23 +23488,23 @@ impl AppData {
 
         if had_mixed_kind {
             tracing::warn!("Glue rejected: mixed kinds");
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Glue: MIDI / Audio / Video / Image / Vocal clip が混在しているため Glue できません"
                     .into();
             return;
         }
         if glued_count == 0 {
             tracing::warn!("Glue: glued_count==0 (no track had 2+ clips)");
-            self.status_message =
+            self.ui_ephemeral.status_message =
                 "Glue: 同じ track 上で 2 つ以上の clip を選択してください".into();
             return;
         }
 
         tracing::info!(glued_count, ?new_refs, "Glue completed");
         self.select_new_clips(&new_refs);
-        self.selected_notes.clear();
-        self.status_message = format!("Glue: {glued_count} 箇所を結合しました");
-        self.is_dirty = true;
+        self.selection.selected_notes.clear();
+        self.ui_ephemeral.status_message = format!("Glue: {glued_count} 箇所を結合しました");
+        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
     }
 }
@@ -24859,6 +24265,7 @@ mod note_duplicate_tests {
 
     fn note(start: f64, dur: f64, pitch: u8) -> Note {
         Note {
+            id: 0,
             start_beat: start,
             duration_beats: dur,
             pitch,
@@ -24970,6 +24377,7 @@ mod note_overlap_tests {
 
     fn note(start: f64, dur: f64, pitch: u8) -> Note {
         Note {
+            id: 0,
             start_beat: start,
             duration_beats: dur,
             pitch,

@@ -78,7 +78,7 @@ const SCRUB_STYLE_GROUP: ScrubableNumberStyle = ScrubableNumberStyle {
 /// drag / text 編集の開始・終了 edge で `BeginInspectorScrub` /
 /// `EndInspectorScrub` を発火して一連の操作を undo 1 step に bracket する
 /// (= Group Transform セクションと同 idiom)。 `scrub_key` は
-/// `app.inspector_scrub_active` の識別に使う。
+/// `app.ui_ephemeral.inspector_scrub_active` の識別に使う。
 #[allow(clippy::too_many_arguments)]
 fn scrub_field(
     ui: &mut Ui<'_, AppData>,
@@ -136,15 +136,15 @@ fn scrub_field(
     );
     // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
     let active = resp.dragging || resp.editing_text;
-    let was_active = app.inspector_scrub_active == Some(scrub_key);
+    let was_active = app.ui_ephemeral.inspector_scrub_active == Some(scrub_key);
     if active && !was_active {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.inspector_scrub_active = Some(scrub_key);
+            app.ui_ephemeral.inspector_scrub_active = Some(scrub_key);
             app.handle_event(AppEvent::BeginInspectorScrub);
         }));
     } else if !active && was_active {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.inspector_scrub_active = None;
+            app.ui_ephemeral.inspector_scrub_active = None;
             app.handle_event(AppEvent::EndInspectorScrub);
         }));
     }
@@ -498,7 +498,7 @@ fn mod_retrigger_toggle(
 
 /// モジュレーションラックを **スクロール viewport の top-down
 /// フロー** で描く (旧: 下端 pinned・2 個 cap)。各ソースは折りたたみ行で、クリックで
-/// クリックで大きなグラフィカルエディタに展開する (`app.expanded_mod_sources`、 複数同時可)。
+/// クリックで大きなグラフィカルエディタに展開する (`app.ui_ephemeral.expanded_mod_sources`、 複数同時可)。
 /// 戻り値は描画後の `y`。
 #[allow(clippy::too_many_lines)]
 fn draw_modulation_rack(
@@ -521,8 +521,8 @@ fn draw_modulation_rack(
         ..SCRUB_STYLE_INSPECTOR
     };
     // ライブカーソル用の transport 位置。
-    let beat = f64::from(app.playhead_beat.unwrap_or(0.0));
-    let secs = beat * 60.0 / f64::from(app.song.bpm.max(1.0));
+    let beat = f64::from(app.transport.playhead_beat.unwrap_or(0.0));
+    let secs = beat * 60.0 / f64::from(app.song_doc.song().bpm.max(1.0));
 
     ui.label_at("inspector_mod_label", "Modulation", lx, y, 12.0, TEXT);
     // [+ ▾] add-menu — 種別を選んで作成。
@@ -563,7 +563,7 @@ fn draw_modulation_rack(
     for (i, src) in mod_sources.iter().enumerate() {
         let sid = src.id;
         let i_u = i as u32;
-        let expanded = app.expanded_mod_sources.contains(&sid);
+        let expanded = app.ui_ephemeral.expanded_mod_sources.contains(&sid);
 
         // --- header row: [▸/▾][name/track] [meter] [arm] [×] ---
         let rm_rect = Rect { x: area.x + area.w - pad - 20.0, y, w: 20.0, h: 20.0 };
@@ -574,14 +574,14 @@ fn draw_modulation_rack(
         ui.label_at(("inspector_mod_src_meter", i), &meter, meter_x, y + 4.0, 11.0, TEXT);
         let arm_w = 24.0;
         let arm_x = meter_x - 4.0 - arm_w;
-        let armed = app.armed_mod_source == Some(sid);
+        let armed = app.ui_ephemeral.armed_mod_source == Some(sid);
         ui.button_at(
             ("inspector_mod_src_arm", i),
             if armed { "\u{25c9}" } else { "\u{25cb}" },
             Rect { x: arm_x, y, w: arm_w, h: 20.0 },
             move || {
                 Edit::mutate(move |app: &mut AppData| {
-                    let next = if app.armed_mod_source == Some(sid) { None } else { Some(sid) };
+                    let next = if app.ui_ephemeral.armed_mod_source == Some(sid) { None } else { Some(sid) };
                     app.handle_event(AppEvent::SetArmedModSource(next));
                 })
             },
@@ -594,8 +594,8 @@ fn draw_modulation_rack(
             move || {
                 Edit::mutate(move |app: &mut AppData| {
                     // multi-expand: 既に開いていれば閉じる、 でなければ追加 (複数同時可)。
-                    if !app.expanded_mod_sources.insert(sid) {
-                        app.expanded_mod_sources.remove(&sid);
+                    if !app.ui_ephemeral.expanded_mod_sources.insert(sid) {
+                        app.ui_ephemeral.expanded_mod_sources.remove(&sid);
                     }
                 })
             },
@@ -1101,7 +1101,7 @@ fn draw_modulation_rack(
     }
 
     // drag-end edge で sync (scrub 中は dirty のみ)。
-    if any_mod_drag != app.mod_follower_scrub_active {
+    if any_mod_drag != app.ui_ephemeral.mod_follower_scrub_active {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::SetModFollowerScrubbing(any_mod_drag));
         }));
@@ -1129,9 +1129,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // v18 (`docs/plan_track_clip_color.md`): タイトル行右端に track 色スウォッチ。
     // 単一トラック選択時のみ表示し、クリックで color_picker を開く (anchor =
     // スウォッチ rect)。effective 色 (上書き or id 由来の導出色) を塗る。
-    if app.selected_track_ids.len() <= 1
+    if app.selection.selected_track_ids.len() <= 1
         && let Some(idx) = app.cursor_track_index()
-        && let Some(track) = app.song.tracks.get(idx)
+        && let Some(track) = app.song_doc.song().tracks.get(idx)
     {
         let track_id = track.id;
         let swatch = Rect { x: area.x + area.w - pad - 20.0, y: y - 2.0, w: 20.0, h: 20.0 };
@@ -1167,7 +1167,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     const CHAIN_MIN_H: f32 = 160.0;
     let body_top = y;
     let max_param_h = (area.y + area.h - body_top - CHAIN_MIN_H).max(0.0);
-    let content_h = app.inspector_body_h.max(1.0);
+    let content_h = app.ui_ephemeral.inspector_body_h.max(1.0);
     // param viewport の高さは **常に最大** に固定する。 旧実装は
     // `content_h.min(max_param_h)` で content に追従させていたため、 device の
     // 「Par」パラメータパネルを開くと content_h が増えて viewport が伸び、
@@ -1194,7 +1194,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 次 frame で正しい formatted 値に書き戻る (= 体感的にちらつかない)。
         // 同じ Clip を選択し直しただけでは target は変わらない (=
         // ResyncClipEditBuffers が無駄に走らない)。
-        if app.clip_edit_buffer_target != Some(summary.target) {
+        if app.ui_ephemeral.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ResyncClipEditBuffers(target));
@@ -1485,7 +1485,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // section と同 idiom)。 image clip 切替後に 1 frame だけ古い
         // buffer が表示されるが、 直後の frame で formatted な現値に
         // 書き戻る。
-        if app.clip_edit_buffer_target != Some(summary.target) {
+        if app.ui_ephemeral.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ResyncClipEditBuffers(target));
@@ -1916,12 +1916,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 開いているデバイスの chain device_index (open_plugin_params / open_video_fx_params、
         // cursor track 上のものだけ)。
         let open_dev: Option<u32> = app
-            .open_plugin_params
-            .or(app.open_video_fx_params)
+            .ui_ephemeral.open_plugin_params
+            .or(app.ui_ephemeral.open_video_fx_params)
             .filter(|(t, _)| Some(*t) == cursor_tid)
             .map(|(_, idx)| idx);
-        let panel_h = if app.inspector_device_panel_h > 1.0 {
-            app.inspector_device_panel_h
+        let panel_h = if app.ui_ephemeral.inspector_device_panel_h > 1.0 {
+            app.ui_ephemeral.inspector_device_panel_h
         } else {
             280.0 // 初回 bootstrap: expansion を 1 度描かせて実測させる
         };
@@ -2134,15 +2134,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             mod_widget::push_mod_drag_resync(ui, app, track_id, &g_target, resp.mod_dragging);
             // drag / text 編集の開始・終了 edge で undo を 1 step に bracket。
             let active = resp.dragging || resp.editing_text;
-            let was_active = app.group_scrub_active == Some(param);
+            let was_active = app.ui_ephemeral.group_scrub_active == Some(param);
             if active && !was_active {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.group_scrub_active = Some(param);
+                    app.ui_ephemeral.group_scrub_active = Some(param);
                     app.handle_event(AppEvent::BeginGroupTransformDrag);
                 }));
             } else if !active && was_active {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.group_scrub_active = None;
+                    app.ui_ephemeral.group_scrub_active = None;
                     app.handle_event(AppEvent::EndGroupTransformDrag);
                 }));
             }
@@ -2182,6 +2182,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let input_w = (row_w - label_w).max(40.0);
         let track_id = view.track_id;
         let device_index = view.device_index;
+        // v29: lane target は安定 device_id。 0 (未解決 — panel が開いている限り
+        // 起きないはず) は lane に一致しない sentinel なので表示 fallback として無害。
+        let device_id =
+            crate::app::device_id_at(&app.song_doc.song(), track_id, device_index).unwrap_or(0);
         for (i, param) in view.def.params.iter().enumerate() {
             let value = f64::from(view.values[i]);
             let (min, max) = param.kind.range();
@@ -2193,8 +2197,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let style =
                 ScrubableNumberStyle { sensitivity: sens, range: Some((min, max)), ..SCRUB_STYLE_GROUP };
             let target = AutomationTarget::PluginParam {
-                device_index,
+                device_id,
                 param_id: param.id,
+                legacy_device_index: None,
                 legacy_slot: None,
             };
             let domain = crate::app::ModControlDomain::Ranged { min, max, log: param.kind.is_log() };
@@ -2226,15 +2231,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // SetVideoFxParam は非 undoable、stroke 先頭で 1 snapshot）。
             let active = resp.dragging || resp.editing_text;
             let scrub_key = crate::app::InspectorScrubField::VideoFx { device_index, param_id };
-            let was_active = app.inspector_scrub_active == Some(scrub_key);
+            let was_active = app.ui_ephemeral.inspector_scrub_active == Some(scrub_key);
             if active && !was_active {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.inspector_scrub_active = Some(scrub_key);
+                    app.ui_ephemeral.inspector_scrub_active = Some(scrub_key);
                     app.handle_event(AppEvent::BeginInspectorScrub);
                 }));
             } else if !active && was_active {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.inspector_scrub_active = None;
+                    app.ui_ephemeral.inspector_scrub_active = None;
                     app.handle_event(AppEvent::EndInspectorScrub);
                 }));
             }
@@ -2253,6 +2258,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     if let Some(view) = app.inspector_plugin_params() {
         let device_index = view.device_index;
         let track_id = view.track_id;
+        // v29: lane target は安定 device_id (上の video FX パネルと同じ fallback)。
+        let device_id =
+            crate::app::device_id_at(&app.song_doc.song(), track_id, device_index).unwrap_or(0);
         ui.label_at("inspector_pp_label", &view.plugin_name, area.x + pad, y, 12.0, TEXT);
         y += 18.0;
 
@@ -2280,8 +2288,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ..SCRUB_STYLE_GROUP
             };
             let target = AutomationTarget::PluginParam {
-                device_index,
+                device_id,
                 param_id: p.id,
+                legacy_device_index: None,
                 legacy_slot: None,
             };
             let domain = crate::app::ModControlDomain::Ranged { min, max, log: false };
@@ -2318,15 +2327,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // (映像 FX と違い audio plugin は daw_audio が lane を読むため要 push)。
             let active = resp.dragging || resp.editing_text;
             let scrub_key = crate::app::InspectorScrubField::PluginParam { device_index, param_id };
-            let was_active = app.inspector_scrub_active == Some(scrub_key);
+            let was_active = app.ui_ephemeral.inspector_scrub_active == Some(scrub_key);
             if active && !was_active {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.inspector_scrub_active = Some(scrub_key);
+                    app.ui_ephemeral.inspector_scrub_active = Some(scrub_key);
                     app.handle_event(AppEvent::BeginInspectorScrub);
                 }));
             } else if !active && was_active {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.inspector_scrub_active = None;
+                    app.ui_ephemeral.inspector_scrub_active = None;
                     app.handle_event(AppEvent::EndInspectorScrub);
                     // 確定値を host へ push (drag 終端なので is_dragging=false → 実 push)。
                     app.sync_song_to_plugin_host();
@@ -2353,7 +2362,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // テキスト編集は失われない。
     let text_track_has_subtitle = app
         .selected_clip_ref()
-        .and_then(|r| app.song.tracks.get(r.track as usize))
+        .and_then(|r| app.song_doc.song().tracks.get(r.track as usize))
         .is_some_and(common::model::Track::has_subtitle_device);
     // 字幕 device の「Par」を押したときだけ Text Event 欄を出す
     // (= 専用欄を常時表示せず Par パネルに集約)。
@@ -2361,7 +2370,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         && app.subtitle_param_panel_open()
         && let Some(summary) = app.inspector_text_event_summary()
     {
-        if app.clip_edit_buffer_target != Some(summary.target) {
+        if app.ui_ephemeral.clip_edit_buffer_target != Some(summary.target) {
             let target = summary.target;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ResyncClipTextEditBuffers(target));
@@ -2420,7 +2429,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let text_resp = ui.text_input_at(
             "inspector_text_content_input",
             Rect { x: input_x, y, w: string_input_w, h: input_h },
-            &app.clip_text_content_edit_text,
+            &app.ui_ephemeral.clip_text_content_edit_text,
             |s| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ClipTextContentEditChanged(s))
@@ -2446,10 +2455,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             11.0,
             TEXT,
         );
-        let font_btn_label = if app.clip_text_font_family_edit_text.is_empty() {
+        let font_btn_label = if app.ui_ephemeral.clip_text_font_family_edit_text.is_empty() {
             "(default)".to_string()
         } else {
-            app.clip_text_font_family_edit_text.clone()
+            app.ui_ephemeral.clip_text_font_family_edit_text.clone()
         };
         if ui.button_at_clicked(
             "inspector_text_font_button",
@@ -2712,11 +2721,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 声は per-clip (`Clip::speaker_id`) が SSoT、 SetClipVoice で焼き込む。
     if app.voicevox_param_panel_open()
         && let Some(r) = app.selected_clip_ref()
-        && let Some(track) = app.song.tracks.get(r.track as usize)
+        && let Some(track) = app.song_doc.song().tracks.get(r.track as usize)
         && track.is_voicevox_vocal()
         && let Some(clip) = track.clips.get(r.clip as usize)
         && app
-            .song
+            .song_doc.song()
             .clip_contents
             .get(&clip.content_id)
             .is_none_or(|c| matches!(c, common::model::ClipContent::Midi(_)))
@@ -2729,7 +2738,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 現在の声の表示名: clip 焼き込み名 → speaker_id 逆引き → アプリ既定。
         let (cur_singer, cur_style) = if !clip.singer_name.is_empty() {
             (clip.singer_name.clone(), clip.style_name.clone())
-        } else if let Some(found) = app.singers.iter().find_map(|s| {
+        } else if let Some(found) = app.voicevox.singers.iter().find_map(|s| {
             s.styles
                 .iter()
                 .find(|st| st.id == cur_speaker)
@@ -2753,7 +2762,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         );
         y += 18.0;
 
-        if app.singers.is_empty() {
+        if app.voicevox.singers.is_empty() {
             // engine 未起動 / 一覧未取得: 焼き込み声名 + 取得中。 声名は常に出せる。
             let txt = format!("{cur_singer} - {cur_style}  (一覧取得中…)");
             ui.label_at(
@@ -2768,9 +2777,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         } else {
             // 上段: キャラ dropdown。
             let char_labels: Vec<&str> =
-                app.singers.iter().map(|s| s.name.as_str()).collect();
+                app.voicevox.singers.iter().map(|s| s.name.as_str()).collect();
             let cur_char_idx = app
-                .singers
+                .voicevox.singers
                 .iter()
                 .position(|s| s.name == cur_singer)
                 .unwrap_or(0);
@@ -2789,8 +2798,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             y += 28.0;
 
             // 下段: スタイル dropdown (= 上段で選んだ or 現在のキャラの styles)。
-            let char_idx = picked_char.unwrap_or(cur_char_idx).min(app.singers.len() - 1);
-            let singer = &app.singers[char_idx];
+            let char_idx = picked_char.unwrap_or(cur_char_idx).min(app.voicevox.singers.len() - 1);
+            let singer = &app.voicevox.singers[char_idx];
             let style_labels: Vec<&str> =
                 singer.styles.iter().map(|st| st.name.as_str()).collect();
             let cur_style_idx = singer
@@ -2815,7 +2824,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // 確定値: キャラを変えたらそのキャラの先頭 style、 style を変えたら
             // その style を採用 (= (speaker_id, singer_name, style_name))。
             let chosen: Option<(u32, String, String)> = if let Some(pc) = picked_char {
-                app.singers.get(pc).and_then(|s| {
+                app.voicevox.singers.get(pc).and_then(|s| {
                     s.styles
                         .first()
                         .map(|st| (st.id, s.name.clone(), st.name.clone()))
@@ -2865,11 +2874,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // を talk style として流用 (SetClipVoice で焼き込み)。スケールは `Clip::talk`。
     if app.voicevox_param_panel_open()
         && let Some(r) = app.selected_clip_ref()
-        && let Some(track) = app.song.tracks.get(r.track as usize)
+        && let Some(track) = app.song_doc.song().tracks.get(r.track as usize)
         && track.is_voicevox_vocal()
         && let Some(clip) = track.clips.get(r.clip as usize)
         && app
-            .song
+            .song_doc.song()
             .clip_contents
             .get(&clip.content_id)
             .is_some_and(|c| matches!(c, common::model::ClipContent::Text(_)))
@@ -2885,7 +2894,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let (cur_char, cur_style) = if !clip.singer_name.is_empty() {
             (clip.singer_name.clone(), clip.style_name.clone())
         } else {
-            app.talk_speakers
+            app.voicevox.talk_speakers
                 .iter()
                 .find_map(|s| {
                     s.styles
@@ -2934,7 +2943,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 持つので、ここは字幕 device 無し (= 喋るが映さない talk-only) のときだけ出し、
         // 二重入力を避ける。編集 buffer / events は overlay と共用 (同時表示しないので競合せず)。
         if !has_subtitle {
-            if app.clip_edit_buffer_target != Some(r) {
+            if app.ui_ephemeral.clip_edit_buffer_target != Some(r) {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ResyncClipTextEditBuffers(r));
                 }));
@@ -2955,7 +2964,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     w: area.w - pad * 2.0 - 48.0,
                     h: 22.0,
                 },
-                &app.clip_text_content_edit_text,
+                &app.ui_ephemeral.clip_text_content_edit_text,
                 |s| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::ClipTextContentEditChanged(s))
@@ -2972,7 +2981,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
 
         // talk 話者 picker (キャラ → talk style)。
-        if app.talk_speakers.is_empty() {
+        if app.voicevox.talk_speakers.is_empty() {
             let txt = if cur_char.is_empty() {
                 "(talk 声一覧 取得中…)".to_string()
             } else {
@@ -2989,13 +2998,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             y += 26.0;
         } else {
             let char_labels: Vec<&str> =
-                app.talk_speakers.iter().map(|s| s.name.as_str()).collect();
+                app.voicevox.talk_speakers.iter().map(|s| s.name.as_str()).collect();
             let cur_char_idx = app
-                .talk_speakers
+                .voicevox.talk_speakers
                 .iter()
                 .position(|s| s.name == cur_char)
                 .or_else(|| {
-                    app.talk_speakers
+                    app.voicevox.talk_speakers
                         .iter()
                         .position(|s| s.styles.iter().any(|st| st.id == cur_speaker))
                 })
@@ -3012,8 +3021,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
             let char_idx = picked_char
                 .unwrap_or(cur_char_idx)
-                .min(app.talk_speakers.len() - 1);
-            let speaker = &app.talk_speakers[char_idx];
+                .min(app.voicevox.talk_speakers.len() - 1);
+            let speaker = &app.voicevox.talk_speakers[char_idx];
             let style_labels: Vec<&str> =
                 speaker.styles.iter().map(|st| st.name.as_str()).collect();
             let cur_style_idx = speaker
@@ -3036,7 +3045,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             y += 28.0;
 
             let chosen: Option<(u32, String, String)> = if let Some(pc) = picked_char {
-                app.talk_speakers.get(pc).and_then(|s| {
+                app.voicevox.talk_speakers.get(pc).and_then(|s| {
                     s.styles
                         .first()
                         .map(|st| (st.id, s.name.clone(), st.name.clone()))
@@ -3130,15 +3139,15 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // Ctrl+Z で戻せない (review)。
             let scrub_key = crate::app::InspectorScrubField::Talk(kind);
             let active = resp.dragging || resp.editing_text;
-            let was_active = app.inspector_scrub_active == Some(scrub_key);
+            let was_active = app.ui_ephemeral.inspector_scrub_active == Some(scrub_key);
             if active && !was_active {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.inspector_scrub_active = Some(scrub_key);
+                    app.ui_ephemeral.inspector_scrub_active = Some(scrub_key);
                     app.handle_event(AppEvent::BeginInspectorScrub);
                 }));
             } else if !active && was_active {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.inspector_scrub_active = None;
+                    app.ui_ephemeral.inspector_scrub_active = None;
                     app.handle_event(AppEvent::EndInspectorScrub);
                 }));
             }
@@ -3160,7 +3169,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // VOICEVOX device の「Par」を押したときだけ出す (= 専用欄を常時
     // 表示せず Par パネルに集約。声 / 話速 / 口パク先をまとめて 1 箇所で編集)。
     if app.voicevox_param_panel_open()
-        && let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i))
+        && let Some(track) = cursor_idx.and_then(|i| app.song_doc.song().tracks.get(i))
         && track.is_voicevox_vocal()
     {
         let self_id = track.id;
@@ -3170,7 +3179,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let mut candidate_ids: Vec<u32> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         labels.push("(なし)".into());
-        for t in app.song.tracks.iter().filter(|t| t.id != self_id) {
+        for t in app.song_doc.song().tracks.iter().filter(|t| t.id != self_id) {
             candidate_ids.push(t.id);
             labels.push(if t.name.is_empty() {
                 format!("Track {}", t.id)
@@ -3225,9 +3234,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 // ====== /device param panel ======
                 // 展開部の実消費高を測って次フレームの row_extra_h に使う (lag-by-one)。
                 let measured = (y - panel_top).max(0.0);
-                if (app.inspector_device_panel_h - measured).abs() > 0.5 {
-                    ui.push_edit(Edit::mutate(move |a: &mut AppData| {
-                        a.inspector_device_panel_h = measured;
+                if (app.ui_ephemeral.inspector_device_panel_h - measured).abs() > 0.5 {
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.ui_ephemeral.inspector_device_panel_h = measured;
                     }));
                 }
             },
@@ -3240,10 +3249,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ---- 口パク mapping (口形状 → 画像) -------------------------------
     // この track を口パク出力先に指定している vocal track があるとき、7 形状
     // (a/i/u/e/o/N/閉口) の画像割当を表示する。各 slot は import 済み image を選ぶ。
-    if let Some(track) = cursor_idx.and_then(|i| app.song.tracks.get(i)) {
+    if let Some(track) = cursor_idx.and_then(|i| app.song_doc.song().tracks.get(i)) {
         let this_id = track.id;
         let is_target = app
-            .song
+            .song_doc.song()
             .tracks
             .iter()
             .any(|t| t.lipsync_target_track == Some(this_id));
@@ -3261,7 +3270,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // image_ids[k] と labels[k+1] が対応 (labels[0] = "(なし)" sentinel)。
             // ラベル文字列を別 Vec へ再 clone せず、 ソート後そのまま labels へ move する。
             let mut images: Vec<(common::model::ImageSourceId, String)> = app
-                .song
+                .song_doc.song()
                 .image_sources
                 .iter()
                 .map(|(id, src)| (*id, image_source_label(src)))
@@ -3346,9 +3355,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     });
     // 測定した param 実高さを次フレーム用に保存 (変化時のみ edit を積む)。
     let measured = measured_body_h.get();
-    if (app.inspector_body_h - measured).abs() > 0.5 {
+    if (app.ui_ephemeral.inspector_body_h - measured).abs() > 0.5 {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.inspector_body_h = measured;
+            app.ui_ephemeral.inspector_body_h = measured;
         }));
     }
     // chain band (下端 pinned): sidechain / modulation / 下端ボタン。 chain list 本体と

@@ -24,7 +24,7 @@ use ara_sys::{
     ARAPlaybackTransformationFlags, ARAPlugInExtensionInstance, ARARegionSequenceRef,
     kARAPlaybackTransformationTimestretch,
 };
-use common::protocol::{AraClipSpec, AraRegionUpdate, AraSourceSpec};
+use common::protocol::{AraClipSpec, AraRegionUpdate};
 
 use crate::ara::audio_source::AraAudioSourceHost;
 use crate::ara::document::AraDocumentController;
@@ -32,8 +32,10 @@ use crate::ara::extension::AraPlugInExtension;
 use crate::ara::host_controllers::AraMusicalContextHost;
 
 // The clip/source spec is defined once in `common::protocol`
-// ([`AraClipSpec`] / [`AraSourceSpec`]) since it crosses the IPC boundary; this
-// module consumes it directly.
+// ([`AraClipSpec`]) since it crosses the IPC boundary; this module consumes
+// it directly. v29: the source is always an absolute WAV path
+// (`AraClipSpec::source_wav`) — the in-memory `Pcm` variant was removed
+// (`docs/plan_arch_refactor.md` §2).
 
 /// A host model source + its plug-in-side refs, owned for the session's life.
 struct OwnedAraSource {
@@ -296,16 +298,7 @@ unsafe fn build_source(
     clip: &AraClipSpec,
     time_stretch: bool,
 ) -> Result<OwnedAraSource> {
-    let host = Box::new(match &clip.source {
-        AraSourceSpec::WavFile(path) => AraAudioSourceHost::from_wav_file(path)?,
-        AraSourceSpec::Pcm {
-            samples,
-            sample_rate,
-            channel_count,
-        } => {
-            AraAudioSourceHost::from_interleaved(samples.clone().into(), *sample_rate, *channel_count)
-        }
-    });
+    let host = Box::new(AraAudioSourceHost::from_wav_file(&clip.source_wav)?);
 
     // The boxed host's address is the opaque host ref the plug-in passes back.
     let host_ref: ARAAudioSourceHostRef = (std::ptr::from_ref::<AraAudioSourceHost>(&host)) as _;

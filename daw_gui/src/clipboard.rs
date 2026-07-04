@@ -336,6 +336,7 @@ mod tests {
 
     fn note(start: f64, dur: f64, pitch: u8, vel: u8) -> Note {
         Note {
+            id: 0,
             start_beat: start,
             duration_beats: dur,
             pitch,

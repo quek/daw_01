@@ -3,7 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 
@@ -16,7 +16,7 @@ static GLOBAL: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 use common::audio_bridge::AudioBridgeHandle;
 use common::meter::compute_block_peak;
 use common::metrics_bridge::MetricsBridgeHandle;
-use common::protocol::{ChildKind, ChildToMain, MainToChild};
+use common::protocol::{AudioCommand, AudioEvent};
 use common::wire::{read_msg, write_msg};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::io::ReadHalf;
@@ -28,10 +28,15 @@ mod automation;
 mod engine;
 mod export;
 mod graph;
+mod metronome;
 mod mixer;
 mod sequencer;
 
-use engine::{EngineShared, LocalState, PlaybackCommand, SharedState};
+use engine::{
+    EngineCommand, EngineShared, LocalState, PlaybackCommand, PluginEntry, RtBundle, SharedState,
+    SyncSlot, WorkerRig,
+};
+use graph::{DelayLine, Schedule, compile_schedule};
 
 /// A1 (r.md #8): 出力ストリームを開く前にデフォルト出力デバイスの実サンプルレートを
 /// 問い合わせる (stream は開かない)。 Hello で親へ報告し、 session.sample_rate の SSoT に
@@ -43,7 +48,8 @@ fn query_default_output_sample_rate() -> Option<u32> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let device = cpal::default_host().default_output_device()?;
     let config = device.default_output_config().ok()?;
-    Some(config.sample_rate().0)
+    // cpal 0.17: `sample_rate()` は raw `u32` を返す (SampleRate newtype 廃止)。
+    Some(config.sample_rate())
 }
 
 #[tokio::main]
@@ -56,12 +62,13 @@ async fn main() -> Result<()> {
         .context("expected pipe name as first argument")?;
 
     // A1 (r.md #8): デバイス実レートを Hello で親へ報告 → session.sample_rate の SSoT。
+    // Hello には PROTOCOL_FINGERPRINT が同梱され、親がビルド世代を検証する (§3)。
     let device_sample_rate = query_default_output_sample_rate();
     let mut pipe =
-        common::client::perform_handshake(&pipe_name, ChildKind::Audio, device_sample_rate).await?;
+        common::client::perform_audio_handshake(&pipe_name, device_sample_rate).await?;
     tracing::info!(?device_sample_rate, "daw_audio handshake complete");
 
-    let session = common::client::read_session(&mut pipe).await?;
+    let session = common::client::read_audio_session(&mut pipe).await?;
     tracing::info!(?session, "audio session ready");
 
     let bridge = Arc::new(
@@ -75,43 +82,34 @@ async fn main() -> Result<()> {
     );
 
     let shared = Arc::new(SharedState::new());
-    // Engine resources shared between the CPAL closure and (in A3) the
-    // export thread. Held by `LocalState` for the audio path; export
-    // will hold its own clone.
+    // Engine resources shared between the CPAL closure, the export thread and
+    // the notify thread.
     let engine_shared = Arc::new(EngineShared::new());
-    // Master gain stays a separate atomic from `SharedState` because the
-    // CPAL closure applies it on the device-final samples (post-engine).
-    let master_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
 
-    // AudioCommand channel: the receive loop pushes handle-bearing
-    // commands (OpenWorkerPool / OpenPluginShmem / ClosePluginShmem)
-    // into this; the audio thread drains it at the top of every buffer.
-    let (cmd_tx, cmd_rx) =
-        tokio::sync::mpsc::unbounded_channel::<engine::AudioCommand>();
+    // Preview channel: the receive loop pushes keyboard-preview notes here;
+    // the audio thread drains it at the top of every buffer. shmem / worker
+    // pool の重い扱いは bundle ring 経由に移設済 (plan §4)。
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<EngineCommand>();
 
-    // D1 / PR3: wait-free SPSC for the audio thread to hand superseded routing
-    // snapshots back to the receive loop for disposal, so neither the off-thread
-    // `compile_schedule` (alloc) nor the old snapshot's `Drop` (free) runs on the
-    // audio callback. 64 slots is far above the edits-between-drains a human can
-    // produce; the receive loop drains it on every command.
-    let (routing_recycle_tx, routing_recycle_rx) =
-        rtrb::RingBuffer::<engine::CompiledRouting>::new(64);
-    // Forward ring: the receive loop pushes freshly off-thread-compiled routing
-    // here, the audio thread pops the newest. Small — the audio thread drains it
-    // every buffer, so it never holds more than the edits landed in one ~10 ms
-    // window.
-    let (routing_tx, routing_rx) = rtrb::RingBuffer::<engine::CompiledRouting>::new(8);
+    // plan §4: wait-free SPSC pair for RT snapshot delivery. The receive loop
+    // builds `RtBundle`s (schedule compile / plugin_refs rebuild / worker pool
+    // spawn — all off-thread) and pushes them on the forward ring; the audio
+    // thread pops the newest and ships the superseded bundle back on the
+    // recycle ring, so `Drop` (free / shmem unmap / worker join) never runs on
+    // the CPAL callback. 64 recycle slots is far above the edits-between-
+    // drains a human can produce; the receive loop drains it on every message.
+    let (bundle_tx, bundle_rx) = rtrb::RingBuffer::<RtBundle>::new(8);
+    let (bundle_recycle_tx, bundle_recycle_rx) = rtrb::RingBuffer::<RtBundle>::new(64);
 
     let _stream = start_output_stream(
         Arc::clone(&shared),
         Arc::clone(&engine_shared),
         Arc::clone(&bridge),
         Arc::clone(&metrics),
-        Arc::clone(&master_gain),
         session.sample_rate,
         cmd_rx,
-        routing_rx,
-        routing_recycle_tx,
+        bundle_rx,
+        bundle_recycle_tx,
     )
     .context("failed to start audio stream")?;
     tracing::info!("audio stream running");
@@ -121,16 +119,20 @@ async fn main() -> Result<()> {
     // daw_gui. `out_rx` drains the queue on a single tokio task so the
     // pipe writer is single-owner.
     let (read_half, mut write_half) = tokio::io::split(pipe);
-    let (out_tx, mut out_rx) =
-        tokio::sync::mpsc::unbounded_channel::<ChildToMain>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<AudioEvent>();
     tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if let Err(e) = write_msg(&mut write_half, &msg).await {
-                tracing::error!(error = ?e, "failed to send ChildToMain from daw_audio");
+                tracing::error!(error = ?e, "failed to send AudioEvent from daw_audio");
                 break;
             }
         }
     });
+
+    // plan §4: RT からは pipe に書けない (I/O 禁止) ので、 quarantine / pool
+    // stall / MMCSS 失敗のフラグを 100ms 周期で poll して GUI へ通知する
+    // 専用スレッド。 dedup は per-entry / per-rig の AtomicBool swap。
+    spawn_notify_thread(Arc::clone(&engine_shared), out_tx.clone());
 
     // Background decode worker (r.md #7 decode 再設計 B): keeps large WAV
     // decodes off the tokio receive loop. The receive loop publishes a
@@ -150,13 +152,12 @@ async fn main() -> Result<()> {
         read_half,
         shared,
         Arc::clone(&engine_shared),
-        master_gain,
         session.sample_rate,
         cmd_tx,
         out_tx,
         decode_tx,
-        routing_tx,
-        routing_recycle_rx,
+        bundle_tx,
+        bundle_recycle_rx,
     )
     .await;
     tracing::info!("daw_audio exiting");
@@ -205,7 +206,7 @@ fn decode_worker_loop(
         );
         // Publish only if no newer schedule has landed while we decoded
         // (mutex-guarded so the generation check and the store are atomic).
-        publish_schedule(&engine_shared, job.generation, full);
+        publish_audio_clip_schedule(&engine_shared, job.generation, full);
     }
 }
 
@@ -216,7 +217,7 @@ fn decode_worker_loop(
 /// decode (the bare `schedule_generation` re-check has a TOCTOU window between
 /// its load and the `store`). Off the audio thread — the CPAL callback only ever
 /// `load()`s the `ArcSwap`, never this mutex (r.md #7 B)。
-fn publish_schedule(
+fn publish_audio_clip_schedule(
     engine_shared: &EngineShared,
     generation: u64,
     renderer: audio_clip_renderer::AudioClipRenderer,
@@ -231,39 +232,217 @@ fn publish_schedule(
     }
 }
 
-/// Compile the routing schedule + tempo map for `song` **off the audio thread**
-/// and publish them (bundled with the song) into `EngineShared::pending_routing`
-/// for the RT thread to swap in with zero allocation (D1 / PR3 — the alloc that
-/// used to run in `LocalState::refresh_schedule` on the audio callback). Also
-/// refreshes the separately-published `shared.song` that off-thread readers
-/// (preview helpers, `update_song_track`) consult. A `compile_schedule` failure
-/// falls back to an empty schedule (silent master) so a broken graph is audible
-/// as silence rather than mysterious audio — mirroring the old RT-side behavior.
-fn publish_routing(
-    routing_tx: &mut rtrb::Producer<engine::CompiledRouting>,
-    shared: &engine::SharedState,
-    song: Arc<common::model::Song>,
-    sample_rate: u32,
+/// plan §4: quarantine / pool stall / MMCSS 失敗フラグを 100ms 周期で poll
+/// して GUI へ `AudioEvent` を送る通知スレッド (RT からは atomic store のみ)。
+/// フラグの SSoT は `PluginEntry` / `WorkerRig` / `EngineShared` 上の
+/// AtomicBool で、 dedup は `*_notified` の swap。
+fn spawn_notify_thread(
+    engine_shared: Arc<EngineShared>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
 ) {
-    let schedule = match crate::graph::compile_schedule(&song, sample_rate) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(?e, "graph compile failed; master goes silent");
-            crate::graph::Schedule::empty()
+    let _ = std::thread::Builder::new()
+        .name("audio-notify".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                // CPAL callback の MMCSS join 失敗の one-shot warn (RT では
+                // tracing を出せないのでここで代行)。
+                if engine_shared.mmcss_join_failed.load(Ordering::Acquire)
+                    && !engine_shared.mmcss_warned.swap(true, Ordering::AcqRel)
+                {
+                    tracing::warn!("CPAL callback: MMCSS join (Pro Audio) failed");
+                }
+                // dispatch timeout → quarantine された device を 1 回だけ通知。
+                let refs = engine_shared.plugin_refs.load();
+                for (id, entry) in refs.iter() {
+                    if entry.quarantined.load(Ordering::Acquire)
+                        && !entry.unresponsive_notified.swap(true, Ordering::AcqRel)
+                    {
+                        tracing::warn!(
+                            device_id = *id,
+                            "plugin unresponsive (dispatch timeout); quarantined"
+                        );
+                        let _ = out_tx.send(AudioEvent::PluginUnresponsive { device_id: *id });
+                    }
+                }
+                // worker pool 全体の完了待ち timeout → pool 停止を 1 回だけ通知
+                // (GUI は plugin_host respawn → OpenWorkerPool 再送で復旧する)。
+                if let Some(rig) = engine_shared.worker.load_full()
+                    && rig.pool.as_ref().is_some_and(|p| p.is_stalled())
+                    && !rig.stall_notified.swap(true, Ordering::AcqRel)
+                {
+                    tracing::error!(
+                        "audio worker pool stalled; dispatch disabled until pool rebuild"
+                    );
+                    let _ = out_tx.send(AudioEvent::WorkerPoolStalled);
+                }
+            }
+        });
+}
+
+/// forward ring への bundle 送出 (drop-oldest 化)。 rtrb の producer は
+/// consumer 側を追い出せないので、 ring full 時は新しい bundle を `parked` に
+/// 退避し (旧 parked = superseded は **ここ (off-thread)** で drop)、 次の
+/// 送出 / recv イテレーションで再 push する。 RT が正常に drain していれば
+/// full は起きない — これは「RT が遅くても最新編集が最終的に必ず届く」保険
+/// (plan §4: drop-newest でなく drop-oldest)。
+struct BundlePublisher {
+    tx: rtrb::Producer<RtBundle>,
+    parked: Option<RtBundle>,
+    /// 直近 topology compile に使った `buffer_frames` (leaf 宛 sidechain tap
+    /// の 1-buffer 補償量)。 実測値との drift を検知して再 compile する。
+    last_compiled_frames: Option<u32>,
+}
+
+impl BundlePublisher {
+    fn new(tx: rtrb::Producer<RtBundle>) -> Self {
+        Self {
+            tx,
+            parked: None,
+            last_compiled_frames: None,
         }
-    };
-    let tempo_map = common::tempo_map::TempoMap::from_song(&song);
-    // Off-thread readers (preview / update_song_track) see the song here.
-    shared.song.store(Some(Arc::clone(&song)));
-    // Hand the freshly compiled routing to the audio thread. If the ring is full
-    // (the audio thread hasn't drained — not reachable at human edit rates), the
-    // snapshot is dropped here and the previous routing stays in effect until the
-    // next edit, rather than blocking.
-    if let Err(rtrb::PushError::Full(_dropped)) =
-        routing_tx.push(engine::CompiledRouting { song, schedule, tempo_map })
-    {
-        tracing::warn!("routing ring full; schedule update deferred to next edit");
     }
+
+    /// parked bundle があれば ring へ再 push を試みる。
+    fn flush(&mut self) {
+        if let Some(bundle) = self.parked.take()
+            && let Err(rtrb::PushError::Full(back)) = self.tx.push(bundle)
+        {
+            self.parked = Some(back);
+        }
+    }
+
+    fn send(&mut self, bundle: RtBundle) {
+        self.flush();
+        if let Err(rtrb::PushError::Full(newest)) = self.tx.push(bundle) {
+            // 旧 parked (superseded) はこの代入で drop される — off-thread。
+            self.parked = Some(newest);
+        }
+    }
+}
+
+/// schedule compile に使う buffer frames (= leaf 宛 sidechain tap の 1-buffer
+/// staging 補償量)。 CPAL callback が実測値を `last_buffer_frames` に publish
+/// する。 未計測 (stream 稼働前の初回 publish のみ) は WASAPI 共有モード既定の
+/// 10ms 周期を仮定し、 最初の callback 後に recv loop の drift check が実測値で
+/// 再 compile する。
+fn resolve_buffer_frames(engine_shared: &EngineShared, sample_rate: u32) -> u32 {
+    let max = common::process_data::MAX_FRAMES as u32;
+    match engine_shared.last_buffer_frames.load(Ordering::Acquire) {
+        0 => (sample_rate / 100).clamp(64, max),
+        measured => measured.min(max),
+    }
+}
+
+/// `input_delay_per_track` が `TrackScratch` の prealloc (1s) を超える病的
+/// ケース用の置換 DelayLine を off-thread で確保する (install 時に RT が
+/// swap するだけで済むように)。 全 track が prealloc 内なら空 Vec。
+fn build_input_delay_replacements(schedule: &Schedule) -> Vec<Option<DelayLine>> {
+    let mut any = false;
+    let repl: Vec<Option<DelayLine>> = schedule
+        .input_delay_per_track
+        .iter()
+        .map(|&d| {
+            let need = d as usize + 1;
+            if d > 0 && need > mixer::INPUT_DELAY_PREALLOC_SAMPLES {
+                any = true;
+                Some(DelayLine::with_capacity(need))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if any { repl } else { Vec::new() }
+}
+
+/// 現在の mirrors (plugin_refs / worker) + `song` で `RtBundle` を組んで RT へ
+/// 配送する。 `recompile = true` なら schedule + tempo map を off-thread で
+/// 再 compile (topology 変更: LoadSong / buffer_frames drift)。 `false` なら
+/// schedule は載せない = RT は現行 schedule (走行状態込み) を据え置く
+/// (§5 D: 値のみの更新で `compile_schedule` を走らせない)。
+/// `shared.song` mirror もここで更新する (off-thread 読者用)。
+fn publish_bundle(
+    publisher: &mut BundlePublisher,
+    shared: &SharedState,
+    engine_shared: &EngineShared,
+    song: Option<Arc<common::model::Song>>,
+    sample_rate: u32,
+    recompile: bool,
+) {
+    shared.song.store(song.clone());
+    let tempo_map = match song.as_deref() {
+        Some(s) => common::tempo_map::TempoMap::from_song(s),
+        None => common::tempo_map::TempoMap::from_song(&common::model::Song::default()),
+    };
+    let (schedule, input_delay_replacements) = if recompile {
+        let buffer_frames = resolve_buffer_frames(engine_shared, sample_rate);
+        publisher.last_compiled_frames = Some(buffer_frames);
+        let sched = match song.as_deref() {
+            // compile 失敗は empty schedule (silent master) に fallback —
+            // 壊れた graph は謎の音ではなく無音として聴こえる方が診断しやすい。
+            Some(s) => match compile_schedule(s, sample_rate, buffer_frames) {
+                Ok(sc) => sc,
+                Err(e) => {
+                    tracing::warn!(?e, "graph compile failed; master goes silent");
+                    Schedule::empty()
+                }
+            },
+            None => Schedule::empty(),
+        };
+        let repl = build_input_delay_replacements(&sched);
+        (Some(sched), repl)
+    } else {
+        (None, Vec::new())
+    };
+    publisher.send(RtBundle {
+        song,
+        tempo_map,
+        schedule,
+        input_delay_replacements,
+        plugin_refs: engine_shared.plugin_refs.load_full(),
+        worker: engine_shared.worker.load_full(),
+    });
+}
+
+/// Apply `f` to a clone of the current song and publish the result as a
+/// **値のみ** bundle (schedule 再 compile なし — §5 D)。 mixer-strip 変更は
+/// user-driven (slider drag rate) なので clone は IPC スレッドで許容。
+fn update_song_values<F>(
+    publisher: &mut BundlePublisher,
+    shared: &SharedState,
+    engine_shared: &EngineShared,
+    sample_rate: u32,
+    f: F,
+) where
+    F: FnOnce(&mut common::model::Song),
+{
+    let snapshot = shared.song.load();
+    let Some(song) = snapshot.as_deref() else {
+        return;
+    };
+    let mut next = song.clone();
+    f(&mut next);
+    publish_bundle(
+        publisher,
+        shared,
+        engine_shared,
+        Some(Arc::new(next)),
+        sample_rate,
+        false,
+    );
+}
+
+/// 鍵盤プレビューの note-on/off を送る対象 track の Vec index を、 audio engine
+/// の現 song snapshot から track id で引く。 song 未ロード / id 不在 / `MAX_TRACKS`
+/// 超過は `None` (= プレビュー drop)。 id ベースなので GUI 側の track 並べ替えと
+/// race しない (= `SetTrackVolume` 等と同じ方針)。
+fn preview_track_index(shared: &Arc<SharedState>, track_id: u32) -> Option<usize> {
+    let snapshot = shared.song.load();
+    let song = snapshot.as_deref()?;
+    song.tracks
+        .iter()
+        .position(|t| t.id == track_id)
+        .filter(|&i| i < engine::MAX_TRACKS)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -271,36 +450,60 @@ async fn recv_loop(
     mut pipe: ReadHalf<NamedPipeClient>,
     shared: Arc<SharedState>,
     engine_shared: Arc<EngineShared>,
-    master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
-    out_tx: tokio::sync::mpsc::UnboundedSender<ChildToMain>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
     decode_tx: std::sync::mpsc::Sender<DecodeJob>,
-    mut routing_tx: rtrb::Producer<engine::CompiledRouting>,
-    mut routing_recycle_rx: rtrb::Consumer<engine::CompiledRouting>,
+    bundle_tx: rtrb::Producer<RtBundle>,
+    mut bundle_recycle_rx: rtrb::Consumer<RtBundle>,
 ) {
+    let mut publisher = BundlePublisher::new(bundle_tx);
     loop {
-        // D1 / PR3: dispose routing snapshots the audio thread superseded, so
-        // their `Drop` (free) runs here, off the audio callback. Drained on
-        // every message; snapshots only accumulate while the user is editing,
-        // which is exactly when messages keep arriving.
-        while let Ok(old) = routing_recycle_rx.pop() {
+        // plan §4: dispose bundles the audio thread superseded, so their
+        // `Drop` (free / shmem unmap / worker pool join) runs here, off the
+        // audio callback. Drained on every message; snapshots only accumulate
+        // while the user is editing, which is exactly when messages keep
+        // arriving. parked bundle (ring full 時の drop-oldest 退避) も再送。
+        while let Ok(old) = bundle_recycle_rx.pop() {
             drop(old);
         }
-        match read_msg::<_, MainToChild>(&mut pipe).await {
-            Ok(MainToChild::Play) => {
+        publisher.flush();
+        // leaf 宛 sidechain tap の 1-buffer 補償量 (= 実測 buffer frames) が
+        // compile 時の仮定から変わっていたら topology を再 publish する
+        // (初回 publish が stream 実測前に走った場合の是正)。
+        if let Some(compiled) = publisher.last_compiled_frames
+            && resolve_buffer_frames(&engine_shared, session_sample_rate) != compiled
+        {
+            let song = shared.song.load_full();
+            if song.is_some() {
+                publish_bundle(
+                    &mut publisher,
+                    &shared,
+                    &engine_shared,
+                    song,
+                    session_sample_rate,
+                    true,
+                );
+            }
+        }
+        match read_msg::<_, AudioCommand>(&mut pipe).await {
+            // Handshake 済みの再送 Ack / Session は no-op (Session は起動時に
+            // `read_audio_session` が消費済み — shmem 名と format はプロセス
+            // 生存中不変)。
+            Ok(AudioCommand::Ack) | Ok(AudioCommand::Session(_)) => {}
+            Ok(AudioCommand::Play) => {
                 tracing::info!("received Play");
                 shared
                     .playback
                     .store(PlaybackCommand::Play as u8, Ordering::Release);
             }
-            Ok(MainToChild::Stop) => {
+            Ok(AudioCommand::Stop) => {
                 tracing::info!("received Stop");
                 shared
                     .playback
                     .store(PlaybackCommand::Stop as u8, Ordering::Release);
             }
-            Ok(MainToChild::Panic) => {
+            Ok(AudioCommand::Panic) => {
                 // arm the master declick. The CPAL callback consumes
                 // this edge flag, fades the master out and holds at zero until
                 // `PanicRelease`, so the imminent `ReinitAllPlugins` (which yanks
@@ -308,16 +511,16 @@ async fn recv_loop(
                 tracing::info!("received Panic (master declick)");
                 shared.panic_declick.store(true, Ordering::Release);
             }
-            Ok(MainToChild::PanicRelease) => {
+            Ok(AudioCommand::PanicRelease) => {
                 // the plugin reinit finished — release the declick
                 // hold so the master fades back in over a now-silent mix.
                 tracing::info!("received PanicRelease (declick fade-in)");
                 shared.panic_release.store(true, Ordering::Release);
             }
-            Ok(MainToChild::SetLoop(b)) => {
+            Ok(AudioCommand::SetLoop(b)) => {
                 shared.looping.store(b, Ordering::Release);
             }
-            Ok(MainToChild::SeekTo { samples }) => {
+            Ok(AudioCommand::SeekTo { samples }) => {
                 // playhead を IPC 受信スレッドから直接書かない。
                 // audio thread も buffer 末で playhead を store するため、両者が
                 // 同一 atomic を別スレッドから書く race になり、Stop 直後の開始
@@ -329,7 +532,7 @@ async fn recv_loop(
                 shared.pending_seek.store(samples, Ordering::Release);
                 tracing::info!(samples, "received SeekTo");
             }
-            Ok(MainToChild::LoadSong(mut song)) => {
+            Ok(AudioCommand::LoadSong(mut song)) => {
                 // IPC は信頼境界なので、 受信した song の値域を store 前に
                 // 正規化 (bpm/time_sig/length/loop/framerate を有限・正に)。
                 // これで下流の divisor (samples_per_beat 等) が NaN / 0 /
@@ -362,11 +565,17 @@ async fn recv_loop(
                 );
                 let needs_decode =
                     audio_clip_renderer::has_undecoded_sources(&song, &partial);
-                publish_schedule(&engine_shared, generation, partial);
-                // D1 / PR3: compile the routing schedule + tempo map off the
-                // audio thread and publish for wait-free pickup (this also
-                // refreshes `shared.song`).
-                publish_routing(&mut routing_tx, &shared, Arc::clone(&song), session_sample_rate);
+                publish_audio_clip_schedule(&engine_shared, generation, partial);
+                // topology publish: routing schedule + tempo map を off-thread
+                // で compile して RT へ wait-free 配送 (shared.song もここで更新)。
+                publish_bundle(
+                    &mut publisher,
+                    &shared,
+                    &engine_shared,
+                    Some(Arc::clone(&song)),
+                    session_sample_rate,
+                    true,
+                );
                 // Phase 2: hand off to the background worker for full decode of
                 // any missing source. Skipped when everything was reusable
                 // (= BPM change / edit / scrub → decode ゼロ で即完結)。
@@ -378,138 +587,194 @@ async fn recv_loop(
                     });
                 }
             }
-            Ok(MainToChild::SetMasterGain(g)) => {
+            Ok(AudioCommand::SetMasterGain(g)) => {
+                // render (`render_master_buffer`) が読む — live / export 共通。
                 let clamped = g.clamp(0.0, 1.0);
-                master_gain.store(clamped.to_bits(), Ordering::Relaxed);
+                engine_shared
+                    .master_gain
+                    .store(clamped.to_bits(), Ordering::Relaxed);
             }
-            Ok(MainToChild::OpenWorkerPool {
+            Ok(AudioCommand::OpenWorkerPool {
                 n_workers,
                 worker_bridge_shmem_id,
                 wake_event_names,
                 done_event_names,
             }) => {
-                if let Err(e) = handle_open_worker_pool(
+                // worker rig (bridge shmem + handshake events + audio worker
+                // threads) を **off-thread で** 構築し、 mirror + bundle で
+                // 配送する。 旧 rig は RT の swap 後 recycle ring 経由で
+                // ここに戻り、 off-thread で drop (= worker join) される。
+                match build_worker_rig(
                     n_workers,
                     &worker_bridge_shmem_id,
                     &wake_event_names,
                     &done_event_names,
-                    &cmd_tx,
                 ) {
-                    tracing::error!(error = ?e, "failed to open audio-side worker pool");
+                    Ok(rig) => {
+                        tracing::info!(
+                            n_sync_slots = rig.slots.len(),
+                            has_pool = rig.pool.is_some(),
+                            "audio engine bound to plugin-host worker pool"
+                        );
+                        engine_shared.worker.store(Some(Arc::new(rig)));
+                        let song = shared.song.load_full();
+                        publish_bundle(
+                            &mut publisher,
+                            &shared,
+                            &engine_shared,
+                            song,
+                            session_sample_rate,
+                            false,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = ?e, "failed to open audio-side worker pool");
+                    }
                 }
             }
-            Ok(MainToChild::OpenPluginShmem {
-                plugin_id,
-                shmem_id,
-                track,
-                index,
-            }) => {
-                if let Err(e) =
-                    handle_open_plugin_shmem(plugin_id, &shmem_id, track, index, &cmd_tx)
-                {
-                    tracing::error!(error = ?e, plugin_id, "failed to open plugin shmem");
+            Ok(AudioCommand::CloseWorkerPool) => {
+                engine_shared.worker.store(None);
+                let song = shared.song.load_full();
+                publish_bundle(
+                    &mut publisher,
+                    &shared,
+                    &engine_shared,
+                    song,
+                    session_sample_rate,
+                    false,
+                );
+            }
+            Ok(AudioCommand::OpenPluginShmem { device_id, shmem_id }) => {
+                // v29: 配置 (どの track のどの位置か) は Song 側の
+                // `PluginInstance::id` が SSoT なので、 ここでは device_id →
+                // shmem の対応を登録するだけ。 map rebuild は off-thread
+                // (snapshot-copy-mutate-publish)、 handle は entry が持つ
+                // (旧 Box::leak の解消)。
+                match common::process_data::ProcessDataHandle::open(&shmem_id) {
+                    Ok(handle) => {
+                        let entry = Arc::new(PluginEntry::new(device_id, handle));
+                        let mut map: engine::PluginRefs =
+                            (**engine_shared.plugin_refs.load()).clone();
+                        map.insert(device_id, entry);
+                        engine_shared.plugin_refs.store(Arc::new(map));
+                        let song = shared.song.load_full();
+                        publish_bundle(
+                            &mut publisher,
+                            &shared,
+                            &engine_shared,
+                            song,
+                            session_sample_rate,
+                            false,
+                        );
+                        tracing::info!(device_id, "plugin shmem registered");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = ?e, device_id, "failed to open plugin shmem");
+                    }
                 }
             }
-            Ok(MainToChild::ClosePluginShmem { plugin_id }) => {
-                let _ = cmd_tx.send(engine::AudioCommand::ClosePluginShmem { plugin_id });
+            Ok(AudioCommand::ClosePluginShmem { device_id }) => {
+                let mut map: engine::PluginRefs = (**engine_shared.plugin_refs.load()).clone();
+                map.remove(&device_id);
+                engine_shared.plugin_refs.store(Arc::new(map));
+                let song = shared.song.load_full();
+                publish_bundle(
+                    &mut publisher,
+                    &shared,
+                    &engine_shared,
+                    song,
+                    session_sample_rate,
+                    false,
+                );
+                // 旧 entry (shmem mapping) は RT が新 bundle を install して
+                // recycle が drain された時点で off-thread unmap される。
+                tracing::info!(device_id, "plugin shmem dropped");
             }
-            // a chain reorder re-keys `slot_to_plugin_id` so each
-            // slot resolves to its moved plugin. Sent to the audio engine in
-            // addition to the plugin host (and a `LoadSong` that rebuilds the
-            // processing order). Atomic re-key on the audio thread; see
-            // `AudioCommand::ReorderChain`.
-            Ok(MainToChild::ReorderChain { track, moves }) => {
-                let _ = cmd_tx.send(engine::AudioCommand::ReorderChain { track, moves });
-            }
-            // Phase 6 review (SSOT fix): `track` field を Track::id (stable)
-            // に統一。 旧コードは `s.tracks.get_mut(track as usize)` で Vec
-            // index 解釈していて、 GUI 側との順序ずれで違う track を操作する
-            // race リスクがあった。 id lookup で stable 化。
-            Ok(MainToChild::SetTrackVolume { track, volume }) => {
-                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
+            // Phase 6 review (SSOT fix): `track` field は Track::id (stable)。
+            // 値のみの更新 — schedule は再 compile されない (§5 D)。
+            Ok(AudioCommand::SetTrackVolume { track, volume }) => {
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.volume = volume.clamp(0.0, 1.0);
                     }
                 });
             }
-            Ok(MainToChild::SetTrackPan { track, pan }) => {
-                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
+            Ok(AudioCommand::SetTrackPan { track, pan }) => {
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.pan = pan.clamp(-1.0, 1.0);
                     }
                 });
             }
-            Ok(MainToChild::SetTrackMuted { track, muted }) => {
-                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
+            Ok(AudioCommand::SetTrackMuted { track, muted }) => {
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.muted = muted;
                     }
                 });
             }
-            Ok(MainToChild::SetTrackSolo { track, solo }) => {
-                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
+            Ok(AudioCommand::SetTrackSolo { track, solo }) => {
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.solo = solo;
                     }
                 });
             }
-            Ok(MainToChild::SetSendGain {
+            Ok(AudioCommand::SetSendGain {
                 track,
-                send_idx,
+                send_id,
                 gain,
             }) => {
-                // Realtime aux-send level. Same lightweight clone-mutate-
-                // store path as SetTrackVolume — the MixSend op re-reads
-                // this live (ramped) without recompiling the schedule.
-                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
+                // Realtime aux-send level. v29: send は stable `Send::id` で
+                // アドレス。 MixSend op が live に再読するので schedule 再
+                // compile は不要 (§5 D)。
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track)
-                        && let Some(send) = t.sends.get_mut(send_idx as usize)
+                        && let Some(send) = t.sends.iter_mut().find(|sd| sd.id == send_id)
                     {
                         send.gain = gain.clamp(0.0, 2.0);
                     }
                 });
             }
-            Ok(MainToChild::SetSendEnabled {
+            Ok(AudioCommand::SetSendEnabled {
                 track,
-                send_idx,
+                send_id,
                 enabled,
             }) => {
-                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track)
-                        && let Some(send) = t.sends.get_mut(send_idx as usize)
+                        && let Some(send) = t.sends.iter_mut().find(|sd| sd.id == send_id)
                     {
                         send.enabled = enabled;
                     }
                 });
             }
-            Ok(MainToChild::SetTrackArmed { track, armed }) => {
+            Ok(AudioCommand::SetTrackArmed { track, armed }) => {
                 // Phase 7 B4 (2026-05-13): track.armed を Song に反映するのみ。
                 // 録音書き込み自体は GUI process で行うため audio thread 側
-                // は schema 一貫性のために値を持つだけ。 将来の audio input
-                // 録音で audio thread 側書き込みに使う想定。
-                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
+                // は schema 一貫性のために値を持つだけ。
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
                         t.armed = armed;
                     }
                 });
             }
-            Ok(MainToChild::SetSongBpm { bpm }) => {
-                // Phase 5 Step 5.1 follow-up: BPM 軽量更新。 LoadSong を回避
-                // して shared.song の inner bpm のみ swap。 ArcSwap で clone →
-                // mutate → store の atomic publish。 BPM scrub drag 中の毎
-                // frame 入力で audio engine が即時追随する。
+            Ok(AudioCommand::SetSongBpm { bpm }) => {
+                // BPM 軽量更新 (transport scrub 中に毎 frame 流れうる)。 値のみ
+                // — schedule は再 compile しない。 tempo map は bundle 側で
+                // 常に再構築される (安価) ので seek/loop 逆算も追従する。
                 let clamped = bpm.clamp(1.0, 400.0);
-                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     s.bpm = clamped;
                 });
             }
-            Ok(MainToChild::SetSongTimeSigNumerator { num }) => {
+            Ok(AudioCommand::SetSongTimeSigNumerator { num }) => {
                 let clamped = num.clamp(1, 32);
-                update_song_track(&shared, &mut routing_tx, session_sample_rate, |s| {
+                update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     s.time_sig.0 = clamped;
                 });
             }
-            Ok(MainToChild::StartCountIn { samples }) => {
+            Ok(AudioCommand::StartCountIn { samples }) => {
                 // Phase 7 B4 Step C (2026-05-13): GUI が Record toggle ON +
                 // count_in_bars > 0 で発火。 EngineShared に preroll を立てて、
                 // process_buffer 頭で「dispatch / clip render skip + metronome
@@ -517,7 +782,6 @@ async fn recv_loop(
                 // audio_bridge mirror 経由で midi_recording_pending 解除。
                 // samples = 0 で count-in 即時 cancel (= stop_recording 中の
                 // preroll 中断)。
-                use std::sync::atomic::Ordering;
                 engine_shared
                     .preroll_total_samples
                     .store(samples, Ordering::Release);
@@ -526,42 +790,36 @@ async fn recv_loop(
                     .store(samples, Ordering::Release);
                 tracing::info!(samples, "received StartCountIn");
             }
-            Ok(MainToChild::SetMetronomeEnabled(enabled)) => {
+            Ok(AudioCommand::SetMetronomeEnabled(enabled)) => {
                 // Phase 7 B3 (2026-05-13): GUI が transport bar の metronome
-                // toggle を切り替え。 SharedState 上の AtomicBool を replace し、
-                // audio thread は次 buffer から `render_metronome` の有効無効を
-                // 切り替える (= 無効時は mix step を skip)。 lock-free / 0
+                // toggle を切り替え。 audio thread は次 buffer から
+                // `render_metronome` の有効無効を切り替える。 lock-free / 0
                 // allocation on audio thread。
-                shared.metronome_enabled.store(
-                    enabled,
-                    std::sync::atomic::Ordering::Release,
-                );
+                shared.metronome_enabled.store(enabled, Ordering::Release);
             }
-            Ok(MainToChild::PreviewNoteOn {
+            Ok(AudioCommand::PreviewNoteOn {
                 track_id,
                 pitch,
                 velocity,
             }) => {
                 // 鍵盤レーン click のプレビュー (gui_01 #055)。 GUI は track id を
                 // 送る。 ここで audio engine の現 song snapshot から Vec index を
-                // 引いて AudioCommand に載せ替える (index は scratch / per-track
-                // dispatch の addressing)。 解決は IPC スレッド上 = RT 外。 song
-                // 未ロード / id 不在なら drop (= 無音、 plan §4 の no-op)。
+                // 引いて EngineCommand に載せ替える。 解決は IPC スレッド上 =
+                // RT 外。 song 未ロード / id 不在なら drop (= 無音)。
                 if let Some(track) = preview_track_index(&shared, track_id) {
-                    let _ = cmd_tx.send(engine::AudioCommand::PreviewNoteOn {
+                    let _ = cmd_tx.send(EngineCommand::PreviewNoteOn {
                         track,
                         pitch,
                         velocity: f64::from(velocity) / 127.0,
                     });
                 }
             }
-            Ok(MainToChild::PreviewNoteOff { track_id, pitch }) => {
+            Ok(AudioCommand::PreviewNoteOff { track_id, pitch }) => {
                 if let Some(track) = preview_track_index(&shared, track_id) {
-                    let _ =
-                        cmd_tx.send(engine::AudioCommand::PreviewNoteOff { track, pitch });
+                    let _ = cmd_tx.send(EngineCommand::PreviewNoteOff { track, pitch });
                 }
             }
-            Ok(MainToChild::SetRecordingLanes { lanes }) => {
+            Ok(AudioCommand::SetRecordingLanes { lanes }) => {
                 // Phase 4 Step C-2: GUI が「現在 recording 中の lane」 セットを
                 // 送ってきた。 ArcSwap で snapshot を replace し、 audio thread
                 // は次 buffer から `fill_track_param_ramps` で該当 lane の
@@ -572,18 +830,10 @@ async fn recv_loop(
                     lanes.into_iter().collect();
                 shared.recording_lanes.store(std::sync::Arc::new(set));
             }
-            // SetGeneratedAudio (Phase 1 PR8): in-memory audio buffer
-            // delivered by the GUI. Used both for
-            // PR-V4: `MainToChild::SetGeneratedAudio` 削除済 (= VOICEVOX
-            // 経路は builtin instrument plugin が plugin host 内で完結)。
-            // 互換性のため variant をしばらく残す場合は ignore arm を
-            // 入れるが、 完全削除したのでここは何もしない。
-            // SetProjectDir (Phase 1 PR2): record the current project
-            // directory so PR6's `compile_audio_schedule` can resolve
-            // `AudioSourcePath::ProjectRelative` against
-            // `<project_dir>/samples/<...>`. `None` for unsaved
-            // projects.
-            Ok(MainToChild::SetProjectDir(dir)) => {
+            Ok(AudioCommand::SetProjectDir(dir)) => {
+                // `compile_audio_schedule` が `AudioSourcePath::ProjectRelative`
+                // を `<project_dir>/samples/<...>` に解決するのに使う。
+                // `None` for unsaved projects.
                 engine_shared
                     .project_dir
                     .store(dir.as_ref().map(|p| Arc::new(p.clone())));
@@ -594,7 +844,7 @@ async fn recv_loop(
             // export thread silences the CPAL callback via
             // `EngineShared::export_running` while it holds the audio
             // resources.
-            Ok(MainToChild::ExportWav { path, range, write_mod_sidecar }) => {
+            Ok(AudioCommand::ExportWav { path, range, write_mod_sidecar }) => {
                 // Multi-process defense: atomically reserve the engine for this
                 // render. compare_exchange on the recv loop serializes against a
                 // second ExportWav — the old "load here, set inside the spawned
@@ -607,13 +857,13 @@ async fn recv_loop(
                     .compare_exchange(
                         false,
                         true,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
                     )
                     .is_err()
                 {
                     tracing::warn!("ExportWav received while a render is already running; ignoring");
-                    let _ = out_tx.send(ChildToMain::ExportWavComplete {
+                    let _ = out_tx.send(AudioEvent::ExportWavComplete {
                         error: Some("export already in progress".into()),
                         cancelled: false,
                     });
@@ -625,8 +875,8 @@ async fn recv_loop(
                     // Release the reservation we just took (no render will run).
                     engine_shared
                         .export_running
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    let _ = out_tx.send(ChildToMain::ExportWavComplete {
+                        .store(false, Ordering::Release);
+                    let _ = out_tx.send(AudioEvent::ExportWavComplete {
                         error: Some("no song loaded".into()),
                         cancelled: false,
                     });
@@ -639,7 +889,7 @@ async fn recv_loop(
                 // CancelExport (which then aborts THIS render, not a prior one).
                 engine_shared
                     .export_cancel
-                    .store(false, std::sync::atomic::Ordering::Release);
+                    .store(false, Ordering::Release);
                 let engine_shared_clone = Arc::clone(&engine_shared);
                 let engine_shared_release = Arc::clone(&engine_shared);
                 let out_tx_clone = out_tx.clone();
@@ -679,7 +929,7 @@ async fn recv_loop(
                                 last_sent = Some(done);
                                 last_at = std::time::Instant::now();
                                 let _ = out_tx_progress
-                                    .send(ChildToMain::ExportWavProgress { done, total });
+                                    .send(AudioEvent::ExportWavProgress { done, total });
                             }
                         };
                         // user export range walks cold from the range
@@ -703,7 +953,7 @@ async fn recv_loop(
                         // run_export, which no longer touches export_running).
                         engine_shared_release
                             .export_running
-                            .store(false, std::sync::atomic::Ordering::Release);
+                            .store(false, Ordering::Release);
                         let (error_msg, cancelled) = match result {
                             Ok(outcome) => (None, outcome.cancelled),
                             Err(e) => {
@@ -711,7 +961,7 @@ async fn recv_loop(
                                 (Some(format!("{e:#}")), false)
                             }
                         };
-                        let _ = out_tx_clone.send(ChildToMain::ExportWavComplete {
+                        let _ = out_tx_clone.send(AudioEvent::ExportWavComplete {
                             error: error_msg,
                             cancelled,
                         });
@@ -721,8 +971,8 @@ async fn recv_loop(
                     // No thread will release the reservation we took above.
                     engine_shared
                         .export_running
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    let _ = out_tx.send(ChildToMain::ExportWavComplete {
+                        .store(false, Ordering::Release);
+                    let _ = out_tx.send(AudioEvent::ExportWavComplete {
                         error: Some(format!("failed to spawn export thread: {e}")),
                         cancelled: false,
                     });
@@ -730,18 +980,13 @@ async fn recv_loop(
             }
             // CancelExport: raise the flag the freewheel loop polls. No-op
             // when no export is running (the next run clears it on entry).
-            Ok(MainToChild::CancelExport) => {
+            Ok(AudioCommand::CancelExport) => {
                 engine_shared
                     .export_cancel
-                    .store(true, std::sync::atomic::Ordering::Release);
+                    .store(true, Ordering::Release);
                 tracing::info!("received CancelExport; offline render will abort");
             }
-            Ok(MainToChild::ReinitAllPlugins) => {
-                // Plugin reinit (export prep / panic button) is the plugin
-                // host's job — it owns the instances. The audio side has no
-                // plugins — ignore.
-            }
-            Ok(MainToChild::BounceClipFxOnline {
+            Ok(AudioCommand::BounceClipFxOnline {
                 path,
                 source_track,
                 source_clip,
@@ -759,13 +1004,13 @@ async fn recv_loop(
                     .compare_exchange(
                         false,
                         true,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
                     )
                     .is_err()
                 {
                     tracing::warn!("BounceClipFxOnline received while a render is already running; ignoring");
-                    let _ = out_tx.send(ChildToMain::BounceClipFxComplete {
+                    let _ = out_tx.send(AudioEvent::BounceClipFxComplete {
                         path,
                         source_track,
                         source_clip,
@@ -779,8 +1024,8 @@ async fn recv_loop(
                     tracing::warn!("BounceClipFxOnline received but no song loaded");
                     engine_shared
                         .export_running
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    let _ = out_tx.send(ChildToMain::BounceClipFxComplete {
+                        .store(false, Ordering::Release);
+                    let _ = out_tx.send(AudioEvent::BounceClipFxComplete {
                         path,
                         source_track,
                         source_clip,
@@ -797,7 +1042,7 @@ async fn recv_loop(
                 // from killing the bounce render on its first buffer.
                 engine_shared
                     .export_cancel
-                    .store(false, std::sync::atomic::Ordering::Release);
+                    .store(false, Ordering::Release);
                 let engine_shared_clone = Arc::clone(&engine_shared);
                 let engine_shared_release = Arc::clone(&engine_shared);
                 let out_tx_clone = out_tx.clone();
@@ -828,7 +1073,7 @@ async fn recv_loop(
                         // Release the engine reservation on every path.
                         engine_shared_release
                             .export_running
-                            .store(false, std::sync::atomic::Ordering::Release);
+                            .store(false, Ordering::Release);
                         let (error_msg, frames) = match result {
                             // Bounce has no Cancel UI; `outcome.cancelled` is
                             // ignored (it can only be set if a stale cancel
@@ -842,7 +1087,7 @@ async fn recv_loop(
                                 (Some(format!("{e:#}")), 0)
                             }
                         };
-                        let _ = out_tx_clone.send(ChildToMain::BounceClipFxComplete {
+                        let _ = out_tx_clone.send(AudioEvent::BounceClipFxComplete {
                             path: path_for_complete,
                             source_track,
                             source_clip,
@@ -855,8 +1100,8 @@ async fn recv_loop(
                     // No thread will release the reservation we took above.
                     engine_shared
                         .export_running
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    let _ = out_tx.send(ChildToMain::BounceClipFxComplete {
+                        .store(false, Ordering::Release);
+                    let _ = out_tx.send(AudioEvent::BounceClipFxComplete {
                         path,
                         source_track,
                         source_clip,
@@ -865,28 +1110,6 @@ async fn recv_loop(
                     });
                 }
             }
-            // Plugin lifecycle, GUI, state save/restore, per-track
-            // mixer params, slot reorder, render-mode bookend, and the
-            // plugin-host worker-pool tear-down stay on the
-            // plugin_host side.
-            Ok(MainToChild::Ack)
-            | Ok(MainToChild::Session(_))
-            | Ok(MainToChild::SetSlotPlugin { .. })
-            | Ok(MainToChild::RemoveSlotPlugin { .. })
-            | Ok(MainToChild::RemoveTrack { .. })
-            | Ok(MainToChild::RequestSlotState { .. })
-            | Ok(MainToChild::RequestAllStates)
-            | Ok(MainToChild::OpenSlotGuiEmbedded { .. })
-            | Ok(MainToChild::CloseSlotGui { .. })
-            | Ok(MainToChild::SetRenderMode(_))
-            | Ok(MainToChild::SetBuiltinPluginNoteMetadata { .. })
-            // 歌唱合成は plugin host が担うので audio engine は無視。
-            | Ok(MainToChild::PrepareVocalSynth { .. })
-            // ARA (r.md #5) は plugin host 専用なので audio engine は無視。
-            | Ok(MainToChild::SetupAraDocument { .. })
-            | Ok(MainToChild::ClearAraDocument { .. })
-            | Ok(MainToChild::UpdateAraRegions { .. })
-            | Ok(MainToChild::CloseWorkerPool) => {}
             Err(e) => {
                 tracing::info!(error = ?e, "receive loop ending");
                 break;
@@ -895,16 +1118,18 @@ async fn recv_loop(
     }
 }
 
-/// Open the WorkerBridge shmem + N (wake, done) events for the audio
-/// side, build N `WorkerSyncRef`s pointing at the bridge slots, and
-/// hand the bundle to the audio thread via the command channel.
-fn handle_open_worker_pool(
+/// Open the WorkerBridge shmem + N (wake, done) named events for the audio
+/// side, spawn the audio worker pool, and bundle everything into a
+/// [`WorkerRig`]. Runs on the receive loop (off-thread) — thread spawn /
+/// event creation never touches the CPAL callback (plan §4)。 event 名は
+/// daw_gui が世代込みで mint した opaque な文字列 (`worker_wake_event_name`)
+/// をそのまま使う — pool 再構築時に旧世代の stale signal が新 pool へ漏れない。
+fn build_worker_rig(
     n_workers: u32,
     worker_bridge_shmem_id: &str,
     wake_event_names: &[String],
     done_event_names: &[String],
-    cmd_tx: &tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
-) -> Result<()> {
+) -> Result<WorkerRig> {
     anyhow::ensure!(
         wake_event_names.len() == n_workers as usize,
         "wake_event_names len {} != n_workers {}",
@@ -926,93 +1151,41 @@ fn handle_open_worker_pool(
     );
     let bridge = common::worker_bridge::WorkerBridgeHandle::open(worker_bridge_shmem_id)
         .context("failed to open worker_bridge shmem")?;
-    // Per-slot pointer into the bridge's worker_task array — stable for
-    // the bridge's lifetime, which the audio thread holds (see
-    // LocalState::worker_bridge).
-    let bridge_ref = bridge.bridge();
-    let mut worker_syncs = Vec::with_capacity(n_workers as usize);
+    // Per-slot pointer into the bridge's worker_task array — the mapping's
+    // address is stable for the bridge handle's lifetime, which the rig owns
+    // (moving the handle struct does not move the mapped view).
+    let mut slots = Vec::with_capacity(n_workers as usize);
     for i in 0..n_workers as usize {
         let wake = common::plugin_ref::create_named_event(&wake_event_names[i])
             .with_context(|| format!("failed to open wake event {i}"))?;
         let done = common::plugin_ref::create_named_event(&done_event_names[i])
             .with_context(|| format!("failed to open done event {i}"))?;
-        worker_syncs.push(common::plugin_ref::WorkerSyncRef {
-            worker_idx: i as u32,
-            worker_task: &bridge_ref.worker_task[i] as *const _,
-            event_wake: wake,
-            event_done: done,
+        slots.push(SyncSlot {
+            sync: common::plugin_ref::WorkerSyncRef {
+                worker_idx: i as u32,
+                worker_task: &bridge.bridge().worker_task[i] as *const _,
+                event_wake: wake,
+                event_done: done,
+            },
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         });
     }
-    cmd_tx
-        .send(engine::AudioCommand::OpenWorkerPool {
-            bridge,
-            worker_syncs,
-        })
-        .map_err(|_| anyhow::anyhow!("audio command channel closed"))?;
-    Ok(())
-}
-
-/// Apply `f` to a clone of the current song and publish the result.
-/// `ArcSwap` keeps the swap wait-free for the audio thread; the clone
-/// happens on the IPC thread, which is acceptable because mixer-strip
-/// changes are user-driven (slider drag rate, not per-buffer).
-/// 鍵盤プレビューの note-on/off を送る対象 track の Vec index を、 audio engine
-/// の現 song snapshot から track id で引く。 song 未ロード / id 不在 / `MAX_TRACKS`
-/// 超過は `None` (= プレビュー drop)。 id ベースなので GUI 側の track 並べ替えと
-/// race しない (= `SetTrackVolume` 等と同じ方針)。
-fn preview_track_index(shared: &Arc<engine::SharedState>, track_id: u32) -> Option<usize> {
-    let snapshot = shared.song.load();
-    let song = snapshot.as_deref()?;
-    song.tracks
-        .iter()
-        .position(|t| t.id == track_id)
-        .filter(|&i| i < engine::MAX_TRACKS)
-}
-
-fn update_song_track<F>(
-    shared: &Arc<engine::SharedState>,
-    routing_tx: &mut rtrb::Producer<engine::CompiledRouting>,
-    sample_rate: u32,
-    f: F,
-) where
-    F: FnOnce(&mut common::model::Song),
-{
-    let snapshot = shared.song.load();
-    let Some(song) = snapshot.as_deref() else {
-        return;
+    // Spawn the audio-engine worker pool sized to the sync slots (master owns
+    // slot 0, worker i owns slot i+1). 失敗しても handshake 面は生かして
+    // serial fallback (slot 0 のみ) で動かす。
+    let pool = match audio_worker::AudioWorkerPool::new(n_workers) {
+        Ok(pool) => Some(pool),
+        Err(e) => {
+            tracing::error!(error = ?e, "AudioWorkerPool::new failed; serial fallback");
+            None
+        }
     };
-    let mut next = song.clone();
-    f(&mut next);
-    // D1 / PR3: republish the routing (schedule compiled off the audio thread)
-    // so the edit reaches the RT via the forward ring, not an RT-side recompile.
-    publish_routing(routing_tx, shared, Arc::new(next), sample_rate);
-}
-
-/// Open the per-plugin `ProcessData` shmem and ship a `PluginRef` to the
-/// audio thread along with the (track, slot) it's assigned to.
-fn handle_open_plugin_shmem(
-    plugin_id: u32,
-    shmem_id: &str,
-    track: u32,
-    index: u32,
-    cmd_tx: &tokio::sync::mpsc::UnboundedSender<engine::AudioCommand>,
-) -> Result<()> {
-    let handle = common::process_data::ProcessDataHandle::open(shmem_id)
-        .context("failed to open ProcessData shmem")?;
-    let plugin_ref = common::plugin_ref::PluginRef {
-        plugin_id,
-        process_data: handle.ptr(),
-    };
-    cmd_tx
-        .send(engine::AudioCommand::OpenPluginShmem {
-            plugin_id,
-            plugin_ref,
-            handle,
-            track,
-            index,
-        })
-        .map_err(|_| anyhow::anyhow!("audio command channel closed"))?;
-    Ok(())
+    Ok(WorkerRig {
+        pool,
+        slots,
+        bridge,
+        stall_notified: std::sync::atomic::AtomicBool::new(false),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1021,22 +1194,25 @@ fn start_output_stream(
     engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
-    master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
-    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<engine::AudioCommand>,
-    routing_rx: rtrb::Consumer<engine::CompiledRouting>,
-    routing_recycle_tx: rtrb::Producer<engine::CompiledRouting>,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
+    bundle_rx: rtrb::Consumer<RtBundle>,
+    bundle_recycle_tx: rtrb::Producer<RtBundle>,
 ) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .context("no default output device")?;
-    let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+    // cpal 0.17: `name()` は deprecated — `description()` (name + 種別) を使う。
+    let device_name = device
+        .description()
+        .map(|d| d.to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
     let supported = device
         .default_output_config()
         .context("failed to query default output config")?;
 
-    let sample_rate = supported.sample_rate().0;
+    let sample_rate = supported.sample_rate();
     let channels = supported.channels();
     let sample_format = supported.sample_format();
 
@@ -1061,11 +1237,10 @@ fn start_output_stream(
         engine_shared,
         bridge,
         metrics,
-        master_gain,
         session_sample_rate,
         cmd_rx,
-        routing_rx,
-        routing_recycle_tx,
+        bundle_rx,
+        bundle_recycle_tx,
     )?;
     stream.play().context("failed to start stream")?;
     Ok(stream)
@@ -1080,11 +1255,10 @@ fn build_stream(
     engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
-    master_gain: Arc<AtomicU32>,
     session_sample_rate: u32,
-    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<engine::AudioCommand>,
-    routing_rx: rtrb::Consumer<engine::CompiledRouting>,
-    routing_recycle_tx: rtrb::Producer<engine::CompiledRouting>,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
+    bundle_rx: rtrb::Consumer<RtBundle>,
+    bundle_recycle_tx: rtrb::Producer<RtBundle>,
 ) -> Result<cpal::Stream> {
     let channels_usize = channels as usize;
     let max_frames = common::process_data::MAX_FRAMES;
@@ -1092,11 +1266,11 @@ fn build_stream(
     // master_l/r and the per-track scratch — pre-allocated here, never
     // touched outside the audio thread.
     let mut local =
-        LocalState::new(max_frames, cmd_rx, engine_shared, routing_rx, routing_recycle_tx);
+        LocalState::new(max_frames, cmd_rx, engine_shared, bundle_rx, bundle_recycle_tx);
 
-    // panic-button master declick. `MainToChild::Panic` sets
+    // panic-button master declick. `AudioCommand::Panic` sets
     // `shared.panic_declick`; the callback consumes that edge and fades the
-    // master out, then HOLDS it at zero until `MainToChild::PanicRelease`
+    // master out, then HOLDS it at zero until `AudioCommand::PanicRelease`
     // (`shared.panic_release`) arrives — which daw_gui sends only once the
     // plugin host has actually finished `ReinitAllPlugins` (reply
     // `PluginsReinitDone`). Holding until the real reinit completion (rather
@@ -1117,11 +1291,31 @@ fn build_stream(
     let mut declick_released_at: Option<u64> = None;
     // resource monitor (r.md #3): DSP load average の EMA 状態。 callback 間で保持。
     let mut dsp_load_ema: f32 = 0.0;
+    // E (plan §5): callback thread を MMCSS "Pro Audio" に自前 join する
+    // one-shot フラグ (per-thread once — CPAL は単一 stream thread で callback
+    // を直列に呼ぶ)。
+    let mut mmcss_tried = false;
 
     let stream = device
         .build_output_stream(
             config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                if !mmcss_tried {
+                    mmcss_tried = true;
+                    // E (plan §5): RT 優先度ポリシーの SSoT を自プロセスに持つ
+                    // (cpal 0.17 の内部対応と独立に自前 join)。 join handle は
+                    // callback thread の寿命 = stream の寿命なので forget で
+                    // 保持 (revert は thread 終了時に OS 側で行われる)。 失敗は
+                    // フラグに立て、 notify thread が 1 回だけ warn する
+                    // (RT では tracing 禁止)。
+                    match common::mmcss::join_pro_audio() {
+                        Some(join) => std::mem::forget(join),
+                        None => local
+                            .shared
+                            .mmcss_join_failed
+                            .store(true, Ordering::Release),
+                    }
+                }
                 // resource monitor (r.md #3): callback 全体の処理時間を測る。
                 // plugin 処理は worker pool でブロッキング同期されるため、 この
                 // 区間に plugin 負荷が含まれる。 `Instant::now()` は RT 許容。
@@ -1138,8 +1332,6 @@ fn build_stream(
                 // 状態) として残す。
                 let published_ph = shared.playhead.load(Ordering::Acquire);
                 bridge.set_playhead_samples(published_ph);
-
-                let gain = f32::from_bits(master_gain.load(Ordering::Relaxed));
 
                 // consume the panic edge to (re)start the master
                 // declick envelope at sample 0 of this buffer.
@@ -1160,7 +1352,8 @@ fn build_stream(
                 }
 
                 // Interleave master_l/r into the device buffer, applying
-                // master_gain (and the panic declick envelope when active).
+                // the panic declick envelope when active (master gain は
+                // render_master_buffer 内で適用済み — live/export 統一 §5)。
                 // Lanes beyond stereo on the device are zeroed.
                 unsafe {
                     let dst = data.as_mut_ptr();
@@ -1174,8 +1367,8 @@ fn build_stream(
                             ),
                             None => 1.0,
                         };
-                        let l = local.master_l[i] * gain * dg;
-                        let r = local.master_r[i] * gain * dg;
+                        let l = local.master_l[i] * dg;
+                        let r = local.master_r[i] * dg;
                         let out = dst.add(i * channels_usize);
                         *out = l;
                         if channels_usize > 1 {
@@ -1320,5 +1513,33 @@ mod tests {
         // done: full gain once the fade-in completes.
         assert_eq!(panic_declick_gain(24, fo, fi, r), 1.0);
         assert_eq!(panic_declick_gain(10_000, fo, fi, r), 1.0);
+    }
+
+    /// BundlePublisher の drop-oldest: ring が full のとき新しい bundle が
+    /// park され (最新優先、 superseded parked は off-thread drop)、 space が
+    /// できたら flush で届く。
+    #[test]
+    fn bundle_publisher_parks_newest_on_full_ring() {
+        let (tx, mut rx) = rtrb::RingBuffer::<RtBundle>::new(1);
+        let mut publisher = BundlePublisher::new(tx);
+        let bundle = || RtBundle {
+            song: None,
+            tempo_map: common::tempo_map::TempoMap::from_song(
+                &common::model::Song::default(),
+            ),
+            schedule: None,
+            input_delay_replacements: Vec::new(),
+            plugin_refs: Arc::new(std::collections::HashMap::new()),
+            worker: None,
+        };
+        publisher.send(bundle()); // fills the 1-slot ring
+        publisher.send(bundle()); // full → parked
+        publisher.send(bundle()); // full → parked (previous parked dropped here)
+        assert!(publisher.parked.is_some());
+        // consumer drains one slot → flush delivers the parked newest.
+        assert!(rx.pop().is_ok());
+        publisher.flush();
+        assert!(publisher.parked.is_none());
+        assert!(rx.pop().is_ok());
     }
 }

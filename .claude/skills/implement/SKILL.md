@@ -19,7 +19,7 @@ $ARGUMENTS を実装する。
 
 - **理想とベストプラクティスを追求する。実装コストは無視して大胆に作り直す。**
   「実装コスト」「影響範囲」「現実的に」「妥協」が思考に出た時点で principle 違反
-  (PreToolUse hook `check_antipattern.ps1` が検出)。
+  (PreToolUse guard engine `scripts/guard_engine.py` + guards.jsonl の compromise-smell ルールが検出)。
 - **最終形まで一気に完成させる。フェーズ分けをしない。**「Phase 1 完成、次に進みますか」は禁止。
   ゴールまで完走する。
 - **まず調べる。推測で実装しない。** 一次情報 (DAW manual / CLAP spec / 参照実装 / gui_01 doc)
@@ -106,6 +106,24 @@ $ARGUMENTS を実装する。
 | 既存機能との相互作用 | Undo、保存／復元 (bincode/serde)、VOICEVOX キャッシュ、Arrangement、export に影響しないか？ |
 | SSoT | このデータは誰が所有し誰が更新するか。複製を作っていないか？ |
 | 類似プロダクトとの一致 | 調査した振る舞いを全部カバーしているか？ |
+
+#### アーキテクチャ影響チェック (CLAUDE.md「アーキテクチャ不変条件」)
+
+実装前に以下を列挙し、1 つでも該当したら `docs/plan_arch_refactor.md` の該当節を読んで
+不変条件に整合する形で設計する (整合しない要求はユーザーへ設計相談):
+
+- **新しい参照/アドレスを導入するか?** → 安定 id (device_id / send_id / 要素 id) 一本。
+  positional index・「削除時に貼り替える補償コード」は禁止 (不変条件 1)
+- **プロセス間で新しいデータを運ぶか?** → 宛先型 enum (AudioCommand 等) に variant を足す。
+  bulk (PCM / blob) は直載せしない (不変条件 2/3)。wire を渡る型を新ファイルへ置いたら
+  `common/build.rs` の WIRE_SOURCES に追加 (不変条件 7)
+- **Song を編集するか?** → `edit_song()` チョークポイント経由のみ (不変条件 5)
+- **RT パス (CPAL callback / worker / process()) に触れるか?** → 無限待ち・確保・解放禁止、
+  重い構築は off-thread + ring swap (不変条件 4)
+- **export / live の両方に効く音声処理か?** → `render_master_buffer` の中に入れる (不変条件 6)
+- **widget を作るか?** → DAW 固有なら daw_gui/src/widgets/ (common::model 直結)、
+  汎用なら ui/crates (ドメイン知識ゼロ)。mirror 型・翻訳 enum を作らない (不変条件 8)
+- **ファイルが 3,000 行に近いか?** → 先に分割 (不変条件 9)。`make arch-lint` で検査
 
 **要件一覧をユーザーに提示し、過不足の確認を取る。承認を得てから次へ進む**
 (`feedback_no_redundant_verification` — 未完成段階で実機確認を求めない)。

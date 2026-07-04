@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use common::model::Song;
 
 use super::delay_line::DelayLine;
-use super::schedule::{BufRef, NodeOp, Schedule};
+use super::schedule::{BufRef, DelayKey, NodeOp, Schedule};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphError {
@@ -39,13 +39,23 @@ pub enum GraphError {
 /// master). Tracks without a `parent_group_id` feed the master bus
 /// directly.
 ///
+/// `buffer_frames` = engine が 1 buffer で処理するフレーム数 (live = CPAL
+/// device period、export = `MAX_FRAMES`)。**leaf** track 宛の sidechain tap は
+/// staging (post-dispatch) と消費 (次 buffer の process) が 1 buffer ずれる
+/// ため、その補償として leaf 宛 sidechain edge の latency に加算される
+/// (`docs/plan_arch_refactor.md` §5)。bus (group / return / paraout dest) 宛は
+/// tap → 同 buffer 内の `ProcessGroupFx` / master fx 消費なので加算しない。
+///
 /// この compile は `Vec` / `HashMap` の heap 確保を伴うが、 **off-RT で実行される**:
-/// 呼び出し元は `main.rs::publish_routing` (receive / decode スレッド) と `export.rs`
-/// のみ。 RT パス (audio callback) は D1 (r.md #8) で wait-free SPSC (`rtrb`) 経由に
-/// pre-compiled な `CompiledRouting { song, schedule, tempo_map }` を pop して swap-in
-/// するだけになり、 この alloc は RT から完全に消えた (`Engine::refresh_schedule` 参照)。
-/// (旧 `TODO(PR3)`: かつては `refresh_schedule` が RT 上でこれを呼んでいた = D1 で解消済)
-pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, GraphError> {
+/// 呼び出し元は `main.rs` の publish 経路 (receive スレッド) と `export.rs`
+/// のみ。 RT パス (audio callback) は wait-free SPSC (`rtrb`) 経由に
+/// pre-compiled な `RtBundle` を pop して swap-in するだけで、 この alloc は
+/// RT から完全に消えている (`LocalState::refresh_bundle` 参照)。
+pub fn compile_schedule(
+    song: &Song,
+    sample_rate: u32,
+    buffer_frames: u32,
+) -> Result<Schedule, GraphError> {
     let n = song.tracks.len();
     if n == 0 {
         return Ok(Schedule {
@@ -53,11 +63,7 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
                 srcs: Vec::new(),
                 dst: BufRef::Master,
             }],
-            delay_lines: Vec::new(),
-            port_buffers: super::PortBufferPool::new(),
-            input_delay_per_track: Vec::new(),
-            follower_slots: Vec::new(),
-            mod_kinds: Vec::new(),
+            ..Schedule::empty()
         });
     }
 
@@ -95,41 +101,42 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
     }
 
     // ---- gather incoming aux sends per destination (return / bus) ----
-    // `incoming_sends[dest_id]` = list of (source track index, send index,
-    // tap mode) for every send landing on `dest_id`. Sends whose dest does
-    // not exist are dropped (tolerant, like dangling sidechain). A track
-    // with ≥1 incoming send acts as a bus (summed like a group) even with
-    // no children.
-    let mut incoming_sends: HashMap<u32, Vec<(u32, u8, common::model::SendMode)>> =
+    // `incoming_sends[dest_id]` = list of (source track index, stable
+    // `Send::id`, tap mode) for every send landing on `dest_id`. Sends whose
+    // dest does not exist are dropped (tolerant, like dangling sidechain). A
+    // track with ≥1 incoming send acts as a bus (summed like a group) even
+    // with no children. v29: positional send index は schedule に焼き込まない
+    // — engine は `send_id` で live lookup する。
+    let mut incoming_sends: HashMap<u32, Vec<(u32, u32, common::model::SendMode)>> =
         HashMap::new();
     for (src_idx, t) in song.tracks.iter().enumerate() {
-        for (send_idx, send) in t.sends.iter().enumerate() {
+        for send in &t.sends {
             if id_to_idx.contains_key(&send.dest_track_id) {
                 incoming_sends
                     .entry(send.dest_track_id)
                     .or_default()
-                    .push((src_idx as u32, send_idx as u8, send.mode));
+                    .push((src_idx as u32, send.id, send.mode));
             }
         }
     }
 
     // ---- パラアウト (docs/plan_paraout.md): gather incoming aux outputs per
     // destination. `incoming_paraout[dest_id]` = list of (source track id,
-    // source device index, aux out port) for every plugin aux output routed at
-    // `dest_id`. The source key is a **track id** (master fx → MASTER_TRACK_ID)
-    // because the engine resolves the source plugin via `slot_to_plugin_id`.
-    // Bounded by `MAX_AUX_OUT` (the engine only fills that many aux out ports).
-    // A track with ≥1 incoming paraout acts as a bus (summed + FX'd in pass 2),
-    // exactly like a group / return; routes to a missing dest are dropped
-    // (tolerant, like dangling sidechain / send). No DAG edge is added: the
-    // source plugin's aux output is produced in pass 1 (`buffer_aux_out`) and
-    // consumed in pass 2, so pass 1 always precedes the read — which is also
-    // why a group-with-instrument (A sums children B/C while B/C read A's aux)
-    // is NOT a cycle.
-    let mut incoming_paraout: HashMap<u32, Vec<(u32, u32, u8)>> = HashMap::new();
+    // stable device id, aux out port) for every plugin aux output routed at
+    // `dest_id`. v29: the engine resolves the source plugin directly by
+    // `device_id` (`PluginInstance::id`); the track id is kept only for the
+    // PDC fan-in below. Bounded by `MAX_AUX_OUT` (the engine only fills that
+    // many aux out ports). A track with ≥1 incoming paraout acts as a bus
+    // (summed + FX'd in pass 2), exactly like a group / return; routes to a
+    // missing dest are dropped (tolerant, like dangling sidechain / send). No
+    // DAG edge is added: the source plugin's aux output is produced in pass 1
+    // (`buffer_aux_out`) and consumed in pass 2, so pass 1 always precedes
+    // the read — which is also why a group-with-instrument (A sums children
+    // B/C while B/C read A's aux) is NOT a cycle.
+    let mut incoming_paraout: HashMap<u32, Vec<(u32, u64, u8)>> = HashMap::new();
     {
         let mut gather = |chain: &[common::model::PluginInstance], src_track_id: u32| {
-            for (dev_idx, p) in chain.iter().enumerate() {
+            for p in chain {
                 for (port, route_opt) in p
                     .aux_outputs
                     .iter()
@@ -141,7 +148,7 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
                         incoming_paraout
                             .entry(route.dest_track)
                             .or_default()
-                            .push((src_track_id, dev_idx as u32, port as u8));
+                            .push((src_track_id, p.id, port as u8));
                     }
                 }
             }
@@ -151,6 +158,23 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
         }
         gather(&song.master_fx_chain, common::model::MASTER_TRACK_ID);
     }
+
+    // ---- bus / leaf classification (shared by op emission + PDC) ----
+    // A track is a "bus" if it has children (a group), incoming sends (a
+    // return), or incoming paraout (a parallel-out destination). A bus's
+    // devices run in pass 2 (`ProcessGroupFx` / master fx) *after* the
+    // sidechain taps of the same buffer; a leaf's devices ran in pass 1
+    // *before* them — so leaf-destined taps are consumed one buffer late
+    // and get `buffer_frames` of extra latency in the PDC math below.
+    let bus_flags: Vec<bool> = song
+        .tracks
+        .iter()
+        .map(|t| {
+            is_group.contains(&t.id)
+                || incoming_sends.contains_key(&t.id)
+                || incoming_paraout.contains_key(&t.id)
+        })
+        .collect();
 
     // ---- detect cycles in path_latency dependency graph ----
     //
@@ -248,17 +272,13 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
         // `process()` (i.e. before ProcessTrack / ProcessGroupFx for
         // this track) so the engine can stage the source signal in the
         // plugin's `pd.buffer_aux_in[port]` shmem region.
-        emit_aux_input_taps(&track.devices, track.id, &id_to_idx, &mut nodes);
+        emit_aux_input_taps(&track.devices, &id_to_idx, &mut nodes);
 
-        // A track is a "bus" if it has children (a group), incoming sends
-        // (a return), or incoming paraout (a parallel-out destination).
-        // Either way it sums its inputs into its own scratch and runs its fx
-        // chain + strip via ProcessGroupFx, rather than rendering its own
-        // clips / instrument as a leaf (Ableton return-track semantics). A
-        // track with none of these is a plain leaf.
-        let is_bus = is_group.contains(&track.id)
-            || incoming_sends.contains_key(&track.id)
-            || incoming_paraout.contains_key(&track.id);
+        // A bus sums its inputs into its own scratch and runs its fx chain +
+        // strip via ProcessGroupFx, rather than rendering its own clips /
+        // instrument as a leaf (Ableton return-track semantics). A track that
+        // is not a bus is a plain leaf. (classification precomputed above)
+        let is_bus = bus_flags[i as usize];
         if is_bus {
             // パラアウト (docs/plan_paraout.md): a group track whose own device
             // chain routes an aux output is a parallel-out **source**. Its
@@ -302,13 +322,12 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
             // パラアウト: accumulate each plugin aux output routed INTO this
             // track on top of the children. The source plugin's aux output is
             // produced in pass 1, so this tap (pass 2) always sees settled
-            // data — zero latency. `src_track` is a track id (slot lookup),
-            // `dst_track` is this bus's scratch **index**.
+            // data — zero latency. `device_id` は安定 id (直接 plugin_refs を
+            // 引ける)、`dst_track` is this bus's scratch **index**.
             if let Some(edges) = incoming_paraout.get(&track.id) {
-                for &(src_track_id, src_device, port) in edges {
+                for &(_, device_id, port) in edges {
                     nodes.push(NodeOp::ParallelOutTap {
-                        src_track: src_track_id,
-                        src_device,
+                        device_id,
                         port,
                         dst_track: track_idx,
                     });
@@ -318,7 +337,7 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
             // post- or pre-fader buffer. The gain is applied live by the
             // engine (`MixSend`), not baked here.
             if let Some(edges) = incoming_sends.get(&track.id) {
-                for &(src_idx, send_idx, mode) in edges {
+                for &(src_idx, send_id, mode) in edges {
                     let src = match mode {
                         common::model::SendMode::PostFader => BufRef::TrackScratch(src_idx),
                         common::model::SendMode::PreFader => BufRef::PreFaderScratch(src_idx),
@@ -327,7 +346,7 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
                         src,
                         dst: BufRef::TrackScratch(track_idx),
                         src_track_idx: src_idx,
-                        send_idx,
+                        send_id,
                     });
                 }
             }
@@ -358,12 +377,7 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
     // `process_master_fx_chain` が plugin process でそれを読む。 dst_track は
     // `MASTER_TRACK_ID` (master は audio fx のみ)。 track 経路と同じ
     // `emit_aux_input_taps` を使う (critique #1: emit site の単一化)。
-    emit_aux_input_taps(
-        &song.master_fx_chain,
-        common::model::MASTER_TRACK_ID,
-        &id_to_idx,
-        &mut nodes,
-    );
+    emit_aux_input_taps(&song.master_fx_chain, &id_to_idx, &mut nodes);
 
     // ---- PR3: Plugin Delay Compensation ----
     //
@@ -391,6 +405,8 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
             &children_of,
             &id_to_idx,
             &incoming_sends,
+            &bus_flags,
+            buffer_frames,
             &mut path_latency,
         );
     }
@@ -436,13 +452,24 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
     // 既存の nodes を線形に走査し、 Mix / MixAdditive を見つけたらその直前に
     // `ApplyDelay` を挿入する。 in-place 操作よりも build-from-scratch
     // の方が境界条件が単純なので、 一度別 Vec に組み直す。
+    // §5 D: 各 DelayLine には stable key (`DelayKey`) を平行 Vec で持たせ、
+    // 再 compile 時に `Schedule::adopt_state_from` が ring の内容を移送する。
     let mut delay_lines: Vec<DelayLine> = Vec::new();
+    let mut delay_keys: Vec<DelayKey> = Vec::new();
+    let track_ids: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
     let mut nodes_with_pdc: Vec<NodeOp> = Vec::with_capacity(nodes.len() + n);
     for op in nodes.into_iter() {
         match &op {
             // clearing Mix: 全 src を最大 path latency に揃える。
             NodeOp::Mix { srcs, .. } => {
-                emit_mix_src_alignment(srcs, &path_latency, &mut delay_lines, &mut nodes_with_pdc);
+                emit_mix_src_alignment(
+                    srcs,
+                    &path_latency,
+                    &track_ids,
+                    &mut delay_lines,
+                    &mut delay_keys,
+                    &mut nodes_with_pdc,
+                );
             }
             // パラアウト MixAdditive (docs/plan_paraout.md): 子 (srcs) を揃える
             // のに加え、 dst (= group-with-instrument 自身の scratch にある prefix
@@ -454,11 +481,20 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
                 srcs,
                 dst: BufRef::TrackScratch(a_idx),
             } => {
-                let max_path =
-                    emit_mix_src_alignment(srcs, &path_latency, &mut delay_lines, &mut nodes_with_pdc);
+                let max_path = emit_mix_src_alignment(
+                    srcs,
+                    &path_latency,
+                    &track_ids,
+                    &mut delay_lines,
+                    &mut delay_keys,
+                    &mut nodes_with_pdc,
+                );
                 if max_path > 0 {
                     let line_idx = delay_lines.len() as u32;
                     delay_lines.push(DelayLine::with_capacity((max_path as usize) + 1));
+                    delay_keys.push(DelayKey::MixDst {
+                        track_id: track_ids.get(*a_idx as usize).copied().unwrap_or(0),
+                    });
                     nodes_with_pdc.push(NodeOp::ApplyDelay {
                         buf: BufRef::TrackScratch(*a_idx),
                         line_idx,
@@ -480,8 +516,13 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
     // audio input and an audio output) can read a sidechain, so only those
     // contribute (a pure source / MIDI device has no main-in to delay against).
     // v23 single-chain: a direct port predicate, no role derivation. Edit-time.
+    // §5 (arch refactor): leaf 宛の tap は staging→消費が 1 buffer ずれるので
+    // `buffer_frames` を加算して plugin 入力での main vs aux を位相一致させる
+    // (compute_path_latency の sidechain edge と同じ規則 — 両者は同値でなければ
+    // master 合流の sibling alignment とズレる)。
     let mut input_delay_per_track = vec![0u32; n];
     for (i, track) in song.tracks.iter().enumerate() {
+        let tap_lag = if bus_flags[i] { 0 } else { buffer_frames };
         let mut max_sc: u32 = 0;
         for p in &track.devices {
             if !(p.ports.has_audio_input && p.ports.has_audio_output) {
@@ -489,7 +530,7 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
             }
             for route in p.aux_inputs.iter().flatten() {
                 if let Some(&src_idx) = id_to_idx.get(&route.tap.source_track) {
-                    let l = path_latency[src_idx as usize];
+                    let l = path_latency[src_idx as usize].saturating_add(tap_lag);
                     if l > max_sc {
                         max_sc = l;
                     }
@@ -513,6 +554,7 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
     // で、 engine が `common::modulators::generator_scalar` を `song_beat` から評価して
     // publish する (`mod_kinds` を保持)。
     let mut follower_slots: Vec<super::follower::FollowerSlot> = Vec::new();
+    let mut follower_keys: Vec<u32> = Vec::new();
     let mut mod_kinds: Vec<common::model::ModSourceKind> = Vec::new();
     for (slot, ms) in song
         .mod_sources
@@ -521,6 +563,8 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
         .enumerate()
     {
         mod_kinds.push(ms.kind.clone());
+        // §5 D: 状態移送キー = ModSource の安定 id (0 = 未採番、移送対象外)。
+        follower_keys.push(ms.id);
         match &ms.kind {
             common::model::ModSourceKind::EnvelopeFollower { tap, follower } => {
                 follower_slots.push(super::follower::FollowerSlot::from_config(
@@ -549,9 +593,11 @@ pub fn compile_schedule(song: &Song, sample_rate: u32) -> Result<Schedule, Graph
     Ok(Schedule {
         nodes: nodes_with_pdc,
         delay_lines,
+        delay_keys,
         port_buffers: super::PortBufferPool::new(),
         input_delay_per_track,
         follower_slots,
+        follower_keys,
         mod_kinds,
     })
 }
@@ -583,11 +629,10 @@ fn tap_bufref(tap_point: common::model::TapPoint, src_idx: u32) -> BufRef {
 
 fn emit_aux_input_taps(
     chain: &[common::model::PluginInstance],
-    dst_track: u32,
     id_to_idx: &HashMap<u32, u32>,
     nodes: &mut Vec<NodeOp>,
 ) {
-    for (device_index, inst) in chain.iter().enumerate() {
+    for inst in chain {
         // aux port は engine が `MAX_AUX_IN` までしか staging しないので
         // `take(MAX_AUX_IN)` で `port_idx < MAX_AUX_IN` を構造的に保証し、
         // `as u8` の wrap を防ぐ。
@@ -604,10 +649,12 @@ fn emit_aux_input_taps(
                 // dangling reference: silently skip
                 continue;
             };
+            // v29: 宛先 plugin は安定 device id で焼き込む。id 未採番 (0) の
+            // instance は engine 側 lookup が必ず外れる (= 旧来の「lookup miss
+            // で skip」と同じ寛容さ) なのでここでは弾かない。
             nodes.push(NodeOp::SidechainTap {
                 src: tap_bufref(route.tap.tap_point, src_idx),
-                dst_track,
-                dst_index: u32::try_from(device_index).unwrap_or(u32::MAX),
+                device_id: inst.id,
                 aux_in_port: port_idx as u8,
             });
         }
@@ -643,6 +690,11 @@ fn emit_aux_input_taps(
 ///
 /// dangling reference (= sidechain source が song に存在しない) は wrap せず
 /// 0 として扱う (compile error にしない方針、 編集中の中間状態を許容)。
+/// §5 (arch refactor): sidechain edge の実効 latency には、**leaf** 宛のとき
+/// `buffer_frames` (tap staging→消費の 1-buffer 遅延) が加算される。bus
+/// (group / return / paraout dest) 宛は同 buffer 内消費なので 0。
+/// `input_delay_per_track` の計算と同じ規則を使わないと、plugin 入力での
+/// main/aux 揃えと master 合流の sibling alignment がズレる。
 #[allow(clippy::too_many_arguments)]
 fn compute_path_latency(
     idx: u32,
@@ -650,7 +702,9 @@ fn compute_path_latency(
     is_group: &HashSet<u32>,
     children_of: &HashMap<u32, Vec<u32>>,
     id_to_idx: &HashMap<u32, u32>,
-    incoming_sends: &HashMap<u32, Vec<(u32, u8, common::model::SendMode)>>,
+    incoming_sends: &HashMap<u32, Vec<(u32, u32, common::model::SendMode)>>,
+    bus_flags: &[bool],
+    buffer_frames: u32,
     cache: &mut [u32],
 ) -> u32 {
     if cache[idx as usize] != u32::MAX {
@@ -671,6 +725,8 @@ fn compute_path_latency(
                             children_of,
                             id_to_idx,
                             incoming_sends,
+                            bus_flags,
+                            buffer_frames,
                             cache,
                         )
                     })
@@ -682,6 +738,8 @@ fn compute_path_latency(
         0
     };
 
+    // leaf 宛 tap の staging lag (moduleコメント参照)。
+    let tap_lag = if bus_flags[idx as usize] { 0 } else { buffer_frames };
     let mut sidechain_input: u32 = 0;
     let mut consider = |src_id_opt: &Option<u32>, cache: &mut [u32]| {
         if let Some(src_id) = src_id_opt
@@ -694,8 +752,11 @@ fn compute_path_latency(
                 children_of,
                 id_to_idx,
                 incoming_sends,
+                bus_flags,
+                buffer_frames,
                 cache,
-            );
+            )
+            .saturating_add(tap_lag);
             if l > sidechain_input {
                 sidechain_input = l;
             }
@@ -725,6 +786,8 @@ fn compute_path_latency(
                 children_of,
                 id_to_idx,
                 incoming_sends,
+                bus_flags,
+                buffer_frames,
                 cache,
             );
             if l > send_input {
@@ -744,11 +807,14 @@ fn compute_path_latency(
 /// Returns the max path latency over the srcs — `MixAdditive` uses it to also
 /// align the dst's own pre-existing signal (the パラアウト instrument main,
 /// `docs/plan_paraout.md`). Shared by the `Mix` and `MixAdditive` arms of the
-/// PDC pass so the two stay in lock-step.
+/// PDC pass so the two stay in lock-step. `track_ids` は delay line の
+/// stable key (`DelayKey::MixSrc`) 用の song-track-index → `Track::id` 表。
 fn emit_mix_src_alignment(
     srcs: &[(BufRef, f32)],
     path_latency: &[u32],
+    track_ids: &[u32],
     delay_lines: &mut Vec<DelayLine>,
+    delay_keys: &mut Vec<DelayKey>,
     out: &mut Vec<NodeOp>,
 ) -> u32 {
     let max_path = srcs
@@ -768,9 +834,12 @@ fn emit_mix_src_alignment(
             let comp = max_path - this;
             let line_idx = delay_lines.len() as u32;
             // DelayLine.step は `delay <= capacity - 1` を要求
-            // (`delay_line.rs:55-56` の clamp ロジック)。 補償量ちょうどを
+            // (`delay_line.rs` の clamp ロジック)。 補償量ちょうどを
             // 返すために capacity = comp + 1。
             delay_lines.push(DelayLine::with_capacity((comp as usize) + 1));
+            delay_keys.push(DelayKey::MixSrc {
+                track_id: track_ids.get(*i as usize).copied().unwrap_or(0),
+            });
             out.push(NodeOp::ApplyDelay {
                 buf: BufRef::TrackScratch(*i),
                 line_idx,
@@ -831,7 +900,7 @@ mod tests {
     #[test]
     fn empty_song_compiles_to_master_only_mix() {
         let song = Song::default();
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
         assert_eq!(sched.nodes.len(), 1);
         match &sched.nodes[0] {
             NodeOp::Mix { dst, srcs } => {
@@ -865,7 +934,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
         // Depth ordering is stable for a flat song, so ProcessTrack ops
         // appear in reverse-track-order (depth=0 group is just descending
         // index order); both ways the Mix at the end carries both refs.
@@ -926,7 +995,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         // Expect (in some order): two leaf ProcessTrack (kick, snare),
         // group's Mix-into-self + ProcessGroupFx, lead ProcessTrack, then
@@ -1039,7 +1108,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         let audio_pos = sched
             .nodes
@@ -1092,7 +1161,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song, 48_000).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule(&song, 48_000, 0).err(), Some(GraphError::Cycle));
     }
 
     #[test]
@@ -1112,7 +1181,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
         // Track 1 should emit Mix → TrackScratch(0) + ProcessGroupFx(0),
         // not ProcessTrack(0).
         let has_group_fx = sched
@@ -1140,7 +1209,7 @@ mod tests {
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&song, 48_000).err(),
+            compile_schedule(&song, 48_000, 0).err(),
             Some(GraphError::DanglingReference(99))
         );
     }
@@ -1173,7 +1242,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         // (a) DelayLine が 1 本以上、 capacity ≥ 100 で確保されている。
         assert!(
@@ -1278,7 +1347,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let mut sched = compile_schedule(&song, 48_000).unwrap();
+        let mut sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         // Track ごとに「ロードされた plugin」 を持たせる。 production の
         // CLAP/VST3 と違って format-agnostic な test stub だが、
@@ -1474,20 +1543,20 @@ mod tests {
 
     // ---- PR4 Sidechain ----
 
-    /// Compile-level test: Track 2 (index 1) の Fx(0) plugin に
-    /// `sidechain_sources = [Some(track_1.id)]` が設定されているとき、
+    /// Compile-level test: Track 2 (index 1) の device 0 (device_id 77) に
+    /// `aux_inputs = [Some(track_1)]` が設定されているとき、
     /// `compile_schedule` は次の順で nodes を emit する。
     ///
     /// 1. `ProcessTrack(0)` (Track 1、 source)
-    /// 2. `SidechainTap { src: TrackScratch(0), dst_track: 2,
-    ///    dst_slot: Fx(0), aux_in_port: 0 }`
+    /// 2. `SidechainTap { src: TrackScratch(0), device_id: 77, aux_in_port: 0 }`
     /// 3. `ProcessTrack(1)` (Track 2、 receiver)
     /// 4. `Mix` → Master
     ///
     /// 順序が肝: SidechainTap は Track 1 の scratch が埋まった **後** で
     /// Track 2 の plugin が process() を呼ばれる **前** に挿入される。
-    /// engine.rs はこの op を見て plugin の `pd.buffer_aux_in[0]` に
+    /// engine 側はこの op を見て plugin の `pd.buffer_aux_in[0]` に
     /// Track 1 の signal を copy してから plugin.process() を dispatch する。
+    /// v29: 宛先 plugin は安定 device id で焼き込まれる。
     #[test]
     fn sidechain_emits_tap_before_destination_process_track() {
         use common::model::PluginInstance;
@@ -1503,6 +1572,7 @@ mod tests {
                     t.id = 2;
                     t.name = "Dest".into();
                     t.devices = vec![PluginInstance {
+                        id: 77,
                         // aux input port 0 ← Track 1's output
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                         ..PluginInstance::with_ports(
@@ -1515,9 +1585,9 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
-        // (a) SidechainTap が emit されている。
+        // (a) SidechainTap が emit されている (安定 device id で addressing)。
         let tap_idx = sched
             .nodes
             .iter()
@@ -1526,15 +1596,14 @@ mod tests {
                     op,
                     NodeOp::SidechainTap {
                         src: BufRef::TrackScratch(0),
-                        dst_track: 2,
-                        dst_index: 0,
+                        device_id: 77,
                         aux_in_port: 0,
                     }
                 )
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "expected SidechainTap (src=TrackScratch(0), dst=2,Fx(0), port=0); \
+                    "expected SidechainTap (src=TrackScratch(0), device_id=77, port=0); \
                      nodes={:?}",
                     sched.nodes
                 )
@@ -1567,7 +1636,7 @@ mod tests {
 
     #[test]
     fn master_fx_sidechain_emits_tap_after_master_mix() {
-        use common::model::{PluginInstance, MASTER_TRACK_ID};
+        use common::model::PluginInstance;
         use common::plugin_format::PluginFormat;
 
         // Track 1 → master bus fx[0] の aux input。 master fx の SidechainTap は
@@ -1578,6 +1647,7 @@ mod tests {
                 t.name = "Source".into();
             })],
             master_fx_chain: vec![PluginInstance {
+                id: 900,
                 aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                 ..PluginInstance::with_ports(
                     "test.bus_comp".into(),
@@ -1587,7 +1657,7 @@ mod tests {
             }],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         let tap_idx = sched
             .nodes
@@ -1597,15 +1667,14 @@ mod tests {
                     op,
                     NodeOp::SidechainTap {
                         src: BufRef::TrackScratch(0),
-                        dst_track,
-                        dst_index: 0,
+                        device_id: 900,
                         aux_in_port: 0,
-                    } if *dst_track == MASTER_TRACK_ID
+                    }
                 )
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "expected master SidechainTap (src=TrackScratch(0), dst=MASTER,Fx(0)); \
+                    "expected master SidechainTap (src=TrackScratch(0), device_id=900); \
                      nodes={:?}",
                     sched.nodes
                 )
@@ -1682,7 +1751,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         // Master Mix の input は (TrackScratch(0), TrackScratch(1)) の 2 本。
         // path_latency(A=0) = 100, path_latency(B=1) = 100 + 50 = 150 になっている
@@ -1788,7 +1857,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         assert_eq!(
             sched.input_delay_per_track.len(),
@@ -1807,6 +1876,71 @@ mod tests {
         assert_eq!(
             sched.input_delay_per_track[2], 0,
             "Bystander has no sidechain wiring, input_delay = 0"
+        );
+    }
+
+    /// §5 (arch refactor): **leaf** 宛の sidechain tap は staging (post-
+    /// dispatch) と消費 (次 buffer の pass-1 process) が 1 buffer ずれるので、
+    /// `buffer_frames` が入力遅延と path latency の両方に加算される。bus 宛
+    /// (return の ProcessGroupFx) は同 buffer 消費なので加算されない。
+    #[test]
+    fn pdc_leaf_sidechain_tap_adds_one_buffer_of_lag() {
+        use common::model::{PluginInstance, Send, SendMode};
+        use common::plugin_format::PluginFormat;
+
+        const BUF: u32 = 512;
+        let sc_device = |id: u64| PluginInstance {
+            id,
+            aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
+            ..PluginInstance::with_ports(
+                "test.compressor".into(),
+                PluginFormat::Vst3,
+                audio_fx_ports(),
+            )
+        };
+        let song = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.name = "Source".into();
+                    t.reported_latency_samples = 100;
+                    // Bus (id 3) へ send → id 3 は return bus になる。
+                    t.sends = vec![Send {
+                        id: 1,
+                        dest_track_id: 3,
+                        gain: 1.0,
+                        mode: SendMode::PostFader,
+                        enabled: true,
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.name = "LeafDest".into();
+                    t.devices = vec![sc_device(20)];
+                }),
+                track(|t| {
+                    t.id = 3;
+                    t.name = "BusDest".into();
+                    t.devices = vec![sc_device(30)];
+                }),
+            ],
+            ..Song::default()
+        };
+        let sched = compile_schedule(&song, 48_000, BUF).unwrap();
+
+        // leaf 宛: source path latency (100) + 1 buffer (512)。
+        assert_eq!(
+            sched.input_delay_per_track[1],
+            100 + BUF,
+            "leaf-destined tap must include the 1-buffer staging lag"
+        );
+        // bus 宛 (return): 同 buffer 消費なので lag 加算なし。入力遅延自体
+        // bus では未使用 (ProcessGroupFx は input_delay を適用しない) だが、
+        // 規則の対称性を検証する。
+        assert_eq!(
+            sched.input_delay_per_track[2],
+            100,
+            "bus-destined tap is consumed in the same buffer (no extra lag)"
         );
     }
 
@@ -1845,7 +1979,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         // path_latency は instrument の sidechain も拾う (= 100 + 0 = 100)
         // ので master mix の sibling alignment は機能する。
@@ -1895,7 +2029,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song, 48_000).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule(&song, 48_000, 0).err(), Some(GraphError::Cycle));
     }
 
     /// 同じく compile-level test: `sidechain_sources` の対象 track が
@@ -1924,7 +2058,7 @@ mod tests {
             })],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
         assert!(
             !sched
                 .nodes
@@ -1948,6 +2082,7 @@ mod tests {
                     t.id = 1;
                     t.name = "Vocal".into();
                     t.sends = vec![Send {
+                        id: 11,
                         dest_track_id: 2,
                         gain: 0.5,
                         mode: SendMode::PostFader,
@@ -1961,7 +2096,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         // Vocal is a leaf → ProcessTrack(0). Reverb has an incoming send,
         // so it is a bus → Mix(clear) + MixSend + ProcessGroupFx(1).
@@ -1993,7 +2128,7 @@ mod tests {
                         src: BufRef::TrackScratch(0),
                         dst: BufRef::TrackScratch(1),
                         src_track_idx: 0,
-                        send_idx: 0,
+                        send_id: 11,
                     }
                 )
             })
@@ -2049,6 +2184,7 @@ mod tests {
                     t.id = 1;
                     t.name = "Vocal".into();
                     t.sends = vec![Send {
+                        id: 1,
                         dest_track_id: 2,
                         gain: 1.0,
                         mode: SendMode::PreFader,
@@ -2062,7 +2198,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
         assert!(
             sched.nodes.iter().any(|op| matches!(
                 op,
@@ -2086,6 +2222,7 @@ mod tests {
                 t.id = 1;
                 t.name = "A".into();
                 t.sends = vec![Send {
+                    id: 1,
                     dest_track_id: 1, // sends to itself
                     gain: 1.0,
                     mode: SendMode::PostFader,
@@ -2094,7 +2231,7 @@ mod tests {
             })],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song, 48_000).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule(&song, 48_000, 0).err(), Some(GraphError::Cycle));
     }
 
     #[test]
@@ -2107,6 +2244,7 @@ mod tests {
                     t.id = 1;
                     t.name = "A".into();
                     t.sends = vec![Send {
+                        id: 1,
                         dest_track_id: 2,
                         gain: 1.0,
                         mode: SendMode::PostFader,
@@ -2117,6 +2255,7 @@ mod tests {
                     t.id = 2;
                     t.name = "B".into();
                     t.sends = vec![Send {
+                        id: 1,
                         dest_track_id: 1,
                         gain: 1.0,
                         mode: SendMode::PostFader,
@@ -2126,7 +2265,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song, 48_000).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule(&song, 48_000, 0).err(), Some(GraphError::Cycle));
     }
 
     #[test]
@@ -2138,6 +2277,7 @@ mod tests {
                 t.id = 1;
                 t.name = "Lone".into();
                 t.sends = vec![Send {
+                    id: 1,
                     dest_track_id: 99, // no such track
                     gain: 1.0,
                     mode: SendMode::PostFader,
@@ -2146,7 +2286,7 @@ mod tests {
             })],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
         assert!(
             !sched
                 .nodes
@@ -2180,6 +2320,7 @@ mod tests {
                     t.name = "Vocal".into();
                     t.reported_latency_samples = 0;
                     t.sends = vec![Send {
+                        id: 1,
                         dest_track_id: 2,
                         gain: 0.5,
                         mode: SendMode::PostFader,
@@ -2194,7 +2335,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).unwrap();
+        let sched = compile_schedule(&song, 48_000, 0).unwrap();
 
         let master_mix = sched
             .nodes
@@ -2266,6 +2407,7 @@ mod tests {
                     t.id = 1;
                     t.name = "Drums".into();
                     t.devices = vec![PluginInstance {
+                        id: 10,
                         // port 0 (main) → 子2, port 1 (aux bus 0) → 子3 = 全部子
                         aux_outputs: vec![
                             Some(AuxOutputRoute::to_track(2)),
@@ -2292,13 +2434,14 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).expect("全部子 must not cycle");
+        let sched = compile_schedule(&song, 48_000, 0).expect("全部子 must not cycle");
 
         // (a) ParallelOutTap per port: main(port0) → 子2(idx1), aux0(port1) → 子3(idx2).
+        //     v29: source plugin は安定 device id (10) で焼き込まれる。
         assert!(
             sched.nodes.iter().any(|op| matches!(
                 op,
-                NodeOp::ParallelOutTap { src_track: 1, src_device: 0, port: 0, dst_track: 1 }
+                NodeOp::ParallelOutTap { device_id: 10, port: 0, dst_track: 1 }
             )),
             "expected ParallelOutTap main(port0) → 子2(idx1); nodes={:?}",
             sched.nodes
@@ -2306,7 +2449,7 @@ mod tests {
         assert!(
             sched.nodes.iter().any(|op| matches!(
                 op,
-                NodeOp::ParallelOutTap { src_track: 1, src_device: 0, port: 1, dst_track: 2 }
+                NodeOp::ParallelOutTap { device_id: 10, port: 1, dst_track: 2 }
             )),
             "expected ParallelOutTap aux0(port1) → 子3(idx2)"
         );
@@ -2385,6 +2528,7 @@ mod tests {
                     t.id = 1;
                     t.name = "Drums".into();
                     t.devices = vec![PluginInstance {
+                        id: 10,
                         aux_outputs: vec![Some(AuxOutputRoute::to_track(4))],
                         aux_output_count: 1,
                         ..PluginInstance::with_ports(
@@ -2401,7 +2545,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).expect("independent paraout must not cycle");
+        let sched = compile_schedule(&song, 48_000, 0).expect("independent paraout must not cycle");
 
         // A (idx 0) is a plain leaf: ProcessTrack, no MixAdditive.
         assert!(
@@ -2416,13 +2560,13 @@ mod tests {
             !sched.nodes.iter().any(|op| matches!(op, NodeOp::MixAdditive { .. })),
             "no MixAdditive when the source has no children"
         );
-        // D (idx 1) is a paraout-dest bus receiving A's aux.
+        // D (idx 1) is a paraout-dest bus receiving A's aux (device_id 10).
         assert!(
             sched.nodes.iter().any(|op| matches!(
                 op,
-                NodeOp::ParallelOutTap { src_track: 1, src_device: 0, port: 0, dst_track: 1 }
+                NodeOp::ParallelOutTap { device_id: 10, port: 0, dst_track: 1 }
             )),
-            "expected ParallelOutTap A.dev0.port0 → D(idx1); nodes={:?}",
+            "expected ParallelOutTap A.dev(10).port0 → D(idx1); nodes={:?}",
             sched.nodes
         );
         assert!(
@@ -2482,7 +2626,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).expect("must compile");
+        let sched = compile_schedule(&song, 48_000, 0).expect("must compile");
 
         let add_mix = sched
             .nodes
@@ -2555,7 +2699,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000).expect("must compile");
+        let sched = compile_schedule(&song, 48_000, 0).expect("must compile");
 
         let master_mix = sched
             .nodes

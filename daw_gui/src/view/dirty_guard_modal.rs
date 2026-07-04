@@ -38,7 +38,7 @@ const MODAL_STYLE: ModalStyle = ModalStyle {
 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
-    let Some(action) = app.dirty_guard.as_ref() else {
+    let Some(action) = app.ui_ephemeral.dirty_guard.as_ref() else {
         return;
     };
     if !ui.is_modal_open("dirty_guard") {
@@ -62,7 +62,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // 表示用プロジェクト名 (未保存新規は "Untitled")。 = いま破棄しようとしている
     // (未保存変更を持つ) プロジェクト。
     let project_name = app
-        .file_path
+        .song_doc.file_path
         .as_ref()
         .and_then(|p| p.file_stem())
         .and_then(|s| s.to_str())

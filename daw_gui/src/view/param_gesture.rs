@@ -4,7 +4,7 @@
 //!
 //! `was_dragging` は caller が `AppData.active_param_gestures` から引いて渡す。
 //! 同 frame で widget が `Edit::mutate` を push → 次 frame の
-//! `app.active_param_gestures` が反映 → `was_dragging` が更新、 という 1
+//! `app.recording.active_param_gestures` が反映 → `was_dragging` が更新、 という 1
 //! frame 遅延 chain で edge が安定検知される。 race なし (= immediate-mode 各
 //! frame 間で edit queue が必ず drain される)。
 

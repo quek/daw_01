@@ -92,6 +92,19 @@ impl FollowerSlot {
         }
     }
 
+    /// Schedule 再 compile 間の状態移送 (`Schedule::adopt_state_from`)。
+    /// 係数 (attack/release/gain/band cutoff — 新 config 由来) は保持した
+    /// まま、走行状態 (`env` + band filter state) だけを `old` から引き継ぐ。
+    /// これで topology 編集ごとに follower env が 0 へ落ちて変調先が段差を
+    /// 踏む問題が消える。RT-safe: f32 コピーのみ。
+    pub fn adopt_state_from(&mut self, old: &FollowerSlot) {
+        self.env = old.env;
+        if let (Some(nb), Some(ob)) = (self.band.as_mut(), old.band.as_ref()) {
+            nb.lp_hp = ob.lp_hp;
+            nb.lp = ob.lp;
+        }
+    }
+
     /// Advance the envelope over `n` frames of the source track's stereo
     /// scratch. Order matches docs/plan_modulation.md §3: stereo detector →
     /// optional band filter → pre-gain → rectify → attack/release one-pole.

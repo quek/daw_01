@@ -87,7 +87,7 @@ const FPS_PRESETS: &[(&str, f32)] = &[
 const FPS_DEFAULT_IDX: usize = 2;
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
-    let Some(picker) = app.export_range_picker else {
+    let Some(picker) = app.ui_ephemeral.export_range_picker else {
         if ui.is_modal_open("export_range") {
             ui.close_modal("export_range");
         }
@@ -97,12 +97,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
         ui.open_modal("export_range");
     }
 
-    let time_sig = app.song.time_sig;
+    let time_sig = app.song_doc.song().time_sig;
     let kind = picker.kind;
     let start_beat = picker.start_beat;
     let end_beat = picker.end_beat;
     // dblclick リセット時の default: 開始=曲頭(0)、 終了=曲末(length_beats)。
-    let song_len = app.song.length_beats;
+    let song_len = app.song_doc.song().length_beats;
     // Mp4 のときだけ出力解像度 / fps の dropdown を出す。 値は picker が
     // 保持する per-export override (open 時に Song から seed 済み)。
     let is_mp4 = matches!(kind, ExportRangeKind::Mp4);

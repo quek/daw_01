@@ -2,34 +2,33 @@
 
 //! VST3 plugin wrapper.
 //!
-//! Implements [`LoadedPlugin`] for VST3 backends. Uses `vst3` crate 0.3 for
-//! the raw COM bindings and `libloading` to resolve `GetPluginFactory` from
-//! the `.vst3` DLL (bundle layout `Contents/x86_64-win/<name>.vst3` on
-//! Windows, or a legacy single-file `.vst3` DLL).
+//! Split-half (`docs/plan_arch_refactor.md` §6): [`Vst3Plugin`] is the
+//! main-thread half (lifecycle / GUI / state / ARA / params), and
+//! [`Vst3AudioHalf`] is the audio-thread half (everything `process()`
+//! touches). The audio half holds a **non-owning** `IAudioProcessor`
+//! pointer (`ComRef` at call time, no refcount) so a stale registry
+//! snapshot dropping its `Arc<AudioHalf>` after the main half unloaded the
+//! DLL never calls `Release()` into unmapped code — the pointer is only
+//! *used* inside dispatch windows, which the quiesce protocol serializes
+//! against teardown.
 //!
-//! Lifecycle mirrors CLAP:
-//!   load → activate → start_processing → process* → stop_processing →
-//!   deactivate → drop.
-//!
-//! Threading: everything here runs on the plugin-main thread except
-//! `start_processing` / `stop_processing` / `process` / `output_buffer` /
-//! `drain_out_notes_into`, which the audio thread touches via a raw
-//! pointer. VST3 partitions its API the same way CLAP does, so long as
-//! plugins respect the spec this is safe.
+//! Cross-half shared state is limited to lock-free primitives:
+//! `GuiParamEditQueue` (GUI → DSP edits), the render-mode flag, and the
+//! one-shot diagnostic flags drained by `stop_processing`.
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
 use common::vst3_scan::resolve_vst3_dll;
-use libloading::{Library, Symbol};
 use common::vst3_scan::{c_array_to_string, tuid_to_hex};
+use libloading::{Library, Symbol};
 use vst3::{
-    ComPtr, ComWrapper, Interface,
+    ComPtr, ComRef, ComWrapper, Interface,
     Steinberg::{
         FUnknown, IBStream, IPlugView, IPlugViewContentScaleSupport,
         IPlugViewContentScaleSupportTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
@@ -47,18 +46,374 @@ use vst3::{
     },
 };
 
-use crate::plugin_instance::{HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent};
+use crate::plugin_instance::{
+    AudioHalf, AudioProcessorHalf, HostCallbacks, LoadedPlugin, NoteTransition, TimedNoteEvent,
+};
+use crate::process_scaffold::{
+    self, TransportBlock, alloc_planar, alloc_planar_ports, copy_aux_inputs_planar,
+    copy_input_planar, fold_mod_offset, refresh_ptrs, refresh_ptrs_ports,
+};
 use crate::vst3_events::{Vst3InEventList, Vst3OutEventList};
 use crate::vst3_host::{Vst3ComponentHandler, Vst3HostApp, Vst3PlugFrame};
 use crate::vst3_params::{GuiParamEditQueue, Vst3InParamChanges};
 use crate::vst3_stream::{Vst3ReadStream, Vst3WriteStream};
 
-/// A loaded VST3 plugin (the IComponent + the associated IEditController
-/// for GUI/state). Field drop order is **declaration order** (Rust
-/// reference: "The fields of a struct are dropped in the same order as
-/// they were declared"), so `_library` is declared LAST: every ComPtr's
-/// `Release()` (which calls back into the DLL) must run before the
-/// `Library` Drop unloads the DLL.
+// ====================================================================
+// Audio half
+// ====================================================================
+
+/// Audio-thread half of a VST3 instance: every field `process()` reads or
+/// writes. Buffers are (re)allocated by `on_activate` from the plugin-main
+/// thread inside a quiesced window.
+pub struct Vst3AudioHalf {
+    /// Non-owning `IAudioProcessor` pointer (owning `ComPtr` lives on the
+    /// main half). Wrapped as a borrowed `ComRef` per call — never
+    /// AddRef'd/Release'd here, so this half's Drop never calls into the
+    /// (possibly unloaded) DLL.
+    audio_raw: *mut IAudioProcessor,
+    /// Defensive gate mirroring the main half's `processing` flag.
+    processing: bool,
+    sample_rate: f64,
+    input_channels: u32,
+    output_channels: u32,
+    aux_input_channels: Vec<u32>,
+    /// Extra (non-main) output buses' channel counts (bus 1..N). VST3
+    /// requires `numOutputs` == total output bus count; multi-output synths
+    /// (Surge XT) otherwise mismatch and emit no main output.
+    extra_output_channels: Vec<u32>,
+    input_buffers: Vec<Vec<f32>>,
+    input_ptrs: Vec<*mut f32>,
+    output_buffers: Vec<Vec<f32>>,
+    output_ptrs: Vec<*mut f32>,
+    aux_input_buffers: Vec<Vec<Vec<f32>>>,
+    aux_input_ptrs: Vec<Vec<*mut f32>>,
+    extra_output_buffers: Vec<Vec<Vec<f32>>>,
+    extra_output_ptrs: Vec<Vec<*mut f32>>,
+    process_input_bufs: Vec<AudioBusBuffers>,
+    process_output_bufs: Vec<AudioBusBuffers>,
+    /// Scratch buffer for input events fed to the plugin this tick.
+    in_event_buffer: Vec<Event>,
+    /// Events the plugin emitted during the previous `process()`.
+    collected_out_notes: Vec<TimedNoteEvent>,
+    /// Reusable host-side COM objects fed to the plugin every `process()`
+    /// (no per-buffer heap alloc). These are Rust-owned vtables — their
+    /// Drop never calls into the plugin DLL.
+    in_event_list: ComWrapper<Vst3InEventList>,
+    out_event_list: ComWrapper<Vst3OutEventList>,
+    in_param_changes: ComWrapper<Vst3InParamChanges>,
+    /// Last absolute normalized value sent per param (mod-fold base).
+    /// Seeded with defaults at load → no RT allocation.
+    param_mod_base: std::collections::HashMap<u32, f64>,
+    /// Pre-allocated scratch: `param_events` with `Mod` offsets folded into
+    /// absolute `Value`s.
+    folded_param_events: Vec<crate::plugin_instance::TimedParamEvent>,
+    /// GUI → DSP parameter-edit bridge (shared with `Vst3ComponentHandler`).
+    gui_param_edits: Arc<GuiParamEditQueue>,
+    /// Pre-allocated scratch for `gui_param_edits.drain_latest`.
+    gui_edit_scratch: Vec<(u32, f64)>,
+    /// One-shot diagnostics, shared with the main half which logs them from
+    /// `stop_processing()` (off the RT path).
+    param_pool_overflowed: Arc<AtomicBool>,
+    process_status_err: Arc<AtomicI32>,
+    /// Render mode shared with the main half (`set_render_mode` writes,
+    /// process() reads per buffer). `true` = offline.
+    offline: Arc<AtomicBool>,
+    /// Transport block the plugin reads via `ProcessData.processContext`.
+    process_context: ProcessContext,
+}
+
+// SAFETY: the raw processor pointer is only used inside the AudioHalf
+// exclusive-access windows; ComWrapper fields are host-owned Rust objects.
+unsafe impl Send for Vst3AudioHalf {}
+
+impl AudioProcessorHalf for Vst3AudioHalf {
+    fn process(
+        &mut self,
+        frames: u32,
+        events: &[TimedNoteEvent],
+        param_events: &[crate::plugin_instance::TimedParamEvent],
+        input_audio: &[&[f32]],
+        aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
+        transport: &crate::plugin_instance::TransportContext,
+    ) -> Result<i32> {
+        anyhow::ensure!(self.processing, "VST3 plugin not processing");
+
+        // --- Copy inputs / aux inputs and refresh channel pointers
+        // (format-independent scaffold).
+        let n = frames as usize;
+        copy_input_planar(&mut self.input_buffers, input_audio, n);
+        refresh_ptrs(&mut self.input_buffers, &mut self.input_ptrs);
+        copy_aux_inputs_planar(&mut self.aux_input_buffers, aux_inputs, n);
+        refresh_ptrs_ports(&mut self.aux_input_buffers, &mut self.aux_input_ptrs);
+        refresh_ptrs(&mut self.output_buffers, &mut self.output_ptrs);
+        refresh_ptrs_ports(&mut self.extra_output_buffers, &mut self.extra_output_ptrs);
+
+        // --- Build Event buffer and hand it to the reusable input list.
+        self.in_event_buffer.clear();
+        for te in events {
+            self.in_event_buffer.push(encode_event(te));
+        }
+        self.in_event_list.set_events(&self.in_event_buffer);
+        self.collected_out_notes.clear();
+
+        // --- Parameter changes: automation lane values + GUI edits.
+        // VST3 has no modulation channel, so `ParamEventKind::Mod` offsets
+        // are folded into absolute normalized values over the cached base
+        // (scaffold pre-pass + fold — same helpers as CLAP's fold path).
+        use crate::plugin_instance::ParamEventKind;
+
+        // r.md #4: drain GUI-originated edits (controller `performEdit`,
+        // queued by `Vst3ComponentHandler` on the UI thread) and feed them
+        // to the processor at sample offset 0.
+        self.gui_edit_scratch.clear();
+        self.gui_param_edits.drain_latest(&mut self.gui_edit_scratch);
+
+        for &(id, val) in &self.gui_edit_scratch {
+            if let Some(slot) = self.param_mod_base.get_mut(&id) {
+                *slot = val;
+            }
+        }
+        process_scaffold::update_param_base_cache(&mut self.param_mod_base, param_events);
+
+        self.folded_param_events.clear();
+        // GUI edits first, at sample offset 0, so a non-automated knob turn
+        // reaches the DSP; automation events follow in ascending time order
+        // (VST3 `IParamValueQueue` requires non-decreasing offsets).
+        for &(id, val) in &self.gui_edit_scratch {
+            self.folded_param_events.push(crate::plugin_instance::TimedParamEvent {
+                time: 0,
+                param_id: id,
+                value: val,
+                kind: ParamEventKind::Value,
+            });
+        }
+        for ev in param_events {
+            match ev.kind {
+                ParamEventKind::Value => self.folded_param_events.push(*ev),
+                ParamEventKind::Mod => {
+                    let base = self.param_mod_base.get(&ev.param_id).copied().unwrap_or(0.0);
+                    // VST3 params are normalized 0..=1 ⇒ offset_scaled == offset.
+                    let value = fold_mod_offset(base, ev.value, 0.0, 1.0);
+                    self.folded_param_events.push(crate::plugin_instance::TimedParamEvent {
+                        time: ev.time,
+                        param_id: ev.param_id,
+                        value,
+                        kind: ParamEventKind::Value,
+                    });
+                }
+            }
+        }
+        if self.in_param_changes.set_changes(&self.folded_param_events) {
+            // RT path: raise the flag only; the log happens once in
+            // `stop_processing()` on the main half.
+            self.param_pool_overflowed.store(true, Ordering::Relaxed);
+        }
+
+        // `to_com_ptr` only bumps refcounts of host-owned objects (no heap
+        // alloc); the ComPtrs' Drop at end-of-scope balances the addRef.
+        let in_list_ptr = self
+            .in_event_list
+            .to_com_ptr::<IEventList>()
+            .context("Vst3InEventList has no IEventList")?;
+        let out_list_ptr = self
+            .out_event_list
+            .to_com_ptr::<IEventList>()
+            .context("Vst3OutEventList has no IEventList")?;
+        let in_param_changes_ptr = self
+            .in_param_changes
+            .to_com_ptr::<IParameterChanges>()
+            .context("Vst3InParamChanges has no IParameterChanges")?;
+
+        // --- Assemble AudioBusBuffers (main + aux inputs / main + extras).
+        self.process_input_bufs.clear();
+        if self.input_channels > 0 {
+            self.process_input_bufs.push(AudioBusBuffers {
+                numChannels: self.input_channels as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: self.input_ptrs.as_mut_ptr(),
+                },
+            });
+        }
+        for bus_idx in 0..self.aux_input_channels.len() {
+            self.process_input_bufs.push(AudioBusBuffers {
+                numChannels: self.aux_input_channels[bus_idx] as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: self.aux_input_ptrs[bus_idx].as_mut_ptr(),
+                },
+            });
+        }
+        self.process_output_bufs.clear();
+        if self.output_channels > 0 {
+            self.process_output_bufs.push(AudioBusBuffers {
+                numChannels: self.output_channels as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: self.output_ptrs.as_mut_ptr(),
+                },
+            });
+        }
+        for bus_idx in 0..self.extra_output_channels.len() {
+            self.process_output_bufs.push(AudioBusBuffers {
+                numChannels: self.extra_output_channels[bus_idx] as i32,
+                silenceFlags: 0,
+                __field0: AudioBusBuffers__type0 {
+                    channelBuffers32: self.extra_output_ptrs[bus_idx].as_mut_ptr(),
+                },
+            });
+        }
+
+        // --- Transport (shared TransportBlock — 非有限 sanitize 込み。旧
+        // 実装は VST3 側だけ projectTimeMusic を無検査で渡していた)。
+        let b = TransportBlock::derive(transport, self.sample_rate);
+        self.process_context.sampleRate = self.sample_rate;
+        self.process_context.tempo = b.bpm;
+        self.process_context.timeSigNumerator = i32::from(b.tsig_num);
+        self.process_context.timeSigDenominator = i32::from(b.tsig_denom);
+        // `projectTimeSamples` derives from the authoritative song_pos_beats
+        // (the engine leaves `steady_time` at 0), keeping it consistent with
+        // `projectTimeMusic` and the ARA playback regions. Without this,
+        // ARA plug-ins (Melodyne) see a frozen position 0 and render the
+        // region's first frame forever.
+        self.process_context.projectTimeSamples = b.song_pos_samples;
+        self.process_context.continousTimeSamples = b.song_pos_samples;
+        self.process_context.projectTimeMusic = b.song_pos_beats;
+        self.process_context.barPositionMusic = b.bar_start_beats;
+        self.process_context.cycleStartMusic = b.loop_start_beats;
+        self.process_context.cycleEndMusic = b.loop_end_beats;
+        let mut state = (StatesAndFlags_::kTempoValid
+            | StatesAndFlags_::kTimeSigValid
+            | StatesAndFlags_::kProjectTimeMusicValid
+            | StatesAndFlags_::kBarPositionValid
+            | StatesAndFlags_::kCycleValid
+            | StatesAndFlags_::kContTimeValid) as u32;
+        if b.is_playing {
+            state |= StatesAndFlags_::kPlaying as u32;
+        }
+        if b.cycle_active {
+            state |= StatesAndFlags_::kCycleActive as u32;
+        }
+        self.process_context.state = state;
+
+        let num_inputs = self.process_input_bufs.len() as i32;
+        let inputs_ptr = if self.process_input_bufs.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            self.process_input_bufs.as_mut_ptr()
+        };
+        let mut data = ProcessData {
+            // export 中 (`set_render_mode(Offline)`) は per-buffer processMode
+            // を kOffline に切替える (spec 準拠の代替 — `setIoMode` は
+            // initialize 前限定)。
+            processMode: if self.offline.load(Ordering::Relaxed) {
+                ProcessModes_::kOffline
+            } else {
+                ProcessModes_::kRealtime
+            },
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32,
+            numSamples: frames as i32,
+            numInputs: num_inputs,
+            numOutputs: self.process_output_bufs.len() as i32,
+            inputs: inputs_ptr,
+            outputs: if self.process_output_bufs.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                self.process_output_bufs.as_mut_ptr()
+            },
+            inputParameterChanges: in_param_changes_ptr.as_ptr(),
+            outputParameterChanges: std::ptr::null_mut(),
+            inputEvents: in_list_ptr.as_ptr(),
+            outputEvents: out_list_ptr.as_ptr(),
+            processContext: &mut self.process_context,
+        };
+        // SAFETY: `audio_raw` is valid for the duration of this dispatch
+        // window (AudioHalf contract — teardown quiesces first). ComRef is
+        // borrowed: no AddRef/Release.
+        let audio = unsafe { ComRef::<IAudioProcessor>::from_raw(self.audio_raw) }
+            .context("IAudioProcessor pointer is null")?;
+        let status = unsafe { audio.process(&mut data) };
+        if status != kResultOk {
+            // Record (don't log) on the RT thread; the warning fires once
+            // (off-RT) from `stop_processing()`.
+            self.process_status_err.store(status, Ordering::Relaxed);
+        }
+
+        // Drain collected events before the ComPtrs drop.
+        self.out_event_list.drain_into(&mut self.collected_out_notes);
+
+        Ok(status)
+    }
+
+    fn output_buffer(&self, channel: usize) -> Option<&[f32]> {
+        self.output_buffers.get(channel).map(|v| v.as_slice())
+    }
+
+    /// パラアウト: **Port 0 is the MAIN output bus**; ports `1..` are the
+    /// extra (non-main) buses. Single-output plugins report no ports.
+    fn aux_output_buffer(&self, port: usize, channel: usize) -> Option<&[f32]> {
+        if self.extra_output_channels.is_empty() {
+            return None;
+        }
+        if port == 0 {
+            self.output_buffers.get(channel).map(|v| v.as_slice())
+        } else {
+            self.extra_output_buffers
+                .get(port - 1)
+                .and_then(|bus| bus.get(channel))
+                .map(|v| v.as_slice())
+        }
+    }
+
+    fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>) {
+        out.append(&mut self.collected_out_notes);
+    }
+
+    fn on_activate(&mut self, sample_rate: f64, max_frames: u32) {
+        let mf = max_frames as usize;
+        self.sample_rate = sample_rate;
+        (self.input_buffers, self.input_ptrs) = alloc_planar(self.input_channels as usize, mf);
+        (self.output_buffers, self.output_ptrs) = alloc_planar(self.output_channels as usize, mf);
+        (self.aux_input_buffers, self.aux_input_ptrs) =
+            alloc_planar_ports(&self.aux_input_channels, mf);
+        (self.extra_output_buffers, self.extra_output_ptrs) =
+            alloc_planar_ports(&self.extra_output_channels, mf);
+        self.process_input_bufs = Vec::with_capacity(1 + self.aux_input_channels.len());
+        self.process_output_bufs = Vec::with_capacity(1 + self.extra_output_channels.len());
+        // Prime the transport block so the very first `process()` already
+        // sees `kPlaying` — some plugins (SynthMaster 3) refuse to output
+        // anything when `processContext` is null or lacks `kPlaying`.
+        self.process_context.state = (StatesAndFlags_::kPlaying
+            | StatesAndFlags_::kTempoValid
+            | StatesAndFlags_::kTimeSigValid) as u32;
+        self.process_context.sampleRate = sample_rate;
+        self.process_context.tempo = 120.0;
+        self.process_context.timeSigNumerator = 4;
+        self.process_context.timeSigDenominator = 4;
+    }
+
+    fn on_deactivate(&mut self) {
+        self.output_buffers.clear();
+        self.output_ptrs.clear();
+        self.extra_output_buffers.clear();
+        self.extra_output_ptrs.clear();
+        self.process_output_bufs.clear();
+    }
+
+    fn set_processing(&mut self, on: bool) {
+        self.processing = on;
+    }
+}
+
+// ====================================================================
+// Main half
+// ====================================================================
+
+/// A loaded VST3 plugin (main half: the IComponent + the associated
+/// IEditController for GUI/state). Field drop order is **declaration
+/// order**, so `_library` is declared LAST: every ComPtr's `Release()`
+/// (which calls back into the DLL) must run before the `Library` Drop
+/// unloads the DLL.
 pub struct Vst3Plugin {
     id: String,
     name: String,
@@ -80,135 +435,35 @@ pub struct Vst3Plugin {
     /// drop. `false` for single-component plugins.
     controller_separate: bool,
 
-    /// (r.md #5 ARA2) ARA session bound to this instance, if any. Dropped before
-    /// the component is released (its drop calls back into this plug-in).
+    /// ARA session bound to this instance, if any.
     ara: Option<crate::ara::session::AraSession>,
-    /// Last activate params, kept so ARA setup — which must bind before
-    /// `setActive` — can deactivate → bind → reactivate.
+    /// Last activate params (ARA setup の deactivate → reactivate 用)。
     last_activate: Option<(f64, u32, u32)>,
 
-    // --- Audio processing state ----------------------------------------
     active: bool,
     processing: bool,
-    input_channels: u32,
-    input_buffers: Vec<Vec<f32>>,
-    input_ptrs: Vec<*mut f32>,
-    output_channels: u32,
-    output_buffers: Vec<Vec<f32>>,
-    output_ptrs: Vec<*mut f32>,
-    max_frames: u32,
-    sample_rate: f64,
-    /// PR4 sidechain: per-aux-input-bus channel counts in the plugin's
-    /// declared bus order (skipping the main bus). Capped at
-    /// `MAX_AUX_IN`. Empty when the plugin has only the main input bus.
-    aux_input_channels: Vec<u32>,
-    /// Pre-allocated planar buffers for each aux input bus (bus × ch × frame).
-    aux_input_buffers: Vec<Vec<Vec<f32>>>,
-    /// Per-aux-bus channel pointer scratch (refreshed each process()).
-    aux_input_ptrs: Vec<Vec<*mut f32>>,
-    /// Phase 6 review (RT 安全): VST3 `process()` の hot path で毎 buffer に
-    /// `Vec<AudioBusBuffers>::with_capacity(1 + aux)` を確保 → drop して
-    /// いた。 audio thread の heap alloc/free は RT 違反。 `activate()` で
-    /// pre-allocate、 `process()` 入口で `clear()` + `push()` で reuse 化。
-    /// CLAP 側の `process_input_bufs` と同 pattern。
-    process_input_bufs: Vec<AudioBusBuffers>,
-    /// Extra (non-main) output buses' channel counts, in declared bus order
-    /// (skipping the main output bus at index 0). Empty when the plugin has
-    /// a single output bus. VST3 spec requires `process()`'s `numOutputs` to
-    /// equal the plugin's total output bus count; multi-output synths
-    /// (Surge XT declares Output + Scene A + Scene B) otherwise get a
-    /// mismatch and emit no main output. We provide (discarded) scratch for
-    /// each extra bus so the count matches and the main bus is honoured.
-    extra_output_channels: Vec<u32>,
-    /// Pre-allocated scratch planar buffers for each extra output bus
-    /// (bus × ch × frame). The plugin writes its unused-by-us extra outputs
-    /// here; we read only the main bus via `output_buffer()`.
-    extra_output_buffers: Vec<Vec<Vec<f32>>>,
-    /// Per-extra-output-bus channel pointer scratch (refreshed each process()).
-    extra_output_ptrs: Vec<Vec<*mut f32>>,
-    /// Pre-allocated `Vec<AudioBusBuffers>` for output buses (main + extras),
-    /// mirroring `process_input_bufs`. clear()/push() reuse on the RT path.
-    process_output_bufs: Vec<AudioBusBuffers>,
+    /// パラアウト port 数 (bus 構成から load 時に確定)。
+    paraout_port_count: usize,
 
-    /// Scratch buffer for input events fed to the plugin this tick. Cleared
-    /// and re-filled on every `process()`.
-    in_event_buffer: Vec<Event>,
-    /// Events the plugin emitted during the previous `process()`.
-    collected_out_notes: Vec<TimedNoteEvent>,
-
-    /// Reusable IEventList instances fed to the plugin on every
-    /// `process()`. Owned here so the audio thread never allocates a new
-    /// `ComWrapper` per buffer (which would heap-allocate inside the RT
-    /// callback).
-    in_event_list: ComWrapper<Vst3InEventList>,
-    out_event_list: ComWrapper<Vst3OutEventList>,
-    /// Reusable `IParameterChanges` fed to the plugin via
-    /// `ProcessData.inputParameterChanges` every `process()`. Carries
-    /// automation lane values (`TimedParamEvent`) into the plugin. Owned
-    /// here so the audio thread never allocates a COM object per buffer.
-    in_param_changes: ComWrapper<Vst3InParamChanges>,
-    /// `docs/plan_modulation_routing_redesign.md` §3.3: last absolute
-    /// normalized value sent per param. VST3 has no modulation channel, so the
-    /// host folds a `ParamEventKind::Mod` offset into `base + offset` using this
-    /// cache (VST3 params are normalized `0..=1`, so `amount == offset`).
-    /// Pre-seeded with every param's default at load → no RT allocation.
-    param_mod_base: std::collections::HashMap<u32, f64>,
-    /// Pre-allocated scratch holding `param_events` with all `Mod` offsets
-    /// folded into absolute `Value`s, handed to `set_changes` each `process()`.
-    folded_param_events: Vec<crate::plugin_instance::TimedParamEvent>,
-    /// r.md #4: bridges GUI parameter edits (the controller's `performEdit`)
-    /// to the audio processor. The producer end lives in `Vst3ComponentHandler`
-    /// (UI thread); `process()` drains this shared end into `gui_edit_scratch`
-    /// and folds the edits into `inputParameterChanges` so a knob turn reaches
-    /// the DSP even when no automation lane drives that param.
+    /// Cross-half shared diagnostics / render mode (audio half stores,
+    /// this half drains / sets).
     gui_param_edits: Arc<GuiParamEditQueue>,
-    /// Pre-allocated scratch for `gui_param_edits.drain_latest` (last value per
-    /// edited param this buffer). Cleared and refilled every `process()`; sized
-    /// for the distinct params a user could realistically edit between buffers.
-    gui_edit_scratch: Vec<(u32, f64)>,
-    /// Set by `process()` (RT thread) when the param-change pool overflowed
-    /// (> capacity distinct params in one buffer; extra param events dropped).
-    /// Logged once from `stop_processing()` (RT-external) so the hot path never
-    /// formats a message or touches `tracing`. `Relaxed` is sufficient: this is
-    /// a best-effort diagnostic flag, not a synchronization signal.
-    param_pool_overflowed: AtomicBool,
-    /// Debug-only: set by `process()` when `IAudioProcessor::process` returned
-    /// a non-OK status, logged once (with the status) from `stop_processing()`.
-    /// Same flag idiom as `param_pool_overflowed` so a misbehaving plugin can't
-    /// flood the log every buffer.
-    /// C5 (r.md #8): release でも記録する (atomic store は RT 安全、 log は
-    /// stop_processing で off-RT に 1 回)。 旧 debug 限定では納品物の診断がゼロだった。
-    process_status_err: std::sync::atomic::AtomicI32,
-    /// Transport / timing block the plugin reads via `ProcessData.processContext`.
-    /// Several instruments (SynthMaster 3, some Arturia products) stay silent
-    /// when this pointer is null because they gate their voice allocator on
-    /// `kPlaying`. Updated in `process()` with the current playhead.
-    process_context: ProcessContext,
-
-    /// Phase 7 B1-R (2026-05-13): export 中 (= `set_render_mode(Offline)`
-    /// 受信後) は `ProcessData::processMode` を `kOffline` に切り替える。
-    /// VST3 spec の `IComponent::setIoMode` は `initialize` 前にしか呼べ
-    /// ない (= 既に active な plugin への動的切替は spec 違反 + plugin 依存
-    /// で動かない) ため、 spec 準拠の代替として process 毎の `processMode`
-    /// を切替える方式を採用。 plugin が process() 毎の processMode を尊重
-    /// するか `setupProcessing` 時の値を固定するかは plugin 実装依存だが、
-    /// 多くの reverb / convolution / lookahead 系 plugin は process 毎を
-    /// 読んで「offline = 高品質 algo に切替」 等を判定する。
-    render_mode: RenderMode,
+    param_pool_overflowed: Arc<AtomicBool>,
+    process_status_err: Arc<AtomicI32>,
+    offline: Arc<AtomicBool>,
 
     // --- GUI state -----------------------------------------------------
     view: Option<ComPtr<IPlugView>>,
-    /// Plug-frame used to relay resize requests back to daw_gui.
+    /// Plug-frame used to relay resize requests back to the host.
     plug_frame: ComWrapper<Vst3PlugFrame>,
     gui_attached: std::cell::Cell<bool>,
 
-    /// DLL handle. Declared LAST so it drops LAST (field drop = declaration
-    /// order): every ComPtr/ComWrapper above must Release into the still-loaded
-    /// DLL before `FreeLibrary` runs here. Reversing this order produces an
-    /// AV ~84-100ms after Drop on plugins (e.g. MeldaProduction VST3) whose
-    /// `IComponent::Release` does heavy global cleanup — by the time their
-    /// `DllMain(DLL_PROCESS_DETACH)` finishes the host has already torn the
-    /// vtable down.
+    /// Audio half (shared with the worker registry via `audio_half()`).
+    /// Its Drop never calls into the DLL (non-owning processor pointer),
+    /// so a stale registry snapshot outliving this struct is benign.
+    audio_half: Arc<AudioHalf>,
+
+    /// DLL handle. Declared LAST so it drops LAST.
     _library: Library,
 }
 
@@ -222,7 +477,7 @@ impl Vst3Plugin {
             .with_context(|| format!("LoadLibrary {}", dll_path.display()))?;
 
         // Call InitDll() if the module exports it (VST3 3.6.x requirement on
-        // Windows). Absent = fine, some crates don't export it.
+        // Windows). Absent = fine.
         unsafe {
             if let Ok(init_dll) = library.get::<Symbol<extern "system" fn() -> bool>>(b"InitDll\0")
                 && !init_dll()
@@ -242,10 +497,9 @@ impl Vst3Plugin {
         let factory = unsafe { ComPtr::<IPluginFactory>::from_raw(factory_raw) }
             .context("factory came back null via from_raw")?;
 
-        // Scan class infos for Audio Module Class entries.
-        // `target_id` is matched as a 32-hex-digit UUID against the class
-        // CID. Anything else (empty string, bundle stem from plugin_db
-        // scanning) is treated as "first Audio Module Class wins".
+        // Scan class infos for Audio Module Class entries. `target_id` is
+        // matched as a 32-hex-digit UUID against the class CID; anything
+        // else means "first Audio Module Class wins".
         let count = unsafe { factory.countClasses() };
         tracing::info!(path = %dll_path.display(), count, "VST3 classes in factory");
         let is_uuid =
@@ -281,8 +535,7 @@ impl Vst3Plugin {
         let class_cid = class_info.cid;
         let class_cid_hex = tuid_to_hex(&class_cid);
         // Keep the caller-provided id when present so it round-trips through
-        // project save / plugin_db lookup. Empty id → default to UUID hex so
-        // initial scans get something stable to persist.
+        // project save / plugin_db lookup.
         let display_id = if target_id.is_empty() {
             class_cid_hex.clone()
         } else {
@@ -295,9 +548,7 @@ impl Vst3Plugin {
 
         // Build the host objects.
         let host_app = ComWrapper::new(Vst3HostApp::new());
-        // r.md #4: the GUI→DSP parameter-edit bridge. The component handler
-        // (UI thread) pushes `performEdit`s here; `process()` (audio thread)
-        // drains them into the processor's `inputParameterChanges`.
+        // r.md #4: the GUI→DSP parameter-edit bridge.
         let gui_param_edits = Arc::new(GuiParamEditQueue::new());
         let component_handler = ComWrapper::new(Vst3ComponentHandler::new(
             callbacks.clone(),
@@ -310,11 +561,7 @@ impl Vst3Plugin {
             .to_com_ptr::<FUnknown>()
             .context("host_app has no FUnknown")?
             .into_raw();
-        // `initialize` takes ownership of one reference; we re-wrap so Drop
-        // releases exactly once after the call below.
         let init_res = unsafe { component.initialize(host_app_ptr) };
-        // Re-grab the ComPtr without adding another ref (we already own one
-        // via the ComWrapper).
         let _ = unsafe { ComPtr::<FUnknown>::from_raw(host_app_ptr) };
         anyhow::ensure!(
             init_res == kResultOk,
@@ -327,12 +574,10 @@ impl Vst3Plugin {
             .cast::<IAudioProcessor>()
             .context("component does not implement IAudioProcessor")?;
 
-        // Resolve controller (same instance or a separate one created via
-        // the factory).
+        // Resolve controller (same instance or a separate one).
         let mut ctrl_cid: TUID = [0; 16];
         let ctrl_res = unsafe { component.getControllerClassId(&mut ctrl_cid as *mut TUID) };
         let (controller, controller_separate) = if ctrl_res == kResultOk && ctrl_cid != class_cid {
-            // Separate controller.
             let c = create_instance::<IEditController>(&factory, &ctrl_cid)
                 .context("failed to create IEditController")?;
             let host_app_ptr2: *mut FUnknown = host_app
@@ -346,10 +591,6 @@ impl Vst3Plugin {
         } else if let Some(c) = component.cast::<IEditController>() {
             (c, false)
         } else {
-            // Some instrument plugins only implement IEditController in a
-            // separate class even when getControllerClassId returns the
-            // component CID (rare). Try createInstance with class_cid just
-            // in case, otherwise bail.
             anyhow::bail!("could not obtain IEditController from component");
         };
 
@@ -366,34 +607,15 @@ impl Vst3Plugin {
             tracing::warn!(res = format!("{set_res:#x}"), "setComponentHandler non-OK (continuing)");
         }
 
-        // For plugins with a separate IEditController (BioTek 2 etc.) the
-        // controller is a fresh COM object that doesn't yet know about the
-        // component's state. Two host-side hooks tie them together — without
-        // these, controllers may refuse to create their editor view (CLAP-
-        // style "no editor" return) or simply mirror stale defaults:
-        //
-        //   1. `IConnectionPoint::connect` — bidirectional message bus used
-        //      by some SDKs to keep parameter values in sync.
-        //   2. `IComponent::getState` → `IEditController::setComponentState`
-        //      — primes the controller's parameters from the component.
-        //
-        // Both calls are best-effort. Plugins that don't implement them, or
-        // that signal `kNotImplemented`, just fall through.
+        // For plugins with a separate IEditController, tie component and
+        // controller together (connection points + state priming).
         if controller_separate {
             connect_component_and_controller(&component, &controller);
             transfer_component_state(&component, &controller);
         }
 
-        // 全 bus (audio + event, in + out) を enumerate して 1 件ずつログ。
-        // MeldaProduction の MSoundFactory のように main bus 以外に sidechain /
-        // sub bus を多数持つプラグインを debug するため、 channel count や
-        // busType (Main / Aux) を明示する。
         log_all_buses(&component);
 
-        // Query main audio bus channel count for activate()-time buffer
-        // allocation. 旧実装は「bus 数 > 0 なら 2ch 決め打ち」 だったが、 main
-        // bus が mono / 4ch の plugin で破綻する。 main bus (busType == Main)
-        // の channelCount をそのまま採用する。
         let input_channels = main_audio_bus_channel_count(&component, BusDirections_::kInput);
         let output_channels = main_audio_bus_channel_count(&component, BusDirections_::kOutput);
         let aux_input_channels = aux_input_bus_channels(&component);
@@ -406,8 +628,61 @@ impl Vst3Plugin {
             "VST3 audio bus channel counts"
         );
 
-        let mut plugin = Self {
-            _library: library,
+        // Seed the modulation base cache with every param's default
+        // (normalized) so the audio-thread fold never allocates.
+        let infos = enumerate_vst3_params(&controller);
+        let mut param_mod_base = std::collections::HashMap::with_capacity(infos.len());
+        for info in &infos {
+            param_mod_base.insert(info.id, info.default_value.clamp(0.0, 1.0));
+        }
+
+        // パラアウト port 数 = 1 (main) + extra bus 数 (multi-out のみ)。
+        let paraout_port_count = if extra_output_channels.is_empty() {
+            0
+        } else {
+            (1 + extra_output_channels.len()).min(common::process_data::MAX_AUX_OUT)
+        };
+
+        let param_pool_overflowed = Arc::new(AtomicBool::new(false));
+        let process_status_err = Arc::new(AtomicI32::new(kResultOk));
+        let offline = Arc::new(AtomicBool::new(false));
+
+        let audio_half = AudioHalf::new(Box::new(Vst3AudioHalf {
+            audio_raw: audio.as_ptr(),
+            processing: false,
+            sample_rate: 0.0,
+            input_channels,
+            output_channels,
+            aux_input_channels,
+            extra_output_channels,
+            input_buffers: Vec::new(),
+            input_ptrs: Vec::new(),
+            output_buffers: Vec::new(),
+            output_ptrs: Vec::new(),
+            aux_input_buffers: Vec::new(),
+            aux_input_ptrs: Vec::new(),
+            extra_output_buffers: Vec::new(),
+            extra_output_ptrs: Vec::new(),
+            process_input_bufs: Vec::new(),
+            process_output_bufs: Vec::new(),
+            in_event_buffer: Vec::with_capacity(256),
+            collected_out_notes: Vec::with_capacity(256),
+            in_event_list: ComWrapper::new(Vst3InEventList::new()),
+            out_event_list: ComWrapper::new(Vst3OutEventList::new()),
+            in_param_changes: ComWrapper::new(Vst3InParamChanges::new()),
+            param_mod_base,
+            // MAX_EVENTS (256) automation/mod events + up to 64 folded-in
+            // GUI edits → never reallocs on the RT path.
+            folded_param_events: Vec::with_capacity(256 + 64),
+            gui_param_edits: Arc::clone(&gui_param_edits),
+            gui_edit_scratch: Vec::with_capacity(64),
+            param_pool_overflowed: Arc::clone(&param_pool_overflowed),
+            process_status_err: Arc::clone(&process_status_err),
+            offline: Arc::clone(&offline),
+            process_context: unsafe { std::mem::zeroed() },
+        }));
+
+        Ok(Self {
             id: display_id,
             name: class_name,
             path: path.to_path_buf(),
@@ -421,71 +696,37 @@ impl Vst3Plugin {
             last_activate: None,
             active: false,
             processing: false,
-            input_channels,
-            input_buffers: Vec::new(),
-            input_ptrs: Vec::new(),
-            output_channels,
-            output_buffers: Vec::new(),
-            output_ptrs: Vec::new(),
-            max_frames: 0,
-            sample_rate: 0.0,
-            aux_input_channels,
-            aux_input_buffers: Vec::new(),
-            aux_input_ptrs: Vec::new(),
-            process_input_bufs: Vec::new(),
-            extra_output_channels,
-            extra_output_buffers: Vec::new(),
-            extra_output_ptrs: Vec::new(),
-            process_output_bufs: Vec::new(),
-            in_event_buffer: Vec::with_capacity(256),
-            collected_out_notes: Vec::with_capacity(256),
-            in_event_list: ComWrapper::new(Vst3InEventList::new()),
-            out_event_list: ComWrapper::new(Vst3OutEventList::new()),
-            in_param_changes: ComWrapper::new(Vst3InParamChanges::new()),
-            param_mod_base: std::collections::HashMap::new(),
-            // common::process_data::MAX_EVENTS (256) automation/mod events +
-            // up to 64 folded-in GUI edits (r.md #4) → never reallocs on the
-            // RT path (`gui_edit_scratch` is capped at 64 distinct params).
-            folded_param_events: Vec::with_capacity(256 + 64),
+            paraout_port_count,
             gui_param_edits,
-            gui_edit_scratch: Vec::with_capacity(64),
-            param_pool_overflowed: AtomicBool::new(false),
-            process_status_err: std::sync::atomic::AtomicI32::new(kResultOk),
-            process_context: unsafe { std::mem::zeroed() },
-            render_mode: RenderMode::Realtime,
+            param_pool_overflowed,
+            process_status_err,
+            offline,
             view: None,
             plug_frame,
             gui_attached: std::cell::Cell::new(false),
-        };
-        // `docs/plan_modulation_routing_redesign.md` §3.3 / §4: seed the
-        // modulation base cache with every param's default (normalized) so the
-        // audio-thread fold only updates existing keys (no RT allocation).
-        plugin.init_param_mod_base();
-        Ok(plugin)
+            audio_half,
+            _library: library,
+        })
     }
 
-    /// Populate `param_mod_base` from the plugin's param list (main thread,
-    /// once at load). Values are normalized `0..=1` (VST3 convention).
-    fn init_param_mod_base(&mut self) {
-        let infos = self.enumerate_params();
-        self.param_mod_base.reserve(infos.len());
-        for info in &infos {
-            self.param_mod_base
-                .insert(info.id, info.default_value.clamp(0.0, 1.0));
-        }
+    /// Exclusive access to the audio half.
+    ///
+    /// # Safety
+    /// Caller (plugin-main thread) must be inside a quiesced window
+    /// (`AudioHalf::get` contract).
+    #[allow(clippy::mut_from_ref)] // UnsafeCell 経由。契約は Safety 節。
+    unsafe fn audio_half_mut(&self) -> &mut (dyn AudioProcessorHalf + 'static) {
+        unsafe { self.audio_half.get() }
     }
 }
 
-/// `String128` ([TChar; 128] = u16 array) を Rust String に。 null terminator
-/// 以降は捨てる。 Bus 名等の人間可読ログ表示用。
+/// `String128` ([TChar; 128] = u16 array) を Rust String に。
 fn utf16_buf_to_string<const N: usize>(buf: &[u16; N]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(N);
     String::from_utf16_lossy(&buf[..end])
 }
 
-/// Audio + Event bus を全 enumerate して 1 件ずつ INFO ログ。 channel count や
-/// busType (Main / Aux) を出すことで、 multi-bus plugin の構成把握 + 不整合
-/// debug を可能にする。
+/// Audio + Event bus を全 enumerate して 1 件ずつ INFO ログ。
 fn log_all_buses(component: &ComPtr<IComponent>) {
     for (media_label, media) in [
         ("Audio", MediaTypes_::kAudio),
@@ -524,9 +765,7 @@ fn log_all_buses(component: &ComPtr<IComponent>) {
     }
 }
 
-/// 指定 audio bus の channel count から SpeakerArrangement を導出。 mono → kMono、
-/// 2 → kStereo、 0 → 0 (= 空 arrangement、 plugin に「この bus は使わない」 を伝える)、
-/// その他は fallback (kStereo) を返す。 channel count 取得失敗時も fallback。
+/// 指定 audio bus の channel count から SpeakerArrangement を導出。
 fn arrangement_for_bus(
     component: &ComPtr<IComponent>,
     dir: BusDirection,
@@ -540,9 +779,8 @@ fn arrangement_for_bus(
     if res != kResultOk {
         return fallback;
     }
-    // C4 (r.md #8): channel 数に応じた正確な SpeakerArrangement (旧実装は 3ch 以上を
-    // 全て stereo fallback していてコメントの surround 記述と不一致だった)。 標準
-    // surround config をマップ、 非標準 (5/7/9+) のみ fallback。
+    // C4 (r.md #8): channel 数に応じた正確な SpeakerArrangement。標準
+    // surround config をマップ、非標準 (5/7/9+) のみ fallback。
     match info.channelCount {
         0 => 0,
         1 => SpeakerArr::kMono,
@@ -550,16 +788,12 @@ fn arrangement_for_bus(
         3 => SpeakerArr::k30Cine, // L R C
         4 => SpeakerArr::k40Music, // quad: L R Ls Rs
         6 => SpeakerArr::k51, // 5.1: L R C Lfe Ls Rs
-        8 => SpeakerArr::k71Music, // 7.1 (side surround — 音楽制作で一般的な layout)
+        8 => SpeakerArr::k71Music, // 7.1 (side surround)
         _ => fallback,
     }
 }
 
-/// `busType == Main` の最初の audio bus の channel count を返す。 main bus が
-/// 無ければ index 0 (= 多くの plugin で main 相当)、 それも無ければ 0。
-/// PR4 sidechain: enumerate `is_main=false` (= `kAux`) input buses and
-/// return their channel counts in declaration order. Capped at
-/// `MAX_AUX_IN`. Empty when the plugin has only the main input bus.
+/// PR4 sidechain: enumerate `kAux` input buses' channel counts.
 fn aux_input_bus_channels(component: &ComPtr<IComponent>) -> Vec<u32> {
     use vst3::Steinberg::Vst::{BusDirections_, BusInfo, BusTypes_, MediaTypes_};
     let count = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput) };
@@ -581,12 +815,6 @@ fn aux_input_bus_channels(component: &ComPtr<IComponent>) -> Vec<u32> {
                 );
                 break;
             }
-            // Match the main-bus side's `.max(0)` (channelCount is i32 and can
-            // be negative on malformed plugins) and clamp to the host's
-            // per-bus channel ceiling. The shmem aux buffer only carries
-            // `MAX_CHANNELS` planes (`buffer_aux_in[..][MAX_CHANNELS][..]`), and
-            // `process()` only ever fills l/r from `AuxInputBuf`, so anything
-            // above that would be allocated-but-never-fed silence.
             let ch = (info.channelCount.max(0) as u32)
                 .min(common::process_data::MAX_CHANNELS as u32);
             aux.push(ch);
@@ -595,7 +823,7 @@ fn aux_input_bus_channels(component: &ComPtr<IComponent>) -> Vec<u32> {
     aux
 }
 
-/// VST3 spec: BusType の Main は `kMain` (= 0)。
+/// `busType == Main` の最初の audio bus の channel count を返す。
 fn main_audio_bus_channel_count(
     component: &ComPtr<IComponent>,
     dir: BusDirection,
@@ -626,13 +854,7 @@ fn main_audio_bus_channel_count(
     }
 }
 
-/// Channel counts of every output bus *after* index 0 (the main output bus
-/// daw_01 reads back via `output_buffer`). VST3 `process()` must provide an
-/// `AudioBusBuffers` for every output bus the plugin declares; multi-output
-/// synths (Surge XT: Output + Scene A + Scene B) would otherwise hit a
-/// `numOutputs` mismatch and emit no main output. Returns one entry per bus
-/// index `1..count` (channel count, or `0` if the info read fails) so the
-/// process-time `outputs` array stays aligned with the plugin's bus indices.
+/// Channel counts of every output bus *after* index 0.
 fn output_bus_extra_channels(component: &ComPtr<IComponent>) -> Vec<u32> {
     use vst3::Steinberg::Vst::{BusDirections_, BusInfo, MediaTypes_};
     let count = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput) };
@@ -648,10 +870,7 @@ fn output_bus_extra_channels(component: &ComPtr<IComponent>) -> Vec<u32> {
 }
 
 /// Connect the component's and controller's `IConnectionPoint` interfaces
-/// in both directions. Best-effort: plugins that don't implement
-/// `IConnectionPoint` (the interface is optional in the VST3 spec) are
-/// silently skipped. The pair stays usable without the connection — only
-/// inter-object messaging breaks, which most hosts don't rely on.
+/// in both directions (best-effort).
 fn connect_component_and_controller(
     component: &ComPtr<IComponent>,
     controller: &ComPtr<IEditController>,
@@ -678,10 +897,7 @@ fn connect_component_and_controller(
 }
 
 /// Stream the component's serialized state into the controller via
-/// `IEditController::setComponentState`. Required by Steinberg's spec for
-/// plugins with separate controllers — without it some plugins refuse to
-/// produce an editor view because they have no parameter snapshot to
-/// render. Best-effort: failures are logged, not propagated.
+/// `IEditController::setComponentState` (best-effort).
 fn transfer_component_state(
     component: &ComPtr<IComponent>,
     controller: &ComPtr<IEditController>,
@@ -729,8 +945,6 @@ fn create_instance<I: Interface>(
 ) -> Option<ComPtr<I>> {
     let mut obj: *mut c_void = std::ptr::null_mut();
     let iid_guid = I::IID;
-    // IPluginFactory::createInstance takes FIDString (= *const c_char) for
-    // cid and iid. Reinterpret as pointers.
     let res = unsafe {
         factory.createInstance(
             cid.as_ptr() as *const _,
@@ -744,16 +958,59 @@ fn create_instance<I: Interface>(
     unsafe { ComPtr::<I>::from_raw(obj as *mut I) }
 }
 
-/// VST3 のクラスを一時 instantiate して bus 構成から **port 構成**
-/// (note 入力 / note 出力 / audio 出力の有無) を読む。 daw_plugin_host の
-/// `--probe-vst3` one-shot モードから呼ばれる。 VST3 規格には note-effect の
-/// category tag が無く、 bus 構成でしか判別できない (`ivstaudioprocessor.h`
-/// PlugType / `ivstcomponent.h` MediaTypes)。 これで note-effect (note in/out・
-/// audio out なし) も dual-role (note out かつ audio out、 例: Scaler 2) も拾える。
-/// 失敗時は呼び元 (scan) が scan-time 暫定値を保持するので退行しない。
-///
-/// `load` の前半 (module → factory → class 解決 → component → initialize) を
-/// 再現し、 audio processing / controller / activate はしない (= 軽量・副作用最小)。
+/// VST3 param 一覧を `IEditController` から列挙 (plugin-main thread)。
+/// VST3 の param は仕様上常に normalized [0,1] なので min/max は 0/1 固定。
+fn enumerate_vst3_params(
+    controller: &ComPtr<IEditController>,
+) -> Vec<common::protocol::PluginParamInfo> {
+    let count = unsafe { controller.getParameterCount() };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        // SAFETY: ParameterInfo is plain data; zeroed start is legal.
+        let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+        let res = unsafe { controller.getParameterInfo(i, &raw mut info) };
+        if res != kResultOk {
+            tracing::warn!(index = i, "IEditController::getParameterInfo non-OK");
+            continue;
+        }
+        let name = utf16_buf_to_string(&info.title);
+        let mut flags: u32 = 0;
+        if info.flags & ParameterFlags_::kCanAutomate != 0 {
+            flags |= common::protocol::plugin_param_flags::AUTOMATABLE;
+        }
+        if info.flags & ParameterFlags_::kIsReadOnly != 0 {
+            flags |= common::protocol::plugin_param_flags::READONLY;
+        }
+        if info.flags & ParameterFlags_::kIsHidden != 0 {
+            flags |= common::protocol::plugin_param_flags::HIDDEN;
+        }
+        // VST3 の離散 param は stepCount > 0 (kIsList は enum 型)。
+        if info.stepCount > 0 || info.flags & ParameterFlags_::kIsList != 0 {
+            flags |= common::protocol::plugin_param_flags::STEPPED;
+        }
+        if info.flags & ParameterFlags_::kIsWrapAround != 0 {
+            flags |= common::protocol::plugin_param_flags::PERIODIC;
+        }
+        out.push(common::protocol::PluginParamInfo {
+            id: info.id,
+            name,
+            // VST3 の module/grouping は unitId + IUnitInfo 階層。flat 表示
+            // なので module は空。
+            module: String::new(),
+            min_value: 0.0,
+            max_value: 1.0,
+            default_value: info.defaultNormalizedValue,
+            flags,
+        });
+    }
+    out
+}
+
+/// VST3 のクラスを一時 instantiate して bus 構成から port 構成を読む
+/// (`--probe-vst3` one-shot モード)。
 pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::PortConfig> {
     let dll_path = resolve_vst3_dll(path)
         .with_context(|| format!("resolving VST3 at {}", path.display()))?;
@@ -776,8 +1033,6 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
     let factory = unsafe { ComPtr::<IPluginFactory>::from_raw(factory_raw) }
         .context("factory came back null")?;
 
-    // クラス検索 (load と同 idiom): target_id が 32-hex UUID ならその CID 一致、
-    // さもなくば最初の Audio Module Class。
     let count = unsafe { factory.countClasses() };
     let is_uuid =
         target_id.len() == 32 && target_id.chars().all(|c| c.is_ascii_hexdigit());
@@ -815,9 +1070,6 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
     let au_out = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput) };
     let _ = unsafe { component.terminate() };
 
-    // bus 構成をそのまま port 構成として返す。v23: audio input bus も拾うことで、
-    // engine が「audio を生成する音源 (au_in==0)」と「audio を加工するエフェクト
-    // (au_in>0)」を port 直結で区別できる (audio_in 有り = 入力を処理して置換)。
     Ok(common::port_config::PortConfig {
         has_note_input: ev_in > 0,
         has_note_output: ev_out > 0,
@@ -829,19 +1081,14 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
     })
 }
 
-// `c_array_to_string` / `tuid_to_hex` live in `common::vst3_scan` as the
-// shared SSoT (imported above) so scan-side (writes `cid_hex` to the plugin
-// DB) and load-side (this module, matches against it) hex / name decoding can
-// never drift.
-
 impl Drop for Vst3Plugin {
     fn drop(&mut self) {
-        // (r.md #5 ARA2) Tear down the ARA session before releasing the
-        // component — its drop issues destroy calls back into this plug-in.
-        // Deactivate first so detaching its playback regions is valid.
+        // Tear down the ARA session before releasing the component — its
+        // drop issues destroy calls back into this plug-in. Deactivate first
+        // so detaching its playback regions is valid.
         if self.ara.is_some() {
             if self.active {
-                self.deactivate();
+                LoadedPlugin::deactivate(self);
             }
             self.ara = None;
         }
@@ -875,6 +1122,32 @@ impl Drop for Vst3Plugin {
     }
 }
 
+impl crate::ara::AraLifecycleHost for Vst3Plugin {
+    fn ara_session(&self) -> Option<&crate::ara::session::AraSession> {
+        self.ara.as_ref()
+    }
+
+    fn ara_session_mut(&mut self) -> &mut Option<crate::ara::session::AraSession> {
+        &mut self.ara
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn last_activate_params(&self) -> Option<(f64, u32, u32)> {
+        self.last_activate
+    }
+
+    fn do_deactivate(&mut self) {
+        LoadedPlugin::deactivate(self);
+    }
+
+    fn do_activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()> {
+        LoadedPlugin::activate(self, sample_rate, min_frames, max_frames)
+    }
+}
+
 impl LoadedPlugin for Vst3Plugin {
     fn id(&self) -> &str {
         &self.id
@@ -886,6 +1159,10 @@ impl LoadedPlugin for Vst3Plugin {
 
     fn format(&self) -> PluginFormat {
         PluginFormat::Vst3
+    }
+
+    fn audio_half(&self) -> Arc<AudioHalf> {
+        Arc::clone(&self.audio_half)
     }
 
     fn bind_ara_if_capable(&mut self) -> Result<bool> {
@@ -916,47 +1193,11 @@ impl LoadedPlugin for Vst3Plugin {
         time_sig: (u16, u16),
         archive: Option<&[u8]>,
     ) -> Result<bool> {
-        if self.ara.is_none() {
-            return Ok(false);
-        }
-        // set_clips / region detach require the instance inactive; deactivate
-        // around the update, then restore. The bind already happened at load.
-        let was_active = self.active;
-        let restore = self.last_activate;
-        if was_active {
-            self.deactivate();
-        }
-        if let Some(session) = self.ara.as_mut() {
-            session.set_clips(clips, bpm, time_sig);
-        }
-        if let Some(archive) = archive.filter(|a| !a.is_empty())
-            && let Some(session) = self.ara.as_ref()
-        {
-            session.restore_archive(archive);
-        }
-        if was_active
-            && let Some((sample_rate, min_frames, max_frames)) = restore
-        {
-            self.activate(sample_rate, min_frames, max_frames)?;
-        }
-        Ok(true)
+        crate::ara::run_setup_ara(self, clips, bpm, time_sig, archive)
     }
 
     fn clear_ara(&mut self) {
-        if self.ara.is_none() {
-            return;
-        }
-        let was_active = self.active;
-        let restore = self.last_activate;
-        if was_active {
-            self.deactivate();
-        }
-        self.ara = None;
-        if was_active
-            && let Some((sample_rate, min_frames, max_frames)) = restore
-        {
-            let _ = self.activate(sample_rate, min_frames, max_frames);
-        }
+        crate::ara::run_clear_ara(self);
     }
 
     fn update_ara_regions(&self, regions: &[common::protocol::AraRegionUpdate]) {
@@ -979,77 +1220,17 @@ impl LoadedPlugin for Vst3Plugin {
         self.ara.as_ref().and_then(|session| session.store_archive())
     }
 
-    /// VST3 param 一覧を `IEditController` から列挙。 VST3 の param は仕様上
-    /// 常に normalized [0,1] なので min/max は 0/1 固定、 default は
-    /// `defaultNormalizedValue`。 plugin-main thread で呼ばれる
-    /// (`SetSlotPlugin` 処理経路、 controller は main-thread API)。
     fn enumerate_params(&self) -> Vec<common::protocol::PluginParamInfo> {
-        let count = unsafe { self.controller.getParameterCount() };
-        if count <= 0 {
-            return Vec::new();
-        }
-        let mut out = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            // SAFETY: ParameterInfo is plain data; zeroed start is legal
-            // because getParameterInfo overwrites the fields it populates.
-            let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
-            let res = unsafe { self.controller.getParameterInfo(i, &raw mut info) };
-            if res != kResultOk {
-                tracing::warn!(index = i, "IEditController::getParameterInfo non-OK");
-                continue;
-            }
-            let name = utf16_buf_to_string(&info.title);
-            let mut flags: u32 = 0;
-            if info.flags & ParameterFlags_::kCanAutomate != 0 {
-                flags |= common::protocol::plugin_param_flags::AUTOMATABLE;
-            }
-            if info.flags & ParameterFlags_::kIsReadOnly != 0 {
-                flags |= common::protocol::plugin_param_flags::READONLY;
-            }
-            if info.flags & ParameterFlags_::kIsHidden != 0 {
-                flags |= common::protocol::plugin_param_flags::HIDDEN;
-            }
-            // VST3 の離散 param は stepCount > 0 (kIsList は enum 型)。 どちらも
-            // CLAP の STEPPED 相当として扱う。
-            if info.stepCount > 0 || info.flags & ParameterFlags_::kIsList != 0 {
-                flags |= common::protocol::plugin_param_flags::STEPPED;
-            }
-            if info.flags & ParameterFlags_::kIsWrapAround != 0 {
-                flags |= common::protocol::plugin_param_flags::PERIODIC;
-            }
-            out.push(common::protocol::PluginParamInfo {
-                id: info.id,
-                name,
-                // VST3 の module/grouping は unitId + IUnitInfo 階層で表現される。
-                // 現状 daw_gui は flat 表示なので module は空 (CLAP も任意)。
-                module: String::new(),
-                min_value: 0.0,
-                max_value: 1.0,
-                default_value: info.defaultNormalizedValue,
-                flags,
-            });
-        }
-        out
+        enumerate_vst3_params(&self.controller)
     }
 
     fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()> {
         anyhow::ensure!(!self.active, "VST3 plugin already active");
-        // (r.md #5 ARA2) remember params so ARA setup can deactivate → bind →
-        // reactivate (ARA binding must precede setActive).
+        // remember params so ARA setup can deactivate → reactivate.
         self.last_activate = Some((sample_rate, min_frames, max_frames));
 
-        // 1. Negotiate speaker arrangements for each bus (MVP: stereo).
+        // 1. Negotiate speaker arrangements for every audio bus (per spec).
         let stereo: SpeakerArrangement = SpeakerArr::kStereo;
-        // VST3 spec: setBusArrangements は **全 audio bus について** 1 つずつ
-        // SpeakerArrangement を渡す必要がある。 旧実装は「main bus 1 個だけに
-        // stereo」 を渡していたため、 multi-bus plugin (例: MeldaProduction
-        // MSoundFactory は main + sidechain + sub) で arrangement 不整合に
-        // なり、 plugin が処理を停止していた。
-        //
-        // 各 bus の channel count を `getBusInfo` で query → `arrangement_for_bus`
-        // が標準 layout (mono / stereo / 3.0 / quad / 5.1 / 7.1) にマップし、
-        // 非標準 ch 数のみ stereo fallback。 plugin が拒否 (kResultFalse) した
-        // 場合はそのまま続行 — 多くの plugin は内部で best-effort fallback する。
         let in_arr_count = unsafe {
             self.component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput)
         };
@@ -1080,8 +1261,6 @@ impl LoadedPlugin for Vst3Plugin {
         if sba != kResultOk && sba != kResultTrue {
             tracing::warn!(res = format!("{sba:#x}"), "setBusArrangements non-OK (continuing)");
         }
-        // negotiated arrangement を確認 (plugin によっては request と異なる
-        // arrangement を採用する)。
         for i in 0..in_arr_count {
             let mut got: SpeakerArrangement = 0;
             let res = unsafe {
@@ -1122,14 +1301,10 @@ impl LoadedPlugin for Vst3Plugin {
         // 3. Activate every audio + event bus.
         for dir in [BusDirections_::kInput, BusDirections_::kOutput] {
             for media in [MediaTypes_::kAudio, MediaTypes_::kEvent] {
-                let n = unsafe {
-                    self.component
-                        .getBusCount(media, dir)
-                };
+                let n = unsafe { self.component.getBusCount(media, dir) };
                 for i in 0..n {
                     unsafe {
-                        self.component
-                            .activateBus(media, dir, i, 1);
+                        self.component.activateBus(media, dir, i, 1);
                     }
                 }
             }
@@ -1143,69 +1318,10 @@ impl LoadedPlugin for Vst3Plugin {
             res
         );
 
-        // 5. Allocate planar buffers for process() and prime the transport
-        // block so the very first `process()` already sees `kPlaying` —
-        // some plugins (SynthMaster 3 among them) refuse to output anything
-        // when `processContext` is null or `state` doesn't include
-        // `kPlaying`.
-        self.process_context.state = (StatesAndFlags_::kPlaying
-            | StatesAndFlags_::kTempoValid
-            | StatesAndFlags_::kTimeSigValid) as u32;
-        self.process_context.sampleRate = sample_rate;
-        self.process_context.tempo = 120.0;
-        self.process_context.timeSigNumerator = 4;
-        self.process_context.timeSigDenominator = 4;
-
-        self.max_frames = max_frames;
-        self.sample_rate = sample_rate;
-        self.input_buffers = (0..self.input_channels as usize)
-            .map(|_| vec![0.0f32; max_frames as usize])
-            .collect();
-        self.input_ptrs = vec![std::ptr::null_mut(); self.input_channels as usize];
-        self.output_buffers = (0..self.output_channels as usize)
-            .map(|_| vec![0.0f32; max_frames as usize])
-            .collect();
-        self.output_ptrs = vec![std::ptr::null_mut(); self.output_channels as usize];
-        // PR4 sidechain: allocate planar buffers + ptr scratch for each
-        // aux input bus. Mirrors the main input bus allocation above.
-        self.aux_input_buffers = self
-            .aux_input_channels
-            .iter()
-            .map(|&ch| {
-                (0..ch as usize)
-                    .map(|_| vec![0.0f32; max_frames as usize])
-                    .collect()
-            })
-            .collect();
-        self.aux_input_ptrs = self
-            .aux_input_channels
-            .iter()
-            .map(|&ch| vec![std::ptr::null_mut(); ch as usize])
-            .collect();
-        // Phase 6 review (RT 安全): process() で毎 buffer 確保していた
-        // Vec<AudioBusBuffers> を pre-allocate。 capacity = 1 (main) +
-        // aux bus 数。 process() 入口で clear() + push() で reuse する。
-        self.process_input_bufs =
-            Vec::with_capacity(1 + self.aux_input_channels.len());
-        // Multi-output-bus support (Surge XT 等): scratch buffers for each
-        // extra output bus + the process-time output `Vec<AudioBusBuffers>`
-        // (main + extras). Mirrors the aux input allocation above.
-        self.extra_output_buffers = self
-            .extra_output_channels
-            .iter()
-            .map(|&ch| {
-                (0..ch as usize)
-                    .map(|_| vec![0.0f32; max_frames as usize])
-                    .collect()
-            })
-            .collect();
-        self.extra_output_ptrs = self
-            .extra_output_channels
-            .iter()
-            .map(|&ch| vec![std::ptr::null_mut(); ch as usize])
-            .collect();
-        self.process_output_bufs =
-            Vec::with_capacity(1 + self.extra_output_channels.len());
+        // 5. Allocate the audio half's process buffers + prime its
+        // transport block.
+        // SAFETY: quiesced window (install / reinit / ARA setup call sites).
+        unsafe { self.audio_half_mut().on_activate(sample_rate, max_frames) };
         self.active = true;
         tracing::info!(name = %self.name, sample_rate, max_frames, "VST3 plugin activated");
         Ok(())
@@ -1219,27 +1335,24 @@ impl LoadedPlugin for Vst3Plugin {
             self.component.setActive(0);
         }
         self.active = false;
-        self.output_buffers.clear();
-        self.output_ptrs.clear();
-        self.extra_output_buffers.clear();
-        self.extra_output_ptrs.clear();
-        self.process_output_bufs.clear();
+        // SAFETY: quiesced window.
+        unsafe { self.audio_half_mut().on_deactivate() };
     }
 
     fn start_processing(&mut self) -> Result<()> {
         anyhow::ensure!(self.active, "VST3 plugin not active");
         anyhow::ensure!(!self.processing, "VST3 plugin already processing");
         let res = unsafe { self.audio.setProcessing(1) };
-        // VST3 spec treats `setProcessing` as optional — some plugins (e.g.
-        // SynthMaster 3) return `kNotImplemented` instead of accepting the
-        // state change. Those plugins are always ready to process; treat
-        // `kNotImplemented` the same as `kResultOk`.
+        // Some plugins (SynthMaster 3) return `kNotImplemented`; those are
+        // always ready to process.
         anyhow::ensure!(
             res == kResultOk || res == kNotImplemented,
             "IAudioProcessor::setProcessing(1) -> {:#x}",
             res
         );
         self.processing = true;
+        // SAFETY: quiesced window.
+        unsafe { self.audio_half_mut().set_processing(true) };
         Ok(())
     }
 
@@ -1251,18 +1364,17 @@ impl LoadedPlugin for Vst3Plugin {
             self.audio.setProcessing(0);
         }
         self.processing = false;
-        // Drain the RT-set overflow flag here (off the hot path). Swap-and-test
-        // so the warning fires at most once per overflow episode.
+        // SAFETY: quiesced window.
+        unsafe { self.audio_half_mut().set_processing(false) };
+        // Drain the RT-set one-shot diagnostics here (off the hot path).
         if self.param_pool_overflowed.swap(false, Ordering::Relaxed) {
             tracing::warn!(
                 plugin = %self.name,
                 "VST3 param changes pool overflow (>64 distinct params/buffer); extra dropped"
             );
         }
-        // r.md #4: GUI→DSP edit ring overflowed (a knob was turned faster than
-        // `process()` drained, or while the engine wasn't processing). Benign —
-        // the trailing edits of a drag re-deliver the final value — but worth a
-        // one-shot note. Off the RT path, like the pool-overflow flag above.
+        // r.md #4: GUI→DSP edit ring overflowed. Benign — trailing edits of
+        // a drag re-deliver the final value — but worth a one-shot note.
         if self.gui_param_edits.take_overflowed() {
             tracing::warn!(
                 plugin = %self.name,
@@ -1281,403 +1393,20 @@ impl LoadedPlugin for Vst3Plugin {
         }
     }
 
-    fn process(
-        &mut self,
-        frames: u32,
-        events: &[TimedNoteEvent],
-        param_events: &[crate::plugin_instance::TimedParamEvent],
-        input_audio: &[&[f32]],
-        aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
-        transport: &crate::plugin_instance::TransportContext,
-    ) -> Result<i32> {
-        anyhow::ensure!(self.processing, "VST3 plugin not processing");
-
-        // --- Copy inputs into pre-allocated planar buffers.
-        let n = frames as usize;
-        for (ch, buf) in self.input_buffers.iter_mut().enumerate() {
-            let buf_len = buf.len();
-            let cap = n.min(buf_len);
-            if ch < input_audio.len() {
-                let src = input_audio[ch];
-                let copy_n = cap.min(src.len());
-                buf[..copy_n].copy_from_slice(&src[..copy_n]);
-                if copy_n < cap {
-                    buf[copy_n..cap].fill(0.0);
-                }
-            } else {
-                buf[..cap].fill(0.0);
-            }
-        }
-        for i in 0..self.input_buffers.len() {
-            self.input_ptrs[i] = self.input_buffers[i].as_mut_ptr();
-        }
-        for i in 0..self.output_buffers.len() {
-            self.output_ptrs[i] = self.output_buffers[i].as_mut_ptr();
-        }
-        // Multi-output-bus: refresh extra output bus channel pointers so the
-        // process-time `AudioBusBuffers` see the latest base pointers.
-        for bus_idx in 0..self.extra_output_buffers.len() {
-            for ch in 0..self.extra_output_buffers[bus_idx].len() {
-                self.extra_output_ptrs[bus_idx][ch] =
-                    self.extra_output_buffers[bus_idx][ch].as_mut_ptr();
-            }
-        }
-        // PR4 sidechain: copy aux input audio into our pre-allocated
-        // planar bus buffers, mirroring the main bus copy above. Each
-        // aux bus channel pointer is refreshed here so AudioBusBuffers
-        // sees the latest base pointers.
-        for (bus_idx, bus_bufs) in self.aux_input_buffers.iter_mut().enumerate() {
-            let aux = aux_inputs.get(bus_idx).copied();
-            for (ch, buf) in bus_bufs.iter_mut().enumerate() {
-                let cap = n.min(buf.len());
-                let src: &[f32] = match (aux, ch) {
-                    (Some(a), 0) if a.active => a.l,
-                    (Some(a), 1) if a.active => a.r,
-                    _ => &[],
-                };
-                let copy_n = cap.min(src.len());
-                buf[..copy_n].copy_from_slice(&src[..copy_n]);
-                if copy_n < cap {
-                    buf[copy_n..cap].fill(0.0);
-                }
-            }
-            for (ch, ptrs) in self.aux_input_ptrs[bus_idx].iter_mut().enumerate() {
-                *ptrs = bus_bufs[ch].as_mut_ptr();
-            }
-        }
-
-        // --- Build Event buffer and hand it to the reusable input list.
-        // No per-process allocation: both `in_event_buffer` and
-        // `Vst3InEventList` keep their capacity across calls.
-        self.in_event_buffer.clear();
-        for te in events {
-            self.in_event_buffer.push(encode_event(te));
-        }
-        self.in_event_list.set_events(&self.in_event_buffer);
-        self.collected_out_notes.clear();
-
-        // Phase: automation lane の値 (`TimedParamEvent`) を reusable
-        // `IParameterChanges` に詰める。 daw_audio が param lane を評価して
-        // ProcessData.events に積み、 process_server が `param_events` として
-        // 渡してくる。 VST3 の値は normalized [0,1] (= daw_gui の VST3 param
-        // automation も normalized で持つ、 enumerate_params が min0/max1 で
-        // 報告するため整合)。
-        //
-        // `docs/plan_modulation_routing_redesign.md` §3.3: VST3 にはモジュレー
-        // ションチャネルが無いので、`ParamEventKind::Mod` のオフセットを host が
-        // `base + offset` に畳んで絶対値として送る (VST3 は normalized 0..=1 なので
-        // `amount == offset`)。base は last-set 値キャッシュ (`param_mod_base`)。
-        use crate::plugin_instance::ParamEventKind;
-
-        // r.md #4: drain GUI-originated parameter edits — the VST3 controller's
-        // `performEdit`, queued by `Vst3ComponentHandler` on the UI thread — and
-        // feed them to the processor at sample offset 0. The edit controller and
-        // the audio processor are decoupled in VST3, so without the host carrying
-        // the edit across, the DSP never sees a knob turn and the sound doesn't
-        // change for any param no automation lane is driving. Collapsed to the
-        // last value per param (only the final knob position matters).
-        self.gui_edit_scratch.clear();
-        self.gui_param_edits.drain_latest(&mut self.gui_edit_scratch);
-
-        // Pre-pass: refresh base cache from this buffer's absolute Value events
-        // (unstable time sort ⇒ update before reading). GUI edits are absolute
-        // values too, so they update the base for any `Mod` folding below.
-        for &(id, val) in &self.gui_edit_scratch {
-            if let Some(slot) = self.param_mod_base.get_mut(&id) {
-                *slot = val;
-            }
-        }
-        for ev in param_events {
-            if ev.kind == ParamEventKind::Value
-                && let Some(slot) = self.param_mod_base.get_mut(&ev.param_id)
-            {
-                *slot = ev.value;
-            }
-        }
-        self.folded_param_events.clear();
-        // GUI edits first, at sample offset 0, so a non-automated knob turn
-        // reaches the DSP. Any automation events for the same param follow in
-        // ascending time order, so each param's value-queue offsets stay
-        // non-decreasing (a VST3 `IParamValueQueue` requirement).
-        for &(id, val) in &self.gui_edit_scratch {
-            self.folded_param_events.push(crate::plugin_instance::TimedParamEvent {
-                time: 0,
-                param_id: id,
-                value: val,
-                kind: ParamEventKind::Value,
-            });
-        }
-        for ev in param_events {
-            match ev.kind {
-                ParamEventKind::Value => self.folded_param_events.push(*ev),
-                ParamEventKind::Mod => {
-                    let base = self.param_mod_base.get(&ev.param_id).copied().unwrap_or(0.0);
-                    let value = (base + ev.value).clamp(0.0, 1.0);
-                    self.folded_param_events.push(crate::plugin_instance::TimedParamEvent {
-                        time: ev.time,
-                        param_id: ev.param_id,
-                        value,
-                        kind: ParamEventKind::Value,
-                    });
-                }
-            }
-        }
-        if self.in_param_changes.set_changes(&self.folded_param_events) {
-            // RT path: just raise a flag. The actual log (which formats
-            // `%self.name`) happens once in `stop_processing()`, off the RT
-            // thread, to keep `process()` free of heap allocation and tracing.
-            self.param_pool_overflowed.store(true, Ordering::Relaxed);
-        }
-
-        // `to_com_ptr` only bumps the Arc strong count + addRef; no heap
-        // allocation. The ComPtrs' Drop at end-of-scope balances the
-        // addRef with a release, keeping the ComWrapper's own ref.
-        let in_list_ptr = self
-            .in_event_list
-            .to_com_ptr::<IEventList>()
-            .context("Vst3InEventList has no IEventList")?;
-        let out_list_ptr = self
-            .out_event_list
-            .to_com_ptr::<IEventList>()
-            .context("Vst3OutEventList has no IEventList")?;
-        let in_param_changes_ptr = self
-            .in_param_changes
-            .to_com_ptr::<IParameterChanges>()
-            .context("Vst3InParamChanges has no IParameterChanges")?;
-
-        // --- Assemble AudioBusBuffers (main + aux inputs).
-        // Phase 6 review (RT 安全): 毎 buffer `Vec::with_capacity` → drop
-        // していた hot path alloc を pre-allocated field の clear/push reuse
-        // に置換。 CLAP 側の `ClapPlugin::process_input_bufs` と同 pattern。
-        self.process_input_bufs.clear();
-        if self.input_channels > 0 {
-            self.process_input_bufs.push(AudioBusBuffers {
-                numChannels: self.input_channels as i32,
-                silenceFlags: 0,
-                __field0: AudioBusBuffers__type0 {
-                    channelBuffers32: self.input_ptrs.as_mut_ptr(),
-                },
-            });
-        }
-        for bus_idx in 0..self.aux_input_channels.len() {
-            self.process_input_bufs.push(AudioBusBuffers {
-                numChannels: self.aux_input_channels[bus_idx] as i32,
-                silenceFlags: 0,
-                __field0: AudioBusBuffers__type0 {
-                    channelBuffers32: self.aux_input_ptrs[bus_idx].as_mut_ptr(),
-                },
-            });
-        }
-        // Assemble output AudioBusBuffers (main + extras). VST3 requires
-        // `numOutputs` to equal the plugin's output bus count; bus 0 is the
-        // real main output we read back, buses 1..N are scratch so multi-
-        // output synths (Surge XT) honour the main bus instead of mismatching.
-        self.process_output_bufs.clear();
-        if self.output_channels > 0 {
-            self.process_output_bufs.push(AudioBusBuffers {
-                numChannels: self.output_channels as i32,
-                silenceFlags: 0,
-                __field0: AudioBusBuffers__type0 {
-                    channelBuffers32: self.output_ptrs.as_mut_ptr(),
-                },
-            });
-        }
-        for bus_idx in 0..self.extra_output_channels.len() {
-            self.process_output_bufs.push(AudioBusBuffers {
-                numChannels: self.extra_output_channels[bus_idx] as i32,
-                silenceFlags: 0,
-                __field0: AudioBusBuffers__type0 {
-                    channelBuffers32: self.extra_output_ptrs[bus_idx].as_mut_ptr(),
-                },
-            });
-        }
-
-        // Phase 7 B1-T (2026-05-13): per-buffer transport snapshot を VST3
-        // `ProcessContext` に populate。 CLAP `build_clap_transport_event`
-        // と同 semantics (= tempo / time_sig / bar_position / cycle 範囲 /
-        // playing flag / project time の VST3 版)。 旧来は
-        // `projectTimeSamples` を free-running で `+= frames` するだけだった
-        // ため、 host の実 playhead と同期せず tempo-sync 系 VST3 plugin
-        // (delay / arp / LFO) が host テンポを追随できなかった問題を解消。
-        // VST3 spec: ProcessContext は `processContext` field 経由で plugin
-        // に届き、 plugin は `state` flag を見て個別 field の有効性を判定する
-        // (= flag の立っていない field は plugin 側で無視)。 musical time は
-        // 拍 (= TQuarterNotes f64) 単位、 sample time は absolute samples。
-        let bpm_f = f64::from(transport.bpm.max(1.0));
-        let tsig_num_f = f64::from(transport.tsig_num.max(1));
-        // beats は daw_audio が tempo automation を積分した真の拍位置を使う
-        // (= CLAP `build_clap_transport_event` と同 SSoT、 一定テンポ逆算廃止)。
-        let song_pos_beats = transport.song_pos_beats;
-        let bar_number = (song_pos_beats / tsig_num_f).floor();
-        let bar_start_beats = bar_number * tsig_num_f;
-        self.process_context.sampleRate = self.sample_rate;
-        self.process_context.tempo = bpm_f;
-        self.process_context.timeSigNumerator =
-            i32::from(transport.tsig_num.max(1));
-        self.process_context.timeSigDenominator =
-            i32::from(transport.tsig_denom.max(1));
-        // VST3 spec: `projectTimeSamples` is the song-relative sample position.
-        // The engine doesn't populate `ProcessData::steady_time` (it stays 0), so
-        // `transport.playhead_samples` is unusable here — deriving the sample
-        // position from the authoritative `song_pos_beats` keeps it consistent
-        // with `projectTimeMusic` and with the ARA playback regions (whose
-        // playback times daw_gui also derives from beats via the song tempo).
-        // Without this, ARA plug-ins (Melodyne) see a frozen position 0 and
-        // render the region's first frame forever (a constant tone), instead of
-        // following the transport. saturating cast guards a pathological value.
-        let song_pos_samples =
-            (song_pos_beats * 60.0 / bpm_f * self.sample_rate).max(0.0) as i64;
-        self.process_context.projectTimeSamples = song_pos_samples;
-        self.process_context.continousTimeSamples = song_pos_samples;
-        self.process_context.projectTimeMusic = song_pos_beats;
-        self.process_context.barPositionMusic = bar_start_beats;
-        self.process_context.cycleStartMusic = transport.loop_start_beats;
-        self.process_context.cycleEndMusic = transport.loop_end_beats;
-        // State flags: kTempoValid / kTimeSigValid / kProjectTimeMusicValid /
-        // kBarPositionValid / kCycleValid は常時 valid。 kPlaying /
-        // kCycleActive のみ transport 状態依存で動的設定。
-        let mut state = (StatesAndFlags_::kTempoValid
-            | StatesAndFlags_::kTimeSigValid
-            | StatesAndFlags_::kProjectTimeMusicValid
-            | StatesAndFlags_::kBarPositionValid
-            | StatesAndFlags_::kCycleValid
-            | StatesAndFlags_::kContTimeValid) as u32;
-        if transport.is_playing {
-            state |= StatesAndFlags_::kPlaying as u32;
-        }
-        if transport.is_looping
-            && transport.loop_end_beats > transport.loop_start_beats
-        {
-            state |= StatesAndFlags_::kCycleActive as u32;
-        }
-        self.process_context.state = state;
-
-        let num_inputs = self.process_input_bufs.len() as i32;
-        let inputs_ptr = if self.process_input_bufs.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            self.process_input_bufs.as_mut_ptr()
-        };
-        let mut data = ProcessData {
-            // Phase 7 B1-R (2026-05-13): per-buffer の processMode は
-            // `set_render_mode` で更新される `self.render_mode` から引く
-            // (= export 中は kOffline、 通常再生は kRealtime)。 詳細は
-            // `set_render_mode` の comment 参照。
-            processMode: match self.render_mode {
-                RenderMode::Realtime => ProcessModes_::kRealtime,
-                RenderMode::Offline => ProcessModes_::kOffline,
-            },
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32,
-            numSamples: frames as i32,
-            numInputs: num_inputs,
-            numOutputs: self.process_output_bufs.len() as i32,
-            inputs: inputs_ptr,
-            outputs: if self.process_output_bufs.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                self.process_output_bufs.as_mut_ptr()
-            },
-            // automation 入力 (host → plugin)。 borrowed ptr: ComWrapper が
-            // 自前 ref を保持するので in_param_changes_ptr drop 後も生存
-            // (in_list_ptr と同 idiom)。
-            inputParameterChanges: in_param_changes_ptr.as_ptr(),
-            // output param changes (plugin → host の param 自動化書き戻し) は
-            // 現状未使用。 GUI gesture は IComponentHandler 経由で別途取得する。
-            outputParameterChanges: std::ptr::null_mut(),
-            // as_ptr keeps shared ownership with the ComPtrs above; they
-            // release on scope exit, so nothing leaks and no extra release
-            // is needed after process().
-            inputEvents: in_list_ptr.as_ptr(),
-            outputEvents: out_list_ptr.as_ptr(),
-            processContext: &mut self.process_context,
-        };
-        let status = unsafe { self.audio.process(&mut data) };
-        if status != kResultOk {
-            // C5 (r.md #8): release でも記録 (旧 debug 限定 → 納品物の診断ゼロ)。
-            // Record (don't log) here: `format!` would heap-allocate on the RT
-            // thread and an unhappy plugin returns non-OK every buffer. The
-            // actual warning fires once (off-RT) from `stop_processing()`.
-            self.process_status_err.store(status, Ordering::Relaxed);
-        }
-
-        // Drain collected events before the ComPtrs drop (order doesn't
-        // strictly matter, but keeps the reader's mental model simple).
-        self.out_event_list.drain_into(&mut self.collected_out_notes);
-
-        Ok(status)
-    }
-
-    fn output_buffer(&self, channel: usize) -> Option<&[f32]> {
-        self.output_buffers.get(channel).map(|v| v.as_slice())
-    }
-
-    /// パラアウト (`docs/plan_paraout.md`): expose every output bus as a
-    /// parallel-out port. **Port 0 is the MAIN output bus** (`output_buffers`,
-    /// the first "part"); ports `1..` are the extra (non-main) buses
-    /// (`extra_output_buffers`), which the plugin already writes every
-    /// `process()` (we used to discard them). A multi-out drum like MDrummer
-    /// puts each part on its own bus, main included — so "explode" can split
-    /// all of them into child tracks. Symmetric to `ClapPlugin::aux_output_buffer`.
-    fn aux_output_buffer(&self, port: usize, channel: usize) -> Option<&[f32]> {
-        // Single-output plugins have no parallel-out ports (port 0 = main is
-        // only exposed for splitting when there's ≥1 extra bus). Skip so the
-        // process server doesn't needlessly copy main into buffer_aux_out[0].
-        if self.extra_output_channels.is_empty() {
-            return None;
-        }
-        if port == 0 {
-            self.output_buffers.get(channel).map(|v| v.as_slice())
-        } else {
-            self.extra_output_buffers
-                .get(port - 1)
-                .and_then(|bus| bus.get(channel))
-                .map(|v| v.as_slice())
-        }
-    }
-
-    /// パラアウト: number of parallel-out ports = `1 (main) + extra bus count`,
-    /// capped at `MAX_AUX_OUT`. Only multi-output plugins (≥1 extra bus) get
-    /// paraout; a single-output plugin reports 0 (no "explode"). MDrummer has
-    /// 15 extra buses → 16 ports (main + 15). Reported to the GUI.
-    fn aux_output_port_count(&self) -> usize {
-        let extra = self.extra_output_channels.len();
-        if extra == 0 {
-            0
-        } else {
-            (1 + extra).min(common::process_data::MAX_AUX_OUT)
-        }
-    }
-
-    fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>) {
-        out.append(&mut self.collected_out_notes);
-    }
-
     fn set_render_mode(&mut self, mode: RenderMode) -> bool {
-        // Phase 7 B1-R (2026-05-13): VST3 spec の `IComponent::setIoMode` は
-        // `initialize` 前にしか呼べない (= 既に active な plugin への動的
-        // 切替は spec 違反 + plugin 依存で動かない) ため、 spec 準拠の代替
-        // として `ProcessData::processMode` を per-buffer で
-        // `kRealtime` / `kOffline` に切り替える。 plugin が process() 毎の
-        // processMode を尊重するか `setupProcessing` 時の値を固定するかは
-        // plugin 実装依存だが、 多くの reverb / convolution / lookahead 系
-        // plugin は process 毎を読んで「offline = 高品質 algo に切替」 等を
-        // 判定する (= effect が plugin 依存で出る、 害は無い)。 daw_audio の
-        // export 経路 (= freewheel offline render) で SetRenderMode IPC を
-        // 送ると本 setter が呼ばれ、 次 process() から `processMode = kOffline`。
-        self.render_mode = mode;
+        // VST3 spec の `IComponent::setIoMode` は `initialize` 前限定なので、
+        // spec 準拠の代替として per-buffer `ProcessData::processMode` を
+        // 切替える (audio half が shared atomic を毎 buffer 読む)。
+        self.offline
+            .store(mode == RenderMode::Offline, Ordering::Relaxed);
         tracing::info!(name = %self.name, ?mode, "VST3 render mode updated");
         true
     }
 
     fn query_latency(&mut self) -> u32 {
-        // PR3.3: VST3 spec (`IAudioProcessor::getLatencySamples`):
-        //   "Gets the current Latency in samples. ... if internally needs
-        //    to look in advance (like compressors) 512 samples then this
-        //    plug-in should report 512 as latency."
-        // Thread requirement: `[UI-thread & Setup Done]` — host must call
-        // it after `setupProcessing` completed. We invoke right after our
-        // `activate()` ran `setupProcessing` + `setActive(true)`, so we're
-        // safely past the Setup Done barrier.
+        // VST3 spec (`IAudioProcessor::getLatencySamples`): call after
+        // `setupProcessing` completed (Setup Done). We invoke right after
+        // our `activate()`, so we're safely past the barrier.
         unsafe { self.audio.getLatencySamples() }
     }
 
@@ -1706,6 +1435,10 @@ impl LoadedPlugin for Vst3Plugin {
             res
         );
         Ok(())
+    }
+
+    fn aux_output_port_count(&self) -> usize {
+        self.paraout_port_count
     }
 
     fn gui_is_embed_supported(&self) -> bool {
@@ -1752,8 +1485,6 @@ impl LoadedPlugin for Vst3Plugin {
         let Some(view) = (unsafe { ComPtr::<IPlugView>::from_raw(view_raw) }) else {
             anyhow::bail!("createView returned null after from_raw");
         };
-        // HWND platform を plugin が受け入れるか確認 (false なら GUI embed
-        // 不可、 plugin 側の標準 window で出す必要がある = MVP では未対応)。
         let supported = unsafe { view.isPlatformTypeSupported(kPlatformTypeHWND) };
         tracing::info!(
             plugin = %self.name,
@@ -1773,14 +1504,10 @@ impl LoadedPlugin for Vst3Plugin {
             res = format!("{set_frame_res:#x}"),
             "VST3 setFrame"
         );
-        // Keep one ref in self via `view`; Release the extra we added via
-        // into_raw — setFrame does addRef internally so ownership is balanced.
         let _ = unsafe { ComPtr::<vst3::Steinberg::IPlugFrame>::from_raw(frame_ptr) };
         self.view = Some(view);
-        // (r.md #5 ARA2) The editor view now exists — push the current ARA
-        // selection so the plug-in's editor displays the track's regions. ARA
-        // requires this on (re-)opening the view; doing it only at document
-        // setup (before the view existed) left Melodyne's timeline empty.
+        // The editor view now exists — push the current ARA selection so the
+        // plug-in's editor displays the track's regions.
         if let Some(session) = self.ara.as_ref() {
             session.notify_editor_selection();
         }
@@ -1805,9 +1532,8 @@ impl LoadedPlugin for Vst3Plugin {
     }
 
     fn gui_set_scale(&self, scale: f64) -> Result<bool> {
-        // C1 (r.md #8): IPlugViewContentScaleSupport を実装する plugin に DPI scale を
-        // 渡す (旧実装は skip で 1.0 固定 → HiDPI でぼやけ)。 非対応 plugin (cast 失敗)
-        // は自前で DPI を扱うので false (= host no-op) を返す。
+        // C1 (r.md #8): IPlugViewContentScaleSupport を実装する plugin に
+        // DPI scale を渡す。非対応 plugin は自前で DPI を扱うので false。
         let Some(view) = self.view.as_ref() else {
             return Ok(false);
         };
@@ -1844,8 +1570,6 @@ impl LoadedPlugin for Vst3Plugin {
             res
         );
         // attached 直後に getSize で plugin が要求する初期サイズを取得 + ログ。
-        // MeldaProduction 等は ここで自身の preferred size を返すので、 0×0
-        // ならば描画 surface 未初期化の signal。
         let mut rect = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
         let size_res = unsafe { view.getSize(&mut rect) };
         tracing::info!(
@@ -1865,8 +1589,7 @@ impl LoadedPlugin for Vst3Plugin {
     }
 
     fn gui_hide(&self) -> Result<()> {
-        // No-op on VST3 — actual hide is deferred to `gui_destroy` which
-        // calls `removed()`.
+        // No-op on VST3 — actual hide is deferred to `gui_destroy`.
         Ok(())
     }
 
@@ -1900,9 +1623,7 @@ impl LoadedPlugin for Vst3Plugin {
 
 fn encode_event(te: &TimedNoteEvent) -> Event {
     match te.event {
-        // PR-V2.4: VST3 NoteOn/Off の `noteId` 標準 field に `note_id` を
-        // 詰める (= host から plugin へ note 識別子を伝搬)。 `i32` 型で
-        // 0..i32::MAX に clamp、 越えたら `-1` (= "未指定") に fallback。
+        // VST3 NoteOn/Off の `noteId` 標準 field に `note_id` を詰める。
         NoteTransition::On { note_id, key, velocity } => {
             let vst_note_id =
                 if note_id <= i32::MAX as u32 { note_id as i32 } else { -1 };
@@ -1961,21 +1682,18 @@ fn encode_event(te: &TimedNoteEvent) -> Event {
 }
 
 fn event_type0_zero() -> Event__type0 {
-    // The Event union is too large for any single variant; zero-init is safe
-    // as a starting point since `std::ptr::write` fills the chosen variant
-    // before the plugin reads it.
+    // Zero-init is safe as a starting point since `std::ptr::write` fills
+    // the chosen variant before the plugin reads it.
     unsafe { std::mem::zeroed() }
 }
 
 /// Decode a VST3 Event coming back from the plugin's output event list into
-/// our format-agnostic `TimedNoteEvent`. Unknown types are dropped silently
-/// (return `None`).
+/// our format-agnostic `TimedNoteEvent`. Unknown types are dropped silently.
 pub(crate) fn decode_event(ev: &Event) -> Option<TimedNoteEvent> {
     let ty = ev.r#type as u32;
     if ty == Event_::EventTypes_::kNoteOnEvent as u32 {
         let note: &NoteOnEvent = unsafe { &*(&ev.__field0 as *const _ as *const NoteOnEvent) };
-        // 「未指定」 = -1 → 0 に丸める (= MIDI FX が note_id を返さない
-        // ケース)。
+        // 「未指定」 = -1 → 0 に丸める。
         let note_id = note.noteId.max(0) as u32;
         Some(TimedNoteEvent {
             time: ev.sampleOffset.max(0) as u32,

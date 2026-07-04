@@ -36,12 +36,12 @@ fn load_color(load: f32) -> Color {
 
 /// 内容 (全体指標 + track/plugin 行数) からパネル rect を決める。 右側固定。
 fn panel_rect(app: &AppData, screen: Rect) -> Rect {
-    let n_tracks = app.song.tracks.len();
+    let n_tracks = app.song_doc.song().tracks.len();
     let n_plugins: usize = app
-        .song
+        .song_doc.song()
         .tracks
         .iter()
-        .map(|t| app.track_plugin_ids.get(&t.id).map_or(0, Vec::len))
+        .map(|t| app.ipc.track_plugin_ids.get(&t.id).map_or(0, Vec::len))
         .sum();
     let header_h = 28.0;
     let overall_h = ROW_H * 4.0;
@@ -63,9 +63,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     // 突き抜けない) が、 keyboard / shortcut は background に通す (Space 再生等が有効)。
     // backdrop (暗転) も描かないので非暗転。 panel 外クリック / Esc で閉じる。
     let open_in_ui = ui.is_overlay_open(PANEL_ID);
-    if app.resource_panel_open && !open_in_ui {
+    if app.ui_ephemeral.resource_panel_open && !open_in_ui {
         ui.open_overlay(PANEL_ID);
-    } else if !app.resource_panel_open && open_in_ui {
+    } else if !app.ui_ephemeral.resource_panel_open && open_in_ui {
         ui.close_overlay(PANEL_ID);
     }
     if !ui.is_overlay_open(PANEL_ID) {
@@ -79,8 +79,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     });
 
     // panel 外クリック / Esc で閉じた → SSoT を同期して閉じる。
-    if app.resource_panel_open && !ui.is_overlay_open(PANEL_ID) {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| app.resource_panel_open = false));
+    if app.ui_ephemeral.resource_panel_open && !ui.is_overlay_open(PANEL_ID) {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| app.ui_ephemeral.resource_panel_open = false));
     }
 }
 
@@ -118,7 +118,7 @@ fn load_row(ui: &mut Ui<'_, AppData>, id: &str, label: &str, indent: f32, load: 
 }
 
 fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
-    let m = &app.metrics;
+    let m = &app.ipc.metrics;
     let px = panel.x;
     let py = panel.y;
     let ph = panel.h;
@@ -131,10 +131,12 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
         0.0
     };
     let load_of = |us: u32| if period_us > 0.0 { us as f32 / period_us } else { 0.0 };
-    let plugin_us = |pid: u32| {
-        app.metrics_bridge
+    // v29: 安定 device id (u64) を bridge の slot index (u32) に落として読む
+    // (bridge 側は plugin-host が同じ id で publish する契約)。
+    let plugin_us = |pid: u64| {
+        app.ipc.metrics_bridge
             .as_ref()
-            .map_or(0, |mb| mb.plugin_dsp_us(pid))
+            .map_or(0, |mb| mb.plugin_dsp_us(u32::try_from(pid).unwrap_or(u32::MAX)))
     };
 
     // パネル背景 + タイトルバー。
@@ -153,11 +155,11 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
         Rect { x: px + PANEL_W - 96.0, y: py + 4.0, w: 62.0, h: 18.0 },
         || {
             Edit::mutate(|app: &mut AppData| {
-                if let Some(mb) = &app.metrics_bridge {
+                if let Some(mb) = &app.ipc.metrics_bridge {
                     mb.reset_xrun();
                 }
                 // 即時反映 (次の poll tick で bridge の 0 を読み直す)。
-                app.metrics.xrun_count = 0;
+                app.ipc.metrics.xrun_count = 0;
             })
         },
     );
@@ -224,8 +226,8 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
 
     // ---- トラック別 / プラグイン別 CPU 内訳 ----
     let bottom = py + ph - ROW_H;
-    'tracks: for track in &app.song.tracks {
-        let pids = app.track_plugin_ids.get(&track.id);
+    'tracks: for track in &app.song_doc.song().tracks {
+        let pids = app.ipc.track_plugin_ids.get(&track.id);
         let track_us: u32 = pids.map_or(0, |v| v.iter().map(|pid| plugin_us(*pid)).sum());
         load_row(
             ui,
@@ -242,7 +244,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
                 if y > bottom {
                     break 'tracks; // パネル下端を超えたら打ち切り。
                 }
-                let name = resolve_plugin_name(&app.plugin_db, &device.plugin_id);
+                let name = resolve_plugin_name(&app.ipc.plugin_db, &device.plugin_id);
                 load_row(
                     ui,
                     &format!("resmon_pl_{pid}"),

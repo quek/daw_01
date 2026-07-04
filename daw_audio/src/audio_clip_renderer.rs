@@ -6,17 +6,11 @@
 //! has a wait-free snapshot to `load()` from day one; PR6 added the
 //! schedule compiler + Raw / Repitch render loop on top.
 //!
-//! VOICEVOX vocal output (the old `vocal.rs` / `VocalAudio`) shares the
-//! same `AudioSourceBuffer` shape — PR8 routed it through
-//! `MainToChild::SetGeneratedAudio` →
-//! `EngineShared::generated_audio_store`, keyed by
-//! `vocal_gen_id(track_id, clip_id)`. The actual per-clip vocal mix
-//! still lives in `engine::process_track_owned`'s vocal block (Vocal
-//! clips are MIDI-shaped with lyrics, so they don't appear in
-//! `AudioContent` and thus aren't picked up by `compile_audio_schedule`
-//! / `render_audio_events`); a future PR can migrate them onto
-//! `AudioContent::Audio` once the model can express
-//! "MIDI-with-baked-audio" cleanly.
+//! VOICEVOX vocal output is NOT rendered here: vocal clips are MIDI-shaped
+//! (lyrics + notes) and play through the builtin VOICEVOX instrument plugin
+//! inside daw_plugin_host (PR-V4 — 旧 `SetGeneratedAudio` wire 経路と
+//! engine 側 vocal block は撤去済み)。 this module only handles
+//! `AudioContent` (imported / bounced WAV) events.
 //!
 //! Spec: `docs/plan_audio_clip.md` §6 / §9.3.
 

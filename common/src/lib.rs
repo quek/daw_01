@@ -26,7 +26,6 @@ pub mod scale;
 pub mod shmem;
 pub mod tempo_map;
 pub mod timing;
-pub mod track_params;
 pub mod video_fx;
 pub mod voicevox;
 pub mod voicevox_cache;

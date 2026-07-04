@@ -19,6 +19,80 @@ pub mod host_controllers;
 pub mod session;
 pub mod vst3_ara;
 
+use anyhow::Result;
+
+use crate::ara::session::AraSession;
+
+/// Backend hooks for the shared ARA lifecycle dance ([`run_setup_ara`] /
+/// [`run_clear_ara`]). CLAP / VST3 は「deactivate → set_clips → restore →
+/// reactivate」の字面一致コードを別々に持っていた (`docs/plan_arch_refactor.md`
+/// §6 B8) — 実体をここに一本化し、backend は自分の activate / deactivate と
+/// session slot を差すだけにする。
+pub trait AraLifecycleHost {
+    fn ara_session(&self) -> Option<&AraSession>;
+    fn ara_session_mut(&mut self) -> &mut Option<AraSession>;
+    fn is_active(&self) -> bool;
+    /// 直近成功した activate の `(sample_rate, min_frames, max_frames)`。
+    fn last_activate_params(&self) -> Option<(f64, u32, u32)>;
+    fn do_deactivate(&mut self);
+    fn do_activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()>;
+}
+
+/// Shared `setup_ara`: ARA の `addPlaybackRegion` / region detach は instance
+/// inactive を要求するので、更新の前後で deactivate → reactivate する。bind
+/// 自体は load 時 (`bind_ara_if_capable`) に済んでいる。ARA 非 bind の
+/// instance は `Ok(false)`。
+pub fn run_setup_ara(
+    host: &mut dyn AraLifecycleHost,
+    clips: &[common::protocol::AraClipSpec],
+    bpm: f64,
+    time_sig: (u16, u16),
+    archive: Option<&[u8]>,
+) -> Result<bool> {
+    if host.ara_session().is_none() {
+        return Ok(false);
+    }
+    let was_active = host.is_active();
+    let restore = host.last_activate_params();
+    if was_active {
+        host.do_deactivate();
+    }
+    if let Some(session) = host.ara_session_mut().as_mut() {
+        session.set_clips(clips, bpm, time_sig);
+    }
+    if let Some(archive) = archive.filter(|a| !a.is_empty())
+        && let Some(session) = host.ara_session()
+    {
+        session.restore_archive(archive);
+    }
+    if was_active
+        && let Some((sample_rate, min_frames, max_frames)) = restore
+    {
+        host.do_activate(sample_rate, min_frames, max_frames)?;
+    }
+    Ok(true)
+}
+
+/// Shared `clear_ara`: session を drop する間 instance を inactive にし、
+/// 元の activation state を復元する。
+pub fn run_clear_ara(host: &mut dyn AraLifecycleHost) {
+    if host.ara_session().is_none() {
+        return;
+    }
+    let was_active = host.is_active();
+    let restore = host.last_activate_params();
+    if was_active {
+        host.do_deactivate();
+    }
+    *host.ara_session_mut() = None;
+    if was_active
+        && let Some((sample_rate, min_frames, max_frames)) = restore
+        && let Err(e) = host.do_activate(sample_rate, min_frames, max_frames)
+    {
+        tracing::error!(error = ?e, "clear_ara: reactivate failed");
+    }
+}
+
 /// Copy a versioned ARA struct from a plug-in pointer, honoring its `structSize`
 /// (the mandatory first `ARASize` field of every ARA interface / instance
 /// struct). Only the bytes the plug-in actually provides are copied; the rest of

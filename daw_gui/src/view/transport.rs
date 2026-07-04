@@ -249,7 +249,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let bpm_resp = ui.scrubable_number_at(
         "transport_bpm_input",
         Rect { x, y: cy, w: bpm_w, h: bh },
-        f64::from(app.song.bpm),
+        f64::from(app.song_doc.song().bpm),
         120.0,
         ScrubableNumberFormat::Decimal(1),
         &SCRUB_STYLE_BPM,
@@ -269,7 +269,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // target = SongTempo、 track_id = MASTER_TRACK_ID (= master row 配下の
     // song-level lane を指す sentinel)。 mixer_strips と同 helper 使用。
     let songtempo_was_dragging = app
-        .active_param_gestures
+        .recording.active_param_gestures
         .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTempo));
     push_param_gesture_edges(
         ui,
@@ -289,7 +289,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let ts_resp = ui.scrubable_number_at(
         "transport_time_sig_num",
         Rect { x, y: cy, w: ts_num_w, h: bh },
-        f64::from(app.song.time_sig.0),
+        f64::from(app.song_doc.song().time_sig.0),
         4.0,
         ScrubableNumberFormat::Integer,
         &SCRUB_STYLE_TSIG_NUM,
@@ -305,7 +305,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         None,
     );
     let tsig_was_dragging = app
-        .active_param_gestures
+        .recording.active_param_gestures
         .contains(&(MASTER_TRACK_ID, AutomationTarget::SongTimeSigNumerator));
     push_param_gesture_edges(
         ui,
@@ -330,7 +330,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // time_sig (denominator) dropdown
     let ts_den_w = 52.0;
-    let cur_den_idx = ts_den_to_index(app.song.time_sig.1);
+    let cur_den_idx = ts_den_to_index(app.song_doc.song().time_sig.1);
     if let Some(idx) = ui.dropdown(
         "transport_time_sig_den",
         Rect { x, y: cy, w: ts_den_w, h: bh },
@@ -358,8 +358,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     );
     x += 28.0;
 
-    let playhead_for_scale = app.playhead_beat.map(f64::from).unwrap_or(0.0).max(0.0);
-    let cur_scale_change = app.song.scale_at(playhead_for_scale).copied();
+    let playhead_for_scale = app.transport.playhead_beat.map(f64::from).unwrap_or(0.0).max(0.0);
+    let cur_scale_change = app.song_doc.song().scale_at(playhead_for_scale).copied();
     let cur_root_idx = cur_scale_change
         .map(|sc| sc.root.min(11) as usize + 1)
         .unwrap_or(0); // 0 = "—" (OFF)
@@ -425,7 +425,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // Play/Stop: icon (▶ / ■) + 緑色 toggle。 再生中は緑 LED で active 強調。
     let play_w = 36.0;
-    let play_active = app.is_playing;
+    let play_active = app.transport.is_playing;
     ui.toggle_button_at(
         "transport_play",
         if play_active { "\u{25A0}" } else { "\u{25B6}" },
@@ -438,7 +438,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // Loop toggle: icon (⟳) + 色のコンパクトボタン。 active 時 blue に染まる。
     let loop_w = 36.0;
-    let loop_active = app.is_looping;
+    let loop_active = app.transport.is_looping;
     ui.toggle_button_at(
         "transport_loop",
         "\u{27F3}",
@@ -456,7 +456,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let follow_w = 36.0;
     ui.toggle_button_at(
         "transport_follow",
-        follow_glyph(app.arrange_follow),
+        follow_glyph(app.ui_prefs.arrange_follow),
         Rect { x, y: cy, w: follow_w, h: bh },
         false, // 色を付けない (ユーザー指定) ので active 強調はしない
         &STYLE_FOLLOW,
@@ -470,7 +470,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let rec_mode_w = 78.0;
     let cur_rec_idx = RECORDING_MODES
         .iter()
-        .position(|(m, _)| *m == app.recording_mode)
+        .position(|(m, _)| *m == app.recording.recording_mode)
         .unwrap_or(0);
     if let Some(idx) = ui.dropdown(
         "transport_rec_mode",
@@ -492,7 +492,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // off、 session-only state (project save には含めない)。 icon = ♬ (16 分
     // 音符 ×2、 細かい beat 感)、 active 時は黄 LED 風で 「click 鳴動中」 を強調。
     let metro_w = 36.0;
-    let metro_active = app.metronome_enabled;
+    let metro_active = app.transport.metronome_enabled;
     ui.toggle_button_at(
         "transport_metronome",
         "\u{266C}",
@@ -513,7 +513,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // とセットで業界標準 (Bitwig / Live / Reaper)。
     let count_in_w = 90.0;
     let count_in_items: &[&str] = &["No count-in", "1 bar", "2 bars"];
-    let cur_count_in_idx = (app.count_in_bars.min(2)) as usize;
+    let cur_count_in_idx = (app.recording.count_in_bars.min(2)) as usize;
     if let Some(idx) = ui.dropdown(
         "transport_count_in",
         Rect { x, y: cy, w: count_in_w, h: bh },
@@ -532,8 +532,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 「Count-in...」 に切り替えて「待機中」 を可視化。 STYLE_RECORD は
     // 業界標準どおり record red 系。
     let rec_w = 86.0;
-    let rec_active = app.midi_recording || app.midi_recording_pending;
-    let rec_label = if app.midi_recording_pending {
+    let rec_active = app.recording.midi_recording || app.recording.midi_recording_pending;
+    let rec_label = if app.recording.midi_recording_pending {
         "Count-in..."
     } else {
         "● Rec"
@@ -556,7 +556,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ON で MIDI 録音中の note_on pitch を Song.scale_at(playhead).snap(pitch)
     // で in-scale に寄せる。 session-only state、 step input は適用外。
     let snap_live_w = 90.0;
-    let snap_live_active = app.snap_live_input;
+    let snap_live_active = app.recording.snap_live_input;
     ui.toggle_button_at(
         "transport_snap_live",
         "Snap Live",
@@ -578,8 +578,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // no-op。 既存 STYLE_REC_MODE (橙) を再利用 (= recording mode と同じく
     // 「現在 user 操作待ちの mode」 強調)。
     let learn_w = 90.0;
-    let learn_active = app.midi_learn_target.is_some();
-    let armed_track_for_learn = app.selected_track_ids.first().copied();
+    let learn_active = app.recording.midi_learn_target.is_some();
+    let armed_track_for_learn = app.selection.selected_track_ids.first().copied();
     // B2 (r.md #8): touch + learn。 直近に触った param が bind 可能なら
     // (PluginParam / Volume / Pan) それを、 無ければ選択 track の Volume を learn。
     let learn_target = app.midi_learn_binding_target(armed_track_for_learn);
@@ -600,7 +600,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &STYLE_REC_MODE,
         move |_| {
             Edit::mutate(move |app: &mut AppData| {
-                if app.midi_learn_target.is_some() {
+                if app.recording.midi_learn_target.is_some() {
                     app.handle_event(AppEvent::CancelMidiLearn);
                 } else if let Some(target) = learn_target {
                     app.handle_event(AppEvent::StartMidiLearn(target));
@@ -622,16 +622,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (空のグループは意味がないため)。
 
     // Playhead 位置 (text)。普通の DAW と同じく音楽的位置 (bar.beat.sub)
-    // と絶対時間 (分:秒.ms) を併記する。SSoT は app.playhead_beat 一本で、
+    // と絶対時間 (分:秒.ms) を併記する。SSoT は app.transport.playhead_beat 一本で、
     // bar.beat は time_sig、time は bpm から導出 (両表示が同じ source、かつ
     // bar 番号はアレンジ / piano-roll ルーラと一致する)。
-    let playhead = match app.playhead_beat {
+    let playhead = match app.transport.playhead_beat {
         Some(b) => {
             let beat = f64::from(b);
-            let (bar, beat_in_bar) = common::timing::beat_to_bar_beat(beat, app.song.time_sig);
+            let (bar, beat_in_bar) = common::timing::beat_to_bar_beat(beat, app.song_doc.song().time_sig);
             let beat_int = beat_in_bar.floor().max(1.0) as u32;
             let sub = ((beat_in_bar - f64::from(beat_int)) * 100.0).floor().clamp(0.0, 99.0) as u32;
-            let secs = common::timing::beat_to_seconds(beat, app.song.bpm);
+            let secs = common::timing::beat_to_seconds(beat, app.song_doc.song().bpm);
             let mins = (secs / 60.0).floor() as u64;
             let rem = secs - (mins as f64) * 60.0;
             let whole_s = rem.floor() as u64;

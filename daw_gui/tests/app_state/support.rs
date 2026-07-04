@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use common::plugin_db::{PluginDatabase, PluginEntry};
 use common::plugin_format::PluginFormat;
-use common::protocol::MainToChild;
+use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent};
@@ -58,8 +58,8 @@ pub fn make_plugin_db() -> Arc<PluginDatabase> {
 /// closed channel への send エラーを許容する。
 pub fn build_app() -> (
     AppData,
-    UnboundedReceiver<MainToChild>, // audio_rx
-    UnboundedReceiver<MainToChild>, // plugin_rx
+    UnboundedReceiver<AudioCommand>,  // audio_rx
+    UnboundedReceiver<PluginCommand>, // plugin_rx
     Arc<RecordingDispatcher>,
 ) {
     let (audio_tx, audio_rx) = mpsc::unbounded_channel();
@@ -94,7 +94,7 @@ pub fn drain<T>(rx: &mut UnboundedReceiver<T>) -> Vec<T> {
 /// 楽器 (test.synth) を track 0 に picker 経由でロードし、plugin_host からの
 /// `SlotPluginLoaded` 応答まで fake dispatch する。
 pub fn load_instrument(app: &mut AppData) {
-    let track_id = app.song.tracks[0].id;
+    let track_id = app.song_doc.song().tracks[0].id;
     app.handle_event(AppEvent::SelectTrack(0));
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -102,33 +102,36 @@ pub fn load_instrument(app: &mut AppData) {
         keep_open: false,
         open_gui: true,
     });
-    app.handle_event(AppEvent::SlotPluginLoadedFromChild {
-        track: track_id,
-        // 単一デバイスチェーン: picker は末尾 append、 空チェーンなので index 0。
-        index: 0,
-        id: "test.synth".into(),
-        name: "Test Synth".into(),
-        plugin_id: 100,
-        shmem_id: String::new(),
-        state_load_error: None,
-        aux_output_count: 0,
-    });
+    // 単一デバイスチェーン: picker は末尾 append、 空チェーンなので index 0。
+    fake_plugin_loaded(app, track_id, 0, "test.synth");
 }
 
 /// ヘルパ: plugin_host の `SlotPluginLoaded` を AppEvent として fake
 /// dispatch。 production で plugin_host が返す内容を test がそのまま模倣する。
 /// `index` は flat な device index (= 末尾 append した位置)。
-pub fn fake_plugin_loaded(app: &mut AppData, track_id: u32, index: u32, id: &str, plugin_id: u32) {
+///
+/// v29: 応答は安定 `device_id` + 要求 `generation` の echo。 song の device
+/// から id を解決し、 直前の `SetSlotPlugin` 送信で AppData が登録した
+/// pending generation をそのまま返す (= production の echo と同じ)。
+/// 戻り値は device_id (以後の `ClosePluginShmem` 等の assert 用)。
+pub fn fake_plugin_loaded(app: &mut AppData, track_id: u32, index: u32, id: &str) -> u64 {
+    let device_id = daw_gui::app::device_id_at(&app.song_doc.song(), track_id, index)
+        .expect("fake_plugin_loaded: no device at (track_id, index)");
+    let generation = app
+        .ipc.pending_plugin_loads
+        .get(&device_id)
+        .copied()
+        .expect("fake_plugin_loaded: SetSlotPlugin was not pending for this device");
     app.handle_event(AppEvent::SlotPluginLoadedFromChild {
-        track: track_id,
-        index,
+        device_id,
         id: id.into(),
         name: id.into(),
-        plugin_id,
         shmem_id: String::new(),
         // テストは state 復元 path をシミュレートしない (= initial_state =
         // None でロードしたのと等価)。
         state_load_error: None,
         aux_output_count: 0,
+        generation,
     });
+    device_id
 }

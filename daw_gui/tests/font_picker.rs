@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use common::protocol::MainToChild;
+use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent};
@@ -21,8 +21,8 @@ use daw_gui::dispatcher::{
 
 fn build_app() -> (
     AppData,
-    UnboundedReceiver<MainToChild>,
-    UnboundedReceiver<MainToChild>,
+    UnboundedReceiver<AudioCommand>,
+    UnboundedReceiver<PluginCommand>,
 ) {
     let (audio_tx, audio_rx) = mpsc::unbounded_channel();
     let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
@@ -57,7 +57,7 @@ fn loaded_families_show_with_default_row_first() {
     app.handle_event(AppEvent::FontFamiliesLoaded(families()));
     // query 空 → 先頭にデフォルト行 ("") + 全フォント。
     assert_eq!(
-        app.font_picker_visible,
+        app.ui_ephemeral.font_picker_visible,
         vec![
             String::new(),
             "Arial".to_string(),
@@ -65,8 +65,8 @@ fn loaded_families_show_with_default_row_first() {
             "Yu Gothic".to_string(),
         ],
     );
-    assert_eq!(app.font_picker_cursor, 0);
-    assert!(!app.font_picker_loading);
+    assert_eq!(app.ui_ephemeral.font_picker_cursor, 0);
+    assert!(!app.ui_ephemeral.font_picker_loading);
 }
 
 #[test]
@@ -75,12 +75,12 @@ fn query_filters_and_drops_default_row() {
     app.handle_event(AppEvent::FontFamiliesLoaded(families()));
     // "Aria" は "Arial" にのみ subsequence マッチ (case-insensitive)。
     app.handle_event(AppEvent::SetFontPickerQuery("Aria".into()));
-    assert_eq!(app.font_picker_visible, vec!["Arial".to_string()]);
-    assert_eq!(app.font_picker_cursor, 0);
+    assert_eq!(app.ui_ephemeral.font_picker_visible, vec!["Arial".to_string()]);
+    assert_eq!(app.ui_ephemeral.font_picker_cursor, 0);
     // 空クエリに戻すとデフォルト行 + 全件が復活。
     app.handle_event(AppEvent::SetFontPickerQuery(String::new()));
-    assert_eq!(app.font_picker_visible.len(), 4);
-    assert_eq!(app.font_picker_visible[0], "");
+    assert_eq!(app.ui_ephemeral.font_picker_visible.len(), 4);
+    assert_eq!(app.ui_ephemeral.font_picker_visible[0], "");
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn cursor_clamps_within_visible() {
     let (mut app, _, _) = build_app();
     app.handle_event(AppEvent::FontFamiliesLoaded(families()));
     app.handle_event(AppEvent::MoveFontPickerCursor(100));
-    assert_eq!(app.font_picker_cursor, 3); // 4 件 (default + 3) → max index 3
+    assert_eq!(app.ui_ephemeral.font_picker_cursor, 3); // 4 件 (default + 3) → max index 3
     app.handle_event(AppEvent::MoveFontPickerCursor(-100));
-    assert_eq!(app.font_picker_cursor, 0);
+    assert_eq!(app.ui_ephemeral.font_picker_cursor, 0);
 }

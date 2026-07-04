@@ -309,8 +309,9 @@ mod tests {
     #[test]
     fn plugin_param_uses_supplied_range() {
         let target = T::PluginParam {
-            device_index: 0,
+            device_id: 1,
             param_id: 3,
+            legacy_device_index: None,
             legacy_slot: None,
         };
         let d = automation_value_display(&target, Some((20.0, 20_000.0)));

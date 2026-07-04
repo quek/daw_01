@@ -105,7 +105,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // 描画する。 modal より前に呼ぶので、 modal が出れば自然に隠れる (意図どおり)。
     resource_monitor::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
-    // Modal: plugin picker。draw 関数内で modal の open/close を app.is_plugin_picker_open
+    // Modal: plugin picker。draw 関数内で modal の open/close を app.ui_ephemeral.is_plugin_picker_open
     // と同期させる (常時呼び、内部で is_modal_open / open_modal を管理)。
     plugin_picker::draw(app, ui, screen);
 
@@ -118,33 +118,33 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // 非ブロック overlay: VOICEVOX wav 合成 / 口パク生成の進行状態。
     voicevox_overlay::draw(app, ui, screen);
 
-    // Modal: send 宛先トラックピッカー。app.send_picker == Some(..) のとき開く。
+    // Modal: send 宛先トラックピッカー。app.ui_ephemeral.send_picker == Some(..) のとき開く。
     track_picker::draw(app, ui, screen);
 
     // Modal: recovery (起動時 or Open 時に検出された autosave 候補)。
-    // app.show_recovery_modal を internal で監視するため常時呼び。
+    // app.ui_ephemeral.show_recovery_modal を internal で監視するため常時呼び。
     recovery_modal::draw(app, ui, screen);
 
     // Modal: 未保存変更ありで「プロジェクトを破棄する操作」 (終了 / New /
     // Open / Open Recent) をしようとしたときの「保存して続行 / 保存せず続行 /
-    // キャンセル」 確認。 app.dirty_guard を監視。
+    // キャンセル」 確認。 app.ui_ephemeral.dirty_guard を監視。
     dirty_guard_modal::draw(app, ui, screen);
 
-    // Modal: 書き出し範囲ピッカー。app.export_range_picker == Some の
+    // Modal: 書き出し範囲ピッカー。app.ui_ephemeral.export_range_picker == Some の
     // とき開く。 export 実行前なので export_overlay より前に描いてよい。
     export_range_modal::draw(app, ui, screen);
 
-    // Overlay: WAV / Video export 中の進捗 + Cancel。app.export_stage を監視。
+    // Overlay: WAV / Video export 中の進捗 + Cancel。app.transport.export_stage を監視。
     export_overlay::draw(app, ui, screen);
 
-    // Overlay: F1 ショートカット / マウス操作一覧。app.is_help_open と
+    // Overlay: F1 ショートカット / マウス操作一覧。app.ui_prefs.is_help_open と
     // 同期。最前面に出すため他の modal / overlay より後に描く。
     shortcuts_help::draw(app, ui, screen);
 }
 
 /// 上部 menu bar (File / Edit / View) を library widget で描画。
 /// `Ui<'a, AppData>` の `'a` は `&AppData` borrow 寿命と同一なので、
-/// `app: &'a AppData` を明示して menu の dynamic label (= `&app.recent_files_labels[i]`)
+/// `app: &'a AppData` を明示して menu の dynamic label (= `&app.ui_prefs.recent_files_labels[i]`)
 /// が `'a` に乗ることを borrow checker に伝える。
 fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
     // 「最近開いた / 保存した」 ファイルの label / path は AppData に
@@ -169,7 +169,7 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             // (= 兄弟 sub_menu の cascade が同時 open のまま重なる) の
             // workaround。 空 cascade を出さなければ他の sub_menu cascade
             // を上書きする事故も起きない。
-            if app.recent_files_labels.is_empty() {
+            if app.ui_prefs.recent_files_labels.is_empty() {
                 m.item_with(daw_ui_core::MenuItemSpec {
                     label: "Open Recent (empty)",
                     on_click: Box::new(|_ui| {}),
@@ -179,9 +179,9 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             } else {
                 m.sub_menu("Open Recent", |sub| {
                     for (label, path) in app
-                        .recent_files_labels
+                        .ui_prefs.recent_files_labels
                         .iter()
-                        .zip(app.recent_files.paths.iter())
+                        .zip(app.ui_prefs.recent_files.paths.iter())
                     {
                         let path_clone = path.clone();
                         sub.item(label.as_str(), move |ui| {
@@ -202,7 +202,7 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             // クリックで OpenRecent と同じ経路で開く (= 保存先 path はそのまま
             // 開けるはず)。 同上 workaround で空のときは disabled top-level
             // item に置換。
-            if app.recent_saved_labels.is_empty() {
+            if app.ui_prefs.recent_saved_labels.is_empty() {
                 m.item_with(daw_ui_core::MenuItemSpec {
                     label: "Recently Saved (empty)",
                     on_click: Box::new(|_ui| {}),
@@ -212,9 +212,9 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             } else {
                 m.sub_menu("Recently Saved", |sub| {
                     for (label, path) in app
-                        .recent_saved_labels
+                        .ui_prefs.recent_saved_labels
                         .iter()
-                        .zip(app.recent_saved.paths.iter())
+                        .zip(app.ui_prefs.recent_saved.paths.iter())
                     {
                         let path_clone = path.clone();
                         sub.item(label.as_str(), move |ui| {
@@ -318,18 +318,18 @@ fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface>
     // clip 選択は automation 選択を消さない)。 複数が非空のときは「最後に選んだ面」
     // (last-wins、 `AppData::last_edit_select`) を copy / cut / delete の対象にする
     // (= 「クリップを選択して Del したのに残存点が消える」 #071 の面跨ぎ一般化)。
-    let auto_prefer_clips = !app.selected_automation_clips.is_empty()
-        && (app.selected_automation_points.is_empty()
-            || app.last_edit_select == Some(S::AutomationClips));
+    let auto_prefer_clips = !app.selection.selected_automation_clips.is_empty()
+        && (app.selection.selected_automation_points.is_empty()
+            || app.selection.last_edit_select == Some(S::AutomationClips));
     // 1. ポインタが乗っている面を最優先。
     if is_pianoroll_active {
-        return Some(if app.audio_editor_clip.is_some() {
+        return Some(if app.ui_ephemeral.audio_editor_clip.is_some() {
             EditSurface::AudioEvents
         } else {
             EditSurface::Notes
         });
     }
-    if app.arrange_hovered_automation_lane.is_some() {
+    if app.ui_ephemeral.arrange_hovered_automation_lane.is_some() {
         // automation lane 上: last-wins で clip が勝つなら clip 面、 それ以外は点面
         // (点が選択されていればその点、 何も無ければ hover-delete 文脈で点面)。
         if auto_prefer_clips {
@@ -339,13 +339,13 @@ fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface>
     }
     // 2. ポインタがどの編集面でもない → 「最後に選んだ面」 がまだ非空ならそれ。
     let audio_events =
-        app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty();
-    let notes = !app.selected_notes.is_empty();
-    let points = !app.selected_automation_points.is_empty();
-    let auto_clips = !app.selected_automation_clips.is_empty();
+        app.ui_ephemeral.audio_editor_clip.is_some() && !app.selection.audio_editor_selected_events.is_empty();
+    let notes = !app.selection.selected_notes.is_empty();
+    let points = !app.selection.selected_automation_points.is_empty();
+    let auto_clips = !app.selection.selected_automation_clips.is_empty();
     // 安価な空判定 (selected_clip_refs() は Vec を確保するので避ける)。
-    let clips = app.selected_clip.is_some() || !app.selected_clips.is_empty();
-    let last_wins = match app.last_edit_select {
+    let clips = app.selection.selected_clip.is_some() || !app.selection.selected_clips.is_empty();
+    let last_wins = match app.selection.last_edit_select {
         Some(S::AudioEvents) if audio_events => Some(EditSurface::AudioEvents),
         Some(S::Notes) if notes => Some(EditSurface::Notes),
         Some(S::AutomationPoints) if points => Some(EditSurface::AutomationPoints),
@@ -372,12 +372,12 @@ fn edit_surface(app: &AppData, is_pianoroll_active: bool) -> Option<EditSurface>
     if auto_clips {
         return Some(EditSurface::AutomationClips);
     }
-    if !app.selected_track_ids.is_empty() {
+    if !app.selection.selected_track_ids.is_empty() {
         return Some(EditSurface::Tracks);
     }
     // section は最低優先 (他面が空のときだけ Delete 対象)。 section 選択時は
     // apply_select_section が他面選択をクリアするので通常ここに到達する。
-    if !app.selected_section_ids.is_empty() {
+    if !app.selection.selected_section_ids.is_empty() {
         return Some(EditSurface::Sections);
     }
     None
@@ -406,12 +406,12 @@ fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edi
         ui.set_clipboard_text(json);
         let label = label.to_string();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.status_message = format!("コピー: {count} {label}");
+            app.ui_ephemeral.status_message = format!("コピー: {count} {label}");
         }));
         return;
     }
     if matches!(surface, EditSurface::Tracks) {
-        let ids = app.selected_track_ids.clone();
+        let ids = app.selection.selected_track_ids.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.copy_tracks(ids);
         }));
@@ -443,23 +443,23 @@ fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<Edit
             EditSurface::AudioEvents => AppEvent::DeleteAudioEditorSelection,
             EditSurface::Notes => AppEvent::DeleteSelectedNotes,
             EditSurface::AutomationPoints => AppEvent::DeleteAutomationPoints {
-                points: app.selected_automation_points.clone(),
+                points: app.selection.selected_automation_points.clone(),
             },
             EditSurface::Clips => AppEvent::DeleteSelectedClip,
             EditSurface::AutomationClips => AppEvent::DeleteAutomationClips {
-                keys: app.selected_automation_clips.clone(),
+                keys: app.selection.selected_automation_clips.clone(),
             },
             _ => return,
         };
         let label = label.to_string();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(del);
-            app.status_message = format!("カット: {count} {label}");
+            app.ui_ephemeral.status_message = format!("カット: {count} {label}");
         }));
         return;
     }
     if matches!(surface, EditSurface::Tracks) {
-        let ids = app.selected_track_ids.clone();
+        let ids = app.selection.selected_track_ids.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.cut_tracks(ids);
         }));
@@ -482,14 +482,14 @@ fn paste_from_clipboard(
     match env.payload {
         P::Notes(notes) => {
             if is_pianoroll_active
-                && app.audio_editor_clip.is_none()
-                && let Some(at) = app.pianoroll_hover_beat
+                && app.ui_ephemeral.audio_editor_clip.is_none()
+                && let Some(at) = app.ui_ephemeral.pianoroll_hover_beat
             {
                 let notes = crate::clipboard::sanitize_notes(notes);
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let n = app.paste_notes_at(notes, at);
                     if n > 0 {
-                        app.status_message = format!("貼り付け: {n} ノート");
+                        app.ui_ephemeral.status_message = format!("貼り付け: {n} ノート");
                     }
                 }));
                 return;
@@ -498,14 +498,14 @@ fn paste_from_clipboard(
         }
         P::AudioEvents(events) => {
             if is_pianoroll_active
-                && app.audio_editor_clip.is_some()
-                && let Some(at) = app.audio_editor_hover_beat_in_clip
+                && app.ui_ephemeral.audio_editor_clip.is_some()
+                && let Some(at) = app.ui_ephemeral.audio_editor_hover_beat_in_clip
             {
                 let events = crate::clipboard::sanitize_audio_events(events);
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let n = app.paste_events_at(events, at);
                     if n > 0 {
-                        app.status_message = format!("貼り付け: {n} イベント");
+                        app.ui_ephemeral.status_message = format!("貼り付け: {n} イベント");
                     }
                 }));
                 return;
@@ -514,14 +514,14 @@ fn paste_from_clipboard(
         }
         P::AutomationPoints(points) => {
             if let (Some(lane), Some(at)) = (
-                app.arrange_hovered_automation_lane,
-                app.arrangement_hover_beat,
+                app.ui_ephemeral.arrange_hovered_automation_lane,
+                app.ui_ephemeral.arrangement_hover_beat,
             ) {
                 let points = crate::clipboard::sanitize_points(points);
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let n = app.paste_points_at(points, lane, at);
                     if n > 0 {
-                        app.status_message =
+                        app.ui_ephemeral.status_message =
                             format!("貼り付け: {n} オートメーションポイント");
                     }
                 }));
@@ -531,15 +531,15 @@ fn paste_from_clipboard(
         }
         P::Clips(clips) => {
             if !is_pianoroll_active
-                && app.arrange_hovered_automation_lane.is_none()
+                && app.ui_ephemeral.arrange_hovered_automation_lane.is_none()
                 && let (Some(track), Some(at)) =
-                    (app.arrange_hovered_track, app.arrangement_hover_beat)
+                    (app.ui_ephemeral.arrange_hovered_track, app.ui_ephemeral.arrangement_hover_beat)
             {
                 let clips = crate::clipboard::sanitize_clips(clips);
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let n = app.paste_clips_at(clips, src_pid, track, at);
                     if n > 0 {
-                        app.status_message = format!("貼り付け: {n} クリップ");
+                        app.ui_ephemeral.status_message = format!("貼り付け: {n} クリップ");
                     }
                 }));
                 return;
@@ -550,14 +550,14 @@ fn paste_from_clipboard(
             // automation clip は「マウス下の automation lane」へ、 hover 拍を基準に貼る
             // (= automation point paste と同じく lane + beat が揃ったときのみ)。
             if let (Some(lane), Some(at)) = (
-                app.arrange_hovered_automation_lane,
-                app.arrangement_hover_beat,
+                app.ui_ephemeral.arrange_hovered_automation_lane,
+                app.ui_ephemeral.arrangement_hover_beat,
             ) {
                 let clips = crate::clipboard::sanitize_automation_clips(clips);
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let n = app.paste_automation_clips_at(clips, lane, at);
                     if n > 0 {
-                        app.status_message =
+                        app.ui_ephemeral.status_message =
                             format!("貼り付け: {n} オートメーションクリップ");
                     }
                 }));
@@ -567,13 +567,13 @@ fn paste_from_clipboard(
         }
         P::Tracks(tracks) => {
             if !is_pianoroll_active
-                && let Some(above) = app.arrange_hovered_track
+                && let Some(above) = app.ui_ephemeral.arrange_hovered_track
             {
                 let tracks = crate::clipboard::sanitize_tracks(tracks);
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let n = app.paste_tracks_at(tracks, src_pid, above);
                     if n > 0 {
-                        app.status_message = format!("貼り付け: {n} トラック");
+                        app.ui_ephemeral.status_message = format!("貼り付け: {n} トラック");
                     }
                 }));
                 return;
@@ -585,7 +585,7 @@ fn paste_from_clipboard(
 
 fn paste_noop(ui: &mut Ui<'_, AppData>) {
     ui.push_edit(Edit::mutate(|app: &mut AppData| {
-        app.status_message =
+        app.ui_ephemeral.status_message =
             "ここには貼り付けできません (貼り先の上にカーソルを置いてください)".to_string();
     }));
 }
@@ -608,12 +608,12 @@ fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<E
         return;
     }
     let audio_event_selected =
-        app.audio_editor_clip.is_some() && !app.audio_editor_selected_events.is_empty();
-    let has_notes = !app.selected_notes.is_empty();
+        app.ui_ephemeral.audio_editor_clip.is_some() && !app.selection.audio_editor_selected_events.is_empty();
+    let has_notes = !app.selection.selected_notes.is_empty();
     let auto_points =
-        (!app.selected_automation_points.is_empty()).then(|| app.selected_automation_points.clone());
+        (!app.selection.selected_automation_points.is_empty()).then(|| app.selection.selected_automation_points.clone());
     let auto_clips =
-        (!app.selected_automation_clips.is_empty()).then(|| app.selected_automation_clips.clone());
+        (!app.selection.selected_automation_clips.is_empty()).then(|| app.selection.selected_automation_clips.clone());
     let pointer_pick: Option<AppEvent> = match surface {
         Some(EditSurface::AudioEvents) if audio_event_selected => {
             Some(AppEvent::DeleteAudioEditorSelection)
@@ -630,7 +630,7 @@ fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<E
         Some(EditSurface::Clips) => Some(AppEvent::DeleteSelectedClip),
         _ => None,
     };
-    let has_clips = app.selected_clip.is_some() || !app.selected_clips.is_empty();
+    let has_clips = app.selection.selected_clip.is_some() || !app.selection.selected_clips.is_empty();
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         if let Some(ev) = pointer_pick {
             app.handle_event(ev);
@@ -666,7 +666,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         .pointer()
         .pos
         .is_some_and(|(px, py)| bottom_rect.contains(px, py));
-    let is_pianoroll_active = app.bottom_panel == 1 && pointer_in_bottom;
+    let is_pianoroll_active = app.ui_prefs.bottom_panel == 1 && pointer_in_bottom;
     let surface = edit_surface(app, is_pianoroll_active);
     // `Z` 段階ズーム / `R` loop の対象面 (通常 clip / automation clip) は
     // copy / cut / delete と同じ `edit_surface` arbiter で解決する (last-selection-wins)。
@@ -695,7 +695,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // note pitch を最寄り in-scale に一括補正。 selected_notes が空なら
     // clip 全 note、 そうでなければ選択 note のみ。
     if ui.take_shortcut("daw.quantize_pitches_to_scale") {
-        let target = if app.selected_notes.is_empty() {
+        let target = if app.selection.selected_notes.is_empty() {
             crate::app::QuantizePitchTarget::SelectedClipAllNotes
         } else {
             crate::app::QuantizePitchTarget::SelectedNotes
@@ -709,7 +709,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 多重選択を実装したので、 selection は `selected_track_ids` から
     // 直接取れる。 空なら no-op。
     if ui.take_shortcut("daw.group_tracks") {
-        let track_ids = app.selected_track_ids.clone();
+        let track_ids = app.selection.selected_track_ids.clone();
         if !track_ids.is_empty() {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::GroupSelectedTracks { track_ids });
@@ -719,7 +719,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // Alt+G — ungroup the selected group tracks (Ableton Live の
     // Cmd/Ctrl+Shift+G に相当、 本 DAW はユーザー指定で Alt+G)。
     if ui.take_shortcut("daw.ungroup_tracks") {
-        let track_ids = app.selected_track_ids.clone();
+        let track_ids = app.selection.selected_track_ids.clone();
         if !track_ids.is_empty() {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::UngroupTracks { track_ids });
@@ -792,12 +792,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.play_from_cursor") {
         let alt = ui.pointer().modifiers.alt;
         let target_beat = if is_pianoroll_active {
-            app.pianoroll_hover_beat_song_raw.map(|raw| {
+            app.ui_ephemeral.pianoroll_hover_beat_song_raw.map(|raw| {
                 snap::piano_roll_snap_config(app).snap_beat(raw, alt, app.pianoroll_zoom_x())
             })
         } else {
-            app.arrangement_hover_beat_raw.map(|raw| {
-                snap::arrange_snap_config(app).snap_beat(raw, alt, app.arrange_zoom_x.max(1.0))
+            app.ui_ephemeral.arrangement_hover_beat_raw.map(|raw| {
+                snap::arrange_snap_config(app).snap_beat(raw, alt, app.ui_prefs.arrange_zoom_x.max(1.0))
             })
         };
         if let Some(beat) = target_beat {
@@ -815,10 +815,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     }
 
     // トラック copy/cut の非同期結果 (plugin state 収集後) を OS clipboard へ flush。
-    if let Some(text) = app.pending_clipboard_write.clone() {
+    if let Some(text) = app.ui_ephemeral.pending_clipboard_write.clone() {
         ui.set_clipboard_text(text);
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.pending_clipboard_write = None;
+            app.ui_ephemeral.pending_clipboard_write = None;
         }));
     }
 
@@ -914,17 +914,17 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // text_input focus 中は gui_01 が単キーを抑制するので rename / 歌詞編集中は発火しない。
     if ui.take_shortcut("daw.toggle_track_solo") {
         let target_track_id = if is_pianoroll_active {
-            if app.audio_editor_clip.is_some() {
+            if app.ui_ephemeral.audio_editor_clip.is_some() {
                 None
             } else {
                 app.selected_clip_ref()
-                    .and_then(|c| app.song.tracks.get(c.track as usize))
+                    .and_then(|c| app.song_doc.song().tracks.get(c.track as usize))
                     .map(|t| t.id)
             }
-        } else if app.bottom_panel == 0 && pointer_in_bottom {
-            app.mixer_hovered_track
+        } else if app.ui_prefs.bottom_panel == 0 && pointer_in_bottom {
+            app.ui_ephemeral.mixer_hovered_track
         } else {
-            app.arrange_hovered_track
+            app.ui_ephemeral.arrange_hovered_track
         };
         if let Some(track_id) = target_track_id {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -945,14 +945,14 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // toggle 方向は「対象が全部 muted なら unmute、 1 つでも非 muted なら全 mute」。
     // text_input フォーカス中は gui_01 が単キーを抑制する。
     if ui.take_shortcut("daw.toggle_mute") {
-        if is_pianoroll_active && app.audio_editor_clip.is_none() {
+        if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_none() {
             // note 群は packed note id (`selected_notes` / `pianoroll_hover_note` は
             // 表示中全クリップに跨る packed id)。所属クリップは handler が decode するので、
             // ここで単一 anchor clip に縛らない (複数クリップ同時 mute を保つ)。
-            let notes: Vec<u32> = if !app.selected_notes.is_empty() {
-                app.selected_notes.clone()
+            let notes: Vec<u32> = if !app.selection.selected_notes.is_empty() {
+                app.selection.selected_notes.clone()
             } else {
-                app.pianoroll_hover_note.into_iter().collect()
+                app.ui_ephemeral.pianoroll_hover_note.into_iter().collect()
             };
             if !notes.is_empty() {
                 let new_muted = !app.all_notes_muted(&notes);
@@ -966,11 +966,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         } else {
             let targets: Vec<crate::app::ClipRef> = if is_pianoroll_active {
                 // audio waveform editor を開いている: その clip を mute。
-                app.audio_editor_clip.into_iter().collect()
-            } else if app.selected_clip.is_some() || !app.selected_clips.is_empty() {
+                app.ui_ephemeral.audio_editor_clip.into_iter().collect()
+            } else if app.selection.selected_clip.is_some() || !app.selection.selected_clips.is_empty() {
                 app.selected_clip_refs()
             } else {
-                app.arrangement_hover_clip.into_iter().collect()
+                app.ui_ephemeral.arrangement_hover_clip.into_iter().collect()
             };
             if !targets.is_empty() {
                 let new_muted = !app.all_clips_muted(&targets);
@@ -990,7 +990,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 下部パネル + piano roll: 全ノート、 それ以外 (アレンジ): 全クリップ。
     // (automation lane 上の「全ポイント → 全クリップ」段階拡大は後続で追加。)
     if ui.take_shortcut("select_all") {
-        if is_pianoroll_active && app.audio_editor_clip.is_some() {
+        if is_pianoroll_active && app.ui_ephemeral.audio_editor_clip.is_some() {
             let indices = app.all_audio_event_indices();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetAudioEditorEventSelection(indices.clone()));
@@ -1000,7 +1000,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetNoteSelection(ids.clone()));
             }));
-        } else if let Some(lane) = app.arrange_hovered_automation_lane {
+        } else if let Some(lane) = app.ui_ephemeral.arrange_hovered_automation_lane {
             // automation lane 上: 段階拡大 (#071 で clip 段を追加)。
             //   1 回目 = lane の全ポイント
             //   2 回目 (全ポイント選択済 or ポイント無し) = lane の全 automation clip
@@ -1009,13 +1009,13 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             // last-wins で copy/cut/delete の対象になる (edit_surface 参照)。
             let all_points = app.all_automation_points_in_lane(lane);
             let points_done = all_points.is_empty()
-                || (app.selected_automation_points.len() == all_points.len() && {
+                || (app.selection.selected_automation_points.len() == all_points.len() && {
                     let cur: std::collections::HashSet<_> =
-                        app.selected_automation_points.iter().collect();
+                        app.selection.selected_automation_points.iter().collect();
                     all_points.iter().all(|p| cur.contains(p))
                 });
             if !points_done {
-                let prev = app.selected_automation_points.clone();
+                let prev = app.selection.selected_automation_points.clone();
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SelectAutomationPoints {
                         prev: prev.clone(),
@@ -1025,13 +1025,13 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             } else {
                 let all_clips = app.all_automation_clips_in_lane(lane);
                 let clips_done = all_clips.is_empty()
-                    || (app.selected_automation_clips.len() == all_clips.len() && {
+                    || (app.selection.selected_automation_clips.len() == all_clips.len() && {
                         let cur: std::collections::HashSet<_> =
-                            app.selected_automation_clips.iter().collect();
+                            app.selection.selected_automation_clips.iter().collect();
                         all_clips.iter().all(|c| cur.contains(c))
                     });
                 if !clips_done {
-                    let prev = app.selected_automation_clips.clone();
+                    let prev = app.selection.selected_automation_clips.clone();
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::SelectAutomationClips {
                             prev: prev.clone(),
@@ -1060,14 +1060,14 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         // ピアノロール上 + ノート選択中なら D = ノート複製。それ以外 (アレンジ文脈
         // / ピアノロールでもノート未選択) は選択中の MIDI/Audio/Vocal clip と
         // automation clip の両方を同時に共有複製 (Ableton/REAPER 流)。
-        if is_pianoroll_active && !app.selected_notes.is_empty() {
+        if is_pianoroll_active && !app.selection.selected_notes.is_empty() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::DuplicateSelectedNotes);
             }));
         } else {
             let midi_sources: Vec<crate::app::ClipRef> = app.selected_clip_refs();
             let automation_sources: Vec<common::model::AutomationClipKey> =
-                app.selected_automation_clips.clone();
+                app.selection.selected_automation_clips.clone();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 if !midi_sources.is_empty() {
                     app.handle_event(AppEvent::DuplicateClipsShared(midi_sources));
@@ -1081,7 +1081,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.duplicate_clip_unique") {
         let midi_sources: Vec<crate::app::ClipRef> = app.selected_clip_refs();
         let automation_sources: Vec<common::model::AutomationClipKey> =
-            app.selected_automation_clips.clone();
+            app.selection.selected_automation_clips.clone();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             if !midi_sources.is_empty() {
                 app.handle_event(AppEvent::DuplicateClipsUnique(midi_sources));
@@ -1175,7 +1175,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // 選択中 event を Duplicate。 audio_editor_clip is None のときは
     // 消費しない (= 既存 D / Alt+D の clip duplicate と紛らわしくない
     // よう、 Audio Editor 内限定の shortcut として gate する)。
-    if app.audio_editor_clip.is_some() && ui.take_shortcut("daw.duplicate_audio_event") {
+    if app.ui_ephemeral.audio_editor_clip.is_some() && ui.take_shortcut("daw.duplicate_audio_event") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::DuplicateAudioEditorEvent)
         }));
@@ -1183,13 +1183,13 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // PR-D 段階 2: Audio Editor 内 event 選択 navigation (Ctrl+] / Ctrl+[)。
     // 現選択 idx を ±1 wrap-around で移動。 audio_editor が開いてないと
     // 無効、 events が空なら no-op。
-    if app.audio_editor_clip.is_some() && ui.take_shortcut("daw.next_audio_event") {
+    if app.ui_ephemeral.audio_editor_clip.is_some() && ui.take_shortcut("daw.next_audio_event") {
         let next = app.next_audio_editor_event_idx(1);
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::SelectAudioEditorEvent(next))
         }));
     }
-    if app.audio_editor_clip.is_some() && ui.take_shortcut("daw.prev_audio_event") {
+    if app.ui_ephemeral.audio_editor_clip.is_some() && ui.take_shortcut("daw.prev_audio_event") {
         let prev = app.next_audio_editor_event_idx(-1);
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::SelectAudioEditorEvent(prev))
@@ -1216,42 +1216,42 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // clip が deselect → MIDI エディタが空表示になってしまう。 編集中はここで消費せず
     // widget に委ねる (widget が `take_shortcut("escape")` で歌詞編集を cancel する)。
     // 条件は piano_roll_view が実際に走る状況 (Piano Roll タブ + Audio Editor 非表示) に
-    // 一致させる (`app.piano_roll_lyric_editing` 単独だと stale-true で誤委譲しうる)。
+    // 一致させる (`app.ui_ephemeral.piano_roll_lyric_editing` 単独だと stale-true で誤委譲しうる)。
     let pianoroll_lyric_editing =
-        app.bottom_panel == 1 && app.audio_editor_clip.is_none() && app.piano_roll_lyric_editing;
-    if !app.is_plugin_picker_open
-        && !app.is_font_picker_open
-        && app.send_picker.is_none()
+        app.ui_prefs.bottom_panel == 1 && app.ui_ephemeral.audio_editor_clip.is_none() && app.ui_ephemeral.piano_roll_lyric_editing;
+    if !app.ui_ephemeral.is_plugin_picker_open
+        && !app.ui_ephemeral.is_font_picker_open
+        && app.ui_ephemeral.send_picker.is_none()
         && !pianoroll_lyric_editing
         && ui.take_shortcut("escape")
     {
-        if app.track_rename_id.is_some() {
+        if app.ui_ephemeral.track_rename_id.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameTrack)
             }));
-        } else if app.section_rename_id.is_some() {
+        } else if app.ui_ephemeral.section_rename_id.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameSection)
             }));
-        } else if app.clip_rename.is_some() {
+        } else if app.ui_ephemeral.clip_rename.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameClip)
             }));
-        } else if app.audio_editor_clip.is_some() {
+        } else if app.ui_ephemeral.audio_editor_clip.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CloseAudioEditor)
             }));
-        } else if app.resource_panel_open {
+        } else if app.ui_ephemeral.resource_panel_open {
             // resource monitor (r.md #3): 詳細パネルが開いていれば Esc で閉じる
             // (rename / audio editor の後、 選択解除より優先)。
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleResourcePanel)
             }));
-        } else if !app.selected_clips.is_empty()
-            || app.selected_clip.is_some()
-            || !app.selected_notes.is_empty()
-            || !app.selected_automation_points.is_empty()
-            || !app.selected_automation_clips.is_empty()
+        } else if !app.selection.selected_clips.is_empty()
+            || app.selection.selected_clip.is_some()
+            || !app.selection.selected_notes.is_empty()
+            || !app.selection.selected_automation_points.is_empty()
+            || !app.selection.selected_automation_clips.is_empty()
         {
             // Escape で選択解除 (clip / note / automation point / clip)。
             // 死蔵だった ClearSelection / ClearNoteSelection を生かす。
@@ -1260,8 +1260,8 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::ClearSelection);
                 app.handle_event(AppEvent::ClearNoteSelection);
-                app.selected_automation_points.clear();
-                app.selected_automation_clips.clear();
+                app.selection.selected_automation_points.clear();
+                app.selection.selected_automation_clips.clear();
             }));
         } else {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
@@ -1276,7 +1276,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use common::protocol::MainToChild;
+    use common::protocol::{AudioCommand, PluginCommand};
     use daw_ui_core::{FrameInput, UiHost};
     use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
     use daw_ui_renderer::Scene;
@@ -1288,8 +1288,8 @@ mod tests {
     };
 
     fn build_app() -> AppData {
-        let (audio_tx, _audio_rx) = mpsc::unbounded_channel::<MainToChild>();
-        let (plugin_tx, _plugin_rx) = mpsc::unbounded_channel::<MainToChild>();
+        let (audio_tx, _audio_rx) = mpsc::unbounded_channel::<AudioCommand>();
+        let (plugin_tx, _plugin_rx) = mpsc::unbounded_channel::<PluginCommand>();
         let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
         let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
         AppData::new(
@@ -1335,12 +1335,12 @@ mod tests {
     #[test]
     fn escape_during_lyric_edit_is_not_consumed_by_global_dispatch() {
         let mut app = build_app();
-        app.bottom_panel = 1; // Piano Roll タブ
-        app.piano_roll_lyric_editing = true; // 歌詞編集中
-        app.selected_notes = vec![1];
+        app.ui_prefs.bottom_panel = 1; // Piano Roll タブ
+        app.ui_ephemeral.piano_roll_lyric_editing = true; // 歌詞編集中
+        app.selection.selected_notes = vec![1];
         dispatch_escape(&mut app);
         assert_eq!(
-            app.selected_notes,
+            app.selection.selected_notes,
             vec![1],
             "歌詞編集中の Esc は global dispatch で消費されず note 選択は維持される",
         );
@@ -1351,12 +1351,12 @@ mod tests {
     #[test]
     fn escape_clears_note_selection_when_not_lyric_editing() {
         let mut app = build_app();
-        app.bottom_panel = 1;
-        app.piano_roll_lyric_editing = false; // 非編集
-        app.selected_notes = vec![1];
+        app.ui_prefs.bottom_panel = 1;
+        app.ui_ephemeral.piano_roll_lyric_editing = false; // 非編集
+        app.selection.selected_notes = vec![1];
         dispatch_escape(&mut app);
         assert!(
-            app.selected_notes.is_empty(),
+            app.selection.selected_notes.is_empty(),
             "非編集時の Esc は従来どおり note 選択を解除する",
         );
     }
@@ -1367,12 +1367,12 @@ mod tests {
     #[test]
     fn escape_closes_audio_editor_even_if_lyric_flag_is_stale() {
         let mut app = build_app();
-        app.bottom_panel = 1;
-        app.piano_roll_lyric_editing = true; // stale-true を想定
-        app.audio_editor_clip = Some(ClipRef { track: 0, clip: 0 });
+        app.ui_prefs.bottom_panel = 1;
+        app.ui_ephemeral.piano_roll_lyric_editing = true; // stale-true を想定
+        app.ui_ephemeral.audio_editor_clip = Some(ClipRef { track: 0, clip: 0 });
         dispatch_escape(&mut app);
         assert!(
-            app.audio_editor_clip.is_none(),
+            app.ui_ephemeral.audio_editor_clip.is_none(),
             "Audio Editor 表示中の Esc は歌詞フラグに関わらず Audio Editor を閉じる",
         );
     }
@@ -1383,12 +1383,12 @@ mod tests {
     #[test]
     fn escape_closes_resource_panel_before_clearing_selection() {
         let mut app = build_app();
-        app.resource_panel_open = true;
-        app.selected_notes = vec![1];
+        app.ui_ephemeral.resource_panel_open = true;
+        app.selection.selected_notes = vec![1];
         dispatch_escape(&mut app);
-        assert!(!app.resource_panel_open, "Esc は開いている詳細パネルを閉じる");
+        assert!(!app.ui_ephemeral.resource_panel_open, "Esc は開いている詳細パネルを閉じる");
         assert_eq!(
-            app.selected_notes,
+            app.selection.selected_notes,
             vec![1],
             "パネルを閉じる Esc は選択を解除しない",
         );

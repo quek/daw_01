@@ -37,15 +37,15 @@ const PANEL_W: f32 = 320.0;
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     // 何も生成していない idle フレーム (= 大多数) は track 走査せず即 return。
-    if app.voicevox_synth_status.is_empty() && app.lipsync_inflight.is_empty() {
+    if app.voicevox.voicevox_synth_status.is_empty() && app.voicevox.lipsync_inflight.is_empty() {
         return;
     }
     // render_frame が frame 冒頭で確定した時刻を使う (= 再描画継続判定
     // `voicevox_animating` と同じ now を読み、5s 境界での食い違いを防ぐ)。
-    let now = app.frame_now;
+    let now = app.ui_ephemeral.frame_now;
     let unreachable = app.voicevox_engine_unreachable(now);
     let wav_n = app.voicevox_synth_busy_count();
-    let lipsync = !app.lipsync_inflight.is_empty();
+    let lipsync = !app.voicevox.lipsync_inflight.is_empty();
 
     // engine 未接続が確定したら、進行中スピナーより警告を優先表示する。
     if !unreachable && wav_n == 0 && !lipsync {
@@ -54,10 +54,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
 
     // load_overlay (上端中央) と重ならないよう、それが出ているときは下にずらす。
     let load_active =
-        matches!(app.load_progress, Some((_, total)) if total > 0) || app.is_async_save_pending();
+        matches!(app.media.load_progress, Some((_, total)) if total > 0) || app.is_async_save_pending();
     let base_y = if load_active { 12.0 + 54.0 } else { 12.0 };
 
-    let phase = spinner_phase(now.duration_since(app.anim_epoch), SPINNER_PERIOD);
+    let phase = spinner_phase(now.duration_since(app.ui_ephemeral.anim_epoch), SPINNER_PERIOD);
 
     if unreachable {
         draw_warning_panel(ui, screen, base_y);

@@ -594,8 +594,10 @@ mod tests {
         song.clip_contents.insert(
             cid,
             ClipContent::Midi(MidiContent {
+                next_note_id: 0,
                 notes: vec![
                     Note {
+                        id: 0,
                         start_beat: 0.0,
                         duration_beats: 1.0,
                         pitch: 60,
@@ -604,6 +606,7 @@ mod tests {
                         muted: false,
                     },
                     Note {
+                        id: 0,
                         start_beat: 1.0,
                         duration_beats: 0.5,
                         pitch: 62,

@@ -211,7 +211,7 @@ fn greedy_columns(heights: &[f32], n_cols: usize) -> Vec<Vec<usize>> {
 
 /// 常時呼び。`is_help_open` を modal の open/close と同期させ、開いている間だけ描画する。
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
-    if !app.is_help_open {
+    if !app.ui_prefs.is_help_open {
         return;
     }
     if !ui.is_modal_open(MODAL_ID) {

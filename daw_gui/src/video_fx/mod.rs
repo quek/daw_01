@@ -161,12 +161,13 @@ pub struct ResolvedEffect {
 /// 1 video device の全 param を **実レンジ値**列に解決する（automation lane の default/curve
 /// ⊕ 変調を 0..=1 で合成 → manifest の実レンジへ展開）。`lanes` / `mod_routings` は track の
 /// （`track.automation_lanes` / `track.mod_routings`）か master の（`song.song_lanes` /
-/// `song.song_mod_routings`）。`device_index` は当該チェーン上の位置（[`AutomationTarget::PluginParam`]）。
+/// `song.song_mod_routings`）。`device_id` は当該 device の安定 id
+/// （v29 — [`AutomationTarget::PluginParam`] は id addressing）。
 fn resolve_device_real_params(
     song: &Song,
     lanes: &[AutomationLane],
     mod_routings: &[ModRouting],
-    device_index: u32,
+    device_id: u64,
     def: &VideoFxDef,
     song_beat: f64,
     mod_scalars: &[f32],
@@ -175,8 +176,9 @@ fn resolve_device_real_params(
         .iter()
         .map(|p| {
             let target = AutomationTarget::PluginParam {
-                device_index,
+                device_id,
                 param_id: p.id,
+                legacy_device_index: None,
                 legacy_slot: None,
             };
             // base = lane の default/curve (0..=1)、無ければ manifest default (0..=1)。
@@ -211,7 +213,7 @@ fn resolve_video_chain(
     mod_scalars: &[f32],
 ) -> Vec<ResolvedEffect> {
     let mut out = Vec::new();
-    for (di, inst) in devices.iter().enumerate() {
+    for inst in devices.iter() {
         if !inst.ports.is_video() {
             continue;
         }
@@ -221,8 +223,9 @@ fn resolve_video_chain(
         if def.category == VideoFxCategory::Transform {
             continue; // 配置 device は apply_chain 非対象（合成段で GroupTransform として消費）。
         }
-        let params =
-            resolve_device_real_params(song, lanes, mod_routings, di as u32, def, song_beat, mod_scalars);
+        let params = resolve_device_real_params(
+            song, lanes, mod_routings, inst.id, def, song_beat, mod_scalars,
+        );
         out.push(ResolvedEffect { def, params });
     }
     out

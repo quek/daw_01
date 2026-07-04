@@ -71,6 +71,10 @@ UI スレッド (gui_01 の `UiHost::frame` / view の build closure / heavy() �
 - **保存と復元の対称性**: 新しい状態を追加した場合、保存・読込・undo の 3 箇所すべてを更新したか
 - **VOICEVOX キャッシュの整合**: Clip 変更時にキャッシュ無効化が漏れていないか
 - **設計判断の整合**: CLAUDE.md / DESIGN.md の原則に違反していないか
+- **アーキテクチャ不変条件** (CLAUDE.md 同名節): `make arch-lint` を実行し新規違反ゼロを確認。
+  特に: positional index addressing の混入 / protocol への bulk 直載せ / 単一 enum への回帰 /
+  RT の無限待ち / edit_song 迂回の song 変更 / live・export の二重実装 / daw-ui core への
+  ドメイン知識混入 / 3,000 行超ファイルの肥大継続
 
 ### 6. 問題の修正
 

@@ -1,100 +1,58 @@
-//! Audio engine. Drives the per-buffer pipeline (sequencer → mixer →
-//! plugin handshake → master) from the CPAL output stream callback.
+//! Audio engine state + per-buffer driver (CPAL コールバック側)。
 //!
-//! State is split in two:
-//! - `SharedState` is `Arc`-clone-able and read by the audio thread (every
-//!   buffer) while the IPC receive loop and GUI commands publish into it
-//!   wait-free (`Atomic*` / `ArcSwap`).
-//! - `LocalState` lives exclusively inside the CPAL closure. It owns the
-//!   pre-allocated scratch buffers and the routing snapshot, so the RT
-//!   loop never touches a `Mutex`.
+//! 役割分担 (`docs/plan_arch_refactor.md` §4/§5):
+//! - `SharedState` — transport / seek / metronome 等の wait-free フラグ面。
+//!   IPC 受信ループが書き、audio thread が毎 buffer 読む。
+//! - `EngineShared` — off-RT 読者 (export thread / notify thread) 向けの
+//!   ミラー (`plugin_refs` / `worker`) と export 予約・preroll 等。**RT は
+//!   これらの `ArcSwap` を load しない** — RT へは [`RtBundle`] が rtrb の
+//!   forward ring で配送され、superseded bundle は recycle ring で off-thread
+//!   drop される (RT で alloc / free / 最終 refcount drop が起きない)。
+//! - `LocalState` — CPAL クロージャ専有の状態 (scratch / cached bundle)。
+//!   [`LocalState::process_buffer`] が 1 buffer を駆動し、実 render は
+//!   live/export 共通の [`crate::graph::render_master_buffer`] に委譲する。
 //!
-//! Plugin handshake is currently a stub: PR3 only wires sequencer + vocal
-//! sample playback + mixer + master accumulation. The `routing.tracks`
-//! vec stays empty until PR5 builds it from `LoadSong`, so the master bus
-//! is silent — that's the expected PR3 behaviour. Plugin process is
-//! filled in by PR5 (handshake) and parallelised in PR6 (worker pool).
+//! plugin dispatch は **有界** (`DISPATCH_TIMEOUT_MS`)。timeout した device は
+//! [`PluginEntry::quarantined`]、pair は [`SyncSlot::poisoned`] で隔離され
+//! (poisoning contract は `common::plugin_ref` module doc)、通知は notify
+//! thread (`main.rs`) がフラグを poll して `AudioEvent` を送る。
 
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use common::audio_bridge::AudioBridgeHandle;
-use common::model::{Song, Track};
+use common::model::Song;
 use common::plugin_ref::{PluginRef, WorkerSyncRef};
-use common::process_data::EventKind;
 use common::timing::{effective_loop_bounds, song_ended};
 use common::worker_bridge::WorkerBridgeHandle;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::audio_worker::AudioWorkerPool;
-use crate::graph::{BufRef, NodeOp, Schedule};
+use crate::graph::{DelayLine, Schedule, render_master_buffer};
+use crate::metronome::{ClickVoice, render_metronome};
 use crate::mixer::TrackScratch;
-use crate::sequencer::{NoteTransition, TimedNoteEvent, collect_events_for_buffer};
-
-/// VOICEVOX synthesis result key. The GUI sends each freshly-rendered
-/// vocal clip via `MainToChild::SetGeneratedAudio` keyed with this id;
-/// `process_track_owned` looks the buffer up by the same key when it
-/// renders a Vocal track that has no instrument plugin. Encoding both
-/// `track_id` and `clip_id` into one `u64` lets a single Vocal track
-/// host multiple independent vocal clips without overwriting each
-/// other (= the old `vocal_store` was track-keyed only).
-#[inline]
-pub fn vocal_gen_id(track_id: u32, clip_id: u32) -> u64 {
-    ((track_id as u64) << 32) | (clip_id as u64)
-}
+use crate::sequencer::NoteTransition;
 
 /// Hard cap on tracks the audio engine can render in a single buffer.
 /// Picked to match `audio_bridge::MAX_TRACKS` so the per-track peak
 /// meter doesn't fall off the GUI side.
 pub const MAX_TRACKS: usize = 32;
 
-/// Commands sent from the IPC receive loop to the audio thread. Pumped
-/// at the top of every `process_buffer` so handles land before the
-/// dispatch logic uses them.
-pub enum AudioCommand {
-    /// The plugin host stood up its worker pool. The audio side has now
-    /// opened the matching `WorkerBridge` shmem and the per-worker
-    /// (wake, done) named events; pass them in so the audio thread can
-    /// dispatch via `WorkerSyncRef::dispatch`.
-    OpenWorkerPool {
-        bridge: WorkerBridgeHandle,
-        worker_syncs: Vec<WorkerSyncRef>,
-    },
-    /// A new plugin instance was loaded; the audio engine has opened
-    /// its `ProcessData` shmem and is ready to drive `plugin.process()`.
-    /// `track` / `index` let the engine slot the plugin into its routing
-    /// graph at the matching position in the single device chain. `handle`
-    /// keeps the daw_audio-side shmem mapping alive — without it,
-    /// `plugin_ref.process_data` would be a dangling pointer once
-    /// `handle_open_plugin_shmem` returns and drops its local
-    /// `ProcessDataHandle`.
-    OpenPluginShmem {
-        plugin_id: u32,
-        plugin_ref: PluginRef,
-        handle: common::process_data::ProcessDataHandle,
-        track: u32,
-        index: u32,
-    },
-    /// Drop a previously-opened plugin shmem mapping. Triggered on
-    /// RemoveSlotPlugin / RemoveTrack from the GUI side.
-    ClosePluginShmem { plugin_id: u32 },
-    /// atomically re-key `slot_to_plugin_id` for a chain reorder.
-    /// `moves` is the complete `(old_index, new_index)` permutation of
-    /// `track`'s loaded plugins (see `MainToChild::ReorderChain`). Only the
-    /// device-index KEYS move — the plugin ids and their `plugin_refs` are
-    /// untouched, so no plugin is ever briefly dropped (unlike a sequence of
-    /// `OpenPluginShmem` at swapping indices). The processing ORDER follows
-    /// the matching `LoadSong`; this just makes each index resolve to its
-    /// moved plugin.
-    ReorderChain {
-        track: u32,
-        moves: Vec<(u32, u32)>,
-    },
+/// 鍵盤プレビュー note の `note_id`。 sequencer が振る通し index (= 0.. の
+/// 小さい値) と衝突しない sentinel。 CLAP/VST3 は `note_id` を無視し、 builtin
+/// は key 一致で発音/停止するので、 on/off で同値であれば voice 対応が取れる。
+const PREVIEW_NOTE_ID: u32 = u32::MAX;
+
+/// IPC 受信ループから audio thread へ渡す軽量コマンド。毎 buffer 頭の
+/// `pump_commands` で drain される。v29: shmem / worker pool の重い扱いは
+/// recv loop 側で [`RtBundle`] に載る経路へ移設したので、残るのは
+/// 鍵盤プレビューのみ。
+pub enum EngineCommand {
     /// 鍵盤レーン click のプレビュー note-on (gui_01 #055)。 `track` は
     /// song.tracks の Vec index (= main.rs が `track_id` から現 song snapshot
     /// で解決済)、 `velocity` は normalized 0..=1。 `pump_commands` が該当
@@ -109,11 +67,6 @@ pub enum AudioCommand {
     /// Vec index。
     PreviewNoteOff { track: usize, pitch: u8 },
 }
-
-/// 鍵盤プレビュー note の `note_id`。 sequencer が振る通し index (= 0.. の
-/// 小さい値) と衝突しない sentinel。 CLAP/VST3 は `note_id` を無視し、 builtin
-/// は key 一致で発音/停止するので、 on/off で同値であれば voice 対応が取れる。
-const PREVIEW_NOTE_ID: u32 = u32::MAX;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -164,20 +117,19 @@ pub struct SharedState {
     /// bypass で済む)。 起動時は空。
     pub recording_lanes:
         arc_swap::ArcSwap<std::collections::HashSet<(u32, common::model::AutomationTarget)>>,
-    /// Phase 7 B3 (2026-05-13): メトロノーム on/off。 GUI が
-    /// `MainToChild::SetMetronomeEnabled(bool)` で更新、 audio thread が
-    /// `render_metronome` で読む。 false なら click 生成を skip (= 無音)。
-    /// 起動時 default false。
+    /// メトロノーム on/off。 GUI が `AudioCommand::SetMetronomeEnabled` で更新、
+    /// audio thread が `render_metronome` で読む。 false なら click 生成を
+    /// skip (= 無音)。 起動時 default false。
     pub metronome_enabled: AtomicBool,
     /// パニックボタンの declick トリガ。 IPC スレッドが
-    /// `MainToChild::Panic` で `true` を store、 CPAL コールバックが各 buffer 頭で
+    /// `AudioCommand::Panic` で `true` を store、 CPAL コールバックが各 buffer 頭で
     /// `swap(false)` して master を fade-out → hold へ入れる。 panic が全 plugin を
     /// mix から外す瞬間の段差クリックを、 master を先にフェードミュートして隠す
     /// ための edge フラグ。
     pub panic_declick: AtomicBool,
     /// declick の hold を解除して fade-in へ移すトリガ。 daw_gui が
     /// `ReinitAllPlugins` の完了 (`PluginsReinitDone`) を確認してから
-    /// `MainToChild::PanicRelease` で `true` を store する。 これで master の
+    /// `AudioCommand::PanicRelease` で `true` を store する。 これで master の
     /// ミュート解除を「固定タイマー」 ではなく「reinit が実際に終わった瞬間」 に
     /// 結びつけ、 GUI メインスレッド stall や巨大 reinit でも、 plugin が mix に
     /// 残ったまま master が戻る (= クリック / reverb tail 復活) ことを防ぐ。
@@ -208,43 +160,116 @@ impl Default for SharedState {
     }
 }
 
-/// Engine resources shared between the CPAL audio thread and (in A3) an
-/// offline-export worker. All fields are wait-free: the IPC apply path
-/// (`pump_commands`) publishes new snapshots via `ArcSwap::store`, RT
-/// readers `load()` an immutable snapshot for the duration of one
-/// buffer.
+/// 1 loaded plugin instance ぶんの daw_audio 側リソース。`plugin_refs`
+/// (device_id → entry) の値。map の clone は `Arc` の refcount bump なので、
+/// recv loop での snapshot-copy-mutate-publish が安価。
+pub struct PluginEntry {
+    /// shmem 上の `ProcessData` への参照 (device_id 込み)。
+    pub plugin_ref: PluginRef,
+    /// plan §4: dispatch timeout でこの device を隔離した。以後の buffer は
+    /// この device を skip (= bypass) し、**pd (shmem) にも触らない** —
+    /// timeout した `process()` は plugin_host 側でまだ走っている可能性が
+    /// あり、入力を書くと並行 process と race する。plugin_host respawn /
+    /// SetSlotPlugin 再ロード (= 新 entry) で解除。
+    pub quarantined: AtomicBool,
+    /// `AudioEvent::PluginUnresponsive` を送ったか (notify thread の dedup)。
+    pub unresponsive_notified: AtomicBool,
+    /// daw_audio 側の shmem mapping を entry の寿命に束ねる (旧 `Box::leak`
+    /// の解消 — plan §4)。entry が map から外れ、全 snapshot (RT bundle /
+    /// mirror / export guard) が死ぬと off-thread で unmap される。
+    /// テストは heap の `ProcessData` を直接指すので `None`。
+    pub _handle: Option<common::process_data::ProcessDataHandle>,
+}
+
+impl PluginEntry {
+    pub fn new(
+        device_id: u64,
+        handle: common::process_data::ProcessDataHandle,
+    ) -> Self {
+        Self {
+            plugin_ref: PluginRef {
+                device_id,
+                process_data: handle.ptr(),
+            },
+            quarantined: AtomicBool::new(false),
+            unresponsive_notified: AtomicBool::new(false),
+            _handle: Some(handle),
+        }
+    }
+
+    /// テスト用: shmem を立てず heap 上の `ProcessData` を指す entry。
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        device_id: u64,
+        process_data: *mut common::process_data::ProcessData,
+    ) -> Self {
+        Self {
+            plugin_ref: PluginRef {
+                device_id,
+                process_data,
+            },
+            quarantined: AtomicBool::new(false),
+            unresponsive_notified: AtomicBool::new(false),
+            _handle: None,
+        }
+    }
+}
+
+/// device_id (安定 `PluginInstance::id`) → entry。schedule / song 側の
+/// `devices[i].id` からこの map を直接引く (positional slot map は v29 で
+/// 廃止)。
+pub type PluginRefs = HashMap<u64, Arc<PluginEntry>>;
+
+/// 1 worker handshake pair (audio worker i ↔ plugin_host worker i)。
+pub struct SyncSlot {
+    pub sync: WorkerSyncRef,
+    /// plan §4 poisoning contract: dispatch timeout を観測した pair は
+    /// 以後 dispatch 禁止 (auto-reset done event に待ち手なし signal が
+    /// 残留し、次 dispatch が「走行中の process と並行に入力を書く」事故に
+    /// なるため)。pool 再構築 (= 新 `WorkerRig`) まで立ちっぱなし。
+    pub poisoned: AtomicBool,
+}
+
+/// worker pool 一式 (plugin_host との handshake 面 + audio 側 worker threads)。
+/// recv loop が `OpenWorkerPool` で off-thread 構築し、`RtBundle` で RT へ
+/// 配送する。旧 rig は recycle ring 経由で off-thread drop — `AudioWorkerPool`
+/// の Drop (worker join) が RT を塞がない (plan §4)。
 ///
-/// Held by `LocalState::shared` (the CPAL closure) and — once A3 lands
-/// — also by the export thread, so both can drive `plugin.process()`
-/// without re-syncing per-buffer state.
+/// **フィールド順序が drop 順序**: `pool` (worker threads join — slots の
+/// raw pointer を deref し得る) → `slots` → `bridge` (slots の
+/// `worker_task` ptr の backing shmem) の順で落とすこと。
+pub struct WorkerRig {
+    /// `None` = `AudioWorkerPool::new` 失敗 (serial fallback で slot 0 のみ使用)。
+    pub pool: Option<AudioWorkerPool>,
+    pub slots: Vec<SyncSlot>,
+    /// shmem mapping を保持 (`slots[*].sync.worker_task` の backing)。
+    pub bridge: WorkerBridgeHandle,
+    /// `AudioEvent::WorkerPoolStalled` を送ったか (notify thread の dedup)。
+    pub stall_notified: AtomicBool,
+}
+
+/// Engine resources shared with off-RT readers: the offline-export thread
+/// and the notify thread. `plugin_refs` / `worker` は recv loop が書く
+/// **ミラー** — RT は `RtBundle` に載った Arc clone を使う (RT で ArcSwap
+/// guard の最終 drop が起きないようにするため)。
 pub struct EngineShared {
-    /// Owned `WorkerBridge` shmem. Populated on `OpenWorkerPool`.
-    pub worker_bridge: ArcSwapOption<WorkerBridgeHandle>,
-    /// Per-worker handshake handles (one per audio-engine worker), in
-    /// the same order the plugin host's `WorkerPool` opened them.
-    pub worker_syncs: ArcSwap<Vec<WorkerSyncRef>>,
-    /// `plugin_id` → `PluginRef` (process_data shmem ptr). New
-    /// snapshot on every plugin load / unload.
-    pub plugin_refs: ArcSwap<HashMap<u32, PluginRef>>,
-    /// `(track, device_index)` → `plugin_id`. New snapshot in lock-step with
-    /// `plugin_refs`. v23 single-chain: addressed by the device's position in
-    /// `Track.devices` (was per-section `PluginSlot`).
-    pub slot_to_plugin_id: ArcSwap<HashMap<(u32, u32), u32>>,
-    /// Worker pool that fans per-track work across N audio-engine
-    /// workers. `None` until `OpenWorkerPool` arrives.
-    pub worker_pool: ArcSwapOption<AudioWorkerPool>,
-    /// Set by A3's export thread while it owns the audio path. CPAL
+    /// device_id → `PluginEntry` のミラー (export / notify 用)。RT へは
+    /// 同じ `Arc<PluginEntry>` 群が bundle で渡るので quarantine フラグは
+    /// 両者で共有される。
+    pub plugin_refs: ArcSwap<PluginRefs>,
+    /// worker rig のミラー (export / notify 用)。
+    pub worker: ArcSwapOption<WorkerRig>,
+    /// Set by the export thread while it owns the audio path. CPAL
     /// callback skips its `process_buffer` and writes silence so the
     /// export render can drive `plugin.process()` exclusively.
     pub export_running: AtomicBool,
     /// Cancel request for the in-flight offline render. The daw_audio
     /// receive loop resets it to `false` *before* spawning each export
     /// thread (in the `ExportWav` / `BounceClipFxOnline` handlers), so the
-    /// reset is FIFO-ordered against a later `MainToChild::CancelExport`
+    /// reset is FIFO-ordered against a later `AudioCommand::CancelExport`
     /// and a stale cancel from a previous render can't abort the next one.
     /// `run_export` / the freewheel loop only **read** it (every buffer)
-    /// and abort (deleting the partial WAV) when set. Raised by
-    /// `MainToChild::CancelExport` (= the progress overlay's Cancel button).
+    /// and abort (deleting the partial WAV) when set.
     pub export_cancel: AtomicBool,
     /// set `true` by the CPAL callback once it observes
     /// `export_running` and parks (writes silence, skips dispatch); set `false`
@@ -256,7 +281,7 @@ pub struct EngineShared {
     /// flag the single-consumer (export thread) polls.
     pub live_parked: AtomicBool,
     /// Audio clip render snapshot. Built off-thread in
-    /// `compile_audio_schedule` (PR6) and published via `ArcSwap`. The
+    /// `compile_audio_schedule` and published via `ArcSwap`. The
     /// audio thread `load()`s once per buffer to find events that
     /// overlap the current playhead range. Empty until imports start
     /// landing.
@@ -277,7 +302,7 @@ pub struct EngineShared {
     /// `AudioSourcePath::ProjectRelative`. `None` for unsaved projects
     /// — `ProjectRelative` paths fail to resolve in that state and the
     /// caller is expected to use `Absolute` (import_cache fallback).
-    /// Updated by `MainToChild::SetProjectDir`.
+    /// Updated by `AudioCommand::SetProjectDir`.
     pub project_dir: ArcSwapOption<PathBuf>,
     /// Phase 7 B4 Step C (2026-05-13): count-in 用 preroll の合計 samples
     /// (= count-in 開始時に GUI が `StartCountIn { samples }` で立てた値の
@@ -289,16 +314,29 @@ pub struct EngineShared {
     /// `frames` だけ deduct + audio_bridge mirror 経由で GUI に publish。
     /// 0 到達で通常再生に戻る (= dispatch / clip render 復帰)。
     pub preroll_remaining_samples: AtomicU64,
+    /// master volume (f32 bits)。 recv loop が `SetMasterGain` で store、
+    /// render (`render_master_buffer`) が load して master へ掛ける。live /
+    /// export 共通 (§5 — 旧実装は CPAL interleave 段のみで export に乗らず、
+    /// master gain が WAV に反映されなかった)。
+    pub master_gain: AtomicU32,
+    /// 直近の CPAL callback が処理した frames (= device period)。 audio
+    /// thread が毎 buffer store し、recv loop が schedule compile の
+    /// `buffer_frames` (leaf 宛 sidechain tap の 1-buffer 補償量) に使う。
+    /// `0` = 未計測 (compile 側は 10ms 相当へ fallback)。
+    pub last_buffer_frames: AtomicU32,
+    /// CPAL callback thread の MMCSS "Pro Audio" join が失敗した (E:
+    /// callback 初回に自前 join する — 失敗ログは RT で出せないので notify
+    /// thread が 1 回だけ warn する)。
+    pub mmcss_join_failed: AtomicBool,
+    /// `mmcss_join_failed` の warn を出したか (notify thread の dedup)。
+    pub mmcss_warned: AtomicBool,
 }
 
 impl EngineShared {
     pub fn new() -> Self {
         Self {
-            worker_bridge: ArcSwapOption::empty(),
-            worker_syncs: ArcSwap::from_pointee(Vec::new()),
             plugin_refs: ArcSwap::from_pointee(HashMap::new()),
-            slot_to_plugin_id: ArcSwap::from_pointee(HashMap::new()),
-            worker_pool: ArcSwapOption::empty(),
+            worker: ArcSwapOption::empty(),
             export_running: AtomicBool::new(false),
             export_cancel: AtomicBool::new(false),
             live_parked: AtomicBool::new(false),
@@ -308,6 +346,10 @@ impl EngineShared {
             project_dir: ArcSwapOption::empty(),
             preroll_total_samples: AtomicU64::new(0),
             preroll_remaining_samples: AtomicU64::new(0),
+            master_gain: AtomicU32::new(1.0_f32.to_bits()),
+            last_buffer_frames: AtomicU32::new(0),
+            mmcss_join_failed: AtomicBool::new(false),
+            mmcss_warned: AtomicBool::new(false),
         }
     }
 }
@@ -318,44 +360,35 @@ impl Default for EngineShared {
     }
 }
 
-/// Off-thread-compiled routing snapshot handed to the RT audio thread (D1 /
-/// PR3). `compile_schedule` + `TempoMap::from_song` (both heap-allocating) run
-/// on the receive loop / decode thread, not the audio callback. The song +
-/// schedule + tempo map are bundled into one `Arc` and published via
-/// [`EngineShared::pending_routing`]; the audio thread swaps it in with no
-/// allocation. The superseded snapshot is shipped back to the off-thread
-/// compiler via the recycle SPSC (`LocalState::routing_recycle_tx`) so its
-/// `Drop` (free) also runs off the audio thread — the RT path neither allocates
-/// nor frees on an edit.
-pub struct CompiledRouting {
-    pub song: Arc<Song>,
-    pub schedule: Schedule,
+/// Off-thread で構築され、RT audio thread へ wait-free に配送される
+/// snapshot 一式 (plan §4 の RtBundle)。`compile_schedule` /
+/// `TempoMap::from_song` / plugin_refs map の rebuild / worker pool の
+/// spawn は全部 recv loop 側で走り、RT は swap (move / Arc clone) だけを
+/// 行う。superseded bundle は recycle ring で recv loop に返送され、
+/// `Drop` (free / shmem unmap / worker join) も off-thread で走る。
+pub struct RtBundle {
+    /// 現 song snapshot (`None` = song 未ロード)。
+    pub song: Option<Arc<Song>>,
     pub tempo_map: common::tempo_map::TempoMap,
+    /// `None` = 値のみ更新 (SetTrackVolume 等) — RT は現行 schedule を
+    /// 保持する (§5 D: 値更新で `compile_schedule` を走らせない)。
+    /// `Some` = topology 変更 — install 時に `adopt_state_from` で
+    /// DelayLine / FollowerSlot の走行状態を旧 schedule から移送する。
+    pub schedule: Option<Schedule>,
+    /// `input_delay_per_track` が `TrackScratch::input_delay_line` の
+    /// prealloc (1s) を超える病的ケース用の off-thread pre-alloc 置換 line
+    /// (index = track index)。install 時に必要なら swap され、旧 line が
+    /// この Vec に残って recycle で off-thread drop される。通常は全 `None`
+    /// (schedule が `None` のときは常に空)。
+    pub input_delay_replacements: Vec<Option<DelayLine>>,
+    /// device_id → entry (Arc clone — recv loop のミラーと同一 entry)。
+    pub plugin_refs: Arc<PluginRefs>,
+    /// worker rig (Arc clone)。`None` = pool 未 open / close 済。
+    pub worker: Option<Arc<WorkerRig>>,
 }
 
 /// Audio-thread-private engine state. Lives in the CPAL closure for the
 /// whole stream lifetime.
-/// Phase 7 B3 (2026-05-13): メトロノーム click voice (sine + linear envelope
-/// decay)。 1 voice mono。 beat 境界で trigger され、 `samples_remaining` が
-/// 0 になるまで sine を mix。 連続 beat で前 voice が decay 中なら新 voice
-/// で overwrite (= 短 decay の業界標準 idiom)。
-///
-/// パラメータ default: decay 40 ms / amplitude peak 0.25 (-12 dB) / freq
-/// downbeat 880 Hz 他 440 Hz。 すべて `render_metronome` で hardcode。
-pub struct ClickVoice {
-    /// remaining samples until envelope reaches 0 (= voice expires)
-    pub samples_remaining: u32,
-    /// total decay length in samples (envelope = remaining / decay_total)
-    pub decay_samples: u32,
-    /// oscillator frequency (Hz)
-    pub freq: f32,
-    /// phase accumulator (radians, 0..=TAU)
-    pub phase: f32,
-    /// 次 buffer 内で voice を再開する sample offset (= trigger frame)。
-    /// 0 なら buffer の最初から再開 (= 前 buffer から続いている voice)。
-    pub start_offset: u32,
-}
-
 pub struct LocalState {
     /// Pre-allocated scratch buffers (MAX_TRACKS entries). The audio
     /// loop indexes into this with the current Song's track index — no
@@ -371,14 +404,11 @@ pub struct LocalState {
     /// beat-domain playhead。 audio thread が buffer 頭で
     /// `evaluate_song_tempo(song, playhead_beats)` を呼んで current_bpm を
     /// 引き、 buffer 末で `playhead_beats += frames * current_bpm / (60 * SR)`
-    /// で advance する。 Play edge / SeekTo IPC では sample-domain playhead +
-    /// 現 song.bpm で初期推定 (過去の tempo 履歴を再生できないので average
-    /// 線形換算)、 user 体感での timing drift は小さい。
+    /// で advance する。 Play edge / SeekTo IPC では tempo map で逆算する。
     pub playhead_beats: f64,
     /// Phase 5 Step 5.2: 前 buffer 末の sample-domain playhead。 次 buffer 頭
     /// で `shared.playhead != last_known_playhead` のとき seek が発生したと
-    /// 判定し、 `playhead_beats` を再初期化する (= 過去の tempo 履歴を
-    /// 再生できないので song.bpm で linear 推定)。 初期値 `u64::MAX` は
+    /// 判定し、 `playhead_beats` を再初期化する。 初期値 `u64::MAX` は
     /// 「未確定」 (= 最初の buffer は必ず seek 扱いで初期化される)。
     pub last_known_playhead: u64,
     /// Phase 5 follow-up (granular DSP click 抑制): LP smoothed **絶対**
@@ -386,50 +416,42 @@ pub struct LocalState {
     /// audio_clip_renderer の Stretch mode (granular_sample_at) が
     /// `tempo_follow_ratio(stretch_ratio, smoothed_current_bpm, nominal_bpm)`
     /// で source 進度を求めるのに使う。 nominal_bpm は per-event の compile時
-    /// song.bpm なので、 base bpm を変えても (= song.bpm 自身が動いても)
-    /// `smoothed_current_bpm / nominal_bpm` が正しく追従する (= 旧実装は
-    /// `current_bpm / song.bpm` を平滑化していて base bpm 変更に追従しなかった、
-    /// r.md #6)。 instantaneous な bpm を直接使うと buffer 越しに tempo が
-    /// 変わったとき `grain_source_offset = k * HOP * ratio` が past grain でも
-    /// 更新され grain 中で source pos が discontinuous → click。 LP smoothing で
-    /// per-buffer の Δbpm を抑え、 active grain (= life 2*HOP ~ 1024 samples ≒
-    /// 1 buffer @ 512) 内の source pos jump を低減する。 完全な stateful
-    /// grain-trigger lock-in は別 phase (= per-event state 必要、 worker pool に
-    /// &mut を通す refactor が要)。 Repitch / Slice は instant `current_bpm` を
-    /// 使う (= 追随性優先)。 初期値 120.0 BPM、 LP coef は process_buffer で
-    /// `~50ms TC` 相当。
+    /// song.bpm なので、 base bpm を変えても `smoothed_current_bpm /
+    /// nominal_bpm` が正しく追従する (r.md #6)。 LP coef は process_buffer で
+    /// `~50ms TC` 相当。 初期値 120.0 BPM。
     pub smoothed_current_bpm: f64,
-    /// Phase 7 B3 (2026-05-13): metronome click voice 状態 (mono single-voice、
-    /// per-buffer で beat 境界を検出して trigger、 sine + linear envelope decay)。
-    /// `Some` なら active (= まだ decay 中)、 `None` なら idle。 連続 beat で
-    /// 前 voice が decay 中なら overwrite (= 短 decay の 1 voice のみ持続、
-    /// 業界標準の click と同 idiom)。 master mix 後に `render_metronome` で
-    /// 反映。 export 中 / playing でない / `metronome_enabled = false` のいずれ
-    /// でも render skip。
+    /// metronome click voice 状態 (mono single-voice)。 `Some` なら active
+    /// (= まだ decay 中)。 詳細は `crate::metronome`。
     pub metronome_voice: Option<ClickVoice>,
-    /// Pending IPC commands from the receive loop. Drained at the top
-    /// of every `process_buffer` so `EngineShared` snapshots are fresh
-    /// before dispatch.
-    pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<AudioCommand>,
-    /// Resources shared with the (future) export thread.
+    /// Pending preview commands from the receive loop. Drained at the top
+    /// of every `process_buffer`.
+    pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
+    /// Resources shared with the export / notify threads.
     pub shared: Arc<EngineShared>,
-    /// SPSC carrying freshly off-thread-compiled `CompiledRouting` snapshots
-    /// from the receive loop to the audio thread (D1 / PR3). The audio thread
-    /// `pop`s the newest (wait-free, no alloc — the value moves out of the
-    /// pre-allocated ring slot, so there is no `Arc` box to free either) and
-    /// swaps it into `cached_*`.
-    pub routing_rx: rtrb::Consumer<CompiledRouting>,
-    /// SPSC to ship superseded `CompiledRouting` snapshots back to the receive
-    /// loop for disposal (D1 / PR3). The audio thread `push`es the old snapshot
-    /// here (wait-free, no alloc) when it swaps in a newer one; the receive loop
-    /// `pop`s and drops them, so the `Drop` (free) runs off the audio thread.
-    pub routing_recycle_tx: rtrb::Producer<CompiledRouting>,
-    /// Cached routing schedule. Recompiled (heap alloc) only when
-    /// `cached_song` is `Arc::ptr_eq`-different from the current song
-    /// snapshot, i.e. on user edits — not on every audio buffer. PR3
-    /// will move `compile_schedule` off the audio thread entirely and
-    /// publish via `ArcSwap` for fully wait-free pickup.
+    /// SPSC carrying freshly off-thread-built [`RtBundle`]s from the receive
+    /// loop to the audio thread. The audio thread `pop`s the newest
+    /// (wait-free, no alloc — the value moves out of the pre-allocated ring
+    /// slot) and swaps it into the cached fields below.
+    pub bundle_rx: rtrb::Consumer<RtBundle>,
+    /// SPSC to ship superseded bundles back to the receive loop for disposal.
+    /// The audio thread `push`es the old snapshot here (wait-free, no alloc)
+    /// when it swaps in a newer one; the receive loop `pop`s and drops them,
+    /// so `Drop` (free / unmap / worker join) runs off the audio thread.
+    pub bundle_recycle_tx: rtrb::Producer<RtBundle>,
+    /// Cached schedule (installed from the newest bundle; 値のみ更新では
+    /// 据え置き)。DelayLine / FollowerSlot の走行状態を内包する。
     pub cached_schedule: Schedule,
+    /// Last installed `Arc<Song>`.
+    pub cached_song: Option<Arc<Song>>,
+    /// (A10 r.md #8) cached_song の SongTempo curve を積分した beat↔sample map。
+    /// seek / loop-wrap で playhead を sample→beat に戻すとき、 constant-bpm 線形推定
+    /// でなくこの map で tempo automation を honor する。 lookup は O(log n)・
+    /// alloc/lock 無で RT 安全。
+    pub tempo_map: common::tempo_map::TempoMap,
+    /// RT が使う plugin_refs snapshot (bundle 由来 Arc clone)。
+    pub plugin_refs: Arc<PluginRefs>,
+    /// RT が使う worker rig (bundle 由来 Arc clone)。
+    pub worker: Option<Arc<WorkerRig>>,
     /// docs/plan_modulation.md §5: reusable per-buffer snapshot of follower
     /// scalars (slot = `ModSource` position), filled from
     /// `cached_schedule.follower_slots` before dispatch (= the previous
@@ -437,15 +459,6 @@ pub struct LocalState {
     /// plugin-param lanes with `mod_routings` modulate. Reused across buffers
     /// (no per-buffer allocation once warmed).
     pub mod_scalars_snapshot: Vec<f32>,
-    /// Last `Arc<Song>` we compiled the schedule from, kept alive so
-    /// pointer equality is meaningful across buffers.
-    pub cached_song: Option<Arc<Song>>,
-    /// (A10 r.md #8) cached_song の SongTempo curve を積分した beat↔sample map。
-    /// seek / loop-wrap で playhead を sample→beat に戻すとき、 constant-bpm 線形推定
-    /// でなくこの map で tempo automation を honor する。 `refresh_schedule` が song
-    /// 変化時に再構築 (compile と同経路、 edit-time のみ)。 lookup は O(log n)・
-    /// alloc/lock 無で RT 安全。
-    pub tempo_map: common::tempo_map::TempoMap,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -456,18 +469,16 @@ pub struct LocalState {
     #[cfg(debug_assertions)]
     pub heartbeat_track_peaks: Vec<(f32, f32, bool)>,
     #[cfg(debug_assertions)]
-    pub heartbeat_plugin_ids: Vec<u32>,
-    #[cfg(debug_assertions)]
-    pub heartbeat_slot_keys: Vec<((u32, u32), u32)>,
+    pub heartbeat_device_ids: Vec<u64>,
 }
 
 impl LocalState {
     pub fn new(
         max_frames: usize,
-        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<AudioCommand>,
+        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
         shared: Arc<EngineShared>,
-        routing_rx: rtrb::Consumer<CompiledRouting>,
-        routing_recycle_tx: rtrb::Producer<CompiledRouting>,
+        bundle_rx: rtrb::Consumer<RtBundle>,
+        bundle_recycle_tx: rtrb::Producer<RtBundle>,
     ) -> Self {
         let scratch = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
         Self {
@@ -481,222 +492,99 @@ impl LocalState {
             metronome_voice: None,
             cmd_rx,
             shared,
-            routing_rx,
-            routing_recycle_tx,
+            bundle_rx,
+            bundle_recycle_tx,
             cached_schedule: Schedule::empty(),
-            mod_scalars_snapshot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
             cached_song: None,
             // 初期は default song (= constant 120bpm)。 seek/loop-wrap は線形に縮退。
             tempo_map: common::tempo_map::TempoMap::from_song(&Song::default()),
+            plugin_refs: Arc::new(HashMap::new()),
+            worker: None,
+            mod_scalars_snapshot: Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
             heartbeat_track_peaks: Vec::with_capacity(MAX_TRACKS),
             // 上限は実態に合わせた hint。超えても Vec が伸びるだけだが、
-            // steady-state で MAX_TRACKS * 4 slot を超えるケースは稀。
+            // steady-state で MAX_TRACKS * 4 device を超えるケースは稀。
             #[cfg(debug_assertions)]
-            heartbeat_plugin_ids: Vec::with_capacity(MAX_TRACKS * 4),
-            #[cfg(debug_assertions)]
-            heartbeat_slot_keys: Vec::with_capacity(MAX_TRACKS * 4),
+            heartbeat_device_ids: Vec::with_capacity(MAX_TRACKS * 4),
         }
     }
 
-    /// Install the latest off-thread-compiled routing, if one was published
-    /// since the last buffer (D1 / PR3). The heap allocation that used to live
-    /// here — `compile_schedule` + `TempoMap::from_song` — now runs on the
-    /// receive loop / decode thread (`publish_routing`); this method only
-    /// *swaps* the pre-built `Schedule` / `TempoMap` / song `Arc` in (moves, no
-    /// allocation) and ships the superseded snapshot back via the recycle SPSC
-    /// so its `Drop` (free) also runs off the audio thread. The RT path neither
-    /// allocates nor frees on an edit.
-    fn refresh_schedule(&mut self) {
-        // Drain the forward ring, keeping only the newest snapshot. The value
-        // moves out of the pre-allocated ring slot — no allocation and no `Arc`
-        // box to free. Any intermediate snapshots the audio thread skipped past
-        // are recycled off-thread (their `Drop` must not run on the callback).
-        let mut newest: Option<CompiledRouting> = None;
-        while let Ok(snapshot) = self.routing_rx.pop() {
-            if let Some(skipped) = newest.replace(snapshot) {
-                let _ = self.routing_recycle_tx.push(skipped);
+    /// Install the newest off-thread-built bundle, if one was published since
+    /// the last buffer. すべて move / `Arc` clone / `mem::swap` — RT 上で
+    /// alloc も free も起きない。schedule が載っている (= topology 変更)
+    /// ときは `adopt_state_from` で DelayLine / FollowerSlot の走行状態を
+    /// 旧 schedule から移送する (§5 D — off-thread では live 状態を持てない
+    /// ため、install 時にポインタ swap で行う)。superseded 一式は recycle
+    /// ring で off-thread drop。
+    fn refresh_bundle(&mut self) {
+        // Drain the forward ring, keeping only the newest bundle. Any
+        // intermediate bundles the audio thread skipped past are recycled
+        // off-thread (their `Drop` must not run on the callback).
+        let mut newest: Option<RtBundle> = None;
+        while let Ok(bundle) = self.bundle_rx.pop() {
+            if let Some(skipped) = newest.replace(bundle) {
+                let _ = self.bundle_recycle_tx.push(skipped);
             }
         }
-        let Some(new) = newest else {
+        let Some(mut new) = newest else {
             return;
         };
-        let old_schedule = std::mem::replace(&mut self.cached_schedule, new.schedule);
-        let old_tempo = std::mem::replace(&mut self.tempo_map, new.tempo_map);
-        let old_song = self.cached_song.replace(new.song);
 
-        // PR4.5 sidechain plugin-internal alignment: ensure each TrackScratch's
-        // input_delay_line has enough capacity for the freshly installed
-        // schedule. Pre-allocated to `INPUT_DELAY_PREALLOC_SAMPLES` in
-        // `TrackScratch::new`, so this loop never reallocates for any real
-        // plugin's latency; the grow path remains only for the pathological
-        // >1 s case (which no real plugin hits). DelayLine.step_in_place clamps
-        // `delay >= cap` to `cap - 1`, so capacity must be `delay + 1`.
-        for (i, &delay) in self.cached_schedule.input_delay_per_track.iter().enumerate() {
-            if i >= self.scratch.len() {
-                break;
+        // ---- swap in the new snapshot, collecting the old for recycling ----
+        let old_song = std::mem::replace(&mut self.cached_song, new.song.take());
+        let old_tempo = std::mem::replace(&mut self.tempo_map, new.tempo_map);
+        let old_refs = std::mem::replace(&mut self.plugin_refs, Arc::clone(&new.plugin_refs));
+        let old_worker = std::mem::replace(&mut self.worker, new.worker.take());
+
+        let mut old_schedule: Option<Schedule> = None;
+        let mut retired_lines: Vec<Option<DelayLine>> = Vec::new();
+        if let Some(mut sched) = new.schedule.take() {
+            // §5 D: 走行状態 (PDC ring / follower env) を stable key で移送。
+            sched.adopt_state_from(&mut self.cached_schedule);
+            old_schedule = Some(std::mem::replace(&mut self.cached_schedule, sched));
+
+            // per-track input delay line: prealloc (1s) を超える補償が要る
+            // track には off-thread pre-alloc された置換 line が載っている。
+            // swap して旧 line を bundle 側に残す (off-thread drop)。
+            for (i, repl) in new.input_delay_replacements.iter_mut().enumerate() {
+                if i >= self.scratch.len() {
+                    break;
+                }
+                if let Some(line) = repl.as_mut()
+                    && self.scratch[i].input_delay_line.capacity() < line.capacity()
+                {
+                    std::mem::swap(&mut self.scratch[i].input_delay_line, line);
+                }
             }
-            let need_cap = delay as usize + 1;
-            if delay > 0 && self.scratch[i].input_delay_line.capacity() < need_cap {
-                self.scratch[i].input_delay_line =
-                    crate::graph::DelayLine::with_capacity(need_cap);
-            }
+            retired_lines = std::mem::take(&mut new.input_delay_replacements);
         }
 
         // Recycle the superseded snapshot off the audio thread. The very first
-        // install has no prior song; its old schedule is empty and its old tempo
-        // map is the tiny default (a ~17-entry `Vec<f64>`), so this is a one-time
-        // drop on the first buffer at stream startup (before playback), not a
-        // steady-state RT free. Every subsequent install recycles off-thread.
-        if let Some(old_song) = old_song {
-            let recycled = CompiledRouting {
-                song: old_song,
-                schedule: old_schedule,
-                tempo_map: old_tempo,
-            };
-            // If the recycle ring is somehow full (a burst the receive loop
-            // hasn't drained — not reachable with human-paced edits), drop here
-            // as a last resort rather than leak.
-            let _ = self.routing_recycle_tx.push(recycled);
-        }
+        // install has no prior song and only tiny defaults (empty schedule /
+        // default tempo map / empty map Arc), so this is a one-time trivial
+        // drop at stream startup, not a steady-state RT free. If the recycle
+        // ring is somehow full (a burst the receive loop hasn't drained — not
+        // reachable with human-paced edits given the ring size), drop here as
+        // a last resort rather than leak.
+        let recycled = RtBundle {
+            song: old_song,
+            tempo_map: old_tempo,
+            schedule: old_schedule,
+            input_delay_replacements: retired_lines,
+            plugin_refs: old_refs,
+            worker: old_worker,
+        };
+        let _ = self.bundle_recycle_tx.push(recycled);
     }
 
-    /// Drain pending IPC commands. Called at the top of `process_buffer`.
-    /// Each command publishes a fresh snapshot into `EngineShared` via
-    /// `ArcSwap::store`, so RT readers see the new state on this very
-    /// buffer. Allocations only happen here when the daw_gui side
-    /// mutates the plugin graph (plugin add/remove) — outside the
-    /// steady-state RT path.
+    /// Drain pending preview commands. Called at the top of `process_buffer`.
     fn pump_commands(&mut self) {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             match cmd {
-                AudioCommand::OpenWorkerPool {
-                    bridge,
-                    worker_syncs,
-                } => {
-                    let n_sync_slots = worker_syncs.len() as u32;
-                    self.shared.worker_bridge.store(Some(Arc::new(bridge)));
-                    self.shared.worker_syncs.store(Arc::new(worker_syncs));
-                    // Spawn the audio-engine worker pool sized to the sync
-                    // slots (master owns slot 0, worker i owns slot i+1) so
-                    // every concurrent runner has a dedicated plugin-host
-                    // handshake pair.
-                    match AudioWorkerPool::new(n_sync_slots) {
-                        Ok(pool) => {
-                            self.shared.worker_pool.store(Some(Arc::new(pool)));
-                        }
-                        Err(e) => {
-                            tracing::error!(error = ?e, "AudioWorkerPool::new failed");
-                            self.shared.worker_pool.store(None);
-                        }
-                    }
-                    tracing::info!(
-                        n_sync_slots = self.shared.worker_syncs.load().len(),
-                        "audio engine bound to plugin-host worker pool"
-                    );
-                }
-                AudioCommand::OpenPluginShmem {
-                    plugin_id,
-                    plugin_ref,
-                    handle,
-                    track,
-                    index,
-                } => {
-                    // Snapshot-copy-mutate-publish so RT readers either
-                    // see the old map or the fully-populated new one,
-                    // never a partial state.
-                    let mut new_refs: HashMap<u32, PluginRef> =
-                        (**self.shared.plugin_refs.load()).clone();
-                    let mut new_slot: HashMap<(u32, u32), u32> =
-                        (**self.shared.slot_to_plugin_id.load()).clone();
-                    if let Some(stale) = new_slot.insert((track, index), plugin_id)
-                        && stale != plugin_id
-                        // only drop the displaced plugin from
-                        // plugin_refs if it isn't still mapped at ANOTHER index.
-                        // On a live move the displaced plugin keeps being
-                        // processed at its new device index (its OpenPluginShmem
-                        // at the new index arrives first); the new plugin then
-                        // displaces it here, but it must stay in plugin_refs.
-                        && !new_slot.values().any(|&pid| pid == stale)
-                    {
-                        new_refs.remove(&stale);
-                    }
-                    new_refs.insert(plugin_id, plugin_ref);
-                    self.shared.plugin_refs.store(Arc::new(new_refs));
-                    self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
-                    // The `handle` keeps the daw_audio-side shmem
-                    // mapping alive for the life of the AudioCommand;
-                    // immediately leak it to extend that lifetime to the
-                    // end of the process. ClosePluginShmem doesn't
-                    // currently reclaim the memory — see
-                    // `handle_open_plugin_shmem` for the original
-                    // leak-on-open pattern this mirrors.
-                    let leaked = Box::leak(Box::new(handle));
-                    let _ = leaked;
-                    tracing::info!(plugin_id, track, index, "plugin shmem registered");
-                }
-                AudioCommand::ClosePluginShmem { plugin_id } => {
-                    let mut new_refs: HashMap<u32, PluginRef> =
-                        (**self.shared.plugin_refs.load()).clone();
-                    let cur_slot = self.shared.slot_to_plugin_id.load();
-                    // Find the (track_id, device_index) that pointed at this
-                    // plugin_id BEFORE we remove the entry, so we can shift the
-                    // remaining higher device indices on the same track down by
-                    // one (mirrors the `Vec::remove` daw_gui / daw_plugin_host
-                    // did on `Track.devices`). v23 single-chain: the index
-                    // space is unified, so removing device i leaves device i+1
-                    // stranded under its old key; without this shift,
-                    // `process_track_owned` would look up index i → no hit →
-                    // silent (chain device dropped on deletion).
-                    let removed_key = cur_slot
-                        .iter()
-                        .find_map(|(k, v)| if *v == plugin_id { Some(*k) } else { None });
-                    let mut new_slot: HashMap<(u32, u32), u32> = (**cur_slot).clone();
-                    new_slot.retain(|_, pid| *pid != plugin_id);
-                    if let Some((track_id, removed_idx)) = removed_key {
-                        let entries: Vec<((u32, u32), u32)> = new_slot.drain().collect();
-                        for ((tid, idx), pid) in entries {
-                            let new_idx = if tid == track_id && idx > removed_idx {
-                                idx - 1
-                            } else {
-                                idx
-                            };
-                            new_slot.insert((tid, new_idx), pid);
-                        }
-                    }
-                    new_refs.remove(&plugin_id);
-                    self.shared.plugin_refs.store(Arc::new(new_refs));
-                    self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
-                    tracing::info!(plugin_id, "plugin shmem dropped + index shifted");
-                }
-                AudioCommand::ReorderChain { track, moves } => {
-                    // Re-key slot_to_plugin_id from old→new in one atomic
-                    // publish. Remove every old key FIRST (snapshot the pids),
-                    // then re-insert at the new keys, so a swap (0↔1) can't
-                    // clobber the second pid. `plugin_refs` is left untouched:
-                    // the plugins themselves don't move, only the
-                    // (track, device_index) → plugin_id addressing does — so no
-                    // plugin is ever transiently missing from the graph.
-                    let mut new_slot: HashMap<(u32, u32), u32> =
-                        (**self.shared.slot_to_plugin_id.load()).clone();
-                    // Pass 1: detach every moved plugin from its old key,
-                    // keeping the pids index-aligned with `moves`.
-                    let pids: Vec<Option<u32>> = moves
-                        .iter()
-                        .map(|&(from, _)| new_slot.remove(&(track, from)))
-                        .collect();
-                    // Pass 2: re-attach each at its new key.
-                    for (&(_, to), pid) in moves.iter().zip(pids) {
-                        if let Some(pid) = pid {
-                            new_slot.insert((track, to), pid);
-                        }
-                    }
-                    self.shared.slot_to_plugin_id.store(Arc::new(new_slot));
-                    tracing::info!(track, n = moves.len(), "slot_to_plugin_id reordered");
-                }
-                AudioCommand::PreviewNoteOn {
+                EngineCommand::PreviewNoteOn {
                     track,
                     pitch,
                     velocity,
@@ -716,7 +604,7 @@ impl LocalState {
                         }
                     }
                 }
-                AudioCommand::PreviewNoteOff { track, pitch } => {
+                EngineCommand::PreviewNoteOff { track, pitch } => {
                     if let Some(s) = self.scratch.get_mut(track) {
                         let pp = &mut s.state.pending_preview;
                         if pp.len() < pp.capacity() {
@@ -731,10 +619,9 @@ impl LocalState {
         }
     }
 
-    /// Render `frames` of master output into `master_l/r`. Walks the
-    /// current `Song`, dispatching every plugin in every track's chain
-    /// via the worker pool. Also publishes per-track peak meter values
-    /// into the shared `AudioBridge` so the GUI mixer strips animate.
+    /// Render `frames` of master output into `master_l/r`. Transport 状態を
+    /// 進め、live/export 共通の `render_master_buffer` で描画し、metronome
+    /// (monitoring 専用) を重ね、meters / mod scalars を publish する。
     pub fn process_buffer(
         &mut self,
         shared: &SharedState,
@@ -744,16 +631,19 @@ impl LocalState {
     ) {
         self.pump_commands();
 
-        // Refresh the cached routing schedule before the dispatch starts
-        // so the master mix step sees the right node order. `refresh_schedule`
-        // is a no-op when the song Arc hasn't changed.
-        self.refresh_schedule();
-        // The song now travels with the routing snapshot installed above, so the
-        // RT reads it from `cached_song` (consistent with `cached_schedule`)
-        // rather than re-loading the separately-published `shared.song`. The
-        // `Arc` clone is a wait-free refcount bump (no heap), releasing the
-        // borrow so the hot path can still take `&mut self` below.
+        // Install the newest off-thread snapshot (song / schedule /
+        // plugin_refs / worker rig) before the dispatch starts.
+        self.refresh_bundle();
         let song_snapshot = self.cached_song.clone();
+
+        // recv loop が schedule compile の buffer_frames (leaf sidechain の
+        // 1-buffer 補償量) に使う実測値。変化時のみ store (steady state では
+        // load 1 回で済む)。
+        if self.shared.last_buffer_frames.load(Ordering::Relaxed) != frames as u32 {
+            self.shared
+                .last_buffer_frames
+                .store(frames as u32, Ordering::Release);
+        }
 
         let n = frames;
         self.master_l[..n].fill(0.0);
@@ -768,7 +658,7 @@ impl LocalState {
         let looping = shared.looping.load(Ordering::Acquire);
         let metronome_enabled = shared.metronome_enabled.load(Ordering::Acquire);
 
-        // A3 freewheel: while the export thread holds the audio
+        // freewheel export: while the export thread holds the audio
         // resources, write silence and skip dispatch so the worker pool
         // and plugin instances are exclusively driven by the export
         // render loop. Publish `live_parked` so the export thread knows the
@@ -780,12 +670,9 @@ impl LocalState {
         }
         self.shared.live_parked.store(false, Ordering::Release);
 
-        // Phase 7 B4 Step C (2026-05-13): count-in モード — preroll > 0 なら
-        // 通常 dispatch / clip render を skip し、 metronome のみ render +
-        // preroll counter を deduct + audio_bridge に mirror。 0 到達で通常
-        // 再生に戻る (= 次 buffer で本 if が false になり、 既存 dispatch
-        // 経路に進む)。 GUI 側 on_tick が audio_bridge の preroll mirror を
-        // poll、 0 検出で midi_recording_pending → midi_recording 遷移。
+        // Phase 7 B4 Step C: count-in モード — preroll > 0 なら通常 dispatch /
+        // clip render を skip し、 metronome のみ render + preroll counter を
+        // deduct + audio_bridge に mirror。 0 到達で通常再生に戻る。
         let preroll =
             self.shared.preroll_remaining_samples.load(Ordering::Acquire);
         if preroll > 0 {
@@ -829,9 +716,7 @@ impl LocalState {
         // buffer 末 advance store と同一 atomic を別スレッドから書く race になり、
         // Stop 直後 (in-flight buffer がまだ playing で advance する瞬間) に開始
         // 位置への巻き戻しが上書きされて停止位置から再生されてしまう。`swap` で
-        // 消費する (多重要求は last-wins)。ここで `playhead` を書き換えておけば、
-        // 下の `playhead` load → seek 検出 (`playhead != last_known_playhead`) が
-        // `playhead_beats` を再同期する。
+        // 消費する (多重要求は last-wins)。
         let pending_seek = shared.pending_seek.swap(NO_PENDING_SEEK, Ordering::AcqRel);
         if pending_seek != NO_PENDING_SEEK {
             shared.playhead.store(pending_seek, Ordering::Release);
@@ -846,11 +731,7 @@ impl LocalState {
                 self.playing = true;
                 // Play は **現在の playhead からそのまま再生する** (頭出しは
                 // しない)。「どこから再生するか」「停止でどこへ戻すか」は GUI 側
-                // が所有する (モデル A = Pro Tools / Ableton 流の
-                // 「停止すると再生を押した位置に戻る」)。GUI は play() 時の
-                // playhead を origin として記録し、stop() で SeekTo を送って
-                // engine カーソルを origin に揃える。engine はその SeekTo
-                // (= pending_seek 経由で playhead に反映済み) をそのまま使う。
+                // が所有する (モデル A = Pro Tools / Ableton 流)。
                 for s in self.scratch.iter_mut() {
                     s.state.active_notes.clear();
                     s.state.pending_offs.clear();
@@ -869,16 +750,11 @@ impl LocalState {
         }
         let playing = self.playing;
 
-        // Reuse the snapshot we took for `refresh_schedule` so the
-        // dispatch sees the same song the schedule was compiled from.
         let song_ref = song_snapshot.as_deref();
         let playhead = shared.playhead.load(Ordering::Acquire);
 
         // Phase 4 Step C-2: 「現在 recording 中の lane」 を SharedState から
-        // 1 buffer 分の lifetime で借りる。 dispatch / process_track_owned /
-        // run_group_fx_chain に &HashSet で渡す。 `_recording_lanes_g` の
-        // Guard が生きている間は Arc が drop されないので audio thread から
-        // 安全に deref できる。
+        // 1 buffer 分の lifetime で借りる。
         let recording_lanes_g = shared.recording_lanes.load();
         let recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)> =
             &recording_lanes_g;
@@ -886,30 +762,16 @@ impl LocalState {
         // Phase 5 Step 5.2: seek 検出 + playhead_beats 同期。 前 buffer 末で
         // 記録した `last_known_playhead` と current playhead を比較し、 一致
         // していなければ (= IPC SeekTo / Play edge / loop wrap / 起動直後)
-        // 過去の tempo 履歴を再生できないので、 song.bpm を constant とした
-        // linear 推定で playhead_beats を再初期化する。
+        // tempo map で正確に beat を逆算する (A10 r.md #8)。
         if playhead != self.last_known_playhead {
-            // A10 (r.md #8): seek 着地点の beat を tempo map で正確に逆算する
-            // (旧 constant-bpm 線形推定は tempo automation 中に着地 beat がズレた)。
-            // map は cached_song から構築済 (song=None / 起動直後は default 120bpm map
-            // = 線形に縮退)。
             self.playhead_beats = self.tempo_map.samples_to_beat(playhead, sample_rate);
         }
         // 今 buffer の effective bpm を SongTempo lane から評価する。
         // song = None なら 120.0 default、 SongTempo lane 無しなら song.bpm。
         // 当該 buffer 内では tempo 定数として扱う (= sub-buffer の tempo
         // change は scope 外、 1 buffer = ~5..20ms なので user 体感には
-        // 影響なし)。
-        //
-        // Phase 5 Step 5.2 follow-up (2026-05-13): SongTempo lane が
-        // recording 中 (= GUI 側で transport BPM input が gesture begin、
-        // `MainToChild::SetRecordingLanes` で set に追加) なら curve eval を
-        // **skip** し、 `song.bpm` constant fallback を維持する。 これで
-        // transport BPM input drag が即時に audio に反映され、 直前 frame
-        // に curve へ記録された point との二重反映 (= 階段状カクつき / 微小
-        // ズレ) を防ぐ。 mixer fader の Volume / Pan と同 idiom
-        // (`fill_track_param_ramps` の `recording_lanes.contains(...)` 分岐
-        // 参照)。 set は 1 buffer の lifetime で borrow 済みなので RT 安全。
+        // 影響なし)。SongTempo lane が recording 中なら curve eval を skip し
+        // `song.bpm` constant fallback を維持する (Volume / Pan と同 idiom)。
         let tempo_recording = recording_lanes.contains(&(
             common::model::MASTER_TRACK_ID,
             common::model::AutomationTarget::SongTempo,
@@ -920,10 +782,8 @@ impl LocalState {
                 let base = common::automation::evaluate_song_tempo(s, self.playhead_beats);
                 // B11 (r.md #8): song-level modulation (LFO/Random/MSEG/follower →
                 // `SongTempo`) を base tempo に適用。 `mod_scalars_snapshot` は前
-                // buffer 値 (followers は元々 1-buffer lag、 generator も 1 buffer
-                // 遅延だが tempo は緩慢なので可聴影響なし)。 `SongTempo` を target に
-                // する song_mod_routing が無ければ offset 0 = no-op。 RT-safe
-                // (fill_track_param_ramps と同じ apply_modulation_with_scalars)。
+                // buffer 値 (followers は元々 1-buffer lag)。 `SongTempo` を target に
+                // する song_mod_routing が無ければ offset 0 = no-op。 RT-safe。
                 common::automation::apply_modulation_with_scalars(
                     s,
                     &common::model::AutomationTarget::SongTempo,
@@ -934,29 +794,16 @@ impl LocalState {
             }
             None => 120.0,
         };
-        // user の loop button 実状態 (= engine が実際に wrap する条件)。
-        // plugin transport の IS_LOOP_ACTIVE / looping field に渡す。
-        // (buffer 冒頭で snapshot 済の `looping` ローカルを使う。)
 
         // Phase 5 follow-up (granular DSP click 抑制) / r.md #6 (base bpm follow):
         // **絶対** current_bpm を LP smoothing して Stretch granular path に渡す。
-        // render 側は `tempo_follow_ratio(stretch_ratio, smoothed_current_bpm,
-        // nominal_bpm)` で source 進度を出す。 nominal は per-event の compile時
-        // song.bpm なので、 base bpm を変えても (= song.bpm が動いても) 追従する
-        // (= 旧実装は `current_bpm / song.bpm` を平滑化しており、 song.bpm 自身が
-        // 動くと比が 1.0 に戻って base bpm 変更に追従しなかった)。 song = None なら
-        // 安全な 120 BPM。 LP coef は ~50ms time constant 相当の固定値 (buffer =
-        // 11.6 ms @ 44100/512 で coef ~ 0.3)、 完全な per-event grain-trigger
-        // lock-in 無しでも一般的な tempo 変化では click が顕著に低減する。
+        // Play edge / seek と同 frame で target に snap-reset し、 旧 tempo 履歴を
+        // 持ち越さない。
         let target_current_bpm = if song_ref.is_some() {
             f64::from(current_bpm)
         } else {
             120.0
         };
-        // Play edge 検出 (= last_known_playhead != playhead で seek) と同 frame
-        // で smoothed を target に snap-reset し、 旧 tempo 履歴を持ち越さない。
-        // これで Stop → 別位置から Play した直後でも granular が新 tempo に
-        // 即座に追随する (= LP lag を抑える)。
         if playhead != self.last_known_playhead {
             self.smoothed_current_bpm = target_current_bpm;
         } else {
@@ -966,17 +813,10 @@ impl LocalState {
         }
 
         if let Some(song) = song_ref {
-            let any_solo = song.tracks.iter().any(|t| t.solo);
             let n_tracks = song.tracks.len().min(MAX_TRACKS);
 
-            // Snapshot the wait-free shared state once for this buffer.
-            // Guards stay live until the end of the call so the workers
-            // can safely deref them via the publish pointers.
-            let plugin_refs_g = self.shared.plugin_refs.load();
-            let slot_map_g = self.shared.slot_to_plugin_id.load();
-            let worker_syncs_g = self.shared.worker_syncs.load();
-            let pool_g = self.shared.worker_pool.load();
-            // PR6: audio clip renderer snapshot for this buffer.
+            // PR6: audio clip renderer snapshot for this buffer. Guard stays
+            // live until the end of the call so workers can safely deref it.
             let audio_renderer_g = self.shared.audio_clip_renderer.load();
             let audio_renderer: &AudioClipRenderer = &audio_renderer_g;
 
@@ -985,7 +825,6 @@ impl LocalState {
             // param modulation, reusing the buffer (no per-buffer alloc). The
             // EnvelopeFollow nodes for THIS buffer run post-dispatch, so param
             // events see the prior buffer's env — a ~1-buffer (block-rate) lag.
-            // follower の env (= 前 buffer 値、 上記の lag) に加え、
             // generator (LFO/Random/MSEG/Steps) は `song_beat`/`song_secs` から
             // この buffer の値を直接算出する (状態レス・lag なし、 決定論)。
             self.mod_scalars_snapshot.clear();
@@ -1001,123 +840,35 @@ impl LocalState {
                 self.mod_scalars_snapshot.push(v);
             }
 
-            // Fan the per-track work out across the audio worker pool
-            // when one is bound; otherwise fall back to serial dispatch
-            // through `worker_syncs[0]` (still correct, just slower).
-            if let Some(pool) = pool_g.as_deref() {
-                pool.dispatch_and_wait(
-                    Some(song),
-                    &mut self.scratch[..n_tracks],
-                    &plugin_refs_g,
-                    &slot_map_g,
-                    audio_renderer,
-                    &worker_syncs_g,
-                    &mut self.master_l[..n],
-                    &mut self.master_r[..n],
-                    sample_rate,
-                    n as u32,
-                    playing,
-                    any_solo,
-                    &self.cached_schedule.input_delay_per_track,
-                    recording_lanes,
-                    current_bpm,
-                    self.playhead_beats,
-                    self.smoothed_current_bpm,
-                    looping,
-                    &self.mod_scalars_snapshot,
-                );
-            } else {
-                let worker_sync = worker_syncs_g.first();
-                for track_idx in 0..n_tracks {
-                    let song_track = &song.tracks[track_idx];
-                    let scratch = &mut self.scratch[track_idx];
-                    let input_delay = self
-                        .cached_schedule
-                        .input_delay_per_track
-                        .get(track_idx)
-                        .copied()
-                        .unwrap_or(0);
-                    process_track_owned(
-                        track_idx as u32,
-                        song_track,
-                        scratch,
-                        &plugin_refs_g,
-                        &slot_map_g,
-                        Some(audio_renderer),
-                        worker_sync,
-                        sample_rate,
-                        n as u32,
-                        playing,
-                        Some(song),
-                        any_solo,
-                        input_delay,
-                        recording_lanes,
-                        current_bpm,
-                        self.playhead_beats,
-                        self.smoothed_current_bpm,
-                        looping,
-                        &self.mod_scalars_snapshot,
-                    );
-                }
-            }
-
-            // Walk the cached schedule to (a) mix children → group
-            // scratches, (b) run each group's audio fx + strip, (c) sum
-            // top-level scratches into the master bus. The legacy
-            // `reduce_master` call is replaced by this graph-driven
-            // execution so groups + future PDC + sidechain hops can plug
-            // in by extending `NodeOp` rather than this function.
-            execute_schedule_post_dispatch(
+            // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
+            // master fx → master gain。
+            let master_gain =
+                f32::from_bits(self.shared.master_gain.load(Ordering::Relaxed));
+            render_master_buffer(
+                song,
                 &mut self.cached_schedule,
                 &mut self.scratch[..MAX_TRACKS],
+                &self.plugin_refs,
+                self.worker.as_deref(),
+                audio_renderer,
                 &mut self.master_l[..n],
                 &mut self.master_r[..n],
-                n,
-                song,
-                &plugin_refs_g,
-                &slot_map_g,
-                worker_syncs_g.first(),
                 sample_rate,
                 n as u32,
                 playing,
-                any_solo,
+                looping,
                 recording_lanes,
                 current_bpm,
                 self.playhead_beats,
-                looping,
+                self.smoothed_current_bpm,
                 &self.mod_scalars_snapshot,
+                master_gain,
             );
 
-            // master bus fx chain。 全 track mix 後・metronome 前に直列 process
-            // する (= metronome guide は master fx を通さない、 track fx と同じ
-            // worker dispatch idiom)。 master_fx_chain が空なら即 return で CPU 0。
-            process_master_fx_chain(
-                &song.master_fx_chain,
-                &mut self.master_l[..n],
-                &mut self.master_r[..n],
-                &plugin_refs_g,
-                &slot_map_g,
-                worker_syncs_g.first(),
-                sample_rate,
-                n as u32,
-                playing,
-                Some(song),
-                current_bpm,
-                self.playhead_beats,
-                looping,
-                recording_lanes,
-                &self.mod_scalars_snapshot,
-            );
-
-            // Phase 7 B3 (2026-05-13): metronome click を master mix に追加。
-            // export 中 / playing でない / metronome_enabled false のいずれ
-            // でも skip (= mix 自体が走らないので CPU 0)。 enable 時は beat
-            // 境界 (current_bpm + tsig 由来) ごとに voice を trigger、 既存
-            // voice があれば overwrite (= 短 decay 1 voice だけ持続、 業界
-            // 標準の click)。 master mix の最後に重ねる (= track の mute /
-            // solo / volume の影響を受けない、 「常に聞こえる guide」 が
-            // metronome の規範動作)。
-            if !export_running && playing && metronome_enabled {
+            // metronome click を master mix に重ねる (monitoring 専用 — export
+            // 経路には存在しない)。 master mix の最後に重ねる (= track の mute /
+            // solo / volume / master fx の影響を受けない「常に聞こえる guide」)。
+            if playing && metronome_enabled {
                 let tsig_num = i64::from(song.time_sig.0.max(1));
                 render_metronome(
                     &mut self.metronome_voice,
@@ -1155,10 +906,6 @@ impl LocalState {
                 bridge.set_mod_scalar(slot, v);
             }
 
-            // Debug heartbeat: once per second of audio time, dump the
-            // engine's view of the world so we can tell whether the
-            // dispatch reached plugin.process(), what came back, and
-            // why master might be silent.
             // Debug-only heartbeat. RT 規約上 audio thread での tracing は
             // 望ましくないが、開発時に engine 状態を可視化できる利点が
             // 大きいので debug ビルド限定で残す。release では消える。
@@ -1182,21 +929,24 @@ impl LocalState {
                             .take(n_tracks)
                             .map(|s| (s.peak_l, s.peak_r, s.effective_mute)),
                     );
-                    self.heartbeat_plugin_ids.clear();
-                    self.heartbeat_plugin_ids
-                        .extend(plugin_refs_g.keys().copied());
-                    self.heartbeat_slot_keys.clear();
-                    self.heartbeat_slot_keys
-                        .extend(slot_map_g.iter().map(|(k, v)| (*k, *v)));
+                    self.heartbeat_device_ids.clear();
+                    self.heartbeat_device_ids
+                        .extend(self.plugin_refs.keys().copied());
                     tracing::info!(
                         playing,
                         playhead,
                         master_peak,
                         track_peaks = ?self.heartbeat_track_peaks,
-                        plugin_ids = ?self.heartbeat_plugin_ids,
-                        slot_keys = ?self.heartbeat_slot_keys,
-                        n_workers = worker_syncs_g.len(),
-                        worker_pool = pool_g.is_some(),
+                        device_ids = ?self.heartbeat_device_ids,
+                        n_sync_slots = self
+                            .worker
+                            .as_ref()
+                            .map(|rig| rig.slots.len())
+                            .unwrap_or(0),
+                        worker_pool = self
+                            .worker
+                            .as_ref()
+                            .is_some_and(|rig| rig.pool.is_some()),
                         audio_clip_n_events = audio_renderer.schedule.len(),
                         audio_clip_n_sources = audio_renderer.sources.len(),
                         "engine heartbeat"
@@ -1240,17 +990,8 @@ impl LocalState {
                 };
                 if let Some(start) = wrap_to {
                     new_ph = start;
-                    // Phase 5 Step 5.2 bug fix: loop wrap 時に playhead_beats
-                    // を sample-domain new_ph に合わせて再計算する (= 上の
-                    // `+=` で advance させた値は loop end 直後の beat 位置
-                    // であって、 loop start に rewind されない)。 次 buffer
-                    // の seek 検知では `playhead == last_known_playhead` で
-                    // 反応しないため、 ここで直接 reset する必要がある。
-                    // current_bpm を constant とした linear 推定で OK (= tempo
-                    // automation 中の loop boundary は MVP scope 外で、 通常
-                    // の constant tempo loop なら精度問題なし)。
-                    // A10 (r.md #8): loop start の beat も tempo map で正確に逆算
-                    // (旧 constant current_bpm 線形推定は tempo automation 中の loop
+                    // A10 (r.md #8): loop start の beat も tempo map で正確に
+                    // 逆算 (constant-bpm 線形推定は tempo automation 中の loop
                     // boundary でズレた)。
                     self.playhead_beats = self.tempo_map.samples_to_beat(new_ph, sample_rate);
                 } else {
@@ -1267,1857 +1008,100 @@ impl LocalState {
             // SeekTo は process_buffer 冒頭の pending_seek consume で (audio
             // thread 自身が) shared.playhead に反映済みなので、その値で
             // last_known_playhead を同期し、次 Play 開始時の seek 検出を
-            // 誤発火させない (= stop 中の seek は位置を変えるだけで
-            // playhead_beats 再計算が必要)。
+            // 誤発火させない。
             self.last_known_playhead = playhead;
         }
     }
 }
 
-/// Phase 5 Step 5.3 (`docs/plan_automation.md` §10): populate the
-/// transport fields on `ProcessData` from the current `Song` so the
-/// plugin host can build a `clap_event_transport` for each
-/// `plugin.process()` call. `song = None` (engine init / no song
-/// loaded) leaves the default constants set by `ProcessData::empty()`
-/// (120 BPM / 4/4 / no loop).
-/// Phase 5 Step 5.2: `effective_bpm` is the SongTempo lane evaluated
-/// at the buffer-start beat (= what the plugin sees as `clap_event_transport
-/// .tempo`)。 引数で受け取るのは song-domain の `song.bpm` (= constant
-/// base BPM) と区別するため。
-pub fn set_pd_transport(
-    pd: &mut common::process_data::ProcessData,
-    song: Option<&Song>,
-    effective_bpm: f32,
-    // 積分済みの真の拍位置 (tempo automation を考慮)。 plugin host が一定
-    // テンポ逆算する代わりにこれを直接 song_pos_beats として使う。
-    song_pos_beats: f64,
-    // user の loop button 実状態 (= `shared.looping`)。 region 有無の
-    // heuristic ではなく engine が実際に wrap している条件を渡す。
-    looping: bool,
-) {
-    let Some(song) = song else { return };
-    pd.bpm = effective_bpm.max(1.0);
-    pd.tsig_num = song.time_sig.0 as u16;
-    pd.tsig_denom = song.time_sig.1 as u16;
-    pd.loop_start_beats = song.loop_start_beat;
-    pd.loop_end_beats = song.loop_end_beat;
-    pd.song_pos_beats = song_pos_beats;
-    // 実 loop トグル状態を渡す。 plugin host は IS_LOOP_ACTIVE 判定で
-    // 別途 `loop_end_beats > loop_start_beats` (= region 定義済) と AND する。
-    pd.looping = if looping { 1 } else { 0 };
-}
-
-/// Render one track's contribution into its `TrackScratch`. Walks the
-/// MIDI FX → instrument (or Vocal) → audio FX chain, dispatches every
-/// plugin via the assigned worker pair, then applies the mixer strip
-/// (equal-power pan + volume + mute/solo). The post-fader audio ends
-/// up in `scratch.track_l/r` along with the peak meter info.
-///
-/// Master accumulation into the bus happens **outside** this function
-/// (`reduce_master`) so concurrent workers never race on the same
-/// `master_{l,r}[i]`.
-///
-/// `worker_sync` may be `None` if `OpenWorkerPool` hasn't arrived yet
-/// — in that case plugin chains are skipped entirely (silent track).
-///
-/// `input_delay_samples`: PR4.5 sidechain plugin-internal alignment. If
-/// non-zero, the track's main signal (vocal / instrument output) is
-/// delayed by that many samples **before** the audio FX chain runs.
-/// The caller (engine main loop / export) passes
-/// `Schedule::input_delay_per_track[track_idx]`, which compile_schedule
-/// has set to `max(path_latency(src) for src in fx_chain[*].aux_inputs[*].tap)`.
-/// 0 = no delay (the common case).
-#[allow(clippy::too_many_arguments)]
-pub fn process_track_owned(
-    track_idx: u32,
-    song_track: &Track,
-    scratch: &mut TrackScratch,
-    plugin_refs: &HashMap<u32, PluginRef>,
-    slot_to_plugin_id: &HashMap<(u32, u32), u32>,
-    audio_renderer: Option<&AudioClipRenderer>,
-    worker_sync: Option<&WorkerSyncRef>,
-    sample_rate: u32,
-    frames: u32,
-    playing: bool,
-    song: Option<&Song>,
-    any_solo: bool,
-    input_delay_samples: u32,
-    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    // Phase 5 Step 5.2: 当該 buffer の effective bpm (= SongTempo lane 評価
-    // or song.bpm fallback)。 set_pd_transport / fill_track_param_ramps /
-    // fill_pd_param_events の sample-to-beat 変換に使う。
-    current_bpm: f32,
-    // Phase 5 follow-up (MIDI tempo follow): buffer 開始時の累積 beat-domain
-    // playhead。 collect_events_for_buffer に渡して beat-domain で note 配置
-    // を判定する。 変動 tempo でも note 位置が正しく追随する。
-    playhead_beats: f64,
-    // Phase 5 follow-up (granular DSP click 抑制) / r.md #6: LP smoothed な
-    // **絶対** current_bpm (BPM 単位)。 audio_clip_renderer::render_audio_events
-    // に渡して、 Stretch mode が `tempo_follow_ratio(stretch_ratio,
-    // smoothed_current_bpm, nominal_bpm)` で source 進度を計算するのに使う。
-    // LocalState 側で per-buffer に 1-pole LP で更新される値。
-    smoothed_current_bpm: f64,
-    // user の loop button 実状態 (= `shared.looping`)。 set_pd_transport に渡す。
-    looping: bool,
-    // docs/plan_modulation.md §5: per-`ModSource` follower scalars (block-rate
-    // snapshot, slot = `Song::mod_sources` position). fill_track_param_ramps /
-    // fill_pd_param_events に渡して volume/pan/plugin param を follower 変調する。
-    // 空なら変調なし (= 既存挙動と byte 同一)。
-    mod_scalars: &[f32],
-) {
-    let n = frames as usize;
-
-    // Tracks that have children (i.e. behave as a "group" / folder)
-    // are handled by the post-dispatch schedule walk: the children's
-    // outputs are mixed into this track's scratch by a `Mix` op, then
-    // `ProcessGroupFx` applies the audio fx_chain and strip. Skip the
-    // sequencer / midi_fx / instrument stages here so the dispatch
-    // doesn't smear plugin output into a buffer the schedule is about
-    // to overwrite. PR2 phase 1 keeps "group ignores its own clips /
-    // instrument" semantics; phase 5 will switch to Reaper's folder
-    // model where the group's own clips also feed the post-fx mix.
-    // パラアウト (docs/plan_paraout.md) + pass-1 bus classification.
-    // A group / return / parallel-out-dest track is summed + FX'd in pass 2
-    // (`run_group_fx_chain`), so it must NOT run its device chain here in pass 1
-    // — doing so would double-process stateful FX (a return's delay / reverb
-    // would advance at 2× and any aux-dest EQ would see a spurious silent
-    // block). This also fixes a latent bug where returns (incoming sends, no
-    // children) were not skipped before paraout existed.
-    //
-    // EXCEPTION — group-with-instrument: a group whose own device chain has a
-    // routed aux output (a multi-out instrument feeding child tracks that sum
-    // back into it). Its **instrument prefix** `[0..split]` runs here in pass 1
-    // to produce the track's own main signal AND fill `buffer_aux_out` for the
-    // children; the **suffix FX** `[split..]` + strip run in pass 2 on the
-    // summed bus (own main + children). `device_end` bounds the pass-1 device
-    // loop; `skip_strip` defers the volume/pan strip + pre-fader/pre-fx
-    // snapshots to pass 2.
-    let (device_end, skip_strip) = match song {
-        Some(s) => {
-            let id = song_track.id;
-            let has_children = s.track_has_children(id);
-            let split = song_track.paraout_split_device();
-            if has_children && split.is_some() {
-                (split.unwrap_or(0) as usize, true)
-            } else if has_children
-                || s.track_receives_send(id)
-                || s.track_receives_paraout(id)
-            {
-                scratch.track_l[..n].fill(0.0);
-                scratch.track_r[..n].fill(0.0);
-                scratch.peak_l = 0.0;
-                scratch.peak_r = 0.0;
-                scratch.effective_mute = false;
-                return;
-            } else {
-                (song_track.devices.len(), false)
-            }
-        }
-        None => (song_track.devices.len(), false),
-    };
-
-    // ---- Sequencer: assemble this buffer's MIDI bus ----
-    scratch.midi_bus_a.clear();
-    for &k in &scratch.state.pending_offs {
-        // pending_offs は stuck note flush 用なので note_id 不明 → 0
-        // (= "未指定" 相当)。 builtin plugin は voice cleanup で key 一致
-        // で停止するので、 note_id 0 でも実害なし。
-        scratch.midi_bus_a.push(TimedNoteEvent {
-            time: 0,
-            event: NoteTransition::Off { note_id: 0, key: k },
-        });
-    }
-    scratch.state.pending_offs.clear();
-    // 鍵盤レーン click のプレビュー note (engine の pump_commands が該当 track の
-    // pending_preview に積む)。 transport に関係なく frame 0 で 1 回注入する
-    // (instrument dispatch は playing で gate されないので停止中でも発音する)。
-    // collect_events_for_buffer より前に push し、 playing 時は同 buffer の
-    // sort (CLAP の time 昇順 / 同 time は Off→On) に乗せる。
-    for &ev in &scratch.state.pending_preview {
-        scratch.midi_bus_a.push(TimedNoteEvent { time: 0, event: ev });
-    }
-    scratch.state.pending_preview.clear();
-    if playing {
-        collect_events_for_buffer(
-            song,
-            track_idx,
-            sample_rate,
-            playhead_beats,
-            current_bpm,
-            frames,
-            &mut scratch.midi_bus_a,
-            &mut scratch.state.active_notes,
-        );
-    }
-
-    let track_id = song_track.id;
-
-    // ---- Track audio output (cleared every buffer) ----
-    // 毎 buffer ゼロから組み立てる。直後に audio clip を加算し、その後 device chain が
-    // port 構成に従って audio を上書き / 加算していく。
-    scratch.track_l[..n].fill(0.0);
-    scratch.track_r[..n].fill(0.0);
-
-    // PR-V4: 旧 VOICEVOX 専用 vocal block を削除。 vocal track は単一チェーン
-    // 中の builtin VOICEVOX plugin (audio_out を持つ音源) として処理される。
-    // daw_gui の migration が project load 時に旧 vocal tracks を builtin path
-    // に移行する。
-
-    // ---- v23 single-chain: serial port connection (Reaper 流) -----------
-    // 役割判定はしない。track の MIDI (notes, midi_bus_a) と audio (clips) を
-    // 起点に、各 device を順に処理し、device の port 構成に従って MIDI / audio を
-    // 接続する。先に audio source (audio clip + sidechain alignment delay) を
-    // track_l/r に入れてからチェーンを通す (clips → エフェクトで処理 / 音源出力に
-    // 加算される)。playing == false では audio clip を mix しない (Stop で鳴り
-    // 続けるバグ防止)。
-    if playing && let Some(renderer) = audio_renderer {
-        crate::audio_clip_renderer::render_audio_events(
-            renderer,
-            track_idx as usize,
-            &mut scratch.track_l[..n],
-            &mut scratch.track_r[..n],
-            playhead_beats,
-            current_bpm,
-            sample_rate,
-            frames,
-            smoothed_current_bpm,
-            &mut scratch.granular_rings,
-            &mut scratch.repitch_accum,
-        );
-    }
-    // PR4.5 sidechain plugin-internal alignment: main 信号を遅延させて sidechain
-    // source と musical time を揃える。capacity は edit-time 確保済 (RT で再確保なし)。
-    if input_delay_samples > 0 {
-        scratch.input_delay_line.step_in_place(
-            &mut scratch.track_l[..n],
-            &mut scratch.track_r[..n],
-            input_delay_samples as usize,
-        );
-    }
-
-    // docs/plan_modulation_followups.md §1: snapshot the **pre-FX** signal (the
-    // raw audio clip / input before the device chain) for any PreFx tap / mod
-    // source. Guarded so untouched tracks skip the memcpy — RT-safe. For a
-    // group-with-instrument prefix (`skip_strip`) the meaningful pre-FX tap is
-    // the summed bus before the suffix FX, captured in pass 2
-    // (`run_group_fx_chain`), so skip the pass-1 capture here.
-    if !skip_strip && song.is_some_and(|s| track_needs_prefx_snapshot(s, track_id)) {
-        scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
-        scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
-    }
-
-    // パラアウト: a group-with-instrument runs only its prefix `[0..device_end]`
-    // in pass 1; a leaf runs its whole chain (`device_end == devices.len()`).
-    for i in 0..device_end {
-        // chain map の key は (track_id, device_index)。 song.tracks の Vec
-        // position に依存しないので、 group 化や drag&drop reorder で track
-        // index が shift しても plugin lookup が壊れない。
-        let key = (track_id, i as u32);
-        let ports = song_track.devices[i].ports;
-        let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
-            continue;
-        };
-        let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
-            continue;
-        };
-        let Some(ws) = worker_sync else { continue };
-
-        let pd = plugin_ref.data_mut();
-        pd.prepare();
-        pd.frames = frames;
-        pd.playing = if playing { 1 } else { 0 };
-        pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
-        // ---- inputs: device の port を持つものだけ現在のバスを渡す ----
-        // M1 (r.md #8): note を param automation より **先に** push する。 B4 の
-        // sub-buffer param automation は events_in (MAX_EVENTS=256) を最大
-        // frames/64 event/lane 消費するので、 param を先に積むと大量 automation 時に
-        // 後続の NoteOff が溢れて drop → ハングノートになる。 note を先に確保すれば
-        // 溢れるのは automation 側だけ (= 音は詰まらず automation が step するのみ)。
-        // plugin host は event を time 順に sort するので発音順序は不変。
-        if ports.has_note_input {
-            for ev in &scratch.midi_bus_a {
-                match ev.event {
-                    NoteTransition::On { note_id, key, velocity } => {
-                        pd.push_note_on(ev.time, key, velocity, 0, note_id)
-                    }
-                    NoteTransition::Off { note_id, key } => {
-                        pd.push_note_off(ev.time, key, 0, note_id)
-                    }
-                }
-            }
-        }
-        if let Some(song) = song {
-            crate::automation::fill_pd_param_events(
-                pd,
-                song,
-                track_id,
-                i as u32,
-                sample_rate,
-                f64::from(current_bpm),
-                playhead_beats,
-                frames,
-                recording_lanes,
-                mod_scalars,
-            );
-        }
-        if ports.has_audio_input {
-            pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
-            pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
-        }
-        if let Err(_e) = ws.dispatch(plugin_id) {
-            // RT path: skip on dispatch failure without per-buffer I/O.
-            #[cfg(debug_assertions)]
-            tracing::error!(error = ?_e, plugin_id, "device dispatch failed");
-            continue;
-        }
-        // ---- outputs ----
-        // note 出力を持つなら出力 MIDI で次段のバスを置き換える (無ければ素通し)。
-        if ports.has_note_output {
-            scratch.midi_bus_b.clear();
-            let n_out = pd.n_events_out as usize;
-            for ev in &pd.events_out[..n_out.min(pd.events_out.len())] {
-                let timed = match ev.kind {
-                    EventKind::NoteOn => TimedNoteEvent {
-                        time: ev.time,
-                        event: NoteTransition::On {
-                            note_id: ev.note_id,
-                            key: ev.key,
-                            velocity: ev.velocity,
-                        },
-                    },
-                    EventKind::NoteOff => TimedNoteEvent {
-                        time: ev.time,
-                        event: NoteTransition::Off {
-                            note_id: ev.note_id,
-                            key: ev.key,
-                        },
-                    },
-                    EventKind::ParamValue | EventKind::ParamMod => continue,
-                };
-                scratch.midi_bus_b.push(timed);
-            }
-            scratch.midi_bus_b.sort_unstable_by_key(|e| e.time);
-            std::mem::swap(&mut scratch.midi_bus_a, &mut scratch.midi_bus_b);
-        }
-        // audio 出力を持つなら: audio 入力も持つ機 (= エフェクト) は処理結果で
-        // 置き換え、入力を持たない機 (= 音源/生成器) はソースとして加算する。
-        if ports.has_audio_output {
-            if ports.has_audio_input {
-                scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
-                scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
-            } else {
-                for j in 0..n {
-                    scratch.track_l[j] += pd.buffer_out[0][j];
-                    scratch.track_r[j] += pd.buffer_out[1][j];
-                }
-            }
-        }
-    }
-
-    // パラアウト (docs/plan_paraout.md): a parallel-out source's pass-1 work
-    // ends here — its output buses are in `buffer_aux_out` (and, for 楽器兼バス
-    // mode, its main signal in `track_l/r`). The children sum + suffix FX +
-    // strip all run in pass 2 (`Mix`/`MixAdditive` → `ProcessGroupFx`), so do
-    // NOT apply the pre-fader snapshot / strip / mute here.
-    if skip_strip {
-        // 全部子 (`paraout_main_to_child`): the instrument's MAIN output goes to
-        // its OWN child track (port 0 → `buffer_aux_out[0]`), so clear it from
-        // the parent's scratch — the parent's clearing `Mix` then sums only the
-        // children. 楽器兼バス mode (port 0 unrouted) keeps main for `MixAdditive`.
-        if song_track.paraout_main_to_child() {
-            scratch.track_l[..n].fill(0.0);
-            scratch.track_r[..n].fill(0.0);
-            scratch.peak_l = 0.0;
-            scratch.peak_r = 0.0;
-        }
-        return;
-    }
-
-    // ---- Pre-fader send tap ----
-    // A pre-fader send reads the post-fx, pre-strip signal. Snapshot it
-    // before the strip overwrites `track_l/r` in place. docs/plan_modulation.md
-    // §6: a PostFx aux-input route or mod source also reads this snapshot, so
-    // capture it for those too. Only copied when something actually needs it
-    // (cheap check; skips the memcpy otherwise).
-    let has_prefader_send = song_track
-        .sends
-        .iter()
-        .any(|s| s.mode == common::model::SendMode::PreFader);
-    if has_prefader_send
-        || song.is_some_and(|s| track_needs_prefader_snapshot(s, song_track.id))
-    {
-        scratch.pre_fader_l[..n].copy_from_slice(&scratch.track_l[..n]);
-        scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);
-    }
-
-    // ---- Mixer strip + master accumulate ----
-    let muted = song_track.muted;
-    let solo = song_track.solo;
-    // Folder solo: グループを solo したらその子も鳴る (Ableton / Reaper 準拠)。
-    // 祖先 group のいずれかが solo なら、 この track 自身が非 solo でも透過させる。
-    let ancestor_soloed = song.is_some_and(|s| s.ancestor_soloed(song_track.id));
-    let effective_mute = muted || (any_solo && !solo && !ancestor_soloed);
-    scratch.effective_mute = effective_mute;
-
-    // Always apply the strip so `track_l/r` carries this track's
-    // post-fader signal — even for an excluded track. The master / group
-    // mixes drop `effective_mute` tracks via the flag (so the dry is never
-    // heard), but keeping the signal lets aux sends into a SOLOED return
-    // and sidechain taps still read it: soloing a return then auditions
-    // the sends feeding it (Ableton). RT-safe: in-place writes only.
-    // Phase 5 Step 5.2: master が当該 buffer の effective bpm を current_bpm
-    // として渡す (song = None なら process_buffer 側で 120.0)。
-    crate::automation::fill_track_param_ramps(
-        song,
-        track_idx,
-        sample_rate,
-        f64::from(current_bpm),
-        playhead_beats,
-        frames,
-        &mut scratch.volume_per_sample,
-        &mut scratch.pan_per_sample,
-        recording_lanes,
-        mod_scalars,
-    );
-    let mut peak_l = 0.0_f32;
-    let mut peak_r = 0.0_f32;
-    for i in 0..n {
-        let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
-        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-        let vol = scratch.volume_per_sample[i];
-        let gain_l = angle.cos() * vol;
-        let gain_r = angle.sin() * vol;
-        let l = scratch.track_l[i] * gain_l;
-        let r = scratch.track_r[i] * gain_r;
-        scratch.track_l[i] = l;
-        scratch.track_r[i] = r;
-        if l.abs() > peak_l {
-            peak_l = l.abs();
-        }
-        if r.abs() > peak_r {
-            peak_r = r.abs();
-        }
-    }
-    scratch.peak_l = peak_l;
-    scratch.peak_r = peak_r;
-
-    // Explicit mute zeroes the output entirely (no dry, no send, no
-    // sidechain). Solo-exclusion does NOT zero — the flag already keeps it
-    // out of the master / group mix, while the signal stays available for
-    // sends / sidechain. Either way an excluded track meters dark.
-    if muted {
-        scratch.track_l[..n].fill(0.0);
-        scratch.track_r[..n].fill(0.0);
-    }
-    if effective_mute {
-        scratch.peak_l = 0.0;
-        scratch.peak_r = 0.0;
-    }
-}
-
-/// Sum every non-muted track's `track_l/r` into `master_l/r`. Runs on
-/// the master thread after `dispatch_and_wait` returns, so writers no
-/// longer touch `master_{l,r}`. Sequential, but cache-friendly: each
-/// scratch is read straight through.
-///
-/// Used by `export.rs` (the offline freewheel render) which still walks
-/// tracks flatly. The realtime engine now goes through
-/// `execute_schedule_post_dispatch` so groups + PDC + sidechain hops can
-/// plug in by extending `NodeOp`.
-pub fn reduce_master(
-    scratch: &[TrackScratch],
-    n_tracks: usize,
-    master_l: &mut [f32],
-    master_r: &mut [f32],
-    frames: usize,
-) {
-    let n = frames.min(master_l.len()).min(master_r.len());
-    for tr in scratch.iter().take(n_tracks) {
-        if tr.effective_mute {
-            continue;
-        }
-        for i in 0..n {
-            master_l[i] += tr.track_l[i];
-            master_r[i] += tr.track_r[i];
-        }
-    }
-}
-
-/// master bus の audio fx chain を直列 process する。 全 track が
-/// `master_l/r` に mix され終わった後・metronome を重ねる前に呼ばれる。
-/// track fx (`process_track_owned` の Audio FX chain 部) と同じ buffer io
-/// idiom: plugin は `(MASTER_TRACK_ID, device_index)` keying で worker pool
-/// 経由 dispatch し、 in-place で `master_l/r` を上書きする。
-///
-/// master fx param automation / 変調 (r.md #8): master 固有データ (`song_lanes` の
-/// PluginParam lane + `song_mod_routings`) を `fill_pd_param_events(MASTER_TRACK_ID, i)`
-/// で適用する (= track / group fx と同一経路)。 `recording_lanes` / `mod_scalars` を追加。
-/// RT 規約: ヒープ確保 / lock / I/O なし。 buffer は呼び出し側が事前確保した
-/// `master_l/r` と plugin 側 ProcessData shmem のみを使う。
-#[allow(clippy::too_many_arguments)]
-pub fn process_master_fx_chain(
-    master_fx_chain: &[common::model::PluginInstance],
-    master_l: &mut [f32],
-    master_r: &mut [f32],
-    plugin_refs: &HashMap<u32, PluginRef>,
-    slot_to_plugin_id: &HashMap<(u32, u32), u32>,
-    worker_sync: Option<&WorkerSyncRef>,
-    sample_rate: u32,
-    frames: u32,
-    playing: bool,
-    song: Option<&Song>,
-    current_bpm: f32,
-    playhead_beats: f64,
-    looping: bool,
-    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    mod_scalars: &[f32],
-) {
-    let n = frames as usize;
-    let Some(ws) = worker_sync else { return };
-    for i in 0..master_fx_chain.len() {
-        // master は音源境界のない単一 audio FX Vec なので、 device_index は
-        // そのまま Vec position。
-        let key = (common::model::MASTER_TRACK_ID, i as u32);
-        let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
-            continue;
-        };
-        let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
-            continue;
-        };
-        let pd = plugin_ref.data_mut();
-        pd.prepare();
-        pd.frames = frames;
-        pd.playing = if playing { 1 } else { 0 };
-        pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
-        // master fx param automation (`song_lanes` の PluginParam lane) + 変調
-        // (`song_mod_routings`) を MASTER_TRACK_ID 経路で適用 (r.md #8、 track/group
-        // fx と同一 idiom)。 song が None の export path 等では skip。
-        if let Some(song) = song {
-            crate::automation::fill_pd_param_events(
-                pd,
-                song,
-                common::model::MASTER_TRACK_ID,
-                i as u32,
-                sample_rate,
-                f64::from(current_bpm),
-                playhead_beats,
-                frames,
-                recording_lanes,
-                mod_scalars,
-            );
-        }
-        pd.buffer_in[0][..n].copy_from_slice(&master_l[..n]);
-        pd.buffer_in[1][..n].copy_from_slice(&master_r[..n]);
-        if let Err(_e) = ws.dispatch(plugin_id) {
-            // RT path: skip on dispatch failure without per-buffer I/O.
-            #[cfg(debug_assertions)]
-            tracing::error!(error = ?_e, plugin_id, "master fx dispatch failed");
-            continue;
-        }
-        master_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
-        master_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
-    }
-}
-
-/// Resolve a tap `BufRef` (PostFader / PostFx / PreFx) to the source track's
-/// `(L, R)` buffers. Returns `None` for a non-tap `BufRef` or out-of-range
-/// track. docs/plan_modulation_followups.md §1. RT-safe (pure slicing).
-fn resolve_tap_buffers(scratch: &[TrackScratch], src: BufRef) -> Option<(&[f32], &[f32])> {
-    Some(match src {
-        BufRef::TrackScratch(i) => {
-            let s = scratch.get(i as usize)?;
-            (s.track_l.as_slice(), s.track_r.as_slice())
-        }
-        BufRef::PreFaderScratch(i) => {
-            let s = scratch.get(i as usize)?;
-            (s.pre_fader_l.as_slice(), s.pre_fader_r.as_slice())
-        }
-        BufRef::PreFxScratch(i) => {
-            let s = scratch.get(i as usize)?;
-            (s.pre_fx_l.as_slice(), s.pre_fx_r.as_slice())
-        }
-        _ => return None,
-    })
-}
-
-/// docs/plan_modulation.md §6 / docs/plan_modulation_followups.md §1: does any
-/// aux-input route or mod source tap `track_id` exactly at `want`? Read-only
-/// scan, no alloc — RT-safe.
-fn any_tap_at(song: &Song, track_id: u32, want: common::model::TapPoint) -> bool {
-    let hit = |t: &common::model::AudioTap| t.source_track == track_id && t.tap_point == want;
-    song.tracks
-        .iter()
-        .flat_map(|tr| tr.devices.iter())
-        .chain(song.master_fx_chain.iter())
-        .flat_map(|p| p.aux_inputs.iter().flatten())
-        .any(|r| hit(&r.tap))
-        // generator (LFO/Random/MSEG/Steps) は tap を持たない。 follower のみ走査。
-        || song
-            .mod_sources
-            .iter()
-            .filter_map(|m| m.follower())
-            .any(|(tap, _)| hit(tap))
-}
-
-/// A `PostFx` tap reads the track's `pre_fader_l/r` snapshot (post-fx,
-/// pre-strip), so the per-track render must capture it.
-fn track_needs_prefader_snapshot(song: &Song, track_id: u32) -> bool {
-    any_tap_at(song, track_id, common::model::TapPoint::PostFx)
-}
-
-/// A `PreFx` tap reads the track's `pre_fx_l/r` snapshot (the raw signal
-/// before the device chain), so the per-track render must capture it.
-fn track_needs_prefx_snapshot(song: &Song, track_id: u32) -> bool {
-    any_tap_at(song, track_id, common::model::TapPoint::PreFx)
-}
-
-/// Replay the post-dispatch portion of the routing schedule:
-/// `Mix { dst: TrackScratch }` (children → group bus), `ProcessGroupFx`
-/// (group's fx_chain + strip), and `Mix { dst: Master }` (top-level
-/// scratches → master). `ProcessTrack` ops are no-ops here because
-/// `dispatch_and_wait` has already filled the per-track scratches.
-#[allow(clippy::too_many_arguments)]
-pub fn execute_schedule_post_dispatch(
-    schedule: &mut Schedule,
-    scratch: &mut [TrackScratch],
-    master_l: &mut [f32],
-    master_r: &mut [f32],
-    n: usize,
-    song: &Song,
-    plugin_refs: &HashMap<u32, PluginRef>,
-    slot_to_plugin_id: &HashMap<(u32, u32), u32>,
-    worker_sync: Option<&WorkerSyncRef>,
-    sample_rate: u32,
-    frames: u32,
-    playing: bool,
-    any_solo: bool,
-    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    current_bpm: f32,
-    // group fx の transport snapshot 用 (= 積分済み拍位置 + 実 loop トグル)。
-    playhead_beats: f64,
-    looping: bool,
-    // B3 (r.md #8): group fx の PluginParam follower 変調 snapshot (track fx と同じ
-    // `mod_scalars_snapshot`)。 post-dispatch 段への plumbing。 空なら変調なし。
-    mod_scalars: &[f32],
-) {
-    // `nodes` の不変参照と `delay_lines` の可変参照を同時に取りたい
-    // (ApplyDelay で line を引きながら nodes を回すため)。 `Schedule`
-    // を split borrow で 2 つの参照に分解する。
-    let Schedule {
-        nodes,
-        delay_lines,
-        port_buffers: _,
-        input_delay_per_track: _,
-        follower_slots,
-        mod_kinds: _,
-    } = schedule;
-    for op in nodes.iter() {
-        match op {
-            NodeOp::ProcessTrack { .. } => {
-                // Already handled by dispatch_and_wait above.
-            }
-            NodeOp::Mix {
-                srcs,
-                dst: BufRef::TrackScratch(target_idx),
-            } => {
-                mix_into_track_scratch(scratch, *target_idx as usize, srcs, n, true);
-            }
-            NodeOp::Mix {
-                srcs,
-                dst: BufRef::Master,
-            } => {
-                mix_into_master(scratch, srcs, master_l, master_r, n);
-            }
-            // パラアウト (docs/plan_paraout.md): a group-with-instrument's
-            // children are summed **on top of** its own instrument output
-            // (already in scratch from the pass-1 prefix), so we accumulate
-            // instead of clearing. dst is always its own TrackScratch.
-            NodeOp::MixAdditive {
-                srcs,
-                dst: BufRef::TrackScratch(target_idx),
-            } => {
-                mix_into_track_scratch(scratch, *target_idx as usize, srcs, n, false);
-            }
-            NodeOp::MixAdditive { .. } => {
-                // Only TrackScratch dsts are ever emitted for MixAdditive.
-            }
-            NodeOp::Mix {
-                dst:
-                    BufRef::Pooled(_)
-                    | BufRef::PluginAuxOut { .. }
-                    | BufRef::PreFaderScratch(_)
-                    | BufRef::PreFxScratch(_),
-                ..
-            } => {
-                // PR4: pooled targets and plugin aux-out routing land
-                // here once parallel-out support arrives. A Mix into a
-                // Pre*Scratch is never emitted (those are written by
-                // ProcessTrack), but the arm keeps the match exhaustive.
-            }
-            NodeOp::ProcessGroupFx {
-                track_idx,
-                start_device,
-            } => {
-                let Some(track) = song.tracks.get(*track_idx as usize) else {
-                    continue;
-                };
-                let Some(target) = scratch.get_mut(*track_idx as usize) else {
-                    continue;
-                };
-                run_group_fx_chain(
-                    *track_idx,
-                    track,
-                    song,
-                    target,
-                    plugin_refs,
-                    slot_to_plugin_id,
-                    worker_sync,
-                    sample_rate,
-                    frames,
-                    playing,
-                    any_solo,
-                    recording_lanes,
-                    current_bpm,
-                    playhead_beats,
-                    looping,
-                    mod_scalars,
-                    *start_device,
-                );
-            }
-            NodeOp::ApplyDelay {
-                buf,
-                line_idx,
-                frames: delay_frames,
-            } => {
-                // PR3: `buf` の scratch を in-place で `delay_frames` だけ
-                // 遅延させる。 `compile_schedule` は path latency が大きい
-                // 側に揃えるため、 小さい side の `BufRef::TrackScratch(i)`
-                // を絶対指す前提。 想定外 BufRef は無視。
-                let BufRef::TrackScratch(track_idx) = *buf else {
-                    continue;
-                };
-                let Some(s) = scratch.get_mut(track_idx as usize) else {
-                    continue;
-                };
-                let Some(line) = delay_lines.get_mut(*line_idx as usize) else {
-                    continue;
-                };
-                let n = (n).min(s.track_l.len()).min(s.track_r.len());
-                line.step_in_place(
-                    &mut s.track_l[..n],
-                    &mut s.track_r[..n],
-                    *delay_frames as usize,
-                );
-            }
-            NodeOp::SidechainTap {
-                src,
-                dst_track,
-                dst_index,
-                aux_in_port,
-            } => {
-                // PR4 sidechain: copy the source track's scratch L/R into the
-                // destination plugin's `pd.buffer_aux_in[port]` shmem region,
-                // marking the port active so `daw_plugin_host` forwards it as a
-                // CLAP `clap_audio_buffer` / VST3 aux bus on the next
-                // `process()`. docs/plan_modulation.md §6: the tap point picks
-                // the buffer — `TrackScratch` = post-fader, `PreFaderScratch` =
-                // post-fx / pre-fader. Other `BufRef`s are ignored (PR4.4/PR5).
-                // RT path: skip silently on any miss (no per-buffer tracing).
-                // docs/plan_modulation_followups.md §1: the tap point picks the
-                // source buffer — PostFader / PostFx (pre-fader) / PreFx.
-                let Some((src_l, src_r)) = resolve_tap_buffers(scratch, *src) else {
-                    continue;
-                };
-                let port = *aux_in_port as usize;
-                if port >= common::process_data::MAX_AUX_IN {
-                    continue;
-                }
-                // Resolve the runtime plugin_id for (dst_track, dst_index).
-                // v23: the chain map is keyed by (track_id, device_index).
-                let key = (*dst_track, *dst_index);
-                let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
-                    continue;
-                };
-                let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
-                    continue;
-                };
-                let pd = plugin_ref.data_mut();
-                let copy_n = n.min(src_l.len()).min(src_r.len());
-                pd.buffer_aux_in[port][0][..copy_n].copy_from_slice(&src_l[..copy_n]);
-                pd.buffer_aux_in[port][1][..copy_n].copy_from_slice(&src_r[..copy_n]);
-                pd.aux_in_active[port] = 1;
-            }
-
-            NodeOp::ParallelOutTap {
-                src_track,
-                src_device,
-                port,
-                dst_track,
-            } => {
-                // パラアウト (docs/plan_paraout.md): read the source plugin's aux
-                // output `port` (`pd.buffer_aux_out[port]`, written by
-                // daw_plugin_host during the source plugin's pass-1 process) and
-                // **accumulate** it into the destination track's input scratch.
-                // The mirror of `SidechainTap`: same `(track_id, device_index)`
-                // slot keying for the source plugin; the dst is a scratch index.
-                // Emitted after the dst's clearing `Mix`, before its
-                // `ProcessGroupFx`, so the dst track's FX process the routed
-                // signal. RT path: skip silently on any miss.
-                let port = *port as usize;
-                if port >= common::process_data::MAX_AUX_OUT {
-                    continue;
-                }
-                let Some(&plugin_id) = slot_to_plugin_id.get(&(*src_track, *src_device)) else {
-                    continue;
-                };
-                let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
-                    continue;
-                };
-                let pd = plugin_ref.data();
-                // The plugin host marks the port active only when the plugin
-                // actually declared (and wrote) this aux output; an unrouted /
-                // absent port stays silent (industry-standard behaviour).
-                if pd.aux_out_active[port] == 0 {
-                    continue;
-                }
-                let Some(target) = scratch.get_mut(*dst_track as usize) else {
-                    continue;
-                };
-                let copy_n = n.min(target.track_l.len()).min(target.track_r.len());
-                for i in 0..copy_n {
-                    target.track_l[i] += pd.buffer_aux_out[port][0][i];
-                    target.track_r[i] += pd.buffer_aux_out[port][1][i];
-                }
-            }
-
-            NodeOp::MixSend {
-                src,
-                dst,
-                src_track_idx,
-                send_idx,
-            } => {
-                // PR4 aux send: accumulate the source's post- or pre-fader
-                // buffer into the destination return / bus scratch, scaled
-                // by the live (optionally automated) send gain.
-                let BufRef::TrackScratch(dst_idx) = *dst else {
-                    continue;
-                };
-                let (src_idx, pre_fader) = match *src {
-                    BufRef::TrackScratch(i) => (i, false),
-                    BufRef::PreFaderScratch(i) => (i, true),
-                    _ => continue,
-                };
-                mix_send_into_track_scratch(
-                    scratch,
-                    dst_idx as usize,
-                    src_idx as usize,
-                    pre_fader,
-                    song,
-                    *src_track_idx,
-                    *send_idx,
-                    sample_rate,
-                    current_bpm,
-                    playhead_beats,
-                    any_solo,
-                    recording_lanes,
-                    n,
-                );
-            }
-
-            NodeOp::EnvelopeFollow { src, slot } => {
-                // docs/plan_modulation.md §3/§6: advance this source's envelope
-                // follower over its (settled) scratch, picking the buffer by
-                // tap point (`TrackScratch` = post-fader, `PreFaderScratch` =
-                // post-fx / pre-fader). The smoothed envelope lands in
-                // `follower_slots[slot].env`; `process_buffer` publishes it to
-                // `AudioBridge::mod_scalars` after this walk. RT-safe: pure
-                // arithmetic, no alloc / lock.
-                let Some((src_l, src_r)) = resolve_tap_buffers(scratch, *src) else {
-                    continue;
-                };
-                let Some(fs) = follower_slots.get_mut(*slot as usize) else {
-                    continue;
-                };
-                fs.process_block(src_l, src_r, n);
-            }
-        }
-    }
-}
-
-/// Sum the listed source scratches into `scratch[target_idx]` (used to
-/// feed group buses with their children). Clears the target first so
-/// stale samples from a previous buffer don't leak.
-fn mix_into_track_scratch(
-    scratch: &mut [TrackScratch],
-    target_idx: usize,
-    srcs: &[(BufRef, f32)],
-    n: usize,
-    // `true` clears `dst` first (normal group / return Mix). `false`
-    // accumulates on top of whatever is already there (パラアウト
-    // group-with-instrument: keep the instrument's own main output written by
-    // the pass-1 prefix before summing the children).
-    clear: bool,
-) {
-    if target_idx >= scratch.len() {
-        return;
-    }
-    if clear {
-        let target = &mut scratch[target_idx];
-        target.track_l[..n].fill(0.0);
-        target.track_r[..n].fill(0.0);
-    }
-    let (left, right) = scratch.split_at_mut(target_idx);
-    let (target_slot, after) = right.split_first_mut().expect("split bounds checked above");
-    for (src, gain) in srcs {
-        let BufRef::TrackScratch(s_idx) = src else {
-            continue;
-        };
-        let s = *s_idx as usize;
-        if s == target_idx {
-            continue;
-        }
-        let s_scratch = if s < target_idx {
-            &left[s]
-        } else if s - target_idx - 1 < after.len() {
-            &after[s - target_idx - 1]
-        } else {
-            continue;
-        };
-        if s_scratch.effective_mute {
-            continue;
-        }
-        let g = *gain;
-        for i in 0..n {
-            target_slot.track_l[i] += s_scratch.track_l[i] * g;
-            target_slot.track_r[i] += s_scratch.track_r[i] * g;
-        }
-    }
-}
-
-/// Sum each non-muted source scratch (with its routing gain) into the
-/// master bus. The master buffers are zeroed earlier in `process_buffer`
-/// so this is `+= ` style accumulation.
-fn mix_into_master(
-    scratch: &[TrackScratch],
-    srcs: &[(BufRef, f32)],
-    master_l: &mut [f32],
-    master_r: &mut [f32],
-    n: usize,
-) {
-    let n = n.min(master_l.len()).min(master_r.len());
-    for (src, gain) in srcs {
-        let BufRef::TrackScratch(s_idx) = src else {
-            continue;
-        };
-        let Some(s_scratch) = scratch.get(*s_idx as usize) else {
-            continue;
-        };
-        if s_scratch.effective_mute {
-            continue;
-        }
-        let g = *gain;
-        for i in 0..n {
-            master_l[i] += s_scratch.track_l[i] * g;
-            master_r[i] += s_scratch.track_r[i] * g;
-        }
-    }
-}
-
-/// Accumulate one aux send into a return / bus scratch.
-///
-/// Reads `scratch[src_idx]`'s post-fader (`track_l/r`) or pre-fader
-/// (`pre_fader_l/r`) buffer, scales it by the **live** send gain of
-/// `song.tracks[src_track_idx].sends[send_idx]` — sampled per-sample from
-/// a `SendGain` automation lane when present (and not being recorded),
-/// otherwise the constant `send.gain` — and adds it into
-/// `scratch[dst_idx].track_l/r` (`+=`, no clear). A disabled send or a
-/// muted source contributes nothing (Ableton: mute silences sends). The
-/// gain is read live, never baked into the schedule, so knob drags and
-/// `SendGain` automation apply without recompiling.
-#[allow(clippy::too_many_arguments)]
-fn mix_send_into_track_scratch(
-    scratch: &mut [TrackScratch],
-    dst_idx: usize,
-    src_idx: usize,
-    pre_fader: bool,
-    song: &Song,
-    src_track_idx: u32,
-    send_idx: u8,
-    sample_rate: u32,
-    bpm: f32,
-    // 積分済み拍位置 (buffer 先頭)。 旧実装は絶対 sample 位置を現在 bpm で線形
-    // 換算しており、 SongTempo automation 中は SendGain lane が誤った beat で
-    // 読まれた (M5 の beat-domain 移行から漏れていた同件、 review)。
-    playhead_beats: f64,
-    any_solo: bool,
-    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    n: usize,
-) {
-    use common::model::{AutomationTarget, TrackBuiltinParam};
-
-    if src_idx == dst_idx || src_idx >= scratch.len() || dst_idx >= scratch.len() {
-        return;
-    }
-    let Some(track) = song.tracks.get(src_track_idx as usize) else {
-        return;
-    };
-    let Some(send) = track.sends.get(send_idx as usize) else {
-        return;
-    };
-    if !send.enabled {
-        return;
-    }
-    // An explicit mute on the source always silences its sends.
-    if track.muted {
-        return;
-    }
-    // Solo handling. Soloing a track should let you hear ONLY it and its
-    // sends — other tracks' sends must NOT leak into a shared return. So
-    // under solo a send flows only if its SOURCE is solo-audible (soloed,
-    // or kept alive by a soloed child / send), OR the DESTINATION return is
-    // itself explicitly soloed (you soloed the return to audition
-    // everything routed to it). The source keeps its signal (see
-    // process_track_owned), so the soloed-return audition still works.
-    if any_solo {
-        let dest_soloed = song.tracks.get(dst_idx).is_some_and(|d| d.solo);
-        if !dest_soloed && !track.solo && !has_soloed_contributor(song, track.id) {
-            return;
-        }
-    }
-
-    // Pick this send's `SendGain` automation lane, unless it is currently
-    // being recorded (then the live knob value is heard, mirroring the
-    // volume / pan recording bypass).
-    let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx });
-    let lane = if recording_lanes.contains(&(track.id, target.clone())) {
-        None
-    } else {
-        track
-            .automation_lanes
-            .iter()
-            .find(|l| l.enabled && l.target == target)
-    };
-    let beats_per_frame = if bpm > 0.0 && sample_rate > 0 {
-        f64::from(bpm) / (60.0 * f64::from(sample_rate))
-    } else {
-        0.0
-    };
-    let const_gain = send.gain;
-
-    // Borrow the source immutably and the destination mutably without
-    // overlap (`src_idx != dst_idx` checked above).
-    let (src_scratch, dst_scratch): (&TrackScratch, &mut TrackScratch) = if src_idx < dst_idx {
-        let (left, right) = scratch.split_at_mut(dst_idx);
-        (&left[src_idx], &mut right[0])
-    } else {
-        let (left, right) = scratch.split_at_mut(src_idx);
-        (&right[0], &mut left[dst_idx])
-    };
-    let (src_l, src_r) = if pre_fader {
-        (&src_scratch.pre_fader_l, &src_scratch.pre_fader_r)
-    } else {
-        (&src_scratch.track_l, &src_scratch.track_r)
-    };
-    let n = n
-        .min(src_l.len())
-        .min(src_r.len())
-        .min(dst_scratch.track_l.len())
-        .min(dst_scratch.track_r.len());
-
-    if let (Some(lane), true) = (lane, beats_per_frame > 0.0) {
-        for i in 0..n {
-            // `fill_track_param_ramps` / `fill_pd_param_events` と同じ積分済み
-            // anchor + per-frame 増分 (M5 の beat-domain 統一)。
-            let beat = playhead_beats + i as f64 * beats_per_frame;
-            let g = common::automation::lane_value_at(lane, &song.clip_contents, beat) as f32;
-            dst_scratch.track_l[i] += src_l[i] * g;
-            dst_scratch.track_r[i] += src_r[i] * g;
-        }
-    } else {
-        for i in 0..n {
-            dst_scratch.track_l[i] += src_l[i] * const_gain;
-            dst_scratch.track_r[i] += src_r[i] * const_gain;
-        }
-    }
-}
-
-/// `track_id` に流れ込む (= contribute する) track のいずれかが
-/// `solo == true` なら true。 寄与エッジは「子 (`parent_group_id == node`、
-/// group の soloed-via-children)」 と「`node` 宛ての aux send を持つ track
-/// (= send 元、 return の solo-safe)」 の 2 種。 これで「あるトラックを
-/// solo すると、 そのトラックが送っている reverb / delay の **リターン** も
-/// 生かす」 Ableton 準拠の挙動になる (リターンを solo-safe にしないと、
-/// ソロしたトラックの send 先が solo 規則で無音化され、 ソロ中はセンド
-/// エフェクトが聞こえない)。 routing graph は DAG (`compile_schedule` が
-/// cycle を弾く) なので BFS は停止する。 `hops` 上限は child + send の
-/// fan-in を見込んで広めに取る。
-fn has_soloed_contributor(song: &Song, track_id: u32) -> bool {
-    // RT-safe non-allocating BFS: this runs on the audio dispatch path, so
-    // the frontier and the visited set must live on the stack rather than
-    // heap-allocated `Vec`s. `MAX_TRACKS` (= 32) caps the number of distinct
-    // nodes; the stack is sized to comfortably hold them. Track ids are not
-    // dense indices, so the visited set stores ids directly.
-    let mut frontier = [0u32; MAX_TRACKS * 2];
-    let mut frontier_len = 0usize;
-    let mut visited = [0u32; MAX_TRACKS];
-    let mut visited_len = 0usize;
-
-    // Seed with the starting node, marked visited so it is never re-pushed.
-    frontier[frontier_len] = track_id;
-    frontier_len += 1;
-    visited[visited_len] = track_id;
-    visited_len += 1;
-
-    while frontier_len > 0 {
-        frontier_len -= 1;
-        let node = frontier[frontier_len];
-        for t in &song.tracks {
-            let feeds_node = t.parent_group_id == Some(node)
-                || t.sends.iter().any(|s| s.dest_track_id == node);
-            if feeds_node {
-                if t.solo {
-                    return true;
-                }
-                // Skip already-visited nodes so the fixed-length frontier
-                // can never overflow (each distinct node is pushed once).
-                if visited[..visited_len].contains(&t.id) {
-                    continue;
-                }
-                if visited_len < visited.len() && frontier_len < frontier.len() {
-                    visited[visited_len] = t.id;
-                    visited_len += 1;
-                    frontier[frontier_len] = t.id;
-                    frontier_len += 1;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Run a Group track's audio fx chain on its already-mixed input
-/// scratch, then apply the group's mixer strip (volume / pan / mute /
-/// solo + peak meter). Mirrors the audio-fx tail of `process_track_owned`,
-/// but skips the sequencer / MIDI FX / instrument stages because groups
-/// have no clips of their own.
-#[allow(clippy::too_many_arguments)]
-fn run_group_fx_chain(
-    track_idx: u32,
-    song_track: &Track,
-    song: &Song,
-    scratch: &mut TrackScratch,
-    plugin_refs: &HashMap<u32, PluginRef>,
-    slot_to_plugin_id: &HashMap<(u32, u32), u32>,
-    worker_sync: Option<&WorkerSyncRef>,
-    sample_rate: u32,
-    frames: u32,
-    playing: bool,
-    any_solo: bool,
-    recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    current_bpm: f32,
-    // group fx の transport snapshot (= 積分済み拍位置 + 実 loop トグル)。
-    playhead_beats: f64,
-    looping: bool,
-    // B3 (r.md #8): group fx PluginParam の follower 変調 snapshot。
-    mod_scalars: &[f32],
-    // パラアウト (docs/plan_paraout.md): first device index to run. `0` for a
-    // pure group / return (whole chain is bus FX). For a group-with-instrument
-    // it's the prefix split point — the instrument `[0..start_device]` ran in
-    // pass 1, so here we run only the suffix FX `[start_device..]` on the bus.
-    start_device: u32,
-) {
-    let n = frames as usize;
-    let track_id = song_track.id;
-
-    // docs/plan_modulation_followups.md §1: a group's pre-FX signal = the summed
-    // children before its own device chain. Capture for any PreFx tap / mod
-    // source (guarded — untouched groups skip the memcpy). For a
-    // group-with-instrument this is the summed bus *before the suffix FX* (the
-    // instrument prefix already ran), which is the right pre-FX tap point.
-    if track_needs_prefx_snapshot(song, track_id) {
-        scratch.pre_fx_l[..n].copy_from_slice(&scratch.track_l[..n]);
-        scratch.pre_fx_r[..n].copy_from_slice(&scratch.track_r[..n]);
-    }
-
-    // v23 single-chain: a group / return bus has a summed audio input (no
-    // sequencer notes), so the chain runs entirely in the audio domain. Walk
-    // `devices` once and connect audio ports serially (Reaper 流) — feed the
-    // bus signal into any device that takes audio in, dispatch, then write the
-    // audio out back (replace when the device has an audio input = effect, add
-    // when it has none = pure source). MIDI ports are irrelevant on a bus.
-    // パラアウト: skip the instrument prefix `[0..start_device]` (already run in
-    // pass 1) — run only the suffix FX.
-    for i in start_device as usize..song_track.devices.len() {
-        let ports = song_track.devices[i].ports;
-        if !ports.has_audio_output {
-            // No audio output (e.g. a pure MIDI effect) — nothing to contribute
-            // to a bus signal; skip.
-            continue;
-        }
-        // id ベースの key で lookup (chain は track_id + device_index で識別、
-        // song.tracks の Vec position に依存しない)。
-        let key = (track_id, i as u32);
-        let Some(&plugin_id) = slot_to_plugin_id.get(&key) else {
-            continue;
-        };
-        let Some(plugin_ref) = plugin_refs.get(&plugin_id) else {
-            continue;
-        };
-        let Some(ws) = worker_sync else { continue };
-
-        let pd = plugin_ref.data_mut();
-        pd.prepare();
-        pd.frames = frames;
-        pd.playing = if playing { 1 } else { 0 };
-        pd.sample_rate = sample_rate;
-        set_pd_transport(pd, Some(song), current_bpm, playhead_beats, looping);
-        // Phase 2b: group fx 宛 PluginParam automation + B3 (r.md #8) follower 変調。
-        crate::automation::fill_pd_param_events(
-            pd,
-            song,
-            track_id,
-            i as u32,
-            sample_rate,
-            f64::from(current_bpm),
-            playhead_beats,
-            frames,
-            recording_lanes,
-            // B3 (r.md #8): group fx PluginParam の follower 変調 snapshot を渡す
-            // (post-dispatch 段へ plumbing 済)。 master fx は automation lane の
-            // data model が無く未対応 (= 別 follow-up)。
-            mod_scalars,
-        );
-        if ports.has_audio_input {
-            pd.buffer_in[0][..n].copy_from_slice(&scratch.track_l[..n]);
-            pd.buffer_in[1][..n].copy_from_slice(&scratch.track_r[..n]);
-        }
-        if let Err(_e) = ws.dispatch(plugin_id) {
-            // RT path: skip on dispatch failure without per-buffer I/O.
-            #[cfg(debug_assertions)]
-            tracing::error!(error = ?_e, plugin_id, "group fx dispatch failed");
-            continue;
-        }
-        if ports.has_audio_input {
-            // effect: 入力を処理した結果で bus を置換。
-            scratch.track_l[..n].copy_from_slice(&pd.buffer_out[0][..n]);
-            scratch.track_r[..n].copy_from_slice(&pd.buffer_out[1][..n]);
-        } else {
-            // source: 入力を取らず生成する機 → bus に加算。
-            for j in 0..n {
-                scratch.track_l[j] += pd.buffer_out[0][j];
-                scratch.track_r[j] += pd.buffer_out[1][j];
-            }
-        }
-    }
-
-    // ---- Pre-fader send tap (bus / return source) ----
-    // A pre-fader send from this bus reads its post-fx, pre-strip signal.
-    if song_track
-        .sends
-        .iter()
-        .any(|s| s.mode == common::model::SendMode::PreFader)
-    {
-        scratch.pre_fader_l[..n].copy_from_slice(&scratch.track_l[..n]);
-        scratch.pre_fader_r[..n].copy_from_slice(&scratch.track_r[..n]);
-    }
-
-    let muted = song_track.muted;
-    let solo = song_track.solo;
-    // Live 互換: 子 / send 元のいずれかが solo されていれば、 この bus 自身は
-    // solo フラグが無くても透過させる (has_soloed_contributor)。 さらに folder
-    // solo: 祖先 group が solo なら、 このネストした group bus 自身も透過させる。
-    let effective_mute = muted
-        || (any_solo
-            && !solo
-            && !song.ancestor_soloed(song_track.id)
-            && !has_soloed_contributor(song, song_track.id));
-    scratch.effective_mute = effective_mute;
-
-    // Always apply the strip (mirrors process_track_owned): keep the signal
-    // in `track_l/r` for onward sends / sidechain even when excluded; only
-    // an explicit mute zeroes it, and the flag handles master / group
-    // exclusion.
-    crate::automation::fill_track_param_ramps(
-        Some(song),
-        track_idx,
-        sample_rate,
-        f64::from(current_bpm),
-        playhead_beats,
-        frames,
-        &mut scratch.volume_per_sample,
-        &mut scratch.pan_per_sample,
-        recording_lanes,
-        // group/master bus の volume/pan follower 変調は follow-up。
-        &[],
-    );
-    let mut peak_l = 0.0_f32;
-    let mut peak_r = 0.0_f32;
-    for i in 0..n {
-        let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
-        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-        let vol = scratch.volume_per_sample[i];
-        let gain_l = angle.cos() * vol;
-        let gain_r = angle.sin() * vol;
-        let l = scratch.track_l[i] * gain_l;
-        let r = scratch.track_r[i] * gain_r;
-        scratch.track_l[i] = l;
-        scratch.track_r[i] = r;
-        if l.abs() > peak_l {
-            peak_l = l.abs();
-        }
-        if r.abs() > peak_r {
-            peak_r = r.abs();
-        }
-    }
-    scratch.peak_l = peak_l;
-    scratch.peak_r = peak_r;
-    if muted {
-        scratch.track_l[..n].fill(0.0);
-        scratch.track_r[..n].fill(0.0);
-    }
-    if effective_mute {
-        scratch.peak_l = 0.0;
-        scratch.peak_r = 0.0;
-    }
-}
-
-/// Phase 7 B3 (2026-05-13): メトロノーム click を 1 buffer 分 master_l/r に
-/// 重ねる。 buffer 範囲内の全 beat 境界 (current_bpm + sample_rate から算出)
-/// で click voice を trigger、 既存 voice が decay 中なら overwrite (= 短
-/// decay 1 voice の業界標準 idiom)。 voice の sample 生成は sine + linear
-/// envelope decay で hardcode (decay 40 ms / amp peak 0.25 = -12 dB / freq
-/// downbeat 880 Hz, 他 440 Hz)。 stereo は同 sample を L/R に均等 mix
-/// (= mono click)。
-///
-/// RT 安全: heap 確保なし、 浮動小数演算と sin() 呼び出しのみ。 bpm = 0 /
-/// sample_rate = 0 / tsig_num < 1 で no-op (defensive)。
-///
-/// 同 buffer 内に 2 個以上 beat 境界が含まれる場合 (= 高速 tempo / 大 buffer)、
-/// 後の trigger が voice を overwrite し前の voice の残響は失われる。 通常
-/// 使用範囲 (~600 BPM @ 11.6 ms buffer = 1.16 beat/buffer) では起きない。
-#[allow(clippy::too_many_arguments)]
-fn render_metronome(
-    voice: &mut Option<ClickVoice>,
-    master_l: &mut [f32],
-    master_r: &mut [f32],
-    frames: usize,
-    playhead_samples: u64,
-    sample_rate: u32,
-    bpm: f32,
-    tsig_num: i64,
-) {
-    if frames == 0 || sample_rate == 0 || bpm <= 0.0 || tsig_num < 1 {
-        return;
-    }
-    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(bpm);
-    if samples_per_beat <= 0.0 {
-        return;
-    }
-    let buffer_start = playhead_samples as f64;
-    let buffer_end = buffer_start + frames as f64;
-    // この buffer 内に含まれる beat 境界 (= sample 位置 = beat_index *
-    // samples_per_beat) を順次 trigger。 連続なら最後の trigger が voice を
-    // overwrite (KISS: 同 buffer 多重 voice なし)。
-    let first_beat_in_buf = (buffer_start / samples_per_beat).ceil() as i64;
-    let mut beat_index = first_beat_in_buf.max(0);
-    loop {
-        let boundary_sample = beat_index as f64 * samples_per_beat;
-        if boundary_sample >= buffer_end {
-            break;
-        }
-        if boundary_sample >= buffer_start {
-            let buf_offset = (boundary_sample - buffer_start).floor() as u32;
-            if (buf_offset as usize) < frames {
-                let downbeat = beat_index.rem_euclid(tsig_num) == 0;
-                let decay = ((sample_rate as f32) * 0.04) as u32;
-                let freq = if downbeat { 880.0 } else { 440.0 };
-                *voice = Some(ClickVoice {
-                    samples_remaining: decay.max(1),
-                    decay_samples: decay.max(1),
-                    freq,
-                    phase: 0.0,
-                    start_offset: buf_offset,
-                });
-            }
-        }
-        beat_index += 1;
-    }
-    // active voice の sample 生成 + mix。 start_offset から frames 末まで
-    // sine + linear envelope decay。 voice 終端で None に戻す。
-    if let Some(v) = voice.as_mut() {
-        let mut i = v.start_offset as usize;
-        v.start_offset = 0;
-        let two_pi = std::f32::consts::TAU;
-        let amp_peak: f32 = 0.25;
-        let freq_per_sr = v.freq / sample_rate as f32;
-        while i < frames && v.samples_remaining > 0 {
-            let env = v.samples_remaining as f32 / v.decay_samples as f32;
-            let s = v.phase.sin() * env * amp_peak;
-            master_l[i] += s;
-            master_r[i] += s;
-            v.phase += two_pi * freq_per_sr;
-            if v.phase > two_pi {
-                v.phase -= two_pi;
-            }
-            v.samples_remaining -= 1;
-            i += 1;
-        }
-        if v.samples_remaining == 0 {
-            *voice = None;
-        }
-    }
-}
-
+/// D1 / plan §4: off-thread bundle publish → wait-free RT install →
+/// off-thread recycle. Verifies the audio thread picks up the newest bundle,
+/// hands the superseded one back for disposal, coalesces bursts, adopts
+/// schedule state, and (under `rt-assert`) performs the install with zero
+/// allocation/free on the audio thread.
 #[cfg(test)]
-mod sidechain_tests {
-    use super::*;
-    use crate::graph::compile_schedule;
-    use common::model::{PluginInstance, Song, Track};
-    use common::plugin_format::PluginFormat;
-
-    /// v23 single-chain: `Track::default()` を mutator で埋める helper。 downstream
-    /// crate (daw_audio) の test で `Track { .., ..Track::default() }` を書くと、
-    /// `common` 内の `pub(crate)` legacy migration fields が見えず E0451 になる
-    /// ため、 private field に触れない default + mutate で回避する。
-    fn track(f: impl FnOnce(&mut Track)) -> Track {
-        let mut t = Track::default();
-        f(&mut t);
-        t
-    }
-
-    #[test]
-    fn set_pd_transport_uses_real_beats_and_loop_toggle() {
-        // SSoT 回帰防止: pd.song_pos_beats は daw_audio が渡す積分済み拍位置を
-        // そのまま使い (= samples × bpm の逆算ではない)、 pd.looping は実 loop
-        // トグルを反映する (= region 有無 heuristic ではない)。
-        let song = Song {
-            time_sig: (3, 4),
-            loop_start_beat: 4.0,
-            loop_end_beat: 8.0,
-            ..Song::default()
-        };
-        let mut pd = common::process_data::ProcessData::empty();
-        // playhead_beats = 12.5 は constant-tempo 逆算とは無関係な「真の拍」。
-        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, true);
-        assert_eq!(pd.song_pos_beats, 12.5);
-        assert_eq!(pd.bpm, 90.0);
-        assert_eq!(pd.tsig_num, 3);
-        assert_eq!(pd.tsig_denom, 4);
-        assert_eq!(pd.loop_start_beats, 4.0);
-        assert_eq!(pd.loop_end_beats, 8.0);
-        assert_eq!(pd.looping, 1);
-        // loop region は定義済のまま looping=false を渡すと pd.looping=0
-        // (= region heuristic を使っていれば 1 のままになる、 という回帰検出)。
-        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, false);
-        assert_eq!(pd.looping, 0);
-    }
-
-    /// PR4 Sidechain engine-handler test: 実 plugin を立てなくても、
-    /// `execute_schedule_post_dispatch` の `NodeOp::SidechainTap` ハンドラ
-    /// が source TrackScratch の signal を `pd.buffer_aux_in[port]` に正しく
-    /// copy することを直接検証する。 ProcessData は heap に Box で置き、
-    /// `PluginRef` を手書きして plugin_refs / slot_to_plugin_id に登録する。
-    #[test]
-    fn sidechain_tap_copies_source_track_into_plugin_aux_in_buffer() {
-        let song = Song {
-            tracks: vec![
-                track(|t| {
-                    t.id = 1;
-                    t.name = "Source".into();
-                }),
-                track(|t| {
-                    t.id = 2;
-                    t.name = "Dest".into();
-                    // v23 single-chain: an audio-FX device (audio_output only,
-                    // no note input) → derives as AudioEffect at device 0.
-                    t.devices = vec![PluginInstance {
-                        aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
-                        ..PluginInstance::with_ports(
-                            "test.scc".into(),
-                            PluginFormat::Vst3,
-                            common::port_config::PortConfig {
-                                has_note_input: false,
-                                has_note_output: false,
-                                has_audio_output: true,
-                                // audio-FX device: audio を加工する → audio 入力あり。
-                                has_audio_input: true,
-                                has_video_input: false,
-                                has_video_output: false,
-                            },
-                        )
-                    }];
-                }),
-            ],
-            ..Song::default()
-        };
-        let mut schedule = compile_schedule(&song, 48_000).unwrap();
-        assert!(schedule.nodes.iter().any(|op| matches!(op, NodeOp::SidechainTap { .. })));
-
-        const FRAMES: usize = 64;
-        let mut scratch: Vec<TrackScratch> =
-            (0..common::audio_bridge::MAX_TRACKS).map(|_| TrackScratch::new()).collect();
-        for i in 0..FRAMES {
-            scratch[0].track_l[i] = (i as f32) * 0.1;
-            scratch[0].track_r[i] = -(i as f32) * 0.1;
-        }
-        let mut master_l = vec![0.0f32; FRAMES];
-        let mut master_r = vec![0.0f32; FRAMES];
-
-        let mut pd = Box::new(common::process_data::ProcessData::empty());
-        let pd_ptr: *mut common::process_data::ProcessData = &mut *pd;
-        let plugin_id: u32 = 42;
-        let plugin_ref = common::plugin_ref::PluginRef { plugin_id, process_data: pd_ptr };
-        let mut plugin_refs: HashMap<u32, common::plugin_ref::PluginRef> = HashMap::new();
-        plugin_refs.insert(plugin_id, plugin_ref);
-
-        let mut slot_to_plugin_id: HashMap<(u32, u32), u32> = HashMap::new();
-        slot_to_plugin_id.insert((2, 0), plugin_id);
-
-        execute_schedule_post_dispatch(
-            &mut schedule,
-            &mut scratch,
-            &mut master_l,
-            &mut master_r,
-            FRAMES,
-            &song,
-            &plugin_refs,
-            &slot_to_plugin_id,
-            None,
-            48_000,
-            FRAMES as u32,
-            true,
-            false,
-            &std::collections::HashSet::new(),
-            song.bpm,
-            0.0,
-            false,
-            &[],
-        );
-
-        for i in 0..FRAMES {
-            let want_l = (i as f32) * 0.1;
-            let want_r = -(i as f32) * 0.1;
-            assert!((pd.buffer_aux_in[0][0][i] - want_l).abs() < 1e-6);
-            assert!((pd.buffer_aux_in[0][1][i] - want_r).abs() < 1e-6);
-        }
-        assert_eq!(pd.aux_in_active[0], 1);
-    }
-}
-
-#[cfg(test)]
-mod send_tests {
-    use super::*;
-    use common::model::{Send, SendMode, Song, Track};
-
-    /// v23 single-chain: `Track::default()` を mutator で埋める helper
-    /// (`sidechain_tests::track` と同趣旨、 E0451 回避)。
-    fn track(f: impl FnOnce(&mut Track)) -> Track {
-        let mut t = Track::default();
-        f(&mut t);
-        t
-    }
-
-    const FRAMES: usize = 64;
-
-    fn song_with_send(gain: f32, mode: SendMode, enabled: bool) -> Song {
-        Song {
-            tracks: vec![
-                track(|t| {
-                    t.id = 1;
-                    t.name = "Vocal".into();
-                    t.sends = vec![Send {
-                        dest_track_id: 2,
-                        gain,
-                        mode,
-                        enabled,
-                    }];
-                }),
-                track(|t| {
-                    t.id = 2;
-                    t.name = "Reverb".into();
-                }),
-            ],
-            ..Song::default()
-        }
-    }
-
-    fn empty_lanes() -> std::collections::HashSet<(u32, common::model::AutomationTarget)> {
-        std::collections::HashSet::new()
-    }
-
-    /// A post-fader send accumulates `src * gain` into the return scratch
-    /// **on top of** whatever is already there (the prior clearing Mix is
-    /// a separate op), reading the source's post-fader `track_l/r`.
-    #[test]
-    fn post_fader_send_accumulates_src_times_gain() {
-        let song = song_with_send(0.5, SendMode::PostFader, true);
-        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
-        for i in 0..FRAMES {
-            scratch[0].track_l[i] = (i as f32) * 0.1;
-            scratch[0].track_r[i] = -(i as f32) * 0.1;
-            scratch[1].track_l[i] = 1.0; // pre-existing return content
-            scratch[1].track_r[i] = 2.0;
-        }
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0.0, false, &empty, FRAMES,
-        );
-        for i in 0..FRAMES {
-            let want_l = 1.0 + (i as f32) * 0.1 * 0.5;
-            let want_r = 2.0 + (-(i as f32) * 0.1) * 0.5;
-            assert!((scratch[1].track_l[i] - want_l).abs() < 1e-6, "l[{i}]");
-            assert!((scratch[1].track_r[i] - want_r).abs() < 1e-6, "r[{i}]");
-        }
-    }
-
-    /// A disabled send contributes nothing (per-send mute).
-    #[test]
-    fn disabled_send_contributes_silence() {
-        let song = song_with_send(0.5, SendMode::PostFader, false);
-        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
-        for i in 0..FRAMES {
-            scratch[0].track_l[i] = 1.0;
-            scratch[1].track_l[i] = 3.0;
-        }
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0.0, false, &empty, FRAMES,
-        );
-        for i in 0..FRAMES {
-            assert_eq!(scratch[1].track_l[i], 3.0, "disabled send must not change dst");
-        }
-    }
-
-    /// An *explicitly* muted source silences its sends.
-    #[test]
-    fn explicitly_muted_source_send_contributes_silence() {
-        let mut song = song_with_send(1.0, SendMode::PostFader, true);
-        song.tracks[0].muted = true; // explicit mute kills the send
-        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
-        for i in 0..FRAMES {
-            scratch[0].track_l[i] = 1.0;
-            scratch[1].track_l[i] = 3.0;
-        }
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0.0, false, &empty, FRAMES,
-        );
-        for i in 0..FRAMES {
-            assert_eq!(
-                scratch[1].track_l[i], 3.0,
-                "explicitly muted source must not feed its send"
-            );
-        }
-    }
-
-    /// Under solo, a send must respect BOTH the source's and the
-    /// destination's solo state: soloing one source must not leak other
-    /// tracks' sends into a shared return, but soloing the return itself
-    /// auditions everything routed to it.
-    #[test]
-    fn send_under_solo_respects_source_and_return_solo() {
-        let render = |solo_src: bool, solo_dest: bool| -> f32 {
-            let mut song = song_with_send(1.0, SendMode::PostFader, true);
-            song.tracks[0].solo = solo_src; // Vocal (source)
-            song.tracks[1].solo = solo_dest; // Reverb return (dest)
-            let mut scratch: Vec<TrackScratch> =
-                (0..4).map(|_| TrackScratch::new()).collect();
-            scratch[0].track_l[0] = 0.5;
-            let empty = empty_lanes();
-            mix_send_into_track_scratch(
-                &mut scratch, 1, 0, false, &song, 0, 0, 48_000, 120.0, 0.0, true, &empty, FRAMES,
-            );
-            scratch[1].track_l[0]
-        };
-        // A soloed source still feeds its own send.
-        assert!(
-            (render(true, false) - 0.5).abs() < 1e-6,
-            "a soloed source still feeds its send"
-        );
-        // Neither the source audible nor the return soloed → blocked, so
-        // soloing one track does not leak other tracks' sends.
-        assert_eq!(
-            render(false, false),
-            0.0,
-            "a non-audible source must not leak into the return"
-        );
-        // Return explicitly soloed → audition: the send flows even from a
-        // non-soloed source.
-        assert!(
-            (render(false, true) - 0.5).abs() < 1e-6,
-            "soloing the return auditions the sends feeding it"
-        );
-    }
-
-    /// A pre-fader send reads the source's `pre_fader_l/r`, not its
-    /// post-fader `track_l/r`.
-    #[test]
-    fn pre_fader_send_reads_pre_fader_buffer() {
-        let song = song_with_send(1.0, SendMode::PreFader, true);
-        let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
-        for i in 0..FRAMES {
-            scratch[0].track_l[i] = 9.0; // post-fader — must be ignored
-            scratch[0].track_r[i] = 9.0;
-            scratch[0].pre_fader_l[i] = 0.25; // pre-fader — must be used
-            scratch[0].pre_fader_r[i] = 0.5;
-        }
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, true, &song, 0, 0, 48_000, 120.0, 0.0, false, &empty, FRAMES,
-        );
-        for i in 0..FRAMES {
-            assert!(
-                (scratch[1].track_l[i] - 0.25).abs() < 1e-6,
-                "pre-fader send must read pre_fader_l"
-            );
-            assert!((scratch[1].track_r[i] - 0.5).abs() < 1e-6);
-        }
-    }
-
-    /// Solo-safe returns: when a track that aux-sends into a return is
-    /// soloed, the return must count as having a soloed contributor so the
-    /// solo rule keeps it audible instead of muting it. Regression for the
-    /// user-reported "soloed track's send reaches the FX, but the return
-    /// fader meter is dead and there is no sound".
-    #[test]
-    fn soloed_send_source_keeps_return_solo_safe() {
-        // song_with_send: Vocal (id 1) post-fader sends to Reverb (id 2).
-        let mut song = song_with_send(1.0, SendMode::PostFader, true);
-        song.tracks[0].solo = true; // solo the send SOURCE (Vocal)
-        assert!(
-            has_soloed_contributor(&song, 2),
-            "Reverb return must be solo-safe when its send source is soloed"
-        );
-        // Nothing soloed → the return has no soloed contributor.
-        song.tracks[0].solo = false;
-        assert!(
-            !has_soloed_contributor(&song, 2),
-            "with nothing soloed, the return has no soloed contributor"
-        );
-    }
-
-    /// Folder solo: soloing a GROUP must keep its children audible (Ableton /
-    /// Reaper folder behavior). The leaf strip rule excludes a non-soloed
-    /// track under solo only when no ancestor group is soloed, so a child of
-    /// a soloed group is NOT effective-muted. Guards the `ancestor_soloed`
-    /// condition added to the effective-mute formula.
-    #[test]
-    fn soloed_group_keeps_children_audible() {
-        // id 10 = group, id 11 = child of 10, id 12 = unrelated.
-        let song = Song {
-            tracks: vec![
-                track(|t| {
-                    t.id = 10;
-                    t.solo = true;
-                }), // solo the group
-                track(|t| {
-                    t.id = 11;
-                    t.parent_group_id = Some(10);
-                }),
-                track(|t| t.id = 12),
-            ],
-            ..Default::default()
-        };
-
-        let any_solo = song.tracks.iter().any(|t| t.solo);
-        assert!(any_solo);
-        // child: not soloed itself, but its ancestor group is → audible.
-        assert!(song.ancestor_soloed(11), "child sees the soloed ancestor group");
-        let child = &song.tracks[1];
-        let child_excluded = any_solo && !child.solo && !song.ancestor_soloed(child.id);
-        assert!(!child_excluded, "child of a soloed group must not be solo-excluded");
-        // unrelated track: no soloed ancestor → excluded (silent) under solo.
-        let other = &song.tracks[2];
-        let other_excluded = any_solo && !other.solo && !song.ancestor_soloed(other.id);
-        assert!(other_excluded, "unrelated track is silenced while a group is soloed");
-    }
-}
-
-/// D1 / PR3: off-thread routing publish → wait-free RT install → off-thread
-/// recycle. Verifies the audio thread picks up the newest schedule, hands the
-/// superseded one back for disposal, coalesces bursts, and (under `rt-assert`)
-/// performs the install with zero allocation/free on the audio thread.
-#[cfg(test)]
-mod routing_publish_tests {
+mod bundle_install_tests {
     use super::*;
     use crate::graph::compile_schedule;
     use common::model::{Song, Track};
 
     fn track(id: u32) -> Track {
-        // See `sidechain_tests::track` for why a default + mutate (not a struct
-        // literal) is required here.
+        // Track の legacy migration fields は common に pub(crate) で閉じて
+        // いるため、 default + mutate で構築する (E0451 回避)。
         let mut t = Track::default();
         t.id = id;
         t
     }
 
-    fn make_routing(song: &Arc<Song>) -> CompiledRouting {
-        CompiledRouting {
-            song: Arc::clone(song),
-            schedule: compile_schedule(song, 48_000).unwrap(),
+    fn make_bundle(song: &Arc<Song>) -> RtBundle {
+        RtBundle {
+            song: Some(Arc::clone(song)),
             tempo_map: common::tempo_map::TempoMap::from_song(song),
+            schedule: Some(compile_schedule(song, 48_000, 0).unwrap()),
+            input_delay_replacements: Vec::new(),
+            plugin_refs: Arc::new(HashMap::new()),
+            worker: None,
         }
     }
 
     /// A `LocalState` plus the off-thread ends of the forward + recycle rings,
-    /// so a test can publish snapshots and inspect what got recycled.
+    /// so a test can publish bundles and inspect what got recycled.
     fn harness() -> (
         LocalState,
-        rtrb::Producer<CompiledRouting>,
-        rtrb::Consumer<CompiledRouting>,
+        rtrb::Producer<RtBundle>,
+        rtrb::Consumer<RtBundle>,
     ) {
         let shared = Arc::new(EngineShared::new());
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (routing_tx, routing_rx) = rtrb::RingBuffer::new(8);
+        let (bundle_tx, bundle_rx) = rtrb::RingBuffer::new(8);
         let (recycle_tx, recycle_rx) = rtrb::RingBuffer::new(8);
         let local = LocalState::new(
             common::process_data::MAX_FRAMES,
             cmd_rx,
             shared,
-            routing_rx,
+            bundle_rx,
             recycle_tx,
         );
-        (local, routing_tx, recycle_rx)
+        (local, bundle_tx, recycle_rx)
     }
 
     #[test]
-    fn refresh_installs_published_routing_and_recycles_the_old() {
-        let (mut local, mut routing_tx, mut recycle_rx) = harness();
+    fn refresh_installs_published_bundle_and_recycles_the_old() {
+        let (mut local, mut bundle_tx, mut recycle_rx) = harness();
 
         let mut s1 = Song::default();
         s1.tracks.push(track(1));
         s1.tracks.push(track(2));
         let s1 = Arc::new(s1);
-        routing_tx.push(make_routing(&s1)).unwrap();
+        bundle_tx.push(make_bundle(&s1)).unwrap();
 
-        local.refresh_schedule();
+        local.refresh_bundle();
         assert!(
             local.cached_song.as_ref().is_some_and(|s| Arc::ptr_eq(s, &s1)),
             "first publish installs its song"
         );
-        // First install has no predecessor → nothing recycled.
-        assert!(recycle_rx.pop().is_err());
+        // First install recycles only trivial defaults (no prior song).
+        let first = recycle_rx.pop().expect("first install ships back the defaults");
+        assert!(first.song.is_none());
 
         let mut s2 = Song::default();
         s2.tracks.push(track(7));
         let s2 = Arc::new(s2);
-        routing_tx.push(make_routing(&s2)).unwrap();
+        bundle_tx.push(make_bundle(&s2)).unwrap();
 
-        local.refresh_schedule();
+        local.refresh_bundle();
         assert!(
             local.cached_song.as_ref().is_some_and(|s| Arc::ptr_eq(s, &s2)),
             "second publish installs its song"
         );
         // The superseded snapshot (s1) is handed back for off-thread disposal.
-        let recycled = recycle_rx.pop().expect("old routing recycled off-thread");
-        assert!(Arc::ptr_eq(&recycled.song, &s1));
+        let recycled = recycle_rx.pop().expect("old bundle recycled off-thread");
+        assert!(recycled.song.as_ref().is_some_and(|s| Arc::ptr_eq(s, &s1)));
     }
 
     #[test]
-    fn refresh_coalesces_a_burst_to_newest_and_recycles_intermediates() {
-        let (mut local, mut routing_tx, mut recycle_rx) = harness();
+    fn refresh_coalesces_a_burst_to_newest() {
+        let (mut local, mut bundle_tx, mut recycle_rx) = harness();
         let songs: Vec<Arc<Song>> = (0..3)
             .map(|i| {
                 let mut s = Song::default();
@@ -3126,11 +1110,11 @@ mod routing_publish_tests {
             })
             .collect();
         for s in &songs {
-            routing_tx.push(make_routing(s)).unwrap();
+            bundle_tx.push(make_bundle(s)).unwrap();
         }
         // One refresh drains all three: installs the last, recycles the two it
-        // skipped past. (The first install has no predecessor of its own.)
-        local.refresh_schedule();
+        // skipped past + the initial defaults.
+        local.refresh_bundle();
         assert!(
             local
                 .cached_song
@@ -3141,32 +1125,118 @@ mod routing_publish_tests {
         while recycle_rx.pop().is_ok() {
             recycled += 1;
         }
-        assert_eq!(recycled, 2, "the two skipped snapshots are recycled off-thread");
+        assert_eq!(
+            recycled, 3,
+            "two skipped bundles + the initial defaults are recycled off-thread"
+        );
+    }
+
+    /// §5 D: 値のみ更新 (schedule = None) は song を差し替えつつ現行 schedule
+    /// (走行状態込み) を据え置く。
+    #[test]
+    fn value_only_bundle_keeps_current_schedule() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+
+        let mut s1 = Song::default();
+        s1.tracks.push(track(1));
+        s1.tracks.push(track(2));
+        let s1 = Arc::new(s1);
+        bundle_tx.push(make_bundle(&s1)).unwrap();
+        local.refresh_bundle();
+        let node_count = local.cached_schedule.nodes.len();
+        assert!(node_count > 0);
+
+        // 値のみ更新: schedule を載せない。
+        let mut s2 = (*s1).clone();
+        s2.tracks[0].volume = 0.5;
+        let s2 = Arc::new(s2);
+        bundle_tx
+            .push(RtBundle {
+                song: Some(Arc::clone(&s2)),
+                tempo_map: common::tempo_map::TempoMap::from_song(&s2),
+                schedule: None,
+                input_delay_replacements: Vec::new(),
+                plugin_refs: Arc::new(HashMap::new()),
+                worker: None,
+            })
+            .unwrap();
+        local.refresh_bundle();
+        assert!(
+            local.cached_song.as_ref().is_some_and(|s| Arc::ptr_eq(s, &s2)),
+            "song must follow the value-only bundle"
+        );
+        assert_eq!(
+            local.cached_schedule.nodes.len(),
+            node_count,
+            "schedule must be kept (not recompiled / not emptied)"
+        );
+    }
+
+    /// §5 D: topology 更新 (schedule = Some) は DelayLine の走行状態を
+    /// stable key で移送する。
+    #[test]
+    fn topology_bundle_adopts_delay_line_state() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+
+        // 2 track、片方に latency → 補償 DelayLine が 1 本出る song。
+        let mut s1 = Song::default();
+        s1.tracks.push(track(1));
+        s1.tracks.push({
+            let mut t = track(2);
+            t.reported_latency_samples = 4;
+            t
+        });
+        let s1 = Arc::new(s1);
+        bundle_tx.push(make_bundle(&s1)).unwrap();
+        local.refresh_bundle();
+        assert_eq!(local.cached_schedule.delay_lines.len(), 1);
+
+        // 走行状態を作る: ring に非ゼロを流し込む。
+        {
+            let line = &mut local.cached_schedule.delay_lines[0];
+            let mut l = [1.0f32, 2.0, 3.0];
+            let mut r = [4.0f32, 5.0, 6.0];
+            line.step_in_place(&mut l, &mut r, 4);
+        }
+
+        // 同一 topology の再 compile (LoadSong 相当) を publish。
+        bundle_tx.push(make_bundle(&s1)).unwrap();
+        local.refresh_bundle();
+
+        // 新 schedule の line が旧状態を引き継いでいる: さらに 3 sample 流すと
+        // 遅延 4 の ring から最初に注入した値が出てくる (リセットなら 0)。
+        let line = &mut local.cached_schedule.delay_lines[0];
+        let mut l = [0.0f32; 3];
+        let mut r = [0.0f32; 3];
+        line.step_in_place(&mut l, &mut r, 4);
+        assert_eq!(l[1], 1.0, "adopted ring must carry the pre-swap history");
+        assert_eq!(l[2], 2.0);
     }
 
     /// Proof of the D1 invariant: a steady-state install allocates and frees
     /// nothing on the audio thread. Requires the `rt-assert` allocator hook.
     #[cfg(feature = "rt-assert")]
     #[test]
-    fn refresh_schedule_does_not_allocate_on_the_audio_thread() {
-        let (mut local, mut routing_tx, _recycle_rx) = harness();
+    fn refresh_bundle_does_not_allocate_on_the_audio_thread() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
 
         let mut s1 = Song::default();
         s1.tracks.push(track(1));
         let s1 = Arc::new(s1);
-        routing_tx.push(make_routing(&s1)).unwrap();
-        local.refresh_schedule(); // warm up (first install, no recycle)
+        bundle_tx.push(make_bundle(&s1)).unwrap();
+        local.refresh_bundle(); // warm up (first install)
 
         let mut s2 = Song::default();
         s2.tracks.push(track(1));
         s2.tracks.push(track(2));
         let s2 = Arc::new(s2);
-        routing_tx.push(make_routing(&s2)).unwrap();
+        bundle_tx.push(make_bundle(&s2)).unwrap();
 
-        // Steady-state install: pop the newest, swap the cached fields, push the
-        // old to the recycle ring — all wait-free, no alloc, no free.
+        // Steady-state install: pop the newest, adopt + swap the cached
+        // fields, push the old to the recycle ring — all wait-free, no alloc,
+        // no free.
         assert_no_alloc::assert_no_alloc(|| {
-            local.refresh_schedule();
+            local.refresh_bundle();
         });
     }
 }

@@ -69,6 +69,22 @@ impl DelayLine {
         self.write = 0;
     }
 
+    /// Schedule 再 compile 間の状態移送 (`Schedule::adopt_state_from`)。
+    /// capacity (= 補償 delay 長 + 1) が一致するときだけ ring の内容と
+    /// write cursor を `old` から引き継ぐ。`Vec` の中身は `mem::swap` の
+    /// ポインタ交換なので RT スレッド上で alloc/free が発生しない。
+    /// capacity 不一致 (= delay 長が変わった) は移送せず `false`
+    /// (呼び出し側はゼロ初期化のまま使う = リセット)。
+    pub fn try_adopt(&mut self, old: &mut DelayLine) -> bool {
+        if self.capacity != old.capacity {
+            return false;
+        }
+        std::mem::swap(&mut self.buf_l, &mut old.buf_l);
+        std::mem::swap(&mut self.buf_r, &mut old.buf_r);
+        std::mem::swap(&mut self.write, &mut old.write);
+        true
+    }
+
     /// `step` の in-place 版: `l` / `r` 1 組のスライスを入力でも出力でも
     /// 兼用する。 audio engine の post-dispatch では track の scratch
     /// (`TrackScratch::track_l/r`) を **そのまま** 遅延線に通したいので、

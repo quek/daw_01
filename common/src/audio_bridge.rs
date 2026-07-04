@@ -13,7 +13,6 @@ pub const DEFAULT_SAMPLE_RATE: u32 = 48000;
 /// 二重定義で乖離すると RT パスの `assert!(frames <= MAX_FRAMES)` が panic する。
 pub const MAX_FRAMES: u32 = crate::process_data::MAX_FRAMES as u32;
 pub const CHANNELS: u32 = 2;
-pub const SAMPLE_BUFFER_LEN: usize = (MAX_FRAMES * CHANNELS) as usize;
 /// Hard cap for the per-track peak meter ring in shmem. Tracks beyond this
 /// index are still processed, they just don't publish a meter. 32 matches
 /// Renoise's default Mixer column count.
@@ -23,25 +22,25 @@ pub const MAX_TRACKS: usize = 32;
 /// `EnvelopeFollow` node isn't emitted). Indexed by `ModSource` position.
 pub const MAX_MOD_SOURCES: usize = 64;
 
-/// Shared memory layout between daw_plugin_host (writer), daw_audio (reader +
-/// meter writer) and daw_gui (polling reader).
-/// daw_audio populates `frames_requested` then signals the request semaphore;
-/// daw_plugin_host fills `samples` (interleaved stereo) then signals the ready
-/// semaphore.
+/// Shared memory telemetry plane: daw_audio (writer) → daw_gui (30Hz
+/// polling reader)。
 ///
-/// `playhead_samples` is published by daw_plugin_host at the end of every
+/// `playhead_samples` is published by **daw_audio** at the end of every
 /// buffer so daw_gui can poll it (once per UI tick) for playhead-row
 /// highlighting.
 ///
 /// `peak_l` / `peak_r` are the most recent per-block peaks (linear
 /// amplitude, stored as `f32::to_bits`) written by daw_audio after applying
-/// master gain, so daw_gui can draw a level meter. All three auxiliary
-/// fields are lock-free Acquire/Release atomics — readers tolerate any
-/// value they happen to observe.
+/// master gain, so daw_gui can draw a level meter. All fields are
+/// lock-free Acquire/Release atomics — readers tolerate any value they
+/// happen to observe.
+///
+/// v29 (`docs/plan_arch_refactor.md` §2): 旧 `frames_requested` / `samples`
+/// 面 (M0 時代の request/ready セマフォ往復データプレーン) は writer /
+/// reader とも存在しない死んだ protocol だったため削除。音声データは
+/// per-plugin の `ProcessData` shmem + `WorkerBridge` dispatch が運ぶ。
 #[repr(C)]
 pub struct AudioBridge {
-    pub frames_requested: AtomicU32,
-    _pad: u32,
     pub playhead_samples: AtomicU64,
     pub peak_l: AtomicU32,
     pub peak_r: AtomicU32,
@@ -61,8 +60,6 @@ pub struct AudioBridge {
     /// 0 = count-in 中ではない / 完了済。 通常再生中は audio thread が更新
     /// しないので、 `StartCountIn` 受信時に audio thread が値を立てる。
     pub preroll_remaining_samples: AtomicU64,
-    _pad_preroll: u32,
-    pub samples: [f32; SAMPLE_BUFFER_LEN],
 }
 
 impl AudioBridge {
@@ -97,19 +94,6 @@ impl AudioBridgeHandle {
 
     pub fn bridge(&self) -> &AudioBridge {
         unsafe { &*self.ptr() }
-    }
-
-    pub fn samples_ptr(&self) -> *mut f32 {
-        let bridge = self.ptr();
-        unsafe { (&raw mut (*bridge).samples) as *mut f32 }
-    }
-
-    pub fn set_frames_requested(&self, n: u32) {
-        self.bridge().frames_requested.store(n, Ordering::Release);
-    }
-
-    pub fn frames_requested(&self) -> u32 {
-        self.bridge().frames_requested.load(Ordering::Acquire)
     }
 
     pub fn set_playhead_samples(&self, n: u64) {
@@ -212,20 +196,11 @@ impl AudioBridgeHandle {
     }
 }
 
-// The underlying shared memory is safe to share across threads; the single
-// atomic counter and the sample buffer are protected by the request/ready
-// semaphore handshake.
+// The underlying shared memory is safe to share across threads; every
+// field is a lock-free atomic and readers tolerate any observed value.
 unsafe impl Send for AudioBridgeHandle {}
 unsafe impl Sync for AudioBridgeHandle {}
 
 pub fn shmem_id(parent_pid: u32) -> String {
     format!("daw_01_audio_{parent_pid}")
-}
-
-pub fn request_sem_id(parent_pid: u32) -> String {
-    format!("daw_01_req_{parent_pid}")
-}
-
-pub fn ready_sem_id(parent_pid: u32) -> String {
-    format!("daw_01_ready_{parent_pid}")
 }

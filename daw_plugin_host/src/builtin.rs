@@ -1,10 +1,10 @@
-//! daw_01-bundled instrument / FX plugins. PR-V1 scaffolding for
-//! `docs/plan_voicevox_synth.md`.
+//! daw_01-bundled instrument / FX plugins.
 //!
-//! Builtin plugins implement [`crate::plugin_instance::LoadedPlugin`] so
-//! they share **every** code path with external CLAP / VST3 plugins on
-//! the audio thread (process scheduling, PDC, sidechain wiring, state
-//! save / restore, project file format). The only difference is how
+//! Builtin plugins implement [`crate::plugin_instance::LoadedPlugin`] (+
+//! a separate [`crate::plugin_instance::AudioProcessorHalf`], split-half
+//! design) so they share **every** code path with external CLAP / VST3
+//! plugins on the audio thread (process scheduling, PDC, sidechain wiring,
+//! state save / restore, project file format). The only difference is how
 //! they are loaded:
 //!
 //! - External CLAP / VST3: `path` is a filesystem path, the host opens
@@ -13,30 +13,14 @@
 //!   host dispatches it to a Rust constructor in this module via
 //!   [`load_builtin`].
 //!
-//! State save / restore: each plugin is responsible for serialising its
-//! own parameters via `LoadedPlugin::state_save` / `state_load`. Builtin
-//! plugins typically use `bincode` so the on-disk size is small and
-//! the format is deterministic.
-//!
-//! ## PR-V1 deliverable: `Silence`
-//!
-//! A no-op instrument that emits stereo silence regardless of MIDI
-//! input. Used to verify the load → activate → process → state →
-//! destroy lifecycle for the Builtin format before VOICEVOX synthesis
-//! is wired up in PR-V2. It also serves as the minimal reference
-//! implementation for future builtins.
-//!
 //! ## Adding a new builtin
 //!
-//! 1. Implement [`crate::plugin_instance::LoadedPlugin`] for your
-//!    struct. Stay on the heap (`Box<Self>` is what the loader returns).
-//! 2. Register it in [`builtin_descriptors`] with a unique
+//! 1. Implement `LoadedPlugin` (+ an audio half) for your struct.
+//! 2. Register it in `common::plugin_db::builtin_descriptors` with a unique
 //!    `builtin://...` URI as `id`.
 //! 3. Add a constructor branch to [`load_builtin`].
-//!
-//! That's it — `plugin_db::scan_system` automatically appends every
-//! [`builtin_descriptors`] entry, so the plugin picker UI sees the new
-//! plugin without further wiring.
+
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use common::plugin_db::{BUILTIN_ID_SILENCE, BUILTIN_ID_VOICEVOX};
@@ -44,102 +28,46 @@ use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
 
 use crate::plugin_instance::{
-    AuxInputBuf, HostCallbacks, LoadedPlugin, TimedNoteEvent,
+    AudioHalf, AudioProcessorHalf, AuxInputBuf, HostCallbacks, LoadedPlugin, TimedNoteEvent,
 };
 
 mod voicevox;
 
 pub use voicevox::VoicevoxBuiltin;
 
-/// Stable URI prefix used for all builtin plugin identifiers. Never
-/// refers to a real filesystem location — `load_builtin` checks the
-/// scheme and dispatches to a Rust constructor in this module.
+/// Stable URI prefix used for all builtin plugin identifiers.
 const BUILTIN_URI_PREFIX: &str = "builtin://";
 
 /// Construct a builtin plugin instance from a `builtin://` URI.
-/// `_callbacks` is accepted for parity with the CLAP / VST3 loaders;
-/// PR-V1 builtins don't request resize / closed callbacks but PR-V2's
-/// VOICEVOX plugin will (synthesis progress reporting).
-///
-/// The list of supported URIs is defined by
-/// [`common::plugin_db::builtin_descriptors`] — adding a new constant
-/// there + a match arm here is all that's needed to register a new
-/// builtin.
+/// `callbacks` is the same host-callback bundle CLAP / VST3 loaders get;
+/// VOICEVOX uses `on_vocal_synth_status` for synthesis progress reporting.
 pub fn load_builtin(
     uri: &str,
-    _callbacks: HostCallbacks,
+    callbacks: HostCallbacks,
 ) -> Result<Box<dyn LoadedPlugin>> {
     if !uri.starts_with(BUILTIN_URI_PREFIX) {
         bail!("builtin loader: expected `builtin://` URI, got {uri:?}");
     }
     match uri {
         BUILTIN_ID_SILENCE => Ok(Box::new(Silence::new()) as Box<dyn LoadedPlugin>),
-        BUILTIN_ID_VOICEVOX => Ok(Box::new(VoicevoxBuiltin::new()) as Box<dyn LoadedPlugin>),
+        BUILTIN_ID_VOICEVOX => Ok(Box::new(VoicevoxBuiltin::new(
+            callbacks.on_vocal_synth_status.clone(),
+        )) as Box<dyn LoadedPlugin>),
         other => bail!("unknown builtin plugin id: {other}"),
     }
 }
 
 // ============================================================
-// Silence — minimal builtin instrument (PR-V1 reference impl)
+// Silence — minimal builtin instrument (reference impl)
 // ============================================================
 
-/// A no-op instrument: ignores all MIDI input and writes stereo silence
-/// to its output buffers every `process()` call. Used to validate the
-/// Builtin format end-to-end before more interesting plugins land.
-pub struct Silence {
+/// Audio half of [`Silence`]: writes stereo silence every `process()`.
+struct SilenceAudioHalf {
     out_l: Vec<f32>,
     out_r: Vec<f32>,
-    activated: bool,
 }
 
-impl Silence {
-    fn new() -> Self {
-        Self {
-            out_l: Vec::new(),
-            out_r: Vec::new(),
-            activated: false,
-        }
-    }
-}
-
-impl LoadedPlugin for Silence {
-    fn id(&self) -> &str {
-        BUILTIN_ID_SILENCE
-    }
-
-    fn name(&self) -> &str {
-        "Silence (builtin)"
-    }
-
-    fn format(&self) -> PluginFormat {
-        PluginFormat::Builtin
-    }
-
-    fn activate(
-        &mut self,
-        _sample_rate: f64,
-        _min_frames: u32,
-        max_frames: u32,
-    ) -> Result<()> {
-        let cap = max_frames as usize;
-        self.out_l.clear();
-        self.out_l.resize(cap, 0.0);
-        self.out_r.clear();
-        self.out_r.resize(cap, 0.0);
-        self.activated = true;
-        Ok(())
-    }
-
-    fn deactivate(&mut self) {
-        self.activated = false;
-    }
-
-    fn start_processing(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn stop_processing(&mut self) {}
-
+impl AudioProcessorHalf for SilenceAudioHalf {
     fn process(
         &mut self,
         frames: u32,
@@ -149,7 +77,7 @@ impl LoadedPlugin for Silence {
         _aux_inputs: &[AuxInputBuf<'_>],
         _transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
-        // Capacity was sized at activate(); zero-fill the live window.
+        // Capacity was sized at on_activate(); zero-fill the live window.
         let n_l = (frames as usize).min(self.out_l.len());
         for v in &mut self.out_l[..n_l] {
             *v = 0.0;
@@ -173,9 +101,76 @@ impl LoadedPlugin for Silence {
         // Builtin instrument with no MIDI output.
     }
 
+    fn on_activate(&mut self, _sample_rate: f64, max_frames: u32) {
+        let cap = max_frames as usize;
+        self.out_l.clear();
+        self.out_l.resize(cap, 0.0);
+        self.out_r.clear();
+        self.out_r.resize(cap, 0.0);
+    }
+}
+
+/// A no-op instrument: ignores all MIDI input and outputs stereo silence.
+/// Validates the Builtin format end-to-end and serves as the minimal
+/// reference implementation for future builtins.
+pub struct Silence {
+    activated: bool,
+    audio: Arc<AudioHalf>,
+}
+
+impl Silence {
+    fn new() -> Self {
+        Self {
+            activated: false,
+            audio: AudioHalf::new(Box::new(SilenceAudioHalf {
+                out_l: Vec::new(),
+                out_r: Vec::new(),
+            })),
+        }
+    }
+}
+
+impl LoadedPlugin for Silence {
+    fn id(&self) -> &str {
+        BUILTIN_ID_SILENCE
+    }
+
+    fn name(&self) -> &str {
+        "Silence (builtin)"
+    }
+
+    fn format(&self) -> PluginFormat {
+        PluginFormat::Builtin
+    }
+
+    fn audio_half(&self) -> Arc<AudioHalf> {
+        Arc::clone(&self.audio)
+    }
+
+    fn activate(
+        &mut self,
+        sample_rate: f64,
+        _min_frames: u32,
+        max_frames: u32,
+    ) -> Result<()> {
+        // SAFETY: quiesced window (install / reinit call sites).
+        unsafe { self.audio.get().on_activate(sample_rate, max_frames) };
+        self.activated = true;
+        Ok(())
+    }
+
+    fn deactivate(&mut self) {
+        self.activated = false;
+    }
+
+    fn start_processing(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn stop_processing(&mut self) {}
+
     fn set_render_mode(&mut self, _mode: RenderMode) -> bool {
-        // No internal state changes between Realtime / Offline; signal
-        // "accepted" so the host doesn't log a render-mode warning.
+        // No internal state changes between Realtime / Offline.
         true
     }
 
@@ -184,8 +179,7 @@ impl LoadedPlugin for Silence {
     }
 
     fn state_save(&self) -> Result<Option<Vec<u8>>> {
-        // Stateless — saving and restoring nothing keeps project files
-        // small and round-trips cleanly.
+        // Stateless.
         Ok(None)
     }
 
@@ -258,18 +252,20 @@ mod tests {
 
     #[test]
     fn silence_process_writes_zeros() {
-        let mut p = Silence::new();
-        p.activate(48000.0, 0, 256).unwrap();
-        p.start_processing().unwrap();
+        let mut h = SilenceAudioHalf {
+            out_l: Vec::new(),
+            out_r: Vec::new(),
+        };
+        h.on_activate(48000.0, 256);
         // Pretend prior process polluted the buffer.
-        p.out_l[0] = 0.7;
-        p.out_r[1] = -0.4;
+        h.out_l[0] = 0.7;
+        h.out_r[1] = -0.4;
         let transport = crate::plugin_instance::TransportContext::from_process_data(
             &common::process_data::ProcessData::empty(),
         );
-        p.process(128, &[], &[], &[], &[], &transport).unwrap();
-        assert!(p.out_l[..128].iter().all(|&v| v == 0.0));
-        assert!(p.out_r[..128].iter().all(|&v| v == 0.0));
+        h.process(128, &[], &[], &[], &[], &transport).unwrap();
+        assert!(h.out_l[..128].iter().all(|&v| v == 0.0));
+        assert!(h.out_r[..128].iter().all(|&v| v == 0.0));
     }
 
     #[test]

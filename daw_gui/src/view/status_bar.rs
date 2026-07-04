@@ -32,12 +32,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     let left = format!(
         "MIDI: {} \u{2502} file: {}",
-        if app.midi_input_label.is_empty() {
+        if app.recording.midi_input_label.is_empty() {
             "(none)"
         } else {
-            app.midi_input_label.as_str()
+            app.recording.midi_input_label.as_str()
         },
-        app.file_path
+        app.song_doc.file_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(unsaved)".to_string()),
@@ -48,8 +48,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 右端に DSP load (peak) / system CPU / FPS / xrun を色付きで常駐表示し、
     // クリックで詳細パネルを開閉する。 app_config で on/off (デフォルト on)。
     let mut left_limit = area.x + area.w - pad;
-    if app.resource_monitor_enabled {
-        let m = &app.metrics;
+    if app.ui_prefs.resource_monitor_enabled {
+        let m = &app.ipc.metrics;
         let badge_w = 248.0;
         let badge_x = area.x + area.w - badge_w - pad;
         let badge_y = area.y + 3.0;
@@ -70,10 +70,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             Rect { x: badge_x + main_w, y: badge_y, w: badge_w - main_w, h: badge_h },
             || {
                 Edit::mutate(|app: &mut AppData| {
-                    if let Some(mb) = &app.metrics_bridge {
+                    if let Some(mb) = &app.ipc.metrics_bridge {
                         mb.reset_xrun();
                     }
-                    app.metrics.xrun_count = 0;
+                    app.ipc.metrics.xrun_count = 0;
                 })
             },
         );
@@ -121,13 +121,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         left_limit = badge_x - 8.0;
     }
 
-    if !app.status_message.is_empty() {
+    if !app.ui_ephemeral.status_message.is_empty() {
         // メーターと被らない位置にだけ status_message を出す。
         let mid_x = area.x + area.w * 0.55;
         if mid_x < left_limit {
             ui.label_at(
                 "status_message",
-                &app.status_message,
+                &app.ui_ephemeral.status_message,
                 mid_x,
                 line_y,
                 11.0,

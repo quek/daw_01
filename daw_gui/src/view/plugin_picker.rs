@@ -1,6 +1,6 @@
 //! Plugin picker (modal overlay)。`Ui::modal` + `Ui::list_view` で構築。
 //!
-//! root.rs から常時呼ばれる。app.is_plugin_picker_open == true のときに
+//! root.rs から常時呼ばれる。app.ui_ephemeral.is_plugin_picker_open == true のときに
 //! modal を開き、ESC / outside click / Close ボタンで閉じる。
 
 use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
@@ -46,9 +46,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // select_plugin_from_db が flag=false にするので、 ここで modal を閉じる
     // (= 選択したら閉じる)。 Ctrl 選択は flag=true のままなので開いた
     // まま連続追加できる。
-    if app.is_plugin_picker_open && !ui.is_modal_open("plugin_picker") {
+    if app.ui_ephemeral.is_plugin_picker_open && !ui.is_modal_open("plugin_picker") {
         ui.open_modal("plugin_picker");
-    } else if !app.is_plugin_picker_open && ui.is_modal_open("plugin_picker") {
+    } else if !app.ui_ephemeral.is_plugin_picker_open && ui.is_modal_open("plugin_picker") {
         ui.close_modal("plugin_picker");
     }
 
@@ -75,7 +75,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             let close_w = 32.0;
             let rescan_x = panel.x + panel.w - pad - rescan_w - 6.0 - close_w;
             let close_x = panel.x + panel.w - pad - close_w;
-            let is_rescanning = app.is_rescanning;
+            let is_rescanning = app.ipc.is_rescanning;
             ui.button_at(
                 "pp_rescan",
                 if is_rescanning { "Rescanning" } else { "Rescan" },
@@ -108,7 +108,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             let search_resp = ui.text_input_at_focused(
                 "pp_search",
                 search_rect,
-                &app.plugin_picker_query,
+                &app.ui_ephemeral.plugin_picker_query,
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::SetPluginPickerQuery(new.clone()))
@@ -128,7 +128,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 }));
             }
             // text_input は placeholder 非対応なので、 空のとき薄色ヒントを重ねる。
-            if app.plugin_picker_query.is_empty() {
+            if app.ui_ephemeral.plugin_picker_query.is_empty() {
                 ui.label_at(
                     "pp_search_hint",
                     "Filter by name / vendor  (e.g. murv)",
@@ -141,7 +141,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             // Enter でカーソル位置の候補を確定 (= list クリックと同じ経路でロード)。
             // 0 件なら何もしない。 カーソルは ↑↓ で動かす (gui_01 #057)。
             if search_resp.committed
-                && let Some(target) = app.plugin_picker_visible.get(app.plugin_picker_cursor)
+                && let Some(target) = app.ui_ephemeral.plugin_picker_visible.get(app.ui_ephemeral.plugin_picker_cursor)
             {
                 let id = target.id.clone();
                 // 修飾キー: Ctrl=開いたまま連続追加 / Shift=GUI を開かない。
@@ -161,7 +161,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 w: panel.w - pad * 2.0,
                 h: panel.y + panel.h - pad - list_y,
             };
-            let visible = &app.plugin_picker_visible;
+            let visible = &app.ui_ephemeral.plugin_picker_visible;
             if visible.is_empty() {
                 ui.label_at(
                     "pp_empty",
@@ -178,7 +178,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             // saturating_sub(1) で安全に clamp (refresh で 0 リセットされる + Move で
             // clamp 済みなので通常 cursor < visible.len() だが防衛的に)。
             let cursor = app
-                .plugin_picker_cursor
+                .ui_ephemeral.plugin_picker_cursor
                 .min(visible.len().saturating_sub(1));
             // row callback は label のみ描画 (背景は list_view が selected / hover /
             // 通常で塗り分けてくれる)。 旧来 `button_at` で row 全面を塗っていたため

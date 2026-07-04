@@ -16,8 +16,10 @@ pub const MAX_EVENTS: usize = common::process_data::MAX_EVENTS;
 /// Pre-allocated capacity (samples per channel) for each track's input delay
 /// line, so PDC / sidechain alignment never reallocates on the audio thread
 /// (D1 / PR3). 48000 = 1 s at 48 kHz — comfortably above any real plugin's
-/// reported latency.
-const INPUT_DELAY_PREALLOC_SAMPLES: usize = 48_000;
+/// reported latency. これを超える (病的な) 補償量は publish 側 (off-thread)
+/// が replacement line を pre-alloc して bundle で配送する
+/// (`RtBundle::input_delay_replacements`)。
+pub(crate) const INPUT_DELAY_PREALLOC_SAMPLES: usize = 48_000;
 
 /// E5 (r.md #8): 1 track が同時に持てる granular grain-lock-in ring の数 (= track 内
 /// audio event の最大 index)。 これを超える index の event は lock 無し (= 従来の LP
@@ -127,5 +129,58 @@ impl TrackScratch {
 impl Default for TrackScratch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// mixer strip を scratch に in-place 適用する: per-sample の equal-power
+/// pan と volume ramp (`volume_per_sample` / `pan_per_sample`、 事前に
+/// `fill_track_param_ramps` が埋めた値) を `track_l/r` に掛け、 peak meter を
+/// 更新する。 leaf (`process_track_owned`) と bus (`run_group_fx_chain`) の
+/// 2 箇所にほぼ同文でインライン展開されていた処理の単一実装
+/// (`docs/plan_arch_refactor.md` §5)。
+///
+/// mute の規則 (両呼び出し元共通):
+/// - `muted` (明示 mute) は出力を完全にゼロ化 — dry / send / sidechain の
+///   どこにも流さない。
+/// - `effective_mute` (solo による除外を含む) は **meter だけ** dark にする。
+///   信号自体は `track_l/r` に残す — solo された return への send や
+///   sidechain tap はミュート対象からも読めるのが Ableton 準拠の挙動。
+///
+/// RT-safe: in-place 書き込みのみ、確保・ロックなし。
+pub fn apply_strip(scratch: &mut TrackScratch, n: usize, muted: bool, effective_mute: bool) {
+    let n = n
+        .min(scratch.track_l.len())
+        .min(scratch.track_r.len())
+        .min(scratch.volume_per_sample.len())
+        .min(scratch.pan_per_sample.len());
+    scratch.effective_mute = effective_mute;
+    let mut peak_l = 0.0_f32;
+    let mut peak_r = 0.0_f32;
+    for i in 0..n {
+        let pan = scratch.pan_per_sample[i].clamp(-1.0, 1.0);
+        let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+        let vol = scratch.volume_per_sample[i];
+        let gain_l = angle.cos() * vol;
+        let gain_r = angle.sin() * vol;
+        let l = scratch.track_l[i] * gain_l;
+        let r = scratch.track_r[i] * gain_r;
+        scratch.track_l[i] = l;
+        scratch.track_r[i] = r;
+        if l.abs() > peak_l {
+            peak_l = l.abs();
+        }
+        if r.abs() > peak_r {
+            peak_r = r.abs();
+        }
+    }
+    scratch.peak_l = peak_l;
+    scratch.peak_r = peak_r;
+    if muted {
+        scratch.track_l[..n].fill(0.0);
+        scratch.track_r[..n].fill(0.0);
+    }
+    if effective_mute {
+        scratch.peak_l = 0.0;
+        scratch.peak_r = 0.0;
     }
 }

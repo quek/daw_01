@@ -236,12 +236,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         ui,
         usize::MAX,
         "MASTER",
-        app.master_gain,
+        app.transport.master_gain,
         0.0,
         false,
         false,
-        app.peak_l_display,
-        app.peak_r_display,
+        app.transport.peak_l_display,
+        app.transport.peak_r_display,
         Rect { x: master_x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
         COLOR_MASTER_BG,
         None, // master は track 色を持たない (neutral 背景)
@@ -255,9 +255,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // 算出した hover track を AppData に反映 (変化時のみ Edit、
     // arrange_hovered_track と同じ diff-guard)。 dispatch_shortcuts が S キーで読む。
-    if app.mixer_hovered_track != hovered_strip {
+    if app.ui_ephemeral.mixer_hovered_track != hovered_strip {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.mixer_hovered_track = hovered_strip;
+            app.ui_ephemeral.mixer_hovered_track = hovered_strip;
         }));
     }
 }
@@ -284,12 +284,12 @@ fn draw_track_strip(
     // group strip は折り畳み disclosure を出す。collapsed 状態は
     // arrangement と共通の collapsed_groups を引く。
     let group_collapsed = if entry.is_group {
-        Some(app.collapsed_groups.contains(&track_id))
+        Some(app.ui_prefs.collapsed_groups.contains(&track_id))
     } else {
         None
     };
     let (was_dragging_vol, was_dragging_pan) = drag_flags(app, track_id);
-    let n_sends = app.song.track_by_id(track_id).map_or(0, |t| t.sends.len());
+    let n_sends = app.song_doc.song().track_by_id(track_id).map_or(0, |t| t.sends.len());
     let sends_band_h = sends_band_height(n_sends);
     draw_strip(
         app,
@@ -353,10 +353,10 @@ fn draw_return_strip(
 /// `AppData.active_param_gestures` から引く (= gesture edge 検知用)。
 fn drag_flags(app: &AppData, track_id: u32) -> (bool, bool) {
     let vol = app
-        .active_param_gestures
+        .recording.active_param_gestures
         .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume)));
     let pan = app
-        .active_param_gestures
+        .recording.active_param_gestures
         .contains(&(track_id, AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan)));
     (vol, pan)
 }
@@ -427,10 +427,10 @@ fn draw_strip(
                 Edit::mutate(move |app: &mut AppData| {
                     // arrangement の ToggleGroupCollapsed と同じ toggle
                     // (collapsed_groups が両 view 共通の SSoT)。
-                    if app.collapsed_groups.contains(&track_idx) {
-                        app.collapsed_groups.remove(&track_idx);
+                    if app.ui_prefs.collapsed_groups.contains(&track_idx) {
+                        app.ui_prefs.collapsed_groups.remove(&track_idx);
                     } else {
-                        app.collapsed_groups.insert(track_idx);
+                        app.ui_prefs.collapsed_groups.insert(track_idx);
                     }
                 })
             },
@@ -641,14 +641,14 @@ fn draw_sends_section(
     let inner_w = rect.w - pad * 2.0;
 
     // 各 send の宛先名は派生 (= track_by_id で都度解決)。 send 本体は
-    // `app.song.track_by_id(track_id).sends` を読む。 track が無ければ
+    // `app.song_doc.song().track_by_id(track_id).sends` を読む。 track が無ければ
     // (race) 何も描かない。
-    let Some(src_track) = app.song.track_by_id(track_id) else {
+    let Some(src_track) = app.song_doc.song().track_by_id(track_id) else {
         return;
     };
     for (send_idx, send) in src_track.sends.iter().enumerate() {
         let dest_name = app
-            .song
+            .song_doc.song()
             .track_by_id(send.dest_track_id)
             .map(|t| {
                 if t.name.is_empty() {
@@ -693,21 +693,17 @@ fn draw_sends_section(
         let knob_rect = Rect { x: inner_x, y: row_y, w: SEND_KNOB_SIZE, h: SEND_KNOB_SIZE };
         let send_idx_for_knob = send_idx;
         // 前フレーム時点で SendGain gesture か (= edge 検知)。
-        let was_dragging_send = app.active_param_gestures.contains(&(
-            track_id,
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
-                send_idx: send_idx as u8,
-            }),
-        ));
+        // v29: SendGain target は安定 send id でアドレスする。
+        let send_gain_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
+            send_id: send.id,
+            legacy_send_idx: None,
+        });
+        let was_dragging_send = app
+            .recording.active_param_gestures
+            .contains(&(track_id, send_gain_target.clone()));
         // 再生中は SendGain オートメーションの playhead 値に追従させる
         // (volume / pan と同 idiom)。 停止中・非 automation・書き込み中は send.gain。
-        let live_gain = app.live_param_value(
-            src_track,
-            &AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
-                send_idx: send_idx as u8,
-            }),
-            send.gain,
-        );
+        let live_gain = app.live_param_value(src_track, &send_gain_target, send.gain);
         let knob_resp = ui.knob_at(
             ("mixer_send_knob", track_id as usize, send_idx),
             knob_rect,
@@ -733,9 +729,7 @@ fn draw_sends_section(
         push_param_gesture_edges(
             ui,
             track_id,
-            AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
-                send_idx: send_idx as u8,
-            }),
+            send_gain_target,
             "Send",
             was_dragging_send,
             knob_resp.dragging,

@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use common::app_dirs::AppDirs;
-use common::protocol::MainToChild;
+use common::protocol::PluginCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent};
@@ -34,7 +34,7 @@ use daw_gui::dispatcher::{
 /// plugin を一切ロードしない素の `AppData` を、 指定の `app_dirs` で構築する。
 /// plugin 無しなので Save は同期実行され、 `push_recent` /
 /// `push_recent_saved` がその場で永続化を試みる。
-fn build_app(app_dirs: Option<AppDirs>) -> (AppData, UnboundedReceiver<MainToChild>) {
+fn build_app(app_dirs: Option<AppDirs>) -> (AppData, UnboundedReceiver<PluginCommand>) {
     let (audio_tx, _audio_rx) = mpsc::unbounded_channel();
     let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
     let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
@@ -58,8 +58,8 @@ fn build_app(app_dirs: Option<AppDirs>) -> (AppData, UnboundedReceiver<MainToChi
 /// 保存された project ファイルのパスを返す。
 fn save_fresh_project(app: &mut AppData, proj_dir: &std::path::Path) -> std::path::PathBuf {
     let proj_path = proj_dir.join("proj.daw");
-    app.file_path = Some(proj_path.clone());
-    app.is_dirty = true;
+    app.song_doc.file_path = Some(proj_path.clone());
+    app.song_doc.is_dirty() = true;
     app.request_close();
     app.handle_event(AppEvent::DirtyGuardSave);
     proj_path
@@ -76,7 +76,7 @@ fn save_persists_recent_into_injected_dir() {
 
     // 前提: 同期保存が成功している。
     assert!(proj_path.exists(), "project file written: {}", proj_path.display());
-    assert!(!app.is_dirty, "is_dirty cleared after save");
+    assert!(!app.song_doc.is_dirty(), "is_dirty cleared after save");
 
     // 本題: recent / recent_saved は **注入した data_dir** に書かれ、
     // 中身は今保存した proj.daw 1 件 (実 %LOCALAPPDATA% ではない)。
@@ -108,18 +108,18 @@ fn none_app_dirs_saves_project_without_persisting_recent() {
         proj_path.exists(),
         "project file written even with no app_dirs"
     );
-    assert!(!app.is_dirty, "is_dirty cleared after save");
+    assert!(!app.song_doc.is_dirty(), "is_dirty cleared after save");
 
     // in-memory list は更新される (= menu は session 内で機能する) が、
     // app_dirs=None なので disk へは一切書かない。 disk 検証は
     // 「注入 dir が無い = 書きようがない」 で構造的に保証される。
     assert_eq!(
-        app.recent_saved.paths,
+        app.ui_prefs.recent_saved.paths,
         vec![proj_path.clone()],
         "in-memory recent_saved は更新される"
     );
     assert_eq!(
-        app.recent_files.paths,
+        app.ui_prefs.recent_files.paths,
         vec![proj_path],
         "in-memory recent_files も更新される"
     );

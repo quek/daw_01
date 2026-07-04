@@ -164,7 +164,15 @@ use crate::scale::ScaleChange;
 ///   pooled MIDI model); `5` routing graph + plugin latency cache;
 ///   `4` per-`Clip` `volume` moved onto `Track::volume`; `3` was a
 ///   brief detour.
-pub const CURRENT_VERSION: u32 = 28;
+/// Bumped to `29` for stable-id addressing (`docs/plan_arch_refactor.md` §1):
+/// `PluginInstance.id: u64` (Song-global `next_device_id` allocator)、
+/// `Send.id: u32` (per-track `next_send_id`)、note / audio event / automation
+/// point の要素 id (per-content allocator)。`AutomationTarget::PluginParam` /
+/// `BindingTarget::PluginParam` は `device_index` → `device_id`、
+/// `TrackBuiltinParam::SendGain` は `send_idx` → `send_id` に移行 — 旧 file の
+/// positional 値は deserialize 専用 legacy field に載り、`Song::ensure_ids` が
+/// id へ写像する。v28 以前の `.daw` はすべて load 可能。
+pub const CURRENT_VERSION: u32 = 29;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -390,6 +398,14 @@ pub struct Song {
     /// time.
     #[serde(default)]
     pub next_track_id: u32,
+    /// v29: stable id allocator for `PluginInstance::id` (device 安定 id)。
+    /// track devices と `master_fx_chain` が共有する Song-global 採番。`0` は
+    /// "未採番" sentinel — `ensure_ids` が load 時に採番する。device の
+    /// addressing (IPC / automation / MIDI binding / plugin host bookkeeping /
+    /// shmem 名 / worker dispatch) はすべてこの id で行い、chain 内 index は
+    /// 表示順序のみに使う (`docs/plan_arch_refactor.md` §1)。
+    #[serde(default)]
+    pub next_device_id: u64,
     /// Shared clip content store. Each `Clip.content_id` references one
     /// entry here; multiple clips with the same `content_id` share the
     /// same `notes` (linked / pooled clips, REAPER pooled MIDI model).
@@ -552,6 +568,7 @@ impl Default for Song {
             loop_start_beat: 0.0,
             loop_end_beat: 0.0,
             next_track_id: 1,
+            next_device_id: 1,
             clip_contents: HashMap::new(),
             next_content_id: 1,
             clip_content_names: HashMap::new(),
@@ -615,11 +632,16 @@ pub enum BindingTarget {
     /// 経路で plugin host へ反映する。
     PluginParam {
         track: u32,
+        /// v29: 安定 device id (`PluginInstance::id`)。`0` は未解決 sentinel。
         #[serde(default)]
-        device_index: u32,
+        device_id: u64,
         param_id: u32,
+        /// v28 以前 migration 用 (deserialize 専用)。旧 save は chain 内
+        /// positional index を持つ。`Song::ensure_ids` が device_id へ写像。
+        #[serde(default, rename = "device_index", skip_serializing)]
+        legacy_device_index: Option<u32>,
         /// v22 以前 migration 用 (deserialize 専用)。 旧 save は `slot: PluginSlot`
-        /// を持つ。 `Song::ensure_ids` が flatten 前に device_index へ写像する
+        /// を持つ。 `Song::ensure_ids` が flatten 前に legacy_device_index へ写像する
         /// (r.md #8 M7: 旧 project の PluginParam binding があると device_index 欠落で
         /// project 全体の deserialize が失敗していたのを是正)。
         #[serde(default, rename = "slot", skip_serializing)]
@@ -636,6 +658,14 @@ impl Song {
         // back to the `0` sentinel on exhaustion.
         let id = self.next_track_id.clamp(1, MASTER_TRACK_ID - 1);
         self.next_track_id = id.saturating_add(1);
+        id
+    }
+
+    /// v29: 新規 device (`PluginInstance`) 用の Song-global 安定 id を採番
+    /// する。 track devices / master_fx_chain 共用。
+    pub fn alloc_device_id(&mut self) -> u64 {
+        let id = self.next_device_id.max(1);
+        self.next_device_id = id.saturating_add(1);
         id
     }
 
@@ -1426,6 +1456,40 @@ impl Song {
     /// sentinel for the first track would, on load, lose all its sidechain
     /// wiring (the references would dangle, `compile_schedule` silently
     /// skips dangling refs, and the user sees no sidechain signal).
+    /// v29 migration: `AutomationTarget` 内の旧 positional 参照
+    /// (`legacy_device_index` / `legacy_send_idx`) を安定 id (`device_id` /
+    /// `send_id`) へ写像する。 新形式 (legacy = None) は no-op、 範囲外
+    /// index は sentinel (0) のまま残す (= 「解決不能な参照」 として
+    /// 消費側が無視できる)。
+    fn remap_target_ids(target: &mut AutomationTarget, device_ids: &[u64], send_ids: &[u32]) {
+        match target {
+            AutomationTarget::PluginParam {
+                device_id,
+                legacy_device_index,
+                ..
+            } => {
+                if let Some(idx) = legacy_device_index.take()
+                    && *device_id == 0
+                    && let Some(&id) = device_ids.get(idx as usize)
+                {
+                    *device_id = id;
+                }
+            }
+            AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
+                send_id,
+                legacy_send_idx,
+            }) => {
+                if let Some(idx) = legacy_send_idx.take()
+                    && *send_id == 0
+                    && let Some(&id) = send_ids.get(idx as usize)
+                {
+                    *send_id = id;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn ensure_ids(&mut self) {
         // v23 migration: 旧 3-split (midi_fx_chain / instrument / fx_chain) を
         // 単一 `devices` へ平坦化し、automation lane の旧 slot を device_index へ
@@ -1440,7 +1504,7 @@ impl Song {
         for binding in &mut self.midi_bindings {
             let BindingTarget::PluginParam {
                 track,
-                device_index,
+                legacy_device_index,
                 legacy_slot,
                 ..
             } = &mut binding.target
@@ -1454,11 +1518,13 @@ impl Song {
                 use crate::protocol::PluginSlot;
                 let n_midi = t.legacy_midi_fx_chain.len() as u32;
                 let has_inst = t.legacy_instrument.is_some() as u32;
-                *device_index = match slot {
+                // v29: index はまだ positional。 後段の remap pass が
+                // device_id へ写像する。
+                *legacy_device_index = Some(match slot {
                     PluginSlot::MidiFx(i) => i,
                     PluginSlot::Instrument => n_midi,
                     PluginSlot::Fx(i) => n_midi + has_inst + i,
-                };
+                });
             }
         }
         for track in &mut self.tracks {
@@ -1564,6 +1630,90 @@ impl Song {
         }
         if self.next_mod_source_id == 0 {
             self.next_mod_source_id = 1;
+        }
+
+        // v29: device 安定 id (`PluginInstance::id`) を採番する。 track devices
+        // と master_fx_chain が Song-global の `next_device_id` を共有。
+        // sentinel (0) のみ上書き、 既存非 0 id は counter を bump するだけ
+        // (他 allocator と同 idiom)。
+        {
+            fn alloc_dev(p: &mut PluginInstance, next: &mut u64) {
+                if p.id == 0 {
+                    let new_id = (*next).max(1);
+                    *next = new_id + 1;
+                    p.id = new_id;
+                } else if p.id >= *next {
+                    *next = p.id + 1;
+                }
+            }
+            let mut next = self.next_device_id;
+            for track in &mut self.tracks {
+                for p in track.devices.iter_mut() {
+                    alloc_dev(p, &mut next);
+                }
+            }
+            for p in self.master_fx_chain.iter_mut() {
+                alloc_dev(p, &mut next);
+            }
+            self.next_device_id = next.max(1);
+        }
+
+        // v29: send 安定 id (`Send::id`) を per-track 採番する。
+        for track in &mut self.tracks {
+            track.ensure_send_ids();
+        }
+
+        // v29: content 内要素 (note / audio event / automation point) の
+        // 安定 id を採番する (選択・undo 後の選択復元を positional index
+        // でなく id でアドレスするため)。
+        for content in self.clip_contents.values_mut() {
+            content.ensure_element_ids();
+        }
+
+        // v29: 旧 positional addressing (`PluginParam.device_index` /
+        // `SendGain.send_idx`) を安定 id へ写像する。 device_index は
+        // 「同 track の devices chain 内 index」、 song_lanes /
+        // song_mod_routings の PluginParam は master_fx_chain の index。
+        {
+            let master_ids: Vec<u64> = self.master_fx_chain.iter().map(|p| p.id).collect();
+            for track in &mut self.tracks {
+                let dev_ids: Vec<u64> = track.devices.iter().map(|p| p.id).collect();
+                let send_ids: Vec<u32> = track.sends.iter().map(|s| s.id).collect();
+                for lane in &mut track.automation_lanes {
+                    Self::remap_target_ids(&mut lane.target, &dev_ids, &send_ids);
+                }
+                for routing in &mut track.mod_routings {
+                    Self::remap_target_ids(&mut routing.target, &dev_ids, &send_ids);
+                }
+            }
+            for lane in &mut self.song_lanes {
+                Self::remap_target_ids(&mut lane.target, &master_ids, &[]);
+            }
+            for routing in &mut self.song_mod_routings {
+                Self::remap_target_ids(&mut routing.target, &master_ids, &[]);
+            }
+            // MIDI binding は任意 track の device を指せるので per-binding で
+            // track を解決してから写像する。
+            let track_devs: std::collections::HashMap<u32, Vec<u64>> = self
+                .tracks
+                .iter()
+                .map(|t| (t.id, t.devices.iter().map(|p| p.id).collect()))
+                .collect();
+            for binding in &mut self.midi_bindings {
+                if let BindingTarget::PluginParam {
+                    track,
+                    device_id,
+                    legacy_device_index,
+                    ..
+                } = &mut binding.target
+                    && let Some(idx) = legacy_device_index.take()
+                    && *device_id == 0
+                    && let Some(ids) = track_devs.get(track)
+                    && let Some(&id) = ids.get(idx as usize)
+                {
+                    *device_id = id;
+                }
+            }
         }
 
         // Pass 2: patch every reference to a remapped id. Multi-sentinel
@@ -1962,10 +2112,14 @@ impl Song {
                             // shouldn't happen, but keep the invariant).
                             *c = ClipContent::Midi(MidiContent {
                                 notes: notes.clone(),
+                                ..Default::default()
                             });
                         })
                         .or_insert_with(|| {
-                            ClipContent::Midi(MidiContent { notes })
+                            ClipContent::Midi(MidiContent {
+                                notes,
+                                ..Default::default()
+                            })
                         });
                 } else {
                     // Ensure an entry exists for every referenced
@@ -2088,31 +2242,31 @@ impl Song {
             .and_then(|c| c.notes_mut())
     }
 
-    /// `track_id` の `sends[send_idx]` を削除し、 その track の SendGain automation
-    /// lane を追従させる (消した send を狙う lane は除去、 後続 index は 1 つ詰める)。
-    /// これを怠ると lane が「別の send」 を変調したり範囲外 index を指す (r.md #8 A5)。
-    /// 削除成功で `true`、 track 不在 / 範囲外なら `false`。
-    pub fn remove_track_send(&mut self, track_id: u32, send_idx: usize) -> bool {
+    /// `track_id` の send (安定 id = `send_id`) を削除し、 その send を狙う
+    /// SendGain automation lane / mod routing を除去する。 v29 で id
+    /// addressing になったため、 残る send への参照は**無変更のまま正しい**
+    /// (positional 時代の「後続 index を詰める」 reindex 儀式は不要になった —
+    /// r.md #8 A5 で実際に壊れた class の構造的解消)。
+    /// 削除成功で `true`、 track 不在 / id 不在なら `false`。
+    pub fn remove_track_send(&mut self, track_id: u32, send_id: u32) -> bool {
         let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
             return false;
         };
-        if send_idx >= t.sends.len() {
+        let Some(pos) = t.sends.iter().position(|s| s.id == send_id) else {
             return false;
-        }
-        t.sends.remove(send_idx);
-        // 旧 index → 新 index: 消した index は None、 それより後ろは 1 つ前へ詰まる。
-        let old_to_new: Vec<Option<u8>> = (0..=t.sends.len())
-            .map(|i| {
-                if i == send_idx {
-                    None
-                } else if i > send_idx {
-                    Some((i - 1) as u8)
-                } else {
-                    Some(i as u8)
-                }
-            })
-            .collect();
-        let dropped = t.reindex_send_gain_lanes(&old_to_new);
+        };
+        t.sends.remove(pos);
+        let targets_send = |target: &AutomationTarget| {
+            matches!(
+                target,
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_id: sid, .. })
+                    if *sid == send_id
+            )
+        };
+        let before = t.automation_lanes.len();
+        t.automation_lanes.retain(|lane| !targets_send(&lane.target));
+        let dropped = t.automation_lanes.len() != before;
+        t.mod_routings.retain(|r| !targets_send(&r.target));
         if dropped {
             self.gc_clip_contents();
         }
@@ -2474,6 +2628,10 @@ pub struct Track {
     /// `docs/plan_routing_graph.md`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sends: Vec<Send>,
+    /// v29: per-track stable id allocator for `Send::id`。`0` は sentinel、
+    /// `1` から採番。
+    #[serde(default)]
+    pub next_send_id: u32,
     /// Most recent plugin-reported latency for this track, populated by
     /// the plugin host via the CLAP `latency` extension and cached on
     /// the model so the GUI can display it and the routing graph can
@@ -2556,10 +2714,16 @@ pub enum SendMode {
 /// is unaffected; the copy is summed into `dest_track_id`'s input bus
 /// before that destination's fx chain runs. The send level is
 /// automatable via `AutomationTarget::TrackBuiltin(TrackBuiltinParam::
-/// SendGain { send_idx })`, where `send_idx` is this send's index in
-/// `Track::sends`.
+/// SendGain { send_id })`, addressed by this send's stable `id` (v29 —
+/// positional index addressing は廃止)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Send {
+    /// v29: track 内で安定な send id (`Track.next_send_id` 採番、`0` = 未採番
+    /// sentinel — `Track::ensure_send_ids` が load 時に採番)。automation
+    /// (`TrackBuiltinParam::SendGain`) と IPC は positional index でなく
+    /// この id でアドレスする。
+    #[serde(default)]
+    pub id: u32,
     /// Stable `Track::id` of the destination (return / bus) track.
     pub dest_track_id: u32,
     /// Linear send gain (`0.0` = silent, `1.0` = unity, up to `2.0` =
@@ -2605,6 +2769,7 @@ impl Default for Track {
             next_clip_id: 1,
             parent_group_id: None,
             sends: Vec::new(),
+            next_send_id: 1,
             reported_latency_samples: 0,
             automation_lanes: Vec::new(),
             next_lane_id: 1,
@@ -2663,34 +2828,6 @@ impl Default for GroupTransform {
 }
 
 impl Track {
-    /// SendGain automation lane の `send_idx` を、 `sends` の index 変化に追従させる。
-    /// `old_to_new[i]` = 旧 index `i` の send の新 index (`None` = その send は消えた)。
-    /// 消えた send を狙う lane は除去、 移動した send を狙う lane は新 index に貼り替える。
-    /// send 削除 / paste で sends を間引いたとき、 lane が別 send を変調する・範囲外を
-    /// 指すのを防ぐ (r.md #8 A5)。 戻り値 = lane を 1 つ以上除去したか (caller の gc 判断用)。
-    pub fn reindex_send_gain_lanes(&mut self, old_to_new: &[Option<u8>]) -> bool {
-        let mut dropped = false;
-        self.automation_lanes.retain_mut(|lane| {
-            if let AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx }) =
-                &mut lane.target
-            {
-                match old_to_new.get(*send_idx as usize).copied().flatten() {
-                    Some(ni) => {
-                        *send_idx = ni;
-                        true
-                    }
-                    None => {
-                        dropped = true;
-                        false
-                    }
-                }
-            } else {
-                true
-            }
-        });
-        dropped
-    }
-
     /// このトラックが VOICEVOX で歌う vocal トラックか。 SSoT は
     /// 「builtin VOICEVOX device を実際に持つか」。 旧 `InstrumentSource::Vocal`
     /// marker は device 挿入と別管理で out-of-sync になり得る (旧プロジェクトで
@@ -2820,6 +2957,30 @@ impl Track {
 
     /// v23 migration: 旧 3-split を devices へ平坦化 (midi_fx ++ instrument? ++ fx) し、
     /// automation lane の旧 slot を device_index へ写像する。新形式 (devices 既存) は no-op。
+    /// v29: send 安定 id を採番する。 sentinel (0) のみ上書き、 既存非 0 id
+    /// は counter を bump するだけ。 `Song::ensure_ids` が load 時に呼ぶ。
+    pub(crate) fn ensure_send_ids(&mut self) {
+        for send in &mut self.sends {
+            if send.id == 0 {
+                let new_id = self.next_send_id.max(1);
+                self.next_send_id = new_id + 1;
+                send.id = new_id;
+            } else if send.id >= self.next_send_id {
+                self.next_send_id = send.id + 1;
+            }
+        }
+        if self.next_send_id == 0 {
+            self.next_send_id = 1;
+        }
+    }
+
+    /// v29: 新規 send 用の安定 id を採番する。
+    pub fn alloc_send_id(&mut self) -> u32 {
+        let id = self.next_send_id.max(1);
+        self.next_send_id = id.saturating_add(1);
+        id
+    }
+
     fn flatten_legacy_devices(&mut self) {
         if !self.devices.is_empty()
             || (self.legacy_midi_fx_chain.is_empty()
@@ -2840,13 +3001,15 @@ impl Track {
         };
         for lane in &mut self.automation_lanes {
             if let AutomationTarget::PluginParam {
-                device_index,
+                legacy_device_index,
                 legacy_slot,
                 ..
             } = &mut lane.target
                 && let Some(slot) = legacy_slot.take()
             {
-                *device_index = to_index(slot);
+                // v29: slot → index はまだ positional。 後段の
+                // `Song::ensure_ids` の remap pass が device_id へ写像する。
+                *legacy_device_index = Some(to_index(slot));
             }
         }
         let mut devices = Vec::new();
@@ -3357,8 +3520,14 @@ impl ModSourceKind {
 /// `IComponent::getState`). Paths are NOT stored — `(format, plugin_id)`
 /// is resolved through `plugin_db::PluginDatabase` at load time, keeping
 /// projects portable across machines.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginInstance {
+    /// v29: Song-global の安定 device id (`Song.next_device_id` 採番、`0` =
+    /// 未採番 sentinel)。IPC / automation / plugin host bookkeeping / shmem 名
+    /// / worker dispatch のアドレスはすべてこの id。chain 内 index は表示順序
+    /// のみ (`docs/plan_arch_refactor.md` §1)。
+    #[serde(default)]
+    pub id: u64,
     /// CLAP stable id (reverse-DNS) or VST3 class UUID rendered as hex.
     pub plugin_id: String,
     /// Which backend created this plugin. Defaults to CLAP for projects
@@ -3424,6 +3593,7 @@ pub struct PluginInstance {
 impl PluginInstance {
     pub fn new(plugin_id: String, format: PluginFormat) -> Self {
         Self {
+            id: 0,
             plugin_id,
             format,
             state: None,
@@ -3442,6 +3612,7 @@ impl PluginInstance {
         ports: crate::port_config::PortConfig,
     ) -> Self {
         Self {
+            id: 0,
             plugin_id,
             format,
             state: None,
@@ -3466,6 +3637,57 @@ impl PluginInstance {
         } else {
             self.legacy_aux_sources = Vec::new();
         }
+    }
+}
+
+/// wire (bincode / IPC) 表現は手書きで、`state` / `ara_archive` の MB 級 blob を
+/// **構造的に除外**する (`docs/plan_arch_refactor.md` §2)。ドキュメント
+/// (serde / JSON 保存) は両フィールドを base64 で保持し、blob が必要な IPC
+/// 操作は専用メッセージ (`SetSlotPlugin.initial_state` /
+/// `SetupAraDocument.archive` / `AllPluginStates`) が個別に運ぶ。これで
+/// `LoadSong` は plugin state / ARA アーカイブの肥大に依らず常に小さく、
+/// 16MB wire 上限に構造的に到達しない。encode / decode の field 順は一致
+/// させること (id → plugin_id → format → aux_inputs → aux_outputs →
+/// aux_output_count → ports)。
+impl bincode::Encode for PluginInstance {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        self.id.encode(encoder)?;
+        self.plugin_id.encode(encoder)?;
+        self.format.encode(encoder)?;
+        self.aux_inputs.encode(encoder)?;
+        self.aux_outputs.encode(encoder)?;
+        self.aux_output_count.encode(encoder)?;
+        self.ports.encode(encoder)
+    }
+}
+
+impl<Ctx> bincode::Decode<Ctx> for PluginInstance {
+    fn decode<D: bincode::de::Decoder<Context = Ctx>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        Ok(Self {
+            id: bincode::Decode::decode(decoder)?,
+            plugin_id: bincode::Decode::decode(decoder)?,
+            format: bincode::Decode::decode(decoder)?,
+            state: None,
+            aux_inputs: bincode::Decode::decode(decoder)?,
+            legacy_aux_sources: Vec::new(),
+            aux_outputs: bincode::Decode::decode(decoder)?,
+            aux_output_count: bincode::Decode::decode(decoder)?,
+            ports: bincode::Decode::decode(decoder)?,
+            ara_archive: None,
+        })
+    }
+}
+
+impl<'de, Ctx> bincode::BorrowDecode<'de, Ctx> for PluginInstance {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Ctx>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        <Self as bincode::Decode<Ctx>>::decode(decoder)
     }
 }
 
@@ -3667,6 +3889,49 @@ impl ClipContent {
         }
     }
 
+    /// v29: 要素 (note / audio event / automation point) の安定 id を採番
+    /// する。 sentinel (0) のみ上書き、 既存非 0 id は counter を bump する
+    /// だけ。 Video / Image / Text の event は単一 event 中心の運用で
+    /// 選択集合を持たないため対象外。
+    pub fn ensure_element_ids(&mut self) {
+        fn alloc(id: &mut u32, next: &mut u32) {
+            if *id == 0 {
+                let new_id = (*next).max(1);
+                *next = new_id + 1;
+                *id = new_id;
+            } else if *id >= *next {
+                *next = *id + 1;
+            }
+        }
+        match self {
+            ClipContent::Midi(m) => {
+                for n in &mut m.notes {
+                    alloc(&mut n.id, &mut m.next_note_id);
+                }
+                if m.next_note_id == 0 {
+                    m.next_note_id = 1;
+                }
+            }
+            ClipContent::Audio(a) => {
+                for e in &mut a.events {
+                    alloc(&mut e.id, &mut a.next_event_id);
+                }
+                if a.next_event_id == 0 {
+                    a.next_event_id = 1;
+                }
+            }
+            ClipContent::Automation(a) => {
+                for p in &mut a.points {
+                    alloc(&mut p.id, &mut a.next_point_id);
+                }
+                if a.next_point_id == 0 {
+                    a.next_point_id = 1;
+                }
+            }
+            ClipContent::Video(_) | ClipContent::Image(_) | ClipContent::Text(_) => {}
+        }
+    }
+
     /// Borrow the notes slice if this is a `Midi` variant. `Audio` /
     /// `Automation` / `Video` variants return `None`. Used by
     /// `Song::clip_notes` and other helpers that previously read
@@ -3837,6 +4102,18 @@ pub struct MidiContent {
     /// order must sort by `Note::start_beat`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<Note>,
+    /// v29: `Note::id` の per-content allocator。`0` は sentinel、`1` から。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub next_note_id: u32,
+}
+
+impl MidiContent {
+    /// 新規 note 用の安定 id を採番する。
+    pub fn alloc_note_id(&mut self) -> u32 {
+        let id = self.next_note_id.max(1);
+        self.next_note_id = id.saturating_add(1);
+        id
+    }
 }
 
 /// Audio clip content — an ordered list of audio events that play
@@ -3850,6 +4127,18 @@ pub struct MidiContent {
 pub struct AudioContent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<AudioEvent>,
+    /// v29: `AudioEvent::id` の per-content allocator。`0` は sentinel。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub next_event_id: u32,
+}
+
+impl AudioContent {
+    /// 新規 audio event 用の安定 id を採番する。
+    pub fn alloc_event_id(&mut self) -> u32 {
+        let id = self.next_event_id.max(1);
+        self.next_event_id = id.saturating_add(1);
+        id
+    }
 }
 
 /// Stable id for an entry in `Song.audio_sources`. `0` is the "未採番"
@@ -3954,6 +4243,11 @@ pub enum VideoSourcePath {
 /// per-event playback parameters (gain / pan / pitch / fade / stretch).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct AudioEvent {
+    /// v29: content 内で安定な event id (`AudioContent.next_event_id` 採番、
+    /// `0` = 未採番 sentinel)。選択・undo 後の選択復元は positional index
+    /// でなくこの id でアドレスする。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub id: u32,
     pub source_id: AudioSourceId,
     pub event_start_in_clip_beats: f64,
     pub event_length_beats: f64,
@@ -3990,6 +4284,7 @@ pub struct AudioEvent {
 impl Default for AudioEvent {
     fn default() -> Self {
         Self {
+            id: 0,
             source_id: 0,
             event_start_in_clip_beats: 0.0,
             event_length_beats: 0.0,
@@ -4445,6 +4740,12 @@ impl Default for TextEvent {
 /// singing synthesis and is `None` for purely instrumental tracks.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Note {
+    /// v29: content 内で安定な note id (`MidiContent.next_note_id` 採番、`0`
+    /// = 未採番 sentinel — `ClipContent::ensure_element_ids` が load 時に
+    /// 採番)。選択・undo 後の選択復元は positional index でなくこの id で
+    /// アドレスする。linked clip は content を共有するので id も共有される。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub id: u32,
     pub start_beat: f64,
     pub duration_beats: f64,
     pub pitch: u8,
@@ -4491,14 +4792,19 @@ pub const MASTER_TRACK_ID: u32 = u32::MAX;
 pub enum AutomationTarget {
     /// Built-in track parameter (volume / pan / mute / send).
     TrackBuiltin(TrackBuiltinParam),
-    /// Plugin parameter on this track. `device_index` identifies which
-    /// plugin inside the track's single `devices` chain. `param_id` is the
-    /// CLAP `clap_id` / VST3 `ParamID` (both `u32`); the format is
-    /// recovered through `Track.devices[device_index].format`.
+    /// Plugin parameter on this track. `device_id` は安定 device id
+    /// (`PluginInstance::id`)。`param_id` is the CLAP `clap_id` / VST3
+    /// `ParamID` (both `u32`); the format is recovered by resolving
+    /// `device_id` in the track's `devices` chain.
     PluginParam {
+        /// v29: 安定 device id。`0` は未解決 sentinel (ensure_ids が写像)。
         #[serde(default)]
-        device_index: u32,
+        device_id: u64,
         param_id: u32,
+        /// v28 以前 migration 用 (deserialize 専用)。旧 save は chain 内
+        /// positional index を持つ。`Song::ensure_ids` が device_id へ写像。
+        #[serde(default, rename = "device_index", skip_serializing)]
+        legacy_device_index: Option<u32>,
         /// v22 以前 migration 用 (deserialize 専用)。旧 save は `slot` を持つ。
         #[serde(default, rename = "slot", skip_serializing)]
         legacy_slot: Option<crate::protocol::PluginSlot>,
@@ -4533,10 +4839,18 @@ pub enum TrackBuiltinParam {
     Volume,
     Pan,
     Mute,
-    /// Aux send level for `Track::sends[send_idx]` (linear, `0.0..=2.0`).
-    /// `send_idx` is the send's position inside the track's `sends`
-    /// array. See `Send` / `docs/plan_routing_graph.md`.
-    SendGain { send_idx: u8 },
+    /// Aux send level (linear, `0.0..=2.0`) for the send with stable id
+    /// `send_id` inside this track's `sends`. v29 で positional `send_idx`
+    /// から安定 id に移行 — 旧 file の index は `legacy_send_idx` に載り
+    /// `Song::ensure_ids` が id へ写像する。See `Send` /
+    /// `docs/plan_routing_graph.md`.
+    SendGain {
+        #[serde(default)]
+        send_id: u32,
+        /// v28 以前 migration 用 (deserialize 専用)。
+        #[serde(default, rename = "send_idx", skip_serializing)]
+        legacy_send_idx: Option<u8>,
+    },
 }
 
 /// v16 (`docs/plan_text_overlay.md` §2.3): text overlay の各 field
@@ -4629,6 +4943,11 @@ pub enum AutomationCurve {
 /// `time_beat` ascending; insertion code MUST keep this invariant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct AutomationPoint {
+    /// v29: content 内で安定な point id (`AutomationContent.next_point_id`
+    /// 採番、`0` = 未採番 sentinel)。選択・undo 後の選択復元は positional
+    /// index でなくこの id でアドレスする。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub id: u32,
     /// Clip-local beat (`0.0` = clip start, `Clip.length_beats` = clip
     /// end). Negative or out-of-range values are clamped on read; the
     /// editor should never produce them.
@@ -4647,6 +4966,7 @@ pub struct AutomationPoint {
 impl Default for AutomationPoint {
     fn default() -> Self {
         Self {
+            id: 0,
             time_beat: 0.0,
             value: 0.0,
             curve: AutomationCurve::Linear,
@@ -4687,6 +5007,18 @@ pub struct AutomationContent {
     /// Sorted by `AutomationPoint::time_beat` ascending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub points: Vec<AutomationPoint>,
+    /// v29: `AutomationPoint::id` の per-content allocator。`0` は sentinel。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub next_point_id: u32,
+}
+
+impl AutomationContent {
+    /// 新規 automation point 用の安定 id を採番する。
+    pub fn alloc_point_id(&mut self) -> u32 {
+        let id = self.next_point_id.max(1);
+        self.next_point_id = id.saturating_add(1);
+        id
+    }
 }
 
 /// One automation lane attached to a `Track`. Each lane targets one
@@ -5080,9 +5412,10 @@ mod tests {
             cid,
             ClipContent::Midi(MidiContent {
                 notes: vec![
-                    Note { start_beat: 0.0, duration_beats: 1.0, pitch: 60, velocity: 100, lyric: None, muted: false },
-                    Note { start_beat: 3.0, duration_beats: 1.0, pitch: 62, velocity: 100, lyric: None, muted: false },
+                    Note { id: 1, start_beat: 0.0, duration_beats: 1.0, pitch: 60, velocity: 100, lyric: None, muted: false },
+                    Note { id: 2, start_beat: 3.0, duration_beats: 1.0, pitch: 62, velocity: 100, lyric: None, muted: false },
                 ],
+                next_note_id: 3,
             }),
         );
         let track = Track {
@@ -5680,8 +6013,9 @@ mod tests {
                     id: 1,
                     ..AutomationLane::new(
                         AutomationTarget::PluginParam {
-                            device_index: 0, // overwritten by legacy_slot
+                            device_id: 0, // resolved via legacy_slot → remap pass
                             param_id: 5,
+                            legacy_device_index: None,
                             legacy_slot: Some(PluginSlot::Instrument),
                         },
                         0.0,
@@ -5691,8 +6025,9 @@ mod tests {
                     id: 2,
                     ..AutomationLane::new(
                         AutomationTarget::PluginParam {
-                            device_index: 0,
+                            device_id: 0,
                             param_id: 9,
+                            legacy_device_index: None,
                             legacy_slot: Some(PluginSlot::Fx(1)),
                         },
                         0.0,
@@ -5702,8 +6037,9 @@ mod tests {
                     id: 3,
                     ..AutomationLane::new(
                         AutomationTarget::PluginParam {
-                            device_index: 0,
+                            device_id: 0,
                             param_id: 2,
+                            legacy_device_index: None,
                             legacy_slot: Some(PluginSlot::MidiFx(1)),
                         },
                         0.0,
@@ -5732,23 +6068,31 @@ mod tests {
         assert!(t.legacy_instrument.is_none());
         assert!(t.legacy_fx_chain.is_empty());
 
-        // Lane slot → device_index: Instrument=2, Fx(1)=3+1=4, MidiFx(1)=1.
-        let device_index_of = |lane_id: u32| -> u32 {
+        // v29: lane slot → (index →) 安定 device_id まで ensure_ids が写像
+        // する。 Instrument=index2, Fx(1)=index4, MidiFx(1)=index1 の device の
+        // 採番済み id と一致すること。
+        let device_id_of = |lane_id: u32| -> u64 {
             match t.lane_by_id(lane_id).unwrap().target {
                 AutomationTarget::PluginParam {
-                    device_index,
+                    device_id,
+                    legacy_device_index,
                     legacy_slot,
                     ..
                 } => {
                     assert!(legacy_slot.is_none(), "legacy_slot must be consumed");
-                    device_index
+                    assert!(
+                        legacy_device_index.is_none(),
+                        "legacy_device_index must be consumed"
+                    );
+                    device_id
                 }
                 _ => panic!("expected PluginParam"),
             }
         };
-        assert_eq!(device_index_of(1), 2, "Instrument → n_midi (=2)");
-        assert_eq!(device_index_of(2), 4, "Fx(1) → n_midi + has_inst + 1 (=4)");
-        assert_eq!(device_index_of(3), 1, "MidiFx(1) → 1");
+        assert_ne!(t.devices[2].id, 0, "devices must be assigned stable ids");
+        assert_eq!(device_id_of(1), t.devices[2].id, "Instrument → n_midi (=2)");
+        assert_eq!(device_id_of(2), t.devices[4].id, "Fx(1) → n_midi + has_inst + 1 (=4)");
+        assert_eq!(device_id_of(3), t.devices[1].id, "MidiFx(1) → 1");
     }
 
     /// v23 migration is a no-op when `devices` is already populated (new
@@ -5764,8 +6108,9 @@ mod tests {
                 id: 1,
                 ..AutomationLane::new(
                     AutomationTarget::PluginParam {
-                        device_index: 0,
+                        device_id: 7,
                         param_id: 3,
+                        legacy_device_index: None,
                         legacy_slot: None,
                     },
                     0.0,
@@ -5778,8 +6123,8 @@ mod tests {
         assert_eq!(track.devices.len(), 1);
         assert_eq!(track.devices[0].plugin_id, "synth");
         match track.automation_lanes[0].target {
-            AutomationTarget::PluginParam { device_index, .. } => {
-                assert_eq!(device_index, 0);
+            AutomationTarget::PluginParam { device_id, .. } => {
+                assert_eq!(device_id, 7, "new-format device_id must be untouched");
             }
             _ => panic!("expected PluginParam"),
         }
@@ -5808,6 +6153,7 @@ mod tests {
     #[test]
     fn note_with_lyric_serializes_compactly() {
         let note = Note {
+            id: 0,
             start_beat: 0.5,
             duration_beats: 1.0,
             pitch: 60,
@@ -5836,6 +6182,7 @@ mod tests {
                     content_id: 0,
                     notes: vec![
                         Note {
+                            id: 0,
                             start_beat: 0.0,
                             duration_beats: 1.0,
                             pitch: 60,
@@ -5844,6 +6191,7 @@ mod tests {
                             muted: false,
                         },
                         Note {
+                            id: 0,
                             start_beat: 1.5,
                             duration_beats: 0.5,
                             pitch: 62,
@@ -5890,7 +6238,12 @@ mod tests {
         // v28: `ProjectFile.view: Option<ViewState>` 追加 (= ズーム/スクロール等の
         // 表示状態を Song の兄弟として同梱)。Song / IPC は無改変、旧ファイルは `#[serde(default)]`
         // で `view == None` に forward-migrate (migration 関数不要)。
-        assert_eq!(CURRENT_VERSION, 28);
+        // v29 (`docs/plan_arch_refactor.md` §1): 安定 id addressing —
+        // `PluginInstance.id: u64` / `Send.id` / note・audio event・automation
+        // point の要素 id を追加し、`PluginParam.device_index` → `device_id`、
+        // `SendGain.send_idx` → `send_id` へ移行。旧 positional 値は
+        // deserialize 専用 legacy field 経由で `ensure_ids` が id へ写像する。
+        assert_eq!(CURRENT_VERSION, 29);
     }
 
     #[test]
@@ -6115,12 +6468,14 @@ mod tests {
                     name: "Vocal".into(),
                     sends: vec![
                         Send {
+                            id: 0,
                             dest_track_id: 2,
                             gain: 0.5,
                             mode: SendMode::PostFader,
                             enabled: true,
                         },
                         Send {
+                            id: 0,
                             dest_track_id: 3,
                             gain: 1.0,
                             mode: SendMode::PreFader,
@@ -6168,6 +6523,7 @@ mod tests {
                     id: 1,
                     name: "Vocal".into(),
                     sends: vec![Send {
+                        id: 0,
                         dest_track_id: 0, // points at Reverb's sentinel id
                         gain: 0.5,
                         mode: SendMode::PostFader,
@@ -6256,13 +6612,16 @@ mod tests {
         song.clip_contents.insert(
             cid,
             ClipContent::Automation(AutomationContent {
+                next_point_id: 0,
                 points: vec![
                     AutomationPoint {
+                        id: 0,
                         time_beat: 0.0,
                         value: 0.5,
                         curve: AutomationCurve::Linear,
                     },
                     AutomationPoint {
+                        id: 0,
                         time_beat: 4.0,
                         value: 1.0,
                         curve: AutomationCurve::Bezier { tension: 0.25 },
@@ -6378,52 +6737,22 @@ mod tests {
         assert!(song.clip_contents.contains_key(&cid));
     }
 
-    /// r.md #8 A5: send の index 変化に SendGain lane が追従する (消えた send の
-    /// lane は除去、 後続は新 index に貼り替え)。 paste path もこの helper を共有。
+    /// v29: `Song::remove_track_send` は安定 send id で削除し、 その send を
+    /// 狙う SendGain lane だけを除去する。 残る send への参照は id なので
+    /// **無変更のまま正しい** (positional reindex 儀式は廃止)。
     #[test]
-    fn reindex_send_gain_lanes_drops_removed_and_shifts_later() {
-        let send_lane = |idx: u8| {
+    fn remove_track_send_drops_only_matching_send_gain_lanes() {
+        let send_lane = |sid: u32| {
             AutomationLane::new(
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx: idx }),
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
+                    send_id: sid,
+                    legacy_send_idx: None,
+                }),
                 1.0,
             )
         };
-        let mut t = Track {
-            automation_lanes: vec![
-                send_lane(0),
-                send_lane(1),
-                send_lane(2),
-                AutomationLane::new(
-                    AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-                    1.0,
-                ),
-            ],
-            ..Track::default()
-        };
-        // 旧 index 1 を削除: [Some(0), None, Some(1)]。
-        assert!(t.reindex_send_gain_lanes(&[Some(0), None, Some(1)]));
-        let targets: Vec<_> = t.automation_lanes.iter().map(|l| l.target.clone()).collect();
-        assert_eq!(
-            targets,
-            vec![
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx: 0 }),
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx: 1 }),
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-            ],
-            "SendGain{{1}} 除去、 {{2}}→{{1}}、 {{0}}/Volume 据置"
-        );
-    }
-
-    /// r.md #8 A5: `Song::remove_track_send` が send を消して SendGain lane を追従。
-    #[test]
-    fn remove_track_send_follows_send_gain_lanes() {
-        let send_lane = |idx: u8| {
-            AutomationLane::new(
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx: idx }),
-                1.0,
-            )
-        };
-        let mk_send = |dest: u32| crate::model::Send {
+        let mk_send = |sid: u32, dest: u32| crate::model::Send {
+            id: sid,
             dest_track_id: dest,
             gain: 1.0,
             mode: crate::model::SendMode::PostFader,
@@ -6432,63 +6761,78 @@ mod tests {
         let mut song = Song::default();
         song.tracks.push(Track {
             id: 42,
-            sends: vec![mk_send(1), mk_send(2), mk_send(3)],
-            automation_lanes: vec![send_lane(0), send_lane(1), send_lane(2)],
+            sends: vec![mk_send(10, 1), mk_send(11, 2), mk_send(12, 3)],
+            next_send_id: 13,
+            automation_lanes: vec![send_lane(10), send_lane(11), send_lane(12)],
             ..Track::default()
         });
-        // send index 1 (dest 2) を削除。
-        assert!(song.remove_track_send(42, 1));
+        // send id 11 (dest 2) を削除。
+        assert!(song.remove_track_send(42, 11));
         let t = song.track_by_id(42).unwrap();
         assert_eq!(t.sends.len(), 2);
         assert_eq!(t.sends[0].dest_track_id, 1);
         assert_eq!(t.sends[1].dest_track_id, 3);
-        let idxs: Vec<u8> = t
+        let ids: Vec<u32> = t
             .automation_lanes
             .iter()
             .filter_map(|l| match l.target {
-                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_idx }) => {
-                    Some(send_idx)
-                }
+                AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain {
+                    send_id, ..
+                }) => Some(send_id),
                 _ => None,
             })
             .collect();
-        assert_eq!(idxs, vec![0, 1], "send 0 据置 + 旧 send 2 が新 index 1 へ");
-        // 範囲外 / 不在 track は false (no-op)。
+        assert_eq!(ids, vec![10, 12], "id 11 の lane だけ除去、残りは無変更");
+        // 不在 id / 不在 track は false (no-op)。
         assert!(!song.remove_track_send(42, 99));
-        assert!(!song.remove_track_send(999, 0));
+        assert!(!song.remove_track_send(999, 10));
     }
 
-    /// r.md #8 M7: 旧 project (v22) の PluginParam MIDI binding は `slot` を持つ。
-    /// device_index に `#[serde(default)]` + legacy_slot (`rename="slot"`) を付けたので、
-    /// 旧 JSON が deserialize 失敗せず legacy_slot に載る (= 旧実装では project 全体が
-    /// load 不能になっていたのを是正)。 新形式・bincode 往復 (IPC) も維持。
+    /// r.md #8 M7 + v29: 旧 project の PluginParam MIDI binding は `slot`
+    /// (v22) または `device_index` (v23-28) を持つ。 どちらも deserialize
+    /// 失敗せず legacy field に載り、 `ensure_ids` が device_id へ写像する。
     #[test]
-    fn binding_target_plugin_param_legacy_slot_compat() {
+    fn binding_target_plugin_param_legacy_compat() {
         use crate::protocol::PluginSlot;
-        // 旧 JSON: device_index の代わりに slot。
+        // v22 JSON: device_index の代わりに slot。
         let json = r#"{"PluginParam":{"track":3,"slot":{"Fx":1},"param_id":7}}"#;
         let bt: BindingTarget = serde_json::from_str(json).expect("旧 slot 形式が load できる");
         assert_eq!(
             bt,
             BindingTarget::PluginParam {
                 track: 3,
-                device_index: 0, // 未 migration (ensure_ids が解決)
+                device_id: 0, // 未 migration (ensure_ids が解決)
                 param_id: 7,
+                legacy_device_index: None,
                 legacy_slot: Some(PluginSlot::Fx(1)),
             }
         );
-        // 新 JSON (device_index) も従来どおり load。
-        let json_new = r#"{"PluginParam":{"track":1,"device_index":2,"param_id":5}}"#;
-        let bt2: BindingTarget = serde_json::from_str(json_new).unwrap();
+        // v23-28 JSON (device_index) は legacy_device_index に載る。
+        let json_v28 = r#"{"PluginParam":{"track":1,"device_index":2,"param_id":5}}"#;
+        let bt2: BindingTarget = serde_json::from_str(json_v28).unwrap();
         assert!(matches!(
             bt2,
-            BindingTarget::PluginParam { device_index: 2, legacy_slot: None, .. }
+            BindingTarget::PluginParam {
+                device_id: 0,
+                legacy_device_index: Some(2),
+                legacy_slot: None,
+                ..
+            }
         ));
-        // bincode 往復 (IPC 経路): legacy_slot=None で round-trip 一致。
+        // v29 JSON (device_id) はそのまま。 bincode 往復 (IPC 経路) も一致。
+        let bt3 = BindingTarget::PluginParam {
+            track: 1,
+            device_id: 42,
+            param_id: 5,
+            legacy_device_index: None,
+            legacy_slot: None,
+        };
+        let via_json = json_roundtrip(&bt3);
+        assert_eq!(bt3, via_json);
         let cfg = bincode::config::standard();
-        let bytes = bincode::encode_to_vec(bt2, cfg).unwrap();
+        let bytes = bincode::encode_to_vec(bt3, cfg).unwrap();
         let (back, _): (BindingTarget, usize) = bincode::decode_from_slice(&bytes, cfg).unwrap();
-        assert_eq!(bt2, back);
+        assert_eq!(bt3, back);
     }
 
     #[test]
@@ -6562,13 +6906,15 @@ mod tests {
         s.insert(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume));
         s.insert(AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan));
         s.insert(AutomationTarget::PluginParam {
-            device_index: 0,
+            device_id: 0,
             param_id: 7,
+            legacy_device_index: None,
             legacy_slot: None,
         });
         s.insert(AutomationTarget::PluginParam {
-            device_index: 1,
+            device_id: 1,
             param_id: 7,
+            legacy_device_index: None,
             legacy_slot: None,
         });
         assert_eq!(s.len(), 4);
@@ -6746,7 +7092,7 @@ mod tests {
         let mut song = Song::default();
         let cid = song.alloc_content_id();
         song.clip_contents
-            .insert(cid, ClipContent::Audio(AudioContent { events }));
+            .insert(cid, ClipContent::Audio(AudioContent { events, next_event_id: 0 }));
         song.tracks = vec![Track {
             id: 1,
             clips: vec![Clip {
@@ -6839,6 +7185,7 @@ mod tests {
             cid,
             ClipContent::Audio(AudioContent {
                 events: vec![rescale_event(StretchMode::Raw, 0.0, 4.0)],
+                next_event_id: 0,
             }),
         );
         song.tracks = vec![Track {

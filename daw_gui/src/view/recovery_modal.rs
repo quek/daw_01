@@ -34,7 +34,7 @@ const MODAL_STYLE: ModalStyle = ModalStyle {
 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
-    if !app.show_recovery_modal {
+    if !app.ui_ephemeral.show_recovery_modal {
         // 「復元」/「破棄」ボタンは Edit 経由で app flag だけ落とすので、 modal の
         // close はここで同期する (export_overlay と同 idiom)。 これを怠ると、 最後の
         // 候補を処理した次フレームから `ui.modal()` が呼ばれなくなり、 open_popups に
@@ -50,7 +50,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
 
     // 高さは候補数で動的に決まる。 上限なし (16 件超えたら scroll 入れたいが
     // 通常 1〜2 件のみのはず)
-    let n = app.recovery_candidates.len() as f32;
+    let n = app.ui_ephemeral.recovery_candidates.len() as f32;
     let panel_h = TITLE_H + (ROW_H + ROW_GAP) * n + FOOTER_H + PAD * 2.0;
 
     ui.modal(
@@ -76,7 +76,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             // 候補 row
             let mut y = panel.y + TITLE_H + PAD;
             // clone してから iterate (closure 内で AppData mut 参照を作るため)
-            let candidates = app.recovery_candidates.clone();
+            let candidates = app.ui_ephemeral.recovery_candidates.clone();
             for (i, candidate) in candidates.iter().enumerate() {
                 let row_rect = Rect {
                     x: panel.x + PAD,

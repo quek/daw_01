@@ -127,8 +127,8 @@ pub fn fill_track_param_ramps(
 }
 
 /// Phase 2b (`docs/plan_automation.md` §8.3): push automation events for
-/// the specified device (by its position in the track's single `devices`
-/// chain) into `pd.events_in` as `EventKind::ParamValue` entries.
+/// the specified device (v29: 安定 device id `PluginInstance::id` で指定)
+/// into `pd.events_in` as `EventKind::ParamValue` entries.
 /// plugin_host's `process_server` decodes them into
 /// `TimedParamEvent` and forwards to `LoadedPlugin::process(..,
 /// param_events, ..)` which converts them to CLAP `clap_event_param_value`
@@ -146,7 +146,7 @@ pub fn fill_pd_param_events(
     pd: &mut ProcessData,
     song: &Song,
     track_id: u32,
-    device_index: u32,
+    device_id: u64,
     sample_rate: u32,
     // M5 (r.md #8 再監査): transport の積分済 `playhead_beats` を anchor に
     // buffer 内は `current_bpm` で advance (SongTempo automation 尊重、 A10 同経路)。
@@ -200,8 +200,8 @@ pub fn fill_pd_param_events(
             continue;
         }
         let param_id = match &lane.target {
-            AutomationTarget::PluginParam { device_index: d, param_id, .. }
-                if *d == device_index =>
+            AutomationTarget::PluginParam { device_id: d, param_id, .. }
+                if *d == device_id =>
             {
                 *param_id
             }
@@ -239,10 +239,10 @@ pub fn fill_pd_param_events(
     // per-format に CLAP `param_mod` / 合成へ変換する。follower が 0 に戻った時も
     // offset 0 を送って mod を解除するため、毎バッファ無条件に emit する。
     for (i, r) in mod_routings.iter().enumerate() {
-        let AutomationTarget::PluginParam { device_index: d, param_id, .. } = &r.target else {
+        let AutomationTarget::PluginParam { device_id: d, param_id, .. } = &r.target else {
             continue;
         };
-        if *d != device_index {
+        if *d != device_id {
             continue;
         }
         // 同一 target は 1 度だけ (先行する同 target routing があれば skip)。
@@ -275,16 +275,19 @@ mod tests {
             ClipContent::Automation(AutomationContent {
                 points: vec![
                     AutomationPoint {
+                        id: 1,
                         time_beat: 0.0,
                         value: 0.0,
                         curve: AutomationCurve::Linear,
                     },
                     AutomationPoint {
+                        id: 2,
                         time_beat: 4.0,
                         value: 1.0,
                         curve: AutomationCurve::Linear,
                     },
                 ],
+                next_point_id: 3,
             }),
         );
         let lane = AutomationLane {
@@ -549,8 +552,10 @@ mod tests {
         }
     }
 
-    /// One track (id 7) with a single `PluginParam` (device_index 0, param 5)
+    /// One track (id 7) with a single `PluginParam` (device_id 40, param 5)
     /// automation lane ramping 0.25 → 0.75 over beats 0..4.
+    const DEVICE_ID: u64 = 40;
+
     fn one_plugin_param_lane_song() -> Song {
         let mut song = Song {
             bpm: 120.0,
@@ -561,14 +566,26 @@ mod tests {
             cid,
             ClipContent::Automation(AutomationContent {
                 points: vec![
-                    AutomationPoint { time_beat: 0.0, value: 0.25, curve: AutomationCurve::Linear },
-                    AutomationPoint { time_beat: 4.0, value: 0.75, curve: AutomationCurve::Linear },
+                    AutomationPoint {
+                        id: 1,
+                        time_beat: 0.0,
+                        value: 0.25,
+                        curve: AutomationCurve::Linear,
+                    },
+                    AutomationPoint {
+                        id: 2,
+                        time_beat: 4.0,
+                        value: 0.75,
+                        curve: AutomationCurve::Linear,
+                    },
                 ],
+                next_point_id: 3,
             }),
         );
         let target = AutomationTarget::PluginParam {
-            device_index: 0,
+            device_id: DEVICE_ID,
             param_id: 5,
+            legacy_device_index: None,
             legacy_slot: None,
         };
         let lane = AutomationLane {
@@ -600,7 +617,7 @@ mod tests {
         let song = one_plugin_param_lane_song();
         let mut pd = ProcessData::empty();
         let empty = empty_recording_lanes();
-        fill_pd_param_events(&mut pd, &song, 7, 0, SR, 120.0, 0.0, 512, &empty, &[]);
+        fill_pd_param_events(&mut pd, &song, 7, DEVICE_ID, SR, 120.0, 0.0, 512, &empty, &[]);
         assert!(
             pd.n_events_in > 1,
             "ramp は sub-buffer で複数 event を出すべき, got {}",
@@ -629,15 +646,16 @@ mod tests {
         let song = one_plugin_param_lane_song();
         let track_id = 7;
         let target = AutomationTarget::PluginParam {
-            device_index: 0,
+            device_id: DEVICE_ID,
             param_id: 5,
+            legacy_device_index: None,
             legacy_slot: None,
         };
 
         // Not recording: the curve value is pushed as a ParamValue event (read).
         let mut pd = ProcessData::empty();
         let empty = empty_recording_lanes();
-        fill_pd_param_events(&mut pd, &song, track_id, 0, SR, 120.0, 0.0, 64, &empty, &[]);
+        fill_pd_param_events(&mut pd, &song, track_id, DEVICE_ID, SR, 120.0, 0.0, 64, &empty, &[]);
         assert_eq!(pd.n_events_in, 1, "read mode must push the curve value");
 
         // Recording: the lane is skipped, so no curve event overwrites the
@@ -645,14 +663,14 @@ mod tests {
         let mut pd2 = ProcessData::empty();
         let mut rec = std::collections::HashSet::new();
         rec.insert((track_id, target));
-        fill_pd_param_events(&mut pd2, &song, track_id, 0, SR, 120.0, 0.0, 64, &rec, &[]);
+        fill_pd_param_events(&mut pd2, &song, track_id, DEVICE_ID, SR, 120.0, 0.0, 64, &rec, &[]);
         assert_eq!(pd2.n_events_in, 0, "recording lane curve must be suppressed");
     }
 
     /// r.md #8 再監査: master fx (`MASTER_TRACK_ID`) の PluginParam automation は
     /// track ではなく `song_lanes` から引く。 track を 1 つも持たない song の
     /// song_lanes に置いた PluginParam lane が `fill_pd_param_events(MASTER_TRACK_ID,
-    /// device_index)` で適用されること (= master fx 自動化) を検証。
+    /// device_id)` で適用されること (= master fx 自動化) を検証。
     #[test]
     fn fill_pd_param_events_master_fx_reads_song_lanes() {
         let mut song = Song { bpm: 120.0, ..Song::default() };
@@ -661,12 +679,28 @@ mod tests {
             cid,
             ClipContent::Automation(AutomationContent {
                 points: vec![
-                    AutomationPoint { time_beat: 0.0, value: 0.25, curve: AutomationCurve::Linear },
-                    AutomationPoint { time_beat: 4.0, value: 0.75, curve: AutomationCurve::Linear },
+                    AutomationPoint {
+                        id: 1,
+                        time_beat: 0.0,
+                        value: 0.25,
+                        curve: AutomationCurve::Linear,
+                    },
+                    AutomationPoint {
+                        id: 2,
+                        time_beat: 4.0,
+                        value: 0.75,
+                        curve: AutomationCurve::Linear,
+                    },
                 ],
+                next_point_id: 3,
             }),
         );
-        let target = AutomationTarget::PluginParam { device_index: 0, param_id: 5, legacy_slot: None };
+        let target = AutomationTarget::PluginParam {
+            device_id: DEVICE_ID,
+            param_id: 5,
+            legacy_device_index: None,
+            legacy_slot: None,
+        };
         let lane = AutomationLane {
             id: 1,
             clips: vec![AutomationClip {
@@ -687,7 +721,7 @@ mod tests {
             &mut pd,
             &song,
             common::model::MASTER_TRACK_ID,
-            0,
+            DEVICE_ID,
             SR,
             120.0,
             0.0,
@@ -702,13 +736,13 @@ mod tests {
             "curve value at beat 0 should be 0.25, got {}",
             pd.events_in[0].value
         );
-        // 別 device_index (別 master fx) には適用されない。
+        // 別 device_id (別 master fx) には適用されない。
         let mut pd2 = ProcessData::empty();
         fill_pd_param_events(
             &mut pd2,
             &song,
             common::model::MASTER_TRACK_ID,
-            1,
+            DEVICE_ID + 1,
             SR,
             120.0,
             0.0,
@@ -716,6 +750,6 @@ mod tests {
             &empty,
             &[],
         );
-        assert_eq!(pd2.n_events_in, 0, "device_index 1 の master fx には lane が無い");
+        assert_eq!(pd2.n_events_in, 0, "別 device_id の master fx には lane が無い");
     }
 }

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use common::model::PianoRollViewState;
-use common::protocol::MainToChild;
+use common::protocol::PluginCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent, ClipRef};
@@ -21,7 +21,7 @@ use daw_gui::dispatcher::{
 const CLIP_A: ClipRef = ClipRef { track: 0, clip: 0 };
 const CLIP_B: ClipRef = ClipRef { track: 1, clip: 0 };
 
-fn build_app() -> (AppData, UnboundedReceiver<MainToChild>) {
+fn build_app() -> (AppData, UnboundedReceiver<PluginCommand>) {
     let (audio_tx, _audio_rx) = mpsc::unbounded_channel();
     let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
     let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
@@ -43,14 +43,14 @@ fn build_app() -> (AppData, UnboundedReceiver<MainToChild>) {
 /// 2 トラック × 各 1 クリップの app。 `Track` は private field を持ち外部クレートから
 /// struct literal を作れないので、 既定 app の 1 本目を clone して 2 本目を用意し、
 /// clip は公開 API (`CreateClip` event = `next_clip_id` 採番) で各トラックに 1 つ作る。
-fn build_two_clip_app() -> (AppData, UnboundedReceiver<MainToChild>) {
+fn build_two_clip_app() -> (AppData, UnboundedReceiver<PluginCommand>) {
     let (mut app, rx) = build_app();
-    app.song.tracks.truncate(1);
-    app.song.tracks[0].id = 1;
-    app.song.tracks[0].clips.clear();
-    let mut t2 = app.song.tracks[0].clone();
+    app.edit_song(|song| song.tracks.truncate(1));
+    app.edit_song(|song| song.tracks[0].id = 1);
+    app.edit_song(|song| song.tracks[0].clips.clear());
+    let mut t2 = app.song_doc.song().tracks[0].clone();
     t2.id = 2;
-    app.song.tracks.push(t2);
+    app.edit_song(|song| song.tracks.push(t2));
     app.handle_event(AppEvent::CreateClip { track: 0, start_beat: 0.0 });
     app.handle_event(AppEvent::CreateClip { track: 1, start_beat: 0.0 });
     (app, rx)
@@ -87,47 +87,47 @@ fn view_state_snapshot_restore_roundtrips() {
     let key_a = app.clip_key_of(CLIP_A).expect("clip A は解決できる");
 
     // 代表的な表示状態を仕込む。
-    app.arrange_zoom_x = 50.0;
-    app.arrange_scroll_beat = 7.0;
-    app.bottom_panel = 1;
-    app.master_row_automation_expanded = true;
-    app.expanded_automation_tracks.insert(2);
+    app.ui_prefs.arrange_zoom_x = 50.0;
+    app.ui_prefs.arrange_scroll_beat = 7.0;
+    app.ui_prefs.bottom_panel = 1;
+    app.ui_prefs.master_row_automation_expanded = true;
+    app.ui_prefs.expanded_automation_tracks.insert(2);
     let pv = PianoRollViewState { zoom_x: 111.0, zoom_y: 20.0, top_pitch: 70, scroll_beat: 2.0 };
-    app.piano_roll_views.insert(key_a, pv);
+    app.ui_prefs.piano_roll_views.insert(key_a, pv);
     // 開いていたクリップ (= 開き直しで復元されるべき選択)。
-    app.selected_clip = Some(key_a);
-    app.selected_clips = vec![key_a];
+    app.selection.selected_clip = Some(key_a);
+    app.selection.selected_clips = vec![key_a];
 
     let snap = app.snapshot_view_state();
 
     // すべて別の値へ壊してから restore。
-    app.arrange_zoom_x = 999.0;
-    app.arrange_scroll_beat = 0.0;
-    app.bottom_panel = 0;
-    app.master_row_automation_expanded = false;
-    app.expanded_automation_tracks.clear();
-    app.piano_roll_views.clear();
-    app.selected_clip = None;
-    app.selected_clips.clear();
+    app.ui_prefs.arrange_zoom_x = 999.0;
+    app.ui_prefs.arrange_scroll_beat = 0.0;
+    app.ui_prefs.bottom_panel = 0;
+    app.ui_prefs.master_row_automation_expanded = false;
+    app.ui_prefs.expanded_automation_tracks.clear();
+    app.ui_prefs.piano_roll_views.clear();
+    app.selection.selected_clip = None;
+    app.selection.selected_clips.clear();
 
     app.restore_view_state(Some(snap));
 
-    assert_eq!(app.arrange_zoom_x, 50.0);
-    assert_eq!(app.arrange_scroll_beat, 7.0);
-    assert_eq!(app.bottom_panel, 1);
-    assert!(app.master_row_automation_expanded);
-    assert!(app.expanded_automation_tracks.contains(&2));
+    assert_eq!(app.ui_prefs.arrange_zoom_x, 50.0);
+    assert_eq!(app.ui_prefs.arrange_scroll_beat, 7.0);
+    assert_eq!(app.ui_prefs.bottom_panel, 1);
+    assert!(app.ui_prefs.master_row_automation_expanded);
+    assert!(app.ui_prefs.expanded_automation_tracks.contains(&2));
     assert_eq!(
-        app.piano_roll_views.get(&key_a).copied(),
+        app.ui_prefs.piano_roll_views.get(&key_a).copied(),
         Some(pv),
         "per-clip piano roll view が復元される"
     );
     assert_eq!(
-        app.selected_clip,
+        app.selection.selected_clip,
         Some(key_a),
         "開いていたクリップ選択が復元される (= 開き直しでピアノロールが空にならない)"
     );
-    assert_eq!(app.selected_clips, vec![key_a]);
+    assert_eq!(app.selection.selected_clips, vec![key_a]);
 }
 
 /// `restore_view_state(None)` (= 旧ファイル) は per-clip map をクリアしつつ
@@ -136,14 +136,14 @@ fn view_state_snapshot_restore_roundtrips() {
 fn restore_none_clears_per_clip_but_keeps_globals() {
     let (mut app, _rx) = build_two_clip_app();
     let key_a = app.clip_key_of(CLIP_A).expect("clip A は解決できる");
-    app.arrange_zoom_x = 42.0;
-    app.piano_roll_views.insert(key_a, PianoRollViewState::default());
+    app.ui_prefs.arrange_zoom_x = 42.0;
+    app.ui_prefs.piano_roll_views.insert(key_a, PianoRollViewState::default());
 
     app.restore_view_state(None);
 
     assert!(
-        app.piano_roll_views.is_empty(),
+        app.ui_prefs.piano_roll_views.is_empty(),
         "旧ファイルでも前プロジェクトの per-clip view は漏らさずクリア"
     );
-    assert_eq!(app.arrange_zoom_x, 42.0, "globals は現状維持 (従来挙動)");
+    assert_eq!(app.ui_prefs.arrange_zoom_x, 42.0, "globals は現状維持 (従来挙動)");
 }

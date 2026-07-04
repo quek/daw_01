@@ -1,8 +1,8 @@
-//! Offline WAV render. Drives the same `AudioWorkerPool` and per-plugin
+//! Offline WAV render. Drives the same worker rig and per-plugin
 //! `ProcessData` shmem the live audio thread uses, but freewheels through
 //! the song as fast as the plugin chain allows. The CPAL callback
 //! cooperates by checking `EngineShared::export_running` and writing
-//! silence while we hold the resources (see [`engine::LocalState::process_buffer`]).
+//! silence while we hold the resources (see [`crate::engine::LocalState::process_buffer`]).
 //!
 //! Threading model: the daw_audio receive loop reserves
 //! `EngineShared::export_running` (compare_exchange, to mute the CPAL
@@ -13,14 +13,17 @@
 //!    here; this thread is RT-irrelevant once the realtime callback is
 //!    parked).
 //! 2. Walks the song from frame 0 to `length_beats * samples_per_beat`,
-//!    calling `pool.dispatch_and_wait` (or the serial fallback) every
-//!    buffer and writing the master bus into `hound::WavWriter`.
+//!    calling the live/export 共通の [`render_master_buffer`] every buffer
+//!    and writing the master bus into `hound::WavWriter`. master fx chain と
+//!    master gain もその中で適用される (§5 — 旧実装は export だけ両方を
+//!    素通りしていて、master に挿した limiter / master volume が WAV に
+//!    乗らなかった)。
 //!
 //! The spawn closure (not `run_export`) releases `export_running` after this
 //! returns, on every path, so live playback can resume.
 //!
 //! `clap_plugin_render.set(CLAP_RENDER_OFFLINE)` is bookended by the GUI
-//! around this call (it sends `MainToChild::SetRenderMode(Offline)` to
+//! around this call (it sends `PluginCommand::SetRenderMode(Offline)` to
 //! the plugin host before triggering the export, and `Realtime` after).
 
 use std::path::PathBuf;
@@ -31,10 +34,8 @@ use anyhow::{Context, Result};
 use common::model::Song;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
-use crate::engine::{
-    EngineShared, MAX_TRACKS, execute_schedule_post_dispatch, process_track_owned,
-};
-use crate::graph::compile_schedule;
+use crate::engine::{EngineShared, MAX_TRACKS};
+use crate::graph::{compile_schedule, render_master_buffer};
 use crate::mixer::TrackScratch;
 
 /// Hard ceiling on the rendered tail (10 s past `length_beats`). Stops
@@ -43,7 +44,7 @@ use crate::mixer::TrackScratch;
 const TAIL_MAX_SECONDS: u64 = 10;
 
 /// Outcome of [`run_export`]. `cancelled` distinguishes a user abort
-/// (`MainToChild::CancelExport`) from success / error so the host can
+/// (`AudioCommand::CancelExport`) from success / error so the host can
 /// branch on a typed flag instead of matching an error string.
 pub struct ExportOutcome {
     /// Frames written to the WAV (0 when cancelled — the partial file is
@@ -91,11 +92,11 @@ pub enum RenderSpan {
 /// song-body samples rendered so far (`done`, capped at the body length)
 /// and the body length in samples (`total`). The caller is expected to
 /// throttle the actual IPC send. Standalone WAV export passes a sender
-/// that emits `ChildToMain::ExportWavProgress`; the clip-range bounce
+/// that emits `AudioEvent::ExportWavProgress`; the clip-range bounce
 /// passes a no-op (no progress overlay).
 ///
 /// Cancellation: if `EngineShared::export_cancel` is raised mid-render
-/// (via `MainToChild::CancelExport`), the loop breaks, the partial WAV is
+/// (via `AudioCommand::CancelExport`), the loop breaks, the partial WAV is
 /// deleted, and the function returns `Ok(ExportOutcome { cancelled: true, .. })`
 /// (a cancel is not an error).
 #[allow(clippy::too_many_arguments)]
@@ -196,7 +197,6 @@ pub fn run_export(
     let render_result = render_loop(
         &engine_shared,
         &song,
-        n_tracks,
         sample_rate,
         max_frames,
         total_samples,
@@ -254,7 +254,6 @@ pub fn run_export(
 fn render_loop(
     engine_shared: &EngineShared,
     song: &Song,
-    n_tracks: usize,
     sample_rate: u32,
     max_frames: usize,
     total_samples: u64,
@@ -273,8 +272,6 @@ fn render_loop(
     let silence_thresh: f32 = 0.001;
     let silence_cutoff_samples = u64::from(sample_rate) / 2;
     let mut silence_counter: u64 = 0;
-
-    let any_solo = song.tracks.iter().any(|t| t.solo);
 
     // Ensure every audio source is decoded before the offline walk. The
     // background decode worker (r.md #7) may not have finished, and the
@@ -303,11 +300,11 @@ fn render_loop(
     }
 
     // Compile the routing schedule once for the whole render — same
-    // structure as the live audio thread's `cached_schedule`. PDC
-    // compensation (`ApplyDelay`), group buses (`Mix → TrackScratch`)
-    // and SidechainTap all live in here; without using it the export
-    // would silently bypass PR3 PDC and mis-render group hierarchies.
-    let mut schedule = compile_schedule(song, sample_rate)
+    // structure as the live audio thread's cached schedule. PDC compensation
+    // (`ApplyDelay`), group buses, SidechainTap and master fx all flow from
+    // it via `render_master_buffer`. `buffer_frames` = このループの処理単位
+    // `max_frames` (leaf 宛 sidechain tap の 1-buffer 補償量、 live と同規則)。
+    let mut schedule = compile_schedule(song, sample_rate, max_frames as u32)
         .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
 
     // docs/plan_modulation.md §7: bake each `ModSource`'s follower envelope per
@@ -325,6 +322,12 @@ fn render_loop(
     // (prev buffer's env) for audio-param modulation, mirroring the live engine.
     let mut mod_scalars_snapshot: Vec<f32> = Vec::with_capacity(schedule.follower_slots.len());
 
+    // Phase 4 Step C-2: offline export 中は recording lane なし
+    // (= GUI が active gesture を持たない、 transport が freewheel)。
+    let empty_recording_lanes: std::collections::HashSet<
+        (u32, common::model::AutomationTarget),
+    > = std::collections::HashSet::new();
+
     // Frame counter for the WAV output. The walk starts at `walk_start`
     // (= 0 for full / warm bounce so plugin state at `write_start` is built
     // up; = `write_start` for a cold range so nothing before it is
@@ -336,7 +339,7 @@ fn render_loop(
     // 始まる range 書き出しは walk_start に対応する beat で seed する。
     let mut playhead_beats = common::automation::samples_to_beats(song, sample_rate, walk_start);
     while playhead < total_samples {
-        // User abort (`MainToChild::CancelExport`). Checked before any
+        // User abort (`AudioCommand::CancelExport`). Checked before any
         // work this buffer so the render stops promptly; `run_export`
         // discards the partial WAV on the `cancelled = true` return.
         if engine_shared.export_cancel.load(Ordering::Acquire) {
@@ -344,37 +347,19 @@ fn render_loop(
         }
         let remaining = total_samples - playhead;
         let frames = (remaining as usize).min(max_frames);
-        let frames_u32 = frames as u32;
 
-        master_l[..frames].fill(0.0);
-        master_r[..frames].fill(0.0);
-
-        // Snapshot the same wait-free state the audio thread reads.
+        // Snapshot the same wait-free state the notify thread sees (mirrors —
+        // this thread is off-RT, so ArcSwap loads are fine here).
         let plugin_refs_g = engine_shared.plugin_refs.load();
-        let slot_map_g = engine_shared.slot_to_plugin_id.load();
-        let worker_syncs_g = engine_shared.worker_syncs.load();
-        let pool_g = engine_shared.worker_pool.load();
+        let worker_g = engine_shared.worker.load_full();
         let audio_renderer_g = engine_shared.audio_clip_renderer.load();
         let audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer =
             &audio_renderer_g;
 
-        // Phase 4 Step C-2: offline export 中は recording lane なし
-        // (= GUI が active gesture を持たない、 transport が freewheel)。
-        // empty set を渡して bypass disabled に統一。
-        let empty_recording_lanes: std::collections::HashSet<
-            (u32, common::model::AutomationTarget),
-        > = std::collections::HashSet::new();
-
         // A2 (r.md #8): 当該 buffer の effective tempo を SongTempo カーブから取り、
-        // live 再生と同じ sample↔beat 対応にする。 `playhead_beats` は buffer 毎に
-        // この bpm で integrate される累算器 (seed は walk_start、 advance はループ末尾)。
-        // render 側 Stretch は tempo_follow_ratio(stretch_ratio, current_bpm,
-        // nominal_bpm) で source 進度を出すので、 tempo automation 中の伸縮も再生と
-        // 一致して WAV に焼かれる (= 旧実装は constant song.bpm で曲を早切りしていた)。
-        // B11 (r.md #8): export も再生と同じく song-level tempo modulation
-        // (LFO/Random/MSEG/follower → SongTempo) を base tempo に焼く。
+        // live 再生と同じ sample↔beat 対応にする。 B11 (r.md #8): export も再生と
+        // 同じく song-level tempo modulation を base tempo に焼く。
         // `mod_scalars_snapshot` は前 iteration 値 (engine と同じ 1-buffer lag)。
-        // SongTempo target の song_mod_routing が無ければ offset 0 = no-op。
         let base_bpm_freewheel =
             f64::from(common::automation::evaluate_song_tempo(song, playhead_beats));
         let smoothed_current_bpm_freewheel = common::automation::apply_modulation_with_scalars(
@@ -400,95 +385,32 @@ fn render_loop(
             mod_scalars_snapshot.push(v);
         }
 
-        if let Some(pool) = pool_g.as_deref() {
-            pool.dispatch_and_wait(
-                Some(song),
-                &mut scratch[..n_tracks],
-                &plugin_refs_g,
-                &slot_map_g,
-                audio_renderer,
-                &worker_syncs_g,
-                &mut master_l[..frames],
-                &mut master_r[..frames],
-                sample_rate,
-                frames_u32,
-                true,
-                any_solo,
-                &schedule.input_delay_per_track,
-                &empty_recording_lanes,
-                // live 側 (engine.rs `current_bpm`) と同じ effective tempo を渡す。
-                // base `song.bpm` を渡すと、 event 収集窓 (frames×bpm/(60·SR)) と
-                // ループ末尾の beat 累算 (effective tempo) が乖離し、 tempo
-                // automation 中の書き出しでノートが欠落 / 二重発音する。
-                smoothed_current_bpm_freewheel as f32,
-                playhead_beats,
-                smoothed_current_bpm_freewheel,
-                // export (freewheel render) は loop しない。
-                false,
-                &mod_scalars_snapshot,
-            );
-        } else {
-            let worker_sync = worker_syncs_g.first();
-            #[allow(clippy::needless_range_loop)]
-            for track_idx in 0..n_tracks {
-                let song_track = &song.tracks[track_idx];
-                let input_delay = schedule
-                    .input_delay_per_track
-                    .get(track_idx)
-                    .copied()
-                    .unwrap_or(0);
-                process_track_owned(
-                    track_idx as u32,
-                    song_track,
-                    &mut scratch[track_idx],
-                    &plugin_refs_g,
-                    &slot_map_g,
-                    Some(audio_renderer),
-                    worker_sync,
-                    sample_rate,
-                    frames_u32,
-                    true,
-                    Some(song),
-                    any_solo,
-                    input_delay,
-                    &empty_recording_lanes,
-                    // dispatch 側と同じ理由で effective tempo (live と同一)。
-                    smoothed_current_bpm_freewheel as f32,
-                    playhead_beats,
-                    smoothed_current_bpm_freewheel,
-                    // export (freewheel render) は loop しない。
-                    false,
-                    &mod_scalars_snapshot,
-                );
-            }
-        }
-
-        // Apply the routing schedule: ProcessTrack ops are no-ops here
-        // (already done by `dispatch_and_wait` / `process_track_owned`
-        // above). The remaining ops (`Mix` → master, `ApplyDelay` PDC,
-        // `ProcessGroupFx` group bus FX) are what differentiates this
-        // from a flat sum.
-        execute_schedule_post_dispatch(
+        // live と同一の単一 render 経路 (§5): dispatch → schedule → master fx
+        // → master gain。 export (freewheel render) は loop しない。
+        let master_gain = f32::from_bits(engine_shared.master_gain.load(Ordering::Relaxed));
+        render_master_buffer(
+            song,
             &mut schedule,
-            &mut scratch[..MAX_TRACKS],
+            scratch,
+            &plugin_refs_g,
+            worker_g.as_deref(),
+            audio_renderer,
             &mut master_l[..frames],
             &mut master_r[..frames],
-            frames,
-            song,
-            &plugin_refs_g,
-            &slot_map_g,
-            worker_syncs_g.first(),
             sample_rate,
             frames as u32,
             true,
-            any_solo,
+            false,
             &empty_recording_lanes,
-            // dispatch 側と同じ理由で effective tempo (live と同一)。
+            // live 側 (engine.rs `current_bpm`) と同じ effective tempo を渡す。
+            // base `song.bpm` を渡すと、 event 収集窓 (frames×bpm/(60·SR)) と
+            // ループ末尾の beat 累算 (effective tempo) が乖離し、 tempo
+            // automation 中の書き出しでノートが欠落 / 二重発音する。
             smoothed_current_bpm_freewheel as f32,
             playhead_beats,
-            // export (freewheel render) は loop しない。
-            false,
+            smoothed_current_bpm_freewheel,
             &mod_scalars_snapshot,
+            master_gain,
         );
 
         // docs/plan_modulation.md §7: record this buffer's follower envelopes

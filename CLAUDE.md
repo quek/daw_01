@@ -45,6 +45,7 @@ make run         # daw_gui をビルド × 起動 (Audio/Plugin プロセスを�
 make test        # テストを持つ package のみ実行 (TEST_PKGS、examples 等 #[test]0個は除外)
 make clippy      # clippy をエラー扱いで (--workspace、examples のコンパイル検証も兼ねる)
 make check       # cargo check --workspace (型検査のみ、ビルド不要)
+make arch-lint   # アーキテクチャ不変条件の機械検査 (下記「アーキテクチャ不変条件」節)
 ```
 
 特定 crate/test だけを素早く確認したいときは `cargo check -p <crate>` /
@@ -277,6 +278,37 @@ gui_01 #045 Phase 74 で `isize` raw vs `HANDLE` 型受け の選択時、 「wo
 - **ロック禁止**: 再生スレッドでブロッキングロックを取らない。UI ↔ 再生スレッド間はロックフリーキューや Atomic で渡す
 - **I/O 禁止**: ファイル I/O・ログ出力・println! を呼ばない
 - **システムコール最小化**: `Instant::now()` は許容、`thread::sleep` は避ける
+
+## アーキテクチャ不変条件
+
+2026-07-03 の全体改修 (`docs/plan_arch_refactor.md`) で確立。**`make arch-lint` が機械検査**し、
+`/arch-review` skill が定期監査する。これらに触れる変更は plan_arch_refactor.md を先に読む。
+
+1. **安定 id addressing**: プロセス境界・イベント・永続参照に positional index を使わない。
+   device = `PluginInstance.id` (u64、shmem 名・worker dispatch・plugin host bookkeeping も同じ id)、
+   send = `Send.id`、note/point/audio event = 要素 id。**「削除/並べ替えで参照を貼り替える補償
+   コード」を書き始めたら設計が誤り** (旧 ReorderChain の 3 プロセス貫通再キーが反例)。
+2. **wire は blob-less**: `LoadSong` の Song は `state`/`ara_archive` を構造的に除外
+   (PluginInstance の手書き bincode Encode)。protocol に `Vec<f32>`/`Arc<[u8]>` の bulk を
+   直載せしない (専用 message / WAV materialize / id 参照で運ぶ。16MB wire 上限は防御であって
+   「大きくして解決」しない)。
+3. **宛先は型で表現**: IPC は `AudioCommand`/`AudioEvent`/`PluginCommand`/`PluginEvent`。
+   単一 enum (旧 MainToChild/ChildToMain) に戻さない。「相手が無視する variant の no-op arm」が
+   生えたら分割が壊れているサイン。
+4. **RT スレッドは無限待ち・確保・解放をしない**: 他プロセスの完了待ちは有界
+   (`DISPATCH_TIMEOUT_MS`) + quarantine (`common/src/plugin_ref.rs` の poisoning contract)。
+   map 再構築・pool 生成/破棄等の重い作業は off-thread で構築し rtrb ring で swap。
+5. **Song 編集の副作用は単一の口**: undo snapshot / dirty / epoch / 子プロセス sync 予約は
+   `edit_song()` チョークポイントが無条件で担う。手動 `push_undo_snapshot`・whitelist・
+   view からの song 直接可変参照を追加しない。
+6. **live と export は同じ render 関数** (`render_master_buffer`): master fx / master gain を
+   含む「1 buffer を描く」処理を二重実装しない。
+7. **fingerprint handshake**: wire を渡る型を新ファイルへ切り出したら `common/build.rs` の
+   `WIRE_SOURCES` に必ず追加 (protocol 変更の検出網に穴が開く)。
+8. **daw-ui core はドメイン知識を持たない**: DAW 固有 widget (arrangement / piano_roll) は
+   `daw_gui/src/widgets/` で `common::model` 直結。mirror 型・翻訳 request enum を作らない。
+9. **god file budget**: 手書き .rs は 1 ファイル 3,000 行以内。超過したら分割してから足す
+   (app.rs 25k 行の再発防止)。
 
 ## FFI / CLAP 境界のセキュリティ
 

@@ -3,6 +3,11 @@
 //! A `Schedule` is the compiled execution plan that the audio thread
 //! steps through every buffer. It owns its delay-line ring buffers and
 //! its port-buffer pool so the RT path never allocates.
+//!
+//! v29 (`docs/plan_arch_refactor.md` §1): plugin を参照する op は
+//! `(track, device_index)` の positional key ではなく **安定 device id**
+//! (`PluginInstance::id`) を compile 時に焼き込む。engine はそれで
+//! `plugin_refs` (device_id → shmem) を直接引く。
 
 #![allow(dead_code)]
 
@@ -24,8 +29,6 @@ pub enum BufRef {
     /// A buffer drawn from `Schedule::port_buffers`. Used (PR2 onwards)
     /// for group-bus inputs that don't map to any track's own scratch.
     Pooled(u32),
-    /// A plugin's aux output port (PR4 parallel out).
-    PluginAuxOut { plugin_id: u32, port: u8 },
     /// A track's **pre-fader** scratch (after its fx chain, before the
     /// volume / pan strip). Written by `ProcessTrack` / `ProcessGroupFx`
     /// and read by a `MixSend` whose send `mode == PreFader`. Indexed by
@@ -89,52 +92,43 @@ pub enum NodeOp {
         frames: u32,
     },
 
-    /// PR4 sidechain: copy `src` into the plugin at `(dst_track, dst_index)`'s
-    /// `aux_in_port` shmem buffer **before** the plugin's `process()` runs.
-    /// `compile_schedule` keys by `(track, device_index)` because the runtime
-    /// `plugin_id` (assigned by daw_plugin_host) isn't visible at compile
-    /// time. The engine resolves to a concrete `plugin_id` via
-    /// `slot_to_plugin_id` at dispatch time. v23 single-chain: `dst_index` is
-    /// the device's position in `Track.devices`.
+    /// PR4 sidechain: copy `src` into the plugin `device_id`'s
+    /// `aux_in_port` shmem buffer **before** that plugin's `process()` runs.
+    /// v29: `device_id` は安定 id (`PluginInstance::id`) — compile 時に Song
+    /// から焼き込む。engine は `plugin_refs` (device_id keyed) を直接引く。
     SidechainTap {
         src: BufRef,
-        dst_track: u32,
-        dst_index: u32,
+        device_id: u64,
         aux_in_port: u8,
     },
 
     /// PR4 aux send: accumulate `src` (the source track's post- or
     /// pre-fader buffer) into `dst` (the destination return / bus track's
     /// scratch) scaled by the **live, per-sample-ramped** send gain of
-    /// `song.tracks[src_track_idx].sends[send_idx]`. Emitted **after** the
-    /// dst's clearing `Mix` (so it accumulates on top of any children) and
-    /// **before** the dst's `ProcessGroupFx`. The gain is read live (not
-    /// baked into the schedule) so knob drags / `SendGain` automation
-    /// apply without recompiling, and a disabled send contributes silence.
-    /// `src_track_idx` / `send_idx` resolve the gain; `src` resolves the
-    /// audio (`PostFader` → `TrackScratch`, `PreFader` → `PreFaderScratch`).
+    /// the send with stable id `send_id` on `song.tracks[src_track_idx]`.
+    /// Emitted **after** the dst's clearing `Mix` (so it accumulates on top
+    /// of any children) and **before** the dst's `ProcessGroupFx`. The gain
+    /// is read live (not baked into the schedule) so knob drags / `SendGain`
+    /// automation apply without recompiling, and a disabled send contributes
+    /// silence. v29: `send_id` は `Send::id` (安定 id)。
     MixSend {
         src: BufRef,
         dst: BufRef,
         src_track_idx: u32,
-        send_idx: u8,
+        send_id: u32,
     },
 
-    /// パラアウト (`docs/plan_paraout.md`): copy the plugin at
-    /// `(src_track, src_device)`'s aux **output** port `port`
-    /// (`pd.buffer_aux_out[port]`, written by daw_plugin_host during the
-    /// source plugin's pass-1 `process()`) **into** `dst_track`'s input
-    /// scratch (`+=`, accumulating after the dst's clearing `Mix`). The mirror
-    /// of `SidechainTap`: same `(track, device_index)` slot keying (the
-    /// runtime `plugin_id` is resolved via `slot_to_plugin_id` at dispatch),
-    /// but the data flows plugin-out → track-in instead of track-out →
-    /// plugin-in. Emitted **before** the dst bus's `ProcessGroupFx` so the
-    /// dst track's FX process the routed signal. Zero latency: the source
-    /// plugin ran in pass 1, so `buffer_aux_out` is settled by the time this
-    /// post-dispatch op reads it.
+    /// パラアウト (`docs/plan_paraout.md`): copy the plugin `device_id`'s aux
+    /// **output** port `port` (`pd.buffer_aux_out[port]`, written by
+    /// daw_plugin_host during the source plugin's pass-1 `process()`) **into**
+    /// `dst_track`'s input scratch (`+=`, accumulating after the dst's
+    /// clearing `Mix`). The mirror of `SidechainTap`, but the data flows
+    /// plugin-out → track-in instead of track-out → plugin-in. Emitted
+    /// **before** the dst bus's `ProcessGroupFx` so the dst track's FX process
+    /// the routed signal. Zero latency: the source plugin ran in pass 1, so
+    /// `buffer_aux_out` is settled by the time this post-dispatch op reads it.
     ParallelOutTap {
-        src_track: u32,
-        src_device: u32,
+        device_id: u64,
         port: u8,
         dst_track: u32,
     },
@@ -149,14 +143,31 @@ pub enum NodeOp {
     EnvelopeFollow { src: BufRef, slot: u32 },
 }
 
-/// Compiled, immutable execution plan. Held inside an
-/// `Arc<ArcSwap<Schedule>>` and replaced wholesale on every routing
-/// edit; the RT thread `load`s a snapshot at the top of each buffer.
+/// PDC delay line の stable identity (`docs/plan_arch_refactor.md` §5 D:
+/// schedule 再 compile を跨いだ状態移送のキー)。track は Song 上の安定
+/// `Track::id`。1 track は高々 1 つの clearing `Mix` (親 bus か master) に
+/// しか流れ込まないので、src 側補償は track id 単独で一意。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelayKey {
+    /// Mix 合流点で低 latency 側 src に入る補償 (`emit_mix_src_alignment`)。
+    MixSrc { track_id: u32 },
+    /// パラアウト `MixAdditive` で dst 自身 (instrument main) を子の最大
+    /// latency に揃える補償。
+    MixDst { track_id: u32 },
+}
+
+/// Compiled, immutable execution plan. Compiled **off the RT thread**
+/// (`main.rs` の publish 経路 / export) and delivered to the audio thread
+/// inside an `RtBundle` via a wait-free SPSC ring; the RT thread swaps it
+/// in with zero allocation and ships the superseded one back for
+/// off-thread disposal.
 pub struct Schedule {
     /// Ordered list of node ops to execute this buffer.
     pub nodes: Vec<NodeOp>,
     /// PDC delay-line pool (PR3). Indexed by `NodeOp::ApplyDelay::line_idx`.
     pub delay_lines: Vec<DelayLine>,
+    /// `delay_lines` と平行な stable key (§5 D 状態移送用)。
+    pub delay_keys: Vec<DelayKey>,
     /// Pooled stereo buffers used by ops whose dst is `BufRef::Pooled`.
     /// PR1 leaves this empty.
     pub port_buffers: PortBufferPool,
@@ -168,21 +179,26 @@ pub struct Schedule {
     /// time.
     ///
     /// Indexed by song track index (parallel to `song.tracks`). Entry `i`
-    /// is `max(path_latency(src) for src in fx_chain[*].aux_inputs[*].tap)`,
-    /// or 0 if the track has no fx_chain sidechain wiring.
+    /// is `max(path_latency(src) [+ buffer_frames for a leaf dst] for src
+    /// in devices[*].aux_inputs[*].tap)`, or 0 if the track has no
+    /// sidechain wiring. leaf dst の `+ buffer_frames` は「tap の staging が
+    /// post-dispatch = 消費が次 buffer」という 1-buffer 遅延の補償
+    /// (`docs/plan_arch_refactor.md` §5)。
     ///
-    /// MVP scope: only `fx_chain` plugin sidechain is reflected here.
-    /// `midi_fx_chain` / `instrument` sidechain alignment requires
-    /// delaying MIDI events too (out of scope for PR4.5).
+    /// MVP scope: only audio-in+out devices' sidechain is reflected here.
+    /// Instrument sidechain alignment requires delaying MIDI events too
+    /// (out of scope for PR4.5).
     pub input_delay_per_track: Vec<u32>,
     /// docs/plan_modulation.md §3: per-`ModSource` envelope follower state +
     /// baked coefficients, indexed by slot (= `ModSource` position in
     /// `Song::mod_sources`). `NodeOp::EnvelopeFollow { slot, .. }` advances
     /// `follower_slots[slot].env` each buffer; the engine publishes that env
-    /// to `AudioBridge::mod_scalars[slot]`. Rebuilt on recompile (so env
-    /// resets), persists across buffers within one schedule (like
-    /// `delay_lines`).
+    /// to `AudioBridge::mod_scalars[slot]`. 再 compile 時は
+    /// `adopt_state_from` が stable id (`follower_keys`) で走行状態を移送する。
     pub follower_slots: Vec<super::follower::FollowerSlot>,
+    /// `follower_slots` と平行な stable `ModSource::id` (§5 D 状態移送用)。
+    /// `0` は未採番 sentinel (移送対象外)。
+    pub follower_keys: Vec<u32>,
     /// per-`ModSource` の種別を
     /// slot 順 (= `follower_slots` / `AudioBridge::mod_scalars` と 1:1) に保持。
     /// generator (LFO/Random/MSEG/Steps) は `common::modulators::generator_scalar`
@@ -196,10 +212,41 @@ impl Schedule {
         Self {
             nodes: Vec::new(),
             delay_lines: Vec::new(),
+            delay_keys: Vec::new(),
             port_buffers: PortBufferPool::new(),
             input_delay_per_track: Vec::new(),
             follower_slots: Vec::new(),
+            follower_keys: Vec::new(),
             mod_kinds: Vec::new(),
+        }
+    }
+
+    /// §5 D (plan_arch_refactor): topology 再 compile 時の状態移送。旧
+    /// schedule から DelayLine (PDC ring の内容) と FollowerSlot (env) を
+    /// stable key で引き継ぐ。delay 長が変わった line は移送されず
+    /// ゼロ初期化のまま (= リセット)。
+    ///
+    /// **RT thread 上で呼ばれる** (`LocalState::refresh_bundle` の install
+    /// 時)。live の走行状態 (ring の音声履歴 / env) は RT だけが持つので、
+    /// off-thread では移送できない — ここで行う操作は `Vec` の `mem::swap`
+    /// (ポインタ交換) と f32 コピーだけで、alloc / free / lock は無い。
+    /// 探索は小さい Vec の線形走査 (delay lines ≤ track 数、followers ≤
+    /// MAX_MOD_SOURCES)。
+    pub fn adopt_state_from(&mut self, old: &mut Schedule) {
+        for (i, key) in self.delay_keys.iter().enumerate() {
+            if let Some(j) = old.delay_keys.iter().position(|k| k == key) {
+                // capacity 不一致 (= 補償 delay 長が変わった) なら false =
+                // リセットのまま。
+                let _ = self.delay_lines[i].try_adopt(&mut old.delay_lines[j]);
+            }
+        }
+        for (i, key) in self.follower_keys.iter().enumerate() {
+            if *key == 0 {
+                continue; // 未採番 sentinel は identity にならない
+            }
+            if let Some(j) = old.follower_keys.iter().position(|k| k == key) {
+                self.follower_slots[i].adopt_state_from(&old.follower_slots[j]);
+            }
         }
     }
 }

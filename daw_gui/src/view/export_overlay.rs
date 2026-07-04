@@ -40,11 +40,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // export 全体（音声 freewheel → 映像 render）で modal を出し、下の UI 操作を
     // ブロックする。`ui.modal` は真のモーダルで pointer 入力を遮断する
     // (gui_01 `pointer_blocked_by_modal_popup`)。
-    let stage = app.export_stage;
+    let stage = app.transport.export_stage;
     // `pending_video_export` だけ立って stage 未設定の窓は実際には起きない
     // (`action_begin_export_mp4` が AudioRender を同時に立てる) が、防御的に
     // active 判定へ含めて取りこぼしを防ぐ。
-    let active = stage.is_some() || app.pending_video_export.is_some();
+    let active = stage.is_some() || app.transport.pending_video_export.is_some();
     if !active {
         if ui.is_modal_open("export_progress") {
             ui.close_modal("export_progress");
@@ -55,7 +55,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
         ui.open_modal("export_progress");
     }
     // タイトル: video export (前段の音声フェーズ含む) か、標準 WAV export か。
-    let is_video = app.pending_video_export.is_some()
+    let is_video = app.transport.pending_video_export.is_some()
         || matches!(stage, Some(ExportStage::VideoRender { .. }));
     let title = if is_video {
         "Video export 中..."

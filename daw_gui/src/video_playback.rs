@@ -1549,9 +1549,10 @@ mod tests {
             cid,
             ClipContent::Automation(AutomationContent {
                 points: vec![
-                    AutomationPoint { time_beat: 0.0, value: 60.0, curve: AutomationCurve::Linear },
-                    AutomationPoint { time_beat: 12.0, value: 180.0, curve: AutomationCurve::Linear },
+                    AutomationPoint { id: 1, time_beat: 0.0, value: 60.0, curve: AutomationCurve::Linear },
+                    AutomationPoint { id: 2, time_beat: 12.0, value: 180.0, curve: AutomationCurve::Linear },
                 ],
+                next_point_id: 3,
             }),
         );
         song.song_lanes.push(AutomationLane {

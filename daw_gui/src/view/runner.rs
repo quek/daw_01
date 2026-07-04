@@ -472,11 +472,11 @@ fn handle_preview_drag(
             let kind = preview_drag_target_kind(app, drag.target);
             let cur_rot = {
                 let content = app
-                    .song
+                    .song_doc.song()
                     .tracks
                     .get(drag.target.track as usize)
                     .and_then(|t| t.clips.get(drag.target.clip as usize))
-                    .and_then(|c| app.song.clip_contents.get(&c.content_id));
+                    .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id));
                 match content {
                     Some(c) if matches!(kind, PreviewDragTargetKind::Text) => c
                         .text_events()
@@ -511,11 +511,11 @@ fn handle_preview_drag(
     // を持つ clip を見つけ、 同 idiom の現値 (x, y, w, h) を返す。
     let target = drag.target;
     let content = app
-        .song
+        .song_doc.song()
         .tracks
         .get(target.track as usize)
         .and_then(|t| t.clips.get(target.clip as usize))
-        .and_then(|c| app.song.clip_contents.get(&c.content_id));
+        .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id));
     let kind = preview_drag_target_kind(app, target);
     let current = match content {
         Some(c) if matches!(kind, PreviewDragTargetKind::Text) => {
@@ -569,11 +569,11 @@ enum PreviewDragTargetKind {
 
 fn preview_drag_target_kind(app: &AppData, target: ClipRef) -> PreviewDragTargetKind {
     let content = app
-        .song
+        .song_doc.song()
         .tracks
         .get(target.track as usize)
         .and_then(|t| t.clips.get(target.clip as usize))
-        .and_then(|c| app.song.clip_contents.get(&c.content_id));
+        .and_then(|c| app.song_doc.song().clip_contents.get(&c.content_id));
     match content {
         Some(common::model::ClipContent::Text(_)) => PreviewDragTargetKind::Text,
         _ => PreviewDragTargetKind::Image,
@@ -651,7 +651,7 @@ impl ApplicationHandler<AppEvent> for Runner {
         #[cfg(windows)]
         let app = {
             let mut app = app;
-            app.main_window_hwnd = dwin.hwnd_isize();
+            app.ui_ephemeral.main_window_hwnd = dwin.hwnd_isize();
             app
         };
 
@@ -831,7 +831,7 @@ impl ApplicationHandler<AppEvent> for Runner {
     /// に永続化して次回起動で復元する。 失敗は log のみ (起動を妨げない)。
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_ref() else { return };
-        save_main_window_state(&state.window, state.app.app_dirs.as_ref());
+        save_main_window_state(&state.window, state.app.ui_prefs.app_dirs.as_ref());
     }
 }
 
@@ -862,7 +862,7 @@ impl Runner {
     /// いずれかで立つ。 close 確認をキャンセルした場合は立たないので no-op。
     fn quit_if_requested(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_ref() else { return };
-        if state.app.should_quit {
+        if state.app.ui_ephemeral.should_quit {
             state.app.on_shutdown();
             event_loop.exit();
         }
@@ -880,15 +880,15 @@ impl Runner {
         let now = Instant::now();
         // この frame の overlay / clip スピナー / engine 未接続判定が
         // すべて同じ時刻を読むよう、frame 冒頭で 1 度だけ確定する (5s 境界の食い違い回避)。
-        state.app.frame_now = now;
+        state.app.ui_ephemeral.frame_now = now;
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
 
         // resource monitor (r.md #3): frame 時間の EMA から GUI FPS を AppData へ。
         // status bar 常駐メーターと詳細パネルが読む。
         let fps_sample = common::metrics_bridge::fps_from_dt(dt.as_secs_f32());
-        state.app.metrics.fps =
-            common::metrics_bridge::ema(state.app.metrics.fps, fps_sample, 0.1);
+        state.app.ipc.metrics.fps =
+            common::metrics_bridge::ema(state.app.ipc.metrics.fps, fps_sample, 0.1);
 
         // Diagnostic: emit a summary every 30 render frames so we can
         // see whether the main thread loop matches worker decode
@@ -973,7 +973,7 @@ impl Runner {
         // close 確認モーダルの「保存して終了」(同期保存) /「保存せず終了」 は
         // この frame の `ui.frame` 内で Edit が適用され `should_quit` が立つ。
         // `state` を borrow 中なので helper を介さず直接 cleanup + exit する。
-        if state.app.should_quit {
+        if state.app.ui_ephemeral.should_quit {
             state.app.on_shutdown();
             event_loop.exit();
             return false;
@@ -984,24 +984,16 @@ impl Runner {
         }
 
         // タイトル差分反映: "<*>プロジェクト名"。未保存変更があれば先頭に * を付ける。
-        // file_path 未設定 (新規未保存) は "Untitled"。毎フレーム is_dirty を読むが、
-        // 差分があるときだけ set_title を呼ぶ。
-        //
-        // is_dirty は編集 / Undo / Redo が sticky に立てる「arming」フラグなので、
-        // 立っているときだけ保存ベースラインとの内容比較で実 dirty を確定する。
-        // これで Undo / scrub で内容が保存状態へ戻れば '*' が自動で消える
-        // (clean な間は比較ゼロ、 dirty な間も 1 フレーム 1 回の比較に収まる)。
-        if state.app.is_dirty {
-            state.app.recompute_dirty();
-        }
+        // file_path 未設定 (新規未保存) は "Untitled"。 dirty は epoch 比較 O(1)
+        // (SongDoc::is_dirty) なので毎フレーム読んでよい。
         let project_name = state
             .app
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("Untitled");
-        let new_title = if state.app.is_dirty {
+        let new_title = if state.app.song_doc.is_dirty() {
             format!("*{project_name}")
         } else {
             project_name.to_string()
@@ -1046,7 +1038,7 @@ impl Runner {
         // クリップ上スピナー + 全体オーバーレイを回す。engine 未接続が確定したら
         // `voicevox_animating` が false を返すので static 警告表示で再描画は止まる
         // (CPU/GPU を回し続けない)。overlay 描画と同じ `now` (= frame_now) を使う。
-        state.app.is_playing || state.app.voicevox_animating(now)
+        state.app.transport.is_playing || state.app.voicevox_animating(now)
     }
 
     /// docs/plan_video.md P4: handle a WindowEvent dispatched against
@@ -1064,7 +1056,7 @@ impl Runner {
         };
         match event {
             WindowEvent::CloseRequested => {
-                state.app.preview_window_visible = false;
+                state.app.ui_prefs.preview_window_visible = false;
                 // Lifecycle pass on the next render_frame drops the
                 // preview state; nothing else to do here.
             }
@@ -1086,7 +1078,7 @@ impl Runner {
                 state.preview_cursor = Some(cursor);
                 if let Some(drag) = state.preview_drag {
                     let size = preview.renderer.size();
-                    let project_resolution = state.app.song.video_resolution;
+                    let project_resolution = state.app.song_doc.song().video_resolution;
                     let project_box = preview_project_box(
                         (size.width as f32, size.height as f32),
                         project_resolution,
@@ -1105,7 +1097,7 @@ impl Runner {
                 }
                 if let Some(gdrag) = state.preview_group_drag {
                     let size = preview.renderer.size();
-                    let project_resolution = state.app.song.video_resolution;
+                    let project_resolution = state.app.song_doc.song().video_resolution;
                     handle_group_drag(
                         &self.proxy,
                         &gdrag,
@@ -1132,7 +1124,7 @@ impl Runner {
                         let size = preview.renderer.size();
                         let screen = (size.width as f32, size.height as f32);
                         let rotation = preview.selection_rotation_radians;
-                        let project_resolution = state.app.song.video_resolution;
+                        let project_resolution = state.app.song_doc.song().video_resolution;
                         let project_box = preview_project_box(screen, project_resolution);
                         // 選択中 clip が active visual group の子なら親 group の
                         // affine を合成（= ハンドルが立ち絵に重なる）。drag 中は
@@ -1179,17 +1171,17 @@ impl Runner {
                     if state.preview_drag.is_none()
                         && let Some(cursor) = state.preview_cursor
                         && let Some(track_id) = state.app.cursor_track_id()
-                        && let Some(track) = state.app.song.track_by_id(track_id)
+                        && let Some(track) = state.app.song_doc.song().track_by_id(track_id)
                         && let Some(transform) = crate::video_fx::resolve_track_transform(
-                            &state.app.song,
+                            &state.app.song_doc.song(),
                             track,
-                            state.app.playhead_beat.map(f64::from).unwrap_or(0.0),
-                            &state.app.mod_scalars,
+                            state.app.transport.playhead_beat.map(f64::from).unwrap_or(0.0),
+                            &state.app.transport.mod_scalars,
                         )
                     {
                         let size = preview.renderer.size();
                         let screen = (size.width as f32, size.height as f32);
-                        let project_resolution = state.app.song.video_resolution;
+                        let project_resolution = state.app.song_doc.song().video_resolution;
                         let project_box = preview_project_box(screen, project_resolution);
                         if let Some(mode) = group_hit_test(&transform, project_box, cursor) {
                             let (rx, ry, _rw, _rh, _rot, px, py, _) =
@@ -1245,10 +1237,10 @@ impl Runner {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        let visible = state.app.preview_window_visible;
+        let visible = state.app.ui_prefs.preview_window_visible;
         match (visible, state.preview.is_some()) {
             (true, false) => {
-                let initial_size = state.app.song.video_resolution;
+                let initial_size = state.app.song_doc.song().video_resolution;
                 // main window の HWND を owner として渡して preview を
                 // main の owned-window に。 Win32 仕様で owned は owner
                 // の常に前面、 owner 最小化で owned も最小化、 タスクバー
@@ -1270,8 +1262,8 @@ impl Runner {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "preview window create failed");
-                        state.app.preview_window_visible = false;
-                        state.app.status_message =
+                        state.app.ui_prefs.preview_window_visible = false;
+                        state.app.ui_ephemeral.status_message =
                             format!("Video preview の作成に失敗: {e}");
                     }
                 }
@@ -1313,7 +1305,7 @@ impl Runner {
     /// queue is empty.
     #[cfg(windows)]
     fn drain_image_uploads(state: &mut RunnerState) {
-        if state.app.pending_image_uploads.is_empty() {
+        if state.app.media.pending_image_uploads.is_empty() {
             return;
         }
         let Some(preview) = state.preview.as_mut() else {
@@ -1323,15 +1315,15 @@ impl Runner {
             return;
         };
         let pending: Vec<_> =
-            state.app.pending_image_uploads.drain(..).collect();
+            state.app.media.pending_image_uploads.drain(..).collect();
         for image_source_id in pending {
             let Some((w, h, bgra)) =
-                state.app.image_source_bgra.remove(&image_source_id)
+                state.app.media.image_source_bgra.remove(&image_source_id)
             else {
                 continue; // already uploaded (= rapid undo path)
             };
             let handle = preview.upload_image_bgra(image_source_id, w, h, &bgra);
-            state.app.image_texture_cache.insert(image_source_id, handle);
+            state.app.ui_ephemeral.image_texture_cache.insert(image_source_id, handle);
         }
     }
 
@@ -1353,7 +1345,7 @@ impl Runner {
         // ~41ms) so a malformed project framerate (0 / NaN) still
         // permits some decoding.
         let frame_interval_ms = {
-            let fps = state.app.song.video_framerate.max(1.0);
+            let fps = state.app.song_doc.song().video_framerate.max(1.0);
             (1000.0 / fps).round().max(33.0) as u64
         };
         let now = Instant::now();
@@ -1364,17 +1356,17 @@ impl Runner {
         }
         state.last_preview_drive_at = Some(now);
 
-        let Some(playhead_beat) = state.app.playhead_beat.map(f64::from) else {
+        let Some(playhead_beat) = state.app.transport.playhead_beat.map(f64::from) else {
             preview.set_track_composites(Vec::new());
             return;
         };
         let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(
-            &state.app.song,
+            &state.app.song_doc.song(),
             playhead_beat,
         );
         let project_dir = state
             .app
-            .file_path
+            .song_doc.file_path
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
 
@@ -1387,12 +1379,12 @@ impl Runner {
         // project doesn't request empty ring decodes.
         if !active.is_empty() {
             let step_micros = {
-                let fps = state.app.song.video_framerate.max(1.0) as f64;
+                let fps = state.app.song_doc.song().video_framerate.max(1.0) as f64;
                 (1_000_000.0 / fps).round() as u64
             };
             for frame_info in &active {
                 let Some(abs_path) = resolve_video_path(
-                    &state.app.song,
+                    &state.app.song_doc.song(),
                     frame_info.video_source_id,
                     project_dir.as_deref(),
                 ) else {
@@ -1420,7 +1412,7 @@ impl Runner {
         // fast-path = 回帰なし・クリスプ・無コスト)。これで spatial 効果 (blur/歪み) が
         // 個別素材でなく「トラックの最終見た目 1 枚」に正しくかかる。
         use crate::group_compose::CompositeItem;
-        let (proj_w, proj_h) = state.app.song.video_resolution;
+        let (proj_w, proj_h) = state.app.song_doc.song().video_resolution;
         let canvas = (proj_w.max(1) as f32, proj_h.max(1) as f32);
         let mut buckets: std::collections::HashMap<u32, Vec<CompositeItem>> =
             std::collections::HashMap::new();
@@ -1451,27 +1443,27 @@ impl Runner {
         // `group_has_visual_content`。transform / lane 未設定の visual group も identity
         // として含む。export と同一述語（SSoT）。
         let active_groups = crate::group_compose::active_visual_groups(
-            &state.app.song,
+            &state.app.song_doc.song(),
             playhead_beat,
-            &state.app.mod_scalars,
+            &state.app.transport.mod_scalars,
         );
 
         // PiP 画像 → 親が active group ならその group bucket へ吸収、さもなくば owning
         // track の bucket。
         let image_frames = crate::image_compose::active_image_sources_at(
-            &state.app.song,
+            &state.app.song_doc.song(),
             playhead_beat,
-            &state.app.mod_scalars,
+            &state.app.transport.mod_scalars,
         );
         for frame_info in image_frames {
             let Some(handle) =
-                state.app.image_texture_cache.get(&frame_info.image_source_id).copied()
+                state.app.ui_ephemeral.image_texture_cache.get(&frame_info.image_source_id).copied()
             else {
                 continue; // texture not yet uploaded
             };
             let dims = state
                 .app
-                .song
+                .song_doc.song()
                 .image_sources
                 .get(&frame_info.image_source_id)
                 .map(|s| (s.width, s.height))
@@ -1481,7 +1473,7 @@ impl Runner {
             }
             let target_track = state
                 .app
-                .song
+                .song_doc.song()
                 .track_by_id(frame_info.owning_track_id)
                 .and_then(|t| t.parent_group_id)
                 .filter(|g| active_groups.contains_key(g))
@@ -1496,9 +1488,9 @@ impl Runner {
 
         // テキスト → owning track の bucket (合成画に焼き込んで track 効果を乗せる)。
         let text_frames = crate::text_compose::active_text_sources_at(
-            &state.app.song,
+            &state.app.song_doc.song(),
             playhead_beat,
-            &state.app.mod_scalars,
+            &state.app.transport.mod_scalars,
         );
         for tf in text_frames {
             buckets.entry(tf.owning_track_id).or_default().push(CompositeItem::Text(tf));
@@ -1508,25 +1500,25 @@ impl Runner {
         // 吸収した子 + group affine、通常 track は自分の視覚アイテム + identity 配置。
         // 選択中 group は children 空でも bounding box 用に emit。
         let mut composites: Vec<crate::group_compose::TrackComposite> = Vec::new();
-        for track in state.app.song.tracks.iter().rev() {
+        for track in state.app.song_doc.song().tracks.iter().rev() {
             let items = buckets.remove(&track.id).unwrap_or_default();
             // 配置 transform は **どのトラックでも** Transform device から
             // 解決（立ち絵 group も通常トラックも統一）。device が無ければ None = identity 配置。
             let transform = crate::video_fx::resolve_track_transform(
-                &state.app.song,
+                &state.app.song_doc.song(),
                 track,
                 playhead_beat,
-                &state.app.mod_scalars,
+                &state.app.transport.mod_scalars,
             );
             let selected = state.app.cursor_track_id() == Some(track.id);
             if items.is_empty() && !(transform.is_some() && selected) {
                 continue;
             }
             let fx = crate::video_fx::resolve_track_effects(
-                &state.app.song,
+                &state.app.song_doc.song(),
                 track,
                 playhead_beat,
-                &state.app.mod_scalars,
+                &state.app.transport.mod_scalars,
             );
             composites.push(crate::group_compose::TrackComposite {
                 track_id: track.id,
@@ -1541,21 +1533,21 @@ impl Runner {
         // がある曲は積分写像 (constant-bpm 線形だと export = TempoMap 積分と
         // 効果進行がズレる。 映像 source 時間の A4 と同じ扱い)。
         preview.fx_engine.set_time(common::tempo_map::song_beat_to_seconds(
-            &state.app.song,
+            &state.app.song_doc.song(),
             playhead_beat,
         ) as f32);
         preview.set_track_composites(composites);
         // マスター映像チェーン（master_fx_chain の映像 device）を解決して渡す。
         // 空でなければ preview が全トラック合成画を master canvas 1 枚に集約してから適用する。
         preview.set_master_fx(crate::video_fx::resolve_master_effects(
-            &state.app.song,
+            &state.app.song_doc.song(),
             playhead_beat,
-            &state.app.mod_scalars,
+            &state.app.transport.mod_scalars,
         ));
         // PiP rect の normalized 座標は project_resolution の letterbox
         // 内で展開される (= window resize しても画像 aspect が崩れない)。
         // Song.video_resolution を毎 frame 同期。
-        preview.set_project_resolution(state.app.song.video_resolution);
+        preview.set_project_resolution(state.app.song_doc.song().video_resolution);
 
         // `docs/plan_image_overlay.md` §4 P5: 選択中 image event の
         // PiP rect を preview window 上に縁取り + handle で描画する。
@@ -1572,9 +1564,9 @@ impl Runner {
             .app
             .selected_clip_ref()
             .and_then(|cref| {
-                let track = state.app.song.tracks.get(cref.track as usize)?;
+                let track = state.app.song_doc.song().tracks.get(cref.track as usize)?;
                 let clip = track.clips.get(cref.clip as usize)?;
-                let content = state.app.song.clip_contents.get(&clip.content_id)?;
+                let content = state.app.song_doc.song().clip_contents.get(&clip.content_id)?;
                 if let Some(events) = content.image_events() {
                     let ev = events.first()?;
                     Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
@@ -1604,9 +1596,9 @@ impl Runner {
         // 判定条件（owning track の parent_group_id ∈ active_groups）は子を
         // group へ bucket する partition（上の image_frames ループ）と同一。
         let selection_group = state.app.selected_clip_ref().and_then(|cref| {
-            let track = state.app.song.tracks.get(cref.track as usize)?;
+            let track = state.app.song_doc.song().tracks.get(cref.track as usize)?;
             let clip = track.clips.get(cref.clip as usize)?;
-            let content = state.app.song.clip_contents.get(&clip.content_id)?;
+            let content = state.app.song_doc.song().clip_contents.get(&clip.content_id)?;
             // text overlay は group 合成パスに乗らないので image の子のみ写像。
             content.image_events()?;
             let gid = track.parent_group_id?;
@@ -1697,22 +1689,22 @@ impl Runner {
         app: &mut AppData,
         renderer: &mut Renderer<WinitWindow>,
     ) {
-        if app.pending_thumbnail_uploads.is_empty() {
+        if app.media.pending_thumbnail_uploads.is_empty() {
             return;
         }
-        let pending: Vec<_> = app.pending_thumbnail_uploads.drain(..).collect();
+        let pending: Vec<_> = app.media.pending_thumbnail_uploads.drain(..).collect();
         for video_source_id in pending {
             // It's possible the source was unloaded between the
             // import and the next frame (= rapid undo path). Just
             // skip — the GPU is the source of truth and a missing
             // RGBA staging means there's nothing to upload.
-            let Some((w, h, rgba)) = app.video_thumbnail_rgba.remove(&video_source_id)
+            let Some((w, h, rgba)) = app.media.video_thumbnail_rgba.remove(&video_source_id)
             else {
                 continue;
             };
             let handle = renderer.create_texture(w, h);
             renderer.upload_texture_rgba(handle, rgba.as_slice());
-            app.video_texture_cache.insert(video_source_id, handle);
+            app.ui_ephemeral.video_texture_cache.insert(video_source_id, handle);
         }
     }
 }

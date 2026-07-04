@@ -41,9 +41,9 @@ const LIST_STYLE: ListViewStyle = ListViewStyle {
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // is_font_picker_open を modal 可視性の SSoT にする (plugin_picker と同 idiom)。
     // commit / cancel が flag=false にしたフレームで modal を閉じる。
-    if app.is_font_picker_open && !ui.is_modal_open("font_picker") {
+    if app.ui_ephemeral.is_font_picker_open && !ui.is_modal_open("font_picker") {
         ui.open_modal("font_picker");
-    } else if !app.is_font_picker_open && ui.is_modal_open("font_picker") {
+    } else if !app.ui_ephemeral.is_font_picker_open && ui.is_modal_open("font_picker") {
         ui.close_modal("font_picker");
     }
 
@@ -88,7 +88,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             let search_resp = ui.text_input_at_focused(
                 "fp_search",
                 search_rect,
-                &app.font_picker_query,
+                &app.ui_ephemeral.font_picker_query,
                 |new| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::SetFontPickerQuery(new.clone()))
@@ -105,7 +105,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     app.handle_event(AppEvent::MoveFontPickerCursor(-1))
                 }));
             }
-            if app.font_picker_query.is_empty() {
+            if app.ui_ephemeral.font_picker_query.is_empty() {
                 ui.label_at(
                     "fp_search_hint",
                     "Filter fonts  (e.g. gothic)",
@@ -117,7 +117,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             }
             // Enter でカーソル位置を確定。
             if search_resp.committed
-                && let Some(family) = app.font_picker_visible.get(app.font_picker_cursor)
+                && let Some(family) = app.ui_ephemeral.font_picker_visible.get(app.ui_ephemeral.font_picker_cursor)
             {
                 let family = family.clone();
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -132,9 +132,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 w: panel.w - pad * 2.0,
                 h: panel.y + panel.h - pad - list_y,
             };
-            let visible = &app.font_picker_visible;
+            let visible = &app.ui_ephemeral.font_picker_visible;
             if visible.is_empty() {
-                let msg = if app.font_picker_loading {
+                let msg = if app.ui_ephemeral.font_picker_loading {
                     "\u{30d5}\u{30a9}\u{30f3}\u{30c8}\u{8aad}\u{8fbc}\u{4e2d}\u{2026}"
                 } else {
                     "(\u{8a72}\u{5f53}\u{30d5}\u{30a9}\u{30f3}\u{30c8}\u{306a}\u{3057})"
@@ -151,7 +151,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             }
 
             let cursor = app
-                .font_picker_cursor
+                .ui_ephemeral.font_picker_cursor
                 .min(visible.len().saturating_sub(1));
             let resp = ui.list_view(
                 "fp_list",

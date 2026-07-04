@@ -242,6 +242,7 @@ mod tests {
 
     fn note(pitch: u8, vel: u8, start: f64, dur: f64) -> Note {
         Note {
+            id: 0,
             start_beat: start,
             duration_beats: dur,
             pitch,
@@ -282,16 +283,19 @@ mod tests {
             ClipContent::Automation(AutomationContent {
                 points: vec![
                     AutomationPoint {
+                        id: 1,
                         time_beat: 0.0,
                         value: 60.0,
                         curve: AutomationCurve::Linear,
                     },
                     AutomationPoint {
+                        id: 2,
                         time_beat: 4.0,
                         value: 120.0,
                         curve: AutomationCurve::Linear,
                     },
                 ],
+                next_point_id: 3,
             }),
         );
         song.song_lanes.push(AutomationLane {
@@ -341,6 +345,7 @@ mod tests {
             cid,
             ClipContent::Midi(MidiContent {
                 notes: vec![note(60, 100, 0.0, 1.0)], // C4 quarter note at beat 0
+                next_note_id: 1,
             }),
         );
         let track = crate::app::track_with(|t| {

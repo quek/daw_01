@@ -1,7 +1,7 @@
 //! Send 宛先トラックピッカー (modal overlay)。`plugin_picker.rs` を踏襲した
 //! `Ui::modal` + `Ui::list_view` 構成。
 //!
-//! root.rs から常時呼ばれる。`app.send_picker == Some(..)` のとき modal を
+//! root.rs から常時呼ばれる。`app.ui_ephemeral.send_picker == Some(..)` のとき modal を
 //! 開き、ESC / outside click / Close ボタンで閉じる。宛先 track を選ぶと
 //! `AppEvent::AddSend { src_track_id, dest_track_id }` を発行して閉じる。
 //!
@@ -38,7 +38,7 @@ const LIST_STYLE: ListViewStyle = ListViewStyle {
 };
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
-    let Some(state) = app.send_picker else {
+    let Some(state) = app.ui_ephemeral.send_picker else {
         return;
     };
     let src_track_id = state.src_track_id;

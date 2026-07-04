@@ -641,6 +641,7 @@ pub struct BuiltinNoteSpec {
 impl BuiltinNoteSpec {
     fn to_model_note(&self) -> Note {
         Note {
+            id: 0,
             start_beat: self.start_beat,
             duration_beats: self.duration_beats,
             pitch: self.pitch,
@@ -785,6 +786,7 @@ mod tests {
             length_beats: 4.0,
             content_id: 0,
             notes: vec![Note {
+                id: 0,
                 start_beat: 0.0,
                 duration_beats: 1.0,
                 pitch: 60,
@@ -815,6 +817,7 @@ mod tests {
             content_id: 0,
             notes: vec![
                 Note {
+                    id: 0,
                     start_beat: 0.0,
                     duration_beats: 1.0,
                     pitch: 60,
@@ -823,6 +826,7 @@ mod tests {
                     muted: false,
                 },
                 Note {
+                    id: 0,
                     start_beat: 2.0,
                     duration_beats: 1.0,
                     pitch: 62,
@@ -860,6 +864,7 @@ mod tests {
             content_id: 0,
             notes: vec![
                 Note {
+                    id: 0,
                     start_beat: 0.0,
                     duration_beats: 1.0,
                     pitch: 60,
@@ -868,6 +873,7 @@ mod tests {
                     muted: false,
                 },
                 Note {
+                    id: 0,
                     start_beat: 1.0,
                     duration_beats: 1.0,
                     pitch: 62,
@@ -897,6 +903,7 @@ mod tests {
             length_beats: 4.0,
             content_id: 0,
             notes: vec![Note {
+                id: 0,
                 start_beat: 0.0,
                 duration_beats: 1.0,
                 pitch: 60,
@@ -923,6 +930,7 @@ mod tests {
             content_id: 0,
             notes: vec![
                 Note {
+                    id: 0,
                     start_beat: 2.0,
                     duration_beats: 1.0,
                     pitch: 64,
@@ -931,6 +939,7 @@ mod tests {
                     muted: false,
                 },
                 Note {
+                    id: 0,
                     start_beat: 0.0,
                     duration_beats: 1.0,
                     pitch: 60,

@@ -42,6 +42,7 @@ pub mod midi_export;
 #[cfg(feature = "script")]
 pub mod script;
 pub mod single_instance;
+pub mod state;
 #[cfg(windows)]
 pub mod smoke_test;
 pub mod subprocess;

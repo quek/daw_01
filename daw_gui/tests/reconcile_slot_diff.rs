@@ -29,9 +29,9 @@ fn make_song_with_one_track(track_id: u32, devices: Vec<PluginInstance>) -> Song
     song
 }
 
-fn loaded(plugin_id: u32, plugin_id_str: &str) -> LoadedSlotInfo {
+fn loaded(device_id: u64, plugin_id_str: &str) -> LoadedSlotInfo {
     LoadedSlotInfo {
-        plugin_id,
+        device_id,
         plugin_id_str: plugin_id_str.into(),
     }
 }

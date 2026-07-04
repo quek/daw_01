@@ -152,9 +152,10 @@ mod tests {
         song.clip_contents.insert(
             cid,
             ClipContent::Automation(AutomationContent {
+                next_point_id: 0,
                 points: vec![
-                    AutomationPoint { time_beat: 0.0, value: f64::from(start), curve: AutomationCurve::Linear },
-                    AutomationPoint { time_beat: len, value: f64::from(end), curve: AutomationCurve::Linear },
+                    AutomationPoint { id: 0, time_beat: 0.0, value: f64::from(start), curve: AutomationCurve::Linear },
+                    AutomationPoint { id: 0, time_beat: len, value: f64::from(end), curve: AutomationCurve::Linear },
                 ],
             }),
         );

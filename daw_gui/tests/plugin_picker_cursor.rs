@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use common::plugin_db::{PluginDatabase, PluginEntry};
 use common::plugin_format::PluginFormat;
-use common::protocol::MainToChild;
+use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent};
@@ -50,8 +50,8 @@ fn build_app(
     n_instruments: usize,
 ) -> (
     AppData,
-    UnboundedReceiver<MainToChild>,
-    UnboundedReceiver<MainToChild>,
+    UnboundedReceiver<AudioCommand>,
+    UnboundedReceiver<PluginCommand>,
 ) {
     let (audio_tx, audio_rx) = mpsc::unbounded_channel();
     let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
@@ -76,8 +76,8 @@ fn build_app(
 fn cursor_starts_at_zero_when_picker_opens() {
     let (mut app, _, _) = build_app(5);
     app.handle_event(AppEvent::OpenPluginPicker);
-    assert_eq!(app.plugin_picker_cursor, 0);
-    assert_eq!(app.plugin_picker_visible.len(), 5);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
+    assert_eq!(app.ui_ephemeral.plugin_picker_visible.len(), 5);
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn cursor_moves_down_within_bounds() {
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
-    assert_eq!(app.plugin_picker_cursor, 2);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 2);
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn cursor_clamps_at_lower_bound() {
     for _ in 0..10 {
         app.handle_event(AppEvent::MovePluginPickerCursor(-1));
     }
-    assert_eq!(app.plugin_picker_cursor, 0);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
 }
 
 #[test]
@@ -106,7 +106,7 @@ fn cursor_clamps_at_upper_bound() {
     for _ in 0..10 {
         app.handle_event(AppEvent::MovePluginPickerCursor(1));
     }
-    assert_eq!(app.plugin_picker_cursor, 4); // visible.len() - 1
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 4); // visible.len() - 1
 }
 
 #[test]
@@ -115,10 +115,10 @@ fn cursor_resets_to_zero_when_query_changes() {
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
-    assert_eq!(app.plugin_picker_cursor, 2);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 2);
     // クエリを入れると visible が再計算され cursor が 0 に戻る
     app.handle_event(AppEvent::SetPluginPickerQuery("synth".into()));
-    assert_eq!(app.plugin_picker_cursor, 0);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
 }
 
 #[test]
@@ -126,19 +126,19 @@ fn cursor_resets_to_zero_when_picker_reopened() {
     let (mut app, _, _) = build_app(5);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
-    assert_eq!(app.plugin_picker_cursor, 1);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 1);
     // 開き直す → cursor が 0 に戻る
     app.handle_event(AppEvent::OpenPluginPicker);
-    assert_eq!(app.plugin_picker_cursor, 0);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
 }
 
 #[test]
 fn move_is_noop_when_visible_is_empty() {
     let (mut app, _, _) = build_app(0);
     app.handle_event(AppEvent::OpenPluginPicker);
-    assert_eq!(app.plugin_picker_visible.len(), 0);
+    assert_eq!(app.ui_ephemeral.plugin_picker_visible.len(), 0);
     app.handle_event(AppEvent::MovePluginPickerCursor(1));
-    assert_eq!(app.plugin_picker_cursor, 0);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
 }
 
 #[test]
@@ -146,7 +146,7 @@ fn large_delta_clamps_to_bounds() {
     let (mut app, _, _) = build_app(3);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::MovePluginPickerCursor(100));
-    assert_eq!(app.plugin_picker_cursor, 2);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 2);
     app.handle_event(AppEvent::MovePluginPickerCursor(-100));
-    assert_eq!(app.plugin_picker_cursor, 0);
+    assert_eq!(app.ui_ephemeral.plugin_picker_cursor, 0);
 }

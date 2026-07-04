@@ -20,18 +20,19 @@ use crate::vst3_plugin::decode_event;
 
 // --- Input list (host -> plugin) -------------------------------------------
 
-/// Reusable input event list: the host-side `Vst3Plugin` owns a single
+/// Reusable input event list: the `Vst3AudioHalf` owns a single
 /// `ComWrapper<Vst3InEventList>` for its lifetime and calls `set_events`
-/// before every `process()` to refill the backing buffer. Using
+/// at the top of every `process()` to refill the backing buffer. Using
 /// `UnsafeCell` (rather than `RefCell` or a lock) avoids runtime cost in
 /// the audio thread.
 pub struct Vst3InEventList {
     events: UnsafeCell<Vec<Event>>,
 }
 
-// SAFETY: only the audio thread touches this during `process()`; the
-// plugin-main thread only calls `set_events` before starting the audio
-// thread (via the audio-thread-stop/start dance in `TracksHandle::mutate`).
+// SAFETY: `set_events` (refill) and the plugin's vtable reads both happen
+// inside the same audio-half `process()` call — a single thread at a time
+// under the `AudioHalf` exclusive-access contract (quiesce protocol), so
+// there is no actual sharing.
 unsafe impl Send for Vst3InEventList {}
 unsafe impl Sync for Vst3InEventList {}
 

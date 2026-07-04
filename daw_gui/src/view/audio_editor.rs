@@ -97,7 +97,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 開いている clip を解決。 audio_editor_clip がセットされていない、
     // または範囲外 / 非 audio なら placeholder を出して return (= clip
     // が削除された / Undo で消えた場合の防御)。
-    let target = match app.audio_editor_clip {
+    let target = match app.ui_ephemeral.audio_editor_clip {
         Some(t) => t,
         None => {
             ui.label_at(
@@ -111,14 +111,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             return;
         }
     };
-    let Some(track) = app.song.tracks.get(target.track as usize) else {
+    let Some(track) = app.song_doc.song().tracks.get(target.track as usize) else {
         return;
     };
     let Some(clip) = track.clips.get(target.clip as usize) else {
         return;
     };
     let Some(common::model::ClipContent::Audio(audio)) =
-        app.song.clip_contents.get(&clip.content_id)
+        app.song_doc.song().clip_contents.get(&clip.content_id)
     else {
         return;
     };
@@ -131,7 +131,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         "audio_editor_title",
         &format!(
             "Audio Editor — {} ({:.2} beats)",
-            app.song.content_name(clip.content_id),
+            app.song_doc.song().content_name(clip.content_id),
             clip.length_beats
         ),
         area.x + pad,
@@ -180,9 +180,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     };
     if ruler_rect.w > 0.0 && view_len_beats > 0.0 {
         let mapping = TimeMapping {
-            sample_rate: app.sample_rate as f64,
-            tempo_bpm: app.song.bpm as f64,
-            time_sig: app.song.time_sig,
+            sample_rate: app.ipc.sample_rate as f64,
+            tempo_bpm: app.song_doc.song().bpm as f64,
+            time_sig: app.song_doc.song().time_sig,
             display: TimeDisplay::BarBeat,
         };
         let spb = mapping.samples_per_beat();
@@ -200,11 +200,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
         // ----- 既存 loop region overlay (ruler 上に半透明バンド) -----
         // arrangement view と同色の cyan、 view 範囲との交差のみ描画。
-        if app.song.loop_end_beat > app.song.loop_start_beat {
+        if app.song_doc.song().loop_end_beat > app.song_doc.song().loop_start_beat {
             let view_start_song = clip.start_beat + view_start_beat;
             let view_end_song = view_start_song + view_len_beats;
-            let lstart = app.song.loop_start_beat;
-            let lend = app.song.loop_end_beat;
+            let lstart = app.song_doc.song().loop_start_beat;
+            let lend = app.song_doc.song().loop_end_beat;
             let visible_start = lstart.max(view_start_song);
             let visible_end = lend.min(view_end_song);
             if visible_end > visible_start && view_len_beats > 0.0 {
@@ -303,7 +303,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         return;
     }
     let selected_set: std::collections::HashSet<usize> =
-        app.audio_editor_selected_events.iter().copied().collect();
+        app.selection.audio_editor_selected_events.iter().copied().collect();
     let anchor_idx = app.audio_editor_anchor_event();
     // 矩形選択 (lasso) の hit-test 用に、 描画した event の rect を収集する。
     let mut event_rects: Vec<(usize, Rect)> = Vec::new();
@@ -356,8 +356,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     let factor = (((sx + sy) as f64) * 0.01).exp() as f32;
                     if (factor - 1.0).abs() > 1e-6 {
                         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                            app.audio_editor_vertical_gain =
-                                (app.audio_editor_vertical_gain * factor).clamp(0.25, 16.0);
+                            app.ui_prefs.audio_editor_vertical_gain =
+                                (app.ui_prefs.audio_editor_vertical_gain * factor).clamp(0.25, 16.0);
                         }));
                     }
                 } else {
@@ -378,7 +378,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 
     for (idx, event) in audio.events.iter().enumerate() {
-        let Some(buffer) = app.audio_source_cache.get(event.source_id) else {
+        let Some(buffer) = app.media.audio_source_cache.get(event.source_id) else {
             // 当該 event は decode 待ち / missing source → 透けて見える
             // 範囲だけマーカー描画 (= 他 event は描く)。
             continue;
@@ -505,7 +505,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 let view = WaveformView {
                     start_sample: src_a.min(src_b).max(0.0) as u64,
                     len_samples: ((src_b - src_a).abs() as u64).max(1),
-                    vertical_gain: app.audio_editor_vertical_gain,
+                    vertical_gain: app.ui_prefs.audio_editor_vertical_gain,
                 };
                 let source = WaveformSource {
                     samples: SampleSlices::Planar(planes_borrowed),
@@ -548,7 +548,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let view = WaveformView {
                 start_sample: src_visible_start_frames,
                 len_samples: src_visible_len_frames.max(1),
-                vertical_gain: app.audio_editor_vertical_gain,
+                vertical_gain: app.ui_prefs.audio_editor_vertical_gain,
             };
             let _ = ui.waveform(
                 ("audio_editor_wf", clip.id, idx),
@@ -827,7 +827,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }
             } else if drag.start_modifiers.shift {
                 if kind == DragKind::Started {
-                    let mut next = app.audio_editor_selected_events.clone();
+                    let mut next = app.selection.audio_editor_selected_events.clone();
                     if let Some(p) = next.iter().position(|&i| i == idx) {
                         next.remove(p);
                     } else {
@@ -912,7 +912,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             .collect();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             if additive {
-                let mut next = app.audio_editor_selected_events.clone();
+                let mut next = app.selection.audio_editor_selected_events.clone();
                 for i in hit.drain(..) {
                     if !next.contains(&i) {
                         next.push(i);
@@ -963,9 +963,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             + ((px - wf_area.x).max(0.0) as f64) * beats_per_px;
         Some(in_clip.clamp(0.0, clip_len_beats))
     });
-    if app.audio_editor_hover_beat_in_clip != hover_in_clip {
+    if app.ui_ephemeral.audio_editor_hover_beat_in_clip != hover_in_clip {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.audio_editor_hover_beat_in_clip = hover_in_clip;
+            app.ui_ephemeral.audio_editor_hover_beat_in_clip = hover_in_clip;
         }));
     }
 
@@ -976,7 +976,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // event.event_start_in_clip_beats から event_length_beats まで
     // (= 1 event = clip 全体) を全幅マッピングしているので、
     // x = wf_area.x + (in_clip_beats / clip.length_beats) * wf_area.w。
-    if let Some(ph_beat) = app.playhead_beat {
+    if let Some(ph_beat) = app.transport.playhead_beat {
         let ph_beat = ph_beat as f64;
         let clip_start = clip.start_beat;
         // playhead の clip 内位置 (clip 始端 = 0)。 view 範囲外 (zoom 中
@@ -1010,7 +1010,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .and_then(|i| audio.events.get(i))
         .or(audio.events.first());
     if let Some(footer_event) = footer_event
-        && let Some(audio_source) = app.song.audio_sources.get(&footer_event.source_id)
+        && let Some(audio_source) = app.song_doc.song().audio_sources.get(&footer_event.source_id)
     {
         let meta = format!(
             "{}  {} Hz · {} ch · {} frames  ({} events)",

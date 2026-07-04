@@ -1,13 +1,42 @@
-//! Format-agnostic plugin interface used by the audio thread and the
-//! plugin-main thread. CLAP (`ClapPlugin`) and VST3 (`Vst3Plugin`) both
-//! implement [`LoadedPlugin`], letting `Chain` hold `Box<dyn LoadedPlugin>`
-//! and drive either backend with the same call-sites.
+//! Format-agnostic plugin interfaces (`docs/plan_arch_refactor.md` §6).
 //!
-//! Keep this trait minimal and behavioural — do not expose format-specific
-//! raw pointers. Everything here must work whether the underlying
-//! representation is CLAP's `clap_plugin_gui.set_parent` or VST3's
-//! `IPlugView::attached(hwnd, "HWND")`.
+//! Split-half design (clack 方式): 1 つのロード済み plugin は 2 つの Rust
+//! オブジェクトで表現される。
+//!
+//! - [`LoadedPlugin`] — **main half**。plugin-main thread が所有する
+//!   `Box<dyn LoadedPlugin>`。lifecycle (activate / deactivate /
+//!   start・stop_processing)、state save/load、GUI、ARA、param 列挙など
+//!   main-thread API を持つ。
+//! - [`AudioProcessorHalf`] — **audio half**。`process()` が触る状態
+//!   (入出力 planar buffer、event scratch、param cache、collected out
+//!   events) だけを持つ別 heap allocation。worker pool の registry には
+//!   こちら ([`AudioHalf`] = `Arc<UnsafeCell<Box<dyn AudioProcessorHalf>>>`
+//!   相当) を渡す。
+//!
+//! これにより「worker が `&mut *raw` で process() 実行中に、plugin-main が
+//! 同一オブジェクトへ `&mut` / `&` を発行する」旧構造の aliasing UB が型で
+//! 消える: 並行に走り得る main-thread 呼び出し (state_save / ARA notify /
+//! GUI / set_note_metadata) は main half のフィールドしか触らず、worker は
+//! audio half のフィールドしか触らない。両 half は生の FFI ポインタ
+//! (CLAP `*const clap_plugin` / VST3 `ComPtr`) を共有するが、その先の状態は
+//! CLAP / VST3 仕様の thread partitioning (main-thread API vs audio-thread
+//! API) が分離を保証する (Rust の aliasing model の外)。
+//!
+//! # `AudioHalf` の動的排他契約
+//!
+//! audio half への `&mut` は 2 経路からしか作られない:
+//!
+//! 1. **worker** — registry で entry を resolve した dispatch-critical
+//!    section 内 (`DispatchCounter::enter`/`exit` で囲まれる)。
+//! 2. **plugin-main** — その entry を registry から外し
+//!    (`registry_remove`) `WorkerPool::quiesce` を済ませた *quiesced
+//!    window* 内 (activate のバッファ再確保 / start・stop の gate 更新)。
+//!
+//! 両者は quiesce プロトコルで動的に直列化される (process_server.rs の
+//! module docs 参照)。`AudioHalf::get` はこの契約を `unsafe fn` の
+//! Safety 節として要求する。
 
+use std::cell::UnsafeCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -22,22 +51,12 @@ use crate::builtin;
 use crate::clap_plugin::ClapPlugin;
 use crate::vst3_plugin::Vst3Plugin;
 
-/// builtin VOICEVOX の合成スレッドが状態遷移時に呼ぶ reporter。
-/// `(busy, failing)` を受け、plugin host が `PluginEvent::VoicevoxSynthStatus` に変換して
-/// daw_gui へ送る (= クリップ上スピナー / 全体オーバーレイ / engine 未接続警告の駆動)。
-/// `busy` = いま合成中、`failing` = 直近の HTTP 試行が失敗 (engine 未起動/起動途中)。
-/// 任意スレッド (= builtin の synth thread) から呼ばれるので `Send + Sync`。
-pub type VoicevoxStatusReporter = Box<dyn Fn(bool, bool) + Send + Sync>;
-
 /// One MIDI-style transition pushed into the next `process()` call.
 ///
-/// `note_id` (PR-V2.4) is the **stable per-note identifier** used to look
-/// up `NoteMetadata` (= 歌詞 / phoneme) and per-note synthesis cache in
-/// builtin plugins. CLAP / VST3 backends ignore the field — they map
-/// `On { key }` to the legacy MIDI note pipeline. For audio events
-/// emitted by `sequencer::collect_events_for_buffer`, the value is the
-/// note's flattened index across all clips on the track (same numbering
-/// `daw_gui::AppData::sync_vocal_metadata` uses on the host side).
+/// `note_id` is the **stable per-note identifier** used to look up
+/// `NoteMetadata` (= 歌詞 / phoneme) and per-note synthesis cache in
+/// builtin plugins. CLAP / VST3 backends map it onto the formats' note-id
+/// fields.
 #[derive(Debug, Clone, Copy)]
 pub enum NoteTransition {
     On { note_id: u32, key: u8, velocity: f64 },
@@ -45,8 +64,7 @@ pub enum NoteTransition {
 }
 
 /// A note transition scheduled at a specific frame offset inside the next
-/// process buffer. The audio thread uses these to feed CLAP's input-event
-/// vtable and VST3's `IEventList::addEvent` alike.
+/// process buffer.
 #[derive(Debug, Clone, Copy)]
 pub struct TimedNoteEvent {
     pub time: u32,
@@ -57,23 +75,17 @@ pub struct TimedNoteEvent {
 /// modulation offset (`docs/plan_modulation_routing_redesign.md` §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParamEventKind {
-    /// Absolute parameter value (automation / direct set). The plugin host
-    /// converts per-format (CLAP `clap_event_param_value` / VST3
-    /// `IParamValueQueue`).
+    /// Absolute parameter value (automation / direct set).
     #[default]
     Value,
     /// Normalized (`-1..=1`) modulation offset. CLAP modulatable params get a
-    /// non-destructive `clap_event_param_mod` (`amount = offset·(max−min)`);
-    /// VST3 / non-modulatable params have it folded into the absolute value the
-    /// host sends.
+    /// non-destructive `clap_event_param_mod`; VST3 / non-modulatable params
+    /// have it folded into the absolute value the host sends.
     Mod,
 }
 
-/// Phase 2 (`docs/plan_automation.md` §8.3): plugin parameter automation
-/// 用の 1 イベント。`time` は buffer 内 sample offset、`param_id` は
-/// CLAP `clap_id` / VST3 `ParamID` (共に u32)。`kind == Value` のとき `value`
-/// は絶対値、`kind == Mod` のとき正規化モジュレーションオフセット。plugin host
-/// 内で per-format に CLAP / VST3 へ変換 (`docs/plan_modulation_routing_redesign.md` §3.2)。
+/// One plugin-parameter automation event. `time` is the buffer-relative
+/// sample offset, `param_id` is CLAP `clap_id` / VST3 `ParamID` (both u32).
 #[derive(Debug, Clone, Copy)]
 pub struct TimedParamEvent {
     pub time: u32,
@@ -83,16 +95,10 @@ pub struct TimedParamEvent {
 }
 
 /// PR4 sidechain: one aux input port worth of buffers handed to
-/// `LoadedPlugin::process`. Mirrors `pd.buffer_aux_in[port]` /
-/// `pd.aux_in_active[port]` from the shmem `ProcessData`. Stereo only
-/// (CLAP / VST3 both expose stereo aux for the typical sidechain
-/// compressor / gate / ducker workflows).
+/// [`AudioProcessorHalf::process`]. Stereo only.
 #[derive(Clone, Copy)]
 pub struct AuxInputBuf<'a> {
-    /// Whether the audio engine wrote real audio into `l` / `r` this
-    /// buffer. Inactive ports are still passed (so plugin's port count
-    /// stays stable across calls) but with silent slices, and CLAP
-    /// backends are free to pass `data32: null` instead.
+    /// Whether the audio engine wrote real audio into `l` / `r` this buffer.
     pub active: bool,
     pub l: &'a [f32],
     pub r: &'a [f32],
@@ -100,38 +106,49 @@ pub struct AuxInputBuf<'a> {
 
 /// Host callbacks plugins may trigger on *any* thread (usually the
 /// plugin's GUI thread). Implementations must be `Send + Sync` and must
-/// not block the caller — plugins often hold an internal lock across
-/// these.
+/// not block the caller — plugins often hold an internal lock across these.
+///
+/// v29: すべての callback は load 時に **安定 device id** を capture した
+/// closure として `main.rs::make_callbacks(device_id)` が生成する。旧
+/// `(track, index)` capture は削除 / 並べ替えで stale になり「別デバイスの
+/// GUI を destroy する」class のバグ源だった。
 #[derive(Clone)]
 pub struct HostCallbacks {
     pub on_request_resize: Arc<dyn Fn(u32, u32) + Send + Sync>,
     pub on_closed: Arc<dyn Fn() + Send + Sync>,
-    /// CLAP `clap_host_gui.request_show` / `request_hide` (C6 / r.md #8): plugin が
-    /// editor を前面化 / 隠すよう要求。 host は所有する editor 窓を
-    /// SetForegroundWindow / hide する (旧実装は常に false で無視)。
+    /// CLAP `clap_host_gui.request_show` / `request_hide`.
     pub on_request_show: Arc<dyn Fn() + Send + Sync>,
     pub on_request_hide: Arc<dyn Fn() + Send + Sync>,
-    /// VST3 `IComponentHandler::restartComponent(flags)` (C3 / r.md #8): plugin が
-    /// re-activate / I/O / latency 変更を要求。 host は該当 plugin を安全に reinit
-    /// (deactivate→activate→reset) + latency 再 query する。
+    /// VST3 `IComponentHandler::restartComponent(flags)`.
     pub on_restart_component: Arc<dyn Fn(i32) + Send + Sync>,
-    /// VST3 only: plugin GUI で param を触り始めた (`IComponentHandler::
-    /// beginEdit`)。 引数は param_id。 daw_gui の last-touched workflow
-    /// (`A` キー) の起点。 CLAP は out_events 経由なのでこれを使わない
-    /// (= CLAP plugin では呼ばれない)。
+    /// CLAP `clap_host.request_restart` — deactivate → activate の全 reinit
+    /// 要求。plugin-main の quiesced-reinit 経路 (per-plugin cooldown 付き)
+    /// へ配線される。
+    pub on_request_restart: Arc<dyn Fn() + Send + Sync>,
+    /// CLAP `clap_host.request_callback` — plugin-main thread で
+    /// [`LoadedPlugin::on_main_thread`] を 1 回呼ぶ要求 (JUCE 系の
+    /// main-thread task 駆動)。
+    pub on_request_callback: Arc<dyn Fn() + Send + Sync>,
+    /// CLAP `clap_host_latency.changed` — latency 再 query +
+    /// `PluginLatencyChanged` 再 emit の要求。
+    pub on_latency_changed: Arc<dyn Fn() + Send + Sync>,
+    /// CLAP `clap_host_params.rescan` — param 一覧再送 (`PluginParamList`)
+    /// の要求。
+    pub on_params_rescan: Arc<dyn Fn() + Send + Sync>,
+    /// VST3 only: plugin GUI param gesture begin (`beginEdit`).
     pub on_param_gesture_begin: Arc<dyn Fn(u32) + Send + Sync>,
-    /// VST3 only: plugin GUI で param 値が変わった (`IComponentHandler::
-    /// performEdit`)。 引数は (param_id, normalized_value)。 daw_gui の
-    /// plugin_param_values cache に積まれ、 automation lane の現在値 source
-    /// になる。
+    /// VST3 only: plugin GUI param value change (`performEdit`).
     pub on_param_value: Arc<dyn Fn(u32, f64) + Send + Sync>,
-    /// VST3 only: plugin GUI で param を離した (`IComponentHandler::
-    /// endEdit`)。 引数は param_id。 gesture lifecycle を閉じる。
+    /// VST3 only: plugin GUI param gesture end (`endEdit`).
     pub on_param_gesture_end: Arc<dyn Fn(u32) + Send + Sync>,
+    /// builtin VOICEVOX の合成状態 `(busy, failing)` 報告。旧「第 2 の
+    /// callback 登録機構」(`set_voicevox_status_reporter`) を廃止して
+    /// ここに統合 (`docs/plan_arch_refactor.md` §6)。synth thread が任意
+    /// スレッドから呼ぶ。
+    pub on_vocal_synth_status: Arc<dyn Fn(bool, bool) + Send + Sync>,
 }
 
 impl HostCallbacks {
-    #[allow(dead_code)]
     pub fn noop() -> Self {
         Self {
             on_request_resize: Arc::new(|_, _| {}),
@@ -139,40 +156,30 @@ impl HostCallbacks {
             on_request_show: Arc::new(|| {}),
             on_request_hide: Arc::new(|| {}),
             on_restart_component: Arc::new(|_| {}),
+            on_request_restart: Arc::new(|| {}),
+            on_request_callback: Arc::new(|| {}),
+            on_latency_changed: Arc::new(|| {}),
+            on_params_rescan: Arc::new(|| {}),
             on_param_gesture_begin: Arc::new(|_| {}),
             on_param_value: Arc::new(|_, _| {}),
             on_param_gesture_end: Arc::new(|_| {}),
+            on_vocal_synth_status: Arc::new(|_, _| {}),
         }
     }
 }
 
-/// The host-side handle to a loaded plugin. Lives on the plugin-main
-/// thread; `process()` / `start_processing()` / `stop_processing()` are
-/// invoked from the audio thread via raw-pointer snapshots (see
-/// `PluginPtr` in `main.rs`).
-/// Phase 5 Step 5.3 (`docs/plan_automation.md` §10): per-buffer transport
-/// snapshot fed into `LoadedPlugin::process` so CLAP backends can build
-/// `clap_event_transport` and set `clap_process.transport`. VST3
-/// backends consume the same fields via `IProcessContext`. VoicevoxBuiltin
-/// / Silence backends ignore everything except `playhead_samples`
-/// (= they already use steady_time for sample positioning).
+/// Per-buffer transport snapshot fed into [`AudioProcessorHalf::process`].
 ///
-/// `bpm` etc. are populated from `ProcessData.bpm` etc. which daw_audio
-/// fills via `engine::set_pd_transport` at buffer head. The fields live
-/// in `ProcessData` (= shmem-portable) so the plugin host only needs to
-/// repackage them into the CLAP / VST3 transport struct.
+/// 真の再生位置は `song_pos_beats` 一本 (= daw_audio が tempo automation を
+/// 積分した累積拍位置)。sample / seconds / bar 表現は
+/// [`crate::process_scaffold::TransportBlock`] がここから導出する
+/// (`ProcessData::steady_time` は engine が設定しない = 常に 0 なので
+/// sample 由来の位置は運ばない)。
 #[derive(Debug, Clone, Copy)]
 pub struct TransportContext {
     pub bpm: f32,
     pub sample_rate: u32,
-    /// Sample-domain playhead. Convertible to `song_pos_seconds` via
-    /// `playhead_samples / sample_rate` and to `song_pos_beats` via
-    /// `playhead_samples * bpm / (60 * sample_rate)`.
-    pub playhead_samples: u64,
     /// 累積拍位置 (= daw_audio が tempo automation を積分した真の song 位置)。
-    /// `playhead_samples × bpm / (60 × SR)` の一定テンポ逆算ではなくこの値を
-    /// CLAP `song_pos_beats` / VST3 `projectTimeMusic` に直接使う。これで
-    /// テンポオートメーション中も plugin の tempo-sync が正しい拍に追従する。
     pub song_pos_beats: f64,
     pub tsig_num: u16,
     pub tsig_denom: u16,
@@ -183,14 +190,11 @@ pub struct TransportContext {
 }
 
 impl TransportContext {
-    /// Phase 5 Step 5.3: build from a `ProcessData` populated by daw_audio.
-    /// `pd.playing` u8 → bool conversion + clamp `bpm` to a sane minimum
-    /// (= 1.0) for divide safety in downstream computations.
+    /// Build from a `ProcessData` populated by daw_audio.
     pub fn from_process_data(pd: &common::process_data::ProcessData) -> Self {
         Self {
             bpm: pd.bpm.max(1.0),
             sample_rate: pd.sample_rate.max(1),
-            playhead_samples: pd.steady_time,
             song_pos_beats: pd.song_pos_beats,
             tsig_num: pd.tsig_num.max(1),
             tsig_denom: pd.tsig_denom.max(1),
@@ -202,36 +206,19 @@ impl TransportContext {
     }
 }
 
-#[allow(dead_code)] // `format()` is wired up for future UI display.
-pub trait LoadedPlugin: Send {
-    fn id(&self) -> &str;
-    fn name(&self) -> &str;
-    fn format(&self) -> PluginFormat;
+// ====================================================================
+// Audio half
+// ====================================================================
 
-    // --- lifecycle (plugin-main thread) ---------------------------------
-    fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()>;
-    fn deactivate(&mut self);
-
-    // --- audio-thread entry points --------------------------------------
-    fn start_processing(&mut self) -> Result<()>;
-    fn stop_processing(&mut self);
-    /// Clear the plugin's audio processing state — filters, delay lines,
-    /// reverb tails, envelopes, held voices — without touching parameters or
-    /// loaded state. CLAP backends forward to `clap_plugin.reset()` (the spec's
-    /// `[audio-thread & active]` tail-clear); VST3 / builtin keep the default
-    /// no-op because their tails are already flushed by the `deactivate` /
-    /// `stop_processing` half of a reinit cycle. Called (in addition to the
-    /// deactivate→activate cycle) when force-silencing every plugin — export
-    /// cold render and the panic button — because a
-    /// deactivate→activate alone does not reliably zero a CLAP reverb's
-    /// internal feedback-delay network.
-    fn reset(&mut self) {}
-    /// Runs one buffer. `events` must be sorted by ascending `time` (CLAP
-    /// requirement, also honoured by VST3 for consistency).
-    /// `aux_inputs` carries PR4 sidechain audio: one entry per `is_main=false`
-    /// input port the plugin declared, in declaration order. `active=false`
-    /// means the host has no source wired to this aux port — backends pass
-    /// silence (or null `data32` for CLAP) so the plugin observes silence.
+/// Audio-thread half of a loaded plugin: **`process()` が触る状態の全て**
+/// (入出力 planar buffer / event scratch / param cache / collected out
+/// events)。worker registry にはこの trait object ([`AudioHalf`] 経由) を
+/// 渡す。main half ([`LoadedPlugin`]) からは lifecycle hook (`on_activate`
+/// / `on_deactivate` / `set_processing`) のみ、**quiesced window 内で**
+/// 呼ばれる。
+pub trait AudioProcessorHalf: Send {
+    /// Runs one buffer. `events` / `param_events` must be sorted by
+    /// ascending `time` (CLAP requirement, also honoured for VST3).
     fn process(
         &mut self,
         frames: u32,
@@ -241,132 +228,170 @@ pub trait LoadedPlugin: Send {
         aux_inputs: &[AuxInputBuf<'_>],
         transport: &TransportContext,
     ) -> Result<i32>;
-    /// Planar output. `None` means "no such channel" (e.g. mono plugin
-    /// queried for channel 1).
+
+    /// Planar output. `None` means "no such channel".
     fn output_buffer(&self, channel: usize) -> Option<&[f32]>;
-    /// パラアウト (`docs/plan_paraout.md`): planar **aux** output for the
-    /// `is_main=false` output port `port` (declaration order, port 0 first),
-    /// channel `channel`. `None` = no such aux port / channel; the process
-    /// server then marks `pd.aux_out_active[port] = 0` so the audio engine
-    /// skips it. Default returns `None` for backends without parallel-out
-    /// support (VST3 / builtin / silence); only the CLAP backend overrides it.
+
+    /// パラアウト: planar aux output (port 0 = main bus when the plugin is
+    /// multi-out). `None` = no such port / channel.
     fn aux_output_buffer(&self, _port: usize, _channel: usize) -> Option<&[f32]> {
         None
     }
-    /// パラアウト (`docs/plan_paraout.md`): how many `is_main=false` output
-    /// ports this plugin declared (capped at `MAX_AUX_OUT`). Reported to the
-    /// GUI via `SlotPluginLoaded` so it knows how many child tracks to create
-    /// on "explode" and how many routing rows to show. Default `0` for
-    /// backends without parallel-out support (VST3 / builtin / silence).
-    fn aux_output_port_count(&self) -> usize {
-        0
-    }
-    /// Moves MIDI-style events emitted during the previous `process()`
-    /// into `out`, draining the plugin's buffer in place (pre-allocated
-    /// capacity preserved).
+
+    /// Moves MIDI-style events emitted during the previous `process()` into
+    /// `out` (capacity-preserving drain).
     fn drain_out_notes_into(&mut self, out: &mut Vec<TimedNoteEvent>);
 
-    /// Phase 2c (`docs/plan_automation.md` §7.5): drain plugin-emitted
-    /// PARAM_GESTURE_BEGIN events from the last `process()` call.
-    /// Default no-op for backends that don't emit them (Silence /
-    /// VoicevoxBuiltin / VST3 backend until Phase 3+).
+    /// Drain plugin-emitted PARAM_GESTURE_BEGIN param ids. Default no-op.
     fn drain_out_param_touches_into(&mut self, _out: &mut Vec<u32>) {}
 
-    /// Phase 2c: drain plugin-emitted PARAM_VALUE events (= plugin GUI
-    /// knob value changes). Default no-op.
+    /// Drain plugin-emitted PARAM_VALUE `(param_id, value)`. Default no-op.
     fn drain_out_param_values_into(&mut self, _out: &mut Vec<(u32, f64)>) {}
 
-    /// Phase 4 Step C-3: drain plugin-emitted PARAM_GESTURE_END events
-    /// (= plugin GUI knob release)。 Default no-op (= Silence /
-    /// VoicevoxBuiltin / VST3 はまだ対応していない)。
+    /// Drain plugin-emitted PARAM_GESTURE_END param ids. Default no-op.
     fn drain_out_param_releases_into(&mut self, _out: &mut Vec<u32>) {}
 
-    // --- render-mode hint (CLAP `render` ext) ---------------------------
-    /// Tell the plugin whether the next `process()` calls are realtime
-    /// or offline (during WAV export). Returns `true` if the plugin
-    /// accepted the change. CLAP plugins forward to
-    /// `clap_plugin_render.set`; backends without the extension return
-    /// `false` and continue at whatever mode they were already in.
+    // --- lifecycle hooks (plugin-main thread, quiesced window のみ) ------
+
+    /// (Re)allocate the process buffers for the new activation params.
+    /// Called by the main half right after the format-level activate
+    /// succeeded, inside a quiesced window.
+    fn on_activate(&mut self, _sample_rate: f64, _max_frames: u32) {}
+
+    /// Free / clear activation-scoped buffers. Quiesced window のみ。
+    fn on_deactivate(&mut self) {}
+
+    /// Mirror of the main half's processing gate (defensive check inside
+    /// `process()`). Quiesced window のみ。
+    fn set_processing(&mut self, _on: bool) {}
+}
+
+/// Shared cell that owns the [`AudioProcessorHalf`] allocation. The worker
+/// registry and the main half ([`LoadedPlugin::audio_half`]) each hold an
+/// `Arc`; the allocation therefore outlives any stale registry snapshot
+/// (no dangling `Box` reads), while *access* is serialized dynamically by
+/// the quiesce protocol (module docs).
+pub struct AudioHalf {
+    inner: UnsafeCell<Box<dyn AudioProcessorHalf>>,
+}
+
+// SAFETY: the inner Box is only dereferenced through `get()`, whose
+// contract requires dynamically exclusive access (registry dispatch window
+// XOR quiesced window). `dyn AudioProcessorHalf` is `Send`.
+unsafe impl Send for AudioHalf {}
+unsafe impl Sync for AudioHalf {}
+
+impl AudioHalf {
+    pub fn new(inner: Box<dyn AudioProcessorHalf>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: UnsafeCell::new(inner),
+        })
+    }
+
+    /// # Safety
+    ///
+    /// The caller must hold dynamically exclusive access per the module-doc
+    /// contract: either (a) a worker inside its dispatch-critical section
+    /// with this entry resolved from the *current* registry snapshot, or
+    /// (b) the plugin-main thread inside a quiesced window (entry removed
+    /// from the registry + `WorkerPool::quiesce` completed) or before the
+    /// entry was ever published.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn get(&self) -> &mut (dyn AudioProcessorHalf + 'static) {
+        unsafe { &mut **self.inner.get() }
+    }
+}
+
+// ====================================================================
+// VOICEVOX capability (docs/plan_arch_refactor.md §6)
+// ====================================================================
+
+/// Vocal-synthesis capability implemented by builtin VOICEVOX. External
+/// CLAP / VST3 plugins have no equivalent concept, so the capability is an
+/// opt-in downcast ([`LoadedPlugin::as_vocal_synth`]) instead of a set of
+/// default-no-op methods on every plugin.
+pub trait VocalSynth {
+    /// Per-note metadata flush (歌詞 + talk)。plugin-main thread から、GUI
+    /// 側で歌詞 / phoneme が編集されるたびに呼ばれる。
+    fn set_note_metadata(&mut self, bpm: f32, entries: &[NoteMetadata], talk: &[TalkMetadata]);
+
+    /// `(queued_gen, done_gen)` 世代カウンタ。歌唱 bounce 前の合成完了待ち
+    /// (`PrepareVocalSynth`) が `done >= queued` を poll する。
+    fn synth_progress(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>);
+}
+
+// ====================================================================
+// Main half
+// ====================================================================
+
+/// The host-side main-thread handle to a loaded plugin. Lives on the
+/// plugin-main thread. The audio thread never touches this object — it
+/// works on the separate [`AudioProcessorHalf`] obtained at publish time
+/// via [`Self::audio_half`].
+#[allow(dead_code)] // `format()` is wired up for future UI display.
+pub trait LoadedPlugin: Send {
+    fn id(&self) -> &str;
+    fn name(&self) -> &str;
+    fn format(&self) -> PluginFormat;
+
+    /// The audio half backing this instance (Arc clone). Published into the
+    /// worker registry; also used by the main half's own lifecycle hooks.
+    fn audio_half(&self) -> Arc<AudioHalf>;
+
+    // --- lifecycle (plugin-main thread; quiesced window when live) -------
+    fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()>;
+    fn deactivate(&mut self);
+    fn start_processing(&mut self) -> Result<()>;
+    fn stop_processing(&mut self);
+
+    /// Clear the plugin's audio processing state (tails / voices) without
+    /// touching parameters. CLAP forwards to `clap_plugin.reset()`; others
+    /// default no-op. Quiesced window のみ。
+    fn reset(&mut self) {}
+
+    /// CLAP `clap_plugin.on_main_thread()` — plugin が `request_callback`
+    /// で予約した main-thread task を 1 回実行する。他 format は no-op。
+    fn on_main_thread(&mut self) {}
+
+    // --- render-mode hint -------------------------------------------------
+    /// Realtime / Offline hint. CLAP は `clap_plugin_render.set`、VST3 は
+    /// per-buffer `ProcessData::processMode` 切替 (audio half と共有の
+    /// atomic 経由)。
     fn set_render_mode(&mut self, mode: RenderMode) -> bool;
 
-    /// PR3.3 PDC: query the plugin's reported processing latency in
-    /// samples (host sample_rate). Called once right after `activate()`
-    /// succeeds (CLAP spec: `clap_plugin_latency.get` requires
-    /// `[main-thread & active]`; VST3 spec: `IAudioProcessor::
-    /// getLatencySamples` requires Setup Done state). Backends without
-    /// the extension or that don't expose latency return 0.
+    /// PDC: query the plugin's reported processing latency in samples.
+    /// Requires the plugin to be active.
     fn query_latency(&mut self) -> u32;
 
-    /// Phase 2 (`daw_01/docs/plan_automation.md` §7.5): enumerate every
-    /// parameter the plugin exposes. Called from the plugin-main thread
-    /// once right after `activate()` succeeds. CLAP / VST3 backends walk
-    /// `clap_plugin_params.{count,get_info}` / `IEditController::
-    /// {getParameterCount, getParameterInfo}` respectively. Default impl
-    /// returns empty (= builtin plugins / Silence). Names that don't fit
-    /// in `String::from_utf8_lossy` are truncated at the first invalid
-    /// byte.
+    /// Enumerate every parameter the plugin exposes (plugin-main thread).
     fn enumerate_params(&self) -> Vec<PluginParamInfo> {
         Vec::new()
     }
 
-    // --- persistence (plugin-main thread) -------------------------------
+    // --- persistence (plugin-main thread) --------------------------------
     fn state_save(&self) -> Result<Option<Vec<u8>>>;
-    /// PR-V2.5 で `&mut self` 化。 builtin plugin が parameter を実際に
-    /// 復元できるようにするための変更。 既存 CLAP / VST3 backend は内部
-    /// で `&self` ベース API (interior mutability) に forward していた
-    /// だけなので、 signature 変更だけで動作不変。
     fn state_load(&mut self, data: &[u8]) -> Result<()>;
 
-    // --- per-note metadata (Builtin plugin only, PR-V2.2 / V2.3) --------
-    /// Builtin plugin (`PluginFormat::Builtin`) 専用の per-note metadata
-    /// flush。 CLAP / VST3 plugin は default no-op (= 規格に存在しない
-    /// 概念なので)、 builtin plugin は `entries` を内部にバッファして
-    /// 次の synthesis pass で参照する。
-    ///
-    /// 呼び出しは plugin-main thread から、 GUI 側で歌詞 / phoneme が
-    /// 編集されるたびに実施。 `entries` は `note_id` ascending に並んで
-    /// いる必要は無い (= builtin が必要なら自分でソートする)。
-    /// `bpm` は note の `start_beat` を frames に変換するときに使う
-    /// (= VOICEVOX `singing_query` のフレーム計算)。 song の bpm 変更時
-    /// にも flush される。
-    /// `docs/plan_voicevox_synth.md` PR-V2.2 / V2.3 で導入。
-    /// (talk, `docs/plan_voicevox_talk.md` §3.3) `_talk` は同トラックの
-    /// `ClipContent::Text` 由来の読み上げ群。歌唱 (`_entries`) と talk を 1 回の flush で
-    /// 受け、builtin が 1 つの合成 job (= 1 連続バッファ) に統合する。CLAP/VST3 は無視。
-    fn set_note_metadata(
-        &mut self,
-        _bpm: f32,
-        _entries: &[NoteMetadata],
-        _talk: &[TalkMetadata],
-    ) {
+    /// パラアウト: how many parallel-out ports this plugin declared.
+    fn aux_output_port_count(&self) -> usize {
+        0
     }
 
-    /// builtin VOICEVOX の歌唱合成の `(queued_gen, done_gen)` 世代カウンタを
-    /// 返す (それ以外の plugin は `None`)。 plugin host が歌唱 bounce の前に、
-    /// `set_note_metadata` が増やした `queued_gen` まで synth thread が `done_gen` を
-    /// 進める (= 最新メタデータの合成完了) のを待つために使う。 stale な synth_result を
-    /// 「完了」 と誤認しないための世代比較に用いる。
-    fn voicevox_synth_progress(&self) -> Option<(Arc<AtomicU64>, Arc<AtomicU64>)> {
+    /// VOICEVOX capability downcast. Default `None` (external plugins).
+    fn as_vocal_synth(&mut self) -> Option<&mut dyn VocalSynth> {
         None
     }
 
-    /// builtin VOICEVOX の合成状態 (busy / failing) を daw_gui へ継続報告する
-    /// callback を仕込む。plugin host が load 後 (plugin_id 確定後) に 1 度設定し、以後
-    /// synth thread が状態遷移ごとに呼ぶ。builtin VOICEVOX 以外は no-op。
-    fn set_voicevox_status_reporter(&mut self, _reporter: VoicevoxStatusReporter) {}
-
-    /// (r.md #5 ARA2) If this plug-in is ARA-capable, create its ARA document
-    /// controller and bind the instance for playback rendering (empty model).
-    /// Returns `Ok(true)` when bound, `Ok(false)` for non-ARA plug-ins (default).
-    /// MUST be called once at load, **before** the first `activate` / state load
-    /// / GUI creation, as the ARA spec requires.
+    // --- ARA (r.md #5) ----------------------------------------------------
+    /// If ARA-capable, create the document controller and bind the instance
+    /// (before the first activate / state load / GUI, per ARA spec).
     fn bind_ara_if_capable(&mut self) -> Result<bool> {
         Ok(false)
     }
 
-    /// (r.md #5 ARA2) Update the bound ARA document to expose `clips` as audio
-    /// sources + playback regions and (if `archive` is given) restore prior
-    /// edits. No-op returning `Ok(false)` when the instance is not ARA-bound.
+    /// Update the bound ARA document to expose `clips` (deactivate →
+    /// set_clips → restore archive → reactivate は
+    /// [`crate::ara::run_setup_ara`] に一本化)。
     fn setup_ara(
         &mut self,
         _clips: &[common::protocol::AraClipSpec],
@@ -377,40 +402,28 @@ pub trait LoadedPlugin: Send {
         Ok(false)
     }
 
-    /// (r.md #7 ARA2) Update only the placement / stretch of the bound ARA
-    /// document's existing regions (matched by `persistent_id`), without
-    /// rebuilding. Unlike `setup_ara` this needs no deactivate —
-    /// `updatePlaybackRegionProperties` is safe while the plug-in renders — so it
-    /// is the live tempo / edge-drag follow path. No-op for non-ARA instances.
+    /// Update only the placement / stretch of existing ARA regions
+    /// (safe while rendering — no deactivate).
     fn update_ara_regions(&self, _regions: &[common::protocol::AraRegionUpdate]) {}
 
-    /// (r.md #5 ARA2) Tear down this instance's ARA session, if any.
+    /// Tear down this instance's ARA session, if any.
     fn clear_ara(&mut self) {}
 
-    /// (r.md #5 ARA2) Drive the bound ARA document's deferred work / analysis.
-    /// Called periodically by the plugin-main thread (ARA requires the host to
-    /// pump `notifyModelUpdates` while not editing); no-op for non-ARA instances.
+    /// Drive the bound ARA document's deferred work / analysis
+    /// (plugin-main timer).
     fn notify_ara_model_updates(&self) {}
 
-    /// (r.md #5 ARA2) Whether this instance currently holds a live ARA session.
-    /// Lets the plugin-main thread run its `notifyModelUpdates` timer only while
-    /// at least one ARA document is loaded.
+    /// Whether this instance currently holds a live ARA session.
     fn has_ara_session(&self) -> bool {
         false
     }
 
-    /// (r.md #5 ARA2) Serialise this instance's ARA edit state for project save,
-    /// or `None` if it is not an ARA instance / has no live session.
+    /// Serialise this instance's ARA edit state for project save.
     fn store_ara_archive(&self) -> Option<Vec<u8>> {
         None
     }
 
-    // --- embedded Win32 GUI (plugin-main thread) ------------------------
-    //
-    // Methods match the existing CLAP `Plugin` inherent impl so the trait
-    // impl can forward with `self.gui_xxx(..)` (inherent method resolution
-    // wins, so no infinite recursion). VST3 internal state changes that
-    // would ordinarily require `&mut self` go through `Cell` / `RefCell`.
+    // --- embedded Win32 GUI (plugin-main thread) --------------------------
     fn gui_is_embed_supported(&self) -> bool;
     fn gui_create_embedded(&mut self) -> Result<()>;
     fn gui_get_size(&self) -> Option<(u32, u32)>;
@@ -442,15 +455,8 @@ pub fn load_plugin(
             Ok(Box::new(plugin) as Box<dyn LoadedPlugin>)
         }
         PluginFormat::Builtin => {
-            // `path` here is a `builtin://...` URI (see plugin_format::
-            // PluginFormat docs). `plugin_id` is unused for builtins —
-            // the URI itself is the descriptor id, mirroring CLAP's
-            // single-id-per-descriptor convention. Some upstream
-            // call-sites may still pass a non-empty `plugin_id` (= the
-            // database entry's `id` field, which equals the URI); we
-            // simply ignore it. Future builtins with multiple
-            // descriptors per URI can switch to `plugin_id`-based
-            // dispatch without changing the protocol.
+            // `path` here is a `builtin://...` URI. `plugin_id` is unused —
+            // the URI itself is the descriptor id.
             let _ = plugin_id;
             let uri = path.to_string_lossy();
             builtin::load_builtin(&uri, callbacks)

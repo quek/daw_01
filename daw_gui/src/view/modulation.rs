@@ -120,7 +120,7 @@ pub(crate) fn build_mod(
 /// 自コントロールの modulation depth ドラッグの立ち上がり / 立ち下がり edge を
 /// 検知し、終了時に schedule を再同期する (`SetModRoutingDepth` は dirty mark
 /// のみで、engine が新 depth を読むには `sync_song_to_plugin_host` = LoadSong が
-/// 要る)。`app.mod_depth_scrub_active` は **(track_id, target) を key** にするので、
+/// 要る)。`app.ui_ephemeral.mod_depth_scrub_active` は **(track_id, target) を key** にするので、
 /// 同時表示される多数の modulatable コントロール (mixer は同一 `Pan` target を全
 /// strip に描く) が共有 flag を奪い合って毎フレーム偽の recompile を撃つことがない
 /// (各コントロールは自分のドラッグ edge にだけ反応)。
@@ -132,7 +132,7 @@ pub(crate) fn push_mod_drag_resync(
     mod_dragging: bool,
 ) {
     let is_active = app
-        .mod_depth_scrub_active
+        .ui_ephemeral.mod_depth_scrub_active
         .as_ref()
         .is_some_and(|(t, tgt)| *t == track_id && tgt == target);
     if mod_dragging == is_active {
@@ -141,9 +141,9 @@ pub(crate) fn push_mod_drag_resync(
     let key = (track_id, target.clone());
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         if mod_dragging {
-            app.mod_depth_scrub_active = Some(key);
+            app.ui_ephemeral.mod_depth_scrub_active = Some(key);
         } else {
-            app.mod_depth_scrub_active = None;
+            app.ui_ephemeral.mod_depth_scrub_active = None;
             app.sync_song_to_plugin_host();
         }
     }));

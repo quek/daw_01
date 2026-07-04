@@ -6,48 +6,38 @@
 //! 各 worker:
 //!   1. 自分専用の `wake` event を待つ (`SetEvent` は audio engine 側)。
 //!   2. audio 側が `WorkerBridge::worker_task` の対応 slot に書いた
-//!      plugin id を読む。
-//!   3. その id を [`PluginRegistry`] で resolve し、 live な entry に
-//!      対応していれば `plugin.process()` を呼ぶ。
+//!      **安定 device id (u64)** を読む (v29 — session-unique plugin_id は
+//!      廃止)。
+//!   3. その id を [`PluginRegistry`] (`HashMap<u64, PluginEntry>` の
+//!      ArcSwap snapshot) で resolve し、 live な entry に対応していれば
+//!      audio half の `process()` を呼ぶ。
 //!   4. `done` event を signal して audio worker を再開させる。
-//!
-//! `MainToChild::OpenWorkerPool` で spawn され、 `CloseWorkerPool`
-//! (または process 終了) で teardown する。 wake/done event handle
-//! は worker 毎に保持し、 worker thread 終了時に close される。
 //!
 //! # plugin Drop の同期: `DispatchCounter` + `quiesce`
 //!
-//! plugin は plugin-main thread の `Box<dyn LoadedPlugin>` が所有
-//! するが、 worker pool は `PluginRegistry` 経由の raw pointer で
-//! deref する。 plugin-main thread が `plugin.process()` 実行中に
-//! plugin を drop すると、 worker は free 済み COM object / unload
-//! 済み DLL に触れて UAF になる (`daw_plugin_host` が ~84-100ms 後
-//! に AV: Windows loader が `DllMain(DLL_PROCESS_DETACH)` の cleanup
-//! を完了し、 worker が無効になった code page の中で何かを実行
-//! しようとするタイミングと一致する)。
+//! Registry entry は [`AudioHalf`] の `Arc` を持つ (v29 — 旧 raw pointer
+//! into Box)。 Arc なので stale snapshot が allocation を dangle させる
+//! ことは構造的に無いが、 audio half の中の FFI ポインタ (plugin 本体) は
+//! main half の Drop で無効になるため、 **アクセスの直列化** は従来どおり
+//! quiesce protocol が担う:
 //!
-//! audio engine をこのために pause することはできない (ユーザーが
-//! 再生中に track を削除するのは許される動作)。 そこで in-flight な
-//! `process()` を排出する形で同期する。 worker 毎に単調増加 counter
-//! の pair を持ち:
+//!   - `enter[i]` は worker `i` が dispatch-critical section に入る直前に
+//!     increment する。
+//!   - `exit[i]` は `process()` return 後、 audio half への参照を手放した
+//!     時点で increment する。
 //!
-//!   - `enter[i]` は worker `i` が dispatch-critical section に入る
-//!     直前 (raw pointer deref の前) に increment する。
-//!   - `exit[i]`  は `plugin.process()` が return した後、 raw pointer
-//!     view を手放した時点で increment する。
+//! plugin-main thread の [`WorkerPool::quiesce`] は `enter` を snapshot し、
+//! 全 worker で `exit` が追いつくのを待つ。 registry から entry を外して
+//! (`registry_remove`) から `quiesce` を呼べば、 以後 worker はその audio
+//! half に触れない — そこで初めて main half (と FFI plugin) を安全に
+//! deactivate / drop できる。
 //!
-//! plugin-main thread の [`WorkerPool::quiesce`] は `enter` を snapshot
-//! し、 全 worker で `exit` がそれに追いつくのを待つ。 ここまで来れば
-//! その plugin の `Box` を drop しても safe。 `quiesce` は registry に
-//! `None` を publish した **後** に呼ぶ必要があり、 そうすれば新規 dispatch
-//! は drop 予定の entry を見つけられない (skip path に流れる)。
-//!
-//! IDLE wake / `None` registry slot でも counter は bump する。 deref
-//! の前後を SeqCst 全順序で確実に挟むためで、 ペアになっていれば
-//! `quiesce` の wait は伸びない。
+//! IDLE wake / missing-entry でも counter は bump する (SeqCst 全順序の
+//! 論証を分岐 free に保つため)。
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -56,6 +46,7 @@ use anyhow::Result;
 use common::metrics_bridge::MetricsBridgeHandle;
 use common::plugin_ref::open_named_event;
 use common::process_data::{Event, EventKind};
+use common::protocol::PluginEvent;
 use common::worker_bridge::{MAX_WORKERS, WorkerBridge, WorkerBridgeHandle};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{
@@ -63,25 +54,79 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-use crate::PluginRegistry;
-use crate::plugin_instance::{NoteTransition, TimedNoteEvent};
+use crate::plugin_instance::{AudioHalf, NoteTransition, TimedNoteEvent};
+
+/// Per-plugin process-server entry (v29: device_id keyed, flat)。
+/// `audio` は split-half の audio 側 ([`AudioHalf`])、 `process_data` は
+/// audio engine が入力を書く shmem slot。
+pub struct PluginEntry {
+    pub audio: Arc<AudioHalf>,
+    pub process_data: *mut common::process_data::ProcessData,
+    /// per-publish one-shot: `process()` Err / panic を最初の 1 回だけ
+    /// log する (TIME_CRITICAL thread での毎 buffer format+log を排除)。
+    /// republish (再 SetSlotPlugin / reinit) で新 entry になりリセット。
+    pub err_logged: Arc<AtomicBool>,
+}
+
+impl Clone for PluginEntry {
+    fn clone(&self) -> Self {
+        Self {
+            audio: Arc::clone(&self.audio),
+            process_data: self.process_data,
+            err_logged: Arc::clone(&self.err_logged),
+        }
+    }
+}
+
+unsafe impl Send for PluginEntry {}
+unsafe impl Sync for PluginEntry {}
+
+/// Lock-free `device_id` → [`PluginEntry`] lookup the worker pool reads
+/// during dispatch. plugin-main thread が add / remove ごとに新しい
+/// `HashMap` を publish する; 古い snapshot は最後の worker guard が落ちる
+/// まで生きる (Arc entry なので dangle しない)。
+pub type PluginRegistry = Arc<arc_swap::ArcSwap<HashMap<u64, PluginEntry>>>;
+
+/// Publish (insert or replace) one registry entry.
+pub fn registry_insert(registry: &PluginRegistry, device_id: u64, entry: PluginEntry) {
+    let mut next: HashMap<u64, PluginEntry> = (**registry.load()).clone();
+    next.insert(device_id, entry);
+    registry.store(Arc::new(next));
+}
+
+/// Remove one registry entry, returning it if present.
+pub fn registry_remove(registry: &PluginRegistry, device_id: u64) -> Option<PluginEntry> {
+    let current = registry.load();
+    if !current.contains_key(&device_id) {
+        return None;
+    }
+    let mut next: HashMap<u64, PluginEntry> = (**current).clone();
+    let removed = next.remove(&device_id);
+    drop(current);
+    registry.store(Arc::new(next));
+    removed
+}
+
+/// Snapshot every entry and clear the registry (ReinitAllPlugins 用)。
+pub fn registry_take_all(registry: &PluginRegistry) -> HashMap<u64, PluginEntry> {
+    let all: HashMap<u64, PluginEntry> = (**registry.load()).clone();
+    registry.store(Arc::new(HashMap::new()));
+    all
+}
+
+/// Re-publish a set of entries at once (ReinitAllPlugins の republish)。
+pub fn registry_restore_all(registry: &PluginRegistry, entries: HashMap<u64, PluginEntry>) {
+    registry.store(Arc::new(entries));
+}
 
 /// `HANDLE` is `*mut c_void` and therefore `!Send`. We only ever wait on
-/// or signal these from one thread (the worker) so wrapping them with an
-/// explicit `unsafe impl Send` is safe.
+/// or signal these from one thread (the worker).
 #[derive(Copy, Clone)]
 struct SendableHandle(HANDLE);
 unsafe impl Send for SendableHandle {}
 
-/// `unsafe { &mut *entry.plugin.0 }` の deref を守る、 worker 毎の
-/// `enter` / `exit` counter ペア。 詳細は module-level docs 参照。
-///
-/// すべての increment は `SeqCst`。 これにより counter 間および
-/// `PluginRegistry` の update との総順序が成立する (`arc_swap` の
-/// 内部 ordering に依存しない)。 `SeqCst` の fetch_add は x86_64 では
-/// `AcqRel` と同コスト (`lock` prefix 付き RMW)、 ARM64 でも `dmb ish`
-/// が 1 つ増える程度。 dispatch path は CLAP/VST3 process() で十分
-/// 重いので、 この差は誤差。
+/// audio half への参照を守る、 worker 毎の `enter` / `exit` counter ペア。
+/// すべての increment は `SeqCst` (`PluginRegistry` update との総順序)。
 struct DispatchCounter {
     enter: [AtomicU64; MAX_WORKERS],
     exit: [AtomicU64; MAX_WORKERS],
@@ -95,27 +140,24 @@ impl DispatchCounter {
         }
     }
 
-    /// worker が dispatch-critical section に入る直前に呼ぶ
-    /// (`unsafe { &mut *entry.plugin.0 }` の前)。 [`Self::exit`] と pair。
+    /// worker が dispatch-critical section に入る直前に呼ぶ。
     #[inline]
     fn enter(&self, idx: usize) {
         self.enter[idx].fetch_add(1, Ordering::SeqCst);
     }
 
-    /// worker が `plugin.process()` から return し、 entry の raw pointer
-    /// view を手放した直後に呼ぶ。 [`Self::enter`] と pair。
+    /// worker が `process()` から return し audio half への参照を手放した
+    /// 直後に呼ぶ。
     #[inline]
     fn exit(&self, idx: usize) {
         self.exit[idx].fetch_add(1, Ordering::SeqCst);
     }
 }
 
-/// per-worker param-event ring の容量。 plugin GUI で knob をドラッグした
-/// ときだけ埋まる。 1024 もあれば 1 buffer 分の gesture を取りこぼさない。
+/// per-worker param-event ring の容量。
 const PARAM_RING_CAP: usize = 1024;
 
-/// plugin-GUI 発の param event の種別。 `PluginEvent` の touch/value/release を
-/// RT 経路で alloc せず ring に詰めるための flat tag (enum 変換は drain 側)。
+/// plugin-GUI 発の param event の種別 (RT 経路で alloc しない flat tag)。
 #[derive(Clone, Copy)]
 enum RtParamKind {
     Touch,
@@ -123,14 +165,11 @@ enum RtParamKind {
     Release,
 }
 
-/// RT worker → drain thread に運ぶ param event 1 件。 `Copy` なので ring の
-/// 固定 slot にそのまま書ける (heap なし)。
+/// RT worker → drain thread に運ぶ param event 1 件 (`Copy`、 heap なし)。
 #[derive(Clone, Copy)]
 struct RtParamEvent {
     kind: RtParamKind,
-    track: u32,
-    index: u32,
-    plugin_id: u32,
+    device_id: u64,
     param_id: u32,
     value: f64,
 }
@@ -139,20 +178,16 @@ impl Default for RtParamEvent {
     fn default() -> Self {
         Self {
             kind: RtParamKind::Touch,
-            track: 0,
-            index: 0,
-            plugin_id: 0,
+            device_id: 0,
             param_id: 0,
             value: 0.0,
         }
     }
 }
 
-/// 固定長 lock-free SPSC ring。 producer = 単一 RT worker thread、 consumer =
-/// 単一 drain thread。 RT 側 `push` は「書くだけ」 (alloc/lock/syscall なし、
-/// 満杯時は drop)。 worker 1 本につき 1 ring を持つので producer は常に 1 つ、
-/// SPSC で十分。 旧実装は RT worker から tokio unbounded mpsc に send して
-/// いて block 境界跨ぎで heap alloc していた (code review 2026-06-06 #10)。
+/// 固定長 lock-free SPSC ring。 producer = 単一 RT worker thread、
+/// consumer = 単一 drain thread。 RT 側 `push` は「書くだけ」 (alloc/lock/
+/// syscall なし、 満杯時は drop)。
 struct ParamEventRing {
     buf: Box<[std::cell::UnsafeCell<RtParamEvent>]>,
     /// consumer が次に読む通し index (mod cap で slot)。
@@ -163,9 +198,7 @@ struct ParamEventRing {
 }
 
 // SAFETY: SPSC 規律 — producer は tail のみ、 consumer は head のみ進め、
-// `head == tail` (空) / `tail - head == cap` (満杯) を atomic で判定するので、
-// producer と consumer が同一 slot に同時アクセスすることはない。 RtParamEvent
-// は `Copy` (内部に参照/ポインタを持たない)。
+// 同一 slot への同時アクセスは起きない。 RtParamEvent は `Copy`。
 unsafe impl Sync for ParamEventRing {}
 
 impl ParamEventRing {
@@ -181,20 +214,17 @@ impl ParamEventRing {
         }
     }
 
-    /// producer (RT worker) 専用。 満杯なら `false` を返して drop する
-    /// (= alloc しない)。 RT-safe。
+    /// producer (RT worker) 専用。 満杯なら `false` を返して drop する。
     fn push(&self, ev: RtParamEvent) -> bool {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
         if tail.wrapping_sub(head) >= self.cap {
             return false;
         }
-        // SAFETY: この slot (`tail % cap`) は head..tail の外 = consumer が
-        // 読まない未使用領域。 producer は単一なので排他。
+        // SAFETY: この slot は head..tail の外 = consumer が読まない領域。
         unsafe {
             *self.buf[tail % self.cap].get() = ev;
         }
-        // Release: 上の書き込みを consumer の Acquire load(tail) から可視化。
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         true
     }
@@ -206,46 +236,40 @@ impl ParamEventRing {
         if head == tail {
             return None;
         }
-        // SAFETY: head < tail なので この slot は producer が書き終えて tail を
-        // Release で進めた後。 consumer は単一なので排他。
+        // SAFETY: head < tail なので producer の書き込み完了後。
         let ev = unsafe { *self.buf[head % self.cap].get() };
         self.head.store(head.wrapping_add(1), Ordering::Release);
         Some(ev)
     }
 }
 
-/// `RtParamEvent` を IPC 用 `PluginEvent` へ変換 (drain thread = 非RT で実行)。
-fn rt_param_to_event(ev: RtParamEvent) -> crate::PluginEvent {
+/// `RtParamEvent` を wire 用 [`PluginEvent`] へ変換 (drain thread = 非RT)。
+fn rt_param_to_event(ev: RtParamEvent) -> PluginEvent {
     match ev.kind {
-        RtParamKind::Touch => crate::PluginEvent::PluginParamTouched {
-            track: ev.track,
-            index: ev.index,
-            plugin_id: ev.plugin_id,
+        RtParamKind::Touch => PluginEvent::PluginParamTouched {
+            device_id: ev.device_id,
             param_id: ev.param_id,
+            // display_name は daw_gui 側で plugin_params cache から解決する
+            // (= host での文字列構築は placeholder のみ)。
+            display_name: format!("Param {}", ev.param_id),
         },
-        RtParamKind::Value => crate::PluginEvent::PluginParamValueChanged {
-            track: ev.track,
-            index: ev.index,
-            plugin_id: ev.plugin_id,
+        RtParamKind::Value => PluginEvent::PluginParamValueChanged {
+            device_id: ev.device_id,
             param_id: ev.param_id,
             value: ev.value,
         },
-        RtParamKind::Release => crate::PluginEvent::PluginParamGestureEnd {
-            track: ev.track,
-            index: ev.index,
-            plugin_id: ev.plugin_id,
+        RtParamKind::Release => PluginEvent::PluginParamGestureEnd {
+            device_id: ev.device_id,
             param_id: ev.param_id,
         },
     }
 }
 
 /// drain thread 本体: 全 worker ring を 2ms 間隔で poll し、 拾った param
-/// event を `evt_tx` (tokio、 非RT) へ流す。 worker は `shutdown` 前に join
-/// されるので、 shutdown 観測時には全 event が ring に揃っており、 最終 drain
-/// で取りこぼさない。
+/// event を `evt_tx` (非RT) へ流す。
 fn run_param_drain(
     rings: Vec<Arc<ParamEventRing>>,
-    evt_tx: tokio::sync::mpsc::UnboundedSender<crate::PluginEvent>,
+    evt_tx: tokio::sync::mpsc::UnboundedSender<PluginEvent>,
     drain_quit: Arc<AtomicBool>,
 ) {
     loop {
@@ -257,9 +281,8 @@ fn run_param_drain(
             }
         }
         if drain_quit.load(Ordering::Acquire) {
-            // `drain_quit` は teardown が **全 worker を join した後** に立てる
-            // (`shutdown` とは別 flag)。 よって break 時点で ring への新規 push
-            // は起き得ない。 直近 push 分を最終 drain で確実に拾ってから抜ける。
+            // `drain_quit` は teardown が全 worker join 後に立てるので、
+            // break 時点で新規 push は起き得ない。 最終 drain で拾い切る。
             for ring in &rings {
                 while let Some(ev) = ring.pop() {
                     let _ = evt_tx.send(rt_param_to_event(ev));
@@ -274,16 +297,8 @@ fn run_param_drain(
 }
 
 /// dispatch-critical section の teardown を `Drop` に集約する guard。
-///
-/// `plugin.process()` が **panic** すると、 通常 path の `dispatch.exit` /
-/// slot を IDLE に戻す store / `SetEvent(done)` が全て skip され、 結果
-/// plugin-main thread の [`WorkerPool::quiesce`] が対応する `exit` を永久に
-/// 待って hang する。 これらの操作を guard の `Drop` に移すことで、 normal
-/// return でも panic unwind でも **必ず** 実行され、 **当 buffer** の quiesce
-/// は解ける。 worker thread 自体の生存 (= 以降の buffer も処理し続ける) は
-/// `run_worker` が `process()` を `catch_unwind` で囲むことで担保している。
-///
-/// 操作順は normal path と同一 (exit → slot IDLE 化 → SetEvent)。
+/// `process()` が panic しても `exit` / slot IDLE 化 / `SetEvent(done)` が
+/// 必ず実行され、 quiesce の永久 wait を防ぐ。
 struct DispatchGuard<'a> {
     dispatch: &'a DispatchCounter,
     bridge: &'a WorkerBridgeHandle,
@@ -293,12 +308,10 @@ struct DispatchGuard<'a> {
 
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
-        // dispatch-critical section を閉じる。 ここから先 registry entry の
-        // pointer を deref しないので、 plugin-main thread が `Box` を drop
-        // しても safe になる。
+        // dispatch-critical section を閉じる。 ここから先 audio half に
+        // 触れないので、 plugin-main が entry を drop しても safe。
         self.dispatch.exit(self.idx);
-        // 次の stale wake がよからぬ plugin を起こさないよう、 slot を
-        // IDLE に戻す。
+        // 次の stale wake がよからぬ device を起こさないよう IDLE に戻す。
         self.bridge.bridge().worker_task[self.idx].store(WorkerBridge::IDLE, Ordering::Release);
         unsafe {
             let _ = SetEvent(self.done.0);
@@ -306,31 +319,21 @@ impl Drop for DispatchGuard<'_> {
     }
 }
 
-/// Owns every worker thread and the shared shutdown flag. Dropped (or
-/// `shutdown()`-ed) on CloseWorkerPool / process exit.
+/// Owns every worker thread and the shared shutdown flag.
 pub struct WorkerPool {
     workers: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
-    /// drain thread 専用の終了 flag。 `shutdown` (= worker 用) とは別にして、
-    /// teardown が **全 worker を join した後** にこれを立てることで、 drain の
-    /// break 時点では「新規 push が起き得ない」 が真に保証される (worker は
-    /// loop 先頭でしか `shutdown` を見ないため、 shutdown 直前に wake された
-    /// buffer が ring に trailing push し得る — それを取りこぼさないため)。
+    /// drain thread 専用の終了 flag (worker join 後に立てる)。
     drain_quit: Arc<AtomicBool>,
-    /// Wake events kept here so `shutdown()` can `SetEvent` each one and
-    /// release the worker from its `WaitForSingleObject`.
+    /// Wake events kept here so `shutdown()` can release the workers.
     wake_events: Vec<HANDLE>,
-    /// [`Self::quiesce`] が参照する `enter` / `exit` counter pair。
+    /// [`Self::quiesce`] が参照する counter pair。
     dispatch: Arc<DispatchCounter>,
-    /// 実際に起動した worker 数。 `dispatch.enter`/`exit` の
-    /// `n_workers` 以降 の slot は `run_worker` から触らないので、
-    /// `quiesce` は `[0, n_workers)` のみを iterate する。
+    /// 実際に起動した worker 数。
     n_workers: u32,
-    /// plugin GUI 発の param event を RT worker → 非RT に運ぶ per-worker
-    /// SPSC ring (worker 1 本 = 1 ring)。 drain thread が consumer。
+    /// plugin GUI 発の param event を RT → 非RT に運ぶ per-worker SPSC ring。
     param_rings: Vec<Arc<ParamEventRing>>,
-    /// param ring を poll して `evt_tx` へ流す非RT thread。 `shutdown()` で
-    /// worker join 後に join する。
+    /// param ring を poll して `evt_tx` へ流す非RT thread。
     drain_thread: Option<JoinHandle<()>>,
 }
 
@@ -342,7 +345,7 @@ impl WorkerPool {
         wake_event_names: &[String],
         done_event_names: &[String],
         registry: PluginRegistry,
-        evt_tx: tokio::sync::mpsc::UnboundedSender<crate::PluginEvent>,
+        evt_tx: tokio::sync::mpsc::UnboundedSender<PluginEvent>,
     ) -> Result<Self> {
         anyhow::ensure!(
             wake_event_names.len() == n_workers as usize,
@@ -364,8 +367,8 @@ impl WorkerPool {
         );
 
         let bridge = Arc::new(WorkerBridgeHandle::open(worker_bridge_shmem_id)?);
-        // resource monitor (r.md #3): per-plugin の process() 時間を publish する
-        // 共有メモリ。 各 worker が clone を持ち、 process() 後に store する。
+        // resource monitor: per-plugin の process() 時間を publish する共有
+        // メモリ。
         let metrics = Arc::new(MetricsBridgeHandle::open(metrics_shmem_id)?);
         let shutdown = Arc::new(AtomicBool::new(false));
         let dispatch = Arc::new(DispatchCounter::new());
@@ -386,8 +389,6 @@ impl WorkerPool {
             let idx = i as u32;
             let wake_s = SendableHandle(wake);
             let done_s = SendableHandle(done);
-            // per-worker SPSC ring: この worker が唯一の producer。 pool 側は
-            // drain 用に 1 本保持し、 worker 側へ 1 本 move する。
             let ring = Arc::new(ParamEventRing::new(PARAM_RING_CAP));
             param_rings.push(Arc::clone(&ring));
             let handle = std::thread::Builder::new()
@@ -402,8 +403,7 @@ impl WorkerPool {
         }
 
         // drain thread: RT worker が ring に書いた param event を非RT で
-        // `evt_tx` (tokio) へ流す。 これで RT 経路から tokio send (alloc) を
-        // 排除する。 `evt_tx` はここで move (worker は ring を使うので不要)。
+        // `evt_tx` へ流す。
         let drain_rings: Vec<Arc<ParamEventRing>> =
             param_rings.iter().map(Arc::clone).collect();
         let drain_quit = Arc::new(AtomicBool::new(false));
@@ -428,41 +428,10 @@ impl WorkerPool {
     /// 全 worker が in-flight な `process()` を完了するまで待つ。
     /// **plugin-main thread からのみ呼ぶ — RT thread からは呼ばない。**
     ///
-    /// 呼び出し側は drop 予定の plugin id 全てについて、 この method を
-    /// 呼ぶ **前に** `PluginRegistry` で `None` を publish しておく必要が
-    /// ある。 これにより、 まだ critical section に入っていない worker は
-    /// drop 対象の entry を見つけられない。
-    ///
-    /// この method が return した時点で、 `None` publish 前に取られた
-    /// registry snapshot を hold したまま `unsafe { &mut *entry.plugin.0 }`
-    /// に居る worker は存在しない。 したがって対応する
-    /// `Box<dyn LoadedPlugin>` を plugin-main thread で drop しても safe。
-    ///
-    /// # 実装
-    ///
-    /// 各 worker `i` について、 `enter[i]` を snapshot し、
-    /// `exit[i] >= snap` になるまで poll する。 invariant:
-    ///
-    ///   - worker のコード path: wake 直後 `enter.fetch_add` → registry
-    ///     resolve → unsafe deref → `plugin.process` → `exit.fetch_add`
-    ///     (program order、 すべて SeqCst)。 `enter` と deref の間に
-    ///     registry を load するので、 load 時に `Some` だった entry の
-    ///     pointer は、 対応する `exit` が来るまで hold される。
-    ///   - caller の order: `registry.store(None)` → `quiesce()`。
-    ///   - 古い (Some) snapshot を観測した worker について: program order
-    ///     により `enter.fetch_add` は `registry.load` より前。 その
-    ///     `registry.load` は (古い値を観測したので) caller の
-    ///     `registry.store(None)` より前。 SeqCst により worker の
-    ///     `enter.fetch_add` と caller の `enter.load` の relative order
-    ///     が決まるので、 caller は worker の bump を観測して、 対応する
-    ///     `exit` を待てる。
-    ///   - 新しい (None) snapshot を観測した worker についても、
-    ///     IDLE / `None` skip path で `enter` / `exit` は対称に bump
-    ///     されるので wait は伸びない。
-    ///
-    /// 200µs 間隔で poll する。 plugin-main thread は RT ではないので
-    /// sleep は問題ない。 200µs は audio buffer 長より十分短いので、
-    /// 典型的な RemoveTrack は 1-2 回の poll で抜ける。
+    /// 呼び出し側は drop / mutate 予定の device 全てについて、 この method
+    /// を呼ぶ **前に** registry から entry を外しておく必要がある
+    /// ([`registry_remove`])。 return した時点で、 旧 snapshot を hold した
+    /// まま audio half に触れている worker は存在しない。
     pub fn quiesce(&self) {
         for i in 0..self.n_workers as usize {
             let snap = self.dispatch.enter[i].load(Ordering::SeqCst);
@@ -476,9 +445,7 @@ impl WorkerPool {
         self.teardown();
     }
 
-    /// 全 worker と drain thread を停止・join する。 `shutdown()` と、
-    /// `shutdown()` を経ずに drop された場合の `Drop` の両方から呼ばれる。
-    /// 既に teardown 済の状態で再呼び出しされても no-op (冪等)。
+    /// 全 worker と drain thread を停止・join する (冪等)。
     fn teardown(&mut self) {
         if self.drain_thread.is_none() && self.workers.is_empty() {
             return;
@@ -495,10 +462,7 @@ impl WorkerPool {
                 tracing::error!("plugin worker thread panicked");
             }
         }
-        // 全 worker が join 済 ⇒ ring への新規 push は起き得ない。 ここで初めて
-        // drain に終了を指示する (worker 用 `shutdown` とは別 flag `drain_quit`)。
-        // これで drain の break 前に全 push が完了している = trailing event を
-        // 取りこぼさない。
+        // 全 worker join 済 ⇒ ring への新規 push は起き得ない。
         self.drain_quit.store(true, Ordering::Release);
         if let Some(d) = self.drain_thread.take()
             && d.join().is_err()
@@ -511,9 +475,8 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        // 正常系は `shutdown()` 済でここは no-op (workers drain 済 / drain_thread
-        // None)。 `shutdown()` を経ずに drop された異常系 (panic unwind 等) のみ、
-        // worker / drain thread の detach を防ぐためここで停止・join する。
+        // 正常系は `shutdown()` 済で no-op。 panic unwind 等の異常系のみ
+        // ここで停止・join する。
         self.teardown();
     }
 }
@@ -530,45 +493,33 @@ fn run_worker(
     done: SendableHandle,
     param_ring: Arc<ParamEventRing>,
 ) {
-    // Best-effort priority boost so we don't lose the CPAL buffer
-    // deadline. Failure is logged but non-fatal.
+    // Best-effort priority boost so we don't lose the CPAL buffer deadline.
     unsafe {
         let h = GetCurrentThread();
         if let Err(e) = SetThreadPriority(h, THREAD_PRIORITY_TIME_CRITICAL) {
             tracing::warn!(error = ?e, worker_idx = idx, "failed to raise plugin worker priority");
         }
     }
-    // MMCSS "Pro Audio" task class: held for the worker's lifetime so
-    // the OS scheduler keeps `plugin.process()` calls on the realtime
-    // priority class. Reverts automatically on Drop.
+    // MMCSS "Pro Audio" task class (reverts on Drop).
     let _mmcss = common::mmcss::join_pro_audio();
     if _mmcss.is_none() {
         tracing::warn!(worker_idx = idx, "plugin worker MMCSS join failed");
     }
-    // Tell the CLAP `thread_check` extension this thread counts as an
-    // audio thread, so plugins calling `host.is_audio_thread()` from
-    // inside `process()` get the correct answer.
+    // CLAP `thread_check`: this thread counts as an audio thread.
     crate::clap_host::mark_audio_thread();
     tracing::info!(worker_idx = idx, "plugin worker started");
-    // Pre-allocated event-conversion buffer so the RT path doesn't
-    // touch the allocator during dispatch.
+    // Pre-allocated event-conversion buffers (RT path never allocates).
     let mut events_in: Vec<TimedNoteEvent> = Vec::with_capacity(common::process_data::MAX_EVENTS);
-    // Phase 2b: parameter events extracted from `pd.events_in` (= EventKind::
-    // ParamValue) and passed to `LoadedPlugin::process` as a second event
-    // stream. Pre-allocated like `events_in` so the audio thread never
-    // allocates inside the dispatch loop.
     let mut param_events_in: Vec<crate::plugin_instance::TimedParamEvent> =
         Vec::with_capacity(common::process_data::MAX_EVENTS);
     let mut events_out: Vec<TimedNoteEvent> = Vec::with_capacity(common::process_data::MAX_EVENTS);
-    // Phase 2c (`docs/plan_automation.md` §7.5): plugin GUI 発の
-    // PARAM_GESTURE_BEGIN / PARAM_VALUE を出力 events から拾うための
-    // pre-allocated buffer。 plugin.process() 終了後に drain して
-    // evt_tx へ送る。
     let mut out_param_touches: Vec<u32> = Vec::with_capacity(64);
     let mut out_param_values: Vec<(u32, f64)> = Vec::with_capacity(common::process_data::MAX_EVENTS);
-    // Phase 4 Step C-3: PARAM_GESTURE_END collector。 plugin GUI で knob を
-    // release した瞬間に 1 entry。
     let mut out_param_releases: Vec<u32> = Vec::with_capacity(64);
+    // per-worker one-shot: 「registry に居ない device」への dispatch 警告は
+    // 同じ id が続く限り 1 回だけ (TIME_CRITICAL thread での毎 buffer log を
+    // 排除 — respawn 待ちの間 audio 側は毎 buffer dispatch し続ける)。
+    let mut warned_missing: Option<u64> = None;
 
     loop {
         unsafe {
@@ -578,23 +529,12 @@ fn run_worker(
             break;
         }
 
-        // dispatch-critical section を、 観測可能な操作を行う **前** に
-        // 開く。 plugin-main thread の `WorkerPool::quiesce` は registry
-        // で `None` を publish した後に `enter` を load するので、 ここ
-        // で `enter` を bump しておけば happens-before が成立する: 古い
-        // `Some` snapshot を見た `registry.load()` は必ず `None` publish
-        // より前 → そこから quiesce 側の `enter.load` に SeqCst 全順序で
-        // 繋がる → quiesce は our bump を観測して、 下の `exit` まで wait
-        // する。
-        //
-        // IDLE skip / None skip path でも unconditional に bump する
-        // (exit と pair) のは、 SeqCst 全順序の証明を分岐 free に保つため。
-        // コストは wake あたり cache line 1 本の RMW で、 CLAP/VST3
-        // process() に比べれば無視できる。
+        // dispatch-critical section を、 観測可能な操作の **前** に開く
+        // (happens-before の論証は module docs)。
         dispatch.enter(idx as usize);
 
-        let plugin_id = bridge.bridge().worker_task[idx as usize].load(Ordering::Acquire);
-        if plugin_id == WorkerBridge::IDLE {
+        let device_id = bridge.bridge().worker_task[idx as usize].load(Ordering::Acquire);
+        if device_id == WorkerBridge::IDLE {
             dispatch.exit(idx as usize);
             unsafe {
                 let _ = SetEvent(done.0);
@@ -603,11 +543,13 @@ fn run_worker(
         }
 
         let snapshot = registry.load();
-        let entry_opt = snapshot
-            .get(plugin_id as usize)
-            .and_then(|opt| opt.as_ref());
+        let entry_opt = snapshot.get(&device_id);
         let Some(entry) = entry_opt else {
-            tracing::warn!(plugin_id, "no plugin registered for id");
+            // one-shot per distinct id (旧実装は毎 buffer warn = RT 違反)。
+            if warned_missing != Some(device_id) {
+                warned_missing = Some(device_id);
+                tracing::warn!(device_id, "no plugin registered for device (suppressing repeats)");
+            }
             bridge.bridge().worker_task[idx as usize]
                 .store(WorkerBridge::IDLE, Ordering::Release);
             dispatch.exit(idx as usize);
@@ -616,11 +558,9 @@ fn run_worker(
             }
             continue;
         };
+        warned_missing = None;
 
-        // teardown (dispatch.exit / slot IDLE 化 / SetEvent(done)) を
-        // `Drop` に集約する。 これで `plugin.process()` が panic しても
-        // `done` が必ず signal され、 plugin-main thread の `quiesce` が
-        // 永久 wait して worker pool 全体が hang するのを防ぐ。
+        // teardown (exit / slot IDLE 化 / SetEvent(done)) を `Drop` に集約。
         let _guard = DispatchGuard {
             dispatch: &dispatch,
             bridge: &bridge,
@@ -628,24 +568,16 @@ fn run_worker(
             done,
         };
 
-        // SAFETY: 上の `dispatch.enter` で dispatch-critical section
-        // に入っている。 `dispatch.exit` (= `plugin.process()` 完了後)
-        // が走るまでは plugin-main thread の `WorkerPool::quiesce` が
-        // block するので、 この raw pointer の指す `Box` は drop され
-        // ない。 happens-before の論証は module-level docs 参照。
-        let plugin = unsafe { &mut *entry.plugin.0 };
+        // SAFETY: dispatch-critical section 内 (`dispatch.enter` 済)。
+        // plugin-main は registry から外して quiesce するまでこの audio
+        // half に `&mut` を発行しない (AudioHalf の契約)。
+        let plugin = unsafe { entry.audio.get() };
         let pd = unsafe { &mut *entry.process_data };
-        // shmem 由来の `frames` を MAX_FRAMES に clamp してから slice する。
-        // audio engine 側は常に `<= MAX_FRAMES` を書くが、 shmem は信頼境界
-        // の外なので out-of-bounds slice (panic) を防ぐ防御 clamp。
+        // shmem 由来の `frames` を clamp (信頼境界の外なので防御)。
         let n = (pd.frames as usize).min(common::process_data::MAX_FRAMES);
         let frames = n as u32;
 
-        // Decode events_in → TimedNoteEvent / TimedParamEvent.
-        // Phase 2b (`docs/plan_automation.md` §8.3): ParamValue events
-        // are no longer dropped — they go through to the plugin as
-        // CLAP_EVENT_PARAM_VALUE / VST3 IParameterChanges via
-        // `LoadedPlugin::process(.., param_events, ..)`.
+        // Decode events_in → TimedNoteEvent / TimedParamEvent。
         events_in.clear();
         param_events_in.clear();
         let n_events_in = pd.n_events_in as usize;
@@ -690,10 +622,7 @@ fn run_worker(
         let (in_a, in_b) = pd.buffer_in.split_at(1);
         let input_audio: [&[f32]; 2] = [&in_a[0][..n], &in_b[0][..n]];
 
-        // PR4 sidechain: build per-aux-port input slices from
-        // `pd.buffer_aux_in` + `pd.aux_in_active`. The order is the host's
-        // declared aux port order (port 0 first), matching what the
-        // plugin's `is_main=false` declarations should be in.
+        // PR4 sidechain: per-aux-port input slices。
         let aux_inputs: [crate::plugin_instance::AuxInputBuf<'_>;
             common::process_data::MAX_AUX_IN] = std::array::from_fn(|port| {
             let active = pd.aux_in_active[port] != 0;
@@ -703,28 +632,19 @@ fn run_worker(
                 r: &pd.buffer_aux_in[port][1][..n],
             }
         });
-        // Reset aux_in_active for the next buffer; the audio engine is
-        // responsible for re-asserting it via `NodeOp::SidechainTap`. This
-        // keeps stale routing from leaking when the user disconnects the
-        // sidechain (no SidechainTap emitted ⇒ aux_in_active stays 0).
+        // Reset aux_in_active for the next buffer (stale routing 防止)。
         for flag in &mut pd.aux_in_active {
             *flag = 0;
         }
-        // パラアウト (docs/plan_paraout.md): clear aux_out_active up front so a
-        // failed / skipped process() (or a plugin that dropped an aux port on
-        // rescan) never leaves a stale "active" flag for the engine to read.
-        // The process_ok block below re-asserts it per declared port.
+        // パラアウト: clear aux_out_active up front (失敗 buffer の stale
+        // flag 防止)。
         for flag in &mut pd.aux_out_active {
             *flag = 0;
         }
 
         let transport = crate::plugin_instance::TransportContext::from_process_data(pd);
-        // builtin / Rust 製 plugin が process() で panic すると unwind が
-        // `run_worker` の loop を抜けて worker thread が死に、 以降その idx に
-        // dispatch された buffer は誰も done を signal せず audio engine が
-        // 永久 hang する (DispatchGuard は当 buffer の quiesce しか救えない)。
-        // catch_unwind で unwind を止め worker thread を生かす。 C/C++ plugin
-        // の例外はそもそも Rust panic として unwind しないので対象は builtin。
+        // builtin / Rust 製 plugin の panic で worker thread を殺さない
+        // (以後の dispatch が誰も done を signal しなくなる)。
         let proc_start = std::time::Instant::now();
         let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             plugin.process(
@@ -739,22 +659,28 @@ fn run_worker(
         let process_ok = match process_result {
             Ok(Ok(_)) => true,
             Ok(Err(e)) => {
-                tracing::error!(error = ?e, plugin_id, "plugin.process() failed");
+                // per-entry one-shot (v29): 落ち続ける plugin が毎 buffer
+                // format+log で RT thread を汚さない。
+                if !entry.err_logged.swap(true, Ordering::Relaxed) {
+                    tracing::error!(error = ?e, device_id, "plugin.process() failed (suppressing repeats)");
+                }
                 false
             }
             Err(_panic) => {
-                tracing::error!(
-                    plugin_id,
-                    "plugin.process() panicked; worker survived, buffer skipped"
-                );
+                if !entry.err_logged.swap(true, Ordering::Relaxed) {
+                    tracing::error!(
+                        device_id,
+                        "plugin.process() panicked; worker survived, buffer skipped (suppressing repeats)"
+                    );
+                }
                 false
             }
         };
-        // resource monitor (r.md #3): per-plugin の process() 時間 (μs) を publish。
-        // panic / err でも計測区間は有効なので worst-case 把握のため常に store。
-        // `Instant::now`/`elapsed` は RT 許容、 store は lock-free。
+        // resource monitor: per-plugin の process() 時間 (μs) を publish。
+        // metrics slot は u32 index API のまま (device_id が slot 数を超える
+        // 場合は silently drop — bridge 側仕様)。
         let proc_us = u32::try_from(proc_start.elapsed().as_micros()).unwrap_or(u32::MAX);
-        metrics.set_plugin_dsp_us(plugin_id, proc_us);
+        metrics.set_plugin_dsp_us(u32::try_from(device_id).unwrap_or(u32::MAX), proc_us);
         if process_ok {
             // Copy output audio into the shmem.
             if let Some(out_l) = plugin.output_buffer(0) {
@@ -768,12 +694,7 @@ fn run_worker(
                 pd.buffer_out[1][..n].fill(0.0);
             }
 
-            // パラアウト (docs/plan_paraout.md): copy each declared aux output
-            // port into pd.buffer_aux_out so the audio engine's
-            // `NodeOp::ParallelOutTap` can route it to its destination track,
-            // same buffer (zero latency). Mono aux ports duplicate L→R. Ports
-            // the plugin doesn't declare return None ⇒ aux_out_active stays 0
-            // (cleared above) and the engine never reads them.
+            // パラアウト: copy each declared aux output port。
             for port in 0..common::process_data::MAX_AUX_OUT {
                 let Some(aux_l) = plugin.aux_output_buffer(port, 0) else {
                     continue;
@@ -789,15 +710,8 @@ fn run_worker(
             // Drain plugin output events back into the shmem.
             events_out.clear();
             plugin.drain_out_notes_into(&mut events_out);
-            // Phase 2c: drain plugin-emitted param touches / values。
-            //
-            // RT 安全 (code review 2026-06-06 #10): この `run_worker` は
-            // TIME_CRITICAL + MMCSS の audio dispatch thread。 旧実装は
-            // `evt_tx.send` (tokio unbounded mpsc) で block 境界跨ぎの heap
-            // alloc を起こしていた (再生中の knob ドラッグで per-buffer 発火)。
-            // 現在は per-worker SPSC `param_ring` に「書くだけ」 (alloc/lock/
-            // syscall なし、 満杯時は drop) で、 非RT の drain thread が拾って
-            // `evt_tx` へ流す。
+            // Drain plugin-emitted param touches / values / releases into the
+            // per-worker SPSC ring (alloc/lock/syscall なし、 満杯時 drop)。
             out_param_touches.clear();
             out_param_values.clear();
             out_param_releases.clear();
@@ -808,14 +722,10 @@ fn run_worker(
                 || !out_param_values.is_empty()
                 || !out_param_releases.is_empty()
             {
-                let track = entry.track;
-                let index = entry.index;
                 for param_id in out_param_touches.drain(..) {
                     param_ring.push(RtParamEvent {
                         kind: RtParamKind::Touch,
-                        track,
-                        index,
-                        plugin_id,
+                        device_id,
                         param_id,
                         value: 0.0,
                     });
@@ -823,9 +733,7 @@ fn run_worker(
                 for (param_id, value) in out_param_values.drain(..) {
                     param_ring.push(RtParamEvent {
                         kind: RtParamKind::Value,
-                        track,
-                        index,
-                        plugin_id,
+                        device_id,
                         param_id,
                         value,
                     });
@@ -833,9 +741,7 @@ fn run_worker(
                 for param_id in out_param_releases.drain(..) {
                     param_ring.push(RtParamEvent {
                         kind: RtParamKind::Release,
-                        track,
-                        index,
-                        plugin_id,
+                        device_id,
                         param_id,
                         value: 0.0,
                     });
@@ -877,9 +783,7 @@ fn run_worker(
             }
         }
 
-        // dispatch-critical section の teardown (dispatch.exit / slot を
-        // IDLE に戻す / SetEvent(done)) は `_guard` の `Drop` がここ (loop
-        // body スコープ末尾) で実行する。 panic unwind でも同様に走る。
+        // dispatch-critical section teardown は `_guard` の Drop。
     }
     tracing::info!(worker_idx = idx, "plugin worker exiting");
 }
@@ -939,8 +843,27 @@ mod tests {
         assert_eq!(got, 50_000);
     }
 
-    /// どの worker も `enter` を bump していない状態では `quiesce`
-    /// は即座に return する (in-flight なし → wait loop 抜ける)。
+    /// param event の wire 変換が device_id を保持する (v29)。
+    #[test]
+    fn rt_param_event_carries_device_id() {
+        let ev = RtParamEvent {
+            kind: RtParamKind::Value,
+            device_id: 0xDEAD_BEEF_0001,
+            param_id: 7,
+            value: 0.25,
+        };
+        match rt_param_to_event(ev) {
+            PluginEvent::PluginParamValueChanged { device_id, param_id, value } => {
+                assert_eq!(device_id, 0xDEAD_BEEF_0001);
+                assert_eq!(param_id, 7);
+                assert_eq!(value, 0.25);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    /// どの worker も `enter` を bump していない状態では `quiesce` は即座に
+    /// return する。
     #[test]
     fn quiesce_returns_immediately_when_idle() {
         let dispatch = Arc::new(DispatchCounter::new());
@@ -959,13 +882,12 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(5));
     }
 
-    /// `quiesce` は in-flight な worker が `exit` を bump するまで
-    /// return しない。 UAF guard の中核を verify する test。
+    /// `quiesce` は in-flight な worker が `exit` を bump するまで return
+    /// しない。 UAF guard の中核を verify する test。
     #[test]
     fn quiesce_waits_for_inflight_dispatch() {
         let dispatch = Arc::new(DispatchCounter::new());
-        // slot 2 で in-flight な状態を作る (`enter` だけ bump して
-        // 対応する `exit` を出さない)。
+        // slot 2 で in-flight な状態を作る。
         dispatch.enter(2);
 
         let pool = WorkerPool {
@@ -996,7 +918,6 @@ mod tests {
             "quiesce が in-flight worker の exit bump 前に return した \
              (elapsed={elapsed:?}, expected >= {release_after:?}) — UAF guard 破壊"
         );
-        // 200µs poll 間隔なので 5ms の遅延は十分許容内。
         assert!(
             elapsed < release_after + Duration::from_millis(5),
             "quiesce の所要時間が想定外に長い ({elapsed:?})"
@@ -1004,9 +925,7 @@ mod tests {
     }
 
     /// `quiesce` が snapshot を取った **後** に到着する `enter` bump は
-    /// wait を延長してはならない。 そうでないと、 RemoveTrack 中も
-    /// 動き続ける audio engine の dispatch によって teardown が
-    /// 無限に starve される。
+    /// wait を延長してはならない (teardown starvation 防止)。
     #[test]
     fn quiesce_ignores_new_enters_after_snapshot() {
         let dispatch = Arc::new(DispatchCounter::new());
@@ -1022,8 +941,6 @@ mod tests {
         };
 
         // background thread で enter/exit pair を高速に回す。
-        // 「removed 対象でない plugin への dispatch を audio engine が
-        // 続けている」 状況の simulation。
         let stop = Arc::new(AtomicBool::new(false));
         let stop_w = Arc::clone(&stop);
         let dispatch_w = Arc::clone(&dispatch);
@@ -1036,8 +953,6 @@ mod tests {
             }
         });
 
-        // quiesce は snapshot を取った時点で exit が enter に
-        // 追いついているので、 即座に return するはず。
         let start = Instant::now();
         pool.quiesce();
         let elapsed = start.elapsed();
@@ -1048,5 +963,55 @@ mod tests {
             elapsed < Duration::from_millis(50),
             "quiesce が継続中の dispatch に starve された (elapsed={elapsed:?})"
         );
+    }
+
+    /// registry の insert / remove / take_all round-trip (device_id keyed)。
+    #[test]
+    fn registry_insert_remove_roundtrip() {
+        struct NullHalf;
+        impl crate::plugin_instance::AudioProcessorHalf for NullHalf {
+            fn process(
+                &mut self,
+                _frames: u32,
+                _events: &[TimedNoteEvent],
+                _param_events: &[crate::plugin_instance::TimedParamEvent],
+                _input_audio: &[&[f32]],
+                _aux_inputs: &[crate::plugin_instance::AuxInputBuf<'_>],
+                _transport: &crate::plugin_instance::TransportContext,
+            ) -> Result<i32> {
+                Ok(0)
+            }
+            fn output_buffer(&self, _channel: usize) -> Option<&[f32]> {
+                None
+            }
+            fn drain_out_notes_into(&mut self, _out: &mut Vec<TimedNoteEvent>) {}
+        }
+
+        let registry: PluginRegistry =
+            Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new()));
+        let entry = PluginEntry {
+            audio: AudioHalf::new(Box::new(NullHalf)),
+            process_data: std::ptr::null_mut(),
+            err_logged: Arc::new(AtomicBool::new(false)),
+        };
+        registry_insert(&registry, 42, entry);
+        assert!(registry.load().contains_key(&42));
+        let removed = registry_remove(&registry, 42);
+        assert!(removed.is_some());
+        assert!(registry.load().is_empty());
+        assert!(registry_remove(&registry, 42).is_none());
+
+        // take_all + restore_all round-trip。
+        let entry2 = PluginEntry {
+            audio: AudioHalf::new(Box::new(NullHalf)),
+            process_data: std::ptr::null_mut(),
+            err_logged: Arc::new(AtomicBool::new(false)),
+        };
+        registry_insert(&registry, 7, entry2);
+        let all = registry_take_all(&registry);
+        assert!(registry.load().is_empty());
+        assert_eq!(all.len(), 1);
+        registry_restore_all(&registry, all);
+        assert!(registry.load().contains_key(&7));
     }
 }

@@ -1,603 +1,235 @@
 # 設計書
 
-VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。Clip ベースのタイムラインに
-トラッカー UI で入力し、CLAP/VST3 プラグインに対応する。
+VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。Clip ベースのタイムライン、CLAP/VST3
+プラグイン、ビルトイン映像 (video/image/text overlay + 立ち絵/口パク) を持つ。
+
+本書は**現行実装の正本**。アーキテクチャの不変条件は CLAUDE.md「アーキテクチャ
+不変条件」、2026-07-03 全体改修の設計判断は `docs/plan_arch_refactor.md`。
 
 ## アーキテクチャ
 
 ### プロセス構成
 
-3 つの独立した実行ファイル（別プロセス）で構成する。
+3 つの独立した実行ファイル（別プロセス）。
 
 | プロセス | 役割 |
 |---|---|
-| **daw_gui** | UI 表示・編集操作。gui_01 (daw-ui) ベース (winit + wgpu + 自作 immediate-mode) |
-| **daw_audio** | オーディオ出力・シーケンサー・ミキサー。CPAL (WASAPI) |
-| **daw_plugin_host** | CLAP/VST3 プラグインのロード・実行 |
+| **daw_gui** | UI 表示・編集。Song ドキュメントの SSoT。gui_01 (daw-ui = winit + wgpu + 自作 immediate-mode) |
+| **daw_audio** | オーディオ出力・シーケンサ・ルーティンググラフ・ミキサ。CPAL (WASAPI) |
+| **daw_plugin_host** | CLAP/VST3/builtin プラグインのロード・実行・エディタ GUI・ARA |
+
+制御プレーンは**星型**: daw_gui が両方の子へ named pipe を張る。audio ↔ plugin_host
+間に制御路は無く、両者を繋ぐのはデータプレーン (shared memory + named event) のみ。
 
 ```
-daw_gui <──IPC──> daw_audio <──IPC──> daw_plugin_host
-  │                  │                     │
-  │ 制御メッセージ    │ オーディオバッファ    │ プラグイン process()
-  │ (named pipe)     │ (shared memory)     │ (shared memory)
+            ┌── control (named pipe, bincode) ──┐
+   AudioCommand/AudioEvent            PluginCommand/PluginEvent
+            │                                   │
+        daw_audio ◄── WorkerBridge + per-device ProcessData ──► daw_plugin_host
+            │            (shmem + named event, RT dispatch)
+            └── AudioBridge / MetricsBridge (shmem telemetry) ──► daw_gui (30Hz poll)
 ```
 
-### IPC — 制御プレーン (named pipe + bincode)
+- 子プロセスは Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) で daw_gui に紐付き、
+  親がどう死んでもゾンビ化しない。
+- 子の crash / pipe 断 (read 断・**write 断の両方**) は synthetic `ChildDisconnected` に
+  正規化され、daw_gui が respawn → Session/worker pool/LoadSong/plugin slot を冪等に
+  再構築する。respawn 時は新 Hello の `device_sample_rate` を採用して session を
+  再構成する (デバイス変更に追従)。
+
+### 制御プレーン (named pipe + bincode)
 
 `common/src/{protocol,wire,pipe,client}.rs`。
 
-プロトコル:
-```rust
-pub enum ChildToMain {
-    Hello { kind: ChildKind, pid: u32 },
-}
-pub enum MainToChild {
-    Ack,
-    Play,
-    Stop,
-    Session(AudioSession),
-    LoadSong(Song),
-}
-pub struct AudioSession {
-    shmem_id: String, request_sem_id: String, ready_sem_id: String,
-    sample_rate: u32, max_frames: u32, channels: u16,
-}
-```
+- **宛先別の型付き enum** (単一 enum は廃止):
+  - `AudioCommand` (gui→audio) / `AudioEvent` (audio→gui)
+  - `PluginCommand` (gui→plugin_host) / `PluginEvent` (plugin_host→gui)
+  - 誤配送・「相手が無視する variant の no-op arm」・無駄 decode が型で消える。
+- フレーミング: 4 byte LE 長プレフィクス + bincode body (16MB 上限で DoS 防御)。
+- **fingerprint handshake**: 子は Hello に `PROTOCOL_FINGERPRINT` (wire を渡る source
+  群の content hash、`common/build.rs` が焼き込み) を載せ、親は不一致で明示 fail
+  (「make build を実行」)。ビルド世代混在の silent misdecode を接続時に検出する。
+- **wire は blob-less**: `LoadSong(Song)` の `PluginInstance` は手書き bincode impl が
+  `state` / `ara_archive` (MB 級 blob) を構造的に除外する。blob が要る操作は専用
+  message (`SetSlotPlugin.initial_state` / `SetupAraDocument.archive` /
+  `AllPluginStates`) が個別に運ぶ。ARA の in-memory PCM は project cache へ WAV
+  materialize してから path で渡す (bulk を pipe に載せない)。
 
-フロー:
-1. daw_gui が `\\.\pipe\daw_01_{pid}_{kind}` を server 作成
-2. 子プロセスを spawn（JobObject で紐付け）し、pipe 名を第 1 引数で渡す
-3. 子が `ClientOptions::new().open(...)` で connect → Hello 送信
-4. daw_gui が Ack 返信
-5. daw_gui が Session メッセージを送信（shmem / セマフォ名 / sample_rate / max_frames）
-6. 以降は `Play` / `Stop` / `LoadSong` を送る
-7. ウィンドウ close → pipe drop → 子が EOF 検知して正常終了
+### identity — 安定 device_id (u64)
 
-フレーミング: 4 byte little-endian 長プレフィクス + bincode body（16 MB 上限で DoS 防御）。
+デバイス (プラグインインスタンス) のアドレスは Song が採番する
+**`PluginInstance.id` 一本** (Song-global `next_device_id`、master fx も同 allocator)。
+IPC・automation (`AutomationTarget::PluginParam { device_id }`)・MIDI binding・
+plugin_host の bookkeeping (`HashMap<u64, InstanceRecord>`)・shmem 名
+(`process_data_shmem_id(pid, device_id)`)・worker dispatch token (WorkerBridge の
+AtomicU64) がすべて同じ id を使う。chain 内 index は表示順序のみ。
 
-### IPC — データプレーン (shared memory + Win32 セマフォ)
+これにより「削除/並べ替えで参照を貼り替える補償機構」(旧 ReorderChain の 3 プロセス
+貫通再キー、callback に焼き込まれた座標の stale 化) が**存在しなくなる** — reorder は
+Song 編集 + LoadSong 再送だけで完結する。send (`Send.id`)、note / audio event /
+automation point (per-content 要素 id) も同様に安定 id。
 
-`common/src/{audio_bridge,win_sem}.rs`。
+### データプレーン (shared memory + named event)
 
-```rust
-#[repr(C)]
-pub struct AudioBridge {
-    frames_requested: AtomicU32,  // daw_audio が書き込む
-    _pad: u32,
-    samples: [f32; 2048],          // 1024 frames × 2ch interleaved
-}
-```
+| 経路 | 用途 |
+|---|---|
+| `WorkerBridge` + wake/done named event 対 | audio worker ↔ plugin_host worker の 1:1 dispatch。`worker_task[i]` (AtomicU64) が device_id を運ぶ |
+| per-device `ProcessData` shmem | 音声バッファ・イベント・transport (per-buffer) |
+| `AudioBridge` shmem | telemetry: playhead / peaks / mod scalars / preroll (writer = daw_audio、GUI 30Hz poll) |
+| `MetricsBridge` shmem | DSP load / xrun / per-plugin process() μs |
 
-固定値: `SAMPLE_RATE=48000`, `MAX_FRAMES=1024`, `CHANNELS=2`。
+#### RT dispatch の有界性 (poisoning contract)
 
-同期: 2 つの名前付きセマフォを使った往復。
-- `request_sem`: daw_audio → daw_plugin_host、「N フレーム埋めろ」
-- `ready_sem`:  daw_plugin_host → daw_audio、「書き終えた」
+`WorkerSyncRef::dispatch(device_id, DISPATCH_TIMEOUT_MS)` は done を**有界**で待つ
+(`common/src/plugin_ref.rs`)。timeout = その worker pair は **poisoned** (auto-reset
+event に待ち手なし signal が残留し得るため、pool 再構築まで dispatch 禁止)。
+該当 device は **quarantine** (AtomicBool、以後 mix から無音バイパス、shmem にも
+触らない) され、専用 notify スレッドが `AudioEvent::PluginUnresponsive` を 1 回だけ
+GUI へ通知する。pool 全体の完了待ち (`all_done`) も有界で、timeout は
+`WorkerPoolStalled` → GUI が plugin_host respawn → `OpenWorkerPool` 再送 (worker
+event 名は **generation** 込みで mint され、旧世代の stale signal が新 pool に漏れない)。
 
-daw_audio の CPAL コールバックで 1 往復（RT スレッドが wait するが、plugin_host の process 時間が短ければ OK）。
+プラグインの SEH crash / `process()` ハングが CPAL コールバックを永久凍結させる
+経路は存在しない — 3 プロセス分離の目的 (crash 隔離) が異常系でも成立する。
 
-### 対応 OS
+#### RT スレッドの構造規約
 
-- Windows (primary)
-- Linux (将来。OS 依存は薄い抽象化レイヤに閉じ込める)
-- macOS はスコープ外
+- CPAL callback / worker では確保・解放・ロック・I/O をしない (`--features rt-assert`
+  の allocator hook + テストで機械証明)。
+- 重い状態遷移 (plugin_refs map / worker pool / schedule の差し替え) は recv loop が
+  off-thread で `RtBundle` を構築し、rtrb forward/recycle ring で RT へ swap 配送。
+  旧 bundle の解体 (shmem unmap / thread join / free) も off-thread。ring 満杯は
+  drop-oldest (最新編集優先)。
+- CPAL callback スレッドは初回に MMCSS Pro Audio へ自前 join (cpal 0.17 の boost に
+  依存しない、RT 優先度ポリシーの SSoT は自プロセス)。
 
-### 対応 OS
+### daw_audio エンジン
 
-- Windows (primary)
-- Linux (将来。OS 依存は薄い抽象化レイヤに閉じ込める)
-- macOS はスコープ外
+- **live と export は同じ render 関数**: `graph/execute.rs::render_master_buffer` =
+  clear → pass-1 dispatch → schedule 実行 → master fx chain → master gain。
+  WAV export / bounce も同経路 (master limiter がエクスポートに乗らない、という
+  非対称は構造的に起きない)。metronome / panic declick だけが live 側。
+- **値更新 vs topology の分離**: volume / pan / send gain / BPM scrub 等は song
+  snapshot の clone-mutate-store のみ (graph 再 compile なし)。topology 変更
+  (LoadSong) の再 compile では `Schedule::adopt_state_from` が PDC DelayLine
+  (`DelayKey` = track_id) と follower env (`ModSource.id`) を旧 schedule から
+  install 時 `mem::swap` で移送 (alloc/free 0) — fader drag 中に補償パスが
+  ミュートされたり follower が段差を出したりしない。
+- PDC は plugin 報告 latency + **leaf 宛 sidechain tap の 1-buffer lag** を
+  `input_delay_per_track` に算入して全経路の位相を揃える。
+- モジュール: `engine.rs` (状態 + transport 駆動) / `graph/{compile,schedule,execute,
+  delay_line,port_buffer,follower}.rs` / `mixer.rs` (strip 適用) / `metronome.rs` /
+  `sequencer.rs` / `export.rs` / `audio_worker.rs` / `audio_clip_renderer.rs`。
+- Song は `RtBundle` (song + tempo_map + schedule) として単一経路で publish され、
+  RT は schedule と同一の song snapshot を読む。playhead は audio thread 単独 writer。
+  WAV decode は専用 `audio-decode` スレッド (RT はディスクに触れない)。
 
-### プロセス寿命管理
+### daw_plugin_host
 
-- daw_gui が `windows` crate の `CreateJobObjectW` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` で Job Object を作成
-- 子プロセスを spawn 直後に `AssignProcessToJobObject` で紐付ける
-- daw_gui が正常終了・panic・強制終了のいずれでも、OS が handle を閉じた時点で子プロセスが kill される（ゾンビ防止）
+- **`HashMap<u64 /*device_id*/, InstanceRecord>` 一本** (plugin / editor window /
+  track_id / loaded meta / shmem を 1 record に集約)。順序概念なし。
+- **split-half**: `LoadedPlugin` (main-thread half: lifecycle / GUI / state / ARA /
+  param) と `AudioProcessorHalf` (process バッファ・event scratch を所有) を型で分離。
+  worker registry には audio half のみ渡り、main の `&mut` と worker の `&mut` が
+  同一オブジェクトに並存する aliasing は構造的に消滅。quiesce
+  (detach → DispatchCounter 待ち → mutate → republish) は維持。
+- **ProcessScaffold** (`process_scaffold.rs`): 入力/aux copy・bus assembly・
+  transport 導出 (非有限 sanitize 込み)・modulation folding を CLAP/VST3 で共有。
+  backend は「scaffold → FFI 型への写像 + 呼び出し」だけ。ARA lifecycle
+  (deactivate → set_clips → restore → reactivate) も共有実装。
+- **CLAP host extension は VST3 と対称**: `clap_host_latency.changed` → 再 query +
+  `PluginLatencyChanged`、`clap_host_params.rescan` → param list 再送、
+  `request_restart` → quiesced reinit (per-plugin **cooldown** 10s/3 回で
+  reinit ループを構造的に防止、VST3 restartComponent も同じ tracker)、
+  `request_callback` → plugin-main queue で `on_main_thread()`。
+- activate 失敗はゾンビ publish せず `SlotPluginLoadFailed` (generation echo)。
+  RT ログは per-entry one-shot。`ReinitAllPlugins` 完了時も latency 再 query。
+- builtin (VOICEVOX / Silence / video 系) は外部プラグインと**同じ** InstanceRecord /
+  worker / shmem / state 経路。VOICEVOX 固有 API は `as_vocal_synth()` capability
+  (`VocalSynth` trait) に分離、status 通知は `HostCallbacks` に統合。
+- スレッド: tokio (IPC) / plugin-main (Win32 pump + CLAP `[main-thread]` 直列化、
+  callback は device_id capture で `HostNotify` channel に集約) / RT worker N 本。
 
-## 技術スタック
+### daw_gui
 
-| コンポーネント | 技術 | 実装状況 |
-|---|---|---|
-| 言語 | Rust (Edition 2024) | ✅ |
-| GUI | gui_01 / daw-ui (winit 0.30 + wgpu 29 + glyphon SDF text + taffy flexbox) | ✅ immediate-mode + heavy() キャッシュ |
-| オーディオ I/O | cpal 0.15 (WASAPI 共有モード、F32) | ✅ |
-| Control plane IPC | tokio named pipe + bincode 2 | ✅ |
-| Data plane IPC | shared_memory 0.12 + windows crate (名前付きセマフォ) | ✅ |
-| CLAP ホスト | clap-sys 0.5 + libloading 0.8 | ✅ scan / load / activate / process / GUI embed / sidechain / PDC |
-| VST3 ホスト | vst3-sys 0.1 + libloading 0.8 | ✅ scan / load / activate / process / GUI embed / sidechain / PDC |
-| VOICEVOX 通信 | reqwest (async HTTP) | ✅ engine 自動起動 + sing/talk + WAV cache |
-| JSON シリアライズ | serde + serde_json (プロジェクトファイル) | ✅ |
-| バイナリシリアライズ | bincode 2 (IPC) | ✅ |
-| Async runtime | tokio (sync / rt-multi-thread / net / macros / io-util / process) | ✅ |
-| 文字幅計算 | unicode-width 0.2 (CJK lyric セル padding) | ✅ |
-| Lock-free 共有 | arc-swap 1 (Song を audio thread へ wait-free 配布) | ✅ |
-| MIDI 入力 | midir 0.10 | ✅ step input |
-| MIDI 出力 / 録音 / export | — | 未着手 (M2) |
-| ファイルダイアログ | rfd 0.15 | ✅ |
+- **Song ドキュメントの SSoT**。編集は `state/song_doc.rs` の `edit_song()`
+  チョークポイント一本 (song field は private): undo snapshot (gesture squash 対応) /
+  dirty (epoch 比較) / 子プロセス sync 予約を無条件で実施。export 中は編集自体を
+  拒否する (イベント whitelist は存在しない)。
+- **AppEvent は 3 分類**: `Edit(EditEvent)` / `System(SystemEvent)` (IPC event の
+  直 wrap + tick + job 完了) / `Ui(UiEvent)`。state は
+  `state/{song_doc,transport,selection,ipc,voicevox,media,recording,ui_prefs,
+  ui_ephemeral}` に分割、reducer は `handler/` 配下。
+- **sync は pull 型一本**: frame 末に `edit_epoch != last_synced_epoch` なら
+  unified sync (ports 解決 → SetProjectDir → blob-less LoadSong → vocal metadata →
+  ARA → lipsync) を 1 回。scrub の coalesce は frame flush が構造的に担う。
+- `SetSlotPlugin` は per-device generation で応答を突き合わせ、最新世代のみ受理
+  (A→B 連続差し替えの stale 応答 race を排除)。
+- GPU テクスチャ / HWND は AppData でなく runner 側 `MediaResources` が所有
+  (model は renderer 型に依存しない)。preview 合成は `PreviewCompositor`。
+- native file dialog は共通ヘルパで別スレッド + owner-modal (GUI スレッド同期禁止)。
+
+### GUI ライブラリ境界 (daw-ui)
+
+- `ui/crates/{platform,renderer,ui}` は**汎用 immediate-mode 基盤** (frame / input /
+  popup / focus / heavy キャッシュ / 汎用 widget)。DAW ドメイン知識・mirror 型・
+  翻訳 request enum を持たない。retained state は公開 API (`stateful`) で
+  アプリ側 widget からも使える。
+- **DAW 固有 widget (arrangement / piano_roll) は `daw_gui/src/widgets/`** に住み、
+  `common::model` を直接読み、`Edit<AppData>` を直接発行する (中間表現なし)。
+- undo は app 側 (song_doc) の単一系統。lib 側 history 機構は持たない。
 
 ## データモデル
 
-### 階層構造
-
 ```
-Song → Track → Clip → Row
-```
-
-Pattern / Song Order 方式は不採用。Clip ベースのタイムラインを採用する。
-
-**選定理由:**
-歌もの（VOICEVOX）ではアウフタクト（弱起）が自然に発生し、フレーズが小節境界を
-跨ぐ。Pattern の固定長区画とは根本的に相性が悪い。Clip ベースならフレーズ単位で
-自由配置でき、VOICEVOX の合成単位（1 フレーズ → 1 WAV）とも自然にマップする。
-
-### 構造定義
-
-```rust
-struct Song {
-    bpm: f32,
-    time_sig: (u8, u8),
-    tracks: Vec<Track>,
-    length_beats: f64,
-}
-
-struct Track {
-    name: String,
-    source: InstrumentSource,
-    fx_chain: Vec<PluginInstance>,
-    volume: f32,
-    pan: f32,
-    clips: Vec<Clip>,
-}
-
-enum InstrumentSource {
-    Vocal { speaker_id: u32, style_name: String },
-    Clap { path: PathBuf },
-    Vst3 { path: PathBuf },
-    BuiltinSynth,
-}
-
-struct Clip {
-    name: String,
-    start_beat: f64,    // 小数・負値 OK（アウフタクト対応）
-    length_beats: f64,
-    rows_per_beat: u16, // グリッド解像度（4 = 16分音符）
-    rows: Vec<Row>,
-}
-
-struct Row {
-    note: Option<Note>,
-    volume: Option<u8>,
-    fx: Option<(u8, u8)>,   // (command, value)
-    lyric: Option<String>,  // 1 モーラ。Vocal トラックのみ使用
-}
+Song ─ tracks: Vec<Track> ─ devices: Vec<PluginInstance>   (id: u64 安定)
+     │                    ─ clips: Vec<Clip> ── content_id ─→ Song.clip_contents
+     │                    ─ sends: Vec<Send> (id: u32 安定)
+     │                    ─ automation_lanes / mod_routings
+     │                    ─ parent_group_id (Reaper folder 流のグループ)
+     ├ clip_contents: HashMap<ContentId, ClipContent>       (linked clip 共有)
+     │    ClipContent = Midi(notes: id 付き) | Audio(events: id 付き)
+     │                | Automation(points: id 付き) | Video | Image | Text
+     ├ audio/video/image_sources (メタデータ pool、バッファは各プロセスで decode)
+     ├ master_fx_chain: Vec<PluginInstance>
+     ├ song_lanes (tempo/time-sig automation) / mod_sources / sections
+     └ 各種 stable id allocator (next_*_id、0 = 未採番 sentinel)
 ```
 
-### 設計判断
-
-- **INS 列なし**: 音源はトラックに紐付く（モダン DAW 流）
-- **Lyric 列**: Vocal トラックのみ UI 表示。データ上は全 Row に存在
-- **Clip 配置**: `start_beat` は f64、負値可（アウフタクト対応）
-- **将来拡張**: `Vec<Row>` → `Vec<Event { time_beat, ... }>` でピアノロール化
+- **Clip ベースのタイムライン** (Pattern 不採用): VOICEVOX のアウフタクト・フレーズ
+  単位合成と自然にマップする。`start_beat` は f64・負値可。
+- 永続化: `.daw` JSON (serde) アトミック書き込み、`CURRENT_VERSION` = 29。
+  旧版は deserialize 専用 legacy field + `ensure_ids` (採番 + positional → id 写像) +
+  JSON 前処理 migration で forward-load する。blob (plugin state / ARA archive) は
+  ドキュメントには base64 で残る (wire にだけ載らない)。
+- IPC は bincode (`Encode/Decode` derive + PluginInstance のみ手書き)。
 
 ## VOICEVOX 統合
 
-### 方式
-
-HTTP API。DAW が VOICEVOX Engine をサブプロセスとして自動起動し、
-`http://localhost:50021` を叩く。事前合成 + キャッシュ方式。
-
-### API フロー
-
-**歌唱 (Sing):**
-1. Clip の Row データから JSON を構築
-   ```json
-   {"notes": [{"id": "note1", "key": 60, "frame_length": 93, "lyric": "こ"}, ...]}
-   ```
-2. `POST /sing_frame_audio_query?speaker=<query_speaker_id>` → audio query JSON
-3. `outputSamplingRate` を 48000 に書き換え
-4. `POST /frame_synthesis?speaker=<singer_id>` → WAV バイナリ
-
-**トーク (Talk):**
-1. `POST /audio_query?speaker=<id>&text=<url_encoded>` → audio query JSON
-2. `POST /synthesis?speaker=<id>` → WAV バイナリ
-
-### 定数
-
-| 項目 | 値 |
-|---|---|
-| Engine URL | `http://localhost:50021` |
-| フレームレート | 93.75 Hz (24000 / 256) |
-| REST_FRAMES | 10 (前後パディング) |
-| QUERY_SPEAKER | 6000 (波音リツ、クエリ生成用固定) |
-| OUTPUT_SAMPLE_RATE | 48000 |
-
-### 歌詞分割
-
-小書きかな（ぁぃぅぇぉゃゅょっ等）は直前の文字と結合して 1 モーラ化。
-
-### 合成タイミング
-
-Clip 内容変更時に VOICEVOX Engine で合成 → WAV をキャッシュ（Clip ID + content hash）
-→ 再生時は Audio Engine がキャッシュ済み WAV を読み出す。
-
-## UI 設計
-
-### ビュー構成
-
-1. **Arrangement View** — タイムライン × トラック。Clip を配置・移動・リサイズ
-2. **Clip Editor (Tracker View)** — 選択した Clip の中身をトラッカー UI で編集
-3. **Track Inspector** — トラックの音源・FX チェイン設定
-
-### キー操作
-
-カーソル移動: `h` (左) `j` (下) `k` (上) `l` (右)
-
-### Arrangement View
-
-```
-       1   2   3   4   5   6   7   8   9
-TRK1 ▶ │[こんにちは    ]    │  ┌[━さようなら────]
-TRK2   │[━━━━━━━ Bass Loop ━━━━━━━━━━━━━━━━]
-TRK3   │[Drum A  ][Drum A  ][Drum B  ]
-```
-
-### Clip Editor (Tracker View)
-
-```
-TRK1 Clip "こんにちは"   Start:bar1.0  Len:4bar
- R# │NOT VOL FX  LYR
- ───┼────────────────
- 00 │C-4 40  --- こ
- 01 │--- --  --- -
- 02 │D-4 40  --- ん
- 03 │--- --  --- -
- 04 │E-4 3E  --- に
- 05 │--- --  --- -
->06 │D-4 40  --- ち       ← カーソル行
- 07 │--- --  --- -
- 08 │C-4 40  A08 は
- 09 │--- --  --- ー       ← 母音延長
-```
-
-### Track Inspector
-
-```
-TRK1 ▶ Vocal
-  Source: VOICEVOX  Speaker: ずんだもん  Style: あまあま
-  FX: [EQ] > [Reverb]
-TRK2   Bass
-  Source: CLAP  Serum.clap
-  FX: [Compressor]
-```
-
-## ワークスペース構成
-
-```
-daw_01/
-├── Cargo.toml              # workspace root
-├── CLAUDE.md
-├── DESIGN.md
-├── Makefile
-├── common/                 # 共有型・IPC プロトコル・shared memory
-│   └── src/
-│       ├── lib.rs
-│       ├── protocol.rs     # メッセージ enum (bincode 直列化)
-│       ├── shmem.rs        # shared memory 抽象化
-│       ├── audio_buffer.rs # 固定サイズオーディオバッファ
-│       ├── model.rs        # Song / Track / Clip / Row
-│       └── event.rs        # Note / CC / Automation イベント
-├── daw_gui/                # GUI プロセス (gui_01 / daw-ui)
-│   └── src/
-│       ├── main.rs
-│       ├── app.rs          # アプリケーション状態
-│       ├── command/        # ユーザーアクション
-│       ├── communicator.rs # Audio/Plugin プロセスとの通信
-│       └── view/           # ビュー (Arrangement, PianoRoll, Mixer, Inspector, etc.)
-├── daw_audio/              # Audio Engine プロセス
-│   └── src/
-│       ├── main.rs
-│       ├── engine.rs       # オーディオコールバック・シーケンサー
-│       ├── mixer.rs        # ミキシング
-│       ├── voicevox.rs     # VOICEVOX HTTP クライアント + WAV キャッシュ
-│       └── communicator.rs # GUI/Plugin プロセスとの通信
-├── daw_plugin_host/        # Plugin Host プロセス
-│   └── src/
-│       ├── main.rs
-│       ├── host.rs         # CLAP/VST3 ホスト実装
-│       ├── clap_manager.rs # CLAP スキャン・ロード
-│       ├── plugin.rs       # プラグインインスタンス管理
-│       └── communicator.rs # Audio プロセスとの通信
-```
-
-## CLAP 統合
-
-`daw_plugin_host/src/{scan,clap_host,plugin}.rs`。
-
-### スキャン
-- 起動時に `%COMMONPROGRAMFILES%\CLAP` (e.g. `C:\Program Files\Common Files\CLAP`) 直下の `.clap` を列挙
-- 先頭の「`features` に `"instrument"` を含む」プラグインを自動選択
-- 無ければ最初にロードできるものに fallback
-- 開発中は `DAW_CLAP_PATH` 環境変数で特定の `.clap` を指定できる
-
-### ライフサイクル
-CLAP 仕様のスレッド規約（`@[main-thread]` / `@[audio-thread]`）に従う:
-
-```
-[main-thread]
-Library::new(.clap) → clap_entry → entry.init(path)
-  → factory.get_plugin_descriptor × n (ログ)
-  → factory.create_plugin(host, id) → plugin.init
-  → plugin.get_extension(CLAP_EXT_AUDIO_PORTS / CLAP_EXT_NOTE_PORTS)
-  → plugin.activate(48000, 64, 1024)
-[audio-thread] (専用 std::thread)
-  → plugin.start_processing → process loop → plugin.stop_processing
-[main-thread]
-  → plugin.deactivate → plugin.destroy → entry.deinit → Library drop
-```
-
-### audio thread のループ
-
-```
-request_sem.wait_timeout_ms(100)
-  ↓
-(note_state が変わっていたら) NoteTransition を TimedNoteEvent に変換
-  ↓
-Song の Track 0 / Clip 0 の rows を walk し、[playhead, playhead+frames) の
-各 row から TimedNoteEvent を生成（モノフォニック再トリガー: 新 NoteOn は
-active_notes を先に off → 新 on）
-  ↓
-plugin.process(frames, &events) → planar f32 出力
-  ↓
-先頭 2 ch を interleaved に変換して AudioBridge.samples に書き込み
-  ↓
-ready_sem.release()
-```
-
-### RT 安全性
-- `pending_events: Vec<clap_event_note>` は capacity 64 で activate 時に事前確保、push のみ
-- `output_buffers: Vec<Vec<f32>>` と `output_ptrs: Vec<*mut f32>` も activate 時確保
-- 入力イベント用 vtable は process 毎にスタック上で構築、ctx は `&self.pending_events` を指す
-- 出力イベント vtable は `const` static（現状は try_push で捨てる）
-
-### Song 再生
-- `Play` 時に daw_gui が `LoadSong(Song)` と `Play` を送る
-- plugin_host の recv_loop が `ArcSwapOption<Song>` に swap、audio thread は `load` で wait-free に取得
-- `samples_per_row = sample_rate * 60 / bpm / rows_per_beat` で行 → サンプル変換
-- clip 終端 (`start_beat + length_beats`) を越えたら自動停止 + 残留ノートを off
-
-### daw_plugin_host のスレッド構成
-
-CLAP `@[main-thread]` 要件 + Windows メッセージポンプ + tokio IPC を共存させるため、
-明示的に 3 種類のスレッドに分ける:
-
-```
-tokio main thread (IPC)       plugin-main std::thread        clap-audio std::thread
-  ├ recv pipe                   ├ CLAP lifecycle              ├ plugin.process() loop
-  ├ send ChildToMain              (load/activate/destroy)       (audio thread 専用)
-  └ select! 多重化              ├ CLAP GUI (create/show/...) 
-                                ├ Win32 メッセージポンプ
-                                │  (GetMessageW で待機)
-                                └ コマンド受信
-                                   (mpsc + PostThreadMessageW)
-```
-
-- **plugin-main** は `std::thread::spawn` で起動。`GetCurrentThreadId` を起動時に親に返す。
-  tokio 側からコマンドを送るときは `mpsc::Sender` に push → `PostThreadMessageW(tid, WM_COMMAND_WAKE)`
-  で `GetMessageW` を叩き起こす
-- すべての CLAP ポインタ操作（init/load/activate/gui/destroy）はこのスレッドで直列化
-- audio thread は Plugin を `Box<Plugin>` + 生ポインタで共有（main から GUI を触る間も
-  audio が process() を回せるよう、CLAP 仕様の状態分離を信じる）
-- tokio runtime は IPC のみ。`tokio::select!` で MainToChild read と ChildToMain write を
-  1 本のパイプ上で多重化し、専用 send task を持たない
-
-### 双方向 IPC プロトコル
-
-- `MainToChild`: DAW → Plugin host（再生 / ロード / GUI 操作指示）
-- `ChildToMain`: Plugin host → DAW（ハンドシェイクの Hello と、プラグイン GUI コールバック
-  `GuiOpened` / `GuiRequestResize` / `GuiClosed`）
-- daw_gui 側は `tokio::sync::mpsc::UnboundedReceiver<ChildToMain>` を `run_gui` に渡し、
-  `cx.spawn` で `blocking_recv` ループを回して AppEvent に変換
-- daw_plugin_host 側は `clap_host_gui.request_resize` / `closed` 等の CLAP コールバックが
-  任意のスレッドから呼ばれても `tmpsc::UnboundedSender` へ push できるよう、`Arc<dyn Fn + Send + Sync>`
-  で callback クロージャを保持
-
-### CLAP GUI (Embedded)
-
-`daw_gui/src/view/plugin_embed.rs` + `daw_plugin_host/src/plugin.rs` の `gui_*` メソッド。
-
-フロー:
-```
-[daw_gui]                                    [daw_plugin_host: plugin-main]
-user press "Open Plugin GUI"                 
-  → PluginHostWindow::create()                          
-    (native Win32 top-level WS_OVERLAPPEDWINDOW)
-  → MainToChild::OpenGuiEmbedded { host_hwnd: u64 } ──▶ recv_loop → PluginCommand::OpenGuiEmbedded
-                                                        │
-                                                        ▼
-                                              plugin.gui_create_embedded()
-                                              plugin.gui_set_scale(1.0)
-                                              plugin.gui_can_resize()
-                                              plugin.gui_get_size()
-                                              plugin.gui_set_parent_hwnd(host_hwnd)
-                                              pump_pending_messages()
-                                              plugin.gui_show()
-                                              ▼
-on_gui_opened(w,h) ◀── ChildToMain::GuiOpened { width, height }
-  → container.set_client_size(w,h)
-
-(plugin 内部で resize 必要時)
-                                              host.request_resize(w,h) called by plugin
-                                              ▼
-on_gui_request_resize(w,h) ◀── ChildToMain::GuiRequestResize
-  → container.set_client_size(w,h)
-  → MainToChild::ResizeGui { w, h } ──────▶ plugin.gui_set_size(w,h)
-
-(✕ ボタン)
-WNDPROC WM_CLOSE → hide + close_requested flag
-  → 30Hz tick が flag を検知
-  → MainToChild::CloseGui ────────────────▶ plugin.gui_hide + plugin.gui_destroy
-                                              ChildToMain::GuiClosed
-on_gui_closed ◀─────────────────────────────
-  → container を Drop（DestroyWindow）
-```
-
-注意点:
-- `gui.set_size` は「前回セッション復元時のみ」呼ぶ（CLAP spec）。初回 open では `get_size` だけ
-- `gui.show` が `false` を返しても create + set_parent が成功していれば GUI は動いている可能性あり
-  (VCV Rack)。即 destroy せず警告ログのみ
-- `set_parent` と `show` の間に `PeekMessage` ポンプを挟むとプラグインの遅延初期化が進む
-
-## GUI (gui_01 / daw-ui)
-
-### レイアウト (daw_gui/src/view/root.rs)
-
-`view/runner.rs::Runner` が winit イベントループを駆動し、毎フレーム
-`build_root(app, ui, screen)` を呼ぶ。`build_root` は画面を以下の領域に分割
-して各 sub view (`view/{transport,track_inspector,arrangement_view,bottom_panel,status_bar}.rs`)
-を呼ぶ:
-
-```
-┌─────────────────────────────────────────────────┐
-│ Transport (44px)  Play / Loop / Synth / Master  │
-├──────┬──────────────────────────────────────────┤
-│ Insp │ Arrangement (track headers + canvas)     │
-│ 280  │                                          │
-├──────┴──────────────────────────────────────────┤
-│ Bottom panel: Mixer or Piano Roll (240px)       │
-├─────────────────────────────────────────────────┤
-│ Status bar (24px)                               │
-└─────────────────────────────────────────────────┘
-```
-
-Modal: plugin picker は `app.is_plugin_picker_open == true` のとき `view/plugin_picker.rs`
-を最後に呼んで半透明 overlay + 中央パネルとして上に重ねる。
-
-### 状態 (daw_gui/src/app.rs の AppData)
-
-plain mutable struct。reactive wrapper (Signal/Memo) は使わない:
-- `song: Song`, `file_path: Option<PathBuf>`
-- `selected_track: u32`, `selected_clip: Option<ClipRef>`, `selected_clips: Vec<ClipRef>`,
-  `selected_notes: Vec<u32>`
-- view state: `bottom_panel`, `arrange_zoom_x`, `arrange_scroll_beat`,
-  `pianoroll_zoom_x/y`, `pianoroll_scroll_beat`, `pianoroll_top_pitch`
-- 再生 / メータ: `is_playing`, `is_looping`, `playhead_beat`, `master_gain`,
-  `peak_l/r_norm`, `track_peak_display`
-- IPC: `audio_tx`, `plugin_tx`, `event_proxy: EventLoopProxy<AppEvent>`
-- view-local interaction: `last_click: Option<(Instant, x, y)>` (ダブルクリック検出)
-
-派生 (`Vec<TrackHeader>`, `Vec<ClipBox>`, `Vec<NoteBox>`, `Vec<TrackMixEntry>`,
-`Vec<ChainEntry>`, `String` lyric 等) は method として毎フレーム計算
-(`app.track_headers()`, `app.clip_boxes()`, `app.note_boxes()`, `app.track_mix()`,
-`app.inspector_chain()`, `app.selected_lyric()`, `app.selected_track_label()`)。
-
-イベント処理: `pub fn handle_event(&mut self, event: AppEvent)` 一本。view からは
-`Edit::mutate(|app| app.handle_event(...))` で、background thread からは
-`event_proxy.send_event(...)` で呼ぶ。
-
-### キーバインド (sing_like_coding 準拠)
-
-| キー | 動作 |
-|---|---|
-| h / j / k / l | カーソル track±1 / row±1 |
-| Space | Play / Stop トグル |
-| Ctrl+Space | Play from cursor（将来） |
-| Ctrl+J / Ctrl+K | transpose -1 / +1 セミトーン（空セルや Off は last_note をそのまま配置） |
-| Ctrl+H / Ctrl+L | transpose -12 / +12 |
-| N | NoteOff を配置 |
-| Delete | セル clear |
-| Ctrl+N / O / S / Shift+S | New / Open / Save / Save As |
-
-## マイルストーン
-
-### M1: 使える DAW (完了)
-
-#### 基盤 (3 プロセス + IPC)
-
-- [x] 3 プロセス起動 + IPC ハンドシェイク
-- [x] Job Object によるプロセス寿命管理
-- [x] Named pipe + bincode の制御プレーン (Play / Stop / Session / LoadSong)
-- [x] Shared memory + セマフォのデータプレーン
-- [x] Audio Engine: CPAL (WASAPI) 経由でオーディオ出力
-- [x] track-parallel スレッドプール + MMCSS / `thread_check` / `assert_no_alloc` (A2)
-
-#### GUI / 編集
-
-- [x] GUI: gui_01 (daw-ui) で 5 パネルレイアウト (transport / inspector / arrangement / bottom panel / status)
-- [x] Arrangement (Bitwig 風 Clip タイムライン)
-- [x] ピアノロール (gui_01 widget、 velocity lane、 snap toolbar、 auto-fit zoom、 smart note length)
-- [x] hjkl ナビゲーション + ノート編集
-- [x] velocity / lyric / FX 編集 (lyric は piano_roll inline 編集)
-- [x] ノートのコピー/ペースト + 量子化
-- [x] 任意トラック削除 + 並び替え (▲▼✕ ボタン)
-- [x] Undo / Redo (Ctrl+Z / Ctrl+Shift+Z、 plugin instance 同期込み)
-- [x] BPM / time_sig 変更 UI (A6)
-- [x] Track Inspector (cursor_track 連動、 ホットスワップ、 Sidechain dropdown)
-- [x] Master fader + L/R peak meter
-- [x] ループ再生 (`P` キー、 clip 範囲を wrap)
-- [x] 再生位置ハイライト
-
-#### Plugin Host
-
-- [x] CLAP: scan / load / activate / process / GUI embed (Win32 host-owned)
-- [x] VST3: scan / load / activate / process / GUI embed (`IPlugView` + `IPlugFrame::resizeView`)
-- [x] Plugin GUI lifecycle (Open / Close / Resize 通知 IPC)
-- [x] PDC (Plugin Delay Compensation、 自動全補償、 CLAP / VST3 両対応)
-- [x] サイドチェイン routing (track → 任意 plugin の aux input port、 実 VST3 (MCompressor) で integration test)
-- [x] パラアウト routing (plugin の aux output port → 任意 track / group / Master)
-- [x] グループトラック (Reaper folder 流、 ネスト無制限、 group fx)
-- [x] plugin worker pool UAF 対策 (`DispatchCounter` + `WorkerPool::quiesce`)
-- [x] plugin load 失敗通知 (`SlotPluginLoadFailed`、 A8、 88bf3dc)
-
-#### Song 永続化
-
-- [x] プロジェクト保存・読込 (`.daw` JSON アトミック書き込み、 v5)
-- [x] オートセーブ + 起動時復元 modal (A4、 sidecar / recovery_dir 両対応)
-- [x] WAV 書き出し (A3、 freewheel offline render + `clap_plugin_render` ext)
-
-#### VOICEVOX
-
-- [x] HTTP client + engine 自動起動 + Job Object 紐付け (A1 Phase A)
-- [x] per-track speaker 選択 UI + `/singers` fetch (A1 Phase B)
-- [x] WAV cache (A1 Phase C)
-- [x] 拗音結合 (`split_into_morae`、 A1 Phase D)
-- [x] piano_roll inline 歌詞編集 (`L` キー、 A5)
-
-#### MIDI
-
-- [x] MIDI step input (midir)
-
-### M2 候補
-
-#### オートメーション + 表現力
-
-- [x] パラメータオートメーション (lane 表示 + plugin パラメータ送信。`automation_lanes` /
-  `fill_pd_param_events` で PluginParam を ParamValue event 化して送信)
-- [x] tempo / time_sig オートメーション (`song_lanes` の `SongTempo` /
-  `SongTimeSigNumerator`、`evaluate_song_tempo` を per-buffer 評価)
-- [x] CLAP `clap_event_transport_t` / VST3 `processContext` で transport / tempo を plugin に通知
-  (tempo / time_sig / song position (拍は tempo automation 積分済) / bar position /
-  cycle 範囲 / playing・looping flag。daw_audio→ProcessData→host で配信)
-- [ ] VST3 `IMidiMapping` (MIDI controller → plugin パラメータ)
-- [ ] VST3 `IComponent::setIoMode(kOfflineProcessing)` (export 高品質モード)
-
-#### 録音
-
-- [ ] オーディオ録音 + オーディオクリップ
-- [ ] MIDI 録音 + export
-- [ ] メトロノーム / count-in
-
-#### 移植
-
-- [ ] Linux 対応 (CPAL ALSA、 X11 / Wayland window、 CLAP `gtk` embed)
+HTTP API (`http://localhost:50021`、engine は自動起動 + Job Object 紐付け)。
+合成は **plugin_host 内の builtin instrument** が実行する (歌唱 = per-clip 声、
+talk = Text clip 由来の読み上げ)。daw_gui は note/talk metadata を
+`SetBuiltinPluginNoteMetadata { device_id }` で flush し、builtin が非同期合成 +
+WAV cache → RT process() でキャッシュ済み音声を鳴らす。字幕は video 系 builtin
+device が gate する。歌唱 wav 先頭の leading rest 分は配置側で補正する。
+
+## 検証
+
+- `make test` (テスト保有 package のみ) / `make clippy` / `make check`
+- **`make arch-lint`**: アーキテクチャ不変条件 (CLAUDE.md 参照) の機械検査
+- `daw_gui --smoke-test <fixture.mp4>`: video preview の visual regression
+  (build/test/clippy をすり抜ける描画破壊を pixel capture で検出)
+- `daw_gui --script <js>` (feature `script`): headless 自動テスト
+  (loadSongFile / play / stop / reinitForExport / exportWavRange)
 
 ## 参照
 
 | プロジェクト | 参考ポイント |
 |---|---|
-| sing_like_coding (自作前作) | IPC, CLAP ホスト, オーディオエンジン, コマンドパターン |
+| sing_like_coding (自作前作) | IPC, CLAP ホスト, オーディオエンジンの原型 (プロト品質 — 構造のみ参考) |
 | REAPER VOICEVOX スクリプト (自作) | VOICEVOX API フロー, 歌詞分割, 自動起動 |
-| [Renoise](https://www.renoise.com/) | トラッカー UI, オートメーション |
 | [clap-host (free-audio)](https://github.com/free-audio/clap-host) | CLAP ホストリファレンス (C++) |
-| [clack](https://github.com/prokopyl/clack) | Rust 製 CLAP ライブラリ |
+| [clack](https://github.com/prokopyl/clack) | Rust 製 CLAP ライブラリ (split-half の先例) |
 | [Meadowlark](https://github.com/MeadowlarkDAW/Meadowlark) | Rust 製 DAW, RT オーディオ |
 | [nih-plug](https://github.com/robbert-vdh/nih-plug) | Rust 製プラグインフレームワーク |
+| Ardour / REAPER / Bitwig manual | DAW 挙動の一次情報 (export freewheel, PDC, folder track, automation) |

@@ -111,6 +111,12 @@ test: build
 clippy:
 	cargo clippy --workspace -- -D warnings
 
+# アーキテクチャ不変条件の機械検査 (CLAUDE.md「アーキテクチャ不変条件」/
+# docs/plan_arch_refactor.md §11)。違反は列挙のみ (exit 0)。
+# CI / commit ゲートでは ARCH_LINT_STRICT=1 を付ける。
+arch-lint:
+	/usr/bin/bash scripts/arch_lint.sh
+
 check: fetch-ffmpeg
 	cargo check --workspace
 

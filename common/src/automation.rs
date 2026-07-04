@@ -476,6 +476,7 @@ pub fn thin_collinear_and_insert(
         }
     }
     let new_point = crate::model::AutomationPoint {
+        id: 0,
         time_beat,
         value: plain_value,
         curve: crate::model::AutomationCurve::Linear,
@@ -581,6 +582,7 @@ mod tests {
 
     fn pt(t: f64, v: f64, curve: AutomationCurve) -> AutomationPoint {
         AutomationPoint {
+            id: 0,
             time_beat: t,
             value: v,
             curve,
@@ -597,6 +599,7 @@ mod tests {
     #[test]
     fn single_point_returns_constant() {
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![pt(2.0, 0.42, AutomationCurve::Linear)],
         };
         assert_eq!(evaluate_clip(&c, 0.0), 0.42);
@@ -607,6 +610,7 @@ mod tests {
     #[test]
     fn linear_interpolates_midpoint() {
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![
                 pt(0.0, 0.0, AutomationCurve::Linear),
                 pt(4.0, 1.0, AutomationCurve::Linear),
@@ -659,8 +663,9 @@ mod tests {
         // placeholder でなく実 min/max で affine 正規化される (range が渡された
         // とき)。audio engine 経路 (range = None) と非 PluginParam target は不変。
         let target = AutomationTarget::PluginParam {
-            device_index: 0,
+            device_id: 0,
             param_id: 7,
+            legacy_device_index: None,
             legacy_slot: None,
         };
         let range = Some((20.0_f64, 20_000.0_f64));
@@ -715,6 +720,7 @@ mod tests {
     #[test]
     fn before_first_clamps_to_first_value() {
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![
                 pt(2.0, 0.5, AutomationCurve::Linear),
                 pt(4.0, 1.0, AutomationCurve::Linear),
@@ -727,6 +733,7 @@ mod tests {
     #[test]
     fn after_last_clamps_to_last_value() {
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![
                 pt(0.0, 0.0, AutomationCurve::Linear),
                 pt(4.0, 1.0, AutomationCurve::Linear),
@@ -742,6 +749,7 @@ mod tests {
         // jumps. Inside the segment we should still see the previous
         // value (a), and the next segment starts from b at t = next.
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![
                 pt(0.0, 0.2, AutomationCurve::Linear),
                 pt(4.0, 0.8, AutomationCurve::Hold),
@@ -759,6 +767,7 @@ mod tests {
         // (SSoT: `apply_curve` Bezier コメント参照)。 数 sample 取って
         // linear と一致を確認。
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![
                 pt(0.0, 0.0, AutomationCurve::Linear),
                 pt(4.0, 1.0, AutomationCurve::Bezier { tension: 0.0 }),
@@ -779,6 +788,7 @@ mod tests {
     fn bezier_endpoints_exact_for_all_tensions() {
         for tension in [-1.0, -0.5, 0.0, 0.5, 1.0] {
             let c = AutomationContent {
+                next_point_id: 0,
                 points: vec![
                     pt(0.0, 0.0, AutomationCurve::Linear),
                     pt(4.0, 1.0, AutomationCurve::Bezier { tension }),
@@ -802,6 +812,7 @@ mod tests {
         // **小さい** (= 前半が緩い、 S 字の凹み)、 three-quarter 点 (u=0.75)
         // は linear (0.75) より **大きい**。
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![
                 pt(0.0, 0.0, AutomationCurve::Linear),
                 pt(4.0, 1.0, AutomationCurve::Bezier { tension: 1.0 }),
@@ -827,6 +838,7 @@ mod tests {
         // 中点で対称、 quarter 点は linear より **大きい**、 3/4 点は
         // linear より **小さい**。
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![
                 pt(0.0, 0.0, AutomationCurve::Linear),
                 pt(4.0, 1.0, AutomationCurve::Bezier { tension: -1.0 }),
@@ -843,6 +855,7 @@ mod tests {
     #[test]
     fn exponential_bend_zero_is_linear() {
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![
                 pt(0.0, 0.0, AutomationCurve::Linear),
                 pt(4.0, 1.0, AutomationCurve::Exponential { bend: 0.0 }),
@@ -856,6 +869,7 @@ mod tests {
     #[test]
     fn exponential_bend_one_is_quadratic_ease_in() {
         let c = AutomationContent {
+            next_point_id: 0,
             points: vec![
                 pt(0.0, 0.0, AutomationCurve::Linear),
                 pt(4.0, 1.0, AutomationCurve::Exponential { bend: 1.0 }),
@@ -902,6 +916,7 @@ mod tests {
         store.insert(
             cid,
             ClipContent::Automation(AutomationContent {
+                next_point_id: 0,
                 points: vec![
                     pt(0.0, 0.0, AutomationCurve::Linear),
                     pt(4.0, 1.0, AutomationCurve::Linear),
@@ -1100,13 +1115,16 @@ mod tests {
         song.clip_contents.insert(
             cid,
             ClipContent::Automation(AutomationContent {
+                next_point_id: 0,
                 points: vec![
                     AutomationPoint {
+                        id: 0,
                         time_beat: 0.0,
                         value: start_value,
                         curve: AutomationCurve::Linear,
                     },
                     AutomationPoint {
+                        id: 0,
                         time_beat: clip_length,
                         value: end_value,
                         curve: AutomationCurve::Linear,
@@ -1233,13 +1251,16 @@ mod tests {
         song.clip_contents.insert(
             cid,
             ClipContent::Automation(AutomationContent {
+                next_point_id: 0,
                 points: vec![
                     AutomationPoint {
+                        id: 0,
                         time_beat: 0.0,
                         value: 60.0,
                         curve: AutomationCurve::Linear,
                     },
                     AutomationPoint {
+                        id: 0,
                         time_beat: 4.0,
                         value: 180.0,
                         curve: AutomationCurve::Bezier { tension: 0.5 },

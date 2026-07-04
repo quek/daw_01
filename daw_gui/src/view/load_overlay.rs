@@ -22,10 +22,10 @@ const SAVE_LABEL: &str = "\u{4fdd}\u{5b58}\u{4e2d}\u{2026}"; // 保存中…
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     // 進捗 (determinate: ロード / プラグイン走査) を優先。 無ければ非同期保存
     // (indeterminate)。 ラベルは `load_progress_label` が文脈別に持つ。
-    if let Some((done, total)) = app.load_progress {
+    if let Some((done, total)) = app.media.load_progress {
         if total > 0 {
             let pct = (done as f32 / total as f32).clamp(0.0, 1.0);
-            let label = format!("{}  {done}/{total}", app.load_progress_label);
+            let label = format!("{}  {done}/{total}", app.media.load_progress_label);
             draw_overlay(ui, screen, &label, Some(pct));
         }
     } else if app.is_async_save_pending() {

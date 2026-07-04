@@ -69,15 +69,11 @@ fn clamp_dim(v: u32) -> i32 {
 
 /// RAII wrapper for a plugin-host-owned editor container window. Created on
 /// the plugin-main thread; never crosses threads.
+///
+/// v29: 所属は `InstanceRecord.editor` (device_id keyed の単一 map) が持つ
+/// ので、旧 `plugin_id` フィールドと述語 matching は不要になった。
 pub struct EditorWindow {
     hwnd: HWND,
-    /// The session-stable plugin id this editor belongs to. The `editor_windows`
-    /// map is keyed by `(track, device_index)` for open/close/resize, but the
-    /// index can SHIFT while the editor is open (removing a lower-index device,
-    /// or a chain reorder). Plugin removal therefore matches by this stable id
-    /// (which never shifts) so a removed plugin's editor is always torn down,
-    /// not orphaned. Mirrors `plugin_registry`'s id keying.
-    plugin_id: u32,
     /// Set by the WNDPROC when the user clicks the window's ✕. The
     /// plugin-main loop polls this each iteration and runs the close flow
     /// (`plugin.gui_destroy()` then drop this window) over IPC notify.
@@ -92,10 +88,8 @@ impl EditorWindow {
     /// Create a standalone top-level container window with a `width × height`
     /// client area. **Must be called on the plugin-main thread** (the one
     /// running the `GetMessageW` pump) so its window messages land on that
-    /// thread's queue. The window has no owner (see module docs). `plugin_id`
-    /// is the stable id used to match this editor on plugin removal.
+    /// thread's queue. The window has no owner (see module docs).
     pub fn create(
-        plugin_id: u32,
         width: u32,
         height: u32,
         title: &str,
@@ -145,14 +139,8 @@ impl EditorWindow {
         }
         Ok(Self {
             hwnd,
-            plugin_id,
             close_requested,
         })
-    }
-
-    /// The stable plugin id this editor hosts (used to match on removal).
-    pub fn plugin_id(&self) -> u32 {
-        self.plugin_id
     }
 
     pub fn hwnd_u64(&self) -> u64 {

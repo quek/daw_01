@@ -58,7 +58,7 @@ pub struct PerTrackState {
     /// Stop / clip-end) so notes don't hang.
     pub pending_offs: Vec<u8>,
     /// 鍵盤レーン click のプレビュー note (on/off)。 engine の `pump_commands`
-    /// が `AudioCommand::PreviewNote*` を受けてここに積み、
+    /// が `EngineCommand::PreviewNote*` を受けてここに積み、
     /// `process_track_owned` が frame 0 で `midi_bus_a` に注入して clear する。
     /// transport に関係なく注入されるので停止中でも発音する。 `active_notes`
     /// とは独立 (= sequencer の note 追跡を汚さない)。 lifecycle は GUI 所有
@@ -332,6 +332,7 @@ mod tests {
             content_id,
             ClipContent::Midi(MidiContent {
                 notes: vec![Note {
+                    id: 1,
                     start_beat,
                     duration_beats,
                     pitch,
@@ -339,6 +340,7 @@ mod tests {
                     lyric: None,
                     muted: false,
                 }],
+                next_note_id: 2,
             }),
         );
         song.tracks.push(track(|t| {
@@ -416,6 +418,7 @@ mod tests {
             // idx 0 = mute、 idx 1 = 鳴る (pitch 64)。
             m.notes[0].muted = true;
             m.notes.push(Note {
+                id: 2,
                 start_beat: 0.0,
                 duration_beats: 1.0,
                 pitch: 64,
@@ -509,6 +512,7 @@ mod tests {
             .notes_mut()
             .expect("Midi variant")
             .push(Note {
+                id: 2,
                 start_beat: 0.0,
                 duration_beats: 1.0,
                 pitch: 64,
@@ -632,6 +636,7 @@ mod tests {
             ClipContent::Midi(MidiContent {
                 notes: vec![
                     Note {
+                        id: 1,
                         start_beat: 0.0,
                         duration_beats: 1.0,
                         pitch: 60,
@@ -640,6 +645,7 @@ mod tests {
                         muted: false,
                     },
                     Note {
+                        id: 2,
                         start_beat: 1.0,
                         duration_beats: 1.0,
                         pitch: 60,
@@ -648,6 +654,7 @@ mod tests {
                         muted: false,
                     },
                 ],
+                next_note_id: 3,
             }),
         );
         song.tracks.push(track(|t| {

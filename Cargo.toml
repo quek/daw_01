@@ -48,7 +48,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # 固定要求しており、ico 自身の Cargo.toml 由来で workspace.dependencies からは制御できない。
 # 統一後も ico 経由の png 0.17.16 は1個だけ残る (影響は縮小のみ、完全ゼロ化ではない)。
 png = "0.18"
-cpal = "0.15"
+# 0.17: 0.15.3 は WASAPI callback thread の priority boost が壊れている
+# (thread id を HANDLE として SetThreadPriority に渡し必ず失敗・握り潰し)。
+# 0.17 は audio_thread_priority で正式対応 (docs/plan_arch_refactor.md §5)。
+cpal = "0.17"
 libloading = "0.8"
 midir = "0.10"
 midly = "0.5"
