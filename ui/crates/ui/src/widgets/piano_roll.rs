@@ -461,13 +461,13 @@ pub enum PianoRollEditRequest {
     /// release frame では emit しない (drag 中の最後の値が確定値、 release 専用 commit は無し)。 同
     /// frame 内で同値を 2 回送らないよう session 側で `last_emitted_beat` を保持。
     /// **snap 適用済 + `0.0` 以上に clamp** (`view.snap.snap_beat(raw, alt, zoom)`)。
-    /// arrangement `ArrangementEditRequest::SetPlayheadBeat` と完全同形。
+    /// arrangement の SetPlayheadBeat seek と完全同形。
     SetPlayheadBeat(f64),
     /// (M14 Phase 69 / daw_01 #041) ruler 上 Shift + drag による loop range edit 要求。
     /// release frame で 1 度だけ発火 (commit-by-release pattern)、 drag 中は overlay 描画のみ。
     /// `(start, end)` は **snap 適用済**、 `compute_loop_drag_endpoints` で overlay と同一値を
     /// 計算 (「release で grid に飛ぶ」 不整合を構造的に回避)。
-    /// arrangement `ArrangementEditRequest::SetLoopRange` と完全同形。
+    /// arrangement の SetLoopRange と完全同形。
     SetLoopRange { start: f64, end: f64 },
     /// edge auto-scroll による横スクロール要求 (delta、拍)。drag 中にポインタが grid 左右端の
     /// hot-zone に入った frame で発火する。caller は `pianoroll_scroll_beat` に delta を加算し `>= 0` に

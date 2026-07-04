@@ -1,0 +1,2003 @@
+//! S4b: arrangement widget の pure-fn 単体テスト (geometry / hit-test / draw primitive helpers)。
+//! private fn に触るため親モジュールの submodule ファイルとして分離 (`use super::*`)。
+
+    use super::*;
+    // S4b: reorder ヘルパは daw-ui-core の reorderable_list へ移設したので import 経由で参照。
+    use daw_ui_core::widgets::reorderable_list::{apply_reorder, compute_reorder_target_index};
+
+    fn clip(id: u32, start: f64, len: f64, name: &str) -> ClipView {
+        ClipView {
+            id,
+            start_beat: start,
+            len_beats: len,
+            name: Arc::from(name),
+            color: None,
+            share_group_color: None,
+            audio_edit: None,
+            thumbnail: None,
+            in_active_group: false,
+            muted: false,
+        }
+    }
+
+    /// M14 Phase 63k (#025): audio_edit が Some の test clip helper。
+    fn audio_clip(
+        id: u32,
+        start: f64,
+        len: f64,
+        name: &str,
+        audio: ClipViewAudioEdit,
+    ) -> ClipView {
+        ClipView {
+            id,
+            start_beat: start,
+            len_beats: len,
+            name: Arc::from(name),
+            color: None,
+            share_group_color: None,
+            audio_edit: Some(audio),
+            thumbnail: None,
+            in_active_group: false,
+            muted: false,
+        }
+    }
+
+    fn track(id: u32, name: &str, clips: Vec<ClipView>) -> ArrangementTrack {
+        ArrangementTrack {
+            id,
+            name: Arc::from(name),
+            muted: false,
+            solo: false,
+            armed: false,
+            clips,
+            volume: 1.0,
+            parent_id: None,
+            depth: 0,
+            automation_lanes_collapsed: true,
+            automation_lanes: Vec::new(),
+            collapsed: false,
+            row_h: None,
+            kind: TrackKind::Audio,
+            color: None,
+        }
+    }
+
+    fn test_view() -> ArrangementView {
+        ArrangementView {
+            start_beat: 0.0,
+            len_beats: 16.0,
+            track_top: 0.0,
+            tracks_visible: 8.0,
+            track_row_h: 32.0,
+            header_w: 0.0,
+            ruler_h: 0.0,
+            playhead_beat: None,
+            loop_range: None,
+            data_generation: 0,
+            bpm: 120.0,
+            time_sig: (4, 4),
+            // 数値検証 test は raw beat 値を期待するので明示 OFF。
+            snap: SnapConfig::OFF,
+            arranger_lane_h: 0.0,
+        }
+    }
+
+    fn test_lanes() -> Rect {
+        Rect { x: 0.0, y: 0.0, w: 640.0, h: 256.0 }
+    }
+
+    /// M14 Phase 63n-1 (#028): test 用 prefix-sum tops 生成 helper。
+    /// lane を持たない tracks (= 既存挙動) では `tops[i] = lanes_y - track_top + i * track_row_h` と等価。
+    fn make_tops(tracks: &[ArrangementTrack], lanes: Rect, view: ArrangementView) -> Vec<f32> {
+        visible_track_row_tops(tracks, lanes.y, view.track_top, view.track_row_h)
+    }
+
+    /// 簡易 tops (test_view + test_lanes と同条件で N track ぶん、 lane なし)。
+    /// `lanes_y=0, track_top=0, row_h=32` → `tops = [0.0, 32.0, 64.0, 96.0, ...]`。
+    fn legacy_tops(n: usize) -> Vec<f32> {
+        #[allow(clippy::cast_precision_loss)]
+        (0..=n).map(|i| i as f32 * 32.0).collect()
+    }
+
+    #[test]
+    fn clip_to_rect_basic_position() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let c = clip(0, 4.0, 4.0, "x");
+        // visible_idx 2 → row_top = lanes.y - track_top + 2 * track_row_h = 0 - 0 + 64 = 64
+        let r = clip_to_rect(64.0, view.track_row_h, &c, view, lanes);
+        // beat_to_px = 640/16 = 40
+        // x = 0 + 4*40 = 160, w = 4*40 = 160
+        // row_top = 64, y = 64+2 = 66, h = 32-4 = 28
+        assert!((r.x - 160.0).abs() < 1e-3);
+        assert!((r.w - 160.0).abs() < 1e-3);
+        assert!((r.y - 66.0).abs() < 1e-3);
+        assert!((r.h - 28.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn track_index_from_y_basic() {
+        // lanes_y=0, row_h=32 → y=0 → idx 0, y=32 → idx 1, y=64 → idx 2
+        let tops = legacy_tops(3);
+        assert_eq!(track_index_from_y(0.0, 0.0, &tops), Some(0));
+        assert_eq!(track_index_from_y(32.0, 0.0, &tops), Some(1));
+        assert_eq!(track_index_from_y(64.0, 0.0, &tops), Some(2));
+        // y < tops[0] = 範囲外
+        assert_eq!(track_index_from_y(-5.0, 0.0, &tops), None);
+        // y > tops[3] = 範囲外
+        assert_eq!(track_index_from_y(200.0, 0.0, &tops), None);
+    }
+
+    #[test]
+    fn track_index_from_y_with_scroll() {
+        // track_top=16 を反映した tops: y=lanes_y-16+i*32 → tops = [-16, 16, 48, 80, 112]
+        let view = ArrangementView { track_top: 16.0, ..test_view() };
+        let lanes = test_lanes();
+        let tracks: Vec<ArrangementTrack> = (0..4).map(|i| track(i, "t", vec![])).collect();
+        let tops = make_tops(&tracks, lanes, view);
+        // y=10 → -16 <= 10 < 16 → idx 0、 y=26 → 16 <= 26 < 48 → idx 1
+        assert_eq!(track_index_from_y(10.0, 0.0, &tops), Some(0));
+        assert_eq!(track_index_from_y(26.0, 0.0, &tops), Some(1));
+    }
+
+    #[test]
+    fn visible_track_row_tops_with_no_lanes_matches_legacy_layout() {
+        // M14 Phase 63n-1 (#028) regression: lane 0 個では legacy 式 `tops[i] = lanes_y - track_top
+        // + i * track_row_h` と完全一致 (= 既存挙動完全互換)。
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks: Vec<ArrangementTrack> = (0..4).map(|i| track(i, "t", vec![])).collect();
+        let tops = make_tops(&tracks, lanes, view);
+        assert_eq!(tops, vec![0.0, 32.0, 64.0, 96.0, 128.0]);
+    }
+
+    #[test]
+    fn visible_track_row_tops_with_expanded_lane_grows_track_height() {
+        // M14 Phase 63n-1 (#028): expanded lane (visible) を持つ track 以降は次 track の row_top が
+        // 下にずれる。 collapsed もしくは invisible lane は加算しない。
+        let view = test_view();
+        let lanes = test_lanes();
+        let mut t1 = track(1, "t1", vec![]);
+        t1.automation_lanes_collapsed = false;
+        t1.automation_lanes = vec![ArrangementAutomationLane {
+            id: 1,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            default_value_norm: 0.5,
+            clips: Vec::new(),
+        }];
+        let t2 = track(2, "t2", vec![]);
+        let tracks = vec![t1, t2];
+        let tops = make_tops(&tracks, lanes, view);
+        // tops[0] = 0、 tops[1] = 0 + (32 + 60) = 92 (t1 expanded)、 tops[2] = 92 + 32 = 124 (t2 collapsed)
+        assert_eq!(tops, vec![0.0, 92.0, 124.0]);
+    }
+
+    #[test]
+    fn visible_track_row_tops_collapsed_lane_does_not_extend_height() {
+        // M14 Phase 63n-1 (#028): `automation_lanes_collapsed = true` で lane を持っていても加算しない。
+        let view = test_view();
+        let lanes = test_lanes();
+        let mut t1 = track(1, "t1", vec![]);
+        t1.automation_lanes_collapsed = true; // 既存挙動
+        t1.automation_lanes = vec![ArrangementAutomationLane {
+            id: 1,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            default_value_norm: 0.5,
+            clips: Vec::new(),
+        }];
+        let tracks = vec![t1];
+        let tops = make_tops(&tracks, lanes, view);
+        assert_eq!(tops, vec![0.0, 32.0]); // collapsed = legacy と同じ
+    }
+
+    #[test]
+    fn visible_track_row_tops_invisible_lane_does_not_extend_height() {
+        // M14 Phase 63n-1 (#028): `lane.visible = false` の lane は expanded でも加算しない。
+        let view = test_view();
+        let lanes = test_lanes();
+        let mut t1 = track(1, "t1", vec![]);
+        t1.automation_lanes_collapsed = false;
+        t1.automation_lanes = vec![ArrangementAutomationLane {
+            id: 1,
+            label: Arc::from("Volume"),
+            icon_glyph: 'V',
+            color: Color::rgb(1.0, 1.0, 1.0),
+            enabled: true,
+            visible: false, // hidden
+            height_px: 60,
+            default_value_norm: 0.5,
+            clips: Vec::new(),
+        }];
+        let tracks = vec![t1];
+        let tops = make_tops(&tracks, lanes, view);
+        assert_eq!(tops, vec![0.0, 32.0]); // invisible lane = legacy と同じ
+    }
+
+    #[test]
+    fn clip_hit_returns_move_in_center() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
+        // clip rect at (0, 2, 160, 28), center = (80, 16)
+        let hit = clip_hit(&tracks, &tops, view, lanes, 80.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Move))
+        );
+    }
+
+    #[test]
+    fn clip_hit_returns_resize_left_at_left_edge() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 1.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
+        );
+    }
+
+    #[test]
+    fn clip_hit_returns_resize_right_at_right_edge() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 159.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
+        );
+    }
+
+    #[test]
+    fn clip_hit_returns_none_outside_lanes() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, -10.0, -10.0, 4.0);
+        assert_eq!(hit, None);
+    }
+
+    // -------- Hit-test extension tests (clip rect 外側 ±resize_handle_px) --------
+    // clip (id 100) start=4, len=4 → rect x∈[160,320] y∈[66,94] in track 2
+    // (test_lanes (0,0,640,256), test_view 16 beats / 8 tracks / row_h=32)。
+    // ただし以下のテストは start=0 len=4 → x∈[0,160] y∈[2,30] in track 0 を使う。
+
+    #[test]
+    fn clip_hit_returns_resize_left_at_outer_left_handle() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // clip rect x∈[0,160]、edge=4 で拡張範囲 x∈[-4,164)。lanes の左端 0 で外側左を表現できないので
+        // clip start=2 (x=80) の clip を使い、cx=77 で外側左 (x=80-3) を確認。
+        let tracks = vec![track(10, "t0", vec![clip(100, 2.0, 4.0, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 77.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
+        );
+    }
+
+    #[test]
+    fn clip_hit_returns_resize_right_at_outer_right_handle() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // clip rect x∈[0,160]、cx=162 = rect 右端(160) + 2 → 外側右
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 162.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
+        );
+    }
+
+    #[test]
+    fn clip_hit_returns_none_just_past_outer_handle() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // clip rect x∈[0,160]。cx=165 = rect 右端 + 5 → 拡張範囲 [-4,164) の外
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 165.0, 16.0, 4.0);
+        assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn clip_hit_short_clip_inside_returns_move() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // 短 clip (len=0.1 → w=4px、edge*2=8px 以下) の rect 内中央は Move 強制
+        // start=2, len=0.1 → x=80, w=4
+        let tracks = vec![track(10, "t0", vec![clip(100, 2.0, 0.1, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 81.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::Move))
+        );
+    }
+
+    #[test]
+    fn clip_hit_short_clip_outer_left_returns_resize_left() {
+        let view = test_view();
+        let lanes = test_lanes();
+        // 短 clip でも rect 外側左は ResizeLeft
+        // start=2, len=0.1 → x=80。cx=78 = x - 2 → 外側左
+        let tracks = vec![track(10, "t0", vec![clip(100, 2.0, 0.1, "c")])];
+        let tops = make_tops(&tracks, lanes, view);
+        let hit = clip_hit(&tracks, &tops, view, lanes, 78.0, 16.0, 4.0);
+        assert_eq!(
+            hit,
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeLeft))
+        );
+    }
+
+    #[test]
+    fn clip_hit_adjacent_clips_inside_clip_owns_shared_handle() {
+        // clip A (id 100, start=0, len=4) → rect x∈[0,160]、右端拡張 [156,164)
+        // clip B (id 101, start=4, len=4) → rect x∈[160,320]、左端拡張 [156,164)
+        // 共有境界 boundary=160。各 clip は自分の rect 内側のハンドル px を所有する
+        // (in-rect は outer-extension に無条件で勝つ / #101、piano_roll note_hit_in と対)。
+        let view = test_view();
+        let lanes = test_lanes();
+        let tracks = vec![track(
+            10,
+            "t0",
+            vec![clip(100, 0.0, 4.0, "a"), clip(101, 4.0, 4.0, "b")],
+        )];
+        let tops = make_tops(&tracks, lanes, view);
+        // cx=159: A の rect 内側 (in-rect ResizeRight) が B の外側ハンドル (outer ResizeLeft)
+        // に勝つ。旧 last-wins では B ResizeLeft だった回帰ケース。
+        assert_eq!(
+            clip_hit(&tracks, &tops, view, lanes, 159.0, 16.0, 4.0),
+            Some((ClipKey { track: 10, clip: 100 }, ClipDragKind::ResizeRight))
+        );
+        // cx=161: B の rect 内側 (in-rect ResizeLeft) が A の外側ハンドル (outer) に勝つ。
+        assert_eq!(
+            clip_hit(&tracks, &tops, view, lanes, 161.0, 16.0, 4.0),
+            Some((ClipKey { track: 10, clip: 101 }, ClipDragKind::ResizeLeft))
+        );
+        // cx=160: 共有境界。半開区間で B の rect 内側 → B の左端 resize。
+        assert_eq!(
+            clip_hit(&tracks, &tops, view, lanes, 160.0, 16.0, 4.0),
+            Some((ClipKey { track: 10, clip: 101 }, ClipDragKind::ResizeLeft))
+        );
+    }
+
+    // `loop_band_hit_kind_*` の test は M14 Phase 69 (#041) で
+    // `daw_ui_core::widgets::ruler_ops::tests` に extract (piano_roll と共有)。
+
+    #[test]
+    fn rects_intersect_basic() {
+        let a = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+        let b = Rect { x: 5.0, y: 5.0, w: 10.0, h: 10.0 };
+        let c = Rect { x: 20.0, y: 0.0, w: 10.0, h: 10.0 };
+        assert!(rects_intersect(a, b));
+        assert!(!rects_intersect(a, c));
+    }
+
+    #[test]
+    fn arrangement_view_default_sane() {
+        let v = ArrangementView::default();
+        assert!(v.len_beats > 0.0);
+        assert!(v.track_row_h > 0.0);
+        assert!(v.tracks_visible > 0.0);
+        assert!(v.header_w > 0.0);
+        assert!(v.ruler_h > 0.0);
+    }
+
+    #[test]
+    fn arrangement_style_default_sane() {
+        let s = ArrangementStyle::default();
+        assert!(s.resize_handle_px > 0.0);
+        assert!(s.playhead_width_px > 0.0);
+        assert!(s.clip_radius >= 0.0);
+    }
+
+    // M14 Phase 63f (#020): clip_rects API
+    #[test]
+    fn arrangement_response_default_has_empty_clip_rects() {
+        let r = ArrangementResponse::default();
+        assert!(r.clip_rects.is_empty());
+        assert!(r.track_header_rects.is_empty());
+    }
+
+    // ============================================================
+    // M14 Phase 72 (daw_01 #044): video track / thumbnail
+    // ============================================================
+
+    #[test]
+    fn track_kind_default_is_audio() {
+        assert_eq!(TrackKind::default(), TrackKind::Audio);
+    }
+
+    #[test]
+    fn aspect_fit_rect_letterbox_for_wide_texture() {
+        // 100x100 rect に 16:9 (= 1920x1080) texture → fit_w=100, fit_h=100*(9/16)=56.25
+        let fit = aspect_fit_rect(Rect::new(0.0, 0.0, 100.0, 100.0), 1920, 1080);
+        assert!((fit.w - 100.0).abs() < 1e-3);
+        assert!((fit.h - 56.25).abs() < 1e-3);
+        // 中央 letterbox: 上下に (100-56.25)/2 = 21.875 px の黒帯
+        assert!((fit.x - 0.0).abs() < 1e-3);
+        assert!((fit.y - 21.875).abs() < 1e-3);
+    }
+
+    #[test]
+    fn aspect_fit_rect_letterbox_for_tall_texture() {
+        // 100x100 rect に 9:16 (= 1080x1920) texture → fit_w=100*(9/16)=56.25, fit_h=100
+        let fit = aspect_fit_rect(Rect::new(10.0, 20.0, 100.0, 100.0), 1080, 1920);
+        assert!((fit.w - 56.25).abs() < 1e-3);
+        assert!((fit.h - 100.0).abs() < 1e-3);
+        // 左右に letterbox: x = 10 + (100-56.25)/2 = 31.875
+        assert!((fit.x - 31.875).abs() < 1e-3);
+        assert!((fit.y - 20.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn aspect_fit_rect_same_aspect_no_letterbox() {
+        // 100x50 rect に 2:1 (= 1920x960) texture → fit 全面で letterbox なし
+        let fit = aspect_fit_rect(Rect::new(0.0, 0.0, 100.0, 50.0), 1920, 960);
+        assert!((fit.w - 100.0).abs() < 1e-3);
+        assert!((fit.h - 50.0).abs() < 1e-3);
+        assert!(fit.x.abs() < 1e-3);
+        assert!(fit.y.abs() < 1e-3);
+    }
+
+    #[test]
+    fn aspect_fit_rect_zero_texture_clamped_to_one() {
+        // tex_w = tex_h = 0 で panic / div-by-zero しない (1:1 aspect で正方形 fit)
+        let fit = aspect_fit_rect(Rect::new(0.0, 0.0, 100.0, 200.0), 0, 0);
+        // 1:1 aspect で rect の短辺 (= 100) に合わせる → fit_w=fit_h=100、 縦に letterbox
+        assert!((fit.w - 100.0).abs() < 1e-3);
+        assert!((fit.h - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn arrangement_track_kind_field_round_trip() {
+        let t = ArrangementTrack {
+            id: 99,
+            name: Arc::from("video1"),
+            muted: false,
+            solo: false,
+            armed: false,
+            clips: Vec::new(),
+            volume: 1.0,
+            parent_id: None,
+            depth: 0,
+            collapsed: false,
+            kind: TrackKind::Video,
+            automation_lanes_collapsed: true,
+            automation_lanes: Vec::new(),
+            row_h: None,
+            color: None,
+        };
+        assert_eq!(t.kind, TrackKind::Video);
+    }
+
+    #[test]
+    fn arrangement_clip_thumbnail_field_round_trip() {
+        use std::num::NonZeroU32;
+        let h = TextureHandle::from_raw(NonZeroU32::new(7).unwrap());
+        let c = ClipView {
+            id: 1,
+            start_beat: 0.0,
+            len_beats: 4.0,
+            name: Arc::from("v_clip"),
+            color: None,
+            share_group_color: None,
+            audio_edit: None,
+            thumbnail: Some((h, 1920, 1080)),
+            in_active_group: false,
+            muted: false,
+        };
+        let (got_h, w, ht) = c.thumbnail.unwrap();
+        assert_eq!(got_h.raw(), 7);
+        assert_eq!(w, 1920);
+        assert_eq!(ht, 1080);
+    }
+
+    #[test]
+    fn drag_preview_geometry_move_clamps_track() {
+        let anchor = ClipDragAnchor {
+            key: ClipKey { track: 0, clip: 0 },
+            start_beat: 4.0,
+            len_beats: 2.0,
+            track_index: 0,
+        };
+        let (s, l, idx) = drag_preview_geometry(anchor, ClipDragKind::Move, 1.5, 5, 0, 3, 0.05);
+        assert!((s - 5.5).abs() < 1e-9);
+        assert!((l - 2.0).abs() < 1e-9);
+        // 0 + 5 = 5 → clamped to 2 (tracks=3 → max idx = 2)
+        assert_eq!(idx, 2);
+    }
+
+    // M10 Phase 46: track reorder
+    #[test]
+    fn compute_reorder_target_above_first_row() {
+        // 上端外 → 0
+        assert_eq!(compute_reorder_target_index(2, -10.0, 0.0, 0.0, 32.0, 5), 0);
+        assert_eq!(compute_reorder_target_index(2, 0.0, 0.0, 0.0, 32.0, 5), 0);
+    }
+
+    #[test]
+    fn compute_reorder_target_below_last_row() {
+        // 下端外 → n_tracks (clamp)、anchor=0 で n=5 → target_u=5、anchor 後なので 5-1=4
+        assert_eq!(compute_reorder_target_index(0, 1000.0, 0.0, 0.0, 32.0, 5), 4);
+    }
+
+    #[test]
+    fn compute_reorder_target_self_or_next_returns_anchor() {
+        // anchor=2, mouse on row 2 → no-op = 2
+        // row 2 中央 = 32*2 + 16 = 80
+        assert_eq!(compute_reorder_target_index(2, 80.0, 0.0, 0.0, 32.0, 5), 2);
+        // anchor=2, mouse on row 2 中央より下 = 90 → target=3, anchor+1 → no-op = 2
+        assert_eq!(compute_reorder_target_index(2, 90.0, 0.0, 0.0, 32.0, 5), 2);
+    }
+
+    #[test]
+    fn compute_reorder_target_above_anchor_keeps_target() {
+        // anchor=4, row 1 中央 (40) → target_u=1 → anchor より前なので 1
+        assert_eq!(compute_reorder_target_index(4, 40.0, 0.0, 0.0, 32.0, 5), 1);
+        // anchor=4, row 0 上半分 (10) → target_u=0
+        assert_eq!(compute_reorder_target_index(4, 10.0, 0.0, 0.0, 32.0, 5), 0);
+    }
+
+    #[test]
+    fn compute_reorder_target_below_anchor_offsets_by_one() {
+        // anchor=0, row 3 中央 (32*3+16=112) → frac=0.5 → target_unbounded=4 → anchor 抜き後 [r1, r2, r3, r4] の
+        // 「row 3 と row 4 の間」= new index 3。target_u=4 > anchor+1=1 で 4-1=3。
+        assert_eq!(compute_reorder_target_index(0, 112.0, 0.0, 0.0, 32.0, 5), 3);
+        // anchor=1, mouse=144 → row 4.5 → target_unbounded=5 → clamp to 5 → 5-1=4
+        assert_eq!(compute_reorder_target_index(1, 144.0, 0.0, 0.0, 32.0, 5), 4);
+    }
+
+    #[test]
+    fn compute_reorder_target_with_track_top_scroll() {
+        // header_top=10 + track_top=16 (1/2 row 上にスクロール) + mouse_y=18 → local=24 → row 0.75 → frac>=0.5 → row 1
+        // anchor=3, target_u=1 → anchor より前 → 1
+        assert_eq!(compute_reorder_target_index(3, 18.0, 10.0, 16.0, 32.0, 5), 1);
+    }
+
+    #[test]
+    fn compute_reorder_target_zero_row_h_safe() {
+        assert_eq!(compute_reorder_target_index(0, 100.0, 0.0, 0.0, 0.0, 5), 0);
+        assert_eq!(compute_reorder_target_index(0, 100.0, 0.0, 0.0, 32.0, 0), 0);
+    }
+
+    // ============================================================
+    // M14 Phase 101 (daw_01 #072): resolve_track_drop / gap_from_y
+    // ============================================================
+
+    /// hierarchy 付き track 生成 helper (depth / parent_id を明示)。
+    fn htrack(id: u32, depth: u8, parent: Option<u32>) -> ArrangementTrack {
+        let mut t = track(id, "t", vec![]);
+        t.depth = depth;
+        t.parent_id = parent;
+        t
+    }
+
+    fn group_set(tracks: &[ArrangementTrack]) -> HashSet<u32> {
+        tracks.iter().filter_map(|t| t.parent_id).collect()
+    }
+
+    /// resolve_track_drop の薄い wrapper (test 用 default 引数)。 visible = full、 lane なし tops。
+    /// mouse_x / anchor_mouse_x は `col` (= 右へ動かした indent 列数) を 16px/列で与える。
+    #[allow(clippy::cast_precision_loss)]
+    fn resolve(
+        tracks: &[ArrangementTrack],
+        source: &[u32],
+        mouse_y: f32,
+        col: f32,
+    ) -> ReorderDrop {
+        let visible: Vec<ArrangementTrack> =
+            tracks.iter().filter(|t| is_visible_track(t, tracks)).cloned().collect();
+        let tops = visible_track_row_tops(&visible, 0.0, 0.0, 32.0);
+        let is_group = group_set(tracks);
+        let anchor_x = 100.0_f32;
+        resolve_track_drop(
+            tracks,
+            &visible,
+            &tops,
+            &is_group,
+            source,
+            16.0,
+            mouse_y,
+            anchor_x + col * 16.0,
+            anchor_x,
+        )
+    }
+
+    #[test]
+    fn gap_from_y_maps_rows_and_edges() {
+        let tops = vec![0.0, 32.0, 64.0, 96.0]; // 3 行
+        assert_eq!(gap_from_y(&tops, -5.0), 0); // 上端より上
+        assert_eq!(gap_from_y(&tops, 10.0), 0); // 行0 上半分 (<16)
+        assert_eq!(gap_from_y(&tops, 20.0), 1); // 行0 下半分 (>16)
+        assert_eq!(gap_from_y(&tops, 50.0), 2); // 行1 下半分 (mid=48)
+        assert_eq!(gap_from_y(&tops, 95.0), 3); // 行2 下半分
+        assert_eq!(gap_from_y(&tops, 200.0), 3); // 最下端以下 = 末尾 gap
+        // 退化
+        assert_eq!(gap_from_y(&[], 10.0), 0);
+        assert_eq!(gap_from_y(&[0.0], 10.0), 0);
+    }
+
+    #[test]
+    fn drop_below_bottom_group_lands_top_level() {
+        // 再現: 最下段 group G + 子 c1/c2、 上にある通常 track t0 を「一番下へ」 drop。
+        // 期待: t0 が group block 全体の後ろに top-level で着地 (= parent None, anchor_after = c2)。
+        let tracks = vec![
+            htrack(0, 0, None),         // t0 (drag source)
+            htrack(1, 0, None),         // G (group: c1/c2 の親)
+            htrack(2, 1, Some(1)),      // c1
+            htrack(3, 1, Some(1)),      // c2 (最終子)
+        ];
+        // 一番下 (mouse_y=200) へ、 X 動かさず (col=0)。
+        let d = resolve(&tracks, &[0], 200.0, 0.0);
+        assert_eq!(d.gap, 4, "末尾 gap");
+        assert_eq!(d.depth, 0, "X 不動 → 境界 default = 最浅 (top-level)");
+        assert_eq!(d.parent, None, "top-level に着地 (group の内側ではない)");
+        assert_eq!(d.anchor_after, Some(3), "最終子 c2 の後ろ (= block 全体の後ろ)");
+    }
+
+    #[test]
+    fn drop_below_bottom_group_with_indent_nests_into_group() {
+        // 同じ末尾 drop でも X を 1 段 indent すれば末尾 group へ nest。
+        let tracks = vec![
+            htrack(0, 0, None),
+            htrack(1, 0, None),
+            htrack(2, 1, Some(1)),
+            htrack(3, 1, Some(1)),
+        ];
+        let d = resolve(&tracks, &[0], 200.0, 1.0);
+        assert_eq!(d.depth, 1);
+        assert_eq!(d.parent, Some(1), "末尾 group G の子になる");
+        assert_eq!(d.anchor_after, Some(3), "c2 の後ろ (= group の最終子)");
+    }
+
+    #[test]
+    fn drop_between_members_stays_inside_group() {
+        // メンバー間 (c1 と c2 の間) は境界 default で内側 (= 同 group の子)。
+        let tracks = vec![
+            htrack(1, 0, None),         // G
+            htrack(2, 1, Some(1)),      // c1
+            htrack(3, 1, Some(1)),      // c2
+            htrack(9, 0, None),         // t9 (drag source)
+        ];
+        // gap between c1(visible idx1) と c2(idx2) = gap2 → mouse_y ~ 48..64 の下半分。
+        let d = resolve(&tracks, &[9], 55.0, 0.0);
+        assert_eq!(d.gap, 2);
+        assert_eq!(d.depth, 1, "メンバー間 = 内側 (深さ 1)");
+        assert_eq!(d.parent, Some(1));
+        assert_eq!(d.anchor_after, Some(2), "c1 の後ろ");
+    }
+
+    #[test]
+    fn drop_at_gap_x_controls_pop_out_depth() {
+        // [s, A(group), B(group,A の子), x(B の子), T(top)]。 x と T の間 (gap4) で X により
+        // 深さ 0/1/2 を選べる (= 何段 group を抜けるか / 末尾 group に nest)。
+        let tracks = vec![
+            htrack(99, 0, None),        // s (drag source、 先頭)
+            htrack(1, 0, None),         // A
+            htrack(2, 1, Some(1)),      // B
+            htrack(3, 2, Some(2)),      // x (最深 leaf)
+            htrack(4, 0, None),         // T
+        ];
+        // visible=[s,A,B,x,T] tops=[0,32,64,96,128,160]。 x(idx3)とT(idx4)の間=gap4 →
+        // T (行4、 128..160) の上半分 (mid=144) で gap4 を選ぶ → mouse_y=130。
+        let d0 = resolve(&tracks, &[99], 130.0, 0.0);
+        assert_eq!(d0.gap, 4);
+        assert_eq!((d0.depth, d0.parent), (0, None), "X 不動 → top-level (x の block 後ろ、 T の前)");
+        assert_eq!(d0.anchor_after, Some(3));
+
+        let d1 = resolve(&tracks, &[99], 130.0, 1.0);
+        assert_eq!((d1.depth, d1.parent), (1, Some(1)), "1 段 indent → A の子 (B subtree の後ろ)");
+        assert_eq!(d1.anchor_after, Some(3));
+
+        let d2 = resolve(&tracks, &[99], 130.0, 2.0);
+        assert_eq!((d2.depth, d2.parent), (2, Some(2)), "2 段 indent → B の子 (x の sibling)");
+        assert_eq!(d2.anchor_after, Some(3));
+
+        // 区間 clamp: 過剰 indent (col=5) でも max_d=2 で止まる。
+        let d_clamp = resolve(&tracks, &[99], 130.0, 5.0);
+        assert_eq!(d_clamp.depth, 2);
+    }
+
+    #[test]
+    fn drop_after_collapsed_group_anchors_past_hidden_children() {
+        // collapsed group G (子 c1/c2 が hidden) の直後 (visible 上は G と T の間) へ drop。
+        // anchor_after は **hidden な最終子 c2** を指す (= Vec 上 group block の連続性を保つ)。
+        // header (G) を指すと expand 時に block 内へ source が紛れ込むため不可。
+        let tracks = vec![
+            htrack(99, 0, None),                       // s (source、 先頭)
+            {
+                let mut g = htrack(1, 0, None);
+                g.collapsed = true;
+                g
+            }, // G (collapsed group)
+            htrack(2, 1, Some(1)),                     // c1 (hidden)
+            htrack(3, 1, Some(1)),                     // c2 (hidden, 最終子)
+            htrack(4, 0, None),                        // T
+        ];
+        // visible=[s, G, T] tops=[0,32,64,96]。 G(idx1)とT(idx2)の間=gap2 → mouse_y ~ 55。
+        let d = resolve(&tracks, &[99], 55.0, 0.0);
+        assert_eq!(d.gap, 2);
+        assert_eq!((d.depth, d.parent), (0, None), "X 不動 → top-level");
+        assert_eq!(
+            d.anchor_after,
+            Some(3),
+            "hidden 最終子 c2 の後ろ (header G ではない、 block 連続性維持)"
+        );
+
+        // 1 段 indent すれば collapsed group の子として末尾に nest。
+        let dn = resolve(&tracks, &[99], 55.0, 1.0);
+        assert_eq!((dn.depth, dn.parent), (1, Some(1)));
+        assert_eq!(dn.anchor_after, Some(3));
+    }
+
+    #[test]
+    fn anchor_after_skips_source_tracks() {
+        // 直前 track が source 自身のとき anchor_after は **その手前の非 source** を指す
+        // (caller が source を remove してから anchor を探す → 見つからず末尾 append する罠を回避)。
+        let tracks = vec![htrack(7, 0, None), htrack(8, 0, None)]; // [x, s]
+        // s(id=8) を一番下へ。 above=s, below=None, ins=2 → tracks[..2]=[x,s] の非 source = x。
+        let d = resolve(&tracks, &[8], 200.0, 0.0);
+        assert_eq!(d.parent, None);
+        assert_eq!(d.anchor_after, Some(7), "source s ではなく x を anchor にする");
+    }
+
+    #[test]
+    fn drop_group_into_own_header_gap_does_not_self_parent() {
+        // expanded group G を G ヘッダ直下 (G と c1 の間) へ drag。 唯一の合法深さ depth(G)+1=1 では
+        // parent=G=source になり self-cycle。 source を親にしない不変で parent は G の親 (None) へ繰り上がる。
+        let tracks = vec![
+            htrack(1, 0, None),    // G (drag source)
+            htrack(2, 1, Some(1)), // c1
+            htrack(3, 1, Some(1)), // c2
+        ];
+        // gap1 = G(row0) と c1(row1) の間 → c1 上半分 (32..48) → mouse_y=40。
+        let d = resolve(&tracks, &[1], 40.0, 0.0);
+        assert_eq!(d.gap, 1);
+        assert_ne!(d.parent, Some(1), "source G を自分の親にしない (self-cycle 回避)");
+        assert_eq!(d.parent, None, "非 source 祖先が無い → top-level へ繰り上げ");
+        assert_eq!(d.anchor_after, None, "G より前に非 source 無し → 先頭");
+    }
+
+    #[test]
+    fn drop_multiselect_ancestor_descendant_never_parents_to_source() {
+        // multi-select で moving 中の祖先 (A) / 子 (B) を親にしない。 [A, B(A の子), x(B の子), T]。
+        // {A,B} を drag して x..T の gap に深く落としても parent は source(A/B) を避け None へ繰り上がる。
+        let tracks = vec![
+            htrack(1, 0, None),    // A (group, source)
+            htrack(2, 1, Some(1)), // B (group, A の子, source)
+            htrack(3, 2, Some(2)), // x (B の子)
+            htrack(4, 0, None),    // T
+        ];
+        // x(row2)とT(row3)の間 = gap3 → T 上半分 (96..112) → mouse_y=100。 深く indent (col=5)。
+        let d = resolve(&tracks, &[1, 2], 100.0, 5.0);
+        assert!(d.parent != Some(1) && d.parent != Some(2), "source A/B を親にしない");
+        assert_eq!(d.parent, None, "全 source 祖先を抜けて top-level");
+    }
+
+    #[test]
+    fn apply_reorder_basic() {
+        // [10, 20, 30, 40, 50] anchor=0 → target=2: [20, 30, 10, 40, 50]
+        assert_eq!(apply_reorder(&[10, 20, 30, 40, 50], 0, 2), vec![20, 30, 10, 40, 50]);
+        // anchor=4 → target=0: [50, 10, 20, 30, 40]
+        assert_eq!(apply_reorder(&[10, 20, 30, 40, 50], 4, 0), vec![50, 10, 20, 30, 40]);
+        // anchor=2 → target=2 (compute_reorder_target_index が anchor 自身を返した no-op semantics):
+        // remove(2)=30 → [10, 20, 40, 50]、insert(2, 30) → 元 array に戻る
+        assert_eq!(apply_reorder(&[10, 20, 30, 40, 50], 2, 2), vec![10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn apply_reorder_safe_on_oob() {
+        assert_eq!(apply_reorder(&[1, 2, 3], 5, 0), vec![1, 2, 3]); // anchor OOB
+        assert_eq!(apply_reorder::<u32>(&[], 0, 0), Vec::<u32>::new()); // empty
+    }
+
+    // M10 Phase 47b: track header volume
+    #[test]
+    fn volume_from_mouse_x_basic() {
+        // band_x=100, band_w=200 → mouse=100 → 0.0、200 → 0.5、300 → 1.0
+        assert!((volume_from_mouse_x(100.0, 100.0, 200.0) - 0.0).abs() < 1e-6);
+        assert!((volume_from_mouse_x(200.0, 100.0, 200.0) - 0.5).abs() < 1e-6);
+        assert!((volume_from_mouse_x(300.0, 100.0, 200.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn volume_from_mouse_x_clamps_outside() {
+        assert!((volume_from_mouse_x(50.0, 100.0, 200.0) - 0.0).abs() < 1e-6);
+        assert!((volume_from_mouse_x(500.0, 100.0, 200.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn volume_from_mouse_x_zero_width_safe() {
+        assert!((volume_from_mouse_x(100.0, 100.0, 0.0) - 0.0).abs() < 1e-6);
+        assert!((volume_from_mouse_x(100.0, 100.0, -10.0) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn header_row_layout_hides_band_at_default_row_h() {
+        // default row_h=32 → inner_h=24、btn=20 + gap=2 + band=4 = 26 > 24 → 非表示
+        let row = Rect { x: 0.0, y: 0.0, w: 200.0, h: 32.0 };
+        let layout = header_row_layout(row, 4.0);
+        assert!(layout.volume_band.is_none(), "default 32px row では band 非表示 (progressive disclosure)");
+    }
+
+    #[test]
+    fn header_row_layout_shows_band_when_large_enough() {
+        // row_h=34 → inner_h=26 = 20+2+4 → ぎりぎり表示
+        let row = Rect { x: 0.0, y: 0.0, w: 200.0, h: 34.0 };
+        let layout = header_row_layout(row, 4.0);
+        assert!(layout.volume_band.is_some(), "row_h=34 で band 表示開始");
+
+        // row_h=48 で十分余裕あり
+        let row = Rect { x: 0.0, y: 0.0, w: 200.0, h: 48.0 };
+        let layout = header_row_layout(row, 4.0);
+        assert!(layout.volume_band.is_some(), "row_h=48 で band 表示");
+        let band = layout.volume_band.unwrap();
+        assert!((band.h - 4.0).abs() < 1e-6, "band の高さ = volume_band_h");
+        assert!(band.y > layout.buttons[0].y, "band は buttons の下に来る");
+    }
+
+    #[test]
+    fn header_row_layout_hides_band_when_volume_band_h_zero() {
+        // band_h=0 → 常に非表示 (disable)
+        let row = Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 };
+        let layout = header_row_layout(row, 0.0);
+        assert!(layout.volume_band.is_none(), "band_h=0 で disable");
+    }
+
+    // -------- M13 Phase 55: ruler / time_sig 対応 grid の確認 --------
+
+
+    // ============================================================
+    // M14 Phase 96 (daw_01 #068): 共有グループ連動ハイライト
+    // ============================================================
+
+
+    // ===== M14 Phase 127 (daw_01 #105): Arranger レーン (section) tests =====
+
+    fn section(id: u32, start: f64, len: f64, name: &str) -> SectionView {
+        SectionView {
+            id,
+            name: Arc::from(name),
+            color: [0.30, 0.45, 0.65],
+            start_beat: start,
+            len_beats: len,
+            selected: false,
+        }
+    }
+
+    fn snap_quarter() -> SnapConfig {
+        SnapConfig {
+            mode: daw_ui_core::snap::SnapMode::Straight { div: 4 },
+            enabled: true,
+            min_beat_unit: 1.0 / 128.0,
+            time_sig: (4, 4),
+        }
+    }
+
+    fn section_drag(kind: SectionGesture, start: f64, len: f64, last: (f32, f32), ctrl: bool) -> SectionDragSession {
+        SectionDragSession {
+            kind,
+            section_id: 7,
+            anchor_start: start,
+            anchor_len: len,
+            anchor_press_beat: start,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: last,
+            last_alt: false,
+            last_ctrl: ctrl,
+            last_shift: false,
+        }
+    }
+
+
+    /// `section_rect_from`: beat → arranger レーン内 px (高さは lane 全高)。
+    #[test]
+    fn section_rect_from_basic_position() {
+        let arranger = Rect { x: 0.0, y: 0.0, w: 400.0, h: 20.0 };
+        let view = ArrangementView { start_beat: 0.0, len_beats: 8.0, ..ArrangementView::default() };
+        // 1 beat = 50 px。 start=2.0 → x=100、 len=4.0 → w=200、 高さは lane 全高。
+        let r = section_rect_from(2.0, 4.0, view, arranger);
+        assert!((r.x - 100.0).abs() < 1e-3, "x=100: got {}", r.x);
+        assert!((r.w - 200.0).abs() < 1e-3, "w=200: got {}", r.w);
+        assert!((r.y - 0.0).abs() < 1e-3 && (r.h - 20.0).abs() < 1e-3, "lane 全高");
+    }
+
+    /// `section_hit`: 帯中央 = Move、 左端 = ResizeLeft、 右端 = ResizeRight、 lane 外 (y) = None。
+    #[test]
+    fn section_hit_move_resize_zones() {
+        let arranger = Rect { x: 0.0, y: 0.0, w: 400.0, h: 20.0 };
+        let view = ArrangementView { start_beat: 0.0, len_beats: 8.0, ..ArrangementView::default() };
+        let secs = vec![section(7, 2.0, 4.0, "A")]; // x 100..300
+        assert_eq!(section_hit(&secs, arranger, view, 200.0, 10.0, 4.0), Some((7, ClipDragKind::Move)));
+        assert_eq!(section_hit(&secs, arranger, view, 100.0, 10.0, 4.0), Some((7, ClipDragKind::ResizeLeft)));
+        assert_eq!(section_hit(&secs, arranger, view, 300.0, 10.0, 4.0), Some((7, ClipDragKind::ResizeRight)));
+        assert_eq!(section_hit(&secs, arranger, view, 200.0, 25.0, 4.0), None, "lane の y 外は None");
+    }
+
+    /// `section_hit`: 隣接 section の共有境界 (A.right == B.left) では、 cursor が A の rect 内
+    /// (A 右端ハンドル) なら、 B の左端外側拡張ハンドルより A を優先 (#101 / piano_roll #053 と同 2-tier)。
+    #[test]
+    fn section_hit_adjacent_in_rect_priority() {
+        let arranger = Rect { x: 0.0, y: 0.0, w: 400.0, h: 20.0 };
+        let view = ArrangementView { start_beat: 0.0, len_beats: 8.0, ..ArrangementView::default() };
+        // A 0..4 (x 0..200)、 B 4..8 (x 200..400)。 共有境界 x=200。
+        let secs = vec![section(1, 0.0, 4.0, "A"), section(2, 4.0, 4.0, "B")];
+        // x=199: A の rect 内 (右端 -1px) なので A の ResizeRight が、 B の左端外側ハンドルより勝つ。
+        assert_eq!(
+            section_hit(&secs, arranger, view, 199.0, 10.0, 4.0),
+            Some((1, ClipDragKind::ResizeRight)),
+            "A の右端 (in-rect) が B の左端 outer より優先"
+        );
+        // x=201: B の rect 内 (左端 +1px) なので B の ResizeLeft。
+        assert_eq!(
+            section_hit(&secs, arranger, view, 201.0, 10.0, 4.0),
+            Some((2, ClipDragKind::ResizeLeft)),
+            "B の左端 (in-rect) が A の右端 outer より優先"
+        );
+    }
+
+    /// `section_at_inrect` は帯の **内側のみ** を返し、 resize handle の外側拡張
+    /// (`±resize_handle_px`) を含めない。 帯のすぐ隣の空白の dblclick / 右クリックを隣 section の
+    /// rename / メニューに化けさせない (= `section_hit` との決定的な差)。
+    #[test]
+    fn section_at_inrect_excludes_resize_handle_extension() {
+        let arranger = Rect { x: 0.0, y: 0.0, w: 400.0, h: 20.0 };
+        let view = ArrangementView { start_beat: 0.0, len_beats: 8.0, ..ArrangementView::default() };
+        let secs = vec![section(7, 2.0, 4.0, "Aメロ")]; // x 100..300
+        // 帯の内側はヒットする (中央 / 端の内側 1px)。
+        assert_eq!(section_at_inrect(&secs, arranger, view, 200.0, 10.0), Some(7), "帯中央");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 100.0, 10.0), Some(7), "左端 (in-rect)");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 299.0, 10.0), Some(7), "右端 -1px (in-rect)");
+        // 帯の **すぐ隣の空白** (resize handle 拡張部 ±4px の内側) は None = リネームしない。
+        assert_eq!(section_at_inrect(&secs, arranger, view, 98.0, 10.0), None, "左端の外 2px は空白");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 300.0, 10.0), None, "右端ちょうど (= rect 外) は空白");
+        assert_eq!(section_at_inrect(&secs, arranger, view, 302.0, 10.0), None, "右端の外 2px は空白");
+        // 同じ外側 2px で `section_hit` は拡張ハンドルにヒットする (= bug の発生源、 drag では正当)。
+        assert!(
+            section_hit(&secs, arranger, view, 302.0, 10.0, 4.0).is_some(),
+            "section_hit は外側拡張を含む (drag 用) — point gesture では section_at_inrect を使う"
+        );
+        // lane の y 外 (帯外の縦領域) も None。
+        assert_eq!(section_at_inrect(&secs, arranger, view, 200.0, 25.0), None, "lane の y 外");
+    }
+
+    /// `compute_section_drag_beat_delta`: snap OFF は pivot+raw を素通し (= 各 gesture で delta = raw)。
+    #[test]
+    fn section_drag_delta_raw_passthrough_off() {
+        let off = &SnapConfig::OFF;
+        // Move: pivot = anchor_start。
+        let sd = section_drag(SectionGesture::Move, 4.0, 4.0, (0.0, 0.0), false);
+        assert!((compute_section_drag_beat_delta(&sd, 1.5, off, 50.0) - 1.5).abs() < 1e-6);
+        // ResizeRight: pivot = anchor_start + anchor_len。
+        let sd = section_drag(SectionGesture::ResizeRight, 4.0, 4.0, (0.0, 0.0), false);
+        assert!((compute_section_drag_beat_delta(&sd, 0.7, off, 50.0) - 0.7).abs() < 1e-6);
+        // Create: pivot = anchor_press_beat (= anchor_start in helper)。
+        let sd = section_drag(SectionGesture::Create, 2.0, 0.0, (0.0, 0.0), false);
+        assert!((compute_section_drag_beat_delta(&sd, 3.0, off, 50.0) - 3.0).abs() < 1e-6);
+    }
+
+    /// `compute_section_drag_beat_delta`: quarter snap で pivot+raw を grid に丸めた差分を返す
+    /// (絶対位置 snap)。 Move pivot=4.0 + raw 1.1 = 5.1 → snap 5.0 → delta 1.0。
+    #[test]
+    fn section_drag_delta_snaps_pivot() {
+        let snap = snap_quarter();
+        let sd = section_drag(SectionGesture::Move, 4.0, 4.0, (0.0, 0.0), false);
+        let d = compute_section_drag_beat_delta(&sd, 1.1, &snap, 50.0);
+        assert!((d - 1.0).abs() < 1e-6, "5.1 → snap 5.0 → delta 1.0: got {d}");
+    }
+
+    /// `beats_per_bar`: 4/4=4、 3/4=3、 6/8=3、 7/8=3.5、 異常 0 は 1 以上に floor。
+    #[test]
+    fn beats_per_bar_time_sigs() {
+        assert!((beats_per_bar((4, 4)) - 4.0).abs() < 1e-6);
+        assert!((beats_per_bar((3, 4)) - 3.0).abs() < 1e-6);
+        assert!((beats_per_bar((6, 8)) - 3.0).abs() < 1e-6);
+        assert!((beats_per_bar((7, 8)) - 3.5).abs() < 1e-6);
+        assert!(beats_per_bar((0, 0)) >= 1.0, "0/0 は 1 以上に floor");
+    }
+
+
+
+    /// id=10, beat 2..6 の clip に share_group hue / in_active_group を載せた test clip。
+    fn shared_clip(in_active: bool, hue: Option<f32>) -> ClipView {
+        let mut c = clip(10, 2.0, 4.0, "shared");
+        c.share_group_color = hue;
+        c.in_active_group = in_active;
+        c
+    }
+
+
+
+
+
+    /// `in_active_group` は viewport_key (heavy cache key) に含まれない: flip しても
+    /// `fold_arrangement_clip_hash` は不変 (= hover 由来の active group 変化で heavy cache を
+    /// 無効化せず、 強調は cached 外 overlay で毎フレーム描く)。
+    #[test]
+    fn fold_arrangement_clip_hash_ignores_in_active_group() {
+        // clone で同一 Arc<str> name を共有させ、 in_active_group だけが異なる 2 clip を作る
+        // (clip() を 2 回呼ぶと name.as_ptr() が変わり hash の name 成分で差が出てしまうため)。
+        let c_off = shared_clip(false, Some(0.33));
+        let mut c_on = c_off.clone();
+        c_on.in_active_group = true;
+        let before = vec![track(0, "t0", vec![c_off])];
+        let after = vec![track(0, "t0", vec![c_on])];
+        assert_eq!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "in_active_group 変化は cache を無効化しない"
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 108 (daw_01 #080): share マークを Video-kind track の clip にも描く
+    // ============================================================
+
+
+
+    /// M14 Phase 89 (daw_01 #060): arrangement の代表 clip fill が共有 `daw_ui_core::color` の閾値の
+    /// 期待側に乗る (黄 selected fill = 明るい側 / 暗青 default fill = 暗い側)。 luminance 関数自体の
+    /// 単調性 / 極値は `daw_ui_core::color` 側で検証済。
+    #[test]
+    fn clip_fills_land_on_expected_contrast_side() {
+        use daw_ui_core::color::{CONTRAST_LUMINANCE_THRESHOLD, relative_luminance};
+        let yellow = relative_luminance(1.0, 0.85, 0.30); // clip_selected_fill
+        let dark_blue = relative_luminance(0.18, 0.40, 0.65); // clip_default_fill
+        assert!(yellow > CONTRAST_LUMINANCE_THRESHOLD, "黄 fill は明るい側: {yellow}");
+        assert!(dark_blue < CONTRAST_LUMINANCE_THRESHOLD, "暗青 fill は暗い側: {dark_blue}");
+        assert!(yellow > dark_blue, "黄 > 暗青 の単調性");
+    }
+
+    /// M14 Phase 89 (daw_01 #060): `clip_text_color_for` が fill 輝度で暗/明文字を選び、
+    /// 半透明 fill は lane bg と合成した実効色で判定し、 opt-out 時は固定色を返す。
+    #[test]
+    fn clip_text_color_for_picks_contrast() {
+        let style = ArrangementStyle::default();
+
+        // 明るい fill (黄 selected) → 暗文字。
+        assert_eq!(
+            clip_text_color_for(&style, style.clip_selected_fill, style.bg),
+            style.clip_text_color_dark,
+            "明るい黄 fill には暗文字"
+        );
+        // 暗い fill (default 青) → 明文字。
+        assert_eq!(
+            clip_text_color_for(&style, style.clip_default_fill, style.bg),
+            style.clip_text_color,
+            "暗い青 fill には明文字"
+        );
+        // 半透明の薄緑 share fill: 不透明なら明るく暗文字寄りだが、 暗い lane bg と alpha 0.3 で
+        // 合成すると実効輝度が下がり明文字が選ばれる (合成判定が効いている証拠)。
+        let pale_green = Color::rgba(0.55, 0.85, 0.55, 0.30);
+        let opaque = clip_text_color_for(
+            &style,
+            Color::rgb(pale_green.r, pale_green.g, pale_green.b),
+            style.bg,
+        );
+        let composited = clip_text_color_for(&style, pale_green, style.bg);
+        assert_eq!(opaque, style.clip_text_color_dark, "不透明な薄緑は暗文字");
+        assert_eq!(
+            composited, style.clip_text_color,
+            "暗 lane bg と合成した薄緑 (alpha 0.3) は明文字"
+        );
+
+        // opt-out: auto を切ると fill に依らず clip_text_color 固定。
+        let mut off = style;
+        off.clip_auto_contrast_text = false;
+        assert_eq!(
+            clip_text_color_for(&off, off.clip_selected_fill, off.bg),
+            off.clip_text_color,
+            "opt-out 時は明るい fill でも clip_text_color 固定"
+        );
+    }
+
+
+    // M14 Phase 61b (#011): fold_arrangement_clip_hash の cache invalidation 性質を verify。
+    // (1) 同一データなら 2 回 fold して同値、 (2) clip.start_beat 変化で hash 変わる、
+    // (3) clip.len_beats 変化で hash 変わる、 (4) clip.id 入替で hash 変わる。
+
+    #[test]
+    fn fold_arrangement_clip_hash_stable_for_unchanged_data() {
+        let tracks = vec![track(
+            10,
+            "t0",
+            vec![clip(100, 0.0, 4.0, "c0"), clip(101, 8.0, 2.0, "c1")],
+        )];
+        let h1 = fold_arrangement_clip_hash(&tracks);
+        let h2 = fold_arrangement_clip_hash(&tracks);
+        assert_eq!(h1, h2, "同じ tracks slice の fold は冪等");
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_move() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let after = vec![track(10, "t0", vec![clip(100, 4.0, 4.0, "c")])]; // start_beat 0 → 4
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.start_beat 変化で hash が変わる (#011 残像 fix)"
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_resize() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let after = vec![track(10, "t0", vec![clip(100, 0.0, 6.0, "c")])]; // len_beats 4 → 6
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.len_beats 変化で hash が変わる (#011 残像 fix)"
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_id_swap() {
+        let before = vec![track(
+            10,
+            "t0",
+            vec![clip(100, 0.0, 4.0, "c"), clip(101, 8.0, 2.0, "d")],
+        )];
+        let after = vec![track(
+            10,
+            "t0",
+            vec![clip(101, 0.0, 4.0, "c"), clip(100, 8.0, 2.0, "d")],
+        )]; // id 入替 (位置同じでも identity 違う)
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.id 入替で hash が変わる (FNV identity 確認)"
+        );
+    }
+
+    /// MIDI clip arm の hash gap fix (share_group_color / color / name) regression test。
+    /// caller が share_group / clip color を変更した frame で viewport_key も更新されることを保証。
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_share_group_color() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let mut c_after = clip(100, 0.0, 4.0, "c");
+        c_after.share_group_color = Some(0.5);
+        let after = vec![track(10, "t0", vec![c_after])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.share_group_color None→Some で hash が変わる",
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_color() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        let mut c_after = clip(100, 0.0, 4.0, "c");
+        c_after.color = Some(daw_ui_renderer::Color::rgb(0.8, 0.2, 0.2));
+        let after = vec![track(10, "t0", vec![c_after])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.color 変化で hash が変わる",
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_clip_rename() {
+        let before = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "old name")])];
+        let after = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "new name")])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "clip.name (Arc<str>) ptr 変化で hash が変わる",
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 63c (#016): group hierarchy + multi-select + reparent
+    // ============================================================
+
+    /// `parent_id` を持つ track 1 つ作る helper (test 専用)。
+    fn track_with_parent(
+        id: u32,
+        name: &str,
+        parent_id: Option<u32>,
+        depth: u8,
+        collapsed: bool,
+    ) -> ArrangementTrack {
+        ArrangementTrack {
+            id,
+            name: Arc::from(name),
+            muted: false,
+            solo: false,
+            armed: false,
+            clips: Vec::new(),
+            volume: 1.0,
+            parent_id,
+            depth,
+            collapsed,
+            kind: TrackKind::Audio,
+            automation_lanes_collapsed: true,
+            automation_lanes: Vec::new(),
+            row_h: None,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn is_group_track_returns_true_when_child_exists() {
+        // `1` (parent) → `2`, `3` (children); `1` is group, `2`/`3` are leaves
+        let tracks = vec![
+            track_with_parent(1, "g", None, 0, false),
+            track_with_parent(2, "c1", Some(1), 1, false),
+            track_with_parent(3, "c2", Some(1), 1, false),
+        ];
+        assert!(is_group_track(1, &tracks), "1 has children → is_group");
+        assert!(!is_group_track(2, &tracks), "2 is leaf → not is_group");
+        assert!(!is_group_track(3, &tracks), "3 is leaf → not is_group");
+    }
+
+    #[test]
+    fn is_visible_track_returns_false_when_ancestor_collapsed() {
+        // `1` collapsed → `2` (child), `3` (grandchild) hidden; `4` (sibling) visible
+        let tracks = vec![
+            track_with_parent(1, "g", None, 0, true),
+            track_with_parent(2, "c1", Some(1), 1, false),
+            track_with_parent(3, "c2", Some(2), 2, false),
+            track_with_parent(4, "leaf", None, 0, false),
+        ];
+        assert!(is_visible_track(&tracks[0], &tracks), "root 自身は visible (collapsed 適用は子のみ)");
+        assert!(!is_visible_track(&tracks[1], &tracks), "親 1 が collapsed → 子 2 は不可視");
+        assert!(!is_visible_track(&tracks[2], &tracks), "祖父 1 が collapsed → 孫 3 は不可視");
+        assert!(is_visible_track(&tracks[3], &tracks), "別 chain の 4 は visible");
+    }
+
+    #[test]
+    fn compute_visible_indices_skips_collapsed_subtree() {
+        let tracks = vec![
+            track_with_parent(1, "g", None, 0, true),
+            track_with_parent(2, "c1", Some(1), 1, false),
+            track_with_parent(3, "c2", Some(2), 2, false),
+            track_with_parent(4, "leaf", None, 0, false),
+        ];
+        let visible = compute_visible_indices(&tracks);
+        assert_eq!(
+            visible,
+            vec![0, 3],
+            "collapsed 親 1 の subtree (2, 3) は skip、 visible は [0, 3]"
+        );
+    }
+
+    #[test]
+    fn disclosure_rect_within_name_rect_left_edge() {
+        // disclosure rect は name_rect の左端から indent_px 幅で切り出し
+        let style = ArrangementStyle::default();
+        let name_rect = Rect { x: 100.0, y: 50.0, w: 120.0, h: 24.0 };
+        let r = disclosure_rect_for(name_rect, &style, 0);
+        assert!((r.x - 100.0).abs() < 1e-6, "disclosure x は name_rect 左端");
+        assert!(r.w >= 8.0, "disclosure 幅は 8px 以上");
+        assert!(r.w <= style.indent_px, "disclosure 幅は indent_px (= 16) 以下");
+        assert!(r.y >= name_rect.y && r.y + r.h <= name_rect.y + name_rect.h, "y range は name_rect 内");
+    }
+
+    #[test]
+    fn select_modifier_single_replaces_selection() {
+        // Single click は selected_tracks を [clicked] で置換 + anchor 更新。
+        // SelectModifier::Single の Edit を caller が apply するだけで動作するため、
+        // Edit 構築側の test は省略 (pure 関数 unit test として selection 計算だけ確認)。
+        let prev: Vec<u32> = vec![5, 10];
+        let clicked = 7_u32;
+        // Single 動作: next = vec![clicked]
+        let next: Vec<u32> = vec![clicked];
+        assert_ne!(prev, next, "Single click で selected_tracks が変わる (置換)");
+        assert_eq!(next, vec![7], "next は clicked 1 件のみ");
+    }
+
+    #[test]
+    fn select_modifier_toggle_adds_or_removes() {
+        // Ctrl+click toggle: clicked が selected に居れば外す、 居なければ追加
+        let prev: Vec<u32> = vec![5, 10];
+        let clicked_in = 5_u32;
+        let clicked_out = 7_u32;
+        // 含まれている case → 削除
+        let mut set: HashSet<u32> = prev.iter().copied().collect();
+        if set.contains(&clicked_in) {
+            set.remove(&clicked_in);
+        } else {
+            set.insert(clicked_in);
+        }
+        let mut v: Vec<u32> = set.into_iter().collect();
+        v.sort_unstable();
+        assert_eq!(v, vec![10], "5 を toggle → 削除");
+        // 含まれていない case → 追加
+        let mut set2: HashSet<u32> = prev.iter().copied().collect();
+        if set2.contains(&clicked_out) {
+            set2.remove(&clicked_out);
+        } else {
+            set2.insert(clicked_out);
+        }
+        let mut v2: Vec<u32> = set2.into_iter().collect();
+        v2.sort_unstable();
+        assert_eq!(v2, vec![5, 7, 10], "7 を toggle → 追加");
+    }
+
+    #[test]
+    fn arrangement_style_has_indent_and_disclosure_defaults() {
+        let s = ArrangementStyle::default();
+        assert!(s.indent_px > 0.0, "indent_px は 0 以上 (default 16)");
+        assert!(s.indent_px <= 32.0, "indent_px は実用範囲 (~16-32) 内");
+        // M14 Phase 113 (daw_01 #085): group track 専用背景 (旧 track_group_bg) は撤去。 group の
+        // 構造手掛かりは disclosure ▶▼ + indent のみなので、 disclosure_color が可視色であることを確認。
+        assert!(
+            s.disclosure_color.r > 0.0 || s.disclosure_color.g > 0.0 || s.disclosure_color.b > 0.0,
+            "disclosure_color は黒以外の色"
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 63j (#024): ruler click / drag による playhead seek
+    // ============================================================
+
+    // ============================================================
+    // M14 Phase 63j (#024): loop range edit に snap 適用
+    // ============================================================
+    //
+    // `compute_loop_drag_endpoints` の unit test 7 件 (Start/End/Middle/NewRange の
+    // snap 適用 / alt bypass / snap OFF) は M14 Phase 69 (#041) で
+    // `daw_ui_core::widgets::ruler_ops::tests` に extract (piano_roll と共有)。
+
+    // -------- M14 Phase 63k (#025): audio_edit grip hit-test + drag commit -----------------------
+
+    /// audio_edit が None の clip では audio_grip_hit が常に None を返す (= MIDI / Vocal clip は
+    /// 既存挙動、 audio gesture は完全 disable)。
+    #[test]
+    fn audio_grip_hit_returns_none_when_audio_edit_is_none() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        // 通常 clip (audio_edit = None) は中央 click でも fade 角 click でも None
+        let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
+        // Get hit at clip middle
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 80.0, 16.0, &style),
+            None,
+            "audio_edit None の clip は GainHandleBand を返さない"
+        );
+        // Get hit at top-left corner
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 6.0, 6.0, &style),
+            None,
+            "audio_edit None の clip は FadeCornerIn を返さない"
+        );
+    }
+
+    /// audio_edit が Some の clip 中央 (handle band) は GainHandleBand を返す。
+    #[test]
+    fn audio_grip_hit_returns_gain_handle_at_clip_middle() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        // clip rect = (0, 2, 160, 28), 中央 (80, 16) は handle band 内
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        // clip 中央 y = r.y + r.h / 2 = 2 + 14 = 16
+        // x = 80 (clip 中央)、 端 (0/160) から 24 px margin 内
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 80.0, 16.0, &style),
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::GainHandleBand))
+        );
+    }
+
+    /// fade in 角 (clip 上端左 12×12) は FadeCornerIn を返す。
+    #[test]
+    fn audio_grip_hit_returns_fade_corner_in_at_top_left() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        // clip rect = (0, 2, 160, 28), top-left 12×12 → cx=6, cy=6 (corner 内)
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 6.0, 6.0, &style),
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn))
+        );
+    }
+
+    /// fade out 角 (clip 上端右 12×12) は FadeCornerOut を返す。
+    #[test]
+    fn audio_grip_hit_returns_fade_corner_out_at_top_right() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        // clip rect = (0, 2, 160, 28), top-right 12×12 → cx=155, cy=6 (corner 内)
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 155.0, 6.0, &style),
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerOut))
+        );
+    }
+
+    /// 短 clip (`r.w < audio_min_clip_w_for_handles_px`) は audio grip 全 disable。
+    #[test]
+    fn audio_grip_hit_returns_none_for_short_clip() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        // len_beats=0.5 → w = 20px、 default min = 32 → grip disable
+        let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 0.5, "c", audio)])];
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 10.0, 16.0, &style),
+            None
+        );
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 2.0, 6.0, &style),
+            None
+        );
+    }
+
+    /// FadeCurve.next() は Linear → Exp → SCurve → Linear の cycle。
+    #[test]
+    fn fade_curve_next_cycles() {
+        assert_eq!(FadeCurve::Linear.next(), FadeCurve::Exponential);
+        assert_eq!(FadeCurve::Exponential.next(), FadeCurve::SCurve);
+        assert_eq!(FadeCurve::SCurve.next(), FadeCurve::Linear);
+    }
+
+    /// compute_audio_drag_outcome: Gain drag は dy 上で gain_db 増加 (pixels_per_db = 0.25 default)。
+    #[test]
+    fn compute_audio_drag_outcome_gain_changes_db_by_pixels() {
+        let style = ArrangementStyle::default();
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::Gain,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (50.0, 14.0),
+            // dy = -20 (上に 20 px) → next_db = 0 + (-(-20) * 0.25) = +5.0
+            last_mouse: (50.0, -6.0),
+            locked_horizontal: Some(false),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::Gain { next_db }) => {
+                assert!((next_db - 5.0).abs() < 1e-3, "+20px = +5dB: got {next_db}");
+            }
+            other => panic!("expected Gain, got {other:?}"),
+        }
+    }
+
+    /// compute_audio_drag_outcome: Gain drag は ±range_db に clamp される。
+    #[test]
+    fn compute_audio_drag_outcome_gain_clamps_to_range() {
+        let style = ArrangementStyle::default(); // range = 24 dB
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        // dy = -200 → +50 dB raw → clamped to +24
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::Gain,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (50.0, 14.0),
+            last_mouse: (50.0, -186.0),
+            locked_horizontal: Some(false),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::Gain { next_db }) => {
+                assert!((next_db - 24.0).abs() < 1e-3, "clamped to +24 dB: got {next_db}");
+            }
+            other => panic!("expected Gain, got {other:?}"),
+        }
+    }
+
+    /// compute_audio_drag_outcome: FadeIn + horizontal lock は dx 正で fade_in_beats 増加。
+    /// beat_per_px = 0.025 (= 40 px/beat), dx = +40 px → +1 beat.
+    #[test]
+    fn compute_audio_drag_outcome_fade_in_horizontal_changes_length() {
+        let style = ArrangementStyle::default();
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeIn,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: (40.0, 0.0),
+            locked_horizontal: Some(true),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::FadeLength { edge, next_beats }) => {
+                assert_eq!(edge, FadeEdge::In);
+                // anchor 0.5 + delta 1.0 = 1.5
+                assert!((next_beats - 1.5).abs() < 1e-6, "got {next_beats}");
+            }
+            other => panic!("expected FadeLength, got {other:?}"),
+        }
+    }
+
+    /// FadeOut + horizontal lock は dx **負** で fade_out_beats 増加 (右側から内側に伸びる)。
+    #[test]
+    fn compute_audio_drag_outcome_fade_out_horizontal_uses_negative_dx() {
+        let style = ArrangementStyle::default();
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.5,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeOut,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (160.0, 0.0),
+            last_mouse: (120.0, 0.0), // dx = -40
+            locked_horizontal: Some(true),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::FadeLength { edge, next_beats }) => {
+                assert_eq!(edge, FadeEdge::Out);
+                // dx=-40 → -40 * 0.025 = -1.0、 FadeOut signed = -(-1) = +1
+                // anchor 0.5 + 1.0 = 1.5
+                assert!((next_beats - 1.5).abs() < 1e-6, "got {next_beats}");
+            }
+            other => panic!("expected FadeLength, got {other:?}"),
+        }
+    }
+
+    /// fade length は `0..=clip_len_beats` に clamp される。
+    #[test]
+    fn compute_audio_drag_outcome_fade_length_clamps_to_clip_len() {
+        let style = ArrangementStyle::default();
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        // dx = +400 px @ 0.025 beat/px = +10 beat → 0.5 + 10 = 10.5、 clamp to clip_len 4.0
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeIn,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: (400.0, 0.0),
+            locked_horizontal: Some(true),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::FadeLength { next_beats, .. }) => {
+                assert!((next_beats - 4.0).abs() < 1e-6, "clamped to 4.0: got {next_beats}");
+            }
+            other => panic!("expected FadeLength, got {other:?}"),
+        }
+    }
+
+    /// FadeIn + vertical lock は curve 切替を返す (Linear → Exponential)。
+    #[test]
+    fn compute_audio_drag_outcome_fade_in_vertical_toggles_curve() {
+        let style = ArrangementStyle::default();
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeIn,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: (0.0, -20.0),
+            locked_horizontal: Some(false),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::FadeCurve { edge, next_curve }) => {
+                assert_eq!(edge, FadeEdge::In);
+                assert_eq!(next_curve, FadeCurve::Exponential);
+            }
+            other => panic!("expected FadeCurve, got {other:?}"),
+        }
+    }
+
+    /// sticky direction 未確定 (locked_horizontal = None) は no-op (None) を返す。
+    #[test]
+    fn compute_audio_drag_outcome_unlocked_returns_none() {
+        let style = ArrangementStyle::default();
+        let audio = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeIn,
+            anchor: audio,
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: (3.0, 4.0), // < threshold 10 px
+            locked_horizontal: None,
+        };
+        assert_eq!(compute_audio_drag_outcome(&ad, 0.025, &style), None);
+    }
+
+    /// fold_arrangement_clip_hash: audio_edit の gain_db / fade を変えると hash が変わる。
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_gain_db() {
+        let audio_a = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let audio_b = ClipViewAudioEdit { gain_db: 3.0, ..audio_a };
+        let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_a)])];
+        let after = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_b)])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "audio_edit.gain_db 変化で hash が変わる (cache 再構築保証)"
+        );
+    }
+
+    #[test]
+    fn fold_arrangement_clip_hash_changes_on_fade_curve() {
+        let audio_a = ClipViewAudioEdit {
+            gain_db: 0.0,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+        };
+        let audio_b = ClipViewAudioEdit {
+            fade_in_curve: FadeCurve::Exponential,
+            ..audio_a
+        };
+        let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_a)])];
+        let after = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_b)])];
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after),
+            "audio_edit.fade_in_curve 変化で hash が変わる"
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 63n-7 (daw_01 #033): Bezier S 字 cubic + Exponential variant の flatten 検証
+    // ============================================================
+
+    /// 出力点列から (画面 x=cx) に最も近い点の y を線形補間で求める。 polyline 内挿。
+    fn sample_polyline_y(pts: &[(f32, f32)], cx: f32) -> f32 {
+        assert!(pts.len() >= 2);
+        for w in pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let (lo_x, hi_x) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
+            if cx >= lo_x && cx <= hi_x {
+                if (b.0 - a.0).abs() < 1e-6 {
+                    return a.1; // 垂直 segment は始点 y を返す (Hold の立ち上がり等は test 対象外)
+                }
+                let t = (cx - a.0) / (b.0 - a.0);
+                return a.1 + (b.1 - a.1) * t;
+            }
+        }
+        // 端 fallback
+        if cx <= pts.first().unwrap().0 {
+            pts.first().unwrap().1
+        } else {
+            pts.last().unwrap().1
+        }
+    }
+
+    /// 端点 (p1, p2) を常に通る (= 描画ズレなし) ことを確認。
+    #[test]
+    fn flatten_segment_endpoints_exact_for_all_curve_kinds() {
+        let p1 = (10.0_f32, 100.0_f32);
+        let p2 = (50.0_f32, 40.0_f32);
+        for kind in [
+            ArrangementCurveKind::Hold,
+            ArrangementCurveKind::Linear,
+            ArrangementCurveKind::Bezier { tension: 0.0 },
+            ArrangementCurveKind::Bezier { tension: 0.5 },
+            ArrangementCurveKind::Bezier { tension: -0.5 },
+            ArrangementCurveKind::Exponential { bend: 0.0 },
+            ArrangementCurveKind::Exponential { bend: 0.8 },
+            ArrangementCurveKind::Exponential { bend: -0.8 },
+        ] {
+            let mut out = vec![p1];
+            flatten_lane_segment(p1, p1, p2, p2, kind, 2.0, &mut out);
+            let last = *out.last().expect("at least 1 point pushed");
+            assert!(
+                (last.0 - p2.0).abs() < 1e-3 && (last.1 - p2.1).abs() < 1e-3,
+                "{kind:?}: 出力末尾 = p2 を期待 (got {last:?})"
+            );
+        }
+    }
+
+    /// Bezier { tension: 0.0 } は **直線**に縮退する (制御点 4 つが対角線上 = daw_01 SSoT の数値性質)。
+    /// 中央 (x=p1.x + dx/2) で y = (p1.y + p2.y) / 2 ± 0.5 px 以内。
+    #[test]
+    fn bezier_tension_zero_is_linear() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 60.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Bezier { tension: 0.0 },
+            2.0,
+            &mut out,
+        );
+        let mid_y = sample_polyline_y(&out, 50.0);
+        let linear_mid = (p1.1 + p2.1) * 0.5;
+        assert!(
+            (mid_y - linear_mid).abs() < 0.5,
+            "tension=0 で中央は線形中点 = {linear_mid}: got {mid_y}"
+        );
+    }
+
+    /// Bezier { tension: +1.0 } で中央 y が **prev に偏る** (= 滑らかな S 字、 前半 prev に張り付く)。
+    /// daw_01 SSoT: tension=+1 で c1y=p1.y, c2y=p2.y (end-hold)、 cubic Bezier の中点 y は
+    /// `1/8*p1.y + 3/8*c1y + 3/8*c2y + 1/8*p2.y = 1/8*p1 + 3/8*p1 + 3/8*p2 + 1/8*p2 = 1/2*p1 + 1/2*p2`
+    /// ではなく、 x(t)=t なので t=0.5 で y(0.5) = (1/2)(p1 + p2)。 ふむ、 これは中点が線形と同じか?
+    ///
+    /// 実際には c1y=p1.y で c2y=p2.y のとき、 y(t) = (1-t)^3*p1 + 3(1-t)^2*t*p1 + 3(1-t)*t^2*p2 + t^3*p2
+    /// = p1 * [(1-t)^3 + 3(1-t)^2*t] + p2 * [3(1-t)*t^2 + t^3]
+    /// = p1 * (1-t)^2 * [(1-t) + 3t] + p2 * t^2 * [3(1-t) + t]
+    /// = p1 * (1-t)^2 * (1 + 2t) + p2 * t^2 * (3 - 2t)
+    /// t=0.5 で y = p1 * 0.25 * 2 + p2 * 0.25 * 2 = 0.5*p1 + 0.5*p2 (= 線形中点)
+    ///
+    /// したがって中点は線形と同じだが、 **t=0.25 / 0.75** で差が出る。 t=0.25 で:
+    /// y(0.25) = p1 * 0.5625 * 1.5 + p2 * 0.0625 * 2.5 = p1 * 0.84375 + p2 * 0.15625
+    /// (線形は p1 * 0.75 + p2 * 0.25、 = +0.09375 だけ p1 寄り)
+    #[test]
+    fn bezier_tension_positive_pulls_toward_endpoints() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Bezier { tension: 1.0 },
+            2.0,
+            &mut out,
+        );
+        // t=0.25 (= x=25) で y は線形 25 より小さい (= p1 寄り = 0 寄り)
+        let y_at_25 = sample_polyline_y(&out, 25.0);
+        assert!(
+            y_at_25 < 25.0 - 5.0,
+            "tension=+1 で x=25 の y は線形 25 より明確に小さい (got {y_at_25})"
+        );
+        // t=0.75 (= x=75) で y は線形 75 より大きい (= p2 寄り = 100 寄り)
+        let y_at_75 = sample_polyline_y(&out, 75.0);
+        assert!(
+            y_at_75 > 75.0 + 5.0,
+            "tension=+1 で x=75 の y は線形 75 より明確に大きい (got {y_at_75})"
+        );
+    }
+
+    /// Bezier { tension: -1.0 } で overshoot 反転 S 字 (= 前半 p2 側、 後半 p1 側に張り出す)。
+    /// daw_01 SSoT: tension=-1 で c1y=p2.y, c2y=p1.y (反転 end-hold)。
+    /// x=25 で y は線形 25 より大きい (= p2=100 寄り)、 x=75 で y は線形 75 より小さい (= p1=0 寄り)。
+    #[test]
+    fn bezier_tension_negative_inverts_s_curve() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Bezier { tension: -1.0 },
+            2.0,
+            &mut out,
+        );
+        let y_at_25 = sample_polyline_y(&out, 25.0);
+        assert!(
+            y_at_25 > 25.0 + 5.0,
+            "tension=-1 で x=25 の y は線形 25 より明確に大きい (overshoot、 got {y_at_25})"
+        );
+        let y_at_75 = sample_polyline_y(&out, 75.0);
+        assert!(
+            y_at_75 < 75.0 - 5.0,
+            "tension=-1 で x=75 の y は線形 75 より明確に小さい (overshoot、 got {y_at_75})"
+        );
+    }
+
+    /// Exponential { bend: +1.0 } は t^2 (二次曲線、 前半遅・後半速)、 t=0.5 で y = 0.25 * (p2 - p1) + p1。
+    /// daw_01 SSoT と完全一致。
+    #[test]
+    fn exponential_bend_positive_is_quadratic() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Exponential { bend: 1.0 },
+            2.0,
+            &mut out,
+        );
+        // t=0.5 で y = 0.5^2 * 100 = 25
+        let y_at_50 = sample_polyline_y(&out, 50.0);
+        assert!(
+            (y_at_50 - 25.0).abs() < 1.0,
+            "bend=+1 で x=50 の y = 25 (t^2): got {y_at_50}"
+        );
+    }
+
+    /// Exponential { bend: -1.0 } は t^0.5 (平方根、 前半速・後半遅)、 t=0.5 で y ≈ 0.707 * (p2 - p1) + p1。
+    #[test]
+    fn exponential_bend_negative_is_sqrt() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Exponential { bend: -1.0 },
+            2.0,
+            &mut out,
+        );
+        // t=0.5 で y = 0.5^0.5 * 100 ≈ 70.71
+        let y_at_50 = sample_polyline_y(&out, 50.0);
+        assert!(
+            (y_at_50 - 70.71).abs() < 1.5,
+            "bend=-1 で x=50 の y ≈ 70.71 (sqrt(t)): got {y_at_50}"
+        );
+    }
+
+    /// Exponential { bend: 0.0 } は **直線** (t^1)。
+    #[test]
+    fn exponential_bend_zero_is_linear() {
+        let p1 = (0.0_f32, 0.0_f32);
+        let p2 = (100.0_f32, 100.0_f32);
+        let mut out = vec![p1];
+        flatten_lane_segment(
+            p1,
+            p1,
+            p2,
+            p2,
+            ArrangementCurveKind::Exponential { bend: 0.0 },
+            2.0,
+            &mut out,
+        );
+        let y_at_50 = sample_polyline_y(&out, 50.0);
+        assert!(
+            (y_at_50 - 50.0).abs() < 1.0,
+            "bend=0 で x=50 の y = 50 (linear): got {y_at_50}"
+        );
+    }
+
+    // ============================================================
+    // M14 Phase 77 (daw_01 #048): 縦 scroll 時の scissor 動作 unit test
+    // ============================================================
+
+    // ============================================================
+    // M14 Phase 117 (daw_01 #091): header 幅 drag splitter
+    // ============================================================
+
+    /// `header_resize_splitter_at` が境界 `rect.x + header_w` 中心 ±handle/2 の縦帯 × 全高で hit、
+    /// 帯の外 / header_w=0 / handle=0 で miss する。
+    #[test]
+    fn header_resize_splitter_at_hits_centered_full_height_band() {
+        let style = ArrangementStyle::default(); // header_resize_handle_px = 8 → ±4
+        let rect = Rect { x: 100.0, y: 50.0, w: 800.0, h: 400.0 };
+        let header_w = 160.0;
+        let boundary = 100.0 + 160.0; // = 260
+        // 境界中心: hit。
+        assert!(header_resize_splitter_at(rect, header_w, &style, boundary, 200.0));
+        // 全高で hit (上端 / 下端近く)。
+        assert!(header_resize_splitter_at(rect, header_w, &style, boundary, 50.0));
+        assert!(header_resize_splitter_at(rect, header_w, &style, boundary, 449.0));
+        // 帯端 (±4px) 内側: hit (256) / 外側: miss (255.9 は < 256 で外、 264 は半開で外)。
+        assert!(header_resize_splitter_at(rect, header_w, &style, 256.0, 200.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, 255.0, 200.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, 264.0, 200.0));
+        // rect の外 (上 / 下): miss。
+        assert!(!header_resize_splitter_at(rect, header_w, &style, boundary, 49.0));
+        assert!(!header_resize_splitter_at(rect, header_w, &style, boundary, 450.0));
+        // header_w = 0 (header 無し): 常に miss。
+        assert!(!header_resize_splitter_at(rect, 0.0, &style, 100.0, 200.0));
+        // handle = 0: 無効化。
+        let no_handle = ArrangementStyle { header_resize_handle_px: 0.0, ..ArrangementStyle::default() };
+        assert!(!header_resize_splitter_at(rect, header_w, &no_handle, boundary, 200.0));
+    }
+
+    // ============================================================
+    // M14 Phase 118 (daw_01 #092): group track 名 double-click rename の信頼性
+    // ============================================================
+
+    // ============================================================
+    // M14 Phase 125 (#102): plain-drag marquee select (REPLACE / UNION / XOR)
+    // ============================================================
+
+
+
+
+    // ============================================================
+    // daw_01 #071: automation clip 複数選択 (box-drag / shift-click / multi-move)
+    // ============================================================
+
+
+

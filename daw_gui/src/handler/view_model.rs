@@ -1091,7 +1091,10 @@ impl AppData {
                         .insert(t.id, std::sync::Arc::from(t.name.as_str()));
                     for c in &t.clips {
                         cache.content_labels.entry(c.content_id).or_insert_with(|| {
-                            crate::view::arrangement_view::clip_display_label(c, self.song_doc.song())
+                            crate::widgets::arrangement::view_build::clip_display_label(
+                                c,
+                                self.song_doc.song(),
+                            )
                         });
                     }
                 }

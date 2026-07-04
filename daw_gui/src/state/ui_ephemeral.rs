@@ -16,7 +16,7 @@ pub struct UiEphemeral {
     /// GPU-side video thumbnail textures keyed by `VideoSourceId`.
     /// Written by the runner (P3.5) after a successful texture upload;
     /// read by `arrangement_view.rs` (P3.6) and passed to
-    /// `ArrangementClip.thumbnail`.
+    /// `ClipView.thumbnail`.
     pub video_texture_cache:
         std::collections::HashMap<common::model::VideoSourceId, daw_ui_renderer::TextureHandle>,
     /// v13: GPU-side image textures keyed by `ImageSourceId`. Written
@@ -242,7 +242,7 @@ pub struct UiEphemeral {
     /// 1 undo step にまとまり、 変更しないまま閉じても dead step が増えない。
     pub color_picker_session_dirty: bool,
 
-    /// gui_01 #071: 空きレーン右クリック (`ArrangementEditRequest::SecondaryClickEmpty`)
+    /// gui_01 #071: 空きレーン右クリック (空きレーン右クリック SecondaryClickEmpty)
     /// で開く clip 生成コンテキストメニューの stash。`Some((track_id, snap 済み beat,
     /// 右クリック viewport pos))` の間、毎フレーム `ui.context_menu_at` で `pos` に
     /// メニューを描画する (color_picker overlay と同 idiom)。on_select (= Text クリップ

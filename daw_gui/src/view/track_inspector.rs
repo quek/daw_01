@@ -3144,7 +3144,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // ---- 親グループ (Parent) の編集 UI はインスペクタから撤去した ----
     // 親子 (グループ階層) の編集はアレンジビューでのトラックドラッグ
-    // (`ArrangementEditRequest::SetTrackParent`) 一本に統一する。階層は
+    // (drag reparent SetTrackParent) 一本に統一する。階層は
     // アレンジの入れ子インデントで可視化されるので、同じ概念をインスペクタの
     // ドロップダウンでも編集できると Single Source of Truth が崩れる。
     // `AppEvent::SetTrackParent` / `action_set_track_parent` 自体はアレンジ

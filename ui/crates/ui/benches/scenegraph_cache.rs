@@ -3,7 +3,7 @@
 //! 1000 ボタンの UI を 1 フレーム描画する CPU コストを、
 //! - `cached`: input_hash が前フレームと一致 → cache hit、draw_fn スキップ
 //! - `no_cache`: text を毎フレーム変えて hash 不一致 → cache miss、draw_fn 実行
-//! の 2 シナリオで比較する。
+//!   の 2 シナリオで比較する。
 //!
 //! 期待: cached が大幅 (10x+) に速い。これが scenegraph cache の主目的。
 
@@ -26,10 +26,10 @@ fn button_rect(i: usize) -> Rect {
 }
 
 fn render_buttons(host: &mut UiHost<()>, scene: &mut Scene, screen: PhysicalSize, label: &str) {
-    host.frame_to_edits(&(), scene, screen, FrameInput::default(), |_, ui| {
+    host.frame_to_edits(&(), scene, screen, FrameInput::default(), |(), ui| {
         for i in 0..N_BUTTONS {
             ui.button_at(("btn", i), label, button_rect(i), || {
-                Edit::mutate(|_: &mut ()| {})
+                Edit::mutate(|(): &mut ()| {})
             });
         }
     });

@@ -179,7 +179,7 @@ impl AppData {
     /// Phase 6 review fix: project load 直後に `self.song_doc.song().audio_sources` 全件
     /// を WAV decode して `self.media.audio_source_cache` に詰める。 旧コードでは
     /// この path が欠落していて、 saved project を開いた audio clip の波形が
-    /// 表示されなかった (= `arrangement_view::draw_audio_clip_waveform` で
+    /// 表示されなかった (= arrangement widget の波形 overlay で
     /// `audio_source_cache.get(event.source_id) → None`)。 import 経由 (=
     /// drag&drop / Open Import Audio) で session 中に追加した source は import_one
     /// が即 decode + cache 投入していたので、 そちらだけ波形が出るという

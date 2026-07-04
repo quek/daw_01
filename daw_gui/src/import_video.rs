@@ -294,7 +294,7 @@ pub struct ThumbnailFrame {
 
 /// Decode a single representative frame from a video and return it as
 /// RGBA8. Used at import time to build the arrangement-view clip
-/// thumbnail (gui_01 #044 `ArrangementClip.thumbnail`). The reader is
+/// thumbnail (gui_01 #044 `ClipView.thumbnail`). The reader is
 /// configured to deliver `MFVideoFormat_RGB32` (= BGRA byte order
 /// under WMF's little-endian DIB convention); we swap channels into
 /// RGBA at copy time so callers downstream get the standard layout

@@ -979,7 +979,7 @@ fn daw_clip_display_label(
         else {
             return String::new();
         };
-        crate::view::arrangement_view::clip_display_label(clip, song).to_string()
+        crate::widgets::arrangement::view_build::clip_display_label(clip, song).to_string()
     });
     Ok(JsString::from(label.as_str()).into())
 }
