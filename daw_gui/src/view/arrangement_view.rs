@@ -190,7 +190,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let labels = app.arrangement_labels();
     // D4 同件: lane build の context refs を束ねる (clippy too_many_arguments 回避)。
     let lane_build_data = LaneBuildData {
-        song: &app.song_doc.song(),
+        song: app.song_doc.song(),
         refcount_by_content: &refcount_by_content,
         lane_height_overrides: &app.ui_prefs.automation_lane_row_overrides,
         content_names: &labels.content_names,
@@ -255,7 +255,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         .content_labels
                         .get(&c.content_id)
                         .cloned()
-                        .unwrap_or_else(|| clip_display_label(c, &app.song_doc.song())),
+                        .unwrap_or_else(|| clip_display_label(c, app.song_doc.song())),
                     // v18 (`docs/plan_track_clip_color.md`): clip は effective
                     // 色 (個別上書き or トラック色継承) で塗る。共有 clip
                     // (refcount >= 2) では widget が `share_group_color` (hue) を

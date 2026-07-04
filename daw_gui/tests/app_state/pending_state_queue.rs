@@ -58,9 +58,9 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     // v29: RemoveSlotPlugin は安定 device_id addressing。 削除実行後は song
     // から引けなくなるので、 実行前にここで捕まえる。
     let bitcrush_dev =
-        daw_gui::app::device_id_at(&app.song_doc.song(), track_id, 1).expect("bitcrush device id");
+        daw_gui::app::device_id_at(app.song_doc.song(), track_id, 1).expect("bitcrush device id");
     let delay_dev =
-        daw_gui::app::device_id_at(&app.song_doc.song(), track_id, 2).expect("delay device id");
+        daw_gui::app::device_id_at(app.song_doc.song(), track_id, 2).expect("delay device id");
 
     // pending_state_queue は初期で空。
     assert!(app.ipc.pending_state_queue.is_empty(), "queue starts empty");
@@ -164,9 +164,9 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     // 積まれるが、 ここでは「2 連続 RemoveSlot で 2 つ追加された」 ことを
     // 確認できれば十分なので最小値だけ assert する。
     assert!(
-        app.song_doc.undo_stack.len() >= 2,
+        app.song_doc.undo_depth() >= 2,
         "at least 2 snapshots from the 2 deferred edits: {}",
-        app.song_doc.undo_stack.len()
+        app.song_doc.undo_depth()
     );
 }
 

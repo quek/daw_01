@@ -115,7 +115,7 @@ pub fn load_instrument(app: &mut AppData) {
 /// pending generation をそのまま返す (= production の echo と同じ)。
 /// 戻り値は device_id (以後の `ClosePluginShmem` 等の assert 用)。
 pub fn fake_plugin_loaded(app: &mut AppData, track_id: u32, index: u32, id: &str) -> u64 {
-    let device_id = daw_gui::app::device_id_at(&app.song_doc.song(), track_id, index)
+    let device_id = daw_gui::app::device_id_at(app.song_doc.song(), track_id, index)
         .expect("fake_plugin_loaded: no device at (track_id, index)");
     let generation = app
         .ipc.pending_plugin_loads

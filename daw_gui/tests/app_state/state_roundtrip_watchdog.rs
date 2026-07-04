@@ -50,7 +50,7 @@ fn hang_during_save_and_quit_aborts_roundtrip_and_unblocks_guard() {
     let (mut app, _rx) = build_app();
     load_instrument(&mut app);
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.request_close();
 
     // 「保存して終了」: plugin 有りなので state 取得待ちの非同期保存 (round-trip in flight)。
@@ -89,7 +89,7 @@ fn hang_during_save_and_quit_aborts_roundtrip_and_unblocks_guard() {
     assert!(!path.exists(), "nothing saved (host never returned state)");
 
     // 以後ふたたびガードが開ける (= ロックされていない)。
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::New);
     assert_eq!(
         app.ui_ephemeral.dirty_guard,
@@ -167,7 +167,7 @@ fn watchdog_suppressed_during_export_then_fires_after() {
     let (mut app, _rx) = build_app();
     load_instrument(&mut app);
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::Save);
     assert!(!app.ipc.pending_state_queue.is_empty(), "save round-trip in flight");
 
@@ -211,7 +211,7 @@ fn roundtrip_with_no_plugin_host_aborts_immediately() {
     // crash 後 respawn 断念で host が居ない状況を模す (plugin_tx=None、 song は plugin 保持)。
     app.ipc.plugin_tx = None;
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
 
     app.handle_event(AppEvent::Save);
 
@@ -224,7 +224,7 @@ fn roundtrip_with_no_plugin_host_aborts_immediately() {
     assert!(!path.exists(), "save did not complete (no plugin states available)");
 
     // 以後もガードは生きている (恒久ロックしない)。
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::New);
     assert_eq!(
         app.ui_ephemeral.dirty_guard,
@@ -243,7 +243,7 @@ fn watchdog_does_not_fire_after_roundtrip_completes() {
     let (mut app, _rx) = build_app();
     load_instrument(&mut app);
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::Save);
     assert!(!app.ipc.pending_state_queue.is_empty(), "save round-trip in flight");
 

@@ -58,21 +58,23 @@ fn add_track_automation_clip(
     start: f64,
     len: f64,
 ) {
-    app.song_doc.song().tracks[track_idx].automation_lanes.push(AutomationLane {
-        id: lane_id,
-        target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-        default_value: 0.0,
-        enabled: true,
-        visible: true,
-        height_px: 60,
-        clips: vec![AutomationClip {
-            id: clip_id,
-            name: String::new(),
-            start_beat: start,
-            length_beats: len,
-            content_id: 0,
-        }],
-        next_clip_id: clip_id + 1,
+    app.edit_song(|song| {
+        song.tracks[track_idx].automation_lanes.push(AutomationLane {
+            id: lane_id,
+            target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+            default_value: 0.0,
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            clips: vec![AutomationClip {
+                id: clip_id,
+                name: String::new(),
+                start_beat: start,
+                length_beats: len,
+                content_id: 0,
+            }],
+            next_clip_id: clip_id + 1,
+        });
     });
 }
 
@@ -123,21 +125,23 @@ fn z_縦ズームは_automation_clip_の_track_を対象にする() {
 fn z_縦ズームは_master_行の_automation_clip_を行_0_として扱う() {
     let (mut app, _rx) = build_app();
     // master (song-level) lane に automation clip を置く。
-    app.song_doc.song().song_lanes.push(AutomationLane {
-        id: 1,
-        target: AutomationTarget::SongTempo,
-        default_value: 120.0,
-        enabled: true,
-        visible: true,
-        height_px: 60,
-        clips: vec![AutomationClip {
+    app.edit_song(|song| {
+        song.song_lanes.push(AutomationLane {
             id: 1,
-            name: String::new(),
-            start_beat: 8.0,
-            length_beats: 4.0,
-            content_id: 0,
-        }],
-        next_clip_id: 2,
+            target: AutomationTarget::SongTempo,
+            default_value: 120.0,
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: String::new(),
+                start_beat: 8.0,
+                length_beats: 4.0,
+                content_id: 0,
+            }],
+            next_clip_id: 2,
+        });
     });
     app.ui_ephemeral.last_arrange_canvas_size = (800.0, 600.0);
     app.selection.selected_automation_clips = vec![AutomationClipKey {
@@ -162,11 +166,13 @@ fn z_は対象面ごとに片方の選択だけを_framing_する() {
     let (mut app, _rx) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
     // 通常 MIDI clip を beat 0..4 に。
-    app.song_doc.song().tracks[0].clips.push(Clip {
-        id: 1,
-        start_beat: 0.0,
-        length_beats: 4.0,
-        ..Default::default()
+    app.edit_song(|song| {
+        song.tracks[0].clips.push(Clip {
+            id: 1,
+            start_beat: 0.0,
+            length_beats: 4.0,
+            ..Default::default()
+        });
     });
     app.selection.selected_clips = vec![ClipKey { track_id, clip_id: 1 }];
     // automation clip を beat 8..12 に。 両方が同時選択された状態。
@@ -225,15 +231,17 @@ fn lane_拡大は_fresh_zoom_で破棄_fit_で行高に_scale_される() {
     let track_id = app.song_doc.song().tracks[0].id;
     // lane 1 (clip 1 @ 8..12) と通常 MIDI clip (@ 0..4)。 lane を展開状態にする
     // (= 実機で automation clip を選べる前提)。
-    app.song_doc.song().tracks[0].automation_lanes.push(AutomationLane {
-        id: 1,
-        target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-        default_value: 0.0,
-        enabled: true,
-        visible: true,
-        height_px: 60,
-        clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0 }],
-        next_clip_id: 2,
+    app.edit_song(|song| {
+        song.tracks[0].automation_lanes.push(AutomationLane {
+            id: 1,
+            target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+            default_value: 0.0,
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0 }],
+            next_clip_id: 2,
+        });
     });
     app.edit_song(|song| song.tracks[0].clips.push(Clip { id: 1, start_beat: 0.0, length_beats: 4.0, ..Default::default() }));
     app.ui_prefs.expanded_automation_tracks.insert(track_id);
@@ -279,18 +287,20 @@ fn z_は別_clip_を選び直すと新しい選択へ横ズームし直す() {
     let (mut app, _rx) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
     // lane 1 に 2 つの automation clip (beat 8..12 と 20..24)。
-    app.song_doc.song().tracks[0].automation_lanes.push(AutomationLane {
-        id: 1,
-        target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-        default_value: 0.0,
-        enabled: true,
-        visible: true,
-        height_px: 60,
-        clips: vec![
-            AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0 },
-            AutomationClip { id: 2, name: String::new(), start_beat: 20.0, length_beats: 4.0, content_id: 0 },
-        ],
-        next_clip_id: 3,
+    app.edit_song(|song| {
+        song.tracks[0].automation_lanes.push(AutomationLane {
+            id: 1,
+            target: AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
+            default_value: 0.0,
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            clips: vec![
+                AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0 },
+                AutomationClip { id: 2, name: String::new(), start_beat: 20.0, length_beats: 4.0, content_id: 0 },
+            ],
+            next_clip_id: 3,
+        });
     });
     app.ui_ephemeral.last_arrange_canvas_size = (800.0, 600.0);
 

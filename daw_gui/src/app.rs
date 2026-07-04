@@ -16,8 +16,6 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const UNDO_LIMIT: usize = 200;
-
 use common::model::{
     AudioContent, AudioEvent, Clip, ClipContent, InstrumentSource, MidiContent, Note, SendMode,
     Song, Track,
@@ -1605,7 +1603,7 @@ impl AppData {
     /// at it via `parent_group_id`. The role is purely derived — there
     /// is no `Track::kind` field. SSOT (CLAUDE.md).
     pub fn is_group_track(&self, track_id: u32) -> bool {
-        crate::group_compose::is_group_track(&self.song_doc.song(), track_id)
+        crate::group_compose::is_group_track(self.song_doc.song(), track_id)
     }
 
     /// A track acts as a "return" iff at least one other track has a
@@ -2087,7 +2085,7 @@ impl AppData {
         // v29: target は安定 device_id。 positional cache
         // (`plugin_params`) へは逆引きで繋ぐ (S3b で cache 自体を id 化)。
         let _ = track_id;
-        let (t, device_index) = find_device_by_id(&self.song_doc.song(), *device_id)?;
+        let (t, device_index) = find_device_by_id(self.song_doc.song(), *device_id)?;
         let params = self.ipc.plugin_params.get(&(t, device_index))?;
         let info = params.iter().find(|p| p.id == *param_id)?;
         (info.max_value > info.min_value).then_some((info.min_value, info.max_value))
@@ -2108,7 +2106,7 @@ impl AppData {
             return None;
         };
         let _ = track_id;
-        let (t, device_index) = find_device_by_id(&self.song_doc.song(), *device_id)?;
+        let (t, device_index) = find_device_by_id(self.song_doc.song(), *device_id)?;
         let info = self
             .ipc.plugin_params
             .get(&(t, device_index))?
@@ -2186,7 +2184,7 @@ impl AppData {
         // modulated value equals the base and the tick is redundant noise).
         let live_display = (!entries.is_empty()).then(|| {
             let live_model = common::automation::apply_modulation_with_scalars(
-                &self.song_doc.song(),
+                self.song_doc.song(),
                 target,
                 model_base,
                 routings,
@@ -2666,7 +2664,7 @@ impl AppData {
                         .insert(t.id, std::sync::Arc::from(t.name.as_str()));
                     for c in &t.clips {
                         cache.content_labels.entry(c.content_id).or_insert_with(|| {
-                            crate::view::arrangement_view::clip_display_label(c, &self.song_doc.song())
+                            crate::view::arrangement_view::clip_display_label(c, self.song_doc.song())
                         });
                     }
                 }
@@ -5661,7 +5659,7 @@ impl AppData {
             } => {
                 // v29: device_id → 旧 (track_id, index) 座標へ逆引きして
                 // 既存の positional cache に繋ぐ (S3b で cache 自体を id 化)。
-                if let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) {
+                if let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) {
                     self.ipc.plugin_params.insert((track, index), params);
                     self.ipc.slot_has_gui.insert((track, index), has_embedded_gui);
                 }
@@ -5671,7 +5669,7 @@ impl AppData {
                 param_id,
                 display_name,
             } => {
-                let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) else {
+                let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) else {
                     return; // 削除済み device の stale event
                 };
                 // Phase 2c: host から来る `display_name` は placeholder
@@ -5708,7 +5706,7 @@ impl AppData {
                 // device_index, param_id) cache に保存。
                 // `current_plain_value(PluginParam)` が record tick でこの値を
                 // read して point を生成する。
-                if let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) {
+                if let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) {
                     self.ipc.plugin_param_values
                         .insert((track, index, param_id), value);
                 }
@@ -5717,7 +5715,7 @@ impl AppData {
                 self.handle_child_disconnected(kind);
             }
             AppEvent::PluginParamGestureEndFromChild { device_id, param_id } => {
-                let Some((track, _index)) = find_device_by_id(&self.song_doc.song(), device_id) else {
+                let Some((track, _index)) = find_device_by_id(self.song_doc.song(), device_id) else {
                     return;
                 };
                 // Phase 4 Step C-3: plugin GUI knob release。 mixer の
@@ -6977,7 +6975,7 @@ impl AppData {
                         // 入力 (notes / 歌詞 / bpm / mouth_map / binding / clip 位置) が
                         // 前回の再生成時から変わっていなければスキップ。track rename / 色 /
                         // mute / volume 等の非入力編集による無駄な再生成を防ぐ。
-                        let fp = Self::lipsync_input_fingerprint(&self.song_doc.song(), target);
+                        let fp = Self::lipsync_input_fingerprint(self.song_doc.song(), target);
                         if self.voicevox.lipsync_fingerprints.get(&target) == Some(&fp) {
                             continue;
                         }
@@ -7503,7 +7501,7 @@ impl AppData {
             return;
         }
         self.song_doc.normalize(|song| {
-            let mut resolve = |devices: &mut [common::model::PluginInstance]| {
+            let resolve = |devices: &mut [common::model::PluginInstance]| {
                 for d in devices.iter_mut() {
                     if d.ports == default_ports
                         && let Some(entry) = db.find_by_id(&d.plugin_id)
@@ -7876,7 +7874,7 @@ impl AppData {
         // autosave も表示状態を同梱する (= ダーティでなくても view が
         // 永続化される → スクロール/ズーム変更が `*` を立てずに次回 open で復元される)。
         let view = self.snapshot_view_state();
-        match common::project::save_project(&autosave_path, &self.song_doc.song(), Some(&view)) {
+        match common::project::save_project(&autosave_path, self.song_doc.song(), Some(&view)) {
             Ok(()) => {
                 tracing::info!(path = %autosave_path.display(), "autosaved");
                 self.song_doc.last_autosave = std::time::Instant::now();
@@ -8153,7 +8151,7 @@ impl AppData {
             }
             return;
         };
-        let actions = compute_slot_reconcile_actions(&self.song_doc.song(), &self.ipc.loaded_slots);
+        let actions = compute_slot_reconcile_actions(self.song_doc.song(), &self.ipc.loaded_slots);
         for action in actions {
             match action {
                 SlotReconcileAction::RemoveSlot { track_id, index } => {
@@ -8187,7 +8185,7 @@ impl AppData {
                         continue;
                     };
                     // v29: Song 側 device の安定 id でアドレスする。
-                    let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, index) else {
+                    let Some(device_id) = device_id_at(self.song_doc.song(), track_id, index) else {
                         tracing::error!(
                             track_id,
                             index,
@@ -10113,7 +10111,7 @@ impl AppData {
         targets.sort_unstable();
         targets.dedup();
         for target in targets {
-            let fp = Self::lipsync_input_fingerprint(&self.song_doc.song(), target);
+            let fp = Self::lipsync_input_fingerprint(self.song_doc.song(), target);
             self.voicevox.lipsync_fingerprints.insert(target, fp);
         }
     }
@@ -10138,7 +10136,7 @@ impl AppData {
         // 再生成する (= rename 等の非入力編集では再生成しない)。直接呼び出し
         // (binding / mouth_map 変更) はここで必ず最新値へ更新されるので、直後の
         // debounce 発火は fingerprint 一致で二重再生成にならない。
-        let fp = Self::lipsync_input_fingerprint(&self.song_doc.song(), target_id);
+        let fp = Self::lipsync_input_fingerprint(self.song_doc.song(), target_id);
         self.voicevox.lipsync_fingerprints.insert(target_id, fp);
         // 口 track が存在し mouth_map が設定済みか (= 生成する意味があるか)。
         let configured = self.song_doc.song().tracks.iter().any(|t| {
@@ -10621,13 +10619,13 @@ impl AppData {
             return;
         }
         let ids = std::mem::take(&mut self.selection.selected_section_ids);
-        let mut removed = false;
-        for id in ids {
-            removed |= self.song_doc.song().delete_section(id);
-        }
-        if !removed {
-            self.song_doc.undo_stack.pop_back();
-        }
+        self.edit_song_checked(move |song| {
+            let mut removed = false;
+            for id in ids {
+                removed |= song.delete_section(id);
+            }
+            removed
+        });
     }
 
     // ----------------------------------------------------------------
@@ -10635,8 +10633,15 @@ impl AppData {
     // ----------------------------------------------------------------
 
     fn set_lane_enabled(&mut self, track_id: u32, lane_id: u32, enabled: bool) {
-        if let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(track_id, lane_id) {
-            lane.enabled = enabled;
+        let changed = self.edit_song_checked(|song| {
+            if let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) {
+                lane.enabled = enabled;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             self.sync_song_to_plugin_host();
         }
     }
@@ -10847,25 +10852,27 @@ impl AppData {
     /// `value` は呼び出し側 (`arrangement_view`) で表示単位レンジに clamp +
     /// `from_display` 済の plain。時間 (`time_beat`) は変えないので sort 順は不変。
     fn set_automation_point_value(&mut self, key: &AutomationPointKeyRef, value: f64) {
-        let Some(lane) = self
-            .song_doc.song()
-            .automation_lane_by_key(key.track_id, key.lane_id)
-        else {
-            return;
-        };
-        let Some(clip) = lane.clip_by_id(key.clip_id) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let Some(common::model::ClipContent::Automation(a)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
-            return;
-        };
-        if let Some(p) = a.points.get_mut(key.point_idx as usize) {
-            p.value = value;
+        let changed = self.edit_song_checked(|song| {
+            let Some(lane) = song.automation_lane_by_key(key.track_id, key.lane_id) else {
+                return false;
+            };
+            let Some(clip) = lane.clip_by_id(key.clip_id) else {
+                return false;
+            };
+            let content_id = clip.content_id;
+            let Some(common::model::ClipContent::Automation(a)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return false;
+            };
+            if let Some(p) = a.points.get_mut(key.point_idx as usize) {
+                p.value = value;
+            }
+            true
+        });
+        if changed {
+            self.sync_song_to_plugin_host();
         }
-        self.sync_song_to_plugin_host();
     }
 
     fn delete_automation_points(&mut self, points: &[AutomationPointKeyRef]) {
@@ -10887,19 +10894,21 @@ impl AppData {
             };
             by_content.entry(clip.content_id).or_default().push(k.point_idx);
         }
-        for (cid, mut indices) in by_content {
-            indices.sort_unstable_by(|a, b| b.cmp(a));
-            indices.dedup();
-            if let Some(common::model::ClipContent::Automation(a)) =
-                self.song_doc.song().clip_contents.get_mut(&cid)
-            {
-                for idx in indices {
-                    if (idx as usize) < a.points.len() {
-                        a.points.remove(idx as usize);
+        self.edit_song(move |song| {
+            for (cid, mut indices) in by_content {
+                indices.sort_unstable_by(|a, b| b.cmp(a));
+                indices.dedup();
+                if let Some(common::model::ClipContent::Automation(a)) =
+                    song.clip_contents.get_mut(&cid)
+                {
+                    for idx in indices {
+                        if (idx as usize) < a.points.len() {
+                            a.points.remove(idx as usize);
+                        }
                     }
                 }
             }
-        }
+        });
         // (review) point_idx は positional なので削除で全 index がずれる。 残すと
         // 次の Del / Cut が詰め後の別の点を破壊する (`delete_selected_notes` の
         // `mem::take` と同じ後始末)。 inline 編集中の点も同様に無効化する。
@@ -10916,20 +10925,27 @@ impl AppData {
         point_idx: u32,
         next: common::model::AutomationCurve,
     ) {
-        let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(track_id, lane_id) else {
-            return;
-        };
-        let Some(clip) = lane.clip_by_id(clip_id) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let Some(common::model::ClipContent::Automation(a)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
-            return;
-        };
-        if let Some(p) = a.points.get_mut(point_idx as usize) {
-            p.curve = next;
+        let changed = self.edit_song_checked(|song| {
+            let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) else {
+                return false;
+            };
+            let Some(clip) = lane.clip_by_id(clip_id) else {
+                return false;
+            };
+            let content_id = clip.content_id;
+            let Some(common::model::ClipContent::Automation(a)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return false;
+            };
+            if let Some(p) = a.points.get_mut(point_idx as usize) {
+                p.curve = next;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             self.sync_song_to_plugin_host();
         }
     }
@@ -10946,24 +10962,31 @@ impl AppData {
         point_idx: u32,
         next: f32,
     ) {
-        let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(track_id, lane_id) else {
-            return;
-        };
-        let Some(clip) = lane.clip_by_id(clip_id) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let Some(common::model::ClipContent::Automation(a)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
-            return;
-        };
-        if let Some(p) = a.points.get_mut(point_idx as usize)
-            && matches!(p.curve, common::model::AutomationCurve::Bezier { .. })
-        {
-            p.curve = common::model::AutomationCurve::Bezier {
-                tension: next.clamp(-1.0, 1.0),
+        let changed = self.edit_song_checked(|song| {
+            let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) else {
+                return false;
             };
+            let Some(clip) = lane.clip_by_id(clip_id) else {
+                return false;
+            };
+            let content_id = clip.content_id;
+            let Some(common::model::ClipContent::Automation(a)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return false;
+            };
+            if let Some(p) = a.points.get_mut(point_idx as usize)
+                && matches!(p.curve, common::model::AutomationCurve::Bezier { .. })
+            {
+                p.curve = common::model::AutomationCurve::Bezier {
+                    tension: next.clamp(-1.0, 1.0),
+                };
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             self.sync_song_to_plugin_host();
         }
     }
@@ -10979,24 +11002,31 @@ impl AppData {
         point_idx: u32,
         next: f32,
     ) {
-        let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(track_id, lane_id) else {
-            return;
-        };
-        let Some(clip) = lane.clip_by_id(clip_id) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let Some(common::model::ClipContent::Automation(a)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
-            return;
-        };
-        if let Some(p) = a.points.get_mut(point_idx as usize)
-            && matches!(p.curve, common::model::AutomationCurve::Exponential { .. })
-        {
-            p.curve = common::model::AutomationCurve::Exponential {
-                bend: next.clamp(-1.0, 1.0),
+        let changed = self.edit_song_checked(|song| {
+            let Some(lane) = song.automation_lane_by_key_mut(track_id, lane_id) else {
+                return false;
             };
+            let Some(clip) = lane.clip_by_id(clip_id) else {
+                return false;
+            };
+            let content_id = clip.content_id;
+            let Some(common::model::ClipContent::Automation(a)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return false;
+            };
+            if let Some(p) = a.points.get_mut(point_idx as usize)
+                && matches!(p.curve, common::model::AutomationCurve::Exponential { .. })
+            {
+                p.curve = common::model::AutomationCurve::Exponential {
+                    bend: next.clamp(-1.0, 1.0),
+                };
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             self.sync_song_to_plugin_host();
         }
     }
@@ -11063,44 +11093,50 @@ impl AppData {
             entry.lookups.push((snap(p.time_beat), p.value));
         }
 
-        let mut new_selection: Vec<AutomationPointKeyRef> = Vec::with_capacity(selected.len());
-        for (content_id, bucket) in by_content {
-            let ContentBuckets {
-                owner,
-                idxs,
-                lookups,
-            } = bucket;
-            let Some(common::model::ClipContent::Automation(a)) =
-                self.song_doc.song().clip_contents.get_mut(&content_id)
-            else {
-                continue;
-            };
-            // snap 対象 point の time_beat を書き換え。 重複 idx は HashSet
-            // で除去せず、 set_mut が冪等なのでそのまま再代入。
-            for idx in &idxs {
-                if let Some(p) = a.points.get_mut(*idx as usize) {
-                    p.time_beat = snap(p.time_beat);
+        let cap = selected.len();
+        let Some(new_selection) = self.edit_song(move |song| {
+            let mut new_selection: Vec<AutomationPointKeyRef> = Vec::with_capacity(cap);
+            for (content_id, bucket) in by_content {
+                let ContentBuckets {
+                    owner,
+                    idxs,
+                    lookups,
+                } = bucket;
+                let Some(common::model::ClipContent::Automation(a)) =
+                    song.clip_contents.get_mut(&content_id)
+                else {
+                    continue;
+                };
+                // snap 対象 point の time_beat を書き換え。 重複 idx は HashSet
+                // で除去せず、 set_mut が冪等なのでそのまま再代入。
+                for idx in &idxs {
+                    if let Some(p) = a.points.get_mut(*idx as usize) {
+                        p.time_beat = snap(p.time_beat);
+                    }
+                }
+                a.points.sort_by(|p1, p2| {
+                    p1.time_beat
+                        .partial_cmp(&p2.time_beat)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                // 新 idx を `(snapped_time, value)` で lookup。
+                for (st, sv) in &lookups {
+                    if let Some(new_idx) = a.points.iter().position(|p| {
+                        (p.time_beat - st).abs() < 1e-9 && (p.value - sv).abs() < 1e-9
+                    }) {
+                        new_selection.push(AutomationPointKeyRef {
+                            track_id: owner.track_id,
+                            lane_id: owner.lane_id,
+                            clip_id: owner.clip_id,
+                            point_idx: new_idx as u32,
+                        });
+                    }
                 }
             }
-            a.points.sort_by(|p1, p2| {
-                p1.time_beat
-                    .partial_cmp(&p2.time_beat)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            // 新 idx を `(snapped_time, value)` で lookup。
-            for (st, sv) in &lookups {
-                if let Some(new_idx) = a.points.iter().position(|p| {
-                    (p.time_beat - st).abs() < 1e-9 && (p.value - sv).abs() < 1e-9
-                }) {
-                    new_selection.push(AutomationPointKeyRef {
-                        track_id: owner.track_id,
-                        lane_id: owner.lane_id,
-                        clip_id: owner.clip_id,
-                        point_idx: new_idx as u32,
-                    });
-                }
-            }
-        }
+            new_selection
+        }) else {
+            return;
+        };
 
         self.selection.selected_automation_points = new_selection;
         self.sync_song_to_plugin_host();
@@ -11210,49 +11246,56 @@ impl AppData {
             return 0;
         }
 
-        let entry = self
-            .song_doc.song()
-            .clip_contents
-            .entry(content_id)
-            .or_insert_with(|| {
-                common::model::ClipContent::Automation(
-                    common::model::AutomationContent::default(),
-                )
-            });
-        let content = match entry {
-            common::model::ClipContent::Automation(a) => a,
-            _ => return 0,
-        };
-
-        // 挿入後の新 idx は sort のたび変動するので、 全 point を挿入し
-        // 終えてから「挿入した値ペア」 で再 lookup する。
-        let mut inserted_pairs: Vec<(f64, f64)> = Vec::with_capacity(points_in.len());
         let count = points_in.len();
-        for src in &points_in {
-            let plain = common::automation::norm_to_plain(&target, src.value_norm);
-            let t = (src.time_beat + anchor).max(0.0);
-            // v29: 新規 point は allocator で安定 id を採番。
-            let new_point = common::model::AutomationPoint {
-                id: content.alloc_point_id(),
-                time_beat: t,
-                value: plain,
-                curve: src.curve,
+        let Some(Some(new_indices)) = self.edit_song(move |song| {
+            let entry = song
+                .clip_contents
+                .entry(content_id)
+                .or_insert_with(|| {
+                    common::model::ClipContent::Automation(
+                        common::model::AutomationContent::default(),
+                    )
+                });
+            let content = match entry {
+                common::model::ClipContent::Automation(a) => a,
+                _ => return None,
             };
-            let insert_at = content.points.partition_point(|p| p.time_beat <= t);
-            content.points.insert(insert_at, new_point);
-            inserted_pairs.push((t, plain));
-        }
-        let points = &mut content.points;
 
-        let new_indices: Vec<u32> = inserted_pairs
-            .iter()
-            .filter_map(|(t, v)| {
-                points
+            // 挿入後の新 idx は sort のたび変動するので、 全 point を挿入し
+            // 終えてから「挿入した値ペア」 で再 lookup する。
+            let mut inserted_pairs: Vec<(f64, f64)> = Vec::with_capacity(points_in.len());
+            for src in &points_in {
+                let plain = common::automation::norm_to_plain(&target, src.value_norm);
+                let t = (src.time_beat + anchor).max(0.0);
+                // v29: 新規 point は allocator で安定 id を採番。
+                let new_point = common::model::AutomationPoint {
+                    id: content.alloc_point_id(),
+                    time_beat: t,
+                    value: plain,
+                    curve: src.curve,
+                };
+                let insert_at = content.points.partition_point(|p| p.time_beat <= t);
+                content.points.insert(insert_at, new_point);
+                inserted_pairs.push((t, plain));
+            }
+            let points = &mut content.points;
+
+            Some(
+                inserted_pairs
                     .iter()
-                    .position(|p| (p.time_beat - t).abs() < 1e-9 && (p.value - v).abs() < 1e-9)
-                    .map(|i| i as u32)
-            })
-            .collect();
+                    .filter_map(|(t, v)| {
+                        points
+                            .iter()
+                            .position(|p| {
+                                (p.time_beat - t).abs() < 1e-9 && (p.value - v).abs() < 1e-9
+                            })
+                            .map(|i| i as u32)
+                    })
+                    .collect::<Vec<u32>>(),
+            )
+        }) else {
+            return 0;
+        };
 
         self.selection.selected_automation_points = new_indices
             .into_iter()
@@ -11336,28 +11379,32 @@ impl AppData {
         }
         let anchor = at_beat.max(0.0);
         let count = events.len();
-        let Some(common::model::ClipContent::Audio(audio)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
+        let Some(Some(new_indices)) = self.edit_song(move |song| {
+            let Some(common::model::ClipContent::Audio(audio)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return None;
+            };
+            let mut new_indices = Vec::with_capacity(events.len());
+            let mut max_end = 0.0f64;
+            for e in &mut events {
+                e.event_start_in_clip_beats += anchor;
+                max_end = max_end.max(e.event_start_in_clip_beats + e.event_length_beats);
+                new_indices.push(audio.events.len());
+                audio.events.push(e.clone());
+            }
+            // clip 長が足りなければ拡張 (add_audio_event_from_file と同 idiom)。
+            if let Some(track) = song.tracks.get_mut(target.track as usize)
+                && let Some(clip) = track.clips.get_mut(target.clip as usize)
+                && max_end > clip.length_beats
+            {
+                clip.length_beats = max_end;
+            }
+            Some(new_indices)
+        }) else {
             return 0;
         };
-        let mut new_indices = Vec::with_capacity(events.len());
-        let mut max_end = 0.0f64;
-        for e in &mut events {
-            e.event_start_in_clip_beats += anchor;
-            max_end = max_end.max(e.event_start_in_clip_beats + e.event_length_beats);
-            new_indices.push(audio.events.len());
-            audio.events.push(e.clone());
-        }
         self.selection.audio_editor_selected_events = new_indices;
-        // clip 長が足りなければ拡張 (add_audio_event_from_file と同 idiom)。
-        if let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize)
-            && let Some(clip) = track.clips.get_mut(target.clip as usize)
-            && max_end > clip.length_beats
-        {
-            clip.length_beats = max_end;
-        }
-        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
@@ -11463,58 +11510,65 @@ impl AppData {
         // content remap: 同一 source content_id は 1 度だけ採番して dedup する
         // (linked クリップ群を複数貼っても貼り付け後もリンクを保つ)。同一プロジェクト
         // かつ content 現存なら流用 (リンク共有)、それ以外は inline payload から独立採番。
-        let mut content_remap: std::collections::HashMap<
-            common::model::ContentId,
-            common::model::ContentId,
-        > = std::collections::HashMap::new();
-        let mut new_refs: Vec<ClipRef> = Vec::new();
-        for cc in &clips {
-            let target_idx = anchor_idx as i64 + cc.track_offset;
-            if target_idx < 0 || target_idx as usize >= self.song_doc.song().tracks.len() {
-                continue;
+        let Some(new_refs) = self.edit_song(move |song| {
+            let mut content_remap: std::collections::HashMap<
+                common::model::ContentId,
+                common::model::ContentId,
+            > = std::collections::HashMap::new();
+            let mut new_refs: Vec<ClipRef> = Vec::new();
+            for cc in &clips {
+                let target_idx = anchor_idx as i64 + cc.track_offset;
+                if target_idx < 0 || target_idx as usize >= song.tracks.len() {
+                    continue;
+                }
+                let target_idx = target_idx as usize;
+                let content_id = if let Some(&new) = content_remap.get(&cc.content_id) {
+                    new
+                } else {
+                    let resolved =
+                        if same_project && song.clip_contents.contains_key(&cc.content_id) {
+                            cc.content_id
+                        } else {
+                            song.alloc_content(
+                                cc.content.clone(),
+                                cc.name.clone().unwrap_or_default(),
+                            )
+                        };
+                    content_remap.insert(cc.content_id, resolved);
+                    resolved
+                };
+                let Some(to_track) = song.tracks.get_mut(target_idx) else {
+                    continue;
+                };
+                let new_clip_id = to_track.alloc_clip_id();
+                let new_idx = to_track.clips.len() as u32;
+                to_track.clips.push(common::model::Clip {
+                    id: new_clip_id,
+                    name: String::new(),
+                    start_beat: (at_beat + cc.start_beat).max(0.0),
+                    length_beats: cc.length_beats,
+                    content_id,
+                    notes: Vec::new(),
+                    color: cc.color,
+                    auto_lipsync: cc.auto_lipsync,
+                    // clipboard の clip-level mute を paste 先 clip へ引き継ぐ。
+                    muted: cc.muted,
+                    // clipboard の per-clip 声を paste 先 clip へ引き継ぐ。
+                    speaker_id: cc.speaker_id,
+                    singer_name: cc.singer_name.clone(),
+                    style_name: cc.style_name.clone(),
+                    // (talk) per-clip 読み上げスケールも引き継ぐ。
+                    talk: cc.talk,
+                });
+                new_refs.push(ClipRef {
+                    track: target_idx as u32,
+                    clip: new_idx,
+                });
             }
-            let target_idx = target_idx as usize;
-            let content_id = if let Some(&new) = content_remap.get(&cc.content_id) {
-                new
-            } else {
-                let resolved =
-                    if same_project && self.song_doc.song().clip_contents.contains_key(&cc.content_id) {
-                        cc.content_id
-                    } else {
-                        self.song_doc.song()
-                            .alloc_content(cc.content.clone(), cc.name.clone().unwrap_or_default())
-                    };
-                content_remap.insert(cc.content_id, resolved);
-                resolved
-            };
-            let Some(to_track) = self.song_doc.song().tracks.get_mut(target_idx) else {
-                continue;
-            };
-            let new_clip_id = to_track.alloc_clip_id();
-            let new_idx = to_track.clips.len() as u32;
-            to_track.clips.push(common::model::Clip {
-                id: new_clip_id,
-                name: String::new(),
-                start_beat: (at_beat + cc.start_beat).max(0.0),
-                length_beats: cc.length_beats,
-                content_id,
-                notes: Vec::new(),
-                color: cc.color,
-                auto_lipsync: cc.auto_lipsync,
-                // clipboard の clip-level mute を paste 先 clip へ引き継ぐ。
-                muted: cc.muted,
-                // clipboard の per-clip 声を paste 先 clip へ引き継ぐ。
-                speaker_id: cc.speaker_id,
-                singer_name: cc.singer_name.clone(),
-                style_name: cc.style_name.clone(),
-                // (talk) per-clip 読み上げスケールも引き継ぐ。
-                talk: cc.talk,
-            });
-            new_refs.push(ClipRef {
-                track: target_idx as u32,
-                clip: new_idx,
-            });
-        }
+            new_refs
+        }) else {
+            return 0;
+        };
         let pasted = new_refs.len();
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
@@ -11606,65 +11660,67 @@ impl AppData {
             return 0;
         };
         let target = lane.target.clone();
-        // 同一 source content_id は 1 度だけ採番して dedup (= linked group を paste 後も保つ)。
-        let mut content_remap: std::collections::HashMap<
-            common::model::ContentId,
-            common::model::ContentId,
-        > = std::collections::HashMap::new();
-        let mut new_keys: Vec<common::model::AutomationClipKey> = Vec::new();
-        for cc in &clips {
-            let content_id = if let Some(&id) = content_remap.get(&cc.source_content_id) {
-                id
-            } else {
-                // v29: 新規 content の点にも安定 id を採番する (1 始まりの
-                // 連番 = per-content allocator と同じ)。
-                let mut points: Vec<common::model::AutomationPoint> = cc
-                    .points
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| common::model::AutomationPoint {
-                        id: i as u32 + 1,
-                        time_beat: p.time_beat.max(0.0),
-                        value: common::automation::norm_to_plain(&target, p.value_norm),
-                        curve: p.curve,
-                    })
-                    .collect();
-                points.sort_by(|a, b| a.time_beat.total_cmp(&b.time_beat));
-                let content = common::model::ClipContent::Automation(
-                    common::model::AutomationContent {
-                        next_point_id: points.len() as u32 + 1,
-                        points,
-                    },
-                );
-                let id = self
-                    .song_doc.song()
-                    .alloc_content(content, cc.name.clone().unwrap_or_default());
-                content_remap.insert(cc.source_content_id, id);
-                id
-            };
-            let Some(lane) = self
-                .song_doc.song()
-                .automation_lane_by_key_mut(lane_key.track, lane_key.lane)
-            else {
-                continue;
-            };
-            let new_id = lane.alloc_clip_id();
-            let start_beat = (at_beat + cc.start_beat).max(0.0);
-            let new_clip = common::model::AutomationClip {
-                id: new_id,
-                name: String::new(),
-                start_beat,
-                length_beats: cc.length_beats,
-                content_id,
-            };
-            let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
-            lane.clips.insert(pos, new_clip);
-            new_keys.push(common::model::AutomationClipKey {
-                track: lane_key.track,
-                lane: lane_key.lane,
-                clip: new_id,
-            });
-        }
+        let Some(new_keys) = self.edit_song(move |song| {
+            // 同一 source content_id は 1 度だけ採番して dedup (= linked group を paste 後も保つ)。
+            let mut content_remap: std::collections::HashMap<
+                common::model::ContentId,
+                common::model::ContentId,
+            > = std::collections::HashMap::new();
+            let mut new_keys: Vec<common::model::AutomationClipKey> = Vec::new();
+            for cc in &clips {
+                let content_id = if let Some(&id) = content_remap.get(&cc.source_content_id) {
+                    id
+                } else {
+                    // v29: 新規 content の点にも安定 id を採番する (1 始まりの
+                    // 連番 = per-content allocator と同じ)。
+                    let mut points: Vec<common::model::AutomationPoint> = cc
+                        .points
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| common::model::AutomationPoint {
+                            id: i as u32 + 1,
+                            time_beat: p.time_beat.max(0.0),
+                            value: common::automation::norm_to_plain(&target, p.value_norm),
+                            curve: p.curve,
+                        })
+                        .collect();
+                    points.sort_by(|a, b| a.time_beat.total_cmp(&b.time_beat));
+                    let content = common::model::ClipContent::Automation(
+                        common::model::AutomationContent {
+                            next_point_id: points.len() as u32 + 1,
+                            points,
+                        },
+                    );
+                    let id = song.alloc_content(content, cc.name.clone().unwrap_or_default());
+                    content_remap.insert(cc.source_content_id, id);
+                    id
+                };
+                let Some(lane) =
+                    song.automation_lane_by_key_mut(lane_key.track, lane_key.lane)
+                else {
+                    continue;
+                };
+                let new_id = lane.alloc_clip_id();
+                let start_beat = (at_beat + cc.start_beat).max(0.0);
+                let new_clip = common::model::AutomationClip {
+                    id: new_id,
+                    name: String::new(),
+                    start_beat,
+                    length_beats: cc.length_beats,
+                    content_id,
+                };
+                let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
+                lane.clips.insert(pos, new_clip);
+                new_keys.push(common::model::AutomationClipKey {
+                    track: lane_key.track,
+                    lane: lane_key.lane,
+                    clip: new_id,
+                });
+            }
+            new_keys
+        }) else {
+            return 0;
+        };
         let pasted = new_keys.len();
         if pasted > 0 {
             self.selection.selected_automation_clips = new_keys;
@@ -11686,27 +11742,28 @@ impl AppData {
         if deltas.is_empty() {
             return;
         }
-        for d in deltas {
-            let mut taken: Option<common::model::AutomationClip> = None;
-            if let Some(source_lane) =
-                self.song_doc.song().automation_lane_by_key_mut(d.from.track, d.from.lane)
-                && let Some(idx) = source_lane.clip_index_by_id(d.from.clip)
-            {
-                taken = Some(source_lane.clips.remove(idx));
+        self.edit_song(|song| {
+            for d in deltas {
+                let mut taken: Option<common::model::AutomationClip> = None;
+                if let Some(source_lane) =
+                    song.automation_lane_by_key_mut(d.from.track, d.from.lane)
+                    && let Some(idx) = source_lane.clip_index_by_id(d.from.clip)
+                {
+                    taken = Some(source_lane.clips.remove(idx));
+                }
+                let Some(mut clip) = taken else { continue };
+                clip.start_beat = d.next_start_beat;
+                if let Some(target_lane) =
+                    song.automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
+                {
+                    let start = clip.start_beat;
+                    let pos = target_lane
+                        .clips
+                        .partition_point(|c| c.start_beat < start);
+                    target_lane.clips.insert(pos, clip);
+                }
             }
-            let Some(mut clip) = taken else { continue };
-            clip.start_beat = d.next_start_beat;
-            if let Some(target_lane) = self
-                .song_doc.song()
-                .automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
-            {
-                let start = clip.start_beat;
-                let pos = target_lane
-                    .clips
-                    .partition_point(|c| c.start_beat < start);
-                target_lane.clips.insert(pos, clip);
-            }
-        }
+        });
         self.sync_song_to_plugin_host();
     }
 
@@ -11717,42 +11774,43 @@ impl AppData {
         if deltas.is_empty() {
             return;
         }
-        for d in deltas {
-            let template = {
-                let Some(source_lane) =
-                    self.song_doc.song().automation_lane_by_key(d.from.track, d.from.lane)
+        self.edit_song(|song| {
+            for d in deltas {
+                let template = {
+                    let Some(source_lane) =
+                        song.automation_lane_by_key(d.from.track, d.from.lane)
+                    else {
+                        continue;
+                    };
+                    let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
+                        continue;
+                    };
+                    (
+                        source_clip.content_id,
+                        source_clip.name.clone(),
+                        source_clip.length_beats,
+                    )
+                };
+                let Some(target_lane) =
+                    song.automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
                 else {
                     continue;
                 };
-                let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
-                    continue;
+                let new_id = target_lane.alloc_clip_id();
+                let new_clip = common::model::AutomationClip {
+                    id: new_id,
+                    name: template.1,
+                    start_beat: d.next_start_beat,
+                    length_beats: template.2,
+                    content_id: template.0,
                 };
-                (
-                    source_clip.content_id,
-                    source_clip.name.clone(),
-                    source_clip.length_beats,
-                )
-            };
-            let Some(target_lane) = self
-                .song_doc.song()
-                .automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
-            else {
-                continue;
-            };
-            let new_id = target_lane.alloc_clip_id();
-            let new_clip = common::model::AutomationClip {
-                id: new_id,
-                name: template.1,
-                start_beat: d.next_start_beat,
-                length_beats: template.2,
-                content_id: template.0,
-            };
-            let start = new_clip.start_beat;
-            let pos = target_lane
-                .clips
-                .partition_point(|c| c.start_beat < start);
-            target_lane.clips.insert(pos, new_clip);
-        }
+                let start = new_clip.start_beat;
+                let pos = target_lane
+                    .clips
+                    .partition_point(|c| c.start_beat < start);
+                target_lane.clips.insert(pos, new_clip);
+            }
+        });
         self.sync_song_to_plugin_host();
     }
 
@@ -11765,57 +11823,57 @@ impl AppData {
         if deltas.is_empty() {
             return;
         }
-        for d in deltas {
-            let template = {
-                let Some(source_lane) =
-                    self.song_doc.song().automation_lane_by_key(d.from.track, d.from.lane)
+        self.edit_song(|song| {
+            for d in deltas {
+                let template = {
+                    let Some(source_lane) =
+                        song.automation_lane_by_key(d.from.track, d.from.lane)
+                    else {
+                        continue;
+                    };
+                    let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
+                        continue;
+                    };
+                    (
+                        source_clip.content_id,
+                        source_clip.name.clone(),
+                        source_clip.length_beats,
+                    )
+                };
+                // Content を deep clone (`ClipContent` enum 全体の clone なので
+                // Midi/Audio/Automation いずれも対応)。content が無い場合は空
+                // Automation で作成。
+                let cloned_content = song
+                    .clip_contents
+                    .get(&template.0)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        common::model::ClipContent::Automation(
+                            common::model::AutomationContent::default(),
+                        )
+                    });
+                let new_content_id = song.alloc_content_id();
+                song.clip_contents.insert(new_content_id, cloned_content);
+                let Some(target_lane) =
+                    song.automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
                 else {
                     continue;
                 };
-                let Some(source_clip) = source_lane.clip_by_id(d.from.clip) else {
-                    continue;
+                let new_id = target_lane.alloc_clip_id();
+                let new_clip = common::model::AutomationClip {
+                    id: new_id,
+                    name: template.1,
+                    start_beat: d.next_start_beat,
+                    length_beats: template.2,
+                    content_id: new_content_id,
                 };
-                (
-                    source_clip.content_id,
-                    source_clip.name.clone(),
-                    source_clip.length_beats,
-                )
-            };
-            // Content を deep clone (`ClipContent` enum 全体の clone なので
-            // Midi/Audio/Automation いずれも対応)。content が無い場合は空
-            // Automation で作成。
-            let cloned_content = self
-                .song_doc.song()
-                .clip_contents
-                .get(&template.0)
-                .cloned()
-                .unwrap_or_else(|| {
-                    common::model::ClipContent::Automation(
-                        common::model::AutomationContent::default(),
-                    )
-                });
-            let new_content_id = self.song_doc.song().alloc_content_id();
-            self.edit_song(|song| song.clip_contents.insert(new_content_id, cloned_content));
-            let Some(target_lane) = self
-                .song_doc.song()
-                .automation_lane_by_key_mut(d.to_lane.track, d.to_lane.lane)
-            else {
-                continue;
-            };
-            let new_id = target_lane.alloc_clip_id();
-            let new_clip = common::model::AutomationClip {
-                id: new_id,
-                name: template.1,
-                start_beat: d.next_start_beat,
-                length_beats: template.2,
-                content_id: new_content_id,
-            };
-            let start = new_clip.start_beat;
-            let pos = target_lane
-                .clips
-                .partition_point(|c| c.start_beat < start);
-            target_lane.clips.insert(pos, new_clip);
-        }
+                let start = new_clip.start_beat;
+                let pos = target_lane
+                    .clips
+                    .partition_point(|c| c.start_beat < start);
+                target_lane.clips.insert(pos, new_clip);
+            }
+        });
         self.sync_song_to_plugin_host();
     }
 
@@ -11850,24 +11908,24 @@ impl AppData {
             let src_clip = lane.clip_by_id(source.clip)?;
             (src_clip.content_id, src_clip.name.clone(), src_clip.length_beats)
         };
-        let lane = self
-            .song_doc.song()
-            .automation_lane_by_key_mut(source.track, source.lane)?;
-        let new_id = lane.alloc_clip_id();
-        let new_clip = common::model::AutomationClip {
-            id: new_id,
-            name,
-            start_beat: new_start_beat,
-            length_beats: length,
-            content_id,
-        };
-        let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
-        lane.clips.insert(pos, new_clip);
-        Some(common::model::AutomationClipKey {
-            track: source.track,
-            lane: source.lane,
-            clip: new_id,
-        })
+        self.edit_song(move |song| {
+            let lane = song.automation_lane_by_key_mut(source.track, source.lane)?;
+            let new_id = lane.alloc_clip_id();
+            let new_clip = common::model::AutomationClip {
+                id: new_id,
+                name,
+                start_beat: new_start_beat,
+                length_beats: length,
+                content_id,
+            };
+            let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
+            lane.clips.insert(pos, new_clip);
+            Some(common::model::AutomationClipKey {
+                track: source.track,
+                lane: source.lane,
+                clip: new_id,
+            })
+        })?
     }
 
     /// `source` の独立コピー (content deep clone + 新 ContentId) を
@@ -11892,28 +11950,26 @@ impl AppData {
                     common::model::AutomationContent::default(),
                 )
             });
-        let new_content_id = self.song_doc.song().alloc_content_id();
-        self.song_doc.song()
-            .clip_contents
-            .insert(new_content_id, cloned_content);
-        let lane = self
-            .song_doc.song()
-            .automation_lane_by_key_mut(source.track, source.lane)?;
-        let new_id = lane.alloc_clip_id();
-        let new_clip = common::model::AutomationClip {
-            id: new_id,
-            name,
-            start_beat: new_start_beat,
-            length_beats: length,
-            content_id: new_content_id,
-        };
-        let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
-        lane.clips.insert(pos, new_clip);
-        Some(common::model::AutomationClipKey {
-            track: source.track,
-            lane: source.lane,
-            clip: new_id,
-        })
+        self.edit_song(move |song| {
+            let new_content_id = song.alloc_content_id();
+            song.clip_contents.insert(new_content_id, cloned_content);
+            let lane = song.automation_lane_by_key_mut(source.track, source.lane)?;
+            let new_id = lane.alloc_clip_id();
+            let new_clip = common::model::AutomationClip {
+                id: new_id,
+                name,
+                start_beat: new_start_beat,
+                length_beats: length,
+                content_id: new_content_id,
+            };
+            let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
+            lane.clips.insert(pos, new_clip);
+            Some(common::model::AutomationClipKey {
+                track: source.track,
+                lane: source.lane,
+                clip: new_id,
+            })
+        })?
     }
 
     /// 選択 automation clip 群をまとめて共有複製 (D shortcut)。 選択
@@ -11973,18 +12029,18 @@ impl AppData {
         if deltas.is_empty() {
             return;
         }
-        for d in deltas {
-            let Some(lane) = self
-                .song_doc.song()
-                .automation_lane_by_key_mut(d.key.track, d.key.lane)
-            else {
-                continue;
-            };
-            if let Some(clip) = lane.clip_by_id_mut(d.key.clip) {
-                clip.start_beat = d.next_start;
-                clip.length_beats = d.next_len;
+        self.edit_song(|song| {
+            for d in deltas {
+                let Some(lane) = song.automation_lane_by_key_mut(d.key.track, d.key.lane)
+                else {
+                    continue;
+                };
+                if let Some(clip) = lane.clip_by_id_mut(d.key.clip) {
+                    clip.start_beat = d.next_start;
+                    clip.length_beats = d.next_len;
+                }
             }
-        }
+        });
         self.sync_song_to_plugin_host();
     }
 
@@ -12010,13 +12066,15 @@ impl AppData {
         else {
             return;
         };
-        let new_content_id = self.song_doc.song().alloc_content_id();
-        self.edit_song(|song| song.clip_contents.insert(new_content_id, cloned_content));
-        if let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(key.track, key.lane)
-            && let Some(clip) = lane.clip_by_id_mut(key.clip)
-        {
-            clip.content_id = new_content_id;
-        }
+        self.edit_song(move |song| {
+            let new_content_id = song.alloc_content_id();
+            song.clip_contents.insert(new_content_id, cloned_content);
+            if let Some(lane) = song.automation_lane_by_key_mut(key.track, key.lane)
+                && let Some(clip) = lane.clip_by_id_mut(key.clip)
+            {
+                clip.content_id = new_content_id;
+            }
+        });
         self.sync_song_to_plugin_host();
     }
 
@@ -12031,13 +12089,18 @@ impl AppData {
         len_beats: f64,
     ) {
         // 新 ContentId を先に採番 + 空 Automation content を登録。
-        let new_content_id = self.song_doc.song().alloc_content_id();
-        self.song_doc.song().clip_contents.insert(
-            new_content_id,
-            common::model::ClipContent::Automation(
-                common::model::AutomationContent::default(),
-            ),
-        );
+        let Some(new_content_id) = self.edit_song(|song| {
+            let new_content_id = song.alloc_content_id();
+            song.clip_contents.insert(
+                new_content_id,
+                common::model::ClipContent::Automation(
+                    common::model::AutomationContent::default(),
+                ),
+            );
+            new_content_id
+        }) else {
+            return;
+        };
         // B6 (r.md #8): clip 名に実 param 名を使うため、 mut borrow を取る前に
         // immutable borrow で target を取り出し track-aware label を解決する。
         let Some(target) = self
@@ -12104,14 +12167,21 @@ impl AppData {
         let target = AutomationTarget::ImageBuiltin(field);
 
         // 既存 lane を find。 あれば visible / enabled を true に。
-        if let Some(track) = self.song_doc.song().track_by_id_mut(track_id)
-            && let Some(lane) = track
-                .automation_lanes
-                .iter_mut()
-                .find(|l| l.target == target)
-        {
-            lane.visible = true;
-            lane.enabled = true;
+        let found_existing = self.edit_song_checked(|song| {
+            if let Some(track) = song.track_by_id_mut(track_id)
+                && let Some(lane) = track
+                    .automation_lanes
+                    .iter_mut()
+                    .find(|l| l.target == target)
+            {
+                lane.visible = true;
+                lane.enabled = true;
+                true
+            } else {
+                false
+            }
+        });
+        if found_existing {
             self.ui_prefs.expanded_automation_tracks.insert(track_id);
             self.ui_ephemeral.status_message = format!(
                 "Image Automation lane '{}' は既に存在します",
@@ -12370,13 +12440,15 @@ impl AppData {
             return;
         };
         let target = AutomationTarget::ImageBuiltin(field);
-        let Some(track) = self.song_doc.song().tracks.get_mut(target_clip.track as usize) else {
-            return;
-        };
-        let before = track.automation_lanes.len();
-        track.automation_lanes.retain(|l| l.target != target);
-        let removed = before - track.automation_lanes.len();
-        if removed == 0 {
+        let removed = self.edit_song_checked(|song| {
+            let Some(track) = song.tracks.get_mut(target_clip.track as usize) else {
+                return false;
+            };
+            let before = track.automation_lanes.len();
+            track.automation_lanes.retain(|l| l.target != target);
+            before != track.automation_lanes.len()
+        });
+        if !removed {
             self.ui_ephemeral.status_message = format!(
                 "Image Automation: {} lane が見つかりません",
                 automation_target_display_name(&target)
@@ -12403,12 +12475,19 @@ impl AppData {
             return;
         };
         let target = AutomationTarget::GroupTransform(param);
-        if let Some(track) = self.song_doc.song().track_by_id_mut(track_id)
-            && let Some(lane) =
-                track.automation_lanes.iter_mut().find(|l| l.target == target)
-        {
-            lane.visible = true;
-            lane.enabled = true;
+        let found_existing = self.edit_song_checked(|song| {
+            if let Some(track) = song.track_by_id_mut(track_id)
+                && let Some(lane) =
+                    track.automation_lanes.iter_mut().find(|l| l.target == target)
+            {
+                lane.visible = true;
+                lane.enabled = true;
+                true
+            } else {
+                false
+            }
+        });
+        if found_existing {
             self.ui_prefs.expanded_automation_tracks.insert(track_id);
             self.ui_ephemeral.status_message = format!(
                 "Group Automation lane '{}' は既に存在します",
@@ -12461,12 +12540,15 @@ impl AppData {
             return;
         };
         let target = AutomationTarget::GroupTransform(param);
-        let Some(track) = self.song_doc.song().track_by_id_mut(track_id) else {
-            return;
-        };
-        let before = track.automation_lanes.len();
-        track.automation_lanes.retain(|l| l.target != target);
-        if before == track.automation_lanes.len() {
+        let removed = self.edit_song_checked(|song| {
+            let Some(track) = song.track_by_id_mut(track_id) else {
+                return false;
+            };
+            let before = track.automation_lanes.len();
+            track.automation_lanes.retain(|l| l.target != target);
+            before != track.automation_lanes.len()
+        });
+        if !removed {
             self.ui_ephemeral.status_message = format!(
                 "Group Automation: {} lane が見つかりません",
                 automation_target_display_name(&target)
@@ -12522,7 +12604,7 @@ impl AppData {
     /// video / text 表示 clip を持つ track が 1 つでもある、または既に
     /// `group_transform` データを持つなら true。inspector / 合成の gate。
     pub fn group_has_visual_content(&self, group_track_id: u32) -> bool {
-        crate::group_compose::group_has_visual_content(&self.song_doc.song(), group_track_id)
+        crate::group_compose::group_has_visual_content(self.song_doc.song(), group_track_id)
     }
 
     /// group inspector 用 summary。cursor track が visual group なら、各 param に
@@ -12583,7 +12665,7 @@ impl AppData {
             };
         // v29: lane target は安定 device_id。 panel の positional index から
         // 解決する。
-        let device_id = device_id_at(&self.song_doc.song(), track_id, device_index)?;
+        let device_id = device_id_at(self.song_doc.song(), track_id, device_index)?;
         let values: Vec<f32> = def
             .params
             .iter()
@@ -12628,7 +12710,7 @@ impl AppData {
         let display_name = format!("{} {}", def.name, param.name);
         let norm = param.kind.real_to_norm(value_real);
         // v29: 安定 device_id で target を組む。
-        let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, device_index) else {
+        let Some(device_id) = device_id_at(self.song_doc.song(), track_id, device_index) else {
             return;
         };
         let target = AutomationTarget::PluginParam {
@@ -12637,27 +12719,29 @@ impl AppData {
             legacy_device_index: None,
             legacy_slot: None,
         };
-        if track_id == common::model::MASTER_TRACK_ID {
-            if let Some(lane) = self.song_doc.song().song_lanes.iter_mut().find(|l| l.target == target) {
-                lane.default_value = norm;
-            } else {
-                let id = self.song_doc.song().alloc_song_lane_id();
-                let mut lane = AutomationLane::new(target.clone(), norm);
-                lane.id = id;
-                lane.visible = false;
-                self.edit_song(|song| song.song_lanes.push(lane));
+        self.edit_song(|song| {
+            if track_id == common::model::MASTER_TRACK_ID {
+                if let Some(lane) = song.song_lanes.iter_mut().find(|l| l.target == target) {
+                    lane.default_value = norm;
+                } else {
+                    let id = song.alloc_song_lane_id();
+                    let mut lane = AutomationLane::new(target.clone(), norm);
+                    lane.id = id;
+                    lane.visible = false;
+                    song.song_lanes.push(lane);
+                }
+            } else if let Some(track) = song.track_by_id_mut(track_id) {
+                if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
+                    lane.default_value = norm;
+                } else {
+                    let id = track.alloc_lane_id();
+                    let mut lane = AutomationLane::new(target.clone(), norm);
+                    lane.id = id;
+                    lane.visible = false;
+                    track.automation_lanes.push(lane);
+                }
             }
-        } else if let Some(track) = self.song_doc.song().track_by_id_mut(track_id) {
-            if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
-                lane.default_value = norm;
-            } else {
-                let id = track.alloc_lane_id();
-                let mut lane = AutomationLane::new(target.clone(), norm);
-                lane.id = id;
-                lane.visible = false;
-                track.automation_lanes.push(lane);
-            }
-        }
+        });
         // 「A」キー (last_touched_param) で automation lane を可視化/curve 化できる。
         self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
@@ -12825,7 +12909,7 @@ impl AppData {
             ((value_real - info.min_value) / span).clamp(0.0, 1.0)
         };
         // v29: 安定 device_id で target を組む。
-        let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, device_index) else {
+        let Some(device_id) = device_id_at(self.song_doc.song(), track_id, device_index) else {
             return;
         };
         let target = AutomationTarget::PluginParam {
@@ -12834,27 +12918,29 @@ impl AppData {
             legacy_device_index: None,
             legacy_slot: None,
         };
-        if track_id == common::model::MASTER_TRACK_ID {
-            if let Some(lane) = self.song_doc.song().song_lanes.iter_mut().find(|l| l.target == target) {
-                lane.default_value = norm;
-            } else {
-                let id = self.song_doc.song().alloc_song_lane_id();
-                let mut lane = AutomationLane::new(target.clone(), norm);
-                lane.id = id;
-                lane.visible = false;
-                self.edit_song(|song| song.song_lanes.push(lane));
+        self.edit_song(|song| {
+            if track_id == common::model::MASTER_TRACK_ID {
+                if let Some(lane) = song.song_lanes.iter_mut().find(|l| l.target == target) {
+                    lane.default_value = norm;
+                } else {
+                    let id = song.alloc_song_lane_id();
+                    let mut lane = AutomationLane::new(target.clone(), norm);
+                    lane.id = id;
+                    lane.visible = false;
+                    song.song_lanes.push(lane);
+                }
+            } else if let Some(track) = song.track_by_id_mut(track_id) {
+                if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
+                    lane.default_value = norm;
+                } else {
+                    let id = track.alloc_lane_id();
+                    let mut lane = AutomationLane::new(target.clone(), norm);
+                    lane.id = id;
+                    lane.visible = false;
+                    track.automation_lanes.push(lane);
+                }
             }
-        } else if let Some(track) = self.song_doc.song().track_by_id_mut(track_id) {
-            if let Some(lane) = track.automation_lanes.iter_mut().find(|l| l.target == target) {
-                lane.default_value = norm;
-            } else {
-                let id = track.alloc_lane_id();
-                let mut lane = AutomationLane::new(target.clone(), norm);
-                lane.id = id;
-                lane.visible = false;
-                track.automation_lanes.push(lane);
-            }
-        }
+        });
         self.ui_ephemeral.last_touched_param = Some(TouchedParam {
             track_id,
             target,
@@ -12889,14 +12975,21 @@ impl AppData {
         let target = AutomationTarget::TextBuiltin(field);
 
         // 既存 lane があれば visible / enabled だけを true に。
-        if let Some(track) = self.song_doc.song().track_by_id_mut(track_id)
-            && let Some(lane) = track
-                .automation_lanes
-                .iter_mut()
-                .find(|l| l.target == target)
-        {
-            lane.visible = true;
-            lane.enabled = true;
+        let found_existing = self.edit_song_checked(|song| {
+            if let Some(track) = song.track_by_id_mut(track_id)
+                && let Some(lane) = track
+                    .automation_lanes
+                    .iter_mut()
+                    .find(|l| l.target == target)
+            {
+                lane.visible = true;
+                lane.enabled = true;
+                true
+            } else {
+                false
+            }
+        });
+        if found_existing {
             self.ui_prefs.expanded_automation_tracks.insert(track_id);
             self.ui_ephemeral.status_message = format!(
                 "Text Automation lane '{}' は既に存在します",
@@ -12957,14 +13050,15 @@ impl AppData {
             return;
         };
         let target = AutomationTarget::TextBuiltin(field);
-        let Some(track) = self.song_doc.song().tracks.get_mut(target_clip.track as usize)
-        else {
-            return;
-        };
-        let before = track.automation_lanes.len();
-        track.automation_lanes.retain(|l| l.target != target);
-        let removed = before - track.automation_lanes.len();
-        if removed == 0 {
+        let removed = self.edit_song_checked(|song| {
+            let Some(track) = song.tracks.get_mut(target_clip.track as usize) else {
+                return false;
+            };
+            let before = track.automation_lanes.len();
+            track.automation_lanes.retain(|l| l.target != target);
+            before != track.automation_lanes.len()
+        });
+        if !removed {
             self.ui_ephemeral.status_message = format!(
                 "Text Automation: {} lane が見つかりません",
                 automation_target_display_name(&target)
@@ -13203,12 +13297,14 @@ impl AppData {
             } else {
                 touched.track_id
             };
-            if let Some(lane) =
-                self.song_doc.song().automation_lane_by_key_mut(lookup_track_id, lane_id)
-            {
-                lane.visible = true;
-                lane.enabled = true;
-            }
+            self.edit_song(|song| {
+                if let Some(lane) =
+                    song.automation_lane_by_key_mut(lookup_track_id, lane_id)
+                {
+                    lane.visible = true;
+                    lane.enabled = true;
+                }
+            });
             if is_song_level {
                 self.ui_prefs.master_row_automation_expanded = true;
             } else {
@@ -13224,18 +13320,20 @@ impl AppData {
         // 新規 lane を作成。default_value は target に応じて現在値を引く。
         let default_value = self.lane_default_for_target(&touched);
         if is_song_level {
-            let lane_id = self.song_doc.song().alloc_song_lane_id();
-            let new_lane = common::model::AutomationLane {
-                id: lane_id,
-                target: touched.target.clone(),
-                default_value,
-                enabled: true,
-                visible: true,
-                height_px: 60,
-                clips: Vec::new(),
-                next_clip_id: 1,
-            };
-            self.edit_song(|song| song.song_lanes.push(new_lane));
+            self.edit_song(|song| {
+                let lane_id = song.alloc_song_lane_id();
+                let new_lane = common::model::AutomationLane {
+                    id: lane_id,
+                    target: touched.target.clone(),
+                    default_value,
+                    enabled: true,
+                    visible: true,
+                    height_px: 60,
+                    clips: Vec::new(),
+                    next_clip_id: 1,
+                };
+                song.song_lanes.push(new_lane);
+            });
             self.ui_prefs.master_row_automation_expanded = true;
         } else {
             let __applied = self.edit_song_checked(|song| {
@@ -13424,14 +13522,16 @@ impl AppData {
         if keys.is_empty() {
             return;
         }
-        for k in keys {
-            let Some(lane) = self.song_doc.song().automation_lane_by_key_mut(k.track, k.lane) else {
-                continue;
-            };
-            if let Some(idx) = lane.clip_index_by_id(k.clip) {
-                lane.clips.remove(idx);
+        self.edit_song(|song| {
+            for k in keys {
+                let Some(lane) = song.automation_lane_by_key_mut(k.track, k.lane) else {
+                    continue;
+                };
+                if let Some(idx) = lane.clip_index_by_id(k.clip) {
+                    lane.clips.remove(idx);
+                }
             }
-        }
+        });
         // 選択中だった clip があれば selection からも除く。
         self.selection.selected_automation_clips
             .retain(|sel| !keys.iter().any(|k| k == sel));
@@ -13501,7 +13601,9 @@ impl AppData {
                 None
             }
         };
-        let group_id = self.song_doc.song().alloc_track_id();
+        let Some(group_id) = self.edit_song(|song| song.alloc_track_id()) else {
+            return;
+        };
         let group_index = self.song_doc.song().tracks.len() + 1;
         let group_track = track_with(|t| {
             t.id = group_id;
@@ -13633,12 +13735,14 @@ impl AppData {
                 continue;
             };
             let new_parent = group_track.parent_group_id;
-            for t in &mut self.song_doc.song().tracks {
-                if t.parent_group_id == Some(*group_id) {
-                    t.parent_group_id = new_parent;
-                    new_selection.push(t.id);
+            self.edit_song(|song| {
+                for t in &mut song.tracks {
+                    if t.parent_group_id == Some(*group_id) {
+                        t.parent_group_id = new_parent;
+                        new_selection.push(t.id);
+                    }
                 }
-            }
+            });
             if let Some(pos) = self.song_doc.song().tracks.iter().position(|t| t.id == *group_id) {
                 #[cfg(windows)]
                 {
@@ -13722,11 +13826,17 @@ impl AppData {
                     .and_then(|t| t.parent_group_id);
             }
         }
-        let Some(track) = self.song_doc.song().track_by_id_mut(track_id) else {
+        let found = self.edit_song_checked(|song| {
+            let Some(track) = song.track_by_id_mut(track_id) else {
+                return false;
+            };
+            track.parent_group_id = parent_id;
+            true
+        });
+        if !found {
             tracing::warn!(track_id, "ignored: track not found");
             return;
-        };
-        track.parent_group_id = parent_id;
+        }
         self.sync_song_to_plugin_host();
         tracing::info!(track_id, ?parent_id, "track reparented");
     }
@@ -13737,7 +13847,7 @@ impl AppData {
             return;
         }
         // PR2.1: pop() の前に id を保存し、 IPC は id で送る。
-        let Some(removed) = self.song_doc.song().tracks.pop() else {
+        let Some(Some(removed)) = self.edit_song(|song| song.tracks.pop()) else {
             return;
         };
         let removed_id = removed.id;
@@ -13847,16 +13957,16 @@ impl AppData {
             // Learn mode: 既存 同 (channel, controller) を retain で除外 +
             // 新 binding push。 status_message は次 frame の通常 status に上書き
             // されるが「bind 完了」 を一瞬表示。
-            self.song_doc.song().midi_bindings.retain(|b| {
-                !(b.controller == controller && b.channel == channel)
+            self.edit_song(move |song| {
+                song.midi_bindings.retain(|b| {
+                    !(b.controller == controller && b.channel == channel)
+                });
+                song.midi_bindings.push(common::model::MidiBinding {
+                    channel,
+                    controller,
+                    target,
+                });
             });
-            self.song_doc.song().midi_bindings.push(common::model::MidiBinding {
-                channel,
-                controller,
-                target,
-            });
-            // `midi_bindings` は永続 field (非 undoable 経路なのでここで dirty)。
-            self.song_doc.is_dirty() = true;
             self.ui_ephemeral.status_message =
                 format!("MIDI bind: CC {controller} (ch {channel}) → {target:?}");
             return;
@@ -13904,8 +14014,6 @@ impl AppData {
                 let bpm = (60.0 + v_norm * 120.0).clamp(1.0, 400.0);
                 let old_bpm = self.song_doc.song().bpm;
                 self.edit_song(|song| song.bpm = bpm);
-                // `bpm` は永続 field (非 undoable 経路なのでここで dirty)。
-                self.song_doc.is_dirty() = true;
                 if !self.rescale_raw_clips_for_bpm_change(old_bpm, bpm) {
                     self.send_audio(AudioCommand::SetSongBpm { bpm });
                 }
@@ -13928,7 +14036,7 @@ impl AppData {
                 // v29: binding は安定 device_id を持つ。 現在位置 (track /
                 // index) へは逆引きで繋ぐ (device 削除済みなら無視)。
                 let Some((resolved_track, device_index)) =
-                    find_device_by_id(&self.song_doc.song(), device_id)
+                    find_device_by_id(self.song_doc.song(), device_id)
                 else {
                     return;
                 };
@@ -13976,27 +14084,28 @@ impl AppData {
         } else {
             cursor
         };
-        let Some(content) =
-            midi_content_in_clip_mut(&mut self.song_doc.song(), target_track_idx, target_clip_idx)
-        else {
+        let Some(Some(selected)) = self.edit_song(|song| {
+            let content =
+                midi_content_in_clip_mut(song, target_track_idx, target_clip_idx)?;
+            // v29: 新規 note は allocator で安定 id を採番する。
+            let note_id = content.alloc_note_id();
+            let notes = &mut content.notes;
+            let new_idx = notes.len() as u32;
+            notes.push(common::model::Note {
+                id: note_id,
+                start_beat: cursor,
+                duration_beats: step,
+                pitch,
+                velocity,
+                lyric: None,
+                muted: false,
+            });
+            // ステップ入力した note を勝者として重なり解消。
+            let remap = resolve_note_overlaps(notes, &[new_idx]);
+            Some(remap_indices(&remap, &[new_idx]))
+        }) else {
             return;
         };
-        // v29: 新規 note は allocator で安定 id を採番する。
-        let note_id = content.alloc_note_id();
-        let notes = &mut content.notes;
-        let new_idx = notes.len() as u32;
-        notes.push(common::model::Note {
-            id: note_id,
-            start_beat: cursor,
-            duration_beats: step,
-            pitch,
-            velocity,
-            lyric: None,
-            muted: false,
-        });
-        // ステップ入力した note を勝者として重なり解消。
-        let remap = resolve_note_overlaps(notes, &[new_idx]);
-        let selected = remap_indices(&remap, &[new_idx]);
         let next_cursor = cursor + step;
         // selected_notes は packed note id。入力先 (target) clip の slot で pack。
         self.selection.selected_notes = self.pack_clip_selection(target, &selected);
@@ -14048,21 +14157,21 @@ impl AppData {
             let clip_start =
                 self.song_doc.song().tracks[track_idx].clips[clip_idx].start_beat;
             let local_start = playhead - clip_start;
-            if let Some(content) =
-                midi_content_in_clip_mut(&mut self.song_doc.song(), track_idx, clip_idx)
-            {
-                // v29: 録音で入る note も allocator で安定 id を採番。
-                let note_id = content.alloc_note_id();
-                content.notes.push(common::model::Note {
-                    id: note_id,
-                    start_beat: local_start,
-                    duration_beats: 0.05,
-                    pitch,
-                    velocity,
-                    lyric: None,
-                    muted: false,
-                });
-            }
+            self.edit_song(|song| {
+                if let Some(content) = midi_content_in_clip_mut(song, track_idx, clip_idx) {
+                    // v29: 録音で入る note も allocator で安定 id を採番。
+                    let note_id = content.alloc_note_id();
+                    content.notes.push(common::model::Note {
+                        id: note_id,
+                        start_beat: local_start,
+                        duration_beats: 0.05,
+                        pitch,
+                        velocity,
+                        lyric: None,
+                        muted: false,
+                    });
+                }
+            });
         }
         self.sync_song_to_plugin_host();
     }
@@ -14109,15 +14218,16 @@ impl AppData {
                 self.song_doc.song().tracks[track_idx].clips[clip_idx].start_beat;
             let local_start = start - clip_start;
             let length = (playhead - start).max(0.05);
-            if let Some(notes) =
-                self.song_doc.song().notes_in_clip_mut(track_idx, clip_idx)
-                && let Some(n) = notes.iter_mut().find(|n| {
-                    (n.start_beat - local_start).abs() < 1e-6
-                        && n.pitch == pitch
-                })
-            {
-                n.duration_beats = length;
-            }
+            self.edit_song(|song| {
+                if let Some(notes) = song.notes_in_clip_mut(track_idx, clip_idx)
+                    && let Some(n) = notes.iter_mut().find(|n| {
+                        (n.start_beat - local_start).abs() < 1e-6
+                            && n.pitch == pitch
+                    })
+                {
+                    n.duration_beats = length;
+                }
+            });
         }
         self.sync_song_to_plugin_host();
     }
@@ -14130,51 +14240,51 @@ impl AppData {
         track_id: u32,
         playhead: f64,
     ) {
-        let Some(track_idx) =
-            self.song_doc.song().tracks.iter().position(|t| t.id == track_id)
-        else {
-            return;
-        };
-        // 既存 clip 内ならそのまま。
-        if self.song_doc.song().tracks[track_idx].clips.iter().any(|c| {
-            playhead >= c.start_beat
-                && playhead < c.start_beat + c.length_beats
-        }) {
-            return;
-        }
-        // 末尾の直近 1 beat 以内なら延長。
-        if let Some(clip) = self.song_doc.song().tracks[track_idx]
-            .clips
-            .iter_mut()
-            .find(|c| {
-                let end = c.start_beat + c.length_beats;
-                playhead >= end && playhead - end <= 1.0
-            })
-        {
-            clip.length_beats = playhead - clip.start_beat + 4.0;
-            return;
-        }
-        // 新規 clip 作成。
-        let cid = self.song_doc.song().alloc_content_id();
-        self.song_doc.song().clip_contents.insert(
-            cid,
-            common::model::ClipContent::Midi(common::model::MidiContent {
-                notes: vec![],
-                next_note_id: 1,
-            }),
-        );
-        let track = &mut self.song_doc.song().tracks[track_idx];
-        let new_clip_id = track.next_clip_id;
-        track.next_clip_id += 1;
-        let new_clip = common::model::Clip {
-            id: new_clip_id,
-            start_beat: playhead,
-            length_beats: 4.0,
-            name: String::new(),
-            content_id: cid,
-            ..Default::default()
-        };
-        track.clips.push(new_clip);
+        self.edit_song_checked(|song| {
+            let Some(track_idx) = song.tracks.iter().position(|t| t.id == track_id) else {
+                return false;
+            };
+            // 既存 clip 内ならそのまま。
+            if song.tracks[track_idx].clips.iter().any(|c| {
+                playhead >= c.start_beat && playhead < c.start_beat + c.length_beats
+            }) {
+                return false;
+            }
+            // 末尾の直近 1 beat 以内なら延長。
+            if let Some(clip) = song.tracks[track_idx]
+                .clips
+                .iter_mut()
+                .find(|c| {
+                    let end = c.start_beat + c.length_beats;
+                    playhead >= end && playhead - end <= 1.0
+                })
+            {
+                clip.length_beats = playhead - clip.start_beat + 4.0;
+                return true;
+            }
+            // 新規 clip 作成。
+            let cid = song.alloc_content_id();
+            song.clip_contents.insert(
+                cid,
+                common::model::ClipContent::Midi(common::model::MidiContent {
+                    notes: vec![],
+                    next_note_id: 1,
+                }),
+            );
+            let track = &mut song.tracks[track_idx];
+            let new_clip_id = track.next_clip_id;
+            track.next_clip_id += 1;
+            let new_clip = common::model::Clip {
+                id: new_clip_id,
+                start_beat: playhead,
+                length_beats: 4.0,
+                name: String::new(),
+                content_id: cid,
+                ..Default::default()
+            };
+            track.clips.push(new_clip);
+            true
+        });
         // content_name は **明示 rename 専用**。 ここで自動名
         // ("Recorded N") を入れると、 後でノートに歌詞が付いたとき明示名優先
         // ルールで歌詞を隠してしまう (= ⑤⑦ の再来)。 生成クリップは
@@ -14574,15 +14684,12 @@ impl AppData {
     /// 重なりを解消 → packed `selected_notes` の当該クリップ部分を remap、という複数クリップ
     /// note 編集の共通基盤。snap 等の immutable 計算は呼び出し側で済ませて `f` に閉じ込める。
     fn edit_clip_notes(&mut self, slot: usize, r: ClipRef, f: impl FnOnce(&mut Vec<Note>) -> Vec<u32>) {
-        let remap = {
-            let Some(notes) = self
-                .song_doc.song()
-                .notes_in_clip_mut(r.track as usize, r.clip as usize)
-            else {
-                return;
-            };
+        let Some(Some(remap)) = self.edit_song(move |song| {
+            let notes = song.notes_in_clip_mut(r.track as usize, r.clip as usize)?;
             let winners = f(notes);
-            resolve_note_overlaps(notes, &winners)
+            Some(resolve_note_overlaps(notes, &winners))
+        }) else {
+            return;
         };
         self.remap_packed_selection_for_clip(slot, &remap);
     }
@@ -15600,52 +15707,54 @@ impl AppData {
                 .then_with(|| b.0.clip.cmp(&a.0.clip))
         });
 
-        let mut new_refs: Vec<(u32, u32)> = Vec::with_capacity(entries.len());
-        for (source, to_track_id, new_start_beat) in entries {
-            let new_start = new_start_beat.max(0.0);
-            let Some(source_track_id) = self
-                .song_doc.song()
-                .tracks
-                .get(source.track as usize)
-                .map(|t| t.id)
-            else {
-                continue;
-            };
-            if source_track_id == to_track_id {
-                if let Some(track) = self.song_doc.song().tracks.get_mut(source.track as usize)
-                    && let Some(clip) = track.clips.get_mut(source.clip as usize)
-                {
-                    clip.start_beat = new_start;
-                    new_refs.push((source.track, clip.id));
+        let Some(new_refs) = self.edit_song(move |song| {
+            let mut new_refs: Vec<(u32, u32)> = Vec::with_capacity(entries.len());
+            for (source, to_track_id, new_start_beat) in entries {
+                let new_start = new_start_beat.max(0.0);
+                let Some(source_track_id) = song
+                    .tracks
+                    .get(source.track as usize)
+                    .map(|t| t.id)
+                else {
+                    continue;
+                };
+                if source_track_id == to_track_id {
+                    if let Some(track) = song.tracks.get_mut(source.track as usize)
+                        && let Some(clip) = track.clips.get_mut(source.clip as usize)
+                    {
+                        clip.start_beat = new_start;
+                        new_refs.push((source.track, clip.id));
+                    }
+                } else {
+                    let Some(to_track_idx) = song.track_index_by_id(to_track_id) else {
+                        continue;
+                    };
+                    let Some(removed) =
+                        song.tracks.get_mut(source.track as usize).and_then(|t| {
+                            if (source.clip as usize) < t.clips.len() {
+                                Some(t.clips.remove(source.clip as usize))
+                            } else {
+                                None
+                            }
+                        })
+                    else {
+                        continue;
+                    };
+                    let Some(to_track) = song.tracks.get_mut(to_track_idx) else {
+                        continue;
+                    };
+                    let new_clip_id = to_track.alloc_clip_id();
+                    let mut new_clip = removed;
+                    new_clip.id = new_clip_id;
+                    new_clip.start_beat = new_start;
+                    to_track.clips.push(new_clip);
+                    new_refs.push((to_track_idx as u32, new_clip_id));
                 }
-            } else {
-                let Some(to_track_idx) =
-                    self.song_doc.song().track_index_by_id(to_track_id)
-                else {
-                    continue;
-                };
-                let Some(removed) =
-                    self.song_doc.song().tracks.get_mut(source.track as usize).and_then(|t| {
-                        if (source.clip as usize) < t.clips.len() {
-                            Some(t.clips.remove(source.clip as usize))
-                        } else {
-                            None
-                        }
-                    })
-                else {
-                    continue;
-                };
-                let Some(to_track) = self.song_doc.song().tracks.get_mut(to_track_idx) else {
-                    continue;
-                };
-                let new_clip_id = to_track.alloc_clip_id();
-                let mut new_clip = removed;
-                new_clip.id = new_clip_id;
-                new_clip.start_beat = new_start;
-                to_track.clips.push(new_clip);
-                new_refs.push((to_track_idx as u32, new_clip_id));
             }
-        }
+            new_refs
+        }) else {
+            return;
+        };
         // 新 clip 群を stable ClipKey (track.id + clip.id) で選択。
         self.selection.selected_clips = new_refs
             .iter()
@@ -15998,8 +16107,13 @@ impl AppData {
             original_bpm: Some(self.song_doc.song().bpm),
             root_key: None,
         };
-        let new_source_id = self.song_doc.song().alloc_audio_source_id();
-        self.edit_song(|song| song.audio_sources.insert(new_source_id, new_source));
+        let Some(new_source_id) = self.edit_song(move |song| {
+            let new_source_id = song.alloc_audio_source_id();
+            song.audio_sources.insert(new_source_id, new_source);
+            new_source_id
+        }) else {
+            return;
+        };
 
         // decode して audio_source_cache に登録 (= 即時再生で playback
         // できるよう)。 失敗しても tracker 表示等は問題ないので warn だけ。
@@ -16031,7 +16145,9 @@ impl AppData {
         match pending.mode {
             BounceMode::WithFx => {
                 // 新 track 作成 (空 plugin chain)。 名前は元 clip 名 + " (FX)"。
-                let new_track_id = self.song_doc.song().alloc_track_id();
+                let Some(new_track_id) = self.edit_song(|song| song.alloc_track_id()) else {
+                    return;
+                };
                 let new_track_name = format!("{} (FX)", pending.clip_name);
                 let new_track = track_with(|t| {
                     t.id = new_track_id;
@@ -16041,43 +16157,46 @@ impl AppData {
                 self.edit_song(|song| song.tracks.push(new_track));
                 let new_track_idx = self.song_doc.song().tracks.len() - 1;
 
-                let new_content_id = self.song_doc.song().alloc_content(
-                    common::model::ClipContent::Audio(common::model::AudioContent {
-                        events: vec![new_event],
-                        next_event_id: 2,
-                    }),
-                    format!("{} (bounced FX)", pending.clip_name),
-                );
+                let bounced_content_name = format!("{} (bounced FX)", pending.clip_name);
+                let Some(new_content_id) = self.edit_song(move |song| {
+                    song.alloc_content(
+                        common::model::ClipContent::Audio(common::model::AudioContent {
+                            events: vec![new_event],
+                            next_event_id: 2,
+                        }),
+                        bounced_content_name,
+                    )
+                }) else {
+                    return;
+                };
 
-                let new_track_mut = &mut self.song_doc.song().tracks[new_track_idx];
-                let new_clip_id = new_track_mut.alloc_clip_id();
-                new_track_mut.clips.push(common::model::Clip {
-                    id: new_clip_id,
-                    name: String::new(),
-                    start_beat: pending.start_beat,
-                    length_beats: pending.clip_length_beats,
-                    content_id: new_content_id,
-                    notes: Vec::new(),
-                    color: None,
-                    auto_lipsync: false,
-                    ..Default::default()
+                self.edit_song(|song| {
+                    let new_track_mut = &mut song.tracks[new_track_idx];
+                    let new_clip_id = new_track_mut.alloc_clip_id();
+                    new_track_mut.clips.push(common::model::Clip {
+                        id: new_clip_id,
+                        name: String::new(),
+                        start_beat: pending.start_beat,
+                        length_beats: pending.clip_length_beats,
+                        content_id: new_content_id,
+                        notes: Vec::new(),
+                        color: None,
+                        auto_lipsync: false,
+                        ..Default::default()
+                    });
+
+                    // 二重再生回避のため元トラックを自動ミュート。 別 SetTrackMuted は
+                    // 不要 (下の sync_song_to_plugin_host が muted=true 込みの full song を LoadSong)。
+                    // index は bounce 中の編集で stale になり得るので stable id で解決する
+                    // (削除済みなら skip = 二重再生の危険自体が無い)。
+                    if let Some(src) =
+                        song.tracks.iter_mut().find(|t| t.id == pending.source_track_id)
+                    {
+                        src.muted = true;
+                    }
                 });
 
-                // 二重再生回避のため元トラックを自動ミュート。 別 SetTrackMuted は
-                // 不要 (下の sync_song_to_plugin_host が muted=true 込みの full song を LoadSong)。
-                // index は bounce 中の編集で stale になり得るので stable id で解決する
-                // (削除済みなら skip = 二重再生の危険自体が無い)。
-                if let Some(src) = self
-                    .song_doc.song()
-                    .tracks
-                    .iter_mut()
-                    .find(|t| t.id == pending.source_track_id)
-                {
-                    src.muted = true;
-                }
-
                 self.resize_track_peak_display();
-                self.song_doc.is_dirty() = true;
                 self.sync_song_to_plugin_host();
                 self.ui_ephemeral.status_message = format!(
                     "Bounce (with FX) 完了: 新トラック '{new_track_name}' を追加 (元トラックはミュート)",
@@ -16088,15 +16207,16 @@ impl AppData {
                 // 置換 (= flat 化)。 同 content_id を共有する linked clip も追従する。
                 // 対象は bounce 開始時に捕捉した stable な content id (index 経由の
                 // 再解決は bounce 中の編集でずれる)。 存在は上で検証済み。
-                if let Some(content) =
-                    self.song_doc.song().clip_contents.get_mut(&pending.source_content_id)
-                {
-                    *content = common::model::ClipContent::Audio(common::model::AudioContent {
-                        events: vec![new_event],
-                        next_event_id: 2,
-                    });
-                }
-                self.song_doc.is_dirty() = true;
+                self.edit_song(move |song| {
+                    if let Some(content) =
+                        song.clip_contents.get_mut(&pending.source_content_id)
+                    {
+                        *content = common::model::ClipContent::Audio(common::model::AudioContent {
+                            events: vec![new_event],
+                            next_event_id: 2,
+                        });
+                    }
+                });
                 self.sync_song_to_plugin_host();
                 self.ui_ephemeral.status_message = format!("Bounce In Place 完了: '{}'", pending.clip_name);
             }
@@ -16172,11 +16292,18 @@ impl AppData {
     /// `sync_song_to_plugin_host` で daw_audio へ LoadSong flush し、再生・書き出しに反映する
     /// (is_dirty もそこで立つ)。
     fn set_clip_muted(&mut self, target: ClipRef, muted: bool) {
-        if let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize)
-            && let Some(clip) = track.clips.get_mut(target.clip as usize)
-            && clip.muted != muted
-        {
-            clip.muted = muted;
+        let changed = self.edit_song_checked(|song| {
+            if let Some(track) = song.tracks.get_mut(target.track as usize)
+                && let Some(clip) = track.clips.get_mut(target.clip as usize)
+                && clip.muted != muted
+            {
+                clip.muted = muted;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
             self.sync_song_to_plugin_host();
         }
     }
@@ -16192,18 +16319,24 @@ impl AppData {
         self.for_each_note_clip_group(
             notes.iter().map(|&id| (id, ())),
             |app, _slot, r, items| {
-                if let Some(clip_notes) =
-                    app.song_doc.song().notes_in_clip_mut(r.track as usize, r.clip as usize)
-                {
+                let group_changed = app.edit_song_checked(|song| {
+                    let Some(clip_notes) =
+                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    else {
+                        return false;
+                    };
+                    let mut c = false;
                     for &(local, ()) in items {
                         if let Some(n) = clip_notes.get_mut(local)
                             && n.muted != muted
                         {
                             n.muted = muted;
-                            changed = true;
+                            c = true;
                         }
                     }
-                }
+                    c
+                });
+                changed |= group_changed;
             },
         );
         if changed {
@@ -16295,22 +16428,27 @@ impl AppData {
         }
 
         // Phase C: 書き戻し (warp 有効 event は Stretch mode へ) + engine 再 sync。
-        let mut warped = 0usize;
-        let mut changed = false;
-        if let Some(common::model::ClipContent::Audio(a)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        {
-            for (i, markers) in results {
-                if let Some(ev) = a.events.get_mut(i) {
-                    if !markers.is_empty() {
-                        ev.stretch_mode = common::model::StretchMode::Stretch;
-                        warped += 1;
+        let (warped, changed) = self
+            .edit_song(move |song| {
+                let mut warped = 0usize;
+                let mut changed = false;
+                if let Some(common::model::ClipContent::Audio(a)) =
+                    song.clip_contents.get_mut(&content_id)
+                {
+                    for (i, markers) in results {
+                        if let Some(ev) = a.events.get_mut(i) {
+                            if !markers.is_empty() {
+                                ev.stretch_mode = common::model::StretchMode::Stretch;
+                                warped += 1;
+                            }
+                            ev.beat_markers = markers;
+                            changed = true;
+                        }
                     }
-                    ev.beat_markers = markers;
-                    changed = true;
                 }
-            }
-        }
+                (warped, changed)
+            })
+            .unwrap_or((0, false));
         if changed {
             self.ui_ephemeral.status_message = format!("Auto-Warp: {warped} event を beat grid に整列");
             self.sync_song_to_plugin_host();
@@ -16373,17 +16511,22 @@ impl AppData {
         }
 
         // Phase C: onsets を書き戻し audio engine へ再 sync (mutable borrow)。
-        let mut changed = false;
-        if let Some(common::model::ClipContent::Audio(a)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        {
-            for (i, onsets) in results {
-                if let Some(e) = a.events.get_mut(i) {
-                    e.onsets = onsets;
-                    changed = true;
+        let changed = self
+            .edit_song(move |song| {
+                let mut changed = false;
+                if let Some(common::model::ClipContent::Audio(a)) =
+                    song.clip_contents.get_mut(&content_id)
+                {
+                    for (i, onsets) in results {
+                        if let Some(e) = a.events.get_mut(i) {
+                            e.onsets = onsets;
+                            changed = true;
+                        }
+                    }
                 }
-            }
-        }
+                changed
+            })
+            .unwrap_or(false);
         if changed {
             self.sync_song_to_plugin_host();
         }
@@ -16526,19 +16669,21 @@ impl AppData {
         else {
             return false;
         };
-        if let Some(common::model::ClipContent::Text(t)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        {
-            if t.events.is_empty() {
-                return false;
+        self.edit_song_checked(move |song| {
+            if let Some(common::model::ClipContent::Text(t)) =
+                song.clip_contents.get_mut(&content_id)
+            {
+                if t.events.is_empty() {
+                    return false;
+                }
+                for event in &mut t.events {
+                    f(event);
+                }
+                true
+            } else {
+                false
             }
-            for event in &mut t.events {
-                f(event);
-            }
-            true
-        } else {
-            false
-        }
+        })
     }
 
     fn set_clip_text_event_x(&mut self, target: ClipRef, value: f32) {
@@ -16572,11 +16717,6 @@ impl AppData {
         // 単一行 text のみ (`plan_text_overlay.md` §1.1)、 '\n' は除外。
         let value = value.replace(['\n', '\r'], " ");
         if self.mutate_text_events_in_clip(target, |e| e.text = value.clone()) {
-            // Text 編集は plugin host へ sync しない経路なので、 ここで明示的に
-            // dirty を立てる (= 未保存変更ありとしてタイトルに '*' / autosave 対象)。
-            // 表示名は content から導出するので content_name は触らない
-            // (デフォルト無名のまま、 clip_display_label が本文を表示)。
-            self.song_doc.is_dirty() = true;
             // (talk) Text は VOICEVOX トラックでは読み上げ原稿。本文変更を builtin へ
             // 再 flush (= 新テキストで talk 再合成) + 口パク再生成。非 VOICEVOX
             // トラックの Text 編集では sync_vocal_metadata は no-op、debounce も
@@ -16839,7 +16979,6 @@ impl AppData {
         // 値になっていても結果は同じ)。
         self.set_clip_text_event_font_family(target, self.ui_ephemeral.font_picker_restore.clone());
         self.set_clip_text_event_font_family(target, family);
-        self.song_doc.is_dirty() = true;
         // commit 経路では close_font_picker (on_close) の restore を no-op 化する
         // ため target を先に落とす。
         self.ui_ephemeral.font_picker_target = None;
@@ -17112,38 +17251,36 @@ impl AppData {
         let Some(idx) = self.audio_editor_anchor_event() else {
             return;
         };
-        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
+        let Some(Some(insert_at)) = self.edit_song(|song| {
+            let track = song.tracks.get_mut(target.track as usize)?;
+            let clip = track.clips.get_mut(target.clip as usize)?;
+            let content_id = clip.content_id;
+            let Some(common::model::ClipContent::Audio(audio)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return None;
+            };
+            let src = audio.events.get(idx).cloned()?;
+            let new_start = src.event_start_in_clip_beats + src.event_length_beats;
+            let mut new_event = src.clone();
+            new_event.event_start_in_clip_beats = new_start;
+            let insert_at = idx + 1;
+            if insert_at >= audio.events.len() {
+                audio.events.push(new_event);
+            } else {
+                audio.events.insert(insert_at, new_event);
+            }
+            // clip.length_beats を必要に応じて拡張 (= 新 event の右端を含むよう
+            // に)。 元 length より長くなる場合のみ更新。
+            let needed = new_start + src.event_length_beats;
+            if needed > clip.length_beats {
+                clip.length_beats = needed;
+            }
+            Some(insert_at)
+        }) else {
             return;
         };
-        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let Some(common::model::ClipContent::Audio(audio)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
-            return;
-        };
-        let Some(src) = audio.events.get(idx).cloned() else {
-            return;
-        };
-        let new_start = src.event_start_in_clip_beats + src.event_length_beats;
-        let mut new_event = src.clone();
-        new_event.event_start_in_clip_beats = new_start;
-        let insert_at = idx + 1;
-        if insert_at >= audio.events.len() {
-            audio.events.push(new_event);
-        } else {
-            audio.events.insert(insert_at, new_event);
-        }
-        // clip.length_beats を必要に応じて拡張 (= 新 event の右端を含むよう
-        // に)。 元 length より長くなる場合のみ更新。
-        let needed = new_start + src.event_length_beats;
-        if needed > clip.length_beats {
-            clip.length_beats = needed;
-        }
         self.selection.audio_editor_selected_events = vec![insert_at];
-        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
@@ -17160,31 +17297,35 @@ impl AppData {
         event_idx: usize,
         new_start_beats: f64,
     ) {
-        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let Some(common::model::ClipContent::Audio(audio)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
-            return;
-        };
-        let Some(event) = audio.events.get_mut(event_idx) else {
-            return;
-        };
-        let new_start = new_start_beats.max(0.0);
-        event.event_start_in_clip_beats = new_start;
-        let needed = new_start + event.event_length_beats;
-        if needed > clip.length_beats {
-            clip.length_beats = needed;
-        }
-        self.song_doc.is_dirty() = true;
-        self.sync_song_to_plugin_host();
-        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
-            self.resync_clip_audio_event_edit_buffers(target);
+        let changed = self.edit_song_checked(|song| {
+            let Some(track) = song.tracks.get_mut(target.track as usize) else {
+                return false;
+            };
+            let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+                return false;
+            };
+            let content_id = clip.content_id;
+            let Some(common::model::ClipContent::Audio(audio)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return false;
+            };
+            let Some(event) = audio.events.get_mut(event_idx) else {
+                return false;
+            };
+            let new_start = new_start_beats.max(0.0);
+            event.event_start_in_clip_beats = new_start;
+            let needed = new_start + event.event_length_beats;
+            if needed > clip.length_beats {
+                clip.length_beats = needed;
+            }
+            true
+        });
+        if changed {
+            self.sync_song_to_plugin_host();
+            if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
+                self.resync_clip_audio_event_edit_buffers(target);
+            }
         }
     }
 
@@ -17226,72 +17367,76 @@ impl AppData {
         };
         let delta_frames = (delta_beats * 60.0 / bpm * sr_hz).round() as i64;
 
-        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let Some(common::model::ClipContent::Audio(audio)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
-            return;
-        };
-        let Some(event) = audio.events.get_mut(event_idx) else {
-            return;
-        };
+        let changed = self.edit_song_checked(|song| {
+            let Some(track) = song.tracks.get_mut(target.track as usize) else {
+                return false;
+            };
+            let Some(clip) = track.clips.get_mut(target.clip as usize) else {
+                return false;
+            };
+            let content_id = clip.content_id;
+            let Some(common::model::ClipContent::Audio(audio)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return false;
+            };
+            let Some(event) = audio.events.get_mut(event_idx) else {
+                return false;
+            };
 
-        const MIN_LEN_BEATS: f64 = 1e-4;
-        match side {
-            AudioEventTrimSide::Left => {
-                // delta_beats > 0 で右に縮める (= start を遅らせる)、
-                // < 0 で左に伸ばす。 ただし event_length が MIN_LEN を
-                // 切らないよう先に clamp。
-                let max_inset = (event.event_length_beats - MIN_LEN_BEATS).max(0.0);
-                let dbeats = delta_beats.clamp(
-                    -event.event_start_in_clip_beats,
-                    max_inset,
-                );
-                let dframes = (dbeats * 60.0 / bpm * sr_hz).round() as i64;
-                let new_start_in_clip = event.event_start_in_clip_beats + dbeats;
-                let new_length = event.event_length_beats - dbeats;
-                let new_source_start = (event.source_start_frames as i64 + dframes)
-                    .max(0)
-                    .min(event.source_end_frames as i64) as u64;
-                event.event_start_in_clip_beats = new_start_in_clip;
-                event.event_length_beats = new_length.max(MIN_LEN_BEATS);
-                event.source_start_frames = new_source_start;
-                let _ = delta_frames;
+            const MIN_LEN_BEATS: f64 = 1e-4;
+            match side {
+                AudioEventTrimSide::Left => {
+                    // delta_beats > 0 で右に縮める (= start を遅らせる)、
+                    // < 0 で左に伸ばす。 ただし event_length が MIN_LEN を
+                    // 切らないよう先に clamp。
+                    let max_inset = (event.event_length_beats - MIN_LEN_BEATS).max(0.0);
+                    let dbeats = delta_beats.clamp(
+                        -event.event_start_in_clip_beats,
+                        max_inset,
+                    );
+                    let dframes = (dbeats * 60.0 / bpm * sr_hz).round() as i64;
+                    let new_start_in_clip = event.event_start_in_clip_beats + dbeats;
+                    let new_length = event.event_length_beats - dbeats;
+                    let new_source_start = (event.source_start_frames as i64 + dframes)
+                        .max(0)
+                        .min(event.source_end_frames as i64) as u64;
+                    event.event_start_in_clip_beats = new_start_in_clip;
+                    event.event_length_beats = new_length.max(MIN_LEN_BEATS);
+                    event.source_start_frames = new_source_start;
+                    let _ = delta_frames;
+                }
+                AudioEventTrimSide::Right => {
+                    // delta_beats > 0 で右に伸ばす、 < 0 で縮める。 縮める
+                    // 側は event_length が MIN_LEN を切らないよう clamp、
+                    // 伸ばす側は source_end_frames が total_frames を超え
+                    // ないよう clamp。
+                    let max_grow_frames = total_frames as i64 - event.source_end_frames as i64;
+                    let max_grow_beats =
+                        (max_grow_frames as f64) / sr_hz * bpm / 60.0;
+                    let min_shrink_beats = -(event.event_length_beats - MIN_LEN_BEATS).max(0.0);
+                    let dbeats = delta_beats.clamp(min_shrink_beats, max_grow_beats);
+                    let dframes = (dbeats * 60.0 / bpm * sr_hz).round() as i64;
+                    let new_length = event.event_length_beats + dbeats;
+                    let new_source_end = ((event.source_end_frames as i64 + dframes)
+                        .max(event.source_start_frames as i64)
+                        .min(total_frames as i64)) as u64;
+                    event.event_length_beats = new_length.max(MIN_LEN_BEATS);
+                    event.source_end_frames = new_source_end;
+                }
             }
-            AudioEventTrimSide::Right => {
-                // delta_beats > 0 で右に伸ばす、 < 0 で縮める。 縮める
-                // 側は event_length が MIN_LEN を切らないよう clamp、
-                // 伸ばす側は source_end_frames が total_frames を超え
-                // ないよう clamp。
-                let max_grow_frames = total_frames as i64 - event.source_end_frames as i64;
-                let max_grow_beats =
-                    (max_grow_frames as f64) / sr_hz * bpm / 60.0;
-                let min_shrink_beats = -(event.event_length_beats - MIN_LEN_BEATS).max(0.0);
-                let dbeats = delta_beats.clamp(min_shrink_beats, max_grow_beats);
-                let dframes = (dbeats * 60.0 / bpm * sr_hz).round() as i64;
-                let new_length = event.event_length_beats + dbeats;
-                let new_source_end = ((event.source_end_frames as i64 + dframes)
-                    .max(event.source_start_frames as i64)
-                    .min(total_frames as i64)) as u64;
-                event.event_length_beats = new_length.max(MIN_LEN_BEATS);
-                event.source_end_frames = new_source_end;
-            }
-        }
 
-        let needed = event.event_start_in_clip_beats + event.event_length_beats;
-        if needed > clip.length_beats {
-            clip.length_beats = needed;
-        }
-        self.song_doc.is_dirty() = true;
-        self.sync_song_to_plugin_host();
-        if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
-            self.resync_clip_audio_event_edit_buffers(target);
+            let needed = event.event_start_in_clip_beats + event.event_length_beats;
+            if needed > clip.length_beats {
+                clip.length_beats = needed;
+            }
+            true
+        });
+        if changed {
+            self.sync_song_to_plugin_host();
+            if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
+                self.resync_clip_audio_event_edit_buffers(target);
+            }
         }
     }
 
@@ -17326,40 +17471,46 @@ impl AppData {
             frames_to_beats(imported.buffer.frames, imported.buffer.sample_rate, bpm);
         let display_name = imported.display_name.clone();
 
-        let source_id = self.song_doc.song().alloc_audio_source_id();
-        self.edit_song(|song| song.audio_sources.insert(source_id, imported.source));
+        let Some(source_id) = self.edit_song(|song| {
+            let source_id = song.alloc_audio_source_id();
+            song.audio_sources.insert(source_id, imported.source);
+            source_id
+        }) else {
+            return;
+        };
         self.media.audio_source_cache
             .insert(source_id, imported.buffer.clone());
 
         let position = position_in_clip_beats.max(0.0);
-        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
+        let source_end_frames = imported.buffer.frames;
+        let Some(Some(new_idx)) = self.edit_song(|song| {
+            let track = song.tracks.get_mut(target.track as usize)?;
+            let clip = track.clips.get_mut(target.clip as usize)?;
+            let content_id = clip.content_id;
+            let Some(common::model::ClipContent::Audio(audio)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return None;
+            };
+            let new_event = AudioEvent {
+                source_id,
+                event_start_in_clip_beats: position,
+                event_length_beats: length_beats,
+                source_start_frames: 0,
+                source_end_frames,
+                ..AudioEvent::default()
+            };
+            audio.events.push(new_event);
+            let new_idx = audio.events.len() - 1;
+            let needed = position + length_beats;
+            if needed > clip.length_beats {
+                clip.length_beats = needed;
+            }
+            Some(new_idx)
+        }) else {
             return;
         };
-        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        let Some(common::model::ClipContent::Audio(audio)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
-            return;
-        };
-        let new_event = AudioEvent {
-            source_id,
-            event_start_in_clip_beats: position,
-            event_length_beats: length_beats,
-            source_start_frames: 0,
-            source_end_frames: imported.buffer.frames,
-            ..AudioEvent::default()
-        };
-        audio.events.push(new_event);
-        let new_idx = audio.events.len() - 1;
-        let needed = position + length_beats;
-        if needed > clip.length_beats {
-            clip.length_beats = needed;
-        }
         self.selection.audio_editor_selected_events = vec![new_idx];
-        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
@@ -17402,19 +17553,23 @@ impl AppData {
         if indices.is_empty() {
             return;
         }
-        if let Some(common::model::ClipContent::Audio(audio)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        {
+        let removed = self.edit_song_checked(move |song| {
+            let Some(common::model::ClipContent::Audio(audio)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return false;
+            };
             for &i in indices.iter().rev() {
                 if i < audio.events.len() {
                     audio.events.remove(i);
                 }
             }
-        } else {
+            true
+        });
+        if !removed {
             return;
         }
         self.selection.audio_editor_selected_events.clear();
-        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
@@ -17447,13 +17602,20 @@ impl AppData {
             };
             let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
             let fade_beats = auto_fade_beats.min(max_beats);
-            if let Some(common::model::ClipContent::Audio(audio)) =
-                self.song_doc.song().clip_contents.get_mut(&content_id)
-            {
-                for event in &mut audio.events {
-                    event.fade_in_beats = fade_beats;
-                    event.fade_out_beats = fade_beats;
+            let did = self.edit_song_checked(move |song| {
+                if let Some(common::model::ClipContent::Audio(audio)) =
+                    song.clip_contents.get_mut(&content_id)
+                {
+                    for event in &mut audio.events {
+                        event.fade_in_beats = fade_beats;
+                        event.fade_out_beats = fade_beats;
+                    }
+                    true
+                } else {
+                    false
                 }
+            });
+            if did {
                 applied += 1;
             }
         }
@@ -17531,22 +17693,24 @@ impl AppData {
                 continue;
             }
             let overlap = (prev_end - next_start).max(0.0);
-            // prev clip の末尾 fade_out
-            if let Some(common::model::ClipContent::Audio(audio)) =
-                self.song_doc.song().clip_contents.get_mut(&prev_content)
-            {
-                for event in &mut audio.events {
-                    event.fade_out_beats = overlap.min(event.event_length_beats);
+            self.edit_song(|song| {
+                // prev clip の末尾 fade_out
+                if let Some(common::model::ClipContent::Audio(audio)) =
+                    song.clip_contents.get_mut(&prev_content)
+                {
+                    for event in &mut audio.events {
+                        event.fade_out_beats = overlap.min(event.event_length_beats);
+                    }
                 }
-            }
-            // next clip の先頭 fade_in
-            if let Some(common::model::ClipContent::Audio(audio)) =
-                self.song_doc.song().clip_contents.get_mut(&next_content)
-            {
-                for event in &mut audio.events {
-                    event.fade_in_beats = overlap.min(event.event_length_beats);
+                // next clip の先頭 fade_in
+                if let Some(common::model::ClipContent::Audio(audio)) =
+                    song.clip_contents.get_mut(&next_content)
+                {
+                    for event in &mut audio.events {
+                        event.fade_in_beats = overlap.min(event.event_length_beats);
+                    }
                 }
-            }
+            });
             applied += 1;
         }
         if applied > 0 {
@@ -17603,18 +17767,18 @@ impl AppData {
         let new_length_beats = new_length_beats.max(0.0625);
         let new_start_beat = new_start_beat.max(0.0);
         let bpm = self.song_doc.song().bpm.max(1.0) as f64;
-        let (content_id, prev_start_beat, prev_length_beats) = {
-            let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
-                return;
-            };
-            let Some(clip) = track.clips.get_mut(target.clip as usize) else {
-                return;
-            };
-            let prev_start_beat = clip.start_beat;
-            let prev_length_beats = clip.length_beats;
-            clip.start_beat = new_start_beat;
-            clip.length_beats = new_length_beats;
-            (clip.content_id, prev_start_beat, prev_length_beats)
+        let Some(Some((content_id, prev_start_beat, prev_length_beats))) =
+            self.edit_song(|song| {
+                let track = song.tracks.get_mut(target.track as usize)?;
+                let clip = track.clips.get_mut(target.clip as usize)?;
+                let prev_start_beat = clip.start_beat;
+                let prev_length_beats = clip.length_beats;
+                clip.start_beat = new_start_beat;
+                clip.length_beats = new_length_beats;
+                Some((clip.content_id, prev_start_beat, prev_length_beats))
+            })
+        else {
+            return;
         };
         let delta_start = new_start_beat - prev_start_beat;
 
@@ -17776,64 +17940,66 @@ impl AppData {
         }
         // 共有 content は fork してから伸縮 (siblings の length と無関係)。
         let content_id = if self.song_doc.song().clip_content_refcount(content_id) > 1 {
-            let new_id = self.song_doc.song().fork_content(content_id);
-            if let Some(clip) = self
-                .song_doc.song()
-                .tracks
-                .get_mut(target.track as usize)
-                .and_then(|t| t.clips.get_mut(target.clip as usize))
-            {
-                clip.content_id = new_id;
-            }
-            new_id
+            self.edit_song(|song| {
+                let new_id = song.fork_content(content_id);
+                if let Some(clip) = song
+                    .tracks
+                    .get_mut(target.track as usize)
+                    .and_then(|t| t.clips.get_mut(target.clip as usize))
+                {
+                    clip.content_id = new_id;
+                }
+                new_id
+            })
+            .unwrap_or(content_id)
         } else {
             content_id
         };
 
-        match self.song_doc.song().clip_contents.get_mut(&content_id) {
-            Some(ClipContent::Audio(audio)) => {
-                for e in &mut audio.events {
-                    let (s, l) = stretch_remap(
-                        prev_start,
-                        prev_len,
-                        new_start,
-                        new_len,
-                        e.event_start_in_clip_beats,
-                        e.event_length_beats,
-                    );
-                    e.event_start_in_clip_beats = s;
-                    e.event_length_beats = l;
-                    // ピッチ保持を既定: Raw (= 時間操作しない定義) は Stretch
-                    // (granular) へ昇格。 既に Repitch/Stretch/Slice なら維持。
-                    if e.stretch_mode == common::model::StretchMode::Raw {
-                        e.stretch_mode = common::model::StretchMode::Stretch;
+        self.edit_song(|song| {
+            match song.clip_contents.get_mut(&content_id) {
+                Some(ClipContent::Audio(audio)) => {
+                    for e in &mut audio.events {
+                        let (s, l) = stretch_remap(
+                            prev_start,
+                            prev_len,
+                            new_start,
+                            new_len,
+                            e.event_start_in_clip_beats,
+                            e.event_length_beats,
+                        );
+                        e.event_start_in_clip_beats = s;
+                        e.event_length_beats = l;
+                        // ピッチ保持を既定: Raw (= 時間操作しない定義) は Stretch
+                        // (granular) へ昇格。 既に Repitch/Stretch/Slice なら維持。
+                        if e.stretch_mode == common::model::StretchMode::Raw {
+                            e.stretch_mode = common::model::StretchMode::Stretch;
+                        }
+                        // source 窓は固定 = これが stretch の本質。
                     }
-                    // source 窓は固定 = これが stretch の本質。
                 }
-            }
-            Some(ClipContent::Midi(midi)) => {
-                for n in &mut midi.notes {
-                    let (s, l) = stretch_remap(
-                        prev_start,
-                        prev_len,
-                        new_start,
-                        new_len,
-                        n.start_beat,
-                        n.duration_beats,
-                    );
-                    n.start_beat = s;
-                    n.duration_beats = l;
+                Some(ClipContent::Midi(midi)) => {
+                    for n in &mut midi.notes {
+                        let (s, l) = stretch_remap(
+                            prev_start,
+                            prev_len,
+                            new_start,
+                            new_len,
+                            n.start_beat,
+                            n.duration_beats,
+                        );
+                        n.start_beat = s;
+                        n.duration_beats = l;
+                    }
                 }
-            }
-            _ => {
-                // overlay / automation は stretch 概念なし → 長さ追従のみ。
-                self.edit_song(|song| {
-                    if let Some(content) = song.clip_contents.get_mut(&content_id) {
+                other => {
+                    // overlay / automation は stretch 概念なし → 長さ追従のみ。
+                    if let Some(content) = other {
                         content.ensure_event_covers_clip(new_len);
                     }
-                });
+                }
             }
-        }
+        });
     }
 
     /// 共有コピー (D shortcut): 末尾直後 (start+length) に同サイズの clip を
@@ -17884,24 +18050,27 @@ impl AppData {
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
         let src_talk = src_clip.talk;
-        let track = self.song_doc.song().tracks.get_mut(source.track as usize)?;
-        let new_clip_id = track.alloc_clip_id();
-        let new_idx = track.clips.len() as u32;
-        track.clips.push(Clip {
-            id: new_clip_id,
-            name: String::new(),
-            start_beat: new_start_beat,
-            length_beats: new_length,
-            content_id,
-            notes: Vec::new(),
-            color: src_color,
-            auto_lipsync: false,
-            muted: src_muted,
-            speaker_id: src_speaker,
-            singer_name: src_singer,
-            style_name: src_style,
-            talk: src_talk,
-        });
+        let new_idx = self.edit_song(move |song| {
+            let track = song.tracks.get_mut(source.track as usize)?;
+            let new_clip_id = track.alloc_clip_id();
+            let new_idx = track.clips.len() as u32;
+            track.clips.push(Clip {
+                id: new_clip_id,
+                name: String::new(),
+                start_beat: new_start_beat,
+                length_beats: new_length,
+                content_id,
+                notes: Vec::new(),
+                color: src_color,
+                auto_lipsync: false,
+                muted: src_muted,
+                speaker_id: src_speaker,
+                singer_name: src_singer,
+                style_name: src_style,
+                talk: src_talk,
+            });
+            Some(new_idx)
+        })??;
         Some(ClipRef { track: source.track, clip: new_idx })
     }
 
@@ -17928,25 +18097,28 @@ impl AppData {
         let src_singer = src_clip.singer_name.clone();
         let src_style = src_clip.style_name.clone();
         let src_talk = src_clip.talk;
-        let new_content_id = self.song_doc.song().fork_content(src_content_id);
-        let track = self.song_doc.song().tracks.get_mut(source.track as usize)?;
-        let new_clip_id = track.alloc_clip_id();
-        let new_idx = track.clips.len() as u32;
-        track.clips.push(Clip {
-            id: new_clip_id,
-            name: String::new(),
-            start_beat: new_start_beat,
-            length_beats: new_length,
-            content_id: new_content_id,
-            notes: Vec::new(),
-            color: src_color,
-            auto_lipsync: false,
-            muted: src_muted,
-            speaker_id: src_speaker,
-            singer_name: src_singer,
-            style_name: src_style,
-            talk: src_talk,
-        });
+        let new_idx = self.edit_song(move |song| {
+            let new_content_id = song.fork_content(src_content_id);
+            let track = song.tracks.get_mut(source.track as usize)?;
+            let new_clip_id = track.alloc_clip_id();
+            let new_idx = track.clips.len() as u32;
+            track.clips.push(Clip {
+                id: new_clip_id,
+                name: String::new(),
+                start_beat: new_start_beat,
+                length_beats: new_length,
+                content_id: new_content_id,
+                notes: Vec::new(),
+                color: src_color,
+                auto_lipsync: false,
+                muted: src_muted,
+                speaker_id: src_speaker,
+                singer_name: src_singer,
+                style_name: src_style,
+                talk: src_talk,
+            });
+            Some(new_idx)
+        })??;
         Some(ClipRef { track: source.track, clip: new_idx })
     }
 
@@ -18012,56 +18184,61 @@ impl AppData {
     /// 群に置き換える (drag 後に選択が新 clip に移るのは MoveClips と同じ semantics)。
     /// §3.4。
     fn clone_clips_linked(&mut self, entries: &[(ClipRef, u32, f64)]) {
-        let mut new_refs = Vec::with_capacity(entries.len());
-        for &(source, to_track_id, drop_start) in entries {
-            let Some(track) = self.song_doc.song().tracks.get(source.track as usize) else {
-                continue;
-            };
-            let Some(src_clip) = track.clips.get(source.clip as usize) else {
-                continue;
-            };
-            let new_length = src_clip.length_beats;
-            // 共有コピー: content_id 流用 → 名前も自動共有。色 (per-clip) は
-            // source の色を引き継ぐ。
-            let content_id = src_clip.content_id;
-            let src_color = src_clip.color;
-            // mute 状態も複製先へ引き継ぐ。
-            let src_muted = src_clip.muted;
-            // per-clip 声を複製先へ引き継ぐ。
-            let src_voice = (
-                src_clip.speaker_id,
-                src_clip.singer_name.clone(),
-                src_clip.style_name.clone(),
-                src_clip.talk,
-            );
-            let Some(to_track_idx) = self.song_doc.song().track_index_by_id(to_track_id) else {
-                continue;
-            };
-            let Some(to_track) = self.song_doc.song().tracks.get_mut(to_track_idx) else {
-                continue;
-            };
-            let new_clip_id = to_track.alloc_clip_id();
-            let new_idx = to_track.clips.len() as u32;
-            to_track.clips.push(Clip {
-                id: new_clip_id,
-                name: String::new(),
-                start_beat: drop_start.max(0.0),
-                length_beats: new_length,
-                content_id,
-                notes: Vec::new(),
-                color: src_color,
-                auto_lipsync: false,
-                muted: src_muted,
-                speaker_id: src_voice.0,
-                singer_name: src_voice.1,
-                style_name: src_voice.2,
-                talk: src_voice.3,
-            });
-            new_refs.push(ClipRef {
-                track: to_track_idx as u32,
-                clip: new_idx,
-            });
-        }
+        let Some(new_refs) = self.edit_song(|song| {
+            let mut new_refs = Vec::with_capacity(entries.len());
+            for &(source, to_track_id, drop_start) in entries {
+                let Some(track) = song.tracks.get(source.track as usize) else {
+                    continue;
+                };
+                let Some(src_clip) = track.clips.get(source.clip as usize) else {
+                    continue;
+                };
+                let new_length = src_clip.length_beats;
+                // 共有コピー: content_id 流用 → 名前も自動共有。色 (per-clip) は
+                // source の色を引き継ぐ。
+                let content_id = src_clip.content_id;
+                let src_color = src_clip.color;
+                // mute 状態も複製先へ引き継ぐ。
+                let src_muted = src_clip.muted;
+                // per-clip 声を複製先へ引き継ぐ。
+                let src_voice = (
+                    src_clip.speaker_id,
+                    src_clip.singer_name.clone(),
+                    src_clip.style_name.clone(),
+                    src_clip.talk,
+                );
+                let Some(to_track_idx) = song.track_index_by_id(to_track_id) else {
+                    continue;
+                };
+                let Some(to_track) = song.tracks.get_mut(to_track_idx) else {
+                    continue;
+                };
+                let new_clip_id = to_track.alloc_clip_id();
+                let new_idx = to_track.clips.len() as u32;
+                to_track.clips.push(Clip {
+                    id: new_clip_id,
+                    name: String::new(),
+                    start_beat: drop_start.max(0.0),
+                    length_beats: new_length,
+                    content_id,
+                    notes: Vec::new(),
+                    color: src_color,
+                    auto_lipsync: false,
+                    muted: src_muted,
+                    speaker_id: src_voice.0,
+                    singer_name: src_voice.1,
+                    style_name: src_voice.2,
+                    talk: src_voice.3,
+                });
+                new_refs.push(ClipRef {
+                    track: to_track_idx as u32,
+                    clip: new_idx,
+                });
+            }
+            new_refs
+        }) else {
+            return;
+        };
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
             self.selection.selected_notes.clear();
@@ -18072,56 +18249,61 @@ impl AppData {
     /// arrangement Ctrl+Shift+drag → release: 各 (source, drop_start_beat)
     /// で独立コピーを生成。 §3.5。
     fn clone_clips_independent(&mut self, entries: &[(ClipRef, u32, f64)]) {
-        let mut new_refs = Vec::with_capacity(entries.len());
-        for &(source, to_track_id, drop_start) in entries {
-            let Some(track) = self.song_doc.song().tracks.get(source.track as usize) else {
-                continue;
-            };
-            let Some(src_clip) = track.clips.get(source.clip as usize) else {
-                continue;
-            };
-            let new_length = src_clip.length_beats;
-            // 独立コピー: content + 名前を fork。色 (per-clip) は source の色を引き継ぐ。
-            let src_content_id = src_clip.content_id;
-            let src_color = src_clip.color;
-            // mute 状態も複製先へ引き継ぐ。
-            let src_muted = src_clip.muted;
-            // per-clip 声を複製先へ引き継ぐ。
-            let src_voice = (
-                src_clip.speaker_id,
-                src_clip.singer_name.clone(),
-                src_clip.style_name.clone(),
-                src_clip.talk,
-            );
-            let new_content_id = self.song_doc.song().fork_content(src_content_id);
-            let Some(to_track_idx) = self.song_doc.song().track_index_by_id(to_track_id) else {
-                continue;
-            };
-            let Some(to_track) = self.song_doc.song().tracks.get_mut(to_track_idx) else {
-                continue;
-            };
-            let new_clip_id = to_track.alloc_clip_id();
-            let new_idx = to_track.clips.len() as u32;
-            to_track.clips.push(Clip {
-                id: new_clip_id,
-                name: String::new(),
-                start_beat: drop_start.max(0.0),
-                length_beats: new_length,
-                content_id: new_content_id,
-                notes: Vec::new(),
-                color: src_color,
-                auto_lipsync: false,
-                muted: src_muted,
-                speaker_id: src_voice.0,
-                singer_name: src_voice.1,
-                style_name: src_voice.2,
-                talk: src_voice.3,
-            });
-            new_refs.push(ClipRef {
-                track: to_track_idx as u32,
-                clip: new_idx,
-            });
-        }
+        let Some(new_refs) = self.edit_song(|song| {
+            let mut new_refs = Vec::with_capacity(entries.len());
+            for &(source, to_track_id, drop_start) in entries {
+                let Some(track) = song.tracks.get(source.track as usize) else {
+                    continue;
+                };
+                let Some(src_clip) = track.clips.get(source.clip as usize) else {
+                    continue;
+                };
+                let new_length = src_clip.length_beats;
+                // 独立コピー: content + 名前を fork。色 (per-clip) は source の色を引き継ぐ。
+                let src_content_id = src_clip.content_id;
+                let src_color = src_clip.color;
+                // mute 状態も複製先へ引き継ぐ。
+                let src_muted = src_clip.muted;
+                // per-clip 声を複製先へ引き継ぐ。
+                let src_voice = (
+                    src_clip.speaker_id,
+                    src_clip.singer_name.clone(),
+                    src_clip.style_name.clone(),
+                    src_clip.talk,
+                );
+                let new_content_id = song.fork_content(src_content_id);
+                let Some(to_track_idx) = song.track_index_by_id(to_track_id) else {
+                    continue;
+                };
+                let Some(to_track) = song.tracks.get_mut(to_track_idx) else {
+                    continue;
+                };
+                let new_clip_id = to_track.alloc_clip_id();
+                let new_idx = to_track.clips.len() as u32;
+                to_track.clips.push(Clip {
+                    id: new_clip_id,
+                    name: String::new(),
+                    start_beat: drop_start.max(0.0),
+                    length_beats: new_length,
+                    content_id: new_content_id,
+                    notes: Vec::new(),
+                    color: src_color,
+                    auto_lipsync: false,
+                    muted: src_muted,
+                    speaker_id: src_voice.0,
+                    singer_name: src_voice.1,
+                    style_name: src_voice.2,
+                    talk: src_voice.3,
+                });
+                new_refs.push(ClipRef {
+                    track: to_track_idx as u32,
+                    clip: new_idx,
+                });
+            }
+            new_refs
+        }) else {
+            return;
+        };
         if !new_refs.is_empty() {
             self.select_new_clips(&new_refs);
             self.selection.selected_notes.clear();
@@ -18144,31 +18326,33 @@ impl AppData {
             return;
         }
         // content + 名前を fork して独立化 (fork 時点の名前を引き継ぐ)。
-        let new_content_id = self.song_doc.song().fork_content(content_id);
-        let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize) else {
-            return;
-        };
-        let Some(clip) = track.clips.get_mut(target.clip as usize) else {
-            return;
-        };
-        clip.content_id = new_content_id;
-        self.sync_song_to_plugin_host();
-        self.ui_ephemeral.status_message = "Clip を独立化しました".to_string();
+        let done = self
+            .edit_song(|song| {
+                let new_content_id = song.fork_content(content_id);
+                if let Some(clip) = song
+                    .tracks
+                    .get_mut(target.track as usize)
+                    .and_then(|t| t.clips.get_mut(target.clip as usize))
+                {
+                    clip.content_id = new_content_id;
+                }
+            })
+            .is_some();
+        if done {
+            self.sync_song_to_plugin_host();
+            self.ui_ephemeral.status_message = "Clip を独立化しました".to_string();
+        }
     }
 
     fn create_clip(&mut self, track_idx: u32, start_beat: f64) {
         let start_beat = start_beat.max(0.0);
-        // Allocate the shared content slot first so the new clip points
-        // at a real entry. Orphan content_ids (if track lookup below
-        // fails) get reclaimed by `Song::gc_clip_contents` before save.
-        let content_id = self.song_doc.song().alloc_content_id();
-        self.song_doc.song()
-            .clip_contents
-            .insert(content_id, ClipContent::default());
-        let __applied = self.edit_song_checked(|song| {
-            let Some(track) = song.tracks.get_mut(track_idx as usize) else {
-                return false;
-            };
+        let Some(Some(r)) = self.edit_song(|song| {
+            // Allocate the shared content slot first so the new clip points
+            // at a real entry. Orphan content_ids (if track lookup below
+            // fails) get reclaimed by `Song::gc_clip_contents` before save.
+            let content_id = song.alloc_content_id();
+            song.clip_contents.insert(content_id, ClipContent::default());
+            let track = song.tracks.get_mut(track_idx as usize)?;
             let new_clip_id = track.alloc_clip_id();
             let new_idx = track.clips.len() as u32;
             // vocal track の新規 clip は声を引き継ぐ: 同トラックの
@@ -18211,15 +18395,13 @@ impl AppData {
             // デフォルトでクリップ名は無し (= content_name 未設定)。 表示名は
             // arrangement_view::clip_display_label が内容 (Text 本文 / ノート歌詞)
             // から導出する。 ユーザーが Rename したときだけ明示名が入る。
-            let r = ClipRef {
+            Some(ClipRef {
                 track: track_idx,
                 clip: new_idx,
-            };
-            true
-        });
-        if !__applied {
+            })
+        }) else {
             return;
-        }
+        };
         self.set_single_clip_selection(r);
         self.selection.selected_notes.clear();
         self.select_track(track_idx);
@@ -18235,13 +18417,15 @@ impl AppData {
         let mut targets: Vec<ClipRef> = self.selected_clip_refs();
         self.selection.selected_clips.clear();
         targets.sort_by(|a, b| a.track.cmp(&b.track).then(b.clip.cmp(&a.clip)));
-        for target in &targets {
-            if let Some(track) = self.song_doc.song().tracks.get_mut(target.track as usize)
-                && (target.clip as usize) < track.clips.len()
-            {
-                track.clips.remove(target.clip as usize);
+        self.edit_song(|song| {
+            for target in &targets {
+                if let Some(track) = song.tracks.get_mut(target.track as usize)
+                    && (target.clip as usize) < track.clips.len()
+                {
+                    track.clips.remove(target.clip as usize);
+                }
             }
-        }
+        });
         self.selection.selected_clip = None;
         self.selection.selected_notes.clear();
         self.sync_song_to_plugin_host();
@@ -18271,10 +18455,12 @@ impl AppData {
             .max(0.0);
         let root = root.min(11);
         if self.song_doc.song().scale_changes.is_empty() {
-            self.song_doc.song().scale_changes.push(common::scale::ScaleChange {
-                beat: 0.0,
-                root,
-                scale,
+            self.edit_song(move |song| {
+                song.scale_changes.push(common::scale::ScaleChange {
+                    beat: 0.0,
+                    root,
+                    scale,
+                });
             });
             return;
         }
@@ -18352,18 +18538,17 @@ impl AppData {
         // pitch 補正で異なる pitch が同一 pitch に丸まると同一ピッチの
         // 重なりが生じ得るので、補正した note を勝者として重なり解消する。
         let winners: Vec<u32> = snaps.iter().map(|&(i, _)| i).collect();
-        let mut remap: Option<Vec<Option<u32>>> = None;
-        if let Some(notes) = self
-            .song_doc.song()
-            .notes_in_clip_mut(r.track as usize, r.clip as usize)
-        {
-            for (i, new_pitch) in snaps {
-                if let Some(n) = notes.get_mut(i as usize) {
-                    n.pitch = new_pitch;
+        let remap = self
+            .edit_song(move |song| {
+                let notes = song.notes_in_clip_mut(r.track as usize, r.clip as usize)?;
+                for (i, new_pitch) in snaps {
+                    if let Some(n) = notes.get_mut(i as usize) {
+                        n.pitch = new_pitch;
+                    }
                 }
-            }
-            remap = Some(resolve_note_overlaps(notes, &winners));
-        }
+                Some(resolve_note_overlaps(notes, &winners))
+            })
+            .flatten();
         if let Some(remap) = remap {
             let sel = std::mem::take(&mut self.selection.selected_notes);
             self.selection.selected_notes = remap_indices(&remap, &sel);
@@ -18401,27 +18586,28 @@ impl AppData {
         } else {
             pitch
         };
-        let Some(content) =
-            midi_content_in_clip_mut(&mut self.song_doc.song(), track_idx as usize, clip_idx as usize)
-        else {
+        let Some(Some(selected)) = self.edit_song(|song| {
+            let content =
+                midi_content_in_clip_mut(song, track_idx as usize, clip_idx as usize)?;
+            // v29: 新規 note は allocator で安定 id を採番する。
+            let note_id = content.alloc_note_id();
+            let notes = &mut content.notes;
+            let new_idx = notes.len() as u32;
+            notes.push(Note {
+                id: note_id,
+                start_beat,
+                duration_beats: duration,
+                pitch,
+                velocity: 100,
+                lyric: None,
+                muted: false,
+            });
+            // 追加した note を勝者として同一ピッチの重なりを解消。
+            let remap = resolve_note_overlaps(notes, &[new_idx]);
+            Some(remap_indices(&remap, &[new_idx]))
+        }) else {
             return;
         };
-        // v29: 新規 note は allocator で安定 id を採番する。
-        let note_id = content.alloc_note_id();
-        let notes = &mut content.notes;
-        let new_idx = notes.len() as u32;
-        notes.push(Note {
-            id: note_id,
-            start_beat,
-            duration_beats: duration,
-            pitch,
-            velocity: 100,
-            lyric: None,
-            muted: false,
-        });
-        // 追加した note を勝者として同一ピッチの重なりを解消。
-        let remap = resolve_note_overlaps(notes, &[new_idx]);
-        let selected = remap_indices(&remap, &[new_idx]);
         let r = ClipRef {
             track: track_idx,
             clip: clip_idx,
@@ -18531,17 +18717,25 @@ impl AppData {
             selected.into_iter().map(|id| (id, ())),
             |app, slot, r, items| {
                 let locals: Vec<u32> = items.iter().map(|&(local, ())| local as u32).collect();
-                if let Some(notes) =
-                    app.song_doc.song().notes_in_clip_mut(r.track as usize, r.clip as usize)
-                {
+                let packed = app.edit_song(move |song| {
+                    let Some(notes) =
+                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    else {
+                        return Vec::new();
+                    };
                     let new_ids = duplicate_notes_into(notes, &locals);
-                    if !new_ids.is_empty() {
-                        // 複製を勝者として重なり解消 (元と密接な複製は元を据え置く)。
-                        let remap = resolve_note_overlaps(notes, &new_ids);
-                        for nid in remap_indices(&remap, &new_ids) {
-                            new_selection.push(Self::pack_note_id(slot, nid as usize));
-                        }
+                    if new_ids.is_empty() {
+                        return Vec::new();
                     }
+                    // 複製を勝者として重なり解消 (元と密接な複製は元を据え置く)。
+                    let remap = resolve_note_overlaps(notes, &new_ids);
+                    remap_indices(&remap, &new_ids)
+                        .into_iter()
+                        .map(|nid| Self::pack_note_id(slot, nid as usize))
+                        .collect::<Vec<u32>>()
+                });
+                if let Some(packed) = packed {
+                    new_selection.extend(packed);
                 }
             },
         );
@@ -18565,17 +18759,25 @@ impl AppData {
                     .iter()
                     .map(|&(local, (beat, pitch))| (local as u32, beat, pitch))
                     .collect();
-                if let Some(notes) =
-                    app.song_doc.song().notes_in_clip_mut(r.track as usize, r.clip as usize)
-                {
+                let packed = app.edit_song(move |song| {
+                    let Some(notes) =
+                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    else {
+                        return Vec::new();
+                    };
                     let new_ids = copy_notes_into(notes, &local_entries);
-                    if !new_ids.is_empty() {
-                        // コピーを勝者として重なり解消。複製の local id を packed 化。
-                        let remap = resolve_note_overlaps(notes, &new_ids);
-                        for nid in remap_indices(&remap, &new_ids) {
-                            new_selection.push(Self::pack_note_id(slot, nid as usize));
-                        }
+                    if new_ids.is_empty() {
+                        return Vec::new();
                     }
+                    // コピーを勝者として重なり解消。複製の local id を packed 化。
+                    let remap = resolve_note_overlaps(notes, &new_ids);
+                    remap_indices(&remap, &new_ids)
+                        .into_iter()
+                        .map(|nid| Self::pack_note_id(slot, nid as usize))
+                        .collect::<Vec<u32>>()
+                });
+                if let Some(packed) = packed {
+                    new_selection.extend(packed);
                 }
             },
         );
@@ -18593,21 +18795,22 @@ impl AppData {
         new_duration: f64,
     ) {
         let new_duration = new_duration.max(0.0625);
-        let Some(notes) = self
-            .song_doc.song()
-            .notes_in_clip_mut(track_idx as usize, clip_idx as usize)
-        else {
+        let remap = self
+            .edit_song(|song| {
+                let notes = song.notes_in_clip_mut(track_idx as usize, clip_idx as usize)?;
+                let note = notes.get_mut(note_idx as usize)?;
+                note.duration_beats = new_duration;
+                // リサイズした note を勝者として重なり解消。既存選択は remap で追従。
+                Some(resolve_note_overlaps(notes, &[note_idx]))
+            })
+            .flatten();
+        let Some(remap) = remap else {
             return;
         };
-        let Some(note) = notes.get_mut(note_idx as usize) else {
-            return;
-        };
-        note.duration_beats = new_duration;
-        // リサイズした note を勝者として重なり解消。既存選択は remap で追従。
-        let remap = resolve_note_overlaps(notes, &[note_idx]);
         let sel = std::mem::take(&mut self.selection.selected_notes);
         self.selection.selected_notes = remap_indices(&remap, &sel);
-        self.sync_song_to_plugin_host();    }
+        self.sync_song_to_plugin_host();
+    }
 
     fn delete_selected_notes(&mut self) {
         // 選択 (packed) を所属クリップごとに分配し、各クリップ内で index 降順に
@@ -18621,15 +18824,17 @@ impl AppData {
             |app, _slot, r, items| {
                 let mut locals: Vec<usize> = items.iter().map(|&(local, ())| local).collect();
                 locals.sort_unstable_by(|a, b| b.cmp(a));
-                if let Some(notes) =
-                    app.song_doc.song().notes_in_clip_mut(r.track as usize, r.clip as usize)
-                {
-                    for i in locals {
-                        if i < notes.len() {
-                            notes.remove(i);
+                app.edit_song(move |song| {
+                    if let Some(notes) =
+                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    {
+                        for i in locals {
+                            if i < notes.len() {
+                                notes.remove(i);
+                            }
                         }
                     }
-                }
+                });
             },
         );
         self.sync_song_to_plugin_host();
@@ -18648,28 +18853,32 @@ impl AppData {
         let Some(r) = self.clip_ref_of(key) else {
             return;
         };
-        let Some(clip) = self
-            .song_doc.song()
-            .tracks
-            .get_mut(r.track as usize)
-            .and_then(|t| t.clips.get_mut(r.clip as usize))
-        else {
-            return;
-        };
-        if clip.speaker_id == speaker_id
-            && clip.singer_name == singer_name
-            && clip.style_name == style_name
-        {
-            return;
+        let changed = self.edit_song_checked(move |song| {
+            let Some(clip) = song
+                .tracks
+                .get_mut(r.track as usize)
+                .and_then(|t| t.clips.get_mut(r.clip as usize))
+            else {
+                return false;
+            };
+            if clip.speaker_id == speaker_id
+                && clip.singer_name == singer_name
+                && clip.style_name == style_name
+            {
+                return false;
+            }
+            clip.speaker_id = speaker_id;
+            clip.singer_name = singer_name;
+            clip.style_name = style_name;
+            true
+        });
+        if changed {
+            // 声変更を builtin に反映 (= clip 単位で再合成)。
+            self.sync_vocal_metadata();
+            // (talk) talk 声変更は phoneme (= 口パク) も変える (speaker で prosody が変わる)。
+            // sing 声変更は phoneme 不変 (QUERY_SPEAKER 固定) なので no-op に近いが無害。
+            self.mark_lipsync_dirty();
         }
-        clip.speaker_id = speaker_id;
-        clip.singer_name = singer_name;
-        clip.style_name = style_name;
-        // 声変更を builtin に反映 (= clip 単位で再合成)。
-        self.sync_vocal_metadata();
-        // (talk) talk 声変更は phoneme (= 口パク) も変える (speaker で prosody が変わる)。
-        // sing 声変更は phoneme 不変 (QUERY_SPEAKER 固定) なので no-op に近いが無害。
-        self.mark_lipsync_dirty();
     }
 
     /// (talk) `SetClipTalkParam` 経由。Text clip の読み上げスケール 1 項目を
@@ -18684,34 +18893,38 @@ impl AppData {
         let Some(r) = self.clip_ref_of(key) else {
             return;
         };
-        let Some(clip) = self
-            .song_doc.song()
-            .tracks
-            .get_mut(r.track as usize)
-            .and_then(|t| t.clips.get_mut(r.clip as usize))
-        else {
-            return;
-        };
-        let mut talk = clip.talk.unwrap_or_default();
-        // VOICEVOX `audio_query` の受理範囲にクランプ (範囲外は 422 を返す)。
-        match param {
-            TalkParamKind::Speed => talk.speed_scale = value.clamp(0.5, 2.0),
-            TalkParamKind::Pitch => talk.pitch_scale = value.clamp(-0.15, 0.15),
-            TalkParamKind::Intonation => talk.intonation_scale = value.clamp(0.0, 2.0),
-            TalkParamKind::Volume => talk.volume_scale = value.clamp(0.0, 2.0),
+        let changed = self.edit_song_checked(|song| {
+            let Some(clip) = song
+                .tracks
+                .get_mut(r.track as usize)
+                .and_then(|t| t.clips.get_mut(r.clip as usize))
+            else {
+                return false;
+            };
+            let mut talk = clip.talk.unwrap_or_default();
+            // VOICEVOX `audio_query` の受理範囲にクランプ (範囲外は 422 を返す)。
+            match param {
+                TalkParamKind::Speed => talk.speed_scale = value.clamp(0.5, 2.0),
+                TalkParamKind::Pitch => talk.pitch_scale = value.clamp(-0.15, 0.15),
+                TalkParamKind::Intonation => talk.intonation_scale = value.clamp(0.0, 2.0),
+                TalkParamKind::Volume => talk.volume_scale = value.clamp(0.0, 2.0),
+            }
+            let new_talk = if talk == common::model::TalkParams::default() {
+                None
+            } else {
+                Some(talk)
+            };
+            if clip.talk == new_talk {
+                return false;
+            }
+            clip.talk = new_talk;
+            true
+        });
+        if changed {
+            self.sync_vocal_metadata();
+            // (talk) スケール変更 (特に話速) は phoneme 長 = 口パクタイミングを変える。
+            self.mark_lipsync_dirty();
         }
-        let new_talk = if talk == common::model::TalkParams::default() {
-            None
-        } else {
-            Some(talk)
-        };
-        if clip.talk == new_talk {
-            return;
-        }
-        clip.talk = new_talk;
-        self.sync_vocal_metadata();
-        // (talk) スケール変更 (特に話速) は phoneme 長 = 口パクタイミングを変える。
-        self.mark_lipsync_dirty();
     }
 
     /// VOICEVOX engine が ready になったら `/singers` を取得して
@@ -18751,28 +18964,30 @@ impl AppData {
     /// 適用。 各 entry は `(note_index, Option<String>)`、 widget 側で空文字列
     /// は `None` に正規化済み (= 歌詞削除)。 clip_ref が無効なら no-op。
     fn set_note_lyrics(&mut self, clip_ref: ClipRef, updates: &[(u32, Option<String>)]) {
-        let Some(notes) = self
-            .song_doc.song()
-            .notes_in_clip_mut(clip_ref.track as usize, clip_ref.clip as usize)
-        else {
-            return;
-        };
-        let mut changed = false;
-        for (id, lyric) in updates {
-            if let Some(n) = notes.get_mut(*id as usize) {
-                let normalised =
-                    lyric.as_ref().and_then(|s| {
+        let changed = self.edit_song_checked(|song| {
+            let Some(notes) =
+                song.notes_in_clip_mut(clip_ref.track as usize, clip_ref.clip as usize)
+            else {
+                return false;
+            };
+            let mut changed = false;
+            for (id, lyric) in updates {
+                if let Some(n) = notes.get_mut(*id as usize) {
+                    let normalised = lyric.as_ref().and_then(|s| {
                         let t = s.trim();
                         if t.is_empty() { None } else { Some(t.to_string()) }
                     });
-                if n.lyric != normalised {
-                    n.lyric = normalised;
-                    changed = true;
+                    if n.lyric != normalised {
+                        n.lyric = normalised;
+                        changed = true;
+                    }
                 }
             }
-        }
+            changed
+        });
         if changed {
-            self.sync_song_to_plugin_host();        }
+            self.sync_song_to_plugin_host();
+        }
     }
 
     // -------- Plugin GUI bridge --------------------------------------------
@@ -18788,7 +19003,7 @@ impl AppData {
     fn on_gui_closed(&mut self, device_id: u64) {
         // The plugin-host process tore the editor window down (user clicked
         // the window's ✕, or the plugin self-closed). Drop our open-state.
-        if let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) {
+        if let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) {
             self.ipc.open_plugin_guis.remove(&(track, index));
         }
     }
@@ -18834,7 +19049,7 @@ impl AppData {
         }
         // v29: 安定 device_id → 旧 (track_id, index) 座標へ逆引きし、 既存の
         // positional bookkeeping / song 再構築ロジックへ繋ぐ。
-        let coords = find_device_by_id(&self.song_doc.song(), device_id);
+        let coords = find_device_by_id(self.song_doc.song(), device_id);
 
         // SSoT (code review 2026-06-06): audio engine に `ProcessData` shmem を
         // 開かせる。 incoming bridge の stale clone ではなく、 respawn で
@@ -18895,54 +19110,69 @@ impl AppData {
         // daw_audio via the next LoadSong, killing the SidechainTap /
         // ParallelOutTap in `compile_schedule`. パラアウト
         // (docs/plan_paraout.md) も sidechain と同じく再ロードで生存させる。
-        let chain: Option<&mut Vec<common::model::PluginInstance>> =
-            if track_id == common::model::MASTER_TRACK_ID {
-                Some(&mut self.song_doc.song().master_fx_chain)
-            } else {
-                self.song_doc.song()
-                    .tracks
-                    .iter_mut()
-                    .find(|t| t.id == track_id)
-                    .map(|t| &mut t.devices)
-            };
-        let Some(chain) = chain else {
+        let placed = self
+            .song_doc
+            .normalize(move |song| {
+                let chain: Option<&mut Vec<common::model::PluginInstance>> =
+                    if track_id == common::model::MASTER_TRACK_ID {
+                        Some(&mut song.master_fx_chain)
+                    } else {
+                        song.tracks
+                            .iter_mut()
+                            .find(|t| t.id == track_id)
+                            .map(|t| &mut t.devices)
+                    };
+                let Some(chain) = chain else {
+                    return false;
+                };
+                let i = index as usize;
+                let (existing_state, format, existing_aux, existing_aux_out, existing_ports) =
+                    chain
+                        .get(i)
+                        .map(|p| {
+                            (
+                                p.state.clone(),
+                                p.format,
+                                p.aux_inputs.clone(),
+                                p.aux_outputs.clone(),
+                                p.ports,
+                            )
+                        })
+                        .unwrap_or((
+                            None,
+                            PluginFormat::Clap,
+                            Vec::new(),
+                            Vec::new(),
+                            Default::default(),
+                        ));
+                let inst = common::model::PluginInstance {
+                    // v29: 安定 device id を必ず引き継ぐ (with_ports は sentinel 0 で
+                    // 作るので、 ここで焼き込まないと以後の id addressing が全滅する)。
+                    id: device_id,
+                    state: existing_state,
+                    aux_inputs: existing_aux,
+                    aux_outputs: existing_aux_out,
+                    // パラアウト: the just-loaded plugin's authoritative aux output port
+                    // count (overrides whatever the DB / previous instance had).
+                    aux_output_count,
+                    ..common::model::PluginInstance::with_ports(
+                        id,
+                        format,
+                        db_ports.unwrap_or(existing_ports),
+                    )
+                };
+                if i < chain.len() {
+                    chain[i] = inst;
+                } else {
+                    chain.push(inst);
+                }
+                true
+            })
+            .unwrap_or(false);
+        if !placed {
             // track id が Vec に無い (load 中に track 削除された等)。 master でも
             // なく該当 track も居ないので、 従来どおり finalize せず early return。
             return;
-        };
-        let i = index as usize;
-        let (existing_state, format, existing_aux, existing_aux_out, existing_ports) = chain
-            .get(i)
-            .map(|p| {
-                (
-                    p.state.clone(),
-                    p.format,
-                    p.aux_inputs.clone(),
-                    p.aux_outputs.clone(),
-                    p.ports,
-                )
-            })
-            .unwrap_or((None, PluginFormat::Clap, Vec::new(), Vec::new(), Default::default()));
-        let inst = common::model::PluginInstance {
-            // v29: 安定 device id を必ず引き継ぐ (with_ports は sentinel 0 で
-            // 作るので、 ここで焼き込まないと以後の id addressing が全滅する)。
-            id: device_id,
-            state: existing_state,
-            aux_inputs: existing_aux,
-            aux_outputs: existing_aux_out,
-            // パラアウト: the just-loaded plugin's authoritative aux output port
-            // count (overrides whatever the DB / previous instance had).
-            aux_output_count,
-            ..common::model::PluginInstance::with_ports(
-                id,
-                format,
-                db_ports.unwrap_or(existing_ports),
-            )
-        };
-        if i < chain.len() {
-            chain[i] = inst;
-        } else {
-            chain.push(inst);
         }
 
         // ユーザーが手動追加した plugin の load 完了 finalize:
@@ -19033,7 +19263,7 @@ impl AppData {
         self.ipc.pending_plugin_loads.remove(&device_id);
         // load 失敗時は finalize 予約も取り消す (stale entry が後の project-load で
         // 誤 sync / 誤 open しないように)。
-        if let Some((track, index)) = find_device_by_id(&self.song_doc.song(), device_id) {
+        if let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) {
             self.ipc.pending_added_plugin_finalize.remove(&(track, index));
         }
         // pending_play 解放: A7 と同じロジック (`on_plugin_loaded_from_child`
@@ -19095,31 +19325,44 @@ impl AppData {
     /// matching `Track::reported_latency_samples`, and re-`sync_song_to_plugin_host`
     /// if anything changed. No-op when the totals already agree.
     fn recompute_track_latencies(&mut self) {
-        let mut changed = false;
-        for (track_id, plugin_ids) in &self.ipc.track_plugin_ids {
-            let total: u32 = plugin_ids
-                .iter()
-                .map(|pid| self.ipc.plugin_latencies.get(pid).copied().unwrap_or(0))
-                .sum();
-            if let Some(track) = self.song_doc.song().track_by_id_mut(*track_id)
-                && track.reported_latency_samples != total
-            {
-                track.reported_latency_samples = total;
-                changed = true;
-            }
-        }
-        // Tracks with no loaded plugins should report 0 — clear any stale
-        // value (e.g. the last plugin in a track was just removed).
+        // Compute per-track latency totals up front (reads self.ipc only) so
+        // the Song mutation can go through the `edit_song` chokepoint without
+        // holding a borrow of `self.ipc`.
+        let totals: Vec<(u32, u32)> = self
+            .ipc.track_plugin_ids
+            .iter()
+            .map(|(track_id, plugin_ids)| {
+                let total: u32 = plugin_ids
+                    .iter()
+                    .map(|pid| self.ipc.plugin_latencies.get(pid).copied().unwrap_or(0))
+                    .sum();
+                (*track_id, total)
+            })
+            .collect();
         let track_ids_with_plugins: std::collections::HashSet<u32> =
             self.ipc.track_plugin_ids.keys().copied().collect();
-        for track in &mut self.song_doc.song().tracks {
-            if !track_ids_with_plugins.contains(&track.id)
-                && track.reported_latency_samples != 0
-            {
-                track.reported_latency_samples = 0;
-                changed = true;
+        let changed = self.edit_song_checked(move |song| {
+            let mut changed = false;
+            for (track_id, total) in totals {
+                if let Some(track) = song.track_by_id_mut(track_id)
+                    && track.reported_latency_samples != total
+                {
+                    track.reported_latency_samples = total;
+                    changed = true;
+                }
             }
-        }
+            // Tracks with no loaded plugins should report 0 — clear any stale
+            // value (e.g. the last plugin in a track was just removed).
+            for track in &mut song.tracks {
+                if !track_ids_with_plugins.contains(&track.id)
+                    && track.reported_latency_samples != 0
+                {
+                    track.reported_latency_samples = 0;
+                    changed = true;
+                }
+            }
+            changed
+        });
         if changed {
             // sync_song_to_plugin_host pushes the Song to daw_audio (the
             // schedule recompile happens inside `LocalState::refresh_schedule`
@@ -19186,7 +19429,7 @@ impl AppData {
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
         // B 側に破棄させ、SlotGuiClosed の受信で set から除去する。
         if self.ipc.open_plugin_guis.contains(&(track_id, index)) {
-            if let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, index) {
+            if let Some(device_id) = device_id_at(self.song_doc.song(), track_id, index) {
                 self.send_plugin(PluginCommand::CloseSlotGui { device_id });
             }
             return;
@@ -19236,7 +19479,7 @@ impl AppData {
                 };
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
             }
-            let Some(device_id) = device_id_at(&self.song_doc.song(), track_id, index) else {
+            let Some(device_id) = device_id_at(self.song_doc.song(), track_id, index) else {
                 tracing::warn!(track_id, index, "open_slot_gui: no device id at slot");
                 return;
             };
@@ -19340,11 +19583,20 @@ impl AppData {
             (0..n).map(|i| (order[i] as u32, i as u32)).collect();
 
         // song を書き換え。
-        if is_master {
-            self.edit_song(|song| song.master_fx_chain = new_devices);
-        } else if let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) {
-            t.devices = new_devices;
+        let applied = if is_master {
+            self.edit_song(move |song| song.master_fx_chain = new_devices)
+                .is_some()
         } else {
+            self.edit_song_checked(move |song| {
+                if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) {
+                    t.devices = new_devices;
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+        if !applied {
             return;
         }
 
@@ -19420,23 +19672,30 @@ impl AppData {
     ) {
         // 単一デバイスチェーン: master は master_fx_chain、 通常 track は devices
         // を flat な device index で引く。
-        let inst = if track_id == common::model::MASTER_TRACK_ID {
-            self.song_doc.song().master_fx_chain.get_mut(device_index as usize)
-        } else {
-            let Some(track) = self.song_doc.song().track_by_id_mut(track_id) else {
-                return;
+        let applied = self.edit_song_checked(|song| {
+            let inst = if track_id == common::model::MASTER_TRACK_ID {
+                song.master_fx_chain.get_mut(device_index as usize)
+            } else {
+                let Some(track) = song.track_by_id_mut(track_id) else {
+                    return false;
+                };
+                track.devices.get_mut(device_index as usize)
             };
-            track.devices.get_mut(device_index as usize)
-        };
-        let Some(inst) = inst else { return };
-        let port_idx = port as usize;
-        if inst.aux_inputs.len() <= port_idx {
-            inst.aux_inputs.resize(port_idx + 1, None);
+            let Some(inst) = inst else {
+                return false;
+            };
+            let port_idx = port as usize;
+            if inst.aux_inputs.len() <= port_idx {
+                inst.aux_inputs.resize(port_idx + 1, None);
+            }
+            // Phase 1: UI は常に PostFader タップを張る (旧 sidechain と同挙動)。
+            // Pre/PostFx トグルは Phase 6 で追加する (docs/plan_modulation.md §9)。
+            inst.aux_inputs[port_idx] = source.map(common::model::AuxInputRoute::post_fader);
+            true
+        });
+        if applied {
+            self.sync_song_to_plugin_host();
         }
-        // Phase 1: UI は常に PostFader タップを張る (旧 sidechain と同挙動)。
-        // Pre/PostFx トグルは Phase 6 で追加する (docs/plan_modulation.md §9)。
-        inst.aux_inputs[port_idx] = source.map(common::model::AuxInputRoute::post_fader);
-        self.sync_song_to_plugin_host();
     }
 
     /// パラアウト (docs/plan_paraout.md): route one aux output `port` of the
@@ -19452,21 +19711,28 @@ impl AppData {
         port: u8,
         dest: Option<u32>,
     ) {
-        let inst = if track_id == common::model::MASTER_TRACK_ID {
-            self.song_doc.song().master_fx_chain.get_mut(device_index as usize)
-        } else {
-            let Some(track) = self.song_doc.song().track_by_id_mut(track_id) else {
-                return;
+        let applied = self.edit_song_checked(|song| {
+            let inst = if track_id == common::model::MASTER_TRACK_ID {
+                song.master_fx_chain.get_mut(device_index as usize)
+            } else {
+                let Some(track) = song.track_by_id_mut(track_id) else {
+                    return false;
+                };
+                track.devices.get_mut(device_index as usize)
             };
-            track.devices.get_mut(device_index as usize)
-        };
-        let Some(inst) = inst else { return };
-        let port_idx = port as usize;
-        if inst.aux_outputs.len() <= port_idx {
-            inst.aux_outputs.resize(port_idx + 1, None);
+            let Some(inst) = inst else {
+                return false;
+            };
+            let port_idx = port as usize;
+            if inst.aux_outputs.len() <= port_idx {
+                inst.aux_outputs.resize(port_idx + 1, None);
+            }
+            inst.aux_outputs[port_idx] = dest.map(common::model::AuxOutputRoute::to_track);
+            true
+        });
+        if applied {
+            self.sync_song_to_plugin_host();
         }
-        inst.aux_outputs[port_idx] = dest.map(common::model::AuxOutputRoute::to_track);
-        self.sync_song_to_plugin_host();
     }
 
     /// パラアウト (docs/plan_paraout.md): one-click "explode" of a multi-out
@@ -19519,7 +19785,9 @@ impl AppData {
                 routes[port] = Some(common::model::AuxOutputRoute::to_track(*dest));
                 continue;
             }
-            let child_id = self.song_doc.song().alloc_track_id();
+            let Some(child_id) = self.edit_song(|song| song.alloc_track_id()) else {
+                return;
+            };
             let name = format!("{src_name} Out {}", port + 1);
             new_children.push(track_with(|t| {
                 t.id = child_id;
@@ -19541,11 +19809,13 @@ impl AppData {
         }
 
         // Wire the source plugin's aux outputs to the (new or kept) children.
-        if let Some(track) = self.song_doc.song().track_by_id_mut(track_id)
-            && let Some(inst) = track.devices.get_mut(device_index as usize)
-        {
-            inst.aux_outputs = routes;
-        }
+        self.edit_song(move |song| {
+            if let Some(track) = song.track_by_id_mut(track_id)
+                && let Some(inst) = track.devices.get_mut(device_index as usize)
+            {
+                inst.aux_outputs = routes;
+            }
+        });
 
         self.resize_track_peak_display();
         self.sync_song_to_plugin_host();
@@ -19557,67 +19827,77 @@ impl AppData {
 
     fn add_mod_source(&mut self, tag: ModSourceKindTag) {
         use common::model::{ModSourceKind, RandomConfig};
-        let id = self.song_doc.song().alloc_mod_source_id();
         // 帰属トラック = カーソルトラック (= このラックを開いているトラック)。以後
         // inspector ではこのトラックの下にだけ列挙される。
         let owner_track_id = self.cursor_track_id().unwrap_or(0);
-        let color = common::model::ModSource::palette_color(self.song_doc.song().mod_sources.len());
-        let kind = match tag {
-            // follower の follow 先は初期 = カーソルトラック。
-            ModSourceKindTag::Follower => ModSourceKind::EnvelopeFollower {
-                tap: common::model::AudioTap::post_fader(owner_track_id),
-                follower: common::model::FollowerConfig::default(),
-            },
-            ModSourceKindTag::Lfo => ModSourceKind::Lfo(Default::default()),
-            // seed は source ごとに決定論的かつ相異にする (id から)。
-            ModSourceKindTag::Random => ModSourceKind::Random(RandomConfig {
-                seed: u64::from(id),
-                ..Default::default()
-            }),
-            ModSourceKindTag::Mseg => ModSourceKind::Mseg(Default::default()),
-            ModSourceKindTag::Steps => ModSourceKind::Steps(Default::default()),
-        };
-        self.song_doc.song().mod_sources.push(common::model::ModSource {
-            id,
-            owner_track_id,
-            color,
-            kind,
-        });
-        self.sync_song_to_plugin_host();
+        let applied = self
+            .edit_song(move |song| {
+                let id = song.alloc_mod_source_id();
+                let color = common::model::ModSource::palette_color(song.mod_sources.len());
+                let kind = match tag {
+                    // follower の follow 先は初期 = カーソルトラック。
+                    ModSourceKindTag::Follower => ModSourceKind::EnvelopeFollower {
+                        tap: common::model::AudioTap::post_fader(owner_track_id),
+                        follower: common::model::FollowerConfig::default(),
+                    },
+                    ModSourceKindTag::Lfo => ModSourceKind::Lfo(Default::default()),
+                    // seed は source ごとに決定論的かつ相異にする (id から)。
+                    ModSourceKindTag::Random => ModSourceKind::Random(RandomConfig {
+                        seed: u64::from(id),
+                        ..Default::default()
+                    }),
+                    ModSourceKindTag::Mseg => ModSourceKind::Mseg(Default::default()),
+                    ModSourceKindTag::Steps => ModSourceKind::Steps(Default::default()),
+                };
+                song.mod_sources.push(common::model::ModSource {
+                    id,
+                    owner_track_id,
+                    color,
+                    kind,
+                });
+            })
+            .is_some();
+        if applied {
+            self.sync_song_to_plugin_host();
+        }
     }
 
-    /// envelope follower の `(tap, follower)` を可変借用 (generator は `None`)。
-    fn mod_source_follower_mut(
+    /// envelope follower の `(tap, follower)` に `f` を適用する (generator
+    /// は対象外 = no-op)。 Song 編集は `edit_song` チョークポイント経由。
+    /// 戻り値 = 実際に適用できたか (= 該当 id が follower だったか)。
+    fn edit_mod_source_follower(
         &mut self,
         id: u32,
-    ) -> Option<(
-        &mut common::model::AudioTap,
-        &mut common::model::FollowerConfig,
-    )> {
-        self.song_doc.song()
-            .mod_sources
-            .iter_mut()
-            .find(|m| m.id == id)
-            .and_then(|m| {
-                if let common::model::ModSourceKind::EnvelopeFollower { tap, follower } =
-                    &mut m.kind
-                {
-                    Some((tap, follower))
-                } else {
-                    None
-                }
-            })
+        f: impl FnOnce(&mut common::model::AudioTap, &mut common::model::FollowerConfig),
+    ) -> bool {
+        self.edit_song_checked(move |song| {
+            let Some(m) = song.mod_sources.iter_mut().find(|m| m.id == id) else {
+                return false;
+            };
+            if let common::model::ModSourceKind::EnvelopeFollower { tap, follower } = &mut m.kind {
+                f(tap, follower);
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// generator (LFO/Random/MSEG/Steps) 設定の編集。`scrub` は連続
     /// ドラッグ系 (per-frame の recompile を避け dirty のみ、 drag-end で sync)。
     fn edit_mod_source(&mut self, id: u32, edit: ModSourceEdit) {
         use common::model::ModSourceKind;
-        let Some(m) = self.song_doc.song().mod_sources.iter_mut().find(|m| m.id == id) else {
+        // 存在しない id は no-op (dirty も付けない = 旧 early return と同じ)。
+        if !self.song_doc.song().mod_sources.iter().any(|m| m.id == id) {
             return;
-        };
-        let mut scrub = false;
-        match edit {
+        }
+        let scrub = self
+            .edit_song(move |song| {
+                let Some(m) = song.mod_sources.iter_mut().find(|m| m.id == id) else {
+                    return false;
+                };
+                let mut scrub = false;
+                match edit {
             ModSourceEdit::Rate(rate) => {
                 if let Some(r) = m.kind.rate_mut() {
                     *r = rate;
@@ -19728,40 +20008,49 @@ impl AppData {
                 scrub = true;
             }
         }
+                scrub
+            })
+            .unwrap_or(false);
         // generator の値は engine が schedule の `mod_kinds` から評価するので、 設定
         // 変更は recompile で engine に反映する。 連続ドラッグ系は per-frame LoadSong
-        // を避け dirty のみ (drag-end edge で sync、 follower の attack/release と同流儀)。
-        if scrub {
-            self.song_doc.is_dirty() = true;
-        } else {
+        // を避け dirty のみ (= edit_song が epoch bump、 drag-end edge で sync、
+        // follower の attack/release と同流儀)。
+        if !scrub {
             self.sync_song_to_plugin_host();
         }
     }
 
     fn remove_mod_source(&mut self, id: u32) {
-        self.edit_song(|song| song.mod_sources.retain(|m| m.id != id));
-        // この source を指す全 routing を掃除 (dangling は scalar 0 になるが、
-        // 残すと UI に幽霊 routing が出るので明示削除)。lane 非依存なので
-        // Track.mod_routings / Song.song_mod_routings を走査する。
-        for t in &mut self.song_doc.song().tracks {
-            t.mod_routings.retain(|r| r.source_id != id);
-        }
-        self.edit_song(|song| song.song_mod_routings.retain(|r| r.source_id != id));
+        self.edit_song(move |song| {
+            song.mod_sources.retain(|m| m.id != id);
+            // この source を指す全 routing を掃除 (dangling は scalar 0 になるが、
+            // 残すと UI に幽霊 routing が出るので明示削除)。lane 非依存なので
+            // Track.mod_routings / Song.song_mod_routings を走査する。
+            for t in &mut song.tracks {
+                t.mod_routings.retain(|r| r.source_id != id);
+            }
+            song.song_mod_routings.retain(|r| r.source_id != id);
+        });
         self.sync_song_to_plugin_host();
     }
 
     /// Resolve `track_id` to its mutable `mod_routings` Vec
     /// (`MASTER_TRACK_ID` → `Song.song_mod_routings`,
     /// `docs/plan_modulation_routing_redesign.md` §2).
-    fn mod_routings_mut(
+    fn edit_mod_routings<R>(
         &mut self,
         track_id: u32,
-    ) -> Option<&mut Vec<common::model::ModRouting>> {
-        if track_id == common::model::MASTER_TRACK_ID {
-            Some(&mut self.song_doc.song().song_mod_routings)
-        } else {
-            Some(&mut self.song_doc.song().track_by_id_mut(track_id)?.mod_routings)
-        }
+        f: impl FnOnce(&mut Vec<common::model::ModRouting>) -> R,
+    ) -> Option<R> {
+        self.edit_song(move |song| {
+            let routings = if track_id == common::model::MASTER_TRACK_ID {
+                &mut song.song_mod_routings
+            } else {
+                &mut song.track_by_id_mut(track_id)?.mod_routings
+            };
+            Some(f(routings))
+        })
+        .flatten()
     }
 
     fn add_mod_routing(
@@ -19770,21 +20059,24 @@ impl AppData {
         target: common::model::AutomationTarget,
         source_id: u32,
     ) {
-        let added = if let Some(routings) = self.mod_routings_mut(track_id)
-            && !routings
-                .iter()
-                .any(|r| r.source_id == source_id && r.target == target)
-        {
-            routings.push(common::model::ModRouting {
-                target,
-                source_id,
-                depth: 1.0,
-                polarity: common::model::Polarity::Unipolar,
-            });
-            true
-        } else {
-            false
-        };
+        let added = self
+            .edit_mod_routings(track_id, |routings| {
+                if routings
+                    .iter()
+                    .any(|r| r.source_id == source_id && r.target == target)
+                {
+                    false
+                } else {
+                    routings.push(common::model::ModRouting {
+                        target,
+                        source_id,
+                        depth: 1.0,
+                        polarity: common::model::Polarity::Unipolar,
+                    });
+                    true
+                }
+            })
+            .unwrap_or(false);
         // 実際に追加したときだけ recompile (per-control depth ドラッグは毎フレーム
         // AddModRouting を呼ぶので、no-op add で sync すると LoadSong 連発になる)。
         if added {
@@ -19798,9 +20090,9 @@ impl AppData {
         target: common::model::AutomationTarget,
         source_id: u32,
     ) {
-        if let Some(routings) = self.mod_routings_mut(track_id) {
+        self.edit_mod_routings(track_id, |routings| {
             routings.retain(|r| !(r.source_id == source_id && r.target == target));
-        }
+        });
         self.sync_song_to_plugin_host();
     }
 
@@ -19811,16 +20103,17 @@ impl AppData {
         source_id: u32,
         depth: f32,
     ) {
-        if let Some(routings) = self.mod_routings_mut(track_id)
-            && let Some(r) = routings
+        // depth は GUI compose が毎フレーム読む visual-only 値 (Phase 4)。 scrub
+        // ドラッグ中の per-frame LoadSong を避け、 dirty マークだけ立てる
+        // (= edit_song が epoch を bump)。
+        self.edit_mod_routings(track_id, |routings| {
+            if let Some(r) = routings
                 .iter_mut()
                 .find(|r| r.source_id == source_id && r.target == target)
-        {
-            r.depth = depth.clamp(-1.0, 1.0);
-        }
-        // depth は GUI compose が毎フレーム読む visual-only 値 (Phase 4)。 scrub
-        // ドラッグ中の per-frame LoadSong を避け、 dirty マークだけ立てる。
-        self.song_doc.is_dirty() = true;
+            {
+                r.depth = depth.clamp(-1.0, 1.0);
+            }
+        });
     }
 
     fn set_mod_routing_polarity(
@@ -19830,42 +20123,35 @@ impl AppData {
         source_id: u32,
         bipolar: bool,
     ) {
-        if let Some(routings) = self.mod_routings_mut(track_id)
-            && let Some(r) = routings
+        self.edit_mod_routings(track_id, |routings| {
+            if let Some(r) = routings
                 .iter_mut()
                 .find(|r| r.source_id == source_id && r.target == target)
-        {
-            r.polarity = if bipolar {
-                common::model::Polarity::Bipolar
-            } else {
-                common::model::Polarity::Unipolar
-            };
-        }
+            {
+                r.polarity = if bipolar {
+                    common::model::Polarity::Bipolar
+                } else {
+                    common::model::Polarity::Unipolar
+                };
+            }
+        });
         self.sync_song_to_plugin_host();
     }
 
     fn set_mod_source_track(&mut self, id: u32, source_track: u32) {
-        if let Some((tap, _)) = self.mod_source_follower_mut(id) {
-            tap.source_track = source_track;
-        }
+        self.edit_mod_source_follower(id, |tap, _| tap.source_track = source_track);
         self.sync_song_to_plugin_host();
     }
 
     fn set_mod_source_attack(&mut self, id: u32, ms: f32) {
-        if let Some((_, follower)) = self.mod_source_follower_mut(id) {
-            follower.attack_ms = ms.max(0.0);
-        }
         // 係数は recompile 時に bake される。 scrub ドラッグ中の per-frame
-        // LoadSong を避けるため dirty マークのみ。 drag-end に sync する
-        // (track_inspector の mod_follower_scrub_active エッジ検出)。
-        self.song_doc.is_dirty() = true;
+        // LoadSong を避けるため dirty マークのみ (= edit_song が epoch を bump)。
+        // drag-end に sync する (track_inspector の mod_follower_scrub_active エッジ検出)。
+        self.edit_mod_source_follower(id, |_, follower| follower.attack_ms = ms.max(0.0));
     }
 
     fn set_mod_source_release(&mut self, id: u32, ms: f32) {
-        if let Some((_, follower)) = self.mod_source_follower_mut(id) {
-            follower.release_ms = ms.max(0.0);
-        }
-        self.song_doc.is_dirty() = true;
+        self.edit_mod_source_follower(id, |_, follower| follower.release_ms = ms.max(0.0));
     }
 
     fn set_mod_follower_scrubbing(&mut self, active: bool) {
@@ -19880,9 +20166,7 @@ impl AppData {
     fn set_mod_source_tap_point(&mut self, id: u32, tap_point: common::model::TapPoint) {
         // tap は EnvelopeFollower{tap} 内に内包 (generator には無い)。
         // dbfed6c の 3 段 TapPoint (PreFx/PostFx/PostFader) をそのまま設定。
-        if let Some((tap, _)) = self.mod_source_follower_mut(id) {
-            tap.tap_point = tap_point;
-        }
+        self.edit_mod_source_follower(id, |tap, _| tap.tap_point = tap_point);
         // tap_point は schedule の BufRef を変えるので recompile が要る。
         self.sync_song_to_plugin_host();
     }
@@ -19894,21 +20178,22 @@ impl AppData {
         port: u8,
         tap_point: common::model::TapPoint,
     ) {
-        let inst = if track_id == common::model::MASTER_TRACK_ID {
-            self.song_doc.song().master_fx_chain.get_mut(device_index as usize)
-        } else {
-            self.song_doc.song()
-                .track_by_id_mut(track_id)
-                .and_then(|t| t.devices.get_mut(device_index as usize))
-        };
-        if let Some(inst) = inst
-            && let Some(route) = inst
-                .aux_inputs
-                .get_mut(port as usize)
-                .and_then(|o| o.as_mut())
-        {
-            route.tap.tap_point = tap_point;
-        }
+        self.edit_song(|song| {
+            let inst = if track_id == common::model::MASTER_TRACK_ID {
+                song.master_fx_chain.get_mut(device_index as usize)
+            } else {
+                song.track_by_id_mut(track_id)
+                    .and_then(|t| t.devices.get_mut(device_index as usize))
+            };
+            if let Some(inst) = inst
+                && let Some(route) = inst
+                    .aux_inputs
+                    .get_mut(port as usize)
+                    .and_then(|o| o.as_mut())
+            {
+                route.tap.tap_point = tap_point;
+            }
+        });
         self.sync_song_to_plugin_host();
     }
 
@@ -19955,7 +20240,7 @@ impl AppData {
         // v29: 安定 device id でアドレスする (song からは chain.remove 前の
         // この時点で引ける)。 video device 等 host に居ないものは host 側が
         // no-op で無視する。
-        let removed_device_id = device_id_at(&self.song_doc.song(), track_id, index);
+        let removed_device_id = device_id_at(self.song_doc.song(), track_id, index);
         if let Some(device_id) = removed_device_id {
             self.send_plugin(PluginCommand::RemoveSlotPlugin { device_id });
         }
@@ -19968,50 +20253,52 @@ impl AppData {
         self.shift_device_caches_after_remove(track_id, index);
 
         // song を書き換え。master は master_fx_chain、 通常 track は devices。
-        let chain: Option<&mut Vec<common::model::PluginInstance>> =
-            if track_id == common::model::MASTER_TRACK_ID {
-                Some(&mut self.song_doc.song().master_fx_chain)
-            } else {
-                self.song_doc.song()
-                    .tracks
-                    .iter_mut()
-                    .find(|t| t.id == track_id)
-                    .map(|t| &mut t.devices)
-            };
-        let Some(chain) = chain else {
+        let Some(Some(removed_id)) = self.edit_song(|song| {
+            let chain: Option<&mut Vec<common::model::PluginInstance>> =
+                if track_id == common::model::MASTER_TRACK_ID {
+                    Some(&mut song.master_fx_chain)
+                } else {
+                    song.tracks
+                        .iter_mut()
+                        .find(|t| t.id == track_id)
+                        .map(|t| &mut t.devices)
+                };
+            let chain = chain?;
+            let i = index as usize;
+            if i >= chain.len() {
+                return None;
+            }
+            let removed = chain.remove(i);
+            // VOICEVOX builtin (= vocal track の音源) を外したら vocal 状態も解除
+            // (vocal 性は VOICEVOX device の有無に追従)。master には適用しない。
+            if track_id != common::model::MASTER_TRACK_ID
+                && removed.format == PluginFormat::Builtin
+                && removed.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
+                && let Some(track) = song.tracks.iter_mut().find(|t| t.id == track_id)
+            {
+                track.source = InstrumentSource::None;
+            }
+            // Transform 配置 device を外したら group_transform を消す
+            // (device-gate で配置は即無効になるが、残すと ensure_ids が次回ロードで device を
+            // 再生成してしまう)。同 track に別の Transform device が残っていれば保持。
+            if track_id != common::model::MASTER_TRACK_ID
+                && removed.plugin_id == common::video_fx::TRANSFORM_ID
+                && let Some(track) = song.tracks.iter_mut().find(|t| t.id == track_id)
+                && !track
+                    .devices
+                    .iter()
+                    .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID)
+            {
+                track.group_transform = None;
+            }
+            Some(removed.id)
+        }) else {
             return;
         };
-        let i = index as usize;
-        if i >= chain.len() {
-            return;
-        }
-        let removed = chain.remove(i);
-        // VOICEVOX builtin (= vocal track の音源) を外したら vocal 状態も解除
-        // (vocal 性は VOICEVOX device の有無に追従)。master には適用しない。
-        if track_id != common::model::MASTER_TRACK_ID
-            && removed.format == PluginFormat::Builtin
-            && removed.plugin_id == common::plugin_db::BUILTIN_ID_VOICEVOX
-            && let Some(track) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id)
-        {
-            track.source = InstrumentSource::None;
-        }
-        // Transform 配置 device を外したら group_transform を消す
-        // (device-gate で配置は即無効になるが、残すと ensure_ids が次回ロードで device を
-        // 再生成してしまう)。同 track に別の Transform device が残っていれば保持。
-        if track_id != common::model::MASTER_TRACK_ID
-            && removed.plugin_id == common::video_fx::TRANSFORM_ID
-            && let Some(track) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id)
-            && !track
-                .devices
-                .iter()
-                .any(|d| d.plugin_id == common::video_fx::TRANSFORM_ID)
-        {
-            track.group_transform = None;
-        }
         // (review) 削除 device を指す参照 (automation lane / mod routing /
         // MIDI binding) を落とす。 v29: 参照は安定 device_id なので「詰め」は
         // 不要になり、 dangling id の除去だけ行う。
-        self.remap_device_refs_after_remove(track_id, removed.id);
+        self.remap_device_refs_after_remove(track_id, removed_id);
         // song 更新を engine へ flush (= schedule から削除 device の dispatch を
         // 落とす)。 これが無いと次の編集まで stale schedule のまま destroyed
         // plugin へ dispatch し続け、 remap した lane も engine へ届かない。
@@ -20039,25 +20326,25 @@ impl AppData {
                     if *device_id == removed_device_id
             )
         }
-        if track_id == common::model::MASTER_TRACK_ID {
-            self.song_doc.song()
-                .song_lanes
-                .retain(|l| keeps(&l.target, removed_device_id));
-            self.song_doc.song()
-                .song_mod_routings
-                .retain(|r| keeps(&r.target, removed_device_id));
-        } else if let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) {
-            t.automation_lanes
-                .retain(|l| keeps(&l.target, removed_device_id));
-            t.mod_routings
-                .retain(|r| keeps(&r.target, removed_device_id));
-        }
-        self.song_doc.song().midi_bindings.retain(|b| {
-            !matches!(
-                &b.target,
-                common::model::BindingTarget::PluginParam { device_id, .. }
-                    if *device_id == removed_device_id
-            )
+        self.edit_song(move |song| {
+            if track_id == common::model::MASTER_TRACK_ID {
+                song.song_lanes
+                    .retain(|l| keeps(&l.target, removed_device_id));
+                song.song_mod_routings
+                    .retain(|r| keeps(&r.target, removed_device_id));
+            } else if let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) {
+                t.automation_lanes
+                    .retain(|l| keeps(&l.target, removed_device_id));
+                t.mod_routings
+                    .retain(|r| keeps(&r.target, removed_device_id));
+            }
+            song.midi_bindings.retain(|b| {
+                !matches!(
+                    &b.target,
+                    common::model::BindingTarget::PluginParam { device_id, .. }
+                        if *device_id == removed_device_id
+                )
+            });
         });
     }
 
@@ -20123,7 +20410,7 @@ impl AppData {
                 .ipc.loaded_slots
                 .get(&(track_id, index))
                 .map(|info| info.device_id)
-                .or_else(|| device_id_at(&self.song_doc.song(), track_id, index));
+                .or_else(|| device_id_at(self.song_doc.song(), track_id, index));
             if let Some(device_id) = device_id {
                 self.send_plugin(PluginCommand::CloseSlotGui { device_id });
             }
@@ -20190,7 +20477,7 @@ impl AppData {
                 }
                 // v29: device_id keyed。 ユーザー向けには (track, device) の
                 // 見える座標に逆引きして表示する (解決不能なら id を出す)。
-                match find_device_by_id(&self.song_doc.song(), s.device_id) {
+                match find_device_by_id(self.song_doc.song(), s.device_id) {
                     Some((track, index)) => {
                         msg.push_str(&format!("track {track} device {index}"));
                     }
@@ -20253,8 +20540,8 @@ impl AppData {
             // round-trip が全て drain した。 in-flight 中に保留していた
             // ガード操作 (New/Open/Open Recent/終了) を、 deferred edit / save 反映後の
             // **最新 dirty 状態で再評価** する (= clean なら実行、 dirty なら確認モーダル)。
+            // dirty は edit_epoch 由来の O(1) 派生なので明示的な recompute は不要。
             // queue は空なので破壊操作も安全に走る。
-            self.recompute_dirty();
             self.request_guarded_action(action);
         }
         // 「保存して終了」 の完了判定は `finish_save` (save 成否が分かる場所) が行う。
@@ -20322,7 +20609,7 @@ impl AppData {
             None
         } else {
             common::timing::playhead_to_beat(
-                Some(&self.song_doc.song()),
+                Some(self.song_doc.song()),
                 self.ipc.sample_rate,
                 playhead_samples,
             )
@@ -20340,7 +20627,7 @@ impl AppData {
             && !self.transport.is_looping
             && playhead_samples != u64::MAX
             && common::timing::song_ended(
-                Some(&self.song_doc.song()),
+                Some(self.song_doc.song()),
                 self.ipc.sample_rate,
                 playhead_samples,
             )
@@ -20575,10 +20862,12 @@ impl AppData {
         // L11 (r.md #8): alloc_content で content + 表示名 "Rec" を同時登録する。
         // 旧実装は AutomationClip.name="Rec" を設定していたが、 arrangement view は
         // content_name(content_id) を描くので "Rec" が表示されなかった。
-        let content_id = self.song_doc.song().alloc_content(
-            ClipContent::Automation(AutomationContent::default()),
-            "Rec".into(),
-        );
+        let content_id = self.edit_song(|song| {
+            song.alloc_content(
+                ClipContent::Automation(AutomationContent::default()),
+                "Rec".into(),
+            )
+        })?;
         if is_song_level {
             self.ui_prefs.master_row_automation_expanded = true;
             self.edit_song(|song| {
@@ -20615,36 +20904,48 @@ impl AppData {
             });
         } else {
             self.ui_prefs.expanded_automation_tracks.insert(track_id);
-            let track = self.song_doc.song().track_by_id_mut(track_id)?;
-            if let Some(lane) = track.automation_lanes.iter_mut().find(|l| &l.target == target) {
-                lane.enabled = true;
-                let cid = lane.next_clip_id;
-                lane.next_clip_id += 1;
-                lane.clips.push(AutomationClip {
-                    id: cid,
-                    name: "Rec".into(),
-                    start_beat: clip_start,
-                    length_beats: clip_len,
-                    content_id,
-                });
-            } else {
-                let lid = track.alloc_lane_id();
-                track.automation_lanes.push(AutomationLane {
-                    id: lid,
-                    target: target.clone(),
-                    default_value,
-                    enabled: true,
-                    visible: true,
-                    height_px: 60,
-                    clips: vec![AutomationClip {
-                        id: 1,
-                        name: "Rec".into(),
-                        start_beat: clip_start,
-                        length_beats: clip_len,
-                        content_id,
-                    }],
-                    next_clip_id: 2,
-                });
+            let found = self
+                .edit_song(|song| {
+                    let Some(track) = song.track_by_id_mut(track_id) else {
+                        return false;
+                    };
+                    if let Some(lane) =
+                        track.automation_lanes.iter_mut().find(|l| &l.target == target)
+                    {
+                        lane.enabled = true;
+                        let cid = lane.next_clip_id;
+                        lane.next_clip_id += 1;
+                        lane.clips.push(AutomationClip {
+                            id: cid,
+                            name: "Rec".into(),
+                            start_beat: clip_start,
+                            length_beats: clip_len,
+                            content_id,
+                        });
+                    } else {
+                        let lid = track.alloc_lane_id();
+                        track.automation_lanes.push(AutomationLane {
+                            id: lid,
+                            target: target.clone(),
+                            default_value,
+                            enabled: true,
+                            visible: true,
+                            height_px: 60,
+                            clips: vec![AutomationClip {
+                                id: 1,
+                                name: "Rec".into(),
+                                start_beat: clip_start,
+                                length_beats: clip_len,
+                                content_id,
+                            }],
+                            next_clip_id: 2,
+                        });
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !found {
+                return None;
             }
         }
         Some((clip_start, content_id))
@@ -20744,7 +21045,7 @@ impl AppData {
                 .map(|t| f64::from(t.pan)),
             common::model::AutomationTarget::PluginParam { device_id, param_id, .. } => {
                 // v29: 安定 device_id → positional cache key へ逆引き。
-                let (t, device_index) = find_device_by_id(&self.song_doc.song(), *device_id)?;
+                let (t, device_index) = find_device_by_id(self.song_doc.song(), *device_id)?;
                 self.ipc.plugin_param_values
                     .get(&(t, device_index, *param_id))
                     .copied()
@@ -20871,28 +21172,29 @@ impl AppData {
         plain_value: f64,
     ) -> bool {
         const THIN_EPSILON_PLAIN: f64 = 0.005;
-        let entry = self
-            .song_doc.song()
-            .clip_contents
-            .entry(content_id)
-            .or_insert_with(|| {
+        // 録音 gesture 途中で crash しても、 挿入済の点が autosave に乗るよう
+        // dirty を立てる (= edit が epoch を bump)。 GUI tick 経路 (= audio
+        // callback でない) なので RT 制約に抵触しない。 連続する record tick は
+        // AutomationRecord stream gesture で 1 undo step に squash する。
+        let scope = self
+            .song_doc
+            .stream_scope(crate::state::StreamGesture::AutomationRecord);
+        self.song_doc.edit_checked(scope, move |song| {
+            let entry = song.clip_contents.entry(content_id).or_insert_with(|| {
                 common::model::ClipContent::Automation(common::model::AutomationContent::default())
             });
-        let points = match entry {
-            common::model::ClipContent::Automation(a) => &mut a.points,
-            _ => return false,
-        };
-        common::automation::thin_collinear_and_insert(
-            points,
-            time_beat,
-            plain_value,
-            THIN_EPSILON_PLAIN,
-        );
-        // 録音 gesture 途中で crash しても、 挿入済の点が autosave に
-        // 乗るよう dirty を立てる。 GUI tick 経路 (= audio callback で
-        // ない) なので bool 書き込みは RT 制約に抵触しない。
-        self.song_doc.is_dirty() = true;
-        true
+            let points = match entry {
+                common::model::ClipContent::Automation(a) => &mut a.points,
+                _ => return false,
+            };
+            common::automation::thin_collinear_and_insert(
+                points,
+                time_beat,
+                plain_value,
+                THIN_EPSILON_PLAIN,
+            );
+            true
+        }) == Some(true)
     }
 
     /// `song.bpm` を変更した後に呼ぶ共通処理。Raw audio clip を「実時間 (秒)
@@ -20905,7 +21207,10 @@ impl AppData {
     /// なので decode 再利用で軽量 (re-decode は走らない)。Raw clip が無ければ `false`
     /// を返し、呼び出し側の軽量 `SetSongBpm` に委ねる。
     fn rescale_raw_clips_for_bpm_change(&mut self, old_bpm: f32, new_bpm: f32) -> bool {
-        if !self.song_doc.song().rescale_raw_clips_for_bpm(old_bpm, new_bpm) {
+        let rescaled = self
+            .edit_song(|song| song.rescale_raw_clips_for_bpm(old_bpm, new_bpm))
+            .unwrap_or(false);
+        if !rescaled {
             return false;
         }
         // H2 同件: 毎 CC / 毎 scrub tick の full LoadSong flood を避け、 runner の
@@ -21036,7 +21341,9 @@ impl AppData {
         // audio 側は完全に不変。param は GUI が automation/変調を評価して描画に使う。
         // v29: 新規 device の安定 id を Song allocator で採番する
         // (0 のまま送る/積むのは禁止 — id addressing の根)。
-        let device_id = self.song_doc.song().alloc_device_id();
+        let Some(device_id) = self.edit_song(|song| song.alloc_device_id()) else {
+            return;
+        };
 
         let is_video = ports.is_video();
         if !is_video {
@@ -21065,7 +21372,8 @@ impl AppData {
         if is_master {
             self.edit_song(|song| song.master_fx_chain.push(new_device));
         } else if let Some(track_idx) = self.cursor_track_index() {
-            let track = &mut self.song_doc.song().tracks[track_idx];
+            self.edit_song(move |song| {
+            let track = &mut song.tracks[track_idx];
             let added_transform = new_device.plugin_id == common::video_fx::TRANSFORM_ID;
             track.devices.push(new_device);
             // Transform 配置 device を刺したら group_transform を有効化
@@ -21085,6 +21393,7 @@ impl AppData {
                 // 「VOICEVOX で鳴らす」 印 (unit marker) のみ持つ。
                 track.source = InstrumentSource::Vocal;
             }
+            });
         }
     }
 
@@ -21241,16 +21550,21 @@ impl AppData {
     // ここから IPC まで一貫して id で識別する。
     fn set_track_volume(&mut self, track_id: u32, volume: f32) {
         let v = volume.clamp(0.0, 1.0);
-        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
+        // 存在しない track は no-op (audio send / last-touched も出さない = 旧 early return)。
+        if !self.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
             return;
-        };
-        // SetSongBpmFromScrub と同 idiom: 値が実際に変わったときだけ
-        // dirty を立てて autosave に乗せる (= drag 途中 crash でも保存)。
-        let changed = (t.volume - v).abs() > f32::EPSILON;
-        t.volume = v;
-        if changed {
-            self.song_doc.is_dirty() = true;
         }
+        // SetSongBpmFromScrub と同 idiom: 値が実際に変わったときだけ dirty を立てて
+        // autosave に乗せる (= edit_song_checked が changed のときだけ epoch を bump、
+        // drag 途中 crash でも保存)。
+        self.edit_song_checked(|song| {
+            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return false;
+            };
+            let changed = (t.volume - v).abs() > f32::EPSILON;
+            t.volume = v;
+            changed
+        });
         let msg = AudioCommand::SetTrackVolume { track: track_id, volume: v };
         self.send_audio(msg);
         // gui_01 #028 §7.3: knob 操作で last-touched param を更新。
@@ -21267,14 +21581,18 @@ impl AppData {
 
     fn set_track_pan(&mut self, track_id: u32, pan: f32) {
         let p = pan.clamp(-1.0, 1.0);
-        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
+        // 存在しない track は no-op (audio send / last-touched も出さない = 旧 early return)。
+        if !self.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
             return;
-        };
-        let changed = (t.pan - p).abs() > f32::EPSILON;
-        t.pan = p;
-        if changed {
-            self.song_doc.is_dirty() = true;
         }
+        self.edit_song_checked(|song| {
+            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return false;
+            };
+            let changed = (t.pan - p).abs() > f32::EPSILON;
+            t.pan = p;
+            changed
+        });
         let msg = AudioCommand::SetTrackPan { track: track_id, pan: p };
         self.send_audio(msg);
         self.ui_ephemeral.last_touched_param = Some(TouchedParam {
@@ -21302,30 +21620,35 @@ impl AppData {
             .iter()
             .filter(|t| self.is_return_track(t.id))
             .count();
-        let id = self.song_doc.song().alloc_track_id();
+        let Some(id) = self.edit_song(|song| song.alloc_track_id()) else {
+            return;
+        };
         let track = track_with(|t| {
             t.id = id;
             t.name = format!("Return {}", existing_returns + 1);
             // リターンは master 直下に流す。
             t.parent_group_id = None;
         });
-        self.edit_song(|song| song.tracks.push(track));
+        self.edit_song(move |song| song.tracks.push(track));
         // 選択中 track があれば、 そこから新リターンへ即座に send を 1 本張る
         // (Ableton "Add Return" の即時性)。 選択が無ければ wiring だけ作って
         // ユーザーが後で「＋ Send」 で繋ぐ。 自分自身宛て (= 新リターンが
         // 選択されていた可能性) は意味が無いので除外。
         if let Some(sel_id) = self.cursor_track_id()
             && sel_id != id
-            && let Some(src) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == sel_id)
         {
-            // v29: 新規 send は必ず per-track allocator で安定 id を採番する。
-            let send_id = src.alloc_send_id();
-            src.sends.push(common::model::Send {
-                id: send_id,
-                dest_track_id: id,
-                gain: 1.0,
-                mode: SendMode::PostFader,
-                enabled: true,
+            self.edit_song(move |song| {
+                if let Some(src) = song.tracks.iter_mut().find(|t| t.id == sel_id) {
+                    // v29: 新規 send は必ず per-track allocator で安定 id を採番する。
+                    let send_id = src.alloc_send_id();
+                    src.sends.push(common::model::Send {
+                        id: send_id,
+                        dest_track_id: id,
+                        gain: 1.0,
+                        mode: SendMode::PostFader,
+                        enabled: true,
+                    });
+                }
             });
         }
         self.resize_track_peak_display();
@@ -21379,7 +21702,10 @@ impl AppData {
         else {
             return;
         };
-        if self.song_doc.song().remove_track_send(track_id, send_id) {
+        let removed = self
+            .edit_song(|song| song.remove_track_send(track_id, send_id))
+            .unwrap_or(false);
+        if removed {
             self.sync_song_to_plugin_host();
             tracing::info!(track_id, send_idx, send_id, "removed send");
         }
@@ -21388,17 +21714,22 @@ impl AppData {
     /// `track_id` の `sends[send_idx].mode` を設定。 tap 位置 (pre/post) は
     /// routing graph に影響するので 構造変化 → full-song resend。
     fn set_send_mode(&mut self, track_id: u32, send_idx: usize, mode: SendMode) {
-        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
-            return;
-        };
-        let Some(send) = t.sends.get_mut(send_idx) else {
-            return;
-        };
-        if send.mode == mode {
-            return;
+        let changed = self.edit_song_checked(|song| {
+            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return false;
+            };
+            let Some(send) = t.sends.get_mut(send_idx) else {
+                return false;
+            };
+            if send.mode == mode {
+                return false;
+            }
+            send.mode = mode;
+            true
+        });
+        if changed {
+            self.sync_song_to_plugin_host();
         }
-        send.mode = mode;
-        self.sync_song_to_plugin_host();
     }
 
     /// `sends[send_idx].gain` を 0..2 に clamp して設定 + realtime IPC。
@@ -21407,20 +21738,32 @@ impl AppData {
     /// 更新して `A` キーで send-gain automation lane を生やせるようにする。
     fn set_send_gain(&mut self, track_id: u32, send_idx: usize, gain: f32) {
         let g = gain.clamp(0.0, 2.0);
-        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
-            return;
-        };
-        let Some(send) = t.sends.get_mut(send_idx) else {
-            return;
-        };
-        let changed = (send.gain - g).abs() > f32::EPSILON;
-        send.gain = g;
-        if changed {
-            self.song_doc.is_dirty() = true;
-        }
         // v29: realtime IPC / automation target は positional index でなく
-        // 安定 send id でアドレスする。
-        let send_id = send.id;
+        // 安定 send id でアドレスする。 track/send が無ければ no-op (旧 early return)。
+        let Some(send_id) = self
+            .song_doc.song()
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .and_then(|t| t.sends.get(send_idx))
+            .map(|s| s.id)
+        else {
+            return;
+        };
+        // 値が変わったときだけ dirty (edit_song_checked が epoch を bump)。
+        self.edit_song_checked(|song| {
+            let Some(send) = song
+                .tracks
+                .iter_mut()
+                .find(|t| t.id == track_id)
+                .and_then(|t| t.sends.get_mut(send_idx))
+            else {
+                return false;
+            };
+            let changed = (send.gain - g).abs() > f32::EPSILON;
+            send.gain = g;
+            changed
+        });
         self.send_audio(AudioCommand::SetSendGain {
             track: track_id,
             send_id,
@@ -21442,18 +21785,29 @@ impl AppData {
     /// `sends[send_idx].enabled` を設定 + realtime IPC。 `set_send_gain` と
     /// 同 idiom、 full-song resend しない (= 配線は維持したまま mute)。
     fn set_send_enabled(&mut self, track_id: u32, send_idx: usize, enabled: bool) {
-        let Some(t) = self.song_doc.song().tracks.iter_mut().find(|t| t.id == track_id) else {
+        let Some(send_id) = self
+            .song_doc.song()
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .and_then(|t| t.sends.get(send_idx))
+            .map(|s| s.id)
+        else {
             return;
         };
-        let Some(send) = t.sends.get_mut(send_idx) else {
-            return;
-        };
-        let changed = send.enabled != enabled;
-        send.enabled = enabled;
-        let send_id = send.id;
-        if changed {
-            self.song_doc.is_dirty() = true;
-        }
+        self.edit_song_checked(|song| {
+            let Some(send) = song
+                .tracks
+                .iter_mut()
+                .find(|t| t.id == track_id)
+                .and_then(|t| t.sends.get_mut(send_idx))
+            else {
+                return false;
+            };
+            let changed = send.enabled != enabled;
+            send.enabled = enabled;
+            changed
+        });
         self.send_audio(AudioCommand::SetSendEnabled {
             track: track_id,
             send_id,
@@ -21462,55 +21816,40 @@ impl AppData {
     }
 
     fn toggle_track_mute(&mut self, track_id: u32) {
-        let __applied = self.edit_song_checked(|song| {
-            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
-                return false;
-            };
+        let Some(Some(muted)) = self.edit_song(|song| {
+            let t = song.tracks.iter_mut().find(|t| t.id == track_id)?;
             t.muted = !t.muted;
-            let muted = t.muted;
-            // toggle なので値は必ず変化する → autosave 用に dirty を立てる。
-            true
-        });
-        if !__applied {
+            // toggle なので値は必ず変化する → edit_song が epoch を bump (autosave)。
+            Some(t.muted)
+        }) else {
             return;
-        }
-        self.song_doc.is_dirty() = true;
+        };
         let msg = AudioCommand::SetTrackMuted { track: track_id, muted };
         self.send_audio(msg);
     }
 
     fn toggle_track_solo(&mut self, track_id: u32) {
-        let __applied = self.edit_song_checked(|song| {
-            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
-                return false;
-            };
+        let Some(Some(solo)) = self.edit_song(|song| {
+            let t = song.tracks.iter_mut().find(|t| t.id == track_id)?;
             t.solo = !t.solo;
-            let solo = t.solo;
-            // toggle なので値は必ず変化する → autosave 用に dirty を立てる。
-            true
-        });
-        if !__applied {
+            // toggle なので値は必ず変化する → edit_song が epoch を bump (autosave)。
+            Some(t.solo)
+        }) else {
             return;
-        }
-        self.song_doc.is_dirty() = true;
+        };
         let msg = AudioCommand::SetTrackSolo { track: track_id, solo };
         self.send_audio(msg);
     }
 
     fn toggle_track_armed(&mut self, track_id: u32) {
-        let __applied = self.edit_song_checked(|song| {
-            let Some(t) = song.tracks.iter_mut().find(|t| t.id == track_id) else {
-                return false;
-            };
+        let Some(Some(armed)) = self.edit_song(|song| {
+            let t = song.tracks.iter_mut().find(|t| t.id == track_id)?;
             t.armed = !t.armed;
-            let armed = t.armed;
-            // `armed` は永続 field。 mute / solo と同じく dirty を立てる。
-            true
-        });
-        if !__applied {
+            // `armed` は永続 field。 mute / solo と同じく edit_song が epoch を bump。
+            Some(t.armed)
+        }) else {
             return;
-        }
-        self.song_doc.is_dirty() = true;
+        };
         let msg = AudioCommand::SetTrackArmed { track: track_id, armed };
         self.send_audio(msg);
     }
@@ -21827,47 +22166,51 @@ impl AppData {
             let length_beats =
                 frames_to_beats(imported.buffer.frames, imported.buffer.sample_rate, bpm);
 
-            let source_id = self.song_doc.song().alloc_audio_source_id();
-            self.edit_song(|song| song.audio_sources.insert(source_id, imported.source));
-            self.media.audio_source_cache.insert(source_id, imported.buffer.clone());
+            let Some(source_id) = self.edit_song(|song| {
+                let source_id = song.alloc_audio_source_id();
+                song.audio_sources.insert(source_id, imported.source);
 
-            // v29: 新規 content の単一 event なので id=1 / allocator は 2 から。
-            let event = AudioEvent {
-                id: 1,
-                source_id,
-                event_start_in_clip_beats: 0.0,
-                event_length_beats: length_beats,
-                source_start_frames: 0,
-                source_end_frames: imported.buffer.frames,
-                ..AudioEvent::default()
+                // v29: 新規 content の単一 event なので id=1 / allocator は 2 から。
+                let event = AudioEvent {
+                    id: 1,
+                    source_id,
+                    event_start_in_clip_beats: 0.0,
+                    event_length_beats: length_beats,
+                    source_start_frames: 0,
+                    source_end_frames: imported.buffer.frames,
+                    ..AudioEvent::default()
+                };
+                let content_id = song.alloc_content(
+                    ClipContent::Audio(AudioContent {
+                        events: vec![event],
+                        next_event_id: 2,
+                    }),
+                    imported.display_name.clone(),
+                );
+
+                let track = &mut song.tracks[target_track_idx];
+                let new_clip_id = track.alloc_clip_id();
+                track.clips.push(Clip {
+                    id: new_clip_id,
+                    name: String::new(),
+                    start_beat: next_start_beat,
+                    length_beats,
+                    content_id,
+                    notes: Vec::new(),
+                    color: None,
+                    auto_lipsync: false,
+                    ..Default::default()
+                });
+                source_id
+            }) else {
+                return;
             };
-            let content_id = self.song_doc.song().alloc_content(
-                ClipContent::Audio(AudioContent {
-                    events: vec![event],
-                    next_event_id: 2,
-                }),
-                imported.display_name.clone(),
-            );
-
-            let track = &mut self.song_doc.song().tracks[target_track_idx];
-            let new_clip_id = track.alloc_clip_id();
-            track.clips.push(Clip {
-                id: new_clip_id,
-                name: String::new(),
-                start_beat: next_start_beat,
-                length_beats,
-                content_id,
-                notes: Vec::new(),
-                color: None,
-                auto_lipsync: false,
-                ..Default::default()
-            });
+            self.media.audio_source_cache.insert(source_id, imported.buffer.clone());
             next_start_beat += length_beats;
             imported_ok += 1;
         }
 
         if imported_ok > 0 {
-            self.song_doc.is_dirty() = true;
             self.sync_song_to_plugin_host();
         }
 
@@ -21939,18 +22282,31 @@ impl AppData {
 
             // 1) Register paired audio (if present) before video so we
             //    have the AudioSourceId for the video back-link.
-            let audio_source_id = imported.audio.as_ref().map(|audio| {
-                let id = self.song_doc.song().alloc_audio_source_id();
-                self.edit_song(|song| song.audio_sources.insert(id, audio.source.clone()));
-                self.media.audio_source_cache.insert(id, audio.buffer.clone());
-                id
-            });
+            let audio_source_id = match &imported.audio {
+                Some(audio) => {
+                    let Some(id) = self.edit_song(|song| {
+                        let id = song.alloc_audio_source_id();
+                        song.audio_sources.insert(id, audio.source.clone());
+                        id
+                    }) else {
+                        return;
+                    };
+                    self.media.audio_source_cache.insert(id, audio.buffer.clone());
+                    Some(id)
+                }
+                None => None,
+            };
 
             // 2) Register video source with the audio back-link.
-            let video_source_id = self.song_doc.song().alloc_video_source_id();
             let mut vs = imported.video_source;
             vs.audio_source_id = audio_source_id;
-            self.edit_song(|song| song.video_sources.insert(video_source_id, vs));
+            let Some(video_source_id) = self.edit_song(|song| {
+                let id = song.alloc_video_source_id();
+                song.video_sources.insert(id, vs);
+                id
+            }) else {
+                return;
+            };
 
             // 2b) Stash the thumbnail RGBA (if extracted) and queue
             //     a GPU upload. The runner picks this up next frame
@@ -21966,37 +22322,39 @@ impl AppData {
             }
 
             // 3) Video clip content + auto track.
-            let v_content_id = self.song_doc.song().alloc_content(
-                ClipContent::Video(VideoContent {
-                    events: vec![VideoEvent {
-                        source_id: video_source_id,
-                        event_start_in_clip_beats: 0.0,
-                        event_length_beats: video_length_beats,
-                        source_start_micros: 0,
-                        source_end_micros: duration_micros,
-                        ..VideoEvent::default()
-                    }],
-                }),
-                display_name.clone(),
-            );
-            let video_track_id = self.song_doc.song().alloc_track_id();
-            let mut video_track = track_with(|t| {
-                t.id = video_track_id;
-                t.name = format!("{display_name} (Video)");
+            self.edit_song(|song| {
+                let v_content_id = song.alloc_content(
+                    ClipContent::Video(VideoContent {
+                        events: vec![VideoEvent {
+                            source_id: video_source_id,
+                            event_start_in_clip_beats: 0.0,
+                            event_length_beats: video_length_beats,
+                            source_start_micros: 0,
+                            source_end_micros: duration_micros,
+                            ..VideoEvent::default()
+                        }],
+                    }),
+                    display_name.clone(),
+                );
+                let video_track_id = song.alloc_track_id();
+                let mut video_track = track_with(|t| {
+                    t.id = video_track_id;
+                    t.name = format!("{display_name} (Video)");
+                });
+                let v_clip_id = video_track.alloc_clip_id();
+                video_track.clips.push(Clip {
+                    id: v_clip_id,
+                    name: String::new(),
+                    start_beat: next_start_beat,
+                    length_beats: video_length_beats,
+                    content_id: v_content_id,
+                    notes: Vec::new(),
+                    color: None,
+                    auto_lipsync: false,
+                    ..Default::default()
+                });
+                song.tracks.push(video_track);
             });
-            let v_clip_id = video_track.alloc_clip_id();
-            video_track.clips.push(Clip {
-                id: v_clip_id,
-                name: String::new(),
-                start_beat: next_start_beat,
-                length_beats: video_length_beats,
-                content_id: v_content_id,
-                notes: Vec::new(),
-                color: None,
-                auto_lipsync: false,
-                ..Default::default()
-            });
-            self.edit_song(|song| song.tracks.push(video_track));
 
             // 4) Paired audio clip + audio track (only when audio is
             //    present in the source).
@@ -22008,40 +22366,42 @@ impl AppData {
                     audio.buffer.sample_rate,
                     bpm,
                 );
-                let a_content_id = self.song_doc.song().alloc_content(
-                    ClipContent::Audio(AudioContent {
-                        events: vec![AudioEvent {
-                            // v29: 新規 content の単一 event = id 1。
-                            id: 1,
-                            source_id: audio_src_id,
-                            event_start_in_clip_beats: 0.0,
-                            event_length_beats: audio_length_beats,
-                            source_start_frames: 0,
-                            source_end_frames: audio.buffer.frames,
-                            ..AudioEvent::default()
-                        }],
-                        next_event_id: 2,
-                    }),
-                    format!("{display_name} (audio)"),
-                );
-                let audio_track_id = self.song_doc.song().alloc_track_id();
-                let mut audio_track = track_with(|t| {
-                    t.id = audio_track_id;
-                    t.name = format!("{display_name} (Audio)");
+                self.edit_song(|song| {
+                    let a_content_id = song.alloc_content(
+                        ClipContent::Audio(AudioContent {
+                            events: vec![AudioEvent {
+                                // v29: 新規 content の単一 event = id 1。
+                                id: 1,
+                                source_id: audio_src_id,
+                                event_start_in_clip_beats: 0.0,
+                                event_length_beats: audio_length_beats,
+                                source_start_frames: 0,
+                                source_end_frames: audio.buffer.frames,
+                                ..AudioEvent::default()
+                            }],
+                            next_event_id: 2,
+                        }),
+                        format!("{display_name} (audio)"),
+                    );
+                    let audio_track_id = song.alloc_track_id();
+                    let mut audio_track = track_with(|t| {
+                        t.id = audio_track_id;
+                        t.name = format!("{display_name} (Audio)");
+                    });
+                    let a_clip_id = audio_track.alloc_clip_id();
+                    audio_track.clips.push(Clip {
+                        id: a_clip_id,
+                        name: String::new(),
+                        start_beat: next_start_beat,
+                        length_beats: audio_length_beats,
+                        content_id: a_content_id,
+                        notes: Vec::new(),
+                        color: None,
+                        auto_lipsync: false,
+                        ..Default::default()
+                    });
+                    song.tracks.push(audio_track);
                 });
-                let a_clip_id = audio_track.alloc_clip_id();
-                audio_track.clips.push(Clip {
-                    id: a_clip_id,
-                    name: String::new(),
-                    start_beat: next_start_beat,
-                    length_beats: audio_length_beats,
-                    content_id: a_content_id,
-                    notes: Vec::new(),
-                    color: None,
-                    auto_lipsync: false,
-                    ..Default::default()
-                });
-                self.edit_song(|song| song.tracks.push(audio_track));
             }
 
             next_start_beat += video_length_beats;
@@ -22049,7 +22409,6 @@ impl AppData {
         }
 
         if imported_ok > 0 {
-            self.song_doc.is_dirty() = true;
             self.sync_song_to_plugin_host();
         }
 
@@ -22145,17 +22504,20 @@ impl AppData {
             };
 
             // 1) Register ImageSource + stage BGRA for GPU upload.
-            let image_source_id = self.song_doc.song().alloc_image_source_id();
-            self.edit_song(|song| song.image_sources.insert(image_source_id, imported.source));
-            let w = imported.bgra.len() as u32;
-            let _ = w;
             // bgra length matches width * height * 4 by construction of
             // `import_one_image`; re-fetch dims from the source we just
             // inserted so the staging matches.
-            let src = &self.song_doc.song().image_sources[&image_source_id];
+            let Some((image_source_id, src_w, src_h)) = self.edit_song(|song| {
+                let image_source_id = song.alloc_image_source_id();
+                song.image_sources.insert(image_source_id, imported.source);
+                let src = &song.image_sources[&image_source_id];
+                (image_source_id, src.width, src.height)
+            }) else {
+                return;
+            };
             self.media.image_source_bgra.insert(
                 image_source_id,
-                (src.width, src.height, std::sync::Arc::new(imported.bgra)),
+                (src_w, src_h, std::sync::Arc::new(imported.bgra)),
             );
             self.media.pending_image_uploads.push(image_source_id);
 
@@ -22172,55 +22534,57 @@ impl AppData {
                 .to_string();
             let (def_x, def_y, def_w, def_h) = aspect_fit_pip_rect(
                 self.song_doc.song().video_resolution,
-                (src.width, src.height),
+                (src_w, src_h),
             );
-            let i_content_id = self.song_doc.song().alloc_content(
-                common::model::ClipContent::Image(common::model::ImageContent {
-                    events: vec![common::model::ImageEvent {
-                        source_id: image_source_id,
-                        event_start_in_clip_beats: 0.0,
-                        event_length_beats: image_clip_length_beats,
-                        x: def_x,
-                        y: def_y,
-                        w: def_w,
-                        h: def_h,
-                        ..common::model::ImageEvent::default()
-                    }],
-                }),
-                display_name.clone(),
-            );
+            self.edit_song(|song| {
+                let i_content_id = song.alloc_content(
+                    common::model::ClipContent::Image(common::model::ImageContent {
+                        events: vec![common::model::ImageEvent {
+                            source_id: image_source_id,
+                            event_start_in_clip_beats: 0.0,
+                            event_length_beats: image_clip_length_beats,
+                            x: def_x,
+                            y: def_y,
+                            w: def_w,
+                            h: def_h,
+                            ..common::model::ImageEvent::default()
+                        }],
+                    }),
+                    display_name.clone(),
+                );
 
-            // 3) 配置先 track を決める。
-            //    - 既存 track (drop 先): その index にそのまま貼る。
-            //    - 新規 track: arrangement 先頭 (index 0) に Video 用 track を
-            //      作って挿入 → 既存 video layer の上に合成される
-            //      (multi-track composite top-wins, plan_video §4 P7)。
-            let place_idx = match dest_track_idx {
-                Some(idx) => idx,
-                None => {
-                    let image_track_id = self.song_doc.song().alloc_track_id();
-                    self.song_doc.song().tracks.insert(
-                        0,
-                        track_with(|t| {
-                            t.id = image_track_id;
-                            t.name = format!("{display_name} (Image)");
-                        }),
-                    );
-                    0
-                }
-            };
-            let track = &mut self.song_doc.song().tracks[place_idx];
-            let i_clip_id = track.alloc_clip_id();
-            track.clips.push(Clip {
-                id: i_clip_id,
-                name: String::new(),
-                start_beat: next_start_beat,
-                length_beats: image_clip_length_beats,
-                content_id: i_content_id,
-                notes: Vec::new(),
-                color: None,
-                auto_lipsync: false,
-                ..Default::default()
+                // 3) 配置先 track を決める。
+                //    - 既存 track (drop 先): その index にそのまま貼る。
+                //    - 新規 track: arrangement 先頭 (index 0) に Video 用 track を
+                //      作って挿入 → 既存 video layer の上に合成される
+                //      (multi-track composite top-wins, plan_video §4 P7)。
+                let place_idx = match dest_track_idx {
+                    Some(idx) => idx,
+                    None => {
+                        let image_track_id = song.alloc_track_id();
+                        song.tracks.insert(
+                            0,
+                            track_with(|t| {
+                                t.id = image_track_id;
+                                t.name = format!("{display_name} (Image)");
+                            }),
+                        );
+                        0
+                    }
+                };
+                let track = &mut song.tracks[place_idx];
+                let i_clip_id = track.alloc_clip_id();
+                track.clips.push(Clip {
+                    id: i_clip_id,
+                    name: String::new(),
+                    start_beat: next_start_beat,
+                    length_beats: image_clip_length_beats,
+                    content_id: i_content_id,
+                    notes: Vec::new(),
+                    color: None,
+                    auto_lipsync: false,
+                    ..Default::default()
+                });
             });
             // 既存 track に複数枚貼るときだけ順送り。 新規 track 経路は各画像が
             // 自分の track を持つので beat 0 固定 (従来挙動)。
@@ -22230,12 +22594,9 @@ impl AppData {
             imported_ok += 1;
         }
 
-        if imported_ok > 0 {
-            self.song_doc.is_dirty() = true;
-            // No `sync_song_to_plugin_host` — image clips have no
-            // audio engine implications, the daw_audio process never
-            // sees them.
-        }
+        // No `sync_song_to_plugin_host` — image clips have no
+        // audio engine implications, the daw_audio process never
+        // sees them.
 
         // `paths.is_empty()` early-returns above, so we know
         // imported_ok + errors.len() >= 1 — the (0, true) "nothing
@@ -22264,33 +22625,38 @@ impl AppData {
         let start_beat = start_beat.max(0.0);
         let length_beats = DEFAULT_CLIP_LENGTH;
 
-        let content_id = self.song_doc.song().alloc_content(
-            common::model::ClipContent::Text(common::model::TextContent {
-                events: vec![common::model::TextEvent {
-                    text: "Title".into(),
-                    event_length_beats: length_beats,
-                    ..common::model::TextEvent::default()
-                }],
-            }),
-            // デフォルトでクリップ名は無し。 表示名は clip_display_label が
-            // TextEvent.text ("Title") から導出する (= 名前 == 本文)。
-            String::new(),
-        );
+        let Some(new_clip_idx) = self.edit_song(|song| {
+            let content_id = song.alloc_content(
+                common::model::ClipContent::Text(common::model::TextContent {
+                    events: vec![common::model::TextEvent {
+                        text: "Title".into(),
+                        event_length_beats: length_beats,
+                        ..common::model::TextEvent::default()
+                    }],
+                }),
+                // デフォルトでクリップ名は無し。 表示名は clip_display_label が
+                // TextEvent.text ("Title") から導出する (= 名前 == 本文)。
+                String::new(),
+            );
 
-        let track = &mut self.song_doc.song().tracks[track_idx];
-        let clip_id = track.alloc_clip_id();
-        let new_clip_idx = track.clips.len() as u32;
-        track.clips.push(common::model::Clip {
-            id: clip_id,
-            name: String::new(),
-            start_beat,
-            length_beats,
-            content_id,
-            notes: Vec::new(),
-            color: None,
-            auto_lipsync: false,
-            ..Default::default()
-        });
+            let track = &mut song.tracks[track_idx];
+            let clip_id = track.alloc_clip_id();
+            let new_clip_idx = track.clips.len() as u32;
+            track.clips.push(common::model::Clip {
+                id: clip_id,
+                name: String::new(),
+                start_beat,
+                length_beats,
+                content_id,
+                notes: Vec::new(),
+                color: None,
+                auto_lipsync: false,
+                ..Default::default()
+            });
+            new_clip_idx
+        }) else {
+            return;
+        };
 
         // create_clip と同様、 生成直後の clip を選択して inspector に出す。
         let r = ClipRef {
@@ -22301,7 +22667,6 @@ impl AppData {
         self.selection.selected_notes.clear();
         self.select_track(track_idx as u32);
 
-        self.song_doc.is_dirty() = true;
         self.ui_ephemeral.status_message = "Text clip 追加".into();
         self.sync_song_to_plugin_host();
     }
@@ -22532,7 +22897,7 @@ impl AppData {
                 let Some(path) = paths.into_iter().next() else {
                     return;
                 };
-                match crate::midi_export::export_midi(&self.song_doc.song(), &path) {
+                match crate::midi_export::export_midi(self.song_doc.song(), &path) {
                     Ok(()) => {
                         self.ui_ephemeral.status_message =
                             format!("MIDI 書き出し完了: {}", path.display());
@@ -22722,7 +23087,6 @@ impl AppData {
             self.selection.selected_notes.clear();
         }
         self.ui_ephemeral.status_message = format!("Split: {split_count} clip を分割しました");
-        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
     }
 
@@ -22788,13 +23152,6 @@ impl AppData {
         // 元 event を clone して詳細パラメータを後半 event にコピー。
         let event = audio_ro.events[event_idx].clone();
 
-        // mut 取り直し → 分割実行。
-        let Some(common::model::ClipContent::Audio(audio_mut)) =
-            self.song_doc.song().clip_contents.get_mut(&content_id)
-        else {
-            return false;
-        };
-
         let offset_in_event = in_clip_beat - event.event_start_in_clip_beats;
         let len_beats = event.event_length_beats.max(1e-9);
         let event_len_frames = event
@@ -22815,17 +23172,6 @@ impl AppData {
             (event.source_start_frames, mid, mid, event.source_end_frames)
         };
 
-        // 前半 event を in-place で更新 (= event_start は変えず、 length と
-        // source 範囲を縮める)。 fade_out は split で消す (右端が新しく
-        // なったので元 fade_out 値は意味を失う)。
-        {
-            let front = &mut audio_mut.events[event_idx];
-            front.source_start_frames = front_ss;
-            front.source_end_frames = front_se;
-            front.event_length_beats = offset_in_event;
-            front.fade_out_beats = 0.0;
-        }
-
         // 後半 event は元 event のパラメータ (gain / pan / pitch / fade /
         // stretch / reversed / muted / onsets / beat_markers) を引き継ぐ。
         // event_start は cursor 位置、 length は残り、 source は分割後の
@@ -22836,13 +23182,34 @@ impl AppData {
         back.event_start_in_clip_beats = in_clip_beat;
         back.event_length_beats = (len_beats - offset_in_event).max(0.0);
         back.fade_in_beats = 0.0;
-        audio_mut.events.insert(event_idx + 1, back);
+        // mut 取り直し → 分割実行。
+        let inserted = self.edit_song_checked(|song| {
+            let Some(common::model::ClipContent::Audio(audio_mut)) =
+                song.clip_contents.get_mut(&content_id)
+            else {
+                return false;
+            };
+            // 前半 event を in-place で更新 (= event_start は変えず、 length と
+            // source 範囲を縮める)。 fade_out は split で消す (右端が新しく
+            // なったので元 fade_out 値は意味を失う)。
+            {
+                let front = &mut audio_mut.events[event_idx];
+                front.source_start_frames = front_ss;
+                front.source_end_frames = front_se;
+                front.event_length_beats = offset_in_event;
+                front.fade_out_beats = 0.0;
+            }
+            audio_mut.events.insert(event_idx + 1, back);
+            true
+        });
+        if !inserted {
+            return false;
+        }
 
         // 選択は後半 event (= ユーザーは「分割直後に新規 event を編集
         // したい」 ことが多い、 Reaper / Bitwig 流)。
         self.selection.audio_editor_selected_events = vec![event_idx + 1];
         self.ui_ephemeral.status_message = "Split: event を分割しました".into();
-        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
         if self.ui_ephemeral.clip_edit_buffer_target == Some(target) {
             self.resync_clip_audio_event_edit_buffers(target);
@@ -22888,6 +23255,7 @@ impl AppData {
 
         // Build the back-half ClipContent by partitioning the source
         // content at `split_offset` (clip-local beats).
+        self.edit_song_checked(|song| {
         let back_content = match src_content.clone() {
             ClipContent::Midi(mut midi) => {
                 let mut back_notes: Vec<Note> = Vec::new();
@@ -22941,9 +23309,8 @@ impl AppData {
                     next_note_id: midi.next_note_id,
                 };
                 back.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-                let front_id = self.song_doc.song().alloc_content_id();
-                self.song_doc.song()
-                    .clip_contents
+                let front_id = song.alloc_content_id();
+                song.clip_contents
                     .insert(front_id, ClipContent::Midi(front));
                 ClipContent::Midi(back)
             }
@@ -22995,9 +23362,8 @@ impl AppData {
                     events: back_events,
                     next_event_id: audio.next_event_id,
                 };
-                let front_id = self.song_doc.song().alloc_content_id();
-                self.song_doc.song()
-                    .clip_contents
+                let front_id = song.alloc_content_id();
+                song.clip_contents
                     .insert(front_id, ClipContent::Audio(front));
                 ClipContent::Audio(back)
             }
@@ -23051,9 +23417,8 @@ impl AppData {
                 let back = common::model::VideoContent {
                     events: back_events,
                 };
-                let front_id = self.song_doc.song().alloc_content_id();
-                self.song_doc.song()
-                    .clip_contents
+                let front_id = song.alloc_content_id();
+                song.clip_contents
                     .insert(front_id, ClipContent::Video(front));
                 ClipContent::Video(back)
             }
@@ -23095,9 +23460,8 @@ impl AppData {
                 }
                 let front = common::model::ImageContent { events: keep_front };
                 let back = common::model::ImageContent { events: back_events };
-                let front_id = self.song_doc.song().alloc_content_id();
-                self.song_doc.song()
-                    .clip_contents
+                let front_id = song.alloc_content_id();
+                song.clip_contents
                     .insert(front_id, ClipContent::Image(front));
                 ClipContent::Image(back)
             }
@@ -23116,23 +23480,21 @@ impl AppData {
         // Strategy: walk back the last alloc'd id we just inserted.
         // The id list above used `alloc_content_id()` so the most
         // recent one is `next_content_id - 1`.
-        let front_content_id = self.song_doc.song().next_content_id.saturating_sub(1);
-        let back_content_id = self.song_doc.song().alloc_content_id();
-        self.song_doc.song()
-            .clip_contents
+        let front_content_id = song.next_content_id.saturating_sub(1);
+        let back_content_id = song.alloc_content_id();
+        song.clip_contents
             .insert(back_content_id, back_content);
         // 両半は元 clip の共有名を引き継ぐ (split は両側を fresh content_id に
         // fork するので、 名前も両方へ複製する)。
         if !src_name.is_empty() {
-            self.song_doc.song()
-                .set_content_name(front_content_id, src_name.clone());
-            self.edit_song(|song| song.set_content_name(back_content_id, src_name.clone()));
+            song.set_content_name(front_content_id, src_name.clone());
+            song.set_content_name(back_content_id, src_name.clone());
         }
 
         // Mutate the clip in place: front half stays as `clip`
         // (length / content_id rewritten), and a new clip for the
         // back half is appended on the same track.
-        let track = &mut self.song_doc.song().tracks[target.track as usize];
+        let track = &mut song.tracks[target.track as usize];
         // 前半は in-place で元 clip の声を保持。 後半 (新 clip) は
         // その声を引き継ぐ。
         // 前半は in-place で mute を保持。 後半 (新 clip) も元 clip の mute を引き継ぐ。
@@ -23171,6 +23533,7 @@ impl AppData {
             clip: new_idx,
         });
         true
+        })
     }
 
     /// Glue (Consolidate) the currently selected clips into one clip
@@ -23385,7 +23748,6 @@ impl AppData {
             // is the common one — but be defensive.)
 
             let combined_len = combined_end - combined_start;
-            let new_content_id = self.song_doc.song().alloc_content_id();
             let new_content = match glue_kind {
                 GlueKind::Audio => {
                     // v29: 複数 content 由来の event id は衝突し得るので、
@@ -23422,68 +23784,70 @@ impl AppData {
                     })
                 }
             };
-            self.edit_song(|song| song.clip_contents.insert(new_content_id, new_content));
-            // merged clip の名前は content_id 単位 SSoT へ。
-            if !combined_name.is_empty() {
-                self.song_doc.song()
-                    .set_content_name(new_content_id, combined_name.clone());
-            }
-
-            // merged clip は最初 (= 最も早い index = sorted 先頭) の
-            // source clip の声を採用 (複数声混在時のポリシー)。 source 削除前に capture。
-            // merged clip の mute も代表 (最早) source clip の値を採用 (声と同ポリシー)。
-            let (glue_speaker, glue_singer, glue_style, glue_talk, glue_muted) = {
-                let track = &self.song_doc.song().tracks[track_idx as usize];
-                refs.iter()
-                    .map(|r| r.clip as usize)
-                    .min()
-                    .and_then(|i| track.clips.get(i))
-                    .map(|c| {
-                        (
-                            c.speaker_id,
-                            c.singer_name.clone(),
-                            c.style_name.clone(),
-                            c.talk,
-                            c.muted,
-                        )
-                    })
-                    .unwrap_or((0, String::new(), String::new(), None, false))
-            };
-            // Remove source clips (descending index to keep earlier
-            // indices stable).
-            let track = &mut self.song_doc.song().tracks[track_idx as usize];
-            let mut indices: Vec<usize> =
-                refs.iter().map(|r| r.clip as usize).collect();
-            indices.sort_unstable();
-            indices.dedup();
-            for &idx in indices.iter().rev() {
-                if idx < track.clips.len() {
-                    track.clips.remove(idx);
+            self.edit_song(|song| {
+                let new_content_id = song.alloc_content_id();
+                song.clip_contents.insert(new_content_id, new_content);
+                // merged clip の名前は content_id 単位 SSoT へ。
+                if !combined_name.is_empty() {
+                    song.set_content_name(new_content_id, combined_name.clone());
                 }
-            }
-            // Append the merged clip.
-            let new_clip_id = track.alloc_clip_id();
-            let new_idx = track.clips.len() as u32;
-            track.clips.push(Clip {
-                id: new_clip_id,
-                name: String::new(),
-                start_beat: combined_start,
-                length_beats: combined_len,
-                content_id: new_content_id,
-                notes: Vec::new(),
-                color: None,
-                auto_lipsync: false,
-                muted: glue_muted,
-                speaker_id: glue_speaker,
-                singer_name: glue_singer,
-                style_name: glue_style,
-                talk: glue_talk,
+
+                // merged clip は最初 (= 最も早い index = sorted 先頭) の
+                // source clip の声を採用 (複数声混在時のポリシー)。 source 削除前に capture。
+                // merged clip の mute も代表 (最早) source clip の値を採用 (声と同ポリシー)。
+                let (glue_speaker, glue_singer, glue_style, glue_talk, glue_muted) = {
+                    let track = &song.tracks[track_idx as usize];
+                    refs.iter()
+                        .map(|r| r.clip as usize)
+                        .min()
+                        .and_then(|i| track.clips.get(i))
+                        .map(|c| {
+                            (
+                                c.speaker_id,
+                                c.singer_name.clone(),
+                                c.style_name.clone(),
+                                c.talk,
+                                c.muted,
+                            )
+                        })
+                        .unwrap_or((0, String::new(), String::new(), None, false))
+                };
+                // Remove source clips (descending index to keep earlier
+                // indices stable).
+                let track = &mut song.tracks[track_idx as usize];
+                let mut indices: Vec<usize> =
+                    refs.iter().map(|r| r.clip as usize).collect();
+                indices.sort_unstable();
+                indices.dedup();
+                for &idx in indices.iter().rev() {
+                    if idx < track.clips.len() {
+                        track.clips.remove(idx);
+                    }
+                }
+                // Append the merged clip.
+                let new_clip_id = track.alloc_clip_id();
+                let new_idx = track.clips.len() as u32;
+                track.clips.push(Clip {
+                    id: new_clip_id,
+                    name: String::new(),
+                    start_beat: combined_start,
+                    length_beats: combined_len,
+                    content_id: new_content_id,
+                    notes: Vec::new(),
+                    color: None,
+                    auto_lipsync: false,
+                    muted: glue_muted,
+                    speaker_id: glue_speaker,
+                    singer_name: glue_singer,
+                    style_name: glue_style,
+                    talk: glue_talk,
+                });
+                new_refs.push(ClipRef {
+                    track: track_idx,
+                    clip: new_idx,
+                });
+                glued_count += 1;
             });
-            new_refs.push(ClipRef {
-                track: track_idx,
-                clip: new_idx,
-            });
-            glued_count += 1;
         }
 
         if had_mixed_kind {
@@ -23504,7 +23868,6 @@ impl AppData {
         self.select_new_clips(&new_refs);
         self.selection.selected_notes.clear();
         self.ui_ephemeral.status_message = format!("Glue: {glued_count} 箇所を結合しました");
-        self.song_doc.is_dirty() = true;
         self.sync_song_to_plugin_host();
     }
 }

@@ -31,7 +31,7 @@ fn build_app() -> (AppData, UnboundedReceiver<PluginCommand>) {
 #[test]
 fn not_dirty_close_quits_immediately() {
     let (mut app, _rx) = build_app();
-    app.song_doc.is_dirty() = false;
+    app.song_doc.mark_saved();
 
     app.request_close();
 
@@ -42,7 +42,7 @@ fn not_dirty_close_quits_immediately() {
 #[test]
 fn dirty_close_opens_confirm_modal() {
     let (mut app, _rx) = build_app();
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
 
     app.request_close();
 
@@ -57,7 +57,7 @@ fn dirty_close_opens_confirm_modal() {
 #[test]
 fn discard_quits_without_saving() {
     let (mut app, _rx) = build_app();
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.request_close();
 
     app.handle_event(AppEvent::DirtyGuardDiscard);
@@ -70,7 +70,7 @@ fn discard_quits_without_saving() {
 #[test]
 fn cancel_keeps_app_running() {
     let (mut app, _rx) = build_app();
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.request_close();
 
     app.handle_event(AppEvent::DirtyGuardCancel);
@@ -87,7 +87,7 @@ fn save_without_plugins_saves_synchronously_then_quits() {
 
     let (mut app, _rx) = build_app();
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.request_close();
 
     app.handle_event(AppEvent::DirtyGuardSave);
@@ -111,7 +111,7 @@ fn save_with_plugins_waits_for_states_then_quits() {
         "queue empty after plugin load"
     );
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.request_close();
 
     // 「保存して終了」: plugin 有りなので save は非同期 (state 取得待ち)。
@@ -142,7 +142,7 @@ fn save_with_plugins_waits_for_states_then_quits() {
 fn clean_new_runs_immediately() {
     let (mut app, _rx) = build_app();
     app.song_doc.file_path = Some(std::path::PathBuf::from("C:/some/proj.daw"));
-    app.song_doc.is_dirty() = false;
+    app.song_doc.mark_saved();
 
     app.handle_event(AppEvent::New);
 
@@ -159,7 +159,7 @@ fn dirty_new_opens_guard_modal() {
     let (mut app, _rx) = build_app();
     let path = std::path::PathBuf::from("C:/some/proj.daw");
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
 
     app.handle_event(AppEvent::New);
 
@@ -177,7 +177,7 @@ fn dirty_new_opens_guard_modal() {
 fn dirty_new_discard_runs_new() {
     let (mut app, _rx) = build_app();
     app.song_doc.file_path = Some(std::path::PathBuf::from("C:/some/proj.daw"));
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::New);
 
     app.handle_event(AppEvent::DirtyGuardDiscard);
@@ -192,7 +192,7 @@ fn dirty_new_cancel_keeps_project() {
     let (mut app, _rx) = build_app();
     let path = std::path::PathBuf::from("C:/some/proj.daw");
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::New);
 
     app.handle_event(AppEvent::DirtyGuardCancel);
@@ -209,7 +209,7 @@ fn dirty_new_save_then_runs_new() {
 
     let (mut app, _rx) = build_app();
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::New);
 
     // 「保存して続行」: plugin 無しなので同期保存 → New 実行。
@@ -225,7 +225,7 @@ fn dirty_new_save_then_runs_new() {
 #[test]
 fn dirty_open_recent_opens_guard_with_path() {
     let (mut app, _rx) = build_app();
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     let target = std::path::PathBuf::from("C:/some/other.daw");
 
     app.handle_event(AppEvent::OpenRecent(target.clone()));
@@ -240,7 +240,7 @@ fn dirty_open_recent_opens_guard_with_path() {
 #[test]
 fn dirty_open_opens_guard_modal() {
     let (mut app, _rx) = build_app();
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
 
     app.handle_event(AppEvent::Open);
 
@@ -254,7 +254,7 @@ fn dirty_open_opens_guard_modal() {
 #[test]
 fn second_guarded_action_ignored_while_modal_open() {
     let (mut app, _rx) = build_app();
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::New);
     assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::New));
 
@@ -288,7 +288,7 @@ fn new_during_in_flight_save_preserves_old_project() {
     app.edit_song(|song| song.tracks.push(extra));
     let real_track_count = app.song_doc.song().tracks.len();
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
 
     // 手動 Ctrl+S → plugin state 待ちの非同期保存が in-flight。
     app.handle_event(AppEvent::Save);
@@ -381,7 +381,7 @@ fn manual_save_ignored_while_guard_modal_open() {
 
     let (mut app, _rx) = build_app(); // plugin 無し → 保存は同期。
     app.song_doc.file_path = Some(path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::New); // dirty → モーダル (保存 in-flight 無し)。
     assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::New));
 
@@ -424,7 +424,7 @@ fn plugin_host_disconnect_unblocks_dirty_guard() {
     );
 
     // 以後ふたたびガードが開ける (= ロックされていない)。
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::New);
     assert_eq!(
         app.ui_ephemeral.dirty_guard,
@@ -444,12 +444,12 @@ fn discard_then_reopen_same_file_has_no_recovery_modal() {
 
     let (mut app, _rx) = build_app();
     // 実在する .daw を作る (Open でロードできるように)。
-    common::project::save(&proj, &app.song_doc.song()).expect("write project file");
+    common::project::save(&proj, app.song_doc.song()).expect("write project file");
     app.song_doc.file_path = Some(proj.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     // 未保存変更を写した sidecar autosave を用意 (.daw より後に書くので newer)。
     let sidecar = common::recovery::sidecar_for(&proj);
-    common::project::save(&sidecar, &app.song_doc.song()).expect("write sidecar autosave");
+    common::project::save(&sidecar, app.song_doc.song()).expect("write sidecar autosave");
     assert!(sidecar.exists(), "sidecar autosave staged");
 
     // 同じ file を Open → ダーティーガード → 「保存せず続行」。

@@ -1173,7 +1173,7 @@ impl Runner {
                         && let Some(track_id) = state.app.cursor_track_id()
                         && let Some(track) = state.app.song_doc.song().track_by_id(track_id)
                         && let Some(transform) = crate::video_fx::resolve_track_transform(
-                            &state.app.song_doc.song(),
+                            state.app.song_doc.song(),
                             track,
                             state.app.transport.playhead_beat.map(f64::from).unwrap_or(0.0),
                             &state.app.transport.mod_scalars,
@@ -1361,7 +1361,7 @@ impl Runner {
             return;
         };
         let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(
-            &state.app.song_doc.song(),
+            state.app.song_doc.song(),
             playhead_beat,
         );
         let project_dir = state
@@ -1384,7 +1384,7 @@ impl Runner {
             };
             for frame_info in &active {
                 let Some(abs_path) = resolve_video_path(
-                    &state.app.song_doc.song(),
+                    state.app.song_doc.song(),
                     frame_info.video_source_id,
                     project_dir.as_deref(),
                 ) else {
@@ -1443,7 +1443,7 @@ impl Runner {
         // `group_has_visual_content`。transform / lane 未設定の visual group も identity
         // として含む。export と同一述語（SSoT）。
         let active_groups = crate::group_compose::active_visual_groups(
-            &state.app.song_doc.song(),
+            state.app.song_doc.song(),
             playhead_beat,
             &state.app.transport.mod_scalars,
         );
@@ -1451,7 +1451,7 @@ impl Runner {
         // PiP 画像 → 親が active group ならその group bucket へ吸収、さもなくば owning
         // track の bucket。
         let image_frames = crate::image_compose::active_image_sources_at(
-            &state.app.song_doc.song(),
+            state.app.song_doc.song(),
             playhead_beat,
             &state.app.transport.mod_scalars,
         );
@@ -1488,7 +1488,7 @@ impl Runner {
 
         // テキスト → owning track の bucket (合成画に焼き込んで track 効果を乗せる)。
         let text_frames = crate::text_compose::active_text_sources_at(
-            &state.app.song_doc.song(),
+            state.app.song_doc.song(),
             playhead_beat,
             &state.app.transport.mod_scalars,
         );
@@ -1505,7 +1505,7 @@ impl Runner {
             // 配置 transform は **どのトラックでも** Transform device から
             // 解決（立ち絵 group も通常トラックも統一）。device が無ければ None = identity 配置。
             let transform = crate::video_fx::resolve_track_transform(
-                &state.app.song_doc.song(),
+                state.app.song_doc.song(),
                 track,
                 playhead_beat,
                 &state.app.transport.mod_scalars,
@@ -1515,7 +1515,7 @@ impl Runner {
                 continue;
             }
             let fx = crate::video_fx::resolve_track_effects(
-                &state.app.song_doc.song(),
+                state.app.song_doc.song(),
                 track,
                 playhead_beat,
                 &state.app.transport.mod_scalars,
@@ -1533,14 +1533,14 @@ impl Runner {
         // がある曲は積分写像 (constant-bpm 線形だと export = TempoMap 積分と
         // 効果進行がズレる。 映像 source 時間の A4 と同じ扱い)。
         preview.fx_engine.set_time(common::tempo_map::song_beat_to_seconds(
-            &state.app.song_doc.song(),
+            state.app.song_doc.song(),
             playhead_beat,
         ) as f32);
         preview.set_track_composites(composites);
         // マスター映像チェーン（master_fx_chain の映像 device）を解決して渡す。
         // 空でなければ preview が全トラック合成画を master canvas 1 枚に集約してから適用する。
         preview.set_master_fx(crate::video_fx::resolve_master_effects(
-            &state.app.song_doc.song(),
+            state.app.song_doc.song(),
             playhead_beat,
             &state.app.transport.mod_scalars,
         ));

@@ -45,7 +45,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     });
 
     // SetSlotPlugin が plugin_host 行きに sent されているはず (安定 device id)。
-    let synth_dev = device_id_at(&app.song_doc.song(), inst_track_id, 0)
+    let synth_dev = device_id_at(app.song_doc.song(), inst_track_id, 0)
         .expect("picker append should allocate a device id");
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
@@ -134,7 +134,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         keep_open: false,
         open_gui: true,
     });
-    let bitcrush_dev = device_id_at(&app.song_doc.song(), group_id, 0)
+    let bitcrush_dev = device_id_at(app.song_doc.song(), group_id, 0)
         .expect("bitcrush append should allocate a device id");
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
@@ -155,7 +155,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         keep_open: false,
         open_gui: true,
     });
-    let delay_dev = device_id_at(&app.song_doc.song(), group_id, 1)
+    let delay_dev = device_id_at(app.song_doc.song(), group_id, 1)
         .expect("delay append should allocate a device id");
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
@@ -422,20 +422,22 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
         setup_loaded_chain(&mut app, &mut audio_rx, &mut plugin_rx);
 
     // Automate a param on bitcrush (currently device index 1).
-    app.song_doc.song().tracks[0].automation_lanes.push(AutomationLane {
-        id: 1,
-        target: AutomationTarget::PluginParam {
-            device_id: bitcrush_dev,
-            param_id: 42,
-            legacy_device_index: None,
-            legacy_slot: None,
-        },
-        default_value: 0.25,
-        enabled: true,
-        visible: true,
-        height_px: 60,
-        clips: Vec::new(),
-        next_clip_id: 1,
+    app.edit_song(|song| {
+        song.tracks[0].automation_lanes.push(AutomationLane {
+            id: 1,
+            target: AutomationTarget::PluginParam {
+                device_id: bitcrush_dev,
+                param_id: 42,
+                legacy_device_index: None,
+                legacy_slot: None,
+            },
+            default_value: 0.25,
+            enabled: true,
+            visible: true,
+            height_px: 60,
+            clips: Vec::new(),
+            next_clip_id: 1,
+        });
     });
 
     // Swap the two FX (delay before bitcrush): order [0,2,1].
@@ -475,16 +477,17 @@ fn inspector_chain_reorder_aborts_when_chain_not_fully_loaded() {
 
     // Inject a PHANTOM 4th device: present in the song (and the inspector chain)
     // but never reported loaded, mimicking a plugin whose load failed.
-    app.song_doc.song()
-        .tracks
-        .iter_mut()
-        .find(|t| t.id == track_id)
-        .unwrap()
-        .devices
-        .push(common::model::PluginInstance::new(
-            "test.delay".into(),
-            common::plugin_format::PluginFormat::Clap,
-        ));
+    app.edit_song(|song| {
+        song.tracks
+            .iter_mut()
+            .find(|t| t.id == track_id)
+            .unwrap()
+            .devices
+            .push(common::model::PluginInstance::new(
+                "test.delay".into(),
+                common::plugin_format::PluginFormat::Clap,
+            ));
+    });
     let before: Vec<String> = app.song_doc.song().tracks[0]
         .devices
         .iter()

@@ -256,6 +256,12 @@ impl SongDoc {
         !self.redo_stack.is_empty()
     }
 
+    /// 現在積まれている undo snapshot 数 (= 遡れる step 数)。 テストが undo
+    /// 履歴の深さを観測するための read-only accessor。
+    pub fn undo_depth(&self) -> usize {
+        self.undo_stack.len()
+    }
+
     fn after_history_jump(&mut self) {
         // undo/redo も epoch を bump する (frame flush が LoadSong を再送する)。
         // saved_epoch とは一致しなくなるので dirty になる (epoch 方式では
@@ -320,10 +326,10 @@ impl SongDoc {
     /// 以内に連続する間は同じ gesture id を返す (= 1 burst = 1 undo step)。
     pub fn stream_scope(&mut self, key: StreamGesture) -> EditScope {
         let now = Instant::now();
-        let fresh = match self.stream_gestures.get(&key) {
-            Some((_, last)) if now.duration_since(*last) < STREAM_GESTURE_GAP => false,
-            _ => true,
-        };
+        let fresh = !matches!(
+            self.stream_gestures.get(&key),
+            Some((_, last)) if now.duration_since(*last) < STREAM_GESTURE_GAP
+        );
         if fresh {
             let id = self.alloc_gesture();
             self.stream_gestures.insert(key, (id, now));

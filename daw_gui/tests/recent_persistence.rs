@@ -59,7 +59,7 @@ fn build_app(app_dirs: Option<AppDirs>) -> (AppData, UnboundedReceiver<PluginCom
 fn save_fresh_project(app: &mut AppData, proj_dir: &std::path::Path) -> std::path::PathBuf {
     let proj_path = proj_dir.join("proj.daw");
     app.song_doc.file_path = Some(proj_path.clone());
-    app.song_doc.is_dirty() = true;
+    app.song_doc.normalize(|_| {});
     app.request_close();
     app.handle_event(AppEvent::DirtyGuardSave);
     proj_path

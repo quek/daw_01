@@ -2185,7 +2185,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // v29: lane target は安定 device_id。 0 (未解決 — panel が開いている限り
         // 起きないはず) は lane に一致しない sentinel なので表示 fallback として無害。
         let device_id =
-            crate::app::device_id_at(&app.song_doc.song(), track_id, device_index).unwrap_or(0);
+            crate::app::device_id_at(app.song_doc.song(), track_id, device_index).unwrap_or(0);
         for (i, param) in view.def.params.iter().enumerate() {
             let value = f64::from(view.values[i]);
             let (min, max) = param.kind.range();
@@ -2260,7 +2260,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let track_id = view.track_id;
         // v29: lane target は安定 device_id (上の video FX パネルと同じ fallback)。
         let device_id =
-            crate::app::device_id_at(&app.song_doc.song(), track_id, device_index).unwrap_or(0);
+            crate::app::device_id_at(app.song_doc.song(), track_id, device_index).unwrap_or(0);
         ui.label_at("inspector_pp_label", &view.plugin_name, area.x + pad, y, 12.0, TEXT);
         y += 18.0;
 

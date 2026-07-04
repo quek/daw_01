@@ -160,7 +160,7 @@ impl ScriptHost {
     /// (loadSongFile 経路) → `last_loaded_song` (loadSongFromObject 経路) の
     /// 順で解決する。
     fn resolve_device_id(&self, track_id: u32, index: u32) -> Option<u64> {
-        crate::app::device_id_at(&self.app.song_doc.song(), track_id, index).or_else(|| {
+        crate::app::device_id_at(self.app.song_doc.song(), track_id, index).or_else(|| {
             self.last_loaded_song
                 .as_ref()
                 .and_then(|s| crate::app::device_id_at(s, track_id, index))
@@ -169,7 +169,7 @@ impl ScriptHost {
 
     /// 逆方向: device id → `(track_id, device_index)`。
     fn resolve_device_coords(&self, device_id: u64) -> Option<(u32, u32)> {
-        crate::app::find_device_by_id(&self.app.song_doc.song(), device_id).or_else(|| {
+        crate::app::find_device_by_id(self.app.song_doc.song(), device_id).or_else(|| {
             self.last_loaded_song
                 .as_ref()
                 .and_then(|s| crate::app::find_device_by_id(s, device_id))

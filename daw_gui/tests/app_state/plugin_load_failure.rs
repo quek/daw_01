@@ -47,7 +47,7 @@ fn load_failure_releases_single_pending_and_flushes_play() {
     });
 
     // 単一デバイスチェーン: picker は末尾 append、 空チェーンなので index 0。
-    let synth_dev = device_id_at(&app.song_doc.song(), track_id, 0).expect("device id allocated");
+    let synth_dev = device_id_at(app.song_doc.song(), track_id, 0).expect("device id allocated");
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
@@ -137,8 +137,8 @@ fn load_failure_keeps_other_pending_unaffected() {
         open_gui: true,
     });
     let _ = drain(&mut plugin_rx);
-    let synth_dev = device_id_at(&app.song_doc.song(), track_id, 0).expect("synth device id");
-    let fx_dev = device_id_at(&app.song_doc.song(), track_id, 1).expect("fx device id");
+    let synth_dev = device_id_at(app.song_doc.song(), track_id, 0).expect("synth device id");
+    let fx_dev = device_id_at(app.song_doc.song(), track_id, 1).expect("fx device id");
 
     assert_eq!(
         app.ipc.pending_plugin_loads.len(),
@@ -208,7 +208,7 @@ fn stale_generation_failure_is_ignored() {
         open_gui: true,
     });
     let _ = drain(&mut plugin_rx);
-    let synth_dev = device_id_at(&app.song_doc.song(), track_id, 0).expect("device id");
+    let synth_dev = device_id_at(app.song_doc.song(), track_id, 0).expect("device id");
     let generation = pending_generation(&app, synth_dev);
 
     // 古い世代 (generation - 1 相当 = 別の値) の失敗が遅れて届いた fake。
