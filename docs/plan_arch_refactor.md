@@ -23,16 +23,17 @@ branch = `feature/arch-refactor`。各段の green を WIP commit でチェッ�
 - S4b (§8) — arrangement を daw_gui/src/widgets/arrangement/ へ移設、mirror 型/EditRequest 58/
   make_edit 736 全廃、**二相描画マジックインセットバグ修正** (単一 SSoT clip_content_inset_top)、
   8 モジュール ≤3000 に分割、テスト AppData-driven 化
+- S4c (§8) — piano_roll を daw_gui/src/widgets/piano_roll/ へ移設 (Phase A 物理移設 `3538065` +
+  Phase B-E 特化 `8afa19f`)、PianoRollEditRequest 12 variant/make_edit/notes_generation 全廃、
+  レイアウト二重同期 (grid_rect 定数再計算) を単一 SSoT (view_build の PrContent.grid) に、
+  piano_roll_view.rs 878 行を widget へ吸収削除、5 モジュール ≤3000 分割、テスト AppData-driven 化
+  (pr_widget 13)。track_inspector.rs 3640→mod.rs 2769 + modulation_rack.rs 890 に分割 (`e57aea4`)
 - S6 DESIGN.md 現行化、S7 ワークフロー (CLAUDE.md 不変条件 + make arch-lint + guards 7 則 +
   /arch-review skill + implement/review skill 更新)
 
-**最新 green checkpoint**: commit `0ff0328` (S4b Phase B-E)。
+**最新 green checkpoint**: commit `e57aea4` (S4c 完了 = piano_roll 移設 + track_inspector 分割)。
 
 **残タスク (逐次、各段 green を WIP commit)**:
-- **S4c**: piano_roll を daw_gui へ移設 (S4b と同型: `PianoRollEditRequest` 翻訳層除去 +
-  model 直結 + **二相描画インセットを arrangement と同じく単一 SSoT に** + `notes_generation`
-  削除 + god-file 分割 ≤3000 + テスト AppData-driven 化)。track_inspector.rs 3640 行も
-  この文脈の view 抽出で ≤3000 に。
 - **S4d**: renderer の意味色 (SOLO/PLAYHEAD/RECORD/CLIP_DEFAULT) を ui-core/daw_gui theme へ、
   FontSystem 二重ロード解消、`snap.rs`/`time.rs`/`split_into_morae` を common へ (S5 と調整)。
 - **S5** (§9,10): common 縮退 (video_fx/app_config/window_state/recent/scale/voicevox_engine →
