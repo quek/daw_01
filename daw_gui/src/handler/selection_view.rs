@@ -806,7 +806,7 @@ impl AppData {
     /// ノート無しの clip は clip 全長が見える初期 zoom にフォールバック。
     /// `last_pianoroll_grid_size` が未測定 (= 0) の場合は `pending_pianoroll_fit`
     /// を立てて return → piano_roll が初めて描画され grid_size が確定したフレームの
-    /// Edit 内で再実行される (初回 fit 喪失バグの修正、 [piano_roll_view::draw] 参照)。
+    /// Edit 内で再実行される (初回 fit 喪失バグの修正、 [`crate::widgets::piano_roll::piano_roll`] 参照)。
     pub(crate) fn fit_piano_roll_to_clip(&mut self) {
         // 表示中の **全 MIDI クリップ** の note bbox を union して zoom/scroll/pitch を
         // 算出する。複数表示は song-absolute (note.start + clip.start_beat) で集計し共有 transient

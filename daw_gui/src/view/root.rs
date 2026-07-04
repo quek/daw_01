@@ -1215,7 +1215,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // (piano_roll.rs) に escape が届かず、 代わりに下の選択解除 branch が走って編集中
     // clip が deselect → MIDI エディタが空表示になってしまう。 編集中はここで消費せず
     // widget に委ねる (widget が `take_shortcut("escape")` で歌詞編集を cancel する)。
-    // 条件は piano_roll_view が実際に走る状況 (Piano Roll タブ + Audio Editor 非表示) に
+    // 条件は piano_roll widget が実際に走る状況 (Piano Roll タブ + Audio Editor 非表示) に
     // 一致させる (`app.ui_ephemeral.piano_roll_lyric_editing` 単独だと stale-true で誤委譲しうる)。
     let pianoroll_lyric_editing =
         app.ui_prefs.bottom_panel == 1 && app.ui_ephemeral.audio_editor_clip.is_none() && app.ui_ephemeral.piano_roll_lyric_editing;

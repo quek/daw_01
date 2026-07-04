@@ -52,7 +52,7 @@ pub struct UiEphemeral {
     /// strip は solo を持たないので None 扱い。
     pub mixer_hovered_track: Option<u32>,
     /// ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
-    /// ノート paste の配置位置に使う。`piano_roll_view::draw` が毎フレーム更新、
+    /// ノート paste の配置位置に使う。`piano_roll` widget が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。
     pub pianoroll_hover_beat: Option<f64>,
     /// ピアノロール grid 上のポインタ拍を **song-absolute かつ snap なし**
@@ -62,7 +62,7 @@ pub struct UiEphemeral {
     pub pianoroll_hover_beat_song_raw: Option<f64>,
     /// ピアノロール grid 上のポインタ直下の note index (= clip 内 notes Vec の
     /// index、`selected_notes` と同空間)。`q` キーで「選択が無ければカーソル直下 note を
-    /// mute」する対象解決に使う。`piano_roll_view::draw` が `note_hit` で毎フレーム更新、
+    /// mute」する対象解決に使う。`piano_roll` widget が `note_hit` で毎フレーム更新、
     /// grid 外 / note 外 / 非 piano-roll は `None`。
     pub pianoroll_hover_note: Option<u32>,
     /// view 層が OS clipboard へ書く保留テキスト。トラック copy/cut は
@@ -103,7 +103,7 @@ pub struct UiEphemeral {
     pub arrange_default_scrub_active: Option<common::model::AutomationLaneKey>,
     /// piano_roll widget が歌詞 inline 編集 (gui_01 #017、 note 上の L キー編集) の
     /// text_input overlay を出している間 `true`。 widget 内部状態 (`PianoRollState`) の
-    /// session-only ミラーで、 `piano_roll_view::draw` が毎フレーム `resp.lyric_editing`
+    /// session-only ミラーで、 `piano_roll` widget が毎フレーム `resp.lyric_editing`
     /// から更新する (project save には含めない)。
     ///
     /// 用途は root.rs の Esc dispatch との調停。 `dispatch_shortcuts` は

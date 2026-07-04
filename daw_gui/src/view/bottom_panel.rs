@@ -10,7 +10,7 @@ use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
-use crate::view::{audio_editor, mixer_strips, piano_roll_view};
+use crate::view::{audio_editor, mixer_strips};
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let prev_tab = app.ui_prefs.bottom_panel as usize;
@@ -32,7 +32,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             } else {
                 // 旧 lyric panel は piano_roll widget の L キー編集 (gui_01 #017)
                 // で代替されたので削除。 Piano Roll タブの全幅を使う。
-                piano_roll_view::draw(app, ui, pane);
+                let _ = crate::widgets::piano_roll::piano_roll(app, ui, pane);
             }
         });
     });

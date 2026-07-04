@@ -79,7 +79,7 @@ pub enum AppEvent {
     Redo,
     QuantizeSelectedNotes(u8),
     /// 鍵盤レーン click のピッチプレビュー (gui_01 #055,
-    /// `docs/plan_pianoroll_keyboard_preview.md`)。 piano_roll_view が毎フレーム
+    /// `docs/plan_pianoroll_keyboard_preview.md`)。 piano_roll widget が毎フレーム
     /// `resp.keyboard_active_pitch` を `preview_note` の pitch と比較し、 変化した
     /// ときだけ発火する。 `track_idx` は描画中 clip の track (Vec index)、 `pitch`
     /// は今フレームの押下 pitch (`None` = release / 鍵盤外)。 handler が前回
