@@ -2337,8 +2337,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.ui_ephemeral.inspector_scrub_active = None;
                     app.handle_event(AppEvent::EndInspectorScrub);
-                    // 確定値を host へ push (drag 終端なので is_dragging=false → 実 push)。
-                    app.sync_song_to_plugin_host();
+                    // 確定値の host push は不要: scrub 中の edit_song が bump した epoch を
+                    // runner の frame flush が per-frame で LoadSong する (sync 一本化)。
                 }));
             }
             // 変調 depth ドラッグの falling edge で host 再同期。

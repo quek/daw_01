@@ -756,7 +756,9 @@ fn daw_load_song_file(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
         // the song + project_dir + LoadSong to the audio engine.
         h.app.restore_plugin_from_song(&song);
         h.app.song_doc.replace_song(song.clone());
-        h.app.sync_song_to_plugin_host();
+        // headless (frame loop 無し) なので明示的に flush する。 replace_song が epoch を
+        // bump しているので flush_song_sync は必ず choreography を実行する。
+        h.app.flush_song_sync();
         h.last_loaded_song = Some(song);
     });
     Ok(JsValue::undefined())
@@ -904,7 +906,8 @@ fn daw_app_load_song_json(
     song.ensure_audio_source_ids();
     with_host(|host| {
         host.app.song_doc.replace_song(song);
-        host.app.sync_song_to_plugin_host();
+        // headless: frame flush が無いので明示 flush (replace_song の epoch bump を拾う)。
+        host.app.flush_song_sync();
     });
     Ok(JsValue::undefined())
 }

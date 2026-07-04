@@ -64,6 +64,10 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         "instrument device_id should register in track_plugin_ids"
     );
 
+    // 子プロセス sync は pull 型 (docs/plan_arch_refactor.md §7.5): 実機では runner が
+    // frame 末に flush_song_sync を呼ぶ。 headless test には frame loop が無いので、
+    // 編集後に手で 1 回呼んで epoch 差分の LoadSong を送る。
+    app.flush_song_sync();
     // add path の audio 再 sync (LoadSong) を drain (Step 2 の assertion を汚さない)。
     let audio_after_add = drain(&mut audio_rx);
     assert!(
@@ -227,6 +231,9 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         track_ids: vec![group_id],
     });
     app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    // frame flush: ClosePluginShmem は ungroup handler が UAF 防止で直送済。 schedule
+    // 再構築の LoadSong はここで送られ、 close をブラケットする (load_before/after)。
+    app.flush_song_sync();
 
     let audio_msgs = drain(&mut audio_rx);
     let plugin_msgs = drain(&mut plugin_rx);
@@ -394,7 +401,9 @@ fn inspector_chain_reorder_rekeys_both_children() {
     );
 
     // (c) v29: children には LoadSong だけが飛ぶ (audio schedule は Song から
-    // 再 compile、 plugin_host は順序を持たない)。
+    // 再 compile、 plugin_host は順序を持たない)。 pull 型 sync なので frame flush を
+    // 明示的に回して reorder 編集の LoadSong を送る (headless には frame loop 無し)。
+    app.flush_song_sync();
     let plugin_msgs = drain(&mut plugin_rx);
     let audio_msgs = drain(&mut audio_rx);
     assert!(

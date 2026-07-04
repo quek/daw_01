@@ -180,11 +180,14 @@ pub struct IpcState {
     // -------- Background workers --------
     pub rescan_result: Arc<Mutex<Option<PluginDatabase>>>,
     pub is_rescanning: bool,
-    /// H2 (r.md #8): MIDI-CC → plugin param 等、 1 frame に多数届き得る realtime
-    /// edit の plugin-host 再 sync を **1 frame 1 回に coalesce** するフラグ。 handler
-    /// が立て、 runner が frame ごとに `flush_pending_host_sync` で消費する
-    /// (毎 CC の full LoadSong flood = stutter/dropout を防ぐ)。
-    pub pending_host_sync: bool,
+    /// 子プロセス sync (pull 型、 docs/plan_arch_refactor.md §7.5) の世代キー。
+    /// [`AppData::flush_song_sync`] が最後に 6 段 choreography を実行したときの
+    /// `SongDoc::edit_epoch()`。 runner の frame flush が `edit_epoch !=
+    /// last_synced_epoch` を見て 1 frame 1 回だけ LoadSong を送り、 scrub / MIDI-CC
+    /// 等の連続編集を構造的に coalesce する (旧 `pending_host_sync` flag +
+    /// `flush_pending_host_sync` 経路の置換)。 初期値 0 (SongDoc の epoch は 1 始まり
+    /// なので初回 flush が必ず走る)。 session-only。
+    pub last_synced_epoch: u64,
 
     /// 背景スレッド (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX
     /// 合成 / plugin DB rescan) からメインスレッドへ `AppEvent` を送るための

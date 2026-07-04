@@ -300,7 +300,7 @@ pub struct UiEphemeral {
     pub inspector_scrub_active: Option<InspectorScrubField>,
     /// docs/plan_modulation.md §3: true while an envelope-follower attack /
     /// release scrub is being dragged. The scrub mutates the value + marks
-    /// dirty each frame but defers the (recompiling) `sync_song_to_plugin_host`
+    /// dirty each frame but defers the (recompiling) `flush_song_sync`
     /// to the drag-end edge, avoiding a per-frame LoadSong storm.
     pub mod_follower_scrub_active: bool,
     /// docs/plan_modulation_routing_redesign.md §6: the `ModSource` currently
@@ -367,7 +367,6 @@ pub struct UiEphemeral {
     /// 編集が別 project に誤適用される / clean 判定が陳腐化する。 queue 完了時に
     /// `recompute_dirty` してから **再評価** する (= clean なら実行、 dirty なら確認)。
     pub guard_pending_action: Option<DirtyGuardAction>,
-    pub is_dragging: bool,
 
     /// Windows: main window の `HWND` (`with_owner_window` と同じ isize 表現)。
     /// runner が window 生成直後にセットする。 native file save dialog を

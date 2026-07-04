@@ -280,6 +280,34 @@ slot 上限を超えて計測が silently drop する問題の根治。
 - examples/{arrangement, piano_roll, daw_prototype} は移設に伴い**削除** (moved widget の
   dev harness だったもの。以後は daw_gui 本体が harness)。他 examples は維持。
 
+### S4 実行分解 (widget 移設の順序)
+
+surface 実測 (2026-07-04): `arrangement.rs` 15,870 行 (mirror 型 + `ArrangementEditRequest`
+58 variant + 4,600 行の `Ui::arrangement()` + in-file テスト ~5,663 行)、`piano_roll.rs`
+8,099 行 (`PianoRollEditRequest`)。`daw_gui/view/arrangement_view.rs` に mirror 構築
+(L198〜) + `make_edit` 736 行 (L1506) + `widget_to_model_*` 変換。lib undo = `edit.rs`
+(244) + `history.rs` (306)、`Edit::Undoable` emit は fader/knob/scrubable_number/
+drag_rect/arrangement/ui.rs/examples/tests — **daw_gui は emit していない** (= 未 replay
+の死荷重、確定)。
+
+runner.rs が S3b と S4 の共有チョークポイント (lib undo の `with_history_capacity`
+呼び出し) なので S3b 完了後に着手。ファイル単位の逐次サブタスク:
+
+- **S4a: lib undo 撤去 + ui core stateful 公開** — `edit.rs` の `Undoable`/`with_inverse`/
+  `with_shared`、`history.rs` 全体、`UiHost::with_history_capacity`/`request_undo` を削除。
+  fader/knob/scrubable_number/drag_rect を `Edit::Mutate` emit に変更 (`Edit<M>` 戻り型は
+  不変なので daw_gui 呼び出し側は無影響のはず)。`Ui::widget_state` 相当を `stateful` として
+  pub 化。examples/ui tests 追従。runner.rs の history 配線削除。
+- **S4b: arrangement 移設** — `daw_gui/src/widgets/arrangement/` へ移し `common::model` 直結 +
+  `edit_song` 経由の `Edit<AppData>` 直発行。mirror 型 / EditRequest 58 / make_edit 736 /
+  変換 / 二重 clone / rect 輸出上書き描画を全廃。4,600 行関数を interaction 単位
+  (clip drag / section / automation / reorder / header / ruler / draw) に分解。in-file
+  テストは `daw_gui/tests/` へ移し common::model ベースに。
+- **S4c: piano_roll 移設** — 同様。`notes_generation` 削除 (content-hash 一本化)。
+- **S4d: renderer/core 衛生** — 意味色 (SOLO/PLAYHEAD/RECORD/CLIP_DEFAULT) を renderer から
+  ui-core / daw_gui theme へ、FontSystem 二重ロード解消、`snap.rs`/`time.rs`/
+  `split_into_morae` を common へ (S5 と調整)。examples/{arrangement,piano_roll,daw_prototype} 削除。
+
 ## 9. common 縮退 [B6]
 
 - daw_gui へ移動: video_fx.rs / app_config.rs / window_state.rs / recent.rs / scale.rs /

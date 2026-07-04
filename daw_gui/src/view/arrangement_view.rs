@@ -1949,7 +1949,8 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                         song.tracks.insert(insert_at + offset, t);
                     }
                 });
-                app.sync_song_to_plugin_host();
+                // host への LoadSong は edit_song の epoch bump を runner の frame flush
+                // が送る (sync 一本化、 docs/plan_arch_refactor.md §7.5)。
             })
         }
         ArrangementEditRequest::DoubleClickClip(key) => {

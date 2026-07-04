@@ -955,9 +955,6 @@ impl Runner {
 
         let screen = state.renderer.size();
         state.scene.clear();
-        // H2 (r.md #8): coalesce した plugin-host 再 sync を frame 1 回 flush する
-        // (MIDI-CC 等が 1 frame に多数届いても full LoadSong は 1 回に抑える)。
-        state.app.flush_pending_host_sync();
         let input = state.input.take_input();
 
         state.ui.frame(
@@ -969,6 +966,13 @@ impl Runner {
                 crate::view::root::build_root(app, ui, screen);
             },
         );
+
+        // 子プロセス sync の pull 一本化 (docs/plan_arch_refactor.md §7.5): この frame の
+        // user_event dispatch と ui.frame 内の view Edit がすべて適用された後・render の
+        // 直前に 1 回だけ flush する。 flush_song_sync は epoch 差 (edit_epoch !=
+        // last_synced_epoch) を見て変化時のみ LoadSong を送るので、 1 frame 内の複数編集
+        // (scrub / MIDI-CC flood 等) は 1 回の LoadSong に構造的に coalesce される。
+        state.app.flush_song_sync();
 
         // close 確認モーダルの「保存して終了」(同期保存) /「保存せず終了」 は
         // この frame の `ui.frame` 内で Edit が適用され `should_quit` が立つ。

@@ -118,12 +118,12 @@ pub(crate) fn build_mod(
 }
 
 /// 自コントロールの modulation depth ドラッグの立ち上がり / 立ち下がり edge を
-/// 検知し、終了時に schedule を再同期する (`SetModRoutingDepth` は dirty mark
-/// のみで、engine が新 depth を読むには `sync_song_to_plugin_host` = LoadSong が
-/// 要る)。`app.ui_ephemeral.mod_depth_scrub_active` は **(track_id, target) を key** にするので、
-/// 同時表示される多数の modulatable コントロール (mixer は同一 `Pan` target を全
-/// strip に描く) が共有 flag を奪い合って毎フレーム偽の recompile を撃つことがない
-/// (各コントロールは自分のドラッグ edge にだけ反応)。
+/// 追跡する (`app.ui_ephemeral.mod_depth_scrub_active` を **(track_id, target) key**
+/// で保持)。 かつては drag-end で `sync_song_to_plugin_host` を撃って engine に新
+/// depth を届けていたが、 sync 一本化 (docs/plan_arch_refactor.md §7.5) で
+/// `SetModRoutingDepth` の edit_song が bump した epoch を runner の frame flush
+/// (`flush_song_sync`) が 1 frame 1 回で LoadSong する構造になったため、 ここでの
+/// 明示 resync は不要になった (drag 中も per-frame で構造的に coalesce される)。
 pub(crate) fn push_mod_drag_resync(
     ui: &mut Ui<'_, AppData>,
     app: &AppData,
@@ -144,7 +144,6 @@ pub(crate) fn push_mod_drag_resync(
             app.ui_ephemeral.mod_depth_scrub_active = Some(key);
         } else {
             app.ui_ephemeral.mod_depth_scrub_active = None;
-            app.sync_song_to_plugin_host();
         }
     }));
 }
