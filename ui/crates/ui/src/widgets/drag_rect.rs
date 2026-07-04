@@ -52,11 +52,11 @@ impl DragRect {
 
 /// `take_drag_rect_in_rect` の内部 state (frame 越しに保持)。
 #[derive(Debug, Default)]
-pub(crate) struct DragRectState {
+pub struct DragRectState {
     /// drag 開始位置 (None = drag していない)。
-    pub(crate) drag_start: Option<(f32, f32)>,
+    pub drag_start: Option<(f32, f32)>,
     /// drag 開始時の修飾キー (drag 中は固定で覚えておく)。
-    pub(crate) start_modifiers: Modifiers,
+    pub start_modifiers: Modifiers,
 }
 
 #[cfg(test)]

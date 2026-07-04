@@ -6,12 +6,14 @@
 
 use std::sync::Arc;
 
-use daw_ui_core::{
+use crate::widgets::arrangement::{
     ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
     ArrangementClip, ArrangementClipAudioEdit, ArrangementCurveKind, ArrangementEditRequest,
-    ArrangementStyle, ArrangementTrack, ArrangementView, AutomationClipKey,
-    AutomationLaneKey, ChannelLayout, ClipKey, ColorPickerStyle, Edit, FadeCurve as WidgetFadeCurve,
-    FadeEdge, MeterScale, SampleSlices, ScrubableNumberStyle,
+    ArrangementStyle, ArrangementTrack, ArrangementView, AutomationClipKey, AutomationLaneKey,
+    ClipKey, FadeCurve as WidgetFadeCurve, FadeEdge,
+};
+use daw_ui_core::{
+    ChannelLayout, ColorPickerStyle, Edit, MeterScale, SampleSlices, ScrubableNumberStyle,
     ToggleButtonStyle, Ui, WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView,
 };
 use daw_ui_renderer::{theme, Color, Rect, RectCommand};
@@ -215,9 +217,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         | Some(common::model::ClipContent::Text(_))
                 )
             }) {
-                daw_ui_core::widgets::arrangement::TrackKind::Video
+                crate::widgets::arrangement::TrackKind::Video
             } else {
-                daw_ui_core::widgets::arrangement::TrackKind::Audio
+                crate::widgets::arrangement::TrackKind::Audio
             },
             name: labels
                 .track_names
@@ -495,10 +497,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // gui_01 #028 (M14 Phase 63n-3): 選択中の automation clip を widget 型
     // にそのまま渡す (daw_01 model と field 名一致なので 1:1 cast)。
-    let selected_automation_clips_widget: Vec<daw_ui_core::AutomationClipKey> = app
+    let selected_automation_clips_widget: Vec<crate::widgets::arrangement::AutomationClipKey> = app
         .selection.selected_automation_clips
         .iter()
-        .map(|k| daw_ui_core::AutomationClipKey {
+        .map(|k| crate::widgets::arrangement::AutomationClipKey {
             track: k.track,
             lane: k.lane,
             clip: k.clip,
@@ -509,11 +511,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (`AutomationPointKey { clip: AutomationClipKey, point_idx }`) に変換。
     // daw_01 内部は flat な `AutomationPointKeyRef { track_id, lane_id,
     // clip_id, point_idx }`、 widget は構造化 key を持つので 1:1 写像。
-    let selected_automation_points_widget: Vec<daw_ui_core::AutomationPointKey> = app
+    let selected_automation_points_widget: Vec<crate::widgets::arrangement::AutomationPointKey> = app
         .selection.selected_automation_points
         .iter()
-        .map(|k| daw_ui_core::AutomationPointKey {
-            clip: daw_ui_core::AutomationClipKey {
+        .map(|k| crate::widgets::arrangement::AutomationPointKey {
+            clip: crate::widgets::arrangement::AutomationClipKey {
                 track: k.track_id,
                 lane: k.lane_id,
                 clip: k.clip_id,
@@ -538,7 +540,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &|tgt| app.plugin_param_range(common::model::MASTER_TRACK_ID, tgt),
         &|tgt| app.plugin_param_name(common::model::MASTER_TRACK_ID, tgt),
     );
-    let master_row = daw_ui_core::ArrangementMasterRow {
+    let master_row = crate::widgets::arrangement::ArrangementMasterRow {
         automation_lanes_collapsed: !app.ui_prefs.master_row_automation_expanded,
         automation_lanes: master_row_lanes,
         height_px_override: None,
@@ -547,11 +549,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Song.sections を gui_01 の SectionView へ mirror (name は Arc<str> 化)。
     // 描画は `ArrangementView.arranger_lane_h > 0` のときのみ (現状 0.0 = gui_01 の
     // lane 描画配線待ち、 data は渡しておく)。
-    let sections_view: Vec<daw_ui_core::SectionView> = app
+    let sections_view: Vec<crate::widgets::arrangement::SectionView> = app
         .song_doc.song()
         .sections
         .iter()
-        .map(|s| daw_ui_core::SectionView {
+        .map(|s| crate::widgets::arrangement::SectionView {
             id: s.id,
             name: labels
                 .section_names
@@ -565,7 +567,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         })
         .collect();
 
-    let resp = ui.arrangement(
+    let resp = crate::widgets::arrangement::arrangement(
+        ui,
         "arrangement",
         area,
         &tracks,
@@ -1836,7 +1839,7 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
             let clip_id = point.clip.clip;
             let point_idx = point.point_idx;
             match kind {
-                daw_ui_core::SetAutomationCurveParamKind::BezierTension => {
+                crate::widgets::arrangement::SetAutomationCurveParamKind::BezierTension => {
                     app.handle_event(AppEvent::SetAutomationCurveBezierTension {
                         track_id,
                         lane_id,
@@ -1846,7 +1849,7 @@ fn make_edit(req: ArrangementEditRequest) -> Edit<AppData> {
                         next: next_value,
                     });
                 }
-                daw_ui_core::SetAutomationCurveParamKind::ExponentialBend => {
+                crate::widgets::arrangement::SetAutomationCurveParamKind::ExponentialBend => {
                     app.handle_event(AppEvent::SetAutomationCurveExponentialBend {
                         track_id,
                         lane_id,
@@ -2705,7 +2708,7 @@ fn widget_to_model_lane_key(k: AutomationLaneKey) -> common::model::AutomationLa
 /// daw_01 内部の `MoveAutomationClipEntry` に変換。 field 名はほぼ
 /// 同形なので逐一 copy するだけ。
 fn widget_to_model_clip_delta(
-    d: daw_ui_core::MoveAutomationClipDelta,
+    d: crate::widgets::arrangement::MoveAutomationClipDelta,
 ) -> crate::app::MoveAutomationClipEntry {
     crate::app::MoveAutomationClipEntry {
         from: widget_to_model_clip_key(d.from),

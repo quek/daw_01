@@ -10,10 +10,8 @@
 //! `automation_point_edit.rs` と同 pattern で `UiHost::frame` を直接呼び `PointerFrame.scroll_delta`
 //! を流し、 発行された `ArrangementEditRequest` を観測する。
 
-use daw_ui_core::{
-    ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView, Edit, FrameInput,
-    PointerFrame, SnapConfig, TrackKind, UiHost,
-};
+use daw_gui::widgets::arrangement::{arrangement, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView, TrackKind};
+use daw_ui_core::{Edit, FrameInput, PointerFrame, SnapConfig, UiHost};
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Rect, Scene};
 use std::sync::Arc;
@@ -93,7 +91,7 @@ fn run_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: FrameInput) {
     let view = make_view();
     let style = ArrangementStyle::default();
     host.frame(m, &mut scene, screen, input, |model, ui| {
-        ui.arrangement(
+        arrangement(ui, 
             "arr",
             WIDGET_RECT,
             &model.tracks,

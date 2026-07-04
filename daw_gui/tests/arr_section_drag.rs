@@ -12,10 +12,8 @@
 
 use std::sync::Arc;
 
-use daw_ui_core::{
-    ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView, Edit, FrameInput,
-    PointerFrame, SectionView, SelectModifier, SnapConfig, SnapMode, TrackKind, UiHost,
-};
+use daw_gui::widgets::arrangement::{arrangement, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView, SectionView, SelectModifier, TrackKind};
+use daw_ui_core::{Edit, FrameInput, PointerFrame, SnapConfig, SnapMode, UiHost};
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Rect, Scene};
 
@@ -136,7 +134,7 @@ fn sec_frame(host: &mut UiHost<SecModel>, m: &mut SecModel, input: FrameInput) {
     let tracks = vec![track()];
     host.frame(m, &mut scene, screen, input, |model, ui| {
         let sections = model.sections.clone();
-        let _ = ui.arrangement(
+        let _ = arrangement(ui, 
             "arr",
             WIDGET_RECT,
             &tracks,

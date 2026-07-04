@@ -8,14 +8,8 @@
 
 use std::sync::Arc;
 
-use daw_ui_core::{
-    ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
-    ArrangementClip, ArrangementCurveKind, ArrangementEditRequest, ArrangementStyle,
-    ArrangementTrack, ArrangementView, AutomationClipKey, AutomationLaneKey, AutomationPointKey,
-    Edit, FrameInput, MoveAutomationPointDelta, PointerFrame, SetAutomationCurveParamKind,
-    SnapConfig, TrackKind, UiHost, automation_lane_header_layout, automation_point_at,
-    visible_track_row_tops,
-};
+use daw_gui::widgets::arrangement::{arrangement, ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint, ArrangementClip, ArrangementCurveKind, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView, AutomationClipKey, AutomationLaneKey, AutomationPointKey, MoveAutomationPointDelta, SetAutomationCurveParamKind, TrackKind, automation_lane_header_layout, automation_point_at, visible_track_row_tops};
+use daw_ui_core::{Edit, FrameInput, PointerFrame, SnapConfig, UiHost};
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Color, Rect, Scene};
 
@@ -207,7 +201,7 @@ fn run_arrangement_frame(host: &mut UiHost<ObsModel>, m: &mut ObsModel, input: F
     let view = make_view();
     let style = ArrangementStyle::default();
     host.frame(m, &mut scene, screen, input, |model, ui| {
-        let resp = ui.arrangement(
+        let resp = arrangement(ui, 
             "arr",
             WIDGET_RECT,
             &model.tracks,

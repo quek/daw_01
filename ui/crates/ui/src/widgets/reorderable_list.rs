@@ -41,7 +41,63 @@ use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::ui::Ui;
-use crate::widgets::arrangement::{apply_reorder, compute_reorder_target_index};
+
+/// anchor を抜き取って target に挿入した新順 `Vec<T>` を返す。`anchor_index >= items.len()`
+/// または `target_index > items.len()-1` (after remove) でも安全に clamp。
+///
+/// `<T: Clone>` で generic。`u32` 用途 (track_id 列) でも `usize` 用途 (`reorderable_list` の
+/// 元 index 列) でも単相化で動く。arrangement / reorderable_list 双方が使う純 Model 非依存ロジック
+/// (旧 arrangement.rs 所有だったが S4b で arrangement が daw_gui に移設されたため、共有元として
+/// 汎用 reorder widget 側に移動)。
+#[must_use]
+pub fn apply_reorder<T: Clone>(items: &[T], anchor_index: usize, target_index: usize) -> Vec<T> {
+    if items.is_empty() || anchor_index >= items.len() {
+        return items.to_vec();
+    }
+    let mut v: Vec<T> = items.to_vec();
+    let it = v.remove(anchor_index);
+    let insert_at = target_index.min(v.len());
+    v.insert(insert_at, it);
+    v
+}
+
+/// 縦リストの reorder drop 先 index を `mouse_y` から計算する。row 中央線 (0.5) で前後判定し、
+/// anchor 抜き取り semantics (`Vec::remove(anchor)` → `Vec::insert(target-1)`) に合わせて 1 詰める。
+/// `apply_reorder` と対で使う (arrangement / reorderable_list 共有)。
+#[must_use]
+pub fn compute_reorder_target_index(
+    anchor_index: usize,
+    mouse_y: f32,
+    header_top: f32,
+    track_top: f32,
+    row_h: f32,
+    n_tracks: usize,
+) -> usize {
+    if n_tracks == 0 || row_h <= 0.0 {
+        return 0;
+    }
+    let local = mouse_y - header_top + track_top;
+    if local <= 0.0 {
+        return 0;
+    }
+    // local / row_h を「row 内 fractional 位置」付きで取り、中央 (0.5) より上下で挿入位置を判定。
+    let raw = local / row_h;
+    let idx = raw as usize;
+    let frac = raw - raw.floor();
+    // 中央線より下 → 次の row の前に挿入
+    let target_unbounded = if frac >= 0.5 { idx + 1 } else { idx };
+    let target_u = target_unbounded.min(n_tracks);
+    // anchor 抜き取り後の semantics: anchor 自身またはその直後 (= anchor_index, anchor_index+1) は no-op。
+    if target_u == anchor_index || target_u == anchor_index + 1 {
+        return anchor_index;
+    }
+    // anchor より後の挿入は 1 詰めて semantics を合わせる (Vec::remove(anchor) → Vec::insert(target-1))。
+    if target_u > anchor_index + 1 {
+        target_u - 1
+    } else {
+        target_u
+    }
+}
 
 /// `scroll_area` 内部の scrollbar 幅 (`scroll_area::SCROLLBAR_W` のミラー、row 幅から差し引くため)。
 const SCROLLBAR_W: f32 = 10.0;
@@ -99,7 +155,7 @@ pub struct ReorderableListResponse {
 #[derive(Debug)]
 pub enum ReorderableListEditRequest {
     /// `order` は新順での元 index 列。`new_items[i] = items[order[i]]` で並び替え可能、
-    /// または `daw_ui_core::widgets::arrangement::apply_reorder(items, anchor, target)` で
+    /// または `daw_ui_core::widgets::reorderable_list::apply_reorder(items, anchor, target)` で
     /// 直接 `Vec<T>` を得られる (内部で apply_reorder を使ってこの値を計算している)。
     Reorder(Vec<usize>),
 }
@@ -544,7 +600,7 @@ mod tests {
     /// `apply_reorder<usize>` の単純 wrapper、test 側で期待値計算に使う。
     fn order_after(n: usize, anchor: usize, target: usize) -> Vec<usize> {
         let cur: Vec<usize> = (0..n).collect();
-        crate::widgets::arrangement::apply_reorder(&cur, anchor, target)
+        super::apply_reorder(&cur, anchor, target)
     }
 
     #[test]

@@ -49,21 +49,6 @@ pub use viewport::ViewportState1D;
 pub use widgets::level_meter::{LevelMeterStyle, MeterBallistic, MeterScale};
 pub use widgets::split_view::Orientation;
 pub use widgets::time_grid::{BarBeatGridStyle, SubGridSpec, TimeRulerStyle};
-pub use widgets::arrangement::{
-    ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
-    ArrangementClip, ArrangementClipAudioEdit, ArrangementCurveKind, ArrangementEditRequest,
-    ArrangementMasterRow, ArrangementResponse, ArrangementStyle, ArrangementTrack, ArrangementView,
-    AutomationClipKey, AutomationLaneHeaderLayout, AutomationLaneKey, AutomationPointKey,
-    ClipDragKind, ClipFadeCurveDelta, ClipFadeDelta, ClipGainDelta, ClipKey, FadeCurve, FadeEdge,
-    MASTER_TRACK_ID, MoveAutomationClipDelta, MoveAutomationPointDelta, MoveClipDelta,
-    ResizeAutomationClipDelta, ResizeClipDelta, SectionView, SelectModifier,
-    SetAutomationCurveParamKind, TrackKind,
-    automation_clip_zone_at, automation_lane_at, automation_lane_header_layout,
-    automation_lane_key_at_y, automation_lane_resize_splitter_at, automation_lanes_total_h,
-    automation_point_at, clip_hit, clip_to_rect, effective_master_row_h, header_resize_splitter_at,
-    lane_disclosure_rect_for, master_row_lanes_total_h, master_row_total_h, track_index_from_y,
-    track_row_height, track_row_resize_splitter_at, visible_track_row_tops,
-};
 pub use widgets::ruler_ops::{
     LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
     compute_loop_drag_endpoints, loop_band_hit_kind,

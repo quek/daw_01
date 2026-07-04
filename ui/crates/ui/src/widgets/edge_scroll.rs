@@ -16,11 +16,11 @@ use daw_ui_renderer::Rect;
 /// click-and-hold (= 単なるクリック) とみなしスクロールしない。実 DAW は「ドラッグして初めて」
 /// 端スクロールする (静止クリックでは動かない) ので、端近くの clip / note をクリックしただけで
 /// view が飛ぶのを防ぐ。drag の short-click 化閾値 (4px) と同値。
-pub(crate) const ACTIVATE_PX: f32 = 4.0;
+pub const ACTIVATE_PX: f32 = 4.0;
 
 /// 端オートスクロールの設定。
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct EdgeScrollCfg {
+pub struct EdgeScrollCfg {
     /// 端からの hot-zone 幅 (px)。ポインタがこの帯に入ると発火する。
     pub zone_px: f32,
     /// 端 (zone 最外) での 1 frame あたり content スクロール量 (px)。zone 境界では 0。
@@ -54,7 +54,7 @@ fn axis_delta(p: f32, lo: f32, hi: f32, cfg: EdgeScrollCfg) -> f32 {
 /// ポインタ `pos` が `rect` の端 hot-zone に入っているとき、その frame で view が動くべき content px を
 /// 軸ごとに返す。`+dx` = 右端側 (横 view を奥 = 後ろの拍へ)、`+dy` = 下端側 (縦下方向)。
 /// `pos == None` / zone 外 / 軸 disable は 0。
-pub(crate) fn edge_scroll_delta(
+pub fn edge_scroll_delta(
     pos: Option<(f32, f32)>,
     rect: Rect,
     cfg: EdgeScrollCfg,

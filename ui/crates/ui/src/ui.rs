@@ -299,6 +299,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
         Self::new(|| {})
     }
 
+    /// `frame()` 末尾で cursor 要求を受け取る sink を差し込む。通常は `with_window` が
+    /// `WindowBackend::set_cursor` を繋ぐが、headless テストで cursor icon を捕捉したいとき
+    /// (arrangement / piano_roll の drag カーソル検証等) に外部から設定する。
+    pub fn set_cursor_sink(&mut self, sink: Box<dyn Fn(CursorIcon) + Send + Sync>) {
+        self.set_cursor_request = Some(sink);
+    }
+
     /// 直前の `frame()` 呼び出しでフォーカスが変化したか。
     /// `frame()` が自動で `redraw_request` を呼ぶので、利用者がこの値を query して
     /// 再描画する必要は **ない** (互換性のため公開しているだけ)。
@@ -843,6 +850,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
     pub fn pointer(&self) -> PointerFrame {
         self.pointer
+    }
+
+    /// 現在の scissor (with_clip_rect スタック top) を返す。外部 widget (daw_gui の arrangement 等) が
+    /// closure 形の `with_clip_rect` を使えない interleave 描画で、scissor を open-code で push/pop する
+    /// ための read アクセサ (旧 `pub(crate) current_clip` フィールド直読の置換)。
+    #[must_use]
+    pub fn current_clip_rect(&self) -> Option<Rect> {
+        self.current_clip
+    }
+
+    /// 現在の scissor を差し替える (`current_clip_rect` の対、push/pop の write 側)。呼び出し側が
+    /// 直前値を保持して復元する責務を負う (`with_clip_rect` と同 idiom を open-code するとき用)。
+    pub fn set_current_clip_rect(&mut self, clip: Option<Rect>) {
+        self.current_clip = clip;
     }
 
     /// 描画コマンドを Scene に積む (外部 widget extension で利用可能)。
@@ -2167,7 +2188,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 }
 
 /// M7 Phase 22: 2 つの clip rect を交差させる (両方 `None` なら `None`、片方なら他方、両方なら intersect)。
-pub(crate) fn merge_clip(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
+pub fn merge_clip(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
     match (a, b) {
         (None, None) => None,
         (Some(r), None) | (None, Some(r)) => Some(r),

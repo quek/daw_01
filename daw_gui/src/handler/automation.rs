@@ -122,8 +122,12 @@ impl AppData {
     /// 選んだ時点で clip / note / track 等の他面選択をクリアし、 キーボード Delete が曖昧に
     /// ならないようにする (section は `edit_surface` の最低優先なので、 他選択が残っていると
     /// Delete がそちらを向く)。
-    pub(crate) fn apply_select_section(&mut self, id: u32, modifier: daw_ui_core::SelectModifier) {
-        use daw_ui_core::SelectModifier;
+    pub(crate) fn apply_select_section(
+        &mut self,
+        id: u32,
+        modifier: crate::widgets::arrangement::SelectModifier,
+    ) {
+        use crate::widgets::arrangement::SelectModifier;
         match modifier {
             SelectModifier::Single => self.selection.selected_section_ids = vec![id],
             SelectModifier::Toggle => {

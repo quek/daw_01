@@ -9,7 +9,7 @@ use daw_ui_renderer::{Color, LineBatch, LineSegment};
 use crate::widgets::heavy::HeavyCtx;
 
 /// `x` を中心に `y_top..y_bottom` の縦線 1 本。`y_bottom <= y_top` なら no-op。
-pub(crate) fn draw_playhead_line<M: ?Sized + 'static>(
+pub fn draw_playhead_line<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     x: f32,
     y_top: f32,

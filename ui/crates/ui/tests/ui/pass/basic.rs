@@ -5,8 +5,7 @@
 //! 紛れ込んでいるか、`Application::Message: Clone` のような型境界が露出している。
 
 use daw_ui_core::{
-    ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    AutomationClipKey, ClipKey, ColorPickerStyle, Edit, Note, NoteId, NoteStyle,
+    ColorPickerStyle, Edit, Note, NoteId, NoteStyle,
     PianoRollEditRequest, PianoRollStyle, PianoRollView, ReorderableListEditRequest,
     ReorderableListStyle, ScrubableNumberFormat, ScrubableNumberStyle, UiHost,
 };
@@ -26,12 +25,6 @@ struct Model {
     // M9 Phase 41e: piano_roll widget 用 (non-Clone Model でも piano_roll が呼べることを担保)
     notes: Vec<Note>,
     selected_note_ids: Vec<NoteId>,
-    // M9 Phase 45e: arrangement widget 用 (non-Clone Model でも arrangement が呼べることを担保)
-    arr_tracks: Vec<ArrangementTrack>,
-    arr_selected_clips: Vec<ClipKey>,
-    arr_selected_tracks: Vec<u32>,
-    arr_selected_automation_clips: Vec<AutomationClipKey>,
-    arr_selected_automation_points: Vec<daw_ui_core::AutomationPointKey>,
     // M11 Phase 51: reorderable_list widget 用 (non-Clone Model でも呼べることを担保)
     chain: Vec<String>,
 }
@@ -48,11 +41,6 @@ fn main() {
         title: String::from("untitled"),
         notes: Vec::new(),
         selected_note_ids: Vec::new(),
-        arr_tracks: Vec::new(),
-        arr_selected_clips: Vec::new(),
-        arr_selected_tracks: Vec::new(),
-        arr_selected_automation_clips: Vec::new(),
-        arr_selected_automation_points: Vec::new(),
         chain: Vec::new(),
     };
 
@@ -200,207 +188,6 @@ fn main() {
                     // edge auto-scroll の 2 variant も non-Clone Model で組み立て可能を担保。
                     PianoRollEditRequest::ScrollByBeats(_) => Edit::mutate(|_m: &mut Model| {}),
                     PianoRollEditRequest::SetTopPitch(_) => Edit::mutate(|_m: &mut Model| {}),
-                },
-            );
-            // M9 Phase 45e: arrangement widget が non-Clone Model でコンパイルする。
-            // 全 variants を make_edit でハンドルすることで API exhaustive 担保
-            // (M14 Phase 127 で Arranger section の 6 variant を追加)。
-            let arr_view = ArrangementView::default();
-            let arr_style = ArrangementStyle::default();
-            let _ = ui.arrangement(
-                "arr",
-                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
-                &m.arr_tracks,
-                &[],
-                arr_view,
-                &m.arr_selected_clips,
-                &m.arr_selected_tracks,
-                &m.arr_selected_automation_clips,
-                &m.arr_selected_automation_points,
-                &arr_style,
-                None,
-                |req| match req {
-                    ArrangementEditRequest::SelectClips { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SelectTrack { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::MoveClips(_) => Edit::mutate(|_m: &mut Model| {
-                        let _new_clip = ArrangementClip {
-                            id: 0,
-                            start_beat: 0.0,
-                            len_beats: 1.0,
-                            name: std::sync::Arc::from("clip"),
-                            color: None,
-                            share_group_color: None,
-                            audio_edit: None,
-                            thumbnail: None,
-                            in_active_group: false,
-                            muted: false,
-                        };
-                    }),
-                    ArrangementEditRequest::CloneClipsLinked(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::CloneClipsIndependent(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::ResizeClips(_) => Edit::mutate(|_m: &mut Model| {}),
-                    ArrangementEditRequest::DeleteClips(_) => Edit::mutate(|_m: &mut Model| {}),
-                    ArrangementEditRequest::DoubleClickClip(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::DoubleClickEmpty { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SecondaryClickEmpty { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::BeginRenameTrack(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::DeleteTrack(_) => Edit::mutate(|_m: &mut Model| {}),
-                    ArrangementEditRequest::MoveTrackUp(_) => Edit::mutate(|_m: &mut Model| {}),
-                    ArrangementEditRequest::MoveTrackDown(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::ReorderTracks(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetTrackVolume { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::ToggleTrackMute(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::ToggleTrackSolo(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::ToggleTrackArmed(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetLoopRange { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetPlayheadBeat(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetZoomX(_) => Edit::mutate(|_m: &mut Model| {}),
-                    ArrangementEditRequest::SetScrollX(_) => Edit::mutate(|_m: &mut Model| {}),
-                    ArrangementEditRequest::SetTrackTop(_) => Edit::mutate(|_m: &mut Model| {}),
-                    ArrangementEditRequest::SetTrackRowH(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::ToggleGroupCollapsed(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetTrackParent { tracks: _, parent: _, anchor_after: _ } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetClipGainDb(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetClipFade(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetClipFadeCurve(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::ToggleTrackAutomationCollapsed { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // M14 Phase 63n-2 (#028): point edit + lane button の 8 variant。
-                    ArrangementEditRequest::SetLaneEnabled { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetLaneVisible { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::DeleteLane(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::AddAutomationPoint { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // 既存 point 上の dblclick → 値の数値入力開始。
-                    ArrangementEditRequest::DoubleClickAutomationPoint(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::MoveAutomationPoints(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::DeleteAutomationPoints(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SetAutomationCurveType { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // M14 Phase 63n-3 (#028): automation clip drag の 5 variant。
-                    ArrangementEditRequest::MoveAutomationClips(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::CloneAutomationClipsLinked(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::CloneAutomationClipsIndependent(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::ResizeAutomationClips(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::DeleteAutomationClips(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SelectAutomationClips { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // M14 Phase 63n-8 (#033): lasso + 短 click による point selection の更新。
-                    ArrangementEditRequest::SelectAutomationPoints { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // M14 Phase 63n-9 (#033): tension/bend handle drag release → curve param 更新。
-                    ArrangementEditRequest::SetAutomationCurveParam { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // M14 Phase 63n-4 (#029): lane body 空き dblclick → CreateAutomationClip。
-                    ArrangementEditRequest::CreateAutomationClip { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // M14 Phase 63n-5 (#030): lane 下端 splitter drag → SetLaneHeight。
-                    ArrangementEditRequest::SetLaneHeight { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // M14 Phase 63n-6 (#031): per-track row 下端 splitter / Alt+drag → SetSingleTrackRowH。
-                    ArrangementEditRequest::SetSingleTrackRowH { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // M14 Phase 117 (daw_01 #091): header / lanes 境界 splitter drag → SetHeaderW。
-                    ArrangementEditRequest::SetHeaderW { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    // M14 Phase 127 (daw_01 #105): Arranger レーン (section) の編集意図 6 variant。
-                    ArrangementEditRequest::SelectSection { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::CreateSection { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::MoveSection { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::ResizeSection { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::DuplicateSection { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::BeginRenameSection(_) => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
-                    ArrangementEditRequest::SecondaryClickSection { .. } => {
-                        Edit::mutate(|_m: &mut Model| {})
-                    }
                 },
             );
             // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。

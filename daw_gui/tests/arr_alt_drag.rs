@@ -19,11 +19,8 @@
 
 use std::sync::Arc;
 
-use daw_ui_core::{
-    ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    Edit, FrameInput, MoveClipDelta, MoveDelta, Note, NoteStyle, PianoRollEditRequest, PianoRollStyle,
-    PianoRollView, PointerFrame, SnapConfig, SnapMode, TrackKind, UiHost,
-};
+use daw_gui::widgets::arrangement::{arrangement, ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView, MoveClipDelta, TrackKind};
+use daw_ui_core::{Edit, FrameInput, MoveDelta, Note, NoteStyle, PianoRollEditRequest, PianoRollStyle, PianoRollView, PointerFrame, SnapConfig, SnapMode, UiHost};
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Rect, Scene};
 
@@ -76,7 +73,7 @@ fn pointer_release(x: f32, y: f32, alt: bool) -> PointerFrame {
 /// arrangement 用 minimal Model。 `last_move` に最新の `MoveClips` の delta 列を捕まえる。
 struct ArrModel {
     tracks: Vec<ArrangementTrack>,
-    selected: Vec<daw_ui_core::ClipKey>,
+    selected: Vec<daw_gui::widgets::arrangement::ClipKey>,
     last_move: Option<Vec<MoveClipDelta>>,
 }
 
@@ -140,7 +137,7 @@ fn arr_frame(host: &mut UiHost<ArrModel>, m: &mut ArrModel, input: FrameInput, s
     let view = arr_view(snap);
     let style = ArrangementStyle::default();
     host.frame(m, &mut scene, screen, input, |model, ui| {
-        ui.arrangement(
+        arrangement(ui, 
             "arr",
             WIDGET_RECT,
             &model.tracks,

@@ -7,11 +7,8 @@
 
 use std::sync::Arc;
 
-use daw_ui_core::{
-    ArrangementAutomationLane, ArrangementClip, ArrangementEditRequest, ArrangementStyle,
-    ArrangementTrack, ArrangementView, Edit, FrameInput, PointerFrame, SnapConfig, TrackKind,
-    UiHost, lane_disclosure_rect_for,
-};
+use daw_gui::widgets::arrangement::{arrangement, ArrangementAutomationLane, ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView, TrackKind, lane_disclosure_rect_for};
+use daw_ui_core::{Edit, FrameInput, PointerFrame, SnapConfig, UiHost};
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Color, Rect, Scene};
 
@@ -129,7 +126,7 @@ fn run_arrangement_frame(
     let view = make_view();
     let style = ArrangementStyle::default();
     host.frame(m, &mut scene, screen, input, |model, ui| {
-        ui.arrangement(
+        arrangement(ui, 
             "arr",
             WIDGET_RECT,
             &model.tracks,

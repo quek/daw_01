@@ -17,10 +17,8 @@
 
 use std::sync::Arc;
 
-use daw_ui_core::{
-    ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView,
-    Edit, FrameInput, MoveClipDelta, PointerFrame, SnapConfig, SnapMode, TrackKind, UiHost,
-};
+use daw_gui::widgets::arrangement::{arrangement, ArrangementClip, ArrangementEditRequest, ArrangementStyle, ArrangementTrack, ArrangementView, MoveClipDelta, TrackKind};
+use daw_ui_core::{Edit, FrameInput, PointerFrame, SnapConfig, SnapMode, UiHost};
 use daw_ui_platform::{Modifiers, PhysicalSize};
 use daw_ui_renderer::{Rect, Scene};
 
@@ -69,12 +67,12 @@ fn pointer_release(x: f32, y: f32, m: Modifiers) -> PointerFrame {
 
 struct ArrModel {
     tracks: Vec<ArrangementTrack>,
-    selected: Vec<daw_ui_core::ClipKey>,
+    selected: Vec<daw_gui::widgets::arrangement::ClipKey>,
     last_move: Option<Vec<MoveClipDelta>>,
     last_clone_linked: Option<Vec<MoveClipDelta>>,
     last_clone_indep: Option<Vec<MoveClipDelta>>,
-    last_resize: Option<Vec<daw_ui_core::ResizeClipDelta>>,
-    last_select: Option<Vec<daw_ui_core::ClipKey>>,
+    last_resize: Option<Vec<daw_gui::widgets::arrangement::ResizeClipDelta>>,
+    last_select: Option<Vec<daw_gui::widgets::arrangement::ClipKey>>,
 }
 
 fn arr_model() -> ArrModel {
@@ -142,7 +140,7 @@ fn arr_frame(host: &mut UiHost<ArrModel>, m: &mut ArrModel, input: FrameInput, s
     let view = arr_view(snap);
     let style = ArrangementStyle::default();
     host.frame(m, &mut scene, screen, input, |model, ui| {
-        ui.arrangement(
+        arrangement(ui, 
             "arr",
             WIDGET_RECT,
             &model.tracks,

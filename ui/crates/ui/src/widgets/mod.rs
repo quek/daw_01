@@ -3,7 +3,6 @@
 //! M2: waveform (波形表示、line strip パイプラインを使う)。
 //! M3: fader / knob / checkbox / text_input。
 
-pub mod arrangement;
 pub mod automation;
 pub mod button;
 pub mod channel_fader_meter;
@@ -11,7 +10,7 @@ pub mod checkbox;
 pub mod color_picker;
 pub mod drag_in_rect;
 pub mod drag_rect;
-pub(crate) mod edge_scroll;
+pub mod edge_scroll;
 pub mod dropdown;
 pub mod fader;
 pub mod heavy;
@@ -45,14 +44,14 @@ use crate::widgets::heavy::HeavyCtx;
 /// muted な clip / note の塗り色。fill の alpha を落として lane 背景を
 /// 透過させ、暗く沈める (REAPER / Ableton 流)。clip rect / note rect 共通で使う。
 #[must_use]
-pub(crate) fn muted_dim_fill(c: Color) -> Color {
+pub fn muted_dim_fill(c: Color) -> Color {
     Color { a: c.a * 0.42, ..c }
 }
 
 /// muted な矩形に 45°(`╱`) の斜線ハッチを重ねる。線は rect の上下端を
 /// 結ぶ平行線群 (`x + y = const`) を `spacing_px` 間隔で生成し、`scissor` で rect 内だけに
 /// clip する (x が rect 外に伸びても scissor が切る)。clip / note 共通。
-pub(crate) fn push_muted_hatch<M: ?Sized + 'static>(
+pub fn push_muted_hatch<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     rect: Rect,
     scissor: Rect,
