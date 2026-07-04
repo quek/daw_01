@@ -114,12 +114,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 矩形指定で垂直 fader を描画 + ドラッグ + ヒットテスト。
     ///
     /// 値が変わったとき `on_change(new_value)` を呼んで `Edit<M>` を発行する。
-    /// **M8 Phase 29**: drag 中の各フレームでは Mutate Edit を発行 (history に乗らない)、
-    /// drag 終端でのみ Undoable Edit (start_value → end_value、label 付き) を 1 度だけ発行する。
-    /// これにより undo/redo は drag 単位の意味のあるステップで巻き戻る (DAW 標準動作)。
-    ///
-    /// `on_change` は `Fn + Clone + Send + Sync + 'static` を要求 (= `move |v| Edit::mutate(...)` の
-    /// 形で書く、capture は Copy 型のみが原則)。
+    /// drag 中の各フレームで forward Mutate を発行し、drag 終端で最終値を 1 度発行する。
+    /// undo/redo はアプリ層の責務 (S4a で lib undo 撤去)。
     ///
     /// `scale = None` のとき `value` / `default_value` / `on_change` 引数はすべて `0.0..=1.0` fraction。
     /// `scale = Some(s)` のとき `value` / `default_value` / `on_change` 引数はすべて dB 値。
@@ -127,8 +123,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ///   - widget が `s.curve` で dB→fraction 変換してハンドル位置を決定し、
     ///     fraction→dB 逆変換して `on_change(db)` を呼ぶ。
     ///   - `level_meter_stereo` に渡す `MeterScale` と同一インスタンスを使うとカーソルが必ず一致する。
-    ///
-    /// `label` は undoable history パネルでの表示文字列 ("fader" / "volume" 等)。
     ///
     /// 操作:
     /// - thumb をドラッグで値編集 (track 1 本分 = 0→1 fraction)
@@ -147,19 +141,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         value: f32,
         default_value: f32,
         scale: Option<MeterScale>,
-        label: &'static str,
         on_change: F,
         modulation: Option<Modulation<'_, M>>,
     ) -> FaderResponse
     where
-        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
+        F: Fn(f32) -> Edit<M>,
     {
         // track 領域は rect から TRACK_PAD インセットで導出 (従来挙動と byte 互換)。
         let wid = WidgetId::ROOT.child((b"fader", &id));
         let track_top = rect.y + TRACK_PAD;
         let track_h = (rect.h - TRACK_PAD * 2.0).max(1.0);
         self.fader_core(
-            wid, rect, track_top, track_h, value, default_value, scale, label, on_change, modulation,
+            wid, rect, track_top, track_h, value, default_value, scale, on_change, modulation,
         )
     }
 
@@ -168,7 +161,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// track 領域を **明示指定** する: `col` が背景パネル + thumb の横列 rect、
     /// `[track_top, track_top+track_h]` が thumb 中心の可動域 (= dB→y region)。 thumb 中心は
     /// `track_top + track_h * (1.0 - frac)`。 `channel_fader_meter` は meter と共有する region を
-    /// 渡して画素整合させる (daw_01 #083)。 `scale` の dB↔fraction 変換と undoable Edit 機構は
+    /// 渡して画素整合させる (daw_01 #083)。 `scale` の dB↔fraction 変換と Edit 発行機構は
     /// `fader_at` と同一。
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub(crate) fn fader_core<F>(
@@ -180,12 +173,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         value: f32,
         default_value: f32,
         scale: Option<MeterScale>,
-        label: &'static str,
         on_change: F,
         modulation: Option<Modulation<'_, M>>,
     ) -> FaderResponse
     where
-        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
+        F: Fn(f32) -> Edit<M>,
     {
         // 値空間 (caller の dB or fraction) → 内部 fraction (0..=1) への変換
         let to_frac = |v: f32| -> f32 {
@@ -418,21 +410,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.push_edit(edit);
         }
 
-        // M8 Phase 29: base drag 終端で Undoable Edit を発行 (start_value → end_value)。
-        // 値変化が無ければ no-op (= 押下しただけで動かさず release した場合は history を汚さない)。
+        // S4a: base drag 終端で最終値を 1 度 commit (旧 Undoable の forward 相当)。undo は
+        // アプリ層 (daw_gui SongDoc) が担うので lib は forward の Mutate を発行するだけ。
+        // 値変化が無ければ no-op (= 押下しただけで動かさず release した場合は何も出さない)。
         if let Some(start_frac) = release_initial_value
             && (start_frac - displayed_value).abs() > f32::EPSILON
         {
-            let on_change_fwd = on_change.clone();
-            let on_change_inv = on_change;
             let end_val = to_val(displayed_value);
-            let start_val = to_val(start_frac);
-            let edit = Edit::with_inverse(
-                label,
-                move |m: &mut M| on_change_fwd(end_val).apply(m),
-                move |m: &mut M| on_change_inv(start_val).apply(m),
-            );
-            self.push_edit(edit);
+            self.push_edit(on_change(end_val));
         }
 
         FaderResponse {
@@ -451,11 +436,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         value: f32,
         default_value: f32,
         scale: Option<MeterScale>,
-        label: &'static str,
         on_change: F,
     ) -> FaderResponse
     where
-        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
+        F: Fn(f32) -> Edit<M>,
     {
         let pad = 8.0;
         let h = 120.0;
@@ -465,7 +449,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             w: 32.0,
             h,
         };
-        let resp = self.fader_at(id, rect, value, default_value, scale, label, on_change, None);
+        let resp = self.fader_at(id, rect, value, default_value, scale, on_change, None);
         self.next_y += h + pad;
         resp
     }
@@ -719,7 +703,7 @@ mod tests {
             screen,
             FrameInput { pointer, ..Default::default() },
             |_, ui| {
-                ui.fader_at("test", rect, value, default_value, None, "fader", |v| {
+                ui.fader_at("test", rect, value, default_value, None, |v| {
                     Edit::mutate(move |m: &mut VolModel| m.value = v)
                 }, None);
             },
@@ -1033,7 +1017,6 @@ mod tests {
                     base,
                     0.5,
                     None,
-                    "vol",
                     |v| Edit::mutate(move |m: &mut ModModel| m.value = v),
                     Some(modulation),
                 );
@@ -1120,7 +1103,7 @@ mod tests {
         let mut host_n: UiHost<ModModel> = UiHost::no_redraw();
         let mut scene_none = Scene::new();
         host_n.frame_to_edits(&model, &mut scene_none, screen, FrameInput::default(), |_, ui| {
-            ui.fader_at("mtest", rect, 0.5, 0.5, None, "vol",
+            ui.fader_at("mtest", rect, 0.5, 0.5, None,
                 |v| Edit::mutate(move |m: &mut ModModel| m.value = v), None);
         });
 
@@ -1216,7 +1199,7 @@ mod tests {
                         on_mod_change: &on_mod,
                     }),
                 };
-                ui.fader_at("mtest", rect, model.value, 0.5, None, "vol",
+                ui.fader_at("mtest", rect, model.value, 0.5, None,
                     |v| Edit::mutate(move |m: &mut ModModel| m.value = v), Some(m));
             })
         };
@@ -1237,7 +1220,7 @@ mod tests {
         let mut host_n: UiHost<ModModel> = UiHost::no_redraw();
         let mut scene_none = Scene::new();
         host_n.frame_to_edits(&model, &mut scene_none, screen, FrameInput::default(), |_, ui| {
-            ui.fader_at("mtest", rect, 0.5, 0.5, None, "vol",
+            ui.fader_at("mtest", rect, 0.5, 0.5, None,
                 |v| Edit::mutate(move |m: &mut ModModel| m.value = v), None);
         });
 
@@ -1316,7 +1299,7 @@ mod tests {
                         on_mod_change: &on_mod,
                     }),
                 };
-                ui.fader_at("mtest", rect, model.value, 0.5, None, "vol",
+                ui.fader_at("mtest", rect, model.value, 0.5, None,
                     |v| Edit::mutate(move |m: &mut ModModel| m.value = v), Some(m));
             })
         };

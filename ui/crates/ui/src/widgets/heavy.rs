@@ -234,7 +234,7 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
         self.ui.bar_beat_grid(id, rect, mapping, viewport, style, sub);
     }
 
-    // === M9 P1-3: input / popup / shortcut / clipboard / dialog / history pull API ===
+    // === M9 P1-3: input / popup / shortcut / clipboard / dialog pull API ===
     //
     // すべて `Ui` の同名メソッドへの 1 行 forward。heavy 抽象の漏れ (rect-select / 右クリック /
     // shortcut consume などが heavy 内で書けなかった) を 1 commit で塞ぐ。
@@ -298,28 +298,6 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     /// `Ui::request_redraw` の delegate。
     pub fn request_redraw(&mut self) {
         self.ui.request_redraw();
-    }
-
-    /// `Ui::request_undo` の delegate (heavy 内で Ctrl+Z 検出 → undo 要求)。
-    pub fn request_undo(&mut self) {
-        self.ui.request_undo();
-    }
-
-    /// `Ui::request_redo` の delegate。
-    pub fn request_redo(&mut self) {
-        self.ui.request_redo();
-    }
-
-    /// `Ui::can_undo` の delegate (heavy 内で UI 状態の表示判断に使う)。
-    #[must_use]
-    pub fn can_undo(&self) -> bool {
-        self.ui.can_undo()
-    }
-
-    /// `Ui::can_redo` の delegate。
-    #[must_use]
-    pub fn can_redo(&self) -> bool {
-        self.ui.can_redo()
     }
 
     /// `Ui::set_cursor` の delegate (M9 Phase 41b、heavy 内 hover で cursor 変更等)。
@@ -463,7 +441,7 @@ mod tests {
         assert_eq!(model.value, 1);
     }
 
-    // -------- M9 P1-3: HeavyCtx delegate (input/popup/shortcut/clipboard/history) --------
+    // -------- M9 P1-3: HeavyCtx delegate (input/popup/shortcut/clipboard) --------
 
     /// `take_drag_rect_in_rect` が heavy 内で呼べる (drag 中でなければ None)。
     #[test]

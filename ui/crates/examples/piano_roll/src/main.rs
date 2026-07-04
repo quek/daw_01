@@ -8,14 +8,14 @@
 //! - 無修飾 drag = pan (空白 or note なし上で press → drag)
 //! - 無修飾 wheel = X zoom (cur_mouse 位置 anchor)
 //! - Ctrl+wheel = Y zoom (pitch 範囲を変える)
-//! - note 中央 drag = move (release で Undoable)
-//! - note 左右端 drag = resize (release で Undoable)
+//! - note 中央 drag = move (release で確定)
+//! - note 左右端 drag = resize (release で確定)
 //! - note click (drag<16px) = selection 1 個
 //! - 空白 click = selection clear
 //! - Shift+drag = rect multi-select (加算: 既存選択 ∪ rect 内)
 //! - Insert = pointer 位置に新規 note 追加 (next_note_id を bump)
 //! - Delete = selected を一括削除
-//! - Ctrl+Z / Ctrl+Shift+Z = undo / redo (M8 history stack)
+//! - (S4a: lib undo は撤去。この demo は undo/redo を配線しない)
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -189,14 +189,30 @@ fn generate_notes(count: usize) -> Vec<Note> {
     notes
 }
 
-// ----- Edit factory (M9 Phase 41a-d で snapshot_inverse 化済) -----
+// ----- Edit factory -----
 
-/// 1 個 or 複数の note を一括 add する Undoable Edit。
+/// S4a: lib 側 undo (`Edit::snapshot_inverse`) は撤去された。この demo では forward だけを
+/// 適用する薄い shim を置き、旧 factory の本体 (forward / inverse クロージャ) は書き換えずに
+/// 使い回す (inverse は無視 = undo 非対応)。undo が要るアプリは自前 snapshot 機構を持つ。
+fn snapshot_forward<S, F, R>(
+    _label: &'static str,
+    snapshot: S,
+    forward: F,
+    _restore_from: R,
+) -> Edit<PianoRollModel>
+where
+    S: Send + 'static,
+    F: FnOnce(&mut PianoRollModel, &S) + Send + 'static,
+{
+    Edit::mutate(move |m| forward(m, &snapshot))
+}
+
+/// 1 個 or 複数の note を一括 add する Edit (forward のみ)。
 /// forward 内で `next_note_id` を `id+1` に bump (= Insert で id 重複しないよう自動増加)。
 /// inverse では bump しない (id は再利用しないので、undo 後に Insert すると新しい id が振られる)。
 fn make_add_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
     let label = if notes.len() == 1 { "add note" } else { "add notes" };
-    Edit::snapshot_inverse(
+    snapshot_forward(
         label,
         notes,
         |m: &mut PianoRollModel, snap: &Vec<Note>| {
@@ -221,7 +237,7 @@ fn make_add_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
 
 fn make_move_notes_edit(deltas: Vec<MoveDelta>) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "move note" } else { "move notes" };
-    Edit::snapshot_inverse(
+    snapshot_forward(
         label,
         deltas,
         |m: &mut PianoRollModel, snap: &Vec<MoveDelta>| {
@@ -261,7 +277,7 @@ fn make_copy_notes_edit(
     prev_selection: Vec<NoteId>,
 ) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "copy note" } else { "copy notes" };
-    Edit::snapshot_inverse(
+    snapshot_forward(
         label,
         (deltas, base_id, prev_selection),
         |m: &mut PianoRollModel, snap: &(Vec<MoveDelta>, NoteId, Vec<NoteId>)| {
@@ -300,7 +316,7 @@ fn make_copy_notes_edit(
 
 fn make_resize_notes_edit(deltas: Vec<ResizeDelta>) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "resize note" } else { "resize notes" };
-    Edit::snapshot_inverse(
+    snapshot_forward(
         label,
         deltas,
         |m: &mut PianoRollModel, snap: &Vec<ResizeDelta>| {
@@ -331,7 +347,7 @@ fn make_resize_notes_edit(deltas: Vec<ResizeDelta>) -> Edit<PianoRollModel> {
 }
 
 fn make_select_notes_edit(prev: Vec<NoteId>, next: Vec<NoteId>) -> Edit<PianoRollModel> {
-    Edit::snapshot_inverse(
+    snapshot_forward(
         "select notes",
         (prev, next),
         |m: &mut PianoRollModel, snap: &(Vec<NoteId>, Vec<NoteId>)| {
@@ -352,7 +368,7 @@ fn make_select_notes_edit(prev: Vec<NoteId>, next: Vec<NoteId>) -> Edit<PianoRol
 /// `m.notes` から prev を引いて この helper に渡す (make_set_lyrics_edit と同 pattern)。
 fn make_set_velocity_edit(deltas: Vec<(NoteId, u8, u8)>) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "set velocity" } else { "set velocities" };
-    Edit::snapshot_inverse(
+    snapshot_forward(
         label,
         deltas,
         |m: &mut PianoRollModel, snap: &Vec<(NoteId, u8, u8)>| {
@@ -378,7 +394,7 @@ fn make_set_lyrics_edit(
     deltas: Vec<(NoteId, Option<String>, Option<String>)>,
 ) -> Edit<PianoRollModel> {
     let label = if deltas.len() == 1 { "set lyric" } else { "set lyrics" };
-    Edit::snapshot_inverse(
+    snapshot_forward(
         label,
         deltas,
         |m: &mut PianoRollModel, snap: &Vec<(NoteId, Option<String>, Option<String>)>| {
@@ -402,7 +418,7 @@ fn make_set_lyrics_edit(
 
 fn make_delete_notes_edit(notes: Vec<Note>) -> Edit<PianoRollModel> {
     let label = if notes.len() == 1 { "delete note" } else { "delete notes" };
-    Edit::snapshot_inverse(
+    snapshot_forward(
         label,
         notes,
         |m: &mut PianoRollModel, snap: &Vec<Note>| {
@@ -663,14 +679,8 @@ impl App {
             screen,
             input,
             |m, ui| {
-                // shortcut undo / redo
-                if ui.take_shortcut("undo") {
-                    ui.request_undo();
-                }
-                if ui.take_shortcut("redo") {
-                    ui.request_redo();
-                }
-
+                // S4a: lib undo は撤去。この demo は undo/redo を配線しない
+                // (Edit factory は forward のみ発行する)。
                 // M14 Phase 70 / daw_01 #042: scale demo shortcuts。
                 // K で mode cycle (None → Highlight → Fold → None)、 R で root cycle (C → C# → ...)。
                 // Major scale 固定 demo。 caller が ScaleChange 経由で実 scale を渡す本番は daw_01 側。
@@ -993,201 +1003,3 @@ fn main() {
     }
 }
 
-// ============================================================
-// M9 Phase 41a-d: Edit factory の Undoable round-trip tests
-// (PianoRollModel 依存なので example 側に残す)
-// ============================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use daw_ui_core::Edit;
-
-    fn note(id: NoteId, start: f64, len: f64, pitch: u8) -> Note {
-        Note { id, start_beat: start, len_beats: len, pitch, velocity: 96, lyric: None, muted: false, style: NoteStyle::default() }
-    }
-
-    #[test]
-    fn add_single_note_then_undo_round_trip() {
-        let mut model = PianoRollModel::new(vec![]);
-        let n = note(0, 0.0, 0.5, 60);
-        let edit = make_add_notes_edit(vec![n]);
-        let Edit::Undoable { forward, inverse, .. } = edit else {
-            panic!("expected Undoable");
-        };
-        forward(&mut model);
-        assert_eq!(model.notes.len(), 1);
-        assert_eq!(model.notes[0].id, 0);
-        inverse(&mut model);
-        assert_eq!(model.notes.len(), 0);
-    }
-
-    #[test]
-    fn add_multiple_notes_then_undo_round_trip() {
-        let mut model = PianoRollModel::new(vec![]);
-        let notes_to_add = vec![
-            note(10, 1.0, 0.5, 60),
-            note(11, 2.0, 0.5, 64),
-            note(12, 3.0, 0.5, 67),
-        ];
-        let edit = make_add_notes_edit(notes_to_add);
-        let Edit::Undoable { forward, inverse, .. } = edit else {
-            panic!("expected Undoable");
-        };
-        forward(&mut model);
-        assert_eq!(model.notes.len(), 3);
-        let ids: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
-        assert_eq!(ids, vec![10, 11, 12]);
-        inverse(&mut model);
-        assert!(model.notes.is_empty());
-    }
-
-    #[test]
-    fn delete_notes_then_undo_restores_original_state() {
-        let initial = vec![
-            note(1, 0.0, 0.5, 60),
-            note(2, 1.0, 0.5, 64),
-            note(3, 2.0, 0.5, 67),
-        ];
-        let mut model = PianoRollModel::new(initial);
-        let to_delete = vec![note(2, 1.0, 0.5, 64)];
-        let edit = make_delete_notes_edit(to_delete);
-        let Edit::Undoable { forward, inverse, .. } = edit else {
-            panic!("expected Undoable");
-        };
-        forward(&mut model);
-        assert_eq!(model.notes.len(), 2);
-        let remaining_ids: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
-        assert_eq!(remaining_ids, vec![1, 3]);
-        inverse(&mut model);
-        let restored_ids: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
-        assert_eq!(restored_ids, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn delete_notes_clears_corresponding_selection() {
-        let initial = vec![note(1, 0.0, 0.5, 60), note(2, 1.0, 0.5, 64)];
-        let mut model = PianoRollModel::new(initial);
-        model.selected_note_ids = vec![1, 2];
-        let to_delete = vec![note(1, 0.0, 0.5, 60)];
-        let edit = make_delete_notes_edit(to_delete);
-        if let Edit::Undoable { forward, .. } = edit {
-            forward(&mut model);
-        }
-        assert_eq!(model.selected_note_ids, vec![2]);
-    }
-
-    #[test]
-    fn move_notes_then_undo_round_trip() {
-        let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
-        let mut model = PianoRollModel::new(initial);
-        let deltas: Vec<MoveDelta> = vec![
-            (0u32, 0.0_f64, 60u8, 2.0_f64, 72u8),
-            (1u32, 1.0_f64, 64u8, 3.0_f64, 70u8),
-        ];
-        let edit = make_move_notes_edit(deltas);
-        let Edit::Undoable { forward, inverse, .. } = edit else {
-            panic!("expected Undoable");
-        };
-        forward(&mut model);
-        let n0 = model.notes.iter().find(|n| n.id == 0).unwrap();
-        assert!((n0.start_beat - 2.0).abs() < 1e-6);
-        assert_eq!(n0.pitch, 72);
-        inverse(&mut model);
-        let n0 = model.notes.iter().find(|n| n.id == 0).unwrap();
-        assert!((n0.start_beat - 0.0).abs() < 1e-6);
-        assert_eq!(n0.pitch, 60);
-    }
-
-    #[test]
-    fn resize_notes_then_undo_round_trip_right_edge() {
-        let initial = vec![note(0, 0.0, 0.5, 60)];
-        let mut model = PianoRollModel::new(initial);
-        let deltas: Vec<ResizeDelta> = vec![(0u32, 0.0_f64, 0.5_f64, 0.0_f64, 1.0_f64)];
-        let edit = make_resize_notes_edit(deltas);
-        let Edit::Undoable { forward, inverse, .. } = edit else {
-            panic!("expected Undoable");
-        };
-        forward(&mut model);
-        assert!((model.notes[0].len_beats - 1.0).abs() < 1e-6);
-        inverse(&mut model);
-        assert!((model.notes[0].len_beats - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn resize_notes_then_undo_round_trip_left_edge() {
-        let initial = vec![note(0, 1.0, 1.0, 60)];
-        let mut model = PianoRollModel::new(initial);
-        let deltas: Vec<ResizeDelta> = vec![(0u32, 1.0_f64, 1.0_f64, 0.75_f64, 1.25_f64)];
-        let edit = make_resize_notes_edit(deltas);
-        let Edit::Undoable { forward, inverse, .. } = edit else {
-            panic!("expected Undoable");
-        };
-        forward(&mut model);
-        let n = &model.notes[0];
-        assert!((n.start_beat - 0.75).abs() < 1e-6);
-        assert!((n.len_beats - 1.25).abs() < 1e-6);
-        inverse(&mut model);
-        let n = &model.notes[0];
-        assert!((n.start_beat - 1.0).abs() < 1e-6);
-        assert!((n.len_beats - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn select_notes_then_undo_restores_prev_selection() {
-        let mut model = PianoRollModel::new(vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)]);
-        model.selected_note_ids = vec![0];
-        let prev: Vec<NoteId> = vec![0u32];
-        let next: Vec<NoteId> = vec![0u32, 1u32];
-        let edit = make_select_notes_edit(prev, next);
-        let Edit::Undoable { forward, inverse, .. } = edit else {
-            panic!("expected Undoable");
-        };
-        forward(&mut model);
-        assert_eq!(model.selected_note_ids, vec![0, 1]);
-        inverse(&mut model);
-        assert_eq!(model.selected_note_ids, vec![0]);
-    }
-
-    #[test]
-    fn copy_notes_then_undo_round_trip_restores_notes_and_selection() {
-        // (M14 Phase 83 / daw_01 #054) 元 note 1 個を選択 → Copy で複製 (新位置 + 複製を選択)
-        // → undo で複製削除 + 複製前の selection 復元、を 1 往復で固定。
-        let mut model = PianoRollModel::new(vec![note(0, 1.0, 0.5, 60)]);
-        model.selected_note_ids = vec![0];
-        let deltas: Vec<MoveDelta> = vec![(0u32, 1.0_f64, 60u8, 3.0_f64, 62u8)];
-        let edit = make_copy_notes_edit(deltas, 1, vec![0]);
-        let Edit::Undoable { forward, inverse, .. } = edit else {
-            panic!("expected Undoable");
-        };
-        forward(&mut model);
-        // 元 note 据え置き + 複製 1 個 = 2 個、複製 (id 1) が新 selection。
-        assert_eq!(model.notes.len(), 2);
-        assert_eq!(model.selected_note_ids, vec![1]);
-        let dup = model.notes.iter().find(|n| n.id == 1).unwrap();
-        assert!((dup.start_beat - 3.0).abs() < 1e-6);
-        assert_eq!(dup.pitch, 62);
-        // 元 note (id 0) は据え置きで変化なし。
-        let src = model.notes.iter().find(|n| n.id == 0).unwrap();
-        assert!((src.start_beat - 1.0).abs() < 1e-6);
-        assert_eq!(src.pitch, 60);
-        // undo: 複製削除 + 複製前 selection (元 note) を復元。
-        inverse(&mut model);
-        assert_eq!(model.notes.len(), 1);
-        assert_eq!(model.selected_note_ids, vec![0], "undo で複製前の selection 復元");
-    }
-
-    #[test]
-    fn move_preserves_sort_order() {
-        let initial = vec![note(0, 0.0, 0.5, 60), note(1, 1.0, 0.5, 64)];
-        let mut model = PianoRollModel::new(initial);
-        let deltas: Vec<MoveDelta> =
-            vec![(0u32, 0.0_f64, 60u8, 2.0_f64, 60u8), (1u32, 1.0_f64, 64u8, 0.5_f64, 64u8)];
-        let edit = make_move_notes_edit(deltas);
-        if let Edit::Undoable { forward, .. } = edit {
-            forward(&mut model);
-        }
-        let order: Vec<NoteId> = model.notes.iter().map(|n| n.id).collect();
-        assert_eq!(order, vec![1, 0]);
-    }
-}

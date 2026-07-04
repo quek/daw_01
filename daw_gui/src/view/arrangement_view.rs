@@ -973,7 +973,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             display_value,
             desc.format,
             &style,
-            "LaneDefault",
             move |display_v| {
                 let target = target_for_change.clone();
                 Edit::mutate(move |app: &mut AppData| {

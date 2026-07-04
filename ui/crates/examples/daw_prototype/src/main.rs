@@ -453,14 +453,8 @@ impl App {
                 ui.request_redraw();
 
                 // M8 Phase 30: shortcut layer。
-                // - Ctrl+Z で undo / Ctrl+Shift+Z / Ctrl+Y で redo
+                // S4a: lib undo は撤去したので Ctrl+Z / Ctrl+Y は配線しない (undo はアプリ層の責務)。
                 // - Ctrl+O で audio file open dialog
-                if ui.take_shortcut("undo") {
-                    ui.request_undo();
-                }
-                if ui.take_shortcut("redo") {
-                    ui.request_redo();
-                }
                 if ui.take_shortcut("open") {
                     ui.request_open_file_dialog(
                         "open_audio",
@@ -499,10 +493,8 @@ impl App {
                 }
 
                 // ---- 1. menu_bar ----
-                // M9 P1-5: Undo/Redo の dynamic enable + shortcut hint。menu_bar の前に
-                // 取得して closure に move (内側 closure から borrow できるように `move` keyword)。
-                let edit_can_undo = ui.can_undo();
-                let edit_can_redo = ui.can_redo();
+                // M9 P1-5: Undo/Redo の shortcut hint。menu_bar の前に取得して closure に move。
+                // S4a: lib undo 撤去で can_undo/can_redo は消えたので、demo の enabled は固定。
                 let undo_hint = ui.shortcut_for("undo");
                 let redo_hint = ui.shortcut_for("redo");
                 ui.menu_bar(menu_rect, move |menu| {
@@ -554,30 +546,27 @@ impl App {
                         });
                     });
                     menu.menu("Edit", |sub| {
-                        // M9 P1-5 (C 案): on_click closure に &mut Ui を渡せるので、menu の Undo
-                        // から ui.request_undo() を直接発火可能。shortcut Ctrl+Z 経路と同等の動作。
-                        // enabled は can_undo() / can_redo() に基づいて動的に灰色化、shortcut_hint
-                        // で右端に "Ctrl+Z" 等を表示。
+                        // M9 P1-5 (C 案): on_click closure に &mut Ui を渡せる (menu item から
+                        // push_edit 発火)。S4a で lib undo は撤去したので、この demo の Undo/Redo は
+                        // last_action を書くだけの placeholder (undo はアプリ層が SongDoc 等で持つ)。
                         sub.item_with(MenuItemSpec {
                             label: "Undo",
                             on_click: Box::new(|ui| {
-                                ui.request_undo();
                                 ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                     m.last_action = "Edit → Undo (menu)".to_string();
                                 }));
                             }),
-                            enabled: edit_can_undo,
+                            enabled: true,
                             shortcut_hint: undo_hint,
                         });
                         sub.item_with(MenuItemSpec {
                             label: "Redo",
                             on_click: Box::new(|ui| {
-                                ui.request_redo();
                                 ui.push_edit(Edit::mutate(|m: &mut DawModel| {
                                     m.last_action = "Edit → Redo (menu)".to_string();
                                 }));
                             }),
-                            enabled: edit_can_redo,
+                            enabled: true,
                             shortcut_hint: redo_hint,
                         });
                     });
@@ -866,7 +855,7 @@ fn drawmixer_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pane: Rec
         // fader
         let fader_rect = Rect { x: cx, y: body_top, w: fader_w, h: body_h };
         let cur = m.faders[ch];
-        let _resp: FaderResponse = ui.fader_at(("ch_fader", ch), fader_rect, cur, 0.7, None, "fader", move |v| {
+        let _resp: FaderResponse = ui.fader_at(("ch_fader", ch), fader_rect, cur, 0.7, None, move |v| {
             Edit::mutate(move |m: &mut DawModel| m.faders[ch] = v)
         }, None);
 
@@ -1312,7 +1301,6 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
         120.0,
         daw_ui_core::ScrubableNumberFormat::Decimal(1),
         &scn_style,
-        "scrub bpm",
         |v: f64| {
             Edit::mutate(move |mm: &mut DawModel| {
                 #[allow(clippy::cast_possible_truncation)]
@@ -1350,7 +1338,6 @@ fn draw_arrangement_tab(ui: &mut daw_ui_core::Ui<'_, DawModel>, m: &DawModel, pa
             cur_vol,
             1.0,
             None,
-            "track volume",
             move |v| {
                 Edit::mutate(move |mm: &mut DawModel| {
                     if let Some(tt) = mm.arr_tracks.iter_mut().find(|t| t.id == tid) {

@@ -9068,36 +9068,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }));
         }
 
-        // ---- M10 Phase 47b+49: track volume drag release → Undoable Edit ----
+        // ---- M10 Phase 47b+49: track volume drag release → 最終値を 1 度 commit ----
         // drag 中は per-frame Mutate で live update 済 (mixer fader と挙動同期)。
-        // release frame は Mutate suppress + `Edit::with_inverse` で Undoable wrap (Ctrl+Z で 1 回 undo)。
-        // forward = end_value、inverse = anchor_volume の対称な make_edit 呼び出し。
+        // S4a: release frame は forward の Mutate を 1 度発行 (undo はアプリ層 SongDoc)。
+        // (このファイルは S4b で daw_gui/src/widgets/ へ移設 + 全面書き換え予定。ここは Undoable
+        //  variant 削除で compile を通すための最小変換。)
         if let Some(tv) = track_volume_release {
             let end = volume_from_mouse_x(tv.last_mouse_x, tv.band_rect.x, tv.band_rect.w);
             if (end - tv.anchor_volume).abs() > 1e-4 {
-                let track_id = tv.track_id;
-                let anchor = tv.anchor_volume;
-                let make_edit_fwd = make_edit.clone();
-                let make_edit_inv = make_edit.clone();
-                self.push_edit(Edit::with_inverse(
-                    "set track volume",
-                    move |m: &mut M| {
-                        make_edit_fwd(ArrangementEditRequest::SetTrackVolume {
-                            track: track_id,
-                            prev: anchor,
-                            next: end,
-                        })
-                        .apply(m);
-                    },
-                    move |m: &mut M| {
-                        make_edit_inv(ArrangementEditRequest::SetTrackVolume {
-                            track: track_id,
-                            prev: end,
-                            next: anchor,
-                        })
-                        .apply(m);
-                    },
-                ));
+                self.push_edit(make_edit(ArrangementEditRequest::SetTrackVolume {
+                    track: tv.track_id,
+                    prev: tv.anchor_volume,
+                    next: end,
+                }));
             }
         }
 

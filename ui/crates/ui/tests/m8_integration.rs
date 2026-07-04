@@ -1,7 +1,7 @@
 //! M8 Integration Tests
 //!
-//! Phase 29-34 の機能を `UiHost::frame` 経由で end-to-end に検証する:
-//! - Phase 29: `Edit::with_inverse` が history に積まれ、`Ui::request_undo` で巻き戻る
+//! Phase 30-34 の機能を `UiHost::frame` 経由で end-to-end に検証する:
+//! (Phase 29 の lib undo/history は S4a で撤去済 — undo SSoT はアプリ層)。
 //! - Phase 30: shortcut が `take_shortcut(name)` で消費される
 //! - Phase 30: focus traversal が Tab で次の focusable に移動する
 //! - Phase 31: NoopClipboard で paste が None / set が握りつぶされる
@@ -13,19 +13,17 @@
 use std::path::PathBuf;
 
 use daw_ui_core::{
-    DroppedFiles, Edit, FrameInput, InputAccumulator, NoopClipboard, PointerFrame, UiHost, WidgetId,
+    DroppedFiles, FrameInput, InputAccumulator, NoopClipboard, PointerFrame, UiHost, WidgetId,
 };
 use daw_ui_platform::{
     AppEvent, ElementState, KeyEvent, Modifiers, PhysicalKey, PhysicalPosition, PhysicalSize,
 };
 use daw_ui_renderer::{Rect, Scene};
 
-struct Model {
-    counter: i32,
-}
+struct Model;
 
 fn model() -> Model {
-    Model { counter: 0 }
+    Model
 }
 
 fn run<F>(host: &mut UiHost<Model>, model: &mut Model, input: FrameInput, f: F)
@@ -38,43 +36,12 @@ where
 }
 
 // ============================================================
-// Phase 29: history (undo / redo)
-// ============================================================
-
-#[test]
-fn undoable_edit_round_trip() {
-    let mut host: UiHost<Model> = UiHost::no_redraw();
-    let mut m = model();
-
-    // フレーム 1: undoable Edit を ui.push_edit で直接発行 (button の click 確定モデルを通さず simple に)
-    run(&mut host, &mut m, FrameInput::default(), |_, ui| {
-        ui.push_edit(Edit::with_inverse(
-            "set5",
-            |m: &mut Model| m.counter = 5,
-            |m: &mut Model| m.counter = 0,
-        ));
-    });
-    assert_eq!(m.counter, 5, "Undoable forward applied: counter == 5");
-    assert!(host.history().can_undo());
-    assert_eq!(host.history().undo_label(), Some("set5"));
-
-    // フレーム 2: ui.request_undo() で巻き戻し
-    run(&mut host, &mut m, FrameInput::default(), |_, ui| {
-        ui.request_undo();
-    });
-    assert_eq!(m.counter, 0, "request_undo: counter == 0 (inverse applied)");
-    assert!(host.history().can_redo());
-
-    // フレーム 3: ui.request_redo() で再適用
-    run(&mut host, &mut m, FrameInput::default(), |_, ui| {
-        ui.request_redo();
-    });
-    assert_eq!(m.counter, 5, "request_redo: counter == 5 (forward applied)");
-}
-
-// ============================================================
 // Phase 30: shortcut
 // ============================================================
+
+// S4a: lib undo/history (旧 Phase 29 の undoable_edit_round_trip) は撤去。undo はアプリ層の
+// 責務になったため、Edit は forward の Mutate のみ (forward apply の検証は edit.rs の unit test)。
+// Ctrl+Z / Ctrl+Y の shortcut 名マッチ自体は下の take_shortcut テストで引き続き検証する。
 
 #[test]
 fn shortcut_take_consumes_match() {

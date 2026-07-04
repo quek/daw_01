@@ -305,9 +305,8 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
     /// `default_value`: dblclick リセット時の値。 `style.range` の clamp は widget 側で実施。
     /// `format`: 表示書式 (Integer / Decimal(N))。 text input mode の parse もこれを SSoT に。
     /// `style`: 色 / sensitivity (units_per_pixel) / 任意 range など。
-    /// `label`: drag scrub の history label (= Ctrl+Z で表示される undo 単位名)。 dblclick reset /
-    ///   text commit も同 label を共有 (drag 中含む user 操作はすべて 1 undo step に集約)。
-    /// `on_change`: 値変化時の Edit を作る closure (knob_at と同形、 `Edit::Mutate` 限定で渡すこと)。
+    /// `on_change`: 値変化時の Edit を作る closure (knob_at と同形)。drag scrub / dblclick reset /
+    ///   text commit のいずれも同じ closure で forward mutation を発行する (undo はアプリ層の責務)。
     /// `placeholder`: `Some(s)` かつ **idle** (`!editing_text && drag_anchor 無`) のとき、 数値の
     ///   代わりに `s` を描画する (= 複数選択で値が割れている mixed 項目を `"—"` 表示する用途、 daw_01 #103)。
     ///   drag scrub 中 / 編集中は live 値・編集中テキストを優先 (placeholder 抑制)。 編集開始時の
@@ -327,13 +326,12 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         default_value: f64,
         format: ScrubableNumberFormat,
         style: &ScrubableNumberStyle,
-        label: &'static str,
         on_change: F,
         placeholder: Option<&str>,
         modulation: Option<Modulation<'_, M>>,
     ) -> ScrubableNumberResponse
     where
-        F: Fn(f64) -> Edit<M> + Clone + Send + Sync + 'static,
+        F: Fn(f64) -> Edit<M>,
     {
         let wid = WidgetId::ROOT.child((b"scrubable_number", &id));
         // 内部 `text_input_at_focused` の inner widget id を construct するため、 outer id を
@@ -515,43 +513,28 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
             self.push_edit((edit.on_mod_change)(final_depth));
         }
 
-        // reset: dblclick で default にリセット (1 frame、 Undoable で Ctrl+Z 戻し可)。
+        // reset: dblclick で default にリセット (1 frame、Mutate 1 発)。undo はアプリ層 (S4a)。
         if reset_fired && (default_value - value).abs() > f64::EPSILON {
-            let on_change_fwd = on_change.clone();
-            let on_change_inv = on_change.clone();
-            let start = value;
-            let end = default_value;
-            self.push_edit(Edit::with_inverse(
-                label,
-                move |m: &mut M| on_change_fwd(end).apply(m),
-                move |m: &mut M| on_change_inv(start).apply(m),
-            ));
+            self.push_edit(on_change(default_value));
         }
 
         // drag 中の per-frame 発火 (= short-click release は除外、 reset は別経路で済、
-        // release frame も skip — release frame は下の Undoable wrap で 1 度 commit する)。
+        // release frame も skip — release frame は下で最終値を 1 度 commit する)。
         if !short_click_release
             && !reset_fired
             && release_initial_value.is_none()
             && (displayed_value - value).abs() > f64::EPSILON
         {
-            self.push_edit(on_change.clone()(displayed_value));
+            self.push_edit(on_change(displayed_value));
         }
 
-        // release 時の最終値 (= drag scrub 完了)。 fader/knob と同 idiom で Undoable wrap、
-        // forward = on_change(end) / inverse = on_change(start) で 1 undo step。
+        // S4a: release 時の最終値 (= drag scrub 完了) を 1 度 commit (旧 Undoable の forward 相当)。
+        // undo はアプリ層 (daw_gui SongDoc) が担う。
         if let Some(start_value) = release_initial_value
             && (start_value - displayed_value).abs() > f64::EPSILON
             && !short_click_release
         {
-            let on_change_fwd = on_change.clone();
-            let on_change_inv = on_change.clone();
-            let end = displayed_value;
-            self.push_edit(Edit::with_inverse(
-                label,
-                move |m: &mut M| on_change_fwd(end).apply(m),
-                move |m: &mut M| on_change_inv(start_value).apply(m),
-            ));
+            self.push_edit(on_change(displayed_value));
         }
 
         // ---- text input mode (editing) の内蔵 delegate ----
@@ -581,7 +564,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 // clamp_opt と同じ防御 (反転 / 非有限 range で panic しない)。
                 let final_value = clamp_opt(parsed, style.range);
                 if (final_value - value).abs() > f64::EPSILON {
-                    self.push_edit(on_change.clone()(final_value));
+                    self.push_edit(on_change(final_value));
                 }
                 committed = true;
                 // editing 終了 (= inner widget は次 frame で見えなくなる、 focus 自動解除は inner 側が
@@ -904,7 +887,6 @@ mod tests {
                     default_value,
                     format,
                     style,
-                    "scrub bpm",
                     |v| Edit::mutate(move |m: &mut BpmModel| m.bpm = v),
                     placeholder,
                     None,
@@ -1259,7 +1241,6 @@ mod tests {
                     120.0,
                     ScrubableNumberFormat::Decimal(1),
                     style,
-                    "scrub",
                     |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v),
                     None,
                     Some(modulation),
@@ -1368,7 +1349,7 @@ mod tests {
             |_, ui| {
                 ui.scrubable_number_at(
                     "mtest", rect_default(), 120.0, 120.0,
-                    ScrubableNumberFormat::Decimal(1), &style, "scrub",
+                    ScrubableNumberFormat::Decimal(1), &style,
                     |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v),
                     None, None,
                 );
@@ -1486,7 +1467,7 @@ mod tests {
                 };
                 ui.scrubable_number_at(
                     "mtest", rect, model.bpm, 120.0, ScrubableNumberFormat::Decimal(1),
-                    &style, "scrub", |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v), None, Some(m),
+                    &style, |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v), None, Some(m),
                 );
             })
         };
@@ -1509,7 +1490,7 @@ mod tests {
         host_n.frame_to_edits(&model, &mut scene_none, screen, FrameInput::default(), |_, ui| {
             ui.scrubable_number_at(
                 "mtest", rect_default(), 120.0, 120.0, ScrubableNumberFormat::Decimal(1),
-                &style, "scrub", |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v), None, None,
+                &style, |v| Edit::mutate(move |m: &mut ModModel| m.bpm = v), None, None,
             );
         });
 

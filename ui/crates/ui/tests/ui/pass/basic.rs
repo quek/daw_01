@@ -79,19 +79,17 @@ fn main() {
             );
             // fader (M3): 矩形指定 + vstack 版の両方が non-Clone Model でコンパイルする。
             // default_value (4 番目の引数) はダブルクリックリセット用 (M3 Phase 4d)。
-            // M8 Phase 29: label (5 番目) は undoable Edit に付与される表示文字列。
-            // closure は `Fn + Clone + Send + Sync + 'static` (drag 終端で再呼び出しされる)。
+            // on_change は `Fn(f32) -> Edit<M>` のみ (S4a で lib undo 撤去、Clone 拘束不要)。
             let _ = ui.fader_at(
                 "vol",
                 Rect { x: 0.0, y: 0.0, w: 32.0, h: 120.0 },
                 m.volume,
                 0.0,
                 None,
-                "fader",
                 |v| Edit::mutate(move |m: &mut Model| m.volume = v),
                 None,
             );
-            let _ = ui.fader("vol2", m.volume, 0.0, None, "fader", |v| {
+            let _ = ui.fader("vol2", m.volume, 0.0, None, |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)
             });
             // knob (M3): 同様に non-Clone Model でコンパイルする。
@@ -100,20 +98,12 @@ fn main() {
                 Rect { x: 0.0, y: 0.0, w: 64.0, h: 64.0 },
                 m.volume,
                 0.5,
-                "knob",
                 |v| Edit::mutate(move |m: &mut Model| m.volume = v),
                 None,
             );
-            let _ = ui.knob("pan2", m.volume, 0.5, "knob", |v| {
+            let _ = ui.knob("pan2", m.volume, 0.5, |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)
             });
-            // M8 Phase 29: Edit::with_inverse は `Fn + Clone + Send + Sync` を要求するが、
-            // ユーザ Model 型に Clone を要求しない (closure 内でフィールドを set するだけ)。
-            let _undoable: Edit<Model> = Edit::with_inverse(
-                "set_volume",
-                |m: &mut Model| m.volume = 0.8,
-                |m: &mut Model| m.volume = 0.5,
-            );
             // checkbox (M3): non-Clone Model でコンパイルする。
             let _ = ui.checkbox_at(
                 "mute",
@@ -435,7 +425,6 @@ fn main() {
                 120.0,
                 ScrubableNumberFormat::Decimal(1),
                 &scn_style,
-                "scrub",
                 |_v: f64| Edit::mutate(|_m: &mut Model| {}),
                 None,
                 None,

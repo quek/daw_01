@@ -11,11 +11,7 @@
 //!         let r = drag.rect();
 //!         let new_sel: Vec<_> = model.notes.iter()
 //!             .filter(|n| r.contains_point(n.x, n.y)).map(|n| n.id).collect();
-//!         ui.push_edit(Edit::with_inverse(
-//!             "select notes",
-//!             move |m| m.selected = new_sel.clone(),
-//!             move |m| m.selected = old_sel.clone(),
-//!         ));
+//!         ui.push_edit(Edit::mutate(move |m| m.selected = new_sel));
 //!     }
 //! }
 //! ```

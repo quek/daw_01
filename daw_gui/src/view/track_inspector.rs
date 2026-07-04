@@ -120,7 +120,6 @@ fn scrub_field(
         default,
         fmt,
         style,
-        "Inspector",
         move |v| {
             let make_event = make_event.clone();
             Edit::mutate(move |app: &mut AppData| {
@@ -447,7 +446,6 @@ fn mod_rate_full(
             1.0,
             ScrubableNumberFormat::Decimal(2),
             &hz_style,
-            "Inspector",
             move |v| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::EditModSource {
@@ -671,7 +669,6 @@ fn draw_modulation_rack(
                     1.0,
                     ScrubableNumberFormat::Decimal(1),
                     &ar_style,
-                    "Inspector",
                     move |v| {
                         Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::SetModSourceAttack { id: sid, ms: v as f32 });
@@ -689,7 +686,6 @@ fn draw_modulation_rack(
                     100.0,
                     ScrubableNumberFormat::Decimal(1),
                     &ar_style,
-                    "Inspector",
                     move |v| {
                         Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::SetModSourceRelease { id: sid, ms: v as f32 });
@@ -754,7 +750,6 @@ fn draw_modulation_rack(
                     0.0,
                     ScrubableNumberFormat::Decimal(2),
                     &unit_style,
-                    "Inspector",
                     move |v| {
                         Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::EditModSource { id: sid, edit: E::LfoPhase(v as f32) });
@@ -774,7 +769,6 @@ fn draw_modulation_rack(
                         0.5,
                         ScrubableNumberFormat::Decimal(2),
                         &unit_style,
-                        "Inspector",
                         move |v| {
                             Edit::mutate(move |app: &mut AppData| {
                                 app.handle_event(AppEvent::EditModSource {
@@ -811,7 +805,6 @@ fn draw_modulation_rack(
                     1.0,
                     ScrubableNumberFormat::Decimal(2),
                     &unit_style,
-                    "Inspector",
                     move |v| {
                         Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::EditModSource { id: sid, edit: E::RandomSmooth(v as f32) });
@@ -955,7 +948,6 @@ fn draw_modulation_rack(
                     0.0,
                     ScrubableNumberFormat::Decimal(2),
                     &unit_style,
-                    "Inspector",
                     move |v| {
                         Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepsSlew(v as f32) });
@@ -1001,7 +993,6 @@ fn draw_modulation_rack(
                     1.0,
                     ScrubableNumberFormat::Decimal(2),
                     &SCRUB_STYLE_INSPECTOR,
-                    "Inspector",
                     move |v| {
                         let tgt = tgt.clone();
                         Edit::mutate(move |app: &mut AppData| {
@@ -2110,7 +2101,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 default,
                 fmt,
                 &style,
-                "Group Transform",
                 move |v| {
                     // Rotation は degree 入力 → radians に変換して設定。
                     let value = if matches!(param, G::Rotation) {
@@ -2213,7 +2203,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 default_real,
                 ScrubableNumberFormat::Decimal(3),
                 &style,
-                "Video FX",
                 move |v| {
                     #[allow(clippy::cast_possible_truncation)]
                     Edit::mutate(move |app: &mut AppData| {
@@ -2309,7 +2298,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 p.default_real,
                 fmt,
                 &style,
-                "Plugin",
                 move |v| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::SetPluginParam {
@@ -3121,7 +3109,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 default,
                 ScrubableNumberFormat::Decimal(2),
                 &SCRUB_STYLE_INSPECTOR,
-                "Inspector",
                 move |v| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::SetClipTalkParam {

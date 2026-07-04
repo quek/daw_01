@@ -63,8 +63,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 適用するのでカーブ一致がコードで保証される (`scale: Some(_)` 前提)。 `style.peak_readout = true`
     /// で上端に peak 帯を確保し、 それを除いた領域が共有 region になる。
     ///
-    /// `on_change(new_db)` が値変化時に `Edit<M>` を発行する (undo/redo は dB 空間、 `fader_at` と同じ
-    /// inverse 機構)。 frac0 (下端) は `f32::NEG_INFINITY` で渡る。
+    /// `on_change(new_db)` が値変化時に `Edit<M>` を発行する (dB 空間、 `fader_at` と同じ発行機構、
+    /// undo はアプリ層の責務)。 frac0 (下端) は `f32::NEG_INFINITY` で渡る。
     ///
     /// `modulation`: `Some` で Bitwig 流 modulation を表示・編集する (daw_01 #110、 #109 knob / #107
     ///   scrubable の fader 版)。 `None` で従来描画・従来挙動 (完全回帰)。 値ドメインは dB でなく
@@ -87,12 +87,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         r: f32,
         ballistic: MeterBallistic,
         style: LevelMeterStyle,
-        label: &'static str,
         on_change: F,
         modulation: Option<Modulation<'_, M>>,
     ) -> ChannelFaderMeterResponse
     where
-        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
+        F: Fn(f32) -> Edit<M>,
     {
         // 共有 dB→y 領域: group rect から 1 度だけ導出する。 fader と meter は同じ rect.y / rect.h を
         // 見るので、 この region.y / region.h を両方に渡せば画素整合する (SSoT、 #083 の本質)。
@@ -118,7 +117,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             volume_db,
             default_db,
             style.scale,
-            label,
             on_change,
             modulation,
         );
@@ -204,7 +202,6 @@ mod tests {
                     r,
                     MeterBallistic::Peak,
                     style(),
-                    "Volume",
                     |new_db| Edit::mutate(move |m: &mut Vol| m.db = new_db),
                     None,
                 );
@@ -417,7 +414,6 @@ mod tests {
                         r,
                         MeterBallistic::Peak,
                         style(),
-                        "Volume",
                         |new_db| Edit::mutate(move |mm: &mut VolMod| mm.db = new_db),
                         Some(modu),
                     );

@@ -253,7 +253,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         120.0,
         ScrubableNumberFormat::Decimal(1),
         &SCRUB_STYLE_BPM,
-        "BPM",
         move |v| {
             #[allow(clippy::cast_possible_truncation)]
             let next = v as f32;
@@ -293,7 +292,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         4.0,
         ScrubableNumberFormat::Integer,
         &SCRUB_STYLE_TSIG_NUM,
-        "Time Sig Numerator",
         move |v: f64| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let next = v.round().clamp(1.0, 32.0) as u8;

@@ -24,7 +24,6 @@ use daw_ui_renderer::{
 use crate::clipboard::ClipboardProvider;
 use crate::dialog::{DialogKind, DialogRequest, DialogResult, FileDialogFilter};
 use crate::edit::Edit;
-use crate::history::{HistoryEntry, HistoryStack};
 use crate::id::WidgetId;
 use crate::input::{DroppedFiles, FrameInput, ImeEvent, PointerFrame};
 use crate::popup::PopupOpenState;
@@ -47,8 +46,7 @@ use crate::widgets::drag_rect::{DragRect, DragRectState};
 /// focus が変わったフレームでは **自動で `request_redraw` を呼ぶ** ため、利用者は
 /// boilerplate (`for e in edits { e.apply(...) }` や `had_edits` 判定) を書く必要が
 /// 一切ない。
-/// `focus_changed_in_last_frame` / `redraw_requested_in_last_frame` / M8 の
-/// `transient_undo_requested` / `transient_redo_requested` がそれぞれ独立した
+/// `focus_changed_in_last_frame` / `redraw_requested_in_last_frame` がそれぞれ独立した
 /// 「frame 内で 1 度だけ書かれる」フラグで意味的に正交、state machine 化のメリットなし。
 /// **(M15)** focus 中 text_input の document snapshot を OS text store に publish する callback。
 type SetTextDocumentFn = Box<dyn Fn(Option<&TextDocument>) + Send + Sync>;
@@ -101,8 +99,6 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだ場合の累積フラグ。
     /// `frame()` の最後で `redraw_request` 呼び出し条件に含まれる。
     redraw_requested_in_last_frame: bool,
-    /// M8 Phase 29: undo / redo stack。
-    history: HistoryStack<M>,
     /// M8 Phase 30: shortcut 登録テーブル。
     shortcut_map: ShortcutMap,
     /// M8 Phase 31: OS clipboard provider (None なら set/get は no-op)。
@@ -113,15 +109,13 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// Tab / arrow nav の対象決定用。
     last_focusable: Vec<(WidgetId, Rect)>,
     /// M8: `frame_to_edits` で Ui が書いた transient な request 群。`frame()` の後半で
-    /// drain される (undo/redo apply, clipboard write, dialog 同期実行, cursor flush)。
+    /// drain される (clipboard write, dialog 同期実行, cursor flush)。
     ///
     /// **`frame_to_edits` 単独で使う場合の挙動**: 各 transient フィールドは `frame_to_edits`
     /// 冒頭で `clear()` されるため、 累積 leak はない (call N+1 で N 件目の transient は捨てられる)。
-    /// ただし undo/redo / clipboard write / dialog 同期実行 は **発火しない**。
+    /// ただし clipboard write / dialog 同期実行 は **発火しない**。
     /// edits を audio thread に送る用途では transient は通常不要だが、 必要なら
     /// `frame()` を使う (内部で `frame_to_edits` + transient drain + 自動 request_redraw を実行)。
-    transient_undo_requested: bool,
-    transient_redo_requested: bool,
     transient_clipboard_writes: Vec<String>,
     transient_dialog_requests: Vec<DialogRequest>,
     transient_consumed_dialog_results: HashSet<&'static str>,
@@ -172,10 +166,6 @@ pub struct FrameStats {
     pub widget_count: u32,
     /// frame 末尾の scenegraph entry 数 (eviction 後)。`widget_count` と通常一致。
     pub scenegraph_size: u32,
-    /// frame 末尾の history undo stack 深さ。
-    pub history_undo_depth: u32,
-    /// frame 末尾の history redo stack 深さ。
-    pub history_redo_depth: u32,
 }
 
 impl FrameStats {
@@ -205,13 +195,10 @@ impl<M: ?Sized + 'static> UiHost<M> {
             redraw_request: Box::new(redraw_request),
             open_popups: HashMap::new(),
             redraw_requested_in_last_frame: false,
-            history: HistoryStack::default(),
             shortcut_map: ShortcutMap::with_default_bindings(),
             clipboard: None,
             pending_dialog_results: HashMap::new(),
             last_focusable: Vec::new(),
-            transient_undo_requested: false,
-            transient_redo_requested: false,
             transient_clipboard_writes: Vec::new(),
             transient_dialog_requests: Vec::new(),
             transient_consumed_dialog_results: HashSet::new(),
@@ -248,13 +235,6 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.last_frame_stats
     }
 
-    /// M8 Phase 29: history stack の容量を変更 (default 100 step、0 で無効化)。
-    #[must_use]
-    pub fn with_history_capacity(mut self, n: usize) -> Self {
-        self.history.set_capacity(n);
-        self
-    }
-
     /// M8 Phase 30: shortcut map を完全に置き換える (preference の serialize/deserialize 用)。
     #[must_use]
     pub fn with_shortcut_map(mut self, map: ShortcutMap) -> Self {
@@ -269,16 +249,6 @@ impl<M: ?Sized + 'static> UiHost<M> {
     pub fn with_clipboard<C: ClipboardProvider + 'static>(mut self, provider: C) -> Self {
         self.clipboard = Some(Box::new(provider));
         self
-    }
-
-    /// M8 Phase 29: history stack への参照 (`undo_label` / `can_undo` 等の query 用)。
-    pub fn history(&self) -> &HistoryStack<M> {
-        &self.history
-    }
-
-    /// M8 Phase 29: history stack への mutable 参照 (project 切替時に clear 等)。
-    pub fn history_mut(&mut self) -> &mut HistoryStack<M> {
-        &mut self.history
     }
 
     /// M8 Phase 30: shortcut map への参照 (preference の serialize 用)。
@@ -354,10 +324,9 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// `f` は `(&model, &mut Ui)` を受け取り、ウィジェットを呼び出して UI を組む。
     /// 内部動作:
     /// 1. scene を積みつつ edits を収集 (build クロージャは古い model 値で 1 度だけ実行)
-    /// 2. **M8**: undo/redo 要求があれば `HistoryStack` に対して実行
-    /// 3. 収集した edits を `&mut model` に apply (`Undoable` は forward + history.push)
-    /// 4. **M8**: clipboard write / file dialog 同期実行 / dialog 結果クリーンアップ
-    /// 5. edits / undo / redo / focus 変化があった場合は `redraw_request` を呼ぶ
+    /// 2. 収集した edits を `&mut model` に apply (forward mutation のみ)
+    /// 3. **M8**: clipboard write / file dialog 同期実行 / dialog 結果クリーンアップ
+    /// 4. edits / focus 変化があった場合は `redraw_request` を呼ぶ
     ///    → 次フレームで apply 後の値で再描画される (immediate-mode + Edit queue の必然対処)
     pub fn frame<F>(
         &mut self,
@@ -372,29 +341,9 @@ impl<M: ?Sized + 'static> UiHost<M> {
         let edits = self.frame_to_edits(&*model, scene, screen, input, f);
         let had_edits = !edits.is_empty();
 
-        // M8 Phase 29: undo / redo (edits apply の前に行う = 「undo を要求したフレームでは
-        // 同フレームの edits は通常通り反映、その後の undo step で巻き戻す」のは紛らわしい
-        // ので、**undo → edits apply** の順)。
-        // つまり「Undo は前フレームまでに積まれた entry を巻き戻し、新規 edits は前進的に積む」。
-        let undo_req = self.transient_undo_requested;
-        let redo_req = self.transient_redo_requested;
-        if undo_req {
-            let _ = self.history.undo(model);
-        }
-        if redo_req {
-            let _ = self.history.redo(model);
-        }
-
-        // edits apply。Undoable は forward を実行 + (forward, inverse, label) を history へ push。
+        // edits apply (forward mutation のみ)。undo/redo はアプリ層の責務 (S4a で lib undo 撤去)。
         for e in edits {
-            match e {
-                Edit::Mutate(f) => f(model),
-                Edit::Undoable { forward, inverse, label } => {
-                    forward(model);
-                    self.history
-                        .push(HistoryEntry::new(forward, inverse, label));
-                }
-            }
+            e.apply(model);
         }
 
         // M8 Phase 31: clipboard write (frame 末尾で provider に書き込み)。
@@ -441,11 +390,9 @@ impl<M: ?Sized + 'static> UiHost<M> {
             req(self.last_text_document.as_ref());
         }
 
-        // 自動 redraw の発火条件: edits / undo / redo / focus 変化 / widget からの request_redraw
+        // 自動 redraw の発火条件: edits / focus 変化 / widget からの request_redraw
         // / dialog 実行 (新結果が出た) / 残っている dialog 結果 (widget が次フレームで取り出す)。
         if had_edits
-            || undo_req
-            || redo_req
             || self.focus_changed_in_last_frame
             || self.redraw_requested_in_last_frame
             || dialog_runs
@@ -547,15 +494,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
                 None
             };
 
-        // M8 Phase 29: history の現状をスナップショットして Ui に渡す (`can_undo` 等の query 用)。
-        let history_can_undo = self.history.can_undo();
-        let history_can_redo = self.history.can_redo();
-        let history_undo_label = self.history.undo_label();
-        let history_redo_label = self.history.redo_label();
-
         // transient outputs (`frame()` 後半で読まれる) を frame 頭でクリア。
-        self.transient_undo_requested = false;
-        self.transient_redo_requested = false;
         self.transient_clipboard_writes.clear();
         self.transient_dialog_requests.clear();
         self.transient_consumed_dialog_results.clear();
@@ -666,12 +605,6 @@ impl<M: ?Sized + 'static> UiHost<M> {
             typing_focus: &mut typing_focus,
             text_metrics: &mut self.text_metrics,
             shortcut_map: &self.shortcut_map,
-            pending_undo: &mut self.transient_undo_requested,
-            pending_redo: &mut self.transient_redo_requested,
-            history_can_undo,
-            history_can_redo,
-            history_undo_label,
-            history_redo_label,
             pending_clipboard_paste,
             pending_clipboard_writes: &mut self.transient_clipboard_writes,
             pending_dialog_requests: &mut self.transient_dialog_requests,
@@ -761,8 +694,6 @@ impl<M: ?Sized + 'static> UiHost<M> {
             cache_misses: self.current_cache_misses,
             widget_count: u32::try_from(seen_widgets.len()).unwrap_or(u32::MAX),
             scenegraph_size: u32::try_from(self.scenegraph.len()).unwrap_or(u32::MAX),
-            history_undo_depth: u32::try_from(self.history.undo_len()).unwrap_or(u32::MAX),
-            history_redo_depth: u32::try_from(self.history.redo_len()).unwrap_or(u32::MAX),
         };
         edits
     }
@@ -779,10 +710,9 @@ impl<M: ?Sized + 'static> Default for UiHost<M> {
 /// `'a` は `&'a M` 借用と同じ寿命。`Edit<M>` は `'static` (M1) なので Ui のライフタイムから
 /// 切り離せる。
 ///
-/// M8 で transient bool 群 (typing_focus / pending_undo / pending_redo / history_can_undo /
-/// history_can_redo + 既存の focus_changed_this_frame / drawing_in_popup) が増えたが、
-/// それぞれが「frame 内で 1 度だけ書かれる / 読まれる」フラグで意味が独立しているため、
-/// `clippy::struct_excessive_bools` を allow する (state machine 化はオーバーヘッド過大)。
+/// M8 で transient bool 群 (typing_focus + 既存の focus_changed_this_frame / drawing_in_popup)
+/// が増えたが、それぞれが「frame 内で 1 度だけ書かれる / 読まれる」フラグで意味が独立している
+/// ため、`clippy::struct_excessive_bools` を allow する (state machine 化はオーバーヘッド過大)。
 #[allow(clippy::struct_excessive_bools)]
 pub struct Ui<'a, M: ?Sized + 'static> {
     state: &'a mut HashMap<WidgetId, Box<dyn WidgetState>>,
@@ -867,13 +797,6 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     pub(crate) text_metrics: &'a mut TextMetrics,
     /// shortcut display_for などの query 用 (mutable は UiHost::shortcut_map_mut 経由)。
     pub(crate) shortcut_map: &'a ShortcutMap,
-    // ---- M8 Phase 29 history ----
-    pub(crate) pending_undo: &'a mut bool,
-    pub(crate) pending_redo: &'a mut bool,
-    pub(crate) history_can_undo: bool,
-    pub(crate) history_can_redo: bool,
-    pub(crate) history_undo_label: Option<&'static str>,
-    pub(crate) history_redo_label: Option<&'static str>,
     // ---- M8 Phase 31 clipboard ----
     /// frame 頭に paste shortcut が match していれば provider から read 済み。`take_clipboard_paste`
     /// で widget が 1 度だけ取り出す。
@@ -1427,7 +1350,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// - frame: `{frame_ms:.2}ms` (引数 `frame_ms` < 1e-6 なら省略)
     /// - cache: `{hits} / {hits+misses}` + ヒット率 `{rate:.0}%`
     /// - widgets: `{widget_count}` (scenegraph_size と通常一致)
-    /// - history: `undo {undo_depth} / redo {redo_depth}`
     ///
     /// 統計は **前フレーム** の値 (今フレームは描画中でまだ確定していない)。`Ui::take_shortcut`
     /// を組み合わせると Ctrl+F1 で toggle できる:
@@ -1458,10 +1380,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             ));
             v.push(format!("wgts   {}", stats.widget_count));
             v.push(format!("sg     {}", stats.scenegraph_size));
-            v.push(format!(
-                "hist   undo {} / redo {}",
-                stats.history_undo_depth, stats.history_redo_depth
-            ));
             v
         };
         let lines_n = lines.len() as f32;
@@ -1612,42 +1530,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             return None;
         }
         Some((px, py))
-    }
-
-    // ============================================================
-    // M8 Phase 29: history (undo / redo)
-    // ============================================================
-
-    /// frame 末尾で UiHost に「undo してください」と要求 (実体は次の `UiHost::frame` 末尾で実行)。
-    /// 1 フレーム内に複数回呼ばれても 1 度として扱う (idempotent)。
-    pub fn request_undo(&mut self) {
-        *self.pending_undo = true;
-    }
-
-    /// frame 末尾で UiHost に「redo してください」と要求。
-    pub fn request_redo(&mut self) {
-        *self.pending_redo = true;
-    }
-
-    #[must_use]
-    pub fn can_undo(&self) -> bool {
-        self.history_can_undo
-    }
-
-    #[must_use]
-    pub fn can_redo(&self) -> bool {
-        self.history_can_redo
-    }
-
-    /// menu の "Undo (fader change)" 表記用のラベル取得。`None` なら undo stack が空。
-    #[must_use]
-    pub fn undo_label(&self) -> Option<&'static str> {
-        self.history_undo_label
-    }
-
-    #[must_use]
-    pub fn redo_label(&self) -> Option<&'static str> {
-        self.history_redo_label
     }
 
     // ============================================================
@@ -2254,9 +2136,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
     }
 
-    /// 内部: WidgetId に紐付く永続状態を取得 or 初期化。
-    /// (M2 で waveform の LOD ピラミッドキャッシュに、M3 以降は fader/knob のドラッグ状態に使う)
-    pub(crate) fn widget_state<S: WidgetState + Default + 'static>(
+    /// `WidgetId` に紐付く永続状態 (retained state) を取得 or 初期化する。
+    ///
+    /// immediate-mode の widget が、フレーム間で保持したい状態 (drag anchor / LOD キャッシュ /
+    /// last-click 等) を id-keyed で持つための**拡張点**。lib 内の fader/knob/waveform も同じ
+    /// 経路で drag 状態を持つが、これを `pub` にすることで **lib 外 (daw_gui 側) の widget も**
+    /// 自前の retained 状態を持てる (S4b/c で移設する arrangement/piano_roll がこれを使う。
+    /// 「stateful widget は lib 内にしか書けない」という構造制約の解消)。
+    ///
+    /// `S` は `WidgetState` (= `Any + Send + Sync` の任意型に blanket 実装) + `Default`。
+    /// 同じ id を別の型 `S` で取り直すと downcast に失敗して panic するので、id と型は 1:1 で使う。
+    pub fn widget_state<S: WidgetState + Default + 'static>(
         &mut self,
         id: WidgetId,
     ) -> &mut S {
@@ -3280,8 +3170,6 @@ mod tests {
         assert_eq!(s.cache_misses, 0);
         assert_eq!(s.widget_count, 0);
         assert_eq!(s.scenegraph_size, 0);
-        assert_eq!(s.history_undo_depth, 0);
-        assert_eq!(s.history_redo_depth, 0);
     }
 
     #[test]
@@ -3347,23 +3235,24 @@ mod tests {
             scene.popup_rect_count() >= 1,
             "debug_overlay は popup buffer の rect を 1 個以上積む"
         );
+        // S4a: history 行を撤去したので frame_ms 含めて frame/cache/wgts/sg の 4 行。
         assert!(
-            scene.popup_glyph_count() >= 5,
-            "debug_overlay は popup buffer の glyph を 5 行以上積む (frame_ms 含む)"
+            scene.popup_glyph_count() >= 4,
+            "debug_overlay は popup buffer の glyph を 4 行以上積む (frame_ms 含む)"
         );
     }
 
     #[test]
     fn debug_overlay_omits_frame_ms_when_zero() {
-        // frame_ms = 0.0 を渡したら frame 行は省略 (= cache + wgts + sg + hist の 4 行)
+        // frame_ms = 0.0 を渡したら frame 行は省略 (= cache + wgts + sg の 3 行、S4a で hist 撤去)
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 400, height: 300 };
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }, 0.0);
         });
-        // popup buffer の glyph_areas に 4 行 (frame_ms 省略)。
-        assert_eq!(scene.popup_glyph_count(), 4, "frame_ms=0 で frame 行省略 → 4 行");
+        // popup buffer の glyph_areas に 3 行 (frame_ms 省略)。
+        assert_eq!(scene.popup_glyph_count(), 3, "frame_ms=0 で frame 行省略 → 3 行");
     }
 
     // -------- M9 P1-4: take_double_click_in_rect --------

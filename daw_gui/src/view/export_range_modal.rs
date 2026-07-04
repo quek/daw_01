@@ -302,7 +302,6 @@ fn field_row<F>(
         default_value,
         ScrubableNumberFormat::BarBeat { beats_per_bar },
         &SCRUB_STYLE,
-        "Export range",
         on_change,
         None,
         None,

@@ -639,8 +639,8 @@ impl ApplicationHandler<AppEvent> for Runner {
         // に自動接続する。これが無いと widget 内の `Ui::set_cursor` 要求が OS まで
         // 届かず、ピアノロール / アレンジビューの hover / drag でカーソル形状が
         // 変わらない。
+        // undo は daw_gui の SongDoc snapshot が SSoT (lib 側 undo は S4a で撤去)。
         let ui = UiHost::<AppData>::with_window(dwin.clone())
-            .with_history_capacity(200)
             .with_shortcut_map(daw_shortcut_map())
             .with_clipboard(ArboardClipboard::new());
 

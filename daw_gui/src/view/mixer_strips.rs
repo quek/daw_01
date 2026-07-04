@@ -494,7 +494,6 @@ fn draw_strip(
             Rect { x: knob_x, y, w: KNOB_SIZE, h: KNOB_SIZE },
             knob_value,
             0.5,
-            "Pan",
             move |v| {
                 let pan = v * 2.0 - 1.0;
                 Edit::mutate(move |app: &mut AppData| {
@@ -531,7 +530,6 @@ fn draw_strip(
     let fader_db = if volume <= 0.0 { f32::NEG_INFINITY } else { 20.0 * volume.log10() };
     let track_idx_for_vol = track_idx;
     let is_master_for_vol = is_master;
-    let fader_label: &'static str = if is_master_for_vol { "Master Volume" } else { "Track Volume" };
     // fader ハンドル・L/R メーター・dB 目盛り・0dB 線・
     // peak を「ただ一つの dB→ピクセル y 写像」から配置する単一 widget に統一。
     // group rect (group_w = FADER_W + METER_GAP + METER_SCALE_W = 55) を渡すと
@@ -565,7 +563,6 @@ fn draw_strip(
         peak_r_raw,
         MeterBallistic::Peak,
         style,
-        fader_label,
         move |new_db| {
             let amp = if new_db.is_finite() { 10f32.powf(new_db / 20.0) } else { 0.0 };
             Edit::mutate(move |app: &mut AppData| {
@@ -710,7 +707,6 @@ fn draw_sends_section(
             (live_gain * 0.5).clamp(0.0, 1.0),
             // double-click reset = unity (= 1.0 linear → 0.5 normalized)。
             0.5,
-            "Send",
             move |v| {
                 let gain = v * 2.0;
                 Edit::mutate(move |app: &mut AppData| {

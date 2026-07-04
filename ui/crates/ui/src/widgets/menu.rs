@@ -19,12 +19,12 @@ use crate::ui::Ui;
 
 /// menu item の click 時に実行される closure 型 (M9 P1-5 で `&mut Ui<'_, M>` を受け取る形に変更)。
 ///
-/// closure 内で任意の `Ui` method (`push_edit` / `request_undo` / `request_redo` / `set_focus` /
-/// `take_clipboard_paste` 等) を呼べる。`Edit::mutate(...)` を発行するだけなら `|ui|
-/// ui.push_edit(Edit::mutate(...))` のように書く。
+/// closure 内で任意の `Ui` method (`push_edit` / `set_focus` / `take_clipboard_paste` 等) を
+/// 呼べる。`Edit::mutate(...)` を発行するだけなら `|ui| ui.push_edit(Edit::mutate(...))` のように
+/// 書く (undo/redo はアプリ層の責務で、S4a 以降 lib には undo API が無い)。
 ///
 /// 設計判断 (P1-5 で B 案 enum 列挙ではなく C 案 `&mut Ui` 採用):
-/// - menu item の action は単一の Edit ではなく「任意の UI 操作」(undo/redo / popup close /
+/// - menu item の action は単一の Edit ではなく「任意の UI 操作」(popup close /
 ///   focus 移動 / 複数 Edit 発行) を取りたい。Ui を渡すのが最も自由度高い。
 /// - fader/knob の `on_change: Fn(f32) -> Edit<M>` は「単一値の変更」のため Ui 不要。
 ///   menu item は本質的に異なる widget なので別 signature。
@@ -148,12 +148,12 @@ impl<'a, M: ?Sized + 'static> Default for MenuBuilder<'a, M> {
 
 impl<'a, M: ?Sized + 'static> MenuBuilder<'a, M> {
     /// 通常の item を追加 (短縮形)。click で `on_click(ui)` が呼ばれ、closure 内で任意の
-    /// Ui 操作 (`push_edit` / `request_undo` / etc) を行う。click 後に親 popup close。
+    /// Ui 操作 (`push_edit` / `set_focus` / etc) を行う。click 後に親 popup close。
     /// `enabled: true / shortcut_hint: None` 相当。`item_with` で完全指定可。
     ///
     /// ```ignore
     /// menu.item("Add", |ui| ui.push_edit(Edit::mutate(|m: &mut M| m.add())));
-    /// menu.item("Undo", |ui| ui.request_undo());
+    /// menu.item("Undo", |ui| ui.push_edit(Edit::mutate(|m: &mut M| m.undo())));
     /// ```
     pub fn item<F>(&mut self, label: &'a str, on_click: F) -> &mut Self
     where
@@ -174,8 +174,8 @@ impl<'a, M: ?Sized + 'static> MenuBuilder<'a, M> {
     /// ```ignore
     /// menu.item_with(MenuItemSpec {
     ///     label: "Undo",
-    ///     on_click: Box::new(|| Edit::mutate(|m: &mut MyModel| m.undo())),
-    ///     enabled: ui.can_undo(),
+    ///     on_click: Box::new(|ui| ui.push_edit(Edit::mutate(|m: &mut MyModel| m.undo()))),
+    ///     enabled: app_can_undo,
     ///     shortcut_hint: ui.shortcut_for("undo").as_deref(),
     /// });
     /// ```
@@ -612,7 +612,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 clicked_action = draw_menu_entries(ui, &mut entries, popup_rect, &id_path);
             });
             if let Some(action) = clicked_action {
-                // M9 P1-5 (C 案): action は &mut Ui を受け、closure 内で push_edit / request_undo
+                // M9 P1-5 (C 案): action は &mut Ui を受け、closure 内で push_edit / set_focus
                 // 等の任意操作を行う。library 側は popup close のみ自動。
                 action(self);
                 // M14 Phase 120 (daw_01 #095): cascade item の click は `close_popup(id)` (top-level)
@@ -631,7 +631,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ///
     /// 利用者は右クリック判定 / popup ライフサイクル管理が一切不要 (M7 設計判断: library 吸収)。
     /// M9 P1-5 (C 案): `on_select` は `(idx, &mut Ui<'_, M>)` を受け、closure 内で任意の
-    /// `Ui` 操作 (`push_edit` / `request_undo` / etc) を行う。
+    /// `Ui` 操作 (`push_edit` / `set_focus` / etc) を行う。
     ///
     /// ```ignore
     /// ui.context_menu_for(clip_rect, &["Cut", "Copy", "Delete"], |idx, ui| match idx {

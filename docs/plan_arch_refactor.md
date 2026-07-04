@@ -300,13 +300,33 @@ runner.rs が S3b と S4 の共有チョークポイント (lib undo の `with_h
   pub 化。examples/ui tests 追従。runner.rs の history 配線削除。
 - **S4b: arrangement 移設** — `daw_gui/src/widgets/arrangement/` へ移し `common::model` 直結 +
   `edit_song` 経由の `Edit<AppData>` 直発行。mirror 型 / EditRequest 58 / make_edit 736 /
-  変換 / 二重 clone / rect 輸出上書き描画を全廃。4,600 行関数を interaction 単位
+  変換 / 二重 clone を全廃。4,600 行関数を interaction 単位
   (clip drag / section / automation / reorder / header / ruler / draw) に分解。in-file
   テストは `daw_gui/tests/` へ移し common::model ベースに。
+  - **【correctness・必達】二相描画のマジックインセット廃止**: 現在アプリ
+    (`arrangement_view.rs:2908` / `:3152`) が widget の返す `clip_rect` の上に波形/MIDI
+    プレビューを `inset_top = 14.0` **ハードコード**で重ね描きしている。widget 側はラベル帯を
+    `style.clip_text_size`(=11.0) から算出しており、**共有定数がない二重同期** (コメント自身が
+    「同じ inset で視覚的に一致させる」と認める)。`clip_text_size` を変えると波形がラベルに
+    めり込む潜在バグ。移設後は widget が**同一レイアウトパスでクローム + 中身を描く**ので
+    inset が単一 SSoT になり乖離が原理消滅する。rect 輸出は **入力用 (hit-test /
+    context-menu アンカー = `clip_rects`) は残し、描画用 (中身の上書き描画経路) を廃止** して
+    widget 内描画へ移す。この 2 種を混同しないこと。
 - **S4c: piano_roll 移設** — 同様。`notes_generation` 削除 (content-hash 一本化)。
 - **S4d: renderer/core 衛生** — 意味色 (SOLO/PLAYHEAD/RECORD/CLIP_DEFAULT) を renderer から
   ui-core / daw_gui theme へ、FontSystem 二重ロード解消、`snap.rs`/`time.rs`/
   `split_into_morae` を common へ (S5 と調整)。examples/{arrangement,piano_roll,daw_prototype} 削除。
+
+**S4b/c の検証は実機必須**: arrangement / piano_roll は **immediate-mode の interactive
+hot path** (drag session / hit-test / 座標変換) で、mirror 型 → `common::model` 直結・
+EditRequest → `edit_song` 直発行への書き換えは、データ源と出力を替えつつ interaction
+ロジックを不変に保つ必要がある。**この種の regression は unit test をすり抜ける** (B5
+finding が指摘した「widget がクロームを描き中身はアプリが rect で描き足す二相 +
+hardcode inset」の性質)。よって S4b/c の完了判定は build/test green に加え:
+(1) `daw_gui --smoke-test` (video preview 経路)、(2) **実機 sign-off で clip drag /
+resize / split / セクション / automation lane 編集 / piano_roll ノート編集・velocity・
+歌詞・snap を目視**。S4b/c 着手前に必ずチェックポイント commit を切り、regression 時に
+即 rollback できるようにする。
 
 ## 9. common 縮退 [B6]
 

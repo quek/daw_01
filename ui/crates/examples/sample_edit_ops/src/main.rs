@@ -26,14 +26,24 @@ use daw_ui_core::{
     WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView,
 };
 
-// ----- Edit factory (M9 Phase 42: trim / fade in / fade out を Undoable 化) -----
+// ----- Edit factory (trim / fade in / fade out) -----
 //
-// 戦略 (混在):
-// - trim: full snapshot (Vec<Vec<f32>> 全体 + viewport/selection/cursor) を保持。
-//   範囲外データを drain で削除するので、復元には全体が必要。
-// - fade in / out: 範囲 snapshot (Vec<f32> の e-s 個) のみ保持。範囲内変更だけなので
-//   範囲だけ保存で復元可能 (メモリ効率)。
-// 両戦略を 1 つの `Edit::snapshot_inverse` で書けることが Phase 42 の検証点。
+// S4a: lib 側 undo (`Edit::snapshot_inverse`) は撤去された。この demo では forward だけを
+// 適用する薄い shim を置き、旧 factory の本体 (forward / inverse クロージャ) は書き換えずに
+// 使い回す (inverse は無視 = undo 非対応)。undo が要るアプリは自前 snapshot 機構を持つ。
+// trim は full snapshot、fade は範囲 snapshot を forward が参照する構造はそのまま。
+fn snapshot_forward<S, F, R>(
+    _label: &'static str,
+    snapshot: S,
+    forward: F,
+    _restore_from: R,
+) -> Edit<SampleEditOpsModel>
+where
+    S: Send + 'static,
+    F: FnOnce(&mut SampleEditOpsModel, &S) + Send + 'static,
+{
+    Edit::mutate(move |m| forward(m, &snapshot))
+}
 
 #[derive(Clone)]
 struct TrimSnapshot {
@@ -48,7 +58,7 @@ struct TrimSnapshot {
 }
 
 fn make_trim_edit(snap: TrimSnapshot) -> Edit<SampleEditOpsModel> {
-    Edit::snapshot_inverse(
+    snapshot_forward(
         "trim",
         snap,
         |m: &mut SampleEditOpsModel, snap: &TrimSnapshot| {
@@ -163,7 +173,7 @@ fn make_fade_edit(snap: FadeSnapshot) -> Edit<SampleEditOpsModel> {
         FadeDir::In => "fade in",
         FadeDir::Out => "fade out",
     };
-    Edit::snapshot_inverse(
+    snapshot_forward(
         label,
         snap,
         |m: &mut SampleEditOpsModel, snap: &FadeSnapshot| {
@@ -469,15 +479,8 @@ impl App {
             screen,
             input,
             |m, ui| {
-                // M9 Phase 42: shortcut undo/redo。trim/fade は Edit::snapshot_inverse で
-                // Undoable 化済 (TrimSnapshot = full Vec<Vec<f32>>、FadeSnapshot = 範囲 Vec<f32>)。
-                if ui.take_shortcut("undo") {
-                    ui.request_undo();
-                }
-                if ui.take_shortcut("redo") {
-                    ui.request_redo();
-                }
-
+                // S4a: lib undo は撤去した (undo はアプリ層の責務)。trim/fade の Edit factory は
+                // forward mutation のみを発行する。この demo は undo/redo を配線しない。
                 // --- HUD ---
                 ui.label_at(
                     "title",
@@ -666,7 +669,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daw_ui_core::Edit;
 
     /// 0..n の sample 値を持つテスト用 model (1 channel)。
     fn make_test_model(n: usize) -> SampleEditOpsModel {
@@ -684,22 +686,17 @@ mod tests {
         }
     }
 
+    // S4a: lib undo は撤去。Edit は forward mutation のみを運ぶ (`apply` で forward 実行)。
+    // 旧 undo round-trip テストは forward の挙動検証に置換した (undo はアプリ層の責務)。
+
     #[test]
-    fn trim_then_undo_restores_full_buffer_and_viewport() {
+    fn trim_applies_forward() {
         let mut model = make_test_model(100);
         // [20..80) の範囲を trim 対象に
         model.selection = Some((20, 80));
         model.cursor_sample = 50;
-        let prev_view_start = model.viewport.view_start;
-        let prev_view_len = model.viewport.view_len;
 
-        let edit = trim_edit_for(&model);
-        let Edit::Undoable { forward, inverse, label } = edit else {
-            panic!("expected Undoable");
-        };
-        assert_eq!(label, "trim");
-
-        forward(&mut model);
+        trim_edit_for(&model).apply(&mut model);
         assert_eq!(model.samples[0].len(), 60, "trim 後は 60 sample");
         assert_eq!(model.valid_len, 60);
         assert!((model.samples[0][0] - 20.0).abs() < 1e-6, "先頭は元の index 20 の値");
@@ -708,132 +705,58 @@ mod tests {
         assert_eq!(model.cursor_sample, 0);
         assert!((model.viewport.view_start - 0.0).abs() < 1e-9);
         assert!((model.viewport.view_len - 60.0).abs() < 1e-9);
-
-        inverse(&mut model);
-        assert_eq!(model.samples[0].len(), 100, "undo で元の 100 sample 復元");
-        assert!(model.samples[0][0].abs() < 1e-6);
-        assert!((model.samples[0][99] - 99.0).abs() < 1e-6);
-        assert_eq!(model.valid_len, 100);
-        assert_eq!(model.selection, Some((20, 80)));
-        assert_eq!(model.cursor_sample, 50);
-        assert!((model.viewport.view_start - prev_view_start).abs() < 1e-9);
-        assert!((model.viewport.view_len - prev_view_len).abs() < 1e-9);
     }
 
     #[test]
-    fn trim_no_selection_returns_mutate_only() {
-        let model = make_test_model(100);
-        // selection 無し → Mutate (history に積まない)
-        let edit = trim_edit_for(&model);
-        match edit {
-            Edit::Mutate(_) => {}
-            Edit::Undoable { .. } => panic!("range 未選択時は Mutate を返すべき"),
-        }
+    fn trim_no_selection_sets_message_only() {
+        let mut model = make_test_model(100);
+        // selection 無し → 値は変えず last_action のみ更新する forward Mutate。
+        trim_edit_for(&model).apply(&mut model);
+        assert_eq!(model.samples[0].len(), 100, "未選択なら buffer 不変");
+        assert_eq!(model.last_action, "Trim: 範囲未選択");
     }
 
     #[test]
-    fn fade_in_then_undo_restores_range() {
+    fn fade_in_applies_forward() {
         let mut model = make_test_model(100);
         model.selection = Some((30, 60));
-        let edit = fade_edit_for(&model, FadeDir::In);
-        let Edit::Undoable { forward, inverse, label } = edit else {
-            panic!("expected Undoable");
-        };
-        assert_eq!(label, "fade in");
-
-        forward(&mut model);
-        // Fade In: t=0 で gain 0、t→1 で gain 1。先頭は 0.0、最後は元値 × ((30-1)/30)
-        let first = model.samples[0][30];
-        assert!(first.abs() < 1e-6, "fade in 先頭は 0.0 (元値 30.0 × t=0)");
+        fade_edit_for(&model, FadeDir::In).apply(&mut model);
+        // Fade In: t=0 で gain 0。先頭は 0.0。
+        assert!(model.samples[0][30].abs() < 1e-6, "fade in 先頭は 0.0 (元値 30.0 × t=0)");
         // 範囲外は元値のまま
         assert!((model.samples[0][29] - 29.0).abs() < 1e-6);
         assert!((model.samples[0][60] - 60.0).abs() < 1e-6);
-
-        inverse(&mut model);
-        // 元 sample (0..100) が完全復元
-        for (i, &v) in model.samples[0].iter().enumerate() {
-            assert!(
-                (v - i as f32).abs() < 1e-6,
-                "undo で sample[{i}] = {i} が復元 (got {v})"
-            );
-        }
     }
 
     #[test]
-    fn fade_out_then_undo_restores_range() {
+    fn fade_out_applies_forward() {
         let mut model = make_test_model(100);
         model.selection = Some((30, 60));
-        let edit = fade_edit_for(&model, FadeDir::Out);
-        let Edit::Undoable { forward, inverse, label } = edit else {
-            panic!("expected Undoable");
-        };
-        assert_eq!(label, "fade out");
-
-        forward(&mut model);
-        // Fade Out: t=0 で gain 1、t→1 で gain 0
-        // 先頭 (i=0) は元値 30.0 × 1.0 = 30.0
+        fade_edit_for(&model, FadeDir::Out).apply(&mut model);
+        // Fade Out: t=0 で gain 1。先頭 (i=0) は元値 30.0 × 1.0 = 30.0。
         assert!((model.samples[0][30] - 30.0).abs() < 1e-6);
-
-        inverse(&mut model);
-        for (i, &v) in model.samples[0].iter().enumerate() {
-            assert!((v - i as f32).abs() < 1e-6);
-        }
     }
 
     #[test]
-    fn fade_forward_idempotent_for_redo() {
-        // fade forward は元値 (snap.prev_range_samples) から再計算するので
-        // 2 度 apply しても結果同じ (= redo 経路で破綻しない)。
+    fn fade_no_selection_sets_message_only() {
         let mut model = make_test_model(100);
-        model.selection = Some((30, 60));
-        let edit = fade_edit_for(&model, FadeDir::In);
-        let Edit::Undoable { forward, .. } = edit else {
-            panic!();
-        };
-        forward(&mut model);
-        let after_first: Vec<f32> = model.samples[0][30..60].to_vec();
-        forward(&mut model);
-        let after_second: Vec<f32> = model.samples[0][30..60].to_vec();
-        assert_eq!(after_first, after_second, "forward 2 回で同じ結果 (idempotent)");
+        fade_edit_for(&model, FadeDir::In).apply(&mut model);
+        assert_eq!(model.last_action, "Fade In: 範囲未選択");
     }
 
     #[test]
-    fn fade_no_selection_returns_mutate_only() {
-        let model = make_test_model(100);
-        let edit = fade_edit_for(&model, FadeDir::In);
-        match edit {
-            Edit::Mutate(_) => {}
-            Edit::Undoable { .. } => panic!("range 未選択時は Mutate を返すべき"),
-        }
-    }
-
-    #[test]
-    fn trim_then_fade_then_undo_undo_restores_original() {
-        // trim → fade の連続を redo/undo で復元できる (history group ではなく
-        // 連続適用 → 連続巻き戻しのテスト、Phase 41 plan_phase41.md L483 への引き継ぎ)。
+    fn trim_then_fade_forward_chain() {
+        // trim → 再 select → fade を forward で連続適用したときの結果を固定。
         let mut model = make_test_model(100);
         model.selection = Some((10, 90));
-        let trim_edit = trim_edit_for(&model);
-        let Edit::Undoable { forward: trim_fwd, inverse: trim_inv, .. } = trim_edit else {
-            panic!();
-        };
-        trim_fwd(&mut model);
+        trim_edit_for(&model).apply(&mut model);
         assert_eq!(model.samples[0].len(), 80);
 
-        // trim 後の selection は None なので、fade する前に再 select
+        // trim 後の selection は None なので、fade 前に再 select。
         model.selection = Some((10, 70));
-        let fade_edit = fade_edit_for(&model, FadeDir::In);
-        let Edit::Undoable { forward: fade_fwd, inverse: fade_inv, .. } = fade_edit else {
-            panic!();
-        };
-        fade_fwd(&mut model);
-
-        // undo fade → undo trim で元データに復元
-        fade_inv(&mut model);
-        trim_inv(&mut model);
-        for (i, &v) in model.samples[0].iter().enumerate() {
-            assert!((v - i as f32).abs() < 1e-6, "sample[{i}] = {i} (got {v})");
-        }
-        assert_eq!(model.samples[0].len(), 100);
+        fade_edit_for(&model, FadeDir::In).apply(&mut model);
+        // fade in 先頭 (index 10) は gain 0 = 0.0。
+        assert!(model.samples[0][10].abs() < 1e-6);
+        assert_eq!(model.samples[0].len(), 80);
     }
 }

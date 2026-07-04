@@ -80,11 +80,10 @@ pub struct KnobResponse {
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 矩形指定で knob を描画 + ドラッグ。値変化時に `on_change(new_value)` を Edit 列に積む。
     ///
-    /// **M8 Phase 29**: drag 中は Mutate Edit (history 非対象)、drag 終端で `label` 付き
-    /// Undoable Edit を発行する DAW 標準動作。`on_change` は `Fn + Clone + Send + Sync + 'static`。
+    /// drag 中は per-frame で forward Mutate、drag 終端で最終値を 1 度発行する。undo/redo は
+    /// アプリ層の責務 (S4a で lib undo 撤去)。
     ///
     /// `default_value` は rect のダブルクリック時にリセットされる値 (例: pan の中央 0.5)。
-    /// `label` は undoable history パネルでの表示文字列 ("knob" / "pan" 等)。
     ///
     /// 操作:
     /// - rect 全体をドラッグで値編集 (rect.h 分 = 0→1)
@@ -106,12 +105,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         rect: Rect,
         value: f32,
         default_value: f32,
-        label: &'static str,
         on_change: F,
         modulation: Option<Modulation<'_, M>>,
     ) -> KnobResponse
     where
-        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
+        F: Fn(f32) -> Edit<M>,
     {
         let wid = WidgetId::ROOT.child((b"knob", &id));
         let pointer = self.pointer;
@@ -315,18 +313,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             self.push_edit(edit);
         }
 
+        // S4a: base drag 終端で最終値を 1 度 commit (旧 Undoable の forward 相当)。undo はアプリ層。
         if let Some(start_value) = release_initial_value
             && (start_value - displayed_value).abs() > f32::EPSILON
         {
-            let on_change_fwd = on_change.clone();
-            let on_change_inv = on_change;
-            let end = displayed_value;
-            let edit = Edit::with_inverse(
-                label,
-                move |m: &mut M| on_change_fwd(end).apply(m),
-                move |m: &mut M| on_change_inv(start_value).apply(m),
-            );
-            self.push_edit(edit);
+            self.push_edit(on_change(displayed_value));
         }
 
         KnobResponse {
@@ -343,11 +334,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         value: f32,
         default_value: f32,
-        label: &'static str,
         on_change: F,
     ) -> KnobResponse
     where
-        F: Fn(f32) -> Edit<M> + Clone + Send + Sync + 'static,
+        F: Fn(f32) -> Edit<M>,
     {
         let pad = 8.0;
         let size = 64.0;
@@ -357,7 +347,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             w: size,
             h: size,
         };
-        let resp = self.knob_at(id, rect, value, default_value, label, on_change, None);
+        let resp = self.knob_at(id, rect, value, default_value, on_change, None);
         self.next_y += size + pad;
         resp
     }
@@ -650,7 +640,7 @@ mod tests {
             screen,
             FrameInput { pointer, ..Default::default() },
             |_, ui| {
-                ui.knob_at("test", rect, value, default_value, "knob", |v| {
+                ui.knob_at("test", rect, value, default_value, |v| {
                     Edit::mutate(move |m: &mut PanModel| m.value = v)
                 }, None);
             },
@@ -915,7 +905,6 @@ mod tests {
                     rect,
                     base,
                     0.5,
-                    "pan",
                     |v| Edit::mutate(move |m: &mut ModModel| m.value = v),
                     Some(modulation),
                 );
@@ -1003,7 +992,7 @@ mod tests {
         let mut host_n: UiHost<ModModel> = UiHost::no_redraw();
         let mut scene_none = Scene::new();
         host_n.frame_to_edits(&model, &mut scene_none, screen, FrameInput::default(), |_, ui| {
-            ui.knob_at("mtest", rect, 0.5, 0.5, "pan",
+            ui.knob_at("mtest", rect, 0.5, 0.5,
                 |v| Edit::mutate(move |m: &mut ModModel| m.value = v), None);
         });
 
@@ -1099,7 +1088,7 @@ mod tests {
                         on_mod_change: &on_mod,
                     }),
                 };
-                ui.knob_at("mtest", rect, model.value, 0.5, "pan",
+                ui.knob_at("mtest", rect, model.value, 0.5,
                     |v| Edit::mutate(move |m: &mut ModModel| m.value = v), Some(m));
             })
         };
@@ -1120,7 +1109,7 @@ mod tests {
         let mut host_n: UiHost<ModModel> = UiHost::no_redraw();
         let mut scene_none = Scene::new();
         host_n.frame_to_edits(&model, &mut scene_none, screen, FrameInput::default(), |_, ui| {
-            ui.knob_at("mtest", rect, 0.5, 0.5, "pan",
+            ui.knob_at("mtest", rect, 0.5, 0.5,
                 |v| Edit::mutate(move |m: &mut ModModel| m.value = v), None);
         });
 
@@ -1255,7 +1244,7 @@ mod tests {
                         on_mod_change: &on_mod,
                     }),
                 };
-                ui.knob_at("mtest", rect, model.value, 0.5, "pan",
+                ui.knob_at("mtest", rect, model.value, 0.5,
                     |v| Edit::mutate(move |m: &mut ModModel| m.value = v), Some(m));
             })
         };

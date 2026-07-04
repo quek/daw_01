@@ -764,8 +764,8 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
     // ----- Edit -----
-    // Task A 段階: 既存の自前 Undo/Redo (AppEvent::Undo/Redo) に流す。
-    // Task B で `ui.request_undo()` / `ui.request_redo()` に切り替える。
+    // undo/redo は daw_gui の SongDoc snapshot が SSoT (AppEvent::Undo/Redo → song_doc.undo())。
+    // lib 側 undo は S4a で撤去したので、ここで shortcut を拾って自前 undo に流すのが最終形。
     if ui.take_shortcut("undo") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::Undo)
