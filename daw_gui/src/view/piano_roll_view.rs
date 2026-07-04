@@ -7,9 +7,11 @@
 
 use std::sync::Arc;
 
-use daw_ui_core::{
-    ButtonTextAlign, Edit, MoveDelta, Note, NoteStyle, PianoRollEditRequest, PianoRollScale,
-    PianoRollScaleMode, PianoRollStyle, PianoRollView, ResizeDelta, ToggleButtonStyle, Ui, note_hit,
+use daw_ui_core::{ButtonTextAlign, Edit, ToggleButtonStyle, Ui};
+
+use crate::widgets::piano_roll::{
+    MoveDelta, Note, NoteStyle, PianoRollEditRequest, PianoRollScale, PianoRollScaleMode,
+    PianoRollStyle, PianoRollView, ResizeDelta, note_hit,
 };
 use daw_ui_renderer::{theme, Color, Rect, RectCommand};
 
@@ -422,7 +424,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     };
 
-    let resp = ui.piano_roll(
+    let resp = crate::widgets::piano_roll::piano_roll(
+        ui,
         "piano_roll",
         body,
         &widget_notes,
@@ -821,7 +824,7 @@ fn draw_legend(
     }
 }
 
-/// 表示対象クリップ群 (`shown`) の note を **すべて** `daw_ui_core::Note` に変換する。
+/// 表示対象クリップ群 (`shown`) の note を **すべて** `crate::widgets::piano_roll::Note` に変換する。
 /// 各 note の id は packed global id (`AppData::pack_note_id(clip_slot, index)`) で複数クリップでも
 /// 衝突しない。**色はそのクリップが乗っている _トラック_ の実効色** (`effective_track_color`、凡例が
 /// トラック単位なのでノートもトラック色)、非対象 _トラック_ のノートは `dimmed`、ロック中トラックの

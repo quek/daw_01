@@ -5,8 +5,7 @@
 //! 紛れ込んでいるか、`Application::Message: Clone` のような型境界が露出している。
 
 use daw_ui_core::{
-    ColorPickerStyle, Edit, Note, NoteId, NoteStyle,
-    PianoRollEditRequest, PianoRollStyle, PianoRollView, ReorderableListEditRequest,
+    ColorPickerStyle, Edit, ReorderableListEditRequest,
     ReorderableListStyle, ScrubableNumberFormat, ScrubableNumberStyle, UiHost,
 };
 use daw_ui_platform::PhysicalSize;
@@ -22,9 +21,6 @@ struct Model {
     volume: f32,
     mute: bool,
     title: String,
-    // M9 Phase 41e: piano_roll widget 用 (non-Clone Model でも piano_roll が呼べることを担保)
-    notes: Vec<Note>,
-    selected_note_ids: Vec<NoteId>,
     // M11 Phase 51: reorderable_list widget 用 (non-Clone Model でも呼べることを担保)
     chain: Vec<String>,
 }
@@ -39,8 +35,6 @@ fn main() {
         volume: 0.5,
         mute: false,
         title: String::from("untitled"),
-        notes: Vec::new(),
-        selected_note_ids: Vec::new(),
         chain: Vec::new(),
     };
 
@@ -123,73 +117,6 @@ fn main() {
             );
             // M9 Phase 43: debug_overlay も non-Clone Model でコンパイルする。
             ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }, 5.5);
-            // M9 Phase 41e: piano_roll widget が non-Clone Model でコンパイルする。
-            let view = PianoRollView {
-                start_beat: 0.0,
-                min_start_beat: 0.0,
-                len_beats: 4.0,
-                pitch_top: 72.0,
-                pitch_visible: 24.0,
-                keyboard_w: 60.0,
-                notes_generation: 0,
-                velocity_lane_h: 0.0,
-                playhead_beat: None,
-                // M13 Phase 55: ruler/bpm/time_sig (no-Clone Model でも構造体リテラルが
-                // コンパイルできることを確認)
-                ruler_h: 0.0,
-                bpm: 120.0,
-                time_sig: (4, 4),
-                // M9 Phase 45f: SnapConfig も non-Clone Model でコンパイル可能。
-                snap: daw_ui_core::SnapConfig::DEFAULT,
-                // M14 Phase 69 / daw_01 #041: loop_range も Option<(f64,f64)> (Copy) で no-Clone 互換。
-                loop_range: None,
-                // M14 Phase 70 / daw_01 #042: scale も Option<PianoRollScale> (Copy) で no-Clone 互換。
-                scale: None,
-                // M14 Phase 70b / daw_01 #042 follow-up: drag preview snap toggle (Copy bool)。
-                snap_pitch_during_drag: false,
-                // M14 Phase 124 / daw_01 #100: subdivision interval も Option<f64> (Copy) で no-Clone 互換。
-                sub_grid_interval_beats: None,
-                // 新規 note の既定長 (f64、 no-Clone 互換)。
-                default_note_len_beats: 1.0,
-            };
-            let style = PianoRollStyle::default();
-            let _ = ui.piano_roll(
-                "pr",
-                Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
-                &m.notes,
-                view,
-                &m.selected_note_ids,
-                &style,
-                |req| match req {
-                    PianoRollEditRequest::Add(_) => Edit::mutate(|_m: &mut Model| {
-                        // Note を作る場合は lyric: None も渡す (M9 Phase 44c で追加)
-                        let _new = Note {
-                            id: 0,
-                            start_beat: 0.0_f64,
-                            len_beats: 0.5_f64,
-                            pitch: 60,
-                            velocity: 96,
-                            lyric: None,
-                            muted: false,
-                            style: NoteStyle::default(),
-                        };
-                    }),
-                    PianoRollEditRequest::Delete(_) => Edit::mutate(|_m: &mut Model| {}),
-                    PianoRollEditRequest::Move(_) => Edit::mutate(|_m: &mut Model| {}),
-                    PianoRollEditRequest::Copy(_) => Edit::mutate(|_m: &mut Model| {}),
-                    PianoRollEditRequest::Resize(_) => Edit::mutate(|_m: &mut Model| {}),
-                    PianoRollEditRequest::Select { .. } => Edit::mutate(|_m: &mut Model| {}),
-                    PianoRollEditRequest::SetLyrics(_) => Edit::mutate(|_m: &mut Model| {}),
-                    PianoRollEditRequest::SetVelocity(_) => Edit::mutate(|_m: &mut Model| {}),
-                    // M14 Phase 69 / daw_01 #041: ruler 上 click / Shift+drag で発火する 2 variant も
-                    // non-Clone Model で `make_edit` を組み立てられることを担保。
-                    PianoRollEditRequest::SetPlayheadBeat(_) => Edit::mutate(|_m: &mut Model| {}),
-                    PianoRollEditRequest::SetLoopRange { .. } => Edit::mutate(|_m: &mut Model| {}),
-                    // edge auto-scroll の 2 variant も non-Clone Model で組み立て可能を担保。
-                    PianoRollEditRequest::ScrollByBeats(_) => Edit::mutate(|_m: &mut Model| {}),
-                    PianoRollEditRequest::SetTopPitch(_) => Edit::mutate(|_m: &mut Model| {}),
-                },
-            );
             // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。
             let rl_style = ReorderableListStyle::default();
             let _ = ui.reorderable_list(

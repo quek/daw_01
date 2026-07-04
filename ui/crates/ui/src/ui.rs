@@ -306,6 +306,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.set_cursor_request = Some(sink);
     }
 
+    /// `frame()` 末尾で cursor 位置 warp 要求を受け取る sink を差し込む。`set_cursor_sink` の
+    /// warp 位置版で、headless テストで `Ui::warp_cursor` の要求座標を捕捉したいとき
+    /// (piano_roll のノート作成 release warp 検証等) に外部から設定する。
+    pub fn set_cursor_pos_sink(&mut self, sink: Box<dyn Fn(f32, f32) + Send + Sync>) {
+        self.set_cursor_pos_request = Some(sink);
+    }
+
     /// 直前の `frame()` 呼び出しでフォーカスが変化したか。
     /// `frame()` が自動で `redraw_request` を呼ぶので、利用者がこの値を query して
     /// 再描画する必要は **ない** (互換性のため公開しているだけ)。

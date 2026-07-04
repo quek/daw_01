@@ -34,7 +34,7 @@ RUN_PKGS := -p daw_gui -p daw_audio -p daw_plugin_host
 # 新規 member 追加/初めて #[test] を足すときはこの列挙も更新すること。
 TEST_PKGS := -p common -p daw_gui -p daw_audio -p daw_plugin_host \
              -p daw-ui-platform -p daw-ui-renderer -p daw-ui-core \
-             -p daw-ui-example-piano-roll -p daw-ui-example-sample-edit-ops
+             -p daw-ui-example-sample-edit-ops
 
 # ---- vendored FFmpeg (third_party/ffmpeg は gitignore、各マシンで fetch) ----
 # ABI は avcodec-61 / avformat-61 / avutil-59 / swscale-8 / swresample-5 (= ffmpeg 7.1)

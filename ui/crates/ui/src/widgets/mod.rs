@@ -22,7 +22,6 @@ pub mod menu;
 pub mod modal;
 pub mod modulator_editor;
 pub mod panel;
-pub mod piano_roll;
 pub mod playhead;
 pub mod reorderable_list;
 pub mod ruler_ops;

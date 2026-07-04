@@ -17,12 +17,12 @@
 //!   model に apply される (= 次フレームで反映)。`UiHost::frame` の closure が `&M` 制約
 //!   のため `&mut` borrow は不可、push_edit ベースが no-Clone 不変条件と整合する設計。
 //!
-//! # 使い方 (example/piano_roll/src/main.rs を参照)
+//! # 使い方 (view/piano_roll_view.rs を参照)
 //!
 //! ```ignore
-//! use daw_ui_core::{Note, NoteId, PianoRollEditRequest, PianoRollStyle, PianoRollView};
+//! use crate::widgets::piano_roll::{Note, NoteId, PianoRollEditRequest, PianoRollStyle, PianoRollView};
 //!
-//! ui.piano_roll(
+//! piano_roll(ui, 
 //!     id, rect,
 //!     &model.notes, view, &model.selected_note_ids,
 //!     &PianoRollStyle::default(),
@@ -43,19 +43,19 @@ use std::sync::Arc;
 use daw_ui_platform::CursorIcon;
 use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
 
-use crate::edit::Edit;
-use crate::id::WidgetId;
-use crate::scenegraph::hash_inputs;
-use crate::snap::SnapConfig;
-use crate::time::{TimeDisplay, TimeMapping};
-use crate::ui::Ui;
-use crate::viewport::ViewportState1D;
-use crate::widgets::playhead::draw_playhead_line;
-use crate::widgets::ruler_ops::{
+use daw_ui_core::edit::Edit;
+use daw_ui_core::id::WidgetId;
+use daw_ui_core::scenegraph::hash_inputs;
+use daw_ui_core::snap::SnapConfig;
+use daw_ui_core::time::{TimeDisplay, TimeMapping};
+use daw_ui_core::ui::Ui;
+use daw_ui_core::viewport::ViewportState1D;
+use daw_ui_core::widgets::playhead::draw_playhead_line;
+use daw_ui_core::widgets::ruler_ops::{
     LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
     compute_loop_drag_endpoints, loop_band_hit_kind,
 };
-use crate::widgets::time_grid::{BarBeatGridStyle, SubGridSpec, TimeRulerStyle};
+use daw_ui_core::widgets::time_grid::{BarBeatGridStyle, SubGridSpec, TimeRulerStyle};
 
 // ============================================================
 // Public types
@@ -703,7 +703,7 @@ fn note_fill_color(note: &Note, note_fill_fn: NoteFillFn, bg: Color) -> Color {
         base
     };
     if note.muted {
-        crate::widgets::muted_dim_fill(base)
+        daw_ui_core::widgets::muted_dim_fill(base)
     } else {
         base
     }
@@ -1181,7 +1181,7 @@ pub fn is_black_key(pitch: u8) -> bool {
 /// # 例
 ///
 /// ```
-/// use daw_ui_core::split_into_morae;
+/// use daw_gui::widgets::piano_roll::split_into_morae;
 /// assert_eq!(split_into_morae("あいうえ"), vec!["あ", "い", "う", "え"]);
 /// assert_eq!(split_into_morae("しゅんかん"), vec!["しゅ", "ん", "か", "ん"]);
 /// assert_eq!(split_into_morae(""), Vec::<String>::new());
@@ -1593,64 +1593,63 @@ fn note_create_geometry(
 // Public widget API
 // ============================================================
 
-impl<'a, M: ?Sized + 'static> Ui<'a, M> {
-    /// piano roll widget (M9 Phase 41e)。
-    ///
-    /// - `id`: 同 frame 内で複数 piano_roll を並べる場合は `(label, index)` 等で一意に。
-    /// - `rect`: 描画矩形 (左端 `style.keyboard_w` 分は keyboard 領域、残りが grid)。
-    /// - `notes`: 描画対象の note 列 (start_beat 昇順ソート前提、二分探索で visible filter)。
-    /// - `view`: pan/zoom 状態 (値渡し)。pan/zoom 更新は user 側責務 (widget は描画のみ)。
-    /// - `selected`: 選択中 note の id 集合 (immutable borrow、Model 側 single source of truth)。
-    /// - `style`: 見た目スタイル (`PianoRollStyle::default()` で example の見た目を再現)。
-    /// - `make_edit`: 各種 Edit 要求を `Edit<M>` に変換する callback。
-    ///   `Add` / `Delete` / `Move` / `Resize` / `Select` の 5 variant を dispatch する。
-    ///
-    /// 戻り値 `PianoRollResponse` で hover / drag / selection 変化を取得できる。
-    ///
-    /// # 操作
-    /// - **note 中央 drag** = move (release で `PianoRollEditRequest::Move` 発行、Undoable)
-    /// - **note 中央 Ctrl+drag** = copy (release で `PianoRollEditRequest::Copy` 発行、Undoable、daw_01 #054)
-    /// - **note 左右端 drag** = resize (release で `PianoRollEditRequest::Resize` 発行、Undoable)
-    /// - **note click** (drag<4px) = selection 1 個 (`PianoRollEditRequest::Select` 発行)
-    /// - **空白 drag** (無修飾) = rect marquee select、**REPLACE** (rect 内 note ids で置換、#102)。
-    ///   `Shift+drag` = **UNION** (既存 `selected` ∪ rect 内)、`Ctrl+drag` = **XOR** (toggle)。
-    ///   いずれも release で `PianoRollEditRequest::Select` 発行 (Undoable)
-    /// - **空白 click** (無修飾、drag<4px) = selection clear (= zero-rect の REPLACE marquee)
-    /// - **Insert** shortcut = pointer 位置に新規 note 追加 (`PianoRollEditRequest::Add`)。
-    ///   `id` は user 側で `next_note_id` 等で割り当て、`make_edit` callback 内で参照する
-    ///   ため、widget は **id=0 placeholder で `Add(vec![note_with_id_0])` を渡す**。
-    ///   user 側で id を上書きしてから push (= user 側で `m.next_note_id` を bump)。
-    /// - **Delete** shortcut = selected を一括削除 (`PianoRollEditRequest::Delete`)
-    /// - **note hover** で cursor を `Move` / `EwResize` に切替
-    ///
-    /// # pan/zoom について
-    ///
-    /// widget は pan/zoom を自前で扱わない (view ownership は app 側)。
-    /// user は widget の **外** で `if resp.dragging.is_none() { /* pan logic */ }` のように
-    /// drag 中でないとき pan を実装する。または `note_hit(...)` を呼んで note 上でない
-    /// press のみ pan を始める (= 現 example の semantics)。
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub fn piano_roll<F>(
-        &mut self,
-        id: impl Hash,
-        rect: Rect,
-        notes: &[Note],
-        view: PianoRollView,
-        selected: &[NoteId],
-        style: &PianoRollStyle,
-        make_edit: F,
-    ) -> PianoRollResponse
-    where
-        F: Fn(PianoRollEditRequest) -> Edit<M> + Send + Sync + 'static,
-    {
+/// piano roll widget (M9 Phase 41e)。
+///
+/// - `id`: 同 frame 内で複数 piano_roll を並べる場合は `(label, index)` 等で一意に。
+/// - `rect`: 描画矩形 (左端 `style.keyboard_w` 分は keyboard 領域、残りが grid)。
+/// - `notes`: 描画対象の note 列 (start_beat 昇順ソート前提、二分探索で visible filter)。
+/// - `view`: pan/zoom 状態 (値渡し)。pan/zoom 更新は user 側責務 (widget は描画のみ)。
+/// - `selected`: 選択中 note の id 集合 (immutable borrow、Model 側 single source of truth)。
+/// - `style`: 見た目スタイル (`PianoRollStyle::default()` で example の見た目を再現)。
+/// - `make_edit`: 各種 Edit 要求を `Edit<M>` に変換する callback。
+///   `Add` / `Delete` / `Move` / `Resize` / `Select` の 5 variant を dispatch する。
+///
+/// 戻り値 `PianoRollResponse` で hover / drag / selection 変化を取得できる。
+///
+/// # 操作
+/// - **note 中央 drag** = move (release で `PianoRollEditRequest::Move` 発行、Undoable)
+/// - **note 中央 Ctrl+drag** = copy (release で `PianoRollEditRequest::Copy` 発行、Undoable、daw_01 #054)
+/// - **note 左右端 drag** = resize (release で `PianoRollEditRequest::Resize` 発行、Undoable)
+/// - **note click** (drag<4px) = selection 1 個 (`PianoRollEditRequest::Select` 発行)
+/// - **空白 drag** (無修飾) = rect marquee select、**REPLACE** (rect 内 note ids で置換、#102)。
+///   `Shift+drag` = **UNION** (既存 `selected` ∪ rect 内)、`Ctrl+drag` = **XOR** (toggle)。
+///   いずれも release で `PianoRollEditRequest::Select` 発行 (Undoable)
+/// - **空白 click** (無修飾、drag<4px) = selection clear (= zero-rect の REPLACE marquee)
+/// - **Insert** shortcut = pointer 位置に新規 note 追加 (`PianoRollEditRequest::Add`)。
+///   `id` は user 側で `next_note_id` 等で割り当て、`make_edit` callback 内で参照する
+///   ため、widget は **id=0 placeholder で `Add(vec![note_with_id_0])` を渡す**。
+///   user 側で id を上書きしてから push (= user 側で `m.next_note_id` を bump)。
+/// - **Delete** shortcut = selected を一括削除 (`PianoRollEditRequest::Delete`)
+/// - **note hover** で cursor を `Move` / `EwResize` に切替
+///
+/// # pan/zoom について
+///
+/// widget は pan/zoom を自前で扱わない (view ownership は app 側)。
+/// user は widget の **外** で `if resp.dragging.is_none() { /* pan logic */ }` のように
+/// drag 中でないとき pan を実装する。または `note_hit(...)` を呼んで note 上でない
+/// press のみ pan を始める (= 現 example の semantics)。
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn piano_roll<'a, M: ?Sized + 'static, F>(
+    ui: &mut Ui<'a, M>,
+    id: impl Hash,
+    rect: Rect,
+    notes: &[Note],
+    view: PianoRollView,
+    selected: &[NoteId],
+    style: &PianoRollStyle,
+    make_edit: F,
+) -> PianoRollResponse
+where
+    F: Fn(PianoRollEditRequest) -> Edit<M> + Send + Sync + 'static,
+{
         let wid = WidgetId::ROOT.child((b"piano_roll_widget", &id));
-        let pointer = self.pointer;
+        let pointer = ui.pointer();
 
         // ===== M14 Phase 59 / daw_01 #017: 歌詞 inline 編集 mode =====
         // Frame 開始時、lyric_editing が selected と sync しているか defensive check。
         // 編集対象 note が消失したら自動で None に戻す (note 削除等のため)。
         let mut lyric_editing: Option<NoteId> = {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             if let Some(eid) = state.lyric_editing
                 && !notes.iter().any(|n| n.id == eid)
             {
@@ -1669,12 +1668,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if lyric_editing.is_none()
             && selected.len() == 1
             && let Some(name) = style.lyric_edit_shortcut
-            && self.take_shortcut(name)
+            && ui.take_shortcut(name)
         {
             lyric_editing = Some(selected[0]);
             // 編集モードに入る瞬間、stale な note_drag セッションを clear (drag 中に L
             // を押した稀なケース対策)。
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.lyric_editing = lyric_editing;
             state.note_drag = None;
         }
@@ -1684,14 +1683,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // これで「編集中の Esc → 1 frame で完全 cancel」を保証 (text_input の blur 検出
         // 経路 (resp.focused = false) は外 click 等の defensive fallback として残す)。
         if let Some(edit_id_for_esc) = lyric_editing
-            && self.take_shortcut("escape")
+            && ui.take_shortcut("escape")
         {
             // text_input の focus を明示的に clear (text_input id は ("piano_roll_lyric", edit_id))
             let ti_wid =
                 WidgetId::ROOT.child((b"text_input", &("piano_roll_lyric", edit_id_for_esc)));
-            self.clear_focus_if_focused(ti_wid);
+            ui.clear_focus_if_focused(ti_wid);
             lyric_editing = None;
-            self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+            ui.widget_state::<PianoRollState>(wid).lyric_editing = None;
         }
         let editing_mode = lyric_editing.is_some();
 
@@ -1765,7 +1764,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if !anchors.is_empty() {
                 let press_alt = pointer.modifiers.alt;
                 let press_ctrl = pointer.modifiers.ctrl;
-                let state: &mut PianoRollState = self.widget_state(wid);
+                let state: &mut PianoRollState = ui.widget_state(wid);
                 state.note_drag = Some(NoteDragSession {
                     kind,
                     anchor_mouse: (px, py),
@@ -1782,7 +1781,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 排他、grid.contains で gate される just_pressed_on_note とは独立)。release で終了。
         // editing_mode 中は無効 (歌詞 typing 優先)。pitch は後段の response 計算で毎フレーム算出。
         {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             if pointer.primary_just_pressed
                 && !editing_mode
                 && pointer.pos.is_some_and(|(px, py)| kbd.contains(px, py))
@@ -1804,7 +1803,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && vel_h > 0.0
             && pointer.pos.is_some_and(|(px, py)| vel_area.contains(px, py));
         if just_pressed_in_vel_lane
-            && self.widget_state::<PianoRollState>(wid).note_drag.is_none()
+            && ui.widget_state::<PianoRollState>(wid).note_drag.is_none()
             && let Some((px, py)) = pointer.pos
             && let Some(hit_id) = velocity_bar_hit(
                 visible,
@@ -1832,7 +1831,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if !anchor_velocities.is_empty() {
                 let final_targets: Vec<NoteId> =
                     anchor_velocities.iter().map(|(id, _)| *id).collect();
-                let state: &mut PianoRollState = self.widget_state(wid);
+                let state: &mut PianoRollState = ui.widget_state(wid);
                 state.velocity_drag = Some(VelocityDragSession {
                     target_ids: final_targets,
                     anchor_velocities,
@@ -1861,11 +1860,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let note_create_press: Option<(f32, f32)> = if editing_mode {
             None
         } else {
-            self.take_double_click_press_in_rect(grid)
+            ui.take_double_click_press_in_rect(grid)
         };
         if let Some((px, py)) = note_create_press
             && note_hit(notes, view, grid, px, py, style.resize_handle_px).is_none()
-            && self.widget_state::<PianoRollState>(wid).note_drag.is_none()
+            && ui.widget_state::<PianoRollState>(wid).note_drag.is_none()
         {
             let press_alt = pointer.modifiers.alt;
             let raw_start = (view.start_beat + f64::from(px - grid.x) * beat_per_px).max(0.0);
@@ -1882,8 +1881,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let default_len = view.default_note_len_beats.max(0.0625);
             #[allow(clippy::cast_possible_truncation)]
             let warp_x = grid.x + ((start_beat + default_len - view.start_beat) / beat_per_px) as f32;
-            self.warp_cursor(warp_x, py);
-            let state: &mut PianoRollState = self.widget_state(wid);
+            ui.warp_cursor(warp_x, py);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.note_create = Some(NoteCreateSession {
                 start_beat,
                 pitch,
@@ -1948,7 +1947,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     anchor_press_beat_for_session,
                     anchor_press_beat_for_session,
                 ));
-                let state: &mut PianoRollState = self.widget_state(wid);
+                let state: &mut PianoRollState = ui.widget_state(wid);
                 state.loop_drag = Some(LoopDragSession {
                     kind,
                     anchor_loop,
@@ -1963,7 +1962,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     .snap
                     .snap_beat(press_beat, press_alt, zoom_x_px_per_beat)
                     .max(0.0);
-                let state: &mut PianoRollState = self.widget_state(wid);
+                let state: &mut PianoRollState = ui.widget_state(wid);
                 state.playhead_drag = Some(PlayheadDragSession {
                     last_mouse_x: px,
                     last_emitted_beat: snapped,
@@ -1972,7 +1971,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
         }
         if let Some(beat) = press_seek_beat {
-            self.push_edit(make_edit(PianoRollEditRequest::SetPlayheadBeat(beat)));
+            ui.push_edit(make_edit(PianoRollEditRequest::SetPlayheadBeat(beat)));
         }
 
         // drag 継続中は毎 continuation frame で `last_mouse` / `last_alt` を update。
@@ -1986,7 +1985,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if let Some((px, py)) = pointer.pos {
             let alt_now = pointer.modifiers.alt;
             let ctrl_now = pointer.modifiers.ctrl;
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             if let Some(ref mut nd) = state.note_drag {
                 if !pointer.primary_just_released {
                     nd.last_mouse = (px, py);
@@ -2075,19 +2074,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if pointer.primary_pressed && !pointer.primary_just_released {
             // 移動量ゲート: press からの移動が ACTIVATE_PX 以上のときのみ端スクロールを許可。
             let moved_enough = {
-                let state: &mut PianoRollState = self.widget_state(wid);
+                let state: &mut PianoRollState = ui.widget_state(wid);
                 if pointer.primary_just_pressed {
                     state.edge_scroll_press = pointer.pos;
                     // 新しい drag の開始で pitch アキュムレータをリセット (前 drag の端数が
                     // 残って次 drag 初回フレームで pitch がジャンプするのを防ぐ)。
                     state.edge_pitch_accum = 0.0;
                 }
-                let gate = crate::widgets::edge_scroll::ACTIVATE_PX;
+                let gate = daw_ui_core::widgets::edge_scroll::ACTIVATE_PX;
                 matches!((state.edge_scroll_press, pointer.pos),
                     (Some(p), Some(c)) if (c.0 - p.0).powi(2) + (c.1 - p.1).powi(2) >= gate * gate)
             };
             let axes: Option<(bool, bool)> = if moved_enough {
-                let state: &mut PianoRollState = self.widget_state(wid);
+                let state: &mut PianoRollState = ui.widget_state(wid);
                 if let Some(nd) = state.note_drag.as_ref() {
                     Some(match nd.kind {
                         NoteDragKind::Move => (true, true), // 移動は横 + 縦 (pitch)。
@@ -2109,13 +2108,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let marquee_active = moved_enough
                 && axes.is_none()
                 && {
-                    let st: &mut crate::widgets::drag_rect::DragRectState =
-                        self.widget_state(drag_rect_wid);
+                    let st: &mut daw_ui_core::widgets::drag_rect::DragRectState =
+                        ui.widget_state(drag_rect_wid);
                     st.drag_start.is_some()
                 };
             if let Some((ax, ay)) = axes.or_else(|| marquee_active.then_some((true, true))) {
-                let cfg = crate::widgets::edge_scroll::EdgeScrollCfg::default();
-                let (dx, dy) = crate::widgets::edge_scroll::edge_scroll_delta(
+                let cfg = daw_ui_core::widgets::edge_scroll::EdgeScrollCfg::default();
+                let (dx, dy) = daw_ui_core::widgets::edge_scroll::edge_scroll_delta(
                     pointer.pos,
                     grid,
                     cfg,
@@ -2140,7 +2139,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let mut new_top_pitch: Option<u8> = None;
                 let mut applied_pitch_px = 0.0_f32;
                 {
-                    let state: &mut PianoRollState = self.widget_state(wid);
+                    let state: &mut PianoRollState = ui.widget_state(wid);
                     if dy != 0.0 && pitch_per_px > 1e-6 {
                         let px_per_semitone = 1.0 / pitch_per_px;
                         state.edge_pitch_accum += dy * pitch_per_px; // 下=正 (lower pitch へ)。
@@ -2169,23 +2168,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
                 let scrolled_x = scroll_by_beats != 0.0;
                 if scrolled_x {
-                    self.push_edit(make_edit(PianoRollEditRequest::ScrollByBeats(
+                    ui.push_edit(make_edit(PianoRollEditRequest::ScrollByBeats(
                         scroll_by_beats,
                     )));
                 }
                 if let Some(p) = new_top_pitch {
-                    self.push_edit(make_edit(PianoRollEditRequest::SetTopPitch(p)));
+                    ui.push_edit(make_edit(PianoRollEditRequest::SetTopPitch(p)));
                 }
                 if scrolled_x || new_top_pitch.is_some() {
                     if marquee_active {
-                        let st: &mut crate::widgets::drag_rect::DragRectState =
-                            self.widget_state(drag_rect_wid);
+                        let st: &mut daw_ui_core::widgets::drag_rect::DragRectState =
+                            ui.widget_state(drag_rect_wid);
                         if let Some(s) = st.drag_start.as_mut() {
                             s.0 -= applied_beat_px;
                             s.1 -= applied_pitch_px;
                         }
                     } else {
-                        let state: &mut PianoRollState = self.widget_state(wid);
+                        let state: &mut PianoRollState = ui.widget_state(wid);
                         if let Some(nd) = state.note_drag.as_mut() {
                             nd.anchor_mouse.0 -= applied_beat_px;
                             nd.anchor_mouse.1 -= applied_pitch_px;
@@ -2197,7 +2196,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                         // loop/playhead: 絶対 px→beat 再解決で自動追従 → shift 不要。
                     }
-                    self.request_redraw();
+                    ui.request_redraw();
                 }
             }
         }
@@ -2216,7 +2215,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let alt = pointer.modifiers.alt;
             let mut emit_beat: Option<f64> = None;
             {
-                let state: &mut PianoRollState = self.widget_state(wid);
+                let state: &mut PianoRollState = ui.widget_state(wid);
                 if let Some(ref mut pd) = state.playhead_drag {
                     let raw = view.start_beat + f64::from(px - ruler.x) * beat_per_px;
                     let next = view
@@ -2230,49 +2229,49 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
             }
             if let Some(beat) = emit_beat {
-                self.push_edit(make_edit(PianoRollEditRequest::SetPlayheadBeat(beat)));
+                ui.push_edit(make_edit(PianoRollEditRequest::SetPlayheadBeat(beat)));
             }
         }
 
         let drag_session: Option<NoteDragSession> = {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.note_drag.clone()
         };
         let velocity_drag_session: Option<VelocityDragSession> = {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.velocity_drag.clone()
         };
         // note_create overlay 用 clone と release 用 take。
         let note_create_session: Option<NoteCreateSession> = {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.note_create
         };
         let note_create_release: Option<NoteCreateSession> = if pointer.primary_just_released {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.note_create.take()
         } else {
             None
         };
         // (M14 Phase 69 / daw_01 #041) loop_drag overlay & release 用 clone / take。
         let loop_drag_session: Option<LoopDragSession> = {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.loop_drag
         };
         let loop_drag_release: Option<LoopDragSession> = if pointer.primary_just_released {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.loop_drag.take()
         } else {
             None
         };
         // playhead_drag は release frame で take して discard (commit-by-release 無し)。
         if pointer.primary_just_released {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             let _ = state.playhead_drag.take();
         }
         // drag release で取り出すが、drag 距離が 16px 未満なら **click に格下げ** する
         // (= 短い「press → release」は note 中央上の click として selection 切替に振り向ける)。
         let drag_release_raw: Option<NoteDragSession> = if pointer.primary_just_released {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.note_drag.take()
         } else {
             None
@@ -2280,7 +2279,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // (M14 Phase 64 / daw_01 #018) velocity_drag release: drag<3px は「click 単発 = no-op」
         // として扱い SetVelocity 発行しない。 後段の commit ブロックで dist 判定 + Edit 発行。
         let velocity_drag_release: Option<VelocityDragSession> = if pointer.primary_just_released {
-            let state: &mut PianoRollState = self.widget_state(wid);
+            let state: &mut PianoRollState = ui.widget_state(wid);
             state.velocity_drag.take()
         } else {
             None
@@ -2354,7 +2353,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // session 中 (press 開始が kbd) かつ まだ押下中 (primary_pressed) かつ pointer が kbd 内の
         // ときだけ Some。release frame は primary_pressed=false で None (= note-off)、kbd 外への drag
         // も None。pitch は毎フレーム pointer.y から計算するので glissando に追従する。
-        if self.widget_state::<PianoRollState>(wid).keyboard_pressing
+        if ui.widget_state::<PianoRollState>(wid).keyboard_pressing
             && pointer.primary_pressed
             && let Some((px, py)) = pointer.pos
             && kbd.contains(px, py)
@@ -2368,7 +2367,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // winit は state-full なので set_cursor を呼ばないと前フレームの形状が残る (ui.rs:999)。
         if response.creating {
             // 作成中は右端を伸ばす操作なので EwResize (resize と同じ)。
-            self.set_cursor(CursorIcon::EwResize);
+            ui.set_cursor(CursorIcon::EwResize);
         } else if response.dragging.is_some() {
             let cursor = match response.dragging {
                 Some(NoteDragKind::Move) => CursorIcon::Move,
@@ -2377,14 +2376,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 }
                 None => CursorIcon::Default,
             };
-            self.set_cursor(cursor);
+            ui.set_cursor(cursor);
         } else if let Some((cx, cy)) = pointer.pos
             && let Some(cursor) =
                 note_hover_cursor(visible, view, grid, cx, cy, style.resize_handle_px)
         {
-            self.set_cursor(cursor);
+            ui.set_cursor(cursor);
         } else if pointer.pos.is_some_and(|(px, py)| rect.contains(px, py)) {
-            self.set_cursor(CursorIcon::Default);
+            ui.set_cursor(CursorIcon::Default);
         }
 
         // ----- M14 Phase 125 (#102): plain-drag marquee gate (空き grid press を marquee が所有) -----
@@ -2398,8 +2397,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 起動する。 Alt は除外、 `note_drag` が press 時 None (= 真の空き press) を要求。
         let drag_rect_wid = wid.child(b"rect_select");
         let shift_rect_active = {
-            let state: &mut crate::widgets::drag_rect::DragRectState =
-                self.widget_state(drag_rect_wid);
+            let state: &mut daw_ui_core::widgets::drag_rect::DragRectState =
+                ui.widget_state(drag_rect_wid);
             state.drag_start.is_some()
         };
         let marquee_press = if !editing_mode
@@ -2412,7 +2411,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && grid.contains(px, py)
             && note_hit(notes, view, grid, px, py, style.resize_handle_px).is_none()
         {
-            let s: &PianoRollState = self.widget_state(wid);
+            let s: &PianoRollState = ui.widget_state(wid);
             s.note_drag.is_none()
         } else {
             false
@@ -2597,7 +2596,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             note_geometry_to_rect(start_beat, len_beats, pitch, view, grid)
         });
 
-        self.heavy(("piano_roll_inner", &id), move |hctx| {
+        ui.heavy(("piano_roll_inner", &id), move |hctx| {
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
             hctx.cached(viewport_key, |hctx| {
                 draw_grid_background(hctx, grid, kbd, view_copy, &style_copy);
@@ -2707,12 +2706,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // (M14 Phase 69 / daw_01 #041) loop band overlay (ruler 上、 cached の外で毎 frame 描画)。
             // drag preview range があれば preview を、 無ければ `view.loop_range` を描画。 ruler_h <= 0
             // のときは `ruler.h = 0` なので描画 helper 内で band_w = 0 となり no-op (= 旧 API 互換)。
-            // arrangement と完全同 helper (`crate::widgets::ruler_ops::draw_loop_band`)、 daw_01 が
+            // arrangement と完全同 helper (`daw_ui_core::widgets::ruler_ops::draw_loop_band`)、 daw_01 が
             // ruler_h > 0 + loop_range Some を渡したときのみ表示される。
             if ruler_h > 0.0
                 && let Some(range) = loop_drag_preview_range.or(view_copy.loop_range)
             {
-                crate::widgets::ruler_ops::draw_loop_band(
+                daw_ui_core::widgets::ruler_ops::draw_loop_band(
                     hctx,
                     range,
                     view_copy.start_beat,
@@ -2748,7 +2747,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // M14 Phase 59: editing_mode 中は global shortcut が typing_focus で抑制される
         // ため take_shortcut は false を返すはずだが、defensive で明示 guard。
         if !editing_mode
-            && self.take_shortcut("add_note")
+            && ui.take_shortcut("add_note")
             && let Some((cx, cy)) = pointer.pos
             && grid.contains(cx, cy)
         {
@@ -2785,15 +2784,15 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 muted: false,
                 style: NoteStyle::default(),
             };
-            self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
+            ui.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
         }
 
-        if !editing_mode && self.take_shortcut("delete") && !selected.is_empty() {
+        if !editing_mode && ui.take_shortcut("delete") && !selected.is_empty() {
             let sel_set: HashSet<NoteId> = selected.iter().copied().collect();
             let to_delete: Vec<Note> =
                 notes.iter().filter(|n| sel_set.contains(&n.id)).cloned().collect();
             if !to_delete.is_empty() {
-                self.push_edit(make_edit(PianoRollEditRequest::Delete(to_delete)));
+                ui.push_edit(make_edit(PianoRollEditRequest::Delete(to_delete)));
             }
         }
 
@@ -2812,7 +2811,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 Vec::new()
             };
             if prev != new_sel {
-                self.push_edit(make_edit(PianoRollEditRequest::Select {
+                ui.push_edit(make_edit(PianoRollEditRequest::Select {
                     prev,
                     next: new_sel,
                 }));
@@ -2879,7 +2878,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         } else {
                             PianoRollEditRequest::Move(deltas)
                         };
-                        self.push_edit(make_edit(req));
+                        ui.push_edit(make_edit(req));
                     }
                 }
                 NoteDragKind::ResizeRight => {
@@ -2897,7 +2896,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                     }
                     if !deltas.is_empty() {
-                        self.push_edit(make_edit(PianoRollEditRequest::Resize(deltas)));
+                        ui.push_edit(make_edit(PianoRollEditRequest::Resize(deltas)));
                     }
                 }
                 NoteDragKind::ResizeLeft => {
@@ -2920,7 +2919,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         }
                     }
                     if !deltas.is_empty() {
-                        self.push_edit(make_edit(PianoRollEditRequest::Resize(deltas)));
+                        ui.push_edit(make_edit(PianoRollEditRequest::Resize(deltas)));
                     }
                 }
             }
@@ -2944,7 +2943,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     }
                 }
                 if !updates.is_empty() {
-                    self.push_edit(make_edit(PianoRollEditRequest::SetVelocity(updates)));
+                    ui.push_edit(make_edit(PianoRollEditRequest::SetVelocity(updates)));
                 }
             }
         }
@@ -2967,13 +2966,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 muted: false,
                 style: NoteStyle::default(),
             };
-            self.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
+            ui.push_edit(make_edit(PianoRollEditRequest::Add(vec![new_note])));
             // 入力完了後、 press 時に既定長ノートの右端へ warp した
             // カーソルを元のクリック位置へ戻す (warp しっぱなしだと「ノートの右端のまま」
             // 残り、 次操作の起点が分かりにくいという要望)。 warp は y を変えない
             // (press 時 `warp_cursor(warp_x, py)`) ので、 復帰先 y は anchor_mouse.1
             // (= press y) をそのまま再利用する (press_y を別フィールドで複製しない = SSoT)。
-            self.warp_cursor(nc.press_x, nc.anchor_mouse.1);
+            ui.warp_cursor(nc.press_x, nc.anchor_mouse.1);
         }
 
         // ----- loop drag release → SetLoopRange (M14 Phase 69 / daw_01 #041) -----
@@ -2985,7 +2984,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 view.start_beat + f64::from(ld.last_mouse_x - ruler.x) * beat_per_px;
             let (start, end) =
                 compute_loop_drag_endpoints(&ld, cur_beat, &view.snap, zoom_x_px_per_beat);
-            self.push_edit(make_edit(PianoRollEditRequest::SetLoopRange { start, end }));
+            ui.push_edit(make_edit(PianoRollEditRequest::SetLoopRange { start, end }));
         }
 
         // ----- M14 Phase 125 (#102): marquee commit (plain=REPLACE / Shift=UNION / Ctrl=XOR) -----
@@ -2996,7 +2995,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // (zero-rect → 空 = 選択 clear)。 editing_mode 中は marquee_press が false なので走らない。
         if !editing_mode
             && marquee_active
-            && let Some(drag) = self.take_drag_rect_in_rect(drag_rect_wid, grid)
+            && let Some(drag) = ui.take_drag_rect_in_rect(drag_rect_wid, grid)
         {
             response.rect_select_active = true;
             if drag.finished {
@@ -3039,7 +3038,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 let mut prev_sorted = prev.clone();
                 prev_sorted.sort_unstable();
                 if prev_sorted != next {
-                    self.push_edit(make_edit(PianoRollEditRequest::Select { prev, next }));
+                    ui.push_edit(make_edit(PianoRollEditRequest::Select { prev, next }));
                     response.selection_changed = true;
                 }
             }
@@ -3051,7 +3050,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // 1 SetLyrics Edit (1 undo) で分配。Esc は text_input が focus clear → 次 frame で
         // resp.focused == false 検出 → lyric_editing = None (2 frame で UX 完了)。
         if let Some(edit_id) = lyric_editing {
-            // borrow conflict 回避: 必要なデータを先にコピーしてから self.text_input を呼ぶ。
+            // borrow conflict 回避: 必要なデータを先にコピーしてから ui.text_input を呼ぶ。
             let edit_data = notes.iter().find(|n| n.id == edit_id).map(|n| {
                 let raw_rect = note_to_rect(n, view, grid);
                 let prefill = n.lyric.as_deref().unwrap_or("").to_string();
@@ -3068,7 +3067,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 // (text_input は font_size 14 px 既定で 8 px 高あれば最低限読める)。
                 if clipped_w < 8.0 || clipped_h < 8.0 {
                     // 表示できないほど小さい (zoom out 過多 etc) → 編集モード解除
-                    self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+                    ui.widget_state::<PianoRollState>(wid).lyric_editing = None;
                     lyric_editing = None;
                 } else {
                     let clipped = Rect {
@@ -3080,7 +3079,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                     // text_input_at_focused: id に edit_id を含めることで note 切替時に
                     // widget id が変化 → was_widget_visible_last_frame == false → 自動 focus +
                     // 全選択 (gained_focus 検知経由)。
-                    let resp = self.text_input_at_focused(
+                    let resp = ui.text_input_at_focused(
                         ("piano_roll_lyric", edit_id),
                         clipped,
                         &prefill,
@@ -3116,21 +3115,21 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         response.lyric_overflow_morae =
                             morae.len().saturating_sub(target_ids.len());
                         if !updates.is_empty() {
-                            self.push_edit(make_edit(PianoRollEditRequest::SetLyrics(updates)));
+                            ui.push_edit(make_edit(PianoRollEditRequest::SetLyrics(updates)));
                         }
                         if resp.committed {
                             // Enter: 分配し終わった先の note へ移動して編集継続。
                             let all_sorted =
                                 collect_next_notes_for_lyric(notes, edit_id, usize::MAX);
                             let next_id = all_sorted.get(target_ids.len()).copied();
-                            self.widget_state::<PianoRollState>(wid).lyric_editing = next_id;
+                            ui.widget_state::<PianoRollState>(wid).lyric_editing = next_id;
                             lyric_editing = next_id;
                             // selection も自動追従 (daw_01 UI が同期、note 強調が次 note へ)
                             if let Some(nid) = next_id
                                 && selected != [nid].as_slice()
                             {
                                 let prev = selected.to_vec();
-                                self.push_edit(make_edit(PianoRollEditRequest::Select {
+                                ui.push_edit(make_edit(PianoRollEditRequest::Select {
                                     prev,
                                     next: vec![nid],
                                 }));
@@ -3138,20 +3137,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                             }
                         } else {
                             // 外 click (blur): 現 note の歌詞を確定して編集終了 (次 note へは進まない)。
-                            self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+                            ui.widget_state::<PianoRollState>(wid).lyric_editing = None;
                             lyric_editing = None;
                         }
                     } else if !resp.focused {
                         // Esc 検出: text_input が clear_focus_if_focused →
                         // 次 frame で resp.focused = false かつ committed/blurred でない。破棄。
-                        self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+                        ui.widget_state::<PianoRollState>(wid).lyric_editing = None;
                         lyric_editing = None;
                     }
                 }
             } else {
                 // defensive: notes に edit_id が無い (フレーム頭の sync check で本来 None
                 // にしているので通常起こらない)
-                self.widget_state::<PianoRollState>(wid).lyric_editing = None;
+                ui.widget_state::<PianoRollState>(wid).lyric_editing = None;
                 lyric_editing = None;
             }
         }
@@ -3159,7 +3158,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         response
     }
-}
 
 // ============================================================
 // Internal drawing helpers
@@ -3168,7 +3166,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 /// M14 Phase 117 (daw_01 #093): 鍵盤オクターブラベルの色を、 その行の **実効背景** から決める。
 /// `key_fill` (白鍵 / 黒鍵 fill) の上に `overlay` (root_row_overlay / out overlay、 無ければ `None`) を
 /// alpha 合成した「実際に目に入る色」 の WCAG relative luminance で `label_fg_dark` / `label_fg_light` を
-/// 選ぶ (arrangement clip 名 #060 と同じ `crate::color` SSoT)。 `label_auto_contrast == false` なら
+/// 選ぶ (arrangement clip 名 #060 と同じ `daw_ui_core::color` SSoT)。 `label_auto_contrast == false` なら
 /// `fallback` (旧固定色) をそのまま返す。
 fn keyboard_label_color(
     style: &PianoRollStyle,
@@ -3180,15 +3178,15 @@ fn keyboard_label_color(
         return fallback;
     }
     let bg = match overlay {
-        Some(ov) => crate::color::composite_over(ov, key_fill),
+        Some(ov) => daw_ui_core::color::composite_over(ov, key_fill),
         None => key_fill,
     };
-    crate::color::pick_contrast(bg, style.label_fg_light, style.label_fg_dark)
+    daw_ui_core::color::pick_contrast(bg, style.label_fg_light, style.label_fg_dark)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::too_many_lines)]
 fn draw_grid_background<M: ?Sized + 'static>(
-    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
+    hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
     grid: Rect,
     kbd: Rect,
     view: PianoRollView,
@@ -3462,7 +3460,7 @@ fn draw_grid_background<M: ?Sized + 'static>(
 /// あれば note rect の左端に重ねて描画する (note 高さが lyric font 1 行分以上あるときのみ)。
 #[allow(clippy::too_many_arguments)]
 fn draw_notes<M: ?Sized + 'static>(
-    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
+    hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
     visible: &[Note],
     view: PianoRollView,
     grid: Rect,
@@ -3492,7 +3490,7 @@ fn draw_notes<M: ?Sized + 'static>(
         let fill = note_fill_color(note, note_fill_fn, bg);
         hctx.push_rect(note_rect_command(clipped, fill, radius_px));
         if note.muted {
-            crate::widgets::push_muted_hatch(
+            daw_ui_core::widgets::push_muted_hatch(
                 hctx,
                 clipped,
                 clipped,
@@ -3512,7 +3510,7 @@ fn draw_notes<M: ?Sized + 'static>(
 /// 縦方向中央寄せで note 内に収める。 lyric_editing 中の note は text_input overlay が
 /// 出ているので skip (= 編集中歌詞は text_input 内で表示される)。
 fn draw_lyrics<M: ?Sized + 'static>(
-    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
+    hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
     visible: &[Note],
     view: PianoRollView,
     grid: Rect,
@@ -3566,7 +3564,7 @@ fn draw_lyrics<M: ?Sized + 'static>(
 
 /// selected note に黄色ハイライト + 白枠 overlay を描画 (cached の外、毎フレーム)。
 fn draw_selection_overlay<M: ?Sized + 'static>(
-    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
+    hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
     visible: &[Note],
     selected_set: &HashSet<NoteId>,
     view: PianoRollView,
@@ -3601,7 +3599,7 @@ fn draw_selection_overlay<M: ?Sized + 'static>(
 /// drag 中の shifted note rect (drag preview) を描画。
 #[allow(clippy::too_many_arguments)]
 fn draw_drag_preview<M: ?Sized + 'static>(
-    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
+    hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
     nd: &NoteDragSession,
     view: PianoRollView,
     grid: Rect,
@@ -3652,7 +3650,7 @@ fn draw_drag_preview<M: ?Sized + 'static>(
 /// 含まれる id の note は `n.velocity` の代わりに `new_vel` で bar を描画する (drag preview)。
 /// drag 中はこの override が active になり、release で None に戻る (= cache 経由で実値が反映)。
 fn draw_velocity_lane<M: ?Sized + 'static>(
-    hctx: &mut crate::widgets::heavy::HeavyCtx<'_, '_, M>,
+    hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
     visible: &[Note],
     view: PianoRollView,
     vel_area: Rect,
@@ -3708,7 +3706,7 @@ fn draw_velocity_lane<M: ?Sized + 'static>(
     }
 }
 
-// (M9 Phase 45e) `draw_playhead_line` は `crate::widgets::playhead` に切り出し済み。
+// (M9 Phase 45e) `draw_playhead_line` は `daw_ui_core::widgets::playhead` に切り出し済み。
 // piano_roll / arrangement 両方が `pub(crate) fn` を呼ぶ形にリファクタ。
 
 // ============================================================
@@ -3718,8 +3716,8 @@ fn draw_velocity_lane<M: ?Sized + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{FrameInput, PointerFrame};
-    use crate::ui::UiHost;
+    use daw_ui_core::input::{FrameInput, PointerFrame};
+    use daw_ui_core::ui::UiHost;
     use daw_ui_platform::{ElementState, KeyEvent, Modifiers, PhysicalKey, PhysicalSize};
     use daw_ui_renderer::Scene;
 
@@ -4330,7 +4328,7 @@ mod tests {
         run_frame(&mut host, &mut model, input, |ui| {
             let sel: Vec<NoteId> = vec![];
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -4372,7 +4370,7 @@ mod tests {
         run_frame(&mut host, &mut model, input, |ui| {
             let sel: Vec<NoteId> = vec![];
             let dispatch = make_dispatch();
-            let _resp = ui.piano_roll(
+            let _resp = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -4406,7 +4404,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -4444,7 +4442,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let resp = ui.piano_roll(
+            let resp = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -4482,7 +4480,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -4507,7 +4505,7 @@ mod tests {
 
         run_frame(&mut host, &mut model, FrameInput::default(), |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 ("pr", 0),
                 Rect { x: 0.0, y: 0.0, w: 400.0, h: 400.0 },
                 &[],
@@ -4516,7 +4514,7 @@ mod tests {
                 &style,
                 dispatch.clone(),
             );
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 ("pr", 1),
                 Rect { x: 400.0, y: 0.0, w: 400.0, h: 400.0 },
                 &[],
@@ -4552,7 +4550,7 @@ mod tests {
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let resp = ui.piano_roll(
+            let resp = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -4590,7 +4588,7 @@ mod tests {
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let resp = ui.piano_roll(
+            let resp = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -4616,7 +4614,7 @@ mod tests {
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -4653,7 +4651,7 @@ mod tests {
             };
             run_frame(host, model, input, |ui| {
                 let sel: Vec<NoteId> = vec![];
-                let _ = ui.piano_roll("pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
             });
         };
         // press at note 中央 → Move 開始 (中央なので scroll 不発)。
@@ -4694,7 +4692,7 @@ mod tests {
             };
             run_frame(host, model, input, |ui| {
                 let sel: Vec<NoteId> = vec![];
-                let _ = ui.piano_roll("pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
             });
         };
         // press at note 中央 → Move 開始。
@@ -4733,7 +4731,7 @@ mod tests {
             };
             run_frame(host, model, input, |ui| {
                 let sel: Vec<NoteId> = vec![];
-                let _ = ui.piano_roll("pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
             });
         };
         // press on the note 内、右端 hot-zone (x=775)。
@@ -4777,7 +4775,7 @@ mod tests {
             };
             run_frame(host, model, input, |ui| {
                 let sel: Vec<NoteId> = vec![];
-                let _ = ui.piano_roll("pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", rect, &notes_clone, view, &sel, &style, make_dispatch());
             });
         };
         // press on the note body (x=40)、release せず左端 zone (x=3) までドラッグ。
@@ -4818,7 +4816,7 @@ mod tests {
         run_frame(&mut host, &mut model, f1, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
         assert_eq!(model.last_request, None, "1 度目 click だけでは作成しない");
 
@@ -4836,7 +4834,7 @@ mod tests {
         run_frame(&mut host, &mut model, f2, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let resp = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let resp = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
             creating2.set(resp.creating);
         });
         assert!(creating2.get(), "2 度目 press で作成 session が active (creating=true)");
@@ -4854,7 +4852,7 @@ mod tests {
         run_frame(&mut host, &mut model, f3, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
 
         // Frame 4: 右端をさらに右 (cursor x600 = beat 3.0) へドラッグ (held)。
@@ -4869,7 +4867,7 @@ mod tests {
         run_frame(&mut host, &mut model, f4, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
 
         // Frame 5: release → cursor 位置 (beat 3.0) を右端とする長さで Add。
@@ -4884,7 +4882,7 @@ mod tests {
         run_frame(&mut host, &mut model, f5, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
         assert_eq!(model.last_request, Some(RequestKind::Add), "release で Add 発行");
         let (start, len) = model.last_added.expect("Add の geometry");
@@ -4908,7 +4906,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let warps_clone = Arc::clone(&warps);
         let mut host: UiHost<TestModel> = UiHost::no_redraw();
-        host.set_cursor_pos_request = Some(Box::new(move |x, y| {
+        host.set_cursor_pos_sink(Box::new(move |x, y| {
             warps_clone.lock().unwrap().push((x, y));
         }));
         let mut model = TestModel::new(vec![]);
@@ -4922,7 +4920,7 @@ mod tests {
             host.frame(model, &mut scene, screen, input, |_, ui| {
                 let d = make_dispatch();
                 let sel: Vec<NoteId> = vec![];
-                let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+                let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
             });
         };
 
@@ -5030,7 +5028,7 @@ mod tests {
         run_frame(&mut host, &mut model, f1, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
 
         // Frame 2: 2 度目 press (start beat 2.0、anchor = warp 先 x600)。
@@ -5046,7 +5044,7 @@ mod tests {
         run_frame(&mut host, &mut model, f2, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
 
         // Frame 3: warp 着地 (cursor が右端 anchor x600 へ)。
@@ -5061,7 +5059,7 @@ mod tests {
         run_frame(&mut host, &mut model, f3, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
 
         // Frame 4: 右へ振らず **左へ** ドラッグ (cursor x500 = beat 2.5、held)。
@@ -5076,7 +5074,7 @@ mod tests {
         run_frame(&mut host, &mut model, f4, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
 
         // Frame 5: release → 既定長 1.0 より短い 0.5 で Add (右端から滑らかに短縮)。
@@ -5091,7 +5089,7 @@ mod tests {
         run_frame(&mut host, &mut model, f5, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
         assert_eq!(model.last_request, Some(RequestKind::Add));
         let (start, len) = model.last_added.expect("Add の geometry");
@@ -5124,7 +5122,7 @@ mod tests {
         run_frame(&mut host, &mut model, f1, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
 
         // Frame 2: 2 度目 press。
@@ -5140,7 +5138,7 @@ mod tests {
         run_frame(&mut host, &mut model, f2, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
 
         // Frame 3: 動かさず release。
@@ -5155,7 +5153,7 @@ mod tests {
         run_frame(&mut host, &mut model, f3, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
         assert_eq!(model.last_request, Some(RequestKind::Add), "即放しでも Add 発行");
         let (start, len) = model.last_added.expect("Add の geometry");
@@ -5190,7 +5188,7 @@ mod tests {
         run_frame(&mut host, &mut model, press, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let resp = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let resp = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
             creating.set(resp.creating);
         });
         assert!(!creating.get(), "単発 press では作成 session は始まらない");
@@ -5206,7 +5204,7 @@ mod tests {
         run_frame(&mut host, &mut model, release, |ui| {
             let d = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll("pr", rect, &[], view, &sel, &style, d);
+            let _ = piano_roll(ui, "pr", rect, &[], view, &sel, &style, d);
         });
         assert_eq!(model.last_request, None, "単発クリックでは Add しない");
     }
@@ -5237,7 +5235,7 @@ mod tests {
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -5262,7 +5260,7 @@ mod tests {
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -5308,7 +5306,7 @@ mod tests {
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let resp = ui.piano_roll("pr", rect, &no_notes, view_owned, &sel, &style, dispatch);
+            let resp = piano_roll(ui, "pr", rect, &no_notes, view_owned, &sel, &style, dispatch);
             p1.set(resp.keyboard_active_pitch);
         });
         assert_eq!(p1.get(), Some(60), "鍵盤 press でカーソル位置の pitch");
@@ -5326,7 +5324,7 @@ mod tests {
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let resp = ui.piano_roll("pr", rect, &no_notes, view_owned, &sel, &style, dispatch);
+            let resp = piano_roll(ui, "pr", rect, &no_notes, view_owned, &sel, &style, dispatch);
             p2.set(resp.keyboard_active_pitch);
         });
         assert_eq!(p2.get(), Some(62), "押下中 drag で別キーへ追従 (glissando)");
@@ -5344,7 +5342,7 @@ mod tests {
         run_frame(&mut host, &mut model, input3, |ui| {
             let dispatch = make_dispatch();
             let sel: Vec<NoteId> = vec![];
-            let resp = ui.piano_roll("pr", rect, &no_notes, view_owned, &sel, &style, dispatch);
+            let resp = piano_roll(ui, "pr", rect, &no_notes, view_owned, &sel, &style, dispatch);
             p3.set(resp.keyboard_active_pitch);
         });
         assert_eq!(p3.get(), None, "release で None (note-off)");
@@ -5390,7 +5388,7 @@ mod tests {
         let sel1 = model.selected.clone();
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -5416,7 +5414,7 @@ mod tests {
         let sel2 = model.selected.clone();
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -5465,7 +5463,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel1, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", area, &notes_clone, view, &sel1, &style, make_dispatch());
             },
         );
         assert_eq!(model.last_request, None, "drag 中は Select 発行せず");
@@ -5484,7 +5482,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel2, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", area, &notes_clone, view, &sel2, &style, make_dispatch());
             },
         );
         assert_eq!(model.last_request, Some(RequestKind::Select));
@@ -5524,7 +5522,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel1, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", area, &notes_clone, view, &sel1, &style, make_dispatch());
             },
         );
         let sel2 = model.selected.clone();
@@ -5541,7 +5539,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel2, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", area, &notes_clone, view, &sel2, &style, make_dispatch());
             },
         );
         assert_eq!(model.last_select_next, Some(vec![2, 3]), "XOR: [1,3] ^ {{1,2}} = [2,3]");
@@ -5572,7 +5570,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel1, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", area, &notes_clone, view, &sel1, &style, make_dispatch());
             },
         );
         // release at (260,125) = +110px (>4px、 demote されず Move commit)。
@@ -5589,7 +5587,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel2, &style, make_dispatch());
+                let _ = piano_roll(ui, "pr", area, &notes_clone, view, &sel2, &style, make_dispatch());
             },
         );
         assert_eq!(model.last_request, Some(RequestKind::Move), "note 上 plain drag は Move、 marquee 不発");
@@ -5626,7 +5624,7 @@ mod tests {
                     ..Default::default()
                 },
                 |_, ui| {
-                    let _ = ui.piano_roll("pr", area, &notes_clone, view, &sel, &style, make_dispatch());
+                    let _ = piano_roll(ui, "pr", area, &notes_clone, view, &sel, &style, make_dispatch());
                 },
             )
         };
@@ -5661,7 +5659,7 @@ mod tests {
         let sel1 = model.selected.clone();
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -5685,7 +5683,7 @@ mod tests {
         let sel2 = model.selected.clone();
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -5712,7 +5710,7 @@ mod tests {
         let screen = PhysicalSize { width: 800, height: 400 };
         host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &model.notes,
@@ -5904,7 +5902,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -5929,7 +5927,7 @@ mod tests {
         let notes_clone2 = model.notes.clone();
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone2,
@@ -5975,7 +5973,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -6018,7 +6016,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -6042,7 +6040,7 @@ mod tests {
         let notes_clone2 = model.notes.clone();
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone2,
@@ -6085,7 +6083,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -6109,7 +6107,7 @@ mod tests {
         let notes_clone2 = model.notes.clone();
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone2,
@@ -6149,7 +6147,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -6190,7 +6188,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -6231,7 +6229,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -6256,7 +6254,7 @@ mod tests {
         let dragging_flag = std::cell::Cell::new(false);
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
-            let resp = ui.piano_roll(
+            let resp = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone2,
@@ -6298,7 +6296,7 @@ mod tests {
         let notes_clone = model.notes.clone();
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -6322,7 +6320,7 @@ mod tests {
         let notes_clone2 = model.notes.clone();
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone2,
@@ -6344,15 +6342,15 @@ mod tests {
         use daw_ui_platform::PhysicalSize;
         use daw_ui_renderer::Scene;
 
-        use crate::input::FrameInput;
-        use crate::ui::UiHost;
+        use daw_ui_core::input::FrameInput;
+        use daw_ui_core::ui::UiHost;
 
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 400 };
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             let style = PianoRollStyle::default();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr_test",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 notes,
@@ -6451,7 +6449,7 @@ mod tests {
     ) {
         let captured_clone = Arc::clone(&captured);
         let mut host: UiHost<TestModel> = UiHost::no_redraw();
-        host.set_cursor_request = Some(Box::new(move |c| {
+        host.set_cursor_sink(Box::new(move |c| {
             captured_clone.lock().unwrap().push(c);
         }));
         let mut scene = Scene::new();
@@ -6480,7 +6478,7 @@ mod tests {
         let sel = model.selected.clone();
         run_frame_with_cursor_capture(Arc::clone(&captured), &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -6513,14 +6511,14 @@ mod tests {
         let sel = model.selected.clone();
         let captured_clone = Arc::clone(&captured);
         let mut host: UiHost<TestModel> = UiHost::no_redraw();
-        host.set_cursor_request = Some(Box::new(move |c| {
+        host.set_cursor_sink(Box::new(move |c| {
             captured_clone.lock().unwrap().push(c);
         }));
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 1000, height: 600 };
         host.frame(&mut model, &mut scene, screen, input, |_, ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -6597,7 +6595,7 @@ mod tests {
             std::cell::RefCell::new(None);
         run_frame(host, model, input, |ui| {
             let dispatch = make_dispatch();
-            let resp = ui.piano_roll(
+            let resp = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &notes_clone,
@@ -7316,7 +7314,7 @@ mod tests {
             screen,
             FrameInput::default(),
             |m, ui| {
-                let _ = ui.piano_roll(
+                let _ = piano_roll(ui, 
                     "test_lyric_cap",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.notes,
@@ -7365,7 +7363,7 @@ mod tests {
         let sel: Vec<NoteId> = vec![];
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -7411,7 +7409,7 @@ mod tests {
         let sel: Vec<NoteId> = vec![];
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -7450,7 +7448,7 @@ mod tests {
         };
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -7472,7 +7470,7 @@ mod tests {
         };
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -7494,7 +7492,7 @@ mod tests {
         };
         run_frame(&mut host, &mut model, input3, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -7539,7 +7537,7 @@ mod tests {
         };
         run_frame(&mut host, &mut model, input1, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -7562,7 +7560,7 @@ mod tests {
         };
         run_frame(&mut host, &mut model, input2, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -7585,7 +7583,7 @@ mod tests {
         };
         run_frame(&mut host, &mut model, input3, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -7617,7 +7615,7 @@ mod tests {
             ruler_h: 20.0,
             // 1 beat snap (SnapMode::Straight { div: 4 })
             snap: SnapConfig {
-                mode: crate::snap::SnapMode::Straight { div: 4 },
+                mode: daw_ui_core::snap::SnapMode::Straight { div: 4 },
                 enabled: true,
                 min_beat_unit: 1.0 / 128.0,
                 time_sig: (4, 4),
@@ -7640,7 +7638,7 @@ mod tests {
         };
         run_frame(&mut host, &mut model, input, |ui| {
             let dispatch = make_dispatch();
-            let _ = ui.piano_roll(
+            let _ = piano_roll(ui, 
                 "pr",
                 Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                 &[],
@@ -8015,7 +8013,7 @@ mod tests {
             PhysicalSize { width: 800, height: 400 },
             FrameInput::default(),
             |m, ui| {
-                let _ = ui.piano_roll(
+                let _ = piano_roll(ui, 
                     "pr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.notes,
@@ -8045,7 +8043,7 @@ mod tests {
             PhysicalSize { width: 800, height: 400 },
             FrameInput::default(),
             |m, ui| {
-                let _ = ui.piano_roll(
+                let _ = piano_roll(ui, 
                     "pr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.notes,
@@ -8084,7 +8082,7 @@ mod tests {
             PhysicalSize { width: 800, height: 400 },
             FrameInput::default(),
             |m, ui| {
-                let _ = ui.piano_roll(
+                let _ = piano_roll(ui, 
                     "pr",
                     Rect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 },
                     &m.notes,

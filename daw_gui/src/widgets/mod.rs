@@ -10,3 +10,4 @@
 //! daw-ui-core の `pub` API を呼ぶ。
 
 pub mod arrangement;
+pub mod piano_roll;

@@ -64,13 +64,6 @@ pub use widgets::list_view::{ListViewResponse, ListViewStyle};
 pub use widgets::menu::MenuItemSpec;
 pub use widgets::modal::ModalStyle;
 pub use widgets::knob::KnobResponse;
-pub use widgets::piano_roll::{
-    Note, NoteDragKind, NoteFillFn, NoteId, NoteStyle, MoveDelta, PianoRollEditRequest,
-    PianoRollResponse,
-    PianoRollScale, PianoRollScaleMode, PianoRollStyle, PianoRollView, ResizeDelta, VelocityUpdate,
-    default_velocity_color, is_black_key, note_hit, note_hover_cursor, note_to_rect,
-    pitch_class_name, rects_intersect, split_into_morae,
-};
 pub use widgets::reorderable_list::{
     ReorderableListEditRequest, ReorderableListResponse, ReorderableListStyle,
 };
