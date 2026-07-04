@@ -4,6 +4,51 @@
 プロセス間同期) で確定した構造問題を、一括で最終形へ改修する。個別の発見と証拠 (file:line)
 はチャットレポート参照。本書は **確定した設計判断の SSoT**。
 
+## 進捗と再開ポイント (2026-07-04 更新)
+
+branch = `feature/arch-refactor`。各段の green を WIP commit でチェックポイント化している
+(未 sign-off なので main 未統合。最終統合は S8 の実機検証後)。
+
+**完了・全 green (workspace check --all-targets 0 / make clippy 0 / make test 全 pass)**:
+- S1 common 基盤 (§1-4,10 の大半) — device_id/send_id/要素 id 安定化 v29、protocol 4 分割、
+  build.rs fingerprint、blob-less wire、AraSourceSpec::Pcm 廃止、死んだ sem/samples 面削除
+- S2a daw_audio (§4-5) — 有界 dispatch+quarantine、render_master_buffer で live/export 統一、
+  値 vs topology 分離 + adopt_state_from、RtBundle off-thread swap、cpal 0.17+mmcss、engine 分割
+- S2b daw_plugin_host (§6) — InstanceRecord device_id 一本化、CLAP host ext 完備 (VST3 対称)、
+  ProcessScaffold 抽出、split-half aliasing 解消、VocalSynth capability 分離
+- S3 daw_gui (§7,7.5) — state 9 分割、edit_song チョークポイント (song private)、sync pull
+  一本化 (flush_song_sync)、handler/ 25 モジュールで app.rs 24840→2097、IPC direct-wrap、
+  export gate 反転 (positive-default + block-list)
+- S4a — lib undo 撤去 (Edit::Undoable/history.rs)、widget_state 公開、死んだ label 引数全廃
+- S4b (§8) — arrangement を daw_gui/src/widgets/arrangement/ へ移設、mirror 型/EditRequest 58/
+  make_edit 736 全廃、**二相描画マジックインセットバグ修正** (単一 SSoT clip_content_inset_top)、
+  8 モジュール ≤3000 に分割、テスト AppData-driven 化
+- S6 DESIGN.md 現行化、S7 ワークフロー (CLAUDE.md 不変条件 + make arch-lint + guards 7 則 +
+  /arch-review skill + implement/review skill 更新)
+
+**最新 green checkpoint**: commit `0ff0328` (S4b Phase B-E)。
+
+**残タスク (逐次、各段 green を WIP commit)**:
+- **S4c**: piano_roll を daw_gui へ移設 (S4b と同型: `PianoRollEditRequest` 翻訳層除去 +
+  model 直結 + **二相描画インセットを arrangement と同じく単一 SSoT に** + `notes_generation`
+  削除 + god-file 分割 ≤3000 + テスト AppData-driven 化)。track_inspector.rs 3640 行も
+  この文脈の view 抽出で ≤3000 に。
+- **S4d**: renderer の意味色 (SOLO/PLAYHEAD/RECORD/CLIP_DEFAULT) を ui-core/daw_gui theme へ、
+  FontSystem 二重ロード解消、`snap.rs`/`time.rs`/`split_into_morae` を common へ (S5 と調整)。
+- **S5** (§9,10): common 縮退 (video_fx/app_config/window_state/recent/scale/voicevox_engine →
+  daw_gui、voicevox/voicevox_cache → plugin_host、scan → plugin_host + RescanPlugins IPC、
+  reqwest を common から除去)。ClipContent の untagged → tag 化 + JSON 前処理 migration
+  (CURRENT_VERSION 29→30)、legacy field を前処理層へ、migration dispatch table 化。
+- **S8**: `make check`/`make clippy`/`make build`/`make test` 全 green、headless script テスト
+  (export/master fx/PDC)、`daw_gui --smoke-test`、旧バージョン project load 互換テスト、
+  **実機 sign-off** (特に S4b/c の arrangement/piano_roll interactive: clip drag/resize/split/
+  automation/ノート編集/velocity/歌詞/snap の目視 — unit test をすり抜ける visual regression)。
+
+**再開時の運用** (この session で確立):
+- 実装は狭くスコープした単一 agent へ (fan-out 禁止・逐次)。各段 green を私が **cargo で実測
+  確認** (rust-analyzer の new-diagnostics は常に stale なので信用しない) → WIP commit。
+- common を触る作業 (S5) は他 agent の daw_gui ビルド確認を撹乱するので単独で。
+
 ## 0. 改修の柱 (原則)
 
 1. **identity は安定 id 一本** — positional index をプロセス境界・イベント・永続参照に使わない。
