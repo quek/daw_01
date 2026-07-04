@@ -21,7 +21,7 @@
 //!    `RemoveTrack` が送られ、 楽器 track は `parent_group_id == None` で残る
 
 use common::model::{AutomationLane, AutomationTarget, InstrumentSource};
-use common::protocol::{AudioCommand, PluginCommand};
+use common::protocol::{AudioCommand, PluginCommand, PluginEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{device_id_at, AppData, AppEvent};
@@ -195,7 +195,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     // RemoveDevice は plugin の最新 state を取ってから Undo snapshot → 削除 という
     // deferred path を通る。 test では plugin_host を mock していないので、 fake で
     // AllStatesReceived を流して deferred edit を実行させる。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
@@ -206,7 +206,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         plugin_msgs
     );
     // plugin_host が destroy 完了して SlotPluginUnloaded を返したのを fake。
-    app.handle_event(AppEvent::SlotPluginUnloadedFromChild { device_id: bitcrush_dev });
+    app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginUnloaded { device_id: bitcrush_dev }));
 
     // Bitcrush が track_plugin_ids から消えて、 Delay のみ残る。
     assert_eq!(
@@ -230,7 +230,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     app.handle_event(AppEvent::UngroupTracks {
         track_ids: vec![group_id],
     });
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     // frame flush: ClosePluginShmem は ungroup handler が UAF 防止で直送済。 schedule
     // 再構築の LoadSong はここで送られ、 close をブラケットする (load_before/after)。
     app.flush_song_sync();

@@ -10,7 +10,7 @@
 //! - `DirtyGuardSave` (非同期): plugin 有り project は plugin state 取得
 //!   (`AllStatesReceived`) を待ってから保存 → 操作実行
 
-use common::protocol::PluginCommand;
+use common::protocol::{PluginCommand, PluginEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction};
@@ -126,7 +126,7 @@ fn save_with_plugins_waits_for_states_then_quits() {
     assert!(!path.exists(), "not saved yet (awaiting states)");
 
     // plugin state 到着 → 保存実行 → 終了確定。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
 
     assert!(path.exists(), "project saved after states arrive");
     assert!(!app.song_doc.is_dirty(), "is_dirty cleared after async save");
@@ -307,7 +307,7 @@ fn new_during_in_flight_save_preserves_old_project() {
     );
 
     // plugin state 到着 → 実プロジェクトを保存 → queue drain → 再評価で New を実行。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
 
     let saved = common::project::load(&path).expect("project saved to disk");
     assert_eq!(
@@ -362,7 +362,7 @@ fn open_recent_during_deferred_edit_defers_then_reevaluates() {
 
     // round-trip 完了 → 削除実行で project が dirty 化 → drain 後に Open を再評価
     // → dirty なので確認モーダルを開く (= 黙って差し替えない)。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     assert!(app.ui_ephemeral.guard_pending_action.is_none(), "deferred guard consumed");
     assert_eq!(
         app.ui_ephemeral.dirty_guard,
@@ -401,14 +401,14 @@ fn manual_save_ignored_while_guard_modal_open() {
 /// で stuck state を破棄し、 ガードが再び機能する。
 #[test]
 fn plugin_host_disconnect_unblocks_dirty_guard() {
-    use common::protocol::ChildKind;
+    
 
     let (mut app, _rx) = build_app();
     // 非同期 round-trip 待ちで両方の deferred ガード state が立った状況を模す。
     app.ui_ephemeral.guard_after_save = Some(DirtyGuardAction::Quit);
     app.ui_ephemeral.guard_pending_action = Some(DirtyGuardAction::New);
 
-    app.handle_event(AppEvent::ChildDisconnected { kind: ChildKind::PluginHost });
+    app.handle_event(AppEvent::Plugin(PluginEvent::ChildDisconnected));
 
     assert!(
         app.ui_ephemeral.guard_after_save.is_none(),

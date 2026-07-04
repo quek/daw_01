@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use common::protocol::{AudioCommand, PluginCommand};
+use common::protocol::{AudioCommand, AudioEvent, PluginCommand, PluginEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, ExportStage};
@@ -248,7 +248,7 @@ fn watchdog_does_not_fire_after_roundtrip_completes() {
     assert!(!app.ipc.pending_state_queue.is_empty(), "save round-trip in flight");
 
     // 正常応答で完了。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     assert!(app.ipc.pending_state_queue.is_empty(), "queue drained on response");
     assert!(path.exists(), "project saved");
 
@@ -277,7 +277,7 @@ fn plugins_reinit_done_passes_export_gate_and_fires_export_wav() {
     let _ = drain(&mut audio_rx);
 
     // host の reinit 完了通知。 gate を通過 → handler が pending_export を撃つ。
-    app.handle_event(AppEvent::PluginsReinitDone);
+    app.handle_event(AppEvent::Plugin(PluginEvent::PluginsReinitDone));
 
     let msgs = drain(&mut audio_rx);
     assert!(
@@ -311,5 +311,45 @@ fn export_gate_still_blocks_song_mutations() {
         vol,
         Some(0.137),
         "song-mutating user events stay gated during export"
+    );
+}
+
+/// gate 反転 (allow-list → block-list) の回帰。 export 中でも block-list 外の
+/// protocol event は default で流れる (= 「新 variant を allow に入れ忘れ →
+/// GUI 永久ロック」 class が構造的に消えた)。 一方、 走行中 render を壊す host
+/// 再構成 round-trip は引き続き drop される。
+#[test]
+fn export_gate_flows_default_events_but_blocks_host_reconfig() {
+    let (mut app, mut plugin_rx, _audio_rx) = build_app_with_audio();
+    app.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+
+    // (1) 正例: 旧 allow-list に無かった VoicevoxSynthStatus は今 export 中も流れ、
+    //     handler が status entry を作る。 追加した variant を何もせず default で
+    //     通す = 「allow 忘れ → deadlock」 が不能。
+    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus {
+        device_id: 7,
+        busy: true,
+        failing: false,
+    }));
+    assert!(
+        app.voicevox.voicevox_synth_status.contains_key(&7),
+        "block-list 外の event は export 中も流れて処理される (positive-default)"
+    );
+
+    // (2) 反例: host を再構成する round-trip は block-list で drop される。
+    //     BounceClipFxComplete の handler は pending 無しでも防御的に
+    //     SetRenderMode(Realtime) を plugin へ送るので、 block されれば handler に
+    //     到達せず、 その送信も起きない。
+    let _ = drain(&mut plugin_rx); // setup 由来の command を掃除
+    app.handle_event(AppEvent::Audio(AudioEvent::BounceClipFxComplete {
+        path: std::path::PathBuf::from("x.wav"),
+        source_track: 0,
+        source_clip: 0,
+        error: None,
+        frames: 0,
+    }));
+    assert!(
+        drain(&mut plugin_rx).is_empty(),
+        "host 再構成 round-trip (BounceClipFxComplete) は export 中 block-list で drop される"
     );
 }

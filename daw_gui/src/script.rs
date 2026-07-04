@@ -250,15 +250,16 @@ impl ScriptHost {
                 // 無いと、 slot ロード前の初回 flush が skip されたまま再 flush されず、
                 // VOICEVOX を含む project の headless export が無音になる
                 // (`docs/plan_voicevox_talk.md` §7 で talk export 検証時に発覚)。
-                self.app.handle_event(AppEvent::SlotPluginLoadedFromChild {
-                    device_id: *device_id,
-                    id: id.clone(),
-                    name: name.clone(),
-                    shmem_id: shmem_id.clone(),
-                    state_load_error: state_load_error.clone(),
-                    aux_output_count: *aux_output_count,
-                    generation: *generation,
-                });
+                self.app
+                    .handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoaded {
+                        device_id: *device_id,
+                        id: id.clone(),
+                        name: name.clone(),
+                        shmem_id: shmem_id.clone(),
+                        state_load_error: state_load_error.clone(),
+                        aux_output_count: *aux_output_count,
+                        generation: *generation,
+                    }));
             }
             PluginEvent::SlotPluginUnloaded { device_id } => {
                 self.plugin_latencies.remove(device_id);

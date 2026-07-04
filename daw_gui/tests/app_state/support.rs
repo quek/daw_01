@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use common::plugin_db::{PluginDatabase, PluginEntry};
 use common::plugin_format::PluginFormat;
-use common::protocol::{AudioCommand, PluginCommand};
+use common::protocol::{AudioCommand, PluginCommand, PluginEvent};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent};
@@ -122,7 +122,7 @@ pub fn fake_plugin_loaded(app: &mut AppData, track_id: u32, index: u32, id: &str
         .get(&device_id)
         .copied()
         .expect("fake_plugin_loaded: SetSlotPlugin was not pending for this device");
-    app.handle_event(AppEvent::SlotPluginLoadedFromChild {
+    app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoaded {
         device_id,
         id: id.into(),
         name: id.into(),
@@ -132,6 +132,6 @@ pub fn fake_plugin_loaded(app: &mut AppData, track_id: u32, index: u32, id: &str
         state_load_error: None,
         aux_output_count: 0,
         generation,
-    });
+    }));
     device_id
 }

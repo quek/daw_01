@@ -9,7 +9,6 @@ use std::time::Duration;
 use anyhow::Result;
 use common::audio_bridge::AudioBridgeHandle;
 use common::metrics_bridge::MetricsBridgeHandle;
-use common::protocol::{AudioEvent, ChildKind, PluginEvent};
 use daw_gui::bootstrap::ChildEvent;
 use tokio::sync::mpsc::UnboundedReceiver;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -326,165 +325,18 @@ fn spawn_incoming_bridge(
         while let Some(msg) = rx.blocking_recv() {
             // v29: pipe が型分割されたので bridge も 2 系統。 変換は従来どおり
             // 1 protocol event = 1 AppEvent を維持する。
+            // direct-wrap: protocol event を丸ごと `AppEvent` に包んで app へ送る。
+            // variant ごとの処理接続は `handler::ipc` の dispatch_* が担う
+            // (旧 1:1 bridge audio_event_to_app / plugin_event_to_app を廃止)。
             let event = match msg {
-                ChildEvent::Audio(ev) => audio_event_to_app(ev),
-                ChildEvent::Plugin(ev) => plugin_event_to_app(ev),
+                ChildEvent::Audio(ev) => AppEvent::Audio(ev),
+                ChildEvent::Plugin(ev) => AppEvent::Plugin(ev),
             };
-            if let Some(event) = event
-                && proxy.send_event(event).is_err()
-            {
+            if proxy.send_event(event).is_err() {
                 break;
             }
         }
     });
-}
-
-/// daw_audio → AppEvent の 1:1 変換 (transport / export / worker pool)。
-fn audio_event_to_app(ev: AudioEvent) -> Option<AppEvent> {
-    match ev {
-        AudioEvent::Hello { .. } => None,
-        AudioEvent::ChildDisconnected => Some(AppEvent::ChildDisconnected {
-            kind: ChildKind::Audio,
-        }),
-        AudioEvent::ExportWavComplete { error, cancelled } => {
-            Some(AppEvent::ExportWavComplete { error, cancelled })
-        }
-        AudioEvent::ExportWavProgress { done, total } => {
-            Some(AppEvent::ExportWavProgress { done, total })
-        }
-        AudioEvent::BounceClipFxComplete {
-            path,
-            source_track,
-            source_clip,
-            error,
-            frames,
-        } => Some(AppEvent::BounceClipFxComplete {
-            path,
-            source_track,
-            source_clip,
-            error,
-            frames,
-        }),
-        AudioEvent::PluginUnresponsive { device_id } => {
-            Some(AppEvent::PluginUnresponsive { device_id })
-        }
-        AudioEvent::WorkerPoolStalled => Some(AppEvent::WorkerPoolStalled),
-    }
-}
-
-/// daw_plugin_host → AppEvent の 1:1 変換 (plugin lifecycle / GUI / param)。
-fn plugin_event_to_app(ev: PluginEvent) -> Option<AppEvent> {
-    match ev {
-        PluginEvent::Hello { .. } => None,
-        PluginEvent::ChildDisconnected => Some(AppEvent::ChildDisconnected {
-            kind: ChildKind::PluginHost,
-        }),
-        PluginEvent::PluginsReinitDone => Some(AppEvent::PluginsReinitDone),
-        PluginEvent::VocalSynthReady { device_id } => {
-            Some(AppEvent::VocalSynthReady { device_id })
-        }
-        PluginEvent::SlotPluginLoaded {
-            device_id,
-            id,
-            name,
-            shmem_id,
-            state_load_error,
-            aux_output_count,
-            generation,
-        } => {
-            // SSoT: `OpenPluginShmem` は AppData が live な
-            // `self.ipc.audio_tx` (respawn で差し替わる側) から送る。
-            // ここで bootstrap 時点の stale clone に直接送ると、
-            // audio engine respawn 後にロードした plugin の shmem が
-            // 開かれず無言で音が出なくなる。 shmem_id を AppEvent まで
-            // 運び、 handler (on_plugin_loaded_from_child) で送る。
-            Some(AppEvent::SlotPluginLoadedFromChild {
-                device_id,
-                id,
-                name,
-                shmem_id,
-                state_load_error,
-                aux_output_count,
-                generation,
-            })
-        }
-        PluginEvent::SlotPluginLoadFailed {
-            device_id,
-            plugin_id,
-            reason,
-            generation,
-        } => Some(AppEvent::SlotPluginLoadFailedFromChild {
-            device_id,
-            plugin_id,
-            reason,
-            generation,
-        }),
-        PluginEvent::SlotPluginState { .. } => None,
-        PluginEvent::AllPluginStates { entries } => Some(AppEvent::AllStatesReceived(entries)),
-        PluginEvent::SlotGuiOpened {
-            device_id,
-            width,
-            height,
-        } => Some(AppEvent::GuiOpenedFromChild {
-            device_id,
-            width,
-            height,
-        }),
-        PluginEvent::SlotGuiClosed { device_id } => {
-            Some(AppEvent::GuiClosedFromChild { device_id })
-        }
-        PluginEvent::SlotPluginUnloaded { device_id } => {
-            // SSoT: `ClosePluginShmem` も AppData が live な audio_tx
-            // から送る (on_plugin_unloaded_from_child)。 stale clone に
-            // 直接送ると respawn 後に dangling shmem 参照が残る。
-            Some(AppEvent::SlotPluginUnloadedFromChild { device_id })
-        }
-        PluginEvent::PluginLatencyChanged { device_id, samples } => {
-            Some(AppEvent::PluginLatencyChangedFromChild { device_id, samples })
-        }
-        // Phase 2 (`docs/plan_automation.md` §7.5): plugin の
-        // parameter 一覧 / touch / value change を AppEvent に
-        // 変換して app に流す。 詳細 handler は app.rs 側。
-        PluginEvent::PluginParamList {
-            device_id,
-            params,
-            has_embedded_gui,
-        } => Some(AppEvent::PluginParamListFromChild {
-            device_id,
-            params,
-            has_embedded_gui,
-        }),
-        PluginEvent::PluginParamTouched {
-            device_id,
-            param_id,
-            display_name,
-        } => Some(AppEvent::PluginParamTouchedFromChild {
-            device_id,
-            param_id,
-            display_name,
-        }),
-        PluginEvent::PluginParamValueChanged {
-            device_id,
-            param_id,
-            value,
-        } => Some(AppEvent::PluginParamValueChangedFromChild {
-            device_id,
-            param_id,
-            value,
-        }),
-        PluginEvent::PluginParamGestureEnd { device_id, param_id } => {
-            Some(AppEvent::PluginParamGestureEndFromChild { device_id, param_id })
-        }
-        PluginEvent::VoicevoxSynthStatus {
-            device_id,
-            busy,
-            failing,
-        } => Some(AppEvent::VoicevoxSynthStatus {
-            device_id,
-            busy,
-            failing,
-        }),
-    }
 }
 
 fn spawn_midi_input(proxy: EventLoopProxy<AppEvent>) {

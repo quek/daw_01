@@ -10,7 +10,7 @@
 //! が再発行され、 2 回目の `AllStatesReceived` で 2 件目が実行されることを
 //! 検証する。
 
-use common::protocol::PluginCommand;
+use common::protocol::{PluginCommand, PluginEvent};
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, PendingStateRequest};
 
@@ -118,7 +118,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
 
     // 1 回目の AllStatesReceived → 1 件目 (index 1) が実行され、 queue 残り 1、
     // 次の RequestAllStates が再発行される。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     assert_eq!(
         app.ipc.pending_state_queue.len(),
         1,
@@ -140,7 +140,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
 
     // 2 回目の AllStatesReceived → 2 件目 (index 2) が実行され、 queue 空、
     // RequestAllStates は再発行されない (= no follow-up)。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     assert!(
         app.ipc.pending_state_queue.is_empty(),
         "queue drained after both responses"
@@ -256,7 +256,7 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
     // R1 応答 → Deferred(RemoveDevice index 1) 実行 (live devices → [synth, delay])、
     // queue 残り [Save]、 dispatch_front_state_request が Save の snapshot を **今の**
     // live (= 削除後 layout) で充填し、 R2 を送る。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     assert_eq!(
         app.ipc.pending_state_queue.len(),
         1,
@@ -314,7 +314,7 @@ fn save_and_quit_clean_sets_should_quit() {
     assert!(has_pending_save(&app), "Save in-flight");
 
     // 編集なしで応答到着 → finish_save が clean を確認して should_quit。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     assert!(app.ui_ephemeral.should_quit, "clean async save-and-quit sets should_quit");
     assert!(
         app.ui_ephemeral.guard_after_save.is_none(),
@@ -352,7 +352,7 @@ fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
 
     // 応答到着 → finish_save: saved baseline = 編集前 snapshot、 live は編集後で
     // dirty。 should_quit は立たず、 再保存が enqueue され、 終了意図は維持される。
-    app.handle_event(AppEvent::AllStatesReceived(Vec::new()));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { entries: Vec::new() }));
     assert!(
         !app.ui_ephemeral.should_quit,
         "window edit during save-and-quit must NOT quit (would drop the edit)"

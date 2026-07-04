@@ -6,7 +6,7 @@
 //! v29: pending は `device_id → 要求 generation` の map。 失敗通知は
 //! 最新 generation の echo だけ受理される (stale 応答 guard)。
 
-use common::protocol::{AudioCommand, PluginCommand};
+use common::protocol::{AudioCommand, PluginCommand, PluginEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{device_id_at, AppData, AppEvent};
@@ -78,12 +78,12 @@ fn load_failure_releases_single_pending_and_flushes_play() {
 
     // 3. plugin_host から load failure 通知が届いた fake dispatch。
     let generation = pending_generation(&app, synth_dev);
-    app.handle_event(AppEvent::SlotPluginLoadFailedFromChild {
+    app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoadFailed {
         device_id: synth_dev,
         plugin_id: "test.synth".into(),
         reason: "fake load failed".into(),
         generation,
-    });
+    }));
 
     // 4. pending 解放 + queue Play flush + status_message に失敗内容。
     assert!(
@@ -155,12 +155,12 @@ fn load_failure_keeps_other_pending_unaffected() {
 
     // device 0 (test.synth) だけ失敗。 device 1 (test.fx) の pending は残る。
     let generation = pending_generation(&app, synth_dev);
-    app.handle_event(AppEvent::SlotPluginLoadFailedFromChild {
+    app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoadFailed {
         device_id: synth_dev,
         plugin_id: "test.synth".into(),
         reason: "fake load failed".into(),
         generation,
-    });
+    }));
 
     assert!(
         !app.ipc.pending_plugin_loads.contains_key(&synth_dev),
@@ -212,12 +212,12 @@ fn stale_generation_failure_is_ignored() {
     let generation = pending_generation(&app, synth_dev);
 
     // 古い世代 (generation - 1 相当 = 別の値) の失敗が遅れて届いた fake。
-    app.handle_event(AppEvent::SlotPluginLoadFailedFromChild {
+    app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoadFailed {
         device_id: synth_dev,
         plugin_id: "test.synth".into(),
         reason: "stale failure".into(),
         generation: generation.wrapping_add(1000),
-    });
+    }));
 
     // pending は解放されない (最新世代の応答待ちを維持)。
     assert!(

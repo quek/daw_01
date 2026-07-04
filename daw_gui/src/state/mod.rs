@@ -52,6 +52,7 @@ impl AppData {
     /// squash され、 Begin*/End* gesture 中は drag 全体が 1 step になる。
     /// export 中は `None` (編集拒否 + status message 予約)。
     pub fn edit_song<R>(&mut self, f: impl FnOnce(&mut common::model::Song) -> R) -> Option<R> {
+        self.sync_export_lock();
         let scope = self.song_doc.event_scope();
         self.song_doc.edit(scope, f)
     }
@@ -62,7 +63,20 @@ impl AppData {
         &mut self,
         f: impl FnOnce(&mut common::model::Song) -> bool,
     ) -> bool {
+        self.sync_export_lock();
         let scope = self.song_doc.event_scope();
         self.song_doc.edit_checked(scope, f) == Some(true)
+    }
+
+    /// song 凍結の単一保証点 (§7.5): export (audio freewheel / video render) 中は
+    /// `SongDoc::edit` が編集を拒否する。 handle_event の gate を block-list へ反転
+    /// した (song 遮断を event 単位の allow-list で担わない) 代わりに、 song
+    /// mutation の遮断はこの 1 箇所 (edit_song チョークポイント) に集約する。
+    /// export 状態は transport が SSoT なので、 編集直前に毎回同期する
+    /// (別途 toggle する scatter を作らない = 「解除し忘れ」故障モードを消す)。
+    fn sync_export_lock(&mut self) {
+        let exporting =
+            self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some();
+        self.song_doc.set_export_lock(exporting);
     }
 }

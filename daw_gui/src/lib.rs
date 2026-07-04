@@ -11,6 +11,11 @@
 //! 構築できる。
 
 pub mod app;
+pub mod app_types;
+#[cfg(test)]
+mod app_tests;
+pub mod event;
+pub mod handler;
 pub mod audio_source_cache;
 pub mod automation_value;
 pub mod bootstrap;
