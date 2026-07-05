@@ -61,15 +61,19 @@ impl AppData {
         // 貼り付け先 clip が実在しなければ (edit 前に判定して) spurious な
         // undo snapshot を積まない。
         let Some(local_sel) = self.edit_song(|song| {
-            let dest = song.notes_in_clip_mut(r.track as usize, r.clip as usize)?;
+            let dest = midi_content_in_clip_mut(song, r.track as usize, r.clip as usize)?;
             let mut new_indices = Vec::with_capacity(notes.len());
             for src in &mut notes {
                 src.start_beat += anchor;
-                new_indices.push(dest.len() as u32);
-                dest.push(src.clone());
+                // clipboard の Note は元 content の id を持つ。 貼り付け先 content で
+                // per-content 一意 id 不変条件 (invariant #1、 piano_roll が note.id で
+                // addressing) を守るため再採番する (M4 sibling)。
+                src.id = dest.alloc_note_id();
+                new_indices.push(dest.notes.len() as u32);
+                dest.notes.push(src.clone());
             }
             // 貼り付けた note を勝者として重なり解消。選択は remap で追従。
-            let remap = resolve_note_overlaps(dest, &new_indices);
+            let remap = resolve_note_overlaps(&mut dest.notes, &new_indices);
             Some(remap_indices(&remap, &new_indices))
         }).flatten() else {
             return 0;
@@ -438,17 +442,17 @@ impl AppData {
             |app, slot, r, items| {
                 let locals: Vec<u32> = items.iter().map(|&(local, ())| local as u32).collect();
                 let packed = app.edit_song(move |song| {
-                    let Some(notes) =
-                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    let Some(content) =
+                        midi_content_in_clip_mut(song, r.track as usize, r.clip as usize)
                     else {
                         return Vec::new();
                     };
-                    let new_ids = duplicate_notes_into(notes, &locals);
+                    let new_ids = duplicate_notes_into(content, &locals);
                     if new_ids.is_empty() {
                         return Vec::new();
                     }
                     // 複製を勝者として重なり解消 (元と密接な複製は元を据え置く)。
-                    let remap = resolve_note_overlaps(notes, &new_ids);
+                    let remap = resolve_note_overlaps(&mut content.notes, &new_ids);
                     remap_indices(&remap, &new_ids)
                         .into_iter()
                         .map(|nid| Self::pack_note_id(slot, nid as usize))
@@ -479,17 +483,17 @@ impl AppData {
                     .map(|&(local, (beat, pitch))| (local as u32, beat, pitch))
                     .collect();
                 let packed = app.edit_song(move |song| {
-                    let Some(notes) =
-                        song.notes_in_clip_mut(r.track as usize, r.clip as usize)
+                    let Some(content) =
+                        midi_content_in_clip_mut(song, r.track as usize, r.clip as usize)
                     else {
                         return Vec::new();
                     };
-                    let new_ids = copy_notes_into(notes, &local_entries);
+                    let new_ids = copy_notes_into(content, &local_entries);
                     if new_ids.is_empty() {
                         return Vec::new();
                     }
                     // コピーを勝者として重なり解消。複製の local id を packed 化。
-                    let remap = resolve_note_overlaps(notes, &new_ids);
+                    let remap = resolve_note_overlaps(&mut content.notes, &new_ids);
                     remap_indices(&remap, &new_ids)
                         .into_iter()
                         .map(|nid| Self::pack_note_id(slot, nid as usize))

@@ -879,6 +879,9 @@ impl AppData {
                 front.event_length_beats = offset_in_event;
                 front.fade_out_beats = 0.0;
             }
+            // `back` は前半 event の clone なので id を共有している。 per-content 一意
+            // id 不変条件 (invariant #1) を守るため後半に新規 id を採番する (M4 sibling)。
+            back.id = audio_mut.alloc_event_id();
             audio_mut.events.insert(event_idx + 1, back);
             true
         });

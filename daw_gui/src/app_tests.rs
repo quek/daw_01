@@ -524,7 +524,7 @@ mod preview_tests {
 #[cfg(test)]
 mod note_duplicate_tests {
     use crate::app_types::{copy_notes_into, duplicate_notes_into};
-    use common::model::Note;
+    use common::model::{MidiContent, Note};
 
     fn note(start: f64, dur: f64, pitch: u8) -> Note {
         Note {
@@ -538,96 +538,122 @@ mod note_duplicate_tests {
         }
     }
 
+    /// 元 note に実 id (1..=n) を振った MidiContent を作る (allocator は n+1 から)。
+    /// 複製後に元と id が衝突しないことを検証できるようにする。
+    fn content(mut notes: Vec<Note>) -> MidiContent {
+        for (i, n) in notes.iter_mut().enumerate() {
+            n.id = i as u32 + 1;
+        }
+        let next_note_id = notes.len() as u32 + 1;
+        MidiContent { notes, next_note_id }
+    }
+
+    /// 複製 index 群 `new` の note id が全て非 0 かつ互いに / 元 (先頭 base 件) と
+    /// 一意であることを検証する (per-content 一意 id 不変条件、 M4 sibling の回帰)。
+    fn assert_ids_unique(c: &MidiContent) {
+        let mut ids: Vec<u32> = c.notes.iter().map(|n| n.id).collect();
+        assert!(ids.iter().all(|&id| id != 0), "全 note が非 0 id を持つ");
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "note id は content 内で一意 (複製で衝突しない)");
+    }
+
     #[test]
     fn single_note_duplicated_after_itself() {
-        let mut notes = vec![note(0.0, 1.0, 60)];
-        let new_ids = duplicate_notes_into(&mut notes, &[0]);
+        let mut c = content(vec![note(0.0, 1.0, 60)]);
+        let new_ids = duplicate_notes_into(&mut c, &[0]);
         assert_eq!(new_ids, vec![1]);
-        assert_eq!(notes.len(), 2);
+        assert_eq!(c.notes.len(), 2);
         // offset = (0+1) - 0 = 1 → 複製は start 1.0、長さ/pitch は維持
-        assert_eq!(notes[1].start_beat, 1.0);
-        assert_eq!(notes[1].duration_beats, 1.0);
-        assert_eq!(notes[1].pitch, 60);
+        assert_eq!(c.notes[1].start_beat, 1.0);
+        assert_eq!(c.notes[1].duration_beats, 1.0);
+        assert_eq!(c.notes[1].pitch, 60);
         // 元ノートは不変
-        assert_eq!(notes[0].start_beat, 0.0);
+        assert_eq!(c.notes[0].start_beat, 0.0);
+        assert_ids_unique(&c);
     }
 
     #[test]
     fn multi_note_keeps_relative_positions_and_shifts_by_span() {
         // [0,1) と [2,3)。選択範囲 span = 3 - 0 = 3。
-        let mut notes = vec![note(0.0, 1.0, 60), note(2.0, 1.0, 64)];
-        let new_ids = duplicate_notes_into(&mut notes, &[0, 1]);
+        let mut c = content(vec![note(0.0, 1.0, 60), note(2.0, 1.0, 64)]);
+        let new_ids = duplicate_notes_into(&mut c, &[0, 1]);
         assert_eq!(new_ids, vec![2, 3]);
-        assert_eq!(notes.len(), 4);
-        assert_eq!(notes[2].start_beat, 3.0); // 0 + 3
-        assert_eq!(notes[2].pitch, 60);
-        assert_eq!(notes[3].start_beat, 5.0); // 2 + 3
-        assert_eq!(notes[3].pitch, 64);
+        assert_eq!(c.notes.len(), 4);
+        assert_eq!(c.notes[2].start_beat, 3.0); // 0 + 3
+        assert_eq!(c.notes[2].pitch, 60);
+        assert_eq!(c.notes[3].start_beat, 5.0); // 2 + 3
+        assert_eq!(c.notes[3].pitch, 64);
+        assert_ids_unique(&c);
     }
 
     #[test]
     fn subset_selection_duplicates_only_selected() {
         // 3 ノート、index 0 と 2 だけ選択。選択範囲 span = (2+1) - 0 = 3。
-        let mut notes = vec![note(0.0, 1.0, 60), note(1.0, 1.0, 62), note(2.0, 1.0, 64)];
-        let new_ids = duplicate_notes_into(&mut notes, &[0, 2]);
+        let mut c = content(vec![note(0.0, 1.0, 60), note(1.0, 1.0, 62), note(2.0, 1.0, 64)]);
+        let new_ids = duplicate_notes_into(&mut c, &[0, 2]);
         assert_eq!(new_ids, vec![3, 4]);
-        assert_eq!(notes.len(), 5);
-        assert_eq!(notes[3].start_beat, 3.0); // 0 + 3
-        assert_eq!(notes[3].pitch, 60);
-        assert_eq!(notes[4].start_beat, 5.0); // 2 + 3
-        assert_eq!(notes[4].pitch, 64);
+        assert_eq!(c.notes.len(), 5);
+        assert_eq!(c.notes[3].start_beat, 3.0); // 0 + 3
+        assert_eq!(c.notes[3].pitch, 60);
+        assert_eq!(c.notes[4].start_beat, 5.0); // 2 + 3
+        assert_eq!(c.notes[4].pitch, 64);
         // 選択外の index 1 は複製されず元のまま
-        assert_eq!(notes[1].start_beat, 1.0);
+        assert_eq!(c.notes[1].start_beat, 1.0);
+        assert_ids_unique(&c);
     }
 
     #[test]
     fn empty_selection_is_noop() {
-        let mut notes = vec![note(0.0, 1.0, 60)];
-        let new_ids = duplicate_notes_into(&mut notes, &[]);
+        let mut c = content(vec![note(0.0, 1.0, 60)]);
+        let new_ids = duplicate_notes_into(&mut c, &[]);
         assert!(new_ids.is_empty());
-        assert_eq!(notes.len(), 1);
+        assert_eq!(c.notes.len(), 1);
     }
 
     #[test]
     fn out_of_range_index_ignored() {
-        let mut notes = vec![note(0.0, 1.0, 60)];
-        let new_ids = duplicate_notes_into(&mut notes, &[5]);
+        let mut c = content(vec![note(0.0, 1.0, 60)]);
+        let new_ids = duplicate_notes_into(&mut c, &[5]);
         assert!(new_ids.is_empty());
-        assert_eq!(notes.len(), 1);
+        assert_eq!(c.notes.len(), 1);
     }
 
     #[test]
     fn copy_places_clone_at_target_beat_and_pitch() {
         // Ctrl+drag: note0 を beat 4.0 / pitch 67 へコピー。元は据え置き。
-        let mut notes = vec![note(0.0, 1.0, 60)];
-        let new_ids = copy_notes_into(&mut notes, &[(0, 4.0, 67)]);
+        let mut c = content(vec![note(0.0, 1.0, 60)]);
+        let new_ids = copy_notes_into(&mut c, &[(0, 4.0, 67)]);
         assert_eq!(new_ids, vec![1]);
-        assert_eq!(notes.len(), 2);
-        assert_eq!(notes[1].start_beat, 4.0);
-        assert_eq!(notes[1].pitch, 67);
-        assert_eq!(notes[1].duration_beats, 1.0); // 長さは維持
-        assert_eq!(notes[0].start_beat, 0.0); // 元は不変
-        assert_eq!(notes[0].pitch, 60);
+        assert_eq!(c.notes.len(), 2);
+        assert_eq!(c.notes[1].start_beat, 4.0);
+        assert_eq!(c.notes[1].pitch, 67);
+        assert_eq!(c.notes[1].duration_beats, 1.0); // 長さは維持
+        assert_eq!(c.notes[0].start_beat, 0.0); // 元は不変
+        assert_eq!(c.notes[0].pitch, 60);
+        assert_ids_unique(&c);
     }
 
     #[test]
     fn copy_multi_preserves_each_target() {
-        let mut notes = vec![note(0.0, 1.0, 60), note(1.0, 0.5, 62)];
-        let new_ids = copy_notes_into(&mut notes, &[(0, 2.0, 60), (1, 3.0, 64)]);
+        let mut c = content(vec![note(0.0, 1.0, 60), note(1.0, 0.5, 62)]);
+        let new_ids = copy_notes_into(&mut c, &[(0, 2.0, 60), (1, 3.0, 64)]);
         assert_eq!(new_ids, vec![2, 3]);
-        assert_eq!(notes[2].start_beat, 2.0);
-        assert_eq!(notes[2].pitch, 60);
-        assert_eq!(notes[3].start_beat, 3.0);
-        assert_eq!(notes[3].pitch, 64);
-        assert_eq!(notes[3].duration_beats, 0.5);
+        assert_eq!(c.notes[2].start_beat, 2.0);
+        assert_eq!(c.notes[2].pitch, 60);
+        assert_eq!(c.notes[3].start_beat, 3.0);
+        assert_eq!(c.notes[3].pitch, 64);
+        assert_eq!(c.notes[3].duration_beats, 0.5);
+        assert_ids_unique(&c);
     }
 
     #[test]
     fn copy_empty_entries_is_noop() {
-        let mut notes = vec![note(0.0, 1.0, 60)];
-        let new_ids = copy_notes_into(&mut notes, &[]);
+        let mut c = content(vec![note(0.0, 1.0, 60)]);
+        let new_ids = copy_notes_into(&mut c, &[]);
         assert!(new_ids.is_empty());
-        assert_eq!(notes.len(), 1);
+        assert_eq!(c.notes.len(), 1);
     }
 }
 

@@ -1753,10 +1753,10 @@ pub(crate) fn load_recent_list(path: Option<PathBuf>) -> crate::recent::RecentFi
 /// (`max(start+dur) - min(start)`、最低 1/16 拍) ぶん後ろへずらして append する。
 /// 元ノートは不変。戻り値は複製ノートの新 index (= 複製後の選択)。
 /// 選択が空 / 該当 index 無しなら `notes` 不変で空 Vec を返す。
-pub(crate) fn duplicate_notes_into(notes: &mut Vec<Note>, selected: &[u32]) -> Vec<u32> {
+pub(crate) fn duplicate_notes_into(content: &mut MidiContent, selected: &[u32]) -> Vec<u32> {
     let mut clones: Vec<Note> = selected
         .iter()
-        .filter_map(|&idx| notes.get(idx as usize).cloned())
+        .filter_map(|&idx| content.notes.get(idx as usize).cloned())
         .collect();
     if clones.is_empty() {
         return Vec::new();
@@ -1772,20 +1772,25 @@ pub(crate) fn duplicate_notes_into(notes: &mut Vec<Note>, selected: &[u32]) -> V
     let offset = (max_end - min_start).max(0.0625);
     for n in &mut clones {
         n.start_beat += offset;
+        // clone は元 note の `id` も複製する。 per-content 一意 note id 不変条件
+        // (invariant #1、 piano_roll が selection/hit-test/drag/edit に note.id を使う)
+        // を守るため新規採番する。 さもないと複製ノートを選択/ドラッグすると元と
+        // 両方に作用する (M4 = duplicate_audio_editor_event の sibling)。
+        n.id = content.alloc_note_id();
     }
-    let base = notes.len() as u32;
+    let base = content.notes.len() as u32;
     let count = clones.len() as u32;
-    notes.append(&mut clones);
+    content.notes.append(&mut clones);
     (base..base + count).collect()
 }
 
 /// gui_01 #054 (Ctrl+drag コピー) の core。`entries` = [(source note index,
 /// new_start_beat, new_pitch)]。各 source を clone し start_beat/pitch を指定値にして
 /// `notes` 末尾へ追加。元は不変。戻り値は複製の新 index。該当 index 無しなら不変で空 Vec。
-pub(crate) fn copy_notes_into(notes: &mut Vec<Note>, entries: &[(u32, f64, u8)]) -> Vec<u32> {
+pub(crate) fn copy_notes_into(content: &mut MidiContent, entries: &[(u32, f64, u8)]) -> Vec<u32> {
     let mut clones: Vec<Note> = Vec::new();
     for &(idx, new_beat, new_pitch) in entries {
-        if let Some(src) = notes.get(idx as usize) {
+        if let Some(src) = content.notes.get(idx as usize) {
             let mut c = src.clone();
             c.start_beat = new_beat.max(0.0);
             c.pitch = new_pitch;
@@ -1795,9 +1800,14 @@ pub(crate) fn copy_notes_into(notes: &mut Vec<Note>, entries: &[(u32, f64, u8)])
     if clones.is_empty() {
         return Vec::new();
     }
-    let base = notes.len() as u32;
+    // clone は元 note の `id` を複製するので新規採番する (duplicate_notes_into と
+    // 同じ per-content 一意 id 不変条件、 invariant #1)。
+    for c in &mut clones {
+        c.id = content.alloc_note_id();
+    }
+    let base = content.notes.len() as u32;
     let count = clones.len() as u32;
-    notes.append(&mut clones);
+    content.notes.append(&mut clones);
     (base..base + count).collect()
 }
 

@@ -908,6 +908,10 @@ impl AppData {
             let mut max_end = 0.0f64;
             for e in &mut events {
                 e.event_start_in_clip_beats += anchor;
+                // clipboard の AudioEvent は元 content の id を持つ。 貼り付け先 content
+                // で per-content 一意 id 不変条件 (invariant #1) を守るため再採番する
+                // (paste_points_at と同 idiom、 M4 sibling)。
+                e.id = audio.alloc_event_id();
                 max_end = max_end.max(e.event_start_in_clip_beats + e.event_length_beats);
                 new_indices.push(audio.events.len());
                 audio.events.push(e.clone());
