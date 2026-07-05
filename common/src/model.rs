@@ -413,6 +413,34 @@ pub struct MediaPools {
     pub image_sources: HashMap<ImageSourceId, ImageSource>,
 }
 
+/// Song の安定 id アロケータ群 (§10 bullet 4 で Song のフラットな `next_*_id` カウンタを集約)。
+/// 各 `next_*_id` は「次に採番する id」で、`0` は "未採番" sentinel。削除後も id を再利用しない
+/// (安定 id addressing、invariant #1)。nested `"ids": {...}` として save / wire し、旧 .daw の
+/// フラット形式は load 時の JSON 前処理 `project::migrate_flat_ids_to_allocators` が `ids` 下へ移す
+/// (save 互換)。Song は `clip_contents` 等の `HashMap<u32, _>` を持つため serde `flatten` は
+/// 使えず (整数キー復元不可)、MediaPools と同じく nested を採る。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct IdAllocators {
+    #[serde(default)]
+    pub next_track_id: u32,
+    #[serde(default)]
+    pub next_device_id: u64,
+    #[serde(default)]
+    pub next_content_id: ContentId,
+    #[serde(default)]
+    pub next_audio_source_id: AudioSourceId,
+    #[serde(default)]
+    pub next_video_source_id: VideoSourceId,
+    #[serde(default)]
+    pub next_image_source_id: ImageSourceId,
+    #[serde(default)]
+    pub next_song_lane_id: u32,
+    #[serde(default)]
+    pub next_section_id: u32,
+    #[serde(default)]
+    pub next_mod_source_id: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Song {
     pub bpm: f32,
@@ -428,20 +456,13 @@ pub struct Song {
     pub loop_start_beat: f64,
     #[serde(default)]
     pub loop_end_beat: f64,
-    /// Stable id allocator for `Track`. Bumped each time a new track is
-    /// created; never reused even after deletion. `0` is reserved as
-    /// "未採番" sentinel — assigned the first available id at allocation
-    /// time.
+    /// §10 bullet 4: 安定 id アロケータ群 (track / device / content / audio-video-image source /
+    /// song-lane / section / mod-source の `next_*_id`)。旧 .daw のフラット形式は load 時
+    /// `project::migrate_flat_ids_to_allocators` が `ids` 下へ移す (save 互換)。device 採番は
+    /// track devices と `master_fx_chain` が共有する Song-global (invariant #1)。access は
+    /// `song.ids.next_track_id` 等。
     #[serde(default)]
-    pub next_track_id: u32,
-    /// v29: stable id allocator for `PluginInstance::id` (device 安定 id)。
-    /// track devices と `master_fx_chain` が共有する Song-global 採番。`0` は
-    /// "未採番" sentinel — `ensure_ids` が load 時に採番する。device の
-    /// addressing (IPC / automation / MIDI binding / plugin host bookkeeping /
-    /// shmem 名 / worker dispatch) はすべてこの id で行い、chain 内 index は
-    /// 表示順序のみに使う (`docs/plan_arch_refactor.md` §1)。
-    #[serde(default)]
-    pub next_device_id: u64,
+    pub ids: IdAllocators,
     /// Shared clip content store. Each `Clip.content_id` references one
     /// entry here; multiple clips with the same `content_id` share the
     /// same `notes` (linked / pooled clips, REAPER pooled MIDI model).
@@ -449,10 +470,6 @@ pub struct Song {
     /// before save.
     #[serde(default)]
     pub clip_contents: HashMap<ContentId, ClipContent>,
-    /// Stable id allocator for `ContentId`. `0` is the sentinel; valid
-    /// allocations start at `1`.
-    #[serde(default)]
-    pub next_content_id: ContentId,
     /// v20: shared clip display name, keyed by `ContentId`. Every clip
     /// sharing a `content_id` (linked clips) shares the same name — rename
     /// one and all update. This is the SSoT for clip names; the legacy
@@ -472,10 +489,6 @@ pub struct Song {
     /// 下へ移す (= save 互換維持)。field access は `song.media.audio_sources` 等。
     #[serde(default)]
     pub media: MediaPools,
-    /// Stable id allocator for `AudioSourceId`. `0` is the sentinel; valid
-    /// allocations start at `1`.
-    #[serde(default)]
-    pub next_audio_source_id: AudioSourceId,
     /// Phase 5 (`docs/plan_automation.md` §10 Phase 5): song-level
     /// automation lanes (`AutomationTarget::SongTempo` /
     /// `SongTimeSigNumerator`)。 master lane に相当し、 track ではなく
@@ -486,10 +499,6 @@ pub struct Song {
     /// 未設定なら従来通り `Song.bpm` を constant tempo として使う。
     #[serde(default)]
     pub song_lanes: Vec<AutomationLane>,
-    /// Stable id allocator for `AutomationLane` ids in `song_lanes`。 0 は
-    /// "未採番" sentinel、 1 から採番。
-    #[serde(default)]
-    pub next_song_lane_id: u32,
     /// Phase 7 B1-M Step 2-3 (`docs/plan_b1_vst3_completion.md`): MIDI Learn の
     /// CC → param バインディング table。 GUI 側で「MIDI Learn」 button 経由
     /// で user が CC を bind、 audio engine 側は使わない (= GUI の
@@ -505,11 +514,6 @@ pub struct Song {
     /// v10 file は `#[serde(default)]` で空 Vec で forward-migrate。
     #[serde(default)]
     pub scale_changes: Vec<ScaleChange>,
-    /// v12: stable id allocator for `VideoSourceId`. `0` is the
-    /// sentinel; valid allocations start at `1`. v11 file forward-
-    /// migrates to `0`, then `ensure_video_source_ids` lifts it.
-    #[serde(default)]
-    pub next_video_source_id: VideoSourceId,
     /// v12 (`docs/plan_video.md` §2.3): project-level video output
     /// resolution `(width, height)` in pixels. Drives preview window
     /// scale + render output dimensions. All imports are letterboxed
@@ -522,11 +526,6 @@ pub struct Song {
     /// forward-migrates to `30.0`.
     #[serde(default = "default_video_framerate")]
     pub video_framerate: f32,
-    /// v13: stable id allocator for `ImageSourceId`. `0` is the
-    /// sentinel; valid allocations start at `1`. v12 file forward-
-    /// migrates to `0`, then `ensure_image_source_ids` lifts it.
-    #[serde(default)]
-    pub next_image_source_id: ImageSourceId,
     /// master bus の audio fx chain。 通常 track の `Track.devices` と同 schema
     /// (= 同 `PluginInstance` を再利用)。 master は audio fx のみ持つ (= 音源境界
     /// なしの単一 Vec、 master bus に instrument / arpeggiator は無意味)。 automation の
@@ -547,17 +546,11 @@ pub struct Song {
     /// `normalize_sections` で保つ。旧 file は空 Vec で forward-migrate。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<Section>,
-    /// Stable id allocator for `Section`。 `0` は "未採番" sentinel、 `1` から採番。
-    #[serde(default)]
-    pub next_section_id: u32,
     /// docs/plan_modulation.md §1: 共有モジュレーション源 (sidechain +
     /// エンベロープフォロワー) の唯一の store。 `AuxInputRoute` / `ModRouting`
     /// から `ModSource.id` で参照される。 旧 file は空 Vec で forward-migrate。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mod_sources: Vec<ModSource>,
-    /// Stable id allocator for `ModSource`。 `0` は "未採番" sentinel、 `1` から採番。
-    #[serde(default)]
-    pub next_mod_source_id: u32,
     /// **song-level lane 非依存モジュレーション** (`docs/plan_modulation_routing_redesign.md`
     /// §2): `SongTempo` / `SongTimeSigNumerator` 等の song-wide param を変調する
     /// `ModRouting`。track 内 param は `Track.mod_routings`、song-wide はこちら
@@ -583,27 +576,29 @@ impl Default for Song {
             tracks: Vec::new(),
             loop_start_beat: 0.0,
             loop_end_beat: 0.0,
-            next_track_id: 1,
-            next_device_id: 1,
+            ids: IdAllocators {
+                next_track_id: 1,
+                next_device_id: 1,
+                next_content_id: 1,
+                next_audio_source_id: 1,
+                next_video_source_id: 1,
+                next_image_source_id: 1,
+                next_song_lane_id: 1,
+                next_section_id: 1,
+                next_mod_source_id: 1,
+            },
             clip_contents: HashMap::new(),
-            next_content_id: 1,
             clip_content_names: HashMap::new(),
             media: MediaPools::default(),
-            next_audio_source_id: 1,
             song_lanes: Vec::new(),
-            next_song_lane_id: 1,
             midi_bindings: Vec::new(),
             scale_changes: Vec::new(),
-            next_video_source_id: 1,
             video_resolution: default_video_resolution(),
             video_framerate: default_video_framerate(),
-            next_image_source_id: 1,
             master_fx_chain: Vec::new(),
             project_id: 0,
             sections: Vec::new(),
-            next_section_id: 1,
             mod_sources: Vec::new(),
-            next_mod_source_id: 1,
             song_mod_routings: Vec::new(),
         }
     }
@@ -667,40 +662,40 @@ impl Song {
         // range to `[1, MASTER_TRACK_ID - 1]` so we never hand out the
         // sentinel, and `saturating_add` keeps the counter from wrapping
         // back to the `0` sentinel on exhaustion.
-        let id = self.next_track_id.clamp(1, MASTER_TRACK_ID - 1);
-        self.next_track_id = id.saturating_add(1);
+        let id = self.ids.next_track_id.clamp(1, MASTER_TRACK_ID - 1);
+        self.ids.next_track_id = id.saturating_add(1);
         id
     }
 
     /// v29: 新規 device (`PluginInstance`) 用の Song-global 安定 id を採番
     /// する。 track devices / master_fx_chain 共用。
     pub fn alloc_device_id(&mut self) -> u64 {
-        let id = self.next_device_id.max(1);
-        self.next_device_id = id.saturating_add(1);
+        let id = self.ids.next_device_id.max(1);
+        self.ids.next_device_id = id.saturating_add(1);
         id
     }
 
     /// Phase 5: allocate a new song-level automation lane id (`song_lanes`)。
     /// `next_song_lane_id` を bump して返す。
     pub fn alloc_song_lane_id(&mut self) -> u32 {
-        let id = self.next_song_lane_id.max(1);
-        self.next_song_lane_id = id.saturating_add(1);
+        let id = self.ids.next_song_lane_id.max(1);
+        self.ids.next_song_lane_id = id.saturating_add(1);
         id
     }
 
     /// allocate a new stable `Section` id, bumping `next_section_id`。
     /// `0` は "未採番" sentinel なので最低 `1` から返す。
     pub fn alloc_section_id(&mut self) -> u32 {
-        let id = self.next_section_id.max(1);
-        self.next_section_id = id.saturating_add(1);
+        let id = self.ids.next_section_id.max(1);
+        self.ids.next_section_id = id.saturating_add(1);
         id
     }
 
     /// docs/plan_modulation.md §1: allocate a new stable `ModSource` id,
     /// bumping `next_mod_source_id`。 `0` は "未採番" sentinel なので最低 `1` から返す。
     pub fn alloc_mod_source_id(&mut self) -> u32 {
-        let id = self.next_mod_source_id.max(1);
-        self.next_mod_source_id = id.saturating_add(1);
+        let id = self.ids.next_mod_source_id.max(1);
+        self.ids.next_mod_source_id = id.saturating_add(1);
         id
     }
 
@@ -1538,18 +1533,18 @@ impl Song {
             std::collections::HashMap::new();
         for track in &mut self.tracks {
             if track.id == 0 {
-                let new_id = self.next_track_id.max(1);
-                self.next_track_id = new_id + 1;
+                let new_id = self.ids.next_track_id.max(1);
+                self.ids.next_track_id = new_id + 1;
                 id_remap.insert(0, new_id);
                 track.id = new_id;
-            } else if track.id >= self.next_track_id {
-                self.next_track_id = track.id + 1;
+            } else if track.id >= self.ids.next_track_id {
+                self.ids.next_track_id = track.id + 1;
             }
             track.ensure_clip_ids();
             track.ensure_lane_ids();
         }
-        if self.next_track_id == 0 {
-            self.next_track_id = 1;
+        if self.ids.next_track_id == 0 {
+            self.ids.next_track_id = 1;
         }
 
         // Phase 5: song-level lane の id も同様に採番。 sentinel (0) のみ
@@ -1558,11 +1553,11 @@ impl Song {
         // ロードでも lane / mod_source の採番・counter 正規化は必要。
         for lane in &mut self.song_lanes {
             if lane.id == 0 {
-                let new_id = self.next_song_lane_id.max(1);
-                self.next_song_lane_id = new_id + 1;
+                let new_id = self.ids.next_song_lane_id.max(1);
+                self.ids.next_song_lane_id = new_id + 1;
                 lane.id = new_id;
-            } else if lane.id >= self.next_song_lane_id {
-                self.next_song_lane_id = lane.id + 1;
+            } else if lane.id >= self.ids.next_song_lane_id {
+                self.ids.next_song_lane_id = lane.id + 1;
             }
             // lane 内 clip ids も担保 (Track の ensure_lane_ids 同 idiom、
             // ただし song_lanes は track field を持たないので per-lane で展開)
@@ -1579,23 +1574,23 @@ impl Song {
                 lane.next_clip_id = 1;
             }
         }
-        if self.next_song_lane_id == 0 {
-            self.next_song_lane_id = 1;
+        if self.ids.next_song_lane_id == 0 {
+            self.ids.next_song_lane_id = 1;
         }
 
         // docs/plan_modulation.md §8: mod_source id も song_lanes と同様に採番。
         // sentinel (0) のみ上書き、 既存非 0 id は触らず counter を bump する。
         for ms in &mut self.mod_sources {
             if ms.id == 0 {
-                let new_id = self.next_mod_source_id.max(1);
-                self.next_mod_source_id = new_id + 1;
+                let new_id = self.ids.next_mod_source_id.max(1);
+                self.ids.next_mod_source_id = new_id + 1;
                 ms.id = new_id;
-            } else if ms.id >= self.next_mod_source_id {
-                self.next_mod_source_id = ms.id + 1;
+            } else if ms.id >= self.ids.next_mod_source_id {
+                self.ids.next_mod_source_id = ms.id + 1;
             }
         }
-        if self.next_mod_source_id == 0 {
-            self.next_mod_source_id = 1;
+        if self.ids.next_mod_source_id == 0 {
+            self.ids.next_mod_source_id = 1;
         }
 
         // v29: device 安定 id (`PluginInstance::id`) を採番する。 track devices
@@ -1612,7 +1607,7 @@ impl Song {
                     *next = p.id + 1;
                 }
             }
-            let mut next = self.next_device_id;
+            let mut next = self.ids.next_device_id;
             for track in &mut self.tracks {
                 for p in track.devices.iter_mut() {
                     alloc_dev(p, &mut next);
@@ -1621,7 +1616,7 @@ impl Song {
             for p in self.master_fx_chain.iter_mut() {
                 alloc_dev(p, &mut next);
             }
-            self.next_device_id = next.max(1);
+            self.ids.next_device_id = next.max(1);
         }
 
         // v29: send 安定 id (`Send::id`) を per-track 採番する。
@@ -1890,8 +1885,8 @@ impl Song {
 
     /// Allocate a fresh `ContentId`, bumping the song-level counter.
     pub fn alloc_content_id(&mut self) -> ContentId {
-        let id = self.next_content_id.max(1);
-        self.next_content_id = id.saturating_add(1);
+        let id = self.ids.next_content_id.max(1);
+        self.ids.next_content_id = id.saturating_add(1);
         id
     }
 
@@ -2040,11 +2035,11 @@ impl Song {
                 }
             }
         }
-        if self.next_content_id <= max_seen {
-            self.next_content_id = max_seen + 1;
+        if self.ids.next_content_id <= max_seen {
+            self.ids.next_content_id = max_seen + 1;
         }
-        if self.next_content_id == 0 {
-            self.next_content_id = 1;
+        if self.ids.next_content_id == 0 {
+            self.ids.next_content_id = 1;
         }
 
         for t_idx in 0..self.tracks.len() {
@@ -2232,8 +2227,8 @@ impl Song {
 
     /// Allocate a fresh `AudioSourceId`, bumping the song-level counter.
     pub fn alloc_audio_source_id(&mut self) -> AudioSourceId {
-        let id = self.next_audio_source_id.max(1);
-        self.next_audio_source_id = id.saturating_add(1);
+        let id = self.ids.next_audio_source_id.max(1);
+        self.ids.next_audio_source_id = id.saturating_add(1);
         id
     }
 
@@ -2292,11 +2287,11 @@ impl Song {
                 max_seen = max_seen.max(*id);
             }
         }
-        if self.next_audio_source_id <= max_seen {
-            self.next_audio_source_id = max_seen + 1;
+        if self.ids.next_audio_source_id <= max_seen {
+            self.ids.next_audio_source_id = max_seen + 1;
         }
-        if self.next_audio_source_id == 0 {
-            self.next_audio_source_id = 1;
+        if self.ids.next_audio_source_id == 0 {
+            self.ids.next_audio_source_id = 1;
         }
         // Re-key any AudioSource currently held under id 0. AudioEvent
         // references to id 0 are NOT remapped — those remain dangling
@@ -2313,8 +2308,8 @@ impl Song {
     /// `VideoSourceId`, bumping the song-level counter. Mirrors
     /// `alloc_audio_source_id`.
     pub fn alloc_video_source_id(&mut self) -> VideoSourceId {
-        let id = self.next_video_source_id.max(1);
-        self.next_video_source_id = id.saturating_add(1);
+        let id = self.ids.next_video_source_id.max(1);
+        self.ids.next_video_source_id = id.saturating_add(1);
         id
     }
 
@@ -2372,11 +2367,11 @@ impl Song {
                 max_seen = max_seen.max(*id);
             }
         }
-        if self.next_video_source_id <= max_seen {
-            self.next_video_source_id = max_seen + 1;
+        if self.ids.next_video_source_id <= max_seen {
+            self.ids.next_video_source_id = max_seen + 1;
         }
-        if self.next_video_source_id == 0 {
-            self.next_video_source_id = 1;
+        if self.ids.next_video_source_id == 0 {
+            self.ids.next_video_source_id = 1;
         }
         if let Some(orphan) = self.media.video_sources.remove(&0) {
             let new_id = self.alloc_video_source_id();
@@ -2388,8 +2383,8 @@ impl Song {
     /// `ImageSourceId`, bumping the song-level counter. Mirrors
     /// `alloc_video_source_id`.
     pub fn alloc_image_source_id(&mut self) -> ImageSourceId {
-        let id = self.next_image_source_id.max(1);
-        self.next_image_source_id = id.saturating_add(1);
+        let id = self.ids.next_image_source_id.max(1);
+        self.ids.next_image_source_id = id.saturating_add(1);
         id
     }
 
@@ -2442,11 +2437,11 @@ impl Song {
                 max_seen = max_seen.max(*id);
             }
         }
-        if self.next_image_source_id <= max_seen {
-            self.next_image_source_id = max_seen + 1;
+        if self.ids.next_image_source_id <= max_seen {
+            self.ids.next_image_source_id = max_seen + 1;
         }
-        if self.next_image_source_id == 0 {
-            self.next_image_source_id = 1;
+        if self.ids.next_image_source_id == 0 {
+            self.ids.next_image_source_id = 1;
         }
         if let Some(orphan) = self.media.image_sources.remove(&0) {
             let new_id = self.alloc_image_source_id();

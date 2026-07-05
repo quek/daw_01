@@ -482,6 +482,7 @@ pub fn migrate_legacy_song(song: &mut serde_json::Value) {
     migrate_legacy_device_chains(song);
     migrate_legacy_clip_content(song);
     migrate_flat_media_to_pools(song);
+    migrate_flat_ids_to_allocators(song);
 }
 
 /// deserialize 前に旧 .daw のフラットな media source マップ (`audio_sources` / `video_sources` /
@@ -504,6 +505,39 @@ fn migrate_flat_media_to_pools(song: &mut serde_json::Value) {
     }
     if !media.is_empty() {
         obj.insert("media".to_string(), Value::Object(media));
+    }
+}
+
+/// deserialize 前に旧 .daw のフラットな `next_*_id` カウンタ (Song 直下) を nested `"ids"` へ移す
+/// (§10 bullet 4 の IdAllocators 化)。既に `"ids"` があれば新形式なので no-op。
+/// `migrate_flat_media_to_pools` と同じ後方互換移行 (serde flatten は Song の HashMap キーを壊すため
+/// nested を採用)。`migrate_legacy_clip_content` が設定するフラット `next_content_id` の後に走る。
+fn migrate_flat_ids_to_allocators(song: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(obj) = song.as_object_mut() else {
+        return;
+    };
+    if obj.contains_key("ids") {
+        return;
+    }
+    let mut ids = serde_json::Map::new();
+    for key in [
+        "next_track_id",
+        "next_device_id",
+        "next_content_id",
+        "next_audio_source_id",
+        "next_video_source_id",
+        "next_image_source_id",
+        "next_song_lane_id",
+        "next_section_id",
+        "next_mod_source_id",
+    ] {
+        if let Some(v) = obj.remove(key) {
+            ids.insert(key.to_string(), v);
+        }
+    }
+    if !ids.is_empty() {
+        obj.insert("ids".to_string(), Value::Object(ids));
     }
 }
 
@@ -1046,6 +1080,24 @@ mod tests {
         assert_eq!(song, before, "media 済みは no-op");
     }
 
+    /// (§10 bullet 4) 旧 .daw のフラットな `next_*_id` カウンタ (Song 直下) を nested `ids` へ移行。
+    #[test]
+    fn migrate_flat_ids_to_allocators_moves_top_level_counters() {
+        let mut song = serde_json::json!({
+            "next_track_id": 5,
+            "next_content_id": 9,
+            "tracks": []
+        });
+        migrate_flat_ids_to_allocators(&mut song);
+        assert!(song.get("next_track_id").is_none(), "フラットカウンタは ids へ移動");
+        assert_eq!(song["ids"]["next_track_id"], 5);
+        assert_eq!(song["ids"]["next_content_id"], 9);
+        // idempotent: 既に ids があれば (新形式) no-op。
+        let before = song.clone();
+        migrate_flat_ids_to_allocators(&mut song);
+        assert_eq!(song, before, "ids 済みは no-op");
+    }
+
     /// (v30 §10) untagged content JSON へ `migrate_clip_content_add_tag` が正しい `type` を
     /// 注入することを全 variant + 空 content で検証する (旧 untagged 判別規則の再現)。
     #[test]
@@ -1370,7 +1422,7 @@ mod tests {
         assert_eq!(notes[0].pitch, 60);
         // audio_sources defaults to empty for v6 files.
         assert!(song.media.audio_sources.is_empty());
-        assert!(song.next_audio_source_id >= 1);
+        assert!(song.ids.next_audio_source_id >= 1);
     }
 
     #[test]

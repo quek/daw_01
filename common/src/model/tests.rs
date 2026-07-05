@@ -31,7 +31,7 @@ fn alloc_section_id_skips_zero_and_increments() {
     assert_eq!(song.alloc_section_id(), 1);
     assert_eq!(song.alloc_section_id(), 2);
     // `0` sentinel が入っていても 1 から採番。
-    song.next_section_id = 0;
+    song.ids.next_section_id = 0;
     assert_eq!(song.alloc_section_id(), 1);
 }
 
@@ -201,7 +201,11 @@ fn duplicate_section_inserts_linked_copy_with_ripple() {
     let mut song = Song {
         length_beats: 8.0,
         sections: vec![mk_section(1, 0.0, 4.0), mk_section(2, 4.0, 4.0)],
-        next_section_id: 3, // 既存 id 1,2 の続き (実運用は alloc 経由で採番される)
+        // 既存 id 1,2 の続き (実運用は alloc 経由で採番される)
+        ids: IdAllocators {
+            next_section_id: 3,
+            ..Song::default().ids
+        },
         tracks: vec![Track {
             id: 1,
             clips: vec![
@@ -692,7 +696,10 @@ fn ensure_ids_remaps_aux_inputs_and_parent_group_id() {
                 ..Track::default()
             },
         ],
-        next_track_id: 2,
+        ids: IdAllocators {
+            next_track_id: 2,
+            ..Song::default().ids
+        },
         ..Song::default()
     };
 
@@ -753,7 +760,10 @@ fn ensure_ids_remaps_aux_outputs_dest() {
                 ..Track::default()
             },
         ],
-        next_track_id: 2,
+        ids: IdAllocators {
+            next_track_id: 2,
+            ..Song::default().ids
+        },
         ..Song::default()
     };
 
@@ -851,7 +861,10 @@ fn ensure_ids_assigns_mod_source_ids_and_remaps_tap() {
                 ..Track::default()
             },
         ],
-        next_track_id: 2,
+        ids: IdAllocators {
+            next_track_id: 2,
+            ..Song::default().ids
+        },
         mod_sources: vec![ModSource {
             id: 0, // sentinel — assigned by ensure_ids
             owner_track_id: 0,
@@ -909,7 +922,10 @@ fn ensure_ids_remaps_lane_device_index_to_device_id() {
             next_lane_id: 2,
             ..Track::default()
         }],
-        next_track_id: 2,
+        ids: IdAllocators {
+            next_track_id: 2,
+            ..Song::default().ids
+        },
         ..Song::default()
     };
     song.ensure_ids();
@@ -1018,7 +1034,7 @@ fn vocal_clip_roundtrip() {
         }),
     );
     song.clip_content_names.insert(1, "こんにちは".into());
-    song.next_content_id = 2;
+    song.ids.next_content_id = 2;
     assert_eq!(json_roundtrip(&song), song);
 }
 
@@ -1070,7 +1086,10 @@ fn v25_ensure_ids_adds_transform_device_for_group_transform_tracks() {
                 ..Track::default()
             },
         ],
-        next_track_id: 3,
+        ids: IdAllocators {
+            next_track_id: 3,
+            ..Song::default().ids
+        },
         ..Song::default()
     };
     song.ensure_ids();
@@ -1357,7 +1376,10 @@ fn ensure_ids_remaps_send_dest_track_id() {
                 ..Track::default()
             },
         ],
-        next_track_id: 2,
+        ids: IdAllocators {
+            next_track_id: 2,
+            ..Song::default().ids
+        },
         ..Song::default()
     };
 
@@ -1749,7 +1771,7 @@ fn v11_song_loads_forward_with_default_video_fields() {
         }"#;
     let song: Song = serde_json::from_str(v11_json).unwrap();
     assert!(song.media.video_sources.is_empty());
-    assert_eq!(song.next_video_source_id, 0);
+    assert_eq!(song.ids.next_video_source_id, 0);
     assert_eq!(song.video_resolution, (1920, 1080));
     assert!((song.video_framerate - 30.0).abs() < f32::EPSILON);
 }
@@ -2053,7 +2075,7 @@ fn alloc_video_source_id_bumps_counter() {
     let b = song.alloc_video_source_id();
     assert_eq!(a, 1);
     assert_eq!(b, 2);
-    assert_eq!(song.next_video_source_id, 3);
+    assert_eq!(song.ids.next_video_source_id, 3);
 }
 
 #[test]
@@ -2211,7 +2233,7 @@ fn alloc_image_source_id_bumps_counter() {
     let b = song.alloc_image_source_id();
     assert_eq!(a, 1);
     assert_eq!(b, 2);
-    assert_eq!(song.next_image_source_id, 3);
+    assert_eq!(song.ids.next_image_source_id, 3);
 }
 
 #[test]
@@ -2310,5 +2332,5 @@ fn v12_forward_migrates_image_fields_to_default() {
     });
     let song: Song = serde_json::from_value(v12_song_json).unwrap();
     assert!(song.media.image_sources.is_empty());
-    assert_eq!(song.next_image_source_id, 0);
+    assert_eq!(song.ids.next_image_source_id, 0);
 }

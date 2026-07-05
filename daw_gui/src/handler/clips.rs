@@ -1159,7 +1159,7 @@ impl AppData {
         // Strategy: walk back the last alloc'd id we just inserted.
         // The id list above used `alloc_content_id()` so the most
         // recent one is `next_content_id - 1`.
-        let front_content_id = song.next_content_id.saturating_sub(1);
+        let front_content_id = song.ids.next_content_id.saturating_sub(1);
         let back_content_id = song.alloc_content_id();
         song.clip_contents
             .insert(back_content_id, back_content);
