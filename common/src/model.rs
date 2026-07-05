@@ -1545,18 +1545,6 @@ impl Song {
             track.flatten_legacy_devices();
         }
 
-        // docs/plan_modulation.md §8: 旧 `sidechain_sources` を `aux_inputs` へ
-        // lift する。 device は flatten 済みなので全 PluginInstance を走査する。
-        // id_remap guard より前 (= sentinel track の有無に関わらず) 必ず走る。
-        for track in &mut self.tracks {
-            for p in track.devices.iter_mut() {
-                p.migrate_legacy_aux();
-            }
-        }
-        for p in self.master_fx_chain.iter_mut() {
-            p.migrate_legacy_aux();
-        }
-
         // (v25): 旧 `group_transform` を持つトラックにチェーン上の
         // Transform 配置 device を補う。これで「動かす変形」がチェーンの 1 device
         // として現れ、`resolve_track_transform` の device-gate で効く（device を抜けば
@@ -2586,15 +2574,6 @@ pub struct PluginInstance {
     /// よい — 末尾は無音)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aux_inputs: Vec<Option<AuxInputRoute>>,
-    /// deserialize 専用 migration: 旧 save の `sidechain_sources:
-    /// Vec<Option<u32>>`。 `ensure_ids` が `migrate_legacy_aux` で
-    /// `Some(id) → AuxInputRoute{tap:{id, PostFader}}` に lift して
-    /// `aux_inputs` を埋める。 serialize はしない (`legacy_slot` /
-    /// `legacy_*_chain` と同 idiom)。 ロード後は常に空。 `pub` は外部クレートが
-    /// `..PluginInstance::with_ports(..)` (FRU) で instance を組めるようにする
-    /// ためで、 設定値に意味は無い (= migrate 後 drain される)。
-    #[serde(default, rename = "sidechain_sources", skip_serializing)]
-    pub legacy_aux_sources: Vec<Option<u32>>,
     /// Consumer B (パラアウト、 docs/plan_paraout.md): aux **出力**ポートごとの
     /// ルート。 各 entry は plugin の `is_main=false` aux output port index →
     /// `AuxOutputRoute { dest_track }`。 `None` (or 不足 index) はそのポートを
@@ -2634,7 +2613,6 @@ impl PluginInstance {
             format,
             state: None,
             aux_inputs: Vec::new(),
-            legacy_aux_sources: Vec::new(),
             aux_outputs: Vec::new(),
             aux_output_count: 0,
             ports: crate::port_config::PortConfig::default(),
@@ -2653,7 +2631,6 @@ impl PluginInstance {
             format,
             state: None,
             aux_inputs: Vec::new(),
-            legacy_aux_sources: Vec::new(),
             aux_outputs: Vec::new(),
             aux_output_count: 0,
             ports,
@@ -2661,19 +2638,6 @@ impl PluginInstance {
         }
     }
 
-    /// 旧 `sidechain_sources` (deserialize 専用 `legacy_aux_sources`) を
-    /// `aux_inputs` に lift する。 `ensure_ids` が load 時に各 instance へ呼ぶ。
-    /// idempotent (lift 後 / 新形式は no-op、 legacy を drain するだけ)。
-    pub(crate) fn migrate_legacy_aux(&mut self) {
-        if self.aux_inputs.is_empty() && !self.legacy_aux_sources.is_empty() {
-            self.aux_inputs = std::mem::take(&mut self.legacy_aux_sources)
-                .into_iter()
-                .map(|opt| opt.map(AuxInputRoute::post_fader))
-                .collect();
-        } else {
-            self.legacy_aux_sources = Vec::new();
-        }
-    }
 }
 
 /// wire (bincode / IPC) 表現は手書きで、`state` / `ara_archive` の MB 級 blob を
@@ -2710,7 +2674,6 @@ impl<Ctx> bincode::Decode<Ctx> for PluginInstance {
             format: bincode::Decode::decode(decoder)?,
             state: None,
             aux_inputs: bincode::Decode::decode(decoder)?,
-            legacy_aux_sources: Vec::new(),
             aux_outputs: bincode::Decode::decode(decoder)?,
             aux_output_count: bincode::Decode::decode(decoder)?,
             ports: bincode::Decode::decode(decoder)?,

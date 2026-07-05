@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::model::{CURRENT_VERSION, ProjectFile, Song, ViewState};
+use crate::model::{AuxInputRoute, CURRENT_VERSION, ProjectFile, Song, ViewState};
 
 /// Result of `load_project`: the normalized song plus the optional GUI view
 /// state. `view` is `None` for legacy files / files saved without
@@ -144,6 +144,45 @@ fn migrate_vocal_source_to_clips(value: &mut serde_json::Value) {
                 obj.insert("style_name".to_string(), serde_json::json!(old_style));
             }
         }
+    }
+}
+
+/// deserialize 前に旧 `sidechain_sources: Vec<Option<u32>>` (PluginInstance) を現行
+/// `aux_inputs: Vec<Option<AuxInputRoute>>` (PostFader タップ) へ lift する。PluginInstance は
+/// `tracks[].devices` / 旧 3-split chain / `master_fx_chain` に散在するので、`sidechain_sources`
+/// キーを持つオブジェクトを再帰的に見つけて変換する (flatten の前後どちらでも効く location 非依存)。
+/// 型安全のため旧値を `Vec<Option<u32>>` に deserialize → `AuxInputRoute::post_fader` で lift →
+/// 再 serialize する (JSON を hard-code しない)。idempotent: `aux_inputs` が既にある object は
+/// 旧キーを drain するだけ、`sidechain_sources` が無い object は無変更。旧 in-memory 移行
+/// (`PluginInstance::migrate_legacy_aux`、§10 で撤去) の JSON 前処理版。
+fn migrate_legacy_sidechain_to_aux(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            if let Some(sc) = map.remove("sidechain_sources")
+                && !map.contains_key("aux_inputs")
+                && let Ok(sources) = serde_json::from_value::<Vec<Option<u32>>>(sc)
+            {
+                let aux: Vec<Option<AuxInputRoute>> = sources
+                    .into_iter()
+                    .map(|opt| opt.map(AuxInputRoute::post_fader))
+                    .collect();
+                if !aux.is_empty()
+                    && let Ok(v) = serde_json::to_value(aux)
+                {
+                    map.insert("aux_inputs".to_string(), v);
+                }
+            }
+            for v in map.values_mut() {
+                migrate_legacy_sidechain_to_aux(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                migrate_legacy_sidechain_to_aux(v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -331,6 +370,8 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     let mut value: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse project JSON from {}", path.display()))?;
     migrate_vocal_source_to_clips(&mut value);
+    // 旧 sidechain_sources → aux_inputs を deserialize 前に lift (version 非依存・idempotent)。
+    migrate_legacy_sidechain_to_aux(&mut value);
     // deserialize が成立する前に生の JSON を整える version-gated migration を単一 dispatch
     // table (VALUE_MIGRATIONS) から適用する (例: v30 の tagged ClipContent `type` 注入 —
     // tagged deserialize は `type` が無いと失敗するため from_value の前に当てる)。
@@ -547,6 +588,43 @@ mod tests {
         let mut song = song_with_one_text_clip();
         migrate_per_event_mute_to_clip_mute(&mut song);
         assert!(!song.tracks[0].clips[0].muted);
+    }
+
+    /// (§10) 旧 `sidechain_sources` を deserialize 前に `aux_inputs` (PostFader タップ) へ lift。
+    #[test]
+    fn migrate_legacy_sidechain_lifts_to_post_fader_aux() {
+        let mut value = serde_json::json!({
+            "tracks": [{
+                "devices": [{
+                    "plugin_id": "test.compressor",
+                    "format": "Vst3",
+                    "sidechain_sources": [1, null]
+                }]
+            }]
+        });
+        migrate_legacy_sidechain_to_aux(&mut value);
+        let dev = &value["tracks"][0]["devices"][0];
+        assert!(
+            dev.get("sidechain_sources").is_none(),
+            "legacy キーは drain される"
+        );
+        let aux: Vec<Option<AuxInputRoute>> =
+            serde_json::from_value(dev["aux_inputs"].clone()).unwrap();
+        assert_eq!(aux, vec![Some(AuxInputRoute::post_fader(1)), None]);
+    }
+
+    /// idempotent: `aux_inputs` が既にある object は lift せず旧キーを drain するだけ。
+    #[test]
+    fn migrate_legacy_sidechain_noop_when_aux_present() {
+        let mut value = serde_json::json!({
+            "devices": [{ "sidechain_sources": [5], "aux_inputs": [null] }]
+        });
+        migrate_legacy_sidechain_to_aux(&mut value);
+        let dev = &value["devices"][0];
+        assert!(dev.get("sidechain_sources").is_none());
+        let aux: Vec<Option<AuxInputRoute>> =
+            serde_json::from_value(dev["aux_inputs"].clone()).unwrap();
+        assert_eq!(aux, vec![None], "既存 aux_inputs は不変");
     }
 
     /// (v30 §10) untagged content JSON へ `migrate_clip_content_add_tag` が正しい `type` を

@@ -833,56 +833,6 @@ fn plugin_instance_without_aux_output_fields_forward_migrates_to_empty() {
     );
 }
 
-/// docs/plan_modulation.md §8: a v-old project that stored sidechain
-/// wiring under the legacy `sidechain_sources: Vec<Option<u32>>` JSON key
-/// must `ensure_ids`-migrate into `aux_inputs` as `PostFader` taps, with
-/// the legacy field drained. No track sentinel here, so the migration
-/// must run even when the id-remap pass is a no-op.
-#[test]
-fn ensure_ids_migrates_legacy_sidechain_sources_to_aux_inputs() {
-    use crate::plugin_format::PluginFormat;
-
-    let mut song = Song {
-        tracks: vec![
-            Track {
-                id: 1,
-                name: "Kick".into(),
-                ..Track::default()
-            },
-            Track {
-                id: 2,
-                name: "Bass".into(),
-                devices: vec![PluginInstance {
-                    // emulate a deserialized old project: legacy field set,
-                    // aux_inputs empty.
-                    legacy_aux_sources: vec![Some(1), None],
-                    ..PluginInstance::with_ports(
-                        "test.compressor".into(),
-                        PluginFormat::Vst3,
-                        crate::port_config::PortConfig::default(),
-                    )
-                }],
-                ..Track::default()
-            },
-        ],
-        next_track_id: 3,
-        ..Song::default()
-    };
-
-    song.ensure_ids();
-
-    let bass = &song.tracks[1];
-    assert_eq!(
-        bass.devices[0].aux_inputs,
-        vec![Some(AuxInputRoute::post_fader(1)), None],
-        "legacy sidechain_sources must lift to PostFader aux_inputs"
-    );
-    assert!(
-        bass.devices[0].legacy_aux_sources.is_empty(),
-        "legacy field must be drained after migration"
-    );
-}
-
 /// docs/plan_modulation.md §8: `mod_sources` get stable ids assigned
 /// (sentinel 0 → fresh) and their `tap.source_track` follows a track id
 /// remap, exactly like `aux_inputs` taps.
