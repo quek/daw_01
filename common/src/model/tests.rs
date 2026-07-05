@@ -876,147 +876,57 @@ fn ensure_ids_assigns_mod_source_ids_and_remaps_tap() {
     );
 }
 
-/// v23 migration: a v22 track with the legacy role-keyed chains
-/// (`midi_fx_chain` / `instrument` / `fx_chain`) flattens into a single
-/// `devices` Vec in `midi_fx ++ instrument? ++ fx` order, and the
-/// automation lanes' legacy `slot` remaps to the equivalent
-/// `device_index`. `ensure_ids` drives the flattening (via
-/// `flatten_legacy_devices`) before the id pass.
+/// `ensure_ids` はレーンの legacy positional `device_index` (= load 時 JSON 前処理
+/// `migrate_legacy_device_chains` が flatten / slot 解決後に残す値) を、その device に
+/// 採番された安定 `device_id` へ写像する。旧 3-split 平坦化と slot→index は前処理層 (project.rs)
+/// のテストで担保する。
 #[test]
-fn ensure_ids_flattens_legacy_chains_and_remaps_lane_slots() {
+fn ensure_ids_remaps_lane_device_index_to_device_id() {
     use crate::plugin_format::PluginFormat;
-    use crate::protocol::PluginSlot;
-
     let plug = |id: &str| PluginInstance::new(id.into(), PluginFormat::Clap);
-    // Layout: 2 MIDI FX, 1 instrument, 2 audio FX.
-    //   index:  0=arp 1=quant | 2=synth | 3=comp 4=reverb
-    let mut track = Track {
-        id: 1,
-        name: "Lead".into(),
-        legacy_midi_fx_chain: vec![plug("arp"), plug("quant")],
-        legacy_instrument: Some(plug("synth")),
-        legacy_fx_chain: vec![plug("comp"), plug("reverb")],
-        automation_lanes: vec![
-            AutomationLane {
+    // 5-device chain; lane が index 2 (synth) を positional index で指す。
+    let mut song = Song {
+        tracks: vec![Track {
+            id: 1,
+            devices: vec![
+                plug("arp"),
+                plug("quant"),
+                plug("synth"),
+                plug("comp"),
+                plug("reverb"),
+            ],
+            automation_lanes: vec![AutomationLane {
                 id: 1,
                 ..AutomationLane::new(
                     AutomationTarget::PluginParam {
-                        device_id: 0, // resolved via legacy_slot → remap pass
+                        device_id: 0,
                         param_id: 5,
-                        legacy_device_index: None,
-                        legacy_slot: Some(PluginSlot::Instrument),
+                        legacy_device_index: Some(2),
                     },
                     0.0,
                 )
-            },
-            AutomationLane {
-                id: 2,
-                ..AutomationLane::new(
-                    AutomationTarget::PluginParam {
-                        device_id: 0,
-                        param_id: 9,
-                        legacy_device_index: None,
-                        legacy_slot: Some(PluginSlot::Fx(1)),
-                    },
-                    0.0,
-                )
-            },
-            AutomationLane {
-                id: 3,
-                ..AutomationLane::new(
-                    AutomationTarget::PluginParam {
-                        device_id: 0,
-                        param_id: 2,
-                        legacy_device_index: None,
-                        legacy_slot: Some(PluginSlot::MidiFx(1)),
-                    },
-                    0.0,
-                )
-            },
-        ],
-        next_lane_id: 4,
-        ..Track::default()
-    };
-    // Pre-condition: nothing in `devices` yet.
-    assert!(track.devices.is_empty());
-
-    let mut song = Song {
-        tracks: vec![std::mem::take(&mut track)],
+            }],
+            next_lane_id: 2,
+            ..Track::default()
+        }],
         next_track_id: 2,
         ..Song::default()
     };
     song.ensure_ids();
 
     let t = &song.tracks[0];
-    // Flattened order: midi_fx ++ instrument ++ fx.
-    let ids: Vec<&str> = t.devices.iter().map(|p| p.plugin_id.as_str()).collect();
-    assert_eq!(ids, vec!["arp", "quant", "synth", "comp", "reverb"]);
-    // Legacy fields are drained.
-    assert!(t.legacy_midi_fx_chain.is_empty());
-    assert!(t.legacy_instrument.is_none());
-    assert!(t.legacy_fx_chain.is_empty());
-
-    // v29: lane slot → (index →) 安定 device_id まで ensure_ids が写像
-    // する。 Instrument=index2, Fx(1)=index4, MidiFx(1)=index1 の device の
-    // 採番済み id と一致すること。
-    let device_id_of = |lane_id: u32| -> u64 {
-        match t.lane_by_id(lane_id).unwrap().target {
-            AutomationTarget::PluginParam {
-                device_id,
-                legacy_device_index,
-                legacy_slot,
-                ..
-            } => {
-                assert!(legacy_slot.is_none(), "legacy_slot must be consumed");
-                assert!(
-                    legacy_device_index.is_none(),
-                    "legacy_device_index must be consumed"
-                );
-                device_id
-            }
-            _ => panic!("expected PluginParam"),
-        }
-    };
-    assert_ne!(t.devices[2].id, 0, "devices must be assigned stable ids");
-    assert_eq!(device_id_of(1), t.devices[2].id, "Instrument → n_midi (=2)");
-    assert_eq!(
-        device_id_of(2),
-        t.devices[4].id,
-        "Fx(1) → n_midi + has_inst + 1 (=4)"
-    );
-    assert_eq!(device_id_of(3), t.devices[1].id, "MidiFx(1) → 1");
-}
-
-/// v23 migration is a no-op when `devices` is already populated (new
-/// format): legacy fields are empty and lane device_index is untouched.
-#[test]
-fn flatten_legacy_devices_is_noop_for_new_format() {
-    use crate::plugin_format::PluginFormat;
-
-    let mut track = Track {
-        id: 1,
-        devices: vec![PluginInstance::new("synth".into(), PluginFormat::Clap)],
-        automation_lanes: vec![AutomationLane {
-            id: 1,
-            ..AutomationLane::new(
-                AutomationTarget::PluginParam {
-                    device_id: 7,
-                    param_id: 3,
-                    legacy_device_index: None,
-                    legacy_slot: None,
-                },
-                0.0,
-            )
-        }],
-        next_lane_id: 2,
-        ..Track::default()
-    };
-    track.flatten_legacy_devices();
-    assert_eq!(track.devices.len(), 1);
-    assert_eq!(track.devices[0].plugin_id, "synth");
-    match track.automation_lanes[0].target {
-        AutomationTarget::PluginParam { device_id, .. } => {
-            assert_eq!(device_id, 7, "new-format device_id must be untouched");
+    assert_ne!(t.devices[2].id, 0, "devices は安定 id を採番される");
+    match t.lane_by_id(1).unwrap().target {
+        AutomationTarget::PluginParam {
+            device_id,
+            legacy_device_index,
+            ..
+        } => {
+            assert_eq!(device_id, t.devices[2].id, "index 2 → devices[2].id");
+            assert!(
+                legacy_device_index.is_none(),
+                "legacy_device_index は消費される"
+            );
         }
         _ => panic!("expected PluginParam"),
     }
@@ -1696,25 +1606,12 @@ fn remove_track_send_drops_only_matching_send_gain_lanes() {
     assert!(!song.remove_track_send(999, 10));
 }
 
-/// r.md #8 M7 + v29: 旧 project の PluginParam MIDI binding は `slot`
-/// (v22) または `device_index` (v23-28) を持つ。 どちらも deserialize
-/// 失敗せず legacy field に載り、 `ensure_ids` が device_id へ写像する。
+/// v23-28 の PluginParam MIDI binding は `device_index` を持ち legacy_device_index に載る
+/// (`ensure_ids` が device_id へ写像)。v29 の device_id はそのまま (bincode 往復も一致)。
+/// 旧 v22 `slot` は load 時 JSON 前処理 (`project::migrate_legacy_device_chains`) が
+/// device_index へ解決するので in-memory 型には現れない (project.rs のテストで担保)。
 #[test]
 fn binding_target_plugin_param_legacy_compat() {
-    use crate::protocol::PluginSlot;
-    // v22 JSON: device_index の代わりに slot。
-    let json = r#"{"PluginParam":{"track":3,"slot":{"Fx":1},"param_id":7}}"#;
-    let bt: BindingTarget = serde_json::from_str(json).expect("旧 slot 形式が load できる");
-    assert_eq!(
-        bt,
-        BindingTarget::PluginParam {
-            track: 3,
-            device_id: 0, // 未 migration (ensure_ids が解決)
-            param_id: 7,
-            legacy_device_index: None,
-            legacy_slot: Some(PluginSlot::Fx(1)),
-        }
-    );
     // v23-28 JSON (device_index) は legacy_device_index に載る。
     let json_v28 = r#"{"PluginParam":{"track":1,"device_index":2,"param_id":5}}"#;
     let bt2: BindingTarget = serde_json::from_str(json_v28).unwrap();
@@ -1723,7 +1620,6 @@ fn binding_target_plugin_param_legacy_compat() {
         BindingTarget::PluginParam {
             device_id: 0,
             legacy_device_index: Some(2),
-            legacy_slot: None,
             ..
         }
     ));
@@ -1733,7 +1629,6 @@ fn binding_target_plugin_param_legacy_compat() {
         device_id: 42,
         param_id: 5,
         legacy_device_index: None,
-        legacy_slot: None,
     };
     let via_json = json_roundtrip(&bt3);
     assert_eq!(bt3, via_json);
@@ -1815,13 +1710,11 @@ fn automation_target_hashes_distinguish_variants() {
         device_id: 0,
         param_id: 7,
         legacy_device_index: None,
-        legacy_slot: None,
     });
     s.insert(AutomationTarget::PluginParam {
         device_id: 1,
         param_id: 7,
         legacy_device_index: None,
-        legacy_slot: None,
     });
     assert_eq!(s.len(), 4);
 }

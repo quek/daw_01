@@ -586,7 +586,6 @@ mod tests {
             device_id: DEVICE_ID,
             param_id: 5,
             legacy_device_index: None,
-            legacy_slot: None,
         };
         let lane = AutomationLane {
             id: 1,
@@ -649,7 +648,6 @@ mod tests {
             device_id: DEVICE_ID,
             param_id: 5,
             legacy_device_index: None,
-            legacy_slot: None,
         };
 
         // Not recording: the curve value is pushed as a ParamValue event (read).
@@ -699,7 +697,6 @@ mod tests {
             device_id: DEVICE_ID,
             param_id: 5,
             legacy_device_index: None,
-            legacy_slot: None,
         };
         let lane = AutomationLane {
             id: 1,

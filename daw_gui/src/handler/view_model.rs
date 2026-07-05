@@ -663,7 +663,6 @@ impl AppData {
                             device_id: dev.id,
                             param_id: p.id,
                             legacy_device_index: None,
-                            legacy_slot: None,
                         });
                     }
                 }
@@ -690,7 +689,6 @@ impl AppData {
                         device_id: dev.id,
                         param_id: p.id,
                         legacy_device_index: None,
-                        legacy_slot: None,
                     });
                 }
             }

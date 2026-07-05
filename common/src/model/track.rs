@@ -21,9 +21,9 @@ use super::*;
 /// insert / remove just permute the Vec; nothing else to re-key.
 ///
 /// Older files used three role-keyed fields (`midi_fx_chain` / `instrument`
-/// / `fx_chain`); they deserialize into the private `legacy_*` slots and
-/// `Track::flatten_legacy_devices` (run from `Song::ensure_ids`) flattens
-/// them into `devices` in `midi_fx ++ instrument? ++ fx` order.
+/// / `fx_chain`); load 時の JSON 前処理 (`project::migrate_legacy_device_chains`) が
+/// deserialize の前に `midi_fx ++ instrument? ++ fx` 順で `devices` へ平坦化するので、
+/// in-memory 型は legacy デバイスフィールドを持たない。
 ///
 /// v16 (`docs/plan_text_overlay.md`): 旧 `kind: TrackKind { Audio, Video }`
 /// を廃止し、 全 track が unified に audio path + visual composite path 両方
@@ -46,16 +46,6 @@ pub struct Track {
     /// v23: 1 本の線形デバイスチェーン。役割は保持せず ports から位置導出。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<PluginInstance>,
-    // pub(crate): public API には出さないが、同 crate の sibling module
-    // (project.rs / timing.rs 等) が `..Track::default()` の functional-update
-    // 構文で Track を組むため、module-private では E0451 になる。migration
-    // 専用なので model module 外から直接読む用途は無い。
-    #[serde(default, rename = "midi_fx_chain", skip_serializing)]
-    pub(crate) legacy_midi_fx_chain: Vec<PluginInstance>,
-    #[serde(default, rename = "instrument", skip_serializing)]
-    pub(crate) legacy_instrument: Option<PluginInstance>,
-    #[serde(default, rename = "fx_chain", skip_serializing)]
-    pub(crate) legacy_fx_chain: Vec<PluginInstance>,
     pub volume: f32,
     pub pan: f32,
     /// Track silenced by the user. Additive with the global solo rule (see
@@ -229,9 +219,6 @@ impl Default for Track {
             id: 0,
             name: String::new(),
             devices: Vec::new(),
-            legacy_midi_fx_chain: Vec::new(),
-            legacy_instrument: None,
-            legacy_fx_chain: Vec::new(),
             volume: 1.0,
             pan: 0.0,
             muted: false,
@@ -452,47 +439,5 @@ impl Track {
         let id = self.next_send_id.max(1);
         self.next_send_id = id.saturating_add(1);
         id
-    }
-
-    // model.rs の `Song::ensure_ids` (親モジュール) が load 時に呼ぶため pub(crate)。
-    // 分割前は同一モジュール内で private 可視だった。
-    pub(crate) fn flatten_legacy_devices(&mut self) {
-        if !self.devices.is_empty()
-            || (self.legacy_midi_fx_chain.is_empty()
-                && self.legacy_instrument.is_none()
-                && self.legacy_fx_chain.is_empty())
-        {
-            return;
-        }
-        let n_midi = self.legacy_midi_fx_chain.len();
-        let has_inst = self.legacy_instrument.is_some();
-        let to_index = |slot: crate::protocol::PluginSlot| -> u32 {
-            use crate::protocol::PluginSlot;
-            match slot {
-                PluginSlot::MidiFx(i) => i,
-                PluginSlot::Instrument => n_midi as u32,
-                PluginSlot::Fx(i) => (n_midi + has_inst as usize) as u32 + i,
-            }
-        };
-        for lane in &mut self.automation_lanes {
-            if let AutomationTarget::PluginParam {
-                legacy_device_index,
-                legacy_slot,
-                ..
-            } = &mut lane.target
-                && let Some(slot) = legacy_slot.take()
-            {
-                // v29: slot → index はまだ positional。 後段の
-                // `Song::ensure_ids` の remap pass が device_id へ写像する。
-                *legacy_device_index = Some(to_index(slot));
-            }
-        }
-        let mut devices = Vec::new();
-        devices.append(&mut self.legacy_midi_fx_chain);
-        if let Some(inst) = self.legacy_instrument.take() {
-            devices.push(inst);
-        }
-        devices.append(&mut self.legacy_fx_chain);
-        self.devices = devices;
     }
 }

@@ -179,7 +179,6 @@ fn resolve_device_real_params(
                 device_id,
                 param_id: p.id,
                 legacy_device_index: None,
-                legacy_slot: None,
             };
             // base = lane の default/curve (0..=1)、無ければ manifest default (0..=1)。
             let base = lanes

@@ -1320,7 +1320,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 device_id,
                 param_id: param.id,
                 legacy_device_index: None,
-                legacy_slot: None,
             };
             let domain = crate::app::ModControlDomain::Ranged { min, max, log: param.kind.is_log() };
             let mod_build = build_mod(app, target.clone(), value, domain, track_id);
@@ -1410,7 +1409,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 device_id,
                 param_id: p.id,
                 legacy_device_index: None,
-                legacy_slot: None,
             };
             let domain = crate::app::ModControlDomain::Ranged { min, max, log: false };
             let mod_build = build_mod(app, target.clone(), p.value_real, domain, track_id);

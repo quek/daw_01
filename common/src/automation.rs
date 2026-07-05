@@ -666,7 +666,6 @@ mod tests {
             device_id: 0,
             param_id: 7,
             legacy_device_index: None,
-            legacy_slot: None,
         };
         let range = Some((20.0_f64, 20_000.0_f64));
         // 端点 + 中点 (20..20000 の 10010 = 中点)。

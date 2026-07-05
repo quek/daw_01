@@ -285,7 +285,6 @@ impl AppData {
                     device_id,
                     param_id,
                     legacy_device_index: None,
-                    legacy_slot: None,
                 };
                 // Phase 4 Step C-3: ParamGestureBegin として同経路で active /
                 // latched に反映する (= mixer knob と同 idiom)。
@@ -319,7 +318,6 @@ impl AppData {
                     device_id,
                     param_id,
                     legacy_device_index: None,
-                    legacy_slot: None,
                 };
                 self.handle_event(AppEvent::ParamGestureEnd {
                     track_id: track,

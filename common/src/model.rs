@@ -650,16 +650,13 @@ pub enum BindingTarget {
         #[serde(default)]
         device_id: u64,
         param_id: u32,
-        /// v28 以前 migration 用 (deserialize 専用)。旧 save は chain 内
-        /// positional index を持つ。`Song::ensure_ids` が device_id へ写像。
+        /// v28 以前 migration 用 (deserialize 専用)。旧 save は chain 内 positional
+        /// index、または旧 `slot: PluginSlot` (load 時 JSON 前処理
+        /// `project::migrate_legacy_device_chains` が chain 長から index へ解決。
+        /// r.md #8 M7: 旧 PluginParam binding が device_index 欠落で deserialize を
+        /// 落としていたのを是正) を持つ。`Song::ensure_ids` の remap pass が安定 device_id へ写像。
         #[serde(default, rename = "device_index", skip_serializing)]
         legacy_device_index: Option<u32>,
-        /// v22 以前 migration 用 (deserialize 専用)。 旧 save は `slot: PluginSlot`
-        /// を持つ。 `Song::ensure_ids` が flatten 前に legacy_device_index へ写像する
-        /// (r.md #8 M7: 旧 project の PluginParam binding があると device_index 欠落で
-        /// project 全体の deserialize が失敗していたのを是正)。
-        #[serde(default, rename = "slot", skip_serializing)]
-        legacy_slot: Option<crate::protocol::PluginSlot>,
     },
 }
 
@@ -1505,45 +1502,12 @@ impl Song {
     }
 
     pub fn ensure_ids(&mut self) {
-        // v23 migration: 旧 3-split (midi_fx_chain / instrument / fx_chain) を
-        // 単一 `devices` へ平坦化し、automation lane の旧 slot を device_index へ
-        // 写像する。新形式 (devices 既存) は no-op。pass 1/2 の前に実行する必要が
-        // ある (pass 2 の sidechain remap は `devices` を走査するため)。
-        //
-        // M7 (r.md #8): BindingTarget::PluginParam の旧 `slot` を device_index へ
-        // 写像する。 flatten が legacy 3-split を消費する **前** に行う (automation
-        // lane の legacy_slot は flatten 内で処理される)。 新形式 (legacy_slot=None)
-        // は no-op。 旧 project の PluginParam MIDI binding が device_index 欠落で
-        // deserialize 全体を落としていたのを是正。
-        for binding in &mut self.midi_bindings {
-            let BindingTarget::PluginParam {
-                track,
-                legacy_device_index,
-                legacy_slot,
-                ..
-            } = &mut binding.target
-            else {
-                continue;
-            };
-            let Some(slot) = legacy_slot.take() else {
-                continue;
-            };
-            if let Some(t) = self.tracks.iter().find(|t| t.id == *track) {
-                use crate::protocol::PluginSlot;
-                let n_midi = t.legacy_midi_fx_chain.len() as u32;
-                let has_inst = t.legacy_instrument.is_some() as u32;
-                // v29: index はまだ positional。 後段の remap pass が
-                // device_id へ写像する。
-                *legacy_device_index = Some(match slot {
-                    PluginSlot::MidiFx(i) => i,
-                    PluginSlot::Instrument => n_midi,
-                    PluginSlot::Fx(i) => n_midi + has_inst + i,
-                });
-            }
-        }
-        for track in &mut self.tracks {
-            track.flatten_legacy_devices();
-        }
+        // 旧 3-split device chain (midi_fx_chain / instrument / fx_chain) の `devices` への
+        // 平坦化、および automation lane / midi_binding の旧 `slot: PluginSlot` →
+        // positional `device_index` 解決は、load 時の JSON 前処理
+        // (`project::migrate_legacy_device_chains`、§10) が担う。ここでは前処理が残した
+        // positional `legacy_device_index` / `legacy_send_idx` を安定 device_id / send_id へ
+        // 写像する (下記 remap pass。新形式 = legacy = None は no-op)。
 
         // (v25): 旧 `group_transform` を持つトラックにチェーン上の
         // Transform 配置 device を補う。これで「動かす変形」がチェーンの 1 device

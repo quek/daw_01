@@ -186,6 +186,149 @@ fn migrate_legacy_sidechain_to_aux(value: &mut serde_json::Value) {
     }
 }
 
+/// 旧 per-section plugin slot 表現 (MIDI FX chain / 単 Instrument / audio FX chain)。
+/// single-chain 再設計 (`docs/plan_linear_chain.md`) 後は旧 project の load 移行専用となり、
+/// wire protocol から migration 層 (ここ) へ移設した。`migrate_legacy_device_chains` が
+/// `slot → device_index` 解決にのみ使う (deserialize 専用)。
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+enum PluginSlot {
+    MidiFx(u32),
+    Instrument,
+    Fx(u32),
+}
+
+/// deserialize 前に旧 3-split デバイスチェーン (`midi_fx_chain` / `instrument` / `fx_chain`) を
+/// 現行の単一 `devices` へ平坦化し、automation lane / midi_binding の旧 `slot: PluginSlot` を
+/// positional `device_index` へ解決する。`device_index` 自体は残し、ensure_ids の後段 remap が
+/// `device_index → 安定 device_id` に写像する分業。旧 in-memory 移行 (§10 で撤去した
+/// `Track::flatten_legacy_devices` と `ensure_ids` の binding-slot loop) の JSON 前処理版。
+/// flatten 順は `midi_fx ++ instrument? ++ fx`、slot→index は
+/// `MidiFx(i)→i / Instrument→n_midi / Fx(i)→n_midi+has_inst+i`。
+fn migrate_legacy_device_chains(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    fn slot_to_index(slot: PluginSlot, n_midi: usize, has_inst: bool) -> u32 {
+        match slot {
+            PluginSlot::MidiFx(i) => i,
+            PluginSlot::Instrument => n_midi as u32,
+            PluginSlot::Fx(i) => (n_midi + has_inst as usize) as u32 + i,
+        }
+    }
+
+    // PluginParam target の旧 `slot` を `device_index` へ解決 (device_index 既存なら旧キー掃除のみ)。
+    fn resolve_slot(pp: &mut serde_json::Map<String, Value>, n_midi: usize, has_inst: bool) {
+        if pp.contains_key("device_index") {
+            pp.remove("slot");
+            return;
+        }
+        if let Some(slot_val) = pp.remove("slot")
+            && let Ok(slot) = serde_json::from_value::<PluginSlot>(slot_val)
+        {
+            pp.insert(
+                "device_index".to_string(),
+                Value::from(slot_to_index(slot, n_midi, has_inst)),
+            );
+        }
+    }
+
+    let Some(song) = value.get_mut("song").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    // pass 1: track id → (n_midi, has_inst)。midi_binding が参照 track の chain 長を要るため
+    // flatten 前に採取する。
+    let mut chain_lens: HashMap<u64, (usize, bool)> = HashMap::new();
+    if let Some(tracks) = song.get("tracks").and_then(Value::as_array) {
+        for track in tracks {
+            let n_midi = track
+                .get("midi_fx_chain")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let has_inst = track.get("instrument").is_some_and(|v| !v.is_null());
+            if let Some(id) = track.get("id").and_then(Value::as_u64) {
+                chain_lens.insert(id, (n_midi, has_inst));
+            }
+        }
+    }
+
+    // pass 2: 各 track の automation lane slot を解決 + 3-split を devices へ平坦化。
+    if let Some(tracks) = song.get_mut("tracks").and_then(Value::as_array_mut) {
+        for track in tracks.iter_mut() {
+            let Some(obj) = track.as_object_mut() else {
+                continue;
+            };
+            let has_devices = obj
+                .get("devices")
+                .and_then(Value::as_array)
+                .is_some_and(|d| !d.is_empty());
+            let n_midi = obj
+                .get("midi_fx_chain")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let has_inst = obj.get("instrument").is_some_and(|v| !v.is_null());
+            let has_legacy = n_midi > 0
+                || has_inst
+                || obj
+                    .get("fx_chain")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty());
+            // guard (Track::flatten_legacy_devices と同): 新形式 (devices 既存) or legacy 無しは
+            // 平坦化しない。旧キーだけは掃除する。
+            if has_devices || !has_legacy {
+                obj.remove("midi_fx_chain");
+                obj.remove("instrument");
+                obj.remove("fx_chain");
+                continue;
+            }
+            if let Some(lanes) = obj.get_mut("automation_lanes").and_then(Value::as_array_mut) {
+                for lane in lanes.iter_mut() {
+                    if let Some(pp) = lane
+                        .get_mut("target")
+                        .and_then(|t| t.get_mut("PluginParam"))
+                        .and_then(Value::as_object_mut)
+                    {
+                        resolve_slot(pp, n_midi, has_inst);
+                    }
+                }
+            }
+            let mut devices = Vec::new();
+            if let Some(Value::Array(a)) = obj.remove("midi_fx_chain") {
+                devices.extend(a);
+            }
+            if let Some(inst) = obj.remove("instrument")
+                && !inst.is_null()
+            {
+                devices.push(inst);
+            }
+            if let Some(Value::Array(a)) = obj.remove("fx_chain") {
+                devices.extend(a);
+            }
+            obj.insert("devices".to_string(), Value::Array(devices));
+        }
+    }
+
+    // pass 3: midi_binding の slot を参照 track の chain 長で解決 (r.md #8 M7)。
+    if let Some(bindings) = song.get_mut("midi_bindings").and_then(Value::as_array_mut) {
+        for binding in bindings.iter_mut() {
+            let Some(pp) = binding
+                .get_mut("target")
+                .and_then(|t| t.get_mut("PluginParam"))
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            if let Some(&(n_midi, has_inst)) = pp
+                .get("track")
+                .and_then(Value::as_u64)
+                .and_then(|id| chain_lens.get(&id))
+            {
+                resolve_slot(pp, n_midi, has_inst);
+            }
+        }
+    }
+}
+
 /// (v30) `ClipContent` を untagged → tagged (`type` field) 化した際の後方互換移行。
 /// v<30 のファイルは content を untagged (flat) で保存しているので、`#[serde(tag = "type")]`
 /// deserialize の前に旧 untagged 判別規則で `type` を注入する。判別順は旧
@@ -372,6 +515,8 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     migrate_vocal_source_to_clips(&mut value);
     // 旧 sidechain_sources → aux_inputs を deserialize 前に lift (version 非依存・idempotent)。
     migrate_legacy_sidechain_to_aux(&mut value);
+    // 旧 3-split device chain → 単一 devices 平坦化 + automation/binding の slot → device_index 解決。
+    migrate_legacy_device_chains(&mut value);
     // deserialize が成立する前に生の JSON を整える version-gated migration を単一 dispatch
     // table (VALUE_MIGRATIONS) から適用する (例: v30 の tagged ClipContent `type` 注入 —
     // tagged deserialize は `type` が無いと失敗するため from_value の前に当てる)。
@@ -625,6 +770,81 @@ mod tests {
         let aux: Vec<Option<AuxInputRoute>> =
             serde_json::from_value(dev["aux_inputs"].clone()).unwrap();
         assert_eq!(aux, vec![None], "既存 aux_inputs は不変");
+    }
+
+    /// (§10) 旧 3-split chain の `devices` への平坦化 + automation/binding の slot → device_index 解決。
+    #[test]
+    fn migrate_legacy_device_chains_flattens_and_resolves_slots() {
+        let mut value = serde_json::json!({
+            "song": {
+                "tracks": [{
+                    "id": 1,
+                    "midi_fx_chain": [
+                        { "plugin_id": "arp", "format": "Clap" },
+                        { "plugin_id": "quant", "format": "Clap" }
+                    ],
+                    "instrument": { "plugin_id": "synth", "format": "Clap" },
+                    "fx_chain": [
+                        { "plugin_id": "comp", "format": "Clap" },
+                        { "plugin_id": "reverb", "format": "Clap" }
+                    ],
+                    "automation_lanes": [
+                        { "target": { "PluginParam": { "track": 1, "param_id": 5, "slot": "Instrument" } } },
+                        { "target": { "PluginParam": { "track": 1, "param_id": 9, "slot": { "Fx": 1 } } } },
+                        { "target": { "PluginParam": { "track": 1, "param_id": 2, "slot": { "MidiFx": 1 } } } }
+                    ]
+                }],
+                "midi_bindings": [
+                    { "target": { "PluginParam": { "track": 1, "param_id": 7, "slot": { "Fx": 0 } } } }
+                ]
+            }
+        });
+        migrate_legacy_device_chains(&mut value);
+        let track = &value["song"]["tracks"][0];
+        // flatten 順: midi_fx ++ instrument ++ fx。
+        let ids: Vec<&str> = track["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["plugin_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["arp", "quant", "synth", "comp", "reverb"]);
+        assert!(track.get("midi_fx_chain").is_none(), "旧 chain キーは drain");
+        assert!(track.get("instrument").is_none());
+        assert!(track.get("fx_chain").is_none());
+        // lane slot → device_index (Instrument=n_midi=2 / Fx(1)=n_midi+has_inst+1=4 / MidiFx(1)=1)。
+        let lanes = track["automation_lanes"].as_array().unwrap();
+        let lane_idx = |i: usize| {
+            lanes[i]["target"]["PluginParam"]["device_index"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(lane_idx(0), 2, "Instrument → 2");
+        assert_eq!(lane_idx(1), 4, "Fx(1) → 4");
+        assert_eq!(lane_idx(2), 1, "MidiFx(1) → 1");
+        assert!(
+            lanes[0]["target"]["PluginParam"].get("slot").is_none(),
+            "slot キーは drain"
+        );
+        // binding slot → device_index (Fx(0) = n_midi+has_inst+0 = 3)。
+        let binding = &value["song"]["midi_bindings"][0]["target"]["PluginParam"];
+        assert_eq!(binding["device_index"].as_u64().unwrap(), 3, "Fx(0) → 3");
+        assert!(binding.get("slot").is_none());
+    }
+
+    /// 新形式 (devices 既存) は平坦化しない (guard)。
+    #[test]
+    fn migrate_legacy_device_chains_noop_for_new_format() {
+        let mut value = serde_json::json!({
+            "song": { "tracks": [{
+                "id": 1,
+                "devices": [{ "plugin_id": "synth", "format": "Clap" }]
+            }] }
+        });
+        migrate_legacy_device_chains(&mut value);
+        let devices = value["song"]["tracks"][0]["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0]["plugin_id"].as_str().unwrap(), "synth");
     }
 
     /// (v30 §10) untagged content JSON へ `migrate_clip_content_add_tag` が正しい `type` を

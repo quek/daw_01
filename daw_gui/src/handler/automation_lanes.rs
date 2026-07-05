@@ -539,7 +539,6 @@ impl AppData {
                     device_id,
                     param_id: p.id,
                     legacy_device_index: None,
-                    legacy_slot: None,
                 };
                 // base = lane default_value、無ければ manifest default（実レンジ表示）。
                 let norm = lanes
@@ -582,7 +581,6 @@ impl AppData {
             device_id,
             param_id,
             legacy_device_index: None,
-            legacy_slot: None,
         };
         self.edit_song(|song| {
             if track_id == common::model::MASTER_TRACK_ID {
@@ -661,7 +659,6 @@ impl AppData {
                             device_id,
                             param_id: p.id,
                             legacy_device_index: None,
-                            legacy_slot: None,
                         };
                         let norm = lanes.iter().find(|l| l.target == target).map_or_else(
                             || {
@@ -781,7 +778,6 @@ impl AppData {
             device_id,
             param_id,
             legacy_device_index: None,
-            legacy_slot: None,
         };
         self.edit_song(|song| {
             if track_id == common::model::MASTER_TRACK_ID {

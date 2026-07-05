@@ -23,7 +23,6 @@
 //!   再ビルドでは変わらない。
 
 use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
 
 use crate::plugin_format::PluginFormat;
 
@@ -35,19 +34,6 @@ pub const PROTOCOL_FINGERPRINT: u64 = match u64::from_str_radix(env!("DAW_PROTOC
     Ok(v) => v,
     Err(_) => panic!("DAW_PROTOCOL_FINGERPRINT must be a hex u64 (set by build.rs)"),
 };
-
-/// 旧 per-section plugin slot 表現 (MIDI FX chain / 単 Instrument / audio FX
-/// chain)。 single-chain 再設計 (`docs/plan_linear_chain.md`) 後は
-/// [`crate::model::AutomationTarget::PluginParam`] / `BindingTarget` の
-/// `legacy_slot` (= 旧 project の save migration) からのみ参照される。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode, Serialize, Deserialize,
-)]
-pub enum PluginSlot {
-    MidiFx(u32),
-    Instrument,
-    Fx(u32),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum ChildKind {

@@ -44,7 +44,6 @@ impl AppData {
                         device_id,
                         param_id,
                         legacy_device_index: None,
-                        legacy_slot: None,
                     });
                 }
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume) => {
@@ -161,7 +160,6 @@ impl AppData {
                     device_id,
                     param_id,
                     legacy_device_index: None,
-                    legacy_slot: None,
                 };
                 let value_real = match self.plugin_param_range(resolved_track, &target) {
                     Some((min, max)) => min + f64::from(v_norm) * (max - min),

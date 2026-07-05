@@ -32,13 +32,12 @@ pub enum AutomationTarget {
         #[serde(default)]
         device_id: u64,
         param_id: u32,
-        /// v28 以前 migration 用 (deserialize 専用)。旧 save は chain 内
-        /// positional index を持つ。`Song::ensure_ids` が device_id へ写像。
+        /// v28 以前 migration 用 (deserialize 専用)。旧 save は chain 内 positional
+        /// index、または旧 `slot: PluginSlot` (load 時 JSON 前処理
+        /// `project::migrate_legacy_device_chains` が index へ解決) を持つ。
+        /// `Song::ensure_ids` の remap pass が安定 device_id へ写像。
         #[serde(default, rename = "device_index", skip_serializing)]
         legacy_device_index: Option<u32>,
-        /// v22 以前 migration 用 (deserialize 専用)。旧 save は `slot` を持つ。
-        #[serde(default, rename = "slot", skip_serializing)]
-        legacy_slot: Option<crate::protocol::PluginSlot>,
     },
     /// Song-wide parameters. Lanes targeting these only make sense on
     /// a designated "master" track. M5 scope.

@@ -438,7 +438,6 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
                 device_id: bitcrush_dev,
                 param_id: 42,
                 legacy_device_index: None,
-                legacy_slot: None,
             },
             default_value: 0.25,
             enabled: true,
@@ -459,7 +458,6 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
             device_id: bitcrush_dev,
             param_id: 42,
             legacy_device_index: None,
-            legacy_slot: None,
         },
         "the automation lane keeps addressing the plugin by its stable id"
     );
