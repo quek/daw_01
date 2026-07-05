@@ -68,10 +68,13 @@ model.rs について解消。§10 dispatch table + class fix + §11 arch-lint �
     換え (~200 行 + 既存 ~20 テストを load_project 経路へ) で、runtime 挙動ゼロ変化・旧 project 全
     load が blast radius。単独の慎重なタスク (fixture 網は既存テストで概ね揃っている)。
   - **残 bullet 4**: Song sub-struct 化 (MediaPools/IdAllocators)。wire/save 互換影響大、最終段。
-- **invariant #9 (god-file budget) — model.rs 解消** (`eefdea1`+`bb0c39d`): 7,488→2,771 行。tests →
-  model/tests.rs、型群 → model/{track,modulation,content,automation}.rs。`pub use *::*` re-export で
-  consumer 無改変、`use super::*` で sibling 参照、WIRE_SOURCES に 4 ファイル登録 (invariant #7)。
-  pure code movement (挙動・serialize 不変)。**残 ui.rs (4,077 行)** は ui crate の別タスク。
+- **invariant #9 (god-file budget) — 完全達成** (`eefdea1`+`bb0c39d`+`720e2c1`): make arch-lint =
+  **OK (違反なし)**。
+  - model.rs 7,488→2,771: tests → model/tests.rs、型群 → model/{track,modulation,content,
+    automation}.rs。`pub use *::*` re-export で consumer 無改変、`use super::*` で sibling 参照、
+    WIRE_SOURCES に 4 ファイル登録 (invariant #7)。
+  - ui.rs (daw-ui-core) 4,077→2,437: tests → ui/tests.rs。
+  - いずれも pure code movement (挙動・serialize 不変)。
 - **§11 arch-lint 精密化** (`528b32c`): grep がコメント言及を違反に誤カウントする false positive を
   共通 `strip_comments` ヘルパ + untagged anchor で class ごと修正 (untagged baseline 0、check 3/5 も
   予防)。§10 (untagged 撤去)・S4 (ui-domain 撤去) の達成が checker に正しく反映されるように。
