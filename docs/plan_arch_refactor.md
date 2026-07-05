@@ -4,10 +4,13 @@
 プロセス間同期) で確定した構造問題を、一括で最終形へ改修する。個別の発見と証拠 (file:line)
 はチャットレポート参照。本書は **確定した設計判断の SSoT**。
 
-## 進捗と再開ポイント (2026-07-05 更新)
+## ✅ 完了 (2026-07-05) — main へ landed 済
 
-branch = `feature/arch-refactor`。各段の green を WIP commit でチェックポイント化している
-(未 sign-off なので main 未統合。最終統合は S8 の実機検証後)。
+**全 13 節 完了。`feature/arch-refactor` は `main` へ統合済 (HEAD `c92d52a`、両者完全同一)。**
+全ゲート green を実測確認 (`make arch-lint` OK / `make test` 1,378 pass / 手書き god-file 最大 2,768 < 3,000)、
+**S8 実機 sign-off も完了** (arrangement/piano_roll interactive、user 確認済)。以下は達成記録。
+
+各段の green を WIP commit でチェックポイント化した (逐次単一 agent + cargo 実測 green gating)。
 
 **完了・全 green (workspace check --all-targets 0 / make clippy 0 / make test 全 pass)**:
 - S1 common 基盤 (§1-4,10 の大半) — device_id/send_id/要素 id 安定化 v29、protocol 4 分割、
@@ -40,10 +43,10 @@ branch = `feature/arch-refactor`。各段の green を WIP commit でチェッ�
 - S6 DESIGN.md 現行化、S7 ワークフロー (CLAUDE.md 不変条件 + make arch-lint + guards 7 則 +
   /arch-review skill + implement/review skill 更新)
 
-**最新 green checkpoint**: commit `ed89566` (§10 **全 bullet 完了** = tag 化 / legacy field 8/8 撤去 /
-dispatch table / Song sub-struct 化 (MediaPools + IdAllocators))。§9 完了・invariant #9 完全達成・
-§11 arch-lint 精密化も landed。全ゲート green (make build/test/clippy/arch-lint + clip_rename/video smoke)。
-**残 = S8 実機 sign-off (ユーザー) のみ** — コード側の arch-refactor は substantive に完了。
+**最終 HEAD**: commit `c92d52a` (ed89566 の §10 全 bullet 完了後、多面コードレビュー 15 レンズ +
+敵対的検証で確定した correctness 10 件 `2254a53` + per-content id 再採番 sibling `c92d52a` を是正)。
+§9 完了・invariant #9 完全達成・§11 arch-lint 精密化も landed。全ゲート green (arch-lint / test 1,378 /
+build / clippy + clip_rename/video smoke)。**S8 実機 sign-off 完了 = arch-refactor 全完了**。
 
 **残タスク (逐次、各段 green を WIP commit)**:
 - **S5 §9 (full rework) 完了** — common は plugin-load / HTTP 系依存ゼロ (reqwest/libloading/
@@ -89,10 +92,10 @@ dispatch table / Song sub-struct 化 (MediaPools + IdAllocators))。§9 完了�
 - **§11 arch-lint 精密化** (`528b32c`): grep がコメント言及を違反に誤カウントする false positive を
   共通 `strip_comments` ヘルパ + untagged anchor で class ごと修正 (untagged baseline 0、check 3/5 も
   予防)。§10 (untagged 撤去)・S4 (ui-domain 撤去) の達成が checker に正しく反映されるように。
-- **S8**: `make check`/`make clippy`/`make build`/`make test` 全 green、headless script テスト
+- **S8 (完了)**: `make check`/`make clippy`/`make build`/`make test` 全 green、headless script テスト
   (export/master fx/PDC)、`daw_gui --smoke-test`、旧バージョン project load 互換テスト、
-  **実機 sign-off** (特に S4b/c の arrangement/piano_roll interactive: clip drag/resize/split/
-  automation/ノート編集/velocity/歌詞/snap の目視 — unit test をすり抜ける visual regression)。
+  **実機 sign-off 完了** (S4b/c の arrangement/piano_roll interactive: clip drag/resize/split/
+  automation/ノート編集/velocity/歌詞/snap を目視 — unit test をすり抜ける visual regression を確認)。
 
 **再開時の運用** (この session で確立):
 - 実装は狭くスコープした単一 agent へ (fan-out 禁止・逐次)。各段 green を私が **cargo で実測
