@@ -54,15 +54,6 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: u8) -> Result<()> {
     Ok(())
 }
 
-/// Picks a default CLAP plugin path: the `DAW_CLAP_PATH` environment variable
-/// if set, otherwise the first entry returned by [`scan_system_clap_directory`].
-pub fn default_plugin_path() -> Option<PathBuf> {
-    if let Some(env_path) = std::env::var_os("DAW_CLAP_PATH") {
-        return Some(PathBuf::from(env_path));
-    }
-    scan_system_clap_directory().ok()?.into_iter().next()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

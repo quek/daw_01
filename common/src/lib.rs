@@ -2,7 +2,6 @@ pub mod app_dirs;
 pub mod audio_bridge;
 pub mod audio_render;
 pub mod automation;
-pub mod clap_scan;
 pub mod logging;
 pub mod meter;
 pub mod metrics_bridge;
@@ -28,7 +27,6 @@ pub mod time;
 pub mod timing;
 pub mod video_fx;
 pub mod voicevox;
-pub mod vst3_scan;
 pub mod wire;
 pub mod worker_bridge;
 

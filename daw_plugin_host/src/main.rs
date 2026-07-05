@@ -14,6 +14,9 @@
 
 mod ara;
 mod builtin;
+mod clap_scan;
+mod plugin_scan;
+mod vst3_scan;
 mod clap_host;
 mod clap_plugin;
 mod editor_window;
@@ -193,6 +196,23 @@ async fn main() -> Result<()> {
         .join();
         if let Ok(Ok(cfg)) = ports {
             println!("{}", cfg.to_line());
+        }
+        return Ok(());
+    }
+
+    // one-shot plugin scan モード。daw_gui の cold-start / rescan がこのプロセスを使い捨てで
+    // 起動し、システムの CLAP/VST3 を列挙した `PluginDatabase` (JSON) を stdout に出す。DLL 実
+    // ロードはこのサブプロセスが担い、GUI プロセスは dlopen しない。プラグインの crash はこの
+    // 使い捨てプロセス内に隔離される (probe subprocess と同じ設計)。
+    if std::env::args().nth(1).as_deref() == Some("--scan-plugins") {
+        let db = std::thread::spawn(plugin_scan::scan_system).join();
+        match db {
+            Ok(Ok(db)) => match serde_json::to_string(&db) {
+                Ok(json) => println!("{json}"),
+                Err(e) => tracing::error!(error = ?e, "failed to serialize scanned plugin_db"),
+            },
+            Ok(Err(e)) => tracing::error!(error = ?e, "plugin scan failed"),
+            Err(_) => tracing::error!("plugin scan panicked on worker thread"),
         }
         return Ok(());
     }

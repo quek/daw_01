@@ -191,8 +191,8 @@ impl AppData {
         self.ipc.is_rescanning = true;
         let slot = Arc::clone(&self.ipc.rescan_result);
         let proxy = self.ipc.event_proxy.clone();
-        std::thread::spawn(move || match common::plugin_db::scan_system() {
-            Ok(mut db) => {
+        std::thread::spawn(move || match crate::subprocess::scan_plugins() {
+            Some(mut db) => {
                 // VST3 / CLAP とも descriptor からは port 構成が分からない
                 // (VST3 は category tag 無し、 CLAP は feature に note 出力の有無が無い)。
                 // 各プラグインを使い捨て probe プロセスで起動して note in/out・audio out
@@ -246,8 +246,8 @@ impl AppData {
                 }
                 proxy.send(AppEvent::PluginDbRescanCompleted);
             }
-            Err(e) => {
-                tracing::error!(error = ?e, "plugin rescan failed");
+            None => {
+                tracing::warn!("plugin rescan subprocess failed; keeping current plugin DB");
                 proxy.send(AppEvent::PluginDbRescanCompleted);
             }
         });

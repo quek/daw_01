@@ -927,11 +927,9 @@ dependencies = [
  "anyhow",
  "base64",
  "bincode",
- "clap-sys",
  "dirs",
  "hound",
  "libc",
- "libloading",
  "serde",
  "serde_json",
  "tempfile",
@@ -940,7 +938,6 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
- "vst3",
  "windows 0.62.2",
 ]
 
@@ -1448,6 +1445,7 @@ dependencies = [
  "libloading",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "vst3",

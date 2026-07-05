@@ -21,3 +21,6 @@ vst3.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

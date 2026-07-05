@@ -78,6 +78,50 @@ pub fn probe_plugin_ports(
     out.lines().find_map(PortConfig::parse_line)
 }
 
+/// daw_plugin_host を `--scan-plugins` 使い捨てプロセスとして起動し、システムのプラグイン DB
+/// (builtin + CLAP + VST3 の enumerated descriptors) を得る。**sync** (cold-start / rescan の
+/// `std::thread` から呼ぶ)。プラグイン DLL の実ロードは **このサブプロセス** が行い、GUI プロセスは
+/// dlopen しない (arch-refactor S5-3。probe subprocess と同じ crash 隔離)。timeout / spawn 失敗 /
+/// 異常終了 / JSON parse 失敗はすべて `None` を返す (呼び元は builtin fallback で退行しない)。
+pub fn scan_plugins() -> Option<common::plugin_db::PluginDatabase> {
+    // scan は多数の DLL を load するので probe より長い timeout。
+    const TIMEOUT: Duration = Duration::from_secs(120);
+    let exe = resolve_sibling_binary("daw_plugin_host").ok()?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["--scan-plugins"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CHILD_CREATION_FLAGS);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!("plugin scan subprocess timed out; falling back to builtins/cache");
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    // scan は最後に DB を 1 行 JSON で出す。 雑音行を弾いて JSON 行を探す (probe と同 idiom)。
+    out.lines()
+        .find_map(|line| serde_json::from_str::<common::plugin_db::PluginDatabase>(line).ok())
+}
+
 pub fn spawn_sibling<I, S>(name: &str, args: I) -> Result<Child>
 where
     I: IntoIterator<Item = S>,

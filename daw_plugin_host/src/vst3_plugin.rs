@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
-use common::vst3_scan::resolve_vst3_dll;
-use common::vst3_scan::{c_array_to_string, tuid_to_hex};
+use crate::vst3_scan::resolve_vst3_dll;
+use crate::vst3_scan::{c_array_to_string, tuid_to_hex};
 use libloading::{Library, Symbol};
 use vst3::{
     ComPtr, ComRef, ComWrapper, Interface,

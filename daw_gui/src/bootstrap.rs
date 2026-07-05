@@ -781,7 +781,7 @@ async fn plugin_pipe_loop(
 }
 
 fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
-    use common::plugin_db::{default_cache_path, scan_system};
+    use common::plugin_db::default_cache_path;
     if let Some(cache) = default_cache_path() {
         match PluginDatabase::load_from_file(&cache) {
             Ok(Some(mut db)) => {
@@ -804,8 +804,10 @@ fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
                 tracing::warn!(error = ?e, "failed to load cache, scanning");
             }
         }
-        match scan_system() {
-            Ok(db) => {
+        // DLL 実ロードによる scan は plugin-host の `--scan-plugins` 使い捨てプロセスが行う
+        // (GUI プロセスは dlopen しない、S5-3)。失敗時は builtin のみで起動する。
+        match crate::subprocess::scan_plugins() {
+            Some(db) => {
                 if let Err(e) = db.save_to_file(&cache) {
                     tracing::warn!(error = ?e, "failed to write plugin cache");
                 } else {
@@ -817,8 +819,8 @@ fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
                 }
                 return Some(Arc::new(db));
             }
-            Err(e) => {
-                tracing::error!(error = ?e, "plugin scan failed");
+            None => {
+                tracing::error!("plugin scan subprocess failed; starting with builtins only");
             }
         }
     }
