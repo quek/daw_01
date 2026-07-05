@@ -2,7 +2,8 @@
 //! resource monitor (r.md #3) の常駐メーター (DSP / CPU / FPS / xrun)。
 
 use daw_ui_core::{Edit, Ui};
-use daw_ui_renderer::{theme, Color, Rect};
+use daw_ui_renderer::{Color, Rect};
+use crate::theme;
 
 use crate::app::{AppData, AppEvent};
 

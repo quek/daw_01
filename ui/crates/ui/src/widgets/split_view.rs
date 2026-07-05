@@ -4,7 +4,8 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{theme, Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, Rect, RectCommand};
+use crate::theme;
 
 use crate::id::WidgetId;
 use crate::ui::{Ui, hovered, pressed_inside};

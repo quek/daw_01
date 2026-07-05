@@ -86,6 +86,13 @@ pub struct Renderer<W: WindowBackend + Send + Sync + 'static> {
 }
 
 impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
+    /// ui-core の text 計測 (`TextMetrics`) にこの renderer 所有の `FontSystem` を貸す。
+    /// `UiHost::frame_with_fonts` に渡すと、ui-core が測定用に別 `FontSystem` を二重ロード
+    /// する無駄を無くせる (measure と raster が同一 font DB / shape 設定を共有する SSoT)。
+    pub fn font_system_mut(&mut self) -> &mut glyphon::FontSystem {
+        self.glyph.font_system_and_swash().0
+    }
+
     /// 同期的に wgpu を初期化。
     ///
     /// # Errors

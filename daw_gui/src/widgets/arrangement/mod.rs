@@ -22,23 +22,24 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use daw_ui_platform::{CursorIcon, Modifiers};
-use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand, TextureHandle, TexturedQuad};
+use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand, TextureHandle, TexturedQuad};
+use crate::theme;
 
 use daw_ui_core::edit::Edit;
 use daw_ui_core::id::WidgetId;
 use daw_ui_core::scenegraph::hash_inputs;
-use daw_ui_core::snap::SnapConfig;
-use daw_ui_core::time::{TimeDisplay, TimeMapping};
+use common::snap::SnapConfig;
+use common::time::{TimeDisplay, TimeMapping};
 use daw_ui_core::ui::Ui;
 use daw_ui_core::viewport::ViewportState1D;
 use daw_ui_core::widgets::heavy::HeavyCtx;
 use daw_ui_core::widgets::{muted_dim_fill, push_muted_hatch};
 use daw_ui_core::widgets::playhead::draw_playhead_line;
-use daw_ui_core::widgets::ruler_ops::{
+use crate::widgets::ruler_ops::{
     LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
     compute_loop_drag_endpoints, draw_loop_band, loop_band_hit_kind,
 };
-use daw_ui_core::widgets::time_grid::{BarBeatGridStyle, TimeRulerStyle};
+use crate::widgets::time_grid::{BarBeatGridStyle, TimeGridExt, TimeRulerStyle};
 use daw_ui_core::widgets::toggle_button::ToggleButtonStyle;
 use daw_ui_core::{
     ChannelLayout, MeterScale, SampleSlices, WaveformRenderMode, WaveformSource, WaveformStyle,
@@ -1483,7 +1484,7 @@ struct SectionDragSession {
 }
 
 // `LoopDragKind` / `LoopDragSession` は M14 Phase 69 (#041) で
-// `daw_ui_core::widgets::ruler_ops` に extract (piano_roll と共有)。
+// `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
 /// M10 Phase 46 / M14 Phase 63c (#016): track header drag&drop session。 release frame で
 /// **drop target に応じて `ReorderTracks` (sibling) と `SetTrackParent` (parent 変更) を振り分け** る。
@@ -1507,7 +1508,7 @@ struct TrackReorderSession {
 }
 
 // `PlayheadDragSession` は M14 Phase 69 (#041) で
-// `daw_ui_core::widgets::ruler_ops` に extract (piano_roll と共有)。
+// `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
 /// M10 Phase 47b: track header の bottom band slider drag による volume 編集セッション。
 #[derive(Clone, Copy, Debug)]
@@ -2029,7 +2030,7 @@ fn compute_section_drag_beat_delta(
 }
 
 // `compute_loop_drag_endpoints` は M14 Phase 69 (#041) で
-// `daw_ui_core::widgets::ruler_ops` に extract (piano_roll と共有)。
+// `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
 /// M14 Phase 61b (#011): caller の `data_generation` は track 構成 (順序 / mute / solo /
 /// volume / name / clip 個数) のみの責務に整理し、 clip 個別の `(id, start_beat, len_beats)`

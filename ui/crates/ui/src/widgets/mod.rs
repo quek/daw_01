@@ -24,13 +24,11 @@ pub mod modulator_editor;
 pub mod panel;
 pub mod playhead;
 pub mod reorderable_list;
-pub mod ruler_ops;
 pub mod scroll_area;
 pub mod scrubable_number;
 pub mod split_view;
 pub mod tab_view;
 pub mod text_input;
-pub mod time_grid;
 pub mod toggle_button;
 pub mod waveform;
 

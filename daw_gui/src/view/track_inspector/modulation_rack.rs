@@ -8,7 +8,8 @@
 use daw_ui_core::{
     Edit, MsegAction, MsegEditorStyle, MsegNode, ScrubableNumberFormat, ScrubableNumberStyle, Ui,
 };
-use daw_ui_renderer::{theme, Color, Rect};
+use daw_ui_renderer::{Color, Rect};
+use crate::theme;
 
 use crate::app::{AppData, AppEvent};
 

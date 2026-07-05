@@ -1052,7 +1052,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
             hctx.cached(viewport_key, |hctx| {
                 draw_grid_background(hctx, grid, kbd, view_copy, &style_copy);
-                hctx.bar_beat_grid(
+                hctx.ui_mut().bar_beat_grid(
                     ("pr_grid", id_for_inner),
                     grid,
                     mapping,
@@ -1061,7 +1061,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     sub_grid_pr,
                 );
                 if ruler_h > 0.0 {
-                    hctx.time_ruler(
+                    hctx.ui_mut().time_ruler(
                         ("pr_ruler", id_for_inner),
                         ruler,
                         mapping,
@@ -1158,12 +1158,12 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             // (M14 Phase 69 / daw_01 #041) loop band overlay (ruler 上、 cached の外で毎 frame 描画)。
             // drag preview range があれば preview を、 無ければ `view.loop_range` を描画。 ruler_h <= 0
             // のときは `ruler.h = 0` なので描画 helper 内で band_w = 0 となり no-op (= 旧 API 互換)。
-            // arrangement と完全同 helper (`daw_ui_core::widgets::ruler_ops::draw_loop_band`)、 daw_01 が
+            // arrangement と完全同 helper (`crate::widgets::ruler_ops::draw_loop_band`)、 daw_01 が
             // ruler_h > 0 + loop_range Some を渡したときのみ表示される。
             if ruler_h > 0.0
                 && let Some(range) = loop_drag_preview_range.or(view_copy.loop_range)
             {
-                daw_ui_core::widgets::ruler_ops::draw_loop_band(
+                crate::widgets::ruler_ops::draw_loop_band(
                     hctx,
                     range,
                     view_copy.start_beat,
@@ -1593,7 +1593,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                             // 空文字 commit → 起点 note の歌詞を None に (= 削除)
                             Vec::new()
                         } else {
-                            split_into_morae(&committed_text)
+                            common::voicevox::split_into_morae(&committed_text)
                         };
                         // 起点 note の歌詞 update count: 空入力は 1 (起点を None に)、
                         // それ以外は morae.len() 個分の連続 note を取る。

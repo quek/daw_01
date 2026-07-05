@@ -14,7 +14,8 @@
 //! open/close と同期する (menu_picker と同じ idiom)。
 
 use daw_ui_core::{Edit, Ui};
-use daw_ui_renderer::{theme, Color, Rect};
+use daw_ui_renderer::{Color, Rect};
+use crate::theme;
 
 use crate::app::{resolve_plugin_name, AppData, AppEvent};
 

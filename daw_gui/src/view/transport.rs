@@ -10,7 +10,8 @@ use common::model::{AutomationTarget, MASTER_TRACK_ID, RecordingMode};
 use daw_ui_core::{
     Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
-use daw_ui_renderer::{theme, Color, Rect};
+use daw_ui_renderer::{Color, Rect};
+use crate::theme;
 
 use crate::app::{AppData, AppEvent};
 use crate::view::param_gesture::push_param_gesture_edges;

@@ -12,7 +12,8 @@
 //!
 //! `Ui::dropdown` は別 file (`widgets/dropdown.rs`)。
 
-use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use crate::theme;
 
 use crate::input::PointerFrame;
 use crate::ui::Ui;

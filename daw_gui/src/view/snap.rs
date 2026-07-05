@@ -11,7 +11,7 @@
 //! 4/4 以外でも user の運用上不要のため (gui_01 SnapMode::Straight { div: 1 } 自体は残る)。
 //! `Adaptive` は `1/2` と `1 bar` の中間 (粗 ↔ 細の連続移動の架け橋) に配置。
 
-pub use daw_ui_core::{SnapConfig, SnapMode};
+pub use common::snap::{SnapConfig, SnapMode};
 
 use crate::app::AppData;
 

@@ -75,7 +75,7 @@ pub(super) fn render_arrangement_heavy(
                         &selected_tracks_for_heavy,
                         &style_copy,
                     );
-                    hctx.bar_beat_grid(
+                    hctx.ui_mut().bar_beat_grid(
                         ("arr_grid", id_for_inner),
                         lanes,
                         mapping,
@@ -119,7 +119,7 @@ pub(super) fn render_arrangement_heavy(
                 // primitive だが defensive で wrap)。
                 if view_copy.ruler_h > 0.0 {
                     hctx.with_clip_rect(ruler, |hctx| {
-                        hctx.time_ruler(
+                        hctx.ui_mut().time_ruler(
                             ("arr_ruler", id_for_inner),
                             ruler,
                             mapping,

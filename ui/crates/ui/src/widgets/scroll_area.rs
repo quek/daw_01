@@ -19,7 +19,8 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{theme, Rect, RectCommand};
+use daw_ui_renderer::{Rect, RectCommand};
+use crate::theme;
 
 use crate::id::WidgetId;
 use crate::ui::Ui;

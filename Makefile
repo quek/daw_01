@@ -26,8 +26,8 @@ endif
 RUN_PKGS := -p daw_gui -p daw_audio -p daw_plugin_host
 
 # `cargo test` は #[test] が 0 個の [[bin]] target でもビルド + リンクを必ず行う。
-# ui/crates/examples/* は winit/wgpu 一式に依存する手動デモで、#[test] を持つのは piano_roll と
-# sample_edit_ops の 2 crate のみ (他は自動テスト 0、check/clippy の --workspace が引き続き
+# ui/crates/examples/* は winit/wgpu 一式に依存する手動デモで、#[test] を持つのは
+# sample_edit_ops のみ (他は自動テスト 0、check/clippy の --workspace が引き続き
 # コンパイル検証を担う)。実際にテストを持つ package だけを明示列挙する。
 # common / daw-ui-platform / daw-ui-renderer は RUN_PKGS には無いが実テストを持つので必須
 # (欠かすとカバレッジが静かに落ちる)。ara-sys は #[test] 0 個なので対象外。

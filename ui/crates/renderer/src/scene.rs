@@ -517,9 +517,14 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// window 背景の既定 clear color。renderer は theme を持たない (Color 型 + 演算のみ) ので、
+    /// この 1 色だけ raw `Color` で自己完結して保持する。app / ui 層は `scene.clear_color` を
+    /// 上書きしてよい (現状 `theme::WINDOW_BG` と同値)。
+    pub const DEFAULT_CLEAR: Color = Color::rgb(0.035, 0.040, 0.050);
+
     pub fn new() -> Self {
         Self {
-            clear_color: crate::theme::WINDOW_BG.to_wgpu(),
+            clear_color: Self::DEFAULT_CLEAR.to_wgpu(),
             primitives: Vec::new(),
             popup_primitives: Vec::new(),
         }

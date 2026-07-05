@@ -389,7 +389,7 @@ pub fn track_index_from_y(y: f32, _lanes_y: f32, tops: &[f32]) -> Option<usize> 
 }
 
 // `LoopBandHit` / `loop_band_hit_kind` は M14 Phase 69 (#041) で
-// `daw_ui_core::widgets::ruler_ops` に extract (piano_roll と共有)。
+// `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
 #[inline]
 pub(super) fn px_to_beat(px: f32, lanes_x: f32, lanes_w: f32, view: ArrangementView) -> f64 {

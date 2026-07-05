@@ -9,7 +9,8 @@
 
 use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{theme, Color, GlyphArea, Rect};
+use daw_ui_renderer::{Color, GlyphArea, Rect};
+use crate::theme;
 
 use crate::app::{AppData, AppEvent};
 

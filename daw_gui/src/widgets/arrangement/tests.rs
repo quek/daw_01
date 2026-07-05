@@ -381,7 +381,7 @@
     }
 
     // `loop_band_hit_kind_*` の test は M14 Phase 69 (#041) で
-    // `daw_ui_core::widgets::ruler_ops::tests` に extract (piano_roll と共有)。
+    // `crate::widgets::ruler_ops::tests` に extract (piano_roll と共有)。
 
     #[test]
     fn rects_intersect_basic() {
@@ -887,7 +887,7 @@
 
     fn snap_quarter() -> SnapConfig {
         SnapConfig {
-            mode: daw_ui_core::snap::SnapMode::Straight { div: 4 },
+            mode: common::snap::SnapMode::Straight { div: 4 },
             enabled: true,
             min_beat_unit: 1.0 / 128.0,
             time_sig: (4, 4),
@@ -1359,7 +1359,7 @@
     //
     // `compute_loop_drag_endpoints` の unit test 7 件 (Start/End/Middle/NewRange の
     // snap 適用 / alt bypass / snap OFF) は M14 Phase 69 (#041) で
-    // `daw_ui_core::widgets::ruler_ops::tests` に extract (piano_roll と共有)。
+    // `crate::widgets::ruler_ops::tests` に extract (piano_roll と共有)。
 
     // -------- M14 Phase 63k (#025): audio_edit grip hit-test + drag commit -----------------------
 

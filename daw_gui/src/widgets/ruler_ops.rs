@@ -9,8 +9,8 @@
 //! - [`LoopBandHit`] / [`loop_band_hit_kind`] : 既存 loop range の handle hit-test
 //! - [`compute_loop_drag_endpoints`] : drag 中 / release 時の snap 適用済 `(start, end)` 計算
 
-use crate::snap::SnapConfig;
-use crate::widgets::heavy::HeavyCtx;
+use common::snap::SnapConfig;
+use daw_ui_core::widgets::heavy::HeavyCtx;
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 /// loop band の hit 種別 (start handle / end handle / 中央 / 範囲外)。
@@ -213,7 +213,7 @@ pub fn compute_loop_drag_endpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snap::SnapMode;
+    use common::snap::SnapMode;
 
     fn snap_quarter_beat() -> SnapConfig {
         SnapConfig {

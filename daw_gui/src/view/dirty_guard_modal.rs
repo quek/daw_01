@@ -13,7 +13,8 @@
 
 use daw_ui_core::{Edit, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{theme, Color, Rect};
+use daw_ui_renderer::{Color, Rect};
+use crate::theme;
 
 use crate::app::{AppData, AppEvent, DirtyGuardAction};
 

@@ -16,7 +16,8 @@
 use std::hash::Hash;
 
 use daw_ui_platform::{ElementState, PhysicalKey};
-use daw_ui_renderer::{theme, Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
+use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;

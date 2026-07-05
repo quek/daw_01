@@ -51,6 +51,7 @@ pub mod state;
 #[cfg(windows)]
 pub mod smoke_test;
 pub mod subprocess;
+pub mod theme;
 pub mod video_fx;
 pub mod view;
 pub mod widgets;

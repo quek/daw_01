@@ -13,7 +13,8 @@ use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, MeterScale, ToggleButto
 use crate::view::modulation::{build_mod, push_mod_drag_resync};
 use crate::view::param_gesture::push_param_gesture_edges;
 use crate::view::track_color;
-use daw_ui_renderer::{theme, Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, Rect, RectCommand};
+use crate::theme;
 
 use crate::app::{AppData, AppEvent, ModControlDomain};
 

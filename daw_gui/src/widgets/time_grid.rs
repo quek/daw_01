@@ -12,13 +12,13 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{theme, Color, GlyphArea, LineBatch, LineSegment, Rect};
-
-use crate::id::WidgetId;
-use crate::scenegraph::hash_inputs;
-use crate::time::{TimeDisplay, TimeMapping};
-use crate::ui::Ui;
-use crate::viewport::ViewportState1D;
+use common::time::{TimeDisplay, TimeMapping};
+use daw_ui_core::id::WidgetId;
+use daw_ui_core::scenegraph::hash_inputs;
+use daw_ui_core::ui::Ui;
+use daw_ui_core::viewport::ViewportState1D;
+use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect};
+use crate::theme;
 
 const RULER_FONT: f32 = 11.0;
 const RULER_LABEL_PAD_X: f32 = 3.0;
@@ -123,14 +123,41 @@ fn compute_label_step(px_per_bar: f32, min_spacing_px: f32) -> i64 {
     step
 }
 
-impl<'a, M: ?Sized + 'static> Ui<'a, M> {
+/// `Ui` に DAW の時間軸 widget (`time_ruler` / `bar_beat_grid`) を生やす拡張トレイト。
+///
+/// daw-ui core は DAW ドメインを持たない (arch 不変条件 #8) ため、これら音楽ドメインの
+/// widget は core の `Ui` 本体ではなくアプリ側 (daw_gui) の拡張トレイトとして定義する。
+/// heavy ブロック内からは `hctx.ui_mut().time_ruler(...)` の形で呼ぶ。
+pub trait TimeGridExt {
+    /// time_ruler widget。`rect` 内に拍 / 小節 / SMPTE label と tick を描画する。
+    fn time_ruler(
+        &mut self,
+        id: impl Hash,
+        rect: Rect,
+        mapping: TimeMapping,
+        viewport: ViewportState1D,
+        style: TimeRulerStyle,
+    );
+    /// bar/beat grid widget。`rect` 内に縦線で拍 / 小節 (+ 任意の subdivision) を描画する。
+    fn bar_beat_grid(
+        &mut self,
+        id: impl Hash,
+        rect: Rect,
+        mapping: TimeMapping,
+        viewport: ViewportState1D,
+        style: BarBeatGridStyle,
+        sub: Option<SubGridSpec>,
+    );
+}
+
+impl<'a, M: ?Sized + 'static> TimeGridExt for Ui<'a, M> {
     /// time_ruler widget。`rect` 内に拍 / 小節 / SMPTE label と tick を描画。
     /// X 軸は `viewport` (sample 単位) を参照。表示モードは `mapping.display`。
     ///
     /// M14 Phase 63m (daw_01 #027): zoom 連動間引き。 1 bar 表示幅 < `min_label_spacing_px`
     /// で label / bar tick を 2 のべき乗 step で skip、 1 beat 表示幅 < `min_beat_tick_px` で
     /// beat tick を非表示。
-    pub fn time_ruler(
+    fn time_ruler(
         &mut self,
         id: impl Hash,
         rect: Rect,
@@ -262,7 +289,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// に淡い縦線を打つ。 push 順は subdivision → beat → bar (subdivision が最背面・最も淡い)。
     /// `px_per_interval < style.min_sub_line_px` の frame では subdivision を描かず 2 段に退避する。
     /// 既存 caller は `None` を渡す (非破壊)。
-    pub fn bar_beat_grid(
+    fn bar_beat_grid(
         &mut self,
         id: impl Hash,
         rect: Rect,
@@ -505,8 +532,8 @@ mod tests {
     // Scene の glyph / line を直接観察。
     // ============================================================
 
-    use crate::input::FrameInput;
-    use crate::ui::UiHost;
+    use daw_ui_core::input::FrameInput;
+    use daw_ui_core::ui::UiHost;
     use daw_ui_platform::PhysicalSize;
     use daw_ui_renderer::Scene;
 

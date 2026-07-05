@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use daw_ui_core::Ui;
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect, theme};
+use daw_ui_renderer::{Color, Rect};
+use crate::theme;
 
 use crate::app::AppData;
 

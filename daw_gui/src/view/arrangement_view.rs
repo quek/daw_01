@@ -6,7 +6,8 @@
 
 use crate::widgets::arrangement::{clip_key_to_ref, ClipKey};
 use daw_ui_core::{ColorPickerStyle, Edit, ScrubableNumberStyle, ToggleButtonStyle, Ui};
-use daw_ui_renderer::{theme, Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, Rect, RectCommand};
+use crate::theme;
 
 use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget};
 use crate::view::track_color;

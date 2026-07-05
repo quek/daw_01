@@ -1,9 +1,9 @@
 //! `SnapConfig` / `SnapMode` の単位 test。
 //!
-//! reference 実装は `daw_01/daw_gui/src/view/snap.rs` (free function 版) で、
-//! こちらは inherent method 化 + Default を `Adaptive ON` に変更済み。
+//! Default は `Adaptive ON`。 純データ型なので common に置き、 GUI ライブラリ
+//! (daw-ui) には音楽ドメインを持ち込まない (arch 不変条件 #8)。
 
-use daw_ui_core::{SnapConfig, SnapMode};
+use common::snap::{SnapConfig, SnapMode};
 
 #[test]
 fn default_is_adaptive_on() {

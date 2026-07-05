@@ -8,7 +8,8 @@
 //!
 //! これで「press inside → 少しドリフト → release inside」を取りこぼさない。
 
-use daw_ui_renderer::{theme, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{GlyphArea, Rect, RectCommand};
+use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;

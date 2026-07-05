@@ -10,7 +10,8 @@ use daw_ui_core::{
     Edit, ReorderableListEditRequest, ReorderableListStyle, ScrubableNumberFormat,
     ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
-use daw_ui_renderer::{theme, Color, Rect};
+use daw_ui_renderer::{Color, Rect};
+use crate::theme;
 
 use crate::app::{
     text_num_to_builtin, AppData, AppEvent, ClipRef, ColorPickerTarget, DiscreteClipEdit,

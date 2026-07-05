@@ -12,7 +12,8 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{theme, Color, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
+use crate::theme;
 
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;

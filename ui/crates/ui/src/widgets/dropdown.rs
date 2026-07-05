@@ -5,7 +5,8 @@
 
 use std::hash::Hash;
 
-use daw_ui_renderer::{theme, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
+use crate::theme;
 
 use crate::id::WidgetId;
 use crate::ui::Ui;

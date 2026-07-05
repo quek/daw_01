@@ -16,7 +16,6 @@ pub mod offscreen;
 pub mod pipelines;
 pub mod scene;
 pub mod texture_store;
-pub mod theme;
 
 // M14 Phase 133 (daw_01 #111): 公開 API (`Renderer::raw_texture` / `create_render_target` /
 // `device` / `queue` 等) が `wgpu` 型を直接やり取りするので、 caller (daw_01 映像効果) が

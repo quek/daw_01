@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
+use cosmic_text::FontSystem;
 use daw_ui_platform::{
     CursorIcon, ImeTextEdit, KeyEvent, PhysicalKey, PhysicalSize, RectPx, TextDocument,
 };
@@ -149,6 +150,11 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// renderer 側の `GlyphPipeline` 内 `FontSystem` とは別 instance だが、同じ system fonts を
     /// 読むので shape 結果は一致する (キャッシュは別)。
     text_metrics: TextMetrics,
+    /// 通常 (headless / example) パス用の measure FontSystem。renderer を持つ runner は
+    /// `frame_with_fonts` で renderer 所有の FontSystem を注入するので、このフィールドは
+    /// None のまま (= 二重ロードしない)。`frame` / `frame_to_edits` を直接使う caller の
+    /// ときだけ初回 measure 時に lazy 生成する。
+    owned_font_system: Option<FontSystem>,
     _m: PhantomData<fn(&mut M)>,
 }
 
@@ -215,6 +221,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             double_click_threshold: (std::time::Duration::from_millis(400), 5.0),
             last_typing_focus: false,
             text_metrics: TextMetrics::new(),
+            owned_font_system: None,
             _m: PhantomData,
         }
     }
@@ -352,7 +359,28 @@ impl<M: ?Sized + 'static> UiHost<M> {
     ) where
         F: for<'a> FnOnce(&'a M, &mut Ui<'a, M>),
     {
-        let edits = self.frame_to_edits(&*model, scene, screen, input, f);
+        // 通常 (headless / example) パス: measure 用 FontSystem を UiHost が lazy 所有する。
+        let mut font_system = self.owned_font_system.take().unwrap_or_else(FontSystem::new);
+        self.frame_with_fonts(model, scene, screen, input, &mut font_system, f);
+        self.owned_font_system = Some(font_system);
+    }
+
+    /// [`Self::frame`] と同じだが、measure 用の `FontSystem` を **呼び出し側が注入する** 版。
+    /// renderer (`Renderer::font_system_mut`) 所有の FontSystem を渡すことで、ui-core が測定用に
+    /// 別 FontSystem を二重ロードするのを避ける (measure と raster が同一 font DB / shape 設定を
+    /// 共有する SSoT)。daw_gui runner はこちらを使う。
+    pub fn frame_with_fonts<F>(
+        &mut self,
+        model: &mut M,
+        scene: &mut Scene,
+        screen: PhysicalSize,
+        input: FrameInput,
+        font_system: &mut FontSystem,
+        f: F,
+    ) where
+        F: for<'a> FnOnce(&'a M, &mut Ui<'a, M>),
+    {
+        let edits = self.frame_to_edits_with_fonts(&*model, scene, screen, input, font_system, f);
         let had_edits = !edits.is_empty();
 
         // edits apply (forward mutation のみ)。undo/redo はアプリ層の責務 (S4a で lib undo 撤去)。
@@ -427,13 +455,35 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// - undo/redo / clipboard write / dialog 同期実行 など `Edit` 以外の副作用は
     ///   **発火しない** (transient フィールドは累積せず冒頭で `clear()` されるので leak はないが、
     ///   ユーザに伝わらない)。 これらを使いたい場合は [`Self::frame`] を使うこと。
-    #[allow(clippy::too_many_lines)]
     pub fn frame_to_edits<F>(
         &mut self,
         model: &M,
         scene: &mut Scene,
         screen: PhysicalSize,
         input: FrameInput,
+        f: F,
+    ) -> Vec<Edit<M>>
+    where
+        F: for<'a> FnOnce(&'a M, &mut Ui<'a, M>),
+    {
+        // 通常パス: measure 用 FontSystem を UiHost が lazy 所有する ([`Self::frame`] 参照)。
+        let mut font_system = self.owned_font_system.take().unwrap_or_else(FontSystem::new);
+        let edits = self.frame_to_edits_with_fonts(model, scene, screen, input, &mut font_system, f);
+        self.owned_font_system = Some(font_system);
+        edits
+    }
+
+    /// [`Self::frame_to_edits`] の FontSystem 注入版 (measure 用 FontSystem を呼び出し側が渡す)。
+    /// 中身は旧 `frame_to_edits` 本体そのもの。通常は [`Self::frame_to_edits`] / [`Self::frame`]
+    /// / [`Self::frame_with_fonts`] を使う。
+    #[allow(clippy::too_many_lines)]
+    pub fn frame_to_edits_with_fonts<F>(
+        &mut self,
+        model: &M,
+        scene: &mut Scene,
+        screen: PhysicalSize,
+        input: FrameInput,
+        font_system: &mut FontSystem,
         f: F,
     ) -> Vec<Edit<M>>
     where
@@ -618,6 +668,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             pending_shortcuts: &mut pending_shortcuts,
             typing_focus: &mut typing_focus,
             text_metrics: &mut self.text_metrics,
+            font_system,
             shortcut_map: &self.shortcut_map,
             pending_clipboard_paste,
             pending_clipboard_writes: &mut self.transient_clipboard_writes,
@@ -809,6 +860,9 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     pub(crate) typing_focus: &'a mut bool,
     /// M14 Phase 58: text shape による実 advance 計算器 (`Ui::measure_text` 経由でアクセス)。
     pub(crate) text_metrics: &'a mut TextMetrics,
+    /// 測定用 FontSystem (frame ごとに注入される)。`Ui::measure_text` が `text_metrics` と
+    /// 組で使う。renderer 所有 (runner) か UiHost lazy 所有 (headless) のいずれか。
+    pub(crate) font_system: &'a mut FontSystem,
     /// shortcut display_for などの query 用 (mutable は UiHost::shortcut_map_mut 経由)。
     pub(crate) shortcut_map: &'a ShortcutMap,
     // ---- M8 Phase 31 clipboard ----
@@ -1638,7 +1692,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 内部の `cosmic_text::FontSystem` は renderer 側 (`GlyphPipeline`) のものとは別 instance だが、
     /// 同じ system fonts を読むので shape 結果は一致する (キャッシュは別)。
     pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
-        self.text_metrics.measure_advance(text, font_size)
+        self.text_metrics.measure_advance(&mut *self.font_system, text, font_size)
     }
 
     /// `text` を `font_size` で描画したとき幅 `max_w` を超えるなら、 末尾を ellipsis
@@ -1665,7 +1719,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         if full_w <= max_w || text.is_empty() {
             return (Cow::Borrowed(text), full_w);
         }
-        let ellipsis = self.text_metrics.ellipsis();
+        let ellipsis = self.text_metrics.ellipsis(&mut *self.font_system);
         let ellipsis_w = self.measure_text(ellipsis, font_size);
         // max_w が ellipsis すら入らないほど狭い: prefix 0 文字 = ellipsis のみ。
         // (描画側の clip_rect が最終的な overshoot を抑える。)

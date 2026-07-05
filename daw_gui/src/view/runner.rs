@@ -957,11 +957,12 @@ impl Runner {
         state.scene.clear();
         let input = state.input.take_input();
 
-        state.ui.frame(
+        state.ui.frame_with_fonts(
             &mut state.app,
             &mut state.scene,
             screen,
             input,
+            state.renderer.font_system_mut(),
             |app, ui| {
                 crate::view::root::build_root(app, ui, screen);
             },

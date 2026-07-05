@@ -12,7 +12,8 @@ use std::f32::consts::PI;
 use std::hash::Hash;
 use std::time::Instant;
 
-use daw_ui_renderer::{theme, Color, LineBatch, LineSegment, Rect, RectCommand};
+use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
+use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;

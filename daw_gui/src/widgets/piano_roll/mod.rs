@@ -26,21 +26,22 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use daw_ui_platform::CursorIcon;
-use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use crate::theme;
 
 use daw_ui_core::edit::Edit;
 use daw_ui_core::id::WidgetId;
 use daw_ui_core::scenegraph::hash_inputs;
-use daw_ui_core::snap::SnapConfig;
-use daw_ui_core::time::{TimeDisplay, TimeMapping};
+use common::snap::SnapConfig;
+use common::time::{TimeDisplay, TimeMapping};
 use daw_ui_core::ui::Ui;
 use daw_ui_core::viewport::ViewportState1D;
 use daw_ui_core::widgets::playhead::draw_playhead_line;
-use daw_ui_core::widgets::ruler_ops::{
+use crate::widgets::ruler_ops::{
     LoopBandHit, LoopDragKind, LoopDragSession, PlayheadDragSession,
     compute_loop_drag_endpoints, loop_band_hit_kind,
 };
-use daw_ui_core::widgets::time_grid::{BarBeatGridStyle, SubGridSpec, TimeRulerStyle};
+use crate::widgets::time_grid::{BarBeatGridStyle, SubGridSpec, TimeGridExt, TimeRulerStyle};
 
 pub(crate) mod view_build;
 mod draw;
@@ -843,49 +844,6 @@ pub fn is_black_key(pitch: u8) -> bool {
     matches!(pitch % 12, 1 | 3 | 6 | 8 | 10)
 }
 
-/// 日本語テキストをモーラ単位で分割する (歌唱合成用)。
-///
-/// `Ui::piano_roll` の歌詞 inline 編集 (M14 Phase 59 / daw_01 #017) が「`Enter` で
-/// commit text を分割して次 note へ自動分配」するために使う公開 helper。daw_01 以外
-/// (将来のボーカルエディタ等) でも再利用可。
-///
-/// # 分割ルール (REAPER VOICEVOX script に準拠)
-///
-/// - 基本: 1 char = 1 モーラ
-/// - **小書きかな** (`ぁぃぅぇぉ ゃゅょ っ ゎ ァィゥェォ ャュョ ッ ヮ`) は **直前の char と結合**。
-///   - 例: `"きゃ"` → 1 モーラ (`["きゃ"]`)
-///   - 例: `"しゅんかん"` → 4 モーラ (`["しゅ", "ん", "か", "ん"]`)
-/// - 連続小書きは結合先 char に積まれる (`"きゃっ"` → `["きゃっ"]`)
-/// - 先頭 char が小書きかなの場合は単独 1 モーラ (defensive、通常入力では発生しない)
-/// - ASCII / 漢字 / その他はそのまま 1 char = 1 モーラ
-///
-/// # 例
-///
-/// ```
-/// use daw_gui::widgets::piano_roll::split_into_morae;
-/// assert_eq!(split_into_morae("あいうえ"), vec!["あ", "い", "う", "え"]);
-/// assert_eq!(split_into_morae("しゅんかん"), vec!["しゅ", "ん", "か", "ん"]);
-/// assert_eq!(split_into_morae(""), Vec::<String>::new());
-/// ```
-#[must_use]
-pub fn split_into_morae(text: &str) -> Vec<String> {
-    const SMALL_KANA: &[char] = &[
-        'ぁ', 'ぃ', 'ぅ', 'ぇ', 'ぉ', 'ゃ', 'ゅ', 'ょ', 'っ', 'ゎ', 'ァ', 'ィ', 'ゥ', 'ェ', 'ォ',
-        'ャ', 'ュ', 'ョ', 'ッ', 'ヮ',
-    ];
-    let mut out: Vec<String> = Vec::new();
-    for c in text.chars() {
-        if SMALL_KANA.contains(&c)
-            && let Some(last) = out.last_mut()
-        {
-            last.push(c);
-        } else {
-            out.push(c.to_string());
-        }
-    }
-    out
-}
-
 /// `from_id` を起点に、(start_beat asc → 同 beat なら pitch desc) 順で `count` 個の
 /// 後続 note id を返す (起点 note 自身を `out[0]` に含む)。
 ///
@@ -1379,66 +1337,6 @@ mod tests {
             off.root_label_fg,
             "auto_contrast=false は fallback 固定色"
         );
-    }
-
-    // -------- M14 Phase 59 / daw_01 #017: split_into_morae unit tests --------
-
-    #[test]
-    fn split_into_morae_single_char() {
-        assert_eq!(split_into_morae("あ"), vec!["あ"]);
-    }
-
-    #[test]
-    fn split_into_morae_basic_distribution() {
-        assert_eq!(split_into_morae("あいうえ"), vec!["あ", "い", "う", "え"]);
-    }
-
-    #[test]
-    fn split_into_morae_combines_yo() {
-        assert_eq!(split_into_morae("きゃ"), vec!["きゃ"]);
-    }
-
-    #[test]
-    fn split_into_morae_combines_tsu() {
-        // "ぱっと" = ぱ + っ (結合) + と → 2 モーラ
-        assert_eq!(split_into_morae("ぱっと"), vec!["ぱっ", "と"]);
-    }
-
-    #[test]
-    fn split_into_morae_consecutive_small_kana() {
-        // "きゃっ" = き + ゃ (結合) + っ (続けて結合) → 1 モーラ
-        assert_eq!(split_into_morae("きゃっ"), vec!["きゃっ"]);
-    }
-
-    #[test]
-    fn split_into_morae_leading_small_kana_defensive() {
-        // 先頭小書きは defensive で単独 1 モーラ (通常入力では発生しない)
-        assert_eq!(split_into_morae("ぁい"), vec!["ぁ", "い"]);
-    }
-
-    #[test]
-    fn split_into_morae_empty() {
-        assert_eq!(split_into_morae(""), Vec::<String>::new());
-    }
-
-    #[test]
-    fn split_into_morae_long_kana() {
-        // "しゅんかんいどう" = しゅ / ん / か / ん / い / ど / う → 7 モーラ
-        assert_eq!(
-            split_into_morae("しゅんかんいどう"),
-            vec!["しゅ", "ん", "か", "ん", "い", "ど", "う"]
-        );
-    }
-
-    #[test]
-    fn split_into_morae_ascii_one_per_char() {
-        assert_eq!(split_into_morae("abc"), vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn split_into_morae_katakana_yo() {
-        // カタカナの拗音も同様に結合
-        assert_eq!(split_into_morae("シュン"), vec!["シュ", "ン"]);
     }
 
     // -------- M14 Phase 59 / daw_01 #017: collect_next_notes_for_lyric unit tests --------

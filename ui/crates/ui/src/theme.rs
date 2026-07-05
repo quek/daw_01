@@ -1,9 +1,10 @@
-//! テーマ — UI クローム色の **Single Source of Truth**。
+//! テーマ — 汎用 UI クローム + 汎用 widget パレットの **Single Source of Truth**。
 //!
-//! 以前は色が `daw_gui/src/view/*` の file-local `const COLOR_*` と
-//! `ui/crates/ui/src/widgets/*` の `*Style::Default` に **約 250 箇所ベタ書き** され、
-//! 同じ論理色 (primary text ~60 / accent blue ~30 / border ~35) が複製されていた。
-//! 「背景をもっと暗く・クールに」 を 1 箇所で実現できるよう、全クローム色をここに集約する。
+//! renderer は `Color` 型と演算のみを持ち、意味を持つ色トークンはここ (ui-core) に置く。
+//! DAW 固有の意味色 (playhead / record / solo / clip / ghost) は **アプリ側**
+//! (`daw_gui::theme`) が持つ (arch 不変条件 #8: daw-ui core は DAW ドメインを持たない)。
+//! ここに残るのは、汎用 widget (button / meter / waveform / automation curve / list 等) が
+//! 描画に使う「ドメイン非依存」トークンだけ。
 //!
 //! ## 設計
 //! - **暗く・クール・階層的**: ほぼ黒の寒色チャコールを基底に、blue チャンネルを常に最も高く
@@ -13,20 +14,16 @@
 //! - **アクセントは 1 色**: 断片化していた 9 種の青を `ACCENT` (electric azure, hue≈212) に統一。
 //!   選択 / フォーカス / アクティブトグル / 押下 / リンク / プログレスの **中立的インタラクション
 //!   すべて** がこれ。
-//! - **彩度は機能色だけに予約**: `PLAYHEAD` (warm coral) / `RECORD` / `SOLO` / `PLAY` / meter ramp
-//!   のみ寒色基調から外れて彩度を持つ。clip/note 選択は意図的に **warm amber** (`SELECTION_WARM`) —
-//!   clip はユーザー着色 (しばしば青) なので補色の暖色で確実にコントラストを確保する。
 //! - **派生状態は再宣言しない**: hover = [`Color::lighten`]、pressed = [`Color::darken`]、
 //!   半透明 wash = [`Color::with_alpha`] で token から計算する。
 //!
 //! ## SSoT の使い方
-//! 新しい色が要るときは **ここに token を 1 つ足す**。call site でベタ書きの `Color::rgb(...)`
-//! を新設しない (guard 対象)。runtime のテーマ切替 (light mode 等) は現状要件に無いので、
-//! 構造体を `Ui` にスレッドする boilerplate は入れず flat `pub const` に留める (KISS)。
-//! 将来 runtime テーマが要るなら、この flat const 群を `Palette` struct に畳む 1 回の機械的
-//! refactor で済む (全参照が `theme::*` を通っているため)。
+//! 新しい汎用色が要るときは **ここに token を 1 つ足す**。DAW 固有色は `daw_gui::theme` へ。
+//! call site でベタ書きの `Color::rgb(...)` を新設しない (guard 対象)。flat `pub const` に留める
+//! (KISS)。将来 runtime テーマが要るなら、この flat const 群を `Palette` struct に畳む 1 回の
+//! 機械的 refactor で済む (全参照が `theme::*` を通っているため)。
 
-use crate::Color;
+use daw_ui_renderer::Color;
 
 // ===== 面 (elevation: 暗→明で奥行きを表現) =====
 
@@ -78,14 +75,12 @@ pub const ACCENT: Color = Color::rgb(0.26, 0.62, 1.00);
 /// accent の低 alpha 版 (テキスト選択矩形・lasso 塗り・nest ターゲット・半透明アクティブ帯)。
 pub const ACCENT_WASH: Color = ACCENT.with_alpha(0.20);
 
-// ===== 選択 / 時間軸アフォーダンス =====
+// ===== 選択 / インタラクションアフォーダンス =====
 
-/// 選択された clip / note の塗り、automation tension ハンドル。**意図的に accent ではない** warm amber:
-/// clip はユーザー着色 (青が多い) なので補色の暖色で確実にコントラストを確保する。
+/// 選択された要素の塗り、automation tension ハンドル。**意図的に accent ではない** warm amber:
+/// ユーザー着色されうる面 (青が多い) の上で補色の暖色で確実にコントラストを確保する。
 pub const SELECTION_WARM: Color = Color::rgb(1.00, 0.72, 0.24);
-/// 再生ヘッド線 (arrangement / piano-roll / audio editor)。寒色フィールドで唯一「叫ぶ」 warm coral。
-pub const PLAYHEAD: Color = Color::rgb(1.00, 0.34, 0.20);
-/// loop 帯 + ドラッグハンドル・reorder ドロップ・ファイルドロップ標的。accent と同系の明るい空色。
+/// ドラッグハンドル帯・reorder ドロップ標的・ファイルドロップ標的。accent と同系の明るい空色。
 pub const LOOP_BAND: Color = Color::rgb(0.40, 0.80, 1.00);
 
 // ===== グリッド / lane hairline =====
@@ -99,17 +94,6 @@ pub const GRID_LINE_STRONG: Color = GRID_LINE.with_alpha(0.17);
 
 /// modal の暗転オーバーレイ。純黒でなく寒色チントで modal も同じスレート世界に置く。
 pub const BACKDROP: Color = Color::rgba(0.02, 0.03, 0.05, 0.62);
-
-// ===== 機能 (semantic) 状態色 — 彩度を持つのはここだけ =====
-
-/// record-arm / MIDI record / mute ON。予約された alarm red。
-pub const RECORD: Color = Color::rgb(0.90, 0.26, 0.30);
-/// record-mode arm (録音モード待機) の orange。
-pub const RECORD_ARM: Color = Color::rgb(0.90, 0.50, 0.22);
-/// solo ON / metronome ON。予約された warning yellow。
-pub const SOLO: Color = Color::rgb(0.97, 0.82, 0.30);
-/// play / transport 稼働 LED・status success。わずかに teal 寄りの green で「go」も寒色家族に。
-pub const PLAY: Color = Color::rgb(0.28, 0.80, 0.48);
 
 // ===== レベルメーター ramp (green → yellow → orange → red) =====
 
@@ -131,14 +115,3 @@ pub const WAVEFORM_PEAK: Color = Color::rgb(0.95, 0.42, 0.40);
 
 /// modulation / automation カーブ線。accent と区別する cyan。
 pub const CURVE: Color = Color::rgb(0.42, 0.85, 0.95);
-
-// ===== clip 既定色 / ドラッグゴースト =====
-
-/// track 未着色時の clip 既定塗り。
-pub const CLIP_DEFAULT: Color = Color::rgb(0.22, 0.34, 0.52);
-/// clip 既定枠。
-pub const CLIP_DEFAULT_BORDER: Color = Color::rgb(0.30, 0.46, 0.66);
-/// ドラッグ複製ゴースト: リンク (元と連動) = green。
-pub const GHOST_LINKED: Color = Color::rgb(0.42, 0.86, 0.58);
-/// ドラッグ複製ゴースト: 独立 (新規実体) = orange。
-pub const GHOST_INDEPENDENT: Color = Color::rgb(1.00, 0.70, 0.34);

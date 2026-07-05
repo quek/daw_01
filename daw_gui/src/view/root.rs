@@ -6,7 +6,8 @@
 
 use daw_ui_core::{Edit, Orientation, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{theme, Rect};
+use daw_ui_renderer::Rect;
+use crate::theme;
 
 use crate::app::{AppData, AppEvent};
 use crate::view::{

@@ -39,11 +39,8 @@ use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::input::{DroppedFiles, PointerFrame};
 use crate::scenegraph::hash_inputs;
-use crate::time::TimeMapping;
 use crate::ui::Ui;
-use crate::viewport::ViewportState1D;
 use crate::widgets::drag_rect::DragRect;
-use crate::widgets::time_grid::{BarBeatGridStyle, SubGridSpec, TimeRulerStyle};
 use crate::widgets::waveform::{WaveformResponse, WaveformSource, WaveformStyle, WaveformView};
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -96,6 +93,19 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
     /// 画面サイズ。
     pub fn screen(&self) -> PhysicalSize {
         self.ui.screen()
+    }
+
+    /// 内側の [`Ui`] への可変参照。**アプリ側 heavy widget の描画脱出口**。
+    ///
+    /// daw-ui core は DAW ドメインを持たない (arch 不変条件 #8) ので、arrangement /
+    /// piano_roll の time_ruler / bar_beat_grid のような DAW 固有 draw を core の
+    /// `HeavyCtx` delegate として足さない。代わりにアプリ側 (daw_gui) が `&mut Ui` を
+    /// 受ける free function / 拡張トレイト (`TimeGridExt` 等) を定義し、heavy ブロック内
+    /// からは `hctx.ui_mut()` で呼ぶ。
+    /// `push_rect` 等は `HeavyCtx` にも生えているが、`with_widget_node` 経由の
+    /// 粗粒度キャッシュを使う描画は `&mut Ui` が要るためこれを公開する。
+    pub fn ui_mut(&mut self) -> &mut Ui<'a, M> {
+        &mut *self.ui
     }
 
     // === 描画コマンド (heavy 内では公開、通常 widget は pub(crate) のまま) ===
@@ -206,32 +216,6 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
         on_click: impl FnOnce() -> Edit<M>,
     ) {
         self.ui.button_at(id, text, rect, on_click);
-    }
-
-    /// `Ui::time_ruler` の delegate (M13 Phase 55、cached layer 内で呼ぶ用)。
-    pub fn time_ruler(
-        &mut self,
-        id: impl Hash,
-        rect: Rect,
-        mapping: TimeMapping,
-        viewport: ViewportState1D,
-        style: TimeRulerStyle,
-    ) {
-        self.ui.time_ruler(id, rect, mapping, viewport, style);
-    }
-
-    /// `Ui::bar_beat_grid` の delegate (M13 Phase 55、cached layer 内で呼ぶ用)。
-    /// (M14 Phase 124 / daw_01 #100) `sub` で subdivision (3 段目) を追加可。
-    pub fn bar_beat_grid(
-        &mut self,
-        id: impl Hash,
-        rect: Rect,
-        mapping: TimeMapping,
-        viewport: ViewportState1D,
-        style: BarBeatGridStyle,
-        sub: Option<SubGridSpec>,
-    ) {
-        self.ui.bar_beat_grid(id, rect, mapping, viewport, style, sub);
     }
 
     // === M9 P1-3: input / popup / shortcut / clipboard / dialog pull API ===

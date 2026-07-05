@@ -26,7 +26,8 @@
 use std::hash::Hash;
 use std::time::Instant;
 
-use daw_ui_renderer::{theme, Color, GlyphArea, Rect, RectCommand};
+use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
+use crate::theme;
 
 use crate::id::WidgetId;
 use crate::ui::Ui;

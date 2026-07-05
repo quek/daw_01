@@ -12,7 +12,8 @@
 use std::cell::Cell;
 use std::hash::Hash;
 
-use daw_ui_renderer::{theme, Color, Rect, RectCommand};
+use daw_ui_renderer::{Color, Rect, RectCommand};
+use crate::theme;
 
 use crate::ui::Ui;
 

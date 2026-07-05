@@ -16,12 +16,16 @@
 use std::sync::Arc;
 
 use daw_ui_core::{
-    ChannelLayout, DragKind, Edit, SampleSlices, TimeDisplay, TimeMapping, TimeRulerStyle, Ui,
-    ViewportState1D, WaveformRenderMode, WaveformSource, WaveformStyle, WaveformView, WidgetId,
+    ChannelLayout, DragKind, Edit, SampleSlices, Ui, ViewportState1D, WaveformRenderMode,
+    WaveformSource, WaveformStyle, WaveformView, WidgetId,
 };
-use daw_ui_renderer::{theme, Color, LineBatch, LineSegment, Rect};
+use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
+use crate::theme;
+
+use common::time::{TimeDisplay, TimeMapping};
 
 use crate::app::{AppData, AppEvent, AudioEventTrimSide, MIN_AUDIO_EDITOR_VIEW_LEN_BEATS};
+use crate::widgets::time_grid::{TimeGridExt, TimeRulerStyle};
 
 const BG: Color = theme::PANEL;
 const TEXT: Color = theme::TEXT;
