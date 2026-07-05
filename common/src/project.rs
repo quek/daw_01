@@ -296,6 +296,27 @@ pub fn load(path: impl AsRef<Path>) -> Result<Song> {
     Ok(load_project(path)?.song)
 }
 
+/// version-gated migration の 1 entry: `(introduced_in, apply)`。ファイルの `version` が
+/// `introduced_in` 未満のときだけ `apply` を走らせる。`T` は適用対象 (生 JSON `Value` か `Song`)。
+type Migration<T> = (u32, fn(&mut T));
+
+/// deserialize が成立する前に生の JSON `Value` へ当てる version-gated migration の表。
+/// tagged ClipContent の `type` 注入等、型 deserialize の前提を作るものを置く。
+/// version 非依存 (idempotent) な前処理 (`migrate_vocal_source_to_clips`) は
+/// gate せず `load_project` 冒頭で無条件に呼ぶ。
+const VALUE_MIGRATIONS: &[Migration<serde_json::Value>] =
+    &[(CLIP_CONTENT_TAG_VERSION, migrate_clip_content_add_tag)];
+
+/// deserialize 後の `Song` へ当てる version-gated migration の表。`< CURRENT_VERSION` で
+/// gate してはならない (version bump のたびに一つ前のバージョンのファイルへ誤再適用される)。
+const SONG_MIGRATIONS: &[Migration<Song>] = &[
+    // (v26) device-gated text overlay 以前の Text 持ちトラックへ字幕デバイスを補い表示を保つ。
+    // normalize の前に走るので、補った device も他 device と同じ正規化 (aux migration 等) を通る。
+    (SUBTITLE_DEVICE_VERSION, migrate_text_overlay_to_subtitle_device),
+    // (v27) 旧 per-event mute を `Clip.muted` へ畳み込む (v27+ の `event.muted` は将来 UI 用に温存)。
+    (CLIP_MUTE_VERSION, migrate_per_event_mute_to_clip_mute),
+];
+
 /// Load a project including optional GUI view state. The returned
 /// `song` is fully normalized (same as `load`); `view` is `None` for legacy
 /// files / files saved without view state.
@@ -310,14 +331,17 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     let mut value: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse project JSON from {}", path.display()))?;
     migrate_vocal_source_to_clips(&mut value);
-    // (v30) ClipContent untagged → tagged。旧 untagged ファイルに `type` を注入してから
-    // deserialize する (tagged deserialize は `type` が無いと失敗するため from_value の前)。
+    // deserialize が成立する前に生の JSON を整える version-gated migration を単一 dispatch
+    // table (VALUE_MIGRATIONS) から適用する (例: v30 の tagged ClipContent `type` 注入 —
+    // tagged deserialize は `type` が無いと失敗するため from_value の前に当てる)。
     let file_version = value
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    if file_version < u64::from(CLIP_CONTENT_TAG_VERSION) {
-        migrate_clip_content_add_tag(&mut value);
+    for &(introduced_in, migrate) in VALUE_MIGRATIONS {
+        if file_version < u64::from(introduced_in) {
+            migrate(&mut value);
+        }
     }
     let project: ProjectFile = serde_json::from_value(value)
         .with_context(|| format!("failed to deserialize project from {}", path.display()))?;
@@ -348,21 +372,13 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     }
     let view = project.view;
     let mut song = project.song;
-    // 各 migration は「その挙動が導入されたバージョン」未満のファイルにだけ適用する。
-    // `< CURRENT_VERSION` で gate すると、version を bump するたびに一つ前のバージョンで
-    // 保存されたファイルへ migration が誤再適用される (例: v26 で字幕デバイスを意図的に
-    // 抜いた「喋るが映さない」トラックが load のたびに再表示化される)。
-    //
-    // (v26) 旧プロジェクト (= device-gated text overlay 以前) の Text 持ちトラックへ
-    // 字幕デバイスを補い、表示を保つ。normalize の前に挿すことで、追加 device も
-    // 他 device と同じ正規化 (aux migration 等) を通る。
-    if project.version < SUBTITLE_DEVICE_VERSION {
-        migrate_text_overlay_to_subtitle_device(&mut song);
-    }
-    // (v27) 旧 per-event mute を `Clip.muted` へ畳み込む。v27 以降の `event.muted` は
-    // 温存 (将来の per-event mute UI 用)。
-    if project.version < CLIP_MUTE_VERSION {
-        migrate_per_event_mute_to_clip_mute(&mut song);
+    // deserialize 後の Song へ当てる version-gated migration を単一 dispatch table
+    // (SONG_MIGRATIONS) から適用する。各 entry は「その挙動が導入されたバージョン」未満の
+    // ファイルにだけ走る (gate 規約の詳細は SONG_MIGRATIONS の doc-comment)。
+    for &(introduced_in, migrate) in SONG_MIGRATIONS {
+        if project.version < introduced_in {
+            migrate(&mut song);
+        }
     }
     // Re-establish every invariant the codebase assumes about a loaded
     // song in one SSoT call: value-range sanity (bpm/time_sig/length/loop
