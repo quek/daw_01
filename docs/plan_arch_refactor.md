@@ -40,14 +40,26 @@ branch = `feature/arch-refactor`。各段の green を WIP commit でチェッ�
 - S6 DESIGN.md 現行化、S7 ワークフロー (CLAUDE.md 不変条件 + make arch-lint + guards 7 則 +
   /arch-review skill + implement/review skill 更新)
 
-**最新 green checkpoint**: commit `3a6576a` (S4d 完了 = renderer 色退去 + FontSystem 単一化 +
-snap/time common 移設 + time widget → daw_gui + morae 統合)。
+**最新 green checkpoint**: commit `74c1b86` (S5-1 = app_config/window_state/recent を
+common → daw_gui 移設。S4d 完了は `3a6576a`)。
 
 **残タスク (逐次、各段 green を WIP commit)**:
-- **S5** (§9,10): common 縮退 (video_fx/app_config/window_state/recent/scale/voicevox_engine →
-  daw_gui、voicevox/voicevox_cache → plugin_host、scan → plugin_host + RescanPlugins IPC、
-  reqwest を common から除去)。ClipContent の untagged → tag 化 + JSON 前処理 migration
-  (CURRENT_VERSION 29→30)、legacy field を前処理層へ、migration dispatch table 化。
+- **S5 §9 (full rework、進行中)**: 2026-07-05 の依存調査で plan §9 の前提を一部修正 (§9 参照)。
+  - **S5-1 完了** (`74c1b86`): app_config/window_state/recent → daw_gui (GUI 専用・blocker 無)。
+  - **S5-2 (未)**: voicevox.rs を 3 分割 (単純 move 不可) — pure 型/const/split_into_morae
+    (VoiceVoxSinger/Phoneme/DEFAULT_*、lipsync/project/daw_gui/plugin_host 共有) は common 残留、
+    HTTP client (fetch_singers/query_phonemes 等 = daw_gui のみ) → daw_gui、synthesis
+    (synthesize_*/decode_wav/BuiltinNoteSpec = plugin_host のみ) → plugin_host。voicevox_cache →
+    plugin_host、voicevox_engine → daw_gui。これで common から reqwest 除去可。
+  - **S5-3 (未・最リスク)**: clap_scan/vst3_scan + plugin_db::scan_system (DLL 実ロード) を
+    plugin_host へ、plugin_db 純データは common 残留、RescanPlugins/PluginDbUpdated IPC 新設
+    (daw_gui はローカル scan をやめ IPC で DB 受領)。これで vst3 除去可。3 プロセス貫通の FFI/IPC
+    変更なので慎重に。
+  - **S5-4 (未)**: common/Cargo.toml から reqwest/vst3 除去 (libloading/clap-sys は plugin_db 残留
+    で除去不可)。**video_fx/scale は common 残留が正** (common::model が参照、scale は wire 型)。
+    track_params は未作成 (削除対象なし)。
+- **S5 §10**: ClipContent untagged → tag 化 + JSON 前処理 migration (CURRENT_VERSION 29→30)、
+  legacy field を前処理層へ、migration dispatch table 化。§9 と独立・blocker 無しなので先行可。
 - **S8**: `make check`/`make clippy`/`make build`/`make test` 全 green、headless script テスト
   (export/master fx/PDC)、`daw_gui --smoke-test`、旧バージョン project load 互換テスト、
   **実機 sign-off** (特に S4b/c の arrangement/piano_roll interactive: clip drag/resize/split/
@@ -384,16 +396,23 @@ resize / split / セクション / automation lane 編集 / piano_roll ノート
 
 ## 9. common 縮退 [B6]
 
-- daw_gui へ移動: video_fx.rs / app_config.rs / window_state.rs / recent.rs / scale.rs /
-  voicevox_engine.rs (エンジン起動)。
-- daw_plugin_host へ移動: voicevox.rs (HTTP 合成) / voicevox_cache.rs (builtin が唯一の実行場所)。
-  ※ GUI が使う speaker 一覧 fetch 等は GUI 残留分を精査して分割。
-- plugin scan (clap_scan/vst3_scan — DLL 実ロード) を daw_plugin_host へ移動し、
+> **2026-07-05 依存調査による修正**: 元の plan は video_fx/scale/track_params の扱いを誤って
+> いた。実測結果を反映した最終形が以下 (進捗は「残タスク」節 S5-1〜4)。
+
+- daw_gui へ移動: app_config.rs / window_state.rs / recent.rs (**S5-1 完了**) / voicevox_engine.rs
+  (reqwest 随伴で daw_gui へ)。
+- **video_fx.rs / scale.rs は common 残留が正** (誤: daw_gui 移動)。common::model が
+  `video_fx::TRANSFORM_ID` を、`Song.scale_changes` が `scale::ScaleChange` (= bincode wire 型) を
+  参照するため daw_gui 移動は `common → daw_gui` cycle。両者は domain/wire データ。
+- voicevox は **3 分割** (単純 move 不可、lipsync/project/daw_gui/plugin_host が別部分を使う):
+  pure 型/const/split_into_morae → common 残留、HTTP client → daw_gui、synthesis +
+  voicevox_cache → plugin_host。
+- plugin scan (clap_scan/vst3_scan + plugin_db::scan_system の DLL 実ロード) を daw_plugin_host へ、
   rescan は `PluginCommand::RescanPlugins` → `PluginEvent::PluginDbUpdated` の IPC に。
   plugin_db.rs (純データ) は common 残留。
-- track_params.rs (参照ゼロ) 削除。
-- 成功指標: common の Cargo.toml から `reqwest` が消える (libloading / clap-sys / vst3 も
-  可能な範囲で退去)。
+- ~~track_params.rs 削除~~ → **未作成** (workspace に存在せず、削除対象なし)。
+- 成功指標: reqwest 除去 = voicevox split + voicevox_engine 移動が前提。vst3 除去 = scan 移動が
+  前提。libloading / clap-sys は plugin_db (common 残留) が使い続けるため **除去不可**。
 
 ## 10. Song / serde 衛生 [common agent 4-5]
 
