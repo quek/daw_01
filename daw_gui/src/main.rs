@@ -227,7 +227,7 @@ fn run_gui(
     let saved_window = app_dirs
         .as_ref()
         .map(|d| d.window_state())
-        .and_then(common::window_state::load);
+        .and_then(daw_gui::window_state::load);
     let init_state = saved_window.unwrap_or_default();
     let mut window_attrs = WindowAttributes::default()
         .with_title("daw_01")

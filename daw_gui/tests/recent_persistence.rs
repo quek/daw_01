@@ -3,7 +3,7 @@
 //!
 //! # なぜ存在するか
 //!
-//! 以前は `push_recent` / `push_recent_saved` が `common::recent::default_path()`
+//! 以前は `push_recent` / `push_recent_saved` が `daw_gui::recent::default_path()`
 //! (= 実 `%LOCALAPPDATA%\daw_01\recent*.json`) に直接書き込んでいた。 その結果
 //! `tempfile::tempdir()` を使う Save 系 integration test (dirty_guard 等) が
 //! 走るたびに、 tempdir の `proj.daw` パスが実ユーザーの recent list に残り、
@@ -80,7 +80,7 @@ fn save_persists_recent_into_injected_dir() {
 
     // 本題: recent / recent_saved は **注入した data_dir** に書かれ、
     // 中身は今保存した proj.daw 1 件 (実 %LOCALAPPDATA% ではない)。
-    let recent = common::recent::load(dirs.recent()).unwrap();
+    let recent = daw_gui::recent::load(dirs.recent()).unwrap();
     assert_eq!(
         recent.paths,
         vec![proj_path.clone()],
@@ -88,7 +88,7 @@ fn save_persists_recent_into_injected_dir() {
         dirs.recent().display()
     );
 
-    let recent_saved = common::recent::load(dirs.recent_saved()).unwrap();
+    let recent_saved = daw_gui::recent::load(dirs.recent_saved()).unwrap();
     assert_eq!(
         recent_saved.paths,
         vec![proj_path.clone()],

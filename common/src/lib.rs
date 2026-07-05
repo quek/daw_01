@@ -1,4 +1,3 @@
-pub mod app_config;
 pub mod app_dirs;
 pub mod audio_bridge;
 pub mod audio_render;
@@ -20,7 +19,6 @@ pub mod port_config;
 pub mod process_data;
 pub mod project;
 pub mod protocol;
-pub mod recent;
 pub mod recovery;
 pub mod scale;
 pub mod shmem;
@@ -33,7 +31,6 @@ pub mod voicevox;
 pub mod voicevox_cache;
 pub mod voicevox_engine;
 pub mod vst3_scan;
-pub mod window_state;
 pub mod wire;
 pub mod worker_bridge;
 

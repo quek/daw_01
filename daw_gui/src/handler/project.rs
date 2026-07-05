@@ -428,7 +428,7 @@ impl AppData {
         self.ui_prefs.recent_files_labels =
             Self::rebuild_recent_labels(&self.ui_prefs.recent_files.paths);
         if let Some(disk) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recent())
-            && let Err(e) = common::recent::save(&disk, &self.ui_prefs.recent_files)
+            && let Err(e) = crate::recent::save(&disk, &self.ui_prefs.recent_files)
         {
             tracing::warn!(
                 error = ?e,
@@ -446,7 +446,7 @@ impl AppData {
         self.ui_prefs.recent_saved_labels =
             Self::rebuild_recent_labels(&self.ui_prefs.recent_saved.paths);
         if let Some(disk) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recent_saved())
-            && let Err(e) = common::recent::save(&disk, &self.ui_prefs.recent_saved)
+            && let Err(e) = crate::recent::save(&disk, &self.ui_prefs.recent_saved)
         {
             tracing::warn!(
                 error = ?e,

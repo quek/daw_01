@@ -844,14 +844,14 @@ fn save_main_window_state(
     let size = win.inner_size();
     let scale = win.scale_factor();
     let pos = win.outer_position().unwrap_or(WinitPhysPos { x: 100, y: 100 });
-    let state = common::window_state::WindowState {
+    let state = crate::window_state::WindowState {
         width: f64::from(size.width) / scale,
         height: f64::from(size.height) / scale,
         x: pos.x,
         y: pos.y,
         maximized: win.is_maximized(),
     };
-    if let Err(e) = common::window_state::save(&path, &state) {
+    if let Err(e) = crate::window_state::save(&path, &state) {
         tracing::warn!(error = ?e, "failed to save window_state.json");
     }
 }

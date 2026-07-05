@@ -11,7 +11,10 @@
 //! 構築できる。
 
 pub mod app;
+pub mod app_config;
 pub mod app_types;
+pub mod recent;
+pub mod window_state;
 #[cfg(test)]
 mod app_tests;
 pub mod event;

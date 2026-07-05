@@ -1735,11 +1735,11 @@ pub(crate) fn micros_to_beats(micros: u64, bpm: f32) -> f64 {
 
 /// `app_dirs` から解決した path で recent list を復元。 path が `None`
 /// (= 永続化先なし) や読み込み失敗時は空 list を返す (起動を妨げない)。
-pub(crate) fn load_recent_list(path: Option<PathBuf>) -> common::recent::RecentFiles {
+pub(crate) fn load_recent_list(path: Option<PathBuf>) -> crate::recent::RecentFiles {
     let Some(path) = path else {
         return Default::default();
     };
-    match common::recent::load(&path) {
+    match crate::recent::load(&path) {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = ?e, path = %path.display(), "recent list load failed");

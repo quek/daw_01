@@ -286,7 +286,7 @@ impl AppData {
                 arrange_snap_choice: crate::view::snap::CHOICE_ARRANGE_DEFAULT,
                 resource_monitor_enabled: app_dirs
                     .as_ref()
-                    .map(|d| common::app_config::load(d.app_config()).resource_monitor_enabled)
+                    .map(|d| crate::app_config::load(d.app_config()).resource_monitor_enabled)
                     .unwrap_or(true),
                 is_help_open: false,
                 app_dirs,
@@ -1346,10 +1346,10 @@ impl AppData {
                 self.ui_prefs.resource_monitor_enabled = !self.ui_prefs.resource_monitor_enabled;
                 // app_config.json に永続化 (プロジェクト非依存の UI 設定)。
                 if let Some(dirs) = &self.ui_prefs.app_dirs {
-                    let cfg = common::app_config::AppConfig {
+                    let cfg = crate::app_config::AppConfig {
                         resource_monitor_enabled: self.ui_prefs.resource_monitor_enabled,
                     };
-                    if let Err(e) = common::app_config::save(dirs.app_config(), &cfg) {
+                    if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
                         tracing::warn!(error = ?e, "failed to save app_config");
                     }
                 }

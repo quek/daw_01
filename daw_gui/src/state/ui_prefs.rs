@@ -123,12 +123,12 @@ pub struct UiPrefs {
     /// 「最近開いたファイル」 (= Open ダイアログ / OpenRecent 経由で読み込んだ
     /// .daw)。 File メニュー「Open Recent ►」 に表示。 永続化先は
     /// `app_dirs.recent()` (= `%LOCALAPPDATA%/daw_01/recent.json`)。
-    pub recent_files: common::recent::RecentFiles,
+    pub recent_files: crate::recent::RecentFiles,
     /// 「最近保存したファイル」 (= Save / Save As で書き込んだ先)。 File
     /// メニュー「Recently Saved ►」 に表示。 永続化先は
     /// `app_dirs.recent_saved()` (= `%LOCALAPPDATA%/daw_01/recent_saved.json`)。
     /// 開いた履歴と分離して「保存先だけ覚えておく」 UX を提供する。
-    pub recent_saved: common::recent::RecentFiles,
+    pub recent_saved: crate::recent::RecentFiles,
     /// `recent_files` の filename だけ抽出したキャッシュ。 gui_01 `menu_bar`
     /// API が label に `&'a str` を要求し、 'a が `Ui` の borrow 寿命
     /// (= `&AppData` の寿命) と一致するため、 label 文字列も AppData 内に
