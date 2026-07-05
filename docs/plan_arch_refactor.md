@@ -40,26 +40,26 @@ branch = `feature/arch-refactor`。各段の green を WIP commit でチェッ�
 - S6 DESIGN.md 現行化、S7 ワークフロー (CLAUDE.md 不変条件 + make arch-lint + guards 7 則 +
   /arch-review skill + implement/review skill 更新)
 
-**最新 green checkpoint**: commit `74c1b86` (S5-1 = app_config/window_state/recent を
-common → daw_gui 移設。S4d 完了は `3a6576a`)。
+**最新 green checkpoint**: commit `a29d55a` (S5-3/S5-4 = plugin scan → plugin_host、common から
+libloading/clap-sys/vst3 除去。**§9 完了**)。
 
 **残タスク (逐次、各段 green を WIP commit)**:
-- **S5 §9 (full rework、進行中)**: 2026-07-05 の依存調査で plan §9 の前提を一部修正 (§9 参照)。
-  - **S5-1 完了** (`74c1b86`): app_config/window_state/recent → daw_gui (GUI 専用・blocker 無)。
-  - **S5-2 (未)**: voicevox.rs を 3 分割 (単純 move 不可) — pure 型/const/split_into_morae
-    (VoiceVoxSinger/Phoneme/DEFAULT_*、lipsync/project/daw_gui/plugin_host 共有) は common 残留、
-    HTTP client (fetch_singers/query_phonemes 等 = daw_gui のみ) → daw_gui、synthesis
-    (synthesize_*/decode_wav/BuiltinNoteSpec = plugin_host のみ) → plugin_host。voicevox_cache →
-    plugin_host、voicevox_engine → daw_gui。これで common から reqwest 除去可。
-  - **S5-3 (未・最リスク)**: clap_scan/vst3_scan + plugin_db::scan_system (DLL 実ロード) を
-    plugin_host へ、plugin_db 純データは common 残留、RescanPlugins/PluginDbUpdated IPC 新設
-    (daw_gui はローカル scan をやめ IPC で DB 受領)。これで vst3 除去可。3 プロセス貫通の FFI/IPC
-    変更なので慎重に。
-  - **S5-4 (未)**: common/Cargo.toml から reqwest/vst3 除去 (libloading/clap-sys は plugin_db 残留
-    で除去不可)。**video_fx/scale は common 残留が正** (common::model が参照、scale は wire 型)。
-    track_params は未作成 (削除対象なし)。
-- **S5 §10**: ClipContent untagged → tag 化 + JSON 前処理 migration (CURRENT_VERSION 29→30)、
-  legacy field を前処理層へ、migration dispatch table 化。§9 と独立・blocker 無しなので先行可。
+- **S5 §9 (full rework) 完了** — common は plugin-load / HTTP 系依存ゼロ (reqwest/libloading/
+  clap-sys/vst3 を全除去)。依存調査で plan §9 の前提を一部修正した (§9 参照)。
+  - S5-1 (`74c1b86`): app_config/window_state/recent → daw_gui (GUI 専用)。
+  - S5-2 (`8952c34`): voicevox 3 分割 (pure→common / HTTP client→daw_gui / synth→plugin_host)、
+    voicevox_cache→plugin_host、voicevox_engine→daw_gui。common から **reqwest 除去**。
+  - S5-3 (`a29d55a`): plugin scan (clap_scan/vst3_scan/scan_system) を daw_plugin_host へ。plan の
+    RescanPlugins IPC ではなく **`--scan-plugins` 使い捨てサブプロセス** を採用 (既存 port-probe と
+    同じ crash 隔離、GUI プロセスは dlopen しない、daw_gui flow 不変で低リスク)。plugin_db 純データ
+    は common 残留。
+  - S5-4 (`a29d55a`): common から **libloading/clap-sys/vst3 除去** (scan が抜けて利用者ゼロに)。
+  - **video_fx/scale は common 残留が正** (common::model が参照、scale は wire 型)。track_params
+    は未作成。
+- **S5 §10**: **core 完了** (`57e8353`): ClipContent `#[serde(untagged)]` → `#[serde(tag = "type")]`
+  + v29→v30 JSON 前処理 migration (全 variant 判別 + 空→Midi)、CURRENT_VERSION 30。**残**: legacy
+  field 8 個の in-memory 型からの除去 (前処理層吸収) + PluginSlot enum の migration 層化 +
+  migration の (version, fn) dispatch table 一本化 (ensure_ids を触る侵襲的作業なので慎重に)。
 - **S8**: `make check`/`make clippy`/`make build`/`make test` 全 green、headless script テスト
   (export/master fx/PDC)、`daw_gui --smoke-test`、旧バージョン project load 互換テスト、
   **実機 sign-off** (特に S4b/c の arrangement/piano_roll interactive: clip drag/resize/split/
