@@ -481,6 +481,30 @@ pub fn migrate_legacy_song(song: &mut serde_json::Value) {
     migrate_legacy_sidechain_to_aux(song);
     migrate_legacy_device_chains(song);
     migrate_legacy_clip_content(song);
+    migrate_flat_media_to_pools(song);
+}
+
+/// deserialize 前に旧 .daw のフラットな media source マップ (`audio_sources` / `video_sources` /
+/// `image_sources` を Song 直下) を nested `"media"` へ移す (§10 bullet 4 の MediaPools 化)。
+/// 既に `"media"` があれば新形式なので no-op。serde `flatten` が `HashMap<u32, _>` の整数キーを
+/// content-buffer 経由で復元できないため nested を採用したことに伴う後方互換移行。
+fn migrate_flat_media_to_pools(song: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(obj) = song.as_object_mut() else {
+        return;
+    };
+    if obj.contains_key("media") {
+        return;
+    }
+    let mut media = serde_json::Map::new();
+    for key in ["audio_sources", "video_sources", "image_sources"] {
+        if let Some(v) = obj.remove(key) {
+            media.insert(key.to_string(), v);
+        }
+    }
+    if !media.is_empty() {
+        obj.insert("media".to_string(), Value::Object(media));
+    }
 }
 
 /// (v30) `ClipContent` を untagged → tagged (`type` field) 化した際の後方互換移行。
@@ -1003,6 +1027,25 @@ mod tests {
         assert_eq!(devices[0]["plugin_id"].as_str().unwrap(), "synth");
     }
 
+    /// (§10 bullet 4) 旧 .daw のフラットな media source マップ (Song 直下) を nested `media` へ移行。
+    #[test]
+    fn migrate_flat_media_to_pools_moves_top_level_maps() {
+        let mut song = serde_json::json!({
+            "audio_sources": { "1": {} },
+            "video_sources": { "2": {} },
+            "tracks": []
+        });
+        migrate_flat_media_to_pools(&mut song);
+        assert!(song.get("audio_sources").is_none(), "フラットキーは media へ移動");
+        assert!(song.get("video_sources").is_none());
+        assert!(song["media"]["audio_sources"].get("1").is_some());
+        assert!(song["media"]["video_sources"].get("2").is_some());
+        // idempotent: 既に media があれば (新形式) no-op。
+        let before = song.clone();
+        migrate_flat_media_to_pools(&mut song);
+        assert_eq!(song, before, "media 済みは no-op");
+    }
+
     /// (v30 §10) untagged content JSON へ `migrate_clip_content_add_tag` が正しい `type` を
     /// 注入することを全 variant + 空 content で検証する (旧 untagged 判別規則の再現)。
     #[test]
@@ -1326,7 +1369,7 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].pitch, 60);
         // audio_sources defaults to empty for v6 files.
-        assert!(song.audio_sources.is_empty());
+        assert!(song.media.audio_sources.is_empty());
         assert!(song.next_audio_source_id >= 1);
     }
 

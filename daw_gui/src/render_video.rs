@@ -278,7 +278,7 @@ pub fn render_mp4_cancellable(
     // wgpu texture, then push a textured-quad per frame the image is
     // visible. The typical MV has < 10 images, each < 4 MB at 1080p,
     // so keeping all of them resident in GPU memory is fine.
-    for (image_source_id, source) in &cfg.song.image_sources {
+    for (image_source_id, source) in &cfg.song.media.image_sources {
         let abs = match &source.path {
             common::model::ImageSourcePath::Absolute(p) => p.clone(),
             common::model::ImageSourcePath::ProjectRelative(rel) => match cfg.project_dir {
@@ -684,7 +684,7 @@ fn resolve_video_source_path(
     video_source_id: VideoSourceId,
     project_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    let src = song.video_sources.get(&video_source_id)?;
+    let src = song.media.video_sources.get(&video_source_id)?;
     match &src.path {
         VideoSourcePath::Absolute(p) => Some(p.clone()),
         VideoSourcePath::ProjectRelative(rel) => project_dir.map(|d| d.join(rel)),
@@ -767,7 +767,7 @@ mod tests {
             ..Song::default()
         };
         let vsrc_id = song.alloc_video_source_id();
-        song.video_sources.insert(
+        song.media.video_sources.insert(
             vsrc_id,
             common::model::VideoSource {
                 path: common::model::VideoSourcePath::Absolute(src_mp4),

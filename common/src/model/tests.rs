@@ -1748,7 +1748,7 @@ fn v11_song_loads_forward_with_default_video_fields() {
             "length_beats": 64.0
         }"#;
     let song: Song = serde_json::from_str(v11_json).unwrap();
-    assert!(song.video_sources.is_empty());
+    assert!(song.media.video_sources.is_empty());
     assert_eq!(song.next_video_source_id, 0);
     assert_eq!(song.video_resolution, (1920, 1080));
     assert!((song.video_framerate - 30.0).abs() < f32::EPSILON);
@@ -1762,7 +1762,7 @@ fn video_track_with_clip_content_roundtrip() {
     // `Midi` / `Audio` / `Automation` variants.
     let mut song = Song::default();
     let vsrc_id = song.alloc_video_source_id();
-    song.video_sources.insert(
+    song.media.video_sources.insert(
         vsrc_id,
         VideoSource {
             path: VideoSourcePath::ProjectRelative("samples/clip.mp4".into()),
@@ -2060,7 +2060,7 @@ fn alloc_video_source_id_bumps_counter() {
 fn video_source_refcount_counts_events() {
     let mut song = Song::default();
     let vid = song.alloc_video_source_id();
-    song.video_sources.insert(
+    song.media.video_sources.insert(
         vid,
         VideoSource {
             path: VideoSourcePath::Absolute("/tmp/v.mp4".into()),
@@ -2106,7 +2106,7 @@ fn gc_video_sources_drops_orphans() {
     let mut song = Song::default();
     let live_id = song.alloc_video_source_id();
     let orphan_id = song.alloc_video_source_id();
-    song.video_sources.insert(
+    song.media.video_sources.insert(
         live_id,
         VideoSource {
             path: VideoSourcePath::Absolute("/tmp/live.mp4".into()),
@@ -2118,7 +2118,7 @@ fn gc_video_sources_drops_orphans() {
             audio_source_id: None,
         },
     );
-    song.video_sources.insert(
+    song.media.video_sources.insert(
         orphan_id,
         VideoSource {
             path: VideoSourcePath::Absolute("/tmp/orphan.mp4".into()),
@@ -2142,8 +2142,8 @@ fn gc_video_sources_drops_orphans() {
     );
 
     song.gc_video_sources();
-    assert!(song.video_sources.contains_key(&live_id));
-    assert!(!song.video_sources.contains_key(&orphan_id));
+    assert!(song.media.video_sources.contains_key(&live_id));
+    assert!(!song.media.video_sources.contains_key(&orphan_id));
 }
 
 // =========================================================================
@@ -2218,7 +2218,7 @@ fn alloc_image_source_id_bumps_counter() {
 fn image_source_refcount_counts_events_across_clips() {
     let mut song = Song::default();
     let img = song.alloc_image_source_id();
-    song.image_sources.insert(
+    song.media.image_sources.insert(
         img,
         ImageSource {
             path: ImageSourcePath::Absolute("/tmp/logo.png".into()),
@@ -2262,7 +2262,7 @@ fn gc_image_sources_drops_orphans() {
     let mut song = Song::default();
     let live_id = song.alloc_image_source_id();
     let orphan_id = song.alloc_image_source_id();
-    song.image_sources.insert(
+    song.media.image_sources.insert(
         live_id,
         ImageSource {
             path: ImageSourcePath::Absolute("/tmp/live.png".into()),
@@ -2272,7 +2272,7 @@ fn gc_image_sources_drops_orphans() {
             format: "Png".into(),
         },
     );
-    song.image_sources.insert(
+    song.media.image_sources.insert(
         orphan_id,
         ImageSource {
             path: ImageSourcePath::Absolute("/tmp/orphan.png".into()),
@@ -2294,8 +2294,8 @@ fn gc_image_sources_drops_orphans() {
     );
 
     song.gc_image_sources();
-    assert!(song.image_sources.contains_key(&live_id));
-    assert!(!song.image_sources.contains_key(&orphan_id));
+    assert!(song.media.image_sources.contains_key(&live_id));
+    assert!(!song.media.image_sources.contains_key(&orphan_id));
 }
 
 #[test]
@@ -2309,6 +2309,6 @@ fn v12_forward_migrates_image_fields_to_default() {
         "length_beats": 64.0,
     });
     let song: Song = serde_json::from_value(v12_song_json).unwrap();
-    assert!(song.image_sources.is_empty());
+    assert!(song.media.image_sources.is_empty());
     assert_eq!(song.next_image_source_id, 0);
 }

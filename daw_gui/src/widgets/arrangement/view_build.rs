@@ -195,7 +195,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                                 .and_then(|ev| {
                                     let handle =
                                         *app.ui_ephemeral.video_texture_cache.get(&ev.source_id)?;
-                                    let src = app.song_doc.song().video_sources.get(&ev.source_id)?;
+                                    let src = app.song_doc.song().media.video_sources.get(&ev.source_id)?;
                                     Some((handle, src.width, src.height))
                                 })
                                 .or_else(|| {
@@ -203,7 +203,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                                     let ev = events.first()?;
                                     let handle =
                                         *app.ui_ephemeral.image_texture_cache.get(&ev.source_id)?;
-                                    let src = app.song_doc.song().image_sources.get(&ev.source_id)?;
+                                    let src = app.song_doc.song().media.image_sources.get(&ev.source_id)?;
                                     Some((handle, src.width, src.height))
                                 })
                         },

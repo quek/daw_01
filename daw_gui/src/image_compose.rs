@@ -322,7 +322,7 @@ mod tests {
             ..Song::default()
         };
         let img_id = song.alloc_image_source_id();
-        song.image_sources.insert(
+        song.media.image_sources.insert(
             img_id,
             ImageSource {
                 path: ImageSourcePath::Absolute("/tmp/x.png".into()),

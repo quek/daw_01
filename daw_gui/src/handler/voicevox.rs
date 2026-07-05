@@ -507,7 +507,7 @@ impl AppData {
                     };
                     // build_mouth_events は rect を全画面 default で返すので、素材寸法から
                     // aspect-fit rect を計算して上書き (立ち絵の他の子レイヤーと収まりを揃える)。
-                    if let Some(src) = song.image_sources.get(&img) {
+                    if let Some(src) = song.media.image_sources.get(&img) {
                         let (x, y, w, h) = aspect_fit_pip_rect(res, (src.width, src.height));
                         ev.x = x;
                         ev.y = y;

@@ -313,7 +313,7 @@ fn plan_unsaved_cache_migration(
 ) -> Vec<(PathBuf, PathBuf)> {
     let dst_dir = project_dir.join(dst_subdir);
     let mut moves = Vec::new();
-    for source in song.audio_sources.values_mut() {
+    for source in song.media.audio_sources.values_mut() {
         let abs = match &source.path {
             AudioSourcePath::Absolute(p) => p.clone(),
             _ => continue,
@@ -482,7 +482,7 @@ mod tests {
         write_test_wav(&src, 8, 1, 48_000);
 
         let mut song = common::model::Song::default();
-        song.audio_sources
+        song.media.audio_sources
             .insert(1, mk_source(AudioSourcePath::Absolute(src.clone())));
 
         // plan: path だけ書き換え、 ファイルは cache に残る (I/O なし)。
@@ -492,7 +492,7 @@ mod tests {
         assert!(src.exists(), "plan must NOT move the file");
         assert!(
             matches!(
-                &song.audio_sources[&1].path,
+                &song.media.audio_sources[&1].path,
                 AudioSourcePath::ProjectRelative(p)
                     if p == &PathBuf::from("samples").join("foo.wav")
             ),

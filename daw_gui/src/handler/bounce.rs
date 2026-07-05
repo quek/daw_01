@@ -428,7 +428,7 @@ impl AppData {
         };
         let Some(new_source_id) = self.edit_song(move |song| {
             let new_source_id = song.alloc_audio_source_id();
-            song.audio_sources.insert(new_source_id, new_source);
+            song.media.audio_sources.insert(new_source_id, new_source);
             new_source_id
         }) else {
             return;

@@ -1496,7 +1496,7 @@ mod tests {
                 }],
             }),
         );
-        song.video_sources.insert(
+        song.media.video_sources.insert(
             video_source_id,
             VideoSource {
                 path: VideoSourcePath::Absolute("/dev/null".into()),
@@ -1862,7 +1862,7 @@ mod tests {
                 }],
             }),
         );
-        song.video_sources.insert(
+        song.media.video_sources.insert(
             2,
             VideoSource {
                 path: VideoSourcePath::Absolute("/dev/null2".into()),

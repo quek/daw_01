@@ -116,7 +116,7 @@ impl AppData {
 
             let Some(source_id) = self.edit_song(|song| {
                 let source_id = song.alloc_audio_source_id();
-                song.audio_sources.insert(source_id, imported.source);
+                song.media.audio_sources.insert(source_id, imported.source);
 
                 // v29: 新規 content の単一 event なので id=1 / allocator は 2 から。
                 let event = AudioEvent {
@@ -229,7 +229,7 @@ impl AppData {
                 Some(audio) => {
                     let Some(id) = self.edit_song(|song| {
                         let id = song.alloc_audio_source_id();
-                        song.audio_sources.insert(id, audio.source.clone());
+                        song.media.audio_sources.insert(id, audio.source.clone());
                         id
                     }) else {
                         return;
@@ -245,7 +245,7 @@ impl AppData {
             vs.audio_source_id = audio_source_id;
             let Some(video_source_id) = self.edit_song(|song| {
                 let id = song.alloc_video_source_id();
-                song.video_sources.insert(id, vs);
+                song.media.video_sources.insert(id, vs);
                 id
             }) else {
                 return;
@@ -445,8 +445,8 @@ impl AppData {
             // inserted so the staging matches.
             let Some((image_source_id, src_w, src_h)) = self.edit_song(|song| {
                 let image_source_id = song.alloc_image_source_id();
-                song.image_sources.insert(image_source_id, imported.source);
-                let src = &song.image_sources[&image_source_id];
+                song.media.image_sources.insert(image_source_id, imported.source);
+                let src = &song.media.image_sources[&image_source_id];
                 (image_source_id, src.width, src.height)
             }) else {
                 return;

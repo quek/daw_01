@@ -391,6 +391,28 @@ impl Section {
     }
 }
 
+/// Song の imported media source プール (audio / video / image)。§10 bullet 4 で Song の
+/// フラットな 3 マップをここへ集約した (god-struct 縮退)。nested `"media": {...}` として save / wire し、
+/// 旧 .daw のフラット形式 (`audio_sources` 等を Song 直下) は load 時の JSON 前処理
+/// `project::migrate_flat_media_to_pools` が `media` 下へ移す (save 互換)。nested を採用するのは
+/// serde `flatten` が `HashMap<u32, _>` の整数キーを復元できないため。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct MediaPools {
+    /// Pool of imported audio file references (WAV / generated)。key = `AudioSourceId`。
+    /// メタデータのみ (path / sample_rate / channels / frames)、decode 済みバッファは各
+    /// プロセスが path から独立に復号。refcount 0 は `gc_audio_sources` が save 前に GC。
+    #[serde(default)]
+    pub audio_sources: HashMap<AudioSourceId, AudioSource>,
+    /// Pool of imported video file references。key = `VideoSourceId`。メタデータのみ
+    /// (path / width / height / framerate / duration / codec)。refcount 0 は `gc_video_sources`。
+    #[serde(default)]
+    pub video_sources: HashMap<VideoSourceId, VideoSource>,
+    /// Pool of imported image file references (PNG / JPEG / WebP)。key = `ImageSourceId`。
+    /// メタデータのみ (path / width / height / format)。refcount 0 は `gc_image_sources`。
+    #[serde(default)]
+    pub image_sources: HashMap<ImageSourceId, ImageSource>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Song {
     pub bpm: f32,
@@ -442,15 +464,14 @@ pub struct Song {
     /// v19 files forward-migrate to a map backfilled from `Clip.name`.
     #[serde(default)]
     pub clip_content_names: HashMap<ContentId, String>,
-    /// Pool of imported audio file references (WAV / generated). Each
-    /// entry is keyed by `AudioSourceId` and shared by every
-    /// `AudioEvent.source_id` that points at it. Decoded sample buffers
-    /// are NOT stored here — only metadata (path / sample_rate / channels
-    /// / frames). The actual buffers are decoded independently in each
-    /// process (GUI / audio engine) from the path. Entries with refcount
-    /// == 0 are GC'd by `Song::gc_audio_sources` before save.
+    /// §10 bullet 4: imported media source プール (audio / video / image)。旧 .daw は
+    /// `audio_sources` / `video_sources` / `image_sources` を Song 直下にフラット保存していたが、
+    /// serde `flatten` は `HashMap<u32, _>` の整数キーを content-buffer 経由で復元できない
+    /// (`invalid type: string "1", expected u32`) ため nested `"media": {...}` として保存する。
+    /// 旧フラット形式は load 時の JSON 前処理 `project::migrate_flat_media_to_pools` が `media`
+    /// 下へ移す (= save 互換維持)。field access は `song.media.audio_sources` 等。
     #[serde(default)]
-    pub audio_sources: HashMap<AudioSourceId, AudioSource>,
+    pub media: MediaPools,
     /// Stable id allocator for `AudioSourceId`. `0` is the sentinel; valid
     /// allocations start at `1`.
     #[serde(default)]
@@ -484,15 +505,6 @@ pub struct Song {
     /// v10 file は `#[serde(default)]` で空 Vec で forward-migrate。
     #[serde(default)]
     pub scale_changes: Vec<ScaleChange>,
-    /// v12 (`docs/plan_video.md` §2.3): pool of imported video file
-    /// references, keyed by `VideoSourceId`. Decoded frames are NOT
-    /// stored here — only metadata (path / width / height / framerate /
-    /// duration / codec). Frames are decoded on demand by daw_gui's
-    /// video worker thread. Entries with refcount == 0 are GC'd by
-    /// `Song::gc_video_sources` before save. v11 file forward-migrates
-    /// to an empty map.
-    #[serde(default)]
-    pub video_sources: HashMap<VideoSourceId, VideoSource>,
     /// v12: stable id allocator for `VideoSourceId`. `0` is the
     /// sentinel; valid allocations start at `1`. v11 file forward-
     /// migrates to `0`, then `ensure_video_source_ids` lifts it.
@@ -510,16 +522,6 @@ pub struct Song {
     /// forward-migrates to `30.0`.
     #[serde(default = "default_video_framerate")]
     pub video_framerate: f32,
-    /// v13 (`docs/plan_image_overlay.md` §2.3): pool of imported image
-    /// file references (PNG / JPEG / WebP / static), keyed by
-    /// `ImageSourceId`. Decoded BGRA8 bytes are NOT stored here — only
-    /// metadata (path / width / height / format). The bytes are
-    /// decoded once at import time and uploaded to a GPU
-    /// `TextureHandle` cached by `PreviewWindowState`. Entries with
-    /// refcount == 0 are GC'd by `Song::gc_image_sources` before save.
-    /// v12 file forward-migrates to an empty map.
-    #[serde(default)]
-    pub image_sources: HashMap<ImageSourceId, ImageSource>,
     /// v13: stable id allocator for `ImageSourceId`. `0` is the
     /// sentinel; valid allocations start at `1`. v12 file forward-
     /// migrates to `0`, then `ensure_image_source_ids` lifts it.
@@ -586,17 +588,15 @@ impl Default for Song {
             clip_contents: HashMap::new(),
             next_content_id: 1,
             clip_content_names: HashMap::new(),
-            audio_sources: HashMap::new(),
+            media: MediaPools::default(),
             next_audio_source_id: 1,
             song_lanes: Vec::new(),
             next_song_lane_id: 1,
             midi_bindings: Vec::new(),
             scale_changes: Vec::new(),
-            video_sources: HashMap::new(),
             next_video_source_id: 1,
             video_resolution: default_video_resolution(),
             video_framerate: default_video_framerate(),
-            image_sources: HashMap::new(),
             next_image_source_id: 1,
             master_fx_chain: Vec::new(),
             project_id: 0,
@@ -2278,7 +2278,7 @@ impl Song {
             .flatten()
             .map(|ev| ev.source_id)
             .collect();
-        self.audio_sources.retain(|id, _| live.contains(id));
+        self.media.audio_sources.retain(|id, _| live.contains(id));
     }
 
     /// Re-assign fresh `AudioSourceId` to any source whose id is the
@@ -2287,7 +2287,7 @@ impl Song {
     /// Mirrors `ensure_clip_contents` semantics.
     pub fn ensure_audio_source_ids(&mut self) {
         let mut max_seen: AudioSourceId = 0;
-        for id in self.audio_sources.keys() {
+        for id in self.media.audio_sources.keys() {
             if *id != 0 {
                 max_seen = max_seen.max(*id);
             }
@@ -2303,9 +2303,9 @@ impl Song {
         // (= "missing source") which is the correct UX for unresolved
         // imports. Callers that mint a fresh AudioSource should always
         // go through `alloc_audio_source_id` and avoid sentinel 0.
-        if let Some(orphan) = self.audio_sources.remove(&0) {
+        if let Some(orphan) = self.media.audio_sources.remove(&0) {
             let new_id = self.alloc_audio_source_id();
-            self.audio_sources.insert(new_id, orphan);
+            self.media.audio_sources.insert(new_id, orphan);
         }
     }
 
@@ -2356,7 +2356,7 @@ impl Song {
             .flatten()
             .map(|ev| ev.source_id)
             .collect();
-        self.video_sources.retain(|id, _| live.contains(id));
+        self.media.video_sources.retain(|id, _| live.contains(id));
     }
 
     /// v12: re-assign fresh `VideoSourceId` to any source whose id is
@@ -2367,7 +2367,7 @@ impl Song {
     /// happen in practice, but the invariant is cheap to enforce).
     pub fn ensure_video_source_ids(&mut self) {
         let mut max_seen: VideoSourceId = 0;
-        for id in self.video_sources.keys() {
+        for id in self.media.video_sources.keys() {
             if *id != 0 {
                 max_seen = max_seen.max(*id);
             }
@@ -2378,9 +2378,9 @@ impl Song {
         if self.next_video_source_id == 0 {
             self.next_video_source_id = 1;
         }
-        if let Some(orphan) = self.video_sources.remove(&0) {
+        if let Some(orphan) = self.media.video_sources.remove(&0) {
             let new_id = self.alloc_video_source_id();
-            self.video_sources.insert(new_id, orphan);
+            self.media.video_sources.insert(new_id, orphan);
         }
     }
 
@@ -2429,7 +2429,7 @@ impl Song {
             .flatten()
             .map(|ev| ev.source_id)
             .collect();
-        self.image_sources.retain(|id, _| live.contains(id));
+        self.media.image_sources.retain(|id, _| live.contains(id));
     }
 
     /// v13: re-assign fresh `ImageSourceId` to any source whose id is
@@ -2437,7 +2437,7 @@ impl Song {
     /// highest seen. Mirrors `ensure_video_source_ids` semantics.
     pub fn ensure_image_source_ids(&mut self) {
         let mut max_seen: ImageSourceId = 0;
-        for id in self.image_sources.keys() {
+        for id in self.media.image_sources.keys() {
             if *id != 0 {
                 max_seen = max_seen.max(*id);
             }
@@ -2448,9 +2448,9 @@ impl Song {
         if self.next_image_source_id == 0 {
             self.next_image_source_id = 1;
         }
-        if let Some(orphan) = self.image_sources.remove(&0) {
+        if let Some(orphan) = self.media.image_sources.remove(&0) {
             let new_id = self.alloc_image_source_id();
-            self.image_sources.insert(new_id, orphan);
+            self.media.image_sources.insert(new_id, orphan);
         }
     }
 }

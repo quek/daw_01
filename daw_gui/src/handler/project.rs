@@ -207,7 +207,7 @@ impl AppData {
 
         // 未 cache の audio source だけ work-list に (idempotent)。
         let mut audio_jobs: Vec<(common::model::AudioSourceId, PathBuf)> = Vec::new();
-        for (&source_id, source) in &self.song_doc.song().audio_sources {
+        for (&source_id, source) in &self.song_doc.song().media.audio_sources {
             if self.media.audio_source_cache.contains(source_id) {
                 continue;
             }
@@ -224,7 +224,7 @@ impl AppData {
         }
         // 未 staging の image source。
         let mut image_jobs: Vec<(common::model::ImageSourceId, PathBuf)> = Vec::new();
-        for (&source_id, source) in &self.song_doc.song().image_sources {
+        for (&source_id, source) in &self.song_doc.song().media.image_sources {
             if self.media.image_source_bgra.contains_key(&source_id) {
                 continue;
             }

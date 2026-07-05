@@ -80,7 +80,7 @@ impl AppData {
         // ---- trim (= 再生範囲を変える) ----
         // Snapshot の per-source metadata (event ごとに lookup できるよう
         // immutable borrow を先に切る)。
-        let audio_sources = self.song_doc.song().audio_sources.clone();
+        let audio_sources = self.song_doc.song().media.audio_sources.clone();
         self.edit_song(|song| {
             if let Some(ClipContent::Audio(audio)) = song.clip_contents.get_mut(&content_id) {
                 for event in &mut audio.events {

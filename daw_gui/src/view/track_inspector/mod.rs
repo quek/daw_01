@@ -2386,7 +2386,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // ラベル文字列を別 Vec へ再 clone せず、 ソート後そのまま labels へ move する。
             let mut images: Vec<(common::model::ImageSourceId, String)> = app
                 .song_doc.song()
-                .image_sources
+                .media.image_sources
                 .iter()
                 .map(|(id, src)| (*id, image_source_label(src)))
                 .collect();

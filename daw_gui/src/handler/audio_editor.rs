@@ -218,7 +218,7 @@ impl AppData {
             let Some(event) = audio.events.get(event_idx) else {
                 return;
             };
-            let Some(audio_source) = self.song_doc.song().audio_sources.get(&event.source_id) else {
+            let Some(audio_source) = self.song_doc.song().media.audio_sources.get(&event.source_id) else {
                 return;
             };
             (audio_source.sample_rate as f64, audio_source.frames)
@@ -328,7 +328,7 @@ impl AppData {
 
         let Some(source_id) = self.edit_song(|song| {
             let source_id = song.alloc_audio_source_id();
-            song.audio_sources.insert(source_id, imported.source);
+            song.media.audio_sources.insert(source_id, imported.source);
             source_id
         }) else {
             return;

@@ -229,7 +229,7 @@ pub fn compile_audio_schedule(
     // 範囲は beat のまま、 nominal_bpm = song.bpm を per-event に控える。
 
     // -- Resolve every AudioSource into a decoded buffer ----------------------
-    for (&id, source) in &song.audio_sources {
+    for (&id, source) in &song.media.audio_sources {
         // (A) reuse an already-decoded buffer from the live renderer. Source ids
         //     are stable and never recycled, so a matching id is the same file —
         //     no re-decode needed (r.md #7 decode 再設計 A)。
@@ -374,7 +374,7 @@ pub fn compile_audio_schedule(
 /// decoded yet? `true` ⇒ the background decode worker must run a full compile to
 /// fill them in. `Generated` sources are excluded (never decoded here).
 pub fn has_undecoded_sources(song: &Song, renderer: &AudioClipRenderer) -> bool {
-    song.audio_sources.iter().any(|(id, source)| {
+    song.media.audio_sources.iter().any(|(id, source)| {
         !matches!(source.path, AudioSourcePath::Generated { .. })
             && !renderer.sources.contains_key(id)
     })

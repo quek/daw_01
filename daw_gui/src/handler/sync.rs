@@ -230,7 +230,7 @@ impl AppData {
                     continue;
                 };
                 for event in &audio.events {
-                    let Some(source) = self.song_doc.song().audio_sources.get(&event.source_id) else {
+                    let Some(source) = self.song_doc.song().media.audio_sources.get(&event.source_id) else {
                         continue;
                     };
                     if matches!(source.path, AudioSourcePath::Generated { .. })
@@ -324,7 +324,7 @@ impl AppData {
                 continue;
             };
             for (event_index, event) in audio.events.iter().enumerate() {
-                let Some(source) = self.song_doc.song().audio_sources.get(&event.source_id) else {
+                let Some(source) = self.song_doc.song().media.audio_sources.get(&event.source_id) else {
                     continue;
                 };
                 let abs = match &source.path {

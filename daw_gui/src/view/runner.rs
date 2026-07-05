@@ -1469,7 +1469,7 @@ impl Runner {
             let dims = state
                 .app
                 .song_doc.song()
-                .image_sources
+                .media.image_sources
                 .get(&frame_info.image_source_id)
                 .map(|s| (s.width, s.height))
                 .unwrap_or((0, 0));
@@ -1726,7 +1726,7 @@ fn resolve_video_path(
     video_source_id: common::model::VideoSourceId,
     project_dir: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
-    let src = song.video_sources.get(&video_source_id)?;
+    let src = song.media.video_sources.get(&video_source_id)?;
     match &src.path {
         common::model::VideoSourcePath::Absolute(p) => Some(p.clone()),
         common::model::VideoSourcePath::ProjectRelative(rel) => {

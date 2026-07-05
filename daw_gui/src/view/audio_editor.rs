@@ -1014,7 +1014,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .and_then(|i| audio.events.get(i))
         .or(audio.events.first());
     if let Some(footer_event) = footer_event
-        && let Some(audio_source) = app.song_doc.song().audio_sources.get(&footer_event.source_id)
+        && let Some(audio_source) = app.song_doc.song().media.audio_sources.get(&footer_event.source_id)
     {
         let meta = format!(
             "{}  {} Hz · {} ch · {} frames  ({} events)",
