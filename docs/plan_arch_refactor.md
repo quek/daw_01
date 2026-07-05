@@ -40,8 +40,8 @@ branch = `feature/arch-refactor`。各段の green を WIP commit でチェッ�
 - S6 DESIGN.md 現行化、S7 ワークフロー (CLAUDE.md 不変条件 + make arch-lint + guards 7 則 +
   /arch-review skill + implement/review skill 更新)
 
-**最新 green checkpoint**: commit `a29d55a` (S5-3/S5-4 = plugin scan → plugin_host、common から
-libloading/clap-sys/vst3 除去。**§9 完了**)。
+**最新 green checkpoint**: commit `bb0c39d` (model.rs god-file 分割 = 7,488→2,771 行、invariant #9 を
+model.rs について解消。§10 dispatch table + class fix + §11 arch-lint 精密化も landed)。
 
 **残タスク (逐次、各段 green を WIP commit)**:
 - **S5 §9 (full rework) 完了** — common は plugin-load / HTTP 系依存ゼロ (reqwest/libloading/
@@ -56,10 +56,25 @@ libloading/clap-sys/vst3 除去。**§9 完了**)。
   - S5-4 (`a29d55a`): common から **libloading/clap-sys/vst3 除去** (scan が抜けて利用者ゼロに)。
   - **video_fx/scale は common 残留が正** (common::model が参照、scale は wire 型)。track_params
     は未作成。
-- **S5 §10**: **core 完了** (`57e8353`): ClipContent `#[serde(untagged)]` → `#[serde(tag = "type")]`
-  + v29→v30 JSON 前処理 migration (全 variant 判別 + 空→Midi)、CURRENT_VERSION 30。**残**: legacy
-  field 8 個の in-memory 型からの除去 (前処理層吸収) + PluginSlot enum の migration 層化 +
-  migration の (version, fn) dispatch table 一本化 (ensure_ids を触る侵襲的作業なので慎重に)。
+- **S5 §10**: bullet 1/3 + class fix 完了。
+  - bullet 1 tag 化 (`57e8353`): ClipContent `#[serde(untagged)]` → `#[serde(tag = "type")]` +
+    v29→v30 JSON 前処理 migration (全 variant 判別 + 空→Midi)、CURRENT_VERSION 30。
+  - class fix (`830c3e6`): untagged song JSON を直 deserialize する全経路 (script appLoadSongJson /
+    loadSongFromObject / export_bench example) に `tag_clip_contents_in_song` を適用。
+  - bullet 3 dispatch table (`e1bb6b0`): version-gate 分岐を `VALUE_MIGRATIONS`/`SONG_MIGRATIONS` の
+    `(introduced_in, fn)` 表へ一本化 (`Migration<T>` alias)。legacy 前処理を足す受け皿にもなる。
+  - **残 bullet 2**: legacy field 8 個の in-memory 型除去。調査で判明 = device flatten / slot→index /
+    aux / id 割当が `ensure_ids` 内で**相互依存**する all-or-nothing の migration+id パイプライン書き
+    換え (~200 行 + 既存 ~20 テストを load_project 経路へ) で、runtime 挙動ゼロ変化・旧 project 全
+    load が blast radius。単独の慎重なタスク (fixture 網は既存テストで概ね揃っている)。
+  - **残 bullet 4**: Song sub-struct 化 (MediaPools/IdAllocators)。wire/save 互換影響大、最終段。
+- **invariant #9 (god-file budget) — model.rs 解消** (`eefdea1`+`bb0c39d`): 7,488→2,771 行。tests →
+  model/tests.rs、型群 → model/{track,modulation,content,automation}.rs。`pub use *::*` re-export で
+  consumer 無改変、`use super::*` で sibling 参照、WIRE_SOURCES に 4 ファイル登録 (invariant #7)。
+  pure code movement (挙動・serialize 不変)。**残 ui.rs (4,077 行)** は ui crate の別タスク。
+- **§11 arch-lint 精密化** (`528b32c`): grep がコメント言及を違反に誤カウントする false positive を
+  共通 `strip_comments` ヘルパ + untagged anchor で class ごと修正 (untagged baseline 0、check 3/5 も
+  予防)。§10 (untagged 撤去)・S4 (ui-domain 撤去) の達成が checker に正しく反映されるように。
 - **S8**: `make check`/`make clippy`/`make build`/`make test` 全 green、headless script テスト
   (export/master fx/PDC)、`daw_gui --smoke-test`、旧バージョン project load 互換テスト、
   **実機 sign-off** (特に S4b/c の arrangement/piano_roll interactive: clip drag/resize/split/
