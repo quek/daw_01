@@ -4,7 +4,7 @@
 プロセス間同期) で確定した構造問題を、一括で最終形へ改修する。個別の発見と証拠 (file:line)
 はチャットレポート参照。本書は **確定した設計判断の SSoT**。
 
-## 進捗と再開ポイント (2026-07-04 更新)
+## 進捗と再開ポイント (2026-07-05 更新)
 
 branch = `feature/arch-refactor`。各段の green を WIP commit でチェックポイント化している
 (未 sign-off なので main 未統合。最終統合は S8 の実機検証後)。
@@ -28,14 +28,22 @@ branch = `feature/arch-refactor`。各段の green を WIP commit でチェッ�
   レイアウト二重同期 (grid_rect 定数再計算) を単一 SSoT (view_build の PrContent.grid) に、
   piano_roll_view.rs 878 行を widget へ吸収削除、5 モジュール ≤3000 分割、テスト AppData-driven 化
   (pr_widget 13)。track_inspector.rs 3640→mod.rs 2769 + modulation_rack.rs 890 に分割 (`e57aea4`)
+- S4d (§8,7.5) — renderer を Color 型+演算のみに縮退 (意味色トークン退去: 汎用 chrome/meter/
+  waveform/curve/selection→ui-core theme / DAW 固有 playhead/record/solo/clip/ghost→daw_gui theme、
+  全 42 参照を crate::theme へ repoint、Scene は renderer 自己完結の DEFAULT_CLEAR)、FontSystem
+  二重ロード解消 (UiHost::frame_with_fonts で renderer 所有 FS を注入 = runner 使用、従来の
+  frame/frame_to_edits は lazy 所有 FS で不変、TextMetrics 非所有化 + scratch lazy)、snap/time を
+  common・time_grid/ruler_ops を daw_gui へ移設 (time_ruler/bar_beat_grid は daw_gui 拡張トレイト
+  TimeGridExt 化 = 描画本体無改変)、split_into_morae を common::voicevox 一本化、旧 gui_01
+  ui/Makefile 撤去 (`3a6576a`)。※別セッションが中断放置した S4d-5 half-done (ui-core の
+  dangling mod / orphan `impl Ui` / heavy delegate = HEAD 破損) を修復し完走した経緯あり。
 - S6 DESIGN.md 現行化、S7 ワークフロー (CLAUDE.md 不変条件 + make arch-lint + guards 7 則 +
   /arch-review skill + implement/review skill 更新)
 
-**最新 green checkpoint**: commit `e57aea4` (S4c 完了 = piano_roll 移設 + track_inspector 分割)。
+**最新 green checkpoint**: commit `3a6576a` (S4d 完了 = renderer 色退去 + FontSystem 単一化 +
+snap/time common 移設 + time widget → daw_gui + morae 統合)。
 
 **残タスク (逐次、各段 green を WIP commit)**:
-- **S4d**: renderer の意味色 (SOLO/PLAYHEAD/RECORD/CLIP_DEFAULT) を ui-core/daw_gui theme へ、
-  FontSystem 二重ロード解消、`snap.rs`/`time.rs`/`split_into_morae` を common へ (S5 と調整)。
 - **S5** (§9,10): common 縮退 (video_fx/app_config/window_state/recent/scale/voicevox_engine →
   daw_gui、voicevox/voicevox_cache → plugin_host、scan → plugin_host + RescanPlugins IPC、
   reqwest を common から除去)。ClipContent の untagged → tag 化 + JSON 前処理 migration
