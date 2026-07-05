@@ -546,7 +546,8 @@ fn migrate_flat_ids_to_allocators(song: &mut serde_json::Value) {
 /// deserialize の前に旧 untagged 判別規則で `type` を注入する。判別順は旧
 /// `#[serde(untagged)]` + `deny_unknown_fields` と同じ:
 /// `notes` → Midi / `points` → Automation / `events[0]` の
-/// `source_start_micros` → Video / `opacity` → Image / `text` → Text / それ以外 → Audio。
+/// `source_start_micros` → Video / `text` → Text / `opacity` → Image / それ以外 → Audio
+/// (TextEvent も `opacity` を持つので text を opacity より先に判定する)。
 /// 空 content (`{}`、旧 untagged では先頭 variant に落ちていた) は Midi。`type` を既に持つ
 /// content は no-op (idempotent)。content は `song.clip_contents` (content_id → content の map)。
 pub fn tag_clip_contents_in_song(song: &mut serde_json::Value) {
@@ -573,12 +574,16 @@ pub fn tag_clip_contents_in_song(song: &mut serde_json::Value) {
             .and_then(|a| a.first())
             .and_then(serde_json::Value::as_object)
         {
+            // 判定順が重要: TextEvent は `opacity` を **持つ** (テキストオーバーレイの不透明度)
+            // ので、`text` (TextEvent 固有) を `opacity` (Image/Text 共有) より先に見る。
+            // 旧 untagged + deny_unknown_fields の exact-match と同じ結果になるよう:
+            // source_start_micros(Video 固有) → text(Text 固有) → opacity(Text 除外後は Image) → Audio。
             if ev0.contains_key("source_start_micros") {
                 "Video"
-            } else if ev0.contains_key("opacity") {
-                "Image"
             } else if ev0.contains_key("text") {
                 "Text"
+            } else if ev0.contains_key("opacity") {
+                "Image"
             } else {
                 "Audio"
             }
@@ -1109,6 +1114,10 @@ mod tests {
             ("Video", serde_json::json!({ "events": [{ "source_start_micros": 0 }] })),
             ("Image", serde_json::json!({ "events": [{ "opacity": 1.0 }] })),
             ("Text", serde_json::json!({ "events": [{ "text": "hi" }] })),
+            // 回帰 (実機 v28 project): TextEvent は `opacity` を持つ (テキストオーバーレイの
+            // 不透明度)。text を opacity より先に判定しないと Image 誤判定 → ImageEvent の
+            // source_id 欠落で load 失敗 (`missing field source_id`)。
+            ("Text", serde_json::json!({ "events": [{ "text": "hi", "opacity": 0.8 }] })),
             // 空 content は旧 untagged で先頭 variant (Midi) に落ちていた。
             ("Midi", serde_json::json!({})),
         ];
