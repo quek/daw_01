@@ -172,7 +172,7 @@ use crate::scale::ScaleChange;
 /// `TrackBuiltinParam::SendGain` は `send_idx` → `send_id` に移行 — 旧 file の
 /// positional 値は deserialize 専用 legacy field に載り、`Song::ensure_ids` が
 /// id へ写像する。v28 以前の `.daw` はすべて load 可能。
-pub const CURRENT_VERSION: u32 = 29;
+pub const CURRENT_VERSION: u32 = 30;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -3823,7 +3823,12 @@ pub struct Clip {
 /// is unambiguous. bincode (used over IPC) ignores the serde-untagged
 /// attribute and encodes the variant index as usual.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
-#[serde(untagged)]
+// v30 (arch-refactor §10): 明示 `type` タグで variant を判別する (旧 `#[serde(untagged)]` は
+// content 型数の 2 乗で silent-misparse リスクがあり、空 content が `{}` で型消失していた)。
+// 旧 untagged ファイル (v<30) は `project.rs` の `migrate_clip_content_add_tag` が load 時に
+// `type` を注入して変換する。bincode (IPC) は serde tag を無視し variant index を使うので
+// wire 互換は不変。
+#[serde(tag = "type")]
 pub enum ClipContent {
     Midi(MidiContent),
     Audio(AudioContent),
@@ -4096,7 +4101,6 @@ impl ClipContent {
 /// to disambiguate variants. With `deny_unknown_fields`, only the
 /// matching variant succeeds.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
 pub struct MidiContent {
     /// Notes are in arbitrary order — readers that care about time
     /// order must sort by `Note::start_beat`.
@@ -4123,7 +4127,6 @@ impl MidiContent {
 /// defined by each event's `event_start_in_clip_beats` /
 /// `event_length_beats`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
 pub struct AudioContent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<AudioEvent>,
@@ -4358,7 +4361,6 @@ pub struct BeatMarker {
 /// disambiguation, but denying unknowns here prevents a future field
 /// addition from accidentally widening the match.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
 pub struct VideoContent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<VideoEvent>,
@@ -4478,7 +4480,6 @@ pub enum ImageSourcePath {
 /// `AudioEvent` and `VideoEvent`. Denying unknowns prevents a future
 /// field addition from widening the match unexpectedly.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
 pub struct ImageContent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<ImageEvent>,
@@ -4632,7 +4633,6 @@ impl MouthMap {
 /// dispatch のため必須。 `TextEvent.text` 等の disjoint required field で
 /// Audio / Video / Image / Automation / MIDI と判別される。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
 pub struct TextContent {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<TextEvent>,
@@ -5002,7 +5002,6 @@ pub enum RecordingMode {
 /// `AutomationClip`s with the same `content_id` share the curve
 /// (linked-clip pattern, mirroring MIDI clips).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
 pub struct AutomationContent {
     /// Sorted by `AutomationPoint::time_beat` ascending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -6243,7 +6242,8 @@ mod tests {
         // point の要素 id を追加し、`PluginParam.device_index` → `device_id`、
         // `SendGain.send_idx` → `send_id` へ移行。旧 positional 値は
         // deserialize 専用 legacy field 経由で `ensure_ids` が id へ写像する。
-        assert_eq!(CURRENT_VERSION, 29);
+        // v30 (§10): ClipContent を untagged → tagged (`type` field) 化。
+        assert_eq!(CURRENT_VERSION, 30);
     }
 
     #[test]
@@ -7023,14 +7023,11 @@ mod tests {
     }
 
     #[test]
-    fn untagged_dispatch_disambiguates_audio_vs_video_events() {
-        // Regression test: `ClipContent::Audio` and `ClipContent::Video`
-        // both serialize their inner list under `"events"`, so the
-        // untagged dispatch falls back to inner-struct required-field
-        // presence. AudioEvent requires `source_start_frames`,
-        // VideoEvent requires `source_start_micros`; a JSON shaped for
-        // one variant must NOT silently match the other.
+    fn tagged_clip_content_round_trips_audio_and_video() {
+        // (v30 §10) tagged `ClipContent`: `"type"` タグで Audio / Video を明示判別する
+        // (旧 `#[serde(untagged)]` + events の required-field 依存は撤去済)。
         let audio_json = r#"{
+            "type": "Audio",
             "events": [{
                 "source_id": 1,
                 "event_start_in_clip_beats": 0.0,
@@ -7051,6 +7048,7 @@ mod tests {
             }]
         }"#;
         let video_json = r#"{
+            "type": "Video",
             "events": [{
                 "source_id": 1,
                 "event_start_in_clip_beats": 0.0,
@@ -7326,13 +7324,11 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn clipcontent_untagged_image_dispatches_via_opacity_field() {
-        // The disambiguator for the new Image variant is the required
-        // `opacity` field on `ImageEvent`. Audio / Video JSON shaped
-        // without `opacity` must NOT silently match Image, and Image
-        // JSON shaped with `opacity` must NOT match Audio / Video
-        // (deny_unknown_fields on Content structs ensures the latter).
+    fn tagged_clip_content_round_trips_image() {
+        // (v30 §10) tagged `ClipContent`: `"type": "Image"` で Image variant を明示判別する
+        // (旧 untagged の opacity 依存 dispatch は撤去済)。
         let image_json = r#"{
+            "type": "Image",
             "events": [{
                 "source_id": 1,
                 "event_start_in_clip_beats": 0.0,

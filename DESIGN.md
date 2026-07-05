@@ -198,7 +198,7 @@ Song ─ tracks: Vec<Track> ─ devices: Vec<PluginInstance>   (id: u64 安定)
 
 - **Clip ベースのタイムライン** (Pattern 不採用): VOICEVOX のアウフタクト・フレーズ
   単位合成と自然にマップする。`start_beat` は f64・負値可。
-- 永続化: `.daw` JSON (serde) アトミック書き込み、`CURRENT_VERSION` = 29。
+- 永続化: `.daw` JSON (serde) アトミック書き込み、`CURRENT_VERSION` = 30。
   旧版は deserialize 専用 legacy field + `ensure_ids` (採番 + positional → id 写像) +
   JSON 前処理 migration で forward-load する。blob (plugin state / ARA archive) は
   ドキュメントには base64 で残る (wire にだけ載らない)。

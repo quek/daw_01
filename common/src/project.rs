@@ -33,6 +33,11 @@ const SUBTITLE_DEVICE_VERSION: u32 = 26;
 /// `migrate_per_event_mute_to_clip_mute` はこのバージョン未満の保存ファイルにだけ適用する。
 const CLIP_MUTE_VERSION: u32 = 27;
 
+/// v30 (§10) で `ClipContent` を `#[serde(untagged)]` から tagged (`type` field) 化した。
+/// この版未満のファイルは content を untagged (flat `{"notes":[...]}` 等) で保存しているので、
+/// `migrate_clip_content_add_tag` で `type` を注入してから deserialize する。
+const CLIP_CONTENT_TAG_VERSION: u32 = 30;
+
 /// Save without GUI view state (legacy callers / tests / headless `--script`).
 /// Delegates to `save_project` with `view = None`.
 pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
@@ -142,6 +147,56 @@ fn migrate_vocal_source_to_clips(value: &mut serde_json::Value) {
     }
 }
 
+/// (v30) `ClipContent` を untagged → tagged (`type` field) 化した際の後方互換移行。
+/// v<30 のファイルは content を untagged (flat) で保存しているので、`#[serde(tag = "type")]`
+/// deserialize の前に旧 untagged 判別規則で `type` を注入する。判別順は旧
+/// `#[serde(untagged)]` + `deny_unknown_fields` と同じ:
+/// `notes` → Midi / `points` → Automation / `events[0]` の
+/// `source_start_micros` → Video / `opacity` → Image / `text` → Text / それ以外 → Audio。
+/// 空 content (`{}`、旧 untagged では先頭 variant に落ちていた) は Midi。`type` を既に持つ
+/// content は no-op (idempotent)。content は `song.clip_contents` (content_id → content の map)。
+fn migrate_clip_content_add_tag(value: &mut serde_json::Value) {
+    let Some(contents) = value
+        .get_mut("song")
+        .and_then(|s| s.get_mut("clip_contents"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for content in contents.values_mut() {
+        let Some(obj) = content.as_object_mut() else {
+            continue;
+        };
+        if obj.contains_key("type") {
+            continue; // 既に tagged
+        }
+        let ty = if obj.contains_key("notes") {
+            "Midi"
+        } else if obj.contains_key("points") {
+            "Automation"
+        } else if let Some(ev0) = obj
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(serde_json::Value::as_object)
+        {
+            if ev0.contains_key("source_start_micros") {
+                "Video"
+            } else if ev0.contains_key("opacity") {
+                "Image"
+            } else if ev0.contains_key("text") {
+                "Text"
+            } else {
+                "Audio"
+            }
+        } else {
+            // events 無し or 空 content → 旧 untagged では先頭 variant (Midi) に落ちた。
+            "Midi"
+        };
+        obj.insert("type".to_string(), serde_json::Value::String(ty.to_string()));
+    }
+}
+
 /// (v26) device-gated text overlay 移行 (`docs/plan_voicevox_talk.md` §6)。
 /// v25 以前は `ClipContent::Text` がトラック非依存で常時 overlay 表示されていた。
 /// v26 で `builtin.video.subtitle` device が表示ゲートになったため、旧プロジェクトの
@@ -248,6 +303,15 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     let mut value: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse project JSON from {}", path.display()))?;
     migrate_vocal_source_to_clips(&mut value);
+    // (v30) ClipContent untagged → tagged。旧 untagged ファイルに `type` を注入してから
+    // deserialize する (tagged deserialize は `type` が無いと失敗するため from_value の前)。
+    let file_version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if file_version < u64::from(CLIP_CONTENT_TAG_VERSION) {
+        migrate_clip_content_add_tag(&mut value);
+    }
     let project: ProjectFile = serde_json::from_value(value)
         .with_context(|| format!("failed to deserialize project from {}", path.display()))?;
     if project.version > CURRENT_VERSION {
@@ -461,6 +525,49 @@ mod tests {
         migrate_per_event_mute_to_clip_mute(&mut song);
         assert!(!song.tracks[0].clips[0].muted);
     }
+
+    /// (v30 §10) untagged content JSON へ `migrate_clip_content_add_tag` が正しい `type` を
+    /// 注入することを全 variant + 空 content で検証する (旧 untagged 判別規則の再現)。
+    #[test]
+    fn migrate_clip_content_add_tag_disambiguates_all_variants() {
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("Midi", serde_json::json!({ "notes": [] })),
+            ("Automation", serde_json::json!({ "points": [] })),
+            ("Audio", serde_json::json!({ "events": [{ "source_start_frames": 0 }] })),
+            ("Video", serde_json::json!({ "events": [{ "source_start_micros": 0 }] })),
+            ("Image", serde_json::json!({ "events": [{ "opacity": 1.0 }] })),
+            ("Text", serde_json::json!({ "events": [{ "text": "hi" }] })),
+            // 空 content は旧 untagged で先頭 variant (Midi) に落ちていた。
+            ("Midi", serde_json::json!({})),
+        ];
+        for (expected, content) in cases {
+            let mut proj = serde_json::json!({
+                "version": 29,
+                "song": { "clip_contents": { "1": content } }
+            });
+            migrate_clip_content_add_tag(&mut proj);
+            assert_eq!(
+                proj["song"]["clip_contents"]["1"]["type"].as_str(),
+                Some(*expected),
+                "content {content:?} は type={expected} に判別される"
+            );
+        }
+    }
+
+    /// (v30 §10) idempotent: 既に `type` を持つ tagged content は上書きしない。
+    #[test]
+    fn migrate_clip_content_add_tag_is_idempotent() {
+        let mut proj = serde_json::json!({
+            "version": 30,
+            "song": { "clip_contents": { "1": { "type": "Audio", "events": [] } } }
+        });
+        migrate_clip_content_add_tag(&mut proj);
+        assert_eq!(proj["song"]["clip_contents"]["1"]["type"].as_str(), Some("Audio"));
+    }
+
+    // 注: untagged → tagged の実 load 経路 (migration → from_value) は既存の
+    // `load_v6_clip_content_struct_form_deserializes_as_midi_variant` が既にカバーする
+    // (v6 < CLIP_CONTENT_TAG_VERSION なので同 migration を通り、flat `{notes}` が Midi に載る)。
 
     #[test]
     fn migrate_v25_text_overlay_adds_subtitle_device() {
