@@ -580,8 +580,13 @@ fn daw_load_song_from_object(
         .ok_or_else(|| JsNativeError::error().with_message("JSON.stringify returned non-string"))?
         .to_std_string_escaped();
 
-    let mut song: Song = serde_json::from_str(&json_str).map_err(|e| {
+    let mut value: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
         JsError::from_native(JsNativeError::error().with_message(format!("song JSON parse: {e}")))
+    })?;
+    // (v30 §10) JS で組んだ song は untagged clip_contents なので type タグを注入してから deserialize。
+    common::project::tag_clip_contents_in_song(&mut value);
+    let mut song: Song = serde_json::from_value(value).map_err(|e| {
+        JsError::from_native(JsNativeError::error().with_message(format!("song deserialize: {e}")))
     })?;
     // v29: 安定 id (track / device / send / note...) を採番してから流す。
     // device_id addressing (`daw.setSlotPlugin` 等) がこの id を引く。
@@ -900,8 +905,13 @@ fn daw_app_load_song_json(
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
     let json = arg_to_string(args, 0, ctx)?;
-    let mut song: Song = serde_json::from_str(&json)
+    let mut value: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| js_native(format!("appLoadSongJson: parse: {e}")))?;
+    // (v30 §10) JS で組んだ song は untagged clip_contents 形式なので、`type` タグを注入してから
+    // deserialize する (ファイル load 経路の migrate_clip_content_add_tag と同じ処理)。
+    common::project::tag_clip_contents_in_song(&mut value);
+    let mut song: Song = serde_json::from_value(value)
+        .map_err(|e| js_native(format!("appLoadSongJson: deserialize: {e}")))?;
     song.ensure_ids();
     song.ensure_clip_contents();
     song.ensure_audio_source_ids();

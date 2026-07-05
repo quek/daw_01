@@ -155,10 +155,9 @@ fn migrate_vocal_source_to_clips(value: &mut serde_json::Value) {
 /// `source_start_micros` → Video / `opacity` → Image / `text` → Text / それ以外 → Audio。
 /// 空 content (`{}`、旧 untagged では先頭 variant に落ちていた) は Midi。`type` を既に持つ
 /// content は no-op (idempotent)。content は `song.clip_contents` (content_id → content の map)。
-fn migrate_clip_content_add_tag(value: &mut serde_json::Value) {
-    let Some(contents) = value
-        .get_mut("song")
-        .and_then(|s| s.get_mut("clip_contents"))
+pub fn tag_clip_contents_in_song(song: &mut serde_json::Value) {
+    let Some(contents) = song
+        .get_mut("clip_contents")
         .and_then(serde_json::Value::as_object_mut)
     else {
         return;
@@ -194,6 +193,14 @@ fn migrate_clip_content_add_tag(value: &mut serde_json::Value) {
             "Midi"
         };
         obj.insert("type".to_string(), serde_json::Value::String(ty.to_string()));
+    }
+}
+
+/// project value (`{version, song, ...}`) の `song.clip_contents` に v30 `type` タグを注入する。
+/// `load_project` が version-gate 越しに呼ぶ。Song 単体 JSON は [`tag_clip_contents_in_song`]。
+fn migrate_clip_content_add_tag(value: &mut serde_json::Value) {
+    if let Some(song) = value.get_mut("song") {
+        tag_clip_contents_in_song(song);
     }
 }
 

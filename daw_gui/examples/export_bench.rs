@@ -29,7 +29,10 @@ fn main() {
         eprintln!("parse .daw json from {}: {e}", daw.display());
         std::process::exit(1);
     });
-    let song: Song = serde_json::from_value(envelope["song"].clone()).unwrap_or_else(|e| {
+    // (v30 §10) 旧 .daw は untagged clip_contents なので type タグを注入してから deserialize。
+    let mut song_value = envelope["song"].clone();
+    common::project::tag_clip_contents_in_song(&mut song_value);
+    let song: Song = serde_json::from_value(song_value).unwrap_or_else(|e| {
         eprintln!("parse Song from {} envelope: {e}", daw.display());
         std::process::exit(1);
     });
