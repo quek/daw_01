@@ -167,9 +167,6 @@ impl SongDoc {
             EditScope::Gesture(id) => self.last_gesture == Some(id),
         };
         if !squash {
-            if self.undo_stack.len() >= UNDO_LIMIT {
-                self.undo_stack.pop_front();
-            }
             self.undo_stack.push_back(self.song.clone());
         }
         let (r, changed) = f(&mut self.song);
@@ -182,6 +179,13 @@ impl SongDoc {
                 EditScope::Gesture(id) => Some(id),
             };
             self.edit_epoch += 1;
+            // 上限適用は **編集が確定してから** (push で高々 +1 したぶんを削る)。
+            // closure 前に pop_front すると、 no-op (changed=false) 時に push 分だけ
+            // 戻しても最古 step の evict は戻らず、 何も起きていないのに undo 履歴の
+            // 最古が失われる (旧バグ)。
+            while self.undo_stack.len() > UNDO_LIMIT {
+                self.undo_stack.pop_front();
+            }
         } else if !squash {
             // no-op: 積んだ snapshot を破棄 (dead undo step を作らない)。
             self.undo_stack.pop_back();

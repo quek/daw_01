@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::Result;
@@ -66,7 +66,14 @@ pub struct PluginEntry {
     /// log する (TIME_CRITICAL thread での毎 buffer format+log を排除)。
     /// republish (再 SetSlotPlugin / reinit) で新 entry になりリセット。
     pub err_logged: Arc<AtomicBool>,
+    /// L1: この device が claim した metrics slot index のキャッシュ
+    /// (`u32::MAX` = 未 claim)。 worker が初回 `process()` で
+    /// `MetricsBridge::claim_plugin_metric_slot` を呼んで確定し、 以後 O(1) store。
+    pub metric_slot: Arc<AtomicU32>,
 }
+
+/// `PluginEntry::metric_slot` の未 claim sentinel。
+pub const METRIC_SLOT_UNCLAIMED: u32 = u32::MAX;
 
 impl Clone for PluginEntry {
     fn clone(&self) -> Self {
@@ -74,6 +81,7 @@ impl Clone for PluginEntry {
             audio: Arc::clone(&self.audio),
             process_data: self.process_data,
             err_logged: Arc::clone(&self.err_logged),
+            metric_slot: Arc::clone(&self.metric_slot),
         }
     }
 }
@@ -677,10 +685,20 @@ fn run_worker(
             }
         };
         // resource monitor: per-plugin の process() 時間 (μs) を publish。
-        // metrics slot は u32 index API のまま (device_id が slot 数を超える
-        // 場合は silently drop — bridge 側仕様)。
+        // L1: device_id (u64、 非有界) を配列 index にせず、 device_id を値で保持する
+        // slot を claim する。 slot index は entry にキャッシュされるので線形 scan は
+        // plugin ごと初回だけ。 満杯 / 競合で未 claim なら次 buffer で再試行。
         let proc_us = u32::try_from(proc_start.elapsed().as_micros()).unwrap_or(u32::MAX);
-        metrics.set_plugin_dsp_us(u32::try_from(device_id).unwrap_or(u32::MAX), proc_us);
+        let mut slot = entry.metric_slot.load(Ordering::Relaxed);
+        if slot == METRIC_SLOT_UNCLAIMED
+            && let Some(i) = metrics.claim_plugin_metric_slot(device_id)
+        {
+            entry.metric_slot.store(i as u32, Ordering::Relaxed);
+            slot = i as u32;
+        }
+        if slot != METRIC_SLOT_UNCLAIMED {
+            metrics.set_plugin_dsp_us_slot(slot as usize, proc_us);
+        }
         if process_ok {
             // Copy output audio into the shmem.
             if let Some(out_l) = plugin.output_buffer(0) {
@@ -993,6 +1011,7 @@ mod tests {
             audio: AudioHalf::new(Box::new(NullHalf)),
             process_data: std::ptr::null_mut(),
             err_logged: Arc::new(AtomicBool::new(false)),
+            metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
         };
         registry_insert(&registry, 42, entry);
         assert!(registry.load().contains_key(&42));
@@ -1006,6 +1025,7 @@ mod tests {
             audio: AudioHalf::new(Box::new(NullHalf)),
             process_data: std::ptr::null_mut(),
             err_logged: Arc::new(AtomicBool::new(false)),
+            metric_slot: Arc::new(AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
         };
         registry_insert(&registry, 7, entry2);
         let all = registry_take_all(&registry);

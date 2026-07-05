@@ -45,8 +45,10 @@ pub struct AudioBridge {
     pub peak_l: AtomicU32,
     pub peak_r: AtomicU32,
     /// Per-track post-fader peaks, `[track][0=L, 1=R]`, as `f32::to_bits`.
-    /// Written by daw_plugin_host after summing each track into the master
-    /// bus; read by daw_gui on its UI tick.
+    /// Written by **daw_audio** after summing each track into the master
+    /// bus (`engine.rs` / `main.rs` の `set_track_peak`); read by daw_gui on
+    /// its UI tick。(v29: 旧 daw_plugin_host request/ready data plane 撤去に伴い
+    /// writer は daw_audio に一本化 — module doc 参照。)
     pub track_peaks: [[AtomicU32; 2]; MAX_TRACKS],
     /// docs/plan_modulation.md §4.2: per-`ModSource` envelope follower scalar
     /// (`f32::to_bits`), block-rate. Written by the audio engine every buffer

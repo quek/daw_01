@@ -129,8 +129,7 @@ impl AppData {
         // ParallelOutTap in `compile_schedule`. パラアウト
         // (docs/plan_paraout.md) も sidechain と同じく再ロードで生存させる。
         let placed = self
-            .song_doc
-            .normalize(move |song| {
+            .normalize_song(move |song| {
                 let chain: Option<&mut Vec<common::model::PluginInstance>> =
                     if track_id == common::model::MASTER_TRACK_ID {
                         Some(&mut song.master_fx_chain)

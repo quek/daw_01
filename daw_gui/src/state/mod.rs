@@ -68,11 +68,22 @@ impl AppData {
         self.song_doc.edit_checked(scope, f) == Some(true)
     }
 
+    /// 派生データ正規化 / save 後 path 書換など undo 非対象の song 変更
+    /// ([`SongDoc::normalize`]) の標準口。 `edit_song` と同じく **編集直前に
+    /// export_lock を transport から同期する**。 これを経由せず
+    /// `song_doc.normalize()` を直呼びすると export_lock が stale なままになり、
+    /// export 中の口パク再生成適用等が render 中に LoadSong を送って書き出しを
+    /// 壊す (song mutation の遮断は edit / normalize 双方でこの同期に依存する)。
+    pub fn normalize_song<R>(&mut self, f: impl FnOnce(&mut common::model::Song) -> R) -> Option<R> {
+        self.sync_export_lock();
+        self.song_doc.normalize(f)
+    }
+
     /// song 凍結の単一保証点 (§7.5): export (audio freewheel / video render) 中は
     /// `SongDoc::edit` が編集を拒否する。 handle_event の gate を block-list へ反転
     /// した (song 遮断を event 単位の allow-list で担わない) 代わりに、 song
-    /// mutation の遮断はこの 1 箇所 (edit_song チョークポイント) に集約する。
-    /// export 状態は transport が SSoT なので、 編集直前に毎回同期する
+    /// mutation の遮断はこの 1 箇所 (edit_song / normalize_song チョークポイント) に
+    /// 集約する。 export 状態は transport が SSoT なので、 編集直前に毎回同期する
     /// (別途 toggle する scatter を作らない = 「解除し忘れ」故障モードを消す)。
     fn sync_export_lock(&mut self) {
         let exporting =

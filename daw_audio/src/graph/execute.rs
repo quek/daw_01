@@ -1299,6 +1299,18 @@ pub fn render_master_buffer(
             looping,
             mod_scalars,
         );
+        // stall した pool は scratch を更新しない (dispatch_and_wait が冒頭で
+        // early-return する)。 その残余 (直前 buffer の per-track 出力) を後段の
+        // schedule mix が master に積むと、 契約上「無音」であるべき所が耳障りな
+        // stuck tone になる (plan §4: stalled = 無音)。 該当 track の scratch を
+        // 明示 zero して post-dispatch に無音を流す (RT-safe: pre-alloc buffer への
+        // fill のみ、 確保なし)。
+        if pool.is_stalled() {
+            for ts in scratch[..n_tracks].iter_mut() {
+                ts.track_l[..n].fill(0.0);
+                ts.track_r[..n].fill(0.0);
+            }
+        }
     } else {
         let worker_sync = slots.first();
         for (track_idx, track_scratch) in scratch.iter_mut().enumerate().take(n_tracks) {

@@ -587,8 +587,21 @@ pub fn tag_clip_contents_in_song(song: &mut serde_json::Value) {
             } else {
                 "Audio"
             }
+        } else if obj.contains_key("next_event_id") {
+            // events を全削除して空になった Audio content。 events は
+            // `skip_serializing_if = Vec::is_empty` で省略されるが、 v29 の
+            // `next_event_id` (`skip_serializing_if = is_zero_u32`) は残るため
+            // `{"next_event_id": N}` として serialize される。 旧 untagged +
+            // deny_unknown_fields はこれを (Midi が unknown field で失格し) Audio と
+            // 解決していた — その等価性を保つ。
+            "Audio"
+        } else if obj.contains_key("next_point_id") {
+            // 同上: points を全削除して空になった Automation content
+            // (`{"next_point_id": N}`)。 旧 untagged では Automation。
+            "Automation"
         } else {
-            // events 無し or 空 content → 旧 untagged では先頭 variant (Midi) に落ちた。
+            // 真に空 (`{}` or `{"next_note_id": N}`) → 旧 untagged でも先頭 variant
+            // (Midi) に落ちた。
             "Midi"
         };
         obj.insert("type".to_string(), serde_json::Value::String(ty.to_string()));
@@ -1120,6 +1133,13 @@ mod tests {
             ("Text", serde_json::json!({ "events": [{ "text": "hi", "opacity": 0.8 }] })),
             // 空 content は旧 untagged で先頭 variant (Midi) に落ちていた。
             ("Midi", serde_json::json!({})),
+            // 回帰 (sibling of opacity→Image bug): events を全削除した Audio content は
+            // `events` が省略され `next_event_id` だけ残る (`{"next_event_id": N}`)。
+            // 旧 untagged は Audio と解決していた。final else に落として Midi と誤判定すると
+            // deny_unknown_fields で v29 project の load が失敗する。
+            ("Audio", serde_json::json!({ "next_event_id": 3 })),
+            // 同型: points を全削除した Automation content。
+            ("Automation", serde_json::json!({ "next_point_id": 2 })),
         ];
         for (expected, content) in cases {
             let mut proj = serde_json::json!({

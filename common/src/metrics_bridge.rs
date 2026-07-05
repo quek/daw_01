@@ -17,16 +17,29 @@ use anyhow::Result;
 
 use crate::shmem::NamedShmem;
 
-/// per-plugin メトリクススロットのハードキャップ。 `plugin_id` は plugin
-/// registry の Vec インデックス (`MAX_TRACKS` = 32 × 妥当な device 数)。 この id
-/// を超える plugin も処理はされるが CPU スロットを publish しない
-/// (`audio_bridge::track_peaks` と同じ silently-drop)。
+/// per-plugin メトリクススロットのハードキャップ (= 同時に CPU 計測できる
+/// device 数)。 slot は安定 `device_id` (u64、 単調増加・非再利用) を **値** で
+/// 保持し、 空き slot を claim して使う (§7.5 `PluginMetricSlot`)。 これにより
+/// device_id を配列 index にする旧実装 (id が 512 を超えると計測が silently
+/// drop する) を根治する。 同時 live device 数がこの上限を超えたときだけ drop。
 pub const MAX_PLUGINS: usize = 512;
 
 /// DSP load を `warn`(黄) 表示に切り替える閾値 (= 期限の 70%)。
 pub const LOAD_WARN: f32 = 0.7;
 /// DSP load を `danger`(赤) 表示に切り替える閾値 (= 期限の 90%)。
 pub const LOAD_DANGER: f32 = 0.9;
+
+/// per-plugin CPU 計測の 1 slot (§7.5)。 `device_id` は「この slot が誰の計測か」
+/// を示す安定 id (`0` = 空き)。 plugin-host worker が load 後に空き slot を claim
+/// (`device_id` を CAS 占有)、 RT では小さい slot index へ `us` を store、 daw_gui は
+/// `device_id` で線形 scan して読む。 全 atomic なので lock-free。
+#[repr(C)]
+pub struct PluginMetricSlot {
+    /// この slot を占有する device の安定 id。 `0` = 空き。
+    pub device_id: AtomicU64,
+    /// 直近 `process()` 時間 (μs)。
+    pub us: AtomicU32,
+}
 
 #[repr(C)]
 pub struct MetricsBridge {
@@ -46,9 +59,10 @@ pub struct MetricsBridge {
     pub buffer_frames: AtomicU32,
     /// 現在の sample rate (Hz)。 daw_audio が起動時に publish (静的)。
     pub sample_rate: AtomicU32,
-    /// per-plugin の直近 `process()` 時間 (μs)。 plugin-host worker が
-    /// `plugin_id` をインデックスに store。 範囲外 id は silently drop。
-    pub plugin_dsp_us: [AtomicU32; MAX_PLUGINS],
+    /// per-plugin の直近 `process()` 時間 (μs)。 device_id 値を保持する slot
+    /// 配列 (§7.5)。 index ではなく `device_id` で claim / read するので、 id が
+    /// `MAX_PLUGINS` を超えても計測が drop しない。
+    pub plugin_metrics: [PluginMetricSlot; MAX_PLUGINS],
 }
 
 impl MetricsBridge {
@@ -139,20 +153,64 @@ impl MetricsBridgeHandle {
         )
     }
 
-    /// plugin-host worker (RT): per-plugin の直近 `process()` μs を store。
-    /// 範囲外 `plugin_id` は silently drop。
-    pub fn set_plugin_dsp_us(&self, plugin_id: u32, us: u32) {
-        let Some(cell) = self.bridge().plugin_dsp_us.get(plugin_id as usize) else {
-            return;
-        };
-        cell.store(us, Ordering::Release);
+    /// plugin-host worker (RT): `device_id` の計測 slot を取得する。 既存 slot が
+    /// あればその index、 無ければ空き slot を CAS 占有して claim する。 満杯 /
+    /// CAS 競合時は `None` (呼び元は次 buffer で再試行)。 worker は返り値を entry に
+    /// キャッシュするので、 この線形 scan は plugin ごと事実上 1 回だけ走る。
+    pub fn claim_plugin_metric_slot(&self, device_id: u64) -> Option<usize> {
+        debug_assert_ne!(device_id, 0, "device_id 0 は sentinel、 claim 不可");
+        let slots = &self.bridge().plugin_metrics;
+        let mut free: Option<usize> = None;
+        for (i, s) in slots.iter().enumerate() {
+            let d = s.device_id.load(Ordering::Acquire);
+            if d == device_id {
+                return Some(i); // 既に自分の slot
+            }
+            if d == 0 && free.is_none() {
+                free = Some(i);
+            }
+        }
+        let i = free?;
+        // 空き slot を占有 (他 worker と競合したら諦め = 次回再試行)。
+        match slots[i].device_id.compare_exchange(
+            0,
+            device_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Some(i),
+            Err(_) => None,
+        }
     }
 
-    pub fn plugin_dsp_us(&self, plugin_id: u32) -> u32 {
-        let Some(cell) = self.bridge().plugin_dsp_us.get(plugin_id as usize) else {
-            return 0;
-        };
-        cell.load(Ordering::Acquire)
+    /// plugin-host worker (RT): claim 済み slot index へ μs を store。
+    pub fn set_plugin_dsp_us_slot(&self, slot: usize, us: u32) {
+        if let Some(s) = self.bridge().plugin_metrics.get(slot) {
+            s.us.store(us, Ordering::Release);
+        }
+    }
+
+    /// daw_gui: `device_id` の直近 `process()` μs。 未計測 / 未 claim は 0。
+    pub fn plugin_dsp_us(&self, device_id: u64) -> u32 {
+        for s in self.bridge().plugin_metrics.iter() {
+            if s.device_id.load(Ordering::Acquire) == device_id {
+                return s.us.load(Ordering::Acquire);
+            }
+        }
+        0
+    }
+
+    /// daw_gui: 現在 live でない device が占有する slot を解放する
+    /// (unload された plugin の entry は既に消えて worker が store しないので安全)。
+    /// per-plugin パネルの read 前に呼び、 slot 枯渇を防ぐ。
+    pub fn reclaim_plugin_metric_slots(&self, live: &std::collections::HashSet<u64>) {
+        for s in self.bridge().plugin_metrics.iter() {
+            let d = s.device_id.load(Ordering::Acquire);
+            if d != 0 && !live.contains(&d) {
+                s.us.store(0, Ordering::Release);
+                s.device_id.store(0, Ordering::Release);
+            }
+        }
     }
 }
 

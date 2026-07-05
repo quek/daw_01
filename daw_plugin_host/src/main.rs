@@ -53,8 +53,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, load_plugin};
 use crate::process_server::{
-    PluginEntry, PluginRegistry, registry_insert, registry_remove, registry_restore_all,
-    registry_take_all,
+    METRIC_SLOT_UNCLAIMED, PluginEntry, PluginRegistry, registry_insert, registry_remove,
+    registry_restore_all, registry_take_all,
 };
 
 /// Custom Win32 message id used to wake the plugin-main thread's `GetMessage`
@@ -1071,6 +1071,7 @@ impl PluginHost {
                 audio,
                 process_data: pd_ptr,
                 err_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                metric_slot: Arc::new(std::sync::atomic::AtomicU32::new(METRIC_SLOT_UNCLAIMED)),
             },
         );
 

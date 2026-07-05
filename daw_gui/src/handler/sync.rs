@@ -407,7 +407,7 @@ impl AppData {
         if !needs {
             return;
         }
-        self.song_doc.normalize(|song| {
+        self.normalize_song(|song| {
             let resolve = |devices: &mut [common::model::PluginInstance]| {
                 for d in devices.iter_mut() {
                     if d.ports == default_ports

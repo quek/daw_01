@@ -450,8 +450,11 @@ impl AppData {
         results: Vec<LipsyncClipResult>,
     ) {
         // 口パクは派生データの自動再生成なので undo 履歴に入れない
-        // (normalize)。 epoch は進む = dirty + frame flush の再 sync は走る。
-        self.song_doc.normalize(|song| {
+        // (normalize_song)。 epoch は進む = dirty + frame flush の再 sync は走る。
+        // normalize_song 経由で export_lock を同期する: export (freewheel /
+        // video render) 中に口パク再生成が完了しても render 中の LoadSong を
+        // 送らない (H2)。
+        self.normalize_song(|song| {
             // HTTP 中に song が変わっている可能性があるため id ベースで再解決。
             let Some(target_id) = song
                 .tracks

@@ -132,12 +132,26 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
         0.0
     };
     let load_of = |us: u32| if period_us > 0.0 { us as f32 / period_us } else { 0.0 };
-    // v29: 安定 device id (u64) を bridge の slot index (u32) に落として読む
-    // (bridge 側は plugin-host が同じ id で publish する契約)。
+    // L1: per-plugin 計測は device_id (u64) を **値** で保持する slot に格納される
+    // (index 化しないので id が MAX_PLUGINS を超えても drop しない)。 read 前に
+    // 現在 live な device 集合で stale slot (unload 済み device) を解放し、 slot
+    // 枯渇を防ぐ (unload 済み device の worker は既に store しないので安全)。
+    if let Some(mb) = app.ipc.metrics_bridge.as_ref() {
+        let song = app.song_doc.song();
+        let live: std::collections::HashSet<u64> = song
+            .tracks
+            .iter()
+            .flat_map(|t| t.devices.iter())
+            .chain(song.master_fx_chain.iter())
+            .map(|d| d.id)
+            .filter(|&id| id != 0)
+            .collect();
+        mb.reclaim_plugin_metric_slots(&live);
+    }
     let plugin_us = |pid: u64| {
         app.ipc.metrics_bridge
             .as_ref()
-            .map_or(0, |mb| mb.plugin_dsp_us(u32::try_from(pid).unwrap_or(u32::MAX)))
+            .map_or(0, |mb| mb.plugin_dsp_us(pid))
     };
 
     // パネル背景 + タイトルバー。

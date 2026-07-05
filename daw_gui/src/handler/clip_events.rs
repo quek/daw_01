@@ -670,6 +670,12 @@ impl AppData {
         self.ui_ephemeral.font_picker_query.clear();
         self.ui_ephemeral.font_picker_cursor = 0;
         self.ui_ephemeral.is_font_picker_open = true;
+        // ピッカー session 全体 (プレビュー hover/arrow 群 + commit) を 1 gesture に
+        // bracket する。 これで最初のプレビューが「元フォント」を snapshot し、 以後の
+        // プレビュー/commit は squash されて **1 undo で元に戻る**。 bracket が無いと
+        // hover ごとに fresh gesture id → プレビュー 1 回ごとに undo step が積まれ、
+        // commit も元を復元しない (M3)。 commit / cancel で end_gesture する。
+        self.song_doc.begin_gesture();
         self.refresh_font_picker_visible();
         // システムフォント列挙は重い (~20-860ms) ので background で 1 度だけ。
         if self.ui_ephemeral.font_picker_families.is_empty() && !self.ui_ephemeral.font_picker_loading {
@@ -730,8 +736,11 @@ impl AppData {
         self.preview_font_at_cursor();
     }
 
-    /// cursor 位置のフォントを編集対象クリップへライブ適用 (非 undo / 非 dirty)。
-    /// `""` = renderer default。
+    /// cursor 位置のフォントを編集対象クリップへライブ適用する。 ピッカー
+    /// session の gesture (open_font_picker が begin) 内なので、 プレビュー群 +
+    /// commit は 1 undo step に squash され、 最初のプレビューが元フォントを
+    /// snapshot する (`""` = renderer default)。 song を書き換えるため dirty には
+    /// なる (epoch ベース dirty の性質)。
     pub(crate) fn preview_font_at_cursor(&mut self) {
         let Some(target) = self.ui_ephemeral.font_picker_target else {
             return;
@@ -755,6 +764,8 @@ impl AppData {
         // ため target を先に落とす。
         self.ui_ephemeral.font_picker_target = None;
         self.ui_ephemeral.is_font_picker_open = false;
+        // session gesture を閉じる (open_font_picker の begin_gesture と対)。
+        self.song_doc.end_gesture();
     }
 
     pub(crate) fn close_font_picker(&mut self) {
@@ -765,6 +776,9 @@ impl AppData {
         }
         self.ui_ephemeral.is_font_picker_open = false;
         self.ui_ephemeral.font_picker_target = None;
+        // session gesture を閉じる (open_font_picker の begin_gesture と対)。
+        // commit 済み (target 既に None) でも呼ぶ: begin/end を必ず対にする。
+        self.song_doc.end_gesture();
     }
 
     /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo / lane

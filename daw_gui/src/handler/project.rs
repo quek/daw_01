@@ -1456,8 +1456,7 @@ impl AppData {
                 let edited_since_snapshot = self.song_doc.edit_epoch() != snap_epoch;
                 if let Some(dir) = path.parent() {
                     let mut status = std::mem::take(&mut self.ui_ephemeral.status_message);
-                    self.song_doc
-                        .normalize(|song| Self::migrate_unsaved_sources(song, dir, &mut status));
+                    self.normalize_song(|song| Self::migrate_unsaved_sources(song, dir, &mut status));
                     self.ui_ephemeral.status_message = status;
                 }
                 // serialize 成功時のみ file_path を確定する (旧契約)。

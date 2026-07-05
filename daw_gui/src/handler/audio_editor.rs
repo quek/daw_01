@@ -126,6 +126,11 @@ impl AppData {
             let new_start = src.event_start_in_clip_beats + src.event_length_beats;
             let mut new_event = src.clone();
             new_event.event_start_in_clip_beats = new_start;
+            // clone は src の非 0 `id` も複製する。 per-content 一意 id 不変条件
+            // (invariant #1) を守るため新規採番する — さもないと同 content に同 id の
+            // event が 2 つでき (`ensure_element_ids` も既存非 0 id は再採番しないので
+            // save/reload で残存)、 id addressing が壊れる。
+            new_event.id = audio.alloc_event_id();
             let insert_at = idx + 1;
             if insert_at >= audio.events.len() {
                 audio.events.push(new_event);
