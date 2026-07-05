@@ -201,7 +201,7 @@ fn is_small_kana(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Clip, Note};
+    use crate::model::Note;
     use serde_json::Value;
 
     fn parse_query(json: &str) -> Vec<(Option<i64>, i64, String)> {
@@ -221,18 +221,8 @@ mod tests {
 
     #[test]
     fn empty_clip_yields_two_rests() {
-        let clip = Clip {
-            id: 1,
-            name: "c".into(),
-            start_beat: 0.0,
-            length_beats: 4.0,
-            content_id: 0,
-            notes: Vec::new(),
-            color: None,
-            auto_lipsync: false,
-            ..Default::default()
-        };
-        let q = build_sing_query(&clip.notes, 120.0);
+        let notes: Vec<Note> = Vec::new();
+        let q = build_sing_query(&notes, 120.0);
         let entries = parse_query(&q);
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.0.is_none()));
@@ -240,26 +230,16 @@ mod tests {
 
     #[test]
     fn single_note_emits_rest_note_rest() {
-        let clip = Clip {
-            id: 1,
-            name: "c".into(),
+        let notes = vec![Note {
+            id: 0,
             start_beat: 0.0,
-            length_beats: 4.0,
-            content_id: 0,
-            notes: vec![Note {
-                id: 0,
-                start_beat: 0.0,
-                duration_beats: 1.0,
-                pitch: 60,
-                velocity: 100,
-                lyric: Some("ら".into()),
-                muted: false,
-            }],
-            color: None,
-            auto_lipsync: false,
-            ..Default::default()
-        };
-        let q = build_sing_query(&clip.notes, 120.0);
+            duration_beats: 1.0,
+            pitch: 60,
+            velocity: 100,
+            lyric: Some("ら".into()),
+            muted: false,
+        }];
+        let q = build_sing_query(&notes, 120.0);
         let entries = parse_query(&q);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].0, None);
@@ -270,37 +250,27 @@ mod tests {
 
     #[test]
     fn gap_between_notes_emits_rest_in_between() {
-        let clip = Clip {
-            id: 1,
-            name: "c".into(),
-            start_beat: 0.0,
-            length_beats: 8.0,
-            content_id: 0,
-            notes: vec![
-                Note {
-                    id: 0,
-                    start_beat: 0.0,
-                    duration_beats: 1.0,
-                    pitch: 60,
-                    velocity: 100,
-                    lyric: Some("こ".into()),
-                    muted: false,
-                },
-                Note {
-                    id: 0,
-                    start_beat: 2.0,
-                    duration_beats: 1.0,
-                    pitch: 62,
-                    velocity: 100,
-                    lyric: Some("ん".into()),
-                    muted: false,
-                },
-            ],
-            color: None,
-            auto_lipsync: false,
-            ..Default::default()
-        };
-        let q = build_sing_query(&clip.notes, 120.0);
+        let notes = vec![
+            Note {
+                id: 0,
+                start_beat: 0.0,
+                duration_beats: 1.0,
+                pitch: 60,
+                velocity: 100,
+                lyric: Some("こ".into()),
+                muted: false,
+            },
+            Note {
+                id: 0,
+                start_beat: 2.0,
+                duration_beats: 1.0,
+                pitch: 62,
+                velocity: 100,
+                lyric: Some("ん".into()),
+                muted: false,
+            },
+        ];
+        let q = build_sing_query(&notes, 120.0);
         let entries = parse_query(&q);
         // rest_start, note0, gap_rest, note1, rest_end
         assert_eq!(entries.len(), 5);
@@ -312,37 +282,27 @@ mod tests {
 
     #[test]
     fn touching_notes_emit_no_extra_rest() {
-        let clip = Clip {
-            id: 1,
-            name: "c".into(),
-            start_beat: 0.0,
-            length_beats: 8.0,
-            content_id: 0,
-            notes: vec![
-                Note {
-                    id: 0,
-                    start_beat: 0.0,
-                    duration_beats: 1.0,
-                    pitch: 60,
-                    velocity: 100,
-                    lyric: Some("こ".into()),
-                    muted: false,
-                },
-                Note {
-                    id: 0,
-                    start_beat: 1.0,
-                    duration_beats: 1.0,
-                    pitch: 62,
-                    velocity: 100,
-                    lyric: Some("ん".into()),
-                    muted: false,
-                },
-            ],
-            color: None,
-            auto_lipsync: false,
-            ..Default::default()
-        };
-        let q = build_sing_query(&clip.notes, 120.0);
+        let notes = vec![
+            Note {
+                id: 0,
+                start_beat: 0.0,
+                duration_beats: 1.0,
+                pitch: 60,
+                velocity: 100,
+                lyric: Some("こ".into()),
+                muted: false,
+            },
+            Note {
+                id: 0,
+                start_beat: 1.0,
+                duration_beats: 1.0,
+                pitch: 62,
+                velocity: 100,
+                lyric: Some("ん".into()),
+                muted: false,
+            },
+        ];
+        let q = build_sing_query(&notes, 120.0);
         let entries = parse_query(&q);
         // rest_start, note0, note1, rest_end — no rest between notes.
         assert_eq!(entries.len(), 4);
@@ -352,63 +312,43 @@ mod tests {
 
     #[test]
     fn lyric_with_quotes_is_escaped() {
-        let clip = Clip {
-            id: 1,
-            name: "c".into(),
+        let notes = vec![Note {
+            id: 0,
             start_beat: 0.0,
-            length_beats: 4.0,
-            content_id: 0,
-            notes: vec![Note {
-                id: 0,
-                start_beat: 0.0,
-                duration_beats: 1.0,
-                pitch: 60,
-                velocity: 100,
-                lyric: Some("\"a\"".into()),
-                muted: false,
-            }],
-            color: None,
-            auto_lipsync: false,
-            ..Default::default()
-        };
-        let q = build_sing_query(&clip.notes, 120.0);
+            duration_beats: 1.0,
+            pitch: 60,
+            velocity: 100,
+            lyric: Some("\"a\"".into()),
+            muted: false,
+        }];
+        let q = build_sing_query(&notes, 120.0);
         // Must remain valid JSON despite embedded quotes.
         let _: Value = serde_json::from_str(&q).expect("invalid JSON output");
     }
 
     #[test]
     fn unsorted_notes_are_sorted_before_emitting() {
-        let clip = Clip {
-            id: 1,
-            name: "c".into(),
-            start_beat: 0.0,
-            length_beats: 8.0,
-            content_id: 0,
-            notes: vec![
-                Note {
-                    id: 0,
-                    start_beat: 2.0,
-                    duration_beats: 1.0,
-                    pitch: 64,
-                    velocity: 100,
-                    lyric: Some("に".into()),
-                    muted: false,
-                },
-                Note {
-                    id: 0,
-                    start_beat: 0.0,
-                    duration_beats: 1.0,
-                    pitch: 60,
-                    velocity: 100,
-                    lyric: Some("こ".into()),
-                    muted: false,
-                },
-            ],
-            color: None,
-            auto_lipsync: false,
-            ..Default::default()
-        };
-        let q = build_sing_query(&clip.notes, 120.0);
+        let notes = vec![
+            Note {
+                id: 0,
+                start_beat: 2.0,
+                duration_beats: 1.0,
+                pitch: 64,
+                velocity: 100,
+                lyric: Some("に".into()),
+                muted: false,
+            },
+            Note {
+                id: 0,
+                start_beat: 0.0,
+                duration_beats: 1.0,
+                pitch: 60,
+                velocity: 100,
+                lyric: Some("こ".into()),
+                muted: false,
+            },
+        ];
+        let q = build_sing_query(&notes, 120.0);
         let entries = parse_query(&q);
         // After sort: rest, note(60,こ), gap_rest, note(64,に), rest
         assert_eq!(entries[1].0, Some(60));

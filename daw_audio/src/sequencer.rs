@@ -348,11 +348,9 @@ mod tests {
             t.name = "T".into();
             t.clips = vec![Clip {
                 id: 1,
-                name: "C".into(),
                 start_beat: 0.0,
                 length_beats: 8.0,
                 content_id,
-                notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
                 ..Default::default()
@@ -662,11 +660,9 @@ mod tests {
             t.name = "T".into();
             t.clips = vec![Clip {
                 id: 1,
-                name: "C".into(),
                 start_beat: 0.0,
                 length_beats: 4.0,
                 content_id: cid,
-                notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
                 ..Default::default()

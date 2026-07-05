@@ -382,11 +382,9 @@ mod tests {
         let cl = track.alloc_clip_id();
         track.clips.push(Clip {
             id: cl,
-            name: "txt".into(),
             start_beat: 0.0,
             length_beats: event_length,
             content_id: cid,
-            notes: Vec::new(),
             color: None,
             auto_lipsync: false,
             ..Default::default()

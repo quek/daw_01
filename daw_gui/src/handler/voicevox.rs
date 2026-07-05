@@ -524,11 +524,9 @@ impl AppData {
                 let clip_id = m.alloc_clip_id();
                 m.clips.push(Clip {
                     id: clip_id,
-                    name: String::new(),
                     start_beat: clip_start,
                     length_beats: clip_end - clip_start,
                     content_id,
-                    notes: Vec::new(),
                     color: None,
                     auto_lipsync: true,
                     ..Default::default()

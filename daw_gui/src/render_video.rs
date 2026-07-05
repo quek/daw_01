@@ -801,11 +801,9 @@ mod tests {
         let clip_id = track.alloc_clip_id();
         track.clips.push(common::model::Clip {
             id: clip_id,
-            name: "vclip".into(),
             start_beat: 0.0,
             length_beats: 4.0,
             content_id: cid,
-            notes: Vec::new(),
             color: None,
             auto_lipsync: false,
             ..Default::default()

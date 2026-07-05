@@ -20,13 +20,6 @@ pub struct Clip {
     /// move and resize.
     #[serde(default)]
     pub id: u32,
-    /// **Legacy field** (v19 まで per-clip 名の owner)。 v20+ は
-    /// `Song.clip_content_names[content_id]` が SSoT (= 共有クリップ間で
-    /// 名前を共有)。 load 時に `Song::ensure_clip_contents` が map へ drain
-    /// して空にする。 **in-memory は常に空**、 直接書かない (rename は
-    /// `Song::set_content_name` 経由)。 空なら serialize されない。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub name: String,
     pub start_beat: f64,
     pub length_beats: f64,
     /// Reference into `Song.clip_contents`. `0` is the "未採番" sentinel —
@@ -34,15 +27,6 @@ pub struct Clip {
     /// clips with the same `content_id` share notes (linked clips).
     #[serde(default)]
     pub content_id: ContentId,
-    /// **Legacy v5 deserialize-only field**: in v5 `Clip` owned `notes`
-    /// directly. v6+ stores notes in `Song.clip_contents` keyed by
-    /// `content_id`. After deserialization, `Song::ensure_clip_contents`
-    /// drains non-empty `notes` into `clip_contents` and clears the
-    /// vector. **In-memory the field is always empty**; never write to
-    /// it directly. Skipped on serialize when empty so v6 files don't
-    /// emit it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notes: Vec<Note>,
     /// v18 (`docs/plan_track_clip_color.md`): per-clip color override
     /// (RGB, opaque). `None` ⇒ inherit the owning track's effective color
     /// (the default; resetting to `None` is the Ableton-style "match track

@@ -387,7 +387,6 @@ impl AppData {
                 id: new_clip_id,
                 start_beat: playhead,
                 length_beats: 4.0,
-                name: String::new(),
                 content_id: cid,
                 ..Default::default()
             };

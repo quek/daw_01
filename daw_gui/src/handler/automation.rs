@@ -1062,11 +1062,9 @@ impl AppData {
                 let new_idx = to_track.clips.len() as u32;
                 to_track.clips.push(common::model::Clip {
                     id: new_clip_id,
-                    name: String::new(),
                     start_beat: (at_beat + cc.start_beat).max(0.0),
                     length_beats: cc.length_beats,
                     content_id,
-                    notes: Vec::new(),
                     color: cc.color,
                     auto_lipsync: cc.auto_lipsync,
                     // clipboard の clip-level mute を paste 先 clip へ引き継ぐ。

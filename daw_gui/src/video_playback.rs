@@ -1514,11 +1514,9 @@ mod tests {
         });
         track.clips.push(Clip {
             id: 1,
-            name: "vid".into(),
             start_beat: 4.0,
             length_beats: 8.0,
             content_id,
-            notes: Vec::new(),
             color: None,
             auto_lipsync: false,
             ..Default::default()
@@ -1881,11 +1879,9 @@ mod tests {
             t.name = "VTop".into();
             t.clips = vec![Clip {
                 id: 1,
-                name: "vclip2".into(),
                 start_beat: 4.0,
                 length_beats: 8.0,
                 content_id: cid2,
-                notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
                 ..Default::default()

@@ -583,7 +583,9 @@ fn daw_load_song_from_object(
     let mut value: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
         JsError::from_native(JsNativeError::error().with_message(format!("song JSON parse: {e}")))
     })?;
-    // (v30 §10) JS で組んだ song は untagged clip_contents なので type タグを注入してから deserialize。
+    // (§10) 旧構造 (sidechain / 3-split chain / per-clip name+notes) を現行へ移してから untagged
+    // clip_contents に type タグを注入し deserialize (ファイル load 経路 migrate_legacy_song と同じ)。
+    common::project::migrate_legacy_song(&mut value);
     common::project::tag_clip_contents_in_song(&mut value);
     let mut song: Song = serde_json::from_value(value).map_err(|e| {
         JsError::from_native(JsNativeError::error().with_message(format!("song deserialize: {e}")))
@@ -907,8 +909,10 @@ fn daw_app_load_song_json(
     let json = arg_to_string(args, 0, ctx)?;
     let mut value: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| js_native(format!("appLoadSongJson: parse: {e}")))?;
-    // (v30 §10) JS で組んだ song は untagged clip_contents 形式なので、`type` タグを注入してから
-    // deserialize する (ファイル load 経路の migrate_clip_content_add_tag と同じ処理)。
+    // (§10) 旧構造 (sidechain / 3-split chain / per-clip name+notes) を現行へ移してから untagged
+    // clip_contents に `type` タグを注入し deserialize (ファイル load 経路 migrate_legacy_song +
+    // migrate_clip_content_add_tag と同じ前処理)。
+    common::project::migrate_legacy_song(&mut value);
     common::project::tag_clip_contents_in_song(&mut value);
     let mut song: Song = serde_json::from_value(value)
         .map_err(|e| js_native(format!("appLoadSongJson: deserialize: {e}")))?;
@@ -934,33 +938,50 @@ fn daw_inspect_song_json(
     // reflects what the user actually sees (and matches the rename smoke
     // test's contract). Without this, every clip name reads back `undefined`.
     let json = with_host(|host| {
-        let mut song = host.app.song_doc.song().clone();
-        let names = song.clip_content_names.clone();
-        let rehydrate = |clips: &mut Vec<common::model::Clip>| {
-            for clip in clips {
-                if let Some(n) = names.get(&clip.content_id) {
-                    clip.name = n.clone();
+        let song = host.app.song_doc.song();
+        let names = &song.clip_content_names;
+        // §10 で `Clip.name` field を撤去。per-clip 名の SSoT は `clip_content_names` (map)。
+        // inspection JSON では serialize 後の各 clip オブジェクトへ `name` を注入し
+        // 「ユーザーに見える名前」を反映する (rename smoke test の contract 用)。
+        let mut value = serde_json::to_value(song)?;
+        fn inject_names(
+            clips: Option<&mut serde_json::Value>,
+            names: &std::collections::HashMap<common::model::ContentId, String>,
+        ) {
+            let Some(arr) = clips.and_then(serde_json::Value::as_array_mut) else {
+                return;
+            };
+            for clip in arr {
+                let Some(cid) = clip.get("content_id").and_then(serde_json::Value::as_u64) else {
+                    continue;
+                };
+                if let Some(n) = names.get(&(cid as common::model::ContentId)) {
+                    clip["name"] = serde_json::Value::String(n.clone());
                 }
             }
-        };
-        for track in &mut song.tracks {
-            rehydrate(&mut track.clips);
-            for lane in &mut track.automation_lanes {
-                for clip in &mut lane.clips {
-                    if let Some(n) = names.get(&clip.content_id) {
-                        clip.name = n.clone();
+        }
+        if let Some(tracks) = value.get_mut("tracks").and_then(serde_json::Value::as_array_mut) {
+            for track in tracks {
+                inject_names(track.get_mut("clips"), names);
+                if let Some(lanes) = track
+                    .get_mut("automation_lanes")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for lane in lanes {
+                        inject_names(lane.get_mut("clips"), names);
                     }
                 }
             }
         }
-        for lane in &mut song.song_lanes {
-            for clip in &mut lane.clips {
-                if let Some(n) = names.get(&clip.content_id) {
-                    clip.name = n.clone();
-                }
+        if let Some(lanes) = value
+            .get_mut("song_lanes")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for lane in lanes {
+                inject_names(lane.get_mut("clips"), names);
             }
         }
-        serde_json::to_string(&song)
+        serde_json::to_string(&value)
     })
     .map_err(|e| js_native(format!("inspectSongJson: serialize: {e}")))?;
     Ok(JsString::from(json.as_str()).into())

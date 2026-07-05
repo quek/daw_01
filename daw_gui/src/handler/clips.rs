@@ -334,11 +334,9 @@ impl AppData {
             let new_idx = track.clips.len() as u32;
             track.clips.push(Clip {
                 id: new_clip_id,
-                name: String::new(),
                 start_beat: new_start_beat,
                 length_beats: new_length,
                 content_id,
-                notes: Vec::new(),
                 color: src_color,
                 auto_lipsync: false,
                 muted: src_muted,
@@ -382,11 +380,9 @@ impl AppData {
             let new_idx = track.clips.len() as u32;
             track.clips.push(Clip {
                 id: new_clip_id,
-                name: String::new(),
                 start_beat: new_start_beat,
                 length_beats: new_length,
                 content_id: new_content_id,
-                notes: Vec::new(),
                 color: src_color,
                 auto_lipsync: false,
                 muted: src_muted,
@@ -493,11 +489,9 @@ impl AppData {
                 let new_idx = to_track.clips.len() as u32;
                 to_track.clips.push(Clip {
                     id: new_clip_id,
-                    name: String::new(),
                     start_beat: drop_start.max(0.0),
                     length_beats: new_length,
                     content_id,
-                    notes: Vec::new(),
                     color: src_color,
                     auto_lipsync: false,
                     muted: src_muted,
@@ -557,11 +551,9 @@ impl AppData {
                 let new_idx = to_track.clips.len() as u32;
                 to_track.clips.push(Clip {
                     id: new_clip_id,
-                    name: String::new(),
                     start_beat: drop_start.max(0.0),
                     length_beats: new_length,
                     content_id: new_content_id,
-                    notes: Vec::new(),
                     color: src_color,
                     auto_lipsync: false,
                     muted: src_muted,
@@ -651,11 +643,9 @@ impl AppData {
                 };
             track.clips.push(Clip {
                 id: new_clip_id,
-                name: String::new(),
                 start_beat,
                 length_beats: DEFAULT_CLIP_LENGTH,
                 content_id,
-                notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
                 muted: false,
@@ -1203,11 +1193,9 @@ impl AppData {
         let new_idx = track.clips.len() as u32;
         track.clips.push(Clip {
             id: new_clip_id,
-            name: String::new(),
             start_beat: clip_start + front_len,
             length_beats: back_len,
             content_id: back_content_id,
-            notes: Vec::new(),
             color: src_color,
             auto_lipsync: false,
             muted: src_muted,

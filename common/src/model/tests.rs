@@ -972,48 +972,53 @@ fn note_with_lyric_serializes_compactly() {
 
 #[test]
 fn vocal_clip_roundtrip() {
-    let song = Song {
+    // §10 以降 notes は `clip_contents` (Midi)、per-clip 名は `clip_content_names` が SSoT。
+    let mut song = Song {
         tracks: vec![Track {
             name: "Vocal".into(),
             source: InstrumentSource::Vocal,
             clips: vec![Clip {
                 id: 1,
-                name: "こんにちは".into(),
                 start_beat: 0.0,
                 length_beats: 16.0,
-                content_id: 0,
-                notes: vec![
-                    Note {
-                        id: 0,
-                        start_beat: 0.0,
-                        duration_beats: 1.0,
-                        pitch: 60,
-                        velocity: 100,
-                        lyric: Some("こ".into()),
-                        muted: false,
-                    },
-                    Note {
-                        id: 0,
-                        start_beat: 1.5,
-                        duration_beats: 0.5,
-                        pitch: 62,
-                        velocity: 100,
-                        lyric: Some("ん".into()),
-                        muted: false,
-                    },
-                ],
-                color: None,
-                auto_lipsync: false,
-                muted: false,
+                content_id: 1,
                 speaker_id: 3061,
                 singer_name: "中国うさぎ".into(),
                 style_name: "ノーマル".into(),
-                talk: None,
+                ..Default::default()
             }],
             ..Track::default()
         }],
         ..Song::default()
     };
+    song.clip_contents.insert(
+        1,
+        ClipContent::Midi(MidiContent {
+            notes: vec![
+                Note {
+                    id: 0,
+                    start_beat: 0.0,
+                    duration_beats: 1.0,
+                    pitch: 60,
+                    velocity: 100,
+                    lyric: Some("こ".into()),
+                    muted: false,
+                },
+                Note {
+                    id: 0,
+                    start_beat: 1.5,
+                    duration_beats: 0.5,
+                    pitch: 62,
+                    velocity: 100,
+                    lyric: Some("ん".into()),
+                    muted: false,
+                },
+            ],
+            ..Default::default()
+        }),
+    );
+    song.clip_content_names.insert(1, "こんにちは".into());
+    song.next_content_id = 2;
     assert_eq!(json_roundtrip(&song), song);
 }
 
@@ -1100,24 +1105,21 @@ fn v25_ensure_ids_adds_transform_device_for_group_transform_tracks() {
 }
 
 #[test]
-fn v19_clip_names_drain_into_shared_map_and_rename_is_group_wide() {
-    // Two linked clips (same content_id) carrying legacy v19 per-clip
-    // names. `ensure_clip_contents` drains the first non-empty name
-    // into the shared `clip_content_names` map and clears `Clip.name`.
+fn shared_clip_name_rename_is_group_wide_and_gc() {
+    // 2 linked clips (同 content_id)。per-clip 名の SSoT は `clip_content_names` (§10 以降)。
+    // 旧 v19 の per-clip `Clip.name` → 共有名 map ドレインは前処理層 (project.rs) のテストで担保。
     let mut song = Song {
         tracks: vec![Track {
             id: 1,
             clips: vec![
                 Clip {
                     id: 1,
-                    name: "Verse".into(),
                     length_beats: 4.0,
                     content_id: 7,
                     ..Clip::default()
                 },
                 Clip {
                     id: 2,
-                    name: "Verse".into(),
                     start_beat: 4.0,
                     length_beats: 4.0,
                     content_id: 7,
@@ -1129,10 +1131,7 @@ fn v19_clip_names_drain_into_shared_map_and_rename_is_group_wide() {
         ..Song::default()
     };
     song.ensure_clip_contents();
-
-    // Legacy per-clip names are drained to empty; the shared map owns it.
-    assert_eq!(song.tracks[0].clips[0].name, "");
-    assert_eq!(song.tracks[0].clips[1].name, "");
+    song.set_content_name(7, "Verse".into());
     assert_eq!(song.content_name(7), "Verse");
 
     // Renaming via the shared map renames the whole linked group: both
@@ -1495,11 +1494,9 @@ fn automation_clip_counts_toward_clip_content_refcount() {
         name: "T".into(),
         clips: vec![Clip {
             id: 1,
-            name: "main".into(),
             start_beat: 0.0,
             length_beats: 4.0,
             content_id: cid,
-            notes: Vec::new(),
             color: None,
             auto_lipsync: false,
             ..Default::default()
@@ -1800,11 +1797,9 @@ fn video_track_with_clip_content_roundtrip() {
         name: "Vid".into(),
         clips: vec![Clip {
             id: 1,
-            name: "intro".into(),
             start_beat: 0.0,
             length_beats: 4.0,
             content_id: cid,
-            notes: Vec::new(),
             color: None,
             auto_lipsync: false,
             ..Default::default()

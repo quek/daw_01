@@ -353,7 +353,6 @@ mod tests {
                 id: 1,
                 start_beat: 0.0,
                 length_beats: 4.0,
-                name: "test".into(),
                 content_id: cid,
                 ..Default::default()
             }];

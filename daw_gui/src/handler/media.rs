@@ -140,11 +140,9 @@ impl AppData {
                 let new_clip_id = track.alloc_clip_id();
                 track.clips.push(Clip {
                     id: new_clip_id,
-                    name: String::new(),
                     start_beat: next_start_beat,
                     length_beats,
                     content_id,
-                    notes: Vec::new(),
                     color: None,
                     auto_lipsync: false,
                     ..Default::default()
@@ -289,11 +287,9 @@ impl AppData {
                 let v_clip_id = video_track.alloc_clip_id();
                 video_track.clips.push(Clip {
                     id: v_clip_id,
-                    name: String::new(),
                     start_beat: next_start_beat,
                     length_beats: video_length_beats,
                     content_id: v_content_id,
-                    notes: Vec::new(),
                     color: None,
                     auto_lipsync: false,
                     ..Default::default()
@@ -336,11 +332,9 @@ impl AppData {
                     let a_clip_id = audio_track.alloc_clip_id();
                     audio_track.clips.push(Clip {
                         id: a_clip_id,
-                        name: String::new(),
                         start_beat: next_start_beat,
                         length_beats: audio_length_beats,
                         content_id: a_content_id,
-                        notes: Vec::new(),
                         color: None,
                         auto_lipsync: false,
                         ..Default::default()
@@ -518,11 +512,9 @@ impl AppData {
                 let i_clip_id = track.alloc_clip_id();
                 track.clips.push(Clip {
                     id: i_clip_id,
-                    name: String::new(),
                     start_beat: next_start_beat,
                     length_beats: image_clip_length_beats,
                     content_id: i_content_id,
-                    notes: Vec::new(),
                     color: None,
                     auto_lipsync: false,
                     ..Default::default()
@@ -586,11 +578,9 @@ impl AppData {
             let new_clip_idx = track.clips.len() as u32;
             track.clips.push(common::model::Clip {
                 id: clip_id,
-                name: String::new(),
                 start_beat,
                 length_beats,
                 content_id,
-                notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
                 ..Default::default()

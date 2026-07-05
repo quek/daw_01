@@ -29,8 +29,10 @@ fn main() {
         eprintln!("parse .daw json from {}: {e}", daw.display());
         std::process::exit(1);
     });
-    // (v30 §10) 旧 .daw は untagged clip_contents なので type タグを注入してから deserialize。
+    // (§10) 旧 .daw の legacy 構造を現行へ移し、untagged clip_contents に type タグを注入してから
+    // deserialize (ファイル load 経路と同じ前処理)。
     let mut song_value = envelope["song"].clone();
+    common::project::migrate_legacy_song(&mut song_value);
     common::project::tag_clip_contents_in_song(&mut song_value);
     let song: Song = serde_json::from_value(song_value).unwrap_or_else(|e| {
         eprintln!("parse Song from {} envelope: {e}", daw.display());

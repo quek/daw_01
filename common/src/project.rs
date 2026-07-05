@@ -232,7 +232,7 @@ fn migrate_legacy_device_chains(value: &mut serde_json::Value) {
         }
     }
 
-    let Some(song) = value.get_mut("song").and_then(Value::as_object_mut) else {
+    let Some(song) = value.as_object_mut() else {
         return;
     };
 
@@ -327,6 +327,160 @@ fn migrate_legacy_device_chains(value: &mut serde_json::Value) {
             }
         }
     }
+}
+
+/// deserialize 前に旧 per-clip インライン content を content store へ移す。
+/// v5 の `Clip.notes` (インライン MIDI) → `clip_contents[cid]`(未 tag Midi)、v19 の `Clip.name`
+/// (per-clip 名) → `clip_content_names[cid]` (共有名 map、同一 content_id は先勝ち)。content_id が
+/// 未採番 (0/欠落) の legacy clip には fresh id を採番し `next_content_id` を進める (runtime clip の
+/// 採番は `Song::ensure_clip_contents` が引き継ぐ)。automation lane / song lane の clip は name のみ
+/// (payload はインラインに持たない)。作った Midi は未 tag なので、後続の `migrate_clip_content_add_tag`
+/// (`notes` → Midi) が tag する。旧 in-memory 移行 (`ensure_clip_contents` の name/notes ドレイン、
+/// §10 で撤去) の JSON 前処理版。
+fn migrate_legacy_clip_content(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(song) = value.as_object_mut() else {
+        return;
+    };
+
+    // pre-scan: 全 clip の content_id 最大値 (採番カウンタを既存 id より上へ上げる)。
+    fn scan_max(clips: Option<&Value>, max: &mut u64) {
+        let Some(arr) = clips.and_then(Value::as_array) else {
+            return;
+        };
+        for c in arr {
+            if let Some(cid) = c.get("content_id").and_then(Value::as_u64) {
+                *max = (*max).max(cid);
+            }
+        }
+    }
+    let mut max_cid = 0u64;
+    if let Some(tracks) = song.get("tracks").and_then(Value::as_array) {
+        for t in tracks {
+            scan_max(t.get("clips"), &mut max_cid);
+            if let Some(lanes) = t.get("automation_lanes").and_then(Value::as_array) {
+                for l in lanes {
+                    scan_max(l.get("clips"), &mut max_cid);
+                }
+            }
+        }
+    }
+    if let Some(lanes) = song.get("song_lanes").and_then(Value::as_array) {
+        for l in lanes {
+            scan_max(l.get("clips"), &mut max_cid);
+        }
+    }
+    let mut counter = song
+        .get("next_content_id")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if counter <= max_cid {
+        counter = max_cid + 1;
+    }
+    if counter == 0 {
+        counter = 1;
+    }
+
+    // content store を song から取り出す (clip walk との借用衝突を避ける)。
+    let mut contents = match song.remove("clip_contents") {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let mut names = match song.remove("clip_content_names") {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+
+    // clip 1 個を処理: name → names、notes(許可時) → contents(Midi)、未採番なら content_id 採番。
+    let mut process = |clip: &mut Value, allow_notes: bool| {
+        let Some(obj) = clip.as_object_mut() else {
+            return;
+        };
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let notes = if allow_notes {
+            obj.get("notes")
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty())
+                .cloned()
+        } else {
+            None
+        };
+        obj.remove("name");
+        obj.remove("notes");
+        if name.is_none() && notes.is_none() {
+            return;
+        }
+        let mut cid = obj.get("content_id").and_then(Value::as_u64).unwrap_or(0);
+        if cid == 0 {
+            cid = counter;
+            counter += 1;
+            obj.insert("content_id".to_string(), Value::from(cid));
+        }
+        let key = cid.to_string();
+        if let Some(name) = name {
+            names.entry(key.clone()).or_insert_with(|| Value::from(name));
+        }
+        if let Some(notes) = notes {
+            contents
+                .entry(key)
+                .or_insert_with(|| serde_json::json!({ "notes": notes }));
+        }
+    };
+
+    if let Some(tracks) = song.get_mut("tracks").and_then(Value::as_array_mut) {
+        for t in tracks.iter_mut() {
+            if let Some(clips) = t.get_mut("clips").and_then(Value::as_array_mut) {
+                for c in clips.iter_mut() {
+                    process(c, true);
+                }
+            }
+            if let Some(lanes) = t
+                .get_mut("automation_lanes")
+                .and_then(Value::as_array_mut)
+            {
+                for l in lanes.iter_mut() {
+                    if let Some(clips) = l.get_mut("clips").and_then(Value::as_array_mut) {
+                        for c in clips.iter_mut() {
+                            process(c, false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(lanes) = song.get_mut("song_lanes").and_then(Value::as_array_mut) {
+        for l in lanes.iter_mut() {
+            if let Some(clips) = l.get_mut("clips").and_then(Value::as_array_mut) {
+                for c in clips.iter_mut() {
+                    process(c, false);
+                }
+            }
+        }
+    }
+
+    if !contents.is_empty() {
+        song.insert("clip_contents".to_string(), Value::Object(contents));
+    }
+    if !names.is_empty() {
+        song.insert("clip_content_names".to_string(), Value::Object(names));
+    }
+    song.insert("next_content_id".to_string(), Value::from(counter));
+}
+
+/// 全 song-load 経路 (`load_project` のファイル load、script の `appLoadSongJson` /
+/// `loadSongFromObject`) が deserialize 前に通す legacy song migration の束。song value を受け、
+/// 旧 sidechain / 3-split device chain / per-clip インライン content (v5 notes / v19 name) を
+/// 現行構造へ移す。1 箇所に集約することで load 経路ごとの migration 漏れ (= 旧データ欠落) を防ぐ。
+/// tagged ClipContent 化 (`tag_clip_contents_in_song`) は呼び元が続けて適用する
+/// (作った Midi content が tag される順序)。
+pub fn migrate_legacy_song(song: &mut serde_json::Value) {
+    migrate_legacy_sidechain_to_aux(song);
+    migrate_legacy_device_chains(song);
+    migrate_legacy_clip_content(song);
 }
 
 /// (v30) `ClipContent` を untagged → tagged (`type` field) 化した際の後方互換移行。
@@ -513,10 +667,12 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     let mut value: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse project JSON from {}", path.display()))?;
     migrate_vocal_source_to_clips(&mut value);
-    // 旧 sidechain_sources → aux_inputs を deserialize 前に lift (version 非依存・idempotent)。
-    migrate_legacy_sidechain_to_aux(&mut value);
-    // 旧 3-split device chain → 単一 devices 平坦化 + automation/binding の slot → device_index 解決。
-    migrate_legacy_device_chains(&mut value);
+    // 旧 sidechain / 3-split device chain / per-clip インライン content (v5 notes / v19 name) を
+    // deserialize 前に現行構造へ移す (全 load 経路共通の SSoT、clip_content_add_tag より前 =
+    // 作った Midi content が tag される)。
+    if let Some(song) = value.get_mut("song") {
+        migrate_legacy_song(song);
+    }
     // deserialize が成立する前に生の JSON を整える version-gated migration を単一 dispatch
     // table (VALUE_MIGRATIONS) から適用する (例: v30 の tagged ClipContent `type` 注入 —
     // tagged deserialize は `type` が無いと失敗するため from_value の前に当てる)。
@@ -799,7 +955,7 @@ mod tests {
                 ]
             }
         });
-        migrate_legacy_device_chains(&mut value);
+        migrate_legacy_device_chains(&mut value["song"]);
         let track = &value["song"]["tracks"][0];
         // flatten 順: midi_fx ++ instrument ++ fx。
         let ids: Vec<&str> = track["devices"]
@@ -841,7 +997,7 @@ mod tests {
                 "devices": [{ "plugin_id": "synth", "format": "Clap" }]
             }] }
         });
-        migrate_legacy_device_chains(&mut value);
+        migrate_legacy_device_chains(&mut value["song"]);
         let devices = value["song"]["tracks"][0]["devices"].as_array().unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0]["plugin_id"].as_str().unwrap(), "synth");
@@ -1051,11 +1207,9 @@ mod tests {
             source: InstrumentSource::Vocal,
             clips: vec![Clip {
                 id: 1,
-                name: "こんにちは".into(),
                 start_beat: 0.0,
                 length_beats: 16.0,
                 content_id: cid,
-                notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
                 muted: false,
@@ -1215,10 +1369,7 @@ mod tests {
         let song = load(&path).expect("v5 must forward-migrate");
         let clip = &song.tracks[0].clips[0];
         assert_ne!(clip.content_id, 0, "ensure_clip_contents must allocate");
-        assert!(
-            clip.notes.is_empty(),
-            "legacy notes must be drained on migration"
-        );
+        // 旧 inline `Clip.notes` は §10 で撤去され、前処理が clip_contents(Midi) へ移す。
         let content = song
             .clip_contents
             .get(&clip.content_id)

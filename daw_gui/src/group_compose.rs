@@ -789,11 +789,9 @@ mod tests {
             let cl = child.alloc_clip_id();
             child.clips.push(Clip {
                 id: cl,
-                name: "img".into(),
                 start_beat: 0.0,
                 length_beats: 8.0,
                 content_id: cid,
-                notes: Vec::new(),
                 color: None,
                 auto_lipsync: false,
                 ..Default::default()

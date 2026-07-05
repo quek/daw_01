@@ -129,11 +129,9 @@ mod tests {
                 source: InstrumentSource::BuiltinSynth,
                 clips: vec![Clip {
                     id: 1,
-                    name: "C".into(),
                     start_beat,
                     length_beats,
                     content_id: 0,
-                    notes: Vec::new(),
                     color: None,
                     auto_lipsync: false,
                     ..Default::default()
@@ -194,11 +192,9 @@ mod tests {
                     name: "A".into(),
                     clips: vec![Clip {
                         id: 1,
-                        name: "A0".into(),
                         start_beat: 0.0,
                         length_beats: 4.0,
                         content_id: 0,
-                        notes: Vec::new(),
                         color: None,
                         auto_lipsync: false,
                         ..Default::default()
@@ -209,11 +205,9 @@ mod tests {
                     name: "B".into(),
                     clips: vec![Clip {
                         id: 1,
-                        name: "B0".into(),
                         start_beat: 6.0,
                         length_beats: 2.0,
                         content_id: 0,
-                        notes: Vec::new(),
                         color: None,
                         auto_lipsync: false,
                         ..Default::default()

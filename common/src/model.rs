@@ -2049,50 +2049,16 @@ impl Song {
 
         for t_idx in 0..self.tracks.len() {
             for c_idx in 0..self.tracks[t_idx].clips.len() {
-                let needs_new_id = self.tracks[t_idx].clips[c_idx].content_id == 0;
-                let has_legacy_notes = !self.tracks[t_idx].clips[c_idx].notes.is_empty();
-                if needs_new_id {
+                if self.tracks[t_idx].clips[c_idx].content_id == 0 {
                     let new_id = self.alloc_content_id();
                     self.tracks[t_idx].clips[c_idx].content_id = new_id;
                 }
                 let cid = self.tracks[t_idx].clips[c_idx].content_id;
-                // v19→v20: drain legacy per-clip name into the shared name
-                // map (first non-empty wins for a shared content_id). Keeps
-                // the in-memory `Clip.name` invariant empty.
-                let legacy_name = std::mem::take(&mut self.tracks[t_idx].clips[c_idx].name);
-                if !legacy_name.is_empty() {
-                    self.clip_content_names.entry(cid).or_insert(legacy_name);
-                }
-                if has_legacy_notes {
-                    let notes =
-                        std::mem::take(&mut self.tracks[t_idx].clips[c_idx].notes);
-                    self.clip_contents
-                        .entry(cid)
-                        .and_modify(|c| {
-                            // Two clips both carrying legacy notes for
-                            // the same migrated content_id is impossible
-                            // (v5 stored notes per-clip; migration emits
-                            // a fresh content_id per clip), so just
-                            // overwrite if it ever happens. Promote any
-                            // existing Audio variant back to Midi (also
-                            // shouldn't happen, but keep the invariant).
-                            *c = ClipContent::Midi(MidiContent {
-                                notes: notes.clone(),
-                                ..Default::default()
-                            });
-                        })
-                        .or_insert_with(|| {
-                            ClipContent::Midi(MidiContent {
-                                notes,
-                                ..Default::default()
-                            })
-                        });
-                } else {
-                    // Ensure an entry exists for every referenced
-                    // content_id so lookups never have to handle the
-                    // missing case.
-                    self.clip_contents.entry(cid).or_default();
-                }
+                // Ensure an entry exists for every referenced content_id so
+                // lookups never miss. 旧 per-clip インライン content (v5 notes /
+                // v19 name) は deserialize 前に `project::migrate_legacy_clip_content`
+                // が content store へドレイン済み。
+                self.clip_contents.entry(cid).or_default();
             }
             for l_idx in 0..self.tracks[t_idx].automation_lanes.len() {
                 let lane_clip_count =
@@ -2108,18 +2074,11 @@ impl Song {
                     }
                     let cid = self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx]
                         .content_id;
-                    // v19→v20: drain legacy automation-clip name too.
-                    let legacy_name = std::mem::take(
-                        &mut self.tracks[t_idx].automation_lanes[l_idx].clips[c_idx].name,
-                    );
-                    if !legacy_name.is_empty() {
-                        self.clip_content_names.entry(cid).or_insert(legacy_name);
-                    }
                     // Automation clips have no legacy in-place payload
-                    // (v8-introduced) — just make sure the content
-                    // store has an entry so audio thread / GUI lookups
-                    // never miss. Default is `Midi(empty)`; writers
-                    // promote to `Automation` on first edit.
+                    // (v8-introduced) — just ensure the content store has an
+                    // entry so audio thread / GUI lookups never miss. Default
+                    // is `Midi(empty)`; writers promote to `Automation` on
+                    // first edit. (Legacy name は前処理でドレイン済み。)
                     self.clip_contents.entry(cid).or_insert_with(|| {
                         ClipContent::Automation(AutomationContent::default())
                     });
@@ -2127,10 +2086,10 @@ impl Song {
             }
         }
         // Song-level automation lanes share the same content store but are
-        // not reached by the per-track walk above. Reassign sentinel ids,
-        // drain legacy names, and ensure an entry exists — mirroring the
-        // `automation_lanes` handling so SongTempo / TimeSig curves resolve
-        // instead of silently falling back to empty.
+        // not reached by the per-track walk above. Reassign sentinel ids and
+        // ensure an entry exists — mirroring the `automation_lanes` handling so
+        // SongTempo / TimeSig curves resolve instead of falling back to empty.
+        // (Legacy name は前処理でドレイン済み。)
         for l_idx in 0..self.song_lanes.len() {
             let lane_clip_count = self.song_lanes[l_idx].clips.len();
             for c_idx in 0..lane_clip_count {
@@ -2139,11 +2098,6 @@ impl Song {
                     self.song_lanes[l_idx].clips[c_idx].content_id = new_id;
                 }
                 let cid = self.song_lanes[l_idx].clips[c_idx].content_id;
-                let legacy_name =
-                    std::mem::take(&mut self.song_lanes[l_idx].clips[c_idx].name);
-                if !legacy_name.is_empty() {
-                    self.clip_content_names.entry(cid).or_insert(legacy_name);
-                }
                 self.clip_contents.entry(cid).or_insert_with(|| {
                     ClipContent::Automation(AutomationContent::default())
                 });

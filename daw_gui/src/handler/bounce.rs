@@ -494,11 +494,9 @@ impl AppData {
                     let new_clip_id = new_track_mut.alloc_clip_id();
                     new_track_mut.clips.push(common::model::Clip {
                         id: new_clip_id,
-                        name: String::new(),
                         start_beat: pending.start_beat,
                         length_beats: pending.clip_length_beats,
                         content_id: new_content_id,
-                        notes: Vec::new(),
                         color: None,
                         auto_lipsync: false,
                         ..Default::default()

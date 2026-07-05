@@ -299,11 +299,9 @@ impl AppData {
                 let new_idx = track.clips.len() as u32;
                 track.clips.push(Clip {
                     id: new_clip_id,
-                    name: String::new(),
                     start_beat: combined_start,
                     length_beats: combined_len,
                     content_id: new_content_id,
-                    notes: Vec::new(),
                     color: None,
                     auto_lipsync: false,
                     muted: glue_muted,
