@@ -40,8 +40,9 @@ branch = `feature/arch-refactor`。各段の green を WIP commit でチェッ�
 - S6 DESIGN.md 現行化、S7 ワークフロー (CLAUDE.md 不変条件 + make arch-lint + guards 7 則 +
   /arch-review skill + implement/review skill 更新)
 
-**最新 green checkpoint**: commit `bb0c39d` (model.rs god-file 分割 = 7,488→2,771 行、invariant #9 を
-model.rs について解消。§10 dispatch table + class fix + §11 arch-lint 精密化も landed)。
+**最新 green checkpoint**: commit `a4767d9` (§10 bullet 2 = legacy field 8/8 撤去完了。invariant #9
+完全達成 (model.rs/ui.rs 分割)、§10 dispatch table + class fix、§11 arch-lint 精密化も landed。
+全ゲート green: make build/test/clippy/arch-lint + clip_rename smoke)。残 = §10 bullet 4 + S8 実機。
 
 **残タスク (逐次、各段 green を WIP commit)**:
 - **S5 §9 (full rework) 完了** — common は plugin-load / HTTP 系依存ゼロ (reqwest/libloading/
@@ -56,18 +57,22 @@ model.rs について解消。§10 dispatch table + class fix + §11 arch-lint �
   - S5-4 (`a29d55a`): common から **libloading/clap-sys/vst3 除去** (scan が抜けて利用者ゼロに)。
   - **video_fx/scale は common 残留が正** (common::model が参照、scale は wire 型)。track_params
     は未作成。
-- **S5 §10**: bullet 1/3 + class fix 完了。
+- **S5 §10**: bullet 1/2/3 + class fix 完了 (bullet 2 = legacy field 8/8 撤去)。残 bullet 4 のみ。
   - bullet 1 tag 化 (`57e8353`): ClipContent `#[serde(untagged)]` → `#[serde(tag = "type")]` +
     v29→v30 JSON 前処理 migration (全 variant 判別 + 空→Midi)、CURRENT_VERSION 30。
   - class fix (`830c3e6`): untagged song JSON を直 deserialize する全経路 (script appLoadSongJson /
     loadSongFromObject / export_bench example) に `tag_clip_contents_in_song` を適用。
   - bullet 3 dispatch table (`e1bb6b0`): version-gate 分岐を `VALUE_MIGRATIONS`/`SONG_MIGRATIONS` の
     `(introduced_in, fn)` 表へ一本化 (`Migration<T>` alias)。legacy 前処理を足す受け皿にもなる。
-  - **残 bullet 2**: legacy field 8 個の in-memory 型除去。調査で判明 = device flatten / slot→index /
-    aux / id 割当が `ensure_ids` 内で**相互依存**する all-or-nothing の migration+id パイプライン書き
-    換え (~200 行 + 既存 ~20 テストを load_project 経路へ) で、runtime 挙動ゼロ変化・旧 project 全
-    load が blast radius。単独の慎重なタスク (fixture 網は既存テストで概ね揃っている)。
-  - **残 bullet 4**: Song sub-struct 化 (MediaPools/IdAllocators)。wire/save 互換影響大、最終段。
+  - bullet 2 legacy field 8/8 撤去 (`2bbc007`+`5f5f969`+`a4767d9`): aux(sidechain→aux_inputs) /
+    Track.legacy_*×3(3-split→devices flatten) / AutomationTarget・BindingTarget.legacy_slot(→device_index) /
+    Clip.name(→clip_content_names)・Clip.notes(→clip_contents Midi) を JSON 前処理へ移設。PluginSlot enum も
+    protocol→migration 層へ。全 load 経路 (load_project / script appLoadSongJson・loadSongFromObject /
+    export_bench) が `migrate_legacy_song` を通る SSoT 化 — 旧は script 経路が migration 漏れで legacy song
+    の name 欠落 (clip_rename_smoke で発覚し是正)。content_id 採番は core (runtime clip 用) なので
+    `ensure_clip_contents` に残し name/notes ドレインのみ前処理へ。workspace 全域 ~30 の Clip 構築サイトの
+    空 name/notes を除去。挙動・serialize 不変。
+  - **残 bullet 4**: Song sub-struct 化 (MediaPools/IdAllocators)。wire/save 互換影響大、plan が明記する最終段。
 - **invariant #9 (god-file budget) — 完全達成** (`eefdea1`+`bb0c39d`+`720e2c1`): make arch-lint =
   **OK (違反なし)**。
   - model.rs 7,488→2,771: tests → model/tests.rs、型群 → model/{track,modulation,content,
