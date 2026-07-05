@@ -146,11 +146,11 @@ impl AppData {
         self.voicevox.voicevox_launch_attempted = true;
         let job = Arc::clone(&self.voicevox.voicevox_job);
         std::thread::spawn(move || {
-            if common::voicevox_engine::is_running() {
+            if crate::voicevox_engine::is_running() {
                 return;
             }
-            let Some(engine) = common::voicevox_engine::resolve_engine_path() else {
-                let cfg_hint = common::voicevox_engine::engine_path_config_file()
+            let Some(engine) = crate::voicevox_engine::resolve_engine_path() else {
+                let cfg_hint = crate::voicevox_engine::engine_path_config_file()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "<no localappdata>".into());
                 tracing::warn!(
@@ -160,7 +160,7 @@ impl AppData {
                 return;
             };
             tracing::info!(?engine, "lazy spawn VOICEVOX engine for builtin plugin");
-            match common::voicevox_engine::spawn_engine(&engine) {
+            match crate::voicevox_engine::spawn_engine(&engine) {
                 Ok(child) => {
                     if let Err(e) = job.assign_std(&child) {
                         tracing::warn!(error = ?e, "failed to attach VOICEVOX to job");

@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 common = { path = "../common" }
 anyhow.workspace = true
+dirs.workspace = true
+reqwest.workspace = true
 boa_engine = { version = "0.21", optional = true }
 midir.workspace = true
 midly.workspace = true

@@ -37,7 +37,7 @@ use common::plugin_db::BUILTIN_ID_VOICEVOX;
 use common::plugin_format::PluginFormat;
 use common::plugin_metadata::{NoteMetadata, TalkMetadata};
 use common::protocol::RenderMode;
-use common::voicevox::{
+use crate::builtin::voicevox_synth::{
     BuiltinNoteSpec, BuiltinSynthOutput, synthesize_notes_for_builtin, synthesize_talk_for_builtin,
 };
 

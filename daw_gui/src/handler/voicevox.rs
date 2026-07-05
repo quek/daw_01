@@ -396,7 +396,7 @@ impl AppData {
         std::thread::spawn(move || {
             let mut clips = Vec::with_capacity(snaps.len() + talk_snaps.len());
             for (clip_start_beat, clip_len_beats, first_note_local_beat, priority, notes) in snaps {
-                match common::voicevox::query_phonemes(&notes, bpm) {
+                match crate::voicevox_client::query_phonemes(&notes, bpm) {
                     Ok(phonemes) => clips.push(LipsyncClipResult {
                         clip_start_beat,
                         clip_len_beats,
@@ -414,7 +414,7 @@ impl AppData {
             for (clip_start_beat, clip_len_beats, first_note_local_beat, priority, text, speaker_id, scales) in
                 talk_snaps
             {
-                match common::voicevox::query_talk_phonemes(&text, speaker_id, &scales) {
+                match crate::voicevox_client::query_talk_phonemes(&text, speaker_id, &scales) {
                     Ok(phonemes) => clips.push(LipsyncClipResult {
                         clip_start_beat,
                         clip_len_beats,

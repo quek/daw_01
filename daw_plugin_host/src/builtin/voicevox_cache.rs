@@ -7,7 +7,7 @@
 //!
 //! 旧実装は in-memory・プロセス寿命のみで、 プロジェクトを開き直すたびに全曲を
 //! 再合成していた。 本キャッシュは per-user global (`%LOCALAPPDATA%\daw_01\
-//! voicevox_cache\`、 [`crate::app_dirs::AppDirs::voicevox_cache_dir`]) に置くので:
+//! voicevox_cache\`、 [`common::app_dirs::AppDirs::voicevox_cache_dir`]) に置くので:
 //!
 //! - プロジェクトを開き直しても再合成しない (= #77 の本旨)
 //! - 同じフレーズはプロジェクト跨ぎで再利用される (コンテンツアドレスの利点)
@@ -22,7 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::model::TalkParams;
+use common::model::TalkParams;
 
 /// 安定 64-bit キー。 `DefaultHasher` は固定キー (0,0) の SipHash-1-3 なので
 /// **プロセス間で安定** (randomize されるのは `RandomState` の方)。 Rust の
@@ -82,7 +82,7 @@ impl VoiceVoxDiskCache {
     /// production の per-user キャッシュ (`AppDirs::production().voicevox_cache_dir()`)。
     /// local data dir が解決できない極端な環境では `None` (= キャッシュ無効)。
     pub fn production() -> Option<Self> {
-        Some(Self::at(crate::app_dirs::AppDirs::production()?.voicevox_cache_dir()))
+        Some(Self::at(common::app_dirs::AppDirs::production()?.voicevox_cache_dir()))
     }
 
     fn path_for(&self, key: CacheKey) -> PathBuf {

@@ -945,7 +945,7 @@ pub enum AppEvent {
     // VOICEVOX plugin 経由で自動 synth)。
     /// VOICEVOX engine `/singers` の取得結果。 起動時 background thread が
     /// 1 度発行する。 失敗時は空 Vec で送る。
-    SingersLoaded(Vec<common::voicevox::VoiceVoxSinger>),
+    SingersLoaded(Vec<crate::voicevox_client::VoiceVoxSinger>),
     /// 口パク (lip-sync) 背景ジョブ完了。`regenerate_lipsync_for_track` が
     /// spawn したスレッドが `query_phonemes` の結果を vocal clip 単位で詰めて
     /// 発行し、handler (`apply_lipsync_generated`) が口 track へ反映する。
@@ -995,7 +995,7 @@ pub enum AppEvent {
     RefetchSingers,
     /// (talk) VOICEVOX engine `/speakers` の取得結果 (`docs/plan_voicevox_talk.md` §4)。
     /// 起動時 background thread が 1 度発行。失敗時は空 Vec。
-    SpeakersLoaded(Vec<common::voicevox::VoiceVoxSinger>),
+    SpeakersLoaded(Vec<crate::voicevox_client::VoiceVoxSinger>),
     /// (talk) Text clip Inspector の「再取得」ボタン。`/speakers` を再取得する。
     RefetchSpeakers,
     /// (talk) Text clip Inspector の talk スケール (話速/音高/抑揚/音量) を 1 つ

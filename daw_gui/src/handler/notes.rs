@@ -651,8 +651,8 @@ impl AppData {
         let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             // engine が ready になるまで待つ (未起動なら timeout で抜ける)。
-            common::voicevox_engine::wait_until_ready();
-            let singers = common::voicevox::fetch_singers().unwrap_or_else(|e| {
+            crate::voicevox_engine::wait_until_ready();
+            let singers = crate::voicevox_client::fetch_singers().unwrap_or_else(|e| {
                 tracing::warn!(error = ?e, "VOICEVOX /singers fetch failed");
                 Vec::new()
             });
@@ -666,8 +666,8 @@ impl AppData {
     pub(crate) fn spawn_fetch_speakers(&self) {
         let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
-            common::voicevox_engine::wait_until_ready();
-            let speakers = common::voicevox::fetch_speakers().unwrap_or_else(|e| {
+            crate::voicevox_engine::wait_until_ready();
+            let speakers = crate::voicevox_client::fetch_speakers().unwrap_or_else(|e| {
                 tracing::warn!(error = ?e, "VOICEVOX /speakers fetch failed");
                 Vec::new()
             });

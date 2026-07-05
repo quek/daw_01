@@ -28,8 +28,6 @@ pub mod time;
 pub mod timing;
 pub mod video_fx;
 pub mod voicevox;
-pub mod voicevox_cache;
-pub mod voicevox_engine;
 pub mod vst3_scan;
 pub mod wire;
 pub mod worker_bridge;

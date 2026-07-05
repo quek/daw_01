@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::voicevox::VOICEVOX_URL;
+use common::voicevox::VOICEVOX_URL;
 
 const VERSION_PATH: &str = "version";
 const POLL_INTERVAL: Duration = Duration::from_millis(500);

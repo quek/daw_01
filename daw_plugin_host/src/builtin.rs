@@ -32,6 +32,8 @@ use crate::plugin_instance::{
 };
 
 mod voicevox;
+mod voicevox_cache;
+mod voicevox_synth;
 
 pub use voicevox::VoicevoxBuiltin;
 

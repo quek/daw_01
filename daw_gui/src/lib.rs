@@ -57,4 +57,6 @@ pub mod subprocess;
 pub mod theme;
 pub mod video_fx;
 pub mod view;
+pub mod voicevox_client;
+pub mod voicevox_engine;
 pub mod widgets;

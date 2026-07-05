@@ -11,12 +11,12 @@ pub struct VoicevoxState {
     /// `AppEvent::SingersLoaded` で投入する。 engine 未起動 / fetch 失敗時は
     /// 空のまま (Clip Inspector の声 dropdown は焼き込み声名 + 「取得中…」表示)。
     /// Clip Inspector の 2 段 dropdown (キャラ→style) が直接読む。
-    pub singers: Vec<common::voicevox::VoiceVoxSinger>,
+    pub singers: Vec<crate::voicevox_client::VoiceVoxSinger>,
     /// (talk) VOICEVOX engine `/speakers` の結果 (`docs/plan_voicevox_talk.md` §4)。
     /// Text clip の talk 声 dropdown (キャラ→talk style) が直接読む。sing の `singers`
     /// (= `/singers`) とは別 id 空間。engine 起動時に background thread が
     /// `AppEvent::SpeakersLoaded` で投入。未取得なら焼き込み声名 + 「取得中…」表示。
-    pub talk_speakers: Vec<common::voicevox::VoiceVoxSinger>,
+    pub talk_speakers: Vec<crate::voicevox_client::VoiceVoxSinger>,
     /// VOICEVOX engine の auto-kill 用 Job dispatcher。
     /// production は `Win32JobDispatcher` (`JobHandle::assign_std` ラップ)、
     /// test は `NoopJobDispatcher`。 trait DI により AppData::new の

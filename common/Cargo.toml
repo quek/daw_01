@@ -11,7 +11,6 @@ clap-sys.workspace = true
 dirs.workspace = true
 hound.workspace = true
 libloading.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
