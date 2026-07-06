@@ -29,6 +29,11 @@ impl AppData {
         // として記録し、開いた直後の非入力編集 (track rename 等) で口パクが再生成
         // されないようにする (= `LipsyncDebounceFired` が fingerprint 一致でスキップ)。
         self.seed_lipsync_fingerprints();
+        // r.md #17/#18: 旧バージョンで生成した重なり口 clip / 隙間で口が消える clip を、
+        // 現行の「1 本の連続 clip・隙間は閉じ口」不変条件へ決定論的に畳み直す。 既に
+        // 目標形なら no-op (dirty 化しない) なので、 seed の直後 (= clean baseline 後) に
+        // 呼んで、 実際に畳んだ legacy プロジェクトだけを dirty にする。
+        self.normalize_lipsync_clips_on_load();
         // `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
         // 別 project に持ち越さない。 段階ズームのアンカーと lane 高
         // override も旧 project の lane key を指すので一緒に破棄。

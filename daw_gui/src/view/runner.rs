@@ -913,7 +913,10 @@ impl Runner {
             };
             let max_dt_ms = self.diag_window_max_dt.as_millis() as u64;
             let mean_dt_ms = elapsed_ms / self.diag_window_count as u64;
-            tracing::info!(
+            // r.md #16: 再生 / lip-sync / synth アニメ中は毎 frame 再描画するので
+            // これは ~2 行/秒で既定ログを埋める。 debug へ降格し (RUST_LOG=debug で
+            // 復活)、 info の既定ログには出さない。
+            tracing::debug!(
                 frames = self.diag_window_count,
                 elapsed_ms,
                 fps = format!("{fps:.1}"),

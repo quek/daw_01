@@ -571,6 +571,17 @@ impl AppData {
         if new_name.is_empty() {
             return;
         }
+        // 同名なら no-op (r.md #12 の sibling: dirty 化させない)。
+        if self
+            .song_doc
+            .song()
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .is_some_and(|t| t.name == new_name)
+        {
+            return;
+        }
         self.edit_song(|song| {
             if let Some(track) = song.tracks.iter_mut().find(|t| t.id == track_id) {
                 track.name = new_name;
@@ -599,11 +610,38 @@ impl AppData {
         if new_name.is_empty() {
             return;
         }
+        // 同名なら no-op (r.md #12 の sibling: dirty 化させない)。
+        if self
+            .song_doc
+            .song()
+            .sections
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.name == new_name)
+        {
+            return;
+        }
         self.edit_song(|song| {
             if let Some(s) = song.sections.iter_mut().find(|s| s.id == id) {
                 s.name = new_name;
             }
         });
+    }
+
+    /// clip rename の編集バッファ seed / no-op 判定の比較基準となる現在の表示名。
+    /// Text clip は先頭の非空 TextEvent 本文、 それ以外は content_name (未設定は "")。
+    /// `begin_rename_clip` の pre-fill と `commit_rename_clip` の同名判定で共有する
+    /// (DRY: 両者が同じ「現在名」を見ることで、 未編集 commit が確実に no-op になる)。
+    fn clip_rename_current(&self, content_id: common::model::ContentId) -> String {
+        self.song_doc
+            .song()
+            .clip_contents
+            .get(&content_id)
+            .and_then(|c| c.text_events())
+            .and_then(|events| events.first())
+            .map(|ev| ev.text.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| self.song_doc.song().content_name(content_id).to_string())
     }
 
     pub(crate) fn begin_rename_clip(&mut self, target: ClipRef) {
@@ -618,24 +656,20 @@ impl AppData {
         };
         // 表示されている名前 (= clip_display_label と同じ) を編集開始値にする。
         // Text clip は本文 (= first TextEvent.text) を、 それ以外は content_name を pre-fill。
-        self.ui_ephemeral.clip_rename_text = self
-            .song_doc.song()
-            .clip_contents
-            .get(&content_id)
-            .and_then(|c| c.text_events())
-            .and_then(|events| events.first())
-            .map(|ev| ev.text.clone())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| self.song_doc.song().content_name(content_id).to_string());
+        self.ui_ephemeral.clip_rename_text = self.clip_rename_current(content_id);
         self.ui_ephemeral.clip_rename = Some(target);
     }
 
-    /// clip rename を確定。 trim 後空文字なら無変更 (track rename と同じ)。
-    /// clip 名は表示専用 (audio / plugin processing に無関係) なので
-    /// `flush_song_sync` は呼ばない。 song の変更は autosave /
-    /// undo snapshot (`is_undoable`) に乗る。 名前は `content_id` 単位の
-    /// SSoT (`Song.clip_content_names`) に書くので、 同 content を共有する
-    /// linked clip 全部が同時に rename される。
+    /// clip rename を確定。 clip 名は表示専用 (audio / plugin processing に無関係)
+    /// なので `flush_song_sync` は呼ばない。 名前は `content_id` 単位の SSoT
+    /// (`Song.clip_content_names`) に書くので、 同 content を共有する linked clip
+    /// 全部が同時に rename される。
+    ///
+    /// r.md #12: リネーム前後で名前が同じなら **`edit_song` を一切呼ばず** 早期
+    /// return する (= epoch を bump しない = dirty マークが付かない)。
+    /// r.md #15: 空文字は「名前をクリア」として通す。 非 Text は共有名を削除して
+    /// derived / 空表示へ戻し、 Text は本文をクリアする (旧実装は空文字を無条件
+    /// 無視して元の名前に張り付いていた)。
     pub(crate) fn commit_rename_clip(&mut self) {
         let Some(target) = self.ui_ephemeral.clip_rename else {
             return;
@@ -643,9 +677,6 @@ impl AppData {
         self.ui_ephemeral.clip_rename = None;
         let new_name = self.ui_ephemeral.clip_rename_text.trim().to_string();
         self.ui_ephemeral.clip_rename_text.clear();
-        if new_name.is_empty() {
-            return;
-        }
         let Some(content_id) = self
             .song_doc.song()
             .tracks
@@ -655,20 +686,32 @@ impl AppData {
         else {
             return;
         };
-        // Text clip は本文 (= 全 TextEvent.text) に書く。 表示名 (clip_display_label)
-        // は content-first で本文を優先するので、 content_name を書いても見えない。
-        // set_clip_text_event_content が全 event 書換え + edit buffer resync + is_dirty を
-        // 行う (inspector の content 編集と同経路)。 非 Text clip は従来どおり content_name。
-        if matches!(
+        // 同名なら no-op (r.md #12: dirty 化させない)。 begin と同じ「現在名」で
+        // 比較するので、 未編集のまま確定した場合も必ず一致して no-op になる。
+        if new_name == self.clip_rename_current(content_id) {
+            return;
+        }
+        let is_text = matches!(
             self.song_doc.song().clip_contents.get(&content_id),
             Some(common::model::ClipContent::Text(_))
-        ) {
+        );
+        if is_text {
+            // Text (字幕) clip は本文 (= 全 TextEvent.text) がそのまま表示名。 空文字
+            // リネームで本文を丸ごと消すのは破壊的なので **no-op** にする (字幕を空に
+            // したいときは inspector の本文編集を使う)。 r.md #15 の「空でクリア」は
+            // 名前を別に持つ非 Text clip 向けの挙動。
+            if new_name.is_empty() {
+                return;
+            }
+            // set_clip_text_event_content が全 event 書換え + edit buffer resync + dirty を
+            // 行う (inspector の content 編集と同経路)。
             self.set_clip_text_event_content(target, new_name);
+        } else if new_name.is_empty() {
+            // r.md #15: 共有名を削除 → content_name が "" になり、 clip_display_label は
+            // derived (歌詞) / 空へ fallback する。
+            self.edit_song(|song| song.clear_content_name(content_id));
         } else {
             self.edit_song(|song| song.set_content_name(content_id, new_name));
-            // content_name 経路は Song 側 set_content_name が dirty を持たないが、
-            // CommitRenameClip は is_undoable なので #40 のチョークポイント
-            // (handle_event 冒頭) が既に is_dirty を立てている (= 手動 arm 不要)。
         }
     }
 

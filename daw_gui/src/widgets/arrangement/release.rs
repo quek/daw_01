@@ -684,8 +684,13 @@ pub(super) fn commit_releases(
         }
 
         // ---- short click on lanes (drag<16px) → SelectClips ----
+        // context menu 等の popup が開いている間は、 menu item への click が背景の
+        // arrangement にも届いて「空きレーン click」と誤判定され選択がクリアされる
+        // (context menu は capture_input==false で background pointer を mask しない)。
+        // popup が開いている frame は clip 選択の click を処理しない (r.md #14)。
         if let Some(((cx, cy), click_ctrl, click_shift)) = clip_short_click_pos
             && lanes.contains(cx, cy)
+            && !ui.has_open_popups()
         {
             let prev = selected_clips.to_vec();
             let next: Vec<ClipKey> =
@@ -818,6 +823,7 @@ pub(super) fn commit_releases(
             && !clip_drag_release_was_some
             && !pointer.modifiers.shift
             && !marquee_active
+            && !ui.has_open_popups() // popup (context menu 等) の item click で clear しない (r.md #14)
             && let Some((cx, cy)) = pointer.pos
             && lanes.contains(cx, cy)
             && clip_hit(visible_tracks, press_tops, view, lanes, cx, cy, style.resize_handle_px).is_none()

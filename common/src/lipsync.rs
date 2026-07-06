@@ -11,7 +11,7 @@
 //! 副作用なし・純粋関数なので unit test しやすい。実際の HTTP 取得は
 //! `crate::voicevox::query_phonemes`、生成先 clip への適用は daw_gui 側。
 
-use crate::model::{ImageEvent, MouthMap, MouthShape};
+use crate::model::{ClipContent, ImageEvent, MouthMap, MouthShape, Song};
 use crate::voicevox::{FRAME_RATE, Phoneme, REST_FRAMES};
 
 /// VOICEVOX frame 数 → clip-local beats。
@@ -165,6 +165,98 @@ pub fn build_mouth_events(
     events
 }
 
+/// `out` の末尾へ `(s, e, img)` を push する。 末尾が同一 image で連続 (端が
+/// 一致) していれば区間を延長して 1 本に coalesce する。 長さ ≈ 0 は捨てる。
+fn push_coalesced(out: &mut Vec<(f64, f64, u32)>, s: f64, e: f64, img: u32) {
+    if e - s <= 1e-9 {
+        return;
+    }
+    if let Some(last) = out.last_mut()
+        && last.2 == img
+        && (s - last.1).abs() <= 1e-6
+    {
+        last.1 = e;
+        return;
+    }
+    out.push((s, e, img));
+}
+
+/// 開き口区間 `open_spans` (song-absolute、 start 昇順・非重複) を、 `range`
+/// 全体を隙間なく覆う `(start, end, image_id)` 列にする。 open span 同士の隙間と、
+/// `range` 先頭 / 末尾の余りは `closed_id` (閉じ口) で埋める
+/// (r.md #18: 歌もセリフも無い間は閉じ口を置く → 口が消えない)。
+///
+/// `closed_id == 0` (閉じ口が未割当) のときは埋めず、 `range` にクランプした
+/// open span だけを返す (= 従来どおり隙間は口なし)。 隣接する同一 image は
+/// 1 区間に coalesce する。 返す区間は `range` 内で非重複・start 昇順。
+#[must_use]
+pub fn fill_mouth_timeline(
+    open_spans: &[(f64, f64, u32)],
+    range: (f64, f64),
+    closed_id: u32,
+) -> Vec<(f64, f64, u32)> {
+    let (r0, r1) = range;
+    if r1 - r0 <= 1e-9 {
+        return Vec::new();
+    }
+    let mut out: Vec<(f64, f64, u32)> = Vec::new();
+    let mut cursor = r0;
+    for &(s, e, img) in open_spans {
+        let s = s.max(r0);
+        let e = e.min(r1);
+        if e - s <= 1e-9 {
+            continue;
+        }
+        // 直前 open span との隙間を閉じ口で埋める (closed_id == 0 なら空けたまま)。
+        if closed_id != 0 && s - cursor > 1e-9 {
+            push_coalesced(&mut out, cursor, s, closed_id);
+        }
+        // open span 本体 (直前区間と重ならないよう cursor 以降にクランプ)。
+        push_coalesced(&mut out, s.max(cursor), e, img);
+        cursor = cursor.max(e);
+    }
+    // range 末尾の余りを閉じ口で埋める。
+    if closed_id != 0 && r1 - cursor > 1e-9 {
+        push_coalesced(&mut out, cursor, r1, closed_id);
+    }
+    out
+}
+
+/// 口 track (`mouth_track_id`) が属する立ち絵 group の「body が映っている」
+/// 時間範囲 (song-absolute beats) を返す。 = 同じ group (親 = 口 track の
+/// `parent_group_id`) に属する track 群 — group track 自身と直下の子 — が持つ
+/// **`auto_lipsync` でない Image clip** の `start..end` の和。
+///
+/// 口 track が group に属さない、 または body となる Image clip が 1 つも無ければ
+/// `None`。 r.md #18 (option 1「立ち絵が映っている間ずっと閉じ口」) で、 閉じ口を
+/// 敷き詰める範囲を決めるのに使う。 生成物である口 clip (`auto_lipsync`) は body に
+/// 含めない (自己参照を避ける)。 subtitle 等の Text clip も body ではないので除く。
+#[must_use]
+pub fn tachie_body_range(song: &Song, mouth_track_id: u32) -> Option<(f64, f64)> {
+    let group_id = song.track_by_id(mouth_track_id)?.parent_group_id?;
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for t in &song.tracks {
+        // 同じ立ち絵 group = group track 自身、 またはその直下の子 (siblings)。
+        if t.id != group_id && t.parent_group_id != Some(group_id) {
+            continue;
+        }
+        for c in &t.clips {
+            if c.auto_lipsync {
+                continue;
+            }
+            if matches!(
+                song.clip_contents.get(&c.content_id),
+                Some(ClipContent::Image(_))
+            ) {
+                lo = lo.min(c.start_beat);
+                hi = hi.max(c.start_beat + c.length_beats);
+            }
+        }
+    }
+    (hi - lo > 1e-9).then_some((lo, hi))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +393,102 @@ mod tests {
         assert!(build_mouth_events(&[], &full_map(), 120.0, 0.0, 4.0).is_empty());
         assert!(build_mouth_events(&[ph("a", 10)], &full_map(), 120.0, 0.0, 0.0).is_empty());
         assert!(build_mouth_events(&[ph("a", 10)], &full_map(), 0.0, 0.0, 4.0).is_empty());
+    }
+
+    // ---- fill_mouth_timeline (r.md #18) ------------------------------------
+
+    #[test]
+    fn fill_timeline_fills_gaps_head_and_tail_with_closed() {
+        // open [2,4) img1, [6,8) img2、 range [0,10)、 closed=9。
+        let filled = fill_mouth_timeline(&[(2.0, 4.0, 1), (6.0, 8.0, 2)], (0.0, 10.0), 9);
+        assert_eq!(
+            filled,
+            vec![
+                (0.0, 2.0, 9),  // 先頭埋め
+                (2.0, 4.0, 1),
+                (4.0, 6.0, 9),  // 中間 (歌/セリフ無し) を閉じ口で埋める
+                (6.0, 8.0, 2),
+                (8.0, 10.0, 9), // 末尾埋め
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_timeline_closed_unassigned_leaves_gaps() {
+        // closed_id == 0 (閉じ口未割当) → 埋めず open だけ (range クランプのみ)。
+        let filled = fill_mouth_timeline(&[(2.0, 4.0, 1), (6.0, 8.0, 2)], (0.0, 10.0), 0);
+        assert_eq!(filled, vec![(2.0, 4.0, 1), (6.0, 8.0, 2)]);
+    }
+
+    #[test]
+    fn fill_timeline_empty_open_is_all_closed() {
+        // 歌もセリフも無い立ち絵 → 範囲全体を閉じ口 1 本で覆う。
+        assert_eq!(fill_mouth_timeline(&[], (0.0, 4.0), 7), vec![(0.0, 4.0, 7)]);
+    }
+
+    #[test]
+    fn fill_timeline_open_equal_to_closed_coalesces_whole_range() {
+        // open の image が閉じ口と同じなら、 先頭埋め・本体・末尾埋めが 1 本に融合。
+        assert_eq!(fill_mouth_timeline(&[(4.0, 6.0, 7)], (0.0, 10.0), 7), vec![(0.0, 10.0, 7)]);
+    }
+
+    #[test]
+    fn fill_timeline_open_covers_full_range_no_closed() {
+        // open が range 全体を覆う → 閉じ口は 1 つも入らない。
+        assert_eq!(fill_mouth_timeline(&[(0.0, 10.0, 3)], (0.0, 10.0), 9), vec![(0.0, 10.0, 3)]);
+    }
+
+    #[test]
+    fn fill_timeline_clamps_open_outside_range() {
+        // range 外へはみ出す open はクランプ、 range 外は捨てる。
+        let filled = fill_mouth_timeline(&[(-2.0, 3.0, 1), (8.0, 20.0, 2)], (0.0, 10.0), 9);
+        assert_eq!(filled, vec![(0.0, 3.0, 1), (3.0, 8.0, 9), (8.0, 10.0, 2)]);
+    }
+
+    // ---- tachie_body_range (r.md #18) --------------------------------------
+
+    fn img_track(id: u32, parent: Option<u32>, clips: Vec<crate::model::Clip>) -> crate::model::Track {
+        crate::model::Track {
+            id,
+            parent_group_id: parent,
+            clips,
+            ..Default::default()
+        }
+    }
+
+    fn img_clip(song: &mut Song, start: f64, len: f64, auto: bool) -> crate::model::Clip {
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Image(crate::model::ImageContent { events: vec![] }),
+        );
+        crate::model::Clip {
+            id: 1,
+            start_beat: start,
+            length_beats: len,
+            content_id: cid,
+            auto_lipsync: auto,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn body_range_is_union_of_group_image_clips_excluding_auto() {
+        // group G(1) 直下に body image track(2) [0,8) と 口 track(3)(auto clip [0,12))。
+        // body 範囲は body track の Image clip だけの和 = [0,8)。 auto_lipsync は除外。
+        let mut song = Song::default();
+        let body = img_clip(&mut song, 0.0, 8.0, false);
+        let auto = img_clip(&mut song, 0.0, 12.0, true);
+        song.tracks.push(img_track(1, None, vec![]));        // group container
+        song.tracks.push(img_track(2, Some(1), vec![body])); // body 立ち絵
+        song.tracks.push(img_track(3, Some(1), vec![auto])); // 口 track (auto)
+        assert_eq!(tachie_body_range(&song, 3), Some((0.0, 8.0)));
+    }
+
+    #[test]
+    fn body_range_none_without_group() {
+        let mut song = Song::default();
+        song.tracks.push(img_track(5, None, vec![]));
+        assert_eq!(tachie_body_range(&song, 5), None);
     }
 }

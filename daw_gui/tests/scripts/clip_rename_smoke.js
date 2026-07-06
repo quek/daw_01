@@ -3,8 +3,8 @@
 //
 // flow:
 //   1. 1 track + 1 audio clip (name "clip1") の Song を構築 + load
-//   2. rename → overwrite → 前後空白 trim → 空白のみ no-op → 空文字 no-op
-//   を inspectSongJson で逐次 assert
+//   2. rename → overwrite → 前後空白 trim → 空文字はクリア (r.md #15) →
+//      クリア後に再リネーム → 空白のみもクリア を inspectSongJson で逐次 assert
 
 function expectEq(actual, expected, label) {
   if (actual !== expected) {
@@ -97,14 +97,21 @@ daw.dispatchRenameClip(ref, "  Bridge  ");
 s = JSON.parse(daw.inspectSongJson());
 expectEq(s.tracks[0].clips[0].name, "Bridge", "trimmed name");
 
-// ---- 6. 空白のみ → trim 後空 → no-op (前の名前を維持) ------------------
-daw.dispatchRenameClip(ref, "   ");
-s = JSON.parse(daw.inspectSongJson());
-expectEq(s.tracks[0].clips[0].name, "Bridge", "whitespace-only no-op");
-
-// ---- 7. 空文字 → no-op --------------------------------------------------
+// ---- 6. 空文字 → 名前をクリア (r.md #15) --------------------------------
+// 旧挙動は「空文字は無視 = 元の名前に張り付く」だったが、 これは修正済み。
+// 共有名を削除するので inspectSongJson の name は undefined (= 未設定) になる。
 daw.dispatchRenameClip(ref, "");
 s = JSON.parse(daw.inspectSongJson());
-expectEq(s.tracks[0].clips[0].name, "Bridge", "empty no-op");
+expectEq(s.tracks[0].clips[0].name, undefined, "empty clears name");
+
+// ---- 7. クリア後に再度リネームできる ------------------------------------
+daw.dispatchRenameClip(ref, "Outro");
+s = JSON.parse(daw.inspectSongJson());
+expectEq(s.tracks[0].clips[0].name, "Outro", "rename after clear");
+
+// ---- 8. 空白のみ → trim 後空 → 同じくクリア -----------------------------
+daw.dispatchRenameClip(ref, "   ");
+s = JSON.parse(daw.inspectSongJson());
+expectEq(s.tracks[0].clips[0].name, undefined, "whitespace-only clears name");
 
 // すべての assert に通れば exit 0 (= test pass)

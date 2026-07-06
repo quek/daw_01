@@ -21,6 +21,15 @@ use crate::app::{AppData, AppEvent, ModControlDomain};
 const STRIP_WIDTH: f32 = 80.0;
 const STRIP_GAP: f32 = 4.0;
 const TOP_LABEL_H: f32 = 18.0;
+/// r.md #13: strip 上端の「トラック名バンド」の高さ (px)。 この帯を押すと
+/// トラックを選択する (M/S トグルや fader/knob より上なので操作と干渉しない)。
+/// top pad(6) + 名前(TOP_LABEL_H=18) = 次の M/S トグル行の直前まで。
+const NAME_BAND_H: f32 = 24.0;
+/// group strip の名前バンド左端にある折り畳み disclosure (▶/▼) が占める幅
+/// (= draw_strip の `pad(6) + disc_w(14) + gap(2)`)。 選択の press 帯はこの分
+/// だけ右にずらして、 disclosure クリック (= 折り畳みトグル) が選択を巻き込まない
+/// ようにする (code review: group strip で disclosure が NAME_BAND 内に重なる)。
+const DISCLOSURE_ZONE_W: f32 = 22.0;
 const TOGGLE_H: f32 = 22.0;
 const KNOB_SIZE: f32 = 32.0;
 const FADER_W: f32 = 18.0;
@@ -125,7 +134,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // rect にポインタ当たり判定をして hover track を求める (arrangement の
     // `arrange_hovered_track` と同 idiom)。 layout を持つこの draw が唯一の算出点
     // (SSoT)。 master strip は solo を持たないので対象外 (= None のまま)。
-    let ptr = ui.pointer().pos;
+    let pointer = ui.pointer();
+    let ptr = pointer.pos;
     let mut hovered_strip: Option<u32> = None;
 
     let inner_pad = 8.0;
@@ -155,6 +165,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         .into_iter()
         .filter(|e| !app.is_hidden_under_collapsed_group(e.track_id))
         .collect();
+
+    // r.md #13: strip の名前バンドを押すとトラックを選択する。 arrangement と同じ
+    // `selection.selected_track_ids` (SSoT) を読み書きするので、 mixer ↔ arrangement
+    // の選択は自動で双方向連動する。 range-select (Shift) の並びは mixer の可視 strip
+    // 順 (normals 左→右 → returns 左→右、 master は除く)。 press 時に modifier を読む
+    // ので release-frame の modifier race が無い (arrangement の press_modifiers と同狙い)。
+    let visible_order: Vec<u32> = normals.iter().chain(returns.iter()).map(|e| e.track_id).collect();
+    let select_press = std::cell::Cell::new(None::<u32>);
 
     // ----- 右端から固定配置: MASTER → returns 帯 → 「＋ Return」 -----
     let master_x = area.x + area.w - inner_pad - STRIP_WIDTH;
@@ -187,6 +205,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 && strip_rect.contains(px, py)
             {
                 hovered_strip = Some(entry.track_id);
+            }
+            // 名前バンド上の press でトラック選択 (r.md #13)。 group strip は左端の
+            // 折り畳み disclosure を避けて帯を右にずらす (disclosure クリックが選択を
+            // 巻き込まないように)。
+            let band_x0 = if entry.is_group { x + DISCLOSURE_ZONE_W } else { x };
+            let name_band = Rect { x: band_x0, y: strip_y, w: x + STRIP_WIDTH - band_x0, h: NAME_BAND_H };
+            if pointer.primary_just_pressed
+                && let Some((px, py)) = ptr
+                && scroll_rect.contains(px, py)
+                && name_band.contains(px, py)
+            {
+                select_press.set(Some(entry.track_id));
             }
             draw_track_strip(app, ui, entry, strip_rect);
         }
@@ -226,7 +256,63 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             {
                 hovered_strip = Some(entry.track_id);
             }
+            // 名前バンド上の press でトラック選択 (r.md #13、 returns も実トラック)。
+            let name_band = Rect { x, y: strip_y, w: STRIP_WIDTH, h: NAME_BAND_H };
+            if pointer.primary_just_pressed
+                && let Some((px, py)) = ptr
+                && name_band.contains(px, py)
+            {
+                select_press.set(Some(entry.track_id));
+            }
             draw_return_strip(app, ui, entry, strip_rect);
+        }
+    }
+
+    // press したトラックがあれば modifier-aware に選択を更新する (r.md #13)。
+    // arrangement のヘッダ選択と同じ意味論: Single / Ctrl=Toggle / Shift=Range。
+    // range の anchor は cursor (= 最後に選んだトラック)。 実際に集合が変わるときだけ
+    // Edit を積む (= 無変更 press では dirty 化も再描画も誘発しない)。
+    if let Some(tid) = select_press.get() {
+        let prev: Vec<u32> = app.selection.selected_track_ids.clone();
+        let next: Vec<u32> = if pointer.modifiers.shift {
+            let to = visible_order.iter().position(|&v| v == tid).unwrap_or(0);
+            // anchor = cursor。 可視 strip に無い (別ビューで選択中 / 折り畳みで隠れた
+            // 等) ときは範囲を張らず単一選択に落とす (先頭 strip に化けさせない)。
+            let from = app
+                .cursor_track_id()
+                .and_then(|a| visible_order.iter().position(|&v| v == a));
+            let (lo, hi) = from.map_or((to, to), |f| (f.min(to), f.max(to)));
+            let mut range: Vec<u32> = visible_order
+                .get(lo..=hi)
+                .map(<[u32]>::to_vec)
+                .unwrap_or_else(|| vec![tid]);
+            // cursor (= 末尾) を今クリックした tid に合わせる → 次の Shift で下方向へ
+            // 再アンカーできる (arrangement の anchor=tid 更新と一致)。
+            if let Some(pos) = range.iter().position(|&v| v == tid) {
+                range.remove(pos);
+                range.push(tid);
+            }
+            range
+        } else if pointer.modifiers.ctrl {
+            // toggle: 追加は末尾へ (= 新 cursor/anchor)、 既存は除去。
+            let mut set = prev.clone();
+            if let Some(pos) = set.iter().position(|&v| v == tid) {
+                set.remove(pos);
+            } else {
+                set.push(tid);
+            }
+            set
+        } else {
+            vec![tid]
+        };
+        // 集合として比較 (順序無視) して、 変化したときだけ書き込む。
+        let (mut a, mut b) = (prev.clone(), next.clone());
+        a.sort_unstable();
+        b.sort_unstable();
+        if a != b {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.selection.selected_track_ids = next;
+            }));
         }
     }
 
@@ -409,6 +495,21 @@ fn draw_strip(
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [4.0, 0.0, 0.0, 4.0],
+            clip_rect: None,
+        });
+    }
+
+    // r.md #13: 選択中トラックの strip をアクセント枠でハイライトする。
+    // arrangement と同じ `selection.selected_track_ids` (SSoT) を参照するので
+    // 両ビューが連動して光る。 master は実トラックではないので対象外。 色ストライプ
+    // の**後**に描いて枠が左辺で途切れないようにする (最前面に完全な枠)。
+    if !is_master && app.selection.selected_track_ids.contains(&track_idx) {
+        ui.push_rect(RectCommand {
+            rect,
+            fill: Color::TRANSPARENT,
+            border: theme::ACCENT,
+            border_width: 2.0,
+            radius: [4.0; 4],
             clip_rect: None,
         });
     }

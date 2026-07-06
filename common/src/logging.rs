@@ -4,6 +4,10 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+/// 保持する日次ログファイルの本数 (= 直近何日分を残すか)。 これより古い
+/// `<process>.YYYY-MM-DD` は appender が起動時/ローテーション時に削除する。
+const LOG_RETAIN_DAYS: usize = 7;
+
 /// 1 プロセス分の tracing を初期化する。
 ///
 /// - **常に** 日次ローテーションのファイル `<log_dir>/<process_name>.YYYY-MM-DD`
@@ -28,9 +32,14 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 pub fn init_tracing(process_name: &str, log_dir: &Path) -> Option<WorkerGuard> {
     // panic-free な builder().build() を使う (rolling::daily() は init 失敗で panic)。
     // build() は親ディレクトリが無ければ作る。 失敗は eprintln して None に縮退。
+    // `max_log_files` で古い日次ファイルを自動 prune し、 ログディレクトリが
+    // 際限なく肥大するのを防ぐ (r.md #16。 tracing_appender は size ベース
+    // ローテーションを持たないので「日数」で上限を掛ける — 直近 LOG_RETAIN_DAYS
+    // 日分だけ残す)。
     let file = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix(process_name)
+        .max_log_files(LOG_RETAIN_DAYS)
         .build(log_dir)
         .map_err(|e| eprintln!("init_tracing: cannot open log file in {log_dir:?}: {e}"))
         .ok()

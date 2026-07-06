@@ -299,3 +299,35 @@ fn clip_short_click_selects() {
     );
 }
 
+/// r.md #14 回帰: context menu (popup) が開いている間の click は、 背景の
+/// arrangement に届いても clip 選択をクリアしない。 修正前は「Make Unique」等の
+/// menu item click が空きレーン click と誤判定され、 実行前に複数選択が消えていた。
+#[test]
+fn popup_open_click_does_not_clear_clip_selection() {
+    let (mut app, _a, _p) = build_app();
+    add_midi_track_with_clip(&mut app, 1, 10, 2.0, 4.0);
+    let y = track0_y();
+    let mut host = UiHost::no_redraw();
+    // まず clip を選択。
+    drive(&mut host, &mut app, press(256.0, y, no_mods()));
+    drive(&mut host, &mut app, release(258.0, y, no_mods()));
+    assert!(!app.selection.selected_clips.is_empty(), "precondition: clip 選択済み");
+
+    // popup を開いた状態で「空きレーン上の click」相当 (clip の無い x) を送る。
+    // ガードが効いていれば選択はクリアされない。
+    let screen = PhysicalSize { width: WIDGET_RECT.w as u32, height: WIDGET_RECT.h as u32 };
+    let empty_x = 700.0; // clip [2,4) (x∈[128,256]) の外
+    for p in [press(empty_x, y, no_mods()), release(empty_x, y, no_mods())] {
+        let mut scene = Scene::new();
+        host.frame(&mut app, &mut scene, screen, frame(p), |app, ui| {
+            // context menu が開いている状況を模す (毎フレーム open で open_popups を維持)。
+            ui.open_popup("test_ctx_menu", WIDGET_RECT, true);
+            let _ = arrangement(app, ui, WIDGET_RECT);
+        });
+    }
+    assert!(
+        !app.selection.selected_clips.is_empty(),
+        "popup が開いている間の click では clip 選択がクリアされない (r.md #14)"
+    );
+}
+

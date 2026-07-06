@@ -1090,7 +1090,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// (M14 Phase 120、 daw_01 #095) を popup が皆無の idle frame で早期 skip して、 closed menu
     /// 毎フレームの id_path `format!` を avoid するために使う。 cascade が orphan するのは必ず
     /// `open_popups` 非空 (= orphan 自身が居る) の状態なので、 空なら cleanup は確実に no-op。
-    pub(crate) fn has_open_popups(&self) -> bool {
+    ///
+    /// `pub`: context menu (`open_popup` は `capture_input == false` で background pointer を
+    /// mask しない) が開いている間、 背景 widget (arrangement 等) が menu item click を
+    /// 誤って自分への click として処理し選択をクリアするのを防ぐガードに使う (daw_gui 側)。
+    pub fn has_open_popups(&self) -> bool {
         !self.open_popups.is_empty()
     }
 

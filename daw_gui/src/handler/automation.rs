@@ -1556,37 +1556,64 @@ impl AppData {
         });
     }
 
-    /// `refcount >= 2` の共有 automation clip を独立化。content を deep
-    /// clone + 新 `ContentId` 採番、当該 clip だけ新 id を指す。`refcount
-    /// == 1` のときは no-op + status_message で通知 (= MIDI 用
-    /// `MakeClipUnique` と同 UX)。
+    /// `refcount >= 2` の共有 automation clip を独立化 (content + 共有名を
+    /// `fork_content` で deep clone、当該 clip だけ新 `ContentId` を指す)。
+    ///
+    /// r.md #14 の sibling: 右クリックした clip が現在の automation clip 選択に
+    /// 含まれるなら **選択した全 automation clip** を対象にする (含まれないなら
+    /// 単体)。 各 clip を per-clip fork するので選択内で linked だった clip も全て
+    /// 独立になる。 1 回の `edit_song` で 1 undo step、 既に全て独立なら
+    /// `edit_song_checked` の no-op 検出で dirty 化しない。
     pub(crate) fn make_automation_clip_unique(&mut self, key: common::model::AutomationClipKey) {
-        let content_id = {
-            let Some(lane) = self.song_doc.song().automation_lane_by_key(key.track, key.lane) else {
-                return;
-            };
-            let Some(clip) = lane.clip_by_id(key.clip) else {
-                return;
-            };
-            clip.content_id
+        let selected = self.selection.selected_automation_clips.clone();
+        let targets = if selected.contains(&key) {
+            selected
+        } else {
+            vec![key]
         };
-        if self.song_doc.song().clip_content_refcount(content_id) <= 1 {
-            self.ui_ephemeral.status_message = "すでに独立 clip です".into();
-            return;
-        }
-        let Some(cloned_content) = self.song_doc.song().clip_contents.get(&content_id).cloned()
-        else {
-            return;
-        };
-        self.edit_song(move |song| {
-            let new_content_id = song.alloc_content_id();
-            song.clip_contents.insert(new_content_id, cloned_content);
-            if let Some(lane) = song.automation_lane_by_key_mut(key.track, key.lane)
-                && let Some(clip) = lane.clip_by_id_mut(key.clip)
-            {
-                clip.content_id = new_content_id;
+        // status message 用: 編集前に「独立化される (= 共有中の)」clip 数を数える
+        // (逐次 fork 回数だと共有群の最後の 1 つを取りこぼす。 clips.rs と同方針)。
+        let made_unique = targets
+            .iter()
+            .filter(|k| {
+                self.song_doc
+                    .song()
+                    .automation_lane_by_key(k.track, k.lane)
+                    .and_then(|lane| lane.clip_by_id(k.clip))
+                    .is_some_and(|c| self.song_doc.song().clip_content_refcount(c.content_id) >= 2)
+            })
+            .count();
+        self.edit_song_checked(|song| {
+            let mut changed = false;
+            for k in &targets {
+                let content_id = {
+                    let Some(lane) = song.automation_lane_by_key(k.track, k.lane) else {
+                        continue;
+                    };
+                    let Some(clip) = lane.clip_by_id(k.clip) else {
+                        continue;
+                    };
+                    clip.content_id
+                };
+                // 他 clip と共有していなければ既に独立 → fork 不要。
+                if song.clip_content_refcount(content_id) <= 1 {
+                    continue;
+                }
+                let new_content_id = song.fork_content(content_id);
+                if let Some(lane) = song.automation_lane_by_key_mut(k.track, k.lane)
+                    && let Some(clip) = lane.clip_by_id_mut(k.clip)
+                {
+                    clip.content_id = new_content_id;
+                    changed = true;
+                }
             }
+            changed
         });
+        self.ui_ephemeral.status_message = match made_unique {
+            0 => "すでに独立 clip です".into(),
+            1 => "Clip を独立化しました".into(),
+            n => format!("{n} 個のクリップを独立化しました"),
+        };
     }
 
     /// gui_01 #029 (M14 Phase 63n-4): lane body 空き領域 dblclick で

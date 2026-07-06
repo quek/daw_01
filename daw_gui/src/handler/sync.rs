@@ -11,7 +11,16 @@ impl AppData {
     // -------- IPC -----------------------------------------------------------
 
     pub(crate) fn send_audio(&self, msg: AudioCommand) {
-        tracing::info!(?msg, "sending to audio");
+        // r.md #16: 全文 Debug dump を info で吐くとログが肥大する (特に LoadSong は
+        // 全 song を 1 行に serialize し、 ドラッグ中は毎 frame 送られる)。 debug へ
+        // 降格し、 LoadSong は track/clip 数の要約だけにする (payload は落とす)。
+        match &msg {
+            AudioCommand::LoadSong(song) => {
+                let clips: usize = song.tracks.iter().map(|t| t.clips.len()).sum();
+                tracing::debug!(tracks = song.tracks.len(), clips, "sending LoadSong to audio");
+            }
+            other => tracing::debug!(msg = ?other, "sending to audio"),
+        }
         let Some(tx) = self.ipc.audio_tx.as_ref() else {
             tracing::warn!("audio sender is not configured");
             return;
@@ -22,7 +31,8 @@ impl AppData {
     }
 
     pub(crate) fn send_plugin(&self, msg: PluginCommand) {
-        tracing::info!(?msg, "sending to plugin_host");
+        // r.md #16: 全文 Debug dump は debug 降格 (info の既定ログには載せない)。
+        tracing::debug!(msg = ?msg, "sending to plugin_host");
         let Some(tx) = self.ipc.plugin_tx.as_ref() else {
             tracing::warn!("plugin sender is not configured");
             return;

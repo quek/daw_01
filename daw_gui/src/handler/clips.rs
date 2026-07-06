@@ -577,36 +577,69 @@ impl AppData {
         }
     }
 
-    /// Make Unique (右クリック): 共有 clip → 独立化。 refcount==1 なら no-op。
-    /// §3.6。
+    /// Make Unique (右クリック): 共有 clip → 独立化。 §3.6。
+    ///
+    /// r.md #14: 右クリックした clip が現在の複数選択に含まれるなら **選択した
+    /// 全 clip** を対象にする (含まれないなら右クリックした 1 つだけ — Reverse
+    /// 等の単一操作と同じ直感)。 各 clip の content を per-clip で fork するので、
+    /// 選択内で互いに linked だった clip も全て独立になる。 1 回の `edit_song` に
+    /// まとめて 1 undo step。 既に全て独立なら `edit_song_checked` の no-op 検出で
+    /// dirty 化しない。
     pub(crate) fn make_clip_unique(&mut self, target: ClipRef) {
-        let Some(track) = self.song_doc.song().tracks.get(target.track as usize) else {
-            return;
+        // 対象集合: 複数選択があれば選択全体を、 無ければ右クリックした clip 単体を
+        // 独立化する (Auto-Fade / Auto-Crossfade と同じ「選択集合に効く」idiom)。
+        let targets: Vec<ClipRef> = if self.selection.selected_clips.is_empty() {
+            vec![target]
+        } else {
+            self.selected_clip_refs()
         };
-        let Some(clip) = track.clips.get(target.clip as usize) else {
-            return;
-        };
-        let content_id = clip.content_id;
-        if self.song_doc.song().clip_content_refcount(content_id) <= 1 {
-            self.ui_ephemeral.status_message = "すでに独立 clip です".to_string();
-            return;
-        }
-        // content + 名前を fork して独立化 (fork 時点の名前を引き継ぐ)。
-        let done = self
-            .edit_song(|song| {
+        // status message 用: 「他と共有していて独立化される」clip 数を編集前に数える。
+        // (逐次 fork では共有群の最後の 1 つは fork せず独立になるので、 fork 回数だと
+        // 1 つ少なく報告してしまう。 元の refcount で「独立化される clip」を数える。)
+        let made_unique = targets
+            .iter()
+            .filter(|t| {
+                self.song_doc
+                    .song()
+                    .tracks
+                    .get(t.track as usize)
+                    .and_then(|tr| tr.clips.get(t.clip as usize))
+                    .is_some_and(|c| self.song_doc.song().clip_content_refcount(c.content_id) >= 2)
+            })
+            .count();
+        self.edit_song_checked(|song| {
+            let mut changed = false;
+            for t in &targets {
+                let Some(content_id) = song
+                    .tracks
+                    .get(t.track as usize)
+                    .and_then(|tr| tr.clips.get(t.clip as usize))
+                    .map(|c| c.content_id)
+                else {
+                    continue;
+                };
+                // 他 clip と共有していなければ既に独立 → fork 不要。 逐次 fork で
+                // 参照数が減るので、 選択内で共有していた最後の 1 つは自然に独立扱い。
+                if song.clip_content_refcount(content_id) <= 1 {
+                    continue;
+                }
                 let new_content_id = song.fork_content(content_id);
                 if let Some(clip) = song
                     .tracks
-                    .get_mut(target.track as usize)
-                    .and_then(|t| t.clips.get_mut(target.clip as usize))
+                    .get_mut(t.track as usize)
+                    .and_then(|tr| tr.clips.get_mut(t.clip as usize))
                 {
                     clip.content_id = new_content_id;
+                    changed = true;
                 }
-            })
-            .is_some();
-        if done {
-            self.ui_ephemeral.status_message = "Clip を独立化しました".to_string();
-        }
+            }
+            changed
+        });
+        self.ui_ephemeral.status_message = match made_unique {
+            0 => "すでに独立 clip です".to_string(),
+            1 => "Clip を独立化しました".to_string(),
+            n => format!("{n} 個のクリップを独立化しました"),
+        };
     }
 
     pub(crate) fn create_clip(&mut self, track_idx: u32, start_beat: f64) {

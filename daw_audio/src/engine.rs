@@ -932,7 +932,9 @@ impl LocalState {
                     self.heartbeat_device_ids.clear();
                     self.heartbeat_device_ids
                         .extend(self.plugin_refs.keys().copied());
-                    tracing::info!(
+                    // r.md #16: 再生中 1 行/秒でログを埋める。 debug へ降格し
+                    // (RUST_LOG=debug で復活)、 既定 (info) の dev ログには出さない。
+                    tracing::debug!(
                         playing,
                         playhead,
                         master_peak,

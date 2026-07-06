@@ -15,8 +15,10 @@
 
 mod support;
 
+mod clip_rename;
 mod dirty_guard;
 mod group_track_lifecycle;
+mod make_unique;
 mod pending_state_queue;
 mod plugin_load_failure;
 mod state_roundtrip_watchdog;

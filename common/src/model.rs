@@ -1907,6 +1907,16 @@ impl Song {
         self.clip_content_names.insert(content_id, name);
     }
 
+    /// Clear the shared name for a `ContentId` (clip rename → empty string,
+    /// r.md #15). After this `content_name` returns `""` and
+    /// `clip_display_label` falls back to the derived source label (Text
+    /// body / note lyrics) or blank. Removing the key (rather than storing
+    /// `""`) keeps the map free of empty sentinels — `content_name` already
+    /// treats a missing key as empty.
+    pub fn clear_content_name(&mut self, content_id: ContentId) {
+        self.clip_content_names.remove(&content_id);
+    }
+
     /// Allocate a fresh `ContentId`, insert its `content` payload and its
     /// shared `name` together. Use at every fresh-clip creation site so
     /// name + content never desync. Returns the new id.
