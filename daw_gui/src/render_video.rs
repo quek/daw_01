@@ -157,9 +157,6 @@ pub fn render_mp4_cancellable(
     cancel: &std::sync::atomic::AtomicBool,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<RenderStats, String> {
-    crate::import_video::ensure_mf_startup_pub()
-        .map_err(|e| format!("MFStartup: {e}"))?;
-
     // output dims/fps come from the per-export override (export
     // dialog) when set, else the project canvas (`Song`). The OffscreenRenderer
     // composites directly at `out_w x out_h`, so a chosen size just re-letterboxes

@@ -290,9 +290,8 @@ struct CachedRingSlot {
     /// `nearest_ring_slot` to pick the slot closest to the current
     /// playhead's `source_micros`.
     target_micros: u64,
-    /// Index into `SharedPool::slots` for HW path, or the worker's
-    /// round-robin counter on the Bgra fallback path. Either way,
-    /// pairs with `source_id` to key the GPU texture cache.
+    /// Slot index paired with `source_id` to key the GPU texture cache.
+    /// Always 0 with the libav BGRA sink (1-frame-latest per source).
     slot_idx: u8,
     /// Cached for the composite pass — avoids round-trip to
     /// `frame_textures` just to read width/height.
@@ -1375,18 +1374,11 @@ impl Runner {
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
 
-        // docs/plan_video_perf.md P4: ring lookahead. step is derived
-        // from the project framerate; the worker decodes
-        // `PREVIEW_RING_SIZE` consecutive frames at
-        // `center + i * step` and writes each into an independent
-        // `SharedPool` slot. Skipped when no video is active (= the
-        // worker has nothing to decode), so an image-only / text-only
-        // project doesn't request empty ring decodes.
+        // Ask the worker to decode the center frame of each active source (the
+        // libav BGRA sink is 1-frame-latest). Skipped when no video is active
+        // (= the worker has nothing to decode), so an image-only / text-only
+        // project doesn't request empty decodes.
         if !active.is_empty() {
-            let step_micros = {
-                let fps = state.app.song_doc.song().video_framerate.max(1.0) as f64;
-                (1_000_000.0 / fps).round() as u64
-            };
             for frame_info in &active {
                 let Some(abs_path) = resolve_video_path(
                     state.app.song_doc.song(),
@@ -1404,7 +1396,6 @@ impl Runner {
                     frame_info.video_source_id,
                     abs_path,
                     frame_info.source_micros,
-                    step_micros,
                 );
             }
         }
@@ -1632,27 +1623,14 @@ impl Runner {
             let mut cached: Vec<CachedRingSlot> = Vec::with_capacity(ring.slots.len());
             for slot in &ring.slots {
                 let t_upload_start = std::time::Instant::now();
-                let (variant_name, frame_bytes, w, h, slot_idx) = match &slot.frame {
-                    crate::video_playback::DecodedFrame::Shared {
-                        width,
-                        height,
-                        slot_idx,
-                        ..
-                    } => ("shared", 0_usize, *width, *height, *slot_idx),
-                    crate::video_playback::DecodedFrame::Bgra {
-                        width,
-                        height,
-                        bgra,
-                    } => {
-                        // CPU fallback: the variant has no slot field,
-                        // so the worker writes all ring slots into the
-                        // same `(source_id, 0)` texture. The composite
-                        // pass treats this as "1-frame-latest" rather
-                        // than a true ring (acceptable for HW-less
-                        // environments — see plan §P4).
-                        ("bgra", bgra.len(), *width, *height, 0_u8)
-                    }
-                };
+                // libav is a 1-frame-latest BGRA sink, so the worker only fills
+                // slot 0 (docs/plan_video_decode_unify.md).
+                let (frame_bytes, w, h, slot_idx) = (
+                    slot.frame.bgra.len(),
+                    slot.frame.width,
+                    slot.frame.height,
+                    0_u8,
+                );
                 preview.upload_frame(source_id, slot_idx, &slot.frame);
                 cached.push(CachedRingSlot {
                     target_micros: slot.target_micros,
@@ -1667,7 +1645,7 @@ impl Runner {
                     tracing::info!(
                         video_source_id = source_id,
                         source_micros = slot.target_micros,
-                        variant = variant_name,
+                        variant = "bgra",
                         slot_idx,
                         width = w,
                         height = h,

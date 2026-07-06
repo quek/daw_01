@@ -1,4 +1,7 @@
-//! Video file import via Windows Media Foundation (`docs/plan_video.md` P2).
+//! Video file import via in-process libav (rsmpeg) — the same decode stack
+//! playback and export use (`docs/plan_video_decode_unify.md`). Media
+//! Foundation was removed; libav handles metadata probe, one-frame thumbnail,
+//! and audio extraction (incl. 10-bit H.264 / HEVC / AV1 that MF could not).
 //!
 //! Pipeline (mirrors `import_audio.rs` shape so the two co-exist cleanly):
 //!
@@ -6,41 +9,33 @@
 //! 2. Copy the file into `<project_dir>/samples/<basename>_<hash>.<ext>`
 //!    (`Absolute` cache path when there is no project_dir yet, same as
 //!    audio import).
-//! 3. Open with `IMFSourceReader` to read metadata (width / height /
-//!    framerate / duration / codec) and — when the file carries an
-//!    audio stream — extract the audio to a paired WAV file via
-//!    `IMFSourceReader::ReadSample` + `hound::WavWriter` (P2.4).
+//! 3. Probe metadata (width / height / framerate / duration / codec) via
+//!    `avformat`, decode a thumbnail frame via `avcodec`, and — when the file
+//!    carries an audio stream — extract the audio to a paired WAV file
+//!    (`avcodec` decode + `swresample` → Float32 + `hound::WavWriter`).
 //! 4. Build a `VideoSource` referencing the on-disk video path, and an
 //!    optional `AudioSource` referencing the extracted WAV. The
 //!    `VideoSource.audio_source_id` field carries the back-link.
-//!
-//! WMF lifecycle: `MFStartup` is called lazily on first use via a
-//! `OnceLock`-guarded helper. We do NOT call `MFShutdown` — daw_gui
-//! shuts the process down without orderly teardown, and skipping
-//! shutdown is documented as safe by the WMF docs.
 
-use std::os::windows::ffi::OsStrExt;
+use std::ffi::CString;
 use std::path::Path;
-use std::sync::OnceLock;
 
 use common::model::{VideoSource, VideoSourcePath};
 
-use windows::Win32::Media::MediaFoundation::{
-    IMFSourceReader, MFAudioFormat_Float, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video, MFSTARTUP_FULL,
-    MFStartup, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS,
-    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-    MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION,
-    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_RGB32,
-    MFVideoFormat_VP90,
-};
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-use windows::core::{GUID, PCWSTR};
+use rsmpeg::avcodec::AVCodecContext;
+use rsmpeg::avformat::AVFormatContextInput;
+use rsmpeg::avutil::{AVChannelLayout, AVFrame};
+use rsmpeg::error::RsmpegError;
+use rsmpeg::ffi;
+use rsmpeg::swresample::SwrContext;
 
 use crate::import_audio::{file_hash8, samples_filename};
+
+/// Convert a path to a NUL-terminated `CString` for libav's `open` APIs.
+fn path_cstring(path: &Path) -> Result<CString, VideoImportError> {
+    CString::new(path.to_string_lossy().as_bytes().to_vec())
+        .map_err(|e| VideoImportError::IoError(format!("path has interior NUL: {e}")))
+}
 
 /// Successful metadata read. `audio_source_id` is populated only when
 /// the source carried an audio stream that was extracted to a paired
@@ -49,13 +44,12 @@ use crate::import_audio::{file_hash8, samples_filename};
 pub struct VideoMetadata {
     pub width: u32,
     pub height: u32,
-    /// Frames per second computed from `MF_MT_FRAME_RATE`
-    /// (numerator / denominator). 0.0 indicates "unknown" (the stream
-    /// reported neither attribute).
+    /// Frames per second from the stream's `avg_frame_rate` (falling back to
+    /// `r_frame_rate`). 0.0 indicates "unknown" (neither was reported).
     pub framerate: f32,
-    /// Total stream duration in microseconds, derived from the WMF
-    /// `MF_PD_DURATION` (100-ns units) divided by 10. Zero when the
-    /// container didn't report a duration.
+    /// Total stream duration in microseconds (from `AVFormatContext.duration`,
+    /// which is already in AV_TIME_BASE = µs). Zero when the container didn't
+    /// report a duration.
     pub duration_micros: u64,
     /// Free-form codec label ("h264" / "hevc" / "vp9" / "av1" / "unknown").
     /// Used only for display and diagnostics.
@@ -65,7 +59,7 @@ pub struct VideoMetadata {
 #[derive(Debug)]
 pub enum VideoImportError {
     UnsupportedFormat(String),
-    /// MFStartup, source reader creation, attribute read failed.
+    /// libav open / probe / decode failed.
     DecodeFailed(String),
     IoError(String),
 }
@@ -85,190 +79,59 @@ impl std::fmt::Display for VideoImportError {
 
 impl std::error::Error for VideoImportError {}
 
-/// Lazy-init `MFStartup` exactly once per process. Returns the cached
-/// result on every subsequent call. `CoInitializeEx(MTA)` is also
-/// invoked once; subsequent thread inits are independent.
-///
-/// Sibling `video_playback` module reuses this via
-/// [`ensure_mf_startup_pub`] so the same process-wide guard covers
-/// both import-time decode and playback-time decode.
-fn ensure_mf_startup() -> Result<(), VideoImportError> {
-    static MF_INIT: OnceLock<Result<(), String>> = OnceLock::new();
-    let result = MF_INIT.get_or_init(|| {
-        unsafe {
-            // `CoInitializeEx` is mandatory before `MFStartup`. RPC_E_CHANGED_MODE
-            // is returned when the apartment was already initialized as STA
-            // by an unrelated subsystem; we ignore that and proceed because
-            // MTA semantics are what WMF wants and STA-initialized callers
-            // (e.g. winit / wgpu on some backends) accept MFStartup anyway.
-            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-            if hr.is_err() && hr.0 != windows::Win32::Foundation::RPC_E_CHANGED_MODE.0 {
-                return Err(format!("CoInitializeEx: {hr:?}"));
-            }
-            MFStartup(MF_VERSION, MFSTARTUP_FULL)
-                .map_err(|e| format!("MFStartup: {e}"))?;
-            Ok(())
-        }
-    });
-    match result {
-        Ok(()) => Ok(()),
-        Err(s) => Err(VideoImportError::DecodeFailed(s.clone())),
-    }
-}
-
-/// Convert a Rust path to the NUL-terminated UTF-16 buffer that
-/// `MFCreateSourceReaderFromURL` consumes (`PCWSTR`). The returned
-/// `Vec<u16>` MUST outlive the `PCWSTR` view it backs.
-fn to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
-
-/// `pub` wrapper around the module-private `ensure_mf_startup` so
-/// sibling `video_playback` can share the same `OnceLock`. Returns
-/// a stringified error so callers can format it without picking up
-/// this module's error enum.
-pub fn ensure_mf_startup_pub() -> Result<(), String> {
-    ensure_mf_startup().map_err(|e| e.to_string())
-}
-
-/// Best-effort PROPVARIANT → u64 extractor for VT_UI8 values (= the
-/// type MF_PD_DURATION uses, 100-ns units). Returns `None` when the
-/// variant carries a different tag — defensive against MF backends
-/// that report duration as VT_I8 / VT_EMPTY on certain containers.
-fn propvariant_to_u64(
-    propvar: &windows::Win32::System::Com::StructuredStorage::PROPVARIANT,
-) -> Option<u64> {
-    use windows::Win32::System::Variant::VT_UI8;
-    unsafe {
-        let inner = &propvar.Anonymous.Anonymous;
-        if inner.vt == VT_UI8 {
-            Some(inner.Anonymous.uhVal)
-        } else if inner.vt.0 == 20 /* VT_I8 */ {
-            // Signed 64-bit; treat negative as "unknown duration".
-            let v = inner.Anonymous.hVal;
-            if v >= 0 { Some(v as u64) } else { None }
-        } else {
-            None
-        }
-    }
-}
-
-/// Map an MF video subtype GUID to a short codec label suitable for
-/// `VideoSource.codec`. Unknown subtypes fall back to `"unknown"`.
-fn codec_label(subtype: &GUID) -> &'static str {
-    if subtype == &MFVideoFormat_H264 {
-        "h264"
-    } else if subtype == &MFVideoFormat_HEVC {
-        "hevc"
-    } else if subtype == &MFVideoFormat_VP90 {
-        "vp9"
-    } else if subtype == &MFVideoFormat_AV1 {
-        "av1"
-    } else {
-        "unknown"
-    }
-}
-
-/// Open a video file with `IMFSourceReader` and read metadata from its
-/// first video stream. The reader is configured with
-/// `MF_SOURCE_READERF_ENABLE_VIDEO_PROCESSING` so the SDK can pivot
-/// codec-specific subtypes (e.g. NV12) to a uniform output later; the
-/// attribute does not affect metadata read.
+/// Probe a video file's first video stream via `avformat`: width / height /
+/// framerate / duration / codec. No frame is decoded.
 pub fn extract_metadata(path: &Path) -> Result<VideoMetadata, VideoImportError> {
-    ensure_mf_startup()?;
-
     if !path.exists() {
         return Err(VideoImportError::IoError(format!(
             "file not found: {}",
             path.display()
         )));
     }
+    let url = path_cstring(path)?;
+    let input = AVFormatContextInput::open(&url).map_err(|e| {
+        VideoImportError::DecodeFailed(format!("open {}: {e:?}", path.display()))
+    })?;
 
-    let wide = to_wide(path);
-    let url = PCWSTR::from_raw(wide.as_ptr());
-
-    let attrs = unsafe {
-        let mut a = None;
-        MFCreateAttributes(&mut a, 1)
-            .map_err(|e| VideoImportError::DecodeFailed(format!("MFCreateAttributes: {e}")))?;
-        let attrs = a.ok_or_else(|| {
-            VideoImportError::DecodeFailed("MFCreateAttributes returned null".into())
-        })?;
-        attrs
-            .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!(
-                    "SetUINT32 ENABLE_VIDEO_PROCESSING: {e}"
-                ))
-            })?;
-        attrs
-    };
-
-    let reader: IMFSourceReader = unsafe {
-        MFCreateSourceReaderFromURL(url, &attrs).map_err(|e| {
-            VideoImportError::DecodeFailed(format!(
-                "MFCreateSourceReaderFromURL({}): {e}",
-                path.display()
-            ))
-        })?
-    };
-
-    // Native media type from the first video stream.
-    let stream_index = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-    let video_type = unsafe { reader.GetNativeMediaType(stream_index, 0) }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!("GetNativeMediaType: {e}"))
+    let (stream_index, codec) = input
+        .find_best_stream(ffi::AVMEDIA_TYPE_VIDEO)
+        .map_err(|e| VideoImportError::DecodeFailed(format!("find video stream: {e:?}")))?
+        .ok_or_else(|| {
+            VideoImportError::DecodeFailed(format!("no video stream in {}", path.display()))
         })?;
 
-    // MF_MT_FRAME_SIZE packs (width:u32, height:u32) into a u64 — high
-    // dword is width, low dword is height.
-    let frame_size = unsafe { video_type.GetUINT64(&MF_MT_FRAME_SIZE) }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!("MF_MT_FRAME_SIZE: {e}"))
-        })?;
-    let width = (frame_size >> 32) as u32;
-    let height = (frame_size & 0xFFFF_FFFF) as u32;
+    let stream = &input.streams()[stream_index];
+    let par = stream.codecpar();
+    let width = par.width.max(0) as u32;
+    let height = par.height.max(0) as u32;
     if width == 0 || height == 0 {
         return Err(VideoImportError::DecodeFailed(format!(
             "invalid frame size {width}x{height}"
         )));
     }
 
-    // MF_MT_FRAME_RATE packs (numerator:u32, denominator:u32) likewise.
-    let framerate = match unsafe { video_type.GetUINT64(&MF_MT_FRAME_RATE) } {
-        Ok(fr) => {
-            let num = (fr >> 32) as u32;
-            let den = (fr & 0xFFFF_FFFF) as u32;
-            if den == 0 {
-                0.0
-            } else {
-                num as f32 / den as f32
-            }
-        }
-        Err(_) => 0.0,
+    // Prefer avg_frame_rate; fall back to r_frame_rate; else unknown (0.0).
+    let fr = if stream.avg_frame_rate.num > 0 && stream.avg_frame_rate.den > 0 {
+        stream.avg_frame_rate
+    } else {
+        stream.r_frame_rate
+    };
+    let framerate = if fr.num > 0 && fr.den > 0 {
+        fr.num as f32 / fr.den as f32
+    } else {
+        0.0
     };
 
-    let subtype = unsafe { video_type.GetGUID(&MF_MT_SUBTYPE) }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!("MF_MT_SUBTYPE: {e}"))
-        })?;
-    let codec = codec_label(&subtype).to_string();
-
-    // Total stream duration in 100-ns units. Convert to microseconds.
-    // `MF_SOURCE_READER_MEDIASOURCE` is the special stream sentinel
-    // (= u32::MAX) used to query presentation-level attributes.
-    let duration_micros = match unsafe {
-        reader.GetPresentationAttribute(
-            MF_SOURCE_READER_MEDIASOURCE.0 as u32,
-            &MF_PD_DURATION,
-        )
-    } {
-        Ok(propvar) => propvariant_to_u64(&propvar).map(|t| t / 10).unwrap_or(0),
-        Err(_) => 0,
+    // `AVFormatContext.duration` is in AV_TIME_BASE (= 1/1_000_000 s) units, i.e.
+    // already microseconds. Negative / AV_NOPTS_VALUE → unknown (0).
+    let duration_micros = if input.duration > 0 {
+        input.duration as u64
+    } else {
+        0
     };
+
+    // libav's canonical short codec name ("h264" / "hevc" / "vp9" / "av1" ...).
+    let codec = codec.name().to_string_lossy().into_owned();
 
     Ok(VideoMetadata {
         width,
@@ -292,206 +155,25 @@ pub struct ThumbnailFrame {
     pub rgba: Vec<u8>,
 }
 
-/// Decode a single representative frame from a video and return it as
-/// RGBA8. Used at import time to build the arrangement-view clip
-/// thumbnail (gui_01 #044 `ClipView.thumbnail`). The reader is
-/// configured to deliver `MFVideoFormat_RGB32` (= BGRA byte order
-/// under WMF's little-endian DIB convention); we swap channels into
-/// RGBA at copy time so callers downstream get the standard layout
-/// `Renderer::upload_texture_rgba` expects.
-///
-/// We don't seek — the first decodable frame is good enough for an
-/// arrangement-view thumbnail (= a few seconds in is more "scene"-y
-/// but adds seek complexity that the MVP doesn't need yet).
+/// Decode a single representative frame and return it as RGBA8 for the
+/// arrangement-view clip thumbnail. Reuses the single libav engine (native
+/// resolution) and swaps BGRA→RGBA. The first decodable frame is used — a
+/// scene-y seek isn't worth the complexity for a thumbnail.
 pub fn extract_thumbnail(path: &Path) -> Result<ThumbnailFrame, VideoImportError> {
-    ensure_mf_startup()?;
-
     if !path.exists() {
         return Err(VideoImportError::IoError(format!(
             "file not found: {}",
             path.display()
         )));
     }
-
-    let wide = to_wide(path);
-    let url = PCWSTR::from_raw(wide.as_ptr());
-
-    // ENABLE_VIDEO_PROCESSING lets the reader insert MFTs to convert
-    // native (e.g. NV12 / YUV420P) to RGB32 transparently.
-    let attrs = unsafe {
-        let mut a = None;
-        MFCreateAttributes(&mut a, 1).map_err(|e| {
-            VideoImportError::DecodeFailed(format!("MFCreateAttributes: {e}"))
-        })?;
-        let attrs = a.ok_or_else(|| {
-            VideoImportError::DecodeFailed("MFCreateAttributes returned null".into())
-        })?;
-        attrs
-            .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!(
-                    "SetUINT32 ENABLE_VIDEO_PROCESSING: {e}"
-                ))
-            })?;
-        attrs
-    };
-    let reader: IMFSourceReader = unsafe {
-        MFCreateSourceReaderFromURL(url, &attrs).map_err(|e| {
-            VideoImportError::DecodeFailed(format!(
-                "MFCreateSourceReaderFromURL({}): {e}",
-                path.display()
-            ))
-        })?
-    };
-
-    let video_stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-
-    // Read native FRAME_SIZE so we know what the converted RGB32
-    // frame's dimensions will be. WMF preserves the native size unless
-    // the output type explicitly sets a different one.
-    let native_type = unsafe { reader.GetNativeMediaType(video_stream, 0) }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!(
-                "thumbnail GetNativeMediaType: {e}"
-            ))
-        })?;
-    let frame_size = unsafe { native_type.GetUINT64(&MF_MT_FRAME_SIZE) }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!("thumbnail FRAME_SIZE: {e}"))
-        })?;
-    let width = (frame_size >> 32) as u32;
-    let height = (frame_size & 0xFFFF_FFFF) as u32;
-    if width == 0 || height == 0 {
-        return Err(VideoImportError::DecodeFailed(format!(
-            "thumbnail invalid frame size {width}x{height}"
-        )));
-    }
-
-    // Request RGB32 output. The reader inserts a video processor MFT
-    // to convert native (likely NV12) → BGRA8. We swap to RGBA below.
-    let output_type = unsafe {
-        let t = MFCreateMediaType().map_err(|e| {
-            VideoImportError::DecodeFailed(format!("thumbnail MFCreateMediaType: {e}"))
-        })?;
-        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!(
-                    "thumbnail set MAJOR_TYPE Video: {e}"
-                ))
-            })?;
-        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!(
-                    "thumbnail set SUBTYPE RGB32: {e}"
-                ))
-            })?;
-        t
-    };
-    unsafe { reader.SetCurrentMediaType(video_stream, None, &output_type) }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!(
-                "thumbnail SetCurrentMediaType RGB32: {e}"
-            ))
-        })?;
-
-    // The copy loop below assumes a tightly-packed `width*4` stride.
-    // For RGB32 under WMF that's almost always exact, but a video
-    // processor MFT can in principle negotiate a padded stride. Read
-    // the negotiated `MF_MT_DEFAULT_STRIDE` (best-effort) so a mismatch
-    // is at least visible in the logs rather than silently producing a
-    // skewed thumbnail. A proper fix would copy row-by-row.
-    if let Ok(current_type) = unsafe { reader.GetCurrentMediaType(video_stream) }
-        && let Ok(stride) = unsafe { current_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
-    {
-        let expected = width.saturating_mul(4);
-        if stride != expected {
-            tracing::warn!(
-                stride,
-                expected,
-                "thumbnail: MF_MT_DEFAULT_STRIDE != width*4; thumbnail may be skewed (row padding not handled)"
-            );
-        }
-    }
-
-    // Drain ReadSample until we get a real sample (skip STREAMTICK
-    // gaps). Bail with an error if we reach EOS without any sample.
-    let frame_bytes = width as usize * height as usize * 4;
-    let mut rgba: Vec<u8> = Vec::with_capacity(frame_bytes);
-
-    loop {
-        let mut flags: u32 = 0;
-        let mut sample: Option<windows::Win32::Media::MediaFoundation::IMFSample> =
-            None;
-        unsafe {
-            reader.ReadSample(
-                video_stream,
-                0,
-                None,
-                Some(&mut flags),
-                None,
-                Some(&mut sample),
-            )
-        }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!("thumbnail ReadSample: {e}"))
-        })?;
-
-        if (flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
-            return Err(VideoImportError::DecodeFailed(
-                "thumbnail: end of stream before any frame decoded".into(),
-            ));
-        }
-        let Some(sample) = sample else {
-            continue;
-        };
-
-        let buffer = unsafe { sample.ConvertToContiguousBuffer() }
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!(
-                    "thumbnail ConvertToContiguousBuffer: {e}"
-                ))
-            })?;
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let mut max_len: u32 = 0;
-        let mut cur_len: u32 = 0;
-        unsafe { buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len)) }
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!("thumbnail Lock: {e}"))
-            })?;
-
-        if ptr.is_null() || (cur_len as usize) < frame_bytes {
-            let _ = unsafe { buffer.Unlock() };
-            return Err(VideoImportError::DecodeFailed(format!(
-                "thumbnail frame too small: {cur_len} < {frame_bytes}"
-            )));
-        }
-
-        // BGRA8 → RGBA8 swap. MF_MT_DEFAULT_STRIDE could in theory be
-        // larger than width*4 (= row padding) — for RGB32 in WMF it's
-        // almost always exactly width*4 but we defensively only read
-        // `frame_bytes`. A more robust implementation would query
-        // MF_MT_DEFAULT_STRIDE and copy row-by-row. The alpha byte in
-        // `MFVideoFormat_RGB32` is undefined per MSDN, so we hardcode
-        // 0xFF — without this the thumbnail texture renders with
-        // arbitrary alpha (often 0) and disappears.
-        let src = unsafe { std::slice::from_raw_parts(ptr, frame_bytes) };
-        rgba.clear();
-        rgba.reserve_exact(frame_bytes);
-        for px in src.chunks_exact(4) {
-            // src order: B, G, R, _ → push R, G, B, 0xFF
-            rgba.push(px[2]);
-            rgba.push(px[1]);
-            rgba.push(px[0]);
-            rgba.push(0xFF);
-        }
-
-        let _ = unsafe { buffer.Unlock() };
-        break;
-    }
-
+    let mut decoder = crate::libav_decoder::LibavVideoDecoder::new();
+    let frame = decoder
+        .decode_at(0, path, 0)
+        .map_err(VideoImportError::DecodeFailed)?;
+    let rgba = crate::video_playback::bgra_to_rgba(&frame.bgra);
     Ok(ThumbnailFrame {
-        width,
-        height,
+        width: frame.width,
+        height: frame.height,
         rgba,
     })
 }
@@ -507,116 +189,70 @@ pub struct ExtractedAudioInfo {
     pub frames: u64,
 }
 
-/// Open `src` with WMF, find the first audio stream, ask the source
-/// reader to deliver PCM Float32 (= the audio engine's native format),
-/// and write the decoded samples into `dst_wav` via `hound`. Returns
-/// `Ok(None)` when the source has no selectable audio stream; in that
-/// case `dst_wav` is NOT created.
-///
-/// MFAudioFormat_Float in WMF is little-endian IEEE-754 32-bit. The
-/// hound writer is configured with `bits_per_sample: 32` and
-/// `sample_format: Float` so the output is interchangeable with any
-/// other Float WAV daw_01 already handles (see
-/// `import_audio::decode_wav`).
+/// Extract the first audio stream to a paired WAV via `avcodec` decode +
+/// `swresample` → interleaved Float32 + `hound`. Returns `Ok(None)` when the
+/// source has no audio stream (in which case `dst_wav` is NOT created). Output
+/// preserves the source's native sample rate / channel count as a Float32 WAV,
+/// interchangeable with the rest of daw_01's audio pipeline.
 pub fn extract_audio_to_wav(
     src: &Path,
     dst_wav: &Path,
 ) -> Result<Option<ExtractedAudioInfo>, VideoImportError> {
-    ensure_mf_startup()?;
-
     if !src.exists() {
         return Err(VideoImportError::IoError(format!(
             "file not found: {}",
             src.display()
         )));
     }
+    let url = path_cstring(src)?;
+    let mut input = AVFormatContextInput::open(&url).map_err(|e| {
+        VideoImportError::DecodeFailed(format!("open {}: {e:?}", src.display()))
+    })?;
 
-    let wide = to_wide(src);
-    let url = PCWSTR::from_raw(wide.as_ptr());
-    let reader: IMFSourceReader = unsafe {
-        MFCreateSourceReaderFromURL(url, None).map_err(|e| {
-            VideoImportError::DecodeFailed(format!(
-                "MFCreateSourceReaderFromURL({}): {e}",
-                src.display()
-            ))
-        })?
+    // No audio stream → Ok(None) so callers treat video-only inputs uniformly.
+    let Some((stream_index, codec)) = input
+        .find_best_stream(ffi::AVMEDIA_TYPE_AUDIO)
+        .map_err(|e| VideoImportError::DecodeFailed(format!("find audio stream: {e:?}")))?
+    else {
+        return Ok(None);
     };
 
-    let audio_stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
-
-    // Probe the native audio media type. If the call fails the source
-    // probably has no audio stream — return Ok(None) instead of
-    // erroring so callers can treat video-only inputs uniformly.
-    let native = match unsafe { reader.GetNativeMediaType(audio_stream, 0) } {
-        Ok(t) => t,
-        Err(_) => return Ok(None),
+    let mut decoder = {
+        let stream = &input.streams()[stream_index];
+        let mut d = AVCodecContext::new(&codec);
+        d.apply_codecpar(&stream.codecpar()).map_err(|e| {
+            VideoImportError::DecodeFailed(format!("apply_codecpar(audio): {e:?}"))
+        })?;
+        d.open(None)
+            .map_err(|e| VideoImportError::DecodeFailed(format!("open audio decoder: {e:?}")))?;
+        d
     };
-    let channels = unsafe { native.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS) }
-        .map_err(|e| VideoImportError::DecodeFailed(format!("audio channels: {e}")))?
-        as u16;
-    let sample_rate = unsafe { native.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND) }
-        .map_err(|e| VideoImportError::DecodeFailed(format!("audio sample_rate: {e}")))?;
-    // A degenerate channel count (= WMF reported 0) would divide-by-zero
-    // in the frame accounting below (`cur_len / 4 / channels`); a 0
-    // sample rate likewise produces an unusable WAV. Treat either as
-    // "no usable audio stream" so callers fall back to video-only.
-    if channels == 0 || sample_rate == 0 {
+
+    let sample_rate = decoder.sample_rate.max(0) as u32;
+    let channels = decoder.ch_layout.nb_channels.max(0) as u16;
+    if sample_rate == 0 || channels == 0 {
         return Ok(None);
     }
 
-    // Build the desired output type: PCM Float32 at the source's
-    // native rate / channels. Letting WMF insert the resampler MFT
-    // would normalise to 48 kHz stereo, but for import-time extract
-    // we want bit-identical content where possible — preserve the
-    // source rate / channels so downstream code can resample on the
-    // playback path if needed.
-    let output_type = unsafe {
-        let t = MFCreateMediaType().map_err(|e| {
-            VideoImportError::DecodeFailed(format!("MFCreateMediaType: {e}"))
-        })?;
-        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
-            .map_err(|e| VideoImportError::DecodeFailed(format!("set MAJOR_TYPE: {e}")))?;
-        t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)
-            .map_err(|e| VideoImportError::DecodeFailed(format!("set SUBTYPE: {e}")))?;
-        t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 32)
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!("set BITS_PER_SAMPLE: {e}"))
-            })?;
-        t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels as u32)
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!("set NUM_CHANNELS: {e}"))
-            })?;
-        t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate)
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!("set SAMPLES_PER_SECOND: {e}"))
-            })?;
-        t
-    };
-    unsafe { reader.SetCurrentMediaType(audio_stream, None, &output_type) }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!(
-                "SetCurrentMediaType(audio, Float32 {channels}ch {sample_rate}Hz): {e}"
-            ))
-        })?;
+    // swresample: decoder-native (planar / int / …) → Float32 packed, same rate.
+    // Input uses the decoder's own channel layout so no channel remap happens;
+    // the output uses a fresh default layout for the same channel count.
+    let out_layout = AVChannelLayout::from_nb_channels(channels as i32).into_inner();
+    let mut swr = SwrContext::new(
+        &out_layout,
+        ffi::AV_SAMPLE_FMT_FLT,
+        sample_rate as i32,
+        &decoder.ch_layout,
+        decoder.sample_fmt,
+        sample_rate as i32,
+    )
+    .map_err(|e| VideoImportError::DecodeFailed(format!("swr_alloc: {e:?}")))?;
+    swr.init()
+        .map_err(|e| VideoImportError::DecodeFailed(format!("swr_init: {e:?}")))?;
 
-    // Deselect video so the reader doesn't decode frames we don't
-    // need. Best-effort — older sources sometimes refuse, in which
-    // case we still drain the audio stream below.
-    let _ = unsafe {
-        reader.SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, false)
-    };
-    unsafe { reader.SetStreamSelection(audio_stream, true) }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!("SetStreamSelection(audio): {e}"))
-        })?;
-
-    // Now drain samples into the WAV.
     if let Some(parent) = dst_wav.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            VideoImportError::IoError(format!(
-                "create_dir_all {}: {e}",
-                parent.display()
-            ))
+            VideoImportError::IoError(format!("create_dir_all {}: {e}", parent.display()))
         })?;
     }
     let spec = hound::WavSpec {
@@ -625,74 +261,65 @@ pub fn extract_audio_to_wav(
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
-    let mut writer = hound::WavWriter::create(dst_wav, spec).map_err(|e| {
-        VideoImportError::IoError(format!("hound::WavWriter::create: {e}"))
-    })?;
+    let mut writer = hound::WavWriter::create(dst_wav, spec)
+        .map_err(|e| VideoImportError::IoError(format!("hound::WavWriter::create: {e}")))?;
 
+    let audio_stream = stream_index as i32;
     let mut frames_written: u64 = 0;
-    loop {
-        let mut flags: u32 = 0;
-        let mut sample: Option<windows::Win32::Media::MediaFoundation::IMFSample> =
-            None;
-        unsafe {
-            reader.ReadSample(
-                audio_stream,
-                0,
-                None,
-                Some(&mut flags),
-                None,
-                Some(&mut sample),
-            )
+    let mut eof = false;
+    'outer: loop {
+        // Drain all frames currently available from the decoder.
+        loop {
+            match decoder.receive_frame() {
+                Ok(frame) => {
+                    let mut out = AVFrame::new();
+                    out.set_format(ffi::AV_SAMPLE_FMT_FLT);
+                    out.set_ch_layout(
+                        AVChannelLayout::from_nb_channels(channels as i32).into_inner(),
+                    );
+                    out.set_sample_rate(sample_rate as i32);
+                    out.set_nb_samples(frame.nb_samples);
+                    out.alloc_buffer().map_err(|e| {
+                        VideoImportError::DecodeFailed(format!("out frame alloc: {e:?}"))
+                    })?;
+                    swr.convert_frame(Some(&frame), &mut out).map_err(|e| {
+                        VideoImportError::DecodeFailed(format!("swr convert: {e:?}"))
+                    })?;
+                    let n = out.nb_samples.max(0) as usize;
+                    write_flt_frame(&mut writer, &out, n, channels as usize)?;
+                    frames_written += n as u64;
+                }
+                Err(RsmpegError::DecoderDrainError) => break, // need more input
+                Err(RsmpegError::DecoderFlushedError) => break 'outer, // fully drained
+                Err(e) => {
+                    return Err(VideoImportError::DecodeFailed(format!(
+                        "receive_frame(audio): {e:?}"
+                    )));
+                }
+            }
         }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!("ReadSample(audio): {e}"))
-        })?;
-        if (flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
-            break;
-        }
-        let Some(sample) = sample else {
-            // Spurious read — gap or format change. Keep looping.
+        if eof {
+            // Already flushed; the drain loop above will hit DecoderFlushedError.
             continue;
-        };
-
-        // ConvertToContiguousBuffer collapses the (possibly split)
-        // sample storage into a single IMFMediaBuffer we can lock.
-        let buffer = unsafe { sample.ConvertToContiguousBuffer() }
-            .map_err(|e| {
-                VideoImportError::DecodeFailed(format!(
-                    "ConvertToContiguousBuffer: {e}"
-                ))
-            })?;
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let mut max_len: u32 = 0;
-        let mut cur_len: u32 = 0;
-        unsafe {
-            buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len))
         }
-        .map_err(|e| {
-            VideoImportError::DecodeFailed(format!("IMFMediaBuffer::Lock: {e}"))
-        })?;
-
-        if !ptr.is_null() && cur_len > 0 {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(ptr, cur_len as usize)
-            };
-            // Float32 little-endian. chunks_exact(4) so a partial tail
-            // byte (which shouldn't happen for a Float stream but
-            // we're defensive) doesn't panic in `f32::from_le_bytes`.
-            for chunk in bytes.chunks_exact(4) {
-                let s = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                writer.write_sample(s).map_err(|e| {
-                    VideoImportError::IoError(format!("hound write: {e}"))
+        match input
+            .read_packet()
+            .map_err(|e| VideoImportError::DecodeFailed(format!("read_packet: {e:?}")))?
+        {
+            Some(packet) => {
+                if packet.stream_index == audio_stream {
+                    decoder.send_packet(Some(&packet)).map_err(|e| {
+                        VideoImportError::DecodeFailed(format!("send_packet(audio): {e:?}"))
+                    })?;
+                }
+            }
+            None => {
+                eof = true;
+                decoder.send_packet(None).map_err(|e| {
+                    VideoImportError::DecodeFailed(format!("flush send_packet: {e:?}"))
                 })?;
             }
-            // One "frame" = `channels` samples; count whole frames
-            // written so the AudioSource entry can report the right
-            // length downstream.
-            frames_written += (cur_len as u64 / 4) / channels as u64;
         }
-
-        let _ = unsafe { buffer.Unlock() };
     }
 
     writer
@@ -704,6 +331,30 @@ pub fn extract_audio_to_wav(
         channels,
         frames: frames_written,
     }))
+}
+
+/// Write one interleaved Float32 audio frame (`nb_samples` per channel) to the
+/// WAV writer. `out.data[0]` is `nb_samples * channels` packed f32.
+fn write_flt_frame(
+    writer: &mut hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    out: &AVFrame,
+    nb_samples: usize,
+    channels: usize,
+) -> Result<(), VideoImportError> {
+    let plane = out.data[0];
+    if plane.is_null() || nb_samples == 0 {
+        return Ok(());
+    }
+    let total = nb_samples * channels;
+    // SAFETY: the FLT packed plane holds `nb_samples * channels` contiguous f32
+    // (alloc_buffer sized it from nb_samples + ch_layout).
+    let samples = unsafe { std::slice::from_raw_parts(plane as *const f32, total) };
+    for &s in samples {
+        writer
+            .write_sample(s)
+            .map_err(|e| VideoImportError::IoError(format!("hound write: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Successful import result. The video has been copied into the
@@ -726,7 +377,7 @@ pub struct ImportedVideo {
     /// Paired audio extracted from the source. `None` when the input
     /// had no audio stream (= `extract_audio_to_wav` returned `None`).
     pub audio: Option<crate::import_audio::ImportedAudio>,
-    /// First-frame RGBA8 thumbnail. `None` when WMF could not decode a
+    /// First-frame RGBA8 thumbnail. `None` when libav could not decode a
     /// representative frame (= rare; we accept import success without
     /// a thumbnail rather than fail the whole import). The caller
     /// queues this for GPU texture upload in `Runner` (P3.5).

@@ -1,20 +1,23 @@
-//! In-process libav (rsmpeg) software video decoder for **export**
-//! (`docs/plan_video_export_libav.md` Phase 3, decode side).
+//! In-process libav (rsmpeg) software video decoder — the **single** decode
+//! engine for both preview and export (`docs/plan_video_decode_unify.md`).
 //!
-//! Replaces the export's `VideoPlaybackEngine::new_cpu_only()` path (Media
-//! Foundation software decode + an `ffmpeg.exe` subprocess fallback for codecs
-//! MF rejects). Now that rsmpeg links libav in-process, we decode every source
-//! — including 10-bit H.264 High10, HEVC, AV1 — directly with `avcodec`, with
-//! `libswscale` converting to BGRA8 for the wgpu `OffscreenRenderer`.
+//! Media Foundation / D3D11 was removed: its reader-teardown path crashed with
+//! a COM access violation (`combase.dll`, 2026-07-06) and it could not decode
+//! 10-bit H.264 High10 at all. `rsmpeg` links libav in-process, so we decode
+//! every source — including 10-bit H.264 High10, HEVC, AV1 — directly with
+//! `avcodec`, with `libswscale` converting to BGRA8.
 //!
-//! This fixes the bug where the export silently dropped 10-bit video: MF's SW
-//! reader can't set up the 10-bit decode pipeline, so the reader was never
-//! created, the `ffmpeg.exe` fallback had no dimensions to start from, and
-//! `build_frame_scene` swallowed the error and skipped the layer (black).
+//! One engine, two entry points differing only in output scale:
+//! - [`LibavVideoDecoder::new_preview`] downscales frames to
+//!   [`PREVIEW_MAX_LONG_EDGE`] in the swscale pass (upload-bandwidth budget);
+//! - [`LibavVideoDecoder::new`] decodes at native resolution (export).
 //!
-//! Preview keeps its own MF D3D11 zero-copy path for now; unifying that onto
-//! libav D3D11VA is a separate, larger change (and pointless for 10-bit on
-//! Ampere, which has no HW 10-bit H.264 decode).
+//! HW-accelerated decode (nvdec / d3d11va / vulkan) is intentionally NOT wired:
+//! the only HW output rsmpeg 0.17 can reach is a GPU→CPU `av_hwframe_transfer_data`
+//! readback (zero-copy Vulkan is unreachable — `hwcontext_vulkan.h` is absent
+//! from the bindings), which is ≥ plain SW at preview resolution. SW decode of
+//! 1080p is 8–20× real-time; the module is structured so a per-codec HW opt-in
+//! can be added behind the same BGRA sink if 4K need is ever measured.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -59,11 +62,20 @@ struct SourceDecoder {
     /// without decoding more.
     last_frame: Option<AVFrame>,
     eof: bool,
+    /// Preview downscale cap (long edge). `Some(n)` → the swscale pass scales
+    /// the frame down so its long edge is ≤ `n` (aspect kept, even dims);
+    /// `None` → native resolution (export). See [`preview_scale`].
+    max_long_edge: Option<u32>,
 }
 
-/// Per-`VideoSourceId` in-process libav decoder for the export pipeline.
+/// The single in-process libav decoder, shared by preview and export
+/// (`docs/plan_video_decode_unify.md`). Per-`VideoSourceId` demuxer+decoder are
+/// opened lazily. Preview constructs it with [`new_preview`](Self::new_preview)
+/// (downscaled to [`PREVIEW_MAX_LONG_EDGE`]); export uses [`new`](Self::new)
+/// (native resolution).
 pub struct LibavVideoDecoder {
     sources: HashMap<VideoSourceId, SourceDecoder>,
+    max_long_edge: Option<u32>,
 }
 
 impl Default for LibavVideoDecoder {
@@ -73,14 +85,30 @@ impl Default for LibavVideoDecoder {
 }
 
 impl LibavVideoDecoder {
+    /// Native-resolution decoder (export / full quality).
     pub fn new() -> Self {
-        Self { sources: HashMap::new() }
+        Self {
+            sources: HashMap::new(),
+            max_long_edge: None,
+        }
+    }
+
+    /// Preview decoder: frames are downscaled so their long edge is ≤
+    /// [`PREVIEW_MAX_LONG_EDGE`] during the swscale→BGRA pass, keeping upload
+    /// bandwidth and per-frame CPU down (the preview window caps at ~960px
+    /// anyway). This is where the old Media-Foundation preview downscale moved.
+    pub fn new_preview() -> Self {
+        Self {
+            sources: HashMap::new(),
+            max_long_edge: Some(PREVIEW_MAX_LONG_EDGE),
+        }
     }
 
     /// Decode the frame covering `target_micros` (source time) of the video at
-    /// `path`, returning it as tightly-packed BGRA8 at the source's native
-    /// resolution. The decoder for a `source_id` is opened on first use and
-    /// reused; sequential targets stream forward, jumps seek + flush.
+    /// `path`, returning it as tightly-packed BGRA8. Native resolution unless
+    /// this decoder was built with [`new_preview`](Self::new_preview). The
+    /// decoder for a `source_id` is opened on first use and reused; sequential
+    /// targets stream forward, jumps seek + flush.
     pub fn decode_at(
         &mut self,
         source_id: VideoSourceId,
@@ -88,12 +116,33 @@ impl LibavVideoDecoder {
         target_micros: u64,
     ) -> Result<DecodedBgra, String> {
         use std::collections::hash_map::Entry;
+        let max_long_edge = self.max_long_edge;
         let dec = match self.sources.entry(source_id) {
             Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => v.insert(SourceDecoder::open(path)?),
+            Entry::Vacant(v) => v.insert(SourceDecoder::open(path, max_long_edge)?),
         };
         dec.decode_at(target_micros)
     }
+}
+
+/// Preview downscale cap (long edge, px). A 1920x1080 source decoded native
+/// uploads 8 MB/frame; the preview window caps at ~960px wide by default, so
+/// decoding above that wastes CPU + GPU bandwidth the eye never consumes.
+/// Sources whose long edge is already ≤ this pass through native.
+pub const PREVIEW_MAX_LONG_EDGE: u32 = 960;
+
+/// Scale `(native_w, native_h)` so the long edge is ≤ `cap`, preserving aspect
+/// and rounding to even dimensions (4:2:0 / NV12 hygiene). Sources already
+/// within the cap pass through unchanged (never upscales).
+fn preview_scale(native_w: u32, native_h: u32, cap: u32) -> (u32, u32) {
+    let long = native_w.max(native_h);
+    if long <= cap {
+        return (native_w.max(1), native_h.max(1));
+    }
+    let scale = cap as f64 / long as f64;
+    let w = ((native_w as f64) * scale).round().max(1.0) as u32;
+    let h = ((native_h as f64) * scale).round().max(1.0) as u32;
+    (w & !1, h & !1)
 }
 
 /// Forward jump (μs) beyond which seeking to a keyframe is cheaper than
@@ -107,7 +156,7 @@ const SEEK_AHEAD_MICROS: u64 = 500_000;
 const WALK_BOUND: usize = 1024;
 
 impl SourceDecoder {
-    fn open(path: &Path) -> Result<Self, String> {
+    fn open(path: &Path, max_long_edge: Option<u32>) -> Result<Self, String> {
         let url = CString::new(path.to_string_lossy().as_bytes().to_vec())
             .map_err(|e| format!("path has interior NUL: {e}"))?;
         let input = AVFormatContextInput::open(&url)
@@ -152,6 +201,7 @@ impl SourceDecoder {
             last_micros: None,
             last_frame: None,
             eof: false,
+            max_long_edge,
         })
     }
 
@@ -321,8 +371,19 @@ impl SourceDecoder {
         if src_w <= 0 || src_h <= 0 {
             return Err(format!("invalid frame dims {src_w}x{src_h}"));
         }
+        // Preview downscale (native for export). swscale performs the resize in
+        // the same pass as the YUV→BGRA convert, so it's essentially free.
+        let (dst_w, dst_h) = match self.max_long_edge {
+            Some(cap) => {
+                let (w, h) = preview_scale(src_w as u32, src_h as u32, cap);
+                (w as i32, h as i32)
+            }
+            None => (src_w, src_h),
+        };
 
-        // (Re)build the sws context if absent or the source format changed.
+        // (Re)build the sws context if absent or the source format/size changed.
+        // `dst_(w,h)` is a pure function of `src_(w,h)` + this decoder's fixed
+        // cap, so keying the cache on the source dims is sufficient.
         let needs_new = match &self.sws {
             Some((_, f, w, h)) => *f != src_fmt || *w != src_w || *h != src_h,
             None => true,
@@ -332,33 +393,37 @@ impl SourceDecoder {
                 src_w,
                 src_h,
                 src_fmt,
-                src_w,
-                src_h,
+                dst_w,
+                dst_h,
                 ffi::AV_PIX_FMT_BGRA,
                 ffi::SWS_BILINEAR,
                 None,
                 None,
                 None,
             )
-            .ok_or_else(|| format!("sws_getContext for fmt {src_fmt} {src_w}x{src_h} failed"))?;
+            .ok_or_else(|| {
+                format!("sws_getContext for fmt {src_fmt} {src_w}x{src_h}→{dst_w}x{dst_h} failed")
+            })?;
             self.sws = Some((ctx, src_fmt, src_w, src_h));
         }
 
         let mut dst = AVFrame::new();
         dst.set_format(ffi::AV_PIX_FMT_BGRA);
-        dst.set_width(src_w);
-        dst.set_height(src_h);
+        dst.set_width(dst_w);
+        dst.set_height(dst_h);
         dst.alloc_buffer()
             .map_err(|e| format!("dst frame alloc_buffer: {e:?}"))?;
 
         let (sws, ..) = self.sws.as_mut().expect("just set");
+        // `src_h` is the source slice height fed to swscale; the destination is
+        // `dst_w x dst_h`.
         sws.scale_frame(frame, 0, src_h, &mut dst)
             .map_err(|e| format!("sws scale_frame: {e:?}"))?;
 
-        // Pack the (possibly padded) BGRA plane into a tight `w*h*4` buffer.
+        // Pack the (possibly padded) BGRA plane into a tight `dst_w*dst_h*4`.
         let stride = dst.linesize[0] as usize;
-        let row = src_w as usize * 4;
-        let h = src_h as usize;
+        let row = dst_w as usize * 4;
+        let h = dst_h as usize;
         let plane = dst.data[0];
         if plane.is_null() {
             return Err("dst BGRA plane is null".to_string());
@@ -376,7 +441,7 @@ impl SourceDecoder {
             }
         }
 
-        Ok(DecodedBgra { bgra, width: src_w as u32, height: src_h as u32 })
+        Ok(DecodedBgra { bgra, width: dst_w as u32, height: dst_h as u32 })
     }
 
     fn half_frame_micros(&self) -> u64 {
@@ -398,4 +463,25 @@ fn build_decoder(
         .apply_codecpar(&codecpar)
         .map_err(|e| format!("apply_codecpar: {e:?}"))?;
     Ok(decoder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_scale_caps_long_edge() {
+        // 1920x1080 → 960x540 (long-edge 960, aspect kept).
+        assert_eq!(preview_scale(1920, 1080, 960), (960, 540));
+        // 4K → 960x540 too (1920/3840 = 0.5).
+        assert_eq!(preview_scale(3840, 2160, 960), (960, 540));
+        // Already within cap → identity.
+        assert_eq!(preview_scale(640, 480, 960), (640, 480));
+        assert_eq!(preview_scale(960, 540, 960), (960, 540));
+        // Portrait → cap applies to the height (long edge).
+        assert_eq!(preview_scale(1080, 1920, 960), (540, 960));
+        // Odd dimensions round to even (NV12 hygiene).
+        let (w, h) = preview_scale(1921, 1081, 960);
+        assert!(w % 2 == 0 && h % 2 == 0, "even-aligned, got {w}x{h}");
+    }
 }

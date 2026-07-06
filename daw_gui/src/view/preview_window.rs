@@ -35,18 +35,15 @@ pub struct PreviewWindowState {
     pub window: Arc<WinitWindow>,
     pub renderer: Renderer<WinitWindow>,
     pub scene: Scene,
-    /// docs/plan_video_perf.md P4: per-`(VideoSourceId, slot_idx)`
-    /// GPU textures backing the lookahead ring. The worker
-    /// round-robins decoded frames through `PREVIEW_RING_SIZE`
-    /// independent `SharedPool` slots; the main thread imports each
-    /// slot's stable NT handle (zero-copy path) or uploads BGRA bytes
-    /// (CPU fallback path) into its own `TextureHandle` here exactly
-    /// once per slot, then re-uses that handle for every subsequent
-    /// frame the worker writes into the same slot. `(handle, width,
-    /// height)`; widths/heights are source-native, the composite pass
-    /// aspect-fits each layer into the preview window independently.
-    /// `clear_all` releases everything when the preview window
-    /// destructs.
+    /// Per-`VideoSourceId` GPU texture the worker's decoded BGRA frame is
+    /// uploaded into. The main thread creates the `TextureHandle` on the first
+    /// frame (or a dimension change) and re-uses it for every subsequent frame
+    /// of the same source. Keyed by `(VideoSourceId, slot_idx)`; with the libav
+    /// BGRA sink `slot_idx` is always 0 (the per-slot lookahead ring was for the
+    /// removed HW zero-copy path). `(handle, width, height)`; widths/heights are
+    /// source-native (capped by the preview downscale), the composite pass
+    /// aspect-fits each layer independently. `clear_all` releases everything
+    /// when the preview window destructs.
     pub frame_textures: std::collections::HashMap<
         (common::model::VideoSourceId, u8),
         (TextureHandle, u32, u32),
@@ -212,104 +209,41 @@ impl PreviewWindowState {
         handle
     }
 
-    /// Upload (or `Shared` import) a freshly-decoded frame into the
-    /// `(source_id, slot_idx)` cache entry. Reuses the existing
-    /// `TextureHandle` when the dimensions match (= hot path during
-    /// playback); on a dimension change (= rare, would mean the
-    /// project's video sources were re-imported) destroys and re-creates
-    /// the texture for that specific slot.
+    /// Upload a freshly-decoded BGRA frame into the `(source_id, slot_idx)`
+    /// cache entry. Reuses the existing `TextureHandle` when the dimensions
+    /// match (= hot path during playback); on a dimension change (= rare, would
+    /// mean the project's video sources were re-imported) destroys and
+    /// re-creates the texture for that slot.
     ///
-    /// docs/plan_video_perf.md P4: per-slot caching. Each
-    /// `VideoSourceId` owns `PREVIEW_RING_SIZE` distinct slots; their
-    /// shared NT handles (HW path) are stable for the slot's lifetime
-    /// so import happens exactly once per `(source_id, slot_idx)`
-    /// pair. Subsequent frames the worker writes into the same slot
-    /// reuse the cached `TextureHandle`.
-    ///
-    /// Two paths, dispatched on the `DecodedFrame` variant:
-    ///
-    /// - `Shared` (zero-copy, P3): the variant's own `slot_idx` is
-    ///   used as the cache key; we ignore the caller's `slot_idx`
-    ///   argument and read the one embedded in the frame to avoid
-    ///   mismatch.
-    /// - `Bgra` (CPU fallback, P2): the variant has no slot field
-    ///   (the ring is HW-path only); we use the caller's `slot_idx`
-    ///   verbatim so the worker can still write all N ring slots
-    ///   into independent CPU textures, though the gains are limited
-    ///   compared to the GPU path.
+    /// libav decodes every source to a system-memory BGRA8 frame — there is one
+    /// decode path now; the old zero-copy D3D11 `Shared` import went away with
+    /// Media Foundation (`docs/plan_video_decode_unify.md`). The BGRA sink is
+    /// 1-frame-latest, so the worker only ever fills slot 0.
     pub fn upload_frame(
         &mut self,
         source_id: common::model::VideoSourceId,
         slot_idx: u8,
         frame: &crate::video_playback::DecodedFrame,
     ) -> Option<TextureHandle> {
-        use crate::video_playback::DecodedFrame;
-        match frame {
-            DecodedFrame::Shared {
-                width,
-                height,
-                handle,
-                slot_idx: frame_slot,
-            } => {
-                let key = (source_id, *frame_slot);
-                if let Some((_, w, h)) = self.frame_textures.get(&key)
-                    && *w == *width
-                    && *h == *height
-                {
-                    // Already imported — the worker writes new content
-                    // into the same underlying D3D11 resource on every
-                    // frame, so nothing for us to do here.
-                    return self.frame_textures.get(&key).map(|(h, _, _)| *h);
-                }
-                // First frame for this (source, slot) (or dimensions
-                // changed): import the DXGI shared NT handle into
-                // wgpu's texture pool exactly once.
-                if let Some((old, _, _)) = self.frame_textures.remove(&key) {
-                    self.renderer.destroy_texture(old);
-                }
-                match self.renderer.create_texture_from_d3d11_shared_handle(
-                    handle.0,
-                    wgpu::TextureFormat::Bgra8UnormSrgb,
-                    *width,
-                    *height,
-                ) {
-                    Ok(tex) => {
-                        self.frame_textures.insert(key, (tex, *width, *height));
-                        Some(tex)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            video_source_id = source_id,
-                            slot_idx = *frame_slot,
-                            "create_texture_from_d3d11_shared_handle failed"
-                        );
-                        None
-                    }
-                }
+        let key = (source_id, slot_idx);
+        let recreate = match self.frame_textures.get(&key) {
+            Some((_, w, h)) => *w != frame.width || *h != frame.height,
+            None => true,
+        };
+        if recreate {
+            if let Some((old, _, _)) = self.frame_textures.remove(&key) {
+                self.renderer.destroy_texture(old);
             }
-            DecodedFrame::Bgra { width, height, bgra } => {
-                let key = (source_id, slot_idx);
-                let recreate = match self.frame_textures.get(&key) {
-                    Some((_, w, h)) => *w != *width || *h != *height,
-                    None => true,
-                };
-                if recreate {
-                    if let Some((old, _, _)) = self.frame_textures.remove(&key) {
-                        self.renderer.destroy_texture(old);
-                    }
-                    let h = self.renderer.create_texture_bgra(*width, *height);
-                    self.frame_textures.insert(key, (h, *width, *height));
-                }
-                let handle = self
-                    .frame_textures
-                    .get(&key)
-                    .map(|(h, _, _)| *h)
-                    .expect("just inserted");
-                self.renderer.upload_texture_bgra(handle, bgra);
-                Some(handle)
-            }
+            let h = self.renderer.create_texture_bgra(frame.width, frame.height);
+            self.frame_textures.insert(key, (h, frame.width, frame.height));
         }
+        let handle = self
+            .frame_textures
+            .get(&key)
+            .map(|(h, _, _)| *h)
+            .expect("just inserted");
+        self.renderer.upload_texture_bgra(handle, &frame.bgra);
+        Some(handle)
     }
 
     /// Drop every cached frame texture and clear the composite list
