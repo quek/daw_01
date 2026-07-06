@@ -208,6 +208,29 @@ impl SongDoc {
         Some(r)
     }
 
+    /// [`SongDoc::normalize`] の no-op 検出版 ([`SongDoc::edit_checked`] と対称)。
+    /// closure が `false` (= 実際には何も変わらなかった) を返したら
+    /// `edit_epoch` を bump しない = dirty 化も子プロセス再 sync も起こさない。
+    ///
+    /// 用途: 非同期の派生 re-write で、 保存ファイルと**同一**な内容を書き戻す
+    /// ケース。 代表例は `SlotPluginLoaded` backfill — plugin load 完了ごとに
+    /// PluginInstance を再構築するが、 現行バージョンで保存した project では
+    /// 再構築結果が既存と同一。 無条件 `normalize` だと epoch が進み「開いた
+    /// だけで '*'」 になる (r.md #9)。 changed 判定を closure に委ねることで、
+    /// 本当に内容が変わったとき (旧 file の port 解決 / 手動 plugin 挿入) だけ
+    /// dirty + sync させる。 戻り値: `None` = export 中拒否、 `Some(changed)`。
+    pub fn normalize_checked(&mut self, f: impl FnOnce(&mut Song) -> bool) -> Option<bool> {
+        if self.export_lock {
+            self.rejection = Some("書き出し中は編集できません");
+            return None;
+        }
+        let changed = f(&mut self.song);
+        if changed {
+            self.edit_epoch += 1;
+        }
+        Some(changed)
+    }
+
     /// plugin state blob の write-back (`RequestAllStates` 応答) **専用**。
     /// blob は host が真実源で wire (LoadSong) からも構造的に除外されているため、
     /// undo / epoch / dirty / 子プロセス sync のどれにも影響しない。
@@ -365,5 +388,52 @@ impl SongDoc {
     /// (handle_event 末尾 → `status_message`)。
     pub fn take_rejection(&mut self) -> Option<&'static str> {
         self.rejection.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r.md #9 の核心: no-op な normalize は epoch を bump せず dirty 化しない
+    /// (= SlotPluginLoaded backfill が保存ファイルと同一内容を書き戻しても
+    /// 「開いただけで '*'」 にならない)。
+    #[test]
+    fn normalize_checked_noop_does_not_dirty() {
+        let mut doc = SongDoc::new(Song::default());
+        assert!(!doc.is_dirty(), "new は clean");
+        let before = doc.edit_epoch();
+        let r = doc.normalize_checked(|_song| false);
+        assert_eq!(r, Some(false));
+        assert_eq!(doc.edit_epoch(), before, "no-op は epoch を進めない");
+        assert!(!doc.is_dirty(), "no-op normalize は dirty 化しない (r.md #9)");
+    }
+
+    /// 対の保証: 実際に変えた normalize は従来どおり epoch bump + dirty。
+    #[test]
+    fn normalize_checked_real_change_dirties() {
+        let mut doc = SongDoc::new(Song::default());
+        let before = doc.edit_epoch();
+        let r = doc.normalize_checked(|song| {
+            song.bpm = 140.0;
+            true
+        });
+        assert_eq!(r, Some(true));
+        assert_eq!(doc.edit_epoch(), before + 1);
+        assert!(doc.is_dirty(), "実変更は dirty 化する");
+    }
+
+    /// export 中は normalize_checked も拒否される (song 凍結の単一保証点)。
+    #[test]
+    fn normalize_checked_rejected_during_export() {
+        let mut doc = SongDoc::new(Song::default());
+        doc.set_export_lock(true);
+        let before = doc.edit_epoch();
+        let r = doc.normalize_checked(|song| {
+            song.bpm = 140.0;
+            true
+        });
+        assert_eq!(r, None, "export 中は拒否");
+        assert_eq!(doc.edit_epoch(), before, "拒否時は epoch 不変");
     }
 }

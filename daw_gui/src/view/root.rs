@@ -808,6 +808,20 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
 
+    // Home / End: プレイヘッドをタイムラインの端へ移動 (r.md #10)。 typing 中は
+    // `is_typing_only_shortcut` で抑止され text_input のカーソル移動になるので、
+    // ここに来るのは非 typing 時のみ。 seek は handler が停止/再生とも面倒を見る。
+    if ui.take_shortcut("daw.goto_timeline_home") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::GotoTimelineHome)
+        }));
+    }
+    if ui.take_shortcut("daw.goto_timeline_end") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::GotoTimelineEnd)
+        }));
+    }
+
     // Alt+F: 再生追従スクロールの方式を循環 (OFF → 連続 → ページ)。
     if ui.take_shortcut("daw.cycle_arrange_follow") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {

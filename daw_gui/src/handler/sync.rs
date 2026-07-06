@@ -407,20 +407,30 @@ impl AppData {
         if !needs {
             return;
         }
-        self.normalize_song(|song| {
-            let resolve = |devices: &mut [common::model::PluginInstance]| {
-                for d in devices.iter_mut() {
-                    if d.ports == default_ports
-                        && let Some(entry) = db.find_by_id(&d.plugin_id)
-                    {
-                        d.ports = port_config_of(entry);
+        // r.md #9: no-op 検出付き normalize。 解決が実際に ports を書き換えたとき
+        // だけ epoch を bump する (port が既に非 default / plugin が無 port で
+        // 解決結果が同じなら dirty 化しない)。 旧 project の port 解決は本当に
+        // 内容が変わる migration なので、 そのときは dirty で正しい (= 再保存で
+        // 解決済み ports を永続化)。
+        self.normalize_song_checked(|song| {
+            let mut changed = false;
+            for d in song
+                .tracks
+                .iter_mut()
+                .flat_map(|t| t.devices.iter_mut())
+                .chain(song.master_fx_chain.iter_mut())
+            {
+                if d.ports == default_ports
+                    && let Some(entry) = db.find_by_id(&d.plugin_id)
+                {
+                    let resolved = port_config_of(entry);
+                    if resolved != d.ports {
+                        d.ports = resolved;
+                        changed = true;
                     }
                 }
-            };
-            for track in song.tracks.iter_mut() {
-                resolve(&mut track.devices);
             }
-            resolve(&mut song.master_fx_chain);
+            changed
         });
     }
 

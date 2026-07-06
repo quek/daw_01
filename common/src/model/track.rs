@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
+/// Maximum linear amplitude for a track's [`Track::volume`], the master gain,
+/// and (matching this range) each [`Send::gain`]. `1.0` = unity (0 dB), `2.0`
+/// = +6.02 dB — the top of the mixer fader's `MeterScale` (+6 dB, Ardour's
+/// default fader ceiling) and the divisor the automation layer already uses to
+/// normalize `Volume` / `SendGain` (`plain / 2.0`). Single source of truth for
+/// every volume / gain clamp (track volume, master gain, send gain) so a fader
+/// pushed to its visual top no longer snaps back to unity (r.md #11).
+pub const MAX_TRACK_GAIN: f32 = 2.0;
+
 /// v23 (`docs/plan_linear_chain.md`): a track owns **one** linear CLAP
 /// signal chain, `devices: Vec<PluginInstance>`. Roles (MIDI FX / instrument
 /// / audio FX) are **not classified at all** — the engine simply connects

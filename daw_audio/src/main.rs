@@ -589,7 +589,8 @@ async fn recv_loop(
             }
             Ok(AudioCommand::SetMasterGain(g)) => {
                 // render (`render_master_buffer`) が読む — live / export 共通。
-                let clamped = g.clamp(0.0, 1.0);
+                // +6 dB (amp 2.0) まで許可 (r.md #11、 GUI clamp と同 SSoT)。
+                let clamped = g.clamp(0.0, common::model::MAX_TRACK_GAIN);
                 engine_shared
                     .master_gain
                     .store(clamped.to_bits(), Ordering::Relaxed);
@@ -695,7 +696,8 @@ async fn recv_loop(
             Ok(AudioCommand::SetTrackVolume { track, volume }) => {
                 update_song_values(&mut publisher, &shared, &engine_shared, session_sample_rate, |s| {
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track) {
-                        t.volume = volume.clamp(0.0, 1.0);
+                        // +6 dB (amp 2.0) まで許可 (r.md #11、 GUI clamp と同 SSoT)。
+                        t.volume = volume.clamp(0.0, common::model::MAX_TRACK_GAIN);
                     }
                 });
             }
@@ -732,7 +734,8 @@ async fn recv_loop(
                     if let Some(t) = s.tracks.iter_mut().find(|t| t.id == track)
                         && let Some(send) = t.sends.iter_mut().find(|sd| sd.id == send_id)
                     {
-                        send.gain = gain.clamp(0.0, 2.0);
+                        // track/master と同じ +6dB 上限を共有 (r.md #11 sibling)。
+                        send.gain = gain.clamp(0.0, common::model::MAX_TRACK_GAIN);
                     }
                 });
             }

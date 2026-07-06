@@ -47,6 +47,13 @@ pub enum AppEvent {
     /// その位置から再生開始。view 層 (`dispatch_shortcuts`) が snap / ルーティング /
     /// song-absolute 解決済みの beat を渡すので、handler は set-playhead + seek/play のみ。
     PlayFromCursor { beat: f64 },
+    /// `Home` キー: プレイヘッドを先頭 (時間的に最初) のクリップの開始位置へ移動。
+    /// 既にそこへ飛んだ直後なら 1.1.1 (song 先頭 = beat 0) へ (2 度押しで先頭)。
+    /// clip が無ければ先頭へ。 r.md #10。
+    GotoTimelineHome,
+    /// `End` キー: プレイヘッドを最後のクリップの直後 (content 終端 beat) へ移動。
+    /// clip が無ければ先頭 (beat 0)。 r.md #10。
+    GotoTimelineEnd,
     ToggleLoop,
     /// `R` キー: 選択素材の bounding range を loop 範囲に設定して loop ON + 再生開始。
     /// 既に loop ON かつ範囲が一致するなら loop を OFF にする (再生は維持)。 選択が

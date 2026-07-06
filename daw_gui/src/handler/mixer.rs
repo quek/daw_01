@@ -5,12 +5,14 @@ use crate::state::*;
 use crate::app_types::*;
 use crate::event::*;
 use std::sync::{Arc};
-use common::model::{InstrumentSource, SendMode};
+use common::model::{InstrumentSource, MAX_TRACK_GAIN, SendMode};
 use common::protocol::{AudioCommand, PluginCommand};
 
 impl AppData {
     pub(crate) fn set_master_gain(&mut self, gain: f32) {
-        let clamped = gain.clamp(0.0, 1.0);
+        // +6 dB (amp 2.0) までブースト可 — フェーダーの MeterScale 上端に一致
+        // (r.md #11。 unity 上限だと 0dB より上げると即 0dB に戻っていた)。
+        let clamped = gain.clamp(0.0, MAX_TRACK_GAIN);
         self.transport.master_gain = clamped;
         self.send_audio(AudioCommand::SetMasterGain(clamped));
     }
@@ -278,7 +280,9 @@ impl AppData {
     // IPC を通すと audio engine 側の Vec 順序とずれて race を起こすため、
     // ここから IPC まで一貫して id で識別する。
     pub(crate) fn set_track_volume(&mut self, track_id: u32, volume: f32) {
-        let v = volume.clamp(0.0, 1.0);
+        // +6 dB (amp 2.0) まで許可 — フェーダー / automation の range に一致
+        // (r.md #11。 unity 上限だとフェーダーを 0dB より上げると 0dB へ戻った)。
+        let v = volume.clamp(0.0, MAX_TRACK_GAIN);
         // 存在しない track は no-op (audio send / last-touched も出さない = 旧 early return)。
         if !self.song_doc.song().tracks.iter().any(|t| t.id == track_id) {
             return;
@@ -460,7 +464,9 @@ impl AppData {
     /// 高頻度更新を audio engine が live re-read する)。 last-touched param も
     /// 更新して `A` キーで send-gain automation lane を生やせるようにする。
     pub(crate) fn set_send_gain(&mut self, track_id: u32, send_idx: usize, gain: f32) {
-        let g = gain.clamp(0.0, 2.0);
+        // send gain も track/master と同じ +6dB 上限 (MAX_TRACK_GAIN) を共有する
+        // (r.md #11 sibling: 定数を SSoT にして ceiling を一箇所で決める)。
+        let g = gain.clamp(0.0, MAX_TRACK_GAIN);
         // v29: realtime IPC / automation target は positional index でなく
         // 安定 send id でアドレスする。 track/send が無ければ no-op (旧 early return)。
         let Some(send_id) = self

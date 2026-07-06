@@ -477,11 +477,11 @@ impl ModControlDomain {
         match self {
             ModControlDomain::Plain { to_model, .. } => to_model(display),
             ModControlDomain::Norm => common::automation::norm_to_plain(target, display as f32),
-            // frac → dB → volume amp。
-            ModControlDomain::FaderDb(scale) => {
-                let db = scale.frac_to_db(display as f32);
-                10f64.powf(f64::from(db) / 20.0)
-            }
+            // frac → volume amp。 `MeterScale::frac_to_amp` に一本化 (r.md #11):
+            // 直接ドラッグ (arrangement band / mixer) と同じ変換を使い、 最下端
+            // (frac 0) で確実に無音 (amp 0) にする。 旧インライン
+            // `10^(frac_to_db/20)` は下端で −60dB の残留 gain を出していた。
+            ModControlDomain::FaderDb(scale) => f64::from(scale.frac_to_amp(display as f32)),
             // 実値 → norm (PluginParam は model==norm)。
             ModControlDomain::Ranged { min, max, log } => {
                 if log && min > 0.0 && max > 0.0 && display > 0.0 {
@@ -500,11 +500,9 @@ impl ModControlDomain {
         match self {
             ModControlDomain::Plain { to_display, .. } => to_display(model),
             ModControlDomain::Norm => f64::from(common::automation::plain_to_norm(target, model)),
-            // volume amp → dB → frac (volume<=0 は −∞dB = frac 下端)。
-            ModControlDomain::FaderDb(scale) => {
-                let db = if model > 0.0 { 20.0 * (model as f32).log10() } else { f32::NEG_INFINITY };
-                f64::from(scale.db_to_frac(db))
-            }
+            // volume amp → frac。 `MeterScale::amp_to_frac` に一本化 (r.md #11、
+            // volume<=0 は −∞dB = frac 下端)。
+            ModControlDomain::FaderDb(scale) => f64::from(scale.amp_to_frac(model as f32)),
             // norm (model) → 実値表示。
             ModControlDomain::Ranged { min, max, log } => {
                 let n = model.clamp(0.0, 1.0);

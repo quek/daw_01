@@ -35,6 +35,9 @@ impl AppData {
         self.ui_ephemeral.arrange_zoom_history.clear();
         self.ui_ephemeral.arrange_zoom_anchor = None;
         self.ui_prefs.automation_lane_row_overrides.clear();
+        // r.md #10: 別 project の `Home` 2 段トグル state を持ち越さない
+        // (= 新 project 最初の Home は先頭クリップ位置から始める)。
+        self.ui_ephemeral.home_toggle_at_first = false;
     }
 
     pub(crate) fn undo(&mut self) {

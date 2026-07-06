@@ -317,6 +317,7 @@ impl AppData {
                 pending_clipboard_write: None,
                 editing_automation_point: None,
                 last_touched_param: None,
+                home_toggle_at_first: false,
                 arrange_zoom_history: Vec::new(),
                 arrange_zoom_anchor: None,
                 arrange_primary_lane_content_top: None,
@@ -536,6 +537,12 @@ impl AppData {
             }
             AppEvent::PlayFromCursor { beat } => {
                 self.action_play_from_cursor(beat);
+            }
+            AppEvent::GotoTimelineHome => {
+                self.goto_timeline_home();
+            }
+            AppEvent::GotoTimelineEnd => {
+                self.goto_timeline_end();
             }
             AppEvent::ToggleLoop => {
                 self.toggle_loop();

@@ -79,6 +79,20 @@ impl AppData {
         self.song_doc.normalize(f)
     }
 
+    /// no-op 検出付き [`AppData::normalize_song`] ([`SongDoc::normalize_checked`]
+    /// 参照)。 closure が `false` を返した (= 実際には song が変わらなかった)
+    /// ときは epoch を bump しない = dirty 化 / 子プロセス再 sync を起こさない。
+    /// `SlotPluginLoaded` backfill 等、 保存ファイルと同一な派生 re-write が
+    /// 「開いただけで '*'」 を招くのを防ぐ (r.md #9)。 戻り値 = `Some(changed)`
+    /// (export 中拒否は `None`)。
+    pub fn normalize_song_checked(
+        &mut self,
+        f: impl FnOnce(&mut common::model::Song) -> bool,
+    ) -> Option<bool> {
+        self.sync_export_lock();
+        self.song_doc.normalize_checked(f)
+    }
+
     /// song 凍結の単一保証点 (§7.5): export (audio freewheel / video render) 中は
     /// `SongDoc::edit` が編集を拒否する。 handle_event の gate を block-list へ反転
     /// した (song 遮断を event 単位の allow-list で担わない) 代わりに、 song

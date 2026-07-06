@@ -79,6 +79,13 @@ pub struct UiEphemeral {
     /// shortcut で「対応 lane を所有 track に追加」 する source。
     /// session-only (起動 None、Undo / save 対象外)。
     pub last_touched_param: Option<TouchedParam>,
+    /// r.md #10: `Home` の 2 段トグル state。 直前の `Home` が「先頭 (時間的に
+    /// 最初) のクリップの頭」 へ飛んだなら `true`。 次の `Home` はこれを見て
+    /// 1.1.1 (beat 0) へ戻す。 **live playhead 位置で判定しない**理由: 再生中は
+    /// playhead が毎フレーム進むので位置比較では 2 度押しが成立しない
+    /// (レビュー指摘)。 明示 seek (`seek_playhead_to`) / 停止で false にリセット
+    /// され、 再生中の playhead poll では触らないので、 再生中でも確実にトグルする。
+    pub(crate) home_toggle_at_first: bool,
     /// gui_01 #068: 前フレームに arrangement でホバーされた clip の
     /// `content_id` (= 連動ハイライトの active group 計算に使う held-value)。
     /// widget の `ArrangementResponse.hovered_clip` を毎フレーム解決して

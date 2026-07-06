@@ -144,6 +144,26 @@ impl MeterScale {
         }
         curve.last().map_or(0.0, |&(db, _)| db)
     }
+
+    /// 線形振幅 (amp、 `1.0` = 0dB unity) → fraction (0.0..=1.0)。 fader / meter が
+    /// 位置決めに使う frac は「dB taper 上のトラック位置」 なので、 amp を dB に
+    /// 直してから [`db_to_frac`](Self::db_to_frac) に通す。 `amp <= 0` は無音 =
+    /// `−∞ dB` として下端 (frac 0)。 mixer strip fader / arrangement track-volume
+    /// band が振幅を frac 空間で描く単一 SSoT。
+    pub fn amp_to_frac(&self, amp: f32) -> f32 {
+        let db = if amp <= 0.0 { f32::NEG_INFINITY } else { 20.0 * amp.log10() };
+        self.db_to_frac(db)
+    }
+
+    /// fraction (0.0..=1.0) → 線形振幅 (amp)。 [`amp_to_frac`](Self::amp_to_frac) の
+    /// 逆。 `frac <= 0` は無音 (amp 0) を返す (curve 下端 dB は有限なので、 特別扱い
+    /// しないと最下端が完全な無音にならない)。
+    pub fn frac_to_amp(&self, frac: f32) -> f32 {
+        if frac <= 0.0 {
+            return 0.0;
+        }
+        10f32.powf(self.frac_to_db(frac) / 20.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -711,6 +731,25 @@ mod tests {
         assert_eq!(s.curve.first().unwrap().0, 6.0);
         assert_eq!(s.curve.last().unwrap().0, -60.0);
         assert!(s.emphasize_zero);
+    }
+
+    /// r.md #11: mixer fader / arrangement volume band が振幅を frac 空間で
+    /// 扱う SSoT。 amp → frac → amp が round-trip し、 unity / +6dB 上端 / 無音の
+    /// 境界が期待どおりであること。
+    #[test]
+    fn amp_frac_roundtrip_and_boundaries() {
+        let s = MeterScale::default();
+        // unity (0 dB): amp 1.0 round-trips.
+        let f_unity = s.amp_to_frac(1.0);
+        assert!((s.frac_to_amp(f_unity) - 1.0).abs() < 1e-3, "unity round-trip");
+        // +6dB 上端: amp 2.0 (= +6.02 dB) は curve 上端 (frac 1.0) に張り付く。
+        assert!(s.amp_to_frac(2.0) >= 0.999, "+6dB maps to the fader top");
+        // 無音: amp 0 → frac 0 → amp 0 (下端の特別扱い)。
+        assert_eq!(s.amp_to_frac(0.0), 0.0);
+        assert_eq!(s.frac_to_amp(0.0), 0.0);
+        // 中間 (-6dB, amp 0.5) も round-trip する。
+        let f = s.amp_to_frac(0.5);
+        assert!((s.frac_to_amp(f) - 0.5).abs() < 1e-3, "-6dB round-trip");
     }
 
     /// 非線形カーブは breakpoint 上で表通り、 中間は線形補間。 範囲外は端値 clamp。

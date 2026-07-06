@@ -373,6 +373,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                                 anchor = cursor;
                             }
                         }
+                        // Home / End (daw_01 r.md #10): 単一行なので行頭 (offset 0) /
+                        // 行末 (len) へカーソル移動。 Shift で anchor 固定の選択拡張
+                        // (ArrowLeft/Right と同 idiom)。 text は変えないので changed 無し。
+                        // これらは `is_typing_only_shortcut` で typing 中 global seek を
+                        // 抑止した上で widget に届く (抑止しないとプレイヘッドが飛ぶ)。
+                        PhysicalKey::Home => {
+                            cursor = 0;
+                            if !mods.shift {
+                                anchor = 0;
+                            }
+                        }
+                        PhysicalKey::End => {
+                            cursor = working.len();
+                            if !mods.shift {
+                                anchor = cursor;
+                            }
+                        }
                         // M14 Phase 57 (daw_01 #016): NumpadEnter も commit 扱い。
                         // DAW の数値入力 (BPM / time_sig / 拍数 / ピッチ等) でテンキー Enter を
                         // 多用する慣習 (Cubase / REAPER / Logic 全部 numpad Enter で commit)。

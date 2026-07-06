@@ -473,7 +473,11 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     if let Some(band) = layout.volume_band
                         && band.contains(px, py)
                     {
-                        let av = t.volume.clamp(0.0, 1.0);
+                        // band は frac 空間 (0..1 = MeterScale 上の位置)。 stored amp を
+                        // frac に写して anchor にすることで、 release の frac 比較 /
+                        // 描画と整合する (r.md #11。 旧 `amp.clamp(0,1)` は amp を frac と
+                        // 誤用し、 +6dB 側で頭打ち + release で fill が飛んでいた)。
+                        let av = MeterScale::default().amp_to_frac(t.volume);
                         let state: &mut ArrangementState = ui.widget_state(wid);
                         state.track_volume_drag = Some(TrackVolumeDragSession {
                             track_id: t.id,
@@ -1359,7 +1363,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 }
             }
             if let Some((track, _prev, next)) = volume_emit {
-                ui.push_edit({ let v_track = track; let v_next = next; Edit::mutate(move |app: &mut AppData| { let frac = v_next.clamp(0.0, 1.0); let amp = if frac <= 0.0 { 0.0 } else { 10f32.powf(MeterScale::default().frac_to_db(frac) / 20.0) }; app.handle_event(AppEvent::SetTrackVolume { track: v_track, amp }); }) });
+                ui.push_edit({ let v_track = track; let v_next = next; Edit::mutate(move |app: &mut AppData| { let amp = MeterScale::default().frac_to_amp(v_next.clamp(0.0, 1.0)); app.handle_event(AppEvent::SetTrackVolume { track: v_track, amp }); }) });
             }
         }
         // 2) drag overlay 計算用に clone を取る (last_mouse を更新した後)。
@@ -2250,7 +2254,9 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     let display_v = if let Some(tv) = dragging_this {
                         volume_from_mouse_x(tv.last_mouse_x, tv.band_rect.x, tv.band_rect.w)
                     } else {
-                        t.volume.clamp(0.0, 1.0)
+                        // stored amp → frac (band と同じ MeterScale 空間)。 +6dB 側も
+                        // 正しい fill 位置で描く (r.md #11)。
+                        MeterScale::default().amp_to_frac(t.volume)
                     };
                     ui.panel(
                         ("arr_tvol_track", t.id),

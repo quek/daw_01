@@ -854,7 +854,7 @@ pub(super) fn commit_releases(
         if let Some(tv) = track_volume_release {
             let end = volume_from_mouse_x(tv.last_mouse_x, tv.band_rect.x, tv.band_rect.w);
             if (end - tv.anchor_volume).abs() > 1e-4 {
-                ui.push_edit({ let v_track = tv.track_id; let v_next = end; Edit::mutate(move |app: &mut AppData| { let frac = v_next.clamp(0.0, 1.0); let amp = if frac <= 0.0 { 0.0 } else { 10f32.powf(MeterScale::default().frac_to_db(frac) / 20.0) }; app.handle_event(AppEvent::SetTrackVolume { track: v_track, amp }); }) });
+                ui.push_edit({ let v_track = tv.track_id; let v_next = end; Edit::mutate(move |app: &mut AppData| { let amp = MeterScale::default().frac_to_amp(v_next.clamp(0.0, 1.0)); app.handle_event(AppEvent::SetTrackVolume { track: v_track, amp }); }) });
             }
         }
 

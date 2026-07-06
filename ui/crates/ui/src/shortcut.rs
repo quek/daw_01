@@ -287,6 +287,10 @@ impl ShortcutMap {
 /// - `"piano_roll.edit_lyric"` (default `L`): 歌詞編集モード中は text_input に `'l'` 文字として
 ///   届かないと困る (M14 Phase 59 / daw_01 #017)。modeless mode-toggle key は
 ///   typing-only の典型 (= typing 中は global suppression、それ以外は global 発火)。
+/// - `"daw.goto_timeline_home"` (Home) / `"daw.goto_timeline_end"` (End): 非 char キーなので
+///   `bare_char_key` に該当せず、放置すると typing 中も global 発火してプレイヘッドが
+///   飛ぶ (BPM / 名前 / picker query 入力中に Home を押すと seek してしまう)。typing-only に
+///   することで typing 中は text_input の行頭/行末カーソル移動になる (daw_01 r.md #10)。
 ///
 /// 含めないもの (典型テキストエディタでも global なので、typing 中も global のまま):
 /// - `undo` / `redo` (Word/VSCode 等もテキスト編集中の Ctrl+Z は document 全体の undo)
@@ -297,7 +301,14 @@ impl ShortcutMap {
 pub fn is_typing_only_shortcut(name: &str) -> bool {
     matches!(
         name,
-        "select_all" | "delete" | "cut" | "copy" | "paste" | "piano_roll.edit_lyric"
+        "select_all"
+            | "delete"
+            | "cut"
+            | "copy"
+            | "paste"
+            | "piano_roll.edit_lyric"
+            | "daw.goto_timeline_home"
+            | "daw.goto_timeline_end"
     )
 }
 

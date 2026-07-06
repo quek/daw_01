@@ -1,7 +1,21 @@
 //! Sample / beat conversion helpers shared by `daw_plugin_host`
 //! (audio thread) and `daw_gui` (playhead rendering).
 
-use crate::model::Song;
+use crate::model::{Clip, Song};
+
+/// Every clip that contributes to the song's playable envelope: finite,
+/// positive-length, finite-start clips across all tracks. Single source of
+/// truth for the clip filter shared by [`song_bounds_samples`],
+/// [`latest_clip_start_beat`], and [`content_end_beat`] — a change to the
+/// filtering rule (e.g. excluding muted tracks) lives here, not in three
+/// copies. Non-finite (NaN / ±Inf) or non-positive geometry is skipped: it
+/// slips past a plain `<= 0.0` guard and would saturate the u64 sample cast /
+/// overflow `start + length` in the sample-domain caller.
+fn playable_clips(song: &Song) -> impl Iterator<Item = &Clip> {
+    song.tracks.iter().flat_map(|t| t.clips.iter()).filter(|c| {
+        c.length_beats.is_finite() && c.length_beats > 0.0 && c.start_beat.is_finite()
+    })
+}
 
 /// Returns `(earliest_clip_start_samples, latest_clip_end_samples)` across
 /// every clip on every track in `song`, or `None` if there is nothing
@@ -19,31 +33,42 @@ pub fn song_bounds_samples(song: Option<&Song>, sample_rate: u32) -> Option<(u64
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
     let mut min_start: Option<u64> = None;
     let mut max_end: u64 = 0;
-    for track in &song.tracks {
-        for clip in &track.clips {
-            // Skip non-finite (NaN / ±Inf) or non-positive geometry: these
-            // slip past a plain `<= 0.0` guard and would saturate the u64
-            // cast and overflow `start + length` below.
-            if !clip.length_beats.is_finite() || clip.length_beats <= 0.0 {
-                continue;
-            }
-            if !clip.start_beat.is_finite() {
-                continue;
-            }
-            let start = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-            let length = (clip.length_beats * samples_per_beat) as u64;
-            if length == 0 {
-                continue;
-            }
-            min_start = Some(min_start.map_or(start, |m| m.min(start)));
-            max_end = max_end.max(start.saturating_add(length));
+    for clip in playable_clips(song) {
+        let start = (clip.start_beat * samples_per_beat).max(0.0) as u64;
+        let length = (clip.length_beats * samples_per_beat) as u64;
+        // A clip shorter than one sample at this rate contributes nothing.
+        if length == 0 {
+            continue;
         }
+        min_start = Some(min_start.map_or(start, |m| m.min(start)));
+        max_end = max_end.max(start.saturating_add(length));
     }
     let start = min_start?;
     if max_end <= start {
         return None;
     }
     Some((start, max_end))
+}
+
+/// The beat-domain content envelope `(earliest_clip_start, content_end)` =
+/// `(min start_beat, max start_beat + length_beats)` over every playable clip
+/// on every track, or `None` when the song has no playable clip (same
+/// filtering as [`song_bounds_samples`]: finite, positive-length clips only).
+/// The beat-domain sibling of [`song_bounds_samples`]'s `(min_start,
+/// max_end)`. r.md #10: the Home key seeks to `.0` (the head of the first /
+/// earliest clip; a second Home press then returns to bar 1) and the End key
+/// seeks to `.1` (just after the last clip).
+pub fn content_bounds_beats(song: &Song) -> Option<(f64, f64)> {
+    let mut bounds: Option<(f64, f64)> = None;
+    for clip in playable_clips(song) {
+        let start = clip.start_beat;
+        let end = clip.start_beat + clip.length_beats;
+        bounds = Some(match bounds {
+            Some((lo, hi)) => (lo.min(start), hi.max(end)),
+            None => (start, end),
+        });
+    }
+    bounds
 }
 
 /// True when `playhead` has advanced past the last clip's end (or there is
@@ -291,5 +316,47 @@ mod tests {
         // 140 BPM: 32 beats → 32 * 60/140 ≈ 13.714 s.
         assert!((beat_to_seconds(32.0, 140.0) - 13.714285714).abs() < 1e-6);
         assert_eq!(beat_to_seconds(4.0, 0.0), 0.0);
+    }
+
+    fn clip(start_beat: f64, length_beats: f64) -> Clip {
+        Clip { id: 1, start_beat, length_beats, content_id: 0, ..Default::default() }
+    }
+
+    fn song_with_clips(clips: Vec<Clip>) -> Song {
+        Song {
+            bpm: 120.0,
+            tracks: vec![Track { name: "T".into(), clips, ..Track::default() }],
+            ..Song::default()
+        }
+    }
+
+    // ---- r.md #10: Home (= earliest clip start) / End (= content end) ----
+
+    #[test]
+    fn content_bounds_none_when_empty() {
+        assert_eq!(content_bounds_beats(&Song::default()), None);
+    }
+
+    #[test]
+    fn content_bounds_are_min_start_and_max_end() {
+        // earliest-starting clip = beat 4 (Home target); last-ending = 8+2 = 10.
+        let s = song_with_clips(vec![clip(4.0, 4.0), clip(8.0, 2.0), clip(6.0, 1.0)]);
+        assert_eq!(content_bounds_beats(&s), Some((4.0, 10.0)));
+    }
+
+    #[test]
+    fn content_bounds_skip_zero_length_and_nonfinite() {
+        // The zero-length (100) and NaN-length (50) clips are skipped, so the
+        // earliest playable clip starts at 2 and content ends at 6.
+        let s = song_with_clips(vec![clip(2.0, 4.0), clip(100.0, 0.0), clip(50.0, f64::NAN)]);
+        assert_eq!(content_bounds_beats(&s), Some((2.0, 6.0)));
+    }
+
+    #[test]
+    fn content_bounds_span_tracks() {
+        // clips live on separate tracks; the envelope is the outer (min, max).
+        let mut s = song_with_clips(vec![clip(5.0, 4.0)]);
+        s.tracks.push(Track { name: "T2".into(), clips: vec![clip(2.0, 20.0)], ..Track::default() });
+        assert_eq!(content_bounds_beats(&s), Some((2.0, 22.0)));
     }
 }

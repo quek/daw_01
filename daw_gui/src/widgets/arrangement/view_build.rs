@@ -147,10 +147,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             muted: t.muted,
             solo: t.solo,
             armed: t.armed,
-            volume: {
-                let db = if t.volume <= 0.0 { f32::NEG_INFINITY } else { 20.0 * t.volume.log10() };
-                MeterScale::default().db_to_frac(db)
-            },
+            volume: MeterScale::default().amp_to_frac(t.volume),
             clips: t
                 .clips
                 .iter()

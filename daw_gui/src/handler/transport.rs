@@ -59,6 +59,12 @@ impl AppData {
     /// 再生中に置き直して停止すると新しい位置へ戻る。 `beat` は呼び出し側で snap 済を渡す。
     pub(crate) fn seek_playhead_to(&mut self, beat: f64) {
         let beat = beat.max(0.0);
+        // r.md #10: 明示 seek は Home の 2 段トグルをリセットする (= 次の Home は
+        // まず最新クリップ位置へ)。 ここは ruler click / `f` / End / Home 自身が
+        // 通る唯一の seek 経路。 goto_timeline_home はこの後で flag を再設定する。
+        // (再生中の playhead poll は playhead_beat を直接書くのでここを通らず、
+        // flag に触れない = 再生中もトグルが壊れない。)
+        self.ui_ephemeral.home_toggle_at_first = false;
         self.transport.playhead_beat = Some(beat as f32);
         self.transport.playback_origin_beat = Some(beat as f32);
         let sr = self.ipc.sample_rate as f64;
@@ -81,6 +87,63 @@ impl AppData {
         if !self.transport.is_playing {
             self.play();
         }
+    }
+
+    /// `Home` キー (r.md #10): 位置導出のトグル。 プレイヘッドが最後 (時間的に
+    /// 最新) のクリップ開始位置に「まだ居ない」 なら そこへ、 「既に居る」 なら
+    /// 1.1.1 (song 先頭 = beat 0) へ移動する (= 2 度押しで先頭)。 clip が無ければ
+    /// 先頭。 transient な押下回数 state を持たず、 現在位置だけで分岐するので
+    /// 無効化するものが無い (SSoT)。 `seek_playhead_to` 経由なので停止中/再生中の
+    /// どちらでも効き、 停止ホーム (`playback_origin_beat`) も追従する。
+    pub(crate) fn goto_timeline_home(&mut self) {
+        // 先頭 (時間的に最初) のクリップの頭。 clip が無ければ None。
+        let first = common::timing::content_bounds_beats(self.song_doc.song()).map(|(lo, _)| lo);
+        // トグルは **live playhead 位置でなく直前の Home 結果**
+        // (`home_toggle_at_first`) で判定する。 位置導出だと再生中に playhead が
+        // 毎フレーム進んで 2 度押しが成立せず、 長尺では f32/f64 の丸め差が EPS を
+        // 超えて先頭へ戻れない (レビュー指摘)。 flag は明示 seek / 停止でのみ
+        // リセットされ、 再生中の playhead poll では触らないので、 再生中でも
+        // 確実にトグルする。 clip が無ければ常に 1.1.1。
+        let go_to_start = self.ui_ephemeral.home_toggle_at_first || first.is_none();
+        let target = if go_to_start { 0.0 } else { first.unwrap_or(0.0) };
+        // `seek_playhead_to` が flag を false に戻すので、 設定はその後に行う。
+        self.seek_playhead_to(target);
+        self.ui_ephemeral.home_toggle_at_first = !go_to_start;
+        // アレンジを横スクロールして移動先を可視化 (Home は左端寄せ)。
+        self.reveal_beat_in_arrange(target, true);
+    }
+
+    /// `End` キー (r.md #10): プレイヘッドを content 終端 (最後のクリップの直後 =
+    /// 全クリップの `max(start + length)`) へ移動する。 clip が無ければ先頭
+    /// (beat 0)。 `seek_playhead_to` 経由なので停止中/再生中どちらでも効く。
+    pub(crate) fn goto_timeline_end(&mut self) {
+        let target = common::timing::content_bounds_beats(self.song_doc.song())
+            .map(|(_, hi)| hi)
+            .unwrap_or(0.0);
+        self.seek_playhead_to(target);
+        // アレンジを横スクロールして終端を可視化 (End は右端寄せ)。
+        self.reveal_beat_in_arrange(target, false);
+    }
+
+    /// Home/End のシーク後、 アレンジビューを横スクロールして目標拍を可視にする
+    /// (r.md #10 user 要望「移動に合わせてスクロールも」)。 `at_start=true` (Home) は
+    /// 目標を左端近くに、 `false` (End) は右端近くに置く。 canvas 幅が未確定 (0、
+    /// 初回描画前) なら左端寄せにフォールバック。 `arrange_scroll_beat` は tick の
+    /// 再生追従と同じ「左端拍」なので、 再生中に follow が ON なら次 tick が上書き
+    /// する (= 新しい playhead を追い続ける、 意図どおり)。
+    fn reveal_beat_in_arrange(&mut self, beat: f64, at_start: bool) {
+        // 端に貼り付けず少し余白を残す。
+        const MARGIN_BEATS: f32 = 1.0;
+        let beat = beat.max(0.0) as f32;
+        let canvas_w = self.ui_ephemeral.last_arrange_canvas_size.0;
+        let visible = canvas_w / self.ui_prefs.arrange_zoom_x.max(1.0); // canvas_w 0 → 0
+        let scroll = if at_start || visible <= 0.0 {
+            beat - MARGIN_BEATS
+        } else {
+            // End: 目標を右端の少し内側に置き、 手前の content を見せる。
+            beat - visible + MARGIN_BEATS
+        };
+        self.ui_prefs.arrange_scroll_beat = scroll.max(0.0);
     }
 
     /// A7: register a `device_id` we are about to send `SetSlotPlugin`

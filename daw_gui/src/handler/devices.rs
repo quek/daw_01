@@ -128,8 +128,13 @@ impl AppData {
         // daw_audio via the next LoadSong, killing the SidechainTap /
         // ParallelOutTap in `compile_schedule`. パラアウト
         // (docs/plan_paraout.md) も sidechain と同じく再ロードで生存させる。
+        // r.md #9: no-op 検出付き normalize を使う。 保存ファイルと同一な再構築
+        // (= 現行バージョンで保存した project の SlotPluginLoaded) では epoch を
+        // bump させず、 「開いただけで '*' が付く」 のを防ぐ。 `coords` が既に
+        // Some (= device は song に在る) と保証しているので、 chain lookup は成功
+        // し、 実行された (= export 中でない) なら placed=true。
         let placed = self
-            .normalize_song(move |song| {
+            .normalize_song_checked(move |song| {
                 let chain: Option<&mut Vec<common::model::PluginInstance>> =
                     if track_id == common::model::MASTER_TRACK_ID {
                         Some(&mut song.master_fx_chain)
@@ -143,25 +148,33 @@ impl AppData {
                     return false;
                 };
                 let i = index as usize;
-                let (existing_state, format, existing_aux, existing_aux_out, existing_ports) =
-                    chain
-                        .get(i)
-                        .map(|p| {
-                            (
-                                p.state.clone(),
-                                p.format,
-                                p.aux_inputs.clone(),
-                                p.aux_outputs.clone(),
-                                p.ports,
-                            )
-                        })
-                        .unwrap_or((
-                            None,
-                            PluginFormat::Clap,
-                            Vec::new(),
-                            Vec::new(),
-                            Default::default(),
-                        ));
+                let (
+                    existing_state,
+                    format,
+                    existing_aux,
+                    existing_aux_out,
+                    existing_ports,
+                    existing_ara,
+                ) = chain
+                    .get(i)
+                    .map(|p| {
+                        (
+                            p.state.clone(),
+                            p.format,
+                            p.aux_inputs.clone(),
+                            p.aux_outputs.clone(),
+                            p.ports,
+                            p.ara_archive.clone(),
+                        )
+                    })
+                    .unwrap_or((
+                        None,
+                        PluginFormat::Clap,
+                        Vec::new(),
+                        Vec::new(),
+                        Default::default(),
+                        None,
+                    ));
                 let inst = common::model::PluginInstance {
                     // v29: 安定 device id を必ず引き継ぐ (with_ports は sentinel 0 で
                     // 作るので、 ここで焼き込まないと以後の id addressing が全滅する)。
@@ -172,20 +185,29 @@ impl AppData {
                     // パラアウト: the just-loaded plugin's authoritative aux output port
                     // count (overrides whatever the DB / previous instance had).
                     aux_output_count,
+                    // (r.md #5 ARA2 / #9) 既存 ARA アーカイブを温存する。 `..with_ports`
+                    // は ara_archive を None に落とすので、 明示引き継ぎしないと reload
+                    // の度に Melodyne 等の編集が失われ、 かつ下の no-op 判定が誤って
+                    // 「変化」 に倒れて開くたび dirty 化する。
+                    ara_archive: existing_ara,
                     ..common::model::PluginInstance::with_ports(
                         id,
                         format,
                         db_ports.unwrap_or(existing_ports),
                     )
                 };
+                // no-op 検出 (r.md #9): 再構築結果が既存と同一なら epoch を bump
+                // させない (= dirty 化 / 冗長な LoadSong 再送をしない)。 内容が本当に
+                // 変わったとき (旧 file の port 解決 / 手動 plugin 挿入) だけ true。
+                let is_change = chain.get(i) != Some(&inst);
                 if i < chain.len() {
                     chain[i] = inst;
                 } else {
                     chain.push(inst);
                 }
-                true
+                is_change
             })
-            .unwrap_or(false);
+            .is_some();
         if !placed {
             // track id が Vec に無い (load 中に track 削除された等)。 master でも
             // なく該当 track も居ないので、 従来どおり finalize せず early return。
