@@ -722,7 +722,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 混在する場合は extension で partition して個別 AppEvent を発火する。
         // `import_video::looks_like_video` が `mp4 / mov / mkv / webm / m4v /
         // avi` を判定 (= P2.7 wire)。 マッチしない path は従来通り Audio
-        // import パイプラインに流す (= hound の WAV 判定で再度はじかれる)。
+        // import パイプラインに流す (= `common::audio_decode` が WAV / AIFF /
+        // FLAC / MP3 / OGG / M4A をコンテンツ判定でデコード、 r.md #19)。
         let drop_y = drop.position.1;
         let target_track_idx =
             track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, drop_y)
@@ -738,9 +739,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             Some(arr_snap.snap_beat(raw.max(0.0), /* alt: */ false, zoom))
         };
         // docs/plan_image_overlay.md P2: 3-way partition (video →
-        // image → audio). Video on Windows only (= WMF dependency);
-        // image is OS-neutral (image crate); audio is the fallback
-        // bucket (hound rejects non-WAV inside `action_import_audio`).
+        // image → audio). Video on Windows only (= libav/rsmpeg dependency);
+        // image is OS-neutral (image crate); audio is the OS-neutral fallback
+        // bucket (`common::audio_decode` handles WAV/AIFF/FLAC/MP3/OGG/M4A,
+        // r.md #19).
         #[cfg(windows)]
         let (video_paths, non_video_paths): (Vec<_>, Vec<_>) = drop
             .paths

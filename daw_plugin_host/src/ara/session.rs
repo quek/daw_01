@@ -298,7 +298,7 @@ unsafe fn build_source(
     clip: &AraClipSpec,
     time_stretch: bool,
 ) -> Result<OwnedAraSource> {
-    let host = Box::new(AraAudioSourceHost::from_wav_file(&clip.source_wav)?);
+    let host = Box::new(AraAudioSourceHost::from_audio_file(&clip.source_wav)?);
 
     // The boxed host's address is the opaque host ref the plug-in passes back.
     let host_ref: ARAAudioSourceHostRef = (std::ptr::from_ref::<AraAudioSourceHost>(&host)) as _;

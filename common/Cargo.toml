@@ -9,6 +9,7 @@ base64.workspace = true
 bincode.workspace = true
 dirs.workspace = true
 hound.workspace = true
+symphonia.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

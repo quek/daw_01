@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use common::audio_render::{fade_envelope, pitch_ratio_for, stretch_ratio_for, tempo_follow_ratio};
 use common::model::{
     AudioSourceId, AudioSourcePath, ClipContent, FadeCurve, Song, StretchMode,
@@ -146,53 +146,25 @@ impl Default for AudioClipRenderer {
 // Phase 1 PR6: schedule compilation + WAV decode + render loop
 // ---------------------------------------------------------------------------
 
-/// Decode a WAV file into a planar `AudioSourceBuffer`. Mirror of
-/// `daw_gui::import_audio::decode_wav` (Phase 1 keeps the two crates'
-/// decoders independent so file-backed sources are decoded twice — once
-/// per process — without IPC for sample data, see §6.1 / §8.3).
-pub fn decode_wav(path: &Path) -> Result<AudioSourceBuffer> {
-    use hound::SampleFormat;
-
-    let mut reader = hound::WavReader::open(path)
-        .with_context(|| format!("open wav {}", path.display()))?;
-    let spec = reader.spec();
-    if spec.channels == 0 {
-        anyhow::bail!("{}: channels = 0", path.display());
-    }
-    if spec.sample_rate == 0 {
-        anyhow::bail!("{}: sample_rate = 0", path.display());
-    }
-    let frames = reader.duration() as u64;
-    let channels = spec.channels as usize;
-
-    let mut planar: Vec<Vec<f32>> = (0..channels)
-        .map(|_| Vec::with_capacity(frames as usize))
-        .collect();
-    match spec.sample_format {
-        SampleFormat::Float => {
-            for (idx, sample) in reader.samples::<f32>().enumerate() {
-                let s = sample.with_context(|| format!("read f32 {}", path.display()))?;
-                planar[idx % channels].push(s);
-            }
-        }
-        SampleFormat::Int => {
-            let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            for (idx, sample) in reader.samples::<i32>().enumerate() {
-                let s = sample.with_context(|| format!("read i32 {}", path.display()))?;
-                planar[idx % channels].push(s as f32 / max_val);
-            }
-        }
-    }
+/// Decode an audio file into a planar `AudioSourceBuffer`. Delegates format
+/// handling to `common::audio_decode` (symphonia), so daw_audio plays back
+/// every format the GUI can import — WAV / AIFF / FLAC / MP3 / OGG / M4A
+/// (r.md #19). File-backed sources are decoded **independently per process**
+/// (no bulk PCM crosses the IPC wire — arch invariant #2 / §6.1 / §8.3); this
+/// is the audio engine's copy of that decode.
+pub fn decode_audio(path: &Path) -> Result<AudioSourceBuffer> {
+    let decoded = common::audio_decode::decode_audio_file(path)
+        .map_err(|e| anyhow::anyhow!("decode {}: {e}", path.display()))?;
     Ok(AudioSourceBuffer {
-        sample_rate: spec.sample_rate,
-        channels: spec.channels,
-        frames,
-        samples: planar,
+        sample_rate: decoded.sample_rate,
+        channels: decoded.channels,
+        frames: decoded.frames,
+        samples: decoded.samples,
     })
 }
 
 /// Build an `AudioClipRenderer` snapshot from the current Song. Walks
-/// `Song.audio_sources` (decoding file-backed entries via `hound`), then
+/// `Song.audio_sources` (decoding file-backed entries via `common::audio_decode`), then
 /// flattens every `ClipContent::Audio` event in every track into the
 /// schedule. Sorted by `start_frame` ascending so the render loop can
 /// short-circuit once `start_frame >= buf_end`.
@@ -251,7 +223,7 @@ pub fn compile_audio_schedule(
                     continue;
                 };
                 let abs = dir.join(rel);
-                match decode_wav(&abs) {
+                match decode_audio(&abs) {
                     Ok(buf) => Arc::new(buf),
                     Err(e) => {
                         tracing::error!(error = ?e, path = %abs.display(), "decode failed");
@@ -259,7 +231,7 @@ pub fn compile_audio_schedule(
                     }
                 }
             }
-            AudioSourcePath::Absolute(abs) => match decode_wav(abs) {
+            AudioSourcePath::Absolute(abs) => match decode_audio(abs) {
                 Ok(buf) => Arc::new(buf),
                 Err(e) => {
                     tracing::error!(error = ?e, path = %abs.display(), "decode failed");

@@ -400,7 +400,7 @@ pub fn import_one_video(
     src: &Path,
     project_dir: Option<&Path>,
 ) -> Result<ImportedVideo, VideoImportError> {
-    use crate::import_audio::{copy_into_dir, decode_wav, unsaved_import_cache_dir};
+    use crate::import_audio::{copy_into_dir, decode_audio, unsaved_import_cache_dir};
     use common::model::AudioSource;
 
     // Read metadata BEFORE copying so unsupported / corrupt sources
@@ -463,7 +463,7 @@ pub fn import_one_video(
 
     let audio_info = extract_audio_to_wav(src, &audio_dst)?;
     let audio = if let Some(info) = audio_info {
-        let buffer = decode_wav(&audio_dst).map_err(|e| {
+        let buffer = decode_audio(&audio_dst).map_err(|e| {
             VideoImportError::IoError(format!(
                 "decode extracted WAV {}: {e}",
                 audio_dst.display()

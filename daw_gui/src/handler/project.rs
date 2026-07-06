@@ -253,7 +253,7 @@ impl AppData {
         let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             for (id, abs) in audio_jobs {
-                let decoded = crate::import_audio::decode_wav(&abs)
+                let decoded = crate::import_audio::decode_audio(&abs)
                     .map_err(|e| {
                         tracing::warn!(path = %abs.display(), error = %e, "asset decode (audio) failed");
                     })

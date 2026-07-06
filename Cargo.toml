@@ -52,6 +52,20 @@ png = "0.18"
 # (thread id を HANDLE として SetThreadPriority に渡し必ず失敗・握り潰し)。
 # 0.17 は audio_thread_priority で正式対応 (docs/plan_arch_refactor.md §5)。
 cpal = "0.17"
+# Pure-Rust audio-file decoder — the single **cross-platform** decode engine for
+# imported audio sources (WAV / AIFF / FLAC / MP3 / OGG-Vorbis / M4A AAC+ALAC).
+# rsmpeg (libav) is Windows-only in this workspace and is reserved for VIDEO
+# decode; audio import is core DAW function and must stay cross-platform (Linux
+# 配慮), so it does NOT go through libav. default-features off + an explicit
+# format/codec list mirrors the `image` scoping above to keep cold builds lean
+# (formats: wav/aiff/ogg/isomp4 containers; codecs: pcm/adpcm for WAV+AIFF,
+# flac, mp3, vorbis, aac+alac for m4a). r.md #19.
+# Pinned to 0.5 deliberately (not the newer 0.6.0): 0.6.0 is a 2026-05 breaking
+# rewrite (renamed probe/decoder API, GenericAudioBufferRef, Result<Option<_>>
+# EOS) whose own GETTING_STARTED.md is internally inconsistent about module
+# paths; 0.5.5 is the battle-tested API this decoder is written against. Revisit
+# when 0.6.x stabilizes its docs.
+symphonia = { version = "0.5", default-features = false, features = ["wav", "aiff", "ogg", "isomp4", "pcm", "adpcm", "flac", "mp3", "vorbis", "aac", "alac"] }
 libloading = "0.8"
 midir = "0.10"
 midly = "0.5"

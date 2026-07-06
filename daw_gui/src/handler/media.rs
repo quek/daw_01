@@ -26,13 +26,14 @@ impl AppData {
     /// in `status_message`; partial progress (= some files succeeded)
     /// is preserved.
     /// File menu → "Import Audio..." 経路。 `rfd` の native file picker
-    /// (multi-select、 WAV filter) を開いて、 選択された path を
+    /// (multi-select、 audio filter) を開いて、 選択された path を
     /// `action_import_audio` に転送するだけのラッパ。 dialog をキャンセル
     /// した場合は no-op。 起点が違うだけで採番 / dedup / コピー / decode
-    /// は drag&drop と完全に同じ pipeline。
+    /// は drag&drop と完全に同じ pipeline。 filter は `common::audio_decode`
+    /// の対応拡張子 SSoT (WAV/AIFF/FLAC/MP3/OGG/M4A、 r.md #19)。
     pub(crate) fn action_open_import_audio_dialog(&mut self) {
         let dialog = rfd::FileDialog::new()
-            .add_filter("WAV", &["wav"])
+            .add_filter("Audio", common::audio_decode::SUPPORTED_AUDIO_EXTENSIONS)
             .set_title("Import Audio");
         self.spawn_file_dialog(
             dialog,
@@ -53,7 +54,7 @@ impl AppData {
         position_in_clip_beats: f64,
     ) {
         let dialog = rfd::FileDialog::new()
-            .add_filter("WAV", &["wav"])
+            .add_filter("Audio", common::audio_decode::SUPPORTED_AUDIO_EXTENSIONS)
             .set_title("Add Audio Event");
         self.spawn_file_dialog(
             dialog,

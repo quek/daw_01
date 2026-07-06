@@ -1,4 +1,4 @@
-//! Audio file import: hash-based dedup, project-dir copy, WAV decode.
+//! Audio file import: hash-based dedup, project-dir copy, audio decode.
 //!
 //! Pipeline (spec `docs/plan_audio_clip.md` §3.1.1, §7):
 //!
@@ -8,7 +8,8 @@
 //!    if not already present. Unsaved projects fall back to a per-
 //!    session import_cache directory; saving the project later moves
 //!    those files into the real `samples/` dir.
-//! 3. Decode with `hound` into a planar `AudioSourceBuffer`.
+//! 3. Decode via `common::audio_decode` (symphonia) into a planar
+//!    `AudioSourceBuffer` — WAV / AIFF / FLAC / MP3 / OGG / M4A (r.md #19).
 //! 4. Build the `AudioSource` model entry referencing
 //!    `AudioSourcePath::ProjectRelative("samples/<filename>")`.
 //!
@@ -26,7 +27,9 @@ use sha2::{Digest, Sha256};
 
 use crate::audio_source_cache::AudioSourceBuffer;
 
-/// Maximum WAV file size accepted on import (Phase 1 cap, §7.2 = 4 GiB).
+/// Maximum audio file size accepted on import (§7.2 = 4 GiB). Guards the
+/// whole-file decode-into-memory against a pathological source, for every
+/// format (WAV / AIFF / FLAC / MP3 / OGG / M4A), not just WAV.
 pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Successful decode result. The `source.path` is already populated
@@ -43,6 +46,9 @@ pub struct ImportedAudio {
 
 #[derive(Debug)]
 pub enum ImportError {
+    /// The file's container/codec could not be recognized or is not built into
+    /// this binary's `symphonia` feature set (detail carries the underlying
+    /// message + path).
     UnsupportedFormat(String),
     TooLarge { actual: u64, limit: u64 },
     DecodeFailed(String),
@@ -52,9 +58,9 @@ pub enum ImportError {
 impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ImportError::UnsupportedFormat(ext) => write!(
+            ImportError::UnsupportedFormat(detail) => write!(
                 f,
-                "Unsupported audio format: .{ext} (Phase 1: WAV only)"
+                "Unsupported or unrecognized audio: {detail}"
             ),
             ImportError::TooLarge { actual, limit } => write!(
                 f,
@@ -139,11 +145,11 @@ pub fn copy_into_dir(src: &Path, dest_dir: &Path, filename: &str) -> Result<Path
     Ok(dst)
 }
 
-/// Decode a WAV file (mono / stereo, 16/24/32-bit PCM, f32/f64) into
-/// a planar `AudioSourceBuffer`. Phase 1 supports WAV only (§7.1).
-pub fn decode_wav(path: &Path) -> Result<AudioSourceBuffer, ImportError> {
-    use hound::SampleFormat;
-
+/// Decode an audio file into a planar `AudioSourceBuffer`. Delegates format
+/// handling to `common::audio_decode` (symphonia): WAV / AIFF / FLAC / MP3 /
+/// OGG-Vorbis / M4A(AAC+ALAC) — the container is detected by content, not by
+/// extension (r.md #19). Only the up-front oversize guard is import-specific.
+pub fn decode_audio(path: &Path) -> Result<AudioSourceBuffer, ImportError> {
     let metadata = fs::metadata(path)
         .map_err(|e| ImportError::IoError(format!("{}: {}", path.display(), e)))?;
     if metadata.len() > MAX_FILE_BYTES {
@@ -153,60 +159,28 @@ pub fn decode_wav(path: &Path) -> Result<AudioSourceBuffer, ImportError> {
         });
     }
 
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    if ext != "wav" {
-        return Err(ImportError::UnsupportedFormat(ext));
-    }
-
-    let mut reader = hound::WavReader::open(path)
-        .map_err(|e| ImportError::DecodeFailed(format!("open: {e}")))?;
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
-    let channels = spec.channels;
-    if channels == 0 {
-        return Err(ImportError::DecodeFailed("channels = 0".into()));
-    }
-    if sample_rate == 0 {
-        return Err(ImportError::DecodeFailed("sample_rate = 0".into()));
-    }
-    let frames = reader.duration() as u64;
-
-    let mut planar: Vec<Vec<f32>> = (0..channels as usize)
-        .map(|_| Vec::with_capacity(frames as usize))
-        .collect();
-
-    match spec.sample_format {
-        SampleFormat::Float => {
-            for (idx, sample) in reader.samples::<f32>().enumerate() {
-                let s = sample
-                    .map_err(|e| ImportError::DecodeFailed(format!("read f32: {e}")))?;
-                let ch = idx % channels as usize;
-                planar[ch].push(s);
-            }
-        }
-        SampleFormat::Int => {
-            // Normalise to [-1, 1] using the dynamic range of the
-            // source bit depth (16 / 24 / 32).
-            let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            for (idx, sample) in reader.samples::<i32>().enumerate() {
-                let s = sample
-                    .map_err(|e| ImportError::DecodeFailed(format!("read i32: {e}")))?;
-                let ch = idx % channels as usize;
-                planar[ch].push(s as f32 / max_val);
-            }
-        }
-    }
-
+    let decoded =
+        common::audio_decode::decode_audio_file(path).map_err(ImportError::from)?;
     Ok(AudioSourceBuffer {
-        sample_rate,
-        channels,
-        frames,
-        samples: planar,
+        sample_rate: decoded.sample_rate,
+        channels: decoded.channels,
+        frames: decoded.frames,
+        samples: decoded.samples,
     })
+}
+
+impl From<common::audio_decode::DecodeError> for ImportError {
+    fn from(e: common::audio_decode::DecodeError) -> Self {
+        use common::audio_decode::DecodeError;
+        match e {
+            DecodeError::Io(s) => ImportError::IoError(s),
+            DecodeError::Unsupported(s) => ImportError::UnsupportedFormat(s),
+            DecodeError::Decode(s) => ImportError::DecodeFailed(s),
+            DecodeError::Empty => {
+                ImportError::DecodeFailed("audio file contained no samples".into())
+            }
+        }
+    }
 }
 
 /// Where to copy import files when there is no project_dir yet. Callers
@@ -389,7 +363,7 @@ pub fn import_one(
 ) -> Result<ImportedAudio, ImportError> {
     // Decode first so we surface format / size errors before we bother
     // hashing or copying anything.
-    let buffer = decode_wav(src)?;
+    let buffer = decode_audio(src)?;
 
     let hash8 = file_hash8(src)
         .map_err(|e| ImportError::IoError(format!("hash {}: {}", src.display(), e)))?;
@@ -527,11 +501,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_wav_returns_planar_buffer_for_stereo_pcm16() {
+    fn decode_audio_returns_planar_buffer_for_stereo_pcm16() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.wav");
         write_test_wav(&path, 1024, 2, 48_000);
-        let buf = decode_wav(&path).unwrap();
+        let buf = decode_audio(&path).unwrap();
         assert_eq!(buf.sample_rate, 48_000);
         assert_eq!(buf.channels, 2);
         assert_eq!(buf.frames, 1024);
@@ -541,12 +515,17 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_non_wav_extension() {
+    fn decode_rejects_unrecognized_content() {
+        // A file that is not decodable audio errors regardless of extension
+        // (symphonia probes by content, so the `.flac` name does not save it).
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.flac");
-        fs::write(&path, b"\0\0\0\0").unwrap();
-        let err = decode_wav(&path).unwrap_err();
-        assert!(matches!(err, ImportError::UnsupportedFormat(_)));
+        fs::write(&path, b"\0\0\0\0not audio").unwrap();
+        let err = decode_audio(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            ImportError::UnsupportedFormat(_) | ImportError::DecodeFailed(_)
+        ));
     }
 
     #[test]

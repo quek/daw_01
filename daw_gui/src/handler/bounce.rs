@@ -436,7 +436,7 @@ impl AppData {
 
         // decode して audio_source_cache に登録 (= 即時再生で playback
         // できるよう)。 失敗しても tracker 表示等は問題ないので warn だけ。
-        match crate::import_audio::decode_wav(&path) {
+        match crate::import_audio::decode_audio(&path) {
             Ok(buffer) => {
                 self.media.audio_source_cache.insert(new_source_id, Arc::new(buffer));
             }
