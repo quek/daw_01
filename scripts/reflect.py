@@ -197,6 +197,103 @@ def detect_bash_failures(session, today):
     return detected
 
 
+# --- verify-handoff heuristic (chronic: feedback_launch_app_for_verification) ---
+# The one failure a PreToolUse guard cannot catch: it lives in CHAT, not a tool
+# call. Pattern = edited GUI code this session, never launched daw_gui myself, yet
+# the final message asks the USER to launch / play / verify. Detected here at Stop
+# and surfaced as an OPEN backlog row (next SessionStart Required Action). We do
+# NOT block the Stop (reflect.py invariant: a fuzzy text heuristic must never
+# wedge the session), so this is a strong automatic nudge, not action-time force.
+
+# A real launch of the built exe / cargo run / smoke test (NOT `ls`/`tasklist`
+# which merely reference the name). Smoke test counts as self-verification.
+_LAUNCH_RE = re.compile(
+    r"(target[\\/]debug[\\/]daw_gui\.exe|cargo\s+run\s+(?:-p|--bin)\s+daw_gui|--smoke-test)"
+)
+# An Edit/Write to daw_gui GUI source or the ui/ renderer crates.
+_GUI_EDIT_RE = re.compile(r"daw_gui[\\/]src|ui[\\/]crates")
+# Final message hands verification to the user: a launch/play/実機/preview context
+# followed by a request particle. Requires the app context so a plain design
+# question ("この設計でよいですか") does not match.
+_HANDOFF_RE = re.compile(
+    r"(起動|立ち上げ|再生|実機|プレビュー|プロジェクトを開)"
+    r"[^。\n]{0,40}?"
+    r"(ください|下さい|お願いし|もらえ|いただけ|ますか|くださ|見ていただ)"
+)
+# I actually launched / verified it myself (affirmative, completed) -> not a
+# handoff. Note "私が起動しても...できない" (the excuse) does NOT match this, so it
+# is correctly still flagged.
+_SELF_DID_RE = re.compile(
+    r"(起動しました|起動した(?:ので|。|、)|起動済|自分で起動(?:した|する。|するので|します)|"
+    r"起動して(?:確認|検証)(?:した|しました|済)|smoke ?test.{0,20}(?:pass|PASS|完了|通))"
+)
+
+
+def _read_transcript(path):
+    """Scan the session transcript: did I launch daw_gui / edit GUI code, and what
+    was my final assistant text? Returns (launched, gui_edited, final_text)."""
+    launched = False
+    gui_edited = False
+    final_text = ""
+    if not path or not os.path.isfile(path):
+        return launched, gui_edited, final_text
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    ent = json.loads(ln)
+                except Exception:
+                    continue
+                if ent.get("type") != "assistant":
+                    continue
+                content = (ent.get("message") or {}).get("content")
+                if not isinstance(content, list):
+                    continue
+                texts = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    it = item.get("type")
+                    if it == "tool_use":
+                        name = item.get("name") or ""
+                        inp = item.get("input") or {}
+                        if name == "Bash" and _LAUNCH_RE.search(str(inp.get("command") or "")):
+                            launched = True
+                        elif name in ("Edit", "Write", "MultiEdit") and _GUI_EDIT_RE.search(
+                            str(inp.get("file_path") or "")
+                        ):
+                            gui_edited = True
+                    elif it == "text":
+                        t = item.get("text")
+                        if t:
+                            texts.append(str(t))
+                if texts:
+                    final_text = "\n".join(texts)  # last assistant text block wins
+    except Exception:
+        return launched, gui_edited, final_text
+    return launched, gui_edited, final_text
+
+
+def detect_verify_handoff(transcript_path):
+    """OPEN backlog row when I edited GUI code, never launched daw_gui, and the
+    final message asks the user to launch/verify. Empty list otherwise."""
+    launched, gui_edited, final_text = _read_transcript(transcript_path)
+    if launched or not gui_edited or not final_text:
+        return []
+    if not _HANDOFF_RE.search(final_text) or _SELF_DID_RE.search(final_text):
+        return []
+    return [{
+        "id": compute_id("verify-handoff", "launch-for-verification"),
+        "status": "open",
+        "target": "memory",
+        "desc": "GUI 変更を検証せず user に起動/再生/確認を丸投げ (daw_gui 自己起動なし + 最終応答で依頼)",
+        "notes": "feedback_launch_app_for_verification; 自分で起動して検証 (--smoke-test / session復元 / --script)",
+    }]
+
+
 def upsert_backlog(detected, session_short, today):
     if not detected:
         return
@@ -281,10 +378,12 @@ def main():
         return 0
     session_short = session[:8]
     today = datetime.now().strftime("%Y-%m-%d")
+    transcript_path = data.get("transcript_path")
 
     detected = []
     detected += escalate_guards(today)
     detected += detect_bash_failures(session, today)
+    detected += detect_verify_handoff(transcript_path)
     upsert_backlog(detected, session_short, today)
     return 0
 
