@@ -141,11 +141,13 @@ pub struct HostCallbacks {
     pub on_param_value: Arc<dyn Fn(u32, f64) + Send + Sync>,
     /// VST3 only: plugin GUI param gesture end (`endEdit`).
     pub on_param_gesture_end: Arc<dyn Fn(u32) + Send + Sync>,
-    /// builtin VOICEVOX の合成状態 `(busy, failing)` 報告。旧「第 2 の
+    /// builtin VOICEVOX の合成状態 `(busy, failure)` 報告。旧「第 2 の
     /// callback 登録機構」(`set_voicevox_status_reporter`) を廃止して
     /// ここに統合 (`docs/plan_arch_refactor.md` §6)。synth thread が任意
-    /// スレッドから呼ぶ。
-    pub on_vocal_synth_status: Arc<dyn Fn(bool, bool) + Send + Sync>,
+    /// スレッドから呼ぶ。`failure` は engine 到達可否を区別する
+    /// (`common::protocol::VocalSynthFailure`)。
+    pub on_vocal_synth_status:
+        Arc<dyn Fn(bool, common::protocol::VocalSynthFailure) + Send + Sync>,
 }
 
 impl HostCallbacks {

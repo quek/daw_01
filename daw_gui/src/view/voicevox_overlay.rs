@@ -4,8 +4,10 @@
 //! - WAV 合成中 (= builtin VOICEVOX が busy なトラックあり) → 回転スピナー +
 //!   「VOICEVOX 合成中…  残り N トラック」。
 //! - 口パク生成中 (= `lipsync_inflight` 非空) → スピナー + 「口パク生成中…」。
-//! - engine 未接続が確定 (= failing が `VOICEVOX_ENGINE_WARNING` 以上継続) → static の
+//! - engine 未接続が確定 (= `Unreachable` が `VOICEVOX_ENGINE_WARNING` 以上継続) → static の
 //!   amber 警告「VOICEVOX エンジンに接続できません / エンジンを起動してください」に切替。
+//! - 内容エラー (= engine は到達できたが歌詞等を `Rejected`) → static の amber 警告
+//!   「合成できない歌詞があります / <理由>」。engine 起動を促す警告とは区別する。
 //!
 //! HTTP は中間進捗を返さないので **percent は出さない** (indeterminate のスピナー +
 //! 残件数のみ)。完了時はスピナーが静かに消えるだけ (= 反映完了の合図、grill-me 確定)。
@@ -45,11 +47,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     // `voicevox_animating` と同じ now を読み、5s 境界での食い違いを防ぐ)。
     let now = app.ui_ephemeral.frame_now;
     let unreachable = app.voicevox_engine_unreachable(now);
+    let rejected = app.voicevox_rejected_detail();
     let wav_n = app.voicevox_synth_busy_count();
     let lipsync = !app.voicevox.lipsync_inflight.is_empty();
 
-    // engine 未接続が確定したら、進行中スピナーより警告を優先表示する。
-    if !unreachable && wav_n == 0 && !lipsync {
+    // engine 未接続 / 内容エラー (拒否された歌詞) が確定したら、進行中スピナーより
+    // 警告を優先表示する。
+    if !unreachable && rejected.is_none() && wav_n == 0 && !lipsync {
         return;
     }
 
@@ -62,6 +66,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
 
     if unreachable {
         draw_warning_panel(ui, screen, base_y);
+        return;
+    }
+
+    // engine には到達済だが歌詞等が拒否された内容エラー。engine 起動を促す警告とは別。
+    if let Some(detail) = rejected {
+        draw_rejected_panel(ui, screen, base_y, detail);
         return;
     }
 
@@ -137,6 +147,59 @@ fn draw_warning_panel(ui: &mut Ui<'_, AppData>, screen: PhysicalSize, base_y: f3
         FONT,
         theme::TEXT_DIM,
     );
+}
+
+/// 歌詞などの入力が VOICEVOX に拒否された内容エラーの static 警告パネル。engine には
+/// 到達できているので「起動してください」ではなく、直すべき歌詞を提示する。
+fn draw_rejected_panel(
+    ui: &mut Ui<'_, AppData>,
+    screen: PhysicalSize,
+    base_y: f32,
+    detail: &str,
+) {
+    let h = PAD * 2.0 + 2.0 * LINE_H;
+    let x = ((screen.width as f32) - PANEL_W) * 0.5;
+    let y = base_y;
+    ui.panel("vox_overlay_bg", Rect { x, y, w: PANEL_W, h }, OVERLAY_BG, 6.0);
+
+    // 静的な警告ドット (アイコン代わり、font glyph 非依存)。
+    let dot_r = 5.0;
+    ui.panel(
+        "vox_overlay_reject_dot",
+        Rect { x: x + PAD + 9.0 - dot_r, y: y + PAD + dot_r, w: dot_r * 2.0, h: dot_r * 2.0 },
+        theme::SOLO,
+        dot_r,
+    );
+
+    let text_x = x + PAD + 28.0;
+    ui.label_at(
+        "vox_overlay_reject_head",
+        "合成できない歌詞があります",
+        text_x,
+        y + PAD,
+        FONT,
+        theme::SOLO,
+    );
+    // VOICEVOX が返した理由 (例: `lyricが不正です: ー`)。パネル幅に収まるよう省略。
+    let sub = truncate_chars(detail, 24);
+    ui.label_at(
+        "vox_overlay_reject_sub",
+        &sub,
+        text_x,
+        y + PAD + LINE_H,
+        FONT,
+        theme::TEXT_DIM,
+    );
+}
+
+/// `s` を最大 `max` 文字に丸める (超過時は末尾に `…`)。char 境界で切る。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 /// 回転スピナー: `N` 個のドットを円周に並べ、phase に応じて明るさを巡回させる。

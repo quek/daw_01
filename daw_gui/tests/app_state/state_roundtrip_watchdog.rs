@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use common::protocol::{AudioCommand, AudioEvent, PluginCommand, PluginEvent};
+use common::protocol::{AudioCommand, AudioEvent, PluginCommand, PluginEvent, VocalSynthFailure};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, ExportStage};
@@ -329,7 +329,7 @@ fn export_gate_flows_default_events_but_blocks_host_reconfig() {
     app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus {
         device_id: 7,
         busy: true,
-        failing: false,
+        failure: VocalSynthFailure::None,
     }));
     assert!(
         app.voicevox.voicevox_synth_status.contains_key(&7),

@@ -19,6 +19,50 @@ use common::voicevox::{
 
 use super::voicevox_cache::{VoiceVoxDiskCache, key_for_sing, key_for_talk};
 
+/// 合成失敗の種別。engine への**到達可否**で分ける (呼び出し側の synth thread が
+/// retry するか / GUI に「engine 未接続」と出すかを正しく決めるため)。
+#[derive(Debug)]
+pub enum SynthError {
+    /// engine に到達できない (接続拒否 / timeout / 未起動)。transient — retry 対象。
+    Unreachable(anyhow::Error),
+    /// engine は応答したが入力を拒否した (HTTP 4xx/5xx や壊れた WAV 等)。
+    /// `detail` は短い理由 (VOICEVOX が返した `detail` を優先)。同入力での retry は無駄。
+    Rejected(String),
+}
+
+impl std::fmt::Display for SynthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SynthError::Unreachable(e) => write!(f, "engine unreachable: {e:#}"),
+            SynthError::Rejected(d) => write!(f, "rejected: {d}"),
+        }
+    }
+}
+
+/// reqwest の送信/受信エラーを `Unreachable` へ (= engine に届かなかった)。
+fn unreachable(e: reqwest::Error, ctx: &'static str) -> SynthError {
+    SynthError::Unreachable(anyhow::Error::new(e).context(ctx))
+}
+
+/// VOICEVOX のエラー応答 body (通常 `{"detail":"..."}`) から人間可読な理由を取り出す。
+/// JSON でなければ先頭 200 文字の preview を返す。UI にそのまま出せる短さに丸める。
+fn reject_detail(status: reqwest::StatusCode, body: &str) -> String {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("detail").and_then(|d| d.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| body.chars().take(200).collect());
+    // status も添えるが、detail が主 (UI で読みやすい)。全体を 200 字に制限。
+    let mut s = if detail.is_empty() {
+        status.to_string()
+    } else {
+        detail
+    };
+    if s.chars().count() > 200 {
+        s = s.chars().take(200).collect();
+    }
+    s
+}
+
 /// 音声 **合成** (`frame_synthesis` / `synthesis`) HTTP の timeout。歌唱は曲全体の全 note を
 /// 1 query にまとめて `frame_synthesis` する (json 数 KB) ため、合成は数十秒かかり得る。
 const SYNTH_HTTP_TIMEOUT_SECS: u64 = 120;
@@ -36,7 +80,7 @@ fn sing_query_to_wav(
     client: &reqwest::blocking::Client,
     query_json: &str,
     singer_id: u32,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>, SynthError> {
     tracing::info!(json_len = query_json.len(), "sing_frame_audio_query");
 
     // Step 1: sing_frame_audio_query
@@ -46,12 +90,14 @@ fn sing_query_to_wav(
         .header("Content-Type", "application/json")
         .body(query_json.to_owned())
         .send()
-        .context("sing_frame_audio_query request failed")?;
+        .map_err(|e| unreachable(e, "sing_frame_audio_query request failed"))?;
     let status = resp.status();
-    let body = resp.text().context("reading sing query response")?;
+    let body = resp
+        .text()
+        .map_err(|e| unreachable(e, "reading sing query response"))?;
     if !status.is_success() {
-        let preview: String = body.chars().take(200).collect();
-        anyhow::bail!("sing_frame_audio_query returned {}: {}", status, preview);
+        // engine は応答した = 到達済。入力 (歌詞等) が不正 → Rejected。
+        return Err(SynthError::Rejected(reject_detail(status, &body)));
     }
 
     // Patch outputSamplingRate
@@ -68,12 +114,14 @@ fn sing_query_to_wav(
         .header("Content-Type", "application/json")
         .body(patched)
         .send()
-        .context("frame_synthesis request failed")?;
+        .map_err(|e| unreachable(e, "frame_synthesis request failed"))?;
     let status = resp.status();
-    let wav = resp.bytes().context("reading frame_synthesis response")?;
+    let wav = resp
+        .bytes()
+        .map_err(|e| unreachable(e, "reading frame_synthesis response"))?;
     if !status.is_success() {
         let preview = String::from_utf8_lossy(&wav[..wav.len().min(300)]);
-        anyhow::bail!("frame_synthesis returned {}: {}", status, preview);
+        return Err(SynthError::Rejected(reject_detail(status, &preview)));
     }
 
     Ok(wav.to_vec())
@@ -130,11 +178,12 @@ pub fn synthesize_notes_for_builtin(
     notes: &[BuiltinNoteSpec],
     bpm: f32,
     speaker_id: u32,
-) -> Result<BuiltinSynthOutput> {
-    anyhow::ensure!(
-        !notes.is_empty(),
-        "synthesize_notes_for_builtin called with no notes"
-    );
+) -> Result<BuiltinSynthOutput, SynthError> {
+    if notes.is_empty() {
+        return Err(SynthError::Rejected(
+            "synthesize_notes_for_builtin called with no notes".into(),
+        ));
+    }
     // speaker_id 0 = 未設定 → DEFAULT_SINGER_ID (歌唱可能 style) へフォールバック。旧プロジェクトの
     // clip は声未焼き込み (0) で来るため、0 をそのまま frame_synthesis に渡すと 500 になる。
     let speaker_id = if speaker_id != 0 {
@@ -155,14 +204,16 @@ pub fn synthesize_notes_for_builtin(
     } else {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
-            .build()?;
+            .build()
+            .map_err(|e| unreachable(e, "building HTTP client"))?;
         let wav = sing_query_to_wav(&client, &query_json, speaker_id)?;
         if let Some(c) = cache.as_ref() {
             c.put(cache_key, &wav);
         }
         wav
     };
-    let (samples, sample_rate) = decode_wav_to_f32(&wav_bytes)?;
+    let (samples, sample_rate) =
+        decode_wav_to_f32(&wav_bytes).map_err(|e| SynthError::Rejected(format!("{e:#}")))?;
 
     // Note frame offsets relative to frame 0 of the rendered buffer.
     //
@@ -203,7 +254,7 @@ fn synthesize_talk(
     text: &str,
     speaker_id: u32,
     scales: &TalkParams,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>, SynthError> {
     // Step 1: audio_query
     let url = format!(
         "{}/audio_query?speaker={}&text={}",
@@ -214,15 +265,17 @@ fn synthesize_talk(
     let resp = client
         .post(&url)
         .send()
-        .context("audio_query request failed")?;
+        .map_err(|e| unreachable(e, "audio_query request failed"))?;
     let status = resp.status();
-    let body = resp.text().context("reading audio_query response")?;
+    let body = resp
+        .text()
+        .map_err(|e| unreachable(e, "reading audio_query response"))?;
     if !status.is_success() {
-        let preview: String = body.chars().take(200).collect();
-        anyhow::bail!("audio_query returned {}: {}", status, preview);
+        return Err(SynthError::Rejected(reject_detail(status, &body)));
     }
 
-    let patched = apply_talk_params(&body, scales)?;
+    let patched = apply_talk_params(&body, scales)
+        .map_err(|e| SynthError::Rejected(format!("{e:#}")))?;
 
     // Step 2: synthesis
     let url = format!("{VOICEVOX_URL}/synthesis?speaker={speaker_id}");
@@ -231,12 +284,14 @@ fn synthesize_talk(
         .header("Content-Type", "application/json")
         .body(patched)
         .send()
-        .context("synthesis request failed")?;
+        .map_err(|e| unreachable(e, "synthesis request failed"))?;
     let status = resp.status();
-    let wav = resp.bytes().context("reading synthesis response")?;
+    let wav = resp
+        .bytes()
+        .map_err(|e| unreachable(e, "reading synthesis response"))?;
     if !status.is_success() {
         let preview = String::from_utf8_lossy(&wav[..wav.len().min(300)]);
-        anyhow::bail!("synthesis returned {}: {}", status, preview);
+        return Err(SynthError::Rejected(reject_detail(status, &preview)));
     }
 
     Ok(wav.to_vec())
@@ -248,8 +303,12 @@ pub fn synthesize_talk_for_builtin(
     text: &str,
     speaker_id: u32,
     scales: &TalkParams,
-) -> Result<(Vec<f32>, u32)> {
-    anyhow::ensure!(!text.is_empty(), "synthesize_talk_for_builtin called with empty text");
+) -> Result<(Vec<f32>, u32), SynthError> {
+    if text.is_empty() {
+        return Err(SynthError::Rejected(
+            "synthesize_talk_for_builtin called with empty text".into(),
+        ));
+    }
     // 永続キャッシュ (text + talk speaker + scales)。再オープンで読み上げを再合成しない。
     let cache = VoiceVoxDiskCache::production();
     let cache_key = key_for_talk(text, speaker_id, scales);
@@ -259,14 +318,15 @@ pub fn synthesize_talk_for_builtin(
     } else {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
-            .build()?;
+            .build()
+            .map_err(|e| unreachable(e, "building HTTP client"))?;
         let wav = synthesize_talk(&client, text, speaker_id, scales)?;
         if let Some(c) = cache.as_ref() {
             c.put(cache_key, &wav);
         }
         wav
     };
-    decode_wav_to_f32(&wav)
+    decode_wav_to_f32(&wav).map_err(|e| SynthError::Rejected(format!("{e:#}")))
 }
 
 /// (talk) `TalkParams` を `/audio_query` 応答 JSON に適用して再シリアライズする。

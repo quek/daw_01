@@ -20,7 +20,7 @@
 //!
 //! ## 合成状態の報告
 //!
-//! 合成状態 `(busy, failing)` は `HostCallbacks::on_vocal_synth_status` で
+//! 合成状態 `(busy, failure)` は `HostCallbacks::on_vocal_synth_status` で
 //! 報告する (旧 `set_voicevox_status_reporter` の第 2 callback 登録機構は
 //! 廃止 — load 時に device_id を capture した callback が渡ってくる)。
 
@@ -36,17 +36,19 @@ use common::model::TalkParams;
 use common::plugin_db::BUILTIN_ID_VOICEVOX;
 use common::plugin_format::PluginFormat;
 use common::plugin_metadata::{NoteMetadata, TalkMetadata};
-use common::protocol::RenderMode;
+use common::protocol::{RenderMode, VocalSynthFailure};
 use crate::builtin::voicevox_synth::{
-    BuiltinNoteSpec, BuiltinSynthOutput, synthesize_notes_for_builtin, synthesize_talk_for_builtin,
+    BuiltinNoteSpec, BuiltinSynthOutput, SynthError, synthesize_notes_for_builtin,
+    synthesize_talk_for_builtin,
 };
 
 use crate::plugin_instance::{
     AudioHalf, AudioProcessorHalf, AuxInputBuf, LoadedPlugin, TimedNoteEvent, VocalSynth,
 };
 
-/// 合成状態 `(busy, failing)` の報告先 (= `HostCallbacks::on_vocal_synth_status`)。
-type StatusFn = Arc<dyn Fn(bool, bool) + Send + Sync>;
+/// 合成状態 `(busy, failure)` の報告先 (= `HostCallbacks::on_vocal_synth_status`)。
+/// `failure` は engine 到達可否を区別する ([`VocalSynthFailure`])。
+type StatusFn = Arc<dyn Fn(bool, VocalSynthFailure) + Send + Sync>;
 
 /// `VoicevoxBuiltin` の persistent state (project file に bincode で埋め込み)。
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -323,7 +325,7 @@ pub struct VoicevoxBuiltin {
     synth_queued_gen: Arc<AtomicU64>,
     /// synth thread が job を完了した世代。
     synth_done_gen: Arc<AtomicU64>,
-    /// 合成状態 `(busy, failing)` の報告 callback
+    /// 合成状態 `(busy, failure)` の報告 callback
     /// (`HostCallbacks::on_vocal_synth_status`、load 時に device_id capture 済)。
     report: StatusFn,
 
@@ -353,13 +355,13 @@ impl VoicevoxBuiltin {
     /// synth thread 用の dedup 付き状態報告。`last` と一致するときは送らない。
     fn synth_report(
         reporter: &StatusFn,
-        last: &mut Option<(bool, bool)>,
+        last: &mut Option<(bool, VocalSynthFailure)>,
         busy: bool,
-        failing: bool,
+        failure: VocalSynthFailure,
     ) {
-        if *last != Some((busy, failing)) {
-            *last = Some((busy, failing));
-            reporter(busy, failing);
+        if last.as_ref() != Some(&(busy, failure.clone())) {
+            *last = Some((busy, failure.clone()));
+            reporter(busy, failure);
         }
     }
 
@@ -401,10 +403,10 @@ impl VoicevoxBuiltin {
                     });
                 // 処理 thread: poll で coalesce slot を取り出して synth。
                 //
-                // busy/failing の遷移時のみ報告 (`synth_report` が dedup)。
-                // `failing` は成功するまで sticky (engine 未起動の retry でも
+                // busy/failure の遷移時のみ報告 (`synth_report` が dedup)。
+                // Unreachable は成功するまで sticky (engine 未起動の retry でも
                 // failing_since がリセットされず、daw_gui 側で警告が貯まる)。
-                let mut last_status: Option<(bool, bool)> = None;
+                let mut last_status: Option<(bool, VocalSynthFailure)> = None;
                 let mut retry_after = std::time::Instant::now();
                 loop {
                     if shutdown.load(Ordering::SeqCst) {
@@ -445,21 +447,34 @@ impl VoicevoxBuiltin {
                         result_arc.store(None);
                         done_gen.store(job.generation, Ordering::SeqCst);
                         // 歌唱/読み上げ無し = 合成しない = idle。
-                        Self::synth_report(&status_reporter, &mut last_status, false, false);
+                        Self::synth_report(
+                            &status_reporter,
+                            &mut last_status,
+                            false,
+                            VocalSynthFailure::None,
+                        );
                         continue;
                     }
                     if shutdown.load(Ordering::SeqCst) {
                         return;
                     }
-                    // blocking HTTP 合成に入る = busy。failing は直前値を維持。
-                    let prev_failing = last_status.is_some_and(|(_, f)| f);
-                    Self::synth_report(&status_reporter, &mut last_status, true, prev_failing);
+                    // blocking HTTP 合成に入る = busy。engine 起動待ち (Unreachable) は
+                    // 直前値を維持して 5s 警告を貯める。Rejected は新 job = 新入力なので
+                    // 引き継がず None にリセット (古い内容エラー表示を消す)。
+                    let prev_failure = match last_status.as_ref() {
+                        Some((_, VocalSynthFailure::Unreachable)) => VocalSynthFailure::Unreachable,
+                        _ => VocalSynthFailure::None,
+                    };
+                    Self::synth_report(&status_reporter, &mut last_status, true, prev_failure);
                     // clip ごとに自分の speaker で合成し、各 clip の mono WAV
                     // を song-absolute なサンプル位置に配置した 1 本のバッファ
-                    // を作る。
+                    // を作る。engine 到達済で一部 group が拒否 (不正歌詞等) されても、
+                    // 合成できた group は placed に積んで再生する (1 歌詞で全滅させない)。
                     let mut out_sr: u32 = 0;
                     let mut placed: Vec<PlacedGroup> = Vec::new();
-                    let mut failed: Option<anyhow::Error> = None;
+                    // engine 未到達 (retry 対象) と 内容拒否 (retry 無意味) を区別する。
+                    let mut unreachable_reason: Option<String> = None;
+                    let mut rejected_detail: Option<String> = None;
                     for spec in &job.groups {
                         if spec.notes.is_empty() {
                             continue;
@@ -504,14 +519,19 @@ impl VoicevoxBuiltin {
                                     .collect();
                                 placed.push((place_samples, samples, abs));
                             }
-                            Err(e) => {
-                                failed = Some(e);
+                            // engine 未到達 = 全 group に影響するので即中断して retry へ。
+                            Err(SynthError::Unreachable(e)) => {
+                                unreachable_reason = Some(format!("{e:#}"));
                                 break;
+                            }
+                            // 内容拒否 = この group だけ諦めて他は続行。
+                            Err(SynthError::Rejected(d)) => {
+                                rejected_detail.get_or_insert(d);
                             }
                         }
                     }
-                    // (talk) 読み上げ群を同じ placed バッファへ。
-                    if failed.is_none() {
+                    // (talk) 読み上げ群を同じ placed バッファへ (engine 到達済のときのみ)。
+                    if unreachable_reason.is_none() {
                         for tspec in &job.talk {
                             if tspec.text.is_empty() {
                                 continue;
@@ -536,20 +556,29 @@ impl VoicevoxBuiltin {
                                         vec![(tspec.event_id, place_samples as u64)],
                                     ));
                                 }
-                                Err(e) => {
-                                    failed = Some(e);
+                                Err(SynthError::Unreachable(e)) => {
+                                    unreachable_reason = Some(format!("{e:#}"));
                                     break;
+                                }
+                                Err(SynthError::Rejected(d)) => {
+                                    rejected_detail.get_or_insert(d);
                                 }
                             }
                         }
                     }
-                    if let Some(e) = failed {
-                        tracing::error!(
-                            error = ?e,
-                            "VoicevoxBuiltin: synth failed (engine 起動済? localhost:50021)"
+                    if let Some(reason) = unreachable_reason {
+                        tracing::warn!(
+                            reason = %reason,
+                            "VoicevoxBuiltin: engine unreachable (localhost:50021 起動待ち), retry"
                         );
-                        // HTTP 失敗 = busy のまま failing。job を戻して retry。
-                        Self::synth_report(&status_reporter, &mut last_status, true, true);
+                        // engine 未接続 = busy のまま Unreachable。job を戻して retry。
+                        // done_gen は進めない (bounce 待ちは engine 復帰まで待つ)。
+                        Self::synth_report(
+                            &status_reporter,
+                            &mut last_status,
+                            true,
+                            VocalSynthFailure::Unreachable,
+                        );
                         if let Ok(mut slot) = coalesce.lock()
                             && slot.is_none()
                         {
@@ -557,45 +586,63 @@ impl VoicevoxBuiltin {
                         }
                         retry_after = std::time::Instant::now()
                             + std::time::Duration::from_millis(1500);
-                    } else if placed.is_empty() {
-                        result_arc.store(None);
-                        done_gen.store(job.generation, Ordering::SeqCst);
-                        let pending = coalesce.lock().map(|s| s.is_some()).unwrap_or(false);
-                        if !pending {
-                            Self::synth_report(&status_reporter, &mut last_status, false, false);
-                        }
                     } else {
-                        // track 長 = max(placement + WAV 長)。
-                        let total = placed
-                            .iter()
-                            .map(|(p, s, _)| p + s.len())
-                            .max()
-                            .unwrap_or(0);
-                        let mut buf = vec![0.0f32; total];
-                        let mut global_offsets: HashMap<u32, u64> = HashMap::new();
-                        for (place, samples, abs) in &placed {
-                            // 重なる clip は mix (加算)。
-                            for (i, s) in samples.iter().enumerate() {
-                                buf[place + i] += *s;
+                        // engine には到達済。合成できた group で 1 本のバッファを作る
+                        // (placed が空なら無音 = None)。この job は終端 (retry しない)。
+                        if placed.is_empty() {
+                            result_arc.store(None);
+                        } else {
+                            // track 長 = max(placement + WAV 長)。
+                            let total = placed
+                                .iter()
+                                .map(|(p, s, _)| p + s.len())
+                                .max()
+                                .unwrap_or(0);
+                            let mut buf = vec![0.0f32; total];
+                            let mut global_offsets: HashMap<u32, u64> = HashMap::new();
+                            for (place, samples, abs) in &placed {
+                                // 重なる clip は mix (加算)。
+                                for (i, s) in samples.iter().enumerate() {
+                                    buf[place + i] += *s;
+                                }
+                                for (nid, off) in abs {
+                                    global_offsets.insert(*nid, *off);
+                                }
                             }
-                            for (nid, off) in abs {
-                                global_offsets.insert(*nid, *off);
-                            }
+                            let res = SynthResult {
+                                samples: Arc::new(buf),
+                                sample_rate: out_sr,
+                                note_offsets: Arc::new(global_offsets),
+                            };
+                            result_arc.store(Some(Arc::new(res)));
+                            tracing::info!(
+                                speaker_groups = placed.len(),
+                                "VoicevoxBuiltin: synth complete (per-speaker-group, song-absolute)"
+                            );
                         }
-                        let res = SynthResult {
-                            samples: Arc::new(buf),
-                            sample_rate: out_sr,
-                            note_offsets: Arc::new(global_offsets),
-                        };
-                        result_arc.store(Some(Arc::new(res)));
                         done_gen.store(job.generation, Ordering::SeqCst);
-                        tracing::info!(
-                            speaker_groups = placed.len(),
-                            "VoicevoxBuiltin: synth complete (per-speaker-group, song-absolute)"
-                        );
+                        // 次 job が pending 中は終端報告を送らない (coalesce 中の点滅回避)。
                         let pending = coalesce.lock().map(|s| s.is_some()).unwrap_or(false);
                         if !pending {
-                            Self::synth_report(&status_reporter, &mut last_status, false, false);
+                            if let Some(detail) = rejected_detail {
+                                tracing::warn!(
+                                    detail = %detail,
+                                    "VoicevoxBuiltin: synth rejected (bad input; not retrying)"
+                                );
+                                Self::synth_report(
+                                    &status_reporter,
+                                    &mut last_status,
+                                    false,
+                                    VocalSynthFailure::Rejected { detail },
+                                );
+                            } else {
+                                Self::synth_report(
+                                    &status_reporter,
+                                    &mut last_status,
+                                    false,
+                                    VocalSynthFailure::None,
+                                );
+                            }
                         }
                     }
                 }
@@ -627,7 +674,7 @@ impl VoicevoxBuiltin {
         }
         // 停止したら必ず idle を報告する (busy のまま deactivate すると
         // daw_gui の overlay / clip スピナーが残り続けるため)。
-        (self.report)(false, false);
+        (self.report)(false, VocalSynthFailure::None);
     }
 }
 
@@ -848,7 +895,7 @@ mod tests {
     use super::*;
 
     fn noop_report() -> StatusFn {
-        Arc::new(|_, _| {})
+        Arc::new(|_, _: VocalSynthFailure| {})
     }
 
     /// audio half を直接組んで activate 相当まで進める test helper。

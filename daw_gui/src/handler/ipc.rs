@@ -327,9 +327,9 @@ impl AppData {
             PluginEvent::VoicevoxSynthStatus {
                 device_id,
                 busy,
-                failing,
+                failure,
             } => {
-                self.apply_voicevox_synth_status(device_id, busy, failing);
+                self.apply_voicevox_synth_status(device_id, busy, failure);
             }
         }
     }

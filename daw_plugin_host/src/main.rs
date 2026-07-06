@@ -640,11 +640,11 @@ impl PluginHost {
             // の第 2 callback 機構を HostCallbacks に統合)。
             on_vocal_synth_status: {
                 let tx = self.evt_tx.clone();
-                Arc::new(move |busy, failing| {
+                Arc::new(move |busy, failure| {
                     let _ = tx.send(PluginEvent::VoicevoxSynthStatus {
                         device_id,
                         busy,
-                        failing,
+                        failure,
                     });
                 })
             },

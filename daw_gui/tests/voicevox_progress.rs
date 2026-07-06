@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use common::model::{Clip, PluginInstance, Track};
 use common::plugin_format::PluginFormat;
 use common::port_config::PortConfig;
-use common::protocol::{PluginCommand, PluginEvent};
+use common::protocol::{PluginCommand, PluginEvent, VocalSynthFailure};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use daw_gui::app::{AppData, AppEvent, LoadedSlotInfo, VOICEVOX_ENGINE_WARNING};
@@ -46,9 +46,9 @@ fn build_app() -> (AppData, UnboundedReceiver<PluginCommand>) {
 #[test]
 fn synth_status_busy_then_failing_then_unreachable_threshold() {
     let (mut app, _rx) = build_app();
-    // busy + failing → entry が立ち failing_since 記録。
-    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 1, busy: true, failing: true }));
-    let st = app.voicevox.voicevox_synth_status.get(&1).copied().expect("entry present");
+    // busy + Unreachable → entry が立ち failing_since 記録。
+    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 1, busy: true, failure: VocalSynthFailure::Unreachable }));
+    let st = app.voicevox.voicevox_synth_status.get(&1).cloned().expect("entry present");
     assert!(st.busy);
     let since = st.failing_since.expect("failing_since set on first failing");
 
@@ -66,10 +66,10 @@ fn synth_status_busy_then_failing_then_unreachable_threshold() {
 #[test]
 fn synth_status_failing_then_success_clears_entry() {
     let (mut app, _rx) = build_app();
-    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 9, busy: true, failing: true }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 9, busy: true, failure: VocalSynthFailure::Unreachable }));
     assert!(app.voicevox_any_generating());
-    // 成功 (busy=false, failing=false) で entry 掃除 → 生成中なし。
-    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 9, busy: false, failing: false }));
+    // 成功 (busy=false, None) で entry 掃除 → 生成中なし。
+    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 9, busy: false, failure: VocalSynthFailure::None }));
     assert!(!app.voicevox.voicevox_synth_status.contains_key(&9));
     assert!(!app.voicevox_any_generating());
     // entry が無ければ未接続警告も出ない。
@@ -79,13 +79,42 @@ fn synth_status_failing_then_success_clears_entry() {
 #[test]
 fn synth_status_busy_without_failing_is_generating_but_never_warns() {
     let (mut app, _rx) = build_app();
-    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 2, busy: true, failing: false }));
-    let st = app.voicevox.voicevox_synth_status.get(&2).copied().expect("entry present");
+    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 2, busy: true, failure: VocalSynthFailure::None }));
+    let st = app.voicevox.voicevox_synth_status.get(&2).cloned().expect("entry present");
     assert!(st.busy);
     assert!(st.failing_since.is_none(), "failing なしでは failing_since を立てない");
     assert!(app.voicevox_any_generating());
     // failing_since が無いので、いくら時間が経っても未接続警告は出ない。
     assert!(!app.voicevox_engine_unreachable(Instant::now() + Duration::from_secs(3600)));
+}
+
+#[test]
+fn synth_status_rejected_shows_content_error_not_engine_warning() {
+    let (mut app, _rx) = build_app();
+    // engine 到達済だが歌詞拒否 (400)。busy=false でも entry は残り、内容エラーを持つ。
+    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus {
+        device_id: 3,
+        busy: false,
+        failure: VocalSynthFailure::Rejected { detail: "lyricが不正です: ー".into() },
+    }));
+    let st = app.voicevox.voicevox_synth_status.get(&3).cloned().expect("entry present");
+    assert!(!st.busy);
+    // Rejected は failing_since を立てない → 「engine 未接続」警告は永遠に出ない。
+    assert!(st.failing_since.is_none());
+    assert!(!app.voicevox_engine_unreachable(Instant::now() + Duration::from_secs(3600)));
+    // 代わりに内容エラーの理由を提示する。
+    assert_eq!(app.voicevox_rejected_detail(), Some("lyricが不正です: ー"));
+    // busy でないので「生成中」でもない (スピナーは回さない)。
+    assert!(!app.voicevox_any_generating());
+
+    // 歌詞を直して合成成功 (None) → entry 掃除、内容エラーも消える。
+    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus {
+        device_id: 3,
+        busy: false,
+        failure: VocalSynthFailure::None,
+    }));
+    assert!(!app.voicevox.voicevox_synth_status.contains_key(&3));
+    assert_eq!(app.voicevox_rejected_detail(), None);
 }
 
 #[test]
@@ -145,12 +174,12 @@ fn track_wav_synthesizing_resolves_plugin_id_and_counts_busy() {
     assert_eq!(app.voicevox_synth_busy_count(), 0);
 
     // device_id=5 が busy → そのトラックが合成中、件数 1。
-    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 5, busy: true, failing: false }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 5, busy: true, failure: VocalSynthFailure::None }));
     assert!(app.track_wav_synthesizing(100));
     assert_eq!(app.voicevox_synth_busy_count(), 1);
 
     // idle に戻ると 0 件 (entry も掃除される)。
-    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 5, busy: false, failing: false }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::VoicevoxSynthStatus { device_id: 5, busy: false, failure: VocalSynthFailure::None }));
     assert!(!app.track_wav_synthesizing(100));
     assert_eq!(app.voicevox_synth_busy_count(), 0);
 }

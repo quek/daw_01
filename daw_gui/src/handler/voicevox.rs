@@ -6,29 +6,58 @@ use crate::app_types::*;
 use crate::event::*;
 use common::model::Clip;
 use common::plugin_format::PluginFormat;
-use common::protocol::{PluginCommand};
+use common::protocol::{PluginCommand, VocalSynthFailure};
 
 impl AppData {
     // ===== VOICEVOX 生成状態の可視化 ==========================
 
-    /// `VoicevoxSynthStatus` IPC handler。per-plugin の busy/failing を更新する。
-    /// failing の立上りで `failing_since` を記録 (継続中は維持)、成功で None。idle かつ
-    /// 非failing の entry は掃除して `voicevox_any_generating` 等の判定を軽く保つ。
-    pub(crate) fn apply_voicevox_synth_status(&mut self, device_id: u64, busy: bool, failing: bool) {
+    /// `VoicevoxSynthStatus` IPC handler。per-plugin の busy + 失敗種別を更新する。
+    /// `Unreachable` の立上りで `failing_since` を記録 (継続中は維持) して 5s 後に
+    /// 「engine 未接続」へ、`Rejected` は `rejected` に理由を積んで即時「合成できない歌詞」
+    /// 表示へ。成功 (`None`) で両方クリア。idle かつ失敗なしの entry は掃除して
+    /// `voicevox_any_generating` 等の判定を軽く保つ。
+    pub(crate) fn apply_voicevox_synth_status(
+        &mut self,
+        device_id: u64,
+        busy: bool,
+        failure: VocalSynthFailure,
+    ) {
         let now = std::time::Instant::now();
         let entry = self
             .voicevox.voicevox_synth_status
             .entry(device_id)
-            .or_insert(VocalSynthStatus { busy: false, failing_since: None });
+            .or_insert(VocalSynthStatus {
+                busy: false,
+                failing_since: None,
+                rejected: None,
+            });
         entry.busy = busy;
-        if failing {
-            entry.failing_since.get_or_insert(now);
-        } else {
-            entry.failing_since = None;
+        match failure {
+            VocalSynthFailure::None => {
+                entry.failing_since = None;
+                entry.rejected = None;
+            }
+            VocalSynthFailure::Unreachable => {
+                entry.failing_since.get_or_insert(now);
+                entry.rejected = None;
+            }
+            VocalSynthFailure::Rejected { detail } => {
+                entry.failing_since = None;
+                entry.rejected = Some(detail);
+            }
         }
-        if !entry.busy && entry.failing_since.is_none() {
+        if !entry.busy && entry.failing_since.is_none() && entry.rejected.is_none() {
             self.voicevox.voicevox_synth_status.remove(&device_id);
         }
+    }
+
+    /// engine には到達できているが歌詞等を拒否した「内容エラー」の理由 (あれば最初の 1 件)。
+    /// overlay が「合成できない歌詞があります」表示に使う。
+    pub fn voicevox_rejected_detail(&self) -> Option<&str> {
+        self.voicevox
+            .voicevox_synth_status
+            .values()
+            .find_map(|s| s.rejected.as_deref())
     }
 
     /// track が持つ builtin VOICEVOX device の安定 device id (= load 済なら)。

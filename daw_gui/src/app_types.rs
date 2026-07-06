@@ -1471,13 +1471,16 @@ pub enum DeferredEdit {
 
 /// builtin VOICEVOX (歌唱/読み上げ) 合成の 1 plugin 分の状態。
 /// `AppData.voicevox_synth_status` に key=plugin_id で保持する。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VocalSynthStatus {
     /// いま合成中か (= plugin host の `queued_gen > done_gen`)。
     pub busy: bool,
-    /// 直近 HTTP 試行が失敗してから (= engine 未接続/起動途中) の起点。成功で `None`。
+    /// engine に**到達できず** (未接続/起動途中) 失敗してからの起点。到達成功で `None`。
     /// `Some` のまま `VOICEVOX_ENGINE_WARNING` 経過 = engine 未接続として警告に切替。
     pub failing_since: Option<std::time::Instant>,
+    /// engine には**到達できたが入力を拒否**された内容エラーの理由 (例: `lyricが不正です: ー`)。
+    /// `Some` の間は「合成できない歌詞」警告を即時表示 (閾値なし)。到達成功/新規合成で `None`。
+    pub rejected: Option<String>,
 }
 
 /// 合成が `failing` のまま継続したとき「engine に接続できません」へ切り替える

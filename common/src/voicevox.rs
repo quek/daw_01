@@ -95,6 +95,8 @@ pub fn build_sing_query(notes: &[Note], bpm: f32) -> String {
     let seconds_per_beat = 60.0 / f64::from(bpm);
     let base_beat = sorted[0].start_beat;
     let mut prev_end_frame: i64 = 0;
+    // 長音「ー」を「直前の母音を伸ばす」で解決するため、直前ノートの母音を持ち越す。
+    let mut carried_vowel: Option<char> = None;
 
     for (i, note) in sorted.iter().enumerate() {
         let start_sec = (note.start_beat - base_beat) * seconds_per_beat;
@@ -115,7 +117,10 @@ pub fn build_sing_query(notes: &[Note], bpm: f32) -> String {
         }
 
         let note_frames = (end_frame - start_frame).max(1);
-        let lyric = note.lyric.as_deref().unwrap_or("ら");
+        // 長音符「ー」は VOICEVOX の sing 合成が単独歌詞として弾く (400
+        // `lyricが不正です: ー`)。直前の母音へ解決してから流す。
+        let raw_lyric = note.lyric.as_deref().unwrap_or("ら");
+        let lyric = resolve_sing_lyric(raw_lyric, &mut carried_vowel);
         let escaped = lyric.replace('\\', "\\\\").replace('"', "\\\"");
         parts.push(format!(
             r#"{{"id":"note{}","key":{},"frame_length":{},"lyric":"{}"}}"#,
@@ -136,6 +141,69 @@ pub fn build_sing_query(notes: &[Note], bpm: f32) -> String {
 
 fn seconds_to_frames(s: f64) -> i64 {
     (s * FRAME_RATE).round().max(1.0) as i64
+}
+
+/// 長音符 (prolonged sound mark)。全角 `ー` (U+30FC) と半角 `ｰ` (U+FF70)。
+fn is_prolongation(ch: char) -> bool {
+    matches!(ch, 'ー' | 'ｰ')
+}
+
+/// 仮名 1 文字の母音を **ひらがな母音** (あ/い/う/え/お) で返す。母音を持たない
+/// 文字 (ん/っ/長音符/非仮名) は `None`。長音「ー」を直前の母音へ解決するために使う。
+/// 濁点・半濁点・小書き・カタカナも同じ母音へ畳む (例: `ぎゃ`→`あ`, `シュ`→`う`)。
+pub fn kana_vowel(ch: char) -> Option<char> {
+    match ch {
+        'あ' | 'か' | 'さ' | 'た' | 'な' | 'は' | 'ま' | 'や' | 'ら' | 'わ' | 'が' | 'ざ' | 'だ'
+        | 'ば' | 'ぱ' | 'ぁ' | 'ゃ' | 'ゎ' | 'ア' | 'カ' | 'サ' | 'タ' | 'ナ' | 'ハ' | 'マ' | 'ヤ'
+        | 'ラ' | 'ワ' | 'ガ' | 'ザ' | 'ダ' | 'バ' | 'パ' | 'ァ' | 'ャ' | 'ヮ' => Some('あ'),
+        'い' | 'き' | 'し' | 'ち' | 'に' | 'ひ' | 'み' | 'り' | 'ぎ' | 'じ' | 'ぢ' | 'び' | 'ぴ'
+        | 'ぃ' | 'ゐ' | 'イ' | 'キ' | 'シ' | 'チ' | 'ニ' | 'ヒ' | 'ミ' | 'リ' | 'ギ' | 'ジ' | 'ヂ'
+        | 'ビ' | 'ピ' | 'ィ' | 'ヰ' => Some('い'),
+        'う' | 'く' | 'す' | 'つ' | 'ぬ' | 'ふ' | 'む' | 'ゆ' | 'る' | 'ぐ' | 'ず' | 'づ' | 'ぶ'
+        | 'ぷ' | 'ぅ' | 'ゅ' | 'ゔ' | 'ウ' | 'ク' | 'ス' | 'ツ' | 'ヌ' | 'フ' | 'ム' | 'ユ' | 'ル'
+        | 'グ' | 'ズ' | 'ヅ' | 'ブ' | 'プ' | 'ゥ' | 'ュ' | 'ヴ' => Some('う'),
+        'え' | 'け' | 'せ' | 'て' | 'ね' | 'へ' | 'め' | 'れ' | 'げ' | 'ぜ' | 'で' | 'べ' | 'ぺ'
+        | 'ぇ' | 'ゑ' | 'エ' | 'ケ' | 'セ' | 'テ' | 'ネ' | 'ヘ' | 'メ' | 'レ' | 'ゲ' | 'ゼ' | 'デ'
+        | 'ベ' | 'ペ' | 'ェ' | 'ヱ' => Some('え'),
+        'お' | 'こ' | 'そ' | 'と' | 'の' | 'ほ' | 'も' | 'よ' | 'ろ' | 'を' | 'ご' | 'ぞ' | 'ど'
+        | 'ぼ' | 'ぽ' | 'ぉ' | 'ょ' | 'オ' | 'コ' | 'ソ' | 'ト' | 'ノ' | 'ホ' | 'モ' | 'ヨ' | 'ロ'
+        | 'ヲ' | 'ゴ' | 'ゾ' | 'ド' | 'ボ' | 'ポ' | 'ォ' | 'ョ' => Some('お'),
+        _ => None,
+    }
+}
+
+/// 歌唱クエリ用に 1 note の歌詞を解決する。VOICEVOX の `sing_frame_audio_query` は
+/// 各 note の歌詞に有効な 1 モーラを要求し、裸の長音符「ー」を 400 で弾く。歌唱では
+/// 長音は日常的な記法なので、ここで「ー」を発声可能な仮名へ変換する:
+///
+/// - 「ー」単独 (= 音を伸ばす継続 note) → 直前ノートの母音 (`ら`→`あ`, `き`→`い`, …)。
+///   直前が無い / 母音を取れない場合は `あ` にフォールバック。
+/// - 通常の歌詞 → そのまま流し、末尾仮名の母音を「直前の母音」として記憶する。
+/// - 歌詞中に「ー」が混じる 1 note (例: `らー`) → 長音符を落として実仮名部分を返す
+///   (その note 自身の frame_length が伸ばしを表現するので、母音の再掲は不要)。
+fn resolve_sing_lyric(raw: &str, carried: &mut Option<char>) -> String {
+    if !raw.chars().any(is_prolongation) {
+        // 通常経路: 末尾の母音持ち仮名から carried を更新し、そのまま返す。
+        for ch in raw.chars() {
+            if let Some(v) = kana_vowel(ch) {
+                *carried = Some(v);
+            }
+        }
+        return raw.to_string();
+    }
+    // 「ー」を含む。実仮名 (長音符以外) を抽出。
+    let real: String = raw.chars().filter(|c| !is_prolongation(*c)).collect();
+    if !real.is_empty() {
+        // 例: `らー` → `ら` (伸ばしは frame_length が担う)。
+        for ch in real.chars() {
+            if let Some(v) = kana_vowel(ch) {
+                *carried = Some(v);
+            }
+        }
+        return real;
+    }
+    // 純粋な長音 (`ー` / `ーー`) → 直前の母音 1 文字。
+    carried.unwrap_or('あ').to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +392,80 @@ mod tests {
         let q = build_sing_query(&notes, 120.0);
         // Must remain valid JSON despite embedded quotes.
         let _: Value = serde_json::from_str(&q).expect("invalid JSON output");
+    }
+
+    /// 歌詞ヘルパ: pitch/duration は固定で lyric だけ変えて query を作る。
+    fn note_with_lyric(start_beat: f64, lyric: &str) -> Note {
+        Note {
+            id: 0,
+            start_beat,
+            duration_beats: 1.0,
+            pitch: 60,
+            velocity: 100,
+            lyric: Some(lyric.into()),
+            muted: false,
+        }
+    }
+
+    #[test]
+    fn lone_prolongation_resolves_to_previous_vowel() {
+        // 「ら」「ー」「ー」→ ら / あ / あ (裸の「ー」を弾かせない)。
+        let notes = vec![
+            note_with_lyric(0.0, "ら"),
+            note_with_lyric(1.0, "ー"),
+            note_with_lyric(2.0, "ー"),
+        ];
+        let entries = parse_query(&build_sing_query(&notes, 120.0));
+        let lyrics: Vec<&str> = entries.iter().map(|e| e.2.as_str()).collect();
+        assert_eq!(lyrics, vec!["", "ら", "あ", "あ", ""]);
+    }
+
+    #[test]
+    fn prolongation_uses_consonant_row_vowel() {
+        // 「き」→い, 「く」→う, 「け」→え, 「こ」→お の各行を伸ばす。
+        for (base, vowel) in [("き", "い"), ("く", "う"), ("け", "え"), ("こ", "お")] {
+            let notes = vec![note_with_lyric(0.0, base), note_with_lyric(1.0, "ー")];
+            let entries = parse_query(&build_sing_query(&notes, 120.0));
+            assert_eq!(entries[2].2, vowel, "base={base} should hold vowel {vowel}");
+        }
+    }
+
+    #[test]
+    fn leading_prolongation_falls_back_to_a() {
+        // 直前が無い先頭「ー」→ あ (フォールバック)。合成を止めないための保険。
+        let notes = vec![note_with_lyric(0.0, "ー")];
+        let entries = parse_query(&build_sing_query(&notes, 120.0));
+        assert_eq!(entries[1].2, "あ");
+    }
+
+    #[test]
+    fn small_kana_mora_vowel_and_inline_prolongation() {
+        // 拗音末尾の母音で伸ばす: 「きゃ」→あ。1 note 内混在「らー」→「ら」。
+        let notes = vec![note_with_lyric(0.0, "きゃ"), note_with_lyric(1.0, "ー")];
+        let entries = parse_query(&build_sing_query(&notes, 120.0));
+        assert_eq!(entries[1].2, "きゃ");
+        assert_eq!(entries[2].2, "あ");
+
+        let notes = vec![note_with_lyric(0.0, "らー")];
+        let entries = parse_query(&build_sing_query(&notes, 120.0));
+        assert_eq!(entries[1].2, "ら");
+    }
+
+    #[test]
+    fn no_bare_prolongation_survives_in_query() {
+        // どんな並びでも出力 JSON に裸の「ー」を残さない (= 400 の根絶)。
+        let notes = vec![
+            note_with_lyric(0.0, "ん"), // 母音なし → carried 変わらず
+            note_with_lyric(1.0, "ー"), // 直前 carried が無い → あ
+            note_with_lyric(2.0, "そ"),
+            note_with_lyric(3.0, "ー"), // → お
+        ];
+        let entries = parse_query(&build_sing_query(&notes, 120.0));
+        assert!(
+            entries.iter().all(|e| !e.2.contains('ー')),
+            "query still contains a bare prolongation: {entries:?}"
+        );
+        assert_eq!(entries.last().unwrap().0, None); // trailing rest
     }
 
     #[test]

@@ -541,8 +541,24 @@ pub enum PluginEvent {
     VoicevoxSynthStatus {
         device_id: u64,
         busy: bool,
-        failing: bool,
+        /// 直近試行の失敗種別 (engine 到達可否で区別)。
+        failure: VocalSynthFailure,
     },
+}
+
+/// builtin VOICEVOX 合成の失敗種別。engine に**到達できない** (未起動 / 起動途中 /
+/// timeout = transient、retry する) のか、engine は**到達できたが入力を拒否**した
+/// (HTTP 4xx/5xx = 例: 不正な歌詞。同 job を retry しても無駄なので retry しない) のかを
+/// 区別する。後者を「engine 未接続」と誤表示しない / 無限 retry しないための SSoT。
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub enum VocalSynthFailure {
+    /// 直近試行は失敗していない (成功 or まだ試行なし)。
+    None,
+    /// engine に到達できない (接続拒否 / timeout / 未起動・起動途中)。transient。
+    Unreachable,
+    /// engine は応答したが入力を拒否した (HTTP 4xx/5xx)。`detail` は VOICEVOX が返した
+    /// 短い理由 (例: `lyricが不正です: ー`)。同じ入力での retry はしない (編集し直しを待つ)。
+    Rejected { detail: String },
 }
 
 #[cfg(test)]
