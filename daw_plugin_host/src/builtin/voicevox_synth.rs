@@ -168,6 +168,15 @@ pub struct BuiltinSynthOutput {
     pub note_offsets: std::collections::HashMap<u32, u64>,
 }
 
+/// `build_sing_query` が sing wav 先頭に必ず入れる leading rest (attack 用の無音) の
+/// サンプル数 (fractional)。 note の音声開始 = beat-grid 位置 + この lead-in。 synth 側の
+/// note offset 計算と、 audio half 側の連続再生 (拍 → buffer 位置写像) が **同じ値** を
+/// 使うため 1 箇所に集約する (r.md #23: 連続再生でこの lead-in を足して拍に合わせる)。
+pub(crate) fn lead_in_frames(sample_rate: u32) -> f64 {
+    f64::from(common::voicevox::REST_FRAMES) / common::voicevox::FRAME_RATE
+        * f64::from(sample_rate)
+}
+
 /// Synthesise a single track's worth of notes for the VOICEVOX builtin plugin
 /// (`docs/plan_voicevox_synth.md` PR-V2.3). Returns the **mono** PCM samples + sample rate +
 /// per-note frame offsets within the synthesised buffer (= `note_id → start frame`).
@@ -219,10 +228,7 @@ pub fn synthesize_notes_for_builtin(
     //
     // `build_sing_query` は wav 先頭に必ず `REST_FRAMES` の leading rest (= attack 用の無音) を
     // 入れる。各 note の音声開始位置 = leading rest + (start_beat - earliest) × samples_per_beat。
-    let lead_in_samples =
-        (f64::from(common::voicevox::REST_FRAMES) / common::voicevox::FRAME_RATE
-            * f64::from(sample_rate))
-        .round() as u64;
+    let lead_in_samples = lead_in_frames(sample_rate).round() as u64;
     let earliest = notes
         .iter()
         .map(|n| n.start_beat)

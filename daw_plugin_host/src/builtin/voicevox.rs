@@ -38,8 +38,8 @@ use common::plugin_format::PluginFormat;
 use common::plugin_metadata::{NoteMetadata, TalkMetadata};
 use common::protocol::{RenderMode, VocalSynthFailure};
 use crate::builtin::voicevox_synth::{
-    BuiltinNoteSpec, BuiltinSynthOutput, SynthError, synthesize_notes_for_builtin,
-    synthesize_talk_for_builtin,
+    BuiltinNoteSpec, BuiltinSynthOutput, SynthError, lead_in_frames,
+    synthesize_notes_for_builtin, synthesize_talk_for_builtin,
 };
 
 use crate::plugin_instance::{
@@ -105,24 +105,29 @@ type PlacedGroup = (usize, Vec<f32>, Vec<(u32, u64)>);
 struct SynthResult {
     samples: Arc<Vec<f32>>, // mono
     sample_rate: u32,
+    /// buffer を配置したときの **synth 時 (job.bpm) の samples-per-beat** (= sample_rate*60/bpm)。
+    /// 連続再生は playhead 拍 → buffer 位置写像にこれを使う (再生時の transport.bpm ではなく)。
+    /// buffer は job.bpm で拍配置されており、 tempo 変更直後の re-synth 完了までの過渡で
+    /// transport.bpm と一致しないことがあるため、 配置時の値を SSoT として持ち回る (r.md #23)。
+    samples_per_beat: f64,
     /// `note_id → synth wav 内 frame offset`。
     note_offsets: Arc<HashMap<u32, u64>>,
 }
 
-/// 再生中 voice。note_on で push、wav 終端で自動停止 (note_off は無視 —
-/// VOICEVOX の出力は envelope を内包する)。
-struct Voice {
-    /// 起動 note_id (debug / introspection 用)。
-    #[allow(dead_code)]
-    note_id: u32,
-    samples: Arc<Vec<f32>>,
-    /// synth wav の sample_rate。出力デバイスレートと異なるとき process()
-    /// が linear resample する (A9 r.md #8)。
-    sample_rate: u32,
-    velocity: f32,
-    /// 次に samples から read する**分数**位置。
+/// 停止中 (transport stopped) の鍵盤プレビュー用 voice。 note_on で張り替え、
+/// synth wav の該当 note 位置から free-run 再生する。 **再生中 (playing) はこの
+/// voice を使わない** — playing は playhead 追従の連続再生 (r.md #23)。
+struct PreviewVoice {
+    /// 次に samples から read する**分数**位置 (buffer sample 単位、song-absolute)。
     cursor: f64,
+    /// note velocity (0..1 正規化済)。
+    velocity: f32,
+    /// declick 用フェード包絡 (0.0 開始 → fade-in で 1.0)。 突入クリックを消す。
+    gain: f32,
 }
+
+/// preview voice の fade-in 時間 (ms)。 波形途中から full amp で突入する click を消す。
+const PREVIEW_FADE_MS: f64 = 5.0;
 
 // ====================================================================
 // Audio half
@@ -134,10 +139,9 @@ struct VoicevoxAudioHalf {
     out_l: Vec<f32>,
     out_r: Vec<f32>,
     sample_rate: f64,
-    /// 再生中 voice 群。note_on で push、wav 終端で自動 drain、同 note_id
-    /// の retrigger は既存 entry を上書き。
-    active_voices: Vec<Voice>,
-    /// 前 buffer の transport 再生状態 (playing→stopped edge 検出用)。
+    /// 停止中の鍵盤プレビュー voice (再生中は使わない、 playing は playhead 連続再生)。
+    preview: Option<PreviewVoice>,
+    /// 前 buffer の transport 再生状態 (stopped→playing edge で preview を捨てる)。
     was_playing: bool,
     /// 共有 synth 結果 (synth thread が store、ここは load のみ)。
     synth_result: Arc<ArcSwapOption<SynthResult>>,
@@ -149,7 +153,7 @@ impl VoicevoxAudioHalf {
             out_l: Vec::new(),
             out_r: Vec::new(),
             sample_rate: 0.0,
-            active_voices: Vec::new(),
+            preview: None,
             was_playing: false,
             synth_result,
         }
@@ -177,93 +181,134 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
             *v = 0.0;
         }
 
-        // Transport gating (playing→stopped edge): Stop した瞬間に再生中の
-        // 歌声 voice を drop する。毎 buffer 無条件 clear ではなく edge 検出
-        // なのは、鍵盤プレビュー (停止中の note_on 試聴) を潰さないため。
-        // RT 安全: bool 1 個 + Vec::clear (容量保持)。
-        let stopped_edge = self.was_playing && !transport.is_playing;
-        self.was_playing = transport.is_playing;
-        if stopped_edge {
-            self.active_voices.clear();
-        }
-
-        // note_on を受信したら synth_result の note_offsets から wav 開始
-        // frame を引き、rolling voice として置き換える (VOICEVOX wav は
-        // 全 note 連続録音なので、cursor jump = 想定された連続再生と等価)。
-        for ev in events {
-            if let crate::plugin_instance::NoteTransition::On { note_id, velocity, .. } = ev.event {
-                // `ArcSwapOption::load_full()` は lock-free (atomic load +
-                // refcount bump)。
-                let snapshot = self.synth_result.load_full();
-                let Some(res) = snapshot else {
-                    continue;
-                };
-                let synth_offset = res
-                    .note_offsets
-                    .get(&note_id)
-                    .copied()
-                    .unwrap_or(0) as usize;
-                if synth_offset >= res.samples.len() {
-                    // synth から note_id が外れている (= 歌詞数とずれた)。
-                    continue;
-                }
-                let voice = Voice {
-                    note_id,
-                    samples: Arc::clone(&res.samples),
-                    sample_rate: res.sample_rate,
-                    velocity: velocity as f32,
-                    cursor: synth_offset as f64,
-                };
-                self.active_voices.clear();
-                self.active_voices.push(voice);
-            }
-            // note_off は無視。
-        }
-
-        // active voices ごとに audio を mix。合成 wav を出力デバイスレート
-        // へ linear resample (A9 r.md #8)。RT 安全: alloc / lock なし。
         let out_max = self.out_l.len().min(self.out_r.len());
+        let out_n = frames_usize.min(out_max);
         let host_sr = self.sample_rate;
-        let mut i = 0usize;
-        while i < self.active_voices.len() {
-            let drop = {
-                let voice = &mut self.active_voices[i];
-                // NoteTransition::On.velocity は sequencer 側で 0..1 に
-                // 正規化済み。
-                let amp = voice.velocity.clamp(0.0, 1.0);
-                let ratio = if host_sr > 0.0 {
-                    f64::from(voice.sample_rate) / host_sr
-                } else {
-                    1.0
-                };
-                let src_len = voice.samples.len();
-                let out_n = frames_usize.min(out_max);
-                let mut produced = 0usize;
-                for k in 0..out_n {
-                    let pos = voice.cursor + k as f64 * ratio;
-                    let i0 = pos.floor() as usize;
-                    if i0 >= src_len {
-                        break;
+
+        // stopped→playing edge で停止中 preview を捨てる (再生は playhead 追従へ)。
+        let started_edge = !self.was_playing && transport.is_playing;
+        self.was_playing = transport.is_playing;
+        if started_edge {
+            self.preview = None;
+        }
+
+        // 共有 synth 結果 (lock-free load)。 `load()` (Guard 借用) を使い `load_full()` は
+        // 使わない: buffer は multi-MB なので、 audio thread が snapshot の最後の所有者になって
+        // process() 末尾で drop = RT スレッド上で解放、 を避ける (CLAUDE.md「解放禁止」)。 Guard は
+        // Arc を clone せず借用し、 retired 値は writer (synth thread、 非 RT) 側で drop される
+        // — daw_audio の RT パスと同じ idiom (automation.rs / audio_worker.rs)。
+        let snapshot = self.synth_result.load();
+
+        if transport.is_playing {
+            // === REAPER 式 連続再生 (r.md #23) =====================================
+            // synth buf は song-absolute (index = song sample @ res.sample_rate、 beat 0
+            // 起点)。 **playhead 位置から buf を直接連続読み出し**する。 旧実装は note_on
+            // ごとに voice を張り替え cursor を jump させていたため、 連続録音である歌声を
+            // 音 (ノート) の境界で毎回切り貼りして click が乗っていた (REAPER は 1 本の
+            // クリップとして通し再生するので click が無い)。 連続読み出しなら retrigger が
+            // 消え、 録音そのものを再生するので click は原理的に発生しない。
+            //
+            // 拍 → buffer 位置: `buf_pos(beat) = beat * samples_per_beat + lead_in`。
+            // `samples_per_beat` は配置時 (synth 時 job.bpm) の値を SynthResult に持ち回る
+            // (再生時 transport.bpm ではなく = tempo 変更過渡の drift を避ける、 下記参照)。
+            // `lead_in` は build_sing_query が wav 先頭に入れる attack 用無音で、 note 音声開始は
+            // beat-grid から lead_in 分後ろにある → 読み出しを lead_in 進める (`lead_in_frames`
+            // を synth と共有 = SSoT)。
+            if let Some(res) = snapshot.as_ref() {
+                let src_len = res.samples.len();
+                if host_sr > 0.0 && res.sample_rate > 0 && res.samples_per_beat > 0.0 && src_len > 0
+                {
+                    let src_sr = f64::from(res.sample_rate);
+                    // 拍→buffer 位置は **synth 時の** samples_per_beat を使う (transport.bpm ではない)。
+                    // buffer は job.bpm で配置され、 song_pos_beats は tempo 積分済の真の拍位置なので、
+                    // これで定テンポは常に厳密、 tempo 変更過渡でも base が各 buffer で song_pos_beats から
+                    // 再同期する。 talk は自前の pre-silence を持ち lead_in を配置に含めないため、 この
+                    // lead_in 加算で ~7ms 早まるが (VOICEVOX 既定 prePhonemeLength≈lead_in)、 sing の
+                    // 拍合わせ (歌声が主用途) を優先する。
+                    let base =
+                        transport.song_pos_beats * res.samples_per_beat + lead_in_frames(res.sample_rate);
+                    let ratio = src_sr / host_sr;
+                    for k in 0..out_n {
+                        let pos = base + k as f64 * ratio;
+                        if pos < 0.0 {
+                            continue;
+                        }
+                        let i0 = pos.floor() as usize;
+                        if i0 >= src_len {
+                            // pos は単調増加なので以降も全て範囲外 = 無音。
+                            break;
+                        }
+                        let frac = (pos - i0 as f64) as f32;
+                        // 末尾サンプルは自身を hold (端の補間を安定化)。
+                        let s1 = if i0 + 1 < src_len {
+                            res.samples[i0 + 1]
+                        } else {
+                            res.samples[i0]
+                        };
+                        let s = res.samples[i0] * (1.0 - frac) + s1 * frac;
+                        self.out_l[k] += s;
+                        self.out_r[k] += s;
                     }
-                    let frac = (pos - i0 as f64) as f32;
-                    // 末尾サンプルは自身を hold (端の補間を安定化)。
-                    let s1 = if i0 + 1 < src_len {
-                        voice.samples[i0 + 1]
-                    } else {
-                        voice.samples[i0]
-                    };
-                    let s = (voice.samples[i0] * (1.0 - frac) + s1 * frac) * amp;
-                    self.out_l[k] += s;
-                    self.out_r[k] += s;
-                    produced = k + 1;
                 }
-                voice.cursor += produced as f64 * ratio;
-                voice.cursor.floor() as usize >= src_len
-            };
-            if drop {
-                self.active_voices.swap_remove(i);
-            } else {
-                i += 1;
+            }
+        } else {
+            // === 停止中: 鍵盤プレビュー (note_on 試聴) ==============================
+            // note_on で preview voice を該当 note 位置 (synth_offset = song-absolute) に
+            // 張り替え、 free-run 再生。 波形途中から突入するので fade-in で declick する。
+            for ev in events {
+                if let crate::plugin_instance::NoteTransition::On { note_id, velocity, .. } =
+                    ev.event
+                    && let Some(res) = snapshot.as_ref()
+                {
+                    let synth_offset =
+                        res.note_offsets.get(&note_id).copied().unwrap_or(0) as usize;
+                    if synth_offset < res.samples.len() {
+                        self.preview = Some(PreviewVoice {
+                            cursor: synth_offset as f64,
+                            velocity: velocity as f32,
+                            gain: 0.0,
+                        });
+                    }
+                }
+                // note_off は無視 (VOICEVOX 出力は envelope 内包、 wav 終端で自動停止)。
+            }
+
+            // preview voice を mix。 別フィールド (out_l / out_r と preview) の disjoint
+            // borrow なので RT 安全 (alloc / lock なし)。
+            let mut drop_preview = false;
+            if let (Some(pv), Some(res)) = (self.preview.as_mut(), snapshot.as_ref()) {
+                let src_len = res.samples.len();
+                if host_sr > 0.0 && res.sample_rate > 0 && src_len > 0 {
+                    let ratio = f64::from(res.sample_rate) / host_sr;
+                    let amp = pv.velocity.clamp(0.0, 1.0);
+                    let fade_step = (1000.0 / (PREVIEW_FADE_MS * host_sr)).min(1.0) as f32;
+                    let mut produced = 0usize;
+                    for k in 0..out_n {
+                        let pos = pv.cursor + k as f64 * ratio;
+                        let i0 = pos.floor() as usize;
+                        if i0 >= src_len {
+                            break;
+                        }
+                        pv.gain = (pv.gain + fade_step).min(1.0);
+                        let frac = (pos - i0 as f64) as f32;
+                        let s1 = if i0 + 1 < src_len {
+                            res.samples[i0 + 1]
+                        } else {
+                            res.samples[i0]
+                        };
+                        let s = (res.samples[i0] * (1.0 - frac) + s1 * frac) * amp * pv.gain;
+                        self.out_l[k] += s;
+                        self.out_r[k] += s;
+                        produced = k + 1;
+                    }
+                    pv.cursor += produced as f64 * ratio;
+                    if pv.cursor.floor() as usize >= src_len {
+                        drop_preview = true;
+                    }
+                }
+            }
+            if drop_preview {
+                self.preview = None;
             }
         }
 
@@ -290,12 +335,12 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
     }
 
     fn on_deactivate(&mut self) {
-        self.active_voices.clear();
+        self.preview = None;
     }
 
     fn set_processing(&mut self, on: bool) {
         if !on {
-            self.active_voices.clear();
+            self.preview = None;
         }
     }
 }
@@ -609,9 +654,14 @@ impl VoicevoxBuiltin {
                                     global_offsets.insert(*nid, *off);
                                 }
                             }
+                            // 配置は各 group で spb = out_sr*60/job.bpm を使っている (sing/talk 共通)。
+                            // 連続再生の拍→buffer 写像に同じ値を持ち回る (r.md #23)。
+                            let samples_per_beat =
+                                f64::from(out_sr) * 60.0 / f64::from(job.bpm.max(0.001));
                             let res = SynthResult {
                                 samples: Arc::new(buf),
                                 sample_rate: out_sr,
+                                samples_per_beat,
                                 note_offsets: Arc::new(global_offsets),
                             };
                             result_arc.store(Some(Arc::new(res)));
@@ -913,6 +963,15 @@ mod tests {
         )
     }
 
+    /// 再生中 (playing) transport を指定 playhead 拍位置で組む (連続再生パス検証用)。
+    fn transport_playing(song_pos_beats: f64) -> crate::plugin_instance::TransportContext {
+        let mut pd = common::process_data::ProcessData::empty();
+        pd.playing = 1;
+        pd.bpm = 120.0;
+        pd.song_pos_beats = song_pos_beats;
+        crate::plugin_instance::TransportContext::from_process_data(&pd)
+    }
+
     #[test]
     fn default_state_uses_sing_speaker() {
         let s = VoicevoxState::default();
@@ -945,7 +1004,7 @@ mod tests {
     fn voicevox_process_silent_when_no_synth_result() {
         let (mut h, _result) = mk_half(48_000.0);
         h.out_l[0] = 0.5;
-        // 合成結果なしで note_on を投げても active_voice は付かない。
+        // 合成結果なしで note_on (stopped preview) を投げても preview は付かない。
         let events = vec![TimedNoteEvent {
             time: 0,
             event: crate::plugin_instance::NoteTransition::On {
@@ -956,7 +1015,7 @@ mod tests {
         }];
         h.process(64, &events, &[], &[], &[], &transport()).unwrap();
         assert!(h.out_l[..64].iter().all(|&v| v == 0.0));
-        assert!(h.active_voices.is_empty());
+        assert!(h.preview.is_none());
     }
 
     #[test]
@@ -1034,17 +1093,64 @@ mod tests {
         p.deactivate();
     }
 
+    /// lead_in は 48kHz で 5120 sample (= 10 frame / 93.75fps × 48000)。 buf は
+    /// song-absolute なので、 十分長い ramp buf を作れば連続再生の写像を厳密検証できる。
+    fn ramp_buf(len: usize) -> Vec<f32> {
+        (0..len).map(|i| i as f32).collect()
+    }
+
+    /// r.md #23: 再生中は playhead 位置から buf を連続読み出しする (note_on retrigger
+    /// を廃止)。 拍 → buffer 位置 = `beat*spb + lead_in`。 lead_in の反映と連続性を検証。
     #[test]
-    fn voice_drains_synth_result() {
-        // synth_result に手で SynthResult を仕込んで、process が note_on で
-        // voice を起こして wav を流すかを確認 (HTTP を介さない)。
+    fn continuous_playback_reads_buf_at_playhead() {
         let (mut h, result) = mk_half(48_000.0);
-        let samples: Vec<f32> = (0..128).map(|i| (i as f32) * 0.001).collect();
-        let mut offsets = HashMap::new();
-        offsets.insert(0, 0);
+        // lead_in(5120) を含むよう十分長い buf。 buf[i] = i。
         result.store(Some(Arc::new(SynthResult {
-            samples: Arc::new(samples),
-            sample_rate: 48000,
+            samples: Arc::new(ramp_buf(8192)),
+            sample_rate: 48_000,
+            samples_per_beat: 24_000.0, // 48000*60/120
+            note_offsets: Arc::new(HashMap::new()),
+        })));
+        // playhead = 拍 0 → base = 0*spb + lead_in(5120)。 host==synth なので ratio=1。
+        h.process(64, &[], &[], &[], &[], &transport_playing(0.0)).unwrap();
+        assert!((h.out_l[0] - 5120.0).abs() < 1e-3, "out_l[0]={}", h.out_l[0]);
+        assert!((h.out_l[10] - 5130.0).abs() < 1e-3, "out_l[10]={}", h.out_l[10]);
+        // 左右同一 (mono → stereo)。
+        assert_eq!(h.out_l[10], h.out_r[10]);
+        // playhead = 拍 0.01 → base = 0.01*24000 + 5120 = 5360。 note_on 無しでも
+        // playhead から鳴る (mid-phrase 再生開始でも欠落しない)。
+        h.process(64, &[], &[], &[], &[], &transport_playing(0.01)).unwrap();
+        assert!((h.out_l[0] - 5360.0).abs() < 1e-3, "out_l[0]={}", h.out_l[0]);
+    }
+
+    /// A9 (r.md #8): 合成 wav (48000Hz) を非48kHz 出力デバイス (24000Hz) へ連続再生
+    /// 中も linear resample する (ratio = synth_sr / host_sr = 2.0)。
+    #[test]
+    fn continuous_playback_resamples_to_host_rate() {
+        let (mut h, result) = mk_half(24_000.0);
+        result.store(Some(Arc::new(SynthResult {
+            samples: Arc::new(ramp_buf(8192)),
+            sample_rate: 48_000,
+            samples_per_beat: 24_000.0, // 48000*60/120
+            note_offsets: Arc::new(HashMap::new()),
+        })));
+        // base = 0*spb + lead_in(5120)。 ratio 2.0 → out frame k = buf[5120 + 2k]。
+        h.process(64, &[], &[], &[], &[], &transport_playing(0.0)).unwrap();
+        assert!((h.out_l[1] - 5122.0).abs() < 1e-3, "out_l[1]={}", h.out_l[1]);
+        assert!((h.out_l[10] - 5140.0).abs() < 1e-3, "out_l[10]={}", h.out_l[10]);
+    }
+
+    /// 停止中の鍵盤プレビュー: note_on で該当 note 位置から free-run 再生し、
+    /// fade-in で declick、 buf 終端で自動停止する。
+    #[test]
+    fn preview_voice_on_note_when_stopped() {
+        let (mut h, result) = mk_half(48_000.0);
+        let mut offsets = HashMap::new();
+        offsets.insert(0, 0); // note 0 → buf offset 0
+        result.store(Some(Arc::new(SynthResult {
+            samples: Arc::new(ramp_buf(128)),
+            sample_rate: 48_000,
+            samples_per_beat: 24_000.0, // 48000*60/120
             note_offsets: Arc::new(offsets),
         })));
         let events = vec![TimedNoteEvent {
@@ -1055,42 +1161,14 @@ mod tests {
                 velocity: 127.0,
             },
         }];
+        // stopped transport → preview パス。
         h.process(64, &events, &[], &[], &[], &transport()).unwrap();
-        // out_l に値が乗っていること (sample[0] = 0.0 はゼロだが以降は非ゼロ)。
+        // 音が乗る (fade-in で振幅は下がるが非ゼロ)。
         assert!(h.out_l[1..64].iter().any(|&v| v != 0.0));
-        // voice が cursor を進めていること (ratio 1.0 → 64.0)。
-        assert_eq!(h.active_voices[0].cursor, 64.0);
-        // 次 process で残り 64 frame 流して voice 終了。
+        // cursor は fade に依らず ratio 1.0 で 64 進む。
+        assert_eq!(h.preview.as_ref().unwrap().cursor, 64.0);
+        // 次 process (note 無し) で残り 64 流して終端 → preview 破棄。
         h.process(64, &[], &[], &[], &[], &transport()).unwrap();
-        assert!(h.active_voices.is_empty());
-    }
-
-    /// A9 (r.md #8): 合成 wav (48000Hz) を非48kHz 出力デバイス (24000Hz) へ
-    /// linear resample する。
-    #[test]
-    fn voice_resamples_to_host_rate() {
-        let (mut h, result) = mk_half(24_000.0);
-        let samples: Vec<f32> = (0..256).map(|i| i as f32).collect();
-        let mut offsets = HashMap::new();
-        offsets.insert(0, 0);
-        result.store(Some(Arc::new(SynthResult {
-            samples: Arc::new(samples),
-            sample_rate: 48_000,
-            note_offsets: Arc::new(offsets),
-        })));
-        let events = vec![TimedNoteEvent {
-            time: 0,
-            event: crate::plugin_instance::NoteTransition::On { note_id: 0, key: 60, velocity: 127.0 },
-        }];
-        h.process(64, &events, &[], &[], &[], &transport()).unwrap();
-        // ratio 2.0 → 64 frame で source を 128 sample 消費。
-        assert!(
-            (h.active_voices[0].cursor - 128.0).abs() < 1e-9,
-            "cursor={}",
-            h.active_voices[0].cursor
-        );
-        // 出力 frame k = source pos 2k (整数 → frac 0 → samples[2k] = 2k)。
-        assert!((h.out_l[1] - 2.0).abs() < 1e-4, "out_l[1]={}", h.out_l[1]);
-        assert!((h.out_l[10] - 20.0).abs() < 1e-4, "out_l[10]={}", h.out_l[10]);
+        assert!(h.preview.is_none());
     }
 }

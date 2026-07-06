@@ -559,7 +559,9 @@ pub(super) fn draw_sections_lane<M: ?Sized + 'static>(
 ///    letterbox の黒帯背景としても兼用)。 選択でも fill は潰さない。
 /// 2. thumbnail = Some なら aspect-fit (黒帯 letterbox) で texture overlay (`HeavyCtx::push_textured_quad`)
 /// 3. name + (share clip なら) link glyph 描画 (`draw_clip_label`、 audio 経路と共通)
-/// 4. selected なら `push_selection_ring` の 2 重リング (明 + 暗) を最後に重ねる
+///
+/// 選択表示 (2 重リング) はこの関数では描かない。 `draw_selection_overlay` が cache + content
+/// の上に別レイヤで重ねる (r.md #20: 選択で thumbnail/プレビューを潰さないため)。
 ///
 /// M14 Phase 108 (daw_01 #080): share マーク (⇌) は「content 共有」 の意味で track kind と直交するため、
 /// video clip でも `share_group_color.is_some()` で link glyph を描く。
@@ -572,7 +574,6 @@ pub(super) fn draw_video_clip<M: ?Sized + 'static>(
     clip: &ClipView,
     style: &ArrangementStyle,
     lanes: Rect,
-    selected: bool,
 ) {
     let has_link = clip.share_group_color.is_some();
     // M14 Phase 114 (daw_01 #086): video clip も `clip.color` を唯一の fill source にする
@@ -580,17 +581,12 @@ pub(super) fn draw_video_clip<M: ?Sized + 'static>(
     // letterbox / loading 背景 `video_clip_loading` を使う (= 既存の非 share video clip と互換)。
     // thumbnail があればその上に aspect-fit で texture を重ねる (fill は letterbox の黒帯として残る)。
     // リンク識別は ⇌ glyph + #068 hover 強調が担う (track kind に依らず share マークが出る、 #080 不変)。
-    // fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
-    // `push_selection_ring` の 2 重リングで示し、 選択時は本体 border を消して
-    // リングへ一本化する (黄 clip でも選択が判別できる)。
+    // fill は常に clip 本来の色 (選択でも潰さない)。 選択表示 (2 重リング) は `draw_selection_overlay`
+    // が cache + content の上に別レイヤで重ねるので、 ここでは選択を扱わない (r.md #20)。
     let base_fill = clip.color.unwrap_or(style.video_clip_loading);
     // muted video clip も fill を暗く沈める。
     let fill = if clip.muted { muted_dim_fill(base_fill) } else { base_fill };
-    let (border, border_w) = if selected {
-        (Color::TRANSPARENT, 0.0)
-    } else {
-        (style.clip_border, style.clip_border_w)
-    };
+    let (border, border_w) = (style.clip_border, style.clip_border_w);
     // M14 Phase 89 (daw_01 #060): 名前色は fill 輝度から auto-contrast (selected の黄 fill → 暗文字、
     // loading の暗 fill → 明文字)。 video lane bg と合成した実効色で判定 (不透明 fill は no-op、
     // 半透明 fill は track_background_video と合成して実効色を得る)。
@@ -629,10 +625,6 @@ pub(super) fn draw_video_clip<M: ?Sized + 'static>(
     }
     // name + (share clip なら) link glyph。 thumbnail の **後** に描くので texture の上に乗る。
     draw_clip_label(hctx, r, &clip.name, has_link, text_color, style);
-    // 選択枠は最後に重ねて thumbnail / label の上に乗せる。
-    if selected {
-        push_selection_ring(hctx, r, style, style.clip_radius, Some(lanes));
-    }
 }
 
 pub(super) fn draw_clip<M: ?Sized + 'static>(
@@ -641,7 +633,6 @@ pub(super) fn draw_clip<M: ?Sized + 'static>(
     clip: &ClipView,
     style: &ArrangementStyle,
     lanes: Rect,
-    selected: bool,
     track_kind: TrackKind,
 ) {
     if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
@@ -651,7 +642,7 @@ pub(super) fn draw_clip<M: ?Sized + 'static>(
     // M14 Phase 108 (daw_01 #080): share_group_color は video clip でも honor する (Text / Image clip
     // の共有マーク)。 audio_edit のみ無視 (video clip では意味を持たない、 caller 責任)。
     if matches!(track_kind, TrackKind::Video) {
-        draw_video_clip(hctx, r, clip, style, lanes, selected);
+        draw_video_clip(hctx, r, clip, style, lanes);
         return;
     }
     // M14 Phase 114 (daw_01 #086): 静的な fill / border は **`clip.color` を唯一の source** にする。
@@ -659,17 +650,12 @@ pub(super) fn draw_clip<M: ?Sized + 'static>(
     // 役割を「リンク識別」 に絞り、 fill / border を一切上書きしない (= ⇌ glyph + #068 hover 強調
     // 専用)。 これにより「clip で色を選べば共有クリップ全部がその色になる」「トラックに揃えれば
     // その色になる」 が成立する (#019/#022 で hue fill が `color` を握り潰していた問題の解消)。
-    // fill は常に clip 本来の色 (選択でも潰さない)。 選択は末尾の
-    // `push_selection_ring` の 2 重リングで示し、 選択時は本体 border を消して
-    // リングへ一本化する (黄 clip でも選択が判別できる)。
+    // fill は常に clip 本来の色 (選択でも潰さない)。 選択表示 (2 重リング) は `draw_selection_overlay`
+    // が cache + content パスの上に別レイヤで重ねるので、 ここでは選択を扱わない (r.md #20)。
     let base_fill = clip.color.unwrap_or(style.clip_default_fill);
     // muted clip は fill を暗く沈めて「再生されない」 を示す。
     let fill = if clip.muted { muted_dim_fill(base_fill) } else { base_fill };
-    let (border, border_w) = if selected {
-        (Color::TRANSPARENT, 0.0)
-    } else {
-        (style.clip_border, style.clip_border_w)
-    };
+    let (border, border_w) = (style.clip_border, style.clip_border_w);
     // M14 Phase 89 (daw_01 #060): 名前 + link glyph 色を fill 輝度から auto-contrast。 不透明 fill は
     // no-op、 半透明 fill (alpha < 1) は lane bg (audio lane = `style.bg`) と合成した実効色で判定する。
     let text_color = clip_text_color_for(style, fill, style.bg);
@@ -697,10 +683,6 @@ pub(super) fn draw_clip<M: ?Sized + 'static>(
     // ロジックは video 経路と共通の `draw_clip_label` に集約 (M14 Phase 108、 daw_01 #080)。
     let has_link = clip.share_group_color.is_some();
     draw_clip_label(hctx, r, &clip.name, has_link, text_color, style);
-    // 選択枠を最後に重ねる (label の上、 clip 本来の色 fill の上)。
-    if selected {
-        push_selection_ring(hctx, r, style, style.clip_radius, Some(lanes));
-    }
 }
 
 pub(super) fn draw_clips<M: ?Sized + 'static>(
@@ -724,7 +706,7 @@ pub(super) fn draw_clips<M: ?Sized + 'static>(
                 continue;
             }
             let r = clip_to_rect(row_top, row_h, c, view, lanes);
-            draw_clip(hctx, r, c, style, lanes, false, t.kind);
+            draw_clip(hctx, r, c, style, lanes, t.kind);
         }
     }
 }
@@ -738,8 +720,14 @@ pub(super) fn draw_selection_overlay<M: ?Sized + 'static>(
     lanes: Rect,
     style: &ArrangementStyle,
 ) {
-    // M14 Phase 63f (#022): selected clip を `draw_clip(.., selected=true)` で上書き再描画。
-    // 共通 helper を使うので link glyph (share clip) は selection と独立に描画される。
+    // r.md #20: 選択は **リングのみ** を重ねる (旧: `draw_clip(.., selected=true)` で clip 全体を
+    // 再描画)。 base fill / label は cache (`draw_clips`) が、 波形 / MIDI ノート / video thumbnail の
+    // プレビューは content パス (`render.rs` の cached 外ブロック) が既に描いている。 ここで clip 全体を
+    // 再描画すると `draw_clip` の不透明 fill (`push_rect`) が content パスの上に来て、 選択クリップ
+    // だけプレビューが塗り潰される (S4b リファクタで content 描画を widget 内に移した際の regression)。
+    // fill は選択でも潰さない設計 (`draw_clip` のコメント参照)。 選択表示に必要なのは 2 重リング
+    // だけ (cache が selected=false で描いた 1px border は 2px リングが覆う。 label 色は fill 由来で
+    // 選択非依存なので cache 済みのもので正しい)。
     if selected.is_empty() {
         return;
     }
@@ -755,7 +743,10 @@ pub(super) fn draw_selection_overlay<M: ?Sized + 'static>(
                 continue;
             }
             let r = clip_to_rect(row_top, row_h, c, view, lanes);
-            draw_clip(hctx, r, c, style, lanes, true, t.kind);
+            if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
+                continue;
+            }
+            push_selection_ring(hctx, r, style, style.clip_radius, Some(lanes));
         }
     }
 }

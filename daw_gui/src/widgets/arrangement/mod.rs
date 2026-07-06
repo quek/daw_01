@@ -1100,7 +1100,10 @@ impl Default for ArrangementStyle {
             radius: 3.0,
             font_size: 11.0,
             text_color: theme::TEXT,
-            on_text_color: None,
+            // r.md #22: ON 色は高輝度の黄 (`SOLO`)。 明るい白文字 (`TEXT`) では「S」が埋もれる
+            // ので、 黄背景には暗文字を敷く (mixer/metronome の Solo と同じ `TEXT_ON_BRIGHT`)。
+            // M/R は ON 色が赤で白文字が読めるため `None` のまま。
+            on_text_color: Some(theme::TEXT_ON_BRIGHT),
         };
         // M14 Phase 68 (#040): R button (Record-arm)。 active = 鮮やかな赤、
         // off = mute / solo と同 neutral 灰。

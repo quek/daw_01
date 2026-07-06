@@ -244,11 +244,11 @@ pub(super) fn render_arrangement_heavy(
                                 );
                             }
                             ClipContentDraw::Midi { notes, len_beats } => {
-                                let clip_bg = if is_selected {
-                                    style_copy.clip_selected_fill
-                                } else {
-                                    c.color.unwrap_or(style_copy.clip_default_fill)
-                                };
+                                // r.md #20: ノート色のコントラストは **実際に塗られる背景色** で計算する。
+                                // 選択でも fill は clip 本来の色のまま (draw_selection_overlay はリングのみ)
+                                // なので、 旧来の is_selected → clip_selected_fill(黄) 前提は誤り
+                                // (既定色=暗青 clip を選択するとノートが暗背景に暗色で描かれ消えていた)。
+                                let clip_bg = c.color.unwrap_or(style_copy.clip_default_fill);
                                 draw_clip_midi_inner(
                                     hctx,
                                     r,

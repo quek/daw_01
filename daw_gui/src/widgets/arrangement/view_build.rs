@@ -9,7 +9,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use daw_ui_core::MeterScale;
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::AppData;
@@ -147,7 +146,12 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             muted: t.muted,
             solo: t.solo,
             armed: t.armed,
-            volume: MeterScale::default().amp_to_frac(t.volume),
+            // r.md #21: `ArrangementTrack.volume` は **amp ドメイン** (struct doc「1.0 で unity」、
+            // master 行 synthesize_master_track も 1.0、 consumer の run.rs は `amp_to_frac(t.volume)`
+            // で frac 位置に直す)。 ここで amp_to_frac すると run.rs 側と合わせて **二重変換** になり、
+            // +6dB へ上げたフェーダーが release で 0dB 位置へ部分的に戻っていた (drag 中は mouse frac
+            // 直描画なので露呈せず、 停止中の静的表示だけがずれる = 「スケールが違う」 症状)。 amp を素通し。
+            volume: t.volume,
             clips: t
                 .clips
                 .iter()
