@@ -121,6 +121,11 @@ pub(super) fn aspect_fit_rect(rect: Rect, tex_width: u32, tex_height: u32) -> Re
 /// clip 名の上パディング (px)。name は `r.y + CLIP_NAME_PAD_TOP` に描く。
 pub(super) const CLIP_NAME_PAD_TOP: f32 = 2.0;
 
+/// r.md #24: drag preview (中身入りコピー) の fill 半透明度。 元 clip 色の alpha に乗じて「動いて
+/// いるコピー」 と分かる薄さにする (中身の波形 / MIDI / thumbnail は上に重ねて視認性を保つ)。 元
+/// clip はその場に不透明のまま残るので、 薄い方が「掴んで動かしている複製」 と直感的に読める。
+pub(super) const DRAG_PREVIEW_FILL_ALPHA: f32 = 0.6;
+
 /// clip の中身 (波形 / MIDI ノートプレビュー) が始まる上インセット (px)。
 ///
 /// ラベル帯 (`CLIP_NAME_PAD_TOP` + 文字高 `style.clip_text_size` + 1px gap) の直下から
@@ -200,6 +205,10 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     lanes_x: f32,
     inset_top: f32,
     style: &ArrangementStyle,
+    // waveform widget の id 弁別子。 base 描画 (content path) は `"audio_clip_wf"`、 drag ghost は
+    // 別 tag を渡す。 `hctx.waveform` は id ごとに LOD 状態を持つので、 同一 (track, clip) の波形を
+    // 1 フレームで 2 度描く (元 clip + ghost) 場合に同 id だと state 衝突 → LOD が毎フレーム再構築される。
+    wf_id_tag: &'static str,
 ) {
     let inset_lr: f32 = 2.0;
     let mut view_rect = Rect {
@@ -254,7 +263,7 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
         render_mode: WaveformRenderMode::Auto,
         line_width_px: 1.0,
     };
-    let _ = hctx.waveform(("audio_clip_wf", key.track, key.clip), view_rect, source, view, wstyle);
+    let _ = hctx.waveform((wf_id_tag, key.track, key.clip), view_rect, source, view, wstyle);
 }
 
 /// S4b Phase C: 1 つの MIDI clip rect 内にノートプレビューを描く (旧 app 側
@@ -883,21 +892,29 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
     beat_delta: f64,
     track_delta: i32,
     min_len: f64,
+    // r.md #24: preview に中身 (波形 / MIDI) を描くための content map (content path と同じ SSoT)。
+    clip_content: &std::collections::HashMap<ClipKey, ClipContentDraw>,
 ) {
-    // M14 Phase 63e (#019): Ctrl / Ctrl+Shift drag は ghost を別色 + badge glyph に切替えて
-    // 「move / linked clone / independent clone」 の 3 種を視覚区別する。 Resize 中は Ctrl 関与
-    // なし (既存 selected_fill のまま)。 commit / overlay の判定はどちらも `nd.last_*` を真値と
-    // するので、 release frame の OS event 順序問題に依存せず一致する。
+    // r.md #24: drag preview は **掴んだ clip の中身入り半透明コピー** を描く (旧: 中身の無い不透明
+    // ghost が元 clip を覆い隠し、 press / drag 中に名前 / 波形 / MIDI が消える #24 の主因だった)。
+    // 元 clip はその場に不透明のまま残り (cached + content path)、 preview は薄いコピーとして重なる/
+    // 動くので「どれを掴んで動かしているか」 が中身ごと見える。
+    //
+    // M14 Phase 63e (#019): Ctrl / Ctrl+Shift drag は clone なので border 色 + badge glyph で
+    // 「move / linked clone / independent clone」 の 3 種を視覚区別する。 Resize 中は Ctrl 関与なし。
+    // commit / overlay の判定はどちらも `nd.last_*` を真値とするので、 release frame の OS event
+    // 順序問題に依存せず一致する。
     let is_move_clone = matches!(nd.kind, ClipDragKind::Move) && nd.last_ctrl;
-    let (fill, border, badge_glyph) = if is_move_clone {
+    let (clone_border, badge_glyph) = if is_move_clone {
         if nd.last_shift {
-            (style.clip_clone_indep_fill, style.clip_clone_indep_border, Some('+'))
+            (Some(style.clip_clone_indep_border), Some('+'))
         } else {
-            (style.clip_clone_linked_fill, style.clip_clone_linked_border, Some('⇌'))
+            (Some(style.clip_clone_linked_border), Some('⇌'))
         }
     } else {
-        (style.clip_selected_fill, style.clip_selected_border, None)
+        (None, None)
     };
+    let inset = clip_content_inset_top(style);
 
     // master row prepend 済みなら drop 先下限は 1 (release commit と同じ guard)。
     let min_idx = usize::from(
@@ -907,22 +924,6 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         let (start, len, new_idx) = drag_preview_geometry(
             *a, nd.kind, beat_delta, track_delta, min_idx, n_tracks, min_len,
         );
-        let preview_clip = ClipView {
-            id: a.key.clip,
-            start_beat: start,
-            len_beats: len,
-            name: Arc::from(""),
-            color: None,
-            share_group_color: None,
-            audio_edit: None,
-            // M14 Phase 72 (#044): drag preview は overlay 用 (実 clip データを表示しない)、
-            // thumbnail は元 clip 側で描画済 (cached 内)、 preview は color + border のみ。
-            thumbnail: None,
-            // drag preview は transient なので連動ハイライト対象外 (元 clip 側 overlay で描画済)。
-            in_active_group: false,
-            // drag ghost は半透明プレビューなので mute ハッチは出さない (元 clip 側で描画済)。
-            muted: false,
-        };
         // drag_preview_geometry が n_tracks 範囲内に clamp 済なので tops から必ず取れる前提。
         // 万一範囲外なら preview を skip (clip 描画消失だけで panic はしない、 defensive)。
         let Some(row_top) = tops.get(new_idx).copied() else {
@@ -932,19 +933,68 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         let ghost_row_h = visible_tracks
             .get(new_idx)
             .map_or(view.track_row_h, |t| effective_track_row_h(t, view.track_row_h));
+        // 元 clip の実データ (kind / 色 / 名前 / thumbnail) を lookup (中身入りコピーの source)。
+        // drag 中に clip が消える等の異常時は選択色でフォールバック (content なしの薄い枠)。
+        let src = visible_tracks
+            .iter()
+            .find(|t| t.id == a.key.track)
+            .and_then(|t| t.clips.iter().find(|c| c.id == a.key.clip).map(|c| (t.kind, c)));
+        let src_color =
+            src.map_or(style.clip_selected_fill, |(_, c)| c.color.unwrap_or(style.clip_default_fill));
+        // preview fill = 元 clip 色を半透明化 (中身が透けて「コピー」 と分かる)。 元色が既に半透明
+        // (share clip 等) なら更に薄くなるよう alpha を乗算する。
+        let preview_fill = src_color.with_alpha(src_color.a * DRAG_PREVIEW_FILL_ALPHA);
+        let src_kind = src.map_or(TrackKind::Audio, |(k, _)| k);
+        let preview_clip = ClipView {
+            id: a.key.clip,
+            start_beat: start,
+            len_beats: len,
+            name: src.map_or_else(|| Arc::from(""), |(_, c)| c.name.clone()),
+            color: Some(preview_fill),
+            // 共有マーク / 連動ハイライトは transient な preview では出さない (元 clip 側で描画済)。
+            share_group_color: None,
+            audio_edit: None,
+            // video / image / text clip の thumbnail はコピーにも見せる (それが中身なので)。
+            thumbnail: src.and_then(|(_, c)| c.thumbnail),
+            in_active_group: false,
+            // drag ghost は半透明プレビューなので mute ハッチは出さない (元 clip 側で描画済)。
+            muted: false,
+        };
         let r = clip_to_rect(row_top, ghost_row_h, &preview_clip, view, lanes);
         if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
             continue;
         }
-        hctx.push_rect(RectCommand {
-            rect: r,
-            fill,
-            border,
-            border_width: style.clip_selected_border_w,
-            radius: [style.clip_radius; 4],
-            clip_rect: Some(lanes),
-        });
-        // ghost rect 左上に badge glyph (`⇌` / `+`) を 1 文字描画。 rect が小さすぎるときは省略。
+        // (1) clip クローム (半透明 fill + border + 名前 + video thumbnail) を base 描画と同じ経路で。
+        draw_clip(hctx, r, &preview_clip, style, lanes, src_kind);
+        // (2) 中身 (波形 / MIDI) を上に重ねる。 波形は ghost 専用 id で LOD state 衝突を避ける
+        //     (元 clip の波形と同一フレームに 2 度描くため。 `draw_clip_waveform_inner` 参照)。
+        match clip_content.get(&a.key) {
+            Some(ClipContentDraw::Audio { buffer, start_frames, end_frames, source_id }) => {
+                draw_clip_waveform_inner(
+                    hctx, a.key, r, buffer, *start_frames, *end_frames, *source_id, true, lanes.x,
+                    inset, style, "drag_ghost_wf",
+                );
+            }
+            Some(ClipContentDraw::Midi { notes, len_beats }) => {
+                // ノート色コントラストは実際に塗る preview_fill (半透明) を背景として計算 (#20 と同 idiom)。
+                draw_clip_midi_inner(hctx, r, notes, *len_beats, preview_fill, style, lanes.x, inset);
+            }
+            None => {}
+        }
+        // (3) 枠: move は選択 2 重リング、 clone は clone 色の枠 (中身は上で描画済なので枠のみ差替え)。
+        if let Some(cb) = clone_border {
+            hctx.push_rect(RectCommand {
+                rect: r,
+                fill: Color::TRANSPARENT,
+                border: cb,
+                border_width: style.clip_selected_border_w,
+                radius: [style.clip_radius; 4],
+                clip_rect: Some(lanes),
+            });
+        } else {
+            push_selection_ring(hctx, r, style, style.clip_radius, Some(lanes));
+        }
+        // clone のときだけ rect 左上に badge glyph (`⇌` / `+`)。 rect が小さすぎるときは省略。
         if let Some(g) = badge_glyph
             && r.w > style.clip_clone_badge_size + 4.0
             && r.h > style.clip_clone_badge_size + 2.0

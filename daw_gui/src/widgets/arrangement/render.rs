@@ -241,6 +241,7 @@ pub(super) fn render_arrangement_heavy(
                                     lanes.x,
                                     inset,
                                     &style_copy,
+                                    "audio_clip_wf",
                                 );
                             }
                             ClipContentDraw::Midi { notes, len_beats } => {
@@ -300,6 +301,7 @@ pub(super) fn render_arrangement_heavy(
                     bd,
                     td,
                     drag_overlay_min_len,
+                    &clip_content,
                 );
             }
             // M14 Phase 63k (#025): audio_drag ghost overlay (drag 中の dB / fade preview + label)。

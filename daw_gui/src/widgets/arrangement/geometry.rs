@@ -438,6 +438,12 @@ pub fn volume_from_mouse_x(mouse_x: f32, band_x: f32, band_w: f32) -> f32 {
 /// **同じ閾値**を使うことで preview と commit の発火条件が一致する。
 pub(super) const REORDER_DRAG_THRESHOLD_PX: f32 = 16.0;
 
+/// clip press を「click か drag か」で分ける jitter slop (px、 manhattan `|dx|+|dy|`)。 これ未満の
+/// 移動で release すると Move は短 click (= 選択切替) に demote される (run.rs の `demote`)。 mouse
+/// jitter を ignore しつつ「ちょっとずらす」 操作は drag として扱う程度の小ささ。 旧実装の 16px 閾値は
+/// 過剰で、 release で元位置 (= grid 上) に戻る「grid に飛ぶ」 symptom の主因だった。
+pub(super) const CLIP_CLICK_DRAG_SLOP_PX: f32 = 4.0;
+
 /// M14 Phase 127 (daw_01 #105): section resize / create の **sanity floor** 拍 (= 異常入力で len が
 /// 0 / 負にならない最小値)。 実用 clamp (隣接帯への食い込み防止 / 重複正規化) は caller の
 /// `normalize_sections` が行うので、 widget はこの floor のみ (既存「widget は snap + sanity floor、

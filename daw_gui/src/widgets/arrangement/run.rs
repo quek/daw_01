@@ -1390,9 +1390,10 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 let dx = nd.last_mouse.0 - nd.anchor_mouse.0;
                 let dy = nd.last_mouse.1 - nd.anchor_mouse.1;
                 let dist = dx.abs() + dy.abs();
-                // 短 click 化 (drag → click 格下げ) の閾値は **mouse jitter を ignore する程度** (4px) に
-                // 抑える。 旧実装の 16px 閾値は過剰で、 user が「ちょっとずらす」 操作も吸収して
-                // しまい release で元位置 (= 通常 grid 上) に戻る → 「grid に飛ぶ」 symptom の主因。
+                // 短 click 化 (drag → click 格下げ) の閾値は **mouse jitter を ignore する程度**
+                // (`CLIP_CLICK_DRAG_SLOP_PX`) に抑える。 旧実装の 16px 閾値は過剰で、 user が「ちょっと
+                // ずらす」 操作も吸収してしまい release で元位置 (= 通常 grid 上) に戻る → 「grid に飛ぶ」
+                // symptom の主因。
                 // 適用条件:
                 //   - **Resize (Left/Right)** は閾値関係なく常に commit (resize handle 上の click は
                 //     意味がない、 短 drag でも長さ変更を反映すべき)。
@@ -1400,7 +1401,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 //     区別が必要なのは Move のみ (click = selection 切替、 drag = 移動)。
                 //   - **Alt 押下中** は Move でも閾値 skip (Alt は raw 微調整の明示意図)。
                 let is_move = matches!(nd.kind, ClipDragKind::Move);
-                let demote = is_move && !nd.last_alt && dist < 4.0;
+                let demote = is_move && !nd.last_alt && dist < CLIP_CLICK_DRAG_SLOP_PX;
                 if demote {
                     (None, Some((nd.last_mouse, nd.last_ctrl, nd.last_shift)))
                 } else {
@@ -1613,6 +1614,11 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         // drag overlay delta (last_mouse ベース、release と一貫)。
         // M14 Phase 63j (#024): `beat_per_px` / `zoom_x_px_per_beat` は関数頭で計算済 (press 振り分けの
         // playhead seek snap でも使うため)。 ここでは shadow せず再利用する。
+        // r.md #24: overlay は press 直後 (delta=0) から出す (= mouse down で掴んだ clip が
+        // 選択枠でハイライトされる)。 press 中に中身 (名前 / 波形 / MIDI) が消えないのは
+        // `draw_drag_preview` が **中身入りの半透明コピー** を描くようにしたため (旧: 中身の無い
+        // 不透明 ghost が元 clip を覆い隠していた = #24 の主因)。 閾値ゲートは張らない
+        // (張ると mouse down のハイライトが消える)。
         let clip_drag_overlay: Option<(ClipDragSession, f64, i32)> = clip_drag_session
             .as_ref()
             .map(|nd| {
