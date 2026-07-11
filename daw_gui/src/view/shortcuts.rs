@@ -97,8 +97,8 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.toggle_track_solo", keys: &["S"], category: ShortcutCategory::Track, description: "カーソル直下のトラックをソロ切替", hidden: false },
     ShortcutDef { name: "daw.toggle_mute", keys: &["Q"], category: ShortcutCategory::Track, description: "選択/カーソル下のクリップ・ノートをミュート切替", hidden: false },
     // ----- クリップ・ノート -----
-    ShortcutDef { name: "daw.duplicate_clip_shared", keys: &["D"], category: ShortcutCategory::ClipNote, description: "クリップを複製 (共有)。ノート選択中はノート複製", hidden: false },
-    ShortcutDef { name: "daw.duplicate_clip_unique", keys: &["Alt+D"], category: ShortcutCategory::ClipNote, description: "クリップを複製 (独立コピー)", hidden: false },
+    ShortcutDef { name: "daw.duplicate_clip_shared", keys: &["D"], category: ShortcutCategory::ClipNote, description: "クリップ/トラックを複製 (共有・リンク)。ノート選択中はノート複製", hidden: false },
+    ShortcutDef { name: "daw.duplicate_clip_unique", keys: &["Alt+D"], category: ShortcutCategory::ClipNote, description: "クリップ/トラックを複製 (独立コピー)", hidden: false },
     ShortcutDef { name: "daw.split_clip_at_cursor", keys: &["E"], category: ShortcutCategory::ClipNote, description: "カーソル位置でクリップを分割", hidden: false },
     ShortcutDef { name: "daw.split_clip_at_cursor_no_snap", keys: &["Alt+E"], category: ShortcutCategory::ClipNote, description: "クリップを分割 (スナップ無効)", hidden: false },
     ShortcutDef { name: "daw.glue_selected_clips", keys: &["J"], category: ShortcutCategory::ClipNote, description: "選択した隣接クリップを 1 つに結合", hidden: false },

@@ -1465,6 +1465,11 @@ pub enum DeferredEdit {
     /// `pending_clipboard_write` に積んでから各トラックを削除する。`Deferred` 経由なので
     /// 削除前に undo snapshot が積まれ、Ctrl+Z 1 回で復元できる。
     CutTracks { track_ids: Vec<u32> },
+    /// トラック複製 (r.md #30)。plugin state を Song に書き戻してから serialize +
+    /// 独立/リンク複製するので、 複製先 device の初期 state が最新 knob を反映する
+    /// (copy → paste と同じ理由で deferred)。`linked=true` はクリップ中身を元と
+    /// content_id 共有、 `false` は独立コピー。
+    DuplicateTracks { track_ids: Vec<u32>, linked: bool },
 }
 
 /// builtin VOICEVOX (歌唱/読み上げ) 合成の 1 plugin 分の状態。

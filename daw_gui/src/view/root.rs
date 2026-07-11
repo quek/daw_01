@@ -1095,14 +1095,22 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // Ctrl+D 流、 Ctrl+drag と同じセマンティクス)。 複製は全選択になり連打で
     // 後方連鎖。 selected が空なら no-op。
     if ui.take_shortcut("daw.duplicate_clip_shared") {
-        // ピアノロール上 + ノート選択中なら D = ノート複製。それ以外 (アレンジ文脈
-        // / ピアノロールでもノート未選択) は選択中の MIDI/Audio/Vocal clip と
-        // automation clip の両方を同時に共有複製 (Ableton/REAPER 流)。
-        if is_pianoroll_active && !app.selection.selected_notes.is_empty() {
+        // 対象面は copy/cut/delete と同じ last-wins (`edit_surface`)。トラック面なら
+        // トラックをリンク複製 (D = 共有、 クリップ複製と同規約)。 それ以外は従来通り。
+        if matches!(edit_surface(app, is_pianoroll_active), Some(EditSurface::Tracks)) {
+            let ids = app.selection.selected_track_ids.clone();
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::DuplicateTracksShared(ids));
+            }));
+        } else if is_pianoroll_active && !app.selection.selected_notes.is_empty() {
+            // ピアノロール上 + ノート選択中なら D = ノート複製。
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::DuplicateSelectedNotes);
             }));
         } else {
+            // それ以外 (アレンジ文脈 / ピアノロールでもノート未選択) は選択中の
+            // MIDI/Audio/Vocal clip と automation clip の両方を同時に共有複製
+            // (Ableton/REAPER 流)。
             let midi_sources: Vec<crate::app::ClipRef> = app.selected_clip_refs();
             let automation_sources: Vec<common::model::AutomationClipKey> =
                 app.selection.selected_automation_clips.clone();
@@ -1117,17 +1125,25 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
     if ui.take_shortcut("daw.duplicate_clip_unique") {
-        let midi_sources: Vec<crate::app::ClipRef> = app.selected_clip_refs();
-        let automation_sources: Vec<common::model::AutomationClipKey> =
-            app.selection.selected_automation_clips.clone();
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if !midi_sources.is_empty() {
-                app.handle_event(AppEvent::DuplicateClipsUnique(midi_sources));
-            }
-            if !automation_sources.is_empty() {
-                app.handle_event(AppEvent::DuplicateAutomationClipsUnique(automation_sources));
-            }
-        }));
+        // トラック面なら Alt+D = トラックを独立複製 (クリップ複製と同規約)。
+        if matches!(edit_surface(app, is_pianoroll_active), Some(EditSurface::Tracks)) {
+            let ids = app.selection.selected_track_ids.clone();
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::DuplicateTracksUnique(ids));
+            }));
+        } else {
+            let midi_sources: Vec<crate::app::ClipRef> = app.selected_clip_refs();
+            let automation_sources: Vec<common::model::AutomationClipKey> =
+                app.selection.selected_automation_clips.clone();
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                if !midi_sources.is_empty() {
+                    app.handle_event(AppEvent::DuplicateClipsUnique(midi_sources));
+                }
+                if !automation_sources.is_empty() {
+                    app.handle_event(AppEvent::DuplicateAutomationClipsUnique(automation_sources));
+                }
+            }));
+        }
     }
 
     // ----- Clip rename (F2) -------------------------------------------------

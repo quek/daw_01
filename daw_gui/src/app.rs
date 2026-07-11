@@ -953,6 +953,8 @@ impl AppData {
             }
             AppEvent::RemoveLastTrack => self.action_remove_last_track(),
             AppEvent::DeleteTrack(idx) => self.delete_track(idx),
+            AppEvent::DuplicateTracksShared(track_ids) => self.duplicate_tracks(track_ids, true),
+            AppEvent::DuplicateTracksUnique(track_ids) => self.duplicate_tracks(track_ids, false),
             AppEvent::MoveTrackUp(idx) => self.swap_tracks(idx, idx.saturating_sub(1)),
             AppEvent::MoveTrackDown(idx) => self.swap_tracks(idx, idx + 1),
             AppEvent::ReorderTracks(order) => self.reorder_tracks(&order),

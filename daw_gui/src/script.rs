@@ -454,6 +454,11 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             1,
         )
         .function(
+            NativeFunction::from_fn_ptr(daw_duplicate_tracks),
+            js_string!("duplicateTracks"),
+            2,
+        )
+        .function(
             NativeFunction::from_fn_ptr(daw_set_hover_clip),
             js_string!("setHoverClip"),
             1,
@@ -1060,6 +1065,27 @@ fn daw_set_selection(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
             refs.iter().filter_map(|r| host.app.clip_key_of(*r)).collect();
         host.app.selection.selected_clip = keys.last().copied();
         host.app.selection.selected_clips = keys;
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.duplicateTracks(idsJson, linked)` — r.md #30 のトラック複製を production の
+/// 右クリックメニュー / D・Alt+D と同じ AppEvent 経路で発火する。`idsJson` は複製対象
+/// の track id 配列 (`[1,4]`)、 `linked=true` はリンク複製 (D 相当)、 `false` は独立複製
+/// (Alt+D 相当)。selected_track_ids を設定してから dispatch する (GUI の選択状態を模倣)。
+fn daw_duplicate_tracks(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let ids_json = arg_to_string(args, 0, ctx)?;
+    let ids: Vec<u32> = serde_json::from_str(&ids_json)
+        .map_err(|e| js_native(format!("duplicateTracks: parse ids: {e}")))?;
+    let linked = args.get_or_undefined(1).to_boolean();
+    with_host(|host| {
+        host.app.selection.selected_track_ids = ids.clone();
+        let ev = if linked {
+            AppEvent::DuplicateTracksShared(ids)
+        } else {
+            AppEvent::DuplicateTracksUnique(ids)
+        };
+        host.app.handle_event(ev);
     });
     Ok(JsValue::undefined())
 }
