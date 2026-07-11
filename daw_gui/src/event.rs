@@ -1064,11 +1064,11 @@ pub enum AppEvent {
     /// to 4 GB §7.2) don't block the UI.
     ImportAudio {
         paths: Vec<PathBuf>,
-        /// drag&drop で drop position から計算された target track index
-        /// (= arrangement view の y 座標から). `None` なら handler 側で
-        /// `cursor_track_index().unwrap_or(0)` にフォールバック (= File
-        /// menu / 起動 dialog 経由の場合は位置情報がないため)。
-        target_track_idx: Option<u32>,
+        /// クリップを置く track の決定方法 (arrangement drop / dialog の起点)。
+        /// `Track(idx)` = drop が乗った既存 track、`NewTrackBottom` = track の
+        /// 無い下の余白 drop → 一番下に新規 track (r.md #31)、`NoHint` = File
+        /// menu / dialog (位置情報なし) → cursor track fallback。
+        target: ImportTrackTarget,
         /// drag&drop の drop X 位置から計算した beat (snap 済み)。 生成する
         /// clip をこの beat に置く (= ドロップしたカーソル位置に貼る)。 `None`
         /// なら handler 側で playhead にフォールバック (= dialog / File menu 経由)。
@@ -1101,15 +1101,14 @@ pub enum AppEvent {
     /// v13 (`docs/plan_image_overlay.md` §P2): import one or more
     /// image files (PNG / JPEG / WebP / static), allocating an
     /// `ImageSource` per file and a Clip holding the image as a PiP
-    /// overlay. `target_track_idx`: drag&drop の drop 位置から計算した
-    /// track index。 既存 track を指していればその track に貼り付け、
-    /// track が無い領域 (= 範囲外 index) / dialog 経由 (`None`) なら
-    /// arrangement 先頭に新規 track を作って貼る。
+    /// overlay. `target`: 既存 track を指していればその track に貼り付け、
+    /// track の無い下の余白 drop / dialog 経由なら arrangement の
+    /// 一番下に新規 track を作って貼る (r.md #31)。
     /// Image clips default to aspect-fit PiP; the user shrinks /
     /// positions them in P5 drag handle UI or P4 inspector.
     ImportImage {
         paths: Vec<PathBuf>,
-        target_track_idx: Option<u32>,
+        target: ImportTrackTarget,
         /// drag&drop の drop X 位置から計算した beat (snap 済み)。 生成する
         /// image clip をこの beat に置く。 `None` なら playhead / beat 0 に
         /// フォールバック (= dialog / File menu 経由)。

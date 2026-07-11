@@ -365,8 +365,8 @@ impl AppData {
             }
             FileDialogKind::ImportAudio => {
                 if !paths.is_empty() {
-                    // dialog 経由は位置情報がないので target = None (cursor / playhead)。
-                    self.action_import_audio(paths, None, None);
+                    // dialog 経由は位置情報がないので NoHint (cursor track / playhead)。
+                    self.action_import_audio(paths, ImportTrackTarget::NoHint, None);
                 }
             }
             FileDialogKind::ImportVideo => {
@@ -376,7 +376,8 @@ impl AppData {
             }
             FileDialogKind::ImportImage => {
                 if !paths.is_empty() {
-                    self.action_import_image(paths, None, None);
+                    // dialog 経由は位置情報がないので NoHint (= 一番下に新規 track)。
+                    self.action_import_image(paths, ImportTrackTarget::NoHint, None);
                 }
             }
             FileDialogKind::AddAudioEvent {

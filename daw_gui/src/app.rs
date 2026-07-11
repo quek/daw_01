@@ -1468,8 +1468,8 @@ impl AppData {
             AppEvent::ExportMidi => {
                 self.action_export_midi();
             }
-            AppEvent::ImportAudio { paths, target_track_idx, target_beat } => {
-                self.action_import_audio(paths, target_track_idx, target_beat);
+            AppEvent::ImportAudio { paths, target, target_beat } => {
+                self.action_import_audio(paths, target, target_beat);
             }
             AppEvent::OpenImportAudioDialog => {
                 self.action_open_import_audio_dialog();
@@ -1493,8 +1493,8 @@ impl AppData {
                         "Video import は Windows 専用 (WMF 経由) です".into();
                 }
             }
-            AppEvent::ImportImage { paths, target_track_idx, target_beat } => {
-                self.action_import_image(paths, target_track_idx, target_beat);
+            AppEvent::ImportImage { paths, target, target_beat } => {
+                self.action_import_image(paths, target, target_beat);
             }
             AppEvent::OpenImportImageDialog => {
                 self.action_open_import_image_dialog();
