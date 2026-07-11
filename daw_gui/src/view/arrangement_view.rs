@@ -9,7 +9,7 @@ use daw_ui_core::{ColorPickerStyle, Edit, ScrubableNumberStyle, ToggleButtonStyl
 use daw_ui_renderer::{Color, Rect, RectCommand};
 use crate::theme;
 
-use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget};
+use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget, ImportTrackTarget};
 use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
 
@@ -716,7 +716,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 「Track9 にドロップしても新規 track が作られる」バグの修正)。 lanes 側
         // drop でも各行の Y レンジは header と共通なので Y のみで判定する。 当たった
         // track_id を song.tracks の index に変換し、 master 行 (song.tracks に居ない)
-        // や、 どの行にも当たらない (= track の無い下の余白) は None → 新規 track 経路。
+        // や、 どの行にも当たらない (= track の無い下の余白) は `NewTrackBottom` =
+        // 一番下に新規 track を作って貼る (r.md #31: 以前は audio=cursor/先頭 track・
+        // image=一番上 insert とバラバラだったのを「ドロップ位置どおり一番下」へ統一)。
         //
         // docs/plan_video.md P2: 同じ drop 内で audio file と video file が
         // 混在する場合は extension で partition して個別 AppEvent を発火する。
@@ -725,9 +727,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // import パイプラインに流す (= `common::audio_decode` が WAV / AIFF /
         // FLAC / MP3 / OGG / M4A をコンテンツ判定でデコード、 r.md #19)。
         let drop_y = drop.position.1;
-        let target_track_idx =
-            track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, drop_y)
-                .map(|idx| idx as u32);
+        let target =
+            match track_index_at_y(&resp.track_header_rects, &app.song_doc.song().tracks, drop_y) {
+                Some(idx) => ImportTrackTarget::Track(idx as u32),
+                None => ImportTrackTarget::NewTrackBottom,
+            };
         // ドロップ X 位置 → beat。 import で生成する clip を「先頭 (playhead) では
         // なくドロップしたカーソル位置」 に置く。 hover-beat (下) と同じ pixel→beat
         // 変換 (canvas 左端基準) + 既存 snap 設定を適用。 header 上に落とした等で
@@ -760,7 +764,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ImportAudio {
                     paths,
-                    target_track_idx,
+                    target,
                     target_beat,
                 });
             }));
@@ -776,7 +780,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ImportImage {
                     paths,
-                    target_track_idx,
+                    target,
                     target_beat,
                 });
             }));

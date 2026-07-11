@@ -1637,17 +1637,40 @@ pub(crate) fn aspect_fit_pip_rect(
     }
 }
 
+/// media import (audio / image) 時にクリップを置く track の決定方法。
+/// drag&drop / dialog の「起点」を型で表す (`Option<u32>` の `None` が
+/// 「空きスペース drop」と「dialog (位置情報なし)」を区別できず両者を
+/// 一番上への新規 track にまとめていた曖昧さを解消。r.md #31)。
+///
+/// arrangement の drop 位置 → track の解決 (`track_index_at_y`) と、File
+/// メニュー / dialog 経由 (位置情報なし) の 3 通りを、それぞれ別 variant で運ぶ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportTrackTarget {
+    /// drop が既存 track に当たった (arrangement view が y 座標から解決した
+    /// `song.tracks` index)。その track にクリップを貼る。
+    Track(u32),
+    /// track の無い下の余白に drop された → 一番下 (`song.tracks` 末尾) に
+    /// 新規 track を作ってクリップを貼る (r.md #31)。song が空でもここで
+    /// 最初の track を作れる。
+    NewTrackBottom,
+    /// 位置情報なし (File メニュー / dialog 経由)。handler ごとの既定に従う
+    /// (audio = cursor track fallback、image = 一番下に新規 track)。
+    NoHint,
+}
+
 /// 画像ドロップの配置先を解決する (`action_import_image` の core 判定)。
-/// `target_track_idx` は arrangement の drop 位置 (`position.y / row_h`) から
-/// 算出した track index。
-/// - `Some(idx)` (= 既存 track を指す): その track に画像 clip を貼る。
-/// - `None`: 新規 track を作って貼る。範囲外 index (= track の無い下の領域への
-///   ドロップ) と入力 `None` (= dialog 経由で位置情報なし) はどちらもこちら。
-pub(crate) fn resolve_image_drop_target(target_track_idx: Option<u32>, n_tracks: usize) -> Option<usize> {
-    target_track_idx.and_then(|i| {
-        let i = i as usize;
-        (i < n_tracks).then_some(i)
-    })
+/// - `Some(idx)` (= `Track(idx)` で既存 track を指す): その track に画像 clip を貼る。
+/// - `None`: 一番下に新規 track を作って貼る。track の無い下の領域への drop
+///   (`NewTrackBottom`)、範囲外 index の `Track`、dialog 経由 (`NoHint`) は
+///   どれもこちら (= r.md #31 で「一番上への insert」を廃し全て末尾 push へ)。
+pub(crate) fn resolve_image_drop_target(target: ImportTrackTarget, n_tracks: usize) -> Option<usize> {
+    match target {
+        ImportTrackTarget::Track(i) => {
+            let i = i as usize;
+            (i < n_tracks).then_some(i)
+        }
+        ImportTrackTarget::NewTrackBottom | ImportTrackTarget::NoHint => None,
+    }
 }
 
 /// time-stretch で clip-local の (start, len) を新 clip 長へ写像する

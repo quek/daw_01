@@ -69,7 +69,7 @@ impl AppData {
     pub(crate) fn action_import_audio(
         &mut self,
         paths: Vec<PathBuf>,
-        target_track_idx: Option<u32>,
+        target: ImportTrackTarget,
         target_beat: Option<f64>,
     ) {
         if paths.is_empty() {
@@ -80,28 +80,52 @@ impl AppData {
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
-        // 引数 `target_track_idx` (= drag&drop の drop 位置から arrangement
-        // view が計算) を最優先、 None なら cursor_track_index にフォール
-        // バック (= File menu / dialog 経由)、 さらに無いときは 0。 範囲外
-        // (= track 数を超える) 値は最後の track に clamp。
+        // 配置先 track の決定 (r.md #31):
+        //  - Track(idx): drop が乗った既存 track (範囲外は末尾 track に clamp)。
+        //  - NewTrackBottom: track の無い下の余白 drop → 一番下に新規 track を
+        //    1 本作って積む (下記ループ内で lazily 生成)。song が空でも作れる。
+        //  - NoHint: File menu / dialog (位置情報なし) → cursor track fallback (無ければ 0)。
+        // `fixed_dest` = 既存 track を指す確定 index (Track/NoHint)。NewTrackBottom は
+        // None で、初回ファイルの edit_song 内で一番下に track を新設する。既存 track を
+        // 要する Track/NoHint で track が 0 本なら取り込めない (NewTrackBottom は除く)。
         let n_tracks = self.song_doc.song().tracks.len();
-        let target_track_idx: usize = target_track_idx
-            .map(|i| (i as usize).min(n_tracks.saturating_sub(1)))
-            .or_else(|| self.cursor_track_index())
-            .unwrap_or(0);
+        let fixed_dest: Option<usize> = match target {
+            ImportTrackTarget::NewTrackBottom => None,
+            ImportTrackTarget::Track(i) => {
+                if n_tracks == 0 {
+                    self.ui_ephemeral.status_message =
+                        "Audio import: 配置先のトラックが無いため取り込めません".to_string();
+                    return;
+                }
+                Some((i as usize).min(n_tracks - 1))
+            }
+            ImportTrackTarget::NoHint => {
+                if n_tracks == 0 {
+                    self.ui_ephemeral.status_message =
+                        "Audio import: 配置先のトラックが無いため取り込めません".to_string();
+                    return;
+                }
+                Some(self.cursor_track_index().unwrap_or(0).min(n_tracks - 1))
+            }
+        };
+        // NewTrackBottom で新設する track 名は最初のファイル名 (stem) を使う。
+        let new_track_name = paths
+            .first()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Audio")
+            .to_string();
+
         // drag&drop の drop 位置 (`target_beat`) を最優先、 無ければ playhead。
         let start_beat_seed: f64 =
             target_beat.unwrap_or(self.transport.playhead_beat.unwrap_or(0.0) as f64);
-        if self.song_doc.song().tracks.is_empty() {
-            self.ui_ephemeral.status_message =
-                "Audio import: 配置先のトラックが無いため取り込めません".to_string();
-            return;
-        }
-
         let bpm = self.song_doc.song().bpm;
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut next_start_beat = start_beat_seed.max(0.0);
+        // NewTrackBottom: 最初の成功ファイルで作った bottom track の index を覚え、
+        // 2 ファイル目以降は同じ track に順送りで積む (track + clip1 が 1 undo step)。
+        let mut bottom_idx: Option<usize> = None;
 
         for path in paths {
             let imported = match import_audio::import_one(&path, project_dir.as_deref()) {
@@ -115,7 +139,9 @@ impl AppData {
             let length_beats =
                 frames_to_beats(imported.buffer.frames, imported.buffer.sample_rate, bpm);
 
-            let Some(source_id) = self.edit_song(|song| {
+            let prev_bottom = bottom_idx;
+            let track_name = new_track_name.clone();
+            let Some((source_id, dest_idx)) = self.edit_song(|song| {
                 let source_id = song.alloc_audio_source_id();
                 song.media.audio_sources.insert(source_id, imported.source);
 
@@ -137,7 +163,23 @@ impl AppData {
                     imported.display_name.clone(),
                 );
 
-                let track = &mut song.tracks[target_track_idx];
+                // 配置先 track index を確定。 NewTrackBottom は初回だけ一番下に
+                // 空 track を push してその index を使う (以降は prev_bottom を再利用)。
+                let dest_idx = match fixed_dest {
+                    Some(idx) => idx,
+                    None => match prev_bottom {
+                        Some(idx) => idx,
+                        None => {
+                            let track_id = song.alloc_track_id();
+                            song.tracks.push(track_with(|t| {
+                                t.id = track_id;
+                                t.name = track_name;
+                            }));
+                            song.tracks.len() - 1
+                        }
+                    },
+                };
+                let track = &mut song.tracks[dest_idx];
                 let new_clip_id = track.alloc_clip_id();
                 track.clips.push(Clip {
                     id: new_clip_id,
@@ -148,10 +190,13 @@ impl AppData {
                     auto_lipsync: false,
                     ..Default::default()
                 });
-                source_id
+                (source_id, dest_idx)
             }) else {
                 return;
             };
+            if fixed_dest.is_none() {
+                bottom_idx = Some(dest_idx);
+            }
             self.media.audio_source_cache.insert(source_id, imported.buffer.clone());
             next_start_beat += length_beats;
             imported_ok += 1;
@@ -395,7 +440,7 @@ impl AppData {
     pub(crate) fn action_import_image(
         &mut self,
         paths: Vec<PathBuf>,
-        target_track_idx: Option<u32>,
+        target: ImportTrackTarget,
         target_beat: Option<f64>,
     ) {
         if paths.is_empty() {
@@ -406,12 +451,12 @@ impl AppData {
             .as_ref()
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
 
-        // drop 位置から計算した track index が既存 track を指していれば、その
-        // track に画像 clip を貼り付ける (= ドロップしたトラックに追加)。 track の
-        // 無い下の領域 (= 範囲外 index) や dialog 経由 (None) は従来どおり
-        // arrangement 先頭 (index 0) に新規 track を作って貼る。
+        // drop が既存 track を指していれば (`Track(idx)`) その track に画像 clip を
+        // 貼り付ける (= ドロップしたトラックに追加)。 track の無い下の余白 drop
+        // (`NewTrackBottom`) や dialog 経由 (`NoHint`) は一番下に新規 track を作って
+        // 貼る (r.md #31: 以前は arrangement 先頭 index 0 への insert だった)。
         let dest_track_idx: Option<usize> =
-            resolve_image_drop_target(target_track_idx, self.song_doc.song().tracks.len());
+            resolve_image_drop_target(target, self.song_doc.song().tracks.len());
 
         // drag&drop の drop 位置 (`target_beat`) を最優先。 無いとき (dialog 経由)
         // は従来挙動: 既存 track に貼るときは playhead を seed に順送り配置
@@ -492,21 +537,19 @@ impl AppData {
 
                 // 3) 配置先 track を決める。
                 //    - 既存 track (drop 先): その index にそのまま貼る。
-                //    - 新規 track: arrangement 先頭 (index 0) に Video 用 track を
-                //      作って挿入 → 既存 video layer の上に合成される
-                //      (multi-track composite top-wins, plan_video §4 P7)。
+                //    - 新規 track: arrangement の一番下 (末尾 push) に track を作って
+                //      貼る (r.md #31: ドロップ位置どおり一番下へ。以前は先頭 index 0 に
+                //      insert して既存 video layer の手前に合成していた — composite は
+                //      top-wins なので一番下 = 奥になる、plan_video §4 P7)。
                 let place_idx = match dest_track_idx {
                     Some(idx) => idx,
                     None => {
                         let image_track_id = song.alloc_track_id();
-                        song.tracks.insert(
-                            0,
-                            track_with(|t| {
-                                t.id = image_track_id;
-                                t.name = format!("{display_name} (Image)");
-                            }),
-                        );
-                        0
+                        song.tracks.push(track_with(|t| {
+                            t.id = image_track_id;
+                            t.name = format!("{display_name} (Image)");
+                        }));
+                        song.tracks.len() - 1
                     }
                 };
                 let track = &mut song.tracks[place_idx];
