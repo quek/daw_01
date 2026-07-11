@@ -78,10 +78,11 @@ impl AppData {
         }
     }
 
-    /// 指定トラック群を `ClipboardPayload::Tracks` envelope JSON に。`order` は現在の
-    /// Vec 順 (上から)。各トラックの clips / automation lanes が参照する content を
-    /// inline 同梱 (別プロジェクト独立復元用)。`state` は呼び出し時点で最新化済み前提。
-    pub(crate) fn serialize_tracks_to_envelope(&self, track_ids: &[u32]) -> Option<(String, usize)> {
+    /// 指定トラック群を `TrackCopy` list に組み立てる (clipboard serialize と
+    /// in-app duplicate の共通口)。`order` は現在の Vec 順 (上から)。各トラックの
+    /// clips / automation lanes が参照する content を inline 同梱 (別プロジェクト /
+    /// 独立複製の復元用)。`state` は呼び出し時点で最新化済み前提。
+    pub(crate) fn collect_track_copies(&self, track_ids: &[u32]) -> Vec<crate::clipboard::TrackCopy> {
         let mut out: Vec<crate::clipboard::TrackCopy> = Vec::new();
         for t in self.song_doc.song().tracks.iter() {
             if !track_ids.contains(&t.id) {
@@ -119,6 +120,14 @@ impl AppData {
                 contents,
             });
         }
+        out
+    }
+
+    /// 指定トラック群を `ClipboardPayload::Tracks` envelope JSON に。`order` は現在の
+    /// Vec 順 (上から)。各トラックの clips / automation lanes が参照する content を
+    /// inline 同梱 (別プロジェクト独立復元用)。`state` は呼び出し時点で最新化済み前提。
+    pub(crate) fn serialize_tracks_to_envelope(&self, track_ids: &[u32]) -> Option<(String, usize)> {
+        let out = self.collect_track_copies(track_ids);
         if out.is_empty() {
             return None;
         }
@@ -147,54 +156,88 @@ impl AppData {
             return 0;
         }
         tracks.sort_by_key(|t| t.order);
-        let Some((n, new_ids)) = self.edit_song(|song| {
-        let same_project = src_pid == song.project_id;
+        let Some(new_ids) = self.edit_song(|song| {
+            let same_project = src_pid == song.project_id;
+            // drop 先の親 group context と挿入 index (above_track の直上)。
+            let drop_parent = song.track_by_id(above_track).and_then(|t| t.parent_group_id);
+            let insert_idx = song
+                .track_index_by_id(above_track)
+                .unwrap_or(song.tracks.len());
+            // paste は content 流用ポリシー (same_project で現存 content はリンク共有)。
+            let built = Self::build_pasted_tracks(song, &tracks, same_project, false, drop_parent);
+            let new_ids: Vec<u32> = built.iter().map(|(_, t)| t.id).collect();
+            // above_track の直上に order 昇順を維持して連続挿入。
+            for (off, (_, t)) in built.into_iter().enumerate() {
+                song.tracks.insert((insert_idx + off).min(song.tracks.len()), t);
+            }
+            new_ids
+        }) else {
+            return 0;
+        };
+        // 選択を新 track 群に + plugin host へ各 device を SetSlotPlugin で実体化
+        // (flush_song_sync = LoadSong は audio 専属で plugin host では no-op なので、
+        //  plugin の実体化には restore が別途必要。state 込みで新インスタンス化)。
+        let n = new_ids.len();
+        self.selection.selected_track_ids = new_ids.clone();
+        self.restore_plugins_for_tracks(&new_ids);
+        self.resize_track_peak_display();
+        n
+    }
 
-
+    /// paste / duplicate 共通の remap エンジン。`tracks` (order 昇順前提) から新 id
+    /// で track を組み立てて返す (`(元 track id, 組み立て済み track)` の列。 挿入は
+    /// caller が行う)。`same_project` = 元と同一 project (集合外の track/content 参照を
+    /// 据え置くか drop するかの判定)。`force_independent_content` = true なら content を
+    /// 常に新採番 (独立複製 / Alt+D 相当)、 false なら same_project で現存する content は
+    /// 流用 (リンク共有 / D 相当)。`drop_parent` = 集合内にも据え置き対象にも無い parent
+    /// の落とし先 (paste は above_track の group、 duplicate は None で top-level 維持)。
+    /// device は常に新 id を採番する (走行中の plugin instance は共有不可、 state だけ
+    /// clone して host で新インスタンス化)。
+    pub(crate) fn build_pasted_tracks(
+        song: &mut common::model::Song,
+        tracks: &[crate::clipboard::TrackCopy],
+        same_project: bool,
+        force_independent_content: bool,
+        drop_parent: Option<u32>,
+    ) -> Vec<(u32, common::model::Track)> {
         // 1) 新 track id を全件先に採番し old→new remap を作る (集合内参照解決用)。
         let mut track_remap: std::collections::HashMap<u32, u32> =
             std::collections::HashMap::new();
-        for tc in &tracks {
+        for tc in tracks {
             let new_id = song.alloc_track_id();
             track_remap.insert(tc.track.id, new_id);
         }
 
-        // 2) content remap。同一プロジェクトかつ content が現存すれば流用 (リンク共有)、
-        //    それ以外 (別プロジェクト / 欠落) は inline payload から新採番 (独立)。同一
-        //    content_id は 1 度だけ採番して dedup する (cross-track linked / 複数選択の
-        //    リンクを保ち、orphan content のリークを防ぐ)。same_project で content が現存
-        //    する場合は old→old を入れておき、step 4 の一律適用が no-op になる。
+        // 2) content remap。`force_independent_content` なら常に新採番 (独立)。 そうでなく
+        //    同一プロジェクトかつ content が現存すれば流用 (リンク共有)、 それ以外 (別
+        //    プロジェクト / 欠落) は inline payload から新採番。同一 content_id は 1 度
+        //    だけ採番して dedup する (cross-track linked / 複数選択のリンクを保ち、
+        //    orphan content のリークを防ぐ)。流用時は old→old を入れておき、step 3 の
+        //    一律適用が no-op になる。
         let mut content_remap: std::collections::HashMap<
             common::model::ContentId,
             common::model::ContentId,
         > = std::collections::HashMap::new();
-        for tc in &tracks {
+        for tc in tracks {
             for ce in &tc.contents {
                 if content_remap.contains_key(&ce.content_id) {
                     continue;
                 }
-                let new_cid =
-                    if same_project && song.clip_contents.contains_key(&ce.content_id) {
-                        ce.content_id
-                    } else {
-                        song
-                            .alloc_content(ce.content.clone(), ce.name.clone().unwrap_or_default())
-                    };
+                let new_cid = if !force_independent_content
+                    && same_project
+                    && song.clip_contents.contains_key(&ce.content_id)
+                {
+                    ce.content_id
+                } else {
+                    song.alloc_content(ce.content.clone(), ce.name.clone().unwrap_or_default())
+                };
                 content_remap.insert(ce.content_id, new_cid);
             }
         }
 
-        // 3) drop 先の親 group context と挿入 index (above_track の直上)。
-        let drop_parent = song
-            .track_by_id(above_track)
-            .and_then(|t| t.parent_group_id);
-        let insert_idx = song
-            .track_index_by_id(above_track)
-            .unwrap_or(song.tracks.len());
-
-        // 4) 各 track を組み立て (参照 remap + content remap)。
-        let mut built: Vec<common::model::Track> = Vec::with_capacity(tracks.len());
-        for tc in &tracks {
+        // 3) 各 track を組み立て (参照 remap + content remap)。
+        let mut built: Vec<(u32, common::model::Track)> = Vec::with_capacity(tracks.len());
+        for tc in tracks {
             let mut t = tc.track.clone();
             t.id = *track_remap.get(&tc.track.id).unwrap();
             t.parent_group_id = match t.parent_group_id {
@@ -294,31 +337,142 @@ impl AppData {
                     }
                 }
             }
-            built.push(t);
+            built.push((tc.track.id, t));
+        }
+        built
+    }
+
+    /// トラック複製 (r.md #30) の dispatcher。plugin があれば最新 state を取ってから
+    /// serialize するため deferred、無ければ即時。copy_tracks / cut_tracks と同 idiom。
+    /// `linked=true` はクリップ中身を元と content_id 共有 (D 相当)、 `false` は独立
+    /// コピー (Alt+D 相当)。
+    pub fn duplicate_tracks(&mut self, track_ids: Vec<u32>, linked: bool) {
+        if track_ids.is_empty() {
+            return;
+        }
+        if !self.song_has_plugin() {
+            self.duplicate_tracks_inner(&track_ids, linked);
+            return;
+        }
+        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::DuplicateTracks {
+            track_ids,
+            linked,
+        }));
+    }
+
+    /// 複製本体。呼び出し側で最新 plugin state 反映済み (deferred 経由 or 即時 fallback)。
+    /// 各「root」(= 選択集合内に祖先を持たない選択 track) の subtree を複製し、 元 subtree
+    /// の直下へ挿入する。remap は root 跨ぎで共有し (root 間の send / sidechain / linked
+    /// clip の内部リンクを保つ)、 挿入だけ root ごとに行う。挿入は下方 index がずれるので
+    /// **現在 index の大きい root から** 処理する。undo snapshot は edit_song が積む。
+    pub(crate) fn duplicate_tracks_inner(&mut self, track_ids: &[u32], linked: bool) {
+        if track_ids.is_empty() {
+            return;
+        }
+        // roots = 選択 id のうち、 別の選択 id を祖先に持たないもの (group とその child
+        // を両方選んだら group だけを root にして二重複製を防ぐ)。存在しない id は除外。
+        let sel: std::collections::HashSet<u32> = track_ids.iter().copied().collect();
+        let roots: Vec<u32> = track_ids
+            .iter()
+            .copied()
+            .filter(|&id| self.song_doc.song().track_by_id(id).is_some())
+            .filter(|&id| !self.track_ancestor_in_set(id, &sel))
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        // 各 root の subtree id list (安定 id、 挿入で index がずれても不変)。
+        let root_subtrees: Vec<(u32, Vec<u32>)> = roots
+            .iter()
+            .map(|&r| (r, self.collect_track_subtree_ids(r)))
+            .collect();
+        // 複製対象の全 id を song 順に (serialize と built の対応付けはこの順)。
+        let full: std::collections::HashSet<u32> = root_subtrees
+            .iter()
+            .flat_map(|(_, s)| s.iter().copied())
+            .collect();
+        let full_ordered: Vec<u32> = self
+            .song_doc
+            .song()
+            .tracks
+            .iter()
+            .map(|t| t.id)
+            .filter(|id| full.contains(id))
+            .collect();
+        let copies = self.collect_track_copies(&full_ordered);
+        if copies.is_empty() {
+            return;
         }
 
-        // 5) above_track の直上に order 昇順を維持して連続挿入。
-        let n = built.len();
-        for (off, t) in built.into_iter().enumerate() {
-            song
-                .tracks
-                .insert((insert_idx + off).min(song.tracks.len()), t);
-        }
-        // 6) 選択を新 track 群に + plugin host へ各 device を SetSlotPlugin で実体化
-        //    (flush_song_sync = LoadSong は audio 専属で plugin host では no-op
-        //    なので、 plugin の実体化には restore が別途必要。state 込みで新インスタンス化)。
-            let new_ids: Vec<u32> = tracks
+        let new_ids = self.edit_song(|song| {
+            // 全 track を 1 度に remap (root 跨ぎのリンクを保つため remap は global)。
+            // same_project=true (元と同一 project)、 独立/リンクは force_independent で
+            // 切替、 drop_parent=None で top-level は top-level のまま (group child は
+            // 元 parent を継承)。
+            let built = Self::build_pasted_tracks(song, &copies, true, !linked, None);
+            let mut built_by_src: std::collections::HashMap<u32, common::model::Track> =
+                built.into_iter().collect();
+            // 各 root の subtree を、 元 subtree の直下へ挿入する。 挿入で下方の index が
+            // ずれるので、 現在 index が大きい root から処理する (下位 root の subtree
+            // index は影響を受けない)。
+            let mut order: Vec<(usize, usize)> = root_subtrees
                 .iter()
-                .filter_map(|tc| track_remap.get(&tc.track.id).copied())
+                .enumerate()
+                .filter_map(|(i, (r, _))| song.track_index_by_id(*r).map(|idx| (idx, i)))
                 .collect();
-            (n, new_ids)
-        }) else {
-            return 0;
+            order.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
+            let mut new_ids: Vec<u32> = Vec::new();
+            for (_, i) in order {
+                let (_, subtree_ids) = &root_subtrees[i];
+                // subtree を現在の song 順に並べ、 最後の index の直後へ順次 insert。
+                let mut sub_ordered: Vec<(usize, u32)> = subtree_ids
+                    .iter()
+                    .filter_map(|id| song.track_index_by_id(*id).map(|idx| (idx, *id)))
+                    .collect();
+                sub_ordered.sort_by_key(|(idx, _)| *idx);
+                let Some(&(last_idx, _)) = sub_ordered.last() else {
+                    continue;
+                };
+                let mut insert_at = last_idx + 1;
+                for (_, src) in sub_ordered {
+                    if let Some(t) = built_by_src.remove(&src) {
+                        new_ids.push(t.id);
+                        song.tracks.insert(insert_at.min(song.tracks.len()), t);
+                        insert_at += 1;
+                    }
+                }
+            }
+            new_ids
+        });
+        let Some(new_ids) = new_ids else {
+            return;
         };
+        if new_ids.is_empty() {
+            return;
+        }
         self.selection.selected_track_ids = new_ids.clone();
         self.restore_plugins_for_tracks(&new_ids);
         self.resize_track_peak_display();
-        n
+        self.ui_ephemeral.status_message = format!("複製: {} トラック", new_ids.len());
+    }
+
+    /// `id` の祖先チェーン (`parent_group_id`) に `set` の要素が居るか (cycle-safe)。
+    /// duplicate の root 判定に使う (選択集合内の group child を root から除外)。
+    fn track_ancestor_in_set(&self, id: u32, set: &std::collections::HashSet<u32>) -> bool {
+        let mut cursor = self.song_doc.song().track_by_id(id).and_then(|t| t.parent_group_id);
+        let limit = self.song_doc.song().tracks.len() + 1;
+        let mut hops = 0;
+        while let Some(pid) = cursor {
+            if set.contains(&pid) {
+                return true;
+            }
+            hops += 1;
+            if hops > limit {
+                break;
+            }
+            cursor = self.song_doc.song().track_by_id(pid).and_then(|t| t.parent_group_id);
+        }
+        false
     }
 
     /// 実際の削除処理。 [`Self::on_all_states_from_child`] か上の

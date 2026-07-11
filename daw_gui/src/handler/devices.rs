@@ -1218,6 +1218,9 @@ impl AppData {
                 self.remove_device_inner(track_id, index)
             }
             DeferredEdit::CutTracks { track_ids } => self.cut_tracks_inner(&track_ids),
+            DeferredEdit::DuplicateTracks { track_ids, linked } => {
+                self.duplicate_tracks_inner(&track_ids, linked)
+            }
         }
     }
 

@@ -513,6 +513,16 @@ pub enum AppEvent {
     },
     RemoveLastTrack,
     DeleteTrack(u32),
+    /// 選択トラック群を複製する (r.md #30)。`Shared` = クリップ中身 (MIDI ノート /
+    /// オーディオ / オートメーション) を元トラックと **リンク** (同じ content_id を
+    /// 共有、 片方のノート編集が両方に反映) して重ねる用、 `Unique` = deep clone +
+    /// 新 ContentId で **完全独立** コピー。 どちらも device は常に新インスタンス化
+    /// される (走行中の plugin instance は共有不可、 state だけコピーして再構築)。
+    /// 複製は元トラック (group ならその subtree) の直下に挿入し、 新トラック群を
+    /// 選択にする。 クリップ複製の D / Alt+D と同じ二本立て。 選択集合内に含まれない
+    /// group child を単独複製した場合は同じ group 内に残る (parent 継承)。
+    DuplicateTracksShared(Vec<u32>),
+    DuplicateTracksUnique(Vec<u32>),
     MoveTrackUp(u32),
     MoveTrackDown(u32),
     /// 新順での `Track.id` 列で `song.tracks` を並び替える (drag&drop reorder)。
@@ -1582,6 +1592,7 @@ impl AppEvent {
             E::UngroupTracks { .. } => "グループ解除",
             E::SetTrackParent { .. } => "トラック親変更",
             E::RemoveLastTrack | E::DeleteTrack(..) => "トラック削除",
+            E::DuplicateTracksShared(..) | E::DuplicateTracksUnique(..) => "トラック複製",
             E::MoveTrackUp(..) | E::MoveTrackDown(..) | E::ReorderTracks(..) => "トラック並べ替え",
             E::CommitRenameTrack => "トラック名変更",
             E::SetTrackColor { .. } => "トラック色変更",

@@ -584,7 +584,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let rect = *rect;
         ui.context_menu_for(
             rect,
-            &["Rename", "色...", "クリップ色をトラックに揃える", "Delete"],
+            &[
+                "Rename",
+                "複製 (独立)",
+                "複製 (リンク)",
+                "色...",
+                "クリップ色をトラックに揃える",
+                "Delete",
+            ],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     let Some(t_idx) =
@@ -592,16 +599,30 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     else {
                         return;
                     };
+                    // 複製 (r.md #30) の対象: 右クリック track が選択集合に含まれるなら
+                    // 選択全体、 含まれないなら右クリック track 単独 (Delete と同じく右
+                    // クリック対象を優先。 REAPER / Ableton 流)。
+                    let dup_ids = || {
+                        if app.selection.selected_track_ids.contains(&track_id) {
+                            app.selection.selected_track_ids.clone()
+                        } else {
+                            vec![track_id]
+                        }
+                    };
                     match idx {
                         0 => app.handle_event(AppEvent::BeginRenameTrack(track_id)),
+                        // 独立複製 (Alt+D 相当): 元と切り離した別コピー。
+                        1 => app.handle_event(AppEvent::DuplicateTracksUnique(dup_ids())),
+                        // リンク複製 (D 相当): クリップ中身を元と content_id 共有。
+                        2 => app.handle_event(AppEvent::DuplicateTracksShared(dup_ids())),
                         // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
                         // (anchor = 右クリックした track header rect)。
-                        1 => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
+                        3 => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
                         // Ableton 流: track の全 clip の色上書きを外して track 色継承に戻す。
-                        2 => app.handle_event(AppEvent::ResetTrackClipColors {
+                        4 => app.handle_event(AppEvent::ResetTrackClipColors {
                             track: track_id,
                         }),
-                        3 => app.handle_event(AppEvent::DeleteTrack(t_idx as u32)),
+                        5 => app.handle_event(AppEvent::DeleteTrack(t_idx as u32)),
                         _ => {}
                     }
                 }));

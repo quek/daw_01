@@ -1042,3 +1042,120 @@ mod plugin_category_tests {
     }
 }
 
+/// r.md #30 トラック複製の remap エンジン (`build_pasted_tracks`) の core 挙動。
+/// linked (D 相当) は content_id 共有、 independent (Alt+D 相当) は新採番、 parent は
+/// 集合内なら新 group へ remap・集合外は据え置きで top-level は None のまま。
+#[cfg(test)]
+mod track_duplicate_tests {
+    use crate::app::AppData;
+    use crate::app_types::track_with;
+    use crate::clipboard::{ContentEntry, TrackCopy};
+    use common::model::{Clip, ClipContent, Song};
+
+    fn clip(id: u32, content_id: u32) -> Clip {
+        Clip { id, content_id, length_beats: 4.0, ..Clip::default() }
+    }
+
+    /// content 付き top-level MIDI track 1 本の Song。戻り値は (song, track id, content id)。
+    fn song_one_track() -> (Song, u32, u32) {
+        let mut song = Song::default();
+        let cid = song.alloc_content(ClipContent::default(), String::new());
+        let tid = song.alloc_track_id();
+        song.tracks.push(track_with(|t| {
+            t.id = tid;
+            t.name = "T".into();
+            t.clips = vec![clip(1, cid)];
+        }));
+        (song, tid, cid)
+    }
+
+    fn copy_of(song: &Song, tid: u32, cid: u32) -> TrackCopy {
+        let track = song.track_by_id(tid).unwrap().clone();
+        let content = song.clip_contents.get(&cid).cloned().unwrap_or_default();
+        TrackCopy {
+            order: 0,
+            track,
+            contents: vec![ContentEntry { content_id: cid, content, name: None }],
+        }
+    }
+
+    #[test]
+    fn linked_duplicate_shares_content_id() {
+        let (mut song, tid, cid) = song_one_track();
+        let before = song.clip_contents.len();
+        let tc = copy_of(&song, tid, cid);
+        // linked = force_independent_content=false。
+        let built = AppData::build_pasted_tracks(&mut song, &[tc], true, false, None);
+        assert_eq!(built.len(), 1);
+        let (src, t) = &built[0];
+        assert_eq!(*src, tid);
+        assert_ne!(t.id, tid, "新 track id が採番される");
+        assert_eq!(t.parent_group_id, None, "top-level は top-level のまま");
+        // クリップ中身は元と content_id 共有 (= 連動)。
+        assert_eq!(t.clips[0].content_id, cid);
+        // 新規 content は増えない。
+        assert_eq!(song.clip_contents.len(), before);
+    }
+
+    #[test]
+    fn independent_duplicate_allocs_new_content() {
+        let (mut song, tid, cid) = song_one_track();
+        let before = song.clip_contents.len();
+        let tc = copy_of(&song, tid, cid);
+        // independent = force_independent_content=true。
+        let built = AppData::build_pasted_tracks(&mut song, &[tc], true, true, None);
+        let (_, t) = &built[0];
+        assert_ne!(t.clips[0].content_id, cid, "独立コピーは新 content_id");
+        assert_eq!(song.clip_contents.len(), before + 1, "content が 1 件増える");
+    }
+
+    #[test]
+    fn duplicated_group_child_reparents_to_new_group() {
+        // group(gid) + child(parent=gid)。 両方複製すると child は複製後の group を指す。
+        let mut song = Song::default();
+        let gid = song.alloc_track_id();
+        let child = song.alloc_track_id();
+        song.tracks.push(track_with(|t| {
+            t.id = gid;
+            t.name = "G".into();
+        }));
+        song.tracks.push(track_with(|t| {
+            t.id = child;
+            t.name = "C".into();
+            t.parent_group_id = Some(gid);
+        }));
+        let tcs = vec![
+            TrackCopy { order: 0, track: song.track_by_id(gid).unwrap().clone(), contents: vec![] },
+            TrackCopy { order: 1, track: song.track_by_id(child).unwrap().clone(), contents: vec![] },
+        ];
+        let built = AppData::build_pasted_tracks(&mut song, &tcs, true, true, None);
+        let new_group = built[0].1.id;
+        assert_ne!(new_group, gid);
+        assert_eq!(built[1].1.parent_group_id, Some(new_group), "child は複製後の group を指す");
+    }
+
+    #[test]
+    fn duplicated_child_alone_keeps_original_parent() {
+        // child だけを複製 (group は集合外・実在) → 元 group を継承 (同じ group 内に残る)。
+        let mut song = Song::default();
+        let gid = song.alloc_track_id();
+        let child = song.alloc_track_id();
+        song.tracks.push(track_with(|t| {
+            t.id = gid;
+            t.name = "G".into();
+        }));
+        song.tracks.push(track_with(|t| {
+            t.id = child;
+            t.name = "C".into();
+            t.parent_group_id = Some(gid);
+        }));
+        let tc = TrackCopy {
+            order: 0,
+            track: song.track_by_id(child).unwrap().clone(),
+            contents: vec![],
+        };
+        let built = AppData::build_pasted_tracks(&mut song, &[tc], true, true, None);
+        assert_eq!(built[0].1.parent_group_id, Some(gid), "同じ group 内に残る");
+    }
+}
+
