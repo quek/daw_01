@@ -27,10 +27,13 @@
 #                       holds real committed work. This INCLUDES a worktree whose tip ==
 #                       main HEAD: landing a feature via `git push . <branch>:main`
 #                       leaves the feature tip AT main HEAD, and that is precisely the
-#                       "I merged it but worktree-rm-merged won't delete it" case. The
-#                       remove_one guards (clean tree + unlocked, unless --force) keep an
-#                       active or dirty worktree safe; a clean one at main HEAD has
-#                       nothing to lose and is recreated with one command. --all ALSO
+#                       "I merged it but worktree-rm-merged won't delete it" case. A
+#                       harness lock left behind by an EXITED "claude session (pid N)" is
+#                       auto-cleared (see remove_one lock handling) so --all sweeps it
+#                       unattended; a lock whose pid is STILL RUNNING is kept (SKIP). The
+#                       remove_one guards (clean tree + merged, plus live-lock SKIP unless
+#                       --force) keep an active or dirty worktree safe; a clean one at main
+#                       HEAD has nothing to lose and is recreated with one command. --all ALSO
 #                       prunes leftover EMPTY .claude/worktrees/<dir> directories that
 #                       git already deregistered (prune_orphan_dirs) -- the
 #                       "空ディレクトリが残る" symptom.
@@ -39,6 +42,9 @@
 #   * branch must be fully merged into main (no unmerged work lost).
 #   * working tree must be clean: no uncommitted tracked changes, and no unsaved
 #     gitignored/untracked deliverables except the regenerable target/ & third_party/.
+#   * a harness lock is respected while its owning "claude session (pid N)" is alive
+#     (SKIP); once that pid is gone the lock is stale and auto-cleared. --force clears
+#     the lock unconditionally.
 set -uo pipefail
 
 # ---- args ------------------------------------------------------------------
@@ -121,25 +127,45 @@ kill_holders() {
   sleep 1
 }
 
+# 0 (true) if OS process $1 is currently running -- used to tell a STALE harness lock
+# (owning "claude session (pid N)" already exited) from a live one. The harness stores a
+# NATIVE Windows pid in the lock reason, which MSYS2 `kill -0` cannot see, so on Windows
+# we query the Win32 process table via tasklist; on Linux/macOS (no tasklist) `kill -0`
+# is exact. A non-numeric arg (unparseable reason) never reaches here -- the caller only
+# calls this once it has extracted a bare pid -- but guard anyway and fail SAFE (alive),
+# so an unclear lock is kept, never auto-cleared.
+pid_alive() {
+  local pid="$1"
+  case "$pid" in ''|*[!0-9]*) return 0;; esac
+  if command -v tasklist >/dev/null 2>&1; then
+    tasklist //FI "PID eq $pid" //NH 2>/dev/null | grep -qw "$pid"
+  else
+    kill -0 "$pid" 2>/dev/null
+  fi
+}
+
 # ---- worktree enumeration --------------------------------------------------
 # Emit one row per worktree, fields separated by US (0x1f, \037): a NON-whitespace
 # delimiter is REQUIRED -- with a tab, `read`'s IFS-whitespace splitting collapses
 # adjacent tabs and drops empty fields, so a DETACHED worktree (empty branch field)
 # would shift `locked` into `branch`, defeating both the detached-HEAD and
 # locked-skip guards in remove_one. US preserves empty fields exactly.
-# Row layout: <path>\037<head>\037<branch>\037<locked>
+# Row layout: <path>\037<head>\037<branch>\037<locked>\037<lockreason>
+# lockreason is the free text git stores from `worktree lock --reason` (the harness
+# writes "claude session <name> (pid <N>)"); remove_one parses the pid out of it to
+# tell a stale lock (owning session gone) from a live one.
 list_worktrees() {
   git -C "$repo" worktree list --porcelain 2>/dev/null | awk -v RS='' '
     {
-      p=""; h=""; b=""; locked=0
+      p=""; h=""; b=""; locked=0; lr=""
       n=split($0, lines, "\n")
       for (i=1;i<=n;i++) {
         if (lines[i] ~ /^worktree /)    { p=substr(lines[i],10) }
         else if (lines[i] ~ /^HEAD /)   { h=substr(lines[i],6) }
         else if (lines[i] ~ /^branch /) { b=substr(lines[i],8); sub(/^refs\/heads\//,"",b) }
-        else if (lines[i] ~ /^locked/)  { locked=1 }
+        else if (lines[i] ~ /^locked/)  { locked=1; lr=substr(lines[i],8) }
       }
-      if (p!="") printf "%s\037%s\037%s\037%s\n", p, h, b, locked
+      if (p!="") printf "%s\037%s\037%s\037%s\037%s\n", p, h, b, locked, lr
     }'
 }
 
@@ -153,8 +179,8 @@ list_worktrees() {
 # unlinked, never followed (no vendored-ffmpeg hazard).
 prune_orphan_dirs() {
   [ -d "$wtroot" ] || return 0
-  local registered=$'\n' p _h _b _lk dir dn
-  while IFS=$'\037' read -r p _h _b _lk; do
+  local registered=$'\n' p _h _b _lk _lr dir dn
+  while IFS=$'\037' read -r p _h _b _lk _lr; do
     [ -n "$p" ] || continue
     registered="$registered$(norm "$p")"$'\n'
   done < <(list_worktrees)
@@ -175,7 +201,7 @@ prune_orphan_dirs() {
 }
 
 remove_one() {
-  local wtpath="$1" branch="$3" locked="$4"
+  local wtpath="$1" branch="$3" locked="$4" lockreason="${5:-}"
   local wt; wt="$(norm "$wtpath")"
   local root; root="$(norm "$repo")"
   local wtroot_n; wtroot_n="$(norm "$wtroot")"
@@ -186,7 +212,34 @@ remove_one() {
     "$wtroot_n"/*) : ;;
     *) log "REFUSE: not under .claude/worktrees: $wt"; return;;
   esac
-  if [ "$locked" = "1" ] && [ "$o_force" -ne 1 ]; then log "SKIP (git-locked): $wt"; return; fi
+
+  # --- lock handling -------------------------------------------------------
+  # The harness locks each fresh worktree to its owning session, storing the reason
+  # "claude session <name> (pid <N>)". That lock only means something while the session
+  # lives; once it exits the lock is STALE and blocks nothing real -- yet the merged
+  # worktree lingers, which is exactly the "make worktree-rm-merged したのに消えない"
+  # symptom. Removing a locked worktree REQUIRES clearing the lock first (`git worktree
+  # remove --force` -- single -- still refuses a locked tree), so we ALWAYS unlock before
+  # proceeding, but ONLY when entitled to:
+  #   * --force        -> caller overrides; clear the lock and proceed.
+  #   * owner pid dead -> stale lock; clear it and proceed (session ended, worktree
+  #                       merged -> precisely what --all should sweep unattended).
+  #   * pid alive/none -> a live session (or a lock whose reason we can't parse) still
+  #                       owns it; SKIP untouched. We never auto-clear an unclear lock.
+  if [ "$locked" = "1" ]; then
+    local lpid; lpid="$(printf '%s' "$lockreason" | sed -n 's/.*[Pp][Ii][Dd][ =]\([0-9][0-9]*\).*/\1/p')"
+    if [ "$o_force" -eq 1 ]; then
+      git -C "$repo" worktree unlock "$wtpath" >/dev/null 2>&1 && log "  --force: cleared lock: $wt"
+    elif [ -n "$lpid" ] && ! pid_alive "$lpid"; then
+      if git -C "$repo" worktree unlock "$wtpath" >/dev/null 2>&1; then
+        log "  auto-cleared stale lock (owner session pid $lpid is gone): $wt"
+      else
+        log "SKIP (git-locked; stale-unlock failed -- retry with FORCE=1): $wt"; return
+      fi
+    else
+      log "SKIP (git-locked${lpid:+, owner session pid $lpid still running}; close it or FORCE=1): $wt"; return
+    fi
+  fi
 
   if [ "$o_force" -ne 1 ]; then
     if [ -z "$branch" ]; then log "SKIP (detached HEAD, use --force): $wt"; return; fi
@@ -242,7 +295,7 @@ remove_one() {
 # ---- select targets --------------------------------------------------------
 wtroot_n="$(norm "$wtroot")"
 matched=0
-while IFS=$'\037' read -r p h b lk; do
+while IFS=$'\037' read -r p h b lk lr; do
   [ -n "$p" ] || continue
   pn="$(norm "$p")"
   if [ "$o_all" -eq 1 ]; then
@@ -251,18 +304,19 @@ while IFS=$'\037' read -r p h b lk; do
     # content-merged: subsumes is-ancestor AND catches the merge-flow leftover whose
     # tip sits AT main HEAD (the `git push . <branch>:main` landing -- the exact
     # "merged but worktree-rm-merged won't delete it" case). We no longer exclude
-    # tip == main HEAD; remove_one's clean+unlocked guards (unless --force) keep an
-    # active or dirty worktree safe, and a clean fresh worktree at main HEAD has
-    # nothing to lose and is one command to recreate.
+    # tip == main HEAD; remove_one's clean guard + live-lock SKIP (a stale harness lock
+    # from an exited session is auto-cleared, a running one is kept) keep an active or
+    # dirty worktree safe, and a clean fresh worktree at main HEAD has nothing to lose
+    # and is one command to recreate.
     branch_merged_into_main "$b" || continue
-    matched=1; remove_one "$p" "$h" "$b" "$lk"
+    matched=1; remove_one "$p" "$h" "$b" "$lk" "$lr"
   elif [ -n "$o_tip" ]; then
     case "$pn/" in "$wtroot_n"/*) : ;; *) continue;; esac
-    case "$h" in "$o_tip"*) matched=1; remove_one "$p" "$h" "$b" "$lk";; esac
+    case "$h" in "$o_tip"*) matched=1; remove_one "$p" "$h" "$b" "$lk" "$lr";; esac
   elif [ -n "$o_path" ]; then
-    [ "$pn" = "$(norm "$o_path")" ] && { matched=1; remove_one "$p" "$h" "$b" "$lk"; }
+    [ "$pn" = "$(norm "$o_path")" ] && { matched=1; remove_one "$p" "$h" "$b" "$lk" "$lr"; }
   elif [ -n "$o_name" ]; then
-    [ "$pn" = "$(norm "$wtroot/$o_name")" ] && { matched=1; remove_one "$p" "$h" "$b" "$lk"; }
+    [ "$pn" = "$(norm "$wtroot/$o_name")" ] && { matched=1; remove_one "$p" "$h" "$b" "$lk" "$lr"; }
   fi
 done < <(list_worktrees)
 

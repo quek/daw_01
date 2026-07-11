@@ -21,7 +21,9 @@
 #                      blocker -> removed, I_local machine-local config
 #                      (.claude/settings.local.json, present in EVERY real worktree)
 #                      NOT a blocker -> removed, F orphan (no merge-base) kept,
-#                      L locked skipped.
+#                      L locked-without-pid conservatively skipped, L_STALE locked by a
+#                      DEAD "claude session (pid N)" auto-cleared -> removed, L_LIVE
+#                      locked by a LIVE pid skipped.
 #   orphan dirs       : ORPH_EMPTY deregistered empty dir pruned by --all,
 #                      ORPH_FULL deregistered non-empty dir kept (may hold work).
 #   remove_one guards : --name on unmerged (merge guard, the most-used path),
@@ -162,8 +164,16 @@ git -C "$scratch" branch ignNotes "$GI"
 git -C "$scratch" branch ignTarget "$GI"
 git -C "$scratch" branch ignLocal "$GI"
 
-# Scenario L "locked": content-merged + clean, but git-locked. Expect: --all skips.
+# Scenario L "locked": content-merged + clean, but git-locked with NO reason. A lock
+# whose reason carries no parseable pid is conservatively kept (never auto-cleared).
 git -C "$scratch" branch lockL "$GI"
+
+# Scenarios L_stale / L_live: content-merged + clean, git-locked WITH a harness-style
+# "claude session (pid N)" reason. A DEAD owner pid => stale lock -> --all auto-clears and
+# REMOVES it (the "session ended but the merged worktree lingers" case). A LIVE owner pid
+# => still owned -> --all keeps it untouched.
+git -C "$scratch" branch lockStale "$GI"
+git -C "$scratch" branch lockLive  "$GI"
 
 # Branch literally named "0", content-merged: makes the OLD tab-collapse bug
 # actually destructive for a detached worktree (it would read branch="0", find it
@@ -194,6 +204,8 @@ git -C "$scratch" worktree add -q "$(wt I_notes)" ignNotes
 git -C "$scratch" worktree add -q "$(wt I_target)" ignTarget
 git -C "$scratch" worktree add -q "$(wt I_local)" ignLocal
 git -C "$scratch" worktree add -q "$(wt L)" lockL
+git -C "$scratch" worktree add -q "$(wt L_STALE)" lockStale
+git -C "$scratch" worktree add -q "$(wt L_LIVE)"  lockLive
 git -C "$scratch" worktree add -q "$scratch/outside_dir" outsideBr
 git -C "$scratch" worktree add -q --detach "$(wt DET)" main
 
@@ -207,6 +219,19 @@ printf 'det work\n' > "$(wt DET)/det.txt"              # DET: commit unique to d
 git -C "$(wt DET)" add det.txt
 git -C "$(wt DET)" commit -q -m "detached unique work"
 git -C "$scratch" worktree lock "$(wt L)"
+
+# Resolve a LIVE and a DEAD pid in the exact form pid_alive() checks on THIS platform: on
+# Windows pid_alive() queries tasklist, which needs the NATIVE Windows pid (MSYS exposes it
+# at /proc/<pid>/winpid); on Linux/macOS it uses kill -0 on the native pid directly. The
+# LIVE pid is this test shell ($$, alive for the whole run); the DEAD pid is a throwaway
+# process we spawn and immediately reap.
+native_pid() { if [ -r "/proc/$1/winpid" ]; then cat "/proc/$1/winpid"; else printf '%s' "$1"; fi; }
+live_pid="$(native_pid "$$")"
+sleep 60 & dead_bg=$!
+dead_pid="$(native_pid "$dead_bg")"
+kill "$dead_bg" 2>/dev/null; wait "$dead_bg" 2>/dev/null
+git -C "$scratch" worktree lock --reason "claude session L_STALE (pid $dead_pid start 0)" "$(wt L_STALE)"
+git -C "$scratch" worktree lock --reason "claude session L_LIVE (pid $live_pid start 0)"  "$(wt L_LIVE)"
 
 # Orphan leftover dirs under .claude/worktrees that git does NOT track as worktrees
 # (an earlier remove/prune lost its rmdir race, leaving the dir behind). --all's
@@ -239,7 +264,10 @@ wt_gone    "$(wt H)"  && pass "H squash-merged removed (patch-id)"   || die "H s
 wt_present "$(wt I_notes)"  && pass "I_notes dirty-gitignored kept"  || die "I_notes WRONGLY removed (lost notes.md)"
 wt_gone    "$(wt I_target)" && pass "I_target (only target/) removed" || die "I_target NOT removed (regenerable ignored should not block)"
 wt_gone    "$(wt I_local)"  && pass "I_local (only .claude/settings.local.json) removed" || die "I_local NOT removed (machine-local config should not block)"
-wt_present "$(wt L)"  && pass "L locked kept"                        || die "L locked WRONGLY removed"
+wt_present "$(wt L)"  && pass "L locked-without-pid kept"            || die "L locked-without-pid WRONGLY removed"
+wt_gone    "$(wt L_STALE)" && pass "L_STALE stale-locked (dead pid) auto-cleared -> removed" || die "L_STALE stale-locked NOT removed (auto-unlock regression)"
+! branch_exists lockStale  && pass "L_STALE branch deleted"         || die "L_STALE branch survived"
+wt_present "$(wt L_LIVE)"  && pass "L_LIVE live-locked (alive pid) kept" || die "L_LIVE live-locked WRONGLY removed"
 wt_gone    "$(wt ORPH_EMPTY)" && pass "empty orphan dir pruned"      || die "empty orphan dir NOT pruned (空ディレクトリ residue)"
 wt_present "$(wt ORPH_FULL)"  && pass "non-empty orphan dir kept"    || die "non-empty orphan dir WRONGLY pruned (may hold unsaved work)"
 
