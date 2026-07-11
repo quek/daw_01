@@ -312,6 +312,11 @@ impl AppData {
         if let Some((device_id, track_id, clip_id)) = vocal {
             self.ipc.pending_vocal_synth_bounce =
                 Some(PendingVocalSynthBounce { track_id, clip_id, mode });
+            // r.md #27: bounce は合成完了 (`VocalSynthReady`) を待つので、metadata が
+            // 前回送信と不変でも必ず再送して synth 世代を進める。差分キャッシュを迂回
+            // するため該当 device の entry を落としてから flush する (= 直前の合成が
+            // engine 未起動等で失敗していても bounce で確実に再試行される)。
+            self.voicevox.voicevox_metadata_sent.remove(&device_id);
             self.sync_vocal_metadata();
             self.send_plugin(PluginCommand::PrepareVocalSynth { device_id });
             self.ui_ephemeral.status_message = "Bounce: 歌唱を合成中...".into();

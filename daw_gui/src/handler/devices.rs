@@ -259,6 +259,11 @@ impl AppData {
         // 明示呼び出し。 単一デバイスチェーン化で「instrument slot」 という
         // 区分は無いので、 全 device load 後に呼ぶ (sync_vocal_metadata 内で
         // VOICEVOX device のみ拾うので overhead は最小)。
+        // r.md #27: (re)load 直後の builtin plugin は fresh (synth cache 空) なので、
+        // metadata 差分キャッシュから該当 device を落として初回 flush を必ず送る
+        // (= seed 合成。project 切替 / plugin 差替で device_id が再利用されても確実に
+        // 再送。cache が残ったままだと「同じ metadata」判定で送信 skip → 無音になる)。
+        self.voicevox.voicevox_metadata_sent.remove(&device_id);
         self.sync_vocal_metadata();
     }
 
@@ -346,6 +351,9 @@ impl AppData {
         // builtin VOICEVOX が外れたら合成状態 entry も消す (busy のまま残ると
         // overlay / スピナーが消えない)。plugin host の deactivate も idle を報告するが二重防御。
         self.voicevox.voicevox_synth_status.remove(&device_id);
+        // r.md #27: metadata 差分キャッシュも live device に揃える (unload された
+        // device の stale entry を残さない。voicevox_synth_status と対称)。
+        self.voicevox.voicevox_metadata_sent.remove(&device_id);
         // PR3.3: drop the latency entry for the destroyed plugin and
         // recompute every track's total since the chain shape changed.
         self.ipc.plugin_latencies.remove(&device_id);

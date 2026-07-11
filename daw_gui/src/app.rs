@@ -230,6 +230,7 @@ impl AppData {
                 lipsync_inflight: std::collections::HashSet::new(),
                 lipsync_fingerprints: std::collections::HashMap::new(),
                 voicevox_synth_status: std::collections::HashMap::new(),
+                voicevox_metadata_sent: std::collections::HashMap::new(),
             },
             media: MediaState {
                 audio_source_cache: AudioSourceCache::new(),
@@ -801,33 +802,44 @@ impl AppData {
                 self.remove_group_automation_lane(param);
             }
             AppEvent::BeginGroupTransformDrag => {
-                // snapshot は is_undoable 経由。group lane recording は未対応。
+                // r.md #28: group transform の scrub / preview drag 全体を 1 undo step に
+                // bracket する (= ParamGestureBegin と同 idiom)。これが無いと per-frame の
+                // `SetGroupTransformField` が各々 fresh な event_scope で snapshot を積み、
+                // 1 回の drag が undo 履歴を大量の step で埋める。group lane recording は未対応。
+                self.song_doc.begin_gesture();
             }
             AppEvent::SetGroupTransformField { track_id, param, value } => {
                 // scrubable_number / preview drag からの live 設定。inspector は
                 // track.group_transform を毎フレーム直接読むので resync 不要。
                 self.set_group_transform_field(track_id, param, value);
             }
-            AppEvent::EndGroupTransformDrag => {}
-            // inspector scrubable_number の drag / text 編集
-            // stroke を 1 undo step に bracket。 Begin は is_undoable 経由で
-            // snapshot を 1 個取る (本体 no-op)、 End は snapshotless。
-            AppEvent::BeginInspectorScrub => {}
-            AppEvent::EndInspectorScrub => {}
+            AppEvent::EndGroupTransformDrag => {
+                self.song_doc.end_gesture();
+            }
+            // r.md #28: inspector scrubable_number の drag / text 編集 stroke を 1 undo step に
+            // bracket する。arch refactor で `is_undoable` whitelist を撤去した際、この Begin/End
+            // が no-op のまま残り、per-frame の Set* 編集が各々 undo step を積んでいた (= 1 drag で
+            // 履歴が溢れる)。ParamGestureBegin/End と同じ begin_gesture/end_gesture で塞ぐ。
+            AppEvent::BeginInspectorScrub => {
+                self.song_doc.begin_gesture();
+            }
+            AppEvent::EndInspectorScrub => {
+                self.song_doc.end_gesture();
+            }
             AppEvent::BeginImagePiPDrag => {
-                // snapshot は is_undoable 経由で既に取られている (=
-                // handle_event 冒頭の push_undo_snapshot)。 ここでは
-                // lane recording seed のみ:  selected_clip が指す image
-                // track に対し、 lane を持つ field を `active_param
-                // _gestures` に登録する。 record_automation_points_for
-                // _tick が再生中に 1/64 beat 刻みで point を打ち続ける。
-                // drag end (= MouseInput Released) で
-                // `image_drag_release` 経路から ParamGestureEnd 相当を
-                // クリアする。
+                // r.md #28: preview canvas 上の image PiP drag 全体を 1 undo step に bracket
+                // する (per-frame の `SetClipImageX/Y/W/H/Rotation` が各々 snapshot を積んで
+                // undo 履歴を溢れさせない = group transform / inspector scrub と同 idiom)。
+                self.song_doc.begin_gesture();
+                // lane recording seed: selected_clip が指す image track に対し、lane を持つ
+                // field を `active_param_gestures` に登録する。record_automation_points_for
+                // _tick が再生中に 1/64 beat 刻みで point を打ち続ける。drag end (= MouseInput
+                // Released) で `image_drag_release` 経路から End を発火してクリアする。
                 self.begin_image_pip_drag_recording();
             }
             AppEvent::EndImagePiPDrag => {
                 self.end_image_pip_drag_recording();
+                self.song_doc.end_gesture();
             }
             AppEvent::SetRecordingMode(mode) => {
                 self.recording.recording_mode = mode;
@@ -1692,10 +1704,14 @@ impl AppData {
                 self.set_clip_text_event_rotation_radians(target, value);
             }
             AppEvent::BeginTextPiPDrag => {
+                // r.md #28: preview canvas 上の text PiP drag 全体を 1 undo step に bracket
+                // する (image PiP と同 idiom)。
+                self.song_doc.begin_gesture();
                 self.begin_text_pip_drag_recording();
             }
             AppEvent::EndTextPiPDrag => {
                 self.end_text_pip_drag_recording();
+                self.song_doc.end_gesture();
             }
             AppEvent::SetClipTextMuted { target, muted } => {
                 // 字幕 clip mute も clip-level `Clip.muted` に一本化。

@@ -24,6 +24,11 @@ impl AppData {
         // 再計算は source 編集時だけに限定したいので、 baseline 確定と同時に
         // pending の再生成を無効化する (= 既存 clip をそのまま温存)。
         self.cancel_pending_lipsync_regen();
+        // r.md #27: 別 project の device 群への「送信済み metadata」を持ち越さない
+        // (device_id は project ごとに再割当されるので stale entry が誤 hit すると
+        // 新 project の vocal device に seed 合成が飛ばず無音になる)。各 device の
+        // load 時にも個別 invalidate するが、ここで全消去して stale entry も掃う。
+        self.voicevox.voicevox_metadata_sent.clear();
         // 保存ファイル内の口パク clip は既に authoritative。 その clip を生成した
         // 入力 (notes / 歌詞 / bpm / mouth_map / binding) を fingerprint のベースライン
         // として記録し、開いた直後の非入力編集 (track rename 等) で口パクが再生成

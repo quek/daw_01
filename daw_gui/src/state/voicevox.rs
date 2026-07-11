@@ -46,4 +46,19 @@ pub struct VoicevoxState {
     /// 失敗中 (= engine 未起動/起動途中)。一定時間 (= `VOICEVOX_ENGINE_WARNING`) 続いたら
     /// engine 未接続警告へ切り替える。plugin unload (`SlotPluginUnloadedFromChild`) で entry を消す。
     pub voicevox_synth_status: std::collections::HashMap<u64, VocalSynthStatus>,
+    /// r.md #27: builtin VOICEVOX device ごとに、最後に `SetBuiltinPluginNoteMetadata`
+    /// で送った `(bpm, notes, talk)`。`sync_vocal_metadata` は epoch bump のたび
+    /// (= あらゆる編集) に呼ばれるが、この device の歌唱/読み上げ入力が前回送信から
+    /// 変わっていなければ **再送しない** (= builtin plugin が不要な再合成を走らせない。
+    /// Transform 等の非 vocal 編集で VOICEVOX 合成が走る問題の修正)。差分検出で送信を
+    /// 抑える `sync_ara_documents` の `ara_doc_cache` と同 idiom。device (re)load 時に
+    /// 該当 entry を破棄して初回 seed 合成を保証する (`SlotPluginLoadedFromChild`)。
+    pub voicevox_metadata_sent: std::collections::HashMap<
+        u64,
+        (
+            f32,
+            Vec<common::plugin_metadata::NoteMetadata>,
+            Vec<common::plugin_metadata::TalkMetadata>,
+        ),
+    >,
 }

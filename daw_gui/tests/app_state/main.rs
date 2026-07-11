@@ -23,3 +23,4 @@ mod pending_state_queue;
 mod plugin_load_failure;
 mod state_roundtrip_watchdog;
 mod sync_flush;
+mod transform_edit_regress;

@@ -392,6 +392,22 @@ impl AppData {
                     });
                 }
             }
+            // r.md #27: この device の歌唱/読み上げ入力 (bpm/notes/talk) が前回送信から
+            // 変わっていなければ再送しない (= builtin plugin が不要な再合成を走らせない)。
+            // `sync_vocal_metadata` は epoch bump のたびに呼ばれるので、Transform 等の
+            // 非 vocal 編集ではここが cache hit → send skip になる。`sync_ara_documents`
+            // の差分キャッシュと同 idiom。
+            if self
+                .voicevox
+                .voicevox_metadata_sent
+                .get(&host_plugin_id)
+                .is_some_and(|(b, e, t)| *b == bpm && *e == entries && *t == talk)
+            {
+                continue;
+            }
+            self.voicevox
+                .voicevox_metadata_sent
+                .insert(host_plugin_id, (bpm, entries.clone(), talk.clone()));
             self.send_plugin(PluginCommand::SetBuiltinPluginNoteMetadata {
                 device_id: host_plugin_id,
                 bpm,
