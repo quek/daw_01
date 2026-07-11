@@ -22,6 +22,7 @@ pub mod shortcuts_help;
 pub mod snap;
 pub mod status_bar;
 pub mod track_color;
+pub mod undo_history;
 pub mod track_inspector;
 pub mod track_picker;
 pub mod transport;

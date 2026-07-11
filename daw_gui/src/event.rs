@@ -84,6 +84,13 @@ pub enum AppEvent {
     SetSongTimeSigNumFromScrub(u8),
     Undo,
     Redo,
+    /// r.md #29: Undo 履歴パネルの開閉トグル (View メニュー / パネル ✕ / Esc)。
+    /// session-only な UI 状態なので Undo 対象外。
+    ToggleUndoHistory,
+    /// r.md #29: 履歴リストの行 click。 `index` = [`crate::state::SongDoc::history_labels`]
+    /// の 0 始まり index。 その state まで一気に Undo / Redo する
+    /// ([`crate::state::SongDoc::jump_to`])。 履歴操作自体は Undo 対象外。
+    JumpHistory(usize),
     QuantizeSelectedNotes(u8),
     /// 鍵盤レーン click のピッチプレビュー (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 piano_roll widget が毎フレーム
@@ -1481,6 +1488,211 @@ pub enum AppEvent {
     /// piano_roll の Fold to Scale toggle (session-only)。 piano_roll snap
     /// toolbar の「Fold」 button で切替。 Undo 非対象。
     ToggleFoldToScale,
+}
+
+impl AppEvent {
+    /// r.md #29: この event が undo step (Song snapshot) を積んだとき、 履歴
+    /// リストに出す **日本語ラベル**。 「command → 名前」 の SSoT。
+    ///
+    /// - 編集 (undoable) event には具体的な名前を与える。
+    /// - 非編集 event (transport / 選択 / view / IPC / 高頻度 tick 等) は
+    ///   snapshot を積まないのでラベルは記録されない → catch-all `"編集"` で足りる。
+    ///   万一ラベル漏れの編集 event があっても catch-all が名前を保証する
+    ///   (= 履歴が空欄にならない graceful degradation)。
+    ///
+    /// `begin_event` が **全 event** で呼ぶので安価であること (heap を持たない
+    /// `&'static str` の純 match)。
+    pub fn undo_label(&self) -> &'static str {
+        use AppEvent as E;
+        match self {
+            // ---- テンポ / 拍子 ----
+            E::CommitBpmEdit | E::SetSongBpmFromScrub(..) => "テンポ変更",
+            E::CommitTimeSigNumEdit
+            | E::SetSongTimeSigDenominator(..)
+            | E::SetSongTimeSigNumFromScrub(..) => "拍子変更",
+
+            // ---- ノート ----
+            E::AddNote { .. } => "ノート追加",
+            E::SetNotePositions(..) => "ノート移動",
+            E::ResizeNote { .. } | E::ResizeNotes(..) => "ノート長さ変更",
+            E::DeleteSelectedNotes => "ノート削除",
+            E::DuplicateSelectedNotes | E::CopyNotes(..) => "ノート複製",
+            E::SetNoteVelocity { .. } | E::SetNoteVelocities(..) => "ベロシティ変更",
+            E::SetNotesMuted { .. } => "ノートミュート",
+            E::SetNoteLyrics { .. } => "歌詞編集",
+            E::QuantizeSelectedNotes(..) => "ノートをクオンタイズ",
+            E::QuantizePitchesToScale(..) => "ピッチをスケールに補正",
+
+            // ---- クリップ ----
+            E::CreateClip { .. } => "クリップ作成",
+            E::AddTextClipAt { .. } => "テキストクリップ追加",
+            E::SetClipPositions(..) => "クリップ移動",
+            E::ResizeClip { .. } => "クリップ長さ変更",
+            E::DeleteSelectedClip => "クリップ削除",
+            E::DuplicateClipsShared(..) | E::DuplicateClipsUnique(..) => "クリップ複製",
+            E::CloneClipsLinked(..) | E::CloneClipsIndependent(..) => "クリップ複製",
+            E::MakeClipUnique(..) => "クリップを独立化",
+            E::CommitRenameClip => "クリップ名変更",
+            E::SplitClipAtPlayhead { .. } => "クリップ分割",
+            E::GlueSelectedClips => "クリップ結合",
+            E::SetClipColor { .. } => "クリップ色変更",
+            E::SetClipMuted { .. } | E::SetClipsMuted { .. } => "クリップミュート",
+            E::SetClipReversed { .. } | E::ToggleClipReversed(..) => "クリップ逆再生",
+            E::SetClipStretchMode { .. } => "ストレッチモード変更",
+            E::SetClipGainDb { .. } | E::SetClipGainDbBatch(..) => "クリップゲイン変更",
+            E::SetClipPan { .. } => "クリップパン変更",
+            E::SetClipPitchSemitones { .. } => "クリップピッチ変更",
+            E::SetClipFadeInBeats { .. }
+            | E::SetClipFadeOutBeats { .. }
+            | E::SetClipFadeInCurve { .. }
+            | E::SetClipFadeOutCurve { .. }
+            | E::SetClipFadeBeatsBatch(..)
+            | E::SetClipFadeCurveBatch(..) => "フェード変更",
+            E::AutoFadeSelectedClips => "オートフェード",
+            E::AutoCrossfadeSelectedClips => "オートクロスフェード",
+            E::BroadcastDiscreteClipEdit { .. } => "クリップ編集",
+            E::BounceClipInPlace(..) | E::BounceClipWithFx(..) => "バウンス",
+
+            // ---- テキスト / 画像 クリップ ----
+            E::SetClipTextMuted { .. }
+            | E::SetClipTextContent { .. }
+            | E::SetClipTextFontFamily { .. }
+            | E::SetClipTextAlign { .. }
+            | E::SetClipTextFadeInCurve { .. }
+            | E::SetClipTextFadeOutCurve { .. }
+            | E::SetClipTextNumField { .. }
+            | E::CommitClipTextContentEdit
+            | E::CommitClipTextFontFamilyEdit
+            | E::SetClipTextX { .. }
+            | E::SetClipTextY { .. }
+            | E::SetClipTextW { .. }
+            | E::SetClipTextH { .. }
+            | E::SetClipTextRotation { .. } => "テキスト編集",
+            E::CommitFontFromPicker(..) => "フォント変更",
+            E::SetClipImageX { .. }
+            | E::SetClipImageY { .. }
+            | E::SetClipImageW { .. }
+            | E::SetClipImageH { .. }
+            | E::SetClipImageOpacity { .. }
+            | E::SetClipImageRotation { .. } => "画像変形",
+
+            // ---- トラック ----
+            E::AddInstrumentTrack => "トラック追加",
+            E::AddReturnTrack => "リターントラック追加",
+            E::GroupSelectedTracks { .. } => "トラックをグループ化",
+            E::UngroupTracks { .. } => "グループ解除",
+            E::SetTrackParent { .. } => "トラック親変更",
+            E::RemoveLastTrack | E::DeleteTrack(..) => "トラック削除",
+            E::MoveTrackUp(..) | E::MoveTrackDown(..) | E::ReorderTracks(..) => "トラック並べ替え",
+            E::CommitRenameTrack => "トラック名変更",
+            E::SetTrackColor { .. } => "トラック色変更",
+            E::ResetTrackClipColors { .. } => "クリップ色リセット",
+
+            // ---- セクション帯 ----
+            E::CommitRenameSection => "セクション名変更",
+            E::SetSectionColor { .. } => "セクション色変更",
+
+            // ---- ミキサー / センド ----
+            E::SetTrackVolume { .. } => "音量変更",
+            E::SetTrackPan { .. } => "パン変更",
+            E::ToggleTrackMute(..) => "ミュート切替",
+            E::ToggleTrackSolo(..) => "ソロ切替",
+            E::SetMasterGain(..) => "マスターゲイン変更",
+            E::AddSend { .. } => "センド追加",
+            E::RemoveSend { .. } => "センド削除",
+            E::SetSendMode { .. } => "センドモード変更",
+            E::SetSendGain { .. } => "センドゲイン変更",
+            E::SetSendEnabled { .. } => "センド有効切替",
+
+            // ---- デバイス / プラグイン ----
+            E::SelectPluginFromDb { .. } => "プラグイン追加",
+            E::RemoveDevice { .. } => "デバイス削除",
+            E::ReorderInspectorChain(..) => "チェーン並べ替え",
+            E::SetVideoFxParam { .. } => "映像FX変更",
+            E::SetPluginParam { .. } => "プラグインパラメータ変更",
+            E::SetSidechainSource { .. } | E::SetAuxInputTapPoint { .. } => "サイドチェイン設定",
+            E::ExplodeParallelOut { .. } => "パラアウト展開",
+            E::SetParallelOutputRoute { .. } => "パラアウト経路変更",
+
+            // ---- モジュレーション ----
+            E::AddModSource { .. } => "モジュレーション追加",
+            E::RemoveModSource { .. } => "モジュレーション削除",
+            E::EditModSource { .. }
+            | E::SetModSourceAttack { .. }
+            | E::SetModSourceRelease { .. }
+            | E::SetModSourceTapPoint { .. }
+            | E::SetModSourceTrack { .. } => "モジュレーション編集",
+            E::AddModRouting { .. } | E::RemoveModRouting { .. } => "モジュレーション接続",
+            E::SetModRoutingDepth { .. } => "モジュレーション深度変更",
+            E::SetModRoutingPolarity { .. } => "モジュレーション極性変更",
+
+            // ---- オートメーション ----
+            E::AddAutomationPoint { .. } => "ポイント追加",
+            E::MoveAutomationPoints { .. } => "ポイント移動",
+            E::DeleteAutomationPoints { .. } => "ポイント削除",
+            E::SetAutomationPointValue { .. } => "ポイント値変更",
+            E::QuantizeSelectedAutomationPoints(..) => "ポイントをクオンタイズ",
+            E::SetAutomationCurveType { .. }
+            | E::SetAutomationCurveBezierTension { .. }
+            | E::SetAutomationCurveExponentialBend { .. } => "カーブ変更",
+            E::CreateAutomationClip { .. } => "オートメーションクリップ作成",
+            E::MoveAutomationClips { .. } => "オートメーションクリップ移動",
+            E::ResizeAutomationClips { .. } => "オートメーションクリップ長さ変更",
+            E::DeleteAutomationClips { .. } => "オートメーションクリップ削除",
+            E::CloneAutomationClipsLinked { .. } | E::CloneAutomationClipsIndependent { .. } => {
+                "オートメーションクリップ複製"
+            }
+            E::DuplicateAutomationClipsShared(..) | E::DuplicateAutomationClipsUnique(..) => {
+                "オートメーションクリップ複製"
+            }
+            E::MakeAutomationClipUnique(..) => "オートメーションクリップを独立化",
+            E::SetLaneEnabled { .. } => "オートメーション有効切替",
+            E::SetLaneVisible { .. } => "レーン表示切替",
+            E::SetLaneDefault { .. } => "レーン既定値変更",
+            E::SetLaneHeight { .. } | E::SetSingleTrackRowH { .. } => "レーン高さ変更",
+            E::DeleteLane { .. } => "レーン削除",
+            E::AddImageAutomationLane { .. }
+            | E::AddTextAutomationLane { .. }
+            | E::AddGroupAutomationLane { .. }
+            | E::AddAutomationFromLastTouched => "オートメーションレーン追加",
+            E::RemoveImageAutomationLane { .. }
+            | E::RemoveTextAutomationLane { .. }
+            | E::RemoveGroupAutomationLane { .. } => "オートメーションレーン削除",
+
+            // ---- 立ち絵グループ変形 ----
+            E::BeginGroupTransformDrag | E::SetGroupTransformField { .. } => "グループ変形",
+
+            // ---- スケール ----
+            E::SetScaleAtPlayhead { .. } => "スケール変更",
+            E::ClearScaleChanges => "スケール解除",
+
+            // ---- VOICEVOX (歌唱 / トーク / 口パク) ----
+            E::SetLipsyncTarget { .. } => "口パク出力先変更",
+            E::SetMouthMapSlot { .. } => "口形状設定",
+            E::SetClipVoice { .. } => "声変更",
+            E::SetClipTalkParam { .. } => "トークパラメータ変更",
+
+            // ---- Audio Editor (波形編集) ----
+            E::DuplicateAudioEditorEvent => "オーディオイベント複製",
+            E::DeleteAudioEditorSelection => "オーディオイベント削除",
+            E::SetAudioEventStart { .. } => "オーディオイベント移動",
+            E::SetAudioEventTrim { .. } => "オーディオイベントトリム",
+            E::AddAudioEventFromFile { .. } => "オーディオイベント追加",
+            E::AutoWarpSelectedClip => "オートワープ",
+            E::MoveWarpMarker { .. } | E::AddWarpMarker { .. } | E::DeleteWarpMarker { .. } => {
+                "ワープマーカー編集"
+            }
+
+            // ---- メディア読み込み ----
+            E::ImportAudio { .. } => "オーディオ読み込み",
+            E::ImportVideo { .. } => "動画読み込み",
+            E::ImportImage { .. } => "画像読み込み",
+
+            // 非編集 event (snapshot を積まない) はここに落ちてラベルは記録
+            // されない。 編集 event のラベル漏れも "編集" で名前を保証する。
+            _ => "編集",
+        }
+    }
 }
 
 /// Phase 7 B5: `QuantizePitchesToScale` の対象スコープ。

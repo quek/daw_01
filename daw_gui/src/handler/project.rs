@@ -59,6 +59,36 @@ impl AppData {
         self.after_undo_redo();
     }
 
+    /// r.md #29: 履歴リストの行 click → `index` 番目の state へ一気に遡る /
+    /// 進む。 undo/redo を必要段数ぶん繰り返すのと等価だが、 reconcile
+    /// (`after_undo_redo`) は最終 state に対して 1 度だけ走らせる。
+    pub(crate) fn jump_history_to(&mut self, index: usize) {
+        if !self.song_doc.jump_to(index) {
+            return;
+        }
+        self.after_undo_redo();
+    }
+
+    /// プロジェクト非依存の UI 設定 (resource monitor on/off・編集履歴 window の
+    /// 開閉/位置/サイズ) を app_config.json に永続化する。 `ui_prefs` が SSoT なので
+    /// 保存対象を増やしても呼び出し側は本メソッド 1 つで済む (r.md #3 / #29)。
+    pub(crate) fn persist_app_config(&self) {
+        let Some(dirs) = &self.ui_prefs.app_dirs else {
+            return;
+        };
+        let cfg = crate::app_config::AppConfig {
+            resource_monitor_enabled: self.ui_prefs.resource_monitor_enabled,
+            undo_history_open: self.ui_prefs.undo_history_open,
+            undo_history_rect: self
+                .ui_prefs
+                .undo_history_rect
+                .map(|r| [r.x, r.y, r.w, r.h]),
+        };
+        if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
+            tracing::warn!(error = ?e, "failed to save app_config");
+        }
+    }
+
     pub(crate) fn after_undo_redo(&mut self) {
         // (epoch bump / gesture chain 切断は SongDoc::undo/redo が実施済み。)
         // selected_clip が undo 後も存在するなら維持、消えていれば None。

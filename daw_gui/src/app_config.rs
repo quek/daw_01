@@ -13,6 +13,13 @@ pub struct AppConfig {
     /// status bar のリソースモニター常駐表示を出すか。 default = true。
     #[serde(default = "default_true")]
     pub resource_monitor_enabled: bool,
+    /// r.md #29: 編集履歴 window が開いているか (再起動を跨いで復元)。 default = false。
+    #[serde(default)]
+    pub undo_history_open: bool,
+    /// r.md #29: 編集履歴 window の位置・サイズ `[x, y, w, h]` (px)。 `None` =
+    /// 未配置 (初回は既定の右上に出す)。 drag / resize 確定時に保存する。
+    #[serde(default)]
+    pub undo_history_rect: Option<[f32; 4]>,
 }
 
 fn default_true() -> bool {
@@ -23,6 +30,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             resource_monitor_enabled: true,
+            undo_history_open: false,
+            undo_history_rect: None,
         }
     }
 }
@@ -59,9 +68,14 @@ mod tests {
         let path = dir.path().join("app_config.json");
         let cfg = AppConfig {
             resource_monitor_enabled: false,
+            undo_history_open: true,
+            undo_history_rect: Some([10.0, 20.0, 260.0, 360.0]),
         };
         save(&path, &cfg).unwrap();
-        assert!(!load(&path).resource_monitor_enabled);
+        let loaded = load(&path);
+        assert!(!loaded.resource_monitor_enabled);
+        assert!(loaded.undo_history_open);
+        assert_eq!(loaded.undo_history_rect, Some([10.0, 20.0, 260.0, 360.0]));
     }
 
     #[test]
