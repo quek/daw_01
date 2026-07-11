@@ -112,6 +112,13 @@ pub struct UiPrefs {
     /// status bar の常駐メーター表示 on/off (app_config.json で永続化)。
     pub resource_monitor_enabled: bool,
 
+    /// r.md #29: 編集履歴 window が開いているか (app_config で永続、 再起動を跨いで
+    /// 復元)。 View メニュー / Ctrl+Alt+Z / Esc / ✕ で toggle。
+    pub undo_history_open: bool,
+    /// r.md #29: 編集履歴 window の位置・サイズ (app_config で永続)。 `None` =
+    /// 未配置 (初回は既定の右上)。 drag / resize 確定時に更新して保存する。
+    pub undo_history_rect: Option<daw_ui_renderer::Rect>,
+
     pub is_help_open: bool,
 
     /// per-user データディレクトリ (recent / recent_saved / recovery /

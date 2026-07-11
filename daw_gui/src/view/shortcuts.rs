@@ -73,6 +73,7 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     // ----- 編集 -----
     ShortcutDef { name: "undo", keys: &["Ctrl+Z"], category: ShortcutCategory::Edit, description: "元に戻す", hidden: false },
     ShortcutDef { name: "redo", keys: &["Ctrl+Shift+Z", "Ctrl+Y"], category: ShortcutCategory::Edit, description: "やり直し", hidden: false },
+    ShortcutDef { name: "daw.toggle_undo_history", keys: &["Ctrl+Alt+Z"], category: ShortcutCategory::Edit, description: "編集履歴パネルを開く / 閉じる", hidden: false },
     ShortcutDef { name: "cut", keys: &["Ctrl+X"], category: ShortcutCategory::Edit, description: "カット (選択中の面)", hidden: false },
     ShortcutDef { name: "copy", keys: &["Ctrl+C"], category: ShortcutCategory::Edit, description: "コピー (選択中の面)", hidden: false },
     ShortcutDef { name: "paste", keys: &["Ctrl+V"], category: ShortcutCategory::Edit, description: "ペースト", hidden: false },

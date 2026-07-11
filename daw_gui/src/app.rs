@@ -289,6 +289,15 @@ impl AppData {
                     .as_ref()
                     .map(|d| crate::app_config::load(d.app_config()).resource_monitor_enabled)
                     .unwrap_or(true),
+                // r.md #29: 編集履歴 window の開閉/位置/サイズを app_config から復元。
+                undo_history_open: app_dirs
+                    .as_ref()
+                    .map(|d| crate::app_config::load(d.app_config()).undo_history_open)
+                    .unwrap_or(false),
+                undo_history_rect: app_dirs
+                    .as_ref()
+                    .and_then(|d| crate::app_config::load(d.app_config()).undo_history_rect)
+                    .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
                 is_help_open: false,
                 app_dirs,
                 recent_files,
@@ -335,6 +344,7 @@ impl AppData {
                 pending_pianoroll_fit: false,
                 last_arrange_canvas_size: (0.0, 0.0),
                 resource_panel_open: false,
+                undo_history_follow_pos: 0,
                 plugin_picker_entries,
                 plugin_picker_visible: Vec::new(),
                 plugin_picker_query: String::new(),
@@ -440,7 +450,9 @@ impl AppData {
     pub fn handle_event(&mut self, event: AppEvent) {
         // この event の ambient undo scope を確定する (1 event 内の複数 edit_song は
         // 1 undo step に squash、 Begin*/End* gesture 中は drag 全体で 1 step)。
-        self.song_doc.begin_event();
+        // 同時に、 この event が snapshot を積んだときの履歴リスト用ラベル
+        // (r.md #29) を event 種から確定して渡す。
+        self.song_doc.begin_event(event.undo_label());
         // Export gate (positive-default + block-list)。
         //
         // 旧構造は negative-default の allow-list だった (export 中は列挙した少数
@@ -617,6 +629,14 @@ impl AppData {
             }
             AppEvent::Undo => self.undo(),
             AppEvent::Redo => self.redo(),
+            // r.md #29: 履歴 window の開閉トグル (View メニュー / ✕ / Esc / Ctrl+Alt+Z)。
+            // 開閉状態は app_config に永続 (再起動を跨いで復元)。
+            AppEvent::ToggleUndoHistory => {
+                self.ui_prefs.undo_history_open = !self.ui_prefs.undo_history_open;
+                self.persist_app_config();
+            }
+            // r.md #29: 履歴リストの行 click → その state へ一発 Undo/Redo。
+            AppEvent::JumpHistory(index) => self.jump_history_to(index),
             AppEvent::QuantizeSelectedNotes(div) => {
                 self.quantize_selected_notes(div);
             }
@@ -1364,14 +1384,7 @@ impl AppData {
             AppEvent::ToggleResourceMonitor => {
                 self.ui_prefs.resource_monitor_enabled = !self.ui_prefs.resource_monitor_enabled;
                 // app_config.json に永続化 (プロジェクト非依存の UI 設定)。
-                if let Some(dirs) = &self.ui_prefs.app_dirs {
-                    let cfg = crate::app_config::AppConfig {
-                        resource_monitor_enabled: self.ui_prefs.resource_monitor_enabled,
-                    };
-                    if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
-                        tracing::warn!(error = ?e, "failed to save app_config");
-                    }
-                }
+                self.persist_app_config();
             }
             AppEvent::ToggleResourcePanel => {
                 self.ui_ephemeral.resource_panel_open = !self.ui_ephemeral.resource_panel_open;

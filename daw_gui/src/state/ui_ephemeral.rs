@@ -169,6 +169,10 @@ pub struct UiEphemeral {
     pub last_arrange_canvas_size: (f32, f32),
     /// 詳細パネルが開いているか (session-only、 Esc / 再クリックで閉じる)。
     pub resource_panel_open: bool,
+    /// 履歴パネルが最後に auto-scroll で追従した履歴 index。 現在位置
+    /// ([`crate::state::SongDoc::history_current`]) がこれと変わったフレームだけ
+    /// current 行が見えるよう scroll offset を合わせ、 手動 scroll は妨げない。
+    pub undo_history_follow_pos: usize,
     pub plugin_picker_entries: Vec<PluginPickEntry>,
     pub plugin_picker_visible: Vec<PluginPickEntry>,
     /// プラグインピッカーの検索ボックスに入力中の絞り込みクエリ。

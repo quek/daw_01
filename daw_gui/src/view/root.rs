@@ -13,7 +13,7 @@ use crate::app::{AppData, AppEvent};
 use crate::view::{
     arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
     font_picker, load_overlay, plugin_picker, recovery_modal, resource_monitor, shortcuts_help,
-    snap, status_bar, track_inspector, track_picker, transport, voicevox_overlay,
+    snap, status_bar, track_inspector, track_picker, transport, undo_history, voicevox_overlay,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -39,6 +39,12 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
         theme::WINDOW_BG,
         0.0,
     );
+
+    // r.md #29: 編集履歴 window が開いていれば、 その rect 分だけ背後の pointer を
+    // 占有する予約を **背景 widget 描画より前** に行う (= window の上の click が
+    // アレンジ等に漏れず、 window の外は通常操作できる true floating)。 本体描画は
+    // build_root 末尾で `undo_history::draw`。
+    undo_history::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
     // ----- レイアウト計算 -----
     let menu_rect = Rect { x: 0.0, y: 0.0, w: sw, h: MENU_H };
@@ -105,6 +111,11 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // resource monitor (r.md #3): 詳細パネル (non-modal overlay)。 開いている時だけ
     // 描画する。 modal より前に呼ぶので、 modal が出れば自然に隠れる (意図どおり)。
     resource_monitor::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+
+    // Undo 履歴 window (r.md #29): inline な true-floating window の本体描画
+    // (背景描画の後 = z-order 最前面)。 pointer 占有予約は build_root 冒頭の
+    // `undo_history::reserve`。
+    undo_history::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
     // Modal: plugin picker。draw 関数内で modal の open/close を app.ui_ephemeral.is_plugin_picker_open
     // と同期させる (常時呼び、内部で is_modal_open / open_modal を管理)。
@@ -273,6 +284,12 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             });
         });
         mb.menu("View", |m| {
+            // r.md #29: 編集履歴パネルの開閉。 行 click でその時点へ一発 Undo/Redo。
+            m.item("編集履歴", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleUndoHistory)
+                }));
+            });
             m.item("Toggle Help", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleHelp)));
             });
@@ -777,6 +794,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             app.handle_event(AppEvent::Redo)
         }));
     }
+    // r.md #29: Ctrl+Alt+Z で編集履歴パネルを開閉。
+    if ui.take_shortcut("daw.toggle_undo_history") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::ToggleUndoHistory)
+        }));
+    }
     // ----- Clipboard / Delete (統一 arbiter) -----
     // ポインタが乗っている編集面 → なければ選択優先順、で対象面を一意に決める
     // (grill-me 2026-06-11)。copy / cut / paste / delete が同じ arbiter を共有。
@@ -1261,6 +1284,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             // (rename / audio editor の後、 選択解除より優先)。
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleResourcePanel)
+            }));
+        } else if app.ui_prefs.undo_history_open {
+            // r.md #29: 編集履歴 window が開いていれば Esc で閉じる
+            // (resource panel と同順、 選択解除より優先)。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleUndoHistory)
             }));
         } else if !app.selection.selected_clips.is_empty()
             || app.selection.selected_clip.is_some()

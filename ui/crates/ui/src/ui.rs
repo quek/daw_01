@@ -1028,6 +1028,45 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.is_popup_open(("overlay", &id))
     }
 
+    /// 常駐 floating panel (daw_01 の編集履歴 window 等) が、 **自分の rect 分だけ**
+    /// 背後の pointer を占有するための予約。 `open_overlay` (= 開いている間、 背景
+    /// 全体の pointer を mask する capture_input modal) と違い、 pointer が `rect` の
+    /// **外** にある間は背景 widget を通常どおり操作できる (= 真の非ブロッキング
+    /// floating window)。
+    ///
+    /// 使い方 (2 段): build_root の **背景 widget 描画より前** に、 panel が開いて
+    /// いるとき panel rect で本メソッドを呼ぶ。 raw pointer が `rect` 内にある間だけ
+    /// `self.pointer` を mask し、 以降に描く背景 widget (arrangement 等) がその
+    /// click / hover / scroll に反応しないようにする (= panel 上のクリックが背後に
+    /// 漏れない)。 panel 自身の描画は末尾で [`Ui::with_floating_region`] に包む。
+    ///
+    /// 真のモーダル (`modal_capturing`) が開いている間は何もしない (モーダルが優先し、
+    /// panel はその背後で inert)。
+    pub fn reserve_floating_region(&mut self, rect: Rect) {
+        if !self.modal_capturing
+            && self
+                .pointer_raw
+                .pos
+                .is_some_and(|(x, y)| rect.contains(x, y))
+        {
+            self.pointer = masked_pointer(self.pointer_raw);
+        }
+    }
+
+    /// [`Ui::reserve_floating_region`] とペア。 floating panel 自身の描画をこの
+    /// closure 内で行う。 panel 内 widget は **raw pointer** を読む (背後 mask を
+    /// 一時解除) ので drag / click / scroll が効く。 真のモーダル中は解除しない
+    /// (panel はモーダルの背後で操作不可のまま)。
+    pub fn with_floating_region<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.pointer;
+        if !self.modal_capturing {
+            self.pointer = self.pointer_raw;
+        }
+        let r = f(self);
+        self.pointer = saved;
+        r
+    }
+
     /// M14 Phase 94 (daw_01 #065): `capture_input` を指定して popup を開く内部 API。
     /// `Ui::open_modal` が `capture_input = true` で呼ぶ。 M14 Phase 114 (daw_01 #087): `color_picker`
     /// も `capture_input = true` で開く (SV/Hue drag の press を背景 widget に先取りされないため)。

@@ -22,6 +22,10 @@ use common::model::Song;
 /// Undo 履歴の上限 (snapshot 方式)。
 const UNDO_LIMIT: usize = 200;
 
+/// 履歴リスト先頭 (= どの編集にも遡れる起点) の表示ラベル。 New / Open /
+/// Recovery の直後に確定する baseline state の名前。
+pub const BASELINE_LABEL: &str = "初期状態";
+
 /// 連続 stream 編集 (MIDI CC / BPM scrub / automation 録音等、 Begin/End
 /// bracket を持たない編集源) の gesture を「時間ギャップ」 で区切る閾値。
 /// 最終編集からこれ以上空いたら新しい undo step を始める。
@@ -53,6 +57,16 @@ pub enum StreamGesture {
     AutomationRecord,
 }
 
+/// undo / redo スタックの 1 要素。 過去 (または未来) の Song snapshot と、
+/// **その state を生んだ編集の表示ラベル**。 ラベルは履歴リスト UI
+/// ([`SongDoc::history_labels`]) がそのまま行に出す。 label は編集イベントの
+/// [`crate::event::AppEvent::undo_label`] 由来の `&'static str` なので heap を
+/// 持たず Copy で stack 間を移動できる。
+struct HistoryEntry {
+    song: Song,
+    label: &'static str,
+}
+
 /// Song 文書: song 本体 + undo/redo + dirty/epoch + 保存先 path。
 pub struct SongDoc {
     /// **private**: 変更は [`SongDoc::edit`] 経由のみ (不変条件 5)。
@@ -68,8 +82,16 @@ pub struct SongDoc {
     /// 保存先 (.daw)。 未保存プロジェクトは `None`。
     pub file_path: Option<PathBuf>,
 
-    undo_stack: VecDeque<Song>,
-    redo_stack: VecDeque<Song>,
+    undo_stack: VecDeque<HistoryEntry>,
+    redo_stack: VecDeque<HistoryEntry>,
+    /// 現在の live state (`song`) を生んだ編集のラベル。 履歴リストで current
+    /// 行に出す。 baseline は [`BASELINE_LABEL`]。 undo/redo/jump で復元し、
+    /// edit() が新 step を積むたびに `pending_label` へ更新される。
+    current_label: &'static str,
+    /// 現在 dispatch 中の編集イベントのラベル ([`SongDoc::begin_event`] が
+    /// event 由来で設定)。 edit() が **実際に snapshot を積んだ** ときだけ
+    /// `current_label` へ昇格する (= 1 undo step = 1 ラベル)。
+    pending_label: &'static str,
     /// 直前の edit の gesture id。 `Gesture(id)` edit が同 id なら snapshot skip。
     last_gesture: Option<u64>,
 
@@ -114,6 +136,8 @@ impl SongDoc {
             file_path: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
+            current_label: BASELINE_LABEL,
+            pending_label: "編集",
             last_gesture: None,
             next_gesture_id: 1,
             active_gesture: None,
@@ -167,13 +191,22 @@ impl SongDoc {
             EditScope::Gesture(id) => self.last_gesture == Some(id),
         };
         if !squash {
-            self.undo_stack.push_back(self.song.clone());
+            // pre-edit state を「その state を生んだラベル」 (= current_label)
+            // ごと退避する。 label は snapshot と一緒に stack を移動するので、
+            // 履歴リストが常に「この state はどの編集の結果か」 を保てる。
+            self.undo_stack.push_back(HistoryEntry {
+                song: self.song.clone(),
+                label: self.current_label,
+            });
         }
         let (r, changed) = f(&mut self.song);
         if changed {
             // redo は「実際に編集が起きた」 ときだけ無効化する (no-op で
             // redo 履歴を消さない)。
             self.redo_stack.clear();
+            // 新しい live state を生んだのは今回の編集イベント。 そのラベルを
+            // current に昇格する (gesture squash 中は同 event 種なので同値)。
+            self.current_label = self.pending_label;
             self.last_gesture = match scope {
                 EditScope::Discrete => None,
                 EditScope::Gesture(id) => Some(id),
@@ -256,21 +289,63 @@ impl SongDoc {
     // -------- undo / redo ---------------------------------------------------
 
     pub fn undo(&mut self) -> bool {
-        let Some(prev) = self.undo_stack.pop_back() else {
+        if self.undo_stack.is_empty() {
             return false;
-        };
-        let current = std::mem::replace(&mut self.song, prev);
-        self.redo_stack.push_back(current);
+        }
+        self.step_backward();
         self.after_history_jump();
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(next) = self.redo_stack.pop_back() else {
+        if self.redo_stack.is_empty() {
             return false;
-        };
-        let current = std::mem::replace(&mut self.song, next);
-        self.undo_stack.push_back(current);
+        }
+        self.step_forward();
+        self.after_history_jump();
+        true
+    }
+
+    /// undo 1 段: undo_stack から 1 state を pop して live に、 元 live を
+    /// current_label ごと redo_stack へ退避する。 caller が境界 (`is_empty`)
+    /// を保証すること。 履歴 jump の副作用 (epoch bump 等) は含めない。
+    fn step_backward(&mut self) {
+        let prev = self.undo_stack.pop_back().expect("caller guarantees non-empty");
+        let current = std::mem::replace(&mut self.song, prev.song);
+        self.redo_stack.push_back(HistoryEntry {
+            song: current,
+            label: self.current_label,
+        });
+        self.current_label = prev.label;
+    }
+
+    /// redo 1 段: [`SongDoc::step_backward`] の対称。
+    fn step_forward(&mut self) {
+        let next = self.redo_stack.pop_back().expect("caller guarantees non-empty");
+        let current = std::mem::replace(&mut self.song, next.song);
+        self.undo_stack.push_back(HistoryEntry {
+            song: current,
+            label: self.current_label,
+        });
+        self.current_label = next.label;
+    }
+
+    /// 履歴リスト click 用: `target` 番目の state (0 = baseline、
+    /// [`SongDoc::history_current`] = 現在) へ一気に遡る / 進む。 undo/redo を
+    /// 必要段数ぶん繰り返すのと等価だが、 中間 state の reconcile を避けて
+    /// **1 回だけ** 履歴 jump 副作用を出す (caller が 1 度 reconcile する)。
+    /// `target` が範囲外、 または既に current のときは `false` (no-op)。
+    pub fn jump_to(&mut self, target: usize) -> bool {
+        let total = self.undo_stack.len() + self.redo_stack.len();
+        if target > total || target == self.undo_stack.len() {
+            return false;
+        }
+        while self.undo_stack.len() > target {
+            self.step_backward();
+        }
+        while self.undo_stack.len() < target {
+            self.step_forward();
+        }
         self.after_history_jump();
         true
     }
@@ -286,6 +361,25 @@ impl SongDoc {
     /// 現在積まれている undo snapshot 数 (= 遡れる step 数)。 テストが undo
     /// 履歴の深さを観測するための read-only accessor。
     pub fn undo_depth(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    // -------- 履歴リスト (r.md #29) -----------------------------------------
+
+    /// 履歴リスト全 state のラベルを **古い順** (baseline → 最新) で返す。
+    /// 長さ = undo 段数 + 1 (current) + redo 段数。 履歴パネルがそのまま
+    /// 各行に描く。 index は [`SongDoc::jump_to`] にそのまま渡せる。
+    pub fn history_labels(&self) -> Vec<&'static str> {
+        let mut labels = Vec::with_capacity(self.undo_stack.len() + 1 + self.redo_stack.len());
+        labels.extend(self.undo_stack.iter().map(|e| e.label));
+        labels.push(self.current_label);
+        // redo_stack は back=次の redo 先 なので、 古い順に並べるには rev。
+        labels.extend(self.redo_stack.iter().rev().map(|e| e.label));
+        labels
+    }
+
+    /// [`SongDoc::history_labels`] の中で現在の live state が占める index。
+    pub fn history_current(&self) -> usize {
         self.undo_stack.len()
     }
 
@@ -306,6 +400,7 @@ impl SongDoc {
         self.song = song;
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.current_label = BASELINE_LABEL;
         self.last_gesture = None;
         self.edit_epoch += 1;
         self.saved_epoch = self.edit_epoch;
@@ -315,13 +410,17 @@ impl SongDoc {
 
     /// AppEvent dispatch の冒頭で呼ぶ: この event の ambient scope を確定する。
     /// interaction gesture 中はその id、 それ以外は fresh id (= 1 event 内の
-    /// 複数 edit は squash、 event 間は独立)。
-    pub fn begin_event(&mut self) {
+    /// 複数 edit は squash、 event 間は独立)。 `label` は この event が edit() で
+    /// snapshot を積んだときの履歴リスト用ラベル (r.md #29)。
+    pub fn begin_event(&mut self, label: &'static str) {
         let id = match self.active_gesture {
             Some(id) => id,
             None => self.alloc_gesture(),
         };
         self.event_scope = EditScope::Gesture(id);
+        // この event が edit() で snapshot を積んだら、 この label が新 step の
+        // 名前になる。 編集しない event では未使用のまま次 event で上書きされる。
+        self.pending_label = label;
     }
 
     /// 現在 dispatch 中 event の ambient scope。
@@ -435,5 +534,126 @@ mod tests {
         });
         assert_eq!(r, None, "export 中は拒否");
         assert_eq!(doc.edit_epoch(), before, "拒否時は epoch 不変");
+    }
+
+    // -------- r.md #29: ラベル付き履歴 + jump ---------------------------------
+
+    /// discrete edit を積むと、 各 state に begin_event で渡したラベルが付き、
+    /// history_labels() が baseline → 最新の順で返す。
+    #[test]
+    fn history_labels_reflect_edits() {
+        let mut doc = SongDoc::new(Song::default());
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL]);
+        assert_eq!(doc.history_current(), 0);
+
+        doc.begin_event("テンポ変更");
+        doc.edit(EditScope::Discrete, |s| s.bpm = 140.0);
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "テンポ変更"]);
+        assert_eq!(doc.history_current(), 1);
+
+        doc.begin_event("音量変更");
+        doc.edit(EditScope::Discrete, |s| s.bpm = 150.0);
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "テンポ変更", "音量変更"]);
+        assert_eq!(doc.history_current(), 2);
+    }
+
+    /// 同一 gesture id の連続 edit は 1 step に squash され、 ラベルも 1 つ。
+    #[test]
+    fn gesture_squash_is_one_labeled_step() {
+        let mut doc = SongDoc::new(Song::default());
+        doc.begin_event("音量変更");
+        doc.edit(EditScope::Gesture(7), |s| s.bpm = 130.0);
+        doc.edit(EditScope::Gesture(7), |s| s.bpm = 131.0);
+        doc.edit(EditScope::Gesture(7), |s| s.bpm = 132.0);
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "音量変更"]);
+        assert_eq!(doc.history_current(), 1);
+    }
+
+    /// undo/redo は current index とラベル対応を保ちつつ live state を戻す。
+    #[test]
+    fn undo_redo_preserve_labels_and_state() {
+        let mut doc = SongDoc::new(Song::default());
+        let base_bpm = doc.song().bpm;
+        doc.begin_event("A");
+        doc.edit(EditScope::Discrete, |s| s.bpm = 140.0);
+        doc.begin_event("B");
+        doc.edit(EditScope::Discrete, |s| s.bpm = 150.0);
+
+        assert!(doc.undo());
+        assert_eq!(doc.song().bpm, 140.0);
+        assert_eq!(doc.history_current(), 1);
+        // 履歴の中身 (ラベル列) は undo では変わらない。
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "A", "B"]);
+
+        assert!(doc.undo());
+        assert_eq!(doc.song().bpm, base_bpm);
+        assert_eq!(doc.history_current(), 0);
+
+        assert!(doc.redo());
+        assert_eq!(doc.song().bpm, 140.0);
+        assert_eq!(doc.history_current(), 1);
+    }
+
+    /// jump_to は 1 発で任意 index の state へ遷移する (undo/redo を必要段数
+    /// 繰り返したのと同じ結果)。
+    #[test]
+    fn jump_to_reaches_any_index() {
+        let mut doc = SongDoc::new(Song::default());
+        let base_bpm = doc.song().bpm;
+        for (label, bpm) in [("A", 140.0), ("B", 150.0), ("C", 160.0)] {
+            doc.begin_event(label);
+            doc.edit(EditScope::Discrete, |s| s.bpm = bpm);
+        }
+        assert_eq!(doc.history_current(), 3);
+
+        // 一気に baseline へ。
+        assert!(doc.jump_to(0));
+        assert_eq!(doc.history_current(), 0);
+        assert_eq!(doc.song().bpm, base_bpm);
+
+        // 一気に途中 (A の直後) へ。
+        assert!(doc.jump_to(1));
+        assert_eq!(doc.history_current(), 1);
+        assert_eq!(doc.song().bpm, 140.0);
+
+        // 一気に最新へ。
+        assert!(doc.jump_to(3));
+        assert_eq!(doc.history_current(), 3);
+        assert_eq!(doc.song().bpm, 160.0);
+
+        // current / 範囲外 は no-op。
+        assert!(!doc.jump_to(3), "current へは no-op");
+        assert!(!doc.jump_to(4), "範囲外は no-op");
+        assert_eq!(doc.song().bpm, 160.0);
+    }
+
+    /// jump 後に新規編集すると redo 分岐は破棄される (linear undo の一貫性)。
+    #[test]
+    fn edit_after_jump_truncates_future() {
+        let mut doc = SongDoc::new(Song::default());
+        for (label, bpm) in [("A", 140.0), ("B", 150.0)] {
+            doc.begin_event(label);
+            doc.edit(EditScope::Discrete, |s| s.bpm = bpm);
+        }
+        doc.jump_to(1); // A の直後、 B は redo 待ち。
+        doc.begin_event("C");
+        doc.edit(EditScope::Discrete, |s| s.bpm = 170.0);
+        // B は捨てられ、 A → C の直線履歴になる。
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "A", "C"]);
+        assert_eq!(doc.history_current(), 2);
+        assert!(!doc.can_redo());
+    }
+
+    /// no-op 編集 (edit_checked が false) は履歴に step を足さない。
+    #[test]
+    fn noop_edit_adds_no_labeled_step() {
+        let mut doc = SongDoc::new(Song::default());
+        doc.begin_event("A");
+        doc.edit(EditScope::Discrete, |s| s.bpm = 140.0);
+        let before = doc.history_labels();
+        doc.begin_event("no-op");
+        doc.edit_checked(EditScope::Discrete, |_s| false);
+        assert_eq!(doc.history_labels(), before, "no-op は履歴を汚さない");
+        assert_eq!(doc.history_current(), 1);
     }
 }
