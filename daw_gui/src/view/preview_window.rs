@@ -663,12 +663,14 @@ fn aspect_fit_rect(dst: (f32, f32), src: (f32, f32)) -> (f32, f32, f32, f32) {
 /// after creation; we just want a reasonable default.
 ///
 /// Heuristic: scale (preserving aspect) so the longest dimension is
-/// at most 960 logical pixels. 4K project → 960x540, 1080p → 960x540,
-/// 720p → 960x540 (= identity), VGA → 640x480 (no scale-up either).
+/// at most 640 logical pixels. 4K project → 640x360, 1080p → 640x360,
+/// 720p → 640x360, VGA (640x480) → 640x480 (長辺がちょうど上限なので等倍)。
+/// r.md #25: 既定サイズを小さめにして、 preview を常時表示しても main
+/// window の作業を邪魔しないようにする (user は自由にリサイズできる)。
 fn scale_to_fit_on_screen(size: (u32, u32)) -> (u32, u32) {
     let (w, h) = size;
     let (w, h) = (w.max(1), h.max(1));
-    let max_dim = 960u32;
+    let max_dim = 640u32;
     let long = w.max(h);
     if long <= max_dim {
         return (w, h);
@@ -686,11 +688,11 @@ mod tests {
 
     #[test]
     fn scale_to_fit_caps_long_dimension() {
-        assert_eq!(scale_to_fit_on_screen((3840, 2160)), (960, 540));
-        assert_eq!(scale_to_fit_on_screen((1920, 1080)), (960, 540));
-        // 720p already under cap → identity.
-        assert_eq!(scale_to_fit_on_screen((1280, 720)), (960, 540));
-        // Below cap stays unchanged.
+        assert_eq!(scale_to_fit_on_screen((3840, 2160)), (640, 360));
+        assert_eq!(scale_to_fit_on_screen((1920, 1080)), (640, 360));
+        // 720p も長辺 1280 > 640 上限なので縮小される。
+        assert_eq!(scale_to_fit_on_screen((1280, 720)), (640, 360));
+        // 長辺がちょうど上限 (VGA 640x480) は等倍のまま。
         assert_eq!(scale_to_fit_on_screen((640, 480)), (640, 480));
         // Pathological zeros clamp to >=1.
         let (w, h) = scale_to_fit_on_screen((0, 0));

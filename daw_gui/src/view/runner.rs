@@ -1076,6 +1076,22 @@ impl Runner {
             WindowEvent::RedrawRequested => {
                 preview.render_placeholder();
             }
+            // r.md #26: preview window にフォーカスがあるときの Space で
+            // 再生 / 停止をトグル。 preview には text 入力欄が無いので無条件で
+            // transport に割り当てられる。 auto-repeat (押しっぱなし) は無視して
+            // 1 押下 1 トグルにする。 main window の `daw.play_toggle` と同じ
+            // `AppEvent::PlayToggle` を proxy 経由で送る (user_event 経路を通り、
+            // main window の redraw 要求と再生スレッド起動が同一 SSoT で走る)。
+            WindowEvent::KeyboardInput { event, .. }
+                if matches!(event.state, winit::event::ElementState::Pressed)
+                    && !event.repeat
+                    && matches!(
+                        map_phys_key(event.physical_key),
+                        daw_ui_platform::PhysicalKey::Space
+                    ) =>
+            {
+                let _ = self.proxy.send_event(AppEvent::PlayToggle);
+            }
             // `docs/plan_image_overlay.md` §4 P5: PiP rect の drag 編集。
             // CursorMoved / MouseInput を捕捉して、 hit-test → drag
             // state 開始 → MouseMoved delta から normalized rect 更新
