@@ -315,16 +315,9 @@ pub fn render_mp4_cancellable(
     // render only the chosen beat window (default = whole song).
     // `start_beat` becomes output frame 0; the audio WAV muxed in is already
     // trimmed to the same window starting at its own sample 0, so A/V stay
-    // aligned. Clamp into [0, length_beats] and require end > start (the GUI
-    // validates this too, but never trust a cross-process payload).
-    let (start_beat, end_beat) = match cfg.range_beats {
-        Some((s, e)) => {
-            let s = s.clamp(0.0, cfg.song.length_beats);
-            let e = e.clamp(0.0, cfg.song.length_beats);
-            (s.min(e), s.max(e))
-        }
-        None => (0.0, cfg.song.length_beats),
-    };
+    // aligned. 窓解決は `resolve_render_window` に一本化 (length_beats で clamp
+    // しないのが要点 — r.md #32、下記関数の doc 参照)。
+    let (start_beat, end_beat) = resolve_render_window(cfg.range_beats, cfg.song.length_beats);
     // M2 (r.md #8): frame↔beat は tempo automation を積分する `TempoMap` で写像する
     // (audio export・preview と同一)。 constant-bpm 換算のままだと SongTempo curve の
     // ある曲で映像が tempo 積分済みの audio から drift する (A/V desync)。
@@ -676,6 +669,36 @@ fn build_frame_scene(
     }
 }
 
+/// 書き出す拍窓 `[start_beat, end_beat)` を解決する。output frame 0 が
+/// `start_beat` に対応し、muxed audio WAV も同じ窓に trim 済みなので A/V が揃う。
+///
+/// `Some((s, e))` は user 指定 / ループ範囲 (レンジピッカーで確定した値) を
+/// **そのまま** 使う。負値・非有限だけ弾いて順序を正すだけで、**`length_beats`
+/// で clamp しない**。
+///
+/// これが r.md #32 の要点: ループ範囲は `length_beats` を超えられ (loop_end >
+/// length_beats)、content 自体も `length_beats` 超に置ける。audio 書き出し
+/// (`AppData::export_beats_to_frames`) は `length_beats` で clamp せず raw な拍
+/// 範囲を frame へ換算するので、ここで video だけ `length_beats` に clamp すると
+/// **映像だけが短く切れて A/V 長が食い違う**。実例: loop `[8, 260]`・length
+/// `64`・BPM 140 の曲で、旧実装は end を 64 に clamp して窓 `[8, 64]` = 56 拍 =
+/// 24.0s の映像しか出さず、audio は raw `[8, 260]` = 252 拍 = 108s だった
+/// (content は beat 260 まで在るのに映像が 24s で凍結)。
+///
+/// `None` は全曲 = `[0, length_beats)` (レンジピッカーで「全曲」を選んだとき)。
+fn resolve_render_window(range_beats: Option<(f64, f64)>, length_beats: f64) -> (f64, f64) {
+    // 負値・NaN/Inf を 0 に潰す (GUI も検証済みだが防御)。`f64::max` は
+    // 非 NaN 側を返すので NaN.max(0.0) == 0.0。
+    let sane = |b: f64| if b.is_finite() { b.max(0.0) } else { 0.0 };
+    match range_beats {
+        Some((s, e)) => {
+            let (s, e) = (sane(s), sane(e));
+            (s.min(e), s.max(e))
+        }
+        None => (0.0, sane(length_beats)),
+    }
+}
+
 fn resolve_video_source_path(
     song: &Song,
     video_source_id: VideoSourceId,
@@ -694,6 +717,33 @@ fn resolve_video_source_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// r.md #32 回帰: 書き出し窓は `length_beats` を超えるループ / 範囲もそのまま
+    /// 尊重し、audio 側と同じ窓を返す。旧実装は end を `length_beats` に clamp して
+    /// いたため、loop `[8, 260]`・length `64` の曲で映像だけ `[8, 64]` = 24s に
+    /// truncate され、audio は `[8, 260]` = 108s と割れていた (映像が 24 秒で凍結)。
+    #[test]
+    fn render_window_honors_range_beyond_length_beats() {
+        // r.md #32 の実データ: loop_end (260) > length_beats (64) を clamp しない。
+        assert_eq!(
+            resolve_render_window(Some((8.0, 260.0)), 64.0),
+            (8.0, 260.0),
+            "範囲は length_beats を超えても clamp せず尊重する"
+        );
+        // 全曲 (レンジピッカー「全曲」) は length_beats まで。
+        assert_eq!(resolve_render_window(None, 64.0), (0.0, 64.0));
+        // 逆順 (end < start) は昇順に正す。
+        assert_eq!(resolve_render_window(Some((260.0, 8.0)), 64.0), (8.0, 260.0));
+        // 負値は 0 へ、上限は clamp しない。
+        assert_eq!(resolve_render_window(Some((-5.0, 100.0)), 64.0), (0.0, 100.0));
+        // 非有限 (NaN/Inf) は 0 に潰して防御する。
+        assert_eq!(resolve_render_window(Some((f64::NAN, 10.0)), 64.0), (0.0, 10.0));
+        assert_eq!(
+            resolve_render_window(Some((5.0, f64::INFINITY)), 64.0),
+            (0.0, 5.0),
+            "Inf は 0 に潰れ、順序正規化で (0, 5) になる"
+        );
+    }
 
     /// the export output dims/fps default to the project canvas, but
     /// a per-export override (export dialog) wins when set. This is the SSoT the
@@ -854,6 +904,40 @@ mod tests {
         assert_eq!(md.width, 320);
         assert_eq!(md.height, 240);
         assert_eq!(md.codec, "h264");
+    }
+
+    /// r.md #32 end-to-end: 書き出し範囲が `length_beats` を超えても、render loop は
+    /// **範囲全体** ぶんの frame を実 encode する。旧実装は end を `length_beats` に
+    /// clamp して映像を半分に truncate していた (loop が length_beats を超える実
+    /// プロジェクトで映像だけ途中で凍結し、audio と長さが割れた)。
+    #[test]
+    fn render_mp4_range_past_length_beats_renders_full_range() {
+        let Some(ffmpeg) = locate_ffmpeg() else {
+            eprintln!("render_mp4: ffmpeg not on PATH, skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out_mp4 = dir.path().join("out.mp4");
+        let src_mp4 = gen_blue_source(&ffmpeg, dir.path(), 320, 240);
+        // length_beats = 4 (= 2s @120bpm) の曲を、範囲 [0, 8] = 4s で書き出す。
+        let song = build_one_video_song(src_mp4, 320, 240);
+        assert_eq!(song.length_beats, 4.0, "fixture の length_beats は 4");
+
+        let cfg = RenderConfig::new(&song, &out_mp4).with_range_beats(Some((0.0, 8.0)));
+        let stats = match render_mp4(&cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("range smoke: encoder unavailable ({e}); skipping");
+                return;
+            }
+        };
+        // 8 beats @120bpm = 4s、@30fps = 120 frames。旧 clamp なら end=4 → 2s → 60
+        // frames に truncate されていた。
+        assert!(
+            stats.frames_written >= 118 && stats.frames_written <= 122,
+            "range [0,8] は length_beats(4) を超えても ~120 frames (4s) 出す (旧: 60), got {}",
+            stats.frames_written
+        );
     }
 
     /// the per-export output resolution + fps override must propagate
