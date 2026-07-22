@@ -189,6 +189,13 @@ impl AppData {
                 selected_clips: Vec::new(),
                 selected_notes: Vec::new(),
                 audio_editor_selected_events: Vec::new(),
+                clip_anchor: None,
+                note_anchor: None,
+                track_anchor: None,
+                section_anchor: None,
+                automation_point_anchor: None,
+                automation_clip_anchor: None,
+                audio_editor_anchor: None,
             },
             ipc: IpcState {
                 sample_rate,
@@ -1067,6 +1074,9 @@ impl AppData {
                 self.selection.selected_clip = None;
                 self.selection.selected_clips.clear();
                 self.selection.selected_notes.clear();
+                // (r.md #35) 選択を捨てたら Shift+click 範囲選択の基点も捨てる。
+                self.selection.clip_anchor = None;
+                self.selection.note_anchor = None;
             }
             AppEvent::SelectLinkedClips(target) => {
                 self.select_linked_clips(target);

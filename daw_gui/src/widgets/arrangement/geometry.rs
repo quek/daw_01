@@ -1234,18 +1234,52 @@ pub(super) fn find_automation_point_data(
     Some((p.time_beat, p.value_norm, clip.start_beat, clip.len_beats))
 }
 
-/// M14 Phase 63n-8 (#033): 短 click on point の Shift / Ctrl 押下時の toggle 計算。 prev の順序を保ち、
-/// `key` が含まれていれば除去、 無ければ末尾に追加する idiom (= UI で「最後に touched された点」 が
-/// list 末尾に来る、 Bitwig / Live と同 UX)。
+/// r.md #35: Shift+click 範囲選択用に、 `clip` が属する automation clip の全 point を
+/// **時間順 (= `point_idx` 順)** に並べた key 列を返す。 automation point は 1 つの clip 内で
+/// 時間順に一意なので、 clip / note のような 2 次元ブロックではなく 1 次元の順序範囲でよい
+/// (値軸は時間で決まる)。 clip が見つからなければ空 vec。
 #[must_use]
-pub(super) fn toggle_selection(prev: &[AutomationPointKey], key: AutomationPointKey) -> Vec<AutomationPointKey> {
-    if prev.contains(&key) {
-        prev.iter().copied().filter(|k| *k != key).collect()
-    } else {
-        let mut out = prev.to_vec();
-        out.push(key);
-        out
+pub(super) fn automation_point_order(
+    visible_tracks: &[ArrangementTrack],
+    clip: AutomationClipKey,
+) -> Vec<AutomationPointKey> {
+    let Some(track) = visible_tracks.iter().find(|t| t.id == clip.track) else {
+        return Vec::new();
+    };
+    let Some(lane) = track.automation_lanes.iter().find(|l| l.id == clip.lane) else {
+        return Vec::new();
+    };
+    let Some(c) = lane.clips.iter().find(|c| c.id == clip.clip) else {
+        return Vec::new();
+    };
+    (0..c.points.len())
+        .map(|i| AutomationPointKey { clip, point_idx: i as u32 })
+        .collect()
+}
+
+/// r.md #35: Shift+click 範囲選択用に、 可視 automation lane 上の全 automation clip を
+/// 「行 = 可視 lane 通し番号 / 時間 = clip の開始〜終了拍」 として並べる。 並び順は描画順
+/// (track → lane → clip)。 MIDI clip の `clip_range_items` と同じ考え方。
+#[must_use]
+pub(super) fn automation_clip_range_items(
+    visible_tracks: &[ArrangementTrack],
+) -> Vec<RangeItem<AutomationClipKey>> {
+    let mut out = Vec::new();
+    let mut row: i64 = 0;
+    for t in visible_tracks {
+        for l in &t.automation_lanes {
+            for c in &l.clips {
+                out.push(RangeItem {
+                    key: AutomationClipKey { track: t.id, lane: l.id, clip: c.id },
+                    row,
+                    start: c.start_beat,
+                    end: c.start_beat + c.len_beats,
+                });
+            }
+            row += 1;
+        }
     }
+    out
 }
 
 /// M14 Phase 63n-8 (#033): lasso rect 内に **中心が含まれる** visible automation point を集める。

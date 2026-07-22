@@ -646,18 +646,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     where
         F: for<'ui> FnOnce(usize, &mut Ui<'ui, M>),
     {
-        let pointer = self.pointer;
-        // 右クリックが rect 内なら、その pos を open trigger にする。検出を済ませたら
-        // 描画 / 選択処理は programmatic な `context_menu_at` に委譲 (DRY)。id は rect 由来で
-        // 従来互換 (同じ rect → 毎フレーム同じ popup)。
-        let open_at = if pointer.secondary_just_pressed
-            && let Some((px, py)) = pointer.pos
-            && rect.contains(px, py)
-        {
-            Some((px, py))
-        } else {
-            None
-        };
+        // 右**クリック** (押して動かさずに離した) が rect 内なら、その press pos を open trigger に
+        // する。検出を済ませたら描画 / 選択処理は programmatic な `context_menu_at` に委譲 (DRY)。
+        // id は rect 由来で従来互換 (同じ rect → 毎フレーム同じ popup)。
+        //
+        // daw_01 r.md #35: 旧実装は `secondary_just_pressed` (= 押した瞬間) で開いていたが、
+        // 右ドラッグを矩形選択に使えるよう **release かつ移動 4px 未満** に変更した。
+        // Windows の `WM_CONTEXTMENU` も右ボタン UP で飛ぶので、こちらが本来の標準でもある。
+        let open_at = self.take_secondary_click_in_rect(rect);
         self.context_menu_at(
             ("context_menu", rect.x.to_bits(), rect.y.to_bits()),
             open_at,

@@ -127,37 +127,28 @@ impl AppData {
         id: u32,
         modifier: crate::widgets::arrangement::SelectModifier,
     ) {
-        use crate::widgets::arrangement::SelectModifier;
-        match modifier {
-            SelectModifier::Single => self.selection.selected_section_ids = vec![id],
-            SelectModifier::Toggle => {
-                if let Some(pos) = self.selection.selected_section_ids.iter().position(|&s| s == id) {
-                    self.selection.selected_section_ids.remove(pos);
-                } else {
-                    self.selection.selected_section_ids.push(id);
-                }
-            }
-            SelectModifier::RangeFromAnchor => {
-                let anchor = self.selection.selected_section_ids.last().copied();
-                let ordered: Vec<u32> = {
-                    let mut v: Vec<&common::model::Section> = self.song_doc.song().sections.iter().collect();
-                    v.sort_by(|a, b| {
-                        a.start_beat
-                            .partial_cmp(&b.start_beat)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    v.into_iter().map(|s| s.id).collect()
-                };
-                let ai = anchor.and_then(|a| ordered.iter().position(|&x| x == a));
-                let bi = ordered.iter().position(|&x| x == id);
-                self.selection.selected_section_ids = match (ai, bi) {
-                    (Some(ai), Some(bi)) => {
-                        let (lo, hi) = if ai <= bi { (ai, bi) } else { (bi, ai) };
-                        ordered[lo..=hi].to_vec()
-                    }
-                    _ => vec![id],
-                };
-            }
+        // r.md #35: 選択遷移は全選択面共通の `SelectModifier::resolve` に統一
+        // (`docs/plan_selection_modifiers.md` §4.2)。 アンカーは
+        // `SelectionState.section_anchor` が所有する — 旧実装は「選択集合の末尾」 を
+        // 基点にしていたが、 RangeFromAnchor が集合ごと書き換えるので Shift+click を
+        // 繰り返すと基点が歩いて範囲を伸縮できなかった。
+        let prev = self.selection.selected_section_ids.clone();
+        let anchor = self.selection.section_anchor;
+        // 帯は開始拍順に並べて 1 次元の範囲を取る。
+        let ordered: Vec<u32> = {
+            let mut v: Vec<&common::model::Section> = self.song_doc.song().sections.iter().collect();
+            v.sort_by(|a, b| {
+                a.start_beat
+                    .partial_cmp(&b.start_beat)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            v.into_iter().map(|s| s.id).collect()
+        };
+        self.selection.selected_section_ids = modifier.resolve(&prev, id, || {
+            crate::widgets::select_modifier::range_ordered(&ordered, anchor?, id)
+        });
+        if modifier.updates_anchor() {
+            self.selection.section_anchor = Some(id);
         }
         // section を選んだら他面の選択を消す (Delete の曖昧さ回避、 §doc 参照)。
         self.selection.selected_clips.clear();

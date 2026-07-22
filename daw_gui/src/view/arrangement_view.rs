@@ -538,13 +538,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Make Unique / Delete。 ただし上で point popup を先に register してい
     // て、 同 frame で右クリックが **point rect 上** だったら clip popup の
     // 登録を skip する (= 同位置で 2 つの popup が同時 open する bug 回避)。
-    let pointer = ui.pointer();
-    let suppress_clip_menu = pointer.secondary_just_pressed
-        && pointer.pos.is_some_and(|(px, py)| {
-            resp.automation_point_rects
-                .iter()
-                .any(|(_, r)| r.contains(px, py))
-        });
+    // r.md #35: context menu は右ボタン **release** (かつ移動 4px 未満) で開くようになったので、
+    // 抑制判定も同じ「右クリック確定フレーム × press 位置」 で見る (旧: `secondary_just_pressed`)。
+    let suppress_clip_menu = ui.pending_secondary_click_pos().is_some_and(|(px, py)| {
+        resp.automation_point_rects
+            .iter()
+            .any(|(_, r)| r.contains(px, py))
+    });
     if !suppress_clip_menu {
         for (auto_key, rect) in &resp.automation_clip_rects {
             let widget_key = *auto_key;

@@ -14,6 +14,7 @@ use daw_ui_core::{ButtonTextAlign, ToggleButtonStyle};
 use crate::app::{AppData, AppEvent, ClipRef};
 use crate::view::snap::{self, SNAP_LABELS};
 use crate::view::track_color;
+use crate::widgets::select_modifier::{RangeItem, SelectModifier, range_block};
 
 const COLOR_HINT: Color = theme::TEXT_DIM;
 
@@ -170,13 +171,15 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
 
         // ----- press 振り分け (state 更新) -----
         // 空き grid の drag は marquee (take_drag_rect_in_rect) が drag state を握るので (#102、
-        // gate の `note_hit().is_none()` で除外)、 ここでは「Shift なし note hit」だけ widget が drag を
-        // 始める。 この **!shift gate** は load-bearing: marquee gate が `note_hit().is_none()` を持つ前提で、
-        // Shift+note press が note drag を起動しない (= marquee にも行かない) ことで成立する。
+        // gate の `note_hit().is_none()` で除外)、 ここでは note hit を widget が drag として掴む。
+        //
+        // r.md #35: 旧実装はここに `!shift` gate があり、 Shift+note press を note drag からも
+        // marquee (`note_hit().is_none()` 必須) からも弾いていた。 結果 **Shift+click が完全に
+        // 無反応** だった。 gate を外して Shift+press でも drag session を張り、 release の短 click
+        // 格下げ経路 (`drag_short_click_pos` が `(ctrl, shift)` を持ち回る) で範囲選択に解決する。
         // M14 Phase 59: editing_mode 中は drag/click を全短絡。
         let just_pressed_on_note = !editing_mode
             && pointer.primary_just_pressed
-            && !pointer.modifiers.shift
             && pointer.pos.is_some_and(|(px, py)| grid.contains(px, py));
 
         if just_pressed_on_note
@@ -203,6 +206,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             if !anchors.is_empty() {
                 let press_alt = pointer.modifiers.alt;
                 let press_ctrl = pointer.modifiers.ctrl;
+                let press_shift = pointer.modifiers.shift;
                 let state: &mut PianoRollState = ui.widget_state(wid);
                 state.note_drag = Some(NoteDragSession {
                     kind,
@@ -211,6 +215,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     last_mouse: (px, py),
                     last_alt: press_alt,
                     last_ctrl: press_ctrl,
+                    last_shift: press_shift,
                 });
             }
         }
@@ -235,10 +240,12 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // ----- velocity lane press 振り分け (M14 Phase 64 / daw_01 #018) -----
         // vel_h > 0 のとき vel_area 内 press でかつ velocity bar 上なら velocity_drag 開始。
         // bar 上でなければ何もしない (= lane 余白 click は no-op で selection も変えない)。
-        // editing_mode / Shift 押下中 / note_drag 既に active のときは skip (排他)。
+        // editing_mode / note_drag 既に active のときは skip (排他)。
+        // (r.md #35) 旧実装はここにも `!shift` gate があったが、 これは Shift が矩形選択の
+        // 起動修飾だった頃の名残で、 Shift+velocity drag を無反応にするだけだった。 Shift の
+        // 意味は「選択の範囲指定」 に一本化したので velocity lane では無修飾と同じ扱いにする。
         let just_pressed_in_vel_lane = !editing_mode
             && pointer.primary_just_pressed
-            && !pointer.modifiers.shift
             && vel_h > 0.0
             && pointer.pos.is_some_and(|(px, py)| vel_area.contains(px, py));
         if just_pressed_in_vel_lane
@@ -428,12 +435,15 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         if let Some((px, py)) = pointer.pos {
             let alt_now = pointer.modifiers.alt;
             let ctrl_now = pointer.modifiers.ctrl;
+            let shift_now = pointer.modifiers.shift;
             let state: &mut PianoRollState = ui.widget_state(wid);
             if let Some(ref mut nd) = state.note_drag {
                 if !pointer.primary_just_released {
                     nd.last_mouse = (px, py);
                     nd.last_alt = alt_now;
                     nd.last_ctrl = ctrl_now;
+                    // (r.md #35) shift も同じ careful-update。 release frame は skip。
+                    nd.last_shift = shift_now;
                 } else if (px, py) != nd.anchor_mouse {
                     nd.last_mouse = (px, py);
                 }
@@ -736,7 +746,15 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         } else {
             None
         };
-        let (drag_release, drag_short_click_pos): (Option<NoteDragSession>, Option<(f32, f32)>) =
+        // 短 click 化時は session の careful-update modifier (`last_ctrl` / `last_shift`) も
+        // 一緒に持ち回る — release frame の `pointer.modifiers` 生読みは「ModifiersChanged が
+        // Released より先に届く」 race で Ctrl/Shift+click が Single に化ける
+        // (arrangement の `clip_short_click_pos` と同 idiom、 r.md #35)。
+        #[allow(clippy::type_complexity)]
+        let (drag_release, drag_short_click_pos): (
+            Option<NoteDragSession>,
+            Option<((f32, f32), bool, bool)>,
+        ) =
             if let Some(nd) = drag_release_raw {
                 // dist 判定 / delta 計算は両者とも `nd.last_mouse` を真値とする (pointer.pos の
                 // winit-bug 化を上の continuation block で吸収済み)。 click 短縮は pointer.pos
@@ -750,7 +768,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 let is_move = matches!(nd.kind, NoteDragKind::Move);
                 let demote = is_move && !nd.last_alt && dist < 4.0;
                 if demote {
-                    (None, pointer.pos)
+                    (None, pointer.pos.map(|p| (p, nd.last_ctrl, nd.last_shift)))
                 } else {
                     (Some(nd), None)
                 }
@@ -879,7 +897,10 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // (M14 Phase 64) vel_area / ruler / keyboard 等 grid 外の release は selection に影響させない
         // = `grid.contains(pos)` で gate (旧: 無条件 release で grid 外なら selection clear する
         // latent bug を修正)。 grid 内の空白 release は従来どおり selection clear。
-        let pending_click: Option<(f32, f32)> = if editing_mode
+        // (r.md #35) modifier も一緒に持つ: `((x, y), ctrl, shift)`。 note 上の click は drag session
+        // の careful-update 値、 空白 release は生読み (drag session が無いので race の余地がない)。
+        #[allow(clippy::type_complexity)]
+        let pending_click: Option<((f32, f32), bool, bool)> = if editing_mode
             || drag_release.is_some()
             || velocity_drag_release.is_some()
             || marquee_active
@@ -893,11 +914,10 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         } else if let Some(p) = drag_short_click_pos {
             Some(p)
         } else if pointer.primary_just_released
-            && !pointer.modifiers.shift
             && let Some((px, py)) = pointer.pos
             && grid.contains(px, py)
         {
-            Some((px, py))
+            Some(((px, py), pointer.modifiers.ctrl, pointer.modifiers.shift))
         } else {
             None
         };
@@ -1250,22 +1270,61 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         }
 
         // ----- pending click → selection 切替 (Edit 発行のみ、外部 selected は frame 末で apply 後に反映) -----
-        if let Some((cx, cy)) = pending_click {
+        if let Some(((cx, cy), click_ctrl, click_shift)) = pending_click {
             let prev: Vec<NoteId> = selected.to_vec();
-            let new_sel: Vec<NoteId> = if grid.contains(cx, cy) {
-                if let Some((hit_id, _)) =
-                    note_hit(notes, view, grid, cx, cy, style.resize_handle_px)
-                {
-                    vec![hit_id]
-                } else {
-                    Vec::new()
-                }
+            // r.md #35: note click も全選択面共通の `SelectModifier` に統一
+            // (`docs/plan_selection_modifiers.md` §3)。 無修飾 = Single / Ctrl = Toggle /
+            // Shift = RangeFromAnchor (= 音程 × 時間の長方形ブロック)。
+            // 旧実装は shift しか見ておらず Ctrl が素通りして **Ctrl+click が無条件置換** になり、
+            // Shift+click は 3 経路すべてで弾かれて **無反応** だった。
+            //
+            // アンカーは `SelectionState.note_anchor` が所有する (SSoT)。 clip / track と同じく
+            // Edit closure 内で apply 時に読む。
+            let hit = if grid.contains(cx, cy) {
+                note_hit(notes, view, grid, cx, cy, style.resize_handle_px)
             } else {
-                Vec::new()
+                None
             };
-            if prev != new_sel {
+            let modifier = SelectModifier::from_modifiers(click_shift, click_ctrl);
+            if let Some((hit_id, _)) = hit {
+                // 範囲用の全 note (行 = pitch / 時間 = start〜end)。 lock された clip の note は
+                // marquee と同じく範囲選択からも除外する (`note_hit` も locked を弾くので
+                // hit 自身が locked になることはない)。 表は Shift のときだけ組む (無修飾 /
+                // Ctrl の click ごとに全 note を走査するのは無駄)。
+                let items: Vec<RangeItem<NoteId>> =
+                    if modifier == SelectModifier::RangeFromAnchor {
+                        notes
+                            .iter()
+                            .filter(|n| !n.style.locked)
+                            .map(|n| RangeItem {
+                                key: n.id,
+                                row: i64::from(n.pitch),
+                                start: n.start_beat,
+                                end: n.start_beat + n.len_beats,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetNoteSelection(new_sel.clone()));
+                    let anchor = app.selection.note_anchor;
+                    let next = modifier
+                        .resolve(&prev, hit_id, || range_block(&items, anchor?, hit_id));
+                    if next != prev {
+                        app.handle_event(AppEvent::SetNoteSelection(next));
+                    }
+                    // アンカー更新: Single / Toggle で clicked へ、 Range は据え置き (§3.1)。
+                    // `SetNoteSelection` はアンカーを触らないので順序依存は無い。
+                    if modifier.updates_anchor() {
+                        app.selection.note_anchor = Some(hit_id);
+                    }
+                }));
+                response.selection_changed = true;
+            } else if !prev.is_empty() {
+                // grid の空白 click → 選択クリア + アンカー破棄 (旧挙動と同じ)。
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::SetNoteSelection(Vec::new()));
+                    app.selection.note_anchor = None;
                 }));
                 response.selection_changed = true;
             }
@@ -1488,10 +1547,27 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         // `DragRect.modifiers` に snapshot する。 release frame (`drag.finished`) に inside を集めて修飾で
         // next を分岐 (`sort_unstable` 後に `prev != next` で no-op 抑制)。 REPLACE は inside そのまま
         // (zero-rect → 空 = 選択 clear)。 editing_mode 中は marquee_press が false なので走らない。
-        if !editing_mode
-            && marquee_active
-            && let Some(drag) = ui.take_drag_rect_in_rect(drag_rect_wid, grid)
-        {
+        //
+        // r.md #35: **右 drag** の marquee も同じ commit を通す。 左 drag が空き grid 専用なのに対し、
+        // 右 drag は `grid` 全域 = **note の上からでも** 起動できる (REAPER 既定と同じ配置。
+        // 右ボタンなので note の move / resize と衝突しない)。 動かさずに離した右ボタンは
+        // context menu 側が拾い、 ここには来ない。 `DragRectState` を共有しないよう id を分ける。
+        let left_marquee = if !editing_mode && marquee_active {
+            ui.take_drag_rect_in_rect(drag_rect_wid, grid)
+        } else {
+            None
+        };
+        // 右ボタンを **動かさずに** 離したフレームは「右クリック = context menu」 なので、
+        // 0 サイズ矩形の REPLACE で選択を消してしまわないよう commit を捨てる
+        // (session 自体は take して state を畳む必要があるので呼び出しは行う)。
+        let secondary_was_click = ui.pending_secondary_click_pos().is_some();
+        let right_marquee = if editing_mode {
+            None
+        } else {
+            ui.take_secondary_drag_rect_in_rect(wid.child(b"rect_select_rmb"), grid)
+                .filter(|d| !(d.finished && secondary_was_click))
+        };
+        for drag in [left_marquee, right_marquee].into_iter().flatten() {
             response.rect_select_active = true;
             if drag.finished {
                 let drag_rect = drag.rect();

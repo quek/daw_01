@@ -266,12 +266,13 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 && in_lanes
                 && let Some((hit_key, kind)) =
                     clip_hit(&visible_tracks, &press_tops, view, lanes, px, py, style.resize_handle_px)
-                && (!shift
-                    || ctrl
-                    // 左右端 grip は Shift = time-stretch を許可
-                    // (clip 本体 Move の Shift は従来どおり選択へ fall through)。
-                    || matches!(kind, ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight))
             {
+                // r.md #35: 旧実装はここに `(!shift || ctrl || resize)` gate があり、 Shift+press を
+                // clip_drag から弾いて marquee (#75) に渡していた。 その marquee は 0 サイズ矩形では
+                // 何も拾わないため **Shift+click が完全に無反応** になっていた。 gate を外して
+                // Shift+press でも drag session を張り、 release の短 click 格下げ経路
+                // (`clip_short_click_pos` が `(ctrl, shift)` を持ち回る) で範囲選択に解決する。
+                // Shift+Move ドラッグは通常の移動、 Shift+resize は従来どおり time-stretch (#61)。
                 let drag_keys: Vec<ClipKey> = if selected_clips.contains(&hit_key) {
                     selected_clips.to_vec()
                 } else {
@@ -2465,50 +2466,33 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
             } else {
                 SelectModifier::Single
             };
-            let prev_anchor = {
-                let state: &ArrangementState = ui.widget_state(wid);
-                state.selection_anchor
-            };
+            // r.md #35: アンカーは `SelectionState.track_anchor` が所有する (旧: widget state の
+            // `ArrangementState.selection_anchor`)。 全選択面で同じ場所・同じ更新規則にするため
+            // (`docs/plan_selection_modifiers.md` §4.3)。 更新規則も **Single / Toggle で更新、
+            // Range は据え置き** に直した (旧実装は Single / Range で更新していたので、 Shift+click
+            // を繰り返すと基点が歩いて範囲を伸縮できなかった。 Explorer / Finder / REAPER は据え置き)。
             let visible_ids: Vec<u32> = visible_idx_for_headers
                 .iter()
                 .map(|&i| tracks_for_draw[i].id)
                 .collect();
-            let next: Vec<u32> = match modifier {
-                SelectModifier::Single => vec![tid],
-                SelectModifier::RangeFromAnchor => {
-                    let anchor_id = prev_anchor.unwrap_or(tid);
-                    let from = visible_ids.iter().position(|&v| v == anchor_id).unwrap_or(0);
-                    let to = visible_ids.iter().position(|&v| v == tid).unwrap_or(0);
-                    let lo = from.min(to);
-                    let hi = from.max(to);
-                    visible_ids[lo..=hi].to_vec()
-                }
-                SelectModifier::Toggle => {
-                    let mut set: HashSet<u32> = selected_tracks.iter().copied().collect();
-                    if set.contains(&tid) {
-                        set.remove(&tid);
-                    } else {
-                        set.insert(tid);
-                    }
-                    let mut v: Vec<u32> = set.into_iter().collect();
-                    v.sort_unstable();
-                    v
-                }
-            };
             let prev_v: Vec<u32> = selected_tracks.to_vec();
-            let mut prev_sorted = prev_v.clone();
-            prev_sorted.sort_unstable();
-            let mut next_sorted = next.clone();
-            next_sorted.sort_unstable();
-            if prev_sorted != next_sorted {
-                ui.push_edit({ let v_next = next; Edit::mutate(move |app: &mut AppData| { app.selection.selected_track_ids = v_next; }) });
-                response.selection_changed = true;
-            }
-            // anchor 更新: Single / Range で update、 Toggle は据え置き
-            if matches!(modifier, SelectModifier::Single | SelectModifier::RangeFromAnchor) {
-                let state: &mut ArrangementState = ui.widget_state(wid);
-                state.selection_anchor = Some(tid);
-            }
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                let anchor = app.selection.track_anchor;
+                let next = modifier.resolve(&prev_v, tid, || {
+                    range_ordered(&visible_ids, anchor?, tid)
+                });
+                let mut prev_sorted = prev_v.clone();
+                prev_sorted.sort_unstable();
+                let mut next_sorted = next.clone();
+                next_sorted.sort_unstable();
+                if prev_sorted != next_sorted {
+                    app.selection.selected_track_ids = next;
+                }
+                if modifier.updates_anchor() {
+                    app.selection.track_anchor = Some(tid);
+                }
+            }));
+            response.selection_changed = true;
         }
 
         // ---- M14 Phase 63f (#020): clip_rects を visible-tracks 順 (= 描画順) で積む ----

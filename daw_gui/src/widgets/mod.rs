@@ -12,4 +12,5 @@
 pub mod arrangement;
 pub mod piano_roll;
 pub mod ruler_ops;
+pub mod select_modifier;
 pub mod time_grid;
