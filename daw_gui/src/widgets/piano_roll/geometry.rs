@@ -250,7 +250,15 @@ pub(super) fn velocity_from_y(py: f32, vel_area: Rect) -> u8 {
 ///
 /// `cx` 位置にある note の velocity bar に hit するかを判定。 各 note の bar 中央 x は
 /// `vel_area.x + (n.start_beat - view.start_beat) * beat_to_px`。 hit zone は **bar 中央から
-/// 左右 ± `(velocity_bar_width_px / 2 + tolerance)` px**。 後勝ち (visible 順で前面)。
+/// 左右 ± `(velocity_bar_width_px / 2 + tolerance)` px**。
+///
+/// **選択優先 (daw_01 #33)**: velocity lane は note を pitch を無視して start_beat の x に集約
+/// するため、 同じ拍に複数 note (ハーモニー / 密集 / tolerance 重なり) があると 1 本の x 列に
+/// 複数の bar が重なる。 このとき「その x に選択中 note があれば選択中を優先」する
+/// (= `is_selected(id)` が真の note を、 無ければ最後の note を返す)。 これで選択の近くを
+/// 掴めば必ず選択 note が hit し、 caller が選択集合全体を編集対象にできる (選択外の最前面
+/// note が握られて「選択したのに一部しか変わらない」事故を防ぐ)。 選択が無い / その x に
+/// 選択 note が無いときは従来どおり後勝ち (visible 順で前面) の 1 本。
 ///
 /// `cy` が `vel_area` 内かは caller 側で判定済み前提 (この関数は x 方向のみ判定)。
 /// 戻り値 `None` は「この cx に bar 無し」 (lane 余白のクリック)。
@@ -261,17 +269,22 @@ pub(super) fn velocity_bar_hit(
     cx: f32,
     bar_width: f32,
     tolerance: f32,
+    is_selected: impl Fn(NoteId) -> bool,
 ) -> Option<NoteId> {
     let beat_to_px = f64::from(vel_area.w) / view.len_beats.max(1e-6);
     let half_w = bar_width * 0.5 + tolerance;
     let mut hit: Option<NoteId> = None;
+    let mut hit_selected: Option<NoteId> = None;
     for n in visible {
         let nx = vel_area.x + ((n.start_beat - view.start_beat) * beat_to_px) as f32;
         if (cx - nx).abs() <= half_w {
             hit = Some(n.id);
+            if is_selected(n.id) {
+                hit_selected = Some(n.id);
+            }
         }
     }
-    hit
+    hit_selected.or(hit)
 }
 
 /// 絶対位置 snap で計算した note drag の beat delta (overlay と release commit で共有)。

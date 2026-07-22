@@ -251,6 +251,8 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 px,
                 style.velocity_bar_width_px,
                 4.0,
+                // #33: 同じ x に重なった bar のうち選択中 note を優先 hit する。
+                |id| selected.contains(&id),
             )
         {
             let target_ids: Vec<NoteId> = if selected.contains(&hit_id) {
@@ -1724,10 +1726,14 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
 
         // wheel handler — note drag / 作成中は無効。Ctrl=横ズーム, Alt=縦ズーム, Shift=横スクロール,
         // plain=ピッチスクロール (Ableton Live / Reaper 流)。
+        // (daw_01 #34) grid だけでなく鍵盤レーン (kbd) 上でも wheel を効かせる。kbd は grid と
+        // 同じ y 範囲・高さ (view_build のレイアウト SSoT) なので、 縦 (pitch) スクロール / 縦ズーム
+        // の anchor は py がそのまま grid 座標系で正しい。 横ズーム (Ctrl) の anchor x のみ kbd 上では
+        // px < grid.x で負値化するため grid 内に clamp して左端 (view start) 基準ズームにする。
         if response.dragging.is_none() && !response.creating {
             let pointer = ui.pointer();
             if let Some((px, py)) = pointer.pos
-                && grid.contains(px, py)
+                && (grid.contains(px, py) || kbd.contains(px, py))
             {
                 let (sx, sy) = pointer.scroll_delta;
                 if sy.abs() > 0.001 || sx.abs() > 0.001 {
@@ -1736,14 +1742,16 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     let modifiers = pointer.modifiers;
                     if modifiers.ctrl {
                         // Ctrl+wheel: 横ズーム。マウス位置の拍を anchor として保持。
+                        // kbd 上 (px < grid.x) は anchor を grid 左端に clamp (負の拍 anchor を回避)。
+                        let anchor_px = px.clamp(grid.x, grid.x + grid.w);
                         let factor = (sy * 0.005).exp();
                         let new_zoom = (zoom_x * factor).clamp(8.0, 400.0);
                         if (new_zoom - zoom_x).abs() > 1e-3 {
                             let anchor_beat =
-                                f64::from(scroll_beat) + f64::from((px - grid.x) / zoom_x);
+                                f64::from(scroll_beat) + f64::from((anchor_px - grid.x) / zoom_x);
                             #[allow(clippy::cast_possible_truncation)]
                             let new_scroll =
-                                (anchor_beat - f64::from((px - grid.x) / new_zoom)).max(0.0) as f32;
+                                (anchor_beat - f64::from((anchor_px - grid.x) / new_zoom)).max(0.0) as f32;
                             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                                 app.handle_event(AppEvent::SetPianoRollZoomX(new_zoom));
                                 app.handle_event(AppEvent::SetPianoRollScrollX(new_scroll));
