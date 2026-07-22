@@ -98,6 +98,16 @@ fn release(x: f32, y: f32, m: Modifiers) -> PointerFrame {
     }
 }
 
+/// wheel (scroll) フレーム。`(sx, sy)` = scroll_delta。
+fn wheel(x: f32, y: f32, sx: f32, sy: f32, m: Modifiers) -> PointerFrame {
+    PointerFrame {
+        pos: Some((x, y)),
+        scroll_delta: (sx, sy),
+        modifiers: m,
+        ..PointerFrame::default()
+    }
+}
+
 fn pointer_input(p: PointerFrame) -> FrameInput {
     let mut input = FrameInput::default();
     input.pointer = p;
@@ -349,6 +359,80 @@ fn velocity_lane_drag_sets_velocity() {
     assert!(vel > 100, "velocity が上がる (40 → ~116): got {vel}");
 }
 
+/// #33 再現: 単一クリップで複数ノートを marquee 選択 → velocity ドラッグ。
+/// 選択した全ノートの velocity が変わるべき。「一部しか」再現の観測用。
+#[test]
+fn repro33_marquee_then_velocity_drag_all_selected() {
+    let (mut app, _a, _p) = build_app();
+    // pitch 60、beats 2/3/4/5、len 1、初期 vel 40/50/60/70。bar x = 184/248/312/376。
+    setup_clip(
+        &mut app,
+        1,
+        10,
+        vec![
+            mk_note(60, 2.0, 1.0, 40),
+            mk_note(60, 3.0, 1.0, 50),
+            mk_note(60, 4.0, 1.0, 60),
+            mk_note(60, 5.0, 1.0, 70),
+        ],
+    );
+    let mut host = UiHost::<AppData>::no_redraw();
+    // marquee: 空白 (100,100) から (460,400) へ。note rect x[184..440] y(pitch60)=[380,394] を全部囲む。
+    drive_pointer(&mut host, &mut app, press(100.0, 100.0, no_mods()));
+    drive_pointer(&mut host, &mut app, hold(460.0, 400.0, no_mods()));
+    drive_pointer(&mut host, &mut app, release(460.0, 400.0, no_mods()));
+    let mut sel = app.selection.selected_notes.clone();
+    sel.sort_unstable();
+    eprintln!("selected after marquee = {sel:?}");
+    // velocity drag: note1 の bar (x=184) を press → 上端付近 (高 vel) へ。
+    drive_pointer(&mut host, &mut app, press(184.0, 590.0, no_mods()));
+    drive_pointer(&mut host, &mut app, hold(184.0, VEL_Y_HIGH, no_mods()));
+    drive_pointer(&mut host, &mut app, release(184.0, VEL_Y_HIGH, no_mods()));
+    let vels: Vec<u8> = clip_notes(&app, 1, 10).iter().map(|n| n.velocity).collect();
+    eprintln!("velocities after drag = {vels:?}");
+    assert!(
+        vels.iter().all(|&v| v > 100),
+        "選択した全ノートの velocity が上がるべき: got {vels:?}"
+    );
+}
+
+/// #33 本命再現: velocity lane はノートを start_beat の x に集約する (pitch 無視) ため、
+/// 同じ拍に複数ノート (ハーモニー / 密集) があると、選択中ノートの bar を掴んだつもりでも
+/// hit-test が「その x の最前面 (visible 順で最後) の1ノート」を返し、それが選択外だと
+/// 選択中ノートが編集されない。選択を優先すべき。
+#[test]
+fn repro33_velocity_same_beat_prefers_selection() {
+    let (mut app, _a, _p) = build_app();
+    // 同じ beat 2 に pitch 60 (local 0) と pitch 67 (local 1)。bar は両方 x=184 に重なる。
+    setup_clip(
+        &mut app,
+        1,
+        10,
+        vec![mk_note(60, 2.0, 1.0, 40), mk_note(67, 2.0, 1.0, 40)],
+    );
+    let mut host = UiHost::<AppData>::no_redraw();
+    // marquee で pitch 60 だけ選択 (y 360..400 は pitch60 rect[380,394] を含み pitch67[282,296] を含まない)。
+    drive_pointer(&mut host, &mut app, press(150.0, 360.0, no_mods()));
+    drive_pointer(&mut host, &mut app, hold(300.0, 400.0, no_mods()));
+    drive_pointer(&mut host, &mut app, release(300.0, 400.0, no_mods()));
+    assert_eq!(
+        app.selection.selected_notes,
+        vec![AppData::pack_note_id(0, 0)],
+        "pitch60 (local 0) だけ選択されるべき: got {:?}",
+        app.selection.selected_notes
+    );
+    // velocity drag: 重なった bar (x=184) を掴んで上げる。選択 (pitch60) が編集されるべき。
+    drive_pointer(&mut host, &mut app, press(184.0, 590.0, no_mods()));
+    drive_pointer(&mut host, &mut app, hold(184.0, VEL_Y_HIGH, no_mods()));
+    drive_pointer(&mut host, &mut app, release(184.0, VEL_Y_HIGH, no_mods()));
+    let notes = clip_notes(&app, 1, 10);
+    let pitch60 = notes.iter().find(|n| n.pitch == 60).unwrap().velocity;
+    let pitch67 = notes.iter().find(|n| n.pitch == 67).unwrap().velocity;
+    eprintln!("after drag: pitch60={pitch60} pitch67={pitch67}");
+    assert!(pitch60 > 100, "選択中の pitch60 の velocity が上がるべき: got {pitch60}");
+    assert_eq!(pitch67, 40, "非選択の pitch67 は変わらないべき: got {pitch67}");
+}
+
 // ============================================================
 // ruler: playhead seek / loop range
 // ============================================================
@@ -390,6 +474,46 @@ fn ruler_shift_drag_sets_loop_range() {
 // ============================================================
 // edge auto-scroll
 // ============================================================
+
+// ============================================================
+// wheel: 鍵盤レーン上の縦スクロール (#34)
+// ============================================================
+
+/// #34: 鍵盤レーン (kbd, x < 56) 上でも plain wheel で pitch 縦スクロールできる。
+#[test]
+fn wheel_over_keyboard_scrolls_pitch() {
+    let (mut app, _a, _p) = build_app();
+    setup_clip(&mut app, 1, 10, vec![]);
+    let mut host = UiHost::<AppData>::no_redraw();
+    let before = app.pianoroll_top_pitch();
+    // kbd レーン (x=20 < grid.x=56, y=200 は grid/kbd の y 範囲 [44,540] 内) で plain wheel。
+    // sy=24 → delta = round(24/12) = 2 → top_pitch += 2。
+    drive_pointer(&mut host, &mut app, wheel(20.0, 200.0, 0.0, 24.0, no_mods()));
+    let after = app.pianoroll_top_pitch();
+    assert_eq!(
+        after,
+        before.saturating_add(2).min(127),
+        "鍵盤レーン上の wheel で pitch がスクロールすべき: before={before} after={after}"
+    );
+}
+
+/// grid 上の wheel と鍵盤上の wheel が同じ pitch スクロール量になる (領域統一の確認)。
+#[test]
+fn wheel_over_keyboard_matches_grid() {
+    let (mut app_k, _a1, _p1) = build_app();
+    setup_clip(&mut app_k, 1, 10, vec![]);
+    let mut host_k = UiHost::<AppData>::no_redraw();
+    drive_pointer(&mut host_k, &mut app_k, wheel(20.0, 200.0, 0.0, 24.0, no_mods())); // kbd
+    let (mut app_g, _a2, _p2) = build_app();
+    setup_clip(&mut app_g, 1, 10, vec![]);
+    let mut host_g = UiHost::<AppData>::no_redraw();
+    drive_pointer(&mut host_g, &mut app_g, wheel(200.0, 200.0, 0.0, 24.0, no_mods())); // grid
+    assert_eq!(
+        app_k.pianoroll_top_pitch(),
+        app_g.pianoroll_top_pitch(),
+        "kbd 上と grid 上で同じ pitch スクロール量になるべき"
+    );
+}
 
 #[test]
 fn edge_autoscroll_horizontal_on_note_drag() {

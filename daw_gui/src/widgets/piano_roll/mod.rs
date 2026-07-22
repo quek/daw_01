@@ -1424,10 +1424,10 @@ mod tests {
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
         let notes = vec![note(7, 1.0, 0.5, 60)]; // bar x = 200
         // 中央は hit
-        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0), Some(7));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |_| false), Some(7));
         // 中央 ±5.5px (= bar_width/2 + tolerance) は hit
-        assert_eq!(velocity_bar_hit(&notes, view, area, 195.0, 3.0, 4.0), Some(7));
-        assert_eq!(velocity_bar_hit(&notes, view, area, 205.0, 3.0, 4.0), Some(7));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 195.0, 3.0, 4.0, |_| false), Some(7));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 205.0, 3.0, 4.0, |_| false), Some(7));
     }
 
     #[test]
@@ -1436,16 +1436,33 @@ mod tests {
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
         let notes = vec![note(7, 1.0, 0.5, 60)]; // bar x = 200
         // hit zone は ±5.5px。 7 px 離れていれば miss。
-        assert_eq!(velocity_bar_hit(&notes, view, area, 207.0, 3.0, 4.0), None);
-        assert_eq!(velocity_bar_hit(&notes, view, area, 193.0, 3.0, 4.0), None);
+        assert_eq!(velocity_bar_hit(&notes, view, area, 207.0, 3.0, 4.0, |_| false), None);
+        assert_eq!(velocity_bar_hit(&notes, view, area, 193.0, 3.0, 4.0, |_| false), None);
     }
 
     #[test]
     fn velocity_bar_hit_overlapping_returns_last() {
-        // 2 つの note が同 start_beat にあるとき、 後勝ち (visible 順 = note_hit と同 semantics)。
+        // 2 つの note が同 start_beat にあるとき、 選択が無ければ後勝ち (visible 順 = note_hit と同 semantics)。
         let view = test_view();
         let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
         let notes = vec![note(1, 1.0, 0.5, 60), note(2, 1.0, 0.5, 67)];
-        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0), Some(2));
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |_| false), Some(2));
+    }
+
+    #[test]
+    fn velocity_bar_hit_overlapping_prefers_selected() {
+        // daw_01 #33: 同じ x に重なった bar のうち選択中 note を優先 hit する。
+        let view = test_view();
+        let area = Rect { x: 0.0, y: 340.0, w: 800.0, h: 60.0 };
+        let notes = vec![note(1, 1.0, 0.5, 60), note(2, 1.0, 0.5, 67)];
+        // note 1 (最前面でない) が選択されていれば、 後勝ちの note 2 でなく note 1 を返す。
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |id| id == 1), Some(1));
+        // note 2 が選択されていれば note 2 (これは後勝ちとも一致)。
+        assert_eq!(velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |id| id == 2), Some(2));
+        // 両方選択なら、 選択中の後勝ち = note 2。
+        assert_eq!(
+            velocity_bar_hit(&notes, view, area, 200.0, 3.0, 4.0, |_| true),
+            Some(2)
+        );
     }
 }
