@@ -140,6 +140,11 @@ pub struct UiHost<M: ?Sized + 'static> {
     last_click: Option<(std::time::Instant, f32, f32)>,
     /// M9 P1-4: ダブルクリック判定の閾値 `(時間, 位置 px)`。default 400ms / 5px。
     double_click_threshold: (std::time::Duration, f32),
+    /// daw_01 r.md #35: 右ボタン press 位置。release frame に「移動したか」を判定して
+    /// **右クリック (= context menu)** と **右ドラッグ (= 矩形選択)** を区別するために保持する。
+    /// press では何も起こさず release で確定するのは Windows の `WM_CONTEXTMENU` と同じ
+    /// (右ボタン UP で飛ぶ)。`docs/plan_selection_modifiers.md` §4.1。
+    secondary_press_pos: Option<(f32, f32)>,
     /// M14 Phase 57: 前フレームに `Ui::set_typing_focus(true)` が立ったか。立っていた場合、
     /// 今フレーム冒頭の shortcut layer は `is_typing_only_shortcut(name)` (= `select_all`
     /// `delete` `cut` `copy` `paste`) を `pending_shortcuts` に積まず `keyboard_events`
@@ -219,6 +224,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             current_cache_misses: 0,
             last_click: None,
             double_click_threshold: (std::time::Duration::from_millis(400), 5.0),
+            secondary_press_pos: None,
             last_typing_focus: false,
             text_metrics: TextMetrics::new(),
             owned_font_system: None,
@@ -616,6 +622,27 @@ impl<M: ?Sized + 'static> UiHost<M> {
             }
         }
 
+        // daw_01 r.md #35: 右ボタンの **click (= context menu)** と **drag (= 矩形選択)** の分離。
+        // press 位置を覚えておき、release frame に移動量が double-click 閾値の px 未満なら
+        // 「右クリック」 と確定して `pending_secondary_click` を立てる。 動いていれば右ドラッグ
+        // だった (= `take_secondary_drag_rect_in_rect` が既に矩形を返している) ので click は
+        // 立てない。 pos 不明の release も click 扱いにしない。
+        if pointer.secondary_just_pressed {
+            self.secondary_press_pos = pointer.pos;
+        }
+        let mut pending_secondary_click: Option<(f32, f32)> = None;
+        if pointer.secondary_just_released {
+            if let Some((sx, sy)) = self.secondary_press_pos.take()
+                && let Some((px, py)) = pointer.pos
+                && (px - sx).hypot(py - sy) < self.double_click_threshold.1
+            {
+                // anchor は press 位置。 release 位置は最大 5px ずれるので、 menu が
+                // 「押した場所」 に出る方が自然 (Explorer / REAPER と同じ)。
+                pending_secondary_click = Some((sx, sy));
+            }
+            self.secondary_press_pos = None;
+        }
+
         let cursor = Rect::new(0.0, 0.0, screen.width as f32, screen.height as f32);
         let focused_at_start = self.focused;
         let mut seen_widgets: HashSet<WidgetId> = HashSet::new();
@@ -683,6 +710,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             last_frame_stats: self.last_frame_stats,
             pending_double_click: &mut pending_double_click,
             pending_double_click_press: &mut pending_double_click_press,
+            pending_secondary_click: &mut pending_secondary_click,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -901,6 +929,11 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// `take_double_click_press_in_rect(rect)` が rect.contains で 1 度だけ消費する。
     /// release ベースの `pending_double_click` と独立 (押下のまま drag を始める用)。
     pub(crate) pending_double_click_press: &'a mut Option<(f32, f32)>,
+    // ---- daw_01 r.md #35: 右クリック (drag でない) ----
+    /// このフレームで「右ボタンを押して動かさずに離した」が判定されていれば press 位置。
+    /// `take_secondary_click_in_rect(rect)` が rect.contains で 1 度だけ消費する。
+    /// 右ドラッグ (= 矩形選択) だったフレームでは立たない。
+    pub(crate) pending_secondary_click: &'a mut Option<(f32, f32)>,
     _m: PhantomData<&'a M>,
 }
 
@@ -1657,6 +1690,37 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         Some((px, py))
     }
 
+    /// `rect` 内で secondary (右) が **click された** (= 押して動かさずに離した) frame に
+    /// 1 度だけ `Some((x, y))` を返す。 座標は **press 位置**。
+    ///
+    /// daw_01 r.md #35。 `take_secondary_press_in_rect` との違いは 2 点:
+    ///
+    /// - press ではなく **release** で確定する (Windows の `WM_CONTEXTMENU` と同じ)
+    /// - 右ドラッグ (press → 移動 → release) では立たない。 これにより、 同じ右ボタンで
+    ///   「click = context menu」 と「drag = 矩形選択 (`take_secondary_drag_rect_in_rect`)」
+    ///   を両立できる (REAPER と同じ配置)
+    ///
+    /// **consume はしない** (`take_secondary_press_in_rect` と同じ理由: caller は rect 全体で
+    /// take した後に clip 上か空きかを判定するため)。
+    pub fn take_secondary_click_in_rect(&mut self, rect: Rect) -> Option<(f32, f32)> {
+        if self.pointer_blocked_by_modal_popup() {
+            return None;
+        }
+        let (px, py) = self.pending_secondary_click_pos()?;
+        if !rect.contains(px, py) {
+            return None;
+        }
+        Some((px, py))
+    }
+
+    /// このフレームに右クリック (押して動かさずに離した) が確定していれば press 位置。
+    /// `take_secondary_click_in_rect` の rect 判定なし版で、 caller が複数 rect を横断して
+    /// 「どの popup を出すか」 を決めるときに使う (consume しない read-only query)。
+    #[must_use]
+    pub fn pending_secondary_click_pos(&self) -> Option<(f32, f32)> {
+        *self.pending_secondary_click
+    }
+
     // ============================================================
     // M8 Phase 30: shortcut + focus traversal + focus ring
     // ============================================================
@@ -1938,6 +2002,42 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         wid: WidgetId,
         bounds: Rect,
     ) -> Option<DragRect> {
+        let p = self.pointer;
+        self.drag_rect_with_button(wid, bounds, p.primary_just_pressed, p.primary_just_released)
+    }
+
+    /// `take_drag_rect_in_rect` の **secondary (右) ボタン** 版 (daw_01 r.md #35)。
+    ///
+    /// 右ドラッグを矩形選択に使うための API。 左ドラッグと違い「要素の上から始めても
+    /// 移動 / リサイズと衝突しない」 ので、 クリップ / ノートの上からでも範囲選択を開始できる
+    /// (REAPER の既定と同じ配置)。 動かさずに離した右ボタンは矩形選択にならず、
+    /// `take_secondary_click_in_rect` (= context menu) 側が拾う。
+    ///
+    /// `wid` は左 drag と **別 id を渡すこと** (同一 id だと `DragRectState` を共有して
+    /// 左右の session が互いを打ち消す)。
+    pub fn take_secondary_drag_rect_in_rect(
+        &mut self,
+        wid: WidgetId,
+        bounds: Rect,
+    ) -> Option<DragRect> {
+        let p = self.pointer;
+        self.drag_rect_with_button(
+            wid,
+            bounds,
+            p.secondary_just_pressed,
+            p.secondary_just_released,
+        )
+    }
+
+    /// `take_drag_rect_in_rect` / `take_secondary_drag_rect_in_rect` の共通実装。
+    /// ボタン差は press / release の edge bool だけなので、 それを引数で受ける。
+    fn drag_rect_with_button(
+        &mut self,
+        wid: WidgetId,
+        bounds: Rect,
+        just_pressed: bool,
+        just_released: bool,
+    ) -> Option<DragRect> {
         // modal popup の下に隠れている widget は pointer 入力を消費しない (#015)。
         if self.pointer_blocked_by_modal_popup() {
             // M14 Phase 94 (daw_01 #065): 真のモーダルが drag 進行中に開いた場合、release が
@@ -1957,7 +2057,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let state: &mut DragRectState = self.widget_state(wid);
 
             // 押下 in bounds → drag 開始
-            if pointer.primary_just_pressed
+            if just_pressed
                 && let Some((px, py)) = pointer.pos
                 && bounds.contains(px, py)
             {
@@ -1966,12 +2066,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
 
             let active = state.drag_start.is_some();
-            let just_finished = active && pointer.primary_just_released;
+            let just_finished = active && just_released;
             let start = state.drag_start;
             let start_mods = state.start_modifiers;
 
             // release で state クリア (次フレーム以降は active=false)
-            if pointer.primary_just_released {
+            if just_released {
                 state.drag_start = None;
             }
             (active, just_finished, start, start_mods)

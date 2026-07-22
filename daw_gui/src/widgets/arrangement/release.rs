@@ -326,24 +326,49 @@ pub(super) fn commit_releases(
                 let press_shift = ad.start_modifiers.shift;
                 let press_ctrl = ad.start_modifiers.ctrl;
                 let prev = selected_automation_points.to_vec();
-                let next: Vec<AutomationPointKey> = if press_shift || press_ctrl {
-                    // toggle: prev XOR {pressed}
-                    toggle_selection(&prev, ad.point)
-                } else {
-                    // replace: vec![pressed] (pressed が既に唯一の selection なら同値 → no-op)
-                    vec![ad.point]
-                };
+                // r.md #35: 旧実装は Shift も Ctrl も一括 toggle だった。 全選択面共通の
+                // `SelectModifier` に統一する — Ctrl = Toggle / Shift = RangeFromAnchor。
+                // point は 1 clip 内で時間順に一意なので範囲は 1 次元 (`range_ordered`)。
+                // アンカーが別 clip / 別 lane に居るときは filter で落として Single に倒れる。
+                let modifier = SelectModifier::from_modifiers(press_shift, press_ctrl);
                 // 修飾なし単一クリック (= 置き換え選択) では競合する clip 選択も解除して
                 // automation 面を 1 つだけにする (点とクリップが同時に光って混乱するのを
                 // 防ぐ。 lasso / Shift / Ctrl は両面選択を温存するので除外)。
-                if !press_shift && !press_ctrl && !selected_automation_clips.is_empty() {
+                if modifier == SelectModifier::Single && !selected_automation_clips.is_empty() {
                     ui.push_edit({ let v_prev = selected_automation_clips.to_vec(); let v_next = Vec::new(); Edit::mutate(move |app: &mut AppData| { let prev_model: Vec<common::model::AutomationClipKey> = v_prev.into_iter().map(widget_to_model_clip_key).collect(); let next_model: Vec<common::model::AutomationClipKey> = v_next.into_iter().map(widget_to_model_clip_key).collect(); app.handle_event(AppEvent::SelectAutomationClips { prev: prev_model, next: next_model }); }) });
                     response.selection_changed = true;
                 }
-                if next != prev {
-                    ui.push_edit({ let v_prev = prev; let v_next = next; Edit::mutate(move |app: &mut AppData| { let prev_model: Vec<AutomationPointKeyRef> = v_prev.into_iter().map(|k| AutomationPointKeyRef { track_id: k.clip.track, lane_id: k.clip.lane, clip_id: k.clip.clip, point_idx: k.point_idx }).collect(); let next_model: Vec<AutomationPointKeyRef> = v_next.into_iter().map(|k| AutomationPointKeyRef { track_id: k.clip.track, lane_id: k.clip.lane, clip_id: k.clip.clip, point_idx: k.point_idx }).collect(); app.handle_event(AppEvent::SelectAutomationPoints { prev: prev_model, next: next_model }); }) });
-                    response.selection_changed = true;
-                }
+                let pressed = ad.point;
+                // 範囲表は Shift のときだけ組む (clip click と同じ理由)。
+                let order = if modifier == SelectModifier::RangeFromAnchor {
+                    automation_point_order(visible_tracks, pressed.clip)
+                } else {
+                    Vec::new()
+                };
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let anchor = app
+                        .selection
+                        .automation_point_anchor
+                        .map(point_key_from_model)
+                        .filter(|a| a.clip == pressed.clip);
+                    let next = modifier
+                        .resolve(&prev, pressed, || range_ordered(&order, anchor?, pressed));
+                    if next != prev {
+                        let prev_model: Vec<AutomationPointKeyRef> =
+                            prev.iter().copied().map(point_key_to_model).collect();
+                        let next_model: Vec<AutomationPointKeyRef> =
+                            next.iter().copied().map(point_key_to_model).collect();
+                        app.handle_event(AppEvent::SelectAutomationPoints {
+                            prev: prev_model,
+                            next: next_model,
+                        });
+                    }
+                    if modifier.updates_anchor() {
+                        app.selection.automation_point_anchor =
+                            Some(point_key_to_model(pressed));
+                    }
+                }));
+                response.selection_changed = true;
             }
         }
 
@@ -510,36 +535,49 @@ pub(super) fn commit_releases(
             let demote =
                 matches!(acd.kind, ClipDragKind::Move) && !release_alt && dist < 4.0;
             if demote {
-                // short click on automation clip → 修飾で分岐 (#071): 修飾なし = 単一置換、
-                // Shift / Ctrl = 選択足し引き (= 既に居れば外す、 居なければ足す toggle)。 MIDI clip
-                // 同様 anchor 順は問わず、 掴んだ clip (= primary) を対象にする。
+                // short click on automation clip → 修飾で分岐。
+                // r.md #35: 旧実装は Shift も Ctrl も一括 toggle だった。 MIDI clip と同じ
+                // `SelectModifier` に統一する — Ctrl = Toggle / Shift = RangeFromAnchor
+                // (= 可視 lane 行 × 時間の長方形ブロック)。 掴んだ clip (= primary) が対象。
                 let prev = selected_automation_clips.to_vec();
                 let key = acd.primary;
-                let next: Vec<AutomationClipKey> = if acd.last_shift || acd.last_ctrl {
-                    if prev.contains(&key) {
-                        prev.iter().copied().filter(|k| *k != key).collect()
-                    } else {
-                        let mut out = prev.clone();
-                        out.push(key);
-                        out
-                    }
-                } else {
-                    vec![key]
-                };
+                let modifier = SelectModifier::from_modifiers(acd.last_shift, acd.last_ctrl);
                 // 修飾なし単一クリック (= 置き換え選択) では競合する point 選択も解除して
                 // automation 面を 1 つだけにする (点とクリップが同時に光って混乱するのを
                 // 防ぐ。 lasso / Shift / Ctrl は両面選択を温存するので除外)。
-                if !acd.last_shift
-                    && !acd.last_ctrl
-                    && !selected_automation_points.is_empty()
-                {
-                    ui.push_edit({ let v_prev = selected_automation_points.to_vec(); let v_next: Vec<AutomationPointKey> = Vec::new(); Edit::mutate(move |app: &mut AppData| { let prev_model: Vec<AutomationPointKeyRef> = v_prev.into_iter().map(|k| AutomationPointKeyRef { track_id: k.clip.track, lane_id: k.clip.lane, clip_id: k.clip.clip, point_idx: k.point_idx }).collect(); let next_model: Vec<AutomationPointKeyRef> = v_next.into_iter().map(|k| AutomationPointKeyRef { track_id: k.clip.track, lane_id: k.clip.lane, clip_id: k.clip.clip, point_idx: k.point_idx }).collect(); app.handle_event(AppEvent::SelectAutomationPoints { prev: prev_model, next: next_model }); }) });
+                if modifier == SelectModifier::Single && !selected_automation_points.is_empty() {
+                    ui.push_edit({ let v_prev = selected_automation_points.to_vec(); Edit::mutate(move |app: &mut AppData| { let prev_model: Vec<AutomationPointKeyRef> = v_prev.into_iter().map(point_key_to_model).collect(); app.handle_event(AppEvent::SelectAutomationPoints { prev: prev_model, next: Vec::new() }); }) });
                     response.selection_changed = true;
                 }
-                if prev != next {
-                    ui.push_edit({ let v_prev = prev; let v_next = next; Edit::mutate(move |app: &mut AppData| { let prev_model: Vec<common::model::AutomationClipKey> = v_prev.into_iter().map(widget_to_model_clip_key).collect(); let next_model: Vec<common::model::AutomationClipKey> = v_next.into_iter().map(widget_to_model_clip_key).collect(); app.handle_event(AppEvent::SelectAutomationClips { prev: prev_model, next: next_model }); }) });
-                    response.selection_changed = true;
-                }
+                // 範囲表は Shift のときだけ組む (clip click と同じ理由)。
+                let items = if modifier == SelectModifier::RangeFromAnchor {
+                    automation_clip_range_items(visible_tracks)
+                } else {
+                    Vec::new()
+                };
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let anchor = app
+                        .selection
+                        .automation_clip_anchor
+                        .map(|k| AutomationClipKey { track: k.track, lane: k.lane, clip: k.clip });
+                    let next =
+                        modifier.resolve(&prev, key, || range_block(&items, anchor?, key));
+                    if next != prev {
+                        let prev_model: Vec<common::model::AutomationClipKey> =
+                            prev.iter().copied().map(widget_to_model_clip_key).collect();
+                        let next_model: Vec<common::model::AutomationClipKey> =
+                            next.iter().copied().map(widget_to_model_clip_key).collect();
+                        app.handle_event(AppEvent::SelectAutomationClips {
+                            prev: prev_model,
+                            next: next_model,
+                        });
+                    }
+                    if modifier.updates_anchor() {
+                        app.selection.automation_clip_anchor =
+                            Some(widget_to_model_clip_key(key));
+                    }
+                }));
+                response.selection_changed = true;
             } else {
                 // beat_to_px は現在フレームの lanes.w から算出 (全 lane body は幅 lanes.w で同一)。
                 // press 時の anchor 幅でなく現幅を使うことで drag 中の resize に追従する。
@@ -693,37 +731,50 @@ pub(super) fn commit_releases(
             && !ui.has_open_popups()
         {
             let prev = selected_clips.to_vec();
-            let next: Vec<ClipKey> =
-                if let Some((hit_key, _)) = clip_hit(visible_tracks, press_tops, view, lanes, cx, cy, style.resize_handle_px) {
-                    // daw_01 #93: clip click も **modifier-aware** に (track header の SelectTrack /
-                    // 9.x 系 marquee と同 idiom)。旧実装は常に `vec![hit_key]` (Single 置換) で、
-                    // Ctrl+click で複数クリップを選べなかった (multi-clip piano roll の前提が崩れていた)。
-                    //   - Ctrl  = Toggle (XOR: 選択に居れば外し、 居なければ末尾 = anchor として足す)
-                    //   - Shift = Union  (足すだけ、 既存ぶんは末尾へ繰り上げて anchor に)
-                    //   - 無修飾 = Single (置換)
-                    // anchor は常に末尾 (caller の `SetClipSelection` が `next.last()` を anchor にする)。
-                    // modifier は session の careful-update 値 (release frame の生読みは race)。
-                    if click_ctrl {
-                        let mut n = prev.clone();
-                        if let Some(pos) = n.iter().position(|k| *k == hit_key) {
-                            n.remove(pos);
-                        } else {
-                            n.push(hit_key);
-                        }
-                        n
-                    } else if click_shift {
-                        let mut n = prev.clone();
-                        n.retain(|k| *k != hit_key);
-                        n.push(hit_key);
-                        n
-                    } else {
-                        vec![hit_key]
-                    }
+            // r.md #35: clip click を全選択面共通の `SelectModifier` に統一
+            // (`docs/plan_selection_modifiers.md` §3)。 無修飾 = Single / Ctrl = Toggle /
+            // Shift = RangeFromAnchor (= 可視 track 行 × 時間の長方形ブロック)。
+            // 旧実装の Shift = Union は **到達不能な dead code** だった (press 側 gate が
+            // Shift を marquee (#75) に渡し、 その marquee は 0 サイズ矩形で何も拾わなかった)。
+            // modifier は session の careful-update 値 (release frame の生読みは
+            // ModifiersChanged 先行 race で Single に化ける)。
+            //
+            // アンカーは `SelectionState.clip_anchor` が所有する (SSoT)。 widget へ引数で
+            // 流さず **Edit closure 内で apply 時に読む**、 = 同 frame の他 Edit と順序が付き、
+            // 「選択集合の末尾」 のような派生値に依存しない。
+            let hit = clip_hit(visible_tracks, press_tops, view, lanes, cx, cy, style.resize_handle_px);
+            let modifier = SelectModifier::from_modifiers(click_shift, click_ctrl);
+            if let Some((hit_key, _)) = hit {
+                // 範囲表は Shift のときだけ組む (無修飾 / Ctrl の click ごとに全 clip を
+                // 走査して Vec を作るのは無駄。 closure へ move する都合で遅延生成にはできない)。
+                let items = if modifier == SelectModifier::RangeFromAnchor {
+                    clip_range_items(visible_tracks)
                 } else {
                     Vec::new()
                 };
-            if prev != next {
-                ui.push_edit({ let v_next = next; Edit::mutate(move |app: &mut AppData| { let next_refs: Vec<ClipRef> = v_next.iter().filter_map(|key| clip_key_to_ref(app, *key)).collect(); app.handle_event(AppEvent::SetClipSelection(next_refs)); }) });
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    let anchor = app.selection.clip_anchor.map(clip_key_from_model);
+                    let next = modifier.resolve(&prev, hit_key, || {
+                        range_block(&items, anchor?, hit_key)
+                    });
+                    if next != prev {
+                        let next_refs: Vec<ClipRef> =
+                            next.iter().filter_map(|key| clip_key_to_ref(app, *key)).collect();
+                        app.handle_event(AppEvent::SetClipSelection(next_refs));
+                    }
+                    // アンカー更新: Single / Toggle で clicked へ、 Range は据え置き (§3.1)。
+                    // `SetClipSelection` はアンカーを触らないので順序依存は無い。
+                    if modifier.updates_anchor() {
+                        app.selection.clip_anchor = Some(clip_key_to_model(hit_key));
+                    }
+                }));
+                response.selection_changed = true;
+            } else if !prev.is_empty() {
+                // 空きレーンの短 click → 選択クリア + アンカー破棄 (旧挙動と同じ)。
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetClipSelection(Vec::new()));
+                    app.selection.clip_anchor = None;
+                }));
                 response.selection_changed = true;
             }
             if let Some(idx) = track_index_from_y(cy, lanes.y, press_tops)
@@ -741,14 +792,11 @@ pub(super) fn commit_releases(
         // `take_drag_rect_in_rect` が `DragRect.modifiers` に snapshot する (下の commit block で読む)。
         // gate を **clear の前** で評価して `marquee_active` を作り、 同フレーム二重 emit を防ぐ。
         //
-        // #75: clip の **上から** でも範囲選択を開始できるようにする。 起動 zone を `marquee_zone_ok`
-        // で判定する:
-        //   - clip 無し (空き zone)              → 任意修飾で marquee (従来どおり)。
-        //   - clip の **Move zone** + Shift+!Ctrl → marquee (NEW)。 plain Move / Ctrl(+Shift) clone /
-        //                                           Shift+resize time-stretch とは排他。
-        //   - clip の resize handle / その他      → marquee 不可 (time-stretch・clone・move に譲る)。
-        // この zone 判定は press 側 clip_drag gate (#021 の `(!shift||ctrl)` / resize) と
-        // 鏡像で、 marquee に入る press は press 側で clip_drag session を **起動しない** ものに限られる。
+        // r.md #35: **左** drag の marquee は空き zone 専用に戻す。 #75 は「clip の Move zone を
+        // Shift+drag しても marquee」 としていたが、 Shift+click が範囲選択になったので衝突する
+        // (一次情報でもどの DAW も Shift+drag で marquee を起動しない — Shift は選択の意味に予約)。
+        // clip の **上から** の範囲選択は **右 drag** が担う (下の secondary marquee、 REAPER 既定と
+        // 同じ配置)。 よって起動 zone は「clip 無し (空き zone)」 のみ。
         // 二重防御として下の no-session ガード (全 session None) でも弾く。 automation lane は lasso が
         // 所有するため `!press_in_automation_lane` で除外 (no_session は `automation_lasso_drag` を
         // 含まないのでこの zone 除外が必須)。 splitter / 他 drag も no-session で除外。
@@ -758,27 +806,30 @@ pub(super) fn commit_releases(
                 ui.widget_state(drag_rect_wid);
             state.drag_start.is_some()
         };
+        // automation lane 行かどうか (y だけで決まる)。 左 marquee の press gate と、
+        // 右 marquee の commit gate (press y で判定) の両方が使う。
+        let in_automation_lane = |py: f32| {
+            automation_lane_at(
+                visible_tracks,
+                press_tops,
+                view.track_row_h,
+                header_pane.x,
+                header_pane.w,
+                lanes.x,
+                lanes.w,
+                style,
+                py,
+            )
+            .is_some()
+        };
         let press_in_automation_lane = pointer.primary_just_pressed
-            && pointer.pos.is_some_and(|(_, py)| {
-                automation_lane_at(
-                    visible_tracks,
-                    press_tops,
-                    view.track_row_h,
-                    header_pane.x,
-                    header_pane.w,
-                    lanes.x,
-                    lanes.w,
-                    style,
-                    py,
-                )
-                .is_some()
-            });
+            && pointer.pos.is_some_and(|(_, py)| in_automation_lane(py));
         let marquee_zone_ok = pointer.primary_just_pressed
             && !pointer.modifiers.alt
             && !press_in_automation_lane
             && pointer.pos.is_some_and(|(px, py)| {
                 lanes.contains(px, py)
-                    && match clip_hit(
+                    && clip_hit(
                         visible_tracks,
                         press_tops,
                         view,
@@ -786,15 +837,8 @@ pub(super) fn commit_releases(
                         px,
                         py,
                         style.resize_handle_px,
-                    ) {
-                        None => true,
-                        // #75: clip 本体 (Move zone) は Shift(Ctrl なし) のときだけ marquee 起動。
-                        Some((_, ClipDragKind::Move)) => {
-                            pointer.modifiers.shift && !pointer.modifiers.ctrl
-                        }
-                        // resize handle 上は time-stretch (#61) / resize に譲る。
-                        Some(_) => false,
-                    }
+                    )
+                    .is_none()
             });
         let marquee_press = if marquee_zone_ok {
             let s: &ArrangementState = ui.widget_state(wid);
@@ -871,9 +915,27 @@ pub(super) fn commit_releases(
         // next を分岐。 REPLACE は inside そのまま (zero-rect → 空 → 選択 clear)。 `prev != next` ガードで
         // no-op を抑制 (automation lasso #033 と同 idiom)。 Ctrl+Shift clone は clip HIT 時のみ (gate の
         // `clip_hit().is_none()`) なので、 ここに来る press は必ず空き zone = clone と競合しない。
-        if marquee_active
-            && let Some(drag) = ui.take_drag_rect_in_rect(drag_rect_wid, lanes)
-        {
+        //
+        // r.md #35: **右 drag** の marquee も同じ commit を通す。 左 drag が空き zone 専用なのに対し、
+        // 右 drag は `lanes` 全域 = **clip の上からでも** 起動できる (REAPER 既定と同じ配置。
+        // 右ボタンなので clip の move / resize と衝突しない)。 動かさずに離した右ボタンは
+        // `take_secondary_click_in_rect` (= context menu) 側が拾い、 ここには来ない。
+        // `DragRectState` を共有しないよう widget id は左 drag と分ける。
+        let left_marquee =
+            if marquee_active { ui.take_drag_rect_in_rect(drag_rect_wid, lanes) } else { None };
+        // 右ボタンを **動かさずに** 離したフレームは「右クリック = context menu」 なので、
+        // 0 サイズ矩形の REPLACE で選択を消してしまわないよう commit を捨てる
+        // (session 自体は take して state を畳む必要があるので呼び出しは行う)。
+        // 左 marquee の空き zone click が選択 clear になるのは従来どおりの設計で、 こちらとは別物。
+        // automation lane 上から始めた右 drag は clip の marquee にしない (その帯は
+        // automation lasso の領分。 左 marquee の `!press_in_automation_lane` と同じ除外を、
+        // 右は session を畳む必要があるので **press y (`d.start.1`) で commit 側から** 掛ける)。
+        let secondary_was_click = ui.pending_secondary_click_pos().is_some();
+        let right_marquee = ui
+            .take_secondary_drag_rect_in_rect(wid.child(b"rect_select_rmb"), lanes)
+            .filter(|d| !(d.finished && secondary_was_click))
+            .filter(|d| !in_automation_lane(d.start.1));
+        for drag in [left_marquee, right_marquee].into_iter().flatten() {
             response.rect_select_active = true;
             if drag.finished {
                 let drag_rect = drag.rect();
@@ -1112,7 +1174,7 @@ pub(super) fn commit_releases(
         // dblclick rename と同じく point gesture なので `section_at_inrect` (帯内のみ) を使う。
         // resize ハンドル拡張 (`section_hit`) だと帯のすぐ隣の空白の右クリックで隣 section のメニューが出る。
         if arranger_lane_h > 0.0
-            && let Some((cx, cy)) = ui.take_secondary_press_in_rect(arranger_rect)
+            && let Some((cx, cy)) = ui.take_secondary_click_in_rect(arranger_rect)
             && let Some(sid) = section_at_inrect(sections, arranger_rect, view, cx, cy)
         {
             ui.push_edit({ let v_id = sid; let v_pos = (cx, cy); Edit::mutate(move |app: &mut AppData| { app.ui_ephemeral.section_menu = Some((v_id, v_pos)); app.ui_ephemeral.section_menu_open = true; }) });
@@ -1230,9 +1292,9 @@ pub(super) fn commit_releases(
         // されない「真の空き track row」 上の右クリックのみ発火する (= 上の dblclick 経路の
         // 空き track row branch と同じ exclusion)。 clip / automation lane 上の右クリックは
         // caller (daw_01) の clip context menu 用に握りつぶさず素通しする (= take はするが
-        // consume しない `take_secondary_press_in_rect` の設計)。 beat は widget 内で snap 済み、
+        // consume しない `take_secondary_click_in_rect` の設計)。 beat は widget 内で snap 済み、
         // pos は menu anchor 用の右クリック viewport 座標。
-        if let Some((cx, cy)) = ui.take_secondary_press_in_rect(lanes) {
+        if let Some((cx, cy)) = ui.take_secondary_click_in_rect(lanes) {
             let on_clip =
                 clip_hit(visible_tracks, press_tops, view, lanes, cx, cy, style.resize_handle_px)
                     .is_some();

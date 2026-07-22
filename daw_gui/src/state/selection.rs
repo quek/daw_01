@@ -48,4 +48,25 @@ pub struct SelectionState {
     /// 全体に broadcast (`audio_event_target_indices`)。 close で clear、
     /// undo でも clear (index は容易にずれるため、 ノート選択と同方針)。
     pub audio_editor_selected_events: Vec<usize>,
+
+    // -------- Shift+click 範囲選択のアンカー (r.md #35) --------
+    // `docs/plan_selection_modifiers.md` §4.3。 無修飾 click / Ctrl+click で更新し、
+    // Shift+click では更新しない (= 同じ基点から繰り返し Shift+click して範囲を伸縮できる。
+    // Explorer / Finder / REAPER と同じ)。 「選択集合の末尾 = アンカー」 という旧 idiom は
+    // RangeFromAnchor が集合ごと書き換えるので基点に使えず、 面ごとの明示フィールドが所有する。
+    // すべて session-only (保存しない)。 対象が消えたら range 解決が None に倒れて Single 相当。
+    /// クリップ選択のアンカー。
+    pub clip_anchor: Option<common::model::ClipKey>,
+    /// ノート選択のアンカー (packed note id、 `selected_notes` と同空間)。
+    pub note_anchor: Option<u32>,
+    /// トラック選択のアンカー (`Track::id`)。 旧 `ArrangementState.selection_anchor` から移設。
+    pub track_anchor: Option<u32>,
+    /// Arranger セクション選択のアンカー (`Section::id`)。
+    pub section_anchor: Option<u32>,
+    /// automation point 選択のアンカー。
+    pub automation_point_anchor: Option<AutomationPointKeyRef>,
+    /// automation clip 選択のアンカー。
+    pub automation_clip_anchor: Option<common::model::AutomationClipKey>,
+    /// Audio Editor event 選択のアンカー (`audio_editor_selected_events` と同じ index 空間)。
+    pub audio_editor_anchor: Option<usize>,
 }

@@ -1295,45 +1295,84 @@
         assert!(r.y >= name_rect.y && r.y + r.h <= name_rect.y + name_rect.h, "y range は name_rect 内");
     }
 
-    #[test]
-    fn select_modifier_single_replaces_selection() {
-        // Single click は selected_tracks を [clicked] で置換 + anchor 更新。
-        // SelectModifier::Single の Edit を caller が apply するだけで動作するため、
-        // Edit 構築側の test は省略 (pure 関数 unit test として selection 計算だけ確認)。
-        let prev: Vec<u32> = vec![5, 10];
-        let clicked = 7_u32;
-        // Single 動作: next = vec![clicked]
-        let next: Vec<u32> = vec![clicked];
-        assert_ne!(prev, next, "Single click で selected_tracks が変わる (置換)");
-        assert_eq!(next, vec![7], "next は clicked 1 件のみ");
+    // ---- r.md #35: clip の Shift+click 範囲選択 (可視 track 行 × 時間の長方形ブロック) ----
+    // 選択遷移そのものの網羅は `widgets::select_modifier` の unit test 側。 ここでは
+    // **arrangement の実データ (`ArrangementTrack` / `ClipView`) から範囲表を組む配線**
+    // (`clip_range_items`) が行 index と時間範囲を正しく載せているかを検証する。
+
+    /// 3 track × 4 拍グリッド。 各 track に 1 拍幅の clip が 4 個 (id は track ごとに 1..=4)。
+    fn range_test_tracks() -> Vec<ArrangementTrack> {
+        (0..3)
+            .map(|t| {
+                let clips = (0..4)
+                    .map(|c| clip(c + 1, f64::from(c), 1.0, "c"))
+                    .collect();
+                track(t + 1, "T", clips)
+            })
+            .collect()
     }
 
     #[test]
-    fn select_modifier_toggle_adds_or_removes() {
-        // Ctrl+click toggle: clicked が selected に居れば外す、 居なければ追加
-        let prev: Vec<u32> = vec![5, 10];
-        let clicked_in = 5_u32;
-        let clicked_out = 7_u32;
-        // 含まれている case → 削除
-        let mut set: HashSet<u32> = prev.iter().copied().collect();
-        if set.contains(&clicked_in) {
-            set.remove(&clicked_in);
-        } else {
-            set.insert(clicked_in);
-        }
-        let mut v: Vec<u32> = set.into_iter().collect();
-        v.sort_unstable();
-        assert_eq!(v, vec![10], "5 を toggle → 削除");
-        // 含まれていない case → 追加
-        let mut set2: HashSet<u32> = prev.iter().copied().collect();
-        if set2.contains(&clicked_out) {
-            set2.remove(&clicked_out);
-        } else {
-            set2.insert(clicked_out);
-        }
-        let mut v2: Vec<u32> = set2.into_iter().collect();
-        v2.sort_unstable();
-        assert_eq!(v2, vec![5, 7, 10], "7 を toggle → 追加");
+    fn clip_range_items_は可視行indexと時間範囲を載せる() {
+        let tracks = range_test_tracks();
+        let items = clip_range_items(&tracks);
+        assert_eq!(items.len(), 12, "3 track × 4 clip");
+        // 先頭 track の 2 番目の clip: row=0 / beat 1..2。
+        let it = items.iter().find(|i| i.key == ClipKey { track: 1, clip: 2 }).unwrap();
+        assert_eq!(it.row, 0);
+        assert!((it.start - 1.0).abs() < 1e-9 && (it.end - 2.0).abs() < 1e-9);
+        // 3 番目の track は row=2。
+        let it3 = items.iter().find(|i| i.key == ClipKey { track: 3, clip: 1 }).unwrap();
+        assert_eq!(it3.row, 2);
+    }
+
+    #[test]
+    fn shift_click_は_track_をまたぐ長方形ブロックを選ぶ() {
+        // アンカー = track1 の clip2 (beat 1..2)、 clicked = track3 の clip3 (beat 2..3)。
+        // → track1..3 × beat 1..3 の 6 個 (各 track の clip2, clip3)。
+        let tracks = range_test_tracks();
+        let items = clip_range_items(&tracks);
+        let anchor = ClipKey { track: 1, clip: 2 };
+        let clicked = ClipKey { track: 3, clip: 3 };
+        let next = SelectModifier::RangeFromAnchor
+            .resolve(&[anchor], clicked, || range_block(&items, anchor, clicked));
+        let expect: Vec<ClipKey> = [1_u32, 2, 3]
+            .iter()
+            .flat_map(|t| [2_u32, 3].iter().map(move |c| ClipKey { track: *t, clip: *c }))
+            .collect();
+        assert_eq!(next, expect);
+    }
+
+    #[test]
+    fn shift_click_は同じtrack内ならその行だけ選ぶ() {
+        let tracks = range_test_tracks();
+        let items = clip_range_items(&tracks);
+        let anchor = ClipKey { track: 2, clip: 2 };
+        let clicked = ClipKey { track: 2, clip: 4 };
+        let next = SelectModifier::RangeFromAnchor
+            .resolve(&[anchor], clicked, || range_block(&items, anchor, clicked));
+        assert_eq!(
+            next,
+            vec![
+                ClipKey { track: 2, clip: 2 },
+                ClipKey { track: 2, clip: 3 },
+                ClipKey { track: 2, clip: 4 },
+            ],
+            "隣接 clip は端点を共有するが、 範囲外の clip1 は含めない"
+        );
+    }
+
+    #[test]
+    fn shift_click_はアンカーが無ければ単一選択に倒れる() {
+        let tracks = range_test_tracks();
+        let items = clip_range_items(&tracks);
+        let clicked = ClipKey { track: 2, clip: 3 };
+        // アンカー未設定 (None) を模す → range が None → Single 相当。
+        let next = SelectModifier::RangeFromAnchor.resolve(&[], clicked, || {
+            let anchor: Option<ClipKey> = None;
+            range_block(&items, anchor?, clicked)
+        });
+        assert_eq!(next, vec![clicked]);
     }
 
     #[test]

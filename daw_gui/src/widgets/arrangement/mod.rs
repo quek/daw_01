@@ -77,8 +77,52 @@ pub(crate) fn clip_key_to_ref(app: &AppData, key: ClipKey) -> Option<ClipRef> {
     Some(ClipRef { track: t_idx as u32, clip: c_idx as u32 })
 }
 
+/// widget `ClipKey` ↔ `common::model::ClipKey` (field 名だけが違う同一の安定 id ペア)。
+pub(crate) fn clip_key_to_model(k: ClipKey) -> common::model::ClipKey {
+    common::model::ClipKey { track_id: k.track, clip_id: k.clip }
+}
+
+pub(crate) fn clip_key_from_model(k: common::model::ClipKey) -> ClipKey {
+    ClipKey { track: k.track_id, clip: k.clip_id }
+}
+
+/// r.md #35: Shift+click 範囲選択 (長方形ブロック) 用に、 可視 track 上の全 clip を
+/// 「行 = 可視 track index / 時間 = clip の開始〜終了拍」 として並べる。 並び順は
+/// 描画順 (行 → track 内 clip 順) なので、 `range_block` の結果もその順になる。
+pub(crate) fn clip_range_items(visible_tracks: &[ArrangementTrack]) -> Vec<RangeItem<ClipKey>> {
+    let mut out = Vec::new();
+    for (row, t) in visible_tracks.iter().enumerate() {
+        for c in &t.clips {
+            out.push(RangeItem {
+                key: ClipKey { track: t.id, clip: c.id },
+                row: row as i64,
+                start: c.start_beat,
+                end: c.start_beat + c.len_beats,
+            });
+        }
+    }
+    out
+}
+
 fn widget_to_model_clip_key(k: AutomationClipKey) -> common::model::AutomationClipKey {
     common::model::AutomationClipKey { track: k.track, lane: k.lane, clip: k.clip }
+}
+
+/// widget `AutomationPointKey` ↔ `AutomationPointKeyRef` (AppData 側の同一 id 表現)。
+pub(crate) fn point_key_to_model(k: AutomationPointKey) -> AutomationPointKeyRef {
+    AutomationPointKeyRef {
+        track_id: k.clip.track,
+        lane_id: k.clip.lane,
+        clip_id: k.clip.clip,
+        point_idx: k.point_idx,
+    }
+}
+
+pub(crate) fn point_key_from_model(k: AutomationPointKeyRef) -> AutomationPointKey {
+    AutomationPointKey {
+        clip: AutomationClipKey { track: k.track_id, lane: k.lane_id, clip: k.clip_id },
+        point_idx: k.point_idx,
+    }
 }
 
 fn widget_to_model_lane_key(k: AutomationLaneKey) -> common::model::AutomationLaneKey {
@@ -658,21 +702,11 @@ pub struct ResizeAutomationClipDelta {
     pub next_len: f64,
 }
 
-/// M14 Phase 63c (#016): track header click 時の selection 変更 modifier (DAW 業界標準)。
-/// caller が `SelectTrack` Edit を受け取ったときに `(prev, next, modifier)` から動作意図を判別できる
-/// ようにするため、 widget 側で modifier を decoded して送る (caller boilerplate の削減)。
-///
-/// - `Single`: 修飾なし click → `next = vec![clicked]`、 anchor を clicked で update
-/// - `RangeFromAnchor`: Shift+click → 直前 Single click 位置 (= widget 内 anchor) と clicked の間の
-///   visible 列上の連続範囲を選択。 anchor が無い場合は Single 同等。
-/// - `Toggle`: Ctrl+click → `next = if prev.contains(&clicked) { prev - clicked } else { prev + clicked }`、
-///   anchor は更新しない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectModifier {
-    Single,
-    RangeFromAnchor,
-    Toggle,
-}
+/// 選択 modifier は全選択面 (クリップ / ノート / オートメーション / トラック / セクション /
+/// オーディオイベント) 共通なので `crate::widgets::select_modifier` が SSoT。 ここは
+/// 既存 caller 向けの re-export (`docs/plan_selection_modifiers.md` §4.2)。
+pub use crate::widgets::select_modifier::SelectModifier;
+pub(crate) use crate::widgets::select_modifier::{RangeItem, range_block, range_ordered};
 
 
 /// `Ui::arrangement` の戻り値。
@@ -1784,11 +1818,9 @@ pub(crate) struct ArrangementState {
     /// (release で `MoveSection` / `ResizeSection` / `DuplicateSection` / `CreateSection` のいずれか
     /// 1 件発火、 短 drag の Move は `SetPlayheadBeat` (帯ジャンプ) に demote)。
     section_drag: Option<SectionDragSession>,
-    /// M14 Phase 63c (#016): 直前の `Single` クリック位置 (= Shift+click 範囲選択の起点)。
-    /// caller には公開せず widget 内 SSoT として持つ (piano_roll の note multi-select は anchor
-    /// なし設計だったが、 arrangement では daw_01 #009 / #016 で「widget 内 anchor」 が確認されている)。
-    /// `Toggle` modifier では update しない、 `Single` / `RangeFromAnchor` で update。
-    selection_anchor: Option<u32>,
+    // (r.md #35) track の選択アンカーは widget state から `SelectionState.track_anchor` へ移設。
+    // 全選択面 (clip / note / automation / section / audio event) で同じ場所・同じ更新規則に
+    // 揃えるため (`docs/plan_selection_modifiers.md` §4.3)。
     /// edge auto-scroll の移動量ゲート用 press 位置 (primary press 時の screen pos)。
     /// 端スクロールは「press からここまでの移動が `ACTIVATE_PX` 以上」 のときのみ発火させ、端近くの
     /// clip を click-and-hold しただけで view が動くのを防ぐ (実 DAW は実ドラッグで初めて端スクロール)。

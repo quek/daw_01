@@ -1336,6 +1336,140 @@ fn take_secondary_press_in_rect_ignores_primary_press() {
     });
 }
 
+// -------- daw_01 r.md #35: 右クリック (context menu) と右ドラッグ (矩形選択) の分離 --------
+
+fn secondary_release_at(x: f32, y: f32) -> FrameInput {
+    FrameInput {
+        pointer: PointerFrame {
+            pos: Some((x, y)),
+            secondary_just_released: true,
+            ..PointerFrame::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// press → 動かさず release で右クリック確定。 座標は **press 位置**。
+#[test]
+fn secondary_click_press_then_release_without_moving_returns_press_pos() {
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 400, height: 300 };
+    let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+    // press フレーム: まだ click は確定しない (menu は release で開く)。
+    host.frame_to_edits(&(), &mut scene, screen, secondary_press_at(120.0, 80.0), |(), ui| {
+        assert_eq!(ui.take_secondary_click_in_rect(rect), None, "press だけでは確定しない");
+    });
+    // release フレーム: 移動 0px → click 確定。
+    host.frame_to_edits(&(), &mut scene, screen, secondary_release_at(120.0, 80.0), |(), ui| {
+        assert_eq!(ui.take_secondary_click_in_rect(rect), Some((120.0, 80.0)));
+    });
+}
+
+/// press → 大きく動かして release は **右ドラッグ** なので click にしない
+/// (= context menu を出さず矩形選択に譲る)。
+#[test]
+fn secondary_click_is_not_emitted_after_a_drag() {
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 400, height: 300 };
+    let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+    host.frame_to_edits(&(), &mut scene, screen, secondary_press_at(120.0, 80.0), |(), _ui| {});
+    host.frame_to_edits(&(), &mut scene, screen, secondary_release_at(220.0, 180.0), |(), ui| {
+        assert_eq!(ui.take_secondary_click_in_rect(rect), None, "drag したので click にしない");
+    });
+}
+
+/// jitter (閾値未満の微小移動) は click のまま扱う。
+#[test]
+fn secondary_click_tolerates_jitter_below_threshold() {
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 400, height: 300 };
+    let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+
+    host.frame_to_edits(&(), &mut scene, screen, secondary_press_at(120.0, 80.0), |(), _ui| {});
+    host.frame_to_edits(&(), &mut scene, screen, secondary_release_at(122.0, 81.0), |(), ui| {
+        assert_eq!(ui.take_secondary_click_in_rect(rect), Some((120.0, 80.0)), "2px は jitter");
+    });
+}
+
+/// 右 drag は `take_secondary_drag_rect_in_rect` が矩形として返し、 release frame で
+/// `finished` が 1 度だけ立つ。 press 時の修飾キーは snapshot される。
+#[test]
+fn secondary_drag_rect_reports_rect_and_finishes_on_release() {
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 400, height: 300 };
+    let bounds = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+    let wid = WidgetId::ROOT.child(b"rmb_marquee");
+
+    // press (Shift 保持) → session 開始。
+    let press = FrameInput {
+        pointer: PointerFrame {
+            pos: Some((100.0, 100.0)),
+            secondary_just_pressed: true,
+            modifiers: daw_ui_platform::Modifiers {
+                shift: true,
+                ..daw_ui_platform::Modifiers::default()
+            },
+            ..PointerFrame::default()
+        },
+        ..Default::default()
+    };
+    host.frame_to_edits(&(), &mut scene, screen, press, |(), ui| {
+        let drag = ui
+            .take_secondary_drag_rect_in_rect(wid, bounds)
+            .expect("press frame で session が立つ");
+        assert!(!drag.finished);
+        assert!(drag.modifiers.shift, "press 時の修飾を snapshot する");
+    });
+    // release → finished + 矩形確定。
+    let release = FrameInput {
+        pointer: PointerFrame {
+            pos: Some((160.0, 140.0)),
+            secondary_just_released: true,
+            ..PointerFrame::default()
+        },
+        ..Default::default()
+    };
+    host.frame_to_edits(&(), &mut scene, screen, release, |(), ui| {
+        let drag = ui
+            .take_secondary_drag_rect_in_rect(wid, bounds)
+            .expect("release frame で 1 度返る");
+        assert!(drag.finished);
+        let r = drag.rect();
+        assert!((r.x - 100.0).abs() < 1e-5 && (r.y - 100.0).abs() < 1e-5);
+        assert!((r.w - 60.0).abs() < 1e-5 && (r.h - 40.0).abs() < 1e-5);
+        assert!(drag.modifiers.shift, "modifier は press 時のものを保持");
+    });
+}
+
+/// 左 drag (primary) は secondary 版の session を起動しない (ボタンが独立)。
+#[test]
+fn secondary_drag_rect_ignores_primary_button() {
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 400, height: 300 };
+    let bounds = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+    let wid = WidgetId::ROOT.child(b"rmb_marquee2");
+
+    let input = FrameInput {
+        pointer: PointerFrame {
+            pos: Some((100.0, 100.0)),
+            primary_just_pressed: true,
+            primary_pressed: true,
+            ..PointerFrame::default()
+        },
+        ..Default::default()
+    };
+    host.frame_to_edits(&(), &mut scene, screen, input, |(), ui| {
+        assert!(ui.take_secondary_drag_rect_in_rect(wid, bounds).is_none());
+    });
+}
+
 #[test]
 fn take_double_click_in_rect_within_threshold_returns_some() {
     let mut host: UiHost<()> = UiHost::no_redraw();

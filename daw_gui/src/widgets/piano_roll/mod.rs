@@ -911,6 +911,10 @@ struct NoteDragSession {
     /// release frame の `Move` ↔ `Copy` 分岐と copy overlay の色が必ず同一値で確定する
     /// (OS の ModifiersChanged が Released より先に届くと ctrl が false に化けるのを回避)。
     last_ctrl: bool,
+    /// (r.md #35) drag 中の最終 shift 状態。 `last_ctrl` と完全同型の careful-update で保持し、
+    /// 短 click 格下げ時の選択 modifier (Shift = 範囲選択) を release frame の生読みに
+    /// 依存せず確定させる (arrangement の `ClipDragSession.last_shift` と同 idiom)。
+    last_shift: bool,
 }
 
 /// 空白ダブルクリック作成で「ドラッグした」と判定する左右いずれかの最小移動量 (px)。

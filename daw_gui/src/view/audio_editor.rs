@@ -15,6 +15,8 @@
 
 use std::sync::Arc;
 
+use crate::widgets::select_modifier::{SelectModifier, range_ordered};
+
 use daw_ui_core::{
     ChannelLayout, DragKind, Edit, SampleSlices, Ui, ViewportState1D, WaveformRenderMode,
     WaveformSource, WaveformStyle, WaveformView, WidgetId,
@@ -381,6 +383,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     }
 
+    // (r.md #35) Shift+click の範囲選択が使う「event の並び」。 index が時間順なので
+    // 0..len がそのまま順序列 (`range_ordered` の入力)。
+    let event_total = audio.events.len();
     for (idx, event) in audio.events.iter().enumerate() {
         let Some(buffer) = app.media.audio_source_cache.get(event.source_id) else {
             // 当該 event は decode 待ち / missing source → 透けて見える
@@ -829,21 +834,34 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         });
                     }));
                 }
-            } else if drag.start_modifiers.shift {
+            } else if drag.start_modifiers.shift || drag.start_modifiers.ctrl {
+                // r.md #35: 旧実装は Shift のみをトグルに使い、 Ctrl は素通り (= 無修飾と同じ
+                // 単一選択) だった。 全選択面共通の `SelectModifier` に統一する —
+                // Ctrl = Toggle / Shift = RangeFromAnchor。 event は 1 clip 内で時間順に
+                // 並ぶ index なので範囲は 1 次元 (`range_ordered`)。
                 if kind == DragKind::Started {
-                    let mut next = app.selection.audio_editor_selected_events.clone();
-                    if let Some(p) = next.iter().position(|&i| i == idx) {
-                        next.remove(p);
-                    } else {
-                        next.push(idx);
-                    }
+                    let modifier = SelectModifier::from_modifiers(
+                        drag.start_modifiers.shift,
+                        drag.start_modifiers.ctrl,
+                    );
+                    let order: Vec<usize> = (0..event_total).collect();
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetAudioEditorEventSelection(next));
+                        let prev = app.selection.audio_editor_selected_events.clone();
+                        let anchor = app.selection.audio_editor_anchor;
+                        let next = modifier
+                            .resolve(&prev, idx, || range_ordered(&order, anchor?, idx));
+                        if next != prev {
+                            app.handle_event(AppEvent::SetAudioEditorEventSelection(next));
+                        }
+                        if modifier.updates_anchor() {
+                            app.selection.audio_editor_anchor = Some(idx);
+                        }
                     }));
                 }
             } else if kind == DragKind::Started {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SelectAudioEditorEvent(Some(idx)));
+                    app.selection.audio_editor_anchor = Some(idx);
                 }));
             } else if kind == DragKind::Continuing && dx.abs() > 1.0 {
                 push_move_ghost(ui, event_rect, wf_area, dx);
@@ -908,25 +926,38 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     ) && dr.finished
     {
         let r = dr.rect();
-        let additive = dr.modifiers.shift;
-        let mut hit: Vec<usize> = event_rects
+        // r.md #35: 投げ縄の修飾も他面と揃える — 無修飾 = REPLACE / Shift = UNION / Ctrl = XOR
+        // (旧実装は Ctrl を見ておらず REPLACE に落ちていた)。
+        let (union, xor) = (dr.modifiers.shift, dr.modifiers.ctrl);
+        let hit: Vec<usize> = event_rects
             .iter()
             .filter(|(_, er)| rects_intersect(r, *er))
             .map(|(i, _)| *i)
             .collect();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if additive {
-                let mut next = app.selection.audio_editor_selected_events.clone();
-                for i in hit.drain(..) {
-                    if !next.contains(&i) {
-                        next.push(i);
+            let prev = app.selection.audio_editor_selected_events.clone();
+            let next: Vec<usize> = if union {
+                let mut out = prev.clone();
+                for i in &hit {
+                    if !out.contains(i) {
+                        out.push(*i);
                     }
                 }
-                app.handle_event(AppEvent::SetAudioEditorEventSelection(next));
+                out
+            } else if xor {
+                let mut out: Vec<usize> =
+                    prev.iter().copied().filter(|i| !hit.contains(i)).collect();
+                for i in &hit {
+                    if !prev.contains(i) {
+                        out.push(*i);
+                    }
+                }
+                out
             } else {
-                app.handle_event(AppEvent::SetAudioEditorEventSelection(std::mem::take(
-                    &mut hit,
-                )));
+                hit
+            };
+            if next != prev {
+                app.handle_event(AppEvent::SetAudioEditorEventSelection(next));
             }
         }));
     }
