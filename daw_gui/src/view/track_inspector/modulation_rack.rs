@@ -424,7 +424,10 @@ pub(super) fn draw_modulation_rack(
         match &src.kind {
             K::EnvelopeFollower { tap, follower } => {
                 // follower は cycle を持たない → canvas は出さず tap/A/R を出す。
-                let tap_w = 64.0;
+                // 既定表示 "Post-Fdr" = 8 字 * 14 * 0.527 = 59.1px。 dropdown の文字領域は
+                // w - PAD_X(8) - ARROW_W(16) なので 84px 以上必要 (旧 64px では 40px しか
+                // 無く、 ▼ シェブロンに完全に重なった上で右枠を 2.3px 越えていた)。
+                let tap_w = 88.0;
                 const TAP_POINTS: [common::model::TapPoint; 3] = [
                     common::model::TapPoint::PreFx,
                     common::model::TapPoint::PostFx,

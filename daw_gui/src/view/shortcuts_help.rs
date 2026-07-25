@@ -220,7 +220,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
 
     let sw = screen.width as f32;
     let sh = screen.height as f32;
-    let pw = (sw * 0.94).min(1180.0);
+    // 説明列の実効幅 = (pw - PAD*2) / N_COLS - COL_GAP - KEY_COL_W。 旧 1180px 上限では
+    // 364px しか取れず、 最長の説明 2 件 (412px) が画面がどれだけ広くても必ず末尾省略
+    // されて最後まで読めなかった。 1400px 上限なら 474px 取れて全項目が省略なしで入る
+    // (狭いウィンドウでは従来どおり sw*0.94 で縮み、 溢れた分は ellipsis に落ちる)。
+    let pw = (sw * 0.94).min(1400.0);
     let ph = (sh * 0.92).min(920.0);
 
     ui.modal(

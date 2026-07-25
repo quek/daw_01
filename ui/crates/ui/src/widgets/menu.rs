@@ -74,8 +74,52 @@ impl<'a, M: ?Sized + 'static> MenuEntry<'a, M> {
 
 const MENU_ITEM_H: f32 = 24.0;
 const MENU_PAD_X: f32 = 12.0;
-const MENU_FONT: f32 = 14.0;
+pub(crate) const MENU_FONT: f32 = 14.0;
+/// popup 幅の**下限** (項目が短くても最低これだけ広げる)。
 const MENU_W_DEFAULT: f32 = 180.0;
+/// popup 幅の上限。 これを超える項目は ellipsis で省略する (画面を横断する
+/// 巨大 popup を防ぐ安全弁)。
+const MENU_W_MAX: f32 = 480.0;
+
+/// `&[&str]` 版の popup 推奨幅 (dropdown 用)。 全項目が省略なしで収まる幅を返す。
+/// 下限は `min_w` (dropdown 本体幅 = combobox の慣用)、 上限は [`MENU_W_MAX`]。
+pub(crate) fn items_popup_width<M: ?Sized + 'static>(
+    ui: &mut Ui<'_, M>,
+    items: &[&str],
+    min_w: f32,
+) -> f32 {
+    let widest = items
+        .iter()
+        .map(|s| ui.measure_text(s, MENU_FONT))
+        .fold(0.0_f32, f32::max);
+    (widest + MENU_PAD_X * 2.0).min(MENU_W_MAX).max(min_w)
+}
+
+/// `MenuEntry` 版の popup 推奨幅。 各項目の「ラベル実幅 + 右側予約 (shortcut hint /
+/// ▶ マーカー)」の最大値に左右 padding を足す。
+///
+/// 固定 180px だと日本語ラベル (全角 1 文字 = font_size) がすぐ枠外へ出る
+/// (例:「クリップ色をトラックに揃える」= 全角 14 文字 ≒ 207px)。 DAW の
+/// コンテキストメニューは内容に合わせて伸びるのが標準なので、実 advance で
+/// 測って伸ばす。 上限を超えた分だけ [`draw_menu_entries`] が ellipsis する。
+pub(crate) fn entries_popup_width<'a, M: ?Sized + 'static>(
+    ui: &mut Ui<'a, M>,
+    entries: &[MenuEntry<'a, M>],
+) -> f32 {
+    let mut widest = 0.0_f32;
+    for e in entries {
+        let label_w = ui.measure_text(e.label(), MENU_FONT);
+        let right = match e {
+            MenuEntry::Item { shortcut_hint: Some(h), .. } => {
+                ui.measure_text(h, MENU_FONT) + MENU_PAD_X
+            }
+            MenuEntry::SubMenu { .. } => MENU_FONT + MENU_PAD_X,
+            MenuEntry::Item { .. } => 0.0,
+        };
+        widest = widest.max(label_w + right);
+    }
+    (widest + MENU_PAD_X * 2.0).clamp(MENU_W_DEFAULT, MENU_W_MAX)
+}
 
 /// item リストを縦並べる popup (menu / context_menu / dropdown 共通)。
 /// `popup_id` は呼び出し側が責任を持って一意にする (例: `(b"menu_file", ...)`)。
@@ -119,14 +163,24 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
                 clip_rect: None,
             });
         }
+        // 項目が popup 幅に収まらないときは末尾 ellipsis + clip (daw_01 #079 の
+        // 「widget は自分の rect 境界に責任を持つ」)。 dropdown の popup 幅は
+        // 呼び出し側 dropdown の rect.w なので、 狭い dropdown ほど溢れやすい。
+        let item_max_w = (item_rect.w - MENU_PAD_X * 2.0).max(1.0);
+        let (display, _) = ui.fit_text_ellipsized(item, MENU_FONT, item_max_w);
         ui.push_text(GlyphArea {
-            text: (*item).into(),
+            text: display.as_ref().into(),
             left: item_rect.x + MENU_PAD_X,
             top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
             font_size: MENU_FONT,
             line_height: MENU_FONT * 1.2,
             color: theme::TEXT,
-            clip_rect: None,
+            clip_rect: Some(Rect {
+                x: item_rect.x + MENU_PAD_X,
+                y: item_rect.y,
+                w: item_max_w,
+                h: item_rect.h,
+            }),
             ..GlyphArea::default()
         });
         if hovered && pointer.primary_just_released {
@@ -323,19 +377,37 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
         } else {
             theme::TEXT_FAINT
         };
+        // 右端の shortcut hint / ▶ マーカーが占める幅を先に確定し、 label はその
+        // 手前までに収める。 実 advance で測るので CJK ラベル (日本語メニュー) でも
+        // 正しい (旧実装は clip も ellipsis も無く、 長いラベルが hint / ▶ の上に
+        // 重なった上で popup 外へはみ出していた)。
+        let hint_w = item_hint.map_or(0.0, |h| ui.measure_text(h, MENU_FONT));
+        let right_reserved = if item_hint.is_some() {
+            hint_w + MENU_PAD_X
+        } else if is_sub {
+            MENU_FONT + MENU_PAD_X
+        } else {
+            0.0
+        };
+        let label_max_w = (item_rect.w - MENU_PAD_X * 2.0 - right_reserved).max(1.0);
+        let (label_display, _) = ui.fit_text_ellipsized(label, MENU_FONT, label_max_w);
         ui.push_text(GlyphArea {
-            text: label.into(),
+            text: label_display.as_ref().into(),
             left: item_rect.x + MENU_PAD_X,
             top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
             font_size: MENU_FONT,
             line_height: MENU_FONT * 1.2,
             color: text_color,
-            clip_rect: None,
+            clip_rect: Some(Rect {
+                x: item_rect.x + MENU_PAD_X,
+                y: item_rect.y,
+                w: label_max_w,
+                h: item_rect.h,
+            }),
             ..GlyphArea::default()
         });
         // shortcut hint を右端に灰色で
         if let Some(hint) = item_hint {
-            let hint_w = (hint.chars().count() as f32) * 7.0;
             ui.push_text(GlyphArea {
                 text: hint.into(),
                 left: item_rect.x + item_rect.w - MENU_PAD_X - hint_w,
@@ -377,7 +449,9 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
                 let sub_popup_rect = Rect {
                     x: item_rect.x + item_rect.w,
                     y: item_rect.y,
-                    w: MENU_W_DEFAULT,
+                    // 中身に合わせて伸ばす (Open Recent の長いファイル名が枠外に
+                    // 出ていた)。 上限を超えたら item 側の ellipsis が効く。
+                    w: entries_popup_width(ui, sub_entries),
                     h: (sub_entries.len() as f32) * MENU_ITEM_H,
                 };
                 let sub_anchor = union_rect(item_rect, sub_popup_rect);
@@ -529,23 +603,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // popup_layer の outside_click (press 判定) がラベルを「外」と誤判定して即閉じる回帰を
         // 防ぐためラベル帯を含める。
         let mut label_rects: Vec<Rect> = Vec::with_capacity(menus.len());
-        let mut popup_rects: Vec<Rect> = Vec::with_capacity(menus.len());
-        let mut anchors: Vec<Rect> = Vec::with_capacity(menus.len());
         let mut next_x = 0.0;
-        for (label, entries) in &menus {
-            let label_w = (label.chars().count() as f32) * 8.0 + MENU_PAD_X * 2.0;
-            let label_rect = Rect { x: rect.x + next_x, y: rect.y, w: label_w, h: rect.h };
+        for (label, _entries) in &menus {
+            // ラベル帯の幅は実 advance で測る。 固定 8px/文字 の概算は CJK
+            // (1 文字 ≒ font_size = 14px) を半分に見積もるので、 日本語メニュー名では
+            // 文字が隣のラベル帯へはみ出し、 hover / click 判定もラベル位置とずれる。
+            let label_w = self.measure_text(label, MENU_FONT) + MENU_PAD_X * 2.0;
+            label_rects.push(Rect { x: rect.x + next_x, y: rect.y, w: label_w, h: rect.h });
             next_x += label_w;
-            let popup_h = (entries.len() as f32) * MENU_ITEM_H;
-            let popup_rect = crate::popup::popup_rect_below_or_above(
-                label_rect,
-                MENU_W_DEFAULT,
-                popup_h,
-                self.screen(),
-            );
-            anchors.push(union_rect(label_rect, popup_rect));
-            label_rects.push(label_rect);
-            popup_rects.push(popup_rect);
         }
 
         // --- Phase 3: 入力処理 (popup_layer より前に open/close を確定) ---
@@ -555,6 +620,31 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let hovered_idx = pointer
             .pos
             .and_then(|(px, py)| label_rects.iter().position(|r| r.contains(px, py)));
+
+        // popup 幅の実測 (`entries_popup_width`) は全 entry を shape するので、 popup が
+        // 要る menu (開いている / hover していて次に開きうる) だけ計算する。 全 menu 分を
+        // 毎フレーム測ると menu bar だけで数十回の shape が走って UI ループが重くなる。
+        // 閉じていて hover もしていない menu の anchor は open されるまで使われない
+        // (open は必ず hover か click 経由 = hovered_idx が Some の frame)。
+        let mut popup_rects: Vec<Rect> = Vec::with_capacity(menus.len());
+        let mut anchors: Vec<Rect> = Vec::with_capacity(menus.len());
+        for (i, (_label, entries)) in menus.iter().enumerate() {
+            let label_rect = label_rects[i];
+            let popup_h = (entries.len() as f32) * MENU_ITEM_H;
+            let popup_w = if open_idx == Some(i) || hovered_idx == Some(i) {
+                entries_popup_width(self, entries)
+            } else {
+                MENU_W_DEFAULT
+            };
+            let popup_rect = crate::popup::popup_rect_below_or_above(
+                label_rect,
+                popup_w,
+                popup_h,
+                self.screen(),
+            );
+            anchors.push(union_rect(label_rect, popup_rect));
+            popup_rects.push(popup_rect);
+        }
         self.switch_menu_bar_top_level(&menus, &anchors, open_idx, hovered_idx, pointer);
 
         // --- Phase 4: 描画 — ラベル列 + (open している menu のみ) popup ---
@@ -689,9 +779,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let n = items.len();
         if let Some((px, py)) = open_at {
             let popup_h = (n as f32) * MENU_ITEM_H;
+            // 幅は項目に合わせて伸ばす (日本語の項目名が 180px 固定枠から
+            // はみ出して背後の画面に直描きされていた)。
+            let popup_w = items_popup_width(self, items, MENU_W_DEFAULT);
             let anchor = crate::popup::popup_rect_clamped_at(
                 (px, py),
-                MENU_W_DEFAULT,
+                popup_w,
                 popup_h,
                 self.screen(),
             );

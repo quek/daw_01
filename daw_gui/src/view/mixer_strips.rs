@@ -377,7 +377,13 @@ fn draw_track_strip(
     };
     let (was_dragging_vol, was_dragging_pan) = drag_flags(app, track_id);
     let n_sends = app.song_doc.song().track_by_id(track_id).map_or(0, |t| t.sends.len());
-    let sends_band_h = sends_band_height(n_sends);
+    // strip 高さが足りないときは band 側を縮めてフェーダーの最低高を守る
+    // (縮めた分の send 行は band 内の縦スクロールで到達できる)。 旧実装は
+    // band を要求どおり確保して fader_h を `.max(20.0)` で誤魔化していたため、
+    // send 2 本以上でフェーダー / メーターと Sends セクションが重なって描かれ、
+    // 重なり領域では先に描かれるフェーダーが press を consume して × / send knob が
+    // クリック不能になっていた。
+    let sends_band_h = sends_band_height_fitted(n_sends, rect.h);
     draw_strip(
         app,
         ui,
@@ -541,11 +547,19 @@ fn draw_strip(
     } else {
         rect.x + pad
     };
-    ui.label_at(
+    // 80px ストリップに収まらない名前は末尾 ellipsis + clip。 素の label_at だと
+    // 半角 13 字以上 (group strip は 10 字以上) で strip 境界を越え、 STRIP_GAP の
+    // 隙間にグリフの破片が残ったまま隣の strip 背景に飲まれて「末尾が黙って消える」
+    // (例: multi-out 子トラックの "Surge XT Out 1" / "Out 2" が区別できない)。
+    ui.label_at_clipped(
         ("mixer_strip_name", layout_idx),
         name,
-        name_x,
-        y,
+        Rect {
+            x: name_x,
+            y,
+            w: (rect.x + rect.w - pad - name_x).max(1.0),
+            h: TOP_LABEL_H,
+        },
         11.0,
         // 全トラック名を明色で描画。 旧 dim
         // (COLOR_TEXT) は暗 strip 背景に対しコントラスト不足で読みにくかった。
@@ -623,6 +637,12 @@ fn draw_strip(
     // band の高さ分だけ fader 下端を持ち上げて領域を空ける (= caller が
     // `draw_sends_section` で同じ band geometry を使って描く)。
     let fader_top = y + 4.0;
+    // `sends_band_height_fitted` はこの積み上げを定数化した値で band 高を決める。
+    // 片方だけ変えると band とフェーダーが重なるので、 非 master 経路で一致を固定する。
+    debug_assert!(
+        is_master || (fader_top - (rect.y + STRIP_FADER_TOP_OFFSET)).abs() < 0.01,
+        "STRIP_FADER_TOP_OFFSET が draw_strip の y 積み上げとずれている"
+    );
     let fader_bottom = rect.y + rect.h - pad - 12.0 - sends_band_h;
     let fader_h = (fader_bottom - fader_top).max(20.0);
 
@@ -702,6 +722,24 @@ fn sends_band_height(n_sends: usize) -> f32 {
     4.0 + (n_sends as f32) * SEND_ROW_H + ADD_SEND_H + 4.0
 }
 
+/// フェーダー / メーターに残す最小高 (px)。 これを割り込むと掴めなくなるので、
+/// Sends band 側を縮めて (= band 内を縦スクロールさせて) 守る。
+const MIN_FADER_H: f32 = 28.0;
+
+/// strip 上部 (pad + 名前 + M/S + pan knob + fader 上マージン) が固定で食う高さ。
+/// `draw_strip` の y 積み上げと一致させること。
+const STRIP_FADER_TOP_OFFSET: f32 = 6.0 + TOP_LABEL_H + TOGGLE_H + 6.0 + KNOB_SIZE + 4.0 + 4.0;
+/// fader 下端から strip 下端までの固定余白 (`draw_strip` の `pad + 12.0`)。
+const STRIP_FADER_BOTTOM_PAD: f32 = 6.0 + 12.0;
+
+/// `sends_band_height` を strip の実高さに収まるよう clamp した値。
+/// 収まらないぶんは `draw_sends_section` 内の縦スクロールで到達する。
+fn sends_band_height_fitted(n_sends: usize, strip_h: f32) -> f32 {
+    let want = sends_band_height(n_sends);
+    let room = (strip_h - STRIP_FADER_TOP_OFFSET - MIN_FADER_H - STRIP_FADER_BOTTOM_PAD).max(0.0);
+    want.min(room)
+}
+
 /// controls 行で Pre/Post トグルに割り当てる幅。 knob 右の小ボタン帯から per-send mute
 /// (M) を固定幅で引いた残り全部を Pre/Post に与え、 "Post" (最長ラベル) が省略
 /// (P…) されないようにする。 `inner_w` は strip の内側幅 (= `rect.w - SEND_PAD*2`)。
@@ -735,28 +773,61 @@ fn draw_sends_section(
         0.0,
     );
 
-    let mut y = band_top + 4.0;
-    let inner_x = rect.x + pad;
-    let inner_w = rect.w - pad * 2.0;
-
     // 各 send の宛先名は派生 (= track_by_id で都度解決)。 send 本体は
     // `app.song_doc.song().track_by_id(track_id).sends` を読む。 track が無ければ
     // (race) 何も描かない。
     let Some(src_track) = app.song_doc.song().track_by_id(track_id) else {
         return;
     };
+    // band が必要高より低い (= strip が短い) ときは band 内を縦スクロールさせる。
+    // scrollbar が出る分だけ行の内側幅を詰めて × / M ボタンと重ならないようにする。
+    let content_h = sends_band_height(src_track.sends.len());
+    let band_rect = Rect { x: rect.x, y: band_top, w: rect.w, h: band_h };
+    let scrolling = content_h > band_h + 0.5;
+    let scrollbar_w = if scrolling { 10.0 } else { 0.0 };
+    ui.scroll_area(
+        ("mixer_sends_scroll", track_id as usize),
+        band_rect,
+        (band_rect.w, content_h),
+        |ui, scroll_off| {
+            draw_sends_rows(app, ui, track_id, src_track, rect, band_top - scroll_off.1, scrollbar_w);
+        },
+    );
+}
+
+/// Sends band の中身 (send 行 + 「＋ Send」)。 `top` は band 上端 (スクロール
+/// オフセット適用済み)、 `scrollbar_w` は band にスクロールバーが出ているときの
+/// 予約幅。 `draw_sends_section` の scroll_area 内からのみ呼ぶ。
+fn draw_sends_rows(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    track_id: u32,
+    src_track: &common::model::Track,
+    rect: Rect,
+    top: f32,
+    scrollbar_w: f32,
+) {
+    let pad = SEND_PAD;
+    let mut y = top + 4.0;
+    let inner_x = rect.x + pad;
+    let inner_w = rect.w - pad * 2.0 - scrollbar_w;
+
     for (send_idx, send) in src_track.sends.iter().enumerate() {
         let dest_name = app
             .song_doc.song()
             .track_by_id(send.dest_track_id)
             .map(|t| {
                 if t.name.is_empty() {
-                    format!("→ {}", send.dest_track_id)
+                    format!("\u{2192}{}", send.dest_track_id)
                 } else {
-                    format!("→ {}", t.name)
+                    format!("\u{2192}{}", t.name)
                 }
             })
-            .unwrap_or_else(|| format!("→ ?{}", send.dest_track_id));
+            .unwrap_or_else(|| format!("\u{2192}?{}", send.dest_track_id));
+        // 矢印の後ろに空白を置かない: 名前欄は 51px しかなく (80px strip − pad − ×)、
+        // 空白 1 文字 (font 10 で 5.3px) を足すと既定リターン名 "Return 1" (42.2px)
+        // まで ellipsis されて "→ Return…" になり、 どのリターン宛てか判別できなく
+        // なっていた。 空白なしなら "→Return 10" まで収まる。
 
         // header 行: 宛先名 (左、 × にかぶらないよう省略付き) + × (右上)。
         let close_x = inner_x + inner_w - SEND_CLOSE_BTN_W;

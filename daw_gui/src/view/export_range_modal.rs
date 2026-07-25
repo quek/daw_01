@@ -22,7 +22,11 @@ use crate::app::{AppData, AppEvent, ExportRangeKind};
 const COLOR_TEXT: Color = theme::TEXT;
 const COLOR_HINT: Color = theme::TEXT_DIM;
 
-const PANEL_W: f32 = 380.0;
+// 「開始 / 終了」 のラベル列 (LABEL_W) をパネル内に入れ、 解像度 dropdown に
+// 最長プリセット "1080 × 1080 (正方形 1:1)" (実 advance 177px + PAD 8 + ARROW 16)
+// を収めるための幅。 旧 380px ではラベルがパネル左端の**外側** (暗転 backdrop の上)
+// に描かれ、 解像度の縦型 / 正方形プリセットが枠と ▼ アローを突き抜けていた。
+const PANEL_W: f32 = 440.0;
 const PANEL_H: f32 = 210.0;
 /// Mp4 は範囲に加えて解像度 / fps の dropdown 行を最下段に持つので背が高い。
 /// dropdown の popup は panel 下端より下 (= 暗転 overlay、 widget 無し) に開くため、
@@ -34,6 +38,9 @@ const FIELD_W: f32 = 130.0;
 const LABEL_W: f32 = 60.0;
 const BTN_H: f32 = 28.0;
 const BTN_W: f32 = 110.0;
+/// 「全曲にリセット」 は全角 7 文字 = 7 * 16 = 112px あり、 BTN_W(110) では
+/// 「全曲にリセッ…」 と省略されて意味が読めなくなるので専用幅を持つ。
+const RESET_BTN_W: f32 = 128.0;
 
 const MODAL_STYLE: ModalStyle = ModalStyle {
     overlay_color: theme::BACKDROP,
@@ -143,7 +150,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 ui,
                 "exr_start",
                 "開始",
-                Rect { x: panel.x + PAD, y: row0_y, w: FIELD_W, h: ROW_H },
+                // field_row はラベルを `field_rect.x - LABEL_W` に描くので、
+                // field 自体をラベル幅ぶん右に置かないとラベルがパネル外に出る。
+                Rect { x: panel.x + PAD + LABEL_W, y: row0_y, w: FIELD_W, h: ROW_H },
                 start_beat,
                 0.0,
                 time_sig,
@@ -160,7 +169,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 ui,
                 "exr_end",
                 "終了",
-                Rect { x: panel.x + PAD, y: row1_y, w: FIELD_W, h: ROW_H },
+                Rect { x: panel.x + PAD + LABEL_W, y: row1_y, w: FIELD_W, h: ROW_H },
                 end_beat,
                 song_len,
                 time_sig,
@@ -173,9 +182,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
 
             // 「全曲」 リセットリンク (右上寄り)。
             let reset_rect = Rect {
-                x: panel.x + panel.w - PAD - BTN_W,
+                x: panel.x + panel.w - PAD - RESET_BTN_W,
                 y: row0_y,
-                w: BTN_W,
+                w: RESET_BTN_W,
                 h: ROW_H,
             };
             if ui.button_at_clicked("exr_reset", "全曲にリセット", reset_rect) {
@@ -235,7 +244,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     .iter()
                     .position(|(_, w, h)| *w == resolution.0 && *h == resolution.1)
                     .unwrap_or(RES_DEFAULT_IDX);
-                let res_rect = Rect { x: panel.x + PAD + 50.0, y: dd_y, w: 168.0, h: ROW_H };
+                // 最長プリセット "1080 × 1080 (正方形 1:1)" = 177.2px。 dropdown の
+                // 文字領域は w - PAD_X(8) - ARROW_W(16) なので 202px 以上必要。
+                let res_rect = Rect { x: panel.x + PAD + 56.0, y: dd_y, w: 204.0, h: ROW_H };
                 if let Some(idx) = ui.dropdown("exr_res_dd", res_rect, &res_labels, res_sel) {
                     let (_, w, h) = RES_PRESETS[idx];
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {

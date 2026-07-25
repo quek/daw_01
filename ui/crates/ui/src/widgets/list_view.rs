@@ -109,8 +109,17 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                         w: row_visible_w,
                         h: style_copy.row_height,
                     };
-                    let inside =
-                        pointer.pos.is_some_and(|(px, py)| row_rect.contains(px, py));
+                    // hit-test は viewport (`rect`) との交差で取る。 row_rect だけを見ると、
+                    // scroll offset が row_total_h の倍数でないとき (ホイール 1 ノッチ =
+                    // LINE_HEIGHT_PX=40 は行高の倍数にならない) 先頭 / 末尾の行が
+                    // viewport の外へ数 px はみ出し、 clip されて **見えていないのに
+                    // クリックできる** 行ができる (検索ボックス下端の click で不可視の
+                    // プラグインがロードされる)。 reorderable_list と同じガード。
+                    let inside = pointer.pos.is_some_and(|(px, py)| {
+                        rect.contains(px, py)
+                            && px < rect.x + row_visible_w
+                            && row_rect.contains(px, py)
+                    });
                     let is_sel = selected == Some(i);
                     let bg = if is_sel {
                         style_copy.row_bg_selected

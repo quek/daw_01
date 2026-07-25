@@ -1558,26 +1558,18 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
             };
             let font_size = style.clip_text_size;
             let has_link = c.share_group_color.is_some();
-            let text_left = if has_link {
-                clip_rect.x + 4.0 + font_size + 2.0
+            // M14 Phase 126 (daw_01 #104) と同じく ⇌ と名前を 1 つの text run に
+            // 統合する。 automation clip 経路だけ旧実装 (glyph 幅を em 幅で近似 +
+            // 固定 +2.0 パッド) が残っており、 ⇌ の実 advance より広く名前を右送り
+            // して、 その分だけ名前の末尾が余計に切れていた。
+            let text: Arc<str> = if has_link {
+                Arc::from(format!("{}{}", style.share_group_link_glyph, c.name))
             } else {
-                clip_rect.x + 4.0
+                Arc::clone(&c.name)
             };
-            if has_link {
-                hctx.push_text(GlyphArea {
-                    text: Arc::from(style.share_group_link_glyph.to_string()),
-                    left: clip_rect.x + 4.0,
-                    top: clip_rect.y + 2.0,
-                    font_size,
-                    line_height: style.clip_text_size * 1.2,
-                    color: glyph_color,
-                    clip_rect: Some(clip_rect),
-                    ..GlyphArea::default()
-                });
-            }
             hctx.push_text(GlyphArea {
-                text: Arc::clone(&c.name),
-                left: text_left,
+                text,
+                left: clip_rect.x + 4.0,
                 top: clip_rect.y + 2.0,
                 font_size,
                 line_height: style.clip_text_size * 1.2,

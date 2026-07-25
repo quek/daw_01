@@ -226,7 +226,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // S4b Phase C: audio 波形 / MIDI ノートプレビューは widget が同一レイアウトパスで
         // clip クローム (ラベル帯) と一緒に描く (共有 inset `CLIP_CONTENT_INSET_TOP`)。旧
         // 旧 app 側 clip 波形 / MIDI overlay の rect + hardcode inset 重ね描きは撤去。
-        draw_audio_clip_value_overlay(app, ui, *clip_key, *rect);
+        // lanes 左端 (= track header の右) より左には描かせない。 左スクロールで
+        // clip の左端がヘッダの下に潜っている状態でも、 値ラベルが M/S/R ボタンの
+        // 上に載らないようにするための下限。
+        let lanes_left = area.x + app.ui_prefs.arrange_header_w.max(0.0);
+        draw_audio_clip_value_overlay(app, ui, *clip_key, *rect, lanes_left);
 
         // VOICEVOX 生成中マーカー。歌唱/読み上げトラックが合成中なら
         // そのトラックの全 clip に、口パク再生成中なら口 track の auto_lipsync clip に、
@@ -1168,6 +1172,7 @@ fn draw_audio_clip_value_overlay(
     ui: &mut Ui<'_, AppData>,
     clip_key: ClipKey,
     clip_rect: Rect,
+    lanes_left: f32,
 ) {
     if clip_rect.w < 60.0 || clip_rect.h < 24.0 {
         return;
@@ -1208,50 +1213,41 @@ fn draw_audio_clip_value_overlay(
     let mut x_right = clip_rect.x + clip_rect.w - pad;
     let y = clip_rect.y + clip_rect.h - font_size - 2.0;
 
-    // 右から左に並べる: [Fade Out] [Fade In] [Gain]。 push_text を
-    // 使うと汎用 left-anchored だが、 ここでは y_baseline と x_left
-    // で十分 (右端揃えは label 幅推定で代替)。 簡易: 全部左揃えで
-    // 順に出す + 適当な width 推定で右端から逆配置。
-    if show_fade_out {
-        let s = format!("Fo {:.2}b", event.fade_out_beats);
-        let w = (s.chars().count() as f32) * (font_size * 0.55);
-        x_right -= w;
-        ui.label_at(
-            ("audio_clip_lbl_fo", clip_key.track, clip_key.clip),
-            &s,
-            x_right,
-            y,
+    // 右から左に並べる: [Fade Out] [Fade In] [Gain]。 幅は実 advance で測り、
+    // clip 左端 (+pad) を下限に clamp する。 旧実装は「1 文字 = font*0.55」 の
+    // 概算幅で無制限に左へ積んでいたため、 狭い clip や左へスクロールして
+    // 右端だけが見えている clip では、 ラベルがトラックヘッダの M/S/R ボタンや
+    // 隣のクリップの上に描かれていた (label_at は clip_rect を持たず、 この
+    // 経路には親の with_clip_rect も無い)。
+    let x_left_limit = (clip_rect.x + pad).max(lanes_left + pad);
+    let emit = |ui: &mut Ui<'_, AppData>, id: &'static str, s: &str, x_right: &mut f32| {
+        let w = ui.measure_text(s, font_size);
+        let x = *x_right - w;
+        if x < x_left_limit {
+            // 収まらないラベルは出さない (途中で切れた数値は誤読の元)。
+            return;
+        }
+        *x_right = x;
+        ui.label_at_clipped(
+            (id, clip_key.track, clip_key.clip),
+            s,
+            Rect { x, y, w, h: font_size * 1.2 },
             font_size,
             text_color,
         );
-        x_right -= 6.0;
+        *x_right -= 6.0;
+    };
+    if show_fade_out {
+        let s = format!("Fo {:.2}b", event.fade_out_beats);
+        emit(ui, "audio_clip_lbl_fo", &s, &mut x_right);
     }
     if show_fade_in {
         let s = format!("Fi {:.2}b", event.fade_in_beats);
-        let w = (s.chars().count() as f32) * (font_size * 0.55);
-        x_right -= w;
-        ui.label_at(
-            ("audio_clip_lbl_fi", clip_key.track, clip_key.clip),
-            &s,
-            x_right,
-            y,
-            font_size,
-            text_color,
-        );
-        x_right -= 6.0;
+        emit(ui, "audio_clip_lbl_fi", &s, &mut x_right);
     }
     if show_gain {
         let s = format!("{:+.1} dB", event.gain_db);
-        let w = (s.chars().count() as f32) * (font_size * 0.55);
-        x_right -= w;
-        ui.label_at(
-            ("audio_clip_lbl_gain", clip_key.track, clip_key.clip),
-            &s,
-            x_right,
-            y,
-            font_size,
-            text_color,
-        );
+        emit(ui, "audio_clip_lbl_gain", &s, &mut x_right);
     }
 }
 

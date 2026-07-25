@@ -667,21 +667,46 @@ pub(super) fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayou
     let lane_disc_size = 12.0_f32;
     let lane_disc_extra = lane_disc_size + gap;
     #[allow(clippy::cast_precision_loss)]
-    let total_right = small * n_btn as f32 + gap * n_btn as f32 + lane_disc_extra;
-    let name_w = (inner.w - total_right).max(20.0);
+    // 右側 widget は「入るぶんだけ」 出す (volume_band と同じ progressive disclosure)。
+    // 旧実装は name_w を 20px フロアで潰すだけだったので、 header 幅が 110px 未満に
+    // なると M/S/R と lane disclosure が header 右端をはみ出し、
+    //   - R は文字が scissor 外に出て "R" が丸ごと消える
+    //   - lane disclosure は描画も click 判定 (header_pane.contains) も届かず開閉不能
+    //   - 一方 toggle_button_at は scissor を見ず rect.contains で hit するので、
+    //     lanes 上に **不可視のクリック標的** が残ってクリップの click を奪う
+    // という 3 つの症状が同時に出ていた。 入らない widget は layout から外し
+    // (= 0 サイズ rect)、 描画と hit-test の両方を同時に消す。
+    const MIN_NAME_W: f32 = 40.0;
+    let room_right = (inner.w - MIN_NAME_W - gap).max(0.0);
+    let mut shown_btns = 0usize;
+    while shown_btns < n_btn
+        && ((shown_btns + 1) as f32) * (small + gap) <= room_right
+    {
+        shown_btns += 1;
+    }
+    let show_lane_disc = shown_btns == n_btn
+        && (n_btn as f32) * (small + gap) + lane_disc_extra <= room_right;
+    let used_right = (shown_btns as f32) * (small + gap)
+        + if show_lane_disc { lane_disc_extra } else { 0.0 };
+    let name_w = (inner.w - used_right).max(MIN_NAME_W.min(inner.w));
     let name_rect = Rect { x: inner.x, y: inner.y, w: name_w, h: btn_h };
     let mut x_cursor = inner.x + name_w + gap;
-    let mut buttons = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 3];
-    for slot in &mut buttons {
+    const ZERO_RECT: Rect = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    let mut buttons = [ZERO_RECT; 3];
+    for slot in buttons.iter_mut().take(shown_btns) {
         *slot = Rect { x: x_cursor, y: inner.y, w: small, h: btn_h };
         x_cursor += small + gap;
     }
-    // S button の右に lane_disc rect (= ASCII `+`/`-` icon)。 行 vertical center に揃える。
-    let lane_disc_rect = Rect {
-        x: x_cursor,
-        y: inner.y + (btn_h - lane_disc_size).max(0.0) * 0.5,
-        w: lane_disc_size,
-        h: lane_disc_size,
+    // R button の右に lane_disc rect (= ASCII `+`/`-` icon)。 行 vertical center に揃える。
+    let lane_disc_rect = if show_lane_disc {
+        Rect {
+            x: x_cursor,
+            y: inner.y + (btn_h - lane_disc_size).max(0.0) * 0.5,
+            w: lane_disc_size,
+            h: lane_disc_size,
+        }
+    } else {
+        ZERO_RECT
     };
     // band 表示条件: band_h > 0 && buttons の下に gap + band 分が収まる (progressive disclosure)。
     // default (`track_volume_band_h=4` / `gap=2`) なら inner.h >= 26 (= row_h >= 34) で表示。

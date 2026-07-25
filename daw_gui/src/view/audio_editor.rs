@@ -131,26 +131,36 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // ----- Header (clip 名 + length + close button) -------------------
     let pad = 12.0;
-    let header_h = 24.0;
+    let header_h = 24.0_f32;
     let ruler_h = 20.0;
-    ui.label_at(
+    let close_w = 60.0;
+    // タイトルは Close ボタンの手前まで。 clip 名は任意長なので素の label_at では
+    // ボタンの上に重なる。
+    ui.label_at_clipped(
         "audio_editor_title",
         &format!(
             "Audio Editor — {} ({:.2} beats)",
             app.song_doc.song().content_name(clip.content_id),
             clip.length_beats
         ),
-        area.x + pad,
-        area.y + 6.0,
+        Rect {
+            x: area.x + pad,
+            y: area.y + 6.0,
+            w: (area.w - pad * 2.0 - close_w - 8.0).max(1.0),
+            h: 14.0 * 1.2,
+        },
         14.0,
         TEXT,
     );
-    let close_w = 60.0;
+    // header 帯 (高さ header_h) の内側に収める。 旧実装は y = area.y + 4 に
+    // 高さ header_h のボタンを置いていたので下端 4px が header の外へ出て、
+    // 直後に描かれるルーラーの不透明背景に角丸と枠線が塗り潰され、 さらに
+    // その 4px 帯の click が「ボタン + ルーラー seek」 の二重発火になっていた。
     let close_rect = Rect {
         x: area.x + area.w - pad - close_w,
-        y: area.y + 4.0,
+        y: area.y + 2.0,
         w: close_w,
-        h: header_h,
+        h: (header_h - 4.0).max(1.0),
     };
     ui.button_at("audio_editor_close", "Close", close_rect, || {
         Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CloseAudioEditor))

@@ -2037,123 +2037,133 @@ fn draw_legend(
             track_indices.push(r.track);
         }
     }
-    let mut y = rect.y + pad + 18.0;
-    for (row_i, &ti) in track_indices.iter().enumerate() {
-        if y + row_h > rect.y + rect.h {
-            break;
-        }
-        let Some(track) = app.song_doc.song().tracks.get(ti as usize) else {
-            continue;
-        };
-        let track_id = track.id;
-        let is_target = ti == target.track;
-        let locked = app.is_pianoroll_track_locked(track_id);
-        // 対象切替先 = このトラックの代表クリップ (anchor がこのトラックなら anchor、 でなければ
-        // このトラックの最初の表示クリップ)。target_clip は anchor なので legend 切替で動く。
-        let rep_key = if ti == target.track {
-            app.clip_key_of(target)
-        } else {
-            shown
-                .iter()
-                .copied()
-                .find(|r| r.track == ti)
-                .and_then(|r| app.clip_key_of(r))
-        };
-        let row = Rect {
-            x: rect.x + pad,
-            y,
-            w: (rect.w - pad * 2.0).max(0.0),
-            h: row_h,
-        };
-        // 行背景 (対象トラック = accent wash で薄く強調)。
-        ui.panel(
-            ("pr_legend_row", row_i),
-            row,
-            if is_target {
-                theme::ACCENT_WASH
+    // 行は縦スクロール可能にする。 旧実装は viewport に入らない行を無言で break して
+    // いたため、 6 トラック以上に跨るクリップを同時選択すると 6 行目以降が描画も
+    // ヒットテストもされず、 そのトラックの対象切替 / L ロックが操作不能になっていた。
+    let list_rect = Rect {
+        x: rect.x,
+        y: rect.y + pad + 18.0,
+        w: rect.w,
+        h: (rect.h - pad - 18.0).max(0.0),
+    };
+    let content_h = track_indices.len() as f32 * (row_h + gap);
+    let scrollbar_w = if content_h > list_rect.h { 10.0 } else { 0.0 };
+    ui.scroll_area("pr_legend_scroll", list_rect, (list_rect.w, content_h), |ui, scroll_off| {
+        let mut y = list_rect.y - scroll_off.1;
+        for (row_i, &ti) in track_indices.iter().enumerate() {
+            let Some(track) = app.song_doc.song().tracks.get(ti as usize) else {
+                continue;
+            };
+            let track_id = track.id;
+            let is_target = ti == target.track;
+            let locked = app.is_pianoroll_track_locked(track_id);
+            // 対象切替先 = このトラックの代表クリップ (anchor がこのトラックなら anchor、 でなければ
+            // このトラックの最初の表示クリップ)。target_clip は anchor なので legend 切替で動く。
+            let rep_key = if ti == target.track {
+                app.clip_key_of(target)
             } else {
-                theme::PANEL_RAISED
-            },
-            4.0,
-        );
-        // 対象トラック行の左端 accent バー。
-        if is_target {
-            ui.push_rect(RectCommand::uniform_radius(
-                Rect { x: row.x, y: row.y, w: 3.0, h: row.h },
-                theme::ACCENT,
-                1.5,
-            ));
+                shown
+                    .iter()
+                    .copied()
+                    .find(|r| r.track == ti)
+                    .and_then(|r| app.clip_key_of(r))
+            };
+            let row = Rect {
+                x: rect.x + pad,
+                y,
+                w: (rect.w - pad * 2.0 - scrollbar_w).max(0.0),
+                h: row_h,
+            };
+            // 行背景 (対象トラック = accent wash で薄く強調)。
+            ui.panel(
+                ("pr_legend_row", row_i),
+                row,
+                if is_target {
+                    theme::ACCENT_WASH
+                } else {
+                    theme::PANEL_RAISED
+                },
+                4.0,
+            );
+            // 対象トラック行の左端 accent バー。
+            if is_target {
+                ui.push_rect(RectCommand::uniform_radius(
+                    Rect { x: row.x, y: row.y, w: 3.0, h: row.h },
+                    theme::ACCENT,
+                    1.5,
+                ));
+            }
+            // 色 swatch (= トラック実効色)。
+            let color = track_color::to_renderer(track_color::effective_track_color(track));
+            ui.push_rect(RectCommand {
+                rect: Rect {
+                    x: row.x + 8.0,
+                    y: row.y + (row.h - 13.0) * 0.5,
+                    w: 13.0,
+                    h: 13.0,
+                },
+                fill: color,
+                border: theme::BORDER,
+                border_width: 1.0,
+                radius: [3.0; 4],
+                clip_rect: None,
+            });
+            // ロックトグル (右端、トラック単位)。
+            let lock_w = 26.0;
+            let lock_rect = Rect {
+                x: row.x + row.w - lock_w - 4.0,
+                y: row.y + 4.0,
+                w: lock_w,
+                h: row.h - 8.0,
+            };
+            ui.toggle_button_at(
+                ("pr_legend_lock", row_i),
+                "L",
+                lock_rect,
+                locked,
+                &SNAP_TOGGLE_STYLE,
+                move |_| {
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::TogglePianoRollTrackLock(track_id));
+                    })
+                },
+            );
+            // トラック名 (クリック = 対象トラック切替)。swatch と lock の間の領域。
+            let name_x = row.x + 26.0;
+            let name_rect = Rect {
+                x: name_x,
+                y: row.y,
+                w: (lock_rect.x - name_x - 4.0).max(10.0),
+                h: row.h,
+            };
+            // 透明ヒット (空テキストの button) でクリックを拾い、テキストは下で label 描画する
+            // (button の中央寄せ固定文字でなく ellipsis 付き左寄せラベルを出すため)。
+            if ui.button_at_clicked_sized_aligned(
+                ("pr_legend_name", row_i),
+                "",
+                name_rect,
+                12.0,
+                ButtonTextAlign::Left,
+            ) && let Some(k) = rep_key
+            {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::SetPianoRollTargetClip(k));
+                }));
+            }
+            let label = track.name.clone();
+            let text_color = if is_target {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            };
+            let label_rect = Rect {
+                x: name_rect.x + 4.0,
+                y: name_rect.y + (name_rect.h - 12.0) * 0.5,
+                w: (name_rect.w - 8.0).max(8.0),
+                h: 14.0,
+            };
+            ui.label_at_clipped(("pr_legend_name_label", row_i), &label, label_rect, 12.0, text_color);
+            y += row_h + gap;
         }
-        // 色 swatch (= トラック実効色)。
-        let color = track_color::to_renderer(track_color::effective_track_color(track));
-        ui.push_rect(RectCommand {
-            rect: Rect {
-                x: row.x + 8.0,
-                y: row.y + (row.h - 13.0) * 0.5,
-                w: 13.0,
-                h: 13.0,
-            },
-            fill: color,
-            border: theme::BORDER,
-            border_width: 1.0,
-            radius: [3.0; 4],
-            clip_rect: None,
-        });
-        // ロックトグル (右端、トラック単位)。
-        let lock_w = 26.0;
-        let lock_rect = Rect {
-            x: row.x + row.w - lock_w - 4.0,
-            y: row.y + 4.0,
-            w: lock_w,
-            h: row.h - 8.0,
-        };
-        ui.toggle_button_at(
-            ("pr_legend_lock", row_i),
-            "L",
-            lock_rect,
-            locked,
-            &SNAP_TOGGLE_STYLE,
-            move |_| {
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::TogglePianoRollTrackLock(track_id));
-                })
-            },
-        );
-        // トラック名 (クリック = 対象トラック切替)。swatch と lock の間の領域。
-        let name_x = row.x + 26.0;
-        let name_rect = Rect {
-            x: name_x,
-            y: row.y,
-            w: (lock_rect.x - name_x - 4.0).max(10.0),
-            h: row.h,
-        };
-        // 透明ヒット (空テキストの button) でクリックを拾い、テキストは下で label 描画する
-        // (button の中央寄せ固定文字でなく ellipsis 付き左寄せラベルを出すため)。
-        if ui.button_at_clicked_sized_aligned(
-            ("pr_legend_name", row_i),
-            "",
-            name_rect,
-            12.0,
-            ButtonTextAlign::Left,
-        ) && let Some(k) = rep_key
-        {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SetPianoRollTargetClip(k));
-            }));
-        }
-        let label = track.name.clone();
-        let text_color = if is_target {
-            theme::TEXT
-        } else {
-            theme::TEXT_DIM
-        };
-        let label_rect = Rect {
-            x: name_rect.x + 4.0,
-            y: name_rect.y + (name_rect.h - 12.0) * 0.5,
-            w: (name_rect.w - 8.0).max(8.0),
-            h: 14.0,
-        };
-        ui.label_at_clipped(("pr_legend_name_label", row_i), &label, label_rect, 12.0, text_color);
-        y += row_h + gap;
-    }
+    });
 }

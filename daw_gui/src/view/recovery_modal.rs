@@ -86,31 +86,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     h: ROW_H,
                 };
 
-                // ファイル名 (1 行目)。 button 列とぶつからないよう truncate (font 13px、
-                // 1 char ≒ 7px)。
-                let display = truncate_display(
-                    &display_name(candidate),
-                    ((TEXT_AREA_END - 8.0) / 7.0) as usize,
-                );
-                ui.label_at(
+                // ファイル名 (1 行目) / フルパス (2 行目)。 幅は「1 char ≒ 7px /
+                // 5px」 の文字数見積りではなく rect で切る。 旧見積りは font 13 の
+                // 実 advance (半角 6.85 / 全角 13.7) と合わず、 純 ASCII の長いパス
+                // (108 文字許可 = 569px > 552px) でも和名でもボタン列の上に重なっていた。
+                let text_w = (TEXT_AREA_END - 8.0).max(1.0);
+                ui.label_at_clipped(
                     ("rec_name", i),
-                    &display,
-                    row_rect.x + 8.0,
-                    row_rect.y + 6.0,
+                    &display_name(candidate),
+                    Rect { x: row_rect.x + 8.0, y: row_rect.y + 6.0, w: text_w, h: 13.0 * 1.2 },
                     13.0,
                     COLOR_TEXT,
                 );
-
-                // フルパス (2 行目、 dim、 font 10px、 1 char ≒ 5px)。
-                let path_str = truncate_display(
-                    &candidate.display().to_string(),
-                    ((TEXT_AREA_END - 8.0) / 5.0) as usize,
-                );
-                ui.label_at(
+                ui.label_at_clipped(
                     ("rec_path", i),
-                    &path_str,
-                    row_rect.x + 8.0,
-                    row_rect.y + 26.0,
+                    &candidate.display().to_string(),
+                    Rect { x: row_rect.x + 8.0, y: row_rect.y + 26.0, w: text_w, h: 10.0 * 1.2 },
                     10.0,
                     COLOR_TEXT,
                 );
@@ -165,14 +156,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     );
 }
 
-/// 長い文字列を表示幅内に収める。 max_chars 超過なら "..." で切る。
-fn truncate_display(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max_chars.saturating_sub(3)).collect();
-    format!("{head}...")
-}
+// 旧 `truncate_display` (文字数見積りで切る) は `label_at_clipped` の実 advance
+// ベースの ellipsis に置き換えたので撤去した。
 
 /// candidate path の表示名 (ユーザー向けの短いラベル)。 sidecar なら元 .daw
 /// の name + " (autosave)"、 recovery_dir なら「未保存セッション + ファイル名」 を返す。

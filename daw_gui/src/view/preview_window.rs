@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use daw_ui_platform::WindowBackend;
-use daw_ui_renderer::{Color, GlyphArea, Renderer, Scene, TextureHandle, TexturedQuad};
+use daw_ui_renderer::{Color, GlyphArea, HAlign, Renderer, Scene, TextureHandle, TexturedQuad, VAlign};
 use winit::dpi::LogicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{WindowAttributes, WindowId};
@@ -334,16 +334,23 @@ impl PreviewWindowState {
         if self.track_composites.is_empty() {
             // No content — show the P4 placeholder text so the user knows the
             // window is alive but waiting on a clip / playhead.
-            let text = "Video Preview";
-            let approx_w = text.len() as f32 * 9.0;
-            self.scene.push_text(GlyphArea::new(
-                text.into(),
-                (screen.width as f32 - approx_w) * 0.5,
-                (screen.height as f32 - 16.0) * 0.5,
-                16.0,
-                20.0,
-                Color::rgb(0.65, 0.7, 0.8),
-            ));
+            // 「1 文字 9px」 の概算幅で中央を出すと実 advance (16 * 0.527 = 8.44px)
+            // とずれて左に寄る。 GlyphArea の box + align に任せて renderer 側の
+            // 実測センタリングを使う (Ui を持たない窓なので measure_text は呼べない)。
+            self.scene.push_text(GlyphArea {
+                box_width: Some(screen.width as f32),
+                box_height: Some(screen.height as f32),
+                align_h: HAlign::Center,
+                align_v: VAlign::Center,
+                ..GlyphArea::new(
+                    "Video Preview".into(),
+                    0.0,
+                    0.0,
+                    16.0,
+                    20.0,
+                    Color::rgb(0.65, 0.7, 0.8),
+                )
+            });
         } else {
             // トラック合成画を bottom→top に描く。borrow 分離のため
             // 一旦 take して iterate。runner が毎 frame 再設定するので take しても問題ない。

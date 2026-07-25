@@ -172,34 +172,25 @@ fn draw_rejected_panel(
     );
 
     let text_x = x + PAD + 28.0;
-    ui.label_at(
+    // カード内に残る幅で切る。 旧実装の「24 文字で丸める」 は全角 1 文字 =
+    // 13.7px なので 24 文字 = 329px となり、 使える 280px を全く制限して
+    // いなかった (= 理由文がカード右端を越えて背後のアレンジ画面に描かれた)。
+    let text_w = (x + PANEL_W - PAD - text_x).max(1.0);
+    ui.label_at_clipped(
         "vox_overlay_reject_head",
         "合成できない歌詞があります",
-        text_x,
-        y + PAD,
+        Rect { x: text_x, y: y + PAD, w: text_w, h: LINE_H },
         FONT,
         theme::SOLO,
     );
     // VOICEVOX が返した理由 (例: `lyricが不正です: ー`)。パネル幅に収まるよう省略。
-    let sub = truncate_chars(detail, 24);
-    ui.label_at(
+    ui.label_at_clipped(
         "vox_overlay_reject_sub",
-        &sub,
-        text_x,
-        y + PAD + LINE_H,
+        detail,
+        Rect { x: text_x, y: y + PAD + LINE_H, w: text_w, h: LINE_H },
         FONT,
         theme::TEXT_DIM,
     );
-}
-
-/// `s` を最大 `max` 文字に丸める (超過時は末尾に `…`)。char 境界で切る。
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('\u{2026}');
-    out
 }
 
 /// 回転スピナー: `N` 個のドットを円周に並べ、phase に応じて明るさを巡回させる。
