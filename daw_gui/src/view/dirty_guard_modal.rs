@@ -88,20 +88,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 COLOR_TEXT,
             );
 
-            // メッセージ (2 行)
-            ui.label_at(
+            // メッセージ (2 行)。 固定文だけで 329px あり、 プロジェクト名に
+            // 使える余地は 115px しかない。 素の label_at だと少し長い名前で
+            // パネル右端を越えて暗転 backdrop の上まで文字が伸びるので rect で切る。
+            let msg_w = (PANEL_W - PAD * 2.0).max(1.0);
+            ui.label_at_clipped(
                 "dg_msg1",
                 &format!("プロジェクト「{project_name}」に保存していない変更があります。"),
-                panel.x + PAD,
-                panel.y + PAD + TITLE_H,
+                Rect { x: panel.x + PAD, y: panel.y + PAD + TITLE_H, w: msg_w, h: 13.0 * 1.2 },
                 13.0,
                 COLOR_TEXT,
             );
-            ui.label_at(
+            ui.label_at_clipped(
                 "dg_msg2",
                 question,
-                panel.x + PAD,
-                panel.y + PAD + TITLE_H + 22.0,
+                Rect {
+                    x: panel.x + PAD,
+                    y: panel.y + PAD + TITLE_H + 22.0,
+                    w: msg_w,
+                    h: 13.0 * 1.2,
+                },
                 13.0,
                 COLOR_TEXT,
             );

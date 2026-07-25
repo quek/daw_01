@@ -213,6 +213,17 @@ const CHAIN_LIST_STYLE: ReorderableListStyle = ReorderableListStyle {
     drag_handle_w: 0.0,
 };
 
+// ---- Sidechain セクションの行レイアウト (高さ予約と描画の SSoT) ----------
+/// 1 行目 = プラグイン名 (行幅いっぱい)。
+const SC_NAME_H: f32 = 14.0;
+/// 2 行目 = [tap point | source] のコントロール行。
+const SC_CTL_H: f32 = 24.0;
+/// tap point dropdown の幅。 最長ラベル "Post-Fdr" = 8 字 * 14 * 0.527 = 59.1px、
+/// dropdown の文字領域は w - PAD_X(8) - ARROW_W(16) なので 84px 以上必要。
+const SC_TAP_W: f32 = 88.0;
+const SC_ROW_H: f32 = SC_NAME_H + SC_CTL_H;
+const SC_ROW_GAP: f32 = 6.0;
+
 /// import 済み image source の表示名 (ファイル名)。口パク mapping dropdown 用。
 fn image_source_label(src: &common::model::ImageSource) -> String {
     // import 時に保持した元ファイル名を優先 (on-disk path は content addressing
@@ -285,9 +296,33 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // すぐ下に続く。 dropdown popup は deferred buffer 描画なので clip_rect の外に
     // 出て切れない (gui_01 popup.rs)。 closure body の param セクションは既存コード
     // のまま (再インデントしない)。
+    // 下端 pinned band (Parallel Out / Sidechain / 下端ボタン) は scroll viewport の
+    // **外** に描かれるので、 その実高さぶんを viewport から先に引く。 旧実装は固定
+    // 160px を予約するだけだったため、 device 4 個 (sidechain 152px) やパラアウト
+    // 5 行 (168px) でセクションが viewport の下端に食い込み、 スクロール中身の上に
+    // 重なって描かれていた。 セクション高の SSoT をここに 1 本化する。
     const CHAIN_MIN_H: f32 = 160.0;
+    const BTNS_H: f32 = 26.0;
+    const PO_ROW_CAP: usize = 5;
+    let sc_entries = app.sidechain_entries();
+    let sc_section_h = if sc_entries.is_empty() {
+        0.0
+    } else {
+        18.0 + 4.0 + sc_entries.len().min(4) as f32 * (SC_ROW_H + SC_ROW_GAP) + 6.0
+    };
+    let po_entries = app.parallel_output_entries();
+    let po_total_rows: usize = po_entries
+        .iter()
+        .map(|e| 1 + if e.exploded { e.aux_output_count as usize } else { 0 })
+        .sum();
+    let po_section_h = if po_entries.is_empty() {
+        0.0
+    } else {
+        18.0 + 4.0 + po_total_rows.min(PO_ROW_CAP) as f32 * (24.0 + 4.0) + 6.0
+    };
+    let chain_band_h = (BTNS_H + pad + sc_section_h + po_section_h).max(CHAIN_MIN_H);
     let body_top = y;
-    let max_param_h = (area.y + area.h - body_top - CHAIN_MIN_H).max(0.0);
+    let max_param_h = (area.y + area.h - body_top - chain_band_h).max(0.0);
     let content_h = app.ui_ephemeral.inspector_body_h.max(1.0);
     // param viewport の高さは **常に最大** に固定する。 旧実装は
     // `content_h.min(max_param_h)` で content に追従させていたため、 device の
@@ -1053,7 +1088,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let btn_x_w = 30.0;
         ui.label_at("inspector_chain_label", "Chain", area.x + pad, y, 12.0, TEXT);
         y += 18.0;
-        let chain_rect = Rect { x: area.x, y, w: area.w, h: chain_h };
+        // 他セクションと同じ左右 pad を取る。 旧実装は area 幅いっぱい (280px) だった
+        // ため、 inspector 本体が縦スクロールすると右端 10px が scrollbar に隠れ、
+        // その帯 (描画されないのに hit-test は生きている) の click が chain 行の
+        // 「x」 (device 削除) を誤発火しえた。
+        let chain_rect = Rect { x: area.x + pad, y, w: area.w - pad * 2.0, h: chain_h };
         ui.reorderable_list_expandable(
             "inspector_chain",
             chain_rect,
@@ -1068,16 +1107,29 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 }
             },
             |ui, entry, idx, row_rect, _selected, _dragging| {
-                ui.label_at(
+                let device_index = entry.device_index;
+                let gui_x = row_rect.x + row_rect.w - btn_gui_w - btn_x_w - 4.0;
+                // 名前は右の [Par|GUI] / [x] ボタンの手前で打ち切る。 素の label_at だと
+                // 長いプラグイン名 (例: "BBC Symphony Orchestra Professional") が
+                // ボタンの上に重なって読めなくなる。
+                let name_x = row_rect.x + 8.0;
+                let buttons_left = if entry.shows_button() {
+                    gui_x
+                } else {
+                    row_rect.x + row_rect.w - btn_x_w
+                };
+                ui.label_at_clipped(
                     ("inspector_row_name", idx),
                     &entry.plugin_name,
-                    row_rect.x + 8.0,
-                    row_rect.y + 8.0,
+                    Rect {
+                        x: name_x,
+                        y: row_rect.y + 8.0,
+                        w: (buttons_left - 6.0 - name_x).max(1.0),
+                        h: 11.0 * 1.2,
+                    },
                     11.0,
                     TEXT,
                 );
-                let device_index = entry.device_index;
-                let gui_x = row_rect.x + row_rect.w - btn_gui_w - btn_x_w - 4.0;
                 if entry.shows_button() {
                     let label = if entry.shows_param_panel() { "Par" } else { "GUI" };
                     ui.button_at(
@@ -1313,7 +1365,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let default_real = f64::from(param.kind.norm_to_real(param.kind.default_norm()));
             #[allow(clippy::cast_possible_truncation)]
             let sens = (((max - min) / 220.0).max(0.0001)) as f32;
-            ui.label_at((i, "vfx_label"), param.name, area.x + pad, y + 5.0, 11.0, TEXT);
+            ui.label_at_clipped(
+                (i, "vfx_label"),
+                param.name,
+                Rect {
+                    x: area.x + pad,
+                    y: y + 5.0,
+                    w: (label_w - 4.0).max(1.0),
+                    h: 11.0 * 1.2,
+                },
+                11.0,
+                TEXT,
+            );
             let style =
                 ScrubableNumberStyle { sensitivity: sens, range: Some((min, max)), ..SCRUB_STYLE_GROUP };
             let target = AutomationTarget::PluginParam {
@@ -1379,7 +1442,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // v29: lane target は安定 device_id (上の video FX パネルと同じ fallback)。
         let device_id =
             crate::app::device_id_at(app.song_doc.song(), track_id, device_index).unwrap_or(0);
-        ui.label_at("inspector_pp_label", &view.plugin_name, area.x + pad, y, 12.0, TEXT);
+        ui.label_at_clipped(
+            "inspector_pp_label",
+            &view.plugin_name,
+            Rect { x: area.x + pad, y, w: (area.w - pad * 2.0).max(1.0), h: 12.0 * 1.2 },
+            12.0,
+            TEXT,
+        );
         y += 18.0;
 
         // 汎用 param 行 (scrubable_number で実レンジ + per-control 変調)。
@@ -1389,11 +1458,30 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let input_x = area.x + pad + label_w;
         let input_w = (row_w - label_w).max(40.0);
         for (i, p) in view.params.iter().enumerate() {
-            ui.label_at((i, "pp_name"), &p.name, area.x + pad, y + 5.0, 11.0, TEXT);
+            // param 名はプラグイン由来で長さ上限が無い。 label_w(96) を超えると
+            // 後続の値ボックス (不透明 bg) に覆われて途中で消えるので rect で切る。
+            ui.label_at_clipped(
+                (i, "pp_name"),
+                &p.name,
+                Rect {
+                    x: area.x + pad,
+                    y: y + 5.0,
+                    w: (label_w - 4.0).max(1.0),
+                    h: 11.0 * 1.2,
+                },
+                11.0,
+                TEXT,
+            );
             if p.readonly {
                 // 編集不可 param は現値をラベル表示するだけ。
                 let txt = format!("{:.3}", p.value_real);
-                ui.label_at((i, "pp_ro"), &txt, input_x, y + 5.0, 11.0, TEXT);
+                ui.label_at_clipped(
+                    (i, "pp_ro"),
+                    &txt,
+                    Rect { x: input_x, y: y + 5.0, w: input_w, h: 11.0 * 1.2 },
+                    11.0,
+                    TEXT,
+                );
                 y += input_h + 4.0;
                 continue;
             }
@@ -1633,11 +1721,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                             label: &str,
                             field: TextNumField,
                             row_y: &mut f32| {
-            ui.label_at(
+            // ラベル欄は input_x までの label_w(60) しかない。 "Sh Blur (px)" は
+            // 実 advance 69.6px でここを溢れ、 後から描かれる数値ボックスの
+            // 不透明背景に末尾が食われていた。
+            ui.label_at_clipped(
                 (field, "label"),
                 label,
-                area.x + pad,
-                *row_y + 5.0,
+                Rect {
+                    x: area.x + pad,
+                    y: *row_y + 5.0,
+                    w: (label_w - 2.0).max(1.0),
+                    h: 11.0 * 1.2,
+                },
                 11.0,
                 TEXT,
             );
@@ -2478,42 +2573,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // chain band (下端 pinned): sidechain / modulation / 下端ボタン。 chain list 本体と
     // 各デバイスの param パネルは viewport 内のアコーディオン (上の
     // reorderable_list_expandable) に移動した。
-    let btns_h = 26.0;
+    // btns_h / sc_section_h / po_section_h は `chain_band_h` の算出 (viewport 分割前)
+    // で既に確定済み — ここで再計算しない (SSoT)。
+    let btns_h = BTNS_H;
     let btns_y = area.y + area.h - btns_h - pad;
-
-    // Sidechain section: only render if there's at least one plugin in the
-    // chain. Vertical budget: 18 px header + 4 px gap + (24 + 4) px per row,
-    // capped at 4 rows; if more entries exist they overflow off-screen
-    // (vertical scrolling not yet implemented in inspector). Without this
-    // dynamic budget the chain list would always shrink even when no
-    // sidechain wiring is meaningful.
-    let sc_entries = app.sidechain_entries();
-    let sc_section_h = if sc_entries.is_empty() {
-        0.0
-    } else {
-        let row_h = 24.0;
-        let row_gap = 4.0;
-        let visible_rows = sc_entries.len().min(4);
-        18.0 + 4.0 + visible_rows as f32 * (row_h + row_gap) + 6.0
-    };
 
     // ---- パラアウト (Parallel Out) section (docs/plan_paraout.md) ----------
     // Above the sidechain section. Per multi-out plugin: an "explode" button
     // (auto-create + group child tracks) and, once exploded, a per-port
     // destination dropdown. Capped like sidechain; excess rows overflow (the
     // inspector has no internal scroll yet).
-    const PO_ROW_CAP: usize = 5;
-    let po_entries = app.parallel_output_entries();
-    let po_total_rows: usize = po_entries
-        .iter()
-        .map(|e| 1 + if e.exploded { e.aux_output_count as usize } else { 0 })
-        .sum();
-    let po_section_h = if po_entries.is_empty() {
-        0.0
-    } else {
-        let visible = po_total_rows.min(PO_ROW_CAP);
-        18.0 + 4.0 + visible as f32 * (24.0 + 4.0) + 6.0
-    };
     if !po_entries.is_empty() {
         let row_h = 24.0;
         let row_gap = 4.0;
@@ -2543,19 +2612,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             // Entry row: plugin name (left) + explode button (right).
             let btn_w = 64.0;
             let btn_x = right_x - btn_w;
-            let max_name_chars = ((btn_x - name_x - 8.0) / 7.0) as usize;
-            let n_chars = entry.plugin_name.chars().count();
-            let display_name = if n_chars > max_name_chars && max_name_chars > 3 {
-                let t: String = entry.plugin_name.chars().take(max_name_chars - 1).collect();
-                format!("{t}…")
-            } else {
-                entry.plugin_name.clone()
-            };
-            ui.label_at(
+            // 手書きの「1 文字 7px」 見積りは実 advance (半角 5.8 / 全角 11.6) と
+            // 一致せず、 ASCII 名では過剰に切り CJK 名では溢れていた。 rect 幅で
+            // 切る共通 helper に寄せる。
+            ui.label_at_clipped(
                 ("inspector_po_name", ei),
-                &display_name,
-                name_x,
-                row_y + 6.0,
+                &entry.plugin_name,
+                Rect {
+                    x: name_x,
+                    y: row_y + 6.0,
+                    w: (btn_x - 6.0 - name_x).max(1.0),
+                    h: 11.0 * 1.2,
+                },
                 11.0,
                 TEXT,
             );
@@ -2649,16 +2717,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             12.0,
             TEXT,
         );
-        let row_h = 24.0;
-        let row_gap = 4.0;
         let mut row_y = sc_header_y + 18.0 + 4.0;
         let visible_rows = sc_entries.len().min(4);
         let choices = app.sidechain_source_choices();
         let labels: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let dropdown_w = 140.0;
         let name_x = area.x + pad;
-        let dropdown_x = area.x + area.w - pad - dropdown_w;
+        let row_w = area.w - pad * 2.0;
         // B8 (r.md #8): tap point (Pre-FX/Post-FX/Post-Fdr) selector を source
         // dropdown の左に置く。 SetAuxInputTapPoint setter は既存だが従来 UI 未配線
         // (= PostFader 固定だった)。
@@ -2668,36 +2733,29 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             common::model::TapPoint::PostFader,
         ];
         let sc_tap_labels = ["Pre-FX", "Post-FX", "Post-Fdr"];
-        let tap_w = 64.0;
-        let tap_x = dropdown_x - tap_w - 6.0;
+        // 1 行に [名前 | tap | source] を詰めると、 280px の inspector では名前に
+        // 46px しか残らず "VOICEVOX (builtin)" が "VOIC…" になり、 tap も既定の
+        // "Post-Fdr" (59px) が 40px の文字領域に入らず "Post…" になって Post-FX と
+        // 区別できなかった。 mixer の send slot と同じ 2 段構成にして
+        // 「名前は行いっぱい / 操作は下段」 にする。
+        let tap_w = SC_TAP_W;
+        let tap_x = name_x;
+        let dropdown_x = tap_x + tap_w + 6.0;
+        let dropdown_w = (row_w - tap_w - 6.0).max(40.0);
         for (i, entry) in sc_entries.iter().take(visible_rows).enumerate() {
-            // Truncate plugin name visually if it's too long for the
-            // available left half — gui_01 doesn't auto-clip, so we
-            // budget by char count (rough; mono font assumption). Use
-            // `chars().take()` for UTF-8 safety: byte-slicing would panic
-            // on multi-byte boundaries (Japanese / fancy plugin names).
-            let max_name_chars = ((tap_x - name_x - 8.0) / 7.0).max(0.0) as usize;
-            let n_chars = entry.plugin_name.chars().count();
-            let display_name = if n_chars > max_name_chars && max_name_chars > 3 {
-                let truncated: String =
-                    entry.plugin_name.chars().take(max_name_chars - 1).collect();
-                format!("{truncated}…")
-            } else {
-                entry.plugin_name.clone()
-            };
-            ui.label_at(
+            ui.label_at_clipped(
                 ("inspector_sc_name", i),
-                &display_name,
-                name_x,
-                row_y + 6.0,
+                &entry.plugin_name,
+                Rect { x: name_x, y: row_y, w: row_w, h: SC_NAME_H },
                 11.0,
                 TEXT,
             );
+            let ctl_y = row_y + SC_NAME_H;
             let dropdown_rect = Rect {
                 x: dropdown_x,
-                y: row_y,
+                y: ctl_y,
                 w: dropdown_w,
-                h: row_h,
+                h: SC_CTL_H,
             };
             let selected_idx = match entry.current_source {
                 None => 0,
@@ -2733,7 +2791,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 .unwrap_or(2);
             if let Some(picked) = ui.dropdown(
                 ("inspector_sc_tap", i),
-                Rect { x: tap_x, y: row_y, w: tap_w, h: row_h },
+                Rect { x: tap_x, y: ctl_y, w: tap_w, h: SC_CTL_H },
                 &sc_tap_labels,
                 tap_sel,
             ) && let Some(&tp) = SC_TAP_POINTS.get(picked)
@@ -2749,7 +2807,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     });
                 }));
             }
-            row_y += row_h + row_gap;
+            row_y += SC_ROW_H + SC_ROW_GAP;
         }
     }
 

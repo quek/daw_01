@@ -187,12 +187,16 @@ fn draw_chrome_and_list(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleUndoHistory)),
     );
 
-    // リスト領域 (タイトル下、 下端はリサイズ帯のぶん残す)。
+    // リスト領域 (タイトル下、 右端と下端はリサイズ帯のぶん残す)。
+    // 右端 RESIZE_MARGIN を空けないと、 scroll_area の縦スクロールバー
+    // (幅 SCROLLBAR_W=10、 右端に寄る) の右半分がリサイズ帯と重なり、
+    // サムを掴もうとすると `take_drag_in_rect` が先に press を consume して
+    // 「掴めずにウィンドウ幅リサイズが始まる」 状態になる。
     let list_rect = Rect {
         x: rect.x + 1.0,
         y: rect.y + TITLE_H,
-        w: (rect.w - 2.0).max(0.0),
-        h: (rect.h - TITLE_H - 2.0).max(0.0),
+        w: (rect.w - 1.0 - RESIZE_MARGIN).max(0.0),
+        h: (rect.h - TITLE_H - 1.0 - RESIZE_MARGIN).max(0.0),
     };
     let labels = app.song_doc.history_labels();
     let current = app.song_doc.history_current();

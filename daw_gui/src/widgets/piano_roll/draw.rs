@@ -169,6 +169,12 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
     // この関数の caller (piano_roll cached layer) で `hctx.bar_beat_grid` を呼ぶ。
 
     // (d) keyboard widget (左端、kbd.w > 0 のみ)
+    //
+    // 以下の鍵盤描画はすべて `clip_rect: Some(kbd)` で鍵盤矩形に閉じる。 Linear
+    // 分岐は `0..=ceil(pitch_visible)` を回すので最終行の rect が必ず kbd 下端を
+    // 1 行分 (row_h = zoom_y、 最大 40px) はみ出し、 その下の「鍵盤の真下 ×
+    // velocity レーンの左」 = どの pass も塗らないガターに白鍵 / 黒鍵の帯と
+    // C ラベルが残っていた。
     if kbd.w == 0.0 {
         return;
     }
@@ -179,7 +185,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
         border: Color::TRANSPARENT,
         border_width: 0.0,
         radius: [0.0; 4],
-        clip_rect: None,
+        clip_rect: Some(kbd),
     });
 
     if geom.fold {
@@ -200,7 +206,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                 border: Color::TRANSPARENT,
                 border_width: 0.0,
                 radius: [0.0; 4],
-                clip_rect: None,
+                clip_rect: Some(kbd),
             });
             // root row overlay
             if Some(pitch % 12) == root_pc_opt {
@@ -210,7 +216,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                     border: Color::TRANSPARENT,
                     border_width: 0.0,
                     radius: [0.0; 4],
-                    clip_rect: None,
+                    clip_rect: Some(kbd),
                 });
             }
             // Label: 全 in-scale 行に
@@ -235,7 +241,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                     font_size: style.c_label_font_px,
                     line_height: style.c_label_font_px * 1.2,
                     color,
-                    clip_rect: None,
+                    clip_rect: Some(kbd),
                     ..GlyphArea::default()
                 });
             }
@@ -265,7 +271,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                 border: Color::TRANSPARENT,
                 border_width: 0.0,
                 radius: [0.0; 4],
-                clip_rect: None,
+                clip_rect: Some(kbd),
             });
             // scale overlay (Highlight)
             if let Some(sc) = scale {
@@ -277,7 +283,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [0.0; 4],
-                        clip_rect: None,
+                        clip_rect: Some(kbd),
                     });
                 } else if !sc.is_in_scale(pitch) {
                     hctx.push_rect(RectCommand {
@@ -286,7 +292,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [0.0; 4],
-                        clip_rect: None,
+                        clip_rect: Some(kbd),
                     });
                 }
             }
@@ -313,7 +319,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                             font_size: style.c_label_font_px,
                             line_height: style.c_label_font_px * 1.2,
                             color,
-                            clip_rect: None,
+                            clip_rect: Some(kbd),
                             ..GlyphArea::default()
                         });
                     }
@@ -330,7 +336,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                         font_size: style.c_label_font_px,
                         line_height: style.c_label_font_px * 1.2,
                         color,
-                        clip_rect: None,
+                        clip_rect: Some(kbd),
                         ..GlyphArea::default()
                     });
                 }
@@ -584,7 +590,10 @@ pub(super) fn draw_velocity_lane<M: ?Sized + 'static>(
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
-            clip_rect: None,
+            // bar は cx を中心に ±half_w なので、 view 先頭 (start_beat == 拍 0) の
+            // note では左半分がレーン外 = 鍵盤の真下の未描画ガターへ出る。
+            // selection overlay (clip_rect: Some(grid)) と同じ SSoT でレーンに閉じる。
+            clip_rect: Some(vel_area),
         });
     }
 }

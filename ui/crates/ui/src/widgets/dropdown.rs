@@ -58,14 +58,26 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         let label = items.get(selected).copied().unwrap_or("");
         if !label.is_empty() {
+            // ラベルが使えるのは [PAD_X .. ▼ アロー左端] まで。 これを無視して素の
+            // `push_text` を撃つと、 長い項目 (例: transport の "No count-in") が
+            // アローの上に重なった上で rect 外へはみ出す (daw_01 #079 の
+            //「widget は自分の rect 境界に責任を持つ」 が dropdown だけ未適用だった)。
+            // button / toggle_button と同じ `fit_text_ellipsized` + clip で揃える。
+            let text_max_w = (rect.w - DROPDOWN_PAD_X - DROPDOWN_ARROW_W).max(1.0);
+            let (display, _text_w) = self.fit_text_ellipsized(label, DROPDOWN_FONT, text_max_w);
             self.push_text(GlyphArea {
-                text: label.into(),
+                text: display.as_ref().into(),
                 left: rect.x + DROPDOWN_PAD_X,
                 top: rect.y + (rect.h - DROPDOWN_FONT * 1.2) * 0.5,
                 font_size: DROPDOWN_FONT,
                 line_height: DROPDOWN_FONT * 1.2,
                 color: theme::TEXT,
-                clip_rect: None,
+                clip_rect: Some(Rect {
+                    x: rect.x + DROPDOWN_PAD_X,
+                    y: rect.y,
+                    w: text_max_w,
+                    h: rect.h,
+                }),
                 ..GlyphArea::default()
             });
         }
@@ -97,8 +109,22 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // (画面下端で popup がはみ出す場合は上に flip)。 anchor は body rect + popup_rect
         // の汎用 union で flip 後でも outside_click 判定が両方を「内」 として扱える。
         let popup_h = (items.len() as f32) * DROPDOWN_ITEM_H;
+        // popup は本体幅を下限に、 項目が省略なしで読める幅まで伸ばす (combobox の
+        // 慣用。 本体は狭くても選択肢は全部読める)。 旧実装は本体幅固定だったため、
+        // 狭い dropdown では項目が popup 枠の外へ直描きされていた。
+        //
+        // 実測 (`items_popup_width`) は全項目を shape するので、 popup が要る frame
+        // (開いている / この frame で開く) だけ計算する。 閉じている dropdown で
+        // 毎フレーム全項目を測ると、 transport / inspector に並ぶ dropdown の数だけ
+        // UI ループが重くなる。
+        let opening = inside && pointer.primary_just_released && !already_open;
+        let popup_w = if already_open || opening {
+            crate::widgets::menu::items_popup_width(self, items, rect.w)
+        } else {
+            rect.w
+        };
         let popup_rect =
-            crate::popup::popup_rect_below_or_above(rect, rect.w, popup_h, self.screen());
+            crate::popup::popup_rect_below_or_above(rect, popup_w, popup_h, self.screen());
         let union_left = rect.x.min(popup_rect.x);
         let union_top = rect.y.min(popup_rect.y);
         let anchor = Rect {

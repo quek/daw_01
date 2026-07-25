@@ -101,7 +101,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let need_h = max_x > 0.0;
 
         // ---- 1. wheel scroll を消費 (rect 内の pointer のみ) ----
-        let scroll = self.take_scroll_in_rect(rect);
+        // 縦横どちらもあふれていない (= スクロールしようがない) scroll_area は wheel を
+        // **消費しない**。 消費すると、 内側にネストした「今はスクロール不要な」 領域が
+        // 親のホイール操作 (例: mixer strip 列の横スクロール) を無言で殺してしまう。
+        let scroll = if need_v || need_h {
+            self.take_scroll_in_rect(rect)
+        } else {
+            (0.0, 0.0)
+        };
 
         // ---- 2. scrollbar drag 処理 + offset 更新 ----
         // M9 Phase 45g (daw_01 conversation #010): drag 判定用 thumb_rect は **wheel 適用後の

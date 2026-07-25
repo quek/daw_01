@@ -466,7 +466,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Phase 4 (`docs/plan_automation.md` §6): automation recording mode
     // 4 択 (Read / Touch / Latch / Write) を dropdown 化。 排他選択なので
     // dropdown が UI 的に自然 + 横幅を 1/4 以下に圧縮できる。
-    let rec_mode_w = 78.0;
+    // 各ボタン幅は「最長ラベルの実 advance + 余白」で決める (HackGen Console NF は
+    // 半角 = font_size * 0.527)。 過大な固定幅は右端の再生位置表示を押し出し、
+    // 既定 1280px 幅で Panic ボタンに食われる原因になっていた。
+    // dropdown は本体幅から PAD_X(8) + ARROW_W(16) を引いた残りが文字領域。
+    // "Touch"/"Latch"/"Write" = 5 字 * 14 * 0.527 = 36.9px <= 66 - 24 = 42px。
+    let rec_mode_w = 66.0;
     let cur_rec_idx = RECORDING_MODES
         .iter()
         .position(|(m, _)| *m == app.recording.recording_mode)
@@ -510,7 +515,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 録音 trigger 時に preroll bars 分 click のみ流して 0 拍到達で正規録音
     // 開始。 0 で count-in 無し (= 即時録音)。 transport の Record button
     // とセットで業界標準 (Bitwig / Live / Reaper)。
-    let count_in_w = 90.0;
+    // 既定表示 "No count-in" = 11 字 * 14 * 0.527 = 81.2px。 文字領域は
+    // w - PAD_X(8) - ARROW_W(16) なので 110 - 24 = 86px 必要 (旧 90 では 66px しか
+    // 無く、 既定ラベルが ▼ アローに重なっていた)。
+    let count_in_w = 110.0;
     let count_in_items: &[&str] = &["No count-in", "1 bar", "2 bars"];
     let cur_count_in_idx = (app.recording.count_in_bars.min(2)) as usize;
     if let Some(idx) = ui.dropdown(
@@ -530,7 +538,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // track への MIDI input が clip に書き込まれる。 count-in 中は label を
     // 「Count-in...」 に切り替えて「待機中」 を可視化。 STYLE_RECORD は
     // 業界標準どおり record red 系。
-    let rec_w = 86.0;
+    // 最長ラベル "Count-in..." = 11 字 * 12 * 0.527 = 69.6px。
+    let rec_w = 76.0;
     let rec_active = app.recording.midi_recording || app.recording.midi_recording_pending;
     let rec_label = if app.recording.midi_recording_pending {
         "Count-in..."
@@ -554,7 +563,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input toggle。
     // ON で MIDI 録音中の note_on pitch を Song.scale_at(playhead).snap(pitch)
     // で in-scale に寄せる。 session-only state、 step input は適用外。
-    let snap_live_w = 90.0;
+    // "Snap Live" = 9 字 * 12 * 0.527 = 57.0px。
+    let snap_live_w = 64.0;
     let snap_live_active = app.recording.snap_live_input;
     ui.toggle_button_at(
         "transport_snap_live",
@@ -576,7 +586,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // dropdown 化予定)。 active 時は Cancel。 selected_track が無ければ
     // no-op。 既存 STYLE_REC_MODE (橙) を再利用 (= recording mode と同じく
     // 「現在 user 操作待ちの mode」 強調)。
-    let learn_w = 90.0;
+    // 最長ラベル "Learn Param" / "Learning..." = 11 字 * 12 * 0.527 = 69.6px。
+    let learn_w = 76.0;
     let learn_active = app.recording.midi_learn_target.is_some();
     let armed_track_for_learn = app.selection.selected_track_ids.first().copied();
     // B2 (r.md #8): touch + learn。 直近に触った param が bind 可能なら
@@ -639,11 +650,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         None => "\u{25a0}  --.-.--  |  --:--.---".to_string(),
     };
-    ui.label_at(
+    // 右端の Panic ボタンまでが再生位置表示の持ち分。 running x にそのまま置くと、
+    // 既定ウィンドウ幅 (1280) では左側のボタン列 (~1116px) の後に 152px を要求して
+    // Panic の矩形 (右端から 40px) に食われ、 秒 / ms が読めなくなる。 右端から
+    // 逆算した幅で clip + ellipsis する。
+    let panic_w = 28.0;
+    let playhead_right = area.x + area.w - pad - panic_w - 8.0;
+    ui.label_at_clipped(
         "transport_playhead",
         &playhead,
-        x,
-        area.y + (area.h - 12.0) * 0.5,
+        Rect {
+            x,
+            y: area.y + (area.h - 12.0) * 0.5,
+            w: (playhead_right - x).max(0.0),
+            h: 12.0 * 1.2,
+        },
         12.0,
         TEXT,
     );
@@ -652,7 +673,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (running `x` を使わず area 右端から逆算するので、 左側に何ボタンが増減しても常に
     // 右端に張り付く)。 ラベルは "!"、 背景は他ボタンと同じ中立色 (STYLE_PANIC)。
     // click で `AppEvent::Panic` を発火 (再生停止 + 全 plugin 再初期化)。
-    let panic_w = 28.0;
     ui.toggle_button_at(
         "transport_panic",
         "!",

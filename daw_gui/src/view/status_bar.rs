@@ -123,14 +123,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 
     if !app.ui_ephemeral.status_message.is_empty() {
-        // メーターと被らない位置にだけ status_message を出す。
+        // メーターと被らない **幅** で status_message を出す。 旧実装は開始位置
+        // (mid_x < left_limit) だけを見て label_at (clip も ellipsis も無し) を撃って
+        // いたため、 長い日本語メッセージ (例:「ここには貼り付けできません (…)」= 377px)
+        // が DSP / CPU / fps ラベルの上に重なって双方読めなくなっていた。
         let mid_x = area.x + area.w * 0.55;
         if mid_x < left_limit {
-            ui.label_at(
+            ui.label_at_clipped(
                 "status_message",
                 &app.ui_ephemeral.status_message,
-                mid_x,
-                line_y,
+                Rect {
+                    x: mid_x,
+                    y: line_y,
+                    w: (left_limit - mid_x).max(0.0),
+                    h: 11.0 * 1.2,
+                },
                 11.0,
                 COLOR_MSG,
             );
