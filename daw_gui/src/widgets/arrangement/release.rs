@@ -231,27 +231,38 @@ pub(super) fn commit_releases(
                 AudioDragOutcome::Gain { next_db } => {
                     let delta = ClipGainDelta {
                         key: ad.key,
-                        prev_gain_db: ad.anchor.gain_db,
+                        prev_gain_db: ad.anchor_gain_db,
                         next_gain_db: next_db,
                     };
                     ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipRef, f32)> = v_d.iter().filter_map(|d| clip_key_to_ref(app, d.key).map(|t| (t, d.next_gain_db))).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipGainDbBatch(entries)); } }) });
                 }
+                // r.md #38: fade の commit 先は掴んだ **event 1 つ** (`event_index`)。
+                // 以前は ClipRef だけを載せ、 handler 側が clip 内全 event に broadcast して
+                // いたため、 複数 event を持つ clip では「掴んだ event と書き換わる event」 が
+                // 一致しなかった。
                 AudioDragOutcome::FadeLength { edge, next_beats } => {
+                    // `compute_audio_drag_outcome` は anchor_fade が None なら
+                    // FadeLength を返さないので Some 確定だが defensive に畳む。
+                    if let Some(anchor) = ad.anchor_fade {
                     let prev_beats = match edge {
-                        FadeEdge::In => ad.anchor.fade_in_beats,
-                        FadeEdge::Out => ad.anchor.fade_out_beats,
+                        FadeEdge::In => anchor.fade.fade_in_beats,
+                        FadeEdge::Out => anchor.fade.fade_out_beats,
                     };
                     let delta = ClipFadeDelta {
                         key: ad.key,
+                        event_index: anchor.event_index,
                         edge,
                         prev_beats,
                         next_beats,
                     };
-                    ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipRef, FadeEdgeKind, f64)> = v_d.iter().filter_map(|d| clip_key_to_ref(app, d.key).map(|t| { let edge = match d.edge { FadeEdge::In => FadeEdgeKind::In, FadeEdge::Out => FadeEdgeKind::Out }; (t, edge, d.next_beats) })).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipFadeBeatsBatch(entries)); } }) });
+                    ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipEventRef, FadeEdgeKind, f64)> = v_d.iter().filter_map(|d| clip_key_to_ref(app, d.key).map(|t| { let edge = match d.edge { FadeEdge::In => FadeEdgeKind::In, FadeEdge::Out => FadeEdgeKind::Out }; (ClipEventRef { clip: t, event: d.event_index }, edge, d.next_beats) })).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipFadeBeatsBatch(entries)); } }) });
+                    }
                 }
                 AudioDragOutcome::FadeCurve { edge, next_curve } => {
-                    let delta = ClipFadeCurveDelta { key: ad.key, edge, next_curve };
-                    ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipRef, FadeEdgeKind, common::model::FadeCurve)> = v_d.iter().filter_map(|d| clip_key_to_ref(app, d.key).map(|t| { let edge = match d.edge { FadeEdge::In => FadeEdgeKind::In, FadeEdge::Out => FadeEdgeKind::Out }; let curve = model_curve_from_widget(d.next_curve); (t, edge, curve) })).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipFadeCurveBatch(entries)); } }) });
+                    if let Some(anchor) = ad.anchor_fade {
+                    let delta = ClipFadeCurveDelta { key: ad.key, event_index: anchor.event_index, edge, next_curve };
+                    ui.push_edit({ let v_d = [delta]; Edit::mutate(move |app: &mut AppData| { let entries: Vec<(ClipEventRef, FadeEdgeKind, common::model::FadeCurve)> = v_d.iter().filter_map(|d| clip_key_to_ref(app, d.key).map(|t| { let edge = match d.edge { FadeEdge::In => FadeEdgeKind::In, FadeEdge::Out => FadeEdgeKind::Out }; (ClipEventRef { clip: t, event: d.event_index }, edge, d.next_curve) })).collect(); if !entries.is_empty() { app.handle_event(AppEvent::SetClipFadeCurveBatch(entries)); } }) });
+                    }
                 }
             }
         }

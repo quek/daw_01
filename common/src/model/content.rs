@@ -124,6 +124,29 @@ pub enum ClipContent {
     Text(TextContent),
 }
 
+/// r.md #38: 1 event 分の fade 情報を content 種別に依らず表す値型。
+///
+/// audio / video / image / text の event が共通で持つ「clip 内のどこに、 どれだけの
+/// 長さで居て、 その両端にどんな fade が掛かっているか」。 アレンジ画面の fade 描画・
+/// hit-test・drag と、 fade の編集 setter がこの型 1 つを見る。
+///
+/// **fade は clip 長ではなく `len_beats` (= event 長) に対して掛かる**。 音側
+/// (`daw_audio::audio_clip_renderer`) / 映像 (`video_playback`) / 画像
+/// (`image_compose`) / 字幕 (`text_compose`) が全部 event 長基準で適用しているので、
+/// 描画も clamp もここに揃える (r.md #38 以前は描画と clamp だけが clip 長基準で、
+/// clip より短い event では絵・音・編集可能範囲が三者三様にずれていた)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EventFade {
+    /// clip 先頭からの event 開始位置 (拍)。
+    pub start_in_clip_beats: f64,
+    /// event の長さ (拍)。 fade 長の上限でもある。
+    pub len_beats: f64,
+    pub fade_in_beats: f64,
+    pub fade_out_beats: f64,
+    pub fade_in_curve: FadeCurve,
+    pub fade_out_curve: FadeCurve,
+}
+
 impl Default for ClipContent {
     fn default() -> Self {
         ClipContent::Midi(MidiContent::default())
@@ -227,6 +250,82 @@ impl ClipContent {
             | ClipContent::Video(_)
             | ClipContent::Image(_)
             | ClipContent::Text(_) => None,
+        }
+    }
+
+    /// r.md #38: clip 内の各 event の fade 情報を **content 種別に依らず** 列挙する。
+    ///
+    /// `AudioEvent` / `VideoEvent` / `ImageEvent` / `TextEvent` は
+    /// `event_start_in_clip_beats` / `event_length_beats` / `fade_in_beats` /
+    /// `fade_out_beats` / `fade_in_curve` / `fade_out_curve` を同じ意味で持ち、
+    /// 適用側も全部 [`crate::audio_render::fade_curve_at`] を通る。 よって
+    /// 「fade をどう描き、 どう掴み、 どう編集するか」 は content に依存しない。
+    /// アレンジ画面の描画 / hit-test / drag はこの 1 本を SSoT にする
+    /// (種別ごとに 4 実装を持たない = DRY)。
+    ///
+    /// `Midi` / `Automation` は fade を持たないので空 Vec。
+    #[must_use]
+    pub fn event_fades(&self) -> Vec<EventFade> {
+        macro_rules! collect {
+            ($events:expr) => {
+                $events
+                    .iter()
+                    .map(|e| EventFade {
+                        start_in_clip_beats: e.event_start_in_clip_beats,
+                        len_beats: e.event_length_beats,
+                        fade_in_beats: e.fade_in_beats,
+                        fade_out_beats: e.fade_out_beats,
+                        fade_in_curve: e.fade_in_curve,
+                        fade_out_curve: e.fade_out_curve,
+                    })
+                    .collect()
+            };
+        }
+        match self {
+            ClipContent::Audio(c) => collect!(c.events),
+            ClipContent::Video(c) => collect!(c.events),
+            ClipContent::Image(c) => collect!(c.events),
+            ClipContent::Text(c) => collect!(c.events),
+            ClipContent::Midi(_) | ClipContent::Automation(_) => Vec::new(),
+        }
+    }
+
+    /// r.md #38: `index` 番目の event の fade フィールドを content 種別に依らず
+    /// 書き換える。 `f` には現在値を渡し、 戻り値をそのまま書き戻す
+    /// (clamp は caller の責務 = [`EventFade::len_beats`] を上限にする)。
+    ///
+    /// event が存在しない / fade を持たない content なら `false`。
+    pub fn set_event_fade(
+        &mut self,
+        index: usize,
+        f: impl FnOnce(EventFade) -> EventFade,
+    ) -> bool {
+        macro_rules! apply {
+            ($events:expr) => {{
+                let Some(e) = $events.get_mut(index) else {
+                    return false;
+                };
+                let next = f(EventFade {
+                    start_in_clip_beats: e.event_start_in_clip_beats,
+                    len_beats: e.event_length_beats,
+                    fade_in_beats: e.fade_in_beats,
+                    fade_out_beats: e.fade_out_beats,
+                    fade_in_curve: e.fade_in_curve,
+                    fade_out_curve: e.fade_out_curve,
+                });
+                e.fade_in_beats = next.fade_in_beats;
+                e.fade_out_beats = next.fade_out_beats;
+                e.fade_in_curve = next.fade_in_curve;
+                e.fade_out_curve = next.fade_out_curve;
+                true
+            }};
+        }
+        match self {
+            ClipContent::Audio(c) => apply!(c.events),
+            ClipContent::Video(c) => apply!(c.events),
+            ClipContent::Image(c) => apply!(c.events),
+            ClipContent::Text(c) => apply!(c.events),
+            ClipContent::Midi(_) | ClipContent::Automation(_) => false,
         }
     }
 
@@ -591,12 +690,35 @@ pub enum StretchMode {
     Slice,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Encode, Decode)]
 pub enum FadeCurve {
     #[default]
     Linear,
     Exponential,
     SCurve,
+}
+
+impl FadeCurve {
+    /// Vertical drag で次の curve に進める (`Linear → Exponential → SCurve → Linear`)。
+    /// r.md #38 で arrangement widget の mirror enum を撤去し、 順送りの SSoT をここに移した。
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            FadeCurve::Linear => FadeCurve::Exponential,
+            FadeCurve::Exponential => FadeCurve::SCurve,
+            FadeCurve::SCurve => FadeCurve::Linear,
+        }
+    }
+
+    /// ghost label / debug 表示用の英語名 (Bitwig / Reaper と整合)。
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            FadeCurve::Linear => "Linear",
+            FadeCurve::Exponential => "Exponential",
+            FadeCurve::SCurve => "SCurve",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]

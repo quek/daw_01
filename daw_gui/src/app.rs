@@ -1282,6 +1282,13 @@ impl AppData {
             } => {
                 self.set_sidechain_source(track_id, device_index, port, source);
             }
+            AppEvent::SetPluginSendAllKeys {
+                track_id,
+                device_index,
+                enabled,
+            } => {
+                self.set_plugin_send_all_keys(track_id, device_index, enabled);
+            }
             AppEvent::AddModSource { kind } => self.add_mod_source(kind),
             AppEvent::EditModSource { id, edit } => self.edit_mod_source(id, edit),
             AppEvent::RemoveModSource { id } => self.remove_mod_source(id),
@@ -1854,26 +1861,31 @@ impl AppData {
             }
             AppEvent::SetClipFadeBeatsBatch(entries) => {
                 for (target, edge, beats) in &entries {
-                    match edge {
-                        FadeEdgeKind::In => {
-                            self.set_clip_audio_event_fade_in_beats(*target, *beats);
+                    let beats = *beats;
+                    let edge = *edge;
+                    self.set_clip_event_fade(*target, move |mut f| {
+                        // 上限は event 長 (音 / 映像 / 画像 / 字幕が全部 event 長基準で
+                        // fade を適用するため。 r.md #38)。
+                        let v = beats.clamp(0.0, f.len_beats.max(0.0));
+                        match edge {
+                            FadeEdgeKind::In => f.fade_in_beats = v,
+                            FadeEdgeKind::Out => f.fade_out_beats = v,
                         }
-                        FadeEdgeKind::Out => {
-                            self.set_clip_audio_event_fade_out_beats(*target, *beats);
-                        }
-                    }
+                        f
+                    });
                 }
             }
             AppEvent::SetClipFadeCurveBatch(entries) => {
                 for (target, edge, curve) in &entries {
-                    match edge {
-                        FadeEdgeKind::In => {
-                            self.set_clip_audio_event_fade_in_curve(*target, *curve);
+                    let curve = *curve;
+                    let edge = *edge;
+                    self.set_clip_event_fade(*target, move |mut f| {
+                        match edge {
+                            FadeEdgeKind::In => f.fade_in_curve = curve,
+                            FadeEdgeKind::Out => f.fade_out_curve = curve,
                         }
-                        FadeEdgeKind::Out => {
-                            self.set_clip_audio_event_fade_out_curve(*target, *curve);
-                        }
-                    }
+                        f
+                    });
                 }
             }
             AppEvent::BroadcastDiscreteClipEdit { targets, edit } => {

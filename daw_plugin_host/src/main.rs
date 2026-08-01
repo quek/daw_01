@@ -19,6 +19,7 @@ mod plugin_scan;
 mod vst3_scan;
 mod clap_host;
 mod clap_plugin;
+mod editor_keys;
 mod editor_window;
 mod plugin_instance;
 mod process_scaffold;
@@ -29,7 +30,7 @@ mod vst3_params;
 mod vst3_plugin;
 mod vst3_stream;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,9 +47,10 @@ use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::mpsc as tmpsc;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, KillTimer, MSG, PM_REMOVE, PeekMessageW, PostThreadMessageW,
-    SetTimer, TranslateMessage, WM_APP, WM_TIMER,
+    DispatchMessageW, GetMessageW, IsChild, KillTimer, MSG, PM_REMOVE, PeekMessageW,
+    PostThreadMessageW, SetTimer, TranslateMessage, WM_APP, WM_TIMER,
 };
 
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, load_plugin};
@@ -526,6 +528,14 @@ struct PluginHost {
     /// ARA WAV 解決等 (v29 時点では `AraClipSpec.source_wav` が常に絶対
     /// パスなので参照されないが、契約として保持)。
     project_dir: Option<PathBuf>,
+    /// r.md #36: daw_gui から通知された 「エディタ窓で拾ってよいキー」 の一覧。
+    /// **意味論 (どのキーが何をするか) は持たない**。 数値比較だけに使う。
+    forwarded_keys: Vec<common::protocol::KeyChord>,
+    /// r.md #36: 横取り中の key-down の chord。 対応する key-up も同じ判定で
+    /// 飲み込むために覚えておく (down だけ奪うとプラグインが押しっぱなしと誤認する)。
+    swallowed_keys: Vec<common::protocol::KeyChord>,
+    /// r.md #36: 「キーを全部プラグインに送る」 が ON の device (逃げ道)。
+    send_all_keys: HashSet<u64>,
 }
 
 impl PluginHost {
@@ -543,6 +553,9 @@ impl PluginHost {
             registry: Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new())),
             worker_pool: None,
             project_dir: None,
+            forwarded_keys: Vec::new(),
+            swallowed_keys: Vec::new(),
+            send_all_keys: HashSet::new(),
         }
     }
 
@@ -653,6 +666,86 @@ impl PluginHost {
 
     fn emit(&self, evt: PluginEvent) {
         let _ = self.evt_tx.send(evt);
+    }
+
+    /// r.md #36: `hwnd` がどの device のエディタ窓 (コンテナ本体 or その子孫) かを返す。
+    /// `instances` は device_id keyed の唯一の bookkeeping なので、 ここを引くだけで
+    /// positional index を新設せずに解決できる (アーキテクチャ不変条件 #1)。
+    fn editor_device_of(&self, hwnd: HWND) -> Option<(u64, bool)> {
+        if hwnd.is_invalid() {
+            return None;
+        }
+        for (&device_id, rec) in &self.instances {
+            let Some(editor) = rec.editor.as_ref() else { continue };
+            let container = HWND(editor.hwnd_u64() as *mut core::ffi::c_void);
+            if container == hwnd {
+                return Some((device_id, true));
+            }
+            if unsafe { IsChild(container, hwnd) }.as_bool() {
+                return Some((device_id, false));
+            }
+        }
+        None
+    }
+
+    /// r.md #36: プラグインエディタ由来のキーメッセージを処理する。
+    ///
+    /// 戻り値 `true` = **飲み込んだ** (呼び出し側は `TranslateMessage` /
+    /// `DispatchMessageW` を呼ばない)。 `false` = 従来どおりプラグインへ流す。
+    fn handle_editor_key(&mut self, msg: &MSG) -> bool {
+        let relay_down = msg.message == editor_window::WM_EDITOR_KEY_RELAY_DOWN;
+        let relay_up = msg.message == editor_window::WM_EDITOR_KEY_RELAY_UP;
+        let is_relay = relay_down || relay_up;
+        let is_down = relay_down || (!is_relay && editor_keys::is_key_down(msg.message));
+        let is_up = relay_up || (!is_relay && editor_keys::is_key_up(msg.message));
+        if !is_down && !is_up {
+            return false;
+        }
+        let Some((device_id, is_container)) = self.editor_device_of(msg.hwnd) else {
+            return false;
+        };
+        // 逃げ道 (REAPER の「Send all keyboard input to plug-in」相当): この device では
+        // 一切横取りしない。 relay は既にプラグインが 「要らない」 と言ったものなので
+        // 飲み込む (再 dispatch しても行き場が無い) が、 転送はしない。
+        if self.send_all_keys.contains(&device_id) {
+            return is_relay;
+        }
+        let chord = editor_keys::chord_of(msg);
+        if is_up {
+            // down を奪ったキーだけ up も奪う (対で奪わないとプラグインが押しっぱなしと誤認)。
+            if let Some(i) = self.swallowed_keys.iter().position(|c| c.vk == chord.vk) {
+                self.swallowed_keys.remove(i);
+                return true;
+            }
+            // relay 経由の up は既にプラグインが捨てたものなので行き場が無い。
+            return is_relay;
+        }
+        if !self.forwarded_keys.contains(&chord) {
+            // 転送対象外のキーは触らない。 relay 経由 (= プラグインが捨てたキー) は
+            // 行き場が無いのでここで捨てる。
+            return is_relay;
+        }
+        // 経路 A: プラグインの子窓宛に **まだ届いていない** キーは、 フォーカス窓に
+        // 「このキー要る?」 を問い合わせてから決める。 コンテナ窓宛 (= relay 含む) は
+        // 既にプラグインが未消化を宣言しているので問い合わせ不要。
+        //
+        // **オートリピート判定より前に問い合わせる**。 逆順にすると、 プラグインの
+        // テキスト欄で Space を長押ししたときに 2 発目以降が無条件で飲まれ、
+        // 「最初の 1 文字しか入らない」 になる。
+        if !is_container && !is_relay && editor_keys::window_wants_key(msg.hwnd, msg) {
+            return false;
+        }
+        if editor_keys::is_auto_repeat(msg.lParam) {
+            // オートリピートは 1 押下 1 発火にするため **飲み込むが emit しない**。
+            return true;
+        }
+        // 取りこぼした key-up の残骸を回収する (エディタを閉じた / フォーカスを
+        // 奪われた等で up が来ないケース)。 物理的に押されていない vk は捨てる。
+        self.swallowed_keys
+            .retain(|c| unsafe { GetAsyncKeyState(i32::from(c.vk)) } < 0);
+        self.swallowed_keys.push(chord);
+        self.emit(PluginEvent::EditorKey { device_id, chord });
+        true
     }
 
     /// registry から `device_id` の entry を外し、worker の in-flight
@@ -823,6 +916,21 @@ impl PluginHost {
             }
             PluginCommand::CloseSlotGui { device_id } => {
                 self.close_slot_gui(device_id);
+            }
+            // r.md #36: daw_gui の SHORTCUTS から導出された chord 列をそのまま保持する。
+            // ここに意味論 (どのキーが何をするか) は無い。
+            PluginCommand::SetEditorForwardedKeys { chords } => {
+                tracing::info!(count = chords.len(), "editor forwarded keys updated");
+                self.forwarded_keys = chords;
+                // 転送対象が変わると「down を奪ったか」の前提も変わるので残骸を捨てる。
+                self.swallowed_keys.clear();
+            }
+            PluginCommand::SetEditorSendAllKeys { device_id, enabled } => {
+                if enabled {
+                    self.send_all_keys.insert(device_id);
+                } else {
+                    self.send_all_keys.remove(&device_id);
+                }
             }
             PluginCommand::SetBuiltinPluginNoteMetadata {
                 device_id,
@@ -1440,6 +1548,10 @@ impl PluginHost {
             // Drop = DestroyWindow, run after gui_destroy detached the child.
             rec.editor = None;
         }
+        // r.md #36: 窓を壊すと対応する key-up はもう届かない (`editor_device_of` が
+        // None を返す) ので、 横取り中の記録をここで捨てる。 残すと次に別のキーの
+        // key-up を誤って飲み込む。
+        self.swallowed_keys.clear();
         self.emit(PluginEvent::SlotGuiClosed { device_id });
     }
 
@@ -1602,6 +1714,10 @@ fn plugin_main_loop(
             if msg.message == WM_TIMER && msg.wParam.0 == ARA_NOTIFY_TIMER_ID {
                 // (r.md #5 ARA2) Pump every ARA document's deferred analysis.
                 host.notify_ara_model_updates();
+            } else if host.handle_editor_key(&msg) {
+                // r.md #36: プラグインが消化しなかった転送対象キー。 daw_gui へ渡し、
+                // TranslateMessage / DispatchMessageW は呼ばない (= WM_CHAR も出ないので
+                // プラグインのテキスト欄に空白が入らない)。
             } else if msg.message != WM_COMMAND_WAKE {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);

@@ -33,7 +33,27 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
     if fade_len == 0 || t >= fade_len {
         return 1.0;
     }
-    let x = (t as f32) / (fade_len as f32);
+    fade_curve_at((t as f32) / (fade_len as f32), curve)
+}
+
+/// Fade カーブそのもの: 正規化した進度 `progress` (0 = fade 開始 = 無音、
+/// 1 = fade 終了 = フル) を 0..=1 のゲインへ写す。 **fade の形を決める唯一の式**。
+///
+/// 音 ([`fade_envelope`] 経由の `daw_audio::audio_clip_renderer`)、 映像
+/// (`daw_gui::video_playback`)、 画像 (`daw_gui::image_compose`)、 字幕
+/// (`daw_gui::text_compose`)、 そして **アレンジ画面の fade 描画**
+/// (`daw_gui::widgets::arrangement`) が全部ここを呼ぶ。 r.md #38 以前は
+/// 同じ 3 行 match が 4 箇所にコピーされ、 描画だけが式を持たず直線 1 本で
+/// 代用していたため 「線の形が curve を反映しない」 状態だった。
+///
+/// 数式 (`docs/plan_audio_clip.md` §3.5):
+/// - `Linear`: `x`
+/// - `Exponential`: `x^2`
+/// - `SCurve`: `0.5 - 0.5 * cos(π x)` (= equal-power に近い)
+#[inline]
+#[must_use]
+pub fn fade_curve_at(progress: f32, curve: FadeCurve) -> f32 {
+    let x = progress.clamp(0.0, 1.0);
     match curve {
         FadeCurve::Linear => x,
         FadeCurve::Exponential => x * x,

@@ -44,23 +44,111 @@ pub fn clip_to_rect(
     Rect { x, y: track_row_top + 2.0, w, h }
 }
 
-/// M14 Phase 63k (#025): audio_edit が Some の clip 上の audio gesture grip ヒット種別。
+/// r.md #38: 1 event の 1 辺ぶんの fade 幾何。 **描画と hit-test の SSoT**
+/// (= 見えている handle がそのまま掴める場所)。
+///
+/// 座標系は y-down。 `anchor` は無音側 (= event 矩形の下端、 固定)、 `handle` は
+/// フル側 (= event 矩形の上端、 fade 長で横に動く)。 r.md #38 以前はこれが上下逆で、
+/// 固定点が上端・可動点が下端に描かれていた (ユーザー報告
+/// 「スナップポイントが動かず、 線の下端が動きます」 そのもの)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct FadeGeometry {
+    /// clip 矩形から event の区間を切り出した矩形。
+    pub event_rect: Rect,
+    /// fade の横幅 (px)。 `0` なら斜辺は描かない (handle 正方形だけ)。
+    pub width_px: f32,
+    /// 無音側の端点 (event 矩形の下端の角、 fade 長に依らず固定)。
+    pub anchor: [f32; 2],
+    /// フル側の端点 (event 矩形の上端、 fade 長ぶん内側)。 掴む点。
+    pub handle: [f32; 2],
+    /// 掴む正方形。 `handle` を基準に event 矩形内へ収める。 `fade = 0` のときは
+    /// event の角にちょうど一致するので、 従来の「角を掴む」 操作感は保たれる。
+    pub handle_rect: Rect,
+}
+
+/// r.md #38: clip 矩形 + event の fade 情報 + 辺 → 描画/hit-test 共通の幾何。
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub(super) fn fade_geometry(
+    clip_rect: Rect,
+    clip_len_beats: f64,
+    fade: &ClipEventFade,
+    edge: FadeEdge,
+    style: &ArrangementStyle,
+) -> FadeGeometry {
+    // event 矩形: clip 矩形を event の clip 内位置 / 長さで切り出す。 clip 全体を覆う
+    // 単一 event (最頻) では clip 矩形そのものになる。
+    let px_per_beat = if clip_len_beats > 1e-9 {
+        f64::from(clip_rect.w) / clip_len_beats
+    } else {
+        0.0
+    };
+    let ex = clip_rect.x + (fade.fade.start_in_clip_beats * px_per_beat) as f32;
+    let ew = ((fade.fade.len_beats * px_per_beat) as f32)
+        .max(0.0)
+        .min(clip_rect.x + clip_rect.w - ex);
+    let event_rect = Rect { x: ex, y: clip_rect.y, w: ew.max(0.0), h: clip_rect.h };
+
+    let fade_beats = match edge {
+        FadeEdge::In => fade.fade.fade_in_beats,
+        FadeEdge::Out => fade.fade.fade_out_beats,
+    };
+    let width_px = ((fade_beats * px_per_beat) as f32).clamp(0.0, event_rect.w);
+
+    let corner = style.audio_fade_corner_size_px;
+    let (anchor, handle, handle_x) = match edge {
+        FadeEdge::In => {
+            let hx = event_rect.x + width_px;
+            (
+                [event_rect.x, event_rect.y + event_rect.h],
+                [hx, event_rect.y],
+                // 正方形は handle から内側へ伸ばす → fade 0 で event 左上角に一致。
+                hx.min(event_rect.x + (event_rect.w - corner).max(0.0)),
+            )
+        }
+        FadeEdge::Out => {
+            let hx = event_rect.x + event_rect.w - width_px;
+            (
+                [event_rect.x + event_rect.w, event_rect.y + event_rect.h],
+                [hx, event_rect.y],
+                // fade 0 で event 右上角に一致。
+                (hx - corner).max(event_rect.x),
+            )
+        }
+    };
+    FadeGeometry {
+        event_rect,
+        width_px,
+        anchor,
+        handle,
+        handle_rect: Rect { x: handle_x, y: event_rect.y, w: corner, h: corner },
+    }
+}
+
+/// M14 Phase 63k (#025): clip 上の inline 編集 grip ヒット種別。
 /// 公開 `ClipDragKind` には足さず内部 enum で扱う (caller の hover/drag 報告は既存 3 variant
-/// のまま維持、 audio gesture は widget 内で完結)。
+/// のまま維持、 gesture は widget 内で完結)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AudioGripHit {
-    /// clip 上端の左角 (12×12 px)。 fade_in length / curve drag の起点。
-    FadeCornerIn,
-    /// clip 上端の右角 (12×12 px)。 fade_out length / curve drag の起点。
-    FadeCornerOut,
+    /// fade in の掴む正方形。 `event_index` は clip 内の event 位置 (r.md #38: fade の
+    /// 編集はこの 1 event にだけ効く)。
+    FadeCornerIn { event_index: u32 },
+    /// fade out の掴む正方形。
+    FadeCornerOut { event_index: u32 },
     /// clip 中央 horizontal 帯 (handle line ±4 px、 端から x_margin 内側)。 gain dB drag の起点。
     GainHandleBand,
 }
 
-/// M14 Phase 63k (#025): 単一 clip の audio_edit grip ヒット (priority: gain > fade corner)。
-/// `audio_edit` が None の clip ではヒット無し、 `r.w < min_w` の短 clip でも無効化。
-/// fade 角は resize handle (4 px) より priority 高 (= clip 内側の上端 12×12 を fade に振る)、
-/// resize は fade 角の外側 (clip rect の外側 ±4 px) で活きる。
+/// M14 Phase 63k (#025) / r.md #38: 単一 clip の inline grip ヒット。
+///
+/// priority は **fade handle > gain band**。 fade handle は fade 長で横に動く小さな
+/// 正方形 (= 狙って掴む対象) で、 gain band は clip 中央を横断する大きな帯なので、
+/// 小さい方を優先しないと 「見えているのに掴めない」 領域が出る (行高が低い clip では
+/// 中央帯が上端 12px に食い込む)。
+///
+/// fade を持たない clip (MIDI / Automation) と `audio_edit` が None の clip では
+/// それぞれ該当ヒットが出ない。 `r.w < min_w` の短 clip では全て無効。
+/// fade handle は resize handle (4 px) より priority 高、 resize は clip rect の外側 ±4 px で活きる。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn audio_grip_hit(
     track_row_top: f32,
@@ -72,7 +160,9 @@ pub(super) fn audio_grip_hit(
     cy: f32,
     style: &ArrangementStyle,
 ) -> Option<AudioGripHit> {
-    clip.audio_edit?;
+    if clip.audio_edit.is_none() && clip.fades.is_empty() {
+        return None;
+    }
     let r = clip_to_rect(track_row_top, track_row_h, clip, view, lanes);
     if r.w < style.audio_min_clip_w_for_handles_px {
         return None;
@@ -80,25 +170,43 @@ pub(super) fn audio_grip_hit(
     if cy < r.y || cy >= r.y + r.h {
         return None;
     }
-    let corner = style.audio_fade_corner_size_px;
-    // priority 1: gain handle band — clip 中央 y ±half_band、 端から x_margin 内側のみ
-    let center_y = r.y + r.h * 0.5;
-    let half_band = style.audio_db_handle_band_h * 0.5;
-    let margin = style.audio_db_handle_x_margin;
-    if cx >= r.x + margin
-        && cx < r.x + r.w - margin
-        && cy >= center_y - half_band
-        && cy < center_y + half_band
-    {
-        return Some(AudioGripHit::GainHandleBand);
+    // priority 1: fade handle (描画と同じ `fade_geometry`)。 後ろの event ほど手前に
+    // 描かれるので、 重なりは後勝ちにして描画順と一致させる。
+    let mut fade_hit: Option<(f32, AudioGripHit)> = None;
+    for f in &clip.fades {
+        // In / Out の handle が同じ位置に重なることがある (例: fade_in が event 全長で
+        // fade_out = 0 のとき、 どちらも event 右上に来る)。 単純な後勝ちだと退化した
+        // 側 (width 0) が常に勝ち、 実際に伸びている側を掴めなくなるので、
+        // **width_px の大きい方を優先**する (同値なら後勝ち = 描画で手前の Out)。
+        for (edge, hit) in [
+            (FadeEdge::In, AudioGripHit::FadeCornerIn { event_index: f.event_index }),
+            (FadeEdge::Out, AudioGripHit::FadeCornerOut { event_index: f.event_index }),
+        ] {
+            let g = fade_geometry(r, clip.len_beats, f, edge, style);
+            if !g.handle_rect.contains(cx, cy) {
+                continue;
+            }
+            if fade_hit.is_none_or(|(w, _)| g.width_px >= w) {
+                fade_hit = Some((g.width_px, hit));
+            }
+        }
     }
-    // priority 2: fade in 角 (top-left 12×12)
-    if cx >= r.x && cx < r.x + corner && cy >= r.y && cy < r.y + corner {
-        return Some(AudioGripHit::FadeCornerIn);
+    let fade_hit = fade_hit.map(|(_, h)| h);
+    if fade_hit.is_some() {
+        return fade_hit;
     }
-    // priority 3: fade out 角 (top-right 12×12)
-    if cx >= r.x + r.w - corner && cx < r.x + r.w && cy >= r.y && cy < r.y + corner {
-        return Some(AudioGripHit::FadeCornerOut);
+    // priority 2: gain handle band — clip 中央 y ±half_band、 端から x_margin 内側のみ (audio のみ)
+    if clip.audio_edit.is_some() {
+        let center_y = r.y + r.h * 0.5;
+        let half_band = style.audio_db_handle_band_h * 0.5;
+        let margin = style.audio_db_handle_x_margin;
+        if cx >= r.x + margin
+            && cx < r.x + r.w - margin
+            && cy >= center_y - half_band
+            && cy < center_y + half_band
+        {
+            return Some(AudioGripHit::GainHandleBand);
+        }
     }
     None
 }
@@ -774,7 +882,11 @@ pub fn automation_lane_header_layout(
     let pad = 4.0_f32;
     let icon_size = style.automation_lane_icon_size.max(4.0);
     let cx = header_rect.x + pad;
-    let cy = header_rect.y + (header_rect.h - icon_size).max(0.0) * 0.5;
+    // r.md #37: header の中身は **上寄せ** (icon 行 → default field の top-down フロー)。
+    // 旧実装は icon 行を上下中央 (`(h - icon_size) * 0.5`)、 default field を下端から
+    // 逆算 (`y + h - field_h - pad`) で置いていたため、 lane を高くリサイズすると
+    // 両者が上下に離れて間が空いた。
+    let cy = header_rect.y + pad;
     let enabled_icon_rect = Rect { x: cx, y: cy, w: icon_size, h: icon_size };
     let icon_glyph_rect = Rect {
         x: cx + icon_size + pad,
@@ -792,13 +904,18 @@ pub fn automation_lane_header_layout(
     let delete_icon_rect = Rect { x: delete_x, y: cy, w: icon_size, h: icon_size };
 
     // default value 数値入力フィールド (旧スライダー帯を置換)。 caller が
-    // scrubable_number_at を overlay できる読める高さ。 header 行下端から pad だけ上、
-    // icon 行 (cy + icon_size) より下にフィールドが収まるなら Some。
+    // scrubable_number_at を overlay できる読める高さ。 icon 行の直下に続けて置き、
+    // header 下端に収まるときだけ Some (極狭 lane では非表示 = 従来どおり)。
+    // 上寄せ化で必要 lane 高が 56px → 42px に下がるので、 従来より広い範囲で
+    // default 値を編集できるようになる (= 逆算配置が奪っていた操作性の回復)。
     let field_h = style.automation_default_field_h;
-    let field_y = header_rect.y + header_rect.h - field_h - pad;
+    let field_y = cy + icon_size + pad;
     let field_x = cx;
     let field_w = (header_rect.w - pad * 2.0).max(0.0);
-    let default_field_rect = if field_h > 0.0 && field_w > 0.0 && field_y >= cy + icon_size {
+    let default_field_rect = if field_h > 0.0
+        && field_w > 0.0
+        && field_y + field_h + pad <= header_rect.y + header_rect.h
+    {
         Some(Rect { x: field_x, y: field_y, w: field_w, h: field_h })
     } else {
         None

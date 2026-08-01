@@ -954,6 +954,8 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
             // 共有マーク / 連動ハイライトは transient な preview では出さない (元 clip 側で描画済)。
             share_group_color: None,
             audio_edit: None,
+            // fade envelope は transient な preview では出さない (元 clip 側で描画済)。
+            fades: Vec::new(),
             // video / image / text clip の thumbnail はコピーにも見せる (それが中身なので)。
             thumbnail: src.and_then(|(_, c)| c.thumbnail),
             in_active_group: false,
@@ -1024,66 +1026,80 @@ pub(super) fn db_to_handle_y(rect: Rect, gain_db: f32, style: &ArrangementStyle)
     rect.y + rect.h * 0.5 - rect.h * 0.5 * normalized
 }
 
-/// M14 Phase 63k (#025): clip 上端の fade envelope を描画 (左角 / 右角)。
-/// `fade_beats > 0` のとき、 grip 角から fade 末尾まで斜辺を描く。 `fade_beats = 0` の場合は
-/// grip 正方形だけ ([clip 上端の角、 corner_size×corner_size]) を細く塗る (= 「掴める場所」 の hint)。
+/// r.md #38: 1 event の fade envelope を描画 (event 左端 = In / 右端 = Out)。
+///
+/// **音・映像・画像・字幕に実際に掛かる envelope をそのまま描く**:
+/// - 無音 (ゲイン 0) = event 矩形の**下端**、 フル (ゲイン 1) = **上端**。
+///   r.md #38 以前は上下が逆で、 fade in が「頭で最大 → 下がる」 という
+///   fade out の絵になっていた。
+/// - 線の形は `common::audio_render::fade_curve_at` を刻んだ折れ線
+///   (Linear / Exponential / SCurve が形に出る)。 以前は直線 1 本だったので
+///   curve を切り替えても線が変わらなかった。
+/// - 掴む正方形は **fade の終端**に置く (fade 長で横に動く)。 以前は clip の角に
+///   固定されていて、 fade を伸ばしても動かなかった。
+///
+/// `fade_beats = 0` でも正方形だけは描く (= 「掴める場所」 の hint)。 このとき
+/// 正方形は event の角にちょうど一致するので従来の見た目と同じ。
 pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
-    edge: FadeEdge,
-    fade_beats: f64,
     clip_len_beats: f64,
+    fade: &ClipEventFade,
+    edge: FadeEdge,
     style: &ArrangementStyle,
 ) {
     use daw_ui_renderer::{LineBatch, LineSegment};
 
-    let corner = style.audio_fade_corner_size_px;
-    let corner_rect = match edge {
-        FadeEdge::In => Rect { x: clip_rect.x, y: clip_rect.y, w: corner, h: corner },
-        FadeEdge::Out => Rect {
-            x: clip_rect.x + clip_rect.w - corner,
-            y: clip_rect.y,
-            w: corner,
-            h: corner,
-        },
-    };
-    // grip square (内部塗り、 hit zone hint)
-    push_filled_rect(hctx, corner_rect, style.audio_fade_overlay_color);
-
-    // envelope 斜辺は fade_beats > 0 のときのみ描画。
-    if fade_beats <= 0.0 || clip_len_beats <= 0.0 {
+    let g = fade_geometry(clip_rect, clip_len_beats, fade, edge, style);
+    if g.event_rect.w <= 0.0 || g.event_rect.h <= 0.0 {
         return;
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let fade_w_px = ((fade_beats / clip_len_beats) * f64::from(clip_rect.w))
-        .min(f64::from(clip_rect.w)) as f32;
-    let (start_xy, end_xy) = match edge {
-        // FadeIn: clip 上端左から fade 末尾の clip 内部 (右下) まで斜め
-        FadeEdge::In => (
-            [clip_rect.x, clip_rect.y],
-            [clip_rect.x + fade_w_px, clip_rect.y + clip_rect.h],
-        ),
-        // FadeOut: clip 上端右から fade 末尾の clip 内部 (左下) まで斜め
-        FadeEdge::Out => (
-            [clip_rect.x + clip_rect.w, clip_rect.y],
-            [clip_rect.x + clip_rect.w - fade_w_px, clip_rect.y + clip_rect.h],
-        ),
+    // 掴む正方形 (hit zone と同じ rect = `fade_geometry` が SSoT)。
+    push_filled_rect(hctx, g.handle_rect, style.audio_fade_overlay_color);
+
+    if g.width_px <= 0.5 {
+        return;
+    }
+    let curve = match edge {
+        FadeEdge::In => fade.fade.fade_in_curve,
+        FadeEdge::Out => fade.fade.fade_out_curve,
     };
-    let seg = LineSegment { a: start_xy, b: end_xy, color: style.audio_fade_overlay_color };
+    // 曲線を px 単位で刻む。 分割粒度は既存の lane curve flatten と同じ 2px
+    // (`flatten_lane_curve` の呼び出し側 `max_segment_px`)。
+    const MAX_SEGMENT_PX: f32 = 2.0;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let steps = ((g.width_px / MAX_SEGMENT_PX).ceil() as usize).clamp(1, 512);
+    let bottom = g.event_rect.y + g.event_rect.h;
+    let mut segments: Vec<LineSegment> = Vec::with_capacity(steps);
+    // t = 0 が無音側 (anchor)、 t = 1 がフル側 (handle)。
+    let point_at = |t: f32| -> [f32; 2] {
+        let gain = common::audio_render::fade_curve_at(t, curve);
+        [
+            g.anchor[0] + (g.handle[0] - g.anchor[0]) * t,
+            bottom - g.event_rect.h * gain,
+        ]
+    };
+    let mut prev = point_at(0.0);
+    for i in 1..=steps {
+        #[allow(clippy::cast_precision_loss)]
+        let t = i as f32 / steps as f32;
+        let cur = point_at(t);
+        segments.push(LineSegment { a: prev, b: cur, color: style.audio_fade_overlay_color });
+        prev = cur;
+    }
     hctx.push_lines(LineBatch {
-        segments: Arc::<[LineSegment]>::from(vec![seg]),
+        segments: Arc::<[LineSegment]>::from(segments),
         line_width_px: style.audio_fade_overlay_width_px,
         clip_rect: Some(clip_rect),
     });
 }
 
-/// M14 Phase 63k (#025): audio_edit が Some の clip に対する base 描画 (dB handle line + 両端 fade envelope)。
+/// M14 Phase 63k (#025): audio_edit が Some の clip に対する dB handle line 描画。
 /// cached 内で呼ばれる (audio_edit / clip rect が変化したら viewport_key で cache 再生成)。
 pub(super) fn draw_clip_audio_overlay<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
     audio: &ClipViewAudioEdit,
-    clip_len_beats: f64,
     style: &ArrangementStyle,
 ) {
     use daw_ui_renderer::{LineBatch, LineSegment};
@@ -1104,24 +1120,27 @@ pub(super) fn draw_clip_audio_overlay<M: ?Sized + 'static>(
             clip_rect: Some(clip_rect),
         });
     }
+}
 
-    // Fade In / Out 両 envelope を描画 (length 0 でも grip を描く = 「掴める場所」 hint)。
-    draw_fade_envelope(
-        hctx,
-        clip_rect,
-        FadeEdge::In,
-        audio.fade_in_beats,
-        clip_len_beats,
-        style,
-    );
-    draw_fade_envelope(
-        hctx,
-        clip_rect,
-        FadeEdge::Out,
-        audio.fade_out_beats,
-        clip_len_beats,
-        style,
-    );
+/// r.md #38: clip の全 event の fade envelope を描画 (content 種別に依らず共通)。
+pub(super) fn draw_clip_fades<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    clip_rect: Rect,
+    clip_len_beats: f64,
+    fades: &[ClipEventFade],
+    style: &ArrangementStyle,
+) {
+    for f in fades {
+        // hit-test (`audio_grip_hit`) は handle が重なったとき **width_px の大きい方**を
+        // 採るので、 描画も「大きい方を後に (= 手前に) 描く」 に揃える (SSoT)。
+        let mut edges = [FadeEdge::In, FadeEdge::Out];
+        if f.fade.fade_in_beats > f.fade.fade_out_beats {
+            edges.swap(0, 1);
+        }
+        for edge in edges {
+            draw_fade_envelope(hctx, clip_rect, clip_len_beats, f, edge, style);
+        }
+    }
 }
 
 /// M14 Phase 63k (#025): audio_drag 中の ghost overlay (cached 外、 drag 中の preview 値を最新表示)。
@@ -1170,10 +1189,25 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
             ))
         }
         (_, Some(AudioDragOutcome::FadeLength { edge, next_beats })) => {
-            draw_fade_envelope(hctx, r, edge, next_beats, ad.clip_len_beats_anchor, style);
+            if let Some(mut preview) = ad.anchor_fade {
+                match edge {
+                    FadeEdge::In => preview.fade.fade_in_beats = next_beats,
+                    FadeEdge::Out => preview.fade.fade_out_beats = next_beats,
+                }
+                draw_fade_envelope(hctx, r, ad.clip_len_beats_anchor, &preview, edge, style);
+            }
             None
         }
-        (_, Some(AudioDragOutcome::FadeCurve { edge: _, next_curve })) => {
+        (_, Some(AudioDragOutcome::FadeCurve { edge, next_curve })) => {
+            // r.md #38: curve drag 中も **形** をプレビューする (以前はラベルだけで、
+            // 線が直線のままだったので何が変わるのか見えなかった)。
+            if let Some(mut preview) = ad.anchor_fade {
+                match edge {
+                    FadeEdge::In => preview.fade.fade_in_curve = next_curve,
+                    FadeEdge::Out => preview.fade.fade_out_curve = next_curve,
+                }
+                draw_fade_envelope(hctx, r, ad.clip_len_beats_anchor, &preview, edge, style);
+            }
             Some(format!("Curve: {}", next_curve.name()))
         }
         // commit すべき変化なし (drag 距離不足 or anchor 同値) — anchor 値の preview を出さない。
