@@ -458,13 +458,16 @@ impl AppData {
             else {
                 continue;
             };
-            let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
-            let fade_beats = auto_fade_beats.min(max_beats);
             let did = self.edit_song_checked(move |song| {
                 if let Some(common::model::ClipContent::Audio(audio)) =
                     song.clip_contents.get_mut(&content_id)
                 {
                     for event in &mut audio.events {
+                        // r.md #38: fade の上限は clip 長ではなく **event 長**
+                        // (音は event 長基準で fade を掛ける)。 Auto-Crossfade
+                        // (`auto_crossfade_selected_clips`) と同じ基準。
+                        let fade_beats =
+                            auto_fade_beats.min(event.event_length_beats.max(0.0));
                         event.fade_in_beats = fade_beats;
                         event.fade_out_beats = fade_beats;
                     }

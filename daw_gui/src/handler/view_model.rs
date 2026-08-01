@@ -780,7 +780,7 @@ impl AppData {
             pitch_semitones: event.pitch_semitones,
             fade_in_beats: event.fade_in_beats,
             fade_out_beats: event.fade_out_beats,
-            clip_length_beats: clip.length_beats,
+            fade_max_beats: event.event_length_beats,
         })
     }
 
@@ -859,7 +859,7 @@ impl AppData {
             rotation_radians: event.rotation_radians,
             fade_in_beats: event.fade_in_beats,
             fade_out_beats: event.fade_out_beats,
-            clip_length_beats: clip.length_beats,
+            fade_max_beats: event.event_length_beats,
         })
     }
 
@@ -1048,6 +1048,7 @@ impl AppData {
                     is_video: p.ports.is_video(),
                     is_voicevox,
                     has_params,
+                    send_all_keys: p.send_all_keys_to_plugin,
                 }
             })
             .collect()

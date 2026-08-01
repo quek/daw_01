@@ -29,6 +29,10 @@ use daw_ui_core::edit::Edit;
 use daw_ui_core::id::WidgetId;
 use daw_ui_core::scenegraph::hash_inputs;
 use common::snap::SnapConfig;
+// r.md #38: fade カーブは model の型をそのまま使う (旧 widget ローカル mirror enum +
+// 変換関数 2 本は撤去。 arrangement widget は daw_gui 配下なので mirror は不要 =
+// アーキテクチャ不変条件 #8)。
+use common::model::FadeCurve;
 use common::time::{TimeDisplay, TimeMapping};
 use daw_ui_core::ui::Ui;
 use daw_ui_core::viewport::ViewportState1D;
@@ -49,7 +53,7 @@ use daw_ui_core::{
 use crate::audio_source_cache::AudioSourceBuffer;
 
 use crate::app::{
-    AppData, AppEvent, AutomationPointKeyRef, ClipRef, FadeEdgeKind, MoveAutomationClipEntry,
+    AppData, AppEvent, AutomationPointKeyRef, ClipEventRef, ClipRef, FadeEdgeKind, MoveAutomationClipEntry,
     MoveAutomationPointEntry, ResizeAutomationClipEntry,
 };
 
@@ -138,14 +142,6 @@ fn widget_to_model_clip_delta(d: MoveAutomationClipDelta) -> MoveAutomationClipE
     }
 }
 
-fn model_curve_from_widget(c: FadeCurve) -> common::model::FadeCurve {
-    match c {
-        FadeCurve::Linear => common::model::FadeCurve::Linear,
-        FadeCurve::Exponential => common::model::FadeCurve::Exponential,
-        FadeCurve::SCurve => common::model::FadeCurve::SCurve,
-    }
-}
-
 // ============================================================
 // Public types (conversation #005 [Replied] のまま)
 // ============================================================
@@ -157,55 +153,37 @@ pub struct ClipKey {
     pub clip: u32,
 }
 
-/// M14 Phase 63k (#025): audio clip の inline 編集用フィールド (gain_db / fade_in/out)。
-/// `ClipView.audio_edit = Some(...)` のとき widget が dB handle line + fade 角 grip +
-/// envelope を描画 + 当該 grip 領域に drag handler を bind。 MIDI / Vocal clip は `None` で
-/// 既存挙動 (audio 描画 / hit zone 完全に無効、 通常の Move/Resize のみ)。
+/// M14 Phase 63k (#025): audio clip の inline 編集用フィールド (gain_db)。
+/// `ClipView.audio_edit = Some(...)` のとき widget が dB handle line を描画 + 中央帯に
+/// drag handler を bind。 MIDI / Vocal clip は `None`。
 ///
-/// 値は **caller が clamp 済**: gain_db は ±24 dB 想定、 fade_*_beats は 0..len_beats、
-/// fade_*_curve は描画用。 widget 側は drag commit 値も同範囲で clamp する (range 統一は caller
-/// の責務、 widget 側は描画 / hit-test の sanity guard のみ)。
-#[derive(Clone, Copy, Debug)]
+/// r.md #38 で fade は [`ClipView::fades`] へ分離した。 fade は audio 固有ではなく
+/// video / image / text の event も同じ形で持つため (= `common::model::EventFade`)、
+/// audio 専用フィールドと同居させると 4 content 種別ぶんの重複実装を誘発する。
+/// ここに残るのは本当に audio だけの値 (gain_db = dB handle line) のみ。
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipViewAudioEdit {
     pub gain_db: f32,
-    pub fade_in_beats: f64,
-    pub fade_out_beats: f64,
-    pub fade_in_curve: FadeCurve,
-    pub fade_out_curve: FadeCurve,
 }
 
-/// M14 Phase 63k (#025): fade のカーブ形状 (3 種、 Bitwig spec §3.5 と整合)。
-/// vertical drag で順送り (`Linear → Exponential → SCurve → Linear`)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FadeCurve {
-    Linear,
-    Exponential,
-    SCurve,
+/// r.md #38: clip 内 1 event 分の fade 表示情報。 content 種別 (audio / video / image /
+/// text) に依らず同じ型で扱う — 4 種とも `event_start_in_clip_beats` /
+/// `event_length_beats` / `fade_*_beats` / `fade_*_curve` を同じ意味で持ち、 適用側も
+/// 全部 `common::audio_render::fade_curve_at` を通るため。
+///
+/// caller は `ClipContent::event_fades()` をそのまま写して渡す。 `event_index` は
+/// clip 内の event 位置で、 drag の commit 先 (`SetClipFadeBeatsBatch` 等) の宛先になる。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipEventFade {
+    /// clip 内の event index。 fade の編集はこの 1 event だけに効く
+    /// (r.md #38 以前は clip 内全 event に broadcast されていて、 掴んだ event と
+    /// 書き換わる event が一致しなかった)。
+    pub event_index: u32,
+    /// 元データ (clip 内位置 / event 長 / fade 長 / curve)。
+    pub fade: common::model::EventFade,
 }
 
-impl FadeCurve {
-    /// Vertical drag で次の curve に進める (`Linear → Exponential → SCurve → Linear`)。
-    #[must_use]
-    pub fn next(self) -> Self {
-        match self {
-            FadeCurve::Linear => FadeCurve::Exponential,
-            FadeCurve::Exponential => FadeCurve::SCurve,
-            FadeCurve::SCurve => FadeCurve::Linear,
-        }
-    }
-
-    /// ghost label / debug 表示用の英語名 (Bitwig / Reaper と整合)。
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            FadeCurve::Linear => "Linear",
-            FadeCurve::Exponential => "Exponential",
-            FadeCurve::SCurve => "SCurve",
-        }
-    }
-}
-
-/// M14 Phase 63k (#025): fade の対象 edge (`In` = clip 左角、 `Out` = clip 右角)。
+/// M14 Phase 63k (#025): fade の対象 edge (`In` = event 左端、 `Out` = event 右端)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FadeEdge {
     In,
@@ -251,6 +229,15 @@ pub struct ClipView {
     /// `SetClipGainDb` / `SetClipFade` / `SetClipFadeCurve` を発行する。 MIDI / Vocal clip は
     /// `None` で既存挙動 (clip 内 hit zone 全体が Move、 audio 描画なし)。
     pub audio_edit: Option<ClipViewAudioEdit>,
+    /// r.md #38: この clip の各 event の fade。 content 種別 (audio / video / image / text)
+    /// に依らず、 空でなければ widget が event ごとに fade envelope + 掴み handle を描画し、
+    /// handle 領域に drag handler を bind して `SetClipFadeBeatsBatch` /
+    /// `SetClipFadeCurveBatch` を発行する。 MIDI / Automation clip は空 (fade を持たない)。
+    ///
+    /// r.md #38 以前は `audio_edit` (= audio の first event) 経由でしか渡らず、
+    /// (a) 音声クリップにしか線が出ず、 (b) 複数 event を持つクリップでは 1 本目の
+    /// fade しか描かれなかった。
+    pub fades: Vec<ClipEventFade>,
     /// M14 Phase 72 (daw_01 #044): video clip 用 thumbnail。 `Some((handle, width, height))` で
     /// widget が clip rect 内に texture を aspect-fit (黒帯 letterbox) で描画する。 `(width, height)`
     /// は texture の native size (= [`daw_ui_renderer::Renderer::texture_size`] と同じ値)。 widget が
@@ -650,6 +637,8 @@ pub struct ClipGainDelta {
 #[derive(Clone, Copy, Debug)]
 pub struct ClipFadeDelta {
     pub key: ClipKey,
+    /// r.md #38: 編集対象の event (clip 内 index)。 fade はこの 1 event にだけ効く。
+    pub event_index: u32,
     pub edge: FadeEdge,
     pub prev_beats: f64,
     pub next_beats: f64,
@@ -660,6 +649,8 @@ pub struct ClipFadeDelta {
 #[derive(Clone, Copy, Debug)]
 pub struct ClipFadeCurveDelta {
     pub key: ClipKey,
+    /// r.md #38: 編集対象の event (clip 内 index)。
+    pub event_index: u32,
     pub edge: FadeEdge,
     pub next_curve: FadeCurve,
 }
@@ -1582,12 +1573,18 @@ struct AudioDragSession {
     /// 単一 clip の drag (multi-select 一括対応は将来拡張、 仕様 §scope 外)。
     key: ClipKey,
     kind: AudioDragKind,
-    /// drag 開始時の anchor 値 (release 時の commit / inverse 算出 + ghost preview に使う)。
-    anchor: ClipViewAudioEdit,
+    /// drag 開始時の gain 値 (`Gain` の commit / ghost preview に使う)。
+    anchor_gain_db: f32,
+    /// r.md #38: drag 開始時の fade 値と **その event の識別**。 `Gain` では未使用。
+    /// fade の commit 先は clip ではなくこの event 1 つ
+    /// (以前は clip 内全 event に broadcast されていた)。
+    anchor_fade: Option<ClipEventFade>,
     /// drag 開始時の clip rect (release 時にも参照、 view scroll 中も安定 — track 並び替えや
     /// scroll で「rect が動いて」 も anchor の dB 0 ライン位置を変えない)。
     clip_rect_anchor: Rect,
-    /// drag 開始時の clip len_beats (fade length の clamp 上限に使う)。
+    /// drag 開始時の clip len_beats。 **fade 長の clamp には使わない** (それは event 長 =
+    /// `anchor_fade.fade.len_beats`)。 ghost 描画で clip rect から event 矩形を切り出す
+    /// ための px/beat スケール算出にだけ使う。
     clip_len_beats_anchor: f64,
     anchor_mouse: (f32, f32),
     /// continuation で update、 release frame は pointer.pos ≠ anchor_mouse のときのみ update
@@ -1865,8 +1862,8 @@ fn compute_audio_drag_outcome(
         AudioDragKind::Gain => {
             // dy 上が負 → gain 増。 px → dB は `pixels_per_db` (default 0.25 dB/px = 4 px/dB)。
             let delta_db = -dy * style.audio_db_pixels_per_db;
-            let next = (ad.anchor.gain_db + delta_db).clamp(-range, range);
-            if (next - ad.anchor.gain_db).abs() < 1e-3 {
+            let next = (ad.anchor_gain_db + delta_db).clamp(-range, range);
+            if (next - ad.anchor_gain_db).abs() < 1e-3 {
                 None
             } else {
                 Some(AudioDragOutcome::Gain { next_db: next })
@@ -1874,23 +1871,27 @@ fn compute_audio_drag_outcome(
         }
         AudioDragKind::FadeIn | AudioDragKind::FadeOut => {
             let lock = ad.locked_horizontal?;
+            let anchor = ad.anchor_fade?;
             let edge = match ad.kind {
                 AudioDragKind::FadeIn => FadeEdge::In,
                 AudioDragKind::FadeOut => FadeEdge::Out,
                 AudioDragKind::Gain => unreachable!(),
             };
             if lock {
-                // length 編集: fade_in は dx 正で増、 fade_out は dx 負で増 (clip 右側から内側に伸びる)。
+                // length 編集: fade_in は dx 正で増、 fade_out は dx 負で増 (event 右端から内側に伸びる)。
                 let raw_delta_beats = f64::from(dx) * beat_per_px;
                 let signed = match edge {
                     FadeEdge::In => raw_delta_beats,
                     FadeEdge::Out => -raw_delta_beats,
                 };
                 let prev = match edge {
-                    FadeEdge::In => ad.anchor.fade_in_beats,
-                    FadeEdge::Out => ad.anchor.fade_out_beats,
+                    FadeEdge::In => anchor.fade.fade_in_beats,
+                    FadeEdge::Out => anchor.fade.fade_out_beats,
                 };
-                let max_beats = ad.clip_len_beats_anchor.max(0.0);
+                // r.md #38: 上限は **event 長**。 音 (`audio_clip_renderer`) / 映像 / 画像 /
+                // 字幕はどれも event 長基準で fade を掛けるので、 clip 長で clamp すると
+                // clip より短い event で「絵と音が合わない範囲まで伸ばせる」 状態になる。
+                let max_beats = anchor.fade.len_beats.max(0.0);
                 let next = (prev + signed).clamp(0.0, max_beats);
                 if (next - prev).abs() < 1e-6 {
                     None
@@ -1900,8 +1901,8 @@ fn compute_audio_drag_outcome(
             } else {
                 // curve 切替: dy 方向問わず常に次 curve に順送り (1 release で 1 段階)。
                 let prev_curve = match edge {
-                    FadeEdge::In => ad.anchor.fade_in_curve,
-                    FadeEdge::Out => ad.anchor.fade_out_curve,
+                    FadeEdge::In => anchor.fade.fade_in_curve,
+                    FadeEdge::Out => anchor.fade.fade_out_curve,
                 };
                 let next = prev_curve.next();
                 if next == prev_curve {
@@ -2145,25 +2146,37 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
                     let mut a: u64 = 0xDEAD_BEEF_CAFE_BABE;
                     a ^= u64::from(audio.gain_db.to_bits());
                     a = a.wrapping_mul(PRIME);
-                    a ^= audio.fade_in_beats.to_bits();
-                    a = a.wrapping_mul(PRIME);
-                    a ^= audio.fade_out_beats.to_bits();
-                    a = a.wrapping_mul(PRIME);
-                    // FadeCurve は Hash 派生済 (Linear=0, Exp=1, SCurve=2 を使う)
-                    let curve_code = |c: FadeCurve| match c {
-                        FadeCurve::Linear => 0_u64,
-                        FadeCurve::Exponential => 1,
-                        FadeCurve::SCurve => 2,
-                    };
-                    a ^= curve_code(audio.fade_in_curve);
-                    a = a.wrapping_mul(PRIME);
-                    a ^= curve_code(audio.fade_out_curve);
-                    a = a.wrapping_mul(PRIME);
                     a
                 }
             };
             h ^= audio_marker;
             h = h.wrapping_mul(PRIME);
+            // r.md #38: fade は content 種別に依らず `fades` (per-event) に移したので、
+            // hash も per-event で混ぜる。 混ぜ忘れると fade を編集しても cached が
+            // 再構築されず「線が更新されない」 (#011 と同根の cache miss 不在問題)。
+            let curve_code = |c: FadeCurve| match c {
+                FadeCurve::Linear => 0_u64,
+                FadeCurve::Exponential => 1,
+                FadeCurve::SCurve => 2,
+            };
+            h ^= c.fades.len() as u64;
+            h = h.wrapping_mul(PRIME);
+            for f in &c.fades {
+                h ^= u64::from(f.event_index);
+                h = h.wrapping_mul(PRIME);
+                h ^= f.fade.start_in_clip_beats.to_bits();
+                h = h.wrapping_mul(PRIME);
+                h ^= f.fade.len_beats.to_bits();
+                h = h.wrapping_mul(PRIME);
+                h ^= f.fade.fade_in_beats.to_bits();
+                h = h.wrapping_mul(PRIME);
+                h ^= f.fade.fade_out_beats.to_bits();
+                h = h.wrapping_mul(PRIME);
+                h ^= curve_code(f.fade.fade_in_curve);
+                h = h.wrapping_mul(PRIME);
+                h ^= curve_code(f.fade.fade_out_curve);
+                h = h.wrapping_mul(PRIME);
+            }
         }
         // M14 Phase 63n-1 (#028): automation lanes も viewport_key に反映 (caller が collapse / lane
         // 追加 / point 追加 を行ったら cached が再構築される)。 旧設計で lane 関連を hash に入れない

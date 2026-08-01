@@ -2526,6 +2526,16 @@ pub struct PluginInstance {
     /// D2 (r.md #8): `Arc<[u8]>` で保持し undo snapshot 間で共有 (Melodyne 等の
     /// ARA アーカイブは MB 級で undo の編集対象でないため)。
     pub ara_archive: Option<std::sync::Arc<[u8]>>,
+    /// r.md #36: このプラグインのエディタ窓では **キーを一切横取りしない**
+    /// (= REAPER の 「Send all keyboard input to plug-in」)。
+    ///
+    /// 既定 `false` = 自動判定に任せる。 通常はプラグイン側が 「消化しなかった」
+    /// と表明したキーだけをホストが取るので Space での再生 / 停止とプラグインの
+    /// 文字入力が両立する。 ただし Dear ImGui / GLFW / 自前 OpenGL 系のエディタは
+    /// 消化の有無を外に一切出さないため、 そういうプラグインではここを `true` にして
+    /// 手動で全キーを譲る。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub send_all_keys_to_plugin: bool,
 }
 
 impl PluginInstance {
@@ -2540,6 +2550,7 @@ impl PluginInstance {
             aux_output_count: 0,
             ports: crate::port_config::PortConfig::default(),
             ara_archive: None,
+            send_all_keys_to_plugin: false,
         }
     }
 
@@ -2558,6 +2569,7 @@ impl PluginInstance {
             aux_output_count: 0,
             ports,
             ara_archive: None,
+            send_all_keys_to_plugin: false,
         }
     }
 
@@ -2571,7 +2583,7 @@ impl PluginInstance {
 /// `LoadSong` は plugin state / ARA アーカイブの肥大に依らず常に小さく、
 /// 16MB wire 上限に構造的に到達しない。encode / decode の field 順は一致
 /// させること (id → plugin_id → format → aux_inputs → aux_outputs →
-/// aux_output_count → ports)。
+/// aux_output_count → ports → send_all_keys_to_plugin)。
 impl bincode::Encode for PluginInstance {
     fn encode<E: bincode::enc::Encoder>(
         &self,
@@ -2583,7 +2595,8 @@ impl bincode::Encode for PluginInstance {
         self.aux_inputs.encode(encoder)?;
         self.aux_outputs.encode(encoder)?;
         self.aux_output_count.encode(encoder)?;
-        self.ports.encode(encoder)
+        self.ports.encode(encoder)?;
+        self.send_all_keys_to_plugin.encode(encoder)
     }
 }
 
@@ -2601,6 +2614,7 @@ impl<Ctx> bincode::Decode<Ctx> for PluginInstance {
             aux_output_count: bincode::Decode::decode(decoder)?,
             ports: bincode::Decode::decode(decoder)?,
             ara_archive: None,
+            send_all_keys_to_plugin: bincode::Decode::decode(decoder)?,
         })
     }
 }

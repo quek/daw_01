@@ -336,12 +336,9 @@ fn event_alpha(event: &VideoEvent, clip_local_beat: f64) -> f32 {
 /// Single fade-curve evaluator. `progress` is `0..=1`, output is
 /// `0..=1`. Mirrors `common::audio_render::fade_envelope` math.
 fn fade_curve_value(progress: f32, curve: FadeCurve) -> f32 {
-    let x = progress.clamp(0.0, 1.0);
-    match curve {
-        FadeCurve::Linear => x,
-        FadeCurve::Exponential => x * x,
-        FadeCurve::SCurve => 0.5 - 0.5 * (std::f32::consts::PI * x).cos(),
-    }
+    // r.md #38: fade カーブの式は `common::audio_render::fade_curve_at` が唯一の SSoT
+    // (音 / 映像 / 画像 / 字幕 / アレンジ画面の描画が全部ここを通る)。
+    common::audio_render::fade_curve_at(progress, curve)
 }
 
 /// BGRA8 → RGBA8 channel swap with alpha pinned to 0xFF. SSSE3-accelerated when

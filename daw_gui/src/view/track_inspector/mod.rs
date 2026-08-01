@@ -4,6 +4,7 @@
 //! - MIDI FX → Instrument → FX のリスト (各行に GUI / × ボタン、drag&drop で reorder)
 //! - + Instrument / + Effect / + MIDI FX ボタン
 
+mod chain_sections;
 mod modulation_rack;
 
 use daw_ui_core::{
@@ -289,49 +290,30 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     y += 28.0;
 
     // ---- param セクションを縦スクロール領域に収める --------------
-    // title 下〜area 下端を param viewport (上、 scroll) と chain band (下、 pinned)
-    // に分割する。 param の実高さは前フレーム測定値 (`inspector_body_h`、
-    // immediate-mode の lag-by-one) を content_size に使い、 viewport = content と
-    // max_param_h の小さい方。 content <= viewport なら scrollbar 無しで chain が
-    // すぐ下に続く。 dropdown popup は deferred buffer 描画なので clip_rect の外に
-    // 出て切れない (gui_01 popup.rs)。 closure body の param セクションは既存コード
-    // のまま (再インデントしない)。
-    // 下端 pinned band (Parallel Out / Sidechain / 下端ボタン) は scroll viewport の
-    // **外** に描かれるので、 その実高さぶんを viewport から先に引く。 旧実装は固定
-    // 160px を予約するだけだったため、 device 4 個 (sidechain 152px) やパラアウト
-    // 5 行 (168px) でセクションが viewport の下端に食い込み、 スクロール中身の上に
-    // 重なって描かれていた。 セクション高の SSoT をここに 1 本化する。
-    const CHAIN_MIN_H: f32 = 160.0;
-    const BTNS_H: f32 = 26.0;
-    const PO_ROW_CAP: usize = 5;
-    let sc_entries = app.sidechain_entries();
-    let sc_section_h = if sc_entries.is_empty() {
-        0.0
-    } else {
-        18.0 + 4.0 + sc_entries.len().min(4) as f32 * (SC_ROW_H + SC_ROW_GAP) + 6.0
-    };
-    let po_entries = app.parallel_output_entries();
-    let po_total_rows: usize = po_entries
-        .iter()
-        .map(|e| 1 + if e.exploded { e.aux_output_count as usize } else { 0 })
-        .sum();
-    let po_section_h = if po_entries.is_empty() {
-        0.0
-    } else {
-        18.0 + 4.0 + po_total_rows.min(PO_ROW_CAP) as f32 * (24.0 + 4.0) + 6.0
-    };
-    let chain_band_h = (BTNS_H + pad + sc_section_h + po_section_h).max(CHAIN_MIN_H);
+    // r.md #37: title 下〜area 下端の **全部** が scroll viewport。 inspector の縦位置は
+    // 「1 本の y カーソル」 だけが決める (= 縦位置の SSoT が 1 つ)。
+    //
+    // 旧実装は viewport の下に 「chain band」 (Parallel Out / Sidechain / 「+ Plugin」) を
+    // pinned で置き、 `btns_y = area.y + area.h - btns_h - pad` から **上へ逆算** して
+    // 積んでいた。 その帰結が 3 つとも実害だった:
+    //   (a) band 予約高の下限 `CHAIN_MIN_H = 160` が実コンテンツ (device 0 個なら
+    //       ボタン 26 + pad 12 = 38px) を上回るので、 viewport 下端とボタンの間に
+    //       誰も描かない空白が最大 122px 残る (= ユーザーの言う 「下寄せ」)。
+    //   (b) 逆算配置は描画前に各セクションの高さを知る必要があるので、 高さ式が
+    //       描画ループと二重管理になる。
+    //   (c) 予約高に収まらない行を無言で捨てる cap が要る。 パラアウト 5 行 /
+    //       sidechain 4 行を超えた分は **描画も操作もできなかった**。
+    // 逆算を全廃すると (a)(b)(c) が同時に消える。 3 セクションは
+    // `chain_sections::draw_*` として scroll フロー内へ移した。
+    //
+    // param の実高さは前フレーム測定値 (`inspector_body_h`、 immediate-mode の
+    // lag-by-one) を content_size に使う。 content <= viewport なら scrollbar は出ない。
+    // dropdown popup は deferred buffer 描画なので clip_rect の外に出て切れない
+    // (gui_01 popup.rs)。 closure body の param セクションは既存コードのまま
+    // (再インデントしない)。
     let body_top = y;
-    let max_param_h = (area.y + area.h - body_top - chain_band_h).max(0.0);
+    let param_h = (area.y + area.h - body_top).max(0.0);
     let content_h = app.ui_ephemeral.inspector_body_h.max(1.0);
-    // param viewport の高さは **常に最大** に固定する。 旧実装は
-    // `content_h.min(max_param_h)` で content に追従させていたため、 device の
-    // 「Par」パラメータパネルを開くと content_h が増えて viewport が伸び、
-    // chain band (= Par ボタン) が下にずれて「押した瞬間ボタンが動く / 表示して
-    // すぐ非表示」 という操作不能感を生んでいた。 高さを固定すると boundary_y が
-    // パネル開閉で不変になり、 chain band が一切動かない (= Par トグルが安定)。
-    // content < viewport の余白は scroll 領域内の空きになるだけで無害。
-    let param_h = max_param_h;
     let param_vp = Rect { x: area.x, y: body_top, w: area.w, h: param_h };
     let measured_body_h = std::cell::Cell::new(0.0_f32);
     ui.scroll_area("inspector_body", param_vp, (param_vp.w, content_h), |ui, scroll_off| {
@@ -545,7 +527,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let fade_len_x = area.x + pad + label_w;
         let fade_curve_x = fade_len_x + fade_len_w + 4.0;
 
-        let fade_max = summary.clip_length_beats.max(0.0);
+        let fade_max = summary.fade_max_beats.max(0.0);
 
         // Fade In length + curve
         ui.label_at(
@@ -972,7 +954,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let fade_len_x = area.x + pad + label_w;
         let fade_curve_x = fade_len_x + fade_len_w + 4.0;
 
-        let fade_max = summary.clip_length_beats.max(0.0);
+        let fade_max = summary.fade_max_beats.max(0.0);
 
         // Fade In
         ui.label_at(
@@ -1715,7 +1697,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // `scrub_field` で drag / text 編集を undo 1 step に bracket する。
         // automate 「A」 トグルは従来どおり共存。 値源は summary の first event
         // snapshot、 on_change は `SetClipTextNumField` (Rotation は deg→rad)。
-        let text_fade_max = summary.clip_length_beats.max(0.0);
+        let text_fade_max = summary.fade_max_beats.max(0.0);
         let emit_num_row = |ui: &mut Ui<'_, AppData>,
                             app: &AppData,
                             label: &str,
@@ -2454,6 +2436,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // チェーン (rows + 開いた展開) ぶん viewport y を進める。
         y = chain_rect.y + chain_rect.h + 8.0;
     }
+
+    // r.md #37: チェーン直下に 「+ Plugin」 → Parallel Out → Sidechain を top-down で
+    // 並べる (旧: inspector 下端に pinned)。 「このチェーンの末尾に足す」 「このチェーンの
+    // デバイスの配線」 が読み順で自明になる。 各 fn は modulation_rack と同じ
+    // `(app, ui, area, pad, y) -> f32` contract。
+    y = chain_sections::draw_add_plugin_button(app, ui, area, pad, y);
+    y = chain_sections::draw_parallel_out_section(app, ui, area, pad, y);
+    y = chain_sections::draw_sidechain_section(app, ui, area, pad, y);
+    y = chain_sections::draw_editor_key_section(app, ui, area, pad, y);
+
     let cursor_idx = app.cursor_track_index();
 
     // ---- 口パク mapping (口形状 → 画像) -------------------------------
@@ -2570,257 +2562,4 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.ui_ephemeral.inspector_body_h = measured;
         }));
     }
-    // chain band (下端 pinned): sidechain / modulation / 下端ボタン。 chain list 本体と
-    // 各デバイスの param パネルは viewport 内のアコーディオン (上の
-    // reorderable_list_expandable) に移動した。
-    // btns_h / sc_section_h / po_section_h は `chain_band_h` の算出 (viewport 分割前)
-    // で既に確定済み — ここで再計算しない (SSoT)。
-    let btns_h = BTNS_H;
-    let btns_y = area.y + area.h - btns_h - pad;
-
-    // ---- パラアウト (Parallel Out) section (docs/plan_paraout.md) ----------
-    // Above the sidechain section. Per multi-out plugin: an "explode" button
-    // (auto-create + group child tracks) and, once exploded, a per-port
-    // destination dropdown. Capped like sidechain; excess rows overflow (the
-    // inspector has no internal scroll yet).
-    if !po_entries.is_empty() {
-        let row_h = 24.0;
-        let row_gap = 4.0;
-        let po_header_y = btns_y - sc_section_h - po_section_h;
-        ui.label_at(
-            "inspector_po_label",
-            "Parallel Out",
-            area.x + pad,
-            po_header_y,
-            12.0,
-            TEXT,
-        );
-        let dropdown_w = 140.0;
-        let name_x = area.x + pad;
-        let right_x = area.x + area.w - pad;
-        let choices = app.sidechain_source_choices();
-        let labels: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
-        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let mut row_y = po_header_y + 18.0 + 4.0;
-        let mut rows_drawn = 0usize;
-        'po_rows: for (ei, entry) in po_entries.iter().enumerate() {
-            if rows_drawn >= PO_ROW_CAP {
-                break;
-            }
-            let track_id = entry.track_id;
-            let device_index = entry.device_index;
-            // Entry row: plugin name (left) + explode button (right).
-            let btn_w = 64.0;
-            let btn_x = right_x - btn_w;
-            // 手書きの「1 文字 7px」 見積りは実 advance (半角 5.8 / 全角 11.6) と
-            // 一致せず、 ASCII 名では過剰に切り CJK 名では溢れていた。 rect 幅で
-            // 切る共通 helper に寄せる。
-            ui.label_at_clipped(
-                ("inspector_po_name", ei),
-                &entry.plugin_name,
-                Rect {
-                    x: name_x,
-                    y: row_y + 6.0,
-                    w: (btn_x - 6.0 - name_x).max(1.0),
-                    h: 11.0 * 1.2,
-                },
-                11.0,
-                TEXT,
-            );
-            ui.button_at(
-                ("inspector_po_explode", ei),
-                "展開",
-                Rect {
-                    x: btn_x,
-                    y: row_y,
-                    w: btn_w,
-                    h: row_h,
-                },
-                move || {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::ExplodeParallelOut {
-                            track_id,
-                            device_index,
-                        });
-                    })
-                },
-            );
-            row_y += row_h + row_gap;
-            rows_drawn += 1;
-            // Port rows (only once exploded): "Out N" + destination dropdown.
-            if entry.exploded {
-                for port in 0..entry.aux_output_count as usize {
-                    if rows_drawn >= PO_ROW_CAP {
-                        break 'po_rows;
-                    }
-                    let key = ei * 64 + port;
-                    ui.label_at(
-                        ("inspector_po_outlabel", key),
-                        &format!("Out {}", port + 1),
-                        name_x,
-                        row_y + 6.0,
-                        11.0,
-                        TEXT,
-                    );
-                    let dropdown_x = right_x - dropdown_w;
-                    let selected_idx = match entry.routes.get(port).and_then(|o| *o) {
-                        None => 0,
-                        Some(dest) => choices
-                            .iter()
-                            .position(|c| c.track_id == Some(dest))
-                            .unwrap_or(0),
-                    };
-                    if let Some(picked) = ui.dropdown(
-                        ("inspector_po_dropdown", key),
-                        Rect {
-                            x: dropdown_x,
-                            y: row_y,
-                            w: dropdown_w,
-                            h: row_h,
-                        },
-                        &label_refs,
-                        selected_idx,
-                    ) && let Some(choice) = choices.get(picked)
-                    {
-                        let dest = choice.track_id;
-                        let p = port as u8;
-                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                            app.handle_event(AppEvent::SetParallelOutputRoute {
-                                track_id,
-                                device_index,
-                                port: p,
-                                dest,
-                            });
-                        }));
-                    }
-                    row_y += row_h + row_gap;
-                    rows_drawn += 1;
-                }
-            }
-        }
-    }
-
-    // ---- Sidechain section ------------------------------------------
-    // PR4.5 sidechain UI: per-plugin source picker. ECS-flat dropdown per
-    // chain row so the user can wire any track's output into the plugin's
-    // first aux input port (aux_inputs[0]). Self-track is filtered
-    // out (would create a feedback cycle which `compile_schedule` rejects).
-    // Only the first aux port is exposed; multi-port plugins (rare) still
-    // need editing via .daw file or follow-up UI.
-    if !sc_entries.is_empty() {
-        let sc_header_y = btns_y - sc_section_h;
-        ui.label_at(
-            "inspector_sc_label",
-            "Sidechain",
-            area.x + pad,
-            sc_header_y,
-            12.0,
-            TEXT,
-        );
-        let mut row_y = sc_header_y + 18.0 + 4.0;
-        let visible_rows = sc_entries.len().min(4);
-        let choices = app.sidechain_source_choices();
-        let labels: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
-        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let name_x = area.x + pad;
-        let row_w = area.w - pad * 2.0;
-        // B8 (r.md #8): tap point (Pre-FX/Post-FX/Post-Fdr) selector を source
-        // dropdown の左に置く。 SetAuxInputTapPoint setter は既存だが従来 UI 未配線
-        // (= PostFader 固定だった)。
-        const SC_TAP_POINTS: [common::model::TapPoint; 3] = [
-            common::model::TapPoint::PreFx,
-            common::model::TapPoint::PostFx,
-            common::model::TapPoint::PostFader,
-        ];
-        let sc_tap_labels = ["Pre-FX", "Post-FX", "Post-Fdr"];
-        // 1 行に [名前 | tap | source] を詰めると、 280px の inspector では名前に
-        // 46px しか残らず "VOICEVOX (builtin)" が "VOIC…" になり、 tap も既定の
-        // "Post-Fdr" (59px) が 40px の文字領域に入らず "Post…" になって Post-FX と
-        // 区別できなかった。 mixer の send slot と同じ 2 段構成にして
-        // 「名前は行いっぱい / 操作は下段」 にする。
-        let tap_w = SC_TAP_W;
-        let tap_x = name_x;
-        let dropdown_x = tap_x + tap_w + 6.0;
-        let dropdown_w = (row_w - tap_w - 6.0).max(40.0);
-        for (i, entry) in sc_entries.iter().take(visible_rows).enumerate() {
-            ui.label_at_clipped(
-                ("inspector_sc_name", i),
-                &entry.plugin_name,
-                Rect { x: name_x, y: row_y, w: row_w, h: SC_NAME_H },
-                11.0,
-                TEXT,
-            );
-            let ctl_y = row_y + SC_NAME_H;
-            let dropdown_rect = Rect {
-                x: dropdown_x,
-                y: ctl_y,
-                w: dropdown_w,
-                h: SC_CTL_H,
-            };
-            let selected_idx = match entry.current_source {
-                None => 0,
-                Some(src_id) => choices
-                    .iter()
-                    .position(|c| c.track_id == Some(src_id))
-                    .unwrap_or(0),
-            };
-            if let Some(picked) = ui.dropdown(
-                ("inspector_sc_dropdown", i),
-                dropdown_rect,
-                &label_refs,
-                selected_idx,
-            ) && let Some(choice) = choices.get(picked)
-            {
-                let track_id = entry.track_id;
-                let device_index = entry.device_index;
-                let new_source = choice.track_id;
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetSidechainSource {
-                        track_id,
-                        device_index,
-                        port: 0,
-                        source: new_source,
-                    });
-                }));
-            }
-            // B8 (r.md #8): tap point selector (source の左)。 port 0 のみ
-            // (multi-port は aux_input_count IPC が要る follow-up、 稀なので保留)。
-            let tap_sel = SC_TAP_POINTS
-                .iter()
-                .position(|t| *t == entry.current_tap_point)
-                .unwrap_or(2);
-            if let Some(picked) = ui.dropdown(
-                ("inspector_sc_tap", i),
-                Rect { x: tap_x, y: ctl_y, w: tap_w, h: SC_CTL_H },
-                &sc_tap_labels,
-                tap_sel,
-            ) && let Some(&tp) = SC_TAP_POINTS.get(picked)
-            {
-                let track_id = entry.track_id;
-                let device_index = entry.device_index;
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetAuxInputTapPoint {
-                        track_id,
-                        device_index,
-                        port: 0,
-                        tap_point: tp,
-                    });
-                }));
-            }
-            row_y += SC_ROW_H + SC_ROW_GAP;
-        }
-    }
-
-    // 下端: 「+ Plugin」 1 ボタン (統合ピッカー)。 plan_unified_plugin_picker.md:
-    // 旧 +Inst / +FX / +MIDI の 3 ボタンを 1 つに統合し、 選んだプラグインの種別で
-    // 行き先 (Instrument / FX / MIDI FX) を自動振り分けする。 master bus は audio fx
-    // のみなのでリスト側 (refresh_picker_visible) が FX のみに絞る。 ラベルだけ master
-    // は「+ FX」で期待値を示す。
-    let is_master = app.cursor_track_id() == Some(common::model::MASTER_TRACK_ID);
-    ui.button_at(
-        "inspector_add_plugin",
-        if is_master { "+ FX" } else { "+ Plugin" },
-        Rect { x: area.x + pad, y: btns_y, w: area.w - pad * 2.0, h: btns_h },
-        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::OpenPluginPicker)),
-    );
 }

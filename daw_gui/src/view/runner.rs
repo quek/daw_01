@@ -817,6 +817,21 @@ impl ApplicationHandler<AppEvent> for Runner {
             state.window.request_redraw();
             return;
         }
+        // r.md #36: プラグインエディタ窓で押され、 **プラグインが消化しなかった** キー。
+        // chord → shortcut 名の解決は `SHORTCUTS` (唯一の宣言) から引き、 解決済みの名前を
+        // shortcut レイヤへ注入する。 これで着地点は `root.rs` の `take_shortcut` =
+        // メインウィンドウで押した場合と完全に同一経路になり、 AppEvent の変換表も
+        // 第 2 の dispatch も増えない。
+        if let AppEvent::Plugin(common::protocol::PluginEvent::EditorKey { chord, .. }) = event {
+            if let Some((_, name)) = crate::view::shortcuts::forwarded_editor_chords()
+                .into_iter()
+                .find(|(c, _)| *c == chord)
+            {
+                state.ui.inject_shortcut(name);
+                state.window.request_redraw();
+            }
+            return;
+        }
         state.app.handle_event(event);
         state.window.request_redraw();
         // 背景スレッド (IPC bridge) 経由の event で、 plugin state 取得待ちの

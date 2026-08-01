@@ -155,6 +155,7 @@ impl AppData {
                     existing_aux_out,
                     existing_ports,
                     existing_ara,
+                    existing_send_all_keys,
                 ) = chain
                     .get(i)
                     .map(|p| {
@@ -165,6 +166,7 @@ impl AppData {
                             p.aux_outputs.clone(),
                             p.ports,
                             p.ara_archive.clone(),
+                            p.send_all_keys_to_plugin,
                         )
                     })
                     .unwrap_or((
@@ -174,6 +176,7 @@ impl AppData {
                         Vec::new(),
                         Default::default(),
                         None,
+                        false,
                     ));
                 let inst = common::model::PluginInstance {
                     // v29: 安定 device id を必ず引き継ぐ (with_ports は sentinel 0 で
@@ -190,6 +193,11 @@ impl AppData {
                     // の度に Melodyne 等の編集が失われ、 かつ下の no-op 判定が誤って
                     // 「変化」 に倒れて開くたび dirty 化する。
                     ara_archive: existing_ara,
+                    // r.md #36: 「キーを全部プラグインに送る」 も既存値を温存する。
+                    // `..with_ports` は false に落とすので、 明示引き継ぎしないと
+                    // 再ロードの度にユーザー設定が消え、 かつ下の no-op 判定が誤って
+                    // 「変化」 に倒れて開くだけで dirty 化する (r.md #9)。
+                    send_all_keys_to_plugin: existing_send_all_keys,
                     ..common::model::PluginInstance::with_ports(
                         id,
                         format,
@@ -530,6 +538,14 @@ impl AppData {
                 device_id,
                 title: format!("Plugin — {label}"),
             });
+            // r.md #36: 「キーを全部プラグインに送る」 の現在値を open のたびに同期する
+            // (plugin-host は再起動で状態を失う / device_id は open まで意味を持たない)。
+            let send_all = device_at(self.song_doc.song(), track_id, index)
+                .is_some_and(|p| p.send_all_keys_to_plugin);
+            self.send_plugin(PluginCommand::SetEditorSendAllKeys {
+                device_id,
+                enabled: send_all,
+            });
         }
         #[cfg(not(windows))]
         {
@@ -704,6 +720,35 @@ impl AppData {
     /// shorter vectors are extended with `None` placeholders so port `port`
     /// becomes addressable. After mutation we re-`flush_song_sync`
     /// so `compile_schedule` regenerates the `SidechainTap` ops.
+    /// r.md #36: この device のエディタ窓で 「キーを全部プラグインに送る」 かを設定する。
+    /// project に保存し (undo 対象)、 plugin-host にも即時反映する。
+    pub(crate) fn set_plugin_send_all_keys(
+        &mut self,
+        track_id: u32,
+        device_index: u32,
+        enabled: bool,
+    ) {
+        self.edit_song_checked(|song| {
+            let inst = if track_id == common::model::MASTER_TRACK_ID {
+                song.master_fx_chain.get_mut(device_index as usize)
+            } else {
+                let Some(track) = song.track_by_id_mut(track_id) else {
+                    return false;
+                };
+                track.devices.get_mut(device_index as usize)
+            };
+            let Some(inst) = inst else { return false };
+            if inst.send_all_keys_to_plugin == enabled {
+                return false;
+            }
+            inst.send_all_keys_to_plugin = enabled;
+            true
+        });
+        if let Some(device_id) = device_id_at(self.song_doc.song(), track_id, device_index) {
+            self.send_plugin(PluginCommand::SetEditorSendAllKeys { device_id, enabled });
+        }
+    }
+
     pub(crate) fn set_sidechain_source(
         &mut self,
         track_id: u32,

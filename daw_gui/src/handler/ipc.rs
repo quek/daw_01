@@ -148,7 +148,15 @@ impl AppData {
     /// `plugin_event_to_app` + 対応 handle_event arm)。
     pub(crate) fn dispatch_plugin_event(&mut self, ev: PluginEvent) {
         match ev {
+            // Hello は `bootstrap::handshake_plugin` が pipe から直接読んで消費するので、
+            // ここには到達しない (網羅性を満たすための空 arm。 `AudioEvent::Hello` と同じ)。
             PluginEvent::Hello { .. } => {}
+            // r.md #36: プラグインが消化しなかった転送対象キー。 winit 経路では
+            // `view::runner::Runner::user_event` が **AppData に渡す前に** 横取りして
+            // `UiHost::inject_shortcut` に流す (= メインウィンドウで押したのと同じ
+            // `take_shortcut` 経路に合流し、 ここに action の arm が増えない)。
+            // headless script mode には UiHost が無いので何もしない。
+            PluginEvent::EditorKey { .. } => {}
             PluginEvent::ChildDisconnected => {
                 self.handle_child_disconnected(ChildKind::PluginHost);
             }

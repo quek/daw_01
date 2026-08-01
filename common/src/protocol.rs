@@ -26,6 +26,21 @@ use bincode::{Decode, Encode};
 
 use crate::plugin_format::PluginFormat;
 
+/// r.md #36: プラグインエディタ窓 ↔ daw_gui 間で運ぶキーの組み合わせ。
+///
+/// **Win32 の仮想キーコード (`VK_*`) + 修飾フラグ** という OS 中立でない表現をあえて
+/// 選んでいる。plugin-host が見るのは Win32 メッセージそのものであり、ここを抽象化すると
+/// plugin-host 側に「キー名 → VK」 の対応表 (= 意味論の複製) が生えるため。
+/// 対応表は daw_gui の `SHORTCUTS` 側 1 箇所に閉じ込め、 plugin-host は数値比較だけを行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct KeyChord {
+    /// Win32 virtual-key code (`VK_SPACE` = 0x20 等)。
+    pub vk: u16,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
 /// wire を渡る型を定義する source file 群の content hash (FNV-1a 64bit)。
 /// `common/build.rs` がコンパイル時に計算する。Hello handshake で照合し、
 /// 「ビルド世代の混在」(= bincode enum discriminant のズレによる silent
@@ -416,6 +431,17 @@ pub enum PluginCommand {
     /// `title` is the window caption daw_gui composed.
     OpenSlotGuiEmbedded { device_id: u64, title: String },
     CloseSlotGui { device_id: u64 },
+    /// r.md #36: プラグインエディタ窓で押されたとき daw_gui へ転送してよいキーの一覧。
+    ///
+    /// **キー割り当ての意味論は daw_gui の `SHORTCUTS` テーブルだけが持つ**。
+    /// plugin-host は受け取った chord 列と Win32 の仮想キー / 修飾を突き合わせるだけで、
+    /// 「Space = 再生」 のような policy を一切知らない (= SSoT を割らない)。
+    /// handshake 後に 1 度送り、 以後 SHORTCUTS が実行時に変わったら再送する。
+    SetEditorForwardedKeys { chords: Vec<KeyChord> },
+    /// r.md #36: この device のエディタ窓で **キーを一切横取りしない** (= REAPER の
+    /// 「Send all keyboard input to plug-in」)。 Dear ImGui / 自前 OpenGL 系のように
+    /// 「今テキスト入力中か」 を外から知る手段が原理的に無い GUI 用の逃げ道。
+    SetEditorSendAllKeys { device_id: u64, enabled: bool },
     /// Worker pool の plugin_host 側 open (audio 側と対で送られる)。
     OpenWorkerPool {
         n_workers: u32,
@@ -461,6 +487,16 @@ pub enum PluginEvent {
     },
     /// IPC pipe 切断の synthetic event (`AudioEvent::ChildDisconnected` 同様)。
     ChildDisconnected,
+    /// r.md #36: プラグインエディタ窓でキーが押され、 **プラグインがそれを消化しなかった**
+    /// ので daw_gui へ返す。 daw_gui は自分の `SHORTCUTS` で chord → shortcut 名を解決し、
+    /// メインウィンドウで押されたのと同じ経路 (`take_shortcut`) に合流させる。
+    ///
+    /// 「消化しなかった」 の判定根拠 (`daw_plugin_host::editor_keys` 参照):
+    /// - JUCE / iPlug2 は未消化キーを親 / ルート HWND (= 我々のエディタ窓) へ転送する規約を
+    ///   持つので、 **こちらの WNDPROC に届いた時点で未消化が確定**する。
+    /// - VSTGUI 等はフレーム窓が `WM_GETDLGCODE` に応答しない一方、 文字編集中は本物の
+    ///   Win32 EDIT を生成するので、 フォーカス窓への `WM_GETDLGCODE` 問い合わせで判別できる。
+    EditorKey { device_id: u64, chord: KeyChord },
     /// Reply to `PluginCommand::ReinitAllPlugins`.
     PluginsReinitDone,
     /// builtin VOICEVOX の歌唱合成が `PrepareVocalSynth` で要求した世代まで

@@ -19,7 +19,7 @@ use super::{
     ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
     ArrangementCurveKind, ArrangementMasterRow, ArrangementStyle, ArrangementTrack, ArrangementView,
     AutomationClipKey, AutomationPointKey, ClipView, ClipViewAudioEdit, ClipKey,
-    FadeCurve as WidgetFadeCurve, SectionView, TrackKind,
+    ClipEventFade, SectionView, TrackKind,
 };
 
 /// Arranger レーン上に確保する ruler の高さ (px)。draw() の RULER_H と一致。
@@ -182,13 +182,19 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                         audio_edit: content
                             .and_then(|ct| ct.audio_events())
                             .and_then(|events| events.first())
-                            .map(|ev| ClipViewAudioEdit {
-                                gain_db: ev.gain_db,
-                                fade_in_beats: ev.fade_in_beats,
-                                fade_out_beats: ev.fade_out_beats,
-                                fade_in_curve: widget_curve_from_model(ev.fade_in_curve),
-                                fade_out_curve: widget_curve_from_model(ev.fade_out_curve),
-                            }),
+                            .map(|ev| ClipViewAudioEdit { gain_db: ev.gain_db }),
+                        // r.md #38: fade は content 種別に依らず全 event ぶん渡す
+                        // (音声だけ / first event だけ だった旧実装を置換)。
+                        fades: content.map_or_else(Vec::new, |ct| {
+                            ct.event_fades()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, fade)| ClipEventFade {
+                                    event_index: u32::try_from(i).unwrap_or(u32::MAX),
+                                    fade,
+                                })
+                                .collect()
+                        }),
                         thumbnail: {
                             content
                                 .and_then(|ct| ct.video_events())
@@ -711,11 +717,4 @@ fn model_curve_to_widget(c: common::model::AutomationCurve) -> ArrangementCurveK
     }
 }
 
-/// gui_01 widget の `FadeCurve` (#025) ← daw_01 model `FadeCurve` (3 種 1:1)。
-fn widget_curve_from_model(c: common::model::FadeCurve) -> WidgetFadeCurve {
-    match c {
-        common::model::FadeCurve::Linear => WidgetFadeCurve::Linear,
-        common::model::FadeCurve::Exponential => WidgetFadeCurve::Exponential,
-        common::model::FadeCurve::SCurve => WidgetFadeCurve::SCurve,
-    }
-}
+

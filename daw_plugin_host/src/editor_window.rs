@@ -34,10 +34,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     GWLP_USERDATA, GetWindowLongPtrW, HCURSOR, HICON, HMENU, RegisterClassExW, SWP_NOMOVE,
     SWP_NOZORDER, SW_HIDE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WM_CLOSE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    PostMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_KEYDOWN,
+    WM_KEYUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::core::PCWSTR;
+
+/// r.md #36: コンテナ窓に返ってきた未消化キーを plugin-main ポンプへ渡すための
+/// 内部メッセージ。 `wParam` / `lParam` は元の `WM_KEYDOWN` / `WM_KEYUP` のまま。
+///
+/// WNDPROC は `extern "system" fn` で `PluginHost` の状態に触れないので、 判定は
+/// ポンプ側で行う。 `WM_COMMAND_WAKE` (= `WM_APP + 1`) と衝突しない値を使う。
+///
+/// **押下と解放で別 id にする**。 1 つにまとめると解放を押下と誤認して 2 回
+/// 発火してしまう (`wParam` は仮想キーで埋まっており元 message を載せられない)。
+pub const WM_EDITOR_KEY_RELAY_DOWN: u32 = WM_APP + 2;
+/// 上の key-up 版。
+pub const WM_EDITOR_KEY_RELAY_UP: u32 = WM_APP + 3;
 
 /// C1 (r.md #8): HWND の DPI scale (= `GetDpiForWindow` / 96)。 取得失敗 (dpi 0) や
 /// 非 HiDPI は 1.0。 plugin の `gui.set_scale` / VST3 `setContentScaleFactor` に渡し、
@@ -272,6 +285,34 @@ unsafe extern "system" fn editor_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // r.md #36 経路 B: JUCE / iPlug2 は **自分が消化しなかった** キーだけを
+    // 親 / ルート HWND (= このコンテナ窓) へ返す規約を持つ。 よってここに
+    // キーが届いた時点で 「プラグインが要らないと言った」 が確定する。
+    //
+    // JUCE は `PostMessage(GetParent(hwnd), ...)`、 iPlug2 は
+    // `SendMessageW(GetAncestor(hWnd, GA_ROOT), ...)`。 前者はキューを経由して
+    // ポンプ → `DispatchMessageW` でここに来るが、 後者は WNDPROC 直接呼び出しで
+    // ポンプを通らない。 両者を 1 本にまとめるため、 ここでは判定せず
+    // `WM_EDITOR_KEY_RELAY` として **自分のキューへ積み直す** だけにする。
+    // 実際の転送判定は plugin-main ポンプ側 (`PluginHost` の状態が要る) が行う。
+    // **`WM_SYSKEY*` (Alt 付き / F10) は横取りしない**。 それらは `DefWindowProc` が
+    // Alt+F4 → `WM_SYSCOMMAND(SC_CLOSE)`、 Alt+Space → system menu、 F10 → メニュー活性
+    // という既定動作を生成する起点で、 飲み込むとこの窓が Alt+F4 で閉じられなくなる。
+    // 現状の転送対象 (Space / Ctrl+S) は Alt 修飾を持たないので、 素の
+    // `WM_KEYDOWN` / `WM_KEYUP` だけ見れば足りる。
+    if msg == WM_KEYDOWN || msg == WM_KEYUP {
+        let relay = if msg == WM_KEYDOWN {
+            WM_EDITOR_KEY_RELAY_DOWN
+        } else {
+            WM_EDITOR_KEY_RELAY_UP
+        };
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), relay, wparam, LPARAM(lparam.0));
+        }
+        // プラグインは既に 「要らない」 と言っている。 素のキーに `DefWindowProc` の
+        // 既定動作は無いので、 ここで止めて二重処理を避ける。
+        return LRESULT(0);
+    }
     if msg == WM_CLOSE {
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);

@@ -313,9 +313,15 @@ impl ChildSupervisor {
         let mut server = server;
         let session_msg = PluginCommand::Session(session);
         let open_pool = pool.to_plugin_cmd();
+        // r.md #36: 「エディタ窓で拾ってよいキー」 も Session / worker pool と同じ
+        // **子起動ごとに必ず送る初期状態**。 respawn で送り忘れると plugin-host の
+        // forwarded_keys が空のままになり、 プラグインエディタ上の Space が黙って
+        // 効かなくなる (キーは素通しされるので症状が「何も起きない」= 気づけない)。
+        let forwarded_keys = forwarded_editor_keys_cmd();
         self.rt_handle.block_on(async {
             write_msg(&mut server, &session_msg).await?;
             write_msg(&mut server, &open_pool).await?;
+            write_msg(&mut server, &forwarded_keys).await?;
             anyhow::Ok(())
         })?;
 
@@ -456,11 +462,14 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
 
     let open_pool_audio = pool_state.spec.to_audio_cmd();
     let open_pool_plugin = pool_state.spec.to_plugin_cmd();
+    let forwarded_keys = forwarded_editor_keys_cmd();
     rt.block_on(async {
         write_msg(&mut audio_server, &AudioCommand::Session(session.clone())).await?;
         write_msg(&mut plugin_server, &PluginCommand::Session(session.clone())).await?;
         write_msg(&mut audio_server, &open_pool_audio).await?;
         write_msg(&mut plugin_server, &open_pool_plugin).await?;
+        // r.md #36: 転送対象キー (SHORTCUTS 由来) も起動時の初期状態として送る。
+        write_msg(&mut plugin_server, &forwarded_keys).await?;
         anyhow::Ok(())
     })
     .context("failed to send audio session / worker pool")?;
@@ -825,4 +834,18 @@ fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
         }
     }
     None
+}
+
+/// r.md #36: プラグインエディタ窓で拾ってよいキー (= `SHORTCUTS` の
+/// `forward_from_external_window` が立った行) を plugin-host へ通知する command。
+///
+/// 「どのキーが何をするか」 の意味論は daw_gui 側の `SHORTCUTS` だけが持ち、
+/// plugin-host には Win32 chord (数値) しか渡らない。 **子プロセス起動ごとに必ず送る
+/// 初期状態** なので、 初回 bootstrap と respawn の両方から呼ぶ。
+fn forwarded_editor_keys_cmd() -> PluginCommand {
+    let chords: Vec<common::protocol::KeyChord> = crate::view::shortcuts::forwarded_editor_chords()
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+    PluginCommand::SetEditorForwardedKeys { chords }
 }

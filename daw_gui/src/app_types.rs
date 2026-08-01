@@ -193,6 +193,8 @@ pub struct ChainEntry {
     /// host から param 一覧が届いていて 1 つ以上 param があるか (= 汎用 param
     /// パネルに出す中身がある)。
     pub has_params: bool,
+    /// r.md #36: 「キーを全部プラグインに送る」 (= ホストがキーを一切横取りしない)。
+    pub send_all_keys: bool,
 }
 
 impl ChainEntry {
@@ -236,8 +238,11 @@ pub struct InspectorAudioEventSummary {
     pub pitch_semitones: f32,
     pub fade_in_beats: f64,
     pub fade_out_beats: f64,
-    /// fade scrub の range 上限 (= clip 長 beats)。
-    pub clip_length_beats: f64,
+    /// r.md #38: fade scrub の range 上限 = **この event の長さ** (拍)。
+    /// fade は clip 長ではなく event 長に対して掛かる (音 / 映像 / 画像 / 字幕の
+    /// 適用側が全部 event 長基準)。 handler 側の clamp (`e.event_length_beats`) と
+    /// ここが食い違うと、 入力した値が clamp で切られて表示が巻き戻る。
+    pub fade_max_beats: f64,
 }
 
 /// Image event 単位 field の inspector 表示用 read snapshot
@@ -274,8 +279,11 @@ pub struct InspectorImageEventSummary {
     pub rotation_radians: f32,
     pub fade_in_beats: f64,
     pub fade_out_beats: f64,
-    /// fade scrub の range 上限 (= clip 長 beats)。
-    pub clip_length_beats: f64,
+    /// r.md #38: fade scrub の range 上限 = **この event の長さ** (拍)。
+    /// fade は clip 長ではなく event 長に対して掛かる (音 / 映像 / 画像 / 字幕の
+    /// 適用側が全部 event 長基準)。 handler 側の clamp (`e.event_length_beats`) と
+    /// ここが食い違うと、 入力した値が clamp で切られて表示が巻き戻る。
+    pub fade_max_beats: f64,
 }
 
 /// docs/plan_text_overlay.md §4 P5: text inspector の編集対象 numeric
@@ -559,8 +567,11 @@ pub struct InspectorTextEventSummary {
     /// snapshot)。 `text_num_field_value` で field 毎の f64 を取り出す
     /// (Rotation は degree に変換)。
     pub event: common::model::TextEvent,
-    /// fade scrub の range 上限 (= clip 長 beats)。
-    pub clip_length_beats: f64,
+    /// r.md #38: fade scrub の range 上限 = **この event の長さ** (拍)。
+    /// fade は clip 長ではなく event 長に対して掛かる (音 / 映像 / 画像 / 字幕の
+    /// 適用側が全部 event 長基準)。 handler 側の clamp (`e.event_length_beats`) と
+    /// ここが食い違うと、 入力した値が clamp で切られて表示が巻き戻る。
+    pub fade_max_beats: f64,
 }
 
 impl InspectorTextEventSummary {
@@ -700,6 +711,18 @@ pub struct ExportRangePicker {
 pub struct ClipRef {
     pub track: u32,
     pub clip: u32,
+}
+
+/// r.md #38: clip 内の 1 event を指す参照。 `ClipRef` (track index / clip index) の延長で、
+/// `event` は clip の `ClipContent` 内 event index。
+///
+/// fade はこの粒度で編集する。 clip 単位だと複数 event を持つ clip で
+/// 「アレンジ画面で掴んだ event」 と 「実際に書き換わる event」 がずれる
+/// (旧実装は clip 内全 event に broadcast していた)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+pub struct ClipEventRef {
+    pub clip: ClipRef,
+    pub event: u32,
 }
 
 /// v18 (`docs/plan_track_clip_color.md`): color_picker overlay (gui_01 #058)
@@ -1265,16 +1288,16 @@ pub fn find_device_by_id(
     None
 }
 
-/// 逆方向: 旧 `(track_id, device_index)` 座標から安定 `device_id` を引く。
-/// IPC 送信サイト (SetSlotPlugin / RemoveSlotPlugin / GUI open 等) が
-/// positional な GUI 内部状態から protocol の id addressing へ変換するのに
-/// 使う。 `track_id == MASTER_TRACK_ID` は `master_fx_chain` を見る。
-/// device が存在しない / id 未採番 (0) なら `None`。
-pub fn device_id_at(
+/// r.md #36: `(track_id, device_index)` 座標から `PluginInstance` 本体を引く。
+/// `track_id == MASTER_TRACK_ID` は `master_fx_chain` を見る。
+/// device が存在しなければ `None` (id 未採番かどうかは見ない — それは
+/// [`device_id_at`] の責務)。
+#[must_use]
+pub fn device_at(
     song: &common::model::Song,
     track_id: u32,
     device_index: u32,
-) -> Option<u64> {
+) -> Option<&common::model::PluginInstance> {
     let devices: &[common::model::PluginInstance] =
         if track_id == common::model::MASTER_TRACK_ID {
             &song.master_fx_chain
@@ -1284,8 +1307,22 @@ pub fn device_id_at(
                 .find(|t| t.id == track_id)
                 .map(|t| t.devices.as_slice())?
         };
-    devices
-        .get(device_index as usize)
+    devices.get(device_index as usize)
+}
+
+/// 逆方向: 旧 `(track_id, device_index)` 座標から安定 `device_id` を引く。
+/// IPC 送信サイト (SetSlotPlugin / RemoveSlotPlugin / GUI open 等) が
+/// positional な GUI 内部状態から protocol の id addressing へ変換するのに
+/// 使う。 `track_id == MASTER_TRACK_ID` は `master_fx_chain` を見る。
+/// device が存在しない / id 未採番 (0) なら `None`。
+#[must_use]
+pub fn device_id_at(
+    song: &common::model::Song,
+    track_id: u32,
+    device_index: u32,
+) -> Option<u64> {
+    // 座標解決は `device_at` 1 本に集約する (同じ走査を 2 度書かない)。
+    device_at(song, track_id, device_index)
         .map(|d| d.id)
         .filter(|&id| id != 0)
 }

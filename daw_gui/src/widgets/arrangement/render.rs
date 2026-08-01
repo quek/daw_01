@@ -97,9 +97,9 @@ pub(super) fn render_arrangement_heavy(
                             continue;
                         }
                         for c in &t.clips {
-                            let Some(audio) = c.audio_edit else {
+                            if c.audio_edit.is_none() && c.fades.is_empty() {
                                 continue;
-                            };
+                            }
                             let end = c.start_beat + c.len_beats;
                             if end < view_copy.start_beat || c.start_beat > view_end_for_audio {
                                 continue;
@@ -111,7 +111,12 @@ pub(super) fn render_arrangement_heavy(
                             if r.w < style_copy.audio_min_clip_w_for_handles_px {
                                 continue;
                             }
-                            draw_clip_audio_overlay(hctx, r, &audio, c.len_beats, &style_copy);
+                            if let Some(audio) = c.audio_edit {
+                                draw_clip_audio_overlay(hctx, r, &audio, &style_copy);
+                            }
+                            // r.md #38: fade は content 種別に依らず全 clip 種別に描く
+                            // (音声だけでなく映像 / 画像 / 字幕も同じ見た目)。
+                            draw_clip_fades(hctx, r, c.len_beats, &c.fades, &style_copy);
                         }
                     }
                 });

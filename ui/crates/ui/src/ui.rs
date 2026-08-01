@@ -150,6 +150,18 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// `delete` `cut` `copy` `paste`) を `pending_shortcuts` に積まず `keyboard_events`
     /// に残し、focused widget が `Ui::take_typing_shortcut(name)` で拾えるようにする。
     last_typing_focus: bool,
+    /// daw_01 r.md #36: **キーボードイベントを伴わずに** 次フレームで発火させる shortcut 名。
+    ///
+    /// OS フォーカスが別プロセスの窓 (= プラグインエディタ) にあるときは winit の
+    /// `KeyboardInput` が来ないので、 通常の解決経路 (`shortcut_map.matches`) に乗せられない。
+    /// かといって raw な `KeyEvent` を注入すると `typing_lock` / `bare_char_key` の調停に
+    /// 掛かり、 daw_gui 側のテキスト欄にフォーカスがあると Space がそこへ入ってしまう。
+    /// OS フォーカスが外にある以上 typing 判定は無意味なので、 **解決済みの shortcut 名**
+    /// という一段上のレイヤに注入するのが正しい高さ。
+    ///
+    /// これにより consumer 側 (`take_shortcut`) は一切変わらず、 「キーの発生源」 だけが
+    /// 増える (= 解決器も dispatch も 1 本のまま)。
+    injected_shortcuts: Vec<&'static str>,
     /// M14 Phase 58: text shape による proportional font の実 advance 計算器。`Ui::measure_text`
     /// 経由で text_input の cursor / selection の x 位置を pixel-accurate に取得する。
     /// renderer 側の `GlyphPipeline` 内 `FontSystem` とは別 instance だが、同じ system fonts を
@@ -226,6 +238,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             double_click_threshold: (std::time::Duration::from_millis(400), 5.0),
             secondary_press_pos: None,
             last_typing_focus: false,
+            injected_shortcuts: Vec::new(),
             text_metrics: TextMetrics::new(),
             owned_font_system: None,
             _m: PhantomData,
@@ -272,6 +285,16 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// M8 Phase 30: shortcut map への mutable 参照 (実行時 rebind 用)。
     pub fn shortcut_map_mut(&mut self) -> &mut ShortcutMap {
         &mut self.shortcut_map
+    }
+
+    /// daw_01 r.md #36: 次フレームで `Ui::take_shortcut(name)` が拾えるように
+    /// shortcut を 1 件注入する。
+    ///
+    /// OS フォーカスが別プロセスの窓 (プラグインエディタ等) にあってキーイベントが
+    /// この event loop に来ないケース用。 呼び出し後は `request_redraw` すること
+    /// (注入しただけでは再描画は走らない)。
+    pub fn inject_shortcut(&mut self, name: &'static str) {
+        self.injected_shortcuts.push(name);
     }
 
     /// M8 Phase 31: clipboard provider が設定されていれば true。
@@ -523,7 +546,10 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // text_input が後で `take_keyboard_events_if_focused` で取るのは shortcut 後の残り。
         let modifiers = pointer.modifiers;
         let typing_lock = self.last_typing_focus;
-        let mut pending_shortcuts: Vec<&'static str> = Vec::new();
+        // daw_01 r.md #36: 外部窓 (プラグインエディタ) から転送された shortcut を先頭に積む。
+        // 解決は済んでいるので typing 調停は通さない (OS フォーカスが daw_gui の外にある間に
+        // 押されたキーなので、 こちらのテキスト欄は入力対象ではない)。
+        let mut pending_shortcuts: Vec<&'static str> = std::mem::take(&mut self.injected_shortcuts);
         // typing 中に keyboard_events に残された paste shortcut があれば clipboard を read する
         // (text_input が `take_typing_shortcut("paste")` で受け取る前に provider から取り出す)。
         let mut typing_paste_pending = false;

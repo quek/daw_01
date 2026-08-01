@@ -339,31 +339,56 @@ impl AppData {
         self.ui_ephemeral.clip_edit_buffer_target = if resolved { Some(target) } else { None };
     }
 
-    /// `target` clip の length_beats を fade clamp 用に取得する helper。
-    /// clip が解決できなければ `None`。
-    pub(crate) fn clip_length_beats(&self, target: ClipRef) -> Option<f64> {
-        Some(
-            self.song_doc.song()
-                .tracks
-                .get(target.track as usize)?
-                .clips
-                .get(target.clip as usize)?
-                .length_beats,
-        )
+
+    /// r.md #38: clip 内の **1 event** の fade を content 種別に依らず書き換える。
+    ///
+    /// アレンジ画面の fade 角 drag はこれを使う。 audio / video / image / text の
+    /// 4 種は同じ fade フィールドを持ち、 適用側も同じ curve 式を通るので、
+    /// 種別ごとの setter を 4 本用意する必要はない
+    /// (`ClipContent::set_event_fade` が唯一の書き込み口)。
+    ///
+    /// clamp は caller (`f`) の責務。 `EventFade::len_beats` が上限。
+    pub(crate) fn set_clip_event_fade(
+        &mut self,
+        target: crate::app_types::ClipEventRef,
+        f: impl FnOnce(common::model::EventFade) -> common::model::EventFade,
+    ) {
+        let Some(content_id) = self
+            .song_doc
+            .song()
+            .tracks
+            .get(target.clip.track as usize)
+            .and_then(|t| t.clips.get(target.clip.clip as usize))
+            .map(|c| c.content_id)
+        else {
+            return;
+        };
+        let index = target.event as usize;
+        self.edit_song(|song| {
+            song.clip_contents
+                .get_mut(&content_id)
+                .is_some_and(|c| c.set_event_fade(index, f))
+        });
+        // audio の inspector edit buffer はこの clip の値を映すので resync する
+        // (他 content 種別の setter は自前の resync を持つが、 fade は arrangement 側
+        // からしか来ないので audio 側だけで十分)。
+        self.resync_clip_audio_event_edit_buffers(target.clip);
     }
 
     pub(crate) fn set_clip_audio_event_fade_in_beats(&mut self, target: ClipRef, beats: f64) {
-        // Spec §3.5: fade は clip 内 beats、 clip 長を超えないように clamp。
-        let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
-        let beats = beats.clamp(0.0, max_beats);
-        self.mutate_audio_events_in_clip(target, |e| e.fade_in_beats = beats);
+        // r.md #38: 上限は **event 長**。 音 (`audio_clip_renderer`) は event 長基準で
+        // fade を掛けるので、 clip 長で clamp すると clip より短い event
+        // (trim / split 後) で fade がフルゲインに到達せず絵と音がずれる。
+        self.mutate_audio_events_in_clip(target, |e| {
+            e.fade_in_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+        });
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
     pub(crate) fn set_clip_audio_event_fade_out_beats(&mut self, target: ClipRef, beats: f64) {
-        let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
-        let beats = beats.clamp(0.0, max_beats);
-        self.mutate_audio_events_in_clip(target, |e| e.fade_out_beats = beats);
+        self.mutate_audio_events_in_clip(target, |e| {
+            e.fade_out_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+        });
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
@@ -612,14 +637,17 @@ impl AppData {
                 self.mutate_text_events_in_clip(target, |e| e.shadow_blur_px = v);
             }
             F::FadeInBeats => {
-                let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
-                let v = (f64::from(value)).clamp(0.0, max_beats);
-                self.mutate_text_events_in_clip(target, |e| e.fade_in_beats = v);
+                // r.md #38: text_compose も event 長基準で fade を適用するので上限は event 長。
+                let v = f64::from(value);
+                self.mutate_text_events_in_clip(target, |e| {
+                    e.fade_in_beats = v.clamp(0.0, e.event_length_beats.max(0.0));
+                });
             }
             F::FadeOutBeats => {
-                let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
-                let v = (f64::from(value)).clamp(0.0, max_beats);
-                self.mutate_text_events_in_clip(target, |e| e.fade_out_beats = v);
+                let v = f64::from(value);
+                self.mutate_text_events_in_clip(target, |e| {
+                    e.fade_out_beats = v.clamp(0.0, e.event_length_beats.max(0.0));
+                });
             }
         }
         self.resync_clip_text_event_edit_buffers(target);
@@ -837,22 +865,23 @@ impl AppData {
             fade_in_curve: event.fade_in_curve,
             fade_out_curve: event.fade_out_curve,
             automated,
+            fade_max_beats: event.event_length_beats,
             event: event.clone(),
-            clip_length_beats: clip.length_beats,
         })
     }
 
     pub(crate) fn set_clip_image_event_fade_in_beats(&mut self, target: ClipRef, beats: f64) {
-        let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
-        let beats = beats.clamp(0.0, max_beats);
-        self.mutate_image_events_in_clip(target, |e| e.fade_in_beats = beats);
+        // r.md #38: image_compose も event 長基準で fade を適用するので上限は event 長。
+        self.mutate_image_events_in_clip(target, |e| {
+            e.fade_in_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+        });
         self.resync_clip_image_event_edit_buffers(target);
     }
 
     pub(crate) fn set_clip_image_event_fade_out_beats(&mut self, target: ClipRef, beats: f64) {
-        let max_beats = self.clip_length_beats(target).unwrap_or(0.0);
-        let beats = beats.clamp(0.0, max_beats);
-        self.mutate_image_events_in_clip(target, |e| e.fade_out_beats = beats);
+        self.mutate_image_events_in_clip(target, |e| {
+            e.fade_out_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+        });
         self.resync_clip_image_event_edit_buffers(target);
     }
 

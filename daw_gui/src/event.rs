@@ -753,6 +753,14 @@ pub enum AppEvent {
         port: u8,
         source: Option<u32>,
     },
+    /// r.md #36: このプラグインのエディタ窓で **キーを一切横取りしない** (= REAPER の
+    /// 「Send all keyboard input to plug-in」)。 消化の有無を外に出さない自前描画 GUI
+    /// (Dear ImGui / GLFW 系) 用の逃げ道。 値は project に保存される。
+    SetPluginSendAllKeys {
+        track_id: u32,
+        device_index: u32,
+        enabled: bool,
+    },
     /// パラアウト (docs/plan_paraout.md): one-click "explode" — auto-create a
     /// child track per `is_main=false` output port of the plugin at
     /// `(track_id, device_index)`, group them under the source track, and wire
@@ -1361,9 +1369,11 @@ pub enum AppEvent {
     /// 単発 `SetClipGainDb` 等は Inspector commit 経路で引き続き使用。
     SetClipGainDbBatch(Vec<(ClipRef, f32)>),
     /// `(target, edge, beats)` 列で fade length を一括設定。
-    SetClipFadeBeatsBatch(Vec<(ClipRef, FadeEdgeKind, f64)>),
+    /// r.md #38: 宛先は clip ではなく **clip 内の 1 event** ([`ClipEventRef`])。
+    /// content 種別 (audio / video / image / text) は handler が clip から解決する。
+    SetClipFadeBeatsBatch(Vec<(ClipEventRef, FadeEdgeKind, f64)>),
     /// `(target, edge, curve)` 列で fade curve を一括設定。
-    SetClipFadeCurveBatch(Vec<(ClipRef, FadeEdgeKind, common::model::FadeCurve)>),
+    SetClipFadeCurveBatch(Vec<(ClipEventRef, FadeEdgeKind, common::model::FadeCurve)>),
     /// inspector のトグル / ドロップダウン (= discrete undoable 編集) を
     /// 複数選択クリップへ一括適用する。 単発イベントをループで撃つと is_undoable の
     /// auto-push で N スナップになるため、 これ 1 つで 1 スナップにまとめ、 handler 内で
@@ -1621,6 +1631,7 @@ impl AppEvent {
             E::SetVideoFxParam { .. } => "映像FX変更",
             E::SetPluginParam { .. } => "プラグインパラメータ変更",
             E::SetSidechainSource { .. } | E::SetAuxInputTapPoint { .. } => "サイドチェイン設定",
+            E::SetPluginSendAllKeys { .. } => "プラグインへのキー送出設定",
             E::ExplodeParallelOut { .. } => "パラアウト展開",
             E::SetParallelOutputRoute { .. } => "パラアウト経路変更",
 

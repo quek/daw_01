@@ -230,12 +230,18 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 if let Some((t_idx, t)) =
                     visible_tracks.iter().enumerate().find(|(_, t)| t.id == hit_key.track)
                     && let Some(c) = t.clips.iter().find(|c| c.id == hit_key.clip)
-                    && let Some(audio) = c.audio_edit
                 {
-                    let kind = match grip {
-                        AudioGripHit::GainHandleBand => AudioDragKind::Gain,
-                        AudioGripHit::FadeCornerIn => AudioDragKind::FadeIn,
-                        AudioGripHit::FadeCornerOut => AudioDragKind::FadeOut,
+                    // r.md #38: fade は掴んだ **その event** だけを対象にする。
+                    let (kind, anchor_fade) = match grip {
+                        AudioGripHit::GainHandleBand => (AudioDragKind::Gain, None),
+                        AudioGripHit::FadeCornerIn { event_index } => (
+                            AudioDragKind::FadeIn,
+                            c.fades.iter().find(|f| f.event_index == event_index).copied(),
+                        ),
+                        AudioGripHit::FadeCornerOut { event_index } => (
+                            AudioDragKind::FadeOut,
+                            c.fades.iter().find(|f| f.event_index == event_index).copied(),
+                        ),
                     };
                     let r_anchor = clip_to_rect(
                         press_tops[t_idx],
@@ -254,7 +260,8 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     state.audio_drag = Some(AudioDragSession {
                         key: hit_key,
                         kind,
-                        anchor: audio,
+                        anchor_gain_db: c.audio_edit.map_or(0.0, |a| a.gain_db),
+                        anchor_fade,
                         clip_rect_anchor: r_anchor,
                         clip_len_beats_anchor: c.len_beats,
                         anchor_mouse: (px, py),

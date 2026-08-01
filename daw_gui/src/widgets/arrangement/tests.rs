@@ -14,9 +14,29 @@
             color: None,
             share_group_color: None,
             audio_edit: None,
+            fades: Vec::new(),
             thumbnail: None,
             in_active_group: false,
             muted: false,
+        }
+    }
+
+    /// r.md #38: fade を 1 event ぶん持つ test clip helper (content 種別は問わない)。
+    fn fade_clip(id: u32, start: f64, len: f64, name: &str, fade: common::model::EventFade) -> ClipView {
+        let mut c = clip(id, start, len, name);
+        c.fades = vec![ClipEventFade { event_index: 0, fade }];
+        c
+    }
+
+    /// r.md #38: `EventFade` の組み立てショートハンド (event が clip 全体を覆う場合)。
+    fn ev_fade(len: f64, fi: f64, fo: f64, ci: FadeCurve, co: FadeCurve) -> common::model::EventFade {
+        common::model::EventFade {
+            start_in_clip_beats: 0.0,
+            len_beats: len,
+            fade_in_beats: fi,
+            fade_out_beats: fo,
+            fade_in_curve: ci,
+            fade_out_curve: co,
         }
     }
 
@@ -36,6 +56,11 @@
             color: None,
             share_group_color: None,
             audio_edit: Some(audio),
+            // r.md #38: clip 全体を覆う 1 event、 fade 0 (= handle は clip の角に一致)。
+            fades: vec![ClipEventFade {
+                event_index: 0,
+                fade: ev_fade(len, 0.0, 0.0, FadeCurve::Linear, FadeCurve::Linear),
+            }],
             thumbnail: None,
             in_active_group: false,
             muted: false,
@@ -502,6 +527,7 @@
             color: None,
             share_group_color: None,
             audio_edit: None,
+            fades: Vec::new(),
             thumbnail: Some((h, 1920, 1080)),
             in_active_group: false,
             muted: false,
@@ -1432,13 +1458,7 @@
         let lanes = test_lanes();
         let style = ArrangementStyle::default();
         // clip rect = (0, 2, 160, 28), 中央 (80, 16) は handle band 内
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.0,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
         // clip 中央 y = r.y + r.h / 2 = 2 + 14 = 16
         // x = 80 (clip 中央)、 端 (0/160) から 24 px margin 内
@@ -1454,18 +1474,12 @@
         let view = test_view();
         let lanes = test_lanes();
         let style = ArrangementStyle::default();
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.0,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
         // clip rect = (0, 2, 160, 28), top-left 12×12 → cx=6, cy=6 (corner 内)
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 6.0, 6.0, &style),
-            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn))
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 }))
         );
     }
 
@@ -1475,18 +1489,12 @@
         let view = test_view();
         let lanes = test_lanes();
         let style = ArrangementStyle::default();
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.0,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
         // clip rect = (0, 2, 160, 28), top-right 12×12 → cx=155, cy=6 (corner 内)
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 155.0, 6.0, &style),
-            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerOut))
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerOut { event_index: 0 }))
         );
     }
 
@@ -1496,13 +1504,7 @@
         let view = test_view();
         let lanes = test_lanes();
         let style = ArrangementStyle::default();
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.0,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         // len_beats=0.5 → w = 20px、 default min = 32 → grip disable
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 0.5, "c", audio)])];
         assert_eq!(
@@ -1527,17 +1529,12 @@
     #[test]
     fn compute_audio_drag_outcome_gain_changes_db_by_pixels() {
         let style = ArrangementStyle::default();
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.0,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::Gain,
-            anchor: audio,
+            anchor_gain_db: audio.gain_db,
+            anchor_fade: None,
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
             anchor_mouse: (50.0, 14.0),
@@ -1557,18 +1554,13 @@
     #[test]
     fn compute_audio_drag_outcome_gain_clamps_to_range() {
         let style = ArrangementStyle::default(); // range = 24 dB
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.0,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         // dy = -200 → +50 dB raw → clamped to +24
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::Gain,
-            anchor: audio,
+            anchor_gain_db: audio.gain_db,
+            anchor_fade: None,
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
             anchor_mouse: (50.0, 14.0),
@@ -1588,17 +1580,15 @@
     #[test]
     fn compute_audio_drag_outcome_fade_in_horizontal_changes_length() {
         let style = ArrangementStyle::default();
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.5,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
-            anchor: audio,
+            anchor_gain_db: audio.gain_db,
+            anchor_fade: Some(ClipEventFade {
+                event_index: 0,
+                fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
+            }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
             anchor_mouse: (0.0, 0.0),
@@ -1619,17 +1609,15 @@
     #[test]
     fn compute_audio_drag_outcome_fade_out_horizontal_uses_negative_dx() {
         let style = ArrangementStyle::default();
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.0,
-            fade_out_beats: 0.5,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeOut,
-            anchor: audio,
+            anchor_gain_db: audio.gain_db,
+            anchor_fade: Some(ClipEventFade {
+                event_index: 0,
+                fade: ev_fade(4.0, 0.0, 0.5, FadeCurve::Linear, FadeCurve::Linear),
+            }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
             anchor_mouse: (160.0, 0.0),
@@ -1651,18 +1639,16 @@
     #[test]
     fn compute_audio_drag_outcome_fade_length_clamps_to_clip_len() {
         let style = ArrangementStyle::default();
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.5,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         // dx = +400 px @ 0.025 beat/px = +10 beat → 0.5 + 10 = 10.5、 clamp to clip_len 4.0
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
-            anchor: audio,
+            anchor_gain_db: audio.gain_db,
+            anchor_fade: Some(ClipEventFade {
+                event_index: 0,
+                fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
+            }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
             anchor_mouse: (0.0, 0.0),
@@ -1677,21 +1663,169 @@
         }
     }
 
+    /// r.md #38: fade length の上限は **clip 長ではなく event 長**。 音 / 映像 / 画像 /
+    /// 字幕はどれも event 長基準で fade を適用するので、 clip より短い event
+    /// (trim / split 後) では event 長で頭打ちにならないと絵と実挙動がずれる。
+    #[test]
+    fn compute_audio_drag_outcome_fade_length_clamps_to_event_len_not_clip_len() {
+        let style = ArrangementStyle::default();
+        let ad = AudioDragSession {
+            key: ClipKey { track: 0, clip: 0 },
+            kind: AudioDragKind::FadeIn,
+            anchor_gain_db: 0.0,
+            // clip は 4 拍だが event は先頭 1 拍だけ。
+            anchor_fade: Some(ClipEventFade {
+                event_index: 0,
+                fade: ev_fade(1.0, 0.0, 0.0, FadeCurve::Linear, FadeCurve::Linear),
+            }),
+            clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
+            clip_len_beats_anchor: 4.0,
+            anchor_mouse: (0.0, 0.0),
+            last_mouse: (400.0, 0.0), // +10 beat 相当
+            locked_horizontal: Some(true),
+        };
+        match compute_audio_drag_outcome(&ad, 0.025, &style) {
+            Some(AudioDragOutcome::FadeLength { next_beats, .. }) => {
+                assert!(
+                    (next_beats - 1.0).abs() < 1e-6,
+                    "event 長 1.0 で頭打ち (clip 長 4.0 ではない): got {next_beats}"
+                );
+            }
+            other => panic!("expected FadeLength, got {other:?}"),
+        }
+    }
+
+    // -------- r.md #38: fade 幾何 (描画と hit-test の SSoT) ----------------------
+
+    /// fade in の線は「event 左端の **下端** (無音、 固定) → fade 末尾の **上端** (フル)」。
+    /// r.md #38 以前は上下が逆で、 固定端が上・可動端が下だった (= fade out の絵)。
+    #[test]
+    fn fade_geometry_in_anchors_at_bottom_and_handle_at_top() {
+        let style = ArrangementStyle::default();
+        let r = Rect { x: 0.0, y: 10.0, w: 160.0, h: 28.0 };
+        let f = ClipEventFade {
+            event_index: 0,
+            fade: ev_fade(4.0, 1.0, 0.0, FadeCurve::Linear, FadeCurve::Linear),
+        };
+        let g = fade_geometry(r, 4.0, &f, FadeEdge::In, &style);
+        assert!((g.anchor[0] - r.x).abs() < 1e-4, "無音端は event 左端");
+        assert!((g.anchor[1] - (r.y + r.h)).abs() < 1e-4, "無音端は下端");
+        assert!((g.handle[1] - r.y).abs() < 1e-4, "フル端は上端");
+        // 1 拍 / 4 拍 * 160px = 40px
+        assert!((g.width_px - 40.0).abs() < 1e-3, "got {}", g.width_px);
+        assert!((g.handle[0] - 40.0).abs() < 1e-3, "掴む点は fade 末尾へ動く");
+    }
+
+    /// fade out は「fade 開始の上端 → event 右端の下端」。
+    #[test]
+    fn fade_geometry_out_anchors_at_bottom_right() {
+        let style = ArrangementStyle::default();
+        let r = Rect { x: 0.0, y: 10.0, w: 160.0, h: 28.0 };
+        let f = ClipEventFade {
+            event_index: 0,
+            fade: ev_fade(4.0, 0.0, 1.0, FadeCurve::Linear, FadeCurve::Linear),
+        };
+        let g = fade_geometry(r, 4.0, &f, FadeEdge::Out, &style);
+        assert!((g.anchor[0] - (r.x + r.w)).abs() < 1e-4, "無音端は event 右端");
+        assert!((g.anchor[1] - (r.y + r.h)).abs() < 1e-4, "無音端は下端");
+        assert!((g.handle[0] - 120.0).abs() < 1e-3, "フル端は右端から 40px 内側");
+        assert!((g.handle[1] - r.y).abs() < 1e-4, "フル端は上端");
+    }
+
+    /// fade = 0 のとき掴む正方形は event の角に一致する (従来の操作感を保つ)。
+    #[test]
+    fn fade_geometry_zero_fade_keeps_handle_at_corner() {
+        let style = ArrangementStyle::default();
+        let r = Rect { x: 5.0, y: 10.0, w: 160.0, h: 28.0 };
+        let f = ClipEventFade {
+            event_index: 0,
+            fade: ev_fade(4.0, 0.0, 0.0, FadeCurve::Linear, FadeCurve::Linear),
+        };
+        let corner = style.audio_fade_corner_size_px;
+        let g_in = fade_geometry(r, 4.0, &f, FadeEdge::In, &style);
+        assert!((g_in.handle_rect.x - r.x).abs() < 1e-4);
+        let g_out = fade_geometry(r, 4.0, &f, FadeEdge::Out, &style);
+        assert!((g_out.handle_rect.x - (r.x + r.w - corner)).abs() < 1e-4);
+    }
+
+    /// event が clip の一部しか占めない場合、 fade は **その event の矩形** を基準に描かれる。
+    #[test]
+    fn fade_geometry_uses_event_rect_not_clip_rect() {
+        let style = ArrangementStyle::default();
+        // clip = 4 拍 / 160px、 event は 1 拍目から 2 拍ぶん (40px 〜 120px)。
+        let r = Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 };
+        let f = ClipEventFade {
+            event_index: 0,
+            fade: common::model::EventFade {
+                start_in_clip_beats: 1.0,
+                len_beats: 2.0,
+                fade_in_beats: 0.0,
+                fade_out_beats: 0.0,
+                fade_in_curve: FadeCurve::Linear,
+                fade_out_curve: FadeCurve::Linear,
+            },
+        };
+        let g = fade_geometry(r, 4.0, &f, FadeEdge::In, &style);
+        assert!((g.event_rect.x - 40.0).abs() < 1e-3, "got {}", g.event_rect.x);
+        assert!((g.event_rect.w - 80.0).abs() < 1e-3, "got {}", g.event_rect.w);
+        assert!((g.anchor[0] - 40.0).abs() < 1e-3, "無音端は event 左端 (clip 左端ではない)");
+    }
+
+    /// fade_in が event 全長 / fade_out が 0 のとき、 両方の掴む正方形が
+    /// **同じ位置に重なる**。 単純な後勝ちだと退化した Out (幅 0) が常に勝ち、
+    /// 実際に伸びている In を掴めなくなるので、 幅の大きい方が勝つこと。
+    #[test]
+    fn audio_grip_hit_prefers_wider_fade_when_handles_coincide() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        // fade_in = 4 拍 (= event 全長)、 fade_out = 0 → どちらの handle も event 右上。
+        let c = fade_clip(100, 0.0, 4.0, "c", ev_fade(4.0, 4.0, 0.0, FadeCurve::Linear, FadeCurve::Linear));
+        let tracks = vec![track(10, "t0", vec![c])];
+        let tops = make_tops(&tracks, lanes, view);
+        // clip rect = (0, 2, 160, 28) → 重なった handle_rect は x ∈ [148, 160)
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 152.0, 6.0, &style),
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 })),
+            "幅のある fade in 側が掴める (幅 0 の fade out に奪われない)"
+        );
+    }
+
+    /// 掴む正方形は fade 長に追従する: fade を伸ばすと元の角では掴めず、 fade 末尾で掴める。
+    #[test]
+    fn audio_grip_hit_follows_fade_end() {
+        let view = test_view();
+        let lanes = test_lanes();
+        let style = ArrangementStyle::default();
+        // clip = 4 拍 → w = 160px。 fade_in = 2 拍 → 80px。
+        let c = fade_clip(100, 0.0, 4.0, "c", ev_fade(4.0, 2.0, 0.0, FadeCurve::Linear, FadeCurve::Linear));
+        let tracks = vec![track(10, "t0", vec![c])];
+        let tops = make_tops(&tracks, lanes, view);
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 84.0, 6.0, &style),
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 })),
+            "fade 末尾 (80px) の正方形で掴める"
+        );
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 6.0, 6.0, &style),
+            None,
+            "clip 左上角はもう掴む場所ではない (fade 末尾へ移動した)"
+        );
+    }
+
     /// FadeIn + vertical lock は curve 切替を返す (Linear → Exponential)。
     #[test]
     fn compute_audio_drag_outcome_fade_in_vertical_toggles_curve() {
         let style = ArrangementStyle::default();
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.5,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
-            anchor: audio,
+            anchor_gain_db: audio.gain_db,
+            anchor_fade: Some(ClipEventFade {
+                event_index: 0,
+                fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
+            }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
             anchor_mouse: (0.0, 0.0),
@@ -1711,17 +1845,15 @@
     #[test]
     fn compute_audio_drag_outcome_unlocked_returns_none() {
         let style = ArrangementStyle::default();
-        let audio = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.5,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
-            anchor: audio,
+            anchor_gain_db: audio.gain_db,
+            anchor_fade: Some(ClipEventFade {
+                event_index: 0,
+                fade: ev_fade(4.0, 0.5, 0.0, FadeCurve::Linear, FadeCurve::Linear),
+            }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
             anchor_mouse: (0.0, 0.0),
@@ -1734,13 +1866,7 @@
     /// fold_arrangement_clip_hash: audio_edit の gain_db / fade を変えると hash が変わる。
     #[test]
     fn fold_arrangement_clip_hash_changes_on_gain_db() {
-        let audio_a = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.0,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
+        let audio_a = ClipViewAudioEdit { gain_db: 0.0 };
         let audio_b = ClipViewAudioEdit { gain_db: 3.0, ..audio_a };
         let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_a)])];
         let after = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_b)])];
@@ -1753,23 +1879,24 @@
 
     #[test]
     fn fold_arrangement_clip_hash_changes_on_fade_curve() {
-        let audio_a = ClipViewAudioEdit {
-            gain_db: 0.0,
-            fade_in_beats: 0.5,
-            fade_out_beats: 0.0,
-            fade_in_curve: FadeCurve::Linear,
-            fade_out_curve: FadeCurve::Linear,
-        };
-        let audio_b = ClipViewAudioEdit {
-            fade_in_curve: FadeCurve::Exponential,
-            ..audio_a
-        };
-        let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_a)])];
-        let after = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio_b)])];
+        // r.md #38: fade は `ClipView.fades` (per-event) に移ったので、 hash も
+        // そちら経由で反応しなければならない (混ぜ忘れると fade を編集しても
+        // cached が再構築されず線が更新されない)。
+        let audio = ClipViewAudioEdit { gain_db: 0.0 };
+        let before = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
+        let mut after = before.clone();
+        after[0].clips[0].fades[0].fade.fade_in_curve = FadeCurve::Exponential;
         assert_ne!(
             fold_arrangement_clip_hash(&before),
             fold_arrangement_clip_hash(&after),
-            "audio_edit.fade_in_curve 変化で hash が変わる"
+            "fade_in_curve 変化で hash が変わる"
+        );
+        let mut after_len = before.clone();
+        after_len[0].clips[0].fades[0].fade.fade_in_beats = 1.0;
+        assert_ne!(
+            fold_arrangement_clip_hash(&before),
+            fold_arrangement_clip_hash(&after_len),
+            "fade_in_beats 変化で hash が変わる"
         );
     }
 
