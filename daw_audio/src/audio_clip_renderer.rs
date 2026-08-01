@@ -474,6 +474,15 @@ pub fn render_audio_events(
             StretchMode::Repitch => event.pitch_ratio * follow_instant,
             _ => event.pitch_ratio,
         };
+        // Stretch (granular) / Slice が「出力 sample → source frame」 を写すときの
+        // native pitch 進度 (= source_sr / engine_sr)。 Stretch/Slice の
+        // `pitch_ratio` は `pitch_ratio_for` が返す sr 補正そのもの。 退化値
+        // (0 / 負 / NaN) は 1.0 に倒す defensive (source が止まって drone 化しない)。
+        let native_stride = if event.pitch_ratio > 0.0 {
+            event.pitch_ratio
+        } else {
+            1.0
+        };
 
         // beat-domain fade を per-buffer の current_bpm で sample 換算する。
         // `event_total_samples` は fade-out の tail (= event 末尾からの距離)
@@ -576,6 +585,7 @@ pub fn render_audio_events(
                     // 完全 click-free には per-event grain-trigger lock-in が必要
                     // (= 別 phase)。
                     follow_smoothed,
+                    native_stride,
                     l_plane,
                     r_plane,
                     event.source_start_frames,
@@ -590,6 +600,7 @@ pub fn render_audio_events(
                     event_local,
                     // slice 配置にも clip 長 stretch + tempo 追従を合成 (instant)。
                     follow_instant,
+                    native_stride,
                     l_plane,
                     r_plane,
                     event.source_start_frames,
@@ -683,10 +694,70 @@ pub fn render_audio_events(
 /// あれば retire まで上書きされない。
 pub type GrainLockRing = [(u64, u64); 8];
 
+/// event-local な **小数** source 位置 `pos_in_event` (= `source_start` 起点の
+/// source frame) から linear interpolation で 1 frame 取り出す。 granular /
+/// slice が source SR ≠ engine SR で小数進度になるため、 整数 index 直読では
+/// 1 frame 単位の量子化ノイズが乗る (44.1k→48k は毎 sample 位相がずれる)。
+/// 範囲外 (負 / NaN / source 窓外 / buffer 外) は `None`。
+/// RT 安全: 確保なし・panic なし (`slice::get` で境界を吸収)。
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn source_frame_lerp(
+    l_plane: &[f32],
+    r_plane: &[f32],
+    source_start: u64,
+    source_end: u64,
+    buffer_frames: u64,
+    source_len: u64,
+    pos_in_event: f64,
+    reversed: bool,
+) -> Option<(f32, f32)> {
+    // NaN / Inf (退化した ratio の伝播) も含めて弾く。
+    if !pos_in_event.is_finite() || pos_in_event < 0.0 || pos_in_event >= source_len as f64 {
+        return None;
+    }
+    // reversed は source 窓の末尾から手前へ読む (小数位置のまま反転)。
+    let abs = source_start as f64
+        + if reversed {
+            (source_len - 1) as f64 - pos_in_event
+        } else {
+            pos_in_event
+        };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let i0 = abs.floor() as u64;
+    #[allow(clippy::cast_possible_truncation)]
+    let frac = (abs - i0 as f64) as f32;
+    if i0 >= source_end || i0 >= buffer_frames {
+        return None;
+    }
+    let l0 = l_plane.get(i0 as usize).copied().unwrap_or(0.0);
+    let r0 = r_plane.get(i0 as usize).copied().unwrap_or(0.0);
+    // 次 frame が窓外なら補間せず l0/r0 を保持 (= 端で 0 に落ちない)。
+    let i1 = i0 + 1;
+    let (l1, r1) = if i1 < source_end && i1 < buffer_frames {
+        (
+            l_plane.get(i1 as usize).copied().unwrap_or(l0),
+            r_plane.get(i1 as usize).copied().unwrap_or(r0),
+        )
+    } else {
+        (l0, r0)
+    };
+    Some((l0 + (l1 - l0) * frac, r0 + (r1 - r0) * frac))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn granular_sample_at(
     event_local: u64,
     tempo_ratio: f64,
+    // 1 output frame あたりの source frame 進度 (**native pitch 時**) =
+    // `source_sr / engine_sr` (= `RenderedEvent.pitch_ratio`、 Stretch/Slice では
+    // `pitch_ratio_for` が sr 補正のみを返す)。 出力時刻 (= engine SR 基準の sample)
+    // を source frame へ写す全ての箇所に掛ける必要がある: grain の配置
+    // (`grain_start_out × tempo_ratio × native_stride`) と grain 内の読み進み
+    // (`in_grain × native_stride` = pitch 保持の再生速度)。 これを落とすと 44.1 kHz
+    // 素材を 48 kHz エンジンで再生したとき source を 8.8% 速く消費し、 clip 末尾が
+    // 無音になった上に pitch が ~1.5 半音上ずる (= 「波形より音が短い」)。
+    native_stride: f64,
     l_plane: &[f32],
     r_plane: &[f32],
     source_start: u64,
@@ -734,18 +805,20 @@ fn granular_sample_at(
         }
         // grain の source 内 offset。 warp markers (≥2) があれば event-local beat
         // (= grain_start_out / samples_per_beat) を warp_source_frame で source
-        // frame に写す非一様 stretch、 無ければ uniform (× tempo_ratio)。
+        // frame に写す非一様 stretch、 無ければ uniform (× tempo_ratio × native_stride)。
+        // warp path の戻り値は既に source frame 空間なので native_stride は掛けない
+        // (掛けるのは「出力 sample → source frame」 の換算のみ)。
         let grain_source_offset = if beat_markers.len() >= 2 && samples_per_beat > 0.0 {
             let event_beat = grain_start_out as f64 / samples_per_beat;
             match common::audio_render::warp_source_frame(event_beat, beat_markers) {
                 Some(sf) => (sf - source_start as f64).max(0.0) as u64,
-                None => (grain_start_out as f64 * tempo_ratio).max(0.0) as u64,
+                None => (grain_start_out as f64 * tempo_ratio * native_stride).max(0.0) as u64,
             }
         } else {
             // E5: uniform stretch。 lock_ring があれば grain k の source offset を **trigger 時の
             // 値に固定** する。 tempo_ratio は buffer ごとに変わりうる (tempo automation) ので、
             // 同じ grain を後続 buffer で recompute すると source position が跳んで click になる。
-            let recomputed = (grain_start_out as f64 * tempo_ratio).max(0.0) as u64;
+            let recomputed = (grain_start_out as f64 * tempo_ratio * native_stride).max(0.0) as u64;
             if let Some(ring) = lock_ring.as_deref_mut() {
                 let slot = (k as usize) % ring.len();
                 if ring[slot].0 == k {
@@ -758,23 +831,21 @@ fn granular_sample_at(
                 recomputed
             }
         };
-        let source_pos_in_event = grain_source_offset + in_grain;
-        if source_pos_in_event >= source_len {
+        // grain 内は **native pitch** で読み進む (= pitch 保持)。 出力 sample の
+        // 進みに `native_stride` を掛けて source frame へ写し、 小数位置は補間する。
+        let source_pos_in_event = grain_source_offset as f64 + in_grain as f64 * native_stride;
+        let Some((s_l, s_r)) = source_frame_lerp(
+            l_plane,
+            r_plane,
+            source_start,
+            source_end,
+            buffer_frames,
+            source_len,
+            source_pos_in_event,
+            reversed,
+        ) else {
             continue;
-        }
-        let abs_idx = if reversed {
-            // reversed: source の末尾から読む
-            let from_end = source_pos_in_event;
-            if from_end >= source_len {
-                continue;
-            }
-            source_start + (source_len - 1 - from_end)
-        } else {
-            source_start + source_pos_in_event
         };
-        if abs_idx >= source_end || abs_idx >= buffer_frames {
-            continue;
-        }
         // Hann window: 0.5 * (1 - cos(2π * t / (LEN - 1)))。 (LEN-1) は
         // window の最後の点を 0 にするための慣例 (= symmetric Hann)。
         #[allow(clippy::cast_precision_loss)]
@@ -784,8 +855,6 @@ fn granular_sample_at(
         let env_win = 0.5
             * (1.0 - (std::f32::consts::TAU * t / len_f).cos());
 
-        let s_l = l_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
-        let s_r = r_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
         sum_l += s_l * env_win;
         sum_r += s_r * env_win;
     }
@@ -815,6 +884,11 @@ fn granular_sample_at(
 fn slice_sample_at(
     event_local: u64,
     tempo_ratio: f64,
+    // granular と同じ「1 output frame あたりの source frame 進度 (native pitch)」
+    // (= `source_sr / engine_sr`)。 slice の **trigger 位置の写像** と **slice 内の
+    // 読み進み** の両方に効く。 落とすと source SR ≠ engine SR で slice が native
+    // rate にならず (pitch がずれ)、 slice 境界も出力上でずれる。
+    native_stride: f64,
     l_plane: &[f32],
     r_plane: &[f32],
     source_start: u64,
@@ -828,41 +902,40 @@ fn slice_sample_at(
         return (0.0, 0.0);
     }
 
-    // onsets が空 / 不足の場合は source 全体を 1 slice (= Raw 等価)。
+    // onsets が空 / 不足の場合は source 全体を 1 slice (= event 頭で 1 回 trigger、
+    // 以降 native rate 再生)。 slice の定義どおり時間伸縮はしない (伸ばした分の
+    // 余りは無音、 縮めた分は cut)。
     if onsets.is_empty() {
-        let source_pos = event_local;
-        if source_pos >= source_len {
-            return (0.0, 0.0);
-        }
-        let abs_idx = if reversed {
-            source_start + (source_len - 1 - source_pos)
-        } else {
-            source_start + source_pos
-        };
-        if abs_idx >= source_end || abs_idx >= buffer_frames {
-            return (0.0, 0.0);
-        }
-        let s_l = l_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
-        let s_r = r_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
-        return (s_l, s_r);
+        return source_frame_lerp(
+            l_plane,
+            r_plane,
+            source_start,
+            source_end,
+            buffer_frames,
+            source_len,
+            event_local as f64 * native_stride,
+            reversed,
+        )
+        .unwrap_or((0.0, 0.0));
     }
 
-    // 出力 sample 位置 event_local が含まれる slice を探す。 slice i の trigger
-    // 出力位置 = `onsets[i] / tempo_ratio` (= nominal で onsets[i] sample 後、
-    // tempo 比でスケール)。 binary search で「`onsets[i] / tempo_ratio <=
-    // event_local` を満たす最大 i」 を求める。 tempo_ratio が安全な範囲なら
-    // `onsets[i] / tempo_ratio` は monotonically increasing。
-    if tempo_ratio <= 0.0 {
+    // 出力 sample 位置 event_local が含まれる slice を探す。 出力 sample →
+    // source frame の写像率 `map_rate` (= 時間軸の伸縮 × SR 比) で両空間を往復する:
+    // slice i の trigger 出力位置 = `onsets[i] / map_rate`。 binary search で
+    // 「`onsets[i] / map_rate <= event_local` を満たす最大 i」 を求める
+    // (map_rate > 0 なら monotonically increasing)。
+    let map_rate = tempo_ratio * native_stride;
+    if !map_rate.is_finite() || map_rate <= 0.0 {
         return (0.0, 0.0);
     }
-    // event_local * tempo_ratio に対応する onsets index を比較で探す
-    // (= `onsets[i] <= event_local * tempo_ratio` を満たす最大 i)。
-    let threshold = (event_local as f64 * tempo_ratio) as u64;
+    // event_local * map_rate に対応する onsets index を比較で探す
+    // (= `onsets[i] <= event_local * map_rate` を満たす最大 i)。
+    let threshold = (event_local as f64 * map_rate) as u64;
     // partition_point: onsets[i] <= threshold な要素数 = i のとき返る。 i-1
     // が「該当 slice index」 (= i == 0 なら slice 開始前で silence)。
     let count = onsets.partition_point(|&o| o <= threshold);
     if count == 0 {
-        // event_local が onsets[0] / tempo_ratio より前 (= まだ最初の slice 前)
+        // event_local が onsets[0] / map_rate より前 (= まだ最初の slice 前)
         // の場合は silence。 これは onsets[0] > 0 のときのみ起き、 通常は
         // onsets[0] = 0 で event 開始と同時に最初の slice が triggered。
         return (0.0, 0.0);
@@ -873,34 +946,172 @@ fn slice_sample_at(
         .get(slice_idx + 1)
         .copied()
         .unwrap_or(source_len);
-    // slice trigger 出力位置 (sample 単位):
-    // `onsets[i] / tempo_ratio` の floor。 整数化で 1 sample 単位の誤差。
-    let slice_trigger_output = (slice_source_start as f64 / tempo_ratio) as u64;
+    // slice trigger 出力位置 (sample 単位): `onsets[i] / map_rate` の floor。
+    // 整数化で 1 sample 単位の誤差。
+    let slice_trigger_output = (slice_source_start as f64 / map_rate) as u64;
     if event_local < slice_trigger_output {
         return (0.0, 0.0);
     }
-    // slice 内 elapsed (= 出力上の sample 数、 = source 上の sample 数 *
-    // 1.0、 native rate なので)
+    // slice 内 elapsed。 出力上の sample 数に native_stride を掛けて source frame
+    // へ写す (= slice 本体は native rate 再生 = pitch 保持)。
     let slice_local = event_local - slice_trigger_output;
-    let source_pos_in_event = slice_source_start + slice_local;
-    if source_pos_in_event >= slice_source_end {
+    let source_pos_in_event = slice_source_start as f64 + slice_local as f64 * native_stride;
+    if source_pos_in_event >= slice_source_end as f64 {
         // slice 末尾を越えた (= tempo 下降で gap、 silence で次 slice 待ち)
         return (0.0, 0.0);
     }
-    if source_pos_in_event >= source_len {
-        return (0.0, 0.0);
+    source_frame_lerp(
+        l_plane,
+        r_plane,
+        source_start,
+        source_end,
+        buffer_frames,
+        source_len,
+        source_pos_in_event,
+        reversed,
+    )
+    .unwrap_or((0.0, 0.0))
+}
+
+/// Stretch / Slice の「出力 sample → source frame」 写像が source SR ≠ engine SR でも
+/// 正しいことを検証する (= source SR 決め打ちの回帰防止)。 素材に ramp (0→1) を使い、
+/// 「出力の f 地点で source の f 地点が鳴っている」 を直接 assert する。
+/// 修正前は 44.1 kHz 素材 / 48 kHz engine で source を 8.8% 速く消費し、 clip 末尾
+/// 8.1% が無音になっていた (= 「波形より音が短い」)。
+#[cfg(test)]
+mod stretch_sample_rate_tests {
+    use super::*;
+
+    const ENGINE_SR: u32 = 48_000;
+    const BPM: f32 = 120.0;
+    /// 4 拍 @ 120 BPM = 2 秒 (= 1 秒素材の 2 倍に stretch)。
+    const LEN_BEATS: f64 = 4.0;
+
+    /// 1 秒ぶんの ramp (0.0 → 1.0) 素材。 出力値がそのまま「source のどこを
+    /// 読んでいるか」 を表すので、 時間写像を直接 assert できる。
+    fn ramp_source(source_sr: u32) -> AudioSourceBuffer {
+        let frames = u64::from(source_sr);
+        let samples: Vec<f32> = (0..frames).map(|i| i as f32 / (frames - 1) as f32).collect();
+        AudioSourceBuffer {
+            sample_rate: source_sr,
+            channels: 1,
+            frames,
+            samples: vec![samples],
+        }
     }
-    let abs_idx = if reversed {
-        source_start + (source_len - 1 - source_pos_in_event)
-    } else {
-        source_start + source_pos_in_event
-    };
-    if abs_idx >= source_end || abs_idx >= buffer_frames {
-        return (0.0, 0.0);
+
+    /// clip 全長 (2 秒) を 512 frame ずつ render して L channel を連結する。
+    fn render_clip(source_sr: u32, mode: StretchMode, onsets: Vec<u64>) -> Vec<f32> {
+        let buffer = ramp_source(source_sr);
+        let source_frames = buffer.frames;
+        let event = RenderedEvent {
+            track_idx: 0,
+            clip_idx: 0,
+            start_beat: 0.0,
+            end_beat: LEN_BEATS,
+            source_id: 1,
+            source_start_frames: 0,
+            source_end_frames: source_frames,
+            gain_lin: 1.0,
+            pan: 0.0,
+            pitch_ratio: pitch_ratio_for(mode, source_sr, ENGINE_SR, 0.0),
+            stretch_ratio: stretch_ratio_for(source_frames, source_sr, LEN_BEATS, BPM),
+            nominal_bpm: BPM,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+            reversed: false,
+            stretch_mode: mode,
+            onsets,
+            beat_markers: Vec::new(),
+        };
+        let mut sources = HashMap::new();
+        sources.insert(1u32, Arc::new(buffer));
+        let renderer = AudioClipRenderer { schedule: vec![event], sources };
+
+        let samples_per_beat = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
+        let total = (LEN_BEATS * samples_per_beat) as usize;
+        let mut rings = vec![[(u64::MAX, 0u64); 8]; 4];
+        let mut accum = vec![(u64::MAX, 0.0f64); 4];
+        let mut out = Vec::with_capacity(total);
+        while out.len() < total {
+            let frames = 512.min(total - out.len());
+            let mut l = vec![0.0f32; frames];
+            let mut r = vec![0.0f32; frames];
+            render_audio_events(
+                &renderer,
+                0,
+                &mut l,
+                &mut r,
+                out.len() as f64 / samples_per_beat,
+                BPM,
+                ENGINE_SR,
+                frames as u32,
+                f64::from(BPM),
+                &mut rings,
+                &mut accum,
+            );
+            out.extend_from_slice(&l);
+        }
+        // pan 中央 (equal-power × √2) は利得 1.0 に戻る前提を固定する。
+        out
     }
-    let s_l = l_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
-    let s_r = r_plane.get(abs_idx as usize).copied().unwrap_or(0.0);
-    (s_l, s_r)
+
+    /// 出力の位置 `f` (0..1) で source の位置 `f` が鳴っている = 時間写像が正しい。
+    /// 44.1 kHz 素材を 48 kHz engine で鳴らしても clip の端まで音が続く。
+    #[test]
+    fn stretch_maps_output_time_to_source_time_at_any_sample_rate() {
+        for source_sr in [48_000u32, 44_100, 96_000] {
+            let out = render_clip(source_sr, StretchMode::Stretch, Vec::new());
+            let total = out.len() as f64;
+            for f in [0.25_f64, 0.5, 0.75, 0.95] {
+                let idx = (total * f) as usize;
+                let got = out[idx];
+                assert!(
+                    (f64::from(got) - f).abs() < 0.03,
+                    "source {source_sr} Hz: 出力 {f} 地点で source {f} 地点が鳴るべき、 got {got}"
+                );
+            }
+            // 末尾がまるごと無音になっていないこと (= 「波形より音が短い」 の回帰検出)。
+            let tail = out[(total * 0.99) as usize];
+            assert!(
+                tail > 0.85,
+                "source {source_sr} Hz: clip 末尾まで鳴るべき、 got {tail}"
+            );
+        }
+    }
+
+    /// Slice は「slice の trigger 位置だけが伸縮し、 slice 本体は native rate」。
+    /// trigger の写像にも SR 比が要る (落とすと slice 境界が出力上でずれる)。
+    #[test]
+    fn slice_triggers_map_with_sample_rate_ratio() {
+        let source_sr = 44_100u32;
+        // 素材の中央 (0.5 秒) に 2 つ目の slice。
+        let onsets = vec![0u64, 22_050];
+        let out = render_clip(source_sr, StretchMode::Slice, onsets);
+
+        // slice 0 は native rate なので出力 0.5 秒 (= 24000 frame) で素材の中央に達し、
+        // slice 末尾を越えて gap になる。
+        assert!(out[23_000] > 0.4, "slice 0 の末尾直前は鳴っている: {}", out[23_000]);
+        assert!(
+            out[30_000].abs() < 1e-6,
+            "slice 0 終了後・slice 1 trigger 前は gap: {}",
+            out[30_000]
+        );
+        // slice 1 の trigger 出力位置 = 22050 / (stretch 0.5 × sr 0.91875) = 48000 frame。
+        assert!(
+            out[47_900].abs() < 1e-6,
+            "trigger 直前はまだ gap: {}",
+            out[47_900]
+        );
+        let after = out[49_000];
+        let expected = (22_050.0 + 1_000.0 * 44_100.0 / 48_000.0) / 44_099.0;
+        assert!(
+            (f64::from(after) - expected).abs() < 0.03,
+            "slice 1 は素材中央から native rate で再生されるべき、 expected {expected}, got {after}"
+        );
+    }
 }
 
 /// E5 (r.md #8): granular grain-trigger lock-in。 grain の source offset が trigger 時の値に
@@ -915,7 +1126,7 @@ mod e5_lockin_tests {
     fn call(el: u64, ratio: f64, ring: Option<&mut GrainLockRing>) {
         let plane = vec![0.0f32; 200_000];
         let _ = granular_sample_at(
-            el, ratio, &plane, &plane, 0, 200_000, 200_000, &[], 512.0, false, ring,
+            el, ratio, 1.0, &plane, &plane, 0, 200_000, 200_000, &[], 512.0, false, ring,
         );
     }
 

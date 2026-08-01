@@ -198,7 +198,15 @@ Raw クリップを Shift ドラッグすると `Stretch`（pitch 保持 granula
 - **Audio Editor（§3.10）の event グリップ Shift=ストレッチ**: 本対応は arrangement の
   clip 端 drag（#61 の主対象「クリップの長さを変える」）に集中。Audio Editor は per-event 詳細
   編集の副 surface で、別経路 `SetAudioEventTrim` を持つ。対称化は follow-up（KISS で今回見送り）。
-- **granular の source SR ≠ engine SR 補正**: 既存実装が granular で sr_factor 未適用（48k 前提）。
-  pre-existing で #61 と独立。stretch_ratio は秒基準で SR 非依存に算出済。
+- ~~**granular の source SR ≠ engine SR 補正**: 既存実装が granular で sr_factor 未適用（48k 前提）。
+  pre-existing で #61 と独立。stretch_ratio は秒基準で SR 非依存に算出済。~~
+  → **2026-08-01 修正済**。「スコープ外」に置いたまま残した結果、44.1 kHz 素材 / 48 kHz エンジンで
+  Stretch（granular）/ Slice が source を 8.8% 速く消費し、**クリップ末尾 8.1% が無音 + ピッチが
+  約 1.5 半音上ずる**実害になっていた（= 「波形より音が短い」）。granular / slice の
+  「出力 sample → source frame」換算すべてに `native_stride = source_sr / engine_sr` を掛け、
+  小数位置は linear interpolation で読むよう修正（`daw_audio/src/audio_clip_renderer.rs` の
+  `source_frame_lerp` / `granular_sample_at` / `slice_sample_at`）。回帰テストは
+  `stretch_sample_rate_tests`。新規 audio event の既定 mode は `Stretch`（`AudioEvent::default`）
+  なので、Shift ストレッチしていない読み込み直後のクリップも同じ影響を受けていた。
 - **stretch ドラッグ中の専用カーソル / ゴースト波形プレビュー**: commit 後の波形＋音が一致する
   ことが検証になるため未実装（polish）。
