@@ -8,13 +8,15 @@
 //! 切り出し対象:
 //! - [`fade_envelope`]: fade-in / fade-out の 0..=1 envelope (Linear /
 //!   Exponential / SCurve)
-//! - [`pitch_ratio_for`]: source frame stride per output frame の計算
-//!   (Raw / Repitch、 sample-rate 比 + pitch 比)
+//! - [`sample_rate_ratio`] / [`pitch_factor`]: **時間軸** (source SR ↔ engine SR)
+//!   と **ピッチ軸** (semitone) の比。 直交した 2 量として持ち、 どの mode で
+//!   どちらを掛けるかは呼び出し側 (render loop) が決める。 mode 分岐をここに
+//!   持たせていた旧 `pitch_ratio_for` は、 Stretch / Slice / Raw で pitch 比を
+//!   捨てていたため inspector のピッチが無反応になっていた
 //!
-//! どちらも RT path で呼ばれることを想定し allocation / panic free。
+//! どれも RT path で呼ばれることを想定し allocation / panic free。
 //! `Stretch` / `Slice` の time-stretch 本体は daw_audio
 //! `audio_clip_renderer.rs` の `granular_sample_at` / `slice_sample_at` が担う。
-//! ここ ([`pitch_ratio_for`]) は両モードで sr 補正のみ返す (= repitch しない)。
 
 use crate::model::{BeatMarker, FadeCurve, StretchMode};
 
@@ -41,35 +43,37 @@ pub fn fade_envelope(t: u64, fade_len: u64, curve: FadeCurve) -> f32 {
     }
 }
 
-/// 1 output frame あたりの source frame 進度 (= linear interp の lookup
-/// step)。 `Raw` は単純な sample-rate 補正、 `Repitch` は SR 比 ×
-/// pitch 比 (タープ式の "tape pitch" 挙動)。 `Stretch` / `Slice` は
-/// sr 比のみ返す (= repitch しない)。 time-stretch 本体は daw_audio
-/// `audio_clip_renderer.rs` の granular / slice 再生が別途担う。
+/// **時間軸**の換算比: engine の 1 output frame が source の何 frame に当たるか
+/// (= `source_sr / engine_sr`)。 pitch とは独立で、 4 mode すべてで「出力 sample →
+/// source frame」 の写像に必ず掛かる。 `engine_sample_rate == 0` は退化入力として
+/// `1.0` (= 補正なし)。
 ///
-/// 単位: `output_frame_at_engine_sr * pitch_ratio = source_frame_at_event_local`。
+/// 単位: `output_frame_at_engine_sr * sample_rate_ratio = source_frame`。
 /// Reverse は別経路 (caller 側で `source_len - 1 - source_pos` する)
 /// なのでここでは扱わない。
 #[inline]
-pub fn pitch_ratio_for(
-    stretch_mode: StretchMode,
-    source_sample_rate: u32,
-    engine_sample_rate: u32,
-    pitch_semitones: f32,
-) -> f64 {
-    let sr_factor = if engine_sample_rate == 0 {
+pub fn sample_rate_ratio(source_sample_rate: u32, engine_sample_rate: u32) -> f64 {
+    if engine_sample_rate == 0 {
         1.0
     } else {
         f64::from(source_sample_rate) / f64::from(engine_sample_rate)
-    };
-    let pitch_factor = 2f64.powf(f64::from(pitch_semitones) / 12.0);
-    match stretch_mode {
-        StretchMode::Raw => sr_factor,
-        StretchMode::Repitch => sr_factor * pitch_factor,
-        // Stretch / Slice は sr 補正のみ (repitch しない)。 time-stretch 本体は
-        // daw_audio audio_clip_renderer.rs の granular_sample_at / slice_sample_at。
-        StretchMode::Stretch | StretchMode::Slice => sr_factor,
     }
+}
+
+/// **ピッチ軸**の比: semitone → 再生比 (`2^(n/12)`)。 時間軸とは独立の量で、
+/// mode ごとに合成先が変わる:
+/// - `Raw` / `Repitch` (tape): source を読む速度そのものに掛かる → 長さも変わる
+/// - `Stretch` (granular) / `Slice`: grain / slice の **内部読み出し速度**にだけ
+///   掛かり、 grain / slice の **配置**には掛からない → 長さを変えずに移調する
+///
+/// 非有限 / 極端な入力は ±120 半音 (= ±10 oct) に clamp して比が inf / NaN に
+/// ならないようにする (RT path で使うので panic / alloc なし)。
+#[inline]
+pub fn pitch_factor(semitones: f32) -> f64 {
+    if !semitones.is_finite() {
+        return 1.0;
+    }
+    2f64.powf(f64::from(semitones.clamp(-120.0, 120.0)) / 12.0)
 }
 
 /// clip 伸縮量 = source の native 再生長 (秒) /
@@ -95,6 +99,64 @@ pub fn stretch_ratio_for(
         return 1.0;
     }
     native_secs / event_secs
+}
+
+/// 波形**描画**用: この audio event が実際に鳴る source 範囲と、 それが鳴る
+/// event-local 拍数を返す。 engine の再生と同じ時間写像を使うので、 これで描けば
+/// 「見えている波形 = 聞こえる音」 になる。
+///
+/// 戻り値 `(frames, beats)`:
+/// - `frames`: `source_start_frames` から鳴る frame 数 (source 窓を超えない)
+/// - `beats`: それが鳴り終わるまでの event-local 拍数 (`event_length_beats` を超えない)
+///
+/// mode ごとの「1 拍あたり消費する source frame 数」:
+/// - `Raw`: native rate × pitch (tempo / clip 伸縮に追従しない)
+/// - `Repitch`: 上記 × 伸縮比 (tape 式に伸縮 = 長さが合う)
+/// - `Stretch` / `Slice`: 伸縮比のみ (pitch は長さに影響しない = grain / slice の
+///   **配置**が長さを決める)
+///
+/// `beats < event_length_beats` なら余りは無音 (= ピッチを上げて速く鳴り終わった)、
+/// `frames < 窓` なら source が clip に収まらず cut された (= ピッチを下げた)。
+/// 退化入力 (0 長 / 0 窓 / bpm 0 / SR 0) は「窓を event 長いっぱいに」 の従来値。
+///
+/// **ここの mode 別 `rate` は `daw_audio::audio_clip_renderer::render_audio_events` の
+/// `time_stride` / `read_stride` 合成と同じ方針を、 engine SR に依らない単位
+/// (source frames / beat) で表したもの。 どちらかを変えたら必ず両方を合わせること**
+/// (GUI は engine SR を知らないので、 出力 frame 基準の render 側と単位を共有できない)。
+pub fn audible_source_span(
+    event: &crate::model::AudioEvent,
+    source_sample_rate: u32,
+    bpm: f32,
+) -> (u64, f64) {
+    let window = event
+        .source_end_frames
+        .saturating_sub(event.source_start_frames);
+    let len_beats = event.event_length_beats.max(0.0);
+    if window == 0 || len_beats <= 0.0 || bpm <= 0.0 || source_sample_rate == 0 {
+        return (window, len_beats);
+    }
+    let source_frames_per_beat = f64::from(source_sample_rate) * 60.0 / f64::from(bpm);
+    let stretch = stretch_ratio_for(window, source_sample_rate, len_beats, bpm);
+    let pitch = pitch_factor(event.pitch_semitones);
+    let rate = match event.stretch_mode {
+        StretchMode::Raw => pitch,
+        StretchMode::Repitch => stretch * pitch,
+        StretchMode::Stretch | StretchMode::Slice => stretch,
+    };
+    let frames_per_beat = source_frames_per_beat * rate;
+    if !frames_per_beat.is_finite() || frames_per_beat <= 0.0 {
+        return (window, len_beats);
+    }
+    let beats_for_window = window as f64 / frames_per_beat;
+    if beats_for_window <= len_beats {
+        // 窓を鳴らし切って余る → 波形は前方に詰まり、 残りは無音。
+        (window, beats_for_window)
+    } else {
+        // 窓が clip に収まらない → 鳴る範囲だけを clip 幅いっぱいに。
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let fits = (len_beats * frames_per_beat) as u64;
+        (fits.min(window), len_beats)
+    }
 }
 
 /// source 進度 = clip の手動 `stretch_ratio` (= [`stretch_ratio_for`]、 nominal
@@ -268,6 +330,99 @@ mod tests {
         BeatMarker { source_frame, locked_beat }
     }
 
+    // ---- audible_source_span (波形描画と再生の一致) ----
+
+    /// 48 kHz / 120 BPM → 1 拍 = 24000 source frame。 2 拍ぶん (48000 frame) の
+    /// 「素直な」 event (= import / trim 直後の lockstep 状態) を作る。
+    fn span_event(mode: StretchMode, window: u64, len_beats: f64, semis: f32) -> crate::model::AudioEvent {
+        crate::model::AudioEvent {
+            source_start_frames: 0,
+            source_end_frames: window,
+            event_length_beats: len_beats,
+            stretch_mode: mode,
+            pitch_semitones: semis,
+            ..crate::model::AudioEvent::default()
+        }
+    }
+
+    #[test]
+    fn audible_span_fills_clip_without_pitch() {
+        // ピッチ 0 なら 4 mode すべて「窓を event 長いっぱいに」 = 従来の描画と同じ。
+        for mode in [
+            StretchMode::Raw,
+            StretchMode::Repitch,
+            StretchMode::Stretch,
+            StretchMode::Slice,
+        ] {
+            let (frames, beats) = audible_source_span(&span_event(mode, 48_000, 2.0, 0.0), 48_000, 120.0);
+            assert_eq!(frames, 48_000, "{mode:?}");
+            assert!((beats - 2.0).abs() < 1e-9, "{mode:?}: got {beats}");
+        }
+    }
+
+    #[test]
+    fn audible_span_shrinks_when_pitched_up_in_tape_modes() {
+        // +1 oct = 2 倍速 → 窓は半分の拍数で鳴り終わり、 残りは無音。
+        for mode in [StretchMode::Raw, StretchMode::Repitch] {
+            let (frames, beats) =
+                audible_source_span(&span_event(mode, 48_000, 2.0, 12.0), 48_000, 120.0);
+            assert_eq!(frames, 48_000, "{mode:?}: 窓は全部鳴る");
+            assert!((beats - 1.0).abs() < 1e-9, "{mode:?}: got {beats}");
+        }
+    }
+
+    #[test]
+    fn audible_span_crops_when_pitched_down_in_tape_modes() {
+        // -1 oct = 半分の速度 → clip に収まらず、 窓の前半だけが鳴る。
+        let (frames, beats) =
+            audible_source_span(&span_event(StretchMode::Raw, 48_000, 2.0, -12.0), 48_000, 120.0);
+        assert_eq!(frames, 24_000);
+        assert!((beats - 2.0).abs() < 1e-9, "got {beats}");
+    }
+
+    #[test]
+    fn audible_span_ignores_pitch_in_granular_modes() {
+        // Stretch / Slice は配置が長さを決めるので、 移調しても長さは変わらない。
+        for mode in [StretchMode::Stretch, StretchMode::Slice] {
+            for semis in [12.0_f32, -12.0] {
+                let (frames, beats) =
+                    audible_source_span(&span_event(mode, 48_000, 2.0, semis), 48_000, 120.0);
+                assert_eq!(frames, 48_000, "{mode:?} {semis}");
+                assert!((beats - 2.0).abs() < 1e-9, "{mode:?} {semis}: got {beats}");
+            }
+        }
+    }
+
+    #[test]
+    fn audible_span_stretched_clip_still_fills() {
+        // Shift ストレッチ済 (窓は 2 拍ぶんのまま clip は 4 拍) でも Stretch は充填。
+        let (frames, beats) =
+            audible_source_span(&span_event(StretchMode::Stretch, 48_000, 4.0, 0.0), 48_000, 120.0);
+        assert_eq!(frames, 48_000);
+        assert!((beats - 4.0).abs() < 1e-9, "got {beats}");
+        // 同じ event を Raw にすると伸縮しないので、 窓は 2 拍で鳴り終わる。
+        let (frames, beats) =
+            audible_source_span(&span_event(StretchMode::Raw, 48_000, 4.0, 0.0), 48_000, 120.0);
+        assert_eq!(frames, 48_000);
+        assert!((beats - 2.0).abs() < 1e-9, "got {beats}");
+    }
+
+    #[test]
+    fn audible_span_degenerate_inputs_are_safe() {
+        assert_eq!(
+            audible_source_span(&span_event(StretchMode::Raw, 0, 2.0, 0.0), 48_000, 120.0),
+            (0, 2.0)
+        );
+        assert_eq!(
+            audible_source_span(&span_event(StretchMode::Raw, 48_000, 2.0, 0.0), 0, 120.0),
+            (48_000, 2.0)
+        );
+        assert_eq!(
+            audible_source_span(&span_event(StretchMode::Raw, 48_000, 2.0, 0.0), 48_000, 0.0),
+            (48_000, 2.0)
+        );
+    }
+
     #[test]
     fn warp_source_frame_piecewise_linear_with_extrapolation() {
         // <2 markers → None (uniform fallback)。
@@ -415,49 +570,34 @@ mod tests {
         assert!((fade_envelope(99, 100, FadeCurve::SCurve) - 1.0).abs() < 0.01);
     }
 
-    // ---- pitch_ratio_for ----
+    // ---- sample_rate_ratio / pitch_factor ----
 
     #[test]
-    fn pitch_ratio_raw_matches_sr_factor() {
-        let r = pitch_ratio_for(StretchMode::Raw, 44_100, 48_000, 12.0);
-        let expected = 44100.0 / 48000.0;
-        assert!((r - expected).abs() < 1e-9);
+    fn sample_rate_ratio_is_source_over_engine() {
+        let r = sample_rate_ratio(44_100, 48_000);
+        assert!((r - 44100.0 / 48000.0).abs() < 1e-9);
     }
 
     #[test]
-    fn pitch_ratio_repitch_applies_pitch_octave() {
-        // +12 semitones (1 octave up) → frame stride 2x。
-        let r = pitch_ratio_for(StretchMode::Repitch, 48_000, 48_000, 12.0);
-        assert!((r - 2.0).abs() < 1e-6);
+    fn pitch_factor_octave_up_and_down() {
+        assert!((pitch_factor(12.0) - 2.0).abs() < 1e-6);
+        assert!((pitch_factor(-12.0) - 0.5).abs() < 1e-6);
+        assert!((pitch_factor(0.0) - 1.0).abs() < 1e-9);
     }
 
     #[test]
-    fn pitch_ratio_repitch_applies_pitch_negative_octave() {
-        let r = pitch_ratio_for(StretchMode::Repitch, 48_000, 48_000, -12.0);
-        assert!((r - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn pitch_ratio_repitch_combines_sr_and_pitch() {
-        // 24kHz source @ engine 48kHz + 12 semitones → 0.5 * 2 = 1.0
-        let r = pitch_ratio_for(StretchMode::Repitch, 24_000, 48_000, 12.0);
+    fn sr_and_pitch_compose_for_tape_modes() {
+        // 24kHz source @ engine 48kHz + 12 semitones → 0.5 * 2 = 1.0 (Raw/Repitch の stride)。
+        let r = sample_rate_ratio(24_000, 48_000) * pitch_factor(12.0);
         assert!((r - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn pitch_ratio_stretch_slice_fallback_to_raw() {
-        let raw = pitch_ratio_for(StretchMode::Raw, 48_000, 48_000, 5.0);
-        let stretch = pitch_ratio_for(StretchMode::Stretch, 48_000, 48_000, 5.0);
-        let slice = pitch_ratio_for(StretchMode::Slice, 48_000, 48_000, 5.0);
-        assert!((raw - stretch).abs() < 1e-9);
-        assert!((raw - slice).abs() < 1e-9);
-    }
-
-    #[test]
-    fn pitch_ratio_engine_sr_zero_is_safe() {
-        // Defensive: engine_sr=0 で divide-by-zero しない (= sr_factor=1.0)。
-        let r = pitch_ratio_for(StretchMode::Raw, 48_000, 0, 0.0);
-        assert!((r - 1.0).abs() < 1e-9);
+    fn engine_sr_zero_and_non_finite_pitch_are_safe() {
+        // Defensive: engine_sr=0 で divide-by-zero しない、 NaN semitone は 1.0。
+        assert!((sample_rate_ratio(48_000, 0) - 1.0).abs() < 1e-9);
+        assert!((pitch_factor(f32::NAN) - 1.0).abs() < 1e-9);
+        assert!(pitch_factor(f32::MAX).is_finite());
     }
 
     // ---- stretch_ratio_for ----

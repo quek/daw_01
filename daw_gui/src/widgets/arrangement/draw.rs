@@ -148,7 +148,17 @@ pub(super) struct MidiNoteDraw {
 /// clip rect 内に重ねる中身 (波形 / MIDI)。`&AppData` (model + audio cache) から 1 フレーム分だけ
 /// 集めて heavy closure に move する (`Arc<AudioSourceBuffer>` は refcount clone で安価)。
 pub(super) enum ClipContentDraw {
-    Audio { buffer: Arc<AudioSourceBuffer>, start_frames: u64, end_frames: u64, source_id: u32 },
+    Audio {
+        buffer: Arc<AudioSourceBuffer>,
+        start_frames: u64,
+        /// **実際に鳴る** source 範囲の終端 (`common::audio_render::audible_source_span`)。
+        /// ピッチを下げて clip に収まらない場合は窓より手前で切れる。
+        end_frames: u64,
+        source_id: u32,
+        /// 上記が鳴り終わるまでが clip 幅の何割か (0..=1)。 ピッチを上げると音が
+        /// 早く終わるので、 波形もその割合まで詰めて描く (= 描いた波形 = 鳴る音)。
+        audible_frac: f32,
+    },
     Midi { notes: Vec<MidiNoteDraw>, len_beats: f64 },
 }
 
@@ -209,12 +219,18 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     // 別 tag を渡す。 `hctx.waveform` は id ごとに LOD 状態を持つので、 同一 (track, clip) の波形を
     // 1 フレームで 2 度描く (元 clip + ghost) 場合に同 id だと state 衝突 → LOD が毎フレーム再構築される。
     wf_id_tag: &'static str,
+    // `[start_frames, end_frames)` が鳴り終わるまでが clip 幅の何割か。 波形の描画幅を
+    // これで縮め、 残りは「無音」 として空ける (= ピッチを上げて速く鳴り終わる Raw /
+    // Repitch で「波形は全幅・音は途中で終わる」 という不一致を防ぐ)。
+    audible_frac: f32,
 ) {
     let inset_lr: f32 = 2.0;
+    let full_w = (clip_rect.w - inset_lr * 2.0).max(0.0);
+    let wf_w = full_w * audible_frac.clamp(0.0, 1.0);
     let mut view_rect = Rect {
         x: clip_rect.x + inset_lr,
         y: clip_rect.y + inset_top,
-        w: (clip_rect.w - inset_lr * 2.0).max(0.0),
+        w: wf_w,
         h: (clip_rect.h - inset_top - inset_lr).max(0.0),
     };
     let event_len_frames = end_frames.saturating_sub(start_frames);
@@ -225,7 +241,7 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
         if cut_px >= view_rect.w {
             return;
         }
-        let frames_per_px = (event_len_frames as f64 / f64::from(clip_rect.w.max(1.0))).max(0.0);
+        let frames_per_px = (event_len_frames as f64 / f64::from(wf_w.max(1.0))).max(0.0);
         let skip_frames = (f64::from(cut_px) * frames_per_px) as u64;
         view_start_sample = view_start_sample.saturating_add(skip_frames);
         view_len_samples = view_len_samples.saturating_sub(skip_frames).max(1);
@@ -969,10 +985,16 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         // (2) 中身 (波形 / MIDI) を上に重ねる。 波形は ghost 専用 id で LOD state 衝突を避ける
         //     (元 clip の波形と同一フレームに 2 度描くため。 `draw_clip_waveform_inner` 参照)。
         match clip_content.get(&a.key) {
-            Some(ClipContentDraw::Audio { buffer, start_frames, end_frames, source_id }) => {
+            Some(ClipContentDraw::Audio {
+                buffer,
+                start_frames,
+                end_frames,
+                source_id,
+                audible_frac,
+            }) => {
                 draw_clip_waveform_inner(
                     hctx, a.key, r, buffer, *start_frames, *end_frames, *source_id, true, lanes.x,
-                    inset, style, "drag_ghost_wf",
+                    inset, style, "drag_ghost_wf", *audible_frac,
                 );
             }
             Some(ClipContentDraw::Midi { notes, len_beats }) => {

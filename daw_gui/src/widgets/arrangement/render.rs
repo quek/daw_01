@@ -228,6 +228,7 @@ pub(super) fn render_arrangement_heavy(
                                 start_frames,
                                 end_frames,
                                 source_id,
+                                audible_frac,
                             } => {
                                 draw_clip_waveform_inner(
                                     hctx,
@@ -242,6 +243,7 @@ pub(super) fn render_arrangement_heavy(
                                     inset,
                                     &style_copy,
                                     "audio_clip_wf",
+                                    *audible_frac,
                                 );
                             }
                             ClipContentDraw::Midi { notes, len_beats } => {

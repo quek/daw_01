@@ -210,3 +210,29 @@ Raw クリップを Shift ドラッグすると `Stretch`（pitch 保持 granula
   なので、Shift ストレッチしていない読み込み直後のクリップも同じ影響を受けていた。
 - **stretch ドラッグ中の専用カーソル / ゴースト波形プレビュー**: commit 後の波形＋音が一致する
   ことが検証になるため未実装（polish）。
+
+## 6. 時間軸とピッチ軸の分離（2026-08-01）
+
+上記 sr_factor 修正と同じ根 — 「1 output frame が source の何 frame か」を **1 個の
+`pitch_ratio_for(mode, ...)`** に mode 分岐込みで押し込んでいたため、Raw / Stretch / Slice で
+ピッチ比が捨てられ、**インスペクタのピッチ（semitones）が既定モードで無反応**だった
+（効いていたのは Repitch のみ）。直交する 2 量に分離した:
+
+| 量 | 定義 | 掛かる場所 |
+|---|---|---|
+| `sample_rate_ratio` | `source_sr / engine_sr` | 出力 sample → source frame の**時間写像**すべて（Raw/Repitch の stride、granular の grain **配置**、slice の trigger 写像） |
+| `pitch_factor` | `2^(semitones/12)` | source を**読む速度**（`read_stride = sr_ratio × pitch_factor`） |
+
+mode ごとの合成は render loop が持つ:
+- **Raw**: stride = `read_stride`（tempo/stretch 非追従、ピッチはテープ式 = Ableton Warp-off + Transpose 相当）
+- **Repitch**: stride = `read_stride × tempo追従`（従来どおり）
+- **Stretch**: 配置 = `time_stride × stretch × tempo`、grain 内読み = `read_stride`
+  → **長さを変えずに移調**（granular pitch shift）
+- **Slice**: trigger 写像 = `time_stride × stretch × tempo`、slice 内読み = `read_stride`
+  → trigger グリッドは動かず slice の鳴る長さだけ変わる（Ableton Beats mode の Transpose 相当）
+
+回帰テスト: `pitch_scales_in_grain_read_rate_only` / `pitch_shift_keeps_length_in_stretch_mode` /
+`pitch_scales_playback_rate_in_tape_and_slice_modes`。
+
+未実装: `AudioEvent.formant_semitones`（モデルに field だけ有り、DSP も UI も無し）。
+フォルマント保持には位相ボコーダ / PSOLA が要るので別対応。

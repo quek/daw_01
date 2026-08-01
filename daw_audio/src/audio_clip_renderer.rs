@@ -21,7 +21,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use common::audio_render::{fade_envelope, pitch_ratio_for, stretch_ratio_for, tempo_follow_ratio};
+use common::audio_render::{
+    fade_envelope, pitch_factor, sample_rate_ratio, stretch_ratio_for, tempo_follow_ratio,
+};
 use common::model::{
     AudioSourceId, AudioSourcePath, ClipContent, FadeCurve, Song, StretchMode,
 };
@@ -78,11 +80,15 @@ pub struct RenderedEvent {
     pub source_end_frames: u64,
     pub gain_lin: f32,
     pub pan: f32,
-    /// Source frame stride per output frame at **nominal** bpm (= compile
-    /// 時点の `song.bpm` での pitch ratio。 Repitch mode は per-buffer に
-    /// `pitch_ratio * current_bpm / nominal_bpm` でスケール、 他 mode は
-    /// 不変)。 1.0 = same speed as engine SR at nominal bpm。
-    pub pitch_ratio: f64,
+    /// **時間軸**の SR 換算比 (= `source_sr / engine_sr`)。 出力 sample を source
+    /// frame へ写す全経路 (Raw/Repitch の stride、 granular の grain 配置、 slice の
+    /// trigger 写像) に掛かる。 pitch とは独立。
+    pub sr_ratio: f64,
+    /// **ピッチ軸**の比 (= `2^(semitones/12)`)。 tape 系 (Raw / Repitch) は source を
+    /// 読む速度そのものに掛かる (長さも変わる)。 granular (Stretch) / Slice は grain /
+    /// slice の **内部読み出し**にだけ掛かり **配置**には掛からない (= 長さを変えずに
+    /// 移調)。
+    pub pitch_factor: f64,
     /// source の native 長 / event の配置長 の比
     /// (= `native_secs / event_secs`、 nominal bpm 基準)。 `1.0` で「source を
     /// そのまま」 (= trim、 native rate)。 `< 1.0` で event slot の方が長い → source
@@ -273,12 +279,12 @@ pub fn compile_audio_schedule(
                 if event_end_beat <= event_start_beat {
                     continue;
                 }
-                let pitch_ratio = pitch_ratio_for(
-                    event.stretch_mode,
-                    buffer.sample_rate,
-                    engine_sample_rate,
-                    event.pitch_semitones,
-                );
+                // 時間軸 (SR 比) と ピッチ軸 (semitone) は直交した 2 量として持ち、
+                // どちらをどこに掛けるかは render loop が mode ごとに決める
+                // (旧 `pitch_ratio_for` は mode 分岐でピッチ比を捨てており、
+                // Raw / Stretch / Slice で inspector のピッチが無反応だった)。
+                let sr_ratio = sample_rate_ratio(buffer.sample_rate, engine_sample_rate);
+                let pitch_factor = pitch_factor(event.pitch_semitones);
                 // clip time-stretch 量 = source native 長 / event 配置長
                 // (秒で比較、 engine SR に依らない)。 nominal bpm 基準で固定し、
                 // tempo-follow (current/nominal) とは render loop で乗算合成する。
@@ -316,7 +322,8 @@ pub fn compile_audio_schedule(
                     source_end_frames: event.source_end_frames,
                     gain_lin,
                     pan: event.pan.clamp(-1.0, 1.0),
-                    pitch_ratio,
+                    sr_ratio,
+                    pitch_factor,
                     stretch_ratio,
                     nominal_bpm: song.bpm,
                     fade_in_beats: event.fade_in_beats.max(0.0),
@@ -467,21 +474,27 @@ pub fn render_audio_events(
             tempo_follow_ratio(event.stretch_ratio, f64::from(current_bpm), nominal_bpm);
         let follow_smoothed =
             tempo_follow_ratio(event.stretch_ratio, smoothed_current_bpm, nominal_bpm);
+        // 「出力 sample → source frame」 の **時間軸** 換算 (= SR 比)。 退化値
+        // (0 / 負 / NaN) は 1.0 に倒す defensive (source が止まって drone 化しない)。
+        // ※ この下の mode 別合成 (time_stride / read_stride) は、 波形描画側の
+        // `common::audio_render::audible_source_span` と同じ方針でなければならない
+        // (= 描いた波形と鳴る音が一致する条件)。 片方だけ変えないこと。
+        let time_stride = if event.sr_ratio > 0.0 { event.sr_ratio } else { 1.0 };
+        // source を **読む** 速度 = 時間軸 × ピッチ軸。 granular / slice はこれを
+        // grain / slice の内部読み出しにだけ使い、 配置には `time_stride` を使う
+        // ので、 移調しても長さが変わらない (= pitch 保持ストレッチ + 独立移調)。
+        let read_stride = if event.pitch_factor > 0.0 {
+            time_stride * event.pitch_factor
+        } else {
+            time_stride
+        };
         let effective_pitch_ratio = match event.stretch_mode {
             // Repitch (tape 式) は clip 長 stretch + tempo 追従が再生速度に乗る
             // (= pitch も一緒に変わる、 vinyl 流)。 Raw は stretch_ratio / tempo を
-            // 無視 (= 時間操作しない定義、 native rate で trim/cut)。
-            StretchMode::Repitch => event.pitch_ratio * follow_instant,
-            _ => event.pitch_ratio,
-        };
-        // Stretch (granular) / Slice が「出力 sample → source frame」 を写すときの
-        // native pitch 進度 (= source_sr / engine_sr)。 Stretch/Slice の
-        // `pitch_ratio` は `pitch_ratio_for` が返す sr 補正そのもの。 退化値
-        // (0 / 負 / NaN) は 1.0 に倒す defensive (source が止まって drone 化しない)。
-        let native_stride = if event.pitch_ratio > 0.0 {
-            event.pitch_ratio
-        } else {
-            1.0
+            // 無視 (= 時間操作しない定義、 native rate で trim/cut) が、 ピッチ指定は
+            // tape として効く (= Ableton Warp-off + Transpose 相当)。
+            StretchMode::Repitch => read_stride * follow_instant,
+            _ => read_stride,
         };
 
         // beat-domain fade を per-buffer の current_bpm で sample 換算する。
@@ -585,7 +598,8 @@ pub fn render_audio_events(
                     // 完全 click-free には per-event grain-trigger lock-in が必要
                     // (= 別 phase)。
                     follow_smoothed,
-                    native_stride,
+                    time_stride,
+                    read_stride,
                     l_plane,
                     r_plane,
                     event.source_start_frames,
@@ -600,7 +614,8 @@ pub fn render_audio_events(
                     event_local,
                     // slice 配置にも clip 長 stretch + tempo 追従を合成 (instant)。
                     follow_instant,
-                    native_stride,
+                    time_stride,
+                    read_stride,
                     l_plane,
                     r_plane,
                     event.source_start_frames,
@@ -749,15 +764,15 @@ fn source_frame_lerp(
 fn granular_sample_at(
     event_local: u64,
     tempo_ratio: f64,
-    // 1 output frame あたりの source frame 進度 (**native pitch 時**) =
-    // `source_sr / engine_sr` (= `RenderedEvent.pitch_ratio`、 Stretch/Slice では
-    // `pitch_ratio_for` が sr 補正のみを返す)。 出力時刻 (= engine SR 基準の sample)
-    // を source frame へ写す全ての箇所に掛ける必要がある: grain の配置
-    // (`grain_start_out × tempo_ratio × native_stride`) と grain 内の読み進み
-    // (`in_grain × native_stride` = pitch 保持の再生速度)。 これを落とすと 44.1 kHz
-    // 素材を 48 kHz エンジンで再生したとき source を 8.8% 速く消費し、 clip 末尾が
-    // 無音になった上に pitch が ~1.5 半音上ずる (= 「波形より音が短い」)。
-    native_stride: f64,
+    // **時間軸** の換算比 (= `source_sr / engine_sr`)。 grain の **配置**
+    // (`grain_start_out × tempo_ratio × time_stride`) に掛かる。 これを落とすと
+    // 44.1 kHz 素材を 48 kHz エンジンで再生したとき source を 8.8% 速く消費し、
+    // clip 末尾が無音になる (= 「波形より音が短い」)。
+    time_stride: f64,
+    // grain **内部** の読み進み (= `time_stride × pitch_factor`)。 配置と分けて
+    // あるので、 移調しても grain の配置 = 出力長は変わらない (granular pitch
+    // shift: 長さは配置が、 音程は読み速度が決める)。
+    read_stride: f64,
     l_plane: &[f32],
     r_plane: &[f32],
     source_start: u64,
@@ -805,20 +820,20 @@ fn granular_sample_at(
         }
         // grain の source 内 offset。 warp markers (≥2) があれば event-local beat
         // (= grain_start_out / samples_per_beat) を warp_source_frame で source
-        // frame に写す非一様 stretch、 無ければ uniform (× tempo_ratio × native_stride)。
-        // warp path の戻り値は既に source frame 空間なので native_stride は掛けない
+        // frame に写す非一様 stretch、 無ければ uniform (× tempo_ratio × time_stride)。
+        // warp path の戻り値は既に source frame 空間なので time_stride は掛けない
         // (掛けるのは「出力 sample → source frame」 の換算のみ)。
         let grain_source_offset = if beat_markers.len() >= 2 && samples_per_beat > 0.0 {
             let event_beat = grain_start_out as f64 / samples_per_beat;
             match common::audio_render::warp_source_frame(event_beat, beat_markers) {
                 Some(sf) => (sf - source_start as f64).max(0.0) as u64,
-                None => (grain_start_out as f64 * tempo_ratio * native_stride).max(0.0) as u64,
+                None => (grain_start_out as f64 * tempo_ratio * time_stride).max(0.0) as u64,
             }
         } else {
             // E5: uniform stretch。 lock_ring があれば grain k の source offset を **trigger 時の
             // 値に固定** する。 tempo_ratio は buffer ごとに変わりうる (tempo automation) ので、
             // 同じ grain を後続 buffer で recompute すると source position が跳んで click になる。
-            let recomputed = (grain_start_out as f64 * tempo_ratio * native_stride).max(0.0) as u64;
+            let recomputed = (grain_start_out as f64 * tempo_ratio * time_stride).max(0.0) as u64;
             if let Some(ring) = lock_ring.as_deref_mut() {
                 let slot = (k as usize) % ring.len();
                 if ring[slot].0 == k {
@@ -831,9 +846,9 @@ fn granular_sample_at(
                 recomputed
             }
         };
-        // grain 内は **native pitch** で読み進む (= pitch 保持)。 出力 sample の
-        // 進みに `native_stride` を掛けて source frame へ写し、 小数位置は補間する。
-        let source_pos_in_event = grain_source_offset as f64 + in_grain as f64 * native_stride;
+        // grain 内は `read_stride` (= SR 比 × ピッチ比) で読み進む。 配置とは独立
+        // なので、 移調しても出力長は変わらない。 小数位置は補間する。
+        let source_pos_in_event = grain_source_offset as f64 + in_grain as f64 * read_stride;
         let Some((s_l, s_r)) = source_frame_lerp(
             l_plane,
             r_plane,
@@ -884,11 +899,13 @@ fn granular_sample_at(
 fn slice_sample_at(
     event_local: u64,
     tempo_ratio: f64,
-    // granular と同じ「1 output frame あたりの source frame 進度 (native pitch)」
-    // (= `source_sr / engine_sr`)。 slice の **trigger 位置の写像** と **slice 内の
-    // 読み進み** の両方に効く。 落とすと source SR ≠ engine SR で slice が native
-    // rate にならず (pitch がずれ)、 slice 境界も出力上でずれる。
-    native_stride: f64,
+    // **時間軸** の換算比 (= `source_sr / engine_sr`)。 slice の **trigger 位置の
+    // 写像** に効く。 落とすと source SR ≠ engine SR で slice 境界が出力上でずれる。
+    time_stride: f64,
+    // slice **内部** の読み進み (= `time_stride × pitch_factor`)。 移調すると slice
+    // 本体が速く / 遅くなる (= Ableton Beats mode の Transpose と同じで、 trigger
+    // グリッドは動かず slice の鳴る長さだけ変わる)。
+    read_stride: f64,
     l_plane: &[f32],
     r_plane: &[f32],
     source_start: u64,
@@ -913,7 +930,7 @@ fn slice_sample_at(
             source_end,
             buffer_frames,
             source_len,
-            event_local as f64 * native_stride,
+            event_local as f64 * read_stride,
             reversed,
         )
         .unwrap_or((0.0, 0.0));
@@ -924,7 +941,7 @@ fn slice_sample_at(
     // slice i の trigger 出力位置 = `onsets[i] / map_rate`。 binary search で
     // 「`onsets[i] / map_rate <= event_local` を満たす最大 i」 を求める
     // (map_rate > 0 なら monotonically increasing)。
-    let map_rate = tempo_ratio * native_stride;
+    let map_rate = tempo_ratio * time_stride;
     if !map_rate.is_finite() || map_rate <= 0.0 {
         return (0.0, 0.0);
     }
@@ -952,10 +969,10 @@ fn slice_sample_at(
     if event_local < slice_trigger_output {
         return (0.0, 0.0);
     }
-    // slice 内 elapsed。 出力上の sample 数に native_stride を掛けて source frame
-    // へ写す (= slice 本体は native rate 再生 = pitch 保持)。
+    // slice 内 elapsed。 出力上の sample 数に read_stride を掛けて source frame
+    // へ写す (= slice 本体は native rate 再生、 移調時のみその比で速くなる)。
     let slice_local = event_local - slice_trigger_output;
-    let source_pos_in_event = slice_source_start as f64 + slice_local as f64 * native_stride;
+    let source_pos_in_event = slice_source_start as f64 + slice_local as f64 * read_stride;
     if source_pos_in_event >= slice_source_end as f64 {
         // slice 末尾を越えた (= tempo 下降で gap、 silence で次 slice 待ち)
         return (0.0, 0.0);
@@ -1002,6 +1019,16 @@ mod stretch_sample_rate_tests {
 
     /// clip 全長 (2 秒) を 512 frame ずつ render して L channel を連結する。
     fn render_clip(source_sr: u32, mode: StretchMode, onsets: Vec<u64>) -> Vec<f32> {
+        render_clip_pitched(source_sr, mode, onsets, 0.0)
+    }
+
+    /// `semitones` 付きの render (= inspector のピッチ指定に相当)。
+    fn render_clip_pitched(
+        source_sr: u32,
+        mode: StretchMode,
+        onsets: Vec<u64>,
+        semitones: f32,
+    ) -> Vec<f32> {
         let buffer = ramp_source(source_sr);
         let source_frames = buffer.frames;
         let event = RenderedEvent {
@@ -1014,7 +1041,8 @@ mod stretch_sample_rate_tests {
             source_end_frames: source_frames,
             gain_lin: 1.0,
             pan: 0.0,
-            pitch_ratio: pitch_ratio_for(mode, source_sr, ENGINE_SR, 0.0),
+            sr_ratio: sample_rate_ratio(source_sr, ENGINE_SR),
+            pitch_factor: pitch_factor(semitones),
             stretch_ratio: stretch_ratio_for(source_frames, source_sr, LEN_BEATS, BPM),
             nominal_bpm: BPM,
             fade_in_beats: 0.0,
@@ -1082,6 +1110,81 @@ mod stretch_sample_rate_tests {
         }
     }
 
+    /// 最後に音が出ている出力 frame (= source を使い切った位置)。
+    fn last_audible(out: &[f32]) -> usize {
+        out.iter()
+            .rposition(|s| s.abs() > 1e-4)
+            .unwrap_or(0)
+    }
+
+    /// granular の **ピッチ** は grain 内部の読み速度だけを変え、 grain の **配置**
+    /// (= 出力長) は変えない。 grain 0 のみが active な区間 (in_grain < HOP) で
+    /// 同じ window 係数が掛かるので、 出力比 = read_stride 比になる。
+    #[test]
+    fn pitch_scales_in_grain_read_rate_only() {
+        // ramp plane: 値 = index / (len-1) なので、 読み位置がそのまま値に出る。
+        let len = 48_000usize;
+        let plane: Vec<f32> = (0..len).map(|i| i as f32 / (len - 1) as f32).collect();
+        let at = |read_stride: f64| {
+            granular_sample_at(
+                300, // grain 0 のみ active (< GRAIN_HOP_SAMPLES)
+                1.0,
+                1.0,
+                read_stride,
+                &plane,
+                &plane,
+                0,
+                len as u64,
+                len as u64,
+                &[],
+                512.0,
+                false,
+                None,
+            )
+            .0
+        };
+        let base = at(1.0);
+        let octave_up = at(2.0);
+        assert!(base > 0.0, "基準が無音では比が取れない: {base}");
+        assert!(
+            (f64::from(octave_up / base) - 2.0).abs() < 1e-3,
+            "+1 oct で grain 内の読み速度が 2 倍になるべき、 got {}",
+            octave_up / base
+        );
+    }
+
+    /// Stretch (granular) で移調しても **長さは変わらない** (= pitch 保持ストレッチ
+    /// と独立した移調)。 修正前は semitone が捨てられ、 そもそも音程が動かなかった。
+    #[test]
+    fn pitch_shift_keeps_length_in_stretch_mode() {
+        let plain = render_clip_pitched(48_000, StretchMode::Stretch, Vec::new(), 0.0);
+        let up = render_clip_pitched(48_000, StretchMode::Stretch, Vec::new(), 12.0);
+        let down = render_clip_pitched(48_000, StretchMode::Stretch, Vec::new(), -12.0);
+        for (label, out) in [("+12", &up), ("-12", &down)] {
+            let ratio = last_audible(out) as f64 / last_audible(&plain) as f64;
+            assert!(
+                (ratio - 1.0).abs() < 0.02,
+                "{label} 半音でも clip 長は不変であるべき、 got {ratio}"
+            );
+        }
+    }
+
+    /// tape 系 (Raw / Repitch) と Slice は、 移調がそのまま再生速度になる
+    /// (= +1 oct で source を 2 倍速で消費 → 鳴る長さが半分)。 修正前は Raw /
+    /// Slice が semitone を無視していた (inspector のピッチが無反応)。
+    #[test]
+    fn pitch_scales_playback_rate_in_tape_and_slice_modes() {
+        for mode in [StretchMode::Raw, StretchMode::Repitch, StretchMode::Slice] {
+            let plain = render_clip_pitched(48_000, mode, Vec::new(), 0.0);
+            let up = render_clip_pitched(48_000, mode, Vec::new(), 12.0);
+            let ratio = last_audible(&up) as f64 / last_audible(&plain) as f64;
+            assert!(
+                (ratio - 0.5).abs() < 0.02,
+                "{mode:?}: +1 oct で 2 倍速 (= 鳴る長さ半分) になるべき、 got {ratio}"
+            );
+        }
+    }
+
     /// Slice は「slice の trigger 位置だけが伸縮し、 slice 本体は native rate」。
     /// trigger の写像にも SR 比が要る (落とすと slice 境界が出力上でずれる)。
     #[test]
@@ -1126,7 +1229,7 @@ mod e5_lockin_tests {
     fn call(el: u64, ratio: f64, ring: Option<&mut GrainLockRing>) {
         let plane = vec![0.0f32; 200_000];
         let _ = granular_sample_at(
-            el, ratio, 1.0, &plane, &plane, 0, 200_000, 200_000, &[], 512.0, false, ring,
+            el, ratio, 1.0, 1.0, &plane, &plane, 0, 200_000, 200_000, &[], 512.0, false, ring,
         );
     }
 

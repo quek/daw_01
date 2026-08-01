@@ -2052,13 +2052,24 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     if let Some(ev) = content.audio_events().and_then(|e| e.first())
                         && let Some(buffer) = app.media.audio_source_cache.get(ev.source_id)
                     {
+                        // 波形は「実際に鳴る範囲」 を「鳴る時間ぶんの幅」 に描く
+                        // (engine と同じ時間写像 = `audible_source_span`)。 ピッチを
+                        // 上げた Raw / Repitch では音が途中で終わるので、 波形も
+                        // そこまでで止まり残りが空く。
+                        let (audible_frames, audible_beats) = common::audio_render::audible_source_span(
+                            ev,
+                            buffer.sample_rate,
+                            app.song_doc.song().bpm,
+                        );
+                        let len_beats = ev.event_length_beats.max(1e-9);
                         map.insert(
                             key,
                             ClipContentDraw::Audio {
                                 buffer,
                                 start_frames: ev.source_start_frames,
-                                end_frames: ev.source_end_frames,
+                                end_frames: ev.source_start_frames.saturating_add(audible_frames),
                                 source_id: ev.source_id,
+                                audible_frac: (audible_beats / len_beats).clamp(0.0, 1.0) as f32,
                             },
                         );
                     } else if let Some(notes) = content.notes()

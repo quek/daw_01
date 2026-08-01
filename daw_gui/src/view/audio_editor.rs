@@ -440,11 +440,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             planes_fallback = buffer.samples.iter().map(Vec::as_slice).collect();
             &planes_fallback
         };
-        let event_len_frames = event
-            .source_end_frames
-            .saturating_sub(event.source_start_frames)
-            .max(1);
-
         let is_selected = selected_set.contains(&idx);
         let fg = if is_selected {
             theme::WAVEFORM_SEL.with_alpha(0.95)
@@ -541,41 +536,54 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 );
             }
         } else {
-            // uniform stretch / raw: 従来の単一 linear 波形。
-            // visible-portion を source frames にマップ。 evt_x_*_clamped は
-            // [0, 1] 内の view 内 ratio。 event-local 比率に直して
-            // event_len_frames に掛ける。
-            let event_len_beats_safe = event.event_length_beats.max(1e-9);
+            // uniform stretch / raw: 単一 linear 波形。 写像は engine と同じ
+            // `audible_source_span` (= 実際に鳴る source 範囲 / それが鳴る拍数) を
+            // 使う。 ピッチを上げた Raw / Repitch は途中で鳴り終わるので、 波形も
+            // そこで止まり残りが空く (= 見える波形 = 聞こえる音)。 `event_rect` は
+            // hit-test / 選択枠の slot なので縮めない (描画 rect だけ縮める)。
+            let (audible_frames, audible_beats) = common::audio_render::audible_source_span(
+                event,
+                buffer.sample_rate,
+                app.song_doc.song().bpm,
+            );
             let event_view_start_beat = event.event_start_in_clip_beats.max(view_start_beat);
             let event_view_end_beat = (event.event_start_in_clip_beats
                 + event.event_length_beats)
                 .min(view_start_beat + view_len_beats);
+            let draw_end_beat =
+                event_view_end_beat.min(event.event_start_in_clip_beats + audible_beats);
             let visible_start_in_event =
                 (event_view_start_beat - event.event_start_in_clip_beats).max(0.0);
-            let visible_len_in_event = (event_view_end_beat - event_view_start_beat).max(0.0);
+            let visible_len_in_event = (draw_end_beat - event_view_start_beat).max(0.0);
+            let visible_span = (event_view_end_beat - event_view_start_beat).max(1e-9);
+            let frames_per_beat = audible_frames as f64 / audible_beats.max(1e-9);
             let src_visible_start_frames = event.source_start_frames
-                + ((visible_start_in_event / event_len_beats_safe) * event_len_frames as f64)
-                    as u64;
-            let src_visible_len_frames = ((visible_len_in_event / event_len_beats_safe)
-                * event_len_frames as f64) as u64;
-            let source = WaveformSource {
-                samples: SampleSlices::Planar(planes_borrowed),
-                valid_len: buffer.frames as usize,
-                generation: event.source_id as u64,
-                sample_rate: buffer.sample_rate,
+                + (visible_start_in_event * frames_per_beat) as u64;
+            let src_visible_len_frames = (visible_len_in_event * frames_per_beat) as u64;
+            let wf_rect = Rect {
+                w: event_rect.w * (visible_len_in_event / visible_span) as f32,
+                ..event_rect
             };
-            let view = WaveformView {
-                start_sample: src_visible_start_frames,
-                len_samples: src_visible_len_frames.max(1),
-                vertical_gain: app.ui_prefs.audio_editor_vertical_gain,
-            };
-            let _ = ui.waveform(
-                ("audio_editor_wf", clip.id, idx),
-                event_rect,
-                source,
-                view,
-                style,
-            );
+            if wf_rect.w > 0.0 && src_visible_len_frames > 0 {
+                let source = WaveformSource {
+                    samples: SampleSlices::Planar(planes_borrowed),
+                    valid_len: buffer.frames as usize,
+                    generation: event.source_id as u64,
+                    sample_rate: buffer.sample_rate,
+                };
+                let view = WaveformView {
+                    start_sample: src_visible_start_frames,
+                    len_samples: src_visible_len_frames.max(1),
+                    vertical_gain: app.ui_prefs.audio_editor_vertical_gain,
+                };
+                let _ = ui.waveform(
+                    ("audio_editor_wf", clip.id, idx),
+                    wf_rect,
+                    source,
+                    view,
+                    style,
+                );
+            }
         }
 
         // Selection border (= 選択中のみ視認できる枠)。 1 px 太い線で
