@@ -1079,6 +1079,13 @@ impl AppData {
                 // _song で SetSlotPlugin 再送。
                 let song_snapshot = self.song_doc.song().clone();
                 self.restore_plugin_from_song(&song_snapshot);
+                // ループ (ON/OFF + 範囲) は `Song` に載らない session state なので
+                // LoadSong では戻らない。 新しい audio プロセスは既定 (OFF / 範囲
+                // 未設定) で立ち上がるため、 明示的に送り直して GUI 表示と engine の
+                // 実挙動を揃える。
+                if matches!(kind, ChildKind::Audio) {
+                    self.set_loop_region(self.transport.loop_region);
+                }
                 self.ui_ephemeral.status_message = format!(
                     "{}を再起動しました{}{}",
                     kind.as_str(),

@@ -14,7 +14,12 @@ pub struct TransportState {
 
     // -------- Playback / metering --------
     pub is_playing: bool,
-    pub is_looping: bool,
+    /// 再生ループ (ON/OFF + 範囲) の live SSoT。 ループは「作った中身」 ではなく
+    /// 「聴き方の都合」 なので `Song` には置かず、 ズーム / スクロールと同じく
+    /// ここ (session state) が持ち `ViewState` で永続化する = **変えても dirty
+    /// (`*`) にならないが保存される**。 更新は必ず [`AppData::set_loop_region`]
+    /// 経由 (state と audio engine への `SetLoop` を 1 か所で揃える)。
+    pub loop_region: common::model::LoopRegion,
     pub playhead_beat: Option<f32>,
     /// Pro Tools 流の「Stop で再生開始位置に戻す」 用、 直前の play()
     /// 開始時点の playhead を保持。 stop() で playhead_beat に書き戻し

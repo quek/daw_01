@@ -76,10 +76,14 @@ pub struct DispatchShared {
     pub frames: AtomicU32,
     pub playing: AtomicU8,
     pub any_solo: AtomicU8,
-    /// user の loop button 実状態 (= `shared.looping`)。 master が dispatch 前に
-    /// store、 workers が `process_track_owned` に渡して plugin transport の
-    /// looping field / IS_LOOP_ACTIVE 判定に使う。
-    pub looping: AtomicU8,
+    /// 再生ループの状態 (= `SharedState::loop_region` の copy)。 master が dispatch
+    /// 直前に自分のスタック上の値を publish し、 workers が `process_track_owned` に
+    /// 渡して plugin transport の `loop_*_beats` / `looping` / IS_LOOP_ACTIVE 判定に
+    /// 使う。 ON/OFF と範囲を別々の atomic に割ると worker が食い違った組を読みうる
+    /// ので、`song_ptr` / `recording_lanes_ptr` と同じ「master が dispatch 窓の間だけ
+    /// 生かす値へのポインタ」 idiom で 1 スナップショットとして渡す。 null = 既定
+    /// (ループ無し)。
+    pub loop_region_ptr: AtomicPtr<common::model::LoopRegion>,
     /// PR4.5 sidechain plugin-internal alignment: per-track input delay
     /// in samples (= `Schedule::input_delay_per_track` snapshotted into
     /// the worker pool's shared state for the current dispatch). `null`
@@ -127,7 +131,7 @@ impl DispatchShared {
             frames: AtomicU32::new(0),
             playing: AtomicU8::new(0),
             any_solo: AtomicU8::new(0),
-            looping: AtomicU8::new(0),
+            loop_region_ptr: AtomicPtr::new(std::ptr::null_mut()),
             input_delays_base: AtomicPtr::new(std::ptr::null_mut()),
             n_input_delays: AtomicU32::new(0),
             mod_scalars_base: AtomicPtr::new(std::ptr::null_mut()),
@@ -247,7 +251,7 @@ impl AudioWorkerPool {
         recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
         current_bpm: f32,
         playhead_beats: f64,
-        looping: bool,
+        loop_region: &common::model::LoopRegion,
         mod_scalars: &[f32],
     ) {
         // plan §4: stalled pool は二度と dispatch しない (worker thread の
@@ -291,9 +295,10 @@ impl AudioWorkerPool {
         self.shared
             .any_solo
             .store(if any_solo { 1 } else { 0 }, Ordering::Release);
-        self.shared
-            .looping
-            .store(if looping { 1 } else { 0 }, Ordering::Release);
+        self.shared.loop_region_ptr.store(
+            loop_region as *const _ as *mut _,
+            Ordering::Release,
+        );
         self.shared.recording_lanes_ptr.store(
             recording_lanes as *const _ as *mut _,
             Ordering::Release,
@@ -523,8 +528,17 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
     // で配信。 f64 bits を Acquire で load。
     let playhead_beats =
         f64::from_bits(shared.playhead_beats_bits.load(Ordering::Acquire));
-    // user の loop button 実状態 (master が dispatch 前に store)。
-    let looping = shared.looping.load(Ordering::Acquire) != 0;
+    // 再生ループの状態 (master が dispatch 前に store)。 `LoopRegion` は `Copy`
+    // なので値へ deref して持つ (= 以後 raw pointer に触れない)。 null は既定
+    // (ループ無し)。
+    let loop_region_ptr = shared.loop_region_ptr.load(Ordering::Acquire);
+    let loop_region = if loop_region_ptr.is_null() {
+        common::model::LoopRegion::default()
+    } else {
+        // SAFETY: master holds the value on its stack for the dispatch window
+        // via `dispatch_and_wait`'s `&LoopRegion` borrow.
+        unsafe { *loop_region_ptr }
+    };
 
     if scratch_base.is_null() || plugin_refs_ptr.is_null() || slots_base.is_null() {
         return;
@@ -597,7 +611,7 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
             recording_lanes,
             current_bpm,
             playhead_beats,
-            looping,
+            loop_region,
             mod_scalars,
         );
     }

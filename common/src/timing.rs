@@ -1,7 +1,7 @@
 //! Sample / beat conversion helpers shared by `daw_plugin_host`
 //! (audio thread) and `daw_gui` (playhead rendering).
 
-use crate::model::{Clip, Song};
+use crate::model::{Clip, LoopRegion, Song};
 
 /// Every clip that contributes to the song's playable envelope: finite,
 /// positive-length, finite-start clips across all tracks. Single source of
@@ -125,15 +125,24 @@ pub fn beat_to_seconds(beat: f64, bpm: f32) -> f64 {
 }
 
 /// Returns the sample range the audio engine should treat as the active
-/// playback loop. Prefers the user-defined `Song::loop_*_beat` range when
-/// it is non-empty; otherwise falls back to the full song-content
-/// envelope from [`song_bounds_samples`].
-pub fn effective_loop_bounds(song: Option<&Song>, sample_rate: u32) -> Option<(u64, u64)> {
+/// playback loop. Prefers the user-defined [`LoopRegion`] range when it is
+/// non-empty; otherwise falls back to the full song-content envelope from
+/// [`song_bounds_samples`].
+///
+/// The loop region is **session state**, not part of `Song` (see
+/// [`LoopRegion`]): the engine receives it via `AudioCommand::SetLoop` and
+/// passes it in here. `song` still supplies the BPM for the beat → sample
+/// conversion and the content-envelope fallback.
+pub fn effective_loop_bounds(
+    song: Option<&Song>,
+    loop_region: LoopRegion,
+    sample_rate: u32,
+) -> Option<(u64, u64)> {
     let song_ref = song?;
-    if song_ref.bpm > 0.0 && song_ref.loop_end_beat > song_ref.loop_start_beat {
+    if song_ref.bpm > 0.0 && loop_region.has_range() {
         let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song_ref.bpm);
-        let start = (song_ref.loop_start_beat * samples_per_beat).max(0.0) as u64;
-        let end = (song_ref.loop_end_beat * samples_per_beat).max(0.0) as u64;
+        let start = (loop_region.start_beat * samples_per_beat).max(0.0) as u64;
+        let end = (loop_region.end_beat * samples_per_beat).max(0.0) as u64;
         if end > start {
             return Some((start, end));
         }

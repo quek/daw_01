@@ -244,11 +244,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
     let zoom = app.ui_prefs.arrange_zoom_x.max(1.0);
     let row_h = app.ui_prefs.arrange_track_row_h.max(1.0);
     let lanes_w = (area.w - app.ui_prefs.arrange_header_w).max(1.0);
-    let loop_range = if app.song_doc.song().loop_end_beat > app.song_doc.song().loop_start_beat {
-        Some((app.song_doc.song().loop_start_beat, app.song_doc.song().loop_end_beat))
-    } else {
-        None
-    };
+    let loop_range = app.transport.loop_region.range();
     // data_generation: widget の glyph キャッシュ無効化キー (描画内容そのものを hash)。
     let data_generation = {
         use std::hash::{Hash, Hasher};

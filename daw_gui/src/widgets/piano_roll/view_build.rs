@@ -121,11 +121,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
     let notes = build_widget_notes(app, &shown, Some(target.track));
     let zoom_x = app.pianoroll_zoom_x().max(4.0);
     let zoom_y = app.pianoroll_zoom_y().max(6.0);
-    let loop_range = if app.song_doc.song().loop_end_beat > app.song_doc.song().loop_start_beat {
-        Some((app.song_doc.song().loop_start_beat, app.song_doc.song().loop_end_beat))
-    } else {
-        None
-    };
+    let loop_range = app.transport.loop_region.range();
     // piano roll を song-absolute 座標系に統一。clip.start_beat を唯一の絶対オフセット SSoT とし、
     // view 入口で加算 (ruler/grid/playhead/loop が曲の絶対小節位置)、note の model 書き戻し出口で
     // 減算する (note は共有 content のため clip-local 保持)。

@@ -97,6 +97,9 @@ fn view_state_snapshot_restore_roundtrips() {
     // 開いていたクリップ (= 開き直しで復元されるべき選択)。
     app.selection.selected_clip = Some(key_a);
     app.selection.selected_clips = vec![key_a];
+    // ループ (ON/OFF + 範囲) も表示状態と同じ扱いで往復する。
+    app.handle_event(AppEvent::SetLoopRange { start: 3.0, end: 11.0 });
+    app.handle_event(AppEvent::ToggleLoop);
 
     let snap = app.snapshot_view_state();
 
@@ -109,8 +112,11 @@ fn view_state_snapshot_restore_roundtrips() {
     app.ui_prefs.piano_roll_views.clear();
     app.selection.selected_clip = None;
     app.selection.selected_clips.clear();
+    app.handle_event(AppEvent::SetLoopRange { start: 0.0, end: 0.0 });
+    app.handle_event(AppEvent::ToggleLoop);
 
-    app.restore_view_state(Some(snap));
+    let loop_region = snap.loop_region;
+    app.restore_view_state(Some(snap), loop_region);
 
     assert_eq!(app.ui_prefs.arrange_zoom_x, 50.0);
     assert_eq!(app.ui_prefs.arrange_scroll_beat, 7.0);
@@ -128,6 +134,11 @@ fn view_state_snapshot_restore_roundtrips() {
         "開いていたクリップ選択が復元される (= 開き直しでピアノロールが空にならない)"
     );
     assert_eq!(app.selection.selected_clips, vec![key_a]);
+    assert_eq!(
+        app.transport.loop_region,
+        common::model::LoopRegion { enabled: true, start_beat: 3.0, end_beat: 11.0 },
+        "ループ (ON/OFF + 範囲) も往復する"
+    );
 }
 
 /// `restore_view_state(None)` (= 旧ファイル) は per-clip map をクリアしつつ
@@ -139,7 +150,7 @@ fn restore_none_clears_per_clip_but_keeps_globals() {
     app.ui_prefs.arrange_zoom_x = 42.0;
     app.ui_prefs.piano_roll_views.insert(key_a, PianoRollViewState::default());
 
-    app.restore_view_state(None);
+    app.restore_view_state(None, common::model::LoopRegion::default());
 
     assert!(
         app.ui_prefs.piano_roll_views.is_empty(),

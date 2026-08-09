@@ -157,7 +157,7 @@ impl AppData {
             transport: TransportState {
                 metronome_enabled: false,
                 is_playing: false,
-                is_looping: false,
+                loop_region: common::model::LoopRegion::default(),
                 playhead_beat: None,
                 playback_origin_beat: None,
                 panic_reinit_due: None,

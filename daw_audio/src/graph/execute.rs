@@ -17,7 +17,7 @@
 
 use std::sync::atomic::Ordering;
 
-use common::model::{Song, Track};
+use common::model::{LoopRegion, Song, Track};
 use common::plugin_ref::{DISPATCH_TIMEOUT_MS, DispatchOutcome};
 use common::process_data::EventKind;
 
@@ -73,20 +73,20 @@ pub fn set_pd_transport(
     // 積分済みの真の拍位置 (tempo automation を考慮)。 plugin host が一定
     // テンポ逆算する代わりにこれを直接 song_pos_beats として使う。
     song_pos_beats: f64,
-    // user の loop button 実状態 (= `shared.looping`)。 region 有無の
-    // heuristic ではなく engine が実際に wrap している条件を渡す。
-    looping: bool,
+    // 再生ループの状態 (= `shared.loop_region`)。 ループは `Song` ではなく GUI の
+    // session state が所有するので、 song からは取れず engine が持ち回った値を渡す。
+    loop_region: LoopRegion,
 ) {
     let Some(song) = song else { return };
     pd.bpm = effective_bpm.max(1.0);
     pd.tsig_num = song.time_sig.0 as u16;
     pd.tsig_denom = song.time_sig.1 as u16;
-    pd.loop_start_beats = song.loop_start_beat;
-    pd.loop_end_beats = song.loop_end_beat;
+    pd.loop_start_beats = loop_region.start_beat;
+    pd.loop_end_beats = loop_region.end_beat;
     pd.song_pos_beats = song_pos_beats;
     // 実 loop トグル状態を渡す。 plugin host は IS_LOOP_ACTIVE 判定で
     // 別途 `loop_end_beats > loop_start_beats` (= region 定義済) と AND する。
-    pd.looping = if looping { 1 } else { 0 };
+    pd.looping = if loop_region.enabled { 1 } else { 0 };
 }
 
 /// Render one track's contribution into its `TrackScratch`. Walks the
@@ -133,8 +133,8 @@ pub fn process_track_owned(
     // playhead。 collect_events_for_buffer に渡して beat-domain で note 配置
     // を判定する。 変動 tempo でも note 位置が正しく追随する。
     playhead_beats: f64,
-    // user の loop button 実状態 (= `shared.looping`)。 set_pd_transport に渡す。
-    looping: bool,
+    // 再生ループの状態 (= `shared.loop_region`)。 set_pd_transport に渡す。
+    loop_region: LoopRegion,
     // docs/plan_modulation.md §5: per-`ModSource` follower scalars (block-rate
     // snapshot, slot = `Song::mod_sources` position). fill_track_param_ramps /
     // fill_pd_param_events に渡して volume/pan/plugin param を follower 変調する。
@@ -301,7 +301,7 @@ pub fn process_track_owned(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
+        set_pd_transport(pd, song, current_bpm, playhead_beats, loop_region);
         // ---- inputs: device の port を持つものだけ現在のバスを渡す ----
         // M1 (r.md #8): note を param automation より **先に** push する。 B4 の
         // sub-buffer param automation は events_in (MAX_EVENTS=256) を最大
@@ -472,7 +472,7 @@ pub fn process_master_fx_chain(
     song: Option<&Song>,
     current_bpm: f32,
     playhead_beats: f64,
-    looping: bool,
+    loop_region: LoopRegion,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     mod_scalars: &[f32],
 ) {
@@ -490,7 +490,7 @@ pub fn process_master_fx_chain(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, song, current_bpm, playhead_beats, looping);
+        set_pd_transport(pd, song, current_bpm, playhead_beats, loop_region);
         // master fx param automation (`song_lanes` の PluginParam lane) + 変調
         // (`song_mod_routings`) を MASTER_TRACK_ID 経路で適用 (r.md #8、 track/group
         // fx と同一 idiom)。
@@ -593,7 +593,7 @@ pub fn execute_schedule_post_dispatch(
     current_bpm: f32,
     // group fx の transport snapshot 用 (= 積分済み拍位置 + 実 loop トグル)。
     playhead_beats: f64,
-    looping: bool,
+    loop_region: LoopRegion,
     // B3 (r.md #8): group fx の PluginParam follower 変調 snapshot (track fx と同じ
     // `mod_scalars_snapshot`)。 post-dispatch 段への plumbing。 空なら変調なし。
     mod_scalars: &[f32],
@@ -677,7 +677,7 @@ pub fn execute_schedule_post_dispatch(
                     recording_lanes,
                     current_bpm,
                     playhead_beats,
-                    looping,
+                    loop_region,
                     mod_scalars,
                     *start_device,
                 );
@@ -1110,7 +1110,7 @@ fn run_group_fx_chain(
     current_bpm: f32,
     // group fx の transport snapshot (= 積分済み拍位置 + 実 loop トグル)。
     playhead_beats: f64,
-    looping: bool,
+    loop_region: LoopRegion,
     // B3 (r.md #8): group fx PluginParam の follower 変調 snapshot。
     mod_scalars: &[f32],
     // パラアウト (docs/plan_paraout.md): first device index to run. `0` for a
@@ -1162,7 +1162,7 @@ fn run_group_fx_chain(
         pd.frames = frames;
         pd.playing = if playing { 1 } else { 0 };
         pd.sample_rate = sample_rate;
-        set_pd_transport(pd, Some(song), current_bpm, playhead_beats, looping);
+        set_pd_transport(pd, Some(song), current_bpm, playhead_beats, loop_region);
         // Phase 2b: group fx 宛 PluginParam automation + B3 (r.md #8) follower 変調。
         crate::automation::fill_pd_param_events(
             pd,
@@ -1261,7 +1261,7 @@ pub fn render_master_buffer(
     sample_rate: u32,
     frames: u32,
     playing: bool,
-    looping: bool,
+    loop_region: LoopRegion,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     current_bpm: f32,
     playhead_beats: f64,
@@ -1294,7 +1294,7 @@ pub fn render_master_buffer(
             recording_lanes,
             current_bpm,
             playhead_beats,
-            looping,
+            &loop_region,
             mod_scalars,
         );
         // stall した pool は scratch を更新しない (dispatch_and_wait が冒頭で
@@ -1334,7 +1334,7 @@ pub fn render_master_buffer(
                 recording_lanes,
                 current_bpm,
                 playhead_beats,
-                looping,
+                loop_region,
                 mod_scalars,
             );
         }
@@ -1357,7 +1357,7 @@ pub fn render_master_buffer(
         recording_lanes,
         current_bpm,
         playhead_beats,
-        looping,
+        loop_region,
         mod_scalars,
     );
 
@@ -1376,7 +1376,7 @@ pub fn render_master_buffer(
         Some(song),
         current_bpm,
         playhead_beats,
-        looping,
+        loop_region,
         recording_lanes,
         mod_scalars,
     );
@@ -1427,15 +1427,11 @@ mod sidechain_tests {
         // SSoT 回帰防止: pd.song_pos_beats は daw_audio が渡す積分済み拍位置を
         // そのまま使い (= samples × bpm の逆算ではない)、 pd.looping は実 loop
         // トグルを反映する (= region 有無 heuristic ではない)。
-        let song = Song {
-            time_sig: (3, 4),
-            loop_start_beat: 4.0,
-            loop_end_beat: 8.0,
-            ..Song::default()
-        };
+        let song = Song { time_sig: (3, 4), ..Song::default() };
+        let region = LoopRegion { enabled: true, start_beat: 4.0, end_beat: 8.0 };
         let mut pd = common::process_data::ProcessData::empty();
         // playhead_beats = 12.5 は constant-tempo 逆算とは無関係な「真の拍」。
-        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, true);
+        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, region);
         assert_eq!(pd.song_pos_beats, 12.5);
         assert_eq!(pd.bpm, 90.0);
         assert_eq!(pd.tsig_num, 3);
@@ -1443,9 +1439,9 @@ mod sidechain_tests {
         assert_eq!(pd.loop_start_beats, 4.0);
         assert_eq!(pd.loop_end_beats, 8.0);
         assert_eq!(pd.looping, 1);
-        // loop region は定義済のまま looping=false を渡すと pd.looping=0
+        // loop region は定義済のまま enabled=false にすると pd.looping=0
         // (= region heuristic を使っていれば 1 のままになる、 という回帰検出)。
-        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, false);
+        set_pd_transport(&mut pd, Some(&song), 90.0, 12.5, LoopRegion { enabled: false, ..region });
         assert_eq!(pd.looping, 0);
     }
 
@@ -1521,7 +1517,7 @@ mod sidechain_tests {
             &std::collections::HashSet::new(),
             song.bpm,
             0.0,
-            false,
+            LoopRegion::default(),
             &[],
         );
 
@@ -1595,7 +1591,7 @@ mod sidechain_tests {
             &std::collections::HashSet::new(),
             song.bpm,
             0.0,
-            false,
+            LoopRegion::default(),
             &[],
         );
 
@@ -1864,7 +1860,7 @@ mod send_tests {
 mod render_master_tests {
     use super::*;
     use crate::graph::compile_schedule;
-    use common::model::{Song, Track};
+    use common::model::{LoopRegion, Song, Track};
     use std::collections::HashMap;
 
     fn track(f: impl FnOnce(&mut Track)) -> Track {
@@ -1903,7 +1899,7 @@ mod render_master_tests {
             48_000,
             64,
             true,
-            false,
+            LoopRegion::default(),
             &std::collections::HashSet::new(),
             120.0,
             0.0,

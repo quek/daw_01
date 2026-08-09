@@ -280,6 +280,9 @@ impl AppData {
             arrange_zoom_x: self.ui_prefs.arrange_zoom_x,
             arrange_scroll_beat: self.ui_prefs.arrange_scroll_beat,
             arrange_follow: self.ui_prefs.arrange_follow,
+            // 再生ループ (ON/OFF + 範囲) は transport が live SSoT。 ここへ書くことで
+            // 「dirty は立てないが保存される」 (= ズーム / スクロールと同じ扱い)。
+            loop_region: self.transport.loop_region,
             arrange_track_top: self.ui_prefs.arrange_track_top,
             arrange_track_row_h: self.ui_prefs.arrange_track_row_h,
             arrange_header_w: self.ui_prefs.arrange_header_w,
@@ -308,12 +311,24 @@ impl AppData {
     }
 
     /// load 時に `ViewState` を AppData へ流し込む。 別プロジェクトの per-clip
-    /// view が漏れないよう **必ず先に map をクリア**。 `None` (旧ファイル / view 未保存) なら
-    /// globals は現状維持 (= 従来の fit-to-content / 既定値挙動)。 全値を有効域へ clamp して
-    /// 壊れた / 古い保存値を吸収する。
-    pub fn restore_view_state(&mut self, view: Option<common::model::ViewState>) {
+    /// view が漏れないよう **必ず先に map をクリア**。 `view = None` (旧ファイル /
+    /// view 未保存) なら globals は現状維持 (= 従来の fit-to-content / 既定値挙動)。
+    /// 全値を有効域へ clamp して壊れた / 古い保存値を吸収する。
+    ///
+    /// `loop_region` は `view` と**別引数**で受ける: v28 以前の `.daw` は `ViewState`
+    /// を持たないのにループ範囲は持つので、 loader
+    /// ([`common::project::LoadedProject::loop_region`]) が両方を解決した値を渡す。
+    /// ここで `view` から取ると、 旧ファイル用に `ViewState::default()` を合成する
+    /// 羽目になり globals が既定値へ潰れる。 engine への `SetLoop` 送出も込みで
+    /// [`AppData::set_loop_region`] を通す (= 復元忘れの故障モードを作らない)。
+    pub fn restore_view_state(
+        &mut self,
+        view: Option<common::model::ViewState>,
+        loop_region: common::model::LoopRegion,
+    ) {
         self.ui_prefs.piano_roll_views.clear();
         self.ui_prefs.audio_editor_views.clear();
+        self.set_loop_region(loop_region);
         let Some(v) = view else { return };
         let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
         self.ui_prefs.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);

@@ -349,7 +349,7 @@ fn r_loop_は選択された_automation_clip_を対象にする() {
 
     app.handle_event(AppEvent::LoopSelectedClipToggle { automation: true });
 
-    assert_eq!(app.song_doc.song().loop_start_beat, 8.0);
-    assert_eq!(app.song_doc.song().loop_end_beat, 12.0);
-    assert!(app.transport.is_looping);
+    assert_eq!(app.transport.loop_region.start_beat, 8.0);
+    assert_eq!(app.transport.loop_region.end_beat, 12.0);
+    assert!(app.transport.loop_region.enabled);
 }

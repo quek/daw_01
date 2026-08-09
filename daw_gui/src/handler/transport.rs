@@ -253,19 +253,39 @@ impl AppData {
         self.ui_ephemeral.status_message = "パニック: 全ての音を停止しました".into();
     }
 
+    /// 再生ループ (ON/OFF + 範囲) を更新する **唯一の口**。 session state を書き、
+    /// 同じ値を `AudioCommand::SetLoop` で engine へ送る (ON/OFF と範囲を別経路に
+    /// しない = SSoT)。 ループは `Song` に属さないので `edit_song()` を通さず、
+    /// 従って undo にも dirty (`*`) にも影響しない — ズーム / スクロールと同じ
+    /// 「聴き方の都合」 (`common::model::LoopRegion`)。 保存は `ViewState` 経由。
+    pub(crate) fn set_loop_region(&mut self, region: common::model::LoopRegion) {
+        let mut region = region;
+        region.sanitize();
+        if !region.has_range() {
+            // 範囲は「未定義」 の正規形 (0/0) に畳む。 engine 側の
+            // `effective_loop_bounds` はこれを見て曲全体へフォールバックする。
+            region.start_beat = 0.0;
+            region.end_beat = 0.0;
+        }
+        self.transport.loop_region = region;
+        self.send_audio(AudioCommand::SetLoop(region));
+    }
+
     pub(crate) fn toggle_loop(&mut self) {
-        self.transport.is_looping = !self.transport.is_looping;
-        self.send_audio(AudioCommand::SetLoop(self.transport.is_looping));
+        let region = common::model::LoopRegion {
+            enabled: !self.transport.loop_region.enabled,
+            ..self.transport.loop_region
+        };
+        self.set_loop_region(region);
     }
 
     pub(crate) fn set_loop_range(&mut self, start: f64, end: f64) {
-        let (start, end) = if end > start {
-            (start.max(0.0), end.max(0.0))
-        } else {
-            (0.0, 0.0)
+        let region = common::model::LoopRegion {
+            start_beat: start,
+            end_beat: end,
+            ..self.transport.loop_region
         };
-        self.edit_song(|song| song.loop_start_beat = start);
-        self.edit_song(|song| song.loop_end_beat = end);
+        self.set_loop_region(region);
     }
 
     /// `R` キー: 選択素材の bounding range (= 最小 `start_beat` 〜 最大
@@ -282,20 +302,20 @@ impl AppData {
         };
 
         const EPS: f64 = 1e-9;
-        let same_range = (self.song_doc.song().loop_start_beat - start).abs() < EPS
-            && (self.song_doc.song().loop_end_beat - end).abs() < EPS;
+        let current = self.transport.loop_region;
+        let same_range = (current.start_beat - start).abs() < EPS
+            && (current.end_beat - end).abs() < EPS;
 
-        if self.transport.is_looping && same_range {
-            self.transport.is_looping = false;
-            self.send_audio(AudioCommand::SetLoop(false));
+        if current.enabled && same_range {
+            self.set_loop_region(common::model::LoopRegion { enabled: false, ..current });
             return;
         }
 
-        self.set_loop_range(start, end);
-        if !self.transport.is_looping {
-            self.transport.is_looping = true;
-            self.send_audio(AudioCommand::SetLoop(true));
-        }
+        self.set_loop_region(common::model::LoopRegion {
+            enabled: true,
+            start_beat: start,
+            end_beat: end,
+        });
         if !self.transport.is_playing {
             self.play();
         }

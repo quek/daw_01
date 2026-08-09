@@ -229,7 +229,11 @@ pub enum AudioCommand {
     /// 全量 Song snapshot の再送 (編集 → frame 末 flush の 1 経路のみ)。
     /// wire 形は blob-less (`PluginInstance` の手書き Encode)。
     LoadSong(crate::model::Song),
-    SetLoop(bool),
+    /// 再生ループの状態を丸ごと更新する (ON/OFF と範囲は 1 つの値 =
+    /// [`crate::model::LoopRegion`] で、 別コマンドに割らない)。 ループは `Song` に
+    /// 属さない session state なので `LoadSong` では届かず、 この経路だけが engine の
+    /// ループ状態を書き換える。
+    SetLoop(crate::model::LoopRegion),
     SetMasterGain(f32),
     /// Offline-render the song to a WAV file. daw_audio freewheels through
     /// the song using its existing AudioWorker pool + plugin handshake, then

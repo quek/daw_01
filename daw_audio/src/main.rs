@@ -717,8 +717,11 @@ async fn recv_loop(
                 tracing::info!("received PanicRelease (declick fade-in)");
                 shared.panic_release.store(true, Ordering::Release);
             }
-            Ok(AudioCommand::SetLoop(b)) => {
-                shared.looping.store(b, Ordering::Release);
+            Ok(AudioCommand::SetLoop(mut region)) => {
+                // IPC は信頼境界。 NaN / 負値の拍位置は samples_per_beat 換算を
+                // 壊すので store 前に正規化する (LoadSong の sanitize_ranges と同旨)。
+                region.sanitize();
+                shared.loop_region.store(std::sync::Arc::new(region));
             }
             Ok(AudioCommand::SeekTo { samples }) => {
                 // playhead を IPC 受信スレッドから直接書かない。
