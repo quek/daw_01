@@ -107,8 +107,6 @@ fn section_survives_json_roundtrip() {
 fn ripple_timeline_open_shifts_everything_after_from_beat_right() {
     let mut song = Song {
         length_beats: 16.0,
-        loop_start_beat: 8.0,
-        loop_end_beat: 12.0,
         sections: vec![mk_section(1, 0.0, 4.0), mk_section(2, 8.0, 4.0)],
         tracks: vec![Track {
             clips: vec![
@@ -129,14 +127,17 @@ fn ripple_timeline_open_shifts_everything_after_from_beat_right() {
     };
 
     // beat 4 に 4 拍挿入 (open) → `>= 4` が +4。
-    song.ripple_timeline(4.0, 4.0);
+    let r = song.ripple_timeline(4.0, 4.0);
 
     assert_eq!(song.tracks[0].clips[0].start_beat, 0.0); // 4 未満は不変
     assert_eq!(song.tracks[0].clips[1].start_beat, 12.0); // 8 → 12
     assert_eq!(song.sections[0].start_beat, 0.0);
     assert_eq!(song.sections[1].start_beat, 12.0);
-    assert_eq!((song.loop_start_beat, song.loop_end_beat), (12.0, 16.0));
     assert_eq!(song.length_beats, 20.0);
+    // 返された Ripple は Song の外に住む時間位置 (ループ範囲) にも同じ規則で効く。
+    let mut region = LoopRegion { enabled: true, start_beat: 8.0, end_beat: 12.0 };
+    region.apply_ripple(r);
+    assert_eq!((region.start_beat, region.end_beat), (12.0, 16.0));
 }
 
 #[test]
@@ -176,7 +177,7 @@ fn move_section_reorders_content_with_ripple() {
     };
 
     // Chorus ([8,12), id=3) を Verse の前 (dest=4) へ移動。
-    assert!(song.move_section(3, 4.0));
+    assert!(!song.move_section(3, 4.0).is_empty());
 
     // セクションは Intro[0,4) / Chorus[4,8) / Verse[8,12) に組み替わる (start 昇順)。
     let secs: Vec<(u32, f64, f64)> = song
@@ -231,7 +232,7 @@ fn duplicate_section_inserts_linked_copy_with_ripple() {
     };
 
     // section1 ([0,4), content_id 7) を 2 つの間 (dest=4) に複製。
-    let new_id = song.duplicate_section(1, 4.0).unwrap();
+    let (new_id, _ripple) = song.duplicate_section(1, 4.0).unwrap();
     assert_eq!(new_id, 3);
 
     // section1[0,4) / copy[4,8) / section2[8,12) の 3 つ。
@@ -393,7 +394,7 @@ fn delete_section_range_removes_content_and_ripples() {
         ..Default::default()
     };
     // 真ん中 section2 [4,8) を範囲ごと削除 → clip2 消滅、 clip3 と section3 が 8→4 へ詰まる。
-    assert!(song.delete_section_range(2));
+    assert!(song.delete_section_range(2).is_some());
     let mut secs: Vec<(u32, f64)> = song.sections.iter().map(|s| (s.id, s.start_beat)).collect();
     secs.sort_by_key(|s| s.0);
     assert_eq!(secs, vec![(1, 0.0), (3, 4.0)]);
@@ -413,8 +414,8 @@ fn move_section_noop_when_dest_equals_start() {
         sections: vec![mk_section(1, 0.0, 4.0)],
         ..Default::default()
     };
-    assert!(!song.move_section(1, 0.0));
-    assert!(!song.move_section(99, 8.0)); // 存在しない id
+    assert!(song.move_section(1, 0.0).is_empty());
+    assert!(song.move_section(99, 8.0).is_empty()); // 存在しない id
 }
 
 #[test]
@@ -1067,7 +1068,11 @@ fn current_version_is_pinned() {
     // `SendGain.send_idx` → `send_id` へ移行。旧 positional 値は
     // deserialize 専用 legacy field 経由で `ensure_ids` が id へ写像する。
     // v30 (§10): ClipContent を untagged → tagged (`type` field) 化。
-    assert_eq!(CURRENT_VERSION, 30);
+    // v31: `Song.loop_start_beat` / `loop_end_beat` を撤去し、再生ループ (ON/OFF +
+    // 範囲) を session state + `ViewState.loop_region` へ移した (「聴き方の都合」 は
+    // dirty を立てないが保存される)。v30 以前のファイルは
+    // `project::legacy_song_loop_region` が Song 直下から拾って移行する。
+    assert_eq!(CURRENT_VERSION, 31);
 }
 
 #[test]

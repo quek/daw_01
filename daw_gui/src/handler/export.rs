@@ -8,18 +8,18 @@ use std::path::{Path, PathBuf};
 use common::protocol::{AudioCommand, PluginCommand};
 
 impl AppData {
-    /// レンジピッカーを開くときの既定範囲 (拍)。 ループ範囲が設定
-    /// されていれば (`loop_end_beat > loop_start_beat`) それを既定にし、 無ければ
-    /// 全曲 (0..length_beats) にフォールバックする。 ループ範囲は `Song` が所有する
-    /// SSoT (`common/src/model.rs`) で、 transport の再生ループと同じ値を使う
-    /// (= 「ループしている区間をそのまま書き出す」 という DAW で一般的な既定)。
-    /// 末尾は最低 `MIN_EXPORT_RANGE_BEATS` を保証する。
+    /// レンジピッカーを開くときの既定範囲 (拍)。 ループ範囲が設定されていれば
+    /// それを既定にし、 無ければ全曲 (0..length_beats) にフォールバックする。
+    /// ループ範囲は session state (`transport.loop_region`) が所有する SSoT で、
+    /// transport の再生ループと同じ値を使う (= 「ループしている区間をそのまま
+    /// 書き出す」 という DAW で一般的な既定)。 ON/OFF は見ない (帯が引いてあれば
+    /// その範囲が「今の関心領域」)。 末尾は最低 `MIN_EXPORT_RANGE_BEATS` を保証する。
     pub(crate) fn default_export_range(&self) -> (f64, f64) {
-        let (start, end) = if self.song_doc.song().loop_end_beat > self.song_doc.song().loop_start_beat {
-            (self.song_doc.song().loop_start_beat, self.song_doc.song().loop_end_beat)
-        } else {
-            (0.0, self.song_doc.song().length_beats)
-        };
+        let (start, end) = self
+            .transport
+            .loop_region
+            .range()
+            .unwrap_or((0.0, self.song_doc.song().length_beats));
         let start = start.max(0.0);
         (start, end.max(start + MIN_EXPORT_RANGE_BEATS))
     }

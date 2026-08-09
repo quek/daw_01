@@ -66,7 +66,7 @@ impl AppData {
         // stop() を通すので「どんな止まり方でも再生を押した位置へ戻る」が一貫する。
         // loop 中は engine が wrap して止まらないので対象外。
         if self.transport.is_playing
-            && !self.transport.is_looping
+            && !self.transport.loop_region.enabled
             && playhead_samples != u64::MAX
             && common::timing::song_ended(
                 Some(self.song_doc.song()),

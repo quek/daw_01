@@ -186,7 +186,11 @@ pub use track::*;
 /// `TrackBuiltinParam::SendGain` は `send_idx` → `send_id` に移行 — 旧 file の
 /// positional 値は deserialize 専用 legacy field に載り、`Song::ensure_ids` が
 /// id へ写像する。v28 以前の `.daw` はすべて load 可能。
-pub const CURRENT_VERSION: u32 = 30;
+/// Bumped to `31`: `Song.loop_start_beat` / `loop_end_beat` を撤去し、再生ループ
+/// (ON/OFF + 範囲) を [`LoopRegion`] として session state + [`ViewState::loop_region`]
+/// へ移した (「聴き方の都合」 は dirty を立てないが保存される)。v30 以前の `.daw` は
+/// `project::legacy_song_loop_region` が Song 直下から読み出して移行する。
+pub const CURRENT_VERSION: u32 = 31;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -302,6 +306,79 @@ pub enum FollowMode {
     Page,
 }
 
+/// 再生ループの状態 — ON/OFF と範囲を 1 つに束ねた SSoT。
+///
+/// **`Song` には置かない**。 ループは「作った中身」 ではなく「聴き方の都合」 なので、
+/// ズーム / スクロールと同じく session state (daw_gui の `TransportState`) が所有し、
+/// [`ViewState`] でプロジェクトに永続化する = **変更しても dirty (`*`) にならないが
+/// 保存される**。 audio engine へは `AudioCommand::SetLoop(LoopRegion)` で 3 値まとめて
+/// 届き、 engine 側も 1 つの値として保持する (ON/OFF と範囲を別経路にしない)。
+///
+/// `end_beat <= start_beat` (既定の 0/0 を含む) は「範囲未定義」 で、 engine は
+/// 曲全体の content envelope をループ区間として使う ([`crate::timing::effective_loop_bounds`])。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, Encode, Decode)]
+pub struct LoopRegion {
+    /// ループ ON/OFF (transport bar の ⟳ トグル)。
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub start_beat: f64,
+    #[serde(default)]
+    pub end_beat: f64,
+}
+
+impl LoopRegion {
+    /// 範囲が定義済 (= 正の長さを持つ) か。
+    pub fn has_range(&self) -> bool {
+        self.end_beat > self.start_beat
+    }
+
+    /// 定義済なら `(start, end)`。 未定義なら `None` (= 描画しない / 全曲を既定にする)。
+    pub fn range(&self) -> Option<(f64, f64)> {
+        self.has_range().then_some((self.start_beat, self.end_beat))
+    }
+
+    /// 信頼境界 (disk からの load / IPC 受信) 用の値域正規化。 `NaN` / 負値は
+    /// 下流の `samples_per_beat` 換算や描画を壊すので 0 に落とす (`NaN <= 0.0` は
+    /// `false` なので `!is_finite()` 側で弾く)。 冪等。
+    pub fn sanitize(&mut self) {
+        for v in [&mut self.start_beat, &mut self.end_beat] {
+            if !(v.is_finite() && *v >= 0.0) {
+                *v = 0.0;
+            }
+        }
+    }
+
+    /// タイムライン ripple (時間の挿入 / 削除) に追従させる。 `Song` 内の時間位置に
+    /// [`Song::ripple_timeline`] が適用するのと同じ規則を、 `Song` の外に住むこの
+    /// 範囲へ適用する。
+    pub fn apply_ripple(&mut self, r: Ripple) {
+        r.shift(&mut self.start_beat);
+        r.shift(&mut self.end_beat);
+    }
+}
+
+/// タイムライン ripple 1 回分 — 「`from_beat` 以降の全ての時間位置を `delta` ずらす」。
+///
+/// セクションの移動 / 複製 / 範囲削除は Song 内の時間位置をこの規則でずらす
+/// ([`Song::ripple_timeline`])。 ループ範囲のように **`Song` の外に住む時間位置**
+/// を同じ規則で追従させるため、 ripple を行う `Song` メソッドは適用した ripple 列を
+/// 返す (呼び出し側が幾何を再計算する「補償コード」 を書かせない)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ripple {
+    pub from_beat: f64,
+    pub delta: f64,
+}
+
+impl Ripple {
+    /// 1 つの拍位置に適用する。 結果は `0.0` 以上に clamp。
+    pub fn shift(&self, beat: &mut f64) {
+        if *beat >= self.from_beat {
+            *beat = (*beat + self.delta).max(0.0);
+        }
+    }
+}
+
 /// プロジェクトに同梱する GUI 表示状態のスナップショット。
 /// `AppData` (live SSoT) から save 時に `snapshot_view_state` で作り、load 時に
 /// `restore_view_state` で流し込む。**serde 専用** (bincode derive 無し) ＝ IPC を渡らない。
@@ -332,6 +409,12 @@ pub struct ViewState {
     /// フィールド欠落 → `FollowMode::default()` (= Page) で読まれる。
     #[serde(default)]
     pub arrange_follow: FollowMode,
+    /// 再生ループ (ON/OFF + 範囲)。 ズーム / スクロールと同じ「聴き方の都合」 として
+    /// ここに永続化する (`Song` には無い = 変えても `*` が付かない)。 旧 `.daw` は
+    /// `Song.loop_start_beat` / `loop_end_beat` を持つので、`crate::project::load_project`
+    /// が読み出して [`crate::project::LoadedProject::loop_region`] へ移す。
+    #[serde(default)]
+    pub loop_region: LoopRegion,
     // ---- Snap / grid / piano roll モード ----
     #[serde(default)]
     pub arrange_snap_enabled: bool,
@@ -448,14 +531,6 @@ pub struct Song {
     pub length_beats: f64,
     #[serde(default)]
     pub tracks: Vec<Track>,
-    /// User-defined playback loop region (beats). When `loop_end_beat <=
-    /// loop_start_beat` (e.g. both zero — the default for new / older
-    /// projects), the engine falls back to looping over the full song
-    /// content envelope.
-    #[serde(default)]
-    pub loop_start_beat: f64,
-    #[serde(default)]
-    pub loop_end_beat: f64,
     /// §10 bullet 4: 安定 id アロケータ群 (track / device / content / audio-video-image source /
     /// song-lane / section / mod-source の `next_*_id`)。旧 .daw のフラット形式は load 時
     /// `project::migrate_flat_ids_to_allocators` が `ids` 下へ移す (save 互換)。device 採番は
@@ -586,8 +661,6 @@ impl Default for Song {
             time_sig: (4, 4),
             length_beats: 64.0,
             tracks: Vec::new(),
-            loop_start_beat: 0.0,
-            loop_end_beat: 0.0,
             ids: IdAllocators {
                 next_track_id: 1,
                 next_device_id: 1,
@@ -739,65 +812,65 @@ impl Song {
     /// `from_beat` 以降の全ての時間位置を `delta` だけずらす (結果は `0.0` 以上に clamp)。
     /// 破壊的セクション移動の close (`delta < 0` = 範囲を詰める) / open (`delta > 0` =
     /// 範囲を空ける) プリミティブ。 対象は全トラックの clip 位置、各トラックと `song_lanes`
-    /// の automation clip 位置、`scale_changes`、`sections`、loop 範囲、`length_beats`。
+    /// の automation clip 位置、`scale_changes`、`sections`、`length_beats`。
     /// clip 内の note / event / point は clip-local なので動かさない (clip 位置だけずらせば
     /// 中身は付いてくる = 歌声キャッシュ key 不変、再合成不要)。 シフト後に scale / sections
     /// の invariant を復元する。
-    pub fn ripple_timeline(&mut self, from_beat: f64, delta: f64) {
-        fn shift(b: &mut f64, from: f64, delta: f64) {
-            if *b >= from {
-                *b = (*b + delta).max(0.0);
-            }
-        }
+    ///
+    /// 戻り値は適用した [`Ripple`]。 ループ範囲のように **`Song` の外に住む時間位置**
+    /// (session state + `ViewState`) を同じ規則で追従させるために返す。
+    pub fn ripple_timeline(&mut self, from_beat: f64, delta: f64) -> Ripple {
+        let r = Ripple { from_beat, delta };
         for t in &mut self.tracks {
             for c in &mut t.clips {
-                shift(&mut c.start_beat, from_beat, delta);
+                r.shift(&mut c.start_beat);
             }
             for lane in &mut t.automation_lanes {
                 for c in &mut lane.clips {
-                    shift(&mut c.start_beat, from_beat, delta);
+                    r.shift(&mut c.start_beat);
                 }
             }
         }
         for lane in &mut self.song_lanes {
             for c in &mut lane.clips {
-                shift(&mut c.start_beat, from_beat, delta);
+                r.shift(&mut c.start_beat);
             }
         }
         for sc in &mut self.scale_changes {
-            shift(&mut sc.beat, from_beat, delta);
+            r.shift(&mut sc.beat);
         }
         for s in &mut self.sections {
-            shift(&mut s.start_beat, from_beat, delta);
+            r.shift(&mut s.start_beat);
         }
-        shift(&mut self.loop_start_beat, from_beat, delta);
-        shift(&mut self.loop_end_beat, from_beat, delta);
         if self.length_beats >= from_beat {
             self.length_beats = (self.length_beats + delta).max(0.0);
         }
         self.ensure_scale_changes_sorted();
         self.normalize_sections();
+        r
     }
 
     /// セクション帯を `dest_start` へ
     /// 破壊的に移動し、 曲構成を組み替える (Studio One 流の能動アレンジャー)。 帯の範囲
     /// `[a, b)` 内の全トラック clip + automation + `song_lanes` automation + `scale_changes`
     /// を帯と一緒に取り出し、 `[a,b)` を ripple-close で詰め、 `dest_start` に ripple-open で
-    /// 空けて落とし直す。 他セクション / 他 clip は ripple で前後に流れる。 戻り値は移動が
-    /// 起きたか。
+    /// 空けて落とし直す。 他セクション / 他 clip は ripple で前後に流れる。
+    ///
+    /// 戻り値は適用した [`Ripple`] 列 (**空 = 移動しなかった**)。 呼び出し側は Song の外に
+    /// 住む時間位置 (session state のループ範囲) をこれで追従させる。
     ///
     /// 境界をまたぐ clip は移動前に `split_clips_at(a)` / `split_clips_at(b)` で分割するので、
     /// 帯範囲ぴったりの content だけが追従する (Studio One の split-at-boundary)。 残りの
     /// content / 他セクションは ripple で前後に流れる。
-    pub fn move_section(&mut self, section_id: u32, dest_start: f64) -> bool {
+    pub fn move_section(&mut self, section_id: u32, dest_start: f64) -> Vec<Ripple> {
         let Some(sec) = self.sections.iter().find(|s| s.id == section_id).cloned() else {
-            return false;
+            return Vec::new();
         };
         let (a, len) = (sec.start_beat, sec.len_beats);
         let b = a + len;
         let dest_start = dest_start.max(0.0);
         if len <= 0.0 || (dest_start - a).abs() < f64::EPSILON {
-            return false;
+            return Vec::new();
         }
         let in_range = |start: f64| start >= a && start < b;
 
@@ -865,7 +938,7 @@ impl Song {
         self.sections.retain(|s| s.id != section_id);
 
         // 2. `[a,b)` を詰める (close)。
-        self.ripple_timeline(b, -len);
+        let close = self.ripple_timeline(b, -len);
         // 3. 詰めた後の座標系での落とし先。
         let dest2 = if dest_start >= b {
             dest_start - len
@@ -875,7 +948,7 @@ impl Song {
             a
         };
         // 4. 落とし先に `len` ぶん空ける (open)。
-        self.ripple_timeline(dest2, len);
+        let open = self.ripple_timeline(dest2, len);
 
         // 5. 取り出した content を `dest2` 基準で戻す。
         for (tid, mut c) in taken_clips {
@@ -917,17 +990,23 @@ impl Song {
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
         self.normalize_sections();
-        true
+        vec![close, open]
     }
 
     /// セクション帯を `dest_start` に複製
     /// 挿入する (Ctrl+drag、 ripple-insert)。 範囲 `[a,b)` 内の clip / automation を **linked**
     /// (= `content_id` 共有、 REAPER pooled idiom) で複製し、 clip id だけ新規採番。 `dest_start`
     /// 以降を `len` ぶん右へ ripple して空けてから複製を落とす。 元の content は残す。 新しい
-    /// セクション id を採番して返す (`Some(new_id)`)。 `move_section` / `delete_section_range`
+    /// セクション id と適用した [`Ripple`] を返す (`None` = 複製しなかった)。 ripple は
+    /// `move_section` と同じく Song の外に住む時間位置 (ループ範囲) の追従用。
+    /// `move_section` / `delete_section_range`
     /// と同じく境界 `a` / `b` で `split_clips_at` してから `start_beat ∈ [a,b)` membership で複製する
     /// ので、 境界をまたぐ clip も範囲内ぶんだけ正しく複製される。
-    pub fn duplicate_section(&mut self, section_id: u32, dest_start: f64) -> Option<u32> {
+    pub fn duplicate_section(
+        &mut self,
+        section_id: u32,
+        dest_start: f64,
+    ) -> Option<(u32, Ripple)> {
         let sec = self.sections.iter().find(|s| s.id == section_id).cloned()?;
         let (a, len) = (sec.start_beat, sec.len_beats);
         let b = a + len;
@@ -996,7 +1075,7 @@ impl Song {
             .collect();
 
         // 2. dest に len ぶん空ける (insert)。
-        self.ripple_timeline(dest_start, len);
+        let open = self.ripple_timeline(dest_start, len);
 
         // 3. 複製を dest_start 基準で挿入。
         for (tid, mut c) in copies_clips {
@@ -1040,7 +1119,7 @@ impl Song {
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
         self.normalize_sections();
-        Some(new_id)
+        Some((new_id, open))
     }
 
     /// セクション帯だけ削除する (内容は温存、 Studio One の Backspace 相当)。
@@ -1053,15 +1132,15 @@ impl Song {
 
     /// セクションの**時間範囲ごと**削除して
     /// 詰める (Studio One の "Delete Range" 相当、 破壊的)。 境界を分割してから範囲内の全
-    /// content を消し、 `[a,b)` を ripple-close で詰める。 削除できたら `true`。
-    pub fn delete_section_range(&mut self, section_id: u32) -> bool {
-        let Some(sec) = self.sections.iter().find(|s| s.id == section_id).cloned() else {
-            return false;
-        };
+    /// content を消し、 `[a,b)` を ripple-close で詰める。 削除できたら適用した
+    /// [`Ripple`] を返す (`None` = 何もしなかった)。 ripple は Song の外に住む時間位置
+    /// (ループ範囲) の追従用。
+    pub fn delete_section_range(&mut self, section_id: u32) -> Option<Ripple> {
+        let sec = self.sections.iter().find(|s| s.id == section_id).cloned()?;
         let (a, len) = (sec.start_beat, sec.len_beats);
         let b = a + len;
         if len <= 0.0 {
-            return false;
+            return None;
         }
         self.split_clips_at(a);
         self.split_clips_at(b);
@@ -1077,10 +1156,10 @@ impl Song {
         }
         self.scale_changes.retain(|sc| !in_range(sc.beat));
         self.sections.retain(|s| s.id != section_id);
-        self.ripple_timeline(b, -len);
+        let close = self.ripple_timeline(b, -len);
         self.ensure_scale_changes_sorted();
         self.normalize_sections();
-        true
+        Some(close)
     }
 
     /// 全トラック clip / track automation clip /
@@ -1304,10 +1383,8 @@ impl Song {
         if !matches!(self.time_sig.1, 1 | 2 | 4 | 8 | 16) {
             self.time_sig.1 = 4;
         }
-        for v in [&mut self.length_beats, &mut self.loop_start_beat, &mut self.loop_end_beat] {
-            if !(v.is_finite() && *v >= 0.0) {
-                *v = 0.0;
-            }
+        if !(self.length_beats.is_finite() && self.length_beats >= 0.0) {
+            self.length_beats = 0.0;
         }
         if !(self.video_framerate.is_finite() && self.video_framerate > 0.0) {
             self.video_framerate = default_video_framerate();

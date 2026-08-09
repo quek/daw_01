@@ -468,7 +468,8 @@ fn render_loop(
             sample_rate,
             frames as u32,
             true,
-            false,
+            // export (freewheel render) は loop しない。
+            common::model::LoopRegion::default(),
             &empty_recording_lanes,
             // live 側 (engine.rs `current_bpm`) と同じ effective tempo を渡す。
             // base `song.bpm` を渡すと、 event 収集窓 (frames×bpm/(60·SR)) と

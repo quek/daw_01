@@ -95,7 +95,12 @@ pub const NO_PENDING_SEEK: u64 = u64::MAX;
 pub struct SharedState {
     pub song: ArcSwapOption<Song>,
     pub playback: AtomicU8,
-    pub looping: AtomicBool,
+    /// 再生ループの状態 (ON/OFF + 範囲)。 ループは `Song` ではなく GUI の
+    /// session state が所有するので、`LoadSong` ではなく `AudioCommand::SetLoop`
+    /// だけがここを書き換える (`common::model::LoopRegion`)。 ON/OFF と範囲を
+    /// 別々の atomic に割らないのは、 audio thread が 1 buffer 内で整合した
+    /// スナップショットを読むため (`recording_lanes` と同じ `ArcSwap` idiom)。
+    pub loop_region: arc_swap::ArcSwap<common::model::LoopRegion>,
     /// Last published playhead in samples. Mirrored to shmem for the GUI
     /// playhead cursor. **書き込みは audio thread (`process_buffer`) 単独**。
     /// IPC スレッドは seek を `pending_seek` に積むだけで、ここを直接書かない
@@ -141,7 +146,9 @@ impl SharedState {
         Self {
             song: ArcSwapOption::empty(),
             playback: AtomicU8::new(PlaybackCommand::Stop as u8),
-            looping: AtomicBool::new(false),
+            loop_region: arc_swap::ArcSwap::from_pointee(
+                common::model::LoopRegion::default(),
+            ),
             playhead: AtomicU64::new(0),
             pending_seek: AtomicU64::new(NO_PENDING_SEEK),
             recording_lanes: arc_swap::ArcSwap::from_pointee(
@@ -835,7 +842,11 @@ impl LocalState {
         // sites could otherwise observe a mid-buffer flip and produce an
         // internally inconsistent buffer.
         let export_running = self.shared.export_running.load(Ordering::Acquire);
-        let looping = shared.looping.load(Ordering::Acquire);
+        // ループ状態は 3 値まとめて 1 回だけ copy-out する (buffer 途中で
+        // ON/OFF と範囲が食い違って見えない)。 `LoopRegion` は `Copy` なので
+        // guard は即座に落とせる = RT 上で Arc を持ち回らない。
+        let loop_region = **shared.loop_region.load();
+        let looping = loop_region.enabled;
         let metronome_enabled = shared.metronome_enabled.load(Ordering::Acquire);
 
         // freewheel export: while the export thread holds the audio
@@ -1026,7 +1037,7 @@ impl LocalState {
                 sample_rate,
                 n as u32,
                 playing,
-                looping,
+                loop_region,
                 recording_lanes,
                 current_bpm,
                 self.playhead_beats,
@@ -1142,7 +1153,7 @@ impl LocalState {
         if playing {
             let mut new_ph = playhead + n as u64;
             let active_end = if looping {
-                effective_loop_bounds(song_ref, sample_rate).map(|(_, e)| e)
+                effective_loop_bounds(song_ref, loop_region, sample_rate).map(|(_, e)| e)
             } else {
                 None
             };
@@ -1167,7 +1178,7 @@ impl LocalState {
                     s.state.active_notes.clear();
                 }
                 let wrap_to = if looping {
-                    effective_loop_bounds(song_ref, sample_rate).map(|(s, _)| s)
+                    effective_loop_bounds(song_ref, loop_region, sample_rate).map(|(s, _)| s)
                 } else {
                     None
                 };

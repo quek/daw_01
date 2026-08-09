@@ -437,7 +437,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // Loop toggle: icon (⟳) + 色のコンパクトボタン。 active 時 blue に染まる。
     let loop_w = 36.0;
-    let loop_active = app.transport.is_looping;
+    let loop_active = app.transport.loop_region.enabled;
     ui.toggle_button_at(
         "transport_loop",
         "\u{27F3}",

@@ -68,6 +68,37 @@ impl AppData {
         self.song_doc.edit_checked(scope, f) == Some(true)
     }
 
+    /// タイムラインを ripple する Song 編集 (セクションの移動 / 複製 / 範囲削除) の
+    /// 標準口。 closure が返した [`common::model::Ripple`] 列を、 **`Song` の外に住む
+    /// 時間位置** — 再生ループ範囲 (session state、`common::model::LoopRegion`) —
+    /// にも同じ規則で適用する。
+    ///
+    /// ループが Song を出た以上、 「時間を挿入 / 削除したらループ範囲も一緒に動く」
+    /// 責務はここが負う。 呼び出し側が帯の幾何 (`[a,b)` / dest の詰め直し) を再計算
+    /// する補償コードを書かないよう、 ripple は `Song` 側が「実際に適用したもの」 を
+    /// 返す。 戻り値 = 実際に編集が起きたか (export 中拒否は false)。
+    pub fn edit_song_rippling(
+        &mut self,
+        f: impl FnOnce(&mut common::model::Song) -> Vec<common::model::Ripple>,
+    ) -> bool {
+        let mut ripples = Vec::new();
+        let changed = self.edit_song_checked(|song| {
+            ripples = f(song);
+            !ripples.is_empty()
+        });
+        if !changed {
+            return false;
+        }
+        let mut region = self.transport.loop_region;
+        for r in &ripples {
+            region.apply_ripple(*r);
+        }
+        if region != self.transport.loop_region {
+            self.set_loop_region(region);
+        }
+        true
+    }
+
     /// 派生データ正規化 / save 後 path 書換など undo 非対象の song 変更
     /// ([`SongDoc::normalize`]) の標準口。 `edit_song` と同じく **編集直前に
     /// export_lock を transport から同期する**。 これを経由せず

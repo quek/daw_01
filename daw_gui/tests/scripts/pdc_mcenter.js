@@ -30,8 +30,6 @@ const song = {
   bpm: 120.0,
   time_sig: [4, 4],
   length_beats: 8.0,
-  loop_start_beat: 0.0,
-  loop_end_beat: 0.0,
   tracks: [
     {
       id: 1,

@@ -76,7 +76,7 @@ impl AppData {
     /// 位置が変わるので `flush_song_sync`。 移動が起きなければ undo snapshot を破棄。
     /// （境界をまたぐ clip の分割は `Song::move_section` の次段。）
     pub(crate) fn apply_move_section(&mut self, id: u32, next_start: f64) {
-        self.edit_song_checked(|song| song.move_section(id, next_start));
+        self.edit_song_rippling(|song| song.move_section(id, next_start));
     }
 
     /// セクション帯をリサイズする (被覆範囲の再定義、内容は動かさない)。
@@ -96,7 +96,10 @@ impl AppData {
     /// linked コピーし、 dest 以降を ripple で空けて落とす)。 clip が増えるので
     /// `flush_song_sync`。 複製が起きなければ undo snapshot を破棄。
     pub(crate) fn apply_duplicate_section(&mut self, id: u32, dest_start: f64) {
-        self.edit_song_checked(|song| song.duplicate_section(id, dest_start).is_some());
+        self.edit_song_rippling(|song| {
+            song.duplicate_section(id, dest_start)
+                .map_or_else(Vec::new, |(_new_id, ripple)| vec![ripple])
+        });
     }
 
     /// 「このセクションをループ」: 帯の範囲を既存ループ領域に設定する (ループの SSoT を駆動、
@@ -116,7 +119,7 @@ impl AppData {
     /// 「範囲ごと削除」: セクションの時間範囲と内容を消して詰める (破壊的、 Delete Range 相当)。
     /// clip が変わるので plugin host へ sync。
     pub(crate) fn apply_delete_section_range(&mut self, id: u32) {
-        self.edit_song_checked(|song| song.delete_section_range(id));
+        self.edit_song_rippling(|song| song.delete_section_range(id).into_iter().collect());
     }
 
     /// gui_01 の `SelectSection { id, modifier }` を解決してセクション選択集合を

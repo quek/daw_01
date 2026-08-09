@@ -216,11 +216,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
         // ----- 既存 loop region overlay (ruler 上に半透明バンド) -----
         // arrangement view と同色の cyan、 view 範囲との交差のみ描画。
-        if app.song_doc.song().loop_end_beat > app.song_doc.song().loop_start_beat {
+        if let Some((lstart, lend)) = app.transport.loop_region.range() {
             let view_start_song = clip.start_beat + view_start_beat;
             let view_end_song = view_start_song + view_len_beats;
-            let lstart = app.song_doc.song().loop_start_beat;
-            let lend = app.song_doc.song().loop_end_beat;
             let visible_start = lstart.max(view_start_song);
             let visible_end = lend.min(view_end_song);
             if visible_end > visible_start && view_len_beats > 0.0 {

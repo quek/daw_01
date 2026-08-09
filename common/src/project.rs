@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::model::{AuxInputRoute, CURRENT_VERSION, ProjectFile, Song, ViewState};
+use crate::model::{AuxInputRoute, CURRENT_VERSION, LoopRegion, ProjectFile, Song, ViewState};
 
 /// Result of `load_project`: the normalized song plus the optional GUI view
 /// state. `view` is `None` for legacy files / files saved without
@@ -13,6 +13,15 @@ use crate::model::{AuxInputRoute, CURRENT_VERSION, ProjectFile, Song, ViewState}
 pub struct LoadedProject {
     pub song: Song,
     pub view: Option<ViewState>,
+    /// 再生ループ (ON/OFF + 範囲) の**解決済み**値。 `view` があればその
+    /// `loop_region`、 無ければ v30 以前の `Song.loop_start_beat` /
+    /// `loop_end_beat` からの移行値 (ON/OFF は当時セッション限りだったので `false`)。
+    ///
+    /// `view` に畳み込まず独立して返すのは、 ViewState 導入 (v28) 以前のファイルに
+    /// ループ範囲だけのために `ViewState::default()` を合成すると、 ズーム / 行高 /
+    /// ヘッダ幅まで既定値へ潰れてしまうため (= `view: None` の「globals は現状維持」
+    /// 挙動が壊れる)。
+    pub loop_region: LoopRegion,
 }
 
 /// Oldest project-file version `load` will accept. Versions below this
@@ -32,6 +41,12 @@ const SUBTITLE_DEVICE_VERSION: u32 = 26;
 /// v27 で `Clip.muted` / `Note.muted` が mute の SSoT になった。
 /// `migrate_per_event_mute_to_clip_mute` はこのバージョン未満の保存ファイルにだけ適用する。
 const CLIP_MUTE_VERSION: u32 = 27;
+
+/// v31 で `Song.loop_start_beat` / `loop_end_beat` を撤去し、再生ループ (ON/OFF + 範囲) を
+/// session state + [`ViewState::loop_region`] へ移した (「聴き方の都合」 は dirty を立てない
+/// が保存される、[`LoopRegion`] 参照)。この版未満のファイルは Song 直下にループ範囲を持つので
+/// [`legacy_song_loop_region`] が deserialize 前に拾い上げる。
+const LOOP_IN_VIEW_STATE_VERSION: u32 = 31;
 
 /// v30 (§10) で `ClipContent` を `#[serde(untagged)]` から tagged (`type` field) 化した。
 /// この版未満のファイルは content を untagged (flat `{"notes":[...]}` 等) で保存しているので、
@@ -702,6 +717,24 @@ fn migrate_per_event_mute_to_clip_mute(song: &mut Song) {
     }
 }
 
+/// v30 以前の `.daw` が Song 直下に持っていたループ範囲を読み出す
+/// ([`LOOP_IN_VIEW_STATE_VERSION`])。`Song` からフィールドが消えた今、
+/// deserialize すると黙って捨てられるので、`from_value` の**前**に生 JSON から拾う。
+/// ON/OFF は当時セッション限り (保存されていなかった) なので `enabled: false` —
+/// 「起動直後はループ OFF」 という旧挙動をそのまま保つ。
+/// 範囲が未定義 (`end <= start`、既定の 0/0 を含む) なら `None` = 移行するものなし。
+fn legacy_song_loop_region(value: &serde_json::Value) -> Option<LoopRegion> {
+    let song = value.get("song")?;
+    let beat = |key: &str| song.get(key).and_then(serde_json::Value::as_f64);
+    let mut region = LoopRegion {
+        enabled: false,
+        start_beat: beat("loop_start_beat")?,
+        end_beat: beat("loop_end_beat")?,
+    };
+    region.sanitize();
+    region.has_range().then_some(region)
+}
+
 /// Load just the song (legacy callers / tests / headless `--script`).
 /// Delegates to `load_project` and drops the view state.
 pub fn load(path: impl AsRef<Path>) -> Result<Song> {
@@ -756,6 +789,13 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    // v31 で `Song` から消えたループ範囲を、deserialize (= 未知フィールドの黙殺) の
+    // **前**に生 JSON から救い出す。他の migration と違い `Song` にも `ViewState` にも
+    // 書き戻せない (前者はフィールドを撤去済、後者を合成すると view: None の
+    // 「globals は現状維持」 が壊れる) ので、値のまま持ち回って下で解決する。
+    let legacy_loop = (file_version < u64::from(LOOP_IN_VIEW_STATE_VERSION))
+        .then(|| legacy_song_loop_region(&value))
+        .flatten();
     for &(introduced_in, migrate) in VALUE_MIGRATIONS {
         if file_version < u64::from(introduced_in) {
             migrate(&mut value);
@@ -788,7 +828,19 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
             "loaded legacy project file; missing fields filled with serde defaults"
         );
     }
-    let view = project.view;
+    // 再生ループの解決: v31+ は `ViewState::loop_region` が真実源。範囲が未設定なら
+    // v30 以前の `Song.loop_*_beat` から移行する (v28..v30 のファイルは view を持つが
+    // loop_region は既定値なので、この順序でないと旧範囲を取りこぼす)。解決値は
+    // `view` にも書き戻して「同じ値が 2 か所で食い違う」状態を作らない。
+    let mut view = project.view;
+    let mut loop_region = view.as_ref().map(|v| v.loop_region).unwrap_or_default();
+    if !loop_region.has_range() && let Some(legacy) = legacy_loop {
+        loop_region = legacy;
+    }
+    loop_region.sanitize();
+    if let Some(v) = view.as_mut() {
+        v.loop_region = loop_region;
+    }
     let mut song = project.song;
     // deserialize 後の Song へ当てる version-gated migration を単一 dispatch table
     // (SONG_MIGRATIONS) から適用する。各 entry は「その挙動が導入されたバージョン」未満の
@@ -806,7 +858,7 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     // automation-point sort invariants. Idempotent — safe if a caller
     // (e.g. `daw_gui::app::open_project`) re-runs it.
     song.normalize_after_load();
-    Ok(LoadedProject { song, view })
+    Ok(LoadedProject { song, view, loop_region })
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -836,6 +888,7 @@ mod tests {
             expanded_automation_tracks: vec![2, 5],
             master_row_automation_expanded: true,
             arrange_follow: FollowMode::Page,
+            loop_region: LoopRegion { enabled: true, start_beat: 8.0, end_beat: 24.0 },
             arrange_snap_enabled: false,
             arrange_snap_choice: 4,
             pianoroll_snap_enabled: true,
@@ -890,6 +943,77 @@ mod tests {
         write_project_with_version(&path, &Song::default(), CURRENT_VERSION);
         let loaded = load_project(&path).unwrap();
         assert_eq!(loaded.view, None);
+    }
+
+    /// (b) ループ (ON/OFF + 範囲) は `ViewState` 経由で save → load を往復する。
+    /// `Song` には載らない (= 変えても dirty にならない) が失われもしない、が要求。
+    #[test]
+    fn loop_region_roundtrips_through_view_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("loop.daw");
+        let view = ViewState {
+            loop_region: LoopRegion { enabled: true, start_beat: 8.0, end_beat: 24.0 },
+            ..ViewState::default()
+        };
+        save_project(&path, &Song::default(), Some(&view)).unwrap();
+        // 保存された JSON の `song` 側にループが漏れていないこと (= Song は無関係)。
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw["song"].get("loop_start_beat").is_none());
+        assert!(raw["song"].get("loop_end_beat").is_none());
+
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.loop_region, view.loop_region);
+        assert_eq!(loaded.view.unwrap().loop_region, view.loop_region);
+    }
+
+    /// (c) v30 以前の `.daw` (= ループ範囲が `Song` 直下) から移行される。
+    /// ViewState を持たない古い版でも範囲を失わず、かつ `view` は `None` のまま
+    /// (= 合成して globals を既定値へ潰さない)。ON/OFF は当時保存されていないので `false`。
+    #[test]
+    fn legacy_song_loop_range_migrates_to_loaded_loop_region() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v30_loop.daw");
+        let mut song_value = serde_json::to_value(Song::default()).unwrap();
+        song_value["loop_start_beat"] = serde_json::json!(4.0);
+        song_value["loop_end_beat"] = serde_json::json!(12.0);
+        let project = serde_json::json!({ "version": 30, "song": song_value });
+        std::fs::write(&path, serde_json::to_string(&project).unwrap()).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(
+            loaded.loop_region,
+            LoopRegion { enabled: false, start_beat: 4.0, end_beat: 12.0 },
+            "旧 Song のループ範囲を拾う (ON/OFF は当時セッション限りなので false)"
+        );
+        assert_eq!(loaded.view, None, "ViewState を合成しない (globals は現状維持)");
+    }
+
+    /// v28..v30 の `.daw` は `view` を持つが `loop_region` は未保存 (= 既定)。
+    /// この場合も `Song` 直下の旧ループ範囲を拾い、`view` にも書き戻して食い違わせない。
+    #[test]
+    fn legacy_song_loop_range_wins_over_defaulted_view_loop_region() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v30_loop_with_view.daw");
+        let mut song_value = serde_json::to_value(Song::default()).unwrap();
+        song_value["loop_start_beat"] = serde_json::json!(2.0);
+        song_value["loop_end_beat"] = serde_json::json!(6.0);
+        let view_value = serde_json::to_value(sample_view_state()).unwrap();
+        // v30 の view には loop_region が無い。
+        let mut view_value = view_value;
+        view_value.as_object_mut().unwrap().remove("loop_region");
+        let project =
+            serde_json::json!({ "version": 30, "song": song_value, "view": view_value });
+        std::fs::write(&path, serde_json::to_string(&project).unwrap()).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(
+            loaded.loop_region,
+            LoopRegion { enabled: false, start_beat: 2.0, end_beat: 6.0 }
+        );
+        assert_eq!(loaded.view.unwrap().loop_region, loaded.loop_region);
+        // 旧 view の他のフィールドは失われない。
+        assert_eq!(load_project(&path).unwrap().view.unwrap().arrange_zoom_x, 37.5);
     }
 
     /// 旧 `save` (= `save_project(.., None)` への委譲) は view を書かない。

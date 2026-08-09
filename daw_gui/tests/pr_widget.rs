@@ -462,12 +462,12 @@ fn ruler_shift_drag_sets_loop_range() {
     drive_pointer(&mut host, &mut app, press(120.0, RULER_Y, m));
     drive_pointer(&mut host, &mut app, hold(312.0, RULER_Y, m));
     drive_pointer(&mut host, &mut app, release(312.0, RULER_Y, m));
-    let song = app.song_doc.song();
+    let region = app.transport.loop_region;
     assert!(
-        (song.loop_start_beat - 1.0).abs() < 1e-3 && (song.loop_end_beat - 4.0).abs() < 1e-3,
+        (region.start_beat - 1.0).abs() < 1e-3 && (region.end_beat - 4.0).abs() < 1e-3,
         "loop 範囲 [1,4]: got [{}, {}]",
-        song.loop_start_beat,
-        song.loop_end_beat
+        region.start_beat,
+        region.end_beat
     );
 }
 
