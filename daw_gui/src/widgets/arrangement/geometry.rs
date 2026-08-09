@@ -542,7 +542,7 @@ pub fn volume_from_mouse_x(mouse_x: f32, band_x: f32, band_w: f32) -> f32 {
 }
 
 /// M14 Phase 101 (daw_01 #072): track header drag を reorder に昇格させる最小移動量 (px)。
-/// これ未満は click (= SelectTrack) 扱い。 pending_drop (commit) と reorder_overlay (描画) が
+/// これ未満は click (= トラック選択) 扱い。 pending_drop (commit) と reorder_overlay (描画) が
 /// **同じ閾値**を使うことで preview と commit の発火条件が一致する。
 pub(super) const REORDER_DRAG_THRESHOLD_PX: f32 = 16.0;
 

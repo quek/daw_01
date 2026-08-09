@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{device_id_at, AppData, AppEvent};
 
-use super::support::{self, drain};
+use super::support::{self, drain, select_track_single};
 
 /// 旧独立バイナリ時代のシグネチャを保つ thin adapter (dispatcher はここで drop)。
 fn build_app() -> (
@@ -38,7 +38,7 @@ fn load_failure_releases_single_pending_and_flushes_play() {
     let track_id = app.song_doc.song().tracks[0].id;
 
     // 1. instrument を picker からロード → SetSlotPlugin 送信、 pending に entry。
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(&mut app, 0);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
@@ -123,7 +123,7 @@ fn load_failure_keeps_other_pending_unaffected() {
     let track_id = app.song_doc.song().tracks[0].id;
 
     // instrument + Fx の 2 つを順次ロード → pending 2 件。
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(&mut app, 0);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
@@ -200,7 +200,7 @@ fn stale_generation_failure_is_ignored() {
     let (mut app, _audio_rx, mut plugin_rx) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
 
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(&mut app, 0);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),

@@ -22,18 +22,6 @@ impl AppData {
         self.song_doc.song().tracks.iter().position(|t| t.id == id)
     }
 
-    /// 単一カーソル選択にする。 multi-select を使う UI 側からは
-    /// `selected_track_ids = vec![id]` を直接書く方が自然なので、 これは
-    /// 既存の「index で選択しなおす」 旧フローを id ベースに変換する
-    /// 互換ヘルパ。 当面は呼び出し側がない (Phase 2 移行中) ので
-    /// dead_code を許容。
-    #[allow(dead_code)]
-    pub fn set_cursor_track_index(&mut self, idx: usize) {
-        if let Some(t) = self.song_doc.song().tracks.get(idx) {
-            self.selection.selected_track_ids = vec![t.id];
-        }
-    }
-
     /// A track acts as a "group" iff at least one other track points
     /// at it via `parent_group_id`. The role is purely derived — there
     /// is no `Track::kind` field. SSOT (CLAUDE.md).

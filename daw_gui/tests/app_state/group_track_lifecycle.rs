@@ -26,7 +26,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{device_id_at, AppData, AppEvent};
 
-use super::support::{build_app, drain, fake_plugin_loaded};
+use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
 
 #[test]
 fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
@@ -36,7 +36,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     let inst_track_id = app.song_doc.song().tracks[0].id;
 
     // Step 1: track 0 を選択し、 picker から synth を入れる (= device 0 に append)。
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(&mut app, 0);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
@@ -318,7 +318,7 @@ fn setup_loaded_chain(
     plugin_rx: &mut UnboundedReceiver<PluginCommand>,
 ) -> (u32, [u64; 3]) {
     let track_id = app.song_doc.song().tracks[0].id;
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(app, 0);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),

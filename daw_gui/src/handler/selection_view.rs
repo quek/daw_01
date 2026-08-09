@@ -6,6 +6,90 @@ use crate::app_types::*;
 use common::model::Note;
 
 impl AppData {
+    /// copy / cut / delete / duplicate / zoom が共有する **単一 arbiter**:
+    /// 「いまキーボード操作の対象になっている編集面」 を 1 つに解決する
+    /// (grill-me 2026-06-11)。 view ではなく `AppData` が持つ — 選択セマンティクスは
+    /// ドメインロジックであり、 headless 統合テストからも検証できる必要があるため。
+    ///
+    /// `is_pianoroll_active` はポインタが bottom panel 内 + Piano Roll タブ選択中か
+    /// (view しか知らないので引数で受ける)。
+    ///
+    /// 解決順:
+    /// 1. **ポインタが乗っている面** (piano roll / automation lane) — hover 文脈が最優先。
+    /// 2. **last-wins**: `last_edit_select` が指す面がまだ非空ならそれ (#071)。
+    /// 3. **非空優先順の fallback**: audio event → automation point → note → clip →
+    ///    automation clip。 **`Tracks` / `Sections` はここに入れない** —
+    ///    `selected_track_ids` はクリップ選択の追従 ([`Self::select_track`]) や削除後の
+    ///    自動再選択でも非空になるので、 非空を「トラックを消したい意図」 の代理にすると
+    ///    「クリップを Del した直後にもう一度 Del を押すとトラックが消える」 事故になる。
+    ///    トラック面 / セクション面は **明示的に選んだ (= タグが立った) ときだけ** 対象。
+    #[must_use]
+    pub fn edit_surface(&self, is_pianoroll_active: bool) -> Option<EditSurface> {
+        use EditSurface as S;
+        // 選択集合は面を跨いで共存できる (lasso は automation の点とクリップを両方拾う、
+        // clip 選択は automation 選択を消さない)。
+        let auto_prefer_clips = !self.selection.selected_automation_clips.is_empty()
+            && (self.selection.selected_automation_points.is_empty()
+                || self.selection.last_edit_select == Some(S::AutomationClips));
+        // 1. ポインタが乗っている面を最優先。
+        if is_pianoroll_active {
+            return Some(if self.ui_ephemeral.audio_editor_clip.is_some() {
+                S::AudioEvents
+            } else {
+                S::Notes
+            });
+        }
+        if self.ui_ephemeral.arrange_hovered_automation_lane.is_some() {
+            // automation lane 上: last-wins で clip が勝つなら clip 面、 それ以外は点面
+            // (点が選択されていればその点、 何も無ければ hover-delete 文脈で点面)。
+            if auto_prefer_clips {
+                return Some(S::AutomationClips);
+            }
+            return Some(S::AutomationPoints);
+        }
+        // 2. ポインタがどの編集面でもない → 「最後に選んだ面」 がまだ非空ならそれ。
+        let audio_events = self.ui_ephemeral.audio_editor_clip.is_some()
+            && !self.selection.audio_editor_selected_events.is_empty();
+        let notes = !self.selection.selected_notes.is_empty();
+        let points = !self.selection.selected_automation_points.is_empty();
+        let auto_clips = !self.selection.selected_automation_clips.is_empty();
+        // 安価な空判定 (selected_clip_refs() は Vec を確保するので避ける)。
+        let clips =
+            self.selection.selected_clip.is_some() || !self.selection.selected_clips.is_empty();
+        let tracks = !self.selection.selected_track_ids.is_empty();
+        let sections = !self.selection.selected_section_ids.is_empty();
+        let last_wins = match self.selection.last_edit_select {
+            Some(S::AudioEvents) if audio_events => Some(S::AudioEvents),
+            Some(S::Notes) if notes => Some(S::Notes),
+            Some(S::AutomationPoints) if points => Some(S::AutomationPoints),
+            Some(S::AutomationClips) if auto_clips => Some(S::AutomationClips),
+            Some(S::Clips) if clips => Some(S::Clips),
+            Some(S::Tracks) if tracks => Some(S::Tracks),
+            Some(S::Sections) if sections => Some(S::Sections),
+            _ => None,
+        };
+        if let Some(surface) = last_wins {
+            return Some(surface);
+        }
+        // 3. タグの面が空 (削除済み等) → 選択集合の非空優先順 (従来順)。
+        if audio_events {
+            return Some(S::AudioEvents);
+        }
+        if points {
+            return Some(S::AutomationPoints);
+        }
+        if notes {
+            return Some(S::Notes);
+        }
+        if clips {
+            return Some(S::Clips);
+        }
+        if auto_clips {
+            return Some(S::AutomationClips);
+        }
+        None
+    }
+
     /// stable `ClipKey` (track_id + clip_id) → 現在の index ベース `ClipRef`。
     /// track / clip が見つからなければ `None` (= 削除済 / undo で消えた)。
     pub fn clip_ref_of(&self, key: common::model::ClipKey) -> Option<ClipRef> {
@@ -567,7 +651,7 @@ impl AppData {
         self.selection.selected_clip = primary;
         self.selection.selected_notes.clear();
         if primary.is_some() {
-            self.selection.last_edit_select = Some(EditSelectSurface::Clips);
+            self.selection.last_edit_select = Some(EditSurface::Clips);
         }
         self.recording.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip_ref() {
@@ -592,7 +676,7 @@ impl AppData {
         self.selection.selected_clip = primary;
         self.selection.selected_notes.clear();
         if primary.is_some() {
-            self.selection.last_edit_select = Some(EditSelectSurface::Clips);
+            self.selection.last_edit_select = Some(EditSurface::Clips);
         }
         self.recording.step_cursor_beat = 0.0;
         if let Some(r) = self.selected_clip_ref() {
@@ -630,7 +714,7 @@ impl AppData {
         }
         // 冪等 early-return より前に last-wins 面だけは更新する (既に全選択でも
         // 「Ctrl+A = クリップ面を選んだ」 という意図は確定している)。
-        self.selection.last_edit_select = Some(EditSelectSurface::Clips);
+        self.selection.last_edit_select = Some(EditSurface::Clips);
         // 既に全選択なら冪等 (集合一致を順序非依存で判定)。
         if self.selection.selected_clips.len() == all.len() {
             let cur: std::collections::HashSet<common::model::ClipKey> =
@@ -652,7 +736,7 @@ impl AppData {
         self.selection.selected_clip = key;
         self.selection.selected_clips = key.into_iter().collect();
         if key.is_some() {
-            self.selection.last_edit_select = Some(EditSelectSurface::Clips);
+            self.selection.last_edit_select = Some(EditSurface::Clips);
         }
     }
 
@@ -663,7 +747,7 @@ impl AppData {
             refs.iter().filter_map(|r| self.clip_key_of(*r)).collect();
         self.selection.selected_clip = keys.last().copied();
         if self.selection.selected_clip.is_some() {
-            self.selection.last_edit_select = Some(EditSelectSurface::Clips);
+            self.selection.last_edit_select = Some(EditSurface::Clips);
         }
         self.selection.selected_clips = keys;
     }

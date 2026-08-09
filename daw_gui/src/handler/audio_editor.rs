@@ -386,7 +386,7 @@ impl AppData {
         let deduped: Vec<usize> = indices.into_iter().filter(|i| seen.insert(*i)).collect();
         self.selection.audio_editor_selected_events = deduped;
         if !self.selection.audio_editor_selected_events.is_empty() {
-            self.selection.last_edit_select = Some(EditSelectSurface::AudioEvents);
+            self.selection.last_edit_select = Some(EditSurface::AudioEvents);
         }
     }
 

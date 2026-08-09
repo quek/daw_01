@@ -1079,7 +1079,7 @@ fn daw_duplicate_tracks(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
         .map_err(|e| js_native(format!("duplicateTracks: parse ids: {e}")))?;
     let linked = args.get_or_undefined(1).to_boolean();
     with_host(|host| {
-        host.app.selection.selected_track_ids = ids.clone();
+        host.app.set_track_selection(ids.clone());
         let ev = if linked {
             AppEvent::DuplicateTracksShared(ids)
         } else {

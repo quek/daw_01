@@ -779,13 +779,13 @@ impl AppData {
                 // 直近に選択した編集面を記録 (= 共存選択されたときの
                 // copy/cut/delete 対象を「最後に選んだ面」 に決める last-wins)。
                 if !next.is_empty() {
-                    self.selection.last_edit_select = Some(EditSelectSurface::AutomationClips);
+                    self.selection.last_edit_select = Some(EditSurface::AutomationClips);
                 }
                 self.selection.selected_automation_clips = next;
             }
             AppEvent::SelectAutomationPoints { prev: _, next } => {
                 if !next.is_empty() {
-                    self.selection.last_edit_select = Some(EditSelectSurface::AutomationPoints);
+                    self.selection.last_edit_select = Some(EditSurface::AutomationPoints);
                 }
                 self.selection.selected_automation_points = next;
             }
@@ -959,13 +959,12 @@ impl AppData {
                 self.action_set_track_parent(track_id, parent_id);
             }
             AppEvent::RemoveLastTrack => self.action_remove_last_track(),
-            AppEvent::DeleteTrack(idx) => self.delete_track(idx),
+            AppEvent::DeleteTracks(track_ids) => self.delete_tracks(track_ids),
             AppEvent::DuplicateTracksShared(track_ids) => self.duplicate_tracks(track_ids, true),
             AppEvent::DuplicateTracksUnique(track_ids) => self.duplicate_tracks(track_ids, false),
             AppEvent::MoveTrackUp(idx) => self.swap_tracks(idx, idx.saturating_sub(1)),
             AppEvent::MoveTrackDown(idx) => self.swap_tracks(idx, idx + 1),
             AppEvent::ReorderTracks(order) => self.reorder_tracks(&order),
-            AppEvent::SelectTrack(idx) => self.select_track(idx),
             AppEvent::BeginRenameTrack(track_id) => {
                 self.begin_rename_track(track_id);
             }
@@ -1121,7 +1120,7 @@ impl AppData {
             AppEvent::SetNoteSelection(targets) => {
                 self.selection.selected_notes = targets;
                 if !self.selection.selected_notes.is_empty() {
-                    self.selection.last_edit_select = Some(EditSelectSurface::Notes);
+                    self.selection.last_edit_select = Some(EditSurface::Notes);
                 }
                 // last (anchor) は packed note id。所属クリップを decode し、
                 // (1) **そのクリップを対象 (target) に切替** — 非対象クリップのノートを掴むと編集対象が
@@ -1803,7 +1802,7 @@ impl AppData {
             AppEvent::SelectAudioEditorEvent(idx) => {
                 self.selection.audio_editor_selected_events = idx.into_iter().collect();
                 if !self.selection.audio_editor_selected_events.is_empty() {
-                    self.selection.last_edit_select = Some(EditSelectSurface::AudioEvents);
+                    self.selection.last_edit_select = Some(EditSurface::AudioEvents);
                 }
             }
             AppEvent::SetAudioEditorEventSelection(indices) => {

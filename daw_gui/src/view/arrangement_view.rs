@@ -578,7 +578,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 
     // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
-    // widget は track_header_rects と BeginRenameTrack / DeleteTrack の発行までを担う。
+    // widget は track_header_rects の収集までを担い、 メニュー項目の発行は view 側。
     // rename mode 中の track には text_input を rect に重ね描きする。
     // rename 対象は安定 ID で直接持つ (index 経由の解決はしない = reorder/delete で
     // 別 track にすり替わらない、 SSoT)。
@@ -598,15 +598,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    let Some(t_idx) =
-                        app.song_doc.song().tracks.iter().position(|t| t.id == track_id)
-                    else {
-                        return;
-                    };
-                    // 複製 (r.md #30) の対象: 右クリック track が選択集合に含まれるなら
-                    // 選択全体、 含まれないなら右クリック track 単独 (Delete と同じく右
-                    // クリック対象を優先。 REAPER / Ableton 流)。
-                    let dup_ids = || {
+                    // 複製 (r.md #30) / 削除 (r.md #43) の対象: 右クリック track が
+                    // 選択集合に含まれるなら選択全体、 含まれないなら右クリック track
+                    // 単独 (REAPER / Ableton 流)。 メニュー内で規則を割らない。
+                    let target_ids = || {
                         if app.selection.selected_track_ids.contains(&track_id) {
                             app.selection.selected_track_ids.clone()
                         } else {
@@ -616,9 +611,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     match idx {
                         0 => app.handle_event(AppEvent::BeginRenameTrack(track_id)),
                         // 独立複製 (Alt+D 相当): 元と切り離した別コピー。
-                        1 => app.handle_event(AppEvent::DuplicateTracksUnique(dup_ids())),
+                        1 => app.handle_event(AppEvent::DuplicateTracksUnique(target_ids())),
                         // リンク複製 (D 相当): クリップ中身を元と content_id 共有。
-                        2 => app.handle_event(AppEvent::DuplicateTracksShared(dup_ids())),
+                        2 => app.handle_event(AppEvent::DuplicateTracksShared(target_ids())),
                         // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
                         // (anchor = 右クリックした track header rect)。
                         3 => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
@@ -626,7 +621,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         4 => app.handle_event(AppEvent::ResetTrackClipColors {
                             track: track_id,
                         }),
-                        5 => app.handle_event(AppEvent::DeleteTrack(t_idx as u32)),
+                        5 => app.handle_event(AppEvent::DeleteTracks(target_ids())),
                         _ => {}
                     }
                 }));

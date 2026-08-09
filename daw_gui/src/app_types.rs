@@ -749,20 +749,34 @@ pub struct AutomationPointKeyRef {
     pub point_idx: u32,
 }
 
+/// 編集面 (copy / cut / delete / duplicate / zoom の対象)。
+///
 /// 直交して共存できる選択集合 (audio event / note / automation point /
-/// automation clip / clip) に効く copy / cut / delete の対象面を決める
-/// 「最後に選んだ面」 (last-wins) のタグ。 `AppData::last_edit_select` が保持し、
-/// 各選択 setter が「選択が非空になったとき」 に更新する (空クリアでは面は
-/// 移らない)。 固定 type 優先順位 tier だと「クリップを選択して Del したのに
-/// 残存 automation 点が消える」 (#071) が面跨ぎで再発するため、 選択の時系列を
-/// 単一 SSoT で追う。
+/// automation clip / clip / track / section) は同時に非空になり得るので、
+/// 「最後に選んだ面」 (last-wins) を `SelectionState::last_edit_select` が保持し、
+/// [`AppData::edit_surface`](crate::app::AppData::edit_surface) がポインタ面 →
+/// last-wins → 非空優先順の順で対象面を 1 つに解決する。 各選択 setter が
+/// 「選択が非空になったとき」 にタグを更新する (空クリアでは面は移らない)。
+/// 固定 type 優先順位 tier だと「クリップを選択して Del したのに残存 automation
+/// 点が消える」 (#071) が面跨ぎで再発するため、 選択の時系列を単一 SSoT で追う。
+///
+/// タグ (「最後に選んだ面」) と arbiter の解決結果は **同じ値空間** なので
+/// 単一 enum で表す (旧実装は `EditSelectSurface` と view 私有の `EditSurface`
+/// に分裂し、 `edit_surface` が 1:1 で翻訳する mirror 型になっていた)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditSelectSurface {
+pub enum EditSurface {
     AudioEvents,
     Notes,
     AutomationPoints,
     AutomationClips,
     Clips,
+    /// トラック面 (ヘッダ / ミキサーストリップ)。 **明示的に選んだときだけ**
+    /// 立つ — `selected_track_ids` はクリップ選択の追従 (`select_track`) や
+    /// 削除後の自動再選択でも非空になるので、 非空を「削除意図」 の代理にできない
+    /// (`edit_surface` の非空優先順 fallback から外してある)。
+    Tracks,
+    /// Arranger セクション帯 (選択中なら Delete で帯削除)。
+    Sections,
 }
 
 /// gui_01 #028: `MoveAutomationPoints` 用の 1 point delta。`value_norm`
@@ -1493,7 +1507,9 @@ pub enum PendingStateRequest {
 /// 中に他の編集が track の Vec position をずらしても整合性が保たれる。
 #[derive(Debug, Clone)]
 pub enum DeferredEdit {
-    DeleteTrack { track_id: u32 },
+    /// トラック削除 (r.md #43)。 選択集合を **1 件にまとめて** 持つ — id ごとに
+    /// enqueue すると round-trip が分かれて undo が N ステップに割れる。
+    DeleteTracks { track_ids: Vec<u32> },
     UngroupTracks { track_ids: Vec<u32> },
     /// 単一デバイスチェーン: `Track.devices` / `master_fx_chain` の指定 index の
     /// device を `Vec::remove` する (役割別 slot 区分は撤廃)。
