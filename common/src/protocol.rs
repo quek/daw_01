@@ -555,10 +555,25 @@ pub enum PluginEvent {
     },
     /// Plugin-initiated close (X button handled by plugin, or `closed`).
     SlotGuiClosed { device_id: u64 },
-    /// Plugin host destroyed a plugin instance (RemoveSlotPlugin /
-    /// RemoveTrack 経由)。 daw_gui はこれを受けて
+    /// Plugin host がこの device の `ProcessData` shmem を破棄した。
+    /// **teardown のたびに必ず先行して発火する** (replace = 同 device に別
+    /// plugin を載せ直す経路も含む)。 daw_gui はこれを受けて
     /// `AudioCommand::ClosePluginShmem { device_id }` を daw_audio に転送し、
-    /// audio engine の stale entry を消す。
+    /// audio engine の stale mapping を落とす。
+    ///
+    /// 「shmem が死んだ」 は 「device が空になった」 ([`Self::SlotPluginUnloaded`])
+    /// とは**別の事実**なので別 event にしてある。 replace 経路で前者だけを
+    /// 送らないと、 daw_audio が **旧** mapping へ入力を書き、 plugin_host の
+    /// worker は registry の **新** mapping を読む窓が開く (数バッファ分の
+    /// 無音 / 取りこぼし)。 close が先行していれば daw_audio 側 entry が
+    /// 一時的に消え、 RT はその device を skip する (= ロード完了までの
+    /// dispatch 抑止)。
+    SlotPluginShmemReleased { device_id: u64 },
+    /// Plugin host destroyed a plugin instance (RemoveSlotPlugin /
+    /// RemoveTrack 経由)。 daw_gui はこれを受けて daw_gui ローカルの
+    /// bookkeeping (`track_plugin_ids` / `loaded_slots` / latency 等) を
+    /// 片付ける。 shmem の解放は必ず先行する
+    /// [`Self::SlotPluginShmemReleased`] が担う (SSoT — 二重に送らない)。
     SlotPluginUnloaded { device_id: u64 },
     /// Plugin が報告した自身の processing latency (samples 単位)。 activate
     /// 直後、および restart / reinit 完了直後に発火。 daw_gui は

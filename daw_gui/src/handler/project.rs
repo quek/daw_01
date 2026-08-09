@@ -1043,7 +1043,7 @@ impl AppData {
 
         // Phase B: 各 track の slot 列を diff。 純粋関数で action 列を
         // 計算し、 順に IPC を dispatch する (test しやすさのため切り出し)。
-        let Some(db) = self.ipc.plugin_db.clone() else {
+        if self.ipc.plugin_db.is_none() {
             // plugin DB が未ロードなら SetSlotPlugin の組み立て不可。
             // RemoveSlotPlugin 単体は db 不要だが、 Phase B はまとめて
             // skip する (= db ロード待ち)。
@@ -1051,7 +1051,7 @@ impl AppData {
                 tracing::warn!("reconcile: plugin database not loaded; phase B skipped");
             }
             return;
-        };
+        }
         let actions = compute_slot_reconcile_actions(self.song_doc.song(), &self.ipc.loaded_slots);
         for action in actions {
             match action {
@@ -1076,15 +1076,6 @@ impl AppData {
                     plugin_id_str,
                     initial_state,
                 } => {
-                    let Some(entry) = db.find_by_id(&plugin_id_str) else {
-                        tracing::error!(
-                            id = %plugin_id_str,
-                            track = track_id,
-                            index,
-                            "reconcile: plugin id not in database"
-                        );
-                        continue;
-                    };
                     // v29: Song 側 device の安定 id でアドレスする。
                     let Some(device_id) = device_id_at(self.song_doc.song(), track_id, index) else {
                         tracing::error!(
@@ -1101,16 +1092,7 @@ impl AppData {
                         plugin_id = %plugin_id_str,
                         "reconcile: loading device from song"
                     );
-                    let generation = self.track_pending_load(device_id);
-                    self.send_plugin(PluginCommand::SetSlotPlugin {
-                        device_id,
-                        track_id,
-                        format: entry.format,
-                        path: entry.path.clone(),
-                        plugin_id: entry.id.clone(),
-                        initial_state,
-                        generation,
-                    });
+                    self.send_set_slot_plugin(track_id, device_id, &plugin_id_str, initial_state);
                 }
             }
         }
@@ -1210,53 +1192,84 @@ impl AppData {
         self.ipc.slot_has_gui.clear();
         self.ipc.pending_plugin_loads.clear();
         self.ipc.pending_added_plugin_finalize.clear();
+        // 「未ロード」 表示も project スコープ (前 project の device_id を
+        // 次 project が再利用するので、 残すと無関係な device が失敗表示になる)。
+        self.ipc.failed_plugin_loads.clear();
+    }
+
+    /// plugin_host に `SetSlotPlugin` を送る唯一の口 (script mode の生 API を除く)。
+    /// plugin DB で `plugin_id` → (format, path) を解決し、 要求世代を採番して
+    /// `pending_plugin_loads` に積む。 送れたら `true`。
+    ///
+    /// project 復元 / paste 復元 / Undo reconcile / インスペクタの再読込 が
+    /// 同じ組み立てを 4 箇所で重複させていたのを 1 本化したもの。
+    pub(crate) fn send_set_slot_plugin(
+        &mut self,
+        track_id: u32,
+        device_id: u64,
+        plugin_id: &str,
+        initial_state: Option<Vec<u8>>,
+    ) -> bool {
+        let Some(db) = self.ipc.plugin_db.clone() else {
+            tracing::warn!(%plugin_id, track_id, "plugin database not loaded; cannot resolve plugin id");
+            return false;
+        };
+        let Some(entry) = db.find_by_id(plugin_id) else {
+            tracing::error!(id = %plugin_id, track_id, device_id, "plugin id not in database");
+            return false;
+        };
+        // v29: 安定 device id でアドレスする。 0 (未採番) は ensure_ids 前の
+        // song が漏れてきた設計バグなので error に出して skip。
+        if device_id == 0 {
+            tracing::error!(id = %plugin_id, track_id, "device id unallocated; skipping SetSlotPlugin");
+            return false;
+        }
+        let format = entry.format;
+        let path = entry.path.clone();
+        let resolved_id = entry.id.clone();
+        let generation = self.track_pending_load(device_id);
+        self.send_plugin(PluginCommand::SetSlotPlugin {
+            device_id,
+            track_id,
+            format,
+            path,
+            plugin_id: resolved_id,
+            initial_state,
+            generation,
+        });
+        true
     }
 
     pub(crate) fn restore_plugin_from_song(&mut self, song: &Song) {
-        let Some(db) = self.ipc.plugin_db.clone() else {
+        if self.ipc.plugin_db.is_none() {
             tracing::warn!("plugin database not loaded; cannot resolve plugin ids");
             return;
-        };
+        }
         // PR2.1: send `Track::id` (not Vec position) so the plugin host
-        // keys its chains by id from the start. 単一デバイスチェーン:
-        // `Track.devices` / `master_fx_chain` を flat な device index で送る。
-        let mut to_send: Vec<(u32, u32, common::model::PluginInstance)> = Vec::new();
+        // keys its chains by id from the start. v29: chain 内の位置は送らない
+        // (host は順序を持たず、 安定 device id だけでアドレスする)。
+        let mut to_send: Vec<(u32, common::model::PluginInstance)> = Vec::new();
         for track in song.tracks.iter() {
-            let t = track.id;
-            for (i, p) in track.devices.iter().enumerate() {
-                to_send.push((t, i as u32, p.clone()));
+            for p in track.devices.iter() {
+                to_send.push((track.id, p.clone()));
             }
         }
-        // master bus fx chain も `(MASTER_TRACK_ID, index)` で送る。
-        for (i, p) in song.master_fx_chain.iter().enumerate() {
-            to_send.push((common::model::MASTER_TRACK_ID, i as u32, p.clone()));
+        // master bus fx chain も `MASTER_TRACK_ID` 帰属で送る。
+        for p in song.master_fx_chain.iter() {
+            to_send.push((common::model::MASTER_TRACK_ID, p.clone()));
         }
-        for (track, index, inst) in to_send {
+        for (track, inst) in to_send {
             // 内蔵映像効果は GUI 描画 device。plugin_host に load しない
             // (該当 builtin 無し)。engine は未登録 index を skip する (= 音声素通り)。
             if inst.ports.is_video() {
                 continue;
             }
-            let Some(entry) = db.find_by_id(&inst.plugin_id) else {
-                tracing::error!(id = %inst.plugin_id, track, index, "plugin id not in database");
-                continue;
-            };
-            // v29: 安定 device id でアドレスする。 0 (未採番) は ensure_ids
-            // 前の song が漏れてきた設計バグなので error に出して skip。
-            if inst.id == 0 {
-                tracing::error!(id = %inst.plugin_id, track, index, "device id unallocated; skipping SetSlotPlugin");
-                continue;
-            }
-            let generation = self.track_pending_load(inst.id);
-            self.send_plugin(PluginCommand::SetSlotPlugin {
-                device_id: inst.id,
-                track_id: track,
-                format: entry.format,
-                path: entry.path.clone(),
-                plugin_id: entry.id.clone(),
-                initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
-                generation,
-            });
+            self.send_set_slot_plugin(
+                track,
+                inst.id,
+                &inst.plugin_id,
+                inst.state.as_deref().map(<[u8]>::to_vec),
+            );
         }
     }
 
@@ -1265,41 +1278,26 @@ impl AppData {
     /// [`Self::restore_plugin_from_song`] の track 限定版。`self.song_doc.song()` を読むため
     /// to_send を先に owned で確保してから送る (borrow 回避)。
     pub(crate) fn restore_plugins_for_tracks(&mut self, track_ids: &[u32]) {
-        let Some(db) = self.ipc.plugin_db.clone() else {
-            return;
-        };
-        let mut to_send: Vec<(u32, u32, common::model::PluginInstance)> = Vec::new();
+        let mut to_send: Vec<(u32, common::model::PluginInstance)> = Vec::new();
         for track in self.song_doc.song().tracks.iter() {
             if !track_ids.contains(&track.id) {
                 continue;
             }
-            for (i, p) in track.devices.iter().enumerate() {
-                to_send.push((track.id, i as u32, p.clone()));
+            for p in track.devices.iter() {
+                to_send.push((track.id, p.clone()));
             }
         }
-        for (track, index, inst) in to_send {
+        for (track, inst) in to_send {
             // 内蔵映像効果は plugin_host に load しない (GUI 描画 device)。
             if inst.ports.is_video() {
                 continue;
             }
-            let Some(entry) = db.find_by_id(&inst.plugin_id) else {
-                tracing::error!(id = %inst.plugin_id, track, index, "pasted plugin id not in database");
-                continue;
-            };
-            if inst.id == 0 {
-                tracing::error!(id = %inst.plugin_id, track, index, "pasted device id unallocated; skipping SetSlotPlugin");
-                continue;
-            }
-            let generation = self.track_pending_load(inst.id);
-            self.send_plugin(PluginCommand::SetSlotPlugin {
-                device_id: inst.id,
-                track_id: track,
-                format: entry.format,
-                path: entry.path.clone(),
-                plugin_id: entry.id.clone(),
-                initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
-                generation,
-            });
+            self.send_set_slot_plugin(
+                track,
+                inst.id,
+                &inst.plugin_id,
+                inst.state.as_deref().map(<[u8]>::to_vec),
+            );
         }
     }
 

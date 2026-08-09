@@ -314,6 +314,11 @@ impl AppData {
             "plugin load failed (notified by plugin host)"
         );
         self.ipc.pending_plugin_loads.remove(&device_id);
+        // 失敗を「そのセッション中ずっと無音」で終わらせない: device を
+        // 「未ロード」としてインスペクタに出し、 明示的な再 load
+        // (`AppEvent::ReloadDevice`) の対象にする。 自動リトライはしない
+        // (plugin 側の恒常的な失敗で無限ループになる)。
+        self.ipc.failed_plugin_loads.insert(device_id, reason.clone());
         // load 失敗時は finalize 予約も取り消す (stale entry が後の project-load で
         // 誤 sync / 誤 open しないように)。
         if let Some((track, index)) = find_device_by_id(self.song_doc.song(), device_id) {
@@ -341,14 +346,64 @@ impl AppData {
         }
     }
 
-    /// plugin_host が plugin destroy を完了した通知を受けて、 audio engine
-    /// に `ClosePluginShmem` を送り (SSoT: live な `self.ipc.audio_tx` 経由)、
-    /// `track_plugin_ids` 等の daw_gui ローカル状態をクリーンアップする。
-    pub(crate) fn on_plugin_unloaded_from_child(&mut self, device_id: u64) {
-        // SSoT (code review 2026-06-06): stale な incoming-bridge clone では
-        // なく live audio_tx から送る。 respawn 後に dangling shmem 参照が
-        // 残るのを防ぐ。
+    /// ロードに失敗した device をユーザーの明示操作で再 load する
+    /// (インスペクタの「読み込み失敗」セクションの「再読込」ボタン)。
+    ///
+    /// 失敗した device は plugin_host に instance が無いまま song に残るので、
+    /// 放置するとそのセッション中ずっと無音で、 復旧手段が「project を開き
+    /// 直す」しか無かった。 **自動リトライはしない** — plugin 側の恒常的な
+    /// 失敗 (DLL 欠損 / activate 失敗) で無限ループになるため、 再試行の
+    /// トリガーは常にユーザーの意思。
+    ///
+    /// 保存済み state (`PluginInstance.state`) 込みで送るので、 一時的な
+    /// 失敗 (shmem 名衝突など) から復帰したときは音色も復元される。
+    pub(crate) fn reload_device(&mut self, track_id: u32, device_index: u32) {
+        let Some(inst) = device_at(self.song_doc.song(), track_id, device_index).cloned() else {
+            return;
+        };
+        // 内蔵映像 FX は plugin_host に載らない device なので再 load の
+        // 対象にならない (そもそも load 失敗も起きない)。
+        if inst.ports.is_video() {
+            return;
+        }
+        let name = self.resolve_name(&inst.plugin_id);
+        if self.send_set_slot_plugin(
+            track_id,
+            inst.id,
+            &inst.plugin_id,
+            inst.state.as_deref().map(<[u8]>::to_vec),
+        ) {
+            self.ui_ephemeral.status_message = format!("再読込中: {name}");
+        } else {
+            self.ui_ephemeral.status_message =
+                format!("再読込できません: {name} (プラグインが見つかりません)");
+        }
+    }
+
+    /// plugin_host がこの device の `ProcessData` shmem を破棄した通知
+    /// (`SlotPluginShmemReleased`)。 audio engine に `ClosePluginShmem` を
+    /// 転送して stale mapping を落とす。
+    ///
+    /// **teardown のたびに必ず来る**ので、 replace (同 device に別 plugin を
+    /// 載せ直す) でも close が新 mapping の `OpenPluginShmem` に先行する。
+    /// daw_gui は plugin event を受信順に処理し、 audio 宛の送信も同じ順序で
+    /// 流れるため、 「Released → Loaded」 が 「Close → Open」 に保存される。
+    ///
+    /// SSoT (code review 2026-06-06): stale な incoming-bridge clone では
+    /// なく live `self.ipc.audio_tx` から送る (audio respawn 後に dangling
+    /// shmem 参照が残るのを防ぐ)。
+    pub(crate) fn on_plugin_shmem_released_from_child(&mut self, device_id: u64) {
         self.send_audio(AudioCommand::ClosePluginShmem { device_id });
+    }
+
+    /// plugin_host が plugin destroy を完了した通知を受けて、
+    /// `track_plugin_ids` 等の daw_gui ローカル状態をクリーンアップする。
+    /// shmem の close は必ず先行する `SlotPluginShmemReleased` が担うので
+    /// ここでは送らない (SSoT — 二重送信しない)。
+    pub(crate) fn on_plugin_unloaded_from_child(&mut self, device_id: u64) {
+        // device が空になったので「未ロード」表示も畳む (再 load の対象は
+        // song に残っている device だけ)。
+        self.ipc.failed_plugin_loads.remove(&device_id);
         for entry in self.ipc.track_plugin_ids.values_mut() {
             entry.retain(|p| *p != device_id);
         }
@@ -957,6 +1012,11 @@ impl AppData {
         let removed_device_id = device_id_at(self.song_doc.song(), track_id, index);
         if let Some(device_id) = removed_device_id {
             self.send_plugin(PluginCommand::RemoveSlotPlugin { device_id });
+            // load に失敗した device は plugin_host に instance が無く
+            // `SlotPluginUnloaded` が返って来ない。 「未ロード」 entry を
+            // ここで落とさないと、 消したはずの device がインスペクタの
+            // 失敗リストに残り続ける。
+            self.ipc.failed_plugin_loads.remove(&device_id);
         }
         // cache から該当 entry を即時削除。 SlotPluginUnloaded event 到着前に
         // reconcile が走っても stale entry を見ないようにする防御策。

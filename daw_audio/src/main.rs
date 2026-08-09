@@ -556,6 +556,89 @@ fn preview_track_index(shared: &Arc<SharedState>, track_id: u32) -> Option<usize
         .filter(|&i| i < engine::MAX_TRACKS)
 }
 
+/// recv loop の周期処理 (メッセージ処理とは独立に走る)。
+///
+/// plan §4: dispose bundles the audio thread superseded, so their `Drop`
+/// (free / shmem unmap / worker pool join) runs here, off the audio callback.
+/// parked bundle (ring full 時の drop-oldest 退避) も再送する。
+///
+/// **メッセージ到着に依存させない**のが load-bearing: 旧実装はこれを
+/// `read_msg().await` の手前 1 箇所でしか走らせておらず、「次の AudioCommand が
+/// 来なければ superseded bundle は永久に解放されない」= 編集を止めた瞬間に
+/// shmem mapping / worker rig / Song snapshot が無期限に居座る状態だった
+/// (解放時刻に上限が無い)。[`HOUSEKEEPING_INTERVAL`] のタイマ枝から同じ処理を
+/// 呼ぶことで上限を与える。RT 側は無変更 (push のみ)。
+fn recv_loop_housekeeping(
+    publisher: &mut BundlePublisher,
+    bundle_recycle_rx: &mut rtrb::Consumer<RtBundle>,
+    shared: &Arc<SharedState>,
+    engine_shared: &Arc<EngineShared>,
+    session_sample_rate: u32,
+) {
+    while let Ok(old) = bundle_recycle_rx.pop() {
+        drop(old);
+    }
+    publisher.flush();
+    // leaf 宛 sidechain tap の 1-buffer 補償量 (= 実測 buffer frames) が
+    // compile 時の仮定から変わっていたら topology を再 publish する
+    // (初回 publish が stream 実測前に走った場合の是正)。
+    if let Some(compiled) = publisher.last_compiled_frames
+        && resolve_buffer_frames(engine_shared, session_sample_rate) != compiled
+    {
+        let song = shared.song.load_full();
+        if song.is_some() {
+            publish_bundle(
+                publisher,
+                shared,
+                engine_shared,
+                song,
+                session_sample_rate,
+                // 同 project の再 compile なので走行状態は引き継ぐ。
+                Topology::Recompile {
+                    reset_song_scoped_state: false,
+                },
+            );
+        }
+    }
+}
+
+/// [`recv_loop_housekeeping`] の周期。数 buffer 分 (~10-21ms/buffer) の
+/// オーダーで、アイドル時の wake も無視できる粒度。
+const HOUSEKEEPING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// shmem 名まわりの回帰を **決定論** に落とすためのフォールトインジェクション
+/// (debug ビルド限定・既定 OFF)。
+///
+/// `DAW01_TEST_SHMEM_HOLD_MS=<ms>` を設定すると、`ClosePluginShmem` で map から
+/// 外した entry (= `ProcessData` shmem の OS ハンドル) を指定時間だけ保持し続ける。
+/// 「daw_audio が旧 mapping をまだ握っている」状態を任意に作れる。
+///
+/// なぜ**保持側**に入れるのか: 「同名 `ProcessData` shmem の再作成が
+/// `already exists` で失敗する」の発火条件は *plugin_host が create する時点で
+/// daw_audio がまだ解放していない* こと。create 側を遅らせると解放が先に間に合って
+/// **失敗しにくくなる** ので、レースを常時再現させるには保持側を押さえるしかない。
+/// これで「(incarnation 導入前は) 必ず落ちる / 導入後は必ず通る」実験が成立する。
+/// 手順は `daw_gui/tests/scripts/reopen_same_project.js` の冒頭コメント。
+#[cfg(debug_assertions)]
+fn hold_released_entry_for_test(entry: Option<Arc<PluginEntry>>) {
+    let Some(entry) = entry else { return };
+    let Some(ms) = std::env::var("DAW01_TEST_SHMEM_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    else {
+        return; // 既定: ここで drop = 通常の解放経路
+    };
+    tracing::warn!(hold_ms = ms, "DAW01_TEST_SHMEM_HOLD_MS: holding released plugin shmem (fault injection)");
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        drop(entry);
+    });
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_released_entry_for_test(_entry: Option<Arc<PluginEntry>>) {}
+
 #[allow(clippy::too_many_arguments)]
 async fn recv_loop(
     mut pipe: ReadHalf<NamedPipeClient>,
@@ -569,38 +652,41 @@ async fn recv_loop(
     mut bundle_recycle_rx: rtrb::Consumer<RtBundle>,
 ) {
     let mut publisher = BundlePublisher::new(bundle_tx);
+    let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+    // 遅延して詰まった tick を burst で取り戻さない (drain は冪等なので
+    // 取り戻す意味が無く、CPU を無駄に食うだけ)。
+    housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        // plan §4: dispose bundles the audio thread superseded, so their
-        // `Drop` (free / shmem unmap / worker pool join) runs here, off the
-        // audio callback. Drained on every message; snapshots only accumulate
-        // while the user is editing, which is exactly when messages keep
-        // arriving. parked bundle (ring full 時の drop-oldest 退避) も再送。
-        while let Ok(old) = bundle_recycle_rx.pop() {
-            drop(old);
-        }
-        publisher.flush();
-        // leaf 宛 sidechain tap の 1-buffer 補償量 (= 実測 buffer frames) が
-        // compile 時の仮定から変わっていたら topology を再 publish する
-        // (初回 publish が stream 実測前に走った場合の是正)。
-        if let Some(compiled) = publisher.last_compiled_frames
-            && resolve_buffer_frames(&engine_shared, session_sample_rate) != compiled
-        {
-            let song = shared.song.load_full();
-            if song.is_some() {
-                publish_bundle(
-                    &mut publisher,
-                    &shared,
-                    &engine_shared,
-                    song,
-                    session_sample_rate,
-                    // 同 project の再 compile なので走行状態は引き継ぐ。
-                    Topology::Recompile {
-                        reset_song_scoped_state: false,
-                    },
-                );
+        recv_loop_housekeeping(
+            &mut publisher,
+            &mut bundle_recycle_rx,
+            &shared,
+            &engine_shared,
+            session_sample_rate,
+        );
+        // `read_msg` (= `read_exact` 2 回) は **cancel-safe ではない**ので、
+        // select の枝に直接置くと timer が先に発火したときに読みかけの
+        // length prefix / body を捨ててストリームを破壊する。future を
+        // ループの外で 1 度だけ作って `&mut` で待ち続け、tick 側だけを
+        // 繰り返すことで、read の状態を保ったまま周期処理を挟む。
+        let msg = {
+            let mut read_fut = std::pin::pin!(read_msg::<_, AudioCommand>(&mut pipe));
+            loop {
+                tokio::select! {
+                    // メッセージが読めたなら常にそちらを優先する。
+                    biased;
+                    r = &mut read_fut => break r,
+                    _ = housekeeping.tick() => recv_loop_housekeeping(
+                        &mut publisher,
+                        &mut bundle_recycle_rx,
+                        &shared,
+                        &engine_shared,
+                        session_sample_rate,
+                    ),
+                }
             }
-        }
-        match read_msg::<_, AudioCommand>(&mut pipe).await {
+        };
+        match msg {
             // Handshake 済みの再送 Ack / Session は no-op (Session は起動時に
             // `read_audio_session` が消費済み — shmem 名と format はプロセス
             // 生存中不変)。
@@ -834,7 +920,7 @@ async fn recv_loop(
             }
             Ok(AudioCommand::ClosePluginShmem { device_id }) => {
                 let mut map: engine::PluginRefs = (**engine_shared.plugin_refs.load()).clone();
-                map.remove(&device_id);
+                let removed = map.remove(&device_id);
                 engine_shared.plugin_refs.store(Arc::new(map));
                 let song = shared.song.load_full();
                 publish_bundle(
@@ -846,7 +932,9 @@ async fn recv_loop(
                     Topology::Unchanged,
                 );
                 // 旧 entry (shmem mapping) は RT が新 bundle を install して
-                // recycle が drain された時点で off-thread unmap される。
+                // recycle が drain された時点で off-thread unmap される
+                // (drain の上限は `recv_loop_housekeeping` のタイマが保証)。
+                hold_released_entry_for_test(removed);
                 tracing::info!(device_id, "plugin shmem dropped");
             }
             // Phase 6 review (SSOT fix): `track` field は Track::id (stable)。

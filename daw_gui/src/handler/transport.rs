@@ -167,6 +167,11 @@ impl AppData {
         self.ipc.next_plugin_load_generation = self.ipc.next_plugin_load_generation.wrapping_add(1).max(1);
         let generation = self.ipc.next_plugin_load_generation;
         self.ipc.pending_plugin_loads.insert(device_id, generation);
+        // 新しい load 要求が in-flight になった時点で、 直近の失敗理由は
+        // 「現在の状態」 ではなくなる (インスペクタの「未ロード」表示もここで
+        // 消える)。 SetSlotPlugin を送る全経路がこの関数を通るので、 ここが
+        // 失敗 entry を落とす唯一の口。
+        self.ipc.failed_plugin_loads.remove(&device_id);
         if self.transport.pending_play {
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",

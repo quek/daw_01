@@ -746,6 +746,11 @@ pub enum AppEvent {
     SetPluginParam { device_index: u32, param_id: u32, value_real: f64 },
     /// inspector の x ボタン: 指定 `device_index` の device を chain から削除。
     RemoveDevice { index: u32 },
+    /// inspector 「読み込み失敗」 セクションの「再読込」 ボタン: ロードに
+    /// 失敗した device を、 保存済み state 込みで plugin_host に load し直す。
+    /// 自動リトライはしない (恒常的失敗で無限ループになる) ので、 再試行の
+    /// トリガーは常にこのユーザー操作。 Song は変えない (= 非 undoable)。
+    ReloadDevice { track_id: u32, device_index: u32 },
     /// PR4 sidechain: wire / unwire the sidechain source for a plugin's
     /// aux input port. `track_id` + `device_index` identifies the plugin
     /// instance; `port` selects the aux input port on that plugin

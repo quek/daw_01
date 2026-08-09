@@ -520,6 +520,13 @@ struct PluginHost {
     evt_tx: tmpsc::UnboundedSender<PluginEvent>,
     notify_tx: tmpsc::UnboundedSender<HostNotify>,
     pid: u32,
+    /// `ProcessData` shmem 名の世代カウンタ (`process_data_shmem_id` の
+    /// `incarnation`)。**リソースの作成者が名前を所有する = SSoT** なので
+    /// daw_gui 側の `generation` (stale 応答ガード用の client 側カウンタ) は
+    /// 借りない。instantiate ごとに bump するだけで、名前は不透明 String と
+    /// して daw_gui → daw_audio へ素通しされる。
+    /// 契約は `common::plugin_ref` の module doc を参照。
+    next_shmem_incarnation: u64,
     /// **唯一の bookkeeping** (v29): 安定 device_id → record。
     instances: HashMap<u64, InstanceRecord>,
     /// worker pool が dispatch 中に読む lock-free registry。
@@ -549,6 +556,7 @@ impl PluginHost {
             evt_tx,
             notify_tx,
             pid: std::process::id(),
+            next_shmem_incarnation: 0,
             instances: HashMap::new(),
             registry: Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new())),
             worker_pool: None,
@@ -1118,9 +1126,11 @@ impl PluginHost {
         };
 
         // (2) 旧 instance の teardown (registry detach → quiesce → drop)。
-        //     replace は同 device_id の shmem 名を引き継ぐので、旧 handle を
-        //     先に落とす。旧 plugin の unload は GUI へは通知しない (直後の
-        //     SlotPluginLoaded が同 device_id を上書きする)。
+        //     旧 plugin の unload は GUI へは通知しない (直後の
+        //     SlotPluginLoaded が同 device_id を上書きする)。ただし
+        //     `SlotPluginShmemReleased` は teardown_device が必ず送るので、
+        //     daw_audio は下の (4) で作る新 mapping を開く前に旧 mapping を
+        //     落とす (= 旧へ書いて新を読む窓が閉じる)。
         self.teardown_device(device_id, false);
 
         // (3) activate + start_processing。v29: 失敗した plugin は registry
@@ -1144,12 +1154,27 @@ impl PluginHost {
             return;
         }
 
-        // (4) ProcessData shmem を作成 (名前は安定 device_id 由来)。
-        let shmem_id = process_data_shmem_id(self.pid, device_id);
+        // (4) ProcessData shmem を作成。名前は **この instantiation 専用**
+        //     (incarnation を焼き込む)。device_id を再利用すると、前世代の
+        //     mapping を daw_audio がまだ握っている間に同名 create が走って
+        //     `already exists` で失敗する (解放は非同期で上限が無い) —
+        //     `common::plugin_ref` の命名契約を参照。世代を含めれば前世代が
+        //     生き残っていても create は必ず成功し、旧 mapping は保持者が
+        //     居なくなった時点で静かに消える。
+        self.next_shmem_incarnation += 1;
+        let shmem_id = process_data_shmem_id(self.pid, device_id, self.next_shmem_incarnation);
+        // 一意名にした後で `already exists` が出たら本物の設計バグ (同
+        // incarnation の二重 create) なので、`NamedShmem::create` の排他
+        // チェックは検出器として残してある。
         let shmem = match common::process_data::ProcessDataHandle::create(&shmem_id) {
-            Ok(handle) => handle,
+            Ok(handle) => {
+                // 名前をログに残す: この class の障害 (名前の再利用 / 世代ずれ) は
+                // 「どの名前を誰が握っているか」が分からないと追えない。
+                tracing::info!(device_id, %shmem_id, "created ProcessData shmem");
+                handle
+            }
             Err(e) => {
-                tracing::error!(error = ?e, device_id, "failed to create ProcessData shmem");
+                tracing::error!(error = ?e, device_id, %shmem_id, "failed to create ProcessData shmem");
                 teardown_plugin(plugin);
                 self.emit(PluginEvent::SlotPluginLoadFailed {
                     device_id,
@@ -1223,11 +1248,22 @@ impl PluginHost {
     }
 
     /// device の instance を完全 teardown する。`emit_unloaded` は
-    /// `SlotPluginUnloaded` を送るか (replace 経路では送らない)。
+    /// `SlotPluginUnloaded` を送るか (replace 経路では送らない — 直後の
+    /// `SlotPluginLoaded` が同 device_id を上書きするので、daw_gui の
+    /// bookkeeping を一度空にする必要はない)。
+    ///
+    /// `SlotPluginShmemReleased` は **`emit_unloaded` に関わらず必ず**送る。
+    /// 「この device の shmem はもう無い」は「device が空になった」とは別の
+    /// 事実で、daw_audio が旧 mapping を掴んだまま新 instance と食い違うのを
+    /// 防ぐのはこちらの責務 (protocol の doc 参照)。
     fn teardown_device(&mut self, device_id: u64, emit_unloaded: bool) {
         let Some(mut rec) = self.instances.remove(&device_id) else {
             return;
         };
+        // (0) daw_audio に mapping を落とさせる。plugin の destroy より先に
+        //     送ることで、daw_gui → daw_audio の順序保証 (Released → 後続の
+        //     Loaded) がそのまま「close が open に先行する」になる。
+        self.emit(PluginEvent::SlotPluginShmemReleased { device_id });
         // (1) registry から外す → (2) in-flight dispatch 排出。
         self.detach_and_quiesce(device_id);
         // (3) editor を先に取り出しておく (drop は plugin teardown の後)。
@@ -1241,9 +1277,12 @@ impl PluginHost {
             drop(editor);
             self.emit(PluginEvent::SlotGuiClosed { device_id });
         }
-        // (6) shmem handle は rec ごと drop 済 (rec.shmem)。
+        // (6) shmem handle は rec ごと drop 済 (rec._shmem)。名前は
+        //     incarnation 入りで二度と再利用されないので、daw_audio 側の
+        //     解放が遅れても次の create と衝突しない。
         if emit_unloaded {
-            // daw_gui はこれを受けて daw_audio へ `ClosePluginShmem` を転送。
+            // daw_gui はこれを受けて自分側の bookkeeping を片付ける
+            // (shmem の close は上の `SlotPluginShmemReleased` が担当)。
             self.emit(PluginEvent::SlotPluginUnloaded { device_id });
         }
     }

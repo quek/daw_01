@@ -82,7 +82,10 @@ sysinfo = "0.33"
 tempfile = "3"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "process", "sync"] }
+# "time": daw_audio の recv loop が `tokio::time::interval` で周期 housekeeping
+# (superseded bundle の解放 = shmem unmap / worker rig join) を回すため。
+# メッセージ到着に依存させないための唯一の手段 (`daw_audio::recv_loop_housekeeping`)。
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "process", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # non-blocking, daily-rolling file appender for tracing. Lets all 3 processes

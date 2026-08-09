@@ -98,6 +98,26 @@ struct ScriptHost {
     /// counter と衝突しないよう ScriptHost 側でも単調増加を維持し、 送信前に
     /// `app.ipc.pending_plugin_loads` へ登録して echo を通す)。
     next_raw_load_generation: u64,
+    /// `daw.takePluginLoadEventsJson()` が返して clear する観測バッファ。
+    /// plugin load の成否をログ grep ではなく **script 内の assertion** で
+    /// 判定するために貯める (`tests/scripts/reopen_same_project.js`)。
+    plugin_load_events: PluginLoadEvents,
+}
+
+/// script が観測した plugin load 応答 (`daw.takePluginLoadEventsJson`)。
+#[derive(Default, serde::Serialize)]
+struct PluginLoadEvents {
+    /// `SlotPluginLoaded` を受けた device id (受信順)。
+    loaded: Vec<u64>,
+    /// `SlotPluginLoadFailed` を受けた device (理由付き)。
+    failed: Vec<FailedPluginLoad>,
+}
+
+#[derive(serde::Serialize)]
+struct FailedPluginLoad {
+    device_id: u64,
+    plugin_id: String,
+    reason: String,
 }
 
 #[derive(Default, Clone)]
@@ -152,6 +172,7 @@ impl ScriptHost {
             plugin_latencies: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
             next_raw_load_generation: 0,
+            plugin_load_events: PluginLoadEvents::default(),
             app,
         }
     }
@@ -244,6 +265,7 @@ impl ScriptHost {
                         .or_default()
                         .push(*device_id);
                 }
+                self.plugin_load_events.loaded.push(*device_id);
                 // GUI runner と同じく app へ dispatch する。これで `loaded_slots` が
                 // 埋まり、OpenPluginShmem 送信 + `sync_vocal_metadata` 再 flush
                 // (= builtin VOICEVOX の歌唱/読み上げ合成 trigger) が走る。これが
@@ -259,6 +281,15 @@ impl ScriptHost {
                         state_load_error: state_load_error.clone(),
                         aux_output_count: *aux_output_count,
                         generation: *generation,
+                    }));
+            }
+            PluginEvent::SlotPluginShmemReleased { device_id } => {
+                // GUI runner と同じく app へ流し、`ClosePluginShmem` を
+                // daw_audio へ転送させる (これが無いと project 切替 /
+                // plugin 差し替えで daw_audio に stale mapping が残る)。
+                self.app
+                    .handle_event(AppEvent::Plugin(PluginEvent::SlotPluginShmemReleased {
+                        device_id: *device_id,
                     }));
             }
             PluginEvent::SlotPluginUnloaded { device_id } => {
@@ -278,7 +309,7 @@ impl ScriptHost {
                 device_id,
                 plugin_id,
                 reason,
-                generation: _,
+                generation,
             } => {
                 tracing::error!(
                     device_id,
@@ -286,6 +317,20 @@ impl ScriptHost {
                     %reason,
                     "script: plugin load failed"
                 );
+                self.plugin_load_events.failed.push(FailedPluginLoad {
+                    device_id: *device_id,
+                    plugin_id: plugin_id.clone(),
+                    reason: reason.clone(),
+                });
+                // production と同じく app へ dispatch する (= `pending_plugin_loads`
+                // が解放され、 script の「全 load 完了」 判定が失敗でも進む)。
+                self.app
+                    .handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoadFailed {
+                        device_id: *device_id,
+                        plugin_id: plugin_id.clone(),
+                        reason: reason.clone(),
+                        generation: *generation,
+                    }));
             }
             _ => {}
         }
@@ -430,6 +475,16 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             NativeFunction::from_fn_ptr(daw_set_track_latency),
             js_string!("setTrackLatency"),
             2,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_take_plugin_load_events),
+            js_string!("takePluginLoadEventsJson"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_pending_plugin_loads),
+            js_string!("pendingPluginLoadsJson"),
+            0,
         )
         // ----- PR7 follow-up (JS test infra) ----------------------------
         // app.* の API は ScriptHost::app (= AppData) を直接 mutate して
@@ -902,6 +957,44 @@ fn daw_set_track_latency(
         JsError::from_native(JsNativeError::error().with_message(format!("setTrackLatency: {e}")))
     })?;
     Ok(JsValue::undefined())
+}
+
+/// `daw.takePluginLoadEventsJson()` — 直近の呼び出し以降に観測した plugin load
+/// 応答を `{"loaded":[device_id...],"failed":[{device_id,plugin_id,reason}...]}`
+/// で返し、 バッファを空にする。
+///
+/// plugin load の成否を **ログ grep ではなく script 内の assertion** で判定する
+/// ための hook。 「同じプロジェクトを連続で開いても全 device が load できる」
+/// (shmem 名の再利用レース回帰) を headless で固定するのに使う。
+fn daw_take_plugin_load_events(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let json = with_host(|h| {
+        let events = std::mem::take(&mut h.plugin_load_events);
+        serde_json::to_string(&events)
+    })
+    .map_err(|e| js_native(format!("takePluginLoadEventsJson: serialize: {e}")))?;
+    Ok(JsString::from(json.as_str()).into())
+}
+
+/// `daw.pendingPluginLoadsJson()` — `SetSlotPlugin` を送ったが応答
+/// (`SlotPluginLoaded` / `SlotPluginLoadFailed`) がまだ来ていない device id の
+/// 配列。 `loadSongFile` 直後は「この project で load を要求した device 全部」、
+/// 全応答が揃った後は空になる。 期待値を script 側で二重管理せずに済む。
+fn daw_pending_plugin_loads(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let json = with_host(|h| {
+        let mut ids: Vec<u64> = h.app.ipc.pending_plugin_loads.keys().copied().collect();
+        ids.sort_unstable();
+        serde_json::to_string(&ids)
+    })
+    .map_err(|e| js_native(format!("pendingPluginLoadsJson: serialize: {e}")))?;
+    Ok(JsString::from(json.as_str()).into())
 }
 
 // ---------------------------------------------------------------------------

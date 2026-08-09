@@ -24,6 +24,9 @@ use common::model::{AutomationTarget, FadeCurve, ImageBuiltinParam, StretchMode,
 
 const BG: Color = theme::PANEL;
 const TEXT: Color = theme::TEXT;
+const TEXT_DIM: Color = theme::TEXT_DIM;
+/// load に失敗した device (= 無音) の見出し / 名前。
+const ERROR_TEXT: Color = theme::TEXT_ERROR;
 const ROW_BG: Color = theme::PANEL_RAISED;
 const ROW_BG_HOVER: Color = theme::CONTROL_HOVER;
 const ROW_BG_DRAGGING: Color = theme::ACCENT.with_alpha(0.85);
@@ -1153,9 +1156,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 } else {
                     row_rect.x + row_rect.w - btn_x_w
                 };
+                // load に失敗した device は host に instance が無い = 無音。
+                // どの行が死んでいるかを行そのもので示し、 理由と復旧手段
+                // (再読込) は下の 「読み込み失敗」 セクションが出す。
+                let failed = entry.load_error.is_some();
+                // 正常時は借用のまま (毎フレーム全 device 分の String を作らない)。
+                let display_name: std::borrow::Cow<'_, str> = if failed {
+                    format!("[未ロード] {}", entry.plugin_name).into()
+                } else {
+                    entry.plugin_name.as_str().into()
+                };
                 ui.label_at_clipped(
                     ("inspector_row_name", idx),
-                    &entry.plugin_name,
+                    &display_name,
                     Rect {
                         x: name_x,
                         y: row_rect.y + 8.0,
@@ -1163,7 +1176,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         h: 11.0 * 1.2,
                     },
                     11.0,
-                    TEXT,
+                    if failed { ERROR_TEXT } else { TEXT },
                 );
                 if entry.shows_button() {
                     let label = if entry.shows_param_panel() { "Par" } else { "GUI" };
@@ -2495,6 +2508,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // デバイスの配線」 が読み順で自明になる。 各 fn は modulation_rack と同じ
     // `(app, ui, area, pad, y) -> f32` contract。
     y = chain_sections::draw_add_plugin_button(app, ui, area, pad, y);
+    // ロード失敗は他の配線セクションより上 (= チェーンに最も近い位置)。
+    // 「+ Plugin」 だけはチェーン末尾に接していることが座標で意味を持つので
+    // その直後に置く。
+    y = chain_sections::draw_failed_load_section(app, ui, area, pad, y);
     y = chain_sections::draw_parallel_out_section(app, ui, area, pad, y);
     y = chain_sections::draw_sidechain_section(app, ui, area, pad, y);
     y = chain_sections::draw_editor_key_section(app, ui, area, pad, y);
