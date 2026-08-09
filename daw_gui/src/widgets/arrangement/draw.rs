@@ -88,6 +88,64 @@ pub(super) fn clip_text_color_for(style: &ArrangementStyle, fill: Color, lane_bg
     daw_ui_core::color::pick_contrast(bg, style.clip_text_color, style.clip_text_color_dark)
 }
 
+/// clip が **実際に塗る** fill 色 (`clip.color` 既定 / muted の減光込み)。
+///
+/// r.md #45 / #46: clip の上に重ねる中身 (波形 / MIDI ノート / fade envelope) の
+/// コントラストは、必ずこの「実際に塗られる背景色」 から導く
+/// (`feedback_ui_indicator_contrast_on_variable_bg`)。 clip クロームを塗る
+/// `draw_clip` / `draw_video_clip` と **同じ 1 本** にすることで、色を変える改修で
+/// 片方だけ古い前提が残る事故を防ぐ。
+///
+/// 未着色 clip の既定色は track 種別で違う (audio = `clip_default_fill`、
+/// video/image/text = `video_clip_loading`) ので `kind` を取る。
+pub(super) fn clip_effective_fill(
+    clip: &ClipView,
+    kind: TrackKind,
+    style: &ArrangementStyle,
+) -> Color {
+    let default = match kind {
+        TrackKind::Video => style.video_clip_loading,
+        TrackKind::Audio => style.clip_default_fill,
+    };
+    let base = clip.color.unwrap_or(default);
+    if clip.muted { muted_dim_fill(base) } else { base }
+}
+
+/// r.md #45: clip 上に描く波形の (通常色, クリップピーク色)。
+///
+/// clip 色はユーザーが自由に着色できる **可変背景** なので、固定の寒色ブルー
+/// (`theme::WAVEFORM`) だけだと明るい clip 色 (既定パレットの黄 / アンバー等) の上で
+/// 沈んで見えなくなる。 clip ラベル (`clip_text_color_for`) や MIDI ノートプレビュー
+/// (r.md #20) と同じ WCAG 輝度 2 択で、暗背景用 / 明背景用を選ぶ。
+pub(super) fn waveform_colors_for(clip_bg: Color, lane_bg: Color, is_selected: bool) -> (Color, Color) {
+    let bg = daw_ui_core::color::composite_over(clip_bg, lane_bg);
+    let (light, dark) = if is_selected {
+        (theme::WAVEFORM_SEL, theme::WAVEFORM_SEL_ON_BRIGHT)
+    } else {
+        (theme::WAVEFORM, theme::WAVEFORM_ON_BRIGHT)
+    };
+    (
+        daw_ui_core::color::pick_contrast(bg, light, dark),
+        daw_ui_core::color::pick_contrast(bg, theme::WAVEFORM_PEAK, theme::WAVEFORM_PEAK_ON_BRIGHT),
+    )
+}
+
+/// r.md #46: fade envelope / 掴む正方形の (前景色, 裏打ち色)。
+///
+/// fade は clip 色の上にも **波形の上にも**乗るので、単層だと下地次第で消える。
+/// 前景は背景輝度から明暗 2 択、裏打ちはその逆極性を敷いて、どちらの下地でも
+/// 縁が立つようにする (無音ベースライン / slice 区切り線と同じ 2 層 idiom)。
+pub(super) fn fade_colors_for(style: &ArrangementStyle, clip_bg: Color, lane_bg: Color) -> (Color, Color) {
+    let bg = daw_ui_core::color::composite_over(clip_bg, lane_bg);
+    let light = style.audio_fade_overlay_color;
+    let dark = style.audio_fade_overlay_color_dark;
+    (
+        daw_ui_core::color::pick_contrast(bg, light, dark),
+        // 逆極性 = 前景が明なら暗、暗なら明。
+        daw_ui_core::color::pick_contrast(bg, dark, light),
+    )
+}
+
 /// M14 Phase 72 (daw_01 #044): `rect` 内に `(tex_w, tex_h)` の native aspect を保ったまま
 /// 中央 letterbox 配置した sub-rect を返す。 余白 (黒帯) は呼び出し側の base fill (= video
 /// clip では `video_clip_loading`) で見える。
@@ -233,6 +291,9 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     is_selected: bool,
     lanes: Rect,
     inset_top: f32,
+    // r.md #45: この clip が実際に塗られている色 (`clip_effective_fill`)。
+    // 波形色をここからの auto-contrast で選ぶ。
+    clip_bg: Color,
     style: &ArrangementStyle,
     // waveform widget の id 弁別子。 base 描画 (content path) は `"audio_clip_wf"`、 drag ghost は
     // 別 tag を渡す。 `hctx.waveform_segments` は id ごとに LOD 状態を持つので、 同一 (track, clip)
@@ -269,11 +330,10 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     let scissor = Rect { x: cx0, y: cy0, w: cx1 - cx0, h: cy1 - cy0 };
 
     let px_per_beat = f64::from(content.w) / clip_len_beats;
-    let (fg, fg_clipped) = if is_selected {
-        (theme::WAVEFORM_SEL.with_alpha(0.95), theme::WAVEFORM_PEAK)
-    } else {
-        (theme::WAVEFORM.with_alpha(0.85), theme::WAVEFORM_PEAK)
-    };
+    // r.md #45: 波形色は clip の実塗り色からの auto-contrast (固定ブルーだと
+    // 明るい clip 色の上で消えていた)。 alpha は従来どおり選択で少し濃く。
+    let (base_fg, fg_clipped) = waveform_colors_for(clip_bg, style.bg, is_selected);
+    let fg = base_fg.with_alpha(if is_selected { 0.95 } else { 0.85 });
     let wstyle = WaveformStyle {
         fg,
         fg_clipped,
@@ -744,9 +804,8 @@ pub(super) fn draw_video_clip<M: ?Sized + 'static>(
     // リンク識別は ⇌ glyph + #068 hover 強調が担う (track kind に依らず share マークが出る、 #080 不変)。
     // fill は常に clip 本来の色 (選択でも潰さない)。 選択表示 (2 重リング) は `draw_selection_overlay`
     // が cache + content の上に別レイヤで重ねるので、 ここでは選択を扱わない (r.md #20)。
-    let base_fill = clip.color.unwrap_or(style.video_clip_loading);
-    // muted video clip も fill を暗く沈める。
-    let fill = if clip.muted { muted_dim_fill(base_fill) } else { base_fill };
+    // 実塗り色は `clip_effective_fill` が SSoT (中身のコントラスト計算と共通)。
+    let fill = clip_effective_fill(clip, TrackKind::Video, style);
     let (border, border_w) = (style.clip_border, style.clip_border_w);
     // M14 Phase 89 (daw_01 #060): 名前色は fill 輝度から auto-contrast (selected の黄 fill → 暗文字、
     // loading の暗 fill → 明文字)。 video lane bg と合成した実効色で判定 (不透明 fill は no-op、
@@ -813,9 +872,8 @@ pub(super) fn draw_clip<M: ?Sized + 'static>(
     // その色になる」 が成立する (#019/#022 で hue fill が `color` を握り潰していた問題の解消)。
     // fill は常に clip 本来の色 (選択でも潰さない)。 選択表示 (2 重リング) は `draw_selection_overlay`
     // が cache + content パスの上に別レイヤで重ねるので、 ここでは選択を扱わない (r.md #20)。
-    let base_fill = clip.color.unwrap_or(style.clip_default_fill);
-    // muted clip は fill を暗く沈めて「再生されない」 を示す。
-    let fill = if clip.muted { muted_dim_fill(base_fill) } else { base_fill };
+    // 実塗り色は `clip_effective_fill` が SSoT (波形 / ノート / fade のコントラストも同じ値)。
+    let fill = clip_effective_fill(clip, TrackKind::Audio, style);
     let (border, border_w) = (style.clip_border, style.clip_border_w);
     // M14 Phase 89 (daw_01 #060): 名前 + link glyph 色を fill 輝度から auto-contrast。 不透明 fill は
     // no-op、 半透明 fill (alpha < 1) は lane bg (audio lane = `style.bg`) と合成した実効色で判定する。
@@ -1127,7 +1185,8 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
                 // preview の長さ (resize drag 中は変化する) で x 写像を作るので、
                 // ghost の中身は base 描画と同じ経路のまま preview rect に追従する。
                 draw_clip_waveform_inner(
-                    hctx, a.key, r, len, events, true, lanes, inset, style, "drag_ghost_wf",
+                    hctx, a.key, r, len, events, true, lanes, inset, preview_fill, style,
+                    "drag_ghost_wf",
                 );
             }
             Some(ClipContentDraw::Midi { notes, len_beats }) => {
@@ -1199,6 +1258,8 @@ pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     clip_len_beats: f64,
     fade: &ClipEventFade,
     edge: FadeEdge,
+    // r.md #46: この clip が実際に塗られている色 (`clip_effective_fill`)。
+    clip_bg: Color,
     style: &ArrangementStyle,
 ) {
     use daw_ui_renderer::{LineBatch, LineSegment};
@@ -1207,8 +1268,21 @@ pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     if g.event_rect.w <= 0.0 || g.event_rect.h <= 0.0 {
         return;
     }
+    // r.md #46: clip 色 (可変背景) と波形の上のどちらでも縁が立つよう、
+    // 前景 + 逆極性の裏打ちの 2 層で描く。
+    let (fg, backing) = fade_colors_for(style, clip_bg, style.bg);
     // 掴む正方形 (hit zone と同じ rect = `fade_geometry` が SSoT)。
-    push_filled_rect(hctx, g.handle_rect, style.audio_fade_overlay_color);
+    // 裏打ちを 1 周り大きく敷いてから前景を重ねる = 1px の縁取り。
+    push_filled_rect(hctx, g.handle_rect, backing);
+    let inner = Rect {
+        x: g.handle_rect.x + 1.0,
+        y: g.handle_rect.y + 1.0,
+        w: (g.handle_rect.w - 2.0).max(0.0),
+        h: (g.handle_rect.h - 2.0).max(0.0),
+    };
+    if inner.w > 0.0 && inner.h > 0.0 {
+        push_filled_rect(hctx, inner, fg);
+    }
 
     if g.width_px <= 0.5 {
         return;
@@ -1233,13 +1307,21 @@ pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
         ]
     };
     let mut prev = point_at(0.0);
+    let mut backing_segments: Vec<LineSegment> = Vec::with_capacity(steps);
     for i in 1..=steps {
         #[allow(clippy::cast_precision_loss)]
         let t = i as f32 / steps as f32;
         let cur = point_at(t);
-        segments.push(LineSegment { a: prev, b: cur, color: style.audio_fade_overlay_color });
+        segments.push(LineSegment { a: prev, b: cur, color: fg });
+        backing_segments.push(LineSegment { a: prev, b: cur, color: backing });
         prev = cur;
     }
+    // 裏打ちを一回り太く敷いてから前景を重ねる (無音ベースライン / slice 区切り線と同 idiom)。
+    hctx.push_lines(LineBatch {
+        segments: Arc::<[LineSegment]>::from(backing_segments),
+        line_width_px: style.audio_fade_overlay_width_px + 2.0,
+        clip_rect: Some(clip_rect),
+    });
     hctx.push_lines(LineBatch {
         segments: Arc::<[LineSegment]>::from(segments),
         line_width_px: style.audio_fade_overlay_width_px,
@@ -1281,6 +1363,8 @@ pub(super) fn draw_clip_fades<M: ?Sized + 'static>(
     clip_rect: Rect,
     clip_len_beats: f64,
     fades: &[ClipEventFade],
+    // r.md #46: この clip が実際に塗られている色 (`clip_effective_fill`)。
+    clip_bg: Color,
     style: &ArrangementStyle,
 ) {
     for f in fades {
@@ -1291,7 +1375,7 @@ pub(super) fn draw_clip_fades<M: ?Sized + 'static>(
             edges.swap(0, 1);
         }
         for edge in edges {
-            draw_fade_envelope(hctx, clip_rect, clip_len_beats, f, edge, style);
+            draw_fade_envelope(hctx, clip_rect, clip_len_beats, f, edge, clip_bg, style);
         }
     }
 }
@@ -1315,6 +1399,7 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
     if r.w <= 0.0 || r.h <= 0.0 {
         return;
     }
+    let clip_bg = ad.clip_bg_anchor;
     let outcome = compute_audio_drag_outcome(ad, beat_per_px, style);
     let label_text: Option<String> = match (ad.kind, outcome) {
         (AudioDragKind::Gain, Some(AudioDragOutcome::Gain { next_db })) => {
@@ -1347,7 +1432,7 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
                     FadeEdge::In => preview.fade.fade_in_beats = next_beats,
                     FadeEdge::Out => preview.fade.fade_out_beats = next_beats,
                 }
-                draw_fade_envelope(hctx, r, ad.clip_len_beats_anchor, &preview, edge, style);
+                draw_fade_envelope(hctx, r, ad.clip_len_beats_anchor, &preview, edge, clip_bg, style);
             }
             None
         }
@@ -1359,7 +1444,7 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
                     FadeEdge::In => preview.fade.fade_in_curve = next_curve,
                     FadeEdge::Out => preview.fade.fade_out_curve = next_curve,
                 }
-                draw_fade_envelope(hctx, r, ad.clip_len_beats_anchor, &preview, edge, style);
+                draw_fade_envelope(hctx, r, ad.clip_len_beats_anchor, &preview, edge, clip_bg, style);
             }
             Some(format!("Curve: {}", next_curve.name()))
         }

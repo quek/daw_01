@@ -152,15 +152,17 @@ fn build_midi_track(song: &Song, track: &common::model::Track) -> Option<Vec<Tra
             continue;
         }
         let clip_end_beats = clip.start_beat + clip.length_beats;
+        // r.md #44: 発音判定は clip の内容窓 (content-local) で。
+        let (win_start, win_end) = clip.content_window();
         for note in &midi.notes {
             if note.muted || note.duration_beats <= 0.0 {
                 continue;
             }
-            if note.start_beat < 0.0 || note.start_beat >= clip.length_beats {
+            if note.start_beat < win_start || note.start_beat >= win_end {
                 continue;
             }
-            // clip-local beat → song-domain beat → tick。 Off は clip 末端 clamp。
-            let on_beat = clip.start_beat + note.start_beat;
+            // content-local beat → song-domain beat → tick。 Off は clip 末端 clamp。
+            let on_beat = clip.content_to_song_beat(note.start_beat);
             let off_beat = (on_beat + note.duration_beats).min(clip_end_beats);
             let on_tick = beat_to_tick(on_beat);
             let off_tick = beat_to_tick(off_beat).max(on_tick + 1);
@@ -306,6 +308,7 @@ mod tests {
                 start_beat: 0.0,
                 length_beats: 4.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
             }],
             ..AutomationLane::new(AutomationTarget::SongTempo, 60.0)
         });

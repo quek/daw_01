@@ -1090,6 +1090,9 @@ pub struct PendingClipFxBounce {
     pub clip_name: String,
     pub clip_length_beats: f64,
     pub start_beat: f64,
+    /// r.md #44: bounce 元 clip の内容窓 offset。 bounce 結果 (single event) を
+    /// この位置に置くことで、窓 `[offset, offset + length)` と event が一致する。
+    pub content_offset_beats: f64,
 }
 
 /// 歌唱 bounce の合成待ち (`PrepareVocalSynth` → `VocalSynthReady`) の退避 entry。

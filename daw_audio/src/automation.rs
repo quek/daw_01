@@ -298,6 +298,7 @@ mod tests {
                 start_beat: 0.0,
                 length_beats: 4.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(
@@ -595,6 +596,7 @@ mod tests {
                 start_beat: 0.0,
                 length_beats: 4.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(target, 0.5)
@@ -706,6 +708,7 @@ mod tests {
                 start_beat: 0.0,
                 length_beats: 4.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(target, 0.5)

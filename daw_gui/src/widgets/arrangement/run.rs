@@ -264,6 +264,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                         anchor_fade,
                         clip_rect_anchor: r_anchor,
                         clip_len_beats_anchor: c.len_beats,
+                        clip_bg_anchor: draw::clip_effective_fill(c, t.kind, style),
                         anchor_mouse: (px, py),
                         last_mouse: (px, py),
                         locked_horizontal,
@@ -2082,7 +2083,9 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                                 ev,
                                 buffer.sample_rate,
                                 &tempo_map,
-                                c.start_beat + ev.event_start_in_clip_beats,
+                                // r.md #44: event の song 位置は content 原点基準
+                                // (tempo 曲線の評価位置に使う)。
+                                mc.content_to_song_beat(ev.event_start_in_clip_beats),
                                 &mut spans,
                             );
                             if spans.is_empty() {
@@ -2100,7 +2103,10 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                                 } else {
                                     u64::MAX - ev_i as u64
                                 },
-                                start_in_clip_beats: ev.event_start_in_clip_beats,
+                                // widget は **clip の窓ローカル** 座標で描くので、
+                                // content-local な event 位置から窓 offset を引く。
+                                start_in_clip_beats: ev.event_start_in_clip_beats
+                                    - mc.content_offset_beats,
                                 len_beats: ev.event_length_beats,
                                 stretch_mode: ev.stretch_mode,
                                 spans: std::mem::take(&mut spans),
@@ -2116,7 +2122,8 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                             .iter()
                             .map(|n| MidiNoteDraw {
                                 pitch: n.pitch,
-                                start_beat: n.start_beat,
+                                // 窓ローカル座標 (r.md #44)。
+                                start_beat: n.start_beat - mc.content_offset_beats,
                                 duration_beats: n.duration_beats,
                                 velocity: n.velocity,
                             })

@@ -377,6 +377,41 @@ pub struct AutomationClip {
     /// loaders log a warning and treat foreign variants as empty.
     #[serde(default)]
     pub content_id: ContentId,
+    /// v32: clip の左端が curve のどの拍に当たるか。意味・不変条件は
+    /// [`Clip::content_offset_beats`](crate::model::Clip::content_offset_beats)
+    /// と完全に同一 (`AutomationClip` は `Clip` と同形なので窓も対称)。
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub content_offset_beats: f64,
+}
+
+impl AutomationClip {
+    /// content-local 拍 0 が置かれる song-absolute 拍。
+    /// 意味は [`Clip::content_origin_beat`](crate::model::Clip::content_origin_beat) と同じ。
+    #[must_use]
+    pub fn content_origin_beat(&self) -> f64 {
+        self.start_beat - self.content_offset_beats
+    }
+
+    /// content-local 拍 → song-absolute 拍。
+    #[must_use]
+    pub fn content_to_song_beat(&self, content_beat: f64) -> f64 {
+        self.content_origin_beat() + content_beat
+    }
+
+    /// song-absolute 拍 → content-local 拍。
+    #[must_use]
+    pub fn song_to_content_beat(&self, song_beat: f64) -> f64 {
+        song_beat - self.content_origin_beat()
+    }
+
+    /// この clip が見せる content の窓 `[offset, offset + length)` (content-local 拍)。
+    #[must_use]
+    pub fn content_window(&self) -> (f64, f64) {
+        (
+            self.content_offset_beats,
+            self.content_offset_beats + self.length_beats,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -185,13 +185,19 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                             .map(|ev| ClipViewAudioEdit { gain_db: ev.gain_db }),
                         // r.md #38: fade は content 種別に依らず全 event ぶん渡す
                         // (音声だけ / first event だけ だった旧実装を置換)。
+                        // r.md #44: widget の座標系は **clip の窓ローカル** なので、
+                        // content-local な `start_in_clip_beats` から窓の offset を引く
+                        // (widget は content の存在を知らないままでよい)。
                         fades: content.map_or_else(Vec::new, |ct| {
                             ct.event_fades()
                                 .into_iter()
                                 .enumerate()
-                                .map(|(i, fade)| ClipEventFade {
-                                    event_index: u32::try_from(i).unwrap_or(u32::MAX),
-                                    fade,
+                                .map(|(i, mut fade)| {
+                                    fade.start_in_clip_beats -= c.content_offset_beats;
+                                    ClipEventFade {
+                                        event_index: u32::try_from(i).unwrap_or(u32::MAX),
+                                        fade,
+                                    }
                                 })
                                 .collect()
                         }),
@@ -497,7 +503,9 @@ fn build_arrangement_lanes_from_slice(
                         .unwrap_or(&[])
                         .iter()
                         .map(|p| ArrangementAutomationPoint {
-                            time_beat: p.time_beat,
+                            // r.md #44: widget は clip の窓ローカル座標で描く
+                            // (curve は content-local なので窓の offset を引く)。
+                            time_beat: p.time_beat - c.content_offset_beats,
                             value_norm: common::automation::plain_to_norm_ranged(
                                 &lane.target,
                                 p.value,

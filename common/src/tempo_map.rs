@@ -161,7 +161,7 @@ mod tests {
         );
         song.song_lanes.push(AutomationLane {
             id: 1,
-            clips: vec![AutomationClip { id: 1, name: "t".into(), start_beat: 0.0, length_beats: len, content_id: cid }],
+            clips: vec![AutomationClip { id: 1, name: "t".into(), start_beat: 0.0, length_beats: len, content_id: cid, content_offset_beats: 0.0 }],
             ..AutomationLane::new(AutomationTarget::SongTempo, f64::from(start))
         });
         song

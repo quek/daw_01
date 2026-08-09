@@ -103,7 +103,9 @@ pub fn active_text_sources_at(
             if playhead_beat < clip_start || playhead_beat >= clip_end {
                 continue;
             }
-            let clip_local = playhead_beat - clip_start;
+            // r.md #44: content 上の位置は clip 開始ではなく content 原点基準
+            // (= 左端 trim した clip は窓の分だけ content の先を見せる)。
+            let clip_local = clip.song_to_content_beat(playhead_beat);
             let Some(content) = song.clip_contents.get(&clip.content_id) else {
                 continue;
             };

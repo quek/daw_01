@@ -273,8 +273,11 @@ impl AppData {
         });
     }
 
-    /// dblclick on lane body → 1 point 追加。clip-local `time_beat`
+    /// dblclick on lane body → 1 point 追加。content-local `time_beat`
     /// 昇順を保つよう挿入位置を二分探索で決める。
+    ///
+    /// 引数の `time_beat` は widget 座標系 (= clip の窓ローカル) なので、
+    /// model へ書く前に窓の offset を足して content-local へ戻す (r.md #44)。
     pub(crate) fn add_automation_point(
         &mut self,
         track_id: u32,
@@ -291,6 +294,7 @@ impl AppData {
             let Some(clip) = lane.clip_by_id(clip_id) else {
                 return false;
             };
+            let time_beat = time_beat + clip.content_offset_beats;
             let content_id = clip.content_id;
             let plain = common::automation::norm_to_plain(&target, value_norm);
             let entry = song.clip_contents.entry(content_id).or_insert_with(|| {
@@ -343,6 +347,8 @@ impl AppData {
                     continue;
                 };
                 let content_id = clip.content_id;
+                // widget が返す `next_time_beat` は窓ローカル → content-local へ戻す。
+                let next_time_beat = delta.next_time_beat + clip.content_offset_beats;
                 let plain = common::automation::norm_to_plain(&target, delta.next_value_norm);
                 let Some(entry) = song.clip_contents.get_mut(&content_id) else {
                     continue;
@@ -351,7 +357,7 @@ impl AppData {
                     continue;
                 };
                 if let Some(p) = a.points.get_mut(delta.key.point_idx as usize) {
-                    p.time_beat = delta.next_time_beat;
+                    p.time_beat = next_time_beat;
                     p.value = plain;
                     touched.insert(content_id);
                 }
@@ -756,7 +762,8 @@ impl AppData {
             clip: clip.id,
         };
         let content_id = clip.content_id;
-        let anchor = (song_beat - clip.start_beat).max(0.0);
+        // r.md #44: curve 上の貼り付け位置は content 原点基準。
+        let anchor = clip.song_to_content_beat(song_beat).max(0.0);
 
         // dest content が automation でない壊れたモデルなら undo を触る前に bail。
         if let Some(c) = self.song_doc.song().clip_contents.get(&content_id)
@@ -918,11 +925,12 @@ impl AppData {
                 audio.events.push(e.clone());
             }
             // clip 長が足りなければ拡張 (add_audio_event_from_file と同 idiom)。
+            // r.md #44: `max_end` は content-local。 clip の窓の末尾を基準に伸ばす。
             if let Some(track) = song.tracks.get_mut(target.track as usize)
                 && let Some(clip) = track.clips.get_mut(target.clip as usize)
-                && max_end > clip.length_beats
+                && max_end > clip.content_offset_beats + clip.length_beats
             {
-                clip.length_beats = max_end;
+                clip.length_beats = max_end - clip.content_offset_beats;
             }
             Some(new_indices)
         }) else {
@@ -981,6 +989,8 @@ impl AppData {
                 // clip-level mute も clipboard へ。
                 muted: c.muted,
                 content_id: c.content_id,
+                // r.md #44: trim で決まった「content のどこを見せるか」も clipboard へ。
+                content_offset_beats: c.content_offset_beats,
                 content,
                 name,
                 // per-clip 声を clipboard へ。
@@ -1070,6 +1080,8 @@ impl AppData {
                     start_beat: (at_beat + cc.start_beat).max(0.0),
                     length_beats: cc.length_beats,
                     content_id,
+                    // clipboard が運んできた窓をそのまま復元 (r.md #44)。
+                    content_offset_beats: cc.content_offset_beats,
                     color: cc.color,
                     auto_lipsync: cc.auto_lipsync,
                     // clipboard は配置世代を運ばないので「世代不明」= 0。
@@ -1138,8 +1150,10 @@ impl AppData {
                     Some(common::model::ClipContent::Automation(a)) => a
                         .points
                         .iter()
+                        // r.md #44: clipboard は clip の窓ローカルで運ぶ
+                        // (貼り付け先の窓 offset は貼る側が足す)。
                         .map(|p| crate::clipboard::CopiedPoint {
-                            time_beat: p.time_beat,
+                            time_beat: p.time_beat - clip.content_offset_beats,
                             value_norm: common::automation::plain_to_norm(target, p.value),
                             curve: p.curve,
                         })
@@ -1231,6 +1245,7 @@ impl AppData {
                     start_beat,
                     length_beats: cc.length_beats,
                     content_id,
+                    content_offset_beats: 0.0,
                 };
                 let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
                 lane.clips.insert(pos, new_clip);
@@ -1324,6 +1339,7 @@ impl AppData {
                     start_beat: d.next_start_beat,
                     length_beats: template.2,
                     content_id: template.0,
+                    content_offset_beats: 0.0,
                 };
                 let start = new_clip.start_beat;
                 let pos = target_lane
@@ -1386,6 +1402,7 @@ impl AppData {
                     start_beat: d.next_start_beat,
                     length_beats: template.2,
                     content_id: new_content_id,
+                    content_offset_beats: 0.0,
                 };
                 let start = new_clip.start_beat;
                 let pos = target_lane
@@ -1436,6 +1453,7 @@ impl AppData {
                 start_beat: new_start_beat,
                 length_beats: length,
                 content_id,
+                content_offset_beats: 0.0,
             };
             let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
             lane.clips.insert(pos, new_clip);
@@ -1480,6 +1498,7 @@ impl AppData {
                 start_beat: new_start_beat,
                 length_beats: length,
                 content_id: new_content_id,
+                content_offset_beats: 0.0,
             };
             let pos = lane.clips.partition_point(|c| c.start_beat < new_start_beat);
             lane.clips.insert(pos, new_clip);
@@ -1666,6 +1685,7 @@ impl AppData {
                 start_beat,
                 length_beats: len_beats,
                 content_id: new_content_id,
+                content_offset_beats: 0.0,
             };
             let pos = lane.clips.partition_point(|c| c.start_beat < start_beat);
             lane.clips.insert(pos, new_clip);

@@ -161,6 +161,11 @@ pub fn collect_events_for_buffer(
             note_id_base += clip_note_count;
             continue;
         }
+        // r.md #44: clip は content への窓。 鳴らす note は content-local 拍で
+        // `[content_offset_beats, +length_beats)` に **発音開始が入る** ものだけ
+        // (= 左端 trim で隠れた note は鳴らない)。 linked clip は content を
+        // 共有するが窓は clip ごとに独立する。
+        let (win_start, win_end) = clip.content_window();
 
         for (note_idx, note) in notes.iter().enumerate() {
             let note_id = note_id_base + note_idx as u32;
@@ -174,14 +179,14 @@ pub fn collect_events_for_buffer(
             }
             // Skip notes whose On is outside the clip — otherwise we could
             // emit On but lose Off to clamping, leaving a stuck note.
-            if note.start_beat < 0.0 || note.start_beat >= clip.length_beats {
+            if note.start_beat < win_start || note.start_beat >= win_end {
                 continue;
             }
             // beat-domain で note の絶対 beat 位置を求める。 Off は clip 末端
             // で clamp (= 旧 sample-domain ロジックと同 idiom)。
-            let on_abs_beat = clip.start_beat + note.start_beat;
+            let on_abs_beat = clip.content_to_song_beat(note.start_beat);
             let raw_off_abs_beat =
-                clip.start_beat + (note.start_beat + note.duration_beats);
+                clip.content_to_song_beat(note.start_beat + note.duration_beats);
             let off_abs_beat = raw_off_abs_beat.min(clip_end_beats);
 
             if on_abs_beat >= playhead_beats && on_abs_beat < buf_end_beats {
@@ -262,11 +267,18 @@ pub fn collect_events_for_buffer(
             else {
                 continue;
             };
+            // r.md #44: 読み上げも clip の窓の中で始まる event だけ発火する。
+            let (win_start, win_end) = clip.content_window();
             for (event_index, ev) in events.iter().enumerate() {
                 if ev.text.is_empty() {
                     continue;
                 }
-                let on_abs_beat = clip.start_beat + ev.event_start_in_clip_beats;
+                if ev.event_start_in_clip_beats < win_start
+                    || ev.event_start_in_clip_beats >= win_end
+                {
+                    continue;
+                }
+                let on_abs_beat = clip.content_to_song_beat(ev.event_start_in_clip_beats);
                 if on_abs_beat >= playhead_beats
                     && on_abs_beat < buf_end_beats
                     && out.len() < MAX_EVENTS
@@ -599,6 +611,102 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0].event, NoteTransition::Off { key: 60, .. }));
         assert!(active.is_empty());
+    }
+
+    /// r.md #44: clip は content への窓。左端を trim (= `content_offset_beats` を
+    /// 進める) した clip は、窓より前の note を鳴らさず、窓内の note は
+    /// **song 上の同じ位置** で鳴る (= content が動いていない証拠)。
+    #[test]
+    fn left_trimmed_clip_hides_notes_before_the_window_and_keeps_the_rest_in_place() {
+        // content: note@0 (1 拍) と note@2 (1 拍)。clip は [0,4) を見せている。
+        let mut song = one_note_song(0.0, 1.0, 60);
+        let cid = song.tracks[0].clips[0].content_id;
+        song.clip_contents
+            .get_mut(&cid)
+            .unwrap()
+            .notes_mut()
+            .expect("Midi variant")
+            .push(Note {
+                id: 2,
+                start_beat: 2.0,
+                duration_beats: 1.0,
+                pitch: 64,
+                velocity: 100,
+                lyric: None,
+                muted: false,
+            });
+        // 左端を 2 拍 trim: start 0→2 / length 4→2 / 窓 offset 0→2。
+        {
+            let clip = &mut song.tracks[0].clips[0];
+            clip.start_beat = 2.0;
+            clip.length_beats = 2.0;
+            clip.content_offset_beats = 2.0;
+        }
+        // 窓の前 (content 0 拍 = song 0 拍) は鳴らない。
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 0.0, 120.0, 1024, &mut out, &mut active);
+        assert!(out.is_empty(), "trim で隠した note は発音しない: {out:?}");
+        // 窓内の note は song 2 拍のまま (= content が動いていない)。
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 2.0, 120.0, 1024, &mut out, &mut active);
+        assert!(
+            matches!(out.first().map(|e| &e.event), Some(NoteTransition::On { key: 64, .. })),
+            "窓内の note は song 上の元の位置で鳴る: {out:?}"
+        );
+        assert_eq!(out[0].time, 0, "playhead=2 拍ちょうどで発音");
+    }
+
+    /// linked clip (= 同 `content_id`) が別々の窓を持てること。同じ content から
+    /// 片方は前半 note を、もう片方は後半 note を鳴らす。
+    #[test]
+    fn linked_clips_sound_their_own_windows_of_the_shared_content() {
+        let mut song = one_note_song(0.0, 1.0, 60);
+        let cid = song.tracks[0].clips[0].content_id;
+        song.clip_contents
+            .get_mut(&cid)
+            .unwrap()
+            .notes_mut()
+            .expect("Midi variant")
+            .push(Note {
+                id: 2,
+                start_beat: 2.0,
+                duration_beats: 1.0,
+                pitch: 64,
+                velocity: 100,
+                lyric: None,
+                muted: false,
+            });
+        {
+            let clip = &mut song.tracks[0].clips[0];
+            clip.start_beat = 0.0;
+            clip.length_beats = 2.0;
+            clip.content_offset_beats = 0.0;
+        }
+        // content を共有する 2 本目: 窓は [2,4) を song 8 拍に置く。
+        let mut linked = song.tracks[0].clips[0].clone();
+        linked.id = 2;
+        linked.start_beat = 8.0;
+        linked.length_beats = 2.0;
+        linked.content_offset_beats = 2.0;
+        song.tracks[0].clips.push(linked);
+
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 0.0, 120.0, 1024, &mut out, &mut active);
+        assert!(
+            matches!(out.first().map(|e| &e.event), Some(NoteTransition::On { key: 60, .. })),
+            "clip 1 の窓は前半 note だけ: {out:?}"
+        );
+
+        let mut out = Vec::new();
+        let mut active = Vec::new();
+        collect_events_for_buffer(Some(&song), 0, SR, 8.0, 120.0, 1024, &mut out, &mut active);
+        assert!(
+            matches!(out.first().map(|e| &e.event), Some(NoteTransition::On { key: 64, .. })),
+            "clip 2 の窓は後半 note だけを 8 拍で鳴らす: {out:?}"
+        );
     }
 
     #[test]

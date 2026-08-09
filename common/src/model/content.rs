@@ -27,6 +27,22 @@ pub struct Clip {
     /// clips with the same `content_id` share notes (linked clips).
     #[serde(default)]
     pub content_id: ContentId,
+    /// v32 (`docs/plan_clip_content_window.md`): clip の左端が content の
+    /// **どの拍に当たるか** (content-local 拍)。REAPER item の `SOFFS` /
+    /// Ableton の clip start marker と同じ量。
+    ///
+    /// clip は共有 content への「窓」であり、見せる範囲は
+    /// `[content_offset_beats, content_offset_beats + length_beats)`。左端 trim は
+    /// content を書き換えず **この値を進める**ので、`content_id` を共有する linked
+    /// clip の開始・終了は完全に独立する (r.md #44)。左端を外へ伸ばすと負になり得る
+    /// (= 先頭に空白が付く、content 側は無傷)。
+    ///
+    /// content-local 拍 ↔ song-absolute 拍の換算は [`Clip::content_origin_beat`]
+    /// / [`Clip::content_to_song_beat`] / [`Clip::song_to_content_beat`] だけを通すこと
+    /// (`clip.start_beat + <content-local>` を直に書くと offset を落とす)。
+    /// v31 以前は 0 に forward-migrate (= 従来の挙動と同一)。
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub content_offset_beats: f64,
     /// v18 (`docs/plan_track_clip_color.md`): per-clip color override
     /// (RGB, opaque). `None` ⇒ inherit the owning track's effective color
     /// (the default; resetting to `None` is the Ableton-style "match track
@@ -86,6 +102,52 @@ pub struct Clip {
     /// `Clip::speaker_id` を流用する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub talk: Option<TalkParams>,
+}
+
+impl Clip {
+    /// content-local 拍 0 が置かれる song-absolute 拍
+    /// (= `start_beat - content_offset_beats`)。
+    ///
+    /// **content ↔ song の換算はここを唯一の口にすること。**
+    /// `clip.start_beat + <content-local 拍>` を直に書くと、左端 trim した clip で
+    /// `content_offset_beats` を落として位置がずれる (r.md #44)。
+    #[must_use]
+    #[inline]
+    pub fn content_origin_beat(&self) -> f64 {
+        self.start_beat - self.content_offset_beats
+    }
+
+    /// content-local 拍 (note / event の `start_beat` 等) → song-absolute 拍。
+    #[must_use]
+    #[inline]
+    pub fn content_to_song_beat(&self, content_beat: f64) -> f64 {
+        self.content_origin_beat() + content_beat
+    }
+
+    /// song-absolute 拍 → content-local 拍 (clip 内容の座標系)。
+    #[must_use]
+    #[inline]
+    pub fn song_to_content_beat(&self, song_beat: f64) -> f64 {
+        song_beat - self.content_origin_beat()
+    }
+
+    /// この clip が見せる content の窓 `[offset, offset + length)` (content-local 拍)。
+    /// 再生・描画はこの窓の外の note / event を出さない。
+    #[must_use]
+    #[inline]
+    pub fn content_window(&self) -> (f64, f64) {
+        (
+            self.content_offset_beats,
+            self.content_offset_beats + self.length_beats,
+        )
+    }
+
+    /// この clip の song-absolute な占有範囲 `[start, start + length)`。
+    #[must_use]
+    #[inline]
+    pub fn song_window(&self) -> (f64, f64) {
+        (self.start_beat, self.start_beat + self.length_beats)
+    }
 }
 
 /// Shared content referenced by one or more `Clip`s via

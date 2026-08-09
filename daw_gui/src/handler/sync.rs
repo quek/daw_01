@@ -361,8 +361,9 @@ impl AppData {
                     .saturating_sub(event.source_start_frames)
                     as f64
                     / sample_rate;
+                // r.md #44: event の song 位置は content 原点基準。
                 let start_in_playback =
-                    (clip.start_beat + event.event_start_in_clip_beats) * 60.0 / bpm;
+                    clip.content_to_song_beat(event.event_start_in_clip_beats) * 60.0 / bpm;
                 // Raw plays the slice natively (no stretch): playback duration ==
                 // modification duration. Every other mode follows the clip's
                 // timeline length, so the playback duration is the event's beat

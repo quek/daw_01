@@ -107,12 +107,22 @@ pub const METER_RED: Color = Color::rgb(0.95, 0.32, 0.30);
 
 // ===== 波形 =====
 
-/// 波形 fg (非選択)。寒色ブルー。
+/// 波形 fg (非選択)。寒色ブルー。**暗い背景の上**で使う。
 pub const WAVEFORM: Color = Color::rgb(0.46, 0.74, 0.95);
-/// 波形 fg (選択中、明るく)。
+/// 波形 fg (選択中、明るく)。暗い背景用。
 pub const WAVEFORM_SEL: Color = Color::rgb(0.62, 0.88, 1.00);
-/// クリップしたピーク (赤)。
+/// クリップしたピーク (赤)。暗い背景用。
 pub const WAVEFORM_PEAK: Color = Color::rgb(0.95, 0.42, 0.40);
+
+/// 明るい塗り (ユーザーが着色した clip 等) の上に描く波形の auto-contrast 対。
+/// `WAVEFORM` の色相 (寒色ブルー) を保ったまま明度だけ落とし、
+/// 「波形はブルー」 という識別性を残しつつコントラストを確保する
+/// (`TEXT` / `TEXT_ON_BRIGHT` と同じ 2 択 idiom)。
+pub const WAVEFORM_ON_BRIGHT: Color = Color::rgb(0.06, 0.20, 0.36);
+/// 選択中 clip 上の明るい塗り用 (`WAVEFORM_SEL` の対)。
+pub const WAVEFORM_SEL_ON_BRIGHT: Color = Color::rgb(0.02, 0.13, 0.28);
+/// 明るい塗りの上のクリップピーク。警告色 (赤) の識別性を保ったまま暗くする。
+pub const WAVEFORM_PEAK_ON_BRIGHT: Color = Color::rgb(0.52, 0.05, 0.04);
 
 // ===== モジュレーション / カーブエディタ =====
 

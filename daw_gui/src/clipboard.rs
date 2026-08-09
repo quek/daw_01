@@ -66,6 +66,11 @@ pub struct ClipCopy {
     pub muted: bool,
     /// source プロジェクトでの content_id (同一プロジェクト paste でリンク共有)。
     pub content_id: ContentId,
+    /// r.md #44: clip が content のどこを見せていたか (`Clip::content_offset_beats`)。
+    /// これを運ばないと、左端を trim した clip を copy&paste しただけで窓が先頭へ
+    /// 戻ってしまう。旧 clipboard JSON との互換のため serde default (`0.0`)。
+    #[serde(default)]
+    pub content_offset_beats: f64,
     /// content payload (別プロジェクト paste で独立復元)。
     pub content: ClipContent,
     /// 共有名 (`Song.clip_content_names` 由来)。
@@ -273,6 +278,10 @@ pub fn sanitize_clips(clips: Vec<ClipCopy>) -> Vec<ClipCopy> {
             if !c.start_beat.is_finite() {
                 c.start_beat = 0.0;
             }
+            // 窓 offset は負も正当 (左端を外へ伸ばした clip) だが、非有限は先頭扱い。
+            if !c.content_offset_beats.is_finite() {
+                c.content_offset_beats = 0.0;
+            }
             sanitize_content(&mut c.content);
             Some(c)
         })
@@ -401,6 +410,7 @@ mod tests {
             auto_lipsync: false,
             muted: false,
             content_id: 0 as ContentId,
+            content_offset_beats: 0.0,
             content: ClipContent::default(),
             name: None,
             speaker_id: 0,

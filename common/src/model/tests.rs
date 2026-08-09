@@ -1072,7 +1072,11 @@ fn current_version_is_pinned() {
     // 範囲) を session state + `ViewState.loop_region` へ移した (「聴き方の都合」 は
     // dirty を立てないが保存される)。v30 以前のファイルは
     // `project::legacy_song_loop_region` が Song 直下から拾って移行する。
-    assert_eq!(CURRENT_VERSION, 31);
+    // v32 (r.md #44 / `docs/plan_clip_content_window.md`): `Clip` / `AutomationClip` に
+    // `content_offset_beats` を追加 (= clip は共有 content への「窓」)。端 trim が
+    // content を書き換えなくなり、linked clip の開始・終了が独立する。v31 以前は
+    // `serde(default)` の 0.0 で読める (migration 関数不要)。
+    assert_eq!(CURRENT_VERSION, 32);
 }
 
 #[test]
@@ -1488,6 +1492,7 @@ fn automation_clip_content_roundtrip() {
                 start_beat: 0.0,
                 length_beats: 4.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(
@@ -1536,6 +1541,7 @@ fn automation_clip_counts_toward_clip_content_refcount() {
                 start_beat: 0.0,
                 length_beats: 4.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
             }],
             ..AutomationLane::new(
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
@@ -1567,6 +1573,7 @@ fn gc_clip_contents_keeps_automation_clip_references() {
                 start_beat: 0.0,
                 length_beats: 4.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
             }],
             ..AutomationLane::new(
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
@@ -1680,6 +1687,7 @@ fn gc_clip_contents_keeps_song_lane_references() {
             start_beat: 0.0,
             length_beats: 4.0,
             content_id: cid,
+            content_offset_beats: 0.0,
         }],
         ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
     });
@@ -1709,6 +1717,7 @@ fn ensure_clip_contents_reassigns_song_lane_sentinel_ids() {
             start_beat: 0.0,
             length_beats: 4.0,
             content_id: 0,
+            content_offset_beats: 0.0,
         }],
         ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
     });

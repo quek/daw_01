@@ -993,8 +993,14 @@ pub struct ArrangementStyle {
     pub audio_db_range_db: f32,
     /// fade 角 grip の正方形サイズ (px、 clip 上端の左右にこの size の正方形 hit zone)。 default 12.0。
     pub audio_fade_corner_size_px: f32,
-    /// fade envelope (clip 上端から fade 末尾まで斜辺) と grip の描画色 (default 半透明白)。
+    /// fade envelope (clip の中身領域上端から fade 末尾まで) と grip の描画色。
+    /// **暗い clip 色の上で使う明色側** (default 半透明白)。
     pub audio_fade_overlay_color: Color,
+    /// r.md #46: 明るい clip 色の上で使う暗色側 (`audio_fade_overlay_color` と対)。
+    /// clip 名の `clip_text_color` / `clip_text_color_dark` と同じ auto-contrast 2 択で、
+    /// どちらを前景にするかは clip の実塗り色の WCAG 輝度で決まる。 選ばれなかった方は
+    /// 1 px の裏打ちとして敷かれるので、波形の上でも fade の縁が立つ。
+    pub audio_fade_overlay_color_dark: Color,
     /// fade envelope 線の太さ (default 1.0 px)。
     pub audio_fade_overlay_width_px: f32,
     /// audio grip / handle を表示する最小 clip 幅 (これ未満では hit zone 全 disable、 描画も
@@ -1232,6 +1238,7 @@ impl Default for ArrangementStyle {
             audio_db_range_db: 24.0,
             audio_fade_corner_size_px: 12.0,
             audio_fade_overlay_color: theme::TEXT.with_alpha(0.65),
+            audio_fade_overlay_color_dark: theme::TEXT_ON_BRIGHT.with_alpha(0.75),
             audio_fade_overlay_width_px: 1.0,
             audio_min_clip_w_for_handles_px: 32.0,
             audio_fade_sticky_threshold_px: 10.0,
@@ -1586,6 +1593,9 @@ struct AudioDragSession {
     /// `anchor_fade.fade.len_beats`)。 ghost 描画で clip rect から event 矩形を切り出す
     /// ための px/beat スケール算出にだけ使う。
     clip_len_beats_anchor: f64,
+    /// r.md #46: drag 開始時の clip 実塗り色。 ghost の fade envelope も base 描画と
+    /// 同じ auto-contrast で色を選ぶ (単層の固定色だと明るい clip 上で消える)。
+    clip_bg_anchor: Color,
     anchor_mouse: (f32, f32),
     /// continuation で update、 release frame は pointer.pos ≠ anchor_mouse のときのみ update
     /// (clip_drag と同じ pattern: winit が release で press 位置に戻すケースを回避)。

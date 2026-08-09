@@ -368,7 +368,11 @@ impl AppData {
             self.ui_prefs.piano_roll_views.insert(k, pv);
         }
         for (k, mut av) in v.audio_editor_views {
-            av.start_beat = av.start_beat.max(0.0);
+            // r.md #44: start_beat は content-local 軸で、左端を外へ伸ばした clip では
+            // 負にもなる (= 0 で clamp しない)。描画側が窓で clamp し直す。
+            if !av.start_beat.is_finite() {
+                av.start_beat = 0.0;
+            }
             av.len_beats = av.len_beats.max(0.0);
             self.ui_prefs.audio_editor_views.insert(k, av);
         }
@@ -481,15 +485,19 @@ impl AppData {
         self.remap_packed_selection_for_clip(slot, &remap);
     }
 
-    /// クリップの song-absolute 開始拍。clip-local note ⇄ song-absolute 変換の
-    /// 唯一のオフセット (範囲外は 0)。
+    /// クリップの **content 原点** の song-absolute 拍。content-local note ⇄
+    /// song-absolute 変換の唯一のオフセット (範囲外は 0)。
+    ///
+    /// r.md #44: clip は content への窓なので、原点は `start_beat` ではなく
+    /// `start_beat - content_offset_beats` ([`Clip::content_origin_beat`])。
+    /// 左端 trim した clip でも note の song 上の位置は動かない。
     #[must_use]
     pub fn clip_start_beat_of(&self, r: ClipRef) -> f64 {
         self.song_doc.song()
             .tracks
             .get(r.track as usize)
             .and_then(|t| t.clips.get(r.clip as usize))
-            .map(|c| c.start_beat)
+            .map(common::model::Clip::content_origin_beat)
             .unwrap_or(0.0)
     }
 
@@ -1004,9 +1012,15 @@ impl AppData {
             let Some(clip) = track.clips.get(r.clip as usize) else {
                 continue;
             };
-            let offset = if multi { clip.start_beat } else { 0.0 };
-            union_start = union_start.min(offset);
-            union_end = union_end.max(offset + clip.length_beats);
+            // r.md #44: note は content-local なので song 化は content 原点基準。
+            // clip の帯 (窓) はそれとは別に `start_beat` / `content_offset_beats`。
+            let (offset, win_start) = if multi {
+                (clip.content_origin_beat(), clip.start_beat)
+            } else {
+                (0.0, clip.content_offset_beats)
+            };
+            union_start = union_start.min(win_start);
+            union_end = union_end.max(win_start + clip.length_beats);
             for n in self.song_doc.song().clip_notes(clip) {
                 note_count += 1;
                 let s = n.start_beat + offset;

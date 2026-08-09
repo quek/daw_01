@@ -315,7 +315,9 @@ pub fn lane_value_at(
     if auto.points.is_empty() {
         return lane.default_value;
     }
-    let local = song_beat - clip.start_beat;
+    // r.md #44: curve 上の位置は clip 開始ではなく **content 原点** 基準
+    // (左端 trim した clip は窓の分だけ curve の先を見せる)。
+    let local = clip.song_to_content_beat(song_beat);
     evaluate_clip(auto, local)
 }
 
@@ -931,6 +933,7 @@ mod tests {
                 start_beat: 8.0,
                 length_beats: 4.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
             }],
             next_clip_id: 2,
             ..AutomationLane::new(
@@ -961,6 +964,7 @@ mod tests {
                 start_beat: 0.0,
                 length_beats: 4.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
             }],
             ..AutomationLane::new(
                 AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
@@ -1140,6 +1144,7 @@ mod tests {
             start_beat: 0.0,
             length_beats: clip_length,
             content_id: cid,
+            content_offset_beats: 0.0,
         });
         lane.next_clip_id = 2;
         song.song_lanes.push(lane);
@@ -1276,6 +1281,7 @@ mod tests {
             start_beat: 0.0,
             length_beats: 4.0,
             content_id: cid,
+            content_offset_beats: 0.0,
         });
         lane.next_clip_id = 2;
         song.song_lanes.push(lane);

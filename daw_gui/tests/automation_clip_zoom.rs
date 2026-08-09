@@ -72,6 +72,7 @@ fn add_track_automation_clip(
                 start_beat: start,
                 length_beats: len,
                 content_id: 0,
+                content_offset_beats: 0.0,
             }],
             next_clip_id: clip_id + 1,
         });
@@ -139,6 +140,7 @@ fn z_縦ズームは_master_行の_automation_clip_を行_0_として扱う() {
                 start_beat: 8.0,
                 length_beats: 4.0,
                 content_id: 0,
+                content_offset_beats: 0.0,
             }],
             next_clip_id: 2,
         });
@@ -239,7 +241,7 @@ fn lane_拡大は_fresh_zoom_で破棄_fit_で行高に_scale_される() {
             enabled: true,
             visible: true,
             height_px: 60,
-            clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0 }],
+            clips: vec![AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 }],
             next_clip_id: 2,
         });
     });
@@ -296,8 +298,8 @@ fn z_は別_clip_を選び直すと新しい選択へ横ズームし直す() {
             visible: true,
             height_px: 60,
             clips: vec![
-                AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0 },
-                AutomationClip { id: 2, name: String::new(), start_beat: 20.0, length_beats: 4.0, content_id: 0 },
+                AutomationClip { id: 1, name: String::new(), start_beat: 8.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 },
+                AutomationClip { id: 2, name: String::new(), start_beat: 20.0, length_beats: 4.0, content_id: 0, content_offset_beats: 0.0 },
             ],
             next_clip_id: 3,
         });

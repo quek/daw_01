@@ -50,10 +50,12 @@ pub(super) struct PrContent {
     pub selected: Vec<NoteId>,
     pub shown: Vec<ClipRef>,
     pub target: ClipRef,
-    /// 各表示クリップ (clip_slot 順) の song-absolute 開始拍 (per-note offset で clip-local へ戻す)。
+    /// 各表示クリップ (clip_slot 順) の **content 原点** の song-absolute 拍
+    /// (per-note offset で content-local へ戻す。r.md #44)。
     pub clip_starts: Vec<f64>,
-    /// 対象 (target) クリップの song-absolute 開始拍。
-    pub clip_start_beat: f64,
+    /// 対象 (target) クリップの **content 原点** の song-absolute 拍。
+    /// note の song ⇄ content 変換はこれ 1 本 (`clip.start_beat` ではない)。
+    pub clip_origin_beat: f64,
     /// 2 クリップ以上を同時表示中か (legend パネル + union-fit)。
     pub multi: bool,
     /// 複数表示時の legend パネル rect (単一表示は `None`)。
@@ -125,16 +127,19 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
     // piano roll を song-absolute 座標系に統一。clip.start_beat を唯一の絶対オフセット SSoT とし、
     // view 入口で加算 (ruler/grid/playhead/loop が曲の絶対小節位置)、note の model 書き戻し出口で
     // 減算する (note は共有 content のため clip-local 保持)。
-    let clip_start_beat = app
+    // r.md #44: note の song ⇄ content 変換は content 原点、view の起点 (単一表示の
+    // scroll 基準 / scale 判定) は clip の窓の開始 = `start_beat`。両者は左端 trim した
+    // clip で食い違うので別々に持つ。
+    let target_clip = app
         .song_doc
         .song()
         .tracks
         .get(target.track as usize)
-        .and_then(|t| t.clips.get(target.clip as usize))
-        .map(|c| c.start_beat)
-        .unwrap_or(0.0);
+        .and_then(|t| t.clips.get(target.clip as usize));
+    let clip_origin_beat = target_clip.map_or(0.0, common::model::Clip::content_origin_beat);
+    let clip_window_start_beat = target_clip.map_or(0.0, |c| c.start_beat);
     // 編集中 clip の start_beat 位置の scale を採用 (単一 view 内で動的に scale が変わらない)。
-    let scale = app.song_doc.song().scale_at(clip_start_beat).map(|sc| PianoRollScale {
+    let scale = app.song_doc.song().scale_at(clip_window_start_beat).map(|sc| PianoRollScale {
         root: sc.root,
         in_scale_mask: sc.scale.pitch_class_mask(),
         mode: if app.ui_prefs.piano_roll_fold {
@@ -162,7 +167,10 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         let earliest = if earliest.is_finite() { earliest } else { 0.0 };
         (f64::from(app.pianoroll_scroll_beat()), earliest)
     } else {
-        (f64::from(app.pianoroll_scroll_beat()) + clip_start_beat, clip_start_beat)
+        (
+            f64::from(app.pianoroll_scroll_beat()) + clip_window_start_beat,
+            clip_window_start_beat,
+        )
     };
 
     let snap_cfg = snap::piano_roll_snap_config(app);
@@ -197,7 +205,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
                 .tracks
                 .get(r.track as usize)
                 .and_then(|t| t.clips.get(r.clip as usize))
-                .map(|c| c.start_beat)
+                // r.md #44: emit の逆変換も content 原点基準 (note は content-local)。
+                .map(common::model::Clip::content_origin_beat)
                 .unwrap_or(0.0)
         })
         .collect();
@@ -215,7 +224,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
             shown,
             target,
             clip_starts,
-            clip_start_beat,
+            clip_origin_beat,
             multi,
             legend_rect,
             body,
@@ -249,7 +258,9 @@ pub(super) fn build_widget_notes(app: &AppData, shown: &[ClipRef], target_track:
         // トラック基準の dim: 編集対象トラック以外のノートを淡色に。
         let dimmed = Some(r.track) != target_track;
         let locked = app.is_pianoroll_clip_locked(r);
-        let clip_start = clip.start_beat;
+        // r.md #44: note は content-local なので song-absolute 化は content 原点基準
+        // (左端 trim した clip でも note は song 上の同じ位置に描かれる)。
+        let clip_start = clip.content_origin_beat();
         for (i, n) in app.song_doc.song().clip_notes(clip).iter().enumerate() {
             out.push(Note {
                 id: AppData::pack_note_id(clip_slot, i),

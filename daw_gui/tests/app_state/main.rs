@@ -18,6 +18,7 @@ mod support;
 mod clip_rename;
 mod dirty_guard;
 mod group_track_lifecycle;
+mod linked_clip_bounds;
 mod make_unique;
 mod pending_state_queue;
 mod plugin_load_failure;

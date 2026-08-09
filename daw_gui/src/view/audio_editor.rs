@@ -172,6 +172,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 初期状態)。 wheel handler が以降 SetAudioEditorScroll / SetAudioEditorZoom
     // を発火する。 描画前に clamp し直して視覚的に無効値を防ぐ (= clip
     // が縮んだ等で view が clip 外に飛び出すケース)。
+    // r.md #44: Audio Editor の座標系は **content-local** (event の
+    // `event_start_in_clip_beats` と同じ軸)。 clip が見せる範囲は
+    // `[content_offset_beats, +length_beats)` なので view もそこに clamp する。
     let total_beats = clip.length_beats.max(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS);
     let view_len_beats = if app.audio_editor_view_len_beats() > 0.0 {
         app.audio_editor_view_len_beats()
@@ -179,10 +182,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     } else {
         total_beats
     };
-    let max_view_start = (total_beats - view_len_beats).max(0.0);
+    let min_view_start = clip.content_offset_beats;
+    let max_view_start = min_view_start + (total_beats - view_len_beats).max(0.0);
     let view_start_beat = app
         .audio_editor_view_start_beat()
-        .clamp(0.0, max_view_start);
+        .clamp(min_view_start, max_view_start);
 
     // ----- Ruler (MIDI エディタ同様、 song 全体の絶対 bar 番号を表示) -
     // viewport は view_start_beat .. view_start_beat + view_len_beats を
@@ -203,7 +207,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         };
         let spb = mapping.samples_per_beat();
         let viewport = ViewportState1D {
-            view_start: (clip.start_beat + view_start_beat) * spb,
+            view_start: clip.content_to_song_beat(view_start_beat) * spb,
             view_len: view_len_beats * spb,
         };
         ui.time_ruler(
@@ -217,7 +221,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // ----- 既存 loop region overlay (ruler 上に半透明バンド) -----
         // arrangement view と同色の cyan、 view 範囲との交差のみ描画。
         if let Some((lstart, lend)) = app.transport.loop_region.range() {
-            let view_start_song = clip.start_beat + view_start_beat;
+            let view_start_song = clip.content_to_song_beat(view_start_beat);
             let view_end_song = view_start_song + view_len_beats;
             let visible_start = lstart.max(view_start_song);
             let visible_end = lend.min(view_end_song);
@@ -256,7 +260,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let to_song_beat = |x_px: f32| -> f64 {
             let local_x = (x_px - ruler_rect.x).clamp(0.0, ruler_rect.w);
             let view_norm = (local_x / ruler_rect.w) as f64;
-            (clip.start_beat + view_start_beat + view_norm * view_len_beats).max(0.0)
+            clip.content_to_song_beat(view_start_beat + view_norm * view_len_beats).max(0.0)
         };
         let cur_beat = to_song_beat(drag.current.0);
         if drag.start_modifiers.shift {
@@ -380,7 +384,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     let speed = if m.shift { 3.0 } else { 1.0 };
                     let dx_beats = -((sx + sy) as f64) * beats_per_px * speed;
                     let new_start =
-                        (view_start_beat + dx_beats).clamp(0.0, max_view_start);
+                        (view_start_beat + dx_beats).clamp(min_view_start, max_view_start);
                     if (new_start - view_start_beat).abs() > 1e-9 {
                         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::SetAudioEditorScroll(new_start));
@@ -500,7 +504,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             event,
             buffer.sample_rate,
             &tempo_map,
-            clip.start_beat + event.event_start_in_clip_beats,
+            clip.content_to_song_beat(event.event_start_in_clip_beats),
             &mut wave_spans,
         );
         let view_end_beat = view_start_beat + view_len_beats;
@@ -1048,10 +1052,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // x = wf_area.x + (in_clip_beats / clip.length_beats) * wf_area.w。
     if let Some(ph_beat) = app.transport.playhead_beat {
         let ph_beat = ph_beat as f64;
-        let clip_start = clip.start_beat;
-        // playhead の clip 内位置 (clip 始端 = 0)。 view 範囲外 (zoom 中
-        // で playhead が画面外) なら描画 skip。
-        let in_clip = ph_beat - clip_start;
+        // playhead の content-local 位置。 view 範囲外 (zoom 中で
+        // playhead が画面外) なら描画 skip。
+        let in_clip = clip.song_to_content_beat(ph_beat);
         let view_end_beat = view_start_beat + view_len_beats;
         if in_clip >= view_start_beat
             && in_clip < view_end_beat

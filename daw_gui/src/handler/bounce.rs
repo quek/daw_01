@@ -244,6 +244,7 @@ impl AppData {
             clip_name: clip_name.clone(),
             clip_length_beats: clip.length_beats,
             start_beat: clip.start_beat,
+            content_offset_beats: clip.content_offset_beats,
         });
         // SetRenderMode(Offline) → LoadSong(isolated) → BounceClipFxOnline。完了通知で
         // Realtime に戻し、restore_engine_song_after_bounce が full song を再 LoadSong
@@ -459,7 +460,9 @@ impl AppData {
         let new_event = AudioEvent {
             id: 1,
             source_id: new_source_id,
-            event_start_in_clip_beats: 0.0,
+            // r.md #44: 元 clip の窓の起点に置く (In Place 置換で窓と一致させる)。
+            // With FX の新 clip は窓 offset をそのまま引き継ぐ。
+            event_start_in_clip_beats: pending.content_offset_beats,
             event_length_beats: pending.clip_length_beats,
             source_start_frames: 0,
             source_end_frames: frames,
@@ -502,6 +505,7 @@ impl AppData {
                         start_beat: pending.start_beat,
                         length_beats: pending.clip_length_beats,
                         content_id: new_content_id,
+                        content_offset_beats: pending.content_offset_beats,
                         color: None,
                         auto_lipsync: false,
                         ..Default::default()

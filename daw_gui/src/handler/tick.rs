@@ -207,8 +207,8 @@ impl AppData {
                 Some(v) => v,
                 None => continue,
             };
-            // lane + clip を探す。
-            let (clip_start, content_id) =
+            // lane + clip を探す (戻り値は content 原点 = clip 開始 - 窓 offset)。
+            let (clip_origin, content_id) =
                 match self.find_recording_lane(track_id, &target, playhead_beat) {
                     Some(ids) => ids,
                     // B5 (r.md #8): lane / clip が無ければ自動生成して記録 (旧 silently skip)。
@@ -217,9 +217,9 @@ impl AppData {
                         None => continue,
                     },
                 };
-            // AutomationPoint は clip-local 時間で保存するので、 playhead から
-            // clip.start_beat を引いて local 化する。
-            let clip_local_beat = playhead_beat - clip_start;
+            // AutomationPoint は content-local 時間で保存するので、 playhead から
+            // content 原点を引いて local 化する (r.md #44)。
+            let clip_local_beat = playhead_beat - clip_origin;
             if self.insert_recording_point(content_id, clip_local_beat, plain_value) {
                 self.recording.recording_last_beat
                     .insert((track_id, target.clone()), playhead_beat);
@@ -232,7 +232,8 @@ impl AppData {
     /// B5 (r.md #8): recording 中に対象 lane / clip が無ければ自動生成する
     /// (Bitwig 流 auto-create)。 lane が無ければ `lane_default_for_target` の値で
     /// 作り、 playhead を含む clip が無ければ playhead (floor) から曲末まで覆う clip を
-    /// 1 本足す。 戻り値 = `(clip.start_beat, content_id)`。 track 不在で作れなければ None。
+    /// 1 本足す。 戻り値 = `(content 原点, content_id)` (r.md #44: 窓 offset を引いた値。
+    /// caller は `playhead - 原点` で content-local 拍を得る)。 track 不在で作れなければ None。
     pub(crate) fn ensure_recording_lane_clip(
         &mut self,
         track_id: u32,
@@ -281,7 +282,7 @@ impl AppData {
                             clip_start >= c.start_beat
                                 && clip_start < c.start_beat + c.length_beats
                         })
-                        .map(|c| (c.start_beat, c.content_id));
+                        .map(|c| (c.content_origin_beat(), c.content_id));
                     let next = l
                         .clips
                         .iter()
@@ -323,6 +324,7 @@ impl AppData {
                         start_beat: clip_start,
                         length_beats: clip_len,
                         content_id,
+                        content_offset_beats: 0.0,
                     });
                 } else {
                     let lid = song.alloc_song_lane_id();
@@ -339,6 +341,7 @@ impl AppData {
                             start_beat: clip_start,
                             length_beats: clip_len,
                             content_id,
+                            content_offset_beats: 0.0,
                         }],
                         next_clip_id: 2,
                     });
@@ -363,6 +366,7 @@ impl AppData {
                             start_beat: clip_start,
                             length_beats: clip_len,
                             content_id,
+                            content_offset_beats: 0.0,
                         });
                     } else {
                         let lid = track.alloc_lane_id();
@@ -379,6 +383,7 @@ impl AppData {
                                 start_beat: clip_start,
                                 length_beats: clip_len,
                                 content_id,
+                                content_offset_beats: 0.0,
                             }],
                             next_clip_id: 2,
                         });
@@ -390,6 +395,7 @@ impl AppData {
                 return None;
             }
         }
+        // 新規作成した clip は窓 offset 0 なので原点 = clip_start。
         Some((clip_start, content_id))
     }
 
@@ -590,7 +596,9 @@ impl AppData {
         let clip = lane.clips.iter().find(|c| {
             playhead_beat >= c.start_beat && playhead_beat < c.start_beat + c.length_beats
         })?;
-        Some((clip.start_beat, clip.content_id))
+        // r.md #44: 返すのは **content 原点** (= clip 開始 - 窓 offset)。
+        // caller は `playhead - origin` で content-local 拍を得る。
+        Some((clip.content_origin_beat(), clip.content_id))
     }
 
     /// Phase 4 Step C: 指定 content (= shared automation curve) に

@@ -61,7 +61,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             shown,
             target,
             clip_starts,
-            clip_start_beat,
+            clip_origin_beat,
             multi,
             legend_rect,
             body,
@@ -1245,13 +1245,13 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
             // 長さは caller の既定長 (= last_note_duration_beats) に統一。下限 1/16。widget は
-            // song-absolute → model は clip-local (clip_start_beat を引く)。id は handler が採番。
+            // song-absolute → model は clip-local (clip_origin_beat を引く)。id は handler が採番。
             let insert_len = view.default_note_len_beats.max(0.0625);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::AddNote {
                     track: target.track,
                     clip: target.clip,
-                    start_beat: start_beat - clip_start_beat,
+                    start_beat: start_beat - clip_origin_beat,
                     duration: insert_len,
                     pitch,
                 });
@@ -1509,12 +1509,12 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             let (start_beat, len_beats, pitch) =
                 note_create_geometry(&nc, view, beat_per_px, zoom_x_px_per_beat);
             // widget が決めた長さ (即放し=既定長 / ドラッグ=ドラッグ長) を尊重する。id は handler が採番。
-            // song-absolute → model は clip-local (clip_start_beat を引く)。
+            // song-absolute → model は clip-local (clip_origin_beat を引く)。
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::AddNote {
                     track: target.track,
                     clip: target.clip,
-                    start_beat: start_beat - clip_start_beat,
+                    start_beat: start_beat - clip_origin_beat,
                     duration: len_beats,
                     pitch,
                 });
@@ -1762,7 +1762,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         }
 
         // ノート paste の配置位置。grid 上のポインタを **clip-local** snapped beat にして毎フレーム
-        // mirror。view.start_beat は song-absolute なので clip_start_beat を引いて clip-local に変換 (grid 外は None)。
+        // mirror。view.start_beat は song-absolute なので clip_origin_beat を引いて clip-local に変換 (grid 外は None)。
         let hover_beat: Option<f64> = ui.pointer().pos.and_then(|(px, py)| {
             if !grid.contains(px, py) {
                 return None;
@@ -1772,9 +1772,9 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             let cfg = snap::piano_roll_snap_config(app);
             let alt = ui.pointer().modifiers.alt;
             let snapped = cfg.snap_beat(beat_raw, alt, app.pianoroll_zoom_x());
-            Some(snapped - clip_start_beat)
+            Some(snapped - clip_origin_beat)
         });
-        // f キー用に **song-absolute かつ snap なし** の生 beat も mirror (clip_start_beat を引く前)。
+        // f キー用に **song-absolute かつ snap なし** の生 beat も mirror (clip_origin_beat を引く前)。
         let hover_beat_song_raw: Option<f64> = ui.pointer().pos.and_then(|(px, py)| {
             if !grid.contains(px, py) {
                 return None;

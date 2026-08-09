@@ -29,16 +29,18 @@ impl AppData {
         // 入れる。 既に記憶があればその view を復元 (= map をそのまま読む)。
         let Some(key) = self.clip_key_of(target) else { return };
         if !self.ui_prefs.audio_editor_views.contains_key(&key) {
-            let len_beats = self
+            // r.md #44: view は content-local 軸なので、初期 view は clip の窓
+            // (`[content_offset_beats, +length_beats)`) をそのまま全体表示する。
+            let (start_beat, len_beats) = self
                 .song_doc.song()
                 .tracks
                 .get(target.track as usize)
                 .and_then(|t| t.clips.get(target.clip as usize))
-                .map_or(0.0, |c| c.length_beats);
+                .map_or((0.0, 0.0), |c| (c.content_offset_beats, c.length_beats));
             self.ui_prefs.audio_editor_views.insert(
                 key,
                 common::model::AudioEditorViewState {
-                    start_beat: 0.0,
+                    start_beat,
                     len_beats: len_beats.max(0.0),
                 },
             );
@@ -100,12 +102,14 @@ impl AppData {
     pub(crate) fn set_audio_editor_scroll(&mut self, new_start: f64) {
         let Some(target) = self.ui_ephemeral.audio_editor_clip else { return };
         let Some(key) = self.clip_key_of(target) else { return };
-        let Some(total) = self
+        // r.md #44: view は content-local 軸で、clip が見せる窓
+        // `[content_offset_beats, +length_beats)` に clamp する。
+        let Some((min_start, total)) = self
             .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.length_beats.max(0.0))
+            .map(|c| (c.content_offset_beats, c.length_beats.max(0.0)))
         else {
             return;
         };
@@ -116,8 +120,9 @@ impl AppData {
             .map_or(total, |v| v.len_beats)
             .max(0.0)
             .min(total);
-        let max_start = (total - view_len).max(0.0);
-        self.ui_prefs.audio_editor_views.entry(key).or_default().start_beat = new_start.clamp(0.0, max_start);
+        let max_start = min_start + (total - view_len).max(0.0);
+        self.ui_prefs.audio_editor_views.entry(key).or_default().start_beat =
+            new_start.clamp(min_start, max_start);
     }
 
     /// Audio Editor zoom: `view_start_beat` + `view_len_beats` を一括設定。
@@ -126,19 +131,19 @@ impl AppData {
     pub(crate) fn set_audio_editor_zoom(&mut self, new_start: f64, new_len: f64) {
         let Some(target) = self.ui_ephemeral.audio_editor_clip else { return };
         let Some(key) = self.clip_key_of(target) else { return };
-        let Some(total) = self
+        let Some((min_start, total)) = self
             .song_doc.song()
             .tracks
             .get(target.track as usize)
             .and_then(|t| t.clips.get(target.clip as usize))
-            .map(|c| c.length_beats.max(0.0))
+            .map(|c| (c.content_offset_beats, c.length_beats.max(0.0)))
         else {
             return;
         };
         let len = new_len.clamp(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS, total.max(MIN_AUDIO_EDITOR_VIEW_LEN_BEATS));
-        let max_start = (total - len).max(0.0);
+        let max_start = min_start + (total - len).max(0.0);
         let entry = self.ui_prefs.audio_editor_views.entry(key).or_default();
-        entry.start_beat = new_start.clamp(0.0, max_start);
+        entry.start_beat = new_start.clamp(min_start, max_start);
         entry.len_beats = len;
     }
 
@@ -183,8 +188,10 @@ impl AppData {
             // clip.length_beats を必要に応じて拡張 (= 新 event の右端を含むよう
             // に)。 元 length より長くなる場合のみ更新。
             let needed = new_start + src.event_length_beats;
-            if needed > clip.length_beats {
-                clip.length_beats = needed;
+            // r.md #44: `needed` は content-local。 clip の窓の末尾
+            // (`content_offset_beats + length_beats`) を基準に伸ばす。
+            if needed > clip.content_offset_beats + clip.length_beats {
+                clip.length_beats = needed - clip.content_offset_beats;
             }
             Some(insert_at)
         }) else {
@@ -225,8 +232,10 @@ impl AppData {
             let new_start = new_start_beats.max(0.0);
             event.event_start_in_clip_beats = new_start;
             let needed = new_start + event.event_length_beats;
-            if needed > clip.length_beats {
-                clip.length_beats = needed;
+            // r.md #44: `needed` は content-local。 clip の窓の末尾
+            // (`content_offset_beats + length_beats`) を基準に伸ばす。
+            if needed > clip.content_offset_beats + clip.length_beats {
+                clip.length_beats = needed - clip.content_offset_beats;
             }
             true
         });
@@ -333,8 +342,10 @@ impl AppData {
             }
 
             let needed = event.event_start_in_clip_beats + event.event_length_beats;
-            if needed > clip.length_beats {
-                clip.length_beats = needed;
+            // r.md #44: `needed` は content-local。 clip の窓の末尾
+            // (`content_offset_beats + length_beats`) を基準に伸ばす。
+            if needed > clip.content_offset_beats + clip.length_beats {
+                clip.length_beats = needed - clip.content_offset_beats;
             }
             true
         });
@@ -409,8 +420,10 @@ impl AppData {
             audio.events.push(new_event);
             let new_idx = audio.events.len() - 1;
             let needed = position + length_beats;
-            if needed > clip.length_beats {
-                clip.length_beats = needed;
+            // r.md #44: `needed` は content-local。 clip の窓の末尾
+            // (`content_offset_beats + length_beats`) を基準に伸ばす。
+            if needed > clip.content_offset_beats + clip.length_beats {
+                clip.length_beats = needed - clip.content_offset_beats;
             }
             Some(new_idx)
         }) else {

@@ -1202,6 +1202,7 @@ mod tests {
             start_beat: 0.0,
             length_beats: len_beats,
             content_id: cid,
+            content_offset_beats: 0.0,
         });
         lane.next_clip_id = 2;
         song.song_lanes.push(lane);

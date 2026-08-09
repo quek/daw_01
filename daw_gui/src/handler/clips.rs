@@ -8,32 +8,23 @@ use common::model::{AudioContent, AudioEvent, Clip, ClipContent, MidiContent, No
 impl AppData {
     /// Clip の左右端 trim ハンドラ。 caller (arrangement widget) は
     /// `ResizeClipDelta { prev_start, next_start, prev_len, next_len }`
-    /// から `next_start` / `next_len` を直接渡す。 ここで `delta_start =
-    /// new_start_beat - prev_start_beat` を計算し、 audio clip では
-    /// 各 event の clip 内位置 (`event_start_in_clip_beats`) と source 切り
-    /// 出し (`source_start_frames` / `event_length_beats`) を整合させる
-    /// (Bitwig 流 §3.2)。 MIDI clip では既存どおり `start_beat` /
-    /// `length_beats` のみ更新。
+    /// から `next_start` / `next_len` を直接渡す。
     ///
-    /// 左端 trim (delta_start > 0):
-    /// - clip.start_beat += delta_start、 clip.length_beats -= delta_start (= next_len)
-    /// - 各 event: clip 内 beats 軸を維持するため event_start_in_clip_beats
-    ///   から delta_start を引く。 event の絶対位置 (= clip.start_beat +
-    ///   event.event_start_in_clip_beats) は変わらない (= source の同位置を
-    ///   そのまま再生する)
-    /// - delta_start が event の途中に入った場合は event の左端を切り
-    ///   詰める: event_start_in_clip_beats = 0、 event_length_beats を
-    ///   削った分だけ縮める、 source_start_frames を delta_samples 進める
+    /// **r.md #44: trim は clip 側 3 フィールドだけを書き換え、content には一切触れない。**
+    /// clip は共有 content への「窓」 (`[content_offset_beats, +length_beats)`) であり、
+    /// 再生も描画もこの窓で crop する (`docs/plan_clip_content_window.md`)。 これで
+    /// `content_id` を共有する linked clip の開始・終了が完全に独立する。
     ///
-    /// 左端を伸ばす (delta_start < 0): event は単に右へスライド (= source
-    /// は変えない、 clip 先頭の追加範囲は無音)。 source_start_frames を
-    /// 負方向に動かすのは安全でない (source 開始フレームを超えると
-    /// 配列範囲外) ので、 単純な後方スライドのみ。
+    /// - 右端 trim: `length_beats` のみ
+    /// - 左端 trim: `start_beat += δ`, `length_beats -= δ`, `content_offset_beats += δ`
+    ///   (= 中身は song 上の同じ位置に留まり、左端より前が隠れる)
+    /// - 左端を外へ伸ばすと `content_offset_beats` は負にもなる (= 先頭に空白が付く)。
+    ///   content は無傷なので、伸ばし直せば隠れていた中身がそのまま復帰する。
     ///
-    /// 右端 trim (delta_start == 0): length_beats を変え、 audio event は
-    /// `source_end_frames` を event 長に **lockstep** させる (旧実装は
-    /// event 長を clamp するだけで source 窓を動かさず、 波形が clip 幅に
-    /// rubber-band されて「見た目だけ伸縮・音は range」 という矛盾になっていた)。
+    /// 旧実装は audio だけ `source_start/end_frames` を動かして辻褄を合わせていた
+    /// (`trim_audio_event`)。 これは (a) 共有 content を壊すので linked clip を巻き込み、
+    /// (b) warp marker / slice onset を持つ event では source 窓を動かすこと自体が
+    /// 写像を壊す、 の 2 点で誤りだった。
     ///
     /// `stretch == true` (Shift + 端 drag) は trim ではなく
     /// **time-stretch** (= 内容を新 clip 長に伸縮)。 `stretch_clip_content` 参照。
@@ -46,21 +37,27 @@ impl AppData {
     ) {
         let new_length_beats = new_length_beats.max(0.0625);
         let new_start_beat = new_start_beat.max(0.0);
-        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
-        let Some(Some((content_id, prev_start_beat, prev_length_beats))) =
+        let Some(Some((content_id, prev_start_beat, prev_length_beats, new_offset))) =
             self.edit_song(|song| {
                 let track = song.tracks.get_mut(target.track as usize)?;
                 let clip = track.clips.get_mut(target.clip as usize)?;
                 let prev_start_beat = clip.start_beat;
                 let prev_length_beats = clip.length_beats;
+                // 左端の移動量ぶんだけ窓を content 上で進める (右端 drag は δ=0)。
+                let delta_start = new_start_beat - prev_start_beat;
                 clip.start_beat = new_start_beat;
                 clip.length_beats = new_length_beats;
-                Some((clip.content_id, prev_start_beat, prev_length_beats))
+                clip.content_offset_beats += delta_start;
+                Some((
+                    clip.content_id,
+                    prev_start_beat,
+                    prev_length_beats,
+                    clip.content_offset_beats,
+                ))
             })
         else {
             return;
         };
-        let delta_start = new_start_beat - prev_start_beat;
 
         // Shift + 端 drag = time-stretch。 content を新 clip 長に
         // 伸縮し (audio は source 窓固定で event 長変更 + Raw→Stretch 昇格、
@@ -77,124 +74,16 @@ impl AppData {
             return;
         }
 
-        // ---- trim (= 再生範囲を変える) ----
-        // Snapshot の per-source metadata (event ごとに lookup できるよう
-        // immutable borrow を先に切る)。
-        let audio_sources = self.song_doc.song().media.audio_sources.clone();
-        self.edit_song(|song| {
-            if let Some(ClipContent::Audio(audio)) = song.clip_contents.get_mut(&content_id) {
-                for event in &mut audio.events {
-                    Self::trim_audio_event(
-                        event,
-                        delta_start,
-                        prev_length_beats,
-                        new_length_beats,
-                        bpm,
-                        &audio_sources,
-                    );
-                }
-            }
-        });
-
         // overlay clip (image / video / text) は「clip 長 = 表示長」が
-        // 不変条件。 Audio/Midi では no-op、 overlay の末尾 event だけ新 clip 長
-        // まで extend する (extend-only / idempotent / linked clip 安全)。
+        // 不変条件。 Audio/Midi では no-op、 overlay の末尾 event だけ窓の末尾
+        // (`offset + length`) まで extend する (extend-only / idempotent)。
+        // 共有 content を伸ばすが extend-only なので linked clip は自分の窓で
+        // clamp され無害 (`ensure_event_covers_clip` の契約)。
         self.edit_song(|song| {
             if let Some(content) = song.clip_contents.get_mut(&content_id) {
-                content.ensure_event_covers_clip(new_length_beats);
+                content.ensure_event_covers_clip(new_offset + new_length_beats);
             }
         });
-
-    }
-
-    /// trim (= 再生範囲を変える) の 1 audio event 分の追従。 source 窓
-    /// (`source_start/end_frames`) と event 長 (`event_length_beats`) を
-    /// **lockstep** させる (= 現在の frames-per-beat 比を保ったまま窓を動かす)。
-    /// これで (a) 右端を縮めると source_end も縮んで波形が crop 表示になり、
-    /// (b) 左端の出し入れで source_start が往復し、 「波形は伸縮するのに音は
-    /// range だけ変わる」 という #61 の矛盾が解消する (stretch = 比を変える、 とは
-    /// 別物)。 比は event の現値から取るので Raw でも stretch 済 event でも正しい。
-    pub(crate) fn trim_audio_event(
-        event: &mut AudioEvent,
-        delta_start: f64,
-        prev_length_beats: f64,
-        new_length_beats: f64,
-        bpm: f64,
-        sources: &std::collections::HashMap<common::model::AudioSourceId, common::model::AudioSource>,
-    ) {
-        let source = sources.get(&event.source_id);
-        let source_frames = source.map_or(u64::MAX, |s| s.frames);
-        let source_sr = source.map_or(48_000.0, |s| f64::from(s.sample_rate));
-        // 現在の source 窓 / event 長 = frames-per-beat (= trim で保つ比)。
-        // 退化 (0 長 / 0 窓) は native (Raw) rate に fallback。
-        let orig_len = event.event_length_beats;
-        let orig_span = event
-            .source_end_frames
-            .saturating_sub(event.source_start_frames);
-        let fpb = if orig_len > 1e-9 && orig_span > 0 {
-            orig_span as f64 / orig_len
-        } else {
-            source_sr * 60.0 / bpm
-        }
-        .max(1e-9);
-        // この event が clip 右端まで届いているか (= clip の右境界を所有するか)。
-        // 多 event clip で、 clip を伸ばしたとき「右端を所有する event だけ」 を
-        // 伸ばし、 中間 event は長さ据え置き (clip を縮めたときの cut は両者共通)。
-        let reached_end = event.event_start_in_clip_beats + orig_len >= prev_length_beats - 1e-6;
-
-        // --- 左端 ---
-        if delta_start > 0.0 {
-            // 左端を右へ: 絶対位置維持で event_start を手前に。 越えたら head chop。
-            let new_evt_start = event.event_start_in_clip_beats - delta_start;
-            if new_evt_start >= 0.0 {
-                event.event_start_in_clip_beats = new_evt_start;
-            } else {
-                let chopped = -new_evt_start;
-                let chopped_frames = (chopped * fpb).max(0.0) as u64;
-                event.event_start_in_clip_beats = 0.0;
-                event.source_start_frames = event
-                    .source_start_frames
-                    .saturating_add(chopped_frames)
-                    .min(event.source_end_frames);
-            }
-        } else if delta_start < 0.0 {
-            if event.event_start_in_clip_beats <= 1e-9 {
-                // 左端を左へ (spanning event): source head を再露出 (source_start
-                // を戻す)、 source 先頭で頭打ち。 足りない分は無音前置きとして
-                // event をスライド (源より手前は無音)。
-                let reveal = -delta_start;
-                let reveal_frames = (reveal * fpb).max(0.0) as u64;
-                let actual_frames = reveal_frames.min(event.source_start_frames);
-                event.source_start_frames -= actual_frames;
-                let remainder = reveal - actual_frames as f64 / fpb;
-                if remainder > 1e-9 {
-                    event.event_start_in_clip_beats += remainder;
-                }
-            } else {
-                // 前方タイル event は単純後方スライド (source 不変)。
-                event.event_start_in_clip_beats -= delta_start;
-            }
-        }
-
-        // --- 右端: source_end を event 長に lockstep ---
-        // 右端を所有する event は clip 長まで充填 (grow/shrink)、 中間 event は
-        // 長さ据え置き (ただし clip を縮めたら cut)。 いずれも source_end は
-        // 結果長に lockstep するので波形は crop 表示になる (#61)。
-        let max_event_len = (new_length_beats - event.event_start_in_clip_beats).max(0.0);
-        let avail_beats =
-            source_frames.saturating_sub(event.source_start_frames) as f64 / fpb;
-        let desired_len = if reached_end {
-            max_event_len
-        } else {
-            orig_len.min(max_event_len)
-        };
-        let target_len = desired_len.min(avail_beats);
-        event.event_length_beats = target_len;
-        let span_frames = (target_len * fpb).max(0.0) as u64;
-        event.source_end_frames = event
-            .source_start_frames
-            .saturating_add(span_frames)
-            .min(source_frames);
     }
 
     /// Shift + 端 drag = time-stretch。 clip 内容を新 clip 長に伸縮する。
@@ -216,6 +105,17 @@ impl AppData {
         if prev_len <= 1e-9 || new_len <= 1e-9 {
             return;
         }
+        // r.md #44: content 内の位置は **窓の起点** (`content_offset_beats`) 基準で
+        // 出し入れする。 `resize_clip` が先に offset を更新済みなので、ここで読む
+        // `new_off` が新しい窓の起点、`prev_off` が伸縮前の起点。
+        let new_off = self
+            .song_doc
+            .song()
+            .tracks
+            .get(target.track as usize)
+            .and_then(|t| t.clips.get(target.clip as usize))
+            .map_or(0.0, |c| c.content_offset_beats);
+        let prev_off = new_off - (new_start - prev_start);
         // 共有 content は fork してから伸縮 (siblings の length と無関係)。
         let content_id = if self.song_doc.song().clip_content_refcount(content_id) > 1 {
             self.edit_song(|song| {
@@ -243,10 +143,10 @@ impl AppData {
                             prev_len,
                             new_start,
                             new_len,
-                            e.event_start_in_clip_beats,
+                            e.event_start_in_clip_beats - prev_off,
                             e.event_length_beats,
                         );
-                        e.event_start_in_clip_beats = s;
+                        e.event_start_in_clip_beats = new_off + s;
                         e.event_length_beats = l;
                         // ピッチ保持を既定: Raw (= 時間操作しない定義) は Stretch
                         // (granular) へ昇格。 既に Repitch/Stretch/Slice なら維持。
@@ -263,17 +163,17 @@ impl AppData {
                             prev_len,
                             new_start,
                             new_len,
-                            n.start_beat,
+                            n.start_beat - prev_off,
                             n.duration_beats,
                         );
-                        n.start_beat = s;
+                        n.start_beat = new_off + s;
                         n.duration_beats = l;
                     }
                 }
                 other => {
                     // overlay / automation は stretch 概念なし → 長さ追従のみ。
                     if let Some(content) = other {
-                        content.ensure_event_covers_clip(new_len);
+                        content.ensure_event_covers_clip(new_off + new_len);
                     }
                 }
             }
@@ -320,6 +220,8 @@ impl AppData {
             .get(source.clip as usize)?;
         let new_length = src_clip.length_beats;
         let content_id = src_clip.content_id;
+        // trim 済み clip の複製は **同じ窓** を見せる (r.md #44)。
+        let src_offset = src_clip.content_offset_beats;
         let src_color = src_clip.color;
         // mute 状態も複製先へ引き継ぐ (color / 声 と同様)。
         let src_muted = src_clip.muted;
@@ -337,6 +239,7 @@ impl AppData {
                 start_beat: new_start_beat,
                 length_beats: new_length,
                 content_id,
+                content_offset_beats: src_offset,
                 color: src_color,
                 auto_lipsync: false,
                 lipsync_gen: 0,
@@ -366,6 +269,8 @@ impl AppData {
             .get(source.clip as usize)?;
         let new_length = src_clip.length_beats;
         let src_content_id = src_clip.content_id;
+        // content は fork するが窓 (offset) は同じものを見せる。
+        let src_offset = src_clip.content_offset_beats;
         let src_color = src_clip.color;
         // mute 状態も複製先へ引き継ぐ。
         let src_muted = src_clip.muted;
@@ -384,6 +289,7 @@ impl AppData {
                 start_beat: new_start_beat,
                 length_beats: new_length,
                 content_id: new_content_id,
+                content_offset_beats: src_offset,
                 color: src_color,
                 auto_lipsync: false,
                 lipsync_gen: 0,
@@ -471,6 +377,8 @@ impl AppData {
                 // 共有コピー: content_id 流用 → 名前も自動共有。色 (per-clip) は
                 // source の色を引き継ぐ。
                 let content_id = src_clip.content_id;
+                // trim 済み clip の共有コピーは同じ窓を見せる (r.md #44)。
+                let src_offset = src_clip.content_offset_beats;
                 let src_color = src_clip.color;
                 // mute 状態も複製先へ引き継ぐ。
                 let src_muted = src_clip.muted;
@@ -494,6 +402,7 @@ impl AppData {
                     start_beat: drop_start.max(0.0),
                     length_beats: new_length,
                     content_id,
+                    content_offset_beats: src_offset,
                     color: src_color,
                     auto_lipsync: false,
                     lipsync_gen: 0,
@@ -533,6 +442,8 @@ impl AppData {
                 let new_length = src_clip.length_beats;
                 // 独立コピー: content + 名前を fork。色 (per-clip) は source の色を引き継ぐ。
                 let src_content_id = src_clip.content_id;
+                // content は fork するが窓 (offset) は同じものを見せる。
+                let src_offset = src_clip.content_offset_beats;
                 let src_color = src_clip.color;
                 // mute 状態も複製先へ引き継ぐ。
                 let src_muted = src_clip.muted;
@@ -557,6 +468,7 @@ impl AppData {
                     start_beat: drop_start.max(0.0),
                     length_beats: new_length,
                     content_id: new_content_id,
+                    content_offset_beats: src_offset,
                     color: src_color,
                     auto_lipsync: false,
                     lipsync_gen: 0,
@@ -683,6 +595,8 @@ impl AppData {
                 start_beat,
                 length_beats: DEFAULT_CLIP_LENGTH,
                 content_id,
+                // 新規 clip は content 先頭から見せる。
+                content_offset_beats: 0.0,
                 color: None,
                 auto_lipsync: false,
                 lipsync_gen: 0,
@@ -834,8 +748,10 @@ impl AppData {
                     .get(target.track as usize)?
                     .clips
                     .get(target.clip as usize)?;
-                let in_clip = ph - clip.start_beat;
-                (in_clip >= 0.0 && in_clip < clip.length_beats).then_some(in_clip)
+                // r.md #44: Audio Editor の軸は content-local。
+                let in_clip = clip.song_to_content_beat(ph);
+                let (w0, w1) = clip.content_window();
+                (in_clip >= w0 && in_clip < w1).then_some(in_clip)
             });
         let Some(in_clip_beat) = in_clip_beat else {
             self.ui_ephemeral.status_message =
@@ -962,9 +878,14 @@ impl AppData {
         if !(playhead > clip_start && playhead < clip_end) {
             return false; // playhead 範囲外 / 端ぴったりは split 不要
         }
-        let split_offset = playhead - clip_start;
-        let front_len = split_offset;
-        let back_len = clip_len - split_offset;
+        let front_len = playhead - clip_start;
+        let back_len = clip_len - front_len;
+        // content を切る位置は **content-local** 拍 (= 窓の offset ぶん進んだ位置)。
+        // 左端 trim 済み clip では clip-local (`playhead - clip_start`) と一致しない
+        // (r.md #44)。 前半は元の窓 offset をそのまま保ち、 後半 content は
+        // `split_offset` ぶん左シフトして作られるので窓 offset は 0 になる。
+        let src_offset = clip.content_offset_beats;
+        let split_offset = src_offset + front_len;
         let src_content_id = clip.content_id;
         // 名前は content_id 単位 SSoT から取得 (legacy clip.name は v20 で空)。
         let src_name = self.song_doc.song().content_name(src_content_id).to_string();
@@ -1237,6 +1158,8 @@ impl AppData {
             start_beat: clip_start + front_len,
             length_beats: back_len,
             content_id: back_content_id,
+            // 後半 content は split 位置ぶん左シフト済みなので窓は先頭から。
+            content_offset_beats: 0.0,
             color: src_color,
             auto_lipsync: false,
             lipsync_gen: 0,

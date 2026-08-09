@@ -1458,6 +1458,7 @@ mod tests {
                 start_beat: 0.0,
                 length_beats: 16.0,
                 content_id: cid,
+                content_offset_beats: 0.0,
                 color: None,
                 auto_lipsync: false,
                 lipsync_gen: 0,

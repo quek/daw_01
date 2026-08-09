@@ -116,7 +116,15 @@ pub(super) fn render_arrangement_heavy(
                             }
                             // r.md #38: fade は content 種別に依らず全 clip 種別に描く
                             // (音声だけでなく映像 / 画像 / 字幕も同じ見た目)。
-                            draw_clip_fades(hctx, r, c.len_beats, &c.fades, &style_copy);
+                            // r.md #46: fade の色は clip の実塗り色から auto-contrast。
+                            draw_clip_fades(
+                                hctx,
+                                r,
+                                c.len_beats,
+                                &c.fades,
+                                clip_effective_fill(c, t.kind, &style_copy),
+                                &style_copy,
+                            );
                         }
                     }
                 });
@@ -238,6 +246,8 @@ pub(super) fn render_arrangement_heavy(
                                     is_selected,
                                     lanes,
                                     inset,
+                                    // r.md #45: 波形色は実塗り色から auto-contrast。
+                                    clip_effective_fill(c, t.kind, &style_copy),
                                     &style_copy,
                                     "audio_clip_wf",
                                 );

@@ -1468,7 +1468,7 @@
         );
     }
 
-    /// fade in 角 (clip 上端左 12×12) は FadeCornerIn を返す。
+    /// fade in 角 (r.md #46: clip 名帯の **下**、中身領域の上端左 12×12) は FadeCornerIn。
     #[test]
     fn audio_grip_hit_returns_fade_corner_in_at_top_left() {
         let view = test_view();
@@ -1476,14 +1476,21 @@
         let style = ArrangementStyle::default();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
-        // clip rect = (0, 2, 160, 28), top-left 12×12 → cx=6, cy=6 (corner 内)
+        // clip rect = (0, 2, 160, 28)、名前帯 = 14px → 中身領域は y ∈ [16, 30)。
+        // 掴む正方形は (0..12, 16..28) → cx=6, cy=20。
+        assert_eq!(
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 6.0, 20.0, &style),
+            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 }))
+        );
+        // r.md #46: 名前帯の中 (cy=6) はもう掴む場所ではない (クリップ名と重ならない)。
         assert_eq!(
             audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 6.0, 6.0, &style),
-            Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 }))
+            None,
+            "クリップ名の帯に fade の四角が食い込んではいけない"
         );
     }
 
-    /// fade out 角 (clip 上端右 12×12) は FadeCornerOut を返す。
+    /// fade out 角 (中身領域の上端右 12×12) は FadeCornerOut を返す。
     #[test]
     fn audio_grip_hit_returns_fade_corner_out_at_top_right() {
         let view = test_view();
@@ -1491,9 +1498,9 @@
         let style = ArrangementStyle::default();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
-        // clip rect = (0, 2, 160, 28), top-right 12×12 → cx=155, cy=6 (corner 内)
+        // clip rect = (0, 2, 160, 28) → 掴む正方形は (148..160, 16..28) → cx=155, cy=20。
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 155.0, 6.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &make_tops(&tracks, lanes, view), view, lanes, 155.0, 20.0, &style),
             Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerOut { event_index: 0 }))
         );
     }
@@ -1537,6 +1544,7 @@
             anchor_fade: None,
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
+            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (50.0, 14.0),
             // dy = -20 (上に 20 px) → next_db = 0 + (-(-20) * 0.25) = +5.0
             last_mouse: (50.0, -6.0),
@@ -1563,6 +1571,7 @@
             anchor_fade: None,
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 100.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
+            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (50.0, 14.0),
             last_mouse: (50.0, -186.0),
             locked_horizontal: Some(false),
@@ -1591,6 +1600,7 @@
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
+            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (40.0, 0.0),
             locked_horizontal: Some(true),
@@ -1620,6 +1630,7 @@
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
+            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (160.0, 0.0),
             last_mouse: (120.0, 0.0), // dx = -40
             locked_horizontal: Some(true),
@@ -1651,6 +1662,7 @@
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
+            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (400.0, 0.0),
             locked_horizontal: Some(true),
@@ -1680,6 +1692,7 @@
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
+            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (400.0, 0.0), // +10 beat 相当
             locked_horizontal: Some(true),
@@ -1695,6 +1708,67 @@
         }
     }
 
+    // -------- r.md #45 / #46: 可変背景 (clip 色) 上のコントラスト ----------------
+
+    /// 波形色は clip の **実塗り色** から選ぶ。明るい clip では暗い波形、
+    /// 暗い clip では明るい波形になる (固定ブルーだと明 clip 上で沈む = r.md #45)。
+    /// クリップピーク (赤) も同じ規律で明暗を切り替える。
+    #[test]
+    fn waveform_colors_follow_clip_fill_luminance() {
+        let dark_clip = Color::rgb(0.10, 0.12, 0.18);
+        let bright_clip = Color::rgb(0.95, 0.80, 0.35); // 既定パレットのアンバー相当
+        let lane_bg = Color::rgb(0.06, 0.07, 0.09);
+        for selected in [false, true] {
+            let (fg_dark_bg, peak_dark_bg) = waveform_colors_for(dark_clip, lane_bg, selected);
+            let (fg_bright_bg, peak_bright_bg) =
+                waveform_colors_for(bright_clip, lane_bg, selected);
+            let lum = |c: Color| daw_ui_core::color::relative_luminance(c.r, c.g, c.b);
+            assert!(
+                lum(fg_dark_bg) > lum(fg_bright_bg),
+                "暗 clip では明るい波形 / 明 clip では暗い波形 (selected={selected})"
+            );
+            assert!(
+                lum(peak_dark_bg) > lum(peak_bright_bg),
+                "クリップピークも背景輝度で切り替わる (selected={selected})"
+            );
+        }
+    }
+
+    /// fade の前景と裏打ちは **逆極性**。どちらの下地 (clip 色 / 波形) でも縁が立つ。
+    #[test]
+    fn fade_colors_are_opposite_polarity_and_follow_clip_fill() {
+        let style = ArrangementStyle::default();
+        let lane_bg = style.bg;
+        let lum = |c: Color| daw_ui_core::color::relative_luminance(c.r, c.g, c.b);
+
+        let (fg, backing) = fade_colors_for(&style, Color::rgb(0.10, 0.12, 0.18), lane_bg);
+        assert!(lum(fg) > lum(backing), "暗 clip 上は明色の前景 + 暗い裏打ち");
+
+        let (fg2, backing2) = fade_colors_for(&style, Color::rgb(0.95, 0.80, 0.35), lane_bg);
+        assert!(lum(fg2) < lum(backing2), "明 clip 上は暗色の前景 + 明るい裏打ち");
+    }
+
+    /// muted clip は fill が減光されるので、中身の色もその **減光後** の色を基準に選ぶ
+    /// (`clip_effective_fill` が draw と共通の 1 本)。
+    #[test]
+    fn clip_effective_fill_applies_muted_dim() {
+        let style = ArrangementStyle::default();
+        let base = Color::rgb(0.95, 0.80, 0.35);
+        let mut c = fade_clip(1, 0.0, 4.0, "c", ev_fade(4.0, 0.0, 0.0, FadeCurve::Linear, FadeCurve::Linear));
+        c.color = Some(base);
+        c.muted = false;
+        let normal = clip_effective_fill(&c, TrackKind::Audio, &style);
+        c.muted = true;
+        let dimmed = clip_effective_fill(&c, TrackKind::Audio, &style);
+        assert!(dimmed.a < normal.a, "muted は alpha を落として lane 背景を透かす");
+        // 暗い lane 背景に合成した実効色は暗くなる = 中身の色選択もそれに追従する。
+        let eff = |x: Color| {
+            let o = daw_ui_core::color::composite_over(x, style.bg);
+            daw_ui_core::color::relative_luminance(o.r, o.g, o.b)
+        };
+        assert!(eff(dimmed) < eff(normal), "合成後の実効輝度が下がる");
+    }
+
     // -------- r.md #38: fade 幾何 (描画と hit-test の SSoT) ----------------------
 
     /// fade in の線は「event 左端の **下端** (無音、 固定) → fade 末尾の **上端** (フル)」。
@@ -1708,9 +1782,11 @@
             fade: ev_fade(4.0, 1.0, 0.0, FadeCurve::Linear, FadeCurve::Linear),
         };
         let g = fade_geometry(r, 4.0, &f, FadeEdge::In, &style);
+        // r.md #46: fade は clip 名の帯を避けて中身領域 (上インセット 14px) に描く。
+        let content_top = r.y + clip_content_inset_top(&style);
         assert!((g.anchor[0] - r.x).abs() < 1e-4, "無音端は event 左端");
         assert!((g.anchor[1] - (r.y + r.h)).abs() < 1e-4, "無音端は下端");
-        assert!((g.handle[1] - r.y).abs() < 1e-4, "フル端は上端");
+        assert!((g.handle[1] - content_top).abs() < 1e-4, "フル端は中身領域の上端");
         // 1 拍 / 4 拍 * 160px = 40px
         assert!((g.width_px - 40.0).abs() < 1e-3, "got {}", g.width_px);
         assert!((g.handle[0] - 40.0).abs() < 1e-3, "掴む点は fade 末尾へ動く");
@@ -1726,10 +1802,11 @@
             fade: ev_fade(4.0, 0.0, 1.0, FadeCurve::Linear, FadeCurve::Linear),
         };
         let g = fade_geometry(r, 4.0, &f, FadeEdge::Out, &style);
+        let content_top = r.y + clip_content_inset_top(&style);
         assert!((g.anchor[0] - (r.x + r.w)).abs() < 1e-4, "無音端は event 右端");
         assert!((g.anchor[1] - (r.y + r.h)).abs() < 1e-4, "無音端は下端");
         assert!((g.handle[0] - 120.0).abs() < 1e-3, "フル端は右端から 40px 内側");
-        assert!((g.handle[1] - r.y).abs() < 1e-4, "フル端は上端");
+        assert!((g.handle[1] - content_top).abs() < 1e-4, "フル端は中身領域の上端");
     }
 
     /// fade = 0 のとき掴む正方形は event の角に一致する (従来の操作感を保つ)。
@@ -1785,7 +1862,7 @@
         let tops = make_tops(&tracks, lanes, view);
         // clip rect = (0, 2, 160, 28) → 重なった handle_rect は x ∈ [148, 160)
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 152.0, 6.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 152.0, 20.0, &style),
             Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 })),
             "幅のある fade in 側が掴める (幅 0 の fade out に奪われない)"
         );
@@ -1802,14 +1879,14 @@
         let tracks = vec![track(10, "t0", vec![c])];
         let tops = make_tops(&tracks, lanes, view);
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 84.0, 6.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 84.0, 20.0, &style),
             Some((ClipKey { track: 10, clip: 100 }, AudioGripHit::FadeCornerIn { event_index: 0 })),
             "fade 末尾 (80px) の正方形で掴める"
         );
         assert_eq!(
-            audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 6.0, 6.0, &style),
+            audio_grip_hit_in_lanes(&tracks, &tops, view, lanes, 6.0, 20.0, &style),
             None,
-            "clip 左上角はもう掴む場所ではない (fade 末尾へ移動した)"
+            "clip 左端はもう掴む場所ではない (fade 末尾へ移動した)"
         );
     }
 
@@ -1828,6 +1905,7 @@
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
+            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (0.0, -20.0),
             locked_horizontal: Some(false),
@@ -1856,6 +1934,7 @@
             }),
             clip_rect_anchor: Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 },
             clip_len_beats_anchor: 4.0,
+            clip_bg_anchor: daw_ui_renderer::Color::rgb(0.1, 0.1, 0.1),
             anchor_mouse: (0.0, 0.0),
             last_mouse: (3.0, 4.0), // < threshold 10 px
             locked_horizontal: None,

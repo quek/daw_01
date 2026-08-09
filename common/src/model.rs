@@ -190,7 +190,12 @@ pub use track::*;
 /// (ON/OFF + 範囲) を [`LoopRegion`] として session state + [`ViewState::loop_region`]
 /// へ移した (「聴き方の都合」 は dirty を立てないが保存される)。v30 以前の `.daw` は
 /// `project::legacy_song_loop_region` が Song 直下から読み出して移行する。
-pub const CURRENT_VERSION: u32 = 31;
+/// Bumped to `32` (r.md #44 / `docs/plan_clip_content_window.md`): `Clip` /
+/// `AutomationClip` に `content_offset_beats` (= clip が共有 content のどこを
+/// 見せているか) を追加。 端 trim が content を書き換えなくなり、`content_id` を
+/// 共有する linked clip の開始・終了が完全に独立する。v31 以前は `serde(default)` の
+/// `0.0` (= 従来どおり content 先頭から見せる) で読める。
+pub const CURRENT_VERSION: u32 = 32;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -1174,19 +1179,23 @@ impl Song {
         for ti in 0..self.tracks.len() {
             let mut i = 0;
             while i < self.tracks[ti].clips.len() {
-                let (start, len, cid) = {
+                let (start, len, cid, off) = {
                     let c = &self.tracks[ti].clips[i];
-                    (c.start_beat, c.length_beats, c.content_id)
+                    (c.start_beat, c.length_beats, c.content_id, c.content_offset_beats)
                 };
                 if start < beat && beat < start + len {
                     let cut = beat - start;
-                    let right_cid = self.fork_content_shifted_left(cid, cut);
+                    // r.md #44: content を切る位置は content-local (窓 offset ぶん進む)。
+                    // 右断片の content は `cut` ぶん左シフト済なので窓は先頭から。
+                    let right_cid =
+                        self.fork_content_shifted_left(cid, off + cut);
                     let right_id = self.tracks[ti].alloc_clip_id();
                     let mut right = self.tracks[ti].clips[i].clone();
                     right.id = right_id;
                     right.content_id = right_cid;
                     right.start_beat = beat;
                     right.length_beats = len - cut;
+                    right.content_offset_beats = 0.0;
                     self.tracks[ti].clips[i].length_beats = cut;
                     self.tracks[ti].clips.insert(i + 1, right);
                     i += 2;
@@ -1197,13 +1206,13 @@ impl Song {
             for li in 0..self.tracks[ti].automation_lanes.len() {
                 let mut j = 0;
                 while j < self.tracks[ti].automation_lanes[li].clips.len() {
-                    let (start, len, cid) = {
+                    let (start, len, cid, off) = {
                         let c = &self.tracks[ti].automation_lanes[li].clips[j];
-                        (c.start_beat, c.length_beats, c.content_id)
+                        (c.start_beat, c.length_beats, c.content_id, c.content_offset_beats)
                     };
                     if start < beat && beat < start + len {
                         let cut = beat - start;
-                        let right_cid = self.fork_content_shifted_left(cid, cut);
+                        let right_cid = self.fork_content_shifted_left(cid, off + cut);
                         let lane = &mut self.tracks[ti].automation_lanes[li];
                         let right_id = lane.next_clip_id.max(1);
                         lane.next_clip_id = right_id + 1;
@@ -1212,6 +1221,7 @@ impl Song {
                         right.content_id = right_cid;
                         right.start_beat = beat;
                         right.length_beats = len - cut;
+                        right.content_offset_beats = 0.0;
                         lane.clips[j].length_beats = cut;
                         lane.clips.insert(j + 1, right);
                         j += 2;
@@ -1224,13 +1234,13 @@ impl Song {
         for li in 0..self.song_lanes.len() {
             let mut j = 0;
             while j < self.song_lanes[li].clips.len() {
-                let (start, len, cid) = {
+                let (start, len, cid, off) = {
                     let c = &self.song_lanes[li].clips[j];
-                    (c.start_beat, c.length_beats, c.content_id)
+                    (c.start_beat, c.length_beats, c.content_id, c.content_offset_beats)
                 };
                 if start < beat && beat < start + len {
                     let cut = beat - start;
-                    let right_cid = self.fork_content_shifted_left(cid, cut);
+                    let right_cid = self.fork_content_shifted_left(cid, off + cut);
                     let lane = &mut self.song_lanes[li];
                     let right_id = lane.next_clip_id.max(1);
                     lane.next_clip_id = right_id + 1;
@@ -1239,6 +1249,7 @@ impl Song {
                     right.content_id = right_cid;
                     right.start_beat = beat;
                     right.length_beats = len - cut;
+                    right.content_offset_beats = 0.0;
                     lane.clips[j].length_beats = cut;
                     lane.clips.insert(j + 1, right);
                     j += 2;
@@ -1446,13 +1457,15 @@ impl Song {
     /// clip でより短い clip があっても、 その clip は自分の clip 範囲 gate で
     /// clamp されるので安全。 idempotent。 Audio / Midi / Automation は no-op。
     pub fn ensure_overlay_event_coverage(&mut self) {
-        // content ごとに、 それを参照する clip 長の最大値を集める。
+        // content ごとに、 それを参照する clip の **窓の末尾** (content-local) の
+        // 最大値を集める (r.md #44: 左端 trim した clip は content の先の方を見せる)。
         let mut max_len: HashMap<ContentId, f64> = HashMap::new();
         for track in &self.tracks {
             for clip in &track.clips {
                 let e = max_len.entry(clip.content_id).or_insert(0.0);
-                if clip.length_beats > *e {
-                    *e = clip.length_beats;
+                let win_end = clip.content_offset_beats + clip.length_beats;
+                if win_end > *e {
+                    *e = win_end;
                 }
             }
         }
@@ -2116,10 +2129,13 @@ impl Song {
             return false;
         }
         // 2. Raw content を参照する clip の length_beats をスケール (start_beat は固定)。
+        //    r.md #44: 内容窓の起点も content 拍量なので同じ比でスケールする
+        //    (= trim 済み clip でも「窓が content の同じ場所を見せ続ける」)。
         for track in &mut self.tracks {
             for clip in &mut track.clips {
                 if raw_content_ids.contains(&clip.content_id) {
                     clip.length_beats *= ratio;
+                    clip.content_offset_beats *= ratio;
                 }
             }
         }
@@ -2738,6 +2754,14 @@ impl<'de, Ctx> bincode::BorrowDecode<'de, Ctx> for PluginInstance {
 /// の「未採番は serialize しない」に使う。
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+/// serde `skip_serializing_if` 用: `f64` がちょうど 0 か。
+/// `Clip::content_offset_beats` / `AutomationClip::content_offset_beats` の
+/// 「trim していない clip は serialize しない」に使う (既定値と完全一致のときだけ省く
+/// ので、丸め誤差で 0 近傍になった値は素直に書き出す)。
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// (talk) VOICEVOX 読み上げの全体スケール。`ClipContent::Text` clip が VOICEVOX

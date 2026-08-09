@@ -93,9 +93,20 @@ pub struct RenderedEvent {
     pub track_idx: usize,
     pub clip_idx: usize,
     /// First song-beat this event contributes audio at。
+    ///
+    /// **event 自身の時間写像の起点** (source 読み出し / fade はここが 0 点)。
+    /// clip の窓による crop は [`gate_start_beat`](Self::gate_start_beat) 側で行い、
+    /// この値は動かさない (動かすと warp / slice / spectral の写像がずれる)。
     pub start_beat: f64,
     /// Exclusive end song-beat。
     pub end_beat: f64,
+    /// r.md #44: この event を含む clip の窓 (song-absolute 拍) の開始。
+    /// `[gate_start_beat, gate_end_beat)` の外は 1 sample も出力しない。
+    /// linked clip は content を共有するので、鳴る範囲を決めるのは content ではなく
+    /// **この窓** (= clip ごとに独立した開始・終了)。
+    pub gate_start_beat: f64,
+    /// clip の窓の終端 (exclusive、song-absolute 拍)。
+    pub gate_end_beat: f64,
     pub source_id: AudioSourceId,
     pub source_start_frames: u64,
     pub source_end_frames: u64,
@@ -331,13 +342,24 @@ pub fn compile_audio_schedule(
             if clip.muted {
                 continue;
             }
+            // r.md #44: clip は content への窓。 窓 (`[start_beat, +length_beats)`) の
+            // 外にはみ出す event 部分は鳴らさない。 event 自身の時間写像
+            // (`start_beat` 起点の source 読み出し / fade) は **一切動かさず**、
+            // 出力範囲だけを交差させる (source 窓を切り詰めると warp marker /
+            // slice onset / spectral stretch の写像が壊れるため)。
+            let (clip_gate_start, clip_gate_end) = clip.song_window();
             for (event_seq, event) in audio.events.iter().enumerate() {
                 let Some(buffer) = sources.get(&event.source_id) else {
                     continue;
                 };
-                let event_start_beat = clip.start_beat + event.event_start_in_clip_beats;
+                let event_start_beat =
+                    clip.content_to_song_beat(event.event_start_in_clip_beats);
                 let event_end_beat = event_start_beat + event.event_length_beats;
                 if event_end_beat <= event_start_beat {
+                    continue;
+                }
+                // 窓と交差しない event は schedule に載せない。
+                if event_end_beat <= clip_gate_start || event_start_beat >= clip_gate_end {
                     continue;
                 }
                 // 時間軸 (SR 比) と ピッチ軸 (semitone) は直交した 2 量として持ち、
@@ -382,6 +404,8 @@ pub fn compile_audio_schedule(
                     clip_idx,
                     start_beat: event_start_beat,
                     end_beat: event_end_beat,
+                    gate_start_beat: clip_gate_start,
+                    gate_end_beat: clip_gate_end,
                     source_id: event.source_id,
                     source_start_frames: event.source_start_frames,
                     source_end_frames: event.source_end_frames,
@@ -472,10 +496,14 @@ fn count_engines_per_track(schedule: &mut [RenderedEvent]) -> Vec<u16> {
             continue;
         }
         let live = per_track.entry(ev.track_idx).or_default();
+        // r.md #44: 同時発音の判定は **実際に鳴る区間** (= event span ∩ clip の窓)。
+        // 窓で切られて短くなった event に素の span を使うと過大に数えてしまう。
+        let audible_start = ev.start_beat.max(ev.gate_start_beat);
+        let audible_end = ev.end_beat.min(ev.gate_end_beat);
         // 既に終わっている枠を再利用 (= 同時発音数を数える貪欲彩色と同型)。
-        match live.iter().position(|&end| end <= ev.start_beat) {
-            Some(i) => live[i] = ev.end_beat,
-            None if live.len() < MAX_STRETCH_ENGINES_PER_TRACK => live.push(ev.end_beat),
+        match live.iter().position(|&end| end <= audible_start) {
+            Some(i) => live[i] = audible_end,
+            None if live.len() < MAX_STRETCH_ENGINES_PER_TRACK => live.push(audible_end),
             // 上限超過: RT で引き当てに失敗し、エンジン無しで degrade する。
             None => {}
         }
@@ -640,8 +668,15 @@ pub fn render_audio_events(
         // Compute the beat-domain overlap of [event.start_beat, event.end_beat)
         // with the buffer's beat range, then convert to per-buffer sample
         // offsets using `samples_per_beat` (= current_bpm based)。
-        let render_start_beat = event.start_beat.max(playhead_beats);
-        let render_end_beat = event.end_beat.min(buf_end_beats);
+        //
+        // r.md #44: さらに **clip の窓** (`gate_*`) とも交差させる。 event の
+        // 時間写像 (`event.start_beat` 起点) は動かさないので、窓の内側だけが
+        // 鳴り、窓の外は無音になる (= clip の開始・終了が linked clip ごとに独立)。
+        let render_start_beat = event
+            .start_beat
+            .max(playhead_beats)
+            .max(event.gate_start_beat);
+        let render_end_beat = event.end_beat.min(buf_end_beats).min(event.gate_end_beat);
         if render_end_beat <= render_start_beat {
             continue;
         }
@@ -1326,6 +1361,8 @@ mod render_tests {
             clip_idx: 0,
             start_beat: 0.0,
             end_beat: LEN_BEATS,
+            gate_start_beat: f64::NEG_INFINITY,
+            gate_end_beat: f64::INFINITY,
             source_id: 1,
             source_start_frames: 0,
             source_end_frames: source_frames,
@@ -1396,6 +1433,104 @@ mod render_tests {
         }
         // pan 中央 (equal-power × √2) は利得 1.0 に戻る前提を固定する。
         (out_l, out_r)
+    }
+
+    /// r.md #44: clip の窓 (`gate_*`) の外は 1 sample も出さない。 event 自身の
+    /// 時間写像 (`start_beat` 起点の source 読み出し) は変えないので、窓の内側は
+    /// gate 無しのときと **完全に同じ波形** になる。
+    ///
+    /// これが audio 側の「clip の開始・終了」 の実体で、旧実装は gate を持たず
+    /// event 長だけが鳴る範囲を決めていた (= 共有 content を書き換えないと clip 長が
+    /// 効かず、書き換えると linked clip を巻き込む、という袋小路だった)。
+    #[test]
+    fn clip_window_gate_mutes_outside_and_keeps_inside_identical() {
+        let source = Arc::new(ramped_sine_source(ENGINE_SR));
+        let source_frames = source.frames;
+        let samples_per_beat = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
+        let render = |gate: (f64, f64)| -> Vec<f32> {
+            let mut schedule = vec![RenderedEvent {
+                track_idx: 0,
+                clip_idx: 0,
+                start_beat: 0.0,
+                end_beat: LEN_BEATS,
+                gate_start_beat: gate.0,
+                gate_end_beat: gate.1,
+                source_id: 1,
+                source_start_frames: 0,
+                source_end_frames: source_frames,
+                gain_lin: 1.0,
+                pan: 0.0,
+                sr_ratio: sample_rate_ratio(source.sample_rate, ENGINE_SR),
+                pitch_factor: 1.0,
+                pitch_semitones: 0.0,
+                formant_semitones: 0.0,
+                stream_key: 1,
+                needs_engine: false,
+                stretch_ratio: 1.0,
+                nominal_bpm: BPM,
+                fade_in_beats: 0.0,
+                fade_out_beats: 0.0,
+                fade_in_curve: FadeCurve::Linear,
+                fade_out_curve: FadeCurve::Linear,
+                reversed: false,
+                stretch_mode: StretchMode::Raw,
+                onsets: Vec::new(),
+                beat_markers: Vec::new(),
+            }];
+            let engines_per_track = count_engines_per_track(&mut schedule);
+            let mut sources = HashMap::new();
+            sources.insert(1u32, Arc::clone(&source));
+            let renderer = AudioClipRenderer { schedule, sources, engines_per_track };
+            let total = (LEN_BEATS * samples_per_beat) as usize;
+            let mut accum = vec![(u64::MAX, 0.0f64); 4];
+            let mut engines: Vec<StretchEngine> = Vec::new();
+            let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
+            let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
+            let mut render_seq = 0u64;
+            let mut out: Vec<f32> = Vec::with_capacity(total);
+            while out.len() < total {
+                let frames = 512.min(total - out.len());
+                let mut l = vec![0.0f32; frames];
+                let mut r = vec![0.0f32; frames];
+                render_audio_events(
+                    &renderer,
+                    0,
+                    &mut l,
+                    &mut r,
+                    out.len() as f64 / samples_per_beat,
+                    BPM,
+                    ENGINE_SR,
+                    frames as u32,
+                    &mut ClipRenderState {
+                        repitch_accum: &mut accum,
+                        engines: &mut engines,
+                        event_l: &mut event_l,
+                        event_r: &mut event_r,
+                        render_seq: &mut render_seq,
+                    },
+                );
+                out.extend_from_slice(&l);
+            }
+            out
+        };
+
+        let full = render((f64::NEG_INFINITY, f64::INFINITY));
+        // 窓を [1 拍, 2 拍) に狭める (= clip を左右から trim した状態)。
+        let gated = render((1.0, 2.0));
+        let one = samples_per_beat as usize;
+        assert!(
+            gated[..one].iter().all(|s| *s == 0.0),
+            "窓より前は無音でなければならない"
+        );
+        assert!(
+            gated[2 * one..].iter().all(|s| *s == 0.0),
+            "窓より後は無音でなければならない"
+        );
+        assert_eq!(
+            &gated[one..2 * one],
+            &full[one..2 * one],
+            "窓の内側は gate 無しと 1 sample も違わない (= source 窓を動かしていない証拠)"
+        );
     }
 
     /// Goertzel: `freq` 成分の振幅。
@@ -1608,6 +1743,8 @@ mod render_tests {
             clip_idx: 0,
             start_beat: start,
             end_beat: end,
+            gate_start_beat: f64::NEG_INFINITY,
+            gate_end_beat: f64::INFINITY,
             source_id: 1,
             source_start_frames: 0,
             source_end_frames: 48_000,
@@ -1909,6 +2046,8 @@ mod render_tests {
             clip_idx: 0,
             start_beat: 0.0,
             end_beat: LEN_BEATS,
+            gate_start_beat: f64::NEG_INFINITY,
+            gate_end_beat: f64::INFINITY,
             source_id: 1,
             source_start_frames: 0,
             source_end_frames: source_frames,
@@ -2159,6 +2298,8 @@ mod wave_span_binding_tests {
             clip_idx: 0,
             start_beat: 0.0,
             end_beat: event.event_length_beats,
+            gate_start_beat: f64::NEG_INFINITY,
+            gate_end_beat: f64::INFINITY,
             source_id: 1,
             source_start_frames: event.source_start_frames,
             source_end_frames: event.source_end_frames,
@@ -2685,6 +2826,7 @@ mod wave_span_binding_tests {
             start_beat: 0.0,
             length_beats: len_beats,
             content_id: cid,
+            content_offset_beats: 0.0,
         });
         lane.next_clip_id = 2;
         song.song_lanes.push(lane);

@@ -5,6 +5,92 @@ use crate::state::*;
 use crate::app_types::*;
 use common::model::{AudioContent, AudioEvent, Clip, ClipContent, MidiContent, Note};
 
+/// r.md #44: audio event を clip の内容窓 `[win_start, win_end)` (content-local 拍) で
+/// 切り出す。 窓と交差しなければ `None`。
+///
+/// Glue は複数 clip を **1 つの新しい content へ焼き込む** 破壊的操作なので、ここでは
+/// 「鳴っている範囲」 をそのまま新 event として作り直す必要がある (窓は clip 側に残せない)。
+/// 頭を落とす分は現在の frames-per-beat 比で `source_start_frames` を進める線形近似
+/// (= split の straddle 処理と同じ規約)。 warp marker / slice を持つ event では近似だが、
+/// Glue 自体が content を flat 化する操作なのでここが唯一の妥協点になる。
+fn crop_audio_event(ev: &AudioEvent, win_start: f64, win_end: f64) -> Option<AudioEvent> {
+    let e0 = ev.event_start_in_clip_beats;
+    let e1 = e0 + ev.event_length_beats;
+    let c0 = e0.max(win_start);
+    let c1 = e1.min(win_end);
+    if c1 <= c0 {
+        return None;
+    }
+    let mut out = ev.clone();
+    let span = ev.source_end_frames.saturating_sub(ev.source_start_frames);
+    // 頭落とし: source を進める (event 長 → source frame の現在比を保つ)。
+    if c0 > e0 && ev.event_length_beats > 1e-9 && span > 0 {
+        let frac = (c0 - e0) / ev.event_length_beats;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        let advance = (span as f64 * frac).max(0.0) as u64;
+        out.source_start_frames = ev
+            .source_start_frames
+            .saturating_add(advance)
+            .min(ev.source_end_frames);
+        // 頭を落とした分だけ fade in は消費済み。
+        out.fade_in_beats = (ev.fade_in_beats - (c0 - e0)).max(0.0);
+    }
+    // 尻切り: source 窓を新しい長さへ lockstep。
+    if c1 < e1 && ev.event_length_beats > 1e-9 && span > 0 {
+        let kept = (c1 - c0) / ev.event_length_beats;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        let keep_frames = (span as f64 * kept).max(0.0) as u64;
+        out.source_end_frames = out
+            .source_start_frames
+            .saturating_add(keep_frames)
+            .min(ev.source_end_frames);
+        out.fade_out_beats = (ev.fade_out_beats - (e1 - c1)).max(0.0);
+    }
+    out.event_start_in_clip_beats = c0;
+    out.event_length_beats = c1 - c0;
+    Some(out)
+}
+
+/// [`crop_audio_event`] の video 版 (source 軸が micro 秒)。
+fn crop_video_event(
+    ev: &common::model::VideoEvent,
+    win_start: f64,
+    win_end: f64,
+) -> Option<common::model::VideoEvent> {
+    let e0 = ev.event_start_in_clip_beats;
+    let e1 = e0 + ev.event_length_beats;
+    let c0 = e0.max(win_start);
+    let c1 = e1.min(win_end);
+    if c1 <= c0 {
+        return None;
+    }
+    let mut out = ev.clone();
+    let span = ev.source_end_micros.saturating_sub(ev.source_start_micros);
+    if c0 > e0 && ev.event_length_beats > 1e-9 && span > 0 {
+        let frac = (c0 - e0) / ev.event_length_beats;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        let advance = (span as f64 * frac).max(0.0) as u64;
+        out.source_start_micros = ev
+            .source_start_micros
+            .saturating_add(advance)
+            .min(ev.source_end_micros);
+        out.fade_in_beats = (ev.fade_in_beats - (c0 - e0)).max(0.0);
+    }
+    if c1 < e1 && ev.event_length_beats > 1e-9 && span > 0 {
+        let kept = (c1 - c0) / ev.event_length_beats;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        let keep_micros = (span as f64 * kept).max(0.0) as u64;
+        out.source_end_micros = out
+            .source_start_micros
+            .saturating_add(keep_micros)
+            .min(ev.source_end_micros);
+        out.fade_out_beats = (ev.fade_out_beats - (e1 - c1)).max(0.0);
+    }
+    out.event_start_in_clip_beats = c0;
+    out.event_length_beats = c1 - c0;
+    Some(out)
+}
+
 impl AppData {
     /// Glue (Consolidate) the currently selected clips into one clip
     /// per track. Mixed-kind selections (MIDI + Audio etc.) are
@@ -146,23 +232,40 @@ impl AppData {
                 else {
                     continue;
                 };
-                let offset_into_combined = s - combined_start;
+                // r.md #44: clip は content への「窓」なので、
+                // (a) content-local 拍 → combined-local 拍の換算は clip 開始ではなく
+                //     **content 原点** (`content_origin_beat`) 基準、
+                // (b) 窓の外の note / event は **鳴っていない**ので glue にも含めない。
+                // これで左端 trim 済み clip を glue しても、隠れていた中身が復活しない。
+                let (win_start, win_end) = clip.content_window();
+                let offset_into_combined = clip.content_origin_beat() - combined_start;
                 match content {
                     ClipContent::Midi(midi) => {
                         for note in &midi.notes {
+                            // sequencer と同じ gate: 発音開始が窓内の note だけ、
+                            // 長さは窓末尾で clamp (= 実際に鳴っている姿)。
+                            if note.start_beat < win_start || note.start_beat >= win_end {
+                                continue;
+                            }
+                            let dur = note
+                                .duration_beats
+                                .min(win_end - note.start_beat)
+                                .max(0.0);
                             frags.midi_notes.push(Note {
                                 start_beat: note.start_beat + offset_into_combined,
+                                duration_beats: dur,
                                 ..note.clone()
                             });
                         }
                     }
                     ClipContent::Audio(audio) => {
                         for ev in &audio.events {
-                            frags.audio_events.push(AudioEvent {
-                                event_start_in_clip_beats: ev.event_start_in_clip_beats
-                                    + offset_into_combined,
-                                ..ev.clone()
-                            });
+                            let Some(mut cropped) = crop_audio_event(ev, win_start, win_end)
+                            else {
+                                continue;
+                            };
+                            cropped.event_start_in_clip_beats += offset_into_combined;
+                            frags.audio_events.push(cropped);
                         }
                     }
                     // Same as the split path above: an Automation
@@ -175,10 +278,18 @@ impl AppData {
                     // event_start を offset するだけ。
                     ClipContent::Image(image) => {
                         for ev in &image.events {
+                            // image は時間軸 source を持たないので、窓との交差で
+                            // 表示区間を切るだけ。
+                            let e0 = ev.event_start_in_clip_beats.max(win_start);
+                            let e1 = (ev.event_start_in_clip_beats
+                                + ev.event_length_beats)
+                                .min(win_end);
+                            if e1 <= e0 {
+                                continue;
+                            }
                             frags.image_events.push(common::model::ImageEvent {
-                                event_start_in_clip_beats: ev
-                                    .event_start_in_clip_beats
-                                    + offset_into_combined,
+                                event_start_in_clip_beats: e0 + offset_into_combined,
+                                event_length_beats: e1 - e0,
                                 ..ev.clone()
                             });
                         }
@@ -190,12 +301,12 @@ impl AppData {
                     // combined timeline.
                     ClipContent::Video(video) => {
                         for ev in &video.events {
-                            frags.video_events.push(common::model::VideoEvent {
-                                event_start_in_clip_beats: ev
-                                    .event_start_in_clip_beats
-                                    + offset_into_combined,
-                                ..ev.clone()
-                            });
+                            let Some(mut cropped) = crop_video_event(ev, win_start, win_end)
+                            else {
+                                continue;
+                            };
+                            cropped.event_start_in_clip_beats += offset_into_combined;
+                            frags.video_events.push(cropped);
                         }
                     }
                     // Text clip Glue は後 commit で実装。 abort 済み
@@ -302,6 +413,8 @@ impl AppData {
                     start_beat: combined_start,
                     length_beats: combined_len,
                     content_id: new_content_id,
+                    // 結合 content は combined_start を原点に組み直したので窓は先頭から。
+                    content_offset_beats: 0.0,
                     color: None,
                     auto_lipsync: false,
                     lipsync_gen: 0,

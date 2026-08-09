@@ -226,7 +226,8 @@ impl AppData {
         let Some(clip) = track.clips.get(r.clip as usize) else {
             return;
         };
-        let clip_start_beat = clip.start_beat;
+        // r.md #44: note は content-local なので song-absolute 化は content 原点基準。
+        let clip_start_beat = clip.content_origin_beat();
         // immutable borrow で snap 計算を済ませてから可変借用に切り替える
         // (= borrow checker 衝突回避)。 `Song::clip_notes` は `Clip` を経由する
         // shared note 取得 helper、 mutable 版は `notes_in_clip_mut`。
@@ -303,7 +304,7 @@ impl AppData {
                 .tracks
                 .get(track_idx as usize)
                 .and_then(|t| t.clips.get(clip_idx as usize))
-                .map(|c| c.start_beat)
+                .map(common::model::Clip::content_origin_beat)
                 .unwrap_or(0.0);
             let global_beat = clip_start_beat + start_beat;
             self.song_doc.song()

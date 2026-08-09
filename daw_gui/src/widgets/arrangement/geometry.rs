@@ -87,7 +87,19 @@ pub(super) fn fade_geometry(
     let ew = ((fade.fade.len_beats * px_per_beat) as f32)
         .max(0.0)
         .min(clip_rect.x + clip_rect.w - ex);
-    let event_rect = Rect { x: ex, y: clip_rect.y, w: ew.max(0.0), h: clip_rect.h };
+    // r.md #46: fade は clip 名の帯を避けて **中身の領域** (波形 / MIDI プレビューと
+    // 同じインセット) に描く。 掴む正方形が clip 名に重なって読めなくなるのを防ぐ
+    // (Ableton / Bitwig と同じ「ヘッダ帯の下」 配置)。 描画と hit-test の SSoT は
+    // この関数 1 本なので、ここで下げれば掴む位置も同時に追従する。
+    // 中身領域が取れないほど低い行 (= 名前帯だけで埋まる) では従来どおり clip 全高を
+    // 使い、掴む場所が消えないようにする。
+    let inset_top = crate::widgets::arrangement::draw::clip_content_inset_top(style);
+    let (ey, eh) = if clip_rect.h - inset_top >= style.audio_fade_corner_size_px {
+        (clip_rect.y + inset_top, clip_rect.h - inset_top)
+    } else {
+        (clip_rect.y, clip_rect.h)
+    };
+    let event_rect = Rect { x: ex, y: ey, w: ew.max(0.0), h: eh.max(0.0) };
 
     let fade_beats = match edge {
         FadeEdge::In => fade.fade.fade_in_beats,

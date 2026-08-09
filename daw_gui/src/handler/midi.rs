@@ -191,8 +191,12 @@ impl AppData {
         else {
             return;
         };
-        let cursor = if cursor >= clip.length_beats {
-            0.0
+        // r.md #44: step カーソルは content-local。 clip が見せている窓
+        // `[offset, offset + length)` の中を進み、外れたら窓の先頭へ戻す
+        // (`selected_clip` 切替時の 0 初期化も窓外なのでここで吸収される)。
+        let (win_start, win_end) = clip.content_window();
+        let cursor = if cursor < win_start || cursor >= win_end {
+            win_start
         } else {
             cursor
         };
@@ -265,9 +269,11 @@ impl AppData {
             else {
                 continue;
             };
-            let clip_start =
-                self.song_doc.song().tracks[track_idx].clips[clip_idx].start_beat;
-            let local_start = playhead - clip_start;
+            // r.md #44: note は content-local なので、原点 (= clip 開始 - 窓 offset)
+            // を引いて local 化する。
+            let clip_origin = self.song_doc.song().tracks[track_idx].clips[clip_idx]
+                .content_origin_beat();
+            let local_start = playhead - clip_origin;
             self.edit_song(|song| {
                 if let Some(content) = midi_content_in_clip_mut(song, track_idx, clip_idx) {
                     // v29: 録音で入る note も allocator で安定 id を採番。
@@ -324,9 +330,9 @@ impl AppData {
             else {
                 continue;
             };
-            let clip_start =
-                self.song_doc.song().tracks[track_idx].clips[clip_idx].start_beat;
-            let local_start = start - clip_start;
+            let clip_origin = self.song_doc.song().tracks[track_idx].clips[clip_idx]
+                .content_origin_beat();
+            let local_start = start - clip_origin;
             let length = (playhead - start).max(0.05);
             self.edit_song(|song| {
                 if let Some(notes) = song.notes_in_clip_mut(track_idx, clip_idx)

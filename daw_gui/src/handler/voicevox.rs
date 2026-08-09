@@ -347,7 +347,8 @@ impl AppData {
                         // clip-relative beats を song-absolute に変換 (=
                         // VOICEVOX synth wrapper が earliest を引いて
                         // 0 起点にする、 clip 境界跨ぎでも一貫)。
-                        start_beat: clip.start_beat + n.start_beat,
+                        // r.md #44: note は content-local → content 原点基準で song 化。
+                        start_beat: clip.content_to_song_beat(n.start_beat),
                         duration_beats: n.duration_beats,
                         pitch: n.pitch,
                         velocity: n.velocity,
@@ -385,7 +386,7 @@ impl AppData {
                             clip.id,
                             event_index as u32,
                         ),
-                        start_beat: clip.start_beat + ev.event_start_in_clip_beats,
+                        start_beat: clip.content_to_song_beat(ev.event_start_in_clip_beats),
                         text: ev.text.clone(),
                         speaker_id: clip.speaker_id,
                         speed_scale: scales.speed_scale,
@@ -472,8 +473,11 @@ impl AppData {
                     .filter(|n| common::voicevox::sing_base_beat(n).is_some())
                 {
                     // sing: clip 位置 + build_sing_query が読む note フィールドのみ。
+                    // r.md #44: 窓 (offset) も配置に効くので fingerprint に含める
+                    // (含めないと端 trim しても口パクが再生成されない)。
                     clip.start_beat.to_bits().hash(&mut h);
                     clip.length_beats.to_bits().hash(&mut h);
+                    clip.content_offset_beats.to_bits().hash(&mut h);
                     for n in notes {
                         n.start_beat.to_bits().hash(&mut h);
                         n.duration_beats.to_bits().hash(&mut h);
@@ -487,6 +491,7 @@ impl AppData {
                     // talk: clip 位置 + 先頭の非空 TextEvent + 声 + 話速のみ。
                     clip.start_beat.to_bits().hash(&mut h);
                     clip.length_beats.to_bits().hash(&mut h);
+                    clip.content_offset_beats.to_bits().hash(&mut h);
                     ev.text.hash(&mut h);
                     ev.event_start_in_clip_beats.to_bits().hash(&mut h);
                     clip.speaker_id.hash(&mut h);
@@ -566,7 +571,7 @@ impl AppData {
                         if closed_id != 0 && ev.source_id == closed_id {
                             continue;
                         }
-                        let s = clip.start_beat + ev.event_start_in_clip_beats;
+                        let s = clip.content_to_song_beat(ev.event_start_in_clip_beats);
                         let e = s + ev.event_length_beats;
                         if e > s {
                             spans.push((s, e, ev.source_id, i as u32));
@@ -666,9 +671,11 @@ impl AppData {
                     .and_then(|c| c.notes())
                     && let Some(base) = common::voicevox::sing_base_beat(notes)
                 {
+                    // r.md #44: phoneme は content-local 起点なので原点基準で置き、
+                    // 長さの上限は窓の末尾 (content-local) にする。
                     snaps.push((
-                        clip.start_beat,
-                        clip.length_beats,
+                        clip.content_origin_beat(),
+                        clip.content_offset_beats + clip.length_beats,
                         common::voicevox::sing_head_beat(base, bpm),
                         priority,
                         notes.to_vec(),
@@ -692,8 +699,8 @@ impl AppData {
                         bpm,
                     );
                     talk_snaps.push((
-                        clip.start_beat,
-                        clip.length_beats,
+                        clip.content_origin_beat(),
+                        clip.content_offset_beats + clip.length_beats,
                         ev.event_start_in_clip_beats - pre_beats,
                         priority,
                         ev.text.clone(),
@@ -1014,8 +1021,8 @@ mod rebuild_mouth_clip_tests {
             .iter()
             .map(|e| {
                 (
-                    clip.start_beat + e.event_start_in_clip_beats,
-                    clip.start_beat + e.event_start_in_clip_beats + e.event_length_beats,
+                    clip.content_to_song_beat(e.event_start_in_clip_beats),
+                    clip.content_to_song_beat(e.event_start_in_clip_beats) + e.event_length_beats,
                     e.source_id,
                 )
             })
@@ -1147,7 +1154,7 @@ mod rebuild_mouth_clip_tests {
                 .iter()
                 .filter(|e| e.source_id != 99)
                 .map(|e| {
-                    let s = clip.start_beat + e.event_start_in_clip_beats;
+                    let s = clip.content_to_song_beat(e.event_start_in_clip_beats);
                     (s, s + e.event_length_beats, e.source_id)
                 })
                 .collect()
