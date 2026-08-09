@@ -37,22 +37,36 @@ const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 /// temp ファイル名のユニーク化カウンタ (同プロセス内の並行 put 衝突回避)。
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 歌唱合成のキャッシュキー = `hash(query_json, singer_id)`。 query は
+/// キャッシュキーの世代。**合成 wav の中身を決める定義を変えたら必ず +1 する**
+/// (query 文字列や scales に現れない変更 — engine へ注入するパラメータ、WAV の
+/// 後処理など — は key に自然には反映されないため)。旧 wav を黙って掴んで
+/// 「直したのに変わらない」という誤診に直結する (r.md #39)。
+///
+/// - 1: 初期
+/// - 2: r.md #39 — talk に `prePhonemeLength = 0` を注入 (先頭無音を消す)
+const CACHE_SCHEMA_VERSION: u32 = 2;
+
+/// 歌唱合成のキャッシュキー = `hash(schema, query_json, singer_id)`。 query は
 /// `build_sing_query` の出力 (= notes の pitch / frame_length / lyric + bpm が
 /// 畳み込まれた決定的な文字列)。 base_beat 相対なので clip の絶対位置に依存しない。
 pub fn key_for_sing(query_json: &str, singer_id: u32) -> CacheKey {
     let mut h = DefaultHasher::new();
     "sing".hash(&mut h);
+    CACHE_SCHEMA_VERSION.hash(&mut h);
     query_json.hash(&mut h);
     singer_id.hash(&mut h);
     h.finish()
 }
 
-/// 読み上げ合成のキャッシュキー = `hash(text, speaker_id, scales)`。 talk wav は
-/// `/audio_query` + scales patch + `/synthesis` の決定的な結果。
+/// 読み上げ合成のキャッシュキー = `hash(schema, text, speaker_id, scales, pre)`。 talk wav は
+/// `/audio_query` + params patch + `/synthesis` の決定的な結果。patch で注入する
+/// `prePhonemeLength` は text / scales に現れないので明示的に混ぜる (これが無いと
+/// 先頭無音付きの旧 wav が hit して修正が効かない — r.md #39)。
 pub fn key_for_talk(text: &str, speaker_id: u32, scales: &TalkParams) -> CacheKey {
     let mut h = DefaultHasher::new();
     "talk".hash(&mut h);
+    CACHE_SCHEMA_VERSION.hash(&mut h);
+    common::voicevox::TALK_PRE_PHONEME_LENGTH.to_bits().hash(&mut h);
     text.hash(&mut h);
     speaker_id.hash(&mut h);
     // f32 は Hash を実装しないので bit pattern を hash (NaN は VOICEVOX scale に

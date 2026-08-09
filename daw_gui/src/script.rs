@@ -327,10 +327,12 @@ impl ScriptHost {
                 .iter()
                 .map(|pid| self.plugin_latencies.get(pid).copied().unwrap_or(0))
                 .sum();
-            if let Some(t) = song.tracks.iter_mut().find(|t| t.id == *track_id)
-                && t.reported_latency_samples != total
+            // r.md #39: master fx (MASTER_TRACK_ID) も sentinel 分岐付き accessor で
+            // 書き戻す (旧 `tracks` 線形探索では master 分が黙って捨てられていた)。
+            if let Some(slot) = song.reported_latency_mut(*track_id)
+                && *slot != total
             {
-                t.reported_latency_samples = total;
+                *slot = total;
                 changed = true;
             }
         }
@@ -343,6 +345,12 @@ impl ScriptHost {
                 t.reported_latency_samples = 0;
                 changed = true;
             }
+        }
+        if !track_ids_with_plugins.contains(&common::model::MASTER_TRACK_ID)
+            && song.master_reported_latency_samples != 0
+        {
+            song.master_reported_latency_samples = 0;
+            changed = true;
         }
         if changed {
             // v29: Song を受けるのは daw_audio のみ (plugin_host は order-free
@@ -879,8 +887,11 @@ fn daw_set_track_latency(
             .ok_or_else(|| anyhow!(
                 "setTrackLatency requires loadSongFromObject to have been called first"
             ))?;
-        if let Some(t) = song.track_by_id_mut(track_id) {
-            t.reported_latency_samples = samples;
+        // r.md #39 同件: `track_by_id_mut` だと `MASTER_TRACK_ID` を渡したときに
+        // 黙って捨てられ、master fx の latency を注入する headless テストが
+        // 「何も起きていないのに pass」する。sentinel 分岐付き accessor で通す。
+        if let Some(slot) = song.reported_latency_mut(track_id) {
+            *slot = samples;
         }
         // v29: Song は daw_audio のみが受ける (plugin_host に LoadSong は無い)。
         let cloned = song.clone();

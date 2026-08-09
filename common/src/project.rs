@@ -1336,6 +1336,7 @@ mod tests {
                 content_id: cid,
                 color: None,
                 auto_lipsync: false,
+                lipsync_gen: 0,
                 muted: false,
                 speaker_id: 3061,
                 singer_name: "中国うさぎ".into(),

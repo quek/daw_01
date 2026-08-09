@@ -783,9 +783,16 @@ impl LocalState {
                     &mut self.master_l[..n],
                     &mut self.master_r[..n],
                     n,
-                    elapsed,
+                    // r.md #39: count-in の click も本再生と **同じ時間軸** に載せる。
+                    // 補償しないと count-in 最終拍と曲 1 拍目の間隔だけが
+                    // 「1 拍 + master_latency」に伸び、録音のダウンビートでつんのめる。
+                    // 揃える相手は count-in 中の音ではなく直後に続く曲の click / 音。
+                    elapsed as i64
+                        - i64::from(self.cached_schedule.master_latency_samples),
                     sample_rate,
-                    bpm,
+                    // count-in は曲の tempo map ではなく定テンポ (preroll 長も
+                    // `bars * time_sig` 拍で決まっている)。
+                    &crate::metronome::ClickGrid::Fixed { bpm },
                     tsig_num,
                 );
             }
@@ -954,16 +961,28 @@ impl LocalState {
             // metronome click を master mix に重ねる (monitoring 専用 — export
             // 経路には存在しない)。 master mix の最後に重ねる (= track の mute /
             // solo / volume / master fx の影響を受けない「常に聞こえる guide」)。
+            //
+            // r.md #39: click の参照位置から **master の PDC 遅延** を引く。 track の音は
+            // 遅延プラグイン (linear-phase EQ 等) の分だけ遅れて master に届くのに、 click
+            // だけ生の playhead で重ねると click が先行して拍の基準に使えなくなる
+            // (REAPER / Ardour もメトロノームを遅延補償の対象にする)。 補償後の位置は曲頭
+            // 付近で負になるので符号付きで渡す (0 クランプすると 1 拍目を毎 buffer 再 trigger
+            // してしまう)。
             if playing && metronome_enabled {
                 let tsig_num = i64::from(song.time_sig.0.max(1));
+                let click_pos = playhead as i64
+                    - i64::from(self.cached_schedule.master_latency_samples);
                 render_metronome(
                     &mut self.metronome_voice,
                     &mut self.master_l[..n],
                     &mut self.master_r[..n],
                     n,
-                    playhead,
+                    click_pos,
                     sample_rate,
-                    current_bpm,
+                    // r.md #39: 拍境界は tempo map (SongTempo automation 積分済み) で
+                    // 求める。瞬間 bpm × sample の等間隔グリッドだと、テンポ変更以降の
+                    // click が clip / note (playhead_beats 基準) と別グリッドに載る。
+                    &crate::metronome::ClickGrid::Song(&self.tempo_map),
                     tsig_num,
                 );
             }

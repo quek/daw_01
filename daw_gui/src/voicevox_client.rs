@@ -11,7 +11,8 @@ use anyhow::{Context, Result};
 
 use common::model::{Note, TalkParams};
 use common::voicevox::{
-    FRAME_RATE, Phoneme, QUERY_SPEAKER, VOICEVOX_URL, build_sing_query, urlencoding_encode,
+    FRAME_RATE, Phoneme, QUERY_SPEAKER, VOICEVOX_URL, build_sing_query, talk_pre_silence_frames,
+    urlencoding_encode,
 };
 
 /// `/singers` レスポンスの 1 entry。 1 キャラクターと、 そのスタイル (= sing 用 style id 群)。
@@ -84,12 +85,12 @@ fn fetch_voices(path: &str) -> anyhow::Result<Vec<VoiceVoxSinger>> {
 /// beat への配置は `common::lipsync` 側で行う。
 pub fn query_phonemes(notes: &[Note], bpm: f32) -> Result<Vec<Phoneme>> {
     let client = reqwest::blocking::Client::new();
-    let query_json = build_sing_query(notes, bpm);
+    let query = build_sing_query(notes, bpm);
     let url = format!("{VOICEVOX_URL}/sing_frame_audio_query?speaker={QUERY_SPEAKER}");
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
-        .body(query_json)
+        .body(query.json)
         .send()
         .context("sing_frame_audio_query request failed")?;
     let status = resp.status();
@@ -154,10 +155,15 @@ pub fn query_talk_phonemes(
     parse_talk_phonemes(&body, scales.speed_scale)
 }
 
-/// `/audio_query` 応答 JSON (`accent_phrases[].moras[]` + pre/post phoneme length + pause_mora)
+/// `/audio_query` 応答 JSON (`accent_phrases[].moras[]` + post phoneme length + pause_mora)
 /// を `Vec<Phoneme>` へ変換する純粋関数。各モーラは子音 (あれば) + 母音の 2 phoneme に展開し、
-/// 長さ (秒) を `FRAME_RATE` × `1/speed` で frame へ。先頭に `prePhonemeLength`、末尾に
-/// `postPhonemeLength` 由来の `pau` を置く。
+/// 長さ (秒) を `FRAME_RATE` × `1/speed` で frame へ。末尾に `postPhonemeLength` 由来の
+/// `pau` を置く。
+///
+/// 先頭 pau は **応答の `prePhonemeLength` を使わない**。合成側 (`apply_talk_params`) が
+/// [`common::voicevox::TALK_PRE_PHONEME_LENGTH`] (= 0) で必ず上書きするので、実際に鳴る
+/// wav の先頭無音は `talk_pre_silence_frames` が返す量 (= 現行 0 frame) だけ。応答の値
+/// (engine 既定 0.1s) をそのまま信じると口が音声より遅れる (r.md #39 付随 (a))。
 fn parse_talk_phonemes(body: &str, speed_scale: f32) -> Result<Vec<Phoneme>> {
     let json: serde_json::Value =
         serde_json::from_str(body).context("parsing audio_query JSON")?;
@@ -165,9 +171,11 @@ fn parse_talk_phonemes(body: &str, speed_scale: f32) -> Result<Vec<Phoneme>> {
     let sec_to_frames = |s: f64| -> u32 { (s / speed * FRAME_RATE).round().max(0.0) as u32 };
 
     let mut out: Vec<Phoneme> = Vec::new();
-    // 先頭 pau (prePhonemeLength、無ければ 0.1s)。
-    let pre = json["prePhonemeLength"].as_f64().unwrap_or(0.1);
-    out.push(Phoneme { phoneme: "pau".into(), frame_length: sec_to_frames(pre) });
+    // 先頭 pau (合成時に注入する prePhonemeLength 由来。0 frame なら置かない)。
+    let pre_frames = talk_pre_silence_frames(speed_scale);
+    if pre_frames > 0 {
+        out.push(Phoneme { phoneme: "pau".into(), frame_length: pre_frames });
+    }
 
     let phrases = json["accent_phrases"]
         .as_array()
@@ -221,11 +229,29 @@ mod tests {
         }"#;
         let ph = parse_talk_phonemes(body, 1.0).unwrap();
         let syms: Vec<&str> = ph.iter().map(|p| p.phoneme.as_str()).collect();
-        assert_eq!(syms, vec!["pau", "k", "o", "pau", "N", "pau"]);
+        // r.md #39: 先頭 pau は出ない (合成側が prePhonemeLength=0 を注入するため)。
+        assert_eq!(syms, vec!["k", "o", "pau", "N", "pau"]);
         // frame_length = 秒 × FRAME_RATE。
-        assert_eq!(ph[1].frame_length, (0.05 * FRAME_RATE).round() as u32);
-        assert_eq!(ph[2].frame_length, (0.1 * FRAME_RATE).round() as u32);
-        assert_eq!(ph[3].frame_length, (0.3 * FRAME_RATE).round() as u32);
+        assert_eq!(ph[0].frame_length, (0.05 * FRAME_RATE).round() as u32);
+        assert_eq!(ph[1].frame_length, (0.1 * FRAME_RATE).round() as u32);
+        assert_eq!(ph[2].frame_length, (0.3 * FRAME_RATE).round() as u32);
+        // 末尾 pau は engine 既定 (postPhonemeLength=0.1) のまま。
+        assert_eq!(ph[4].frame_length, (0.1 * FRAME_RATE).round() as u32);
+    }
+
+    #[test]
+    fn parse_talk_phonemes_ignores_response_pre_phoneme_length() {
+        // 応答が 0.1s と言っていても、実際に鳴る wav は先頭無音 0 (合成側が上書き)。
+        // 口パクは wav 側に合わせる = 先頭 pau を作らない (r.md #39 付随 (a))。
+        let body = r#"{"accent_phrases":[{"moras":[{"text":"ア","consonant":null,"consonant_length":null,"vowel":"a","vowel_length":0.2,"pitch":5.0}],"accent":1,"pause_mora":null}],"prePhonemeLength":0.1,"postPhonemeLength":0.0}"#;
+        for speed in [0.5f32, 1.0, 1.5] {
+            let ph = parse_talk_phonemes(body, speed).unwrap();
+            assert_eq!(
+                ph.first().map(|p| p.phoneme.as_str()),
+                Some("a"),
+                "speed={speed}: 先頭は最初の音素そのもの"
+            );
+        }
     }
 
     #[test]
