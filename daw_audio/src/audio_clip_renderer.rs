@@ -1295,6 +1295,7 @@ mod wave_span_binding_tests {
             .map(|i| i as f32 / (frames - 1) as f32)
             .collect();
         AudioSourceBuffer {
+            origin: std::path::PathBuf::from("test://wave-span-ramp"),
             sample_rate: source_sr,
             channels: 1,
             frames,
