@@ -878,8 +878,11 @@ fn daw_set_track_latency(
             .ok_or_else(|| anyhow!(
                 "setTrackLatency requires loadSongFromObject to have been called first"
             ))?;
-        if let Some(t) = song.track_by_id_mut(track_id) {
-            t.reported_latency_samples = samples;
+        // r.md #39 同件: `track_by_id_mut` だと `MASTER_TRACK_ID` を渡したときに
+        // 黙って捨てられ、master fx の latency を注入する headless テストが
+        // 「何も起きていないのに pass」する。sentinel 分岐付き accessor で通す。
+        if let Some(slot) = song.reported_latency_mut(track_id) {
+            *slot = samples;
         }
         // v29: Song は daw_audio のみが受ける (plugin_host に LoadSong は無い)。
         let cloned = song.clone();
