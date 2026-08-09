@@ -193,6 +193,73 @@ fn load_failure_keeps_other_pending_unaffected() {
     );
 }
 
+/// 失敗した device が「未ロード」としてインスペクタに出続け、明示的な再読込
+/// (`AppEvent::ReloadDevice`) で表示が畳まれて `SetSlotPlugin` が再送されること。
+///
+/// これが無いと、一度 load に失敗した device はそのセッション中ずっと無音のまま
+/// (復旧手段が「project を開き直す」だけ) になる。entry の寿命は
+/// insert (失敗) / remove (新しい load 要求 = `track_pending_load`) の 2 点に
+/// 依存し、どちらを取り落としても「消えない警告」or「気付けない無音」になるので
+/// 往復で固定する。
+#[test]
+fn failed_load_is_visible_in_chain_and_reload_retries() {
+    let (mut app, _audio_rx, mut plugin_rx) = build_app();
+    let track_id = app.song_doc.song().tracks[0].id;
+
+    select_track_single(&mut app, 0);
+    app.handle_event(AppEvent::OpenPluginPicker);
+    app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "test.synth".into(),
+        keep_open: false,
+        open_gui: true,
+    });
+    let _ = drain(&mut plugin_rx);
+    let synth_dev = device_id_at(app.song_doc.song(), track_id, 0).expect("device id");
+
+    // 成功前のチェーン行は「未ロード」ではない。
+    assert!(
+        app.inspector_chain()[0].load_error.is_none(),
+        "load 応答前に失敗扱いしてはいけない"
+    );
+
+    let generation = pending_generation(&app, synth_dev);
+    app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoadFailed {
+        device_id: synth_dev,
+        plugin_id: "test.synth".into(),
+        reason: "shmem create failed".into(),
+        generation,
+    }));
+
+    let chain = app.inspector_chain();
+    assert_eq!(
+        chain[0].load_error.as_deref(),
+        Some("shmem create failed"),
+        "失敗理由がチェーン行に出ること: {chain:?}"
+    );
+
+    // 再読込 → SetSlotPlugin が再送され、pending に戻り、「未ロード」表示は畳まれる。
+    app.handle_event(AppEvent::ReloadDevice {
+        track_id,
+        device_index: 0,
+    });
+    let msgs = drain(&mut plugin_rx);
+    assert!(
+        msgs.iter().any(|m| matches!(
+            m,
+            PluginCommand::SetSlotPlugin { device_id, .. } if *device_id == synth_dev
+        )),
+        "ReloadDevice は SetSlotPlugin を再送すること: {msgs:?}"
+    );
+    assert!(
+        app.ipc.pending_plugin_loads.contains_key(&synth_dev),
+        "再読込中は pending に戻る"
+    );
+    assert!(
+        app.inspector_chain()[0].load_error.is_none(),
+        "再読込を要求した時点で「未ロード」表示は畳まれる"
+    );
+}
+
 /// v29 世代 guard: 古い generation の失敗応答は無視される (A→B 連続差し替えの
 /// stale 応答 race 対策)。
 #[test]

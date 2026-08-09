@@ -62,6 +62,9 @@ pub const TEXT: Color = Color::rgb(0.880, 0.902, 0.945);
 pub const TEXT_DIM: Color = Color::rgb(0.560, 0.600, 0.680);
 /// 最弱可読層 (disabled menu/label・スケール外の鍵盤ラベル)。
 pub const TEXT_FAINT: Color = Color::rgb(0.380, 0.415, 0.490);
+/// 失敗 / 使用不能を伝えるテキスト (エラー理由・「読み込み失敗」ラベル)。塗り用の
+/// `METER_RED` は暗い面の上の文字には沈むので、明度を持ち上げた warm red を別 token に。
+pub const TEXT_ERROR: Color = Color::rgb(1.00, 0.47, 0.44);
 /// accent で選択された行の上に乗るテキスト/タグ (azure 上のクリスプ near-white)。
 pub const TEXT_ON_ACCENT: Color = Color::rgb(0.97, 0.985, 1.0);
 /// 明るい塗り (solo 黄 / 明 clip / 白鍵) の上の auto-contrast 暗テキスト。

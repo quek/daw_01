@@ -163,6 +163,18 @@ pub struct IpcState {
     /// per-device 単調増加を含意)。 送信ごとに bump して
     /// `pending_plugin_loads` へ記録する。
     pub(crate) next_plugin_load_generation: u64,
+    /// `device_id → 直近の load 失敗理由`。 `SlotPluginLoadFailed` を受けた
+    /// device は plugin_host に instance が無い (= そのセッション中ずっと
+    /// 無音) 状態で song には残る。 ここに残すことでインスペクタが
+    /// 「未ロード」として可視化し、 ユーザーが明示的に再 load できる
+    /// (`AppEvent::ReloadDevice`)。 自動リトライはしない — plugin 側の
+    /// 恒常的な失敗で無限ループになるため。
+    ///
+    /// entry の寿命: `track_pending_load` (= 新しい load 要求を送る唯一の
+    /// 口) で消え、 `on_plugin_load_failed_from_child` で入る。 device が
+    /// 消える経路 (`SlotPluginUnloaded` / device 削除 / project 切替) でも
+    /// 落とす。 session-only (保存対象外)。
+    pub failed_plugin_loads: std::collections::HashMap<u64, String>,
     /// ユーザーが plugin picker で手動追加した plugin の集合 (値 = GUI 自動 open
     /// するか)。load 完了 (`on_plugin_loaded_from_child`) で consume し、(1) daw_audio
     /// へ `LoadSong` を再送して新 plugin を signal path に入れ (Shift 追加でも必須)、

@@ -6,7 +6,7 @@ use crate::app_types::*;
 use crate::event::*;
 use std::sync::{Arc};
 use common::model::{InstrumentSource, MAX_TRACK_GAIN, SendMode};
-use common::protocol::{AudioCommand, PluginCommand};
+use common::protocol::AudioCommand;
 
 impl AppData {
     pub(crate) fn set_master_gain(&mut self, gain: f32) {
@@ -38,7 +38,6 @@ impl AppData {
             tracing::error!(id, "picked plugin id not in database");
             return;
         };
-        let path = entry.path.clone();
         let entry_id = entry.id.clone();
         let entry_format = entry.format;
         // 役割導出の入力 (= ports)。append する device に持たせ、LoadSong で
@@ -78,22 +77,13 @@ impl AppData {
 
         let is_video = ports.is_video();
         if !is_video {
-            let generation = self.track_pending_load(device_id);
             // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync +
             // (open_gui なら) GUI 自動 open する (project-load の一斉復元はこの
             // 集合に積まれない)。 Shift (open_gui=false) でも sync は必要なので
             // 常に積み、 auto-open だけ値で分岐する。
             self.ipc.pending_added_plugin_finalize
                 .insert((track_id, dest_index), open_gui);
-            self.send_plugin(PluginCommand::SetSlotPlugin {
-                device_id,
-                track_id,
-                format: entry_format,
-                path,
-                plugin_id: entry_id.clone(),
-                initial_state: None,
-                generation,
-            });
+            self.send_set_slot_plugin(track_id, device_id, &entry_id, None);
         }
 
         let new_device = common::model::PluginInstance {

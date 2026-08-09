@@ -35,6 +35,37 @@
 //! `OpenWorkerPool` の再送) まで該当 pair を停止する。pool 再構築時は
 //! event 名に **generation** を含めて mint し (`worker_wake_event_name`)、
 //! 旧世代の stale signal が新 pool に漏れないようにする。
+//!
+//! # OS リソース名の命名契約 (load-bearing)
+//!
+//! **再利用される id (device_id / track_id / slot index / clip id ...) を、
+//! 単独で OS カーネルオブジェクト名にしてはならない。** 作り直される単位の
+//! 名前には必ず「世代」(generation / incarnation) を含める。
+//!
+//! 理由: これらの名前は**解放が非同期な他プロセス**と共有される。Windows の
+//! named section / named event は「全プロセスがハンドルを閉じるまで名前が
+//! 生き続ける」ので、作成者 (plugin_host) が自分のハンドルを閉じても、
+//! daw_audio が 1 本でも握っていれば同名の再作成は失敗する
+//! ([`crate::shmem::NamedShmem::create`] は既存名を明示 bail する排他作成)。
+//! daw_audio の解放は RT の bundle 差し替え + off-thread recycle drain を
+//! 経るので、作成者から見て**完了時刻に上限が無い**。
+//!
+//! したがって「他プロセスの解放を待ってから同名で作り直す」ハンドシェイクは
+//! 解ではない (project open の同期パスを RT の cadence に縛りつけるうえ、
+//! 「他プロセスの解放を待つ補償コード」そのもの = `../../CLAUDE.md`
+//! アーキテクチャ不変条件 #1 が禁じる形)。**名前を再利用しない**のが唯一の
+//! 正解であり、世代を焼き込めば前世代の mapping が生き残っていても新世代の
+//! create は必ず成功し、旧 mapping は保持者が居なくなった時点で静かに消える。
+//!
+//! 現行の適用状況:
+//! - [`worker_wake_event_name`] / [`worker_done_event_name`] … pool
+//!   `generation` 入り (daw_gui が `OpenWorkerPool` ごとに bump)。
+//! - [`process_data_shmem_id`] … plugin_host 所有の `incarnation` 入り
+//!   (instantiation ごとに bump)。
+//! - [`worker_bridge_shmem_id`] / `metrics_bridge::metrics_shmem_id` /
+//!   `audio_bridge` … daw_gui の bootstrap で **プロセス生存中 1 度だけ**
+//!   create され作り直されないので pid だけで一意。作り直す設計に変えるなら
+//!   同時に世代を足すこと。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -157,13 +188,23 @@ pub fn worker_done_event_name(pid: u32, generation: u32, worker_idx: u32) -> Str
 }
 
 /// Build the shared-memory id for a plugin instance's `ProcessData` slot.
-/// v29: keyed by the stable device id.
-pub fn process_data_shmem_id(pid: u32, device_id: u64) -> String {
-    format!("daw_01_process_data_{pid}_{device_id}")
+///
+/// **この名前は 1 instantiation につき 1 回限り**。一意性を担保するのは
+/// `incarnation` (plugin_host が所有する単調カウンタ — リソースの作成者が
+/// 名前を所有する = SSoT) で、`device_id` は診断のために名前へ残しているだけ。
+/// v29 で addressing を安定 `device_id` に統一した際、**addressing の id と
+/// OS リソースの名前を同一視して** `(pid, device_id)` の純関数にしたのが
+/// 「プロジェクトを開き直すと `shmem ... already exists` で plugin load が
+/// 失敗する」バグの起点だった (module doc の命名契約を参照)。
+/// addressing は再利用される id でよいが、リソース名は再利用されてはならない。
+pub fn process_data_shmem_id(pid: u32, device_id: u64, incarnation: u64) -> String {
+    format!("daw_01_process_data_{pid}_{device_id}_{incarnation}")
 }
 
 /// Build the shared-memory id for the worker bridge (`WorkerBridge`,
-/// containing the `worker_task` array).
+/// containing the `worker_task` array). daw_gui の bootstrap で 1 度だけ
+/// create され、プロセス生存中は作り直されないので世代を持たない
+/// (module doc の命名契約を参照)。
 pub fn worker_bridge_shmem_id(pid: u32) -> String {
     format!("daw_01_worker_bridge_{pid}")
 }

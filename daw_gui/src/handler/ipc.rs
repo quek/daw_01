@@ -253,6 +253,9 @@ impl AppData {
             PluginEvent::SlotGuiClosed { device_id } => {
                 self.on_gui_closed(device_id);
             }
+            PluginEvent::SlotPluginShmemReleased { device_id } => {
+                self.on_plugin_shmem_released_from_child(device_id);
+            }
             PluginEvent::SlotPluginUnloaded { device_id } => {
                 self.on_plugin_unloaded_from_child(device_id);
             }

@@ -195,6 +195,11 @@ pub struct ChainEntry {
     pub has_params: bool,
     /// r.md #36: 「キーを全部プラグインに送る」 (= ホストがキーを一切横取りしない)。
     pub send_all_keys: bool,
+    /// plugin_host での load が失敗した device の理由 (`SlotPluginLoadFailed`)。
+    /// `Some` = song には居るが host には instance が無い = **無音**。
+    /// チェーン行に警告色 + ⚠ を出し、 「読み込み失敗」 セクションで理由と
+    /// 「再読込」 ボタンを出す (自動リトライはしない)。
+    pub load_error: Option<String>,
 }
 
 impl ChainEntry {

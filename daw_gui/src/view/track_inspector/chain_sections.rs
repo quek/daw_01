@@ -18,7 +18,7 @@ use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
 
-use super::{SC_CTL_H, SC_NAME_H, SC_ROW_GAP, SC_ROW_H, SC_TAP_W, TEXT};
+use super::{ERROR_TEXT, SC_CTL_H, SC_NAME_H, SC_ROW_GAP, SC_ROW_H, SC_TAP_W, TEXT, TEXT_DIM};
 
 /// 「+ Plugin」 (master bus は 「+ FX」) をチェーンリストの直下に置く。
 ///
@@ -45,6 +45,92 @@ pub(super) fn draw_add_plugin_button(
         || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::OpenPluginPicker)),
     );
     y + BTNS_H + 12.0
+}
+
+/// 「読み込み失敗」 section — plugin_host での load に失敗した device を
+/// **可視化し、 明示的に再 load できる** ようにする。
+///
+/// 失敗した device は song には残るが host に instance が無いので、 その
+/// セッション中ずっと**無音**になる。 従来は status_message に 1 度出るだけで
+/// 復旧手段が「project を開き直す」しか無く、 一時的な失敗 (shmem 名衝突など)
+/// でもユーザーは原因も対処も分からなかった。
+///
+/// **自動リトライはしない**: plugin 側の恒常的な失敗 (DLL 欠損 / activate 失敗)
+/// で無限ループになるため、 再試行は必ずユーザーの意思 (「再読込」 ボタン) で。
+/// チェーン行側は名前に `[未ロード]` を付けて警告色で描くので、 このセクションは
+/// 「どれが / なぜ / どう直すか」 を担当する。
+pub(super) fn draw_failed_load_section(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    pad: f32,
+    mut y: f32,
+) -> f32 {
+    let entries: Vec<crate::app_types::ChainEntry> = app
+        .inspector_chain()
+        .into_iter()
+        .filter(|e| e.load_error.is_some())
+        .collect();
+    if entries.is_empty() {
+        return y;
+    }
+    let Some(track_id) = app.cursor_track_id() else {
+        return y;
+    };
+    ui.label_at(
+        "inspector_loadfail_label",
+        "読み込み失敗",
+        area.x + pad,
+        y,
+        12.0,
+        ERROR_TEXT,
+    );
+    y += 18.0 + 4.0;
+
+    const NAME_H: f32 = 14.0;
+    const ROW_H: f32 = 24.0;
+    const ROW_GAP: f32 = 8.0;
+    const BTN_W: f32 = 64.0;
+    let row_w = area.w - pad * 2.0;
+    let name_x = area.x + pad;
+    let btn_x = area.x + area.w - pad - BTN_W;
+    for (i, entry) in entries.iter().enumerate() {
+        ui.label_at_clipped(
+            ("inspector_loadfail_name", i),
+            &entry.plugin_name,
+            Rect { x: name_x, y, w: row_w, h: NAME_H },
+            11.0,
+            ERROR_TEXT,
+        );
+        // 理由は 1 行で切る (長い FFI エラーでも行が伸びない)。 全文は
+        // status bar / ログに出ている。
+        let reason = entry.load_error.as_deref().unwrap_or("");
+        ui.label_at_clipped(
+            ("inspector_loadfail_reason", i),
+            reason,
+            Rect {
+                x: name_x,
+                y: y + NAME_H + 4.0,
+                w: (btn_x - 6.0 - name_x).max(1.0),
+                h: 11.0 * 1.2,
+            },
+            11.0,
+            TEXT_DIM,
+        );
+        let device_index = entry.device_index;
+        ui.button_at(
+            ("inspector_loadfail_reload", i),
+            "再読込",
+            Rect { x: btn_x, y: y + NAME_H, w: BTN_W, h: ROW_H },
+            move || {
+                Edit::mutate(move |app: &mut AppData| {
+                    app.handle_event(AppEvent::ReloadDevice { track_id, device_index });
+                })
+            },
+        );
+        y += NAME_H + ROW_H + ROW_GAP;
+    }
+    y + 6.0
 }
 
 /// r.md #36: 「キーを全部プラグインに送る」 の per-device トグル。

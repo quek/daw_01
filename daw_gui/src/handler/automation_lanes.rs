@@ -969,6 +969,11 @@ impl AppData {
                 self.ipc.plugin_tx = None;
                 self.ipc.pending_plugin_loads.clear();
                 self.ipc.loaded_slots.clear();
+                // host が消えた時点で **全** device が未ロードなので、「一部だけ
+                // 未ロード」を示す失敗 entry は誤情報になる (respawn すれば
+                // restore_plugin_from_song が全 device を load し直し、crash-loop で
+                // 諦めた場合は status_message がその旨を伝える)。
+                self.ipc.failed_plugin_loads.clear();
                 // plugin state 取得待ちの round-trip はもう完了しない
                 // (host 消滅で AllStatesReceived が来ない)。 stale な queue / 保留ガードを
                 // 破棄して GUI の恒久ロックを防ぐ。 hang watchdog (`abort_state_roundtrip`)

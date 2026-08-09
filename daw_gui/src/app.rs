@@ -219,6 +219,7 @@ impl AppData {
                 open_plugin_guis: std::collections::HashSet::new(),
                 pending_plugin_loads: std::collections::HashMap::new(),
                 next_plugin_load_generation: 0,
+                failed_plugin_loads: std::collections::HashMap::new(),
                 pending_added_plugin_finalize: std::collections::HashMap::new(),
                 gui_open_requests: Vec::new(),
                 rescan_result: Arc::new(Mutex::new(None)),
@@ -1261,6 +1262,12 @@ impl AppData {
             }
             AppEvent::RemoveDevice { index } => {
                 self.remove_device(index);
+            }
+            AppEvent::ReloadDevice {
+                track_id,
+                device_index,
+            } => {
+                self.reload_device(track_id, device_index);
             }
             AppEvent::ExplodeParallelOut {
                 track_id,
