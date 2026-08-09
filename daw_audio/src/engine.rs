@@ -292,6 +292,12 @@ pub struct EngineShared {
     /// decode for a superseded song can't clobber a newer schedule
     /// (r.md #7 decode 再設計 B)。
     pub schedule_generation: AtomicU64,
+    /// 直近 `LoadSong` で読み込んだ `Song::project_id` (v24 で導入された
+    /// プロジェクト同一性の SSoT)。値が変わった瞬間が「別プロジェクトに
+    /// 切り替わった」であり、Song スコープの id を key にした engine 側の
+    /// 状態 (`plugin_refs` / `recording_lanes` / RT の走行状態) をまとめて
+    /// 捨てる唯一の検出点。`0` = 未ロード。
+    pub loaded_project_id: AtomicU64,
     /// Guards publication of a freshly compiled `audio_clip_renderer` so a slow
     /// background decode for an older generation can't clobber a newer one
     /// (closes the TOCTOU between the generation re-check and the `ArcSwap`
@@ -342,6 +348,7 @@ impl EngineShared {
             live_parked: AtomicBool::new(false),
             audio_clip_renderer: ArcSwap::from_pointee(AudioClipRenderer::empty()),
             schedule_generation: AtomicU64::new(0),
+            loaded_project_id: AtomicU64::new(0),
             last_published_generation: std::sync::Mutex::new(0),
             project_dir: ArcSwapOption::empty(),
             preroll_total_samples: AtomicU64::new(0),
@@ -386,6 +393,14 @@ pub struct RtBundle {
     /// `Some` = topology 変更 — install 時に `adopt_state_from` で
     /// DelayLine / FollowerSlot の走行状態を旧 schedule から移送する。
     pub schedule: Option<Schedule>,
+    /// **delta**: `true` = 別プロジェクトが読み込まれた (`Song::project_id` が
+    /// 変わった) ので、Song スコープの id で引き継いでいる **走行状態を捨てる**。
+    ///
+    /// `adopt_state_from` の移送キー (`DelayKey::MixSrc{track_id}` /
+    /// `ModSource::id`) も `TrackScratch` の index も Song スコープの名前なので、
+    /// project を跨ぐと別物同士が一致してしまう。引き継ぐと前 project の PDC
+    /// リングに残った音声や follower の envelope が新 project の頭に混ざる。
+    pub reset_song_scoped_state: bool,
     /// `input_delay_per_track` が `TrackScratch::input_delay_line` の
     /// prealloc (1s) を超える病的ケース用の off-thread pre-alloc 置換 line
     /// (index = track index)。install 時に必要なら swap され、旧 line が
@@ -428,6 +443,9 @@ impl RtBundle {
                 &mut older.input_delay_replacements,
             );
         }
+        // 「捨てろ」は一度でも要求されたら畳み込み後も残す (OR)。落とすと
+        // project 切替の走行状態リセットが coalescing で消える。
+        self.reset_song_scoped_state |= older.reset_song_scoped_state;
         older
     }
 }
@@ -591,8 +609,26 @@ impl LocalState {
         let mut old_schedule: Option<Schedule> = None;
         let mut retired_lines: Vec<Option<DelayLine>> = Vec::new();
         if let Some(mut sched) = new.schedule.take() {
-            // §5 D: 走行状態 (PDC ring / follower env) を stable key で移送。
-            sched.adopt_state_from(&mut self.cached_schedule);
+            if new.reset_song_scoped_state {
+                // 別 project。移送キー (track_id / ModSource::id) は Song
+                // スコープの名前なので、引き継ぐと **別物同士が一致**して前
+                // project の PDC リング音声 / follower envelope が新 project の
+                // 頭に混ざる。新 schedule は compile 直後でゼロ初期化済みなので、
+                // 移送を **やらない** ことがそのままリセットになる。
+                //
+                // schedule 外で生き続ける per-track の input delay line は
+                // 明示的にゼロ化する。全 track を舐めると 32 × 384 KB の memset に
+                // なるので、実際に補償が効く (= 遅延サンプルを読み出す) track
+                // だけに絞る。alloc / free は無い。
+                for (i, &d) in sched.input_delay_per_track.iter().enumerate() {
+                    if d > 0 && let Some(s) = self.scratch.get_mut(i) {
+                        s.input_delay_line.reset();
+                    }
+                }
+            } else {
+                // §5 D: 走行状態 (PDC ring / follower env) を stable key で移送。
+                sched.adopt_state_from(&mut self.cached_schedule);
+            }
             old_schedule = Some(std::mem::replace(&mut self.cached_schedule, sched));
 
             // per-track input delay line: prealloc (1s) を超える補償が要る
@@ -622,6 +658,7 @@ impl LocalState {
             song: old_song,
             tempo_map: old_tempo,
             schedule: old_schedule,
+            reset_song_scoped_state: false,
             input_delay_replacements: retired_lines,
             plugin_refs: old_refs,
             worker: old_worker,
@@ -1085,10 +1122,16 @@ mod bundle_install_tests {
     }
 
     fn make_bundle(song: &Arc<Song>) -> RtBundle {
+        make_bundle_with_reset(song, false)
+    }
+
+    /// `reset_song_scoped_state` を明示する版 (project 切替相当)。
+    fn make_bundle_with_reset(song: &Arc<Song>, reset: bool) -> RtBundle {
         RtBundle {
             song: Some(Arc::clone(song)),
             tempo_map: common::tempo_map::TempoMap::from_song(song),
             schedule: Some(compile_schedule(song, 48_000, 0).unwrap()),
+            reset_song_scoped_state: reset,
             input_delay_replacements: Vec::new(),
             plugin_refs: Arc::new(HashMap::new()),
             worker: None,
@@ -1206,6 +1249,7 @@ mod bundle_install_tests {
                 song: Some(Arc::clone(&s2)),
                 tempo_map: common::tempo_map::TempoMap::from_song(&s2),
                 schedule: None,
+                reset_song_scoped_state: false,
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
@@ -1257,6 +1301,7 @@ mod bundle_install_tests {
                 song: Some(Arc::clone(&opened)),
                 tempo_map: common::tempo_map::TempoMap::from_song(&opened),
                 schedule: None,
+                reset_song_scoped_state: false,
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,
@@ -1353,6 +1398,109 @@ mod bundle_install_tests {
         assert_eq!(l[2], 2.0);
     }
 
+    /// 別プロジェクトの読み込み (`reset_song_scoped_state`) では走行状態を
+    /// **引き継がない**。移送キー (`DelayKey::MixSrc{track_id}` /
+    /// `ModSource::id`) は Song スコープの名前なので、project を跨ぐと別物
+    /// 同士が一致し、前 project の PDC リングに残った音声が新 project の頭に
+    /// 混ざる。
+    #[test]
+    fn project_switch_bundle_does_not_adopt_running_state() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+
+        let mut s1 = Song::default();
+        s1.tracks.push(track(1));
+        s1.tracks.push({
+            let mut t = track(2);
+            t.reported_latency_samples = 4;
+            t
+        });
+        let s1 = Arc::new(s1);
+        bundle_tx.push(make_bundle(&s1)).unwrap();
+        local.refresh_bundle();
+        assert_eq!(local.cached_schedule.delay_lines.len(), 1);
+
+        // 前 project の走行状態を作る。
+        {
+            let line = &mut local.cached_schedule.delay_lines[0];
+            let mut l = [1.0f32, 2.0, 3.0];
+            let mut r = [4.0f32, 5.0, 6.0];
+            line.step_in_place(&mut l, &mut r, 4);
+        }
+        // per-track input delay line にも痕跡を残す (schedule の外で生き続ける)。
+        {
+            let mut l = [7.0f32, 8.0, 9.0];
+            let mut r = [7.0f32, 8.0, 9.0];
+            local.scratch[1]
+                .input_delay_line
+                .step_in_place(&mut l, &mut r, 4);
+        }
+
+        // 別 project の LoadSong 相当。
+        bundle_tx.push(make_bundle_with_reset(&s1, true)).unwrap();
+        local.refresh_bundle();
+
+        let line = &mut local.cached_schedule.delay_lines[0];
+        let mut l = [0.0f32; 3];
+        let mut r = [0.0f32; 3];
+        line.step_in_place(&mut l, &mut r, 4);
+        assert_eq!(
+            [l[0], l[1], l[2]],
+            [0.0, 0.0, 0.0],
+            "project 切替では前 project の PDC ring を引き継がない"
+        );
+    }
+
+    /// `reset_song_scoped_state` は delta なので、coalescing で捨ててはいけない
+    /// (捨てると project 切替のリセット要求が消える)。
+    #[test]
+    fn coalescing_keeps_the_project_switch_reset_request() {
+        let (mut local, mut bundle_tx, mut recycle_rx) = harness();
+
+        let mut s1 = Song::default();
+        s1.tracks.push(track(1));
+        s1.tracks.push({
+            let mut t = track(2);
+            t.reported_latency_samples = 4;
+            t
+        });
+        let s1 = Arc::new(s1);
+        bundle_tx.push(make_bundle(&s1)).unwrap();
+        local.refresh_bundle();
+        {
+            let line = &mut local.cached_schedule.delay_lines[0];
+            let mut l = [1.0f32, 2.0, 3.0];
+            let mut r = [4.0f32, 5.0, 6.0];
+            line.step_in_place(&mut l, &mut r, 4);
+        }
+
+        // project 切替の LoadSong の直後に値のみ更新 (OpenPluginShmem 相当) が
+        // 同一バッファ周期で積まれる — 実際に曲を開くと必ず起きる並び。
+        bundle_tx.push(make_bundle_with_reset(&s1, true)).unwrap();
+        bundle_tx
+            .push(RtBundle {
+                song: Some(Arc::clone(&s1)),
+                tempo_map: common::tempo_map::TempoMap::from_song(&s1),
+                schedule: None,
+                reset_song_scoped_state: false,
+                input_delay_replacements: Vec::new(),
+                plugin_refs: Arc::new(HashMap::new()),
+                worker: None,
+            })
+            .unwrap();
+        local.refresh_bundle();
+
+        let line = &mut local.cached_schedule.delay_lines[0];
+        let mut l = [0.0f32; 3];
+        let mut r = [0.0f32; 3];
+        line.step_in_place(&mut l, &mut r, 4);
+        assert_eq!(
+            [l[0], l[1], l[2]],
+            [0.0, 0.0, 0.0],
+            "畳み込みでリセット要求が落ちてはいけない"
+        );
+        while recycle_rx.pop().is_ok() {}
+    }
+
     /// Proof of the D1 invariant: a steady-state install allocates and frees
     /// nothing on the audio thread. Requires the `rt-assert` allocator hook.
     #[cfg(feature = "rt-assert")]
@@ -1378,6 +1526,7 @@ mod bundle_install_tests {
                 song: Some(Arc::clone(&s2)),
                 tempo_map: common::tempo_map::TempoMap::from_song(&s2),
                 schedule: None,
+                reset_song_scoped_state: false,
                 input_delay_replacements: Vec::new(),
                 plugin_refs: Arc::new(HashMap::new()),
                 worker: None,

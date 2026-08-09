@@ -100,6 +100,9 @@ struct RunnerState {
         common::model::VideoSourceId,
         Vec<CachedRingSlot>,
     >,
+    /// `AppData::ui_ephemeral.project_generation` のうち、GPU 側の解放を
+    /// 済ませた世代 (`release_project_scoped_gpu_state`)。
+    released_project_generation: u64,
     /// docs/plan_video.md P5 perf: 直近に preview decode を駆動した時刻。
     /// `drive_preview_playback` を `Song.video_framerate` Hz に throttle
     /// する基準。 main loop は vsync で 60fps+ 回るが、 video preview は
@@ -668,6 +671,7 @@ impl ApplicationHandler<AppEvent> for Runner {
             playback_worker: crate::video_playback_worker::PreviewDecodeWorker::new(),
             #[cfg(windows)]
             cached_rings: std::collections::HashMap::new(),
+            released_project_generation: 0,
             #[cfg(windows)]
             last_preview_drive_at: None,
             // 60 uploads ≈ 2 seconds at 30fps preview, mirroring the
@@ -928,6 +932,11 @@ impl Runner {
             self.diag_window_count = 0;
             self.diag_window_max_dt = std::time::Duration::ZERO;
         }
+
+        // 別プロジェクトに切り替わったら GPU 側の Song スコープキャッシュも
+        // 捨てる。`AppData::reset_song_scoped_state` は renderer を持たないので
+        // 世代印だけ進め、実際の `destroy_texture` はここ (runner) が行う。
+        Self::release_project_scoped_gpu_state(state);
 
         // docs/plan_video.md P3.5: drain pending video thumbnail
         // uploads BEFORE this frame's `ui.frame()` so the arrangement
@@ -1706,8 +1715,52 @@ impl Runner {
             };
             let handle = renderer.create_texture(w, h);
             renderer.upload_texture_rgba(handle, rgba.as_slice());
-            app.ui_ephemeral.video_texture_cache.insert(video_source_id, handle);
+            // 同 id への再 upload では旧 handle を必ず解放する (insert で
+            // 上書きすると GPU テクスチャがそのまま漏れる)。
+            if let Some(old) = app
+                .ui_ephemeral
+                .video_texture_cache
+                .insert(video_source_id, handle)
+            {
+                renderer.destroy_texture(old);
+            }
         }
+    }
+
+    /// プロジェクトが切り替わったら GPU 側の Song スコープキャッシュを解放する。
+    ///
+    /// `VideoSourceId` / `ImageSourceId` は Song スコープの名前 (project ごとに
+    /// 1 から再採番) なので、テクスチャを id で引き継ぐと **前 project の
+    /// サムネイル・画像・動画フレームが新 project のクリップに出る**。しかも
+    /// video のサムネイルは project load 経路で再生成されないため、放置すると
+    /// 前 project の絵が唯一の候補として当たり続ける。
+    ///
+    /// `AppData` は `Renderer` を持てないので、破棄の要求は
+    /// `ui_ephemeral.project_generation` の変化として伝わってくる。
+    fn release_project_scoped_gpu_state(state: &mut RunnerState) {
+        let generation = state.app.ui_ephemeral.project_generation;
+        if generation == state.released_project_generation {
+            return;
+        }
+        state.released_project_generation = generation;
+        // サムネイルのテクスチャは `drain_video_thumbnail_uploads` が
+        // main window の `Renderer` から作り、この map が唯一の所有者なので
+        // ここで destroy する。
+        for (_, handle) in state.app.ui_ephemeral.video_texture_cache.drain() {
+            state.renderer.destroy_texture(handle);
+        }
+        // 画像テクスチャの所有者は `PreviewWindowState::image_textures` で、
+        // こちらは composite pass 用の **ミラー**。destroy は所有者側
+        // (`clear_all`) に任せ、ここでは参照を落とすだけ (両方で destroy
+        // すると二重解放になる)。
+        state.app.ui_ephemeral.image_texture_cache.clear();
+        // preview 側のフレーム / 画像テクスチャ (`(source_id, slot)` keyed) と、
+        // それを指す ring スナップショットは対で捨てる。
+        if let Some(preview) = state.preview.as_mut() {
+            preview.clear_all();
+        }
+        #[cfg(windows)]
+        state.cached_rings.clear();
     }
 }
 
