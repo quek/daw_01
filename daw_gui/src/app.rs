@@ -321,6 +321,8 @@ impl AppData {
             },
             ui_ephemeral: UiEphemeral {
                 arr_label_cache: std::cell::RefCell::default(),
+                loaded_project_id: 0,
+                project_generation: 0,
                 video_texture_cache: std::collections::HashMap::new(),
                 image_texture_cache: std::collections::HashMap::new(),
                 arrangement_hover_beat: None,

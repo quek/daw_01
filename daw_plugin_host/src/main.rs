@@ -876,6 +876,16 @@ impl PluginHost {
                     self.teardown_device(id, true);
                 }
             }
+            PluginCommand::UnloadAllPlugins => {
+                // project 切替。`device_id` は Song スコープの名前なので、
+                // 残すと新 project の同 id device が旧 instance に dedup
+                // 吸収される (保存 state が復元されず前 project の音で鳴る)。
+                let ids: Vec<u64> = self.instances.keys().copied().collect();
+                tracing::info!(count = ids.len(), "UnloadAllPlugins: project switched");
+                for id in ids {
+                    self.teardown_device(id, true);
+                }
+            }
             PluginCommand::RequestSlotState { device_id } => {
                 let data = match self.instances.get_mut(&device_id) {
                     Some(rec) => match rec.plugin.state_save() {
@@ -1038,9 +1048,14 @@ impl PluginHost {
         // LoadSong: 同じ plugin id が既にこの device に居るなら reload せず、
         // ただし daw_gui の `pending_plugin_loads` を解放するため
         // `SlotPluginLoaded` は必ず再 emit する (generation echo 付き)。
-        if let Some(rec) = self.instances.get(&device_id)
+        if let Some(rec) = self.instances.get_mut(&device_id)
             && rec.requested_id == plugin_id
         {
+            // 帰属 track を必ず最新にする。ここを更新しないと、track を跨いで
+            // 同 device_id が再利用されたとき `RemoveTrack` の列挙
+            // (`rec.track_id == track_id`) から外れ、instance が永久に
+            // 回収されなくなる。
+            rec.track_id = track_id;
             tracing::info!(
                 device_id,
                 id = %plugin_id,
