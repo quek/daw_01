@@ -697,7 +697,9 @@ impl LocalState {
                     &mut self.master_l[..n],
                     &mut self.master_r[..n],
                     n,
-                    elapsed,
+                    // count-in は track の音が鳴らない専用モードなので PDC 補償しない
+                    // (揃える相手がいない = 生の経過位置で数える)。
+                    elapsed as i64,
                     sample_rate,
                     bpm,
                     tsig_num,
@@ -868,14 +870,23 @@ impl LocalState {
             // metronome click を master mix に重ねる (monitoring 専用 — export
             // 経路には存在しない)。 master mix の最後に重ねる (= track の mute /
             // solo / volume / master fx の影響を受けない「常に聞こえる guide」)。
+            //
+            // r.md #39: click の参照位置から **master の PDC 遅延** を引く。 track の音は
+            // 遅延プラグイン (linear-phase EQ 等) の分だけ遅れて master に届くのに、 click
+            // だけ生の playhead で重ねると click が先行して拍の基準に使えなくなる
+            // (REAPER / Ardour もメトロノームを遅延補償の対象にする)。 補償後の位置は曲頭
+            // 付近で負になるので符号付きで渡す (0 クランプすると 1 拍目を毎 buffer 再 trigger
+            // してしまう)。
             if playing && metronome_enabled {
                 let tsig_num = i64::from(song.time_sig.0.max(1));
+                let click_pos = playhead as i64
+                    - i64::from(self.cached_schedule.master_latency_samples);
                 render_metronome(
                     &mut self.metronome_voice,
                     &mut self.master_l[..n],
                     &mut self.master_r[..n],
                     n,
-                    playhead,
+                    click_pos,
                     sample_rate,
                     current_bpm,
                     tsig_num,

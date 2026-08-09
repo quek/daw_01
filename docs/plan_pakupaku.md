@@ -116,14 +116,20 @@ pub fn build_mouth_events(
     phonemes: &[Phoneme],
     mouth_map: &MouthMap,
     bpm: f32,
-    first_note_local_beat: f64,  // clip 内 earliest note の start_beat
+    first_phoneme_local_beat: f64,  // phoneme 列 frame 0 が来る clip-local beat
     clip_len_beats: f64,
 ) -> Vec<ImageEvent>;
 ```
 
+> **不変条件 (r.md #39)**: `first_phoneme_local_beat` は **phoneme 列の frame 0 が来る
+> 位置** = 合成 wav の先頭が来る位置。歌なら
+> `voicevox::sing_head_beat(sing_base_beat(notes), bpm)`、talk なら
+> 「発話開始 − `talk_pre_silence_frames()` 相当 beats」を呼び出し側が渡す。
+> `build_mouth_events` の内部で経路別の補正 (先頭 pau を引く等) は **しない**
+> — 音声側の配置式と口側の配置式を 1 本に保つため (多重 SSoT を作らない)。
+
 手順 (REAPER 忠実):
-1. `rest_beats = REST_FRAMES / FRAME_RATE * (bpm/60)`。
-   `cursor = first_note_local_beat - rest_beats` (先頭 pau の分手前から)。
+1. `cursor = first_phoneme_local_beat` (= phoneme 列 frame 0 = wav 先頭)。
 2. 各 phoneme:
    - shape 判定: 母音 a/i/u/e/o → 対応形 / `N` → N / `cl`/`pau` → Closed /
      子音 → **次の母音** (pau/cl で打ち切り、無ければ Closed) の形を借用。
@@ -138,8 +144,10 @@ pub fn build_mouth_events(
 5. `ImageEvent` は `Default` (全画面 rect、opacity 1、fade 0) ベース、
    `source_id` / `event_start_in_clip_beats` / `event_length_beats` のみ設定。
 
-タイミング検証: 実 phoneme は `first_note` の絶対位置に来る → 音声合成も
-同じ note 位置で鳴る (builtin が lead-in silence を skip) → 口と音声が同期。
+タイミング検証: phoneme 列 frame 0 と合成 wav 先頭が **同じ beat** に置かれ、
+どちらも「frame/sample を積むだけ」で進むので、口と音声は構造的に同期する
+(r.md #39 でこの契約に統一。旧実装は talk だけ別式で置いていたため口が
+106.67ms 遅れていた)。
 
 ## 7. GUI wiring (`daw_gui`)
 

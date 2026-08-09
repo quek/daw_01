@@ -458,11 +458,13 @@ pub fn compile_schedule(
     let mut delay_keys: Vec<DelayKey> = Vec::new();
     let track_ids: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
     let mut nodes_with_pdc: Vec<NodeOp> = Vec::with_capacity(nodes.len() + n);
+    // master 合流点で全 src が揃う latency (= metronome を同じだけ遅らせる量、r.md #39)。
+    let mut master_latency_samples: u32 = 0;
     for op in nodes.into_iter() {
         match &op {
             // clearing Mix: 全 src を最大 path latency に揃える。
-            NodeOp::Mix { srcs, .. } => {
-                emit_mix_src_alignment(
+            NodeOp::Mix { srcs, dst } => {
+                let max_path = emit_mix_src_alignment(
                     srcs,
                     &path_latency,
                     &track_ids,
@@ -470,6 +472,9 @@ pub fn compile_schedule(
                     &mut delay_keys,
                     &mut nodes_with_pdc,
                 );
+                if *dst == BufRef::Master {
+                    master_latency_samples = max_path;
+                }
             }
             // パラアウト MixAdditive (docs/plan_paraout.md): 子 (srcs) を揃える
             // のに加え、 dst (= group-with-instrument 自身の scratch にある prefix
@@ -599,6 +604,7 @@ pub fn compile_schedule(
         follower_slots,
         follower_keys,
         mod_kinds,
+        master_latency_samples,
     })
 }
 
@@ -1215,6 +1221,59 @@ mod tests {
     }
 
     // ---- PR3: Plugin Delay Compensation ----
+
+    /// r.md #39: `master_latency_samples` = master 合流点で全 src が揃えられる
+    /// latency。engine はこの値だけ metronome click の参照位置を戻して、遅延
+    /// プラグインを通った track の音と click を一致させる。
+    #[test]
+    fn master_latency_samples_is_the_max_path_latency_reaching_master() {
+        // latency 無しなら 0 (= 補償不要)。
+        let plain = Song {
+            tracks: vec![track(|t| t.id = 1)],
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&plain, 48_000, 0).unwrap().master_latency_samples,
+            0
+        );
+
+        // 直列でない 2 track のうち片方が 2048 sample 報告 → master は 2048 で揃う。
+        let latent = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.reported_latency_samples = 0;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.reported_latency_samples = 2048;
+                }),
+            ],
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&latent, 48_000, 0).unwrap().master_latency_samples,
+            2048
+        );
+
+        // group 経由 (= 親を指す子がいる) でも、子の latency が group の path latency
+        // として master へ伝わる。master src は group 1 本だけ。
+        let grouped = Song {
+            tracks: vec![
+                track(|t| t.id = 1),
+                track(|t| {
+                    t.id = 2;
+                    t.parent_group_id = Some(1);
+                    t.reported_latency_samples = 512;
+                }),
+            ],
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&grouped, 48_000, 0).unwrap().master_latency_samples,
+            512
+        );
+    }
 
     /// Compile-level test: 親子無しの 2 track が並行に master へ流れるとき、
     /// 片方のみが latency 100 を report していたら、 もう片方 (latency 0)

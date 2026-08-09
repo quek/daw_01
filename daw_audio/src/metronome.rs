@@ -30,6 +30,12 @@ pub struct ClickVoice {
 /// (decay 40 ms / amp peak 0.25 = -12 dB / freq downbeat 880 Hz, 他 440 Hz)。
 /// stereo は同 sample を L/R に均等 mix (= mono click)。
 ///
+/// `playhead_samples` は **符号付き**: r.md #39 で PDC 補償 (= master に届く音の
+/// 遅延ぶん click も遅らせる) を入れたため、曲頭付近では負の位置を取る。負の間は
+/// beat 境界を跨がないので click は鳴らず、position 0 を含む buffer で 1 回だけ
+/// 鳴る (`u64` の saturating clamp だと曲頭で beat 0 を毎 buffer 再 trigger して
+/// しまうため、ここは必ず符号付きで計算する)。
+///
 /// RT 安全: heap 確保なし、 浮動小数演算と sin() 呼び出しのみ。 bpm = 0 /
 /// sample_rate = 0 / tsig_num < 1 で no-op (defensive)。
 ///
@@ -42,7 +48,7 @@ pub fn render_metronome(
     master_l: &mut [f32],
     master_r: &mut [f32],
     frames: usize,
-    playhead_samples: u64,
+    playhead_samples: i64,
     sample_rate: u32,
     bpm: f32,
     tsig_num: i64,
@@ -106,5 +112,71 @@ pub fn render_metronome(
         if v.samples_remaining == 0 {
             *voice = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: u32 = 48_000;
+    const BPM: f32 = 120.0; // → 1 拍 = 24 000 sample
+
+    /// 1 buffer 描画して L/R を返す。
+    fn render_at(
+        voice: &mut Option<ClickVoice>,
+        pos: i64,
+        frames: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut l = vec![0.0f32; frames];
+        let mut r = vec![0.0f32; frames];
+        render_metronome(voice, &mut l, &mut r, frames, pos, SR, BPM, 4);
+        (l, r)
+    }
+
+    /// 区間の絶対値和 (= その範囲に click が乗っているか)。
+    fn energy(buf: &[f32], range: std::ops::Range<usize>) -> f32 {
+        buf[range].iter().map(|v| v.abs()).sum()
+    }
+
+    #[test]
+    fn click_starts_exactly_at_the_beat_boundary() {
+        let mut v = None;
+        // 拍 1 の境界 = 24 000 sample → buffer [23 900, 24 412) の offset 100。
+        let (l, r) = render_at(&mut v, 23_900, 512);
+        assert_eq!(energy(&l, 0..100), 0.0, "境界より前は無音");
+        assert!(energy(&l, 100..512) > 0.0, "境界から click が鳴る");
+        assert_eq!(l, r, "mono click を L/R 均等に");
+    }
+
+    #[test]
+    fn negative_position_is_silent_and_beat_zero_fires_once() {
+        // r.md #39: PDC 補償で click の参照位置は曲頭付近で負になる。負の間は拍境界を
+        // 跨がないので無音、0 を含む buffer で 1 拍目が 1 回だけ鳴る。u64 の 0 クランプ
+        // だと負の buffer 全部が「境界 0 を含む」と誤判定して毎 buffer 再 trigger する。
+        let mut v = None;
+        let mut start = -5_120i64;
+        while start < 0 {
+            let (l, _) = render_at(&mut v, start, 512);
+            assert_eq!(energy(&l, 0..512), 0.0, "start={start} は拍境界を跨がない");
+            assert!(v.is_none(), "start={start} で voice が立ってはいけない");
+            start += 512;
+        }
+        let (l, _) = render_at(&mut v, 0, 512);
+        assert!(energy(&l, 0..512) > 0.0, "曲頭 (位置 0) で 1 拍目が鳴る");
+    }
+
+    #[test]
+    fn pdc_compensation_shifts_the_click_later_by_the_same_amount() {
+        // 参照位置を latency 分だけ手前にする = buffer 内で同じだけ遅れて鳴る
+        // (= 遅延プラグインを通った track の音と揃う)。
+        let mut plain = None;
+        let (l0, _) = render_at(&mut plain, 24_000, 512);
+        assert!(energy(&l0, 0..512) > 0.0, "補償なしは buffer 先頭で鳴る");
+
+        let mut compensated = None;
+        let (l1, _) = render_at(&mut compensated, 24_000 - 200, 512);
+        assert_eq!(energy(&l1, 0..200), 0.0, "補償量ぶん遅れる");
+        assert!(energy(&l1, 200..512) > 0.0);
     }
 }

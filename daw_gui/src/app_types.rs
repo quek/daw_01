@@ -1536,8 +1536,10 @@ pub struct LipsyncClipResult {
     pub clip_start_beat: f64,
     /// 生成先 clip の length_beats (= 元 vocal clip と揃える)。
     pub clip_len_beats: f64,
-    /// clip 内 earliest note の clip-local start_beat (REST offset 配置の基準)。
-    pub first_note_local_beat: f64,
+    /// phoneme 列の **frame 0** が来る clip-local beat (= 合成 wav の先頭が来る位置)。
+    /// 歌なら `voicevox::sing_head_beat(基準ノート)`、talk なら「発話開始 − pre-silence」。
+    /// `common::lipsync::build_mouth_events` にそのまま渡す (r.md #39)。
+    pub first_phoneme_local_beat: f64,
     /// (talk) この結果の元ソーストラックの並び順 index (= 口パク優先度)。複数の
     /// ソーストラック (歌唱 Vox / 読み上げ Talk 等) が同じ口 track を出力先に
     /// 指定したとき、時間が重なる部分は **index が小さい (= 上の) トラック**が

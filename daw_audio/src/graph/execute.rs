@@ -611,6 +611,7 @@ pub fn execute_schedule_post_dispatch(
         follower_slots,
         follower_keys: _,
         mod_kinds: _,
+        master_latency_samples: _,
     } = schedule;
     for op in nodes.iter() {
         match op {

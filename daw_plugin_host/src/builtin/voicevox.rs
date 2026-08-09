@@ -38,8 +38,8 @@ use common::plugin_format::PluginFormat;
 use common::plugin_metadata::{NoteMetadata, TalkMetadata};
 use common::protocol::{RenderMode, VocalSynthFailure};
 use crate::builtin::voicevox_synth::{
-    BuiltinNoteSpec, BuiltinSynthOutput, SynthError, lead_in_frames,
-    synthesize_notes_for_builtin, synthesize_talk_for_builtin,
+    BuiltinNoteSpec, BuiltinSynthOutput, SynthError, synthesize_notes_for_builtin,
+    synthesize_talk_for_builtin,
 };
 
 use crate::plugin_instance::{
@@ -97,7 +97,74 @@ struct TalkSynthSpec {
 
 /// 合成済み 1 声グループの配置結果。
 /// `(buffer 配置サンプル位置, mono WAV, [(note_id, buffer 内絶対 offset)])`。
-type PlacedGroup = (usize, Vec<f32>, Vec<(u32, u64)>);
+///
+/// 配置位置は **符号付き**: 各 WAV は自分の先頭無音 (歌の leading rest / talk の
+/// pre-silence) 分だけ手前に置かれるので、曲頭付近のクリップでは負になる
+/// (r.md #39)。負の分は「曲頭より前 = 再生され得ない」ので mix 時に切り落とす。
+type PlacedGroup = (i64, Vec<f32>, Vec<(u32, u64)>);
+
+/// 歌グループ wav の配置位置 = **wav frame 0 が来る曲 sample 位置**
+/// (= 基準ノート [`common::voicevox::sing_base_beat`] の `REST_FRAMES` 手前)。
+///
+/// r.md #39 の単一契約「合成 buffer の index N = 曲の sample 位置 N」を満たすため、
+/// query が wav 先頭に入れた leading rest は **配置側がここで吸収する**。曲頭付近では
+/// 負になる (= 先頭無音が曲より手前) ので符号付き。
+fn sing_place_samples(base_beat: f64, bpm: f32, sample_rate: u32) -> i64 {
+    let spb = f64::from(sample_rate) * 60.0 / f64::from(bpm.max(0.001));
+    (common::voicevox::sing_head_beat(base_beat, bpm) * spb).round() as i64
+}
+
+/// talk wav の `(配置位置 = wav frame 0 の曲 sample, 発話開始の曲 sample)`。
+///
+/// talk wav の先頭無音は [`common::voicevox::TALK_PRE_PHONEME_LENGTH`] (= 0) で消して
+/// あるので通常は両者一致 (= クリップ位置がそのまま発話開始)。定数を変えたときも配置が
+/// 追従するよう、無音量は式で引く (歌の leading rest と同じ扱い)。
+fn talk_place_samples(
+    start_beat: f64,
+    speed_scale: f32,
+    bpm: f32,
+    sample_rate: u32,
+) -> (i64, i64) {
+    let spb = f64::from(sample_rate) * 60.0 / f64::from(bpm.max(0.001));
+    let pre_silence = common::voicevox::frames_to_samples(
+        f64::from(common::voicevox::talk_pre_silence_frames(speed_scale)),
+        sample_rate,
+    )
+    .round() as i64;
+    let speech_start = (start_beat * spb).round() as i64;
+    (speech_start - pre_silence, speech_start)
+}
+
+/// 配置済み各 wav を 1 本の song-absolute buffer へ加算合成する。
+///
+/// `place` が負の wav は曲頭より手前の部分 (= 再生され得ない先頭無音) を切り落として
+/// index 0 に貼る。戻り値は `(buffer, note_id → 曲 sample 位置)`。
+fn mix_placed_groups(placed: &[PlacedGroup]) -> (Vec<f32>, HashMap<u32, u64>) {
+    // track 長 = max(placement + WAV 長)。placement は負にもなり得るので 0 でクランプ。
+    // 位置は f64 → i64 の飽和キャスト由来なので saturating で回す (壊れた project の
+    // 巨大な start_beat でも panic させない)。
+    let total = placed
+        .iter()
+        .map(|(p, s, _)| p.saturating_add(s.len() as i64).max(0) as usize)
+        .max()
+        .unwrap_or(0);
+    let mut buf = vec![0.0f32; total];
+    let mut offsets: HashMap<u32, u64> = HashMap::new();
+    for (place, samples, abs) in placed {
+        let skip = place.saturating_neg().max(0) as usize;
+        if skip < samples.len() {
+            let start = place.saturating_add(skip as i64).max(0) as usize;
+            // 重なる clip は mix (加算)。
+            for (i, s) in samples[skip..].iter().enumerate() {
+                buf[start + i] += *s;
+            }
+        }
+        for (nid, off) in abs {
+            offsets.insert(*nid, *off);
+        }
+    }
+    (buf, offsets)
+}
 
 /// 合成完了時に共有される結果 (synth thread が store、audio half が
 /// lock-free load)。
@@ -208,12 +275,13 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
             // クリップとして通し再生するので click が無い)。 連続読み出しなら retrigger が
             // 消え、 録音そのものを再生するので click は原理的に発生しない。
             //
-            // 拍 → buffer 位置: `buf_pos(beat) = beat * samples_per_beat + lead_in`。
+            // 拍 → buffer 位置: `buf_pos(beat) = beat * samples_per_beat`。
+            // **buffer index N = 曲の sample 位置 N** が唯一の契約 (r.md #39)。各ソースの
+            // 先頭無音 (歌の leading rest / talk の pre-silence) は synth thread が配置時に
+            // 吸収済みなので、読み出し側は補正オフセットを **一切持たない**。旧実装は歌用の
+            // lead-in を全ソース共通に足しており、talk が話速依存で -53〜+96ms ずれていた。
             // `samples_per_beat` は配置時 (synth 時 job.bpm) の値を SynthResult に持ち回る
             // (再生時 transport.bpm ではなく = tempo 変更過渡の drift を避ける、 下記参照)。
-            // `lead_in` は build_sing_query が wav 先頭に入れる attack 用無音で、 note 音声開始は
-            // beat-grid から lead_in 分後ろにある → 読み出しを lead_in 進める (`lead_in_frames`
-            // を synth と共有 = SSoT)。
             if let Some(res) = snapshot.as_ref() {
                 let src_len = res.samples.len();
                 if host_sr > 0.0 && res.sample_rate > 0 && res.samples_per_beat > 0.0 && src_len > 0
@@ -222,11 +290,8 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
                     // 拍→buffer 位置は **synth 時の** samples_per_beat を使う (transport.bpm ではない)。
                     // buffer は job.bpm で配置され、 song_pos_beats は tempo 積分済の真の拍位置なので、
                     // これで定テンポは常に厳密、 tempo 変更過渡でも base が各 buffer で song_pos_beats から
-                    // 再同期する。 talk は自前の pre-silence を持ち lead_in を配置に含めないため、 この
-                    // lead_in 加算で ~7ms 早まるが (VOICEVOX 既定 prePhonemeLength≈lead_in)、 sing の
-                    // 拍合わせ (歌声が主用途) を優先する。
-                    let base =
-                        transport.song_pos_beats * res.samples_per_beat + lead_in_frames(res.sample_rate);
+                    // 再同期する。
+                    let base = transport.song_pos_beats * res.samples_per_beat;
                     let ratio = src_sr / host_sr;
                     for k in 0..out_n {
                         let pos = base + k as f64 * ratio;
@@ -259,9 +324,12 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
                 if let crate::plugin_instance::NoteTransition::On { note_id, velocity, .. } =
                     ev.event
                     && let Some(res) = snapshot.as_ref()
+                    // offset が無い note (= まだ合成されていない / 重なりで query から
+                    // 落ちた) は試聴しない。 `unwrap_or(0)` にすると曲頭から再生されて
+                    // しまい「押した音と違う音が出る」ため (r.md #39)。
+                    && let Some(&synth_offset) = res.note_offsets.get(&note_id)
                 {
-                    let synth_offset =
-                        res.note_offsets.get(&note_id).copied().unwrap_or(0) as usize;
+                    let synth_offset = synth_offset as usize;
                     if synth_offset < res.samples.len() {
                         self.preview = Some(PreviewVoice {
                             cursor: synth_offset as f64,
@@ -532,34 +600,25 @@ impl VoicevoxBuiltin {
                             job.bpm,
                             spec.speaker_id,
                         ) {
-                            Ok(BuiltinSynthOutput {
+                            // 歌える note が無いグループは無音として skip (エラーではない)。
+                            Ok(None) => {}
+                            Ok(Some(BuiltinSynthOutput {
                                 samples,
                                 sample_rate,
+                                base_beat,
                                 note_offsets,
-                            }) => {
+                            })) => {
                                 out_sr = sample_rate;
-                                let spb = f64::from(sample_rate) * 60.0
-                                    / f64::from(job.bpm.max(0.001));
-                                // placement = この声グループ先頭ノートの
-                                // song-absolute サンプル位置。全グループを
-                                // earliest*spb 配置に統一すると cursor 差が
-                                // lead_in で揃い、rolling voice が境界の手前で
-                                // 次グループを先取りしない。
-                                let earliest = spec
-                                    .notes
-                                    .iter()
-                                    .map(|n| n.start_beat)
-                                    .fold(f64::INFINITY, f64::min);
-                                let place_samples = if earliest.is_finite() {
-                                    (earliest * spb).max(0.0).round() as usize
-                                } else {
-                                    0
-                                };
-                                // 各ノートの絶対 offset = placement + local offset。
+                                let place_samples =
+                                    sing_place_samples(base_beat, job.bpm, sample_rate);
+                                // 各ノートの絶対 offset = placement + wav 内実位置。
                                 let abs: Vec<(u32, u64)> = note_offsets
                                     .iter()
                                     .map(|(nid, off)| {
-                                        (*nid, (place_samples as u64).saturating_add(*off))
+                                        (
+                                            *nid,
+                                            place_samples.saturating_add(*off as i64).max(0) as u64,
+                                        )
                                     })
                                     .collect();
                                 placed.push((place_samples, samples, abs));
@@ -591,14 +650,16 @@ impl VoicevoxBuiltin {
                             ) {
                                 Ok((samples, sample_rate)) => {
                                     out_sr = sample_rate;
-                                    let spb = f64::from(sample_rate) * 60.0
-                                        / f64::from(job.bpm.max(0.001));
-                                    let place_samples =
-                                        (tspec.start_beat * spb).max(0.0).round() as usize;
+                                    let (head, speech_start) = talk_place_samples(
+                                        tspec.start_beat,
+                                        tspec.scales.speed_scale,
+                                        job.bpm,
+                                        sample_rate,
+                                    );
                                     placed.push((
-                                        place_samples,
+                                        head,
                                         samples,
-                                        vec![(tspec.event_id, place_samples as u64)],
+                                        vec![(tspec.event_id, speech_start.max(0) as u64)],
                                     ));
                                 }
                                 Err(SynthError::Unreachable(e)) => {
@@ -637,23 +698,7 @@ impl VoicevoxBuiltin {
                         if placed.is_empty() {
                             result_arc.store(None);
                         } else {
-                            // track 長 = max(placement + WAV 長)。
-                            let total = placed
-                                .iter()
-                                .map(|(p, s, _)| p + s.len())
-                                .max()
-                                .unwrap_or(0);
-                            let mut buf = vec![0.0f32; total];
-                            let mut global_offsets: HashMap<u32, u64> = HashMap::new();
-                            for (place, samples, abs) in &placed {
-                                // 重なる clip は mix (加算)。
-                                for (i, s) in samples.iter().enumerate() {
-                                    buf[place + i] += *s;
-                                }
-                                for (nid, off) in abs {
-                                    global_offsets.insert(*nid, *off);
-                                }
-                            }
+                            let (buf, global_offsets) = mix_placed_groups(&placed);
                             // 配置は各 group で spb = out_sr*60/job.bpm を使っている (sing/talk 共通)。
                             // 連続再生の拍→buffer 写像に同じ値を持ち回る (r.md #23)。
                             let samples_per_beat =
@@ -1093,34 +1138,34 @@ mod tests {
         p.deactivate();
     }
 
-    /// lead_in は 48kHz で 5120 sample (= 10 frame / 93.75fps × 48000)。 buf は
-    /// song-absolute なので、 十分長い ramp buf を作れば連続再生の写像を厳密検証できる。
+    /// buf は song-absolute (index N = 曲 sample N) なので、 十分長い ramp buf を
+    /// 作れば連続再生の写像を厳密検証できる。
     fn ramp_buf(len: usize) -> Vec<f32> {
         (0..len).map(|i| i as f32).collect()
     }
 
-    /// r.md #23: 再生中は playhead 位置から buf を連続読み出しする (note_on retrigger
-    /// を廃止)。 拍 → buffer 位置 = `beat*spb + lead_in`。 lead_in の反映と連続性を検証。
+    /// r.md #39: 再生中の読み出しは `buf index = 曲 sample` の恒等写像。読み出し側は
+    /// 補正オフセットを **一切持たない** (先頭無音は配置側が吸収済み)。
     #[test]
-    fn continuous_playback_reads_buf_at_playhead() {
+    fn continuous_playback_maps_song_sample_to_buf_index() {
         let (mut h, result) = mk_half(48_000.0);
-        // lead_in(5120) を含むよう十分長い buf。 buf[i] = i。
         result.store(Some(Arc::new(SynthResult {
             samples: Arc::new(ramp_buf(8192)),
             sample_rate: 48_000,
             samples_per_beat: 24_000.0, // 48000*60/120
             note_offsets: Arc::new(HashMap::new()),
         })));
-        // playhead = 拍 0 → base = 0*spb + lead_in(5120)。 host==synth なので ratio=1。
+        // playhead = 拍 0 → base = 0。 host==synth なので ratio=1 → out[k] = buf[k]。
         h.process(64, &[], &[], &[], &[], &transport_playing(0.0)).unwrap();
-        assert!((h.out_l[0] - 5120.0).abs() < 1e-3, "out_l[0]={}", h.out_l[0]);
-        assert!((h.out_l[10] - 5130.0).abs() < 1e-3, "out_l[10]={}", h.out_l[10]);
+        assert!((h.out_l[0] - 0.0).abs() < 1e-3, "out_l[0]={}", h.out_l[0]);
+        assert!((h.out_l[10] - 10.0).abs() < 1e-3, "out_l[10]={}", h.out_l[10]);
         // 左右同一 (mono → stereo)。
         assert_eq!(h.out_l[10], h.out_r[10]);
-        // playhead = 拍 0.01 → base = 0.01*24000 + 5120 = 5360。 note_on 無しでも
-        // playhead から鳴る (mid-phrase 再生開始でも欠落しない)。
-        h.process(64, &[], &[], &[], &[], &transport_playing(0.01)).unwrap();
-        assert!((h.out_l[0] - 5360.0).abs() < 1e-3, "out_l[0]={}", h.out_l[0]);
+        // playhead = 拍 0.25 → base = 0.25*24000 = 6000。 note_on 無しでも playhead
+        // から鳴る (mid-phrase 再生開始でも欠落しない)。
+        h.process(64, &[], &[], &[], &[], &transport_playing(0.25)).unwrap();
+        assert!((h.out_l[0] - 6000.0).abs() < 1e-3, "out_l[0]={}", h.out_l[0]);
+        assert!((h.out_l[7] - 6007.0).abs() < 1e-3, "out_l[7]={}", h.out_l[7]);
     }
 
     /// A9 (r.md #8): 合成 wav (48000Hz) を非48kHz 出力デバイス (24000Hz) へ連続再生
@@ -1134,10 +1179,99 @@ mod tests {
             samples_per_beat: 24_000.0, // 48000*60/120
             note_offsets: Arc::new(HashMap::new()),
         })));
-        // base = 0*spb + lead_in(5120)。 ratio 2.0 → out frame k = buf[5120 + 2k]。
-        h.process(64, &[], &[], &[], &[], &transport_playing(0.0)).unwrap();
-        assert!((h.out_l[1] - 5122.0).abs() < 1e-3, "out_l[1]={}", h.out_l[1]);
-        assert!((h.out_l[10] - 5140.0).abs() < 1e-3, "out_l[10]={}", h.out_l[10]);
+        // base = 拍 0.25 × 24000 = 6000。 ratio 2.0 → out frame k = buf[6000 + 2k]。
+        h.process(64, &[], &[], &[], &[], &transport_playing(0.25)).unwrap();
+        assert!((h.out_l[1] - 6002.0).abs() < 1e-3, "out_l[1]={}", h.out_l[1]);
+        assert!((h.out_l[10] - 6020.0).abs() < 1e-3, "out_l[10]={}", h.out_l[10]);
+    }
+
+    // ---- 配置 × 読み出しの合成写像 (r.md #39) -------------------------------
+
+    /// 48kHz で歌 query の leading rest が占める sample 数 (= 10 frame / 93.75fps)。
+    fn lead_samples(sr: u32) -> usize {
+        common::voicevox::frames_to_samples(f64::from(common::voicevox::REST_FRAMES), sr)
+            .round() as usize
+    }
+
+    /// 「配置 (synth thread) → mix → 読み出し (process)」の合成が、曲の sample 位置と
+    /// 厳密に一致することの回帰テスト。読み出し側に補正オフセットが復活したら落ちる。
+    #[test]
+    fn sing_placement_and_reader_compose_to_song_sample_identity() {
+        let sr = 48_000u32;
+        let bpm = 120.0f32; // spb = 24 000
+        let base_beat = 2.0;
+        // 配置 = 基準ノートの leading rest ぶん手前 = 48 000 − 5 120。
+        let place = sing_place_samples(base_beat, bpm, sr);
+        assert_eq!(place, 42_880);
+
+        // wav: 先頭 leading rest は無音、その直後 (= 基準ノート) から 1,2,3...。
+        let lead = lead_samples(sr);
+        let mut wav = vec![0.0f32; lead + 1_000];
+        for (i, v) in wav[lead..].iter_mut().enumerate() {
+            *v = (i + 1) as f32;
+        }
+        let note_abs = place + lead as i64;
+        let (buf, offsets) = mix_placed_groups(&[(place, wav, vec![(7, note_abs as u64)])]);
+        // note の曲位置 = 拍 2.0 の sample (= 2.0 × 24 000)。
+        assert_eq!(offsets[&7], 48_000);
+
+        // 読み出し: playhead 拍 2.0 の 1 sample 目が「基準ノートの 1 sample 目」。
+        let (mut h, result) = mk_half(f64::from(sr));
+        result.store(Some(Arc::new(SynthResult {
+            samples: Arc::new(buf),
+            sample_rate: sr,
+            samples_per_beat: 24_000.0,
+            note_offsets: Arc::new(offsets),
+        })));
+        h.process(64, &[], &[], &[], &[], &transport_playing(2.0)).unwrap();
+        assert!(
+            (h.out_l[0] - 1.0).abs() < 1e-3,
+            "拍 2.0 で基準ノートの先頭が鳴る: out_l[0]={}",
+            h.out_l[0]
+        );
+        assert!((h.out_l[9] - 10.0).abs() < 1e-3, "out_l[9]={}", h.out_l[9]);
+    }
+
+    #[test]
+    fn talk_placement_is_speed_independent() {
+        // r.md #39 原因 2: 先頭無音を 0 にしたので、話速を変えても「クリップ位置 =
+        // 発話開始」。旧実装は engine 既定 0.1s の無音と歌用 lead-in の差で
+        // -53〜+96ms 動いていた。
+        for speed in [0.5f32, 0.8, 1.0, 1.2, 1.5, 2.0] {
+            assert_eq!(
+                talk_place_samples(1.0, speed, 120.0, 48_000),
+                (24_000, 24_000),
+                "speed={speed}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_before_song_start_is_trimmed_not_shifted() {
+        // 曲頭 (拍 0) の歌は leading rest が曲より手前に来る。捨てるのはその無音だけで、
+        // 実音は 1 sample もずらさない。
+        let place = sing_place_samples(0.0, 120.0, 48_000);
+        assert_eq!(place, -5_120);
+        let lead = lead_samples(48_000);
+        let wav: Vec<f32> = (0..lead + 500).map(|i| i as f32).collect();
+        let (buf, offsets) = mix_placed_groups(&[(place, wav, vec![(3, 0)])]);
+        assert_eq!(buf.len(), 500, "曲頭より前の 5 120 sample を捨てる");
+        assert!(
+            (buf[0] - lead as f32).abs() < 1e-3,
+            "曲 sample 0 に来るのは wav[5120]: {}",
+            buf[0]
+        );
+        assert_eq!(offsets[&3], 0);
+    }
+
+    #[test]
+    fn overlapping_groups_are_summed() {
+        // 声グループ / 読み上げが重なる区間は加算 mix。
+        let (buf, _) = mix_placed_groups(&[
+            (0, vec![1.0, 1.0, 1.0], vec![]),
+            (2, vec![10.0, 10.0], vec![]),
+        ]);
+        assert_eq!(buf, vec![1.0, 1.0, 11.0, 10.0]);
     }
 
     /// 停止中の鍵盤プレビュー: note_on で該当 note 位置から free-run 再生し、

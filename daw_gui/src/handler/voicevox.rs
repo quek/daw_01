@@ -464,7 +464,10 @@ impl AppData {
             // 内容のみをハッシュする (= 非対象 clip の移動では fingerprint 不変)。
             for clip in &src.clips {
                 let content = song.clip_contents.get(&clip.content_id);
-                if let Some(notes) = content.and_then(|c| c.notes()).filter(|n| !n.is_empty()) {
+                if let Some(notes) = content
+                    .and_then(|c| c.notes())
+                    .filter(|n| common::voicevox::sing_base_beat(n).is_some())
+                {
                     // sing: clip 位置 + build_sing_query が読む note フィールドのみ。
                     clip.start_beat.to_bits().hash(&mut h);
                     clip.length_beats.to_bits().hash(&mut h);
@@ -612,7 +615,6 @@ impl AppData {
             return;
         }
         let bpm = self.song_doc.song().bpm;
-        let lead_in = common::lipsync::lead_in_beats(bpm);
         // (talk) target 中心: 出力先が `target_id` の **全ソーストラック** をまとめて
         // 再生成する (`docs/plan_voicevox_talk.md`)。トラック並び順 index を priority に
         // し、apply 側で重なりを上位優先で解決する。各 clip は notes (歌唱) があれば sing、
@@ -626,28 +628,26 @@ impl AppData {
             }
             let priority = idx as u32;
             for clip in &src.clips {
-                // sing: notes を持つ clip。
+                // sing: notes を持つ clip。phoneme 列 frame 0 は「基準ノートの
+                // `REST_FRAMES` 手前」に来る (= 合成 wav 先頭と同じ位置、r.md #39)。
                 if let Some(notes) = self
                     .song_doc.song()
                     .clip_contents
                     .get(&clip.content_id)
                     .and_then(|c| c.notes())
-                    && !notes.is_empty()
+                    && let Some(base) = common::voicevox::sing_base_beat(notes)
                 {
-                    let first_note_local_beat = notes
-                        .iter()
-                        .map(|n| n.start_beat)
-                        .fold(f64::INFINITY, f64::min);
                     snaps.push((
                         clip.start_beat,
                         clip.length_beats,
-                        first_note_local_beat,
+                        common::voicevox::sing_head_beat(base, bpm),
                         priority,
                         notes.to_vec(),
                     ));
                     continue;
                 }
-                // talk: Text clip の先頭の非空 TextEvent。
+                // talk: Text clip の先頭の非空 TextEvent。phoneme 列 frame 0 = wav 先頭 =
+                // 「発話開始の pre-silence 分手前」(現行 pre-silence は 0 なので event 開始)。
                 if let Some(events) = self
                     .song_doc.song()
                     .clip_contents
@@ -655,14 +655,21 @@ impl AppData {
                     .and_then(|c| c.text_events())
                     && let Some(ev) = events.iter().find(|e| !e.text.is_empty())
                 {
+                    let scales = clip.talk.unwrap_or_default();
+                    let pre_beats = common::voicevox::frames_to_beats(
+                        f64::from(common::voicevox::talk_pre_silence_frames(
+                            scales.speed_scale,
+                        )),
+                        bpm,
+                    );
                     talk_snaps.push((
                         clip.start_beat,
                         clip.length_beats,
-                        ev.event_start_in_clip_beats + lead_in,
+                        ev.event_start_in_clip_beats - pre_beats,
                         priority,
                         ev.text.clone(),
                         clip.speaker_id,
-                        clip.talk.unwrap_or_default(),
+                        scales,
                     ));
                 }
             }
@@ -687,12 +694,12 @@ impl AppData {
         let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             let mut clips = Vec::with_capacity(snaps.len() + talk_snaps.len());
-            for (clip_start_beat, clip_len_beats, first_note_local_beat, priority, notes) in snaps {
+            for (clip_start_beat, clip_len_beats, first_phoneme_local_beat, priority, notes) in snaps {
                 match crate::voicevox_client::query_phonemes(&notes, bpm) {
                     Ok(phonemes) => clips.push(LipsyncClipResult {
                         clip_start_beat,
                         clip_len_beats,
-                        first_note_local_beat,
+                        first_phoneme_local_beat,
                         priority,
                         phonemes,
                     }),
@@ -703,14 +710,14 @@ impl AppData {
             }
             // (talk) 読み上げ phoneme を `query_talk_phonemes` で取り、同じ
             // `LipsyncClipResult` に詰める (= apply 経路は歌唱と共通)。
-            for (clip_start_beat, clip_len_beats, first_note_local_beat, priority, text, speaker_id, scales) in
+            for (clip_start_beat, clip_len_beats, first_phoneme_local_beat, priority, text, speaker_id, scales) in
                 talk_snaps
             {
                 match crate::voicevox_client::query_talk_phonemes(&text, speaker_id, &scales) {
                     Ok(phonemes) => clips.push(LipsyncClipResult {
                         clip_start_beat,
                         clip_len_beats,
-                        first_note_local_beat,
+                        first_phoneme_local_beat,
                         priority,
                         phonemes,
                     }),
@@ -774,7 +781,7 @@ impl AppData {
                     &r.phonemes,
                     &mouth_map,
                     bpm,
-                    r.first_note_local_beat,
+                    r.first_phoneme_local_beat,
                     r.clip_len_beats,
                 );
                 for ev in events {

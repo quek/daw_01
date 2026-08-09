@@ -205,6 +205,14 @@ pub struct Schedule {
     /// で `song_beat` から直接算出され、その slot の `follower_slots` 値は使われない
     /// (inert)。envelope follower の slot は `follower_slots[slot].env` を使う。
     pub mod_kinds: Vec<common::model::ModSourceKind>,
+    /// master bus に到達する音の PDC 遅延量 (samples) = master `Mix` の src の
+    /// `path_latency` 最大値 (= 全 src がこの値に揃えられる)。
+    ///
+    /// r.md #39: metronome click は `render_master_buffer` の **後** に生の playhead で
+    /// 重ねるため、latency を報告するプラグインが 1 つでもあると click だけが早く鳴る。
+    /// engine はこの値だけ click の参照位置を戻して、他の音と同じ時間軸に揃える
+    /// (REAPER / Ardour もメトロノームを遅延補償の対象にする)。
+    pub master_latency_samples: u32,
 }
 
 impl Schedule {
@@ -218,6 +226,7 @@ impl Schedule {
             follower_slots: Vec::new(),
             follower_keys: Vec::new(),
             mod_kinds: Vec::new(),
+            master_latency_samples: 0,
         }
     }
 
