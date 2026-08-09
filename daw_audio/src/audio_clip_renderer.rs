@@ -33,6 +33,15 @@ use common::model::{
 /// receive loop, the decode worker, and the audio render thread —
 /// the audio thread only ever clones the `Arc`, never the bytes.
 pub struct AudioSourceBuffer {
+    /// **このバッファの同一性**: decode 元の解決済み絶対パス。
+    ///
+    /// `AudioClipRenderer::sources` の key である `AudioSourceId` は
+    /// **Song スコープの名前**でしかない (`IdAllocators::next_audio_source_id`
+    /// は project ごとに 1 から再採番される)。id 一致だけで前 renderer の
+    /// バッファを再利用すると、別 project を開いたとき **前の project の音源が
+    /// 鳴る**。再利用の可否はこの origin の一致で判定する (= キャッシュの
+    /// 同一性はキャッシュされた値自身が持つ)。
+    pub origin: std::path::PathBuf,
     pub sample_rate: u32,
     pub channels: u16,
     pub frames: u64,
@@ -42,9 +51,17 @@ pub struct AudioSourceBuffer {
 impl AudioSourceBuffer {
     /// Empty silent buffer — used as a placeholder when the source is
     /// missing or still decoding. Allocates `frames` zeros per channel.
-    pub fn silent(sample_rate: u32, channels: u16, frames: u64) -> Self {
+    /// `origin` は placeholder が「どの file の代わりか」 (= 再利用判定の
+    /// 同一性)。
+    pub fn silent(
+        origin: std::path::PathBuf,
+        sample_rate: u32,
+        channels: u16,
+        frames: u64,
+    ) -> Self {
         let ch = channels.max(1) as usize;
         Self {
+            origin,
             sample_rate,
             channels,
             frames,
@@ -162,11 +179,31 @@ pub fn decode_audio(path: &Path) -> Result<AudioSourceBuffer> {
     let decoded = common::audio_decode::decode_audio_file(path)
         .map_err(|e| anyhow::anyhow!("decode {}: {e}", path.display()))?;
     Ok(AudioSourceBuffer {
+        origin: path.to_path_buf(),
         sample_rate: decoded.sample_rate,
         channels: decoded.channels,
         frames: decoded.frames,
         samples: decoded.samples,
     })
+}
+
+/// `AudioSource` が実際にどのファイルを指すかを解決する (= decode 元、かつ
+/// キャッシュ再利用の同一性)。`ProjectRelative` は `project_dir` 基準、
+/// `Absolute` はそのまま。`Generated` はファイルを持たない (PR-V4 で廃止、
+/// decode 対象外) ので `None`。
+///
+/// `compile_audio_schedule` と [`has_undecoded_sources`] が **同じ判定**を
+/// 使うための単一定義 — ここがズレると「再利用もされず decode も予約されない
+/// 源」が生まれて恒久的に無音になる。
+pub fn resolve_source_path(
+    source: &common::model::AudioSource,
+    project_dir: Option<&Path>,
+) -> Option<std::path::PathBuf> {
+    match &source.path {
+        AudioSourcePath::Absolute(abs) => Some(abs.clone()),
+        AudioSourcePath::ProjectRelative(rel) => project_dir.map(|dir| dir.join(rel)),
+        AudioSourcePath::Generated { .. } => None,
+    }
 }
 
 /// Build an `AudioClipRenderer` snapshot from the current Song. Walks
@@ -208,11 +245,30 @@ pub fn compile_audio_schedule(
 
     // -- Resolve every AudioSource into a decoded buffer ----------------------
     for (&id, source) in &song.media.audio_sources {
-        // (A) reuse an already-decoded buffer from the live renderer. Source ids
-        //     are stable and never recycled, so a matching id is the same file —
-        //     no re-decode needed (r.md #7 decode 再設計 A)。
+        let Some(abs) = resolve_source_path(source, project_dir) else {
+            // 解決できないのは 2 通りだけ: (a) `project_dir` 未設定の
+            // `ProjectRelative`、(b) `Generated` (PR-V4 で廃止 — VOICEVOX は
+            // builtin plugin 経由)。どちらも decode 対象外なので skip する。
+            // IPC 受信ループ上なので `unreachable!` 等で panic させない
+            // (audio プロセスごと落ちる)。
+            tracing::warn!(
+                source_id = id,
+                path = ?source.path,
+                "audio source path unresolved (project_dir unset or Generated); skipping"
+            );
+            continue;
+        };
+        // (A) reuse an already-decoded buffer from the live renderer — ただし
+        //     **同じファイルを decode したものに限る** (r.md #7 decode 再設計 A)。
+        //     `AudioSourceId` は Song スコープの名前で、project ごとに 1 から
+        //     再採番される。id 一致だけで再利用すると、別 project を開いたときに
+        //     前 project の音源が id 衝突でそのまま鳴る (しかも
+        //     `has_undecoded_sources` が false になり decode も走らない)。
+        //     同一 project 内の再 compile (BPM 変更 / 編集 / scrub) では origin が
+        //     一致するので、従来どおり decode ゼロで済む。
         if let Some(prev) = prev
             && let Some(buf) = prev.sources.get(&id)
+            && buf.origin == abs
         {
             sources.insert(id, Arc::clone(buf));
             continue;
@@ -222,37 +278,14 @@ pub fn compile_audio_schedule(
         if !decode_missing {
             continue;
         }
-        let buffer = match &source.path {
-            AudioSourcePath::ProjectRelative(rel) => {
-                let Some(dir) = project_dir else {
-                    tracing::warn!(?rel, "ProjectRelative source but project_dir is unset; skipping");
-                    continue;
-                };
-                let abs = dir.join(rel);
-                match decode_audio(&abs) {
-                    Ok(buf) => Arc::new(buf),
-                    Err(e) => {
-                        tracing::error!(error = ?e, path = %abs.display(), "decode failed");
-                        continue;
-                    }
-                }
+        match decode_audio(&abs) {
+            Ok(buf) => {
+                sources.insert(id, Arc::new(buf));
             }
-            AudioSourcePath::Absolute(abs) => match decode_audio(abs) {
-                Ok(buf) => Arc::new(buf),
-                Err(e) => {
-                    tracing::error!(error = ?e, path = %abs.display(), "decode failed");
-                    continue;
-                }
-            },
-            AudioSourcePath::Generated { id: gen_id } => {
-                tracing::warn!(
-                    gen_id,
-                    "PR-V4: AudioSourcePath::Generated は廃止 (VOICEVOX は builtin plugin 経由)、 skipping"
-                );
-                continue;
+            Err(e) => {
+                tracing::error!(error = ?e, path = %abs.display(), "decode failed");
             }
-        };
-        sources.insert(id, buffer);
+        }
     }
 
     // -- Flatten every audio clip's events into RenderedEvent ----------------
@@ -352,10 +385,26 @@ pub fn compile_audio_schedule(
 /// Does `song` reference any file-backed `AudioSource` that `renderer` has not
 /// decoded yet? `true` ⇒ the background decode worker must run a full compile to
 /// fill them in. `Generated` sources are excluded (never decoded here).
-pub fn has_undecoded_sources(song: &Song, renderer: &AudioClipRenderer) -> bool {
+///
+/// 「decode 済み」の判定は `compile_audio_schedule` の再利用条件と**同一**
+/// (id 一致 **かつ** origin 一致) でなければならない。id だけで見ると、別
+/// project の同 id バッファが「decode 済み」に見えて decode が予約されず、
+/// 前 project の音が鳴り続ける。
+pub fn has_undecoded_sources(
+    song: &Song,
+    renderer: &AudioClipRenderer,
+    project_dir: Option<&Path>,
+) -> bool {
     song.media.audio_sources.iter().any(|(id, source)| {
-        !matches!(source.path, AudioSourcePath::Generated { .. })
-            && !renderer.sources.contains_key(id)
+        let Some(abs) = resolve_source_path(source, project_dir) else {
+            // Generated (廃止) / project_dir 未設定の ProjectRelative は
+            // そもそも decode 対象外なので「未 decode」に数えない。
+            return false;
+        };
+        renderer
+            .sources
+            .get(id)
+            .is_none_or(|buf| buf.origin != abs)
     })
 }
 
@@ -1010,6 +1059,7 @@ mod stretch_sample_rate_tests {
         let frames = u64::from(source_sr);
         let samples: Vec<f32> = (0..frames).map(|i| i as f32 / (frames - 1) as f32).collect();
         AudioSourceBuffer {
+            origin: std::path::PathBuf::from("test://ramp"),
             sample_rate: source_sr,
             channels: 1,
             frames,
@@ -1307,5 +1357,103 @@ mod e5_lockin_tests {
                 "constant ratio は el×1.5、 got {p} at el={el}"
             );
         }
+    }
+}
+
+/// `AudioSourceId` は **Song スコープの名前** (project ごとに 1 から再採番) な
+/// ので、decode 済みバッファの再利用を id 一致だけで判断してはいけない。
+/// 別 project を開くと id 衝突で前 project の音源が鳴り、しかも
+/// `has_undecoded_sources` が false を返して decode job も積まれないため
+/// 恒久的に直らなかった。再利用の同一性は `AudioSourceBuffer::origin`
+/// (decode 元の解決済み絶対パス) が担う。
+#[cfg(test)]
+mod source_identity_tests {
+    use super::*;
+    use common::model::AudioSource;
+
+    const ENGINE_SR: u32 = 48_000;
+
+    fn song_with_source(rel: &str) -> Song {
+        let mut song = Song::default();
+        song.media.audio_sources.insert(
+            1,
+            AudioSource {
+                path: AudioSourcePath::ProjectRelative(std::path::PathBuf::from(rel)),
+                sample_rate: ENGINE_SR,
+                channels: 1,
+                frames: 8,
+                original_bpm: None,
+                root_key: None,
+            },
+        );
+        song
+    }
+
+    fn renderer_with_cached(origin: &Path) -> AudioClipRenderer {
+        let mut sources = HashMap::new();
+        sources.insert(
+            1u32,
+            Arc::new(AudioSourceBuffer {
+                origin: origin.to_path_buf(),
+                sample_rate: ENGINE_SR,
+                channels: 1,
+                frames: 8,
+                samples: vec![vec![0.5; 8]],
+            }),
+        );
+        AudioClipRenderer {
+            schedule: Vec::new(),
+            sources,
+        }
+    }
+
+    /// 同一 project 内の再 compile (BPM 変更 / 編集 / scrub) は従来どおり
+    /// decode ゼロで再利用される。
+    #[test]
+    fn same_origin_is_reused_without_decoding() {
+        let dir = Path::new("C:/projects/A");
+        let song = song_with_source("samples/kick.wav");
+        let prev = renderer_with_cached(&dir.join("samples/kick.wav"));
+
+        let out = compile_audio_schedule(&song, Some(&prev), Some(dir), ENGINE_SR, false);
+        assert!(
+            out.sources.contains_key(&1),
+            "origin 一致なら decode_missing=false でも再利用される"
+        );
+        assert!(
+            !has_undecoded_sources(&song, &out, Some(dir)),
+            "再利用できた source は未 decode 扱いにしない"
+        );
+    }
+
+    /// 別 project を開いた状況: 同じ `AudioSourceId` だが別ファイル。
+    /// 前 project のバッファを掴んではならず、decode job が積まれること。
+    #[test]
+    fn different_origin_is_not_reused_and_is_queued_for_decode() {
+        let dir_b = Path::new("C:/projects/B");
+        let song_b = song_with_source("samples/snare.wav");
+        // 前 project A の同 id バッファが live renderer に残っている状況。
+        let prev = renderer_with_cached(Path::new("C:/projects/A/samples/kick.wav"));
+
+        let out = compile_audio_schedule(&song_b, Some(&prev), Some(dir_b), ENGINE_SR, false);
+        assert!(
+            !out.sources.contains_key(&1),
+            "別 project の同 id バッファを id 一致だけで再利用してはいけない"
+        );
+        assert!(
+            has_undecoded_sources(&song_b, &out, Some(dir_b)),
+            "再利用できなかった source は decode job の対象になること \
+             (ここが false だと恒久的に前 project の音が鳴り続ける)"
+        );
+    }
+
+    /// `project_dir` が未設定だと `ProjectRelative` は解決できない。decode 対象に
+    /// できないので「未 decode」に数えない (数えると decode job が空回りし続ける)。
+    #[test]
+    fn unresolvable_project_relative_is_not_counted_as_undecoded() {
+        let song = song_with_source("samples/kick.wav");
+        let out = compile_audio_schedule(&song, None, None, ENGINE_SR, false);
+        assert!(out.sources.is_empty());
+        assert!(!has_undecoded_sources(&song, &out, None));
     }
 }

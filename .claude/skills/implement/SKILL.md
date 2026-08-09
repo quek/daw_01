@@ -166,7 +166,7 @@ interim な自前 widget を作る前に、**まず `docs/gui_01_conversation.md
 | **モデル操作** | `Song`/`Track`/`Clip`/`Row` のメソッドや `ensure_ids`/save-load 往復を検証 | copy/paste、undo/redo、bincode round-trip、歌詞分割 |
 | **純粋ロジック** | 関数に入力を与え出力を検証 | DSP、BPM/サンプル変換、`apply_modulation`、変調器の `f(beat)`、正規化 |
 
-protocol/model 型 (bincode derive) を変えたら `cargo build --workspace`
+protocol/model 型 (bincode derive) を変えたら `make build`
 (`feedback_workspace_build_for_protocol_changes`) — daw_gui だけ rebuild すると子プロセスが
 古い protocol のまま decode 失敗し「再生が止まる」誤認症状になる。
 
@@ -208,7 +208,7 @@ fn lfo_は_beat_の純粋関数で各シェイプの値を返す() {
 #### テスト失敗の確認
 
 ```bash
-cargo test --workspace
+make test
 ```
 
 - コンパイルが通る / 新規テストがアサーション失敗で落ちる (意味のある検証の証拠) / 既存テストは壊れていない
@@ -261,8 +261,8 @@ cargo test --workspace
 ### 6. 全テスト通過 + 実機ビルドの確認
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
+make test
+make clippy
 ```
 
 **実機検証前の再ビルド (必須)**: clippy/check/test は実行 exe を生成しない (or test exe のみ)。
@@ -270,7 +270,7 @@ cargo clippy --workspace -- -D warnings
 
 ```bash
 cargo build -p daw_gui     # daw_gui だけ変えた場合
-cargo build --workspace    # 子プロセス (daw_audio / daw_plugin_host) も変えた場合は必須
+make build                 # 子プロセス (daw_audio / daw_plugin_host) も変えた場合は必須
 ```
 
 子プロセスのコードを変えてバイナリを再生成しないと「直したのに挙動が変わらない」混乱が起きる。
@@ -310,8 +310,8 @@ NG: 新機能追加 (次サイクル)。リファクタ後も全テスト通過�
 承認を得たら:
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
+make test
+make clippy
 git add <変更ファイルを全列挙>        # -A / . / ディレクトリ指定は不可 (feedback_git_add_one_file)
 git commit -m "<日本語メッセージ>"
 ```

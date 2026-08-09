@@ -309,12 +309,23 @@ fn render_loop(
     {
         let prev = engine_shared.audio_clip_renderer.load();
         let prev_ref: &crate::audio_clip_renderer::AudioClipRenderer = &prev;
-        if crate::audio_clip_renderer::has_undecoded_sources(song, prev_ref) {
-            let project_dir = engine_shared
-                .project_dir
-                .load()
-                .as_ref()
-                .map(|a| (**a).clone());
+        let project_dir = engine_shared
+            .project_dir
+            .load()
+            .as_ref()
+            .map(|a| (**a).clone());
+        if crate::audio_clip_renderer::has_undecoded_sources(
+            song,
+            prev_ref,
+            project_dir.as_deref(),
+        ) {
+            // publish の口は `publish_audio_clip_schedule` 一本 (SSoT)。生 store
+            // だと generation guard を迂回し、export 中に届いた新 song 用の
+            // renderer を古いもので上書きしてしまう (かつ
+            // `last_published_generation` も進まないので stale が live に残る)。
+            let generation = engine_shared
+                .schedule_generation
+                .load(std::sync::atomic::Ordering::Acquire);
             let full = crate::audio_clip_renderer::compile_audio_schedule(
                 song,
                 Some(prev_ref),
@@ -322,7 +333,7 @@ fn render_loop(
                 sample_rate,
                 true,
             );
-            engine_shared.audio_clip_renderer.store(Arc::new(full));
+            crate::publish_audio_clip_schedule(engine_shared, generation, full);
         }
     }
 
