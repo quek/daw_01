@@ -5,29 +5,25 @@
 //!   - 子音は次の母音の口形状を借用 (pau / cl で打ち切り、無ければ閉口)
 //!   - cl (促音) / pau (ポーズ) は閉口
 //!   - 連続同形はマージ (1 つの長い `ImageEvent` にまとめる)
-//!   - 先頭 pau の `REST_FRAMES` 分手前から配置し、実 phoneme を最初の note 位置へ
+//!   - phoneme 列の frame 0 を呼び出し側が指定した位置に置く (音声 WAV の先頭と同じ位置)
 //!   - clip 範囲外はクランプ、前後の隙間は閉口で埋める
 //!
 //! 副作用なし・純粋関数なので unit test しやすい。実際の HTTP 取得は
 //! `crate::voicevox::query_phonemes`、生成先 clip への適用は daw_gui 側。
 
 use crate::model::{ClipContent, ImageEvent, MouthMap, MouthShape, Song};
-use crate::voicevox::{FRAME_RATE, Phoneme, REST_FRAMES};
+use crate::voicevox::{Phoneme, frames_to_beats};
 
-/// VOICEVOX frame 数 → clip-local beats。
-/// `beats = frames / FRAME_RATE / (60 / bpm)`。
-fn frames_to_beats(frames: f64, bpm: f32) -> f64 {
-    frames / FRAME_RATE * (bpm as f64) / 60.0
-}
-
-/// (talk) `build_mouth_events` が先頭 pau の手前に置く lead-in (= `REST_FRAMES` 分)
-/// の beats。talk 経路 (`docs/plan_voicevox_talk.md` §5) は TextEvent 開始位置に
-/// この量を足して `first_note_local_beat` に渡すことで、cursor 起点を WAV 配置位置
-/// (= event 開始) に揃え、実音声 (= placement から WAV 先頭再生) と口を一致させる。
-#[must_use]
-pub fn lead_in_beats(bpm: f32) -> f64 {
-    frames_to_beats(f64::from(REST_FRAMES), bpm)
-}
+/// 口パク **配置ルール** の世代。生成した clip に [`crate::model::Clip::lipsync_gen`]
+/// として焼き込み、load 時にこれより古い clip を見つけたら一度だけ再生成する。
+///
+/// **phoneme 列 → clip-local beat の対応を変えたら必ず +1 する。** 入力
+/// (notes / text / bpm / mouth_map) が同じでも出力が変わる変更は fingerprint では
+/// 検出できないため (合成 WAV 側の `CACHE_SCHEMA_VERSION` と対になる仕組み)。
+///
+/// - 1: r.md #39 — anchor を「phoneme 列 frame 0 が来る位置」に統一し、talk の
+///   先頭 pau (prePhonemeLength 由来 ~96ms) を廃止
+pub const PLACEMENT_GEN: u32 = 1;
 
 /// phoneme 文字列が母音 (a/i/u/e/o/N) なら対応する口形状。子音 / cl / pau は
 /// `None`。REAPER の VOWELS セット (撥音 N を含む) と同じ判定。
@@ -76,8 +72,14 @@ fn effective_shape(phonemes: &[Phoneme], i: usize) -> MouthShape {
 /// - `phonemes`: `query_phonemes` の生出力 (先頭/末尾の pau 込み、frame 0 起点)。
 /// - `mouth_map`: 口形状 → `ImageSourceId`。未割当 slot は閉口へ fallback。
 /// - `bpm`: 曲の BPM (frame → beat 変換に使用)。
-/// - `first_note_local_beat`: 生成先 clip 内で earliest note が始まる clip-local
-///   beat。VOICEVOX frame `REST_FRAMES` (= 先頭 pau の直後) がこの位置に対応する。
+/// - `first_phoneme_local_beat`: **phoneme 列の frame 0** が来る clip-local beat。
+///   これは音声 WAV の先頭が来る位置と同一 (r.md #39: 合成 buffer / phoneme 列 /
+///   曲位置を「先頭を揃える」1 本の契約で結ぶ)。呼び出し側が渡す値:
+///     - 歌: `voicevox::sing_head_beat(sing_base_beat(notes), bpm)` (= 基準 note の
+///       `REST_FRAMES` 手前)
+///     - talk: `TextEvent 開始 − voicevox::talk_pre_silence_frames()` 相当の beats
+///
+///   ここで先頭 pau を引く等の経路別補正は **しない** (多重 SSoT を作らない)。
 /// - `clip_len_beats`: 生成先 clip の長さ。範囲外の event はクランプ/破棄する。
 ///
 /// 戻り値の `ImageEvent` は `source_id` / `event_start_in_clip_beats` /
@@ -87,16 +89,15 @@ pub fn build_mouth_events(
     phonemes: &[Phoneme],
     mouth_map: &MouthMap,
     bpm: f32,
-    first_note_local_beat: f64,
+    first_phoneme_local_beat: f64,
     clip_len_beats: f64,
 ) -> Vec<ImageEvent> {
     if phonemes.is_empty() || clip_len_beats <= 0.0 || bpm <= 0.0 {
         return Vec::new();
     }
 
-    let rest_beats = frames_to_beats(REST_FRAMES as f64, bpm);
-    // 先頭 pau の手前から配置 → 実 phoneme が first_note 位置へ来る (音声と同期)。
-    let mut cursor = first_note_local_beat - rest_beats;
+    // phoneme 列 frame 0 = 音声 WAV 先頭。以降は frame_length を積むだけ。
+    let mut cursor = first_phoneme_local_beat;
 
     // 1) phoneme ごとの raw 区間 (source_id 付き、まだクランプ/マージ前)。
     struct Raw {
@@ -222,6 +223,42 @@ pub fn fill_mouth_timeline(
     out
 }
 
+/// **古い配置ルール** ([`PLACEMENT_GEN`]) で作られた `auto_lipsync` clip を持つ口 track の、
+/// ソース vocal track id 群 (昇順・重複なし)。
+///
+/// r.md #39: 口パク event は project に永続化される派生データで、通常の再生成トリガは
+/// 入力 fingerprint の差分だけ。配置ルール自体を変えると入力が同じままなので、この世代
+/// チェックが「開いたときに一度だけ作り直す」唯一のトリガになる。現行世代しか無い
+/// project では空 Vec (= 何もしない → dirty-on-open しない、r.md #9)。
+#[must_use]
+pub fn vocal_tracks_with_outdated_lipsync(song: &Song) -> Vec<u32> {
+    let outdated: Vec<u32> = song
+        .tracks
+        .iter()
+        .filter(|t| {
+            t.clips
+                .iter()
+                .any(|c| c.auto_lipsync && c.lipsync_gen < PLACEMENT_GEN)
+        })
+        .map(|t| t.id)
+        .collect();
+    if outdated.is_empty() {
+        return Vec::new();
+    }
+    let mut vocals: Vec<u32> = song
+        .tracks
+        .iter()
+        .filter(|t| {
+            t.lipsync_target_track
+                .is_some_and(|target| outdated.contains(&target))
+        })
+        .map(|t| t.id)
+        .collect();
+    vocals.sort_unstable();
+    vocals.dedup();
+    vocals
+}
+
 /// 口 track (`mouth_track_id`) が属する立ち絵 group の「body が映っている」
 /// 時間範囲 (song-absolute beats) を返す。 = 同じ group (親 = 口 track の
 /// `parent_group_id`) に属する track 群 — group track 自身と直下の子 — が持つ
@@ -282,7 +319,7 @@ mod tests {
 
     /// frame → beat (テスト用、本体と同式)。
     fn b(frames: f64, bpm: f32) -> f64 {
-        frames / FRAME_RATE * (bpm as f64) / 60.0
+        frames_to_beats(frames, bpm)
     }
 
     fn ids(events: &[ImageEvent]) -> Vec<u32> {
@@ -309,10 +346,10 @@ mod tests {
         let bpm = 120.0;
         // 先頭 pau(10) → k(5) → a(20) → 末尾 pau(10)。
         let phs = vec![ph("pau", 10), ph("k", 5), ph("a", 20), ph("pau", 10)];
-        // first_note を rest_beats に置く → cursor 開始 = 0。
-        let first_note = b(REST_FRAMES as f64, bpm);
+        // frame 0 を clip 頭に置く。
+        let head = 0.0;
         let clip_len = b(45.0, bpm); // 10+5+20+10
-        let events = build_mouth_events(&phs, &full_map(), bpm, first_note, clip_len);
+        let events = build_mouth_events(&phs, &full_map(), bpm, head, clip_len);
         // k(子音)→a を借用し id=1、a も id=1 → マージ。前後 pau は閉口 id=7。
         assert_eq!(ids(&events), vec![7, 1, 7]);
         assert_contiguous(&events, clip_len);
@@ -325,32 +362,40 @@ mod tests {
     fn distinct_vowels_are_separate_events() {
         let bpm = 100.0;
         let phs = vec![ph("pau", 10), ph("a", 10), ph("i", 10), ph("o", 10), ph("pau", 10)];
-        let first_note = b(REST_FRAMES as f64, bpm);
         let clip_len = b(50.0, bpm);
-        let events = build_mouth_events(&phs, &full_map(), bpm, first_note, clip_len);
+        let events = build_mouth_events(&phs, &full_map(), bpm, 0.0, clip_len);
         assert_eq!(ids(&events), vec![7, 1, 2, 5, 7]);
         assert_contiguous(&events, clip_len);
     }
 
     #[test]
-    fn rest_offset_places_first_vowel_at_note() {
+    fn frame_zero_anchors_at_head_beat_and_phonemes_follow_in_order() {
+        // r.md #39: 引数は「phoneme 列 frame 0 が来る clip-local beat」。歌なら
+        // `sing_head_beat` (= 基準 note の REST_FRAMES 手前) を渡すので、先頭 pau(10)
+        // の直後 = 基準 note 位置に最初の母音が来る。
         let bpm = 120.0;
         let phs = vec![ph("pau", 10), ph("a", 20), ph("pau", 10)];
-        // first_note を clip 内 beat 2.0 に。
         let first_note = 2.0;
+        let head = crate::voicevox::sing_head_beat(first_note, bpm);
         let clip_len = 8.0;
-        let events = build_mouth_events(&phs, &full_map(), bpm, first_note, clip_len);
-        // 最初の母音 'a' (id=1) は first_note=2.0 に始まる。
+        let events = build_mouth_events(&phs, &full_map(), bpm, head, clip_len);
         let a_event = events.iter().find(|e| e.source_id == 1).expect("has 'a' event");
         assert!(
-            (a_event.event_start_in_clip_beats - 2.0).abs() < 1e-6,
-            "first vowel starts at first_note_local_beat, got {}",
+            (a_event.event_start_in_clip_beats - first_note).abs() < 1e-6,
+            "first vowel starts at the base note, got {}",
             a_event.event_start_in_clip_beats
         );
-        // 先頭は [0, 2.0] の閉口 fill。
+        // 先頭は [0, head] の閉口 fill + 先頭 pau [head, first_note] が同じ閉口で
+        // merge され、ちょうど [0, first_note] の 1 本になる。
+        // (この長さ assert は先頭 fill / 連続同形マージの回帰検出そのもの。
+        //  contiguous / start≈0 だけでは merge が壊れても素通りする。)
         assert_eq!(events[0].source_id, 7);
         assert!((events[0].event_start_in_clip_beats).abs() < 1e-6);
-        assert!((events[0].event_length_beats - 2.0).abs() < 1e-6);
+        assert!(
+            (events[0].event_length_beats - first_note).abs() < 1e-6,
+            "先頭閉口は [0, {first_note}] の 1 本にマージされる: {}",
+            events[0].event_length_beats
+        );
         assert_contiguous(&events, clip_len);
     }
 
@@ -358,10 +403,9 @@ mod tests {
     fn trailing_gap_filled_with_closed() {
         let bpm = 120.0;
         let phs = vec![ph("pau", 10), ph("a", 20), ph("pau", 10)];
-        let first_note = b(REST_FRAMES as f64, bpm);
         // clip_len を phoneme 終端 (b(40)) より長く。
         let clip_len = b(40.0, bpm) + 1.0;
-        let events = build_mouth_events(&phs, &full_map(), bpm, first_note, clip_len);
+        let events = build_mouth_events(&phs, &full_map(), bpm, 0.0, clip_len);
         assert_contiguous(&events, clip_len);
         // 末尾は閉口。
         assert_eq!(events.last().unwrap().source_id, 7);
@@ -381,9 +425,8 @@ mod tests {
             closed: 9,
         };
         let phs = vec![ph("pau", 10), ph("a", 20), ph("pau", 10)];
-        let first_note = b(REST_FRAMES as f64, bpm);
         let clip_len = b(40.0, bpm);
-        let events = build_mouth_events(&phs, &map, bpm, first_note, clip_len);
+        let events = build_mouth_events(&phs, &map, bpm, 0.0, clip_len);
         // 全部 closed(9) に解決 → 1 つにマージ。
         assert_eq!(ids(&events), vec![9]);
     }
@@ -490,5 +533,58 @@ mod tests {
         let mut song = Song::default();
         song.tracks.push(img_track(5, None, vec![]));
         assert_eq!(tachie_body_range(&song, 5), None);
+    }
+
+    // ---- 配置ルールの世代 (r.md #39) ---------------------------------------
+
+    /// vocal track(1) → 口 track(2)。口 track に指定世代の auto clip を 1 本。
+    fn lipsync_gen_song(generation: u32) -> Song {
+        let mut song = Song::default();
+        let mut auto = img_clip(&mut song, 0.0, 8.0, true);
+        auto.lipsync_gen = generation;
+        song.tracks.push(crate::model::Track {
+            id: 1,
+            lipsync_target_track: Some(2),
+            ..Default::default()
+        });
+        song.tracks.push(img_track(2, None, vec![auto]));
+        song
+    }
+
+    #[test]
+    fn outdated_lipsync_generation_is_detected_and_current_is_not() {
+        // 旧世代 (0 = 世代を持たない旧 file) → ソース vocal track を再生成対象に。
+        assert_eq!(
+            vocal_tracks_with_outdated_lipsync(&lipsync_gen_song(0)),
+            vec![1]
+        );
+        // 現行世代 → 何もしない (= 開いただけで dirty にならない、r.md #9)。
+        assert!(
+            vocal_tracks_with_outdated_lipsync(&lipsync_gen_song(PLACEMENT_GEN)).is_empty()
+        );
+    }
+
+    #[test]
+    fn hand_placed_clips_never_trigger_regeneration() {
+        // auto_lipsync == false の手置き clip は世代 0 でも対象外。
+        let mut song = Song::default();
+        let manual = img_clip(&mut song, 0.0, 8.0, false);
+        song.tracks.push(crate::model::Track {
+            id: 1,
+            lipsync_target_track: Some(2),
+            ..Default::default()
+        });
+        song.tracks.push(img_track(2, None, vec![manual]));
+        assert!(vocal_tracks_with_outdated_lipsync(&song).is_empty());
+    }
+
+    #[test]
+    fn outdated_mouth_track_without_source_yields_nothing() {
+        // 口 track だけ残ってソース vocal が消えている project では再生成できない。
+        let mut song = Song::default();
+        let mut auto = img_clip(&mut song, 0.0, 8.0, true);
+        auto.lipsync_gen = 0;
+        song.tracks.push(img_track(2, None, vec![auto]));
+        assert!(vocal_tracks_with_outdated_lipsync(&song).is_empty());
     }
 }

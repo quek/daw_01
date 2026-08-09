@@ -304,6 +304,7 @@ impl AppData {
                     content_id: new_content_id,
                     color: None,
                     auto_lipsync: false,
+                    lipsync_gen: 0,
                     muted: glue_muted,
                     speaker_id: glue_speaker,
                     singer_name: glue_singer,

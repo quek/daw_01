@@ -535,6 +535,18 @@ pub struct Song {
     /// 直列 process する。 旧 file は `#[serde(default)]` で空 Vec に forward-migrate。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub master_fx_chain: Vec<PluginInstance>,
+    /// `master_fx_chain` 上の plugin が報告する latency の合計 (samples)。
+    /// 通常 track の [`Track::reported_latency_samples`] の master 版 —
+    /// master は `Track` を持たない (`MASTER_TRACK_ID` は `tracks` に存在しない) ので、
+    /// `master_fx_chain` / `song_lanes` と同じ「master 固有データは Song 直下」流儀で
+    /// ここに置く。書き込みは `reported_latency_mut` (sentinel 分岐付き accessor) 経由。
+    ///
+    /// r.md #39: メトロノーム click と WAV 書き出しは master **出力** の遅延量
+    /// (`Schedule::master_latency_samples`) を差し引く。master fx が latency を報告する
+    /// 場合その分も master 出力が遅れるので、この値を加算しないと click だけが先行し、
+    /// 書き出し WAV もその分後ろへずれる。旧 file は `#[serde(default)]` で 0。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub master_reported_latency_samples: u32,
     /// v24: プロジェクト固有の安定 ID。New で 1 度採番、Save/Load で保持。
     /// クリップボード round-trip で「同一プロジェクト由来か」を判定し、clip/track paste の
     /// リンク共有 (同一) / 独立コピー (別) を分岐する。`0` は未採番 sentinel —
@@ -596,6 +608,7 @@ impl Default for Song {
             video_resolution: default_video_resolution(),
             video_framerate: default_video_framerate(),
             master_fx_chain: Vec::new(),
+            master_reported_latency_samples: 0,
             project_id: 0,
             sections: Vec::new(),
             mod_sources: Vec::new(),
@@ -1753,6 +1766,23 @@ impl Song {
 
     pub fn track_by_id_mut(&mut self, track_id: u32) -> Option<&mut Track> {
         self.tracks.iter_mut().find(|t| t.id == track_id)
+    }
+
+    /// `track_id` が持つ「plugin 報告 latency の合計」への可変参照。
+    /// `MASTER_TRACK_ID` なら [`Song::master_reported_latency_samples`]、それ以外は
+    /// 該当 track の [`Track::reported_latency_samples`]。`fx_chain_by_track_id_mut` と
+    /// 同 idiom (master 固有データは Song 直下、sentinel 分岐で透過アクセス)。
+    ///
+    /// r.md #39: これが無いと `recompute_track_latencies` が master fx の合計を
+    /// `track_by_id_mut(MASTER_TRACK_ID) == None` で黙って捨て、master に latency を
+    /// 持つ plugin を挿しても PDC に載らない (= click 先行 / 書き出しずれ)。
+    pub fn reported_latency_mut(&mut self, track_id: u32) -> Option<&mut u32> {
+        if track_id == MASTER_TRACK_ID {
+            Some(&mut self.master_reported_latency_samples)
+        } else {
+            self.track_by_id_mut(track_id)
+                .map(|t| &mut t.reported_latency_samples)
+        }
     }
 
     /// Effective silence for the VISUAL layer (preview + export). A track's

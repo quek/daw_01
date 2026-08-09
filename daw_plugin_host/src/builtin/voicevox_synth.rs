@@ -14,7 +14,8 @@ use anyhow::{Context, Result};
 
 use common::model::{Note, TalkParams};
 use common::voicevox::{
-    DEFAULT_SINGER_ID, QUERY_SPEAKER, VOICEVOX_URL, build_sing_query, urlencoding_encode,
+    DEFAULT_SINGER_ID, QUERY_SPEAKER, TALK_PRE_PHONEME_LENGTH, VOICEVOX_URL, build_sing_query,
+    frames_to_samples, sing_base_beat, urlencoding_encode,
 };
 
 use super::voicevox_cache::{VoiceVoxDiskCache, key_for_sing, key_for_talk};
@@ -165,16 +166,13 @@ impl BuiltinNoteSpec {
 pub struct BuiltinSynthOutput {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+    /// query の基準 note の `start_beat` (= `common::voicevox::sing_base_beat`)。
+    /// wav の **frame 0** は `sing_head_beat(base_beat, bpm)` に来る。呼び出し側が
+    /// この wav を曲上へ配置するときの唯一の基準 (r.md #39)。
+    pub base_beat: f64,
+    /// `note_id → wav 内の sample offset` (= query の絶対 frame 位置を sample 換算した
+    /// **実位置**。「理想位置」の再計算ではないので停止中プレビューが波形とズレない)。
     pub note_offsets: std::collections::HashMap<u32, u64>,
-}
-
-/// `build_sing_query` が sing wav 先頭に必ず入れる leading rest (attack 用の無音) の
-/// サンプル数 (fractional)。 note の音声開始 = beat-grid 位置 + この lead-in。 synth 側の
-/// note offset 計算と、 audio half 側の連続再生 (拍 → buffer 位置写像) が **同じ値** を
-/// 使うため 1 箇所に集約する (r.md #23: 連続再生でこの lead-in を足して拍に合わせる)。
-pub(crate) fn lead_in_frames(sample_rate: u32) -> f64 {
-    f64::from(common::voicevox::REST_FRAMES) / common::voicevox::FRAME_RATE
-        * f64::from(sample_rate)
 }
 
 /// Synthesise a single track's worth of notes for the VOICEVOX builtin plugin
@@ -183,11 +181,15 @@ pub(crate) fn lead_in_frames(sample_rate: u32) -> f64 {
 ///
 /// `notes` must NOT be empty — VOICEVOX rejects empty queries; callers should bail before
 /// reaching this function.
+///
+/// 歌える note (長さ > 0 かつ pitch > 0) が 1 つも無いときは `Ok(None)` = 「このグループ
+/// には音が無い」。query builder が歌えない note を黙って落とす契約と揃える (= エラーに
+/// しない)。
 pub fn synthesize_notes_for_builtin(
     notes: &[BuiltinNoteSpec],
     bpm: f32,
     speaker_id: u32,
-) -> Result<BuiltinSynthOutput, SynthError> {
+) -> Result<Option<BuiltinSynthOutput>, SynthError> {
     if notes.is_empty() {
         return Err(SynthError::Rejected(
             "synthesize_notes_for_builtin called with no notes".into(),
@@ -201,12 +203,16 @@ pub fn synthesize_notes_for_builtin(
         DEFAULT_SINGER_ID
     };
     let model_notes: Vec<Note> = notes.iter().map(|n| n.to_model_note()).collect();
-    let query_json = build_sing_query(&model_notes, bpm);
+    let Some(base_beat) = sing_base_beat(&model_notes) else {
+        // 歌える note が 1 つも無い (長さ 0 / pitch 0 のみ) = 無音。エラーではない。
+        return Ok(None);
+    };
+    let query = build_sing_query(&model_notes, bpm);
 
     // 永続コンテンツアドレスキャッシュ。query 内容 (= 歌詞 / pitch / frame / bpm が畳み込み済) +
     // singer が同じなら、HTTP 合成を丸ごと skip して保存済 WAV を返す。
     let cache = VoiceVoxDiskCache::production();
-    let cache_key = key_for_sing(&query_json, speaker_id);
+    let cache_key = key_for_sing(&query.json, speaker_id);
     let wav_bytes = if let Some(hit) = cache.as_ref().and_then(|c| c.get(cache_key)) {
         tracing::info!(cache_key, "VOICEVOX sing cache hit (HTTP skip)");
         hit
@@ -215,7 +221,7 @@ pub fn synthesize_notes_for_builtin(
             .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
             .build()
             .map_err(|e| unreachable(e, "building HTTP client"))?;
-        let wav = sing_query_to_wav(&client, &query_json, speaker_id)?;
+        let wav = sing_query_to_wav(&client, &query.json, speaker_id)?;
         if let Some(c) = cache.as_ref() {
             c.put(cache_key, &wav);
         }
@@ -224,29 +230,22 @@ pub fn synthesize_notes_for_builtin(
     let (samples, sample_rate) =
         decode_wav_to_f32(&wav_bytes).map_err(|e| SynthError::Rejected(format!("{e:#}")))?;
 
-    // Note frame offsets relative to frame 0 of the rendered buffer.
-    //
-    // `build_sing_query` は wav 先頭に必ず `REST_FRAMES` の leading rest (= attack 用の無音) を
-    // 入れる。各 note の音声開始位置 = leading rest + (start_beat - earliest) × samples_per_beat。
-    let lead_in_samples = lead_in_frames(sample_rate).round() as u64;
-    let earliest = notes
-        .iter()
-        .map(|n| n.start_beat)
-        .fold(f64::INFINITY, f64::min);
-    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(bpm.max(0.001));
+    // 各 note の wav 内 offset は query の **実 frame 位置** から換算する (`note_frames`)。
+    // 旧実装は「lead-in + (start_beat - earliest) × spb」という理想位置の再計算で、
+    // query の丸め (93.75fps) と最大 0.5 frame ずれていた (r.md #39 付随 (d))。
     let mut note_offsets: std::collections::HashMap<u32, u64> =
-        std::collections::HashMap::with_capacity(notes.len());
-    for n in notes {
-        let frame = lead_in_samples
-            + (((n.start_beat - earliest) * samples_per_beat).max(0.0)) as u64;
-        note_offsets.insert(n.note_id, frame);
+        std::collections::HashMap::with_capacity(query.note_frames.len());
+    for &(idx, frame) in &query.note_frames {
+        let off = frames_to_samples(frame as f64, sample_rate).round().max(0.0) as u64;
+        note_offsets.insert(notes[idx].note_id, off);
     }
 
-    Ok(BuiltinSynthOutput {
+    Ok(Some(BuiltinSynthOutput {
         samples,
         sample_rate,
+        base_beat,
         note_offsets,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -337,12 +336,21 @@ pub fn synthesize_talk_for_builtin(
 
 /// (talk) `TalkParams` を `/audio_query` 応答 JSON に適用して再シリアライズする。
 /// `outputSamplingRate` も 48000 に揃える。
+///
+/// r.md #39: `prePhonemeLength` を [`TALK_PRE_PHONEME_LENGTH`] (= 0) で **必ず上書き**
+/// する。engine 既定 (0.1s) のままだと wav 先頭に話速依存の無音が入り、「クリップ位置 =
+/// 発話開始」が話速で ±100ms 動く。無音を推定して差し引くのではなく、そもそも作らない。
+/// `postPhonemeLength` は語尾の余韻なので触らない。
 fn apply_talk_params(audio_query_json: &str, scales: &TalkParams) -> Result<String> {
     let mut v: serde_json::Value =
         serde_json::from_str(audio_query_json).context("parsing audio_query response JSON")?;
     let obj = v
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("audio_query response is not a JSON object"))?;
+    obj.insert(
+        "prePhonemeLength".into(),
+        serde_json::json!(TALK_PRE_PHONEME_LENGTH),
+    );
     obj.insert("speedScale".into(), serde_json::json!(scales.speed_scale));
     obj.insert("pitchScale".into(), serde_json::json!(scales.pitch_scale));
     obj.insert(
@@ -415,7 +423,7 @@ mod tests {
 
     #[test]
     fn apply_talk_params_sets_all_scales_and_keeps_query() {
-        let query = r#"{"accent_phrases":[{"moras":[]}],"speedScale":1.0,"pitchScale":0.0,"intonationScale":1.0,"volumeScale":1.0,"outputSamplingRate":24000}"#;
+        let query = r#"{"accent_phrases":[{"moras":[]}],"speedScale":1.0,"pitchScale":0.0,"intonationScale":1.0,"volumeScale":1.0,"prePhonemeLength":0.1,"postPhonemeLength":0.1,"outputSamplingRate":24000}"#;
         let scales = TalkParams {
             speed_scale: 1.3,
             pitch_scale: 0.05,
@@ -430,6 +438,10 @@ mod tests {
         assert!((v["volumeScale"].as_f64().unwrap() as f32 - 1.5).abs() < 1e-6);
         assert_eq!(v["outputSamplingRate"].as_u64().unwrap(), u64::from(OUTPUT_SAMPLE_RATE));
         assert!(v["accent_phrases"].is_array());
+        // r.md #39: 先頭無音は必ず 0 に上書き (話速で伸縮する engine 既定 0.1s を消す)。
+        assert!(v["prePhonemeLength"].as_f64().unwrap().abs() < 1e-12);
+        // 語尾の余韻 (postPhonemeLength) は engine 既定のまま。
+        assert!((v["postPhonemeLength"].as_f64().unwrap() - 0.1).abs() < 1e-12);
     }
 
     /// 実 VOICEVOX engine に対する talk 合成の統合テスト。engine (localhost:50021) が要るので

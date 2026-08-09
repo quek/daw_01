@@ -4,6 +4,56 @@
 後回し 2「VOICEVOX → ClipContent::Audio 統合」 を「ゼロから作るなら」
 の観点で再設計したもの。
 
+## タイミングの不変条件 (r.md #39、これに触れる変更は先にここを読む)
+
+**合成バッファの index N = 曲の sample 位置 N。これが唯一の契約。**
+
+- **読み出し側 (`VoicevoxAudioHalf::process`) は補正オフセットを一切持たない**:
+  `base = song_pos_beats * samples_per_beat` のみ。ここに「lead-in を足す」等の
+  経路別補正を戻さない (旧実装は歌用 lead-in を talk にも一律に適用しており、
+  talk が話速依存で −53〜+96ms ずれていた)。
+- **各ソースの先頭無音は配置側 (synth thread) が自分の既知量として吸収する**:
+  - 歌 = `sing_place_samples(base_beat, bpm, sr)` — query が入れた
+    `REST_FRAMES` の leading rest ぶん手前に置く。
+  - talk = `talk_place_samples(start_beat, speed, bpm, sr)` — `prePhonemeLength`
+    を 0 に注入してあるので実質「クリップ位置 = 発話開始」。
+  - 配置位置は **符号付き**。曲頭付近では負になり、その部分 (無音) は
+    `mix_placed_groups` が捨てる。位置をずらして回避しない。
+- **query の note 位置は絶対 frame**: `build_sing_query` は「基準ノートからの拍
+  オフセットを frame へ丸めた絶対値」を先に確定してから frame_length 列に落とす。
+  長さの下限 1 frame を確保するために **後続の位置を押し出さない**
+  (重なりは前ノートの切り詰めで解決、潰れたら落とす)。残差は VOICEVOX の
+  93.75fps 分解能そのもの (±5.33ms、バイアス 0) で、これ以上は原理的に詰められない。
+- **口パクも同じ契約**: `build_mouth_events` の anchor は「phoneme 列 frame 0 が
+  来る beat」= wav 先頭が来る beat。`docs/plan_pakupaku.md` §6 参照。
+- **キャッシュ**: wav の中身を決める定義 (engine へ注入するパラメータ等) を変えたら
+  `voicevox_cache.rs::CACHE_SCHEMA_VERSION` を必ず +1 する。query 文字列や
+  `TalkParams` に現れない変更は key に自然には反映されず、旧 wav を掴んで
+  「直したのに変わらない」になる。同じ理由で、**口パクの配置ルール** を変えたら
+  `common::lipsync::PLACEMENT_GEN` を +1 する (保存済み口パク clip は入力が同じままなので
+  fingerprint では再生成されない。`Clip::lipsync_gen` の世代照合が唯一のトリガ)。
+
+## master 出力の遅延 (`Schedule::master_latency_samples`) の消費者
+
+`master_buffer[P]` に載っているのは曲位置 `P - master_latency_samples` の音。この値は
+**master `Mix` の src の最大 path latency ＋ `Song::master_reported_latency_samples`**
+(= master fx chain 自身の報告 latency)。master は `Track` を持たないので、後者は
+`Song` 直下に置き `Song::reported_latency_mut` の sentinel 分岐で書き込む
+(`fx_chain_by_track_id_mut` と同 idiom)。
+
+この 1 つの値を **2 箇所** が引く。片方だけ直すと非対称になるので必ず両方見ること:
+
+1. **metronome click** (`engine.rs`) — click は `render_master_buffer` の後に重ねる
+   (master fx を通らない) ので、参照位置からこの値を引いて音と揃える。count-in の
+   click も同じだけ引く (引かないと count-in → 本再生の境目で 1 拍だけ間隔が伸びる)。
+2. **WAV 書き出し** (`export.rs::shift_window_for_master_latency`) — 書き出し窓と
+   走査終端をこの値だけ後ろへずらす。ずらさないと wav 全体が後ろへずれ、
+   stem を元位置に貼り戻すと二重にずれる。
+
+なお click の **拍グリッド** は `metronome::ClickGrid::Song(&TempoMap)` (tempo automation
+積分済み) で求める。瞬間 bpm × 絶対 sample の等間隔グリッドにすると、テンポ変更以降の
+click が clip / note (`playhead_beats` 基準) と別グリッドに載る。
+
 ## 進捗
 
 - ✅ **PR-V1**: builtin plugin インフラ完了

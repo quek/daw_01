@@ -1,4 +1,4 @@
-.PHONY: help build run test clippy clean release run-release fmt check fetch-ffmpeg worktree-rm worktree-rm-merged
+.PHONY: help build run test test-rt clippy clean release run-release fmt check fetch-ffmpeg worktree-rm worktree-rm-merged
 
 .DEFAULT_GOAL := release
 
@@ -53,6 +53,7 @@ help:
 	@echo "  make release       実行 3 exe (daw_gui/daw_audio/daw_plugin_host) を release ビルド"
 	@echo "  make run-release   daw_gui をビルド × 起動 (release)"
 	@echo "  make test          テストを持つ package のみ実行 (TEST_PKGS、#[test]0個の examples 等は除外)"
+	@echo "  make test-rt       RT (audio thread) の無確保検査 (rt-assert feature、make test から呼ばれる)"
 	@echo "  make clippy        clippy をエラー扱いで走らせる"
 	@echo "  make check         cargo check (ビルド不要、型検査のみ)"
 	@echo "  make fmt           cargo fmt"
@@ -105,8 +106,21 @@ run-release: release
 # daw_plugin_host.exe を子プロセス起動する。`cargo test` はこれら runtime バイナリの
 # 生成を保証しない (テストハーネス版のみ) ので、クリーンな target では build なしだと
 # 「daw_audio.exe が見つかりません」で落ちる (2026-07-03 の cargo clean 後に発覚)。
-test: build
+test: build test-rt
 	cargo test $(TEST_PKGS) --features daw_gui/script
+
+# RT (audio thread) の無確保検査。 `rt-assert` は非 default feature なので、
+# 上の `test` の feature 集合ではテストが **コンパイルすらされない**。
+# feature を `test` 側に足すのでは不十分: script smoke が spawn する
+# daw_audio.exe は `make build` 産 (feature 無し) なので、別 target で
+# daw_audio 単体を feature 付きで回す。
+#
+# 有効化されるもの:
+# - `assert_no_alloc` の #[global_allocator] フック (Rust 側の確保を検出)
+# - `signalsmith-sys/alloc-count` (vendored C++ エンジンの確保を検出。
+#   Rust の allocator フックは C++ の確保を **一切見られない**)
+test-rt:
+	cargo test -p daw_audio --features rt-assert
 
 clippy:
 	cargo clippy --workspace -- -D warnings

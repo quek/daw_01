@@ -14,7 +14,7 @@ use common::protocol::{PluginCommand, PluginEvent};
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction, PendingStateRequest};
 
-use super::support::{build_app, drain, fake_plugin_loaded};
+use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
 
 fn has_pending_save(app: &AppData) -> bool {
     app.ipc.pending_state_queue
@@ -30,7 +30,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     // delay=2) を順に append。 song_has_plugin() == true なので 各 RemoveDevice が
     // deferred path を通る。
     let track_id = app.song_doc.song().tracks[0].id;
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(&mut app, 0);
 
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -173,7 +173,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
 /// 1 つの track に device 3 つ (synth=0, bitcrush=1, delay=2) を載せる。
 fn setup_track_with_two_fx(app: &mut AppData) -> u32 {
     let track_id = app.song_doc.song().tracks[0].id;
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(app, 0);
 
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
@@ -296,7 +296,7 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
 fn save_and_quit_clean_sets_should_quit() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(&mut app, 0);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
@@ -331,7 +331,7 @@ fn save_and_quit_clean_sets_should_quit() {
 fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(&mut app, 0);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),
@@ -373,7 +373,7 @@ fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
 fn save_with_idle_queue_freezes_snapshot_at_invoke() {
     let (mut app, _audio_rx, mut plugin_rx, _proxy) = build_app();
     let track_id = app.song_doc.song().tracks[0].id;
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(&mut app, 0);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),

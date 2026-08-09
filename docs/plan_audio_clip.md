@@ -214,8 +214,8 @@ import するファイルは **`<project_dir>/samples/<basename>_<hash8>.<ext>`*
 |---|---|---|---|
 | Gain | Inspector + clip 中央の dB handle (上下 drag、 ±24 dB 範囲) | 単一値 (event ごと) | point 列 (時間変化、 M3+) |
 | Pan | Inspector | 単一値 | point 列 |
-| Pitch | Inspector (semitones, -96..+96) | 単一値 (Repitch mode 時に有効) | point 列 |
-| Formant | Inspector (semitones) | 未対応 (M3+) | point 列 |
+| Pitch | Inspector (semitones, -96..+96) | 単一値 (全 mode で有効) | point 列 |
+| Formant | Inspector (semitones, -48..+48) | 単一値 (全 mode で有効、 r.md #40) | point 列 |
 
 ### 3.7 Stretch Mode (event ごと)
 
@@ -223,11 +223,11 @@ import するファイルは **`<project_dir>/samples/<basename>_<hash8>.<ext>`*
 |---|---|---|---|
 | **Raw** | tempo / project BPM を無視、 source 元速度で再生 | ○ default | — |
 | **Repitch** | playback speed = pitch ratio (tape 風)。 Pitch field と project tempo 比に従って source frame stride を変える | ○ (linear interp) | sinc / Lanczos M3+ |
-| **Stretch** | granular / spectral。 tempo に合わせ伸縮、 pitch 維持 | × (M2-3) | SoundTouch / 自前 phase vocoder |
-| **Slice** | チャンクに割って各 chunk を granular stretch | × (M3+) | beat markers / transients ベース |
+| **Stretch** | スペクトル (位相ボコーダ)。 tempo に合わせ伸縮、 pitch / formant を独立に制御 | ○ (Signalsmith Stretch を vendoring、 r.md #40) | 時間変化 point 列 |
+| **Slice** | transient で割って各 slice を native rate 再生 | ○ (onset 自動検出 = r.md #8 B1) | beat markers 手編集 |
 
-beat markers / formant auto-shift / grain size 等の Bitwig 詳細パラメータは Stretch / Slice
-実装に合わせて段階導入。
+Formant は全 mode で有効 (Stretch は「0 = 原音の声質を保持」、 テープ系は「0 = 素通し」)。
+詳細は `docs/plan_clip_stretch.md` §7。 grain size 等の Bitwig 詳細パラメータは未対応。
 
 ### 3.8 Reverse / Normalize / Bounce
 

@@ -81,6 +81,15 @@ pub struct KeyEvent {
     pub text: Option<String>,
     /// 物理キーの識別子 (winit `KeyCode` 由来)。
     pub physical_key: PhysicalKey,
+    /// OS の auto-repeat (押しっぱなしで繰り返し届く) 由来か (winit `KeyEvent::repeat`)。
+    ///
+    /// **テキスト入力は repeat を消費する** (Backspace / 矢印の長押しが効かないと使い物に
+    /// ならない) が、**global shortcut は立ち上がり 1 回だけ発火させる**。 shortcut は
+    /// Delete / D / E のような離散コマンドに bind されており、 repeat で連射されると
+    /// 「Delete 長押しでトラックが次々消える」 のような破壊的挙動になる。 従って
+    /// repeat の抑止は `Ui::frame` の shortcut 解決層だけで行い、 event 自体は
+    /// `keyboard_events` に残して focused widget へ渡す。
+    pub repeat: bool,
 }
 
 /// 物理キー。

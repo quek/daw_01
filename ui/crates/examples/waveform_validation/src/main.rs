@@ -370,6 +370,7 @@ impl App {
                             .min(max_start),
                         len_samples: m.viewport.view_len as u64,
                         vertical_gain: m.vertical_gain,
+                        reversed: false,
                     };
                     let _resp = ui.waveform(("clip", i), rect, source, view, style);
                 }

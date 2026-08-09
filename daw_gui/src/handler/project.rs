@@ -151,6 +151,11 @@ impl AppData {
         // 目標形なら no-op (dirty 化しない) なので、 seed の直後 (= clean baseline 後) に
         // 呼んで、 実際に畳んだ legacy プロジェクトだけを dirty にする。
         self.normalize_lipsync_clips_on_load();
+        // r.md #39: 保存済み口パクが **古い配置ルール** で作られていたら一度だけ
+        // 再生成する。 上の fingerprint baseline は「入力が変わったか」しか見ないので、
+        // 配置ルール自体を変えたときはこの世代チェックが唯一の再生成トリガになる
+        // (合成 WAV 側の `CACHE_SCHEMA_VERSION` と対)。 現行世代なら何もしない。
+        self.regenerate_outdated_lipsync_on_load();
         // `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
         // 別 project に持ち越さない。 段階ズームのアンカーと lane 高
         // override も旧 project の lane key を指すので一緒に破棄。
@@ -160,30 +165,38 @@ impl AppData {
         // r.md #10: 別 project の `Home` 2 段トグル state を持ち越さない
         // (= 新 project 最初の Home は先頭クリップ位置から始める)。
         self.ui_ephemeral.home_toggle_at_first = false;
+        // 編集面の last-wins タグ (r.md #43) を含む Song スコープの参照系は、
+        // 冒頭の `reset_song_scoped_state` が一括で捨てている。 個別に消し直さない
+        // (破棄の口を 2 つにすると、また片方だけ更新される)。
     }
 
     pub(crate) fn undo(&mut self) {
+        // audio editor の対象は positional な `ClipRef` なので、 song を差し替える
+        // **前** に安定 key を退避して `after_undo_redo` で貼り直す。
+        let key = self.audio_editor_target_key();
         if !self.song_doc.undo() {
             return;
         }
-        self.after_undo_redo();
+        self.after_undo_redo(key);
     }
 
     pub(crate) fn redo(&mut self) {
+        let key = self.audio_editor_target_key();
         if !self.song_doc.redo() {
             return;
         }
-        self.after_undo_redo();
+        self.after_undo_redo(key);
     }
 
     /// r.md #29: 履歴リストの行 click → `index` 番目の state へ一気に遡る /
     /// 進む。 undo/redo を必要段数ぶん繰り返すのと等価だが、 reconcile
     /// (`after_undo_redo`) は最終 state に対して 1 度だけ走らせる。
     pub(crate) fn jump_history_to(&mut self, index: usize) {
+        let key = self.audio_editor_target_key();
         if !self.song_doc.jump_to(index) {
             return;
         }
-        self.after_undo_redo();
+        self.after_undo_redo(key);
     }
 
     /// プロジェクト非依存の UI 設定 (resource monitor on/off・編集履歴 window の
@@ -206,7 +219,10 @@ impl AppData {
         }
     }
 
-    pub(crate) fn after_undo_redo(&mut self) {
+    /// `audio_editor_key` は song を差し替える **前** に退避した安定 `ClipKey`
+    /// (`AppData::audio_editor_target_key`)。 audio editor の対象は positional な
+    /// `ClipRef` なので、 これで貼り直さないと index が詰まって別クリップを指す。
+    pub(crate) fn after_undo_redo(&mut self, audio_editor_key: Option<common::model::ClipKey>) {
         // (epoch bump / gesture chain 切断は SongDoc::undo/redo が実施済み。)
         // selected_clip が undo 後も存在するなら維持、消えていれば None。
         // (常に None にすると undo のたびにピアノロールがプレースホルダに戻ってしまう)
@@ -228,22 +244,12 @@ impl AppData {
         // point も undo でずれるため clear (notes / audio events と同じ扱い)。
         self.selection.selected_automation_points.clear();
         self.ui_ephemeral.editing_automation_point = None;
-        // audio_editor_clip は index ベース ClipRef。 undo で track/clip が詰まる
-        // と別 clip を編集してしまうので、 解決不能 / 非 audio になったら閉じる。
-        if let Some(r) = self.ui_ephemeral.audio_editor_clip {
-            let still_audio = self
-                .song_doc.song()
-                .tracks
-                .get(r.track as usize)
-                .and_then(|t| t.clips.get(r.clip as usize))
-                .and_then(|c| self.song_doc.song().clip_contents.get(&c.content_id))
-                .is_some_and(|c| {
-                    matches!(c, common::model::ClipContent::Audio(_))
-                });
-            if !still_audio {
-                self.close_audio_editor();
-            }
-        }
+        // audio_editor_clip は index ベース ClipRef。 undo で track/clip が詰まると
+        // 別 clip を編集してしまうので、 **安定 key で貼り直す** (解決不能 / 非 audio
+        // なら閉じる)。 旧実装は「その index に audio clip が居るか」 しか見ておらず、
+        // 詰まった先に別の audio clip が居るケースを取りこぼしていた
+        // (track 削除経路と共通のガード = `reanchor_audio_editor`)。
+        self.reanchor_audio_editor(audio_editor_key);
         self.ui_ephemeral.track_rename_id = None;
         self.ui_ephemeral.track_rename_text.clear();
         self.ui_ephemeral.section_rename_id = None;
@@ -262,7 +268,16 @@ impl AppData {
         if self.selection.selected_track_ids.is_empty()
             && let Some(last) = self.song_doc.song().tracks.last()
         {
-            self.selection.selected_track_ids.push(last.id);
+            let id = last.id;
+            self.selection.selected_track_ids.push(id);
+            // r.md #43: このフォールバックは **ユーザーの選択ではない** (undo で選択が
+            // 全部消えたときに任意の 1 本を当てているだけ)。 last-wins タグが Tracks の
+            // まま残ると、 直後の Delete が「触ってもいないトラック」 を消すので降ろす。
+            // 削除経路の自動再選択は「削除位置の隣」 = 操作の続きなのでタグを保つが、
+            // こちらは位置の連続性が無いので保てない。
+            if self.selection.last_edit_select == Some(EditSurface::Tracks) {
+                self.selection.last_edit_select = None;
+            }
         }
         // collapsed_groups も track が消えていたら除外。
         self.ui_prefs.collapsed_groups.retain(|id| live_ids.contains(id));

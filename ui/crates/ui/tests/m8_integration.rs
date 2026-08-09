@@ -53,7 +53,7 @@ fn shortcut_take_consumes_match() {
     input.keyboard = vec![KeyEvent {
         state: ElementState::Pressed,
         text: None,
-        physical_key: PhysicalKey::Char('Z'),
+        physical_key: PhysicalKey::Char('Z'), repeat: false
     }];
 
     let mut got_undo = false;
@@ -77,7 +77,7 @@ fn shortcut_redo_with_ctrl_y() {
     input.keyboard = vec![KeyEvent {
         state: ElementState::Pressed,
         text: None,
-        physical_key: PhysicalKey::Char('Y'),
+        physical_key: PhysicalKey::Char('Y'), repeat: false
     }];
 
     let mut got_redo = false;
@@ -113,7 +113,7 @@ fn tab_traversal_moves_focus_in_order() {
     input.keyboard = vec![KeyEvent {
         state: ElementState::Pressed,
         text: None,
-        physical_key: PhysicalKey::Tab,
+        physical_key: PhysicalKey::Tab, repeat: false
     }];
     run(&mut host, &mut m, input, |_, ui| {
         ui.focusable(wid_a, Rect { x: 0.0, y: 0.0, w: 100.0, h: 30.0 });
@@ -137,7 +137,7 @@ fn noop_clipboard_paste_returns_none() {
     input.keyboard = vec![KeyEvent {
         state: ElementState::Pressed,
         text: None,
-        physical_key: PhysicalKey::Char('V'),
+        physical_key: PhysicalKey::Char('V'), repeat: false
     }];
 
     let mut paste_result: Option<String> = None;

@@ -328,6 +328,7 @@ impl<H: AppHost, F: FnOnce(WinitWindow) -> H> ApplicationHandler for WinitRunner
                     state: map_state(event.state),
                     text: event.text.map(|s| s.to_string()),
                     physical_key: map_phys_key(event.physical_key),
+                    repeat: event.repeat,
                 };
                 host.on_event(AppEvent::Keyboard(key));
             }

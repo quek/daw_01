@@ -955,7 +955,7 @@ mod tests {
         let numpad_enter = KeyEvent {
             state: ElementState::Pressed,
             text: None,
-            physical_key: PhysicalKey::NumpadEnter,
+            physical_key: PhysicalKey::NumpadEnter, repeat: false
         };
         host.frame_to_edits(
             &(),
@@ -999,7 +999,7 @@ mod tests {
         let enter = KeyEvent {
             state: ElementState::Pressed,
             text: None,
-            physical_key: PhysicalKey::Enter,
+            physical_key: PhysicalKey::Enter, repeat: false
         };
         host.frame_to_edits(
             &(),
@@ -1045,14 +1045,14 @@ mod tests {
     }
 
     fn key_pressed(physical: PhysicalKey) -> KeyEvent {
-        KeyEvent { state: ElementState::Pressed, text: None, physical_key: physical }
+        KeyEvent { state: ElementState::Pressed, text: None, physical_key: physical , repeat: false}
     }
 
     fn key_pressed_text(physical: PhysicalKey, t: &str) -> KeyEvent {
         KeyEvent {
             state: ElementState::Pressed,
             text: Some(t.into()),
-            physical_key: physical,
+            physical_key: physical, repeat: false
         }
     }
 

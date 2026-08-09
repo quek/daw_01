@@ -250,6 +250,33 @@ pub fn run_export(
     Ok(ExportOutcome { frames: frames_written, cancelled: false })
 }
 
+/// r.md #39: 書き出し窓と走査終端を master 出力の PDC 遅延ぶん **後ろ** へずらす。
+///
+/// PDC は export でも有効なので (`compile_schedule` は live と共通)、`master_buffer[P]`
+/// に載っているのは曲位置 `P - master_latency` の音。素通しで書くと wav 全体が
+/// `master_latency` ぶん後ろへずれ、書き出した stem を同じ project の元位置へ貼り戻すと
+/// 二重にずれて聞こえる (`daw_gui/tests/pdc_real_vst3.rs` が実 VST3 でこの症状を記述)。
+///
+/// 3 つ全部をずらすのが要点:
+/// - `write_start`: 書き始めを遅らせる = 先頭の遅延ぶんを捨てる → `wav[0]` が曲位置 `write_start`
+/// - `write_end`: tail-silence 検出の開始点も曲位置基準に保つ
+/// - `total_samples`: 走査を同じだけ延長しないと末尾が `master_latency` ぶん欠ける
+///
+/// `master_latency == 0` (= PDC 無し) では恒等変換なので、既存挙動は変わらない。
+fn shift_window_for_master_latency(
+    master_latency: u32,
+    write_start: u64,
+    write_end: u64,
+    total_samples: u64,
+) -> (u64, u64, u64) {
+    let l = u64::from(master_latency);
+    (
+        write_start.saturating_add(l),
+        write_end.saturating_add(l),
+        total_samples.saturating_add(l),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
     engine_shared: &EngineShared,
@@ -306,7 +333,29 @@ fn render_loop(
                 sample_rate,
                 true,
             );
-            crate::publish_audio_clip_schedule(engine_shared, generation, full);
+            crate::publish_audio_clip_schedule(engine_shared, generation, full, sample_rate);
+        }
+    }
+
+    // r.md #40: live 側は off-thread pool を RT へ配送するが、この walk 自体が
+    // off-RT なので自前の `TrackScratch` に直接エンジンを積む (= live と同じ
+    // `render_audio_events` を通す = 不変条件 #6)。 足りないと Stretch clip が
+    // degrade 経路に落ちて書き出しだけ音が変わるので、ここで必ず揃える。
+    {
+        let renderer_g = engine_shared.audio_clip_renderer.load();
+        for (track_idx, &needed) in renderer_g.engines_per_track.iter().enumerate() {
+            let Some(ts) = scratch.get_mut(track_idx) else {
+                break;
+            };
+            while ts.stretch_engines.len() < usize::from(needed)
+                && ts.stretch_engines.len() < ts.stretch_engines.capacity()
+            {
+                let Some(engine) = crate::stretch_engine::StretchEngine::new(sample_rate) else {
+                    tracing::error!(track_idx, "export: stretch engine の確保に失敗 (OOM?)");
+                    break;
+                };
+                ts.stretch_engines.push(engine);
+            }
         }
     }
 
@@ -317,6 +366,14 @@ fn render_loop(
     // `max_frames` (leaf 宛 sidechain tap の 1-buffer 補償量、 live と同規則)。
     let mut schedule = compile_schedule(song, sample_rate, max_frames as u32)
         .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
+
+    // r.md #39: PDC 遅延ぶん書き出し窓を後ろへずらす (下の helper に理由を集約)。
+    let (write_start, write_end, total_samples) = shift_window_for_master_latency(
+        schedule.master_latency_samples,
+        write_start,
+        write_end,
+        total_samples,
+    );
 
     // docs/plan_modulation.md §7: bake each `ModSource`'s follower envelope per
     // render buffer (keyed by beat) so the offline video render reproduces the
@@ -419,7 +476,6 @@ fn render_loop(
             // automation 中の書き出しでノートが欠落 / 二重発音する。
             smoothed_current_bpm_freewheel as f32,
             playhead_beats,
-            smoothed_current_bpm_freewheel,
             &mod_scalars_snapshot,
             master_gain,
         );
@@ -515,4 +571,37 @@ fn render_loop(
     // `run_export`, which owns the WAV path and persists it next to the WAV.
     // `false` = ran to completion (not cancelled).
     Ok((frames_written, env_sidecar, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_master_latency_leaves_the_write_window_untouched() {
+        // PDC 無しの曲では恒等変換 (既存挙動の回帰防止)。
+        assert_eq!(
+            shift_window_for_master_latency(0, 12_000, 96_000, 120_000),
+            (12_000, 96_000, 120_000)
+        );
+    }
+
+    #[test]
+    fn master_latency_shifts_write_window_and_extends_the_walk() {
+        // r.md #39: 書き始め・tail 判定・走査終端の 3 つを同じだけ後ろへ。
+        // 走査を延ばさないと末尾が latency ぶん欠ける。
+        let (ws, we, total) = shift_window_for_master_latency(4_096, 0, 96_000, 120_000);
+        assert_eq!(ws, 4_096, "wav[0] は master[write_start + L] = 曲位置 write_start");
+        assert_eq!(we, 100_096);
+        assert_eq!(total, 124_096, "走査を L だけ延長して末尾を欠けさせない");
+        // 書き出される長さは latency に依らず「要求された範囲」のまま。
+        assert_eq!(total - ws, 120_000);
+    }
+
+    #[test]
+    fn shift_saturates_instead_of_overflowing() {
+        let (ws, we, total) =
+            shift_window_for_master_latency(u32::MAX, u64::MAX, u64::MAX, u64::MAX);
+        assert_eq!((ws, we, total), (u64::MAX, u64::MAX, u64::MAX));
+    }
 }

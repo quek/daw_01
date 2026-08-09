@@ -512,7 +512,12 @@ pub enum AppEvent {
         parent_id: Option<u32>,
     },
     RemoveLastTrack,
-    DeleteTrack(u32),
+    /// 選択トラック群の削除 (r.md #43)。 引数は **安定 `Track::id`** の集合
+    /// (positional index ではない、 不変条件 1)。 group を含むときは subtree ごと
+    /// 再帰削除 (Live 準拠、 `docs/plan_group_track.md` §6)。 1 event = 1 gesture
+    /// なので N 本消しても undo は 1 ステップ。 song に居ない id (master row の
+    /// `MASTER_TRACK_ID` / subtree 削除で先に消えた子) は黙って無視される。
+    DeleteTracks(Vec<u32>),
     /// 選択トラック群を複製する (r.md #30)。`Shared` = クリップ中身 (MIDI ノート /
     /// オーディオ / オートメーション) を元トラックと **リンク** (同じ content_id を
     /// 共有、 片方のノート編集が両方に反映) して重ねる用、 `Unique` = deep clone +
@@ -528,7 +533,6 @@ pub enum AppEvent {
     /// 新順での `Track.id` 列で `song.tracks` を並び替える (drag&drop reorder)。
     /// order に含まれない track はそのまま末尾に残す。
     ReorderTracks(Vec<u32>),
-    SelectTrack(u32),
     /// 引数は rename 対象 track の **安定 ID** (positional index ではない)。
     BeginRenameTrack(u32),
     RenameTrackChanged(String),
@@ -1278,6 +1282,9 @@ pub enum AppEvent {
     SetClipGainDb { target: ClipRef, gain_db: f32 },
     SetClipPan { target: ClipRef, pan: f32 },
     SetClipPitchSemitones { target: ClipRef, semitones: f32 },
+    /// r.md #40: スペクトル包絡 (フォルマント) の移調量。 音程とは独立に
+    /// 「声質」 だけを動かす。
+    SetClipFormantSemitones { target: ClipRef, semitones: f32 },
 
     // ---- Audio event fade 編集 (Phase 2 PR3) ----------------------------
     /// Fade length / curve の programmatic 設定。 `SetClipGainDb` 等と
@@ -1561,6 +1568,7 @@ impl AppEvent {
             E::SetClipGainDb { .. } | E::SetClipGainDbBatch(..) => "クリップゲイン変更",
             E::SetClipPan { .. } => "クリップパン変更",
             E::SetClipPitchSemitones { .. } => "クリップピッチ変更",
+            E::SetClipFormantSemitones { .. } => "クリップフォルマント変更",
             E::SetClipFadeInBeats { .. }
             | E::SetClipFadeOutBeats { .. }
             | E::SetClipFadeInCurve { .. }
@@ -1601,7 +1609,7 @@ impl AppEvent {
             E::GroupSelectedTracks { .. } => "トラックをグループ化",
             E::UngroupTracks { .. } => "グループ解除",
             E::SetTrackParent { .. } => "トラック親変更",
-            E::RemoveLastTrack | E::DeleteTrack(..) => "トラック削除",
+            E::RemoveLastTrack | E::DeleteTracks(..) => "トラック削除",
             E::DuplicateTracksShared(..) | E::DuplicateTracksUnique(..) => "トラック複製",
             E::MoveTrackUp(..) | E::MoveTrackDown(..) | E::ReorderTracks(..) => "トラック並べ替え",
             E::CommitRenameTrack => "トラック名変更",

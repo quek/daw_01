@@ -164,6 +164,9 @@ fn rebuild_mouth_clip(
                 content_id,
                 color: None,
                 auto_lipsync: true,
+                // 生成した配置ルールの世代を焼き込む (r.md #39)。load 時に
+                // 古い世代を見つけたら一度だけ再生成する。
+                lipsync_gen: common::lipsync::PLACEMENT_GEN,
                 ..Default::default()
             });
             song.gc_clip_contents();
@@ -464,7 +467,10 @@ impl AppData {
             // 内容のみをハッシュする (= 非対象 clip の移動では fingerprint 不変)。
             for clip in &src.clips {
                 let content = song.clip_contents.get(&clip.content_id);
-                if let Some(notes) = content.and_then(|c| c.notes()).filter(|n| !n.is_empty()) {
+                if let Some(notes) = content
+                    .and_then(|c| c.notes())
+                    .filter(|n| common::voicevox::sing_base_beat(n).is_some())
+                {
                     // sing: clip 位置 + build_sing_query が読む note フィールドのみ。
                     clip.start_beat.to_bits().hash(&mut h);
                     clip.length_beats.to_bits().hash(&mut h);
@@ -582,6 +588,32 @@ impl AppData {
         }
     }
 
+    /// load 時に呼ぶ (r.md #39): 保存済みの `auto_lipsync` clip が **古い配置ルール**
+    /// ([`common::lipsync::PLACEMENT_GEN`]) で作られていたら、そのソース vocal track の
+    /// 口パクを一度だけ再生成する。
+    ///
+    /// 口パク event は project に永続化される派生データで、通常の再生成トリガは
+    /// `lipsync_input_fingerprint` の差分だけ。配置ルールを変えても入力は変わらないので、
+    /// この経路が無いと旧タイミング (talk なら音声より ~100ms 遅れ) が温存され、
+    /// 「直したのに変わらない」になる。合成 WAV 側の `CACHE_SCHEMA_VERSION` と対の仕組み。
+    ///
+    /// r.md #9 の dirty-on-open contract とは「**実際に古い世代のときだけ** dirty になる」
+    /// 形で両立する (現行世代の clip しか無い project では何もしない)。engine 未起動等で
+    /// phoneme query が失敗した場合は既存 clip が温存され、世代も古いままなので次回 open で
+    /// 再試行される。
+    pub(crate) fn regenerate_outdated_lipsync_on_load(&mut self) {
+        let vocal_ids =
+            common::lipsync::vocal_tracks_with_outdated_lipsync(self.song_doc.song());
+        for vid in vocal_ids {
+            tracing::info!(
+                vocal_track_id = vid,
+                placement_gen = common::lipsync::PLACEMENT_GEN,
+                "口パク配置ルールが更新されているため再生成する (r.md #39)"
+            );
+            self.regenerate_lipsync_for_track(vid);
+        }
+    }
+
     /// 口パク (lip-sync) を再生成する (docs/plan_pakupaku.md §7)。`vocal_track_id`
     /// の各 clip の notes を snapshot し、背景スレッドで `query_phonemes`
     /// (`sing_frame_audio_query` のみ) を叩いて結果を `AppEvent::LipsyncGenerated`
@@ -612,7 +644,6 @@ impl AppData {
             return;
         }
         let bpm = self.song_doc.song().bpm;
-        let lead_in = common::lipsync::lead_in_beats(bpm);
         // (talk) target 中心: 出力先が `target_id` の **全ソーストラック** をまとめて
         // 再生成する (`docs/plan_voicevox_talk.md`)。トラック並び順 index を priority に
         // し、apply 側で重なりを上位優先で解決する。各 clip は notes (歌唱) があれば sing、
@@ -626,28 +657,26 @@ impl AppData {
             }
             let priority = idx as u32;
             for clip in &src.clips {
-                // sing: notes を持つ clip。
+                // sing: notes を持つ clip。phoneme 列 frame 0 は「基準ノートの
+                // `REST_FRAMES` 手前」に来る (= 合成 wav 先頭と同じ位置、r.md #39)。
                 if let Some(notes) = self
                     .song_doc.song()
                     .clip_contents
                     .get(&clip.content_id)
                     .and_then(|c| c.notes())
-                    && !notes.is_empty()
+                    && let Some(base) = common::voicevox::sing_base_beat(notes)
                 {
-                    let first_note_local_beat = notes
-                        .iter()
-                        .map(|n| n.start_beat)
-                        .fold(f64::INFINITY, f64::min);
                     snaps.push((
                         clip.start_beat,
                         clip.length_beats,
-                        first_note_local_beat,
+                        common::voicevox::sing_head_beat(base, bpm),
                         priority,
                         notes.to_vec(),
                     ));
                     continue;
                 }
-                // talk: Text clip の先頭の非空 TextEvent。
+                // talk: Text clip の先頭の非空 TextEvent。phoneme 列 frame 0 = wav 先頭 =
+                // 「発話開始の pre-silence 分手前」(現行 pre-silence は 0 なので event 開始)。
                 if let Some(events) = self
                     .song_doc.song()
                     .clip_contents
@@ -655,14 +684,21 @@ impl AppData {
                     .and_then(|c| c.text_events())
                     && let Some(ev) = events.iter().find(|e| !e.text.is_empty())
                 {
+                    let scales = clip.talk.unwrap_or_default();
+                    let pre_beats = common::voicevox::frames_to_beats(
+                        f64::from(common::voicevox::talk_pre_silence_frames(
+                            scales.speed_scale,
+                        )),
+                        bpm,
+                    );
                     talk_snaps.push((
                         clip.start_beat,
                         clip.length_beats,
-                        ev.event_start_in_clip_beats + lead_in,
+                        ev.event_start_in_clip_beats - pre_beats,
                         priority,
                         ev.text.clone(),
                         clip.speaker_id,
-                        clip.talk.unwrap_or_default(),
+                        scales,
                     ));
                 }
             }
@@ -687,12 +723,12 @@ impl AppData {
         let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             let mut clips = Vec::with_capacity(snaps.len() + talk_snaps.len());
-            for (clip_start_beat, clip_len_beats, first_note_local_beat, priority, notes) in snaps {
+            for (clip_start_beat, clip_len_beats, first_phoneme_local_beat, priority, notes) in snaps {
                 match crate::voicevox_client::query_phonemes(&notes, bpm) {
                     Ok(phonemes) => clips.push(LipsyncClipResult {
                         clip_start_beat,
                         clip_len_beats,
-                        first_note_local_beat,
+                        first_phoneme_local_beat,
                         priority,
                         phonemes,
                     }),
@@ -703,14 +739,14 @@ impl AppData {
             }
             // (talk) 読み上げ phoneme を `query_talk_phonemes` で取り、同じ
             // `LipsyncClipResult` に詰める (= apply 経路は歌唱と共通)。
-            for (clip_start_beat, clip_len_beats, first_note_local_beat, priority, text, speaker_id, scales) in
+            for (clip_start_beat, clip_len_beats, first_phoneme_local_beat, priority, text, speaker_id, scales) in
                 talk_snaps
             {
                 match crate::voicevox_client::query_talk_phonemes(&text, speaker_id, &scales) {
                     Ok(phonemes) => clips.push(LipsyncClipResult {
                         clip_start_beat,
                         clip_len_beats,
-                        first_note_local_beat,
+                        first_phoneme_local_beat,
                         priority,
                         phonemes,
                     }),
@@ -774,7 +810,7 @@ impl AppData {
                     &r.phonemes,
                     &mouth_map,
                     bpm,
-                    r.first_note_local_beat,
+                    r.first_phoneme_local_beat,
                     r.clip_len_beats,
                 );
                 for ev in events {
@@ -996,6 +1032,20 @@ mod rebuild_mouth_clip_tests {
             mouth_triples(&song),
             vec![(0.0, 2.0, 99), (2.0, 4.0, 5), (4.0, 8.0, 99)],
         );
+    }
+
+    #[test]
+    fn rebuild_stamps_the_current_placement_generation() {
+        // r.md #39: 再生成した clip には現行の配置ルール世代を焼き込む。これで
+        // 「古い世代を見つけたら load 時に一度だけ作り直す」検出が終端する
+        // (焼き込みを忘れると毎回 open のたびに再生成 = '*' が付き続ける)。
+        let mut song = tachie_song(99);
+        assert!(rebuild_mouth_clip(&mut song, 3, vec![(2.0, 4.0, 5)]));
+        let clip = &song.track_by_id(3).unwrap().clips[0];
+        assert!(clip.auto_lipsync);
+        assert_eq!(clip.lipsync_gen, common::lipsync::PLACEMENT_GEN);
+        // 世代が現行なので、もう再生成対象にならない。
+        assert!(common::lipsync::vocal_tracks_with_outdated_lipsync(&song).is_empty());
     }
 
     #[test]

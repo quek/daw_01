@@ -42,6 +42,18 @@ pub struct Clip {
     /// v20 files forward-migrate to `false`。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_lipsync: bool,
+    /// この `auto_lipsync` clip を生成した **口パク配置ルールの世代**
+    /// ([`crate::lipsync::PLACEMENT_GEN`])。`0` = 世代を持たない旧 file。
+    ///
+    /// r.md #39: 口パク event は project に永続化される派生データで、再生成は
+    /// 入力 (notes / text / bpm / mouth_map …) の fingerprint が変わったときだけ走る。
+    /// 配置ルール自体を変えると、入力が同じままなので **開いても再生成されず旧
+    /// タイミングが残る** (talk が音声より ~100ms 遅れたまま)。合成 WAV 側が
+    /// `voicevox_cache::CACHE_SCHEMA_VERSION` で世代を切っているのと対になる仕組みで、
+    /// load 時に古い世代の clip を見つけたら一度だけ再生成する。
+    /// `auto_lipsync == false` の手置き clip では常に 0 (意味を持たない)。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub lipsync_gen: u32,
     /// clip 全体のミュート (= MIDI / audio / video / image / 字幕 / 歌唱
     /// すべての content type 共通の clip-level mute の SSoT)。`true` で再生・書き出しから
     /// この clip を除外し、GUI は dim + 斜線ハッチで「ミュート中」を表示する。`q`
@@ -623,7 +635,26 @@ pub struct AudioEvent {
 
     pub gain_db: f32,
     pub pan: f32,
+    /// 移調量 (半音)。有効範囲は [`PITCH_SEMITONES_LIMIT`]。
     pub pitch_semitones: f32,
+    /// **スペクトル包絡 (フォルマント) の移調量 (半音)** — 「声質」を音程と
+    /// 独立に動かすつまみ。有効範囲は [`FORMANT_SEMITONES_LIMIT`]。r.md #40。
+    ///
+    /// mode ごとの意味 (`0` の意味が mode で違うのが肝):
+    ///
+    /// | mode | `0` の意味 | `F` の意味 |
+    /// |---|---|---|
+    /// | [`StretchMode::Stretch`] | **原音のフォルマントを保持** (= 移調しても声質が変わらない) | 原音の包絡を `F` 半音動かす |
+    /// | `Raw` / `Repitch` / `Slice` | 完全バイパス (= テープ挙動そのまま、出力は 1 サンプルも変わらない) | テープ結果の包絡を `F` 半音動かす |
+    ///
+    /// Stretch だけ「0 = 保持」なのは、スペクトル方式の定義が音程と包絡の分離
+    /// だから (Ableton Complex Pro の Formants=100%、Bitwig Elastique Pro、
+    /// Cubase VariAudio、Melodyne と同じ流儀)。テープ系で「0 = 未処理」なのは、
+    /// Repitch の存在意義がテープ挙動そのものだから (Ableton Re-Pitch に
+    /// フォルマント制御が無いのと同じ理由)。
+    ///
+    /// **時間軸には一切効かない** ので、波形描画
+    /// (`common::audio_render::audible_source_span`) には現れない。
     pub formant_semitones: f32,
 
     pub stretch_mode: StretchMode,
@@ -678,6 +709,29 @@ impl Default for AudioEvent {
             onsets: Vec::new(),
             beat_markers: Vec::new(),
         }
+    }
+}
+
+/// [`AudioEvent::pitch_semitones`] の絶対値上限 (半音)。Bitwig の audio event
+/// pitch range (±96) に合わせる。
+///
+/// **setter / clipboard sanitize / inspector の range はここだけを見ること**。
+/// r.md #40 以前は setter が ±96、貼り付け sanitize が ±48 と割れていて、
+/// コピー&ペーストするだけで値が静かに切られていた。
+pub const PITCH_SEMITONES_LIMIT: f32 = 96.0;
+
+/// [`AudioEvent::formant_semitones`] の絶対値上限 (半音)。±4 oct は Melodyne の
+/// フォルマントツール (cent 単位で数千 cent) の実用域を包含する。
+pub const FORMANT_SEMITONES_LIMIT: f32 = 48.0;
+
+/// 有限値かつ `±limit` に収める。非有限 (NaN / Inf) は `0.0`。
+/// pitch / formant の clamp を書く場所を 1 つにするための helper。
+#[must_use]
+pub fn clamp_semitones(value: f32, limit: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-limit, limit)
+    } else {
+        0.0
     }
 }
 

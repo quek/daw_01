@@ -12,6 +12,7 @@ use daw_gui::app::{AppData, AppEvent};
 use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
+use daw_gui::widgets::select_modifier::SelectModifier;
 
 fn entry(id: &str, name: &str, instrument: bool, path: &str) -> PluginEntry {
     PluginEntry {
@@ -91,11 +92,20 @@ pub fn drain<T>(rx: &mut UnboundedReceiver<T>) -> Vec<T> {
     v
 }
 
+/// index 指定でトラックを 1 本だけ単独選択する (= production のトラックヘッダ
+/// click 相当)。 production は可視順を `apply_select_tracks` に渡すので、 ここでも
+/// 全トラックの id 列をそのまま可視順として渡す (折り畳み無しの test song では同じ)。
+pub fn select_track_single(app: &mut AppData, idx: usize) {
+    let visible: Vec<u32> = app.song_doc.song().tracks.iter().map(|t| t.id).collect();
+    let id = visible[idx];
+    app.apply_select_tracks(id, SelectModifier::Single, &visible);
+}
+
 /// 楽器 (test.synth) を track 0 に picker 経由でロードし、plugin_host からの
 /// `SlotPluginLoaded` 応答まで fake dispatch する。
 pub fn load_instrument(app: &mut AppData) {
     let track_id = app.song_doc.song().tracks[0].id;
-    app.handle_event(AppEvent::SelectTrack(0));
+    select_track_single(app, 0);
     app.handle_event(AppEvent::OpenPluginPicker);
     app.handle_event(AppEvent::SelectPluginFromDb {
         id: "test.synth".into(),

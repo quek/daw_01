@@ -210,8 +210,12 @@ ImageEvent を生成している(`Track::lipsync_target_track` / `mouth_map`)。
 - 生成タイミング: 歌唱と同じ口パク再生成経路に Text clip を追加(`auto_lipsync`
   clip は再生成で全削除→再構築)。
 - talk phoneme は秒単位長 → `FRAME_RATE` 換算で歌唱 phoneme と同じ frame_length へ。
-- 先頭/末尾の pause も含めて配置(`build_mouth_events` の lead-in は talk では
-  `pre_phoneme_length` 由来。歌唱の `REST_FRAMES` に相当する量で揃える)。
+- 先頭/末尾の pause も含めて配置。**先頭無音は `prePhonemeLength = 0`
+  (`common::voicevox::TALK_PRE_PHONEME_LENGTH`) を合成時に注入して消す**ので、
+  `build_mouth_events` に渡す anchor は素の TextEvent 開始位置になる (r.md #39)。
+  engine 既定 0.1s のまま残すと先頭無音が `speedScale` で割られ、話速 0.5 で
+  +96ms / 1.5 で −43ms と発話位置が動いてしまう。`parse_talk_phonemes` も応答の
+  `prePhonemeLength` ではなく同じ定数を見る (音声と口の SSoT)。
 
 ---
 
@@ -302,7 +306,8 @@ auto-insert**(既に在れば no-op)。
   (2 段 picker + scrubable 4 つ + 字幕デバイス追加ヘルパ)。scale は scrub 系なので非 undoable。
 - **誤読**: 辞書/読み欄なし (Q9)。テキスト = 表示 = 読み上げの 1 文字列を貫く。
 - **口パク**: talk の `query_talk_phonemes` (audio_query → Phoneme 換算、speed で長さ補正) を既存
-  `build_mouth_events` に相乗り。lead-in は `lipsync::lead_in_beats` で event 開始に揃え音声と一致。
+  `build_mouth_events` に相乗り。anchor は「phoneme 列 frame 0 = wav 先頭」の共通契約
+  (r.md #39) に従い `event 開始 − pre-silence` を渡す (pre-silence は現行 0)。
   1 Text clip = 1 発話 (先頭の非空 TextEvent) として扱う (多 event/clip の口パクは別途)。
 - **再合成トリガ配線**: text 本文編集 (`set_clip_text_event_content`) / 声変更 (`set_clip_voice`) /
   scale 変更 (`set_clip_talk_param`) いずれも `sync_vocal_metadata` 再 flush + `mark_lipsync_dirty`。

@@ -17,7 +17,6 @@ pub(super) fn commit_releases(
     master_row: Option<&ArrangementMasterRow>,
     sections: &[SectionView],
     selected_clips: &[ClipKey],
-    selected_tracks: &[u32],
     selected_automation_clips: &[AutomationClipKey],
     selected_automation_points: &[AutomationPointKey],
     visible_tracks: &[ArrangementTrack],
@@ -44,18 +43,13 @@ pub(super) fn commit_releases(
     pending_drop: Option<(Vec<u32>, Option<u32>, Option<u32>)>,
 ) {
         // ---- shortcut: Delete ----
-        // Phase 47c: clip 選択優先、無ければ selected_tracks (multi-select) の先頭を削除。
-        // M14 Phase 63c (#016): multi-track の一括削除はあえて単一にとどめる (ungroup → 残った
-        // 子 track 群の parent_id 整理を caller 側で必要、 widget API としては `DeleteTrack(u32)` を
-        // 既存 1:1 で維持し、 multi 削除は caller が selected_tracks を loop して呼べば実現できる)。
-        // 現状は user 体験として「Delete shortcut で 1 track 削除」 を想定。
-        if ui.take_shortcut("delete") {
-            if !selected_clips.is_empty() {
-                ui.push_edit({ let v_k = selected_clips.to_vec(); Edit::mutate(move |app: &mut AppData| { let refs: Vec<ClipRef> = v_k.iter().filter_map(|key| clip_key_to_ref(app, *key)).collect(); if !refs.is_empty() { app.handle_event(AppEvent::SetClipSelection(refs)); app.handle_event(AppEvent::DeleteSelectedClip); } }) });
-            } else if let Some(&tid) = selected_tracks.first() {
-                ui.push_edit({ let v_id = tid; Edit::mutate(move |app: &mut AppData| { if let Some(idx) = app.song_doc.song().tracks.iter().position(|t| t.id == v_id) { app.handle_event(AppEvent::DeleteTrack(idx as u32)); } }) });
-            }
-        }
+        // r.md #43: widget 内蔵の Delete ハンドラは **撤去した**。 `dispatch_shortcuts`
+        // (view/root.rs) が arrangement 描画より前に走り `Ui::take_shortcut` で 1 度きり
+        // 消費するので、 ここに書いた handler は構造的に到達不能な死蔵コードだった
+        // (かつ「clip が無ければ選択トラックの先頭を 1 本だけ positional index で削除」
+        // という root の arbiter と食い違う旧仕様を温存していた)。
+        // 削除規則の SSoT は root の単一 arbiter (`AppData::edit_surface` →
+        // `delete_for_surface`) 1 本。
 
         // ---- clip drag release → MoveClips / ResizeClips ----
         // M9 Phase 60: anchor 0 の delta を `view.snap.snap_beat_delta` で round → 全 anchor に
@@ -900,7 +894,7 @@ pub(super) fn commit_releases(
         }
 
         // ---- M14 Phase 63c (#016): track header drag release → SetTrackParent ----
-        // dist < 16px → click 格下げ (modifier-aware SelectTrack に任せる、 後続 loop の clicked_track 経路)
+        // dist < 16px → click 格下げ (modifier-aware なトラック選択に任せる、 後続 loop の clicked_track 経路)
         // dist >= 16px → 上で計算した `pending_drop` を SetTrackParent として 1 度発行。
         // 旧 ReorderTracks 経由の sibling reorder も同 variant に統合済 (parent 不変 + anchor_after 指定)。
         if let Some((src_tracks, parent, anchor_after)) = pending_drop {
@@ -1124,7 +1118,7 @@ pub(super) fn commit_releases(
                     if dist < 4.0 {
                         // M14 Phase 128 (#106): 短 click (jitter 未満) = 選択 + 帯ジャンプを併発。 drag して
                         // いないので Ctrl は Toggle-select (Duplicate は dist>=4 の Ctrl+drag のみ)。 modifier は
-                        // Shift=RangeFromAnchor / Ctrl=Toggle / 無=Single (`SelectTrack` と同 idiom)。
+                        // Shift=RangeFromAnchor / Ctrl=Toggle / 無=Single (track header click と同 idiom)。
                         let modifier = if sd.last_shift {
                             SelectModifier::RangeFromAnchor
                         } else if sd.last_ctrl {

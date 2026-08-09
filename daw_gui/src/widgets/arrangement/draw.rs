@@ -145,20 +145,33 @@ pub(super) struct MidiNoteDraw {
     pub(super) velocity: u8,
 }
 
+/// clip 内の audio event 1 件ぶんの波形描画データ (r.md #41)。
+///
+/// `spans` は [`common::audio_render::event_wave_spans`] が返す「実際に鳴る
+/// event-local 拍区間 → source 範囲」 の列。 engine と同じ時間写像なので、 これを
+/// そのまま並べれば Slice のスライス配置 / gap も warp 区間も逆再生も正しく出る。
+pub(super) struct AudioEventDraw {
+    pub(super) buffer: Arc<AudioSourceBuffer>,
+    pub(super) source_id: u32,
+    /// 波形 widget の id 弁別子 (= `AudioEvent.id`、 未採番なら model index 由来)。
+    /// LOD ピラミッドはこの id で frame を跨いで保持されるので、 decode 完了で
+    /// 描画対象の並びが変わっても入れ替わらない安定値でなければならない。
+    pub(super) key: u64,
+    /// clip 先頭からの event 開始拍 (複数 event / 分割 clip に対応)。
+    pub(super) start_in_clip_beats: f64,
+    /// event の長さ (拍)。 span が張られていない末尾 (= 鳴り終わったあと) を
+    /// 無音ベースラインで示すのに使う。
+    pub(super) len_beats: f64,
+    pub(super) stretch_mode: common::model::StretchMode,
+    pub(super) spans: Vec<common::audio_render::WaveSpan>,
+}
+
 /// clip rect 内に重ねる中身 (波形 / MIDI)。`&AppData` (model + audio cache) から 1 フレーム分だけ
 /// 集めて heavy closure に move する (`Arc<AudioSourceBuffer>` は refcount clone で安価)。
 pub(super) enum ClipContentDraw {
-    Audio {
-        buffer: Arc<AudioSourceBuffer>,
-        start_frames: u64,
-        /// **実際に鳴る** source 範囲の終端 (`common::audio_render::audible_source_span`)。
-        /// ピッチを下げて clip に収まらない場合は窓より手前で切れる。
-        end_frames: u64,
-        source_id: u32,
-        /// 上記が鳴り終わるまでが clip 幅の何割か (0..=1)。 ピッチを上げると音が
-        /// 早く終わるので、 波形もその割合まで詰めて描く (= 描いた波形 = 鳴る音)。
-        audible_frac: f32,
-    },
+    /// clip 内の **全** audio event (旧実装は先頭 1 件だけを描いており、 分割 / glue で
+    /// 複数 event になった clip は 2 件目以降が見えなかった)。
+    Audio { events: Vec<AudioEventDraw> },
     Midi { notes: Vec<MidiNoteDraw>, len_beats: f64 },
 }
 
@@ -202,74 +215,65 @@ pub(super) fn draw_clip_label<M: ?Sized + 'static>(
 
 /// S4b Phase C: 1 つの audio clip rect 内に波形を描く (旧 app 側 clip 波形 overlay の
 /// widget 内版)。 `inset_top` はラベル帯と共有する [`clip_content_inset_top`] の値。
+///
+/// r.md #41: clip 内の **全 audio event** を、 それぞれ
+/// [`common::audio_render::event_wave_spans`] が返す span 列で描く。 「clip 拍 → x」 は
+/// `clip_len_beats` からの単純な線形写像 1 本で、 mode 別の分岐は持たない
+/// (Slice のスライス配置 / gap、 warp 区間、 逆再生はすべて span 側の情報)。
+/// span の無い区間 (= 無音) には薄いベースラインを引き、 Slice はスライス頭に
+/// 区切り線を出す。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     key: ClipKey,
     clip_rect: Rect,
-    buffer: &AudioSourceBuffer,
-    start_frames: u64,
-    end_frames: u64,
-    source_id: u32,
+    // この rect が表す clip の長さ (拍)。 波形の x 写像 = `content.w / clip_len_beats`。
+    clip_len_beats: f64,
+    events: &[AudioEventDraw],
     is_selected: bool,
-    lanes_x: f32,
+    lanes: Rect,
     inset_top: f32,
     style: &ArrangementStyle,
     // waveform widget の id 弁別子。 base 描画 (content path) は `"audio_clip_wf"`、 drag ghost は
-    // 別 tag を渡す。 `hctx.waveform` は id ごとに LOD 状態を持つので、 同一 (track, clip) の波形を
-    // 1 フレームで 2 度描く (元 clip + ghost) 場合に同 id だと state 衝突 → LOD が毎フレーム再構築される。
+    // 別 tag を渡す。 `hctx.waveform_segments` は id ごとに LOD 状態を持つので、 同一 (track, clip)
+    // の波形を 1 フレームで 2 度描く (元 clip + ghost) 場合に同 id だと state 衝突 → LOD が毎フレーム再構築される。
     wf_id_tag: &'static str,
-    // `[start_frames, end_frames)` が鳴り終わるまでが clip 幅の何割か。 波形の描画幅を
-    // これで縮め、 残りは「無音」 として空ける (= ピッチを上げて速く鳴り終わる Raw /
-    // Repitch で「波形は全幅・音は途中で終わる」 という不一致を防ぐ)。
-    audible_frac: f32,
 ) {
+    use daw_ui_renderer::{LineBatch, LineSegment};
+
+    let _ = style;
     let inset_lr: f32 = 2.0;
-    let full_w = (clip_rect.w - inset_lr * 2.0).max(0.0);
-    let wf_w = full_w * audible_frac.clamp(0.0, 1.0);
-    let mut view_rect = Rect {
+    let content = Rect {
         x: clip_rect.x + inset_lr,
         y: clip_rect.y + inset_top,
-        w: wf_w,
+        w: (clip_rect.w - inset_lr * 2.0).max(0.0),
         h: (clip_rect.h - inset_top - inset_lr).max(0.0),
     };
-    let event_len_frames = end_frames.saturating_sub(start_frames);
-    let mut view_start_sample = start_frames;
-    let mut view_len_samples = event_len_frames.max(1);
-    if view_rect.x < lanes_x {
-        let cut_px = lanes_x - view_rect.x;
-        if cut_px >= view_rect.w {
-            return;
-        }
-        let frames_per_px = (event_len_frames as f64 / f64::from(wf_w.max(1.0))).max(0.0);
-        let skip_frames = (f64::from(cut_px) * frames_per_px) as u64;
-        view_start_sample = view_start_sample.saturating_add(skip_frames);
-        view_len_samples = view_len_samples.saturating_sub(skip_frames).max(1);
-        view_rect.x = lanes_x;
-        view_rect.w -= cut_px;
-    }
-    if view_rect.w <= 0.0 || view_rect.h <= 0.0 {
+    if content.w <= 0.0
+        || content.h <= 0.0
+        || !clip_len_beats.is_finite()
+        || clip_len_beats <= 0.0
+        || events.is_empty()
+    {
         return;
     }
-    // SampleSlices::Planar 用の &[&[f32]] (毎フレーム alloc は GUI 描画 path なので許容)。
-    let planes_borrowed: Vec<&[f32]> = buffer.samples.iter().map(Vec::as_slice).collect();
-    let source = WaveformSource {
-        samples: SampleSlices::Planar(&planes_borrowed),
-        valid_len: buffer.frames as usize,
-        generation: u64::from(source_id),
-        sample_rate: buffer.sample_rate,
-    };
-    let view = WaveformView {
-        start_sample: view_start_sample,
-        len_samples: view_len_samples,
-        vertical_gain: 1.0,
-    };
+    // 波形の scissor = clip の中身領域 ∩ lanes (widget 側のセグメントカリングも
+    // この rect を使うので、 画面外にはみ出す span の pixel ループが有界になる)。
+    let cx0 = content.x.max(lanes.x);
+    let cy0 = content.y.max(lanes.y);
+    let cx1 = (content.x + content.w).min(lanes.x + lanes.w);
+    let cy1 = (content.y + content.h).min(lanes.y + lanes.h);
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return;
+    }
+    let scissor = Rect { x: cx0, y: cy0, w: cx1 - cx0, h: cy1 - cy0 };
+
+    let px_per_beat = f64::from(content.w) / clip_len_beats;
     let (fg, fg_clipped) = if is_selected {
         (theme::WAVEFORM_SEL.with_alpha(0.95), theme::WAVEFORM_PEAK)
     } else {
         (theme::WAVEFORM.with_alpha(0.85), theme::WAVEFORM_PEAK)
     };
-    let _ = style;
     let wstyle = WaveformStyle {
         fg,
         fg_clipped,
@@ -279,7 +283,139 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
         render_mode: WaveformRenderMode::Auto,
         line_width_px: 1.0,
     };
-    let _ = hctx.waveform((wf_id_tag, key.track, key.clip), view_rect, source, view, wstyle);
+    // 無音区間のベースライン (= 波形が 0 の直線) と slice 区切り線。
+    // clip 色はユーザーが任意色に設定できる可変背景なので、 中央線も区切り線も
+    // 暗い backing + 明色の 2 層で描く (`feedback_ui_indicator_contrast_on_variable_bg`)。
+    // 単層だと明るい clip 色 (既定パレットの黄 / アンバー等) の上で消え、
+    // 「隙間があるのか描画が抜けているのか」 が判別できなくなる。
+    let silent_color = fg.with_alpha(0.85);
+    let backing_color = theme::WINDOW_BG.with_alpha(0.55);
+    let mid_y = content.y + content.h * 0.5;
+    let mut silent_backing: Vec<LineSegment> = Vec::new();
+    let mut silent: Vec<LineSegment> = Vec::new();
+    let mut div_backing: Vec<LineSegment> = Vec::new();
+    let mut div_bright: Vec<LineSegment> = Vec::new();
+
+    hctx.with_clip_rect(scissor, |hctx| {
+        for ev in events {
+            let x_at = |beat: f64| {
+                content.x + ((ev.start_in_clip_beats + beat) * px_per_beat) as f32
+            };
+            let ev_x0 = x_at(0.0);
+            let mut segs: Vec<WaveformSegment> = Vec::with_capacity(ev.spans.len());
+            let show_dividers = ev.spans.len() > 1
+                && matches!(ev.stretch_mode, common::model::StretchMode::Slice);
+            let mut divider_xs: Vec<f32> = Vec::new();
+            let mut prev_end_x: Option<f32> = None;
+            let mut push_silent = |x0: f32, x1: f32| {
+                silent_backing.push(LineSegment {
+                    a: [x0, mid_y],
+                    b: [x1, mid_y],
+                    color: backing_color,
+                });
+                silent.push(LineSegment {
+                    a: [x0, mid_y],
+                    b: [x1, mid_y],
+                    color: silent_color,
+                });
+            };
+            for sp in &ev.spans {
+                let x0 = x_at(sp.start_beat);
+                let x1 = x_at(sp.end_beat);
+                // 1px 未満のスライスも「そこに音がある」 ことは描く (0 幅だと消える)。
+                let w = (x1 - x0).max(1.0);
+                segs.push(WaveformSegment {
+                    rect: Rect { x: x0, y: content.y, w, h: content.h },
+                    view: WaveformView {
+                        start_sample: sp.source_start,
+                        len_samples: sp.source_end.saturating_sub(sp.source_start).max(1),
+                        vertical_gain: 1.0,
+                        reversed: sp.reversed,
+                    },
+                });
+                if let Some(pe) = prev_end_x
+                    && x0 > pe + 0.5
+                {
+                    push_silent(pe, x0);
+                }
+                // 区切り線は「スライスとスライスの間」 に出す。 tempo 曲線で分割された
+                // 継続 span (`head == false`) は音の切れ目ではないので対象外。
+                // event 左端と一致する先頭スライスの頭は clip 境界そのものなので出さない。
+                if show_dividers && sp.head && (x0 - ev_x0).abs() > 0.5 {
+                    divider_xs.push(x0);
+                }
+                prev_end_x = Some(x1);
+            }
+            // 密なスライスは線だけで領域が埋まるので間引く (audio editor と同規約)。
+            for x in crate::widgets::thin_slice_dividers(divider_xs) {
+                div_backing.push(LineSegment {
+                    a: [x, content.y],
+                    b: [x, content.y + content.h],
+                    color: theme::WINDOW_BG.with_alpha(0.65),
+                });
+                div_bright.push(LineSegment {
+                    a: [x, content.y],
+                    b: [x, content.y + content.h],
+                    color: theme::SELECTION_WARM.with_alpha(0.85),
+                });
+            }
+            // event 冒頭 / 末尾の無音 (= 最初の trigger 前 / 鳴り終わり後) もベースラインで示す。
+            let ev_x1 = x_at(ev.len_beats);
+            if let (Some(first), Some(last)) = (segs.first(), prev_end_x) {
+                if first.rect.x > ev_x0 + 0.5 {
+                    push_silent(ev_x0, first.rect.x);
+                }
+                if ev_x1 > last + 0.5 {
+                    push_silent(last, ev_x1);
+                }
+            }
+            if segs.is_empty() {
+                continue;
+            }
+            // SampleSlices::Planar 用の &[&[f32]] (毎フレーム alloc は GUI 描画 path なので許容)。
+            let planes_borrowed: Vec<&[f32]> =
+                ev.buffer.samples.iter().map(Vec::as_slice).collect();
+            let source = WaveformSource {
+                samples: SampleSlices::Planar(&planes_borrowed),
+                valid_len: ev.buffer.frames as usize,
+                generation: u64::from(ev.source_id),
+                sample_rate: ev.buffer.sample_rate,
+            };
+            let _ = hctx.waveform_segments(
+                (wf_id_tag, key.track, key.clip, ev.key),
+                source,
+                &segs,
+                wstyle,
+            );
+        }
+        if !silent.is_empty() {
+            hctx.push_lines(LineBatch {
+                segments: Arc::<[LineSegment]>::from(silent_backing),
+                line_width_px: 2.0,
+                clip_rect: None,
+            });
+            hctx.push_lines(LineBatch {
+                segments: Arc::<[LineSegment]>::from(silent),
+                line_width_px: 1.0,
+                clip_rect: None,
+            });
+        }
+        // 可変背景 (clip 色 / 波形) 上でも読めるよう暗い backing + 明色の 2 層
+        // (`feedback_ui_indicator_contrast_on_variable_bg`)。 warp marker
+        // (audio editor の空色 3px/1.5px) とは色・太さで区別する。
+        if !div_backing.is_empty() {
+            hctx.push_lines(LineBatch {
+                segments: Arc::<[LineSegment]>::from(div_backing),
+                line_width_px: 2.0,
+                clip_rect: None,
+            });
+            hctx.push_lines(LineBatch {
+                segments: Arc::<[LineSegment]>::from(div_bright),
+                line_width_px: 1.0,
+                clip_rect: None,
+            });
+        }
+    });
 }
 
 /// S4b Phase C: 1 つの MIDI clip rect 内にノートプレビューを描く (旧 app 側
@@ -987,16 +1123,11 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         // (2) 中身 (波形 / MIDI) を上に重ねる。 波形は ghost 専用 id で LOD state 衝突を避ける
         //     (元 clip の波形と同一フレームに 2 度描くため。 `draw_clip_waveform_inner` 参照)。
         match clip_content.get(&a.key) {
-            Some(ClipContentDraw::Audio {
-                buffer,
-                start_frames,
-                end_frames,
-                source_id,
-                audible_frac,
-            }) => {
+            Some(ClipContentDraw::Audio { events }) => {
+                // preview の長さ (resize drag 中は変化する) で x 写像を作るので、
+                // ghost の中身は base 描画と同じ経路のまま preview rect に追従する。
                 draw_clip_waveform_inner(
-                    hctx, a.key, r, buffer, *start_frames, *end_frames, *source_id, true, lanes.x,
-                    inset, style, "drag_ghost_wf", *audible_frac,
+                    hctx, a.key, r, len, events, true, lanes, inset, style, "drag_ghost_wf",
                 );
             }
             Some(ClipContentDraw::Midi { notes, len_beats }) => {

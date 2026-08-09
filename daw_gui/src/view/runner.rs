@@ -892,6 +892,9 @@ impl ApplicationHandler<AppEvent> for Runner {
                     state: map_state(event.state),
                     text: event.text.map(|s| s.to_string()),
                     physical_key: map_phys_key(event.physical_key),
+                    // OS auto-repeat は shortcut 層 (`Ui::frame`) が落とす。 ここで捨てると
+                    // text_input の Backspace / 矢印長押しまで死ぬので **通す**。
+                    repeat: event.repeat,
                 };
                 self.dispatch_platform_event(PlatformEvent::Keyboard(key));
             }

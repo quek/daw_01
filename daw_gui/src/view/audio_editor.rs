@@ -19,7 +19,7 @@ use crate::widgets::select_modifier::{SelectModifier, range_ordered};
 
 use daw_ui_core::{
     ChannelLayout, DragKind, Edit, SampleSlices, Ui, ViewportState1D, WaveformRenderMode,
-    WaveformSource, WaveformStyle, WaveformView, WidgetId,
+    WaveformSegment, WaveformSource, WaveformStyle, WaveformView, WidgetId,
 };
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
 use crate::theme;
@@ -396,6 +396,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (r.md #35) Shift+click の範囲選択が使う「event の並び」。 index が時間順なので
     // 0..len がそのまま順序列 (`range_ordered` の入力)。
     let event_total = audio.events.len();
+    // r.md #41: 波形描画の span 列 (event ごとに `event_wave_spans` で埋め直す
+    // 使い回しバッファ。 毎フレーム全 event ぶん確保しないため)。
+    let mut wave_spans: Vec<common::audio_render::WaveSpan> = Vec::new();
+    // SongTempo automation 込みで engine と同じ tempo 写像を得る (native rate 再生は
+    // current_bpm に依存する)。 lane が無ければ定数 = 従来と同コスト。
+    let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
     for (idx, event) in audio.events.iter().enumerate() {
         let Some(buffer) = app.media.audio_source_cache.get(event.source_id) else {
             // 当該 event は decode 待ち / missing source → 透けて見える
@@ -450,140 +456,93 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             fg,
             fg_clipped: theme::WAVEFORM_PEAK,
             fill: None,
-            baseline: Some(theme::GRID_LINE.with_alpha(0.15)),
+            // r.md #41: 中央線は波形区間ごとではなく event 全幅に 1 度描く (下記)。
+            // 区間ごとに任せると Slice の gap (= 音が鳴らない隙間) だけ中央線が
+            // 途切れ、「描画が抜けている」 ように見えてしまう。
+            baseline: None,
             channel_layout: ChannelLayout::Stack,
             render_mode: WaveformRenderMode::Auto,
             line_width_px: 1.0,
         };
 
-        let markers = event.beat_markers.as_slice();
-        if markers.len() >= 2 {
-            // ----- B12-manual: 非均一 warp の区分線形波形描画 -----
-            // playback (`common::audio_render::warp_source_frame`) と同じ区分線形
-            // 写像で各 marker 区間を個別の linear `ui.waveform` として描く。 区間内
-            // は線形なので ui.waveform をそのまま流用でき、 全体で warp 形状 (= 実際
-            // に再生される source 位置) を反映する。 境界点 = (clip 相対 beat, source
-            // frame)。 端 (event-local 0 / event_length) が marker で覆われない場合は
-            // `warp_source_frame` で外挿し source frame を [0, buffer.frames] に clamp。
-            let src_max = buffer.frames as f64;
-            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(markers.len() + 2);
-            if markers[0].locked_beat > 1e-9 {
-                let sf = common::audio_render::warp_source_frame(0.0, markers)
-                    .unwrap_or(event.source_start_frames as f64)
-                    .clamp(0.0, src_max);
-                pts.push((event.event_start_in_clip_beats, sf));
+        // 中央線 (無音の直線) を event 可視範囲の全幅に channel ごと 1 本。 Slice の
+        // gap / ピッチで鳴り終わったあとの余りも「無音がそこにある」 と読める。
+        {
+            let n_ch = planes_borrowed.len().max(1);
+            #[allow(clippy::cast_precision_loss)]
+            let ch_h = event_rect.h / n_ch as f32;
+            let base_color = theme::GRID_LINE.with_alpha(0.15);
+            let baselines: Vec<LineSegment> = (0..n_ch)
+                .map(|i| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let y = event_rect.y + ch_h * (i as f32 + 0.5);
+                    LineSegment {
+                        a: [event_rect.x, y],
+                        b: [event_rect.x + event_rect.w, y],
+                        color: base_color,
+                    }
+                })
+                .collect();
+            ui.push_lines(LineBatch {
+                segments: Arc::from(baselines),
+                line_width_px: 1.0,
+                clip_rect: Some(wf_area),
+            });
+        }
+
+        // ----- 波形 (r.md #41: 全 mode 共通の span 列 1 経路) -----
+        // engine と同じ時間写像 (`event_wave_spans`) が返す「鳴る拍区間 → source 範囲」
+        // をそのまま区間として描く。 Slice のスライス配置 / gap、 Stretch の warp 区分
+        // 線形、 逆再生、 ピッチで早く鳴り終わる Raw / Repitch を **すべて同じ経路** で
+        // 表す (旧実装は `markers.len() >= 2` で分岐しており、 再生が marker を無視する
+        // Raw / Repitch / Slice でも warp 形状を描いてしまっていた)。 LOD ピラミッドは
+        // event ごとに 1 つで、 区間を増やしても複製されない。
+        // `event_rect` は hit-test / 選択枠の slot なので縮めない。
+        common::audio_render::event_wave_spans(
+            event,
+            buffer.sample_rate,
+            &tempo_map,
+            clip.start_beat + event.event_start_in_clip_beats,
+            &mut wave_spans,
+        );
+        let view_end_beat = view_start_beat + view_len_beats;
+        let span_x = |clip_beat: f64| wf_area.x + ((clip_beat - view_start_beat) / beats_per_px) as f32;
+        let mut segs: Vec<WaveformSegment> = Vec::with_capacity(wave_spans.len());
+        for sp in &wave_spans {
+            let b0 = event.event_start_in_clip_beats + sp.start_beat;
+            let b1 = event.event_start_in_clip_beats + sp.end_beat;
+            // view 外の区間は捨てる (可視部分の切り詰めは widget 側のカリングが行う)。
+            if b1 <= view_start_beat || b0 >= view_end_beat {
+                continue;
             }
-            for m in markers {
-                pts.push((
-                    event.event_start_in_clip_beats + m.locked_beat,
-                    (m.source_frame as f64).clamp(0.0, src_max),
-                ));
-            }
-            if markers[markers.len() - 1].locked_beat < event.event_length_beats - 1e-9 {
-                let sf =
-                    common::audio_render::warp_source_frame(event.event_length_beats, markers)
-                        .unwrap_or(event.source_end_frames as f64)
-                        .clamp(0.0, src_max);
-                pts.push((
-                    event.event_start_in_clip_beats + event.event_length_beats,
-                    sf,
-                ));
-            }
-            let view_end_beat = view_start_beat + view_len_beats;
-            for (seg_i, w) in pts.windows(2).enumerate() {
-                let (b0, sf0) = w[0];
-                let (b1, sf1) = w[1];
-                let seg_beats = b1 - b0;
-                if seg_beats <= 1e-9 {
-                    continue;
-                }
-                // 区間 [b0, b1] (clip 相対 beat) を view にクリップ。
-                let vis_start = b0.max(view_start_beat);
-                let vis_end = b1.min(view_end_beat);
-                if vis_end <= vis_start {
-                    continue;
-                }
-                let nx0 = ((vis_start - view_start_beat) / view_len_beats) as f32;
-                let nx1 = ((vis_end - view_start_beat) / view_len_beats) as f32;
-                let seg_rect = Rect {
-                    x: wf_area.x + nx0 * wf_area.w,
-                    y: wf_area.y,
-                    w: ((nx1 - nx0) * wf_area.w).max(1.0),
-                    h: wf_area.h,
-                };
-                // 区間内は linear: 可視 beat 範囲を source frame に線形写像。
-                let f0 = (vis_start - b0) / seg_beats;
-                let f1 = (vis_end - b0) / seg_beats;
-                let src_a = sf0 + (sf1 - sf0) * f0;
-                let src_b = sf0 + (sf1 - sf0) * f1;
-                let view = WaveformView {
-                    start_sample: src_a.min(src_b).max(0.0) as u64,
-                    len_samples: ((src_b - src_a).abs() as u64).max(1),
+            let (x0, x1) = (span_x(b0), span_x(b1));
+            segs.push(WaveformSegment {
+                rect: Rect { x: x0, y: wf_area.y, w: (x1 - x0).max(1.0), h: wf_area.h },
+                view: WaveformView {
+                    start_sample: sp.source_start,
+                    len_samples: sp.source_end.saturating_sub(sp.source_start).max(1),
                     vertical_gain: app.ui_prefs.audio_editor_vertical_gain,
-                };
-                let source = WaveformSource {
-                    samples: SampleSlices::Planar(planes_borrowed),
-                    valid_len: buffer.frames as usize,
-                    generation: event.source_id as u64,
-                    sample_rate: buffer.sample_rate,
-                };
-                let _ = ui.waveform(
-                    ("audio_editor_wf_seg", clip.id, idx, seg_i),
-                    seg_rect,
-                    source,
-                    view,
-                    style,
-                );
-            }
-        } else {
-            // uniform stretch / raw: 単一 linear 波形。 写像は engine と同じ
-            // `audible_source_span` (= 実際に鳴る source 範囲 / それが鳴る拍数) を
-            // 使う。 ピッチを上げた Raw / Repitch は途中で鳴り終わるので、 波形も
-            // そこで止まり残りが空く (= 見える波形 = 聞こえる音)。 `event_rect` は
-            // hit-test / 選択枠の slot なので縮めない (描画 rect だけ縮める)。
-            let (audible_frames, audible_beats) = common::audio_render::audible_source_span(
-                event,
-                buffer.sample_rate,
-                app.song_doc.song().bpm,
-            );
-            let event_view_start_beat = event.event_start_in_clip_beats.max(view_start_beat);
-            let event_view_end_beat = (event.event_start_in_clip_beats
-                + event.event_length_beats)
-                .min(view_start_beat + view_len_beats);
-            let draw_end_beat =
-                event_view_end_beat.min(event.event_start_in_clip_beats + audible_beats);
-            let visible_start_in_event =
-                (event_view_start_beat - event.event_start_in_clip_beats).max(0.0);
-            let visible_len_in_event = (draw_end_beat - event_view_start_beat).max(0.0);
-            let visible_span = (event_view_end_beat - event_view_start_beat).max(1e-9);
-            let frames_per_beat = audible_frames as f64 / audible_beats.max(1e-9);
-            let src_visible_start_frames = event.source_start_frames
-                + (visible_start_in_event * frames_per_beat) as u64;
-            let src_visible_len_frames = (visible_len_in_event * frames_per_beat) as u64;
-            let wf_rect = Rect {
-                w: event_rect.w * (visible_len_in_event / visible_span) as f32,
-                ..event_rect
+                    reversed: sp.reversed,
+                },
+            });
+        }
+        if !segs.is_empty() {
+            let source = WaveformSource {
+                samples: SampleSlices::Planar(planes_borrowed),
+                valid_len: buffer.frames as usize,
+                generation: u64::from(event.source_id),
+                sample_rate: buffer.sample_rate,
             };
-            if wf_rect.w > 0.0 && src_visible_len_frames > 0 {
-                let source = WaveformSource {
-                    samples: SampleSlices::Planar(planes_borrowed),
-                    valid_len: buffer.frames as usize,
-                    generation: event.source_id as u64,
-                    sample_rate: buffer.sample_rate,
-                };
-                let view = WaveformView {
-                    start_sample: src_visible_start_frames,
-                    len_samples: src_visible_len_frames.max(1),
-                    vertical_gain: app.ui_prefs.audio_editor_vertical_gain,
-                };
-                let _ = ui.waveform(
+            // scissor = wf_area。 zoom 中に画面外へ大きくはみ出す区間の pixel ループを
+            // widget 側カリングで有界化する (旧手書きクリップ計算の置き換え)。
+            ui.with_clip_rect(wf_area, |ui| {
+                let _ = ui.waveform_segments(
                     ("audio_editor_wf", clip.id, idx),
-                    wf_rect,
                     source,
-                    view,
+                    &segs,
                     style,
                 );
-            }
+            });
         }
 
         // Selection border (= 選択中のみ視認できる枠)。 1 px 太い線で
@@ -621,6 +580,53 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 line_width_px: 1.5,
                 clip_rect: Some(wf_area),
             });
+        }
+
+        // ----- r.md #41: slice 境界 (transient) マーカー -----
+        // Slice mode は onset ごとに音が切り替わるので、 「どこで切れているか」 を
+        // Ableton の Beats モード同様に縦線で示す。 warp marker (空色・3px/1.5px) とは
+        // 色 (amber) と太さ (2.5px/1.0px) で区別する。 可変背景 (波形) 上でも読めるよう
+        // 暗い backing + 明色の 2 層 (`feedback_ui_indicator_contrast_on_variable_bg`)。
+        if matches!(event.stretch_mode, common::model::StretchMode::Slice) && wave_spans.len() > 1 {
+            // event 左端と一致する先頭スライスの頭は event 境界そのものなので出さない。
+            // tempo 曲線で分割された継続 span (`head == false`) は音の切れ目ではない。
+            // 密なスライス (長尺素材の onset は数百〜数千本) は縦線だけで領域が埋まり
+            // 波形が読めなくなるので、 アレンジビューと同じ最小間隔で間引く。
+            let event_x0 = span_x(event.event_start_in_clip_beats);
+            let slice_xs = crate::widgets::thin_slice_dividers(
+                wave_spans
+                    .iter()
+                    .filter(|sp| sp.head)
+                    .map(|sp| span_x(event.event_start_in_clip_beats + sp.start_beat))
+                    .filter(|x| (*x - event_x0).abs() > 0.5)
+                    .filter(|x| *x >= wf_area.x - 0.5 && *x <= wf_area.x + wf_area.w + 0.5),
+            );
+            if !slice_xs.is_empty() {
+                let mut backing: Vec<LineSegment> = Vec::with_capacity(slice_xs.len());
+                let mut bright: Vec<LineSegment> = Vec::with_capacity(slice_xs.len());
+                for &x in &slice_xs {
+                    backing.push(LineSegment {
+                        a: [x, event_rect.y],
+                        b: [x, event_rect.y + event_rect.h],
+                        color: theme::WINDOW_BG.with_alpha(0.65),
+                    });
+                    bright.push(LineSegment {
+                        a: [x, event_rect.y],
+                        b: [x, event_rect.y + event_rect.h],
+                        color: theme::SELECTION_WARM.with_alpha(0.85),
+                    });
+                }
+                ui.push_lines(LineBatch {
+                    segments: Arc::from(backing),
+                    line_width_px: 2.5,
+                    clip_rect: Some(wf_area),
+                });
+                ui.push_lines(LineBatch {
+                    segments: Arc::from(bright),
+                    line_width_px: 1.0,
+                    clip_rect: Some(wf_area),
+                });
+            }
         }
 
         // ----- B12-manual: warp marker 描画 + 手動編集 -----
@@ -827,22 +833,35 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let kind = drag.kind;
             if drag.start_modifiers.alt {
                 // Alt+click on waveform (marker 以外) = press 位置に warp marker
-                // 追加。 source frame = 現在の warp 曲線上の source (= 既存曲線に
-                // pin して追加 → ドラッグで再 warp)。 marker < 2 (uniform) は線形近似。
+                // 追加。 source frame は **描いた波形と同じ写像** (`source_frame_at_beat`
+                // = `event_wave_spans` の逆) で取る → 見えている波形の位置に pin される
+                // (r.md #41。 旧実装は `local / event_length × 窓` の uniform 近似
+                // 直書きで、 Slice / ピッチ変更したクリップでは別の source を指していた)。
+                // span の外 (無音の隙間) を掴んだときだけ uniform 近似に degrade。
                 if kind == DragKind::Started {
                     let clip_beat =
                         view_start_beat + (drag.anchor.0 - wf_area.x) as f64 * beats_per_px;
                     let local = (clip_beat - event.event_start_in_clip_beats)
                         .clamp(0.0, event.event_length_beats);
-                    let src = common::audio_render::warp_source_frame(local, &event.beat_markers)
+                    let window = event
+                        .source_end_frames
+                        .saturating_sub(event.source_start_frames)
+                        as f64;
+                    let src = common::audio_render::source_frame_at_beat(&wave_spans, local)
                         .unwrap_or_else(|| {
-                            let len = event
-                                .source_end_frames
-                                .saturating_sub(event.source_start_frames)
-                                as f64;
                             event.source_start_frames as f64
-                                + (local / event.event_length_beats.max(1e-9)) * len
+                                + (local / event.event_length_beats.max(1e-9)) * window
                         });
+                    // span の source 範囲は「実際に鳴る」 (= 逆再生なら反転後) 座標だが、
+                    // warp marker は engine が **反転前** の座標で解釈し、
+                    // `source_frame_lerp` が改めて反転する。 逆再生 event では
+                    // forward ドメインに戻してから保存しないと鏡像の位置に pin される。
+                    let src = if event.reversed {
+                        let base = event.source_start_frames as f64;
+                        base + (window - 1.0 - (src - base)).max(0.0)
+                    } else {
+                        src
+                    };
                     let source_frame = src.max(0.0) as u64;
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::AddWarpMarker {

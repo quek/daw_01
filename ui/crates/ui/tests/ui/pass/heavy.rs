@@ -98,6 +98,7 @@ fn main() {
                         start_sample: m.view_start,
                         len_samples: m.view_len,
                         vertical_gain: 1.0,
+                        reversed: false,
                     },
                     WaveformStyle {
                         channel_layout: ChannelLayout::Stack,

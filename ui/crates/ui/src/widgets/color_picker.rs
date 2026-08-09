@@ -648,7 +648,7 @@ mod tests {
         let esc = KeyEvent {
             state: ElementState::Pressed,
             text: None,
-            physical_key: PhysicalKey::Escape,
+            physical_key: PhysicalKey::Escape, repeat: false
         };
         let r = run_picker(
             vec![

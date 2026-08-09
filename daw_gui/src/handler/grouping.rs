@@ -103,8 +103,9 @@ impl AppData {
         let insert_at = top_child_idx.min(self.song_doc.song().tracks.len());
         self.edit_song(|song| song.tracks.insert(insert_at, group_track));
         // 新規 group track を選択状態に (Live 互換: グループ化直後は
-        // 親 group が selection cursor になる)。
-        self.selection.selected_track_ids = vec![group_id];
+        // 親 group が selection cursor になる)。 明示的なトラック面操作なので
+        // last-wins タグも Tracks に倒す。
+        self.set_track_selection(vec![group_id]);
         self.resize_track_peak_display();
         tracing::info!(group_id, ?child_ids, "grouped tracks");
     }
@@ -248,9 +249,10 @@ impl AppData {
             }
             self.send_plugin(PluginCommand::RemoveTrack { track_id: *group_id });
         }
-        // selection: ungroup 後は元 group の子を選択 (Live 互換)。
+        // selection: ungroup 後は元 group の子を選択 (Live 互換)。 明示的な
+        // トラック面操作なので last-wins タグも Tracks に倒す。
         if !new_selection.is_empty() {
-            self.selection.selected_track_ids = new_selection;
+            self.set_track_selection(new_selection);
         }
         self.resize_track_peak_display();
         tracing::info!(?groups_to_ungroup, "ungrouped tracks");

@@ -105,13 +105,22 @@ fn hang_during_save_and_quit_aborts_roundtrip_and_unblocks_guard() {
 #[test]
 fn hang_during_deferred_edit_aborts_without_applying_edit() {
     let (mut app, _rx) = build_app();
-    load_instrument(&mut app); // plugin あり → DeleteTrack は deferred round-trip。
+    load_instrument(&mut app); // plugin あり → DeleteTracks は deferred round-trip。
+    // id は必ず採番し直す (clone のまま push すると同 id が 2 本並び、 安定 id での
+    // 削除が意図しない方を指す)。
     let extra = app.song_doc.song().tracks[0].clone();
-    app.edit_song(|song| song.tracks.push(extra));
+    let target_id = app
+        .edit_song(|song| {
+            let id = song.alloc_track_id();
+            let mut t = extra;
+            t.id = id;
+            song.tracks.push(t);
+            id
+        })
+        .expect("edit_song");
     let track_count = app.song_doc.song().tracks.len();
-    let target_idx = (track_count - 1) as u32;
 
-    app.handle_event(AppEvent::DeleteTrack(target_idx));
+    app.handle_event(AppEvent::DeleteTracks(vec![target_id]));
     assert!(
         !app.ipc.pending_state_queue.is_empty(),
         "deferred delete round-trip in flight"

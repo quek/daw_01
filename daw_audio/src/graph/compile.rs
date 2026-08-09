@@ -458,11 +458,14 @@ pub fn compile_schedule(
     let mut delay_keys: Vec<DelayKey> = Vec::new();
     let track_ids: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
     let mut nodes_with_pdc: Vec<NodeOp> = Vec::with_capacity(nodes.len() + n);
+    // master 合流点で全 src が揃う latency (r.md #39)。master fx chain 自身の
+    // latency は下でこれに加算する (click / export は master **出力** を基準にする)。
+    let mut master_mix_latency: u32 = 0;
     for op in nodes.into_iter() {
         match &op {
             // clearing Mix: 全 src を最大 path latency に揃える。
-            NodeOp::Mix { srcs, .. } => {
-                emit_mix_src_alignment(
+            NodeOp::Mix { srcs, dst } => {
+                let max_path = emit_mix_src_alignment(
                     srcs,
                     &path_latency,
                     &track_ids,
@@ -470,6 +473,9 @@ pub fn compile_schedule(
                     &mut delay_keys,
                     &mut nodes_with_pdc,
                 );
+                if *dst == BufRef::Master {
+                    master_mix_latency = max_path;
+                }
             }
             // パラアウト MixAdditive (docs/plan_paraout.md): 子 (srcs) を揃える
             // のに加え、 dst (= group-with-instrument 自身の scratch にある prefix
@@ -599,6 +605,12 @@ pub fn compile_schedule(
         follower_slots,
         follower_keys,
         mod_kinds,
+        // r.md #39: click / export が基準にするのは master **出力** の遅延量。
+        // master fx chain は Mix の後段で直列 process される (`process_master_fx_chain`)
+        // ので、その報告 latency も足さないと master に遅延プラグインを挿したときだけ
+        // click が先行し、書き出し WAV もその分ずれる。
+        master_latency_samples: master_mix_latency
+            .saturating_add(song.master_reported_latency_samples),
     })
 }
 
@@ -1216,6 +1228,156 @@ mod tests {
 
     // ---- PR3: Plugin Delay Compensation ----
 
+    /// r.md #39: `master_latency_samples` = master 合流点で全 src が揃えられる
+    /// latency。engine はこの値だけ metronome click の参照位置を戻して、遅延
+    /// プラグインを通った track の音と click を一致させる。
+    #[test]
+    fn master_latency_samples_is_the_max_path_latency_reaching_master() {
+        // latency 無しなら 0 (= 補償不要)。
+        let plain = Song {
+            tracks: vec![track(|t| t.id = 1)],
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&plain, 48_000, 0).unwrap().master_latency_samples,
+            0
+        );
+
+        // 直列でない 2 track のうち片方が 2048 sample 報告 → master は 2048 で揃う。
+        let latent = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.reported_latency_samples = 0;
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.reported_latency_samples = 2048;
+                }),
+            ],
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&latent, 48_000, 0).unwrap().master_latency_samples,
+            2048
+        );
+
+        // group 経由 (= 親を指す子がいる) でも、子の latency が group の path latency
+        // として master へ伝わる。master src は group 1 本だけ。
+        let grouped = Song {
+            tracks: vec![
+                track(|t| t.id = 1),
+                track(|t| {
+                    t.id = 2;
+                    t.parent_group_id = Some(1);
+                    t.reported_latency_samples = 512;
+                }),
+            ],
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&grouped, 48_000, 0).unwrap().master_latency_samples,
+            512
+        );
+    }
+
+    /// r.md #39: `master_latency_samples` は master **出力** の遅延量なので、
+    /// send/return・パラアウト・master fx のどの経路で latency が入っても拾う。
+    /// (レビュー指摘: 並列 2 track と group しか見ていなかった。)
+    #[test]
+    fn master_latency_samples_covers_send_paraout_and_master_fx() {
+        use common::model::{AuxOutputRoute, PluginInstance, Send, SendMode};
+        use common::plugin_format::PluginFormat;
+
+        // (a) send/return: Vocal → Reverb(latency 100)。return が master src なので
+        //     master 合流は 100 に揃う。
+        let sends = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.sends = vec![Send {
+                        id: 1,
+                        dest_track_id: 2,
+                        gain: 0.5,
+                        mode: SendMode::PostFader,
+                        enabled: true,
+                    }];
+                }),
+                track(|t| {
+                    t.id = 2;
+                    t.reported_latency_samples = 100;
+                }),
+            ],
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&sends, 48_000, 0).unwrap().master_latency_samples,
+            100,
+            "send 先 (return) の latency も master 合流に効く"
+        );
+
+        // (b) パラアウト: Drums.aux → Snare(latency 256)。dest は独立 bus なので
+        //     source の path latency を取り込んだ上で自分の chain latency を足す。
+        let paraout = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.reported_latency_samples = 64;
+                    t.devices = vec![PluginInstance {
+                        id: 10,
+                        aux_outputs: vec![Some(AuxOutputRoute::to_track(4))],
+                        aux_output_count: 1,
+                        ..PluginInstance::with_ports(
+                            "test.drum_sampler".into(),
+                            PluginFormat::Clap,
+                            instrument_ports(),
+                        )
+                    }];
+                }),
+                track(|t| {
+                    t.id = 4;
+                    t.reported_latency_samples = 256;
+                }),
+            ],
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&paraout, 48_000, 0).unwrap().master_latency_samples,
+            64 + 256,
+            "paraout dest は source の path latency を取り込む"
+        );
+
+        // (c) master fx: track 側 latency 0 でも master chain の報告 latency を拾う。
+        //     旧実装は master Mix の src だけを見ていたので 0 のまま = click が先行した。
+        let master_fx = Song {
+            tracks: vec![track(|t| t.id = 1)],
+            master_reported_latency_samples: 2048,
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&master_fx, 48_000, 0).unwrap().master_latency_samples,
+            2048,
+            "master fx chain の latency も master 出力の遅延"
+        );
+
+        // (d) track 側と master fx は加算 (直列なので両方遅れる)。
+        let both = Song {
+            tracks: vec![
+                track(|t| {
+                    t.id = 1;
+                    t.reported_latency_samples = 512;
+                }),
+                track(|t| t.id = 2),
+            ],
+            master_reported_latency_samples: 2048,
+            ..Song::default()
+        };
+        assert_eq!(
+            compile_schedule(&both, 48_000, 0).unwrap().master_latency_samples,
+            512 + 2048
+        );
+    }
+
     /// Compile-level test: 親子無しの 2 track が並行に master へ流れるとき、
     /// 片方のみが latency 100 を report していたら、 もう片方 (latency 0)
     /// に対して `ApplyDelay { frames: 100 }` を Master Mix の **直前** に
@@ -1489,6 +1651,16 @@ mod tests {
                 v
             );
         }
+
+        // (d) r.md #39: この peak 位置こそが `master_latency_samples` の定義
+        //     — `master_buffer[P]` に載っているのは曲位置 `P - master_latency_samples`。
+        //     metronome click の参照位置と WAV 書き出し窓は、どちらもこの値を引くことで
+        //     曲位置に揃う (`engine.rs` の click_pos / `export.rs` の
+        //     `shift_window_for_master_latency`)。ここが崩れると両方が同時に壊れる。
+        assert_eq!(
+            sched.master_latency_samples, 100,
+            "曲位置 0 の impulse は master[master_latency_samples] に現れる"
+        );
     }
 
     /// テスト専用「latency を持つ plugin」 stub。 production の `LoadedPlugin`

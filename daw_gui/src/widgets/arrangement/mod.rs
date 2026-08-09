@@ -15,7 +15,7 @@
 //!   `MoveClips` / `ResizeClips` / `SetLoopRange` を発行する。drag 中の Mutate Edit は発行しない。
 //! - **track header の Rename / Delete** は widget 内蔵せず、`Response.track_header_rects` を返して
 //!   app 側で `context_menu_for` 等を重ねて呼ぶ (#005 設計判断)。
-//! - **SelectTrack トリガ** は track header 全体 click (button hit zone を除く)。
+//! - **トラック選択トリガ** は track header 全体 click (button hit zone を除く)。
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -46,8 +46,8 @@ use crate::widgets::ruler_ops::{
 use crate::widgets::time_grid::{BarBeatGridStyle, TimeGridExt, TimeRulerStyle};
 use daw_ui_core::widgets::toggle_button::ToggleButtonStyle;
 use daw_ui_core::{
-    ChannelLayout, MeterScale, SampleSlices, WaveformRenderMode, WaveformSource, WaveformStyle,
-    WaveformView,
+    ChannelLayout, MeterScale, SampleSlices, WaveformRenderMode, WaveformSegment, WaveformSource,
+    WaveformStyle, WaveformView,
 };
 
 use crate::audio_source_cache::AudioSourceBuffer;
@@ -1822,7 +1822,7 @@ pub(crate) struct ArrangementState {
     /// 端スクロールは「press からここまでの移動が `ACTIVATE_PX` 以上」 のときのみ発火させ、端近くの
     /// clip を click-and-hold しただけで view が動くのを防ぐ (実 DAW は実ドラッグで初めて端スクロール)。
     edge_scroll_press: Option<(f32, f32)>,
-    /// 直近 primary press 時の modifier snapshot。 track header の SelectTrack
+    /// 直近 primary press 時の modifier snapshot。 track header の選択更新
     /// (release frame で確定する click) が読む — release frame の `pointer.modifiers`
     /// 生読みは「ModifiersChanged が MouseInput(Released) より先に届く」 race で
     /// Ctrl/Shift+click が Single に化ける (drag session の `last_*` と同 class)。
