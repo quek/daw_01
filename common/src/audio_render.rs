@@ -438,6 +438,31 @@ pub fn event_wave_spans(
     }
 }
 
+/// [`event_wave_spans`] の逆写像: event-local 拍 `beat` の位置で **実際に鳴っている**
+/// source frame。 span の外 (= スライス間の無音 / 鳴り終わったあと) は `None`。
+///
+/// 「波形上のこの位置は source のどこか」 を UI が知る唯一の口 (warp marker の
+/// Alt+click 追加など)。 span 側と同じ写像なので、 描いた波形とクリック位置が
+/// 一致する (旧実装は `local / event_length × 窓` の uniform 近似を直書きしており、
+/// Slice / ピッチ変更したクリップでは見えている波形と違う source を指していた)。
+#[must_use]
+pub fn source_frame_at_beat(spans: &[WaveSpan], beat: f64) -> Option<f64> {
+    let s = spans
+        .iter()
+        .find(|s| beat >= s.start_beat && beat < s.end_beat)?;
+    let span_beats = s.end_beat - s.start_beat;
+    if span_beats <= 0.0 {
+        return None;
+    }
+    let f = (beat - s.start_beat) / span_beats;
+    let len = (s.source_end - s.source_start) as f64;
+    Some(if s.reversed {
+        s.source_end as f64 - len * f
+    } else {
+        s.source_start as f64 + len * f
+    })
+}
+
 /// source 進度 = clip の手動 `stretch_ratio` (= [`stretch_ratio_for`]、 nominal
 /// bpm 基準の native長/配置長) × tempo 追従比 (`current_bpm / nominal_bpm`)。
 /// この 2 つを掛けると、 clip は **拍数を固定したまま** tempo 変化に追従して
@@ -890,6 +915,26 @@ mod tests {
         }
         // NaN ピッチは pitch_factor が 1.0 に倒すので普通の 1 span。
         assert_eq!(spans_of(&span_event(StretchMode::Raw, 48_000, 2.0, f32::NAN)).len(), 1);
+    }
+
+    #[test]
+    fn source_frame_at_beat_inverts_spans_and_skips_gaps() {
+        // 伸ばした Slice (1 拍ごとに trigger、 0.5 拍鳴って 0.5 拍 gap)。
+        let spans = spans_of(&slice_event(48_000, 4.0, 0.0, vec![0, 12_000, 24_000, 36_000]));
+        // slice 1 の中央 (1.25 拍) は source 12000 + 0.25拍×24000 = 18000。
+        let got = source_frame_at_beat(&spans, 1.25).expect("span 内");
+        assert!((got - 18_000.0).abs() < 1.0, "got {got}");
+        // gap (1.75 拍) は何も鳴っていない。
+        assert!(source_frame_at_beat(&spans, 1.75).is_none());
+        // event 末尾の余り (3.9 拍) も無音。
+        assert!(source_frame_at_beat(&spans, 3.9).is_none());
+
+        // reversed は span 内で右→左に読む (左端 = source_end)。
+        let mut ev = slice_event(48_000, 2.0, 0.0, vec![0]);
+        ev.reversed = true;
+        let spans = spans_of(&ev);
+        let got = source_frame_at_beat(&spans, 0.5).expect("span 内");
+        assert!((got - 36_000.0).abs() < 1.0, "窓末尾から 1/4 読んだ位置: got {got}");
     }
 
     #[test]

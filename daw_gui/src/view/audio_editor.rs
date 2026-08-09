@@ -824,14 +824,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let kind = drag.kind;
             if drag.start_modifiers.alt {
                 // Alt+click on waveform (marker 以外) = press 位置に warp marker
-                // 追加。 source frame = 現在の warp 曲線上の source (= 既存曲線に
-                // pin して追加 → ドラッグで再 warp)。 marker < 2 (uniform) は線形近似。
+                // 追加。 source frame は **描いた波形と同じ写像** (`source_frame_at_beat`
+                // = `event_wave_spans` の逆) で取る → 見えている波形の位置に pin される
+                // (r.md #41。 旧実装は `local / event_length × 窓` の uniform 近似
+                // 直書きで、 Slice / ピッチ変更したクリップでは別の source を指していた)。
+                // span の外 (無音の隙間) を掴んだときだけ uniform 近似に degrade。
                 if kind == DragKind::Started {
                     let clip_beat =
                         view_start_beat + (drag.anchor.0 - wf_area.x) as f64 * beats_per_px;
                     let local = (clip_beat - event.event_start_in_clip_beats)
                         .clamp(0.0, event.event_length_beats);
-                    let src = common::audio_render::warp_source_frame(local, &event.beat_markers)
+                    let src = common::audio_render::source_frame_at_beat(&wave_spans, local)
                         .unwrap_or_else(|| {
                             let len = event
                                 .source_end_frames
