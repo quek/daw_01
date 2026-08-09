@@ -153,6 +153,10 @@ pub(super) struct MidiNoteDraw {
 pub(super) struct AudioEventDraw {
     pub(super) buffer: Arc<AudioSourceBuffer>,
     pub(super) source_id: u32,
+    /// 波形 widget の id 弁別子 (= `AudioEvent.id`、 未採番なら model index 由来)。
+    /// LOD ピラミッドはこの id で frame を跨いで保持されるので、 decode 完了で
+    /// 描画対象の並びが変わっても入れ替わらない安定値でなければならない。
+    pub(super) key: u64,
     /// clip 先頭からの event 開始拍 (複数 event / 分割 clip に対応)。
     pub(super) start_in_clip_beats: f64,
     /// event の長さ (拍)。 span が張られていない末尾 (= 鳴り終わったあと) を
@@ -208,10 +212,6 @@ pub(super) fn draw_clip_label<M: ?Sized + 'static>(
         ..GlyphArea::default()
     });
 }
-
-/// slice 区切り線を描く最小スライス幅 (px)。 これより細いスライスは線だけで潰れて
-/// 波形が読めなくなるので区切り線を出さない。
-const SLICE_DIVIDER_MIN_PX: f32 = 3.0;
 
 /// S4b Phase C: 1 つの audio clip rect 内に波形を描く (旧 app 側 clip 波形 overlay の
 /// widget 内版)。 `inset_top` はラベル帯と共有する [`clip_content_inset_top`] の値。
@@ -284,14 +284,20 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
         line_width_px: 1.0,
     };
     // 無音区間のベースライン (= 波形が 0 の直線) と slice 区切り線。
-    let silent_color = fg.with_alpha(fg.a * 0.35);
+    // clip 色はユーザーが任意色に設定できる可変背景なので、 中央線も区切り線も
+    // 暗い backing + 明色の 2 層で描く (`feedback_ui_indicator_contrast_on_variable_bg`)。
+    // 単層だと明るい clip 色 (既定パレットの黄 / アンバー等) の上で消え、
+    // 「隙間があるのか描画が抜けているのか」 が判別できなくなる。
+    let silent_color = fg.with_alpha(0.85);
+    let backing_color = theme::WINDOW_BG.with_alpha(0.55);
     let mid_y = content.y + content.h * 0.5;
+    let mut silent_backing: Vec<LineSegment> = Vec::new();
     let mut silent: Vec<LineSegment> = Vec::new();
     let mut div_backing: Vec<LineSegment> = Vec::new();
     let mut div_bright: Vec<LineSegment> = Vec::new();
 
     hctx.with_clip_rect(scissor, |hctx| {
-        for (ev_i, ev) in events.iter().enumerate() {
+        for ev in events {
             let x_at = |beat: f64| {
                 content.x + ((ev.start_in_clip_beats + beat) * px_per_beat) as f32
             };
@@ -299,7 +305,20 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
             let mut segs: Vec<WaveformSegment> = Vec::with_capacity(ev.spans.len());
             let show_dividers = ev.spans.len() > 1
                 && matches!(ev.stretch_mode, common::model::StretchMode::Slice);
+            let mut divider_xs: Vec<f32> = Vec::new();
             let mut prev_end_x: Option<f32> = None;
+            let mut push_silent = |x0: f32, x1: f32| {
+                silent_backing.push(LineSegment {
+                    a: [x0, mid_y],
+                    b: [x1, mid_y],
+                    color: backing_color,
+                });
+                silent.push(LineSegment {
+                    a: [x0, mid_y],
+                    b: [x1, mid_y],
+                    color: silent_color,
+                });
+            };
             for sp in &ev.spans {
                 let x0 = x_at(sp.start_beat);
                 let x1 = x_at(sp.end_beat);
@@ -317,44 +336,37 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
                 if let Some(pe) = prev_end_x
                     && x0 > pe + 0.5
                 {
-                    silent.push(LineSegment {
-                        a: [pe, mid_y],
-                        b: [x0, mid_y],
-                        color: silent_color,
-                    });
+                    push_silent(pe, x0);
                 }
-                // 区切り線は「スライスとスライスの間」 に出す。 event 左端と一致する
-                // 先頭スライスの頭は clip 境界そのものなので出さない。
-                if show_dividers && w >= SLICE_DIVIDER_MIN_PX && (x0 - ev_x0).abs() > 0.5 {
-                    div_backing.push(LineSegment {
-                        a: [x0, content.y],
-                        b: [x0, content.y + content.h],
-                        color: theme::WINDOW_BG.with_alpha(0.65),
-                    });
-                    div_bright.push(LineSegment {
-                        a: [x0, content.y],
-                        b: [x0, content.y + content.h],
-                        color: theme::SELECTION_WARM.with_alpha(0.85),
-                    });
+                // 区切り線は「スライスとスライスの間」 に出す。 tempo 曲線で分割された
+                // 継続 span (`head == false`) は音の切れ目ではないので対象外。
+                // event 左端と一致する先頭スライスの頭は clip 境界そのものなので出さない。
+                if show_dividers && sp.head && (x0 - ev_x0).abs() > 0.5 {
+                    divider_xs.push(x0);
                 }
                 prev_end_x = Some(x1);
+            }
+            // 密なスライスは線だけで領域が埋まるので間引く (audio editor と同規約)。
+            for x in crate::widgets::thin_slice_dividers(divider_xs) {
+                div_backing.push(LineSegment {
+                    a: [x, content.y],
+                    b: [x, content.y + content.h],
+                    color: theme::WINDOW_BG.with_alpha(0.65),
+                });
+                div_bright.push(LineSegment {
+                    a: [x, content.y],
+                    b: [x, content.y + content.h],
+                    color: theme::SELECTION_WARM.with_alpha(0.85),
+                });
             }
             // event 冒頭 / 末尾の無音 (= 最初の trigger 前 / 鳴り終わり後) もベースラインで示す。
             let ev_x1 = x_at(ev.len_beats);
             if let (Some(first), Some(last)) = (segs.first(), prev_end_x) {
                 if first.rect.x > ev_x0 + 0.5 {
-                    silent.push(LineSegment {
-                        a: [ev_x0, mid_y],
-                        b: [first.rect.x, mid_y],
-                        color: silent_color,
-                    });
+                    push_silent(ev_x0, first.rect.x);
                 }
                 if ev_x1 > last + 0.5 {
-                    silent.push(LineSegment {
-                        a: [last, mid_y],
-                        b: [ev_x1, mid_y],
-                        color: silent_color,
-                    });
+                    push_silent(last, ev_x1);
                 }
             }
             if segs.is_empty() {
@@ -370,13 +382,18 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
                 sample_rate: ev.buffer.sample_rate,
             };
             let _ = hctx.waveform_segments(
-                (wf_id_tag, key.track, key.clip, ev_i),
+                (wf_id_tag, key.track, key.clip, ev.key),
                 source,
                 &segs,
                 wstyle,
             );
         }
         if !silent.is_empty() {
+            hctx.push_lines(LineBatch {
+                segments: Arc::<[LineSegment]>::from(silent_backing),
+                line_width_px: 2.0,
+                clip_rect: None,
+            });
             hctx.push_lines(LineBatch {
                 segments: Arc::<[LineSegment]>::from(silent),
                 line_width_px: 1.0,

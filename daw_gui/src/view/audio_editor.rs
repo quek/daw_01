@@ -399,6 +399,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // r.md #41: 波形描画の span 列 (event ごとに `event_wave_spans` で埋め直す
     // 使い回しバッファ。 毎フレーム全 event ぶん確保しないため)。
     let mut wave_spans: Vec<common::audio_render::WaveSpan> = Vec::new();
+    // SongTempo automation 込みで engine と同じ tempo 写像を得る (native rate 再生は
+    // current_bpm に依存する)。 lane が無ければ定数 = 従来と同コスト。
+    let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
     for (idx, event) in audio.events.iter().enumerate() {
         let Some(buffer) = app.media.audio_source_cache.get(event.source_id) else {
             // 当該 event は decode 待ち / missing source → 透けて見える
@@ -498,7 +501,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         common::audio_render::event_wave_spans(
             event,
             buffer.sample_rate,
-            app.song_doc.song().bpm,
+            &tempo_map,
+            clip.start_beat + event.event_start_in_clip_beats,
             &mut wave_spans,
         );
         let view_end_beat = view_start_beat + view_len_beats;
@@ -585,13 +589,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 暗い backing + 明色の 2 層 (`feedback_ui_indicator_contrast_on_variable_bg`)。
         if matches!(event.stretch_mode, common::model::StretchMode::Slice) && wave_spans.len() > 1 {
             // event 左端と一致する先頭スライスの頭は event 境界そのものなので出さない。
+            // tempo 曲線で分割された継続 span (`head == false`) は音の切れ目ではない。
+            // 密なスライス (長尺素材の onset は数百〜数千本) は縦線だけで領域が埋まり
+            // 波形が読めなくなるので、 アレンジビューと同じ最小間隔で間引く。
             let event_x0 = span_x(event.event_start_in_clip_beats);
-            let slice_xs: Vec<f32> = wave_spans
-                .iter()
-                .map(|sp| span_x(event.event_start_in_clip_beats + sp.start_beat))
-                .filter(|x| (*x - event_x0).abs() > 0.5)
-                .filter(|x| *x >= wf_area.x - 0.5 && *x <= wf_area.x + wf_area.w + 0.5)
-                .collect();
+            let slice_xs = crate::widgets::thin_slice_dividers(
+                wave_spans
+                    .iter()
+                    .filter(|sp| sp.head)
+                    .map(|sp| span_x(event.event_start_in_clip_beats + sp.start_beat))
+                    .filter(|x| (*x - event_x0).abs() > 0.5)
+                    .filter(|x| *x >= wf_area.x - 0.5 && *x <= wf_area.x + wf_area.w + 0.5),
+            );
             if !slice_xs.is_empty() {
                 let mut backing: Vec<LineSegment> = Vec::with_capacity(slice_xs.len());
                 let mut bright: Vec<LineSegment> = Vec::with_capacity(slice_xs.len());
@@ -834,15 +843,25 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         view_start_beat + (drag.anchor.0 - wf_area.x) as f64 * beats_per_px;
                     let local = (clip_beat - event.event_start_in_clip_beats)
                         .clamp(0.0, event.event_length_beats);
+                    let window = event
+                        .source_end_frames
+                        .saturating_sub(event.source_start_frames)
+                        as f64;
                     let src = common::audio_render::source_frame_at_beat(&wave_spans, local)
                         .unwrap_or_else(|| {
-                            let len = event
-                                .source_end_frames
-                                .saturating_sub(event.source_start_frames)
-                                as f64;
                             event.source_start_frames as f64
-                                + (local / event.event_length_beats.max(1e-9)) * len
+                                + (local / event.event_length_beats.max(1e-9)) * window
                         });
+                    // span の source 範囲は「実際に鳴る」 (= 逆再生なら反転後) 座標だが、
+                    // warp marker は engine が **反転前** の座標で解釈し、
+                    // `source_frame_lerp` が改めて反転する。 逆再生 event では
+                    // forward ドメインに戻してから保存しないと鏡像の位置に pin される。
+                    let src = if event.reversed {
+                        let base = event.source_start_frames as f64;
+                        base + (window - 1.0 - (src - base)).max(0.0)
+                    } else {
+                        src
+                    };
                     let source_frame = src.max(0.0) as u64;
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::AddWarpMarker {

@@ -2041,6 +2041,8 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         // clip のみ (`visible_tracks`)。 描画は下の non-cached 領域で共有 inset を使って行う。
         let clip_content: HashMap<ClipKey, ClipContentDraw> = {
             let mut map: HashMap<ClipKey, ClipContentDraw> = HashMap::new();
+            // SongTempo automation を持つ曲だけ曲線評価になる (無ければ定数 = 従来と同コスト)。
+            let tempo_map = common::audio_render::TempoMap::from_song(app.song_doc.song());
             for t in &visible_tracks {
                 if t.id == MASTER_TRACK_ID {
                     continue;
@@ -2061,10 +2063,11 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                         // (`event_wave_spans`) が返す span 列で描く。 Slice はスライスの
                         // trigger 位置と gap、 Stretch は warp 区間、 逆再生は反転が
                         // そのまま span に乗るので、 描画側に mode 分岐は要らない。
-                        let bpm = app.song_doc.song().bpm;
+                        // tempo は SongTempo automation 込みで engine と同じ写像を得る
+                        // (native rate 再生は current_bpm に依存する)。
                         let mut spans = Vec::new();
                         let mut events: Vec<AudioEventDraw> = Vec::new();
-                        for ev in audio_events {
+                        for (ev_i, ev) in audio_events.iter().enumerate() {
                             let Some(buffer) = app.media.audio_source_cache.get(ev.source_id) else {
                                 // decode 待ち / missing source は skip (他 event は描く)。
                                 continue;
@@ -2072,7 +2075,8 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                             common::audio_render::event_wave_spans(
                                 ev,
                                 buffer.sample_rate,
-                                bpm,
+                                &tempo_map,
+                                c.start_beat + ev.event_start_in_clip_beats,
                                 &mut spans,
                             );
                             if spans.is_empty() {
@@ -2081,6 +2085,15 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                             events.push(AudioEventDraw {
                                 buffer,
                                 source_id: ev.source_id,
+                                // 波形 widget の LOD state キー。 `AudioEvent.id` は
+                                // 安定 id (undo / 並べ替えを跨ぐ) なので decode 完了で
+                                // 詰め方が変わっても pyramid が入れ替わらない。 未採番
+                                // (0 sentinel) の古い song だけ model index に degrade。
+                                key: if ev.id != 0 {
+                                    u64::from(ev.id)
+                                } else {
+                                    u64::MAX - ev_i as u64
+                                },
                                 start_in_clip_beats: ev.event_start_in_clip_beats,
                                 len_beats: ev.event_length_beats,
                                 stretch_mode: ev.stretch_mode,

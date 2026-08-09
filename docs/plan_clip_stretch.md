@@ -283,6 +283,41 @@ Slice の式（`source_fpb = source_sr × 60 / bpm`、`place_fpb = source_fpb ×
 **束縛テスト**: `daw_audio` の `wave_span_binding_tests` が ramp 素材を実レンダリングし、
 「span 区間は span の source 写像どおりに鳴る / span の無い区間は完全無音」を assert する。
 片方の写像だけ変えると CI が落ちる（従来はコメントでしか結び付いていなかった）。
+Raw / Repitch / Stretch（uniform + warp）/ Slice / reversed / SongTempo automation を網羅する。
+
+### 7.1 tempo は `TempoMap` 経由（スカラー bpm では表せない）
+
+engine は buffer ごとに `evaluate_song_tempo(song, playhead_beats)` で `current_bpm` を
+評価し `samples_per_beat` を作り直す。式を展開すると：
+
+| 量 | current_bpm 依存 | 理由 |
+|---|---|---|
+| Slice の trigger 拍 / Stretch の grain 配置 / Repitch | **不変** | `tempo_follow_ratio` の `current/nominal` が `samples_per_beat` と約分される |
+| **Raw の消費速度 / Slice 本体の read 速度** | **反比例** | `source_pos = event_local × read_stride` で `event_local` が `samples_per_beat` 由来 |
+
+つまり native rate 再生（Raw 全体・slice 本体）だけが「1 拍あたりの source 消費量」を
+tempo に応じて変える。描画が定数 `song.bpm` を使っていると、SongTempo lane を持つ曲で
+60 BPM 区間の Raw クリップが実音の 2 倍幅に描かれる（= #41 の不変条件の破れ）。
+そのため `event_wave_spans` はスカラー bpm ではなく **`TempoMap`**（`nominal_bpm` +
+SongTempo lane 参照）と **event の song 絶対拍**を取る。tempo が曲線のときは native rate
+区間を 1/8 拍刻みの区分線形 span 列に分割する（2 本目以降は `WaveSpan.head = false` で、
+スライス境界の縦線は `head` の span にだけ出す）。SongTempo lane が無い曲は
+`TempoMap::is_constant()` で従来どおり閉形式 1 span（曲線評価コストゼロ）。
+
+既知の限界: engine は automation の上に song modulation（LFO/MSEG → `SongTempo`）を
+重ねるが、modulator の位相は audio thread が持つので GUI からは再現できない。変調中の
+tempo は automation 値で近似する。
+
+### 7.2 その他の一致条件
+
+- **warp の窓手前 clamp は区分**: engine は grain ごとに `(sf - source_start).max(0)` を
+  評価するので、warp が窓手前を指す拍区間は「先頭 frame 保持（flat）→ 本来の傾き」の
+  区分写像になる。描画も交点で segment を分割する（端点だけ clamp して線形補間すると
+  最大 25% ずれる。auto-warp 後に左 trim した event で実際に到達する）。
+- **warp marker は forward ドメイン**: `WaveSpan` の source 範囲は「実際に鳴る」
+  （逆再生なら反転後）座標だが、marker は engine が反転前の座標で解釈し
+  `source_frame_lerp` が改めて反転する。Alt+click で marker を置く UI は
+  `source_frame_at_beat` の戻り値を forward に戻してから保存する。
 
 未実装（Ableton にはあるが daw_01 に無い）: Transient Loop Mode（gap を loop で埋める）、
 Transient Envelope（slice 境界のフェード）。現状 gap 境界は無フェードのハードカットなので、

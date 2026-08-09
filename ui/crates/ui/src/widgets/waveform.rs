@@ -1071,12 +1071,25 @@ fn cull_segment(seg: &WaveformSegment, clip: Option<Rect>) -> Option<WaveformSeg
     } else {
         (start + f0 * len, start + f1 * len)
     };
+    // `WaveformView` はサンプル範囲を整数で持つので、素朴に切り捨てると rect (float)
+    // との対応が frac(s0) サンプルぶんずれる (= 高倍率で波形が最大数 px 横に動く)。
+    // **サンプル境界の外側へ丸めた分だけ rect も広げて**位相を保つ (はみ出しは
+    // 呼び出し側の scissor が落とす)。
+    let px_per_sample = f64::from(r.w) / len.max(1.0);
+    let (i0, i1) = (s0.max(0.0).floor(), s1.max(0.0).ceil().max(s0.max(0.0).floor() + 1.0));
+    // 左端がどちらのサンプルに対応するかは向きで変わる (forward = i0、reversed = i1)。
+    let lead = if seg.view.reversed { i1 - s1 } else { s0 - i0 };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     Some(WaveformSegment {
-        rect: Rect { x: x0, y: r.y, w: x1 - x0, h: r.h },
+        rect: Rect {
+            x: x0 - (lead * px_per_sample) as f32,
+            y: r.y,
+            w: ((i1 - i0) * px_per_sample) as f32,
+            h: r.h,
+        },
         view: WaveformView {
-            start_sample: s0.max(0.0) as u64,
-            len_samples: ((s1 - s0).max(0.0) as u64).max(1),
+            start_sample: i0 as u64,
+            len_samples: ((i1 - i0) as u64).max(1),
             ..seg.view
         },
     })
@@ -1130,23 +1143,29 @@ fn segments_input_hash(
     h
 }
 
-/// カリング済み 1 区間を scene に積む。
+/// カリング済み 1 区間の線分を `lines` に積む (push はしない)。
+///
+/// 区間ごとに `LineBatch` を push すると renderer 側で
+/// 「`set_scissor_rect` + `draw`」 が区間数ぶん走る (スライス数に比例した draw call)
+/// ので、呼び出し側で 1 バッチにまとめられるよう **生成だけ**を行う。生成される
+/// 線分は必ず区間 rect の内側なので、バッチ単位の scissor で足りる。
 ///
 /// M5 Phase 15: `render_mode` を resolve して SamplePolyline / PeakLines を分岐。
 /// SamplePolyline のときは LOD ピラミッドを触らず生サンプルから直接描画する
 /// (samples_per_pixel < 1.0 = ピラミッド無意味な領域)。
-fn draw_waveform_segment<'a, M: ?Sized + 'static>(
+fn build_waveform_segment<'a, M: ?Sized + 'static>(
     ui: &mut Ui<'a, M>,
     wid: WidgetId,
     source: &WaveformSource<'_>,
     seg: &WaveformSegment,
     style: WaveformStyle,
+    lines: &mut Vec<LineSegment>,
 ) {
     let (rect, view) = (seg.rect, seg.view);
     let view_len = view.len_samples.max(1) as f64;
     let samples_per_pixel = view_len / f64::from(rect.w.max(1.0));
     let effective_mode = resolve_render_mode(style.render_mode, samples_per_pixel);
-    let lines = match effective_mode {
+    let built = match effective_mode {
         WaveformRenderMode::SamplePolyline => {
             build_sample_polyline_segments(source, rect, view, style)
         }
@@ -1162,13 +1181,7 @@ fn draw_waveform_segment<'a, M: ?Sized + 'static>(
         }
         WaveformRenderMode::Auto => unreachable!("resolve_render_mode で除去済"),
     };
-    if !lines.is_empty() {
-        ui.push_lines(LineBatch {
-            segments: lines.into(),
-            line_width_px: style.line_width_px.max(1.0),
-            clip_rect: Some(rect),
-        });
-    }
+    lines.extend(built);
     // M5 Phase 16: SamplePolyline のとき、samples_per_pixel < 0.25 ならサンプル点
     // マーカー (rect 角丸円、knob と同パターン) を追加 push。閾値超過なら markers
     // は空 Vec が返るので no-op。
@@ -1227,11 +1240,33 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let input_hash = segments_input_hash(&source, segments, style);
         self.with_widget_node(wid, input_hash, |ui| {
             let clip = ui.current_clip;
+            // 全区間を 1 バッチにまとめる (区間ごとに push すると renderer 側の
+            // scissor 切替 + draw call がスライス数に比例して増える)。scissor は
+            // 可視区間の bbox 1 つで足りる (線分は各区間 rect の内側に収まる)。
+            let mut lines: Vec<LineSegment> = Vec::new();
+            let mut bbox: Option<Rect> = None;
             for seg in segments {
                 let Some(seg) = cull_segment(seg, clip) else {
                     continue;
                 };
-                draw_waveform_segment(ui, wid, &source, &seg, style);
+                build_waveform_segment(ui, wid, &source, &seg, style, &mut lines);
+                bbox = Some(match bbox {
+                    None => seg.rect,
+                    Some(b) => {
+                        let x0 = b.x.min(seg.rect.x);
+                        let y0 = b.y.min(seg.rect.y);
+                        let x1 = (b.x + b.w).max(seg.rect.x + seg.rect.w);
+                        let y1 = (b.y + b.h).max(seg.rect.y + seg.rect.h);
+                        Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+                    }
+                });
+            }
+            if !lines.is_empty() {
+                ui.push_lines(LineBatch {
+                    segments: lines.into(),
+                    line_width_px: style.line_width_px.max(1.0),
+                    clip_rect: bbox,
+                });
             }
         });
 
@@ -1487,18 +1522,48 @@ mod tests {
         assert_eq!(got.view.start_sample, 2_000);
         assert_eq!(got.view.len_samples, 2_000);
 
-        // reversed は左端が範囲末尾なので、切り詰め先も左右反転して対応する。
-        let got = cull_segment(&seg(50.0, 200.0, 1_000, 4_000, true), Some(clip)).expect("visible");
-        assert_eq!(got.view.start_sample, 2_000);
-        assert_eq!(got.view.len_samples, 2_000);
-        assert!(got.view.reversed);
-
         // 完全に外 / 交差なし → 描かない。
         assert!(cull_segment(&seg(0.0, 40.0, 0, 100, false), Some(clip)).is_none());
         assert!(cull_segment(&seg(300.0, 40.0, 0, 100, false), Some(clip)).is_none());
         // 完全に内側 → そのまま (切り詰めによる丸め誤差を入れない)。
         let got = cull_segment(&seg(120.0, 40.0, 7, 99, false), Some(clip)).expect("visible");
         assert_eq!((got.view.start_sample, got.view.len_samples), (7, 99));
+    }
+
+    /// `reversed` の切り詰めは forward と **別式** であること (左端 = 範囲末尾)。
+    /// 対称なカリング (左右同量) では両式が一致してしまい判別できないので、
+    /// **非対称** (右半分だけ残す) で検証する。
+    #[test]
+    fn cull_segment_reversed_uses_mirrored_sample_range() {
+        // seg = x[0,200) / sample[1000,5000)、clip = x[0,100) → 左半分だけ可視。
+        let clip = Rect { x: 0.0, y: 0.0, w: 100.0, h: 40.0 };
+        let s = seg(0.0, 200.0, 1_000, 4_000, true);
+        let got = cull_segment(&s, Some(clip)).expect("visible");
+        // reversed の左半分 = サンプル範囲の **後半** (3000..5000)。
+        // forward 式に退化していると 1000..3000 になる。
+        assert_eq!(got.view.start_sample, 3_000, "reversed の左半分は範囲後半");
+        assert_eq!(got.view.len_samples, 2_000);
+        assert!(got.view.reversed);
+        // 同じ切り方を forward でやると前半 (1000..3000)。
+        let got = cull_segment(&seg(0.0, 200.0, 1_000, 4_000, false), Some(clip)).expect("visible");
+        assert_eq!(got.view.start_sample, 1_000);
+        assert_eq!(got.view.len_samples, 2_000);
+    }
+
+    /// 整数丸めで rect とサンプル範囲の位相がずれない (= 高倍率で波形が横に飛ばない)。
+    /// サンプル境界の外側へ丸めた分だけ rect も広げるので、
+    /// 「rect 左端が指すサンプル」 は切り詰め前後で不変。
+    #[test]
+    fn cull_segment_keeps_sample_phase_when_rounding() {
+        // 1 サンプル = 4px。x=10 で切ると s0 = 2.5 サンプル目 (非整数)。
+        let clip = Rect { x: 10.0, y: 0.0, w: 100.0, h: 40.0 };
+        let s = seg(0.0, 40.0, 0, 10, false);
+        let got = cull_segment(&s, Some(clip)).expect("visible");
+        assert_eq!(got.view.start_sample, 2, "floor したサンプルから始める");
+        // sample 2 の x = 元 rect 基準で 8.0 → 丸めた分だけ rect も左へ広がる。
+        assert!((got.rect.x - 8.0).abs() < 1e-4, "got {}", got.rect.x);
+        let px_per_sample = f64::from(got.rect.w) / got.view.len_samples as f64;
+        assert!((px_per_sample - 4.0).abs() < 1e-4, "スケールも保つ: {px_per_sample}");
     }
 
     /// `reversed` は同じサンプル範囲を右→左に描く (ピーク線の x が鏡像になる)。
