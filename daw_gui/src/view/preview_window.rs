@@ -21,7 +21,9 @@
 use std::sync::Arc;
 
 use daw_ui_platform::WindowBackend;
-use daw_ui_renderer::{Color, GlyphArea, HAlign, Renderer, Scene, TextureHandle, TexturedQuad, VAlign};
+use daw_ui_renderer::{
+    Color, GlyphArea, HAlign, RenderError, Renderer, Scene, TextureHandle, TexturedQuad, VAlign,
+};
 use winit::dpi::LogicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{WindowAttributes, WindowId};
@@ -59,7 +61,7 @@ pub struct PreviewWindowState {
     >,
     /// トラック合成画リスト。runner が毎 frame
     /// 構築し、bottom→top (track z 順) に並ぶ。各 `TrackComposite` は 1 トラックの
-    /// 動画 / PiP 画像 / テキストを `items` に持ち、`render_placeholder` が:
+    /// 動画 / PiP 画像 / テキストを `items` に持ち、`render` が:
     /// - 効果も配置 transform も無ければ items を直接描く (plain track の fast-path)、
     /// - さもなくば `composite_scene_to_texture` で 1 枚へ合成 → track 効果チェーンを
     ///   `apply_chain` → 配置 transform (identity = canvas 全体 / group affine) で 1 quad push。
@@ -67,7 +69,7 @@ pub struct PreviewWindowState {
     /// 空 = placeholder text を表示。旧 `composite_layers`/`group_layers`/`text_layers` を統合。
     pub track_composites: Vec<crate::group_compose::TrackComposite>,
     /// マスター映像チェーン（`Song.master_fx_chain` の映像 device を
-    /// 解決した実効効果）。空でなければ `render_placeholder` が全トラック合成画を project
+    /// 解決した実効効果）。空でなければ `render` が全トラック合成画を project
     /// 解像度の master canvas 1 枚に集約 → これをチェーン順 `apply_chain` → screen へ配置。
     /// runner が毎 frame `set_master_fx` で更新。
     pub master_fx: Vec<crate::video_fx::ResolvedEffect>,
@@ -95,7 +97,7 @@ pub struct PreviewWindowState {
     /// project resolution に固定される (= 動画と同じ aspect-fit 動作)。
     pub project_resolution: (u32, u32),
     /// docs/plan_video_fx.md: トラック映像効果の GPU 実行基盤。
-    /// `render_placeholder` が composite layer / group layer の texture へ
+    /// `render` が composite layer / group layer の texture へ
     /// チェーン順適用する (pipeline cache + ping-pong pool を frame 跨ぎ保持)。
     pub fx_engine: crate::video_fx::VideoFxEngine,
 }
@@ -260,7 +262,7 @@ impl PreviewWindowState {
     }
 
     /// トラック合成画リストを毎 frame 更新。runner が
-    /// `render_placeholder` の前に bottom→top (track z 順) で渡す。旧
+    /// `render` の前に bottom→top (track z 順) で渡す。旧
     /// `set_composite_layers`/`set_group_layers`/`set_text_layers` を統合。
     pub fn set_track_composites(
         &mut self,
@@ -270,7 +272,7 @@ impl PreviewWindowState {
     }
 
     /// マスター映像チェーンの解決済み効果を毎 frame 更新（runner）。
-    /// 空でなければ `render_placeholder` が master canvas 1 枚に集約してから適用する。
+    /// 空でなければ `render` が master canvas 1 枚に集約してから適用する。
     pub fn set_master_fx(&mut self, fx: Vec<crate::video_fx::ResolvedEffect>) {
         self.master_fx = fx;
     }
@@ -288,6 +290,32 @@ impl PreviewWindowState {
         self.window.request_redraw();
     }
 
+    /// GPU device が失われた preview の資産を丸ごと作り直す (r.md #42)。
+    ///
+    /// **OS ウィンドウは破棄しない**。`state.preview = None` で窓ごと作り直すと位置と
+    /// サイズがリセットされ一瞬消えて再表示されるので、中身 (wgpu device / 各テクスチャ /
+    /// 効果エンジン) だけを差し替える。
+    ///
+    /// - `frame_textures` / `image_textures`: 旧 device の handle なので `destroy` せずに
+    ///   捨てる (死んだ store に触るだけで無意味。実体は旧 device と一緒に解放される)。
+    ///   動画フレームは次の decode で、画像は `pending_image_uploads` の再投入で戻る。
+    /// - `fx_engine`: pool / pipeline / feedback history がすべて旧 device のものなので
+    ///   個別に片付けようとせず [`VideoFxEngine::new`] で丸ごと差し替える。
+    ///
+    /// # Errors
+    /// wgpu 再初期化に失敗 (= まだ GPU が戻っていない)。caller は backoff して再試行する。
+    pub fn recreate_gpu(&mut self) -> Result<(), String> {
+        self.renderer
+            .recreate()
+            .map_err(|e| format!("preview Renderer::recreate: {e}"))?;
+        self.frame_textures.clear();
+        self.image_textures.clear();
+        self.fx_engine = crate::video_fx::VideoFxEngine::new();
+        self.track_composites.clear();
+        self.master_fx.clear();
+        Ok(())
+    }
+
     /// Build the scene + render. docs/plan_video.md P7: walks
     /// `composite_layers` bottom→top and pushes one aspect-fit
     /// textured quad per layer on top of the dark backdrop. gui_01's
@@ -295,7 +323,16 @@ impl PreviewWindowState {
     /// so the topmost track wins at `alpha=1.0` and crossfades mix
     /// at intermediate alphas. Empty layer list falls back to the
     /// P4 placeholder text.
-    pub fn render_placeholder(&mut self) {
+    ///
+    /// # Errors
+    /// 描画できなかった理由 ([`RenderError`])。`DeviceLost` なら caller (runner) が
+    /// [`Self::recreate_gpu`] を含む復旧シーケンスを駆動する。
+    pub fn render(&mut self) -> Result<(), RenderError> {
+        // GPU 消失中は合成も効果適用も全部無駄 (かつ死んだ device を触る) なので、
+        // scene を組む前に抜ける。復旧は runner が駆動する。
+        if !self.renderer.is_live() {
+            return Err(RenderError::DeviceLost);
+        }
         // 前 frame の効果 target を解放 (前 frame は末尾の render() で sample 済み)。
         // これで今 frame の apply_chain が同寸でも別 target を払い出し、レイヤー間衝突を防ぐ
         // (gui_01 CompositePool::end_cycle を render 冒頭で呼ぶのと同 idiom)。
@@ -420,9 +457,7 @@ impl PreviewWindowState {
         }
         self.draw_selection_overlay(screen.width as f32, screen.height as f32);
 
-        if let Err(e) = self.renderer.render(&self.scene) {
-            tracing::error!(error = ?e, "preview render error");
-        }
+        self.renderer.render(&self.scene)
     }
 
     /// 1 トラック合成画を描く。効果も配置

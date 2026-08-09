@@ -14,6 +14,11 @@ use crate::import_audio;
 impl AppData {
     /// New / Open / Restore 時、 `SongDoc::replace_song` の直後に呼ぶ
     /// (履歴破棄 / clean 化 / epoch bump は replace_song 側が担う)。
+    ///
+    /// r.md #42: **Song 由来の派生データの purge と再構築 (`begin_asset_decode`) も
+    /// ここが担う**。 呼び出し側で「purge してから decode を起動する」 順序を守らせると、
+    /// 1 箇所でも順序を間違えた瞬間に「前のプロジェクトの絵が出る / サムネイルが出ない」
+    /// になるため、 順序ごとこの 1 関数に閉じ込める。
     pub(crate) fn after_song_replaced(&mut self) {
         // load / new / recovery では直前に flush_song_sync が
         // 走り、 口パク binding を持つ project だと mark_lipsync_dirty が 400ms
@@ -48,6 +53,23 @@ impl AppData {
         // r.md #10: 別 project の `Home` 2 段トグル state を持ち越さない
         // (= 新 project 最初の Home は先頭クリップ位置から始める)。
         self.ui_ephemeral.home_toggle_at_first = false;
+        // r.md #42: GPU 上のサムネイル / 画像テクスチャは **今の Song から導出された**
+        // データ。 `VideoSourceId` / `ImageSourceId` は project ごとに 1 から振り直される
+        // ので、 持ち越すと別 project の同 id が誤 hit して「前のプロジェクトの絵が
+        // クリップに出る」。 実テクスチャは renderer 側 store に残るが、 参照が消えれば
+        // 以後 upload 先が変わるだけで描画には現れない (次の import / 復旧で再確保)。
+        self.ui_ephemeral.video_texture_cache.clear();
+        self.ui_ephemeral.image_texture_cache.clear();
+        // 旧 project の CPU 側 staging も同様に持ち越さない (未 upload のまま残ると
+        // 新 project の同 id を「decode 済み」 と誤判定して job から漏れる)。
+        self.media.video_thumbnail_rgba.clear();
+        self.media.pending_thumbnail_uploads.clear();
+        self.media.image_source_bgra.clear();
+        self.media.pending_image_uploads.clear();
+        // purge の **直後**に再構築を起動する (音声 / 画像 / 動画サムネイル)。
+        // `file_path` は呼び出し側が replace_song の直後に設定済みなので、
+        // ProjectRelative なパスもここで解決できる。
+        self.begin_asset_decode("プロジェクトを読込中");
     }
 
     pub(crate) fn undo(&mut self) {
@@ -238,8 +260,23 @@ impl AppData {
     /// 固めていた。 本関数は構造の swap 後に呼ばれ、 work-list を作って 1 本の
     /// thread で順次 decode、 1 件ごとに `AssetDecodeTick` を発火して `on_asset_
     /// decode_tick` が cache へ流し込む (= 波形 / 画像が順次出る streaming load)。
-    /// 完了まで `asset_decode` は `Some` で、 再生はこの間 gate される。
-    pub(crate) fn begin_asset_decode(&mut self) {
+    /// 完了まで `asset_decode` は `Some`。 再生 gate は **audio 件数だけ**を見る
+    /// (`AssetDecodeStaging::audio_remaining`)。
+    ///
+    /// r.md #42: 動画クリップのサムネイルも同じ work-list に載せる。 これは
+    /// (a) プロジェクトを開き直したときにサムネイルが出なかった既存の穴、
+    /// (b) GPU 再初期化後にテクスチャを作り直す必要、
+    /// の **両方が「ディスク上の動画からサムネイルを再生成する」 同一処理**なので、
+    /// 経路を 2 つ持たない (「サムネイルはいつ出るのか」 が一意に決まる)。
+    ///
+    /// `label` は進捗 overlay の文言 (プロジェクト読込 / GPU 復旧 で変える)。
+    ///
+    /// 走行中の decode があっても **常に新しい staging へ差し替える**。
+    /// `on_asset_decode_tick` は `media.asset_decode` が指す **現行の** staging しか
+    /// 読まないので、 旧スレッドの成果は孤児 Arc に溜まってそのまま捨てられる
+    /// (= 別 project を開いた直後に旧 project の decode 結果が混入しない)。
+    /// 未完了だった分は新しい work-list に再び載る (未 cache / 未 staging が条件なので)。
+    pub(crate) fn begin_asset_decode(&mut self, label: &'static str) {
         use common::model::{AudioSourcePath, ImageSourcePath};
         // file_path = None (= 未保存 project の sidecar 復元) の場合、
         // ProjectRelative は resolve できないので skip。
@@ -280,16 +317,52 @@ impl AppData {
             };
             image_jobs.push((source_id, abs));
         }
+        // r.md #42: 未 staging の video source サムネイル。 GPU へ上げ済みの分は
+        // `video_thumbnail_rgba` から drain 済なので、 プロジェクトを開いた直後 /
+        // GPU 再初期化直後は全件が job になる (= どちらも「ディスクの動画から作り直す」)。
+        // CPU staging / GPU texture のどちらかに既にあるものだけ skip する冪等な work-list。
+        //
+        // 動画 decode は libav 依存で Windows 限定 (`decode_video_thumbnail` 参照)。
+        // 他プラットフォームでは job を積まない (= total にも数えない)。
+        let mut video_jobs: Vec<(common::model::VideoSourceId, PathBuf)> = Vec::new();
+        if cfg!(windows) {
+            for (&source_id, source) in &self.song_doc.song().media.video_sources {
+                if self.media.video_thumbnail_rgba.contains_key(&source_id)
+                    || self.ui_ephemeral.video_texture_cache.contains_key(&source_id)
+                {
+                    continue;
+                }
+                let abs = match &source.path {
+                    common::model::VideoSourcePath::Absolute(abs) => abs.clone(),
+                    common::model::VideoSourcePath::ProjectRelative(rel) => {
+                        match project_dir.as_ref() {
+                            Some(dir) => dir.join(rel),
+                            None => continue,
+                        }
+                    }
+                };
+                video_jobs.push((source_id, abs));
+            }
+        }
 
-        let total = audio_jobs.len() + image_jobs.len();
+        let audio_remaining = audio_jobs.len();
+        let total = audio_jobs.len() + image_jobs.len() + video_jobs.len();
         if total == 0 {
+            // 走行中だった decode の marker も畳む (= その成果は孤児 Arc へ捨てる)。
+            // `load_progress` も一緒に消さないと、 進捗 overlay が出たまま残る
+            // (例: 重い project を読込中に「新規」 を選んだとき)。
             self.media.asset_decode = None;
+            self.media.load_progress = None;
             return;
         }
-        let staging = Arc::new(Mutex::new(AssetDecodeStaging { total, ..Default::default() }));
+        let staging = Arc::new(Mutex::new(AssetDecodeStaging {
+            total,
+            audio_remaining,
+            ..Default::default()
+        }));
         self.media.asset_decode = Some(Arc::clone(&staging));
         self.media.load_progress = Some((0, total));
-        self.media.load_progress_label = "プロジェクトを読込中";
+        self.media.load_progress_label = label;
         let proxy = self.ipc.event_proxy.clone();
         std::thread::spawn(move || {
             for (id, abs) in audio_jobs {
@@ -304,6 +377,8 @@ impl AppData {
                         g.audio.push((id, buf));
                     }
                     g.done += 1;
+                    // 成否に関わらず 1 件消化 (失敗した source を待ち続けない)。
+                    g.audio_remaining = g.audio_remaining.saturating_sub(1);
                 }
                 proxy.send(AppEvent::AssetDecodeTick);
             }
@@ -317,7 +392,27 @@ impl AppData {
                 }
                 proxy.send(AppEvent::AssetDecodeTick);
             }
+            for (id, abs) in video_jobs {
+                let decoded = decode_video_thumbnail(&abs);
+                if let Ok(mut g) = staging.lock() {
+                    if let Some(t) = decoded {
+                        g.video_thumbnail.push((id, t));
+                    }
+                    g.done += 1;
+                }
+                proxy.send(AppEvent::AssetDecodeTick);
+            }
         });
+    }
+
+    /// 未 decode の **audio** source が残っているか (= 再生を gate すべきか)。
+    /// 画像 / 動画サムネイルの decode 中は `false` (音は揃っているので再生してよい)。
+    pub(crate) fn audio_decode_pending(&self) -> bool {
+        self.media
+            .asset_decode
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|g| g.audio_remaining > 0))
+            .unwrap_or(false)
     }
 
     /// background decode から 1 件 decode 完了するたびに発火。 staging に
@@ -327,15 +422,17 @@ impl AppData {
         let Some(staging) = self.media.asset_decode.clone() else {
             return;
         };
-        let (audio, image, done, total) = {
+        let (audio, image, video_thumbnail, done, total, audio_remaining) = {
             let Ok(mut g) = staging.lock() else {
                 return;
             };
             (
                 std::mem::take(&mut g.audio),
                 std::mem::take(&mut g.image),
+                std::mem::take(&mut g.video_thumbnail),
                 g.done,
                 g.total,
+                g.audio_remaining,
             )
         };
         for (id, buf) in audio {
@@ -345,19 +442,38 @@ impl AppData {
             self.media.image_source_bgra.insert(id, (w, h, bytes));
             self.media.pending_image_uploads.push(id);
         }
+        for (id, (w, h, rgba)) in video_thumbnail {
+            self.media.video_thumbnail_rgba.insert(id, (w, h, rgba));
+            self.media.pending_thumbnail_uploads.push(id);
+        }
+        // 音が揃った時点で再生 gate を外す (画像 / サムネイルは待たない)。
+        if audio_remaining == 0 && self.transport.pending_play {
+            self.transport.pending_play = false;
+            self.play();
+        }
         if done >= total {
             tracing::info!(total, "asset decode complete");
             self.media.asset_decode = None;
             self.media.load_progress = None;
-            // 読込完了 → gate していた Play を流す (plugin gate が残っていれば
-            // play() が再 queue する)。
-            if self.transport.pending_play {
-                self.transport.pending_play = false;
-                self.play();
-            }
         } else {
             self.media.load_progress = Some((done, total));
         }
+    }
+
+    /// r.md #42: GPU 資産を作り直した直後に呼ぶ。 GPU 上にしか無かった派生データ
+    /// (動画サムネイル / 画像テクスチャ) を **ディスク上の元ファイルから**再構築する。
+    ///
+    /// SSoT はディスク上のファイルであって GPU テクスチャではない。 復元のためだけに
+    /// 展開済みビットマップを RAM に常駐させる (4K 画像 1 枚 ~33MB × 枚数) 案は採らない
+    /// — 復帰直後の一瞬の空白より、 常時のメモリ増のほうが害が大きい。
+    pub(crate) fn rebuild_gpu_derived_caches(&mut self) {
+        // 旧 device の handle は全部無効。 `destroy_texture` は既に死んだ store を
+        // 触るだけなので呼ばない (renderer 側が世代ごと捨てている)。
+        self.ui_ephemeral.video_texture_cache.clear();
+        self.ui_ephemeral.image_texture_cache.clear();
+        // 「未 staging のものだけ」 を対象にする冪等な work-list 構築なので、
+        // GPU へ上げ済みだった (= staging が drain 済みの) ものだけが再 decode される。
+        self.begin_asset_decode("GPU を再初期化しています");
     }
 
     pub(crate) fn action_open_path(&mut self, path: PathBuf) {
@@ -384,10 +500,9 @@ impl AppData {
                 self.restore_plugin_from_song(&song);
                 self.song_doc.replace_song(song);
                 self.song_doc.file_path = Some(path.clone());
-                // audio / image source の decode は重いので background
-                // スレッドへ。 構造は既に swap 済みなので即操作可、 波形 / 画像は
-                // streaming で順次出る (begin_asset_decode → AssetDecodeTick)。
-                self.begin_asset_decode();
+                // audio / image / video サムネイルの decode は重いので background
+                // スレッドへ。 波形 / 画像は streaming で順次出る
+                // (`after_song_replaced` → begin_asset_decode → AssetDecodeTick)。
                 self.selection.selected_track_ids.clear();
                 self.ui_prefs.collapsed_groups.clear();
                 self.selection.selected_clip = None;
@@ -649,9 +764,9 @@ impl AppData {
         self.restore_plugin_from_song(&song);
         self.song_doc.replace_song(song);
         self.song_doc.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
-        // recovery 復元も load path と同じく background streaming
-        // decode へ。 file_path を先にセット済みなので ProjectRelative も解決可。
-        self.begin_asset_decode();
+        // recovery 復元も load path と同じく background streaming decode へ
+        // (`after_song_replaced` が起動する)。 file_path を先にセット済みなので
+        // ProjectRelative も解決可。
         self.selection.selected_track_ids.clear();
         self.ui_prefs.collapsed_groups.clear();
         self.selection.selected_clip = None;

@@ -1,10 +1,53 @@
-//! インストール済みフォント family の列挙 (M14 Phase 121 / daw_01 #096)。
+//! フォント資産 ([`FontAssets`]) と、 インストール済みフォント family の列挙
+//! (M14 Phase 121 / daw_01 #096)。
 //!
 //! Text クリップのフォントピッカー等で、 `GlyphArea.font_family` に渡せる family 名の集合を
 //! 取得するための free 関数。 GPU も live [`FontSystem`](glyphon::FontSystem) も要求しないので、
 //! GUI の background thread から呼べる。
 
 use std::collections::BTreeSet;
+
+use glyphon::{FontSystem, SwashCache};
+
+/// **CPU 側**のフォント資産 (font DB + glyph raster cache)。
+///
+/// GPU デバイスに一切依存しないので、 device lost (= スリープ復帰で GPU が電源断される等、
+/// daw_01 r.md #42) で GPU 資産を丸ごと作り直しても **これは作り直さない**。
+/// `FontSystem::new()` は OS のフォントディレクトリ全走査 (~20-860ms、 [`available_font_families`]
+/// のコスト節参照) を伴うため、 再生成のたびに走らせるのは論外。
+///
+/// 同時に、 これは daw-ui 全体で **font DB の Single Source of Truth** でもある。
+/// 以前は `GlyphPipeline` が `FontSystem` / `SwashCache` を内包しており、 base pass 用と
+/// popup pass 用で 2 インスタンス生成 = システムフォント全走査を 2 回やっていた。
+/// CPU 資産をこの型に括り出したことで、 その二重ロードが構造的に消えている
+/// (`Renderer` / `OffscreenRenderer` が 1 個だけ持ち、 各 pipeline へ `&mut` で貸す)。
+pub struct FontAssets {
+    pub font_system: FontSystem,
+    pub swash_cache: SwashCache,
+}
+
+impl FontAssets {
+    /// システムフォントを走査して構築する (**重い**、 renderer 1 個につき 1 回)。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            font_system: FontSystem::new(),
+            swash_cache: SwashCache::new(),
+        }
+    }
+
+    /// glyphon の `prepare` は `&mut FontSystem` と `&mut SwashCache` を別引数で取るので、
+    /// disjoint-field borrow をまとめて取り出す accessor。
+    pub fn split(&mut self) -> (&mut FontSystem, &mut SwashCache) {
+        (&mut self.font_system, &mut self.swash_cache)
+    }
+}
+
+impl Default for FontAssets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// この環境にインストールされているフォント family 名を、 **ソート済み・重複排除** して返す。
 ///

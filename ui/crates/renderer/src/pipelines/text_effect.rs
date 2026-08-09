@@ -38,10 +38,11 @@ use std::hash::{Hash, Hasher};
 use bytemuck::{Pod, Zeroable};
 use glyphon::{
     Attrs, Buffer, Cache, Color as GlyphColor, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use wgpu::MultisampleState;
 
+use crate::fonts::FontAssets;
 use crate::scene::{Color, GlyphArea, TextureHandle};
 use crate::texture_store::TextureStore;
 
@@ -464,8 +465,7 @@ impl TextEffectCompositor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        font_system: &mut FontSystem,
-        swash_cache: &mut SwashCache,
+        fonts: &mut FontAssets,
         texture_store: &mut TextureStore,
         texture_sampler: &wgpu::Sampler,
         texture_bgl: &wgpu::BindGroupLayout,
@@ -488,7 +488,7 @@ impl TextEffectCompositor {
         // cache miss — measure text + render
 
         // (1) measure text via glyphon Buffer::layout_runs
-        let (text_w, text_h) = self.measure_text(font_system, area);
+        let (text_w, text_h) = self.measure_text(&mut fonts.font_system, area);
         if text_w <= 0.0 || text_h <= 0.0 {
             return None;
         }
@@ -526,8 +526,7 @@ impl TextEffectCompositor {
             device,
             queue,
             encoder,
-            font_system,
-            swash_cache,
+            fonts,
             area,
             text_offset_x,
             text_offset_y,
@@ -689,8 +688,7 @@ impl TextEffectCompositor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        font_system: &mut FontSystem,
-        swash_cache: &mut SwashCache,
+        fonts: &mut FontAssets,
         area: &GlyphArea,
         text_offset_x: f32,
         text_offset_y: f32,
@@ -759,6 +757,7 @@ impl TextEffectCompositor {
             custom_glyphs: &[],
         };
 
+        let (font_system, swash_cache) = fonts.split();
         if let Err(e) = self.renderers[idx].prepare(
             device,
             queue,

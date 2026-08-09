@@ -43,10 +43,29 @@ pub struct TextureStore {
 
 impl TextureStore {
     pub fn new() -> Self {
+        Self::new_starting_at(0)
+    }
+
+    /// `next_id` を引き継いで空の store を作る (device lost → GPU 資産再生成、 daw_01 r.md #42)。
+    ///
+    /// **なぜ 0 に戻してはいけないか**: `TextureHandle` は「id が生きているか」だけで判定される
+    /// (destroy 済 handle への操作は no-op という契約)。 再生成で id 空間を 0 に巻き戻すと、
+    /// 呼び出し側が取りこぼした **旧世代の handle が新しい別テクスチャを指す** (別名衝突) ため、
+    /// upload / 描画が **無言で違う絵になる**。 build も test も clippy も全部通ってしまう類の
+    /// visual regression なので、 id 空間の単調性を構造的に保つ。
+    #[must_use]
+    pub fn new_starting_at(next_id: u32) -> Self {
         Self {
-            next_id: 0,
+            next_id,
             entries: HashMap::new(),
         }
+    }
+
+    /// 次に払い出す id の直前値 (= これまでに払い出した最大 id)。
+    /// [`Self::new_starting_at`] に渡して世代をまたいで id 空間を継続させる。
+    #[must_use]
+    pub fn next_id(&self) -> u32 {
+        self.next_id
     }
 
     /// 指定サイズ + format の空 texture を確保し、 `(texture_view, sampler)` の bind_group を

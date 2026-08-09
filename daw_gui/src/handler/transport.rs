@@ -18,9 +18,11 @@ impl AppData {
             return;
         }
         // プロジェクトロードの asset decode 中は音声がまだ揃って
-        // いないので再生を gate して queue する (load 完了で on_asset_decode_tick
-        // が flush)。
-        if self.media.asset_decode.is_some() {
+        // いないので再生を gate して queue する (audio 完了で on_asset_decode_tick
+        // が flush)。 r.md #42: gate の根拠は **音が揃っていないこと** なので、
+        // 画像 / 動画サムネイルの decode 中 (= GPU 再初期化後の再読込を含む) は
+        // 待たせない。
+        if self.audio_decode_pending() {
             self.transport.pending_play = true;
             self.ui_ephemeral.status_message = "プロジェクト読込中...".into();
             return;

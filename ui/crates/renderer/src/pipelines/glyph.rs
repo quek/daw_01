@@ -11,10 +11,12 @@ use std::hash::{Hash, Hasher};
 
 use daw_ui_platform::PhysicalSize;
 use glyphon::{
-    Attrs, Buffer, Cache, Color as GlyphColor, Family, FontSystem, Metrics, Resolution,
-    Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    Attrs, Buffer, Cache, Color as GlyphColor, Family, Metrics, Resolution, Shaping, TextArea,
+    TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use wgpu::MultisampleState;
+
+use crate::fonts::FontAssets;
 
 /// 既定で使うフォント family。固定幅 (CJK は ASCII の 2 倍)。
 /// インストールされていない環境では glyphon の fallback (システムデフォルト) に倒れる。
@@ -87,9 +89,12 @@ impl GlyphRun {
     }
 }
 
+/// テキスト描画の **GPU 側**資産のみを持つ pipeline。
+///
+/// font DB / glyph raster cache は GPU に依存しない CPU 資産なので
+/// [`FontAssets`](crate::fonts::FontAssets) 側が所有し、 `enqueue_run` に `&mut` で渡される
+/// (device lost で GPU 資産だけ捨てて作り直せるようにするための分離、 daw_01 r.md #42)。
 pub struct GlyphPipeline {
-    font_system: FontSystem,
-    swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
     /// 同一 (text, font_size, line_height) の Buffer を再利用する cache。
@@ -110,8 +115,6 @@ impl GlyphPipeline {
         queue: &wgpu::Queue,
         target_format: wgpu::TextureFormat,
     ) -> Self {
-        let font_system = FontSystem::new();
-        let swash_cache = SwashCache::new();
         let cache_handle = Cache::new(device);
         let viewport = Viewport::new(device, &cache_handle);
         let mut atlas = TextAtlas::new(device, queue, &cache_handle, target_format);
@@ -120,8 +123,6 @@ impl GlyphPipeline {
             TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
 
         Self {
-            font_system,
-            swash_cache,
             viewport,
             atlas,
             cache: HashMap::new(),
@@ -148,6 +149,7 @@ impl GlyphPipeline {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        fonts: &mut FontAssets,
         glyph_areas: &[GlyphArea],
         screen: PhysicalSize,
     ) -> GlyphRun {
@@ -164,7 +166,7 @@ impl GlyphPipeline {
             ));
         }
         let idx = self.next_renderer_idx;
-        self.prepare_renderer(device, queue, idx, glyph_areas, screen);
+        self.prepare_renderer(device, queue, fonts, idx, glyph_areas, screen);
         self.next_renderer_idx += 1;
         GlyphRun { idx: idx as u32 }
     }
@@ -186,10 +188,12 @@ impl GlyphPipeline {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_renderer(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        fonts: &mut FontAssets,
         renderer_idx: usize,
         glyph_areas: &[GlyphArea],
         screen: PhysicalSize,
@@ -205,15 +209,12 @@ impl GlyphPipeline {
         for (area, &key) in glyph_areas.iter().zip(keys.iter()) {
             if !self.cache.contains_key(&key) {
                 let metrics = Metrics::new(area.font_size, area.line_height);
-                let mut buffer = Buffer::new(&mut self.font_system, metrics);
-                buffer.set_size(
-                    &mut self.font_system,
-                    Some(screen.width as f32),
-                    Some(screen.height as f32),
-                );
+                let fs = &mut fonts.font_system;
+                let mut buffer = Buffer::new(fs, metrics);
+                buffer.set_size(fs, Some(screen.width as f32), Some(screen.height as f32));
                 let attrs = Attrs::new().family(Family::Name(area.resolved_font_family()));
-                buffer.set_text(&mut self.font_system, &area.text, &attrs, Shaping::Advanced, None);
-                buffer.shape_until_scroll(&mut self.font_system, false);
+                buffer.set_text(fs, &area.text, &attrs, Shaping::Advanced, None);
+                buffer.shape_until_scroll(fs, false);
                 self.cache.insert(key, CachedBuffer { buffer, last_seen_frame: self.frame_counter });
             } else if let Some(entry) = self.cache.get_mut(&key) {
                 entry.last_seen_frame = self.frame_counter;
@@ -265,14 +266,15 @@ impl GlyphPipeline {
             })
             .collect();
 
+        let (font_system, swash_cache) = fonts.split();
         if let Err(e) = self.renderers[renderer_idx].prepare(
             device,
             queue,
-            &mut self.font_system,
+            font_system,
             &mut self.atlas,
             &self.viewport,
             text_areas,
-            &mut self.swash_cache,
+            swash_cache,
         ) {
             eprintln!("glyph prepare error: {e:?}");
         }
@@ -282,14 +284,6 @@ impl GlyphPipeline {
     #[cfg(any(test, debug_assertions))]
     pub fn cache_size(&self) -> usize {
         self.cache.len()
-    }
-
-    /// M14 Phase 78 (daw_01 #049): `TextEffectCompositor` が offscreen text render で
-    /// 同じ font / glyph rasterization を共有するための disjoint-field borrow accessor。
-    /// `Cache` (= glyphon pipeline cache、 Arc<Inner> で cheap) は別 instance を持つが、
-    /// font_system / swash_cache は重い (font 全 load + glyph raster cache) なので共有する。
-    pub fn font_system_and_swash(&mut self) -> (&mut FontSystem, &mut SwashCache) {
-        (&mut self.font_system, &mut self.swash_cache)
     }
 }
 

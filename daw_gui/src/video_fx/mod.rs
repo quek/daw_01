@@ -54,19 +54,24 @@ use daw_ui_platform::WinitWindow;
 
 /// preview / export の両レンダラを効果実行基盤から統一して触るための抽象。
 /// gui_01 #111 で公開された interop primitive をそのまま薄く束ねる。
+/// GPU 消失中 (r.md #42: スリープ復帰で device lost) は device / queue / target 確保が
+/// すべて `None` を返す。効果チェーンはその場合 **何も適用せず入力をそのまま返す**
+/// (`apply_chain` の早期 return)。通常 caller はその手前 (`Renderer::is_live()` /
+/// `OffscreenRenderer::is_live()`) で弾くので、ここは防御的な二重ガード。
 pub trait VideoFxRenderer {
-    fn fx_device(&self) -> &wgpu::Device;
-    fn fx_queue(&self) -> &wgpu::Queue;
+    fn fx_device(&self) -> Option<&wgpu::Device>;
+    fn fx_queue(&self) -> Option<&wgpu::Queue>;
     /// `handle` の wgpu テクスチャ (効果シェーダの sample 入力)。destroy 済は `None`。
     fn fx_raw_texture(&self, handle: TextureHandle) -> Option<&wgpu::Texture>;
     /// `RENDER_ATTACHMENT | TEXTURE_BINDING` な target を確保 (caller 管理 = この
     /// engine が pool で frame 跨ぎ使い回し、teardown で destroy)。`(handle, color view)`。
+    /// GPU 消失中は `None`。
     fn fx_create_render_target(
         &mut self,
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
-    ) -> (TextureHandle, wgpu::TextureView);
+    ) -> Option<(TextureHandle, wgpu::TextureView)>;
     fn fx_destroy_texture(&mut self, handle: TextureHandle);
     /// 効果 target / base pass の color format (preview = surface、export = Rgba8UnormSrgb)。
     fn fx_format(&self) -> wgpu::TextureFormat;
@@ -82,10 +87,10 @@ pub trait VideoFxRenderer {
 }
 
 impl VideoFxRenderer for Renderer<WinitWindow> {
-    fn fx_device(&self) -> &wgpu::Device {
+    fn fx_device(&self) -> Option<&wgpu::Device> {
         self.device()
     }
-    fn fx_queue(&self) -> &wgpu::Queue {
+    fn fx_queue(&self) -> Option<&wgpu::Queue> {
         self.queue()
     }
     fn fx_raw_texture(&self, handle: TextureHandle) -> Option<&wgpu::Texture> {
@@ -96,7 +101,7 @@ impl VideoFxRenderer for Renderer<WinitWindow> {
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
-    ) -> (TextureHandle, wgpu::TextureView) {
+    ) -> Option<(TextureHandle, wgpu::TextureView)> {
         self.create_render_target(width, height, format)
     }
     fn fx_destroy_texture(&mut self, handle: TextureHandle) {
@@ -116,11 +121,17 @@ impl VideoFxRenderer for Renderer<WinitWindow> {
 }
 
 impl VideoFxRenderer for OffscreenRenderer {
-    fn fx_device(&self) -> &wgpu::Device {
-        self.device()
+    fn fx_device(&self) -> Option<&wgpu::Device> {
+        if !self.is_live() {
+            return None;
+        }
+        Some(self.device())
     }
-    fn fx_queue(&self) -> &wgpu::Queue {
-        self.queue()
+    fn fx_queue(&self) -> Option<&wgpu::Queue> {
+        if !self.is_live() {
+            return None;
+        }
+        Some(self.queue())
     }
     fn fx_raw_texture(&self, handle: TextureHandle) -> Option<&wgpu::Texture> {
         self.raw_texture(handle)
@@ -130,8 +141,11 @@ impl VideoFxRenderer for OffscreenRenderer {
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
-    ) -> (TextureHandle, wgpu::TextureView) {
-        self.create_render_target(width, height, format)
+    ) -> Option<(TextureHandle, wgpu::TextureView)> {
+        if !self.is_live() {
+            return None;
+        }
+        Some(self.create_render_target(width, height, format))
     }
     fn fx_destroy_texture(&mut self, handle: TextureHandle) {
         self.destroy_texture(handle);
@@ -511,13 +525,15 @@ impl VideoFxEngine {
     /// `(w, h, format)` の未使用 target を 1 枚払い出す (なければ作成、format 不一致なら作り直し)。
     /// 払い出した target は frame 内 `in_use` になり、[`end_frame`](Self::end_frame) まで他の
     /// `apply_chain` 呼び出しへ再払い出しされない (= 遅延描画でも各レイヤーの効果出力が衝突しない)。
+    ///
+    /// GPU 消失中 (r.md #42) は新規 target を作れないので `None`。
     fn acquire<R: VideoFxRenderer>(
         &mut self,
         r: &mut R,
         w: u32,
         h: u32,
         format: wgpu::TextureFormat,
-    ) -> (TextureHandle, wgpu::TextureView) {
+    ) -> Option<(TextureHandle, wgpu::TextureView)> {
         let sp = self
             .pool
             .entry((w, h))
@@ -531,11 +547,11 @@ impl VideoFxEngine {
         if let Some(t) = sp.targets.iter_mut().find(|t| !t.in_use) {
             t.in_use = true;
             t.idle = 0;
-            return (t.handle, t.view.clone());
+            return Some((t.handle, t.view.clone()));
         }
-        let (handle, view) = r.fx_create_render_target(w, h, format);
+        let (handle, view) = r.fx_create_render_target(w, h, format)?;
         sp.targets.push(PoolTarget { handle, view: view.clone(), in_use: true, idle: 0 });
-        (handle, view)
+        Some((handle, view))
     }
 
     /// frame ごとに 1 回呼ぶ (preview は `render` 前の冒頭、export は build_frame_scene 冒頭)。
@@ -615,28 +631,35 @@ impl VideoFxEngine {
         }
 
         let format = r.fx_format();
+        // GPU 消失中 (r.md #42) は効果を適用せず入力をそのまま返す。通常は caller が
+        // `is_live()` で手前を弾くので、ここは防御的な二重ガード。
+        let (Some(device), Some(queue)) = (r.fx_device().cloned(), r.fx_queue().cloned()) else {
+            return src;
+        };
         // feedback (history) チェーンなら per-chain の前フレーム target を確保 (無ければ作成、
         // 寸法変化で作り直し)。History パスはこの target を `history(uv)` で読み、chain 末で
         // 今フレーム出力をここへ退避する。それ以外のチェーンでは binding 3 は入力 texture を
         // dummy として埋める (シェーダが binding 3 を宣言しないので無視される)。
         let needs_hist = chain.iter().any(|e| e.def.needs_history);
         let hist_view = if needs_hist {
-            Some(self.ensure_history_target(r, chain_key, width, height, format))
+            self.ensure_history_target(r, chain_key, width, height, format)
         } else {
             None
         };
         // この呼び出し専用の出力 target を確保 (frame 内 in_use で他レイヤーと分離)。単一パスは
         // 1 枚、複数パスは ping-pong 用に 2 枚。返した handle は end_frame まで上書きされないので、
         // 遅延描画 (frame 末に 1 回 render) でも同寸の他レイヤーと衝突しない。
-        let t0 = self.acquire(r, width, height, format);
+        let Some(t0) = self.acquire(r, width, height, format) else {
+            return src;
+        };
         let t1 = if passes.len() > 1 {
-            Some(self.acquire(r, width, height, format))
+            match self.acquire(r, width, height, format) {
+                Some(t) => Some(t),
+                None => return src,
+            }
         } else {
             None
         };
-        // borrow を分離: device / queue は Arc backed clone で取り出してから pipeline を使う。
-        let device = r.fx_device().clone();
-        let queue = r.fx_queue().clone();
         let sampler = self.ensure_common(&device).sampler.clone();
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -791,6 +814,7 @@ impl VideoFxEngine {
 
     /// feedback chain の前フレーム target を取得 (無ければ作成、寸法変化で作り直し)。今 frame
     /// 使われたので `idle` を 0 に戻す。返り値はサンプル (history) / 描画 (blit 退避) 兼用 view。
+    /// GPU 消失中 (r.md #42) は作成できないので `None` (= feedback 無しで描く)。
     fn ensure_history_target<R: VideoFxRenderer>(
         &mut self,
         r: &mut R,
@@ -798,7 +822,7 @@ impl VideoFxEngine {
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
-    ) -> wgpu::TextureView {
+    ) -> Option<wgpu::TextureView> {
         let recreate = self
             .history_targets
             .get(&chain_key)
@@ -807,7 +831,7 @@ impl VideoFxEngine {
             if let Some(old) = self.history_targets.remove(&chain_key) {
                 r.fx_destroy_texture(old.handle);
             }
-            let (handle, view) = r.fx_create_render_target(width, height, format);
+            let (handle, view) = r.fx_create_render_target(width, height, format)?;
             self.history_targets
                 .insert(chain_key, HistoryTarget { handle, view, width, height, idle: 0 });
         }
@@ -816,7 +840,7 @@ impl VideoFxEngine {
             .get_mut(&chain_key)
             .expect("history target just ensured");
         ht.idle = 0;
-        ht.view.clone()
+        Some(ht.view.clone())
     }
 }
 

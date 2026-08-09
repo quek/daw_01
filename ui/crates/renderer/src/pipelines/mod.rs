@@ -21,9 +21,9 @@ use self::line::{LinePipeline, LineRun};
 use self::rect::{RectPipeline, RectRun};
 use self::text_effect::TextEffectCompositor;
 use self::texture::{TexturePipeline, TextureRun};
+use crate::fonts::FontAssets;
 use crate::scene::{GlyphArea, LineBatch, Primitive, Rect, RectCommand, TexturedQuad};
 use crate::texture_store::TextureStore;
-use glyphon::{FontSystem, SwashCache};
 
 /// M14 Phase 78 (daw_01 #049): scene primitive を walk して effect 付き `Primitive::Glyph` を
 /// `TextEffectCompositor` で render → `Primitive::Texture` に substitute する。 effect 無し
@@ -42,8 +42,7 @@ pub fn prepare_text_effects(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
-    font_system: &mut FontSystem,
-    swash_cache: &mut SwashCache,
+    fonts: &mut FontAssets,
     texture_store: &mut TextureStore,
     texture_sampler: &wgpu::Sampler,
     texture_bgl: &wgpu::BindGroupLayout,
@@ -56,8 +55,7 @@ pub fn prepare_text_effects(
                     device,
                     queue,
                     encoder,
-                    font_system,
-                    swash_cache,
+                    fonts,
                     texture_store,
                     texture_sampler,
                     texture_bgl,
@@ -139,8 +137,8 @@ fn primitive_kind(p: &Primitive) -> PrimKind {
 /// Texture primitive が混ざっていれば silently skip (Ui レイヤで base 側に振り分けるのが
 /// 通常パスなので、 popup に来る Texture は誤用)。
 ///
-/// 引数数は 8 (= clippy default 7 超過)。 4 pipeline + texture option + device/queue + screen と
-/// 本質的に多入力なので `Config` 構造体に集約しても意味的に意味不明な bag になるため `#[allow]`。
+/// 引数数は 9 (= clippy default 7 超過)。 4 pipeline + texture option + device/queue + fonts +
+/// screen と本質的に多入力なので `Config` 構造体に集約しても意味不明な bag になるため `#[allow]`。
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_runs(
     primitives: &[Primitive],
@@ -150,6 +148,7 @@ pub fn enqueue_runs(
     mut texture: Option<&mut TexturePipeline>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    fonts: &mut FontAssets,
     screen: PhysicalSize,
 ) -> Vec<RunHandle> {
     let mut runs: Vec<RunHandle> = Vec::new();
@@ -182,7 +181,9 @@ pub fn enqueue_runs(
                     .iter()
                     .filter_map(|p| if let Primitive::Glyph(g) = p { Some(g.clone()) } else { None })
                     .collect();
-                runs.push(RunHandle::Glyph(glyph.enqueue_run(device, queue, &buf, screen)));
+                runs.push(RunHandle::Glyph(
+                    glyph.enqueue_run(device, queue, fonts, &buf, screen),
+                ));
             }
             PrimKind::Texture => {
                 let Some(tex_pipeline) = texture.as_deref_mut() else {

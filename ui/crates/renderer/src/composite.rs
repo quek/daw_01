@@ -41,6 +41,7 @@
 
 use daw_ui_platform::PhysicalSize;
 
+use crate::fonts::FontAssets;
 use crate::pipelines::{
     enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, prepare_text_effects,
     rect::RectPipeline, render_runs, text_effect::TextEffectCompositor, texture::TexturePipeline,
@@ -167,6 +168,7 @@ pub(crate) fn composite_scene(
     target_format: wgpu::TextureFormat,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    fonts: &mut FontAssets,
     rect: &mut RectPipeline,
     line: &mut LinePipeline,
     glyph: &mut GlyphPipeline,
@@ -191,15 +193,13 @@ pub(crate) fn composite_scene(
     });
 
     // 3. effect 付き Glyph を offscreen で焼いて Primitive::Texture に substitute。
-    let (font_system, swash_cache) = glyph.font_system_and_swash();
     let substituted = prepare_text_effects(
         &scene.primitives,
         text_effect,
         device,
         queue,
         &mut encoder,
-        font_system,
-        swash_cache,
+        fonts,
         texture_store,
         texture.sampler(),
         texture.texture_bind_group_layout(),
@@ -214,6 +214,7 @@ pub(crate) fn composite_scene(
         Some(texture),
         device,
         queue,
+        fonts,
         size,
     );
 
