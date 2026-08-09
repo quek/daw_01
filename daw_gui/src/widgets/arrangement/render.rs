@@ -228,27 +228,18 @@ pub(super) fn render_arrangement_heavy(
                         }
                         let is_selected = selected_set.contains(&key);
                         match content {
-                            ClipContentDraw::Audio {
-                                buffer,
-                                start_frames,
-                                end_frames,
-                                source_id,
-                                audible_frac,
-                            } => {
+                            ClipContentDraw::Audio { events } => {
                                 draw_clip_waveform_inner(
                                     hctx,
                                     key,
                                     r,
-                                    buffer,
-                                    *start_frames,
-                                    *end_frames,
-                                    *source_id,
+                                    c.len_beats,
+                                    events,
                                     is_selected,
-                                    lanes.x,
+                                    lanes,
                                     inset,
                                     &style_copy,
                                     "audio_clip_wf",
-                                    *audible_frac,
                                 );
                             }
                             ClipContentDraw::Midi { notes, len_beats } => {

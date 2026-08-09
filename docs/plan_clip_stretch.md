@@ -236,3 +236,54 @@ mode ごとの合成は render loop が持つ:
 
 未実装: `AudioEvent.formant_semitones`（モデルに field だけ有り、DSP も UI も無し）。
 フォルマント保持には位相ボコーダ / PSOLA が要るので別対応。
+
+## 7. 波形描画 = `event_wave_spans` を SSoT に（2026-08-09, r.md #41）
+
+§6 で確立した写像は **再生側だけ**の SSoT で、描画側は「1 event = 1 連続レンジ」を返す
+`audible_source_span` を別に持っていた。Slice はその関数で必ず `rate = stretch` を使い
+`窓 / (source_fpb × stretch) == len_beats` が恒等成立するため、**常に「窓全体を clip 幅
+いっぱいに引き伸ばした連続波形」に退化**していた（= r.md #41「スライスの配置ではなく
+連続波形のまま」の直接原因）。10053df のコミットメッセージが「別件」としていた項目。
+
+`audible_source_span` を廃止し、`common::audio_render::event_wave_spans` に置き換えた。
+戻り値は **span 列**（`WaveSpan { start_beat, end_beat, source_start, source_end, reversed }`）で、
+「出力の event-local 拍区間 → source frame 範囲」の区分線形写像を並べたもの。
+engine SR / current bpm は約分されて消えるので、GUI が `song.bpm` と source SR だけで
+engine と同じ写像を再現できる。
+
+| mode | span |
+|---|---|
+| `Raw` | 1 本。1 拍 = `source_fpb × pitch` frame |
+| `Repitch` | 1 本。1 拍 = `source_fpb × stretch × pitch` frame |
+| `Stretch` | warp marker ≥ 2 なら marker 境界で区切った区分線形（`warp_source_frame`）、無ければ 1 本で `source_fpb × stretch` |
+| `Slice` | onset ごとに 1 本 |
+
+Slice の式（`source_fpb = source_sr × 60 / bpm`、`place_fpb = source_fpb × stretch`
+（恒等的に `窓 / clip 長`）、`read_fpb = source_fpb × pitch`）:
+
+- trigger 拍 `start_beat_i = onsets[i] / place_fpb`
+- 鳴る拍数 `= (min(onsets[i+1], 窓) − onsets[i]) / read_fpb`（slice 本体は伸縮しない）
+- `end_beat_i = min(start_beat_i + 鳴る拍数, start_beat_{i+1}, clip 長)`
+- ⇒ `stretch < pitch` で **gap**（無音・フェード無しのハードカット）、`stretch > pitch` で **cut**。
+  伸縮もピッチ変更もしていない取り込み直後は隙間ゼロで連続波形と一致する
+
+どの mode でも「窓を鳴らし切って余った」区間には span を張らない（= 無音）。`reversed` は
+窓全体を反転して読む（`source_frame_lerp` と同じく slice 単位ではない）ので、span の source
+範囲を窓の反対側へ写して `reversed` を立てる。
+
+描画側は mode 分岐を持たない:
+- daw-ui `Ui::waveform_segments`（1 id・1 LOD ピラミッド・複数区間、`WaveformView.reversed`、
+  scissor による区間カリング）。`Ui::waveform` はその 1 区間ラッパ。
+- アレンジビュー `draw_clip_waveform_inner`: clip 拍 → x の線形写像 1 本 + 全 event の span を
+  そのまま並べる（旧: 先頭 event 1 件のみ + `audible_frac` で幅を縮める）。gap には薄い中央線、
+  Slice はスライス頭に区切り線。
+- オーディオエディタ: 旧 `markers.len() >= 2` 分岐を撤去（再生が marker を無視する
+  Raw / Repitch / Slice でも warp 形状を描いていた同種のバグ）。Slice は transient マーカーを描く。
+
+**束縛テスト**: `daw_audio` の `wave_span_binding_tests` が ramp 素材を実レンダリングし、
+「span 区間は span の source 写像どおりに鳴る / span の無い区間は完全無音」を assert する。
+片方の写像だけ変えると CI が落ちる（従来はコメントでしか結び付いていなかった）。
+
+未実装（Ableton にはあるが daw_01 に無い）: Transient Loop Mode（gap を loop で埋める）、
+Transient Envelope（slice 境界のフェード）。現状 gap 境界は無フェードのハードカットなので、
+素材によっては境界でクリックノイズが出る（`slice_sample_at` が 0.0 を返す）。

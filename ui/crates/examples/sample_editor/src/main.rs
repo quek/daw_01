@@ -307,6 +307,7 @@ impl App {
                     start_sample: m.viewport.view_start as u64,
                     len_samples: m.viewport.view_len as u64,
                     vertical_gain: m.vertical_gain,
+                    reversed: false,
                 };
                 let render_mode = m.forced_mode.unwrap_or(WaveformRenderMode::Auto);
                 let style = WaveformStyle {

@@ -1217,6 +1217,281 @@ mod stretch_sample_rate_tests {
     }
 }
 
+/// r.md #41: **波形描画の写像 (`common::audio_render::event_wave_spans`) と、
+/// 実レンダリング出力が一致する**ことを直接 assert する束縛テスト。
+///
+/// 従来この 2 つはコメント (`render_audio_events` の time_stride / read_stride 節)
+/// でしか結び付いておらず、 片方だけ変えても CI が落ちなかった。 ここで
+/// 「span が張られている拍区間は鳴っていて、 span の source 写像どおりの音が出る」
+/// 「span が無い拍区間は完全に無音」 を ramp 素材で検証し、 描画と再生の乖離を
+/// 構造的に検出できるようにする。
+#[cfg(test)]
+mod wave_span_binding_tests {
+    use super::*;
+    use common::audio_render::{WaveSpan, event_wave_spans};
+    use common::model::AudioEvent;
+
+    const ENGINE_SR: u32 = 48_000;
+    const BPM: f32 = 120.0;
+    /// 1 秒 (= 120 BPM で 2 拍) ぶんの ramp 素材。
+    const SOURCE_FRAMES: u64 = 48_000;
+
+    /// 値 = 位置 の ramp 素材 (出力値がそのまま「source のどこを読んでいるか」)。
+    fn ramp(source_sr: u32) -> AudioSourceBuffer {
+        let frames = u64::from(source_sr);
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| i as f32 / (frames - 1) as f32)
+            .collect();
+        AudioSourceBuffer {
+            sample_rate: source_sr,
+            channels: 1,
+            frames,
+            samples: vec![samples],
+        }
+    }
+
+    fn slice_event(len_beats: f64, semis: f32, onsets: Vec<u64>) -> AudioEvent {
+        AudioEvent {
+            source_start_frames: 0,
+            source_end_frames: SOURCE_FRAMES,
+            event_length_beats: len_beats,
+            stretch_mode: StretchMode::Slice,
+            pitch_semitones: semis,
+            onsets,
+            ..AudioEvent::default()
+        }
+    }
+
+    /// model の `AudioEvent` を `compile_audio_schedule` と **同じ写像** で
+    /// `RenderedEvent` に落とし、 clip 全長を 512 frame ずつ render する。
+    fn render_model_event(event: &AudioEvent, source_sr: u32) -> Vec<f32> {
+        let buffer = ramp(source_sr);
+        let mut onsets = event.onsets.clone();
+        onsets.sort_unstable();
+        onsets.dedup();
+        let mut beat_markers = event.beat_markers.clone();
+        beat_markers.sort_by(|a, b| a.locked_beat.total_cmp(&b.locked_beat));
+        beat_markers.dedup_by(|a, b| (a.locked_beat - b.locked_beat).abs() < 1e-9);
+        let rendered = RenderedEvent {
+            track_idx: 0,
+            clip_idx: 0,
+            start_beat: 0.0,
+            end_beat: event.event_length_beats,
+            source_id: 1,
+            source_start_frames: event.source_start_frames,
+            source_end_frames: event.source_end_frames,
+            gain_lin: 1.0,
+            pan: 0.0,
+            sr_ratio: sample_rate_ratio(buffer.sample_rate, ENGINE_SR),
+            pitch_factor: pitch_factor(event.pitch_semitones),
+            stretch_ratio: stretch_ratio_for(
+                event.source_end_frames.saturating_sub(event.source_start_frames),
+                buffer.sample_rate,
+                event.event_length_beats,
+                BPM,
+            ),
+            nominal_bpm: BPM,
+            fade_in_beats: 0.0,
+            fade_out_beats: 0.0,
+            fade_in_curve: FadeCurve::Linear,
+            fade_out_curve: FadeCurve::Linear,
+            reversed: event.reversed,
+            stretch_mode: event.stretch_mode,
+            onsets,
+            beat_markers,
+        };
+        let mut sources = HashMap::new();
+        sources.insert(1u32, Arc::new(buffer));
+        let renderer = AudioClipRenderer { schedule: vec![rendered], sources };
+
+        let samples_per_beat = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
+        let total = (event.event_length_beats * samples_per_beat) as usize;
+        let mut rings = vec![[(u64::MAX, 0u64); 8]; 4];
+        let mut accum = vec![(u64::MAX, 0.0f64); 4];
+        let mut out = Vec::with_capacity(total);
+        while out.len() < total {
+            let frames = 512.min(total - out.len());
+            let mut l = vec![0.0f32; frames];
+            let mut r = vec![0.0f32; frames];
+            render_audio_events(
+                &renderer,
+                0,
+                &mut l,
+                &mut r,
+                out.len() as f64 / samples_per_beat,
+                BPM,
+                ENGINE_SR,
+                frames as u32,
+                f64::from(BPM),
+                &mut rings,
+                &mut accum,
+            );
+            out.extend_from_slice(&l);
+        }
+        out
+    }
+
+    /// span の x 方向 fraction `f` が指す source frame (widget の写像と同じ:
+    /// `reversed` なら左端が `source_end`)。
+    fn span_source_at(s: &WaveSpan, f: f64) -> f64 {
+        let len = (s.source_end - s.source_start) as f64;
+        if s.reversed {
+            s.source_end as f64 - len * f
+        } else {
+            s.source_start as f64 + len * f
+        }
+    }
+
+    /// 「span が張られた区間は span の写像どおりに鳴り、 span 外は完全無音」 を assert。
+    fn assert_render_matches_spans(event: &AudioEvent, source_sr: u32, label: &str) {
+        let out = render_model_event(event, source_sr);
+        let mut spans = Vec::new();
+        event_wave_spans(event, source_sr, BPM, &mut spans);
+        assert!(!spans.is_empty(), "{label}: span が 1 本も無い");
+        let spb = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
+        let src_max = (u64::from(source_sr) - 1) as f64;
+        // 境界の整数丸め (trigger の floor / buffer 分割) を避ける inset。
+        const INSET: usize = 64;
+
+        for (i, s) in spans.iter().enumerate() {
+            let dur = s.end_beat - s.start_beat;
+            for f in [0.25_f64, 0.5, 0.75] {
+                let idx = ((s.start_beat + dur * f) * spb) as usize;
+                if idx >= out.len() {
+                    continue;
+                }
+                let expect = (span_source_at(s, f) / src_max) as f32;
+                let got = out[idx];
+                assert!(
+                    (got - expect).abs() < 0.02,
+                    "{label}: span {i} ({s:?}) の {f} 地点は source {expect} が鳴るべき、 got {got}"
+                );
+            }
+        }
+
+        // span と span の隙間 (= gap) / 先頭前 / 末尾後は engine も完全無音。
+        let mut silent_ranges: Vec<(f64, f64)> = Vec::new();
+        if spans[0].start_beat > 0.0 {
+            silent_ranges.push((0.0, spans[0].start_beat));
+        }
+        for w in spans.windows(2) {
+            if w[1].start_beat > w[0].end_beat {
+                silent_ranges.push((w[0].end_beat, w[1].start_beat));
+            }
+        }
+        let last_end = spans[spans.len() - 1].end_beat;
+        if last_end < event.event_length_beats {
+            silent_ranges.push((last_end, event.event_length_beats));
+        }
+        for (b0, b1) in silent_ranges {
+            let lo = (b0 * spb) as usize + INSET;
+            let hi = ((b1 * spb) as usize).min(out.len()).saturating_sub(INSET);
+            if hi <= lo {
+                continue;
+            }
+            for (k, v) in out[lo..hi].iter().enumerate() {
+                assert!(
+                    v.abs() < 1e-6,
+                    "{label}: {b0}..{b1} 拍は無音のはず、 out[{}] = {v}",
+                    lo + k
+                );
+            }
+        }
+    }
+
+    /// 伸ばした Slice clip: trigger は広がるが slice 本体は native rate → gap が空く。
+    /// **これが r.md #41 の症状そのもの** (旧描画は連続波形を全幅に引き伸ばしていた)。
+    #[test]
+    fn slice_spans_match_render_with_gaps() {
+        let ev = slice_event(4.0, 0.0, vec![0, 12_000, 24_000, 36_000]);
+        let mut spans = Vec::new();
+        event_wave_spans(&ev, 48_000, BPM, &mut spans);
+        assert_eq!(spans.len(), 4);
+        assert!(
+            spans[0].end_beat < spans[1].start_beat - 1e-9,
+            "伸ばした Slice は gap が空く: {spans:?}"
+        );
+        assert_render_matches_spans(&ev, 48_000, "slice gap");
+    }
+
+    /// 詰めた Slice clip: 次 trigger が先に来て前 slice が cut される (gap 無し)。
+    #[test]
+    fn slice_spans_match_render_with_cuts() {
+        let ev = slice_event(1.0, 0.0, vec![0, 12_000, 24_000, 36_000]);
+        assert_render_matches_spans(&ev, 48_000, "slice cut");
+    }
+
+    /// 移調した Slice clip: trigger は動かず slice 本体だけ速くなる → gap。
+    #[test]
+    fn slice_spans_match_render_when_pitched() {
+        let ev = slice_event(2.0, 12.0, vec![0, 12_000, 24_000, 36_000]);
+        assert_render_matches_spans(&ev, 48_000, "slice pitch");
+    }
+
+    /// 伸縮なしの Slice clip は隙間ゼロ (= 従来の連続波形と同じ絵) で、 かつ
+    /// 各 slice が正しい source を鳴らす。 取り込み直後の回帰検出。
+    #[test]
+    fn slice_spans_match_render_when_not_stretched() {
+        let ev = slice_event(2.0, 0.0, vec![0, 12_000, 24_000, 36_000]);
+        let mut spans = Vec::new();
+        event_wave_spans(&ev, 48_000, BPM, &mut spans);
+        for w in spans.windows(2) {
+            assert!(
+                (w[1].start_beat - w[0].end_beat).abs() < 1e-9,
+                "伸縮なしなら隙間ゼロ: {spans:?}"
+            );
+        }
+        assert_render_matches_spans(&ev, 48_000, "slice lockstep");
+    }
+
+    /// source SR ≠ engine SR でも span と実出力が一致する (SR 補正漏れの回帰検出)。
+    #[test]
+    fn slice_spans_match_render_at_other_sample_rate() {
+        for source_sr in [44_100u32, 96_000] {
+            let ev = AudioEvent {
+                source_end_frames: u64::from(source_sr),
+                ..slice_event(4.0, 0.0, vec![0, u64::from(source_sr) / 4, u64::from(source_sr) / 2])
+            };
+            assert_render_matches_spans(&ev, source_sr, &format!("slice {source_sr}Hz"));
+        }
+    }
+
+    /// tape 系 (Raw) をピッチアップすると途中で鳴り終わる。 span も同じ拍で終わる。
+    #[test]
+    fn raw_pitched_span_matches_render() {
+        let ev = AudioEvent {
+            source_start_frames: 0,
+            source_end_frames: SOURCE_FRAMES,
+            event_length_beats: 4.0,
+            stretch_mode: StretchMode::Raw,
+            pitch_semitones: 12.0,
+            ..AudioEvent::default()
+        };
+        assert_render_matches_spans(&ev, 48_000, "raw pitched");
+    }
+
+    /// 逆再生は窓全体を反転して読む。 span の `reversed` 写像が実出力と一致する
+    /// (描画側は今まで `reversed` を一切見ておらず、 波形が嘘をついていた)。
+    #[test]
+    fn reversed_span_matches_render() {
+        let ev = AudioEvent {
+            source_start_frames: 0,
+            source_end_frames: SOURCE_FRAMES,
+            event_length_beats: 2.0,
+            stretch_mode: StretchMode::Raw,
+            reversed: true,
+            ..AudioEvent::default()
+        };
+        assert_render_matches_spans(&ev, 48_000, "raw reversed");
+
+        let ev = AudioEvent {
+            reversed: true,
+            ..slice_event(4.0, 0.0, vec![0, 12_000, 24_000, 36_000])
+        };
+        assert_render_matches_spans(&ev, 48_000, "slice reversed");
+    }
+}
+
 /// E5 (r.md #8): granular grain-trigger lock-in。 grain の source offset が trigger 時の値に
 /// 固定され、 後続 buffer で tempo_ratio が変わっても再計算されない (= tempo 変化での source
 /// position 跳び = click を防ぐ) ことを検証する。

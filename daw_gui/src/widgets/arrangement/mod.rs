@@ -46,8 +46,8 @@ use crate::widgets::ruler_ops::{
 use crate::widgets::time_grid::{BarBeatGridStyle, TimeGridExt, TimeRulerStyle};
 use daw_ui_core::widgets::toggle_button::ToggleButtonStyle;
 use daw_ui_core::{
-    ChannelLayout, MeterScale, SampleSlices, WaveformRenderMode, WaveformSource, WaveformStyle,
-    WaveformView,
+    ChannelLayout, MeterScale, SampleSlices, WaveformRenderMode, WaveformSegment, WaveformSource,
+    WaveformStyle, WaveformView,
 };
 
 use crate::audio_source_cache::AudioSourceBuffer;

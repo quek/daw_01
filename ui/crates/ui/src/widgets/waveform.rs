@@ -1,6 +1,9 @@
-//! 波形表示ウィジェット (`Ui::waveform`)。
+//! 波形表示ウィジェット (`Ui::waveform` / `Ui::waveform_segments`)。
 //!
 //! 設計の要点 (詳細は `docs/plan.html`「波形表示 UI 詳細設計」):
+//! - 1 ウィジェット = **複数区間** (`WaveformSegment`) で、区間ごとに (rect ↔ サンプル
+//!   範囲) の線形写像を持つ。区間の間は描かない = 無音の隙間。`Ui::waveform` は
+//!   1 区間の薄いラッパ。LOD ピラミッドは区間数によらず id ごとに 1 つ。
 //! - 入力は **生サンプルの借用** (`SampleSlices<'s>`) と `valid_len` + `generation`。
 //!   `generation` が一致すれば内部 LOD ピラミッドを再利用する。
 //! - LOD ピラミッド (`WaveformPyramid`) は `WidgetState` の blanket impl 経由で
@@ -86,12 +89,29 @@ pub struct WaveformView {
     pub start_sample: u64,
     pub len_samples: u64,
     pub vertical_gain: f32,
+    /// この範囲を **右→左** に描く (= rect 左端が `start_sample + len_samples`)。
+    /// 逆再生 (`AudioEvent.reversed`) のように「時間が進むと source を末尾から
+    /// 手前へ読む」 素材を、サンプル範囲を分割せずそのまま渡すための向き指定。
+    /// ヒットテストも同じ写像で戻す。
+    pub reversed: bool,
 }
 
 impl Default for WaveformView {
     fn default() -> Self {
-        Self { start_sample: 0, len_samples: 0, vertical_gain: 1.0 }
+        Self { start_sample: 0, len_samples: 0, vertical_gain: 1.0, reversed: false }
     }
+}
+
+/// 1 ウィジェットの中に描く波形 1 区間 (rect ↔ サンプル範囲の線形写像)。
+///
+/// [`Ui::waveform_segments`] は複数区間を **1 つの LOD ピラミッド**で描く。
+/// 区間ごとに `Ui::waveform` を呼ぶと WidgetId ごとにピラミッドが作られ、
+/// source 全長ぶんのメモリが区間数だけ複製されてしまう (スライス 30 個の
+/// ループで 17 MB 超)。 スライス配置 / warp 区間 / 逆再生はこの型で表す。
+#[derive(Debug, Clone, Copy)]
+pub struct WaveformSegment {
+    pub rect: Rect,
+    pub view: WaveformView,
 }
 
 /// チャンネルレイアウト。
@@ -592,8 +612,10 @@ fn build_peak_segments(
             chosen_level.and_then(|l| l.per_channel.get(ch).map(Vec::as_slice));
 
         for px in 0..pixel_count {
-            let p_start = view_start + (px as f64) * samples_per_pixel;
-            let p_end = view_start + (px as f64 + 1.0) * samples_per_pixel;
+            // `reversed` は同じサンプル範囲を右→左に読む (x ↔ sample の対応だけ反転)。
+            let src_px = if view.reversed { pixel_count - 1 - px } else { px };
+            let p_start = view_start + (src_px as f64) * samples_per_pixel;
+            let p_end = p_start + samples_per_pixel;
             let pair = peak_in_view_cached(
                 cached_col,
                 chosen_level.map(|l| l.decimation as usize),
@@ -726,7 +748,7 @@ fn build_sample_polyline_segments(
             let sample_idx = s_start_int + i;
             let s = sample_at(&src.samples, ch, sample_idx);
             let local_pos = sample_idx as f64 - view_start;
-            let x = rect.x + (local_pos * x_per_sample) as f32;
+            let x = rect.x + (sample_x_offset(local_pos, view_len, view.reversed) * x_per_sample) as f32;
             let v = (s * view.vertical_gain).clamp(-1.0, 1.0);
             let y = ch_mid - v * ch_half;
             let is_clipped = s.abs() > 1.0;
@@ -803,7 +825,7 @@ fn build_sample_polyline_markers(
             let sample_idx = s_start_int + i;
             let s = sample_at(&src.samples, ch, sample_idx);
             let local_pos = sample_idx as f64 - view_start;
-            let x = rect.x + (local_pos * x_per_sample) as f32;
+            let x = rect.x + (sample_x_offset(local_pos, view_len, view.reversed) * x_per_sample) as f32;
             let v = (s * view.vertical_gain).clamp(-1.0, 1.0);
             let y = ch_mid - v * ch_half;
             let is_clipped = s.abs() > 1.0;
@@ -820,6 +842,14 @@ fn build_sample_polyline_markers(
     }
 
     markers
+}
+
+/// view 内サンプル位置 `local_pos` (= `sample_idx - view.start_sample`) を
+/// rect 左端からの x オフセット (サンプル単位) に写す。 `reversed` なら
+/// 右→左 (= `view_len - local_pos`)。 `SamplePolyline` の線と点で共有する。
+#[inline]
+fn sample_x_offset(local_pos: f64, view_len: f64, reversed: bool) -> f64 {
+    if reversed { view_len - local_pos } else { local_pos }
 }
 
 /// 生サンプルから 1 サンプル分の値を取り出す (channels = 0 / 範囲外は 0.0)。
@@ -941,8 +971,9 @@ fn build_rms_bar_segments(
             chosen_level.and_then(|l| l.per_channel.get(ch).map(Vec::as_slice));
 
         for px in 0..pixel_count {
-            let p_start = view_start + (px as f64) * samples_per_pixel;
-            let p_end = view_start + (px as f64 + 1.0) * samples_per_pixel;
+            let src_px = if view.reversed { pixel_count - 1 - px } else { px };
+            let p_start = view_start + (src_px as f64) * samples_per_pixel;
+            let p_end = p_start + samples_per_pixel;
             let rms = rms_in_view_cached(
                 cached_col,
                 chosen_level.map(|l| l.decimation as usize),
@@ -1005,6 +1036,149 @@ fn peak_in_view_cached(
 // Public widget API
 // ============================================================
 
+/// scissor (`Ui::current_clip`) と交差しない区間を捨て、はみ出す区間は rect と
+/// サンプル範囲を **同じ比率で** 切り詰める。
+///
+/// `PeakLines` / `RmsBars` のセグメント生成は `rect.w` の pixel ループなので、
+/// 画面外に大きくはみ出す rect をそのまま渡すとコストが rect 幅に比例して跳ねる。
+/// ここで画面内に有界化することで、アプリ側が手書きのクリップ計算を持たなくて済む。
+fn cull_segment(seg: &WaveformSegment, clip: Option<Rect>) -> Option<WaveformSegment> {
+    let r = seg.rect;
+    if r.w <= 0.0 || r.h <= 0.0 {
+        return None;
+    }
+    let Some(c) = clip else {
+        return Some(*seg);
+    };
+    if r.y >= c.y + c.h || r.y + r.h <= c.y {
+        return None;
+    }
+    let x0 = r.x.max(c.x);
+    let x1 = (r.x + r.w).min(c.x + c.w);
+    if x1 <= x0 {
+        return None;
+    }
+    if x0 <= r.x && x1 >= r.x + r.w {
+        return Some(*seg);
+    }
+    let f0 = f64::from((x0 - r.x) / r.w).clamp(0.0, 1.0);
+    let f1 = f64::from((x1 - r.x) / r.w).clamp(0.0, 1.0);
+    let start = seg.view.start_sample as f64;
+    let len = seg.view.len_samples as f64;
+    // `reversed` は左端が範囲末尾なので、x の [f0, f1] は sample の [1-f1, 1-f0]。
+    let (s0, s1) = if seg.view.reversed {
+        (start + (1.0 - f1) * len, start + (1.0 - f0) * len)
+    } else {
+        (start + f0 * len, start + f1 * len)
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(WaveformSegment {
+        rect: Rect { x: x0, y: r.y, w: x1 - x0, h: r.h },
+        view: WaveformView {
+            start_sample: s0.max(0.0) as u64,
+            len_samples: ((s1 - s0).max(0.0) as u64).max(1),
+            ..seg.view
+        },
+    })
+}
+
+/// 全区間 + source + style を畳み込んだ `with_widget_node` の input hash。
+/// 一致すれば LOD 再構築も描画もスキップされる (M4 Phase 12)。
+/// 注: Rust の `Hash` 実装は tuple 要素 12 個まで。ネスト tuple で回避。
+fn segments_input_hash(
+    source: &WaveformSource<'_>,
+    segments: &[WaveformSegment],
+    style: WaveformStyle,
+) -> u64 {
+    let mut h = hash_inputs((
+        b"waveform",
+        (source.generation, source.valid_len as u64, source.sample_rate),
+        style.line_width_px.to_bits(),
+        (
+            style.fg.r.to_bits(),
+            style.fg.g.to_bits(),
+            style.fg.b.to_bits(),
+            style.fg.a.to_bits(),
+        ),
+        (
+            style.fg_clipped.r.to_bits(),
+            style.fg_clipped.g.to_bits(),
+            style.fg_clipped.b.to_bits(),
+            style.fg_clipped.a.to_bits(),
+        ),
+        style.channel_layout,
+        style.render_mode,
+        segments.len() as u64,
+    ));
+    for seg in segments {
+        h = hash_inputs((
+            h,
+            (
+                seg.rect.x.to_bits(),
+                seg.rect.y.to_bits(),
+                seg.rect.w.to_bits(),
+                seg.rect.h.to_bits(),
+            ),
+            (
+                seg.view.start_sample,
+                seg.view.len_samples,
+                seg.view.vertical_gain.to_bits(),
+            ),
+            seg.view.reversed,
+        ));
+    }
+    h
+}
+
+/// カリング済み 1 区間を scene に積む。
+///
+/// M5 Phase 15: `render_mode` を resolve して SamplePolyline / PeakLines を分岐。
+/// SamplePolyline のときは LOD ピラミッドを触らず生サンプルから直接描画する
+/// (samples_per_pixel < 1.0 = ピラミッド無意味な領域)。
+fn draw_waveform_segment<'a, M: ?Sized + 'static>(
+    ui: &mut Ui<'a, M>,
+    wid: WidgetId,
+    source: &WaveformSource<'_>,
+    seg: &WaveformSegment,
+    style: WaveformStyle,
+) {
+    let (rect, view) = (seg.rect, seg.view);
+    let view_len = view.len_samples.max(1) as f64;
+    let samples_per_pixel = view_len / f64::from(rect.w.max(1.0));
+    let effective_mode = resolve_render_mode(style.render_mode, samples_per_pixel);
+    let lines = match effective_mode {
+        WaveformRenderMode::SamplePolyline => {
+            build_sample_polyline_segments(source, rect, view, style)
+        }
+        WaveformRenderMode::PeakLines => {
+            let pyramid: &mut WaveformPyramid = ui.widget_state(wid);
+            pyramid.ensure_built(source);
+            build_peak_segments(pyramid, source, rect, view, style)
+        }
+        WaveformRenderMode::RmsBars => {
+            let pyramid: &mut WaveformPyramid = ui.widget_state(wid);
+            pyramid.ensure_built(source);
+            build_rms_bar_segments(pyramid, source, rect, view, style)
+        }
+        WaveformRenderMode::Auto => unreachable!("resolve_render_mode で除去済"),
+    };
+    if !lines.is_empty() {
+        ui.push_lines(LineBatch {
+            segments: lines.into(),
+            line_width_px: style.line_width_px.max(1.0),
+            clip_rect: Some(rect),
+        });
+    }
+    // M5 Phase 16: SamplePolyline のとき、samples_per_pixel < 0.25 ならサンプル点
+    // マーカー (rect 角丸円、knob と同パターン) を追加 push。閾値超過なら markers
+    // は空 Vec が返るので no-op。
+    if effective_mode == WaveformRenderMode::SamplePolyline {
+        for m in build_sample_polyline_markers(source, rect, view, style) {
+            ui.push_rect(m);
+        }
+    }
+}
+
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 波形ウィジェット。生サンプルを借りて min/max ピーク線を描く。
     ///
@@ -1015,6 +1189,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// - `style`: 描画スタイル。M2 では `render_mode` は実質 `PeakLines` のみ。
     ///
     /// 戻り値で hover / clicked / dragging を取り出し、`Edit` の組み立てはアプリ側で行う。
+    /// 1 区間だけの [`Ui::waveform_segments`] (= 実装本体)。
     pub fn waveform<'s>(
         &mut self,
         id: impl Hash,
@@ -1023,89 +1198,59 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         view: WaveformView,
         style: WaveformStyle,
     ) -> WaveformResponse {
+        self.waveform_segments(id, source, &[WaveformSegment { rect, view }], style)
+    }
+
+    /// 複数区間の波形を **1 つの LOD ピラミッド**で描く。
+    ///
+    /// 各区間は独立した (rect, サンプル範囲) の線形写像なので、スライス配置
+    /// (`StretchMode::Slice` の onset ごとの trigger + gap)、warp marker の区分線形、
+    /// 逆再生をすべて同じ経路で描ける。区間の間は何も描かない = 無音の隙間になる。
+    ///
+    /// - LOD ピラミッドは `id` 単位で 1 つ。区間を増やしてもメモリは増えない
+    ///   (区間ごとに `waveform` を呼ぶと source 全長のピラミッドが区間数だけ複製される)。
+    /// - 各区間は現在の scissor (`with_clip_rect`) で自動カリング + 切り詰めされる
+    ///   (`cull_segment`)。画面外へ大きくはみ出す rect を渡してよい。
+    /// - ヒットテストは pointer を含む最初の区間を返す (`WaveformHit.sample_index` は
+    ///   その区間の写像で戻す)。
+    pub fn waveform_segments<'s>(
+        &mut self,
+        id: impl Hash,
+        source: WaveformSource<'s>,
+        segments: &[WaveformSegment],
+        style: WaveformStyle,
+    ) -> WaveformResponse {
         let wid = WidgetId::ROOT.child((b"waveform", &id));
 
-        // M4 Phase 12: input_hash 一致なら LOD ピラミッドの再構築 + 描画を全部スキップ。
-        // generation 変化が主な invalidation トリガ (= LOD pyramid の fingerprint と整合)。
-        // 注: Rust の `Hash` 実装は tuple 要素 12 個まで。ネスト tuple で回避。
-        let input_hash = hash_inputs((
-            b"waveform",
-            (rect.x.to_bits(), rect.y.to_bits(), rect.w.to_bits(), rect.h.to_bits()),
-            (source.generation, source.valid_len as u64, source.sample_rate),
-            (view.start_sample, view.len_samples, view.vertical_gain.to_bits()),
-            style.line_width_px.to_bits(),
-            (
-                style.fg.r.to_bits(),
-                style.fg.g.to_bits(),
-                style.fg.b.to_bits(),
-                style.fg.a.to_bits(),
-            ),
-            (
-                style.fg_clipped.r.to_bits(),
-                style.fg_clipped.g.to_bits(),
-                style.fg_clipped.b.to_bits(),
-                style.fg_clipped.a.to_bits(),
-            ),
-            style.channel_layout,
-            style.render_mode,
-        ));
-
         // pyramid は wid 経由の widget_state で持つので、closure 内で取り直す。
-        // source / view / style は closure 内で borrow / Copy。
-        // M5 Phase 15: render_mode を resolve して SamplePolyline / PeakLines を分岐。
-        // SamplePolyline モードのときは LOD ピラミッドを触らず、生サンプルから直接描画する
-        // (samples_per_pixel < 1.0 = ピラミッド無意味な領域)。
+        // source / style は closure 内で borrow / Copy。
+        let input_hash = segments_input_hash(&source, segments, style);
         self.with_widget_node(wid, input_hash, |ui| {
-            let view_len = view.len_samples.max(1) as f64;
-            let samples_per_pixel = view_len / f64::from(rect.w.max(1.0));
-            let effective_mode = resolve_render_mode(style.render_mode, samples_per_pixel);
-            let segments = match effective_mode {
-                WaveformRenderMode::SamplePolyline => {
-                    build_sample_polyline_segments(&source, rect, view, style)
-                }
-                WaveformRenderMode::PeakLines => {
-                    let pyramid: &mut WaveformPyramid = ui.widget_state(wid);
-                    pyramid.ensure_built(&source);
-                    build_peak_segments(pyramid, &source, rect, view, style)
-                }
-                WaveformRenderMode::RmsBars => {
-                    let pyramid: &mut WaveformPyramid = ui.widget_state(wid);
-                    pyramid.ensure_built(&source);
-                    build_rms_bar_segments(pyramid, &source, rect, view, style)
-                }
-                WaveformRenderMode::Auto => unreachable!("resolve_render_mode で除去済"),
-            };
-            if !segments.is_empty() {
-                ui.push_lines(LineBatch {
-                    segments: segments.into(),
-                    line_width_px: style.line_width_px.max(1.0),
-                    clip_rect: Some(rect),
-                });
-            }
-            // M5 Phase 16: SamplePolyline のとき、samples_per_pixel < 0.25 ならサンプル点
-            // マーカー (rect 角丸円、knob と同パターン) を追加 push。閾値超過なら markers
-            // は空 Vec が返るので no-op。
-            if effective_mode == WaveformRenderMode::SamplePolyline {
-                let markers = build_sample_polyline_markers(&source, rect, view, style);
-                for m in markers {
-                    ui.push_rect(m);
-                }
+            let clip = ui.current_clip;
+            for seg in segments {
+                let Some(seg) = cull_segment(seg, clip) else {
+                    continue;
+                };
+                draw_waveform_segment(ui, wid, &source, &seg, style);
             }
         });
 
         // 3. ヒットテスト。
         let pointer = self.pointer;
         let mut response = WaveformResponse {
-            hovered: hovered(rect, pointer),
+            hovered: segments.iter().any(|s| hovered(s.rect, pointer)),
             clicked_at: None,
             dragging_at: None,
         };
         if let Some((px, py)) = pointer.pos
-            && rect.contains(px, py)
+            && let Some(seg) = segments.iter().find(|s| s.rect.contains(px, py))
         {
+            let rect = seg.rect;
+            let view = seg.view;
             let local_x = px - rect.x;
             let local_y = py - rect.y;
             let frac = (f64::from(local_x) / f64::from(rect.w)).clamp(0.0, 1.0);
+            let frac = if view.reversed { 1.0 - frac } else { frac };
             let sample_index =
                 (view.start_sample as f64 + frac * view.len_samples as f64) as u64;
             let channels = source.samples.channels().max(1);
@@ -1322,6 +1467,60 @@ mod tests {
         let interleaved_pyr = build_full(&interleaved_samples, 10_000);
 
         assert_pyramid_eq(&planar_pyr, &interleaved_pyr);
+    }
+
+    fn seg(x: f32, w: f32, start: u64, len: u64, reversed: bool) -> WaveformSegment {
+        WaveformSegment {
+            rect: Rect { x, y: 0.0, w, h: 40.0 },
+            view: WaveformView { start_sample: start, len_samples: len, vertical_gain: 1.0, reversed },
+        }
+    }
+
+    /// scissor ではみ出した区間は rect と **同じ比率で** サンプル範囲も切り詰める
+    /// (= 画面内に有界化しても波形が横にずれない)。
+    #[test]
+    fn cull_segment_narrows_rect_and_view_proportionally() {
+        let clip = Rect { x: 100.0, y: 0.0, w: 100.0, h: 40.0 };
+        // [50, 250) の rect を [100, 200) に切ると、左 25% と右 25% が落ちる。
+        let got = cull_segment(&seg(50.0, 200.0, 1_000, 4_000, false), Some(clip)).expect("visible");
+        assert!((got.rect.x - 100.0).abs() < 1e-6 && (got.rect.w - 100.0).abs() < 1e-6);
+        assert_eq!(got.view.start_sample, 2_000);
+        assert_eq!(got.view.len_samples, 2_000);
+
+        // reversed は左端が範囲末尾なので、切り詰め先も左右反転して対応する。
+        let got = cull_segment(&seg(50.0, 200.0, 1_000, 4_000, true), Some(clip)).expect("visible");
+        assert_eq!(got.view.start_sample, 2_000);
+        assert_eq!(got.view.len_samples, 2_000);
+        assert!(got.view.reversed);
+
+        // 完全に外 / 交差なし → 描かない。
+        assert!(cull_segment(&seg(0.0, 40.0, 0, 100, false), Some(clip)).is_none());
+        assert!(cull_segment(&seg(300.0, 40.0, 0, 100, false), Some(clip)).is_none());
+        // 完全に内側 → そのまま (切り詰めによる丸め誤差を入れない)。
+        let got = cull_segment(&seg(120.0, 40.0, 7, 99, false), Some(clip)).expect("visible");
+        assert_eq!((got.view.start_sample, got.view.len_samples), (7, 99));
+    }
+
+    /// `reversed` は同じサンプル範囲を右→左に描く (ピーク線の x が鏡像になる)。
+    #[test]
+    fn reversed_view_mirrors_peak_lines() {
+        // 前半が無音・後半が振幅 1.0 の素材 → 通常は右半分、reversed は左半分が振れる。
+        let mut s = vec![0.0f32; 2_000];
+        for (i, v) in s.iter_mut().enumerate() {
+            *v = if i >= 1_000 { if i % 2 == 0 { 1.0 } else { -1.0 } } else { 0.0 };
+        }
+        let samples = SampleSlices::Mono(&s);
+        let src = WaveformSource { samples, valid_len: 2_000, generation: 1, sample_rate: 48_000 };
+        let pyramid = build_full(&samples, 2_000);
+        let rect = Rect { x: 0.0, y: 0.0, w: 20.0, h: 40.0 };
+        let style = WaveformStyle { baseline: None, channel_layout: ChannelLayout::Overlay, ..WaveformStyle::default() };
+        let height = |reversed: bool, px: usize| -> f32 {
+            let view = WaveformView { start_sample: 0, len_samples: 2_000, vertical_gain: 1.0, reversed };
+            let segs = build_peak_segments(&pyramid, &src, rect, view, style);
+            (segs[px].b[1] - segs[px].a[1]).abs()
+        };
+        assert!(height(false, 15) > height(false, 4), "通常は右側が振れる");
+        assert!(height(true, 4) > height(true, 15), "reversed は左側が振れる");
     }
 
     /// `generation` 変化は完全再構築されること (たとえ valid_len が増えていても)。

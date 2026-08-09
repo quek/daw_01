@@ -41,7 +41,9 @@ use crate::input::{DroppedFiles, PointerFrame};
 use crate::scenegraph::hash_inputs;
 use crate::ui::Ui;
 use crate::widgets::drag_rect::DragRect;
-use crate::widgets::waveform::{WaveformResponse, WaveformSource, WaveformStyle, WaveformView};
+use crate::widgets::waveform::{
+    WaveformResponse, WaveformSegment, WaveformSource, WaveformStyle, WaveformView,
+};
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// 巨大ビュー用の脱出口。`HeavyCtx::cached` で ViewportKey 一致時に
@@ -192,6 +194,18 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
         style: WaveformStyle,
     ) -> WaveformResponse {
         self.ui.waveform(id, rect, source, view, style)
+    }
+
+    /// `Ui::waveform_segments` の delegate。1 クリップの波形を複数区間 (スライス配置 /
+    /// warp 区間 / 逆再生) で描くときに使う。
+    pub fn waveform_segments<'s>(
+        &mut self,
+        id: impl Hash,
+        source: WaveformSource<'s>,
+        segments: &[WaveformSegment],
+        style: WaveformStyle,
+    ) -> WaveformResponse {
+        self.ui.waveform_segments(id, source, segments, style)
     }
 
     /// `Ui::label_at` の delegate。

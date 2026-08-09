@@ -73,6 +73,7 @@ fn render_n_waveforms(
                     start_sample: 0,
                     len_samples: planes[0].len() as u64,
                     vertical_gain: 1.0,
+                    reversed: false,
                 },
                 WaveformStyle::default(),
             );
