@@ -148,10 +148,9 @@ impl AppData {
         // r.md #10: 別 project の `Home` 2 段トグル state を持ち越さない
         // (= 新 project 最初の Home は先頭クリップ位置から始める)。
         self.ui_ephemeral.home_toggle_at_first = false;
-        // r.md #43: 編集面の last-wins タグも持ち越さない。 残すと、 差し替え後に
-        // 「選択ゼロを避ける」 自動再選択が集合を埋めた瞬間に Delete が前プロジェクト
-        // 由来の面 (例: Tracks) を向き、 触ってもいないトラックが消える。
-        self.selection.last_edit_select = None;
+        // 編集面の last-wins タグ (r.md #43) を含む Song スコープの参照系は、
+        // 冒頭の `reset_song_scoped_state` が一括で捨てている。 個別に消し直さない
+        // (破棄の口を 2 つにすると、また片方だけ更新される)。
     }
 
     pub(crate) fn undo(&mut self) {
