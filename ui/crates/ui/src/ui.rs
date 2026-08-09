@@ -368,6 +368,20 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.focused
     }
 
+    /// 粗粒度描画キャッシュ (`with_widget_node` / `HeavyCtx::cached`) を全部捨てる。
+    ///
+    /// **GPU 資産を作り直したとき (device lost からの復旧、daw_01 r.md #42) に必ず呼ぶ。**
+    /// キャッシュされた描画コマンドには旧世代の `TextureHandle` が焼き込まれており、
+    /// 捨てないと「input_hash が同じだから」という理由で無効ハンドル入りのコマンドが
+    /// 再送され続ける (絵が欠けたまま固まる)。
+    ///
+    /// focus / widget state / popup は **保持**する (= 編集中の状態を壊さない)。
+    /// 利用者に `viewport_key` へ世代番号を混ぜさせる (= 全 heavy widget に同じ
+    /// boilerplate を強要する) 案は採らない。
+    pub fn invalidate_scene_cache(&mut self) {
+        self.scenegraph.clear();
+    }
+
     /// 1 フレーム分の UI を構築。**edits は内部で apply され、`request_redraw` も
     /// 自動で呼ばれる**。利用者の boilerplate はゼロ。
     ///

@@ -14,5 +14,9 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 daw-ui-platform.workspace = true
 glyphon = "0.11.0"
 pollster = "0.4.0"
+# device lost の検出・復旧はログが唯一の事後追跡手段 (daw_01 r.md #42: スリープ復帰で
+# 画面が固まったとき、 何が起きたかは %LOCALAPPDATA%\daw_01\logs でしか分からなかった)。
+# subscriber 未設定なら no-op なので、 example / test での使用感は変わらない。
+tracing.workspace = true
 wgpu = "29.0.1"
 

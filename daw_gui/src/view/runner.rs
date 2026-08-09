@@ -132,6 +132,87 @@ struct RunnerState {
     /// 立ち絵 group box を preview 上で drag 中の状態（clip drag とは別経路、
     /// `docs/plan_tachie_group_transform.md` §5.5）。
     preview_group_drag: Option<GroupDragState>,
+    /// r.md #42: GPU 復旧の状態。`None` = 正常。
+    gpu_recovery: Option<GpuRecovery>,
+    /// main window の render error ログのレート制限 (秒 1 行 + 抑制件数)。
+    /// これが無いと別要因の恒常エラーで再びログが 6MB 級に膨らむ
+    /// (実際 daw_gui.2026-08-01 は 54,043 行 / 6.4MB)。
+    render_error_log: RenderErrorLog,
+    /// preview window 用の **独立した** レート制限器。
+    ///
+    /// main と共有すると、main が正常描画している限り毎フレーム `reset()` が走って
+    /// preview 側の `last_at` が消え、抑制が完全に効かなくなる (60 行/秒)。
+    /// main / preview は別々の wgpu Device を持つので片方だけ壊れる状態は構造的に
+    /// あり得るため、レート制限器も窓ごとに分ける。
+    preview_error_log: RenderErrorLog,
+}
+
+/// r.md #42: device lost からの復旧進行状態。
+struct GpuRecovery {
+    /// 消失を検出した時刻 (= [`GPU_RECOVERY_GIVEUP`] 判定の起点)。
+    lost_at: Instant,
+    /// 次に再試行する時刻。
+    retry_at: Instant,
+    /// 連続失敗回数 (backoff 段数)。
+    attempts: u32,
+    /// 「保存して再起動してください」 の OS ダイアログを既に出したか (1 回だけ)。
+    giveup_notified: bool,
+}
+
+/// 再試行の backoff (250ms → 500ms → 1s → 2s で頭打ち)。
+///
+/// **無制限に毎フレーム再試行してはいけない**: present が起きないと vsync 律速が
+/// 消えるので、 復旧できないまま回すと 860fps でスピンして CPU を焼き続ける
+/// (実ログで 51,827 行/分)。 バッテリー駆動でファン全開になる形で顕在化する。
+fn gpu_retry_backoff(attempts: u32) -> std::time::Duration {
+    let ms = match attempts {
+        0 => 250,
+        1 => 500,
+        2 => 1000,
+        _ => 2000,
+    };
+    std::time::Duration::from_millis(ms)
+}
+
+/// この時間 GPU 復旧に失敗し続けたら、 OS ダイアログで「保存して再起動」 を促す。
+///
+/// 静かに再試行し続けるだけだと、 ユーザーから見て「固まったまま何も分からない」
+/// (8/1 のログでは ✕ を 4 回押して諦め、 強制終了している)。 自前 UI は GPU が
+/// 無いと描けないので、 **OS 側が描くメッセージボックス**で伝える。
+const GPU_RECOVERY_GIVEUP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// render error ログのレート制限器 (秒 1 行 + 抑制件数のサマリ)。
+#[derive(Default)]
+struct RenderErrorLog {
+    last_at: Option<Instant>,
+    suppressed: u32,
+}
+
+impl RenderErrorLog {
+    /// 抑制間隔。 これより短い間隔で来た記録はカウントだけして出力しない。
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// 1 件記録する。 直近 1 秒以内に出していれば抑制し、 次に出す行へ件数を載せる。
+    /// 戻り値は **実際にログを出したか** (テスト用。 production では捨ててよい)。
+    fn record(&mut self, now: Instant, what: &str, err: &daw_ui_renderer::RenderError) -> bool {
+        if self.last_at.is_some_and(|t| now.duration_since(t) < Self::INTERVAL) {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return false;
+        }
+        self.last_at = Some(now);
+        let suppressed = std::mem::take(&mut self.suppressed);
+        tracing::error!(error = %err, suppressed, "{what}");
+        true
+    }
+
+    /// **その窓が**正常描画できたときに抑制状態を畳む。
+    ///
+    /// 呼ぶのは対応する窓の成功フレームだけ (main の成功で preview 用の状態を消すと
+    /// preview 側の抑制が無効化される)。
+    fn reset(&mut self) {
+        self.last_at = None;
+        self.suppressed = 0;
+    }
 }
 
 /// preview window 上で PiP rect を drag 中の状態 (`docs/plan_image_
@@ -681,7 +762,24 @@ impl ApplicationHandler<AppEvent> for Runner {
             preview_cursor: None,
             preview_drag: None,
             preview_group_drag: None,
+            gpu_recovery: None,
+            render_error_log: RenderErrorLog::default(),
+            preview_error_log: RenderErrorLog::default(),
         });
+    }
+
+    /// r.md #42: `ControlFlow::WaitUntil` で予約した GPU 復旧の再試行時刻に到達したら
+    /// 再試行する。 winit は `WaitUntil` の期限到来を `new_events(ResumeTimeReached)` で
+    /// 通知するので、 ここが「復旧リトライを時間駆動で回す」 唯一の入口。
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        let due = self
+            .state
+            .as_ref()
+            .and_then(|s| s.gpu_recovery.as_ref())
+            .is_some_and(|r| Instant::now() >= r.retry_at);
+        if due {
+            self.attempt_gpu_recovery(event_loop);
+        }
     }
 
     fn window_event(
@@ -889,6 +987,90 @@ impl Runner {
         }
     }
 
+    /// r.md #42: device lost を検出した。 復旧シーケンスを開始する (既に進行中なら no-op)。
+    fn begin_gpu_recovery(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else { return };
+        if state.gpu_recovery.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        tracing::warn!("gpu device lost — 復旧を開始します");
+        state.app.ui_ephemeral.status_message = "GPU を再初期化しています…".into();
+        state.gpu_recovery = Some(GpuRecovery {
+            lost_at: now,
+            retry_at: now,
+            attempts: 0,
+            giveup_notified: false,
+        });
+        self.attempt_gpu_recovery(event_loop);
+    }
+
+    /// GPU 資産を作り直す 1 回の試行。 成功したら復旧状態を畳んで再描画を要求し、
+    /// 失敗したら backoff して `ControlFlow::WaitUntil` で次を予約する。
+    fn attempt_gpu_recovery(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else { return };
+        let Some(recovery) = state.gpu_recovery.as_mut() else { return };
+        let now = Instant::now();
+
+        // preview window も **同時に** 作り直す。 GPU リセットは両方の device を殺すので、
+        // main だけ復旧して preview を放置すると preview 側だけ固まり続ける。
+        // OS ウィンドウ自体は残す (位置とサイズを保つ / ちらつかせない)。
+        // 片方だけ成功した状態で再試行が来ることがあるので、 既に生きている方は触らない。
+        let preview_result = match state.preview.as_mut() {
+            Some(p) if !p.renderer.is_live() => p.recreate_gpu(),
+            _ => Ok(()),
+        };
+        let main_result = if state.renderer.is_live() {
+            Ok(())
+        } else {
+            state
+                .renderer
+                .recreate()
+                .map_err(|e| format!("Renderer::recreate: {e}"))
+        };
+
+        if let (Ok(()), Ok(())) = (&preview_result, &main_result) {
+            // 粗粒度描画キャッシュに旧世代の TextureHandle が焼き込まれているので必ず捨てる。
+            // これを忘れると build も test も clippy も通るのに絵だけ欠ける。
+            state.ui.invalidate_scene_cache();
+            // GPU 上にしか無かった派生データ (動画サムネイル / 画像) をディスクから再構築。
+            state.app.rebuild_gpu_derived_caches();
+            state.app.ui_ephemeral.status_message = "GPU を再初期化しました".into();
+            state.gpu_recovery = None;
+            state.render_error_log.reset();
+            state.preview_error_log.reset();
+            state.window.request_redraw();
+            if let Some(p) = state.preview.as_ref() {
+                p.window.request_redraw();
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            tracing::info!("gpu recovered");
+            return;
+        }
+
+        for e in [preview_result.err(), main_result.err()].into_iter().flatten() {
+            tracing::warn!(error = %e, attempts = recovery.attempts, "gpu 再初期化に失敗");
+        }
+        recovery.attempts = recovery.attempts.saturating_add(1);
+        let backoff = gpu_retry_backoff(recovery.attempts);
+        recovery.retry_at = now + backoff;
+
+        // 30 秒失敗し続けたら OS ダイアログで伝える (自前 UI は GPU が無いと描けない)。
+        if !recovery.giveup_notified && now.duration_since(recovery.lost_at) >= GPU_RECOVERY_GIVEUP {
+            recovery.giveup_notified = true;
+            #[cfg(windows)]
+            let parent_hwnd = state.app.ui_ephemeral.main_window_hwnd;
+            #[cfg(not(windows))]
+            let parent_hwnd: Option<isize> = None;
+            spawn_gpu_giveup_dialog(parent_hwnd);
+        }
+        state.app.ui_ephemeral.status_message =
+            "GPU を再初期化しています… (応答がありません)".into();
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            now + backoff,
+        ));
+    }
+
     fn render_frame(&mut self, event_loop: &ActiveEventLoop) -> bool {
         // docs/plan_video.md P4: sync the preview window lifecycle
         // with `AppData.preview_window_visible` BEFORE everything
@@ -951,35 +1133,62 @@ impl Runner {
             self.diag_window_max_dt = std::time::Duration::ZERO;
         }
 
-        // 別プロジェクトに切り替わったら GPU 側の Song スコープキャッシュも
-        // 捨てる。`AppData::reset_song_scoped_state` は renderer を持たないので
-        // 世代印だけ進め、実際の `destroy_texture` はここ (runner) が行う。
-        Self::release_project_scoped_gpu_state(state);
+        // r.md #42: GPU 消失中は GPU を触る処理を全部飛ばす。 `ui.frame` は下で通常どおり
+        // 走らせるので、 Space / 保存 / 終了は効き続ける (= 消失中の唯一の救い)。
+        // ここで staging を drain してしまうと、 死んだ store へ upload して CPU 側の
+        // 元データだけ失う (「GPU が SSoT」 設計の裏返し) ので必ず gate する。
+        let gpu_live = state.renderer.is_live();
+        let mut device_lost = !gpu_live;
 
-        // docs/plan_video.md P3.5: drain pending video thumbnail
-        // uploads BEFORE this frame's `ui.frame()` so the arrangement
-        // view can read the resulting `TextureHandle` immediately.
-        // First frame after import shows the thumbnail with one
-        // frame's latency (= imports landing during a frame are
-        // queued for the next frame's drain).
-        Self::drain_video_thumbnail_uploads(&mut state.app, &mut state.renderer);
+        if gpu_live {
+            // 別プロジェクトに切り替わったら GPU 側の Song スコープ状態も捨てる。
+            // handle で表現できない preview 側 (frame textures / decode ring) を
+            // 世代印で破棄する経路 (main renderer のテクスチャは下の破棄予約が担当)。
+            Self::release_project_scoped_gpu_state(state);
+            // AppData 側で参照を捨てた main renderer の texture を実際に解放する
+            // (AppData は Renderer を持てないので破棄予約経由。upload の **前**に流して
+            // 解放と確保の順序を固定する)。
+            Self::drain_texture_destroys(&mut state.app, &mut state.renderer);
 
-        // P5: drive playback decode + upload into the preview
-        // window's frame_texture. When the playhead lands inside a
-        // video clip, decode the corresponding source_micros frame
-        // and re-upload; otherwise clear so the placeholder shows.
-        #[cfg(windows)]
-        if state.preview.is_some() {
-            Self::drive_preview_playback(state);
-        }
+            // docs/plan_video.md P3.5: drain pending video thumbnail
+            // uploads BEFORE this frame's `ui.frame()` so the arrangement
+            // view can read the resulting `TextureHandle` immediately.
+            // First frame after import shows the thumbnail with one
+            // frame's latency (= imports landing during a frame are
+            // queued for the next frame's drain).
+            Self::drain_video_thumbnail_uploads(&mut state.app, &mut state.renderer);
+            // 画像も同じ frame で main / preview 双方へ upload する (preview の有無に
+            // 依らず arrangement のサムネイルが出るように)。
+            Self::drain_image_uploads(state);
 
-        // P4 baseline / P5 hand-off: render the preview window each
-        // frame. `render_placeholder` picks between the placeholder
-        // text and the textured-quad path internally based on whether
-        // `frame_texture` is Some.
-        if let Some(preview) = state.preview.as_mut() {
-            preview.render_placeholder();
-            preview.window.request_redraw();
+            // P5: drive playback decode + upload into the preview
+            // window's frame_texture. When the playhead lands inside a
+            // video clip, decode the corresponding source_micros frame
+            // and re-upload; otherwise clear so the placeholder shows.
+            #[cfg(windows)]
+            if state.preview.is_some() {
+                Self::drive_preview_playback(state);
+            }
+
+            // P4 baseline / P5 hand-off: render the preview window each
+            // frame. `render` picks between the placeholder text and the
+            // textured-quad path internally based on whether
+            // `frame_texture` is Some.
+            if let Some(preview) = state.preview.as_mut() {
+                match preview.render() {
+                    Ok(()) => {
+                        // 抑制状態を畳むのは **preview 自身が成功したとき** だけ。
+                        state.preview_error_log.reset();
+                        preview.window.request_redraw();
+                    }
+                    Err(e) if e.is_device_lost() => device_lost = true,
+                    // 一時障害 / validation は次フレームで再試行 (redraw は継続要求)。
+                    Err(e) => {
+                        state.preview_error_log.record(now, "preview render error", &e);
+                        preview.window.request_redraw();
+                    }
+                }
+            }
         }
 
         let screen = state.renderer.size();
@@ -1013,8 +1222,14 @@ impl Runner {
             return false;
         }
 
-        if let Err(e) = state.renderer.render(&state.scene) {
-            tracing::error!(error = ?e, "render error");
+        if gpu_live {
+            match state.renderer.render(&state.scene) {
+                Ok(()) => state.render_error_log.reset(),
+                Err(e) if e.is_device_lost() => device_lost = true,
+                Err(e) => {
+                    state.render_error_log.record(now, "render error", &e);
+                }
+            }
         }
 
         // タイトル差分反映: "<*>プロジェクト名"。未保存変更があれば先頭に * を付ける。
@@ -1068,10 +1283,21 @@ impl Runner {
             (false, None) => {}
         }
 
+        // r.md #42: device lost を検出したらここで復旧を開始する (`state` の borrow を
+        // 手放してから呼ぶ必要があるので frame 末尾)。
+        if device_lost {
+            self.begin_gpu_recovery(event_loop);
+            // 復旧は `ControlFlow::WaitUntil` の backoff で駆動する。 ここで継続 redraw を
+            // 要求すると present しないまま毎フレーム回り、 860fps でスピンして CPU を
+            // 焼き続ける (実ログで 51,827 行/分)。
+            return false;
+        }
+
         // 再生中に加え、VOICEVOX 合成/口パク生成中も連続再描画を要求して
         // クリップ上スピナー + 全体オーバーレイを回す。engine 未接続が確定したら
         // `voicevox_animating` が false を返すので static 警告表示で再描画は止まる
         // (CPU/GPU を回し続けない)。overlay 描画と同じ `now` (= frame_now) を使う。
+        let state = self.state.as_ref().expect("render_frame 内で state は生存");
         state.app.transport.is_playing || state.app.voicevox_animating(now)
     }
 
@@ -1101,7 +1327,20 @@ impl Runner {
                 });
             }
             WindowEvent::RedrawRequested => {
-                preview.render_placeholder();
+                // device lost はメインループ側の復旧シーケンスが拾う (ここで再帰的に
+                // request_redraw しないことで、 消失中の preview スピンも止まる)。
+                match preview.render() {
+                    Ok(()) => state.preview_error_log.reset(),
+                    // device lost はメインループ側の復旧シーケンスが拾う。
+                    Err(e) if e.is_device_lost() => {}
+                    Err(e) => {
+                        state.preview_error_log.record(
+                            Instant::now(),
+                            "preview render error",
+                            &e,
+                        );
+                    }
+                }
             }
             // r.md #26: preview window にフォーカスがあるときの Space で
             // 再生 / 停止をトグル。 preview には text 入力欄が無いので無条件で
@@ -1309,6 +1548,12 @@ impl Runner {
                         // appears without waiting for the next OS event.
                         p.window.request_redraw();
                         state.preview = Some(p);
+                        // r.md #42: 画像の CPU staging は main への upload 時に捨てている
+                        // (メモリ SSoT はディスク) ので、後から開いた preview は自前の
+                        // texture を持っていない。ディスクから staging を作り直す
+                        // (冪等: 既に staging 済みなら job は積まれない)。
+                        // preview を閉じて開き直したときにも同じ経路で復元される。
+                        state.app.begin_asset_decode("プレビュー用の画像を読込中");
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "preview window create failed");
@@ -1347,33 +1592,68 @@ impl Runner {
     /// Throttled to `Song.video_framerate` (typical 30fps). The main
     /// loop runs at vsync; throttling avoids spamming the worker with
     /// requests that would just overwrite each other.
-    /// docs/plan_image_overlay.md §P3: drain `AppData.pending_image_uploads`
-    /// by uploading staged BGRA buffers into the preview window's
-    /// per-`ImageSourceId` GPU texture, and mirror the resulting
-    /// handle into `AppData.image_texture_cache` so the composite
-    /// pass can look it up by source_id. Idempotent / cheap when the
-    /// queue is empty.
-    #[cfg(windows)]
+    /// `AppData.pending_image_uploads` を drain し、staging された BGRA を
+    /// **main / preview の両 renderer へそれぞれアップロード**する。
+    ///
+    /// # なぜ両方に上げるのか (r.md #42 レビュー指摘)
+    ///
+    /// `TextureHandle` は `NonZeroU32` だけを持ち、どの renderer のものかを持たない。
+    /// `TextureStore` は renderer-local で id を 1 から採番するので、**preview が払い出した
+    /// handle を main の scene に流すと別テクスチャに別名衝突する** (動画クリップの
+    /// サムネイル位置に別の絵が出る、あるいは無言で描画 skip)。これは本 commit が
+    /// [`TextureStore::new_starting_at`] の doc で「世代間で id を巻き戻すな」として
+    /// 定義した欠陥クラスの **renderer 間版**。
+    ///
+    /// よって arrangement のサムネイル用 (main) と preview 合成用 (preview) は
+    /// **それぞれの renderer で作った別々の handle** を持つ。`image_texture_cache` は
+    /// main 専用 (arrangement が読む)、preview は自前の `image_textures` を持つ。
+    ///
+    /// CPU staging (`image_source_bgra`) はアップロード後に捨てる (メモリ SSoT はディスク)。
+    /// preview を後から開いた場合は `sync_preview_window` が再 decode を起動する。
     fn drain_image_uploads(state: &mut RunnerState) {
         if state.app.media.pending_image_uploads.is_empty() {
             return;
         }
-        let Some(preview) = state.preview.as_mut() else {
-            // Preview window is not open yet; keep the queue intact
-            // and re-drain when it opens (= the user is allowed to
-            // import images before opening the preview).
-            return;
-        };
-        let pending: Vec<_> =
-            state.app.media.pending_image_uploads.drain(..).collect();
+        let pending: Vec<_> = state.app.media.pending_image_uploads.drain(..).collect();
         for image_source_id in pending {
             let Some((w, h, bgra)) =
                 state.app.media.image_source_bgra.remove(&image_source_id)
             else {
                 continue; // already uploaded (= rapid undo path)
             };
-            let handle = preview.upload_image_bgra(image_source_id, w, h, &bgra);
-            state.app.ui_ephemeral.image_texture_cache.insert(image_source_id, handle);
+            // main: arrangement クリップのサムネイル用。既に同 id の texture を持って
+            // いれば作り直さない (preview を開いたときの再 staging で無駄に確保しない)。
+            // 寸法が変わる再 import 等では旧 handle を destroy してから差し替える
+            // (上書きするだけだと GPU 側 store に orphan が積み上がる)。
+            let existing = state
+                .app
+                .ui_ephemeral
+                .image_texture_cache
+                .get(&image_source_id)
+                .copied()
+                .filter(|handle| state.renderer.texture_size(*handle) == Some((w, h)));
+            let main_handle = match existing {
+                Some(handle) => handle,
+                None => {
+                    if let Some(old) =
+                        state.app.ui_ephemeral.image_texture_cache.remove(&image_source_id)
+                    {
+                        state.renderer.destroy_texture(old);
+                    }
+                    let handle = state.renderer.create_texture_bgra(w, h);
+                    state
+                        .app
+                        .ui_ephemeral
+                        .image_texture_cache
+                        .insert(image_source_id, handle);
+                    handle
+                }
+            };
+            state.renderer.upload_texture_bgra(main_handle, &bgra);
+            // preview: 合成用 (開いていれば)。preview 側は自前 map が SSoT。
+            if let Some(preview) = state.preview.as_mut() {
+                preview.upload_image_bgra(image_source_id, w, h, &bgra);
+            }
         }
     }
 
@@ -1383,10 +1663,6 @@ impl Runner {
         // frames. Decoded frames are precious — uploading them is
         // cheap (GPU memcpy) and keeps the texture fresh.
         Self::drain_preview_worker_results(state);
-        // docs/plan_image_overlay.md §P3: also drain any pending
-        // image uploads so a freshly-imported image appears on the
-        // very next composite pass (= no 1-frame delay).
-        Self::drain_image_uploads(state);
 
         let Some(preview) = state.preview.as_mut() else {
             return;
@@ -1498,8 +1774,10 @@ impl Runner {
             &state.app.transport.mod_scalars,
         );
         for frame_info in image_frames {
-            let Some(handle) =
-                state.app.ui_ephemeral.image_texture_cache.get(&frame_info.image_source_id).copied()
+            // **preview 自身の** texture を引く。`image_texture_cache` は main renderer 用
+            // なので、ここで使うと renderer 間で id が別名衝突する (r.md #42 レビュー指摘)。
+            let Some((handle, _, _)) =
+                preview.image_textures.get(&frame_info.image_source_id).copied()
             else {
                 continue; // texture not yet uploaded
             };
@@ -1731,6 +2009,13 @@ impl Runner {
             else {
                 continue;
             };
+            // 同 id の旧 texture は必ず destroy してから差し替える。 サムネイルは
+            // **ネイティブ解像度** (`extract_thumbnail` は downscale しない) なので
+            // 4K なら 1 枚 33MB。 上書きするだけだと再 import / project 開き直しの
+            // たびに GPU 側 store に orphan が積み上がる。
+            if let Some(old) = app.ui_ephemeral.video_texture_cache.remove(&video_source_id) {
+                renderer.destroy_texture(old);
+            }
             let handle = renderer.create_texture(w, h);
             renderer.upload_texture_rgba(handle, rgba.as_slice());
             // 同 id への再 upload では旧 handle を必ず解放する (insert で
@@ -1745,33 +2030,40 @@ impl Runner {
         }
     }
 
-    /// プロジェクトが切り替わったら GPU 側の Song スコープキャッシュを解放する。
+    /// r.md #42: `AppData` が参照を捨てた **main renderer** の `TextureHandle` を
+    /// 実際に解放する。
+    ///
+    /// `AppData` は `Renderer` を持たない (持たせるとモデルが GPU に依存する) ので、
+    /// 破棄は「予約を積む → runner が drain して destroy」 の 2 段で行う。
+    /// これが無いと cache の `clear()` は参照を捨てるだけで GPU 側 store に
+    /// entry が残り続け、 プロジェクトを開き直すたびに VRAM が単調増加する。
+    ///
+    /// project 切替 (`reset_song_scoped_state`) と GPU 復旧
+    /// (`rebuild_gpu_derived_caches`) の **両方**がこの 1 本の口を使う
+    /// (後者は project_id が変わらないので世代印では表現できない)。
+    fn drain_texture_destroys(app: &mut AppData, renderer: &mut Renderer<WinitWindow>) {
+        for handle in app.ui_ephemeral.pending_texture_destroys.drain(..) {
+            renderer.destroy_texture(handle);
+        }
+    }
+
+    /// プロジェクトが切り替わったら GPU 側の Song スコープ状態を解放する。
     ///
     /// `VideoSourceId` / `ImageSourceId` は Song スコープの名前 (project ごとに
     /// 1 から再採番) なので、テクスチャを id で引き継ぐと **前 project の
-    /// サムネイル・画像・動画フレームが新 project のクリップに出る**。しかも
-    /// video のサムネイルは project load 経路で再生成されないため、放置すると
-    /// 前 project の絵が唯一の候補として当たり続ける。
+    /// サムネイル・画像・動画フレームが新 project のクリップに出る**。
     ///
-    /// `AppData` は `Renderer` を持てないので、破棄の要求は
-    /// `ui_ephemeral.project_generation` の変化として伝わってくる。
+    /// ここが担当するのは **`TextureHandle` として `AppData` から渡せないもの**
+    /// だけ: preview window が自前で所有するフレーム / 画像テクスチャと、それを
+    /// 指す decode ring スナップショット。main renderer 上のテクスチャは
+    /// `reset_song_scoped_state` が破棄予約へ積み、[`Self::drain_texture_destroys`]
+    /// が解放する (破棄の口を 2 つ持たない = 二重解放も取りこぼしも起きない)。
     fn release_project_scoped_gpu_state(state: &mut RunnerState) {
         let generation = state.app.ui_ephemeral.project_generation;
         if generation == state.released_project_generation {
             return;
         }
         state.released_project_generation = generation;
-        // サムネイルのテクスチャは `drain_video_thumbnail_uploads` が
-        // main window の `Renderer` から作り、この map が唯一の所有者なので
-        // ここで destroy する。
-        for (_, handle) in state.app.ui_ephemeral.video_texture_cache.drain() {
-            state.renderer.destroy_texture(handle);
-        }
-        // 画像テクスチャの所有者は `PreviewWindowState::image_textures` で、
-        // こちらは composite pass 用の **ミラー**。destroy は所有者側
-        // (`clear_all`) に任せ、ここでは参照を落とすだけ (両方で destroy
-        // すると二重解放になる)。
-        state.app.ui_ephemeral.image_texture_cache.clear();
         // preview 側のフレーム / 画像テクスチャ (`(source_id, slot)` keyed) と、
         // それを指す ring スナップショットは対で捨てる。
         if let Some(preview) = state.preview.as_mut() {
@@ -1780,6 +2072,38 @@ impl Runner {
         #[cfg(windows)]
         state.cached_rings.clear();
     }
+}
+
+/// r.md #42: GPU 再初期化が [`GPU_RECOVERY_GIVEUP`] 以上失敗し続けたときに
+/// 「保存して再起動してください」 を伝える **OS 描画の**メッセージボックス。
+///
+/// 自前のモーダルは `Renderer` が死んでいる間は 1 ピクセルも描けないので、 この状況で
+/// ユーザーに何かを伝える手段は OS 側が描くダイアログしかない。 8/1 のログではこの
+/// 通知が無かったために、 ユーザーは ✕ を 4 回押して諦め強制終了している。
+///
+/// **別スレッド + owner-modal** で開く (`spawn_file_dialog` と同じ理由: 同期に開くと
+/// dialog 自身のメッセージポンプが GUI スレッドで回り、 復旧リトライが止まる)。
+/// 作業内容は既存の autosave (90 秒間隔) が守っているので、 勝手な保存や終了はしない。
+fn spawn_gpu_giveup_dialog(parent_hwnd: Option<isize>) {
+    let dialog = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("GPU を再初期化できません")
+        .set_description(
+            "グラフィックデバイスが応答しないため画面を再描画できません。\n\
+             プロジェクトを保存して daw_01 を再起動してください。\n\
+             (再初期化は背後で試行を続けます)",
+        )
+        .set_buttons(rfd::MessageButtons::Ok);
+    #[cfg(windows)]
+    let dialog = match parent_hwnd {
+        Some(hwnd) if hwnd != 0 => dialog.set_parent(&crate::app_types::Win32Parent { hwnd }),
+        _ => dialog,
+    };
+    #[cfg(not(windows))]
+    let _ = parent_hwnd;
+    std::thread::spawn(move || {
+        dialog.show();
+    });
 }
 
 /// docs/plan_video.md P5: turn a `VideoSourcePath` into an on-disk
@@ -1806,3 +2130,70 @@ fn resolve_video_path(
 // map_button / map_state / map_phys_key / query_cursor_pos_in_window は
 // daw_ui_platform::winit_backend に一本化 (Phase 4 で手写しミラーを撤去)。
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daw_ui_renderer::RenderError;
+
+    fn err() -> RenderError {
+        RenderError::Validation("test".into())
+    }
+
+    /// r.md #42 レビュー指摘: main の成功で preview の抑制状態が消えると、
+    /// preview だけが恒常エラーのときレート制限が完全に無効になる (60 行/秒)。
+    ///
+    /// `RenderErrorLog` は窓ごとに独立していて、`reset()` は **その窓の** 状態しか
+    /// 触らないことを固定する。
+    #[test]
+    fn render_error_log_is_per_window_and_reset_does_not_leak() {
+        let t0 = Instant::now();
+        let mut main_log = RenderErrorLog::default();
+        let mut preview_log = RenderErrorLog::default();
+
+        // preview の 1 件目は出力される。
+        assert!(preview_log.record(t0, "preview render error", &err()));
+        // main が成功して reset しても、preview の抑制状態は消えない。
+        main_log.reset();
+        // 同じ 1 秒窓の中の 2 件目は抑制される (= ここが以前は素通りしていた)。
+        let t1 = t0 + std::time::Duration::from_millis(16);
+        assert!(!preview_log.record(t1, "preview render error", &err()));
+        assert!(!preview_log.record(
+            t0 + std::time::Duration::from_millis(999),
+            "preview render error",
+            &err()
+        ));
+        // 窓を跨いだら再び出力し、抑制件数が畳まれる。
+        let t2 = t0 + RenderErrorLog::INTERVAL;
+        assert!(preview_log.record(t2, "preview render error", &err()));
+        assert_eq!(preview_log.suppressed, 0);
+    }
+
+    /// 自分の窓が成功したときは抑制状態を畳む (= 次のエラーは即座に 1 行出る)。
+    #[test]
+    fn render_error_log_reset_clears_own_window() {
+        let t0 = Instant::now();
+        let mut log = RenderErrorLog::default();
+        assert!(log.record(t0, "render error", &err()));
+        assert!(!log.record(t0 + std::time::Duration::from_millis(1), "render error", &err()));
+        log.reset();
+        assert!(log.record(t0 + std::time::Duration::from_millis(2), "render error", &err()));
+    }
+
+    /// GPU 復旧の backoff は「毎フレーム再試行」 に戻らず、上限で頭打ちになること
+    /// (present しないと vsync 律速が消えるので、無制限再試行は 860fps スピンになる)。
+    #[test]
+    fn gpu_retry_backoff_is_monotonic_and_capped() {
+        let mut prev = std::time::Duration::ZERO;
+        for attempts in 0..10 {
+            let d = gpu_retry_backoff(attempts);
+            assert!(d >= std::time::Duration::from_millis(250), "毎フレーム再試行に戻らない");
+            assert!(d <= std::time::Duration::from_secs(2), "上限 2 秒");
+            if attempts <= 3 {
+                assert!(d >= prev, "段階的に伸びる");
+            }
+            prev = d;
+        }
+        assert_eq!(gpu_retry_backoff(3), gpu_retry_backoff(100), "上限で頭打ち");
+    }
+}

@@ -14,12 +14,15 @@
 //! - `Maintain::Wait` は 28 以前の API。29 では `PollType::wait_indefinitely()` を使う。
 //! - readback bytes は sRGB 8-bit (`Rgba8UnormSrgb`)、PNG `ColorType::Rgba` にそのまま渡せる。
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
 
 use daw_ui_platform::PhysicalSize;
 
 use crate::composite::{composite_scene, CompositePool};
 use crate::device::{RenderError, RendererInitError};
+use crate::fonts::FontAssets;
 use crate::pipelines::{
     enqueue_runs, glyph::GlyphPipeline, line::LinePipeline, prepare_text_effects,
     rect::RectPipeline, render_runs, text_effect::TextEffectCompositor,
@@ -39,6 +42,14 @@ pub struct OffscreenRenderer {
     rect: RectPipeline,
     line: LinePipeline,
     glyph: GlyphPipeline,
+    /// CPU 側フォント資産 (`Renderer<W>` と同 idiom、 GPU 非依存の SSoT)。
+    fonts: FontAssets,
+    /// device lost callback が立てるフラグ (daw_01 r.md #42)。
+    ///
+    /// export 中に GPU を失った場合 **再生成はしない**。 途中フレームの整合性が取れないので
+    /// やり直しが正しく、 何より「黒フレームだらけの mp4 が正常終了として出力される」 のを
+    /// 防ぐ必要がある (build / test / clippy を全部すり抜ける典型の visual regression)。
+    lost: Arc<AtomicBool>,
     /// M14 Phase 71 (daw_01 #043): textured-quad pipeline (offscreen でも base pass で texture 描画可能)。
     texture: TexturePipeline,
     /// M14 Phase 71: texture handle → wgpu::Texture + bind_group の lookup table。
@@ -221,6 +232,22 @@ impl OffscreenRenderer {
         }))
         .map_err(RendererInitError::RequestDevice)?;
 
+        // device lost の唯一の検出口 (`device.rs` module doc 参照)。 export 中に GPU を失うと
+        // wgpu は無言で全 draw を捨てるので、 これが無いと「真っ黒な mp4 が正常終了する」。
+        let lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let lost = Arc::clone(&lost);
+            move |reason, msg| {
+                // `Destroyed` = 意図的な teardown (障害ではない、 `device.rs` と同 policy)。
+                if matches!(reason, wgpu::DeviceLostReason::Destroyed) {
+                    tracing::debug!(message = %msg, "wgpu device destroyed (offscreen)");
+                    return;
+                }
+                lost.store(true, Ordering::Release);
+                tracing::warn!(?reason, message = %msg, "wgpu device lost (offscreen)");
+            }
+        });
+
         let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let rect = RectPipeline::new(&device, target_format);
         let line = LinePipeline::new(&device, target_format);
@@ -238,6 +265,8 @@ impl OffscreenRenderer {
             rect,
             line,
             glyph,
+            fonts: FontAssets::new(),
+            lost,
             texture,
             texture_store,
             text_effect,
@@ -253,6 +282,33 @@ impl OffscreenRenderer {
 
     pub fn target_format(&self) -> wgpu::TextureFormat {
         self.target_format
+    }
+
+    /// GPU device が生きているか (daw_01 r.md #42)。 `false` になったら以降の描画は
+    /// 全部無意味 (黒フレーム) なので、 export は中断してやり直す。
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        !self.lost.load(Ordering::Acquire)
+    }
+
+    /// device 消失時に返すエラー (各 public 描画 API の共通ガード)。
+    fn guard_device_lost(&self) -> Result<(), RenderError> {
+        if self.is_live() {
+            Ok(())
+        } else {
+            Err(RenderError::DeviceLost)
+        }
+    }
+
+    /// readback 失敗を分類して返す。 device が失われていれば `DeviceLost` を優先する
+    /// (poll / map_async の失敗は device lost の **二次症状**なので、 caller に
+    /// 「やり直せば直るのか」 を正しく伝えるには根本の方を返す)。
+    fn readback_error(&self, msg: String) -> RenderError {
+        if self.is_live() {
+            RenderError::Readback(msg)
+        } else {
+            RenderError::DeviceLost
+        }
     }
 
     // ============================================================
@@ -372,14 +428,16 @@ impl OffscreenRenderer {
     /// 同じ。 返る texture の format は `Rgba8UnormSrgb` (= offscreen pipeline の target format)。
     ///
     /// # Errors
-    /// `width` / `height` が `max_texture_dimension_2d` を超える場合
-    /// [`RenderError::CompositeTargetTooLarge`]。
+    /// - device 消失時は [`RenderError::DeviceLost`] (export は中断してやり直す)。
+    /// - `width` / `height` が `max_texture_dimension_2d` を超える場合
+    ///   [`RenderError::CompositeTargetTooLarge`]。
     pub fn composite_scene_to_texture(
         &mut self,
         scene: &Scene,
         width: u32,
         height: u32,
     ) -> Result<TextureHandle, RenderError> {
+        self.guard_device_lost()?;
         let max = self.device.limits().max_texture_dimension_2d;
         if width > max || height > max {
             return Err(RenderError::CompositeTargetTooLarge { width, height, max });
@@ -391,6 +449,7 @@ impl OffscreenRenderer {
             self.target_format,
             &self.device,
             &self.queue,
+            &mut self.fonts,
             &mut self.rect,
             &mut self.line,
             &mut self.glyph,
@@ -439,15 +498,13 @@ impl OffscreenRenderer {
         });
 
         // M14 Phase 78 (daw_01 #049): effect 付き Glyph を offscreen で焼いて Primitive::Texture に substitute
-        let (font_system, swash_cache) = self.glyph.font_system_and_swash();
         let base_primitives_substituted = prepare_text_effects(
             &scene.primitives,
             &mut self.text_effect,
             &self.device,
             &self.queue,
             &mut encoder,
-            font_system,
-            swash_cache,
+            &mut self.fonts,
             &mut self.texture_store,
             self.texture.sampler(),
             self.texture.texture_bind_group_layout(),
@@ -461,6 +518,7 @@ impl OffscreenRenderer {
             Some(&mut self.texture),
             &self.device,
             &self.queue,
+            &mut self.fonts,
             self.size,
         );
         // popup pass: OffscreenRenderer は pipeline instance を base / popup で共有するが、
@@ -474,6 +532,7 @@ impl OffscreenRenderer {
             None,
             &self.device,
             &self.queue,
+            &mut self.fonts,
             self.size,
         );
 
@@ -586,8 +645,10 @@ impl OffscreenRenderer {
     /// 据え置く (出力 bytes は async 版と完全一致)。
     ///
     /// # Errors
-    /// staging buffer の `map_async` / `Device::poll` が失敗した場合。
+    /// device 消失 ([`RenderError::DeviceLost`])、 staging buffer の `map_async` /
+    /// `Device::poll` 失敗 ([`RenderError::Readback`])。
     pub fn render_to_rgba(&mut self, scene: &Scene) -> Result<Vec<u8>, RenderError> {
+        self.guard_device_lost()?;
         // M14 Phase 93 (daw_01 #063): 直前の composite target を解放 (Renderer::render と同様、
         // readback error の早期 return でも pool が in-use のまま残らないよう **冒頭**で呼ぶ)。
         self.composite_pool.end_cycle(&mut self.texture_store);
@@ -607,11 +668,14 @@ impl OffscreenRenderer {
         });
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| RenderError::SurfaceUnavailable(format!("offscreen poll: {e:?}")))?;
+            .map_err(|e| self.readback_error(format!("offscreen poll: {e:?}")))?;
         rx.recv()
-            .map_err(|e| RenderError::SurfaceUnavailable(format!("offscreen recv: {e:?}")))?
-            .map_err(|e| RenderError::SurfaceUnavailable(format!("offscreen map_async: {e:?}")))?;
+            .map_err(|e| self.readback_error(format!("offscreen recv: {e:?}")))?
+            .map_err(|e| self.readback_error(format!("offscreen map_async: {e:?}")))?;
 
+        // readback 自体は成功でも、 描画 submit の途中で device を失っていれば中身は
+        // 黒フレーム。 「正常終了した真っ黒な mp4」 を出さないためにここでも判定する。
+        self.guard_device_lost()?;
         Ok(Self::pack_unpadded(&staging, w, h, padded))
     }
 
@@ -645,10 +709,10 @@ impl OffscreenRenderer {
     /// 3 で頭打ちになるはず。 [`clear_readback_cache`](Self::clear_readback_cache) で全 slot を破棄できる。
     ///
     /// # Errors
-    /// daw_01 の想定 call site が `?` で受ける (spec `submit_readback(&scene)?`) ため `Result` を返すが、
-    /// [`composite_scene_to_texture`](Self::composite_scene_to_texture) と同様、 描画自体は失敗しないので
-    /// 現状は常に `Ok` (error 系 API の一貫性 + 将来の拡張余地)。
+    /// device 消失時に [`RenderError::DeviceLost`] (= 以降のフレームは全部黒になるので export を
+    /// 中断してやり直す)。 それ以外では描画自体は失敗しないので `Ok`。
     pub fn submit_readback(&mut self, scene: &Scene) -> Result<PendingReadback, RenderError> {
+        self.guard_device_lost()?;
         // render_to_rgba と同様、 直前 frame の composite target を解放 (冒頭で呼ぶ)。
         // submit_readback は render を即 submit するので、 この frame の composite target は
         // 解放マークされても submit までは valid (texture_store が handle を保持、 end_cycle は
@@ -692,6 +756,7 @@ impl OffscreenRenderer {
     /// ので、 後続の in-flight readback の進行を妨げない。
     ///
     /// # Errors
+    /// - device 消失 ([`RenderError::DeviceLost`])。
     /// - stale / 二重回収など無効な `PendingReadback` (`clear_readback_cache` 後の token 等)。
     /// - staging buffer の `map_async` / `Device::poll` 失敗。
     pub fn finish_readback(&mut self, pending: PendingReadback) -> Result<Vec<u8>, RenderError> {
@@ -702,7 +767,7 @@ impl OffscreenRenderer {
             .get(slot)
             .is_some_and(|s| s.in_flight && s.generation == pending.generation);
         if !valid {
-            return Err(RenderError::SurfaceUnavailable(
+            return Err(RenderError::Readback(
                 "finish_readback: stale or already-finished PendingReadback".to_string(),
             ));
         }
@@ -736,7 +801,7 @@ impl OffscreenRenderer {
         };
         if let Err(e) = self.device.poll(poll) {
             recycle_on_error(&mut self.readback.slots, &self.device);
-            return Err(RenderError::SurfaceUnavailable(format!("offscreen poll: {e:?}")));
+            return Err(self.readback_error(format!("offscreen poll: {e:?}")));
         }
         // wgpu 29 `PollType::Wait` は「指定 submission の完了 **と** その callback の呼び出し」 まで
         // block する保証があるので、 poll が Ok を返した時点でこの slot の map_async callback は既に
@@ -747,7 +812,7 @@ impl OffscreenRenderer {
             .and_then(|r| r.map_err(|e| format!("offscreen map_async: {e:?}")));
         if let Err(msg) = map_result {
             recycle_on_error(&mut self.readback.slots, &self.device);
-            return Err(RenderError::SurfaceUnavailable(msg));
+            return Err(self.readback_error(msg));
         }
 
         // `pack_unpadded` が `staging.unmap()` するまで in_flight=true を保つ (= 下の解放を unmap
@@ -757,6 +822,9 @@ impl OffscreenRenderer {
             Self::pack_unpadded(staging, w, h, padded)
         };
         self.readback.slots[slot].in_flight = false;
+        // readback は成功したが device を失っていたら、 中身は黒フレーム。 「正常終了した
+        // 真っ黒な mp4」 を出さないよう、 ここでも DeviceLost を優先して返す。
+        self.guard_device_lost()?;
         Ok(out)
     }
 

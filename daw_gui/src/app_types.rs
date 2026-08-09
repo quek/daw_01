@@ -2125,6 +2125,14 @@ pub(crate) type DecodedImage = (
     (u32, u32, std::sync::Arc<Vec<u8>>),
 );
 
+/// r.md #42: 動画クリップのサムネイル 1 件 (`(id, (width, height, rgba))`)。
+/// 画像と同じく **ディスク上の動画ファイルが唯一の正**で、 GPU テクスチャはそこから
+/// 何度でも作り直せる派生データ。
+pub(crate) type DecodedVideoThumbnail = (
+    common::model::VideoSourceId,
+    (u32, u32, std::sync::Arc<Vec<u8>>),
+);
+
 /// background asset decode の中間バッファ。 decode スレッドが結果を
 /// push + `done` を進め、 GUI スレッドの `on_asset_decode_tick` が caches へ排出
 /// する。
@@ -2134,10 +2142,19 @@ pub struct AssetDecodeStaging {
     pub audio: Vec<DecodedAudio>,
     /// 同 image。
     pub image: Vec<DecodedImage>,
+    /// 同 video サムネイル (r.md #42)。 `(id, (w, h, rgba))`。
+    pub video_thumbnail: Vec<DecodedVideoThumbnail>,
     /// 処理済み件数 (成功 + 失敗、 進捗表示用)。
     pub done: usize,
     /// 総件数。
     pub total: usize,
+    /// **未処理の audio 件数**。 再生 gate はこれだけを見る (r.md #42)。
+    ///
+    /// 「decode 中は再生できない」 制約の根拠は **音が揃っていないこと** であって、
+    /// サムネイルや立ち絵の画像とは無関係。 `asset_decode.is_some()` 全体で gate すると、
+    /// GPU 復旧後の画像再読込 (音は cache 済) や、 音源の無いプロジェクトを開いた直後まで
+    /// 再生が保留されてしまう。
+    pub audio_remaining: usize,
 }
 
 /// PNG/JPEG/… を decode して BGRA8 + 寸法を返す (background thread から呼ぶ自由
@@ -2163,5 +2180,32 @@ pub(crate) fn decode_image_to_bgra(abs: &Path) -> Option<(u32, u32, std::sync::A
             None
         }
     }
+}
+
+/// r.md #42: 動画 1 本から 1 フレーム目のサムネイル RGBA8 を取り出す
+/// (background thread から呼ぶ自由関数、 `decode_image_to_bgra` と同 idiom)。
+///
+/// import 時と同じ [`crate::import_video::extract_thumbnail`] を通すので、
+/// 「取り込んだ直後」 と「開き直した後」 と「GPU 再初期化後」 で同じ絵になる。
+#[cfg(windows)]
+pub(crate) fn decode_video_thumbnail(abs: &Path) -> Option<(u32, u32, std::sync::Arc<Vec<u8>>)> {
+    match crate::import_video::extract_thumbnail(abs) {
+        Ok(t) => Some((t.width, t.height, std::sync::Arc::new(t.rgba))),
+        Err(e) => {
+            tracing::warn!(
+                path = %abs.display(),
+                error = %e,
+                "asset decode (video thumbnail) failed"
+            );
+            None
+        }
+    }
+}
+
+/// 動画 decode は libav (`import_video` / `libav_decoder`) 依存で Windows 限定なので、
+/// 他プラットフォームではサムネイル機能ごと無効 (job も積まれない)。
+#[cfg(not(windows))]
+pub(crate) fn decode_video_thumbnail(_abs: &Path) -> Option<(u32, u32, std::sync::Arc<Vec<u8>>)> {
+    None
 }
 

@@ -68,6 +68,16 @@ impl Scenegraph {
         self.nodes.retain(|wid, _| seen.contains(wid));
     }
 
+    /// 全 entry を破棄して、次フレームを **全 widget cache miss** から始める。
+    ///
+    /// 用途は GPU 資産の作り直し (device lost からの復旧、daw_01 r.md #42)。
+    /// キャッシュ済みの描画コマンドには `TextureHandle` が焼き込まれており、
+    /// GPU 再生成後はそれらが全部無効になる。捨てずに再送すると「前フレームと同じ
+    /// 絵のはずが中身だけ空」という無言の描画崩れになるので、まとめて捨てる。
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+    }
+
     /// `wid` が前フレームに登場していた (= `record` 後 `retain` で残った) かを返す。
     /// M11 Phase 52: `text_input_at_focused` が「初回 show」判定に使う。
     /// frame 末尾の `retain` で eviction されるため、このフレーム途中で呼んだとき

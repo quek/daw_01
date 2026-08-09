@@ -325,6 +325,7 @@ impl AppData {
                 project_generation: 0,
                 video_texture_cache: std::collections::HashMap::new(),
                 image_texture_cache: std::collections::HashMap::new(),
+                pending_texture_destroys: Vec::new(),
                 arrangement_hover_beat: None,
                 arrangement_hover_beat_raw: None,
                 arrangement_hover_clip: None,

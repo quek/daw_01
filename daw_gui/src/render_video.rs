@@ -28,7 +28,20 @@ use std::path::{Path, PathBuf};
 
 use common::model::{ImageSourceId, Song, VideoSourceId, VideoSourcePath};
 use common::tempo_map::TempoMap;
-use daw_ui_renderer::{OffscreenRenderer, Rect, Scene, TextureHandle, TexturedQuad};
+use daw_ui_renderer::{OffscreenRenderer, Rect, RenderError, Scene, TextureHandle, TexturedQuad};
+
+/// export 中の描画エラーをユーザー向けメッセージにする (r.md #42)。
+///
+/// device lost は **再生成しない**: 途中フレームの整合性が取れないのでやり直しが正しく、
+/// 何より黙って続行すると「黒フレームだらけの mp4 が正常終了として出力される」
+/// (build / test / clippy を全部すり抜ける典型の visual regression)。
+fn export_error(e: &RenderError, frame_index: u64) -> String {
+    if e.is_device_lost() {
+        "書き出し中に GPU が失われました。再実行してください".to_string()
+    } else {
+        format!("frame {frame_index}: {e}")
+    }
+}
 
 use crate::video_playback::VideoPlaybackEngine;
 
@@ -396,14 +409,14 @@ pub fn render_mp4_cancellable(
         // return)。reusing `scene` next iteration is fine — submit captures it.
         let next = offscreen
             .submit_readback(&scene)
-            .map_err(|e| format!("submit_readback frame {frame_index}: {e:?}"))?;
+            .map_err(|e| export_error(&e, frame_index))?;
         // Collect + hand off the previous frame (its GPU readback overlapped
         // this iteration's composite). A send error means the encode worker
         // died mid-stream; its real error is surfaced by `join` below.
         if let Some(prev) = pending.take() {
             let rgba = offscreen
                 .finish_readback(prev)
-                .map_err(|e| format!("finish_readback frame {frame_index}: {e:?}"))?;
+                .map_err(|e| export_error(&e, frame_index))?;
             if cmd_tx.send(EncCmd::Video(rgba)).is_err() {
                 break;
             }
@@ -416,7 +429,7 @@ pub fn render_mp4_cancellable(
     if !cancelled && let Some(prev) = pending.take() {
         let rgba = offscreen
             .finish_readback(prev)
-            .map_err(|e| format!("finish_readback (final): {e:?}"))?;
+            .map_err(|e| export_error(&e, total_frames.saturating_sub(1)))?;
         let _ = cmd_tx.send(EncCmd::Video(rgba));
     }
 
