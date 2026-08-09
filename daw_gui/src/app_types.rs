@@ -371,6 +371,7 @@ pub enum InspectorScrubField {
     Gain,
     Pan,
     Pitch,
+    Formant,
     FadeIn,
     FadeOut,
     ImageX,

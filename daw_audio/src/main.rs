@@ -31,6 +31,7 @@ mod graph;
 mod metronome;
 mod mixer;
 mod sequencer;
+mod stretch_engine;
 
 use engine::{
     EngineCommand, EngineShared, LocalState, PlaybackCommand, PluginEntry, RtBundle, SharedState,
@@ -84,7 +85,11 @@ async fn main() -> Result<()> {
     let shared = Arc::new(SharedState::new());
     // Engine resources shared between the CPAL closure, the export thread and
     // the notify thread.
-    let engine_shared = Arc::new(EngineShared::new());
+    // r.md #40: stretch engine pool の off-thread -> RT 配送 ring は EngineShared と
+    // 一緒に作り、RT 側の片割れを CPAL closure (LocalState) へ渡す。
+    let (engine_shared, stretch_pool_rx, stretch_pool_recycle_tx) =
+        EngineShared::new_with_stretch_rings();
+    let engine_shared = Arc::new(engine_shared);
 
     // Preview channel: the receive loop pushes keyboard-preview notes here;
     // the audio thread drains it at the top of every buffer. shmem / worker
@@ -110,6 +115,8 @@ async fn main() -> Result<()> {
         cmd_rx,
         bundle_rx,
         bundle_recycle_tx,
+        stretch_pool_rx,
+        stretch_pool_recycle_tx,
     )
     .context("failed to start audio stream")?;
     tracing::info!("audio stream running");
@@ -206,7 +213,7 @@ fn decode_worker_loop(
         );
         // Publish only if no newer schedule has landed while we decoded
         // (mutex-guarded so the generation check and the store are atomic).
-        publish_audio_clip_schedule(&engine_shared, job.generation, full);
+        publish_audio_clip_schedule(&engine_shared, job.generation, full, session_sample_rate);
     }
 }
 
@@ -221,14 +228,90 @@ pub(crate) fn publish_audio_clip_schedule(
     engine_shared: &EngineShared,
     generation: u64,
     renderer: audio_clip_renderer::AudioClipRenderer,
+    session_sample_rate: u32,
 ) {
     let mut last = engine_shared
         .last_published_generation
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if generation >= *last {
+        // r.md #40: schedule を store する **前**に、その schedule が要求する
+        // stretch engine を確保して配送する。 RT は buffer の頭で pool を drain
+        // してから renderer snapshot を load するので、この順序で「新 schedule の
+        // `engine_slot` に対応するエンジンが必ず居る」 が成立する。
+        deliver_stretch_engines(engine_shared, &renderer, session_sample_rate);
         engine_shared.audio_clip_renderer.store(Arc::new(renderer));
         *last = generation;
+    }
+}
+
+/// 新 schedule が要求する stretch engine のうち **不足分だけ**を確保して RT へ
+/// 配送する (`EngineShared::stretch_pool_tx`)。 pool は grow-only なので、
+/// 既に走行中のエンジンには一切触らない (= 無関係な編集で発音中の clip が
+/// prime し直しにならない)。 off-thread 専用 (1 個 ~1 MB の確保が走る)。
+fn deliver_stretch_engines(
+    engine_shared: &EngineShared,
+    renderer: &audio_clip_renderer::AudioClipRenderer,
+    session_sample_rate: u32,
+) {
+    // RT が空にして返した配送便をここで捨てる (RT では free しない)。
+    if let Ok(mut recycle) = engine_shared.stretch_pool_recycle_rx.lock() {
+        while recycle.pop().is_ok() {}
+    }
+
+    let mut delivered = engine_shared
+        .delivered_engines_per_track
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Ok(mut tx) = engine_shared.stretch_pool_tx.lock() else {
+        return;
+    };
+    // RT 側 (= consumer) が居ないなら作っても捨てるだけ。 1 個 ~1 MB の確保を
+    // publish のたびに空振りさせない。
+    if tx.is_abandoned() {
+        return;
+    }
+    for (track_idx, &needed) in renderer.engines_per_track.iter().enumerate() {
+        // `MAX_TRACKS` を超える track は render されない (`render_master_buffer` が
+        // `min(MAX_TRACKS)` で切る) ので、エンジンを作っても無駄。
+        if track_idx >= common::audio_bridge::MAX_TRACKS {
+            break;
+        }
+        // `TrackScratch::stretch_engines` の予約容量が上限。 これを超えて配送すると
+        // RT 側が取り込めず、「配送済み」 だけが進んで永久に足りない状態になる
+        // (`assign_engine_slots` が同じ上限で彩色するので通常は届かない)。
+        let needed = needed.min(
+            u16::try_from(audio_clip_renderer::MAX_STRETCH_ENGINES_PER_TRACK).unwrap_or(u16::MAX),
+        );
+        if delivered.len() <= track_idx {
+            delivered.resize(track_idx + 1, 0);
+        }
+        let have = delivered[track_idx];
+        if needed <= have {
+            continue;
+        }
+        let mut engines = Vec::with_capacity(usize::from(needed - have));
+        for _ in have..needed {
+            let Some(engine) = stretch_engine::StretchEngine::new(session_sample_rate) else {
+                tracing::error!(track_idx, "stretch engine の確保に失敗 (OOM?)");
+                break;
+            };
+            engines.push(engine);
+        }
+        if engines.is_empty() {
+            continue;
+        }
+        let added = u16::try_from(engines.len()).unwrap_or(u16::MAX);
+        if tx
+            .push(engine::StretchPoolDelivery { track_idx, engines })
+            .is_err()
+        {
+            // ring 満杯 = RT が drain していない (停止中 / 起動前)。 次の publish で
+            // 再送されるよう配送済みカウントは進めない。
+            tracing::warn!(track_idx, "stretch engine pool ring full; 次の publish で再送");
+            continue;
+        }
+        delivered[track_idx] = have.saturating_add(added);
     }
 }
 
@@ -625,12 +708,20 @@ async fn recv_loop(
                     session_sample_rate,
                     false,
                 );
+                // main 側: 未 decode 判定は id 一致でなく origin (解決済み絶対
+                // パス) 一致で行う。 r.md #40 側: publish が stretch engine pool の
+                // 配送も担うので session SR が要る。
                 let needs_decode = audio_clip_renderer::has_undecoded_sources(
                     &song,
                     &partial,
                     project_dir.as_deref(),
                 );
-                publish_audio_clip_schedule(&engine_shared, generation, partial);
+                publish_audio_clip_schedule(
+                    &engine_shared,
+                    generation,
+                    partial,
+                    session_sample_rate,
+                );
                 // topology publish: routing schedule + tempo map を off-thread
                 // で compile して RT へ wait-free 配送 (shared.song もここで更新)。
                 publish_bundle(
@@ -1268,6 +1359,8 @@ fn start_output_stream(
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
     bundle_rx: rtrb::Consumer<RtBundle>,
     bundle_recycle_tx: rtrb::Producer<RtBundle>,
+    stretch_pool_rx: rtrb::Consumer<engine::StretchPoolDelivery>,
+    stretch_pool_recycle_tx: rtrb::Producer<engine::StretchPoolDelivery>,
 ) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
@@ -1311,6 +1404,8 @@ fn start_output_stream(
         cmd_rx,
         bundle_rx,
         bundle_recycle_tx,
+        stretch_pool_rx,
+        stretch_pool_recycle_tx,
     )?;
     stream.play().context("failed to start stream")?;
     Ok(stream)
@@ -1329,14 +1424,23 @@ fn build_stream(
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
     bundle_rx: rtrb::Consumer<RtBundle>,
     bundle_recycle_tx: rtrb::Producer<RtBundle>,
+    stretch_pool_rx: rtrb::Consumer<engine::StretchPoolDelivery>,
+    stretch_pool_recycle_tx: rtrb::Producer<engine::StretchPoolDelivery>,
 ) -> Result<cpal::Stream> {
     let channels_usize = channels as usize;
     let max_frames = common::process_data::MAX_FRAMES;
     // `LocalState` is the CPAL closure's exclusive heap. It holds
     // master_l/r and the per-track scratch — pre-allocated here, never
     // touched outside the audio thread.
-    let mut local =
-        LocalState::new(max_frames, cmd_rx, engine_shared, bundle_rx, bundle_recycle_tx);
+    let mut local = LocalState::new(
+        max_frames,
+        cmd_rx,
+        engine_shared,
+        bundle_rx,
+        bundle_recycle_tx,
+        stretch_pool_rx,
+        stretch_pool_recycle_tx,
+    );
 
     // panic-button master declick. `AudioCommand::Panic` sets
     // `shared.panic_declick`; the callback consumes that edge and fades the

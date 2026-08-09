@@ -304,6 +304,25 @@ pub struct EngineShared {
     /// store). Holds the highest generation published so far. Off the audio
     /// thread — the CPAL callback never takes this lock (r.md #7 B)。
     pub last_published_generation: std::sync::Mutex<u64>,
+    /// r.md #40: stretch engine pool の off-thread → RT 配送口。
+    ///
+    /// `StretchEngine` は 1 個 ~1 MB を確保するので **RT では作れない**。
+    /// `publish_audio_clip_schedule` が新 schedule の
+    /// `AudioClipRenderer::engines_per_track` を見て不足分を作り、ここへ push する
+    /// (schedule を `ArcSwap` に store する **前**に push するので、RT が新
+    /// schedule を見るときには pool が届いている)。 producer が 2 つある
+    /// (recv loop / decode worker) ので `Mutex` で直列化する — off-thread なので
+    /// ロックしてよい (RT 側は `LocalState::stretch_pool_rx` を lock-free に drain)。
+    pub stretch_pool_tx: std::sync::Mutex<rtrb::Producer<StretchPoolDelivery>>,
+    /// RT が空にした配送便 (= `Vec` の heap 実体) を返す口。 RT で `drop` すると
+    /// free になるので、ここへ push して off-thread で捨てる
+    /// (`input_delay_replacements` の recycle と同じ idiom)。
+    pub stretch_pool_recycle_rx: std::sync::Mutex<rtrb::Consumer<StretchPoolDelivery>>,
+    /// track ごとに **配送済み**のエンジン数 (= `TrackScratch::stretch_engines` の
+    /// 長さ)。 pool は grow-only: 一度作ったエンジンは走行中のストリームを壊さない
+    /// よう回収しない (縮めると `Vec` 全体を差し替えることになり、無関係な発音まで
+    /// prime し直しになる)。 `last_published_generation` を保持したまま触る。
+    pub delivered_engines_per_track: std::sync::Mutex<Vec<u16>>,
     /// Current project directory, used to resolve
     /// `AudioSourcePath::ProjectRelative`. `None` for unsaved projects
     /// — `ProjectRelative` paths fail to resolve in that state and the
@@ -338,9 +357,43 @@ pub struct EngineShared {
     pub mmcss_warned: AtomicBool,
 }
 
+/// r.md #40: off-thread で確保した stretch engine を RT の `TrackScratch` へ
+/// 渡す配送便。 RT は `engines` を `pop` して
+/// `TrackScratch::stretch_engines` へ `push` し (予約済み容量内なので再確保なし)、
+/// 空になった本体を recycle ring へ返す (`Vec` の解放を off-thread に追い出す)。
+pub struct StretchPoolDelivery {
+    pub track_idx: usize,
+    pub engines: Vec<crate::stretch_engine::StretchEngine>,
+}
+
+/// 配送 ring の深さ。1 回の publish で最大 `MAX_TRACKS` 便が積まれるので、
+/// RT が 1 buffer 遅れても溢れないよう 2 倍取る。
+const STRETCH_POOL_RING_CAP: usize = MAX_TRACKS * 2;
+
 impl EngineShared {
+    /// `EngineShared` と、RT (`LocalState`) が持つべき ring の片割れを作る。
+    pub fn new_with_stretch_rings() -> (
+        Self,
+        rtrb::Consumer<StretchPoolDelivery>,
+        rtrb::Producer<StretchPoolDelivery>,
+    ) {
+        let (tx, rx) = rtrb::RingBuffer::new(STRETCH_POOL_RING_CAP);
+        let (recycle_tx, recycle_rx) = rtrb::RingBuffer::new(STRETCH_POOL_RING_CAP);
+        let mut shared = Self::new();
+        shared.stretch_pool_tx = std::sync::Mutex::new(tx);
+        shared.stretch_pool_recycle_rx = std::sync::Mutex::new(recycle_rx);
+        (shared, rx, recycle_tx)
+    }
+
     pub fn new() -> Self {
+        // 呼び出し側が `new_with_stretch_rings` を使わない (テスト等) 場合は、
+        // 相手のいない ring を持つ = 配送は起きないが panic もしない。
+        let (tx, _rx) = rtrb::RingBuffer::new(1);
+        let (_recycle_tx, recycle_rx) = rtrb::RingBuffer::new(1);
         Self {
+            stretch_pool_tx: std::sync::Mutex::new(tx),
+            stretch_pool_recycle_rx: std::sync::Mutex::new(recycle_rx),
+            delivered_engines_per_track: std::sync::Mutex::new(Vec::new()),
             plugin_refs: ArcSwap::from_pointee(HashMap::new()),
             worker: ArcSwapOption::empty(),
             export_running: AtomicBool::new(false),
@@ -474,15 +527,6 @@ pub struct LocalState {
     /// 判定し、 `playhead_beats` を再初期化する。 初期値 `u64::MAX` は
     /// 「未確定」 (= 最初の buffer は必ず seek 扱いで初期化される)。
     pub last_known_playhead: u64,
-    /// Phase 5 follow-up (granular DSP click 抑制): LP smoothed **絶対**
-    /// `current_bpm` (= SongTempo curve eval 後の現テンポ、 単位は BPM)。
-    /// audio_clip_renderer の Stretch mode (granular_sample_at) が
-    /// `tempo_follow_ratio(stretch_ratio, smoothed_current_bpm, nominal_bpm)`
-    /// で source 進度を求めるのに使う。 nominal_bpm は per-event の compile時
-    /// song.bpm なので、 base bpm を変えても `smoothed_current_bpm /
-    /// nominal_bpm` が正しく追従する (r.md #6)。 LP coef は process_buffer で
-    /// `~50ms TC` 相当。 初期値 120.0 BPM。
-    pub smoothed_current_bpm: f64,
     /// metronome click voice 状態 (mono single-voice)。 `Some` なら active
     /// (= まだ decay 中)。 詳細は `crate::metronome`。
     pub metronome_voice: Option<ClickVoice>,
@@ -501,6 +545,11 @@ pub struct LocalState {
     /// when it swaps in a newer one; the receive loop `pop`s and drops them,
     /// so `Drop` (free / unmap / worker join) runs off the audio thread.
     pub bundle_recycle_tx: rtrb::Producer<RtBundle>,
+    /// r.md #40: off-thread が確保した stretch engine の受け口。 毎 buffer
+    /// (renderer snapshot を load する前に) drain して `TrackScratch` に移す。
+    pub stretch_pool_rx: rtrb::Consumer<StretchPoolDelivery>,
+    /// 空にした配送便を off-thread へ返す口 (RT で `Vec` を drop しないため)。
+    pub stretch_pool_recycle_tx: rtrb::Producer<StretchPoolDelivery>,
     /// Cached schedule (installed from the newest bundle; 値のみ更新では
     /// 据え置き)。DelayLine / FollowerSlot の走行状態を内包する。
     pub cached_schedule: Schedule,
@@ -542,16 +591,19 @@ impl LocalState {
         shared: Arc<EngineShared>,
         bundle_rx: rtrb::Consumer<RtBundle>,
         bundle_recycle_tx: rtrb::Producer<RtBundle>,
+        stretch_pool_rx: rtrb::Consumer<StretchPoolDelivery>,
+        stretch_pool_recycle_tx: rtrb::Producer<StretchPoolDelivery>,
     ) -> Self {
         let scratch = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
         Self {
+            stretch_pool_rx,
+            stretch_pool_recycle_tx,
             scratch,
             master_l: vec![0.0; max_frames],
             master_r: vec![0.0; max_frames],
             playing: false,
             playhead_beats: 0.0,
             last_known_playhead: u64::MAX,
-            smoothed_current_bpm: 120.0,
             metronome_voice: None,
             cmd_rx,
             shared,
@@ -625,6 +677,22 @@ impl LocalState {
                         s.input_delay_line.reset();
                     }
                 }
+                // r.md #40: stretch engine の走行ストリームも Song スコープ。
+                // `stream_key = clip.id << 32 | audio event id` は project ごとに
+                // 1 から再採番される名前なので、別 project の event が同じキーで
+                // **引き当てに成功してしまう** (= 前 project のスペクトル状態を
+                // 引き継いだ音が頭に混ざる)。 pool の実体は使い回すが、走行状態は
+                // 捨てて必ず prime し直させる。 alloc / free 無し。
+                for s in &mut self.scratch {
+                    for engine in &mut s.stretch_engines {
+                        engine.forget_stream();
+                    }
+                    // tape 位置 accumulator も同じ理由で無効化する
+                    // (添字は track 内 schedule 順 = 位置キー)。
+                    for slot in &mut s.repitch_accum {
+                        *slot = (u64::MAX, 0.0);
+                    }
+                }
             } else {
                 // §5 D: 走行状態 (PDC ring / follower env) を stable key で移送。
                 sched.adopt_state_from(&mut self.cached_schedule);
@@ -664,6 +732,29 @@ impl LocalState {
             worker: old_worker,
         };
         let _ = self.bundle_recycle_tx.push(recycled);
+    }
+
+    /// r.md #40: off-thread が確保した stretch engine を `TrackScratch` へ取り込む。
+    /// **`audio_clip_renderer` の snapshot を load する前**に呼ぶこと — publish 側が
+    /// 「pool を push してから schedule を store」 の順で出すので、この順序を守れば
+    /// 新 schedule の `engine_slot` に対応するエンジンが必ず揃っている。
+    ///
+    /// RT-safe: `pop` / `push` / move のみ。 `stretch_engines` は容量予約済なので
+    /// `push` は再確保しない (= 走行中のエンジンを動かさずに増やせる)。 空になった
+    /// 配送便は recycle ring へ返して off-thread で drop する。
+    fn refresh_stretch_pools(&mut self) {
+        while let Ok(mut delivery) = self.stretch_pool_rx.pop() {
+            if let Some(scratch) = self.scratch.get_mut(delivery.track_idx) {
+                while scratch.stretch_engines.len() < scratch.stretch_engines.capacity() {
+                    let Some(engine) = delivery.engines.pop() else {
+                        break;
+                    };
+                    scratch.stretch_engines.push(engine);
+                }
+            }
+            // 取り込めなかったエンジン (容量超過) も配送便に残したまま返す。
+            let _ = self.stretch_pool_recycle_tx.push(delivery);
+        }
     }
 
     /// Drain pending preview commands. Called at the top of `process_buffer`.
@@ -720,6 +811,9 @@ impl LocalState {
         // Install the newest off-thread snapshot (song / schedule /
         // plugin_refs / worker rig) before the dispatch starts.
         self.refresh_bundle();
+        // r.md #40: audio clip renderer snapshot を load する前に stretch engine
+        // pool を取り込む (publish 側は pool → schedule の順で出す)。
+        self.refresh_stretch_pools();
         let song_snapshot = self.cached_song.clone();
 
         // recv loop が schedule compile の buffer_frames (leaf sidechain の
@@ -881,23 +975,6 @@ impl LocalState {
             None => 120.0,
         };
 
-        // Phase 5 follow-up (granular DSP click 抑制) / r.md #6 (base bpm follow):
-        // **絶対** current_bpm を LP smoothing して Stretch granular path に渡す。
-        // Play edge / seek と同 frame で target に snap-reset し、 旧 tempo 履歴を
-        // 持ち越さない。
-        let target_current_bpm = if song_ref.is_some() {
-            f64::from(current_bpm)
-        } else {
-            120.0
-        };
-        if playhead != self.last_known_playhead {
-            self.smoothed_current_bpm = target_current_bpm;
-        } else {
-            const GRANULAR_LP_COEF: f64 = 0.3;
-            self.smoothed_current_bpm +=
-                GRANULAR_LP_COEF * (target_current_bpm - self.smoothed_current_bpm);
-        }
-
         if let Some(song) = song_ref {
             let n_tracks = song.tracks.len().min(MAX_TRACKS);
 
@@ -946,7 +1023,6 @@ impl LocalState {
                 recording_lanes,
                 current_bpm,
                 self.playhead_beats,
-                self.smoothed_current_bpm,
                 &self.mod_scalars_snapshot,
                 master_gain,
             );
@@ -1149,12 +1225,18 @@ mod bundle_install_tests {
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (bundle_tx, bundle_rx) = rtrb::RingBuffer::new(8);
         let (recycle_tx, recycle_rx) = rtrb::RingBuffer::new(8);
+        let (pool_tx, pool_rx) = rtrb::RingBuffer::<StretchPoolDelivery>::new(4);
+        let (pool_recycle_tx, pool_recycle_rx) = rtrb::RingBuffer::<StretchPoolDelivery>::new(4);
+        drop(pool_tx);
+        drop(pool_recycle_rx);
         let local = LocalState::new(
             common::process_data::MAX_FRAMES,
             cmd_rx,
             shared,
             bundle_rx,
             recycle_tx,
+            pool_rx,
+            pool_recycle_tx,
         );
         (local, bundle_tx, recycle_rx)
     }

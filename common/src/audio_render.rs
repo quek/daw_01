@@ -15,8 +15,9 @@
 //!   捨てていたため inspector のピッチが無反応になっていた
 //!
 //! どれも RT path で呼ばれることを想定し allocation / panic free。
-//! `Stretch` / `Slice` の time-stretch 本体は daw_audio
-//! `audio_clip_renderer.rs` の `granular_sample_at` / `slice_sample_at` が担う。
+//! `Stretch` の time-stretch 本体は daw_audio `stretch_engine.rs`
+//! (スペクトル方式、 pitch / formant を直交して持つ)、 `Slice` は
+//! `audio_clip_renderer.rs` の `slice_sample_at` が担う。
 
 use crate::model::{BeatMarker, FadeCurve, StretchMode};
 
@@ -83,8 +84,10 @@ pub fn sample_rate_ratio(source_sample_rate: u32, engine_sample_rate: u32) -> f6
 /// **ピッチ軸**の比: semitone → 再生比 (`2^(n/12)`)。 時間軸とは独立の量で、
 /// mode ごとに合成先が変わる:
 /// - `Raw` / `Repitch` (tape): source を読む速度そのものに掛かる → 長さも変わる
-/// - `Stretch` (granular) / `Slice`: grain / slice の **内部読み出し速度**にだけ
-///   掛かり、 grain / slice の **配置**には掛からない → 長さを変えずに移調する
+/// - `Slice`: slice の **内部読み出し速度**にだけ掛かり、 slice の **配置**には
+///   掛からない → 長さを変えずに移調する
+/// - `Stretch`: スペクトルエンジンが半音値を直接受けるのでこの比は使わない
+///   (時間伸縮・移調・フォルマントを 1 段で担う)
 ///
 /// 非有限 / 極端な入力は ±120 半音 (= ±10 oct) に clamp して比が inf / NaN に
 /// ならないようにする (RT path で使うので panic / alloc なし)。
@@ -441,38 +444,25 @@ fn warp_wave_spans(
         ) else {
             continue;
         };
-        // engine は grain **ごと** に `(warp_source_frame(beat) - source_start).max(0.0)`
-        // を評価する (`granular_sample_at`) ので、 窓手前を指す拍区間は
-        // 「先頭 frame を保持 (flat)」 → その先は本来の傾き、 という区分写像になる。
-        // 端点だけ clamp してから線形補間すると別形 (圧縮された 1 本の線) に
-        // なってしまうので、 source_start を跨ぐ区間はその交点で分割する。
-        let (p0, p1) = (sf0 - base, sf1 - base);
-        if (p0 < 0.0) != (p1 < 0.0) && (p1 - p0).abs() > 1e-9 {
-            let t = (-p0) / (p1 - p0);
-            let bx = b0 + (b1 - b0) * t;
-            if p0 < 0.0 {
-                // 前半 flat (先頭 frame 保持) → 後半が本来の傾き。
-                push_wave_span(out, source_start, window, event.reversed, b0, bx, 0.0, 0.0, head);
-                head = false;
-                push_wave_span(out, source_start, window, event.reversed, bx, b1, 0.0, p1, head);
-            } else {
-                push_wave_span(out, source_start, window, event.reversed, b0, bx, p0, 0.0, head);
-                head = false;
-                push_wave_span(out, source_start, window, event.reversed, bx, b1, 0.0, 0.0, head);
-            }
-        } else {
-            push_wave_span(
-                out,
-                source_start,
-                window,
-                event.reversed,
-                b0,
-                b1,
-                p0.max(0.0),
-                p1.max(0.0),
-                head,
-            );
-        }
+        // spectral 経路 (r.md #40) の `u_of` は
+        // `warp_source_frame(beat) - source_start_frames` を **clamp せずに**
+        // `source_frame_lerp` へ渡す。 窓外 (`u < 0` / `u >= 窓`) は `None` =
+        // 無音なので、 描画も窓を跨ぐ区間をその交点で切り詰めるだけでよい
+        // (`push_wave_span` が担う)。
+        // ※ 旧 granular は grain ごとに `.max(0.0)` していたため「窓手前は
+        // 先頭 frame を保持 (flat)」 だった。 #40 でこの clamp は無くなったので、
+        // flat 区間を作ってはいけない (作ると無音のはずの場所に波形が出る)。
+        push_wave_span(
+            out,
+            source_start,
+            window,
+            event.reversed,
+            b0,
+            b1,
+            sf0 - base,
+            sf1 - base,
+            head,
+        );
         head = false;
     }
 }
@@ -555,7 +545,12 @@ fn slice_wave_spans(
 ///   (伸縮に追従しない = **実時間** で source を消費するので tempo に依存する)
 /// - `Repitch`: 1 span、 `nominal_fpb × stretch × pitch` (tape 式、 tempo 不変)
 /// - `Stretch`: warp marker が 2 本以上なら marker 区間ごとの区分線形、 無ければ
-///   1 span で `nominal_fpb × stretch` (ピッチは長さに影響しない、 tempo 不変)
+///   1 span で `nominal_fpb × stretch` (ピッチ / フォルマントは長さに影響しない、
+///   tempo 不変)。 r.md #40 でスペクトル方式 (signalsmith-stretch) に置換されたが、
+///   時間写像は engine ではなく呼び出し側の `u_of` が決めており、
+///   その値が `beat × src_frames_per_beat` = ここの `nominal_fpb × stretch` と同一。
+///   engine 不在時の degrade 経路 (`tape_ratio = time_stride × follow_instant`) も
+///   拍領域では同じ量なので、 どちらに落ちても描画は一致する
 /// - `Slice`: onset ごとに 1 slice。 trigger 拍 = `onsets[i] / (nominal_fpb × stretch)`
 ///   で **tempo 不変**、 slice 本体は Raw と同じ native rate なので、
 ///   伸ばせば **gap**、 詰めれば **cut**
@@ -572,10 +567,17 @@ fn slice_wave_spans(
 /// 毎フレームの描画 path から呼ばれるので、 結果は呼び出し側の `Vec` に積む
 /// (先頭で `clear` する)。
 ///
-/// **この写像は `daw_audio::audio_clip_renderer` の `render_audio_events` /
-/// `granular_sample_at` / `slice_sample_at` と一致していなければならない**
-/// (= 描いた波形と鳴る音が一致する条件)。 束縛テストは daw_audio 側の
-/// `wave_span_binding_tests` にある。
+/// **`formant_semitones` はここに現れない** — フォルマント (スペクトル包絡の
+/// 移調) は周波数軸だけの操作で時間写像に一切効かないので、 波形の長さにも
+/// 位置にも影響しない (r.md #40)。 将来 formant を足したくなっても、 それは
+/// 仕様の誤解。
+///
+/// **この写像は `daw_audio::audio_clip_renderer::render_audio_events` と一致して
+/// いなければならない** (= 描いた波形と鳴る音が一致する条件):
+/// `Stretch` は spectral 経路の `u_of` (= `beat × src_frames_per_beat`、
+/// warp marker があれば `warp_source_frame`)、 tape / slice は
+/// `tape_sample_at` / `slice_sample_at` の `time_stride` / `read_stride` 合成。
+/// 束縛テストは daw_audio 側の `wave_span_binding_tests` にある。
 pub fn event_wave_spans(
     event: &crate::model::AudioEvent,
     source_sample_rate: u32,
@@ -723,9 +725,9 @@ pub fn source_frame_at_beat(spans: &[WaveSpan], beat: f64) -> Option<f64> {
 /// よって schedule の再コンパイル (= nominal_bpm が現 song.bpm に更新され、
 /// stretch_ratio も同時に再算出される) を跨いでも追従結果が一致する。
 ///
-/// `current_bpm` は呼び出し側で、 Stretch (granular) は LP smoothed な値 (=
-/// click 抑制、 grain source jump 抑制)、 Repitch / Slice は instant な値 (=
-/// pitch / slice trigger の追随性優先) を渡す。 `nominal_bpm <= 0` は退化入力と
+/// 呼び出すのは Repitch / Slice (instant な `current_bpm`)。 Stretch は
+/// **beat 領域**で写像する (= 1 拍あたりの source frame 数は tempo に依らない)
+/// ので、この関数を通さない。 `nominal_bpm <= 0` は退化入力と
 /// して `stretch_ratio` を素通し (= 追従なし) する defensive。 RT path で呼ばれる
 /// ので alloc / panic free。
 #[inline]

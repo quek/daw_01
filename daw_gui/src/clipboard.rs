@@ -193,16 +193,17 @@ pub fn sanitize_audio_events(events: Vec<AudioEvent>) -> Vec<AudioEvent> {
             }
             e.gain_db = e.gain_db.clamp(-60.0, 24.0);
             e.pan = if e.pan.is_finite() { e.pan.clamp(-1.0, 1.0) } else { 0.0 };
-            e.pitch_semitones = if e.pitch_semitones.is_finite() {
-                e.pitch_semitones.clamp(-48.0, 48.0)
-            } else {
-                0.0
-            };
-            e.formant_semitones = if e.formant_semitones.is_finite() {
-                e.formant_semitones.clamp(-48.0, 48.0)
-            } else {
-                0.0
-            };
+            // 範囲は setter / inspector と同じ定数を引く (r.md #40 以前は
+            // setter ±96 / ここ ±48 と割れていて、コピー&ペーストするだけで
+            // ピッチが静かに切られていた)。
+            e.pitch_semitones = common::model::clamp_semitones(
+                e.pitch_semitones,
+                common::model::PITCH_SEMITONES_LIMIT,
+            );
+            e.formant_semitones = common::model::clamp_semitones(
+                e.formant_semitones,
+                common::model::FORMANT_SEMITONES_LIMIT,
+            );
             e.fade_in_beats = if e.fade_in_beats.is_finite() {
                 e.fade_in_beats.max(0.0)
             } else {

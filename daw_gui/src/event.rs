@@ -1278,6 +1278,9 @@ pub enum AppEvent {
     SetClipGainDb { target: ClipRef, gain_db: f32 },
     SetClipPan { target: ClipRef, pan: f32 },
     SetClipPitchSemitones { target: ClipRef, semitones: f32 },
+    /// r.md #40: スペクトル包絡 (フォルマント) の移調量。 音程とは独立に
+    /// 「声質」 だけを動かす。
+    SetClipFormantSemitones { target: ClipRef, semitones: f32 },
 
     // ---- Audio event fade 編集 (Phase 2 PR3) ----------------------------
     /// Fade length / curve の programmatic 設定。 `SetClipGainDb` 等と
@@ -1561,6 +1564,7 @@ impl AppEvent {
             E::SetClipGainDb { .. } | E::SetClipGainDbBatch(..) => "クリップゲイン変更",
             E::SetClipPan { .. } => "クリップパン変更",
             E::SetClipPitchSemitones { .. } => "クリップピッチ変更",
+            E::SetClipFormantSemitones { .. } => "クリップフォルマント変更",
             E::SetClipFadeInBeats { .. }
             | E::SetClipFadeOutBeats { .. }
             | E::SetClipFadeInCurve { .. }
