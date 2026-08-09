@@ -115,6 +115,7 @@ fn render_frame(
                             .min(max_start),
                         len_samples: view_len,
                         vertical_gain: 1.0,
+                        reversed: false,
                     };
                     let _ = hctx.waveform(("clip", i), rect, source, view, style);
                 }

@@ -317,9 +317,24 @@ impl AppData {
     }
 
     pub(crate) fn set_clip_audio_event_pitch_semitones(&mut self, target: ClipRef, semitones: f32) {
-        // Bitwig spec §3.6: Pitch range is -96 .. +96 semitones.
-        let semitones = semitones.clamp(-96.0, 96.0);
+        // 範囲の SSoT は `common::model::PITCH_SEMITONES_LIMIT`
+        // (inspector の range / 貼り付け sanitize も同じ定数を引く)。
+        let semitones =
+            common::model::clamp_semitones(semitones, common::model::PITCH_SEMITONES_LIMIT);
         self.mutate_audio_events_in_clip(target, |e| e.pitch_semitones = semitones);
+        self.resync_clip_audio_event_edit_buffers(target);
+    }
+
+    /// r.md #40: スペクトル包絡 (フォルマント) の移調量。 `0` の意味は
+    /// stretch mode で変わる (`common::model::AudioEvent::formant_semitones` の表)。
+    pub(crate) fn set_clip_audio_event_formant_semitones(
+        &mut self,
+        target: ClipRef,
+        semitones: f32,
+    ) {
+        let semitones =
+            common::model::clamp_semitones(semitones, common::model::FORMANT_SEMITONES_LIMIT);
+        self.mutate_audio_events_in_clip(target, |e| e.formant_semitones = semitones);
         self.resync_clip_audio_event_edit_buffers(target);
     }
 

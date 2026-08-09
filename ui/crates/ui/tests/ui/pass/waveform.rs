@@ -57,6 +57,7 @@ fn main() {
                     start_sample: 0,
                     len_samples: m.valid_len as u64,
                     vertical_gain: 1.0,
+                    reversed: false,
                 },
                 WaveformStyle::default(),
             );
@@ -76,6 +77,7 @@ fn main() {
                     start_sample: 0,
                     len_samples: m.valid_len as u64,
                     vertical_gain: 1.0,
+                    reversed: false,
                 },
                 WaveformStyle::default(),
             );
@@ -97,6 +99,7 @@ fn main() {
                     start_sample: 0,
                     len_samples: m.valid_len as u64,
                     vertical_gain: 1.0,
+                    reversed: false,
                 },
                 WaveformStyle::default(),
             );

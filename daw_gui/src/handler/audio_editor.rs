@@ -395,7 +395,7 @@ impl AppData {
             else {
                 return None;
             };
-            let new_event = AudioEvent {
+            let mut new_event = AudioEvent {
                 source_id,
                 event_start_in_clip_beats: position,
                 event_length_beats: length_beats,
@@ -403,6 +403,9 @@ impl AppData {
                 source_end_frames,
                 ..AudioEvent::default()
             };
+            // 安定 id を採番する (`AudioEvent::default()` は 0 sentinel)。 波形の LOD
+            // キャッシュ等が id でアドレスするので、 同一 content 内で衝突させない。
+            new_event.id = audio.alloc_event_id();
             audio.events.push(new_event);
             let new_idx = audio.events.len() - 1;
             let needed = position + length_beats;

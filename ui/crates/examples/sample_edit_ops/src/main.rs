@@ -503,6 +503,7 @@ impl App {
                     start_sample: m.viewport.view_start as u64,
                     len_samples: m.viewport.view_len as u64,
                     vertical_gain: m.vertical_gain,
+                    reversed: false,
                 };
                 let style = WaveformStyle {
                     fg: Color::rgb(0.55, 0.78, 0.95),

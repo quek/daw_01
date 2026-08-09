@@ -68,5 +68,5 @@ pub use widgets::text_input::TextInputResponse;
 pub use widgets::toggle_button::{ToggleButtonResponse, ToggleButtonStyle};
 pub use widgets::waveform::{
     ChannelLayout, SampleSlices, WaveformHit, WaveformRenderMode, WaveformResponse,
-    WaveformSource, WaveformStyle, WaveformView,
+    WaveformSegment, WaveformSource, WaveformStyle, WaveformView,
 };

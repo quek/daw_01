@@ -106,11 +106,6 @@ pub struct DispatchShared {
     /// playhead を f64 bits で atomic 配信。 workers が
     /// `f64::from_bits(load())` で復元、 `collect_events_for_buffer` に渡す。
     pub playhead_beats_bits: std::sync::atomic::AtomicU64,
-    /// Phase 5 follow-up (granular DSP click 抑制) / r.md #6: LP smoothed な
-    /// **絶対** current_bpm (BPM 単位)。 audio_clip_renderer::render_audio_events
-    /// の Stretch mode が source 進度を出すのに使う。 f64 bits で atomic 配信、
-    /// init = 120.0 BPM。
-    pub smoothed_current_bpm_bits: std::sync::atomic::AtomicU64,
 }
 
 unsafe impl Send for DispatchShared {}
@@ -141,9 +136,6 @@ impl DispatchShared {
             current_bpm_bits: AtomicU32::new(120.0_f32.to_bits()),
             playhead_beats_bits: std::sync::atomic::AtomicU64::new(
                 0.0_f64.to_bits(),
-            ),
-            smoothed_current_bpm_bits: std::sync::atomic::AtomicU64::new(
-                120.0_f64.to_bits(),
             ),
         }
     }
@@ -255,7 +247,6 @@ impl AudioWorkerPool {
         recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
         current_bpm: f32,
         playhead_beats: f64,
-        smoothed_current_bpm: f64,
         looping: bool,
         mod_scalars: &[f32],
     ) {
@@ -313,9 +304,6 @@ impl AudioWorkerPool {
         self.shared
             .playhead_beats_bits
             .store(playhead_beats.to_bits(), Ordering::Release);
-        self.shared
-            .smoothed_current_bpm_bits
-            .store(smoothed_current_bpm.to_bits(), Ordering::Release);
         // PR4.5: publish per-track input delay slice so workers can read
         // their track's value without locking. Empty slice (= no
         // sidechain wiring anywhere) → null pointer + len 0.
@@ -535,10 +523,6 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
     // で配信。 f64 bits を Acquire で load。
     let playhead_beats =
         f64::from_bits(shared.playhead_beats_bits.load(Ordering::Acquire));
-    // Phase 5 follow-up (granular DSP click 抑制) / r.md #6: LP smoothed 絶対 bpm。
-    let smoothed_current_bpm = f64::from_bits(
-        shared.smoothed_current_bpm_bits.load(Ordering::Acquire),
-    );
     // user の loop button 実状態 (master が dispatch 前に store)。
     let looping = shared.looping.load(Ordering::Acquire) != 0;
 
@@ -613,7 +597,6 @@ fn run_work_loop(shared: &DispatchShared, sync_slot: usize) {
             recording_lanes,
             current_bpm,
             playhead_beats,
-            smoothed_current_bpm,
             looping,
             mod_scalars,
         );

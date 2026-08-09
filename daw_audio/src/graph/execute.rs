@@ -133,11 +133,6 @@ pub fn process_track_owned(
     // playhead。 collect_events_for_buffer に渡して beat-domain で note 配置
     // を判定する。 変動 tempo でも note 位置が正しく追随する。
     playhead_beats: f64,
-    // Phase 5 follow-up (granular DSP click 抑制) / r.md #6: LP smoothed な
-    // **絶対** current_bpm (BPM 単位)。 audio_clip_renderer::render_audio_events
-    // に渡して、 Stretch mode が `tempo_follow_ratio(stretch_ratio,
-    // smoothed_current_bpm, nominal_bpm)` で source 進度を計算するのに使う。
-    smoothed_current_bpm: f64,
     // user の loop button 実状態 (= `shared.looping`)。 set_pd_transport に渡す。
     looping: bool,
     // docs/plan_modulation.md §5: per-`ModSource` follower scalars (block-rate
@@ -254,9 +249,13 @@ pub fn process_track_owned(
             current_bpm,
             sample_rate,
             frames,
-            smoothed_current_bpm,
-            &mut scratch.granular_rings,
-            &mut scratch.repitch_accum,
+            &mut crate::audio_clip_renderer::ClipRenderState {
+                repitch_accum: &mut scratch.repitch_accum,
+                engines: &mut scratch.stretch_engines,
+                event_l: &mut scratch.stretch_out_l,
+                event_r: &mut scratch.stretch_out_r,
+                render_seq: &mut scratch.clip_render_seq,
+            },
         );
     }
     // PR4.5 sidechain plugin-internal alignment: main 信号を遅延させて sidechain
@@ -1266,7 +1265,6 @@ pub fn render_master_buffer(
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     current_bpm: f32,
     playhead_beats: f64,
-    smoothed_current_bpm: f64,
     mod_scalars: &[f32],
     master_gain: f32,
 ) {
@@ -1296,7 +1294,6 @@ pub fn render_master_buffer(
             recording_lanes,
             current_bpm,
             playhead_beats,
-            smoothed_current_bpm,
             looping,
             mod_scalars,
         );
@@ -1337,7 +1334,6 @@ pub fn render_master_buffer(
                 recording_lanes,
                 current_bpm,
                 playhead_beats,
-                smoothed_current_bpm,
                 looping,
                 mod_scalars,
             );
@@ -1911,7 +1907,6 @@ mod render_master_tests {
             &std::collections::HashSet::new(),
             120.0,
             0.0,
-            120.0,
             &[],
             0.5,
         );

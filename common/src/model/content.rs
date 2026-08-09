@@ -635,7 +635,26 @@ pub struct AudioEvent {
 
     pub gain_db: f32,
     pub pan: f32,
+    /// 移調量 (半音)。有効範囲は [`PITCH_SEMITONES_LIMIT`]。
     pub pitch_semitones: f32,
+    /// **スペクトル包絡 (フォルマント) の移調量 (半音)** — 「声質」を音程と
+    /// 独立に動かすつまみ。有効範囲は [`FORMANT_SEMITONES_LIMIT`]。r.md #40。
+    ///
+    /// mode ごとの意味 (`0` の意味が mode で違うのが肝):
+    ///
+    /// | mode | `0` の意味 | `F` の意味 |
+    /// |---|---|---|
+    /// | [`StretchMode::Stretch`] | **原音のフォルマントを保持** (= 移調しても声質が変わらない) | 原音の包絡を `F` 半音動かす |
+    /// | `Raw` / `Repitch` / `Slice` | 完全バイパス (= テープ挙動そのまま、出力は 1 サンプルも変わらない) | テープ結果の包絡を `F` 半音動かす |
+    ///
+    /// Stretch だけ「0 = 保持」なのは、スペクトル方式の定義が音程と包絡の分離
+    /// だから (Ableton Complex Pro の Formants=100%、Bitwig Elastique Pro、
+    /// Cubase VariAudio、Melodyne と同じ流儀)。テープ系で「0 = 未処理」なのは、
+    /// Repitch の存在意義がテープ挙動そのものだから (Ableton Re-Pitch に
+    /// フォルマント制御が無いのと同じ理由)。
+    ///
+    /// **時間軸には一切効かない** ので、波形描画
+    /// (`common::audio_render::audible_source_span`) には現れない。
     pub formant_semitones: f32,
 
     pub stretch_mode: StretchMode,
@@ -690,6 +709,29 @@ impl Default for AudioEvent {
             onsets: Vec::new(),
             beat_markers: Vec::new(),
         }
+    }
+}
+
+/// [`AudioEvent::pitch_semitones`] の絶対値上限 (半音)。Bitwig の audio event
+/// pitch range (±96) に合わせる。
+///
+/// **setter / clipboard sanitize / inspector の range はここだけを見ること**。
+/// r.md #40 以前は setter が ±96、貼り付け sanitize が ±48 と割れていて、
+/// コピー&ペーストするだけで値が静かに切られていた。
+pub const PITCH_SEMITONES_LIMIT: f32 = 96.0;
+
+/// [`AudioEvent::formant_semitones`] の絶対値上限 (半音)。±4 oct は Melodyne の
+/// フォルマントツール (cent 単位で数千 cent) の実用域を包含する。
+pub const FORMANT_SEMITONES_LIMIT: f32 = 48.0;
+
+/// 有限値かつ `±limit` に収める。非有限 (NaN / Inf) は `0.0`。
+/// pitch / formant の clamp を書く場所を 1 つにするための helper。
+#[must_use]
+pub fn clamp_semitones(value: f32, limit: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-limit, limit)
+    } else {
+        0.0
     }
 }
 

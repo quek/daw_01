@@ -1390,6 +1390,7 @@ dependencies = [
  "cpal",
  "hound",
  "rtrb",
+ "signalsmith-sys",
  "tokio",
  "tracing",
  "windows 0.62.2",
@@ -4519,6 +4520,13 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "signalsmith-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

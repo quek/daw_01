@@ -15,8 +15,9 @@
 //!   捨てていたため inspector のピッチが無反応になっていた
 //!
 //! どれも RT path で呼ばれることを想定し allocation / panic free。
-//! `Stretch` / `Slice` の time-stretch 本体は daw_audio
-//! `audio_clip_renderer.rs` の `granular_sample_at` / `slice_sample_at` が担う。
+//! `Stretch` の time-stretch 本体は daw_audio `stretch_engine.rs`
+//! (スペクトル方式、 pitch / formant を直交して持つ)、 `Slice` は
+//! `audio_clip_renderer.rs` の `slice_sample_at` が担う。
 
 use crate::model::{BeatMarker, FadeCurve, StretchMode};
 
@@ -83,8 +84,10 @@ pub fn sample_rate_ratio(source_sample_rate: u32, engine_sample_rate: u32) -> f6
 /// **ピッチ軸**の比: semitone → 再生比 (`2^(n/12)`)。 時間軸とは独立の量で、
 /// mode ごとに合成先が変わる:
 /// - `Raw` / `Repitch` (tape): source を読む速度そのものに掛かる → 長さも変わる
-/// - `Stretch` (granular) / `Slice`: grain / slice の **内部読み出し速度**にだけ
-///   掛かり、 grain / slice の **配置**には掛からない → 長さを変えずに移調する
+/// - `Slice`: slice の **内部読み出し速度**にだけ掛かり、 slice の **配置**には
+///   掛からない → 長さを変えずに移調する
+/// - `Stretch`: スペクトルエンジンが半音値を直接受けるのでこの比は使わない
+///   (時間伸縮・移調・フォルマントを 1 段で担う)
 ///
 /// 非有限 / 極端な入力は ±120 半音 (= ±10 oct) に clamp して比が inf / NaN に
 /// ならないようにする (RT path で使うので panic / alloc なし)。
@@ -121,62 +124,593 @@ pub fn stretch_ratio_for(
     native_secs / event_secs
 }
 
-/// 波形**描画**用: この audio event が実際に鳴る source 範囲と、 それが鳴る
-/// event-local 拍数を返す。 engine の再生と同じ時間写像を使うので、 これで描けば
+/// 波形**描画**の 1 区間。 出力の event-local 拍区間 `[start_beat, end_beat)` に
+/// source frame 範囲 `[source_start, source_end)` を **線形に** 写す。
+/// `reversed` なら区間内は右→左 (= source を末尾から読む)。
+///
+/// 「1 event = 1 連続レンジ」 を前提にしていた旧 `audible_source_span` の置き換え
+/// (r.md #41)。 Slice の onset ごとの区分配置 / gap、 warp marker の区分線形、
+/// 逆再生を **1 つの型**で表せるので、 アレンジビューもオーディオエディタも
+/// mode 別の描画分岐を持たずに済む。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaveSpan {
+    /// 区間開始 (event-local 拍)。
+    pub start_beat: f64,
+    /// 区間終了 (event-local 拍)。 次 span との隙間 = 無音 (gap)。
+    pub end_beat: f64,
+    /// 区間が読む source 範囲 (絶対 frame、 `source_start < source_end`)。
+    pub source_start: u64,
+    pub source_end: u64,
+    /// 区間内を source 末尾から読むか (= 描画も左右反転する)。
+    pub reversed: bool,
+    /// この span が **音の立ち上がり** (= slice trigger / event 頭) か。
+    /// `false` は直前 span からの連続で、 warp marker 境界や tempo curve の
+    /// 区分線形化のために分割されただけ。 スライス境界の縦線を出す UI は
+    /// これで間引く (分割 span ごとに線を出すと嘘になる)。
+    pub head: bool,
+}
+
+/// 拍 ↔ tempo の写像。 描画が engine と同じ tempo 追従を得るための唯一の口。
+///
+/// engine は buffer ごとに `evaluate_song_tempo(song, playhead_beats)` で
+/// `current_bpm` を評価し、 `samples_per_beat` を作り直す
+/// (`daw_audio::engine` / `audio_clip_renderer::render_audio_events`)。
+/// このため **native rate 再生** (`Raw` 全体と `Slice` の slice 本体) は
+/// 「1 拍あたりの source 消費量」 が `current_bpm` に反比例して変わる。
+/// 一方 trigger / grain の **配置** は `tempo_follow_ratio` で `current_bpm` が
+/// 約分されるので `nominal_bpm` (= compile 時 `song.bpm`) だけで決まる。
+///
+/// スカラー bpm を渡していた旧 API はこの区別ができず、 SongTempo automation を
+/// 持つ曲で「描いた波形と鳴る音がずれる」 (r.md #41 の不変条件の破れ) ため、
+/// 描画側もこの型を経由する。 SongTempo lane が無ければ `Constant` 相当で
+/// 従来と完全に同じ (曲線評価コストも掛からない)。
+///
+/// **既知の限界**: engine は automation の上に song modulation
+/// (LFO / MSEG → `SongTempo`) を重ねるが、 modulator の位相は audio thread が
+/// 持つので GUI からは再現できない。 変調中の tempo は automation 値で近似する。
+#[derive(Debug, Clone, Copy)]
+pub struct TempoMap<'a> {
+    /// compile 時 (`song.bpm`) 基準の nominal bpm。 `stretch_ratio` / trigger 配置に使う。
+    nominal_bpm: f64,
+    /// SongTempo automation を持つ song (`None` = 定数 tempo)。
+    song: Option<&'a crate::model::Song>,
+}
+
+impl<'a> TempoMap<'a> {
+    /// 定数 tempo (SongTempo lane 無し / テスト用)。
+    #[must_use]
+    pub fn constant(bpm: f32) -> Self {
+        Self { nominal_bpm: f64::from(bpm), song: None }
+    }
+
+    /// song から構築する。 有効な `SongTempo` lane がある場合だけ曲線評価を有効にする
+    /// (無い曲では `evaluate_song_tempo` を 1 度も呼ばない)。
+    #[must_use]
+    pub fn from_song(song: &'a crate::model::Song) -> Self {
+        let has_curve = song.song_lanes.iter().any(|l| {
+            l.enabled && matches!(l.target, crate::model::AutomationTarget::SongTempo)
+        });
+        Self {
+            nominal_bpm: f64::from(song.bpm),
+            song: has_curve.then_some(song),
+        }
+    }
+
+    /// compile 時基準の bpm (= `RenderedEvent.nominal_bpm`)。
+    #[must_use]
+    pub fn nominal_bpm(&self) -> f64 {
+        self.nominal_bpm
+    }
+
+    /// tempo が曲線でない (= 全拍で `nominal_bpm`) か。 `true` なら描画は
+    /// 区分線形化せず閉形式 1 span で済む。
+    #[must_use]
+    pub fn is_constant(&self) -> bool {
+        self.song.is_none()
+    }
+
+    /// song 絶対拍 `beat` での実効 bpm (= engine の `current_bpm`)。
+    #[must_use]
+    pub fn bpm_at(&self, beat: f64) -> f64 {
+        match self.song {
+            Some(s) => f64::from(crate::automation::evaluate_song_tempo(s, beat)),
+            None => self.nominal_bpm,
+        }
+    }
+}
+
+/// `(beat, pos_in_event)` の線形区間を「実際に鳴る範囲」 に切り詰めて [`WaveSpan`] へ積む。
+///
+/// `pos_in_event` は `source_start_frames` 起点の source 位置 (= engine の
+/// `source_frame_lerp` に渡る値)。 engine は `pos < 0` / `pos >= source_len` を
+/// `None` (= 無音) で返すので、 窓外を指す部分は区間ごと切り詰める (beat 側も
+/// 同じ比率で縮める)。 区間の source が減少方向 (warp marker の逆行 / `reversed`)
+/// なら `reversed` を立てて正規化した範囲を積む。
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::too_many_arguments)]
+fn push_wave_span(
+    out: &mut Vec<WaveSpan>,
+    source_start: u64,
+    window: u64,
+    event_reversed: bool,
+    b0: f64,
+    b1: f64,
+    p0: f64,
+    p1: f64,
+    head: bool,
+) {
+    if !b0.is_finite() || !b1.is_finite() || !p0.is_finite() || !p1.is_finite() {
+        return;
+    }
+    if b1 <= b0 || window == 0 {
+        return;
+    }
+    let win = window as f64;
+    let d = p1 - p0;
+    let (mut t_lo, mut t_hi) = (0.0_f64, 1.0_f64);
+    if d.abs() < 1e-9 {
+        // source 位置が動かない区間 (warp の退化 / 窓手前の clamp)。 窓内なら
+        // 「1 frame を保持」 として残す (engine も同じ source を読み続ける)。
+        if p0 < 0.0 || p0 >= win {
+            return;
+        }
+    } else {
+        let ta = -p0 / d;
+        let tb = (win - p0) / d;
+        let (lo, hi) = if ta <= tb { (ta, tb) } else { (tb, ta) };
+        t_lo = t_lo.max(lo);
+        t_hi = t_hi.min(hi);
+        if t_hi <= t_lo {
+            return;
+        }
+    }
+    let nb0 = b0 + (b1 - b0) * t_lo;
+    let nb1 = b0 + (b1 - b0) * t_hi;
+    if nb1 <= nb0 {
+        return;
+    }
+    let np0 = p0 + d * t_lo;
+    let np1 = p0 + d * t_hi;
+    let mut reversed = np1 < np0;
+    let (lo, hi) = if reversed { (np1, np0) } else { (np0, np1) };
+    // `reversed` event は窓全体を反転して読む (`source_frame_lerp`)。 slice / grain
+    // 単位ではなく窓基準なので、 pos 範囲を窓の反対側へ写して向きを反転する。
+    let (a, b) = if event_reversed {
+        reversed = !reversed;
+        (win - hi, win - lo)
+    } else {
+        (lo, hi)
+    };
+    // source 範囲は必ず窓 `[source_start, source_start + window)` の内側に収める
+    // (engine は窓外を無音で返すので、 窓外を指す span を描いてはいけない)。
+    let window_end = source_start.saturating_add(window);
+    let s0 = source_start
+        .saturating_add(a.clamp(0.0, win) as u64)
+        .min(window_end - 1);
+    let s1 = source_start
+        .saturating_add(b.clamp(0.0, win) as u64)
+        .clamp(s0 + 1, window_end);
+    out.push(WaveSpan {
+        start_beat: nb0,
+        end_beat: nb1,
+        source_start: s0,
+        source_end: s1,
+        reversed,
+        head,
+    });
+}
+
+/// **native rate** (= 実時間で source を消費する) 区間を span 列にする。
+/// `Raw` の全体と `Slice` の slice 本体が使う共通経路。
+///
+/// engine は `event_local`(出力 sample) を **その buffer の** `samples_per_beat`
+/// (= `current_bpm` 由来) で作り、 `source_pos = event_local × read_stride` に
+/// 再 anchor する (`repitch_source_pos` の不連続分岐 / `slice_sample_at`)。
+/// 展開すると 1 拍あたりの消費量は `source_sr × 60 / current_bpm × pitch` で、
+/// **tempo automation があると拍に対して非線形**になる。 定数 tempo なら
+/// 閉形式 1 span、 曲線なら拍を細かく刻んだ区分線形 span 列で表す
+/// (最初の 1 本だけ `head = true`)。
+///
+/// - `t0` / `t_limit`: event-local の開始拍 / 上限拍 (次 trigger or event 長)
+/// - `p0` / `p_limit`: 開始時の `pos_in_event` / 到達したら鳴り止む `pos_in_event`
+/// - `fpb_at`: event-local 拍 `t` における「1 拍あたり消費 source frame」
+#[allow(clippy::too_many_arguments)]
+fn push_native_rate_spans(
+    out: &mut Vec<WaveSpan>,
+    source_start: u64,
+    window: u64,
+    event_reversed: bool,
+    constant_tempo: bool,
+    t0: f64,
+    t_limit: f64,
+    p0: f64,
+    p_limit: f64,
+    fpb_at: &dyn Fn(f64) -> f64,
+) {
+    /// tempo 曲線を区分線形化する刻み (拍)。 1/8 拍は 120 BPM で 62 ms 相当。
+    const STEP_BEATS: f64 = 1.0 / 8.0;
+    /// 1 区間あたりの分割上限 (退化入力でループが伸びないための防御)。
+    const MAX_PIECES: usize = 512;
+
+    if t_limit <= t0 || p_limit <= p0 {
+        return;
+    }
+    if constant_tempo {
+        let fpb = fpb_at(t0);
+        if !fpb.is_finite() || fpb <= 0.0 {
+            return;
+        }
+        let end = (t0 + (p_limit - p0) / fpb).min(t_limit);
+        push_wave_span(
+            out,
+            source_start,
+            window,
+            event_reversed,
+            t0,
+            end,
+            p0,
+            p0 + (end - t0) * fpb,
+            true,
+        );
+        return;
+    }
+    let mut t = t0;
+    let mut p = p0;
+    let mut head = true;
+    for _ in 0..MAX_PIECES {
+        if t >= t_limit || p >= p_limit {
+            break;
+        }
+        let mut t_next = (t + STEP_BEATS).min(t_limit);
+        let fpb = fpb_at(t_next);
+        if !fpb.is_finite() || fpb <= 0.0 {
+            break;
+        }
+        // engine は「event 頭からの拍差 × その時点の 1 拍あたり消費量」 で
+        // source 位置を再 anchor する (積分ではない)。 同じ式で端点を作る。
+        let mut p_next = p0 + (t_next - t0) * fpb;
+        if p_next >= p_limit {
+            // 鳴り止む位置を区間内で線形に解いて最後の 1 本にする。
+            if p_next > p {
+                t_next = t + (p_limit - p) * (t_next - t) / (p_next - p);
+            }
+            p_next = p_limit;
+        }
+        push_wave_span(
+            out,
+            source_start,
+            window,
+            event_reversed,
+            t,
+            t_next,
+            p,
+            p_next,
+            head,
+        );
+        head = false;
+        if p_next >= p_limit {
+            break;
+        }
+        t = t_next;
+        p = p_next;
+    }
+}
+
+/// `StretchMode::Stretch` + warp marker (>= 2 本) の区分線形 span。
+/// `granular_sample_at` の warp path (`warp_source_frame` で beat → source frame)
+/// と同じ写像を、 marker 境界で区切った線形区間の列として返す。
+fn warp_wave_spans(
+    out: &mut Vec<WaveSpan>,
+    event: &crate::model::AudioEvent,
+    source_start: u64,
+    window: u64,
+    len_beats: f64,
+) {
+    // engine (compile) は locked_beat 昇順 + dedup 済を前提にするので、 描画も同じ
+    // 正規化を通す (未 sort データで描画と再生がずれるのを防ぐ)。
+    let mut sorted_buf: Vec<BeatMarker>;
+    let markers: &[BeatMarker] = if event
+        .beat_markers
+        .windows(2)
+        .all(|w| w[1].locked_beat - w[0].locked_beat > 1e-9)
+    {
+        &event.beat_markers
+    } else {
+        sorted_buf = event.beat_markers.clone();
+        sorted_buf.sort_by(|a, b| a.locked_beat.total_cmp(&b.locked_beat));
+        sorted_buf.dedup_by(|a, b| (a.locked_beat - b.locked_beat).abs() < 1e-9);
+        &sorted_buf
+    };
+    if markers.len() < 2 {
+        return;
+    }
+    let mut beats: Vec<f64> = Vec::with_capacity(markers.len() + 2);
+    beats.push(0.0);
+    for m in markers {
+        if m.locked_beat > 1e-9 && m.locked_beat < len_beats - 1e-9 {
+            beats.push(m.locked_beat);
+        }
+    }
+    beats.push(len_beats);
+    let base = source_start as f64;
+    let mut head = true;
+    for w in beats.windows(2) {
+        let (b0, b1) = (w[0], w[1]);
+        if b1 - b0 <= 1e-9 {
+            continue;
+        }
+        let (Some(sf0), Some(sf1)) = (
+            warp_source_frame(b0, markers),
+            warp_source_frame(b1, markers),
+        ) else {
+            continue;
+        };
+        // spectral 経路 (r.md #40) の `u_of` は
+        // `warp_source_frame(beat) - source_start_frames` を **clamp せずに**
+        // `source_frame_lerp` へ渡す。 窓外 (`u < 0` / `u >= 窓`) は `None` =
+        // 無音なので、 描画も窓を跨ぐ区間をその交点で切り詰めるだけでよい
+        // (`push_wave_span` が担う)。
+        // ※ 旧 granular は grain ごとに `.max(0.0)` していたため「窓手前は
+        // 先頭 frame を保持 (flat)」 だった。 #40 でこの clamp は無くなったので、
+        // flat 区間を作ってはいけない (作ると無音のはずの場所に波形が出る)。
+        push_wave_span(
+            out,
+            source_start,
+            window,
+            event.reversed,
+            b0,
+            b1,
+            sf0 - base,
+            sf1 - base,
+            head,
+        );
+        head = false;
+    }
+}
+
+/// `StretchMode::Slice` の span 列 (`slice_sample_at` と同じ写像)。
+///
+/// - trigger の event-local 拍 = `onsets[i] / place_fpb`
+///   (`place_fpb = source_frames_per_beat × stretch`。 engine の
+///   `onsets[i] / (tempo_ratio × time_stride)` を engine SR / current bpm が
+///   約分された形で表したもの)
+/// - slice 本体は **伸縮しない** ので、 鳴る拍数 = `slice の source 長 / read_fpb`
+///   (`read_fpb = source_frames_per_beat × pitch`)
+/// - 次 trigger / event 末尾 / 窓末尾のいずれか早い方で打ち切り (= cut)、
+///   残りは無音 (= gap)
+///
+/// slice 本体は native rate なので tempo automation で 1 拍あたりの消費量が
+/// 変わる。 `read_fpb_at` (event-local 拍 → 1 拍あたり消費 frame) 経由で
+/// [`push_native_rate_spans`] に委ねる。
+#[allow(clippy::too_many_arguments)]
+fn slice_wave_spans(
+    out: &mut Vec<WaveSpan>,
+    event: &crate::model::AudioEvent,
+    source_start: u64,
+    window: u64,
+    len_beats: f64,
+    place_fpb: f64,
+    read_fpb_at: &dyn Fn(f64) -> f64,
+    constant_tempo: bool,
+) {
+    // compile (`compile_audio_schedule`) と同じ sort + dedup。 既に厳密増加なら借用のまま。
+    let mut sorted_buf: Vec<u64>;
+    let onsets: &[u64] = if event.onsets.windows(2).all(|w| w[0] < w[1]) {
+        &event.onsets
+    } else {
+        sorted_buf = event.onsets.clone();
+        sorted_buf.sort_unstable();
+        sorted_buf.dedup();
+        &sorted_buf
+    };
+    let win = window as f64;
+    for (i, &o) in onsets.iter().enumerate() {
+        let o_f = o as f64;
+        let start_beat = o_f / place_fpb;
+        if start_beat >= len_beats {
+            // trigger が event 外 → これ以降の slice は鳴らない (直前 slice の cut
+            // だけは下の next_trigger_beat 経由で既に効いている)。
+            break;
+        }
+        let next = onsets.get(i + 1).copied();
+        // engine の `slice_source_end` (= 次 onset、 無ければ窓末尾)。 窓を越える
+        // onset は `source_frame_lerp` が無音を返すので窓末尾で頭打ち。
+        let src_end = next.map_or(win, |n| (n as f64).min(win));
+        if o_f >= win || src_end <= o_f {
+            continue;
+        }
+        let next_trigger_beat = next.map_or(f64::INFINITY, |n| n as f64 / place_fpb);
+        push_native_rate_spans(
+            out,
+            source_start,
+            window,
+            event.reversed,
+            constant_tempo,
+            start_beat,
+            next_trigger_beat.min(len_beats),
+            o_f,
+            src_end,
+            read_fpb_at,
+        );
+    }
+}
+
+/// 波形**描画**の SSoT: この audio event を「どの拍区間に source のどの範囲を描くか」
+/// の列 ([`WaveSpan`]) に展開する。 engine (`render_audio_events`) と同じ時間写像を
+/// engine SR / current bpm に依らない単位で表すので、 これで描けば
 /// 「見えている波形 = 聞こえる音」 になる。
 ///
-/// 戻り値 `(frames, beats)`:
-/// - `frames`: `source_start_frames` から鳴る frame 数 (source 窓を超えない)
-/// - `beats`: それが鳴り終わるまでの event-local 拍数 (`event_length_beats` を超えない)
+/// mode ごとの内訳 (`nominal_fpb = source_sr × 60 / nominal_bpm`、
+/// `stretch =` [`stretch_ratio_for`]、 `pitch =` [`pitch_factor`]):
+/// - `Raw`: 1 拍あたり `source_sr × 60 / current_bpm × pitch` frame 消費
+///   (伸縮に追従しない = **実時間** で source を消費するので tempo に依存する)
+/// - `Repitch`: 1 span、 `nominal_fpb × stretch × pitch` (tape 式、 tempo 不変)
+/// - `Stretch`: warp marker が 2 本以上なら marker 区間ごとの区分線形、 無ければ
+///   1 span で `nominal_fpb × stretch` (ピッチ / フォルマントは長さに影響しない、
+///   tempo 不変)。 r.md #40 でスペクトル方式 (signalsmith-stretch) に置換されたが、
+///   時間写像は engine ではなく呼び出し側の `u_of` が決めており、
+///   その値が `beat × src_frames_per_beat` = ここの `nominal_fpb × stretch` と同一。
+///   engine 不在時の degrade 経路 (`tape_ratio = time_stride × follow_instant`) も
+///   拍領域では同じ量なので、 どちらに落ちても描画は一致する
+/// - `Slice`: onset ごとに 1 slice。 trigger 拍 = `onsets[i] / (nominal_fpb × stretch)`
+///   で **tempo 不変**、 slice 本体は Raw と同じ native rate なので、
+///   伸ばせば **gap**、 詰めれば **cut**
 ///
-/// mode ごとの「1 拍あたり消費する source frame 数」:
-/// - `Raw`: native rate × pitch (tempo / clip 伸縮に追従しない)
-/// - `Repitch`: 上記 × 伸縮比 (tape 式に伸縮 = 長さが合う)
-/// - `Stretch` / `Slice`: 伸縮比のみ (pitch は長さに影響しない = grain / slice の
-///   **配置**が長さを決める)
+/// `tempo` が曲線 (SongTempo automation) のときは、 native rate 区間だけ拍に対して
+/// 非線形になるので区分線形の span 列に分割する (2 本目以降は `head = false`)。
+/// `event_start_beat` はその評価に使う **song 絶対拍** (= clip 開始拍 + event 開始拍)。
 ///
-/// `beats < event_length_beats` なら余りは無音 (= ピッチを上げて速く鳴り終わった)、
-/// `frames < 窓` なら source が clip に収まらず cut された (= ピッチを下げた)。
-/// 退化入力 (0 長 / 0 窓 / bpm 0 / SR 0) は「窓を event 長いっぱいに」 の従来値。
+/// どの mode でも「窓を鳴らし切って余った」 分は span が張られない (= 無音)。
+/// `reversed` event は窓全体を反転して読むので、 span の source 範囲を反対側へ
+/// 写して `reversed` を立てる。 退化入力 (0 長 / 0 窓 / bpm 0 / SR 0) は
+/// 「窓を event 長いっぱいに」 の 1 span。
 ///
-/// **ここの mode 別 `rate` は `daw_audio::audio_clip_renderer::render_audio_events` の
-/// `time_stride` / `read_stride` 合成と同じ方針を、 engine SR に依らない単位
-/// (source frames / beat) で表したもの。 どちらかを変えたら必ず両方を合わせること**
-/// (GUI は engine SR を知らないので、 出力 frame 基準の render 側と単位を共有できない)。
-pub fn audible_source_span(
+/// 毎フレームの描画 path から呼ばれるので、 結果は呼び出し側の `Vec` に積む
+/// (先頭で `clear` する)。
+///
+/// **`formant_semitones` はここに現れない** — フォルマント (スペクトル包絡の
+/// 移調) は周波数軸だけの操作で時間写像に一切効かないので、 波形の長さにも
+/// 位置にも影響しない (r.md #40)。 将来 formant を足したくなっても、 それは
+/// 仕様の誤解。
+///
+/// **この写像は `daw_audio::audio_clip_renderer::render_audio_events` と一致して
+/// いなければならない** (= 描いた波形と鳴る音が一致する条件):
+/// `Stretch` は spectral 経路の `u_of` (= `beat × src_frames_per_beat`、
+/// warp marker があれば `warp_source_frame`)、 tape / slice は
+/// `tape_sample_at` / `slice_sample_at` の `time_stride` / `read_stride` 合成。
+/// 束縛テストは daw_audio 側の `wave_span_binding_tests` にある。
+pub fn event_wave_spans(
     event: &crate::model::AudioEvent,
     source_sample_rate: u32,
-    bpm: f32,
-) -> (u64, f64) {
-    let window = event
-        .source_end_frames
-        .saturating_sub(event.source_start_frames);
+    tempo: &TempoMap<'_>,
+    event_start_beat: f64,
+    out: &mut Vec<WaveSpan>,
+) {
+    out.clear();
+    let source_start = event.source_start_frames;
+    let window = event.source_end_frames.saturating_sub(source_start);
     let len_beats = event.event_length_beats.max(0.0);
-    if window == 0 || len_beats <= 0.0 || bpm <= 0.0 || source_sample_rate == 0 {
-        return (window, len_beats);
+    if window == 0 || len_beats <= 0.0 {
+        return;
     }
-    let source_frames_per_beat = f64::from(source_sample_rate) * 60.0 / f64::from(bpm);
-    let stretch = stretch_ratio_for(window, source_sample_rate, len_beats, bpm);
-    let pitch = pitch_factor(event.pitch_semitones);
-    let rate = match event.stretch_mode {
-        StretchMode::Raw => pitch,
-        StretchMode::Repitch => stretch * pitch,
-        StretchMode::Stretch | StretchMode::Slice => stretch,
+    let rev = event.reversed;
+    let whole = |out: &mut Vec<WaveSpan>| {
+        push_wave_span(out, source_start, window, rev, 0.0, len_beats, 0.0, window as f64, true);
     };
-    let frames_per_beat = source_frames_per_beat * rate;
-    if !frames_per_beat.is_finite() || frames_per_beat <= 0.0 {
-        return (window, len_beats);
+    let nominal_bpm = tempo.nominal_bpm();
+    if nominal_bpm <= 0.0 || source_sample_rate == 0 {
+        whole(out);
+        return;
     }
-    let beats_for_window = window as f64 / frames_per_beat;
-    if beats_for_window <= len_beats {
-        // 窓を鳴らし切って余る → 波形は前方に詰まり、 残りは無音。
-        (window, beats_for_window)
+    let src_sr = f64::from(source_sample_rate);
+    // 配置 (trigger / grain / tape) 側の基準。 engine では `tempo_follow_ratio` で
+    // current_bpm が約分されるので nominal 固定。
+    let nominal_fpb = src_sr * 60.0 / nominal_bpm;
+    #[allow(clippy::cast_possible_truncation)]
+    let stretch = stretch_ratio_for(window, source_sample_rate, len_beats, nominal_bpm as f32);
+    let pitch = pitch_factor(event.pitch_semitones);
+    let constant_tempo = tempo.is_constant();
+    // native rate 側は event-local 拍 t 時点の **current_bpm** で決まる。
+    let read_fpb_at = |t: f64| src_sr * 60.0 / tempo.bpm_at(event_start_beat + t) * pitch;
+    // 1 拍あたり `fpb` frame 進む単一 span (窓を超える分は push_wave_span が切る)。
+    let uniform = |out: &mut Vec<WaveSpan>, fpb: f64| {
+        if fpb.is_finite() && fpb > 0.0 {
+            push_wave_span(
+                out,
+                source_start,
+                window,
+                rev,
+                0.0,
+                len_beats,
+                0.0,
+                len_beats * fpb,
+                true,
+            );
+        } else {
+            whole(out);
+        }
+    };
+    match event.stretch_mode {
+        // Raw = 窓全体を 1 slice とした native rate 再生 (`slice_sample_at` の
+        // onsets 空 early-return と同じ写像)。
+        StretchMode::Raw => push_native_rate_spans(
+            out,
+            source_start,
+            window,
+            rev,
+            constant_tempo,
+            0.0,
+            len_beats,
+            0.0,
+            window as f64,
+            &read_fpb_at,
+        ),
+        StretchMode::Repitch => uniform(out, nominal_fpb * stretch * pitch),
+        StretchMode::Stretch => {
+            if event.beat_markers.len() >= 2 {
+                warp_wave_spans(out, event, source_start, window, len_beats);
+                if out.is_empty() {
+                    // marker が全部退化 → granular も uniform に fallback する。
+                    uniform(out, nominal_fpb * stretch);
+                }
+            } else {
+                uniform(out, nominal_fpb * stretch);
+            }
+        }
+        StretchMode::Slice => {
+            let place_fpb = nominal_fpb * stretch;
+            if event.onsets.is_empty() || !(place_fpb.is_finite() && place_fpb > 0.0) {
+                // `slice_sample_at` の onsets 空 early-return = 窓全体を 1 slice。
+                push_native_rate_spans(
+                    out,
+                    source_start,
+                    window,
+                    rev,
+                    constant_tempo,
+                    0.0,
+                    len_beats,
+                    0.0,
+                    window as f64,
+                    &read_fpb_at,
+                );
+            } else {
+                slice_wave_spans(
+                    out,
+                    event,
+                    source_start,
+                    window,
+                    len_beats,
+                    place_fpb,
+                    &read_fpb_at,
+                    constant_tempo,
+                );
+            }
+        }
+    }
+}
+
+/// [`event_wave_spans`] の逆写像: event-local 拍 `beat` の位置で **実際に鳴っている**
+/// source frame。 span の外 (= スライス間の無音 / 鳴り終わったあと) は `None`。
+///
+/// 「波形上のこの位置は source のどこか」 を UI が知る唯一の口 (warp marker の
+/// Alt+click 追加など)。 span 側と同じ写像なので、 描いた波形とクリック位置が
+/// 一致する (旧実装は `local / event_length × 窓` の uniform 近似を直書きしており、
+/// Slice / ピッチ変更したクリップでは見えている波形と違う source を指していた)。
+#[must_use]
+pub fn source_frame_at_beat(spans: &[WaveSpan], beat: f64) -> Option<f64> {
+    let s = spans
+        .iter()
+        .find(|s| beat >= s.start_beat && beat < s.end_beat)?;
+    let span_beats = s.end_beat - s.start_beat;
+    if span_beats <= 0.0 {
+        return None;
+    }
+    let f = (beat - s.start_beat) / span_beats;
+    let len = (s.source_end - s.source_start) as f64;
+    Some(if s.reversed {
+        s.source_end as f64 - len * f
     } else {
-        // 窓が clip に収まらない → 鳴る範囲だけを clip 幅いっぱいに。
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let fits = (len_beats * frames_per_beat) as u64;
-        (fits.min(window), len_beats)
-    }
+        s.source_start as f64 + len * f
+    })
 }
 
 /// source 進度 = clip の手動 `stretch_ratio` (= [`stretch_ratio_for`]、 nominal
@@ -191,9 +725,9 @@ pub fn audible_source_span(
 /// よって schedule の再コンパイル (= nominal_bpm が現 song.bpm に更新され、
 /// stretch_ratio も同時に再算出される) を跨いでも追従結果が一致する。
 ///
-/// `current_bpm` は呼び出し側で、 Stretch (granular) は LP smoothed な値 (=
-/// click 抑制、 grain source jump 抑制)、 Repitch / Slice は instant な値 (=
-/// pitch / slice trigger の追随性優先) を渡す。 `nominal_bpm <= 0` は退化入力と
+/// 呼び出すのは Repitch / Slice (instant な `current_bpm`)。 Stretch は
+/// **beat 領域**で写像する (= 1 拍あたりの source frame 数は tempo に依らない)
+/// ので、この関数を通さない。 `nominal_bpm <= 0` は退化入力と
 /// して `stretch_ratio` を素通し (= 追従なし) する defensive。 RT path で呼ばれる
 /// ので alloc / panic free。
 #[inline]
@@ -350,7 +884,7 @@ mod tests {
         BeatMarker { source_frame, locked_beat }
     }
 
-    // ---- audible_source_span (波形描画と再生の一致) ----
+    // ---- event_wave_spans (波形描画と再生の一致、 r.md #41) ----
 
     /// 48 kHz / 120 BPM → 1 拍 = 24000 source frame。 2 拍ぶん (48000 frame) の
     /// 「素直な」 event (= import / trim 直後の lockstep 状態) を作る。
@@ -365,82 +899,426 @@ mod tests {
         }
     }
 
+    fn spans_of(event: &crate::model::AudioEvent) -> Vec<WaveSpan> {
+        let mut out = Vec::new();
+        event_wave_spans(event, 48_000, &TempoMap::constant(120.0), 0.0, &mut out);
+        out
+    }
+
+    /// span 列が「拍の重なり無し・昇順」 という不変条件を満たすか (全 mode 共通)。
+    fn assert_monotonic(spans: &[WaveSpan], label: &str) {
+        for w in spans.windows(2) {
+            assert!(
+                w[1].start_beat >= w[0].end_beat - 1e-9,
+                "{label}: span が重なっている {:?}",
+                spans
+            );
+        }
+        for s in spans {
+            assert!(s.end_beat > s.start_beat, "{label}: 空 span {s:?}");
+            assert!(s.source_end > s.source_start, "{label}: 空 source {s:?}");
+        }
+    }
+
     #[test]
-    fn audible_span_fills_clip_without_pitch() {
-        // ピッチ 0 なら 4 mode すべて「窓を event 長いっぱいに」 = 従来の描画と同じ。
+    fn wave_spans_fill_clip_without_pitch() {
+        // ピッチ 0 / 伸縮なしなら 4 mode すべて「窓を event 長いっぱいに」 1 span
+        // (= 従来の連続波形と同じ絵。 ここが崩れると取り込み直後の clip が回帰する)。
         for mode in [
             StretchMode::Raw,
             StretchMode::Repitch,
             StretchMode::Stretch,
             StretchMode::Slice,
         ] {
-            let (frames, beats) = audible_source_span(&span_event(mode, 48_000, 2.0, 0.0), 48_000, 120.0);
-            assert_eq!(frames, 48_000, "{mode:?}");
-            assert!((beats - 2.0).abs() < 1e-9, "{mode:?}: got {beats}");
+            let spans = spans_of(&span_event(mode, 48_000, 2.0, 0.0));
+            assert_eq!(spans.len(), 1, "{mode:?}: {spans:?}");
+            let s = spans[0];
+            assert!((s.start_beat - 0.0).abs() < 1e-9, "{mode:?}");
+            assert!((s.end_beat - 2.0).abs() < 1e-9, "{mode:?}: got {}", s.end_beat);
+            assert_eq!((s.source_start, s.source_end), (0, 48_000), "{mode:?}");
+            assert!(!s.reversed);
         }
     }
 
     #[test]
-    fn audible_span_shrinks_when_pitched_up_in_tape_modes() {
-        // +1 oct = 2 倍速 → 窓は半分の拍数で鳴り終わり、 残りは無音。
+    fn wave_spans_shrink_when_pitched_up_in_tape_modes() {
+        // +1 oct = 2 倍速 → 窓は半分の拍数で鳴り終わり、 残りは無音 (span 無し)。
         for mode in [StretchMode::Raw, StretchMode::Repitch] {
-            let (frames, beats) =
-                audible_source_span(&span_event(mode, 48_000, 2.0, 12.0), 48_000, 120.0);
-            assert_eq!(frames, 48_000, "{mode:?}: 窓は全部鳴る");
-            assert!((beats - 1.0).abs() < 1e-9, "{mode:?}: got {beats}");
+            let spans = spans_of(&span_event(mode, 48_000, 2.0, 12.0));
+            assert_eq!(spans.len(), 1, "{mode:?}");
+            assert_eq!(spans[0].source_end, 48_000, "{mode:?}: 窓は全部鳴る");
+            assert!((spans[0].end_beat - 1.0).abs() < 1e-9, "{mode:?}: {spans:?}");
         }
     }
 
     #[test]
-    fn audible_span_crops_when_pitched_down_in_tape_modes() {
-        // -1 oct = 半分の速度 → clip に収まらず、 窓の前半だけが鳴る。
-        let (frames, beats) =
-            audible_source_span(&span_event(StretchMode::Raw, 48_000, 2.0, -12.0), 48_000, 120.0);
-        assert_eq!(frames, 24_000);
-        assert!((beats - 2.0).abs() < 1e-9, "got {beats}");
+    fn wave_spans_crop_when_pitched_down_in_tape_modes() {
+        // -1 oct = 半分の速度 → clip に収まらず、 窓の前半だけが鳴る (= cut)。
+        let spans = spans_of(&span_event(StretchMode::Raw, 48_000, 2.0, -12.0));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].source_end, 24_000);
+        assert!((spans[0].end_beat - 2.0).abs() < 1e-9, "{spans:?}");
     }
 
     #[test]
-    fn audible_span_ignores_pitch_in_granular_modes() {
-        // Stretch / Slice は配置が長さを決めるので、 移調しても長さは変わらない。
-        for mode in [StretchMode::Stretch, StretchMode::Slice] {
-            for semis in [12.0_f32, -12.0] {
-                let (frames, beats) =
-                    audible_source_span(&span_event(mode, 48_000, 2.0, semis), 48_000, 120.0);
-                assert_eq!(frames, 48_000, "{mode:?} {semis}");
-                assert!((beats - 2.0).abs() < 1e-9, "{mode:?} {semis}: got {beats}");
-            }
+    fn wave_spans_ignore_pitch_for_placement_in_granular_mode() {
+        // Stretch は配置が長さを決めるので、 移調しても span は clip 全長のまま。
+        for semis in [12.0_f32, -12.0] {
+            let spans = spans_of(&span_event(StretchMode::Stretch, 48_000, 2.0, semis));
+            assert_eq!(spans.len(), 1, "{semis}");
+            assert_eq!((spans[0].source_start, spans[0].source_end), (0, 48_000));
+            assert!((spans[0].end_beat - 2.0).abs() < 1e-9, "{semis}: {spans:?}");
         }
     }
 
     #[test]
-    fn audible_span_stretched_clip_still_fills() {
+    fn wave_spans_stretched_clip_still_fills_in_stretch_mode() {
         // Shift ストレッチ済 (窓は 2 拍ぶんのまま clip は 4 拍) でも Stretch は充填。
-        let (frames, beats) =
-            audible_source_span(&span_event(StretchMode::Stretch, 48_000, 4.0, 0.0), 48_000, 120.0);
-        assert_eq!(frames, 48_000);
-        assert!((beats - 4.0).abs() < 1e-9, "got {beats}");
+        let spans = spans_of(&span_event(StretchMode::Stretch, 48_000, 4.0, 0.0));
+        assert_eq!(spans.len(), 1);
+        assert!((spans[0].end_beat - 4.0).abs() < 1e-9, "{spans:?}");
         // 同じ event を Raw にすると伸縮しないので、 窓は 2 拍で鳴り終わる。
-        let (frames, beats) =
-            audible_source_span(&span_event(StretchMode::Raw, 48_000, 4.0, 0.0), 48_000, 120.0);
-        assert_eq!(frames, 48_000);
-        assert!((beats - 2.0).abs() < 1e-9, "got {beats}");
+        let spans = spans_of(&span_event(StretchMode::Raw, 48_000, 4.0, 0.0));
+        assert_eq!(spans.len(), 1);
+        assert!((spans[0].end_beat - 2.0).abs() < 1e-9, "{spans:?}");
+    }
+
+    // ---- Slice: onset ごとの区分配置 / gap / cut (r.md #41 の本丸) ----
+
+    fn slice_event(window: u64, len_beats: f64, semis: f32, onsets: Vec<u64>) -> crate::model::AudioEvent {
+        crate::model::AudioEvent {
+            onsets,
+            ..span_event(StretchMode::Slice, window, len_beats, semis)
+        }
     }
 
     #[test]
-    fn audible_span_degenerate_inputs_are_safe() {
-        assert_eq!(
-            audible_source_span(&span_event(StretchMode::Raw, 0, 2.0, 0.0), 48_000, 120.0),
-            (0, 2.0)
+    fn slice_spans_are_contiguous_when_not_stretched() {
+        // 伸縮なし・ピッチ 0 → trigger 間隔と slice の鳴る長さが一致 → 隙間ゼロ。
+        // (= 取り込み直後の Slice clip は従来の連続波形と同じ絵になる = 回帰しない)
+        let spans = spans_of(&slice_event(48_000, 2.0, 0.0, vec![0, 12_000, 24_000, 36_000]));
+        assert_eq!(spans.len(), 4, "{spans:?}");
+        assert_monotonic(&spans, "contiguous");
+        for (i, s) in spans.iter().enumerate() {
+            assert!(
+                (s.start_beat - i as f64 * 0.5).abs() < 1e-9,
+                "slice {i} の trigger 拍: {spans:?}"
+            );
+            assert!(
+                (s.end_beat - s.start_beat - 0.5).abs() < 1e-9,
+                "slice {i} は次 trigger まで鳴り続ける (gap なし): {spans:?}"
+            );
+        }
+        assert_eq!(spans[3].source_end, 48_000);
+    }
+
+    #[test]
+    fn slice_spans_open_gaps_when_clip_is_stretched() {
+        // clip を 2 倍に伸ばす (窓 2 拍ぶん / clip 4 拍 → stretch 0.5)。 trigger は
+        // 2 倍に広がるが slice 本体は native rate なので、 各 slice の後ろに
+        // 同じ長さの gap が空く (= Ableton Beats warp / Transient Loop Off)。
+        let spans = spans_of(&slice_event(48_000, 4.0, 0.0, vec![0, 12_000, 24_000, 36_000]));
+        assert_eq!(spans.len(), 4, "{spans:?}");
+        assert_monotonic(&spans, "gap");
+        for (i, s) in spans.iter().enumerate() {
+            assert!(
+                (s.start_beat - i as f64).abs() < 1e-9,
+                "trigger は 1 拍ごと: {spans:?}"
+            );
+            assert!(
+                (s.end_beat - s.start_beat - 0.5).abs() < 1e-9,
+                "slice 本体は native rate の 0.5 拍: {spans:?}"
+            );
+        }
+        // 末尾 slice の後ろ (3.5 → 4.0 拍) も無音。
+        assert!(spans[3].end_beat < 4.0 - 1e-9);
+    }
+
+    #[test]
+    fn slice_spans_cut_when_clip_is_compressed() {
+        // clip を半分に詰める (窓 2 拍ぶん / clip 1 拍 → stretch 2.0)。 trigger が
+        // 詰まるので各 slice は鳴り終わる前に次 trigger で切られる (= cut、 gap なし)。
+        let spans = spans_of(&slice_event(48_000, 1.0, 0.0, vec![0, 12_000, 24_000, 36_000]));
+        assert_eq!(spans.len(), 4, "{spans:?}");
+        assert_monotonic(&spans, "cut");
+        for (i, s) in spans.iter().enumerate() {
+            assert!((s.start_beat - i as f64 * 0.25).abs() < 1e-9, "{spans:?}");
+            assert!(
+                (s.end_beat - s.start_beat - 0.25).abs() < 1e-9,
+                "次 trigger で cut: {spans:?}"
+            );
+            // cut された分だけ source も短く読む (= 見えている波形が鳴る音)。
+            assert_eq!(s.source_end - s.source_start, 6_000, "slice {i}: {spans:?}");
+        }
+    }
+
+    #[test]
+    fn slice_spans_shorten_when_pitched_up() {
+        // Slice の移調は slice **本体**の読み速度だけを変える (trigger は動かない)。
+        // +1 oct → 各 slice は半分の時間で鳴り終わり、 残りが gap になる。
+        let spans = spans_of(&slice_event(48_000, 2.0, 12.0, vec![0, 12_000, 24_000, 36_000]));
+        assert_eq!(spans.len(), 4, "{spans:?}");
+        assert_monotonic(&spans, "pitched");
+        for (i, s) in spans.iter().enumerate() {
+            assert!((s.start_beat - i as f64 * 0.5).abs() < 1e-9, "trigger 不変: {spans:?}");
+            assert!(
+                (s.end_beat - s.start_beat - 0.25).abs() < 1e-9,
+                "slice {i} は 2 倍速で鳴り終わる: {spans:?}"
+            );
+            assert_eq!(s.source_end - s.source_start, 12_000, "source は全部鳴る");
+        }
+    }
+
+    #[test]
+    fn slice_spans_without_onsets_degrade_to_single_slice() {
+        // onsets 空 = `slice_sample_at` の early-return (窓全体を 1 slice、 native rate)。
+        let spans = spans_of(&slice_event(48_000, 4.0, 0.0, Vec::new()));
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert!((spans[0].end_beat - 2.0).abs() < 1e-9, "伸縮しない: {spans:?}");
+    }
+
+    #[test]
+    fn slice_spans_normalize_unsorted_onsets_like_compile() {
+        // 未 sort / 重複 onsets でも compile (sort+dedup) と同じ列で描く。
+        let a = spans_of(&slice_event(48_000, 4.0, 0.0, vec![24_000, 0, 12_000, 12_000]));
+        let b = spans_of(&slice_event(48_000, 4.0, 0.0, vec![0, 12_000, 24_000]));
+        assert_eq!(a, b, "sort+dedup 後の span 列は一致する");
+    }
+
+    #[test]
+    fn slice_spans_ignore_onsets_outside_the_source_window() {
+        // trigger 配置率は必ず `窓 / clip 長` なので、 窓外 (>= 窓) の onset は
+        // event 末尾以降にしか trigger されない = 鳴らないし前 slice も切らない。
+        // 描画も同じく無視する (窓 24000 / clip 2 拍 → onset 48000 は 4 拍地点)。
+        let spans = spans_of(&slice_event(24_000, 2.0, 0.0, vec![0, 48_000]));
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert!((spans[0].start_beat).abs() < 1e-9);
+        // 単一 slice は native rate (窓 24000 = 1 拍ぶん) で 1 拍鳴って残りは無音。
+        assert!((spans[0].end_beat - 1.0).abs() < 1e-9, "{spans:?}");
+    }
+
+    // ---- reversed / warp ----
+
+    #[test]
+    fn wave_spans_mirror_source_range_when_reversed() {
+        // 逆再生は窓全体を反転して読む (`source_frame_lerp`)。 slice 単位ではない。
+        let mut ev = slice_event(48_000, 2.0, 0.0, vec![0, 12_000, 24_000, 36_000]);
+        ev.reversed = true;
+        let spans = spans_of(&ev);
+        assert_eq!(spans.len(), 4, "{spans:?}");
+        assert_monotonic(&spans, "reversed");
+        // 出力の最初の slice は source の **末尾** 12000 frame を後ろから読む。
+        assert_eq!((spans[0].source_start, spans[0].source_end), (36_000, 48_000));
+        assert!(spans[0].reversed);
+        assert_eq!((spans[3].source_start, spans[3].source_end), (0, 12_000));
+    }
+
+    #[test]
+    fn wave_spans_reversed_offset_window_maps_into_window() {
+        // trim 済 (source_start != 0) + reversed でも span は窓内に収まる。
+        let ev = crate::model::AudioEvent {
+            source_start_frames: 10_000,
+            source_end_frames: 58_000,
+            event_length_beats: 2.0,
+            reversed: true,
+            ..crate::model::AudioEvent::default()
+        };
+        let spans = spans_of(&ev);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].source_start, spans[0].source_end), (10_000, 58_000));
+        assert!(spans[0].reversed);
+    }
+
+    #[test]
+    fn wave_spans_follow_warp_markers_only_in_stretch_mode() {
+        // 0..2 拍が source 前半 8000 frame、 2..4 拍が残り 40000 frame という非一様 warp。
+        let markers = vec![bm(0, 0.0), bm(8_000, 2.0), bm(48_000, 4.0)];
+        let mut ev = span_event(StretchMode::Stretch, 48_000, 4.0, 0.0);
+        ev.beat_markers = markers.clone();
+        let spans = spans_of(&ev);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert_monotonic(&spans, "warp");
+        assert_eq!((spans[0].source_start, spans[0].source_end), (0, 8_000));
+        assert!((spans[0].end_beat - 2.0).abs() < 1e-9);
+        assert_eq!((spans[1].source_start, spans[1].source_end), (8_000, 48_000));
+
+        // 同じ marker が残ったまま Slice / Raw にすると、 再生は marker を無視する
+        // ので描画も無視しなければならない (= 旧 audio_editor の markers 優先分岐バグ)。
+        for mode in [StretchMode::Raw, StretchMode::Repitch, StretchMode::Slice] {
+            ev.stretch_mode = mode;
+            let spans = spans_of(&ev);
+            assert_eq!(spans.len(), 1, "{mode:?} は warp 形状を描かない: {spans:?}");
+        }
+    }
+
+    #[test]
+    fn wave_spans_degenerate_inputs_are_safe() {
+        // 0 窓 / 0 長 → span 無し。 SR 0 / bpm 0 → 窓全体を clip 幅いっぱいに 1 span。
+        assert!(spans_of(&span_event(StretchMode::Raw, 0, 2.0, 0.0)).is_empty());
+        assert!(spans_of(&span_event(StretchMode::Raw, 48_000, 0.0, 0.0)).is_empty());
+        let mut out = Vec::new();
+        for (sr, bpm) in [(0u32, 120.0f32), (48_000, 0.0)] {
+            event_wave_spans(
+                &span_event(StretchMode::Raw, 48_000, 2.0, 0.0),
+                sr,
+                &TempoMap::constant(bpm),
+                0.0,
+                &mut out,
+            );
+            assert_eq!(out.len(), 1, "sr={sr} bpm={bpm}");
+            assert_eq!((out[0].source_start, out[0].source_end), (0, 48_000));
+            assert!((out[0].end_beat - 2.0).abs() < 1e-9);
+        }
+        // NaN ピッチは pitch_factor が 1.0 に倒すので普通の 1 span。
+        assert_eq!(spans_of(&span_event(StretchMode::Raw, 48_000, 2.0, f32::NAN)).len(), 1);
+    }
+
+    // ---- TempoMap (SongTempo automation 下での native rate) ----
+
+    /// `beat 0..len` を `start_bpm → end_bpm` の直線で結ぶ SongTempo lane を持つ song。
+    fn song_with_tempo_ramp(start_bpm: f64, end_bpm: f64, len_beats: f64) -> crate::model::Song {
+        use crate::model::{
+            AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint,
+            AutomationTarget, ClipContent, Song,
+        };
+        let mut song = Song { bpm: 120.0, ..Song::default() };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                next_point_id: 0,
+                points: vec![
+                    AutomationPoint { id: 0, time_beat: 0.0, value: start_bpm, curve: AutomationCurve::Linear },
+                    AutomationPoint { id: 0, time_beat: len_beats, value: end_bpm, curve: AutomationCurve::Linear },
+                ],
+            }),
         );
-        assert_eq!(
-            audible_source_span(&span_event(StretchMode::Raw, 48_000, 2.0, 0.0), 0, 120.0),
-            (48_000, 2.0)
+        let lane_id = song.alloc_song_lane_id();
+        let mut lane = AutomationLane::new(AutomationTarget::SongTempo, 120.0);
+        lane.id = lane_id;
+        lane.clips.push(AutomationClip {
+            id: 1,
+            name: "Tempo".into(),
+            start_beat: 0.0,
+            length_beats: len_beats,
+            content_id: cid,
+        });
+        lane.next_clip_id = 2;
+        song.song_lanes.push(lane);
+        song
+    }
+
+    #[test]
+    fn tempo_map_uses_curve_only_when_song_tempo_lane_exists() {
+        let plain = crate::model::Song { bpm: 100.0, ..crate::model::Song::default() };
+        let t = TempoMap::from_song(&plain);
+        assert!(t.is_constant());
+        assert!((t.bpm_at(3.0) - 100.0).abs() < 1e-9);
+
+        let song = song_with_tempo_ramp(60.0, 60.0, 8.0);
+        let t = TempoMap::from_song(&song);
+        assert!(!t.is_constant(), "SongTempo lane があれば曲線評価");
+        assert!((t.bpm_at(1.0) - 60.0).abs() < 1e-6, "got {}", t.bpm_at(1.0));
+        // nominal は compile 基準 (song.bpm) のまま = 配置計算に使う。
+        assert!((t.nominal_bpm() - 120.0).abs() < 1e-9);
+
+        // lane を disable すると定数へ戻る。
+        let mut song = song;
+        song.song_lanes[0].enabled = false;
+        assert!(TempoMap::from_song(&song).is_constant());
+    }
+
+    #[test]
+    fn raw_span_follows_tempo_curve_for_native_rate() {
+        // song.bpm = 120 のまま SongTempo lane で全域 60 BPM にする。 Raw は
+        // 実時間で source を消費するので、 1 拍あたりの消費量が 2 倍になり
+        // 「窓を鳴らし切る拍数」 が半分になる (= 波形が clip の左半分で終わる)。
+        let song = song_with_tempo_ramp(60.0, 60.0, 8.0);
+        let tempo = TempoMap::from_song(&song);
+        let ev = span_event(StretchMode::Raw, 48_000, 4.0, 0.0);
+        let mut out = Vec::new();
+        event_wave_spans(&ev, 48_000, &tempo, 0.0, &mut out);
+        assert!(!out.is_empty());
+        assert_monotonic(&out, "raw tempo curve");
+        let end = out.last().unwrap().end_beat;
+        assert!((end - 1.0).abs() < 0.05, "60 BPM では 1 拍で鳴り終わる: got {end}");
+        // 定数 120 BPM なら 2 拍ぶん鳴る (= 従来値)。
+        let mut base = Vec::new();
+        event_wave_spans(&ev, 48_000, &TempoMap::constant(120.0), 0.0, &mut base);
+        assert_eq!(base.len(), 1);
+        assert!((base[0].end_beat - 2.0).abs() < 1e-9);
+        // 分割された span は 2 本目以降 head = false (スライス境界線を出さない)。
+        assert!(out[0].head);
+        assert!(out[1..].iter().all(|s| !s.head), "分割 span は head でない");
+    }
+
+    #[test]
+    fn slice_body_follows_tempo_curve_but_triggers_do_not() {
+        // 全域 60 BPM。 trigger 配置 (= 窓 / clip 長) は tempo 不変、 slice 本体だけが
+        // 2 倍速で鳴り終わる → gap が広がる。
+        let song = song_with_tempo_ramp(60.0, 60.0, 8.0);
+        let tempo = TempoMap::from_song(&song);
+        let ev = slice_event(48_000, 4.0, 0.0, vec![0, 12_000, 24_000, 36_000]);
+        let mut out = Vec::new();
+        event_wave_spans(&ev, 48_000, &tempo, 0.0, &mut out);
+        assert_monotonic(&out, "slice tempo curve");
+        let heads: Vec<f64> = out.iter().filter(|s| s.head).map(|s| s.start_beat).collect();
+        assert_eq!(heads.len(), 4, "trigger は 4 本のまま: {out:?}");
+        for (i, b) in heads.iter().enumerate() {
+            assert!((b - i as f64).abs() < 1e-9, "trigger 拍は tempo 不変: {heads:?}");
+        }
+        // slice 0 が鳴り終わる拍 = 次の head の直前 span の end。
+        let first_end = out
+            .iter()
+            .take_while(|s| s.start_beat < 1.0 - 1e-9)
+            .last()
+            .unwrap()
+            .end_beat;
+        assert!(
+            (first_end - 0.25).abs() < 0.05,
+            "60 BPM では slice 本体が 0.25 拍で終わる (120 BPM なら 0.5): got {first_end}"
         );
-        assert_eq!(
-            audible_source_span(&span_event(StretchMode::Raw, 48_000, 2.0, 0.0), 48_000, 0.0),
-            (48_000, 2.0)
+    }
+
+    #[test]
+    fn source_frame_at_beat_inverts_spans_and_skips_gaps() {
+        // 伸ばした Slice (1 拍ごとに trigger、 0.5 拍鳴って 0.5 拍 gap)。
+        let spans = spans_of(&slice_event(48_000, 4.0, 0.0, vec![0, 12_000, 24_000, 36_000]));
+        // slice 1 の中央 (1.25 拍) は source 12000 + 0.25拍×24000 = 18000。
+        let got = source_frame_at_beat(&spans, 1.25).expect("span 内");
+        assert!((got - 18_000.0).abs() < 1.0, "got {got}");
+        // gap (1.75 拍) は何も鳴っていない。
+        assert!(source_frame_at_beat(&spans, 1.75).is_none());
+        // event 末尾の余り (3.9 拍) も無音。
+        assert!(source_frame_at_beat(&spans, 3.9).is_none());
+
+        // reversed は span 内で右→左に読む (左端 = source_end)。
+        let mut ev = slice_event(48_000, 2.0, 0.0, vec![0]);
+        ev.reversed = true;
+        let spans = spans_of(&ev);
+        let got = source_frame_at_beat(&spans, 0.5).expect("span 内");
+        assert!((got - 36_000.0).abs() < 1.0, "窓末尾から 1/4 読んだ位置: got {got}");
+    }
+
+    #[test]
+    fn wave_spans_clear_out_param_before_filling() {
+        let mut out = vec![WaveSpan {
+            start_beat: 9.0,
+            end_beat: 10.0,
+            source_start: 1,
+            source_end: 2,
+            reversed: false,
+            head: true,
+        }];
+        event_wave_spans(
+            &span_event(StretchMode::Raw, 48_000, 2.0, 0.0),
+            48_000,
+            &TempoMap::constant(120.0),
+            0.0,
+            &mut out,
         );
+        assert_eq!(out.len(), 1);
+        assert!((out[0].start_beat).abs() < 1e-9, "前回の内容が残っている");
     }
 
     #[test]
