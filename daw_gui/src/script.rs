@@ -765,10 +765,19 @@ fn daw_load_song_file(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
         // Resolve plugin ids → DLL paths from the cached DB the bootstrap built.
         h.app.ipc.plugin_db = h.bootstrap.plugin_db.clone();
         h.app.song_doc.file_path = Some(path.clone());
+        // GUI の File→Open と同じ順序を厳守する。 teardown を飛ばすと前 song の
+        // plugin instance が plugin_host に残り、 device_id が project ごとに
+        // 再採番されるせいで新 song の SetSlotPlugin が **旧 instance に dedup
+        // 吸収** される (= 保存した音色が復元されず前 project の音で鳴る)。
+        // 2 本目以降の loadSongFile を呼ぶ headless テストでは race なしに毎回
+        // 発生するので、 テストが緑でも実機と一致しなくなる。
+        h.app.teardown_all_loaded_plugins();
         // Instantiate every plugin in the chain (sends SetSlotPlugin), then push
         // the song + project_dir + LoadSong to the audio engine.
         h.app.restore_plugin_from_song(&song);
         h.app.song_doc.replace_song(song.clone());
+        // Song スコープの派生状態を破棄する唯一の口 (GUI 経路と同じ)。
+        h.app.after_song_replaced();
         // headless (frame loop 無し) なので明示的に flush する。 replace_song が epoch を
         // bump しているので flush_song_sync は必ず choreography を実行する。
         h.app.flush_song_sync();

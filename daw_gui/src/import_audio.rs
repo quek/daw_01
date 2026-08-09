@@ -162,6 +162,7 @@ pub fn decode_audio(path: &Path) -> Result<AudioSourceBuffer, ImportError> {
     let decoded =
         common::audio_decode::decode_audio_file(path).map_err(ImportError::from)?;
     Ok(AudioSourceBuffer {
+        origin: path.to_path_buf(),
         sample_rate: decoded.sample_rate,
         channels: decoded.channels,
         frames: decoded.frames,
@@ -363,30 +364,40 @@ pub fn import_one(
 ) -> Result<ImportedAudio, ImportError> {
     // Decode first so we surface format / size errors before we bother
     // hashing or copying anything.
-    let buffer = decode_audio(src)?;
+    let mut buffer = decode_audio(src)?;
 
     let hash8 = file_hash8(src)
         .map_err(|e| ImportError::IoError(format!("hash {}: {}", src.display(), e)))?;
     let filename = samples_filename(src, &hash8);
 
-    let path_kind = match project_dir {
+    let (path_kind, resolved) = match project_dir {
         Some(dir) => {
             let samples_dir = dir.join("samples");
-            copy_into_dir(src, &samples_dir, &filename).map_err(|e| {
+            let dst = copy_into_dir(src, &samples_dir, &filename).map_err(|e| {
                 ImportError::IoError(format!(
                     "copy into samples/: {e}",
                 ))
             })?;
-            AudioSourcePath::ProjectRelative(PathBuf::from("samples").join(&filename))
+            (
+                AudioSourcePath::ProjectRelative(PathBuf::from("samples").join(&filename)),
+                dst,
+            )
         }
         None => {
             let cache = unsaved_import_cache_dir();
             let dst = copy_into_dir(src, &cache, &filename).map_err(|e| {
                 ImportError::IoError(format!("copy into import_cache: {e}"))
             })?;
-            AudioSourcePath::Absolute(dst)
+            (AudioSourcePath::Absolute(dst.clone()), dst)
         }
     };
+    // `origin` は「この source が **今どこに在るか**」= キャッシュ再利用の同一性。
+    // decode 元はユーザーが選んだ元ファイルだが、import はそれを samples/ (or
+    // 未保存 project の import cache) へ複製し、以後 Song はそちらを指す。
+    // origin を複製先に揃えておかないと、次に同じ project を開いたとき
+    // `begin_asset_decode` の照合 (解決済み絶対パス) と食い違って無駄に
+    // decode し直すことになる。
+    buffer.origin = resolved;
 
     let source = AudioSource {
         path: path_kind,
