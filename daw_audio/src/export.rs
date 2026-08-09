@@ -282,12 +282,16 @@ fn render_loop(
     {
         let prev = engine_shared.audio_clip_renderer.load();
         let prev_ref: &crate::audio_clip_renderer::AudioClipRenderer = &prev;
-        if crate::audio_clip_renderer::has_undecoded_sources(song, prev_ref) {
-            let project_dir = engine_shared
-                .project_dir
-                .load()
-                .as_ref()
-                .map(|a| (**a).clone());
+        let project_dir = engine_shared
+            .project_dir
+            .load()
+            .as_ref()
+            .map(|a| (**a).clone());
+        if crate::audio_clip_renderer::has_undecoded_sources(
+            song,
+            prev_ref,
+            project_dir.as_deref(),
+        ) {
             let full = crate::audio_clip_renderer::compile_audio_schedule(
                 song,
                 Some(prev_ref),

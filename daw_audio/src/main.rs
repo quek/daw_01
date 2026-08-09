@@ -570,8 +570,11 @@ async fn recv_loop(
                     session_sample_rate,
                     false,
                 );
-                let needs_decode =
-                    audio_clip_renderer::has_undecoded_sources(&song, &partial);
+                let needs_decode = audio_clip_renderer::has_undecoded_sources(
+                    &song,
+                    &partial,
+                    project_dir.as_deref(),
+                );
                 publish_audio_clip_schedule(&engine_shared, generation, partial);
                 // topology publish: routing schedule + tempo map を off-thread
                 // で compile して RT へ wait-free 配送 (shared.song もここで更新)。

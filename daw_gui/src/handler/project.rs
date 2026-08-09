@@ -249,11 +249,15 @@ impl AppData {
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
         // 未 cache の audio source だけ work-list に (idempotent)。
+        // `AudioSourceId` は Song スコープの名前で project ごとに 1 から再採番
+        // されるので、**id 一致だけで cache hit と見なしてはいけない** — 別
+        // project を開くと前 project の波形がそのまま残り、しかも decode job も
+        // 積まれないので恒久的に直らない。cache された buffer 自身が持つ
+        // `origin` (decode 元の解決済み絶対パス) が一致したときだけ再利用し、
+        // 食い違う entry はここで捨てて decode し直す。
         let mut audio_jobs: Vec<(common::model::AudioSourceId, PathBuf)> = Vec::new();
+        let mut stale_audio: Vec<common::model::AudioSourceId> = Vec::new();
         for (&source_id, source) in &self.song_doc.song().media.audio_sources {
-            if self.media.audio_source_cache.contains(source_id) {
-                continue;
-            }
             let abs = match &source.path {
                 AudioSourcePath::Absolute(abs) => abs.clone(),
                 AudioSourcePath::ProjectRelative(rel) => match project_dir.as_ref() {
@@ -263,7 +267,17 @@ impl AppData {
                 // PR-V4 で廃止 (builtin VOICEVOX plugin 経由)。
                 AudioSourcePath::Generated { .. } => continue,
             };
+            match self.media.audio_source_cache.get(source_id) {
+                Some(buf) if buf.origin == abs => continue,
+                Some(_) => stale_audio.push(source_id),
+                None => {}
+            }
             audio_jobs.push((source_id, abs));
+        }
+        // 別 project の同 id を掴んだ entry は、decode 完了を待たずに **即座に**
+        // 落とす (待つ間に波形描画 / onset 検出が前 project の音を読むため)。
+        for source_id in stale_audio {
+            self.media.audio_source_cache.remove(source_id);
         }
         // 未 staging の image source。
         let mut image_jobs: Vec<(common::model::ImageSourceId, PathBuf)> = Vec::new();
