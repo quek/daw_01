@@ -365,7 +365,7 @@ mod tests {
         KeyEvent {
             state: ElementState::Pressed,
             text: None,
-            physical_key: physical,
+            physical_key: physical, repeat: false
         }
     }
 

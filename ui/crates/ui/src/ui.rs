@@ -554,6 +554,14 @@ impl<M: ?Sized + 'static> UiHost<M> {
         // (text_input が `take_typing_shortcut("paste")` で受け取る前に provider から取り出す)。
         let mut typing_paste_pending = false;
         keyboard_events.retain(|ev| {
+            // OS auto-repeat (押しっぱなし) は **global shortcut にしない**。 shortcut は
+            // Delete / D / E のような離散コマンドに bind されるので、 repeat で連射されると
+            // 「Delete 長押しでトラックが次々消える」 類の破壊的挙動になる (daw_01 r.md #43)。
+            // event は `keyboard_events` に残すので、 focused な text_input は従来どおり
+            // Backspace / 矢印の長押しリピートを受け取れる (= 抑止は shortcut 層のみ)。
+            if ev.repeat {
+                return true;
+            }
             if let Some(name) = self.shortcut_map.matches(ev, modifiers) {
                 // (daw_01 #056) typing 中は command 修飾 (Ctrl/Alt/Logo) を持たない printable
                 // 文字キー (英数字 / Space、Shift だけ付きも含む) に bind された shortcut を global

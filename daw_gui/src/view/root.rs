@@ -280,7 +280,9 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                 // clip を無条件連続発火する別ロジックで、 対象決定規則が 2 系統に
                 // 割れていた (SSoT 崩れ)。 menu 上の pointer は編集面に乗らないので
                 // is_pianoroll_active=false で選択集合ベースの解決になる。
-                delete_for_surface(app, ui, app.edit_surface(false));
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.delete_current_surface(false);
+                }));
             });
         });
         mb.menu("View", |m| {
@@ -521,78 +523,6 @@ fn paste_noop(ui: &mut Ui<'_, AppData>) {
     }));
 }
 
-/// Delete: `edit_surface` が解決した面 (ポインタ面 → last-wins → 選択優先順) の
-/// 選択を削除。 fallback の優先順 (audio event > automation point > note >
-/// automation clip > clip) は surface が解決しなかったときの従来挙動。
-fn delete_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
-    // section が対象面なら選択帯を削除して終わり (帯のみ・内容温存)。
-    if matches!(surface, Some(EditSurface::Sections)) {
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.apply_delete_selected_sections();
-        }));
-        return;
-    }
-    // トラック面: 選択中の全トラックを 1 undo step で削除 (r.md #43、 Ableton 準拠)。
-    // 確認ダイアログは出さない (Ableton / REAPER とも出さず undo で戻す。 削除前に
-    // 最新 plugin state を取り込んでから snapshot するので knob 値まで復元される)。
-    // section と同じく早期分岐にして、 下の非空優先順 fallback を踏ませない。
-    if matches!(surface, Some(EditSurface::Tracks)) {
-        let ids = app.selection.selected_track_ids.clone();
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.handle_event(AppEvent::DeleteTracks(ids));
-        }));
-        return;
-    }
-    // 何も選択が無い (edit_surface が None) なら no-op。 無条件で
-    // DeleteSelectedClip を発火すると空選択でも undo snapshot が積まれ
-    // redo 履歴が破棄される (copy/cut の early return と同じ gate)。
-    if surface.is_none() {
-        return;
-    }
-    let audio_event_selected =
-        app.ui_ephemeral.audio_editor_clip.is_some() && !app.selection.audio_editor_selected_events.is_empty();
-    let has_notes = !app.selection.selected_notes.is_empty();
-    let auto_points =
-        (!app.selection.selected_automation_points.is_empty()).then(|| app.selection.selected_automation_points.clone());
-    let auto_clips =
-        (!app.selection.selected_automation_clips.is_empty()).then(|| app.selection.selected_automation_clips.clone());
-    let pointer_pick: Option<AppEvent> = match surface {
-        Some(EditSurface::AudioEvents) if audio_event_selected => {
-            Some(AppEvent::DeleteAudioEditorSelection)
-        }
-        Some(EditSurface::Notes) if has_notes => Some(AppEvent::DeleteSelectedNotes),
-        Some(EditSurface::AutomationPoints) => auto_points
-            .clone()
-            .map(|points| AppEvent::DeleteAutomationPoints { points }),
-        Some(EditSurface::AutomationClips) => auto_clips
-            .clone()
-            .map(|keys| AppEvent::DeleteAutomationClips { keys }),
-        // last-wins が clip 面を選んだときは、 残存 automation 点があっても
-        // クリップ削除に直行する (下の優先順 fallback を踏ませない)。
-        Some(EditSurface::Clips) => Some(AppEvent::DeleteSelectedClip),
-        _ => None,
-    };
-    let has_clips = app.selection.selected_clip.is_some() || !app.selection.selected_clips.is_empty();
-    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        if let Some(ev) = pointer_pick {
-            app.handle_event(ev);
-            return;
-        }
-        if audio_event_selected {
-            app.handle_event(AppEvent::DeleteAudioEditorSelection);
-        } else if let Some(points) = auto_points {
-            app.handle_event(AppEvent::DeleteAutomationPoints { points });
-        } else if has_notes {
-            app.handle_event(AppEvent::DeleteSelectedNotes);
-        } else if let Some(keys) = auto_clips {
-            app.handle_event(AppEvent::DeleteAutomationClips { keys });
-        } else if has_clips {
-            // 非空判定付き (空選択の no-op snapshot + redo 破棄を避ける)。
-            app.handle_event(AppEvent::DeleteSelectedClip);
-        }
-    }));
-}
-
 /// `ShortcutMap` ルックアップで判定済みの shortcut name を pull して AppEvent / undo
 /// 要求に変換する。`Ui::take_shortcut` は 1 度だけ消費するので、各 name について
 /// この関数で一括処理する。`app` は immut で受けて、コピーや状態判定のみで使う
@@ -796,7 +726,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         paste_from_clipboard(app, ui, &text, is_pianoroll_active);
     }
     if ui.take_shortcut("delete") {
-        delete_for_surface(app, ui, surface);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.delete_current_surface(is_pianoroll_active);
+        }));
     }
 
     // ----- Grid snap / fit -----
@@ -1301,7 +1233,7 @@ mod tests {
             keyboard: vec![KeyEvent {
                 state: ElementState::Pressed,
                 text: None,
-                physical_key: PhysicalKey::Escape,
+                physical_key: PhysicalKey::Escape, repeat: false
             }],
             ..FrameInput::default()
         };

@@ -407,7 +407,7 @@ fn text_input_click_focus_then_typing_modifies_text() {
     let keys = vec![KeyEvent {
         state: ElementState::Pressed,
         text: Some("A".to_string()),
-        physical_key: PhysicalKey::Other(0x41),
+        physical_key: PhysicalKey::Other(0x41), repeat: false
     }];
     let edits = host.frame_to_edits(
         &model,
@@ -432,7 +432,7 @@ fn text_input_click_focus_then_typing_modifies_text() {
     let keys = vec![KeyEvent {
         state: ElementState::Pressed,
         text: None,
-        physical_key: PhysicalKey::Backspace,
+        physical_key: PhysicalKey::Backspace, repeat: false
     }];
     let edits = host.frame_to_edits(
         &model,
@@ -613,7 +613,7 @@ fn keyboard_events_delivered_only_to_focused() {
     let keys = vec![KeyEvent {
         state: ElementState::Pressed,
         text: Some("x".to_string()),
-        physical_key: PhysicalKey::Other(0),
+        physical_key: PhysicalKey::Other(0), repeat: false
     }];
     host.frame_to_edits(
         &(),
@@ -674,7 +674,7 @@ fn typing_focus_blocks_global_delete_shortcut() {
     let delete_ev = KeyEvent {
         state: ElementState::Pressed,
         text: None,
-        physical_key: PhysicalKey::Delete,
+        physical_key: PhysicalKey::Delete, repeat: false
     };
     let outer_got_delete = std::cell::Cell::new(true);
     host.frame_to_edits(
@@ -704,6 +704,67 @@ fn typing_focus_blocks_global_delete_shortcut() {
     assert!(
         !outer_got_delete.get(),
         "typing_focus 中は take_shortcut(\"delete\") が false を返す (= 他 widget の note 削除等を防ぐ)"
+    );
+}
+
+/// OS auto-repeat (押しっぱなし) は **global shortcut にしない**。
+///
+/// shortcut は Delete / D / E のような離散コマンドに bind されるので、 repeat で
+/// 連射されると「Delete 長押しでトラックが次々消える」 類の破壊的挙動になる
+/// (daw_01 r.md #43)。 ただし event 自体は `keyboard_events` に残さないと
+/// text_input の Backspace / 矢印の長押しリピートが死ぬので、 **抑止は
+/// shortcut 解決層だけ** に閉じることを固定する。
+#[test]
+fn auto_repeat_does_not_fire_shortcuts_but_still_reaches_widgets() {
+    use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    host.shortcut_map_mut().bind("delete", "Delete");
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 200, height: 100 };
+
+    let key = |repeat: bool| KeyEvent {
+        state: ElementState::Pressed,
+        text: None,
+        physical_key: PhysicalKey::Delete,
+        repeat,
+    };
+
+    // 立ち上がり (repeat=false) は shortcut として発火する。
+    let fired = std::cell::Cell::new(false);
+    let leftover = std::cell::Cell::new(0_usize);
+    host.frame_to_edits(
+        &(),
+        &mut scene,
+        screen,
+        FrameInput { keyboard: vec![key(false)], ..Default::default() },
+        |(), ui| {
+            fired.set(ui.take_shortcut("delete"));
+            let id = WidgetId::ROOT.child("sink");
+            ui.set_focus(id);
+            leftover.set(ui.take_keyboard_events_if_focused(id).len());
+        },
+    );
+    assert!(fired.get(), "立ち上がりの Delete は shortcut として発火する");
+    assert_eq!(leftover.get(), 0, "発火したイベントは consume される");
+
+    // auto-repeat は shortcut にならず、 keyboard_events に残って widget へ届く。
+    host.frame_to_edits(
+        &(),
+        &mut scene,
+        screen,
+        FrameInput { keyboard: vec![key(true)], ..Default::default() },
+        |(), ui| {
+            fired.set(ui.take_shortcut("delete"));
+            let id = WidgetId::ROOT.child("sink");
+            ui.set_focus(id);
+            leftover.set(ui.take_keyboard_events_if_focused(id).len());
+        },
+    );
+    assert!(!fired.get(), "auto-repeat は shortcut を発火させない");
+    assert_eq!(
+        leftover.get(),
+        1,
+        "repeat イベントは keyboard_events に残る (text_input の長押しリピート用)"
     );
 }
 
@@ -741,7 +802,7 @@ fn typing_focus_keeps_bare_char_shortcut_for_text_input() {
     let r_ev = KeyEvent {
         state: ElementState::Pressed,
         text: Some("r".to_string()),
-        physical_key: PhysicalKey::Char('R'),
+        physical_key: PhysicalKey::Char('R'), repeat: false
     };
     let got_shortcut = std::cell::Cell::new(true);
     host.frame_to_edits(
@@ -791,7 +852,7 @@ fn non_typing_bare_char_shortcut_still_fires() {
     let r_ev = KeyEvent {
         state: ElementState::Pressed,
         text: Some("r".to_string()),
-        physical_key: PhysicalKey::Char('R'),
+        physical_key: PhysicalKey::Char('R'), repeat: false
     };
     let got_shortcut = std::cell::Cell::new(false);
     host.frame_to_edits(

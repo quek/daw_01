@@ -127,7 +127,7 @@ fn drive_pointer(host: &mut UiHost<AppData>, app: &mut AppData, p: PointerFrame)
 }
 
 fn key(pk: PhysicalKey) -> KeyEvent {
-    KeyEvent { state: ElementState::Pressed, text: None, physical_key: pk }
+    KeyEvent { state: ElementState::Pressed, text: None, physical_key: pk , repeat: false}
 }
 
 // ---- Song setup ----

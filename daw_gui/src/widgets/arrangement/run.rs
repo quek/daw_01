@@ -440,7 +440,13 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
             //  - 16px 未満 drag は release で click 格下げ (track header click のトラック選択が代替)
             // M14 Phase 63n-2 (#028): track 行 と lane 行 で分岐。 lane 行 (= track 行下、 expanded のみ)
             // では lane header button (★/👁/✕) と default band drag を扱う。
+            // r.md #43 review: popup (右クリックメニュー) が開いている frame は header の
+            // press 経路を丸ごと止める。 context menu は `capture_input == false` で背景
+            // pointer を mask しないので、 menu item の press が背後の行に届き
+            // **volume band drag が起動して離した位置の音量に飛ぶ** / reorder session が
+            // 始まる (release 側の選択ガードだけでは塞げない press 側の同件)。
             if header_w > 0.0
+                && !ui.has_open_popups()
                 && header_pane.contains(px, py)
                 && let Some(idx) = track_index_from_y(py, header_pane.y, &press_tops)
                 && let Some(t) = visible_tracks.get(idx)
@@ -2382,7 +2388,11 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     name_rect_visible,
                     style.track_text_size,
                     daw_ui_core::widgets::button::ButtonTextAlign::Left,
-                ) {
+                ) && !ui.has_open_popups()
+                {
+                    // 名前ボタン経路も popup ガード対象 (release catch-all / master 行と同件)。
+                    // daw-ui の button 自体も popup mask を見るようにしたが、 ここは
+                    // 「どの行が click されたか」 を蓄える daw_gui 側の状態遷移なので明示する。
                     clicked_track_for_select = Some(t.id);
                 }
                 // M14 Phase 118 (daw_01 #092): group track 名 double-click rename の信頼性。 深くネストした

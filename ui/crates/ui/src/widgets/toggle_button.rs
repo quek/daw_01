@@ -79,7 +79,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     {
         let wid = WidgetId::ROOT.child((b"toggle_button", &id));
         let pointer = self.pointer;
-        let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
+        // 開いている modal popup (context menu / dropdown) の上ではヒットさせない。
+        // context menu は `capture_input == false` で背景 pointer を mask しないので、
+        // menu item の press/release が **背後のボタン** にもそのまま届き、
+        // 「メニュー項目を押したら裏のトラックが Mute された / 音量が飛んだ」 が起きる
+        // (daw_01 r.md #43 review)。 popup の中を描いている間は
+        // `pointer_blocked_by_modal_popup` が false を返すので menu 自身の item は無傷。
+        let blocked = self.pointer_blocked_by_modal_popup();
+        let inside = !blocked && pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
 
         // armed-state click 判定 (button / checkbox と同じモデル)。
         let (visual_pressed, click) = {

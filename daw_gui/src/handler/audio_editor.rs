@@ -50,6 +50,49 @@ impl AppData {
         self.ui_ephemeral.audio_editor_clip = None;
         self.selection.audio_editor_selected_events.clear();
         self.ui_ephemeral.audio_editor_hover_beat_in_clip = None;
+        // 面そのものが消えたので last-wins タグも降ろす。 残すと
+        // 「閉じた audio editor の面」 を指したまま `edit_surface` が空判定で
+        // 落ちるだけの死んだタグになり、 Delete が None に倒れて効かなくなる。
+        if self.selection.last_edit_select == Some(EditSurface::AudioEvents) {
+            self.selection.last_edit_select = None;
+        }
+    }
+
+    /// Audio Editor の編集対象を指す **安定 `ClipKey`**。 track / clip の Vec が
+    /// 詰まる編集の **直前** に退避しておき、 編集後に
+    /// [`Self::reanchor_audio_editor`] へ渡す。
+    pub(crate) fn audio_editor_target_key(&self) -> Option<common::model::ClipKey> {
+        self.ui_ephemeral
+            .audio_editor_clip
+            .and_then(|r| self.clip_key_of(r))
+    }
+
+    /// `ui_ephemeral.audio_editor_clip` は **positional な `ClipRef`** (track/clip とも
+    /// Vec index) なので、 トラック削除 / undo / redo / load で Vec が詰まると
+    /// **黙って別のクリップを指す**。 index の妥当性だけを見る旧ガードでは、
+    /// 「詰まった先にたまたま別の audio clip が居る」 ケースを取りこぼし、
+    /// エディタ上の Delete が無関係なクリップのイベントを消す。
+    ///
+    /// そこで編集前に退避した安定 `ClipKey` で **貼り直す**: 同じクリップが生きて
+    /// いれば新しい index に付け替え (エディタは開いたまま)、 消えた / audio で
+    /// なくなった / そもそも key が取れなかったなら閉じる。
+    pub(crate) fn reanchor_audio_editor(&mut self, key: Option<common::model::ClipKey>) {
+        if self.ui_ephemeral.audio_editor_clip.is_none() {
+            return;
+        }
+        let Some(key) = key else {
+            self.close_audio_editor();
+            return;
+        };
+        let still_audio = self
+            .clip_at(key)
+            .map(|c| c.content_id)
+            .and_then(|cid| self.song_doc.song().clip_contents.get(&cid))
+            .is_some_and(|c| matches!(c, common::model::ClipContent::Audio(_)));
+        match self.clip_ref_of(key) {
+            Some(r) if still_audio => self.ui_ephemeral.audio_editor_clip = Some(r),
+            _ => self.close_audio_editor(),
+        }
     }
 
     /// Audio Editor 水平 scroll: `view_start_beat` を `[0, total - view_len]`

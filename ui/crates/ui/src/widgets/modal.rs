@@ -228,7 +228,7 @@ mod tests {
         let esc = KeyEvent {
             state: ElementState::Pressed,
             text: None,
-            physical_key: PhysicalKey::Escape,
+            physical_key: PhysicalKey::Escape, repeat: false
         };
         let on_close_fired_clone = on_close_fired.clone();
         host.frame_to_edits(
@@ -314,7 +314,7 @@ mod tests {
         let esc = KeyEvent {
             state: ElementState::Pressed,
             text: None,
-            physical_key: PhysicalKey::Escape,
+            physical_key: PhysicalKey::Escape, repeat: false
         };
         let click = PointerFrame {
             pos: Some((10.0, 10.0)),
@@ -576,7 +576,7 @@ mod tests {
         let esc = KeyEvent {
             state: ElementState::Pressed,
             text: None,
-            physical_key: PhysicalKey::Escape,
+            physical_key: PhysicalKey::Escape, repeat: false
         };
         let got = Cell::new(true);
         host.frame_to_edits(

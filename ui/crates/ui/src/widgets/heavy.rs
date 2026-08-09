@@ -458,7 +458,7 @@ mod tests {
         let key = KeyEvent {
             state: ElementState::Pressed,
             text: None,
-            physical_key: PhysicalKey::Delete,
+            physical_key: PhysicalKey::Delete, repeat: false
         };
 
         let outer = Cell::new(false);
@@ -490,7 +490,7 @@ mod tests {
         let key = KeyEvent {
             state: ElementState::Pressed,
             text: None,
-            physical_key: PhysicalKey::Delete,
+            physical_key: PhysicalKey::Delete, repeat: false
         };
 
         let inner = Cell::new(false);
