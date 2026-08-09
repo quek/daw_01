@@ -19,6 +19,16 @@ use common::model::AudioSourceId;
 /// independently and don't share the buffer over IPC.
 #[derive(Debug)]
 pub struct AudioSourceBuffer {
+    /// **このバッファの同一性**: decode 元の解決済み絶対パス。
+    /// `daw_audio::audio_clip_renderer::AudioSourceBuffer::origin` と同じ規約。
+    ///
+    /// [`AudioSourceCache`] の key である `AudioSourceId` は **Song スコープの
+    /// 名前**でしかない (`IdAllocators::next_audio_source_id` は project ごとに
+    /// 1 から再採番される) ので、別 project を開くと必ず衝突する。id だけで
+    /// キャッシュヒットを判定すると前 project の波形が描かれ、onset 検出 /
+    /// ARA materialize も前 project の音を読む。再利用の可否はこの origin の
+    /// 一致で判定する (= キャッシュの同一性はキャッシュされた値自身が持つ)。
+    pub origin: std::path::PathBuf,
     pub sample_rate: u32,
     pub channels: u16,
     pub frames: u64,

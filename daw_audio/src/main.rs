@@ -224,7 +224,7 @@ fn decode_worker_loop(
 /// decode (the bare `schedule_generation` re-check has a TOCTOU window between
 /// its load and the `store`). Off the audio thread — the CPAL callback only ever
 /// `load()`s the `ArcSwap`, never this mutex (r.md #7 B)。
-fn publish_audio_clip_schedule(
+pub(crate) fn publish_audio_clip_schedule(
     engine_shared: &EngineShared,
     generation: u64,
     renderer: audio_clip_renderer::AudioClipRenderer,
@@ -397,8 +397,15 @@ impl BundlePublisher {
 
     fn send(&mut self, bundle: RtBundle) {
         self.flush();
-        if let Err(rtrb::PushError::Full(newest)) = self.tx.push(bundle) {
-            // 旧 parked (superseded) はこの代入で drop される — off-thread。
+        if let Err(rtrb::PushError::Full(mut newest)) = self.tx.push(bundle) {
+            // ring full。 旧 parked は superseded だが、 `schedule` は snapshot
+            // ではなく delta なので、 捨てる前に `supersede` で newest へ
+            // 畳み込む (RT 側 `refresh_bundle` の coalescing と同じ規約 —
+            // 畳み込まないと topology 更新がここで失われる)。 畳み込み後の
+            // 残骸だけを drop する — off-thread。
+            if let Some(older) = self.parked.take() {
+                drop(newest.supersede(older));
+            }
             self.parked = Some(newest);
         }
     }
@@ -438,26 +445,41 @@ fn build_input_delay_replacements(schedule: &Schedule) -> Vec<Option<DelayLine>>
     if any { repl } else { Vec::new() }
 }
 
+/// `publish_bundle` の topology 引数。 旧 `recompile: bool` を置き換え、
+/// 呼び出し側が意図を名前で述べるようにしたもの。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Topology {
+    /// 値のみの更新 (SetTrackVolume 等)。 schedule は載せない = RT は現行
+    /// schedule (走行状態込み) を据え置く (§5 D: 値更新で `compile_schedule`
+    /// を走らせない)。
+    Unchanged,
+    /// topology 変更 (LoadSong / buffer_frames drift)。 schedule を off-thread
+    /// で再 compile して載せる。
+    ///
+    /// `reset_song_scoped_state = true` は「別プロジェクトが読み込まれた」
+    /// (`Song::project_id` が変わった) の意で、RT に走行状態 (PDC ring /
+    /// follower envelope / per-track input delay line) を **引き継がず捨てさせる**。
+    /// これらの移送キーは Song スコープの id なので project を跨ぐと別物同士が
+    /// 一致してしまう。
+    Recompile { reset_song_scoped_state: bool },
+}
+
 /// 現在の mirrors (plugin_refs / worker) + `song` で `RtBundle` を組んで RT へ
-/// 配送する。 `recompile = true` なら schedule + tempo map を off-thread で
-/// 再 compile (topology 変更: LoadSong / buffer_frames drift)。 `false` なら
-/// schedule は載せない = RT は現行 schedule (走行状態込み) を据え置く
-/// (§5 D: 値のみの更新で `compile_schedule` を走らせない)。
-/// `shared.song` mirror もここで更新する (off-thread 読者用)。
+/// 配送する。 `shared.song` mirror もここで更新する (off-thread 読者用)。
 fn publish_bundle(
     publisher: &mut BundlePublisher,
     shared: &SharedState,
     engine_shared: &EngineShared,
     song: Option<Arc<common::model::Song>>,
     sample_rate: u32,
-    recompile: bool,
+    topology: Topology,
 ) {
     shared.song.store(song.clone());
     let tempo_map = match song.as_deref() {
         Some(s) => common::tempo_map::TempoMap::from_song(s),
         None => common::tempo_map::TempoMap::from_song(&common::model::Song::default()),
     };
-    let (schedule, input_delay_replacements) = if recompile {
+    let (schedule, input_delay_replacements) = if topology != Topology::Unchanged {
         let buffer_frames = resolve_buffer_frames(engine_shared, sample_rate);
         publisher.last_compiled_frames = Some(buffer_frames);
         let sched = match song.as_deref() {
@@ -481,6 +503,12 @@ fn publish_bundle(
         song,
         tempo_map,
         schedule,
+        reset_song_scoped_state: matches!(
+            topology,
+            Topology::Recompile {
+                reset_song_scoped_state: true
+            }
+        ),
         input_delay_replacements,
         plugin_refs: engine_shared.plugin_refs.load_full(),
         worker: engine_shared.worker.load_full(),
@@ -511,7 +539,7 @@ fn update_song_values<F>(
         engine_shared,
         Some(Arc::new(next)),
         sample_rate,
-        false,
+        Topology::Unchanged,
     );
 }
 
@@ -565,7 +593,10 @@ async fn recv_loop(
                     &engine_shared,
                     song,
                     session_sample_rate,
-                    true,
+                    // 同 project の再 compile なので走行状態は引き継ぐ。
+                    Topology::Recompile {
+                        reset_song_scoped_state: false,
+                    },
                 );
             }
         }
@@ -621,6 +652,37 @@ async fn recv_loop(
                 // これで下流の divisor (samples_per_beat 等) が NaN / 0 /
                 // 負値で壊れない。 idempotent。
                 song.sanitize_ranges();
+                // 別プロジェクトが読み込まれたか (`Song::project_id` は v24 で
+                // 導入されたプロジェクト同一性の SSoT。New で採番し save/load で
+                // 保持される)。Song 内の id (track / device / audio_source /
+                // ModSource …) はどれも project ごとに 1 から再採番されるので、
+                // project が変わった瞬間に **それらを key にした状態は全部無効**
+                // になる。ここが daw_audio 側の唯一の検出点。
+                let project_switched = engine_shared
+                    .loaded_project_id
+                    .swap(song.project_id, Ordering::AcqRel)
+                    != song.project_id;
+                if project_switched {
+                    tracing::info!(
+                        project_id = song.project_id,
+                        "project switched; dropping song-scoped engine state"
+                    );
+                    // 旧 project の device の shmem 参照。 破棄は daw_gui の
+                    // ClosePluginShmem に依存していたが、 その列挙元 (帳簿) に
+                    // 取りこぼしがあると前 project の instance を掴んだまま
+                    // 音を出してしまう。 device_id も project ごとに 1 から
+                    // 再採番されるので、 ここで一括して捨てる (新 project の
+                    // 分は SetSlotPlugin → SlotPluginLoaded → OpenPluginShmem
+                    // で必ず後から届く)。
+                    engine_shared
+                        .plugin_refs
+                        .store(Arc::new(std::collections::HashMap::new()));
+                    // track_id keyed。 非空のまま持ち越すと新 project の同番号
+                    // track の automation が bypass されたままになる。
+                    shared
+                        .recording_lanes
+                        .store(Arc::new(std::collections::HashSet::new()));
+                }
                 let project_dir_g = engine_shared.project_dir.load();
                 let project_dir: Option<std::path::PathBuf> =
                     project_dir_g.as_ref().map(|arc| (**arc).clone());
@@ -646,8 +708,14 @@ async fn recv_loop(
                     session_sample_rate,
                     false,
                 );
-                let needs_decode =
-                    audio_clip_renderer::has_undecoded_sources(&song, &partial);
+                // main 側: 未 decode 判定は id 一致でなく origin (解決済み絶対
+                // パス) 一致で行う。 r.md #40 側: publish が stretch engine pool の
+                // 配送も担うので session SR が要る。
+                let needs_decode = audio_clip_renderer::has_undecoded_sources(
+                    &song,
+                    &partial,
+                    project_dir.as_deref(),
+                );
                 publish_audio_clip_schedule(
                     &engine_shared,
                     generation,
@@ -662,7 +730,9 @@ async fn recv_loop(
                     &engine_shared,
                     Some(Arc::clone(&song)),
                     session_sample_rate,
-                    true,
+                    Topology::Recompile {
+                        reset_song_scoped_state: project_switched,
+                    },
                 );
                 // Phase 2: hand off to the background worker for full decode of
                 // any missing source. Skipped when everything was reusable
@@ -713,7 +783,7 @@ async fn recv_loop(
                             &engine_shared,
                             song,
                             session_sample_rate,
-                            false,
+                            Topology::Unchanged,
                         );
                     }
                     Err(e) => {
@@ -730,7 +800,7 @@ async fn recv_loop(
                     &engine_shared,
                     song,
                     session_sample_rate,
-                    false,
+                    Topology::Unchanged,
                 );
             }
             Ok(AudioCommand::OpenPluginShmem { device_id, shmem_id }) => {
@@ -753,7 +823,7 @@ async fn recv_loop(
                             &engine_shared,
                             song,
                             session_sample_rate,
-                            false,
+                            Topology::Unchanged,
                         );
                         tracing::info!(device_id, "plugin shmem registered");
                     }
@@ -773,7 +843,7 @@ async fn recv_loop(
                     &engine_shared,
                     song,
                     session_sample_rate,
-                    false,
+                    Topology::Unchanged,
                 );
                 // 旧 entry (shmem mapping) は RT が新 bundle を install して
                 // recycle が drain された時点で off-thread unmap される。
@@ -1632,6 +1702,7 @@ mod tests {
                 &common::model::Song::default(),
             ),
             schedule: None,
+            reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),
             plugin_refs: Arc::new(std::collections::HashMap::new()),
             worker: None,

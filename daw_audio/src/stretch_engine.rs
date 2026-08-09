@@ -172,6 +172,13 @@ impl StretchEngine {
         self.stream.as_ref().map(|s| s.key)
     }
 
+    /// 走行中ストリームを捨てる (次の `render` は必ず prime し直す)。
+    /// project 切替で呼ぶ: `stream_key` は Song スコープの id 合成なので、
+    /// 別 project では **別物同士が一致してしまう**。
+    pub fn forget_stream(&mut self) {
+        self.stream = None;
+    }
+
     /// この buffer で既に別の発音に取られたか。
     pub fn is_claimed(&self, stamp: u64) -> bool {
         self.claim_stamp == stamp
