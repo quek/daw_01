@@ -1,7 +1,7 @@
 //! S3b-1: AppData state group (SelectionState)。 docs/plan_arch_refactor.md §7.5
 //! の分割表に従って app.rs の AppData から機械移送したフィールド群。
 
-use crate::app::{AutomationPointKeyRef, EditSelectSurface};
+use crate::app::{AutomationPointKeyRef, EditSurface};
 
 pub struct SelectionState {
 
@@ -27,7 +27,7 @@ pub struct SelectionState {
     /// 曖昧になる。 「最後に選んだ面を対象にする」 (last-wins、 #071) ための
     /// タイブレーカ。 `None` は初期状態。 session-only。 edit_surface (view) が
     /// この値で対象面を解決する。
-    pub last_edit_select: Option<EditSelectSurface>,
+    pub last_edit_select: Option<EditSurface>,
     /// Phase 3 (`docs/plan_automation.md` §10): 選択中の automation point。
     /// gui_01 #033 で widget 側の lasso 矩形選択が landing するまで空のまま
     /// だが、 copy / paste / quantize / delete のハンドラは selection を

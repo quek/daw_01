@@ -17,6 +17,7 @@ use daw_ui_renderer::{Color, Rect, RectCommand};
 use crate::theme;
 
 use crate::app::{AppData, AppEvent, ModControlDomain};
+use crate::widgets::select_modifier::SelectModifier;
 
 const STRIP_WIDTH: f32 = 80.0;
 const STRIP_GAP: f32 = 4.0;
@@ -270,50 +271,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // press したトラックがあれば modifier-aware に選択を更新する (r.md #13)。
     // arrangement のヘッダ選択と同じ意味論: Single / Ctrl=Toggle / Shift=Range。
-    // range の anchor は cursor (= 最後に選んだトラック)。 実際に集合が変わるときだけ
-    // Edit を積む (= 無変更 press では dirty 化も再描画も誘発しない)。
+    // r.md #43: 解決ロジックは `AppData::apply_select_tracks` の 1 実装に集約した
+    // (旧実装はここと arrangement/run.rs に別々の範囲計算を持ち、 anchor の SSoT も
+    // 割れていた — mixer は cursor = 選択末尾を基点にしていたので、 Shift+click を
+    // 繰り返すと基点が歩いて範囲を伸縮できなかった)。 view が渡すのは mixer の
+    // 可視 strip 順 (`visible_order`) だけ。
     if let Some(tid) = select_press.get() {
-        let prev: Vec<u32> = app.selection.selected_track_ids.clone();
-        let next: Vec<u32> = if pointer.modifiers.shift {
-            let to = visible_order.iter().position(|&v| v == tid).unwrap_or(0);
-            // anchor = cursor。 可視 strip に無い (別ビューで選択中 / 折り畳みで隠れた
-            // 等) ときは範囲を張らず単一選択に落とす (先頭 strip に化けさせない)。
-            let from = app
-                .cursor_track_id()
-                .and_then(|a| visible_order.iter().position(|&v| v == a));
-            let (lo, hi) = from.map_or((to, to), |f| (f.min(to), f.max(to)));
-            let mut range: Vec<u32> = visible_order
-                .get(lo..=hi)
-                .map(<[u32]>::to_vec)
-                .unwrap_or_else(|| vec![tid]);
-            // cursor (= 末尾) を今クリックした tid に合わせる → 次の Shift で下方向へ
-            // 再アンカーできる (arrangement の anchor=tid 更新と一致)。
-            if let Some(pos) = range.iter().position(|&v| v == tid) {
-                range.remove(pos);
-                range.push(tid);
-            }
-            range
-        } else if pointer.modifiers.ctrl {
-            // toggle: 追加は末尾へ (= 新 cursor/anchor)、 既存は除去。
-            let mut set = prev.clone();
-            if let Some(pos) = set.iter().position(|&v| v == tid) {
-                set.remove(pos);
-            } else {
-                set.push(tid);
-            }
-            set
-        } else {
-            vec![tid]
-        };
-        // 集合として比較 (順序無視) して、 変化したときだけ書き込む。
-        let (mut a, mut b) = (prev.clone(), next.clone());
-        a.sort_unstable();
-        b.sort_unstable();
-        if a != b {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.selection.selected_track_ids = next;
-            }));
-        }
+        let modifier =
+            SelectModifier::from_modifiers(pointer.modifiers.shift, pointer.modifiers.ctrl);
+        let order = visible_order.clone();
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.apply_select_tracks(tid, modifier, &order);
+        }));
     }
 
     // ----- MASTER strip (右端固定) -----

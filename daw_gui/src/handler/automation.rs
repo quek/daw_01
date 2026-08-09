@@ -32,7 +32,9 @@ impl AppData {
             return;
         };
         // 追加直後はこの新 track を唯一の選択 + カーソルにする (次の操作の対象)。
-        self.selection.selected_track_ids = vec![id];
+        // 明示的なトラック面操作なので last-wins タグも Tracks に倒す (= 直後の
+        // Delete は「今足したトラック」 を消す。 Ableton と同じ)。
+        self.set_track_selection(vec![id]);
         self.resize_track_peak_display();
         tracing::info!(insert_at, ?parent_group_id, "added instrument track");
     }
@@ -118,11 +120,14 @@ impl AppData {
     }
 
     /// gui_01 の `SelectSection { id, modifier }` を解決してセクション選択集合を
-    /// 更新する (`SelectModifier` は track header click と同 idiom、 末尾 = anchor)。 section を
-    /// 選んだ時点で clip / note / track 等の他面選択をクリアし、 キーボード Delete が曖昧に
-    /// ならないようにする (section は `edit_surface` の最低優先なので、 他選択が残っていると
-    /// Delete がそちらを向く)。
-    pub(crate) fn apply_select_section(
+    /// 更新する (`SelectModifier` は track header click と同 idiom、 末尾 = anchor)。
+    ///
+    /// r.md #43: 旧実装は「section を選んだら clip / note / automation / track の
+    /// 全選択を強制クリアする」 ことで Delete の曖昧さを避けていたが、 それは
+    /// last-wins タグ方式との **二重規格** だった (他面はタグ、 section だけ破壊的クリア)。
+    /// 全 7 面を同じ規則に揃え、 ここでは [`EditSurface::Sections`] タグを立てるだけにする
+    /// (= セクションを選んでもクリップ選択が消えない)。
+    pub fn apply_select_section(
         &mut self,
         id: u32,
         modifier: crate::widgets::arrangement::SelectModifier,
@@ -150,13 +155,15 @@ impl AppData {
         if modifier.updates_anchor() {
             self.selection.section_anchor = Some(id);
         }
-        // section を選んだら他面の選択を消す (Delete の曖昧さ回避、 §doc 参照)。
-        self.selection.selected_clips.clear();
-        self.selection.selected_clip = None;
-        self.selection.selected_notes.clear();
-        self.selection.selected_automation_clips.clear();
-        self.selection.selected_automation_points.clear();
-        self.selection.selected_track_ids.clear();
+        // 「最後に選んだ面」 = セクション。 空になった (Ctrl+click で最後の 1 本を外した)
+        // ときはタグを降ろす (トラック面の `set_track_selection` と同じ規則)。
+        if self.selection.selected_section_ids.is_empty() {
+            if self.selection.last_edit_select == Some(EditSurface::Sections) {
+                self.selection.last_edit_select = None;
+            }
+        } else {
+            self.selection.last_edit_select = Some(EditSurface::Sections);
+        }
     }
 
     /// 選択中のセクション帯を削除する (帯のみ・内容温存、 キーボード Delete から)。
@@ -817,7 +824,7 @@ impl AppData {
                 point_idx: i,
             })
             .collect();
-        self.selection.last_edit_select = Some(EditSelectSurface::AutomationPoints);
+        self.selection.last_edit_select = Some(EditSurface::AutomationPoints);
         count
     }
 
@@ -1241,7 +1248,7 @@ impl AppData {
             // 解除し (paste_clips_at が selected_notes を clear するのと同じ)、 last-wins も
             // clip 側に倒す。
             self.selection.selected_automation_points.clear();
-            self.selection.last_edit_select = Some(EditSelectSurface::AutomationClips);
+            self.selection.last_edit_select = Some(EditSurface::AutomationClips);
         }
         pasted
     }
@@ -1503,7 +1510,7 @@ impl AppData {
         }
         if !new_keys.is_empty() {
             self.selection.selected_automation_clips = new_keys;
-            self.selection.last_edit_select = Some(EditSelectSurface::AutomationClips);
+            self.selection.last_edit_select = Some(EditSurface::AutomationClips);
         }
     }
 
@@ -1528,7 +1535,7 @@ impl AppData {
         }
         if !new_keys.is_empty() {
             self.selection.selected_automation_clips = new_keys;
-            self.selection.last_edit_select = Some(EditSelectSurface::AutomationClips);
+            self.selection.last_edit_select = Some(EditSurface::AutomationClips);
         }
     }
 

@@ -129,7 +129,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
             let in_ruler = ruler.contains(px, py);
             let shift = pointer.modifiers.shift;
             let ctrl = pointer.modifiers.ctrl;
-            // release frame で確定する click 系 (track header SelectTrack) 用の
+            // release frame で確定する click 系 (track header のトラック選択) 用の
             // press 時 modifier snapshot (`press_modifiers` doc 参照)。
             {
                 let state: &mut ArrangementState = ui.widget_state(wid);
@@ -437,10 +437,16 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
             // M10 Phase 46+47b: track header press 振り分け
             //  - volume band 内 → TrackVolumeDragSession (priority 最高)
             //  - 上記以外 + Name button area を含む row + M/S/Up/Dn/Del button rect 非 hit → reorder
-            //  - 16px 未満 drag は release で click 格下げ (button_at の SelectTrack / ↑↓ button が代替)
+            //  - 16px 未満 drag は release で click 格下げ (track header click のトラック選択が代替)
             // M14 Phase 63n-2 (#028): track 行 と lane 行 で分岐。 lane 行 (= track 行下、 expanded のみ)
             // では lane header button (★/👁/✕) と default band drag を扱う。
+            // r.md #43 review: popup (右クリックメニュー) が開いている frame は header の
+            // press 経路を丸ごと止める。 context menu は `capture_input == false` で背景
+            // pointer を mask しないので、 menu item の press が背後の行に届き
+            // **volume band drag が起動して離した位置の音量に飛ぶ** / reorder session が
+            // 始まる (release 側の選択ガードだけでは塞げない press 側の同件)。
             if header_w > 0.0
+                && !ui.has_open_popups()
                 && header_pane.contains(px, py)
                 && let Some(idx) = track_index_from_y(py, header_pane.y, &press_tops)
                 && let Some(t) = visible_tracks.get(idx)
@@ -2103,16 +2109,16 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
             render::render_arrangement_heavy(hctx, tracks_owned, view_copy, style_copy, lanes, ruler, header_pane, header_pane_copy, arranger_rect_copy, arranger_header_rect_copy, arranger_lane_h_copy, beat_per_px, zoom_x_px_per_beat, id_for_inner, viewport_key_hash, clip_content, selected_set, selected_tracks_for_heavy, selected_automation_clips_set_for_heavy, selected_automation_points_for_heavy, mapping, sample_viewport, grid_style, ruler_style, drag_overlay_clone, drag_overlay_min_len, audio_drag_overlay, point_drag_overlay, automation_clip_drag_overlay, curve_param_overlay, lasso_overlay, section_drag_overlay, sections_for_draw, reorder_overlay, loop_preview_clone);
         });
 
-        release::commit_releases(ui, wid, &mut response, pointer, view, style, master_row, sections, selected_clips, selected_tracks, selected_automation_clips, selected_automation_points, &visible_tracks, &press_tops, lanes, ruler, header_pane, arranger_rect, lanes_h, arranger_lane_h, beat_per_px, zoom_x_px_per_beat, clip_drag_release, clip_short_click_pos, audio_drag_release, point_drag_release, automation_clip_drag_release, automation_curve_param_release, automation_lasso_release, lane_resize_drag_release, section_drag_release, loop_drag_release, track_volume_release, pending_drop);
+        release::commit_releases(ui, wid, &mut response, pointer, view, style, master_row, sections, selected_clips, selected_automation_clips, selected_automation_points, &visible_tracks, &press_tops, lanes, ruler, header_pane, arranger_rect, lanes_h, arranger_lane_h, beat_per_px, zoom_x_px_per_beat, clip_drag_release, clip_short_click_pos, audio_drag_release, point_drag_release, automation_clip_drag_release, automation_curve_param_release, automation_lasso_release, lane_resize_drag_release, section_drag_release, loop_drag_release, track_volume_release, pending_drop);
 
-        // ---- track headers (button_at × 4 + toggle_button_at × 2) + SelectTrack トリガ ----
+        // ---- track headers (button_at × 4 + toggle_button_at × 2) + トラック選択トリガ ----
         // M10 Phase 50: tracks_for_draw を使う (release frame の optimistic preview と同順序)。
         // M14 Phase 63c (#016): visible_indices を pre-compute して collapsed 親配下を skip、
         // visible_i (描画上の row index) を row_y に使う。 各 track header に depth * indent_px の
         // 左 indent + group track には disclosure ▼/▶ アイコン。 selection は selected_tracks_set で判定。
-        // 修飾 (Shift / Ctrl) で Single / RangeFromAnchor / Toggle を decode し SelectTrack に乗せる。
-        // 1 frame 内で最初に click された track id を `clicked_track` に蓄え、 loop 後に modifier-aware
-        // SelectTrack を 1 度発行する (loop 内で複数発行しないため)。
+        // 修飾 (Shift / Ctrl) で Single / RangeFromAnchor / Toggle を decode して渡す。
+        // 1 frame 内で最初に click された track id を `clicked_track` に蓄え、 loop 後に
+        // `apply_select_tracks` を 1 度呼ぶ (loop 内で複数発行しないため)。
         //
         // M14 Phase 77 (daw_01 #048): header row 描画 push_* 群を `header_pane` で auto-scissor
         // する。 closure 化すると `ui.xxx` の大量 rename を要するため、 `with_clip_rect` と
@@ -2145,7 +2151,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 }
 
                 // M14 Phase 63n-10 (#034): master row 専用 header 描画。 mute/solo button / volume band /
-                // group disclosure / row click → SelectTrack の全 path を skip し、 neutral gray 背景 +
+                // group disclosure / row click → トラック選択の全 path を skip し、 neutral gray 背景 +
                 // "Master" label + lane disclosure (`▶`/`▼`) のみを描画する (daw_01 #034 §B 仕様)。
                 // 通常 track 経路の `selected_tracks` / `is_group_set` 判定とは独立 (master は selection
                 // 対象外、 group でもない、 = 「特殊な行」 として描画分岐)。
@@ -2202,7 +2208,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     }
                     // Response.track_header_rects に積む (caller が master row の rect 領域を識別可能に)。
                     response.track_header_rects.push((t.id, row));
-                    // M14 Phase 90 (daw_01 #061): master 行の header click → SelectTrack。 通常 track と
+                    // M14 Phase 90 (daw_01 #061): master 行の header click もトラック選択。 通常 track と
                     // 同じ `clicked_track_for_select` 経路を再利用し、 loop 後の modifier-aware 発行に乗せる
                     // (Single なら next=[MASTER_TRACK_ID])。 lane disclosure (`+`/`-`) rect 内 release は
                     // automation collapse トグルが priority なので除外する (disclosure > row-select)。
@@ -2211,6 +2217,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                         && let Some((rx, ry)) = pointer.pos
                         && row.contains(rx, ry)
                         && (t.automation_lanes.is_empty() || !layout.lane_disc_rect.contains(rx, ry))
+                        && !ui.has_open_popups()
                     {
                         clicked_track_for_select = Some(t.id);
                     }
@@ -2301,7 +2308,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 }
 
                 // M14 Phase 63c (#016): disclosure ▼/▶ — group track のみ描画 + click で
-                // ToggleGroupCollapsed Edit 発行 (loop 後に発火、 SelectTrack より priority 高)。
+                // ToggleGroupCollapsed Edit 発行 (loop 後に発火、 トラック選択より priority 高)。
                 let is_group = is_group_set.contains(&t.id);
                 let disclosure_rect = disclosure_rect_for(name_rect, style, t.depth);
                 if is_group {
@@ -2368,9 +2375,9 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 let armed = t.armed;
 
                 let name_text = t.name.clone();
-                // M14 Phase 63c (#016): name 領域 click は modifier-aware SelectTrack を loop 後に
+                // M14 Phase 63c (#016): name 領域 click は modifier-aware なトラック選択を loop 後に
                 // 発行する形に変更。 button_at_clicked で click 検知のみ行い、 内部で Edit は emit
-                // しない (旧設計は button_at の closure 内で SelectTrack を emit していた)。
+                // しない (旧設計は button_at の closure 内で選択更新を emit していた)。
                 // M14 Phase 105 (#076): track 名 font は `style.track_text_size` に追従させる
                 // (汎用 button の 16px 固定では daw_01 が名前サイズを下げられないため)。
                 // M14 Phase 107 (#079): track 名は常に左寄せ (Reaper / Cubase / Live と同じ。
@@ -2381,7 +2388,11 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     name_rect_visible,
                     style.track_text_size,
                     daw_ui_core::widgets::button::ButtonTextAlign::Left,
-                ) {
+                ) && !ui.has_open_popups()
+                {
+                    // 名前ボタン経路も popup ガード対象 (release catch-all / master 行と同件)。
+                    // daw-ui の button 自体も popup mask を見るようにしたが、 ここは
+                    // 「どの行が click されたか」 を蓄える daw_gui 側の状態遷移なので明示する。
                     clicked_track_for_select = Some(t.id);
                 }
                 // M14 Phase 118 (daw_01 #092): group track 名 double-click rename の信頼性。 深くネストした
@@ -2431,16 +2442,21 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     { let v_id = track_id; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::ToggleTrackArmed(v_id)); }) }
                 });
                 // Phase 47c: ↑/↓/× button は削除 (drag&drop reorder + Delete shortcut で代替)。
-                // `MoveTrackUp/Down` / `DeleteTrack` Edit variants は context menu / keyboard 用に残す。
+                // `MoveTrackUp/Down` は context menu / keyboard 用に残す (削除は root の arbiter)。
 
                 // Response.track_header_rects に積む
                 response.track_header_rects.push((t.id, row));
 
-                // SelectTrack トリガ: row 内 release + button_zones / disclosure いずれにも非 hit。
-                // catch-all は modifier-aware SelectTrack の元データを蓄えるだけ (発行は loop 後)。
+                // トラック選択トリガ: row 内 release + button_zones / disclosure いずれにも非 hit。
+                // catch-all は modifier-aware な選択更新の元データを蓄えるだけ (発行は loop 後)。
                 // lane disclosure (`+`/`-`) と volume band も除外する — 除外しないと
-                // toggle / volume drag の release が SelectTrack を併発し、 multi-select が
+                // toggle / volume drag の release が選択更新を併発し、 multi-select が
                 // 単一選択に潰れる (master 分岐は除外済みで通常 track だけ漏れていた、 review)。
+                // popup (右クリックメニュー) が開いている frame も除外する: context menu は
+                // `capture_input == false` で背景 pointer を mask しないので、 menu item への
+                // click がこの row にも届き multi-select が単一に潰れる → 「選択トラックを
+                // まとめて Delete / 複製」 が右クリック 1 本にしか効かなくなる
+                // (clip 短 click の r.md #14 ガードと同 class、 r.md #43 で同件対処)。
                 if pointer.primary_just_released
                     && let Some((rx, ry)) = pointer.pos
                     && row.contains(rx, ry)
@@ -2449,6 +2465,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     && (t.automation_lanes.is_empty()
                         || !layout.lane_disc_rect.contains(rx, ry))
                     && !layout.volume_band.is_some_and(|b| b.contains(rx, ry))
+                    && !ui.has_open_popups()
                 {
                     clicked_track_for_select = Some(t.id);
                 }
@@ -2457,7 +2474,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         // M14 Phase 77 (daw_01 #048): header_pane scope を復元 (= track header push_* 群が終了)。
         ui.set_current_clip_rect(prev_clip_for_headers);
 
-        // M14 Phase 63c (#016): disclosure click → ToggleGroupCollapsed (priority 高、 SelectTrack は
+        // M14 Phase 63c (#016): disclosure click → ToggleGroupCollapsed (priority 高、 トラック選択は
         // この frame では skip = group の collapsed toggle 動作のみで selection は変えない、
         // Reaper / Live と同じ UX)。
         if let Some(tid) = disclosure_clicked {
@@ -2465,10 +2482,10 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
             clicked_track_for_select = None;
         }
 
-        // M14 Phase 63c (#016): clicked_track があれば modifier-aware SelectTrack を 1 度発行。
-        // Single → next = [tid]、 anchor 更新。
-        // RangeFromAnchor (Shift) → anchor から visible 列の連続範囲。 anchor が None なら Single 同等。
-        // Toggle (Ctrl) → tid を selected に対して toggle、 anchor 更新しない。
+        // M14 Phase 63c (#016): clicked_track があれば modifier-aware なトラック選択を
+        // 1 度だけ発行する。 Single → next = [tid]、 anchor 更新。 RangeFromAnchor (Shift)
+        // → anchor から visible 列の連続範囲 (anchor が None なら Single 同等)。
+        // Toggle (Ctrl) → tid を selected に対して toggle。
         if let Some(tid) = clicked_track_for_select {
             // press 時 snapshot を真値にする (release frame の生読みは
             // ModifiersChanged 先行 race で Ctrl/Shift+click が Single に化ける、
@@ -2477,38 +2494,21 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 let state: &ArrangementState = ui.widget_state(wid);
                 (state.press_modifiers.shift, state.press_modifiers.ctrl)
             };
-            let modifier = if shift {
-                SelectModifier::RangeFromAnchor
-            } else if ctrl {
-                SelectModifier::Toggle
-            } else {
-                SelectModifier::Single
-            };
+            let modifier = SelectModifier::from_modifiers(shift, ctrl);
             // r.md #35: アンカーは `SelectionState.track_anchor` が所有する (旧: widget state の
             // `ArrangementState.selection_anchor`)。 全選択面で同じ場所・同じ更新規則にするため
             // (`docs/plan_selection_modifiers.md` §4.3)。 更新規則も **Single / Toggle で更新、
             // Range は据え置き** に直した (旧実装は Single / Range で更新していたので、 Shift+click
             // を繰り返すと基点が歩いて範囲を伸縮できなかった。 Explorer / Finder / REAPER は据え置き)。
+            // r.md #43: 選択遷移の解決自体は `AppData::apply_select_tracks` に集約した
+            // (mixer strip の click と同じ 1 実装 + last-wins タグを Tracks に倒す口)。
+            // view が渡すのは「この view の可視順」 だけ。
             let visible_ids: Vec<u32> = visible_idx_for_headers
                 .iter()
                 .map(|&i| tracks_for_draw[i].id)
                 .collect();
-            let prev_v: Vec<u32> = selected_tracks.to_vec();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                let anchor = app.selection.track_anchor;
-                let next = modifier.resolve(&prev_v, tid, || {
-                    range_ordered(&visible_ids, anchor?, tid)
-                });
-                let mut prev_sorted = prev_v.clone();
-                prev_sorted.sort_unstable();
-                let mut next_sorted = next.clone();
-                next_sorted.sort_unstable();
-                if prev_sorted != next_sorted {
-                    app.selection.selected_track_ids = next;
-                }
-                if modifier.updates_anchor() {
-                    app.selection.track_anchor = Some(tid);
-                }
+                app.apply_select_tracks(tid, modifier, &visible_ids);
             }));
             response.selection_changed = true;
         }

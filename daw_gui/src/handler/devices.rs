@@ -1266,7 +1266,7 @@ impl AppData {
     /// 避けるため)。
     pub(crate) fn execute_deferred_edit(&mut self, edit: DeferredEdit) {
         match edit {
-            DeferredEdit::DeleteTrack { track_id } => self.delete_track_inner(track_id),
+            DeferredEdit::DeleteTracks { track_ids } => self.delete_tracks_inner(&track_ids),
             DeferredEdit::UngroupTracks { track_ids } => {
                 self.action_ungroup_tracks_inner(&track_ids)
             }

@@ -8,23 +8,48 @@ use common::protocol::{AudioCommand, PluginCommand};
 impl AppData {
     // -------- Track operations ---------------------------------------------
 
-    /// `AppEvent::DeleteTrack` の dispatcher。 plugin が song に居る
+    /// `AppEvent::DeleteTracks` の dispatcher (r.md #43)。 plugin が song に居る
     /// 場合は `RequestAllStates` を投げて、 受信時に最新 plugin state
     /// を Song に書き込んでから [`Self::push_undo_snapshot`] + 削除を
     /// 実行する。 これで「knob を回した状態で track 削除 → Undo」 で
     /// knob 値が復元される。 plugin 無しの song は即時実行 (= state を
     /// 取りに行く相手が居ない)。
-    pub(crate) fn delete_track(&mut self, idx: u32) {
-        let Some(track_id) = self.song_doc.song().tracks.get(idx as usize).map(|t| t.id) else {
-            return;
-        };
-        if !self.song_has_plugin() {
-            self.delete_track_inner(track_id);
+    ///
+    /// **deferred は必ず 1 件にまとめる** — id ごとに enqueue すると round-trip が
+    /// 分かれて undo が N ステップに割れる (Ctrl+Z 1 回で戻らなくなる)。
+    ///
+    /// 実在しない id (master row の `MASTER_TRACK_ID` は `song.tracks` に居ない、
+    /// 重複指定) は先に落とす。 落とした結果が空なら **何もしない** —
+    /// 空のまま deferred / edit_song に入ると「何も消えないのに dirty 化 +
+    /// 死んだ undo step」 になる。
+    pub(crate) fn delete_tracks(&mut self, track_ids: Vec<u32>) {
+        let ids = self.live_track_ids(&track_ids);
+        if ids.is_empty() {
+            // 無言の no-op にしない: master 行を選んで Delete したときに
+            // 「Delete が壊れた」 と誤認されるので理由を出す (paste_noop と同方針)。
+            if track_ids.contains(&common::model::MASTER_TRACK_ID) {
+                self.ui_ephemeral.status_message =
+                    "マスタートラックは削除できません".to_string();
+            }
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(
-            DeferredEdit::DeleteTrack { track_id },
-        ));
+        if !self.song_has_plugin() {
+            self.delete_tracks_inner(&ids);
+            return;
+        }
+        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::DeleteTracks {
+            track_ids: ids,
+        }));
+    }
+
+    /// 複数トラック削除の本体。 呼び出し側で undo snapshot 済み (deferred 経由 or
+    /// 即時 fallback)。 group は [`Self::delete_track_inner`] が subtree ごと消すので、
+    /// 親と子を同時に選択していても 2 周目は `track_index_by_id` が `None` を返して
+    /// 自然に no-op になる (= 与えられた集合をそのまま回してよい、 順序依存を作らない)。
+    pub(crate) fn delete_tracks_inner(&mut self, track_ids: &[u32]) {
+        for &id in track_ids {
+            self.delete_track_inner(id);
+        }
     }
 
     // -------- track clipboard --------
@@ -32,6 +57,10 @@ impl AppData {
     /// Ctrl+C (トラック面)。plugin があれば最新 state を取ってから serialize する
     /// ため deferred、無ければ即時。copy は Song 不変なので undo を積まない。
     pub fn copy_tracks(&mut self, track_ids: Vec<u32>) {
+        // delete と同じ実在フィルタを通す (SSoT)。 master 行だけの選択で Ctrl+C を
+        // 押すと、 素通しでは plugin state の全 round-trip を 1 往復空振りさせ、
+        // その間 dirty guard (New / Open / 終了) まで保留される。
+        let track_ids = self.live_track_ids(&track_ids);
         if track_ids.is_empty() {
             return;
         }
@@ -45,6 +74,9 @@ impl AppData {
     /// Ctrl+X (トラック面)。copy → 削除を 1 undo step。plugin があれば deferred
     /// (削除前に最新 state 捕捉 + undo snapshot)、無ければ即時。
     pub fn cut_tracks(&mut self, track_ids: Vec<u32>) {
+        // copy / delete と同じ実在フィルタ (master 行だけの選択で空振り round-trip を
+        // 起こさない)。
+        let track_ids = self.live_track_ids(&track_ids);
         if track_ids.is_empty() {
             return;
         }
@@ -73,9 +105,7 @@ impl AppData {
             self.ui_ephemeral.pending_clipboard_write = Some(json);
             self.ui_ephemeral.status_message = format!("カット: {count} トラック");
         }
-        for &id in track_ids {
-            self.delete_track_inner(id);
-        }
+        self.delete_tracks_inner(track_ids);
     }
 
     /// 指定トラック群を `TrackCopy` list に組み立てる (clipboard serialize と
@@ -156,6 +186,8 @@ impl AppData {
             return 0;
         }
         tracks.sort_by_key(|t| t.order);
+        // audio editor は positional な ClipRef を持つので index が動く編集では貼り直す。
+        let audio_editor_key = self.audio_editor_target_key();
         let Some(new_ids) = self.edit_song(|song| {
             let same_project = src_pid == song.project_id;
             // drop 先の親 group context と挿入 index (above_track の直上)。
@@ -178,8 +210,9 @@ impl AppData {
         // (flush_song_sync = LoadSong は audio 専属で plugin host では no-op なので、
         //  plugin の実体化には restore が別途必要。state 込みで新インスタンス化)。
         let n = new_ids.len();
-        self.selection.selected_track_ids = new_ids.clone();
+        self.set_track_selection(new_ids.clone());
         self.restore_plugins_for_tracks(&new_ids);
+        self.reanchor_audio_editor(audio_editor_key);
         self.resize_track_peak_display();
         n
     }
@@ -347,6 +380,9 @@ impl AppData {
     /// `linked=true` はクリップ中身を元と content_id 共有 (D 相当)、 `false` は独立
     /// コピー (Alt+D 相当)。
     pub fn duplicate_tracks(&mut self, track_ids: Vec<u32>, linked: bool) {
+        // delete / copy / cut と同じ実在フィルタ (master 行だけの選択で空振り
+        // round-trip を起こさない)。
+        let track_ids = self.live_track_ids(&track_ids);
         if track_ids.is_empty() {
             return;
         }
@@ -450,7 +486,7 @@ impl AppData {
         if new_ids.is_empty() {
             return;
         }
-        self.selection.selected_track_ids = new_ids.clone();
+        self.set_track_selection(new_ids.clone());
         self.restore_plugins_for_tracks(&new_ids);
         self.resize_track_peak_display();
         self.ui_ephemeral.status_message = format!("複製: {} トラック", new_ids.len());
@@ -483,6 +519,10 @@ impl AppData {
         let Some(idx) = self.song_doc.song().track_index_by_id(track_id) else {
             return;
         };
+        // Audio Editor の対象は positional な `ClipRef`。 track を remove すると
+        // index が詰まって **別トラックのクリップを指す** ので、 安定 key を
+        // 退避しておき末尾で貼り直す (undo 経路 `after_undo_redo` と同じガード)。
+        let audio_editor_key = self.audio_editor_target_key();
         let idx = idx as u32;
         if idx as usize >= self.song_doc.song().tracks.len() {
             return;
@@ -503,6 +543,8 @@ impl AppData {
             .collect();
         subtree_idxs.sort_unstable();
         subtree_idxs.dedup();
+        // 削除で空く最小 index。 削除後にここへ繰り上がる track が「隣接」。
+        let removed_min_idx = subtree_idxs.first().copied().unwrap_or(idx) as usize;
 
         // PR2.1 race-fix: 順序を「song update → LoadSong → plugin
         // destroy → RemoveTrack」 に固定する。 song update を先に送ら
@@ -557,20 +599,46 @@ impl AppData {
         }
 
         // selected_track_ids: subtree に含まれていた id を全て除外。
-        // 残りが空なら直近の生存 track にフォールバック (UI 完全選択
-        // ゼロを避ける)。
+        // 残りが空なら **削除位置に繰り上がった隣接トラック** を選ぶ
+        // (UI 完全選択ゼロを避ける)。
+        //
+        // r.md #43 review: 旧実装は `tracks.last()` = 曲の最下段に飛んでいた。
+        // Delete がトラック面を破壊操作の対象にした今、 last-wins タグは Tracks の
+        // まま残る (自動再選択はユーザー操作ではないので `set_track_selection` を
+        // 通さない = タグを触らない) ため、 **次の Delete が画面外の最下段トラックを
+        // 消す**。 Ableton / REAPER と同じく削除位置の直後 (無ければ直前) へ倒す。
         let subtree_ids_set: std::collections::HashSet<u32> = subtree_ids.iter().copied().collect();
         self.selection.selected_track_ids
             .retain(|id| !subtree_ids_set.contains(id));
         if self.selection.selected_track_ids.is_empty()
-            && let Some(t) = self.song_doc.song().tracks.last()
+            && let Some(id) = self.neighbor_track_id_after_removal(removed_min_idx)
         {
-            self.selection.selected_track_ids.push(t.id);
+            self.selection.selected_track_ids.push(id);
         }
         // collapsed_groups からも消えた id を除外。
         self.ui_prefs.collapsed_groups
             .retain(|id| !subtree_ids_set.contains(id));
+        // Audio Editor を安定 key で貼り直す (消えていれば閉じる)。
+        self.reanchor_audio_editor(audio_editor_key);
         self.resize_track_peak_display();
+    }
+
+    /// トラックを消したあと「選択ゼロ」 を避けるためのフォールバック先。
+    ///
+    /// `removed_min_idx` は削除で空いた最小 index。 削除後の `song.tracks` で
+    /// **その位置に繰り上がった track** (= 消したトラックの直後にあった行) を返し、
+    /// 末尾を消したなら 1 つ上、 全部消えたなら `None`。 Ableton / REAPER と同じ
+    /// 「削除位置の隣を選ぶ」 挙動で、 Delete を連打しても手元から順に消える。
+    ///
+    /// **これはユーザーの選択操作ではない**ので、 呼び出し側は
+    /// [`Self::set_track_selection`] を通さず `selected_track_ids` に直接入れる
+    /// (= last-wins タグを立て直さない)。
+    fn neighbor_track_id_after_removal(&self, removed_min_idx: usize) -> Option<u32> {
+        let tracks = &self.song_doc.song().tracks;
+        tracks
+            .get(removed_min_idx)
+            .or_else(|| tracks.last())
+            .map(|t| t.id)
     }
 
     /// Return `root_id` plus every descendant track that points at it
@@ -613,7 +681,10 @@ impl AppData {
         if a >= n || b >= n {
             return;
         }
+        // audio editor は positional な ClipRef を持つので index が動く編集では貼り直す。
+        let audio_editor_key = self.audio_editor_target_key();
         self.edit_song(|song| song.tracks.swap(a as usize, b as usize));
+        self.reanchor_audio_editor(audio_editor_key);
         // PR2.1: plugin_host の chains は `Track::id` ベースなので、
         // Vec position swap は通知不要。 SwapTracks IPC は削除済。
         // selected_clip / selected_clips は stable ClipKey 保持なので、 track の
@@ -642,6 +713,8 @@ impl AppData {
             .tracks
             .get(self.cursor_track_index().unwrap_or(0))
             .map(|t| t.id);
+        // audio editor は positional な ClipRef を持つので index が動く編集では貼り直す。
+        let audio_editor_key = self.audio_editor_target_key();
         // selected_clips / selected_clip は stable ClipKey 保持なので reorder
         // (track の index 変化) に自動追従する。 旧実装の id ラウンドトリップ
         // (抽出 → 並べ替え → index 逆引き) は不要になった。
@@ -685,12 +758,119 @@ impl AppData {
         // 削除済。 LoadSong (flush_song_sync) で song_store
         // のみ新順序に同期する。
         let _ = index_order;
+        self.reanchor_audio_editor(audio_editor_key);
         self.resize_track_peak_display();
     }
 
-    /// 単独選択する (index ベース、 旧 API 互換)。 新 multi-select API
-    /// (gui_01 #016) からは `SelectTrack { next, modifier, .. }` 経由で
-    /// `selected_track_ids` を直接書き込む。
+    /// トラック面の選択集合を確定する **唯一の口** (r.md #43)。 集合を書き、
+    /// last-wins タグを [`EditSurface::Tracks`] にする (= 以後の Delete / Cut /
+    /// Copy / D がトラック面を向く)。
+    ///
+    /// ここを通るのは「ユーザーがトラック面を明示的に操作した」 結果だけ —
+    /// ヘッダ / ミキサーストリップの click、 追加 / グループ化 / 解除 / 複製 /
+    /// 貼り付けの結果選択。 **削除・undo 後の「選択ゼロを避ける」 自動再選択と、
+    /// クリップ選択に追従する [`Self::select_track`] はここを通さない**。 通すと
+    /// 「クリップを Del した直後の 2 回目の Del でトラックが消える」 事故になる
+    /// (`AppData::edit_surface` はトラック面を非空優先順 fallback から外し、
+    /// このタグ経由でしか選ばない)。
+    ///
+    /// 集合が空になったとき (Ctrl+click で最後の 1 本を外した) はタグを降ろす。
+    /// 立てたままだと、 後から暗黙の追従選択が集合を埋めた瞬間に Delete が
+    /// トラックを向いてしまう。
+    ///
+    /// **master 行 (`MASTER_TRACK_ID`) しか入っていない選択でもタグは立てない**
+    /// (r.md #43 review)。 master は `song.tracks` に居ない合成行なので、 タグを立てると
+    /// `edit_surface` が Tracks を返す → Delete / Cut / Copy / D が「実在 0 件」 で
+    /// 空振りし、 **しかも早期分岐なので他の面 (クリップ等) の削除まで殺す**。
+    /// 「マスターのインスペクタを見るためにヘッダを click しただけで Delete が
+    /// 効かなくなる」 という不可視の故障になるため、 選択表示はしてもタグは立てない。
+    pub(crate) fn set_track_selection(&mut self, ids: Vec<u32>) {
+        self.selection.selected_track_ids = ids;
+        if self.has_deletable_track_selection() {
+            self.selection.last_edit_select = Some(EditSurface::Tracks);
+        } else if self.selection.last_edit_select == Some(EditSurface::Tracks) {
+            self.selection.last_edit_select = None;
+        }
+    }
+
+    /// 選択中トラックに `song.tracks` の実在トラックが 1 本でもあるか。
+    /// master 行 (合成 id) だけの選択は「トラック面の編集対象なし」 とみなす。
+    pub(crate) fn has_deletable_track_selection(&self) -> bool {
+        self.selection
+            .selected_track_ids
+            .iter()
+            .any(|id| self.song_doc.song().track_index_by_id(*id).is_some())
+    }
+
+    /// トラック面の一括操作 (削除 / cut / copy / 複製) が受け取る id 集合を正規化する。
+    /// `song.tracks` に実在する id だけを **入力順のまま** 残し、 重複を落とす。
+    ///
+    /// master 行の `MASTER_TRACK_ID` は合成行で `song.tracks` に居ないため必ず落ちる。
+    /// 空でないことを呼び出し側が確認してから作業に入ることで、 「何も起きないのに
+    /// plugin state round-trip を 1 往復させる」 「dirty 化だけする死んだ undo step」
+    /// を全経路で防ぐ (r.md #43 review: 以前は delete だけがこのフィルタを持っていた)。
+    pub(crate) fn live_track_ids(&self, track_ids: &[u32]) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::with_capacity(track_ids.len());
+        for &id in track_ids {
+            if self.song_doc.song().track_index_by_id(id).is_some() && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// トラックヘッダ / ミキサーストリップの click を解決してトラック選択を更新する
+    /// (`apply_select_section` と同 idiom)。 修飾キーの意味論は全選択面共通の
+    /// [`SelectModifier`](crate::widgets::select_modifier::SelectModifier) —
+    /// 無修飾 = Single / Ctrl = Toggle / Shift = アンカーからの範囲。
+    ///
+    /// `visible_ids` は **その view の可視順** (arrangement = 折り畳み除外後の行順、
+    /// mixer = normal strip 左→右 → return 帯)。 範囲解決の並びだけは view しか
+    /// 知らないので引数で受け、 解決ロジック自体はここ 1 本に集約する
+    /// (旧実装は arrangement と mixer に別実装が 2 本あった)。
+    ///
+    /// アンカーは `SelectionState::track_anchor` が所有し、 Single / Toggle で更新、
+    /// Shift では据え置き (r.md #35、 `docs/plan_selection_modifiers.md` §4.3)。
+    pub fn apply_select_tracks(
+        &mut self,
+        id: u32,
+        modifier: crate::widgets::select_modifier::SelectModifier,
+        visible_ids: &[u32],
+    ) {
+        let prev = self.selection.selected_track_ids.clone();
+        let anchor = self.selection.track_anchor;
+        let mut next = modifier.resolve(&prev, id, || {
+            crate::widgets::select_modifier::range_ordered(visible_ids, anchor?, id)
+        });
+        // **click した id を末尾へ寄せる** = `cursor_track_id()` (選択順の末尾) が
+        // 常に「今 click したトラック」 になる。 range_ordered は表示順の slice を
+        // 返すだけなので、 下から上へ Shift+click すると click したのが先頭に来て
+        // カーソルが範囲下端に固着し、 インスペクタ / デバイスチェーン /
+        // プラグイン追加先が click したストリップと食い違う (r.md #43 review)。
+        // 統合前の mixer 実装が持っていた挙動を全選択面へ一般化したもの。
+        if let Some(pos) = next.iter().position(|&v| v == id) {
+            next.remove(pos);
+            next.push(id);
+        }
+        // タグ / 集合 / 順序の更新は `set_track_selection` 1 本に通す (SSoT)。
+        // 「集合が同じなら書き込みを省く」 早期分岐は持たない — 省くと
+        // `next` (= 選択順) が捨てられてカーソルが古いトラックに固着する。
+        // 省けるコストは Vec 1 本の代入だけで、 `push_edit` は既に積まれている。
+        self.set_track_selection(next);
+        if modifier.updates_anchor() {
+            self.selection.track_anchor = Some(id);
+        }
+    }
+
+    /// **クリップ選択に追従する暗黙のトラック選択** (単独選択、 index ベース)。
+    /// 明示的なトラック選択は [`Self::set_track_selection`] /
+    /// [`Self::apply_select_tracks`]。
+    ///
+    /// last-wins タグは立てない。 むしろ立っている [`EditSurface::Tracks`] を
+    /// **降ろす** — 直前のユーザー意図は「クリップを触った」 なので、 タグが
+    /// Tracks のままだとクリップを消すつもりの Delete でトラックが消える。
+    /// (`apply_select_clip` / `set_clip_selection` は `Clips` タグを立てた **直後**
+    /// にここを呼ぶので、 そちらのタグは上書きされない。)
     pub(crate) fn select_track(&mut self, idx: u32) {
         let Some(t) = self.song_doc.song().tracks.get(idx as usize) else {
             return;
@@ -698,6 +878,9 @@ impl AppData {
         let id = t.id;
         if self.selection.selected_track_ids.as_slice() != [id] {
             self.selection.selected_track_ids = vec![id];
+        }
+        if self.selection.last_edit_select == Some(EditSurface::Tracks) {
+            self.selection.last_edit_select = None;
         }
     }
 

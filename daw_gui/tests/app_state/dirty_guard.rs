@@ -333,15 +333,23 @@ fn new_during_in_flight_save_preserves_old_project() {
 #[test]
 fn open_recent_during_deferred_edit_defers_then_reevaluates() {
     let (mut app, _rx) = build_app();
-    load_instrument(&mut app); // plugin あり → DeleteTrack は deferred round-trip。
-    // 削除対象に 2 本目のトラックを用意。
+    load_instrument(&mut app); // plugin あり → DeleteTracks は deferred round-trip。
+    // 削除対象に 2 本目のトラックを用意 (id は必ず採番し直す — clone のまま push すると
+    // 同 id が 2 本並び、 安定 id での削除が意図しない方を指す)。
     let extra = app.song_doc.song().tracks[0].clone();
-    app.edit_song(|song| song.tracks.push(extra));
-    let target_idx = (app.song_doc.song().tracks.len() - 1) as u32;
+    let target_id = app
+        .edit_song(|song| {
+            let id = song.alloc_track_id();
+            let mut t = extra;
+            t.id = id;
+            song.tracks.push(t);
+            id
+        })
+        .expect("edit_song");
 
-    // DeleteTrack → Deferred(DeleteTrack) を enqueue (= state round-trip in flight)。
+    // DeleteTracks → Deferred(DeleteTracks) を enqueue (= state round-trip in flight)。
     // 削除自体は完了時に実行されるので、 この時点では song 未変更。
-    app.handle_event(AppEvent::DeleteTrack(target_idx));
+    app.handle_event(AppEvent::DeleteTracks(vec![target_id]));
     assert!(
         !app.ipc.pending_state_queue.is_empty(),
         "deferred delete round-trip in flight"
