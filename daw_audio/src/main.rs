@@ -314,8 +314,15 @@ impl BundlePublisher {
 
     fn send(&mut self, bundle: RtBundle) {
         self.flush();
-        if let Err(rtrb::PushError::Full(newest)) = self.tx.push(bundle) {
-            // 旧 parked (superseded) はこの代入で drop される — off-thread。
+        if let Err(rtrb::PushError::Full(mut newest)) = self.tx.push(bundle) {
+            // ring full。 旧 parked は superseded だが、 `schedule` は snapshot
+            // ではなく delta なので、 捨てる前に `supersede` で newest へ
+            // 畳み込む (RT 側 `refresh_bundle` の coalescing と同じ規約 —
+            // 畳み込まないと topology 更新がここで失われる)。 畳み込み後の
+            // 残骸だけを drop する — off-thread。
+            if let Some(older) = self.parked.take() {
+                drop(newest.supersede(older));
+            }
             self.parked = Some(newest);
         }
     }

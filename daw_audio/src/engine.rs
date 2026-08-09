@@ -366,6 +366,17 @@ impl Default for EngineShared {
 /// spawn は全部 recv loop 側で走り、RT は swap (move / Arc clone) だけを
 /// 行う。superseded bundle は recycle ring で recv loop に返送され、
 /// `Drop` (free / shmem unmap / worker join) も off-thread で走る。
+///
+/// **不変条件 (field を足すときは必ずどちらか決めること)**: forward ring は
+/// 両端が「最新だけ残す」 coalescing channel なので、
+/// - **snapshot** field (`song` / `tempo_map` / `plugin_refs` / `worker`) は
+///   最新値が過去を包含する ⇒ そのまま最新で上書きしてよい。
+/// - **delta** field (`schedule` と、それと対の `input_delay_replacements`)
+///   は「無い = 変更なし」を意味する ⇒ **中間 bundle を捨てるときに
+///   [`RtBundle::supersede`] で畳み込まないと変更が永久に失われる**。
+///   schedule が delta なのは本質的で、schedule は RT だけが持つ走行状態
+///   (PDC ring / follower env) を内包するため off-thread では snapshot を
+///   作れない。
 pub struct RtBundle {
     /// 現 song snapshot (`None` = song 未ロード)。
     pub song: Option<Arc<Song>>,
@@ -385,6 +396,40 @@ pub struct RtBundle {
     pub plugin_refs: Arc<PluginRefs>,
     /// worker rig (Arc clone)。`None` = pool 未 open / close 済。
     pub worker: Option<Arc<WorkerRig>>,
+}
+
+impl RtBundle {
+    /// `self` (新) が `older` (旧) を supersede するときの **畳み込み**。
+    /// 「`older` を install してから `self` を install する」のと、
+    /// 「畳み込んだ `self` だけを install する」のを等価にする。
+    ///
+    /// snapshot field は `self` の値がそのまま勝つ (最新が過去を包含する)。
+    /// delta field (`schedule` = `None` は「据え置き」の意) は、`self` が
+    /// 持っていなければ `older` のものを引き継ぐ。`input_delay_replacements`
+    /// は採用した schedule 用に off-thread で確保された line なので、必ず
+    /// schedule と同じ bundle 由来のものを連れて行く。
+    ///
+    /// これが無いと、topology 更新 (LoadSong) と値のみ更新
+    /// (`OpenPluginShmem` / `SetTrackMuted` 等) が同一バッファ周期に積まれた
+    /// とき、coalescing で **compile 済み schedule が捨てられ**、RT は前の
+    /// song の schedule を使い続ける (= 曲を開いて再生すると先頭 track しか
+    /// 鳴らず、値のみ更新を 1 回起こすと直る、という症状になる)。
+    ///
+    /// 戻り値は空にした `older` (呼び出し側が recycle ring へ返して
+    /// off-thread で drop する)。RT thread から呼ばれるので、操作は move と
+    /// `Vec` のポインタ swap のみ — alloc / free / lock は無い。
+    pub fn supersede(&mut self, mut older: RtBundle) -> RtBundle {
+        if self.schedule.is_none() {
+            self.schedule = older.schedule.take();
+            // self 側 (値のみ更新) は常に空 Vec だが、drop を RT で走らせない
+            // ため代入ではなく swap で older に載せて返す。
+            std::mem::swap(
+                &mut self.input_delay_replacements,
+                &mut older.input_delay_replacements,
+            );
+        }
+        older
+    }
 }
 
 /// Audio-thread-private engine state. Lives in the CPAL closure for the
@@ -520,14 +565,18 @@ impl LocalState {
     /// ため、install 時にポインタ swap で行う)。superseded 一式は recycle
     /// ring で off-thread drop。
     fn refresh_bundle(&mut self) {
-        // Drain the forward ring, keeping only the newest bundle. Any
-        // intermediate bundles the audio thread skipped past are recycled
-        // off-thread (their `Drop` must not run on the callback).
+        // Drain the forward ring down to a single bundle. Skipping straight to
+        // the newest is only sound for the snapshot fields; `schedule` is a
+        // delta (`None` = 据え置き) なので、飛ばす bundle は捨てる前に
+        // `supersede` で畳み込む (= 全 bundle を順に install したのと等価)。
+        // 畳み込み後の残骸は recycle off-thread (`Drop` を callback で
+        // 走らせない)。
         let mut newest: Option<RtBundle> = None;
-        while let Ok(bundle) = self.bundle_rx.pop() {
-            if let Some(skipped) = newest.replace(bundle) {
-                let _ = self.bundle_recycle_tx.push(skipped);
+        while let Ok(mut bundle) = self.bundle_rx.pop() {
+            if let Some(skipped) = newest.take() {
+                let _ = self.bundle_recycle_tx.push(bundle.supersede(skipped));
             }
+            newest = Some(bundle);
         }
         let Some(mut new) = newest else {
             return;
@@ -1174,6 +1223,95 @@ mod bundle_install_tests {
         );
     }
 
+    /// coalescing の畳み込み規約: topology 更新 (LoadSong) の直後に値のみ
+    /// 更新 (`OpenPluginShmem` / `SetTrackMuted` 等) が同一バッファ周期で
+    /// 積まれても、compile 済み schedule を落とさない。
+    ///
+    /// 回帰元: 曲を開くと LoadSong の 1〜2ms 後に `OpenPluginShmem` が届き、
+    /// RT が「最新だけ残す」coalescing で LoadSong の schedule を捨てて
+    /// **起動時 default song (1 track) の schedule を使い続け**、先頭 track
+    /// しか鳴らなくなっていた (値のみ更新を 1 回起こすと LoadSong が単独で
+    /// 届いて直る、という紛らわしい症状)。
+    #[test]
+    fn coalescing_keeps_the_schedule_of_a_superseded_topology_bundle() {
+        let (mut local, mut bundle_tx, mut recycle_rx) = harness();
+
+        // 起動時 default 相当: 1 track の song で schedule を install。
+        let mut boot = Song::default();
+        boot.tracks.push(track(1));
+        let boot = Arc::new(boot);
+        bundle_tx.push(make_bundle(&boot)).unwrap();
+        local.refresh_bundle();
+        let boot_nodes = local.cached_schedule.nodes.len();
+
+        // 曲を開く: LoadSong (schedule 有り) → 直後に OpenPluginShmem 相当の
+        // 値のみ更新 (schedule = None)。RT は両方を 1 回の refresh で拾う。
+        let mut opened = Song::default();
+        for i in 1..=4 {
+            opened.tracks.push(track(i));
+        }
+        let opened = Arc::new(opened);
+        bundle_tx.push(make_bundle(&opened)).unwrap();
+        bundle_tx
+            .push(RtBundle {
+                song: Some(Arc::clone(&opened)),
+                tempo_map: common::tempo_map::TempoMap::from_song(&opened),
+                schedule: None,
+                input_delay_replacements: Vec::new(),
+                plugin_refs: Arc::new(HashMap::new()),
+                worker: None,
+            })
+            .unwrap();
+        local.refresh_bundle();
+
+        assert!(
+            local
+                .cached_song
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &opened)),
+            "song は最新 (値のみ更新) が勝つ"
+        );
+        assert!(
+            local.cached_schedule.nodes.len() > boot_nodes,
+            "飛ばした topology bundle の schedule が畳み込まれ、開いた曲の \
+             4 track 分の node が入っていること (捨てられると起動時 1 track \
+             の schedule のままになる)"
+        );
+        assert_eq!(
+            local.cached_schedule.input_delay_per_track.len(),
+            4,
+            "schedule と同じ bundle 由来の topology 派生データも追従する"
+        );
+        while recycle_rx.pop().is_ok() {}
+    }
+
+    /// 畳み込みは「無い delta を引き継ぐ」だけで、新しい方が delta を持つ
+    /// ときは新しい方が勝つ (LoadSong 2 連発で古い schedule が復活しない)。
+    #[test]
+    fn coalescing_prefers_the_newest_schedule_when_both_carry_one() {
+        let (mut local, mut bundle_tx, mut recycle_rx) = harness();
+
+        let mut s1 = Song::default();
+        s1.tracks.push(track(1));
+        let s1 = Arc::new(s1);
+        let mut s2 = Song::default();
+        for i in 1..=3 {
+            s2.tracks.push(track(i));
+        }
+        let s2 = Arc::new(s2);
+
+        bundle_tx.push(make_bundle(&s1)).unwrap();
+        bundle_tx.push(make_bundle(&s2)).unwrap();
+        local.refresh_bundle();
+
+        assert_eq!(
+            local.cached_schedule.input_delay_per_track.len(),
+            3,
+            "新しい topology bundle の schedule が勝つ"
+        );
+        while recycle_rx.pop().is_ok() {}
+    }
+
     /// §5 D: topology 更新 (schedule = Some) は DelayLine の走行状態を
     /// stable key で移送する。
     #[test]
@@ -1233,6 +1371,18 @@ mod bundle_install_tests {
         s2.tracks.push(track(2));
         let s2 = Arc::new(s2);
         bundle_tx.push(make_bundle(&s2)).unwrap();
+        // 値のみ更新を重ねて coalescing の畳み込み (`supersede`) も同じ
+        // install で通す (畳み込みは move / Vec ポインタ swap のみ)。
+        bundle_tx
+            .push(RtBundle {
+                song: Some(Arc::clone(&s2)),
+                tempo_map: common::tempo_map::TempoMap::from_song(&s2),
+                schedule: None,
+                input_delay_replacements: Vec::new(),
+                plugin_refs: Arc::new(HashMap::new()),
+                worker: None,
+            })
+            .unwrap();
 
         // Steady-state install: pop the newest, adopt + swap the cached
         // fields, push the old to the recycle ring — all wait-free, no alloc,
