@@ -421,6 +421,19 @@ pub enum PluginCommand {
     RemoveSlotPlugin { device_id: u64 },
     /// Drop every plugin instance belonging to `track_id` (= track 削除)。
     RemoveTrack { track_id: u32 },
+    /// **別プロジェクトに切り替わったので instance を全部捨てる。**
+    ///
+    /// `device_id` (= `PluginInstance::id`) は Song スコープの名前で、
+    /// `IdAllocators` が project ごとに 1 から再採番する。plugin_host は
+    /// `instances` をこの id で引くので、前 project の instance が残っていると
+    /// 新 project の `SetSlotPlugin` が **同 id・同 plugin_id の dedup に吸収され**、
+    /// 保存済み state を復元しないまま旧 instance で鳴ってしまう。
+    ///
+    /// `RemoveTrack` の積み重ねでは塞げない: 列挙元は daw_gui 側の帳簿
+    /// (`loaded_slots`) で、load 応答が返る前に切り替わった device は帳簿に
+    /// 載っておらず、以後 **永久に** 回収対象にならない (漏れが自己増殖する)。
+    /// 「全部捨てろ」は帳簿に依存しない唯一の表現。
+    UnloadAllPlugins,
     /// Ask the plugin_host to capture state for one device. Reply is
     /// `PluginEvent::SlotPluginState`.
     RequestSlotState { device_id: u64 },

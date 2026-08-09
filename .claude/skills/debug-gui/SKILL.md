@@ -100,14 +100,14 @@ fn dispatch_platform_event(&mut self, ev: PlatformEvent) {
 ### 3. **再ビルドを明示**（必須）
 
 ```bash
-make build       # = cargo build --workspace
+make build       # 実行 3 exe (daw_gui / daw_audio / daw_plugin_host) を生成
 ```
 
 `cargo clippy` / `cargo check` / `cargo test` だけでは **exe が更新されない**。
 古いバイナリで検証すると「直したはずなのに動かない」で時間を溶かす。
 （このプロジェクトで 2 回繰り返している。[feedback_build_after_clippy.md] 参照）
 
-子プロセス側 (daw_audio / daw_plugin_host) も `make build` で workspace 全体を rebuild する。
+子プロセス側 (daw_audio / daw_plugin_host) も `make build` が同時に生成する。
 
 ### 4. 実行してキー操作 → ログを確認
 

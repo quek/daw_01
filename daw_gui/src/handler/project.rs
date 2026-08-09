@@ -12,9 +12,109 @@ use common::protocol::{AudioCommand, PluginCommand, SlotState};
 use crate::import_audio;
 
 impl AppData {
+    /// **Song スコープ状態の破棄チョークポイント。**
+    ///
+    /// `Song` 内の id (`Track::id` / `PluginInstance::id` / `AudioSourceId` /
+    /// `ImageSourceId` / `VideoSourceId` / `ModSource::id` / `ClipKey` …) も
+    /// `(track_id, device_index)` のような位置キーも、**その Song の中でしか
+    /// 意味を持たない名前**である (`IdAllocators` は project ごとに 1 から
+    /// 再採番する)。したがって別プロジェクトを開いた瞬間、それらを key にした
+    /// 派生キャッシュ・選択・UI 状態は **全部無効**になる。id 空間が重なるので、
+    /// 放置すると「解決に成功してしまう」= 前 project の対象に対して操作が
+    /// 走る (前の曲の波形が出る / 選んでいないクリップが消える / 掴めない
+    /// ノートができる、等)。
+    ///
+    /// 個別に思い出して消す方式は破綻する (実際、`voicevox_metadata_sent` だけが
+    /// 消され、他は消されずに残っていた)。**Song を差し替える経路はここを通す**
+    /// こと。GPU テクスチャなど renderer を必要とするものは AppData から解放
+    /// できないので、[`Self::project_generation`] を bump して runner 側に
+    /// 解放させる。
+    ///
+    /// 破棄は 2 段。**(A)** 参照系 (選択 / アンカー / 開いているエディタの対象 /
+    /// 子プロセス帳簿) は Song を差し替えた時点で常に無効 — 同じ project の
+    /// 別スナップショット (保存版に戻す / recovery 復元) でも clip / point の
+    /// id 構成は乖離しうる。**(B)** decode 済みメディア (音源 / 画像 / 動画 /
+    /// GPU テクスチャ) は「id + 実体」で同一性が決まるので、`project_id` が
+    /// 変わったときだけ捨てる (同 project の読み直しで再 decode しない)。
+    pub(crate) fn reset_song_scoped_state(&mut self) {
+        // ---- (A) Song を差し替えたら常に無効になるもの --------------------
+        // 同じ project の別スナップショット (保存版に戻す / recovery 復元) でも
+        // clip / point の id 構成は乖離しうるので、参照系は無条件に捨てる。
+        //
+        // -- 選択 / アンカー (ClipKey・track_id・lane_id・point index) -------
+        // 解決できてしまうので、残すと Delete / Cut が非選択対象に当たる。
+        self.selection.selected_track_ids.clear();
+        self.selection.selected_section_ids.clear();
+        self.selection.selected_automation_clips.clear();
+        self.selection.selected_automation_points.clear();
+        self.selection.selected_clip = None;
+        self.selection.selected_clips.clear();
+        self.selection.selected_notes.clear();
+        self.selection.audio_editor_selected_events.clear();
+        self.selection.clip_anchor = None;
+        self.selection.note_anchor = None;
+        self.selection.track_anchor = None;
+        self.selection.section_anchor = None;
+        self.selection.automation_point_anchor = None;
+        self.selection.automation_clip_anchor = None;
+        self.selection.audio_editor_anchor = None;
+        self.selection.last_edit_select = None;
+
+        // -- 開いているエディタ / インスペクタの対象 ------------------------
+        // `audio_editor_clip` は positional `ClipRef` なので、開いたままだと
+        // 新 project の track[i].clip[j] を編集対象にしてしまう。
+        self.ui_ephemeral.audio_editor_clip = None;
+        self.ui_ephemeral.armed_mod_source = None;
+        self.ui_ephemeral.expanded_mod_sources.clear();
+        self.ui_ephemeral.open_plugin_params = None;
+        self.ui_ephemeral.open_video_fx_params = None;
+
+        // -- track_id / ClipKey keyed の表示設定 ----------------------------
+        // ViewState を持たない旧 .daw では `restore_view_state` が早期 return
+        // するので、ここで消さないと前 project の値が適用され続ける。
+        self.ui_prefs.locked_pr_tracks.clear();
+        self.ui_prefs.expanded_automation_tracks.clear();
+        self.ui_prefs.track_row_overrides.clear();
+        self.ui_prefs.multi_clip_view_key.clear();
+        self.ui_prefs.collapsed_groups.clear();
+
+        // -- 子プロセスに関する帳簿 (device_id / (track,index) keyed) -------
+        // teardown_all_loaded_plugins が消し損ねる分をここで確実に落とす。
+        self.ipc.plugin_param_values.clear();
+        self.ipc.plugin_latencies.clear();
+        self.ipc.track_plugin_ids.clear();
+        self.ipc.ara_doc_cache.clear();
+        self.ipc.ara_pcm_materialized.clear();
+        self.ipc.gui_open_requests.clear();
+        // 進行中 bounce の完了通知を新 project に適用しない。
+        self.ipc.pending_clip_fx_bounce = None;
+        self.ipc.pending_vocal_synth_bounce = None;
+
+        // ---- (B) **別プロジェクト**のときだけ無効になるもの ----------------
+        // decode 済みメディアは「id + 実体」で同一性が決まるので、同じ project
+        // を読み直すだけなら有効なまま (再 decode は無駄)。project が変われば
+        // id 空間ごと別物になるので全部捨てる。
+        let project_id = self.song_doc.song().project_id;
+        if project_id != 0 && project_id == self.ui_ephemeral.loaded_project_id {
+            return;
+        }
+        self.ui_ephemeral.loaded_project_id = project_id;
+        // renderer を持つ runner に「GPU 側も捨てろ」と伝える世代印。
+        self.ui_ephemeral.project_generation =
+            self.ui_ephemeral.project_generation.wrapping_add(1);
+        self.media.audio_source_cache.retain(|_| false);
+        self.media.image_source_bgra.clear();
+        self.media.pending_image_uploads.clear();
+        self.media.video_thumbnail_rgba.clear();
+        self.media.pending_thumbnail_uploads.clear();
+    }
+
     /// New / Open / Restore 時、 `SongDoc::replace_song` の直後に呼ぶ
     /// (履歴破棄 / clean 化 / epoch bump は replace_song 側が担う)。
     pub(crate) fn after_song_replaced(&mut self) {
+        // Song スコープの派生状態を捨てる (この 1 行が漏れると id 衝突で
+        // 前 project の対象に操作が走る)。
+        self.reset_song_scoped_state();
         // load / new / recovery では直前に flush_song_sync が
         // 走り、 口パク binding を持つ project だと mark_lipsync_dirty が 400ms
         // debounce で自動再生成をスケジュールする。 保存ファイル内の口パク clip は
@@ -249,11 +349,15 @@ impl AppData {
             .and_then(|p| p.parent().map(Path::to_path_buf));
 
         // 未 cache の audio source だけ work-list に (idempotent)。
+        // `AudioSourceId` は Song スコープの名前で project ごとに 1 から再採番
+        // されるので、**id 一致だけで cache hit と見なしてはいけない** — 別
+        // project を開くと前 project の波形がそのまま残り、しかも decode job も
+        // 積まれないので恒久的に直らない。cache された buffer 自身が持つ
+        // `origin` (decode 元の解決済み絶対パス) が一致したときだけ再利用し、
+        // 食い違う entry はここで捨てて decode し直す。
         let mut audio_jobs: Vec<(common::model::AudioSourceId, PathBuf)> = Vec::new();
+        let mut stale_audio: Vec<common::model::AudioSourceId> = Vec::new();
         for (&source_id, source) in &self.song_doc.song().media.audio_sources {
-            if self.media.audio_source_cache.contains(source_id) {
-                continue;
-            }
             let abs = match &source.path {
                 AudioSourcePath::Absolute(abs) => abs.clone(),
                 AudioSourcePath::ProjectRelative(rel) => match project_dir.as_ref() {
@@ -263,7 +367,17 @@ impl AppData {
                 // PR-V4 で廃止 (builtin VOICEVOX plugin 経由)。
                 AudioSourcePath::Generated { .. } => continue,
             };
+            match self.media.audio_source_cache.get(source_id) {
+                Some(buf) if buf.origin == abs => continue,
+                Some(_) => stale_audio.push(source_id),
+                None => {}
+            }
             audio_jobs.push((source_id, abs));
+        }
+        // 別 project の同 id を掴んだ entry は、decode 完了を待たずに **即座に**
+        // 落とす (待つ間に波形描画 / onset 検出が前 project の音を読むため)。
+        for source_id in stale_audio {
+            self.media.audio_source_cache.remove(source_id);
         }
         // 未 staging の image source。
         let mut image_jobs: Vec<(common::model::ImageSourceId, PathBuf)> = Vec::new();
@@ -384,14 +498,18 @@ impl AppData {
                 self.restore_plugin_from_song(&song);
                 self.song_doc.replace_song(song);
                 self.song_doc.file_path = Some(path.clone());
+                // load した内容を新しい保存ベースラインに確定し、 前プロジェクトの
+                // Undo/Redo 履歴と **Song スコープ状態** を破棄する
+                // (reset_saved_baseline 内で is_dirty=false)。
+                // `begin_asset_decode` / `restore_view_state` より **先** に呼ぶ:
+                // 後だと、前 project のキャッシュを見て「decode 済み」と判断した
+                // 直後にそのキャッシュが捨てられ、decode job も無いまま波形が
+                // 永久に出ない状態になる。
+                self.after_song_replaced();
                 // audio / image source の decode は重いので background
                 // スレッドへ。 構造は既に swap 済みなので即操作可、 波形 / 画像は
                 // streaming で順次出る (begin_asset_decode → AssetDecodeTick)。
                 self.begin_asset_decode();
-                self.selection.selected_track_ids.clear();
-                self.ui_prefs.collapsed_groups.clear();
-                self.selection.selected_clip = None;
-                self.selection.selected_notes.clear();
                 // 保存済みの表示状態 (ズーム / スクロール / per-clip view / 選択
                 // クリップ) を復元。`None` (旧ファイル / view 未保存) なら per-clip map をクリア
                 // するだけで globals は現状維持 = 従来の fit-to-content 挙動。
@@ -402,9 +520,6 @@ impl AppData {
                 }
                 self.resize_track_peak_display();
                 self.resync_song_edit_texts();
-                // load した内容を新しい保存ベースラインに確定し、 前プロジェクトの
-                // Undo/Redo 履歴を破棄する (reset_saved_baseline 内で is_dirty=false)。
-                self.after_song_replaced();
                 // sidecar 検出: 前回のセッションが正常終了せず、 同 file の
                 // autosave が残っているなら recovery modal に追加。 ユーザーが
                 // 「復元」 で sidecar に切り替えられる。
@@ -649,13 +764,14 @@ impl AppData {
         self.restore_plugin_from_song(&song);
         self.song_doc.replace_song(song);
         self.song_doc.file_path = common::recovery::original_file_for_sidecar(&autosave_path);
+        // 復元した内容を新しい保存ベースラインに確定し、 履歴と Song スコープ
+        // 状態を破棄する (action_open_path と同じく decode / view 復元より先)。
+        // sidecar は元 project と同じ `project_id` を持つので、同一 project の
+        // 復元ではキャッシュは温存される。
+        self.after_song_replaced();
         // recovery 復元も load path と同じく background streaming
         // decode へ。 file_path を先にセット済みなので ProjectRelative も解決可。
         self.begin_asset_decode();
-        self.selection.selected_track_ids.clear();
-        self.ui_prefs.collapsed_groups.clear();
-        self.selection.selected_clip = None;
-        self.selection.selected_notes.clear();
         // recovery も表示状態 + 選択クリップを復元 (autosave が view を書いている)。
         self.restore_view_state(view);
         if let Some(r) = self.selected_clip_ref() {
@@ -663,8 +779,6 @@ impl AppData {
         }
         self.resize_track_peak_display();
         self.resync_song_edit_texts();
-        // 復元した内容を新しい保存ベースラインに確定し、 履歴を破棄する。
-        self.after_song_replaced();
         let _ = std::fs::remove_file(&autosave_path);
         self.ui_ephemeral.recovery_candidates.retain(|p| p != &autosave_path);
         if self.ui_ephemeral.recovery_candidates.is_empty() {
@@ -944,6 +1058,20 @@ impl AppData {
                 }
             }
             self.send_plugin(PluginCommand::RemoveTrack { track_id });
+        }
+        // 上の RemoveTrack は `loaded_slots` (= SlotPluginLoaded を受け取った
+        // device だけ) からの列挙なので、load 応答待ちの device を取りこぼす。
+        // 取りこぼした instance は以後どの track にも帰属せず永久に残り、
+        // 新 project の同 device_id が dedup で吸収される。帳簿に依存しない
+        // 「全部捨てろ」で確実に閉じる。
+        self.send_plugin(PluginCommand::UnloadAllPlugins);
+        // 計測 slot も device_id で引くので同じく project スコープ。解放は
+        // これまでリソースモニタを描画しているフレームでしか走らず、モニタを
+        // 開かずに project を開き続けると 512 slot が stale で埋まって以後
+        // どの plugin も 0 μs になっていた。instance を全部落とした直後の
+        // ここが、live 集合が空だと確実に言える唯一の地点。
+        if let Some(bridge) = self.ipc.metrics_bridge.as_ref() {
+            bridge.reclaim_plugin_metric_slots(&std::collections::HashSet::new());
         }
         self.ipc.loaded_slots.clear();
         self.ipc.open_plugin_guis.clear();

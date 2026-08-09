@@ -83,7 +83,16 @@ UI スレッド (gui_01 の `UiHost::frame` / view の build closure / heavy() �
 - **Mid**: パフォーマンス、整合性
 - **Low**: 軽微な重複、命名
 
-修正後は `cargo build --workspace --release` と `cargo clippy --workspace -- -D warnings` で確認。
+修正後の確認は **`make clippy` と `make test` だけ**。各 1 回。
+
+- **release ビルドは回さない**。opt-level / LTO が違うだけで、debug の clippy が
+  通っていて新たに出るコンパイルエラーは実質無い。thin LTO の全ビルドは数分〜
+  十数分かかり、その間 review が止まるだけ。
+- **素の `cargo build --workspace` / `cargo test --workspace` を使わない**
+  (CLAUDE.md「Makefile が SSoT」)。`make` 側の scoping が効かなくなる。
+- 同じコマンドを 2 度走らせない (失敗判定と件数確認は 1 回の出力から読む)。
+- 変更が 1 crate に閉じているなら `cargo check -p <crate>` /
+  `cargo test -p <crate> --test <name>` まで絞ってよい。
 
 ### 7. レポート
 

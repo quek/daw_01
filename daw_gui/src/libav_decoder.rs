@@ -42,6 +42,15 @@ pub struct DecodedBgra {
 /// `decode_at` (= the export frame loop) just keeps pulling frames; only a
 /// backward / large-forward jump triggers a seek + flush.
 struct SourceDecoder {
+    /// **この decoder の同一性**: 実際に open したファイルパス。
+    ///
+    /// `sources` の key である `VideoSourceId` は **Song スコープの名前**で、
+    /// `IdAllocators` が project ごとに 1 から再採番するため、別 project でも
+    /// 同じ id が普通に存在する。preview 用の `LibavVideoDecoder` は
+    /// `PreviewDecodeWorker` が起動〜終了まで持ち続けるので、id 一致だけで
+    /// 既存 decoder を使い回すと **前 project の動画が流れ続ける**。
+    /// `decode_at` はこのパスを照合し、食い違えば開き直す。
+    path: std::path::PathBuf,
     input: AVFormatContextInput,
     decoder: AVCodecContext,
     stream_index: usize,
@@ -109,6 +118,12 @@ impl LibavVideoDecoder {
     /// this decoder was built with [`new_preview`](Self::new_preview). The
     /// decoder for a `source_id` is opened on first use and reused; sequential
     /// targets stream forward, jumps seek + flush.
+    ///
+    /// 再利用の条件は **`source_id` 一致だけでなく `path` 一致**。`VideoSourceId`
+    /// は Song スコープの名前で project ごとに 1 から再採番されるので、id だけで
+    /// 使い回すと別 project を開いた後も前 project の動画を復号し続ける
+    /// (preview 用 decoder は worker が起動〜終了まで保持する)。パスが変われば
+    /// 旧 decoder を捨てて開き直す。
     pub fn decode_at(
         &mut self,
         source_id: VideoSourceId,
@@ -118,7 +133,13 @@ impl LibavVideoDecoder {
         use std::collections::hash_map::Entry;
         let max_long_edge = self.max_long_edge;
         let dec = match self.sources.entry(source_id) {
-            Entry::Occupied(o) => o.into_mut(),
+            Entry::Occupied(o) if o.get().path == path => o.into_mut(),
+            Entry::Occupied(mut o) => {
+                // 同 id・別ファイル = project 跨ぎの id 衝突。旧 decoder は
+                // ここで drop される (demuxer / codec context ごと)。
+                o.insert(SourceDecoder::open(path, max_long_edge)?);
+                o.into_mut()
+            }
             Entry::Vacant(v) => v.insert(SourceDecoder::open(path, max_long_edge)?),
         };
         dec.decode_at(target_micros)
@@ -192,6 +213,7 @@ impl SourceDecoder {
             .map_err(|e| format!("open decoder: {e:?}"))?;
 
         Ok(Self {
+            path: path.to_path_buf(),
             input,
             decoder,
             stream_index,
