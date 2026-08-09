@@ -17,6 +17,17 @@ pub struct UiEphemeral {
     /// Written by the runner (P3.5) after a successful texture upload;
     /// read by `arrangement_view.rs` (P3.6) and passed to
     /// `ClipView.thumbnail`.
+    /// 直近 `AppData::reset_song_scoped_state` が確定した `Song::project_id`
+    /// (プロジェクト同一性の SSoT、v24)。同じ project の再読込ではキャッシュを
+    /// 捨てないための照合用。`0` = 未確定。
+    pub loaded_project_id: u64,
+    /// プロジェクトが切り替わるたびに +1 される世代印。
+    ///
+    /// GPU テクスチャ (`video_texture_cache` / `image_texture_cache`)・
+    /// preview のフレームテクスチャ・デコード ring は `Renderer` を持つ runner
+    /// でしか解放できないので、AppData 側からは「捨てろ」を **この値の変化**
+    /// として伝える。runner は自分が最後に見た世代と比較して破棄する。
+    pub project_generation: u64,
     pub video_texture_cache:
         std::collections::HashMap<common::model::VideoSourceId, daw_ui_renderer::TextureHandle>,
     /// v13: GPU-side image textures keyed by `ImageSourceId`.

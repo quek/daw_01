@@ -27,10 +27,13 @@ allowed-tools: Read, Grep, Glob, Bash, PowerShell
 ## 手順
 
 ### 1. ビルド (挙動を変えた場合)
-- protocol (bincode derive 型) を変えたら **`cargo build --workspace`** (子バイナリ
+- protocol (bincode derive 型) を変えたら **`make build`** (実行 3 exe を生成。子バイナリ
   daw_audio / daw_plugin_host も再生成しないと古い protocol のまま handshake/decode 失敗)。
 - それ以外でも `cargo run` は dependency を自動ビルドするが、子プロセスバイナリが上書き
-  されないことがある (Windows ERROR 5)。疑わしければ先に `cargo build --workspace`。
+  されないことがある (Windows ERROR 5)。疑わしければ先に `make build`。
+- 素の `cargo build --workspace` は使わない (CLAUDE.md「Makefile が SSoT」。examples 等
+  テスト 0 個の crate まで毎回フルビルドして無駄に遅い)。1 crate に閉じるなら
+  `cargo build -p <crate>` まで絞る。
 
 ### 2. 二重起動チェック
 ```powershell
