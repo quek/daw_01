@@ -205,13 +205,19 @@ pub struct Schedule {
     /// で `song_beat` から直接算出され、その slot の `follower_slots` 値は使われない
     /// (inert)。envelope follower の slot は `follower_slots[slot].env` を使う。
     pub mod_kinds: Vec<common::model::ModSourceKind>,
-    /// master bus に到達する音の PDC 遅延量 (samples) = master `Mix` の src の
-    /// `path_latency` 最大値 (= 全 src がこの値に揃えられる)。
+    /// master **出力** に現れる PDC 遅延量 (samples)。
+    /// = master `Mix` の src の `path_latency` 最大値 (= 全 src がこの値に揃えられる)
+    ///   **＋ `Song::master_reported_latency_samples`** (master fx chain 自身の報告 latency)。
     ///
-    /// r.md #39: metronome click は `render_master_buffer` の **後** に生の playhead で
-    /// 重ねるため、latency を報告するプラグインが 1 つでもあると click だけが早く鳴る。
-    /// engine はこの値だけ click の参照位置を戻して、他の音と同じ時間軸に揃える
-    /// (REAPER / Ardour もメトロノームを遅延補償の対象にする)。
+    /// 言い換えると `master_buffer[P]` に載っているのは曲位置 `P - master_latency_samples`
+    /// の音、という写像の遅延量。
+    ///
+    /// r.md #39 の消費者は 2 つ:
+    /// - metronome click は `render_master_buffer` の **後** (= master fx を通さずに) 重ねる
+    ///   ので、この値だけ参照位置を戻して他の音と同じ時間軸に揃える
+    ///   (REAPER / Ardour もメトロノームを遅延補償の対象にする)。
+    /// - WAV 書き出しはこの値だけ書き始めを後ろへずらす (= 先頭の遅延ぶんを捨てる)。
+    ///   でないと書き出した wav が丸ごと後ろへずれ、stem を貼り戻すとダブる。
     pub master_latency_samples: u32,
 }
 

@@ -380,6 +380,10 @@ impl AppData {
     /// Walk every `track_plugin_ids` entry, sum the plugin latencies into the
     /// matching `Track::reported_latency_samples`, and re-`flush_song_sync`
     /// if anything changed. No-op when the totals already agree.
+    ///
+    /// r.md #39: 書き戻し先は `Song::reported_latency_mut` (sentinel 分岐付き)。
+    /// 旧実装は `track_by_id_mut` だったので `MASTER_TRACK_ID` の合計が **黙って
+    /// 捨てられ**、master fx に latency 報告プラグインを挿しても PDC に載らなかった。
     pub(crate) fn recompute_track_latencies(&mut self) {
         // Compute per-track latency totals up front (reads self.ipc only) so
         // the Song mutation can go through the `edit_song` chokepoint without
@@ -400,10 +404,10 @@ impl AppData {
         self.edit_song_checked(move |song| {
             let mut changed = false;
             for (track_id, total) in totals {
-                if let Some(track) = song.track_by_id_mut(track_id)
-                    && track.reported_latency_samples != total
+                if let Some(slot) = song.reported_latency_mut(track_id)
+                    && *slot != total
                 {
-                    track.reported_latency_samples = total;
+                    *slot = total;
                     changed = true;
                 }
             }
@@ -416,6 +420,13 @@ impl AppData {
                     track.reported_latency_samples = 0;
                     changed = true;
                 }
+            }
+            // master fx chain も同様に空なら 0 へ戻す (最後の master plugin を外した後)。
+            if !track_ids_with_plugins.contains(&common::model::MASTER_TRACK_ID)
+                && song.master_reported_latency_samples != 0
+            {
+                song.master_reported_latency_samples = 0;
+                changed = true;
             }
             changed
         });

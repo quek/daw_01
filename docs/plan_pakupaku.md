@@ -127,6 +127,13 @@ pub fn build_mouth_events(
 > 「発話開始 − `talk_pre_silence_frames()` 相当 beats」を呼び出し側が渡す。
 > `build_mouth_events` の内部で経路別の補正 (先頭 pau を引く等) は **しない**
 > — 音声側の配置式と口側の配置式を 1 本に保つため (多重 SSoT を作らない)。
+>
+> **配置ルールを変えたら `common::lipsync::PLACEMENT_GEN` を +1 する。** 口パク event は
+> project に永続化される派生データで、通常の再生成トリガは入力 fingerprint の差分だけ。
+> 配置ルールを変えても入力は同じままなので、生成時に `Clip::lipsync_gen` へ焼き込んだ
+> 世代と照合する `vocal_tracks_with_outdated_lipsync` が「開いたときに一度だけ作り直す」
+> 唯一の経路になる (合成 WAV 側の `CACHE_SCHEMA_VERSION` と対)。現行世代しか無い project
+> では何もしないので、r.md #9 の dirty-on-open contract とは両立する。
 
 手順 (REAPER 忠実):
 1. `cursor = first_phoneme_local_beat` (= phoneme 列 frame 0 = wav 先頭)。

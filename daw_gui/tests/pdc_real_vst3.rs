@@ -95,36 +95,42 @@ fn pdc_real_mcenter_aligns_master_output() {
     //      Track B: sample 4096 で 0.7071 (MCenter 単独)
     //      → 2 つの分離した peak、 master[0] = 0.7071、 master[4096] = 0.7071
     //
-    //    判定: master[4096] が ~1.4142 (overlay 印) なら PDC 効いている。
-    //    PDC 無しなら master[4096] = 0.7071 にしかならず assertion で fail。
+    //    判定: **書き出し WAV の sample 0** が ~1.4142 (overlay 印) なら
+    //    「PDC が効いている」かつ「export が master latency を差し引いている」。
+    //
+    // r.md #39: 以前この test は「peak が sample 4096 に出る」ことを期待していたが、
+    // それは **書き出し WAV 全体が PDC 遅延ぶん後ろへずれている** バグの記述だった
+    // (stem を曲頭に貼り戻すと 85ms ずれる)。export は
+    // `daw_audio::export::shift_window_for_master_latency` で書き出し窓を
+    // master_latency ぶん後ろへずらすようになったので、曲位置 0 の impulse は
+    // wav[0] に来るのが正しい。
     const MCENTER_LATENCY: usize = 4096;
-    let amp_4096 = l[MCENTER_LATENCY].abs();
+    let amp_0 = l[0].abs();
     eprintln!("L sample[0]: {}", l[0]);
     eprintln!("L sample[{}]: {}", MCENTER_LATENCY, l[MCENTER_LATENCY]);
-    eprintln!("R sample[{}]: {}", MCENTER_LATENCY, r[MCENTER_LATENCY]);
+    eprintln!("R sample[0]: {}", r[0]);
     let _ = r;
 
-    // PDC overlay: 両 track の impulse が sample 4096 で重なるので
+    // PDC overlay: 両 track の impulse が曲位置 0 で重なるので
     // master の振幅は ~1.4142 (≈ 2 * 0.7071)。 1.2 以上を許容。
     assert!(
-        amp_4096 > 1.2,
-        "expected PDC-overlaid peak at sample {} (~1.4142), got {:.4}; \
-         L[0]={:.4}, L[{}]={:.4}",
-        MCENTER_LATENCY,
-        amp_4096,
-        l[0],
+        amp_0 > 1.2,
+        "expected PDC-overlaid peak at wav sample 0 (~1.4142), got {:.4}; \
+         L[{}]={:.4} (peak がここに出るなら export が master latency を引いていない)",
+        amp_0,
         MCENTER_LATENCY,
         l[MCENTER_LATENCY],
     );
 
-    // PDC が動いていない場合、 Track A は sample 0 に出る → master[0] が
-    // 0.5 以上。 PDC 効いていれば Track A は sample 4096 に移動して
-    // master[0] = 0 になる。
-    let amp_0 = l[0].abs();
+    // 書き出しがずれていれば peak は sample 4096 に居残る。そこが静かなことを
+    // 確かめて「ずれたまま」を検出する。
+    let amp_shifted = l[MCENTER_LATENCY].abs();
     assert!(
-        amp_0 < 0.1,
-        "sample 0 amplitude {:.4} too high; PDC apparently not delaying Track A",
-        amp_0,
+        amp_shifted < 0.1,
+        "sample {} amplitude {:.4} too high; 書き出し WAV が master latency ぶん \
+         後ろへずれている (export の窓ずらし漏れ)",
+        MCENTER_LATENCY,
+        amp_shifted,
     );
 }
 

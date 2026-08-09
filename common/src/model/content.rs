@@ -42,6 +42,18 @@ pub struct Clip {
     /// v20 files forward-migrate to `false`。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_lipsync: bool,
+    /// この `auto_lipsync` clip を生成した **口パク配置ルールの世代**
+    /// ([`crate::lipsync::PLACEMENT_GEN`])。`0` = 世代を持たない旧 file。
+    ///
+    /// r.md #39: 口パク event は project に永続化される派生データで、再生成は
+    /// 入力 (notes / text / bpm / mouth_map …) の fingerprint が変わったときだけ走る。
+    /// 配置ルール自体を変えると、入力が同じままなので **開いても再生成されず旧
+    /// タイミングが残る** (talk が音声より ~100ms 遅れたまま)。合成 WAV 側が
+    /// `voicevox_cache::CACHE_SCHEMA_VERSION` で世代を切っているのと対になる仕組みで、
+    /// load 時に古い世代の clip を見つけたら一度だけ再生成する。
+    /// `auto_lipsync == false` の手置き clip では常に 0 (意味を持たない)。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub lipsync_gen: u32,
     /// clip 全体のミュート (= MIDI / audio / video / image / 字幕 / 歌唱
     /// すべての content type 共通の clip-level mute の SSoT)。`true` で再生・書き出しから
     /// この clip を除外し、GUI は dim + 斜線ハッチで「ミュート中」を表示する。`q`

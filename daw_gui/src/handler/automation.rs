@@ -1062,6 +1062,9 @@ impl AppData {
                     content_id,
                     color: cc.color,
                     auto_lipsync: cc.auto_lipsync,
+                    // clipboard は配置世代を運ばないので「世代不明」= 0。
+                    // auto_lipsync clip なら次の load / 再生成で作り直される。
+                    lipsync_gen: 0,
                     // clipboard の clip-level mute を paste 先 clip へ引き継ぐ。
                     muted: cc.muted,
                     // clipboard の per-clip 声を paste 先 clip へ引き継ぐ。

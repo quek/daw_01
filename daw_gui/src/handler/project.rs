@@ -39,6 +39,11 @@ impl AppData {
         // 目標形なら no-op (dirty 化しない) なので、 seed の直後 (= clean baseline 後) に
         // 呼んで、 実際に畳んだ legacy プロジェクトだけを dirty にする。
         self.normalize_lipsync_clips_on_load();
+        // r.md #39: 保存済み口パクが **古い配置ルール** で作られていたら一度だけ
+        // 再生成する。 上の fingerprint baseline は「入力が変わったか」しか見ないので、
+        // 配置ルール自体を変えたときはこの世代チェックが唯一の再生成トリガになる
+        // (合成 WAV 側の `CACHE_SCHEMA_VERSION` と対)。 現行世代なら何もしない。
+        self.regenerate_outdated_lipsync_on_load();
         // `Z`/`X` のズーム履歴は旧 project の view / track id を指すので
         // 別 project に持ち越さない。 段階ズームのアンカーと lane 高
         // override も旧 project の lane key を指すので一緒に破棄。

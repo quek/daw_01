@@ -23,21 +23,75 @@ pub struct ClickVoice {
     pub start_offset: u32,
 }
 
+/// click の拍グリッド (= 「拍 ↔ 曲 sample 位置」の写像)。
+///
+/// r.md #39: 旧実装は常に `beat_index * (sample_rate*60/bpm)` という **絶対 sample 原点の
+/// 等間隔グリッド** で拍境界を求めていた。`bpm` はその buffer の瞬間値なので、SongTempo
+/// automation がある曲ではテンポ変更以降の click が真の拍とまったく別のグリッドに載る
+/// (120→140BPM を 8 小節目に置くと変更直後の click が 143ms 早い)。clip / note の
+/// スケジューリングは積分済み `playhead_beats` 基準なので、click だけが別グリッドだった。
+pub enum ClickGrid<'a> {
+    /// 定テンポ。count-in (preroll) 用 — 曲の tempo map とは独立した lead-in で、
+    /// `daw_gui` が拍の整数倍で長さを決めている。
+    Fixed { bpm: f32 },
+    /// 曲の tempo map (SongTempo automation を積分済み)。テンポ変更後も click が
+    /// 真の拍位置に乗る。
+    Song(&'a common::tempo_map::TempoMap),
+}
+
+impl ClickGrid<'_> {
+    /// 曲 sample 位置 → 拍。負の位置 (PDC 補償で曲頭より手前) は 0 に丸める
+    /// (拍 0 より前の click は元々鳴らさないため)。
+    fn beat_at(&self, sample: f64, sample_rate: u32) -> f64 {
+        match self {
+            Self::Fixed { bpm } => {
+                let spb = f64::from(sample_rate) * 60.0 / f64::from(*bpm);
+                if spb > 0.0 { (sample / spb).max(0.0) } else { 0.0 }
+            }
+            Self::Song(map) => {
+                if sample <= 0.0 || sample_rate == 0 {
+                    0.0
+                } else {
+                    map.seconds_to_beat(sample / f64::from(sample_rate))
+                }
+            }
+        }
+    }
+
+    /// 拍 → 曲 sample 位置 (`beat_at` の逆写像)。
+    fn sample_at(&self, beat: f64, sample_rate: u32) -> f64 {
+        match self {
+            Self::Fixed { bpm } => {
+                beat * f64::from(sample_rate) * 60.0 / f64::from(*bpm)
+            }
+            Self::Song(map) => map.beat_to_seconds(beat) * f64::from(sample_rate),
+        }
+    }
+
+    /// グリッドが退化していないか (bpm <= 0 等)。
+    fn is_valid(&self, sample_rate: u32) -> bool {
+        match self {
+            Self::Fixed { bpm } => *bpm > 0.0 && sample_rate > 0,
+            Self::Song(_) => sample_rate > 0,
+        }
+    }
+}
+
 /// メトロノーム click を 1 buffer 分 master_l/r に重ねる。 buffer 範囲内の
-/// 全 beat 境界 (bpm + sample_rate から算出) で click voice を trigger、
+/// 全 beat 境界を `grid` で求めて click voice を trigger、
 /// 既存 voice が decay 中なら overwrite (= 短 decay 1 voice の業界標準
 /// idiom)。 voice の sample 生成は sine + linear envelope decay で hardcode
 /// (decay 40 ms / amp peak 0.25 = -12 dB / freq downbeat 880 Hz, 他 440 Hz)。
 /// stereo は同 sample を L/R に均等 mix (= mono click)。
 ///
-/// `playhead_samples` は **符号付き**: r.md #39 で PDC 補償 (= master に届く音の
+/// `buffer_start_samples` は **符号付き**: r.md #39 で PDC 補償 (= master に届く音の
 /// 遅延ぶん click も遅らせる) を入れたため、曲頭付近では負の位置を取る。負の間は
 /// beat 境界を跨がないので click は鳴らず、position 0 を含む buffer で 1 回だけ
 /// 鳴る (`u64` の saturating clamp だと曲頭で beat 0 を毎 buffer 再 trigger して
 /// しまうため、ここは必ず符号付きで計算する)。
 ///
-/// RT 安全: heap 確保なし、 浮動小数演算と sin() 呼び出しのみ。 bpm = 0 /
-/// sample_rate = 0 / tsig_num < 1 で no-op (defensive)。
+/// RT 安全: heap 確保なし、 浮動小数演算・`TempoMap` の O(1) table lookup・sin() のみ。
+/// sample_rate = 0 / bpm <= 0 / tsig_num < 1 で no-op (defensive)。
 ///
 /// 同 buffer 内に 2 個以上 beat 境界が含まれる場合 (= 高速 tempo / 大 buffer)、
 /// 後の trigger が voice を overwrite し前の voice の残響は失われる。 通常
@@ -48,27 +102,29 @@ pub fn render_metronome(
     master_l: &mut [f32],
     master_r: &mut [f32],
     frames: usize,
-    playhead_samples: i64,
+    buffer_start_samples: i64,
     sample_rate: u32,
-    bpm: f32,
+    grid: &ClickGrid<'_>,
     tsig_num: i64,
 ) {
-    if frames == 0 || sample_rate == 0 || bpm <= 0.0 || tsig_num < 1 {
+    if frames == 0 || tsig_num < 1 || !grid.is_valid(sample_rate) {
         return;
     }
-    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(bpm);
-    if samples_per_beat <= 0.0 {
-        return;
-    }
-    let buffer_start = playhead_samples as f64;
+    let buffer_start = buffer_start_samples as f64;
     let buffer_end = buffer_start + frames as f64;
-    // この buffer 内に含まれる beat 境界 (= sample 位置 = beat_index *
-    // samples_per_beat) を順次 trigger。 連続なら最後の trigger が voice を
-    // overwrite (KISS: 同 buffer 多重 voice なし)。
-    let first_beat_in_buf = (buffer_start / samples_per_beat).ceil() as i64;
-    let mut beat_index = first_beat_in_buf.max(0);
+    // この buffer 内に含まれる beat 境界を順次 trigger。 連続なら最後の trigger が
+    // voice を overwrite (KISS: 同 buffer 多重 voice なし)。
+    //
+    // 探索開始は `ceil` ではなく **`floor`**: tempo map の beat↔sample 往復は補間
+    // 誤差を持つので、境界ちょうどの buffer で `ceil` を使うと 1 拍まるごと取りこぼす
+    // ことがある。1 拍手前から始めて `>= buffer_start` で弾けば取りこぼさない
+    // (余分な反復は高々 1 回)。
+    let mut beat_index = grid
+        .beat_at(buffer_start, sample_rate)
+        .floor()
+        .max(0.0) as i64;
     loop {
-        let boundary_sample = beat_index as f64 * samples_per_beat;
+        let boundary_sample = grid.sample_at(beat_index as f64, sample_rate);
         if boundary_sample >= buffer_end {
             break;
         }
@@ -122,15 +178,25 @@ mod tests {
     const SR: u32 = 48_000;
     const BPM: f32 = 120.0; // → 1 拍 = 24 000 sample
 
-    /// 1 buffer 描画して L/R を返す。
+    /// 1 buffer 描画して L/R を返す (定テンポ grid)。
     fn render_at(
         voice: &mut Option<ClickVoice>,
         pos: i64,
         frames: usize,
     ) -> (Vec<f32>, Vec<f32>) {
+        render_on(voice, pos, frames, &ClickGrid::Fixed { bpm: BPM })
+    }
+
+    /// 1 buffer 描画して L/R を返す (grid 指定)。
+    fn render_on(
+        voice: &mut Option<ClickVoice>,
+        pos: i64,
+        frames: usize,
+        grid: &ClickGrid<'_>,
+    ) -> (Vec<f32>, Vec<f32>) {
         let mut l = vec![0.0f32; frames];
         let mut r = vec![0.0f32; frames];
-        render_metronome(voice, &mut l, &mut r, frames, pos, SR, BPM, 4);
+        render_metronome(voice, &mut l, &mut r, frames, pos, SR, grid, 4);
         (l, r)
     }
 
@@ -164,6 +230,93 @@ mod tests {
         }
         let (l, _) = render_at(&mut v, 0, 512);
         assert!(energy(&l, 0..512) > 0.0, "曲頭 (位置 0) で 1 拍目が鳴る");
+    }
+
+    /// 120BPM で 8 小節 (拍 32) 進んでから 140BPM に変わる曲。
+    fn tempo_step_song() -> common::model::Song {
+        use common::model::{
+            AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint,
+            AutomationTarget, ClipContent, Song,
+        };
+        let mut song = Song {
+            bpm: 120.0,
+            length_beats: 64.0,
+            ..Song::default()
+        };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Automation(AutomationContent {
+                next_point_id: 0,
+                // 拍 32 で 120 → 140 の階段 (Hold カーブで手前まで 120 を保つ)。
+                points: vec![
+                    AutomationPoint { id: 0, time_beat: 0.0, value: 120.0, curve: AutomationCurve::Hold },
+                    AutomationPoint { id: 0, time_beat: 32.0, value: 140.0, curve: AutomationCurve::Hold },
+                ],
+            }),
+        );
+        song.song_lanes.push(AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "tempo".into(),
+                start_beat: 0.0,
+                length_beats: 64.0,
+                content_id: cid,
+            }],
+            ..AutomationLane::new(AutomationTarget::SongTempo, 120.0)
+        });
+        song
+    }
+
+    #[test]
+    fn click_follows_the_tempo_map_after_a_tempo_change() {
+        // r.md #39: 拍境界は tempo map から求める。旧実装は「瞬間 bpm × 絶対 sample の
+        // 等間隔グリッド」だったので、120→140BPM の変更後は真の拍から 143ms 早く鳴り、
+        // 以降もずれ続けていた。
+        let map = common::tempo_map::TempoMap::from_song(&tempo_step_song());
+        let grid = ClickGrid::Song(&map);
+        // 拍 32 (= 120BPM で 768 000 sample) の直後の拍 33 の真の位置。
+        let beat33 = map.beat_to_seconds(33.0) * f64::from(SR);
+        // 140BPM なので 1 拍 = 20 571.43 sample。旧実装の等間隔グリッドは
+        // beat_index=38 → 781 714 sample を叩いていた (真値より 6 857 sample 早い)。
+        let naive = 38.0 * (f64::from(SR) * 60.0 / 140.0);
+        assert!(
+            (beat33 - naive) > 6_000.0,
+            "テスト前提: 旧グリッドと真の拍が十分離れている (beat33={beat33}, naive={naive})"
+        );
+
+        // 真の拍位置を含む buffer で鳴り、旧グリッド位置の buffer では鳴らない。
+        let at = beat33.floor() as i64;
+        let mut v = None;
+        let (l, _) = render_on(&mut v, at - 100, 512, &grid);
+        assert_eq!(energy(&l, 0..100), 0.0, "真の拍より前は無音");
+        assert!(energy(&l, 100..512) > 0.0, "真の拍で click");
+
+        let mut v2 = None;
+        let (l2, _) = render_on(&mut v2, naive.floor() as i64, 512, &grid);
+        assert_eq!(
+            energy(&l2, 0..512),
+            0.0,
+            "旧実装が叩いていた等間隔グリッド位置では鳴らない"
+        );
+    }
+
+    #[test]
+    fn constant_tempo_song_grid_matches_the_fixed_grid() {
+        // tempo automation の無い曲では tempo map grid = 定テンポ grid (退行なし)。
+        let song = common::model::Song { bpm: BPM, length_beats: 64.0, ..Default::default() };
+        let map = common::tempo_map::TempoMap::from_song(&song);
+        for beat in [1i64, 2, 7] {
+            let pos = beat * 24_000; // 120BPM @48k
+            let mut a = None;
+            let (la, _) = render_on(&mut a, pos - 50, 512, &ClickGrid::Song(&map));
+            let mut b = None;
+            let (lb, _) = render_at(&mut b, pos - 50, 512);
+            assert_eq!(energy(&la, 0..50), 0.0, "beat={beat}");
+            assert!(energy(&la, 50..512) > 0.0, "beat={beat}");
+            assert_eq!(la, lb, "beat={beat}: tempo map grid と定テンポ grid が一致");
+        }
     }
 
     #[test]

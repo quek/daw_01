@@ -697,11 +697,16 @@ impl LocalState {
                     &mut self.master_l[..n],
                     &mut self.master_r[..n],
                     n,
-                    // count-in は track の音が鳴らない専用モードなので PDC 補償しない
-                    // (揃える相手がいない = 生の経過位置で数える)。
-                    elapsed as i64,
+                    // r.md #39: count-in の click も本再生と **同じ時間軸** に載せる。
+                    // 補償しないと count-in 最終拍と曲 1 拍目の間隔だけが
+                    // 「1 拍 + master_latency」に伸び、録音のダウンビートでつんのめる。
+                    // 揃える相手は count-in 中の音ではなく直後に続く曲の click / 音。
+                    elapsed as i64
+                        - i64::from(self.cached_schedule.master_latency_samples),
                     sample_rate,
-                    bpm,
+                    // count-in は曲の tempo map ではなく定テンポ (preroll 長も
+                    // `bars * time_sig` 拍で決まっている)。
+                    &crate::metronome::ClickGrid::Fixed { bpm },
                     tsig_num,
                 );
             }
@@ -888,7 +893,10 @@ impl LocalState {
                     n,
                     click_pos,
                     sample_rate,
-                    current_bpm,
+                    // r.md #39: 拍境界は tempo map (SongTempo automation 積分済み) で
+                    // 求める。瞬間 bpm × sample の等間隔グリッドだと、テンポ変更以降の
+                    // click が clip / note (playhead_beats 基準) と別グリッドに載る。
+                    &crate::metronome::ClickGrid::Song(&self.tempo_map),
                     tsig_num,
                 );
             }

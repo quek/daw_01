@@ -14,6 +14,17 @@
 use crate::model::{ClipContent, ImageEvent, MouthMap, MouthShape, Song};
 use crate::voicevox::{Phoneme, frames_to_beats};
 
+/// 口パク **配置ルール** の世代。生成した clip に [`crate::model::Clip::lipsync_gen`]
+/// として焼き込み、load 時にこれより古い clip を見つけたら一度だけ再生成する。
+///
+/// **phoneme 列 → clip-local beat の対応を変えたら必ず +1 する。** 入力
+/// (notes / text / bpm / mouth_map) が同じでも出力が変わる変更は fingerprint では
+/// 検出できないため (合成 WAV 側の `CACHE_SCHEMA_VERSION` と対になる仕組み)。
+///
+/// - 1: r.md #39 — anchor を「phoneme 列 frame 0 が来る位置」に統一し、talk の
+///   先頭 pau (prePhonemeLength 由来 ~96ms) を廃止
+pub const PLACEMENT_GEN: u32 = 1;
+
 /// phoneme 文字列が母音 (a/i/u/e/o/N) なら対応する口形状。子音 / cl / pau は
 /// `None`。REAPER の VOWELS セット (撥音 N を含む) と同じ判定。
 fn vowel_shape(phoneme: &str) -> Option<MouthShape> {
@@ -212,6 +223,42 @@ pub fn fill_mouth_timeline(
     out
 }
 
+/// **古い配置ルール** ([`PLACEMENT_GEN`]) で作られた `auto_lipsync` clip を持つ口 track の、
+/// ソース vocal track id 群 (昇順・重複なし)。
+///
+/// r.md #39: 口パク event は project に永続化される派生データで、通常の再生成トリガは
+/// 入力 fingerprint の差分だけ。配置ルール自体を変えると入力が同じままなので、この世代
+/// チェックが「開いたときに一度だけ作り直す」唯一のトリガになる。現行世代しか無い
+/// project では空 Vec (= 何もしない → dirty-on-open しない、r.md #9)。
+#[must_use]
+pub fn vocal_tracks_with_outdated_lipsync(song: &Song) -> Vec<u32> {
+    let outdated: Vec<u32> = song
+        .tracks
+        .iter()
+        .filter(|t| {
+            t.clips
+                .iter()
+                .any(|c| c.auto_lipsync && c.lipsync_gen < PLACEMENT_GEN)
+        })
+        .map(|t| t.id)
+        .collect();
+    if outdated.is_empty() {
+        return Vec::new();
+    }
+    let mut vocals: Vec<u32> = song
+        .tracks
+        .iter()
+        .filter(|t| {
+            t.lipsync_target_track
+                .is_some_and(|target| outdated.contains(&target))
+        })
+        .map(|t| t.id)
+        .collect();
+    vocals.sort_unstable();
+    vocals.dedup();
+    vocals
+}
+
 /// 口 track (`mouth_track_id`) が属する立ち絵 group の「body が映っている」
 /// 時間範囲 (song-absolute beats) を返す。 = 同じ group (親 = 口 track の
 /// `parent_group_id`) に属する track 群 — group track 自身と直下の子 — が持つ
@@ -338,9 +385,17 @@ mod tests {
             "first vowel starts at the base note, got {}",
             a_event.event_start_in_clip_beats
         );
-        // 先頭は [0, head] の閉口 fill (先頭 pau は head から始まる)。
+        // 先頭は [0, head] の閉口 fill + 先頭 pau [head, first_note] が同じ閉口で
+        // merge され、ちょうど [0, first_note] の 1 本になる。
+        // (この長さ assert は先頭 fill / 連続同形マージの回帰検出そのもの。
+        //  contiguous / start≈0 だけでは merge が壊れても素通りする。)
         assert_eq!(events[0].source_id, 7);
         assert!((events[0].event_start_in_clip_beats).abs() < 1e-6);
+        assert!(
+            (events[0].event_length_beats - first_note).abs() < 1e-6,
+            "先頭閉口は [0, {first_note}] の 1 本にマージされる: {}",
+            events[0].event_length_beats
+        );
         assert_contiguous(&events, clip_len);
     }
 
@@ -478,5 +533,58 @@ mod tests {
         let mut song = Song::default();
         song.tracks.push(img_track(5, None, vec![]));
         assert_eq!(tachie_body_range(&song, 5), None);
+    }
+
+    // ---- 配置ルールの世代 (r.md #39) ---------------------------------------
+
+    /// vocal track(1) → 口 track(2)。口 track に指定世代の auto clip を 1 本。
+    fn lipsync_gen_song(generation: u32) -> Song {
+        let mut song = Song::default();
+        let mut auto = img_clip(&mut song, 0.0, 8.0, true);
+        auto.lipsync_gen = generation;
+        song.tracks.push(crate::model::Track {
+            id: 1,
+            lipsync_target_track: Some(2),
+            ..Default::default()
+        });
+        song.tracks.push(img_track(2, None, vec![auto]));
+        song
+    }
+
+    #[test]
+    fn outdated_lipsync_generation_is_detected_and_current_is_not() {
+        // 旧世代 (0 = 世代を持たない旧 file) → ソース vocal track を再生成対象に。
+        assert_eq!(
+            vocal_tracks_with_outdated_lipsync(&lipsync_gen_song(0)),
+            vec![1]
+        );
+        // 現行世代 → 何もしない (= 開いただけで dirty にならない、r.md #9)。
+        assert!(
+            vocal_tracks_with_outdated_lipsync(&lipsync_gen_song(PLACEMENT_GEN)).is_empty()
+        );
+    }
+
+    #[test]
+    fn hand_placed_clips_never_trigger_regeneration() {
+        // auto_lipsync == false の手置き clip は世代 0 でも対象外。
+        let mut song = Song::default();
+        let manual = img_clip(&mut song, 0.0, 8.0, false);
+        song.tracks.push(crate::model::Track {
+            id: 1,
+            lipsync_target_track: Some(2),
+            ..Default::default()
+        });
+        song.tracks.push(img_track(2, None, vec![manual]));
+        assert!(vocal_tracks_with_outdated_lipsync(&song).is_empty());
+    }
+
+    #[test]
+    fn outdated_mouth_track_without_source_yields_nothing() {
+        // 口 track だけ残ってソース vocal が消えている project では再生成できない。
+        let mut song = Song::default();
+        let mut auto = img_clip(&mut song, 0.0, 8.0, true);
+        auto.lipsync_gen = 0;
+        song.tracks.push(img_track(2, None, vec![auto]));
+        assert!(vocal_tracks_with_outdated_lipsync(&song).is_empty());
     }
 }

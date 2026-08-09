@@ -164,6 +164,9 @@ fn rebuild_mouth_clip(
                 content_id,
                 color: None,
                 auto_lipsync: true,
+                // 生成した配置ルールの世代を焼き込む (r.md #39)。load 時に
+                // 古い世代を見つけたら一度だけ再生成する。
+                lipsync_gen: common::lipsync::PLACEMENT_GEN,
                 ..Default::default()
             });
             song.gc_clip_contents();
@@ -585,6 +588,32 @@ impl AppData {
         }
     }
 
+    /// load 時に呼ぶ (r.md #39): 保存済みの `auto_lipsync` clip が **古い配置ルール**
+    /// ([`common::lipsync::PLACEMENT_GEN`]) で作られていたら、そのソース vocal track の
+    /// 口パクを一度だけ再生成する。
+    ///
+    /// 口パク event は project に永続化される派生データで、通常の再生成トリガは
+    /// `lipsync_input_fingerprint` の差分だけ。配置ルールを変えても入力は変わらないので、
+    /// この経路が無いと旧タイミング (talk なら音声より ~100ms 遅れ) が温存され、
+    /// 「直したのに変わらない」になる。合成 WAV 側の `CACHE_SCHEMA_VERSION` と対の仕組み。
+    ///
+    /// r.md #9 の dirty-on-open contract とは「**実際に古い世代のときだけ** dirty になる」
+    /// 形で両立する (現行世代の clip しか無い project では何もしない)。engine 未起動等で
+    /// phoneme query が失敗した場合は既存 clip が温存され、世代も古いままなので次回 open で
+    /// 再試行される。
+    pub(crate) fn regenerate_outdated_lipsync_on_load(&mut self) {
+        let vocal_ids =
+            common::lipsync::vocal_tracks_with_outdated_lipsync(self.song_doc.song());
+        for vid in vocal_ids {
+            tracing::info!(
+                vocal_track_id = vid,
+                placement_gen = common::lipsync::PLACEMENT_GEN,
+                "口パク配置ルールが更新されているため再生成する (r.md #39)"
+            );
+            self.regenerate_lipsync_for_track(vid);
+        }
+    }
+
     /// 口パク (lip-sync) を再生成する (docs/plan_pakupaku.md §7)。`vocal_track_id`
     /// の各 clip の notes を snapshot し、背景スレッドで `query_phonemes`
     /// (`sing_frame_audio_query` のみ) を叩いて結果を `AppEvent::LipsyncGenerated`
@@ -1003,6 +1032,20 @@ mod rebuild_mouth_clip_tests {
             mouth_triples(&song),
             vec![(0.0, 2.0, 99), (2.0, 4.0, 5), (4.0, 8.0, 99)],
         );
+    }
+
+    #[test]
+    fn rebuild_stamps_the_current_placement_generation() {
+        // r.md #39: 再生成した clip には現行の配置ルール世代を焼き込む。これで
+        // 「古い世代を見つけたら load 時に一度だけ作り直す」検出が終端する
+        // (焼き込みを忘れると毎回 open のたびに再生成 = '*' が付き続ける)。
+        let mut song = tachie_song(99);
+        assert!(rebuild_mouth_clip(&mut song, 3, vec![(2.0, 4.0, 5)]));
+        let clip = &song.track_by_id(3).unwrap().clips[0];
+        assert!(clip.auto_lipsync);
+        assert_eq!(clip.lipsync_gen, common::lipsync::PLACEMENT_GEN);
+        // 世代が現行なので、もう再生成対象にならない。
+        assert!(common::lipsync::vocal_tracks_with_outdated_lipsync(&song).is_empty());
     }
 
     #[test]

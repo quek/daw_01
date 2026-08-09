@@ -29,7 +29,30 @@
 - **キャッシュ**: wav の中身を決める定義 (engine へ注入するパラメータ等) を変えたら
   `voicevox_cache.rs::CACHE_SCHEMA_VERSION` を必ず +1 する。query 文字列や
   `TalkParams` に現れない変更は key に自然には反映されず、旧 wav を掴んで
-  「直したのに変わらない」になる。
+  「直したのに変わらない」になる。同じ理由で、**口パクの配置ルール** を変えたら
+  `common::lipsync::PLACEMENT_GEN` を +1 する (保存済み口パク clip は入力が同じままなので
+  fingerprint では再生成されない。`Clip::lipsync_gen` の世代照合が唯一のトリガ)。
+
+## master 出力の遅延 (`Schedule::master_latency_samples`) の消費者
+
+`master_buffer[P]` に載っているのは曲位置 `P - master_latency_samples` の音。この値は
+**master `Mix` の src の最大 path latency ＋ `Song::master_reported_latency_samples`**
+(= master fx chain 自身の報告 latency)。master は `Track` を持たないので、後者は
+`Song` 直下に置き `Song::reported_latency_mut` の sentinel 分岐で書き込む
+(`fx_chain_by_track_id_mut` と同 idiom)。
+
+この 1 つの値を **2 箇所** が引く。片方だけ直すと非対称になるので必ず両方見ること:
+
+1. **metronome click** (`engine.rs`) — click は `render_master_buffer` の後に重ねる
+   (master fx を通らない) ので、参照位置からこの値を引いて音と揃える。count-in の
+   click も同じだけ引く (引かないと count-in → 本再生の境目で 1 拍だけ間隔が伸びる)。
+2. **WAV 書き出し** (`export.rs::shift_window_for_master_latency`) — 書き出し窓と
+   走査終端をこの値だけ後ろへずらす。ずらさないと wav 全体が後ろへずれ、
+   stem を元位置に貼り戻すと二重にずれる。
+
+なお click の **拍グリッド** は `metronome::ClickGrid::Song(&TempoMap)` (tempo automation
+積分済み) で求める。瞬間 bpm × 絶対 sample の等間隔グリッドにすると、テンポ変更以降の
+click が clip / note (`playhead_beats` 基準) と別グリッドに載る。
 
 ## 進捗
 
