@@ -19,13 +19,24 @@ pub struct UiEphemeral {
     /// `ClipView.thumbnail`.
     pub video_texture_cache:
         std::collections::HashMap<common::model::VideoSourceId, daw_ui_renderer::TextureHandle>,
-    /// v13: GPU-side image textures keyed by `ImageSourceId`. Written
-    /// by the runner after upload, read by `preview_window.rs`
-    /// composite pass and `arrangement_view.rs` thumbnail rendering.
+    /// v13: GPU-side image textures keyed by `ImageSourceId`.
+    ///
+    /// **main window の `Renderer` が払い出した handle だけ**を入れる
+    /// (arrangement のクリップサムネイル用)。`TextureHandle` は renderer-local な
+    /// id 空間なので、preview 側の handle を混ぜると別名衝突する (r.md #42)。
+    /// preview の合成が使う画像テクスチャは `PreviewWindowState::image_textures`。
     pub image_texture_cache: std::collections::HashMap<
         common::model::ImageSourceId,
         daw_ui_renderer::TextureHandle,
     >,
+    /// r.md #42: 参照を捨てた **main renderer** の `TextureHandle` の破棄予約。
+    ///
+    /// `AppData` は `Renderer` を持たない (モデルを GPU に依存させない) ので、
+    /// cache を purge する側はここに積むだけにし、runner が毎フレーム drain して
+    /// `Renderer::destroy_texture` を呼ぶ。積み忘れると GPU 側 store に entry が
+    /// 残り続け、プロジェクトを開き直すたびに VRAM が単調増加する
+    /// (サムネイルはネイティブ解像度なので 4K なら 1 枚 33MB)。
+    pub pending_texture_destroys: Vec<daw_ui_renderer::TextureHandle>,
     /// Snapped mouse hover beat inside the arrangement canvas. `None`
     /// outside the canvas. `arrangement_view::draw` updates it every
     /// frame using the current `SnapConfig`. Used by Split (E) so the

@@ -56,10 +56,10 @@ impl AppData {
         // r.md #42: GPU 上のサムネイル / 画像テクスチャは **今の Song から導出された**
         // データ。 `VideoSourceId` / `ImageSourceId` は project ごとに 1 から振り直される
         // ので、 持ち越すと別 project の同 id が誤 hit して「前のプロジェクトの絵が
-        // クリップに出る」。 実テクスチャは renderer 側 store に残るが、 参照が消えれば
-        // 以後 upload 先が変わるだけで描画には現れない (次の import / 復旧で再確保)。
-        self.ui_ephemeral.video_texture_cache.clear();
-        self.ui_ephemeral.image_texture_cache.clear();
+        // クリップに出る」。 参照を捨てるだけでは GPU 側 store に entry が残るので、
+        // **破棄予約に積んで runner に destroy させる** (サムネイルはネイティブ解像度で
+        // 4K なら 1 枚 33MB。 開き直すたびに単調増加するのを防ぐ)。
+        self.discard_gpu_derived_caches();
         // 旧 project の CPU 側 staging も同様に持ち越さない (未 upload のまま残ると
         // 新 project の同 id を「decode 済み」 と誤判定して job から漏れる)。
         self.media.video_thumbnail_rgba.clear();
@@ -467,13 +467,22 @@ impl AppData {
     /// 展開済みビットマップを RAM に常駐させる (4K 画像 1 枚 ~33MB × 枚数) 案は採らない
     /// — 復帰直後の一瞬の空白より、 常時のメモリ増のほうが害が大きい。
     pub(crate) fn rebuild_gpu_derived_caches(&mut self) {
-        // 旧 device の handle は全部無効。 `destroy_texture` は既に死んだ store を
-        // 触るだけなので呼ばない (renderer 側が世代ごと捨てている)。
-        self.ui_ephemeral.video_texture_cache.clear();
-        self.ui_ephemeral.image_texture_cache.clear();
+        // 旧世代の handle を破棄予約へ。 device ごと作り直された経路では新 store に
+        // その id が無いので destroy は no-op (id 空間は単調なので新テクスチャを
+        // 巻き添えにしない)。 **片方の renderer だけ生きていた** 場合はここで実際に
+        // 解放され、 orphan が残らない。
+        self.discard_gpu_derived_caches();
         // 「未 staging のものだけ」 を対象にする冪等な work-list 構築なので、
         // GPU へ上げ済みだった (= staging が drain 済みの) ものだけが再 decode される。
         self.begin_asset_decode("GPU を再初期化しています");
+    }
+
+    /// main renderer 上の派生テクスチャ (動画サムネイル / 画像) の参照を捨て、
+    /// 実体の解放を runner (`drain_texture_destroys`) に予約する。
+    fn discard_gpu_derived_caches(&mut self) {
+        let destroys = &mut self.ui_ephemeral.pending_texture_destroys;
+        destroys.extend(self.ui_ephemeral.video_texture_cache.drain().map(|(_, h)| h));
+        destroys.extend(self.ui_ephemeral.image_texture_cache.drain().map(|(_, h)| h));
     }
 
     pub(crate) fn action_open_path(&mut self, path: PathBuf) {

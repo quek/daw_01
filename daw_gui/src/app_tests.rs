@@ -1159,3 +1159,84 @@ mod track_duplicate_tests {
     }
 }
 
+
+#[cfg(test)]
+mod gpu_derived_cache_tests {
+    //! r.md #42: main renderer 上の派生テクスチャ (動画サムネイル / 画像) は
+    //! `AppData` 側の HashMap と `Renderer` 側の `TextureStore` に参照が二重化する。
+    //! `AppData` は `Renderer` を持てないので、cache を捨てる側は **破棄予約に積む**
+    //! 必要がある。単に `clear()` すると GPU 側 entry が解放されず、プロジェクトを
+    //! 開き直すたびに VRAM が単調増加する (サムネイルはネイティブ解像度で 4K なら
+    //! 1 枚 33MB)。
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+
+    use common::protocol::{AudioCommand, PluginCommand};
+    use daw_ui_renderer::TextureHandle;
+    use tokio::sync::mpsc;
+
+    use crate::app::AppData;
+    use crate::dispatcher::{
+        BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
+    };
+
+    fn build_app() -> AppData {
+        let (audio_tx, _audio_rx) = mpsc::unbounded_channel::<AudioCommand>();
+        let (plugin_tx, _plugin_rx) = mpsc::unbounded_channel::<PluginCommand>();
+        let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
+        let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
+        AppData::new(
+            audio_tx,
+            plugin_tx,
+            None,
+            None,
+            event_dispatcher,
+            job_dispatcher,
+            None,
+            None,
+            common::audio_bridge::DEFAULT_SAMPLE_RATE,
+        )
+    }
+
+    fn handle(raw: u32) -> TextureHandle {
+        TextureHandle::from_raw(NonZeroU32::new(raw).expect("nonzero"))
+    }
+
+    /// プロジェクト差し替えで cache を捨てるとき、handle は **破棄予約へ移す**。
+    #[test]
+    fn after_song_replaced_queues_texture_destroys() {
+        let mut app = build_app();
+        app.ui_ephemeral.video_texture_cache.insert(7, handle(1));
+        app.ui_ephemeral.image_texture_cache.insert(9, handle(2));
+
+        app.after_song_replaced();
+
+        assert!(
+            app.ui_ephemeral.video_texture_cache.is_empty(),
+            "別 project の id が誤 hit しないよう参照は捨てる"
+        );
+        assert!(app.ui_ephemeral.image_texture_cache.is_empty());
+        let mut queued: Vec<u32> = app
+            .ui_ephemeral
+            .pending_texture_destroys
+            .iter()
+            .map(|h| h.raw())
+            .collect();
+        queued.sort_unstable();
+        assert_eq!(queued, vec![1, 2], "捨てた handle は必ず destroy 予約に積む");
+    }
+
+    /// GPU 復旧時も同じ (片方の renderer だけ生きていた場合に orphan を残さない)。
+    #[test]
+    fn rebuild_gpu_derived_caches_queues_texture_destroys() {
+        let mut app = build_app();
+        app.ui_ephemeral.video_texture_cache.insert(1, handle(11));
+        app.ui_ephemeral.image_texture_cache.insert(2, handle(12));
+
+        app.rebuild_gpu_derived_caches();
+
+        assert!(app.ui_ephemeral.video_texture_cache.is_empty());
+        assert!(app.ui_ephemeral.image_texture_cache.is_empty());
+        assert_eq!(app.ui_ephemeral.pending_texture_destroys.len(), 2);
+    }
+}

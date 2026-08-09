@@ -87,6 +87,54 @@ pub(crate) fn timeout_action(consecutive: u32) -> TimeoutAction {
     }
 }
 
+/// surface 由来の失敗 (`Validation` / reconfigure しても取れない `Outdated`/`Lost`) を
+/// 「device lost 相当」 へ昇格させる閾値。
+///
+/// # なぜ必要か (r.md #42 レビュー指摘)
+///
+/// 復旧の起動条件を `set_device_lost_callback` **一点**に依存させると、
+/// **device は valid のまま surface だけが恒久的に壊れる** 経路で #42 と同じ
+/// 「落ちないのに永久に描けない」 状態に戻る。 wgpu 29 に実在する経路:
+///
+/// `Surface::configure` は hal を叩く **前** に `presentation` を `take()` して `None` に
+/// する (wgpu-core `device/resource.rs:5161`)。 hal 側が device 由来でないエラー
+/// (Vulkan `create_swapchain` の `ERROR_SURFACE_LOST_KHR` 等) で失敗すると
+/// `ConfigureSurfaceError::InvalidSurface` になり **`lose()` を通らない**ため、
+/// `presentation` は `None` のまま残る。 以後 `get_current_texture` は
+/// `SurfaceError::NotConfigured` → `ErrorType::Validation`
+/// (wgpu-core `present.rs:162` / `present.rs:56-65`) → `SurfaceStatus::Validation` を
+/// 返し続け、 device は valid なので `lost` フラグは永久に立たない。
+///
+/// wgpu の doc (`api/surface_texture.rs` の `CurrentSurfaceTexture::Lost`) は
+/// 「device 全体が lost でなければ `Instance::create_surface()` で surface を作り直せ」
+/// と言っており、 [`Renderer::recreate`] は Instance/Surface/Device ごと作り直すので
+/// **この昇格はそのまま正しい remedy** になる。
+///
+/// 閾値は「連続失敗回数」 と「経過時間」 の **両方**。 回数だけだと 1 フレームの
+/// blip で誤発火し、 時間だけだと 1 回きりの失敗で発火する。 モニタ切替 / 解像度変更の
+/// ような正当な過渡状態 (~1-2 秒) を外すため 2 秒を採る。
+const SURFACE_FAILURE_ESCALATE_COUNT: u32 = 4;
+const SURFACE_FAILURE_ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 連続 `count` 回・最初の失敗から `elapsed` 経過した surface 失敗を、
+/// device lost 相当として復旧起動すべきか。 GPU 無しでテストできるよう純関数に切り出す。
+pub(crate) fn surface_failure_escalates(count: u32, elapsed: std::time::Duration) -> bool {
+    count >= SURFACE_FAILURE_ESCALATE_COUNT && elapsed >= SURFACE_FAILURE_ESCALATE_AFTER
+}
+
+/// 昇格 (= 自動 recreate) を 1 つの不調エピソード内で何回まで試みるか。
+///
+/// recreate が成功するのに描画が直らない (= surface が本当に死んでいる) 場合、
+/// 上限が無いと 2 秒周期で「recreate → 派生キャッシュ全再構築 (画像 / サムネイルの
+/// 再 decode)」 を回し続けて CPU を焼く。 wgpu 公認の remedy を数回試して駄目なら諦め、
+/// エラーを返し続ける (ログはレート制限済み)。 成功フレームで 0 に戻る。
+const MAX_SURFACE_ESCALATIONS: u32 = 3;
+
+/// surface 失敗の理由文字列 (ログ / `RenderError` 用)。
+const RECONFIGURE_FAILED: &str = "reconfigure 後も surface を取得できない";
+const TIMEOUT_STREAK: &str = "surface acquire timeout が 60 フレーム連続";
+const SURFACE_VALIDATION: &str = "Surface::get_current_texture が validation error を返す";
+
 /// GPU に依存する全資産。device lost で丸ごと捨てて作り直す単位。
 struct GpuState {
     /// surface を生かすために window を保持。drop 順序は struct 末尾の方が後なので
@@ -125,12 +173,19 @@ struct GpuState {
     /// 使い回す pool。 handle は `texture_store` 内の texture を指す (pool 自体は GPU resource を
     /// 直接持たない)。
     composite_pool: CompositePool,
-    /// device lost callback が立てるフラグ。 callback は wgpu から **任意スレッド**で
-    /// 呼ばれうる (`Send + 'static` 要求) ので `Arc<AtomicBool>`。
+    /// **この `GpuState` はもう使えない** (= 作り直しが必要) を表すフラグ。
+    ///
+    /// 立てるのは 2 経路: (1) wgpu の device lost callback (**任意スレッド**から
+    /// 呼ばれうる `Send + 'static` 要求なので `Arc<AtomicBool>`)、
+    /// (2) surface 由来の連続失敗の昇格 ([`surface_failure_escalates`])。
+    /// どちらも意味は同じ「この世代を捨てて `recreate` しろ」 なので 1 つの状態に集約する
+    /// (復旧トリガを callback 一点に依存させない = 単一障害点を作らない)。
     lost: Arc<AtomicBool>,
     /// acquire `Timeout` の連続回数 ([`timeout_action`] の入力)。 成功フレーム /
     /// `Occluded` (= 正常な最小化) で 0 に戻す。
     consecutive_timeouts: u32,
+    /// surface 由来の連続失敗 `(最初の失敗時刻, 連続回数)`。 成功フレームで `None`。
+    surface_failures: Option<(std::time::Instant, u32)>,
 }
 
 impl GpuState {
@@ -236,11 +291,38 @@ impl GpuState {
             composite_pool,
             lost,
             consecutive_timeouts: 0,
+            surface_failures: None,
         })
     }
 
+
     fn is_lost(&self) -> bool {
         self.lost.load(Ordering::Acquire)
+    }
+
+    /// surface 由来の失敗を 1 件記録し、 **device lost 相当へ昇格すべきなら `true`**。
+    ///
+    /// 昇格した場合は `lost` を自分で立てる (= 以後 `is_live()` は false、
+    /// `render()` は即 `DeviceLost`、 caller の復旧経路が `recreate` する)。
+    /// これで「復旧トリガは device lost callback だけ」 という単一障害点が外れる。
+    fn note_surface_failure(&mut self, what: &str) -> bool {
+        let now = std::time::Instant::now();
+        let (first_at, count) = match self.surface_failures {
+            Some((first_at, count)) => (first_at, count.saturating_add(1)),
+            None => (now, 1),
+        };
+        self.surface_failures = Some((first_at, count));
+        if !surface_failure_escalates(count, now.duration_since(first_at)) {
+            return false;
+        }
+        self.surface_failures = None;
+        tracing::warn!(
+            count,
+            reason = what,
+            "surface が継続的に失敗しているため device lost 相当として作り直す"
+        );
+        self.lost.store(true, Ordering::Release);
+        true
     }
 }
 
@@ -256,6 +338,10 @@ pub struct Renderer<W: WindowBackend + Send + Sync + 'static> {
     /// 直近に確定した surface format。 GPU 消失中でも caller が pipeline format を
     /// 問い合わせられるようここに写す (再生成でも同じ adapter/surface なら同値)。
     surface_format: wgpu::TextureFormat,
+    /// surface 失敗を device lost 相当へ昇格させた回数 ([`MAX_SURFACE_ESCALATIONS`] 上限)。
+    /// **`recreate` をまたいで保持**し、 成功フレームで 0 に戻す
+    /// (= 作り直しても直らない状況で 2 秒周期の再生成ループに陥らないため)。
+    surface_escalations: u32,
     /// 現在の物理ピクセルサイズ。
     size: PhysicalSize,
     /// Window の所有権 (Surface 再生成に必要なので保持)。
@@ -286,6 +372,7 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
             fonts: FontAssets::new(),
             next_texture_id: 0,
             surface_format,
+            surface_escalations: 0,
             size,
             window,
         })
@@ -600,58 +687,86 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         ))
     }
 
-    /// Scene を 1 フレームとして描画。
+    /// surface 由来の失敗を記録し、 返すべきエラーを決める。
     ///
-    /// # Errors
-    /// - [`RenderError::DeviceLost`]: GPU が失われた。 caller は [`Self::recreate`] を呼び、
-    ///   自前の `TextureHandle` キャッシュを破棄して再アップロードすること。
-    /// - [`RenderError::SurfaceTransient`]: surface だけの一時障害 (次フレームで再試行)。
-    /// - [`RenderError::Validation`]: 本物の validation error (= バグ)。
-    #[allow(clippy::too_many_lines)]
-    pub fn render(&mut self, scene: &Scene) -> Result<(), RenderError> {
-        let size = self.size;
-        let fonts = &mut self.fonts;
-        let Some(gpu) = (match self.gpu.as_mut() {
-            Some(g) if !g.is_lost() => Some(g),
-            _ => None,
-        }) else {
+    /// 連続失敗が [`surface_failure_escalates`] の閾値を超えたら **device lost 相当**に
+    /// 昇格させて `DeviceLost` を返す (caller の復旧経路が `recreate` する)。
+    /// ただし 1 エピソードあたり [`MAX_SURFACE_ESCALATIONS`] 回まで。
+    fn surface_failure(&mut self, what: &'static str, transient: RenderError) -> RenderError {
+        if self.surface_escalations >= MAX_SURFACE_ESCALATIONS {
+            return transient;
+        }
+        let Some(gpu) = self.gpu.as_mut() else {
+            return RenderError::DeviceLost;
+        };
+        if !gpu.note_surface_failure(what) {
+            return transient;
+        }
+        self.surface_escalations = self.surface_escalations.saturating_add(1);
+        if self.surface_escalations >= MAX_SURFACE_ESCALATIONS {
+            tracing::error!(
+                attempts = self.surface_escalations,
+                "surface を作り直しても描画が回復しない (以後は自動再生成を止める)"
+            );
+        }
+        RenderError::DeviceLost
+    }
+
+    /// 1 フレーム分の surface texture を取得する。
+    ///
+    /// - `Ok(Some((frame, reconfigure_after_present)))`: 描ける。
+    /// - `Ok(None)`: このフレームはスキップ (最小化 / 一時的な acquire timeout)。
+    /// - `Err(..)`: 描けない。 `DeviceLost` なら caller は [`Self::recreate`] へ。
+    fn acquire_frame(&mut self) -> Result<Option<(wgpu::SurfaceTexture, bool)>, RenderError> {
+        let Some(gpu) = self.gpu.as_mut() else {
             return Err(RenderError::DeviceLost);
         };
-
-        // M14 Phase 93 (daw_01 #063): 直前フレームに composite された target を解放 (in-use 解除 +
-        // idle evict)。 **render の冒頭**で呼ぶことで、 surface 取得失敗 (Timeout / Occluded の
-        // frame-skip / device lost) で早期 return しても pool が in-use のまま膨らむ leak を
-        // 防ぐ。 ここで in-use を解除しても、 この frame で sample される composite target は handle
-        // 経由で texture_store から引かれる (= destroy されない限り valid)、 かつ end_cycle は
-        // idle>閾値 の **未使用** target しか destroy しないので base pass の sampling は壊れない。
-        gpu.composite_pool.end_cycle(&mut gpu.texture_store);
-
-        // 1. サーフェステクスチャ取得 (wgpu 29 は CurrentSurfaceTexture enum を返す)。
-        //
-        //    device lost は wgpu のエラーシンクで握り潰されて `Validation` として現れる
-        //    (module doc 参照) ので、 **`lost` フラグを見て振り分ける** のが唯一の正しい判別。
-        //    `Suboptimal` は描いたあとに再 configure する (wgpu doc の推奨)。
-        let mut reconfigure_after_present = false;
-        let frame = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
+        // device lost は wgpu のエラーシンクで握り潰されて `Validation` として現れる
+        // (module doc 参照) ので、 **`lost` フラグを見て振り分ける** のが第一の判別。
+        // フラグが立たないまま surface だけ壊れる経路もあるので、 その場合は
+        // 連続失敗を数えて `surface_failure` が device lost 相当へ昇格させる。
+        // `Suboptimal` は描いたあとに再 configure する (wgpu doc の推奨)。
+        match gpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => {
+                gpu.consecutive_timeouts = 0;
+                gpu.surface_failures = None;
+                self.surface_escalations = 0;
+                Ok(Some((t, false)))
+            }
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                reconfigure_after_present = true;
-                t
+                gpu.consecutive_timeouts = 0;
+                gpu.surface_failures = None;
+                self.surface_escalations = 0;
+                Ok(Some((t, true)))
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 gpu.surface.configure(&gpu.device, &gpu.config);
                 match gpu.surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(t)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                    _ if gpu.is_lost() => return Err(RenderError::DeviceLost),
-                    _ => return Err(RenderError::SurfaceTransient("reconfigure 後も取得不可")),
+                    wgpu::CurrentSurfaceTexture::Success(t) => {
+                        gpu.consecutive_timeouts = 0;
+                        gpu.surface_failures = None;
+                        self.surface_escalations = 0;
+                        Ok(Some((t, false)))
+                    }
+                    wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                        gpu.consecutive_timeouts = 0;
+                        gpu.surface_failures = None;
+                        self.surface_escalations = 0;
+                        Ok(Some((t, true)))
+                    }
+                    _ if gpu.is_lost() => Err(RenderError::DeviceLost),
+                    _ => Err(self.surface_failure(
+                        RECONFIGURE_FAILED,
+                        RenderError::SurfaceTransient(RECONFIGURE_FAILED),
+                    )),
                 }
             }
             wgpu::CurrentSurfaceTexture::Occluded => {
                 // 最小化 / 他ウィンドウの背後。 wgpu の doc どおり **正常な状態** なので
                 // 障害として扱わない (カウントもしない = 復帰後に誤って昇格させない)。
                 gpu.consecutive_timeouts = 0;
-                return Ok(());
+                gpu.surface_failures = None;
+                Ok(None)
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
                 // acquire がタイムアウトした = 異常。 **無言でスキップし続けない**よう
@@ -672,23 +787,65 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
                         if gpu.is_lost() {
                             return Err(RenderError::DeviceLost);
                         }
-                        return Err(RenderError::SurfaceTransient(
-                            "surface acquire timeout が 60 フレーム連続",
+                        return Err(self.surface_failure(
+                            TIMEOUT_STREAK,
+                            RenderError::SurfaceTransient(TIMEOUT_STREAK),
                         ));
                     }
                 }
-                return Ok(());
+                Ok(None)
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 if gpu.is_lost() {
                     return Err(RenderError::DeviceLost);
                 }
-                return Err(RenderError::Validation(
-                    "Surface::get_current_texture validation error".to_string(),
-                ));
+                // **ここが r.md #42 の再発点**。 `configure` が device 由来でない理由で
+                // 失敗すると presentation が None のまま残り、 以後 `NotConfigured` が
+                // 永久に `Validation` として返り続ける (device は valid なので `lost` は
+                // 立たない)。 連続失敗を数えて device lost 相当へ昇格させ、 Instance ごと
+                // 作り直す ([`surface_failure_escalates`] の doc 参照)。
+                Err(self.surface_failure(
+                    SURFACE_VALIDATION,
+                    RenderError::Validation(SURFACE_VALIDATION.to_string()),
+                ))
             }
+        }
+    }
+
+    /// Scene を 1 フレームとして描画。
+    ///
+    /// # Errors
+    /// - [`RenderError::DeviceLost`]: GPU が失われた (または surface が継続的に壊れていて
+    ///   作り直しが必要)。 caller は [`Self::recreate`] を呼び、 自前の `TextureHandle`
+    ///   キャッシュを破棄して再アップロードすること。
+    /// - [`RenderError::SurfaceTransient`]: surface だけの一時障害 (次フレームで再試行)。
+    /// - [`RenderError::Validation`]: 本物の validation error (= バグ)。
+    #[allow(clippy::too_many_lines)]
+    pub fn render(&mut self, scene: &Scene) -> Result<(), RenderError> {
+        let size = self.size;
+        if !self.is_live() {
+            return Err(RenderError::DeviceLost);
+        }
+
+        // M14 Phase 93 (daw_01 #063): 直前フレームに composite された target を解放 (in-use 解除 +
+        // idle evict)。 **render の冒頭**で呼ぶことで、 surface 取得失敗 (Timeout / Occluded の
+        // frame-skip / device lost) で早期 return しても pool が in-use のまま膨らむ leak を
+        // 防ぐ。 ここで in-use を解除しても、 この frame で sample される composite target は handle
+        // 経由で texture_store から引かれる (= destroy されない限り valid)、 かつ end_cycle は
+        // idle>閾値 の **未使用** target しか destroy しないので base pass の sampling は壊れない。
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.composite_pool.end_cycle(&mut gpu.texture_store);
+        }
+
+        // 1. サーフェステクスチャ取得 (wgpu 29 は CurrentSurfaceTexture enum を返す)。
+        let Some((frame, reconfigure_after_present)) = self.acquire_frame()? else {
+            return Ok(()); // フレームスキップ (最小化 / 一時的な timeout)
         };
-        gpu.consecutive_timeouts = 0;
+
+        let fonts = &mut self.fonts;
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Err(RenderError::DeviceLost);
+        };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // 2. begin_frame: 各 pipeline の scratch / pool を reset
@@ -930,6 +1087,35 @@ mod tests {
         assert_eq!(timeout_action(TIMEOUT_ESCALATE_AT - 1), TimeoutAction::Continue);
         assert_eq!(timeout_action(TIMEOUT_ESCALATE_AT), TimeoutAction::Escalate);
         assert_eq!(timeout_action(u32::MAX), TimeoutAction::Escalate);
+    }
+
+    /// surface 由来の連続失敗を device lost 相当へ昇格させる条件 (r.md #42 レビュー指摘)。
+    ///
+    /// device lost callback が発火しない経路 (`configure` 失敗で presentation が None の
+    /// まま残り、以後 `NotConfigured` が `Validation` として永久に返る) でも復旧が
+    /// 起動するための安全網。回数と経過時間の **両方** を要求する:
+    /// - 回数だけ → 1 フレームの blip で誤発火する
+    /// - 時間だけ → 単発の失敗から 2 秒後に誤発火する
+    #[test]
+    fn surface_failure_escalates_needs_both_count_and_elapsed() {
+        use std::time::Duration;
+        let enough = SURFACE_FAILURE_ESCALATE_AFTER;
+        let count = SURFACE_FAILURE_ESCALATE_COUNT;
+
+        // 回数・時間とも足りて初めて昇格する。
+        assert!(surface_failure_escalates(count, enough));
+        assert!(surface_failure_escalates(count + 10, enough + Duration::from_secs(5)));
+
+        // 回数が足りない (= 一瞬の blip) では昇格しない。
+        assert!(!surface_failure_escalates(count - 1, enough));
+        assert!(!surface_failure_escalates(1, Duration::from_secs(60)));
+
+        // 時間が足りない (= 高フレームレートで一気に数が伸びただけ) では昇格しない。
+        assert!(!surface_failure_escalates(count, enough - Duration::from_millis(1)));
+        assert!(!surface_failure_escalates(1000, Duration::ZERO));
+
+        // モニタ切替 / 解像度変更のような正当な過渡状態 (~1 秒) を巻き込まない。
+        assert!(!surface_failure_escalates(60, Duration::from_secs(1)));
     }
 }
 
