@@ -21,10 +21,11 @@ pub const MAX_EVENTS: usize = common::process_data::MAX_EVENTS;
 /// (`RtBundle::input_delay_replacements`)。
 pub(crate) const INPUT_DELAY_PREALLOC_SAMPLES: usize = 48_000;
 
-/// E5 (r.md #8): 1 track が同時に持てる granular grain-lock-in ring の数 (= track 内
-/// audio event の最大 index)。 これを超える index の event は lock 無し (= 従来の LP
-/// smoothing 挙動) に degrade する。 1 track に数百 clip は実用上稀なので 256 で足りる。
-const MAX_GRANULAR_EVENTS_PER_TRACK: usize = 256;
+/// E5 (r.md #8): 1 track が同時に持てる tape 位置 accumulator の数 (= track 内
+/// audio event の最大 index)。 これを超える index の event は積分無し (= 毎回
+/// `event_local × ratio` で再計算) に degrade する。 1 track に数百 clip は実用上
+/// 稀なので 256 で足りる。
+const MAX_TAPE_EVENTS_PER_TRACK: usize = 256;
 
 #[repr(align(64))]
 pub struct TrackScratch {
@@ -52,18 +53,24 @@ pub struct TrackScratch {
     /// input_delay_per_track[track_idx] + 1` (DelayLine spec requires
     /// capacity ≥ delay + 1).
     pub input_delay_line: DelayLine,
-    /// E5 (r.md #8): track 内 event ごとの granular grain-lock-in ring (添字 = event の
-    /// schedule 順 index)。 `render_audio_events` が Stretch mode の grain offset を trigger 時に
-    /// 固定するのに使い、 tempo 変化での source position 跳び (= click) を防ぐ。 起動時に
-    /// `MAX_GRANULAR_EVENTS_PER_TRACK` ぶん pre-alloc し RT で再確保しない。
-    pub granular_rings: Vec<crate::audio_clip_renderer::GrainLockRing>,
-    /// E5 sibling (r.md #8): Repitch (tape) mode の **連続 source 位置 accumulator** (event 単位、
-    /// 添字 = granular_rings と同じ event index)。 `(last_event_local, accumulated_source_pos)`。
-    /// Repitch は `event_local × ratio` で絶対位置を毎 buffer 再計算していたため tempo automation
-    /// で ratio が変わると位置が跳んで click した (jump 量は event_local に比例 = granular より
-    /// 重症)。 contiguous 再生では ratio を積分 (= 連続)、 seek/schedule 変化 (event_local 不連続)
-    /// では再 anchor して click を防ぐ。 `u64::MAX` = 未初期化。
+    /// E5 (r.md #8): tape (Raw / Repitch) mode の **連続 source 位置 accumulator**
+    /// (event 単位、 添字 = track 内 schedule 順 index)。
+    /// `(last_event_local, accumulated_source_pos)`。 Repitch は `event_local × ratio`
+    /// で絶対位置を毎 buffer 再計算していたため tempo automation で ratio が変わると
+    /// 位置が跳んで click した。 contiguous 再生では ratio を積分 (= 連続)、
+    /// seek/schedule 変化 (event_local 不連続) では再 anchor して click を防ぐ。
+    /// `u64::MAX` = 未初期化。 起動時に `MAX_TAPE_EVENTS_PER_TRACK` ぶん pre-alloc し
+    /// RT で再確保しない。
     pub repitch_accum: Vec<(u64, f64)>,
+    /// r.md #40: この track の stretch engine pool (添字 =
+    /// `RenderedEvent::engine_slot`)。 1 個 ~1 MB なので **確保は off-thread** で行い、
+    /// RT は配送された物を `push` するだけ (`Vec` は容量
+    /// `MAX_STRETCH_ENGINES_PER_TRACK` ぶん予約済なので push で再確保しない =
+    /// 既に走行中のエンジンを触らずに増やせる)。
+    pub stretch_engines: Vec<crate::stretch_engine::StretchEngine>,
+    /// スペクトル経路の per-event 出力バッファ (fade / gain / pan を掛ける前)。
+    pub stretch_out_l: Vec<f32>,
+    pub stretch_out_r: Vec<f32>,
     /// Per-sample volume gain ramp for the buffer about to be processed.
     /// `MAX_FRAMES` long, allocated once at construction and overwritten
     /// in place every buffer by `fill_track_param_ramps`. The fx-chain
@@ -114,8 +121,14 @@ impl TrackScratch {
             // real plugin's reported latency; the refresh path still grows it
             // for the pathological >1 s case (which no real plugin hits).
             input_delay_line: DelayLine::with_capacity(INPUT_DELAY_PREALLOC_SAMPLES),
-            granular_rings: vec![[(u64::MAX, 0); 8]; MAX_GRANULAR_EVENTS_PER_TRACK],
-            repitch_accum: vec![(u64::MAX, 0.0); MAX_GRANULAR_EVENTS_PER_TRACK],
+            repitch_accum: vec![(u64::MAX, 0.0); MAX_TAPE_EVENTS_PER_TRACK],
+            // 実体 (= 高価なエンジン) は off-thread で作って配送される。 ここでは
+            // 容量だけ予約しておき、RT の `push` が再確保しないことを保証する。
+            stretch_engines: Vec::with_capacity(
+                crate::audio_clip_renderer::MAX_STRETCH_ENGINES_PER_TRACK,
+            ),
+            stretch_out_l: vec![0.0; MAX_FRAMES],
+            stretch_out_r: vec![0.0; MAX_FRAMES],
             volume_per_sample: vec![1.0; MAX_FRAMES],
             pan_per_sample: vec![0.0; MAX_FRAMES],
             pre_fader_l: vec![0.0; MAX_FRAMES],

@@ -509,13 +509,63 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ScrubableNumberFormat::Decimal(1),
             &ScrubableNumberStyle {
                 sensitivity: 0.05,
-                range: Some((-96.0, 96.0)),
+                range: Some((
+                    f64::from(-common::model::PITCH_SEMITONES_LIMIT),
+                    f64::from(common::model::PITCH_SEMITONES_LIMIT),
+                )),
                 ..SCRUB_STYLE_INSPECTOR
             },
             InspectorScrubField::Pitch,
             move |t, v| AppEvent::SetClipPitchSemitones { target: t, semitones: v as f32 },
         );
-        y += input_h + 8.0;
+        y += input_h + 4.0;
+
+        // Formant (semitones) — r.md #40。 スペクトル包絡 (= 声質) を音程とは
+        // 独立に動かす。 Stretch では `0` が「原音のフォルマントを保持」 (=
+        // ピッチを動かしても声質が変わらない)、 テープ系では `0` が「素通し」。
+        ui.label_at(
+            "inspector_audio_formant_label",
+            "Formant st",
+            area.x + pad,
+            y + 5.0,
+            11.0,
+            TEXT,
+        );
+        scrub_field(
+            ui,
+            app,
+            "inspector_audio_formant_input",
+            Rect { x: input_x, y, w: input_w, h: input_h },
+            app.inspector_fold(|a, t| a.audio_first_event(t, |e| f64::from(e.formant_semitones))),
+            0.0,
+            ScrubableNumberFormat::Decimal(1),
+            &ScrubableNumberStyle {
+                sensitivity: 0.05,
+                range: Some((
+                    f64::from(-common::model::FORMANT_SEMITONES_LIMIT),
+                    f64::from(common::model::FORMANT_SEMITONES_LIMIT),
+                )),
+                ..SCRUB_STYLE_INSPECTOR
+            },
+            InspectorScrubField::Formant,
+            move |t, v| AppEvent::SetClipFormantSemitones { target: t, semitones: v as f32 },
+        );
+        y += 16.0;
+        // mode で `0` の意味が変わるのでヒントを添える (グレーアウトはしない —
+        // 全 mode で効く設計、 r.md #40 の仕様分岐 2)。
+        ui.label_at(
+            "inspector_audio_formant_hint",
+            if summary.stretch_mode == StretchMode::Stretch {
+                "0 = 移調しても声質を保つ"
+            } else {
+                "0 = 素通し (テープ結果からのずらし量)"
+            },
+            area.x + pad,
+            y,
+            10.0,
+            theme::TEXT_DIM,
+        );
+        y += 14.0;
 
         // ---- Phase 2 PR3: Fade In / Fade Out (length + curve) -------
         // length は text_input (beats、 0..clip_length で clamp)、 curve

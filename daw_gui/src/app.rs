@@ -1674,6 +1674,9 @@ impl AppData {
             AppEvent::SetClipPitchSemitones { target, semitones } => {
                 self.set_clip_audio_event_pitch_semitones(target, semitones);
             }
+            AppEvent::SetClipFormantSemitones { target, semitones } => {
+                self.set_clip_audio_event_formant_semitones(target, semitones);
+            }
             AppEvent::SetClipFadeInBeats { target, beats } => {
                 if self.is_image_clip(target) {
                     self.set_clip_image_event_fade_in_beats(target, beats);

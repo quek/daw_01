@@ -299,6 +299,28 @@ fn render_loop(
         }
     }
 
+    // r.md #40: live 側は off-thread pool を RT へ配送するが、この walk 自体が
+    // off-RT なので自前の `TrackScratch` に直接エンジンを積む (= live と同じ
+    // `render_audio_events` を通す = 不変条件 #6)。 足りないと Stretch clip が
+    // degrade 経路に落ちて書き出しだけ音が変わるので、ここで必ず揃える。
+    {
+        let renderer_g = engine_shared.audio_clip_renderer.load();
+        for (track_idx, &needed) in renderer_g.engines_per_track.iter().enumerate() {
+            let Some(ts) = scratch.get_mut(track_idx) else {
+                break;
+            };
+            while ts.stretch_engines.len() < usize::from(needed)
+                && ts.stretch_engines.len() < ts.stretch_engines.capacity()
+            {
+                let Some(engine) = crate::stretch_engine::StretchEngine::new(sample_rate) else {
+                    tracing::error!(track_idx, "export: stretch engine の確保に失敗 (OOM?)");
+                    break;
+                };
+                ts.stretch_engines.push(engine);
+            }
+        }
+    }
+
     // Compile the routing schedule once for the whole render — same
     // structure as the live audio thread's cached schedule. PDC compensation
     // (`ApplyDelay`), group buses, SidechainTap and master fx all flow from
@@ -408,7 +430,6 @@ fn render_loop(
             // automation 中の書き出しでノートが欠落 / 二重発音する。
             smoothed_current_bpm_freewheel as f32,
             playhead_beats,
-            smoothed_current_bpm_freewheel,
             &mod_scalars_snapshot,
             master_gain,
         );

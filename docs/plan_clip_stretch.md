@@ -226,13 +226,69 @@ Raw クリップを Shift ドラッグすると `Stretch`（pitch 保持 granula
 mode ごとの合成は render loop が持つ:
 - **Raw**: stride = `read_stride`（tempo/stretch 非追従、ピッチはテープ式 = Ableton Warp-off + Transpose 相当）
 - **Repitch**: stride = `read_stride × tempo追従`（従来どおり）
-- **Stretch**: 配置 = `time_stride × stretch × tempo`、grain 内読み = `read_stride`
-  → **長さを変えずに移調**（granular pitch shift）
+- **Stretch**: r.md #40 でスペクトル方式に置換。 時間写像は beat 領域
+  （`source_sr × 60 / nominal_bpm × stretch_ratio` = tempo 非依存）、移調は半音値を
+  エンジンへ直接渡す → **長さを変えずに移調**し、さらにフォルマントも独立（§7）
 - **Slice**: trigger 写像 = `time_stride × stretch × tempo`、slice 内読み = `read_stride`
   → trigger グリッドは動かず slice の鳴る長さだけ変わる（Ableton Beats mode の Transpose 相当）
 
-回帰テスト: `pitch_scales_in_grain_read_rate_only` / `pitch_shift_keeps_length_in_stretch_mode` /
+回帰テスト: `pitch_shift_keeps_length_in_stretch_mode` / `pitch_shift_moves_the_pitch_in_stretch_mode` /
 `pitch_scales_playback_rate_in_tape_and_slice_modes`。
 
-未実装: `AudioEvent.formant_semitones`（モデルに field だけ有り、DSP も UI も無し）。
-フォルマント保持には位相ボコーダ / PSOLA が要るので別対応。
+## 7. フォルマント (r.md #40) — Stretch のスペクトル化
+
+### 7.1 なぜ granular を捨てたか
+
+固定 hop の granular OLA は、grain の**配置**が長さを、grain 内部の**読み速度**が
+音程を決める。読み速度を変えるとスペクトル全体（倍音列 *と* その包絡 =
+フォルマント）が同率で写るので、「ピッチを上げるとフォルマントも必ず一緒に上がる」
+= チップマンク化はアルゴリズムの定義そのもので、パラメータでは外せない。
+フォルマントを音程から外すには周波数軸で包絡を別に写す必要があり、Stretch の DSP
+ごと差し替えるのが唯一の道だった。
+
+### 7.2 採用エンジン
+
+**Signalsmith Stretch**（MIT、header-only C++）を `signalsmith-sys/vendor/` に
+取り込み、C ABI shim 経由で使う（`signalsmith-sys/VENDOR.md` に由来と更新手順）。
+Qt 6.10 の QMediaPlayer が採用している実装で、`setFormantSemitones(s,
+compensatePitch)` を本体 API に持ち、`process()` が確保をしない（= RT 適合）。
+自前の位相ボコーダ / PSOLA は品質（包絡推定・位相ロックの再発明）で劣り、
+Rubber Band は GPL で不可、オフライン事前ベイクは将来の「時間変化する formant /
+pitch の point 列」を不可能にするので不可。
+
+### 7.3 モード別の意味論
+
+| mode | pitch の効き | `formant = 0` の意味 | `formant = F` |
+|---|---|---|---|
+| Stretch（スペクトル） | 長さを変えずに移調 | **原音のフォルマントを保持** (`compensatePitch=true`) | 原音の包絡を F 半音移動 |
+| Raw / Repitch（テープ） | 速度 = ピッチ | **完全バイパス**（出力が 1 サンプルも変わらない） | テープ結果の包絡をさらに F 半音移動 |
+| Slice | slice 内テープ | 同上 | 同上 |
+
+Stretch だけ「0 = 保持」なのは、スペクトル方式の定義が音程と包絡の分離だから
+（Ableton Complex Pro の Formants=100%、Bitwig Elastique Pro、Cubase VariAudio、
+Melodyne と同じ流儀）。テープ系で「0 = 未処理」なのは Repitch の存在意義が
+テープ挙動そのものだから（Ableton Re-Pitch にフォルマント制御が無いのと同じ理由）。
+範囲は ±48 半音（`common::model::FORMANT_SEMITONES_LIMIT`）。
+
+### 7.4 時間写像を beat 領域へ
+
+スペクトル経路の source 進度は「1 拍あたり消費する source frame 数」
+`source_sr × 60 / nominal_bpm × stretch_ratio` で持つ。この量は **tempo に依らない**
+ので、tempo automation でも source 位置が跳ばず拍にロックしたまま追従する。
+これにより旧実装の grain-trigger lock-in ring（E5）と LP smoothed bpm
+（`GRANULAR_LP_COEF`）は不要になり、両方とも撤去した。
+
+### 7.5 エンジンの所有と RT 契約
+
+- 1 発音 = 1 エンジン。`StretchEngine::new` だけが確保する（内部で white-noise
+  warm-up を回し、C++ 側の `std::vector` 高水位を **off-RT で**確定させる）。
+- 必要数は compile 時に **区間グラフの貪欲彩色**で出す（`assign_engine_slots`）＝
+  track ごとの最大同時発音数。1 個 ~1 MB なので「track 内 event 数」で確保すると破綻する。
+- off-thread の `publish_audio_clip_schedule` が不足分を作って ring で RT へ送り、
+  RT は `TrackScratch::stretch_engines` へ `push` するだけ（容量予約済 = 再確保なし）。
+  **pool → schedule の順**で publish するので、RT が新 schedule を見るときには
+  エンジンが揃っている。pool は grow-only（縮めると走行中の発音まで prime し直しになる）。
+- ストリーム同一性は `stream_key`（安定 clip id + audio event id）と「次に出る
+  `event_local`」で判定。ズレたら `sms_output_seek` でパイプラインを詰め直す。
+  素材は全部メモリ上にあるので、出力位置より `input_latency + output_latency` ぶん
+  先の入力を先読みして食わせられる = **実効レイテンシ 0**。

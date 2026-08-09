@@ -15,8 +15,9 @@
 //!   捨てていたため inspector のピッチが無反応になっていた
 //!
 //! どれも RT path で呼ばれることを想定し allocation / panic free。
-//! `Stretch` / `Slice` の time-stretch 本体は daw_audio
-//! `audio_clip_renderer.rs` の `granular_sample_at` / `slice_sample_at` が担う。
+//! `Stretch` の time-stretch 本体は daw_audio `stretch_engine.rs`
+//! (スペクトル方式、 pitch / formant を直交して持つ)、 `Slice` は
+//! `audio_clip_renderer.rs` の `slice_sample_at` が担う。
 
 use crate::model::{BeatMarker, FadeCurve, StretchMode};
 
@@ -83,8 +84,10 @@ pub fn sample_rate_ratio(source_sample_rate: u32, engine_sample_rate: u32) -> f6
 /// **ピッチ軸**の比: semitone → 再生比 (`2^(n/12)`)。 時間軸とは独立の量で、
 /// mode ごとに合成先が変わる:
 /// - `Raw` / `Repitch` (tape): source を読む速度そのものに掛かる → 長さも変わる
-/// - `Stretch` (granular) / `Slice`: grain / slice の **内部読み出し速度**にだけ
-///   掛かり、 grain / slice の **配置**には掛からない → 長さを変えずに移調する
+/// - `Slice`: slice の **内部読み出し速度**にだけ掛かり、 slice の **配置**には
+///   掛からない → 長さを変えずに移調する
+/// - `Stretch`: スペクトルエンジンが半音値を直接受けるのでこの比は使わない
+///   (時間伸縮・移調・フォルマントを 1 段で担う)
 ///
 /// 非有限 / 極端な入力は ±120 半音 (= ±10 oct) に clamp して比が inf / NaN に
 /// ならないようにする (RT path で使うので panic / alloc なし)。
@@ -139,9 +142,13 @@ pub fn stretch_ratio_for(
 /// `frames < 窓` なら source が clip に収まらず cut された (= ピッチを下げた)。
 /// 退化入力 (0 長 / 0 窓 / bpm 0 / SR 0) は「窓を event 長いっぱいに」 の従来値。
 ///
+/// **`formant_semitones` はここに現れない** — フォルマント (スペクトル包絡の
+/// 移調) は時間写像に一切効かないので、 波形の長さにも位置にも影響しない
+/// (r.md #40)。 将来 formant を足したくなっても、それは仕様の誤解。
+///
 /// **ここの mode 別 `rate` は `daw_audio::audio_clip_renderer::render_audio_events` の
-/// `time_stride` / `read_stride` 合成と同じ方針を、 engine SR に依らない単位
-/// (source frames / beat) で表したもの。 どちらかを変えたら必ず両方を合わせること**
+/// `time_stride` / `src_frames_per_beat` 合成と同じ方針を、 engine SR に依らない
+/// 単位 (source frames / beat) で表したもの。 どちらかを変えたら必ず両方を合わせること**
 /// (GUI は engine SR を知らないので、 出力 frame 基準の render 側と単位を共有できない)。
 pub fn audible_source_span(
     event: &crate::model::AudioEvent,
@@ -191,9 +198,9 @@ pub fn audible_source_span(
 /// よって schedule の再コンパイル (= nominal_bpm が現 song.bpm に更新され、
 /// stretch_ratio も同時に再算出される) を跨いでも追従結果が一致する。
 ///
-/// `current_bpm` は呼び出し側で、 Stretch (granular) は LP smoothed な値 (=
-/// click 抑制、 grain source jump 抑制)、 Repitch / Slice は instant な値 (=
-/// pitch / slice trigger の追随性優先) を渡す。 `nominal_bpm <= 0` は退化入力と
+/// 呼び出すのは Repitch / Slice (instant な `current_bpm`)。 Stretch は
+/// **beat 領域**で写像する (= 1 拍あたりの source frame 数は tempo に依らない)
+/// ので、この関数を通さない。 `nominal_bpm <= 0` は退化入力と
 /// して `stretch_ratio` を素通し (= 追従なし) する defensive。 RT path で呼ばれる
 /// ので alloc / panic free。
 #[inline]

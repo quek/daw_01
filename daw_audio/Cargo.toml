@@ -11,6 +11,7 @@ assert_no_alloc = { workspace = true, optional = true }
 cpal.workspace = true
 hound.workspace = true
 rtrb.workspace = true
+signalsmith-sys = { path = "../signalsmith-sys" }
 tokio.workspace = true
 tracing.workspace = true
 
