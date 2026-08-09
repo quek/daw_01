@@ -25,6 +25,11 @@ fn main() {
         .include("vendor/signalsmith-stretch")
         .file("shim/stretch_shim.cpp");
 
+    // `alloc-count`: C++ 側のヒープ確保を数えられるようにする (RT 検証用)。
+    if std::env::var_os("CARGO_FEATURE_ALLOC_COUNT").is_some() {
+        build.define("DAW01_SMS_COUNT_ALLOCS", None);
+    }
+
     // The vendored headers are third-party; their warnings are noise in our
     // build log and must never fail the build.
     if build.get_compiler().is_like_msvc() {

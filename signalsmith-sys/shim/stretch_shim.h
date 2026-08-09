@@ -37,6 +37,13 @@ void sms_destroy(sms_stretch *s);
 /* Drop all stream state (spectra, overlap-add tail, input history). */
 void sms_reset(sms_stretch *s);
 
+/* Rewind the random source used for phase randomisation (which the engine
+ * only engages above 2x stretch). `sms_output_seek` already does this, so a
+ * stream always starts from the same RNG position regardless of what that
+ * pooled engine processed before — that is what keeps an offline export
+ * identical to what was heard live. */
+void sms_reseed(sms_stretch *s);
+
 /* Latency of the internal pipeline, in samples. See `sms_output_seek`. */
 int sms_input_latency(const sms_stretch *s);
 int sms_output_latency(const sms_stretch *s);
@@ -61,6 +68,23 @@ void sms_output_seek(sms_stretch *s, const float *in_l, const float *in_r, int n
  * time-stretch ratio is `in_n / out_n`. */
 void sms_process(sms_stretch *s, const float *in_l, const float *in_r, int in_n,
                  float *out_l, float *out_r, int out_n);
+
+/* Number of C++ heap allocations made so far **on the calling thread**.
+ *
+ * Only meaningful when built with the `alloc-count` cargo feature (which
+ * defines DAW01_SMS_COUNT_ALLOCS and replaces the global operator new /
+ * delete); otherwise this returns UINT64_MAX to mean "not instrumented".
+ *
+ * This exists because Rust's `#[global_allocator]` hook (assert_no_alloc)
+ * cannot see C++ allocations at all: they go straight to the CRT. Without
+ * it, a vendored-engine regression that reintroduces a realloc inside
+ * process() would leave the RT no-alloc test green.
+ *
+ * Caveat: over-aligned allocations (operator new(size_t, align_val_t)) are
+ * not replaced and therefore not counted. The engine's containers hold
+ * float / std::complex<float> / plain structs, none of which are
+ * over-aligned, so the vectors that can actually grow are all covered. */
+unsigned long long sms_alloc_count(void);
 
 #ifdef __cplusplus
 } /* extern "C" */

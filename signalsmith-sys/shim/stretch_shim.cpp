@@ -7,6 +7,47 @@
 #include <new>
 #include <vector>
 
+#ifdef DAW01_SMS_COUNT_ALLOCS
+#include <cstdlib>
+
+// Replace the global operator new / delete so C++ heap traffic is countable.
+//
+// Rust's `#[global_allocator]` hook (assert_no_alloc) only sees Rust's
+// GlobalAlloc; the vendored engine's std::vector growth goes straight to the
+// CRT and is invisible to it. Without this, an RT regression inside the
+// engine (a resize past the warm-up high-water mark) would leave the
+// no-alloc test green. Compiled in only under the `alloc-count` cargo
+// feature, so production builds are untouched.
+//
+// The replacements only count and forward — behaviour is unchanged. Sized and
+// array forms are provided so the STL's calls land here too; the nothrow and
+// over-aligned forms are left to the library (their defaults call these, resp.
+// use _aligned_malloc, and the engine holds no over-aligned types).
+//
+// The counter is **per thread**: what an RT check cares about is "did anything
+// allocate on the audio thread while it was rendering", and a process-wide
+// counter would also pick up whatever other threads happen to be doing (which
+// makes it useless under a parallel test runner). Plain storage, no atomics —
+// each thread only ever touches its own.
+namespace {
+thread_local unsigned long long g_alloc_count = 0;
+}
+
+void *operator new(std::size_t size) {
+    ++g_alloc_count;
+    void *p = std::malloc(size != 0 ? size : 1);
+    if (p == nullptr) {
+        throw std::bad_alloc();
+    }
+    return p;
+}
+void *operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete[](void *p) noexcept { std::free(p); }
+void operator delete(void *p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
+#endif
+
 namespace {
 
 /// Duck-typed channel accessor pairs the engine template expects
@@ -22,15 +63,68 @@ struct StereoOut {
 
 constexpr int CHANNELS = 2;
 
+/// Seed for every stream start. Any fixed value works; this one is arbitrary.
+constexpr std::uint32_t STREAM_SEED = 0x5EED0040u;
+
+/// Where the next-constructed `ShimRandom` finds its state. The engine holds
+/// its RNG as a *private* member, so the only way to reach it later is to make
+/// the RNG itself point at storage we own — this thread-local hands that
+/// storage over during construction (see `sms_stretch`'s ctor).
+thread_local std::uint32_t *g_rng_slot = nullptr;
+
+/// The engine's random source, supplied as its `RandomEngine` template
+/// parameter, with its state kept **outside** the engine so the shim can
+/// re-seed it at every stream start (`sms_reseed`).
+///
+/// Why this matters: the engine only randomises phases above 2x stretch
+/// (`maxCleanStretch`), and `reset()` / `outputSeek()` do NOT rewind the RNG.
+/// Engines are pooled and reused, so without an explicit re-seed the random
+/// sequence position depends on **how much audio that pool entry happened to
+/// have processed before** — live playback (which keeps its pool for the whole
+/// session and depends on where you started / how many times you looped) would
+/// then not match an offline export (which starts from fresh engines). Same
+/// clip, different phase smear, only reproducible as "the WAV sounds different
+/// from what I heard".
+///
+/// Using our own generator (rather than `std::default_random_engine`) also
+/// makes the output identical across standard-library implementations.
+struct ShimRandom {
+    using result_type = std::uint32_t;
+    std::uint32_t *state;
+
+    explicit ShimRandom(long seed) : state(g_rng_slot) {
+        if (state != nullptr) {
+            // xorshift32 requires non-zero state.
+            *state = static_cast<std::uint32_t>(seed) | 1u;
+        }
+    }
+    static constexpr result_type min() { return 0; }
+    static constexpr result_type max() { return 0xFFFFFFFFu; }
+    result_type operator()() {
+        std::uint32_t x = (state != nullptr) ? *state : STREAM_SEED;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        if (state != nullptr) {
+            *state = x;
+        }
+        return x;
+    }
+};
+
 } // namespace
 
 struct sms_stretch {
-    signalsmith::stretch::SignalsmithStretch<float> engine;
+    // Declared before `engine` so its address is valid when the engine's
+    // constructor (and therefore `ShimRandom`'s) runs.
+    std::uint32_t rng_state;
+    signalsmith::stretch::SignalsmithStretch<float, ShimRandom> engine;
 
-    // Deterministic seed: two engines given the same input must produce the
-    // same output, otherwise offline export would not match live playback.
-    // (`SignalsmithStretch()` seeds from `std::random_device`.)
-    sms_stretch() : engine(/*seed=*/0x5EED'0040L) {}
+    sms_stretch()
+        : rng_state(STREAM_SEED),
+          // The comma expression publishes the RNG storage before the engine's
+          // constructor consumes it.
+          engine((g_rng_slot = &rng_state, static_cast<long>(STREAM_SEED))) {}
 };
 
 namespace {
@@ -118,6 +212,12 @@ void sms_reset(sms_stretch *s) {
     }
 }
 
+void sms_reseed(sms_stretch *s) {
+    if (s) {
+        s->rng_state = STREAM_SEED;
+    }
+}
+
 int sms_input_latency(const sms_stretch *s) {
     return s ? s->engine.inputLatency() : 0;
 }
@@ -146,6 +246,10 @@ void sms_output_seek(sms_stretch *s, const float *in_l, const float *in_r, int n
     if (!s || !in_l || !in_r || n <= 0) {
         return;
     }
+    // Every stream start begins from the same RNG position, so a clip sounds
+    // the same no matter what that pooled engine processed before (live vs
+    // offline export, first play vs after a loop).
+    s->rng_state = STREAM_SEED;
     StereoIn in{{in_l, in_r}};
     s->engine.outputSeek(in, n);
 }
@@ -158,6 +262,14 @@ void sms_process(sms_stretch *s, const float *in_l, const float *in_r, int in_n,
     StereoIn in{{in_l, in_r}};
     StereoOut out{{out_l, out_r}};
     s->engine.process(in, in_n, out, out_n);
+}
+
+unsigned long long sms_alloc_count(void) {
+#ifdef DAW01_SMS_COUNT_ALLOCS
+    return g_alloc_count;
+#else
+    return ~0ULL;
+#endif
 }
 
 } // extern "C"

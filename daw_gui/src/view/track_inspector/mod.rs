@@ -550,7 +550,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             InspectorScrubField::Formant,
             move |t, v| AppEvent::SetClipFormantSemitones { target: t, semitones: v as f32 },
         );
-        y += 16.0;
+        // 他の数値行と同じ送り。 ラベル用の `+= 16.0` を 22px フィールドの後に
+        // 使うと、続くヒント行 (label_at は y を行ボックス上端として扱う) が
+        // フィールド矩形の下端 6px に食い込む。
+        y += input_h + 4.0;
         // mode で `0` の意味が変わるのでヒントを添える (グレーアウトはしない —
         // 全 mode で効く設計、 r.md #40 の仕様分岐 2)。
         ui.label_at(

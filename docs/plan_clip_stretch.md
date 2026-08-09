@@ -288,7 +288,26 @@ Melodyne と同じ流儀）。テープ系で「0 = 未処理」なのは Repitc
   RT は `TrackScratch::stretch_engines` へ `push` するだけ（容量予約済 = 再確保なし）。
   **pool → schedule の順**で publish するので、RT が新 schedule を見るときには
   エンジンが揃っている。pool は grow-only（縮めると走行中の発音まで prime し直しになる）。
-- ストリーム同一性は `stream_key`（安定 clip id + audio event id）と「次に出る
-  `event_local`」で判定。ズレたら `sms_output_seek` でパイプラインを詰め直す。
+- ストリーム同一性は 3 点で判定する: `stream_key`（安定 clip id + audio event id）/
+  「次に出る `event_local`」/ **`u` 座標系そのもの**（`du` と `u_of` の現在地）。
+  3 点目が要るのは、Stretch 経路（`u` = 絶対 source frame）と tape/slice 経路
+  （`u` = event-local sample）で座標系が別物だから。再生中に stretch mode を
+  切り替えると `key` も `el` も連続なのに `cursor_u` だけ旧空間に残り、
+  数秒間フリーズしたドローンになる。ズレたら `sms_output_seek` で詰め直す。
   素材は全部メモリ上にあるので、出力位置より `input_latency + output_latency` ぶん
   先の入力を先読みして食わせられる = **実効レイテンシ 0**。
+- エンジンの引き当ては **`stream_key` による安定マップ**（`acquire_engine`）。
+  貪欲彩色の色番号を pool の位置として使うと、無関係な clip の追加/削除で色が
+  玉突きし、発音中の clip が別エンジンへ移って `sms_output_seek` の内部 `reset`
+  （= OLA テール破棄 = クリック）が起きる（アーキ不変条件 #1）。彩色は
+  **必要数の計画にだけ**使う（`count_engines_per_track`）。
+- 乱数位置は発音の頭で必ず巻き戻す（`sms_reseed`）。これが無いと pool の使用履歴で
+  位相スメアが変わり、live と export が食い違う（`signalsmith-sys/VENDOR.md`）。
+
+### 7.6 RT 無確保の機械検査
+
+`make test-rt`（= `cargo test -p daw_audio --features rt-assert`）が
+**Rust 側と C++ 側を別々に**検査する。Rust の `#[global_allocator]` フック
+（`assert_no_alloc`）は C++ の確保を一切見られない（CRT へ直行する）ので、
+`signalsmith-sys/alloc-count` が global `operator new` を置換して数える方も要る。
+`make test` から呼ばれるので既定のワークフローに乗る。

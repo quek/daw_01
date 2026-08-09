@@ -70,6 +70,15 @@ const PRIME_RATE_CAP: usize = 4;
 const CONTINUITY_SLACK_SAMPLES: u64 = 64;
 
 /// 走行中ストリームの同一性。
+///
+/// `key` と `next_el` だけでは足りない: **`u` 座標系そのものが変わる**ことがある。
+/// Stretch 経路は `du = time_stride` / `u_of = beat × src_frames_per_beat`
+/// (= 絶対 source frame)、tape / slice 経路は `du = 1.0` / `u_of(el) = el`
+/// (= event-local sample) と、同じ発音でも全く別の空間を使う。 再生中に
+/// stretch mode を切り替えたり clip 端をドラッグしたりすると、`key` も `el` も
+/// 連続なのに `cursor_u` だけが旧空間の値のまま残り、`input_needed` が
+/// 「もう十分食わせた」 と判断し続けて **数秒間フリーズしたドローン**になる
+/// (逆向きなら過大な入力を一気に食う早送り破片)。 写像側も一緒に照合する。
 struct Stream {
     /// 発音中の audio event の安定キー。
     key: u64,
@@ -77,6 +86,13 @@ struct Stream {
     next_el: u64,
     /// 次に engine へ食わせる中間サンプルの u 座標 (単位は呼び出し側の `du` 系)。
     cursor_u: f64,
+    /// `next_el` に対応する `u` 座標 (= 写像の現在地)。 次の buffer の
+    /// `u_of(el_start)` と突き合わせて **座標系が変わっていないか**を見る。
+    /// tempo 変化では連続 (beat 領域の絶対量なので)、mode 切替 / clip 長編集では
+    /// 跳ぶ、という区別がこれで付く。
+    out_u: f64,
+    /// 中間サンプル 1 個あたりの `u` 増分。 これが変われば別の座標系。
+    du: f64,
 }
 
 /// 1 発音 (audio event) ぶんのスペクトルエンジン。
@@ -93,6 +109,9 @@ pub struct StretchEngine {
     cur_formant: f32,
     cur_compensate: bool,
     stream: Option<Stream>,
+    /// 「この buffer で既に別の発音に取られた」印 (pool 争奪の解決用)。
+    /// `render_audio_events` が buffer ごとに増やす連番を入れる。
+    claim_stamp: u64,
 }
 
 // SAFETY: `raw` は本 struct が排他所有する C++ オブジェクトへのポインタ。
@@ -143,7 +162,24 @@ impl StretchEngine {
             cur_formant: 0.0,
             cur_compensate: false,
             stream: None,
+            claim_stamp: u64::MAX,
         })
+    }
+
+    /// 走行中ストリームのキー (`None` = 空き)。 pool から **安定キーで**引く
+    /// ための識別子 (= positional slot を使わない、アーキ不変条件 #1)。
+    pub fn stream_key(&self) -> Option<u64> {
+        self.stream.as_ref().map(|s| s.key)
+    }
+
+    /// この buffer で既に別の発音に取られたか。
+    pub fn is_claimed(&self, stamp: u64) -> bool {
+        self.claim_stamp == stamp
+    }
+
+    /// この buffer での使用権を取る。
+    pub fn claim(&mut self, stamp: u64) {
+        self.claim_stamp = stamp;
     }
 
     /// パラメータを差分適用する。値が動かないフレームでは FFI も `pow` も走らない。
@@ -208,7 +244,17 @@ impl StretchEngine {
         self.apply_params(transpose_semitones, formant_semitones, compensate_pitch);
 
         let continuous = self.stream.as_ref().is_some_and(|s| {
-            s.key == key && el_start.abs_diff(s.next_el) <= CONTINUITY_SLACK_SAMPLES
+            // (a) 同じ発音か (b) 出力位置が続きか (c) **写像の座標系が同じか**。
+            // (c) が抜けていると、再生中の stretch mode 切替 / clip 端ドラッグで
+            // `cursor_u` が旧空間のまま残り、フリーズしたドローンになる。
+            s.key == key
+                && el_start.abs_diff(s.next_el) <= CONTINUITY_SLACK_SAMPLES
+                // `du` は同じ入力から決定的に導かれるので、相対誤差で見る。
+                && (s.du - du).abs() <= s.du.abs() * 1e-9
+                // `u_of` は tempo 変化では連続 (beat 領域の絶対量)、mode 切替 /
+                // clip 長編集では跳ぶ。 許容幅は出力 `CONTINUITY_SLACK_SAMPLES`
+                // サンプル相当を `u` 系へ写したもの。
+                && (u_of(el_start) - s.out_u).abs() <= CONTINUITY_SLACK_SAMPLES as f64 * du
         });
         if !continuous {
             self.prime(key, el_start, du, &u_of, &mut fetch);
@@ -264,6 +310,8 @@ impl StretchEngine {
 
         if let Some(stream) = self.stream.as_mut() {
             stream.next_el = el_start.saturating_add(n_out as u64);
+            stream.out_u = u_of(stream.next_el);
+            stream.du = du;
         }
     }
 
@@ -330,6 +378,8 @@ impl StretchEngine {
             key,
             next_el: el_start,
             cursor_u: u0 + n as f64 * du,
+            out_u: u0,
+            du,
         });
     }
 }
@@ -452,33 +502,63 @@ mod tests {
         assert!(e.output_latency > 0, "output latency: {}", e.output_latency);
     }
 
+    /// 決定的な白色雑音 (xorshift32)。 **周期を持たない**ので、相互相関の
+    /// ピーク位置が 1 サンプル分解能で一意に決まる。 純サインだと周期
+    /// (440 Hz @48k = 109.09 sample) の整数倍ずれが相関で区別できず、
+    /// アライメント回帰の 1/3 以上を見逃す。
+    fn noise(n: usize) -> Vec<f32> {
+        let mut rng = 0x1234_5678u32;
+        (0..n)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                (rng as i32) as f32 * 4.656_613e-10 * 0.5
+            })
+            .collect()
+    }
+
     /// `sms_output_seek` の規約 = 「次の process 出力が素材の先頭」。 これが
     /// ずれると clip の頭が遅れて鳴る (= vendored ヘッダ更新時の回帰検出)。
-    /// 素材は 1 秒の 440 Hz サイン。移調も伸縮もしない (= 恒等) 経路で、
-    /// 出力が入力と位相まで揃うことを相関で確認する。
+    ///
+    /// 素材は **白色雑音**。 移調も伸縮もしない (= 恒等) 経路で相互相関を取り、
+    /// **ピーク位置が lag 0 であること**を 1 サンプル分解能で確認する。
+    /// 純サインで「lag 0 が特定の lag より大きい」 を見る形だと、周期の整数倍
+    /// (109 / 218 / 327 … sample) のずれが盲点として残る。
     #[test]
     fn output_seek_aligns_output_to_stream_start() {
         let mut e = StretchEngine::new(SR).expect("engine");
         let n = SR as usize;
-        let src = sine(440.0, n);
+        let src = noise(n);
         let out = render_identity(&mut e, &src, n, 0.0, 0.0, false, 1024);
 
-        // 立ち上がり (最初の 1 block) を含む区間で、遅延 0 の相関が最大になること。
-        let probe = 4096usize;
-        let corr = |lag: usize| -> f64 {
+        // 立ち上がりの過渡を避けつつ十分長い窓で相関を取る。
+        let start = 8_000usize;
+        let probe = 16_000usize;
+        let corr = |lag: i64| -> f64 {
             (0..probe)
-                .map(|i| f64::from(out[i + lag]) * f64::from(src[i]))
+                .map(|i| {
+                    let oi = start as i64 + i as i64 + lag;
+                    let o = usize::try_from(oi).ok().and_then(|k| out.get(k)).copied().unwrap_or(0.0);
+                    f64::from(o) * f64::from(src[start + i])
+                })
                 .sum::<f64>()
         };
-        let zero = corr(0);
-        assert!(zero > 0.0, "恒等経路で出力が素材と逆相関/無音: {zero}");
-        for lag in [64usize, 256, 1024, 4096] {
-            assert!(
-                corr(lag) < zero,
-                "lag {lag} の相関 {} が lag 0 の {zero} 以上 = 出力が遅れている",
-                corr(lag)
-            );
+        // ±3000 sample を 1 サンプル刻みで走査してピーク位置を出す
+        // (現行 preset の代表的なズレ量 interval=1440 / block/2=2880 を覆う)。
+        let mut best = (i64::MIN, f64::NEG_INFINITY);
+        for lag in -3_000i64..=3_000 {
+            let c = corr(lag);
+            if c > best.1 {
+                best = (lag, c);
+            }
         }
+        assert!(best.1 > 0.0, "恒等経路で出力が素材と無相関/無音: {}", best.1);
+        assert!(
+            best.0.abs() <= 4,
+            "相互相関のピークは lag 0 であるべき (= 頭が揃っている)、 got {} sample",
+            best.0
+        );
     }
 
     /// 移調は基本周波数を動かす。+12 半音で 440 Hz → 880 Hz。
@@ -500,8 +580,9 @@ mod tests {
 
     /// **r.md #40 の core**: ピッチを上げても声質 (スペクトル包絡の山) が動かない。
     /// = Ableton Complex Pro の Formants=100% / Cubase VariAudio / Melodyne 流。
-    /// 合成母音 (F0=200 Hz、共振 700/1200 Hz) を +12 半音移調し、
-    /// 「倍音は 2 倍になるが包絡の山は 700 Hz 付近のまま」を測る。
+    /// 合成母音 (F0=200 Hz、共振 `VOWEL_F1_HZ` = 800 Hz / 1600 Hz) を +12 半音
+    /// 移調し、「倍音は 2 倍 (F0 200→400 Hz) になるが包絡の山は 800 Hz 付近の
+    /// まま」を測る。
     #[test]
     fn pitch_shift_preserves_the_spectral_envelope() {
         let n = SR as usize;
@@ -537,7 +618,8 @@ mod tests {
     }
 
     /// フォルマント指定はスペクトル包絡だけを動かし、音程 (倍音の位置) は
-    /// 変えない。+12 半音で山が 700 Hz → 1400 Hz 付近へ、F0 は 200 Hz のまま。
+    /// 変えない。+12 半音で山が `VOWEL_F1_HZ` (800 Hz) → 1600 Hz 付近へ、
+    /// F0 は 200 Hz のまま。
     #[test]
     fn formant_shift_moves_the_envelope_but_not_the_pitch() {
         let n = SR as usize;
@@ -551,8 +633,16 @@ mod tests {
         let dry_peak = envelope_peak_hz(&dry[n / 2..], 200.0);
         let up_peak = envelope_peak_hz(&out[n / 2..], 200.0);
         assert!(
-            up_peak > dry_peak * 1.5,
-            "+12 半音のフォルマントで包絡の山は上がるべき: {dry_peak} Hz → {up_peak} Hz"
+            (dry_peak - VOWEL_F1_HZ).abs() <= 100.0,
+            "素材の包絡の山は {VOWEL_F1_HZ} Hz 付近のはず: {dry_peak}"
+        );
+        // 「上がる向き」 だけでなく **移動量 (= 2 倍)** を Hz で押さえる。
+        // 向きだけの比較 (`> dry * 1.5`) だと、スケーリングが 2^(n/12) から
+        // ずれても倍音格子 200 Hz の粗さに紛れて通ってしまう。
+        let expected = VOWEL_F1_HZ * 2.0;
+        assert!(
+            (up_peak - expected).abs() <= 200.0,
+            "+12 半音のフォルマントで包絡の山は {expected} Hz 付近へ動くべき:              {dry_peak} Hz → {up_peak} Hz"
         );
 
         // 音程は不動: 倍音は 200 Hz の整数倍のまま (非倍音 300 Hz は立たない)。
@@ -562,6 +652,132 @@ mod tests {
         assert!(
             m200 > m300 * 4.0,
             "フォルマントを動かしても倍音格子は 200 Hz 基準のまま: 200={m200} 300={m300}"
+        );
+    }
+
+    /// **live と export が一致する条件**: 使い回されたエンジンでも、発音の頭は
+    /// 常に同じ乱数位置から始まる。
+    ///
+    /// エンジンは 3 倍ストレッチ (= `maxCleanStretch` 2 を超える) で位相を
+    /// ランダム化するが、`reset()` / `outputSeek()` は乱数列を巻き戻さない。
+    /// live の pool はセッション中ずっと生き続け「その枠でそれまで何を処理したか」
+    /// で乱数位置が変わる一方、export は毎回新品のエンジンで頭から歩く。
+    /// 巻き戻しが無いと「聴いた音と書き出した WAV が違う」 になる。
+    #[test]
+    fn reused_engine_starts_each_stream_from_the_same_random_position() {
+        let n = 24_000usize;
+        let src = noise(n);
+        // 3 倍に伸ばす (= 位相ランダム化が作動する領域)。
+        let stretch_u = |el: u64| el as f64 / 3.0;
+
+        let render = |engine: &mut StretchEngine, key: u64| -> Vec<f32> {
+            let block = 512usize;
+            let mut out = Vec::with_capacity(n);
+            let mut el = 0u64;
+            while out.len() < n {
+                let mut l = vec![0.0f32; block];
+                let mut r = vec![0.0f32; block];
+                engine.render(
+                    key,
+                    0.0,
+                    0.0,
+                    false,
+                    el,
+                    1.0,
+                    stretch_u,
+                    |u| {
+                        let i = u as usize;
+                        let v = src.get(i).copied().unwrap_or(0.0);
+                        (v, v)
+                    },
+                    &mut l,
+                    &mut r,
+                );
+                out.extend_from_slice(&l);
+                el += block as u64;
+            }
+            out
+        };
+
+        // (a) 新品のエンジンで 1 回だけ鳴らす (= export 相当)。
+        let mut fresh = StretchEngine::new(SR).expect("engine");
+        let expected = render(&mut fresh, 1);
+
+        // (b) 同じエンジンを別の発音で散々使ってから、同じ発音を鳴らす
+        //     (= live で pool を使い回した状態)。
+        let mut reused = StretchEngine::new(SR).expect("engine");
+        let _ = render(&mut reused, 99);
+        let _ = render(&mut reused, 98);
+        let got = render(&mut reused, 1);
+
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "使い回したエンジンの出力が新品と違う (乱数位置が持ち越されている) \
+                 at {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    /// 再生中に **`u` 座標系が変わる**編集 (stretch mode 切替 / clip 長ドラッグ)
+    /// をしても、フリーズしたドローンにならない。
+    ///
+    /// `key` も出力位置も連続なのに座標系だけが別物になるケース。 継続判定が
+    /// `key` + `next_el` だけだと、旧空間の `cursor_u` が残って
+    /// `input_needed` が 0 を返し続け、エンジンが同じスペクトルを再合成し続ける
+    /// (= 数秒間フリーズしたドローン)。 写像アイデンティティも見ることで
+    /// prime し直され、素材が正しく進む。
+    #[test]
+    fn switching_the_u_space_mid_stream_reprimes_instead_of_freezing() {
+        let mut engine = StretchEngine::new(SR).expect("engine");
+        let n = 48_000usize;
+        // 位置が値に出る素材 (ramp)。出力値 ≒ 読んでいる source 位置 / n。
+        let src: Vec<f32> = (0..n).map(|i| i as f32 / (n - 1) as f32).collect();
+        let fetch_at = |u: f64| -> (f32, f32) {
+            let i = u as usize;
+            let v = src.get(i).copied().unwrap_or(0.0);
+            (v, v)
+        };
+
+        let block = 512usize;
+        let mut out = vec![0.0f32; block];
+        let mut out_r = vec![0.0f32; block];
+
+        // 前半: tape 経路 (du = 1.0、u_of(el) = el) で 40 block 進める。
+        let mut el = 0u64;
+        for _ in 0..40 {
+            engine.render(
+                7, 0.0, 0.0, false, el, 1.0, |e| e as f64, fetch_at, &mut out, &mut out_r,
+            );
+            el += block as u64;
+        }
+        let tape_last = out[block - 1];
+        assert!(tape_last > 0.3, "tape 経路で素材が進んでいる: {tape_last}");
+
+        // 後半: 同じ発音のまま Stretch 経路 (du = 1.0 だが u_of は半分の速さ)
+        // へ切り替える。 el は連続、key も同じ。
+        let stretch_u = |e: u64| e as f64 * 0.5;
+        let mut values = Vec::new();
+        for _ in 0..40 {
+            engine.render(
+                7, 0.0, 0.0, false, el, 1.0, stretch_u, fetch_at, &mut out, &mut out_r,
+            );
+            el += block as u64;
+            values.push(out[block - 1]);
+        }
+
+        // 新座標系の期待値 (= source 位置 el*0.5 / n) に追随していること。
+        let expected = stretch_u(el - 1) / n as f64;
+        let got = f64::from(*values.last().expect("値"));
+        assert!(
+            (got - expected).abs() < 0.08,
+            "座標系切替後は新しい写像で素材を読むべき: expected {expected:.3} got {got:.3}"
+        );
+        // フリーズ (= 同じ値を出し続ける) になっていないこと。
+        let first = f64::from(values[0]);
+        assert!(
+            (got - first).abs() > 0.05,
+            "切替後に出力が動いていない = フリーズしたドローン: {first:.3} → {got:.3}"
         );
     }
 

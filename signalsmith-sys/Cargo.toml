@@ -7,5 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Count C++ heap allocations so the RT no-alloc test can actually see them.
+# Rust の `#[global_allocator]` フック (assert_no_alloc) は Rust の
+# `GlobalAlloc` しか捕まえないので、vendored エンジンの `std::vector` 成長
+# (C++ `operator new` → CRT malloc) は **完全に不可視**。 この feature を
+# 有効にすると shim が global `operator new` / `delete` を置換してカウンタを
+# 回し、`sms_alloc_count()` で読めるようにする。
+# daw_audio の `rt-assert` から有効化される。 通常ビルドには一切入らない。
+alloc-count = []
+
 [build-dependencies]
 cc = "1"

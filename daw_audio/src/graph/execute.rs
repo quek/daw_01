@@ -254,6 +254,7 @@ pub fn process_track_owned(
                 engines: &mut scratch.stretch_engines,
                 event_l: &mut scratch.stretch_out_l,
                 event_r: &mut scratch.stretch_out_r,
+                render_seq: &mut scratch.clip_render_seq,
             },
         );
     }

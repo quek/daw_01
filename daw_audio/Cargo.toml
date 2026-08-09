@@ -22,4 +22,7 @@ windows.workspace = true
 # Debug-only: detects heap allocations in audio worker threads at
 # runtime. Build with `--features rt-assert` to catch RT violations
 # (Vec::push, format!, etc.) before they cause dropouts.
-rt-assert = ["dep:assert_no_alloc"]
+# `signalsmith-sys/alloc-count` も一緒に有効化する: Rust 側の allocator hook は
+# vendored C++ エンジンの確保を見られないので、両方揃って初めて
+# 「RT で誰も確保しない」 を機械検査できる。
+rt-assert = ["dep:assert_no_alloc", "signalsmith-sys/alloc-count"]

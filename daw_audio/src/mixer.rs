@@ -62,8 +62,9 @@ pub struct TrackScratch {
     /// `u64::MAX` = 未初期化。 起動時に `MAX_TAPE_EVENTS_PER_TRACK` ぶん pre-alloc し
     /// RT で再確保しない。
     pub repitch_accum: Vec<(u64, f64)>,
-    /// r.md #40: この track の stretch engine pool (添字 =
-    /// `RenderedEvent::engine_slot`)。 1 個 ~1 MB なので **確保は off-thread** で行い、
+    /// r.md #40: この track の stretch engine pool。 引き当ては位置ではなく
+    /// **`RenderedEvent::stream_key`** で行う (`acquire_engine`)。
+    /// 1 個 ~1 MB なので **確保は off-thread** で行い、
     /// RT は配送された物を `push` するだけ (`Vec` は容量
     /// `MAX_STRETCH_ENGINES_PER_TRACK` ぶん予約済なので push で再確保しない =
     /// 既に走行中のエンジンを触らずに増やせる)。
@@ -71,6 +72,9 @@ pub struct TrackScratch {
     /// スペクトル経路の per-event 出力バッファ (fade / gain / pan を掛ける前)。
     pub stretch_out_l: Vec<f32>,
     pub stretch_out_r: Vec<f32>,
+    /// `render_audio_events` が buffer ごとに増やす連番。 同じ buffer 内で
+    /// 2 つの発音が同じ stretch engine を掴むのを防ぐ (`acquire_engine`)。
+    pub clip_render_seq: u64,
     /// Per-sample volume gain ramp for the buffer about to be processed.
     /// `MAX_FRAMES` long, allocated once at construction and overwritten
     /// in place every buffer by `fill_track_param_ramps`. The fx-chain
@@ -129,6 +133,7 @@ impl TrackScratch {
             ),
             stretch_out_l: vec![0.0; MAX_FRAMES],
             stretch_out_r: vec![0.0; MAX_FRAMES],
+            clip_render_seq: 0,
             volume_per_sample: vec![1.0; MAX_FRAMES],
             pan_per_sample: vec![0.0; MAX_FRAMES],
             pre_fader_l: vec![0.0; MAX_FRAMES],

@@ -29,6 +29,10 @@ unsafe extern "C" {
     pub fn sms_create(sample_rate: f32) -> *mut SmsStretch;
     pub fn sms_destroy(s: *mut SmsStretch);
     pub fn sms_reset(s: *mut SmsStretch);
+    /// 位相ランダム化用の乱数列を巻き戻す。 `sms_output_seek` が内部で呼ぶので
+    /// 通常は不要。 pool 再利用でも live / export でも発音の頭が同じ乱数位置から
+    /// 始まることを保証する。
+    pub fn sms_reseed(s: *mut SmsStretch);
     pub fn sms_input_latency(s: *const SmsStretch) -> i32;
     pub fn sms_output_latency(s: *const SmsStretch) -> i32;
     /// `tonality_limit` is a frequency **relative to the sample rate**
@@ -50,4 +54,12 @@ unsafe extern "C" {
         out_r: *mut f32,
         out_n: i32,
     );
+    /// C++ 側のヒープ確保回数 (**呼び出しスレッド**単位)。 `alloc-count`
+    /// feature でビルドしたときだけ意味を持ち、無効なら `u64::MAX` (= 未計装)。
+    /// RT 検査で見たいのは「audio thread が render 中に確保したか」なので、
+    /// プロセス全体のカウンタでは他スレッドの確保を拾って使い物にならない。
+    ///
+    /// Rust の `#[global_allocator]` フックは **C++ の確保を一切見られない**
+    /// (CRT へ直行するため) ので、RT 無確保の検証にはこちらが要る。
+    pub fn sms_alloc_count() -> u64;
 }

@@ -37,3 +37,18 @@ curl -L -o sl.tar.gz https://codeload.github.com/Signalsmith-Audio/linear/tar.gz
 `daw_audio/src/stretch_engine.rs` の latency 較正テスト
 (`output_seek_aligns_output_to_stream_start`) が、更新でレイテンシ規約が変わって
 いないことを機械検査する。
+
+## shim 側で吸収している 2 点 (vendor は無改変のまま)
+
+- **乱数源**: エンジンは 2 倍超のストレッチで位相をランダム化するが、
+  `randomEngine` は private かつ `reset()` / `outputSeek()` で巻き戻らない。
+  pool でエンジンを使い回すと「その枠でそれまで何を処理したか」で乱数位置が
+  変わり、live と offline export が食い違う。 shim は `RandomEngine`
+  **テンプレート引数**に自前の xorshift32 を渡し、その状態をエンジンの外
+  (`sms_stretch::rng_state`) に置くことで、`sms_output_seek` のたびに巻き戻す。
+  標準ライブラリ実装に依らない再現性も同時に得られる。
+- **確保の可視化**: `alloc-count` feature を有効にすると shim が global
+  `operator new` / `delete` を置換して回数を数え、`sms_alloc_count()` で読める。
+  Rust の `#[global_allocator]` フックは C++ の確保を **一切見られない**ので、
+  これが無いと RT 無確保テストが vendored エンジン側の回帰を素通しする
+  (`make test-rt`)。

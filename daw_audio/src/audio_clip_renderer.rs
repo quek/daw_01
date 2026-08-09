@@ -104,10 +104,12 @@ pub struct RenderedEvent {
     /// アーキ不変条件 #1)。 編集で schedule を組み直しても値が変わらないので、
     /// 無関係な編集で発音中の clip が re-prime されない。
     pub stream_key: u64,
-    /// この event が使う per-track stretch engine の slot (= track 内で beat 区間が
-    /// 重なる event 同士が別 slot になるよう off-RT で貪欲彩色した結果)。
-    /// `None` = エンジン不要 (tape / slice + formant 0) か、pool 上限超過。
-    pub engine_slot: Option<u16>,
+    /// この event はスペクトルエンジンを要るか (compile 時に確定)。
+    /// **どのエンジンを使うかは持たない** — pool は `stream_key` で引く
+    /// (位置インデックスを持たせると、無関係な clip の追加/削除で貪欲彩色の
+    /// 色が玉突きして発音中の clip が別エンジンに移り、`sms_output_seek` の
+    /// 内部 `reset` = OLA テール破棄でプツッと鳴る。 アーキ不変条件 #1)。
+    pub needs_engine: bool,
     /// source の native 長 / event の配置長 の比
     /// (= `native_secs / event_secs`、 nominal bpm 基準)。 `1.0` で「source を
     /// そのまま」 (= trim、 native rate)。 `< 1.0` で event slot の方が長い → source
@@ -367,8 +369,8 @@ pub fn compile_audio_schedule(
                         } else {
                             0x8000_0000 | u32::try_from(event_seq).unwrap_or(0x7fff_ffff)
                         }),
-                    // 彩色は schedule 完成後 (`assign_engine_slots`)。
-                    engine_slot: None,
+                    // 判定は schedule 完成後 (`count_engines_per_track`)。
+                    needs_engine: false,
                     stretch_ratio,
                     nominal_bpm: song.bpm,
                     fade_in_beats: event.fade_in_beats.max(0.0),
@@ -384,7 +386,7 @@ pub fn compile_audio_schedule(
         }
     }
     schedule.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-    let engines_per_track = assign_engine_slots(&mut schedule);
+    let engines_per_track = count_engines_per_track(&mut schedule);
     tracing::info!(
         n_events = schedule.len(),
         n_sources = sources.len(),
@@ -415,46 +417,73 @@ fn needs_stretch_engine(ev: &RenderedEvent) -> bool {
     ev.stretch_mode == StretchMode::Stretch || ev.formant_semitones != 0.0
 }
 
-/// track ごとに「beat 区間が重なる event 同士は別 slot」となるよう engine slot を
-/// 貪欲彩色し、track index → 必要エンジン数を返す。off-RT (compile 時) 専用。
+/// 各 event の `needs_engine` を確定し、track index → **必要エンジン数**
+/// (= 同時に鳴りうる Stretch / formant≠0 event の最大数) を返す。
+/// off-RT (compile 時) 専用。
 ///
-/// 区間グラフの貪欲彩色なので使う色数 = **最大同時発音数** = 最適。 `schedule` は
-/// `start_beat` 昇順である前提 (呼び出し元が sort 済)。 同じ event 集合に対しては
-/// 決定的なので、無関係な編集で slot が入れ替わって re-prime が走ることもない。
-fn assign_engine_slots(schedule: &mut [RenderedEvent]) -> Vec<u16> {
-    // track index → slot ごとの「現在その slot を占有している event の end_beat」。
+/// 数だけを出し、**どの event がどのエンジンを使うかは決めない**。 区間グラフの
+/// 貪欲彩色は「使う色数 = 最大同時発音数」で最適だが、**event 集合が変わると
+/// 既存 event の色も動く** (例: A[0,2)→0, B[4,8)→0 の間に C[3,5) を足すと B が
+/// slot1 へ玉突きする)。 色を永続 pool の位置として使うと、その瞬間に発音中の
+/// clip が別エンジンへ移って再 prime = 内部 `reset` (上流ヘッダ自身が
+/// 「full reset はクリックが出る」 と TODO に明記) になる。 引き当ては RT 側で
+/// `stream_key` で行い、ここは容量計画だけを担う。
+fn count_engines_per_track(schedule: &mut [RenderedEvent]) -> Vec<u16> {
+    // track index → 「現在鳴っている event の end_beat」 の集合 (同時発音数の計測)。
     let mut per_track: HashMap<usize, Vec<f64>> = HashMap::new();
     let mut max_track = 0usize;
     for ev in schedule.iter_mut() {
         max_track = max_track.max(ev.track_idx);
-        if !needs_stretch_engine(ev) {
-            ev.engine_slot = None;
+        ev.needs_engine = needs_stretch_engine(ev);
+        if !ev.needs_engine {
             continue;
         }
-        let slots = per_track.entry(ev.track_idx).or_default();
-        // 既に空いている (= end_beat <= この event の start_beat) 最小 slot を再利用。
-        let slot = match slots.iter().position(|&end| end <= ev.start_beat) {
-            Some(i) => i,
-            None if slots.len() < MAX_STRETCH_ENGINES_PER_TRACK => {
-                slots.push(f64::NEG_INFINITY);
-                slots.len() - 1
-            }
-            // 上限超過: エンジン無しで degrade (下の fallback 経路)。
-            None => {
-                ev.engine_slot = None;
-                continue;
-            }
-        };
-        slots[slot] = ev.end_beat;
-        ev.engine_slot = u16::try_from(slot).ok();
+        let live = per_track.entry(ev.track_idx).or_default();
+        // 既に終わっている枠を再利用 (= 同時発音数を数える貪欲彩色と同型)。
+        match live.iter().position(|&end| end <= ev.start_beat) {
+            Some(i) => live[i] = ev.end_beat,
+            None if live.len() < MAX_STRETCH_ENGINES_PER_TRACK => live.push(ev.end_beat),
+            // 上限超過: RT で引き当てに失敗し、エンジン無しで degrade する。
+            None => {}
+        }
     }
     let mut per_track_counts = vec![0u16; if schedule.is_empty() { 0 } else { max_track + 1 }];
-    for (track, slots) in per_track {
+    for (track, live) in per_track {
         if let Some(slot) = per_track_counts.get_mut(track) {
-            *slot = u16::try_from(slots.len()).unwrap_or(u16::MAX);
+            *slot = u16::try_from(live.len()).unwrap_or(u16::MAX);
         }
     }
     per_track_counts
+}
+
+/// pool から `key` の発音に対応するエンジンを **安定キーで**引き当てる (RT)。
+///
+/// 1. 既にその発音を走らせているエンジン (= 継続。無関係な編集で pool の並びが
+///    変わっても同じ実体に戻るので、発音中に prime し直さない)
+/// 2. 空きエンジン (まだどの発音も持っていない)
+/// 3. この buffer で誰にも取られていないエンジン (= 既に鳴り終わった発音の
+///    使い回し。取られたら旧発音側は次に鳴るとき prime し直す)
+///
+/// `stamp` は buffer ごとの連番で、同じ buffer 内で 2 つの発音が同じエンジンを
+/// 掴むのを防ぐ。 どれも取れなければ `None` (= degrade)。
+/// RT-safe: 線形探索のみ (pool は最大 32)。
+fn acquire_engine(
+    engines: &mut [StretchEngine],
+    key: u64,
+    stamp: u64,
+) -> Option<&mut StretchEngine> {
+    let pick = engines
+        .iter()
+        .position(|e| e.stream_key() == Some(key) && !e.is_claimed(stamp))
+        .or_else(|| {
+            engines
+                .iter()
+                .position(|e| e.stream_key().is_none() && !e.is_claimed(stamp))
+        })
+        .or_else(|| engines.iter().position(|e| !e.is_claimed(stamp)))?;
+    let engine = engines.get_mut(pick)?;
+    engine.claim(stamp);
+    Some(engine)
 }
 
 /// Does `song` reference any file-backed `AudioSource` that `renderer` has not
@@ -506,6 +535,9 @@ pub struct ClipRenderState<'a> {
     /// 掛ける前の素の DSP 出力を受ける。
     pub event_l: &'a mut [f32],
     pub event_r: &'a mut [f32],
+    /// buffer ごとに増える連番。 同じ buffer 内で 2 つの発音が同じエンジンを
+    /// 掴むのを防ぐ (`acquire_engine`)。 実体は `TrackScratch` にある。
+    pub render_seq: &'a mut u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -523,6 +555,9 @@ pub fn render_audio_events(
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
     }
+    // pool 争奪の解決用 (同 buffer 内で 2 発音が同じエンジンを掴まないように)。
+    *state.render_seq = state.render_seq.wrapping_add(1);
+    let render_seq = *state.render_seq;
     let n = frames as usize;
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(current_bpm);
     let buf_end_beats =
@@ -676,10 +711,11 @@ pub fn render_audio_events(
         // 変わらない) か、pool 上限超過 / 配送待ちの degrade。 degrade した Stretch は
         // 下の tape 経路を **ピッチ比なし**の伸縮率で通るので、長さと拍同期は保たれ、
         // 伸縮率 1.0 近傍 (= 大多数) では正しい出力と一致する。
-        let engine = event
-            .engine_slot
-            .map(usize::from)
-            .and_then(|slot| state.engines.get_mut(slot));
+        let engine = if event.needs_engine {
+            acquire_engine(state.engines, event.stream_key, render_seq)
+        } else {
+            None
+        };
 
         if let Some(engine) = engine {
             let out_l = &mut state.event_l[..count];
@@ -1209,9 +1245,6 @@ mod render_tests {
         render_clip_full(ramp_source(source_sr), mode, onsets, semitones, 0.0)
     }
 
-    /// clip 全長を 512 frame ずつ render して L channel を連結する。
-    /// engine pool は `assign_engine_slots` が出した必要数を off-RT で確保する
-    /// (= live の publish 経路 / export の walk と同じ手順)。
     fn render_clip_full(
         buffer: AudioSourceBuffer,
         mode: StretchMode,
@@ -1219,6 +1252,19 @@ mod render_tests {
         semitones: f32,
         formant: f32,
     ) -> Vec<f32> {
+        render_clip_stereo(buffer, mode, onsets, semitones, formant).0
+    }
+
+    /// clip 全長を 512 frame ずつ render して **L / R 両方**を返す。
+    /// engine pool は `count_engines_per_track` が出した必要数を off-RT で確保する
+    /// (= live の publish 経路 / export の walk と同じ手順)。
+    fn render_clip_stereo(
+        buffer: AudioSourceBuffer,
+        mode: StretchMode,
+        onsets: Vec<u64>,
+        semitones: f32,
+        formant: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
         let source_sr = buffer.sample_rate;
         let source_frames = buffer.frames;
         let mut schedule = vec![RenderedEvent {
@@ -1236,7 +1282,7 @@ mod render_tests {
             pitch_semitones: semitones,
             formant_semitones: formant,
             stream_key: 1,
-            engine_slot: None,
+            needs_engine: false,
             stretch_ratio: stretch_ratio_for(source_frames, source_sr, LEN_BEATS, BPM),
             nominal_bpm: BPM,
             fade_in_beats: 0.0,
@@ -1248,7 +1294,7 @@ mod render_tests {
             onsets,
             beat_markers: Vec::new(),
         }];
-        let engines_per_track = assign_engine_slots(&mut schedule);
+        let engines_per_track = count_engines_per_track(&mut schedule);
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));
         let renderer = AudioClipRenderer {
@@ -1267,9 +1313,11 @@ mod render_tests {
         let mut accum = vec![(u64::MAX, 0.0f64); 4];
         let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
         let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
-        let mut out = Vec::with_capacity(total);
-        while out.len() < total {
-            let frames = 512.min(total - out.len());
+        let mut render_seq = 0u64;
+        let mut out_l: Vec<f32> = Vec::with_capacity(total);
+        let mut out_r: Vec<f32> = Vec::with_capacity(total);
+        while out_l.len() < total {
+            let frames = 512.min(total - out_l.len());
             let mut l = vec![0.0f32; frames];
             let mut r = vec![0.0f32; frames];
             render_audio_events(
@@ -1277,7 +1325,7 @@ mod render_tests {
                 0,
                 &mut l,
                 &mut r,
-                out.len() as f64 / samples_per_beat,
+                out_l.len() as f64 / samples_per_beat,
                 BPM,
                 ENGINE_SR,
                 frames as u32,
@@ -1286,12 +1334,14 @@ mod render_tests {
                     engines: &mut engines,
                     event_l: &mut event_l,
                     event_r: &mut event_r,
+                    render_seq: &mut render_seq,
                 },
             );
-            out.extend_from_slice(&l);
+            out_l.extend_from_slice(&l);
+            out_r.extend_from_slice(&r);
         }
         // pan 中央 (equal-power × √2) は利得 1.0 に戻る前提を固定する。
-        out
+        (out_l, out_r)
     }
 
     /// Goertzel: `freq` 成分の振幅。
@@ -1305,6 +1355,58 @@ mod render_tests {
             s1 = s0;
         }
         (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt() / x.len() as f64
+    }
+
+    /// 素材の第 1 フォルマント (= 包絡の山) の位置。 `f0` = 200 / 400 の
+    /// どちらの倍音格子にも乗る値なので、移調前後で同じ指標が使える。
+    const VOWEL_F1_HZ: f64 = 800.0;
+
+    /// 共振ピーク 2 本 (`VOWEL_F1_HZ` / 1600 Hz) を持つ合成母音。 倍音の**位置**が
+    /// 音程、倍音の**振幅の山**が声質 (フォルマント) で、この 2 つが独立に動くかを
+    /// render 経路で測るための素材。
+    fn vowel_source(source_sr: u32, f0: f64) -> AudioSourceBuffer {
+        let frames = u64::from(source_sr);
+        let env = |f: f64| -> f64 {
+            1.0 / (1.0 + ((f - VOWEL_F1_HZ) / 110.0).powi(2))
+                + 0.45 / (1.0 + ((f - 1600.0) / 160.0).powi(2))
+                + 0.02
+        };
+        let harmonics: Vec<(f64, f64)> = (1..=30)
+            .map(|k| (f0 * f64::from(k), env(f0 * f64::from(k))))
+            .filter(|(f, _)| *f < f64::from(source_sr) / 2.0 * 0.8)
+            .collect();
+        let norm: f64 = harmonics.iter().map(|(_, a)| a).sum::<f64>().max(1e-9);
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f64 / f64::from(source_sr);
+                let v: f64 = harmonics
+                    .iter()
+                    .map(|(f, a)| a * (std::f64::consts::TAU * f * t).sin())
+                    .sum();
+                (v / norm * 0.8) as f32
+            })
+            .collect();
+        AudioSourceBuffer {
+            sample_rate: source_sr,
+            channels: 1,
+            frames,
+            samples: vec![samples],
+        }
+    }
+
+    /// `f0` の倍音のうち最も強いものの周波数 = スペクトル包絡の山の位置。
+    fn envelope_peak_hz(x: &[f32], f0: f64) -> f64 {
+        let mut best = (0.0f64, 0.0f64);
+        let mut k = 1u32;
+        while (f0 * f64::from(k)) < 4000.0 {
+            let f = f0 * f64::from(k);
+            let m = magnitude_at(x, f);
+            if m > best.1 {
+                best = (f, m);
+            }
+            k += 1;
+        }
+        best.0
     }
 
     /// 最後に音が出ている出力 frame (= source を使い切った位置)。
@@ -1461,7 +1563,7 @@ mod render_tests {
             pitch_semitones: 0.0,
             formant_semitones: formant,
             stream_key: 1,
-            engine_slot: None,
+            needs_engine: false,
             stretch_ratio: 1.0,
             nominal_bpm: BPM,
             fade_in_beats: 0.0,
@@ -1490,45 +1592,87 @@ mod render_tests {
         ];
         for (mode, formant, want) in cases {
             let mut schedule = vec![test_event(mode, formant, 0.0, 4.0)];
-            let per_track = assign_engine_slots(&mut schedule);
-            assert_eq!(
-                schedule[0].engine_slot.is_some(),
-                want,
-                "{mode:?} formant={formant}"
-            );
+            let per_track = count_engines_per_track(&mut schedule);
+            assert_eq!(schedule[0].needs_engine, want, "{mode:?} formant={formant}");
             assert_eq!(per_track.first().copied().unwrap_or(0), u16::from(want));
         }
     }
 
-    /// slot は **重なった event の数**だけ使い、離れた event は使い回す
-    /// (= 区間グラフの貪欲彩色 = 最大同時発音数が必要数)。 これを誤ると
-    /// track あたり数百 MB のエンジンを確保して破綻する。
+    /// pool の必要数は **最大同時発音数**であって event 数ではない。
+    /// これを誤ると track あたり数百 MB のエンジンを確保して破綻する。
     #[test]
-    fn engine_slots_reuse_across_non_overlapping_events() {
+    fn engine_count_is_max_concurrency_not_event_count() {
         let mut schedule = vec![
             test_event(StretchMode::Stretch, 0.0, 0.0, 4.0),
-            // 重なる → 別 slot
+            // 重なる → 同時に 2 個要る
             test_event(StretchMode::Stretch, 0.0, 2.0, 6.0),
-            // 上 2 つが終わってから → slot 0 を再利用
+            // 上 2 つが終わってから → 追加は要らない
             test_event(StretchMode::Stretch, 0.0, 8.0, 12.0),
         ];
-        let per_track = assign_engine_slots(&mut schedule);
-        assert_eq!(schedule[0].engine_slot, Some(0));
-        assert_eq!(schedule[1].engine_slot, Some(1));
-        assert_eq!(schedule[2].engine_slot, Some(0), "非重複は slot 再利用");
+        let per_track = count_engines_per_track(&mut schedule);
+        assert!(schedule.iter().all(|e| e.needs_engine));
         assert_eq!(per_track, vec![2], "同時発音数 = 2 個で足りる");
     }
 
-    /// 上限を超える同時発音は `None` に落ち、エンジン無しで degrade する
-    /// (= 破綻ではなく劣化)。
+    /// 必要数は上限で頭打ちになる (溢れた発音は RT の引き当て失敗で degrade)。
     #[test]
-    fn engine_slots_are_capped_per_track() {
+    fn engine_count_is_capped_per_track() {
         let mut schedule: Vec<RenderedEvent> = (0..MAX_STRETCH_ENGINES_PER_TRACK + 3)
             .map(|i| test_event(StretchMode::Stretch, 0.0, i as f64 * 0.01, 100.0))
             .collect();
-        let per_track = assign_engine_slots(&mut schedule);
+        let per_track = count_engines_per_track(&mut schedule);
         assert_eq!(per_track, vec![MAX_STRETCH_ENGINES_PER_TRACK as u16]);
-        assert!(schedule[MAX_STRETCH_ENGINES_PER_TRACK].engine_slot.is_none());
+    }
+
+    /// **アーキ不変条件 #1**: エンジンの引き当ては位置ではなく安定キー。
+    /// 無関係な clip の追加で pool 内の並びが変わっても、発音中の clip は
+    /// 同じエンジン実体に戻る (= 発音中に prime し直さない)。
+    #[test]
+    fn engine_is_reacquired_by_stable_key_not_position() {
+        let mut engines: Vec<StretchEngine> = (0..3)
+            .map(|_| StretchEngine::new(ENGINE_SR).expect("stretch engine"))
+            .collect();
+        // 3 発音がそれぞれ別エンジンを掴む。
+        for (i, key) in [10u64, 20, 30].iter().enumerate() {
+            let e = acquire_engine(&mut engines, *key, 1).expect("engine");
+            // 走行中ストリームを作るため 1 サンプルだけ回す。
+            let mut l = [0.0f32; 1];
+            let mut r = [0.0f32; 1];
+            e.render(*key, 0.0, 0.0, false, 0, 1.0, |el| el as f64, |_| (0.0, 0.0), &mut l, &mut r);
+            assert_eq!(e.stream_key(), Some(*key), "{i} 番目");
+        }
+        // key 20 のエンジンの実体アドレスを控える。
+        let addr20 = engines
+            .iter()
+            .position(|e| e.stream_key() == Some(20))
+            .expect("key 20 のエンジン");
+        // 次の buffer で順番を入れ替えて引き当てても、同じ実体に戻る。
+        for key in [30u64, 20, 10] {
+            let picked = engines
+                .iter()
+                .position(|e| e.stream_key() == Some(key))
+                .expect("key に対応するエンジン");
+            let e = acquire_engine(&mut engines, key, 2).expect("engine");
+            assert_eq!(e.stream_key(), Some(key));
+            if key == 20 {
+                assert_eq!(picked, addr20, "key 20 は同じエンジン実体に戻る");
+            }
+        }
+    }
+
+    /// pool が足りないときは degrade する (= 他の発音のエンジンを奪って
+    /// 無限に prime し合わない)。 同じ buffer 内で二重取りしないことも固定。
+    #[test]
+    fn engine_acquire_degrades_when_pool_is_exhausted() {
+        let mut engines: Vec<StretchEngine> =
+            vec![StretchEngine::new(ENGINE_SR).expect("stretch engine")];
+        assert!(acquire_engine(&mut engines, 1, 7).is_some());
+        assert!(
+            acquire_engine(&mut engines, 2, 7).is_none(),
+            "同じ buffer で 2 発音が同じエンジンを掴んではいけない"
+        );
+        // buffer が変われば使い回せる。
+        assert!(acquire_engine(&mut engines, 2, 8).is_some());
     }
 
     /// フォルマントは **時間軸に効かない**: tape mode で値を入れても鳴る長さは
@@ -1558,34 +1702,147 @@ mod render_tests {
             (ratio - 1.0).abs() < 0.05,
             "フォルマントは時間軸に効かない (長さ不変) はず、 got {ratio}"
         );
-        let mid_a = &plain[plain.len() / 3..plain.len() * 2 / 3];
-        let mid_b = &shifted[shifted.len() / 3..shifted.len() * 2 / 3];
-        let diff: f64 = mid_a
+        // formant 0 の tape はエンジンを通らない per-sample 経路、formant≠0 は
+        // STFT 経路なので、この 2 つの差は「STFT を通ったか」しか測れない
+        // (= 恒真に近い)。 formant 値そのものが届いているかは、**同じ STFT 経路
+        // どうし** (+12 vs -12) を比べて初めて分かる。
+        let up = render_clip_full(
+            sine_source(48_000, 440.0),
+            StretchMode::Raw,
+            Vec::new(),
+            0.0,
+            12.0,
+        );
+        let down = render_clip_full(
+            sine_source(48_000, 440.0),
+            StretchMode::Raw,
+            Vec::new(),
+            0.0,
+            -12.0,
+        );
+        let mid_up = &up[up.len() / 3..up.len() * 2 / 3];
+        let mid_down = &down[down.len() / 3..down.len() * 2 / 3];
+        let diff: f64 = mid_up
             .iter()
-            .zip(mid_b.iter())
+            .zip(mid_down.iter())
             .map(|(a, b)| f64::from((a - b).abs()))
             .sum::<f64>()
-            / mid_a.len() as f64;
+            / mid_up.len() as f64;
         assert!(
             diff > 1e-3,
-            "tape mode でもフォルマント指定が出力に効くべき (配線確認)、 差 {diff}"
+            "tape mode でも formant_semitones の値が engine に届くべき (配線確認)、 差 {diff}"
         );
         // 音程は動かない (倍音格子は 440 Hz のまま)。
-        let m440 = magnitude_at(mid_b, 440.0);
-        let m880 = magnitude_at(mid_b, 880.0);
+        let m440 = magnitude_at(mid_up, 440.0);
+        let m880 = magnitude_at(mid_up, 880.0);
         assert!(
             m440 > m880 * 4.0,
             "フォルマントを動かしても音程は不動: 440={m440} 880={m880}"
         );
     }
 
-    /// r.md #40 の RT 不変条件の機械検査: スペクトル経路 (prime を含む) が
-    /// audio thread で **確保も解放もしない**。`rt-assert` の allocator hook が
-    /// 要る (`cargo test -p daw_audio --features rt-assert`)。
+    /// **r.md #40 の主契約を render 経路で固定する**: Stretch でピッチを上げても
+    /// スペクトル包絡 (= 声質) の山が動かない。
     ///
-    /// C++ 側は `sms_create` の noise warm-up で内部 `std::vector` の高水位を
-    /// off-RT に追い出してあり、Rust 側 wrapper も scratch を `new` で確保済。
-    /// ここが落ちたらどちらかの前提が崩れている。
+    /// エンジン層のテスト (`crate::stretch_engine`) は `compensate` を
+    /// **テスト自身が渡す**ので、`render_audio_events` 側の配線
+    /// (Stretch は `compensate_pitch = true`) が壊れても素通しになる。
+    /// ここは依頼文そのものを render 経路で押さえる。
+    #[test]
+    fn stretch_pitch_preserves_the_formant_through_the_render_path() {
+        let dry = render_clip_full(
+            vowel_source(48_000, 200.0),
+            StretchMode::Stretch,
+            Vec::new(),
+            0.0,
+            0.0,
+        );
+        let up = render_clip_full(
+            vowel_source(48_000, 200.0),
+            StretchMode::Stretch,
+            Vec::new(),
+            12.0,
+            0.0,
+        );
+        // 過渡を避けて中央付近で測る。
+        let dry_mid = &dry[dry.len() / 3..dry.len() * 2 / 3];
+        let up_mid = &up[up.len() / 3..up.len() * 2 / 3];
+
+        // 音程は 1 オクターブ上がる (F0 200 → 400)。
+        let m200 = magnitude_at(up_mid, 200.0);
+        let m400 = magnitude_at(up_mid, 400.0);
+        assert!(
+            m400 > m200 * 4.0,
+            "Stretch +12 半音で F0 は 400 Hz になるべき: 400={m400} 200={m200}"
+        );
+
+        // 声質 (包絡の山) は動かない。 配線が `compensate_pitch = false` に
+        // 倒れると山も 1 オクターブ上がるので、この assert が落ちる。
+        let dry_peak = envelope_peak_hz(dry_mid, 200.0);
+        let up_peak = envelope_peak_hz(up_mid, 400.0);
+        assert!(
+            (dry_peak - VOWEL_F1_HZ).abs() <= 200.0,
+            "素材の包絡の山は {VOWEL_F1_HZ} Hz 付近のはず: {dry_peak}"
+        );
+        assert!(
+            (up_peak - dry_peak).abs() <= 400.0,
+            "移調しても包絡の山は動かないべき: 移調前 {dry_peak} Hz → 移調後 {up_peak} Hz"
+        );
+    }
+
+    /// ステレオ経路 (`sms_process` の 2ch API、`event_l`/`event_r` scratch、
+    /// pan 段) が L/R を取り違えていないこと。 全テストが mono 素材 + L のみ
+    /// 収集だと、shim の `StereoOut{{out_l, out_l}}` のような取り違えを
+    /// 1 件も検出できない。
+    #[test]
+    fn stereo_channels_are_kept_separate_through_the_spectral_path() {
+        // L = 440 Hz、R = 660 Hz の別内容ステレオ素材。
+        let frames = 48_000u64;
+        let l: Vec<f32> = (0..frames)
+            .map(|i| (std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin() as f32 * 0.5)
+            .collect();
+        let r: Vec<f32> = (0..frames)
+            .map(|i| (std::f64::consts::TAU * 660.0 * i as f64 / 48_000.0).sin() as f32 * 0.5)
+            .collect();
+        let buffer = AudioSourceBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames,
+            samples: vec![l, r],
+        };
+        let (out_l, out_r) =
+            render_clip_stereo(buffer, StretchMode::Stretch, Vec::new(), 0.0, 0.0);
+
+        let mid_l = &out_l[out_l.len() / 3..out_l.len() * 2 / 3];
+        let mid_r = &out_r[out_r.len() / 3..out_r.len() * 2 / 3];
+        let l440 = magnitude_at(mid_l, 440.0);
+        let l660 = magnitude_at(mid_l, 660.0);
+        let r440 = magnitude_at(mid_r, 440.0);
+        let r660 = magnitude_at(mid_r, 660.0);
+        assert!(
+            l440 > l660 * 4.0,
+            "L は 440 Hz のまま: 440={l440} 660={l660}"
+        );
+        assert!(
+            r660 > r440 * 4.0,
+            "R は 660 Hz のまま: 660={r660} 440={r440}"
+        );
+    }
+
+    /// r.md #40 の RT 不変条件の機械検査: スペクトル経路 (prime を含む) が
+    /// audio thread で **確保も解放もしない**。`make test-rt` で走る
+    /// (`cargo test -p daw_audio --features rt-assert`)。
+    ///
+    /// **Rust 側と C++ 側を別々に検査する**:
+    /// - Rust: `assert_no_alloc` の `#[global_allocator]` フック。
+    /// - C++: `sms_alloc_count()` (= `alloc-count` feature が global
+    ///   `operator new` を置換して数える)。 Rust の allocator フックは
+    ///   **C++ の確保を一切見られない** (CRT へ直行するので不可視) ため、
+    ///   これが無いと vendored エンジン側の realloc 回帰を緑のまま素通しする。
+    ///
+    /// 落ちたら: Rust 側なら wrapper に確保が入った、C++ 側なら
+    /// `sms_create` の noise warm-up がカバーしない `resize` が増えた
+    /// (vendor 更新 / preset・block・interval 変更) ということ。
     #[cfg(feature = "rt-assert")]
     #[test]
     fn spectral_render_does_not_allocate_on_the_audio_thread() {
@@ -1606,7 +1863,7 @@ mod render_tests {
             pitch_semitones: 5.0,
             formant_semitones: -3.0,
             stream_key: 1,
-            engine_slot: None,
+            needs_engine: false,
             stretch_ratio: stretch_ratio_for(source_frames, 48_000, LEN_BEATS, BPM),
             nominal_bpm: BPM,
             fade_in_beats: 0.0,
@@ -1618,7 +1875,7 @@ mod render_tests {
             onsets: Vec::new(),
             beat_markers: Vec::new(),
         }];
-        let engines_per_track = assign_engine_slots(&mut schedule);
+        let engines_per_track = count_engines_per_track(&mut schedule);
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));
         let renderer = AudioClipRenderer {
@@ -1636,6 +1893,18 @@ mod render_tests {
         let mut l = vec![0.0f32; 512];
         let mut r = vec![0.0f32; 512];
         let samples_per_beat = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
+
+        let mut render_seq = 0u64;
+
+        // C++ 側の確保カウンタ。 計装されていない (= feature の配線ミス) なら
+        // この検査は無意味なので、まずそれ自体を弾く。
+        // SAFETY: 引数なしのカウンタ読み出し。
+        let cxx_before = unsafe { signalsmith_sys::sms_alloc_count() };
+        assert_ne!(
+            cxx_before,
+            u64::MAX,
+            "signalsmith-sys/alloc-count が有効になっていない              (rt-assert から有効化されるはず) — C++ 側の確保を検査できない"
+        );
 
         // 1 回目は prime (= `sms_output_seek`) を含む発音開始、2 回目以降は定常。
         // どちらも RT で走るのでまとめて検査する。
@@ -1655,10 +1924,19 @@ mod render_tests {
                         engines: &mut engines,
                         event_l: &mut event_l,
                         event_r: &mut event_r,
+                        render_seq: &mut render_seq,
                     },
                 );
             }
         });
+
+        // SAFETY: 同上。
+        let cxx_after = unsafe { signalsmith_sys::sms_alloc_count() };
+        assert_eq!(
+            cxx_after, cxx_before,
+            "vendored C++ エンジンが RT で {} 回ヒープ確保した              (warm-up がカバーしない resize が増えている)",
+            cxx_after - cxx_before
+        );
     }
 
     // ---- tape 位置積分 (E5 / r.md #8) --------------------------------------
