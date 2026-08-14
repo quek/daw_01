@@ -19,6 +19,19 @@ use common::model::{
 };
 use daw_ui_core::ScrubableNumberFormat;
 
+/// **pan / balance の数値表記** (`"L50"` / `"C"` / `"R100"`)。 内部値は `-1.0..=1.0`、
+/// 表示は左右それぞれ 0..100 の整数 (参照 DAW の慣習: REAPER `100%L..100%R`、Live `50L`)。
+///
+/// pan の数値が出る経路 (mixer strip の readout / track inspector の Pan 行 / automation
+/// lane header の default 値 / automation point drag の readout) は **すべてこれを共有する**。
+/// 表記を変えるならここ 1 箇所 (SSoT)。
+pub const PAN_FORMAT: ScrubableNumberFormat = ScrubableNumberFormat::SignedLabeled {
+    neg: "L",
+    pos: "R",
+    center: "C",
+    scale: 100.0,
+};
+
 /// `AutomationTarget` 1 つ分の値の人間可読表示記述子。
 #[derive(Clone, Copy, Debug)]
 pub struct AutomationValueDisplay {
@@ -35,22 +48,14 @@ pub struct AutomationValueDisplay {
 }
 
 impl AutomationValueDisplay {
-    /// 表示単位での小数桁数 (drag readout / prefill の文字列整形用)。
-    #[must_use]
-    fn decimals(&self) -> usize {
-        match self.format {
-            ScrubableNumberFormat::Integer => 0,
-            ScrubableNumberFormat::Decimal(n) => n as usize,
-            // automation 値で BarBeat は使わないが、 fallback で 2 桁。
-            ScrubableNumberFormat::BarBeat { .. } => 2,
-        }
-    }
-
-    /// plain 値を **数字のみ** の文字列に (inline 入力欄の初期値 = 単位なし)。
+    /// plain 値を **単位なし** の文字列に (inline 入力欄の初期値 / readout の数値部)。
+    ///
+    /// 文字列化は [`ScrubableNumberFormat::format_value`] に委譲する = `scrubable_number`
+    /// widget が入力欄に描く文字列と **同一の写像** (SSoT)。 Pan のように `SignedLabeled`
+    /// を使う target では `"L50"` / `"C"` のような側ラベル付き表記になる。
     #[must_use]
     pub fn format_number(&self, plain: f64) -> String {
-        let d = (self.to_display)(plain);
-        format!("{:.*}", self.decimals(), d)
+        self.format.format_value((self.to_display)(plain))
     }
 
     /// plain 値を **単位つき** の文字列に (drag 中の現値表示用)。
@@ -64,12 +69,17 @@ impl AutomationValueDisplay {
         }
     }
 
-    /// ユーザー入力文字列を plain 値へ。先頭の数値部分を抽出 → 表示レンジで
-    /// clamp → `from_display`。数値が読めなければ `None` (= 入力を破棄して
-    /// 元値を維持)。
+    /// ユーザー入力文字列を plain 値へ。単位 suffix (`"-6.0 dB"`) を剥がしてから
+    /// **書式自身の parser** ([`ScrubableNumberFormat::parse_value`] = 入力欄と同じ解釈、
+    /// Pan の `"L50"` 等) に渡し、表示レンジで clamp → `from_display`。数値が読めなければ
+    /// `None` (= 入力を破棄して元値を維持)。
+    ///
+    /// parser を 1 本に保つのが要点。「先頭の数値だけ読む」 fallback を併用すると、`scale` を
+    /// 持つ書式 (Pan の `SignedLabeled`) で **土俵が 100 倍ずれる**: `"50%"` は書式 parser が
+    /// 拒否 → fallback が `50` を display 値と解釈 → `clamp(-1, 1)` で `1.0` = R100 に化ける。
     #[must_use]
     pub fn parse_to_plain(&self, s: &str) -> Option<f64> {
-        let display = parse_leading_f64(s)?;
+        let display = self.format.parse_value(&strip_unit_suffix(s, self.unit))?;
         let clamped = display.clamp(self.range.0, self.range.1);
         Some((self.from_display)(clamped))
     }
@@ -82,18 +92,26 @@ impl AutomationValueDisplay {
     }
 }
 
-/// 文字列先頭の浮動小数を読む (単位 suffix "dB" 等を許容)。
-fn parse_leading_f64(s: &str) -> Option<f64> {
+/// 末尾に付いた記述子自身の単位ラベル (`"dB"` / `"°"` / `"BPM"`) を剥がす (ASCII 大文字小文字は
+/// 無視)。 `unit` が空、または付いていなければ trim だけして返す。 これで「単位つきで打ち直す」
+/// を許容しつつ、 parse 本体は書式 1 本に保てる。
+fn strip_unit_suffix<'a>(s: &'a str, unit: &str) -> std::borrow::Cow<'a, str> {
     let t = s.trim();
-    let mut end = 0;
-    for (i, c) in t.char_indices() {
-        if c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E' {
-            end = i + c.len_utf8();
-        } else {
-            break;
-        }
+    if unit.is_empty() || t.len() < unit.len() {
+        return std::borrow::Cow::Borrowed(t);
     }
-    t.get(..end)?.parse().ok()
+    let cut = t.len() - unit.len();
+    // `unit` が非 ASCII ("°") のとき、 byte 差分が char 境界に落ちない入力があり得る
+    // (`split_at` は境界外で panic する)。
+    if !t.is_char_boundary(cut) {
+        return std::borrow::Cow::Borrowed(t);
+    }
+    let (head, tail) = t.split_at(cut);
+    if tail.eq_ignore_ascii_case(unit) {
+        std::borrow::Cow::Owned(head.trim_end().to_string())
+    } else {
+        std::borrow::Cow::Borrowed(t)
+    }
 }
 
 // ---- 変換関数 (fn pointer 用) ----
@@ -160,8 +178,9 @@ pub fn automation_value_display(
     match target {
         T::TrackBuiltin(TrackBuiltinParam::Volume | TrackBuiltinParam::SendGain { .. }) => gain_db,
         T::TrackBuiltin(TrackBuiltinParam::Pan) => AutomationValueDisplay {
+            // 単位は表記自身が持つ (`"L50"`) ので unit ラベルは空。
             unit: "",
-            format: ScrubableNumberFormat::Decimal(2),
+            format: PAN_FORMAT,
             range: (-1.0, 1.0),
             to_display: id,
             from_display: id,
@@ -284,18 +303,42 @@ mod tests {
         // +24 dB は表示レンジ (−60..+6) で +6 にクランプ → 線形 \u{2248} 1.995。
         let plain = d.parse_to_plain("24").unwrap();
         assert!((plain - (d.from_display)(6.0)).abs() < 1e-9);
-        // 単位 suffix つきでも数値先頭を読む。
+        // 単位 suffix は剥がしてから書式 parser に渡す (大文字小文字は無視)。
         assert!(d.parse_to_plain("-6.0 dB").is_some());
+        assert!(d.parse_to_plain("-6.0 db").is_some());
         // 数値でなければ None。
         assert!(d.parse_to_plain("abc").is_none());
     }
 
+    /// parser は書式 1 本 (先頭数値だけ読む fallback を併用しない)。 併用すると `scale` を持つ
+    /// 書式で土俵が 100 倍ずれ、 `"50%"` が R100 に化ける。 読めない入力は値を変えない契約。
     #[test]
-    fn pan_is_identity_two_decimals() {
+    fn parse_does_not_fall_back_to_bare_leading_number() {
+        let pan = automation_value_display(&T::TrackBuiltin(TrackBuiltinParam::Pan), None);
+        assert_eq!(pan.parse_to_plain("50%"), None, "書式が拒否する入力は None (R100 に化けない)");
+        assert_eq!(pan.parse_to_plain("R50%"), None);
+        // 一方、 素の数字は書式自身が表示土俵 (0..100) で受ける。
+        assert!((pan.parse_to_plain("50").unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    /// pan は plain 値 (-1..1) 恒等 + **L/C/R 表記** (r.md #47)。表示・入力の両方向を固定する。
+    #[test]
+    fn pan_is_identity_with_lr_notation() {
         let d = automation_value_display(&T::TrackBuiltin(TrackBuiltinParam::Pan), None);
         assert_eq!(d.range, (-1.0, 1.0));
-        assert_eq!(d.format_number(-0.5), "-0.50");
         assert_eq!((d.from_display)(0.5), 0.5);
+        assert_eq!(d.format_number(-0.5), "L50");
+        assert_eq!(d.format_number(0.0), "C");
+        assert_eq!(d.format_number(1.0), "R100");
+        // 入力は表示と同じ土俵 (WYSIWYG)。ラベルは前後どちらでも、大文字小文字も無視。
+        assert!((d.parse_to_plain("L50").unwrap() + 0.5).abs() < 1e-9);
+        assert!((d.parse_to_plain("50l").unwrap() + 0.5).abs() < 1e-9);
+        assert!(d.parse_to_plain("C").unwrap().abs() < 1e-9);
+        assert!((d.parse_to_plain("r30").unwrap() - 0.3).abs() < 1e-9);
+        // 素の数字も表示土俵 (0..100) で解釈し、表示レンジで clamp。
+        assert!((d.parse_to_plain("-50").unwrap() + 0.5).abs() < 1e-9);
+        assert!((d.parse_to_plain("R500").unwrap() - 1.0).abs() < 1e-9);
+        assert!(d.parse_to_plain("abc").is_none());
     }
 
     #[test]
@@ -324,6 +367,7 @@ mod tests {
     fn format_with_unit_appends_unit() {
         assert_eq!(vol().format_with_unit(1.0), "0.0 dB");
         let pan = automation_value_display(&T::TrackBuiltin(TrackBuiltinParam::Pan), None);
-        assert_eq!(pan.format_with_unit(0.25), "0.25");
+        // pan は表記自身が側を示すので unit suffix は付かない。
+        assert_eq!(pan.format_with_unit(0.25), "R25");
     }
 }

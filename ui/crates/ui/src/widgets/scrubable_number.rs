@@ -51,6 +51,43 @@ pub enum ScrubableNumberFormat {
     /// `"3"` / `"3.1"` / `"3.2.5"` を受ける。 ドメイン非依存にするため拍/小節換算は
     /// `beats_per_bar` 引数で受け取る (UI ライブラリは time signature を知らない)。
     BarBeat { beats_per_bar: f64 },
+    /// **零点対称の符号付き値** を「側のラベル + 絶対量」で表記する (負 → `neg`、
+    /// 正 → `pos`、 零 → `center`)。 pan の `"L50"` / `"C"` / `"R100"`、 balance、
+    /// stereo width、 EQ tilt 等が該当する DAW 慣習表記。
+    ///
+    /// `scale` は「表示する数字 = |値| × scale」 の倍率で、 数字は四捨五入した整数
+    /// (参照 DAW はいずれも整数表示: REAPER `100%L`、 Live `50L`)。 例: pan の内部値が
+    /// `-1.0..=1.0` なら `scale = 100.0` で `-0.5` → `"L50"`。
+    ///
+    /// 入力は表示と同じ土俵で受ける (WYSIWYG): `"L50"` / `"50L"` / `"l 50"` / `"C"` /
+    /// `"R30"` / `"30r"`、 およびラベル無しの素の数字 (`"-50"` → 負側 50 = `-0.5`)。
+    /// ドメイン非依存にするためラベル文字列と倍率は caller が渡す (`BarBeat` と同じ作法。
+    /// UI ライブラリは「左右」 が pan なのか balance なのかを知らない)。
+    SignedLabeled {
+        /// 負側のラベル (pan なら `"L"`)。
+        neg: &'static str,
+        /// 正側のラベル (pan なら `"R"`)。
+        pos: &'static str,
+        /// 零点のラベル (pan なら `"C"`)。
+        center: &'static str,
+        /// 表示数字 = `|値| × scale` の倍率 (pan の `-1..1` → `0..100` なら `100.0`)。
+        scale: f64,
+    },
+}
+
+impl ScrubableNumberFormat {
+    /// 値を書式に従って文字列化する。 **値 ⇄ 文字列 写像の SSoT** で、 widget の表示 /
+    /// text input の prefill / アプリ側の read-only readout がすべてこれを共有する。
+    #[must_use]
+    pub fn format_value(self, value: f64) -> String {
+        format_value(value, self)
+    }
+
+    /// 文字列を書式に従って値へ (失敗で `None`)。 [`Self::format_value`] の逆写像。
+    #[must_use]
+    pub fn parse_value(self, text: &str) -> Option<f64> {
+        parse_value(text, self)
+    }
 }
 
 /// `scrubable_number_at` のスタイル + sensitivity + range。
@@ -237,6 +274,9 @@ fn format_value(value: f64, format: ScrubableNumberFormat) -> String {
             format!("{:.*}", usize::from(n), value)
         }
         ScrubableNumberFormat::BarBeat { beats_per_bar } => format_bar_beat(value, beats_per_bar),
+        ScrubableNumberFormat::SignedLabeled { neg, pos, center, scale } => {
+            format_signed_labeled(value, neg, pos, center, scale)
+        }
     }
 }
 
@@ -247,7 +287,73 @@ fn parse_value(text: &str, format: ScrubableNumberFormat) -> Option<f64> {
         ScrubableNumberFormat::Integer => trimmed.parse::<i64>().ok().map(|v| v as f64),
         ScrubableNumberFormat::Decimal(_) => trimmed.parse::<f64>().ok(),
         ScrubableNumberFormat::BarBeat { beats_per_bar } => parse_bar_beat(trimmed, beats_per_bar),
+        ScrubableNumberFormat::SignedLabeled { neg, pos, center, scale } => {
+            parse_signed_labeled(trimmed, neg, pos, center, scale)
+        }
     }
+}
+
+/// 零点対称の符号付き値 → `"L50"` / `"C"` / `"R100"` 形式。 数字は `|value| × scale` の
+/// 四捨五入整数で、 丸めて 0 になる値 (= 零点の極近傍) は `center` に落とす (= 表示上の
+/// `"L0"` / `"R0"` を作らない)。 非有限値は `center`。
+fn format_signed_labeled(
+    value: f64,
+    neg: &str,
+    pos: &str,
+    center: &str,
+    scale: f64,
+) -> String {
+    if !value.is_finite() {
+        return center.to_string();
+    }
+    let magnitude = (value.abs() * scale).round();
+    if magnitude < 1.0 {
+        return center.to_string();
+    }
+    let label = if value < 0.0 { neg } else { pos };
+    format!("{label}{magnitude:.0}")
+}
+
+/// `"L50"` / `"50L"` / `"l 50"` / `"C"` / `"R30"` / `"30r"` / 素の数字 (`"-50"`) → 値。
+/// 表示と同じ土俵 (= `scale` を掛けた数字) で受け、 `value = ±magnitude / scale` を返す。
+/// ラベルの照合は ASCII 大文字小文字を無視する。
+fn parse_signed_labeled(
+    text: &str,
+    neg: &str,
+    pos: &str,
+    center: &str,
+    scale: f64,
+) -> Option<f64> {
+    if scale == 0.0 || !scale.is_finite() {
+        return None;
+    }
+    let t = text.trim();
+    if t.eq_ignore_ascii_case(center) {
+        return Some(0.0);
+    }
+    // 先頭 / 末尾のどちらに付いたラベルも受ける (`"L50"` と `"50L"`)。
+    let strip = |s: &str, label: &str| -> Option<String> {
+        if label.is_empty() {
+            return None;
+        }
+        let lower = s.to_ascii_lowercase();
+        let l = label.to_ascii_lowercase();
+        lower
+            .strip_prefix(&l)
+            .or_else(|| lower.strip_suffix(&l))
+            .map(|rest| rest.trim().to_string())
+    };
+    let (sign, number) = if let Some(rest) = strip(t, neg) {
+        (-1.0, rest)
+    } else if let Some(rest) = strip(t, pos) {
+        (1.0, rest)
+    } else {
+        // ラベル無しの素の数字は符号込みでそのまま (`"-50"` → 負側 50)。
+        (1.0, t.to_string())
+    };
+    let magnitude: f64 = number.parse().ok()?;
+    let value = sign * magnitude / scale;
+    value.is_finite().then_some(value)
 }
 
 /// beat → 1-based "小節.拍" 文字列。 `beat_to_bar_beat` (common::timing) と同じ式
@@ -600,7 +706,6 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 None => format_value(displayed_value, format),
             };
             // input_hash で cache: 同じ表示値 / 同じ rect / 同じ bg なら再描画 skip。
-            // placeholder の有無 + 内容も fold (= 選択変更で「—」⇔数値が切替わったとき stale 防止)。
             let input_hash = hash_inputs((
                 b"scrubable_number",
                 rect.x.to_bits(),
@@ -611,8 +716,11 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
                 dragging_now,
                 hovered(rect, pointer),
                 style.font_size.to_bits(),
-                show_placeholder.is_some(),
-                show_placeholder.unwrap_or(""),
+                // **描画する文字列そのもの** を fold する。 値だけを hash すると (a) 同 id で
+                // `format` を差し替えたとき cache HIT で旧表記が残り (同値でも `Decimal(2)` の
+                // "-0.50" と `SignedLabeled` の "L50" は別物)、 (b) placeholder ⇔ 数値の切替も
+                // 取りこぼす。 text は両方を包含するので placeholder 用の fold は不要。
+                text.as_str(),
             ));
             let style_copy = *style;
             self.with_widget_node(wid, input_hash, |ui| {
@@ -984,6 +1092,55 @@ mod tests {
         let f = ScrubableNumberFormat::BarBeat { beats_per_bar: 4.0 };
         assert_eq!(parse_value("3.1", f), Some(8.0));
         assert_eq!(format_value(8.0, f), "3.1");
+    }
+
+    /// `SignedLabeled` (pan の `"L50"` / `"C"` / `"R100"`) の表示。 零点へ丸まる値は
+    /// `"L0"` / `"R0"` でなく center ラベルにする。
+    #[test]
+    fn signed_labeled_formats_side_and_center() {
+        let f = pan_format();
+        assert_eq!(f.format_value(-1.0), "L100");
+        assert_eq!(f.format_value(-0.5), "L50");
+        assert_eq!(f.format_value(-0.004), "C"); // |v|*100 = 0.4 → 四捨五入 0 → center
+        assert_eq!(f.format_value(0.0), "C");
+        assert_eq!(f.format_value(0.3), "R30");
+        assert_eq!(f.format_value(1.0), "R100");
+        assert_eq!(f.format_value(f64::NAN), "C");
+    }
+
+    /// `SignedLabeled` の入力: ラベルは前後どちらでも / 大文字小文字無視 / 素の数字は
+    /// **表示と同じ土俵** (scale 側) で解釈。
+    #[test]
+    fn signed_labeled_parses_both_orders_and_bare_numbers() {
+        let f = pan_format();
+        let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+        assert!(close(f.parse_value("L50"), -0.5));
+        assert!(close(f.parse_value("50L"), -0.5));
+        assert!(close(f.parse_value(" l 50 "), -0.5));
+        assert!(close(f.parse_value("C"), 0.0));
+        assert!(close(f.parse_value("c"), 0.0));
+        assert!(close(f.parse_value("R30"), 0.3));
+        assert!(close(f.parse_value("30r"), 0.3));
+        assert!(close(f.parse_value("-50"), -0.5));
+        assert!(close(f.parse_value("0"), 0.0));
+        assert_eq!(f.parse_value("abc"), None);
+        assert_eq!(f.parse_value("L"), None);
+        assert_eq!(f.parse_value(""), None);
+    }
+
+    /// 表示 → 入力の往復で値が戻る (整数表記に丸まる分だけ量子化)。
+    #[test]
+    fn signed_labeled_round_trips() {
+        let f = pan_format();
+        for v in [-1.0_f64, -0.75, -0.5, -0.01, 0.0, 0.01, 0.42, 1.0] {
+            let text = f.format_value(v);
+            let back = f.parse_value(&text).unwrap();
+            assert!((back - v).abs() < 0.005, "{v} → {text} → {back}");
+        }
+    }
+
+    fn pan_format() -> ScrubableNumberFormat {
+        ScrubableNumberFormat::SignedLabeled { neg: "L", pos: "R", center: "C", scale: 100.0 }
     }
 
     /// drag 上方向 (= dy negative) で値が増加、 sensitivity が units_per_pixel として効く。

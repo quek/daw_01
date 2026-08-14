@@ -2,7 +2,10 @@
 //!
 //! - 値範囲: `0.0..=1.0`
 //! - 視覚: 7 時の位置から 5 時の位置まで 300° のスイープ (DAW 標準)
-//! - drag 感度: rect 高さ分のドラッグで 0 → 1 (fader と同じ感覚)
+//! - **値弧の起点は [`KnobStyle::arc_origin`]** で決まる (DAW 標準): unipolar param
+//!   (send level / dry-wet) は 7 時起点、bipolar param (pan / balance) は 12 時起点で
+//!   中央から左右へ伸びる。起点が可動範囲の内側にあるときは起点に目印 (notch) を描く
+//! - drag 感度: **ノブの大きさに依らない定数** ([`KNOB_UNITS_PER_PX`]) = 250px のドラッグで 0 → 1
 //! - hit area: rect 全体 (つまみが小さいので円外部でもドラッグ可とする)
 //! - **DAW 標準挙動** (fader と同じ):
 //!   - ダブルクリックで `default_value` に戻る (~300ms × 5px 以内の 2 回目 press)
@@ -30,6 +33,36 @@ const FINE_DRAG_SCALE: f32 = 0.1;
 /// depth-edit gesture を「実 drag」 と見なす最小移動量 (px、 縦距離)。 これ未満の press→release は
 /// micro-jitter として depth Edit を発火させず `mod_dragging` も立てない (scrubable_number #107 と同義)。
 const DRAG_THRESHOLD_PX: f32 = 4.0;
+/// 可動範囲のスイープ角 (rad) = 300° (7 時 → 5 時)。 残る 60° (5 時 → 6 時 → 7 時) は範囲外で
+/// 弧が届かない (= "切れて見える") DAW 標準の見え方。
+const SWEEP: f32 = 5.0 * PI / 3.0;
+/// 値弧 / track 弧の線幅 (px)。
+const ARC_WIDTH_PX: f32 = 4.0;
+/// 起点 notch の線幅 (px)。 値弧より細く、 指針より細い「パネル刻印」の太さ。
+const NOTCH_WIDTH_PX: f32 = 1.5;
+/// 起点 notch がリング内側へ食い込む長さ (px、 弧の内縁からさらに内側へ)。
+const NOTCH_INNER_PX: f32 = 3.0;
+/// 起点と現在値の差がこれ未満なら値弧を描かない (正規化値の dead band)。 丸め誤差で pan が
+/// センタから 1e-5 ずれただけで「センタなのに片側に 1px の欠片が光る」 のを防ぐ。 DAW 実装の
+/// 慣習値: nih-plug `ParamSlider` は 1e-3、 iced_audio の bipolar 判定は ±0.001。
+const ARC_DEAD_BAND: f32 = 1e-3;
+/// knob の drag 感度 (値/px)。 **ノブの大きさに依らない定数** = 可動域全体を 250px で走る。
+///
+/// 一次情報: x42 robtk `robtk_dial.h` の `d->base_mult *= 0.004; // 250px` (= 25〜40px の dial を
+/// 駆動する実装で、 当 knob の 32px / 18px と同じサイズ帯)。 参考値: Ardour `scale = 0.0025`
+/// (400px)、 VCV Rack `0.001` (1000px)。 **3 実装とも knob の大きさに依らない定数** で駆動する。
+///
+/// 旧実装の `1/rect.h` (= 32px で端から端) は fader からの写しだったが、 fader の式は「thumb が
+/// pointer に追従する」 幾何的必然から来るもので、 drag 軸上に追従対象が無い knob には根拠が無い
+/// (1px = 3.1% 変化では微調整不能で、 px ドメインの detent も成立しない)。
+pub const KNOB_UNITS_PER_PX: f32 = 0.004;
+/// detent (零点吸着) の総 dead travel (px)。 平坦域は target の左右に半分ずつ (片側 16px)。
+///
+/// 一次情報: Ardour `px_deadzone = 42.f * ui_scale` (`ardour_ctrl_base.cc:171`)、 x42 robtk
+/// `px_deadzone = 34.f - n_detents` (= 33px)。 [`KNOB_UNITS_PER_PX`] との比で 32px = 可動域の
+/// 12.8% (robtk 13.2% / Ardour 10.5% と同水準)。 **Ctrl (fine) でも px は同じ** (両実装とも
+/// modifier で deadzone を縮めない) なので、 値ドメインでは自動的に 1/10 になる。
+const DETENT_TOTAL_PX: f64 = 32.0;
 
 /// knob の永続状態 (フレーム間で保持)。
 #[derive(Debug, Default)]
@@ -65,6 +98,106 @@ struct ClickRecord {
     pos: (f32, f32),
 }
 
+/// knob の視覚 + 吸着スタイル。
+///
+/// DAW の knob は param が unipolar (最小値が零点) か bipolar (中央が零点) かで **見かけの零点**
+/// が変わり、 これは色やサイズと同じ「描画の指定」なので widget 引数ではなく style に置く
+/// (scrubable_number / level_meter と同じ作法)。
+///
+/// `arc_origin` (描画) と `detent` (操作) は **独立** に指定する。 Ardour も `ArcToZero`
+/// (弧を default 値起点に) と `Detent` (default 値で粘る) を別フラグにしていて、 例えば unity
+/// gain を既定値とする音量 knob は「弧は左端起点 + unity で粘る」 = `arc_origin: 0.0` +
+/// `detent: true` になる (`gtk2_ardour/monitor_section.cc` の `gain_control` / `dim_control`)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KnobStyle {
+    /// 値弧 (accent) が伸び始める **起点値** (knob と同じ 0..=1 正規化ドメイン)。
+    ///
+    /// - `0.0` = 7 時起点 = unipolar (send level / dry-wet / 音量)。 [`KnobStyle::UNIPOLAR`]
+    /// - `0.5` = 12 時起点 = bipolar (pan / balance / EQ gain)。 [`KnobStyle::BIPOLAR`]
+    ///
+    /// 起点が可動範囲の **内側** (`0.0 < arc_origin < 1.0`) のときは、 零点が中央にあることが
+    /// 一目で分かるよう起点に目印 (notch) を描く (= 物理ノブのパネル刻印、 DAW 標準)。
+    pub arc_origin: f32,
+    /// `true` で **`default_value` に吸着** する (detent): ドラッグが `default_value` を通ると
+    /// そこで一旦張り付き、 [`DETENT_TOTAL_PX`] 分のドラッグを追加で消費するまで
+    /// 離れない。 pan をセンタへ正確に戻す / センタから不意にずれるのを防ぐ DAW 標準挙動。
+    ///
+    /// 吸着先が `arc_origin` ではなく `default_value` なのは Ardour と同じ帰属
+    /// (`_normal = c->internal_to_interface(c->normal())` = param の既定値)。 modulation depth
+    /// の drag には効かない (depth は base と別ドメインで、 Ardour にも対応概念が無い)。
+    pub detent: bool,
+}
+
+impl KnobStyle {
+    /// 片極性: 弧は最小値 (7 時) から伸びる。 吸着なし。 送り量 / dry-wet など。
+    pub const UNIPOLAR: Self = Self { arc_origin: 0.0, detent: false };
+    /// 双極性: 弧は中央 (12 時) から左右へ伸び、 中央に目印が付き、 中央 (= `default_value`)
+    /// に吸着する。 pan / balance など。
+    pub const BIPOLAR: Self = Self { arc_origin: 0.5, detent: true };
+}
+
+/// 零点吸着 (detent) の写像。 ドラッグ座標 (raw) と値の間に「`target` で平らな区間」を挟む
+/// piecewise-linear 写像で、 `plateau` がその区間の幅 (値単位、 target の左右へ半分ずつ)。
+///
+/// Ardour は incremental な motion delta から pixel を食う実装 (`_dead_zone_delta` に蓄積) だが、
+/// 当 knob は **anchor からの絶対 delta** で値を出すので、 同じ体感を **状態を持たない純関数**
+/// で作る (蓄積器が要らず、 mid-drag の再 anchor / release と干渉しない)。 `plateau == 0` で
+/// 恒等写像 (= detent 無効) に退化する。
+#[derive(Debug, Clone, Copy)]
+struct Detent {
+    target: f64,
+    plateau: f64,
+}
+
+impl Detent {
+    /// この gesture の detent 記述。 Ctrl (fine drag) 中は、 同じ **pixel 量** で抜けられるよう
+    /// plateau を感度と同率で縮める (Ardour が `px_deadzone` を pixel 固定にしているのと同義)。
+    fn for_gesture(style: KnobStyle, default_value: f32, ctrl: bool) -> Self {
+        let scale = if ctrl { f64::from(FINE_DRAG_SCALE) } else { 1.0 };
+        Self {
+            target: f64::from(default_value),
+            plateau: if style.detent {
+                DETENT_TOTAL_PX * f64::from(KNOB_UNITS_PER_PX) * scale
+            } else {
+                0.0
+            },
+        }
+    }
+
+    /// 値 → raw ドラッグ座標 ([`Self::value_of`] の逆写像)。 `value_of(raw_of(v)) == v` なので
+    /// **掴んだ瞬間に値が跳ねない**。 ちょうど target 上の値は plateau の中心に置く (= どちら
+    /// 向きにも半幅ぶん粘る = 対称)。
+    fn raw_of(self, value: f64) -> f64 {
+        let half = self.plateau * 0.5;
+        if value < self.target {
+            value - half
+        } else if value > self.target {
+            value + half
+        } else {
+            self.target
+        }
+    }
+
+    /// raw ドラッグ座標 → 値。 `target ± plateau/2` の区間は `target` に張り付き、 外側は
+    /// 平行移動 (傾き 1 のまま) なので連続。
+    fn value_of(self, raw: f64) -> f64 {
+        let half = self.plateau * 0.5;
+        if raw < self.target - half {
+            raw + half
+        } else if raw > self.target + half {
+            raw - half
+        } else {
+            self.target
+        }
+    }
+}
+
+impl Default for KnobStyle {
+    fn default() -> Self {
+        Self::UNIPOLAR
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KnobResponse {
     /// 描画された値 (drag 中は preview、 idle は入力値、 dblclick reset frame は default_value)。
@@ -86,6 +219,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ///
     /// `default_value` は rect のダブルクリック時にリセットされる値 (例: pan の中央 0.5)。
     ///
+    /// `style` は値弧の起点 (= 見かけの零点) を決める。 pan / balance のような bipolar param は
+    /// [`KnobStyle::BIPOLAR`] を渡すと中央 (12 時) から左右へ弧が伸び、 中央に目印が付く。
+    /// send level のような unipolar param は [`KnobStyle::UNIPOLAR`] (= `Default`)。
+    /// **`default_value` とは別物** で、 dblclick の戻り先が中央でも弧の起点は左端でありうる
+    /// (例: unity gain = 0.5 が既定値の送り量 knob は起点 0.0 のまま)。
+    ///
     /// 操作:
     /// - rect 全体をドラッグで値編集 (rect.h 分 = 0→1)
     /// - rect 全体をダブルクリック (~300ms / 5px 以内) で `default_value` に戻る
@@ -106,6 +245,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         rect: Rect,
         value: f32,
         default_value: f32,
+        style: &KnobStyle,
         on_change: F,
         modulation: Option<Modulation<'_, M>>,
     ) -> KnobResponse
@@ -116,6 +256,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let pointer = self.pointer;
         let value = value.clamp(0.0, 1.0);
         let default_value = default_value.clamp(0.0, 1.0);
+        let arc_origin = style.arc_origin.clamp(0.0, 1.0);
 
         // ---- modulation 記述の展開 (None = 完全回帰、 borrow のみ取り出す、 scrubable_number と同形) ----
         let mod_ref = modulation.as_ref();
@@ -125,9 +266,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let depth_mode = mod_edit.is_some();
         let current_depth = mod_edit.map_or(0.0, |e| e.current_depth);
         let depth_range = mod_edit.and_then(|e| e.depth_range);
-        // knob の base drag 感度 = rect.h 分で 0→1 (= 1/h units_per_pixel)。 depth も ModEdit 指定が
-        // 無ければ同じ感度を流用 (knob 値と depth が同じ 0..=1 スパンなので自然)。
-        let base_units_per_px = 1.0 / rect.h.max(1.0);
+        // knob の base drag 感度 = [`KNOB_UNITS_PER_PX`] (= 250px で 0→1、 サイズ非依存)。 depth も
+        // ModEdit 指定が無ければ同じ感度を流用 (knob 値と depth が同じ 0..=1 スパンなので自然)。
+        let base_units_per_px = KNOB_UNITS_PER_PX;
         let depth_units_per_px = mod_edit
             .and_then(|e| e.depth_sensitivity)
             .unwrap_or(base_units_per_px);
@@ -232,7 +373,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             && !anchor.depth_drag
         {
             let d = knob_drag_delta(anchor.pointer_y, py, base_units_per_px, anchor.ctrl);
-            ((anchor.value + d) as f32).clamp(0.0, 1.0)
+            // detent (`KnobStyle::detent`): anchor 値を raw ドラッグ座標へ写してから delta を
+            // 足し、 値へ戻す。 plateau の中は `default_value` に張り付く (pan のセンタ吸着)。
+            // detent 無効なら恒等写像なので旧経路とバイト等価。
+            let detent = Detent::for_gesture(*style, default_value, anchor.ctrl);
+            let raw = detent.raw_of(anchor.value) + d;
+            (detent.value_of(raw) as f32).clamp(0.0, 1.0)
         } else {
             value
         };
@@ -264,11 +410,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             rect.h.to_bits(),
             displayed_value.to_bits(),
             default_value.to_bits(),
+            // 弧の起点 (= 見かけの零点)。 hash に入れないと style 切替が cache に映らない。
+            arc_origin.to_bits(),
             dragging,
             hovered_rect,
         ));
         self.with_widget_node(wid, input_hash, |ui| {
-            draw_knob(ui, rect, displayed_value, dragging, pointer);
+            draw_knob(ui, rect, displayed_value, arc_origin, dragging, pointer);
         });
 
         // ---- modulation overlay (= cache node の外、 毎フレーム描画) ----
@@ -335,6 +483,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         id: impl Hash,
         value: f32,
         default_value: f32,
+        style: &KnobStyle,
         on_change: F,
     ) -> KnobResponse
     where
@@ -348,16 +497,27 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             w: size,
             h: size,
         };
-        let resp = self.knob_at(id, rect, value, default_value, on_change, None);
+        let resp = self.knob_at(id, rect, value, default_value, style, on_change, None);
         self.next_y += size + pad;
         resp
     }
+}
+
+/// 正規化値 (0..=1) → 弧の角度 (rad、 12 時起点・時計回り正)。 value=0 → -150° (7 時)、
+/// value=0.5 → 0° (12 時)、 value=1 → +150° (5 時)。 非有限値は 7 時に丸めて renderer に
+/// NaN 座標を渡さない。 **knob の値 ⇄ 角度写像の SSoT** (本体描画と modulation overlay が共有)。
+fn value_angle(v: f32) -> f32 {
+    if !v.is_finite() {
+        return -0.5 * SWEEP;
+    }
+    (v.clamp(0.0, 1.0) - 0.5) * SWEEP
 }
 
 fn draw_knob<M: ?Sized + 'static>(
     ui: &mut Ui<'_, M>,
     rect: Rect,
     value: f32,
+    arc_origin: f32,
     dragging: bool,
     pointer: crate::input::PointerFrame,
 ) {
@@ -368,8 +528,8 @@ fn draw_knob<M: ?Sized + 'static>(
     let r = (size * 0.5 - 2.0).max(2.0); // 2px の周囲余白
     let circle_rect = Rect { x: cx - r, y: cy - r, w: r * 2.0, h: r * 2.0 };
 
-    // Ableton 流: dark gray の円 + 円周上に cyan の arc。インジケータ線なし。
-    // arc は -150° (7時) から value_angle までを円周 (radius = r) 上に描画。
+    // Ableton 流: dark gray の円 + 円周上に accent の arc。
+    // arc は「起点値の角度」から value_angle までを円周 (radius = r) 上に描画。
     // 下の 60° (5時 → 7時 経由 6時) は 300° sweep 範囲外で arc は届かない (= "切れている")。
     let base = theme::CONTROL;
     let hover_c = theme::CONTROL_HOVER;
@@ -392,62 +552,59 @@ fn draw_knob<M: ?Sized + 'static>(
     });
 
     // 角度: value=0 → -150° (7時)、value=0.5 → 0° (12時)、value=1 → +150° (5時)。
-    let value_angle = (value - 0.5) * (5.0 * PI / 3.0);
-    let start_angle = -150.0_f32 * PI / 180.0;
-    let end_angle = 150.0_f32 * PI / 180.0;
-
-    // 可動範囲の弧を 2 色で描く (300° 全部表示):
-    // - 回転側 (start → value): cyan = 既に動いた範囲
-    // - 非回転側 (value → end): 暗グレー = 残りの可動範囲
-    // 6時付近の 60° (5時 → 7時) は範囲外なので空白 = "弧が切れて見える"。
-    // 角度ステップを 2° に下げて polygon 近似のコーナーアーティファクトを目立たなく。
-    // 300° / 2° = 150 segments per knob、毎フレーム計算でも軽量。
-    let step = 2.0_f32 * PI / 180.0;
+    let val_angle = value_angle(value);
+    let origin_angle = value_angle(arc_origin);
+    let start_angle = value_angle(0.0);
+    let end_angle = value_angle(1.0);
     let arc_radius = r;
     let active_color = theme::ACCENT;
     let inactive_color = theme::INSET_BG;
 
-    let mut active: Vec<LineSegment> = Vec::new();
-    let mut a0 = start_angle;
-    while a0 < value_angle {
-        let a1 = (a0 + step).min(value_angle);
-        active.push(LineSegment {
-            a: [cx + a0.sin() * arc_radius, cy - a0.cos() * arc_radius],
-            b: [cx + a1.sin() * arc_radius, cy - a1.cos() * arc_radius],
-            color: active_color,
-        });
-        a0 = a1;
-    }
-    if !active.is_empty() {
-        ui.push_lines(LineBatch {
-            segments: active.into(),
-            line_width_px: 4.0,
-            clip_rect: None,
-        });
-    }
+    // 1-2. 弧は 2 色で可動範囲 300° を **過不足なく 1 周** 分だけ描く:
+    //   - 値弧 (accent) = 起点値 → 現在値。 unipolar (起点 0.0) では 7 時から伸び、
+    //     bipolar (起点 0.5) では中央 12 時から左右どちらへも伸びる。 起点 == 現在値
+    //     (dead band 内) なら 1 本も描かれない (= pan センタで塗りが消える)。
+    //   - track (暗グレー) = 残りの可動範囲。 値弧が覆う区間は描かない。
+    // 6時付近の 60° (5時 → 7時) は範囲外なので空白 = "弧が切れて見える"。
+    //
+    // Ardour / iced_audio は track を全 span 描いてから値弧を上書きするが、 こちらは弧を
+    // polygon 近似 (2° 刻み) するので、 全 span 重ね描きは segment 数が最悪 2 倍になる
+    // (mixer の strip 数だけ効く)。 同じ見た目を区間分割で得られるなら分割する。
+    let (fill_lo, fill_hi) = if (value - arc_origin).abs() >= ARC_DEAD_BAND {
+        let (lo, hi) = (origin_angle.min(val_angle), origin_angle.max(val_angle));
+        push_arc(ui, cx, cy, arc_radius, lo, hi, active_color, ARC_WIDTH_PX);
+        (lo, hi)
+    } else {
+        // 値弧なし = track が全 span (dead band 内は起点角で 0 幅の切れ目を作らない)。
+        (origin_angle, origin_angle)
+    };
+    push_arc(ui, cx, cy, arc_radius, start_angle, fill_lo, inactive_color, ARC_WIDTH_PX);
+    push_arc(ui, cx, cy, arc_radius, fill_hi, end_angle, inactive_color, ARC_WIDTH_PX);
 
-    let mut inactive: Vec<LineSegment> = Vec::new();
-    let mut a0 = value_angle;
-    while a0 < end_angle {
-        let a1 = (a0 + step).min(end_angle);
-        inactive.push(LineSegment {
-            a: [cx + a0.sin() * arc_radius, cy - a0.cos() * arc_radius],
-            b: [cx + a1.sin() * arc_radius, cy - a1.cos() * arc_radius],
-            color: inactive_color,
-        });
-        a0 = a1;
-    }
-    if !inactive.is_empty() {
+    // 3. 起点 notch: 起点が可動範囲の内側 (= bipolar) のときだけ、 零点の位置を刻印する。
+    //    値弧の**内縁より内側からリング外縁まで**を横切る細線で、 値弧 (2) の上に描く。
+    //    「リング上の点」 として描くと、 センタでは指針に、 振り切った側では値弧の始端に
+    //    必ず覆われて消えるため、 radial に横切る形が唯一「常に見える」 幾何。
+    if arc_origin > 0.0 && arc_origin < 1.0 {
+        let dx = origin_angle.sin();
+        let dy = -origin_angle.cos();
+        let inner = (arc_radius - ARC_WIDTH_PX * 0.5 - NOTCH_INNER_PX).max(1.0);
+        let outer = arc_radius + ARC_WIDTH_PX * 0.5;
         ui.push_lines(LineBatch {
-            segments: inactive.into(),
-            line_width_px: 4.0,
+            segments: vec![LineSegment {
+                a: [cx + dx * inner, cy + dy * inner],
+                b: [cx + dx * outer, cy + dy * outer],
+                color: theme::TEXT_DIM,
+            }]
+            .into(),
+            line_width_px: NOTCH_WIDTH_PX,
             clip_rect: None,
         });
     }
 
     // インジケータ: 中心から外円まで伸びる白い太線。値角度を指す。
-    let dx = value_angle.sin();
-    let dy = -value_angle.cos();
+    let dx = val_angle.sin();
+    let dy = -val_angle.cos();
     let indicator = LineSegment {
         a: [cx, cy],
         b: [cx + dx * r, cy + dy * r],
@@ -535,14 +692,9 @@ fn draw_knob_modulation_overlay<M: ?Sized + 'static>(
     let cx = rect.x + rect.w * 0.5;
     let cy = rect.y + rect.h * 0.5;
     let r = (size * 0.5 - 2.0).max(2.0);
-    let sweep = 5.0_f32 * PI / 3.0; // 300°
-    let angle_of = |v: f64| -> f32 {
-        if !v.is_finite() {
-            return -0.5 * sweep; // 7 時 (= value 0 の角度)
-        }
-        let t = (v as f32).clamp(0.0, 1.0);
-        (t - 0.5) * sweep
-    };
+    // 本体描画と同じ 300° sweep 写像 (SSoT = `value_angle`)。 f64 の非有限も f32 cast 後に
+    // 非有限のまま残るので、 `value_angle` の guard がそのまま効く。
+    let angle_of = |v: f64| -> f32 { value_angle(v as f32) };
     let base_angle = angle_of(f64::from(base_value));
 
     // depth-edit 中の枠強調 (entries / live が無くても出す、 source 色の円周枠)。
@@ -633,6 +785,19 @@ mod tests {
         default_value: f32,
         pointer: PointerFrame,
     ) -> Vec<Edit<PanModel>> {
+        run_frame_styled(host, model, rect, value, default_value, &KnobStyle::default(), pointer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_frame_styled(
+        host: &mut UiHost<PanModel>,
+        model: &PanModel,
+        rect: Rect,
+        value: f32,
+        default_value: f32,
+        style: &KnobStyle,
+        pointer: PointerFrame,
+    ) -> Vec<Edit<PanModel>> {
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 200 };
         host.frame_to_edits(
@@ -641,7 +806,7 @@ mod tests {
             screen,
             FrameInput { pointer, ..Default::default() },
             |_, ui| {
-                ui.knob_at("test", rect, value, default_value, |v| {
+                ui.knob_at("test", rect, value, default_value, style, |v| {
                     Edit::mutate(move |m: &mut PanModel| m.value = v)
                 }, None);
             },
@@ -858,6 +1023,239 @@ mod tests {
         );
     }
 
+    // ---- r.md #47: センタ吸着 (KnobStyle::detent) ----
+    //
+    // base 感度 = KNOB_UNITS_PER_PX (0.004/px = 250px で端から端)。 plateau =
+    // DETENT_TOTAL_PX (32px) × 0.004 = 0.128 値単位、 片側 0.064 (16px)。 吸着先 = default_value = 0.5。
+
+    /// press → 下に `down_px` ドラッグしたときの値 (BIPOLAR = detent 有効)。
+    fn drag_from(start: f32, down_px: f32, style: &KnobStyle) -> f32 {
+        let mut host: UiHost<PanModel> = UiHost::no_redraw();
+        let mut model = PanModel { value: start };
+        let rect = knob_rect();
+        let c = knob_center();
+        for e in run_frame_styled(&mut host, &model, rect, model.value, 0.5, style, press_at(c, false)) {
+            e.apply(&mut model);
+        }
+        let edits = run_frame_styled(
+            &mut host,
+            &model,
+            rect,
+            model.value,
+            0.5,
+            style,
+            hold_at((c.0, c.1 + down_px), false),
+        );
+        for e in edits {
+            e.apply(&mut model);
+        }
+        model.value
+    }
+
+    /// plateau の外 (掴んだ側) では detent が値を歪めない = 素の drag と同値。
+    #[test]
+    fn detent_does_not_distort_outside_plateau() {
+        // 0.8 から 25px 下 = -0.1 → 0.7 (plateau [0.436, 0.564] の外)。
+        let v = drag_from(0.8, 25.0, &KnobStyle::BIPOLAR);
+        assert!((v - 0.7).abs() < 1e-5, "plateau 外は素の drag と同値 (got {v})");
+    }
+
+    /// default_value を通り越すドラッグは、 そこで **ぴったり張り付く** (素の drag なら 0.45)。
+    #[test]
+    fn detent_holds_exactly_at_default_when_crossing() {
+        // 91px 下げ = 素なら 0.436。 detent では plateau 内なのでちょうど 0.5。
+        let v = drag_from(0.8, 91.0, &KnobStyle::BIPOLAR);
+        assert!((v - 0.5).abs() < 1e-6, "センタに正確に吸着する (got {v})");
+    }
+
+    /// plateau を食い切ると離脱し、 写像は連続 (= 素の値 + plateau)。
+    #[test]
+    fn detent_escapes_after_consuming_plateau() {
+        // 0.8 から 125px 下 = -0.5 → 素なら 0.3、 detent は plateau 0.128 を食った分ずれて 0.428。
+        let v = drag_from(0.8, 125.0, &KnobStyle::BIPOLAR);
+        assert!(v < 0.5 - 1e-6, "plateau を超えたら離脱する (got {v})");
+        assert!((v - 0.428).abs() < 1e-5, "離脱後は連続 (素 0.3 + plateau 0.128) (got {v})");
+    }
+
+    /// センタを掴んだ場合、 上下どちらへも半幅ぶん粘る (対称) — 1px では動かない。
+    #[test]
+    fn detent_from_center_is_symmetric() {
+        for px in [1.0_f32, -1.0] {
+            let v = drag_from(0.5, px, &KnobStyle::BIPOLAR);
+            assert!((v - 0.5).abs() < 1e-6, "{px}px では動かない (got {v})");
+        }
+        // 半幅 (16px) を超えれば両方向へ離脱する。
+        assert!(drag_from(0.5, 20.0, &KnobStyle::BIPOLAR) < 0.5, "下へ離脱");
+        assert!(drag_from(0.5, -20.0, &KnobStyle::BIPOLAR) > 0.5, "上へ離脱");
+    }
+
+    /// `detent: false` (unipolar) は default_value 上でも一切粘らない (回帰保証)。
+    #[test]
+    fn no_detent_when_disabled() {
+        let v = drag_from(0.8, 91.0, &KnobStyle::UNIPOLAR);
+        assert!((v - 0.436).abs() < 1e-5, "detent 無効なら素の drag (got {v})");
+    }
+
+    // ---- r.md #47: 値弧の起点 (KnobStyle::arc_origin) の幾何 ----
+    //
+    // knob rect は 64×64 @ (0,0) なので中心 (32, 32)、 弧半径 r = 64/2 - 2 = 30。
+    // 12 時の点 = (32, 2)、 7 時 (value 0) の点 = (32 + sin(-150°)·30, 32 - cos(-150°)·30)。
+
+    const CX: f32 = 32.0;
+    const CY: f32 = 32.0;
+    const R: f32 = 30.0;
+
+    /// 指定 value / style で 1 frame 描画して scene を返す (入力なし・pointer 無し)。
+    fn render_knob(value: f32, style: &KnobStyle) -> Scene {
+        let mut host: UiHost<PanModel> = UiHost::no_redraw();
+        let model = PanModel { value };
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 200 };
+        host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
+            ui.knob_at(
+                "test",
+                knob_rect(),
+                value,
+                0.5,
+                style,
+                |v| Edit::mutate(move |m: &mut PanModel| m.value = v),
+                None,
+            );
+        });
+        scene
+    }
+
+    /// scene 中の指定色の line segment を全部集める (値弧 = ACCENT、 notch = TEXT_DIM で識別)。
+    fn segments_colored(scene: &Scene, color: Color) -> Vec<LineSegment> {
+        scene
+            .iter_lines()
+            .flat_map(|b| b.segments.iter().copied())
+            .filter(|s| {
+                (s.color.r - color.r).abs() < 1e-3
+                    && (s.color.g - color.g).abs() < 1e-3
+                    && (s.color.b - color.b).abs() < 1e-3
+            })
+            .collect()
+    }
+
+    /// 与えた点を端点に持つ segment があるか (弧の端 = 起点/現在値の確認用)。
+    fn touches(segs: &[LineSegment], p: (f32, f32)) -> bool {
+        segs.iter().any(|s| {
+            ((s.a[0] - p.0).abs() < 0.05 && (s.a[1] - p.1).abs() < 0.05)
+                || ((s.b[0] - p.0).abs() < 0.05 && (s.b[1] - p.1).abs() < 0.05)
+        })
+    }
+
+    /// bipolar (pan) のセンタでは値弧が 1 本も描かれない (= 「フルレフトが零点」 の解消)。
+    /// 零点の位置は notch が示す。
+    #[test]
+    fn bipolar_center_draws_no_value_arc_but_a_notch() {
+        let scene = render_knob(0.5, &KnobStyle::BIPOLAR);
+        let arc = segments_colored(&scene, theme::ACCENT);
+        assert!(arc.is_empty(), "センタで値弧は 0 本 (got {} 本)", arc.len());
+        let notch = segments_colored(&scene, theme::TEXT_DIM);
+        assert_eq!(notch.len(), 1, "起点 notch が 1 本描かれる (got {})", notch.len());
+        // notch は 12 時の radial 線 (x はセンタ、 y は弧の内側 → 外側)。
+        let n = notch[0];
+        assert!((n.a[0] - CX).abs() < 0.05 && (n.b[0] - CX).abs() < 0.05, "notch は 12 時 (got {n:?})");
+        assert!(n.a[1] > n.b[1], "notch は内側 → 外側 (上向き) に伸びる (got {n:?})");
+    }
+
+    /// センタから 1e-4 しかずれていない値でも塗らない (dead band): 丸め誤差の 1px 欠片で
+    /// 「センタなのに片側が光る」 のを防ぐ。
+    #[test]
+    fn bipolar_near_center_stays_unfilled() {
+        for v in [0.5_f32 + 1e-4, 0.5 - 1e-4] {
+            let scene = render_knob(v, &KnobStyle::BIPOLAR);
+            let arc = segments_colored(&scene, theme::ACCENT);
+            assert!(arc.is_empty(), "value={v} (dead band 内) で値弧は 0 本 (got {} 本)", arc.len());
+        }
+    }
+
+    /// 同一 host / 同一 id で style だけ差し替えた 2 frame 目が **新しい起点** で描かれる
+    /// (= `arc_origin` が input_hash に入っている証明。 漏れていると cache HIT で 1 frame 目の
+    /// unipolar 弧が描かれ続ける)。
+    #[test]
+    fn arc_origin_change_invalidates_draw_cache() {
+        let mut host: UiHost<PanModel> = UiHost::no_redraw();
+        let model = PanModel { value: 0.25 };
+        let screen = PhysicalSize { width: 200, height: 200 };
+        let draw = |host: &mut UiHost<PanModel>, style: &KnobStyle| -> Scene {
+            let mut scene = Scene::new();
+            host.frame_to_edits(&model, &mut scene, screen, FrameInput::default(), |_, ui| {
+                ui.knob_at(
+                    "test",
+                    knob_rect(),
+                    0.25,
+                    0.5,
+                    style,
+                    |v| Edit::mutate(move |m: &mut PanModel| m.value = v),
+                    None,
+                );
+            });
+            scene
+        };
+        let f1 = draw(&mut host, &KnobStyle::UNIPOLAR);
+        let seven = (
+            CX + (-150.0_f32).to_radians().sin() * R,
+            CY - (-150.0_f32).to_radians().cos() * R,
+        );
+        assert!(touches(&segments_colored(&f1, theme::ACCENT), seven), "1 frame 目は 7 時起点");
+
+        let f2 = draw(&mut host, &KnobStyle::BIPOLAR);
+        let arc = segments_colored(&f2, theme::ACCENT);
+        assert!(touches(&arc, (CX, CY - R)), "2 frame 目は 12 時起点で描き直される");
+        assert!(!touches(&arc, seven), "cache HIT で 1 frame 目 (7 時起点) の弧が残らない");
+    }
+
+    /// bipolar で L 側 (value < 0.5) は **センタから左へ** 弧が伸びる (左端からではない)。
+    #[test]
+    fn bipolar_arc_grows_from_center_to_left() {
+        let scene = render_knob(0.25, &KnobStyle::BIPOLAR);
+        let arc = segments_colored(&scene, theme::ACCENT);
+        assert!(!arc.is_empty(), "L 側で値弧が描かれる");
+        assert!(
+            touches(&arc, (CX, CY - R)),
+            "弧の起点は 12 時 (32, 2) にある (got {:?})",
+            arc.iter().map(|s| (s.a, s.b)).collect::<Vec<_>>(),
+        );
+        for s in &arc {
+            assert!(
+                s.a[0] <= CX + 0.05 && s.b[0] <= CX + 0.05,
+                "L 側の弧はセンタより左だけ (got {s:?})",
+            );
+        }
+    }
+
+    /// bipolar で R 側 (value > 0.5) は **センタから右へ** 弧が伸びる。
+    #[test]
+    fn bipolar_arc_grows_from_center_to_right() {
+        let scene = render_knob(0.75, &KnobStyle::BIPOLAR);
+        let arc = segments_colored(&scene, theme::ACCENT);
+        assert!(!arc.is_empty(), "R 側で値弧が描かれる");
+        assert!(touches(&arc, (CX, CY - R)), "弧の起点は 12 時 (32, 2)");
+        for s in &arc {
+            assert!(
+                s.a[0] >= CX - 0.05 && s.b[0] >= CX - 0.05,
+                "R 側の弧はセンタより右だけ (got {s:?})",
+            );
+        }
+    }
+
+    /// unipolar (送り量 / 音量) は従来どおり **最小値 (7 時) 起点**、 notch 無し (回帰保証)。
+    #[test]
+    fn unipolar_arc_grows_from_minimum_without_notch() {
+        let scene = render_knob(0.5, &KnobStyle::UNIPOLAR);
+        let arc = segments_colored(&scene, theme::ACCENT);
+        let seven = (CX + (-150.0_f32).to_radians().sin() * R, CY - (-150.0_f32).to_radians().cos() * R);
+        assert!(touches(&arc, seven), "弧の起点は 7 時 {seven:?}");
+        assert!(touches(&arc, (CX, CY - R)), "value 0.5 まで = 12 時 (32, 2) まで届く");
+        assert!(
+            segments_colored(&scene, theme::TEXT_DIM).is_empty(),
+            "unipolar は起点 notch を描かない (起点 = 可動範囲の端)",
+        );
+    }
+
     // ---- daw_01 #109: Bitwig 流 modulation (knob 版、 値も depth も 0..=1 正規化ドメイン) ----
 
     use crate::widgets::scrubable_number::ModEdit;
@@ -869,7 +1267,7 @@ mod tests {
     }
 
     /// modulation 付き 1 frame を描画 + 処理し、 edits と response を返す (rect = 64×64 knob、
-    /// base 感度 = 1/64 units/px)。
+    /// base 感度 = KNOB_UNITS_PER_PX = 0.004 units/px)。
     #[allow(clippy::too_many_arguments)]
     fn run_mod_frame(
         host: &mut UiHost<ModModel>,
@@ -906,6 +1304,7 @@ mod tests {
                     rect,
                     base,
                     0.5,
+                    &KnobStyle::default(),
                     |v| Edit::mutate(move |m: &mut ModModel| m.value = v),
                     Some(modulation),
                 );
@@ -926,13 +1325,13 @@ mod tests {
         let (edits, _) =
             run_mod_frame(&mut host, &model, rect, press_at(c, false), true, &[], None, &mut Scene::new());
         for e in edits { e.apply(&mut model); }
-        // drag up 32px → depth = 0 + 32/64 = 0.5。 value は不変。
+        // drag up 32px → depth = 0 + 32×0.004 = 0.128。 value は不変。
         let (edits, resp) = run_mod_frame(
             &mut host, &model, rect, hold_at((c.0, c.1 - 32.0), false), true, &[], None, &mut Scene::new(),
         );
         for e in edits { e.apply(&mut model); }
 
-        assert!((model.depth - 0.5).abs() < 1e-5, "depth scrub +0.5 (got {})", model.depth);
+        assert!((model.depth - 0.128).abs() < 1e-5, "depth scrub +0.128 (got {})", model.depth);
         assert!((model.value - 0.5).abs() < 1e-5, "base value は depth-edit 中 不変 (got {})", model.value);
         assert!(resp.mod_dragging, "depth drag 中は mod_dragging=true");
         assert!(!resp.dragging, "depth drag 中は base dragging=false (排他)");
@@ -949,13 +1348,13 @@ mod tests {
         let (edits, _) =
             run_mod_frame(&mut host, &model, rect, press_at(c, false), false, &[], None, &mut Scene::new());
         for e in edits { e.apply(&mut model); }
-        // drag up 32px → value 0.5 + 0.5 = 1.0
+        // drag up 32px → value 0.5 + 32×0.004 = 0.628
         let (edits, resp) = run_mod_frame(
             &mut host, &model, rect, hold_at((c.0, c.1 - 32.0), false), false, &[], None, &mut Scene::new(),
         );
         for e in edits { e.apply(&mut model); }
 
-        assert!((model.value - 1.0).abs() < 1e-5, "base scrub +0.5 → 1.0 (got {})", model.value);
+        assert!((model.value - 0.628).abs() < 1e-5, "base scrub +0.128 → 0.628 (got {})", model.value);
         assert!((model.depth - 0.25).abs() < 1e-5, "非 arm では depth 不変 (got {})", model.depth);
         assert!(resp.dragging, "非 arm は base dragging=true");
         assert!(!resp.mod_dragging, "非 arm は mod_dragging=false");
@@ -993,7 +1392,7 @@ mod tests {
         let mut host_n: UiHost<ModModel> = UiHost::no_redraw();
         let mut scene_none = Scene::new();
         host_n.frame_to_edits(&model, &mut scene_none, screen, FrameInput::default(), |_, ui| {
-            ui.knob_at("mtest", rect, 0.5, 0.5,
+            ui.knob_at("mtest", rect, 0.5, 0.5, &KnobStyle::default(),
                 |v| Edit::mutate(move |m: &mut ModModel| m.value = v), None);
         });
 
@@ -1050,19 +1449,19 @@ mod tests {
         let (edits, _) =
             run_mod_frame(&mut host, &model, rect, press_at(c, false), true, &[], None, &mut Scene::new());
         for e in edits { e.apply(&mut model); }
-        // hold up 16px → depth 16/64 = 0.25
+        // hold up 16px → depth 16×0.004 = 0.064
         let (edits, _) = run_mod_frame(
             &mut host, &model, rect, hold_at((c.0, c.1 - 16.0), false), true, &[], None, &mut Scene::new(),
         );
         for e in edits { e.apply(&mut model); }
-        assert!((model.depth - 0.25).abs() < 1e-5, "hold で depth 0.25 (got {})", model.depth);
+        assert!((model.depth - 0.064).abs() < 1e-5, "hold で depth 0.064 (got {})", model.depth);
 
-        // release は更に上 (-32px) で離す → 最終 depth 0.5 が release frame で確定。
+        // release は更に上 (-32px) で離す → 最終 depth 0.128 が release frame で確定。
         let (edits, _) = run_mod_frame(
             &mut host, &model, rect, release_at((c.0, c.1 - 32.0)), true, &[], None, &mut Scene::new(),
         );
         for e in edits { e.apply(&mut model); }
-        assert!((model.depth - 0.5).abs() < 1e-5, "release frame で最終 depth 0.5 確定 (got {})", model.depth);
+        assert!((model.depth - 0.128).abs() < 1e-5, "release frame で最終 depth 0.128 確定 (got {})", model.depth);
     }
 
     /// `depth_sensitivity: Some` は depth drag で knob の base 感度 (1/rect.h) を上書きする。
@@ -1085,17 +1484,17 @@ mod tests {
                         source_color: Color::WHITE,
                         current_depth: cur,
                         depth_range: Some((-2.0, 2.0)),
-                        depth_sensitivity: Some(0.1), // 0.1 units/px (base 1/64 ≈ 0.0156 を上書き)
+                        depth_sensitivity: Some(0.1), // 0.1 units/px (base 0.004 を上書き)
                         on_mod_change: &on_mod,
                     }),
                 };
-                ui.knob_at("mtest", rect, model.value, 0.5,
+                ui.knob_at("mtest", rect, model.value, 0.5, &KnobStyle::default(),
                     |v| Edit::mutate(move |m: &mut ModModel| m.value = v), Some(m));
             })
         };
 
         for e in run(&mut host, &model, press_at(c, false)) { e.apply(&mut model); }
-        // drag up 10px × depth_sensitivity 0.1 = 1.0 (base 感度 1/64 なら 0.156)。
+        // drag up 10px × depth_sensitivity 0.1 = 1.0 (base 感度 0.004 なら 0.04)。
         for e in run(&mut host, &model, hold_at((c.0, c.1 - 10.0), false)) { e.apply(&mut model); }
         assert!((model.depth - 1.0).abs() < 1e-5, "depth_sensitivity 0.1 で +1.0 (got {})", model.depth);
     }
@@ -1110,7 +1509,7 @@ mod tests {
         let mut host_n: UiHost<ModModel> = UiHost::no_redraw();
         let mut scene_none = Scene::new();
         host_n.frame_to_edits(&model, &mut scene_none, screen, FrameInput::default(), |_, ui| {
-            ui.knob_at("mtest", rect, 0.5, 0.5,
+            ui.knob_at("mtest", rect, 0.5, 0.5, &KnobStyle::default(),
                 |v| Edit::mutate(move |m: &mut ModModel| m.value = v), None);
         });
 
@@ -1245,7 +1644,7 @@ mod tests {
                         on_mod_change: &on_mod,
                     }),
                 };
-                ui.knob_at("mtest", rect, model.value, 0.5,
+                ui.knob_at("mtest", rect, model.value, 0.5, &KnobStyle::default(),
                     |v| Edit::mutate(move |m: &mut ModModel| m.value = v), Some(m));
             })
         };

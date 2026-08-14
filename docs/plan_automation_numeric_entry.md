@@ -86,7 +86,7 @@ target ごとの表 (既存表示サイトと一致させる):
 |---|---|---|---|---|
 | TrackBuiltin(Volume) | dB | Decimal(1) | (-60, 6) | linear↔dB: `20*log10`, `10^(db/20)`、0/負は -inf→-60 floor |
 | TrackBuiltin(SendGain) | dB | Decimal(1) | (-60, 6) | 同上 |
-| TrackBuiltin(Pan) | "" | Decimal(2) | (-1, 1) | 恒等 |
+| TrackBuiltin(Pan) | "" | `SignedLabeled{L,R,C,×100}` (= `PAN_FORMAT`) | (-1, 1) | 恒等 |
 | TrackBuiltin(Mute) | "" | Integer | (0, 1) | 恒等 (0/1) |
 | PluginParam | "" | Decimal(3) | plugin_range or (0,1) | 恒等 (plain=native) |
 | SongTempo | BPM | Decimal(1) | (1, 400) | 恒等 |
