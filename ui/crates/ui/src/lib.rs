@@ -55,7 +55,7 @@ pub use widgets::heavy::HeavyCtx;
 pub use widgets::list_view::{ListViewResponse, ListViewStyle};
 pub use widgets::menu::MenuItemSpec;
 pub use widgets::modal::ModalStyle;
-pub use widgets::knob::KnobResponse;
+pub use widgets::knob::{KnobResponse, KnobStyle};
 pub use widgets::reorderable_list::{
     ReorderableListEditRequest, ReorderableListResponse, ReorderableListStyle,
 };

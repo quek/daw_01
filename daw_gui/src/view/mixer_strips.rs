@@ -8,8 +8,13 @@
 //!   - Volume fader (縦) + L/R peak meter
 
 use common::model::{AutomationTarget, SendMode, TrackBuiltinParam};
-use daw_ui_core::{Edit, LevelMeterStyle, MeterBallistic, MeterScale, ToggleButtonStyle, Ui};
+use daw_ui_core::{
+    Edit, KnobStyle, LevelMeterStyle, MeterBallistic, MeterScale, ToggleButtonStyle, Ui,
+};
 
+use common::automation::{norm_to_plain, plain_to_norm};
+
+use crate::automation_value::automation_value_display;
 use crate::view::modulation::{build_mod, push_mod_drag_resync};
 use crate::view::param_gesture::push_param_gesture_edges;
 use crate::view::track_color;
@@ -33,6 +38,10 @@ const NAME_BAND_H: f32 = 24.0;
 const DISCLOSURE_ZONE_W: f32 = 22.0;
 const TOGGLE_H: f32 = 22.0;
 const KNOB_SIZE: f32 = 32.0;
+/// Pan ノブ下の数値表示 (`"L50"` / `"C"` / `"R100"`) の font size / 行高 (px)。
+/// send 行のラベル (10px) と同格の副次情報サイズ。
+const PAN_READOUT_FONT: f32 = 10.0;
+const PAN_READOUT_H: f32 = 12.0;
 const FADER_W: f32 = 18.0;
 const METER_GAP: f32 = 2.0;
 /// scale 付きステレオメーターの box 幅 (px)。 widget が内部で
@@ -564,14 +573,15 @@ fn draw_strip(
         );
         y += TOGGLE_H + 6.0;
 
-        // Pan knob (-1..1 → 0..1)
+        // Pan knob (plain -1..1 ⇔ knob の正規化 0..1)。 写像は手書きしず
+        // `common::automation` の plain⇔norm SSoT を使う (同じ式を 3 本書かない)。
         let knob_x = rect.x + (rect.w - KNOB_SIZE) * 0.5;
-        let knob_value = (pan + 1.0) * 0.5;
         let track_idx_for_pan = track_idx;
         // per-control modulation (docs/plan_modulation_routing_redesign.md §6, gui_01
         // #109): Pan を音でドラッグ変調する Bitwig 流。knob は値が 0..=1 正規化なので
         // `ModControlDomain::Norm`、routing 帰属はこの strip のトラック (track_idx)。
         let pan_target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan);
+        let knob_value = plain_to_norm(&pan_target, f64::from(pan));
         let pan_mod =
             build_mod(app, pan_target.clone(), f64::from(knob_value), ModControlDomain::Norm, track_idx);
         let pan_resp = ui.knob_at(
@@ -579,14 +589,21 @@ fn draw_strip(
             Rect { x: knob_x, y, w: KNOB_SIZE, h: KNOB_SIZE },
             knob_value,
             0.5,
-            move |v| {
-                let pan = v * 2.0 - 1.0;
-                Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::SetTrackPan {
-                        track: track_idx_for_pan,
-                        pan,
+            // Pan は bipolar param: 見かけの零点はセンタ (12 時)。 弧はセンタから
+            // L/R 方向へ伸び、 センタでは塗りが消えてセンタ notch だけが残る (r.md #47)。
+            &KnobStyle::BIPOLAR,
+            {
+                let target_for_change = pan_target.clone();
+                move |v| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let pan = norm_to_plain(&target_for_change, v) as f32;
+                    Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetTrackPan {
+                            track: track_idx_for_pan,
+                            pan,
+                        })
                     })
-                })
+                }
             },
             Some(pan_mod.modulation()),
         );
@@ -599,7 +616,27 @@ fn draw_strip(
             pan_resp.dragging,
         );
         push_mod_drag_resync(ui, app, track_idx, &pan_target, pan_resp.mod_dragging);
-        y += KNOB_SIZE + 4.0;
+        y += KNOB_SIZE + 2.0;
+
+        // Pan の数値表示 (`"L50"` / `"C"` / `"R100"`)。 参照 DAW は全社が pan の数値を出す
+        // (REAPER `100%L..100%R` / Ardour `L:50 R:50` / Live `50L`)。 表記は
+        // `automation_value` の PAN_FORMAT が SSoT で、 inspector / automation lane と同一。
+        //
+        // 値は **knob の `displayed_value`** から取る: drag / dblclick reset 中は model より
+        // widget の preview が先行するので、 app 側の pan を読むと数値だけ 1 frame 遅れる。
+        let pan_plain = norm_to_plain(&pan_target, pan_resp.displayed_value);
+        let pan_text = automation_value_display(&pan_target, None).format_number(pan_plain);
+        let pan_text_w = ui.measure_text(&pan_text, PAN_READOUT_FONT);
+        ui.label_at(
+            ("mixer_strip_pan_value", layout_idx),
+            &pan_text,
+            rect.x + (rect.w - pan_text_w) * 0.5,
+            y,
+            PAN_READOUT_FONT,
+            // drag 中は明色で「今触っている値」を強調 (fader の % 表示と同 idiom)。
+            if pan_resp.dragging { COLOR_TEXT } else { theme::TEXT_DIM },
+        );
+        y += PAN_READOUT_H + 2.0;
     }
 
     // 縦 fader + L/R peak meter。 Sends セクションを持つ strip では、 その
@@ -695,9 +732,17 @@ fn sends_band_height(n_sends: usize) -> f32 {
 /// Sends band 側を縮めて (= band 内を縦スクロールさせて) 守る。
 const MIN_FADER_H: f32 = 28.0;
 
-/// strip 上部 (pad + 名前 + M/S + pan knob + fader 上マージン) が固定で食う高さ。
-/// `draw_strip` の y 積み上げと一致させること。
-const STRIP_FADER_TOP_OFFSET: f32 = 6.0 + TOP_LABEL_H + TOGGLE_H + 6.0 + KNOB_SIZE + 4.0 + 4.0;
+/// strip 上部 (pad + 名前 + M/S + pan knob + pan 数値 + fader 上マージン) が固定で食う高さ。
+/// `draw_strip` の y 積み上げと一致させること (`debug_assert` で固定)。
+const STRIP_FADER_TOP_OFFSET: f32 = 6.0
+    + TOP_LABEL_H
+    + TOGGLE_H
+    + 6.0
+    + KNOB_SIZE
+    + 2.0
+    + PAN_READOUT_H
+    + 2.0
+    + 4.0;
 /// fader 下端から strip 下端までの固定余白 (`draw_strip` の `pad + 12.0`)。
 const STRIP_FADER_BOTTOM_PAD: f32 = 6.0 + 12.0;
 
@@ -849,6 +894,9 @@ fn draw_sends_rows(
             (live_gain * 0.5).clamp(0.0, 1.0),
             // double-click reset = unity (= 1.0 linear → 0.5 normalized)。
             0.5,
+            // 送り量は unipolar param: 零点は最小値 (7 時) で、 dblclick の戻り先が
+            // unity (0.5) であることとは無関係 (弧の起点 ≠ default_value)。
+            &KnobStyle::UNIPOLAR,
             move |v| {
                 let gain = v * 2.0;
                 Edit::mutate(move |app: &mut AppData| {
@@ -977,6 +1025,48 @@ mod tests {
         assert!(
             pre_w <= avail,
             "'Pre' ({pre_w}px @ {SEND_PREPOST_FONT}pt) は Pre/Post 幅 {avail}px に収まる"
+        );
+    }
+
+    /// Pan の数値表示 (r.md #47) は最長表記でも strip 幅に収まる。 `label_at` は clip も
+    /// ellipsis も持たないので、 溢れると隣の strip 背景へグリフが漏れる (#13 と同じ症状)。
+    #[test]
+    fn pan_readout_fits_strip_width() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        // 最長は 3 桁 + ラベル。 PAN_FORMAT の実表記から生成して定数のズレを防ぐ。
+        let widest = crate::automation_value::PAN_FORMAT.format_value(-1.0);
+        let mut w = 0.0_f32;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            w = ui.measure_text(&widest, PAN_READOUT_FONT);
+        });
+
+        let avail = STRIP_WIDTH - 6.0 * 2.0; // draw_strip の pad = 6.0
+        assert_eq!(widest, "L100", "最長 pan 表記");
+        assert!(
+            w <= avail,
+            "'{widest}' ({w}px @ {PAN_READOUT_FONT}pt) は strip 内側幅 {avail}px に収まる"
+        );
+    }
+
+    /// strip の y 積み上げと `STRIP_FADER_TOP_OFFSET` の一致 (pan 数値行を足したので更新済)。
+    /// `draw_strip` 側は debug_assert でしか守られていないため、 定数側をここで固定する。
+    #[test]
+    fn strip_fader_top_offset_matches_stack() {
+        let stack = 6.0 // 上 pad
+            + TOP_LABEL_H
+            + TOGGLE_H
+            + 6.0 // M/S 行の下マージン
+            + KNOB_SIZE
+            + 2.0 // knob → pan 数値
+            + PAN_READOUT_H
+            + 2.0 // pan 数値 → fader 上マージン
+            + 4.0; // fader_top の +4.0
+        assert!(
+            (STRIP_FADER_TOP_OFFSET - stack).abs() < 1e-6,
+            "STRIP_FADER_TOP_OFFSET ({STRIP_FADER_TOP_OFFSET}) が積み上げ ({stack}) と一致"
         );
     }
 }

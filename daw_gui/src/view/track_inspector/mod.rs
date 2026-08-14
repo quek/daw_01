@@ -482,7 +482,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             Rect { x: input_x, y, w: input_w, h: input_h },
             app.inspector_fold(|a, t| a.audio_first_event(t, |e| f64::from(e.pan))),
             0.0,
-            ScrubableNumberFormat::Decimal(2),
+            // pan の表記は mixer / automation と同一 (`"L50"` / `"C"` / `"R100"`、r.md #47)。
+            crate::automation_value::PAN_FORMAT,
             &ScrubableNumberStyle {
                 sensitivity: 0.004,
                 range: Some((-1.0, 1.0)),
