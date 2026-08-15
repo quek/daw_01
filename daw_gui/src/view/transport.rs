@@ -514,11 +514,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 業界標準どおり record red 系。
     // 最長ラベル "Count-in..." = 11 字 * 12 * 0.527 = 69.6px。
     let rec_w = 76.0;
-    let rec_active = app.recording.midi_recording || app.recording.midi_recording_pending;
-    let rec_label = if app.recording.midi_recording_pending {
+    // r.md #51: 点灯 = 「録音したい」意思、ラベル = 「今どの段階か」。
+    // 要求したのにまだ録れていない理由は 2 つあり、区別して出す:
+    // count-in を鳴らしている最中 (preroll 残あり) と、プロジェクト読込 /
+    // プラグイン読込を待っている最中。 同じ文言にすると嘘になる。
+    let rec_active = app.recording.requested;
+    let rec_label = if !rec_active || app.recording.live {
+        "● Rec"
+    } else if app.transport.preroll_remaining > 0 {
         "Count-in..."
     } else {
-        "● Rec"
+        "待機中..."
     };
     ui.toggle_button_at(
         "transport_record",

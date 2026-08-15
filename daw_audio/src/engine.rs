@@ -167,9 +167,8 @@ pub const IDLE_SILENCE_PEAK: f32 = 1.0e-6;
 /// r.md #49: 今 buffer が park 条件を満たすか。
 ///
 /// CPAL コールバックから atomic の読み値だけで呼ぶ純関数 (RT 安全 — 確保も
-/// ロックも I/O もしない)。`playing` は engine の内部状態で、GUI の
-/// `transport.is_playing` ではない (後者は Rec 単独の録音中に立たないので
-/// park 判定に使えない)。
+/// ロックも I/O もしない)。`playing` は engine の内部状態 = 「走っているか」の
+/// 唯一の所有者で、GUI 側はこれを観測している (r.md #51)。
 #[must_use]
 pub fn buffer_is_idle(
     app_active: bool,
@@ -185,6 +184,26 @@ pub fn buffer_is_idle(
         && !export_running
         && peak_l.abs() < IDLE_SILENCE_PEAK
         && peak_r.abs() < IDLE_SILENCE_PEAK
+}
+
+/// r.md #51: この buffer の末尾で transport を畳む (停止 or loop wrap) べきか。
+///
+/// - loop が有効なら loop 終端で wrap する (録音中も同じ — ループ録音は
+///   「範囲を繰り返す」意図なので、そこで曲末判定を持ち出さない)。
+/// - loop が無効なら曲末で停止する。ただし **録音中は停止しない**: 録音は曲の
+///   後ろへ素材を継ぎ足す操作でもあり、最後のクリップの末尾で勝手に止まると
+///   曲の続きを録れない (参照 DAW 5 製品とも曲末で録音を止めない)。
+#[must_use]
+pub fn reached_transport_end(
+    recording_requested: bool,
+    active_loop_end: Option<u64>,
+    new_playhead: u64,
+    song_has_ended: bool,
+) -> bool {
+    match active_loop_end {
+        Some(end) => new_playhead >= end,
+        None => !recording_requested && song_has_ended,
+    }
 }
 
 /// r.md #49: 連続アイドルサンプル数の更新。アイドルでない buffer が 1 つでも
@@ -228,6 +247,30 @@ mod idle_park_tests {
                 buffer_is_idle(active, playing, preroll, export, l, r),
                 expect,
                 "active={active} playing={playing} preroll={preroll} export={export} l={l} r={r}"
+            );
+        }
+    }
+
+    /// r.md #51: 録音中は曲末で止まらない。ループが有効なら録音中でも wrap する。
+    #[test]
+    fn recording_suppresses_song_end_stop_but_not_loop_wrap() {
+        // (recording, loop_end, playhead, song_ended, expect_reached_end)
+        let cases = [
+            // ループ無し + 曲末: 再生は止まる / 録音は止まらない (継ぎ足せる)。
+            (false, None, 1_000, true, true),
+            (true, None, 1_000, true, false),
+            // ループ無し + 曲の途中: どちらも止まらない。
+            (false, None, 1_000, false, false),
+            (true, None, 1_000, false, false),
+            // ループ有効: 録音中でも終端で wrap する (曲末判定は使わない)。
+            (true, Some(900), 1_000, false, true),
+            (true, Some(1_200), 1_000, true, false),
+        ];
+        for (recording, loop_end, playhead, ended, expect) in cases {
+            assert_eq!(
+                reached_transport_end(recording, loop_end, playhead, ended),
+                expect,
+                "recording={recording} loop_end={loop_end:?} ph={playhead} ended={ended}"
             );
         }
     }
@@ -473,7 +516,7 @@ pub struct EngineShared {
     /// Updated by `AudioCommand::SetProjectDir`.
     pub project_dir: ArcSwapOption<PathBuf>,
     /// Phase 7 B4 Step C (2026-05-13): count-in 用 preroll の合計 samples
-    /// (= count-in 開始時に GUI が `StartCountIn { samples }` で立てた値の
+    /// (= 録音開始時に GUI が `StartRecording { preroll_samples }` で立てた値の
     /// snapshot)。 `process_buffer` で `elapsed = total - remaining` を
     /// 計算して metronome の click trigger 用 playhead として使う。 0 で
     /// count-in 中ではない。
@@ -482,6 +525,15 @@ pub struct EngineShared {
     /// `frames` だけ deduct + audio_bridge mirror 経由で GUI に publish。
     /// 0 到達で通常再生に戻る (= dispatch / clip render 復帰)。
     pub preroll_remaining_samples: AtomicU64,
+    /// r.md #51: 録音セッションが開いているか (`StartRecording` で true、
+    /// `StopRecording` で false)。 audio thread はこれを 2 つに使う:
+    ///
+    /// 1. **曲末 auto-stop の抑止** — 録音は曲の後ろへ継ぎ足すものなので、
+    ///    最後のクリップの末尾で勝手に止まってはいけない (参照 DAW 5 製品とも
+    ///    曲末で録音を止めない)。
+    /// 2. `recording_live` の publish — 「今ノートを書いてよいか」は
+    ///    count-in 明けを知っている engine だけが正しく言える。
+    pub recording_requested: AtomicBool,
     /// master volume (f32 bits)。 recv loop が `SetMasterGain` で store、
     /// render (`render_master_buffer`) が load して master へ掛ける。live /
     /// export 共通 (§5 — 旧実装は CPAL interleave 段のみで export に乗らず、
@@ -549,6 +601,7 @@ impl EngineShared {
             project_dir: ArcSwapOption::empty(),
             preroll_total_samples: AtomicU64::new(0),
             preroll_remaining_samples: AtomicU64::new(0),
+            recording_requested: AtomicBool::new(false),
             master_gain: AtomicU32::new(1.0_f32.to_bits()),
             last_buffer_frames: AtomicU32::new(0),
             mmcss_join_failed: AtomicBool::new(false),
@@ -900,6 +953,56 @@ impl LocalState {
         }
     }
 
+    /// GUI からの seek 要求と Play / Stop の要求を消費して `self.playing` を
+    /// 更新する。`process_buffer` の**あらゆる早期 return より先に**呼ぶこと
+    /// (r.md #51 — count-in 中 / 書き出し中に要求を溜めたまま return すると、
+    /// 溜まった Play がずっと後になって勝手に発火する)。
+    ///
+    /// seek を audio thread 単独 writer として `playhead` に反映するのも
+    /// ここ。IPC スレッドが `playhead` を直接書くと、buffer 末の advance store と
+    /// 同一 atomic を別スレッドから書く race になり、Stop 直後 (in-flight buffer が
+    /// まだ playing で advance する瞬間) に開始位置への巻き戻しが上書きされて
+    /// 停止位置から再生されてしまう。`swap` で消費する (多重要求は last-wins)。
+    fn consume_transport_requests(&mut self, shared: &SharedState) {
+        let pending_seek = shared.pending_seek.swap(NO_PENDING_SEEK, Ordering::AcqRel);
+        if pending_seek != NO_PENDING_SEEK {
+            shared.playhead.store(pending_seek, Ordering::Release);
+        }
+
+        // Play / Stop edge handling. On Play, restart playhead and clear
+        // active notes. On Stop, queue offs at frame 0 of the next buffer
+        // so plugins drain cleanly.
+        let desired = PlaybackCommand::from_u8(shared.playback.load(Ordering::Acquire));
+        match (self.playing, desired) {
+            (false, PlaybackCommand::Play) => {
+                self.playing = true;
+                // Play は **現在の playhead からそのまま再生する** (頭出しは
+                // しない)。「どこから再生するか」「停止でどこへ戻すか」は GUI 側
+                // が所有する (モデル A = Pro Tools / Ableton 流)。
+                for s in self.scratch.iter_mut() {
+                    s.state.active_notes.clear();
+                    s.state.pending_offs.clear();
+                }
+            }
+            (true, PlaybackCommand::Stop) => {
+                self.playing = false;
+                // count-in は「再生中」の一形態なので、止めたら一緒に捨てる。
+                // 残すと次に Play したとき、頼んでいない count-in が鳴る。
+                self.shared
+                    .preroll_remaining_samples
+                    .store(0, Ordering::Release);
+                self.shared.preroll_total_samples.store(0, Ordering::Release);
+                for s in self.scratch.iter_mut() {
+                    for &k in &s.state.active_notes {
+                        s.state.pending_offs.push(k);
+                    }
+                    s.state.active_notes.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Drain pending preview commands. Called at the top of `process_buffer`.
     fn pump_commands(&mut self) {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
@@ -985,6 +1088,26 @@ impl LocalState {
         let looping = loop_region.enabled;
         let metronome_enabled = shared.metronome_enabled.load(Ordering::Acquire);
 
+        // r.md #51: transport の要求 (Play / Stop) と seek の消費、および
+        // 「今どういう状態か」の publish は **どの早期 return よりも先に**行う。
+        //
+        // 旧実装は count-in と書き出しの早期 return より後ろに置いていたため、
+        // その間に届いた Stop が永久に消費されず、
+        // - count-in を取り消したのに preroll が 0 になった瞬間に曲が鳴り出す
+        // - 書き出しが終わった瞬間に (誰も押していないのに) 再生が再開する
+        // という 2 つの取りこぼしが起きていた。要求は届いた順に必ず消費する。
+        self.consume_transport_requests(shared);
+        let recording_requested = self.shared.recording_requested.load(Ordering::Acquire);
+        let preroll =
+            self.shared.preroll_remaining_samples.load(Ordering::Acquire);
+        // GUI はこの 3 つを観測して transport 表示と録音セッションを決める
+        // (GUI 側に「Play を送った記憶」を持たせない = 状態の所有者は engine)。
+        // count-in を止めたときの 0 もここで必ず伝わる (count-in ブロックの中だけで
+        // mirror していると、停止で捨てた preroll が GUI 側に残る)。
+        bridge.set_playing(self.playing);
+        bridge.set_recording_live(recording_requested && self.playing && preroll == 0);
+        bridge.set_preroll_remaining(preroll);
+
         // freewheel export: while the export thread holds the audio
         // resources, write silence and skip dispatch so the worker pool
         // and plugin instances are exclusively driven by the export
@@ -1000,9 +1123,10 @@ impl LocalState {
         // Phase 7 B4 Step C: count-in モード — preroll > 0 なら通常 dispatch /
         // clip render を skip し、 metronome のみ render + preroll counter を
         // deduct + audio_bridge に mirror。 0 到達で通常再生に戻る。
-        let preroll =
-            self.shared.preroll_remaining_samples.load(Ordering::Acquire);
-        if preroll > 0 {
+        // count-in は「再生中」の一形態なので、Stop が届いていればここには来ない
+        // (上の `consume_transport_requests` が playing を落とし、下の
+        // `preroll > 0 && self.playing` で弾かれる)。
+        if preroll > 0 && self.playing {
             let total =
                 self.shared.preroll_total_samples.load(Ordering::Acquire);
             let elapsed = total.saturating_sub(preroll);
@@ -1045,43 +1169,6 @@ impl LocalState {
             return;
         }
 
-        // GUI からの seek 要求を audio thread 単独 writer として
-        // `playhead` に反映する。IPC スレッドが `playhead` を直接書くと、下の
-        // buffer 末 advance store と同一 atomic を別スレッドから書く race になり、
-        // Stop 直後 (in-flight buffer がまだ playing で advance する瞬間) に開始
-        // 位置への巻き戻しが上書きされて停止位置から再生されてしまう。`swap` で
-        // 消費する (多重要求は last-wins)。
-        let pending_seek = shared.pending_seek.swap(NO_PENDING_SEEK, Ordering::AcqRel);
-        if pending_seek != NO_PENDING_SEEK {
-            shared.playhead.store(pending_seek, Ordering::Release);
-        }
-
-        // Play / Stop edge handling. On Play, restart playhead and clear
-        // active notes. On Stop, queue offs at frame 0 of the next buffer
-        // so plugins drain cleanly.
-        let desired = PlaybackCommand::from_u8(shared.playback.load(Ordering::Acquire));
-        match (self.playing, desired) {
-            (false, PlaybackCommand::Play) => {
-                self.playing = true;
-                // Play は **現在の playhead からそのまま再生する** (頭出しは
-                // しない)。「どこから再生するか」「停止でどこへ戻すか」は GUI 側
-                // が所有する (モデル A = Pro Tools / Ableton 流)。
-                for s in self.scratch.iter_mut() {
-                    s.state.active_notes.clear();
-                    s.state.pending_offs.clear();
-                }
-            }
-            (true, PlaybackCommand::Stop) => {
-                self.playing = false;
-                for s in self.scratch.iter_mut() {
-                    for &k in &s.state.active_notes {
-                        s.state.pending_offs.push(k);
-                    }
-                    s.state.active_notes.clear();
-                }
-            }
-            _ => {}
-        }
         let playing = self.playing;
 
         let song_ref = song_snapshot.as_deref();
@@ -1293,11 +1380,12 @@ impl LocalState {
             } else {
                 None
             };
-            let reached_end = if let Some(end) = active_end {
-                new_ph >= end
-            } else {
-                song_ended(song_ref, sample_rate, new_ph)
-            };
+            let reached_end = reached_transport_end(
+                recording_requested,
+                active_end,
+                new_ph,
+                song_ended(song_ref, sample_rate, new_ph),
+            );
             // Phase 5 Step 5.2: playhead_beats を current_bpm で 1 buffer 分
             // advance する。 sub-buffer の tempo 変化は scope 外 (= 1 buffer
             // ~5..20ms 内 constant)。
