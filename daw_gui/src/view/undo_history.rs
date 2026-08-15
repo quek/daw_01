@@ -276,7 +276,7 @@ fn draw_list(
             // 未来 (redo 待ち = idx > current、 newest-first では current より上) は薄く。
             // 行背景はクローム面 (panel / control_hover / accent) なので極性固定インクは不要。
             let text_color = if is_current {
-                p.text_on_accent
+                p.ink_on_accent()
             } else if idx > current {
                 p.text_faint
             } else {

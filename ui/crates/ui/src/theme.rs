@@ -183,8 +183,10 @@ palette! {
         text_faint: Color::rgb(0.380, 0.415, 0.490), srgb(0.522, 0.553, 0.612);
         /// 失敗 / 使用不能を伝えるテキスト (塗り用 `meter_red` は文字だと沈むので別トークン)。
         text_error: Color::rgb(1.00, 0.47, 0.44), srgb(0.702, 0.094, 0.071);
-        /// accent で塗られた面の上に乗るテキスト/タグ。
-        text_on_accent: Color::rgb(0.97, 0.985, 1.0), srgb(0.980, 0.988, 1.000);
+        // NOTE: 「accent 塗りの上の文字色」 のトークンは**置かない**。
+        // それは `ink_for(accent)` が答える問いで、トークンを別に持つと同じ問いに 2 つの
+        // 答えができる (実際、旧 `TEXT_ON_ACCENT` は near-white 固定で、ダークの明るい
+        // azure accent の上で 1.7:1 しか出ていなかった)。[`Palette::ink_on_accent`] を使う。
 
         // ===== アクセント =====
 
@@ -277,7 +279,9 @@ palette! {
         /// **暗い背景の上**に置く明インク (クリップ名・鍵盤ラベル・fade 線・選択点)。
         ink_on_dark: Color::rgb(0.880, 0.902, 0.945), Color::rgb(0.880, 0.902, 0.945);
         /// **明るい背景の上**に置く暗インク。
-        ink_on_bright: Color::rgb(0.080, 0.090, 0.120), Color::rgb(0.080, 0.090, 0.120);
+        /// accent 塗り (ダークの明るい azure が最も明度が高い) の上でも AA (4.5:1) が
+        /// 出る濃さにしてある。ここを明るくすると選択行の文字が真っ先に読めなくなる。
+        ink_on_bright: Color::rgb(0.075, 0.085, 0.115), Color::rgb(0.075, 0.085, 0.115);
 
         /// 波形 fg (非選択、暗い背景用)。
         waveform_on_dark: Color::rgb(0.46, 0.74, 0.95), Color::rgb(0.46, 0.74, 0.95);
@@ -367,6 +371,17 @@ impl Palette {
         } else {
             self.ink_on_dark
         }
+    }
+
+    /// `accent` 塗り (選択行 / menu hover / アクティブトグル) の上に置くインク。
+    ///
+    /// 専用トークンを持たず `ink_for(accent)` から**導出**する。トークンにすると
+    /// 「accent の上は何色か」 に 2 つの答えができ、accent だけ差し替えたテーマ
+    /// (ユーザーテーマを含む) で文字が読めなくなる。実際、旧 `TEXT_ON_ACCENT` は
+    /// near-white 固定で、ダークの明るい azure accent の上で 1.7:1 だった。
+    #[must_use]
+    pub fn ink_on_accent(&self) -> Color {
+        self.ink_for(self.accent)
     }
 
     /// `bg` の上に描く波形インク。色相 (寒色ブルー / 警告赤) を保ったまま明暗だけ切り替える。
@@ -464,18 +479,16 @@ mod tests {
             assert!(r >= 7.0, "本文は AAA 相当 (7:1) を満たす: got {r}");
             let dim = contrast_ratio(p.text_dim, p.panel);
             assert!(dim >= 4.5, "二次テキストは AA (4.5:1) を満たす: got {dim}");
-            // 可変な塗りの上は `ink_for` が選ぶ。**どのテーマでも** AA を満たすことが、
-            // toggle ON / scrub ドラッグ中 / クリップ名の可読性の土台。
-            let auto = contrast_ratio(p.ink_for(p.accent), p.accent);
-            assert!(auto >= 4.5, "ink_for は accent 塗りの上で AA を満たす: got {auto}");
+            // 選択行 / menu hover / アクティブトグルの文字色は `ink_on_accent` が決める。
+            // **どのテーマでも** AA を満たすことが、選択行の可読性の土台。
+            let auto = contrast_ratio(p.ink_on_accent(), p.accent);
+            assert!(auto >= 4.5, "ink_on_accent は accent 塗りの上で AA を満たす: got {auto}");
         }
-        // `text_on_accent` は「accent 面の上はクリスプな near-white で」 という
-        // **意図的な designer override**。ダークの azure accent の上では 2.7:1 しかないが、
-        // これは r.md #48 以前からの既存デザインなので変えない (変えるとダークの
-        // 選択行・menu hover の見た目が一斉に変わる)。ライトは自前で起こした値なので AA を課す。
-        let light_on_accent =
-            contrast_ratio(Palette::light().text_on_accent, Palette::light().accent);
-        assert!(light_on_accent >= 4.5, "ライトの accent 上文字は AA: got {light_on_accent}");
+        // 極性が両テーマで逆に出ることも固定する (ダークの accent は明るい azure なので
+        // 暗インク、ライトの accent は濃い青なので明インク)。ここが同じ向きになったら
+        // `ink_for` の閾値かどちらかの accent 値が壊れている。
+        assert_eq!(Palette::dark().ink_on_accent(), Palette::dark().ink_on_bright);
+        assert_eq!(Palette::light().ink_on_accent(), Palette::light().ink_on_dark);
     }
 
     #[test]

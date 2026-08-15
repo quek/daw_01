@@ -5,7 +5,7 @@
 //! 紛れ込んでいるか、`Application::Message: Clone` のような型境界が露出している。
 
 use daw_ui_core::{
-    ColorPickerStyle, Edit, ReorderableListEditRequest,
+    ColorPickerStyle, Edit, KnobStyle, ReorderableListEditRequest,
     ReorderableListStyle, ScrubableNumberFormat, ScrubableNumberStyle, UiHost,
 };
 use daw_ui_platform::PhysicalSize;
@@ -80,10 +80,11 @@ fn main() {
                 Rect { x: 0.0, y: 0.0, w: 64.0, h: 64.0 },
                 m.volume,
                 0.5,
+                &KnobStyle::BIPOLAR,
                 |v| Edit::mutate(move |m: &mut Model| m.volume = v),
                 None,
             );
-            let _ = ui.knob("pan2", m.volume, 0.5, |v| {
+            let _ = ui.knob("pan2", m.volume, 0.5, &KnobStyle::BIPOLAR, |v| {
                 Edit::mutate(move |m: &mut Model| m.volume = v)
             });
             // checkbox (M3): non-Clone Model でコンパイルする。

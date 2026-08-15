@@ -164,7 +164,7 @@ fn draw_checkbox<M: ?Sized + 'static>(
         let p2 = [cx + s * 0.42, cy + s * 0.72];
         let p3 = [cx + s * 0.78, cy + s * 0.30];
         // チェック時の塗りは accent なので、その上に乗るインクは accent 面用トークン。
-        let check_color = p.text_on_accent;
+        let check_color = p.ink_on_accent();
         ui.push_lines(LineBatch {
             segments: vec![
                 LineSegment { a: p1, b: p2, color: check_color },

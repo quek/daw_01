@@ -97,8 +97,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 &list_style,
                 |ui, entry, i, row_rect, is_selected| {
                     // 行背景は list_view が塗るクローム面なので、 本文は `p.text` /
-                    // 選択行は accent の上の `p.text_on_accent`。
-                    let name_color = if is_selected { p.text_on_accent } else { p.text };
+                    // 選択行は accent 塗りの上なので auto-contrast で取る。
+                    let name_color = if is_selected { p.ink_on_accent() } else { p.text };
                     ui.label_at(
                         ("sp_row_name", i),
                         &entry.1,

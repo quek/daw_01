@@ -170,14 +170,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 Some(cursor),
                 &list_style,
                 |ui, entry, i, row_rect, is_selected| {
-                    // 選択行は全 label を text_on_accent に統一 (accent 背景と高コントラスト、
-                    // Windows ListBox / macOS NSTableView の反転表示慣習)。 非選択時は
-                    // format をタグ色で区別する。 選択時は format 色と accent 背景が
-                    // 同化して読めなくなるため潰す。
+                    // 選択行は全 label を accent 上のインクに統一 (Windows ListBox /
+                    // macOS NSTableView の反転表示慣習)。 非選択時は format をタグ色で
+                    // 区別する。 選択時は format 色と accent 背景が同化して読めなくなるため潰す。
                     // 行の背景は list_view が塗るクローム面 (panel_raised / control_hover /
                     // accent) なので、 本文は極性固定インクではなく `p.text` でよい。
                     let (name_color, vendor_color, format_color) = if is_selected {
-                        (p.text_on_accent, p.text_on_accent, p.text_on_accent)
+                        (p.ink_on_accent(), p.ink_on_accent(), p.ink_on_accent())
                     } else {
                         (p.text, p.text, app.theme.daw.tag_format)
                     };
@@ -208,7 +207,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     // 種別タグ (楽器 / FX / MIDI / 映像): 混合リストで選ぶ前に行き先が分かる。
                     // 分類色はテーマの `daw.tag_*` が SSoT (ライトでは同じ色相のまま暗く沈む)。
                     let tag_color = if is_selected {
-                        p.text_on_accent
+                        p.ink_on_accent()
                     } else {
                         match entry.category {
                             PluginCategory::Instrument => app.theme.daw.tag_instrument,
