@@ -7,13 +7,15 @@
 
 use super::*;
 
+use crate::theme::Palette;
+
 /// note の最終 fill を決める (color/dim/lock/mute を統合)。`draw_notes` と
 /// `draw_velocity_lane` が共有して描画一致を保証する。`bg` は dim の寄せ先 (grid 背景)。
 #[must_use]
-pub(super) fn note_fill_color(note: &Note, note_fill_fn: NoteFillFn, bg: Color) -> Color {
+pub(super) fn note_fill_color(note: &Note, velocity_ramp: VelocityRamp, bg: Color) -> Color {
     let base = match note.style.color {
         Some(c) => shade_by_velocity(c, note.velocity),
-        None => note_fill_fn(note.velocity),
+        None => velocity_ramp.fill(note.velocity),
     };
     // lock は dim より強く沈める (参照専用を明示)、次いで非対象 dimmed。
     let base = if note.style.locked {
@@ -48,10 +50,11 @@ pub(super) fn note_rect_command(rect: Rect, fill: Color, radius_px: f32) -> Rect
 
 /// M14 Phase 117 (daw_01 #093): 鍵盤オクターブラベルの色を、 その行の **実効背景** から決める。
 /// `key_fill` (白鍵 / 黒鍵 fill) の上に `overlay` (root_row_overlay / out overlay、 無ければ `None`) を
-/// alpha 合成した「実際に目に入る色」 の WCAG relative luminance で `label_fg_dark` / `label_fg_light` を
-/// 選ぶ (arrangement clip 名 #060 と同じ `daw_ui_core::color` SSoT)。 `label_auto_contrast == false` なら
-/// `fallback` (旧固定色) をそのまま返す。
+/// alpha 合成した「実際に目に入る色」 を [`Palette::ink_for`] に渡し、 明背景なら暗インク・暗背景なら
+/// 明インクを得る。 鍵盤 fill は白鍵 / 黒鍵 / scale overlay で **可変** なので、 ここは `p.text` では
+/// なく極性固定インク (r.md #48)。 `label_auto_contrast == false` なら `fallback` をそのまま返す。
 pub(super) fn keyboard_label_color(
+    p: &Palette,
     style: &PianoRollStyle,
     key_fill: Color,
     overlay: Option<Color>,
@@ -64,7 +67,7 @@ pub(super) fn keyboard_label_color(
         Some(ov) => daw_ui_core::color::composite_over(ov, key_fill),
         None => key_fill,
     };
-    daw_ui_core::color::pick_contrast(bg, style.label_fg_light, style.label_fg_dark)
+    p.ink_for(bg)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::too_many_lines)]
@@ -75,6 +78,9 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
     view: PianoRollView,
     style: &PianoRollStyle,
 ) {
+    // 鍵盤ラベルの極性判定に使う (戻りは host の `'a` 借用なので push_rect と衝突しない)。
+    let p = hctx.palette();
+
     // (a) 主領域背景
     hctx.push_rect(RectCommand {
         rect: grid,
@@ -233,7 +239,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                 // M14 Phase 117 (daw_01 #093): root 行は root_row_overlay 重畳、 in-scale 行は key fill のみ。
                 // 実効背景の輝度で dark/light を選ぶ (白鍵 in-scale 行で明文字が潰れる旧 symptom も解消)。
                 let overlay = if is_root { Some(style.root_row_overlay) } else { None };
-                let color = keyboard_label_color(style, fill, overlay, fallback);
+                let color = keyboard_label_color(p, style, fill, overlay, fallback);
                 hctx.push_text(GlyphArea {
                     text: text.into(),
                     left: kbd.x + 4.0,
@@ -307,6 +313,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                         // M14 Phase 117 (daw_01 #093): Highlight mode の root 行は常に root_row_overlay
                         // 重畳 (warm cream)。 その実効背景で auto-contrast → warm-on-warm 潰れを解消。
                         let color = keyboard_label_color(
+                            p,
                             style,
                             fill,
                             Some(style.root_row_overlay),
@@ -328,7 +335,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                     let octave = (pitch_i / 12) - 1;
                     // M14 Phase 117 (daw_01 #093): scale=None の C 行は overlay 無し (key fill のみ)。
                     // C は白鍵なので auto-contrast で暗文字が選ばれ、 旧 `c_label_color` (dark) と整合。
-                    let color = keyboard_label_color(style, fill, None, style.c_label_color);
+                    let color = keyboard_label_color(p, style, fill, None, style.c_label_color);
                     hctx.push_text(GlyphArea {
                         text: format!("C{octave}").into(),
                         left: kbd.x + 4.0,
@@ -353,7 +360,7 @@ pub(super) fn draw_notes<M: ?Sized + 'static>(
     visible: &[Note],
     view: PianoRollView,
     grid: Rect,
-    note_fill_fn: NoteFillFn,
+    velocity_ramp: VelocityRamp,
     bg: Color,
     radius_px: f32,
     muted_hatch_color: Color,
@@ -376,7 +383,7 @@ pub(super) fn draw_notes<M: ?Sized + 'static>(
             h: y_bot - y_top,
         };
         // クリップ色 (色 None なら velocity 色) → dim/lock 沈め → mute 沈め。
-        let fill = note_fill_color(note, note_fill_fn, bg);
+        let fill = note_fill_color(note, velocity_ramp, bg);
         hctx.push_rect(note_rect_command(clipped, fill, radius_px));
         if note.muted {
             daw_ui_core::widgets::push_muted_hatch(

@@ -18,7 +18,7 @@ use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
 
-use super::{ERROR_TEXT, SC_CTL_H, SC_NAME_H, SC_ROW_GAP, SC_ROW_H, SC_TAP_W, TEXT, TEXT_DIM};
+use super::{SC_CTL_H, SC_NAME_H, SC_ROW_GAP, SC_ROW_H, SC_TAP_W};
 
 /// 「+ Plugin」 (master bus は 「+ FX」) をチェーンリストの直下に置く。
 ///
@@ -66,6 +66,7 @@ pub(super) fn draw_failed_load_section(
     pad: f32,
     mut y: f32,
 ) -> f32 {
+    let p = &app.theme.core;
     let entries: Vec<crate::app_types::ChainEntry> = app
         .inspector_chain()
         .into_iter()
@@ -83,7 +84,7 @@ pub(super) fn draw_failed_load_section(
         area.x + pad,
         y,
         12.0,
-        ERROR_TEXT,
+        p.text_error,
     );
     y += 18.0 + 4.0;
 
@@ -100,7 +101,7 @@ pub(super) fn draw_failed_load_section(
             &entry.plugin_name,
             Rect { x: name_x, y, w: row_w, h: NAME_H },
             11.0,
-            ERROR_TEXT,
+            p.text_error,
         );
         // 理由は 1 行で切る (長い FFI エラーでも行が伸びない)。 全文は
         // status bar / ログに出ている。
@@ -115,7 +116,7 @@ pub(super) fn draw_failed_load_section(
                 h: 11.0 * 1.2,
             },
             11.0,
-            TEXT_DIM,
+            p.text_dim,
         );
         let device_index = entry.device_index;
         ui.button_at(
@@ -150,6 +151,7 @@ pub(super) fn draw_editor_key_section(
     pad: f32,
     mut y: f32,
 ) -> f32 {
+    let p = &app.theme.core;
     let entries: Vec<crate::app_types::ChainEntry> = app
         .inspector_chain()
         .into_iter()
@@ -161,7 +163,7 @@ pub(super) fn draw_editor_key_section(
     let Some(track_id) = app.cursor_track_id() else {
         return y;
     };
-    ui.label_at("inspector_keys_label", "エディタ窓のキー", area.x + pad, y, 12.0, TEXT);
+    ui.label_at("inspector_keys_label", "エディタ窓のキー", area.x + pad, y, 12.0, p.text);
     y += 18.0 + 4.0;
 
     const ROW_H: f32 = 24.0;
@@ -174,7 +176,7 @@ pub(super) fn draw_editor_key_section(
             &entry.plugin_name,
             Rect { x: area.x + pad, y, w: row_w, h: NAME_H },
             11.0,
-            TEXT,
+            p.text,
         );
         let device_index = entry.device_index;
         let next = !entry.send_all_keys;
@@ -183,7 +185,7 @@ pub(super) fn draw_editor_key_section(
             "キーを全部プラグインに送る",
             Rect { x: area.x + pad, y: y + NAME_H, w: row_w, h: ROW_H },
             entry.send_all_keys,
-            &super::TOGGLE_AUDIO_BASE,
+            &super::toggle_audio_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetPluginSendAllKeys {
@@ -211,13 +213,14 @@ pub(super) fn draw_parallel_out_section(
     pad: f32,
     mut y: f32,
 ) -> f32 {
+    let p = &app.theme.core;
     let po_entries = app.parallel_output_entries();
     if po_entries.is_empty() {
         return y;
     }
     let row_h = 24.0;
     let row_gap = 4.0;
-    ui.label_at("inspector_po_label", "Parallel Out", area.x + pad, y, 12.0, TEXT);
+    ui.label_at("inspector_po_label", "Parallel Out", area.x + pad, y, 12.0, p.text);
     y += 18.0 + 4.0;
 
     let dropdown_w = 140.0;
@@ -245,7 +248,7 @@ pub(super) fn draw_parallel_out_section(
                 h: 11.0 * 1.2,
             },
             11.0,
-            TEXT,
+            p.text,
         );
         ui.button_at(
             ("inspector_po_explode", ei),
@@ -270,7 +273,7 @@ pub(super) fn draw_parallel_out_section(
                 name_x,
                 y + 6.0,
                 11.0,
-                TEXT,
+                p.text,
             );
             let dropdown_x = right_x - dropdown_w;
             let selected_idx = match entry.routes.get(port).and_then(|o| *o) {
@@ -317,11 +320,12 @@ pub(super) fn draw_sidechain_section(
     pad: f32,
     mut y: f32,
 ) -> f32 {
+    let p = &app.theme.core;
     let sc_entries = app.sidechain_entries();
     if sc_entries.is_empty() {
         return y;
     }
-    ui.label_at("inspector_sc_label", "Sidechain", area.x + pad, y, 12.0, TEXT);
+    ui.label_at("inspector_sc_label", "Sidechain", area.x + pad, y, 12.0, p.text);
     y += 18.0 + 4.0;
 
     let choices = app.sidechain_source_choices();
@@ -352,7 +356,7 @@ pub(super) fn draw_sidechain_section(
             &entry.plugin_name,
             Rect { x: name_x, y, w: row_w, h: SC_NAME_H },
             11.0,
-            TEXT,
+            p.text,
         );
         let ctl_y = y + SC_NAME_H;
         let selected_idx = match entry.current_source {

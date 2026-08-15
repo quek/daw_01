@@ -15,7 +15,7 @@
 
 use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use crate::theme::Theme;
 
 use crate::app::{resolve_plugin_name, AppData, AppEvent};
 
@@ -24,14 +24,19 @@ const PANEL_W: f32 = 360.0;
 const PANEL_TOP: f32 = 76.0; // MENU_H(24) + TRANSPORT_H(44) + 8 の下。
 const PANEL_ID: &str = "resource_panel";
 
-/// DSP / CPU load (0..1) を緑→黄→赤で色分け。 閾値は `metrics_bridge` の SSoT。
-fn load_color(load: f32) -> Color {
+/// DSP / CPU load (0..1) を緑→黄→赤で色分け。 閾値は `metrics_bridge` の SSoT、
+/// 色は meter ramp (色相固定・明度可変) の SSoT。
+///
+/// ステータスバーの常駐バッジ (`view::status_bar`) もこの 1 実装を呼ぶ
+/// (旧実装は status_bar 側に 1 文字違わない複製があった)。
+#[must_use]
+pub fn load_color(theme: &Theme, load: f32) -> Color {
     if load >= common::metrics_bridge::LOAD_DANGER {
-        theme::METER_RED
+        theme.core.meter_red
     } else if load >= common::metrics_bridge::LOAD_WARN {
-        theme::METER_YELLOW
+        theme.core.meter_yellow
     } else {
-        theme::METER_GREEN
+        theme.core.meter_green
     }
 }
 
@@ -85,10 +90,21 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     }
 }
 
-/// ラベル + load バー (幅 = load、 色 = load_color) + % 数値の 1 行。
-fn load_row(ui: &mut Ui<'_, AppData>, id: &str, label: &str, indent: f32, load: f32, row: Rect) {
+/// ラベル + load バー (幅 = load、 色 = `load_color`) + % 数値の 1 行。
+/// バーの溝はパネル面に彫り込む窪みなので `inset_bg`、 文字は溝ではなく
+/// パネル面の上に乗るのでテーマ従属の `text` / `text_dim`。
+fn load_row(
+    theme: &Theme,
+    ui: &mut Ui<'_, AppData>,
+    id: &str,
+    label: &str,
+    indent: f32,
+    load: f32,
+    row: Rect,
+) {
+    let p = &theme.core;
     let text_y = row.y + (row.h - 11.0) * 0.5;
-    ui.label_at((id, 0u8), label, row.x + indent, text_y, 11.0, theme::TEXT);
+    ui.label_at((id, 0u8), label, row.x + indent, text_y, 11.0, p.text);
     let bar_x = row.x + row.w * 0.46;
     let bar_w = row.w * 0.40;
     let bar_h = 8.0;
@@ -96,7 +112,7 @@ fn load_row(ui: &mut Ui<'_, AppData>, id: &str, label: &str, indent: f32, load: 
     ui.panel(
         (id, 1u8),
         Rect { x: bar_x, y: bar_y, w: bar_w, h: bar_h },
-        theme::INSET_BG,
+        p.inset_bg,
         2.0,
     );
     let fill_w = bar_w * load.clamp(0.0, 1.0);
@@ -104,7 +120,7 @@ fn load_row(ui: &mut Ui<'_, AppData>, id: &str, label: &str, indent: f32, load: 
         ui.panel(
             (id, 2u8),
             Rect { x: bar_x, y: bar_y, w: fill_w, h: bar_h },
-            load_color(load),
+            load_color(theme, load),
             2.0,
         );
     }
@@ -114,11 +130,12 @@ fn load_row(ui: &mut Ui<'_, AppData>, id: &str, label: &str, indent: f32, load: 
         bar_x + bar_w + 6.0,
         text_y,
         11.0,
-        theme::TEXT_DIM,
+        p.text_dim,
     );
 }
 
 fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
+    let p = &app.theme.core;
     let m = &app.ipc.metrics;
     let px = panel.x;
     let py = panel.y;
@@ -155,14 +172,14 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
     };
 
     // パネル背景 + タイトルバー。
-    ui.panel("resmon_panel_bg", panel, theme::PANEL, 6.0);
+    ui.panel("resmon_panel_bg", panel, p.panel, 6.0);
     ui.panel(
         "resmon_titlebar",
         Rect { x: px, y: py, w: PANEL_W, h: 24.0 },
-        theme::HEADER,
+        p.header,
         6.0,
     );
-    ui.label_at("resmon_title", "Performance", px + 12.0, py + 7.0, 13.0, theme::TEXT);
+    ui.label_at("resmon_title", "Performance", px + 12.0, py + 7.0, 13.0, p.text);
     // xrun カウンタをリセットするボタン (Ardour / Cubase の reset xruns に相当)。
     ui.button_at(
         "resmon_clear_xrun",
@@ -190,6 +207,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
 
     // ---- 全体指標 ----
     load_row(
+        &app.theme,
         ui,
         "resmon_o_dsp",
         &format!("DSP peak (avg {:>3.0}%)", m.dsp_load_avg * 100.0),
@@ -198,7 +216,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
         row(y),
     );
     y += ROW_H;
-    load_row(ui, "resmon_o_cpu", "System CPU", 0.0, m.system_cpu / 100.0, row(y));
+    load_row(&app.theme, ui, "resmon_o_cpu", "System CPU", 0.0, m.system_cpu / 100.0, row(y));
     y += ROW_H;
     ui.label_at(
         "resmon_o_fps",
@@ -206,7 +224,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
         px + 12.0,
         y + 3.0,
         11.0,
-        theme::TEXT,
+        p.text,
     );
     y += ROW_H;
     let latency_ms = if m.sample_rate > 0 {
@@ -224,9 +242,9 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
         y + 3.0,
         11.0,
         if m.xrun_count > 0 {
-            theme::RECORD
+            app.theme.daw.record
         } else {
-            theme::TEXT_DIM
+            p.text_dim
         },
     );
     y += ROW_H + 8.0;
@@ -234,7 +252,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
     ui.panel(
         "resmon_sep",
         Rect { x: px + 8.0, y, w: cw, h: 1.0 },
-        theme::BORDER,
+        p.border,
         0.0,
     );
     y += 8.0;
@@ -245,6 +263,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
         let pids = app.ipc.track_plugin_ids.get(&track.id);
         let track_us: u32 = pids.map_or(0, |v| v.iter().map(|pid| plugin_us(*pid)).sum());
         load_row(
+            &app.theme,
             ui,
             &format!("resmon_tr_{}", track.id),
             &track.name,
@@ -261,6 +280,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
                 }
                 let name = resolve_plugin_name(&app.ipc.plugin_db, &device.plugin_id);
                 load_row(
+                    &app.theme,
                     ui,
                     &format!("resmon_pl_{pid}"),
                     &name,

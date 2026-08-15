@@ -20,7 +20,6 @@ use std::cell::Cell;
 
 use daw_ui_core::{DragKind, Edit, Ui};
 use daw_ui_renderer::{Color, Rect, RectCommand};
-use crate::theme;
 
 use crate::app::{AppData, AppEvent};
 
@@ -157,11 +156,12 @@ fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
 }
 
 fn draw_chrome_and_list(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
+    let p = &app.theme.core;
     // 背景 + 枠 + タイトルバー + ✕。
     ui.push_rect(RectCommand {
         rect,
-        fill: theme::PANEL,
-        border: theme::BORDER,
+        fill: p.panel,
+        border: p.border,
         border_width: 1.0,
         radius: [6.0; 4],
         clip_rect: None,
@@ -169,17 +169,10 @@ fn draw_chrome_and_list(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     ui.panel(
         "undohist_titlebar",
         Rect { x: rect.x, y: rect.y, w: rect.w, h: TITLE_H },
-        theme::HEADER,
+        p.header,
         6.0,
     );
-    ui.label_at(
-        "undohist_title",
-        "編集履歴",
-        rect.x + 12.0,
-        rect.y + 7.0,
-        13.0,
-        theme::TEXT,
-    );
+    ui.label_at("undohist_title", "編集履歴", rect.x + 12.0, rect.y + 7.0, 13.0, p.text);
     ui.button_at(
         "undohist_close",
         "\u{2715}",
@@ -208,7 +201,7 @@ fn draw_chrome_and_list(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         ui.panel(
             ("undohist_grip", i),
             Rect { x: rect.x + rect.w - off - 2.0, y: rect.y + rect.h - off - 2.0, w: 2.0, h: 2.0 },
-            theme::TEXT_FAINT,
+            p.text_faint,
             0.0,
         );
     }
@@ -221,6 +214,7 @@ fn draw_list(
     labels: &[&'static str],
     current: usize,
 ) {
+    let p = &app.theme.core;
     let row_total = ROW_H + ROW_GAP;
     let n = labels.len();
     let content_h = n as f32 * row_total;
@@ -263,9 +257,9 @@ fn draw_list(
             let inside = pointer.pos.is_some_and(|(px, py)| row_rect.contains(px, py));
             let is_current = idx == current;
             let bg = if is_current {
-                Some(theme::ACCENT)
+                Some(p.accent)
             } else if inside {
-                Some(theme::CONTROL_HOVER)
+                Some(p.control_hover)
             } else {
                 None
             };
@@ -280,12 +274,13 @@ fn draw_list(
                 });
             }
             // 未来 (redo 待ち = idx > current、 newest-first では current より上) は薄く。
+            // 行背景はクローム面 (panel / control_hover / accent) なので極性固定インクは不要。
             let text_color = if is_current {
-                theme::TEXT_ON_ACCENT
+                p.text_on_accent
             } else if idx > current {
-                theme::TEXT_FAINT
+                p.text_faint
             } else {
-                theme::TEXT
+                p.text
             };
             ui.label_at(
                 ("undohist_row", idx),

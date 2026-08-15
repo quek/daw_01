@@ -22,11 +22,11 @@ use std::hash::Hash;
 use std::time::Instant;
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
+use crate::theme::Palette;
 use crate::ui::{Ui, hovered};
 
 /// ダブルクリック判定の時間しきい値 (ms)。 knob/fader と統一。
@@ -118,14 +118,21 @@ pub struct ScrubableNumberStyle {
     pub range: Option<(f64, f64)>,
 }
 
-impl Default for ScrubableNumberStyle {
-    fn default() -> Self {
+impl ScrubableNumberStyle {
+    /// パレット由来の既定スタイル (窪んだ数値欄 = `inset_bg` / hover で `inset_bg_hover` /
+    /// scrub 中は `accent`)。
+    ///
+    /// r.md #48: `Default` を持たせない。 テーマ色を読む `Default::default()` は隠れた
+    /// グローバル依存で、 ライトテーマに追従しない (= caller が `..Default::default()` を
+    /// 書いた瞬間ダーク固定の色が混ざる)。 呼び出し側は `ui.palette()` を渡す。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            bg_color: theme::INSET_BG,
-            bg_color_hovered: theme::INSET_BG.lighten(0.06),
-            bg_color_dragging: theme::ACCENT,
-            text_color: theme::TEXT,
-            border: theme::BORDER,
+            bg_color: p.inset_bg,
+            bg_color_hovered: p.inset_bg_hover,
+            bg_color_dragging: p.accent,
+            text_color: p.text,
+            border: p.border,
             border_width: 1.0,
             radius: 3.0,
             font_size: 14.0,
@@ -775,17 +782,27 @@ fn draw_scrubable_number<M: ?Sized + 'static>(
     });
 
     // 数値テキスト (rect 中央寄せ、 horizontal は left-padded 4px)。
+    // 文字色は **実際に塗った背景の輝度** から auto-contrast で決める (r.md #48)。
+    // drag 中は背景が `bg_color_dragging` に変わり、その色は caller 任意 (daw_gui は
+    // `scrub_drag_bg` / `scrub_drag_bg_warm`) なので、`text_color` 固定だとテーマや
+    // caller 次第で数値が読めなくなる。通常時 (= `bg_color` 塗り) はテーマの本文色をそのまま
+    // 使い、ダークの見た目を変えない。
     let pad_x = 4.0;
     let line_h = style.font_size * 1.2;
     let tx = rect.x + pad_x;
     let ty = rect.y + (rect.h - line_h) * 0.5;
+    let text_color = if bg_fill == style.bg_color {
+        style.text_color
+    } else {
+        ui.palette().ink_for(bg_fill)
+    };
     ui.push_text(GlyphArea {
         text: text.into(),
         left: tx,
         top: ty,
         font_size: style.font_size,
         line_height: line_h,
-        color: style.text_color,
+        color: text_color,
         clip_rect: Some(rect),
         ..GlyphArea::default()
     });
@@ -908,9 +925,8 @@ fn draw_modulation_overlay<M: ?Sized + 'static>(
     if !entries.is_empty() || live_value.is_some() || edit_color.is_some() {
         ui.push_rect(RectCommand {
             rect: Rect { x: base_x - 0.5, y: strip_y - 1.0, w: 1.0, h: strip_h + 2.0 },
-            // modulation base 位置の中立マーカー線。 modulation 専用マーカーの theme token が
-            // 無いため literal 維持。
-            fill: Color::rgba(0.70, 0.70, 0.75, 0.85),
+            // modulation base 位置の中立マーカー線 (r.md #48 で専用トークン化)。
+            fill: ui.palette().modulation_base_marker,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
@@ -923,9 +939,9 @@ fn draw_modulation_overlay<M: ?Sized + 'static>(
         let lx = value_to_x(lv);
         ui.push_rect(RectCommand {
             rect: Rect { x: lx - 0.75, y: strip_y - 2.0, w: 1.5, h: strip_h + 4.0 },
-            // modulation の live 出力値 tick (明るい縦線)。 modulation-live indicator 用の
-            // theme token が無いため literal 維持。
-            fill: Color::rgba(0.98, 0.98, 1.0, 0.95),
+            // modulation の live 出力値 tick。 r.md #48 で fader / knob と同じ amber
+            // トークンに統一 (旧実装はここだけ near-white で、変調系の色の語彙が割れていた)。
+            fill: ui.palette().modulation_live,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
@@ -1149,7 +1165,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         // press
@@ -1177,7 +1193,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         let edits = run_frame(
@@ -1207,7 +1223,7 @@ mod tests {
         let style = ScrubableNumberStyle {
             sensitivity: 10.0,                  // 1 px = 10 BPM
             range: Some((20.0, 240.0)),         // 上限 240
-            ..ScrubableNumberStyle::default()
+            ..ScrubableNumberStyle::from_palette(&Palette::dark())
         };
         let center = (40.0_f32, 14.0_f32);
 
@@ -1238,7 +1254,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 200.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle::default();
+        let style = ScrubableNumberStyle::from_palette(&Palette::dark());
         let center = (40.0_f32, 14.0_f32);
 
         // 1 回目 click
@@ -1280,7 +1296,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
         let idle = PointerFrame::default();
 
@@ -1329,7 +1345,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle::default();
+        let style = ScrubableNumberStyle::from_palette(&Palette::dark());
         let center = (40.0_f32, 14.0_f32);
 
         // press → release (< 4px = 短 click) で editing 突入。 placeholder は Some("—")。
@@ -1413,7 +1429,7 @@ mod tests {
         ScrubableNumberStyle {
             sensitivity: 0.5,
             range: Some((100.0, 140.0)),
-            ..ScrubableNumberStyle::default()
+            ..ScrubableNumberStyle::from_palette(&Palette::dark())
         }
     }
 
@@ -1692,7 +1708,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         let edits = run_frame(
@@ -1716,7 +1732,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         let edits = run_frame(
@@ -1740,7 +1756,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         let edits = run_frame(
@@ -1764,7 +1780,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         let edits = run_frame(
@@ -1810,7 +1826,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         let edits = run_frame(
@@ -1834,7 +1850,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         let edits = run_frame(
@@ -1858,7 +1874,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         let edits = run_frame(
@@ -1882,7 +1898,7 @@ mod tests {
         let mut host: UiHost<BpmModel> = UiHost::no_redraw();
         let mut model = BpmModel { bpm: 120.0 };
         let rect = rect_default();
-        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::default() };
+        let style = ScrubableNumberStyle { sensitivity: 0.5, ..ScrubableNumberStyle::from_palette(&Palette::dark()) };
         let center = (40.0_f32, 14.0_f32);
 
         let edits = run_frame(

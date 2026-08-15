@@ -154,6 +154,7 @@ mod tests {
 
     use super::*;
     use crate::input::PointerFrame;
+    use crate::theme::Palette;
     use crate::ui::UiHost;
     use crate::widgets::level_meter::{MeterScale, meter_content_region};
     use crate::{FrameInput, LevelMeterStyle};
@@ -168,11 +169,13 @@ mod tests {
 
     const FADER_W: f32 = 18.0;
 
+    /// テスト用の style。 色はダークテーマ固定 (`Default` は色を持つ style から撤去した:
+    /// テーマ従属の色を隠れたグローバルから引くとライトテーマに追従しないため)。
     fn style() -> LevelMeterStyle {
         LevelMeterStyle {
             scale: Some(MeterScale::default()),
             peak_readout: true,
-            ..LevelMeterStyle::default()
+            ..LevelMeterStyle::from_palette(&Palette::dark())
         }
     }
 

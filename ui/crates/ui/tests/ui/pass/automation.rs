@@ -29,7 +29,7 @@ fn main() {
             "main",
             rect,
             &m.points,
-            AutomationCurveStyle::default(),
+            AutomationCurveStyle::from_palette(ui.palette()),
             |idx, pos| {
                 Edit::mutate(move |m: &mut Model| {
                     if idx < m.points.len() {

@@ -16,10 +16,10 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
-use crate::theme;
 
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
+use crate::theme::Palette;
 use crate::ui::{Ui, hovered, pressed_inside};
 
 // ============================================================
@@ -152,13 +152,25 @@ pub struct WaveformStyle {
     pub line_width_px: f32,
 }
 
-impl Default for WaveformStyle {
-    fn default() -> Self {
+impl WaveformStyle {
+    /// パレットから既定スタイルを組む (r.md #48)。
+    ///
+    /// **`Default` にはしない**: テーマ色を読む `Default::default()` は隠れたグローバル依存で、
+    /// ライトテーマに追従しない。
+    ///
+    /// 波形インクは **極性固定** (テーマではなく「どんな背景の上に描くか」 で決まる)。 この既定は
+    /// **暗い背景**を前提とした `waveform_on_dark` / `waveform_peak_on_dark`。 ユーザー着色クリップの
+    /// ように背景が可変な呼び出し側は、 塗った背景色から
+    /// [`Palette::waveform_for`] で `fg` / `fg_clipped` を取り直すこと
+    /// (明るいクリップの上で波形が消える事故を構造的に防ぐ)。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            fg: theme::WAVEFORM,
-            fg_clipped: theme::WAVEFORM_PEAK,
+            fg: p.waveform_on_dark,
+            fg_clipped: p.waveform_peak_on_dark,
             fill: None,
-            baseline: Some(theme::GRID_LINE.with_alpha(0.10)),
+            // 中央線はグリッド hairline と同じ層 (テーマ従属)。 既定のグリッドより更に薄い。
+            baseline: Some(p.grid_line.with_alpha(0.10)),
             channel_layout: ChannelLayout::Stack,
             render_mode: WaveformRenderMode::PeakLines,
             line_width_px: 1.0,
@@ -1578,7 +1590,11 @@ mod tests {
         let src = WaveformSource { samples, valid_len: 2_000, generation: 1, sample_rate: 48_000 };
         let pyramid = build_full(&samples, 2_000);
         let rect = Rect { x: 0.0, y: 0.0, w: 20.0, h: 40.0 };
-        let style = WaveformStyle { baseline: None, channel_layout: ChannelLayout::Overlay, ..WaveformStyle::default() };
+        let style = WaveformStyle {
+            baseline: None,
+            channel_layout: ChannelLayout::Overlay,
+            ..WaveformStyle::from_palette(&Palette::dark())
+        };
         let height = |reversed: bool, px: usize| -> f32 {
             let view = WaveformView { start_sample: 0, len_samples: 2_000, vertical_gain: 1.0, reversed };
             let segs = build_peak_segments(&pyramid, &src, rect, view, style);

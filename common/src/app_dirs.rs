@@ -71,6 +71,13 @@ impl AppDirs {
         self.root.join("app_config.json")
     }
 
+    /// `<root>\themes\` — ユーザーが追加したテーマ (`*.json`) の置き場 (r.md #48)。
+    /// ここに置いたファイルが設定画面のテーマ一覧に出る。ディレクトリが無くてもよい
+    /// (= 組込みテーマだけになる)。
+    pub fn themes_dir(&self) -> PathBuf {
+        self.root.join("themes")
+    }
+
     /// `<root>\logs\` — 各プロセスの日次ローテーション tracing ログ置き場。
     /// release で windows-subsystem 化 (コンソール無し) しても、 ここに
     /// `<process>.YYYY-MM-DD` が常時書かれる。 docs/plan_icon_and_console.md (#48)。

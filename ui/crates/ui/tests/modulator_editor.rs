@@ -49,7 +49,7 @@ fn run_mseg(host: &mut UiHost<Obs>, obs: &mut Obs, p: PointerFrame) {
     let node_list = nodes();
     let sample_list = samples();
     let edits = host.frame_to_edits(obs, &mut scene, screen, FrameInput { pointer: p, ..Default::default() }, |_obs, ui| {
-        ui.mseg_editor("t", RECT, &node_list, &sample_list, None, MsegEditorStyle::default(), |act| {
+        ui.mseg_editor("t", RECT, &node_list, &sample_list, None, MsegEditorStyle::from_palette(ui.palette()), |act| {
             Edit::mutate(move |o: &mut Obs| match act {
                 MsegAction::Move { index, time, value } => o.moves.push((index, time, value)),
                 MsegAction::Add { time, value } => o.adds.push((time, value)),
@@ -165,7 +165,7 @@ fn step_grid_drag_emits_set() {
     let screen = PhysicalSize { width: 160, height: 100 };
     // step 0 (x 0..40) の y=30 → value = 1 - 30/100 = 0.7。
     let edits = host.frame_to_edits(&obs, &mut scene, screen, FrameInput { pointer: press(20.0, 30.0, Modifiers::default()), ..Default::default() }, |_o, ui| {
-        ui.step_grid("s", STEP_RECT, &values, Some(1), MsegEditorStyle::default(), |idx, v| {
+        ui.step_grid("s", STEP_RECT, &values, Some(1), MsegEditorStyle::from_palette(ui.palette()), |idx, v| {
             Edit::mutate(move |o: &mut Obs| o.sets.push((idx, v)))
         });
     });

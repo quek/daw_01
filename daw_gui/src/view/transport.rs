@@ -10,51 +10,47 @@ use common::model::{AutomationTarget, MASTER_TRACK_ID, RecordingMode};
 use daw_ui_core::{
     Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
-use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
+use crate::theme::Theme;
 use crate::view::param_gesture::push_param_gesture_edges;
-
-const BG: Color = theme::HEADER;
-const TEXT: Color = theme::TEXT;
 
 const TS_DEN_ITEMS: &[&str] = &["2", "4", "8", "16"];
 
 /// Phase 5 Step 5.1 follow-up (gui_01 #035): BPM scrubable_number style。
 /// sensitivity 0.5 = `1 px drag で 0.5 BPM 変化` (Ableton 流の感度)、
 /// range は SetSongBpmFromScrub handler の clamp と同じ 1..=400。
-/// drag 中の hint band 風に bg_color_dragging が transport の overall
-/// オレンジ tinge に合うよう薄橙系を選ぶ。
-const SCRUB_STYLE_BPM: ScrubableNumberStyle = ScrubableNumberStyle {
-    bg_color: theme::INSET_BG,
-    bg_color_hovered: theme::CONTROL,
-    bg_color_dragging: Color { r: 0.45, g: 0.30, b: 0.20, a: 1.0 },
-    text_color: theme::TEXT,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 3.0,
-    font_size: 13.0,
-    sensitivity: 0.5,
-    range: Some((1.0, 400.0)),
-};
+/// drag 中の背景は `scrub_drag_bg_warm` (暖色版) — テンポは「時間軸そのもの」 を
+/// 触る欄なので、 一般の数値欄 (`scrub_drag_bg`、 寒色) と一目で区別する。
+///
+/// hover は `inset_bg_hover` でなく `control` (= from_palette の既定より 1 段明るい)。
+/// transport の欄は他のクロームより主張させたいので意図的に上書きしている。
+fn scrub_style_bpm(theme: &Theme) -> ScrubableNumberStyle {
+    let p = &theme.core;
+    ScrubableNumberStyle {
+        bg_color_hovered: p.control,
+        bg_color_dragging: p.scrub_drag_bg_warm,
+        radius: 3.0,
+        font_size: 13.0,
+        sensitivity: 0.5,
+        range: Some((1.0, 400.0)),
+        ..ScrubableNumberStyle::from_palette(p)
+    }
+}
 
 /// Phase 5 Step 5.1 follow-up: TimeSig numerator scrubable_number style。
 /// 1 px drag で 0.1 だけ変化 (= 整数値だが widget は f64 値で内部保持、 表示は
 /// `Integer` で int 切り捨て)。 これで 10 px drag = 1 拍子変化、 ユーザーの
 /// 慎重さが必要な操作 (= 拍子変更は楽曲の構造変化なので飛ばすと混乱)。
-const SCRUB_STYLE_TSIG_NUM: ScrubableNumberStyle = ScrubableNumberStyle {
-    bg_color: theme::INSET_BG,
-    bg_color_hovered: theme::CONTROL,
-    bg_color_dragging: Color { r: 0.45, g: 0.30, b: 0.20, a: 1.0 },
-    text_color: theme::TEXT,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 3.0,
-    font_size: 13.0,
-    sensitivity: 0.1,
-    range: Some((1.0, 32.0)),
-};
+/// drag 中の背景は BPM と同じ暖色 (拍子も時間軸そのもの)。
+fn scrub_style_tsig_num(theme: &Theme) -> ScrubableNumberStyle {
+    ScrubableNumberStyle {
+        sensitivity: 0.1,
+        range: Some((1.0, 32.0)),
+        ..scrub_style_bpm(theme)
+    }
+}
 
 /// Phase 4 (`docs/plan_automation.md` §6): transport bar の automation
 /// recording mode 4 way toggle のラベル列。 enum 並びは UI 並びと一致。
@@ -79,19 +75,22 @@ static SCALE_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 static REC_LABELS: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| RECORDING_MODES.iter().map(|(_, l)| *l).collect());
 
+/// transport のボタン共通形 (角丸 4 / 中立の off 面)。 各ボタンは `on_color` と
+/// `font_size` だけを上書きして意味色を足す。
+fn style_transport_button(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle {
+        radius: 4.0,
+        font_size: 16.0,
+        ..ToggleButtonStyle::from_palette(&theme.core)
+    }
+}
+
 /// 再生追従スクロール (Follow) ボタンのスタイル。色は付けない (ユーザー指定) ＝
 /// 追従中も Off も同じ中立色で、状態は label の記号だけで示す。クリックごとに
 /// Off → 連続 → ページ を循環する (= `Alt+F` と同じ `CycleArrangeFollow`)。
-const STYLE_FOLLOW: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::CONTROL,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 16.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+fn style_follow(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle { on_color: theme.core.control, ..style_transport_button(theme) }
+}
 
 /// 追従方式を表す記号 (Follow ボタンの label)。色なしの単色グリフ (ユーザー指定):
 /// ⊘=OFF / ➡=連続スクロール / ⇥=ページめくり (arrow-to-bar = 端でページ送り)。
@@ -108,93 +107,67 @@ fn follow_glyph(mode: common::model::FollowMode) -> &'static str {
 /// Phase 7 B4 Step C/D (2026-05-13): MIDI Record toggle button のスタイル。
 /// active 時 record red (= 業界標準) + hint band で「録音中」 を強調。
 /// count-in 中も同 active state で描画 (label 側で「Count-in...」 表示と
-/// 切り替え)。 STYLE_REC_MODE (橙、 automation recording) と意図的に
+/// 切り替え)。 `style_rec_mode` (橙、 automation recording) と意図的に
 /// 区別 (= MIDI 録音は別概念)。
-const STYLE_RECORD: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::RECORD,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 12.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+fn style_record(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle {
+        on_color: theme.daw.record,
+        font_size: 12.0,
+        ..style_transport_button(theme)
+    }
+}
 
 /// Phase 4: recording mode toggle の見た目。 active 時 off_color (灰)
 /// → on_color (橙) + 下端の hint band で「writing」 状態を強調する。
 /// Bitwig の Touch/Latch/Write ボタンに準拠 (Read 含めて 4 つすべて同 style)。
-const STYLE_REC_MODE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::RECORD_ARM,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 12.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+fn style_rec_mode(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle {
+        on_color: theme.daw.record_arm,
+        font_size: 12.0,
+        ..style_transport_button(theme)
+    }
+}
 
 /// Loop toggle の icon ボタンスタイル。 active 時に Ableton 流の blue 系に染め、
 /// off 時は灰。 record (赤) / automation (橙) と意味的に区別する。 font_size は
 /// 矢印 glyph ⟳ が button (28 px) 内で視認できるよう 16 に拡張。
-const STYLE_LOOP: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::ACCENT,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 16.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+fn style_loop(theme: &Theme) -> ToggleButtonStyle {
+    // on_color は from_palette 既定の `accent` そのまま (= Ableton 流の blue)。
+    style_transport_button(theme)
+}
 
 /// Play toggle の icon ボタンスタイル。 再生中 (active) は LED 風の緑、 停止中は
 /// 灰。 業界標準の transport LED idiom に従う (= Ableton / Bitwig / Reaper)。
 /// label は active 時 ■ (stop)、 inactive 時 ▶ (play) で切り替え。
-const STYLE_PLAY: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::PLAY,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 16.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+fn style_play(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle { on_color: theme.daw.play, ..style_transport_button(theme) }
+}
 
 /// パニックボタンのスタイル。 momentary（toggle ではない）ので
 /// `toggle_button_at` に `value=false` を渡し、 常に off_color が効く。 #76 で配置を
-/// 一番右へ移し、 背景を他の transport ボタンと同じ中立色 (`{0.22,0.22,0.26}`、 Play /
+/// 一番右へ移し、 背景を他の transport ボタンと同じ中立色 (`control`、 Play /
 /// Loop / Metronome の off 時と同一) に揃えた。 旧「常時赤 + label "Panic"」 の強い
 /// 強調をやめ、 ラベルも "!" に圧縮して corner に控えめに置く。 on_color は momentary
-/// ゆえ実描画されないが style 自己整合のため中立の明色にする。
-const STYLE_PANIC: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::CONTROL_ACTIVE,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 16.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+/// ゆえ実描画されないが style 自己整合のため中立の `control_active` にする。
+fn style_panic(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle { on_color: theme.core.control_active, ..style_transport_button(theme) }
+}
 
 /// Click (metronome) toggle の icon ボタンスタイル。 active 時は Ableton 流の
-/// bright yellow 背景 + 黒文字 (= `on_text_color = Some(black)`)、 inactive は
-/// 灰背景 + 白文字 (= `text_color = white`)。 record (赤) / loop (青) / play (緑)
-/// / automation (橙) と意味的に区別。 label は ♬ (16 分音符 ×2、 細かい beat 感)。
+/// bright yellow 背景 + 暗インク (= `on_text_color = Some(ink_on_bright)`)、 inactive は
+/// 中立面 + `text` 。 record (赤) / loop (青) / play (緑) / automation (橙) と
+/// 意味的に区別。 label は ♬ (16 分音符 ×2、 細かい beat 感)。
 /// gui_01 #051 (state-dependent text color) landing で実現。
-const STYLE_CLICK: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::SOLO,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 16.0,
-    text_color: theme::TEXT,
-    on_text_color: Some(theme::TEXT_ON_BRIGHT),
-};
+///
+/// on 面 (`solo`) は**どのテーマでも明るい黄**なので、 その上のインクは `text`
+/// (テーマ従属 = ダークでは明色) ではなく極性固定の `ink_on_bright` を使う。
+fn style_click(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle {
+        on_color: theme.daw.solo,
+        on_text_color: Some(theme.core.ink_on_bright),
+        ..style_transport_button(theme)
+    }
+}
 
 fn ts_den_to_index(den: u8) -> usize {
     match den {
@@ -217,7 +190,8 @@ fn ts_index_to_den(idx: usize) -> u8 {
 }
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    ui.panel("transport_bg", area, BG, 0.0);
+    let p = &app.theme.core;
+    ui.panel("transport_bg", area, p.header, 0.0);
 
     let pad = 12.0;
     let mut x = area.x + pad;
@@ -231,7 +205,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         x,
         area.y + (area.h - 12.0) * 0.5,
         12.0,
-        TEXT,
+        p.text,
     );
     x += 28.0;
 
@@ -253,7 +227,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         f64::from(app.song_doc.song().bpm),
         120.0,
         ScrubableNumberFormat::Decimal(1),
-        &SCRUB_STYLE_BPM,
+        &scrub_style_bpm(&app.theme),
         move |v| {
             #[allow(clippy::cast_possible_truncation)]
             let next = v as f32;
@@ -292,7 +266,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         f64::from(app.song_doc.song().time_sig.0),
         4.0,
         ScrubableNumberFormat::Integer,
-        &SCRUB_STYLE_TSIG_NUM,
+        &scrub_style_tsig_num(&app.theme),
         move |v: f64| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let next = v.round().clamp(1.0, 32.0) as u8;
@@ -323,7 +297,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         x,
         area.y + (area.h - 12.0) * 0.5,
         12.0,
-        TEXT,
+        p.text,
     );
     x += 8.0;
 
@@ -353,7 +327,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         x,
         area.y + (area.h - 12.0) * 0.5,
         12.0,
-        TEXT,
+        p.text,
     );
     x += 28.0;
 
@@ -430,7 +404,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         if play_active { "\u{25A0}" } else { "\u{25B6}" },
         Rect { x, y: cy, w: play_w, h: bh },
         play_active,
-        &STYLE_PLAY,
+        &style_play(&app.theme),
         |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::PlayToggle)),
     );
     x += play_w + 6.0;
@@ -443,7 +417,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         "\u{27F3}",
         Rect { x, y: cy, w: loop_w, h: bh },
         loop_active,
-        &STYLE_LOOP,
+        &style_loop(&app.theme),
         |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleLoop)),
     );
     x += loop_w + 12.0;
@@ -458,7 +432,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         follow_glyph(app.ui_prefs.arrange_follow),
         Rect { x, y: cy, w: follow_w, h: bh },
         false, // 色を付けない (ユーザー指定) ので active 強調はしない
-        &STYLE_FOLLOW,
+        &style_follow(&app.theme),
         |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CycleArrangeFollow)),
     );
     x += follow_w + 12.0;
@@ -502,7 +476,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         "\u{266C}",
         Rect { x, y: cy, w: metro_w, h: bh },
         metro_active,
-        &STYLE_CLICK,
+        &style_click(&app.theme),
         move |_| {
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetMetronomeEnabled(!metro_active))
@@ -536,7 +510,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // Phase 7 B4 Step C/D (2026-05-13): MIDI 録音 toggle。 active で armed
     // track への MIDI input が clip に書き込まれる。 count-in 中は label を
-    // 「Count-in...」 に切り替えて「待機中」 を可視化。 STYLE_RECORD は
+    // 「Count-in...」 に切り替えて「待機中」 を可視化。 `style_record` は
     // 業界標準どおり record red 系。
     // 最長ラベル "Count-in..." = 11 字 * 12 * 0.527 = 69.6px。
     let rec_w = 76.0;
@@ -551,7 +525,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         rec_label,
         Rect { x, y: cy, w: rec_w, h: bh },
         rec_active,
-        &STYLE_RECORD,
+        &style_record(&app.theme),
         move |_| {
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleMidiRecording)
@@ -571,7 +545,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         "Snap Live",
         Rect { x, y: cy, w: snap_live_w, h: bh },
         snap_live_active,
-        &STYLE_REC_MODE,
+        &style_rec_mode(&app.theme),
         move |_| {
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleSnapLiveInput)
@@ -584,7 +558,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 時 click で「次の MIDI CC を selected_track の Volume に bind」 (=
     // 段階 2 minimum scope、 Pan / Tempo / Plugin Param target は段階 4 で
     // dropdown 化予定)。 active 時は Cancel。 selected_track が無ければ
-    // no-op。 既存 STYLE_REC_MODE (橙) を再利用 (= recording mode と同じく
+    // no-op。 既存 `style_rec_mode` (橙) を再利用 (= recording mode と同じく
     // 「現在 user 操作待ちの mode」 強調)。
     // 最長ラベル "Learn Param" / "Learning..." = 11 字 * 12 * 0.527 = 69.6px。
     let learn_w = 76.0;
@@ -607,7 +581,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         learn_label,
         Rect { x, y: cy, w: learn_w, h: bh },
         learn_active,
-        &STYLE_REC_MODE,
+        &style_rec_mode(&app.theme),
         move |_| {
             Edit::mutate(move |app: &mut AppData| {
                 if app.recording.midi_learn_target.is_some() {
@@ -666,12 +640,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             h: 12.0 * 1.2,
         },
         12.0,
-        TEXT,
+        p.text,
     );
 
     // Panic ボタンは transport バーの **一番右** に右端揃えで固定配置する
     // (running `x` を使わず area 右端から逆算するので、 左側に何ボタンが増減しても常に
-    // 右端に張り付く)。 ラベルは "!"、 背景は他ボタンと同じ中立色 (STYLE_PANIC)。
+    // 右端に張り付く)。 ラベルは "!"、 背景は他ボタンと同じ中立色 (`style_panic`)。
     // click で `AppEvent::Panic` を発火 (再生停止 + 全 plugin 再初期化)。
     ui.toggle_button_at(
         "transport_panic",
@@ -683,7 +657,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             h: bh,
         },
         false,
-        &STYLE_PANIC,
+        &style_panic(&app.theme),
         |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Panic)),
     );
 }

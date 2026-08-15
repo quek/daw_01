@@ -11,8 +11,7 @@ use daw_ui_core::{
     Edit, ReorderableListEditRequest, ReorderableListStyle, ScrubableNumberFormat,
     ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
-use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use daw_ui_renderer::Rect;
 
 use crate::app::{
     text_num_to_builtin, AppData, AppEvent, ClipRef, ColorPickerTarget, DiscreteClipEdit,
@@ -22,62 +21,49 @@ use crate::view::modulation::{self as mod_widget, build_mod, scrub_field_mod, Mo
 use crate::view::track_color;
 use common::model::{AutomationTarget, FadeCurve, ImageBuiltinParam, StretchMode, TextAlign};
 
-const BG: Color = theme::PANEL;
-const TEXT: Color = theme::TEXT;
-const TEXT_DIM: Color = theme::TEXT_DIM;
-/// load に失敗した device (= 無音) の見出し / 名前。
-const ERROR_TEXT: Color = theme::TEXT_ERROR;
-const ROW_BG: Color = theme::PANEL_RAISED;
-const ROW_BG_HOVER: Color = theme::CONTROL_HOVER;
-const ROW_BG_DRAGGING: Color = theme::ACCENT.with_alpha(0.85);
-const DROP_INDICATOR: Color = theme::LOOP_BAND;
+// r.md #48: style は const にできない (const はランタイムのパレットを読めず、テーマを
+// 切り替えても古い色のまま残る)。 いずれも `Theme` を受け取る fn にして、 ui-core の
+// `from_palette` を base にした差分だけをここで宣言する。
 
-// Audio event toggle (Reverse / Muted) 用 style。 mixer_strips の
-// STYLE_MUTE / STYLE_SOLO とほぼ同じだが、 inspector 側に独立して定義
-// (mixer の private const を import するより、 同 widget 並びの一覧性を
-// 優先)。 hint band は無し (= 単純トグル) にして、 文字 + ON/OFF 色だけで
-// 状態を伝える。
-const TOGGLE_AUDIO_BASE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::ACCENT,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 12.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+/// Audio event toggle (Reverse / Muted) 用 style。 mixer_strips の
+/// STYLE_MUTE / STYLE_SOLO とほぼ同じだが、 inspector 側に独立して定義
+/// (mixer の private style を import するより、 同 widget 並びの一覧性を
+/// 優先)。 hint band は無し (= 単純トグル) にして、 文字 + ON/OFF 色だけで
+/// 状態を伝える。
+pub(super) fn toggle_audio_style(theme: &crate::theme::Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle {
+        radius: 4.0,
+        font_size: 12.0,
+        ..ToggleButtonStyle::from_palette(&theme.core)
+    }
+}
 
-// Image PiP の automate toggle 用 style (= lane を作る / 削除する 1 個
-// 1 個のボタン)。 ON 状態は arrangement lane 行のヘッダ色 (薄い藤色) と
-// 揃えて「この field は lane 駆動中」 を視覚化。
-const TOGGLE_IMAGE_AUTOMATE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    // ON 色は arrangement automation lane ヘッダの「薄い藤色」に揃えた専用色。theme に
-    // automation-lane purple の token が無いので一点物としてベタ書きを残す。
-    on_color: Color { r: 0.78, g: 0.55, b: 0.85, a: 1.0 },
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 11.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+/// Image PiP / Group Transform / Text の automate toggle 用 style (= lane を作る /
+/// 削除する 1 個 1 個のボタン)。 ON 色は arrangement automation lane ヘッダと同じ
+/// `daw.automation_lane` (薄い藤色) で、「この field は lane 駆動中」 を視覚化する。
+fn toggle_automate_style(theme: &crate::theme::Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle {
+        on_color: theme.daw.automation_lane,
+        radius: 4.0,
+        font_size: 11.0,
+        ..ToggleButtonStyle::from_palette(&theme.core)
+    }
+}
 
-// Group Transform の scrubable_number base style。 sensitivity / range は param
-// 別に上書きする。 ドラッグで連続変化 / click で text 入力 / dblclick で reset。
-const SCRUB_STYLE_GROUP: ScrubableNumberStyle = ScrubableNumberStyle {
-    bg_color: theme::INSET_BG,
-    bg_color_hovered: theme::CONTROL,
-    bg_color_dragging: theme::ACCENT,
-    text_color: TEXT,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 3.0,
-    font_size: 11.0,
-    sensitivity: 0.004,
-    range: None,
-};
+/// inspector (audio / image / text / plugin param) と Group Transform が共有する
+/// scrubable_number の base style。 sensitivity / range は param 別に上書きする。
+/// ドラッグで連続変化 / click で text 入力 / dblclick で reset。
+pub(super) fn scrub_style(theme: &crate::theme::Theme) -> ScrubableNumberStyle {
+    ScrubableNumberStyle {
+        // hover は窪みの既定 (`inset_bg_hover`) ではなく 1 段持ち上げた `control`。
+        // inspector は同幅の数値欄が縦に何本も並ぶので、 hover 中の 1 本が面から
+        // はっきり離れないと「いまどの行を掴んでいるか」 が読めない。
+        bg_color_hovered: theme.core.control,
+        font_size: 11.0,
+        sensitivity: 0.004,
+        ..ScrubableNumberStyle::from_palette(&theme.core)
+    }
+}
 
 /// audio / image / text inspector
 /// の数値 field を 1 行ぶん描く共通 helper。 `ui.scrubable_number_at` を呼び、
@@ -161,11 +147,6 @@ fn scrub_field(
     }
 }
 
-/// audio / image / text inspector の scrubable_number base style。
-/// sensitivity / range は field 別に上書きする (= Group Transform と同 idiom、
-/// `SCRUB_STYLE_GROUP` を共有)。
-const SCRUB_STYLE_INSPECTOR: ScrubableNumberStyle = SCRUB_STYLE_GROUP;
-
 const STRETCH_MODE_LABELS: &[&str] = &["Raw", "Repitch", "Stretch", "Slice"];
 
 fn stretch_mode_to_index(m: StretchMode) -> usize {
@@ -204,18 +185,16 @@ fn fade_curve_from_index(i: usize) -> FadeCurve {
     }
 }
 
-const CHAIN_LIST_STYLE: ReorderableListStyle = ReorderableListStyle {
-    row_height: 26.0,
-    row_gap: 3.0,
-    row_bg: ROW_BG,
-    row_bg_hover: ROW_BG_HOVER,
-    row_bg_selected: ROW_BG,
-    row_bg_dragging: ROW_BG_DRAGGING,
-    drop_indicator_color: DROP_INDICATOR,
-    drop_indicator_h: 2.0,
-    radius: 3.0,
-    drag_handle_w: 0.0,
-};
+/// チェーン (device 一覧) の reorder list style。
+/// 「選択」 は param パネルの開閉で示すので、 選択行は accent で塗らず静止行と同じ面のまま。
+fn chain_list_style(theme: &crate::theme::Theme) -> ReorderableListStyle {
+    ReorderableListStyle {
+        row_gap: 3.0,
+        row_bg_selected: theme.core.panel_raised,
+        radius: 3.0,
+        ..ReorderableListStyle::from_palette(&theme.core)
+    }
+}
 
 // ---- Sidechain セクションの行レイアウト (高さ予約と描画の SSoT) ----------
 /// 1 行目 = プラグイン名 (行幅いっぱい)。
@@ -247,7 +226,8 @@ fn image_source_label(src: &common::model::ImageSource) -> String {
 }
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    ui.panel("inspector_bg", area, BG, 0.0);
+    let p = &app.theme.core;
+    ui.panel("inspector_bg", area, p.panel, 0.0);
 
     let pad = 12.0;
     let mut y = area.y + pad;
@@ -259,7 +239,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         area.x + pad,
         y,
         16.0,
-        TEXT,
+        p.text,
     );
 
     // v18 (`docs/plan_track_clip_color.md`): タイトル行右端に track 色スウォッチ。
@@ -279,7 +259,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "inspector_color_swatch_fill",
             swatch,
             fill,
-            theme::BORDER,
+            p.border,
             1.0,
             4.0,
         );
@@ -348,7 +328,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT,
+            p.text,
         );
         y += 18.0;
 
@@ -362,7 +342,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "Reverse",
             Rect { x: area.x + pad, y, w: toggle_w, h: toggle_h },
             summary.reversed,
-            &TOGGLE_AUDIO_BASE,
+            &toggle_audio_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     // 選択全クリップへ一括 (variant-safe broadcast)。
@@ -384,7 +364,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 h: toggle_h,
             },
             summary.muted,
-            &TOGGLE_AUDIO_BASE,
+            &toggle_audio_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
@@ -403,7 +383,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             11.0,
-            TEXT,
+            p.text,
         );
         y += 16.0;
         let dropdown_rect = Rect {
@@ -446,7 +426,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -459,7 +439,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &ScrubableNumberStyle {
                 sensitivity: 0.1,
                 range: Some((-80.0, 24.0)),
-                ..SCRUB_STYLE_INSPECTOR
+                ..scrub_style(&app.theme)
             },
             InspectorScrubField::Gain,
             move |t, v| AppEvent::SetClipGainDb { target: t, gain_db: v as f32 },
@@ -473,7 +453,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -487,7 +467,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &ScrubableNumberStyle {
                 sensitivity: 0.004,
                 range: Some((-1.0, 1.0)),
-                ..SCRUB_STYLE_INSPECTOR
+                ..scrub_style(&app.theme)
             },
             InspectorScrubField::Pan,
             move |t, v| AppEvent::SetClipPan { target: t, pan: v as f32 },
@@ -501,7 +481,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -517,7 +497,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     f64::from(-common::model::PITCH_SEMITONES_LIMIT),
                     f64::from(common::model::PITCH_SEMITONES_LIMIT),
                 )),
-                ..SCRUB_STYLE_INSPECTOR
+                ..scrub_style(&app.theme)
             },
             InspectorScrubField::Pitch,
             move |t, v| AppEvent::SetClipPitchSemitones { target: t, semitones: v as f32 },
@@ -533,7 +513,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -549,7 +529,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     f64::from(-common::model::FORMANT_SEMITONES_LIMIT),
                     f64::from(common::model::FORMANT_SEMITONES_LIMIT),
                 )),
-                ..SCRUB_STYLE_INSPECTOR
+                ..scrub_style(&app.theme)
             },
             InspectorScrubField::Formant,
             move |t, v| AppEvent::SetClipFormantSemitones { target: t, semitones: v as f32 },
@@ -570,7 +550,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             10.0,
-            theme::TEXT_DIM,
+            p.text_dim,
         );
         y += 14.0;
 
@@ -593,7 +573,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -606,7 +586,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &ScrubableNumberStyle {
                 sensitivity: 0.01,
                 range: Some((0.0, fade_max)),
-                ..SCRUB_STYLE_INSPECTOR
+                ..scrub_style(&app.theme)
             },
             InspectorScrubField::FadeIn,
             move |t, v| AppEvent::SetClipFadeInBeats { target: t, beats: v },
@@ -635,7 +615,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -648,7 +628,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &ScrubableNumberStyle {
                 sensitivity: 0.01,
                 range: Some((0.0, fade_max)),
-                ..SCRUB_STYLE_INSPECTOR
+                ..scrub_style(&app.theme)
             },
             InspectorScrubField::FadeOut,
             move |t, v| AppEvent::SetClipFadeOutBeats { target: t, beats: v },
@@ -693,7 +673,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT,
+            p.text,
         );
         y += 18.0;
 
@@ -717,7 +697,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "Mute",
             Rect { x: area.x + pad, y, w: row_w, h: toggle_h },
             summary.muted,
-            &TOGGLE_AUDIO_BASE,
+            &toggle_audio_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
@@ -733,7 +713,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let style_unit = ScrubableNumberStyle {
             sensitivity: 0.004,
             range: Some((0.0, 1.0)),
-            ..SCRUB_STYLE_INSPECTOR
+            ..scrub_style(&app.theme)
         };
 
         // X
@@ -743,7 +723,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -763,7 +743,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "A",
             Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
             x_auto_on,
-            &TOGGLE_IMAGE_AUTOMATE,
+            &toggle_automate_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     let ev = if x_auto_on {
@@ -784,7 +764,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -804,7 +784,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "A",
             Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
             y_auto_on,
-            &TOGGLE_IMAGE_AUTOMATE,
+            &toggle_automate_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     let ev = if y_auto_on {
@@ -825,7 +805,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -845,7 +825,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "A",
             Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
             w_auto_on,
-            &TOGGLE_IMAGE_AUTOMATE,
+            &toggle_automate_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     let ev = if w_auto_on {
@@ -866,7 +846,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -886,7 +866,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "A",
             Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
             h_auto_on,
-            &TOGGLE_IMAGE_AUTOMATE,
+            &toggle_automate_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     let ev = if h_auto_on {
@@ -907,7 +887,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -927,7 +907,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "A",
             Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
             opacity_auto_on,
-            &TOGGLE_IMAGE_AUTOMATE,
+            &toggle_automate_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     let ev = if opacity_auto_on {
@@ -953,7 +933,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         // Rotation は degree 表示 / 入力（model は radians）。 on_change で
         // degree→radians 変換、 handler 側が -π..π に wrap するので range なし。
@@ -972,7 +952,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 // 度域 range で modulation の色帯/live tick を描けるように (gui_01
                 // overlay は range 必須)。handler は -π..π wrap のまま。
                 range: Some((-180.0, 180.0)),
-                ..SCRUB_STYLE_INSPECTOR
+                ..scrub_style(&app.theme)
             },
             InspectorScrubField::ImageRotation,
             move |t, v| AppEvent::SetClipImageRotation {
@@ -986,7 +966,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "A",
             Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
             rotation_auto_on,
-            &TOGGLE_IMAGE_AUTOMATE,
+            &toggle_automate_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     let ev = if rotation_auto_on {
@@ -1020,7 +1000,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -1033,7 +1013,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &ScrubableNumberStyle {
                 sensitivity: 0.01,
                 range: Some((0.0, fade_max)),
-                ..SCRUB_STYLE_INSPECTOR
+                ..scrub_style(&app.theme)
             },
             InspectorScrubField::ImageFadeIn,
             move |t, v| AppEvent::SetClipFadeInBeats { target: t, beats: v },
@@ -1062,7 +1042,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         scrub_field(
             ui,
@@ -1075,7 +1055,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &ScrubableNumberStyle {
                 sensitivity: 0.01,
                 range: Some((0.0, fade_max)),
-                ..SCRUB_STYLE_INSPECTOR
+                ..scrub_style(&app.theme)
             },
             InspectorScrubField::ImageFadeOut,
             move |t, v| AppEvent::SetClipFadeOutBeats { target: t, beats: v },
@@ -1107,7 +1087,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     {
         let chain = app.inspector_chain();
         let cursor_tid = app.cursor_track_id();
-        let row_total_h = CHAIN_LIST_STYLE.row_height + CHAIN_LIST_STYLE.row_gap;
+        let chain_style = chain_list_style(&app.theme);
+        let row_total_h = chain_style.row_height + chain_style.row_gap;
         // 開いているデバイスの chain device_index (open_plugin_params / open_video_fx_params、
         // cursor track 上のものだけ)。
         let open_dev: Option<u32> = app
@@ -1125,7 +1106,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             + 4.0;
         let btn_gui_w = 44.0;
         let btn_x_w = 30.0;
-        ui.label_at("inspector_chain_label", "Chain", area.x + pad, y, 12.0, TEXT);
+        ui.label_at("inspector_chain_label", "Chain", area.x + pad, y, 12.0, p.text);
         y += 18.0;
         // 他セクションと同じ左右 pad を取る。 旧実装は area 幅いっぱい (280px) だった
         // ため、 inspector 本体が縦スクロールすると右端 10px が scrollbar に隠れ、
@@ -1137,7 +1118,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             chain_rect,
             &chain,
             None,
-            &CHAIN_LIST_STYLE,
+            &chain_style,
             |req| match req {
                 ReorderableListEditRequest::Reorder(order) => {
                     Edit::mutate(move |app: &mut AppData| {
@@ -1177,7 +1158,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         h: 11.0 * 1.2,
                     },
                     11.0,
-                    if failed { ERROR_TEXT } else { TEXT },
+                    if failed { p.text_error } else { p.text },
                 );
                 if entry.shows_button() {
                     let label = if entry.shows_param_panel() { "Par" } else { "GUI" };
@@ -1229,7 +1210,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT,
+            p.text,
         );
         y += 18.0;
 
@@ -1311,9 +1292,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     "Opacity",
                 ),
             };
-            ui.label_at((param, "group_label"), label, area.x + pad, y + 5.0, 11.0, TEXT);
+            ui.label_at((param, "group_label"), label, area.x + pad, y + 5.0, 11.0, p.text);
             let style =
-                ScrubableNumberStyle { sensitivity: sens, range, ..SCRUB_STYLE_GROUP };
+                ScrubableNumberStyle { sensitivity: sens, range, ..scrub_style(&app.theme) };
             // per-control modulation (docs/plan_modulation_routing_redesign.md §6):
             // 立ち絵を音でドラッグ変調する Bitwig 流。全 8 param を対象 (Rotation は
             // deg↔rad、ScaleX/Y は log space を `build_mod` が到達値ベースで吸収)。
@@ -1373,7 +1354,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 "A",
                 Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
                 auto_on,
-                &TOGGLE_IMAGE_AUTOMATE,
+                &toggle_automate_style(&app.theme),
                 move |_| {
                     Edit::mutate(move |app: &mut AppData| {
                         let ev = if auto_on {
@@ -1394,7 +1375,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 各 param を scrubable_number で実レンジ表示 + per-control 変調（Ranged domain で kick→効果）。
     // 値の SSoT は PluginParam lane の default_value（`SetVideoFxParam` が格納）。
     if let Some(view) = app.inspector_video_fx_params() {
-        ui.label_at("inspector_vfx_label", view.def.name, area.x + pad, y, 12.0, TEXT);
+        ui.label_at("inspector_vfx_label", view.def.name, area.x + pad, y, 12.0, p.text);
         y += 18.0;
         let row_w = area.w - pad * 2.0;
         let input_h = 22.0;
@@ -1424,10 +1405,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     h: 11.0 * 1.2,
                 },
                 11.0,
-                TEXT,
+                p.text,
             );
-            let style =
-                ScrubableNumberStyle { sensitivity: sens, range: Some((min, max)), ..SCRUB_STYLE_GROUP };
+            let style = ScrubableNumberStyle {
+                sensitivity: sens,
+                range: Some((min, max)),
+                ..scrub_style(&app.theme)
+            };
             let target = AutomationTarget::PluginParam {
                 device_id,
                 param_id: param.id,
@@ -1496,7 +1480,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &view.plugin_name,
             Rect { x: area.x + pad, y, w: (area.w - pad * 2.0).max(1.0), h: 12.0 * 1.2 },
             12.0,
-            TEXT,
+            p.text,
         );
         y += 18.0;
 
@@ -1506,12 +1490,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let label_w = 96.0;
         let input_x = area.x + pad + label_w;
         let input_w = (row_w - label_w).max(40.0);
-        for (i, p) in view.params.iter().enumerate() {
+        for (i, row) in view.params.iter().enumerate() {
             // param 名はプラグイン由来で長さ上限が無い。 label_w(96) を超えると
             // 後続の値ボックス (不透明 bg) に覆われて途中で消えるので rect で切る。
             ui.label_at_clipped(
                 (i, "pp_name"),
-                &p.name,
+                &row.name,
                 Rect {
                     x: area.x + pad,
                     y: y + 5.0,
@@ -1519,39 +1503,39 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     h: 11.0 * 1.2,
                 },
                 11.0,
-                TEXT,
+                p.text,
             );
-            if p.readonly {
+            if row.readonly {
                 // 編集不可 param は現値をラベル表示するだけ。
-                let txt = format!("{:.3}", p.value_real);
+                let txt = format!("{:.3}", row.value_real);
                 ui.label_at_clipped(
                     (i, "pp_ro"),
                     &txt,
                     Rect { x: input_x, y: y + 5.0, w: input_w, h: 11.0 * 1.2 },
                     11.0,
-                    TEXT,
+                    p.text,
                 );
                 y += input_h + 4.0;
                 continue;
             }
-            let (min, max) = (p.min, p.max);
+            let (min, max) = (row.min, row.max);
             #[allow(clippy::cast_possible_truncation)]
             let sens = (((max - min) / 220.0).max(0.0001)) as f32;
             let style = ScrubableNumberStyle {
                 sensitivity: sens,
                 range: Some((min, max)),
-                ..SCRUB_STYLE_GROUP
+                ..scrub_style(&app.theme)
             };
             let target = AutomationTarget::PluginParam {
                 device_id,
-                param_id: p.id,
+                param_id: row.id,
                 legacy_device_index: None,
             };
             let domain = crate::app::ModControlDomain::Ranged { min, max, log: false };
-            let mod_build = build_mod(app, target.clone(), p.value_real, domain, track_id);
+            let mod_build = build_mod(app, target.clone(), row.value_real, domain, track_id);
             let modulation = Some(mod_build.modulation());
-            let param_id = p.id;
-            let fmt = if p.stepped {
+            let param_id = row.id;
+            let fmt = if row.stepped {
                 ScrubableNumberFormat::Decimal(0)
             } else {
                 ScrubableNumberFormat::Decimal(3)
@@ -1559,8 +1543,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let resp = ui.scrubable_number_at(
                 (i, "pp_scrub"),
                 Rect { x: input_x, y, w: input_w, h: input_h },
-                p.value_real,
-                p.default_real,
+                row.value_real,
+                row.default_real,
                 fmt,
                 &style,
                 move |v| {
@@ -1636,7 +1620,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT,
+            p.text,
         );
         y += 18.0;
 
@@ -1658,7 +1642,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "Mute",
             Rect { x: area.x + pad, y, w: row_w, h: toggle_h },
             summary.muted,
-            &TOGGLE_AUDIO_BASE,
+            &toggle_audio_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::BroadcastDiscreteClipEdit {
@@ -1677,7 +1661,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         let text_resp = ui.text_input_at(
             "inspector_text_content_input",
@@ -1706,7 +1690,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         let font_btn_label = if app.ui_ephemeral.clip_text_font_family_edit_text.is_empty() {
             "(default)".to_string()
@@ -1731,7 +1715,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         const ALIGN_LABELS: &[&str] = &["Left", "Center", "Right"];
         let align_idx = match summary.align {
@@ -1783,7 +1767,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     h: 11.0 * 1.2,
                 },
                 11.0,
-                TEXT,
+                p.text,
             );
             // field 別の (書式, range, sensitivity[units/px])。 clamp は handler
             // (`set_clip_text_num_field`) と一致させる。
@@ -1839,7 +1823,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 TextNumField::FontSize => 48.0,
                 _ => 0.0,
             };
-            let style = ScrubableNumberStyle { sensitivity: sens, range, ..SCRUB_STYLE_INSPECTOR };
+            let style =
+                ScrubableNumberStyle { sensitivity: sens, range, ..scrub_style(&app.theme) };
             scrub_field(
                 ui,
                 app,
@@ -1867,7 +1852,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     "A",
                     Rect { x: auto_btn_x, y: *row_y, w: auto_btn_w, h: input_h },
                     auto_on,
-                    &TOGGLE_IMAGE_AUTOMATE,
+                    &toggle_automate_style(&app.theme),
                     move |_| {
                         Edit::mutate(move |app: &mut AppData| {
                             let ev = if auto_on {
@@ -1928,7 +1913,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         if let Some(picked) = ui.dropdown(
             "inspector_text_fade_in_curve",
@@ -1951,7 +1936,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y + 5.0,
             11.0,
-            TEXT,
+            p.text,
         );
         if let Some(picked) = ui.dropdown(
             "inspector_text_fade_out_curve",
@@ -2018,7 +2003,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT,
+            p.text,
         );
         y += 18.0;
 
@@ -2031,7 +2016,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + pad + 4.0,
                 y + 6.0,
                 11.0,
-                TEXT,
+                p.text,
             );
             y += 26.0;
         } else {
@@ -2171,7 +2156,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT,
+            p.text,
         );
         y += 18.0;
 
@@ -2214,7 +2199,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + pad,
                 y + 5.0,
                 11.0,
-                TEXT,
+                p.text,
             );
             let resp = ui.text_input_at(
                 "inspector_talk_text_input",
@@ -2253,7 +2238,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + pad + 4.0,
                 y + 6.0,
                 11.0,
-                TEXT,
+                p.text,
             );
             y += 26.0;
         } else {
@@ -2366,7 +2351,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + pad,
                 y + 4.0,
                 11.0,
-                TEXT,
+                p.text,
             );
             let input_rect = Rect {
                 x: area.x + pad + 48.0,
@@ -2380,7 +2365,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 val,
                 default,
                 ScrubableNumberFormat::Decimal(2),
-                &SCRUB_STYLE_INSPECTOR,
+                &scrub_style(&app.theme),
                 move |v| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::SetClipTalkParam {
@@ -2452,7 +2437,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             y,
             12.0,
-            TEXT,
+            p.text,
         );
         y += 18.0;
         let dropdown_rect = Rect {
@@ -2536,7 +2521,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + pad,
                 y,
                 12.0,
-                TEXT,
+                p.text,
             );
             y += 18.0;
             // import 済み image source の (id, ファイル名) 一覧 (id 昇順)。
@@ -2575,7 +2560,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     area.x + pad,
                     y + 5.0,
                     11.0,
-                    TEXT,
+                    p.text,
                 );
                 let dropdown_rect = Rect {
                     x: area.x + pad + 40.0,

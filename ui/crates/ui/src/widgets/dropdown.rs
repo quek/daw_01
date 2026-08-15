@@ -6,7 +6,6 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
-use crate::theme;
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
@@ -37,16 +36,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let already_open = self.is_popup_open(popup_id);
 
         // 1. 本体描画 (現在値の表示 + 三角アロー)
-        let bg_fill = if inside {
-            theme::INSET_BG.lighten(0.06)
-        } else {
-            theme::INSET_BG
-        };
-        let border = if already_open {
-            theme::BORDER_FOCUS
-        } else {
-            theme::BORDER
-        };
+        // palette の寿命は host の `'a` なので、 以後の `push_rect` / `push_text` (= `&mut self`)
+        // と衝突しない。 1 度取って本体描画の全色に使う。
+        let p = self.palette();
+        let bg_fill = if inside { p.inset_bg_hover } else { p.inset_bg };
+        let border = if already_open { p.border_focus } else { p.border };
         self.push_rect(RectCommand {
             rect,
             fill: bg_fill,
@@ -71,7 +65,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: rect.y + (rect.h - DROPDOWN_FONT * 1.2) * 0.5,
                 font_size: DROPDOWN_FONT,
                 line_height: DROPDOWN_FONT * 1.2,
-                color: theme::TEXT,
+                color: p.text,
                 clip_rect: Some(Rect {
                     x: rect.x + DROPDOWN_PAD_X,
                     y: rect.y,
@@ -86,7 +80,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let arrow_x = rect.x + rect.w - DROPDOWN_ARROW_W * 0.5;
         let arrow_y = rect.y + rect.h * 0.5;
         let arrow_size = 4.0;
-        let arrow_color = theme::TEXT_DIM;
+        let arrow_color = p.text_dim;
         self.push_lines(LineBatch {
             segments: vec![
                 LineSegment {

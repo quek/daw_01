@@ -44,6 +44,12 @@ pub struct AppData {
     pub ui_prefs: UiPrefs,
     /// 一時 UI 状態 (hover / picker / rename / menu / modal / scrub)。
     pub ui_ephemeral: UiEphemeral,
+    /// r.md #48: いま有効なテーマ (汎用パレット + DAW 固有トークン) の **SSoT**。
+    /// view は `app.theme.core.<token>` / `app.theme.daw.<token>` で色を読む。
+    /// `theme.core` は `UiHost` が持つ実体と同じ `Arc` で、runner が毎フレーム
+    /// `UiHost::set_palette` に流し込む (変化していたら描画キャッシュを捨てる)。
+    /// 選択中の id は `theme.id` が持つので別フィールドに複製しない。
+    pub theme: crate::theme::Theme,
 }
 
 impl AppData {

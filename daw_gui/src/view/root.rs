@@ -7,13 +7,13 @@
 use daw_ui_core::{Edit, Orientation, Ui};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::Rect;
-use crate::theme;
 
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::view::{
     arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
-    font_picker, load_overlay, plugin_picker, recovery_modal, resource_monitor, shortcuts_help,
-    snap, status_bar, track_inspector, track_picker, transport, undo_history, voicevox_overlay,
+    font_picker, load_overlay, plugin_picker, recovery_modal, resource_monitor, settings,
+    shortcuts_help, snap, status_bar, track_inspector, track_picker, transport, undo_history,
+    voicevox_overlay,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -32,11 +32,12 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     let sw = screen.width as f32;
     let sh = screen.height as f32;
 
-    // 全画面背景。
+    // 全画面背景 = アプリの床。 全 panel がこの上に浮いて見える (`Palette::is_dark`
+    // の判定基準でもあるので、 テーマ切替はまずここが変わる)。
     ui.panel(
         "root_bg",
         Rect { x: 0.0, y: 0.0, w: sw, h: sh },
-        theme::WINDOW_BG,
+        app.theme.core.window_bg,
         0.0,
     );
 
@@ -45,6 +46,9 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // アレンジ等に漏れず、 window の外は通常操作できる true floating)。 本体描画は
     // build_root 末尾で `undo_history::draw`。
     undo_history::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+    // r.md #48: 設定 window も同じ true-floating 機構 (背景を暗転しないので、
+    // テーマを選んだ瞬間に背後の全画面が切り替わるのを見ながら選べる)。
+    settings::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
     // ----- レイアウト計算 -----
     let menu_rect = Rect { x: 0.0, y: 0.0, w: sw, h: MENU_H };
@@ -116,6 +120,9 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // (背景描画の後 = z-order 最前面)。 pointer 占有予約は build_root 冒頭の
     // `undo_history::reserve`。
     undo_history::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+
+    // 設定 window (r.md #48): 同上、 背景描画の後 = z-order 最前面。
+    settings::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
     // Modal: plugin picker。draw 関数内で modal の open/close を app.ui_ephemeral.is_plugin_picker_open
     // と同期させる (常時呼び、内部で is_modal_open / open_modal を管理)。
@@ -282,6 +289,13 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                 // is_pianoroll_active=false で選択集合ベースの解決になる。
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.delete_current_surface(false);
+                }));
+            });
+            // r.md #48: アプリ全体の設定 (テーマ選択)。 Ardour / Cubase の Windows 版が
+            // Edit > Preferences なので、 DAW に慣れた人が最初に見る場所に置く。
+            m.item("設定...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleSettings)
                 }));
             });
         });
@@ -652,6 +666,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.toggle_undo_history") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ToggleUndoHistory)
+        }));
+    }
+    // r.md #48: Ctrl+, で設定を開閉 (Edit メニュー「設定...」 と同じイベント)。
+    if ui.take_shortcut("daw.toggle_settings") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::ToggleSettings)
         }));
     }
     // ----- Clipboard / Delete (統一 arbiter) -----
@@ -1163,6 +1183,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleUndoHistory)
             }));
+        } else if app.ui_prefs.settings_open {
+            // r.md #48: 設定 window が開いていれば Esc で閉じる (同順)。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleSettings)
+            }));
         } else if !app.selection.selected_clips.is_empty()
             || app.selection.selected_clip.is_some()
             || !app.selection.selected_notes.is_empty()
@@ -1307,6 +1332,23 @@ mod tests {
             app.selection.selected_notes,
             vec![1],
             "パネルを閉じる Esc は選択を解除しない",
+        );
+    }
+
+    /// r.md #48: 設定 window が開いている間の Esc は window を閉じ、選択は維持する
+    /// (編集履歴 window / resource panel と同順)。 ここが抜けると Esc で閉じられず、
+    /// 代わりに選択が消える。
+    #[test]
+    fn escape_closes_settings_window_before_clearing_selection() {
+        let mut app = build_app();
+        app.ui_prefs.settings_open = true;
+        app.selection.selected_notes = vec![1];
+        dispatch_escape(&mut app);
+        assert!(!app.ui_prefs.settings_open, "Esc は開いている設定 window を閉じる");
+        assert_eq!(
+            app.selection.selected_notes,
+            vec![1],
+            "設定 window を閉じる Esc は選択を解除しない",
         );
     }
 }

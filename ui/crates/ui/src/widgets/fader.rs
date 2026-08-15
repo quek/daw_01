@@ -18,7 +18,6 @@ use std::hash::Hash;
 use std::time::Instant;
 
 use daw_ui_renderer::{Color, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -465,11 +464,13 @@ fn draw_fader<M: ?Sized + 'static>(
     dragging: bool,
     pointer: crate::input::PointerFrame,
 ) {
+    let p = ui.palette();
+
     // 背景パネル (列全体)
     ui.push_rect(RectCommand {
         rect: col,
-        fill: theme::PANEL,
-        border: theme::BORDER,
+        fill: p.panel,
+        border: p.border,
         border_width: 1.0,
         radius: [4.0; 4],
         clip_rect: None,
@@ -480,7 +481,7 @@ fn draw_fader<M: ?Sized + 'static>(
     // 細い track
     ui.push_rect(RectCommand {
         rect: track,
-        fill: theme::INSET_BG,
+        fill: p.inset_bg,
         border: Color::TRANSPARENT,
         border_width: 0.0,
         radius: [3.0; 4],
@@ -497,7 +498,7 @@ fn draw_fader<M: ?Sized + 'static>(
                 w: track.w,
                 h: filled_h,
             },
-            fill: theme::ACCENT,
+            fill: p.accent,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [3.0; 4],
@@ -506,13 +507,12 @@ fn draw_fader<M: ?Sized + 'static>(
     }
 
     // thumb: flat な水平バー (border / shadow なし、Ableton 系ミニマル)。
-    // bright-neutral な可動ハンドル surface に当たる theme token が無いため literal 維持。
-    let base = Color::rgb(0.78, 0.82, 0.90);
-    let press = Color::rgb(0.95, 0.97, 1.00);
+    // 可動ハンドルの面は `handle` / `handle_active` トークン (周囲の面より必ず目立つ中立色。
+    // ライトテーマでは暗い側に反転するので、 明度固定の literal では成立しない)。
     let thumb_fill = if dragging || hovered(thumb, pointer) {
-        press
+        p.handle_active
     } else {
-        base
+        p.handle
     };
     ui.push_rect(RectCommand {
         rect: thumb,
@@ -562,6 +562,7 @@ fn draw_fader_modulation_overlay<M: ?Sized + 'static>(
     live_value: Option<f64>,
     edit_color: Option<Color>,
 ) {
+    let p = ui.palette();
     let track_w = 6.0;
     let track_x = col.x + (col.w - track_w) * 0.5;
     let y_of = |f: f32| -> f32 {
@@ -622,9 +623,8 @@ fn draw_fader_modulation_overlay<M: ?Sized + 'static>(
     if !entries.is_empty() || live_value.is_some() || edit_color.is_some() {
         ui.push_rect(RectCommand {
             rect: Rect { x: track_x - 2.0, y: base_y - 0.5, w: track_w + 4.0, h: 1.0 },
-            // modulation base 位置の中立マーカー線。 modulation 専用マーカーの theme token が
-            // 無いため literal 維持。
-            fill: Color::rgba(0.70, 0.70, 0.75, 0.9),
+            // modulation base 位置の中立マーカー線 (r.md #48 で専用トークン化)。
+            fill: p.modulation_base_marker,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
@@ -637,9 +637,8 @@ fn draw_fader_modulation_overlay<M: ?Sized + 'static>(
         let ly = y_of(lv as f32);
         ui.push_rect(RectCommand {
             rect: Rect { x: track_x - 3.0, y: ly - 1.0, w: track_w + 6.0, h: 2.0 },
-            // modulation の live 出力値マーク (amber)。 modulation-live indicator 用の theme
-            // token が無いため literal 維持 (knob と共通の amber)。
-            fill: Color::rgba(1.0, 0.85, 0.30, 0.95),
+            // modulation の live 出力値マーク (amber、r.md #48 で専用トークン化)。
+            fill: p.modulation_live,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],

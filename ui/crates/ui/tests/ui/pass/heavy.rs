@@ -103,7 +103,7 @@ fn main() {
                     WaveformStyle {
                         channel_layout: ChannelLayout::Stack,
                         render_mode: WaveformRenderMode::PeakLines,
-                        ..WaveformStyle::default()
+                        ..WaveformStyle::from_palette(hctx.palette())
                     },
                 );
             });

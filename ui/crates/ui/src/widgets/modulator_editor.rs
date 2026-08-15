@@ -20,11 +20,11 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
+use crate::theme::{Palette, WaveformInk};
 use crate::ui::{Ui, hovered};
 
 /// MSEG の 1 ブレークポイント (描画 / hit-test 用の plain コピー)。`curve` は
@@ -63,19 +63,26 @@ pub struct MsegEditorStyle {
     pub cursor_color: Color,
 }
 
-impl Default for MsegEditorStyle {
-    fn default() -> Self {
+impl MsegEditorStyle {
+    /// パレット由来の既定スタイル。テーマ色を読む `Default` は**持たない** —
+    /// `Default::default()` はパレットを知らない隠れたグローバル依存になり、
+    /// ライトテーマに追従できないため (r.md #48)。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            bg: theme::INSET_BG,
-            grid: theme::GRID_LINE,
-            line_color: theme::CURVE,
+            bg: p.inset_bg,
+            grid: p.grid_line,
+            line_color: p.curve,
             line_width_px: 2.0,
-            node_color: theme::TEXT,
-            node_hover_color: theme::SELECTION_WARM,
-            node_drag_color: theme::WAVEFORM_PEAK,
+            // ノードは窪み (`bg`) の上に置く標識なので、テーマ従属の本文インク。
+            node_color: p.text,
+            node_hover_color: p.selection_warm,
+            // drag 中の赤は極性固定インク (明背景では沈むので暗い赤へ)。基準面は
+            // このエディタ自身の背景 `bg` = `inset_bg`。
+            node_drag_color: p.waveform_for(p.inset_bg, WaveformInk::Peak),
             node_radius_px: 5.0,
-            tension_color: theme::SELECTION_WARM.with_alpha(0.7),
-            cursor_color: theme::SELECTION_WARM.with_alpha(0.85),
+            tension_color: p.selection_warm.with_alpha(0.7),
+            cursor_color: p.selection_warm.with_alpha(0.85),
         }
     }
 }
@@ -446,6 +453,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         ));
         let values_owned: Vec<f32> = values.to_vec();
         self.with_widget_node(wid, input_hash, move |ui| {
+            let p = ui.palette();
             ui.push_rect(RectCommand {
                 rect,
                 fill: style.bg,
@@ -461,7 +469,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 if Some(i) == current {
                     ui.push_rect(RectCommand {
                         rect: Rect { x, y: rect.y, w: cell, h: rect.h },
-                        fill: theme::SELECTION_WARM.with_alpha(0.16),
+                        fill: p.selection_warm.with_alpha(0.16),
                         border: Color::TRANSPARENT,
                         border_width: 0.0,
                         radius: [0.0; 4],

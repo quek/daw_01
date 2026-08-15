@@ -27,9 +27,10 @@ use std::hash::Hash;
 use std::time::Instant;
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
-use crate::theme;
 
+use crate::color::composite_over;
 use crate::id::WidgetId;
+use crate::theme::Palette;
 use crate::ui::Ui;
 
 const RMS_WINDOW: usize = 32;
@@ -57,6 +58,10 @@ const SCALE_FONT_PX: f32 = 9.0;
 const READOUT_FONT_PX: f32 = 10.0;
 /// peak readout の暗チップ高さ。
 const READOUT_H: f32 = 13.0;
+/// peak readout の暗チップ (`Palette::scrim`) を塗る不透明度。 チップ上の数値色を決める
+/// [`LevelMeterStyle::from_palette`] と実際に塗る `draw_meter_readout` が同じ値を見るための
+/// SSoT (ずれると「読める前提で選んだ色」 が実際のチップと食い違う)。
+const READOUT_CHIP_ALPHA: f32 = 0.78;
 /// peak readout 専用帯の高さ (チップ + 上下余白)。 バー/目盛りはこのぶん下げる。
 const READOUT_BAND_H: f32 = READOUT_H + 3.0;
 /// scale 時の上下パディング (px)。 端ラベル (+6 / -60) を rect の端に貼り付けない。
@@ -195,24 +200,41 @@ pub struct LevelMeterStyle {
     pub peak_readout_over_color: Color,
 }
 
-impl Default for LevelMeterStyle {
-    fn default() -> Self {
+impl LevelMeterStyle {
+    /// パレットから既定スタイルを組む (r.md #48)。
+    ///
+    /// **`Default` にはしない**: テーマ色を読む `Default::default()` は隠れたグローバル依存で、
+    /// ライトテーマに追従しない (呼び出し側が palette を渡す形にすることで、 テーマ切替が
+    /// そのままメーターの色に届く)。
+    ///
+    /// 極性の内訳:
+    /// - メーター ramp (`low`..`clip`) は **色相固定・明度可変**。 テーマごとの `meter_*` を使う。
+    /// - 目盛り (tick / 数字 / 0dB 線) と peak hold 線はクローム面 (`inset_bg` の溝) の上なので
+    ///   テーマ従属の `text` / `text_dim`。
+    /// - peak readout の数値だけは **極性固定の暗いチップ (`scrim`) の上**に乗るので、
+    ///   テーマ従属の `text` ではなく `ink_on_dark` を使う (ライトで `text` は暗くなり、
+    ///   暗チップに沈んで読めなくなる)。 over 色 (`meter_red`) も同じチップの上なので
+    ///   [`Palette::adapt_on`] で色相を保ったままチップ上で読める明度に寄せる
+    ///   (ダークでは既に十分なコントラストがあるので恒等 = 見た目不変)。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
+        let chip_bg = composite_over(p.scrim.with_alpha(READOUT_CHIP_ALPHA), p.inset_bg);
         Self {
-            bg: theme::INSET_BG,
-            low: theme::METER_GREEN,
-            mid: theme::METER_YELLOW,
-            high: theme::METER_ORANGE,
-            clip: theme::METER_RED,
-            peak_hold_color: theme::TEXT,
+            bg: p.inset_bg,
+            low: p.meter_green,
+            mid: p.meter_yellow,
+            high: p.meter_orange,
+            clip: p.meter_red,
+            peak_hold_color: p.text,
             db_range: (-60.0, 6.0),
             peak_hold_ms: PEAK_HOLD_DEFAULT_MS,
             scale: None,
             peak_readout: false,
-            scale_text_color: theme::TEXT_DIM.with_alpha(0.95),
-            scale_tick_color: theme::TEXT_DIM.with_alpha(0.95),
-            scale_zero_color: theme::TEXT,
-            peak_readout_color: theme::TEXT,
-            peak_readout_over_color: theme::METER_RED,
+            scale_text_color: p.text_dim.with_alpha(0.95),
+            scale_tick_color: p.text_dim.with_alpha(0.95),
+            scale_zero_color: p.text,
+            peak_readout_color: p.ink_on_dark,
+            peak_readout_over_color: p.adapt_on(chip_bg, p.meter_red),
         }
     }
 }
@@ -390,11 +412,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let right_x = left_x + bar_each + STEREO_BAR_GAP;
         let bars_right = right_x + bar_each;
 
-        // 背景 (rect 全体)
+        // 背景 (rect 全体)。 枠だけはテーマの汎用枠線 (面は caller の style.bg)。
+        let p = self.palette();
         self.push_rect(RectCommand {
             rect,
             fill: style.bg,
-            border: theme::BORDER,
+            border: p.border,
             border_width: 1.0,
             radius: [2.0; 4],
             clip_rect: None,
@@ -562,7 +585,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     }
 
     /// 最大到達 dB の数値ピークを rect 上端の専用帯に描く (暗チップ + 数値、 全幅中央寄せ)。
+    ///
+    /// チップは **極性固定** (`Palette::scrim`) — メーターの色帯 (可変背景) の上でも数値を
+    /// 確実に読ませるための裏打ちなので、 テーマで明暗を反転させてはいけない
+    /// (memory `feedback_ui_indicator_contrast_on_variable_bg` の idiom)。
     fn draw_meter_readout(&mut self, rect: Rect, long_peak_value: f32, style: &LevelMeterStyle) {
+        let p = self.palette();
         let (text, over) = format_peak_readout(long_peak_value);
         let color = if over { style.peak_readout_over_color } else { style.peak_readout_color };
         let text_w = text.chars().count() as f32 * READOUT_FONT_PX * CHAR_W_RATIO;
@@ -570,7 +598,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let chip_x = rect.x + ((rect.w - chip_w).max(0.0)) * 0.5;
         self.push_rect(RectCommand {
             rect: Rect { x: chip_x, y: rect.y + 1.0, w: chip_w, h: READOUT_H },
-            fill: theme::BACKDROP.with_alpha(0.78),
+            fill: p.scrim.with_alpha(READOUT_CHIP_ALPHA),
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [2.0; 4],
@@ -704,6 +732,12 @@ mod tests {
     use crate::FrameInput;
     use crate::input::PointerFrame;
     use crate::ui::UiHost;
+
+    /// テストの基準スタイル。 テーマ色を読む `Default` は廃止した (r.md #48) ので、
+    /// どのテーマで検証しているかを組込みダーク明示で固定する。
+    fn dark_style() -> LevelMeterStyle {
+        LevelMeterStyle::from_palette(&Palette::dark())
+    }
 
     #[test]
     fn linear_to_db_zero_is_minus_120() {
@@ -862,7 +896,7 @@ mod tests {
     fn clean_bar_has_no_text() {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let rect = Rect { x: 0.0, y: 0.0, w: 10.0, h: 200.0 };
-        let scene = run_stereo(&mut host, rect, 0.5, 0.5, LevelMeterStyle::default(), PointerFrame::default());
+        let scene = run_stereo(&mut host, rect, 0.5, 0.5, dark_style(), PointerFrame::default());
         assert_eq!(scene.glyph_count(), 0, "clean bar はテキストを描かない");
     }
 
@@ -872,7 +906,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let rect = Rect { x: 0.0, y: 0.0, w: 12.0, h: 200.0 };
         // L=1.0 (frac 1.0)、 R=0.5 (frac 中) で高さが違う 2 本
-        let scene = run_stereo(&mut host, rect, 1.0, 0.5, LevelMeterStyle::default(), PointerFrame::default());
+        let scene = run_stereo(&mut host, rect, 1.0, 0.5, dark_style(), PointerFrame::default());
         // バーのみを取る: bg (w == rect.w) と peak-hold 線 (h == 2.0) を除外。 h > 2.5 でバー本体だけ。
         let bars: Vec<_> = scene
             .iter_rects()
@@ -891,7 +925,7 @@ mod tests {
     fn scale_layout_tick_left_numbers_right_zero_line() {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let rect = Rect { x: 0.0, y: 0.0, w: 40.0, h: 240.0 };
-        let style = LevelMeterStyle { scale: Some(MeterScale::default()), ..Default::default() };
+        let style = LevelMeterStyle { scale: Some(MeterScale::default()), ..dark_style() };
         let scene = run_stereo(&mut host, rect, 0.0, 0.0, style, PointerFrame::default());
         let (left_x, _bar_each, bars_right) = stereo_geom(rect);
         // tick (h=2) が L バーの左
@@ -926,7 +960,7 @@ mod tests {
     fn scale_labels_stay_within_rect() {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let rect = Rect { x: 0.0, y: 0.0, w: 40.0, h: 240.0 };
-        let style = LevelMeterStyle { scale: Some(MeterScale::default()), ..Default::default() };
+        let style = LevelMeterStyle { scale: Some(MeterScale::default()), ..dark_style() };
         let scene = run_stereo(&mut host, rect, 0.0, 0.0, style, PointerFrame::default());
         for g in scene.iter_glyphs() {
             assert!(
@@ -943,7 +977,7 @@ mod tests {
     fn peak_readout_within_rect_and_resets_on_click() {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let rect = Rect { x: 5.0, y: 0.0, w: 40.0, h: 200.0 };
-        let style = LevelMeterStyle { peak_readout: true, ..Default::default() };
+        let style = LevelMeterStyle { peak_readout: true, ..dark_style() };
         // L=1.0 → long_peak 1.0 → "0.0"
         let scene = run_stereo(&mut host, rect, 1.0, 0.3, style, PointerFrame::default());
         let g = scene.iter_glyphs().find(|g| g.text.as_ref() == "0.0").expect("readout 0.0");
@@ -988,7 +1022,7 @@ mod tests {
     fn scale_scene(h: f32) -> Scene {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let rect = Rect { x: 0.0, y: 0.0, w: 40.0, h };
-        let style = LevelMeterStyle { scale: Some(MeterScale::default()), ..Default::default() };
+        let style = LevelMeterStyle { scale: Some(MeterScale::default()), ..dark_style() };
         run_stereo(&mut host, rect, 0.0, 0.0, style, PointerFrame::default())
     }
 

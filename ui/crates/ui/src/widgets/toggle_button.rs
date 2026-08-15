@@ -9,11 +9,11 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
+use crate::theme::Palette;
 use crate::ui::Ui;
 
 /// `toggle_button_at` の永続状態 (button / checkbox と同形)。
@@ -47,17 +47,28 @@ pub struct ToggleButtonStyle {
     pub on_text_color: Option<Color>,
 }
 
-impl Default for ToggleButtonStyle {
-    fn default() -> Self {
+impl ToggleButtonStyle {
+    /// パレットから既定スタイルを組み立てる (r.md #48)。
+    ///
+    /// `Default` にしないのは、テーマ色を読む `Default::default()` が「どのパレットで
+    /// 描いているか」 を知らない隠れたグローバル依存になり、ライトテーマに追従しない
+    /// (= off の面だけダークのまま残る) ため。 caller は `ui.palette()` を渡す。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            off_color: theme::CONTROL,
-            on_color: theme::ACCENT,
-            border: theme::BORDER,
+            off_color: p.control,
+            on_color: p.accent,
+            border: p.border,
             border_width: 1.0,
             radius: 6.0,
             font_size: 14.0,
-            text_color: theme::TEXT,
-            on_text_color: None,
+            text_color: p.text,
+            // r.md #48: 既定の `on_color` は `p.accent` なので、ON の文字色も accent 用の
+            // トークンを既定にする。 旧実装は `None` (= off 用 `text_color` に fallback) で、
+            // ライトテーマだと「暗い accent 塗りの上に暗い本文色」 になって文字が消えていた。
+            // caller が `on_color` を上書きする場合 (mute の赤 / solo の黄) は
+            // `on_text_color` も併せて指定する既存 idiom のまま。
+            on_text_color: Some(p.text_on_accent),
         }
     }
 }
@@ -170,10 +181,14 @@ fn draw_toggle_button<M: ?Sized + 'static>(
     pressed: bool,
     style: &ToggleButtonStyle,
 ) {
-    // 背景色: value で off/on を選び、hover で明るく、press で暗く。
+    // 背景色: value で off/on を選び、hover は面から離れる方向 (ダークは明・ライトは暗)、
+    // press は押し込みとして暗く。 base は caller 任意色 (mute/solo/rec の赤・黄) なので
+    // トークンでは表せず、パレットの派生関数で向きだけをテーマに従わせる
+    // (`Color::lighten` 直打ちだとライトテーマで hover が背景に溶ける)。
+    let p = ui.palette();
     let base = if value { style.on_color } else { style.off_color };
-    let hover_c = base.lighten(0.10);
-    let press_c = base.darken(0.20);
+    let hover_c = p.hover(base);
+    let press_c = p.pressed(base);
 
     let fill = if pressed {
         press_c
@@ -209,6 +224,8 @@ fn draw_toggle_button<M: ?Sized + 'static>(
     let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
     // value=true のとき on_text_color (Some) を優先、 None なら text_color に fallback
     // (daw_01 #051: metronome 黄背景 + 黒文字のような state-dependent text color)。
+    // r.md #48: 既定スタイル (`from_palette`) は `on_text_color: Some(p.text_on_accent)` を
+    // 持つので、ライトテーマで「暗い accent 塗りの上に暗い text_color」 になることはない。
     let text_color = if value {
         style.on_text_color.unwrap_or(style.text_color)
     } else {
@@ -236,6 +253,7 @@ mod tests {
     use super::ToggleButtonStyle;
     use crate::edit::Edit;
     use crate::input::{FrameInput, PointerFrame};
+    use crate::theme::Palette;
     use crate::ui::UiHost;
 
     struct Toy {
@@ -267,7 +285,7 @@ mod tests {
         let mut model = Toy { flag: false };
         let screen = PhysicalSize { width: 200, height: 100 };
         let rect = Rect { x: 10.0, y: 10.0, w: 60.0, h: 24.0 };
-        let style = ToggleButtonStyle::default();
+        let style = ToggleButtonStyle::from_palette(&Palette::dark());
         let toggled_seen = Cell::new(false);
 
         let (press, release) = click_at(rect);
@@ -323,7 +341,7 @@ mod tests {
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let rect = Rect { x: 10.0, y: 20.0, w: 60.0, h: 24.0 };
-        let style = ToggleButtonStyle::default();
+        let style = ToggleButtonStyle::from_palette(&Palette::dark());
 
         let mut measured_w = 0.0;
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -364,7 +382,7 @@ mod tests {
         let style = ToggleButtonStyle {
             text_color: Color::rgb(0.95, 0.95, 0.97), // white (off)
             on_text_color: Some(Color::rgb(0.10, 0.10, 0.12)), // black (on)
-            ..ToggleButtonStyle::default()
+            ..ToggleButtonStyle::from_palette(&Palette::dark())
         };
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -389,7 +407,7 @@ mod tests {
         let style = ToggleButtonStyle {
             text_color: Color::rgb(0.95, 0.95, 0.97), // white
             on_text_color: None,
-            ..ToggleButtonStyle::default()
+            ..ToggleButtonStyle::from_palette(&Palette::dark())
         };
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -412,7 +430,7 @@ mod tests {
         let style = ToggleButtonStyle {
             text_color: Color::rgb(0.95, 0.95, 0.97), // white (off で使われる)
             on_text_color: Some(Color::rgb(0.10, 0.10, 0.12)), // black (off では無視)
-            ..ToggleButtonStyle::default()
+            ..ToggleButtonStyle::from_palette(&Palette::dark())
         };
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -433,7 +451,8 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 400, height: 100 };
-        let style = ToggleButtonStyle { font_size: 11.0, ..ToggleButtonStyle::default() };
+        let style =
+            ToggleButtonStyle { font_size: 11.0, ..ToggleButtonStyle::from_palette(&Palette::dark()) };
         let rect = Rect { x: 10.0, y: 10.0, w: 40.0, h: 18.0 };
 
         // (a) 長いラベル → 省略。
@@ -475,7 +494,7 @@ mod tests {
         let style = ToggleButtonStyle {
             off_color: Color::rgb(0.10, 0.10, 0.10),
             on_color: Color::rgb(0.90, 0.10, 0.10),
-            ..ToggleButtonStyle::default()
+            ..ToggleButtonStyle::from_palette(&Palette::dark())
         };
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {

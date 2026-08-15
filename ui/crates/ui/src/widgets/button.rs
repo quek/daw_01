@@ -9,7 +9,6 @@
 //! これで「press inside → 少しドリフト → release inside」を取りこぼさない。
 
 use daw_ui_renderer::{GlyphArea, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -164,9 +163,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             align as u8,
         ));
         self.with_widget_node(wid, input_hash, |ui| {
-            let base = theme::CONTROL;
-            let hover = theme::CONTROL_HOVER;
-            let press = theme::ACCENT;
+            let p = ui.palette();
+            let base = p.control;
+            let hover = p.control_hover;
+            let press = p.accent;
 
             let fill = if visual_pressed {
                 press
@@ -179,7 +179,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             ui.push_rect(RectCommand {
                 rect,
                 fill,
-                border: theme::BORDER,
+                border: p.border,
                 border_width: 1.0,
                 radius: [6.0; 4],
                 clip_rect: None,
@@ -212,7 +212,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: ty,
                 font_size,
                 line_height: line_h,
-                color: theme::TEXT,
+                color: p.text,
                 clip_rect: truncated.then_some(rect),
                 ..GlyphArea::default()
             });

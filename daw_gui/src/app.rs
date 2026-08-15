@@ -152,7 +152,21 @@ impl AppData {
             })
             .unwrap_or_default();
 
+        // プロジェクト非依存のアプリ設定は **1 回だけ** 読む (旧実装はフィールドごとに
+        // 同じ JSON を 3 回 load していた)。 `app_dirs == None` (テスト) では既定値。
+        let app_config = app_dirs
+            .as_ref()
+            .map(|d| crate::app_config::load(d.app_config()))
+            .unwrap_or_default();
+        // r.md #48: 保存された id からテーマを解決する。ファイルが消えていても
+        // `resolve` が既定テーマにフォールバックするので起動できる。
+        let theme = crate::theme::resolve(
+            app_dirs.as_ref().map(common::app_dirs::AppDirs::themes_dir).as_deref(),
+            &app_config.theme,
+        );
+
         let app = Self {
+            theme,
             song_doc: SongDoc::new(song),
             transport: TransportState {
                 metronome_enabled: false,
@@ -293,18 +307,16 @@ impl AppData {
                 pianoroll_snap_choice: crate::view::snap::CHOICE_PIANOROLL_DEFAULT,
                 arrange_snap_enabled: true,
                 arrange_snap_choice: crate::view::snap::CHOICE_ARRANGE_DEFAULT,
-                resource_monitor_enabled: app_dirs
-                    .as_ref()
-                    .map(|d| crate::app_config::load(d.app_config()).resource_monitor_enabled)
-                    .unwrap_or(true),
+                resource_monitor_enabled: app_config.resource_monitor_enabled,
                 // r.md #29: 編集履歴 window の開閉/位置/サイズを app_config から復元。
-                undo_history_open: app_dirs
-                    .as_ref()
-                    .map(|d| crate::app_config::load(d.app_config()).undo_history_open)
-                    .unwrap_or(false),
-                undo_history_rect: app_dirs
-                    .as_ref()
-                    .and_then(|d| crate::app_config::load(d.app_config()).undo_history_rect)
+                undo_history_open: app_config.undo_history_open,
+                undo_history_rect: app_config
+                    .undo_history_rect
+                    .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
+                // r.md #48: 設定 window の開閉/位置/サイズ。
+                settings_open: app_config.settings_open,
+                settings_rect: app_config
+                    .settings_rect
                     .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
                 is_help_open: false,
                 app_dirs,
@@ -322,6 +334,9 @@ impl AppData {
             },
             ui_ephemeral: UiEphemeral {
                 arr_label_cache: std::cell::RefCell::default(),
+                // r.md #48: 設定 window を開いたときに `refresh_available_themes` が埋める。
+                // 起動時に settings_open が復元されるケースは `new()` 末尾で埋める。
+                available_themes: Vec::new(),
                 loaded_project_id: 0,
                 project_generation: 0,
                 video_texture_cache: std::collections::HashMap::new(),
@@ -417,6 +432,11 @@ impl AppData {
         // 同期されるので、 初回のみここで初期化する。
         let mut app = app;
         app.init_recent_labels();
+        // r.md #48: 設定 window が開いた状態で復元されたときは、最初のフレームまでに
+        // テーマ一覧が要る (描画側は毎フレーム作り直さない)。
+        if app.ui_prefs.settings_open {
+            app.refresh_available_themes();
+        }
         // cache が旧 port-probe 版 (PluginEntry の 3 bool 未取得) なら、
         // 起動時に 1 回だけ自動で再 probe (rescan) して port 構成を埋める。 production
         // (app_dirs=Some) のみ — test は app_dirs=None なので実システム scan を避ける。
@@ -644,6 +664,24 @@ impl AppData {
             // 開閉状態は app_config に永続 (再起動を跨いで復元)。
             AppEvent::ToggleUndoHistory => {
                 self.ui_prefs.undo_history_open = !self.ui_prefs.undo_history_open;
+                self.persist_app_config();
+            }
+            // r.md #48: 設定 window の開閉トグル (Edit メニュー / ✕ / Esc)。
+            AppEvent::ToggleSettings => {
+                self.ui_prefs.settings_open = !self.ui_prefs.settings_open;
+                if self.ui_prefs.settings_open {
+                    // テーマ一覧の実体は `themes/` の read_dir + JSON パース。
+                    // **開いたときに 1 回だけ**取る (描画ループでディスクを叩かない)。
+                    // 開き直せば新しく置いたファイルが出るので再起動は要らない。
+                    self.refresh_available_themes();
+                }
+                self.persist_app_config();
+            }
+            // r.md #48: テーマ切替。 id からパレットを解決して差し替えるだけで、
+            // 実際に画面へ反映するのは runner (`UiHost::set_palette` + 描画キャッシュ破棄)。
+            AppEvent::SetTheme(id) => {
+                let dirs = self.ui_prefs.app_dirs.as_ref().map(common::app_dirs::AppDirs::themes_dir);
+                self.theme = crate::theme::resolve(dirs.as_deref(), &id);
                 self.persist_app_config();
             }
             // r.md #29: 履歴リストの行 click → その state へ一発 Undo/Redo。

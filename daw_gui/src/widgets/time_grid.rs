@@ -18,7 +18,7 @@ use daw_ui_core::scenegraph::hash_inputs;
 use daw_ui_core::ui::Ui;
 use daw_ui_core::viewport::ViewportState1D;
 use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect};
-use crate::theme;
+use crate::theme::Palette;
 
 const RULER_FONT: f32 = 11.0;
 const RULER_LABEL_PAD_X: f32 = 3.0;
@@ -45,12 +45,18 @@ pub struct TimeRulerStyle {
     pub min_beat_tick_px: f32,
 }
 
-impl Default for TimeRulerStyle {
-    fn default() -> Self {
+impl TimeRulerStyle {
+    /// パレットから既定スタイルを組み立てる (r.md #48)。
+    ///
+    /// `Default` を廃したのは、テーマ色を読む `default()` が「いまどのパレットで描いて
+    /// いるか」 を知らない隠れたグローバル依存になり、ライトテーマに追従しない (= ruler
+    /// の帯だけダークのまま残る) ため。 caller は `ui.palette()` / `app.theme.core` を渡す。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            bg: theme::HEADER,
-            tick_color: theme::TEXT_DIM,
-            label_color: theme::TEXT_DIM,
+            bg: p.header,
+            tick_color: p.text_dim,
+            label_color: p.text_dim,
             bar_tick_height: 12.0,
             beat_tick_height: 5.0,
             min_label_spacing_px: 60.0,
@@ -75,11 +81,14 @@ pub struct BarBeatGridStyle {
     pub min_sub_line_px: f32,
 }
 
-impl Default for BarBeatGridStyle {
-    fn default() -> Self {
+impl BarBeatGridStyle {
+    /// パレットから既定スタイルを組み立てる (r.md #48)。理由は
+    /// [`TimeRulerStyle::from_palette`] と同じ (テーマ非追従の隠れたグローバル依存を作らない)。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            bar_color: theme::GRID_LINE_STRONG,
-            beat_color: theme::GRID_LINE,
+            bar_color: p.grid_line_strong,
+            beat_color: p.grid_line,
             bar_line_width: 1.0,
             beat_line_width: 1.0,
             min_beat_line_px: 4.0,
@@ -610,13 +619,13 @@ mod tests {
     fn ruler_no_thinning_when_bars_wide_enough() {
         // 4 bar (16 beats) を 800px → 1 bar = 200px、 threshold 60px → step 1 (間引き無し)。
         // bar 0..=4 = 5 個の bar boundary、 すべて label。
-        let style = TimeRulerStyle::default();
+        let style = TimeRulerStyle::from_palette(&Palette::dark());
         assert_eq!(ruler_label_count(16.0, style), 5);
     }
 
     #[test]
     fn ruler_thins_labels_on_zoom_out() {
-        let style = TimeRulerStyle::default();
+        let style = TimeRulerStyle::from_palette(&Palette::dark());
         // 800 bar (3200 beats) を 800px → 1 bar = 1px、 threshold 60px → step 64。
         // bar idx 0,64,128,...,768 が出る → ceil(800/64)+1 = 14 個。
         // ただし view_end の ceil で bar_index_end = 800、 0..=800 を step 64 で iter:
@@ -642,7 +651,7 @@ mod tests {
     fn ruler_label_count_bounded_by_threshold() {
         // 任意の zoom で label 数 ≦ ceil(rect.w / min_label_spacing_px) + 1 を満たす。
         // 800px / 60px = 13.3 → 上限 ≈ 14 個 (bar_index_end の +1 含む)。
-        let style = TimeRulerStyle::default();
+        let style = TimeRulerStyle::from_palette(&Palette::dark());
         for &beats in &[8.0_f64, 100.0, 1000.0, 10_000.0, 100_000.0] {
             let count = ruler_label_count(beats, style);
             let bound = (800.0_f32 / style.min_label_spacing_px).ceil() as usize + 2;
@@ -656,7 +665,10 @@ mod tests {
 
     #[test]
     fn ruler_thinning_disabled_with_zero_threshold() {
-        let style = TimeRulerStyle { min_label_spacing_px: 0.0, ..TimeRulerStyle::default() };
+        let style = TimeRulerStyle {
+            min_label_spacing_px: 0.0,
+            ..TimeRulerStyle::from_palette(&Palette::dark())
+        };
         // 800 bar → 間引き無効なら全 bar に label。 0..=800 = 801 個。
         let count = ruler_label_count(3200.0, style);
         assert_eq!(count, 801, "min_label_spacing_px=0 で全 bar に label");
@@ -676,7 +688,7 @@ mod tests {
         };
         let spb = mapping.samples_per_beat();
         let rect = Rect { x: 0.0, y: 0.0, w: 800.0, h: 24.0 };
-        let style = TimeRulerStyle::default();
+        let style = TimeRulerStyle::from_palette(&Palette::dark());
 
         let count_short_ticks = |scene: &Scene| -> usize {
             scene
@@ -711,7 +723,7 @@ mod tests {
 
     #[test]
     fn grid_no_beat_lines_on_extreme_zoom_out() {
-        let style = BarBeatGridStyle::default();
+        let style = BarBeatGridStyle::from_palette(&Palette::dark());
         // 1 bar = 800px → 1 beat = 200px → beat 線 描画。
         let (bars_close, beats_close, _) = grid_segment_counts(4.0, style, None);
         assert!(bars_close >= 1);
@@ -725,7 +737,10 @@ mod tests {
 
     #[test]
     fn grid_threshold_zero_keeps_beat_lines_always() {
-        let style = BarBeatGridStyle { min_beat_line_px: 0.0, ..BarBeatGridStyle::default() };
+        let style = BarBeatGridStyle {
+            min_beat_line_px: 0.0,
+            ..BarBeatGridStyle::from_palette(&Palette::dark())
+        };
         // 200 bar = 800 beats、 1 beat = 1px。 threshold 0 で常に描画 → beat 線 600 本程度。
         let (_bars, beats, _) = grid_segment_counts(800.0, style, None);
         assert!(beats > 100, "min_beat_line_px=0 で zoom out でも beat 線描画: got {beats}");
@@ -762,7 +777,7 @@ mod tests {
     /// frame レベル: subdivision 線が beat 線と別色で描かれ、 拍線位置と重複しない。
     #[test]
     fn grid_draws_subdivision_lines() {
-        let style = BarBeatGridStyle::default();
+        let style = BarBeatGridStyle::from_palette(&Palette::dark());
         let sub = SubGridSpec {
             interval_beats: 0.25,
             color: Color::rgba(0.5, 0.5, 0.5, 0.5), // bar/beat と別色
@@ -778,7 +793,7 @@ mod tests {
     /// ズーム退避: px_per_interval < min_sub_line_px で subdivision 0 本、 bar/beat は残る。
     #[test]
     fn grid_subdivision_retreats_on_zoom_out() {
-        let style = BarBeatGridStyle::default(); // min_sub_line_px = 6.0
+        let style = BarBeatGridStyle::from_palette(&Palette::dark()); // min_sub_line_px = 6.0
         let sub = SubGridSpec {
             interval_beats: 0.25,
             color: Color::rgba(0.5, 0.5, 0.5, 0.5),

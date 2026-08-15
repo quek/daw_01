@@ -23,9 +23,9 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, Rect, RectCommand};
-use crate::theme;
 
 use crate::id::WidgetId;
+use crate::theme::Palette;
 use crate::ui::Ui;
 
 /// `Ui::color_picker` の見た目スタイル。
@@ -56,11 +56,23 @@ pub struct ColorPickerStyle {
     pub selector: Color,
 }
 
-impl Default for ColorPickerStyle {
-    fn default() -> Self {
+impl ColorPickerStyle {
+    /// パレットから既定のカラーピッカースタイルを組む。panel 面と枠はクロームのトークン
+    /// (`panel` / `border`)。
+    ///
+    /// セレクタだけは **極性固定の明インク** (`ink_on_dark`) を使う。SV 矩形 / Hue バーは
+    /// HSV から生成される **テーマ非依存の可変背景** で、ライトテーマでも見た目は変わらない。
+    /// ここにクローム面用の `text` を使うとライトで暗インクに反転し、SV 矩形の下半分 (黒) や
+    /// 濃い hue の上でセレクタが消える。ダーク値は両者同値なので既存の見た目は不変。
+    ///
+    /// `Default` は持たない (r.md #48): テーマ色を読む `Default::default()` は隠れた
+    /// グローバル依存になり、ライトテーマに追従しないため。caller は
+    /// `ColorPickerStyle::from_palette(ui.palette())` で組む。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            background: theme::PANEL,
-            border: theme::BORDER,
+            background: p.panel,
+            border: p.border,
             border_width: 1.0,
             radius: 6.0,
             padding: 8.0,
@@ -71,7 +83,7 @@ impl Default for ColorPickerStyle {
             hue_bar_w: 16.0,
             gap: 8.0,
             preview_h: 18.0,
-            selector: theme::TEXT,
+            selector: p.ink_on_dark,
         }
     }
 }
@@ -585,6 +597,7 @@ mod tests {
 
     use super::{ColorPickerResponse, ColorPickerStyle};
     use crate::input::{FrameInput, PointerFrame};
+    use crate::theme::Palette;
     use crate::ui::UiHost;
 
     const ANCHOR: Rect = Rect { x: 100.0, y: 100.0, w: 50.0, h: 20.0 };
@@ -593,7 +606,7 @@ mod tests {
     /// frame 1 で popup を開き、 callback の戻り `ColorPickerResponse` を `out` に格納する helper。
     /// `frames[i]` の `FrameInput` を順に流す。
     fn run_picker(frames: Vec<FrameInput>, palette: Vec<Color>) -> ColorPickerResponse {
-        let style = ColorPickerStyle::default();
+        let style = ColorPickerStyle::from_palette(&Palette::dark());
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
@@ -677,7 +690,7 @@ mod tests {
         // daw_01 #087: capturing modal (#065) — picker open 中の 2 フレーム目、 background 描画
         // フェーズで `ui.pointer().pos` が masking される (= 背景 arrangement が SV/Hue drag の
         // press を先取りして下の clip を動かす事故を防ぐ)。
-        let style = ColorPickerStyle::default();
+        let style = ColorPickerStyle::from_palette(&Palette::dark());
         let palette = vec![Color::rgb(0.9, 0.1, 0.1)];
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();

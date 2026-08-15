@@ -19,16 +19,15 @@ use std::time::Duration;
 use daw_ui_core::Ui;
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Color, Rect};
-use crate::theme;
 
 use crate::app::AppData;
+use crate::theme::Theme;
 
-// テーマ SSoT に準拠 (call site で Color::rgb ベタ書きしない)。load_overlay と
-// 同じ非モーダル progress カード idiom: elevation-2 の PANEL_RAISED を alpha 0.94 で透過。
-const OVERLAY_BG: Color = theme::PANEL_RAISED.with_alpha(0.94);
-/// クリップ上バッジの暗い scrim。どのクリップ色 (明/暗) の上でも前景スピナーを浮かせる。
-/// BACKDROP (寒色の暗幕) を小バッジ向けに少し濃くする。
-const BADGE_BG: Color = theme::BACKDROP.with_alpha(0.74);
+/// カード面の透過率。load_overlay と同じ非モーダル progress カード idiom:
+/// elevation-2 の `panel_raised` をこの alpha で透過させ、背後の作業画面を透かす。
+/// 面そのものはテーマ従属なので、色はフレームごとに `ui.palette()` から取る
+/// (module-level const にすると起動時のテーマで固定され、切替に追従しない)。
+const OVERLAY_BG_ALPHA: f32 = 0.94;
 
 /// スピナー 1 回転の周期。
 pub const SPINNER_PERIOD: Duration = Duration::from_millis(900);
@@ -65,13 +64,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     let phase = spinner_phase(now.duration_since(app.ui_ephemeral.anim_epoch), SPINNER_PERIOD);
 
     if unreachable {
-        draw_warning_panel(ui, screen, base_y);
+        draw_warning_panel(ui, &app.theme, screen, base_y);
         return;
     }
 
     // engine には到達済だが歌詞等が拒否された内容エラー。engine 起動を促す警告とは別。
     if let Some(detail) = rejected {
-        draw_rejected_panel(ui, screen, base_y, detail);
+        draw_rejected_panel(ui, &app.theme, screen, base_y, detail);
         return;
     }
 
@@ -94,39 +93,59 @@ fn draw_progress_panel(
     phase: f32,
     lines: &[String],
 ) {
+    let p = ui.palette();
     let n = lines.len().max(1) as f32;
     let h = PAD * 2.0 + n * LINE_H;
     let x = ((screen.width as f32) - PANEL_W) * 0.5;
     let y = base_y;
-    ui.panel("vox_overlay_bg", Rect { x, y, w: PANEL_W, h }, OVERLAY_BG, 6.0);
+    ui.panel(
+        "vox_overlay_bg",
+        Rect { x, y, w: PANEL_W, h },
+        p.panel_raised.with_alpha(OVERLAY_BG_ALPHA),
+        6.0,
+    );
 
     let spin_cx = x + PAD + 9.0;
     let spin_cy = y + h * 0.5;
-    // 進捗系インタラクションは accent (= theme で progress fill に統一)。暗カード上なので可視。
-    draw_spinner(ui, "vox_overlay_spin", spin_cx, spin_cy, 9.0, phase, theme::ACCENT);
+    // 進捗系インタラクションは accent (= theme で progress fill に統一)。
+    // 背景はパレット自身のクローム面なので、テーマ従属の accent で常にコントラストが立つ。
+    draw_spinner(ui, "vox_overlay_spin", spin_cx, spin_cy, 9.0, phase, p.accent);
 
     let text_x = x + PAD + 28.0;
     let mut ty = y + PAD;
     for (i, line) in lines.iter().enumerate() {
-        ui.label_at(("vox_overlay_line", i), line, text_x, ty, FONT, theme::TEXT);
+        // カード面 (panel_raised) の上の本文なので極性固定インクではなく `text`。
+        ui.label_at(("vox_overlay_line", i), line, text_x, ty, FONT, p.text);
         ty += LINE_H;
     }
 }
 
 /// engine 未接続の static 警告パネル。再描画は止まっているので回転なし。面は寒色 panel の
-/// まま、警告は theme の warning-yellow (`SOLO`) のドット + 見出しで伝える (彩度は機能色だけ)。
-fn draw_warning_panel(ui: &mut Ui<'_, AppData>, screen: PhysicalSize, base_y: f32) {
+/// まま、警告は DAW の warning-yellow (`daw.solo`) のドット + 見出しで伝える
+/// (彩度は機能色だけ)。`daw.solo` は core パレットに無いので `Theme` を受け取る。
+fn draw_warning_panel(
+    ui: &mut Ui<'_, AppData>,
+    theme: &Theme,
+    screen: PhysicalSize,
+    base_y: f32,
+) {
+    let p = &theme.core;
     let h = PAD * 2.0 + 2.0 * LINE_H;
     let x = ((screen.width as f32) - PANEL_W) * 0.5;
     let y = base_y;
-    ui.panel("vox_overlay_bg", Rect { x, y, w: PANEL_W, h }, OVERLAY_BG, 6.0);
+    ui.panel(
+        "vox_overlay_bg",
+        Rect { x, y, w: PANEL_W, h },
+        p.panel_raised.with_alpha(OVERLAY_BG_ALPHA),
+        6.0,
+    );
 
     // 静的な警告ドット (= アイコン代わり、font glyph 非依存)。
     let dot_r = 5.0;
     ui.panel(
         "vox_overlay_warn_dot",
         Rect { x: x + PAD + 9.0 - dot_r, y: y + PAD + dot_r, w: dot_r * 2.0, h: dot_r * 2.0 },
-        theme::SOLO,
+        theme.daw.solo,
         dot_r,
     );
 
@@ -137,7 +156,7 @@ fn draw_warning_panel(ui: &mut Ui<'_, AppData>, screen: PhysicalSize, base_y: f3
         text_x,
         y + PAD,
         FONT,
-        theme::SOLO,
+        theme.daw.solo,
     );
     ui.label_at(
         "vox_overlay_warn_sub",
@@ -145,7 +164,7 @@ fn draw_warning_panel(ui: &mut Ui<'_, AppData>, screen: PhysicalSize, base_y: f3
         text_x,
         y + PAD + LINE_H,
         FONT,
-        theme::TEXT_DIM,
+        p.text_dim,
     );
 }
 
@@ -153,21 +172,28 @@ fn draw_warning_panel(ui: &mut Ui<'_, AppData>, screen: PhysicalSize, base_y: f3
 /// 到達できているので「起動してください」ではなく、直すべき歌詞を提示する。
 fn draw_rejected_panel(
     ui: &mut Ui<'_, AppData>,
+    theme: &Theme,
     screen: PhysicalSize,
     base_y: f32,
     detail: &str,
 ) {
+    let p = &theme.core;
     let h = PAD * 2.0 + 2.0 * LINE_H;
     let x = ((screen.width as f32) - PANEL_W) * 0.5;
     let y = base_y;
-    ui.panel("vox_overlay_bg", Rect { x, y, w: PANEL_W, h }, OVERLAY_BG, 6.0);
+    ui.panel(
+        "vox_overlay_bg",
+        Rect { x, y, w: PANEL_W, h },
+        p.panel_raised.with_alpha(OVERLAY_BG_ALPHA),
+        6.0,
+    );
 
     // 静的な警告ドット (アイコン代わり、font glyph 非依存)。
     let dot_r = 5.0;
     ui.panel(
         "vox_overlay_reject_dot",
         Rect { x: x + PAD + 9.0 - dot_r, y: y + PAD + dot_r, w: dot_r * 2.0, h: dot_r * 2.0 },
-        theme::SOLO,
+        theme.daw.solo,
         dot_r,
     );
 
@@ -181,7 +207,7 @@ fn draw_rejected_panel(
         "合成できない歌詞があります",
         Rect { x: text_x, y: y + PAD, w: text_w, h: LINE_H },
         FONT,
-        theme::SOLO,
+        theme.daw.solo,
     );
     // VOICEVOX が返した理由 (例: `lyricが不正です: ー`)。パネル幅に収まるよう省略。
     ui.label_at_clipped(
@@ -189,7 +215,7 @@ fn draw_rejected_panel(
         detail,
         Rect { x: text_x, y: y + PAD + LINE_H, w: text_w, h: LINE_H },
         FONT,
-        theme::TEXT_DIM,
+        p.text_dim,
     );
 }
 
@@ -233,6 +259,10 @@ pub fn draw_spinner(
 /// (= over-clip 標識の idiom。新規の clip 上インジケータはこれを流用すること、
 /// `feedback_ui_indicator_contrast_on_variable_bg`)。`radius` はスピナー半径、チップは
 /// それより一回り大きい円。
+///
+/// チップ (`scrim`) とドット (`ink_on_dark`) はどちらも **極性固定インク**。ここは
+/// パレット面ではなくユーザー着色クリップの上なので、テーマ従属トークンを使うと
+/// ライトテーマでチップが明るくなり標識が消える。
 pub fn draw_spinner_badge(
     ui: &mut Ui<'_, AppData>,
     id: impl std::hash::Hash + Copy,
@@ -241,15 +271,16 @@ pub fn draw_spinner_badge(
     radius: f32,
     phase: f32,
 ) {
+    let p = ui.palette();
     let chip = radius + 3.0;
     ui.panel(
         (id, "badge_chip"),
         Rect { x: cx - chip, y: cy - chip, w: chip * 2.0, h: chip * 2.0 },
-        BADGE_BG,
+        p.scrim,
         chip, // radius = 半径 → 円
     );
-    // 暗チップの上は最大コントラストの crisp near-white (theme token) で、どのクリップ色でも視認。
-    draw_spinner(ui, id, cx, cy, radius, phase, theme::TEXT_ON_ACCENT);
+    // 暗チップの上なので「暗背景の上の明インク」= `ink_on_dark`。どのクリップ色でも視認。
+    draw_spinner(ui, id, cx, cy, radius, phase, p.ink_on_dark);
 }
 
 /// 経過時間 → スピナー位相 `[0,1)`。`period` で 1 回転。純関数 (テスト可能)。

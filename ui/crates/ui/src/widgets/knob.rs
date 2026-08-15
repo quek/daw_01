@@ -16,7 +16,6 @@ use std::hash::Hash;
 use std::time::Instant;
 
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -521,6 +520,8 @@ fn draw_knob<M: ?Sized + 'static>(
     dragging: bool,
     pointer: crate::input::PointerFrame,
 ) {
+    let p = ui.palette();
+
     // 円本体: rect の中央に max-radius の正方形を置いて 4 隅 r で円形に。
     let size = rect.w.min(rect.h);
     let cx = rect.x + rect.w * 0.5;
@@ -528,12 +529,12 @@ fn draw_knob<M: ?Sized + 'static>(
     let r = (size * 0.5 - 2.0).max(2.0); // 2px の周囲余白
     let circle_rect = Rect { x: cx - r, y: cy - r, w: r * 2.0, h: r * 2.0 };
 
-    // Ableton 流: dark gray の円 + 円周上に accent の arc。
+    // Ableton 流: 中立な `control` の円 + 円周上に `accent` の arc。
     // arc は「起点値の角度」から value_angle までを円周 (radius = r) 上に描画。
     // 下の 60° (5時 → 7時 経由 6時) は 300° sweep 範囲外で arc は届かない (= "切れている")。
-    let base = theme::CONTROL;
-    let hover_c = theme::CONTROL_HOVER;
-    let press_c = theme::ACCENT;
+    let base = p.control;
+    let hover_c = p.control_hover;
+    let press_c = p.accent;
     let bg_fill = if dragging {
         press_c
     } else if hovered(rect, pointer) {
@@ -545,7 +546,7 @@ fn draw_knob<M: ?Sized + 'static>(
     ui.push_rect(RectCommand {
         rect: circle_rect,
         fill: bg_fill,
-        border: theme::BORDER,
+        border: p.border,
         border_width: 1.0,
         radius: [r; 4],
         clip_rect: None,
@@ -557,8 +558,8 @@ fn draw_knob<M: ?Sized + 'static>(
     let start_angle = value_angle(0.0);
     let end_angle = value_angle(1.0);
     let arc_radius = r;
-    let active_color = theme::ACCENT;
-    let inactive_color = theme::INSET_BG;
+    let active_color = p.accent;
+    let inactive_color = p.inset_bg;
 
     // 1-2. 弧は 2 色で可動範囲 300° を **過不足なく 1 周** 分だけ描く:
     //   - 値弧 (accent) = 起点値 → 現在値。 unipolar (起点 0.0) では 7 時から伸び、
@@ -594,7 +595,7 @@ fn draw_knob<M: ?Sized + 'static>(
             segments: vec![LineSegment {
                 a: [cx + dx * inner, cy + dy * inner],
                 b: [cx + dx * outer, cy + dy * outer],
-                color: theme::TEXT_DIM,
+                color: p.text_dim,
             }]
             .into(),
             line_width_px: NOTCH_WIDTH_PX,
@@ -602,15 +603,16 @@ fn draw_knob<M: ?Sized + 'static>(
         });
     }
 
-    // インジケータ: 中心から外円まで伸びる白い太線。値角度を指す。
+    // インジケータ: 中心から外円まで伸びる太線。値角度を指す。
     let dx = val_angle.sin();
     let dy = -val_angle.cos();
     let indicator = LineSegment {
         a: [cx, cy],
         b: [cx + dx * r, cy + dy * r],
-        // knob の値を指す明るい中立ポインタ (物理的なつまみ指針)。 bright-neutral な
-        // 可動ハンドル surface に当たる theme token が無いため literal 維持。
-        color: Color::rgb(0.95, 0.97, 1.00),
+        // knob の値を指す物理的なつまみ指針。 hover/drag で色を変えない常時最大コントラストの
+        // 指針なので、 中立ハンドル 2 段のうち強い方 (`handle_active`) を使う (ダークでは明、
+        // ライトでは暗に反転して、 どちらでも `control` の円面から浮く)。
+        color: p.handle_active,
     };
     ui.push_lines(LineBatch {
         segments: vec![indicator].into(),
@@ -728,7 +730,7 @@ fn draw_knob_modulation_overlay<M: ?Sized + 'static>(
         push_arc(ui, cx, cy, band_top, base_angle, end_angle, Color { a: 0.9, ..c }, arc_lw + 1.0);
     }
 
-    // live 変調値の可動半径マーク (最前面、 明るい指針)。 base 白インジケータと別色 (amber) で区別。
+    // live 変調値の可動半径マーク (最前面、 明るい指針)。 base の中立指針と別色 (amber) で区別。
     if let Some(lv) = live_value {
         let la = angle_of(lv);
         let dx = la.sin();
@@ -738,9 +740,9 @@ fn draw_knob_modulation_overlay<M: ?Sized + 'static>(
             segments: vec![LineSegment {
                 a: [cx + dx * r_in, cy + dy * r_in],
                 b: [cx + dx * r, cy + dy * r],
-                // modulation の live 出力値マーク (amber、 base 白指針と区別)。 modulation-live
-                // indicator 用の theme token が無いため literal 維持。
-                color: Color::rgb(1.0, 0.85, 0.30),
+                // modulation の live 出力値マーク (amber、 base の中立指針と区別。
+                // r.md #48 で専用トークン化)。線なので alpha は載せない。
+                color: ui.palette().modulation_live.with_alpha(1.0),
             }]
             .into(),
             line_width_px: 2.5,
@@ -1151,9 +1153,9 @@ mod tests {
     #[test]
     fn bipolar_center_draws_no_value_arc_but_a_notch() {
         let scene = render_knob(0.5, &KnobStyle::BIPOLAR);
-        let arc = segments_colored(&scene, theme::ACCENT);
+        let arc = segments_colored(&scene, crate::theme::Palette::dark().accent);
         assert!(arc.is_empty(), "センタで値弧は 0 本 (got {} 本)", arc.len());
-        let notch = segments_colored(&scene, theme::TEXT_DIM);
+        let notch = segments_colored(&scene, crate::theme::Palette::dark().text_dim);
         assert_eq!(notch.len(), 1, "起点 notch が 1 本描かれる (got {})", notch.len());
         // notch は 12 時の radial 線 (x はセンタ、 y は弧の内側 → 外側)。
         let n = notch[0];
@@ -1167,7 +1169,7 @@ mod tests {
     fn bipolar_near_center_stays_unfilled() {
         for v in [0.5_f32 + 1e-4, 0.5 - 1e-4] {
             let scene = render_knob(v, &KnobStyle::BIPOLAR);
-            let arc = segments_colored(&scene, theme::ACCENT);
+            let arc = segments_colored(&scene, crate::theme::Palette::dark().accent);
             assert!(arc.is_empty(), "value={v} (dead band 内) で値弧は 0 本 (got {} 本)", arc.len());
         }
     }
@@ -1200,10 +1202,10 @@ mod tests {
             CX + (-150.0_f32).to_radians().sin() * R,
             CY - (-150.0_f32).to_radians().cos() * R,
         );
-        assert!(touches(&segments_colored(&f1, theme::ACCENT), seven), "1 frame 目は 7 時起点");
+        assert!(touches(&segments_colored(&f1, crate::theme::Palette::dark().accent), seven), "1 frame 目は 7 時起点");
 
         let f2 = draw(&mut host, &KnobStyle::BIPOLAR);
-        let arc = segments_colored(&f2, theme::ACCENT);
+        let arc = segments_colored(&f2, crate::theme::Palette::dark().accent);
         assert!(touches(&arc, (CX, CY - R)), "2 frame 目は 12 時起点で描き直される");
         assert!(!touches(&arc, seven), "cache HIT で 1 frame 目 (7 時起点) の弧が残らない");
     }
@@ -1212,7 +1214,7 @@ mod tests {
     #[test]
     fn bipolar_arc_grows_from_center_to_left() {
         let scene = render_knob(0.25, &KnobStyle::BIPOLAR);
-        let arc = segments_colored(&scene, theme::ACCENT);
+        let arc = segments_colored(&scene, crate::theme::Palette::dark().accent);
         assert!(!arc.is_empty(), "L 側で値弧が描かれる");
         assert!(
             touches(&arc, (CX, CY - R)),
@@ -1231,7 +1233,7 @@ mod tests {
     #[test]
     fn bipolar_arc_grows_from_center_to_right() {
         let scene = render_knob(0.75, &KnobStyle::BIPOLAR);
-        let arc = segments_colored(&scene, theme::ACCENT);
+        let arc = segments_colored(&scene, crate::theme::Palette::dark().accent);
         assert!(!arc.is_empty(), "R 側で値弧が描かれる");
         assert!(touches(&arc, (CX, CY - R)), "弧の起点は 12 時 (32, 2)");
         for s in &arc {
@@ -1246,12 +1248,12 @@ mod tests {
     #[test]
     fn unipolar_arc_grows_from_minimum_without_notch() {
         let scene = render_knob(0.5, &KnobStyle::UNIPOLAR);
-        let arc = segments_colored(&scene, theme::ACCENT);
+        let arc = segments_colored(&scene, crate::theme::Palette::dark().accent);
         let seven = (CX + (-150.0_f32).to_radians().sin() * R, CY - (-150.0_f32).to_radians().cos() * R);
         assert!(touches(&arc, seven), "弧の起点は 7 時 {seven:?}");
         assert!(touches(&arc, (CX, CY - R)), "value 0.5 まで = 12 時 (32, 2) まで届く");
         assert!(
-            segments_colored(&scene, theme::TEXT_DIM).is_empty(),
+            segments_colored(&scene, crate::theme::Palette::dark().text_dim).is_empty(),
             "unipolar は起点 notch を描かない (起点 = 可動範囲の端)",
         );
     }

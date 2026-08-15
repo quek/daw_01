@@ -18,20 +18,15 @@ use std::sync::Arc;
 use crate::widgets::select_modifier::{SelectModifier, range_ordered};
 
 use daw_ui_core::{
-    ChannelLayout, DragKind, Edit, SampleSlices, Ui, ViewportState1D, WaveformRenderMode,
-    WaveformSegment, WaveformSource, WaveformStyle, WaveformView, WidgetId,
+    ChannelLayout, DragKind, Edit, SampleSlices, Ui, ViewportState1D, WaveformInk,
+    WaveformRenderMode, WaveformSegment, WaveformSource, WaveformStyle, WaveformView, WidgetId,
 };
-use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect};
-use crate::theme;
+use daw_ui_renderer::{LineBatch, LineSegment, Rect};
 
 use common::time::{TimeDisplay, TimeMapping};
 
 use crate::app::{AppData, AppEvent, AudioEventTrimSide, MIN_AUDIO_EDITOR_VIEW_LEN_BEATS};
 use crate::widgets::time_grid::{TimeGridExt, TimeRulerStyle};
-
-const BG: Color = theme::PANEL;
-const TEXT: Color = theme::TEXT;
-const GHOST: Color = theme::SELECTION_WARM.with_alpha(0.85);
 
 /// common な mono / stereo source 用の borrowed-plane スタック配列サイズ。
 /// channel 数がこれ以下なら event ループ内の毎フレーム `Vec` 確保を消せる。
@@ -41,6 +36,9 @@ const MAX_WAVEFORM_CHANNELS: usize = 2;
 /// PR-D 段階 3: 中央 drag 中の event ghost (rectangle outline)。 dx は
 /// drag.delta.0 (px)。 描画は wf_area で clip。
 fn push_move_ghost(ui: &mut Ui<'_, AppData>, event_rect: Rect, wf_area: Rect, dx: f32) {
+    // ghost は「いま掴んでいる対象」 の予告なので選択と同じ warm
+    // (波形の寒色ブルーと補色の関係で、 どちらのテーマでも波形の上で分離する)。
+    let ghost = ui.palette().selection_warm.with_alpha(0.85);
     let g = Rect {
         x: event_rect.x + dx,
         y: event_rect.y,
@@ -49,17 +47,17 @@ fn push_move_ghost(ui: &mut Ui<'_, AppData>, event_rect: Rect, wf_area: Rect, dx
     };
     ui.push_lines(LineBatch {
         segments: Arc::from(vec![
-            LineSegment { a: [g.x, g.y], b: [g.x + g.w, g.y], color: GHOST },
+            LineSegment { a: [g.x, g.y], b: [g.x + g.w, g.y], color: ghost },
             LineSegment {
                 a: [g.x, g.y + g.h],
                 b: [g.x + g.w, g.y + g.h],
-                color: GHOST,
+                color: ghost,
             },
-            LineSegment { a: [g.x, g.y], b: [g.x, g.y + g.h], color: GHOST },
+            LineSegment { a: [g.x, g.y], b: [g.x, g.y + g.h], color: ghost },
             LineSegment {
                 a: [g.x + g.w, g.y],
                 b: [g.x + g.w, g.y + g.h],
-                color: GHOST,
+                color: ghost,
             },
         ]),
         line_width_px: 2.0,
@@ -76,6 +74,7 @@ fn push_trim_ghost(
     dx: f32,
     is_left: bool,
 ) {
+    let ghost = ui.palette().selection_warm.with_alpha(0.85);
     let x = if is_left {
         event_rect.x + dx
     } else {
@@ -85,7 +84,7 @@ fn push_trim_ghost(
         segments: Arc::from(vec![LineSegment {
             a: [x, event_rect.y],
             b: [x, event_rect.y + event_rect.h],
-            color: GHOST,
+            color: ghost,
         }]),
         line_width_px: 2.0,
         clip_rect: Some(wf_area),
@@ -98,7 +97,10 @@ fn rects_intersect(a: Rect, b: Rect) -> bool {
 }
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    ui.panel("audio_editor_bg", area, BG, 0.0);
+    // Audio Editor の面はパレットのクローム面 (panel)。 この上に載る文字は
+    // 可変背景ではないので極性固定インクではなく `p.text` で正しい。
+    let p = &app.theme.core;
+    ui.panel("audio_editor_bg", area, p.panel, 0.0);
 
     // 開いている clip を解決。 audio_editor_clip がセットされていない、
     // または範囲外 / 非 audio なら placeholder を出して return (= clip
@@ -112,7 +114,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 area.x + 12.0,
                 area.y + 18.0,
                 12.0,
-                TEXT,
+                p.text,
             );
             return;
         }
@@ -150,7 +152,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             h: 14.0 * 1.2,
         },
         14.0,
-        TEXT,
+        p.text,
     );
     // header 帯 (高さ header_h) の内側に収める。 旧実装は y = area.y + 4 に
     // 高さ header_h のボタンを置いていたので下端 4px が header の外へ出て、
@@ -215,7 +217,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             ruler_rect,
             mapping,
             viewport,
-            TimeRulerStyle::default(),
+            TimeRulerStyle::from_palette(p),
         );
 
         // ----- 既存 loop region overlay (ruler 上に半透明バンド) -----
@@ -236,8 +238,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 };
                 ui.push_rect(daw_ui_renderer::RectCommand {
                     rect: band,
-                    fill: theme::LOOP_BAND.with_alpha(0.18),
-                    border: theme::LOOP_BAND.with_alpha(0.55),
+                    fill: p.loop_band.with_alpha(0.18),
+                    border: p.loop_band.with_alpha(0.55),
                     border_width: 1.0,
                     radius: [0.0; 4],
                     clip_rect: Some(ruler_rect),
@@ -316,7 +318,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             wf_area.x + 4.0,
             wf_area.y + 8.0,
             11.0,
-            TEXT,
+            p.text,
         );
         return;
     }
@@ -449,14 +451,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             &planes_fallback
         };
         let is_selected = selected_set.contains(&idx);
+        // r.md #48: 波形インクは **テーマではなく「何の上に描くか」** で決まる。
+        // Audio Editor は clip 色を敷かず素の panel 面に描くので、 その panel を
+        // `waveform_for` に渡して明暗を選ばせる (旧実装は暗背景用の色を無条件に
+        // 選んでいたので、 ライトテーマでは波形が背景に溶けて消えていた)。
+        let wf_bg = p.panel;
         let fg = if is_selected {
-            theme::WAVEFORM_SEL.with_alpha(0.95)
+            p.waveform_for(wf_bg, WaveformInk::Selected).with_alpha(0.95)
         } else {
-            theme::WAVEFORM.with_alpha(0.85)
+            p.waveform_for(wf_bg, WaveformInk::Normal).with_alpha(0.85)
         };
         let style = WaveformStyle {
             fg,
-            fg_clipped: theme::WAVEFORM_PEAK,
+            fg_clipped: p.waveform_for(wf_bg, WaveformInk::Peak),
             fill: None,
             // r.md #41: 中央線は波形区間ごとではなく event 全幅に 1 度描く (下記)。
             // 区間ごとに任せると Slice の gap (= 音が鳴らない隙間) だけ中央線が
@@ -473,7 +480,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let n_ch = planes_borrowed.len().max(1);
             #[allow(clippy::cast_precision_loss)]
             let ch_h = event_rect.h / n_ch as f32;
-            let base_color = theme::GRID_LINE.with_alpha(0.15);
+            let base_color = p.grid_line.with_alpha(0.15);
             let baselines: Vec<LineSegment> = (0..n_ch)
                 .map(|i| {
                     #[allow(clippy::cast_precision_loss)]
@@ -551,7 +558,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 上下左右を marker。 push_rect で半透明帯にしても良いが、
         // border の方が波形を遮らない。
         if is_selected {
-            let border_color = theme::SELECTION_WARM.with_alpha(0.85);
+            let border_color = p.selection_warm.with_alpha(0.85);
             ui.push_lines(LineBatch {
                 segments: Arc::from(vec![
                     // top
@@ -586,9 +593,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
         // ----- r.md #41: slice 境界 (transient) マーカー -----
         // Slice mode は onset ごとに音が切り替わるので、 「どこで切れているか」 を
-        // Ableton の Beats モード同様に縦線で示す。 warp marker (空色・3px/1.5px) とは
-        // 色 (amber) と太さ (2.5px/1.0px) で区別する。 可変背景 (波形) 上でも読めるよう
-        // 暗い backing + 明色の 2 層 (`feedback_ui_indicator_contrast_on_variable_bg`)。
+        // Ableton の Beats モード同様に縦線で示す。 warp marker (`loop_band` の空色・
+        // 3px/1.5px) とは色 (`daw.slice_divider` の amber) と太さ (2.5px/1.0px) で区別する。
+        // 可変背景 (波形) 上でも読めるよう極性固定の暗い `scrim` を backing に敷いて
+        // 2 層で描く (`feedback_ui_indicator_contrast_on_variable_bg`)。
         if matches!(event.stretch_mode, common::model::StretchMode::Slice) && wave_spans.len() > 1 {
             // event 左端と一致する先頭スライスの頭は event 境界そのものなので出さない。
             // tempo 曲線で分割された継続 span (`head == false`) は音の切れ目ではない。
@@ -610,12 +618,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     backing.push(LineSegment {
                         a: [x, event_rect.y],
                         b: [x, event_rect.y + event_rect.h],
-                        color: theme::WINDOW_BG.with_alpha(0.65),
+                        color: p.scrim,
                     });
                     bright.push(LineSegment {
                         a: [x, event_rect.y],
                         b: [x, event_rect.y + event_rect.h],
-                        color: theme::SELECTION_WARM.with_alpha(0.85),
+                        color: app.theme.daw.slice_divider.with_alpha(0.85),
                     });
                 }
                 ui.push_lines(LineBatch {
@@ -633,7 +641,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
         // ----- B12-manual: warp marker 描画 + 手動編集 -----
         // 各 marker を locked_beat の x に縦線で描く。 可変な波形/背景上でも
-        // 視認できるよう暗い backing line (太) + 明色 (細) の 2 層
+        // 視認できるよう極性固定の `scrim` を backing (太) に敷き、 その上に
+        // `loop_band` の空色 (細) を重ねる 2 層
         // (`feedback_ui_indicator_contrast_on_variable_bg`)。 x は draw と
         // 下記 hit-test で共有 (DRY)。
         let marker_xs: Vec<(usize, f32)> = event
@@ -654,12 +663,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 backing.push(LineSegment {
                     a: [x, event_rect.y],
                     b: [x, event_rect.y + event_rect.h],
-                    color: theme::WINDOW_BG.with_alpha(0.65),
+                    color: p.scrim,
                 });
                 bright.push(LineSegment {
                     a: [x, event_rect.y],
                     b: [x, event_rect.y + event_rect.h],
-                    color: theme::LOOP_BAND.with_alpha(0.92),
+                    color: p.loop_band.with_alpha(0.92),
                 });
             }
             ui.push_lines(LineBatch {
@@ -802,7 +811,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     segments: Arc::from(vec![LineSegment {
                         a: [gx, event_rect.y],
                         b: [gx, event_rect.y + event_rect.h],
-                        color: theme::LOOP_BAND.with_alpha(0.6),
+                        color: p.loop_band.with_alpha(0.6),
                     }]),
                     line_width_px: 1.5,
                     clip_rect: Some(wf_area),
@@ -1062,7 +1071,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         {
             let norm = (in_clip - view_start_beat) / view_len_beats;
             let x = wf_area.x + norm as f32 * wf_area.w;
-            let color = theme::PLAYHEAD.with_alpha(0.9);
+            let color = app.theme.daw.playhead.with_alpha(0.9);
             ui.push_lines(LineBatch {
                 segments: std::sync::Arc::from(vec![LineSegment {
                     a: [x, wf_area.y],
@@ -1103,7 +1112,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             area.x + pad,
             area.y + area.h - 18.0,
             10.0,
-            TEXT,
+            p.text,
         );
     }
 }

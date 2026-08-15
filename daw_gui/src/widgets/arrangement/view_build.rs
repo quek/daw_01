@@ -304,13 +304,16 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         arranger_lane_h: SECTION_LANE_H,
     };
 
+    // r.md #48: style の色は **いま有効なテーマ** から組む (`const STYLE` / `Default` は
+    // runtime パレットを読めない)。ここで上書きするのは色ではない寸法と、意図的に描画を
+    // 止める 1 色だけ。
     let style = ArrangementStyle {
         // 完全透明で dB handle line の描画だけ抑制する (hit zone は色非依存)。
         audio_db_handle_color: Color::TRANSPARENT,
         track_text_size: 11.0,
         master_row_label_size: 11.0,
         indent_px: 8.0,
-        ..ArrangementStyle::default()
+        ..ArrangementStyle::from_theme(&app.theme)
     };
 
     let selected_automation_clips: Vec<AutomationClipKey> = app
@@ -557,6 +560,12 @@ fn build_arrangement_lanes_from_slice(
 struct LaneDisplay {
     label: Arc<str>,
     icon_glyph: char,
+    /// lane の **アイデンティティ色** (「どのパラメータのレーンか」 を運ぶカテゴリ色)。
+    ///
+    /// r.md #48: テーマ非従属 — テーマを切り替えても Volume は青、Pan は緑のままにする
+    /// (ユーザーが color_picker で選ぶトラック色と同じ扱い)。薄い面の上で沈む問題は
+    /// トークンを増やして解くのではなく、描画側 (`draw_automation_lane`) が
+    /// `Palette::adapt_on` で **色相・彩度を保ったまま明度だけ寄せて** 解く。
     color: Color,
 }
 

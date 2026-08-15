@@ -2,31 +2,17 @@
 //! resource monitor (r.md #3) の常駐メーター (DSP / CPU / FPS / xrun)。
 
 use daw_ui_core::{Edit, Ui};
-use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
-
-const COLOR_BG: Color = theme::HEADER;
-// 旧 dim グレー (0.65/0.68/0.72) はコントラスト不足だったため primary
-// (= 他 view と同じ body text) に統一。MIDI/file ラベルの可読性を上げる。
-const COLOR_TEXT: Color = theme::TEXT;
-// status_message は成功/通知系の緑 = semantic PLAY (status success)。
-const COLOR_MSG: Color = theme::PLAY;
-
-/// DSP / CPU load (0..1) を緑→黄→赤で色分け。 閾値は `metrics_bridge` の SSoT。
-fn load_color(load: f32) -> Color {
-    if load >= common::metrics_bridge::LOAD_DANGER {
-        theme::METER_RED
-    } else if load >= common::metrics_bridge::LOAD_WARN {
-        theme::METER_YELLOW
-    } else {
-        theme::METER_GREEN
-    }
-}
+use crate::view::resource_monitor::load_color;
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    ui.panel("status_bg", area, COLOR_BG, 0.0);
+    // ステータスバーはクロームのバー類 (= transport / menu bar と同じ層)。
+    // 上に乗る文字はこの面 (パレット自身のクローム) の上なのでテーマ従属の
+    // `text` / `text_dim` でよい (極性固定インクは不要)。
+    let p = &app.theme.core;
+    ui.panel("status_bg", area, p.header, 0.0);
 
     let pad = 12.0;
     let line_y = area.y + (area.h - 11.0) * 0.5;
@@ -40,10 +26,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         },
         app.song_doc.file_path
             .as_ref()
-            .map(|p| p.display().to_string())
+            .map(|path| path.display().to_string())
             .unwrap_or_else(|| "(unsaved)".to_string()),
     );
-    ui.label_at("status_left", &left, area.x + pad, line_y, 11.0, COLOR_TEXT);
+    // 旧 dim グレーはコントラスト不足だったため primary (= 他 view と同じ
+    // body text) に統一。MIDI/file ラベルの可読性を上げる。
+    ui.label_at("status_left", &left, area.x + pad, line_y, 11.0, p.text);
 
     // ----- 常駐リソースメーター (r.md #3) -----
     // 右端に DSP load (peak) / system CPU / FPS / xrun を色付きで常駐表示し、
@@ -86,7 +74,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             mx,
             line_y,
             11.0,
-            load_color(m.dsp_load_peak),
+            load_color(&app.theme, m.dsp_load_peak),
         );
         mx += 62.0;
         ui.label_at(
@@ -95,7 +83,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             mx,
             line_y,
             11.0,
-            load_color(m.system_cpu / 100.0),
+            load_color(&app.theme, m.system_cpu / 100.0),
         );
         mx += 62.0;
         ui.label_at(
@@ -104,7 +92,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             mx,
             line_y,
             11.0,
-            COLOR_TEXT,
+            p.text,
         );
         mx += 46.0;
         ui.label_at(
@@ -114,9 +102,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             line_y,
             11.0,
             if m.xrun_count > 0 {
-                theme::RECORD
+                app.theme.daw.record
             } else {
-                theme::TEXT_DIM
+                p.text_dim
             },
         );
         left_limit = badge_x - 8.0;
@@ -139,7 +127,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     h: 11.0 * 1.2,
                 },
                 11.0,
-                COLOR_MSG,
+                // status_message は成功 / 通知系の緑 = semantic な play
+                // (status success)。
+                app.theme.daw.play,
             );
         }
     }

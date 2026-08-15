@@ -12,24 +12,19 @@ use super::*;
 use daw_ui_core::{ButtonTextAlign, ToggleButtonStyle};
 
 use crate::app::{AppData, AppEvent, ClipRef};
+use crate::theme::Palette;
 use crate::view::snap::{self, SNAP_LABELS};
 use crate::view::track_color;
 use crate::widgets::select_modifier::{RangeItem, SelectModifier, range_block};
 
-const COLOR_HINT: Color = theme::TEXT_DIM;
-
-const SNAP_TOGGLE_STYLE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::ACCENT,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 3.0,
-    font_size: 12.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+/// Snap toolbar / legend の小さめトグル (標準の角丸 6px・14px 文字より 1 段小さい)。
+/// 色は毎フレームのパレットから引く (r.md #48: `const` はテーマ切替に追従できない)。
+fn snap_toggle_style(p: &Palette) -> ToggleButtonStyle {
+    ToggleButtonStyle { radius: 3.0, font_size: 12.0, ..ToggleButtonStyle::from_palette(p) }
+}
 
 pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoRollResponse {
+        let p = &*app.theme.core;
         // ---- view 構築 (レイアウト SSoT) + toolbar (常時描画) ----
         let built = view_build::build(app, area);
         draw_snap_toolbar(app, ui, built.toolbar_rect);
@@ -42,14 +37,14 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     app.ui_ephemeral.piano_roll_lyric_editing = false;
                 }));
             }
-            ui.panel("pr_bg_empty", built.body_full, theme::PANEL, 0.0);
+            ui.panel("pr_bg_empty", built.body_full, p.panel, 0.0);
             ui.label_at(
                 "pr_no_clip",
                 "(\u{30af}\u{30ea}\u{30c3}\u{30d7}\u{304c}\u{9078}\u{629e}\u{3055}\u{308c}\u{3066}\u{3044}\u{307e}\u{305b}\u{3093})",
                 built.body_full.x + 12.0,
                 built.body_full.y + 12.0,
                 12.0,
-                COLOR_HINT,
+                p.text_dim,
             );
             return PianoRollResponse::default();
         };
@@ -999,7 +994,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             bar_line_width: style.bar_line_width_px,
             beat_line_width: style.beat_line_width_px,
             // M14 Phase 63m (daw_01 #027): zoom 連動の beat 線間引き (default 4px)。
-            ..BarBeatGridStyle::default()
+            ..BarBeatGridStyle::from_palette(p)
         };
         // M14 Phase 124 (#100): 3 段目 subdivision。 caller が拍間隔を渡したときだけ構築
         // (ズーム退避は bar_beat_grid 内の px_per_interval 判定に委ねる)。 cache 無効化は
@@ -1019,7 +1014,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             bar_tick_height: 12.0,
             beat_tick_height: 5.0,
             // M14 Phase 63m (daw_01 #027): zoom 連動の label / beat tick 間引き (default 60 / 4 px)。
-            ..TimeRulerStyle::default()
+            ..TimeRulerStyle::from_palette(p)
         };
         let id_for_inner: u64 = hash_inputs(id);
 
@@ -1096,7 +1091,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     &visible_owned,
                     view_copy,
                     grid,
-                    style_copy.note_fill_fn,
+                    style_copy.velocity_ramp,
                     style_copy.bg,
                     style_copy.note_border_radius_px,
                     style_copy.note_muted_hatch_color,
@@ -1921,7 +1916,9 @@ fn fold_piano_roll_note_hash(notes: &[Note]) -> u64 {
 /// 配置: [Snap toggle][snap unit dropdown][Fit] [Fold][Snap on Draw]。
 /// Fold / Snap on Draw は Phase 7 B5 (Scale &amp; Root)。
 fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
-    ui.panel("pr_toolbar_bg", rect, theme::HEADER, 0.0);
+    let p = &*app.theme.core;
+    let toggle_style = snap_toggle_style(p);
+    ui.panel("pr_toolbar_bg", rect, p.header, 0.0);
 
     let pad = 6.0;
     let h = 18.0;
@@ -1940,7 +1937,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "Snap",
         Rect { x, y, w: toggle_w, h },
         app.ui_prefs.pianoroll_snap_enabled,
-        &SNAP_TOGGLE_STYLE,
+        &toggle_style,
         |new| {
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetPianoRollSnapEnabled(new));
@@ -1978,7 +1975,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "Fold",
         Rect { x, y, w: fold_w, h },
         app.ui_prefs.piano_roll_fold,
-        &SNAP_TOGGLE_STYLE,
+        &toggle_style,
         |_| {
             Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleFoldToScale);
@@ -1996,7 +1993,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "Snap Draw",
         Rect { x, y, w: snap_draw_w, h },
         app.ui_prefs.snap_on_draw,
-        &SNAP_TOGGLE_STYLE,
+        &toggle_style,
         |_| {
             Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleSnapOnDraw);
@@ -2017,7 +2014,9 @@ fn draw_legend(
     shown: &[ClipRef],
     target: ClipRef,
 ) {
-    ui.panel("pr_legend_bg", rect, theme::HEADER, 0.0);
+    let p = &*app.theme.core;
+    let toggle_style = snap_toggle_style(p);
+    ui.panel("pr_legend_bg", rect, p.header, 0.0);
     let pad = 6.0;
     let row_h = 28.0;
     let gap = 4.0;
@@ -2028,7 +2027,7 @@ fn draw_legend(
         rect.x + pad,
         rect.y + pad,
         11.0,
-        COLOR_HINT,
+        p.text_dim,
     );
     // 表示中クリップが乗っている **トラック** を初出順に列挙 (同じトラックの複数クリップは 1 行)。
     let mut track_indices: Vec<u32> = Vec::new();
@@ -2079,9 +2078,9 @@ fn draw_legend(
                 ("pr_legend_row", row_i),
                 row,
                 if is_target {
-                    theme::ACCENT_WASH
+                    p.accent_wash
                 } else {
-                    theme::PANEL_RAISED
+                    p.panel_raised
                 },
                 4.0,
             );
@@ -2089,7 +2088,7 @@ fn draw_legend(
             if is_target {
                 ui.push_rect(RectCommand::uniform_radius(
                     Rect { x: row.x, y: row.y, w: 3.0, h: row.h },
-                    theme::ACCENT,
+                    p.accent,
                     1.5,
                 ));
             }
@@ -2103,7 +2102,7 @@ fn draw_legend(
                     h: 13.0,
                 },
                 fill: color,
-                border: theme::BORDER,
+                border: p.border,
                 border_width: 1.0,
                 radius: [3.0; 4],
                 clip_rect: None,
@@ -2121,7 +2120,7 @@ fn draw_legend(
                 "L",
                 lock_rect,
                 locked,
-                &SNAP_TOGGLE_STYLE,
+                &toggle_style,
                 move |_| {
                     Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::TogglePianoRollTrackLock(track_id));
@@ -2151,11 +2150,9 @@ fn draw_legend(
                 }));
             }
             let label = track.name.clone();
-            let text_color = if is_target {
-                theme::TEXT
-            } else {
-                theme::TEXT_DIM
-            };
+            // 行背景は panel_raised / accent_wash (パレット自身のクローム面) なので、
+            // 極性固定インクではなく通常の本文色でよい。
+            let text_color = if is_target { p.text } else { p.text_dim };
             let label_rect = Rect {
                 x: name_rect.x + 4.0,
                 y: name_rect.y + (name_rect.h - 12.0) * 0.5,

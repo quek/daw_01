@@ -112,7 +112,7 @@ impl App {
                     "main",
                     area,
                     &m.points,
-                    AutomationCurveStyle::default(),
+                    AutomationCurveStyle::from_palette(ui.palette()),
                     |idx, pos| {
                         Edit::mutate(move |m: &mut AutomationModel| {
                             if idx < m.points.len() {
