@@ -21,6 +21,7 @@ pub mod project;
 pub mod protocol;
 pub mod recovery;
 pub mod scale;
+pub mod scope_bridge;
 pub mod shmem;
 pub mod snap;
 pub mod tempo_map;

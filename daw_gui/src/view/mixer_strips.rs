@@ -172,15 +172,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let visible_order: Vec<u32> = normals.iter().chain(returns.iter()).map(|e| e.track_id).collect();
     let select_press = std::cell::Cell::new(None::<u32>);
 
-    // ----- 右端から固定配置: MASTER → returns 帯 → 「＋ Return」 -----
-    let master_x = area.x + area.w - inner_pad - STRIP_WIDTH;
+    // ----- 右端から固定配置: returns 帯 → 「＋ Return」 -----
+    // r.md #50: MASTER ストリップは画面右端の常駐マスターパネル
+    // (`view::master_panel`) へ移設したので、ここには居ない。同じフェーダーを
+    // 2 か所で編集できる状態を作らないため、Mixer 側からは完全に消す。
+    let returns_right = area.x + area.w - inner_pad;
 
-    // returns 帯: master の左に returns.len() 本 + 帯上端に「＋ Return」 ボタン。
-    // returns 0 本でも「＋ Return」 ボタンは出す (= master のすぐ左)。
+    // returns 帯: 右端に returns.len() 本 + その左に「＋ Return」 ボタン。
+    // returns 0 本でも「＋ Return」 ボタンは出す。
     let returns_w = (returns.len() as f32) * pitch;
     // 「＋ Return」 ボタン用に固定列を 1 本分確保する。
     let add_return_col_w = STRIP_WIDTH;
-    let returns_band_x = master_x - inner_pad - returns_w;
+    let returns_band_x = returns_right - returns_w;
     let add_return_x = returns_band_x - STRIP_GAP - add_return_col_w;
 
     // 通常 track strips: 左端 inner_pad から returns 帯 / Add Return 列の手前まで
@@ -281,31 +284,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.apply_select_tracks(tid, modifier, &order);
         }));
     }
-
-    // ----- MASTER strip (右端固定) -----
-    // Master strip は track ではないので gesture 対象外 (= 渡す flag は false)。
-    draw_strip(
-        app,
-        ui,
-        usize::MAX,
-        "MASTER",
-        app.transport.master_gain,
-        0.0,
-        false,
-        false,
-        app.transport.peak_l_display,
-        app.transport.peak_r_display,
-        Rect { x: master_x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
-        // master strip 本体 (elevation-2 = 通常 strip より一段浮く面)。
-        p.panel_raised,
-        None, // master は track 色を持たない (neutral 背景)
-        u32::MAX,
-        true,
-        None, // group_collapsed: master は group disclosure 無し
-        0.0, // sends_band_h (master は Sends セクション無し)
-        false,
-        false,
-    );
 
     // 算出した hover track を AppData に反映 (変化時のみ Edit、
     // arrange_hovered_track と同じ diff-guard)。 dispatch_shortcuts が S キーで読む。

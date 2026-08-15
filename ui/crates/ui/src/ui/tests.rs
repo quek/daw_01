@@ -1148,7 +1148,16 @@ fn ui_set_cursor_resets_between_frames() {
             ui.set_cursor(CursorIcon::EwResize);
         },
     );
-    // Frame 2: 呼ばない → callback も発火しないこと (前 frame の cursor は残らない)
+    // Frame 2: 呼ばない → **Default に戻す** (OS 側は state-full なので、送らないと
+    // 前フレームの形が貼り付く。daw_01 r.md #50 でこの per-frame 仕様に変更)。
+    host.frame(
+        &mut (),
+        &mut scene,
+        screen,
+        FrameInput::default(),
+        |(), _ui| {},
+    );
+    // Frame 3: 同じく呼ばない → 既に Default なので**送り直さない** (dedup)。
     host.frame(
         &mut (),
         &mut scene,
@@ -1157,7 +1166,10 @@ fn ui_set_cursor_resets_between_frames() {
         |(), _ui| {},
     );
 
-    assert_eq!(*captured.lock().unwrap(), vec![CursorIcon::EwResize]);
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec![CursorIcon::EwResize, CursorIcon::Default]
+    );
 }
 
 // -------- M9 Phase 43: FrameStats / debug_overlay --------

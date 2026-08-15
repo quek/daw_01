@@ -946,6 +946,7 @@ impl LocalState {
         &mut self,
         shared: &SharedState,
         bridge: &AudioBridgeHandle,
+        scope: &common::scope_bridge::ScopeBridgeHandle,
         sample_rate: u32,
         frames: usize,
     ) {
@@ -1180,6 +1181,13 @@ impl LocalState {
                 &self.mod_scalars_snapshot,
                 master_gain,
             );
+
+            // r.md #50: マスター出力サンプルを GUI のメーター解析リングへ流す。
+            // **metronome click を重ねる前** に取るのがこのタップ位置の要点で、
+            // これで「メーターの数値 = 書き出す WAV の数値」が構造的に一致する
+            // (grill-me で確定した測定対象 = 曲の音だけ)。事前確保済み shmem への
+            // store のみなので RT 安全 (確保・ロック・I/O 無し)。
+            scope.write_block(&self.master_l[..n], &self.master_r[..n]);
 
             // metronome click を master mix に重ねる (monitoring 専用 — export
             // 経路には存在しない)。 master mix の最後に重ねる (= track の mute /

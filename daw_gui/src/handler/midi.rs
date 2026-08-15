@@ -482,6 +482,10 @@ impl AppData {
             self.recording.midi_recording = true;
         }
         self.send_audio(AudioCommand::Play);
+        // r.md #50: 録音開始も transport を回す = 「再生を始めた」ので、積算
+        // ラウドネスを畳む。ここは `play()` を経由しない独立経路なので、
+        // 明示的に呼ばないと前のテイクの I / LRA / 最大 TP を引きずる。
+        self.reset_master_loudness();
     }
 
     /// Phase 7 B4 Step C/D: 録音停止 / cancel。 active_notes 全 clear、

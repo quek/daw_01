@@ -8,7 +8,7 @@ use common::protocol::{AudioCommand, PluginCommand};
 impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
-    pub(crate) fn on_tick(&mut self, playhead_samples: u64, peak_l_raw: f32, peak_r_raw: f32) {
+    pub(crate) fn on_tick(&mut self, playhead_samples: u64) {
         // パニックの遅延 reinit を発火する。 master の declick フェード
         // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を
         // 送ることで、 plugin を mix から外す detach が master ミュート後に起き、
@@ -138,13 +138,9 @@ impl AppData {
         // sends `SlotGuiClosed` back. daw_gui no longer polls a local
         // close flag here.
 
-        const RELEASE: f32 = 0.85;
-        let new_l = common::meter::update_peak(self.transport.peak_l_display, peak_l_raw, RELEASE);
-        let new_r = common::meter::update_peak(self.transport.peak_r_display, peak_r_raw, RELEASE);
-        self.transport.peak_l_display = new_l;
-        self.transport.peak_r_display = new_r;
-        self.transport.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_l));
-        self.transport.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_r));
+        // r.md #50: マスターメーターの減衰はここに無い。規格準拠の弾道
+        // (VU 2 次系 / dB 直線のピーク落下 / ピーク保持) はテレメトリスレッドの
+        // `MasterAnalyzer` が持ち、`MasterMeterTick` で完成した表示値だけが届く。
     }
 
     /// Phase 4 Step C: tick ごとの automation recording。 `is_playing` と

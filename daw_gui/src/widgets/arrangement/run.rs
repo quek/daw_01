@@ -1827,11 +1827,10 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                 ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => CursorIcon::EwResize,
             };
             ui.set_cursor(cur);
-        } else if let Some((px, py)) = pointer.pos
-            && (lanes.contains(px, py) || ruler.contains(px, py) || header_pane.contains(px, py))
-        {
-            ui.set_cursor(CursorIcon::Default);
         }
+        // 「自分の矩形なら Default」の分岐はもう要らない (daw_01 r.md #50):
+        // `Ui` が per-frame セマンティクスになり、誰も要求しなかったフレームは
+        // 自動で Default に戻る。
 
         // ---- 描画 (heavy + cached + 動的 overlay) ----
         // M10 Phase 50: pending_reorder_hash を viewport_key に入れて、release frame の optimistic

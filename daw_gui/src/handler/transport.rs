@@ -52,6 +52,10 @@ impl AppData {
         self.transport.playback_origin_beat = Some(self.transport.playhead_beat.unwrap_or(0.0));
         self.send_audio(AudioCommand::Play);
         self.transport.is_playing = true;
+        // r.md #50: 再生を始めるたびに積算ラウドネス一式をリセットする
+        // (Cubase の "Reset on Start" 相当)。曲を頭から通せば「この曲の
+        // ラウドネス」がそのまま出る、という grill-me の決定。
+        self.reset_master_loudness();
     }
 
     /// プレイヘッドを `beat` に置き、「停止で戻るホーム」 (`playback_origin_beat`)

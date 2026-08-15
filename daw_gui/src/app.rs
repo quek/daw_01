@@ -177,10 +177,7 @@ impl AppData {
                 panic_reinit_due: None,
                 panic_release_pending: false,
                 master_gain: 1.0,
-                peak_l_display: 0.0,
-                peak_r_display: 0.0,
-                peak_l_norm: 0.0,
-                peak_r_norm: 0.0,
+                master_meter: crate::master_meter::MasterMeterSnapshot::default(),
                 track_peak_display: initial_peak_display,
                 mod_scalars: Vec::new(),
                 pending_play: false,
@@ -318,6 +315,11 @@ impl AppData {
                 settings_rect: app_config
                     .settings_rect
                     .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
+                // r.md #50: マスターパネルの開閉 / 幅 / セクション配分 / メーター設定。
+                master_panel_open: app_config.master_panel_open,
+                master_panel_w: app_config.master_panel_w,
+                master_panel_sections: app_config.master_panel_sections,
+                meter_settings: app_config.meter,
                 is_help_open: false,
                 app_dirs,
                 recent_files,
@@ -433,6 +435,16 @@ impl AppData {
                 main_focused: true,
                 ..Default::default()
             },
+            // r.md #50: メーター設定の初期値は app_config から。`active` は
+            // 「パネルが描かれているか」で、view が毎フレーム同期する。
+            meter_control: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::master_meter::settings::MeterControl {
+                    settings: app_config.meter,
+                    loudness_reset_epoch: 0,
+                    peak_reset_epoch: 0,
+                    active: app_config.master_panel_open,
+                },
+            )),
         };
         // recent_files / recent_saved の path 列から filename label cache を
         // 1 回構築。 push_recent / push_recent_saved 経由の更新でも自動的に
@@ -684,6 +696,56 @@ impl AppData {
                 }
                 self.persist_app_config();
             }
+            // r.md #50: 画面右端のマスターパネルの開閉 (View メニュー / Ctrl+Alt+M)。
+            AppEvent::ToggleMasterPanel => {
+                self.ui_prefs.master_panel_open = !self.ui_prefs.master_panel_open;
+                self.sync_meter_control();
+                self.persist_app_config();
+            }
+            // ドラッグ中は状態だけ更新し、release でまとめてディスクへ書く
+            // (毎フレーム app_config.json を同期書き込みしない — 設定 window /
+            // 編集履歴 window と同じ commit-on-release の流儀)。
+            AppEvent::SetMasterPanelWidth { w, commit } => {
+                use crate::handler::master_panel::{MASTER_PANEL_MAX_W, MASTER_PANEL_MIN_W};
+                let next = w.clamp(MASTER_PANEL_MIN_W, MASTER_PANEL_MAX_W);
+                let changed = (next - self.ui_prefs.master_panel_w).abs() >= 0.5;
+                if changed {
+                    self.ui_prefs.master_panel_w = next;
+                }
+                if commit {
+                    self.persist_app_config();
+                }
+            }
+            AppEvent::SetMasterPanelSectionRatios { ratios, commit } => {
+                let sum: f32 = ratios.iter().sum();
+                if sum <= 0.0 {
+                    return;
+                }
+                let next = [
+                    ratios[0] / sum,
+                    ratios[1] / sum,
+                    ratios[2] / sum,
+                    ratios[3] / sum,
+                ];
+                let changed = !next
+                    .iter()
+                    .zip(self.ui_prefs.master_panel_sections.iter())
+                    .all(|(a, b)| (a - b).abs() < 1e-4);
+                if changed {
+                    self.ui_prefs.master_panel_sections = next;
+                }
+                if commit {
+                    self.persist_app_config();
+                }
+            }
+            AppEvent::SetMeterSettings(settings) => {
+                self.ui_prefs.meter_settings = *settings;
+                self.sync_meter_control();
+                self.persist_app_config();
+            }
+            // EBU Tech 3341 §2.2: 積算値は「同時に」リセットできること。
+            AppEvent::ResetLoudness => self.reset_master_loudness(),
+            AppEvent::ResetMasterPeakHold => self.reset_master_peak_hold(),
             // r.md #48: テーマ切替。 id からパレットを解決して差し替えるだけで、
             // 実際に画面へ反映するのは runner (`UiHost::set_palette` + 描画キャッシュ破棄)。
             AppEvent::SetTheme(id) => {
@@ -1390,7 +1452,7 @@ impl AppData {
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
             }
-            AppEvent::Tick { samples, peak_l, peak_r, preroll } => {
+            AppEvent::Tick { samples, preroll } => {
                 // Phase 7 B4 Step C: preroll mirror で count-in 完了を検知。
                 // midi_recording_pending == true かつ preroll == 0 なら、
                 // midi_recording に昇格して以後の MIDI input を armed track に
@@ -1400,7 +1462,12 @@ impl AppData {
                     self.recording.midi_recording = true;
                 }
                 let _ = preroll;  // 上で消費
-                self.on_tick(samples, peak_l, peak_r);
+                self.on_tick(samples);
+            }
+            // r.md #50: マスターメーターの表示状態は解析器が丸ごと作るので、
+            // ここは差し替えるだけ (GUI 側で弾道を二重に掛けない)。
+            AppEvent::MasterMeterTick(snapshot) => {
+                self.transport.master_meter = *snapshot;
             }
             AppEvent::SetTrackVolume { track, amp } => {
                 self.set_track_volume(track, amp);

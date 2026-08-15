@@ -60,8 +60,6 @@ pub(super) struct PrContent {
     pub multi: bool,
     /// 複数表示時の legend パネル rect (単一表示は `None`)。
     pub legend_rect: Option<Rect>,
-    /// toolbar を除いた widget 本体 (legend を除いた分)。
-    pub body: Rect,
     /// note grid (レイアウト SSoT。hover / hit-test / drag / 描画すべてが参照)。
     pub grid: Rect,
     pub kbd: Rect,
@@ -228,7 +226,6 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
             clip_origin_beat,
             multi,
             legend_rect,
-            body,
             grid,
             kbd,
             ruler,

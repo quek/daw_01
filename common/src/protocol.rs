@@ -93,6 +93,10 @@ pub struct AudioSession {
     /// (`metrics_bridge::metrics_shmem_id(pid)`)。 daw_audio / daw_plugin_host
     /// がこれで `MetricsBridgeHandle::open` し、 DSP load / per-plugin CPU を publish。
     pub metrics_shmem_id: String,
+    /// r.md #50: マスター出力サンプルリング (`scope_bridge::scope_shmem_id(pid)`)
+    /// の shmem os_id。daw_audio がこれで `ScopeBridgeHandle::open` し、
+    /// `render_master_buffer` の出力を毎バッファ書き込む。daw_plugin_host は使わない。
+    pub scope_shmem_id: String,
     pub sample_rate: u32,
     pub max_frames: u32,
     pub channels: u16,

@@ -213,6 +213,8 @@ fn run_gui(
         .expect("Bootstrap.incoming_rx already taken");
     let bridge = Arc::clone(&bootstrap.bridge);
     let metrics = Arc::clone(&bootstrap.metrics);
+    // r.md #50: マスター出力サンプルのリング (テレメトリポーラの解析器が読む)。
+    let scope = Arc::clone(&bootstrap.scope);
     let job = Arc::clone(&bootstrap.job);
     let plugin_db = bootstrap.plugin_db.clone();
     let supervisor = Arc::clone(&bootstrap.supervisor);
@@ -270,6 +272,8 @@ fn run_gui(
             spawn_playhead_poller(
                 bridge,
                 Arc::clone(&metrics),
+                scope,
+                Arc::clone(&app.meter_control),
                 proxy.clone(),
                 Arc::clone(&awake),
             );
@@ -405,12 +409,24 @@ const METRICS_TICK_DIVISOR: u32 = 8;
 fn spawn_playhead_poller(
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
+    scope: Arc<common::scope_bridge::ScopeBridgeHandle>,
+    meter_control: Arc<
+        std::sync::Mutex<daw_gui::master_meter::settings::MeterControl>,
+    >,
     proxy: EventLoopProxy<AppEvent>,
     awake: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
         let mut mod_buf: Vec<f32> = Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES);
+        // r.md #50: マスター出力サンプルのリング読み手と、そこから全メーターを
+        // 導く解析器。ここが唯一の読み手 (単一 reader 前提のカーソル)。
+        let mut scope_reader = scope.reader();
+        let mut scope_buf: Vec<[f32; 2]> =
+            Vec::with_capacity(common::scope_bridge::max_read_frames(scope.sample_rate()));
+        let mut analyzer =
+            daw_gui::master_meter::MasterAnalyzer::new(scope.sample_rate());
+        let mut last_meter_at = std::time::Instant::now();
         let mut tick_count: u32 = 0;
         loop {
             let awake_now = awake.load(std::sync::atomic::Ordering::Acquire);
@@ -421,18 +437,42 @@ fn spawn_playhead_poller(
             });
             tick_count = tick_count.wrapping_add(1);
             let samples = bridge.playhead_samples();
-            let (peak_l, peak_r) = bridge.peaks();
             let preroll = bridge.preroll_remaining();
-            if proxy
-                .send_event(AppEvent::Tick {
-                    samples,
-                    peak_l,
-                    peak_r,
-                    preroll,
-                })
-                .is_err()
-            {
+            if proxy.send_event(AppEvent::Tick { samples, preroll }).is_err() {
                 break;
+            }
+            // r.md #50: マスターメーター。パネルが閉じているときは解析ごと止める
+            // (リングは読み捨ててカーソルだけ進め、再表示で古い音が流れ込まない
+            // ようにする)。
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_meter_at).as_secs_f32();
+            last_meter_at = now;
+            scope_buf.clear();
+            let outcome = scope_reader.read(&scope, &mut scope_buf);
+            let control = meter_control.lock().ok().map(|c| daw_gui::master_meter::settings::MeterControl {
+                settings: c.settings,
+                loudness_reset_epoch: c.loudness_reset_epoch,
+                peak_reset_epoch: c.peak_reset_epoch,
+                active: c.active,
+            });
+            if let Some(control) = control
+                && control.active
+            {
+                let snapshot = analyzer
+                    .tick(
+                        &control,
+                        scope.sample_rate(),
+                        &scope_buf,
+                        elapsed,
+                        outcome.dropped > 0,
+                    )
+                    .clone();
+                if proxy
+                    .send_event(AppEvent::MasterMeterTick(Box::new(snapshot)))
+                    .is_err()
+                {
+                    break;
+                }
             }
             // docs/plan_modulation.md §4.2: poll the modulation scalars on the
             // same ~30Hz tick as peaks and stream them to the model so visual

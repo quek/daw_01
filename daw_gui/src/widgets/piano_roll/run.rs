@@ -59,7 +59,6 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             clip_origin_beat,
             multi,
             legend_rect,
-            body,
             grid,
             kbd,
             ruler,
@@ -828,8 +827,8 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         }
 
         // hover 中の cursor 形状要求 (drag 中は drag kind、note hover (拡張範囲含む) は
-        // hover_cursor、その他 widget 内は Default に明示 reset で stale cursor を防ぐ)。
-        // winit は state-full なので set_cursor を呼ばないと前フレームの形状が残る (ui.rs:999)。
+        // hover_cursor)。要求しなかったフレームは `Ui` が自動で Default に戻すので
+        // (daw_01 r.md #50 の per-frame セマンティクス)、明示 reset は不要。
         if response.creating {
             // 作成中は右端を伸ばす操作なので EwResize (resize と同じ)。
             ui.set_cursor(CursorIcon::EwResize);
@@ -847,8 +846,6 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 note_hover_cursor(visible, view, grid, cx, cy, style.resize_handle_px)
         {
             ui.set_cursor(cursor);
-        } else if pointer.pos.is_some_and(|(px, py)| body.contains(px, py)) {
-            ui.set_cursor(CursorIcon::Default);
         }
 
         // ----- M14 Phase 125 (#102): plain-drag marquee gate (空き grid press を marquee が所有) -----
