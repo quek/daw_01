@@ -63,12 +63,9 @@ impl ToggleButtonStyle {
             radius: 6.0,
             font_size: 14.0,
             text_color: p.text,
-            // r.md #48: 既定の `on_color` は `p.accent` なので、ON の文字色も accent 用の
-            // トークンを既定にする。 旧実装は `None` (= off 用 `text_color` に fallback) で、
-            // ライトテーマだと「暗い accent 塗りの上に暗い本文色」 になって文字が消えていた。
-            // caller が `on_color` を上書きする場合 (mute の赤 / solo の黄) は
-            // `on_text_color` も併せて指定する既存 idiom のまま。
-            on_text_color: Some(p.text_on_accent),
+            // `None` = ON 塗りの輝度から auto-contrast (下記 `draw_toggle_button`)。
+            // caller が `on_color` を上書きしても文字が読めることが保証される。
+            on_text_color: None,
         }
     }
 }
@@ -222,12 +219,13 @@ fn draw_toggle_button<M: ?Sized + 'static>(
         rect.x + (rect.w - text_w).max(0.0) * 0.5
     };
     let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
-    // value=true のとき on_text_color (Some) を優先、 None なら text_color に fallback
-    // (daw_01 #051: metronome 黄背景 + 黒文字のような state-dependent text color)。
-    // r.md #48: 既定スタイル (`from_palette`) は `on_text_color: Some(p.text_on_accent)` を
-    // 持つので、ライトテーマで「暗い accent 塗りの上に暗い text_color」 になることはない。
+    // value=true のとき on_text_color (Some) を優先。 None なら **ON 塗りの輝度から
+    // auto-contrast** (r.md #48)。 旧実装は off 用 `text_color` に fallback していたため、
+    // caller が明るい on_color (solo の黄) を指定するたびに on_text_color を手で足す
+    // boilerplate が要り、指定漏れがそのまま視認性バグになっていた。 ライトテーマでは
+    // `text_color` が暗インクなので、fallback のままだと accent 塗りの上で文字が消える。
     let text_color = if value {
-        style.on_text_color.unwrap_or(style.text_color)
+        style.on_text_color.unwrap_or_else(|| p.ink_for(fill))
     } else {
         style.text_color
     };
@@ -397,27 +395,38 @@ mod tests {
         assert!((glyph.color.r - 0.10).abs() < 1e-6);
     }
 
+    /// r.md #48 で契約変更: `on_text_color = None` は **ON 塗りの輝度から auto-contrast**。
+    /// 旧契約は off 用 `text_color` への fallback だったが、それだと caller が明るい
+    /// `on_color` (solo の黄) を指定するたびに `on_text_color` を手で足す boilerplate が要り、
+    /// 指定漏れがそのまま視認性バグになっていた (ライトテーマでは accent 塗りの上に
+    /// 暗い本文色が乗って文字が消える)。
     #[test]
-    fn text_color_falls_back_to_text_color_when_on_text_color_none() {
-        // daw_01 #051 back compat: on_text_color=None なら value=true でも text_color。
-        let mut host: UiHost<()> = UiHost::no_redraw();
-        let mut scene = Scene::new();
-        let screen = PhysicalSize { width: 200, height: 100 };
-        let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
-        let style = ToggleButtonStyle {
-            text_color: Color::rgb(0.95, 0.95, 0.97), // white
-            on_text_color: None,
-            ..ToggleButtonStyle::from_palette(&Palette::dark())
-        };
-
-        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
-            ui.toggle_button_at("t", "M", rect, true, &style, |_| {
-                Edit::mutate(|(): &mut ()| {})
+    fn text_color_auto_contrasts_against_the_on_fill_when_on_text_color_none() {
+        fn on_glyph_color(on_color: Color) -> Color {
+            let mut host: UiHost<()> = UiHost::no_redraw();
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 200, height: 100 };
+            let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
+            let style = ToggleButtonStyle {
+                on_color,
+                text_color: Color::rgb(0.95, 0.95, 0.97),
+                on_text_color: None,
+                ..ToggleButtonStyle::from_palette(&Palette::dark())
+            };
+            host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+                ui.toggle_button_at("t", "M", rect, true, &style, |_| {
+                    Edit::mutate(|(): &mut ()| {})
+                });
             });
-        });
+            scene.iter_glyphs().next().expect("text should be pushed").color
+        }
 
-        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
-        assert!((glyph.color.r - 0.95).abs() < 1e-6, "on_text_color=None で text_color を fallback");
+        let p = Palette::dark();
+        // 明るい ON 塗り (solo の黄 / accent の azure) → 暗インク。
+        assert_eq!(on_glyph_color(Color::rgb(0.97, 0.82, 0.30)), p.ink_on_bright);
+        assert_eq!(on_glyph_color(p.accent), p.ink_on_bright);
+        // 暗い ON 塗り (record の赤) → 明インク。
+        assert_eq!(on_glyph_color(Color::rgb(0.30, 0.05, 0.06)), p.ink_on_dark);
     }
 
     #[test]

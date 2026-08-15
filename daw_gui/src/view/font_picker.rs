@@ -149,8 +149,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 &list_style,
                 |ui, family, i, row_rect, is_selected| {
                     // 行背景は list_view が塗るクローム面なので、 見本は `p.text` /
-                    // 選択行は accent の上の `p.text_on_accent`。
-                    let color = if is_selected { p.text_on_accent } else { p.text };
+                    // 選択行は accent 塗りの上なので auto-contrast で取る。
+                    let color = if is_selected { p.ink_on_accent() } else { p.text };
                     // 各行はその行のフォント自身で描画 (本物のプレビュー)。
                     // `""` = renderer default → "デフォルト" を default フォントで。
                     let (label, font): (&str, Option<std::sync::Arc<str>>) = if family.is_empty() {

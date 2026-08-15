@@ -266,7 +266,7 @@ fn draw_theme_list(app: &AppData, ui: &mut Ui<'_, AppData>, list_rect: Rect) {
                     clip_rect: None,
                 });
             }
-            let text_color = if is_current { p.text_on_accent } else { p.text };
+            let text_color = if is_current { p.ink_on_accent() } else { p.text };
             ui.label_at(
                 ("settings_theme_row", i),
                 &theme.name,
@@ -279,7 +279,7 @@ fn draw_theme_list(app: &AppData, ui: &mut Ui<'_, AppData>, list_rect: Rect) {
             if let ThemeSource::User(path) = &theme.source {
                 let file =
                     path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
-                let dim = if is_current { p.text_on_accent } else { p.text_faint };
+                let dim = if is_current { p.ink_on_accent() } else { p.text_faint };
                 // 右寄せ位置は実測幅で決める (固定幅近似だと日本語ファイル名でずれる)。
                 let w = ui.measure_text(&file, 10.0);
                 ui.label_at(
