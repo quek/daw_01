@@ -19,8 +19,8 @@ use anyhow::{Context as _, Result, anyhow};
 use boa_engine::property::Attribute;
 use boa_engine::value::TryFromJs;
 use boa_engine::{
-    Context, JsArgs, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source,
-    js_string,
+    Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsString, JsValue, NativeFunction,
+    Source, js_string,
 };
 use common::model::Song;
 use common::plugin_format::PluginFormat;
@@ -457,6 +457,21 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
         .function(NativeFunction::from_fn_ptr(daw_play), js_string!("play"), 0)
         .function(NativeFunction::from_fn_ptr(daw_stop), js_string!("stop"), 0)
         .function(
+            NativeFunction::from_fn_ptr(daw_start_recording),
+            js_string!("startRecording"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_stop_recording),
+            js_string!("stopRecording"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_transport_state),
+            js_string!("transportState"),
+            0,
+        )
+        .function(
             NativeFunction::from_fn_ptr(daw_sleep_ms),
             js_string!("sleepMs"),
             1,
@@ -865,6 +880,54 @@ fn daw_stop(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<
         let _ = h.bootstrap.audio_tx.send(AudioCommand::Stop);
     });
     Ok(JsValue::undefined())
+}
+
+/// `daw.startRecording(prerollSamples)` — open a recording session in the audio
+/// engine (r.md #51). Mirrors what the GUI sends when Rec is pressed, so the
+/// headless harness can exercise the engine-side contract (count-in, song-end
+/// auto-stop suppression, `recording_live` publication).
+fn daw_start_recording(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let preroll_samples = u64::try_from_js(args.get_or_undefined(0), ctx).unwrap_or(0);
+    with_host(|h| {
+        let _ = h
+            .bootstrap
+            .audio_tx
+            .send(AudioCommand::StartRecording { preroll_samples });
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.stopRecording()` — close the engine-side recording session (r.md #51).
+/// Does not stop the transport (punch-out keeps playing).
+fn daw_stop_recording(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    with_host(|h| {
+        let _ = h.bootstrap.audio_tx.send(AudioCommand::StopRecording);
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.transportState()` — read what the audio engine is publishing about the
+/// transport (r.md #51): `{ playing, recordingLive, prerollRemaining, playhead }`.
+///
+/// This is the same shmem plane the GUI's playhead poller reads, so a headless
+/// script can verify the engine half of "who owns the transport state" without a
+/// window (`feedback_prefer_headless_verification`).
+fn daw_transport_state(_this: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let (playing, recording_live, preroll, playhead) = with_host(|h| {
+        let b = &h.bootstrap.bridge;
+        (
+            b.playing(),
+            b.recording_live(),
+            b.preroll_remaining(),
+            b.playhead_samples(),
+        )
+    });
+    let obj = JsObject::default(ctx.intrinsics());
+    obj.set(js_string!("playing"), playing, false, ctx)?;
+    obj.set(js_string!("recordingLive"), recording_live, false, ctx)?;
+    obj.set(js_string!("prerollRemaining"), preroll as f64, false, ctx)?;
+    obj.set(js_string!("playhead"), playhead as f64, false, ctx)?;
+    Ok(obj.into())
 }
 
 /// `daw.sleepMs(ms)` — wall-clock wait that keeps pumping incoming IPC events

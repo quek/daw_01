@@ -1160,21 +1160,35 @@ async fn recv_loop(
                     s.time_sig.0 = clamped;
                 });
             }
-            Ok(AudioCommand::StartCountIn { samples }) => {
-                // Phase 7 B4 Step C (2026-05-13): GUI が Record toggle ON +
-                // count_in_bars > 0 で発火。 EngineShared に preroll を立てて、
-                // process_buffer 頭で「dispatch / clip render skip + metronome
-                // のみ render」 ループに入る。 0 到達で通常再生復帰、 GUI 側は
-                // audio_bridge mirror 経由で midi_recording_pending 解除。
-                // samples = 0 で count-in 即時 cancel (= stop_recording 中の
-                // preroll 中断)。
+            Ok(AudioCommand::StartRecording { preroll_samples }) => {
+                // r.md #51: 録音セッションの開始。 `recording_requested` は
+                // 曲末 auto-stop の抑止と `recording_live` の publish に使う。
+                // preroll > 0 なら process_buffer が「dispatch / clip render skip +
+                // metronome のみ render」 の count-in ループに入り、 0 到達で
+                // 通常再生に復帰する (= その瞬間に recording_live が立つ)。
                 engine_shared
                     .preroll_total_samples
-                    .store(samples, Ordering::Release);
+                    .store(preroll_samples, Ordering::Release);
                 engine_shared
                     .preroll_remaining_samples
-                    .store(samples, Ordering::Release);
-                tracing::info!(samples, "received StartCountIn");
+                    .store(preroll_samples, Ordering::Release);
+                engine_shared
+                    .recording_requested
+                    .store(true, Ordering::Release);
+                tracing::info!(preroll_samples, "received StartRecording");
+            }
+            Ok(AudioCommand::StopRecording) => {
+                // r.md #51: 録音セッションの終了 (パンチアウト / 停止 / count-in
+                // 取り消し)。 transport はここでは止めない — パンチアウトは
+                // 再生を続けるのが参照 DAW 共通の挙動で、停止は `Stop` の仕事。
+                engine_shared
+                    .recording_requested
+                    .store(false, Ordering::Release);
+                engine_shared
+                    .preroll_remaining_samples
+                    .store(0, Ordering::Release);
+                engine_shared.preroll_total_samples.store(0, Ordering::Release);
+                tracing::info!("received StopRecording");
             }
             Ok(AudioCommand::SetMetronomeEnabled(enabled)) => {
                 // Phase 7 B3 (2026-05-13): GUI が transport bar の metronome

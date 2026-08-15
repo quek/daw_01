@@ -305,9 +305,8 @@ pub enum AudioCommand {
     /// アクティブか。daw_gui が唯一の判定者で、**事実だけ**を運ぶ。
     ///
     /// engine を park するかどうかは engine 側が決める (再生中 / count-in / 書き出し中 /
-    /// 出力が無音か、を engine だけが知っているため)。GUI 側の `transport.is_playing` は
-    /// Rec 単独の録音中に立たない (`daw_gui::handler::midi::start_recording`) ので、
-    /// 「停止中か」の判断を GUI から送ると録音中に音を切ってしまう。
+    /// 出力が無音か、を engine だけが知っているため)。GUI は「窓がアクティブか」という
+    /// 事実だけを運ぶ。
     SetAppActive(bool),
     /// 鍵盤レーン click のピッチプレビュー単発 note-on。 `track_id` は
     /// stable `Track::id`。 transport 状態に関係なく発音する。
@@ -318,9 +317,19 @@ pub enum AudioCommand {
     },
     /// 鍵盤プレビューの note-off。
     PreviewNoteOff { track_id: u32, pitch: u8 },
-    /// count-in 開始。 preroll 中は dispatch / clip render を skip して
-    /// metronome のみ render。 `samples = 0` で即時 cancel。
-    StartCountIn { samples: u64 },
+    /// r.md #51: 録音セッションの開始。 engine はこれを受けて
+    /// 1. `preroll_samples > 0` なら count-in に入る (preroll 中は dispatch /
+    ///    clip render を skip して metronome のみ render)、
+    /// 2. 曲末の auto-stop を抑止する (録音は曲の後ろへ継ぎ足せる)、
+    /// 3. `recording_live` (= 録音要求 && 再生中 && count-in 完了) を publish する。
+    ///
+    /// 「count-in の開始」ではなく **録音そのもの**を運ぶ。engine が曲末 auto-stop を
+    /// 抑止するにも、count-in 明けを GUI に知らせるにも「録音中か」が要るため。
+    StartRecording { preroll_samples: u64 },
+    /// r.md #51: 録音セッションの終了 (パンチアウト / 停止 / count-in 取り消し)。
+    /// engine は preroll を捨て、auto-stop の抑止と `recording_live` を解除する。
+    /// transport は **止めない** — 停止は `Stop` の仕事 (パンチアウトは再生継続)。
+    StopRecording,
     /// Stand up the per-buffer plugin process worker pool. `n_workers`
     /// audio-engine workers pair 1:1 with plugin-host workers via the named
     /// events listed. イベント名は世代 (generation) 込みで daw_gui が mint

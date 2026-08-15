@@ -1422,8 +1422,11 @@ impl Runner {
         //
         // frame 中に再生が始まった場合は `user_event` 側の `AppEvent::Play` 処理が
         // 改めて `refresh_activity` して redraw を要求するので取りこぼさない。
+        //
+        // r.md #51: 「走っているか」は `should_keep_rendering` と同じ
+        // `transport_rolling()` で判定する (述語を 2 つ持たない)。
         let state = self.state.as_ref().expect("render_frame 内で state は生存");
-        keep && (state.app.transport.is_playing || state.app.voicevox_animating(now))
+        keep && (state.app.transport_rolling() || state.app.voicevox_animating(now))
     }
 
     /// docs/plan_video.md P4: handle a WindowEvent dispatched against

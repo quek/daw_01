@@ -91,7 +91,8 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         "Play does NOT re-send LoadSong (dbca77f): {:?}",
         audio_msgs
     );
-    assert!(app.transport.is_playing, "is_playing should be true after Play");
+    // r.md #51: `is_playing` は engine の観測値なので Play 送信直後には立たない
+    // (上の `AudioCommand::Play` 送信で「再生が始まった」ことは見ている)。
 
     // Step 3: instrument track を group 化。
     app.handle_event(AppEvent::GroupSelectedTracks {

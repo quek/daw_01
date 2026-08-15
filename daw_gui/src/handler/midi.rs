@@ -1,6 +1,7 @@
 //! handler::midi — MIDI 入力 / learn / binding / step & realtime 録音
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
+use crate::handler::transport::PlayOutcome;
 use crate::state::*;
 use crate::app_types::*;
 use crate::event::*;
@@ -10,21 +11,87 @@ impl AppData {
     // -------- Clip / note / midi -------------------------------------------
 
     /// Phase 7 B4 Step D (2026-05-13): MIDI input note_on dispatcher。
-    /// `midi_recording` で arm 録音 path、 そうでなければ既存 step-input mode。
+    /// 録音実体が走っていれば arm 録音 path、 そうでなければ既存 step-input mode。
+    ///
+    /// r.md #51: どちらの場合も **先にモニターへ流す**。録音待機トラックは
+    /// transport 状態に関わらず入力を発音する (一般的なインプットモニター) ので、
+    /// 弾いた音が耳で確認できる。旧実装はこの経路が無く、Rec を押して弾いても
+    /// 音が一切鳴らなかった。
+    ///
+    /// 記録するかどうかは `recording.live` (= engine の観測値) だけで決める。
+    /// 「録音したい」意思 (`requested`) で判定すると、停止中 / count-in 中 /
+    /// 読み込み待ちの一時停止中に、凍ったプレイヘッドへノートが積み上がる。
     pub(crate) fn handle_midi_note_on(&mut self, pitch: u8, velocity: u8) {
-        if self.recording.midi_recording {
+        self.monitor_note_on(pitch, velocity);
+        if self.recording.live {
             self.record_midi_note_on(pitch, velocity);
-        } else {
+        } else if !self.recording.requested {
+            // 録音を待っている最中 (count-in / 読み込み待ち) の入力を step input で
+            // 拾うと、意図しない位置にノートが置かれる。モニターだけして捨てる。
             self.step_input_note_on(pitch, velocity);
         }
     }
 
     /// Phase 7 B4 Step D: MIDI input note_off dispatcher。 録音中は length 確定、
-    /// step-input mode は no-op (既存挙動)。
+    /// step-input mode は no-op (既存挙動)。 モニターの消音は常に行う。
     pub(crate) fn handle_midi_note_off(&mut self, pitch: u8) {
-        if self.recording.midi_recording {
+        self.monitor_note_off(pitch);
+        if self.recording.live {
             self.record_midi_note_off(pitch);
         }
+    }
+
+    /// 録音待機トラックへ入力ノートを送って発音させる (r.md #51)。
+    ///
+    /// 既存の鍵盤プレビュー経路 (`AudioCommand::PreviewNoteOn` →
+    /// engine の `pending_preview`) をそのまま使う。 engine は次の dispatch の
+    /// frame 0 に注入するので、再生中でも停止中でも鳴る。
+    fn monitor_note_on(&mut self, pitch: u8, velocity: u8) {
+        for track_id in self.armed_track_ids() {
+            // 同じ鍵の重複 on (auto-repeat / 取りこぼした off) は 1 回に畳む。
+            if !self.recording.monitor_notes.insert((track_id, pitch)) {
+                continue;
+            }
+            self.send_audio(AudioCommand::PreviewNoteOn {
+                track_id,
+                pitch,
+                velocity,
+            });
+        }
+    }
+
+    /// モニター発音の消音。 arm を外した後に来た note-off でも確実に止められる
+    /// よう、armed の集合ではなく **鳴らした台帳** を引いて off を送る。
+    fn monitor_note_off(&mut self, pitch: u8) {
+        let sounding: Vec<u32> = self
+            .recording
+            .monitor_notes
+            .iter()
+            .filter(|(_, p)| *p == pitch)
+            .map(|(t, _)| *t)
+            .collect();
+        for track_id in sounding {
+            self.recording.monitor_notes.remove(&(track_id, pitch));
+            self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
+        }
+    }
+
+    /// 鳴らしているモニター音を全て止める (arm 変更 / 停止 / 曲の入れ替え)。
+    pub(crate) fn silence_monitor_notes(&mut self) {
+        for (track_id, pitch) in std::mem::take(&mut self.recording.monitor_notes) {
+            self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
+        }
+    }
+
+    /// 録音待機 (`Track::armed`) のトラック id。 録音・モニターの宛先。
+    pub(crate) fn armed_track_ids(&self) -> Vec<u32> {
+        self.song_doc
+            .song()
+            .tracks
+            .iter()
+            .filter(|t| t.armed)
+            .map(|t| t.id)
+            .collect()
     }
 
     /// MIDI Learn button (transport) が bind する target を決める (B2 / r.md #8、
@@ -174,7 +241,7 @@ impl AppData {
     }
 
     /// 既存 step-input mode (= selected_clip + step_cursor_beat に固定 length
-    /// で 1 note ずつ手動入力)。 midi_recording == false のときだけ走る。
+    /// で 1 note ずつ手動入力)。 録音を要求していないときだけ走る。
     pub(crate) fn step_input_note_on(&mut self, pitch: u8, velocity: u8) {
         let Some(target) = self.selected_clip_ref() else {
             return;
@@ -253,16 +320,7 @@ impl AppData {
         } else {
             pitch
         };
-        let armed_ids: Vec<u32> = self
-            .song_doc.song()
-            .tracks
-            .iter()
-            .filter(|t| t.armed)
-            .map(|t| t.id)
-            .collect();
-        for track_id in armed_ids {
-            self.recording.midi_recording_active_notes
-                .insert((track_id, pitch), playhead);
+        for track_id in self.armed_track_ids() {
             self.ensure_midi_clip_at_playhead(track_id, playhead);
             let Some((track_idx, clip_idx)) =
                 self.find_midi_clip_at_playhead(track_id, playhead)
@@ -274,29 +332,35 @@ impl AppData {
             let clip_origin = self.song_doc.song().tracks[track_idx].clips[clip_idx]
                 .content_origin_beat();
             let local_start = playhead - clip_origin;
-            self.edit_song(|song| {
-                if let Some(content) = midi_content_in_clip_mut(song, track_idx, clip_idx) {
-                    // v29: 録音で入る note も allocator で安定 id を採番。
-                    let note_id = content.alloc_note_id();
-                    content.notes.push(common::model::Note {
-                        id: note_id,
-                        start_beat: local_start,
-                        duration_beats: 0.05,
-                        pitch,
-                        velocity,
-                        lyric: None,
-                        muted: false,
-                    });
-                }
+            let note_id = self.edit_song(|song| {
+                let content = midi_content_in_clip_mut(song, track_idx, clip_idx)?;
+                // v29: 録音で入る note も allocator で安定 id を採番。
+                let note_id = content.alloc_note_id();
+                content.notes.push(common::model::Note {
+                    id: note_id,
+                    start_beat: local_start,
+                    duration_beats: 0.05,
+                    pitch,
+                    velocity,
+                    lyric: None,
+                    muted: false,
+                });
+                Some(note_id)
             });
+            // r.md #51: 採番した id を控える。 note_off はこの id でノートを
+            // 確定するので、同じ位置に同じ高さのノートが複数あっても取り違えない
+            // (不変条件 1 — 位置照合で参照を貼り直さない)。 書き込みが拒否された
+            // (書き出し中) 場合は id が無いので、note_off も何もしない。
+            if let Some(Some(note_id)) = note_id {
+                self.recording
+                    .midi_recording_active_notes
+                    .insert((track_id, pitch), (playhead, note_id));
+            }
         }
     }
 
-    /// Phase 7 B4 Step D: 録音中の note_off 処理。 active_notes から start
-    /// を取り出し、 length = playhead - start で確定。 該当 note を
-    /// `start_beat` (clip-local) + `pitch` で再 search (= note_on 時に
-    /// active_notes に track-domain start を保存しているので、 clip-local
-    /// に戻して check)。
+    /// Phase 7 B4 Step D: 録音中の note_off 処理。 `active_notes` から
+    /// `(start_beat, note_id)` を取り出し、 `length = playhead - start` で確定する。
     pub(crate) fn record_midi_note_off(&mut self, pitch: u8) {
         let playhead =
             self.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
@@ -311,40 +375,37 @@ impl AppData {
         } else {
             pitch
         };
-        let armed_ids: Vec<u32> = self
-            .song_doc.song()
-            .tracks
-            .iter()
-            .filter(|t| t.armed)
-            .map(|t| t.id)
-            .collect();
-        for track_id in armed_ids {
-            let Some(start) = self
+        for track_id in self.armed_track_ids() {
+            let Some((start, note_id)) = self
                 .recording.midi_recording_active_notes
                 .remove(&(track_id, pitch))
             else {
                 continue;
             };
-            let Some((track_idx, clip_idx)) =
-                self.find_midi_clip_containing_beat(track_id, start)
-            else {
-                continue;
-            };
-            let clip_origin = self.song_doc.song().tracks[track_idx].clips[clip_idx]
-                .content_origin_beat();
-            let local_start = start - clip_origin;
-            let length = (playhead - start).max(0.05);
-            self.edit_song(|song| {
-                if let Some(notes) = song.notes_in_clip_mut(track_idx, clip_idx)
-                    && let Some(n) = notes.iter_mut().find(|n| {
-                        (n.start_beat - local_start).abs() < 1e-6
-                            && n.pitch == pitch
-                    })
-                {
-                    n.duration_beats = length;
-                }
-            });
+            self.finalize_recorded_note(track_id, start, note_id, playhead);
         }
+    }
+
+    /// 押していたノートの長さを確定する (r.md #51)。 note_off と、録音セッションの
+    /// クローズ (= 鍵盤を押したまま止めた場合) の共通口。
+    ///
+    /// ノートは **`note_id` で引く**。旧実装は `start_beat` と pitch の値照合で
+    /// 探し直していたため、同じ位置に同じ高さのノートが 2 本あると常に 1 本目に
+    /// 当たり、2 本目以降が仮の長さ (0.05 拍) のまま残った (不変条件 1)。
+    fn finalize_recorded_note(&mut self, track_id: u32, start: f64, note_id: u32, end: f64) {
+        let Some((track_idx, clip_idx)) =
+            self.find_midi_clip_containing_beat(track_id, start)
+        else {
+            return;
+        };
+        let length = (end - start).max(0.05);
+        self.edit_song(|song| {
+            if let Some(notes) = song.notes_in_clip_mut(track_idx, clip_idx)
+                && let Some(n) = notes.iter_mut().find(|n| n.id == note_id)
+            {
+                n.duration_beats = length;
+            }
+        });
     }
 
     /// playhead 位置に armed track 用 MIDI clip があれば何もしない、 末尾
@@ -434,81 +495,120 @@ impl AppData {
         self.find_midi_clip_at_playhead(track_id, beat)
     }
 
-    /// Phase 7 B4 Step C/D: Record toggle button click。 既に recording
-    /// (含 pending) なら stop、 idle なら start。
+    /// Phase 7 B4 Step C/D: Record toggle button click。
+    ///
+    /// 録音中なら **パンチアウト** (録音だけ終わり再生は続く)、そうでなければ開始。
+    /// 参照 DAW 5 製品すべてが Rec 再押下でトランスポートを止めない
+    /// (Cubase:「To stop recording and continue playback, click Record」)。
+    /// 止めたいときは停止 (スペース / ■)。
     pub(crate) fn toggle_midi_recording(&mut self) {
-        if self.recording.midi_recording || self.recording.midi_recording_pending {
-            self.stop_recording();
+        if self.recording.requested {
+            self.close_recording_session();
         } else {
             self.start_recording();
         }
     }
 
-    /// Phase 7 B4 Step C: 録音開始。 `count_in_bars > 0` なら preroll +
-    /// metronome 強制 ON、 0 なら即時 recording。 いずれも `Play` を audio に
-    /// 送る。 metronome の元状態は `metronome_enabled_pre_recording` に snap。
+    /// 録音を開始する (r.md #51)。
+    ///
+    /// - **停止中**: `start_transport` でトランスポートごと走らせる。count-in の
+    ///   設定があればここで消費する。書き出し中は `play()` と同じ理由で断られ、
+    ///   録音も始まらない。
+    /// - **再生中 (パンチイン)**: トランスポートには触らない。count-in も使わない
+    ///   (Cubase の count-in は「停止状態から録音を始めたとき」の機能) ので、
+    ///   曲が途切れず、停止で戻る位置 (`playback_origin_beat`) も動かない。
     pub(crate) fn start_recording(&mut self) {
-        if self.recording.midi_recording || self.recording.midi_recording_pending {
+        if self.recording.requested {
             return;
         }
-        // (review) 録音 take を 1 undo step にする。 `MidiNoteOn` / 録音 point
-        // 挿入は per-event で snapshot しない (is_undoable 外) ので、 ここで
-        // 1 回だけ積む — これが無いと Ctrl+Z が「録音 + 直前の別編集」 を
-        // まとめて巻き戻す。
+        // 録音先が無いまま走り出すと、何も記録されないのに再生だけ始まって
+        // 「録れているつもり」になる。トラックの arm 状態を勝手に変えるのではなく、
+        // 理由を出して始めない。
+        if self.armed_track_ids().is_empty() {
+            self.ui_ephemeral.status_message =
+                "録音待機 (R) のトラックがありません".into();
+            return;
+        }
         self.recording.midi_recording_active_notes.clear();
-        // ensure-synced: StartCountIn の preroll (bpm→sample) と Play は engine の
+        // ensure-synced: count-in の preroll (bpm→sample) と Play は engine の
         // 現 song を前提にする。 録音開始直前の編集が未 flush なら先に届ける
         // (epoch 未変化なら no-op)。
         self.flush_song_sync();
-        let bars = self.recording.count_in_bars;
-        self.recording.metronome_enabled_pre_recording = Some(self.transport.metronome_enabled);
-        if bars > 0 {
-            if !self.transport.metronome_enabled {
+
+        if self.transport.is_playing {
+            // パンチイン: 走っているものに乗るだけ。
+            self.send_audio(AudioCommand::StartRecording { preroll_samples: 0 });
+        } else {
+            let preroll_samples = self.count_in_samples();
+            if preroll_samples > 0 && !self.transport.metronome_enabled {
                 // count-in 強制 ON。 既存 SetMetronomeEnabled handler を
                 // 呼び出して audio engine への IPC 送信もまとめて。
+                // 元の状態は録音セッションのクローズで戻す (強制 ON したときだけ)。
+                self.recording.metronome_enabled_pre_recording = Some(false);
                 self.handle_event(AppEvent::SetMetronomeEnabled(true));
             }
-            let beats_per_bar = f64::from(self.song_doc.song().time_sig.0.max(1));
-            let preroll_beats = f64::from(bars) * beats_per_bar;
-            let sr = f64::from(self.ipc.sample_rate);
-            let bpm = f64::from(self.song_doc.song().bpm.max(1.0));
-            let preroll_samples =
-                (preroll_beats * 60.0 / bpm * sr).round().max(0.0) as u64;
-            self.send_audio(AudioCommand::StartCountIn {
-                samples: preroll_samples,
-            });
-            self.recording.midi_recording_pending = true;
-        } else {
-            self.recording.midi_recording = true;
+            // `StartRecording` + `Play` の送信は start_transport が順序込みで行う。
+            if self.start_transport(Some(preroll_samples)) == PlayOutcome::Refused {
+                // 書き出し中。 status_message は start_transport が出している。
+                self.recording.metronome_enabled_pre_recording = None;
+                return;
+            }
         }
-        self.send_audio(AudioCommand::Play);
-        // r.md #50: 録音開始も transport を回す = 「再生を始めた」ので、積算
-        // ラウドネスを畳む。ここは `play()` を経由しない独立経路なので、
-        // 明示的に呼ばないと前のテイクの I / LRA / 最大 TP を引きずる。
-        self.reset_master_loudness();
+        // r.md #50 の積算ラウドネスのリセットはここに要らない — 録音の開始も
+        // `start_transport` を通るので、あちらの 1 箇所で畳まれる。パンチイン
+        // (既に走っている transport に乗る) では畳まないのが正しい。
+        self.recording.requested = true;
+        // 録音 take 全体を 1 undo step に bracket する (r.md #51)。 これが無いと
+        // note-on / note-off の song 編集が別々の step になり、8 音録ると
+        // Ctrl+Z を 16 回押すことになる。
+        self.song_doc.begin_gesture();
     }
 
-    /// Phase 7 B4 Step C/D: 録音停止 / cancel。 active_notes 全 clear、
-    /// metronome を recording 開始前の状態に戻す、 audio engine の preroll を
-    /// `StartCountIn { samples: 0 }` で cancel (= count-in 中の stop に対応)。
-    pub(crate) fn stop_recording(&mut self) {
-        let was_active =
-            self.recording.midi_recording || self.recording.midi_recording_pending;
-        self.recording.midi_recording = false;
-        self.recording.midi_recording_pending = false;
-        self.recording.midi_recording_active_notes.clear();
-        if let Some(prev) =
-            self.recording.metronome_enabled_pre_recording.take()
+    /// count-in の長さ (samples)。 0 = count-in 無し。
+    fn count_in_samples(&self) -> u64 {
+        let bars = self.recording.count_in_bars;
+        if bars == 0 {
+            return 0;
+        }
+        let beats_per_bar = f64::from(self.song_doc.song().time_sig.0.max(1));
+        let preroll_beats = f64::from(bars) * beats_per_bar;
+        let sr = f64::from(self.ipc.sample_rate);
+        let bpm = f64::from(self.song_doc.song().bpm.max(1.0));
+        (preroll_beats * 60.0 / bpm * sr).round().max(0.0) as u64
+    }
+
+    /// 録音セッションを閉じる (r.md #51)。 パンチアウト・停止・書き出し・
+    /// 曲の入れ替え・子プロセス crash の **共通の出口**で、冪等。
+    ///
+    /// トランスポートは止めない — パンチアウトは再生を続けるのが参照 DAW 共通の
+    /// 挙動で、停止は `stop()` の仕事。
+    pub(crate) fn close_recording_session(&mut self) {
+        if !self.recording.requested {
+            return;
+        }
+        self.recording.requested = false;
+        self.recording.live = false;
+        // 押しっぱなしのノートは、ここで長さを確定する。放置すると仮の長さ
+        // (0.05 拍) のまま残り、録り終わりの音だけ極端に短くなる。
+        let playhead = self.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
+        let held: Vec<(u32, f64, u32)> = self
+            .recording
+            .midi_recording_active_notes
+            .drain()
+            .map(|((track_id, _pitch), (start, note_id))| (track_id, start, note_id))
+            .collect();
+        for (track_id, start, note_id) in held {
+            self.finalize_recorded_note(track_id, start, note_id, playhead);
+        }
+        // count-in で強制 ON にしていたら元へ戻す (触っていなければ None)。
+        if let Some(prev) = self.recording.metronome_enabled_pre_recording.take()
             && prev != self.transport.metronome_enabled
         {
             self.handle_event(AppEvent::SetMetronomeEnabled(prev));
         }
-        if was_active {
-            // count-in 中の cancel もしくは録音終了。 audio engine 側 preroll
-            // を 0 で上書きして count-in 即時終了。 normal 録音終了の場合は
-            // preroll は既に 0 なので no-op。
-            self.send_audio(AudioCommand::StartCountIn { samples: 0 });
-        }
+        // engine 側の count-in と曲末 auto-stop の抑止を解除する。
+        self.send_audio(AudioCommand::StopRecording);
+        // 録音 take の undo bracket を閉じる。
+        self.song_doc.end_gesture();
     }
-
 }

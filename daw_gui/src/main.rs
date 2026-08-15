@@ -438,7 +438,17 @@ fn spawn_playhead_poller(
             tick_count = tick_count.wrapping_add(1);
             let samples = bridge.playhead_samples();
             let preroll = bridge.preroll_remaining();
-            if proxy.send_event(AppEvent::Tick { samples, preroll }).is_err() {
+            if proxy
+                .send_event(AppEvent::Tick {
+                    samples,
+                    preroll,
+                    // r.md #51: 「走っているか」「録音してよいか」は engine が所有する
+                    // 事実。GUI は他の telemetry と同じ面で観測する。
+                    playing: bridge.playing(),
+                    recording_live: bridge.recording_live(),
+                })
+                .is_err()
+            {
                 break;
             }
             // r.md #50: マスターメーター。パネルが閉じているときは解析ごと止める

@@ -885,7 +885,18 @@ pub enum AppEvent {
     SetMasterGain(f32),
 
     // -------- IPC events from plugin_host ---------------------------------
-    Tick { samples: u64, preroll: u64 },
+    /// audio engine の telemetry を 30Hz で観測したもの (`AudioBridge` の poll)。
+    /// r.md #51: `playing` / `recording_live` は engine が所有する状態の観測値で、
+    /// GUI の `transport.is_playing` / `recording.live` はこれで**しか**更新されない。
+    ///
+    /// r.md #50: マスターのピークはここに載らない。計測は `MasterMeterTick` の
+    /// 解析器 1 か所が持つ (同じ音の値を 2 経路に複製しない)。
+    Tick {
+        samples: u64,
+        preroll: u64,
+        playing: bool,
+        recording_live: bool,
+    },
     /// r.md #50: テレメトリスレッドの `MasterAnalyzer` が 1 ティックぶん解析した
     /// マスターメーターの表示状態。`Box` なのは variant を巨大にしないため
     /// (`AppEvent` は全 variant が最大サイズに揃うので、配列を直載せすると

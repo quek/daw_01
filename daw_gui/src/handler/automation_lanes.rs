@@ -945,8 +945,16 @@ impl AppData {
     pub(crate) fn handle_child_disconnected(&mut self, kind: common::protocol::ChildKind) {
         use common::protocol::ChildKind;
         let was_playing = self.transport.is_playing;
+        // r.md #51: 通常 `is_playing` の writer は `on_tick` の観測だけだが、
+        // 子プロセスが落ちた以上 Tick はもう来ない (= 観測が永久に止まる) ので、
+        // ここだけは「走っていない」ことを直接書き込む。 録音セッションも同時に
+        // 閉じないと Rec が点灯したまま、凍ったプレイヘッドへノートが積み上がる。
         self.transport.is_playing = false;
+        self.transport.preroll_remaining = 0;
         self.transport.pending_play = false;
+        self.transport.pending_play_record = None;
+        self.close_recording_session();
+        self.silence_monitor_notes();
         self.recording.active_param_gestures.clear();
         self.recording.latched_param_gestures.clear();
         // 音声 render 中の crash で export を中止したか。respawn 成功時の status に

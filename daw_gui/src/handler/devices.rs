@@ -251,9 +251,8 @@ impl AppData {
         // last plugin to register on the audio side, fire it now.
         self.ipc.pending_plugin_loads.remove(&device_id);
         if self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play {
-            self.transport.pending_play = false;
             self.ui_ephemeral.status_message.clear();
-            self.play();
+            self.fire_pending_play();
         } else if !self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play {
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
@@ -327,10 +326,9 @@ impl AppData {
         // pending_play 解放: A7 と同じロジック (`on_plugin_loaded_from_child`
         // と対称)。 失敗で空になったタイミングで queue Play を flush する。
         if self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play {
-            self.transport.pending_play = false;
             self.ui_ephemeral.status_message =
                 format!("プラグイン読み込み失敗: {plugin_id} ({reason})");
-            self.play();
+            self.fire_pending_play();
         } else if !self.ipc.pending_plugin_loads.is_empty() && self.transport.pending_play {
             // まだ他の load が走っているなら、 残数表示を更新しつつエラーは
             // 上書き (最新の状況をユーザーに見せる)。

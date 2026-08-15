@@ -171,6 +171,7 @@ impl AppData {
             transport: TransportState {
                 metronome_enabled: false,
                 is_playing: false,
+                preroll_remaining: 0,
                 loop_region: common::model::LoopRegion::default(),
                 playhead_beat: None,
                 playback_origin_beat: None,
@@ -181,6 +182,7 @@ impl AppData {
                 track_peak_display: initial_peak_display,
                 mod_scalars: Vec::new(),
                 pending_play: false,
+                pending_play_record: None,
                 export_stage: None,
                 export_progress_at: None,
                 export_cancel: None,
@@ -263,10 +265,11 @@ impl AppData {
             },
             recording: RecordingState {
                 recording_mode: common::model::RecordingMode::default(),
-                midi_recording: false,
-                midi_recording_pending: false,
+                requested: false,
+                live: false,
                 count_in_bars: 0,
                 midi_recording_active_notes: std::collections::HashMap::new(),
+                monitor_notes: std::collections::HashSet::new(),
                 metronome_enabled_pre_recording: None,
                 midi_learn_target: None,
                 active_param_gestures: std::collections::HashSet::new(),
@@ -1452,17 +1455,27 @@ impl AppData {
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
             }
-            AppEvent::Tick { samples, preroll } => {
-                // Phase 7 B4 Step C: preroll mirror で count-in 完了を検知。
-                // midi_recording_pending == true かつ preroll == 0 なら、
-                // midi_recording に昇格して以後の MIDI input を armed track に
-                // 書き込む。
-                if self.recording.midi_recording_pending && preroll == 0 {
-                    self.recording.midi_recording_pending = false;
-                    self.recording.midi_recording = true;
-                }
-                let _ = preroll;  // 上で消費
+            AppEvent::Tick {
+                samples,
+                preroll,
+                playing,
+                recording_live,
+            } => {
+                // r.md #51: engine が所有する状態をここで観測する。
+                // **`transport.is_playing` / `recording.live` を書くのはここだけ**
+                // (他所で立てると engine の実状態と食い違い、Rec 単独録音で
+                // プレイヘッド凍結・オートメーション未記録・曲末で止まらない、が
+                // 一度に起きていた)。
+                self.transport.preroll_remaining = preroll;
+                self.recording.live = recording_live;
+                let stopped = self.transport.is_playing && !playing;
+                self.transport.is_playing = playing;
                 self.on_tick(samples);
+                if stopped {
+                    // 手動停止・曲末 auto-stop・書き出し・パニックのどれで止まっても
+                    // ここへ収束する (停止ホームへの復帰と録音セッションのクローズ)。
+                    self.on_transport_stopped();
+                }
             }
             // r.md #50: マスターメーターの表示状態は解析器が丸ごと作るので、
             // ここは差し替えるだけ (GUI 側で弾道を二重に掛けない)。

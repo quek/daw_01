@@ -10,29 +10,48 @@ pub struct RecordingState {
     /// curve eval をバイパスし、 GUI からの knob 値を `playhead_beat`
     /// 起点に point として書き込む。
     pub recording_mode: common::model::RecordingMode,
-    /// Phase 7 B4 Step D (2026-05-13): MIDI 録音中 flag。 Record toggle ON
-    /// で true、 Stop / OFF で false。 true のとき handle_midi_note_on/off
-    /// は armed track の MIDI clip に書き込む (= 既存 step-input mode は
-    /// midi_recording == false のときのみ動作)。 session-only / Undo 対象外。
-    pub midi_recording: bool,
-    /// Phase 7 B4 Step C (2026-05-13): count-in 中で「0 拍到達まで preroll
-    /// 待ち」 状態。 `start_recording` で `count_in_bars > 0` なら true、
-    /// audio engine の `preroll_remaining_samples` mirror が 0 に達したら
-    /// `on_tick` が `midi_recording_pending → midi_recording` 遷移させる。
-    /// metronome は pending 中だけ強制 ON で click guide を流す。
-    pub midi_recording_pending: bool,
+    /// r.md #51: ユーザーが録音したいと言っているか (= Rec ボタンの点灯状態)。
+    /// **daw_gui が持つ唯一の録音状態**で、これが意思、[`Self::live`] が事実。
+    /// `start_recording` で true、パンチアウト / 停止 / 書き出し / 子プロセス
+    /// crash で false。 session-only / Undo 対象外。
+    pub requested: bool,
+    /// r.md #51: 今この瞬間ノートを記録してよいか (audio engine の
+    /// `AudioBridge::recording_live` の観測ミラー、writer は `on_tick` 1 箇所)。
+    ///
+    /// `録音要求あり && 再生中 && count-in 完了` を engine が判定して publish する。
+    /// GUI 側で導出しないのは、次の 2 つを構造的に防ぐため:
+    ///
+    /// - 停止 / 一時停止中に書くと凍ったプレイヘッドへノートが積み上がる。
+    /// - count-in の残量 `0` は「まだ始まっていない」と「終わった」の両方を
+    ///   意味するので、要求直後の stale な Tick で count-in を飛ばす。
+    pub live: bool,
     /// Phase 7 B4 Step C (2026-05-13): count-in bars (0 / 1 / 2)。 transport
     /// bar の dropdown で設定、 default 0。 session-only state。
     pub count_in_bars: u8,
-    /// Phase 7 B4 Step D (2026-05-13): 直近 note_on の `(track_id, key) →
-    /// start_beat`。 note_off 受信時に start_beat 取り出して `length_beats =
-    /// playhead - start` を確定する。 stop / midi_recording 解除で clear。
+    /// Phase 7 B4 Step D (2026-05-13): 押している最中の録音ノート。
+    /// `(track_id, key) → (start_beat, note_id)`。
+    ///
+    /// note_off で `start_beat` を取り出して `length_beats = playhead - start` を
+    /// 確定する。 **どのノートかは `note_id` で確定する** (r.md #51、不変条件 1):
+    /// 旧実装は `start_beat` と pitch の値照合で探し直していたので、同じ位置に
+    /// 同じ高さのノートが 2 本あると常に 1 本目に当たり、2 本目以降が仮の長さ
+    /// (0.05 拍) のまま残った。 録音セッションのクローズで、押しっぱなしのぶんも
+    /// ここを見て長さを確定する。
     pub midi_recording_active_notes:
-        std::collections::HashMap<(u32, u8), f64>,
+        std::collections::HashMap<(u32, u8), (f64, u32)>,
+    /// r.md #51: モニターで鳴らしている `(track_id, pitch)`。
+    ///
+    /// 録音待機トラックは transport 状態に関わらず入力を発音する
+    /// (一般的なインプットモニター) ので、note-off を取りこぼすと音が鳴り
+    /// 続ける。 arm 解除 / パニック / 停止で確実に消音するための held-value。
+    pub monitor_notes: std::collections::HashSet<(u32, u8)>,
     /// Phase 7 B4 Step C (2026-05-13): count-in 開始前の metronome_enabled
-    /// 状態 snapshot。 count-in 中だけ強制 ON にし、 `stop_recording` 時に
+    /// 状態 snapshot。 count-in 中だけ強制 ON にし、録音セッションのクローズで
     /// 元の値へ戻す (= user の「click off」 設定を尊重しつつ count-in 中は
-    /// guide が聞こえる)。 None なら recording 開始前 = 復元不要。
+    /// guide が聞こえる)。 `None` = 強制 ON していない (count-in 無しの録音を
+    /// 含む) ので復元不要。 r.md #51: 旧実装は count-in の有無に関わらず
+    /// snapshot していたため、count-in Off の録音中にユーザーがメトロノームを
+    /// 切り替えると録音終了時に巻き戻されていた。
     pub metronome_enabled_pre_recording: Option<bool>,
     /// Phase 7 B1-M Step 2 (2026-05-13): MIDI Learn の bind 待ち target。
     /// `Some` なら次に来る MIDI CC をこの target に bind (= `Song.midi_bindings`

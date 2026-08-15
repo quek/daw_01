@@ -4,10 +4,35 @@
 use crate::state::*;
 use common::protocol::{AudioCommand};
 
+/// [`AppData::play`] の結果。 録音開始が「本当に走り出したか」で分岐する
+/// (r.md #51) ため、要求が通ったかどうかを型で返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlayOutcome {
+    /// engine へ `Play` を送った (実際に走り出したかは `on_tick` が観測する)。
+    Started,
+    /// 読み込み待ちで queue した。 完了時に `pending_play` が再発火する。
+    Queued,
+    /// 開始できない (書き出し中)。 status_message は `play()` が出している。
+    Refused,
+}
+
 impl AppData {
     // -------- Playback -----------------------------------------------------
 
-    pub(crate) fn play(&mut self) {
+    /// 再生を開始する **唯一の口**。 録音開始 (`start_recording`) もここを通る
+    /// ので、書き出し中の拒否・読み込み待ちの queue・停止ホーム
+    /// (`playback_origin_beat`) の捕捉が録音でも同じように効く。
+    pub(crate) fn play(&mut self) -> PlayOutcome {
+        self.start_transport(None)
+    }
+
+    /// [`Self::play`] の本体。 `record` が `Some(preroll_samples)` なら
+    /// 「録音として走り出す」 (`0` = count-in 無し) で、録音の開始だけがこれを使う。
+    ///
+    /// 録音の開始を `play()` の外から送らないのが要点 — 別々に送ると、
+    /// `StartRecording` が届く前の 1 バッファだけ曲が進んでから count-in / 録音に
+    /// 入る、という取りこぼしが生まれる。ここなら送信順が保証される。
+    pub(crate) fn start_transport(&mut self, record: Option<u64>) -> PlayOutcome {
         // export 中は再生を禁止する。音声 freewheel フェーズの realtime play は
         // offline render と競合し、書き出される音声を壊しうる（映像フェーズは
         // 独立だが、 混乱を避けて export 全体で一律に止める）。標準 WAV export も
@@ -15,7 +40,7 @@ impl AppData {
         // 再生できてしまい render を壊しえた）。
         if self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some() {
             self.ui_ephemeral.status_message = "書き出し中は再生できません".into();
-            return;
+            return PlayOutcome::Refused;
         }
         // プロジェクトロードの asset decode 中は音声がまだ揃って
         // いないので再生を gate して queue する (audio 完了で on_asset_decode_tick
@@ -24,8 +49,9 @@ impl AppData {
         // 待たせない。
         if self.audio_decode_pending() {
             self.transport.pending_play = true;
+            self.transport.pending_play_record = record;
             self.ui_ephemeral.status_message = "プロジェクト読込中...".into();
-            return;
+            return PlayOutcome::Queued;
         }
         // A7: if any plugin is still in the SetSlotPlugin →
         // SlotPluginLoaded round-trip (its `OpenPluginShmem` may not
@@ -35,11 +61,12 @@ impl AppData {
         // first few buffers / first loop.
         if !self.ipc.pending_plugin_loads.is_empty() {
             self.transport.pending_play = true;
+            self.transport.pending_play_record = record;
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
                 self.ipc.pending_plugin_loads.len()
             );
-            return;
+            return PlayOutcome::Queued;
         }
         // ensure-synced (docs/plan_arch_refactor.md §7.5): 同 frame 内に編集があって
         // まだ frame flush 前なら、 最新 song を Play の前に engine へ届ける。 epoch
@@ -50,12 +77,34 @@ impl AppData {
         // 開始時の playhead を保存。 ruler クリック等で playhead を
         // 移動してから play した場合は、 その位置が origin になる。
         self.transport.playback_origin_beat = Some(self.transport.playhead_beat.unwrap_or(0.0));
+        if let Some(preroll_samples) = record {
+            // 録音の開始は Play より先に届ける必要がある (engine は届いた順に
+            // 消費するので、逆順だと 1 バッファぶん曲が進んでから count-in / 録音に
+            // 入る)。 count-in 無し (`0`) でも必ず送る — engine はこれで
+            // 「録音中」を知り、曲末 auto-stop の抑止と `recording_live` の
+            // publish を始める。
+            self.send_audio(AudioCommand::StartRecording { preroll_samples });
+        }
         self.send_audio(AudioCommand::Play);
-        self.transport.is_playing = true;
-        // r.md #50: 再生を始めるたびに積算ラウドネス一式をリセットする
+        // r.md #50: 走り出すたびに積算ラウドネス一式をリセットする
         // (Cubase の "Reset on Start" 相当)。曲を頭から通せば「この曲の
         // ラウドネス」がそのまま出る、という grill-me の決定。
+        //
+        // r.md #51 で再生も録音もこの 1 箇所を通るようになったので、
+        // 録音開始のためにもう 1 箇所リセットを置く必要は無い。
         self.reset_master_loudness();
+        // `is_playing` はここでは書かない。engine が走り出したことを `on_tick` が
+        // 観測して立てる (r.md #51 — 状態の所有者は engine)。
+        PlayOutcome::Started
+    }
+
+    /// 読み込み待ちで queue しておいた再生要求を発火する (プラグインロード完了 /
+    /// asset decode 完了の 3 経路から呼ぶ唯一の口)。 queue 時に「録音だったか /
+    /// count-in が何拍か」を復元するので、録音開始が queue されても録音のまま再開する。
+    pub(crate) fn fire_pending_play(&mut self) {
+        self.transport.pending_play = false;
+        let record = self.transport.pending_play_record.take();
+        self.start_transport(record);
     }
 
     /// プレイヘッドを `beat` に置き、「停止で戻るホーム」 (`playback_origin_beat`)
@@ -163,9 +212,13 @@ impl AppData {
     /// に載せる)。 応答 (`SlotPluginLoaded` / `SlotPluginLoadFailed`) は
     /// この generation と一致するものだけ受理される (stale 応答 race guard)。
     pub(crate) fn track_pending_load(&mut self, device_id: u64) -> u64 {
-        if self.ipc.pending_plugin_loads.is_empty() && self.transport.is_playing {
+        // r.md #51: **録音中は止めない**。 テイクを切らないことの方が、
+        // 足したプラグインが数バッファ遅れて鳴り出すことより重い
+        // (REAPER も走行中のトラック arm 追加を明示的に許可している)。
+        // 止めてしまうと録音セッションが閉じ、録り直しになる。
+        let recording = self.recording.requested;
+        if self.ipc.pending_plugin_loads.is_empty() && self.transport.is_playing && !recording {
             self.send_audio(AudioCommand::Stop);
-            self.transport.is_playing = false;
             self.transport.pending_play = true;
         }
         self.ipc.next_plugin_load_generation = self.ipc.next_plugin_load_generation.wrapping_add(1).max(1);
@@ -185,9 +238,24 @@ impl AppData {
         generation
     }
 
+    /// 停止を **要求する** 唯一の口。 実際に止まったことの反映
+    /// (プレイヘッドを開始位置へ戻す / 録音セッションを閉じる) は、engine が
+    /// 止まったのを観測した [`Self::on_transport_stopped`] が行う。
+    ///
+    /// 録音セッションだけはここでも即座に閉じる。ユーザーが明示的に止めた以上、
+    /// 観測が届くまでの数十 ms に鍵盤を叩いたぶんが録音に混ざってはいけない。
+    /// クローズは冪等なので二重に呼ばれても害はない。
     pub(crate) fn stop(&mut self) {
         self.send_audio(AudioCommand::Stop);
-        self.transport.is_playing = false;
+        self.close_recording_session();
+    }
+
+    /// engine が止まったことを観測したときの後始末 (r.md #51)。
+    ///
+    /// 手動停止・曲末の auto-stop・書き出し・パニック・子プロセスの crash が
+    /// **すべてここへ収束する**。「どんな止まり方でも再生を押した位置へ戻る」
+    /// (r.md #50 の停止ホーム契約) を 1 箇所で保証するための合流点。
+    pub(crate) fn on_transport_stopped(&mut self) {
         // Pro Tools 流: 停止時に playhead を「再生開始位置」 (= 直前の
         // play() 呼び出し時点の playhead) に戻す。 GUI 側 playhead_beat
         // の即時上書きと、 audio engine への SeekTo IPC を 1 セットで
@@ -204,6 +272,10 @@ impl AppData {
             self.flush_song_sync();
             self.send_audio(AudioCommand::SeekTo { samples });
         }
+        // 録音は transport に乗るモードなので、止まったら必ず閉じる
+        // (旧実装は stop() が録音フラグに触れず、停止後も Rec が点灯したまま
+        // 凍ったプレイヘッドへノートが積み上がっていた)。
+        self.close_recording_session();
         // Phase 4 Step C: recording session を transport stop でクローズ。
         // Latch / Write の latched set + per-param 直近 record 位置を全て
         // clear。 これで次の Play 時には latched / last_beat が空からスタート、
@@ -248,9 +320,14 @@ impl AppData {
         if self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some() {
             return;
         }
-        if self.transport.is_playing {
-            self.stop();
-        }
+        // r.md #51: `is_playing` で条件を付けない。 これは観測値なので、押した
+        // 瞬間にはまだ true になっていない (= 録音を始めた直後のパニック) ことが
+        // あり、そこで Stop を送らないと「全ての音を停止しました」が嘘になる。
+        // stop() は要求 + 録音セッションのクローズだけで冪等。
+        self.stop();
+        // モニターで鳴らしている held は reinit が黙らせるので、こちらは
+        // 台帳だけ畳む (残すと次の note-off で存在しない音を止めにいく)。
+        self.recording.monitor_notes.clear();
         self.send_audio(AudioCommand::Panic);
         self.transport.panic_reinit_due = Some(std::time::Instant::now());
         self.transport.panic_release_pending = true;

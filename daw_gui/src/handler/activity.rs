@@ -3,10 +3,6 @@
 //! daw_gui の責務は **「アプリの窓がアクティブか」という事実の SSoT** であって、
 //! オーディオを止めてよいかの判断ではない。後者は daw_audio が持つ (再生中 /
 //! count-in / 書き出し中 / 出力が無音か、を engine だけが知っているため)。
-//!
-//! 特に `transport.is_playing` を「停止中か」の根拠に使ってはならない — Rec 単独の
-//! 録音は `AudioCommand::Play` を送るのに `is_playing` を立てない
-//! (`handler::midi::start_recording`) ので、録音中に音を切ってしまう。
 
 use common::protocol::AudioCommand;
 
@@ -48,14 +44,12 @@ impl AppData {
 
     /// transport が走っているか (再生 or 録音)。
     ///
-    /// `transport.is_playing` だけでは足りない: Rec 単独の録音は
-    /// `AudioCommand::Play` を送るのに `is_playing` を立てない
-    /// (`handler::midi::start_recording`、r.md #51)。録音フラグを直接見て塞ぐ。
+    /// r.md #51 以降、`transport.is_playing` は engine の観測値なので、録音を
+    /// 別に見る必要は無い (録音は必ず transport の上で走る)。count-in 中も
+    /// engine は playing なのでここに含まれる。
     #[must_use]
     pub fn transport_rolling(&self) -> bool {
         self.transport.is_playing
-            || self.recording.midi_recording
-            || self.recording.midi_recording_pending
     }
 
     /// 画面を描き続けるべきか。
@@ -137,7 +131,14 @@ impl AppData {
         // watchdog が発火すると status_message / export 表示 / 録音状態が変わる。
         mix(self.ui_ephemeral.status_message.len() as u64);
         mix(u64::from(self.transport.export_stage.is_some()));
-        mix(u64::from(self.recording.midi_recording));
+        // Rec ボタンの表示は「要求」「実際に録っているか」「count-in 中か」で変わる。
+        // count-in の残量は **有無だけ**混ぜる — 生の残量を混ぜると、画面に出ない
+        // 数値が毎 tick 変わるだけで count-in 中ずっと 30fps 描き直すことになる
+        // (表示解像度で量子化する、というこの関数の原則どおり)。
+        mix(u64::from(self.recording.requested));
+        mix(u64::from(self.recording.live));
+        mix(u64::from(self.transport.preroll_remaining > 0));
+        mix(u64::from(self.transport.is_playing));
         h
     }
 
