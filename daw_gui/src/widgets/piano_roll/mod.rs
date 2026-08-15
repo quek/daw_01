@@ -1403,8 +1403,10 @@ mod tests {
         let on_black =
             keyboard_label_color(p, &style, style.black_key, None, style.in_scale_label_fg);
         assert_eq!(on_black, p.ink_on_dark, "黒鍵行 → 明ラベル");
-        // 黒鍵 root + root_row_overlay (warm cream overlay を暗い黒鍵に重ねても実効輝度は閾値下) → 明ラベル。
-        // root が黒鍵 (F# pentatonic 等) の Highlight mode で warm-on-dark にならないことの確認。
+        // 黒鍵 root + root_row_overlay: warm cream を 32% 重ねると実効色は画面上
+        // sRGB (166,149,110) の中間トーンになる (linear 0.388/0.305/0.165、輝度 0.313)。
+        // 明るい側なので暗ラベル。 2026-08-15 まで relative_luminance の二重デコードで
+        // 「暗い」と誤判定され明ラベルが選ばれていたが、実効 2.6:1 で読みづらかった。
         let on_black_root = keyboard_label_color(
             p,
             &style,
@@ -1412,7 +1414,7 @@ mod tests {
             Some(style.root_row_overlay),
             style.root_label_fg,
         );
-        assert_eq!(on_black_root, p.ink_on_dark, "黒鍵 root + overlay 行 → 明ラベル");
+        assert_eq!(on_black_root, p.ink_on_bright, "黒鍵 root + warm overlay 行 → 暗ラベル");
         // 白鍵 in-scale (overlay 無し) → 明るい → 暗ラベル (旧 in_scale_label_fg の明文字が潰れる症状も解消)。
         let on_white =
             keyboard_label_color(p, &style, style.white_key, None, style.in_scale_label_fg);

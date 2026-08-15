@@ -53,7 +53,6 @@ pub struct TransportState {
     /// `PanicRelease` を送って `false` に戻す。 ミュート解除を reinit 完了に結び
     /// つけるためのフラグ（[`Self::panic`] 参照）。
     pub panic_release_pending: bool,
-    pub master_gain: f32,
     /// r.md #50: マスター出力の全メーター表示状態。テレメトリスレッドの
     /// `MasterAnalyzer` が `MasterMeterTick` で毎ティック更新する。
     ///

@@ -5,6 +5,15 @@
 //! - `toggle_button`: 矩形全面に任意ラベル + ON/OFF 背景色変化
 //!
 //! click 判定は `button` と同じ armed-state モデル (`press_started_inside`)。
+//!
+//! 同じ「OFF/ON の塗り + hover/押下フィードバック」 を持つが **click の意味が違う**
+//! 兄弟として `indicator_button_at` がある (daw_01 r.md #50 の CLIP 表示):
+//! - `toggle_button_at`: 点灯 = ユーザが所有する bool。click は `!value` への反転。
+//! - `indicator_button_at`: 点灯 = 外部データ (音がクリップした等)。click は反転でなく
+//!   常に同じ動作 (クリア等)。click しても点灯状態が直接ひっくり返るわけではない。
+//!
+//! 描画・ヒットテストは完全に同じなので `lit_button_at` に一本化し、 差分は click の
+//! 扱いだけに留める。
 
 use std::hash::Hash;
 
@@ -29,7 +38,17 @@ pub struct ToggleButtonResponse {
     pub hovered: bool,
 }
 
-/// `toggle_button_at` の見た目スタイル。 ON/OFF は `on_color` / `off_color` の背景色のみで表現する。
+/// `indicator_button_at` の応答。 `toggled` (= 値の反転) ではなく `clicked` (= 動作の発火)
+/// を返すのが `ToggleButtonResponse` との違い。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IndicatorButtonResponse {
+    /// このフレームで click を検出 (`Edit<M>` 発行と同じフレームで `true`)。
+    pub clicked: bool,
+    pub hovered: bool,
+}
+
+/// `toggle_button_at` / `indicator_button_at` の見た目スタイル。
+/// 消灯/点灯は `off_color` / `on_color` の背景色のみで表現する。
 #[derive(Clone, Copy, Debug)]
 pub struct ToggleButtonStyle {
     pub off_color: Color,
@@ -86,6 +105,57 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         F: FnOnce(bool) -> Edit<M>,
     {
         let wid = WidgetId::ROOT.child((b"toggle_button", &id));
+        let hit = self.lit_button_at(wid, "toggle_button", text, rect, value, style);
+
+        if hit.clicked {
+            let edit = on_toggle(!value);
+            self.push_edit(edit);
+        }
+
+        ToggleButtonResponse { toggled: hit.clicked, hovered: hit.hovered }
+    }
+
+    /// 点灯状態が **外部データ由来** の button を描画 + ヒットテスト。
+    ///
+    /// `toggle_button_at` と見た目・操作感 (hover / 押下 / 点灯色) は同一だが、 click は
+    /// 値の反転ではなく `on_click()` の 1 動作。 「音がクリップしたら赤く点いて、 押すと
+    /// クリアされる」 CLIP 表示のような **ラッチ表示 + リセット** に使う (daw_01 r.md #50)。
+    /// `lit` を `value` として `toggle_button_at` に渡すと「押すと点く/消える」 という嘘の
+    /// アフォーダンスになるので、 契約を分けている。
+    pub fn indicator_button_at<F>(
+        &mut self,
+        id: impl Hash,
+        text: &str,
+        rect: Rect,
+        lit: bool,
+        style: &ToggleButtonStyle,
+        on_click: F,
+    ) -> IndicatorButtonResponse
+    where
+        F: FnOnce() -> Edit<M>,
+    {
+        let wid = WidgetId::ROOT.child((b"indicator_button", &id));
+        let hit = self.lit_button_at(wid, "indicator_button", text, rect, lit, style);
+
+        if hit.clicked {
+            let edit = on_click();
+            self.push_edit(edit);
+        }
+
+        IndicatorButtonResponse { clicked: hit.clicked, hovered: hit.hovered }
+    }
+
+    /// `toggle_button_at` / `indicator_button_at` 共通の描画 + click 判定。
+    /// Edit をどう積むか (反転か動作か) だけを caller に残す。
+    fn lit_button_at(
+        &mut self,
+        wid: WidgetId,
+        tag: &'static str,
+        text: &str,
+        rect: Rect,
+        lit: bool,
+        style: &ToggleButtonStyle,
+    ) -> LitButtonHit {
         let pointer = self.pointer;
         // 開いている modal popup (context menu / dropdown) の上ではヒットさせない。
         // context menu は `capture_input == false` で背景 pointer を mask しないので、
@@ -143,7 +213,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         ));
 
         let input_hash = hash_inputs((
-            b"toggle_button",
+            tag,
             rect.x.to_bits(),
             rect.y.to_bits(),
             rect.w.to_bits(),
@@ -151,22 +221,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             text,
             inside,
             visual_pressed,
-            value,
+            lit,
             style_hash,
         ));
 
         let style_copy = *style;
         self.with_widget_node(wid, input_hash, |ui| {
-            draw_toggle_button(ui, text, rect, value, inside, visual_pressed, &style_copy);
+            draw_toggle_button(ui, text, rect, lit, inside, visual_pressed, &style_copy);
         });
 
-        if click {
-            let edit = on_toggle(!value);
-            self.push_edit(edit);
-        }
-
-        ToggleButtonResponse { toggled: click, hovered: inside }
+        LitButtonHit { clicked: click, hovered: inside }
     }
+}
+
+/// `lit_button_at` の内部戻り値 (公開 response 型へ caller が言い換える)。
+struct LitButtonHit {
+    clicked: bool,
+    hovered: bool,
 }
 
 fn draw_toggle_button<M: ?Sized + 'static>(

@@ -10,19 +10,24 @@ use daw_ui_renderer::Color;
 /// `luminance > THRESHOLD` を「明るい背景 = 暗文字を選ぶべき」と解釈する。
 pub const CONTRAST_LUMINANCE_THRESHOLD: f32 = 0.179;
 
-/// sRGB 成分 (各 `0.0..=1.0`) を WCAG 2.x relative luminance に変換する。
-/// gamma decode (sRGB → linear) 込み。
+/// **linear-light** 成分 (各 `0.0..=1.0`) を WCAG 2.x relative luminance に変換する。
+///
+/// WCAG の relative luminance は定義上 linear-light の加重和なので、入力が既に linear なら
+/// **そのまま加重するのが正しい**。gamma decode は「sRGB エンコードされた値」を linear に
+/// 戻すための前処理であって、輝度計算の一部ではない。
+///
+/// この crate のパレット値は linear で持つ (render target が `Rgba8UnormSrgb` で GPU が表示時に
+/// エンコードする。`theme::srgb` / テーマ JSON の hex パーサはどちらも `srgb_to_linear` を
+/// 通してから格納する) ので、ここで decode を掛けると **二重デコード** になる。
+///
+/// 実際 2026-08-15 まで decode 込みで実装されていて、輝度を最大 13 倍過小評価していた。
+/// 症状: (a) 中間調の面が一律「暗い」と判定され明インクが選ばれる (linear 0.22/0.34/0.52 =
+/// 画面上は明るいスチールブルーの既定クリップ色で、白文字は 2.8:1 しか出ていなかった)、
+/// (b) [`Palette::adapt_on`](crate::theme::Palette::adapt_on) が 3:1 を満たしたと誤認して
+/// 実効 2.5:1 で停止する (ライトテーマのメーター peak readout が読めない)。
 #[must_use]
 pub fn relative_luminance(r: f32, g: f32, b: f32) -> f32 {
-    fn lin(c: f32) -> f32 {
-        let c = c.clamp(0.0, 1.0);
-        if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    }
-    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    0.2126 * r.clamp(0.0, 1.0) + 0.7152 * g.clamp(0.0, 1.0) + 0.0722 * b.clamp(0.0, 1.0)
 }
 
 /// `fg` を `bg` の上に standard src-over alpha 合成した実効色を返す (RGB のみ、結果は不透明扱い)。
@@ -92,12 +97,19 @@ mod tests {
         assert_eq!(pick_contrast(Color::rgb(0.95, 0.95, 0.95), light, dark), dark);
         // 暗い背景 → 明文字。
         assert_eq!(pick_contrast(Color::rgb(0.10, 0.10, 0.12), light, dark), light);
-        // 不透明な薄緑は明るく暗文字寄りだが、暗 bg と alpha 0.30 で合成すると実効輝度が下がり明文字。
-        let pale_green = Color::rgba(0.55, 0.85, 0.55, 0.30);
-        let dark_bg = Color::rgb(0.12, 0.13, 0.16);
+        // 不透明な薄緑は明るく暗文字寄りだが、暗 bg に薄く重ねると実効輝度が下がり明文字。
+        // = 「overlay 自身の色ではなく合成後の色で判定する」 という契約。
+        //
+        // alpha は 0.15。 輝度は linear で線形合成されるので、 薄緑 (Y=0.765) を
+        // ほぼ黒 (Y=0.021) に 15% 重ねた実効輝度は 0.13 で分岐点 0.179 を下回る。
+        // 旧テストは alpha 0.30 / bg (0.12,0.13,0.16) で「明文字」 を期待していたが、
+        // 実効 Y は 0.32 = 画面上は中間色のセージグリーンで、暗文字が正しい
+        // (relative_luminance の二重デコードで輝度が過小評価されていたため通っていた)。
+        let pale_green = Color::rgba(0.55, 0.85, 0.55, 0.15);
+        let dark_bg = Color::rgb(0.02, 0.02, 0.03);
         let opaque = pick_contrast(Color::rgb(0.55, 0.85, 0.55), light, dark);
         let composited = pick_contrast(composite_over(pale_green, dark_bg), light, dark);
         assert_eq!(opaque, dark, "不透明な薄緑は暗文字");
-        assert_eq!(composited, light, "暗 bg と合成した薄緑 (alpha 0.30) は明文字");
+        assert_eq!(composited, light, "ほぼ黒に 15% で重ねた薄緑は明文字");
     }
 }

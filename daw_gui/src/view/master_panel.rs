@@ -20,7 +20,7 @@
 
 use daw_ui_core::{
     CorrelationStyle, Edit, GoniometerStyle, LevelMeterStyle, LoudnessMeterStyle, MeterBallistic,
-    MeterScale, OscilloscopeStyle, SpectrumStyle, Ui,
+    MeterScale, OscilloscopeStyle, SpectrumStyle, ToggleButtonStyle, Ui,
 };
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
@@ -270,10 +270,11 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
         reference_db: Some(settings.vu_reference_dbfs),
         ..LevelMeterStyle::from_palette(p)
     };
-    let fader_db = if app.transport.master_gain <= 0.0 {
+    let master_gain = app.song_doc.song().master_gain;
+    let fader_db = if master_gain <= 0.0 {
         f32::NEG_INFINITY
     } else {
-        20.0 * app.transport.master_gain.log10()
+        20.0 * master_gain.log10()
     };
     let fader_rect = Rect { x: body.x, y: body.y, w: FADER_GROUP_W, h: body.h };
     let long_peak = if m.peak_max_db.is_finite() {
@@ -302,6 +303,20 @@ fn draw_master_section<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, body: Rec
         },
         None,
     );
+    // drag の立ち上がり / 立ち下がりで undo gesture を開閉する。`master_gain` は
+    // `Song` に入って undo 対象になったので、これが無いと 1 回のドラッグで
+    // per-frame の編集が undo 履歴を埋める。was_dragging は 1 frame 遅れで
+    // 追従する (param_gesture と同じ edge 検出の連鎖)。
+    if resp.fader.dragging != app.ui_ephemeral.master_gain_dragging {
+        let started = resp.fader.dragging;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(if started {
+                AppEvent::BeginMasterGainDrag
+            } else {
+                AppEvent::EndMasterGainDrag
+            });
+        }));
+    }
     if resp.peak_reset {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ResetMasterPeakHold);
@@ -401,40 +416,45 @@ fn draw_loudness_readout<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: R
         let clip_w = (rect.w * 0.45).min(60.0);
         let clip_rect = Rect { x: rect.x, y: y + 2.0, w: clip_w, h: RESET_BTN_H };
         let clipped = m.clip_count > 0;
-        ui.push_rect(RectCommand {
-            rect: clip_rect,
-            fill: if clipped { app.theme.daw.record } else { p.inset_bg },
-            border: p.border,
-            border_width: 1.0,
-            radius: [3.0; 4],
-            clip_rect: None,
-        });
         let text = if clipped { format!("CLIP {}", m.clip_count) } else { "CLIP".into() };
-        let tw = ui.measure_text(&text, READ_FONT);
-        ui.label_at(
+        // 点灯はユーザが決める state ではなく音の観測結果、 click は反転でなく常に
+        // クリアなので toggle ではなく `indicator_button_at`。 手書きの rect + label +
+        // press 判定だと hover も押下も出ず、 隣の Reset と作法が揃わなかった。
+        ui.indicator_button_at(
             "mp_clip",
             &text,
-            clip_rect.x + (clip_rect.w - tw) * 0.5,
-            clip_rect.y + 2.0,
-            READ_FONT,
-            if clipped { p.ink_for(app.theme.daw.record) } else { p.text_dim },
+            clip_rect,
+            clipped,
+            &clip_indicator_style(&app.theme),
+            || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ResetMasterPeakHold)),
         );
-        if !ui.has_open_popups() && ui.take_primary_press_in_rect(clip_rect).is_some() {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::ResetMasterPeakHold);
-            }));
-        }
         // Reset (ラウドネス積算を同時リセット)。
         let btn_x = clip_rect.x + clip_rect.w + 4.0;
         let btn_w = (rect.x + rect.w - btn_x).max(0.0);
         if btn_w >= 40.0 {
-            ui.button_at(
+            // `button_at` は 16px 固定で、隣の CLIP ラベルや上の読み値 (10px) に対して
+            // 大きすぎる。同じ帯に並ぶものは同じ font に揃える。
+            ui.button_at_sized(
                 "mp_reset_loudness",
                 "Reset",
                 Rect { x: btn_x, y: clip_rect.y, w: btn_w, h: RESET_BTN_H },
+                READ_FONT,
                 || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ResetLoudness)),
             );
         }
+    }
+}
+
+/// CLIP 表示の見た目 (Mixer の Rec = `style_rec` と同じ流儀)。
+/// 点灯 = クリップ検出で赤背景、 消灯は通常のボタン面。
+fn clip_indicator_style(theme: &crate::theme::Theme) -> ToggleButtonStyle {
+    // `on_text_color` は None のまま = 点灯塗りの輝度から auto-contrast (r.md #48 の契約)。
+    // 手で `ink_for` を書くと同じ計算の重複になる。
+    ToggleButtonStyle {
+        on_color: theme.daw.record,
+        radius: 3.0,
+        font_size: READ_FONT,
+        ..ToggleButtonStyle::from_palette(&theme.core)
     }
 }
 

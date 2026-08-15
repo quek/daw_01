@@ -73,6 +73,11 @@ pub struct UiEphemeral {
     /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master
     /// strip は solo を持たないので None 扱い。
     pub mixer_hovered_track: Option<u32>,
+    /// マスターフェーダーを掴んでいるか (undo gesture の edge 検出用)。
+    /// `Song.master_gain` を編集するようになったので、drag 全体を 1 undo step に
+    /// bracket しないと per-frame の編集が履歴を埋める (group transform /
+    /// inspector scrub と同じ罠)。session-only。
+    pub master_gain_dragging: bool,
     /// ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
     /// ノート paste の配置位置に使う。`piano_roll` widget が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。

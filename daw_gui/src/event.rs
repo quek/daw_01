@@ -883,6 +883,11 @@ pub enum AppEvent {
     /// チェーン化で **棄却なしの純 permutation** (役割は位置から再導出)。
     ReorderInspectorChain(Vec<usize>),
     SetMasterGain(f32),
+    /// マスターフェーダーの drag 全体を 1 undo step に bracket する
+    /// (`BeginGroupTransformDrag` / `BeginInspectorScrub` と同 idiom)。
+    /// `master_gain` が `Song` に入って undo 対象になったので必要になった。
+    BeginMasterGainDrag,
+    EndMasterGainDrag,
 
     // -------- IPC events from plugin_host ---------------------------------
     /// audio engine の telemetry を 30Hz で観測したもの (`AudioBridge` の poll)。

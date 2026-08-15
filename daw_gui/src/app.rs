@@ -177,7 +177,6 @@ impl AppData {
                 playback_origin_beat: None,
                 panic_reinit_due: None,
                 panic_release_pending: false,
-                master_gain: 1.0,
                 master_meter: crate::master_meter::MasterMeterSnapshot::default(),
                 track_peak_display: initial_peak_display,
                 mod_scalars: Vec::new(),
@@ -352,6 +351,7 @@ impl AppData {
                 arrangement_hover_clip: None,
                 arrange_hovered_track: None,
                 mixer_hovered_track: None,
+                master_gain_dragging: false,
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,
                 pianoroll_hover_note: None,
@@ -1454,6 +1454,17 @@ impl AppData {
             }
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
+            }
+            // マスターフェーダーの drag を 1 undo step に束ねる。これが無いと
+            // per-frame の `SetMasterGain` が各々 snapshot を積み、1 回の drag で
+            // undo 履歴が埋まる (group transform / inspector scrub と同じ罠)。
+            AppEvent::BeginMasterGainDrag => {
+                self.ui_ephemeral.master_gain_dragging = true;
+                self.song_doc.begin_gesture();
+            }
+            AppEvent::EndMasterGainDrag => {
+                self.ui_ephemeral.master_gain_dragging = false;
+                self.song_doc.end_gesture();
             }
             AppEvent::Tick {
                 samples,

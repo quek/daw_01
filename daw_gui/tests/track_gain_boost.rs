@@ -86,15 +86,15 @@ fn master_gain_keeps_boost_above_unity() {
 
     app.handle_event(AppEvent::SetMasterGain(1.5));
     assert!(
-        (app.transport.master_gain - 1.5).abs() < 1e-6,
+        (app.song_doc.song().master_gain - 1.5).abs() < 1e-6,
         "master のブーストが保持される (got {})",
-        app.transport.master_gain
+        app.song_doc.song().master_gain
     );
 
     app.handle_event(AppEvent::SetMasterGain(5.0));
     assert!(
-        (app.transport.master_gain - common::model::MAX_TRACK_GAIN).abs() < 1e-6,
+        (app.song_doc.song().master_gain - common::model::MAX_TRACK_GAIN).abs() < 1e-6,
         "master 上限は MAX_TRACK_GAIN (got {})",
-        app.transport.master_gain
+        app.song_doc.song().master_gain
     );
 }

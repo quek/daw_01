@@ -70,7 +70,9 @@ pub use widgets::scrubable_number::{
 };
 pub use widgets::button::ButtonTextAlign;
 pub use widgets::text_input::TextInputResponse;
-pub use widgets::toggle_button::{ToggleButtonResponse, ToggleButtonStyle};
+pub use widgets::toggle_button::{
+    IndicatorButtonResponse, ToggleButtonResponse, ToggleButtonStyle,
+};
 pub use widgets::waveform::{
     ChannelLayout, SampleSlices, WaveformHit, WaveformRenderMode, WaveformResponse,
     WaveformSegment, WaveformSource, WaveformStyle, WaveformView,

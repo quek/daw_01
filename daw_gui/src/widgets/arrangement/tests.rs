@@ -1099,11 +1099,24 @@
     #[test]
     fn clip_fills_land_on_expected_contrast_side() {
         use daw_ui_core::color::{CONTRAST_LUMINANCE_THRESHOLD, relative_luminance};
+        use daw_ui_core::theme::srgb;
+        // パレット値は linear。 **画面上の見え方** で書かないと直感とずれる:
+        // linear (0.18,0.40,0.65) は画面では sRGB (118,169,212) の明るいスチールブルーで、
+        // 「暗い側」 ではない (2026-08-15 まで relative_luminance の二重デコードで暗いと
+        // 誤判定されていた)。 既定クリップ色はこの明るい側に乗る。
         let yellow = relative_luminance(1.0, 0.85, 0.30); // clip_selected_fill
-        let dark_blue = relative_luminance(0.18, 0.40, 0.65); // clip_default_fill
+        let steel_blue = relative_luminance(0.18, 0.40, 0.65); // clip_default_fill
+        let true_dark = {
+            let c = srgb(0.10, 0.14, 0.22); // 画面上も暗い紺
+            relative_luminance(c.r, c.g, c.b)
+        };
         assert!(yellow > CONTRAST_LUMINANCE_THRESHOLD, "黄 fill は明るい側: {yellow}");
-        assert!(dark_blue < CONTRAST_LUMINANCE_THRESHOLD, "暗青 fill は暗い側: {dark_blue}");
-        assert!(yellow > dark_blue, "黄 > 暗青 の単調性");
+        assert!(
+            steel_blue > CONTRAST_LUMINANCE_THRESHOLD,
+            "既定 fill は画面上明るいので明るい側: {steel_blue}"
+        );
+        assert!(true_dark < CONTRAST_LUMINANCE_THRESHOLD, "本当に暗い紺は暗い側: {true_dark}");
+        assert!(yellow > steel_blue && steel_blue > true_dark, "黄 > スチール青 > 紺 の単調性");
     }
 
     /// M14 Phase 89 (daw_01 #060): `clip_text_color_for` が fill 輝度で暗/明文字を選び、
@@ -1124,15 +1137,25 @@
             p.ink_on_bright,
             "明るい黄 fill には暗インク"
         );
-        // 暗い fill (default 青) → 明インク。
+        // 既定 fill (スチールブルー) は画面上明るい (sRGB 127,157,190) → 暗インク。
+        // かつて明インクが選ばれていたが実効 2.8:1 で AA を大きく割っていた。
         assert_eq!(
             clip_text_color_for(p, &style, style.clip_default_fill, style.bg),
-            p.ink_on_dark,
-            "暗い青 fill には明インク"
+            p.ink_on_bright,
+            "既定 fill は画面上明るいので暗インク"
         );
-        // 半透明の薄緑 share fill: 不透明なら明るく暗インク寄りだが、 暗い lane bg と alpha 0.3 で
+        // 画面上も暗い fill → 明インク。
+        assert_eq!(
+            clip_text_color_for(p, &style, daw_ui_core::theme::srgb(0.10, 0.14, 0.22), style.bg),
+            p.ink_on_dark,
+            "暗い紺 fill には明インク"
+        );
+        // 半透明の薄緑 share fill: 不透明なら明るく暗インク寄りだが、 暗い lane bg と薄い alpha で
         // 合成すると実効輝度が下がり明インクが選ばれる (合成判定が効いている証拠)。
-        let pale_green = Color::rgba(0.55, 0.85, 0.55, 0.30);
+        // alpha は 0.10。 輝度は linear で線形合成されるので、 薄緑を lane bg に 30% 重ねた
+        // 実効輝度は 0.28 = 画面上は中間色で、暗インクが正しい (旧 0.30 は二重デコードで
+        // 「暗い」と誤判定されていた)。
+        let pale_green = Color::rgba(0.55, 0.85, 0.55, 0.10);
         let opaque = clip_text_color_for(
             p,
             &style,
@@ -1143,7 +1166,7 @@
         assert_eq!(opaque, p.ink_on_bright, "不透明な薄緑は暗インク");
         assert_eq!(
             composited, p.ink_on_dark,
-            "暗 lane bg と合成した薄緑 (alpha 0.3) は明インク"
+            "暗 lane bg に薄く重ねた薄緑 (alpha 0.1) は明インク"
         );
 
         // opt-out: auto を切ると fill に依らず clip_text_color 固定。

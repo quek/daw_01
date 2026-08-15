@@ -76,6 +76,11 @@ impl AppData {
             .and_then(|p| p.parent().map(Path::to_path_buf));
         self.send_audio(AudioCommand::SetProjectDir(project_dir));
         let song = self.song_doc.song().clone();
+        // マスター音量は engine 側では atomic (`EngineShared.master_gain`) が live
+        // 値を持つので、**送る Song から導いて**必ず一緒に届ける。ここは
+        // 「Song が差し替わる」全経路 (Open / New / Undo / Redo / 復旧) が通る
+        // 唯一の口なので、開いた直後に保存値が効かない取りこぼしが構造的に無い。
+        self.send_audio(AudioCommand::SetMasterGain(song.master_gain));
         self.send_audio(AudioCommand::LoadSong(song));
         // PR-V3: vocal track が builtin VOICEVOX を instrument に持つ場合、
         // notes / bpm 変更を plugin に flush して背景 synth を trigger。

@@ -195,7 +195,11 @@ pub use track::*;
 /// 見せているか) を追加。 端 trim が content を書き換えなくなり、`content_id` を
 /// 共有する linked clip の開始・終了が完全に独立する。v31 以前は `serde(default)` の
 /// `0.0` (= 従来どおり content 先頭から見せる) で読める。
-pub const CURRENT_VERSION: u32 = 32;
+/// Bumped to `33` (r.md #50 の follow-up): master の出力音量を [`Song::master_gain`]
+/// として保存する。従来は GUI のセッション状態にしか無く、**保存しても開き直すと
+/// 0dB に戻っていた**。v32 以前の `.daw` は `serde(default)` の `1.0` (unity) で
+/// 読めるので、旧ファイルの聞こえ方は変わらない。
+pub const CURRENT_VERSION: u32 = 33;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -615,6 +619,19 @@ pub struct Song {
     /// 直列 process する。 旧 file は `#[serde(default)]` で空 Vec に forward-migrate。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub master_fx_chain: Vec<PluginInstance>,
+    /// v33: master bus の出力音量 (linear amp、`1.0` = 0dB unity、上限
+    /// [`MAX_TRACK_GAIN`] = +6dB)。全 track を mix し `master_fx_chain` を通した
+    /// **最後**に掛かる。
+    ///
+    /// `master_fx_chain` / `song_lanes` と同じ「master 固有データは Track ではなく
+    /// Song 直下」流儀。ここに置くのは **曲の一部** だから — マスター音量を変えると
+    /// 書き出す音が変わるので、「作った中身が変わる = dirty を立てる」 側
+    /// (`docs/plan_arch_refactor.md` の dirty 規約) に入る。
+    ///
+    /// v32 以前の `.daw` はフィールドを持たないので `1.0` (unity) に
+    /// forward-migrate する (= 旧ファイルの聞こえ方は変わらない)。
+    #[serde(default = "default_master_gain")]
+    pub master_gain: f32,
     /// `master_fx_chain` 上の plugin が報告する latency の合計 (samples)。
     /// 通常 track の [`Track::reported_latency_samples`] の master 版 —
     /// master は `Track` を持たない (`MASTER_TRACK_ID` は `tracks` に存在しない) ので、
@@ -659,6 +676,11 @@ fn default_video_framerate() -> f32 {
     30.0
 }
 
+/// v33 以前の `.daw` に `master_gain` は無いので unity (0dB) へ forward-migrate。
+fn default_master_gain() -> f32 {
+    1.0
+}
+
 impl Default for Song {
     fn default() -> Self {
         Self {
@@ -686,6 +708,7 @@ impl Default for Song {
             video_resolution: default_video_resolution(),
             video_framerate: default_video_framerate(),
             master_fx_chain: Vec::new(),
+            master_gain: default_master_gain(),
             master_reported_latency_samples: 0,
             project_id: 0,
             sections: Vec::new(),

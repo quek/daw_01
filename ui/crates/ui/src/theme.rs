@@ -328,9 +328,13 @@ pub enum WaveformInk {
     Peak,
 }
 
-/// 図形要素 (線 / 点 / 塗り) に WCAG が求める最小コントラスト比。
+/// 図形要素 (線 / 点 / 塗り) に WCAG が求める最小コントラスト比 (WCAG 2.2 SC 1.4.11)。
 /// [`Palette::adapt_on`] がこの比を満たすまでアイデンティティ色の明度を寄せる。
 const MIN_GRAPHIC_CONTRAST: f32 = 3.0;
+
+/// 本文サイズのテキストに WCAG AA が求める最小コントラスト比 (WCAG 2.2 SC 1.4.3)。
+/// 図形の 3:1 では小さい数字は読めないので、文字には [`Palette::adapt_text_on`] を使う。
+const MIN_TEXT_CONTRAST: f32 = 4.5;
 
 impl Default for Palette {
     fn default() -> Self {
@@ -421,18 +425,36 @@ impl Palette {
     /// アイデンティティ色は「変換」で読ませる。
     #[must_use]
     pub fn adapt_on(&self, bg: Color, identity: Color) -> Color {
-        let bg_l = relative_luminance(bg.r, bg.g, bg.b);
-        let target = if bg_l > CONTRAST_LUMINANCE_THRESHOLD { Color::BLACK } else { Color::WHITE };
-        let mut out = identity;
-        // 8% 刻みで target 方向へ寄せる (最大 96%)。決定論的で、テストで固定できる。
-        for step in 0..=12 {
-            out = identity.lerp(target.with_alpha(identity.a), step as f32 * 0.08);
-            if contrast_ratio(out, bg) >= MIN_GRAPHIC_CONTRAST {
-                break;
-            }
-        }
-        out
+        adapt_to(bg, identity, MIN_GRAPHIC_CONTRAST)
     }
+
+    /// [`adapt_on`](Self::adapt_on) のテキスト版。求めるコントラストが図形の 3:1 ではなく
+    /// 本文テキストの AA 4.5:1 になる。
+    ///
+    /// 色付きの**文字** (メーターの over 表示・警告ラベル等) はこちらを使う。3:1 のまま
+    /// 文字に流用すると「規格は満たしているのに小さい数字が読めない」状態になる。
+    #[must_use]
+    pub fn adapt_text_on(&self, bg: Color, identity: Color) -> Color {
+        adapt_to(bg, identity, MIN_TEXT_CONTRAST)
+    }
+}
+
+/// `identity` の色相を保ったまま、`bg` の上で `min_ratio` を満たす明度まで寄せる。
+///
+/// 寄せ先が純黒 / 純白なので、分岐は `CONTRAST_LUMINANCE_THRESHOLD` (= 純黒と純白の
+/// コントラストが等しくなる点) が正しい。パレット依存が無いので自由関数。
+fn adapt_to(bg: Color, identity: Color, min_ratio: f32) -> Color {
+    let bg_l = relative_luminance(bg.r, bg.g, bg.b);
+    let target = if bg_l > CONTRAST_LUMINANCE_THRESHOLD { Color::BLACK } else { Color::WHITE };
+    let mut out = identity;
+    // 8% 刻みで target 方向へ寄せる (最大 96%)。決定論的で、テストで固定できる。
+    for step in 0..=12 {
+        out = identity.lerp(target.with_alpha(identity.a), step as f32 * 0.08);
+        if contrast_ratio(out, bg) >= min_ratio {
+            break;
+        }
+    }
+    out
 }
 
 /// WCAG 2.x のコントラスト比 (1.0..=21.0)。どちらが明るいかは問わない。
@@ -495,8 +517,12 @@ mod tests {
     fn ink_for_picks_opposite_polarity_in_both_themes() {
         // テーマを切り替えても「明るい面には暗インク / 暗い面には明インク」 は不変。
         // ここが破れるとライトでクリップ名・波形が消える (r.md #48 の最大の落とし穴)。
-        let bright_clip = Color::rgb(0.93, 0.74, 0.28);
-        let dark_clip = Color::rgb(0.22, 0.34, 0.52);
+        // **画面で見える色**で宣言する (srgb 経由)。 linear 直値で書くと直感とずれる:
+        // linear (0.22, 0.34, 0.52) は画面上では sRGB (127, 157, 190) の明るいスチール
+        // ブルーで、「暗いクリップ」 ではない (2026-08-15 まで relative_luminance の
+        // 二重デコードでこれが「暗い」と誤判定され、白文字が 2.8:1 で載っていた)。
+        let bright_clip = srgb(0.97, 0.88, 0.57);
+        let dark_clip = srgb(0.22, 0.34, 0.52);
         for p in [Palette::dark(), Palette::light()] {
             assert_eq!(p.ink_for(bright_clip), p.ink_on_bright);
             assert_eq!(p.ink_for(dark_clip), p.ink_on_dark);

@@ -28,7 +28,6 @@ use std::time::Instant;
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
 
-use crate::color::composite_over;
 use crate::id::WidgetId;
 use crate::theme::Palette;
 use crate::ui::Ui;
@@ -56,13 +55,9 @@ const SCALE_TICK_LEN: f32 = 5.0;
 const SCALE_FONT_PX: f32 = 9.0;
 /// peak readout の font サイズ。
 const READOUT_FONT_PX: f32 = 10.0;
-/// peak readout の暗チップ高さ。
+/// peak readout の行の高さ。
 const READOUT_H: f32 = 13.0;
-/// peak readout の暗チップ (`Palette::scrim`) を塗る不透明度。 チップ上の数値色を決める
-/// [`LevelMeterStyle::from_palette`] と実際に塗る `draw_meter_readout` が同じ値を見るための
-/// SSoT (ずれると「読める前提で選んだ色」 が実際のチップと食い違う)。
-const READOUT_CHIP_ALPHA: f32 = 0.78;
-/// peak readout 専用帯の高さ (チップ + 上下余白)。 バー/目盛りはこのぶん下げる。
+/// peak readout 専用帯の高さ (行 + 上下余白)。 バー/目盛りはこのぶん下げる。
 const READOUT_BAND_H: f32 = READOUT_H + 3.0;
 /// scale 時の上下パディング (px)。 端ラベル (+6 / -60) を rect の端に貼り付けない。
 const SCALE_VPAD: f32 = 6.0;
@@ -211,10 +206,6 @@ pub struct LevelMeterStyle {
     pub scale_tick_color: Color,
     /// 0dB 強調時の tick / ラベル / 横線の色 (`MeterScale.emphasize_zero`)。
     pub scale_zero_color: Color,
-    /// peak readout 数値の通常色 (< 0dB)。
-    pub peak_readout_color: Color,
-    /// peak readout 数値の over 色 (>= 0dB)。
-    pub peak_readout_over_color: Color,
     /// `Some(db)` のとき、その dB 位置に **基準線** を 1 本引く (daw_01 r.md #50)。
     ///
     /// 用途は VU の 0 VU アライメント (EBU R68 = -18 dBFS / SMPTE RP155 =
@@ -236,14 +227,11 @@ impl LevelMeterStyle {
     /// - メーター ramp (`low`..`clip`) は **色相固定・明度可変**。 テーマごとの `meter_*` を使う。
     /// - 目盛り (tick / 数字 / 0dB 線) と peak hold 線はクローム面 (`inset_bg` の溝) の上なので
     ///   テーマ従属の `text` / `text_dim`。
-    /// - peak readout の数値だけは **極性固定の暗いチップ (`scrim`) の上**に乗るので、
-    ///   テーマ従属の `text` ではなく `ink_on_dark` を使う (ライトで `text` は暗くなり、
-    ///   暗チップに沈んで読めなくなる)。 over 色 (`meter_red`) も同じチップの上なので
-    ///   [`Palette::adapt_on`] で色相を保ったままチップ上で読める明度に寄せる
-    ///   (ダークでは既に十分なコントラストがあるので恒等 = 見た目不変)。
+    /// - peak readout の数値はスタイルに持たない。 背後が `bg` 1 色と分かっているので
+    ///   描画時に `ink_for(bg)` / `adapt_text_on(bg, text_error)` から導出する
+    ///   (`draw_meter_readout` 参照)。
     #[must_use]
     pub fn from_palette(p: &Palette) -> Self {
-        let chip_bg = composite_over(p.scrim.with_alpha(READOUT_CHIP_ALPHA), p.inset_bg);
         Self {
             bg: p.inset_bg,
             low: p.meter_green,
@@ -258,8 +246,6 @@ impl LevelMeterStyle {
             scale_text_color: p.text_dim.with_alpha(0.95),
             scale_tick_color: p.text_dim.with_alpha(0.95),
             scale_zero_color: p.text,
-            peak_readout_color: p.ink_on_dark,
-            peak_readout_over_color: p.adapt_on(chip_bg, p.meter_red),
             reference_db: None,
             reference_color: p.accent,
         }
@@ -659,29 +645,34 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
     }
 
-    /// 最大到達 dB の数値ピークを rect 上端の専用帯に描く (暗チップ + 数値、 全幅中央寄せ)。
+    /// 最大到達 dB の数値ピークを rect 上端の専用帯に描く (全幅中央寄せ)。
     ///
-    /// チップは **極性固定** (`Palette::scrim`) — メーターの色帯 (可変背景) の上でも数値を
-    /// 確実に読ませるための裏打ちなので、 テーマで明暗を反転させてはいけない
-    /// (memory `feedback_ui_indicator_contrast_on_variable_bg` の idiom)。
+    /// **この数値は色帯バーの上には乗らない**。 バーは [`meter_content_region`] が上端から
+    /// `READOUT_BAND_H` を差し引いた `content` の中だけに描かれるので、 数値の背後は常に
+    /// `style.bg` (= メーター背景のクローム面) 1 色である。
+    ///
+    /// したがって色は **背景の輝度から導出** する。 以前は `Palette::scrim` の暗チップを敷いて
+    /// 極性固定インクを載せていたが、 それは「可変背景の上の標識」 の idiom
+    /// (memory `feedback_ui_indicator_contrast_on_variable_bg`) をここに誤適用したもので、
+    /// ダークではチップが背景と同輝度で見えず (実測 0.0301 vs 0.0301)、 ライトでは明るい面に
+    /// 暗チップだけが浮いた上に、 テーマの赤 (明るい面で読ませる濃い赤) がその暗チップ上で
+    /// 1.27:1 に潰れていた。 `adapt_on` が救おうとしても図形基準 3:1 止まりで、 実効 2.5:1 の
+    /// 読めない淡いピンクにしかならない (r.md #50)。
     fn draw_meter_readout(&mut self, rect: Rect, long_peak_value: f32, style: &LevelMeterStyle) {
         let p = self.palette();
         let (text, over) = format_peak_readout(long_peak_value);
-        let color = if over { style.peak_readout_over_color } else { style.peak_readout_color };
+        // over は色相 (赤 = 警告) を保ったまま、 文字として読める明度まで寄せる。
+        // 通常時は「この面の上の本文インク」 = ink_for に委ねる (答えを 2 つ持たない)。
+        let color = if over {
+            p.adapt_text_on(style.bg, p.text_error)
+        } else {
+            p.ink_for(style.bg)
+        };
         let text_w = text.chars().count() as f32 * READOUT_FONT_PX * CHAR_W_RATIO;
-        let chip_w = (text_w + 6.0).min(rect.w);
-        let chip_x = rect.x + ((rect.w - chip_w).max(0.0)) * 0.5;
-        self.push_rect(RectCommand {
-            rect: Rect { x: chip_x, y: rect.y + 1.0, w: chip_w, h: READOUT_H },
-            fill: p.scrim.with_alpha(READOUT_CHIP_ALPHA),
-            border: Color::TRANSPARENT,
-            border_width: 0.0,
-            radius: [2.0; 4],
-            clip_rect: Some(rect),
-        });
+        let text_x = rect.x + (rect.w - text_w).max(0.0) * 0.5;
         self.push_text(GlyphArea {
             text: text.into(),
-            left: chip_x + (chip_w - text_w).max(0.0) * 0.5,
+            left: text_x,
             top: rect.y + 1.0 + (READOUT_H - READOUT_FONT_PX) * 0.5 - 1.0,
             font_size: READOUT_FONT_PX,
             line_height: READOUT_H,
@@ -806,6 +797,7 @@ mod tests {
     use super::*;
     use crate::FrameInput;
     use crate::input::PointerFrame;
+    use crate::theme::contrast_ratio;
     use crate::ui::UiHost;
 
     /// テストの基準スタイル。 テーマ色を読む `Default` は廃止した (r.md #48) ので、
@@ -1044,6 +1036,37 @@ mod tests {
                 g.text,
                 g.top
             );
+        }
+    }
+
+    /// peak readout の数値が **両テーマで** 本文テキストの AA (4.5:1) を満たす。
+    ///
+    /// r.md #50 の回帰: 数値は極性固定の暗チップ (`scrim`) の上に置かれていて、ライトでは
+    /// 実効 2.5:1 まで落ちて読めなかった。 背後は `style.bg` 1 色と分かっているので、
+    /// 実際に描かれたグリフの色を Scene から読み、その背景に対する実測比を検証する
+    /// (widget の色決定ロジックをテスト側に書き写すと、何も検証しないテストになる)。
+    #[test]
+    fn peak_readout_meets_text_contrast_in_both_themes() {
+        for (name, palette) in [("dark", Palette::dark()), ("light", Palette::light())] {
+            let style = LevelMeterStyle { peak_readout: true, ..LevelMeterStyle::from_palette(&palette) };
+            let rect = Rect { x: 5.0, y: 0.0, w: 40.0, h: 200.0 };
+
+            // (a) 0 dBFS 到達 = over 表示 (赤系)。 (b) -6 dBFS = 通常表示。
+            // long_peak は host に溜まるので、ケースごとに新しい host を使う。
+            for (l, want) in [(1.0_f32, "0.0"), (0.5, "-6.0")] {
+                let mut host: UiHost<()> = UiHost::no_redraw();
+                host.set_palette(std::sync::Arc::new(palette.clone()));
+                let scene = run_stereo(&mut host, rect, l, 0.0, style, PointerFrame::default());
+                let g = scene
+                    .iter_glyphs()
+                    .find(|g| g.text.as_ref() == want)
+                    .unwrap_or_else(|| panic!("{name}: readout {want} が描かれていない"));
+                let ratio = contrast_ratio(g.color, style.bg);
+                assert!(
+                    ratio >= 4.5,
+                    "{name}: readout {want} の実効コントラストが AA 未満 ({ratio:.2}:1)"
+                );
+            }
         }
     }
 

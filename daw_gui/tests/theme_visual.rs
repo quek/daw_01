@@ -52,12 +52,13 @@ fn build_app(app_dirs: Option<AppDirs>) -> (AppData, UnboundedReceiver<PluginCom
 }
 
 /// sRGB バイトから WCAG relative luminance。
+///
+/// ここは **本当に sRGB エンコードされた値** を扱う唯一の経路 (GPU readback は
+/// `Rgba8UnormSrgb` = エンコード済みバイト)。 `relative_luminance` はパレット同様の
+/// linear 入力を前提にしているので、 呼び出し側で `srgb_to_linear` を通す。
 fn luminance(r: u8, g: u8, b: u8) -> f32 {
-    daw_ui_core::color::relative_luminance(
-        f32::from(r) / 255.0,
-        f32::from(g) / 255.0,
-        f32::from(b) / 255.0,
-    )
+    let lin = |v: u8| daw_ui_core::theme::srgb_to_linear(f32::from(v) / 255.0);
+    daw_ui_core::color::relative_luminance(lin(r), lin(g), lin(b))
 }
 
 struct Shot {

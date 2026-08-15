@@ -265,11 +265,10 @@ fn the_master_panel_follows_the_light_theme() {
             .pixels
             .chunks_exact(3)
             .map(|p| {
-                daw_ui_core::color::relative_luminance(
-                    f32::from(p[0]) / 255.0,
-                    f32::from(p[1]) / 255.0,
-                    f32::from(p[2]) / 255.0,
-                )
+                // readback は `Rgba8UnormSrgb` = sRGB エンコード済みバイト。
+                // `relative_luminance` は linear 入力前提なので decode してから渡す。
+                let lin = |v: u8| daw_ui_core::theme::srgb_to_linear(f32::from(v) / 255.0);
+                daw_ui_core::color::relative_luminance(lin(p[0]), lin(p[1]), lin(p[2]))
             })
             .sum();
         (sum / (r.pixels.len() / 3) as f32, r.unique_colors)
