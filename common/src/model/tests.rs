@@ -1076,7 +1076,10 @@ fn current_version_is_pinned() {
     // `content_offset_beats` を追加 (= clip は共有 content への「窓」)。端 trim が
     // content を書き換えなくなり、linked clip の開始・終了が独立する。v31 以前は
     // `serde(default)` の 0.0 で読める (migration 関数不要)。
-    assert_eq!(CURRENT_VERSION, 32);
+    // v33 (r.md #50 の follow-up): master の出力音量を `Song.master_gain` として
+    // 保存する。従来は GUI のセッション状態にしか無く、保存しても開き直すと 0dB に
+    // 戻っていた。v32 以前は `serde(default)` の 1.0 (unity) で読める。
+    assert_eq!(CURRENT_VERSION, 33);
 }
 
 #[test]

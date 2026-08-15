@@ -85,6 +85,8 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "undo", keys: &["Ctrl+Z"], category: ShortcutCategory::Edit, description: "元に戻す", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "redo", keys: &["Ctrl+Shift+Z", "Ctrl+Y"], category: ShortcutCategory::Edit, description: "やり直し", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "daw.toggle_undo_history", keys: &["Ctrl+Alt+Z"], category: ShortcutCategory::Edit, description: "編集履歴パネルを開く / 閉じる", hidden: false, forward_from_external_window: false },
+    // r.md #48: 設定 (テーマ選択)。REAPER の Options > Preferences と同じ Ctrl+P。
+    ShortcutDef { name: "daw.toggle_settings", keys: &["Ctrl+P"], category: ShortcutCategory::Edit, description: "設定を開く / 閉じる", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "cut", keys: &["Ctrl+X"], category: ShortcutCategory::Edit, description: "カット (選択中の面)", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "copy", keys: &["Ctrl+C"], category: ShortcutCategory::Edit, description: "コピー (選択中の面)", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "paste", keys: &["Ctrl+V"], category: ShortcutCategory::Edit, description: "ペースト", hidden: false, forward_from_external_window: false },
@@ -128,6 +130,7 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.widen_grid", keys: &["2"], category: ShortcutCategory::GridView, description: "グリッドを粗く", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "daw.toggle_triplet", keys: &["3"], category: ShortcutCategory::GridView, description: "三連符グリッド ON / OFF", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "daw.toggle_preview_window", keys: &["F12"], category: ShortcutCategory::GridView, description: "ビデオプレビューウィンドウを開く / 閉じる", hidden: false, forward_from_external_window: false },
+    ShortcutDef { name: "daw.toggle_master_panel", keys: &["Ctrl+Alt+M"], category: ShortcutCategory::GridView, description: "マスターパネル (フェーダー + 各種メーター) を開く / 閉じる", hidden: false, forward_from_external_window: false },
     // ----- オーディオエディタ -----
     ShortcutDef { name: "daw.duplicate_audio_event", keys: &["Ctrl+D"], category: ShortcutCategory::AudioEditor, description: "オーディオイベントを複製", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "daw.next_audio_event", keys: &["Ctrl+]"], category: ShortcutCategory::AudioEditor, description: "次のオーディオイベントへ", hidden: false, forward_from_external_window: false },

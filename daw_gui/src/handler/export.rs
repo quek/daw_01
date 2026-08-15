@@ -117,11 +117,13 @@ impl AppData {
         range: Option<(u64, u64)>,
         write_mod_sidecar: bool,
     ) {
-        // 書き出しは freewheel render。 再生中なら先に停止する (live dispatch と
-        // export dispatch が同じ plugin host worker slot で衝突するのを防ぐ)。
-        if self.transport.is_playing {
-            self.stop();
-        }
+        // 書き出しは freewheel render。 先に停止する (live dispatch と export
+        // dispatch が同じ plugin host worker slot で衝突するのを防ぐ)。
+        // r.md #51: `is_playing` で条件を付けない。 これは観測値なので、走り始めた
+        // 直後は false のことがあり、そこで Stop を送らないと engine が走ったまま
+        // freewheel に入り、書き出し後に勝手に再生が続く。 stop() は録音セッションの
+        // クローズも兼ねる (録音中の書き出しで Rec が点きっぱなしにならない)。
+        self.stop();
         // ensure-synced: freewheel 開始前に最新 song + project_dir を daw_audio へ
         // 確実に届ける (SetRenderMode(Offline) より前)。 epoch 未変化 (= frame flush
         // 済) なら no-op で engine は既に最新を持つ。

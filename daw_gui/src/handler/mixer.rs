@@ -13,7 +13,15 @@ impl AppData {
         // +6 dB (amp 2.0) までブースト可 — フェーダーの MeterScale 上端に一致
         // (r.md #11。 unity 上限だと 0dB より上げると即 0dB に戻っていた)。
         let clamped = gain.clamp(0.0, MAX_TRACK_GAIN);
-        self.transport.master_gain = clamped;
+        // マスター音量は **曲の一部** なので Song が SSoT (= 保存され、変えると
+        // dirty が立つ)。`set_track_volume` と同じ形: 実際に変わったときだけ
+        // epoch を bump し (drag 途中の crash でも autosave に乗る)、engine へは
+        // 軽量 IPC で即座に届ける (LoadSong の同期待ちでフェーダーが遅れない)。
+        self.edit_song_checked(|song| {
+            let changed = (song.master_gain - clamped).abs() > f32::EPSILON;
+            song.master_gain = clamped;
+            changed
+        });
         self.send_audio(AudioCommand::SetMasterGain(clamped));
     }
 
@@ -571,6 +579,22 @@ impl AppData {
         };
         let msg = AudioCommand::SetTrackArmed { track: track_id, armed };
         self.send_audio(msg);
+        if !armed {
+            // r.md #51: arm を外した瞬間に、そのトラックで鳴らしていたモニター音を
+            // 止める。 note-off はもう届かない (armed でないので送り先から外れる) ので、
+            // ここで消さないと鍵盤を離しても鳴り続ける。
+            let held: Vec<u8> = self
+                .recording
+                .monitor_notes
+                .iter()
+                .filter(|(t, _)| *t == track_id)
+                .map(|(_, p)| *p)
+                .collect();
+            for pitch in held {
+                self.recording.monitor_notes.remove(&(track_id, pitch));
+                self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
+            }
+        }
     }
 
     pub(crate) fn on_track_peaks_tick(&mut self, peaks: &[(f32, f32)]) {

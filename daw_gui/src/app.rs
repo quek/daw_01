@@ -152,24 +152,36 @@ impl AppData {
             })
             .unwrap_or_default();
 
+        // プロジェクト非依存のアプリ設定は **1 回だけ** 読む (旧実装はフィールドごとに
+        // 同じ JSON を 3 回 load していた)。 `app_dirs == None` (テスト) では既定値。
+        let app_config = app_dirs
+            .as_ref()
+            .map(|d| crate::app_config::load(d.app_config()))
+            .unwrap_or_default();
+        // r.md #48: 保存された id からテーマを解決する。ファイルが消えていても
+        // `resolve` が既定テーマにフォールバックするので起動できる。
+        let theme = crate::theme::resolve(
+            app_dirs.as_ref().map(common::app_dirs::AppDirs::themes_dir).as_deref(),
+            &app_config.theme,
+        );
+
         let app = Self {
+            theme,
             song_doc: SongDoc::new(song),
             transport: TransportState {
                 metronome_enabled: false,
                 is_playing: false,
+                preroll_remaining: 0,
                 loop_region: common::model::LoopRegion::default(),
                 playhead_beat: None,
                 playback_origin_beat: None,
                 panic_reinit_due: None,
                 panic_release_pending: false,
-                master_gain: 1.0,
-                peak_l_display: 0.0,
-                peak_r_display: 0.0,
-                peak_l_norm: 0.0,
-                peak_r_norm: 0.0,
+                master_meter: crate::master_meter::MasterMeterSnapshot::default(),
                 track_peak_display: initial_peak_display,
                 mod_scalars: Vec::new(),
                 pending_play: false,
+                pending_play_record: None,
                 export_stage: None,
                 export_progress_at: None,
                 export_cancel: None,
@@ -252,12 +264,11 @@ impl AppData {
             },
             recording: RecordingState {
                 recording_mode: common::model::RecordingMode::default(),
-                midi_recording: false,
-                midi_recording_pending: false,
+                requested: false,
+                live: false,
                 count_in_bars: 0,
-                count_in_total_samples: 0,
-                count_in_remaining_samples: 0,
                 midi_recording_active_notes: std::collections::HashMap::new(),
+                monitor_notes: std::collections::HashSet::new(),
                 metronome_enabled_pre_recording: None,
                 midi_learn_target: None,
                 active_param_gestures: std::collections::HashSet::new(),
@@ -295,19 +306,22 @@ impl AppData {
                 pianoroll_snap_choice: crate::view::snap::CHOICE_PIANOROLL_DEFAULT,
                 arrange_snap_enabled: true,
                 arrange_snap_choice: crate::view::snap::CHOICE_ARRANGE_DEFAULT,
-                resource_monitor_enabled: app_dirs
-                    .as_ref()
-                    .map(|d| crate::app_config::load(d.app_config()).resource_monitor_enabled)
-                    .unwrap_or(true),
+                resource_monitor_enabled: app_config.resource_monitor_enabled,
                 // r.md #29: 編集履歴 window の開閉/位置/サイズを app_config から復元。
-                undo_history_open: app_dirs
-                    .as_ref()
-                    .map(|d| crate::app_config::load(d.app_config()).undo_history_open)
-                    .unwrap_or(false),
-                undo_history_rect: app_dirs
-                    .as_ref()
-                    .and_then(|d| crate::app_config::load(d.app_config()).undo_history_rect)
+                undo_history_open: app_config.undo_history_open,
+                undo_history_rect: app_config
+                    .undo_history_rect
                     .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
+                // r.md #48: 設定 window の開閉/位置/サイズ。
+                settings_open: app_config.settings_open,
+                settings_rect: app_config
+                    .settings_rect
+                    .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
+                // r.md #50: マスターパネルの開閉 / 幅 / セクション配分 / メーター設定。
+                master_panel_open: app_config.master_panel_open,
+                master_panel_w: app_config.master_panel_w,
+                master_panel_sections: app_config.master_panel_sections,
+                meter_settings: app_config.meter,
                 is_help_open: false,
                 app_dirs,
                 recent_files,
@@ -324,6 +338,9 @@ impl AppData {
             },
             ui_ephemeral: UiEphemeral {
                 arr_label_cache: std::cell::RefCell::default(),
+                // r.md #48: 設定 window を開いたときに `refresh_available_themes` が埋める。
+                // 起動時に settings_open が復元されるケースは `new()` 末尾で埋める。
+                available_themes: Vec::new(),
                 loaded_project_id: 0,
                 project_generation: 0,
                 video_texture_cache: std::collections::HashMap::new(),
@@ -334,6 +351,7 @@ impl AppData {
                 arrangement_hover_clip: None,
                 arrange_hovered_track: None,
                 mixer_hovered_track: None,
+                master_gain_dragging: false,
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,
                 pianoroll_hover_note: None,
@@ -413,12 +431,34 @@ impl AppData {
                 #[cfg(windows)]
                 main_window_hwnd: None,
             },
+            // r.md #49: 起動直後は「アクティブ」から始める。winit は起動時の
+            // `Focused(true)` を必ずしも送らないので、false 始まりだと最初の
+            // クリックまで画面が描かれない。
+            activity: crate::state::ActivityState {
+                main_focused: true,
+                ..Default::default()
+            },
+            // r.md #50: メーター設定の初期値は app_config から。`active` は
+            // 「パネルが描かれているか」で、view が毎フレーム同期する。
+            meter_control: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::master_meter::settings::MeterControl {
+                    settings: app_config.meter,
+                    loudness_reset_epoch: 0,
+                    peak_reset_epoch: 0,
+                    active: app_config.master_panel_open,
+                },
+            )),
         };
         // recent_files / recent_saved の path 列から filename label cache を
         // 1 回構築。 push_recent / push_recent_saved 経由の更新でも自動的に
         // 同期されるので、 初回のみここで初期化する。
         let mut app = app;
         app.init_recent_labels();
+        // r.md #48: 設定 window が開いた状態で復元されたときは、最初のフレームまでに
+        // テーマ一覧が要る (描画側は毎フレーム作り直さない)。
+        if app.ui_prefs.settings_open {
+            app.refresh_available_themes();
+        }
         // cache が旧 port-probe 版 (PluginEntry の 3 bool 未取得) なら、
         // 起動時に 1 回だけ自動で再 probe (rescan) して port 構成を埋める。 production
         // (app_dirs=Some) のみ — test は app_dirs=None なので実システム scan を避ける。
@@ -646,6 +686,74 @@ impl AppData {
             // 開閉状態は app_config に永続 (再起動を跨いで復元)。
             AppEvent::ToggleUndoHistory => {
                 self.ui_prefs.undo_history_open = !self.ui_prefs.undo_history_open;
+                self.persist_app_config();
+            }
+            // r.md #48: 設定 window の開閉トグル (Edit メニュー / ✕ / Esc)。
+            AppEvent::ToggleSettings => {
+                self.ui_prefs.settings_open = !self.ui_prefs.settings_open;
+                if self.ui_prefs.settings_open {
+                    // テーマ一覧の実体は `themes/` の read_dir + JSON パース。
+                    // **開いたときに 1 回だけ**取る (描画ループでディスクを叩かない)。
+                    // 開き直せば新しく置いたファイルが出るので再起動は要らない。
+                    self.refresh_available_themes();
+                }
+                self.persist_app_config();
+            }
+            // r.md #50: 画面右端のマスターパネルの開閉 (View メニュー / Ctrl+Alt+M)。
+            AppEvent::ToggleMasterPanel => {
+                self.ui_prefs.master_panel_open = !self.ui_prefs.master_panel_open;
+                self.sync_meter_control();
+                self.persist_app_config();
+            }
+            // ドラッグ中は状態だけ更新し、release でまとめてディスクへ書く
+            // (毎フレーム app_config.json を同期書き込みしない — 設定 window /
+            // 編集履歴 window と同じ commit-on-release の流儀)。
+            AppEvent::SetMasterPanelWidth { w, commit } => {
+                use crate::handler::master_panel::{MASTER_PANEL_MAX_W, MASTER_PANEL_MIN_W};
+                let next = w.clamp(MASTER_PANEL_MIN_W, MASTER_PANEL_MAX_W);
+                let changed = (next - self.ui_prefs.master_panel_w).abs() >= 0.5;
+                if changed {
+                    self.ui_prefs.master_panel_w = next;
+                }
+                if commit {
+                    self.persist_app_config();
+                }
+            }
+            AppEvent::SetMasterPanelSectionRatios { ratios, commit } => {
+                let sum: f32 = ratios.iter().sum();
+                if sum <= 0.0 {
+                    return;
+                }
+                let next = [
+                    ratios[0] / sum,
+                    ratios[1] / sum,
+                    ratios[2] / sum,
+                    ratios[3] / sum,
+                ];
+                let changed = !next
+                    .iter()
+                    .zip(self.ui_prefs.master_panel_sections.iter())
+                    .all(|(a, b)| (a - b).abs() < 1e-4);
+                if changed {
+                    self.ui_prefs.master_panel_sections = next;
+                }
+                if commit {
+                    self.persist_app_config();
+                }
+            }
+            AppEvent::SetMeterSettings(settings) => {
+                self.ui_prefs.meter_settings = *settings;
+                self.sync_meter_control();
+                self.persist_app_config();
+            }
+            // EBU Tech 3341 §2.2: 積算値は「同時に」リセットできること。
+            AppEvent::ResetLoudness => self.reset_master_loudness(),
+            AppEvent::ResetMasterPeakHold => self.reset_master_peak_hold(),
+            // r.md #48: テーマ切替。 id からパレットを解決して差し替えるだけで、
+            // 実際に画面へ反映するのは runner (`UiHost::set_palette` + 描画キャッシュ破棄)。
+            AppEvent::SetTheme(id) => {
+                let dirs = self.ui_prefs.app_dirs.as_ref().map(common::app_dirs::AppDirs::themes_dir);
+                self.theme = crate::theme::resolve(dirs.as_deref(), &id);
                 self.persist_app_config();
             }
             // r.md #29: 履歴リストの行 click → その state へ一発 Undo/Redo。
@@ -1347,18 +1455,43 @@ impl AppData {
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
             }
-            AppEvent::Tick { samples, peak_l, peak_r, preroll } => {
-                // Phase 7 B4 Step C: preroll mirror で count-in 完了を検知。
-                // midi_recording_pending == true かつ preroll == 0 なら、
-                // midi_recording に昇格して以後の MIDI input を armed track に
-                // 書き込む。 残量そのものは transport の Rec ボタンが
-                // 「残り小節数」 を出すのに使う (count_in_remaining_bars)。
-                self.recording.count_in_remaining_samples = preroll;
-                if self.recording.midi_recording_pending && preroll == 0 {
-                    self.recording.midi_recording_pending = false;
-                    self.recording.midi_recording = true;
+            // マスターフェーダーの drag を 1 undo step に束ねる。これが無いと
+            // per-frame の `SetMasterGain` が各々 snapshot を積み、1 回の drag で
+            // undo 履歴が埋まる (group transform / inspector scrub と同じ罠)。
+            AppEvent::BeginMasterGainDrag => {
+                self.ui_ephemeral.master_gain_dragging = true;
+                self.song_doc.begin_gesture();
+            }
+            AppEvent::EndMasterGainDrag => {
+                self.ui_ephemeral.master_gain_dragging = false;
+                self.song_doc.end_gesture();
+            }
+            AppEvent::Tick {
+                samples,
+                preroll,
+                playing,
+                recording_live,
+            } => {
+                // r.md #51: engine が所有する状態をここで観測する。
+                // **`transport.is_playing` / `recording.live` を書くのはここだけ**
+                // (他所で立てると engine の実状態と食い違い、Rec 単独録音で
+                // プレイヘッド凍結・オートメーション未記録・曲末で止まらない、が
+                // 一度に起きていた)。
+                self.transport.preroll_remaining = preroll;
+                self.recording.live = recording_live;
+                let stopped = self.transport.is_playing && !playing;
+                self.transport.is_playing = playing;
+                self.on_tick(samples);
+                if stopped {
+                    // 手動停止・曲末 auto-stop・書き出し・パニックのどれで止まっても
+                    // ここへ収束する (停止ホームへの復帰と録音セッションのクローズ)。
+                    self.on_transport_stopped();
                 }
-                self.on_tick(samples, peak_l, peak_r);
+            }
+            // r.md #50: マスターメーターの表示状態は解析器が丸ごと作るので、
+            // ここは差し替えるだけ (GUI 側で弾道を二重に掛けない)。
+            AppEvent::MasterMeterTick(snapshot) => {
+                self.transport.master_meter = *snapshot;
             }
             AppEvent::SetTrackVolume { track, amp } => {
                 self.set_track_volume(track, amp);

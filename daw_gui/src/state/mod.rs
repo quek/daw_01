@@ -13,8 +13,10 @@ pub mod media;
 pub mod recording;
 pub mod ui_prefs;
 pub mod ui_ephemeral;
+pub mod activity;
 
 pub use song_doc::{EditScope, SongDoc, StreamGesture};
+pub use activity::ActivityState;
 pub use transport::TransportState;
 pub use selection::SelectionState;
 pub use ipc::IpcState;
@@ -44,6 +46,18 @@ pub struct AppData {
     pub ui_prefs: UiPrefs,
     /// 一時 UI 状態 (hover / picker / rename / menu / modal / scrub)。
     pub ui_ephemeral: UiEphemeral,
+    /// r.md #49: アプリの窓がアクティブか (省電力判定の材料)。
+    pub activity: ActivityState,
+    /// r.md #50: テレメトリスレッドの `MasterAnalyzer` へ渡す設定とリセット要求。
+    /// UI スレッドが書き、解析スレッドが 1 ティック 1 回読む唯一の口
+    /// (逆向きは `AppEvent::MasterMeterTick`)。
+    pub meter_control: std::sync::Arc<std::sync::Mutex<crate::master_meter::settings::MeterControl>>,
+    /// r.md #48: いま有効なテーマ (汎用パレット + DAW 固有トークン) の **SSoT**。
+    /// view は `app.theme.core.<token>` / `app.theme.daw.<token>` で色を読む。
+    /// `theme.core` は `UiHost` が持つ実体と同じ `Arc` で、runner が毎フレーム
+    /// `UiHost::set_palette` に流し込む (変化していたら描画キャッシュを捨てる)。
+    /// 選択中の id は `theme.id` が持つので別フィールドに複製しない。
+    pub theme: crate::theme::Theme,
 }
 
 impl AppData {

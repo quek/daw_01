@@ -11,7 +11,24 @@ use std::sync::Arc;
 
 use daw_ui_core::{Edit, FlexDirection, Gap, InputAccumulator, LayoutPass, NodeId, Padding, UiHost};
 use daw_ui_platform::{AppEvent, AppHost, PhysicalSize, WindowBackend, winit_backend};
-use daw_ui_core::{FaderResponse, KnobResponse, TextInputResponse, ToggleButtonStyle};
+use daw_ui_core::{
+    FaderResponse, KnobResponse, KnobStyle, ScrubableNumberFormat, TextInputResponse,
+    ToggleButtonStyle,
+};
+
+/// pan の表記 (`"L50"` / `"C"` / `"R100"`)。 knob の値は 0..=1 なので `pan_lr` で
+/// 中央 0 の -1..=1 に直してから渡す。
+const PAN_FORMAT: ScrubableNumberFormat = ScrubableNumberFormat::SignedLabeled {
+    neg: "L",
+    pos: "R",
+    center: "C",
+    scale: 100.0,
+};
+
+/// knob の正規化値 (0..=1) → 中央 0 の L/R 値 (-1..=1)。
+fn pan_lr(norm: f32) -> f64 {
+    f64::from(norm) * 2.0 - 1.0
+}
 use daw_ui_renderer::{Color, Rect, RectCommand, Renderer, Scene};
 use winit::window::WindowAttributes;
 
@@ -272,27 +289,16 @@ impl App {
                     );
 
                     let kresp: KnobResponse =
-                        ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], 0.5, move |v| {
+                        // pan = bipolar param → 弧はセンタ (12 時) 起点 + センタ notch + センタ吸着。
+                        ui.knob_at(("ch_pan", i), knob_rect, m.pans[i], 0.5, &KnobStyle::BIPOLAR, move |v| {
                             Edit::mutate(move |m: &mut MixerModel| {
                                 m.pans[i] = v;
-                                let lr = (v - 0.5) * 2.0; // -1..1
-                                m.last_action = if lr.abs() < 0.02 {
-                                    format!("ch{} pan = C", i + 1)
-                                } else if lr < 0.0 {
-                                    format!("ch{} pan = L{:.0}", i + 1, lr.abs() * 100.0)
-                                } else {
-                                    format!("ch{} pan = R{:.0}", i + 1, lr * 100.0)
-                                };
+                                m.last_action =
+                                    format!("ch{} pan = {}", i + 1, PAN_FORMAT.format_value(pan_lr(v)));
                             })
                         }, None);
-                    let lr = (kresp.displayed_value - 0.5) * 2.0;
-                    let pan_label = if lr.abs() < 0.02 {
-                        "C".to_string()
-                    } else if lr < 0.0 {
-                        format!("L{:.0}", lr.abs() * 100.0)
-                    } else {
-                        format!("R{:.0}", lr * 100.0)
-                    };
+                    // 表記は `SignedLabeled` に任せる ("L50" / "C" / "R100")。
+                    let pan_label = PAN_FORMAT.format_value(pan_lr(kresp.displayed_value));
                     ui.label_at(
                         ("pan_label", i),
                         &pan_label,
@@ -311,7 +317,7 @@ impl App {
                         on_color: Color::rgb(0.55, 0.20, 0.20),
                         radius: 4.0,
                         font_size: 13.0,
-                        ..ToggleButtonStyle::default()
+                        ..ToggleButtonStyle::from_palette(ui.palette())
                     };
                     let _ = ui.toggle_button_at(
                         ("ch_mute", i),

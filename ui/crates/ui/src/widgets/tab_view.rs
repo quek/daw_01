@@ -10,7 +10,6 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
-use crate::theme;
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
@@ -59,10 +58,11 @@ impl<'b, 'a, M: ?Sized + 'static> TabBuilder<'b, 'a, M> {
         }
 
         let is_sel = i == self.selected;
+        let p = self.ui.palette();
         let fill = if is_sel {
-            theme::PANEL_RAISED
+            p.panel_raised
         } else if inside {
-            theme::PANEL
+            p.panel
         } else {
             Color::TRANSPARENT
         };
@@ -82,11 +82,7 @@ impl<'b, 'a, M: ?Sized + 'static> TabBuilder<'b, 'a, M> {
             top: tab_rect.y + (tab_rect.h - TAB_FONT * 1.2) * 0.5,
             font_size: TAB_FONT,
             line_height: TAB_FONT * 1.2,
-            color: if is_sel {
-                theme::TEXT
-            } else {
-                theme::TEXT_DIM
-            },
+            color: if is_sel { p.text } else { p.text_dim },
             clip_rect: None,
             ..GlyphArea::default()
         });
@@ -163,9 +159,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     {
         // バー背景
         let bar_rect = Rect { x: rect.x, y: rect.y, w: rect.w, h: TAB_BAR_H };
+        let p = self.palette();
         self.push_rect(RectCommand {
             rect: bar_rect,
-            fill: theme::HEADER,
+            fill: p.header,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],

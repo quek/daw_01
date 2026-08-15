@@ -75,7 +75,7 @@ fn render_n_waveforms(
                     vertical_gain: 1.0,
                     reversed: false,
                 },
-                WaveformStyle::default(),
+                WaveformStyle::from_palette(ui.palette()),
             );
             black_box(resp);
         }

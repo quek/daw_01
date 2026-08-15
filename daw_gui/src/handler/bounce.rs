@@ -121,6 +121,10 @@ impl AppData {
         let track = self.song_doc.song().tracks.get(target.track as usize)?;
         let mut isolated = self.song_doc.song().clone();
         isolated.master_fx_chain.clear();
+        // master fx と同じ理由でマスター音量も外す。焼き込むと、再生時に
+        // マスターフェーダーが**もう一度**掛かって二重に効く。
+        // (master_gain が Song に入る前は engine の atomic 経由で漏れていた。)
+        isolated.master_gain = 1.0;
         let mut kept = track.clone();
         kept.parent_group_id = None;
         kept.sends.clear();
@@ -251,6 +255,10 @@ impl AppData {
         // して復元する。 この isolated 送出は epoch flush とは独立の明示経路 (isolated は
         // song_doc の編集ではないので edit_epoch は変わらず、 last_synced_epoch も
         // 触らない → frame flush は no-op のままで isolated を上書きしない)。
+        // engine のマスター音量は atomic なので、送る Song に合わせて明示的に
+        // 揃える (bounce 中は unity)。「engine が持つ song と master_gain は常に
+        // 一致する」を LoadSong の全送出点で保つ。
+        self.send_audio(AudioCommand::SetMasterGain(isolated.master_gain));
         self.send_audio(AudioCommand::LoadSong(isolated));
         self.send_plugin(PluginCommand::SetRenderMode(
             common::protocol::RenderMode::Offline,
@@ -348,6 +356,8 @@ impl AppData {
     /// 同期は不要 (song 内容は bounce 前と同一)。
     pub(crate) fn restore_engine_song_after_bounce(&mut self) {
         let song = self.song_doc.song().clone();
+        // bounce 中に unity へ落としたマスター音量も一緒に戻す。
+        self.send_audio(AudioCommand::SetMasterGain(song.master_gain));
         self.send_audio(AudioCommand::LoadSong(song));
     }
 

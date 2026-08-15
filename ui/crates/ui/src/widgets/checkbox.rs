@@ -6,7 +6,6 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -125,10 +124,11 @@ fn draw_checkbox<M: ?Sized + 'static>(
     let box_y = rect.y + (rect.h - BOX_SIZE) * 0.5;
     let box_rect = Rect { x: rect.x, y: box_y, w: BOX_SIZE, h: BOX_SIZE };
 
-    let base = theme::CONTROL;
-    let hover_c = theme::CONTROL_HOVER;
-    let press_c = theme::ACCENT;
-    let checked_c = theme::ACCENT;
+    let p = ui.palette();
+    let base = p.control;
+    let hover_c = p.control_hover;
+    let press_c = p.accent;
+    let checked_c = p.accent;
 
     let bg_fill = if checked {
         checked_c
@@ -140,9 +140,9 @@ fn draw_checkbox<M: ?Sized + 'static>(
         base
     };
     let border_c = if hovered || checked {
-        theme::BORDER_FOCUS
+        p.border_focus
     } else {
-        theme::BORDER
+        p.border
     };
 
     ui.push_rect(RectCommand {
@@ -163,7 +163,8 @@ fn draw_checkbox<M: ?Sized + 'static>(
         let p1 = [cx + s * 0.22, cy + s * 0.50];
         let p2 = [cx + s * 0.42, cy + s * 0.72];
         let p3 = [cx + s * 0.78, cy + s * 0.30];
-        let check_color = theme::TEXT_ON_ACCENT;
+        // チェック時の塗りは accent なので、その上に乗るインクは accent 面用トークン。
+        let check_color = p.ink_on_accent();
         ui.push_lines(LineBatch {
             segments: vec![
                 LineSegment { a: p1, b: p2, color: check_color },
@@ -187,7 +188,7 @@ fn draw_checkbox<M: ?Sized + 'static>(
             top: ty,
             font_size,
             line_height: line_h,
-            color: theme::TEXT,
+            color: p.text,
             clip_rect: None,
             ..GlyphArea::default()
         });

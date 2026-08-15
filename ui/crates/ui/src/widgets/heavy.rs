@@ -92,6 +92,12 @@ impl<'b, 'a, M: ?Sized + 'static> HeavyCtx<'b, 'a, M> {
         self.ui.pointer()
     }
 
+    /// このフレームの色パレット ([`crate::Ui::palette`] と同じ実体)。
+    #[must_use]
+    pub fn palette(&self) -> &'a crate::theme::Palette {
+        self.ui.palette()
+    }
+
     /// 画面サイズ。
     pub fn screen(&self) -> PhysicalSize {
         self.ui.screen()

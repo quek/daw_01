@@ -29,6 +29,7 @@ const WIRE_SOURCES: &[&str] = &[
     "src/process_data.rs",
     "src/audio_bridge.rs",
     "src/metrics_bridge.rs",
+    "src/scope_bridge.rs",
     "src/worker_bridge.rs",
     "src/plugin_ref.rs",
 ];

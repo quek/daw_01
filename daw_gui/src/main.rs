@@ -213,6 +213,8 @@ fn run_gui(
         .expect("Bootstrap.incoming_rx already taken");
     let bridge = Arc::clone(&bootstrap.bridge);
     let metrics = Arc::clone(&bootstrap.metrics);
+    // r.md #50: マスター出力サンプルのリング (テレメトリポーラの解析器が読む)。
+    let scope = Arc::clone(&bootstrap.scope);
     let job = Arc::clone(&bootstrap.job);
     let plugin_db = bootstrap.plugin_db.clone();
     let supervisor = Arc::clone(&bootstrap.supervisor);
@@ -258,9 +260,24 @@ fn run_gui(
             // resource monitor (r.md #3): per-plugin CPU の直接読み出し用に
             // MetricsBridge ハンドルを AppData へ持たせる。
             app.ipc.metrics_bridge = Some(Arc::clone(&metrics));
+            // r.md #49: smoke test は preview 窓を `PrintWindow` で pixel capture して
+            // 検証する。窓がフォーカスを得るかは実行環境次第なので、省電力で描画が
+            // 止まると「真っ黒 = 視覚回帰」と誤検出しうる。検証対象は描画結果なので
+            // この経路だけアクティブ判定を固定する。
+            app.activity.force_active = smoke_test_fixture.is_some() || smoke_test_text;
 
-            spawn_playhead_poller(bridge, Arc::clone(&metrics), proxy.clone());
-            spawn_resource_sysinfo_poller(proxy.clone());
+            // r.md #49: 省電力中は背景 poller 自身に止まってもらう
+            // (`AppData` 側が毎イベントで最新値を書き込む共有フラグ)。
+            let awake = Arc::clone(&app.activity.awake);
+            spawn_playhead_poller(
+                bridge,
+                Arc::clone(&metrics),
+                scope,
+                Arc::clone(&app.meter_control),
+                proxy.clone(),
+                Arc::clone(&awake),
+            );
+            spawn_resource_sysinfo_poller(proxy.clone(), awake);
             spawn_autosave_timer(proxy.clone());
             spawn_midi_input(proxy.clone());
             spawn_incoming_bridge(incoming_rx, proxy.clone());
@@ -371,29 +388,101 @@ fn spawn_autosave_timer(proxy: EventLoopProxy<AppEvent>) {
     });
 }
 
+/// r.md #49: 省電力中の poll 間隔。
+///
+/// 完全に止めないのは `on_tick` に同居する 3 つの watchdog (panic 遅延 reinit /
+/// 書き出し 60s / plugin state round-trip) を生かしておくため — いずれも閾値が
+/// 秒オーダーなので数 Hz で足りる。
+///
+/// 1 秒まで伸ばさないのは**復帰の応答性**のため。フォーカスが戻っても、寝ている
+/// スレッドは起きるまで間隔ぶん待つので、そのまま復帰後のメーター / プレイヘッドの
+/// 遅れになる。値が変わらなければ再描画は起きない (指紋比較) ので、この頻度の
+/// 起床自体はほぼ無コスト。30Hz のうち 7/8 の起床が消える。
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// リソースモニターの表示更新レート。ステータスバーの読み値 (整数パーセント) は
+/// 毎 tick 揺れるので、30Hz で流すと **停止中でも DSP% が変わるだけで全画面を
+/// 30fps 描き直す**ことになる。表示に必要なのは数 Hz なので tick を間引く
+/// (REAPER が `Meter update frequency` を別設定に持っているのと同じ理由)。
+const METRICS_TICK_DIVISOR: u32 = 8;
+
 fn spawn_playhead_poller(
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
+    scope: Arc<common::scope_bridge::ScopeBridgeHandle>,
+    meter_control: Arc<
+        std::sync::Mutex<daw_gui::master_meter::settings::MeterControl>,
+    >,
     proxy: EventLoopProxy<AppEvent>,
+    awake: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
         let mut mod_buf: Vec<f32> = Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES);
+        // r.md #50: マスター出力サンプルのリング読み手と、そこから全メーターを
+        // 導く解析器。ここが唯一の読み手 (単一 reader 前提のカーソル)。
+        let mut scope_reader = scope.reader();
+        let mut scope_buf: Vec<[f32; 2]> =
+            Vec::with_capacity(common::scope_bridge::max_read_frames(scope.sample_rate()));
+        let mut analyzer =
+            daw_gui::master_meter::MasterAnalyzer::new(scope.sample_rate());
+        let mut last_meter_at = std::time::Instant::now();
+        let mut tick_count: u32 = 0;
         loop {
-            std::thread::sleep(Duration::from_millis(33));
+            let awake_now = awake.load(std::sync::atomic::Ordering::Acquire);
+            std::thread::sleep(if awake_now {
+                Duration::from_millis(33)
+            } else {
+                IDLE_POLL_INTERVAL
+            });
+            tick_count = tick_count.wrapping_add(1);
             let samples = bridge.playhead_samples();
-            let (peak_l, peak_r) = bridge.peaks();
             let preroll = bridge.preroll_remaining();
             if proxy
                 .send_event(AppEvent::Tick {
                     samples,
-                    peak_l,
-                    peak_r,
                     preroll,
+                    // r.md #51: 「走っているか」「録音してよいか」は engine が所有する
+                    // 事実。GUI は他の telemetry と同じ面で観測する。
+                    playing: bridge.playing(),
+                    recording_live: bridge.recording_live(),
                 })
                 .is_err()
             {
                 break;
+            }
+            // r.md #50: マスターメーター。パネルが閉じているときは解析ごと止める
+            // (リングは読み捨ててカーソルだけ進め、再表示で古い音が流れ込まない
+            // ようにする)。
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_meter_at).as_secs_f32();
+            last_meter_at = now;
+            scope_buf.clear();
+            let outcome = scope_reader.read(&scope, &mut scope_buf);
+            let control = meter_control.lock().ok().map(|c| daw_gui::master_meter::settings::MeterControl {
+                settings: c.settings,
+                loudness_reset_epoch: c.loudness_reset_epoch,
+                peak_reset_epoch: c.peak_reset_epoch,
+                active: c.active,
+            });
+            if let Some(control) = control
+                && control.active
+            {
+                let snapshot = analyzer
+                    .tick(
+                        &control,
+                        scope.sample_rate(),
+                        &scope_buf,
+                        elapsed,
+                        outcome.dropped > 0,
+                    )
+                    .clone();
+                if proxy
+                    .send_event(AppEvent::MasterMeterTick(Box::new(snapshot)))
+                    .is_err()
+                {
+                    break;
+                }
             }
             // docs/plan_modulation.md §4.2: poll the modulation scalars on the
             // same ~30Hz tick as peaks and stream them to the model so visual
@@ -418,7 +507,11 @@ fn spawn_playhead_poller(
                 break;
             }
             // resource monitor (r.md #3): DSP load (peak は swap でリセット) /
-            // xrun / buffer を同じ 30Hz tick で読み UI へ流す。
+            // xrun / buffer を読み UI へ流す。
+            // r.md #49: 表示レートは playhead より低くてよいので間引く。
+            if !tick_count.is_multiple_of(METRICS_TICK_DIVISOR) {
+                continue;
+            }
             let (buffer_frames, sample_rate) = metrics.buffer_info();
             if proxy
                 .send_event(AppEvent::MetricsTick {
@@ -439,12 +532,21 @@ fn spawn_playhead_poller(
 /// resource monitor (r.md #3): daw_01 セッション (daw_gui + 子プロセス群) の
 /// system CPU% と常駐メモリを sysinfo で ~1Hz ポーリングし UI へ流す。 DSP load
 /// とは別物の「アプリ全体の重さ」。 RT パス外の専用スレッド。
-fn spawn_resource_sysinfo_poller(proxy: EventLoopProxy<AppEvent>) {
+fn spawn_resource_sysinfo_poller(
+    proxy: EventLoopProxy<AppEvent>,
+    awake: Arc<std::sync::atomic::AtomicBool>,
+) {
     std::thread::spawn(move || {
         let self_pid = sysinfo::get_current_pid().ok();
         let mut sys = sysinfo::System::new();
         loop {
             std::thread::sleep(Duration::from_millis(1000));
+            // r.md #49: `refresh_processes(All)` は**全プロセス列挙**で、この
+            // poller の中で圧倒的に重い。省電力中は読み手 (リソースモニター) が
+            // 見えていないので、送るのを止めるのではなく **poll 自体をしない**。
+            if !awake.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
             sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             let Some(self_pid) = self_pid else {
                 continue;

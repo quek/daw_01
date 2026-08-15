@@ -8,14 +8,13 @@
 use daw_ui_core::{
     Edit, MsegAction, MsegEditorStyle, MsegNode, ScrubableNumberFormat, ScrubableNumberStyle, Ui,
 };
-use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
 
-// `TEXT` (ラベル色) と `SCRUB_STYLE_INSPECTOR` (数値 field の base style) は
-// inspector 全体で共有する定数なので親モジュールに置いたまま借りる。
-use super::{SCRUB_STYLE_INSPECTOR, TEXT};
+// 数値 field の base style は inspector 全体で共有するので親モジュールから借りる
+// (ラベル色は `app.theme.core.text` を直接読む)。
+use super::scrub_style;
 
 // generator の rate (tempo 同期 division か Free Hz) 選択肢。
 const MOD_RATE_DIVS: [(&str, u32, u32); 9] = [
@@ -70,22 +69,26 @@ fn mod_rate_control(
     }
 }
 
-// モジュレーター用グラフィカルエディタの色味。
-const MOD_EDITOR_STYLE: MsegEditorStyle = MsegEditorStyle {
-    bg: theme::INSET_BG,
-    grid: theme::GRID_LINE.with_alpha(0.06),
-    line_color: theme::CURVE,
-    line_width_px: 2.0,
-    node_color: theme::TEXT,
-    // node の hover (淡黄) / drag (珊瑚) は curve エディタ固有の操作中アフォーダンス。
-    // 中立な hover/drag マーカー token が無いので一点物としてベタ書きを残す。
-    node_hover_color: Color { r: 1.0, g: 1.0, b: 0.6, a: 1.0 },
-    node_drag_color: Color { r: 0.95, g: 0.45, b: 0.4, a: 1.0 },
-    node_radius_px: 5.0,
-    // tension は line_color と同 hue の半透明版なので CURVE 由来で揃える。
-    tension_color: theme::CURVE.with_alpha(0.7),
-    cursor_color: theme::PLAYHEAD.with_alpha(0.85),
-};
+/// モジュレーター用グラフィカルエディタの色味。
+///
+/// 面 (`inset_bg`) / カーブ (`curve`) / ノード (`text`) は ui-core の
+/// [`MsegEditorStyle::from_palette`] のまま。 ラック固有なのはグリッドの濃度と、
+/// 操作中アフォーダンス / 再生位置カーソルの 4 色だけ。
+fn mod_editor_style(theme: &crate::theme::Theme) -> MsegEditorStyle {
+    MsegEditorStyle {
+        // automation の最弱段 (`grid_line_faint`) より濃い中間段。 canvas が窪み 1 枚
+        // しか無いので、 これ以上薄いと波形の縦位置 (0 / 0.5 / 1) が読めなくなる。
+        grid: theme.core.grid_line.with_alpha(0.06),
+        // node の hover (淡黄) / drag (珊瑚) は curve エディタ固有の操作中アフォーダンス。
+        node_hover_color: theme.daw.node_hover,
+        node_drag_color: theme.daw.node_drag,
+        // tension は line_color と同 hue の半透明版なので curve 由来で揃える。
+        tension_color: theme.core.curve.with_alpha(0.7),
+        // ライブカーソルは transport の再生位置そのものなので playhead と同色。
+        cursor_color: theme.daw.playhead.with_alpha(0.85),
+        ..MsegEditorStyle::from_palette(&theme.core)
+    }
+}
 
 /// グラフィカルエディタのカーブ描画高さ (px)。
 const MOD_CANVAS_H: f32 = 96.0;
@@ -214,6 +217,7 @@ fn generator_phase(kind: &common::model::ModSourceKind, beat: f64, secs: f64) ->
 /// rate dropdown + (Free のとき) Hz scrub を描く。 Hz drag 中は true を返す。
 fn mod_rate_full(
     ui: &mut Ui<'_, AppData>,
+    theme: &crate::theme::Theme,
     id_seed: u32,
     x: f32,
     y: f32,
@@ -226,7 +230,7 @@ fn mod_rate_full(
         let hz_style = ScrubableNumberStyle {
             range: Some((0.01, 50.0)),
             sensitivity: 0.05,
-            ..SCRUB_STYLE_INSPECTOR
+            ..scrub_style(theme)
         };
         let resp = ui.scrubable_number_at(
             ("inspector_mod_hz", id_seed),
@@ -298,6 +302,8 @@ pub(super) fn draw_modulation_rack(
     use common::model::ModSourceKind as K;
     use crate::app::ModSourceEdit as E;
 
+    let p = &app.theme.core;
+    let mod_style = mod_editor_style(&app.theme);
     let lx = area.x + pad;
     let row_w = area.w - pad * 2.0;
     let mod_sources = app.mod_source_display();
@@ -305,13 +311,13 @@ pub(super) fn draw_modulation_rack(
     let unit_style = ScrubableNumberStyle {
         range: Some((0.0, 1.0)),
         sensitivity: 0.006,
-        ..SCRUB_STYLE_INSPECTOR
+        ..scrub_style(&app.theme)
     };
     // ライブカーソル用の transport 位置。
     let beat = f64::from(app.transport.playhead_beat.unwrap_or(0.0));
     let secs = beat * 60.0 / f64::from(app.song_doc.song().bpm.max(1.0));
 
-    ui.label_at("inspector_mod_label", "Modulation", lx, y, 12.0, TEXT);
+    ui.label_at("inspector_mod_label", "Modulation", lx, y, 12.0, p.text);
     // [+ ▾] add-menu — 種別を選んで作成。
     {
         let add_w = 64.0;
@@ -358,7 +364,7 @@ pub(super) fn draw_modulation_rack(
         let meter_x = rm_rect.x - 4.0 - meter_w;
         let filled = ((src.scalar.clamp(0.0, 1.0) * 6.0).round() as usize).min(6);
         let meter: String = "\u{25ae}".repeat(filled) + &"\u{25af}".repeat(6 - filled);
-        ui.label_at(("inspector_mod_src_meter", i), &meter, meter_x, y + 4.0, 11.0, TEXT);
+        ui.label_at(("inspector_mod_src_meter", i), &meter, meter_x, y + 4.0, 11.0, p.text);
         let arm_w = 24.0;
         let arm_x = meter_x - 4.0 - arm_w;
         let armed = app.ui_ephemeral.armed_mod_source == Some(sid);
@@ -409,7 +415,7 @@ pub(super) fn draw_modulation_rack(
                 name_rect.x,
                 y + 4.0,
                 12.0,
-                TEXT,
+                p.text,
             );
         }
         ui.button_at(("inspector_mod_src_rm", i), "\u{00d7}", rm_rect, move || {
@@ -451,9 +457,9 @@ pub(super) fn draw_modulation_rack(
                 let ar_style = ScrubableNumberStyle {
                     range: Some((0.0, 60_000.0)),
                     sensitivity: 0.04,
-                    ..SCRUB_STYLE_INSPECTOR
+                    ..scrub_style(&app.theme)
                 };
-                ui.label_at(("inspector_mod_a_lbl", i), "A", rest_x, y + 4.0, 10.0, TEXT);
+                ui.label_at(("inspector_mod_a_lbl", i), "A", rest_x, y + 4.0, 10.0, p.text);
                 let a_resp = ui.scrubable_number_at(
                     ("inspector_mod_attack", i),
                     Rect { x: rest_x + 12.0, y, w: (half - 12.0).max(20.0), h: 20.0 },
@@ -470,7 +476,7 @@ pub(super) fn draw_modulation_rack(
                     None,
                 );
                 let r_x = rest_x + half + 6.0;
-                ui.label_at(("inspector_mod_r_lbl", i), "R", r_x, y + 4.0, 10.0, TEXT);
+                ui.label_at(("inspector_mod_r_lbl", i), "R", r_x, y + 4.0, 10.0, p.text);
                 let r_resp = ui.scrubable_number_at(
                     ("inspector_mod_release", i),
                     Rect { x: r_x + 12.0, y, w: (half - 12.0).max(20.0), h: 20.0 },
@@ -497,7 +503,7 @@ pub(super) fn draw_modulation_rack(
                     canvas,
                     &generator_cycle_samples(&src.kind, 160, beat, secs),
                     generator_phase(&src.kind, beat, secs),
-                    MOD_EDITOR_STYLE,
+                    mod_style,
                 );
                 y += MOD_CANVAS_H + 4.0;
                 // row A: shape + rate(+Hz)
@@ -531,10 +537,10 @@ pub(super) fn draw_modulation_rack(
                         app.handle_event(AppEvent::EditModSource { id: sid, edit: E::LfoShape(shape) });
                     }));
                 }
-                any_mod_drag |= mod_rate_full(ui, i_u, lx + 62.0, y, &c.rate, sid);
+                any_mod_drag |= mod_rate_full(ui, &app.theme, i_u, lx + 62.0, y, &c.rate, sid);
                 y += 22.0;
                 // row B: φ phase + (Pulse width) + retrig
-                ui.label_at(("inspector_lfo_ph_lbl", i), "\u{03c6}", lx, y + 4.0, 10.0, TEXT);
+                ui.label_at(("inspector_lfo_ph_lbl", i), "\u{03c6}", lx, y + 4.0, 10.0, p.text);
                 let ph_resp = ui.scrubable_number_at(
                     ("inspector_lfo_phase", i),
                     Rect { x: lx + 12.0, y, w: 50.0, h: 20.0 },
@@ -553,7 +559,7 @@ pub(super) fn draw_modulation_rack(
                 any_mod_drag |= ph_resp.dragging || ph_resp.editing_text;
                 let mut next_x = lx + 68.0;
                 if let common::model::LfoShape::Pulse { width } = c.shape {
-                    ui.label_at(("inspector_lfo_w_lbl", i), "w", next_x, y + 4.0, 10.0, TEXT);
+                    ui.label_at(("inspector_lfo_w_lbl", i), "w", next_x, y + 4.0, 10.0, p.text);
                     let w_resp = ui.scrubable_number_at(
                         ("inspector_lfo_width", i),
                         Rect { x: next_x + 12.0, y, w: 46.0, h: 20.0 },
@@ -585,11 +591,11 @@ pub(super) fn draw_modulation_rack(
                     canvas,
                     &generator_cycle_samples(&src.kind, 160, beat, secs),
                     generator_phase(&src.kind, beat, secs),
-                    MOD_EDITOR_STYLE,
+                    mod_style,
                 );
                 y += MOD_CANVAS_H + 4.0;
                 // row A: Stepped↔Smooth morph (0=階段/S&H, 1=滑らか) + rate(+Hz)
-                ui.label_at(("inspector_rand_sm_lbl", i), "Smooth", lx, y + 4.0, 10.0, TEXT);
+                ui.label_at(("inspector_rand_sm_lbl", i), "Smooth", lx, y + 4.0, 10.0, p.text);
                 let sm_resp = ui.scrubable_number_at(
                     ("inspector_rand_smooth", i),
                     Rect { x: lx + 48.0, y, w: 44.0, h: 20.0 },
@@ -606,7 +612,7 @@ pub(super) fn draw_modulation_rack(
                     None,
                 );
                 any_mod_drag |= sm_resp.dragging || sm_resp.editing_text;
-                any_mod_drag |= mod_rate_full(ui, i_u, lx + 96.0, y, &c.rate, sid);
+                any_mod_drag |= mod_rate_full(ui, &app.theme, i_u, lx + 96.0, y, &c.rate, sid);
                 y += 22.0;
                 // row B: 「別の乱数パターンを引き直す」 ボタン (raw seed は内部値なので隠す) + retrig
                 ui.button_at(
@@ -633,7 +639,7 @@ pub(super) fn draw_modulation_rack(
                     &nodes,
                     &samples,
                     phase,
-                    MOD_EDITOR_STYLE,
+                    mod_style,
                     move |act| {
                         Edit::mutate(move |app: &mut AppData| {
                             let edit = match act {
@@ -671,7 +677,7 @@ pub(super) fn draw_modulation_rack(
                         app.handle_event(AppEvent::EditModSource { id: sid, edit: E::MsegPlayMode(pm) });
                     }));
                 }
-                any_mod_drag |= mod_rate_full(ui, i_u, lx + 62.0, y, &c.rate, sid);
+                any_mod_drag |= mod_rate_full(ui, &app.theme, i_u, lx + 62.0, y, &c.rate, sid);
                 mod_retrigger_toggle(ui, i_u, Rect { x: lx + 176.0, y, w: 56.0, h: 20.0 }, &c.retrigger, sid, beat);
                 y += 22.0;
             }
@@ -683,7 +689,7 @@ pub(super) fn draw_modulation_rack(
                     canvas,
                     &c.values,
                     current,
-                    MOD_EDITOR_STYLE,
+                    mod_style,
                     move |idx, v| {
                         Edit::mutate(move |app: &mut AppData| {
                             app.handle_event(AppEvent::EditModSource {
@@ -710,7 +716,7 @@ pub(super) fn draw_modulation_rack(
                         app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepsCount(n + 1) });
                     })
                 });
-                ui.label_at(("inspector_steps_n", i), &format!("{n}"), lx + 52.0, y + 4.0, 10.0, TEXT);
+                ui.label_at(("inspector_steps_n", i), &format!("{n}"), lx + 52.0, y + 4.0, 10.0, p.text);
                 let dirs = ["Fwd", "Bwd", "Ping"];
                 let dsel = match c.direction {
                     common::model::StepsDirection::Forward => 0,
@@ -729,10 +735,10 @@ pub(super) fn draw_modulation_rack(
                         app.handle_event(AppEvent::EditModSource { id: sid, edit: E::StepsDirection(dir) });
                     }));
                 }
-                any_mod_drag |= mod_rate_full(ui, i_u, lx + 130.0, y, &c.rate, sid);
+                any_mod_drag |= mod_rate_full(ui, &app.theme, i_u, lx + 130.0, y, &c.rate, sid);
                 y += 22.0;
                 // row B: slew + retrig
-                ui.label_at(("inspector_steps_sl_lbl", i), "slew", lx, y + 4.0, 10.0, TEXT);
+                ui.label_at(("inspector_steps_sl_lbl", i), "slew", lx, y + 4.0, 10.0, p.text);
                 let sl_resp = ui.scrubable_number_at(
                     ("inspector_steps_slew", i),
                     Rect { x: lx + 32.0, y, w: 44.0, h: 20.0 },
@@ -771,7 +777,7 @@ pub(super) fn draw_modulation_rack(
                     lx + 18.0,
                     row_y + 4.0,
                     11.0,
-                    TEXT,
+                    p.text,
                 );
                 let rm_x = area.x + area.w - pad - 20.0;
                 let pol_x = rm_x - 4.0 - 22.0;
@@ -784,7 +790,7 @@ pub(super) fn draw_modulation_rack(
                     f64::from(*depth),
                     1.0,
                     ScrubableNumberFormat::Decimal(2),
-                    &SCRUB_STYLE_INSPECTOR,
+                    &scrub_style(&app.theme),
                     move |v| {
                         let tgt = tgt.clone();
                         Edit::mutate(move |app: &mut AppData| {

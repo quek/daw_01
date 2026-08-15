@@ -7,9 +7,9 @@
 use crate::widgets::arrangement::{clip_key_to_ref, ClipKey};
 use daw_ui_core::{ColorPickerStyle, Edit, ScrubableNumberStyle, ToggleButtonStyle, Ui};
 use daw_ui_renderer::{Color, Rect, RectCommand};
-use crate::theme;
 
 use crate::app::{AppData, AppEvent, ClipRef, ColorPickerTarget, ImportTrackTarget};
+use crate::theme::Theme;
 use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
 
@@ -39,20 +39,19 @@ fn track_index_at_y(
 // とし (default 160.0)、 gui_01 widget の右端 splitter drag で可変。
 const RULER_H: f32 = 20.0;
 const TOOLBAR_H: f32 = 24.0;
-const COLOR_TOOLBAR_BG: Color = theme::HEADER;
 
-const SNAP_TOGGLE_STYLE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::ACCENT,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 3.0,
-    font_size: 12.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+/// Snap toolbar の toggle スタイル。 面 / 枠 / 文字 / ON 色 (accent) はすべて
+/// パレット既定で、 toolbar の 18 px 行に収まるよう角丸と font だけ詰める。
+fn snap_toggle_style(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle {
+        radius: 3.0,
+        font_size: 12.0,
+        ..ToggleButtonStyle::from_palette(&theme.core)
+    }
+}
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    let p = &app.theme.core;
     // 上部 24 px を Snap toolbar に。残りを arrangement widget に渡す。
     let toolbar_rect = Rect { x: area.x, y: area.y, w: area.w, h: TOOLBAR_H };
     let body = Rect {
@@ -441,20 +440,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         #[allow(clippy::cast_possible_truncation)]
         let sensitivity = ((span / 256.0).max(1e-4)) as f32;
         let style = ScrubableNumberStyle {
-            bg_color: theme::INSET_BG,
-            bg_color_hovered: theme::CONTROL,
-            // drag 中の hint band (= transport の BPM scrubable と同じく
-            // bg_color_dragging は文脈固有の deliberate な一点もの)。 ここは
-            // automation lane を示す控えめな blue tint で、 ACCENT の electric
-            // azure とは別物なので literal を維持。
-            bg_color_dragging: Color { r: 0.20, g: 0.32, b: 0.42, a: 1.0 },
-            text_color: theme::TEXT,
-            border: theme::BORDER,
-            border_width: 1.0,
+            bg_color_hovered: p.control,
+            // drag 中の hint band。 `accent` の electric azure とは別物の控えめな
+            // blue tint = 汎用の `scrub_drag_bg` (transport のテンポ / 拍子だけが
+            // 暖色版 `scrub_drag_bg_warm` を使う)。
+            bg_color_dragging: p.scrub_drag_bg,
             radius: 3.0,
             font_size: 11.0,
             sensitivity,
             range: Some(desc.range),
+            ..ScrubableNumberStyle::from_palette(p)
         };
         let target_for_change = target.clone();
         let resp_s = ui.scrubable_number_at(
@@ -520,10 +515,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             w,
             h: 16.0,
         };
+        // 読み値は不透明に近いクローム面 (`panel`) のチップに載せる = 背景は
+        // パレット自身の面なので、 文字は極性固定インクでなく `text` でよい。
         ui.push_rect(RectCommand {
             rect: label_rect,
-            fill: theme::PANEL.with_alpha(0.92),
-            border: theme::BORDER,
+            fill: p.panel.with_alpha(0.92),
+            border: p.border,
             border_width: 1.0,
             radius: [3.0; 4],
             clip_rect: None,
@@ -534,7 +531,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             label_rect.x + pad,
             label_rect.y + 2.0,
             11.0,
-            theme::TEXT,
+            p.text,
         );
     }
 
@@ -728,7 +725,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             "arr_file_drop_hint",
             canvas_area,
             Color::TRANSPARENT,
-            theme::LOOP_BAND,
+            p.loop_band,
             2.0,
             0.0,
         );
@@ -960,7 +957,7 @@ fn render_color_picker_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
     else {
         return;
     };
-    let style = ColorPickerStyle::default();
+    let style = ColorPickerStyle::from_palette(&app.theme.core);
     let palette = track_color::palette_colors();
 
     // 対象の現在色を引く。対象が消えていれば picker を閉じる。
@@ -1043,7 +1040,8 @@ fn target_id_hash(target: ColorPickerTarget) -> u64 {
 /// 上部 24 px の Snap toolbar を描画。
 /// 配置: [Snap toggle 60px] [snap unit dropdown 90px] [Fit button 50px]
 fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
-    ui.panel("arr_toolbar_bg", rect, COLOR_TOOLBAR_BG, 0.0);
+    // クロームのバー類は `header` (transport / ruler / menu bar と同じ面)。
+    ui.panel("arr_toolbar_bg", rect, app.theme.core.header, 0.0);
 
     let pad = 6.0;
     let h = 18.0;
@@ -1072,7 +1070,7 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         "Snap",
         toggle_rect,
         app.ui_prefs.arrange_snap_enabled,
-        &SNAP_TOGGLE_STYLE,
+        &snap_toggle_style(&app.theme),
         |new| {
             Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetArrangeSnapEnabled(new));
@@ -1188,7 +1186,8 @@ fn draw_audio_clip_value_overlay(
     else {
         return;
     };
-    let clip = &app.song_doc.song().tracks[t_idx].clips[c_idx];
+    let track = &app.song_doc.song().tracks[t_idx];
+    let clip = &track.clips[c_idx];
     let Some(content) = app.song_doc.song().clip_contents.get(&clip.content_id) else {
         return;
     };
@@ -1208,7 +1207,12 @@ fn draw_audio_clip_value_overlay(
     }
 
     // 描画位置: clip rect の右下 (= name は左上、 重ならないように)。
-    let text_color = theme::TEXT.with_alpha(0.85);
+    // 背景は**ユーザーが着色しうるクリップ面** = 可変なので、 テーマ従属の `text` では
+    // なく極性固定インクを `ink_for` で選ぶ (明るいクリップ色 / ライトテーマで
+    // ラベルが消えるのを構造的に防ぐ。 clip の実効色は widget 側の描画と同じ
+    // `effective_clip_color` を SSoT にする)。
+    let clip_bg = track_color::to_renderer(track_color::effective_clip_color(track, clip));
+    let text_color = app.theme.core.ink_for(clip_bg).with_alpha(0.85);
     let font_size = 9.0;
     let pad = 3.0;
     let mut x_right = clip_rect.x + clip_rect.w - pad;

@@ -8,7 +8,7 @@ use common::protocol::{AudioCommand, PluginCommand};
 impl AppData {
     // -------- Tick / metering ----------------------------------------------
 
-    pub(crate) fn on_tick(&mut self, playhead_samples: u64, peak_l_raw: f32, peak_r_raw: f32) {
+    pub(crate) fn on_tick(&mut self, playhead_samples: u64) {
         // パニックの遅延 reinit を発火する。 master の declick フェード
         // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を
         // 送ることで、 plugin を mix から外す detach が master ミュート後に起き、
@@ -57,25 +57,14 @@ impl AppData {
             )
             .map(|b| b as f32)
         };
-        // 曲末に達したら engine の auto-stop (engine.rs の
-        // `song_ended` 判定で playing=false) に合わせて GUI 側 transport も止め、
-        // 再生開始位置 (origin) へ戻す。Tick は playing 状態を運ばないので、engine
-        // と同一の `song_ended` 述語 (= 停止境界がサンプル単位で一致) を使って GUI
-        // 自身が検知する。これが無いと engine が曲末で止まっても is_playing が true
-        // のまま playhead が末尾に固着する (既存の不整合)。手動 Stop と同じ
-        // stop() を通すので「どんな止まり方でも再生を押した位置へ戻る」が一貫する。
-        // loop 中は engine が wrap して止まらないので対象外。
-        if self.transport.is_playing
-            && !self.transport.loop_region.enabled
-            && playhead_samples != u64::MAX
-            && common::timing::song_ended(
-                Some(self.song_doc.song()),
-                self.ipc.sample_rate,
-                playhead_samples,
-            )
-        {
-            self.stop();
-        }
+        // r.md #51: 曲末の auto-stop は **engine だけ**が判定する
+        // (`daw_audio/src/engine.rs` の `song_ended`)。 GUI 側にも同じ述語を
+        // 複製していたが、engine 側は録音中に抑止する / GUI 側は抑止しない、の
+        // ように片方だけ条件が増えた瞬間に「音は止まったのに録音は続く」
+        // 「録音が始まった瞬間に止まる」という食い違いになる。 GUI は Tick で
+        // 運ばれてくる `playing` の落ち際を観測して `on_transport_stopped` を
+        // 走らせるだけにする (= 手動停止と同じ合流点)。
+        //
         // 再生中のみ Tick の playhead を反映する。 停止中は GUI 側 playhead が
         // 権威 (stop() の「開始位置へ戻す」 / ruler seek / engine respawn 後の
         // 据え置き)。 これを入れないと、 stop() が playhead を origin に戻した
@@ -138,13 +127,9 @@ impl AppData {
         // sends `SlotGuiClosed` back. daw_gui no longer polls a local
         // close flag here.
 
-        const RELEASE: f32 = 0.85;
-        let new_l = common::meter::update_peak(self.transport.peak_l_display, peak_l_raw, RELEASE);
-        let new_r = common::meter::update_peak(self.transport.peak_r_display, peak_r_raw, RELEASE);
-        self.transport.peak_l_display = new_l;
-        self.transport.peak_r_display = new_r;
-        self.transport.peak_l_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_l));
-        self.transport.peak_r_norm = common::meter::db_to_norm(common::meter::linear_to_db(new_r));
+        // r.md #50: マスターメーターの減衰はここに無い。規格準拠の弾道
+        // (VU 2 次系 / dB 直線のピーク落下 / ピーク保持) はテレメトリスレッドの
+        // `MasterAnalyzer` が持ち、`MasterMeterTick` で完成した表示値だけが届く。
     }
 
     /// Phase 4 Step C: tick ごとの automation recording。 `is_playing` と

@@ -157,7 +157,19 @@ impl AppData {
             // `take_shortcut` 経路に合流し、 ここに action の arm が増えない)。
             // headless script mode には UiHost が無いので何もしない。
             PluginEvent::EditorKey { .. } => {}
+            // r.md #49: プラグインエディタ窓のアクティブ / 非アクティブ。daw_gui からは
+            // 見えない (エディタ窓は plugin-host 所有の別プロセス top-level) ので、
+            // これが「プラグインを触っている間もアプリはアクティブ」の唯一の根拠。
+            PluginEvent::HostWindowsActive(active) => {
+                self.activity.plugin_host_active = active;
+                self.sync_app_active_with_audio();
+            }
             PluginEvent::ChildDisconnected => {
+                // r.md #49: 落ちたプロセスの窓はもうアクティブではない。エディタが
+                // アクティブなまま crash した場合、報告者が消えて true のまま固着し、
+                // 二度と省電力に入れなくなる。
+                self.activity.plugin_host_active = false;
+                self.sync_app_active_with_audio();
                 self.handle_child_disconnected(ChildKind::PluginHost);
             }
             PluginEvent::PluginsReinitDone => {

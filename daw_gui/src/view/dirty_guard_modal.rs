@@ -13,12 +13,9 @@
 
 use daw_ui_core::{Edit, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, DirtyGuardAction};
-
-const COLOR_TEXT: Color = theme::TEXT;
 
 const PANEL_W: f32 = 460.0;
 const PANEL_H: f32 = 176.0;
@@ -29,14 +26,6 @@ const BTN_H: f32 = 28.0;
 const BTN_SAVE_W: f32 = 136.0;
 const BTN_W: f32 = 116.0;
 const BTN_GAP: f32 = 8.0;
-
-const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: theme::BACKDROP,
-    panel_bg: theme::PANEL,
-    panel_radius: 6.0,
-    close_on_outside_click: true,
-    close_on_escape: true,
-};
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let Some(action) = app.ui_ephemeral.dirty_guard.as_ref() else {
@@ -70,23 +59,23 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
         .unwrap_or("Untitled")
         .to_string();
 
+    // 暗幕 + 中央パネル + Esc/外クリックで閉じる = ui-core の既定そのものなので
+    // パレットから素直に組む (r.md #48: 色を焼き込んだ const は runtime テーマを読めない)。
+    let style = ModalStyle::from_palette(&app.theme.core);
+
     ui.modal(
         "dirty_guard",
         (PANEL_W, PANEL_H),
-        &MODAL_STYLE,
+        &style,
         Some(Box::new(|| {
             Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::DirtyGuardCancel))
         })),
         move |ui, panel| {
+            // 文字が乗るのは modal panel (= パレットのクローム面) なので本文インクは `text`。
+            let p = ui.palette();
+
             // タイトル
-            ui.label_at(
-                "dg_title",
-                "保存の確認",
-                panel.x + PAD,
-                panel.y + PAD,
-                16.0,
-                COLOR_TEXT,
-            );
+            ui.label_at("dg_title", "保存の確認", panel.x + PAD, panel.y + PAD, 16.0, p.text);
 
             // メッセージ (2 行)。 固定文だけで 329px あり、 プロジェクト名に
             // 使える余地は 115px しかない。 素の label_at だと少し長い名前で
@@ -97,7 +86,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 &format!("プロジェクト「{project_name}」に保存していない変更があります。"),
                 Rect { x: panel.x + PAD, y: panel.y + PAD + TITLE_H, w: msg_w, h: 13.0 * 1.2 },
                 13.0,
-                COLOR_TEXT,
+                p.text,
             );
             ui.label_at_clipped(
                 "dg_msg2",
@@ -109,7 +98,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     h: 13.0 * 1.2,
                 },
                 13.0,
-                COLOR_TEXT,
+                p.text,
             );
 
             // ボタン行 (下部、 右寄せ)。 左から「保存して〜」「保存せず〜」

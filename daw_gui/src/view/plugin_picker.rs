@@ -5,42 +5,14 @@
 
 use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, PluginCategory};
-
-const COLOR_TEXT: Color = theme::TEXT;
-// プラグイン種別タグ / format ラベルの色分け (楽器=緑 / FX=青 / MIDI=橙 / 映像=紫)。
-// theme に「プラグイン分類タグ」専用 token が無いため、 一意の category accent として
-// 固有色を残す (選択行では TEXT_ON_ACCENT に潰す)。
-const COLOR_TEXT_FORMAT: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
-const COLOR_TAG_INST: Color = Color { r: 0.58, g: 0.85, b: 0.55, a: 1.0 };
-const COLOR_TAG_FX: Color = Color { r: 0.55, g: 0.78, b: 0.95, a: 1.0 };
-const COLOR_TAG_MIDI: Color = Color { r: 0.95, g: 0.74, b: 0.45, a: 1.0 };
-const COLOR_TAG_VIDEO: Color = Color { r: 0.80, g: 0.62, b: 0.95, a: 1.0 };
 
 const PANEL_W: f32 = 520.0;
 const PANEL_H: f32 = 460.0;
 const TITLE_H: f32 = 36.0;
 const SEARCH_H: f32 = 26.0;
-
-const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: theme::BACKDROP,
-    panel_bg: theme::PANEL,
-    panel_radius: 6.0,
-    close_on_outside_click: true,
-    close_on_escape: true,
-};
-
-const LIST_STYLE: ListViewStyle = ListViewStyle {
-    row_height: 26.0,
-    row_gap: 2.0,
-    row_bg: theme::PANEL_RAISED,
-    row_bg_hover: theme::CONTROL_HOVER,
-    row_bg_selected: theme::ACCENT,
-    radius: 3.0,
-};
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // is_plugin_picker_open を modal 可視性の SSoT にする。 選択時 (Ctrl 以外) は
@@ -53,10 +25,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
         ui.close_modal("plugin_picker");
     }
 
+    // スタイルは const にできない (runtime テーマを読めない、 r.md #48)。 パレット既定を
+    // ベースに、 このピッカー固有の寸法だけ差分で上書きする。
+    let p = &app.theme.core;
+    let modal_style = ModalStyle::from_palette(p);
+    let list_style = ListViewStyle { radius: 3.0, ..ListViewStyle::from_palette(p) };
+
     ui.modal(
         "plugin_picker",
         (PANEL_W, PANEL_H),
-        &MODAL_STYLE,
+        &modal_style,
         Some(Box::new(|| {
             Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ClosePluginPicker))
         })),
@@ -70,7 +48,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 panel.x + pad,
                 panel.y + pad,
                 16.0,
-                COLOR_TEXT,
+                p.text,
             );
             let rescan_w = 90.0;
             let close_w = 32.0;
@@ -136,7 +114,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     search_rect.x + 8.0,
                     search_rect.y + 6.0,
                     13.0,
-                    COLOR_TEXT,
+                    p.text,
                 );
             }
             // Enter でカーソル位置の候補を確定 (= list クリックと同じ経路でロード)。
@@ -170,7 +148,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     list_rect.x,
                     list_rect.y + 8.0,
                     12.0,
-                    COLOR_TEXT,
+                    p.text,
                 );
                 return;
             }
@@ -190,20 +168,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 list_rect,
                 visible,
                 Some(cursor),
-                &LIST_STYLE,
+                &list_style,
                 |ui, entry, i, row_rect, is_selected| {
-                    // 選択行は全 label を白に統一 (背景青と高コントラスト、 Windows
-                    // ListBox / macOS NSTableView の反転表示慣習)。 非選択時は format
-                    // を青、 vendor を dim グレーで区別。 選択時は format の青と背景
-                    // 青が同化して読めなくなるため白で潰す。
+                    // 選択行は全 label を accent 上のインクに統一 (Windows ListBox /
+                    // macOS NSTableView の反転表示慣習)。 非選択時は format をタグ色で
+                    // 区別する。 選択時は format 色と accent 背景が同化して読めなくなるため潰す。
+                    // 行の背景は list_view が塗るクローム面 (panel_raised / control_hover /
+                    // accent) なので、 本文は極性固定インクではなく `p.text` でよい。
                     let (name_color, vendor_color, format_color) = if is_selected {
-                        (
-                            theme::TEXT_ON_ACCENT,
-                            theme::TEXT_ON_ACCENT,
-                            theme::TEXT_ON_ACCENT,
-                        )
+                        (p.ink_on_accent(), p.ink_on_accent(), p.ink_on_accent())
                     } else {
-                        (COLOR_TEXT, COLOR_TEXT, COLOR_TEXT_FORMAT)
+                        (p.text, p.text, app.theme.daw.tag_format)
                     };
                     ui.label_at(
                         ("pp_row_name", i),
@@ -229,15 +204,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                         10.0,
                         format_color,
                     );
-                    // 種別タグ (楽器 / FX / MIDI): 混合リストで選ぶ前に行き先が分かる。
+                    // 種別タグ (楽器 / FX / MIDI / 映像): 混合リストで選ぶ前に行き先が分かる。
+                    // 分類色はテーマの `daw.tag_*` が SSoT (ライトでは同じ色相のまま暗く沈む)。
                     let tag_color = if is_selected {
-                        theme::TEXT_ON_ACCENT
+                        p.ink_on_accent()
                     } else {
                         match entry.category {
-                            PluginCategory::Instrument => COLOR_TAG_INST,
-                            PluginCategory::Fx => COLOR_TAG_FX,
-                            PluginCategory::MidiFx => COLOR_TAG_MIDI,
-                            PluginCategory::Video => COLOR_TAG_VIDEO,
+                            PluginCategory::Instrument => app.theme.daw.tag_instrument,
+                            PluginCategory::Fx => app.theme.daw.tag_fx,
+                            PluginCategory::MidiFx => app.theme.daw.tag_midi,
+                            PluginCategory::Video => app.theme.daw.tag_video,
                         }
                     };
                     ui.label_at(

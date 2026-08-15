@@ -73,6 +73,11 @@ pub struct UiEphemeral {
     /// マウス直下のストリップを solo するために `dispatch_shortcuts` が読む。master
     /// strip は solo を持たないので None 扱い。
     pub mixer_hovered_track: Option<u32>,
+    /// マスターフェーダーを掴んでいるか (undo gesture の edge 検出用)。
+    /// `Song.master_gain` を編集するようになったので、drag 全体を 1 undo step に
+    /// bracket しないと per-frame の編集が履歴を埋める (group transform /
+    /// inspector scrub と同じ罠)。session-only。
+    pub master_gain_dragging: bool,
     /// ピアノロール grid 上のポインタ拍 (clip-local, snap 済)。
     /// ノート paste の配置位置に使う。`piano_roll` widget が毎フレーム更新、
     /// grid 外 / 非 piano-roll は `None`。
@@ -191,6 +196,13 @@ pub struct UiEphemeral {
     pub last_arrange_canvas_size: (f32, f32),
     /// 詳細パネルが開いているか (session-only、 Esc / 再クリックで閉じる)。
     pub resource_panel_open: bool,
+    /// r.md #48: 設定画面に出すテーマ一覧のキャッシュ (session-only)。
+    ///
+    /// **毎フレーム作り直してはいけない** — 実体は `themes/` の `read_dir` +
+    /// 各ファイルの JSON パースで、描画ループでディスク I/O を回すことになる。
+    /// 設定 window を **開いたとき**に 1 回だけ更新する (= 開き直せば新しく置いた
+    /// テーマファイルが出る。再起動は不要)。
+    pub available_themes: Vec<crate::theme::Theme>,
     /// 履歴パネルが最後に auto-scroll で追従した履歴 index。 現在位置
     /// ([`crate::state::SongDoc::history_current`]) がこれと変わったフレームだけ
     /// current 行が見えるよう scroll offset を合わせ、 手動 scroll は妨げない。

@@ -14,28 +14,15 @@
 
 use daw_ui_core::{Edit, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, ExportStage};
-
-const COLOR_TEXT: Color = theme::TEXT;
-const BAR_BG: Color = theme::INSET_BG;
-const BAR_FILL: Color = theme::ACCENT;
 
 const PANEL_W: f32 = 420.0;
 const PANEL_H: f32 = 150.0;
 const PAD: f32 = 16.0;
 const BTN_H: f32 = 28.0;
 const BTN_W: f32 = 110.0;
-
-const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: theme::BACKDROP,
-    panel_bg: theme::PANEL,
-    panel_radius: 6.0,
-    close_on_outside_click: false,
-    close_on_escape: false,
-};
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // export 全体（音声 freewheel → 映像 render）で modal を出し、下の UI 操作を
@@ -63,20 +50,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     } else {
         "WAV 書き出し中..."
     };
+    // 中断は Cancel / ESC のみ (外クリック・Esc の即閉じは無効) なので、
+    // パレット既定の modal から閉じ方 2 つだけ倒す。
+    let style = ModalStyle {
+        close_on_outside_click: false,
+        close_on_escape: false,
+        ..ModalStyle::from_palette(&app.theme.core)
+    };
     ui.modal(
         "export_progress",
         (PANEL_W, PANEL_H),
-        &MODAL_STYLE,
+        &style,
         None,
         move |ui, panel| {
-            ui.label_at(
-                "exp_title",
-                title,
-                panel.x + PAD,
-                panel.y + PAD,
-                16.0,
-                COLOR_TEXT,
-            );
+            // 文字が乗るのは modal panel (= パレットのクローム面) なので本文インクは `text`。
+            let p = ui.palette();
+            ui.label_at("exp_title", title, panel.x + PAD, panel.y + PAD, 16.0, p.text);
             // ESC は Cancel ボタンと同じ「キャンセル要求」にする。modal を即閉じ
             // しない（`close_on_escape: false`）ことで、close→次フレーム再 open の
             // フラッシュを避ける。CancelExport で中断要求が伝わり、完了通知で
@@ -115,7 +104,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                         panel.x + PAD,
                         panel.y + PAD + 28.0,
                         13.0,
-                        COLOR_TEXT,
+                        p.text,
                     );
                 }
             }
@@ -126,28 +115,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
 /// 進捗テキスト + バー (bg + fill) + Cancel ボタンを描く。AudioRender /
 /// VideoRender 共通レイアウト。
 fn draw_progress(ui: &mut Ui<'_, AppData>, panel: Rect, count_text: &str, pct: f32) {
-    ui.label_at(
-        "exp_count",
-        count_text,
-        panel.x + PAD,
-        panel.y + PAD + 28.0,
-        13.0,
-        COLOR_TEXT,
-    );
-    // 進捗バー（bg + fill）。
+    let p = ui.palette();
+    ui.label_at("exp_count", count_text, panel.x + PAD, panel.y + PAD + 28.0, 13.0, p.text);
+    // 進捗バー: 溝 (`inset_bg`) を彫って accent で満たす。
     let bar_y = panel.y + PAD + 54.0;
     let bar_w = panel.w - PAD * 2.0;
     let bar_h = 12.0;
     ui.panel(
         "exp_bar_bg",
         Rect { x: panel.x + PAD, y: bar_y, w: bar_w, h: bar_h },
-        BAR_BG,
+        p.inset_bg,
         3.0,
     );
     ui.panel(
         "exp_bar_fill",
         Rect { x: panel.x + PAD, y: bar_y, w: bar_w * pct, h: bar_h },
-        BAR_FILL,
+        p.accent,
         3.0,
     );
     // Cancel ボタン（右下）。

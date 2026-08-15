@@ -40,10 +40,15 @@ pub use widgets::drag_rect::DragRect;
 pub use layout::{FlexDirection, Gap, LayoutPass, NodeId, Padding};
 pub use scenegraph::{CachedCommands, SceneNode, Scenegraph, hash_inputs};
 pub use daw_ui_platform::CursorIcon;
-pub use daw_ui_renderer::{available_font_families, TextureHandle, TexturedQuad};
+pub use daw_ui_renderer::{available_font_families, Color, TextureHandle, TexturedQuad};
+pub use theme::{Palette, WaveformInk, contrast_ratio};
 pub use ui::{FrameStats, Ui, UiHost};
 pub use viewport::ViewportState1D;
+pub use widgets::goniometer::{CorrelationStyle, GoniometerStyle};
 pub use widgets::level_meter::{LevelMeterStyle, MeterBallistic, MeterScale};
+pub use widgets::loudness_meter::LoudnessMeterStyle;
+pub use widgets::oscilloscope::{OscilloscopeStyle, ScopeColumn};
+pub use widgets::spectrum::SpectrumStyle;
 pub use widgets::split_view::Orientation;
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::modulator_editor::{MsegAction, MsegEditorResponse, MsegEditorStyle, MsegNode};
@@ -55,7 +60,7 @@ pub use widgets::heavy::HeavyCtx;
 pub use widgets::list_view::{ListViewResponse, ListViewStyle};
 pub use widgets::menu::MenuItemSpec;
 pub use widgets::modal::ModalStyle;
-pub use widgets::knob::KnobResponse;
+pub use widgets::knob::{KnobResponse, KnobStyle};
 pub use widgets::reorderable_list::{
     ReorderableListEditRequest, ReorderableListResponse, ReorderableListStyle,
 };
@@ -65,7 +70,9 @@ pub use widgets::scrubable_number::{
 };
 pub use widgets::button::ButtonTextAlign;
 pub use widgets::text_input::TextInputResponse;
-pub use widgets::toggle_button::{ToggleButtonResponse, ToggleButtonStyle};
+pub use widgets::toggle_button::{
+    IndicatorButtonResponse, ToggleButtonResponse, ToggleButtonStyle,
+};
 pub use widgets::waveform::{
     ChannelLayout, SampleSlices, WaveformHit, WaveformRenderMode, WaveformResponse,
     WaveformSegment, WaveformSource, WaveformStyle, WaveformView,

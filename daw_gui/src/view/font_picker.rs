@@ -9,35 +9,15 @@
 
 use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, GlyphArea, Rect};
-use crate::theme;
+use daw_ui_renderer::{GlyphArea, Rect};
 
 use crate::app::{AppData, AppEvent};
-
-const COLOR_TEXT: Color = theme::TEXT;
 
 const PANEL_W: f32 = 460.0;
 const PANEL_H: f32 = 480.0;
 const TITLE_H: f32 = 36.0;
 const SEARCH_H: f32 = 26.0;
 const ROW_FONT: f32 = 15.0;
-
-const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: theme::BACKDROP,
-    panel_bg: theme::PANEL,
-    panel_radius: 6.0,
-    close_on_outside_click: true,
-    close_on_escape: true,
-};
-
-const LIST_STYLE: ListViewStyle = ListViewStyle {
-    row_height: 28.0,
-    row_gap: 2.0,
-    row_bg: theme::PANEL_RAISED,
-    row_bg_hover: theme::CONTROL_HOVER,
-    row_bg_selected: theme::ACCENT,
-    radius: 3.0,
-};
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // is_font_picker_open を modal 可視性の SSoT にする (plugin_picker と同 idiom)。
@@ -48,10 +28,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
         ui.close_modal("font_picker");
     }
 
+    // スタイルは const にできない (runtime テーマを読めない、 r.md #48)。 パレット既定を
+    // ベースに、 このピッカー固有の寸法 (行はフォント見本のぶん高い) を差分で上書きする。
+    let p = &app.theme.core;
+    let modal_style = ModalStyle::from_palette(p);
+    let list_style =
+        ListViewStyle { row_height: 28.0, radius: 3.0, ..ListViewStyle::from_palette(p) };
+
     ui.modal(
         "font_picker",
         (PANEL_W, PANEL_H),
-        &MODAL_STYLE,
+        &modal_style,
         // Esc / 外クリックで閉じたら cancel = 元フォントへ復元。
         Some(Box::new(|| {
             Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CloseFontPicker))
@@ -65,7 +52,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 panel.x + pad,
                 panel.y + pad,
                 16.0,
-                COLOR_TEXT,
+                p.text,
             );
             let close_w = 32.0;
             let close_x = panel.x + panel.w - pad - close_w;
@@ -113,7 +100,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     search_rect.x + 8.0,
                     search_rect.y + 6.0,
                     13.0,
-                    COLOR_TEXT,
+                    p.text,
                 );
             }
             // Enter でカーソル位置を確定。
@@ -146,7 +133,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     list_rect.x,
                     list_rect.y + 8.0,
                     12.0,
-                    COLOR_TEXT,
+                    p.text,
                 );
                 return;
             }
@@ -159,9 +146,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 list_rect,
                 visible,
                 Some(cursor),
-                &LIST_STYLE,
+                &list_style,
                 |ui, family, i, row_rect, is_selected| {
-                    let color = if is_selected { theme::TEXT_ON_ACCENT } else { COLOR_TEXT };
+                    // 行背景は list_view が塗るクローム面なので、 見本は `p.text` /
+                    // 選択行は accent 塗りの上なので auto-contrast で取る。
+                    let color = if is_selected { p.ink_on_accent() } else { p.text };
                     // 各行はその行のフォント自身で描画 (本物のプレビュー)。
                     // `""` = renderer default → "デフォルト" を default フォントで。
                     let (label, font): (&str, Option<std::sync::Arc<str>>) = if family.is_empty() {

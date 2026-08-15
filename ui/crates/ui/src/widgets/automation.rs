@@ -16,11 +16,11 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
+use crate::theme::{Palette, WaveformInk};
 use crate::ui::{Ui, hovered};
 
 /// flatten の最大再帰深度 (NaN / 異常値で無限再帰しないようガード)。
@@ -38,15 +38,22 @@ pub struct AutomationCurveStyle {
     pub max_segment_px: f32,
 }
 
-impl Default for AutomationCurveStyle {
-    fn default() -> Self {
+impl AutomationCurveStyle {
+    /// パレット由来の既定スタイル。テーマ色を読む `Default` は**持たない** —
+    /// `Default::default()` はパレットを知らない隠れたグローバル依存になり、
+    /// ライトテーマに追従できないため (r.md #48)。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            line_color: theme::CURVE,
+            line_color: p.curve,
             line_width_px: 2.0,
-            node_color: theme::TEXT,
+            // ノードはクローム面 (lane / パネル) の上に置く標識なので、テーマ従属の本文インク。
+            node_color: p.text,
             node_radius_px: 5.0,
-            node_hover_color: theme::SELECTION_WARM,
-            node_drag_color: theme::WAVEFORM_PEAK,
+            node_hover_color: p.selection_warm,
+            // drag 中の赤は極性固定インク (明背景では沈むので暗い赤へ)。背景は caller が
+            // 描くので、テーマの床 `window_bg` を基準面として明暗を選ぶ。
+            node_drag_color: p.waveform_for(p.window_bg, WaveformInk::Peak),
             max_segment_px: 2.0,
         }
     }

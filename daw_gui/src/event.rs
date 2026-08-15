@@ -87,6 +87,33 @@ pub enum AppEvent {
     /// r.md #29: Undo 履歴パネルの開閉トグル (View メニュー / パネル ✕ / Esc)。
     /// session-only な UI 状態なので Undo 対象外。
     ToggleUndoHistory,
+    /// r.md #48: 設定 window の開閉トグル (Edit メニュー「設定...」 / ✕ / Esc)。
+    /// 開閉状態は `app_config.json` に永続。 Song は触らないので Undo / dirty 対象外。
+    ToggleSettings,
+    /// r.md #50: 画面右端のマスターパネルの表示トグル (View メニュー / `Ctrl+Alt+M`)。
+    /// 開閉は `app_config.json` に永続。Song は触らないので Undo / dirty 対象外。
+    ToggleMasterPanel,
+    /// マスターパネルの幅 [px] (左端ドラッグ)。handler が最小 / 最大に clamp する。
+    /// `commit = false` はドラッグ中の追従 (状態だけ更新)、`true` は release
+    /// (ここで初めて `app_config.json` へ書く — 毎フレーム同期書き込みしない)。
+    SetMasterPanelWidth { w: f32, commit: bool },
+    /// マスターパネルのセクション高さ配分 (MASTER / スペクトラム / オシロ / ゴニオ)。
+    /// 合計 1.0 に正規化して保存する。`commit` の意味は上と同じ。
+    SetMasterPanelSectionRatios { ratios: [f32; 4], commit: bool },
+    /// メーター設定 (右クリックメニュー) の更新。`app_config.json` に永続し、
+    /// テレメトリスレッドの解析器へ即座に伝わる。
+    SetMeterSettings(Box<crate::master_meter::settings::MeterSettings>),
+    /// 積算ラウドネス一式 (I / LRA / 最大 M / 最大 S / 最大 TP / ピーク保持 /
+    /// クリップ表示) を同時リセットする (EBU Tech 3341 §2.2)。再生開始でも発火。
+    ResetLoudness,
+    /// ピーク保持線 / 数値ピーク / クリップ表示だけをリセットする
+    /// (メーターのクリック。ラウドネス積算には触らない)。
+    ResetMasterPeakHold,
+    /// r.md #48: テーマを切り替える。**パレット実体ではなくテーマ id を運ぶ**
+    /// (arch 不変条件 #2 blob-less wire の精神。id から解決すればテーマファイルの
+    /// 編集が次回にそのまま効く)。 切替は即時で全画面に反映され、`app_config.json`
+    /// に保存される。 Song は触らないので Undo / dirty 対象外。
+    SetTheme(String),
     /// r.md #29: 履歴リストの行 click。 `index` = [`crate::state::SongDoc::history_labels`]
     /// の 0 始まり index。 その state まで一気に Undo / Redo する
     /// ([`crate::state::SongDoc::jump_to`])。 履歴操作自体は Undo 対象外。
@@ -856,9 +883,30 @@ pub enum AppEvent {
     /// チェーン化で **棄却なしの純 permutation** (役割は位置から再導出)。
     ReorderInspectorChain(Vec<usize>),
     SetMasterGain(f32),
+    /// マスターフェーダーの drag 全体を 1 undo step に bracket する
+    /// (`BeginGroupTransformDrag` / `BeginInspectorScrub` と同 idiom)。
+    /// `master_gain` が `Song` に入って undo 対象になったので必要になった。
+    BeginMasterGainDrag,
+    EndMasterGainDrag,
 
     // -------- IPC events from plugin_host ---------------------------------
-    Tick { samples: u64, peak_l: f32, peak_r: f32, preroll: u64 },
+    /// audio engine の telemetry を 30Hz で観測したもの (`AudioBridge` の poll)。
+    /// r.md #51: `playing` / `recording_live` は engine が所有する状態の観測値で、
+    /// GUI の `transport.is_playing` / `recording.live` はこれで**しか**更新されない。
+    ///
+    /// r.md #50: マスターのピークはここに載らない。計測は `MasterMeterTick` の
+    /// 解析器 1 か所が持つ (同じ音の値を 2 経路に複製しない)。
+    Tick {
+        samples: u64,
+        preroll: u64,
+        playing: bool,
+        recording_live: bool,
+    },
+    /// r.md #50: テレメトリスレッドの `MasterAnalyzer` が 1 ティックぶん解析した
+    /// マスターメーターの表示状態。`Box` なのは variant を巨大にしないため
+    /// (`AppEvent` は全 variant が最大サイズに揃うので、配列を直載せすると
+    /// 全イベントの送信コストが上がる)。
+    MasterMeterTick(Box<crate::master_meter::MasterMeterSnapshot>),
     RescanPluginDb,
     PluginDbRescanCompleted,
 

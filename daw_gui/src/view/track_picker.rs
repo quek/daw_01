@@ -10,33 +10,13 @@
 
 use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
-
-const COLOR_TEXT: Color = theme::TEXT;
 
 const PANEL_W: f32 = 420.0;
 const PANEL_H: f32 = 420.0;
 const TITLE_H: f32 = 36.0;
-
-const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: theme::BACKDROP,
-    panel_bg: theme::PANEL,
-    panel_radius: 6.0,
-    close_on_outside_click: true,
-    close_on_escape: true,
-};
-
-const LIST_STYLE: ListViewStyle = ListViewStyle {
-    row_height: 26.0,
-    row_gap: 2.0,
-    row_bg: theme::PANEL_RAISED,
-    row_bg_hover: theme::CONTROL_HOVER,
-    row_bg_selected: theme::ACCENT,
-    radius: 3.0,
-};
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let Some(state) = app.ui_ephemeral.send_picker else {
@@ -52,10 +32,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // track 数オーダーなので per-frame 再計算で十分。
     let candidates = app.send_destination_candidates(src_track_id);
 
+    // スタイルは const にできない (runtime テーマを読めない、 r.md #48)。 パレット既定を
+    // ベースに、 このピッカー固有の寸法だけ差分で上書きする。
+    let p = &app.theme.core;
+    let modal_style = ModalStyle::from_palette(p);
+    let list_style = ListViewStyle { radius: 3.0, ..ListViewStyle::from_palette(p) };
+
     ui.modal(
         "send_picker",
         (PANEL_W, PANEL_H),
-        &MODAL_STYLE,
+        &modal_style,
         Some(Box::new(|| {
             Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CloseSendPicker))
         })),
@@ -68,7 +54,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 panel.x + pad,
                 panel.y + pad,
                 16.0,
-                COLOR_TEXT,
+                p.text,
             );
             let close_w = 32.0;
             let close_x = panel.x + panel.w - pad - close_w;
@@ -98,7 +84,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     list_rect.x,
                     list_rect.y + 8.0,
                     12.0,
-                    COLOR_TEXT,
+                    p.text,
                 );
                 return;
             }
@@ -108,9 +94,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 list_rect,
                 &candidates,
                 None,
-                &LIST_STYLE,
+                &list_style,
                 |ui, entry, i, row_rect, is_selected| {
-                    let name_color = if is_selected { theme::TEXT_ON_ACCENT } else { COLOR_TEXT };
+                    // 行背景は list_view が塗るクローム面なので、 本文は `p.text` /
+                    // 選択行は accent 塗りの上なので auto-contrast で取る。
+                    let name_color = if is_selected { p.ink_on_accent() } else { p.text };
                     ui.label_at(
                         ("sp_row_name", i),
                         &entry.1,

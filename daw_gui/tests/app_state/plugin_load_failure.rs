@@ -96,7 +96,8 @@ fn load_failure_releases_single_pending_and_flushes_play() {
         app.ipc.pending_plugin_loads
     );
     assert!(!app.transport.pending_play, "pending_play should be cleared");
-    assert!(app.transport.is_playing, "play() should have fired");
+    // r.md #51: `is_playing` は engine の観測値なので Play 送信直後には立たない。
+    // 「queue した Play が発火したか」は直下の `AudioCommand::Play` で見る。
     let audio_msgs_after_failure = drain(&mut audio_rx);
     assert!(
         audio_msgs_after_failure

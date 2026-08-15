@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use daw_ui_platform::CursorIcon;
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
-use crate::theme;
+use crate::theme::Theme;
 
 use daw_ui_core::edit::Edit;
 use daw_ui_core::id::WidgetId;
@@ -65,7 +65,7 @@ pub type NoteId = u32;
 /// - `start_beat: f64` — 開始位置 (拍単位、0.0 = 最初の拍)。f64 で長尺 song / sample 精度を確保
 /// - `len_beats: f64` — 長さ (拍単位)
 /// - `pitch: u8` — MIDI 0..127 (実用 36..96 が C2..C7)
-/// - `velocity: u8` — MIDI 0..127 (色濃度に使う、`PianoRollStyle::note_fill_fn` で Color に変換)
+/// - `velocity: u8` — MIDI 0..127 (色濃度に使う、`PianoRollStyle::velocity_ramp` で Color に変換)
 /// - `lyric: Option<Arc<str>>` — singing synthesis 用歌詞 (VOICEVOX 等)、note 上に表示。
 ///   `None` なら lyric 表示せず。`Arc<str>` で多数 note 間の文字列共有を可能にする。
 ///
@@ -95,7 +95,7 @@ pub struct Note {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NoteStyle {
     /// note の基底色。`Some(c)` = `c` を velocity で陰影付け (`shade_by_velocity`) して描画
-    /// (複数クリップをクリップ色で塗り分ける)。`None` = 既存どおり `PianoRollStyle::note_fill_fn`
+    /// (複数クリップをクリップ色で塗り分ける)。`None` = 既存どおり `PianoRollStyle::velocity_ramp`
     /// (velocity → Color) を使う。
     pub color: Option<Color>,
     /// 対象 (target/active) でない background クリップの note。fill を grid 背景側へ寄せて
@@ -352,12 +352,35 @@ pub struct PianoRollResponse {
     pub creating: bool,
 }
 
-/// velocity → fill Color の関数。`fn` pointer (closure 不可、Style: Copy 維持のため)。
-pub type NoteFillFn = fn(velocity: u8) -> Color;
-
-/// piano roll の見た目スタイル。`Default` で example の見た目を再現。
+/// velocity → note fill を決める色ランプ。両端はテーマトークン
+/// (`daw.note_velocity_low` = velocity 0 / `daw.note_velocity_high` = velocity 127) から解決し、
+/// 間は線形補間する。
 ///
-/// `note_fill_fn` は velocity を Color に変換する関数 (default = `default_velocity_color`)。
+/// r.md #48 で旧 `NoteFillFn` (= `fn(velocity: u8) -> Color` の関数ポインタ) を置き換えた。
+/// 関数ポインタは runtime パレットを読めないため、テーマを切り替えても note だけ旧色のまま
+/// 取り残される。`PianoRollStyle` の他フィールドと同じ「解決済みの色」を持つ `Copy` データに
+/// することで、heavy() クロージャへの capture (style ごと move) もそのまま維持できる。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VelocityRamp {
+    /// velocity 0 の色 (ランプ下端)。
+    pub low: Color,
+    /// velocity 127 の色 (ランプ上端)。
+    pub high: Color,
+}
+
+impl VelocityRamp {
+    /// `velocity` (0..=127) に対応する fill。`velocity = 0` で [`low`](Self::low)、
+    /// `127` で [`high`](Self::high)。
+    #[must_use]
+    pub fn fill(self, velocity: u8) -> Color {
+        self.low.lerp(self.high, f32::from(velocity) / 127.0)
+    }
+}
+
+/// piano roll の見た目スタイル。[`PianoRollStyle::from_theme`] で現在のテーマから解決する。
+///
+/// 色は全て **解決済みの値** で持つ (テーマトークンへの参照は持たない)。widget 本体は
+/// `ui.heavy()` のクロージャへ style ごと move するので、`Copy` であることが load-bearing。
 #[derive(Clone, Copy, Debug)]
 pub struct PianoRollStyle {
     /// grid (note 領域) の背景色 = **白鍵レーン**。
@@ -365,7 +388,8 @@ pub struct PianoRollStyle {
     /// **不変条件 (M14 Phase 63d / daw_01 #017)**: `black_row_overlay` を `bg` に src-over 合成した
     /// 結果が `bg` より **暗く** なるよう値を選ぶこと (= 鍵盤側 `white_key` > `black_key` の
     /// 濃淡関係を grid 側でも保つ)。Ableton Live / Cubase / Reaper / FL Studio 等の主流 DAW 慣習。
-    /// `default_black_row_is_darker_than_white_row` test で固定。
+    /// `default_black_row_is_darker_than_white_row` /
+    /// `row_shading_and_label_polarity_hold_in_every_builtin_theme` test で全テーマ分固定。
     pub bg: Color,
     pub keyboard_bg: Color,
     pub white_key: Color,
@@ -386,10 +410,11 @@ pub struct PianoRollStyle {
     pub sub_line: Color,
     /// (M14 Phase 124 / daw_01 #100) subdivision 線の幅 (px、 default `1.0`)。
     pub sub_line_width_px: f32,
-    pub note_fill_fn: NoteFillFn,
+    /// `NoteStyle::color == None` の note を velocity で塗るランプ (両端はテーマトークン)。
+    pub velocity_ramp: VelocityRamp,
     pub note_border_radius_px: f32,
-    /// muted note に重ねる斜線ハッチの色 (半透明)。default は
-    /// 半透明黒 `rgba(0,0,0,0.40)`。`Note.muted == true` のときのみ描画。
+    /// muted note に重ねる斜線ハッチの色 (半透明)。極性固定の `core.hatch_ink` を
+    /// note 用の濃さ (alpha 0.40) にしたもの。`Note.muted == true` のときのみ描画。
     pub note_muted_hatch_color: Color,
     /// muted note ハッチの線間隔 (px、default 5.0) と線幅 (px、default 1.0)。
     /// note は clip より小さいので clip ハッチより密にする。
@@ -469,28 +494,20 @@ pub struct PianoRollStyle {
     /// (root 行のみ label) ので、 将来「全 12 行に label」 拡張が来たときの為の予約 field。
     pub out_of_scale_label_fg: Color,
     /// (M14 Phase 117 / daw_01 #093) 鍵盤オクターブラベルを、 その行の **実効背景** (key fill +
-    /// root/out overlay の alpha 合成色) の WCAG relative luminance で `label_fg_dark` / `label_fg_light`
-    /// に自動反転するか。 default `true`。 `false` で旧挙動 (root=`root_label_fg` / in-scale=
-    /// `in_scale_label_fg` / C=`c_label_color` の固定色)。 arrangement の clip 名 auto-contrast (#060) と
-    /// 同じ「widget が実際に塗った fill から文字色を導出する」 SSoT を鍵盤ラベルに適用したもの。
-    /// warm root 行 (root_row_overlay 重畳の cream) / 白鍵で暗文字、 黒鍵 / dim 行で明文字を選ぶ。
+    /// root/out overlay の alpha 合成色) の輝度で明暗反転するか。 default `true`。 `false` で
+    /// 旧挙動 (root=`root_label_fg` / in-scale=`in_scale_label_fg` / C=`c_label_color` の固定色)。
+    /// arrangement の clip 名 auto-contrast (#060) と同じ「widget が実際に塗った fill から文字色を
+    /// 導出する」 SSoT を鍵盤ラベルに適用したもの。 warm root 行 (root_row_overlay 重畳の cream) /
+    /// 白鍵で暗文字、 黒鍵 / dim 行で明文字を選ぶ。
+    ///
+    /// **選ばれる 2 色は style に持たない** (r.md #48): 鍵盤 fill は可変背景なので極性固定インク
+    /// (`Palette::ink_for` = `ink_on_bright` / `ink_on_dark`) が唯一の出どころ。
     pub label_auto_contrast: bool,
-    /// (M14 Phase 117 / daw_01 #093) `label_auto_contrast` で明るい行背景に選ぶ暗ラベル色 (near-black)。
-    pub label_fg_dark: Color,
-    /// (M14 Phase 117 / daw_01 #093) `label_auto_contrast` で暗い行背景に選ぶ明ラベル色 (near-white)。
-    pub label_fg_light: Color,
-}
-
-/// デフォルト velocity color (青系の濃淡 0.5..0.95)。`PianoRollStyle::note_fill_fn` の初期値。
-#[must_use]
-pub fn default_velocity_color(velocity: u8) -> Color {
-    let t = f32::from(velocity) / 127.0;
-    Color::rgba(0.35 + t * 0.35, 0.55 + t * 0.30, 0.85 + t * 0.10, 1.0)
 }
 
 /// クリップ基底色 `base` を velocity で陰影付けする (hue は保ち明度のみ変える)。
 /// 低 velocity ほど暗く (係数 0.55..1.0)。`NoteStyle::color = Some` の note に使う。
-/// alpha は `base` を維持。`note_fill_fn` (velocity → 青の濃淡) のクリップ色版に相当。
+/// alpha は `base` を維持。[`VelocityRamp`] (velocity → テーマの青の濃淡) のクリップ色版に相当。
 #[must_use]
 pub fn shade_by_velocity(base: Color, velocity: u8) -> Color {
     let t = f32::from(velocity) / 127.0;
@@ -513,88 +530,94 @@ pub fn dim_toward(color: Color, bg: Color, amount: f32) -> Color {
 }
 
 
-impl Default for PianoRollStyle {
-    fn default() -> Self {
+impl PianoRollStyle {
+    /// いま有効なテーマから piano roll の全色を解決する (r.md #48)。
+    ///
+    /// 呼び出しは 1 frame 1 回 (`view_build`) を想定。`Copy` なので heavy() クロージャへは
+    /// 値ごと move する。
+    #[must_use]
+    pub fn from_theme(theme: &Theme) -> Self {
+        let p = &theme.core;
+        let d = &theme.daw;
         Self {
-            // M14 Phase 63d / daw_01 #017: 鍵盤側 `white_key (0.92) > black_key (0.10)` の濃淡に
-            // 揃え、grid の **白鍵レーン (= bg) を黒鍵レーン (= bg + overlay) より明るく** する。
+            // M14 Phase 63d / daw_01 #017: 鍵盤側 `key_white > key_black` の濃淡に揃え、
+            // grid の **白鍵レーン (= bg) を黒鍵レーン (= bg + overlay) より明るく** する。
             // 旧値 `bg=(0.12)` + `overlay=rgba(1,1,1,0.04)` は黒鍵 row が約 (0.155) で bg より
             // 明るくなる (鍵盤と逆) symptom があった。Live / Cubase / Reaper 慣習に合わせる。
-            // 階層: ruler_bg(0.13) < velocity_lane_bg(0.16) < bg(0.18) < keyboard_bg(0.22)
-            // → grid (note 配置領域) が最も明るく、 周辺 panel が段階的に暗い。
-            bg: theme::PANEL_RAISED,
-            keyboard_bg: theme::PANEL_RAISED,
-            // white_key / black_key は物理ピアノ鍵盤のメタファ。 寒色 dark テーマには白鍵に
-            // 充てる明 surface token が無いため、 意図的な literal のまま残す (token 化しない)。
-            white_key: Color::rgb(0.92, 0.93, 0.95),
-            black_key: Color::rgb(0.10, 0.11, 0.13),
-            // src-over 合成で黒鍵 row を bg より暗く。
-            black_row_overlay: theme::BACKDROP.with_alpha(0.25),
-            bar_line: theme::GRID_LINE_STRONG,
-            beat_line: theme::GRID_LINE,
+            // 階層 (elevation): ruler_bg(header) < velocity_lane_bg(panel) < bg / keyboard_bg
+            // (panel_raised) → grid (note 配置領域) が最も浮き、 周辺 panel が段階的に沈む。
+            bg: p.panel_raised,
+            keyboard_bg: p.panel_raised,
+            // 物理ピアノ鍵盤のメタファなので、 面 (elevation) ではなく専用トークン。
+            white_key: d.key_white,
+            black_key: d.key_black,
+            // src-over 合成で黒鍵 row を bg より暗くする極性固定インク
+            // (ライトテーマでも「黒鍵 row は沈む」 は反転してはいけない)。
+            black_row_overlay: p.row_dim_ink,
+            bar_line: p.grid_line_strong,
+            beat_line: p.grid_line,
             bar_line_width_px: 1.5,
             beat_line_width_px: 1.0,
-            // M14 Phase 124 / daw_01 #100: subdivision 線は beat_line より淡く。
-            sub_line: theme::GRID_LINE.with_alpha(0.04),
+            // M14 Phase 124 / daw_01 #100: subdivision 線は beat_line より淡い 3 段目。
+            sub_line: p.grid_line_faint,
             sub_line_width_px: 1.0,
-            note_fill_fn: default_velocity_color,
+            velocity_ramp: VelocityRamp { low: d.note_velocity_low, high: d.note_velocity_high },
             note_border_radius_px: 1.5,
-            note_muted_hatch_color: theme::BACKDROP.with_alpha(0.40),
+            // note は clip より小さいので clip ハッチ (alpha 0.34) より一段濃く。
+            note_muted_hatch_color: p.hatch_ink.with_alpha(0.40),
             note_muted_hatch_spacing_px: 5.0,
             note_muted_hatch_width_px: 1.0,
-            note_selected_fill: theme::SELECTION_WARM,
-            // 選択ノードのリングは velocity 着色されたノート上で確実に立つ意図的な pure-white。
-            note_selected_border: Color::WHITE,
+            note_selected_fill: p.selection_warm,
+            // 選択リングは velocity / クリップ色で着色された note の上に乗るので極性固定 (常に明)。
+            note_selected_border: p.selection_ring_outer,
             note_selected_border_w: 2.0,
             note_selected_pad_px: 2.0,
             // M14 Phase 83 / daw_01 #054: copy ghost は move ghost (黄) と区別する緑系
             // (arrangement の clone linked ghost と同系統)。
-            note_clone_ghost_fill: theme::GHOST_LINKED.with_alpha(0.85),
-            note_clone_ghost_border: theme::GHOST_LINKED,
+            note_clone_ghost_fill: d.ghost_linked.with_alpha(0.85),
+            note_clone_ghost_border: d.ghost_linked,
             resize_handle_px: 4.0,
-            c_label_color: theme::TEXT_FAINT,
+            c_label_color: p.text_faint,
             c_label_font_px: 11.0,
-            // M9 Phase 45c: playhead / velocity lane defaults
-            // playhead は bar_line (白 alpha 0.3) と紛れないよう強い赤系 + 太め
-            playhead_color: theme::PLAYHEAD,
+            // M9 Phase 45c: playhead / velocity lane
+            playhead_color: d.playhead,
             playhead_width_px: 2.5,
-            velocity_lane_bg: theme::PANEL,
-            velocity_bar_color: theme::ACCENT,
+            velocity_lane_bg: p.panel,
+            velocity_bar_color: p.accent,
             velocity_bar_width_px: 3.0,
-            lyric_color: theme::TEXT_ON_BRIGHT,
+            // 歌詞は velocity / クリップ色で塗られた note の上に乗る = 可変背景。 note fill は
+            // 明るい側なので極性固定の暗インク (テーマで反転させるとライトで消える)。
+            lyric_color: p.ink_on_bright,
             // M14 Phase 59: MAX cap (実 font_size = note_h * 0.75 で note 高さスケール)。
             // 旧 9.0 固定 → 24.0 max にして zoom in 時の readable 化。
             lyric_font_px: 24.0,
             // M14 Phase 59 / daw_01 #017: 歌詞編集 (L キー) shortcut。caller が `bind("L")` する想定。
             lyric_edit_shortcut: Some("piano_roll.edit_lyric"),
             // M13 Phase 55: ruler 領域 (`view.ruler_h > 0` のときのみ描画)
-            ruler_bg: theme::HEADER,
-            ruler_label_color: theme::TEXT_DIM,
-            // M14 Phase 69 / daw_01 #041: arrangement と同 default 値 (cyan ~0.20 alpha 帯 + 不透明 handle)。
-            loop_band: theme::LOOP_BAND.with_alpha(0.20),
-            loop_handle: theme::LOOP_BAND,
+            ruler_bg: p.header,
+            ruler_label_color: p.text_dim,
+            // M14 Phase 69 / daw_01 #041: arrangement と同値 (loop_band ~0.20 alpha 帯 + 不透明 handle)。
+            loop_band: p.loop_band.with_alpha(0.20),
+            loop_handle: p.loop_band,
             loop_handle_w: 2.0,
-            // M14 Phase 70 / daw_01 #042 + 70a (follow-up): Bitwig 風 warm-yellow tint (root 行)
-            // + 黒 dim (out 行)。 alpha は daw_01 実機 smoke test (#042 follow-up) で「白鍵 row 上
-            // の root tint が見えない / 黒鍵 row との dim 差が 0.015 で out 認識が立たない」 指摘
-            // を受けて引き上げ済。 control: dark theme (widget bg 0.18、 黒鍵 row ≈ 0.135) で
-            // 「在ることが分かる」 を最低基準にする。 alpha 0.18 / 0.32 だと不可視レベル。
-            root_row_overlay: theme::SELECTION_WARM.with_alpha(0.32),
-            // out_of_scale_row_overlay: alpha 0.50 で 黒鍵 row との差が ≈ 0.045 に拡大、 dim 認識成立。
-            out_of_scale_row_overlay: theme::BACKDROP.with_alpha(0.50),
-            // 鍵盤レーンラベル色: root は warm-yellow を強調 (0.95, 0.78, 0.40)、 in-scale は Fold
-            // mode で全行に label が出るため keyboard_bg (0.22) 上で読める明度 (0.78〜0.85)、
-            // out-of-scale は dim (0.45 程度、 Highlight mode で root 行以外の label 描画は v0 では
-            // 出ないが、 将来「全 12 行 label」 拡張用に予約)。
-            root_label_fg: theme::SELECTION_WARM,
-            in_scale_label_fg: theme::TEXT_DIM,
-            out_of_scale_label_fg: theme::TEXT_FAINT,
-            // M14 Phase 117 / daw_01 #093: 鍵盤ラベルの auto-contrast (default on)。 両極は white 鍵
-            // (0.92) / black 鍵 (0.10) / warm cream root 行のいずれでも WCAG コントラスト比が十分立つ
-            // near-black / near-white。
+            // M14 Phase 70 / daw_01 #042 + 70a (follow-up): warm tint (root 行) + dim (out 行)。
+            // alpha は daw_01 実機 smoke test (#042 follow-up) で「白鍵 row 上の root tint が
+            // 見えない / 黒鍵 row との dim 差が 0.015 で out 認識が立たない」 指摘を受けて
+            // 引き上げ済 (0.18 / 0.32 では不可視レベルだった)。
+            root_row_overlay: p.selection_warm.with_alpha(0.32),
+            // out 行は黒鍵 row との差が認識できるまで `row_dim_ink` を濃くした段 (alpha 0.50)。
+            out_of_scale_row_overlay: p.row_dim_ink.with_alpha(0.50),
+            // 鍵盤レーンラベルの fallback 色 (`label_auto_contrast == false` のときだけ使う)。
+            // root は選択暖色を強調、 in-scale は Fold mode で全行に label が出るので二次テキスト、
+            // out-of-scale は最弱層 (Highlight mode で root 行以外の label 描画は v0 では出ないが、
+            // 将来「全 12 行 label」 拡張用に予約)。
+            root_label_fg: p.selection_warm,
+            in_scale_label_fg: p.text_dim,
+            out_of_scale_label_fg: p.text_faint,
+            // M14 Phase 117 / daw_01 #093: 鍵盤ラベルの auto-contrast (既定 on)。 選ぶ 2 色は
+            // `Palette::ink_for` が持つ (行の実効背景が白鍵 / 黒鍵 / warm cream root 行と **可変**
+            // なので極性固定インク。 `p.text` にするとライトテーマで白鍵行のラベルが消える)。
             label_auto_contrast: true,
-            label_fg_dark: theme::TEXT_ON_BRIGHT,
-            label_fg_light: theme::TEXT,
         }
     }
 }
@@ -1071,28 +1094,74 @@ mod tests {
 
     // -------- Style invariants (M14 Phase 63d / daw_01 #017) --------
 
-    /// `PianoRollStyle::default()` の `bg` (= 白鍵レーン) と `black_row_overlay` を src-over
-    /// 合成した結果 (= 黒鍵レーン) は **bg より暗くなる** こと。鍵盤側の white_key > black_key
-    /// と濃淡関係を一致させる業界標準動作。 Ableton Live / Cubase / Reaper / FL Studio 慣習。
+    fn theme_of(theme_id: &str) -> Theme {
+        Theme::builtin(theme_id).expect("組込みテーマ")
+    }
+
+    fn style_of(theme_id: &str) -> PianoRollStyle {
+        PianoRollStyle::from_theme(&theme_of(theme_id))
+    }
+
+    /// 黒鍵レーン (= `bg` に `black_row_overlay` を src-over 合成した色) が `bg` より暗いか。
+    fn black_row_is_darker(style: &PianoRollStyle) -> bool {
+        let (bg, ov) = (style.bg, style.black_row_overlay);
+        // src-over: out = src.rgb * src.a + dst.rgb * (1 - src.a)
+        let bk = |s: f32, d: f32| s * ov.a + d * (1.0 - ov.a);
+        bk(ov.r, bg.r) < bg.r && bk(ov.g, bg.g) < bg.g && bk(ov.b, bg.b) < bg.b
+    }
+
+    /// ダークテーマの `bg` (= 白鍵レーン) と `black_row_overlay` を src-over 合成した結果
+    /// (= 黒鍵レーン) は **bg より暗くなる** こと。鍵盤側の white_key > black_key と濃淡関係を
+    /// 一致させる業界標準動作。 Ableton Live / Cubase / Reaper / FL Studio 慣習。
     #[test]
     fn default_black_row_is_darker_than_white_row() {
-        let style = PianoRollStyle::default();
-        let bg = style.bg;
-        let ov = style.black_row_overlay;
-        // src-over: out = src.rgb * src.a + dst.rgb * (1 - src.a)
-        let bk_r = ov.r * ov.a + bg.r * (1.0 - ov.a);
-        let bk_g = ov.g * ov.a + bg.g * (1.0 - ov.a);
-        let bk_b = ov.b * ov.a + bg.b * (1.0 - ov.a);
+        let style = style_of("dark");
         assert!(
-            bk_r < bg.r && bk_g < bg.g && bk_b < bg.b,
-            "黒鍵 row ({bk_r}, {bk_g}, {bk_b}) は bg ({}, {}, {}) より暗いべき (鍵盤と整合)",
-            bg.r, bg.g, bg.b
+            black_row_is_darker(&style),
+            "黒鍵 row は bg ({:?}) より暗いべき (鍵盤と整合)",
+            style.bg
         );
         // 鍵盤側の濃淡関係も同方向であることを念のため確認 (regression 防止)。
         assert!(
             style.white_key.r > style.black_key.r,
             "鍵盤 white_key.r > black_key.r 不変条件"
         );
+    }
+
+    /// r.md #48: 上の 2 つの濃淡不変条件と鍵盤ラベルの極性は、**どのテーマでも** 成り立つ。
+    /// `black_row_overlay` やラベル色を面トークン (= ライトでは明るい側) に倒すと、黒鍵 row が
+    /// 白鍵 row より明るくなったり、白鍵行のラベルが背景に溶けて消えたりする。
+    #[test]
+    fn row_shading_and_label_polarity_hold_in_every_builtin_theme() {
+        for id in ["dark", "light"] {
+            let theme = theme_of(id);
+            let p = &theme.core;
+            let style = PianoRollStyle::from_theme(&theme);
+            assert!(black_row_is_darker(&style), "{id}: 黒鍵 row は白鍵 row より暗い");
+            assert!(style.white_key.r > style.black_key.r, "{id}: 白鍵 > 黒鍵");
+            // 鍵盤ラベルは行の実効背景で極性が決まる (明るい行 → 暗インク / 暗い行 → 明インク)。
+            assert_eq!(
+                keyboard_label_color(p, &style, style.white_key, None, style.in_scale_label_fg),
+                p.ink_on_bright,
+                "{id}: 白鍵行 → 暗ラベル"
+            );
+            assert_eq!(
+                keyboard_label_color(p, &style, style.black_key, None, style.in_scale_label_fg),
+                p.ink_on_dark,
+                "{id}: 黒鍵行 → 明ラベル"
+            );
+            assert_eq!(
+                keyboard_label_color(
+                    p,
+                    &style,
+                    style.white_key,
+                    Some(style.root_row_overlay),
+                    style.root_label_fg
+                ),
+                p.ink_on_bright,
+                "{id}: warm root tint を重ねた白鍵行 → 暗ラベル"
+            );
+        }
     }
 
     // -------- Pure function tests (note_hit / note_hover_cursor / rects_intersect) --------
@@ -1318,26 +1387,48 @@ mod tests {
     /// dark / light を選び、 opt-out 時は fallback を返す。
     #[test]
     fn keyboard_label_color_auto_contrast_picks_by_row_bg() {
-        let style = PianoRollStyle::default();
+        let theme = theme_of("dark");
+        let p = &theme.core;
+        let style = PianoRollStyle::from_theme(&theme);
         // 白鍵 + root_row_overlay (warm cream) → 明るい背景 → 暗ラベル (旧 warm-on-warm 潰れを解消)。
-        let on_root =
-            keyboard_label_color(&style, style.white_key, Some(style.root_row_overlay), style.root_label_fg);
-        assert_eq!(on_root, style.label_fg_dark, "warm cream root 行 → 暗ラベル");
+        let on_root = keyboard_label_color(
+            p,
+            &style,
+            style.white_key,
+            Some(style.root_row_overlay),
+            style.root_label_fg,
+        );
+        assert_eq!(on_root, p.ink_on_bright, "warm cream root 行 → 暗ラベル");
         // 黒鍵 (overlay 無し) → 暗い背景 → 明ラベル。
-        let on_black = keyboard_label_color(&style, style.black_key, None, style.in_scale_label_fg);
-        assert_eq!(on_black, style.label_fg_light, "黒鍵行 → 明ラベル");
-        // 黒鍵 root + root_row_overlay (warm cream overlay を暗い黒鍵に重ねても実効輝度は閾値下) → 明ラベル。
-        // root が黒鍵 (F# pentatonic 等) の Highlight mode で warm-on-dark にならないことの確認。
-        let on_black_root =
-            keyboard_label_color(&style, style.black_key, Some(style.root_row_overlay), style.root_label_fg);
-        assert_eq!(on_black_root, style.label_fg_light, "黒鍵 root + overlay 行 → 明ラベル");
+        let on_black =
+            keyboard_label_color(p, &style, style.black_key, None, style.in_scale_label_fg);
+        assert_eq!(on_black, p.ink_on_dark, "黒鍵行 → 明ラベル");
+        // 黒鍵 root + root_row_overlay: warm cream を 32% 重ねると実効色は画面上
+        // sRGB (166,149,110) の中間トーンになる (linear 0.388/0.305/0.165、輝度 0.313)。
+        // 明るい側なので暗ラベル。 2026-08-15 まで relative_luminance の二重デコードで
+        // 「暗い」と誤判定され明ラベルが選ばれていたが、実効 2.6:1 で読みづらかった。
+        let on_black_root = keyboard_label_color(
+            p,
+            &style,
+            style.black_key,
+            Some(style.root_row_overlay),
+            style.root_label_fg,
+        );
+        assert_eq!(on_black_root, p.ink_on_bright, "黒鍵 root + warm overlay 行 → 暗ラベル");
         // 白鍵 in-scale (overlay 無し) → 明るい → 暗ラベル (旧 in_scale_label_fg の明文字が潰れる症状も解消)。
-        let on_white = keyboard_label_color(&style, style.white_key, None, style.in_scale_label_fg);
-        assert_eq!(on_white, style.label_fg_dark, "白鍵 in-scale 行 → 暗ラベル");
+        let on_white =
+            keyboard_label_color(p, &style, style.white_key, None, style.in_scale_label_fg);
+        assert_eq!(on_white, p.ink_on_bright, "白鍵 in-scale 行 → 暗ラベル");
         // opt-out: fallback 固定色をそのまま返す。
-        let off = PianoRollStyle { label_auto_contrast: false, ..PianoRollStyle::default() };
+        let off = PianoRollStyle { label_auto_contrast: false, ..style };
         assert_eq!(
-            keyboard_label_color(&off, off.white_key, Some(off.root_row_overlay), off.root_label_fg),
+            keyboard_label_color(
+                p,
+                &off,
+                off.white_key,
+                Some(off.root_row_overlay),
+                off.root_label_fg
+            ),
             off.root_label_fg,
             "auto_contrast=false は fallback 固定色"
         );

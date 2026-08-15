@@ -82,7 +82,9 @@ fn play_after_edit_syncs_latest_song_before_play() {
         load_idx < play_idx,
         "LoadSong は Play より前に届く (ensure-synced): {msgs:?}"
     );
-    assert!(app.transport.is_playing, "Play 後は再生中");
+    // r.md #51: `transport.is_playing` は engine の観測値になったので、Play を
+    // 送った直後には (Tick が来るまで) まだ立たない。「再生が始まったか」は上の
+    // `AudioCommand::Play` 送信で直接見ている。
 
     // 追加編集の無い 2 回目 Play は LoadSong を再送しない (epoch 一致 = ensure-synced の
     // no-op)。 大量 WAV の再 compile 遅延を定常状態で踏まないための性質。

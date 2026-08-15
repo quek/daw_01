@@ -5,15 +5,24 @@
 //! - `toggle_button`: 矩形全面に任意ラベル + ON/OFF 背景色変化
 //!
 //! click 判定は `button` と同じ armed-state モデル (`press_started_inside`)。
+//!
+//! 同じ「OFF/ON の塗り + hover/押下フィードバック」 を持つが **click の意味が違う**
+//! 兄弟として `indicator_button_at` がある (daw_01 r.md #50 の CLIP 表示):
+//! - `toggle_button_at`: 点灯 = ユーザが所有する bool。click は `!value` への反転。
+//! - `indicator_button_at`: 点灯 = 外部データ (音がクリップした等)。click は反転でなく
+//!   常に同じ動作 (クリア等)。click しても点灯状態が直接ひっくり返るわけではない。
+//!
+//! 描画・ヒットテストは完全に同じなので `lit_button_at` に一本化し、 差分は click の
+//! 扱いだけに留める。
 
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
+use crate::theme::Palette;
 use crate::ui::Ui;
 
 /// `toggle_button_at` の永続状態 (button / checkbox と同形)。
@@ -29,7 +38,17 @@ pub struct ToggleButtonResponse {
     pub hovered: bool,
 }
 
-/// `toggle_button_at` の見た目スタイル。 ON/OFF は `on_color` / `off_color` の背景色のみで表現する。
+/// `indicator_button_at` の応答。 `toggled` (= 値の反転) ではなく `clicked` (= 動作の発火)
+/// を返すのが `ToggleButtonResponse` との違い。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IndicatorButtonResponse {
+    /// このフレームで click を検出 (`Edit<M>` 発行と同じフレームで `true`)。
+    pub clicked: bool,
+    pub hovered: bool,
+}
+
+/// `toggle_button_at` / `indicator_button_at` の見た目スタイル。
+/// 消灯/点灯は `off_color` / `on_color` の背景色のみで表現する。
 #[derive(Clone, Copy, Debug)]
 pub struct ToggleButtonStyle {
     pub off_color: Color,
@@ -47,16 +66,24 @@ pub struct ToggleButtonStyle {
     pub on_text_color: Option<Color>,
 }
 
-impl Default for ToggleButtonStyle {
-    fn default() -> Self {
+impl ToggleButtonStyle {
+    /// パレットから既定スタイルを組み立てる (r.md #48)。
+    ///
+    /// `Default` にしないのは、テーマ色を読む `Default::default()` が「どのパレットで
+    /// 描いているか」 を知らない隠れたグローバル依存になり、ライトテーマに追従しない
+    /// (= off の面だけダークのまま残る) ため。 caller は `ui.palette()` を渡す。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            off_color: theme::CONTROL,
-            on_color: theme::ACCENT,
-            border: theme::BORDER,
+            off_color: p.control,
+            on_color: p.accent,
+            border: p.border,
             border_width: 1.0,
             radius: 6.0,
             font_size: 14.0,
-            text_color: theme::TEXT,
+            text_color: p.text,
+            // `None` = ON 塗りの輝度から auto-contrast (下記 `draw_toggle_button`)。
+            // caller が `on_color` を上書きしても文字が読めることが保証される。
             on_text_color: None,
         }
     }
@@ -78,6 +105,57 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         F: FnOnce(bool) -> Edit<M>,
     {
         let wid = WidgetId::ROOT.child((b"toggle_button", &id));
+        let hit = self.lit_button_at(wid, "toggle_button", text, rect, value, style);
+
+        if hit.clicked {
+            let edit = on_toggle(!value);
+            self.push_edit(edit);
+        }
+
+        ToggleButtonResponse { toggled: hit.clicked, hovered: hit.hovered }
+    }
+
+    /// 点灯状態が **外部データ由来** の button を描画 + ヒットテスト。
+    ///
+    /// `toggle_button_at` と見た目・操作感 (hover / 押下 / 点灯色) は同一だが、 click は
+    /// 値の反転ではなく `on_click()` の 1 動作。 「音がクリップしたら赤く点いて、 押すと
+    /// クリアされる」 CLIP 表示のような **ラッチ表示 + リセット** に使う (daw_01 r.md #50)。
+    /// `lit` を `value` として `toggle_button_at` に渡すと「押すと点く/消える」 という嘘の
+    /// アフォーダンスになるので、 契約を分けている。
+    pub fn indicator_button_at<F>(
+        &mut self,
+        id: impl Hash,
+        text: &str,
+        rect: Rect,
+        lit: bool,
+        style: &ToggleButtonStyle,
+        on_click: F,
+    ) -> IndicatorButtonResponse
+    where
+        F: FnOnce() -> Edit<M>,
+    {
+        let wid = WidgetId::ROOT.child((b"indicator_button", &id));
+        let hit = self.lit_button_at(wid, "indicator_button", text, rect, lit, style);
+
+        if hit.clicked {
+            let edit = on_click();
+            self.push_edit(edit);
+        }
+
+        IndicatorButtonResponse { clicked: hit.clicked, hovered: hit.hovered }
+    }
+
+    /// `toggle_button_at` / `indicator_button_at` 共通の描画 + click 判定。
+    /// Edit をどう積むか (反転か動作か) だけを caller に残す。
+    fn lit_button_at(
+        &mut self,
+        wid: WidgetId,
+        tag: &'static str,
+        text: &str,
+        rect: Rect,
+        lit: bool,
+        style: &ToggleButtonStyle,
+    ) -> LitButtonHit {
         let pointer = self.pointer;
         // 開いている modal popup (context menu / dropdown) の上ではヒットさせない。
         // context menu は `capture_input == false` で背景 pointer を mask しないので、
@@ -135,7 +213,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         ));
 
         let input_hash = hash_inputs((
-            b"toggle_button",
+            tag,
             rect.x.to_bits(),
             rect.y.to_bits(),
             rect.w.to_bits(),
@@ -143,22 +221,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             text,
             inside,
             visual_pressed,
-            value,
+            lit,
             style_hash,
         ));
 
         let style_copy = *style;
         self.with_widget_node(wid, input_hash, |ui| {
-            draw_toggle_button(ui, text, rect, value, inside, visual_pressed, &style_copy);
+            draw_toggle_button(ui, text, rect, lit, inside, visual_pressed, &style_copy);
         });
 
-        if click {
-            let edit = on_toggle(!value);
-            self.push_edit(edit);
-        }
-
-        ToggleButtonResponse { toggled: click, hovered: inside }
+        LitButtonHit { clicked: click, hovered: inside }
     }
+}
+
+/// `lit_button_at` の内部戻り値 (公開 response 型へ caller が言い換える)。
+struct LitButtonHit {
+    clicked: bool,
+    hovered: bool,
 }
 
 fn draw_toggle_button<M: ?Sized + 'static>(
@@ -170,10 +249,14 @@ fn draw_toggle_button<M: ?Sized + 'static>(
     pressed: bool,
     style: &ToggleButtonStyle,
 ) {
-    // 背景色: value で off/on を選び、hover で明るく、press で暗く。
+    // 背景色: value で off/on を選び、hover は面から離れる方向 (ダークは明・ライトは暗)、
+    // press は押し込みとして暗く。 base は caller 任意色 (mute/solo/rec の赤・黄) なので
+    // トークンでは表せず、パレットの派生関数で向きだけをテーマに従わせる
+    // (`Color::lighten` 直打ちだとライトテーマで hover が背景に溶ける)。
+    let p = ui.palette();
     let base = if value { style.on_color } else { style.off_color };
-    let hover_c = base.lighten(0.10);
-    let press_c = base.darken(0.20);
+    let hover_c = p.hover(base);
+    let press_c = p.pressed(base);
 
     let fill = if pressed {
         press_c
@@ -207,10 +290,13 @@ fn draw_toggle_button<M: ?Sized + 'static>(
         rect.x + (rect.w - text_w).max(0.0) * 0.5
     };
     let ty = rect.y + (rect.h - line_h).max(0.0) * 0.5;
-    // value=true のとき on_text_color (Some) を優先、 None なら text_color に fallback
-    // (daw_01 #051: metronome 黄背景 + 黒文字のような state-dependent text color)。
+    // value=true のとき on_text_color (Some) を優先。 None なら **ON 塗りの輝度から
+    // auto-contrast** (r.md #48)。 旧実装は off 用 `text_color` に fallback していたため、
+    // caller が明るい on_color (solo の黄) を指定するたびに on_text_color を手で足す
+    // boilerplate が要り、指定漏れがそのまま視認性バグになっていた。 ライトテーマでは
+    // `text_color` が暗インクなので、fallback のままだと accent 塗りの上で文字が消える。
     let text_color = if value {
-        style.on_text_color.unwrap_or(style.text_color)
+        style.on_text_color.unwrap_or_else(|| p.ink_for(fill))
     } else {
         style.text_color
     };
@@ -236,6 +322,7 @@ mod tests {
     use super::ToggleButtonStyle;
     use crate::edit::Edit;
     use crate::input::{FrameInput, PointerFrame};
+    use crate::theme::Palette;
     use crate::ui::UiHost;
 
     struct Toy {
@@ -267,7 +354,7 @@ mod tests {
         let mut model = Toy { flag: false };
         let screen = PhysicalSize { width: 200, height: 100 };
         let rect = Rect { x: 10.0, y: 10.0, w: 60.0, h: 24.0 };
-        let style = ToggleButtonStyle::default();
+        let style = ToggleButtonStyle::from_palette(&Palette::dark());
         let toggled_seen = Cell::new(false);
 
         let (press, release) = click_at(rect);
@@ -323,7 +410,7 @@ mod tests {
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 200, height: 100 };
         let rect = Rect { x: 10.0, y: 20.0, w: 60.0, h: 24.0 };
-        let style = ToggleButtonStyle::default();
+        let style = ToggleButtonStyle::from_palette(&Palette::dark());
 
         let mut measured_w = 0.0;
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -364,7 +451,7 @@ mod tests {
         let style = ToggleButtonStyle {
             text_color: Color::rgb(0.95, 0.95, 0.97), // white (off)
             on_text_color: Some(Color::rgb(0.10, 0.10, 0.12)), // black (on)
-            ..ToggleButtonStyle::default()
+            ..ToggleButtonStyle::from_palette(&Palette::dark())
         };
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -379,27 +466,38 @@ mod tests {
         assert!((glyph.color.r - 0.10).abs() < 1e-6);
     }
 
+    /// r.md #48 で契約変更: `on_text_color = None` は **ON 塗りの輝度から auto-contrast**。
+    /// 旧契約は off 用 `text_color` への fallback だったが、それだと caller が明るい
+    /// `on_color` (solo の黄) を指定するたびに `on_text_color` を手で足す boilerplate が要り、
+    /// 指定漏れがそのまま視認性バグになっていた (ライトテーマでは accent 塗りの上に
+    /// 暗い本文色が乗って文字が消える)。
     #[test]
-    fn text_color_falls_back_to_text_color_when_on_text_color_none() {
-        // daw_01 #051 back compat: on_text_color=None なら value=true でも text_color。
-        let mut host: UiHost<()> = UiHost::no_redraw();
-        let mut scene = Scene::new();
-        let screen = PhysicalSize { width: 200, height: 100 };
-        let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
-        let style = ToggleButtonStyle {
-            text_color: Color::rgb(0.95, 0.95, 0.97), // white
-            on_text_color: None,
-            ..ToggleButtonStyle::default()
-        };
-
-        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
-            ui.toggle_button_at("t", "M", rect, true, &style, |_| {
-                Edit::mutate(|(): &mut ()| {})
+    fn text_color_auto_contrasts_against_the_on_fill_when_on_text_color_none() {
+        fn on_glyph_color(on_color: Color) -> Color {
+            let mut host: UiHost<()> = UiHost::no_redraw();
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 200, height: 100 };
+            let rect = Rect { x: 0.0, y: 0.0, w: 60.0, h: 24.0 };
+            let style = ToggleButtonStyle {
+                on_color,
+                text_color: Color::rgb(0.95, 0.95, 0.97),
+                on_text_color: None,
+                ..ToggleButtonStyle::from_palette(&Palette::dark())
+            };
+            host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+                ui.toggle_button_at("t", "M", rect, true, &style, |_| {
+                    Edit::mutate(|(): &mut ()| {})
+                });
             });
-        });
+            scene.iter_glyphs().next().expect("text should be pushed").color
+        }
 
-        let glyph = scene.iter_glyphs().next().expect("text should be pushed");
-        assert!((glyph.color.r - 0.95).abs() < 1e-6, "on_text_color=None で text_color を fallback");
+        let p = Palette::dark();
+        // 明るい ON 塗り (solo の黄 / accent の azure) → 暗インク。
+        assert_eq!(on_glyph_color(Color::rgb(0.97, 0.82, 0.30)), p.ink_on_bright);
+        assert_eq!(on_glyph_color(p.accent), p.ink_on_bright);
+        // 暗い ON 塗り (record の赤) → 明インク。
+        assert_eq!(on_glyph_color(Color::rgb(0.30, 0.05, 0.06)), p.ink_on_dark);
     }
 
     #[test]
@@ -412,7 +510,7 @@ mod tests {
         let style = ToggleButtonStyle {
             text_color: Color::rgb(0.95, 0.95, 0.97), // white (off で使われる)
             on_text_color: Some(Color::rgb(0.10, 0.10, 0.12)), // black (off では無視)
-            ..ToggleButtonStyle::default()
+            ..ToggleButtonStyle::from_palette(&Palette::dark())
         };
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -433,7 +531,8 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 400, height: 100 };
-        let style = ToggleButtonStyle { font_size: 11.0, ..ToggleButtonStyle::default() };
+        let style =
+            ToggleButtonStyle { font_size: 11.0, ..ToggleButtonStyle::from_palette(&Palette::dark()) };
         let rect = Rect { x: 10.0, y: 10.0, w: 40.0, h: 18.0 };
 
         // (a) 長いラベル → 省略。
@@ -475,7 +574,7 @@ mod tests {
         let style = ToggleButtonStyle {
             off_color: Color::rgb(0.10, 0.10, 0.10),
             on_color: Color::rgb(0.90, 0.10, 0.10),
-            ..ToggleButtonStyle::default()
+            ..ToggleButtonStyle::from_palette(&Palette::dark())
         };
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {

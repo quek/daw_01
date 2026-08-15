@@ -1773,6 +1773,31 @@ mod tests {
         assert!(err.contains("retired"), "unexpected error: {err}");
     }
 
+    /// v33: マスター音量が保存され、開き直すと復元されること。
+    /// 旧 `.daw` (フィールド無し) は unity で読めること。
+    #[test]
+    fn master_gain_round_trips_and_defaults_to_unity_for_old_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gain.daw");
+        let mut song = Song::default();
+        song.master_gain = 0.5;
+        save(&path, &song).unwrap();
+        assert_eq!(load(&path).unwrap().master_gain, 0.5);
+
+        // v32 以前は master_gain キーを持たない。
+        let old = dir.path().join("v32.daw");
+        fs::write(
+            &old,
+            r#"{"version":32,"song":{"bpm":120.0,"time_sig":[4,4],"length_beats":64.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load(&old).unwrap().master_gain,
+            1.0,
+            "旧ファイルの聞こえ方が変わってはいけない"
+        );
+    }
+
     #[test]
     fn load_rejects_invalid_json() {
         let dir = tempdir().unwrap();

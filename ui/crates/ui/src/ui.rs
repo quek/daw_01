@@ -13,13 +13,14 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cosmic_text::FontSystem;
 use daw_ui_platform::{
     CursorIcon, ImeTextEdit, KeyEvent, PhysicalKey, PhysicalSize, RectPx, TextDocument,
 };
 use daw_ui_renderer::{
-    Color, GlyphArea, LineBatch, LineSegment, Primitive, Rect, RectCommand, Scene, TexturedQuad,
+    GlyphArea, LineBatch, LineSegment, Primitive, Rect, RectCommand, Scene, TexturedQuad,
 };
 
 use crate::clipboard::ClipboardProvider;
@@ -31,6 +32,7 @@ use crate::popup::PopupOpenState;
 use crate::scenegraph::{CachedCommands, Scenegraph};
 use crate::shortcut::{self, ShortcutMap};
 use crate::text_metrics::TextMetrics;
+use crate::theme::Palette;
 use crate::widgets::WidgetState;
 use crate::widgets::drag_in_rect::{DragInRectState, DragInfo, DragKind};
 use crate::widgets::drag_rect::{DragRect, DragRectState};
@@ -56,6 +58,11 @@ type TakeImeEditsFn = Box<dyn Fn() -> Vec<ImeTextEdit> + Send + Sync>;
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct UiHost<M: ?Sized + 'static> {
+    /// r.md #48: 現在有効な色パレット。**widget が読む色の唯一の出どころ**で、
+    /// `Ui::palette()` から供給される。プロセスグローバルにしないのは、テストが
+    /// 並列スレッドで走るため (可変グローバルだとテーマを差し替えるテストが
+    /// 他テストの色アサーションを壊す)。差し替えは [`UiHost::set_palette`]。
+    palette: Arc<Palette>,
     state: HashMap<WidgetId, Box<dyn WidgetState>>,
     /// キーボードフォーカスを持つウィジェット (`text_input` 等)。
     focused: Option<WidgetId>,
@@ -100,6 +107,8 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだ場合の累積フラグ。
     /// `frame()` の最後で `redraw_request` 呼び出し条件に含まれる。
     redraw_requested_in_last_frame: bool,
+    /// 自動 `request_redraw` を抑止しているか ([`Self::set_redraw_suppressed`])。
+    redraw_suppressed: bool,
     /// M8 Phase 30: shortcut 登録テーブル。
     shortcut_map: ShortcutMap,
     /// M8 Phase 31: OS clipboard provider (None なら set/get は no-op)。
@@ -123,6 +132,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// M9 Phase 41b: 今フレームに `Ui::set_cursor` で要求された cursor (last call wins)。
     /// `frame()` 末尾で `set_cursor_request` callback に flush され、None にリセットされる。
     transient_cursor: Option<CursorIcon>,
+    /// 最後に OS へ送った cursor 形状。per-frame flush で「前回と違うときだけ送る」
+    /// ための dedup (毎フレーム Win32 を叩かないため)。`None` = 未送信。
+    last_flushed_cursor: Option<CursorIcon>,
     /// 今フレームに `Ui::warp_cursor` で要求された cursor 位置 (物理 px、last call wins)。
     /// `frame()` 末尾で `set_cursor_pos_request` callback に flush され、None にリセットされる。
     transient_cursor_pos: Option<(f32, f32)>,
@@ -209,6 +221,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// 通常は [`Self::with_window`] を使う方が簡潔。
     pub fn new(redraw_request: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
+            palette: Arc::new(Palette::dark()),
             state: HashMap::new(),
             focused: None,
             focus_changed_in_last_frame: false,
@@ -218,6 +231,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             redraw_request: Box::new(redraw_request),
             open_popups: HashMap::new(),
             redraw_requested_in_last_frame: false,
+            redraw_suppressed: false,
             shortcut_map: ShortcutMap::with_default_bindings(),
             clipboard: None,
             pending_dialog_results: HashMap::new(),
@@ -226,6 +240,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             transient_dialog_requests: Vec::new(),
             transient_consumed_dialog_results: HashSet::new(),
             transient_cursor: None,
+            last_flushed_cursor: None,
             transient_cursor_pos: None,
             set_cursor_request: None,
             set_cursor_pos_request: None,
@@ -243,6 +258,27 @@ impl<M: ?Sized + 'static> UiHost<M> {
             owned_font_system: None,
             _m: PhantomData,
         }
+    }
+
+    /// r.md #48: 有効な色パレットを差し替える。**変わったら `true`** を返すので、
+    /// 呼び出し側は `if host.set_palette(p) { host.invalidate_scene_cache(); }` と書ける
+    /// (キャッシュされた描画コマンドには旧テーマの色が焼き込まれているため、
+    /// 捨てないとアレンジ / ピアノロールだけ旧色のまま残る)。
+    ///
+    /// 毎フレーム無条件に呼んでよい (同じ `Arc` なら `false` を返して no-op)。
+    /// そうしておけば「テーマを変えたのに push し忘れた」 が構造的に起きない。
+    pub fn set_palette(&mut self, palette: Arc<Palette>) -> bool {
+        if Arc::ptr_eq(&self.palette, &palette) || self.palette == palette {
+            return false;
+        }
+        self.palette = palette;
+        true
+    }
+
+    /// 現在の色パレット。アプリ側が同じ実体を共有する (= 複製しない) ために `Arc` を返す。
+    #[must_use]
+    pub fn palette(&self) -> &Arc<Palette> {
+        &self.palette
     }
 
     /// M9 P1-4: ダブルクリック判定の閾値を変更 (default: 400ms / 5px)。
@@ -333,6 +369,25 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// テスト / offscreen render 用、`request_redraw` を呼ばない UiHost を構築する。
     pub fn no_redraw() -> Self {
         Self::new(|| {})
+    }
+
+    /// 自動 `request_redraw` を抑止する / 解除する。
+    ///
+    /// `frame()` 末尾の自動 redraw は、edits / focus 変化に加えて **widget が
+    /// `Ui::request_redraw` で要求した継続アニメ** (レベルメーターの減衰・
+    /// peak hold、scroll / tab のトランジション等) でも発火する。これは
+    /// 「見えている画面を滑らかに保つ」ためのもので、利用者側が省電力等で
+    /// **「今この画面は誰も見ていないので描かない」** と決めているときには
+    /// 逆効果になる — widget は自分が見えているかを知らないので、要求を出し続ける。
+    ///
+    /// `true` の間は自動 redraw を呼ばないので、「描くかどうか」の判断を
+    /// 利用者側の 1 箇所に集約できる。**解除した側が次のフレームを要求する責任を負う**
+    /// (抑止中に溜まった要求は再生されない)。
+    ///
+    /// 入力イベント由来の再描画は利用者が直接 `WindowBackend::request_redraw` を
+    /// 呼ぶ経路なので、これには影響されない。
+    pub fn set_redraw_suppressed(&mut self, suppressed: bool) {
+        self.redraw_suppressed = suppressed;
     }
 
     /// `frame()` 末尾で cursor 要求を受け取る sink を差し込む。通常は `with_window` が
@@ -455,10 +510,22 @@ impl<M: ?Sized + 'static> UiHost<M> {
         }
 
         // M9 Phase 41b: cursor flush (Ui::set_cursor で要求された形状を OS に伝える)。
-        if let Some(c) = self.transient_cursor.take()
+        //
+        // **per-frame セマンティクス** (daw_01 r.md #50): 誰も要求しなかったフレームは
+        // `Default` を送る。winit / OS 側は state-full なので、要求が無いときに何も
+        // 送らないと前フレームの形状が残り続ける。そのため旧仕様では *全 widget* が
+        // 「自分の担当矩形の中なら明示的に Default」という同じ boilerplate を書く
+        // 必要があり、書き忘れた widget の上でカーソルが貼り付いた (arrangement /
+        // piano_roll は書いていた、master_panel は書き忘れた = 設計欠陥のシグナル)。
+        //
+        // 実際に OS へ送るのは **前回と違うときだけ** なので、毎フレーム Win32 を
+        // 叩くことにはならない。
+        let want = self.transient_cursor.take().unwrap_or(CursorIcon::Default);
+        if self.last_flushed_cursor != Some(want)
             && let Some(req) = self.set_cursor_request.as_ref()
         {
-            req(c);
+            req(want);
+            self.last_flushed_cursor = Some(want);
         }
 
         // cursor 位置 warp flush (Ui::warp_cursor で要求された位置を OS に伝える)。
@@ -477,11 +544,12 @@ impl<M: ?Sized + 'static> UiHost<M> {
 
         // 自動 redraw の発火条件: edits / focus 変化 / widget からの request_redraw
         // / dialog 実行 (新結果が出た) / 残っている dialog 結果 (widget が次フレームで取り出す)。
-        if had_edits
-            || self.focus_changed_in_last_frame
-            || self.redraw_requested_in_last_frame
-            || dialog_runs
-            || !self.pending_dialog_results.is_empty()
+        if !self.redraw_suppressed
+            && (had_edits
+                || self.focus_changed_in_last_frame
+                || self.redraw_requested_in_last_frame
+                || dialog_runs
+                || !self.pending_dialog_results.is_empty())
         {
             (self.redraw_request)();
         }
@@ -713,7 +781,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
             .any(|s| s.modal && s.capture_input && s.capture_keyboard);
         let effective_pointer = if modal_capturing { masked_pointer(pointer) } else { pointer };
 
+        // r.md #48: ウィンドウの clear 色はパレットの床。renderer 側の `Scene::DEFAULT_CLEAR`
+        // は「app が何も言わなかったときの中立値」 に留め、意味づけは ui 層が行う。
+        // これを入れないと、panel の隙間・レイアウト余白だけが旧テーマの色で残る。
+        scene.clear_color = self.palette.window_bg.to_wgpu();
+
         let mut ui = Ui {
+            palette: &self.palette,
             state: &mut self.state,
             scene,
             edits: &mut edits,
@@ -856,6 +930,9 @@ impl<M: ?Sized + 'static> Default for UiHost<M> {
 /// ため、`clippy::struct_excessive_bools` を allow する (state machine 化はオーバーヘッド過大)。
 #[allow(clippy::struct_excessive_bools)]
 pub struct Ui<'a, M: ?Sized + 'static> {
+    /// r.md #48: このフレームで有効な色パレット (`UiHost` 所有の実体への借用)。
+    /// widget は [`Ui::palette`] から読む。
+    palette: &'a Palette,
     state: &'a mut HashMap<WidgetId, Box<dyn WidgetState>>,
     scene: &'a mut Scene,
     edits: &'a mut Vec<Edit<M>>,
@@ -988,6 +1065,15 @@ pub struct Ui<'a, M: ?Sized + 'static> {
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub fn screen(&self) -> PhysicalSize {
         self.screen
+    }
+
+    /// r.md #48: このフレームの色パレット。**widget が色を得る唯一の口**。
+    ///
+    /// 戻りの寿命は `&self` ではなく **host の `'a`** に紐づけてある。おかげで
+    /// `let p = ui.palette();` の後に `ui.push_rect(...)` を呼べる (借用衝突しない)。
+    #[must_use]
+    pub fn palette(&self) -> &'a Palette {
+        self.palette
     }
 
     pub fn pointer(&self) -> PointerFrame {
@@ -1523,9 +1609,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// (low-level constructor [`UiHost::new`] / [`UiHost::no_redraw`] で構築した場合)。
     /// 通常 [`UiHost::with_window`] で構築すれば自動的に有効化される。
     ///
-    /// `set_cursor` を呼ばなかったフレームは前フレームの形状が OS 側に保持されたまま
-    /// (winit は state-full)。reset したい場合は明示的に `set_cursor(CursorIcon::Default)`
-    /// を呼ぶこと。
+    /// **誰も `set_cursor` を呼ばなかったフレームは自動的に `Default` に戻る**
+    /// (daw_01 r.md #50)。OS 側は state-full なので、旧仕様 (要求が無ければ何も
+    /// 送らない) では全 widget が「自分の担当矩形の中なら明示的に Default」という
+    /// 同じ boilerplate を書く必要があり、書き忘れた widget の上でカーソルが
+    /// 貼り付いた。実際に OS へ送るのは前回と形状が変わったときだけ。
+    ///
+    /// したがって widget は「自分が形を変えたいときだけ呼ぶ」でよい。
     pub fn set_cursor(&mut self, cursor: CursorIcon) {
         *self.pending_cursor = Some(cursor);
     }
@@ -1602,10 +1692,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // popup_glyph: GlyphPipeline を独立インスタンスにすることで根本解決済み。
         let prev_in_popup = self.drawing_in_popup;
         self.drawing_in_popup = true;
+        let p = self.palette();
         self.push_rect(RectCommand {
             rect: bg_rect,
-            fill: Color::rgba(0.05, 0.06, 0.10, 0.85),
-            border: Color::rgba(0.55, 0.85, 0.65, 0.55),
+            fill: p.debug_overlay_bg,
+            border: p.debug_overlay_border,
             border_width: 1.0,
             radius: [3.0; 4],
             clip_rect: None,
@@ -1617,7 +1708,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: bg_rect.y + pad + (i as f32) * line_h,
                 font_size,
                 line_height: line_h,
-                color: Color::rgb(0.85, 0.95, 0.85),
+                color: p.debug_text,
                 clip_rect: None,
                 ..GlyphArea::default()
             });
@@ -1947,7 +2038,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// `wid` を渡し、self が focused かを内部で判定する想定だが、`is_focused` を呼んで
     /// 利用者側で判定するスタイルでも動く (描画のみ行う、判定はしない)。
     pub fn draw_focus_ring(&mut self, rect: Rect) {
-        let color = Color::rgb(0.55, 0.78, 0.95);
+        let color = self.palette().focus_ring;
         let segments = vec![
             LineSegment { a: [rect.x, rect.y], b: [rect.x + rect.w, rect.y], color },
             LineSegment {
@@ -2138,10 +2229,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             finished: just_finished,
         };
 
-        // drag 中は半透明 cyan overlay を自動描画 (release frame でも 1 度描画する)。
+        // drag 中は半透明の marquee overlay を自動描画 (release frame でも 1 度描画する)。
         let r = drag.rect();
-        let fill = Color { r: 0.32, g: 0.78, b: 0.95, a: 0.20 };
-        let border = Color { r: 0.32, g: 0.78, b: 0.95, a: 0.85 };
+        let fill = self.palette().marquee_fill;
+        let border = self.palette().marquee_border;
         self.push_rect(RectCommand {
             rect: r,
             fill,

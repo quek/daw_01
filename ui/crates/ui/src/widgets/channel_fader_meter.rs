@@ -51,7 +51,10 @@ pub struct ChannelFaderMeterResponse {
     /// modulation depth の drag 編集中 (= `fader.mod_dragging` の便宜 re-export、 daw_01 #110)。
     /// edge 検出で caller が depth の undo bracket を発火する。 base `fader.dragging` とは排他。
     pub mod_dragging: bool,
-    // meter の peak-reset click は widget 内部で消費済み。
+    /// メーター列がクリックされ、数値ピークのリセットが要求された。
+    /// [`MeterBallistic::Direct`] のとき **呼び出し側が自分の測定器をリセットする**
+    /// (それ以外のモードでは widget 内部で reset 済みなので無視してよい)。
+    pub peak_reset: bool,
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -135,9 +138,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // depth の fader_core consume で fader が掴んだ press は既に除かれているので衝突しない)。
         let meter_wid = WidgetId::ROOT.child((b"cfm_meter", &id));
         let content = Rect { x: meter_col.x, y: region.y, w: meter_col.w, h: region.h };
-        self.meter_body(meter_wid, meter_col, content, l, r, ballistic, &style);
+        let peak_reset = self.meter_body(meter_wid, meter_col, content, l, r, ballistic, &style);
 
-        ChannelFaderMeterResponse { mod_dragging: fader.mod_dragging, fader }
+        ChannelFaderMeterResponse { mod_dragging: fader.mod_dragging, fader, peak_reset }
     }
 }
 
@@ -154,6 +157,7 @@ mod tests {
 
     use super::*;
     use crate::input::PointerFrame;
+    use crate::theme::Palette;
     use crate::ui::UiHost;
     use crate::widgets::level_meter::{MeterScale, meter_content_region};
     use crate::{FrameInput, LevelMeterStyle};
@@ -168,11 +172,13 @@ mod tests {
 
     const FADER_W: f32 = 18.0;
 
+    /// テスト用の style。 色はダークテーマ固定 (`Default` は色を持つ style から撤去した:
+    /// テーマ従属の色を隠れたグローバルから引くとライトテーマに追従しないため)。
     fn style() -> LevelMeterStyle {
         LevelMeterStyle {
             scale: Some(MeterScale::default()),
             peak_readout: true,
-            ..LevelMeterStyle::default()
+            ..LevelMeterStyle::from_palette(&Palette::dark())
         }
     }
 

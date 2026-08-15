@@ -93,6 +93,10 @@ pub struct AudioSession {
     /// (`metrics_bridge::metrics_shmem_id(pid)`)。 daw_audio / daw_plugin_host
     /// がこれで `MetricsBridgeHandle::open` し、 DSP load / per-plugin CPU を publish。
     pub metrics_shmem_id: String,
+    /// r.md #50: マスター出力サンプルリング (`scope_bridge::scope_shmem_id(pid)`)
+    /// の shmem os_id。daw_audio がこれで `ScopeBridgeHandle::open` し、
+    /// `render_master_buffer` の出力を毎バッファ書き込む。daw_plugin_host は使わない。
+    pub scope_shmem_id: String,
     pub sample_rate: u32,
     pub max_frames: u32,
     pub channels: u16,
@@ -297,6 +301,13 @@ pub enum AudioCommand {
     },
     /// メトロノーム on/off。 session-only state。
     SetMetronomeEnabled(bool),
+    /// r.md #49: daw_01 の窓 (メイン / 動画プレビュー / プラグインエディタ) のいずれかが
+    /// アクティブか。daw_gui が唯一の判定者で、**事実だけ**を運ぶ。
+    ///
+    /// engine を park するかどうかは engine 側が決める (再生中 / count-in / 書き出し中 /
+    /// 出力が無音か、を engine だけが知っているため)。GUI は「窓がアクティブか」という
+    /// 事実だけを運ぶ。
+    SetAppActive(bool),
     /// 鍵盤レーン click のピッチプレビュー単発 note-on。 `track_id` は
     /// stable `Track::id`。 transport 状態に関係なく発音する。
     PreviewNoteOn {
@@ -306,9 +317,19 @@ pub enum AudioCommand {
     },
     /// 鍵盤プレビューの note-off。
     PreviewNoteOff { track_id: u32, pitch: u8 },
-    /// count-in 開始。 preroll 中は dispatch / clip render を skip して
-    /// metronome のみ render。 `samples = 0` で即時 cancel。
-    StartCountIn { samples: u64 },
+    /// r.md #51: 録音セッションの開始。 engine はこれを受けて
+    /// 1. `preroll_samples > 0` なら count-in に入る (preroll 中は dispatch /
+    ///    clip render を skip して metronome のみ render)、
+    /// 2. 曲末の auto-stop を抑止する (録音は曲の後ろへ継ぎ足せる)、
+    /// 3. `recording_live` (= 録音要求 && 再生中 && count-in 完了) を publish する。
+    ///
+    /// 「count-in の開始」ではなく **録音そのもの**を運ぶ。engine が曲末 auto-stop を
+    /// 抑止するにも、count-in 明けを GUI に知らせるにも「録音中か」が要るため。
+    StartRecording { preroll_samples: u64 },
+    /// r.md #51: 録音セッションの終了 (パンチアウト / 停止 / count-in 取り消し)。
+    /// engine は preroll を捨て、auto-stop の抑止と `recording_live` を解除する。
+    /// transport は **止めない** — 停止は `Stop` の仕事 (パンチアウトは再生継続)。
+    StopRecording,
     /// Stand up the per-buffer plugin process worker pool. `n_workers`
     /// audio-engine workers pair 1:1 with plugin-host workers via the named
     /// events listed. イベント名は世代 (generation) 込みで daw_gui が mint
@@ -514,6 +535,16 @@ pub enum PluginEvent {
     /// - VSTGUI 等はフレーム窓が `WM_GETDLGCODE` に応答しない一方、 文字編集中は本物の
     ///   Win32 EDIT を生成するので、 フォーカス窓への `WM_GETDLGCODE` 問い合わせで判別できる。
     EditorKey { device_id: u64, chord: KeyChord },
+    /// r.md #49: このプロセスが所有する窓 (= プラグインエディタ) がアクティブになった /
+    /// 非アクティブになった。`WM_ACTIVATEAPP` 由来。
+    ///
+    /// エディタ窓は **daw_plugin_host が所有する owner 無し top-level** で、daw_gui を
+    /// owner にすることは設計上禁止されている (`GetAncestor(GA_ROOTOWNER)` が daw_gui に
+    /// 解決すると JUCE の cascade サブメニューが `isForegroundProcess()` 判定で即 dismiss
+    /// される — `daw_plugin_host::editor_window` の冒頭コメント)。よって「プラグイン GUI を
+    /// 触っている間もアプリはアクティブ」を daw_gui 内の情報だけで判定することは**原理的に
+    /// できず**、このプロセスが自分で報告するしかない。
+    HostWindowsActive(bool),
     /// Reply to `PluginCommand::ReinitAllPlugins`.
     PluginsReinitDone,
     /// builtin VOICEVOX の歌唱合成が `PrepareVocalSynth` で要求した世代まで
@@ -684,6 +715,21 @@ mod tests {
     fn load_song_roundtrip() {
         let msg = AudioCommand::LoadSong(crate::model::Song::default());
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    /// r.md #49: アイドル省電力の 2 本の新 wire。
+    #[test]
+    fn idle_power_roundtrip() {
+        for active in [true, false] {
+            assert_eq!(
+                roundtrip(&AudioCommand::SetAppActive(active)),
+                AudioCommand::SetAppActive(active)
+            );
+            assert_eq!(
+                roundtrip(&PluginEvent::HostWindowsActive(active)),
+                PluginEvent::HostWindowsActive(active)
+            );
+        }
     }
 
     /// wire を渡る `Song` は blob-less であること (`PluginInstance` の手書き

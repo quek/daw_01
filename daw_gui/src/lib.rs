@@ -43,6 +43,7 @@ pub mod video_playback;
 #[cfg(windows)]
 pub mod video_playback_worker;
 pub mod job;
+pub mod master_meter;
 pub mod midi;
 pub mod midi_export;
 // `--script` headless テスト駆動。JS エンジン boa_engine を抱えるので `script`

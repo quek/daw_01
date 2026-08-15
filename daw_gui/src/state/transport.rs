@@ -13,7 +13,23 @@ pub struct TransportState {
     pub metronome_enabled: bool,
 
     // -------- Playback / metering --------
+    /// r.md #51: audio engine が今 transport を回しているか
+    /// (`AudioBridge::playing` の観測ミラー)。
+    ///
+    /// **writer は `on_tick` ただ 1 箇所**。GUI 側で「Play を送ったから再生中の
+    /// はず」という記憶を持つと、engine が自分で止まったとき (曲末 auto-stop /
+    /// 書き出し / crash) や、GUI 以外の経路で走り出したときに食い違う。実際、
+    /// 旧実装は Rec 単独録音でこれが食い違い、プレイヘッド凍結・オートメーション
+    /// 未記録・曲末で止まらない、が一度に起きていた。
+    ///
+    /// 観測なので Play を押してから true になるまで最大 1 tick (33ms) 遅れる。
+    /// プレイヘッド自身が同じ面から来るので、表示上の齟齬は生じない。
     pub is_playing: bool,
+    /// r.md #51: count-in の残り samples (`AudioBridge::preroll_remaining_samples`
+    /// の観測ミラー)。0 = count-in 中でない。**これ単体で「count-in が終わったか」を
+    /// 判定しない** — 0 は「まだ始まっていない」も意味する。録音実体の開始は
+    /// `recording.live` を見る。
+    pub preroll_remaining: u64,
     /// 再生ループ (ON/OFF + 範囲) の live SSoT。 ループは「作った中身」 ではなく
     /// 「聴き方の都合」 なので `Song` には置かず、 ズーム / スクロールと同じく
     /// ここ (session state) が持ち `ViewState` で永続化する = **変えても dirty
@@ -37,11 +53,13 @@ pub struct TransportState {
     /// `PanicRelease` を送って `false` に戻す。 ミュート解除を reinit 完了に結び
     /// つけるためのフラグ（[`Self::panic`] 参照）。
     pub panic_release_pending: bool,
-    pub master_gain: f32,
-    pub peak_l_display: f32,
-    pub peak_r_display: f32,
-    pub peak_l_norm: f32,
-    pub peak_r_norm: f32,
+    /// r.md #50: マスター出力の全メーター表示状態。テレメトリスレッドの
+    /// `MasterAnalyzer` が `MasterMeterTick` で毎ティック更新する。
+    ///
+    /// 旧 `peak_l_display` / `peak_r_display` / `peak_*_norm` はここに吸収した
+    /// (ピークだけ別経路で持つと「同じ音なのに値が違う」を作るため — 計測は
+    /// 解析器 1 か所が SSoT)。
+    pub master_meter: crate::master_meter::MasterMeterSnapshot,
 
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,
@@ -53,6 +71,11 @@ pub struct TransportState {
     /// `play()` was called while `pending_plugin_loads` was non-empty;
     /// re-fire it once the last `SlotPluginLoaded` arrives.
     pub pending_play: bool,
+    /// queue された要求が「録音の開始」だったか、だとすれば count-in の長さ
+    /// (samples、`0` = count-in 無し)。 録音開始が読み込み待ちで queue された
+    /// とき、再発火でも録音と count-in を落とさないために覚えておく (r.md #51)。
+    /// `None` = ただの再生。
+    pub pending_play_record: Option<u64>,
 
     /// 進行中 export の現在フェーズ + 進捗 ([`ExportStage`])。音声 freewheel
     /// (標準 WAV export / video 前段) は daw_audio の `ExportWavProgress`、映像

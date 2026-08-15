@@ -16,9 +16,9 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
+use crate::theme::Palette;
 use crate::ui::Ui;
 
 /// `Ui::modal` の見た目スタイル。
@@ -37,11 +37,18 @@ pub struct ModalStyle {
     pub close_on_escape: bool,
 }
 
-impl Default for ModalStyle {
-    fn default() -> Self {
+impl ModalStyle {
+    /// パレットから既定の modal スタイルを組む。overlay は背後を沈める暗幕 (`backdrop`)、
+    /// panel は elevation-1 の面 (`panel`)。
+    ///
+    /// `Default` は持たない (r.md #48): テーマ色を読む `Default::default()` は隠れた
+    /// グローバル依存になり、ライトテーマに追従しないため。caller は
+    /// `ModalStyle::from_palette(ui.palette())` で組む。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
-            overlay_color: theme::BACKDROP,
-            panel_bg: theme::PANEL,
+            overlay_color: p.backdrop,
+            panel_bg: p.panel,
             panel_radius: 6.0,
             close_on_outside_click: true,
             close_on_escape: true,
@@ -178,6 +185,7 @@ mod tests {
     use super::ModalStyle;
     use crate::edit::Edit;
     use crate::input::{FrameInput, PointerFrame};
+    use crate::theme::Palette;
     use crate::ui::UiHost;
 
     #[test]
@@ -185,7 +193,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
         let body_called = Cell::new(0u32);
 
         // 開いていない → body は呼ばれない
@@ -211,7 +219,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
         let on_close_fired = std::rc::Rc::new(Cell::new(false));
 
         // open
@@ -258,7 +266,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
         let on_close_fired = std::rc::Rc::new(Cell::new(false));
 
         // open + 1 frame で anchor 更新
@@ -349,7 +357,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.open_modal("dlg");
@@ -371,7 +379,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
         let on_close_fired = std::rc::Rc::new(Cell::new(false));
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -401,7 +409,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
         let on_close_fired = std::rc::Rc::new(Cell::new(false));
 
         // open + 1 frame で anchor を panel_rect に確定 (panel 200x100 を screen 800x600 中央)。
@@ -482,7 +490,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
 
         // 1 frame: open + draw (anchor 確定 + capture_input=true sync)
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
@@ -529,7 +537,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.open_modal("m");
@@ -565,7 +573,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.open_modal("m");
@@ -600,7 +608,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default();
+        let style = ModalStyle::from_palette(&Palette::dark());
         let menu_anchor = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
 
         // 1 frame: background popup (menu = capture_input false) と capturing modal を両方開く。
@@ -646,7 +654,10 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle { close_on_outside_click: false, ..ModalStyle::default() };
+        let style = ModalStyle {
+            close_on_outside_click: false,
+            ..ModalStyle::from_palette(&Palette::dark())
+        };
         let on_close_fired = std::rc::Rc::new(Cell::new(false));
         let body_called = Cell::new(0u32);
 
@@ -695,7 +706,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ModalStyle::default(); // close_on_outside_click = true
+        let style = ModalStyle::from_palette(&Palette::dark()); // close_on_outside_click = true
 
         host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
             ui.open_modal("dlg");

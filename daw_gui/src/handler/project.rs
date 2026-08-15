@@ -37,6 +37,17 @@ impl AppData {
     /// GPU テクスチャ) は「id + 実体」で同一性が決まるので、`project_id` が
     /// 変わったときだけ捨てる (同 project の読み直しで再 decode しない)。
     pub(crate) fn reset_song_scoped_state(&mut self) {
+        // r.md #51: 走っているものを畳む。 録音セッションを閉じないと、新しい曲で
+        // Rec が点灯したまま (かつ engine 側は曲末 auto-stop が抑止されたまま) になる。
+        // モニター音も、新 Song に無い track id 宛の note-off が残らないよう全部止める。
+        //
+        // ここは **Song 差し替えの後**に呼ばれる (`after_song_replaced`) ので、
+        // 押しっぱなしノートの長さ確定は先に捨てる — 対象の Song はもう無く、
+        // 同じ id が新 Song の別ノートに当たりうる。
+        self.recording.midi_recording_active_notes.clear();
+        self.stop();
+        self.silence_monitor_notes();
+
         // ---- (A) Song を差し替えたら常に無効になるもの --------------------
         // 同じ project の別スナップショット (保存版に戻す / recovery 復元) でも
         // clip / point の id 構成は乖離しうるので、参照系は無条件に捨てる。
@@ -202,6 +213,13 @@ impl AppData {
     /// プロジェクト非依存の UI 設定 (resource monitor on/off・編集履歴 window の
     /// 開閉/位置/サイズ) を app_config.json に永続化する。 `ui_prefs` が SSoT なので
     /// 保存対象を増やしても呼び出し側は本メソッド 1 つで済む (r.md #3 / #29)。
+    /// r.md #48: 設定画面に出すテーマ一覧を取り直す (`themes/` の read_dir + JSON パース)。
+    /// 設定 window を開いたときだけ呼ぶ — 描画ループから呼ぶとフレームごとにディスクを叩く。
+    pub(crate) fn refresh_available_themes(&mut self) {
+        let dirs = self.ui_prefs.app_dirs.as_ref().map(common::app_dirs::AppDirs::themes_dir);
+        self.ui_ephemeral.available_themes = crate::theme::available_themes(dirs.as_deref());
+    }
+
     pub(crate) fn persist_app_config(&self) {
         let Some(dirs) = &self.ui_prefs.app_dirs else {
             return;
@@ -213,6 +231,17 @@ impl AppData {
                 .ui_prefs
                 .undo_history_rect
                 .map(|r| [r.x, r.y, r.w, r.h]),
+            // r.md #48: テーマは **id だけ**保存する (色を焼き込むとテーマファイルを
+            // 編集しても反映されず SSoT が二重化する)。
+            theme: self.theme.id.clone(),
+            settings_open: self.ui_prefs.settings_open,
+            settings_rect: self.ui_prefs.settings_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            // r.md #50: マスターパネルの見え方は「この人の画面の使い方」なので
+            // プロジェクト (`ViewState`) ではなくアプリ設定側に持つ。
+            master_panel_open: self.ui_prefs.master_panel_open,
+            master_panel_w: self.ui_prefs.master_panel_w,
+            master_panel_sections: self.ui_prefs.master_panel_sections,
+            meter: self.ui_prefs.meter_settings,
         };
         if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
             tracing::warn!(error = ?e, "failed to save app_config");
@@ -568,8 +597,7 @@ impl AppData {
         }
         // 音が揃った時点で再生 gate を外す (画像 / サムネイルは待たない)。
         if audio_remaining == 0 && self.transport.pending_play {
-            self.transport.pending_play = false;
-            self.play();
+            self.fire_pending_play();
         }
         if done >= total {
             tracing::info!(total, "asset decode complete");
