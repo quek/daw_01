@@ -56,6 +56,8 @@ pub fn run(init: RunnerInit) -> Result<(), winit::error::EventLoopError> {
         diag_window_start: None,
         diag_window_count: 0,
         diag_window_max_dt: std::time::Duration::ZERO,
+        fps_window_start: Instant::now(),
+        fps_window_frames: 0,
     };
     event_loop.run_app(&mut runner)
 }
@@ -680,28 +682,55 @@ struct Runner {
     diag_window_start: Option<Instant>,
     diag_window_count: u32,
     diag_window_max_dt: std::time::Duration,
+    /// r.md #49: ステータスバーの FPS 表示用の実測窓 (開始時刻と描いた本数)。
+    /// per-frame dt ではなく本数 ÷ 経過時間で出す (`render_frame` のコメント参照)。
+    fps_window_start: Instant,
+    fps_window_frames: u32,
 }
 
 impl Runner {
     fn dispatch_platform_event(&mut self, ev: PlatformEvent) {
         let Some(state) = self.state.as_mut() else { return };
         state.input.ingest(&ev);
-        match ev {
-            PlatformEvent::Resized(size) => {
-                state.renderer.resize(size);
-                state.window.request_redraw();
-            }
-            PlatformEvent::PointerMoved(_)
-            | PlatformEvent::PointerInput { .. }
-            | PlatformEvent::Scroll(_)
-            | PlatformEvent::Keyboard(_)
-            | PlatformEvent::ImePreedit { .. }
-            | PlatformEvent::ImeCommit(_)
-            | PlatformEvent::ModifiersChanged(_) => {
-                state.window.request_redraw();
+        match &ev {
+            PlatformEvent::Resized(size) => state.renderer.resize(*size),
+            // r.md #49: メインウィンドウの focus は「アプリがアクティブか」の材料。
+            PlatformEvent::Focus(focused) => {
+                state.app.activity.main_focused = *focused;
+                state.app.sync_app_active_with_audio();
             }
             _ => {}
         }
+        // r.md #49: **すべての** platform event で再描画する。
+        //
+        // 旧実装は pointer / key / scroll / IME / modifier だけを列挙し、残り
+        // (`Focus` / `PointerEntered` / `PointerLeft` / `FileHovered` /
+        // `FileHoverCancelled` / `FileDropped` / `ScaleFactorChanged`) を
+        // `_ => {}` に落としていた。これらは **33ms tick の無条件再描画に
+        // 救われて動いていただけ**で、tick を間引くと即座に体感バグになる
+        // (Alt+Tab でドラッグ表示が貼り付く / ファイルのドロップ対象ハイライトが
+        // 出ない・消えない / 窓外へ出た hover が残る)。
+        //
+        // そもそも platform event が届くのは **自分の窓が入力を受けたとき** =
+        // アプリはアクティブなので、ここで省電力の判定を挟む意味も無い。
+        state.window.request_redraw();
+    }
+
+    /// r.md #49: 「今この瞬間、画面を描く意味があるか」を評価し、背景スレッドと
+    /// 共有するフラグを更新して、描画すべきかを返す。
+    ///
+    /// 描画条件と tick レートの条件は **同じ**。再生 / 録音中は非アクティブでも
+    /// 描き続けるので (`should_keep_rendering`)、`on_tick` に同居する曲末の
+    /// 自動停止判定・オートメーション録音の分解能・再生追従スクロールも自動的に
+    /// 30Hz を保つ。
+    fn refresh_activity(state: &mut RunnerState, now: Instant) -> bool {
+        let keep = state.app.should_keep_rendering(now);
+        state
+            .app
+            .activity
+            .awake
+            .store(keep, std::sync::atomic::Ordering::Release);
+        keep
     }
 }
 
@@ -937,8 +966,45 @@ impl ApplicationHandler<AppEvent> for Runner {
             }
             return;
         }
+        // r.md #49: tick 系だけは「画面に出る値が変わったか」で再描画を決める。
+        // 毎秒 30 回届くのに中身が同じ (停止中は playhead も peak も動かない) ため、
+        // 従来はこれだけで 30fps 描き続けていた。他の event は**従来どおり無条件に
+        // 再描画**する — 判定対象を 5 つに閉じ込めることで、残り数百の variant に
+        // 「立て忘れ = 画面が固まる」という新しい失敗モードを持ち込まない。
+        let is_tick = matches!(
+            event,
+            AppEvent::Tick { .. }
+                | AppEvent::ModScalarsTick(_)
+                | AppEvent::TrackPeaksTick(_)
+                | AppEvent::MetricsTick { .. }
+                | AppEvent::SystemMetricsTick { .. }
+        );
+        let before = is_tick.then(|| state.app.tick_visual_fingerprint());
         state.app.handle_event(event);
-        state.window.request_redraw();
+        let changed = match before {
+            Some(before) => state.app.tick_visual_fingerprint() != before,
+            None => true,
+        };
+        if Self::refresh_activity(state, Instant::now()) {
+            if changed {
+                state.window.request_redraw();
+            }
+        } else {
+            // r.md #49: 子プロセスへの Song 同期は通常 `render_frame` の末尾で
+            // 1 frame 1 回に coalesce される (docs/plan_arch_refactor.md §7.5)。
+            // 省電力中はその口が来ないので、ここで流す。
+            //
+            // これが無いと、**裏で MIDI コントローラを触った編集が engine に
+            // 届かない** (`AppEvent::MidiControlChange` → binding → param 変更は
+            // フォーカスと無関係に届く)。`flush_song_sync` は epoch 差分ゲートなので、
+            // 編集が無ければ no-op。
+            //
+            // **描画する側では呼ばない**。編集は必ず非 tick event か epoch を
+            // 動かす tick から来るので `changed` が立ち、再描画 = frame flush が
+            // 必ず後に続く。両方で呼ぶと、ドラッグ中に frame flush と tick flush が
+            // 交互に走って `LoadSong` の送信回数が増える (coalesce の意味が薄れる)。
+            state.app.flush_song_sync();
+        }
         // 背景スレッド (IPC bridge) 経由の event で、 plugin state 取得待ちの
         // 非同期保存が完了して `should_quit` が立つことがある (= 「保存して
         // 終了」 で plugin 有り project)。 ここで終了を拾う。
@@ -1087,11 +1153,47 @@ impl Runner {
         let dt = now.duration_since(self.last_tick);
         self.last_tick = now;
 
-        // resource monitor (r.md #3): frame 時間の EMA から GUI FPS を AppData へ。
+        // resource monitor (r.md #3): GUI の実フレームレートを AppData へ。
         // status bar 常駐メーターと詳細パネルが読む。
-        let fps_sample = common::metrics_bridge::fps_from_dt(dt.as_secs_f32());
-        state.app.ipc.metrics.fps =
-            common::metrics_bridge::ema(state.app.ipc.metrics.fps, fps_sample, 0.1);
+        //
+        // r.md #49: **1 フレームごとの dt からではなく、一定時間の実測本数から出す**。
+        // 描画がイベント駆動になると dt の分布が二極化する (連続描画中は 16ms、
+        // アイドル明けは数秒) ため、per-frame dt を EMA に入れる方式は破綻する:
+        // - そのまま入れる → アイドル明けの 1 サンプルで表示が 0 付近まで落ちる
+        // - 長い dt を捨てる → **短い側だけが残って EMA が上に暴走する**
+        //   (実測 3.9fps のとき 126fps と表示された。2026-08-15 実機検証)
+        //
+        // 本数 ÷ 経過時間なら、どちらの regime でも「秒間何枚描いたか」をそのまま
+        // 表す。アイドル中に低い値が出るのは嘘ではなく、まさに省電力が効いている証拠。
+        // r.md #49: この frame を描く意味があるかを **ui.frame の前に** 決める。
+        //
+        // daw-ui の `UiHost::frame` は末尾で自動 `request_redraw` を呼ぶ。発火条件には
+        // **widget 発の継続アニメ要求** (レベルメーターの減衰 / peak hold) が含まれ、
+        // widget は自分が見えているかを知らないので、非アクティブでも要求を出し続ける。
+        // これを塞がないと、こちらのゲートを迂回して 60fps で回り続ける
+        // (実際、停止 + 非アクティブでメーターが落ち切るまで 8 秒間 60fps だった。
+        //  2026-08-15 実機検証)。
+        let keep = Self::refresh_activity(state, now);
+        state.ui.set_redraw_suppressed(!keep);
+
+        const FPS_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+        if keep {
+            self.fps_window_frames = self.fps_window_frames.saturating_add(1);
+            let fps_elapsed = now.duration_since(self.fps_window_start);
+            if fps_elapsed >= FPS_WINDOW {
+                state.app.ipc.metrics.fps =
+                    self.fps_window_frames as f32 / fps_elapsed.as_secs_f32();
+                self.fps_window_frames = 0;
+                self.fps_window_start = now;
+            }
+        } else {
+            // 省電力に入るこの frame が「最後に描かれた絵」として残る。実測 0fps
+            // なのに直前の 60 が焼き付くと、止まっている画面が「60fps 出ている」と
+            // 読めてしまうので、ここで 0 に畳んでから描く。
+            state.app.ipc.metrics.fps = 0.0;
+            self.fps_window_frames = 0;
+            self.fps_window_start = now;
+        }
 
         // Diagnostic: emit a summary every 30 render frames so we can
         // see whether the main thread loop matches worker decode
@@ -1179,7 +1281,12 @@ impl Runner {
                     Ok(()) => {
                         // 抑制状態を畳むのは **preview 自身が成功したとき** だけ。
                         state.preview_error_log.reset();
-                        preview.window.request_redraw();
+                        // r.md #49: 成功時に `request_redraw` しない。ここで要求すると
+                        // その redraw が `handle_preview_window_event` の
+                        // `RedrawRequested` で **もう一度** `preview.render()` を呼び、
+                        // main の 1 フレームにつき preview を 2 回描いていた。
+                        // preview は main のフレームに従属して描かれれば足りる
+                        // (OS 起因の再描画は `RedrawRequested` 側が拾う)。
                     }
                     Err(e) if e.is_device_lost() => device_lost = true,
                     // 一時障害 / validation は次フレームで再試行 (redraw は継続要求)。
@@ -1307,8 +1414,15 @@ impl Runner {
         // クリップ上スピナー + 全体オーバーレイを回す。engine 未接続が確定したら
         // `voicevox_animating` が false を返すので static 警告表示で再描画は止まる
         // (CPU/GPU を回し続けない)。overlay 描画と同じ `now` (= frame_now) を使う。
+        //
+        // r.md #49: 省電力中は継続要求そのものを打ち切る。`keep` は frame 冒頭で
+        // 確定した値をそのまま使う (自動 redraw の抑止と同じ判断でなければ、
+        // 「抑止したのに継続要求は出す」ような食い違いが生まれる)。
+        //
+        // frame 中に再生が始まった場合は `user_event` 側の `AppEvent::Play` 処理が
+        // 改めて `refresh_activity` して redraw を要求するので取りこぼさない。
         let state = self.state.as_ref().expect("render_frame 内で state は生存");
-        state.app.transport.is_playing || state.app.voicevox_animating(now)
+        keep && (state.app.transport.is_playing || state.app.voicevox_animating(now))
     }
 
     /// docs/plan_video.md P4: handle a WindowEvent dispatched against
@@ -1335,6 +1449,17 @@ impl Runner {
                     width: size.width,
                     height: size.height,
                 });
+            }
+            // r.md #49: preview 窓も daw_01 の窓なので、ここを触っている間は
+            // アプリはアクティブ。これを拾わないと preview をクリックした瞬間に
+            // main が `Focused(false)` を受けて「非アクティブ」と誤判定する
+            // (preview 側の `Focused(true)` はどこにも届かない)。
+            WindowEvent::Focused(focused) => {
+                state.app.activity.preview_focused = focused;
+                state.app.sync_app_active_with_audio();
+                if focused {
+                    state.window.request_redraw();
+                }
             }
             WindowEvent::RedrawRequested => {
                 // device lost はメインループ側の復旧シーケンスが拾う (ここで再帰的に
@@ -1579,6 +1704,10 @@ impl Runner {
                 // chain — winit closes the OS window when the last
                 // Arc<Window> reference drops.
                 state.preview = None;
+                // r.md #49: 無くなった窓はアクティブではない。閉じた瞬間に
+                // focus が付いていると true のまま固着し、二度と省電力に入れない。
+                state.app.activity.preview_focused = false;
+                state.app.sync_app_active_with_audio();
             }
             _ => {}
         }

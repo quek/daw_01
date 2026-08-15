@@ -118,13 +118,24 @@ scoping と矛盾しない、むしろ更に絞り込む方向)。避けるべ�
   `waveform`。`Ui::push_edit` は `pub(crate)` なので、view から Edit を流す際は heavy ブロック内で
   `hctx.push_edit(...)` を使う
 
-### 子プロセスとクロスプロセス HWND（Windows）
+### プラグインエディタ窓と Win32（Windows）
 
-- `HWND` は `windows` crate で `HWND(*mut c_void)`。IPC 越しに渡すには `u64` にキャストして bincode
-- CLAP プラグイン GUI は daw_gui が所有する **別 top-level HWND** にホストする
-  (`view/plugin_embed.rs::PluginHostWindow`)。daw_gui のメインウィンドウとは独立、winit/wgpu
-  surface と干渉しない。`daw_plugin_host` へ HWND を `u64` で送る → `clap_plugin_gui.set_parent`
-  でプラグインが子ウィンドウ化
+- **エディタ窓は daw_plugin_host が所有する owner 無しの top-level**
+  (`daw_plugin_host/src/editor_window.rs`)。plugin-main スレッドで `CreateWindowExW` し、
+  同じスレッドで CLAP `clap_plugin_gui.set_parent` / VST3 `IPlugView::attached(kPlatformTypeHWND)`
+  を呼んでプラグイン側を子ウィンドウ化する。設計正本は `docs/plan_plugin_editor_topwindow.md`
+- **daw_gui を owner にしてはいけない**。`GetAncestor(.., GA_ROOTOWNER)` が daw_gui に解決すると、
+  JUCE (Scaler 2 等) が cascade サブメニューを `Process::isForegroundProcess()` 判定で即 dismiss
+  する。旧実装 (daw_gui が窓を作り HWND を IPC で子プロセスへ渡す) がこれを踏んでいた (FIXME #31)
+- 上の帰結として **HWND は IPC を渡らない**。protocol に HWND の field は無い。
+  `gui_set_parent_hwnd(u64)` の `u64` は plugin format 非依存にするためのプロセス内表現で、
+  プロセス境界とは無関係 (`HWND` は `windows` crate で `HWND(*mut c_void)`)。
+  daw_gui 内で HWND を持ち回る箇所 (preview 窓の owner / file dialog の owner-modal 化) も
+  すべて同一プロセス内
+- **エディタ窓を操作している間、daw_gui は非フォーカスどころか foreground プロセスですらない**
+  (上記のとおり意図的)。「アプリ全体がアクティブか」は daw_gui 内の情報だけでは原理的に
+  判定できないので、エディタ窓の WNDPROC が `WM_ACTIVATEAPP` を拾い
+  `PluginEvent::HostWindowsActive` で daw_gui へ報告する (r.md #49 アイドル省電力)
 - WNDPROC は `extern "system" fn` で Rust 状態にアクセスできないので、`GWLP_USERDATA` に
   `Arc<AtomicBool>` 等を leak で貼り付け、Drop で `Arc::from_raw` して回収する
 - プラグインのウィンドウメッセージは **作ったスレッドのキュー** に入る。daw_plugin_host は

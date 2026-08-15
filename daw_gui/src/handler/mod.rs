@@ -1,6 +1,7 @@
 //! `AppData` の event handler 群 (domain 別)。 app.rs の god-file を
 //! docs/plan_arch_refactor.md §7 に沿って分割したもの。 dispatch は
 //! app.rs の `handle_event`、 各 arm の本体がここのメソッド。
+pub mod activity;
 pub mod audio_editor;
 pub mod automation;
 pub mod automation_lanes;

@@ -139,6 +139,137 @@ pub struct SharedState {
     /// 結びつけ、 GUI メインスレッド stall や巨大 reinit でも、 plugin が mix に
     /// 残ったまま master が戻る (= クリック / reverb tail 復活) ことを防ぐ。
     pub panic_release: AtomicBool,
+    /// r.md #49: daw_01 の窓 (メイン / 動画プレビュー / プラグインエディタ) のいずれかが
+    /// アクティブか。daw_gui が `AudioCommand::SetAppActive` で更新する。
+    ///
+    /// **これは park の条件の 1 つでしかない**。park してよいかは engine が決める
+    /// (§`idle_park_state`)。起動時は true — daw_gui からの最初の報告が届くまで
+    /// 「非アクティブ」と誤認して park しないため。
+    pub app_active: AtomicBool,
+    /// park 条件が連続して成立しているサンプル数。1 つでも崩れたら 0 に戻る。
+    /// CPAL コールバック単独の writer。
+    pub idle_silent_samples: AtomicU64,
+    /// park すべき状態に達した。CPAL コールバックが立て、notify thread が
+    /// `Stream::pause()` を実行する (コールバック内から stream は触れない)。
+    pub park_requested: AtomicBool,
+}
+
+/// r.md #49: 無音かつアイドルがこの秒数続いたら CPAL stream を pause する。
+///
+/// 「音が消えてから」数えるので、リバーブの残響や自走プラグイン (VCV Rack 等) が
+/// 鳴っている間はカウンタが進まず park しない = ブツッと切れる音は構造的に出ない。
+pub const IDLE_PARK_DELAY_SECS: u64 = 5;
+
+/// 「無音」とみなす master ピークの閾値 (≈ -120 dBFS)。24bit の LSB より
+/// 十分下なので、可聴音を無音と誤判定することはない。
+pub const IDLE_SILENCE_PEAK: f32 = 1.0e-6;
+
+/// r.md #49: 今 buffer が park 条件を満たすか。
+///
+/// CPAL コールバックから atomic の読み値だけで呼ぶ純関数 (RT 安全 — 確保も
+/// ロックも I/O もしない)。`playing` は engine の内部状態で、GUI の
+/// `transport.is_playing` ではない (後者は Rec 単独の録音中に立たないので
+/// park 判定に使えない)。
+#[must_use]
+pub fn buffer_is_idle(
+    app_active: bool,
+    playing: bool,
+    preroll_remaining: u64,
+    export_running: bool,
+    peak_l: f32,
+    peak_r: f32,
+) -> bool {
+    !app_active
+        && !playing
+        && preroll_remaining == 0
+        && !export_running
+        && peak_l.abs() < IDLE_SILENCE_PEAK
+        && peak_r.abs() < IDLE_SILENCE_PEAK
+}
+
+/// r.md #49: 連続アイドルサンプル数の更新。アイドルでない buffer が 1 つでも
+/// 挟まったら 0 に戻る (= 「連続して」の意味)。加算後の値を返す。
+///
+/// **`load` → 加算 → `store` ではなく `fetch_add` で行う**。カウンタは
+/// コールバック以外 (receive loop の `wake_stream`) も 0 へ落とすので、
+/// load と store の間に入った reset を取りこぼすと、**起こした直後に古い
+/// カウント値が復活して即座に park し直す** = 再生開始と同時に無音になる。
+pub fn advance_idle_counter(counter: &AtomicU64, idle: bool, frames: u64) -> u64 {
+    if idle {
+        counter
+            .fetch_add(frames, Ordering::AcqRel)
+            .saturating_add(frames)
+    } else {
+        counter.store(0, Ordering::Release);
+        0
+    }
+}
+
+#[cfg(test)]
+mod idle_park_tests {
+    use super::*;
+
+    /// アクティブ / 再生 / count-in / 書き出し / 可聴音 のどれか 1 つでも
+    /// あれば park しない。
+    #[test]
+    fn park_conditions_are_all_required() {
+        // (app_active, playing, preroll, export, peak_l, peak_r, expect_idle)
+        let cases = [
+            (false, false, 0, false, 0.0, 0.0, true),
+            (true, false, 0, false, 0.0, 0.0, false),   // アクティブ
+            (false, true, 0, false, 0.0, 0.0, false),   // 再生中
+            (false, false, 1, false, 0.0, 0.0, false),  // count-in
+            (false, false, 0, true, 0.0, 0.0, false),   // 書き出し中
+            (false, false, 0, false, 0.01, 0.0, false), // L が鳴っている
+            (false, false, 0, false, 0.0, -0.01, false), // R が鳴っている (負値)
+        ];
+        for (active, playing, preroll, export, l, r, expect) in cases {
+            assert_eq!(
+                buffer_is_idle(active, playing, preroll, export, l, r),
+                expect,
+                "active={active} playing={playing} preroll={preroll} export={export} l={l} r={r}"
+            );
+        }
+    }
+
+    /// 残響が鳴り止むまでカウンタは進まず、鳴り止んでから閾値まで数える。
+    #[test]
+    fn counter_restarts_after_audible_buffer() {
+        let threshold = IDLE_PARK_DELAY_SECS * 48_000;
+        let frames = 512;
+        let counter = AtomicU64::new(0);
+        // 無音が続いて閾値の手前まで到達。
+        let mut n = 0;
+        while n < threshold - frames {
+            n = advance_idle_counter(&counter, true, frames);
+        }
+        assert!(n < threshold, "まだ park しない");
+        // ここで 1 buffer だけ音が鳴る (= 残響 / 自走プラグイン) → 振り出しに戻る。
+        n = advance_idle_counter(&counter, false, frames);
+        assert_eq!(n, 0);
+        // 鳴り止んだ後、改めて閾値ぶん数え直して park に至る。
+        let mut buffers = 0;
+        while n < threshold {
+            n = advance_idle_counter(&counter, true, frames);
+            buffers += 1;
+        }
+        assert_eq!(buffers, threshold.div_ceil(frames));
+    }
+
+    /// 別スレッド (receive loop の `wake_stream`) が挟んだ 0 リセットを
+    /// 取りこぼさない = 起こした直後に古いカウントが復活しない。
+    #[test]
+    fn external_reset_is_not_clobbered() {
+        let threshold = IDLE_PARK_DELAY_SECS * 48_000;
+        let frames = 512;
+        let counter = AtomicU64::new(threshold - frames);
+        // コマンド受信でカウンタが 0 に落とされた直後に、アイドルのままの
+        // buffer が 1 つ走るケース。加算は 0 からやり直す。
+        counter.store(0, Ordering::Release);
+        let n = advance_idle_counter(&counter, true, frames);
+        assert_eq!(n, frames, "リセット前の値へ戻ってはいけない");
+        assert!(n < threshold, "起こした直後に park し直してはいけない");
+    }
 }
 
 impl SharedState {
@@ -157,6 +288,11 @@ impl SharedState {
             metronome_enabled: AtomicBool::new(false),
             panic_declick: AtomicBool::new(false),
             panic_release: AtomicBool::new(false),
+            // 起動直後は「アクティブ」から始める。daw_gui の最初の
+            // `SetAppActive` が届く前に park してしまうのを防ぐ。
+            app_active: AtomicBool::new(true),
+            idle_silent_samples: AtomicU64::new(0),
+            park_requested: AtomicBool::new(false),
         }
     }
 }

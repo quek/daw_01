@@ -34,8 +34,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     GWLP_USERDATA, GetWindowLongPtrW, HCURSOR, HICON, HMENU, RegisterClassExW, SWP_NOMOVE,
     SWP_NOZORDER, SW_HIDE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    PostMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_KEYDOWN,
-    WM_KEYUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    PostMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CLOSE,
+    WM_KEYDOWN, WM_KEYUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::core::PCWSTR;
@@ -70,6 +70,40 @@ static CLASS_ATOM: OnceLock<u16> = OnceLock::new();
 // Win32 stores only a pointer into its class table, so the class-name buffer
 // must outlive every window created with it.
 static CLASS_NAME: OnceLock<Vec<u16>> = OnceLock::new();
+
+/// r.md #49: このプロセスの窓がアクティブか。
+///
+/// **プロセス単位の状態であってウィンドウ単位ではない**。`WM_ACTIVATEAPP` は
+/// 「別スレッドの窓へ activation が移った / から移ってきた」ときに、そのスレッドの
+/// **全 top-level 窓へ**送られる。エディタを 2 枚開いていれば 2 枚とも同じ真偽値を
+/// 受け取り、同一スレッド内の窓を行き来しても送られない。よって per-window に持つと
+/// 同じ値の重複管理になるだけで、最後に届いた値がプロセスの答えになる。
+static WINDOWS_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// 未報告の変化があるか。pump が `take_activation_change` で消費して daw_gui へ流す。
+static ACTIVATION_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// WNDPROC (= `extern "system"` で Rust 状態に触れない) から呼ぶ設定口。
+/// 値が変わったときだけ dirty を立てる。
+fn store_windows_active(active: bool) {
+    if WINDOWS_ACTIVE.swap(active, Ordering::AcqRel) != active {
+        ACTIVATION_DIRTY.store(true, Ordering::Release);
+    }
+}
+
+/// 最後のエディタ窓を閉じた等、`WM_ACTIVATEAPP` が来ない経路で非アクティブへ
+/// 落とすための強制口。窓が無いプロセスは定義上アクティブでない。
+pub fn clear_windows_active() {
+    store_windows_active(false);
+}
+
+/// 変化があれば新しい値を返して dirty を落とす。plugin-main の pump が毎周回で呼ぶ。
+pub fn take_activation_change() -> Option<bool> {
+    if ACTIVATION_DIRTY.swap(false, Ordering::AcqRel) {
+        Some(WINDOWS_ACTIVE.load(Ordering::Acquire))
+    } else {
+        None
+    }
+}
 
 /// Clamp a plugin-reported pixel dimension into a sane positive `i32`.
 /// `gui_get_size` / `resizeView` come from the plugin, so a buggy or hostile
@@ -312,6 +346,14 @@ unsafe extern "system" fn editor_wnd_proc(
         // プラグインは既に 「要らない」 と言っている。 素のキーに `DefWindowProc` の
         // 既定動作は無いので、 ここで止めて二重処理を避ける。
         return LRESULT(0);
+    }
+    // r.md #49: アプリ全体のアクティブ判定。daw_gui は自分の窓しか見えないので、
+    // 「プラグインエディタを触っている間もアプリはアクティブ」をこちらから報告する。
+    // `wparam != 0` = このスレッドの窓が activation を得た。
+    if msg == WM_ACTIVATEAPP {
+        store_windows_active(wparam.0 != 0);
+        // 既定動作 (フォーカス周りの内部処理) は潰さずそのまま流す。
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
     if msg == WM_CLOSE {
         unsafe {
