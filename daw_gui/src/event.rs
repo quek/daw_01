@@ -866,7 +866,17 @@ pub enum AppEvent {
     SetMasterGain(f32),
 
     // -------- IPC events from plugin_host ---------------------------------
-    Tick { samples: u64, peak_l: f32, peak_r: f32, preroll: u64 },
+    /// audio engine の telemetry を 30Hz で観測したもの (`AudioBridge` の poll)。
+    /// r.md #51: `playing` / `recording_live` は engine が所有する状態の観測値で、
+    /// GUI の `transport.is_playing` / `recording.live` はこれで**しか**更新されない。
+    Tick {
+        samples: u64,
+        peak_l: f32,
+        peak_r: f32,
+        preroll: u64,
+        playing: bool,
+        recording_live: bool,
+    },
     RescanPluginDb,
     PluginDbRescanCompleted,
 

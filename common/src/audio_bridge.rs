@@ -57,11 +57,24 @@ pub struct AudioBridge {
     /// `ModSource` position in `Song::mod_sources` (= `EnvelopeFollow::slot`).
     pub mod_scalars: [AtomicU32; MAX_MOD_SOURCES],
     /// Phase 7 B4 Step C (2026-05-13): count-in 残り samples mirror (audio
-    /// thread が `process_buffer` で書く、 GUI が on_tick で poll)。 GUI 側は
-    /// `midi_recording_pending` 中だけ参照、 0 検出で `midi_recording` に昇格。
-    /// 0 = count-in 中ではない / 完了済。 通常再生中は audio thread が更新
-    /// しないので、 `StartCountIn` 受信時に audio thread が値を立てる。
+    /// thread が `process_buffer` で書く、 GUI が on_tick で poll)。
+    /// 0 = count-in 中ではない / 完了済。 `StartRecording` 受信時に audio
+    /// thread が値を立てる。 **これ単体で「count-in が終わったか」を判定しては
+    /// いけない** — 0 は「まだ始まっていない」も意味するので、録音実体の開始判定は
+    /// [`AudioBridge::recording_live`] を見る (r.md #51)。
     pub preroll_remaining_samples: AtomicU64,
+    /// r.md #51: engine が今 transport を回しているか (0/1)。
+    ///
+    /// **「再生中か」の唯一の所有者は engine** で、GUI はこれを観測して
+    /// `transport.is_playing` に写すだけ。GUI 側で「Play を送った記憶」を持つと、
+    /// engine が自分で止まったとき (曲末 auto-stop / 書き出し) に食い違う。
+    pub playing: AtomicU32,
+    /// r.md #51: 今この瞬間 MIDI ノートを記録してよいか (0/1)。
+    ///
+    /// `録音要求あり && 再生中 && count-in 完了` を engine が判定して publish する。
+    /// GUI が preroll ミラーの 0 を見て自前で導出すると、`StartRecording` 送信直後に
+    /// 届いた stale な Tick (まだ preroll が立つ前の 0) で count-in を丸ごと飛ばす。
+    pub recording_live: AtomicU32,
 }
 
 impl AudioBridge {
@@ -144,10 +157,9 @@ impl AudioBridgeHandle {
     /// Fills `out` with `(L, R)` peaks for tracks 0..`out.len()`.
     /// Out-of-range tracks are reported as `(0.0, 0.0)`.
     /// Phase 7 B4 Step C: count-in 残り samples を audio thread が更新。
-    /// `StartCountIn` 受信時は GUI 側の `app.rs` が `MainToChild` 経由で
-    /// 流す → audio thread の `process_buffer` が preroll > 0 ループ内で
-    /// 毎 buffer `set_preroll_remaining(new_value)` を呼ぶ。 0 到達で
-    /// 通常再生に戻る。
+    /// `StartRecording` 受信時に audio thread が preroll を立て、
+    /// `process_buffer` が preroll > 0 ループ内で毎 buffer 更新する。
+    /// 0 到達で通常再生に戻る。
     pub fn set_preroll_remaining(&self, n: u64) {
         self.bridge()
             .preroll_remaining_samples
@@ -158,6 +170,30 @@ impl AudioBridgeHandle {
         self.bridge()
             .preroll_remaining_samples
             .load(Ordering::Acquire)
+    }
+
+    /// r.md #51: engine の transport 走行状態を publish する (audio thread が
+    /// 毎 buffer 呼ぶ)。読み手は GUI の playhead poller。
+    pub fn set_playing(&self, playing: bool) {
+        self.bridge()
+            .playing
+            .store(u32::from(playing), Ordering::Release);
+    }
+
+    pub fn playing(&self) -> bool {
+        self.bridge().playing.load(Ordering::Acquire) != 0
+    }
+
+    /// r.md #51: 「今ノートを記録してよいか」を publish する (audio thread が
+    /// 毎 buffer 呼ぶ)。count-in 明けの立ち上がりもここが唯一の合図。
+    pub fn set_recording_live(&self, live: bool) {
+        self.bridge()
+            .recording_live
+            .store(u32::from(live), Ordering::Release);
+    }
+
+    pub fn recording_live(&self) -> bool {
+        self.bridge().recording_live.load(Ordering::Acquire) != 0
     }
 
     pub fn track_peaks(&self, out: &mut Vec<(f32, f32)>) {

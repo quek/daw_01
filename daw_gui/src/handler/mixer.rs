@@ -571,6 +571,22 @@ impl AppData {
         };
         let msg = AudioCommand::SetTrackArmed { track: track_id, armed };
         self.send_audio(msg);
+        if !armed {
+            // r.md #51: arm を外した瞬間に、そのトラックで鳴らしていたモニター音を
+            // 止める。 note-off はもう届かない (armed でないので送り先から外れる) ので、
+            // ここで消さないと鍵盤を離しても鳴り続ける。
+            let held: Vec<u8> = self
+                .recording
+                .monitor_notes
+                .iter()
+                .filter(|(t, _)| *t == track_id)
+                .map(|(_, p)| *p)
+                .collect();
+            for pitch in held {
+                self.recording.monitor_notes.remove(&(track_id, pitch));
+                self.send_audio(AudioCommand::PreviewNoteOff { track_id, pitch });
+            }
+        }
     }
 
     pub(crate) fn on_track_peaks_tick(&mut self, peaks: &[(f32, f32)]) {

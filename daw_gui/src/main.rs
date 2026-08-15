@@ -429,6 +429,10 @@ fn spawn_playhead_poller(
                     peak_l,
                     peak_r,
                     preroll,
+                    // r.md #51: 「走っているか」「録音してよいか」は engine が所有する
+                    // 事実。GUI は他の telemetry と同じ面で観測する。
+                    playing: bridge.playing(),
+                    recording_live: bridge.recording_live(),
                 })
                 .is_err()
             {
