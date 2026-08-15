@@ -44,7 +44,11 @@ pub use daw_ui_renderer::{available_font_families, Color, TextureHandle, Texture
 pub use theme::{Palette, WaveformInk, contrast_ratio};
 pub use ui::{FrameStats, Ui, UiHost};
 pub use viewport::ViewportState1D;
+pub use widgets::goniometer::{CorrelationStyle, GoniometerStyle};
 pub use widgets::level_meter::{LevelMeterStyle, MeterBallistic, MeterScale};
+pub use widgets::loudness_meter::LoudnessMeterStyle;
+pub use widgets::oscilloscope::{OscilloscopeStyle, ScopeColumn};
+pub use widgets::spectrum::SpectrumStyle;
 pub use widgets::split_view::Orientation;
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::modulator_editor::{MsegAction, MsegEditorResponse, MsegEditorStyle, MsegNode};

@@ -91,11 +91,28 @@ const DEFAULT_CURVE: &[(f32, f32)] = &[
     (-60.0, 0.00),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MeterBallistic {
     Peak,
     Rms,
     Vu,
+    /// 呼び出し側が弾道を所有するモード (daw_01 r.md #50)。
+    ///
+    /// 規格準拠の測定器 (IEC 60268-17 の VU 2 次系 / dB 直線のピーク落下 /
+    /// 保持時間) を持っている利用者は、widget 内蔵の簡易弾道ではなくその値を
+    /// そのまま描く。`l` / `r` 引数がバーの塗り、ここに載る 3 つが重ね描き:
+    /// - `overlay`: バーに重ねる細線 (= 今のピーク)
+    /// - `hold`: ピーク保持線
+    /// - `long_peak`: 上端の数値ピーク (linear amp)
+    ///
+    /// このモードでは widget は state を一切更新しない。数値ピークのクリック
+    /// リセットは [`Ui::level_meter_stereo`] / [`Ui::channel_fader_meter`] の
+    /// 戻り値で通知するので、リセットも呼び出し側が行う。
+    Direct {
+        overlay: (f32, f32),
+        hold: (f32, f32),
+        long_peak: f32,
+    },
 }
 
 /// メーターの dB 目盛り定義 (M14 Phase 103 / daw_01 #074)。
@@ -198,6 +215,14 @@ pub struct LevelMeterStyle {
     pub peak_readout_color: Color,
     /// peak readout 数値の over 色 (>= 0dB)。
     pub peak_readout_over_color: Color,
+    /// `Some(db)` のとき、その dB 位置に **基準線** を 1 本引く (daw_01 r.md #50)。
+    ///
+    /// 用途は VU の 0 VU アライメント (EBU R68 = -18 dBFS / SMPTE RP155 =
+    /// -20 dBFS)。Ardour が「メーターのスケール」と「line-up level」を別設定に
+    /// しているのと同じ考え方で、バーの写像は dBFS のまま、基準だけを線で示す。
+    pub reference_db: Option<f32>,
+    /// 基準線の色。
+    pub reference_color: Color,
 }
 
 impl LevelMeterStyle {
@@ -235,6 +260,8 @@ impl LevelMeterStyle {
             scale_zero_color: p.text,
             peak_readout_color: p.ink_on_dark,
             peak_readout_over_color: p.adapt_on(chip_bg, p.meter_red),
+            reference_db: None,
+            reference_color: p.accent,
         }
     }
 }
@@ -321,6 +348,8 @@ impl ChannelMeter {
             MeterBallistic::Peak => self.peak,
             MeterBallistic::Rms => rms,
             MeterBallistic::Vu => self.vu_smoothed,
+            // Direct は state を通らない (呼び出し側で描画値が確定している)。
+            MeterBallistic::Direct { .. } => abs,
         };
         (display, self.peak_hold)
     }
@@ -341,6 +370,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// `style.scale` で Ableton Live 風の目盛り (tick + 数字 + 0dB 横線、 非線形カーブ) を、
     /// `style.peak_readout` で数値ピーク (click reset) を有効化できる。 `peak_readout = true` の
     /// ときのみメーター rect 上の primary click を消費して long-term peak を reset する。
+    /// 戻り値は「数値ピークのリセットが要求されたか」。 [`MeterBallistic::Direct`] の
+    /// ときだけ意味を持つ (それ以外は widget 内部で reset 済みなので常に `false` 扱いでよい)。
     pub fn level_meter_stereo(
         &mut self,
         id: impl Hash,
@@ -349,12 +380,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         r: f32,
         ballistic: MeterBallistic,
         style: LevelMeterStyle,
-    ) {
+    ) -> bool {
         let wid = WidgetId::ROOT.child((b"level_meter", &id));
         // 縦の dB→y 領域は `rect` から導出 (peak_readout 帯 + scale 上下 vpad)。 standalone では
         // この領域が widget rect 内で完結する。
         let content = meter_content_region(rect, style.scale.is_some(), style.peak_readout);
-        self.meter_body(wid, rect, content, l, r, ballistic, &style);
+        self.meter_body(wid, rect, content, l, r, ballistic, &style)
     }
 
     /// メーター本体 (reset click 消費 + state 更新 + 背景 + L/R バー + 目盛り + readout) を描く。
@@ -374,23 +405,30 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         r: f32,
         ballistic: MeterBallistic,
         style: &LevelMeterStyle,
-    ) {
+    ) -> bool {
         let reset_clicked = style.peak_readout && self.take_primary_press_in_rect(rect).is_some();
 
-        // 1. state 更新 (L/R 個別)。 long_peak は L/R の最大到達 (readout 用)。
-        let (l_disp, l_hold, r_disp, r_hold, long_peak) = {
-            let state: &mut MeterState = self.widget_state(wid);
-            if reset_clicked {
-                state.long_peak = 0.0;
-            }
-            let (ld, lh) = state.l.update(l, ballistic, style.peak_hold_ms);
-            let (rd, rh) = state.r.update(r, ballistic, style.peak_hold_ms);
-            state.long_peak = state.long_peak.max(l.abs().min(2.0)).max(r.abs().min(2.0));
-            (ld, lh, rd, rh, state.long_peak)
-        };
+        // 1. 表示値の確定。 `Direct` は呼び出し側が弾道を所有するので state を通さない
+        //    (通すと「2 つの弾道が二重に掛かる」ことになり、規格準拠の測定値が歪む)。
+        let (l_disp, l_hold, r_disp, r_hold, long_peak, overlay) =
+            if let MeterBallistic::Direct { overlay, hold, long_peak } = ballistic {
+                (l, hold.0, r, hold.1, long_peak, Some(overlay))
+            } else {
+                let state: &mut MeterState = self.widget_state(wid);
+                if reset_clicked {
+                    state.long_peak = 0.0;
+                }
+                let (ld, lh) = state.l.update(l, ballistic, style.peak_hold_ms);
+                let (rd, rh) = state.r.update(r, ballistic, style.peak_hold_ms);
+                state.long_peak = state.long_peak.max(l.abs().min(2.0)).max(r.abs().min(2.0));
+                (ld, lh, rd, rh, state.long_peak, None)
+            };
 
-        // active なら自動 redraw (idle 時は電力節約)。
-        if l_disp > 1e-4 || r_disp > 1e-4 || l_hold > 1e-4 || r_hold > 1e-4 {
+        // active なら自動 redraw (idle 時は電力節約)。 `Direct` は呼び出し側の
+        // テレメトリ tick が再描画を駆動するので widget からは要求しない。
+        if !matches!(ballistic, MeterBallistic::Direct { .. })
+            && (l_disp > 1e-4 || r_disp > 1e-4 || l_hold > 1e-4 || r_hold > 1e-4)
+        {
             self.request_redraw();
         }
 
@@ -424,22 +462,41 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
 
         // 3. L / R 色帯バー + peak hold 線 (同一カーブ、 content の dB→y を共有)。
-        self.draw_meter_bar(content, left_x, bar_each, l_disp, l_hold, style);
-        self.draw_meter_bar(content, right_x, bar_each, r_disp, r_hold, style);
+        self.draw_meter_bar(content, left_x, bar_each, l_disp, l_hold, overlay.map(|o| o.0), style);
+        self.draw_meter_bar(content, right_x, bar_each, r_disp, r_hold, overlay.map(|o| o.1), style);
 
         // 4. dB 目盛り (tick = L バー左 / 数字 = R バー右 / 0dB 線 = 両バー横断)。
         if let Some(scale) = style.scale {
             self.draw_meter_scale(content, rect, left_x, bars_right, scale, style);
         }
 
+        // 4b. 基準線 (0 VU アライメント)。バーを横切る破線ではなく実線 1px。
+        if let Some(db) = style.reference_db {
+            let frac = meter_frac(db, style);
+            let y = (content.y + content.h - content.h * frac).round();
+            self.push_rect(RectCommand {
+                rect: Rect { x: left_x, y, w: (bars_right - left_x).max(1.0), h: 1.0 },
+                fill: style.reference_color,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: Some(rect),
+            });
+        }
+
         // 5. peak readout (上端の専用帯)。
         if style.peak_readout {
             self.draw_meter_readout(rect, long_peak, style);
         }
+        reset_clicked
     }
 
     /// 1 本の色帯バー (dB→高さ) + peak hold 線を `content` の `[bar_x, bar_x+bar_w]` に描く。
     /// dB→frac は `meter_frac` (scale 有 = curve / 無 = 線形) を使う。
+    ///
+    /// `overlay` が `Some` なら、塗り (= VU 等の平均値) の上に「今のピーク」を
+    /// 細線で重ねる (K-System / Studio One のアウトチャンネルと同じ二重表示)。
+    #[allow(clippy::too_many_arguments)]
     fn draw_meter_bar(
         &mut self,
         content: Rect,
@@ -447,6 +504,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         bar_w: f32,
         display_value: f32,
         peak_hold_value: f32,
+        overlay: Option<f32>,
         style: &LevelMeterStyle,
     ) {
         let db = linear_to_db(display_value);
@@ -478,6 +536,23 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 radius: [0.0; 4],
                 clip_rect: None,
             });
+        }
+
+        // 「今のピーク」の細線 (塗り = VU の上に重ねる)。 保持線より薄くして、
+        // 「動いている線 = 現在値」「止まっている線 = 保持値」を見分けられるようにする。
+        if let Some(peak) = overlay {
+            let f = meter_frac(linear_to_db(peak), style);
+            if f > 0.001 {
+                let y = (content.y + content.h - content.h * f).round();
+                self.push_rect(RectCommand {
+                    rect: Rect { x: bar_x, y, w: bar_w, h: 1.0 },
+                    fill: style.peak_hold_color.with_alpha(0.55),
+                    border: Color::TRANSPARENT,
+                    border_width: 0.0,
+                    radius: [0.0; 4],
+                    clip_rect: None,
+                });
+            }
         }
 
         // peak hold の細い線 (tick と同じく整数 px に丸めて crisp + 0dB 線と揃える)

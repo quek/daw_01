@@ -976,6 +976,7 @@ impl ApplicationHandler<AppEvent> for Runner {
             AppEvent::Tick { .. }
                 | AppEvent::ModScalarsTick(_)
                 | AppEvent::TrackPeaksTick(_)
+                | AppEvent::MasterMeterTick(_)
                 | AppEvent::MetricsTick { .. }
                 | AppEvent::SystemMetricsTick { .. }
         );

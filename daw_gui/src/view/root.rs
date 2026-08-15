@@ -11,9 +11,9 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::view::{
     arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
-    font_picker, load_overlay, plugin_picker, recovery_modal, resource_monitor, settings,
-    shortcuts_help, snap, status_bar, track_inspector, track_picker, transport, undo_history,
-    voicevox_overlay,
+    font_picker, load_overlay, master_panel, plugin_picker, recovery_modal, resource_monitor,
+    settings, shortcuts_help, snap, status_bar, track_inspector, track_picker, transport,
+    undo_history, voicevox_overlay,
 };
 
 pub const MENU_H: f32 = 24.0;
@@ -75,6 +75,16 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // 旧レイアウト (inspector は上ペイン内の左帯、 bottom panel は全幅) から
     // 「左=inspector フル高 / 右上=arrangement / 右下=bottom panel」 へ再編。
     // gui_01 `split_view` が 6px の handle を描画して上下 drag を扱う。
+    // r.md #50: 右端にマスターパネルを切り出してから、残りを inspector +
+    // split(arrangement / bottom) に配る。**アレンジと Mixer/MIDI エディタの
+    // 両方の右**に常駐させるので、切り出すのは center_bottom 帯の全高。
+    let master_w = master_panel::panel_width(app).min((center_bottom_rect.w - INSPECTOR_W).max(0.0));
+    let master_rect = Rect {
+        x: center_bottom_rect.x + center_bottom_rect.w - master_w,
+        y: center_bottom_rect.y,
+        w: master_w,
+        h: center_bottom_rect.h,
+    };
     let inspector_rect = Rect {
         x: center_bottom_rect.x,
         y: center_bottom_rect.y,
@@ -84,7 +94,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     let right_rect = Rect {
         x: center_bottom_rect.x + INSPECTOR_W,
         y: center_bottom_rect.y,
-        w: (center_bottom_rect.w - INSPECTOR_W).max(0.0),
+        w: (center_bottom_rect.w - INSPECTOR_W - master_w).max(0.0),
         h: center_bottom_rect.h,
     };
 
@@ -109,6 +119,10 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
             bottom_panel::draw(app, ui, bottom_rect);
         },
     );
+
+    // r.md #50: マスターパネル (右端フル高)。split の後に描くのは、
+    // 分割 handle の hit 判定より手前で pointer を受けたいから。
+    master_panel::draw(app, ui, master_rect);
 
     status_bar::draw(app, ui, status_rect);
 
@@ -304,6 +318,12 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             m.item("編集履歴", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::ToggleUndoHistory)
+                }));
+            });
+            // r.md #50: 画面右端のマスターパネル (フェーダー + 各種メーター)。
+            m.item("マスターパネル", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleMasterPanel)
                 }));
             });
             m.item("Toggle Help", |ui| {
@@ -666,6 +686,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.toggle_undo_history") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ToggleUndoHistory)
+        }));
+    }
+    // r.md #50: Ctrl+Alt+M でマスターパネルを開閉 (REAPER の Master Track トグルと同キー)。
+    if ui.take_shortcut("daw.toggle_master_panel") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::ToggleMasterPanel)
         }));
     }
     // r.md #48: Ctrl+, で設定を開閉 (Edit メニュー「設定...」 と同じイベント)。

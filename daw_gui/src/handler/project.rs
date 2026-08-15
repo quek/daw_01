@@ -236,6 +236,12 @@ impl AppData {
             theme: self.theme.id.clone(),
             settings_open: self.ui_prefs.settings_open,
             settings_rect: self.ui_prefs.settings_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            // r.md #50: マスターパネルの見え方は「この人の画面の使い方」なので
+            // プロジェクト (`ViewState`) ではなくアプリ設定側に持つ。
+            master_panel_open: self.ui_prefs.master_panel_open,
+            master_panel_w: self.ui_prefs.master_panel_w,
+            master_panel_sections: self.ui_prefs.master_panel_sections,
+            meter: self.ui_prefs.meter_settings,
         };
         if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
             tracing::warn!(error = ?e, "failed to save app_config");

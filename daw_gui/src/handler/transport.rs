@@ -86,6 +86,13 @@ impl AppData {
             self.send_audio(AudioCommand::StartRecording { preroll_samples });
         }
         self.send_audio(AudioCommand::Play);
+        // r.md #50: 走り出すたびに積算ラウドネス一式をリセットする
+        // (Cubase の "Reset on Start" 相当)。曲を頭から通せば「この曲の
+        // ラウドネス」がそのまま出る、という grill-me の決定。
+        //
+        // r.md #51 で再生も録音もこの 1 箇所を通るようになったので、
+        // 録音開始のためにもう 1 箇所リセットを置く必要は無い。
+        self.reset_master_loudness();
         // `is_playing` はここでは書かない。engine が走り出したことを `on_tick` が
         // 観測して立てる (r.md #51 — 状態の所有者は engine)。
         PlayOutcome::Started

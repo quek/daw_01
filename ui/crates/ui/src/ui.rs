@@ -132,6 +132,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// M9 Phase 41b: 今フレームに `Ui::set_cursor` で要求された cursor (last call wins)。
     /// `frame()` 末尾で `set_cursor_request` callback に flush され、None にリセットされる。
     transient_cursor: Option<CursorIcon>,
+    /// 最後に OS へ送った cursor 形状。per-frame flush で「前回と違うときだけ送る」
+    /// ための dedup (毎フレーム Win32 を叩かないため)。`None` = 未送信。
+    last_flushed_cursor: Option<CursorIcon>,
     /// 今フレームに `Ui::warp_cursor` で要求された cursor 位置 (物理 px、last call wins)。
     /// `frame()` 末尾で `set_cursor_pos_request` callback に flush され、None にリセットされる。
     transient_cursor_pos: Option<(f32, f32)>,
@@ -237,6 +240,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             transient_dialog_requests: Vec::new(),
             transient_consumed_dialog_results: HashSet::new(),
             transient_cursor: None,
+            last_flushed_cursor: None,
             transient_cursor_pos: None,
             set_cursor_request: None,
             set_cursor_pos_request: None,
@@ -506,10 +510,22 @@ impl<M: ?Sized + 'static> UiHost<M> {
         }
 
         // M9 Phase 41b: cursor flush (Ui::set_cursor で要求された形状を OS に伝える)。
-        if let Some(c) = self.transient_cursor.take()
+        //
+        // **per-frame セマンティクス** (daw_01 r.md #50): 誰も要求しなかったフレームは
+        // `Default` を送る。winit / OS 側は state-full なので、要求が無いときに何も
+        // 送らないと前フレームの形状が残り続ける。そのため旧仕様では *全 widget* が
+        // 「自分の担当矩形の中なら明示的に Default」という同じ boilerplate を書く
+        // 必要があり、書き忘れた widget の上でカーソルが貼り付いた (arrangement /
+        // piano_roll は書いていた、master_panel は書き忘れた = 設計欠陥のシグナル)。
+        //
+        // 実際に OS へ送るのは **前回と違うときだけ** なので、毎フレーム Win32 を
+        // 叩くことにはならない。
+        let want = self.transient_cursor.take().unwrap_or(CursorIcon::Default);
+        if self.last_flushed_cursor != Some(want)
             && let Some(req) = self.set_cursor_request.as_ref()
         {
-            req(c);
+            req(want);
+            self.last_flushed_cursor = Some(want);
         }
 
         // cursor 位置 warp flush (Ui::warp_cursor で要求された位置を OS に伝える)。
@@ -1593,9 +1609,13 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// (low-level constructor [`UiHost::new`] / [`UiHost::no_redraw`] で構築した場合)。
     /// 通常 [`UiHost::with_window`] で構築すれば自動的に有効化される。
     ///
-    /// `set_cursor` を呼ばなかったフレームは前フレームの形状が OS 側に保持されたまま
-    /// (winit は state-full)。reset したい場合は明示的に `set_cursor(CursorIcon::Default)`
-    /// を呼ぶこと。
+    /// **誰も `set_cursor` を呼ばなかったフレームは自動的に `Default` に戻る**
+    /// (daw_01 r.md #50)。OS 側は state-full なので、旧仕様 (要求が無ければ何も
+    /// 送らない) では全 widget が「自分の担当矩形の中なら明示的に Default」という
+    /// 同じ boilerplate を書く必要があり、書き忘れた widget の上でカーソルが
+    /// 貼り付いた。実際に OS へ送るのは前回と形状が変わったときだけ。
+    ///
+    /// したがって widget は「自分が形を変えたいときだけ呼ぶ」でよい。
     pub fn set_cursor(&mut self, cursor: CursorIcon) {
         *self.pending_cursor = Some(cursor);
     }

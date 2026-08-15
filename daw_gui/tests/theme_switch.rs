@@ -58,7 +58,12 @@ fn set_theme_swaps_the_palette_and_persists_only_the_id() {
     // 永続化されるのは id だけ (色は焼き込まない = テーマファイルを編集したら次回反映される)。
     let cfg_text = std::fs::read_to_string(dirs.app_config()).expect("app_config が書かれる");
     assert!(cfg_text.contains("\"theme\": \"light\""), "id が保存される: {cfg_text}");
-    assert!(!cfg_text.contains("panel"), "色トークンは保存されない: {cfg_text}");
+    // 色トークン名 (`panel` / `accent` …) がキーとして現れないこと。
+    // 引用符込みで見るのは、r.md #50 で `master_panel_w` のような**色ではない**
+    // キーが増えたため (素の部分一致だと巻き込む)。
+    for token in ["\"panel\"", "\"accent\"", "\"window_bg\"", "\"meter_green\""] {
+        assert!(!cfg_text.contains(token), "色トークン {token} は保存されない: {cfg_text}");
+    }
 
     // 再起動相当: 同じ dirs で組み直すと保存済み id から復元される。
     let (restarted, _rx2) = build_app(Some(dirs));

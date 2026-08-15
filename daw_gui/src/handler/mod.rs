@@ -13,6 +13,7 @@ pub mod export;
 pub mod glue;
 pub mod grouping;
 pub mod ipc;
+pub mod master_panel;
 pub mod media;
 pub mod midi;
 pub mod mixer;

@@ -16,6 +16,7 @@ static GLOBAL: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 use common::audio_bridge::AudioBridgeHandle;
 use common::meter::compute_block_peak;
 use common::metrics_bridge::MetricsBridgeHandle;
+use common::scope_bridge::ScopeBridgeHandle;
 use common::protocol::{AudioCommand, AudioEvent};
 use common::wire::{read_msg, write_msg};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -81,6 +82,13 @@ async fn main() -> Result<()> {
         MetricsBridgeHandle::open(&session.metrics_shmem_id)
             .context("failed to open metrics shmem")?,
     );
+    // r.md #50: マスター出力サンプルのリング。GUI が create したものを open し、
+    // `render_master_buffer` の出力 (メトロノーム前) を毎バッファ書き込む。
+    let scope = Arc::new(
+        ScopeBridgeHandle::open(&session.scope_shmem_id)
+            .context("failed to open scope shmem")?,
+    );
+    scope.set_sample_rate(session.sample_rate);
 
     let shared = Arc::new(SharedState::new());
     // Engine resources shared between the CPAL closure, the export thread and
@@ -111,6 +119,7 @@ async fn main() -> Result<()> {
         Arc::clone(&engine_shared),
         Arc::clone(&bridge),
         Arc::clone(&metrics),
+        Arc::clone(&scope),
         session.sample_rate,
         cmd_rx,
         bundle_rx,
@@ -1585,6 +1594,7 @@ fn start_output_stream(
     engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
+    scope: Arc<ScopeBridgeHandle>,
     session_sample_rate: u32,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
     bundle_rx: rtrb::Consumer<RtBundle>,
@@ -1630,6 +1640,7 @@ fn start_output_stream(
         engine_shared,
         bridge,
         metrics,
+        scope,
         session_sample_rate,
         cmd_rx,
         bundle_rx,
@@ -1650,6 +1661,7 @@ fn build_stream(
     engine_shared: Arc<EngineShared>,
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
+    scope: Arc<ScopeBridgeHandle>,
     session_sample_rate: u32,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
     bundle_rx: rtrb::Consumer<RtBundle>,
@@ -1728,7 +1740,7 @@ fn build_stream(
                 let cb_start = std::time::Instant::now();
                 let frames = (data.len() / channels_usize).min(max_frames);
 
-                local.process_buffer(&shared, &bridge, session_sample_rate, frames);
+                local.process_buffer(&shared, &bridge, &scope, session_sample_rate, frames);
 
                 // A2: publish the engine's playhead to shmem so the GUI
                 // can draw the cursor. 停止中も現在の playhead をそのまま
@@ -1799,8 +1811,12 @@ fn build_stream(
                     *s = 0.0;
                 }
 
+                // r.md #49 のアイドル判定用「実際にデバイスへ出た音の無音判定」。
+                // r.md #50 でメーター表示の測定点は `render_master_buffer` 直後
+                // (= メトロノーム前) へ移したが、park してよいかは**スピーカーへ
+                // 出ている音**で決めなければならない (メトロノームが鳴っている
+                // 間に park すると click が切れる)。目的が違うので共有しない。
                 let (peak_l, peak_r) = block_peaks_stereo(data, channels_usize);
-                bridge.set_peaks(peak_l, peak_r);
 
                 // resource monitor (r.md #3): DSP load を publish。 load =
                 // 処理時間 ÷ バッファ周期。 peak は直近窓の worst-case (GUI が
@@ -1849,7 +1865,10 @@ fn build_stream(
                         // mod scalars は**ゼロにしない** — メーターではなく
                         // パラメータ値なので、最後の値のまま凍結するのが正しい
                         // (ゼロにすると画像 / 映像効果の見た目が飛ぶ)。
-                        bridge.set_peaks(0.0, 0.0);
+                        //
+                        // r.md #50 のマスターメーターはここで何もしない: 解析器は
+                        // 「新しいフレームが来なかった経過時間ぶんの無音」を自分で
+                        // 流し込んで落ちるので、書き手側の後始末が要らない。
                         for t in 0..common::audio_bridge::MAX_TRACKS {
                             bridge.set_track_peak(t, 0.0, 0.0);
                         }

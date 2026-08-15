@@ -29,11 +29,14 @@ pub const MAX_MOD_SOURCES: usize = 64;
 /// buffer so daw_gui can poll it (once per UI tick) for playhead-row
 /// highlighting.
 ///
-/// `peak_l` / `peak_r` are the most recent per-block peaks (linear
-/// amplitude, stored as `f32::to_bits`) written by daw_audio after applying
-/// master gain, so daw_gui can draw a level meter. All fields are
-/// lock-free Acquire/Release atomics — readers tolerate any value they
-/// happen to observe.
+/// マスター出力のメーターはここに**居ない** (r.md #50)。マスターのピーク /
+/// VU / ラウドネス / スペクトラム等はすべて daw_gui 側の `MasterAnalyzer` が
+/// `scope_bridge` のサンプルリングから導くので、値を shmem に複製しない
+/// (SSoT)。ここに残るのは per-track の peak — こちらは mixer strip 用に
+/// 「track ごとの post-fader ピーク」だけが要るスカラー面。
+///
+/// All fields are lock-free Acquire/Release atomics — readers tolerate any
+/// value they happen to observe.
 ///
 /// v29 (`docs/plan_arch_refactor.md` §2): 旧 `frames_requested` / `samples`
 /// 面 (M0 時代の request/ready セマフォ往復データプレーン) は writer /
@@ -42,8 +45,6 @@ pub const MAX_MOD_SOURCES: usize = 64;
 #[repr(C)]
 pub struct AudioBridge {
     pub playhead_samples: AtomicU64,
-    pub peak_l: AtomicU32,
-    pub peak_r: AtomicU32,
     /// Per-track post-fader peaks, `[track][0=L, 1=R]`, as `f32::to_bits`.
     /// Written by **daw_audio** after summing each track into the master
     /// bus (`engine.rs` / `main.rs` の `set_track_peak`); read by daw_gui on
@@ -117,21 +118,6 @@ impl AudioBridgeHandle {
 
     pub fn playhead_samples(&self) -> u64 {
         self.bridge().playhead_samples.load(Ordering::Acquire)
-    }
-
-    pub fn set_peaks(&self, l: f32, r: f32) {
-        self.bridge()
-            .peak_l
-            .store(l.to_bits(), Ordering::Release);
-        self.bridge()
-            .peak_r
-            .store(r.to_bits(), Ordering::Release);
-    }
-
-    pub fn peaks(&self) -> (f32, f32) {
-        let l = f32::from_bits(self.bridge().peak_l.load(Ordering::Acquire));
-        let r = f32::from_bits(self.bridge().peak_r.load(Ordering::Acquire));
-        (l, r)
     }
 
     /// Publishes one track's post-fader peak pair. Out-of-range track

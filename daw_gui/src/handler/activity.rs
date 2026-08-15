@@ -105,9 +105,11 @@ impl AppData {
         // playhead は拍の 1/1000 まで見る (ズーム最大でも 1px 未満)。
         mix(quantize(self.transport.playhead_beat.unwrap_or(f32::NAN), 1000.0));
         mix(quantize(self.ui_prefs.arrange_scroll_beat, 1000.0));
-        // マスターメーターは正規化済み値 (0..1) なので直接量子化。
-        mix(quantize(self.transport.peak_l_norm, METER_STEPS));
-        mix(quantize(self.transport.peak_r_norm, METER_STEPS));
+        // r.md #50: マスターパネルの全メーター (ピーク / VU / ラウドネス /
+        // スペクトラム / オシロ / ゴニオ) は解析器が 1 つのダイジェストに畳んで
+        // よこす。解析器側で表示解像度に量子化してあるので、無音になれば必ず
+        // 収束する = ここで再描画が止まる。
+        mix(self.transport.master_meter.visual_digest);
         // トラックメーターは linear なので dB 経由で正規化してから量子化する
         // (そのまま量子化すると指数減衰が 0 に収束せず永久に描き続ける)。
         for (l, r) in &self.transport.track_peak_display {

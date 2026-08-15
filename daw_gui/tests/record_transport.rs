@@ -65,8 +65,6 @@ fn arm_first_track(app: &mut AppData) -> u32 {
 fn tick(app: &mut AppData, playing: bool, recording_live: bool, samples: u64) {
     app.handle_event(AppEvent::Tick {
         samples,
-        peak_l: 0.0,
-        peak_r: 0.0,
         preroll: 0,
         playing,
         recording_live,

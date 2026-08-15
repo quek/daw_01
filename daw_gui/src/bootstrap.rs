@@ -100,6 +100,9 @@ pub struct Bootstrap {
     /// per-plugin CPU を daw_audio / daw_plugin_host が書き、 poller と AppData
     /// (per-plugin 直接読み) が読む。
     pub metrics: Arc<MetricsBridgeHandle>,
+    /// r.md #50 のマスター出力サンプルリング。daw_audio が `render_master_buffer`
+    /// の出力を毎バッファ書き、テレメトリポーラの `MasterAnalyzer` が読む。
+    pub scope: Arc<common::scope_bridge::ScopeBridgeHandle>,
     /// VOICEVOX engine 等の子プロセスを kill-on-close するための Job Object。
     pub job: Arc<JobHandle>,
     /// 起動時に読み込んだ plugin database (CLAP / VST3 enumeration)。
@@ -427,6 +430,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
     let mut session = AudioSession {
         shmem_id: shmem_id(pid),
         metrics_shmem_id: metrics_shmem_id(pid),
+        scope_shmem_id: common::scope_bridge::scope_shmem_id(pid),
         sample_rate: DEFAULT_SAMPLE_RATE,
         max_frames: MAX_FRAMES,
         channels: CHANNELS as u16,
@@ -440,6 +444,12 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
     let metrics = Arc::new(
         MetricsBridgeHandle::create(&session.metrics_shmem_id)
             .context("failed to create metrics shmem")?,
+    );
+    // r.md #50: マスター出力サンプルのリング。daw_audio が RT スレッドから書き、
+    // daw_gui のテレメトリポーラが全メーターの計測元として読む。
+    let scope = Arc::new(
+        common::scope_bridge::ScopeBridgeHandle::create(&session.scope_shmem_id)
+            .context("failed to create scope shmem")?,
     );
     tracing::info!(?session, "created audio session handles");
 
@@ -502,6 +512,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         bridge,
         sample_rate: session.sample_rate,
         metrics,
+        scope,
         job,
         plugin_db,
         rt,

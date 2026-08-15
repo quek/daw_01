@@ -54,10 +54,13 @@ pub struct TransportState {
     /// つけるためのフラグ（[`Self::panic`] 参照）。
     pub panic_release_pending: bool,
     pub master_gain: f32,
-    pub peak_l_display: f32,
-    pub peak_r_display: f32,
-    pub peak_l_norm: f32,
-    pub peak_r_norm: f32,
+    /// r.md #50: マスター出力の全メーター表示状態。テレメトリスレッドの
+    /// `MasterAnalyzer` が `MasterMeterTick` で毎ティック更新する。
+    ///
+    /// 旧 `peak_l_display` / `peak_r_display` / `peak_*_norm` はここに吸収した
+    /// (ピークだけ別経路で持つと「同じ音なのに値が違う」を作るため — 計測は
+    /// 解析器 1 か所が SSoT)。
+    pub master_meter: crate::master_meter::MasterMeterSnapshot,
 
     // -------- Mixer --------
     pub track_peak_display: Vec<(f32, f32)>,

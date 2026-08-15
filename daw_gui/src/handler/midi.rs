@@ -554,6 +554,9 @@ impl AppData {
                 return;
             }
         }
+        // r.md #50 の積算ラウドネスのリセットはここに要らない — 録音の開始も
+        // `start_transport` を通るので、あちらの 1 箇所で畳まれる。パンチイン
+        // (既に走っている transport に乗る) では畳まないのが正しい。
         self.recording.requested = true;
         // 録音 take 全体を 1 undo step に bracket する (r.md #51)。 これが無いと
         // note-on / note-off の song 編集が別々の step になり、8 音録ると

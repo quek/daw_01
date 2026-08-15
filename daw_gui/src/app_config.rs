@@ -32,6 +32,28 @@ pub struct AppConfig {
     /// r.md #48: 設定 window の位置・サイズ `[x, y, w, h]` (px)。 `None` = 未配置。
     #[serde(default)]
     pub settings_rect: Option<[f32; 4]>,
+    /// r.md #50: 画面右端のマスターパネルを出すか。 default = true
+    /// (「常に音を視覚的にも確認できるように」が要求なので既定で見えている)。
+    #[serde(default = "default_true")]
+    pub master_panel_open: bool,
+    /// マスターパネルの幅 (px)。
+    #[serde(default = "default_master_panel_w")]
+    pub master_panel_w: f32,
+    /// マスターパネルのセクション高さ配分 (MASTER / スペクトラム / オシロ / ゴニオ)。
+    #[serde(default = "default_master_panel_sections")]
+    pub master_panel_sections: [f32; 4],
+    /// メーター設定 (各メーターの右クリックメニューで変える)。
+    #[serde(default)]
+    pub meter: crate::master_meter::settings::MeterSettings,
+}
+
+fn default_master_panel_w() -> f32 {
+    300.0
+}
+
+/// 既定の高さ配分。MASTER (フェーダー + ラウドネス) を厚めに、残りを均等に。
+fn default_master_panel_sections() -> [f32; 4] {
+    [0.34, 0.24, 0.18, 0.24]
 }
 
 fn default_theme() -> String {
@@ -51,6 +73,10 @@ impl Default for AppConfig {
             theme: default_theme(),
             settings_open: false,
             settings_rect: None,
+            master_panel_open: true,
+            master_panel_w: default_master_panel_w(),
+            master_panel_sections: default_master_panel_sections(),
+            meter: crate::master_meter::settings::MeterSettings::default(),
         }
     }
 }
@@ -92,6 +118,13 @@ mod tests {
             theme: "light".to_string(),
             settings_open: true,
             settings_rect: Some([1.0, 2.0, 300.0, 400.0]),
+            master_panel_open: false,
+            master_panel_w: 412.0,
+            master_panel_sections: [0.4, 0.2, 0.2, 0.2],
+            meter: crate::master_meter::settings::MeterSettings {
+                loudness_target_lufs: -23.0,
+                ..Default::default()
+            },
         };
         save(&path, &cfg).unwrap();
         let loaded = load(&path);
@@ -101,6 +134,10 @@ mod tests {
         assert_eq!(loaded.theme, "light");
         assert!(loaded.settings_open);
         assert_eq!(loaded.settings_rect, Some([1.0, 2.0, 300.0, 400.0]));
+        assert!(!loaded.master_panel_open);
+        assert_eq!(loaded.master_panel_w, 412.0);
+        assert_eq!(loaded.master_panel_sections, [0.4, 0.2, 0.2, 0.2]);
+        assert_eq!(loaded.meter.loudness_target_lufs, -23.0);
     }
 
     #[test]
