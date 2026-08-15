@@ -13,7 +13,6 @@
 //! `Ui::dropdown` は別 file (`widgets/dropdown.rs`)。
 
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand};
-use crate::theme;
 
 use crate::input::PointerFrame;
 use crate::ui::Ui;
@@ -131,12 +130,13 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
     popup_rect: Rect,
 ) -> Option<usize> {
     let pointer = ui.pointer();
+    let p = ui.palette();
 
     // 背景パネル
     ui.push_rect(RectCommand {
         rect: popup_rect,
-        fill: theme::PANEL,
-        border: theme::BORDER,
+        fill: p.panel,
+        border: p.border,
         border_width: 1.0,
         radius: [4.0; 4],
         clip_rect: None,
@@ -156,7 +156,7 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
         if hovered {
             ui.push_rect(RectCommand {
                 rect: item_rect,
-                fill: theme::ACCENT,
+                fill: p.accent,
                 border: Color::TRANSPARENT,
                 border_width: 0.0,
                 radius: [2.0; 4],
@@ -174,7 +174,7 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
             top: item_rect.y + (MENU_ITEM_H - MENU_FONT * 1.2) * 0.5,
             font_size: MENU_FONT,
             line_height: MENU_FONT * 1.2,
-            color: theme::TEXT,
+            color: p.text,
             clip_rect: Some(Rect {
                 x: item_rect.x + MENU_PAD_X,
                 y: item_rect.y,
@@ -304,19 +304,20 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
     id_path: &str,
 ) -> Option<MenuItemAction<'a, M>> {
     let pointer = ui.pointer();
+    let p = ui.palette();
 
     // 背景パネル
     ui.push_rect(RectCommand {
         rect: popup_rect,
-        fill: theme::PANEL,
-        border: theme::BORDER,
+        fill: p.panel,
+        border: p.border,
         border_width: 1.0,
         radius: [4.0; 4],
         clip_rect: None,
     });
 
     let mut return_action: Option<MenuItemAction<'a, M>> = None;
-    let arrow_color = theme::TEXT_DIM;
+    let arrow_color = p.text_dim;
     let entries_len = entries.len();
 
     // 兄弟 sub-popup 排他 (daw_01 #037 fix): hover している item を loop 前に確定し、
@@ -364,7 +365,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
         if hovered && item_enabled {
             ui.push_rect(RectCommand {
                 rect: item_rect,
-                fill: theme::ACCENT,
+                fill: p.accent,
                 border: Color::TRANSPARENT,
                 border_width: 0.0,
                 radius: [2.0; 4],
@@ -372,11 +373,7 @@ pub(crate) fn draw_menu_entries<'a, M: ?Sized + 'static>(
             });
         }
         // text 色: enabled なら通常色、disabled なら灰色
-        let text_color = if item_enabled {
-            theme::TEXT
-        } else {
-            theme::TEXT_FAINT
-        };
+        let text_color = if item_enabled { p.text } else { p.text_faint };
         // 右端の shortcut hint / ▶ マーカーが占める幅を先に確定し、 label はその
         // 手前までに収める。 実 advance で測るので CJK ラベル (日本語メニュー) でも
         // 正しい (旧実装は clip も ellipsis も無く、 長いラベルが hint / ▶ の上に
@@ -580,10 +577,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     where
         F: FnOnce(&mut MenuBarBuilder<'a, M>),
     {
+        let p = self.palette();
+
         // 背景バー
         self.push_rect(RectCommand {
             rect,
-            fill: theme::HEADER,
+            fill: p.header,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
@@ -658,7 +657,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             if hovered_idx == Some(i) || is_open {
                 self.push_rect(RectCommand {
                     rect: label_rect,
-                    fill: theme::CONTROL_HOVER,
+                    fill: p.control_hover,
                     border: Color::TRANSPARENT,
                     border_width: 0.0,
                     radius: [2.0; 4],
@@ -671,7 +670,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: label_rect.y + (label_rect.h - MENU_FONT * 1.2) * 0.5,
                 font_size: MENU_FONT,
                 line_height: MENU_FONT * 1.2,
-                color: theme::TEXT,
+                color: p.text,
                 clip_rect: None,
                 ..GlyphArea::default()
             });

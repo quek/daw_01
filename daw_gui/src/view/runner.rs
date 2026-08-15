@@ -1175,7 +1175,7 @@ impl Runner {
             // textured-quad path internally based on whether
             // `frame_texture` is Some.
             if let Some(preview) = state.preview.as_mut() {
-                match preview.render() {
+                match preview.render(&state.app.theme) {
                     Ok(()) => {
                         // 抑制状態を畳むのは **preview 自身が成功したとき** だけ。
                         state.preview_error_log.reset();
@@ -1194,6 +1194,16 @@ impl Runner {
         let screen = state.renderer.size();
         state.scene.clear();
         let input = state.input.take_input();
+
+        // r.md #48: テーマの SSoT は `AppData.theme`。 UiHost へは **毎フレーム無条件に**
+        // 同じ Arc を流し込む (同一なら no-op)。 こうしておけば「テーマを変えたのに
+        // push し忘れた」 が構造的に起きない。 変化したフレームだけ描画キャッシュを捨てる —
+        // `with_widget_node` の input_hash にも `HeavyCtx::cached` の viewport_key にも色は
+        // 入っておらず、色は描画コマンドに焼き込まれて Scenegraph に残るため、捨てないと
+        // アレンジ / ピアノロールだけ旧テーマの色で固まる。
+        if state.ui.set_palette(state.app.theme.core.clone()) {
+            state.ui.invalidate_scene_cache();
+        }
 
         state.ui.frame_with_fonts(
             &mut state.app,
@@ -1329,7 +1339,7 @@ impl Runner {
             WindowEvent::RedrawRequested => {
                 // device lost はメインループ側の復旧シーケンスが拾う (ここで再帰的に
                 // request_redraw しないことで、 消失中の preview スピンも止まる)。
-                match preview.render() {
+                match preview.render(&state.app.theme) {
                     Ok(()) => state.preview_error_log.reset(),
                     // device lost はメインループ側の復旧シーケンスが拾う。
                     Err(e) if e.is_device_lost() => {}

@@ -2023,13 +2023,17 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         let spb = mapping.samples_per_beat();
         let sample_viewport =
             ViewportState1D::new(view.start_beat * spb, view.len_beats.max(1e-6) * spb);
+        // r.md #48: 汎用 widget の style はパレットから組む (`Default` は「いまどのテーマで
+        // 描いているか」 を知れないので廃止された)。色は arrangement の style が SSoT なので
+        // 上書きし、間引き閾値だけパレット既定を引き継ぐ。
+        let palette = ui.palette();
         let grid_style = BarBeatGridStyle {
             bar_color: style.bar_line,
             beat_color: style.beat_line,
             bar_line_width: style.bar_line_width_px,
             beat_line_width: style.beat_line_width_px,
             // M14 Phase 63m (daw_01 #027): zoom 連動の beat 線間引き (default 4px)。
-            ..BarBeatGridStyle::default()
+            ..BarBeatGridStyle::from_palette(palette)
         };
         let ruler_style = TimeRulerStyle {
             bg: style.ruler_bg,
@@ -2038,7 +2042,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
             bar_tick_height: 12.0,
             beat_tick_height: 5.0,
             // M14 Phase 63m (daw_01 #027): zoom 連動の label / beat tick 間引き (default 60 / 4 px)。
-            ..TimeRulerStyle::default()
+            ..TimeRulerStyle::from_palette(palette)
         };
         // heavy() closure は `'static` 要求なので id を hash 化して move capture。
         let id_for_inner: u64 = hash_inputs(id);

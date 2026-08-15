@@ -20,6 +20,22 @@ pub struct AppConfig {
     /// 未配置 (初回は既定の右上に出す)。 drag / resize 確定時に保存する。
     #[serde(default)]
     pub undo_history_rect: Option<[f32; 4]>,
+    /// r.md #48: 選択中テーマの id (`"dark"` / `"light"` / ユーザーテーマのファイル名)。
+    /// **パレットの実体ではなく id を保存する** — テーマファイルを編集したら次回起動で
+    /// その内容が反映されるべきで、色を焼き込むと SSoT が二重化するため。
+    /// id のテーマが見つからないときは既定テーマにフォールバックする。
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// r.md #48: 設定 window が開いているか (再起動を跨いで復元)。
+    #[serde(default)]
+    pub settings_open: bool,
+    /// r.md #48: 設定 window の位置・サイズ `[x, y, w, h]` (px)。 `None` = 未配置。
+    #[serde(default)]
+    pub settings_rect: Option<[f32; 4]>,
+}
+
+fn default_theme() -> String {
+    crate::theme::DEFAULT_THEME_ID.to_string()
 }
 
 fn default_true() -> bool {
@@ -32,6 +48,9 @@ impl Default for AppConfig {
             resource_monitor_enabled: true,
             undo_history_open: false,
             undo_history_rect: None,
+            theme: default_theme(),
+            settings_open: false,
+            settings_rect: None,
         }
     }
 }
@@ -70,12 +89,18 @@ mod tests {
             resource_monitor_enabled: false,
             undo_history_open: true,
             undo_history_rect: Some([10.0, 20.0, 260.0, 360.0]),
+            theme: "light".to_string(),
+            settings_open: true,
+            settings_rect: Some([1.0, 2.0, 300.0, 400.0]),
         };
         save(&path, &cfg).unwrap();
         let loaded = load(&path);
         assert!(!loaded.resource_monitor_enabled);
         assert!(loaded.undo_history_open);
         assert_eq!(loaded.undo_history_rect, Some([10.0, 20.0, 260.0, 360.0]));
+        assert_eq!(loaded.theme, "light");
+        assert!(loaded.settings_open);
+        assert_eq!(loaded.settings_rect, Some([1.0, 2.0, 300.0, 400.0]));
     }
 
     #[test]
@@ -91,6 +116,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("partial.json");
         std::fs::write(&path, "{}").unwrap();
-        assert!(load(&path).resource_monitor_enabled); // 欠落 → default true
+        let loaded = load(&path);
+        assert!(loaded.resource_monitor_enabled); // 欠落 → default true
+        // r.md #48: theme が無い旧 config でも既定テーマで起動できる。
+        assert_eq!(loaded.theme, crate::theme::DEFAULT_THEME_ID);
+        assert!(!loaded.settings_open);
     }
 }

@@ -119,6 +119,12 @@ pub struct UiPrefs {
     /// 未配置 (初回は既定の右上)。 drag / resize 確定時に更新して保存する。
     pub undo_history_rect: Option<daw_ui_renderer::Rect>,
 
+    /// r.md #48: 設定 window が開いているか (app_config で永続)。
+    /// Edit メニュー「設定...」 / Esc / ✕ で toggle。
+    pub settings_open: bool,
+    /// r.md #48: 設定 window の位置・サイズ (app_config で永続)。 `None` = 未配置。
+    pub settings_rect: Option<daw_ui_renderer::Rect>,
+
     pub is_help_open: bool,
 
     /// per-user データディレクトリ (recent / recent_saved / recovery /

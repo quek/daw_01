@@ -43,6 +43,9 @@ pub(super) fn render_arrangement_heavy(
     reorder_overlay: Option<ReorderOverlay>,
     loop_preview_clone: Option<(f64, f64)>,
 ) {
+            // r.md #48: このフレームの色パレット。`&'a Palette` (host 寿命) なので、以降の
+            // `hctx.cached(..)` / `hctx.with_clip_rect(..)` クロージャにそのまま持ち込める。
+            let p = hctx.palette();
             // M14 Phase 63n-1 (#028): heavy closure 内でも prefix sum tops を計算 ('static borrow が
             // 必要なため caller scope の tops_for_draw は持ち込めない、 同一 visibility を再計算)。
             let tops_owned_for_heavy = visible_track_row_tops(
@@ -347,7 +350,10 @@ pub(super) fn render_arrangement_heavy(
                 hctx.push_rect(RectCommand {
                     rect: Rect { x: px - r, y: py - r, w: r * 2.0, h: r * 2.0 },
                     fill: style_copy.clip_selected_fill,
-                    border: theme::TEXT,
+                    // 枠が乗るのは automation lane 面 (パレット自身のクローム面) と
+                    // `clip_selected_fill` なので、極性固定インクではなくテーマ従属の `text`
+                    // (ライトでは暗くなり、明るい lane / 黄 dot の双方で縁が立つ)。
+                    border: p.text,
                     border_width: 1.5,
                     radius: [r; 4],
                     clip_rect: Some(pd.body_rect_anchor),

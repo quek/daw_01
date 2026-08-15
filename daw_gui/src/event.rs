@@ -87,6 +87,14 @@ pub enum AppEvent {
     /// r.md #29: Undo 履歴パネルの開閉トグル (View メニュー / パネル ✕ / Esc)。
     /// session-only な UI 状態なので Undo 対象外。
     ToggleUndoHistory,
+    /// r.md #48: 設定 window の開閉トグル (Edit メニュー「設定...」 / ✕ / Esc)。
+    /// 開閉状態は `app_config.json` に永続。 Song は触らないので Undo / dirty 対象外。
+    ToggleSettings,
+    /// r.md #48: テーマを切り替える。**パレット実体ではなくテーマ id を運ぶ**
+    /// (arch 不変条件 #2 blob-less wire の精神。id から解決すればテーマファイルの
+    /// 編集が次回にそのまま効く)。 切替は即時で全画面に反映され、`app_config.json`
+    /// に保存される。 Song は触らないので Undo / dirty 対象外。
+    SetTheme(String),
     /// r.md #29: 履歴リストの行 click。 `index` = [`crate::state::SongDoc::history_labels`]
     /// の 0 始まり index。 その state まで一気に Undo / Redo する
     /// ([`crate::state::SongDoc::jump_to`])。 履歴操作自体は Undo 対象外。

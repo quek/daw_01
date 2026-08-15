@@ -14,7 +14,7 @@ use crate::view::modulation::{build_mod, push_mod_drag_resync};
 use crate::view::param_gesture::push_param_gesture_edges;
 use crate::view::track_color;
 use daw_ui_renderer::{Color, Rect, RectCommand};
-use crate::theme;
+use crate::theme::Theme;
 
 use crate::app::{AppData, AppEvent, ModControlDomain};
 use crate::widgets::select_modifier::SelectModifier;
@@ -66,70 +66,58 @@ const COLOR_STRIP_W: f32 = 4.0;
 /// 「＋ Return」 ボタンの高さ (returns 帯の上端に置く)。
 const ADD_RETURN_H: f32 = 22.0;
 
-/// mixer ビューの最下層 backdrop (= strip が浮く床)。strip 本体 = PANEL より
-/// 一段沈める必要があるので view base の WINDOW_BG を使う。
-const COLOR_BG: Color = theme::WINDOW_BG;
-/// 通常 track strip 本体 (elevation-1 = theme の "strip body")。
-const COLOR_STRIP_BG: Color = theme::PANEL;
-/// Return strip — 緑寄りの tint で、 通常 track / group bus とも別物だと
-/// 一目で分かるようにする (Ableton の return track 列のメタファ)。
-/// theme に return 帯専用の surface token は無いので one-off リテラルを維持。
-const COLOR_RETURN_BG: Color = Color { r: 0.18, g: 0.28, b: 0.22, a: 1.0 };
-/// returns 帯と通常帯を分ける縦 divider の色。COLOR_RETURN_BG と対の緑系
-/// 一点物で theme token が無いためリテラルを維持。
-const COLOR_RETURN_DIVIDER: Color = Color { r: 0.30, g: 0.40, b: 0.32, a: 1.0 };
-/// master strip 本体 (elevation-2 = theme の "master strip")。
-const COLOR_MASTER_BG: Color = theme::PANEL_RAISED;
-const COLOR_TEXT: Color = theme::TEXT;
-/// Mute active 時の背景色 (= 業界標準の赤)。 旧 hint band 色を on_color に昇格
-/// (gui_01 #052 で hint_band 廃止 → ON は背景色のみで表現する idiom に統一)。
-const COLOR_MUTE_ACTIVE: Color = theme::RECORD;
-/// Solo active 時の背景色 (= 業界標準の黄)。 同様に旧 hint band 色を on_color に昇格。
-const COLOR_SOLO_ACTIVE: Color = theme::SOLO;
-/// 黄背景 (Solo) と組み合わせる黒文字 (= 白文字では視認性低い、 STYLE_CLICK と同 idiom)。
-const COLOR_TEXT_BLACK: Color = theme::TEXT_ON_BRIGHT;
+/// mixer のトグル (M / S / send の Pre-Post / per-send mute) の共通ベース。
+/// ui-core 既定 (`ToggleButtonStyle::from_palette`) から、 mixer の詰まった
+/// 80px ストリップ向けに radius / font を詰め、 ON を非意味的な
+/// `control_active` に戻す (意味色を持つトグルは各 style 関数が上書きする)。
+fn toggle_button_base(theme: &Theme) -> ToggleButtonStyle {
+    let p = &theme.core;
+    ToggleButtonStyle {
+        on_color: p.control_active,
+        radius: 4.0,
+        font_size: 12.0,
+        ..ToggleButtonStyle::from_palette(p)
+    }
+}
 
-const TOGGLE_BUTTON_BASE: ToggleButtonStyle = ToggleButtonStyle {
-    off_color: theme::CONTROL,
-    on_color: theme::CONTROL_ACTIVE,
-    border: theme::BORDER,
-    border_width: 1.0,
-    radius: 4.0,
-    font_size: 12.0,
-    text_color: theme::TEXT,
-    on_text_color: None,
-};
+/// Mute トグル。 ON 背景 = 業界標準の赤 (gui_01 #052 で hint_band 廃止 →
+/// ON は背景色のみで表現する idiom に統一)。
+fn style_mute(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle { on_color: theme.daw.record, ..toggle_button_base(theme) }
+}
 
-const STYLE_MUTE: ToggleButtonStyle = ToggleButtonStyle {
-    on_color: COLOR_MUTE_ACTIVE,
-    ..TOGGLE_BUTTON_BASE
-};
-
-const STYLE_SOLO: ToggleButtonStyle = ToggleButtonStyle {
-    on_color: COLOR_SOLO_ACTIVE,
-    on_text_color: Some(COLOR_TEXT_BLACK),
-    ..TOGGLE_BUTTON_BASE
-};
+/// Solo トグル。 ON 背景 = 業界標準の黄。 黄は明るいので文字は極性固定インクを
+/// `ink_for` で選ぶ (テーマ従属の `text` のままだと、 ライトテーマで暗い黄の上に
+/// 暗い文字が乗って読めなくなる)。
+fn style_solo(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle {
+        on_color: theme.daw.solo,
+        on_text_color: Some(theme.core.ink_for(theme.daw.solo)),
+        ..toggle_button_base(theme)
+    }
+}
 
 /// send 内 per-send mute (`enabled`)。 mute と同じ赤系 on_color、 ただし
 /// `enabled == true` (= 鳴っている) が「OFF 表示」、 `enabled == false`
 /// (= ミュート) が「ON 表示 (赤)」 になるよう、 描画側で `!enabled` を渡す。
-const STYLE_SEND_MUTE: ToggleButtonStyle = ToggleButtonStyle {
-    on_color: COLOR_MUTE_ACTIVE,
-    font_size: 10.0,
-    ..TOGGLE_BUTTON_BASE
-};
+fn style_send_mute(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle { on_color: theme.daw.record, font_size: 10.0, ..toggle_button_base(theme) }
+}
 
 /// Pre/Post 切替トグル。 PreFader のとき on_color (accent) で強調する。
-const STYLE_SEND_PREPOST: ToggleButtonStyle = ToggleButtonStyle {
-    on_color: theme::ACCENT,
-    font_size: SEND_PREPOST_FONT,
-    ..TOGGLE_BUTTON_BASE
-};
-
+fn style_send_prepost(theme: &Theme) -> ToggleButtonStyle {
+    ToggleButtonStyle {
+        on_color: theme.core.accent,
+        font_size: SEND_PREPOST_FONT,
+        ..toggle_button_base(theme)
+    }
+}
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
-    ui.panel("mixer_bg", area, COLOR_BG, 0.0);
+    let p = &app.theme.core;
+    // mixer ビューの最下層 backdrop (= strip が浮く床)。strip 本体 = panel より
+    // 一段沈める必要があるので view base の window_bg を使う。
+    ui.panel("mixer_bg", area, p.window_bg, 0.0);
 
     // S キーで「マウス直下のストリップ」を solo するため、 各 strip の
     // rect にポインタ当たり判定をして hover track を求める (arrangement の
@@ -242,7 +230,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 w: RETURN_DIVIDER_W,
                 h: strip_h,
             },
-            COLOR_RETURN_DIVIDER,
+            app.theme.daw.strip_return_divider,
             0.0,
         );
         for (i, entry) in returns.iter().enumerate() {
@@ -299,7 +287,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         app.transport.peak_l_display,
         app.transport.peak_r_display,
         Rect { x: master_x, y: strip_y, w: STRIP_WIDTH, h: strip_h },
-        COLOR_MASTER_BG,
+        // master strip 本体 (elevation-2 = 通常 strip より一段浮く面)。
+        p.panel_raised,
         None, // master は track 色を持たない (neutral 背景)
         u32::MAX,
         true,
@@ -328,8 +317,8 @@ fn draw_track_strip(
 ) {
     // グループ強調の色ハイライト (旧 COLOR_GROUP_BG 青 tint) は撤去。
     // グループ識別は構造手掛かり ("↳" depth prefix + 折り畳み) だけで担い、
-    // 背景は通常 strip と同じ neutral に統一する。
-    let bg = COLOR_STRIP_BG;
+    // 背景は通常 strip と同じ neutral (elevation-1 = strip 本体) に統一する。
+    let bg = app.theme.core.panel;
     let display_name = if entry.depth > 0 {
         let arrows = "↳".repeat(entry.depth.min(4) as usize);
         format!("{arrows} {}", entry.name)
@@ -378,8 +367,9 @@ fn draw_track_strip(
     draw_sends_section(app, ui, track_id, rect, sends_band_h);
 }
 
-/// リターン strip。 通常の fader / pan / mute / solo を持つが、 緑 tint で
-/// 別物として見せ、 Sends セクションは描画しない (= 簡潔さ優先)。
+/// リターン strip。 通常の fader / pan / mute / solo を持つが、 緑 tint
+/// (`daw.strip_return_bg`) で別物として見せ、 Sends セクションは描画しない
+/// (= 簡潔さ優先)。
 fn draw_return_strip(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -400,7 +390,7 @@ fn draw_return_strip(
         entry.peak_l_raw,
         entry.peak_r_raw,
         rect,
-        COLOR_RETURN_BG,
+        app.theme.daw.strip_return_bg,
         Some(track_color::to_renderer(entry.color)),
         track_id,
         false,
@@ -458,6 +448,7 @@ fn draw_strip(
     was_dragging_vol: bool,
     was_dragging_pan: bool,
 ) {
+    let p = &app.theme.core;
     ui.panel(("mixer_strip_bg", layout_idx), rect, bg, 4.0);
 
     // track 色ストライプ: strip 左端に縦 COLOR_STRIP_W px。 panel と同じ角丸
@@ -482,7 +473,7 @@ fn draw_strip(
         ui.push_rect(RectCommand {
             rect,
             fill: Color::TRANSPARENT,
-            border: theme::ACCENT,
+            border: p.accent,
             border_width: 2.0,
             radius: [4.0; 4],
             clip_rect: None,
@@ -530,9 +521,11 @@ fn draw_strip(
             h: TOP_LABEL_H,
         },
         11.0,
-        // 全トラック名を明色で描画。 旧 dim
-        // (COLOR_TEXT) は暗 strip 背景に対しコントラスト不足で読みにくかった。
-        COLOR_TEXT,
+        // 全トラック名を本文色で描画。 旧 dim はクローム面 (strip 本体) に対し
+        // コントラスト不足で読みにくかった。 乗る背景は strip の面 (panel /
+        // return tint / master) というパレット自身のクロームなので、 極性固定
+        // インクではなくテーマ従属の `text` でよい。
+        p.text,
     );
     y += TOP_LABEL_H;
 
@@ -543,7 +536,7 @@ fn draw_strip(
             "M",
             Rect { x: rect.x + pad, y, w: btn_w, h: TOGGLE_H },
             muted,
-            &STYLE_MUTE,
+            &style_mute(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ToggleTrackMute(track_idx))
@@ -555,7 +548,7 @@ fn draw_strip(
             "S",
             Rect { x: rect.x + pad + btn_w + 4.0, y, w: btn_w, h: TOGGLE_H },
             solo,
-            &STYLE_SOLO,
+            &style_solo(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::ToggleTrackSolo(track_idx))
@@ -630,7 +623,7 @@ fn draw_strip(
     let style = LevelMeterStyle {
         scale: Some(vol_scale),
         peak_readout: true,
-        ..LevelMeterStyle::default()
+        ..LevelMeterStyle::from_palette(p)
     };
     // per-control modulation (docs/plan_modulation_routing_redesign.md §6, gui_01
     // #110): 音量フェーダーを音でドラッグ変調。表示ドメインは「フェーダーの正規化
@@ -734,11 +727,12 @@ fn draw_sends_section(
 ) {
     let pad = SEND_PAD;
     let band_top = rect.y + rect.h - pad - band_h;
-    // 上端に薄い区切り線。
+    // 上端に区切り線。 strip の面の上に引くクロームなので本文色 (`text`) で、
+    // fader/メーター帯と Sends 帯の境目をはっきり分ける。
     ui.panel(
         ("mixer_sends_div", track_id as usize),
         Rect { x: rect.x + pad, y: band_top, w: rect.w - pad * 2.0, h: 1.0 },
-        COLOR_TEXT,
+        app.theme.core.text,
         0.0,
     );
 
@@ -806,7 +800,7 @@ fn draw_sends_rows(
             &dest_name,
             Rect { x: inner_x, y, w: name_max_w, h: 12.0 },
             10.0,
-            COLOR_TEXT,
+            app.theme.core.text,
         );
         // × (remove send) — slot 右上 (= 一般的な「閉じる / 削除」位置)。
         let send_idx_for_remove = send_idx;
@@ -889,7 +883,7 @@ fn draw_sends_rows(
             mode_label,
             Rect { x: btns_x, y: btn_y, w: prepost_w, h: btn_h },
             is_pre,
-            &STYLE_SEND_PREPOST,
+            &style_send_prepost(&app.theme),
             move |_| {
                 // クリックで Pre ↔ Post を反転。
                 let next = if is_pre { SendMode::PostFader } else { SendMode::PreFader };
@@ -912,7 +906,7 @@ fn draw_sends_rows(
             "M",
             Rect { x: btns_x + prepost_w + SEND_BTN_GAP, y: btn_y, w: SEND_MUTE_BTN_W, h: btn_h },
             !enabled,
-            &STYLE_SEND_MUTE,
+            &style_send_mute(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::SetSendEnabled {

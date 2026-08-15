@@ -59,7 +59,7 @@ fn main() {
                     vertical_gain: 1.0,
                     reversed: false,
                 },
-                WaveformStyle::default(),
+                WaveformStyle::from_palette(ui.palette()),
             );
 
             // Planar: チャンネル別スライスの参照配列
@@ -79,7 +79,7 @@ fn main() {
                     vertical_gain: 1.0,
                     reversed: false,
                 },
-                WaveformStyle::default(),
+                WaveformStyle::from_palette(ui.palette()),
             );
 
             // Interleaved: フレームごとに channels 個ずつ並ぶ
@@ -101,7 +101,7 @@ fn main() {
                     vertical_gain: 1.0,
                     reversed: false,
                 },
-                WaveformStyle::default(),
+                WaveformStyle::from_palette(ui.palette()),
             );
         },
     );

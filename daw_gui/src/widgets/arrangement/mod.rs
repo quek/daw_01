@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use daw_ui_platform::{CursorIcon, Modifiers};
 use daw_ui_renderer::{Color, GlyphArea, Rect, RectCommand, TextureHandle, TexturedQuad};
-use crate::theme;
 
 use daw_ui_core::edit::Edit;
 use daw_ui_core::id::WidgetId;
@@ -828,7 +827,12 @@ impl Default for ArrangementResponse {
     }
 }
 
-/// arrangement の見た目スタイル。`Default` で example 互換の見た目を再現。
+/// arrangement の見た目スタイル。[`ArrangementStyle::from_theme`] が有効テーマから組み立てる。
+///
+/// r.md #48: `Default` は持たない。色トークンは runtime 切替可能な
+/// [`crate::theme::Theme`] (汎用 [`Palette`](daw_ui_core::theme::Palette) + DAW 固有
+/// `DawColors`) が SSoT で、`Default::default()` にすると「どのテーマで描いているか」 を
+/// 知らないまま組込みダーク値を焼き込む隠れたグローバル依存になる。
 #[derive(Clone, Copy, Debug)]
 pub struct ArrangementStyle {
     pub bg: Color,
@@ -840,11 +844,11 @@ pub struct ArrangementStyle {
     pub track_color_strip_w: f32,
     pub ruler_bg: Color,
     /// M14 Phase 72 (daw_01 #044): video track の行背景 (audio track は既存 `bg` のまま)。
-    /// 推奨 default = 暗青 `rgb(0.13, 0.14, 0.18)` で audio 背景 (`rgb(0.10, 0.11, 0.13)`) と
-    /// 視覚区別。 lane 描画前に `track.kind == Video` のとき 1 度塗る。
+    /// 既定は elevation-1 の `panel` で、床 (`window_bg`) の audio 行から 1 段浮いて見える。
+    /// lane 描画前に `track.kind == Video` のとき 1 度塗る。
     pub track_background_video: Color,
     /// M14 Phase 72 (daw_01 #044): video clip 内 `thumbnail = None` のときの fallback fill
-    /// (= decode 失敗 / loading 中)。 推奨 default = 暗グレー `rgb(0.18, 0.18, 0.20)`。
+    /// (= decode 失敗 / loading 中)。 既定は中立な `control` 面で「loading 中」 を控えめに表す。
     pub video_clip_loading: Color,
     pub bar_line: Color,
     pub beat_line: Color,
@@ -856,8 +860,9 @@ pub struct ArrangementStyle {
     pub clip_border: Color,
     pub clip_border_w: f32,
     pub clip_radius: f32,
-    /// muted clip に重ねる斜線ハッチの色 (半透明)。default は暗い
-    /// 半透明黒 `rgba(0,0,0,0.34)`。`ClipView.muted == true` のときのみ描画。
+    /// muted clip に重ねる斜線ハッチの色 (半透明)。既定は極性固定の `hatch_ink`
+    /// (ユーザー着色 clip の上に乗るのでテーマで反転させない)。
+    /// `ClipView.muted == true` のときのみ描画。
     pub clip_muted_hatch_color: Color,
     /// muted ハッチ線の間隔 (px、default 7.0) と線幅 (px、default 1.5)。
     pub clip_muted_hatch_spacing_px: f32,
@@ -875,10 +880,11 @@ pub struct ArrangementStyle {
     /// どんな clip でも選択枠が視認できる 2 重リングを成す。
     pub clip_selected_border_inner: Color,
     pub clip_selected_border_w: f32,
+    /// clip 名 + link glyph の **明インク側** (暗い fill の上)。 clip の塗りはユーザーが選ぶ
+    /// 可変色なので、テーマで反転する `text` ではなく極性固定の `ink_on_dark` を使う。
     pub clip_text_color: Color,
     /// M14 Phase 89 (daw_01 #060): auto-contrast が「暗い文字」を選んだときの色 (明るい fill 上)。
-    /// `clip_text_color` (明るい文字、暗い fill 上) と対をなす黒寄りプール。 selected clip の
-    /// 旧ハードコード `rgb(0.10, 0.10, 0.15)` をこの field に統合した (SSoT)。
+    /// `clip_text_color` (明インク、暗い fill 上) と対をなす極性固定の `ink_on_bright`。
     pub clip_text_color_dark: Color,
     /// M14 Phase 89 (daw_01 #060): clip / video clip の名前 + link glyph の色を、 widget が実際に
     /// 塗る fill の WCAG relative luminance から自動選択するか (default true)。 `true` のとき明るい
@@ -887,6 +893,10 @@ pub struct ArrangementStyle {
     /// `clip_text_color` 固定 (opt-out)。
     pub clip_auto_contrast_text: bool,
     pub clip_text_size: f32,
+    /// 選択トラックの行背景 (header + lanes の全幅)。 `panel_raised` を `accent` 方向へ
+    /// 22% だけ寄せた派生で、**どちらのテーマでも「選択行が非選択行より目立つ」** が成り立つ:
+    /// ダークでは床より明るい raised が更に accent の青に寄って浮き、ライトでは最も白い
+    /// raised が accent の濃青に寄って沈む — どちらも非選択行との差が accent 側に開く。
     pub track_selected_bg: Color,
     pub track_text_color: Color,
     /// track header の **トラック名** + group disclosure グリフ (▶ / ▼) の font size
@@ -952,7 +962,8 @@ pub struct ArrangementStyle {
     pub clip_clone_indep_border: Color,
     /// ghost rect 左上に重ねる badge glyph (`⇌` / `+`) の font_size。 default = `clip_text_size`。
     pub clip_clone_badge_size: f32,
-    /// badge glyph の color (default = `clip_text_color` と同等の白)。
+    /// badge glyph の color。 badge は ghost の明るい緑 / 橙 fill の上に乗るので、
+    /// 極性固定の暗インク (`ink_on_bright`)。
     pub clip_clone_badge_color: Color,
     // ---- M14 Phase 63e (#019) / Phase 114 (#086): share group (linked clip group) 描画パラメータ ----
     /// share clip の name 左に描く link glyph (default = `'⇌'` U+21CC)。 font に存在しない場合は
@@ -961,10 +972,11 @@ pub struct ArrangementStyle {
     pub share_group_link_glyph: char,
     // ---- M14 Phase 96 (daw_01 #068) / Phase 114 (#086): 共有グループ連動ハイライト (active group 強調) ----
     /// M14 Phase 114 (daw_01 #086): `ClipView.in_active_group == true` の clip に重ねる強調色
-    /// (glow wash + bright thick border 共通)。 旧 hue 由来から **identity-neutral な bright 中立色** に変更
+    /// (glow wash + bright thick border 共通)。 旧 hue 由来から **identity-neutral な中立色** に変更
     /// (clip fill が user 指定色になったので hue wash だと喧嘩する、 hover 中は 1 グループのみ強調 = 色で
-    /// 区別する必要が無い)。 default = bright cool white。 glow wash はこの RGB を `share_group_active_glow_alpha`
-    /// で、 border はこの色を不透明で描く。
+    /// 区別する必要が無い)。 既定は DAW トークンの `highlight_ring` (ダークでは明中立色、ライトでは
+    /// 暗中立色 = 明るい clip の上でも枠が沈まない)。 glow wash はこの RGB を
+    /// `share_group_active_glow_alpha` で、 border はこの色を不透明で描く。
     pub share_group_active_color: Color,
     /// active group 強調の outline 太さ (px)。 透明 fill + この太さの bright border を clip rect に
     /// 重ねる (= clip 名 / fill を隠さず枠だけ強調)。 default = 2.5 で通常 `clip_border_w` (1.0) /
@@ -976,7 +988,8 @@ pub struct ArrangementStyle {
     /// (= ring のみの強調にしたい theme 向け)。
     pub share_group_active_glow_alpha: f32,
     // ---- M14 Phase 63k (#025): audio clip inline 編集 (dB handle / fade) ----
-    /// audio_edit が Some の clip に重ねる dB handle line の色 (default 半透明白)。
+    /// audio_edit が Some の clip に重ねる dB handle line の色。 波形 / ユーザー着色 clip の
+    /// 上に乗るので極性固定の明インク (`ink_on_dark`) を半透明で。
     pub audio_db_handle_color: Color,
     /// dB handle line の太さ (default 1.5 px)。
     pub audio_db_handle_width_px: f32,
@@ -994,7 +1007,7 @@ pub struct ArrangementStyle {
     /// fade 角 grip の正方形サイズ (px、 clip 上端の左右にこの size の正方形 hit zone)。 default 12.0。
     pub audio_fade_corner_size_px: f32,
     /// fade envelope (clip の中身領域上端から fade 末尾まで) と grip の描画色。
-    /// **暗い clip 色の上で使う明色側** (default 半透明白)。
+    /// **暗い clip 色の上で使う明色側** (極性固定の `ink_on_dark` を半透明で)。
     pub audio_fade_overlay_color: Color,
     /// r.md #46: 明るい clip 色の上で使う暗色側 (`audio_fade_overlay_color` と対)。
     /// clip 名の `clip_text_color` / `clip_text_color_dark` と同じ auto-contrast 2 択で、
@@ -1003,6 +1016,11 @@ pub struct ArrangementStyle {
     pub audio_fade_overlay_color_dark: Color,
     /// fade envelope 線の太さ (default 1.0 px)。
     pub audio_fade_overlay_width_px: f32,
+    /// audio clip 内の **スライス区切り線** (event の trigger 境界) の前景色。
+    /// r.md #48: 波形描画は `HeavyCtx::palette()` (汎用パレット) しか手元に無い一方、
+    /// この色は DAW 固有トークン (`slice_divider`) なので style 経由で渡す。 裏打ちの暗線は
+    /// 汎用 `scrim` を widget が直接引く (2 層で波形の上でも縁が立つ)。
+    pub slice_divider_color: Color,
     /// audio grip / handle を表示する最小 clip 幅 (これ未満では hit zone 全 disable、 描画も
     /// skip)。 default 32.0 → ResizeLeft + ResizeRight + 中央 = 32 px 必要、 短 clip は audio
     /// gesture 起動しない。
@@ -1013,7 +1031,7 @@ pub struct ArrangementStyle {
     /// drag 中の ghost label (`+3.2 dB` / `Curve: Exponential`) の font_size。 default 11.0
     /// (= clip_text_size と同等)。
     pub audio_ghost_label_size: f32,
-    /// ghost label の color (default 白系)。
+    /// ghost label の color。 clip / 波形の上に直接乗るので極性固定の明インク (`ink_on_dark`)。
     pub audio_ghost_label_color: Color,
     // ---- M14 Phase 63n-1 (#028): automation lane 描画パラメータ ----
     /// automation lane 行の左 header 領域の最低幅 (px、 これ未満で label / icon / slider 帯を skip)。
@@ -1032,7 +1050,8 @@ pub struct ArrangementStyle {
     /// M14 Phase 63n-9 (#033): tension/bend handle の fill。 default 黄色系 (curve / point とは異なる色相
     /// で「これは handle」 と user に明示)。
     pub automation_curve_param_handle_fill: Color,
-    /// M14 Phase 63n-9 (#033): tension/bend handle の border。 default 黒 (= handle を背景から分離)。
+    /// M14 Phase 63n-9 (#033): tension/bend handle の border。 明るい handle fill の上に乗る
+    /// 極性固定の暗インク (`ink_on_bright`) で handle を背景から分離する。
     pub automation_curve_param_handle_border: Color,
     /// M14 Phase 63n-9 (#033): handle を curve から上方向 (= y - offset) に offset させる px。 default 10.0
     /// (= curve 線 (1.5px) と完全に分離して click target が curve と紛れない)。
@@ -1045,17 +1064,19 @@ pub struct ArrangementStyle {
     /// M14 Phase 63n-8 (#033): selected automation point の半径 (px)。 default 5.0 (= 通常 4.0 から +25%)。
     /// `automation_point_radius_px` より大きい値を期待 (= 視認性、 「selected の方が大きく / 明るく見える」 SSoT)。
     pub automation_point_radius_selected_px: f32,
-    /// M14 Phase 63n-8 (#033): selected automation point の fill。 default 白 (= 通常の curve_color から
-    /// 大きく外して selected を強調)、 lane が disabled でも変えない (= selected を見失わないため)。
+    /// M14 Phase 63n-8 (#033): selected automation point の fill。 lane 識別色で塗られた clip の上に
+    /// 乗る (= 背景が可変) ので、極性固定の明インク (`ink_on_dark`) で curve 色から大きく外して
+    /// selected を強調する。 lane が disabled でも変えない (= selected を見失わないため)。
     pub automation_point_selected_fill: Color,
-    /// M14 Phase 63n-8 (#033): selected automation point の border。 default 白 (上書き fill と同色 +
-    /// `automation_point_radius_px` の border_w で枠線扱い)、 widget 側で `border_w = 1.5` (= 通常 1.0 から +50%)
-    /// で「枠線が太い」 visual を作る。
+    /// M14 Phase 63n-8 (#033): selected automation point の border。 fill と同じ `ink_on_dark` (上書き
+    /// fill と同色 + `automation_point_radius_px` の border_w で枠線扱い)、 widget 側で `border_w = 1.5`
+    /// (= 通常 1.0 から +50%) で「枠線が太い」 visual を作る。
     pub automation_point_selected_border: Color,
     /// M14 Phase 63n-8 (#033): lasso 矩形 (空き automation lane zone での drag) の fill (半透明)。
-    /// default は cyan 系 12% alpha。 widget は drag 中 cached 外で overlay 描画する。
+    /// 既定は `accent` の 12% alpha (MIDI rect select と同じ選択の色言語)。 widget は drag 中
+    /// cached 外で overlay 描画する。
     pub automation_lasso_fill: Color,
-    /// M14 Phase 63n-8 (#033): lasso 矩形の border。 default cyan 60% alpha + 1px。
+    /// M14 Phase 63n-8 (#033): lasso 矩形の border。 既定は `accent` の 60% alpha + 1px。
     pub automation_lasso_border: Color,
     /// lane 内 default_value 水平線の色 (clip ギャップ / curve 範囲外の値表示)。
     pub automation_default_line_color: Color,
@@ -1099,9 +1120,9 @@ pub struct ArrangementStyle {
     /// lane header の text color (label + icon、 default = `track_text_color`)。
     pub automation_lane_text_color: Color,
     // ---- M14 Phase 63n-10 (#034): master row 描画パラメータ ----
-    /// master row header の背景塗り (track.color の代わりに使う neutral gray、 default
-    /// `rgb(0.45, 0.45, 0.48)`)。 daw_01 #034 §B 仕様。 track 色と differentiate しつつ track header_bg
-    /// より暗くないようにして「特殊だが視認可能」 を保つ。
+    /// master row header の背景塗り (track.color の代わりに使う中立面、 既定は `control_active`)。
+    /// daw_01 #034 §B 仕様。 track 色と differentiate しつつ、床から最も離れたコントロール面を
+    /// 使うことで「特殊だが視認可能」 をどちらのテーマでも保つ。
     pub master_row_color: Color,
     /// master row header の "Master" label に使う font size (default = `track_text_size`)。
     /// 通常 track と並んだとき揃って見えるよう同サイズが既定。
@@ -1110,163 +1131,176 @@ pub struct ArrangementStyle {
     pub master_row_label_color: Color,
 }
 
-impl Default for ArrangementStyle {
+impl ArrangementStyle {
+    /// 有効テーマ (汎用 `Palette` + DAW 固有 `DawColors`) から arrangement のスタイルを組み立てる。
+    ///
+    /// 極性の原則 (r.md #48):
+    /// - **クローム面の上**に乗るもの (track header の文字 / ruler ラベル / lane header / grid) は
+    ///   テーマ従属の `text` / `text_dim` / `grid_line`。
+    /// - **ユーザー着色 clip・波形・映像 thumbnail の上**に乗るもの (clip 名 / fade 線 / dB handle /
+    ///   選択リング / ghost badge) は極性固定インク (`ink_on_dark` / `ink_on_bright` /
+    ///   `selection_ring_*` / `hatch_ink`)。ここを `text` にするとライトテーマで clip 名や fade の
+    ///   線が消える。
+    #[must_use]
     #[allow(clippy::too_many_lines)]
-    fn default() -> Self {
+    pub fn from_theme(theme: &crate::theme::Theme) -> Self {
+        let p = &*theme.core;
+        let d = &theme.daw;
+        // M/S/R は共通の小型トグル (角丸 3px / 11px 文字)。off 面・枠・OFF 文字色は
+        // パレット既定 (`from_palette`) をそのまま使い、ON 色だけ DAW の意味色で差し替える。
         let mute_button = ToggleButtonStyle {
-            off_color: theme::CONTROL,
-            on_color: theme::RECORD,
-            border: theme::BORDER,
-            border_width: 1.0,
+            on_color: d.record,
             radius: 3.0,
             font_size: 11.0,
-            text_color: theme::TEXT,
-            on_text_color: None,
+            ..ToggleButtonStyle::from_palette(p)
         };
         let solo_button = ToggleButtonStyle {
-            off_color: theme::CONTROL,
-            on_color: theme::SOLO,
-            border: theme::BORDER,
-            border_width: 1.0,
+            on_color: d.solo,
             radius: 3.0,
             font_size: 11.0,
-            text_color: theme::TEXT,
-            // r.md #22: ON 色は高輝度の黄 (`SOLO`)。 明るい白文字 (`TEXT`) では「S」が埋もれる
-            // ので、 黄背景には暗文字を敷く (mixer/metronome の Solo と同じ `TEXT_ON_BRIGHT`)。
-            // M/R は ON 色が赤で白文字が読めるため `None` のまま。
-            on_text_color: Some(theme::TEXT_ON_BRIGHT),
+            // r.md #22: ON 色は高輝度の黄 (`solo`)。 明インクでは「S」が埋もれるので、 黄背景には
+            // 極性固定の暗インク (`ink_on_bright`) を敷く (mixer/metronome の Solo と同じ)。
+            // M/R は ON 色が赤で明インクが読めるため `None` (= `text_color`) のまま。
+            on_text_color: Some(p.ink_on_bright),
+            ..ToggleButtonStyle::from_palette(p)
         };
         // M14 Phase 68 (#040): R button (Record-arm)。 active = 鮮やかな赤、
-        // off = mute / solo と同 neutral 灰。
+        // off = mute / solo と同じ中立コントロール面。
         let armed_button = ToggleButtonStyle {
-            off_color: theme::CONTROL,
-            on_color: theme::RECORD,
-            border: theme::BORDER,
-            border_width: 1.0,
+            on_color: d.record,
             radius: 3.0,
             font_size: 11.0,
-            text_color: theme::TEXT,
-            on_text_color: None,
+            ..ToggleButtonStyle::from_palette(p)
         };
         Self {
-            bg: theme::WINDOW_BG,
-            header_bg: theme::HEADER,
+            bg: p.window_bg,
+            header_bg: p.header,
             track_color_strip_w: 4.0,
-            ruler_bg: theme::HEADER,
-            // M14 Phase 72 (#044): 暗青で audio bg と視覚区別 (elevation-1 surface)。
-            track_background_video: theme::PANEL,
-            // M14 Phase 72 (#044): 中立灰で「loading 中」 を控えめに表現。
-            video_clip_loading: theme::CONTROL,
-            bar_line: theme::GRID_LINE_STRONG,
-            beat_line: theme::GRID_LINE,
+            ruler_bg: p.header,
+            // M14 Phase 72 (#044): elevation-1 面で audio 行 (床) と視覚区別。
+            track_background_video: p.panel,
+            // M14 Phase 72 (#044): 中立コントロール面で「loading 中」 を控えめに表現。
+            video_clip_loading: p.control,
+            bar_line: p.grid_line_strong,
+            beat_line: p.grid_line,
             bar_line_width_px: 1.5,
             beat_line_width_px: 1.0,
-            lane_line: theme::GRID_LINE,
+            lane_line: p.grid_line,
             lane_line_width_px: 1.0,
-            clip_default_fill: theme::CLIP_DEFAULT,
-            clip_border: theme::CLIP_DEFAULT_BORDER,
+            clip_default_fill: d.clip_default,
+            clip_border: d.clip_default_border,
             clip_border_w: 1.0,
             clip_radius: 3.0,
-            clip_muted_hatch_color: theme::BACKDROP.with_alpha(0.34),
+            clip_muted_hatch_color: p.hatch_ink,
             clip_muted_hatch_spacing_px: 7.0,
             clip_muted_hatch_width_px: 1.5,
-            clip_selected_fill: theme::SELECTION_WARM,
-            // 選択リングは任意色の clip 上で確実に立つ意図的な pure-white (token 化しない)。
-            clip_selected_border: Color::WHITE,
-            // 選択リング内側の暗線。 明るい fill (黄 / 白) でも枠が見える。
-            clip_selected_border_inner: theme::TEXT_ON_BRIGHT,
+            clip_selected_fill: p.selection_warm,
+            // 選択の 2 重リング。任意色の clip の上で必ず立つ極性固定ペア (外 = 明 / 内 = 暗)。
+            clip_selected_border: p.selection_ring_outer,
+            clip_selected_border_inner: p.selection_ring_inner,
             clip_selected_border_w: 2.0,
-            clip_text_color: theme::TEXT,
-            // M14 Phase 89 (daw_01 #060): auto-contrast の暗文字プール (旧 selected ハードコード値)。
-            clip_text_color_dark: theme::TEXT_ON_BRIGHT,
+            // clip 名は user 着色 clip / 波形 / thumbnail の上。テーマ従属の `text` ではなく
+            // 極性固定インクの 2 択 (`clip_auto_contrast_text` が実塗り色の輝度で選ぶ)。
+            clip_text_color: p.ink_on_dark,
+            clip_text_color_dark: p.ink_on_bright,
             clip_auto_contrast_text: true,
             clip_text_size: 11.0,
-            // 選択トラックは行全体 (header + lanes) を塗るため、 full ACCENT だと clip を
-            // 塗り潰す。 PANEL_RAISED を ACCENT 方向へ少しだけブレンドした控えめな選択ブルー。
-            track_selected_bg: theme::PANEL_RAISED.lerp(theme::ACCENT, 0.22),
-            track_text_color: theme::TEXT,
+            // 選択トラックは行全体 (header + lanes) を塗るため、 full accent だと clip を
+            // 塗り潰す。 panel_raised を accent 方向へ少しだけブレンドした控えめな選択色。
+            // ライトでも raised (最も白い面) が accent の濃青へ寄るので、 非選択行との差は開く。
+            track_selected_bg: p.panel_raised.lerp(p.accent, 0.22),
+            track_text_color: p.text,
             track_text_size: 12.0,
-            playhead_color: theme::PLAYHEAD,
+            playhead_color: d.playhead,
             playhead_width_px: 2.5,
-            loop_band: theme::LOOP_BAND.with_alpha(0.20),
-            loop_handle: theme::LOOP_BAND,
+            loop_band: p.loop_band.with_alpha(0.20),
+            loop_handle: p.loop_band,
             loop_handle_w: 2.0,
-            arranger_lane_bg: theme::HEADER,
-            arranger_label_color: theme::TEXT_DIM,
-            arranger_preview_fill: theme::ACCENT.with_alpha(0.25),
+            arranger_lane_bg: p.header,
+            arranger_label_color: p.text_dim,
+            arranger_preview_fill: p.accent.with_alpha(0.25),
             resize_handle_px: 4.0,
             mute_button,
             solo_button,
             armed_button,
-            reorder_drop_indicator: theme::LOOP_BAND,
+            reorder_drop_indicator: p.loop_band,
             reorder_drop_indicator_h: 2.0,
             reorder_drag_alpha: 0.6,
-            // indicator と同系 (シアン) を低 alpha で。 group 行に薄く乗せて nest 先を示す。
-            reorder_group_highlight: theme::ACCENT.with_alpha(0.22),
+            // group 行に accent を薄く乗せて nest 先を示す (drop indicator と同じ選択の色言語)。
+            reorder_group_highlight: p.accent.with_alpha(0.22),
             track_volume_band_h: 4.0,
-            track_volume_band_track: theme::BACKDROP.with_alpha(0.45),
-            track_volume_band_fill: theme::ACCENT,
-            ruler_label_color: theme::TEXT_DIM,
+            // 溝は「沈んで見える」 ことが意味なので、 header 面の上に極性固定の暗い scrim を敷く
+            // (fill = accent との明度差がどちらのテーマでも保たれる)。
+            track_volume_band_track: p.scrim.with_alpha(0.45),
+            track_volume_band_fill: p.accent,
+            ruler_label_color: p.text_dim,
             indent_px: 16.0,
-            disclosure_color: theme::TEXT_DIM,
+            disclosure_color: p.text_dim,
             // M14 Phase 63e (#019): clone ghost (Ctrl / Ctrl+Shift) — 緑系 / 橙系で 3 種視覚区別。
-            // selected fill (黄系 = (1.0, 0.85, 0.30)) と色相を分けて drag 中に「同じ ghost
+            // selected fill (selection_warm = 黄系) と色相を分けて drag 中に「同じ ghost
             // にしか見えない」 状態を回避。
-            clip_clone_linked_fill: theme::GHOST_LINKED.with_alpha(0.55),
-            clip_clone_linked_border: theme::GHOST_LINKED,
-            clip_clone_indep_fill: theme::GHOST_INDEPENDENT.with_alpha(0.55),
-            clip_clone_indep_border: theme::GHOST_INDEPENDENT,
+            clip_clone_linked_fill: d.ghost_linked.with_alpha(0.55),
+            clip_clone_linked_border: d.ghost_linked,
+            clip_clone_indep_fill: d.ghost_independent.with_alpha(0.55),
+            clip_clone_indep_border: d.ghost_independent,
             clip_clone_badge_size: 11.0,
-            clip_clone_badge_color: theme::TEXT_ON_BRIGHT,
+            // badge は明るい緑 / 橙の ghost fill の上 → 極性固定の暗インク。
+            clip_clone_badge_color: p.ink_on_bright,
             // M14 Phase 114 (#086): share_group_color の hue 値で塗る挙動を撤去したため、 共有マークは
             // link glyph (⇌) + 下記 active 強調のみ。
             share_group_link_glyph: '⇌',
             // M14 Phase 96 (daw_01 #068) / Phase 114 (#086): active group 強調 — identity-neutral な
-            // bright cool white。 border は clip_selected_border_w (2.0) より太い 2.5、 glow wash は名前
-            // 可読性を保つ 0.22 alpha。 selection の黄塗りとは別レイヤの「明度上げ + 明るい中立枠」。
-            share_group_active_color: theme::TEXT,
+            // 中立色 (`highlight_ring`。 ダーク = 明中立 / ライト = 暗中立)。 border は
+            // clip_selected_border_w (2.0) より太い 2.5、 glow wash は名前可読性を保つ 0.22 alpha
+            // (= `highlight_glow` と同じ alpha)。 selection の黄塗りとは別レイヤの強調。
+            share_group_active_color: d.highlight_ring,
             share_group_active_border_w: 2.5,
             share_group_active_glow_alpha: 0.22,
             // M14 Phase 63k (#025): audio clip 編集 default — Bitwig spec §3.5/§3.6 と整合。
-            // dB handle: 半透明白の細線、 ±4 px hit 帯、 端から 24 px margin、 0.25 dB/px、 ±24 dB 範囲。
-            // fade 角: 12×12 grip、 半透明白の envelope 線。 sticky 閾値 10 px (要望文 §3.2)。
-            audio_db_handle_color: theme::TEXT.with_alpha(0.55),
+            // dB handle / fade envelope は波形と clip 色の上に乗るので極性固定インク。
+            // ±4 px hit 帯、 端から 24 px margin、 0.25 dB/px、 ±24 dB 範囲、 12×12 の fade grip、
+            // sticky 閾値 10 px (要望文 §3.2)。
+            audio_db_handle_color: p.ink_on_dark.with_alpha(0.55),
             audio_db_handle_width_px: 1.5,
             audio_db_handle_band_h: 8.0,
             audio_db_handle_x_margin: 24.0,
             audio_db_pixels_per_db: 0.25,
             audio_db_range_db: 24.0,
             audio_fade_corner_size_px: 12.0,
-            audio_fade_overlay_color: theme::TEXT.with_alpha(0.65),
-            audio_fade_overlay_color_dark: theme::TEXT_ON_BRIGHT.with_alpha(0.75),
+            audio_fade_overlay_color: p.ink_on_dark.with_alpha(0.65),
+            audio_fade_overlay_color_dark: p.ink_on_bright.with_alpha(0.75),
             audio_fade_overlay_width_px: 1.0,
+            // 旧実装は選択色 (`selection_warm`) を借りていた。 DAW 専用トークンに分離済み
+            // (値はダークで同一なので見た目は不変)。
+            slice_divider_color: d.slice_divider.with_alpha(0.85),
             audio_min_clip_w_for_handles_px: 32.0,
             audio_fade_sticky_threshold_px: 10.0,
             audio_ghost_label_size: 11.0,
-            audio_ghost_label_color: theme::TEXT,
+            audio_ghost_label_color: p.ink_on_dark,
             // M14 Phase 63n-1 (#028): automation lane defaults — Bitwig "Volume" lane の見た目に近づける。
             automation_lane_header_min_w_px: 80.0,
-            automation_lane_bg: theme::WINDOW_BG,
-            automation_lane_disabled_color: theme::TEXT_DIM.with_alpha(0.65),
+            automation_lane_bg: p.window_bg,
+            automation_lane_disabled_color: p.text_dim.with_alpha(0.65),
             automation_curve_line_width_px: 1.5,
             automation_point_radius_px: 4.0,
-            // M14 Phase 63n-9 (#033): tension/bend handle はオレンジ系 (lane.color の青/橙 と差別化、
-            // 「触ると curve param が変わる handle」 を user に明示)、 size は selection dot と同 4.0。
+            // M14 Phase 63n-9 (#033): tension/bend handle は暖色 (`selection_warm`。 lane.color と差別化して
+            // 「触ると curve param が変わる handle」 を明示)、 size は selection dot と同 4.0。
             automation_curve_param_handle_radius_px: 4.0,
-            automation_curve_param_handle_fill: theme::SELECTION_WARM,
-            automation_curve_param_handle_border: theme::TEXT_ON_BRIGHT,
+            automation_curve_param_handle_fill: p.selection_warm,
+            automation_curve_param_handle_border: p.ink_on_bright,
             automation_curve_param_handle_offset_px: 10.0,
-            automation_curve_param_preview_color: theme::SELECTION_WARM,
-            // M14 Phase 63n-8 (#033): selected point は半径 +25% (= 通常 4 → 5)、 fill / border 共に白で
-            // 「明らかに大きく / 明るく見える」 を実現 (daw_01 #033 §D 仕様)。 lane disabled でも色維持。
+            automation_curve_param_preview_color: p.selection_warm,
+            // M14 Phase 63n-8 (#033): selected point は半径 +25% (= 通常 4 → 5)、 fill / border 共に
+            // 明インクで「明らかに大きく / 明るく見える」 を実現 (daw_01 #033 §D 仕様)。
+            // lane disabled でも色維持。
             automation_point_radius_selected_px: 5.0,
-            automation_point_selected_fill: theme::TEXT,
-            automation_point_selected_border: theme::TEXT,
-            // M14 Phase 63n-8 (#033): lasso 矩形は cyan 系で MIDI rect_select (= 既存 cyan rect select) と
-            // 視覚的に共通の言語、 ただし fill alpha 12% で透明感を強め overlay と分かりやすく。
-            automation_lasso_fill: theme::ACCENT.with_alpha(0.12),
-            automation_lasso_border: theme::ACCENT.with_alpha(0.60),
-            automation_default_line_color: theme::GRID_LINE.with_alpha(0.18),
+            automation_point_selected_fill: p.ink_on_dark,
+            automation_point_selected_border: p.ink_on_dark,
+            // M14 Phase 63n-8 (#033): lasso 矩形は accent で MIDI rect_select と視覚的に共通の言語、
+            // ただし fill alpha 12% で透明感を強め overlay と分かりやすく。
+            automation_lasso_fill: p.accent.with_alpha(0.12),
+            automation_lasso_border: p.accent.with_alpha(0.60),
+            automation_default_line_color: p.grid_line.with_alpha(0.18),
             automation_default_line_width_px: 1.0,
             automation_clip_v_pad_px: 6.0,
             automation_clip_default_len_beats: 4.0,
@@ -1277,11 +1311,11 @@ impl Default for ArrangementStyle {
             automation_lane_max_height_px: 2000,
             automation_disclosure_size: 12.0,
             automation_lane_icon_size: 12.0,
-            automation_lane_text_color: theme::TEXT,
-            // M14 Phase 63n-10 (#034): master row default (neutral gray + track と同 font / 色)。
-            master_row_color: theme::CONTROL_ACTIVE,
+            automation_lane_text_color: p.text,
+            // M14 Phase 63n-10 (#034): master row default (中立面 + track と同 font / 色)。
+            master_row_color: p.control_active,
             master_row_label_size: 12.0,
-            master_row_label_color: theme::TEXT,
+            master_row_label_color: p.text,
         }
     }
 }

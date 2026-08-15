@@ -37,10 +37,10 @@ use std::cell::Cell;
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
+use crate::theme::Palette;
 use crate::ui::Ui;
 
 /// anchor を抜き取って target に挿入した新順 `Vec<T>` を返す。`anchor_index >= items.len()`
@@ -125,16 +125,23 @@ pub struct ReorderableListStyle {
     pub drag_handle_w: f32,
 }
 
-impl Default for ReorderableListStyle {
-    fn default() -> Self {
+impl ReorderableListStyle {
+    /// パレットから既定の reorder list スタイルを組む。row 面は [`crate::widgets::list_view`]
+    /// と同じ (`panel_raised` / `control_hover` / `accent`)、drag 中の anchor row はその accent を
+    /// 半透明にしたもの、drop 標的の線は `loop_band` (= 帯 / ドロップ標的の共通色)。
+    ///
+    /// `Default` は持たない (r.md #48): テーマ色を読む `Default::default()` は隠れた
+    /// グローバル依存になり、ライトテーマに追従しないため。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
             row_height: 26.0,
             row_gap: 2.0,
-            row_bg: theme::PANEL_RAISED,
-            row_bg_hover: theme::CONTROL_HOVER,
-            row_bg_selected: theme::ACCENT,
-            row_bg_dragging: theme::ACCENT.with_alpha(0.85),
-            drop_indicator_color: theme::LOOP_BAND,
+            row_bg: p.panel_raised,
+            row_bg_hover: p.control_hover,
+            row_bg_selected: p.accent,
+            row_bg_dragging: p.accent.with_alpha(0.85),
+            drop_indicator_color: p.loop_band,
             drop_indicator_h: 2.0,
             radius: 2.0,
             drag_handle_w: 0.0,
@@ -595,6 +602,7 @@ mod tests {
     use super::{ReorderableListEditRequest, ReorderableListStyle};
     use crate::edit::Edit;
     use crate::input::{FrameInput, PointerFrame};
+    use crate::theme::Palette;
     use crate::ui::UiHost;
 
     /// 元 index 列 `0..n` から anchor → target reorder 適用後の Vec<usize>。
@@ -609,7 +617,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ReorderableListStyle::default();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = (0..5).collect();
         let calls = Cell::new(0u32);
 
@@ -635,7 +643,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ReorderableListStyle::default();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = (0..1000).collect();
         let calls = Cell::new(0u32);
 
@@ -663,7 +671,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ReorderableListStyle::default();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = (0..5).collect();
 
         let edit_log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
@@ -716,7 +724,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ReorderableListStyle::default();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = (0..5).collect();
 
         let captured: Arc<Mutex<Option<Vec<usize>>>> = Arc::new(Mutex::new(None));
@@ -801,7 +809,10 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ReorderableListStyle { drag_handle_w: 12.0, ..Default::default() };
+        let style = ReorderableListStyle {
+            drag_handle_w: 12.0,
+            ..ReorderableListStyle::from_palette(&Palette::dark())
+        };
         let items: Vec<u32> = (0..5).collect();
 
         let resp_drag = Cell::new(None::<usize>);
@@ -840,7 +851,10 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ReorderableListStyle { drag_handle_w: 12.0, ..Default::default() };
+        let style = ReorderableListStyle {
+            drag_handle_w: 12.0,
+            ..ReorderableListStyle::from_palette(&Palette::dark())
+        };
         let items: Vec<u32> = (0..5).collect();
 
         let resp_drag = Cell::new(None::<usize>);
@@ -879,7 +893,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ReorderableListStyle::default();
+        let style = ReorderableListStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = vec![];
         let calls = Cell::new(0u32);
 
@@ -907,7 +921,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ReorderableListStyle::default(); // row_height 26, gap 2 → row_total 28
+        let style = ReorderableListStyle::from_palette(&Palette::dark()); // row_height 26, gap 2 → row_total 28
         let items: Vec<u32> = (0..4).collect();
 
         // row 1 を 100px 展開。

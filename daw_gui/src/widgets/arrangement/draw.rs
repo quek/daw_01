@@ -6,6 +6,11 @@
 // 型・外部クレート import・幾何 helper はすべて親 (`mod.rs`) の可視名を継承する。
 use super::*;
 
+// r.md #48: 色は runtime パレット (`HeavyCtx::palette`) から読む。可変背景 (ユーザー着色
+// クリップ / 波形 / 映像) の上に置くインクの明暗 2 択は呼び出し側では選ばず、
+// `Palette::ink_for` / `Palette::waveform_for` に畳んである。
+use daw_ui_core::theme::{Palette, WaveformInk};
+
 pub(super) fn push_filled_rect<M: ?Sized + 'static>(hctx: &mut HeavyCtx<'_, '_, M>, r: Rect, fill: Color) {
     hctx.push_rect(RectCommand {
         rect: r,
@@ -73,19 +78,26 @@ pub(super) fn draw_lanes_bg<M: ?Sized + 'static>(
 }
 
 /// M14 Phase 89 (daw_01 #060): clip が実際に塗る `fill` の輝度から名前 / link glyph のテキスト色を
-/// 自動選択する (SSoT = widget が唯一 fill を知る)。 WCAG relative luminance が閾値 0.179 を超える
-/// (= 明るい fill) なら `clip_text_color_dark`、 そうでなければ `clip_text_color` を返し、 白/黒文字の
-/// どちらか **コントラスト比が高い方** を選ぶ (0.179 は white/black それぞれとのコントラスト比が
-/// 等しくなる relative luminance)。 `fill.a < 1.0` (share clip の半透明 fill 等) は `lane_bg` と
-/// alpha 合成した実効色で判定する。 `style.clip_auto_contrast_text == false` の opt-out 時は常に
-/// `clip_text_color` を返す。 輝度計算 / alpha 合成 / 閾値判定は piano_roll の鍵盤ラベル (#093) と
-/// 共有する `daw_ui_core::color` の SSoT helper に委譲する。
-pub(super) fn clip_text_color_for(style: &ArrangementStyle, fill: Color, lane_bg: Color) -> Color {
+/// 自動選択する (SSoT = widget が唯一 fill を知る)。 `fill.a < 1.0` (share clip の半透明 fill 等) は
+/// `lane_bg` と alpha 合成した実効色で判定する。 `style.clip_auto_contrast_text == false` の opt-out
+/// 時は常に `clip_text_color` を返す。
+///
+/// r.md #48: clip 色は **ユーザーが自由に着色できる可変背景** なので、ここで選ぶのはテーマ従属の
+/// `text` ではなく **極性固定インク** ([`Palette::ink_for`])。明暗 2 色を呼び出し側が渡す旧
+/// `pick_contrast(bg, light, dark)` は廃止した (引数を取り違えて「どちらも暗色」になり、ライト
+/// テーマでクリップ名が消える事故が構造的に起きなくなる)。輝度計算 / alpha 合成 / 閾値判定は
+/// piano_roll の鍵盤ラベル (#093) と共有する SSoT。
+pub(super) fn clip_text_color_for(
+    p: &Palette,
+    style: &ArrangementStyle,
+    fill: Color,
+    lane_bg: Color,
+) -> Color {
     if !style.clip_auto_contrast_text {
         return style.clip_text_color;
     }
     let bg = daw_ui_core::color::composite_over(fill, lane_bg);
-    daw_ui_core::color::pick_contrast(bg, style.clip_text_color, style.clip_text_color_dark)
+    p.ink_for(bg)
 }
 
 /// clip が **実際に塗る** fill 色 (`clip.color` 既定 / muted の減光込み)。
@@ -113,21 +125,22 @@ pub(super) fn clip_effective_fill(
 
 /// r.md #45: clip 上に描く波形の (通常色, クリップピーク色)。
 ///
-/// clip 色はユーザーが自由に着色できる **可変背景** なので、固定の寒色ブルー
-/// (`theme::WAVEFORM`) だけだと明るい clip 色 (既定パレットの黄 / アンバー等) の上で
-/// 沈んで見えなくなる。 clip ラベル (`clip_text_color_for`) や MIDI ノートプレビュー
-/// (r.md #20) と同じ WCAG 輝度 2 択で、暗背景用 / 明背景用を選ぶ。
-pub(super) fn waveform_colors_for(clip_bg: Color, lane_bg: Color, is_selected: bool) -> (Color, Color) {
+/// clip 色はユーザーが自由に着色できる **可変背景** なので、固定の寒色ブルーだけだと
+/// 明るい clip 色 (既定パレットの黄 / アンバー等) の上で沈んで見えなくなる。 clip ラベル
+/// (`clip_text_color_for`) や MIDI ノートプレビュー (r.md #20) と同じ WCAG 輝度 2 択で、
+/// 暗背景用 / 明背景用を選ぶ。
+///
+/// r.md #48: 2 択そのものは [`Palette::waveform_for`] が持つ (色相 = 寒色ブルー / 警告赤 は
+/// 保ったまま明暗だけ切り替わる極性固定インク)。呼び出し側が明暗 2 色を渡す旧 API は廃止。
+pub(super) fn waveform_colors_for(
+    p: &Palette,
+    clip_bg: Color,
+    lane_bg: Color,
+    is_selected: bool,
+) -> (Color, Color) {
     let bg = daw_ui_core::color::composite_over(clip_bg, lane_bg);
-    let (light, dark) = if is_selected {
-        (theme::WAVEFORM_SEL, theme::WAVEFORM_SEL_ON_BRIGHT)
-    } else {
-        (theme::WAVEFORM, theme::WAVEFORM_ON_BRIGHT)
-    };
-    (
-        daw_ui_core::color::pick_contrast(bg, light, dark),
-        daw_ui_core::color::pick_contrast(bg, theme::WAVEFORM_PEAK, theme::WAVEFORM_PEAK_ON_BRIGHT),
-    )
+    let body = if is_selected { WaveformInk::Selected } else { WaveformInk::Normal };
+    (p.waveform_for(bg, body), p.waveform_for(bg, WaveformInk::Peak))
 }
 
 /// r.md #46: fade envelope / 掴む正方形の (前景色, 裏打ち色)。
@@ -135,15 +148,25 @@ pub(super) fn waveform_colors_for(clip_bg: Color, lane_bg: Color, is_selected: b
 /// fade は clip 色の上にも **波形の上にも**乗るので、単層だと下地次第で消える。
 /// 前景は背景輝度から明暗 2 択、裏打ちはその逆極性を敷いて、どちらの下地でも
 /// 縁が立つようにする (無音ベースライン / slice 区切り線と同じ 2 層 idiom)。
-pub(super) fn fade_colors_for(style: &ArrangementStyle, clip_bg: Color, lane_bg: Color) -> (Color, Color) {
+///
+/// r.md #48: 極性の判定は [`Palette::ink_for`] 1 本に畳んだ。実際に引く 2 色は線の太さに
+/// 合わせた alpha 込みの style 値 (明インク / 暗インクで濃さが違う) なので、ink_for が選んだ
+/// 極性で **前景と裏打ちの役割を入れ替える** だけにしてある。
+pub(super) fn fade_colors_for(
+    p: &Palette,
+    style: &ArrangementStyle,
+    clip_bg: Color,
+    lane_bg: Color,
+) -> (Color, Color) {
     let bg = daw_ui_core::color::composite_over(clip_bg, lane_bg);
     let light = style.audio_fade_overlay_color;
     let dark = style.audio_fade_overlay_color_dark;
-    (
-        daw_ui_core::color::pick_contrast(bg, light, dark),
-        // 逆極性 = 前景が明なら暗、暗なら明。
-        daw_ui_core::color::pick_contrast(bg, dark, light),
-    )
+    if p.ink_for(bg) == p.ink_on_bright {
+        // 明るい下地 → 暗インクを前景に、明インクを裏打ちに。
+        (dark, light)
+    } else {
+        (light, dark)
+    }
 }
 
 /// M14 Phase 72 (daw_01 #044): `rect` 内に `(tex_w, tex_h)` の native aspect を保ったまま
@@ -302,7 +325,7 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
 ) {
     use daw_ui_renderer::{LineBatch, LineSegment};
 
-    let _ = style;
+    let p = hctx.palette();
     let inset_lr: f32 = 2.0;
     let content = Rect {
         x: clip_rect.x + inset_lr,
@@ -332,7 +355,7 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     let px_per_beat = f64::from(content.w) / clip_len_beats;
     // r.md #45: 波形色は clip の実塗り色からの auto-contrast (固定ブルーだと
     // 明るい clip 色の上で消えていた)。 alpha は従来どおり選択で少し濃く。
-    let (base_fg, fg_clipped) = waveform_colors_for(clip_bg, style.bg, is_selected);
+    let (base_fg, fg_clipped) = waveform_colors_for(p, clip_bg, style.bg, is_selected);
     let fg = base_fg.with_alpha(if is_selected { 0.95 } else { 0.85 });
     let wstyle = WaveformStyle {
         fg,
@@ -348,8 +371,10 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
     // 暗い backing + 明色の 2 層で描く (`feedback_ui_indicator_contrast_on_variable_bg`)。
     // 単層だと明るい clip 色 (既定パレットの黄 / アンバー等) の上で消え、
     // 「隙間があるのか描画が抜けているのか」 が判別できなくなる。
+    // r.md #48: 裏打ちは「常に暗い」 ことが意味そのものなので極性固定の `scrim`
+    // (テーマを切り替えても反転しない)。 濃さだけは線の役割ごとに call site で決める。
     let silent_color = fg.with_alpha(0.85);
-    let backing_color = theme::WINDOW_BG.with_alpha(0.55);
+    let backing_color = p.scrim.with_alpha(0.55);
     let mid_y = content.y + content.h * 0.5;
     let mut silent_backing: Vec<LineSegment> = Vec::new();
     let mut silent: Vec<LineSegment> = Vec::new();
@@ -411,12 +436,12 @@ pub(super) fn draw_clip_waveform_inner<M: ?Sized + 'static>(
                 div_backing.push(LineSegment {
                     a: [x, content.y],
                     b: [x, content.y + content.h],
-                    color: theme::WINDOW_BG.with_alpha(0.65),
+                    color: p.scrim.with_alpha(0.65),
                 });
                 div_bright.push(LineSegment {
                     a: [x, content.y],
                     b: [x, content.y + content.h],
-                    color: theme::SELECTION_WARM.with_alpha(0.85),
+                    color: style.slice_divider_color,
                 });
             }
             // event 冒頭 / 末尾の無音 (= 最初の trigger 前 / 鳴り終わり後) もベースラインで示す。
@@ -495,6 +520,7 @@ pub(super) fn draw_clip_midi_inner<M: ?Sized + 'static>(
     if notes.is_empty() {
         return;
     }
+    let p = hctx.palette();
     let inset_lr: f32 = 2.0;
     let inset_bottom: f32 = 2.0;
     let view_rect = Rect {
@@ -527,8 +553,9 @@ pub(super) fn draw_clip_midi_inner<M: ?Sized + 'static>(
     let pitch_span = (i32::from(max_p) - i32::from(min_p)).max(1) as f32;
     let row_h = (view_rect.h / pitch_span).max(1.0);
     let effective_bg = daw_ui_core::color::composite_over(clip_bg, style.bg);
-    let base_fill =
-        daw_ui_core::color::pick_contrast(effective_bg, theme::TEXT, theme::TEXT_ON_BRIGHT);
+    // r.md #48: ノートが乗るのはユーザー着色の clip = 可変背景なので、テーマ従属の `text`
+    // ではなく極性固定インク (`ink_for`)。 ライトテーマでも「明 clip には暗ノート」 が保たれる。
+    let base_fill = p.ink_for(effective_bg);
     let clip_len = clip_len_beats.max(0.0001) as f32;
     let px_per_beat = view_rect.w / clip_len;
     for n in notes {
@@ -585,7 +612,7 @@ pub(super) fn draw_section_band<M: ?Sized + 'static>(
         push_section_border(hctx, r, style.clip_border, 1.0);
     }
     if r.w > 8.0 && r.h > style.clip_text_size + 2.0 && !name.is_empty() {
-        let text_color = clip_text_color_for(style, fill, style.arranger_lane_bg);
+        let text_color = clip_text_color_for(hctx.palette(), style, fill, style.arranger_lane_bg);
         hctx.push_text(GlyphArea {
             // 毎フレーム描画なので `Arc::from(&str)` (byte copy) でなく Arc refcount clone
             // (draw_clip_label と同じ安価経路、 section 数が多い曲で per-frame alloc を避ける)。
@@ -620,10 +647,12 @@ pub(super) fn push_section_border<M: ?Sized + 'static>(
 
 /// 選択枠を fill 色に依存せず描く 2 重リング。 clip / video clip /
 /// section 帯の選択表示に共通で使う。 呼び出し側は fill を **clip 本来の色**で
-/// 描き、 ここは枠だけを重ねる: 外側の明線 (`clip_selected_border`) が暗い lane
-/// 背景に、 内側の暗線 (`clip_selected_border_inner`) が黄 / 白など明るい fill に
-/// 必ずコントラストするので、 どんな clip 色 (選択色と同色を含む) でも選択を
-/// 判別できる。 `radius` は枠の角丸 (clip = `clip_radius`、 section 帯 = 0)。
+/// 描き、 ここは枠だけを重ねる: 外側の明線 (`clip_selected_border`) と内側の暗線
+/// (`clip_selected_border_inner`) は **極性固定** のペア (r.md #48 の
+/// `selection_ring_outer` / `selection_ring_inner`) なので、 暗い lane 背景でも
+/// 黄 / 白の明るい fill でも必ずどちらかが立つ。 どんな clip 色 (選択色と同色を
+/// 含む) でも、 どのテーマでも選択を判別できる。
+/// `radius` は枠の角丸 (clip = `clip_radius`、 section 帯 = 0)。
 /// rect 内側に描く SDF ボーダー (rect.wgsl) なので、 外側リングを `r`、 内側
 /// リングを `r` を線幅ぶん inset した矩形に描けば 2 本が隣接して並ぶ。
 pub(super) fn push_selection_ring<M: ?Sized + 'static>(
@@ -634,7 +663,7 @@ pub(super) fn push_selection_ring<M: ?Sized + 'static>(
     clip_rect: Option<Rect>,
 ) {
     let w = style.clip_selected_border_w;
-    // 外側: 明線 (暗い lane 背景に対して光る)。
+    // 外側: 明線 (暗い lane 背景 / 暗い clip 色に対して光る)。
     hctx.push_rect(RectCommand {
         rect: r,
         fill: Color::TRANSPARENT,
@@ -810,7 +839,7 @@ pub(super) fn draw_video_clip<M: ?Sized + 'static>(
     // M14 Phase 89 (daw_01 #060): 名前色は fill 輝度から auto-contrast (selected の黄 fill → 暗文字、
     // loading の暗 fill → 明文字)。 video lane bg と合成した実効色で判定 (不透明 fill は no-op、
     // 半透明 fill は track_background_video と合成して実効色を得る)。
-    let text_color = clip_text_color_for(style, fill, style.track_background_video);
+    let text_color = clip_text_color_for(hctx.palette(), style, fill, style.track_background_video);
     hctx.push_rect(RectCommand {
         rect: r,
         fill,
@@ -877,7 +906,7 @@ pub(super) fn draw_clip<M: ?Sized + 'static>(
     let (border, border_w) = (style.clip_border, style.clip_border_w);
     // M14 Phase 89 (daw_01 #060): 名前 + link glyph 色を fill 輝度から auto-contrast。 不透明 fill は
     // no-op、 半透明 fill (alpha < 1) は lane bg (audio lane = `style.bg`) と合成した実効色で判定する。
-    let text_color = clip_text_color_for(style, fill, style.bg);
+    let text_color = clip_text_color_for(hctx.palette(), style, fill, style.bg);
     hctx.push_rect(RectCommand {
         rect: r,
         fill,
@@ -1270,7 +1299,7 @@ pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     }
     // r.md #46: clip 色 (可変背景) と波形の上のどちらでも縁が立つよう、
     // 前景 + 逆極性の裏打ちの 2 層で描く。
-    let (fg, backing) = fade_colors_for(style, clip_bg, style.bg);
+    let (fg, backing) = fade_colors_for(hctx.palette(), style, clip_bg, style.bg);
     // 掴む正方形 (hit zone と同じ rect = `fade_geometry` が SSoT)。
     // 裏打ちを 1 周り大きく敷いてから前景を重ねる = 1px の縁取り。
     push_filled_rect(hctx, g.handle_rect, backing);
@@ -1650,6 +1679,13 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
     lanes_clip: Rect,
     selected_clips_set: &HashSet<AutomationClipKey>,
 ) {
+    let p = hctx.palette();
+    // r.md #48: `lane.color` は「どのパラメータのレーンか」 を運ぶ **アイデンティティ色** で
+    // テーマ非従属。ただしライトテーマの薄い lane 面の上ではそのままだと沈むので、
+    // 色相・彩度を保ったままコントラストが足りるまで明度だけ寄せる (`adapt_on` は既に
+    // 足りていれば恒等 = ダークテーマでは何も変わらない)。 icon glyph / clip 枠 / clip の
+    // 薄い wash はすべてこの 1 本から引く (= 同じレーンが 3 箇所で違う色にならない)。
+    let lane_ink = p.adapt_on(style.automation_lane_bg, lane.color);
     // ---- 背景 (lane 行 全幅) ----
     push_filled_rect(
         hctx,
@@ -1668,7 +1704,7 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
     // curve line / point dot の色は「lane.color 直塗り」 をやめ、 clip ごとに実際の
     // `fill` 輝度から白/黒 neutral を auto-contrast する (= clip 名 `clip_text_color_for` と同 SSoT)。
     // 黄など明るい識別色でも常にコントラストを確保する狙い。 実際の色決定は下の clip ループ内
-    // (fill 確定後) で行う。 header の icon glyph 色は従来どおり `lane.color` を直接使う。
+    // (fill 確定後) で行う。 header の icon glyph 色は lane 識別色 (`lane_ink`) を使う。
     if let Some(layout) = automation_lane_header_layout(header_rect, style) {
         let icon_size = style.automation_lane_icon_size.max(4.0);
         let pad = 4.0_f32;
@@ -1690,7 +1726,7 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
             top: layout.icon_glyph_rect.y,
             font_size: icon_size,
             line_height: icon_size * 1.2,
-            color: lane.color,
+            color: lane_ink,
             clip_rect: Some(header_rect),
             ..GlyphArea::default()
         });
@@ -1782,14 +1818,12 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
         // fill / border の唯一 source (audio clip の `clip.color` に相当)。 `share_group_color` は fill /
         // border を上書きせず、 リンク識別は ⇌ glyph + #068 hover 強調のみが担う (#086)。 disabled lane は
         // **clip rect の fill / border のみ灰色** (= bypass marker)、 中身 (curve / point / clip 名) は元の
-        // lane.color のままにして可読性を保つ (Bitwig / Live と同パターン、 #028 user 指摘 3)。
+        // lane 識別色のままにして可読性を保つ (Bitwig / Live と同パターン、 #028 user 指摘 3)。
+        // r.md #48: 識別色は lane 面に合わせて明度を寄せた `lane_ink` (ダークでは恒等)。
         let (fill, border) = if is_selected {
             (style.clip_selected_fill, style.clip_selected_border)
         } else if lane.enabled {
-            (
-                Color { r: lane.color.r, g: lane.color.g, b: lane.color.b, a: 0.20 },
-                lane.color,
-            )
+            (lane_ink.with_alpha(0.20), lane_ink)
         } else {
             // disabled: fill = 灰色 alpha 0.10 (lane_bg がほぼ透ける、 中身可読) + border = 灰色
             // alpha 1.0 (識別 marker、 不透明で確実に見える)。 fill alpha 0 だと renderer が rect 全体を
@@ -1824,7 +1858,7 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
             let glyph_color = if !lane.enabled {
                 style.automation_lane_disabled_color
             } else if style.clip_auto_contrast_text {
-                clip_text_color_for(style, fill, style.automation_lane_bg)
+                clip_text_color_for(p, style, fill, style.automation_lane_bg)
             } else {
                 style.automation_lane_text_color
             };
@@ -1851,24 +1885,22 @@ pub(super) fn draw_automation_lane<M: ?Sized + 'static>(
             });
         }
 
-        // curve line / point dot を背景輝度から白/黒 neutral で auto-contrast する。
-        // enabled lane は実際に塗った `fill` (selected = 黄不透明 / 非選択 = lane.color alpha 0.20 を
-        // lane_bg と合成) の実効輝度から `pick_contrast` で line / dot fill 色を選び、 dot の枠は
-        // その逆色にして「line から浮いた node」 として常に縁が見えるようにする。 disabled lane は
-        // bypass marker として従来の灰色 (`automation_lane_disabled_color`) を維持 (= clip 名と同方針)。
+        // curve line / point dot を背景輝度から明/暗 neutral で auto-contrast する。
+        // enabled lane は実際に塗った `fill` (selected = 黄不透明 / 非選択 = lane 識別色 alpha 0.20 を
+        // lane_bg と合成) の実効輝度から極性固定インク (`ink_for`) を選び、 dot の枠は **その逆極性**
+        // (= `ink_for(neutral)`) にして「line から浮いた node」 として常に縁が見えるようにする。
+        // clip fill は選択 / ユーザー識別色で動く可変背景なので、テーマ従属の `text` ではなく
+        // 極性固定インクを使う (r.md #48)。 disabled lane は bypass marker として従来の灰色
+        // (`automation_lane_disabled_color`) を維持 (= clip 名と同方針)、 その枠だけはクローム面
+        // の上に乗る細線なので `text` (テーマ従属) で薄く縁取る。
         let (curve_line_color, point_fill, point_border) = if lane.enabled {
             let eff_bg = daw_ui_core::color::composite_over(fill, style.automation_lane_bg);
-            let neutral =
-                daw_ui_core::color::pick_contrast(eff_bg, style.clip_text_color, style.clip_text_color_dark);
-            let edge = daw_ui_core::color::pick_contrast(
-                neutral,
-                style.clip_text_color,
-                style.clip_text_color_dark,
-            );
+            let neutral = p.ink_for(eff_bg);
+            let edge = p.ink_for(neutral);
             (neutral, neutral, edge)
         } else {
             let dc = style.automation_lane_disabled_color;
-            (dc, dc, theme::TEXT.with_alpha(0.4))
+            (dc, dc, p.text.with_alpha(0.4))
         };
 
         // curve flatten (clip 内描画域 = clip_rect 全体)。 caller の screen-wide な beat_to_px

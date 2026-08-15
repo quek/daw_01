@@ -518,8 +518,12 @@ pub struct Scene {
 
 impl Scene {
     /// window 背景の既定 clear color。renderer は theme を持たない (Color 型 + 演算のみ) ので、
-    /// この 1 色だけ raw `Color` で自己完結して保持する。app / ui 層は `scene.clear_color` を
-    /// 上書きしてよい (現状 `theme::WINDOW_BG` と同値)。
+    /// この 1 色だけ raw `Color` で自己完結して保持する。
+    ///
+    /// **これは「誰も設定しなかったとき」 の中立値**。r.md #48 以降、`UiHost::frame*` が
+    /// 毎フレーム `scene.clear_color = palette.window_bg` を書くので、ui 層を通る経路では
+    /// この値は使われない (テーマを切り替えると panel の隙間まで追従する)。
+    /// `Scene` を直接組む経路 (映像 export 等) は自分で `clear_color` を設定する。
     pub const DEFAULT_CLEAR: Color = Color::rgb(0.035, 0.040, 0.050);
 
     pub fn new() -> Self {

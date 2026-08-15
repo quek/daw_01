@@ -219,7 +219,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         content: Some(PrContent {
             notes,
             view,
-            style: PianoRollStyle::default(),
+            // r.md #48: 色は毎フレームのテーマから引く (`Default` はテーマ切替に追従しない)。
+            style: PianoRollStyle::from_theme(&app.theme),
             selected,
             shown,
             target,

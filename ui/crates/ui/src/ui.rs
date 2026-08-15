@@ -13,13 +13,14 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cosmic_text::FontSystem;
 use daw_ui_platform::{
     CursorIcon, ImeTextEdit, KeyEvent, PhysicalKey, PhysicalSize, RectPx, TextDocument,
 };
 use daw_ui_renderer::{
-    Color, GlyphArea, LineBatch, LineSegment, Primitive, Rect, RectCommand, Scene, TexturedQuad,
+    GlyphArea, LineBatch, LineSegment, Primitive, Rect, RectCommand, Scene, TexturedQuad,
 };
 
 use crate::clipboard::ClipboardProvider;
@@ -31,6 +32,7 @@ use crate::popup::PopupOpenState;
 use crate::scenegraph::{CachedCommands, Scenegraph};
 use crate::shortcut::{self, ShortcutMap};
 use crate::text_metrics::TextMetrics;
+use crate::theme::Palette;
 use crate::widgets::WidgetState;
 use crate::widgets::drag_in_rect::{DragInRectState, DragInfo, DragKind};
 use crate::widgets::drag_rect::{DragRect, DragRectState};
@@ -56,6 +58,11 @@ type TakeImeEditsFn = Box<dyn Fn() -> Vec<ImeTextEdit> + Send + Sync>;
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct UiHost<M: ?Sized + 'static> {
+    /// r.md #48: 現在有効な色パレット。**widget が読む色の唯一の出どころ**で、
+    /// `Ui::palette()` から供給される。プロセスグローバルにしないのは、テストが
+    /// 並列スレッドで走るため (可変グローバルだとテーマを差し替えるテストが
+    /// 他テストの色アサーションを壊す)。差し替えは [`UiHost::set_palette`]。
+    palette: Arc<Palette>,
     state: HashMap<WidgetId, Box<dyn WidgetState>>,
     /// キーボードフォーカスを持つウィジェット (`text_input` 等)。
     focused: Option<WidgetId>,
@@ -209,6 +216,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// 通常は [`Self::with_window`] を使う方が簡潔。
     pub fn new(redraw_request: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
+            palette: Arc::new(Palette::dark()),
             state: HashMap::new(),
             focused: None,
             focus_changed_in_last_frame: false,
@@ -243,6 +251,27 @@ impl<M: ?Sized + 'static> UiHost<M> {
             owned_font_system: None,
             _m: PhantomData,
         }
+    }
+
+    /// r.md #48: 有効な色パレットを差し替える。**変わったら `true`** を返すので、
+    /// 呼び出し側は `if host.set_palette(p) { host.invalidate_scene_cache(); }` と書ける
+    /// (キャッシュされた描画コマンドには旧テーマの色が焼き込まれているため、
+    /// 捨てないとアレンジ / ピアノロールだけ旧色のまま残る)。
+    ///
+    /// 毎フレーム無条件に呼んでよい (同じ `Arc` なら `false` を返して no-op)。
+    /// そうしておけば「テーマを変えたのに push し忘れた」 が構造的に起きない。
+    pub fn set_palette(&mut self, palette: Arc<Palette>) -> bool {
+        if Arc::ptr_eq(&self.palette, &palette) || self.palette == palette {
+            return false;
+        }
+        self.palette = palette;
+        true
+    }
+
+    /// 現在の色パレット。アプリ側が同じ実体を共有する (= 複製しない) ために `Arc` を返す。
+    #[must_use]
+    pub fn palette(&self) -> &Arc<Palette> {
+        &self.palette
     }
 
     /// M9 P1-4: ダブルクリック判定の閾値を変更 (default: 400ms / 5px)。
@@ -713,7 +742,13 @@ impl<M: ?Sized + 'static> UiHost<M> {
             .any(|s| s.modal && s.capture_input && s.capture_keyboard);
         let effective_pointer = if modal_capturing { masked_pointer(pointer) } else { pointer };
 
+        // r.md #48: ウィンドウの clear 色はパレットの床。renderer 側の `Scene::DEFAULT_CLEAR`
+        // は「app が何も言わなかったときの中立値」 に留め、意味づけは ui 層が行う。
+        // これを入れないと、panel の隙間・レイアウト余白だけが旧テーマの色で残る。
+        scene.clear_color = self.palette.window_bg.to_wgpu();
+
         let mut ui = Ui {
+            palette: &self.palette,
             state: &mut self.state,
             scene,
             edits: &mut edits,
@@ -856,6 +891,9 @@ impl<M: ?Sized + 'static> Default for UiHost<M> {
 /// ため、`clippy::struct_excessive_bools` を allow する (state machine 化はオーバーヘッド過大)。
 #[allow(clippy::struct_excessive_bools)]
 pub struct Ui<'a, M: ?Sized + 'static> {
+    /// r.md #48: このフレームで有効な色パレット (`UiHost` 所有の実体への借用)。
+    /// widget は [`Ui::palette`] から読む。
+    palette: &'a Palette,
     state: &'a mut HashMap<WidgetId, Box<dyn WidgetState>>,
     scene: &'a mut Scene,
     edits: &'a mut Vec<Edit<M>>,
@@ -988,6 +1026,15 @@ pub struct Ui<'a, M: ?Sized + 'static> {
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     pub fn screen(&self) -> PhysicalSize {
         self.screen
+    }
+
+    /// r.md #48: このフレームの色パレット。**widget が色を得る唯一の口**。
+    ///
+    /// 戻りの寿命は `&self` ではなく **host の `'a`** に紐づけてある。おかげで
+    /// `let p = ui.palette();` の後に `ui.push_rect(...)` を呼べる (借用衝突しない)。
+    #[must_use]
+    pub fn palette(&self) -> &'a Palette {
+        self.palette
     }
 
     pub fn pointer(&self) -> PointerFrame {
@@ -1602,10 +1649,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         // popup_glyph: GlyphPipeline を独立インスタンスにすることで根本解決済み。
         let prev_in_popup = self.drawing_in_popup;
         self.drawing_in_popup = true;
+        let p = self.palette();
         self.push_rect(RectCommand {
             rect: bg_rect,
-            fill: Color::rgba(0.05, 0.06, 0.10, 0.85),
-            border: Color::rgba(0.55, 0.85, 0.65, 0.55),
+            fill: p.debug_overlay_bg,
+            border: p.debug_overlay_border,
             border_width: 1.0,
             radius: [3.0; 4],
             clip_rect: None,
@@ -1617,7 +1665,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: bg_rect.y + pad + (i as f32) * line_h,
                 font_size,
                 line_height: line_h,
-                color: Color::rgb(0.85, 0.95, 0.85),
+                color: p.debug_text,
                 clip_rect: None,
                 ..GlyphArea::default()
             });
@@ -1947,7 +1995,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// `wid` を渡し、self が focused かを内部で判定する想定だが、`is_focused` を呼んで
     /// 利用者側で判定するスタイルでも動く (描画のみ行う、判定はしない)。
     pub fn draw_focus_ring(&mut self, rect: Rect) {
-        let color = Color::rgb(0.55, 0.78, 0.95);
+        let color = self.palette().focus_ring;
         let segments = vec![
             LineSegment { a: [rect.x, rect.y], b: [rect.x + rect.w, rect.y], color },
             LineSegment {
@@ -2138,10 +2186,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             finished: just_finished,
         };
 
-        // drag 中は半透明 cyan overlay を自動描画 (release frame でも 1 度描画する)。
+        // drag 中は半透明の marquee overlay を自動描画 (release frame でも 1 度描画する)。
         let r = drag.rect();
-        let fill = Color { r: 0.32, g: 0.78, b: 0.95, a: 0.20 };
-        let border = Color { r: 0.32, g: 0.78, b: 0.95, a: 0.85 };
+        let fill = self.palette().marquee_fill;
+        let border = self.palette().marquee_border;
         self.push_rect(RectCommand {
             rect: r,
             fill,

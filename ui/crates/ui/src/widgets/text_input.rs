@@ -17,7 +17,6 @@ use std::hash::Hash;
 
 use daw_ui_platform::{ElementState, PhysicalKey};
 use daw_ui_renderer::{Color, GlyphArea, LineBatch, LineSegment, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -683,13 +682,10 @@ fn draw_text_input<M: ?Sized + 'static>(
     anchor_byte: usize,
     preedit: &str,
 ) {
-    // 背景。
-    let bg_fill = theme::INSET_BG;
-    let border = if focused {
-        theme::BORDER_FOCUS
-    } else {
-        theme::BORDER
-    };
+    // 背景。 palette の寿命は host の `'a` なので、 以下の `ui.push_*` (= `&mut`) と衝突しない。
+    let p = ui.palette();
+    let bg_fill = p.inset_bg;
+    let border = if focused { p.border_focus } else { p.border };
     ui.push_rect(RectCommand {
         rect,
         fill: bg_fill,
@@ -727,7 +723,7 @@ fn draw_text_input<M: ?Sized + 'static>(
         let sel_w = sel_hi_w - sel_lo_w;
         ui.push_rect(RectCommand {
             rect: Rect { x: sel_x, y: ty, w: sel_w, h: line_h },
-            fill: theme::ACCENT.with_alpha(0.45),
+            fill: p.accent.with_alpha(0.45),
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
@@ -755,7 +751,7 @@ fn draw_text_input<M: ?Sized + 'static>(
             top: ty,
             font_size,
             line_height: line_h,
-            color: theme::TEXT,
+            color: p.text,
             clip_rect: None,
             ..GlyphArea::default()
         });
@@ -770,8 +766,8 @@ fn draw_text_input<M: ?Sized + 'static>(
                 a: [pre_x, underline_y],
                 b: [pre_x + preedit_w, underline_y],
                 // IME composition (preedit) 専用の下線マーカー。 警告色でも選択色でもない
-                // composition affordance で、 対応する theme token が無いため literal 維持。
-                color: Color::rgb(0.95, 0.85, 0.55),
+                // composition affordance なので、 専用トークンを持つ (r.md #48)。
+                color: p.ime_preedit_underline,
             }]
             .into(),
             line_width_px: 1.5,
@@ -788,7 +784,7 @@ fn draw_text_input<M: ?Sized + 'static>(
             segments: vec![LineSegment {
                 a: [cursor_x, cursor_y],
                 b: [cursor_x, cursor_y + cursor_h],
-                color: theme::TEXT,
+                color: p.text,
             }]
             .into(),
             line_width_px: 1.5,

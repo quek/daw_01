@@ -13,8 +13,8 @@ use std::cell::Cell;
 use std::hash::Hash;
 
 use daw_ui_renderer::{Color, Rect, RectCommand};
-use crate::theme;
 
+use crate::theme::Palette;
 use crate::ui::Ui;
 
 /// `scroll_area` 内部の scrollbar 幅 (`scroll_area::SCROLLBAR_W` のミラー、
@@ -31,14 +31,21 @@ pub struct ListViewStyle {
     pub radius: f32,
 }
 
-impl Default for ListViewStyle {
-    fn default() -> Self {
+impl ListViewStyle {
+    /// パレットから既定の list スタイルを組む。row は panel から 1 段浮いた面
+    /// (`panel_raised`)、hover は汎用コントロールの hover 塗り、選択は accent。
+    ///
+    /// `Default` は持たない (r.md #48): テーマ色を読む `Default::default()` は隠れた
+    /// グローバル依存になり、ライトテーマに追従しないため。caller は
+    /// `ListViewStyle::from_palette(ui.palette())` で組む。
+    #[must_use]
+    pub fn from_palette(p: &Palette) -> Self {
         Self {
             row_height: 26.0,
             row_gap: 2.0,
-            row_bg: theme::PANEL_RAISED,
-            row_bg_hover: theme::CONTROL_HOVER,
-            row_bg_selected: theme::ACCENT,
+            row_bg: p.panel_raised,
+            row_bg_hover: p.control_hover,
+            row_bg_selected: p.accent,
             radius: 2.0,
         }
     }
@@ -161,6 +168,7 @@ mod tests {
 
     use super::ListViewStyle;
     use crate::input::{FrameInput, PointerFrame};
+    use crate::theme::Palette;
     use crate::ui::UiHost;
 
     #[test]
@@ -168,7 +176,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ListViewStyle::default();
+        let style = ListViewStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = (0..5).collect();
         let calls = Cell::new(0u32);
 
@@ -194,7 +202,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ListViewStyle::default();
+        let style = ListViewStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = (0..1000).collect();
         let calls = Cell::new(0u32);
 
@@ -222,7 +230,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ListViewStyle::default();
+        let style = ListViewStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = (0..5).collect();
         let rect = Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 };
 
@@ -258,7 +266,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ListViewStyle::default();
+        let style = ListViewStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = (0..3).collect();
         let rect = Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 };
 
@@ -283,7 +291,7 @@ mod tests {
         let mut host: UiHost<()> = UiHost::no_redraw();
         let mut scene = Scene::new();
         let screen = PhysicalSize { width: 800, height: 600 };
-        let style = ListViewStyle::default();
+        let style = ListViewStyle::from_palette(&Palette::dark());
         let items: Vec<u32> = vec![];
         let calls = Cell::new(0u32);
 

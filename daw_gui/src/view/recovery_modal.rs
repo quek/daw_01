@@ -7,12 +7,9 @@
 
 use daw_ui_core::{Edit, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
-use daw_ui_renderer::{Color, Rect};
-use crate::theme;
+use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
-
-const COLOR_TEXT: Color = theme::TEXT;
 
 const PANEL_W: f32 = 720.0;
 const ROW_H: f32 = 60.0;
@@ -25,14 +22,6 @@ const BTN_W: f32 = 64.0;
 const BTN_H: f32 = 24.0;
 const PAD: f32 = 12.0;
 const ROW_GAP: f32 = 6.0;
-
-const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: theme::BACKDROP,
-    panel_bg: theme::PANEL,
-    panel_radius: 6.0,
-    close_on_outside_click: true,
-    close_on_escape: true,
-};
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     if !app.ui_ephemeral.show_recovery_modal {
@@ -54,16 +43,22 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let n = app.ui_ephemeral.recovery_candidates.len() as f32;
     let panel_h = TITLE_H + (ROW_H + ROW_GAP) * n + FOOTER_H + PAD * 2.0;
 
+    // 暗幕 + 中央パネル + Esc/外クリックで閉じる = ui-core の既定そのもの。
+    let style = ModalStyle::from_palette(&app.theme.core);
+
     ui.modal(
         "recovery",
         (PANEL_W, panel_h),
-        &MODAL_STYLE,
+        &style,
         Some(Box::new(|| {
             Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::RecoveryDismiss)
             })
         })),
         |ui, panel| {
+            // 文字が乗るのは modal panel (= パレットのクローム面) なので本文インクは `text`。
+            let p = ui.palette();
+
             // タイトル
             ui.label_at(
                 "rec_title",
@@ -71,7 +66,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 panel.x + PAD,
                 panel.y + PAD,
                 16.0,
-                COLOR_TEXT,
+                p.text,
             );
 
             // 候補 row
@@ -96,14 +91,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     &display_name(candidate),
                     Rect { x: row_rect.x + 8.0, y: row_rect.y + 6.0, w: text_w, h: 13.0 * 1.2 },
                     13.0,
-                    COLOR_TEXT,
+                    p.text,
                 );
                 ui.label_at_clipped(
                     ("rec_path", i),
                     &candidate.display().to_string(),
                     Rect { x: row_rect.x + 8.0, y: row_rect.y + 26.0, w: text_w, h: 10.0 * 1.2 },
                     10.0,
-                    COLOR_TEXT,
+                    p.text,
                 );
 
                 // ボタン (右寄せ): 「復元」 / 「破棄」

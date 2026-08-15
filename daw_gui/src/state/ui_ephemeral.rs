@@ -191,6 +191,13 @@ pub struct UiEphemeral {
     pub last_arrange_canvas_size: (f32, f32),
     /// 詳細パネルが開いているか (session-only、 Esc / 再クリックで閉じる)。
     pub resource_panel_open: bool,
+    /// r.md #48: 設定画面に出すテーマ一覧のキャッシュ (session-only)。
+    ///
+    /// **毎フレーム作り直してはいけない** — 実体は `themes/` の `read_dir` +
+    /// 各ファイルの JSON パースで、描画ループでディスク I/O を回すことになる。
+    /// 設定 window を **開いたとき**に 1 回だけ更新する (= 開き直せば新しく置いた
+    /// テーマファイルが出る。再起動は不要)。
+    pub available_themes: Vec<crate::theme::Theme>,
     /// 履歴パネルが最後に auto-scroll で追従した履歴 index。 現在位置
     /// ([`crate::state::SongDoc::history_current`]) がこれと変わったフレームだけ
     /// current 行が見えるよう scroll offset を合わせ、 手動 scroll は妨げない。

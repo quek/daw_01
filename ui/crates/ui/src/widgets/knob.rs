@@ -13,7 +13,6 @@ use std::hash::Hash;
 use std::time::Instant;
 
 use daw_ui_renderer::{Color, LineBatch, LineSegment, Rect, RectCommand};
-use crate::theme;
 
 use crate::edit::Edit;
 use crate::id::WidgetId;
@@ -361,6 +360,8 @@ fn draw_knob<M: ?Sized + 'static>(
     dragging: bool,
     pointer: crate::input::PointerFrame,
 ) {
+    let p = ui.palette();
+
     // 円本体: rect の中央に max-radius の正方形を置いて 4 隅 r で円形に。
     let size = rect.w.min(rect.h);
     let cx = rect.x + rect.w * 0.5;
@@ -368,12 +369,12 @@ fn draw_knob<M: ?Sized + 'static>(
     let r = (size * 0.5 - 2.0).max(2.0); // 2px の周囲余白
     let circle_rect = Rect { x: cx - r, y: cy - r, w: r * 2.0, h: r * 2.0 };
 
-    // Ableton 流: dark gray の円 + 円周上に cyan の arc。インジケータ線なし。
+    // Ableton 流: 中立な `control` の円 + 円周上に `accent` の arc。
     // arc は -150° (7時) から value_angle までを円周 (radius = r) 上に描画。
     // 下の 60° (5時 → 7時 経由 6時) は 300° sweep 範囲外で arc は届かない (= "切れている")。
-    let base = theme::CONTROL;
-    let hover_c = theme::CONTROL_HOVER;
-    let press_c = theme::ACCENT;
+    let base = p.control;
+    let hover_c = p.control_hover;
+    let press_c = p.accent;
     let bg_fill = if dragging {
         press_c
     } else if hovered(rect, pointer) {
@@ -385,7 +386,7 @@ fn draw_knob<M: ?Sized + 'static>(
     ui.push_rect(RectCommand {
         rect: circle_rect,
         fill: bg_fill,
-        border: theme::BORDER,
+        border: p.border,
         border_width: 1.0,
         radius: [r; 4],
         clip_rect: None,
@@ -397,15 +398,15 @@ fn draw_knob<M: ?Sized + 'static>(
     let end_angle = 150.0_f32 * PI / 180.0;
 
     // 可動範囲の弧を 2 色で描く (300° 全部表示):
-    // - 回転側 (start → value): cyan = 既に動いた範囲
-    // - 非回転側 (value → end): 暗グレー = 残りの可動範囲
+    // - 回転側 (start → value): `accent` = 既に動いた範囲
+    // - 非回転側 (value → end): `inset_bg` (窪み色) = 残りの可動範囲
     // 6時付近の 60° (5時 → 7時) は範囲外なので空白 = "弧が切れて見える"。
     // 角度ステップを 2° に下げて polygon 近似のコーナーアーティファクトを目立たなく。
     // 300° / 2° = 150 segments per knob、毎フレーム計算でも軽量。
     let step = 2.0_f32 * PI / 180.0;
     let arc_radius = r;
-    let active_color = theme::ACCENT;
-    let inactive_color = theme::INSET_BG;
+    let active_color = p.accent;
+    let inactive_color = p.inset_bg;
 
     let mut active: Vec<LineSegment> = Vec::new();
     let mut a0 = start_angle;
@@ -445,15 +446,16 @@ fn draw_knob<M: ?Sized + 'static>(
         });
     }
 
-    // インジケータ: 中心から外円まで伸びる白い太線。値角度を指す。
+    // インジケータ: 中心から外円まで伸びる太線。値角度を指す。
     let dx = value_angle.sin();
     let dy = -value_angle.cos();
     let indicator = LineSegment {
         a: [cx, cy],
         b: [cx + dx * r, cy + dy * r],
-        // knob の値を指す明るい中立ポインタ (物理的なつまみ指針)。 bright-neutral な
-        // 可動ハンドル surface に当たる theme token が無いため literal 維持。
-        color: Color::rgb(0.95, 0.97, 1.00),
+        // knob の値を指す物理的なつまみ指針。 hover/drag で色を変えない常時最大コントラストの
+        // 指針なので、 中立ハンドル 2 段のうち強い方 (`handle_active`) を使う (ダークでは明、
+        // ライトでは暗に反転して、 どちらでも `control` の円面から浮く)。
+        color: p.handle_active,
     };
     ui.push_lines(LineBatch {
         segments: vec![indicator].into(),
@@ -576,7 +578,7 @@ fn draw_knob_modulation_overlay<M: ?Sized + 'static>(
         push_arc(ui, cx, cy, band_top, base_angle, end_angle, Color { a: 0.9, ..c }, arc_lw + 1.0);
     }
 
-    // live 変調値の可動半径マーク (最前面、 明るい指針)。 base 白インジケータと別色 (amber) で区別。
+    // live 変調値の可動半径マーク (最前面、 明るい指針)。 base の中立指針と別色 (amber) で区別。
     if let Some(lv) = live_value {
         let la = angle_of(lv);
         let dx = la.sin();
@@ -586,9 +588,9 @@ fn draw_knob_modulation_overlay<M: ?Sized + 'static>(
             segments: vec![LineSegment {
                 a: [cx + dx * r_in, cy + dy * r_in],
                 b: [cx + dx * r, cy + dy * r],
-                // modulation の live 出力値マーク (amber、 base 白指針と区別)。 modulation-live
-                // indicator 用の theme token が無いため literal 維持。
-                color: Color::rgb(1.0, 0.85, 0.30),
+                // modulation の live 出力値マーク (amber、 base の中立指針と区別。
+                // r.md #48 で専用トークン化)。線なので alpha は載せない。
+                color: ui.palette().modulation_live.with_alpha(1.0),
             }]
             .into(),
             line_width_px: 2.5,

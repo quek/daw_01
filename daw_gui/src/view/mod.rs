@@ -17,6 +17,7 @@ pub mod recovery_modal;
 pub mod resource_monitor;
 pub mod root;
 pub mod runner;
+pub mod settings;
 pub mod shortcuts;
 pub mod shortcuts_help;
 pub mod snap;

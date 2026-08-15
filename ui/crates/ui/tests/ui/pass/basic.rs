@@ -118,7 +118,7 @@ fn main() {
             // M9 Phase 43: debug_overlay も non-Clone Model でコンパイルする。
             ui.debug_overlay(Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }, 5.5);
             // M11 Phase 51: reorderable_list widget が non-Clone Model でコンパイルする。
-            let rl_style = ReorderableListStyle::default();
+            let rl_style = ReorderableListStyle::from_palette(ui.palette());
             let _ = ui.reorderable_list(
                 "rl",
                 Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 },
@@ -131,7 +131,7 @@ fn main() {
                 |_ui, _name: &String, _i, _row, _sel, _drag| {},
             );
             // M14 Phase 64a (daw_01 #035): scrubable_number widget が non-Clone Model でコンパイルする。
-            let scn_style = ScrubableNumberStyle::default();
+            let scn_style = ScrubableNumberStyle::from_palette(ui.palette());
             let _ = ui.scrubable_number_at(
                 "scn",
                 Rect { x: 0.0, y: 0.0, w: 80.0, h: 28.0 },
@@ -146,7 +146,7 @@ fn main() {
             // M14 Phase 88 (daw_01 #058): color_picker widget が non-Clone Model でコンパイルする。
             // Model に一切触れない (response を返すだけ) ので構造的に no-Clone 安全だが、API が
             // 露出していることを CI 固定する。
-            let cp_style = ColorPickerStyle::default();
+            let cp_style = ColorPickerStyle::from_palette(ui.palette());
             let _ = ui.color_picker(
                 "cp",
                 Rect { x: 0.0, y: 0.0, w: 50.0, h: 20.0 },

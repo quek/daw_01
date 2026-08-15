@@ -1,7 +1,6 @@
 //! `label` ウィジェット — テキスト 1 行を表示するだけ。
 
 use daw_ui_renderer::{Color, GlyphArea, Rect};
-use crate::theme;
 
 use crate::id::WidgetId;
 use crate::scenegraph::hash_inputs;
@@ -97,6 +96,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         let x = self.cursor.x + pad;
         let y = self.cursor.y + self.next_y + pad * 0.5;
+        // クローム面 (panel / window) の上に置く本文なので `text`。
+        let p = self.palette();
         let input_hash = hash_inputs((
             b"label",
             text,
@@ -111,7 +112,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 top: y,
                 font_size,
                 line_height: line_h,
-                color: theme::TEXT,
+                color: p.text,
                 clip_rect: None,
                 ..GlyphArea::default()
             });

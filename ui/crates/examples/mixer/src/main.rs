@@ -311,7 +311,7 @@ impl App {
                         on_color: Color::rgb(0.55, 0.20, 0.20),
                         radius: 4.0,
                         font_size: 13.0,
-                        ..ToggleButtonStyle::default()
+                        ..ToggleButtonStyle::from_palette(ui.palette())
                     };
                     let _ = ui.toggle_button_at(
                         ("ch_mute", i),

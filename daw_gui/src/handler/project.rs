@@ -202,6 +202,13 @@ impl AppData {
     /// プロジェクト非依存の UI 設定 (resource monitor on/off・編集履歴 window の
     /// 開閉/位置/サイズ) を app_config.json に永続化する。 `ui_prefs` が SSoT なので
     /// 保存対象を増やしても呼び出し側は本メソッド 1 つで済む (r.md #3 / #29)。
+    /// r.md #48: 設定画面に出すテーマ一覧を取り直す (`themes/` の read_dir + JSON パース)。
+    /// 設定 window を開いたときだけ呼ぶ — 描画ループから呼ぶとフレームごとにディスクを叩く。
+    pub(crate) fn refresh_available_themes(&mut self) {
+        let dirs = self.ui_prefs.app_dirs.as_ref().map(common::app_dirs::AppDirs::themes_dir);
+        self.ui_ephemeral.available_themes = crate::theme::available_themes(dirs.as_deref());
+    }
+
     pub(crate) fn persist_app_config(&self) {
         let Some(dirs) = &self.ui_prefs.app_dirs else {
             return;
@@ -213,6 +220,11 @@ impl AppData {
                 .ui_prefs
                 .undo_history_rect
                 .map(|r| [r.x, r.y, r.w, r.h]),
+            // r.md #48: テーマは **id だけ**保存する (色を焼き込むとテーマファイルを
+            // 編集しても反映されず SSoT が二重化する)。
+            theme: self.theme.id.clone(),
+            settings_open: self.ui_prefs.settings_open,
+            settings_rect: self.ui_prefs.settings_rect.map(|r| [r.x, r.y, r.w, r.h]),
         };
         if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
             tracing::warn!(error = ?e, "failed to save app_config");

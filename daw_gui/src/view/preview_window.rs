@@ -324,10 +324,16 @@ impl PreviewWindowState {
     /// at intermediate alphas. Empty layer list falls back to the
     /// P4 placeholder text.
     ///
+    /// この窓は自前の [`Renderer`] / [`Scene`] を持ち `Ui` を通らないので、色は
+    /// `ui.palette()` ではなく引数の `theme` から取る (r.md #48)。使うのは
+    /// `theme.daw.video_*` = **極性固定トークン**で、両テーマ同値。映像の外側
+    /// (レターボックス) が暗いままなのは書き出し動画の黒背景と対だからで、
+    /// `--smoke-test` の near-black 判定もこれを前提にしている。
+    ///
     /// # Errors
     /// 描画できなかった理由 ([`RenderError`])。`DeviceLost` なら caller (runner) が
     /// [`Self::recreate_gpu`] を含む復旧シーケンスを駆動する。
-    pub fn render(&mut self) -> Result<(), RenderError> {
+    pub fn render(&mut self, theme: &crate::theme::Theme) -> Result<(), RenderError> {
         // GPU 消失中は合成も効果適用も全部無駄 (かつ死んだ device を触る) なので、
         // scene を組む前に抜ける。復旧は runner が駆動する。
         if !self.renderer.is_live() {
@@ -338,10 +344,12 @@ impl PreviewWindowState {
         // (gui_01 CompositePool::end_cycle を render 冒頭で呼ぶのと同 idiom)。
         self.fx_engine.end_frame(&mut self.renderer);
         self.scene.clear();
+        let daw = &theme.daw;
         let screen = self.renderer.size();
         // Dark backdrop spanning the entire window so any unfilled
         // area outside the project canvas reads as "letterbox" rather
-        // than the platform default.
+        // than the platform default. ライトテーマでも暗いままなのが仕様
+        // (`video_canvas_bg` は両テーマ同値の極性固定トークン)。
         self.scene.push_rect(daw_ui_renderer::RectCommand {
             rect: daw_ui_renderer::Rect::new(
                 0.0,
@@ -349,7 +357,7 @@ impl PreviewWindowState {
                 screen.width as f32,
                 screen.height as f32,
             ),
-            fill: Color::rgb(0.05, 0.05, 0.07),
+            fill: daw.video_canvas_bg,
             border: Color::TRANSPARENT,
             border_width: 0.0,
             radius: [0.0; 4],
@@ -385,7 +393,7 @@ impl PreviewWindowState {
                     0.0,
                     16.0,
                     20.0,
-                    Color::rgb(0.65, 0.7, 0.8),
+                    daw.video_placeholder_text,
                 )
             });
         } else {
@@ -396,7 +404,7 @@ impl PreviewWindowState {
             if master_fx.is_empty() {
                 // 通常: 各トラック合成画を screen project_box へ直接描く（fast-path 含む）。
                 for tc in &composites {
-                    self.draw_track_composite(tc, project_box);
+                    self.draw_track_composite(tc, project_box, daw);
                 }
             } else {
                 // master 映像チェーン。全トラック合成画を project 解像度の
@@ -448,14 +456,14 @@ impl PreviewWindowState {
                 // 選択中トラックの Transform overlay を screen 座標で（master fx 後）。
                 for tc in &composites {
                     if tc.selected && let Some(t) = tc.transform {
-                        self.draw_group_overlay(&t, project_box);
+                        self.draw_group_overlay(&t, project_box, daw);
                     }
                 }
             }
             self.track_composites = composites;
             self.master_fx = master_fx;
         }
-        self.draw_selection_overlay(screen.width as f32, screen.height as f32);
+        self.draw_selection_overlay(screen.width as f32, screen.height as f32, daw);
 
         self.renderer.render(&self.scene)
     }
@@ -469,6 +477,7 @@ impl PreviewWindowState {
         &mut self,
         tc: &crate::group_compose::TrackComposite,
         project_box: (f32, f32, f32, f32),
+        daw: &crate::theme::DawColors,
     ) {
         // 合成 + 配置は preview / export 共通の SSoT 経路（byte parity）。
         crate::group_compose::composite_and_place(
@@ -481,7 +490,7 @@ impl PreviewWindowState {
         );
         // 選択中 group / Transform は bounding box + handle を描く（preview のみ）。
         if tc.selected && let Some(t) = tc.transform {
-            self.draw_group_overlay(&t, project_box);
+            self.draw_group_overlay(&t, project_box, daw);
         }
     }
 
@@ -492,6 +501,7 @@ impl PreviewWindowState {
         &mut self,
         t: &common::model::GroupTransform,
         project_box: (f32, f32, f32, f32),
+        daw: &crate::theme::DawColors,
     ) {
         let (rx, ry, rw, rh, rot, px, py, _alpha) =
             crate::group_compose::group_quad_params(t, project_box);
@@ -510,12 +520,13 @@ impl PreviewWindowState {
         let c1 = rotate_pt(rx + rw, ry);
         let c2 = rotate_pt(rx + rw, ry + rh);
         let c3 = rotate_pt(rx, ry + rh);
-        const STROKE: Color = Color { r: 0.45, g: 0.82, b: 1.0, a: 0.9 };
+        // 親グループの範囲枠。暗い映像面の上に置く極性固定トークン (r.md #48)。
+        let stroke = daw.video_group_outline;
         let edges = vec![
-            daw_ui_renderer::LineSegment { a: c0, b: c1, color: STROKE },
-            daw_ui_renderer::LineSegment { a: c1, b: c2, color: STROKE },
-            daw_ui_renderer::LineSegment { a: c2, b: c3, color: STROKE },
-            daw_ui_renderer::LineSegment { a: c3, b: c0, color: STROKE },
+            daw_ui_renderer::LineSegment { a: c0, b: c1, color: stroke },
+            daw_ui_renderer::LineSegment { a: c1, b: c2, color: stroke },
+            daw_ui_renderer::LineSegment { a: c2, b: c3, color: stroke },
+            daw_ui_renderer::LineSegment { a: c3, b: c0, color: stroke },
         ];
         self.scene.push_lines(daw_ui_renderer::LineBatch {
             segments: std::sync::Arc::from(edges),
@@ -525,8 +536,8 @@ impl PreviewWindowState {
         // anchor marker: pivot（= 回転・スケール中心）に小さな十字。
         const AH: f32 = 7.0;
         let cross = vec![
-            daw_ui_renderer::LineSegment { a: [pivx - AH, pivy], b: [pivx + AH, pivy], color: STROKE },
-            daw_ui_renderer::LineSegment { a: [pivx, pivy - AH], b: [pivx, pivy + AH], color: STROKE },
+            daw_ui_renderer::LineSegment { a: [pivx - AH, pivy], b: [pivx + AH, pivy], color: stroke },
+            daw_ui_renderer::LineSegment { a: [pivx, pivy - AH], b: [pivx, pivy + AH], color: stroke },
         ];
         self.scene.push_lines(daw_ui_renderer::LineBatch {
             segments: std::sync::Arc::from(cross),
@@ -540,7 +551,7 @@ impl PreviewWindowState {
             segments: std::sync::Arc::from(vec![daw_ui_renderer::LineSegment {
                 a: top_mid,
                 b: rot_knob,
-                color: STROKE,
+                color: stroke,
             }]),
             line_width_px: 2.0,
             clip_rect: None,
@@ -550,7 +561,7 @@ impl PreviewWindowState {
         for [hx, hy] in [rot_knob, c0, c1, c2, c3] {
             self.scene.push_rect(daw_ui_renderer::RectCommand {
                 rect: daw_ui_renderer::Rect::new(hx - KNOB * 0.5, hy - KNOB * 0.5, KNOB, KNOB),
-                fill: STROKE,
+                fill: stroke,
                 border: Color::TRANSPARENT,
                 border_width: 0.0,
                 radius: [2.0; 4],
@@ -565,7 +576,7 @@ impl PreviewWindowState {
     /// 旋回で `selection_rotation_radians` を反映 (= 画像と一緒に回る)。
     /// 4 corner handle / center handle / rotate handle 位置も同様に
     /// 回転後座標で描画 (`docs/plan_image_automation.md` rotation)。
-    fn draw_selection_overlay(&mut self, sw: f32, sh: f32) {
+    fn draw_selection_overlay(&mut self, sw: f32, sh: f32, daw: &crate::theme::DawColors) {
         let Some((nx, ny, nw, nh)) = self.selection_overlay else {
             return;
         };
@@ -604,28 +615,29 @@ impl PreviewWindowState {
         // 縁取り 4 edge を line で描画。 push_lines は 1 batch で
         // 複数 segment OK。 LineSegment の field は `a: [f32; 2]` /
         // `b: [f32; 2]` / `color`。
-        const STROKE_COLOR: Color = Color { r: 1.0, g: 0.95, b: 0.45, a: 0.85 };
+        // 選択枠。暗い映像面の上の極性固定トークン (r.md #48)。
+        let stroke_color = daw.video_selection_stroke;
         const STROKE_W: f32 = 2.0;
         let edge_pts: Vec<daw_ui_renderer::LineSegment> = vec![
             daw_ui_renderer::LineSegment {
                 a: [nw_p.0, nw_p.1],
                 b: [ne_p.0, ne_p.1],
-                color: STROKE_COLOR,
+                color: stroke_color,
             },
             daw_ui_renderer::LineSegment {
                 a: [ne_p.0, ne_p.1],
                 b: [se_p.0, se_p.1],
-                color: STROKE_COLOR,
+                color: stroke_color,
             },
             daw_ui_renderer::LineSegment {
                 a: [se_p.0, se_p.1],
                 b: [sw_p.0, sw_p.1],
-                color: STROKE_COLOR,
+                color: stroke_color,
             },
             daw_ui_renderer::LineSegment {
                 a: [sw_p.0, sw_p.1],
                 b: [nw_p.0, nw_p.1],
-                color: STROKE_COLOR,
+                color: stroke_color,
             },
         ];
         self.scene.push_lines(daw_ui_renderer::LineBatch {
@@ -642,7 +654,7 @@ impl PreviewWindowState {
             segments: std::sync::Arc::from(vec![daw_ui_renderer::LineSegment {
                 a: [top_mid.0, top_mid.1],
                 b: [rotate_p.0, rotate_p.1],
-                color: STROKE_COLOR,
+                color: stroke_color,
             }]),
             line_width_px: STROKE_W,
             clip_rect: None,
@@ -651,8 +663,9 @@ impl PreviewWindowState {
         // Corner / center / rotate handle (= 6 個)。 handle 自体は
         // axis-aligned rect で描画 (= 回転後の中心位置に小 square)。
         const HANDLE: f32 = 10.0;
-        const HANDLE_COLOR: Color = Color { r: 1.0, g: 0.95, b: 0.45, a: 1.0 };
-        const HANDLE_BORDER: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.85 };
+        // 選択ハンドルと、その縁取り (映像の上で必ず立つ純黒)。両テーマ同値の極性固定トークン。
+        let handle_color = daw.video_handle;
+        let handle_border = daw.video_handle_border;
         let handle_centers = [
             nw_p,
             ne_p,
@@ -669,8 +682,8 @@ impl PreviewWindowState {
                     HANDLE,
                     HANDLE,
                 ),
-                fill: HANDLE_COLOR,
-                border: HANDLE_BORDER,
+                fill: handle_color,
+                border: handle_border,
                 border_width: 1.0,
                 radius: [2.0; 4],
                 clip_rect: None,

@@ -20,7 +20,6 @@
 use std::hash::Hash;
 
 use daw_ui_renderer::{Rect, RectCommand};
-use crate::theme;
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
@@ -225,27 +224,24 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         });
 
         // ---- 4. scrollbar 描画 (track + thumb)。drag hit-test と同一 thumb rect を使う ----
+        // 溝と thumb は専用トークン (grid_line からの alpha 派生ではない): ライトテーマでは
+        // 溝を「薄い暗」、thumb を「濃い暗」にする必要があり、alpha だけでは表現できない。
+        let p = self.palette();
         if let Some(thumb) = v_thumb_rect {
-            let track_color = theme::GRID_LINE.with_alpha(0.04);
-            let thumb_color = theme::GRID_LINE.with_alpha(0.55);
-            let thumb_hover = theme::GRID_LINE.with_alpha(0.80);
-            self.push_rect(RectCommand::uniform_radius(v_track_rect, track_color, 2.0));
+            self.push_rect(RectCommand::uniform_radius(v_track_rect, p.scrollbar_track, 2.0));
             let hovered = pointer.pos.is_some_and(|(px, py)| thumb.contains(px, py));
             self.push_rect(RectCommand::uniform_radius(
                 thumb,
-                if hovered { thumb_hover } else { thumb_color },
+                if hovered { p.scrollbar_thumb_hover } else { p.scrollbar_thumb },
                 3.0,
             ));
         }
         if let Some(thumb) = h_thumb_rect {
-            let track_color = theme::GRID_LINE.with_alpha(0.04);
-            let thumb_color = theme::GRID_LINE.with_alpha(0.55);
-            let thumb_hover = theme::GRID_LINE.with_alpha(0.80);
-            self.push_rect(RectCommand::uniform_radius(h_track_rect, track_color, 2.0));
+            self.push_rect(RectCommand::uniform_radius(h_track_rect, p.scrollbar_track, 2.0));
             let hovered = pointer.pos.is_some_and(|(px, py)| thumb.contains(px, py));
             self.push_rect(RectCommand::uniform_radius(
                 thumb,
-                if hovered { thumb_hover } else { thumb_color },
+                if hovered { p.scrollbar_thumb_hover } else { p.scrollbar_thumb },
                 3.0,
             ));
         }

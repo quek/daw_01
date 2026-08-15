@@ -5,6 +5,18 @@
     // S4b: reorder ヘルパは daw-ui-core の reorderable_list へ移設したので import 経由で参照。
     use daw_ui_core::widgets::reorderable_list::{apply_reorder, compute_reorder_target_index};
 
+    /// r.md #48: テストの基準テーマ。組込みダークから組むので、`Palette` / `DawColors` の
+    /// ダーク値を変えたら期待値も自動で追従する (色を literal でベタ書きしない)。
+    /// `Theme::builtin` はプロセスグローバルを触らないので並列テストでも安全。
+    fn test_theme() -> crate::theme::Theme {
+        crate::theme::Theme::builtin("dark").expect("組込みダークテーマは常に存在する")
+    }
+
+    /// 旧 `ArrangementStyle::default()` の置換 — 組込みダークテーマから組んだ style。
+    fn test_style() -> ArrangementStyle {
+        ArrangementStyle::from_theme(&test_theme())
+    }
+
     fn clip(id: u32, start: f64, len: f64, name: &str) -> ClipView {
         ClipView {
             id,
@@ -429,7 +441,7 @@
 
     #[test]
     fn arrangement_style_default_sane() {
-        let s = ArrangementStyle::default();
+        let s = test_style();
         assert!(s.resize_handle_px > 0.0);
         assert!(s.playhead_width_px > 0.0);
         assert!(s.clip_radius >= 0.0);
@@ -1096,45 +1108,75 @@
 
     /// M14 Phase 89 (daw_01 #060): `clip_text_color_for` が fill 輝度で暗/明文字を選び、
     /// 半透明 fill は lane bg と合成した実効色で判定し、 opt-out 時は固定色を返す。
+    ///
+    /// r.md #48: clip はユーザー着色の可変背景なので、選ばれるのは **極性固定インク**
+    /// (`ink_on_bright` / `ink_on_dark`)。テーマ従属の `text` ではないことを直接 assert する
+    /// (ここが `text` に化けるとライトテーマでクリップ名が消える)。
     #[test]
     fn clip_text_color_for_picks_contrast() {
-        let style = ArrangementStyle::default();
+        let theme = test_theme();
+        let p = &theme.core;
+        let style = ArrangementStyle::from_theme(&theme);
 
-        // 明るい fill (黄 selected) → 暗文字。
+        // 明るい fill (黄 selected) → 暗インク。
         assert_eq!(
-            clip_text_color_for(&style, style.clip_selected_fill, style.bg),
-            style.clip_text_color_dark,
-            "明るい黄 fill には暗文字"
+            clip_text_color_for(p, &style, style.clip_selected_fill, style.bg),
+            p.ink_on_bright,
+            "明るい黄 fill には暗インク"
         );
-        // 暗い fill (default 青) → 明文字。
+        // 暗い fill (default 青) → 明インク。
         assert_eq!(
-            clip_text_color_for(&style, style.clip_default_fill, style.bg),
-            style.clip_text_color,
-            "暗い青 fill には明文字"
+            clip_text_color_for(p, &style, style.clip_default_fill, style.bg),
+            p.ink_on_dark,
+            "暗い青 fill には明インク"
         );
-        // 半透明の薄緑 share fill: 不透明なら明るく暗文字寄りだが、 暗い lane bg と alpha 0.3 で
-        // 合成すると実効輝度が下がり明文字が選ばれる (合成判定が効いている証拠)。
+        // 半透明の薄緑 share fill: 不透明なら明るく暗インク寄りだが、 暗い lane bg と alpha 0.3 で
+        // 合成すると実効輝度が下がり明インクが選ばれる (合成判定が効いている証拠)。
         let pale_green = Color::rgba(0.55, 0.85, 0.55, 0.30);
         let opaque = clip_text_color_for(
+            p,
             &style,
             Color::rgb(pale_green.r, pale_green.g, pale_green.b),
             style.bg,
         );
-        let composited = clip_text_color_for(&style, pale_green, style.bg);
-        assert_eq!(opaque, style.clip_text_color_dark, "不透明な薄緑は暗文字");
+        let composited = clip_text_color_for(p, &style, pale_green, style.bg);
+        assert_eq!(opaque, p.ink_on_bright, "不透明な薄緑は暗インク");
         assert_eq!(
-            composited, style.clip_text_color,
-            "暗 lane bg と合成した薄緑 (alpha 0.3) は明文字"
+            composited, p.ink_on_dark,
+            "暗 lane bg と合成した薄緑 (alpha 0.3) は明インク"
         );
 
         // opt-out: auto を切ると fill に依らず clip_text_color 固定。
         let mut off = style;
         off.clip_auto_contrast_text = false;
         assert_eq!(
-            clip_text_color_for(&off, off.clip_selected_fill, off.bg),
+            clip_text_color_for(p, &off, off.clip_selected_fill, off.bg),
             off.clip_text_color,
             "opt-out 時は明るい fill でも clip_text_color 固定"
         );
+    }
+
+    /// r.md #48: 同じ判定がライトテーマでも成立する (= 極性は **テーマで反転しない**)。
+    /// 明るいクリップには暗インク / 暗いクリップには明インクが、両テーマで同じ色になる。
+    #[test]
+    fn clip_text_color_polarity_is_theme_independent() {
+        let bright_clip = Color::rgb(0.95, 0.80, 0.35);
+        let dark_clip = Color::rgb(0.10, 0.12, 0.18);
+        for id in ["dark", "light"] {
+            let theme = crate::theme::Theme::builtin(id).unwrap();
+            let p = &theme.core;
+            let style = ArrangementStyle::from_theme(&theme);
+            assert_eq!(
+                clip_text_color_for(p, &style, bright_clip, style.bg),
+                p.ink_on_bright,
+                "theme={id}: 明るいクリップには暗インク"
+            );
+            assert_eq!(
+                clip_text_color_for(p, &style, dark_clip, style.bg),
+                p.ink_on_dark,
+                "theme={id}: 暗いクリップには明インク"
+            );
+        }
     }
 
 
@@ -1312,7 +1354,7 @@
     #[test]
     fn disclosure_rect_within_name_rect_left_edge() {
         // disclosure rect は name_rect の左端から indent_px 幅で切り出し
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let name_rect = Rect { x: 100.0, y: 50.0, w: 120.0, h: 24.0 };
         let r = disclosure_rect_for(name_rect, &style, 0);
         assert!((r.x - 100.0).abs() < 1e-6, "disclosure x は name_rect 左端");
@@ -1403,7 +1445,7 @@
 
     #[test]
     fn arrangement_style_has_indent_and_disclosure_defaults() {
-        let s = ArrangementStyle::default();
+        let s = test_style();
         assert!(s.indent_px > 0.0, "indent_px は 0 以上 (default 16)");
         assert!(s.indent_px <= 32.0, "indent_px は実用範囲 (~16-32) 内");
         // M14 Phase 113 (daw_01 #085): group track 専用背景 (旧 track_group_bg) は撤去。 group の
@@ -1434,7 +1476,7 @@
     fn audio_grip_hit_returns_none_when_audio_edit_is_none() {
         let view = test_view();
         let lanes = test_lanes();
-        let style = ArrangementStyle::default();
+        let style = test_style();
         // 通常 clip (audio_edit = None) は中央 click でも fade 角 click でも None
         let tracks = vec![track(10, "t0", vec![clip(100, 0.0, 4.0, "c")])];
         // Get hit at clip middle
@@ -1456,7 +1498,7 @@
     fn audio_grip_hit_returns_gain_handle_at_clip_middle() {
         let view = test_view();
         let lanes = test_lanes();
-        let style = ArrangementStyle::default();
+        let style = test_style();
         // clip rect = (0, 2, 160, 28), 中央 (80, 16) は handle band 内
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
@@ -1473,7 +1515,7 @@
     fn audio_grip_hit_returns_fade_corner_in_at_top_left() {
         let view = test_view();
         let lanes = test_lanes();
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
         // clip rect = (0, 2, 160, 28)、名前帯 = 14px → 中身領域は y ∈ [16, 30)。
@@ -1495,7 +1537,7 @@
     fn audio_grip_hit_returns_fade_corner_out_at_top_right() {
         let view = test_view();
         let lanes = test_lanes();
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 4.0, "c", audio)])];
         // clip rect = (0, 2, 160, 28) → 掴む正方形は (148..160, 16..28) → cx=155, cy=20。
@@ -1510,7 +1552,7 @@
     fn audio_grip_hit_returns_none_for_short_clip() {
         let view = test_view();
         let lanes = test_lanes();
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         // len_beats=0.5 → w = 20px、 default min = 32 → grip disable
         let tracks = vec![track(10, "t0", vec![audio_clip(100, 0.0, 0.5, "c", audio)])];
@@ -1535,7 +1577,7 @@
     /// compute_audio_drag_outcome: Gain drag は dy 上で gain_db 増加 (pixels_per_db = 0.25 default)。
     #[test]
     fn compute_audio_drag_outcome_gain_changes_db_by_pixels() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
@@ -1561,7 +1603,7 @@
     /// compute_audio_drag_outcome: Gain drag は ±range_db に clamp される。
     #[test]
     fn compute_audio_drag_outcome_gain_clamps_to_range() {
-        let style = ArrangementStyle::default(); // range = 24 dB
+        let style = test_style(); // range = 24 dB
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         // dy = -200 → +50 dB raw → clamped to +24
         let ad = AudioDragSession {
@@ -1588,7 +1630,7 @@
     /// beat_per_px = 0.025 (= 40 px/beat), dx = +40 px → +1 beat.
     #[test]
     fn compute_audio_drag_outcome_fade_in_horizontal_changes_length() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
@@ -1618,7 +1660,7 @@
     /// FadeOut + horizontal lock は dx **負** で fade_out_beats 増加 (右側から内側に伸びる)。
     #[test]
     fn compute_audio_drag_outcome_fade_out_horizontal_uses_negative_dx() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
@@ -1649,7 +1691,7 @@
     /// fade length は `0..=clip_len_beats` に clamp される。
     #[test]
     fn compute_audio_drag_outcome_fade_length_clamps_to_clip_len() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         // dx = +400 px @ 0.025 beat/px = +10 beat → 0.5 + 10 = 10.5、 clamp to clip_len 4.0
         let ad = AudioDragSession {
@@ -1680,7 +1722,7 @@
     /// (trim / split 後) では event 長で頭打ちにならないと絵と実挙動がずれる。
     #[test]
     fn compute_audio_drag_outcome_fade_length_clamps_to_event_len_not_clip_len() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
             kind: AudioDragKind::FadeIn,
@@ -1713,46 +1755,61 @@
     /// 波形色は clip の **実塗り色** から選ぶ。明るい clip では暗い波形、
     /// 暗い clip では明るい波形になる (固定ブルーだと明 clip 上で沈む = r.md #45)。
     /// クリップピーク (赤) も同じ規律で明暗を切り替える。
+    ///
+    /// r.md #48: 波形インクは極性固定なので、この関係は **両テーマで同じ** でなければ
+    /// ならない (ライトで反転すると明るいクリップ上の波形が消える)。
     #[test]
     fn waveform_colors_follow_clip_fill_luminance() {
         let dark_clip = Color::rgb(0.10, 0.12, 0.18);
         let bright_clip = Color::rgb(0.95, 0.80, 0.35); // 既定パレットのアンバー相当
         let lane_bg = Color::rgb(0.06, 0.07, 0.09);
-        for selected in [false, true] {
-            let (fg_dark_bg, peak_dark_bg) = waveform_colors_for(dark_clip, lane_bg, selected);
-            let (fg_bright_bg, peak_bright_bg) =
-                waveform_colors_for(bright_clip, lane_bg, selected);
-            let lum = |c: Color| daw_ui_core::color::relative_luminance(c.r, c.g, c.b);
-            assert!(
-                lum(fg_dark_bg) > lum(fg_bright_bg),
-                "暗 clip では明るい波形 / 明 clip では暗い波形 (selected={selected})"
-            );
-            assert!(
-                lum(peak_dark_bg) > lum(peak_bright_bg),
-                "クリップピークも背景輝度で切り替わる (selected={selected})"
-            );
+        for id in ["dark", "light"] {
+            let theme = crate::theme::Theme::builtin(id).unwrap();
+            let p = &theme.core;
+            for selected in [false, true] {
+                let (fg_dark_bg, peak_dark_bg) =
+                    waveform_colors_for(p, dark_clip, lane_bg, selected);
+                let (fg_bright_bg, peak_bright_bg) =
+                    waveform_colors_for(p, bright_clip, lane_bg, selected);
+                let lum = |c: Color| daw_ui_core::color::relative_luminance(c.r, c.g, c.b);
+                assert!(
+                    lum(fg_dark_bg) > lum(fg_bright_bg),
+                    "暗 clip では明るい波形 / 明 clip では暗い波形 (theme={id} selected={selected})"
+                );
+                assert!(
+                    lum(peak_dark_bg) > lum(peak_bright_bg),
+                    "クリップピークも背景輝度で切り替わる (theme={id} selected={selected})"
+                );
+            }
         }
     }
 
     /// fade の前景と裏打ちは **逆極性**。どちらの下地 (clip 色 / 波形) でも縁が立つ。
+    /// r.md #48: 極性の判定は `Palette::ink_for` なので両テーマで同じ向きになる。
     #[test]
     fn fade_colors_are_opposite_polarity_and_follow_clip_fill() {
-        let style = ArrangementStyle::default();
-        let lane_bg = style.bg;
         let lum = |c: Color| daw_ui_core::color::relative_luminance(c.r, c.g, c.b);
+        for id in ["dark", "light"] {
+            let theme = crate::theme::Theme::builtin(id).unwrap();
+            let p = &theme.core;
+            let style = ArrangementStyle::from_theme(&theme);
+            let lane_bg = style.bg;
 
-        let (fg, backing) = fade_colors_for(&style, Color::rgb(0.10, 0.12, 0.18), lane_bg);
-        assert!(lum(fg) > lum(backing), "暗 clip 上は明色の前景 + 暗い裏打ち");
+            let (fg, backing) =
+                fade_colors_for(p, &style, Color::rgb(0.10, 0.12, 0.18), lane_bg);
+            assert!(lum(fg) > lum(backing), "theme={id}: 暗 clip 上は明色の前景 + 暗い裏打ち");
 
-        let (fg2, backing2) = fade_colors_for(&style, Color::rgb(0.95, 0.80, 0.35), lane_bg);
-        assert!(lum(fg2) < lum(backing2), "明 clip 上は暗色の前景 + 明るい裏打ち");
+            let (fg2, backing2) =
+                fade_colors_for(p, &style, Color::rgb(0.95, 0.80, 0.35), lane_bg);
+            assert!(lum(fg2) < lum(backing2), "theme={id}: 明 clip 上は暗色の前景 + 明るい裏打ち");
+        }
     }
 
     /// muted clip は fill が減光されるので、中身の色もその **減光後** の色を基準に選ぶ
     /// (`clip_effective_fill` が draw と共通の 1 本)。
     #[test]
     fn clip_effective_fill_applies_muted_dim() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let base = Color::rgb(0.95, 0.80, 0.35);
         let mut c = fade_clip(1, 0.0, 4.0, "c", ev_fade(4.0, 0.0, 0.0, FadeCurve::Linear, FadeCurve::Linear));
         c.color = Some(base);
@@ -1775,7 +1832,7 @@
     /// r.md #38 以前は上下が逆で、 固定端が上・可動端が下だった (= fade out の絵)。
     #[test]
     fn fade_geometry_in_anchors_at_bottom_and_handle_at_top() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let r = Rect { x: 0.0, y: 10.0, w: 160.0, h: 28.0 };
         let f = ClipEventFade {
             event_index: 0,
@@ -1795,7 +1852,7 @@
     /// fade out は「fade 開始の上端 → event 右端の下端」。
     #[test]
     fn fade_geometry_out_anchors_at_bottom_right() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let r = Rect { x: 0.0, y: 10.0, w: 160.0, h: 28.0 };
         let f = ClipEventFade {
             event_index: 0,
@@ -1812,7 +1869,7 @@
     /// fade = 0 のとき掴む正方形は event の角に一致する (従来の操作感を保つ)。
     #[test]
     fn fade_geometry_zero_fade_keeps_handle_at_corner() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let r = Rect { x: 5.0, y: 10.0, w: 160.0, h: 28.0 };
         let f = ClipEventFade {
             event_index: 0,
@@ -1828,7 +1885,7 @@
     /// event が clip の一部しか占めない場合、 fade は **その event の矩形** を基準に描かれる。
     #[test]
     fn fade_geometry_uses_event_rect_not_clip_rect() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         // clip = 4 拍 / 160px、 event は 1 拍目から 2 拍ぶん (40px 〜 120px)。
         let r = Rect { x: 0.0, y: 0.0, w: 160.0, h: 28.0 };
         let f = ClipEventFade {
@@ -1855,7 +1912,7 @@
     fn audio_grip_hit_prefers_wider_fade_when_handles_coincide() {
         let view = test_view();
         let lanes = test_lanes();
-        let style = ArrangementStyle::default();
+        let style = test_style();
         // fade_in = 4 拍 (= event 全長)、 fade_out = 0 → どちらの handle も event 右上。
         let c = fade_clip(100, 0.0, 4.0, "c", ev_fade(4.0, 4.0, 0.0, FadeCurve::Linear, FadeCurve::Linear));
         let tracks = vec![track(10, "t0", vec![c])];
@@ -1873,7 +1930,7 @@
     fn audio_grip_hit_follows_fade_end() {
         let view = test_view();
         let lanes = test_lanes();
-        let style = ArrangementStyle::default();
+        let style = test_style();
         // clip = 4 拍 → w = 160px。 fade_in = 2 拍 → 80px。
         let c = fade_clip(100, 0.0, 4.0, "c", ev_fade(4.0, 2.0, 0.0, FadeCurve::Linear, FadeCurve::Linear));
         let tracks = vec![track(10, "t0", vec![c])];
@@ -1893,7 +1950,7 @@
     /// FadeIn + vertical lock は curve 切替を返す (Linear → Exponential)。
     #[test]
     fn compute_audio_drag_outcome_fade_in_vertical_toggles_curve() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
@@ -1922,7 +1979,7 @@
     /// sticky direction 未確定 (locked_horizontal = None) は no-op (None) を返す。
     #[test]
     fn compute_audio_drag_outcome_unlocked_returns_none() {
-        let style = ArrangementStyle::default();
+        let style = test_style();
         let audio = ClipViewAudioEdit { gain_db: 0.0 };
         let ad = AudioDragSession {
             key: ClipKey { track: 0, clip: 0 },
@@ -2206,7 +2263,7 @@
     /// 帯の外 / header_w=0 / handle=0 で miss する。
     #[test]
     fn header_resize_splitter_at_hits_centered_full_height_band() {
-        let style = ArrangementStyle::default(); // header_resize_handle_px = 8 → ±4
+        let style = test_style(); // header_resize_handle_px = 8 → ±4
         let rect = Rect { x: 100.0, y: 50.0, w: 800.0, h: 400.0 };
         let header_w = 160.0;
         let boundary = 100.0 + 160.0; // = 260
@@ -2225,7 +2282,7 @@
         // header_w = 0 (header 無し): 常に miss。
         assert!(!header_resize_splitter_at(rect, 0.0, &style, 100.0, 200.0));
         // handle = 0: 無効化。
-        let no_handle = ArrangementStyle { header_resize_handle_px: 0.0, ..ArrangementStyle::default() };
+        let no_handle = ArrangementStyle { header_resize_handle_px: 0.0, ..test_style() };
         assert!(!header_resize_splitter_at(rect, header_w, &no_handle, boundary, 200.0));
     }
 

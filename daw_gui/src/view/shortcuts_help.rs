@@ -19,23 +19,17 @@ use crate::view::shortcuts::{SHORTCUTS, ShortcutCategory};
 
 const MODAL_ID: &str = "shortcuts_help";
 
-const COLOR_TITLE: Color = Color { r: 0.96, g: 0.97, b: 1.0, a: 1.0 };
-const COLOR_TEXT: Color = Color { r: 0.82, g: 0.84, b: 0.90, a: 1.0 };
-const COLOR_DIM: Color = Color { r: 0.55, g: 0.57, b: 0.64, a: 1.0 };
-const COLOR_HEADER: Color = Color { r: 0.45, g: 0.72, b: 0.98, a: 1.0 };
-/// キーボードのキー表記 (ティール)。
-const COLOR_KEY: Color = Color { r: 0.52, g: 0.86, b: 0.78, a: 1.0 };
-/// マウスのジェスチャ表記 (アンバー、キーボードと一目で区別)。
-const COLOR_GESTURE: Color = Color { r: 0.93, g: 0.78, b: 0.46, a: 1.0 };
-const COLOR_RULE: Color = Color { r: 0.30, g: 0.33, b: 0.40, a: 1.0 };
-
-const MODAL_STYLE: ModalStyle = ModalStyle {
-    overlay_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.72 },
-    panel_bg: Color { r: 0.13, g: 0.14, b: 0.17, a: 1.0 },
-    panel_radius: 8.0,
-    close_on_outside_click: true,
-    close_on_escape: true,
-};
+/// r.md #48: このヘルプ窓は以前 theme を import すらしておらず、色を全部直書きしていた
+/// (= テーマを切り替えてもここだけ暗いまま残る唯一の view だった)。色は `app.theme` から取る。
+fn modal_style(theme: &crate::theme::Theme) -> ModalStyle {
+    ModalStyle {
+        overlay_color: theme.core.backdrop,
+        panel_bg: theme.core.panel,
+        panel_radius: 8.0,
+        close_on_outside_click: true,
+        close_on_escape: true,
+    }
+}
 
 const PAD: f32 = 22.0;
 const TITLE_H: f32 = 44.0;
@@ -230,7 +224,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
     ui.modal(
         MODAL_ID,
         (pw, ph),
-        &MODAL_STYLE,
+        &modal_style(&app.theme),
         Some(Box::new(|| {
             Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CloseHelp))
         })),
@@ -240,19 +234,20 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: PhysicalSize) {
                 ui.close_modal(MODAL_ID);
                 return;
             }
-            draw_body(ui, panel);
+            draw_body(app, ui, panel);
         },
     );
 }
 
-fn draw_body(ui: &mut Ui<'_, AppData>, panel: Rect) {
+fn draw_body(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
+    let p = &app.theme.core;
     ui.label_at(
         "sc_help_title",
         "ショートカット / マウス操作",
         panel.x + PAD,
         panel.y + PAD * 0.7,
         19.0,
-        COLOR_TITLE,
+        p.text,
     );
     // 閉じ方ヒント (右上、概算右寄せ)。
     let hint = "F1 / Esc / 画面外クリックで閉じる";
@@ -262,7 +257,7 @@ fn draw_body(ui: &mut Ui<'_, AppData>, panel: Rect) {
         (panel.x + panel.w - PAD - 232.0).max(panel.x + PAD),
         panel.y + PAD * 0.95,
         12.0,
-        COLOR_DIM,
+        p.text_dim,
     );
 
     let content = Rect {
@@ -292,14 +287,25 @@ fn draw_body(ui: &mut Ui<'_, AppData>, panel: Rect) {
             let x = content.x + ci as f32 * col_w;
             let mut y = content.y - offset.1;
             for &si in col {
-                y = draw_section(ui, sections[si], &rows[si], x, y, col_w - COL_GAP, &mut id_counter);
+                y = draw_section(
+                    app,
+                    ui,
+                    sections[si],
+                    &rows[si],
+                    x,
+                    y,
+                    col_w - COL_GAP,
+                    &mut id_counter,
+                );
             }
         }
     });
 }
 
 /// 1 ブロックを描画して次の y を返す。
+#[allow(clippy::too_many_arguments)]
 fn draw_section(
+    app: &AppData,
     ui: &mut Ui<'_, AppData>,
     section: Section,
     rows: &[(String, &'static str)],
@@ -308,14 +314,17 @@ fn draw_section(
     w: f32,
     counter: &mut u32,
 ) -> f32 {
-    let key_color = if section.is_mouse() { COLOR_GESTURE } else { COLOR_KEY };
+    let p = &app.theme.core;
+    // キー表記 (ティール) とマウスのジェスチャ表記 (アンバー) を一目で区別する専用トークン。
+    let key_color =
+        if section.is_mouse() { app.theme.daw.text_gesture } else { app.theme.daw.text_keycap };
 
-    ui.label_at(("sc_h", *counter), section.label(), x, y, 14.5, COLOR_HEADER);
+    ui.label_at(("sc_h", *counter), section.label(), x, y, 14.5, p.accent);
     *counter += 1;
     // 見出し下線。
     ui.push_rect(RectCommand {
         rect: Rect { x, y: y + HEADER_H - 8.0, w, h: 1.0 },
-        fill: COLOR_RULE,
+        fill: p.border,
         border: Color::TRANSPARENT,
         border_width: 0.0,
         radius: [0.0; 4],
@@ -338,7 +347,7 @@ fn draw_section(
             desc,
             Rect { x: x + KEY_COL_W, y: yy, w: (w - KEY_COL_W).max(0.0), h: ROW_H },
             12.0,
-            COLOR_TEXT,
+            p.text,
         );
         *counter += 1;
         yy += ROW_H;
