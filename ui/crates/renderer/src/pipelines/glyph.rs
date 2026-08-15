@@ -227,20 +227,28 @@ impl GlyphPipeline {
             .iter()
             .zip(keys.iter())
             .map(|(area, &key)| {
-                let bounds = area.clip_rect.map_or(
-                    TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: screen.width.try_into().unwrap_or(i32::MAX),
-                        bottom: screen.height.try_into().unwrap_or(i32::MAX),
-                    },
-                    |c| TextBounds {
-                        left: c.x.max(0.0) as i32,
-                        top: c.y.max(0.0) as i32,
-                        right: ((c.x + c.w).min(screen.width as f32)).max(0.0) as i32,
-                        bottom: ((c.y + c.h).min(screen.height as f32)).max(0.0) as i32,
-                    },
-                );
+                // 丸め規則は rect / line / texture と同じ `scissor_edges` に一本化する
+                // (旧実装だけ各辺独立 floor で、 同じ論理 clip でもグリフだけ 1px ずれた)。
+                let full = TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: screen.width.try_into().unwrap_or(i32::MAX),
+                    bottom: screen.height.try_into().unwrap_or(i32::MAX),
+                };
+                let bounds = area
+                    .clip_rect
+                    .map_or(full, |c| {
+                        super::scissor::scissor_edges(c, screen).map_or(
+                            // 空 clip = 何も描かない。 潰れた bounds を渡して抑止する。
+                            TextBounds { left: 0, top: 0, right: 0, bottom: 0 },
+                            |[l, t, r, b]| TextBounds {
+                                left: i32::try_from(l).unwrap_or(i32::MAX),
+                                top: i32::try_from(t).unwrap_or(i32::MAX),
+                                right: i32::try_from(r).unwrap_or(i32::MAX),
+                                bottom: i32::try_from(b).unwrap_or(i32::MAX),
+                            },
+                        )
+                    });
                 // M14 Phase 122 (daw_01 #097): box + 非 default align のときだけ実測 advance を
                 // 測って描画原点を補正。 box 無し / Left+Top は measure を skip して既存挙動。
                 let (left, top) = if area.needs_alignment() {

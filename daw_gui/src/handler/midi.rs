@@ -477,6 +477,10 @@ impl AppData {
             self.send_audio(AudioCommand::StartCountIn {
                 samples: preroll_samples,
             });
+            // Rec ボタンの残り小節数表示用。 最初の Tick が届くまでの数フレームも
+            // 正しい値 (= 満タン) を出せるよう remaining も同じ値で初期化する。
+            self.recording.count_in_total_samples = preroll_samples;
+            self.recording.count_in_remaining_samples = preroll_samples;
             self.recording.midi_recording_pending = true;
         } else {
             self.recording.midi_recording = true;
@@ -492,6 +496,8 @@ impl AppData {
             self.recording.midi_recording || self.recording.midi_recording_pending;
         self.recording.midi_recording = false;
         self.recording.midi_recording_pending = false;
+        self.recording.count_in_total_samples = 0;
+        self.recording.count_in_remaining_samples = 0;
         self.recording.midi_recording_active_notes.clear();
         if let Some(prev) =
             self.recording.metronome_enabled_pre_recording.take()

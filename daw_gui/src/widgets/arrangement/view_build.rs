@@ -19,7 +19,7 @@ use super::{
     ArrangementAutomationClip, ArrangementAutomationLane, ArrangementAutomationPoint,
     ArrangementCurveKind, ArrangementMasterRow, ArrangementStyle, ArrangementTrack, ArrangementView,
     AutomationClipKey, AutomationPointKey, ClipView, ClipViewAudioEdit, ClipKey,
-    ClipEventFade, SectionView, TrackKind,
+    ClipEventFade, SectionView, TrackKind, pixel_snapped_scroll_beat, view_len_beats,
 };
 
 /// Arranger レーン上に確保する ruler の高さ (px)。draw() の RULER_H と一致。
@@ -287,9 +287,13 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         h.finish()
     };
 
+    // r.md #53: 表示原点はデバイスピクセル境界に載せる (`clip_to_rect` が使うのと同じ
+    // `beat_to_px` で丸めるので、スクロール中は全アイテムが整数 px の剛体平行移動になる)。
+    let scroll_beat_raw = f64::from(app.ui_prefs.arrange_scroll_beat);
     let view = ArrangementView {
-        start_beat: app.ui_prefs.arrange_scroll_beat as f64,
-        len_beats: (lanes_w / zoom) as f64,
+        start_beat: pixel_snapped_scroll_beat(scroll_beat_raw, lanes_w, zoom),
+        scroll_beat_raw,
+        len_beats: view_len_beats(lanes_w, zoom),
         track_top: app.ui_prefs.arrange_track_top,
         tracks_visible: ((area.h - RULER_H) / row_h).max(1.0),
         track_row_h: row_h,

@@ -313,14 +313,10 @@ impl TexturePipeline {
                 continue;
             };
             if let Some(clip) = call.clip {
-                let l = clip.x.max(0.0);
-                let t = clip.y.max(0.0);
-                let r = (clip.x + clip.w).min(screen.width as f32);
-                let b = (clip.y + clip.h).min(screen.height as f32);
-                if r <= l || b <= t {
+                let Some((x, y, w, h)) = super::scissor::scissor_rect(clip, screen) else {
                     continue;
-                }
-                pass.set_scissor_rect(l as u32, t as u32, (r - l) as u32, (b - t) as u32);
+                };
+                pass.set_scissor_rect(x, y, w, h);
             } else {
                 pass.set_scissor_rect(0, 0, screen.width, screen.height);
             }

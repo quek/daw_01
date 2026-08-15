@@ -714,8 +714,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // S4b: widget が内部で構築する view 相当の pixel→beat 変換パラメータを AppData から直接再導出
     // (file drop / Split hover 用)。widget と同じ SSoT (`arrange_scroll_beat` / `arrange_zoom_x` /
     // `arrange_snap_config`) を読むので座標変換は完全一致する。
-    let scroll_beat = app.ui_prefs.arrange_scroll_beat as f64;
+    // r.md #53: widget 側は表示原点をピクセル境界にスナップして描くので、pixel→beat の
+    // 逆変換もスナップ後の原点を使う (= 見えている位置とドロップ / Split 位置が一致する)。
     let zoom = app.ui_prefs.arrange_zoom_x.max(1.0);
+    let scroll_beat = crate::widgets::arrangement::pixel_snapped_scroll_beat(
+        f64::from(app.ui_prefs.arrange_scroll_beat),
+        (area.w - app.ui_prefs.arrange_header_w).max(1.0),
+        zoom,
+    );
     let arr_snap = snap::arrange_snap_config(app);
     if ui.is_file_hovering_in_rect(canvas_area) {
         ui.panel_with_border(

@@ -144,7 +144,10 @@ impl RectPipeline {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // rect の fs は fill と border を **内部で合成** する唯一の pipeline なので、
+                    // 出力は premultiplied alpha でなければ辻褄が合わない (r.md #53)。
+                    // 単色を返す line / texture は straight alpha のままでよい。
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -247,14 +250,10 @@ impl RectPipeline {
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         for span in &self.spans[run.span_start as usize..run.span_end as usize] {
             if let Some(clip) = span.clip {
-                let l = clip.x.max(0.0);
-                let t = clip.y.max(0.0);
-                let r = (clip.x + clip.w).min(screen.width as f32);
-                let b = (clip.y + clip.h).min(screen.height as f32);
-                if r <= l || b <= t {
+                let Some((x, y, w, h)) = super::scissor::scissor_rect(clip, screen) else {
                     continue;
-                }
-                pass.set_scissor_rect(l as u32, t as u32, (r - l) as u32, (b - t) as u32);
+                };
+                pass.set_scissor_rect(x, y, w, h);
             } else {
                 pass.set_scissor_rect(0, 0, screen.width, screen.height);
             }

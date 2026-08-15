@@ -106,19 +106,28 @@ fn follow_glyph(mode: common::model::FollowMode) -> &'static str {
 }
 
 /// Phase 7 B4 Step C/D (2026-05-13): MIDI Record toggle button のスタイル。
-/// active 時 record red (= 業界標準) + hint band で「録音中」 を強調。
-/// count-in 中も同 active state で描画 (label 側で「Count-in...」 表示と
-/// 切り替え)。 STYLE_REC_MODE (橙、 automation recording) と意図的に
-/// 区別 (= MIDI 録音は別概念)。
+/// active 時 record red (= 業界標準) で「録音中」 を強調。 STYLE_REC_MODE
+/// (橙、 automation recording) と意図的に区別 (= MIDI 録音は別概念)。
+/// r.md #52 で Play / Loop / Follow と同じ 36px アイコンボタン (label = ●) に
+/// 揃えたので font_size も他の transport アイコンと同じ 16。
 const STYLE_RECORD: ToggleButtonStyle = ToggleButtonStyle {
     off_color: theme::CONTROL,
     on_color: theme::RECORD,
     border: theme::BORDER,
     border_width: 1.0,
     radius: 4.0,
-    font_size: 12.0,
+    font_size: 16.0,
     text_color: theme::TEXT,
     on_text_color: None,
+};
+
+/// count-in 中 (= `midi_recording_pending`) の Record button スタイル。 まだ
+/// 録音していない 「待機」 状態なので red ではなく arm 橙で染め、 label は
+/// ● の代わりに残り小節数 (2 → 1) を出す (Bitwig / Live の count-in 表示と
+/// 同 idiom)。 数字は 1 桁なので font_size は ● と同じ 16 で読める。
+const STYLE_RECORD_COUNT_IN: ToggleButtonStyle = ToggleButtonStyle {
+    on_color: theme::RECORD_ARM,
+    ..STYLE_RECORD
 };
 
 /// Phase 4: recording mode toggle の見た目。 active 時 off_color (灰)
@@ -435,6 +444,36 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     );
     x += play_w + 6.0;
 
+    // Phase 7 B4 Step C/D (2026-05-13): MIDI 録音 toggle。 active で armed
+    // track への MIDI input が clip に書き込まれる。
+    // r.md #52: 旧実装は "● Rec" / "Count-in..." のテキストラベル用に 76px を
+    // 確保していて、 実ラベル (~38px) との差が左右の余白として空いていた。 Play /
+    // Loop / Follow / Metronome と同じ 36px の正方形アイコンボタンに詰め、 位置も
+    // 再生ボタンの右隣 (= Ableton / Bitwig / Reaper の [▶][●] 並び) へ移した。
+    // count-in 中は ● の代わりに残り小節数 (2 → 1) を arm 橙で出す。
+    let rec_w = 36.0;
+    let rec_active = app.recording.midi_recording || app.recording.midi_recording_pending;
+    let count_in_left = app.recording.count_in_remaining_bars().map(|n| n.to_string());
+    let rec_label = count_in_left.as_deref().unwrap_or("\u{25CF}");
+    let rec_style = if count_in_left.is_some() {
+        &STYLE_RECORD_COUNT_IN
+    } else {
+        &STYLE_RECORD
+    };
+    ui.toggle_button_at(
+        "transport_record",
+        rec_label,
+        Rect { x, y: cy, w: rec_w, h: bh },
+        rec_active,
+        rec_style,
+        move |_| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleMidiRecording)
+            })
+        },
+    );
+    x += rec_w + 6.0;
+
     // Loop toggle: icon (⟳) + 色のコンパクトボタン。 active 時 blue に染まる。
     let loop_w = 36.0;
     let loop_active = app.transport.loop_region.enabled;
@@ -532,33 +571,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.handle_event(AppEvent::SetCountInBars(bars))
         }));
     }
-    x += count_in_w + 8.0;
-
-    // Phase 7 B4 Step C/D (2026-05-13): MIDI 録音 toggle。 active で armed
-    // track への MIDI input が clip に書き込まれる。 count-in 中は label を
-    // 「Count-in...」 に切り替えて「待機中」 を可視化。 STYLE_RECORD は
-    // 業界標準どおり record red 系。
-    // 最長ラベル "Count-in..." = 11 字 * 12 * 0.527 = 69.6px。
-    let rec_w = 76.0;
-    let rec_active = app.recording.midi_recording || app.recording.midi_recording_pending;
-    let rec_label = if app.recording.midi_recording_pending {
-        "Count-in..."
-    } else {
-        "● Rec"
-    };
-    ui.toggle_button_at(
-        "transport_record",
-        rec_label,
-        Rect { x, y: cy, w: rec_w, h: bh },
-        rec_active,
-        &STYLE_RECORD,
-        move |_| {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::ToggleMidiRecording)
-            })
-        },
-    );
-    x += rec_w + 6.0;
+    x += count_in_w + 12.0;
 
     // Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input toggle。
     // ON で MIDI 録音中の note_on pitch を Song.scale_at(playhead).snap(pitch)

@@ -24,6 +24,16 @@ pub struct RecordingState {
     /// Phase 7 B4 Step C (2026-05-13): count-in bars (0 / 1 / 2)。 transport
     /// bar の dropdown で設定、 default 0。 session-only state。
     pub count_in_bars: u8,
+    /// count-in の総 preroll サンプル数 (`start_recording` が
+    /// `AudioCommand::StartCountIn` へ送ったのと同じ値)。 残り小節数を
+    /// 「remaining / (total / bars)」 で出すための分母で、 bpm / time_sig を
+    /// 再計算せずに済ませる (count-in 中に bpm を変えても数字が飛ばない)。
+    /// count-in していないときは 0。 session-only state。
+    pub count_in_total_samples: u64,
+    /// audio engine の `preroll_remaining_samples` の GUI ミラー
+    /// (`AppEvent::Tick` が ~30Hz で更新)。 Rec ボタンの残り小節数表示の分子。
+    /// session-only state。
+    pub count_in_remaining_samples: u64,
     /// Phase 7 B4 Step D (2026-05-13): 直近 note_on の `(track_id, key) →
     /// start_beat`。 note_off 受信時に start_beat 取り出して `length_beats =
     /// playhead - start` を確定する。 stop / midi_recording 解除で clear。
@@ -96,4 +106,24 @@ pub struct RecordingState {
     /// state。 step input (recording 停止中の MIDI input) には適用しない
     /// (= pitch を「聞いて」 決める用途、 Cubase / Bitwig も同方針)。
     pub snap_live_input: bool,
+}
+
+impl RecordingState {
+    /// count-in 中に残っている小節数 (1 起算)。 count-in していなければ `None`。
+    /// transport bar の Rec ボタンが `●` の代わりにこの数字を出す
+    /// (2 → 1 と減り、 0 到達で `midi_recording` へ昇格して `●` (赤) に戻る)。
+    ///
+    /// 端数の小節は「まだ残っている」 ので切り上げる (= 1 小節目の途中なら 1)。
+    pub fn count_in_remaining_bars(&self) -> Option<u64> {
+        if !self.midi_recording_pending {
+            return None;
+        }
+        let bars = u64::from(self.count_in_bars.max(1));
+        let per_bar = self.count_in_total_samples.checked_div(bars)?;
+        if per_bar == 0 {
+            return None;
+        }
+        let remaining = self.count_in_remaining_samples.min(self.count_in_total_samples);
+        Some(remaining.div_ceil(per_bar).clamp(1, bars))
+    }
 }

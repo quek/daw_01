@@ -90,6 +90,7 @@
     fn test_view() -> ArrangementView {
         ArrangementView {
             start_beat: 0.0,
+            scroll_beat_raw: 0.0,
             len_beats: 16.0,
             track_top: 0.0,
             tracks_visible: 8.0,
@@ -2239,6 +2240,94 @@
 
 
 
+
+    // ============================================================
+    // r.md #53: 追従スクロールは整数ピクセルの剛体平行移動でなければならない
+    // ============================================================
+
+    /// 追従スクロールを連続値で少しずつ進めても、各クリップの screen x は
+    /// **整数ピクセル単位でしか動かない**。
+    ///
+    /// これが崩れると 1px 幅の枠線が毎フレーム別のサブピクセル位相で描かれ、
+    /// 「くっきり ↔ にじみ」を往復してチラつく (= ユーザー報告の症状)。
+    /// スナップは `pixel_snapped_scroll_beat` **1 箇所だけ**で行い、各アイテムの端は
+    /// 丸めない (端ごとに丸めると今度は幅が 1px 揺れる) ので、この test は同時に
+    /// 「幅がスクロールで変わらない」ことも押さえる。
+    #[test]
+    fn follow_scroll_moves_clips_by_whole_pixels() {
+        let lanes = test_lanes();
+        let zoom = 40.0_f32; // px/beat
+        // 端数だらけの開始位置を並べて、位相がクリップごとに違う状況を作る。
+        let clips = [
+            clip(1, 0.0, 4.0, "a"),
+            clip(2, 4.371, 2.5, "b"),
+            clip(3, 9.013, 1.25, "c"),
+        ];
+
+        let mut prev: Option<Vec<Rect>> = None;
+        // 1 フレームあたり 0.017 拍 (= 0.68px) ずつ進む = 整数 px に揃っていない刻み。
+        for step in 0..60 {
+            let scroll = f64::from(step) * 0.017;
+            let view = ArrangementView {
+                start_beat: pixel_snapped_scroll_beat(scroll, lanes.w, zoom),
+                len_beats: view_len_beats(lanes.w, zoom),
+                ..test_view()
+            };
+            let rects: Vec<Rect> = clips
+                .iter()
+                .map(|c| clip_to_rect(0.0, view.track_row_h, c, view, lanes))
+                .collect();
+
+            if let Some(prev) = &prev {
+                for (i, (a, b)) in prev.iter().zip(&rects).enumerate() {
+                    let dx = b.x - a.x;
+                    assert!(
+                        (dx - dx.round()).abs() < 1e-3,
+                        "step {step} clip {i}: x が {dx} px 動いた (整数でない) \
+                         — スクロール原点がピクセル境界に載っていない",
+                    );
+                    assert!(
+                        (b.w - a.w).abs() < 1e-3,
+                        "step {step} clip {i}: 幅が {} → {} と変わった",
+                        a.w,
+                        b.w,
+                    );
+                }
+                // 全クリップが同じ量だけ動く (= 剛体平行移動)。
+                let d0 = rects[0].x - prev[0].x;
+                for (i, (a, b)) in prev.iter().zip(&rects).enumerate() {
+                    assert!(
+                        ((b.x - a.x) - d0).abs() < 1e-3,
+                        "step {step} clip {i} だけ {} px 動いた (他は {d0} px)",
+                        b.x - a.x,
+                    );
+                }
+            }
+            prev = Some(rects);
+        }
+    }
+
+    /// スナップ後の原点で描いた x と、同じ原点を使う逆変換 (`px_to_beat`) が往復する。
+    /// = 「見えている位置がそのまま掴める」不変条件。
+    #[test]
+    fn snapped_view_round_trips_through_px_to_beat() {
+        let lanes = test_lanes();
+        let zoom = 40.0_f32;
+        let view = ArrangementView {
+            start_beat: pixel_snapped_scroll_beat(3.271, lanes.w, zoom),
+            len_beats: view_len_beats(lanes.w, zoom),
+            ..test_view()
+        };
+        let c = clip(1, 7.5, 2.0, "a");
+        let r = clip_to_rect(0.0, view.track_row_h, &c, view, lanes);
+        let back = px_to_beat(r.x, lanes.x, lanes.w, view);
+        assert!(
+            (back - c.start_beat).abs() < 0.01,
+            "px_to_beat({}) = {back}, expected {}",
+            r.x,
+            c.start_beat
+        );
+    }
 
     // ============================================================
     // daw_01 #071: automation clip 複数選択 (box-drag / shift-click / multi-move)

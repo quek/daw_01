@@ -1212,10 +1212,13 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
                     let mut applied_beat_px = 0.0_f32;
                     let mut applied_track_px = 0.0_f32;
                     if dx != 0.0 && beat_per_px > 1e-6 {
+                        // r.md #53: 端自動スクロールは 1 frame あたり 0〜18px の連続量なので、
+                        // スナップ済の表示原点に足すと zone 入口 (< 0.5px/frame) で端数が
+                        // 毎フレーム捨てられて一切進まなくなる。 基準は連続値のモデル側。
                         let new_start =
-                            (view.start_beat + f64::from(dx) * beat_per_px).max(0.0);
+                            (view.scroll_beat_raw + f64::from(dx) * beat_per_px).max(0.0);
                         #[allow(clippy::cast_possible_truncation)]
-                        let adx = ((new_start - view.start_beat) / beat_per_px) as f32;
+                        let adx = ((new_start - view.scroll_beat_raw) / beat_per_px) as f32;
                         if adx != 0.0 {
                             applied_beat_px = adx;
                             ui.push_edit({ let v_b = new_start; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetArrangeScroll(v_b as f32)); }) });

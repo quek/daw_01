@@ -24,6 +24,42 @@ pub fn visible_track_row_tops(
     tops
 }
 
+/// r.md #53: 水平スクロールの原点をデバイスピクセル境界に載せる。**時間軸で唯一の丸め点**。
+///
+/// 追従スクロール (`FollowMode::Scroll`) は playhead を連続値で追うので、素のままだと
+/// 全クリップの x が毎フレーム任意の小数になる。1px 幅の枠線はサブピクセル位相によって
+/// 「1 列くっきり ↔ 2 列に分かれてにじむ」を往復するので、これが左右エッジのチラつきに
+/// 見える (`rect.wgsl` の AA を直しても、位相が動き続ける限り鮮鋭度は脈動する)。
+///
+/// ブラウザの合成器 (Firefox bug 1451439 / Chromium の RenderingIndependentScrollOffsets)
+/// も Ardour の canvas も、**共有される平行移動を 1 箇所だけ丸める** ことでこれを避ける。
+/// ここがその 1 箇所で、描画も hit-test も必ずこの戻り値を経由する。
+///
+/// **各アイテムの端は丸めない**。端ごとに丸めると幅が 1px 揺れるうえ、line で描く
+/// グリッド線と rect で描くクリップ枠で丸め規則が分裂する (= Firefox 1451439 の
+/// root cause そのもの)。原点だけ整数にすれば、スクロール中の全要素は整数ピクセルの
+/// **剛体平行移動**になり、各要素のサブピクセル位相は固定される。
+///
+/// モデル側 (`ui_prefs.arrange_scroll_beat`) は連続値のまま保つ (追従の計算と表示の
+/// 丸めを混ぜない)。
+/// `lanes_w` / `zoom` から `clip_to_rect` と**同一の** `beat_to_px` を導くので、
+/// 呼び出し側 (view_build / file drop の逆変換) は必ずここを通す。
+#[must_use]
+pub fn pixel_snapped_scroll_beat(scroll_beat: f64, lanes_w: f32, zoom: f32) -> f64 {
+    let beat_to_px = f64::from(lanes_w) / view_len_beats(lanes_w, zoom).max(1e-6);
+    if !beat_to_px.is_finite() || beat_to_px <= 0.0 {
+        return scroll_beat;
+    }
+    (scroll_beat * beat_to_px).round() / beat_to_px
+}
+
+/// `ArrangementView::len_beats` (= lanes 幅に収まる拍数)。`clip_to_rect` の
+/// `beat_to_px = lanes.w / len_beats` と対で 1 つの写像を成す。
+#[must_use]
+pub fn view_len_beats(lanes_w: f32, zoom: f32) -> f64 {
+    f64::from(lanes_w / zoom)
+}
+
 /// (track_row_top, track_row_h, clip) → screen rect (lanes 範囲、horizontal clip 形状)。
 /// M14 Phase 63n-1 (#028): row_top は caller が `tops[visible_idx]` で渡す前提
 /// (lane 込みの prefix sum)。 `track_row_h` は **MIDI/Audio clip 行の高さのみ** (= `view.track_row_h`、

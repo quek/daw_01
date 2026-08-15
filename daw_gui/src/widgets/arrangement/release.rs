@@ -1079,8 +1079,10 @@ pub(super) fn commit_releases(
                     }
                 }
             } else if pointer.modifiers.shift && over_lanes {
+                // r.md #53: 差分加算の基準は **スナップ前** の連続値。 表示原点
+                // (view.start_beat) に足すと 1px 未満の端数が毎フレーム捨てられる。
                 let delta = -f64::from(dy) * beat_per_px * 4.0;
-                ui.push_edit({ let v_b = view.start_beat + delta; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetArrangeScroll(v_b as f32)); }) });
+                ui.push_edit({ let v_b = view.scroll_beat_raw + delta; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::SetArrangeScroll(v_b as f32)); }) });
             } else if !pointer.modifiers.ctrl && !pointer.modifiers.shift {
                 // plain wheel (= 縦 scroll)。 header / lanes どちらの上でも同一挙動。 `!ctrl && !shift`
                 // guard は header 上で横操作キーが押されているときに plain scroll へ落ちないため

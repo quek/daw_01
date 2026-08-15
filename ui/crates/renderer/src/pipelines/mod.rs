@@ -11,6 +11,7 @@
 pub mod glyph;
 pub mod line;
 pub mod rect;
+pub mod scissor;
 pub mod text_effect;
 pub mod texture;
 

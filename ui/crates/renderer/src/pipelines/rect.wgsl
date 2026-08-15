@@ -44,6 +44,13 @@ fn quad_corner(idx: u32) -> vec2<f32> {
     return t[idx];
 }
 
+// AA fade 領域を geometry の外側に確保する幅 (px)。 これが無いと矩形の境界を
+// またぐピクセルは fragment がそもそも raster されず、 被覆率 (= 部分的な alpha)
+// を出せない。 line.wgsl:51-54 が「bar grid の特定 bar だけ消える」 症状の
+// root cause として同じ拡張を既に持っている。 rect だけ取り残されていたのが
+// 「オートスクロールでクリップの左右がチラつく」 (r.md #53) の主因。
+const AA_PAD: f32 = 1.0;
+
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32, in: VsIn) -> VsOut {
     let corner = quad_corner(vid);
@@ -52,8 +59,12 @@ fn vs_main(@builtin(vertex_index) vid: u32, in: VsIn) -> VsOut {
     let w = in.pos.z;
     let h = in.pos.w;
 
-    let px = left + corner.x * w;
-    let py = top + corner.y * h;
+    // quad は矩形より各辺 AA_PAD だけ大きい。 local_uv は矩形基準のまま
+    // (= [-AA_PAD, size + AA_PAD]) に保つので SDF の意味は変わらない。
+    let ex_w = w + 2.0 * AA_PAD;
+    let ex_h = h + 2.0 * AA_PAD;
+    let px = left - AA_PAD + corner.x * ex_w;
+    let py = top - AA_PAD + corner.y * ex_h;
 
     // 物理ピクセル -> NDC (左上原点 -> 左下原点)
     let ndc_x = (px / screen.size.x) * 2.0 - 1.0;
@@ -61,7 +72,7 @@ fn vs_main(@builtin(vertex_index) vid: u32, in: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip_pos = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
-    out.local_uv = vec2<f32>(corner.x * w, corner.y * h);
+    out.local_uv = vec2<f32>(corner.x * ex_w - AA_PAD, corner.y * ex_h - AA_PAD);
     out.size = vec2<f32>(w, h);
     out.fill = in.fill;
     out.border = in.border;
@@ -94,26 +105,38 @@ fn rounded_box_sdf(p: vec2<f32>, size: vec2<f32>, r_tl: f32, r_tr: f32, r_br: f3
     return outside + inside - r;
 }
 
+// 符号付き距離 d (px、 内側が負) の位置にある 1 ピクセルの被覆率。
+// `clamp(0.5 - d, 0, 1)` は直線エッジに対する 1px box filter の厳密解で、
+// 隣り合う 2 ピクセルの被覆の和が常に 1 になる (= インク保存)。 旧実装の
+// `1 - smoothstep(-1, 0, d)` は「図形の内側だけ」 の片側ランプで、 (a) 半ピクセル
+// 内側にずれる、 (b) 幅 1px の帯では位相によって総インクが 0 〜 0.5 に振動する、
+// の 2 つの欠陥があった。
+fn coverage(d: f32) -> f32 {
+    return clamp(0.5 - d, 0.0, 1.0);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let d = rounded_box_sdf(in.local_uv, in.size, in.r_tl, in.r_tr, in.r_br, in.r_bl);
 
-    // アンチエイリアス幅 (1 ピクセル目安)
-    let aa = 1.0;
+    // 図形全体の被覆と、 ボーダーの内側 (= fill だけの領域) の被覆。 差がボーダー帯の
+    // 被覆になる。 この差分方式なら任意の位相・任意の border_w で帯の総インクが
+    // border_w に厳密一致する (border_w = 0 なら自動的に 0 なので分岐も要らない)。
+    let a_shape = coverage(d);
+    let a_inner = coverage(d + max(in.border_w, 0.0));
+    let a_band = max(a_shape - a_inner, 0.0);
 
-    // fill alpha: SDF<=0 で 1, 境界付近で smoothstep
-    let fill_alpha = 1.0 - smoothstep(-aa, 0.0, d);
-    var color = in.fill * fill_alpha;
+    // 帯の中では border が fill の上に乗る (旧実装の mix と同じ意味)。
+    let ba = in.border.a;
+    let fa = in.fill.a;
+    let band_a = ba + fa * (1.0 - ba);
+    let band_rgb = in.border.rgb * ba + in.fill.rgb * fa * (1.0 - ba);
 
-    // ボーダー: 境界 d=0 から内側 -border_w までを線で塗る
-    if (in.border_w > 0.0 && in.border.a > 0.0) {
-        let bw = in.border_w;
-        // 帯の中心 d = -bw/2、幅 bw
-        let band = abs(d + bw * 0.5);
-        let border_alpha = 1.0 - smoothstep(bw * 0.5 - aa, bw * 0.5, band);
-        // ボーダーは fill に上書き
-        color = mix(color, in.border, border_alpha * in.border.a);
-    }
-
-    return color;
+    // 帯と内側は幾何的に排他なので、 被覆で重み付けして足せばよい。 出力は
+    // premultiplied alpha (pipeline 側 blend も PREMULTIPLIED_ALPHA_BLENDING)。
+    // 旧実装は premultiplied な色を straight alpha の blend に流していたため、
+    // エッジ 1 列が被覆率の 2 乗で暗くなっていた。
+    let out_rgb = band_rgb * a_band + in.fill.rgb * fa * a_inner;
+    let out_a = band_a * a_band + fa * a_inner;
+    return vec4<f32>(out_rgb, out_a);
 }

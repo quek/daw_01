@@ -65,6 +65,7 @@ use geometry::*;
 mod render;
 mod release;
 mod run;
+pub use geometry::{pixel_snapped_scroll_beat, view_len_beats};
 pub use run::arrangement;
 
 // ============================================================
@@ -501,8 +502,21 @@ pub struct ArrangementMasterRow {
 /// arrangement の view 状態 (pan / zoom / playhead / loop)。値渡し (Copy)。
 #[derive(Clone, Copy, Debug)]
 pub struct ArrangementView {
-    /// 表示 left の拍 (浮動小数で smooth scroll)。
+    /// **表示原点**の拍。モデルのスクロール量 ([`Self::scroll_beat_raw`]) を
+    /// デバイスピクセル境界へスナップした値 ([`pixel_snapped_scroll_beat`])。
+    /// 描画も hit-test もすべてこちらを使う (= 見えている位置がそのまま掴める)。
+    ///
+    /// r.md #53: スナップしないと追従スクロール中に全クリップの x が毎フレーム任意の
+    /// 小数になり、1px 枠線の鮮鋭度が脈動してチラつく。
     pub start_beat: f64,
+    /// モデルが持つ**連続値**のスクロール位置 (拍、`ui_prefs.arrange_scroll_beat`)。
+    ///
+    /// スクロール量を**差分で**更新する経路 (ホイール横スクロール / ドラッグ中の端
+    /// 自動スクロール) だけがこちらを基準にする。スナップ済の [`Self::start_beat`] に
+    /// 差分を足すと 1px 未満の端数が毎フレーム捨てられ、低速の自動スクロールが
+    /// まったく進まなくなる。ブラウザの「layout scroll offset (連続) と visual scroll
+    /// offset (ピクセルスナップ済)」と同じ役割分担。
+    pub scroll_beat_raw: f64,
     /// 表示する拍範囲 (= zoom 倍率の逆数)。
     pub len_beats: f64,
     /// 縦 scroll offset (px、smooth)。`track_top = 0.0` で first track が lanes 上端。
@@ -546,6 +560,7 @@ impl Default for ArrangementView {
     fn default() -> Self {
         Self {
             start_beat: 0.0,
+            scroll_beat_raw: 0.0,
             len_beats: 16.0,
             track_top: 0.0,
             tracks_visible: 8.0,

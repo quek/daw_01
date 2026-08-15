@@ -255,6 +255,8 @@ impl AppData {
                 midi_recording: false,
                 midi_recording_pending: false,
                 count_in_bars: 0,
+                count_in_total_samples: 0,
+                count_in_remaining_samples: 0,
                 midi_recording_active_notes: std::collections::HashMap::new(),
                 metronome_enabled_pre_recording: None,
                 midi_learn_target: None,
@@ -1349,12 +1351,13 @@ impl AppData {
                 // Phase 7 B4 Step C: preroll mirror で count-in 完了を検知。
                 // midi_recording_pending == true かつ preroll == 0 なら、
                 // midi_recording に昇格して以後の MIDI input を armed track に
-                // 書き込む。
+                // 書き込む。 残量そのものは transport の Rec ボタンが
+                // 「残り小節数」 を出すのに使う (count_in_remaining_bars)。
+                self.recording.count_in_remaining_samples = preroll;
                 if self.recording.midi_recording_pending && preroll == 0 {
                     self.recording.midi_recording_pending = false;
                     self.recording.midi_recording = true;
                 }
-                let _ = preroll;  // 上で消費
                 self.on_tick(samples, peak_l, peak_r);
             }
             AppEvent::SetTrackVolume { track, amp } => {
