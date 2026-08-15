@@ -411,6 +411,13 @@ impl AppData {
                 #[cfg(windows)]
                 main_window_hwnd: None,
             },
+            // r.md #49: 起動直後は「アクティブ」から始める。winit は起動時の
+            // `Focused(true)` を必ずしも送らないので、false 始まりだと最初の
+            // クリックまで画面が描かれない。
+            activity: crate::state::ActivityState {
+                main_focused: true,
+                ..Default::default()
+            },
         };
         // recent_files / recent_saved の path 列から filename label cache を
         // 1 回構築。 push_recent / push_recent_saved 経由の更新でも自動的に

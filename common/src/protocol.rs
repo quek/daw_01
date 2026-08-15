@@ -297,6 +297,14 @@ pub enum AudioCommand {
     },
     /// メトロノーム on/off。 session-only state。
     SetMetronomeEnabled(bool),
+    /// r.md #49: daw_01 の窓 (メイン / 動画プレビュー / プラグインエディタ) のいずれかが
+    /// アクティブか。daw_gui が唯一の判定者で、**事実だけ**を運ぶ。
+    ///
+    /// engine を park するかどうかは engine 側が決める (再生中 / count-in / 書き出し中 /
+    /// 出力が無音か、を engine だけが知っているため)。GUI 側の `transport.is_playing` は
+    /// Rec 単独の録音中に立たない (`daw_gui::handler::midi::start_recording`) ので、
+    /// 「停止中か」の判断を GUI から送ると録音中に音を切ってしまう。
+    SetAppActive(bool),
     /// 鍵盤レーン click のピッチプレビュー単発 note-on。 `track_id` は
     /// stable `Track::id`。 transport 状態に関係なく発音する。
     PreviewNoteOn {
@@ -514,6 +522,16 @@ pub enum PluginEvent {
     /// - VSTGUI 等はフレーム窓が `WM_GETDLGCODE` に応答しない一方、 文字編集中は本物の
     ///   Win32 EDIT を生成するので、 フォーカス窓への `WM_GETDLGCODE` 問い合わせで判別できる。
     EditorKey { device_id: u64, chord: KeyChord },
+    /// r.md #49: このプロセスが所有する窓 (= プラグインエディタ) がアクティブになった /
+    /// 非アクティブになった。`WM_ACTIVATEAPP` 由来。
+    ///
+    /// エディタ窓は **daw_plugin_host が所有する owner 無し top-level** で、daw_gui を
+    /// owner にすることは設計上禁止されている (`GetAncestor(GA_ROOTOWNER)` が daw_gui に
+    /// 解決すると JUCE の cascade サブメニューが `isForegroundProcess()` 判定で即 dismiss
+    /// される — `daw_plugin_host::editor_window` の冒頭コメント)。よって「プラグイン GUI を
+    /// 触っている間もアプリはアクティブ」を daw_gui 内の情報だけで判定することは**原理的に
+    /// できず**、このプロセスが自分で報告するしかない。
+    HostWindowsActive(bool),
     /// Reply to `PluginCommand::ReinitAllPlugins`.
     PluginsReinitDone,
     /// builtin VOICEVOX の歌唱合成が `PrepareVocalSynth` で要求した世代まで
@@ -684,6 +702,21 @@ mod tests {
     fn load_song_roundtrip() {
         let msg = AudioCommand::LoadSong(crate::model::Song::default());
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    /// r.md #49: アイドル省電力の 2 本の新 wire。
+    #[test]
+    fn idle_power_roundtrip() {
+        for active in [true, false] {
+            assert_eq!(
+                roundtrip(&AudioCommand::SetAppActive(active)),
+                AudioCommand::SetAppActive(active)
+            );
+            assert_eq!(
+                roundtrip(&PluginEvent::HostWindowsActive(active)),
+                PluginEvent::HostWindowsActive(active)
+            );
+        }
     }
 
     /// wire を渡る `Song` は blob-less であること (`PluginInstance` の手書き

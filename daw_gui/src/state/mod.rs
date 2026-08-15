@@ -13,8 +13,10 @@ pub mod media;
 pub mod recording;
 pub mod ui_prefs;
 pub mod ui_ephemeral;
+pub mod activity;
 
 pub use song_doc::{EditScope, SongDoc, StreamGesture};
+pub use activity::ActivityState;
 pub use transport::TransportState;
 pub use selection::SelectionState;
 pub use ipc::IpcState;
@@ -44,6 +46,8 @@ pub struct AppData {
     pub ui_prefs: UiPrefs,
     /// 一時 UI 状態 (hover / picker / rename / menu / modal / scrub)。
     pub ui_ephemeral: UiEphemeral,
+    /// r.md #49: アプリの窓がアクティブか (省電力判定の材料)。
+    pub activity: ActivityState,
 }
 
 impl AppData {

@@ -100,6 +100,8 @@ pub struct UiHost<M: ?Sized + 'static> {
     /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだ場合の累積フラグ。
     /// `frame()` の最後で `redraw_request` 呼び出し条件に含まれる。
     redraw_requested_in_last_frame: bool,
+    /// 自動 `request_redraw` を抑止しているか ([`Self::set_redraw_suppressed`])。
+    redraw_suppressed: bool,
     /// M8 Phase 30: shortcut 登録テーブル。
     shortcut_map: ShortcutMap,
     /// M8 Phase 31: OS clipboard provider (None なら set/get は no-op)。
@@ -218,6 +220,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             redraw_request: Box::new(redraw_request),
             open_popups: HashMap::new(),
             redraw_requested_in_last_frame: false,
+            redraw_suppressed: false,
             shortcut_map: ShortcutMap::with_default_bindings(),
             clipboard: None,
             pending_dialog_results: HashMap::new(),
@@ -333,6 +336,25 @@ impl<M: ?Sized + 'static> UiHost<M> {
     /// テスト / offscreen render 用、`request_redraw` を呼ばない UiHost を構築する。
     pub fn no_redraw() -> Self {
         Self::new(|| {})
+    }
+
+    /// 自動 `request_redraw` を抑止する / 解除する。
+    ///
+    /// `frame()` 末尾の自動 redraw は、edits / focus 変化に加えて **widget が
+    /// `Ui::request_redraw` で要求した継続アニメ** (レベルメーターの減衰・
+    /// peak hold、scroll / tab のトランジション等) でも発火する。これは
+    /// 「見えている画面を滑らかに保つ」ためのもので、利用者側が省電力等で
+    /// **「今この画面は誰も見ていないので描かない」** と決めているときには
+    /// 逆効果になる — widget は自分が見えているかを知らないので、要求を出し続ける。
+    ///
+    /// `true` の間は自動 redraw を呼ばないので、「描くかどうか」の判断を
+    /// 利用者側の 1 箇所に集約できる。**解除した側が次のフレームを要求する責任を負う**
+    /// (抑止中に溜まった要求は再生されない)。
+    ///
+    /// 入力イベント由来の再描画は利用者が直接 `WindowBackend::request_redraw` を
+    /// 呼ぶ経路なので、これには影響されない。
+    pub fn set_redraw_suppressed(&mut self, suppressed: bool) {
+        self.redraw_suppressed = suppressed;
     }
 
     /// `frame()` 末尾で cursor 要求を受け取る sink を差し込む。通常は `with_window` が
@@ -477,11 +499,12 @@ impl<M: ?Sized + 'static> UiHost<M> {
 
         // 自動 redraw の発火条件: edits / focus 変化 / widget からの request_redraw
         // / dialog 実行 (新結果が出た) / 残っている dialog 結果 (widget が次フレームで取り出す)。
-        if had_edits
-            || self.focus_changed_in_last_frame
-            || self.redraw_requested_in_last_frame
-            || dialog_runs
-            || !self.pending_dialog_results.is_empty()
+        if !self.redraw_suppressed
+            && (had_edits
+                || self.focus_changed_in_last_frame
+                || self.redraw_requested_in_last_frame
+                || dialog_runs
+                || !self.pending_dialog_results.is_empty())
         {
             (self.redraw_request)();
         }

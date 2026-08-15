@@ -258,9 +258,22 @@ fn run_gui(
             // resource monitor (r.md #3): per-plugin CPU の直接読み出し用に
             // MetricsBridge ハンドルを AppData へ持たせる。
             app.ipc.metrics_bridge = Some(Arc::clone(&metrics));
+            // r.md #49: smoke test は preview 窓を `PrintWindow` で pixel capture して
+            // 検証する。窓がフォーカスを得るかは実行環境次第なので、省電力で描画が
+            // 止まると「真っ黒 = 視覚回帰」と誤検出しうる。検証対象は描画結果なので
+            // この経路だけアクティブ判定を固定する。
+            app.activity.force_active = smoke_test_fixture.is_some() || smoke_test_text;
 
-            spawn_playhead_poller(bridge, Arc::clone(&metrics), proxy.clone());
-            spawn_resource_sysinfo_poller(proxy.clone());
+            // r.md #49: 省電力中は背景 poller 自身に止まってもらう
+            // (`AppData` 側が毎イベントで最新値を書き込む共有フラグ)。
+            let awake = Arc::clone(&app.activity.awake);
+            spawn_playhead_poller(
+                bridge,
+                Arc::clone(&metrics),
+                proxy.clone(),
+                Arc::clone(&awake),
+            );
+            spawn_resource_sysinfo_poller(proxy.clone(), awake);
             spawn_autosave_timer(proxy.clone());
             spawn_midi_input(proxy.clone());
             spawn_incoming_bridge(incoming_rx, proxy.clone());
@@ -371,16 +384,42 @@ fn spawn_autosave_timer(proxy: EventLoopProxy<AppEvent>) {
     });
 }
 
+/// r.md #49: 省電力中の poll 間隔。
+///
+/// 完全に止めないのは `on_tick` に同居する 3 つの watchdog (panic 遅延 reinit /
+/// 書き出し 60s / plugin state round-trip) を生かしておくため — いずれも閾値が
+/// 秒オーダーなので数 Hz で足りる。
+///
+/// 1 秒まで伸ばさないのは**復帰の応答性**のため。フォーカスが戻っても、寝ている
+/// スレッドは起きるまで間隔ぶん待つので、そのまま復帰後のメーター / プレイヘッドの
+/// 遅れになる。値が変わらなければ再描画は起きない (指紋比較) ので、この頻度の
+/// 起床自体はほぼ無コスト。30Hz のうち 7/8 の起床が消える。
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// リソースモニターの表示更新レート。ステータスバーの読み値 (整数パーセント) は
+/// 毎 tick 揺れるので、30Hz で流すと **停止中でも DSP% が変わるだけで全画面を
+/// 30fps 描き直す**ことになる。表示に必要なのは数 Hz なので tick を間引く
+/// (REAPER が `Meter update frequency` を別設定に持っているのと同じ理由)。
+const METRICS_TICK_DIVISOR: u32 = 8;
+
 fn spawn_playhead_poller(
     bridge: Arc<AudioBridgeHandle>,
     metrics: Arc<MetricsBridgeHandle>,
     proxy: EventLoopProxy<AppEvent>,
+    awake: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let mut peaks_buf: Vec<(f32, f32)> = Vec::with_capacity(common::audio_bridge::MAX_TRACKS);
         let mut mod_buf: Vec<f32> = Vec::with_capacity(common::audio_bridge::MAX_MOD_SOURCES);
+        let mut tick_count: u32 = 0;
         loop {
-            std::thread::sleep(Duration::from_millis(33));
+            let awake_now = awake.load(std::sync::atomic::Ordering::Acquire);
+            std::thread::sleep(if awake_now {
+                Duration::from_millis(33)
+            } else {
+                IDLE_POLL_INTERVAL
+            });
+            tick_count = tick_count.wrapping_add(1);
             let samples = bridge.playhead_samples();
             let (peak_l, peak_r) = bridge.peaks();
             let preroll = bridge.preroll_remaining();
@@ -418,7 +457,11 @@ fn spawn_playhead_poller(
                 break;
             }
             // resource monitor (r.md #3): DSP load (peak は swap でリセット) /
-            // xrun / buffer を同じ 30Hz tick で読み UI へ流す。
+            // xrun / buffer を読み UI へ流す。
+            // r.md #49: 表示レートは playhead より低くてよいので間引く。
+            if !tick_count.is_multiple_of(METRICS_TICK_DIVISOR) {
+                continue;
+            }
             let (buffer_frames, sample_rate) = metrics.buffer_info();
             if proxy
                 .send_event(AppEvent::MetricsTick {
@@ -439,12 +482,21 @@ fn spawn_playhead_poller(
 /// resource monitor (r.md #3): daw_01 セッション (daw_gui + 子プロセス群) の
 /// system CPU% と常駐メモリを sysinfo で ~1Hz ポーリングし UI へ流す。 DSP load
 /// とは別物の「アプリ全体の重さ」。 RT パス外の専用スレッド。
-fn spawn_resource_sysinfo_poller(proxy: EventLoopProxy<AppEvent>) {
+fn spawn_resource_sysinfo_poller(
+    proxy: EventLoopProxy<AppEvent>,
+    awake: Arc<std::sync::atomic::AtomicBool>,
+) {
     std::thread::spawn(move || {
         let self_pid = sysinfo::get_current_pid().ok();
         let mut sys = sysinfo::System::new();
         loop {
             std::thread::sleep(Duration::from_millis(1000));
+            // r.md #49: `refresh_processes(All)` は**全プロセス列挙**で、この
+            // poller の中で圧倒的に重い。省電力中は読み手 (リソースモニター) が
+            // 見えていないので、送るのを止めるのではなく **poll 自体をしない**。
+            if !awake.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
             sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             let Some(self_pid) = self_pid else {
                 continue;

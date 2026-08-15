@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
     let (bundle_tx, bundle_rx) = rtrb::RingBuffer::<RtBundle>::new(8);
     let (bundle_recycle_tx, bundle_recycle_rx) = rtrb::RingBuffer::<RtBundle>::new(64);
 
-    let _stream = start_output_stream(
+    let stream = start_output_stream(
         Arc::clone(&shared),
         Arc::clone(&engine_shared),
         Arc::clone(&bridge),
@@ -120,6 +120,13 @@ async fn main() -> Result<()> {
     )
     .context("failed to start audio stream")?;
     tracing::info!("audio stream running");
+    // r.md #49: 以後 stream の pause / play は `ParkDriver` 経由でのみ行う
+    // (park を要求する CPAL コールバックと、解除を要求する receive loop の
+    // 2 系統を 1 本の Mutex に直列化する)。
+    let park: Park = Arc::new(std::sync::Mutex::new(ParkDriver {
+        stream,
+        parked: false,
+    }));
 
     // Split the pipe so the receive loop can keep reading while the
     // export thread (off-tokio) ships completion notifications back to
@@ -139,7 +146,12 @@ async fn main() -> Result<()> {
     // plan §4: RT からは pipe に書けない (I/O 禁止) ので、 quarantine / pool
     // stall / MMCSS 失敗のフラグを 100ms 周期で poll して GUI へ通知する
     // 専用スレッド。 dedup は per-entry / per-rig の AtomicBool swap。
-    spawn_notify_thread(Arc::clone(&engine_shared), out_tx.clone());
+    spawn_notify_thread(
+        Arc::clone(&engine_shared),
+        out_tx.clone(),
+        Arc::clone(&shared),
+        Arc::clone(&park),
+    );
 
     // Background decode worker (r.md #7 decode 再設計 B): keeps large WAV
     // decodes off the tokio receive loop. The receive loop publishes a
@@ -165,6 +177,7 @@ async fn main() -> Result<()> {
         decode_tx,
         bundle_tx,
         bundle_recycle_rx,
+        park,
     )
     .await;
     tracing::info!("daw_audio exiting");
@@ -315,19 +328,109 @@ fn deliver_stretch_engines(
     }
 }
 
+/// r.md #49: CPAL stream の park / resume を直列化する唯一の口。
+///
+/// park を要求するのは CPAL コールバック (無音アイドルの検出者)、解除を要求するのは
+/// receive loop (コマンドの受け手) と、所有者が 2 つに割れる。どちらも非 RT スレッド
+/// なので Mutex で 1 本化し、「今 pause 済みか」をこの中だけが持つ状態にする
+/// (2 箇所が別々に `Stream` を触ると、pause と play が入れ違って **無音のまま
+/// 起きてこない** = 最悪の失敗モードになる)。
+///
+/// コールバック自身は stream を触れない (cpal のコマンドキュー経由なので
+/// コールバック内から呼ぶとデッドロックしうる) ため、要求は atomic フラグで渡す。
+struct ParkDriver {
+    stream: cpal::Stream,
+    parked: bool,
+}
+
+impl ParkDriver {
+    /// stream を `want` の状態へ遷移させる (既にその状態なら何もしない)。
+    /// **呼び出し側が Mutex を保持していること** — 「今どちらか」の判定と実際の
+    /// pause / play が割り込まれると、pause と play が入れ違って無音のまま
+    /// 起きてこなくなる。
+    fn apply(&mut self, engine_shared: &EngineShared, want: bool) {
+        if self.parked == want {
+            return;
+        }
+        let result = if want {
+            self.stream.pause().map_err(|e| e.to_string())
+        } else {
+            self.stream.play().map_err(|e| e.to_string())
+        };
+        match result {
+            Ok(()) => {
+                self.parked = want;
+                if !want {
+                    engine_shared.live_parked.store(false, Ordering::Release);
+                }
+                tracing::info!(parked = want, "audio stream park state changed");
+            }
+            // 失敗しても状態は変えないので、次の reconcile で再試行される。
+            // デバイス消失等の恒常障害は CPAL の error callback が別途上げる。
+            Err(e) => tracing::error!(
+                error = %e,
+                want_parked = want,
+                "failed to change audio stream park state"
+            ),
+        }
+    }
+}
+
+// `cpal::Stream` は wasapi backend で `Send + Sync`
+// (`cpal-0.17.1/src/host/wasapi/stream.rs:40,49`)。Mutex 越しに 2 スレッドから
+// pause / play を出すのはこの保証に依存している。
+type Park = Arc<std::sync::Mutex<ParkDriver>>;
+
+/// `park_requested` が指す状態へ stream を寄せる (reconciler)。notify thread が
+/// 100ms ごとに呼ぶ。
+///
+/// **要求の読み取りを Mutex の中で行う**のが要点。外で読むと、`wake_stream` が
+/// 要求を取り下げた**後**に古い `true` で pause してしまい、再生中に音が止まる。
+///
+/// 「要求 → 追従」の形にしておくと、コールバックが要求を取り下げただけの場合
+/// (= IPC を伴わずにアイドルが崩れた) も次の周回で自然に復帰する。
+fn reconcile_park(park: &Park, shared: &SharedState, engine_shared: &EngineShared) {
+    let mut d = park
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let want = shared.park_requested.load(Ordering::Acquire);
+    d.apply(engine_shared, want);
+}
+
+/// park 要求を取り下げて即座に起こす。receive loop がコマンド受信時に呼ぶ。
+///
+/// reconciler を待たずにここで起こすのは応答性のため (最大 100ms 遅れると
+/// 「Play を押してから音が出るまで一拍おく」になる)。要求の取り下げを先に
+/// 行うので、同時に走っている reconciler が pause 側へ倒すことはない。
+fn wake_stream(park: &Park, shared: &SharedState, engine_shared: &EngineShared) {
+    shared.park_requested.store(false, Ordering::Release);
+    shared.idle_silent_samples.store(0, Ordering::Release);
+    let mut d = park
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    d.apply(engine_shared, false);
+}
+
 /// plan §4: quarantine / pool stall / MMCSS 失敗フラグを 100ms 周期で poll
 /// して GUI へ `AudioEvent` を送る通知スレッド (RT からは atomic store のみ)。
 /// フラグの SSoT は `PluginEntry` / `WorkerRig` / `EngineShared` 上の
 /// AtomicBool で、 dedup は `*_notified` の swap。
+///
+/// r.md #49: アイドル park の実行もここが担う (コールバックは atomic を立てるだけ)。
 fn spawn_notify_thread(
     engine_shared: Arc<EngineShared>,
     out_tx: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
+    shared: Arc<SharedState>,
+    park: Park,
 ) {
     let _ = std::thread::Builder::new()
         .name("audio-notify".to_string())
         .spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
+                // r.md #49: stream の状態をコールバックの park 要求へ追従させる。
+                // pause 側 (アイドル検出) も play 側 (要求の取り下げ) もここが拾う。
+                reconcile_park(&park, &shared, &engine_shared);
                 // CPAL callback の MMCSS join 失敗の one-shot warn (RT では
                 // tracing を出せないのでここで代行)。
                 if engine_shared.mmcss_join_failed.load(Ordering::Acquire)
@@ -650,6 +753,7 @@ async fn recv_loop(
     decode_tx: std::sync::mpsc::Sender<DecodeJob>,
     bundle_tx: rtrb::Producer<RtBundle>,
     mut bundle_recycle_rx: rtrb::Consumer<RtBundle>,
+    park: Park,
 ) {
     let mut publisher = BundlePublisher::new(bundle_tx);
     let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
@@ -686,11 +790,32 @@ async fn recv_loop(
                 }
             }
         };
+        // r.md #49: park 中に届いたコマンドは、それが何であれ「エンジンに仕事が
+        // 生じた」合図なので stream を起こしてから処理する。`Play` のとき /
+        // preview のとき / 書き出しのとき… と列挙すると、コマンドが増えるたびに
+        // 起こし忘れる「補償コード」(アーキテクチャ不変条件 1 が禁じる形) になる。
+        //
+        // 例外は `SetAppActive(false)` だけ — これは park 要求そのもの。
+        // 起こしたあと条件がまだ揃っていれば、コールバックが改めて数え直して
+        // 再び park するので、余分に起きても害はない。
+        if !matches!(msg, Ok(AudioCommand::SetAppActive(false))) {
+            wake_stream(&park, &shared, &engine_shared);
+        }
         match msg {
             // Handshake 済みの再送 Ack / Session は no-op (Session は起動時に
             // `read_audio_session` が消費済み — shmem 名と format はプロセス
             // 生存中不変)。
             Ok(AudioCommand::Ack) | Ok(AudioCommand::Session(_)) => {}
+            // r.md #49: アプリの窓がアクティブかの報告。park してよいかの判断は
+            // engine 側 (`buffer_is_idle`) が行うので、ここは事実の反映のみ。
+            Ok(AudioCommand::SetAppActive(active)) => {
+                shared.app_active.store(active, Ordering::Release);
+                if active {
+                    // 猶予カウンタを畳んでおく (非アクティブ→アクティブ→非アクティブ
+                    // と往復したとき、前回の途中まで数えた分から再開しない)。
+                    shared.idle_silent_samples.store(0, Ordering::Release);
+                }
+            }
             Ok(AudioCommand::Play) => {
                 tracing::info!("received Play");
                 shared
@@ -1556,6 +1681,8 @@ fn build_stream(
     let mut declick_released_at: Option<u64> = None;
     // resource monitor (r.md #3): DSP load average の EMA 状態。 callback 間で保持。
     let mut dsp_load_ema: f32 = 0.0;
+    // r.md #49: アイドル park に入るまでの連続無音サンプル数。
+    let idle_park_samples = sr64 * engine::IDLE_PARK_DELAY_SECS;
     // E (plan §5): callback thread を MMCSS "Pro Audio" に自前 join する
     // one-shot フラグ (per-thread once — CPAL は単一 stream thread で callback
     // を直列に呼ぶ)。
@@ -1676,6 +1803,59 @@ fn build_stream(
                 // 音切れではないため除外する (`local.playing` = 今 buffer が rolling か)。
                 if load > 1.0 && local.playing {
                     metrics.add_xrun();
+                }
+
+                // r.md #49: アイドル park の判定。atomic の読み書きだけなので RT 安全。
+                //
+                // 「無音」を条件に含めているので、リバーブの残響や自走プラグイン
+                // (VCV Rack 等) が鳴っている間はカウンタが進まない = 音が途中で
+                // ブツッと切れることは構造的に起きない。
+                //
+                // **コールバックの最後に置くこと** — publish を 0 に畳む処理が、
+                // 上の meters / DSP load publish に上書きされてはならない。
+                let idle = engine::buffer_is_idle(
+                    shared.app_active.load(Ordering::Acquire),
+                    local.playing,
+                    local.shared.preroll_remaining_samples.load(Ordering::Acquire),
+                    local.shared.export_running.load(Ordering::Acquire),
+                    peak_l,
+                    peak_r,
+                );
+                let idle_n = engine::advance_idle_counter(
+                    &shared.idle_silent_samples,
+                    idle,
+                    frames as u64,
+                );
+                if idle_n >= idle_park_samples {
+                    if !shared.park_requested.swap(true, Ordering::AcqRel) {
+                        // park に入る前に「動くもの」を 0 で publish しておく。
+                        // publish が止まった後も GUI は最後の値を読み続けるので、
+                        // これが無いと止まったメーターが点灯したまま凍結する。
+                        //
+                        // mod scalars は**ゼロにしない** — メーターではなく
+                        // パラメータ値なので、最後の値のまま凍結するのが正しい
+                        // (ゼロにすると画像 / 映像効果の見た目が飛ぶ)。
+                        bridge.set_peaks(0.0, 0.0);
+                        for t in 0..common::audio_bridge::MAX_TRACKS {
+                            bridge.set_track_peak(t, 0.0, 0.0);
+                        }
+                        dsp_load_ema = 0.0;
+                        metrics.set_dsp_load_avg(0.0);
+                    }
+                    // park 中は dispatch していないのが事実なので `live_parked` を
+                    // 立てる。これが無いと書き出しのたびに `export.rs` の
+                    // 「live callback が park するまで最大 2 秒待つ」を踏む。
+                    local.shared.live_parked.store(true, Ordering::Release);
+                } else if shared.park_requested.load(Ordering::Acquire) {
+                    // 条件が崩れた (= resume 済み or 音が鳴り始めた)。要求を取り下げ
+                    // れば notify thread の reconciler が stream を起こす。
+                    //
+                    // `swap` でなく load してから store するのは、定常状態
+                    // (park 要求が無い) で **書き込みを一切出さない**ため。毎バッファ
+                    // RMW すると notify thread と共有するキャッシュラインを 10ms ごとに
+                    // 汚す。
+                    shared.park_requested.store(false, Ordering::Release);
+                    local.shared.live_parked.store(false, Ordering::Release);
                 }
             },
             |err| tracing::error!(?err, "audio stream error"),

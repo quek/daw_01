@@ -1275,6 +1275,10 @@ impl PluginHost {
         // (5) container window の破棄 (gui_destroy の後) + GUI 開状態の同期。
         if editor.is_some() {
             drop(editor);
+            // r.md #49: `close_slot_gui` と同じ理由 — 窓が尽きたら非アクティブへ落とす。
+            if self.instances.values().all(|r| r.editor.is_none()) {
+                editor_window::clear_windows_active();
+            }
             self.emit(PluginEvent::SlotGuiClosed { device_id });
         }
         // (6) shmem handle は rec ごと drop 済 (rec._shmem)。名前は
@@ -1606,6 +1610,13 @@ impl PluginHost {
         // None を返す) ので、 横取り中の記録をここで捨てる。 残すと次に別のキーの
         // key-up を誤って飲み込む。
         self.swallowed_keys.clear();
+        // r.md #49: 窓が 1 枚も無いプロセスは定義上アクティブでない。アクティブな窓を
+        // 閉じた場合 activation は他プロセスへ移るが、破棄済みの窓に `WM_ACTIVATEAPP`
+        // は届かないので、ここで明示的に落とす (これが無いと daw_gui が
+        // 「プラグイン GUI がアクティブなまま」と誤認して永久に park しない)。
+        if self.instances.values().all(|r| r.editor.is_none()) {
+            editor_window::clear_windows_active();
+        }
         self.emit(PluginEvent::SlotGuiClosed { device_id });
     }
 
@@ -1748,6 +1759,13 @@ fn plugin_main_loop(
 
         // editor 窓の ✕ (close flag) を poll。
         host.poll_editor_close_requests();
+
+        // r.md #49: エディタ窓の activation 変化を daw_gui へ報告する。close の
+        // poll より後に置く — 最後のエディタを閉じた周回で `close_slot_gui` が
+        // 非アクティブを強制するので、同じ周回でそれを送り出せる。
+        if let Some(active) = editor_window::take_activation_change() {
+            host.emit(PluginEvent::HostWindowsActive(active));
+        }
 
         // ARA notify timer を live session の有無に同期。
         let want_ara_timer = host.has_any_ara_session();

@@ -273,13 +273,26 @@ fn rt_param_to_event(ev: RtParamEvent) -> PluginEvent {
     }
 }
 
-/// drain thread 本体: 全 worker ring を 2ms 間隔で poll し、 拾った param
-/// event を `evt_tx` (非RT) へ流す。
+/// drain thread 本体: 全 worker ring を poll し、 拾った param event を
+/// `evt_tx` (非RT) へ流す。
+///
+/// r.md #49: 空振り時の sleep は **backoff する**。 旧実装は常に 2ms 固定で、
+/// param が 1 つも動いていないアイドル状態でも **毎秒 500 回**このスレッドを
+/// 起こしていた (プラグインを 1 つでも読み込めば常時)。 RT 側から `SetEvent` を
+/// 打ってイベント駆動にする案は「RT スレッドはシステムコールを最小化する」
+/// (CLAUDE.md) と衝突するので採らず、 poll のまま間隔を伸ばす。
+///
+/// イベントを 1 つでも拾ったら即座に最小間隔へ戻すので、 ノブを回している間の
+/// 追従は従来どおり。 静止状態から動かし始めた最初の 1 イベントだけ最大
+/// `PARAM_DRAIN_MAX_MS` 遅れるが、 これは GUI の数値表示更新であって音ではない。
 fn run_param_drain(
     rings: Vec<Arc<ParamEventRing>>,
     evt_tx: tokio::sync::mpsc::UnboundedSender<PluginEvent>,
     drain_quit: Arc<AtomicBool>,
 ) {
+    const PARAM_DRAIN_MIN_MS: u64 = 2;
+    const PARAM_DRAIN_MAX_MS: u64 = 32;
+    let mut idle_sleep_ms = PARAM_DRAIN_MIN_MS;
     loop {
         let mut any = false;
         for ring in &rings {
@@ -298,8 +311,11 @@ fn run_param_drain(
             }
             break;
         }
-        if !any {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        if any {
+            idle_sleep_ms = PARAM_DRAIN_MIN_MS;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(idle_sleep_ms));
+            idle_sleep_ms = (idle_sleep_ms * 2).min(PARAM_DRAIN_MAX_MS);
         }
     }
 }
