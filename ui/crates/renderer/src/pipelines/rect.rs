@@ -33,7 +33,19 @@ struct ScreenUniform {
     size: [f32; 4],
 }
 
-const MAX_INSTANCES: u64 = 64 * 1024;
+/// instance buffer の初期容量。 以後は [`RectPipeline::upload`] が必要量まで grow する。
+/// 固定上限をやめた理由は `line.rs` の同名定数の doc を参照 (daw_01 r.md #59)。
+const INITIAL_INSTANCE_CAPACITY: u64 = 1024;
+
+/// `capacity` 個の [`RectInstance`] を収容する instance buffer を確保する。
+fn create_instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rect instance buffer"),
+        size: capacity * std::mem::size_of::<RectInstance>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
 
 /// 1 batch を何 instance 描画するか + scissor。
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +79,8 @@ pub struct RectPipeline {
     spans: Vec<DrawSpan>,
     /// frame 全体の instance バッファ scratch (`upload` で 1 度に GPU へ転送)。
     instances: Vec<RectInstance>,
+    /// `instance_buffer` が現在収容できる instance 数 (`upload` で grow、 shrink しない)。
+    instance_capacity: u64,
 }
 
 impl RectPipeline {
@@ -112,12 +126,7 @@ impl RectPipeline {
             immediate_size: 0,
         });
 
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rect instance buffer"),
-            size: MAX_INSTANCES * std::mem::size_of::<RectInstance>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let instance_buffer = create_instance_buffer(device, INITIAL_INSTANCE_CAPACITY);
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("rect pipeline"),
@@ -168,6 +177,7 @@ impl RectPipeline {
             bind_group,
             spans: Vec::new(),
             instances: Vec::new(),
+            instance_capacity: INITIAL_INSTANCE_CAPACITY,
         }
     }
 
@@ -181,12 +191,10 @@ impl RectPipeline {
     /// に成長するので、以前の run の data は保持されたままで append される。
     pub fn enqueue_run(&mut self, rects: &[RectCommand]) -> RectRun {
         let span_start = self.spans.len() as u32;
-        let avail = MAX_INSTANCES.saturating_sub(self.instances.len() as u64) as usize;
-        let count = rects.len().min(avail);
         let mut span_inst_start: u32 = self.instances.len() as u32;
         let mut current_clip: Option<Rect> = None;
         let mut span_open = false;
-        for cmd in rects.iter().take(count) {
+        for cmd in rects {
             let i = self.instances.len() as u32;
             self.instances.push(RectInstance {
                 pos: [cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h],
@@ -221,7 +229,12 @@ impl RectPipeline {
     }
 
     /// frame 全 run の enqueue が終わったあとに呼ぶ。`instances` 全体を GPU に upload + uniform 更新。
-    pub fn upload(&self, queue: &wgpu::Queue, screen: PhysicalSize) {
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, screen: PhysicalSize) {
+        let needed = self.instances.len() as u64;
+        if needed > self.instance_capacity {
+            self.instance_capacity = needed.next_power_of_two();
+            self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
+        }
         let uniform = ScreenUniform {
             size: [screen.width as f32, screen.height as f32, 0.0, 0.0],
         };

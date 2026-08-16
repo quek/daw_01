@@ -171,10 +171,41 @@ impl GlyphPipeline {
         GlyphRun { idx: idx as u32 }
     }
 
-    /// frame 末で呼ぶ: cache eviction を進める。
+    /// frame 末で呼ぶ: layout buffer cache eviction を進め、 glyph atlas を trim する。
+    ///
+    /// # なぜ `atlas.trim()` が要るか (daw_01 r.md #59)
+    ///
+    /// glyphon の `TextAtlas` は **毎フレーム `trim()` される前提** で設計されている
+    /// (upstream `examples/hello-world.rs` / `text-sizes.rs` / `custom-glyphs.rs` /
+    /// `benches/prepare.rs` がいずれも submit 後に呼ぶ)。 `TextRenderer::prepare` は描いた
+    /// glyph の cache key を `InnerAtlas::glyphs_in_use` に挿し、 `trim()` だけがそれを
+    /// clear する。 呼ばないと **一度描いた全 glyph が永久に in-use** になり、
+    /// `InnerAtlas::try_allocate` の LRU が 1 つも追い出せず `None` を返す → glyphon は
+    /// atlas texture を 2 倍に `grow` する。 256 → 512 → … と育ち、 上限は
+    /// `device.limits().max_texture_dimension_2d` = **8192**
+    /// (`Renderer` / `OffscreenRenderer` とも `required_limits: wgpu::Limits::default()` で
+    /// 生成しており、 wgpu 29 の default は 8192)。 到達すると mask atlas (R8) 1 枚で 64 MiB、
+    /// color 絵文字を描けば color atlas (Rgba8) が 256 MiB。 しかも atlas は
+    /// **GlyphPipeline (base) / GlyphPipeline (popup) / TextEffectCompositor** に 1 枚ずつ、
+    /// さらに preview 窓と export 用 `OffscreenRenderer` が独自 renderer なので別系統に増える。
+    /// 8192 に達した後は `grow` が false を返して `PrepareError::AtlasFull` になり、
+    /// 今度は **文字が描画されなくなる**。
+    ///
+    /// font size は zoom / トラック高さから連続的に決まり (piano_roll の歌詞は `note_h * 0.75`、
+    /// 字幕は preview 窓幅 / project 幅のスケール)、 cosmic-text の `CacheKey` は font size を
+    /// 生ビットで持つので、 縦スクロールや窓リサイズだけで key が無限に増える = 実運用で必ず踏む。
+    ///
+    /// # なぜ submit 前のこの位置で安全か
+    ///
+    /// `trim()` が触るのは CPU 側 `HashSet` のみで GPU 資産は動かない。 実際の eviction は
+    /// **次の** `prepare` が packer を埋めたときに起き、 その上書きは `queue.write_texture`
+    /// = 次 submit の先頭で実行される。 `end_frame` は当フレームの全 `prepare` が済んだ後
+    /// (= 以後 prepare されない) に呼ばれるので、 encode 済み draw が参照する atlas 領域が
+    /// 同一 submit 内で書き換わることはない。
     pub fn end_frame(&mut self) {
         let frame = self.frame_counter;
         self.cache.retain(|_, e| frame.saturating_sub(e.last_seen_frame) < EVICT_AFTER_FRAMES);
+        self.atlas.trim();
     }
 
     /// 1 つの run を render pass に発行する。

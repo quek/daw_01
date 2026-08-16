@@ -27,7 +27,26 @@ struct ScreenUniform {
     size: [f32; 4],
 }
 
-const MAX_INSTANCES: u64 = 256 * 1024;
+/// instance buffer の初期容量。 以後は [`LinePipeline::upload`] が必要量まで grow する
+/// (daw_01 r.md #59)。
+///
+/// **なぜ固定上限をやめたか**: 以前は `MAX_INSTANCES = 256 * 1024` を起動時に無条件確保して
+/// おり、 `LineInstance` 48 B × 256 K = 12.6 MiB を **1 pipeline あたり** 常時占有していた。
+/// `Renderer` は base と popup の 2 本を持ち、 daw_01 は main 窓と preview 窓で `Renderer` を
+/// 2 つ持つので、 線を 1 本も描かない preview 窓のぶんまで含めて計 50 MiB が寝ていた。
+/// さらに固定上限は超過分の線を **黙って捨てる** (旧 `enqueue_run` の `break`) ので、
+/// 巨大アレンジで描画が欠ける崖でもあった。 grow 方式は両方を同時に解消する。
+const INITIAL_INSTANCE_CAPACITY: u64 = 1024;
+
+/// `capacity` 個の [`LineInstance`] を収容する instance buffer を確保する。
+fn create_instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("line instance buffer"),
+        size: capacity * std::mem::size_of::<LineInstance>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
 
 /// 1 batch を何 instance 描画するか + scissor。
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +79,8 @@ pub struct LinePipeline {
     spans: Vec<DrawSpan>,
     /// frame 全体の line instance scratch (`upload` で 1 度に GPU へ転送)。
     instances: Vec<LineInstance>,
+    /// `instance_buffer` が現在収容できる instance 数 (`upload` で必要量まで grow、 shrink しない)。
+    instance_capacity: u64,
 }
 
 impl LinePipeline {
@@ -105,12 +126,7 @@ impl LinePipeline {
             immediate_size: 0,
         });
 
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("line instance buffer"),
-            size: MAX_INSTANCES * std::mem::size_of::<LineInstance>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let instance_buffer = create_instance_buffer(device, INITIAL_INSTANCE_CAPACITY);
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("line pipeline"),
@@ -157,6 +173,7 @@ impl LinePipeline {
             bind_group,
             spans: Vec::new(),
             instances: Vec::new(),
+            instance_capacity: INITIAL_INSTANCE_CAPACITY,
         }
     }
 
@@ -172,9 +189,6 @@ impl LinePipeline {
         for batch in batches {
             let start = self.instances.len() as u32;
             for seg in batch.segments.iter() {
-                if self.instances.len() as u64 >= MAX_INSTANCES {
-                    break;
-                }
                 self.instances.push(LineInstance {
                     a: seg.a,
                     b: seg.b,
@@ -191,16 +205,19 @@ impl LinePipeline {
                     clip: batch.clip_rect,
                 });
             }
-            if self.instances.len() as u64 >= MAX_INSTANCES {
-                break;
-            }
         }
         let span_end = self.spans.len() as u32;
         LineRun { span_start, span_end }
     }
 
-    /// frame 全 run の enqueue 後に呼ぶ。
-    pub fn upload(&self, queue: &wgpu::Queue, screen: PhysicalSize) {
+    /// frame 全 run の enqueue 後に呼ぶ。 instance 数がバッファ容量を超えていたら
+    /// 転送前に確保し直す (daw_01 r.md #59)。
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, screen: PhysicalSize) {
+        let needed = self.instances.len() as u64;
+        if needed > self.instance_capacity {
+            self.instance_capacity = needed.next_power_of_two();
+            self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
+        }
         let uniform = ScreenUniform {
             size: [screen.width as f32, screen.height as f32, 0.0, 0.0],
         };

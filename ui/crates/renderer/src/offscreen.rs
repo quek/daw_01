@@ -536,8 +536,8 @@ impl OffscreenRenderer {
             self.size,
         );
 
-        self.rect.upload(&self.queue, self.size);
-        self.line.upload(&self.queue, self.size);
+        self.rect.upload(&self.device, &self.queue, self.size);
+        self.line.upload(&self.device, &self.queue, self.size);
         self.texture.upload(&self.queue, self.size);
 
         // encode: base pass + (popup pass) + copy_texture_to_buffer

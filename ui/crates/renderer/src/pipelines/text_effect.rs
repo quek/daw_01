@@ -47,6 +47,28 @@ use crate::scene::{Color, GlyphArea, TextureHandle};
 use crate::texture_store::TextureStore;
 
 const EVICT_AFTER_FRAMES: u64 = 300;
+
+/// composite texture cache が保持してよい GPU バイト数の上限 (daw_01 r.md #59)。
+///
+/// # なぜフレーム数の TTL だけでは足りないか
+///
+/// [`EVICT_AFTER_FRAMES`] は「何フレーム使われなかったら捨てるか」しか決めておらず、
+/// **1 entry が何バイトかを一切見ていない**。 `EffectKey` は text 内容と font size を含む
+/// (= 鍵空間が無制限) 一方、 composite texture は「テキスト実寸 + outline + shadow 余白」で
+/// 最大 4096×4096×4 B = 64 MiB まで振れる。 字幕の font size はプレビュー窓幅 / project 幅の
+/// スケールで決まる (`group_compose.rs`) ので、 **窓をドラッグリサイズする / FontSize を
+/// 変調する** だけで毎フレーム新しい鍵になり、 300 フレームぶんの巨大テクスチャが同時に
+/// 生き残る。 実測 (このモジュールの回帰テスト): 400 フレームで 300 枚 = 176 MiB。
+/// 1920 幅の字幕なら 1 枚 2 MB 級なので現実には数百 MiB に届く。
+///
+/// # なぜ 32 MiB か
+///
+/// このキャッシュが本当に必要なのは「今フレームに出ている effect 付きテキスト」だけで、
+/// それ以外は投機的な再利用にすぎない。 1080p 全幅の字幕 1 枚が概ね 2 MB なので、
+/// 32 MiB は同時表示しうる枚数より 1 桁多い余裕がある。 現フレームで使われた entry は
+/// 予算超過でも決して捨てない (捨てるとその場で焼き直しになる) ので、 予算は
+/// 「投機的に持ち越す量の上限」として働く。
+const COMPOSITE_CACHE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 /// offscreen composite texture format。 sRGB で blend が正しく走る。 既存
 /// `OffscreenRenderer` の format (`Rgba8UnormSrgb`) と同じ。
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -154,6 +176,13 @@ struct CachedEffect {
     text_w: f32,
     text_h: f32,
     last_seen_frame: u64,
+}
+
+impl CachedEffect {
+    /// この entry が GPU 上で占めるバイト数 ([`OFFSCREEN_FORMAT`] は 4 B/px)。
+    fn gpu_bytes(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.height) * 4
+    }
 }
 
 // ============================================================
@@ -654,10 +683,50 @@ impl TextEffectCompositor {
                 texture_store.destroy(entry.handle);
             }
         }
+        self.enforce_cache_budget(texture_store, frame);
         // M14 Phase 78 review: glyphon layout buffer cache eviction (= 既存 `GlyphPipeline::end_frame`
         // と同 idiom、 dynamic text で `buffer_cache` 無制限増加するのを防ぐ)。
         self.buffer_cache
             .retain(|_, e| frame.saturating_sub(e.last_seen_frame) < EVICT_AFTER_FRAMES);
+        // daw_01 r.md #59: glyph atlas を trim (= `glyphs_in_use` を clear して LRU を回す)。
+        // 呼ばないと atlas texture が `max_texture_dimension_2d` (= 8192) まで倍々に grow し、
+        // 最後は `PrepareError::AtlasFull` で文字が出なくなる (理由と安全性の詳細は
+        // `GlyphPipeline::end_frame` の doc comment)。 この位置は struct doc の
+        // 「縮小は全 render pass 完了後 (= end_frame) に限る」 制約をそのまま満たす:
+        // `end_frame` 以降このフレームでは `prepare` が走らないので、 caller の encoder に
+        // 積んだ offscreen pass が読む atlas 領域が submit 前に書き換わることはない。
+        self.atlas.trim();
+    }
+
+    /// composite texture cache を [`COMPOSITE_CACHE_BUDGET_BYTES`] 以下に収める
+    /// (daw_01 r.md #59)。 古い (= `last_seen_frame` が小さい) entry から捨てる。
+    ///
+    /// **現フレームで使われた entry (`last_seen_frame == frame`) は捨てない**。 それらは
+    /// caller の scene が `TexturedQuad` として今まさに参照しており、 捨てれば次フレームで
+    /// 即座に焼き直しになるだけで何も得しない。 結果として、 1 フレームの working set 自体が
+    /// 予算を超える場合は予算を超えたまま保持する (= 描画は絶対に壊さない)。
+    fn enforce_cache_budget(&mut self, texture_store: &mut TextureStore, frame: u64) {
+        let mut total: u64 = self.cache.values().map(CachedEffect::gpu_bytes).sum();
+        if total <= COMPOSITE_CACHE_BUDGET_BYTES {
+            return;
+        }
+        // 古い順に並べる (現フレーム使用ぶんは候補から除外)。
+        let mut victims: Vec<(u64, EffectKey)> = self
+            .cache
+            .iter()
+            .filter(|(_, e)| e.last_seen_frame != frame)
+            .map(|(k, e)| (e.last_seen_frame, *k))
+            .collect();
+        victims.sort_unstable_by_key(|(seen, _)| *seen);
+        for (_, key) in victims {
+            if total <= COMPOSITE_CACHE_BUDGET_BYTES {
+                break;
+            }
+            if let Some(entry) = self.cache.remove(&key) {
+                total -= entry.gpu_bytes();
+                texture_store.destroy(entry.handle);
+            }
+        }
     }
 
     // ============================================================

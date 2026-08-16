@@ -140,6 +140,9 @@ struct RunnerState {
     /// これが無いと別要因の恒常エラーで再びログが 6MB 級に膨らむ
     /// (実際 daw_gui.2026-08-01 は 54,043 行 / 6.4MB)。
     render_error_log: RenderErrorLog,
+    /// r.md #59: GPU メモリ使用量を定期ログする最後の時刻 (`None` = まだ 1 度も出していない)。
+    /// 「気付いたら GPU メモリを大量に使っていた」 を後追いできるようにするための観測点。
+    last_gpu_memory_log: Option<Instant>,
     /// preview window 用の **独立した** レート制限器。
     ///
     /// main と共有すると、main が正常描画している限り毎フレーム `reset()` が走って
@@ -794,6 +797,7 @@ impl ApplicationHandler<AppEvent> for Runner {
             gpu_recovery: None,
             render_error_log: RenderErrorLog::default(),
             preview_error_log: RenderErrorLog::default(),
+            last_gpu_memory_log: None,
         });
     }
 
@@ -1348,6 +1352,7 @@ impl Runner {
                     state.render_error_log.record(now, "render error", &e);
                 }
             }
+            Self::log_gpu_memory_periodically(state, now);
         }
 
         // タイトル差分反映: "<*>プロジェクト名"。未保存変更があれば先頭に * を付ける。
@@ -2171,6 +2176,64 @@ impl Runner {
                 renderer.destroy_texture(old);
             }
         }
+    }
+
+    /// r.md #59: GPU メモリ使用量を 60 秒ごとに 1 行ログする。
+    ///
+    /// 「気付いたら GPU メモリを大量に使っていた」 類の報告は、 後から原因を切り分けようにも
+    /// 当時の数値が残っていないと何も言えない。 wgpu の allocator report (`total_allocated_bytes`
+    /// = 実確保、 `total_reserved_bytes` = block 予約込み) をログに残しておけば、
+    /// `%LOCALAPPDATA%\daw_01\logs` を後追いするだけで「増え続けているのか」 が判る。
+    ///
+    /// 60 秒間隔なのでコスト無視できる (report 生成は allocator の block 走査のみ)。
+    fn log_gpu_memory_periodically(state: &mut RunnerState, now: Instant) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        if state.last_gpu_memory_log.is_some_and(|t| now.duration_since(t) < INTERVAL) {
+            return;
+        }
+        state.last_gpu_memory_log = Some(now);
+        // **main と preview は別々の wgpu Device**。 main だけ見ると preview 側 (動画フレーム /
+        // 映像効果の中間 target / composite pool) が丸ごと死角に入る。 r.md #59 の調査では
+        // main が 148 MiB で横ばいなのにプロセス全体は 1 GiB という乖離が実際に出た。
+        Self::log_one_device_memory(state.renderer.device(), "main");
+        if let Some(preview) = state.preview.as_ref() {
+            Self::log_one_device_memory(preview.renderer.device(), "preview");
+        }
+    }
+
+    /// 1 つの `wgpu::Device` の allocator report を 1 行ログする ([`Self::log_gpu_memory_periodically`] の下請け)。
+    ///
+    /// report は DX12 / Vulkan バックエンドのみ実装 (wgpu-hal 29)。 非対応なら何も出さない。
+    fn log_one_device_memory(device: Option<&wgpu::Device>, which: &'static str) {
+        let Some(report) = device.and_then(wgpu::Device::generate_allocator_report) else {
+            return;
+        };
+        // ラベル別の内訳 (上位 6 件)。 totals だけだと「どの資産が増えたか」 が判らず、
+        // 増加を見つけても切り分けに実機の再現待ちが発生する。 wgpu のラベルは
+        // `"glyphon atlas"` / `"texture pool entry (render target)"` のように資産名そのもの。
+        let mut by_label: std::collections::BTreeMap<&str, (usize, u64)> =
+            std::collections::BTreeMap::new();
+        for a in &report.allocations {
+            let e = by_label.entry(a.name.as_str()).or_default();
+            e.0 += 1;
+            e.1 += a.size;
+        }
+        let mut top: Vec<_> = by_label.into_iter().collect();
+        top.sort_unstable_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+        let breakdown = top
+            .iter()
+            .take(6)
+            .map(|(name, (count, bytes))| format!("{name} x{count}={}MiB", bytes / (1024 * 1024)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!(
+            device = which,
+            allocated_mib = report.total_allocated_bytes / (1024 * 1024),
+            reserved_mib = report.total_reserved_bytes / (1024 * 1024),
+            allocations = report.allocations.len(),
+            %breakdown,
+            "gpu memory"
+        );
     }
 
     /// r.md #42: `AppData` が参照を捨てた **main renderer** の `TextureHandle` を

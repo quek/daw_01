@@ -906,11 +906,11 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
         );
 
         // 7. upload (rect/line/texture の instance buffer を 1 度に GPU へ転送、glyph は enqueue 内で済)
-        gpu.rect.upload(&gpu.queue, size);
-        gpu.line.upload(&gpu.queue, size);
+        gpu.rect.upload(&gpu.device, &gpu.queue, size);
+        gpu.line.upload(&gpu.device, &gpu.queue, size);
         gpu.texture.upload(&gpu.queue, size);
-        gpu.popup_rect.upload(&gpu.queue, size);
-        gpu.popup_line.upload(&gpu.queue, size);
+        gpu.popup_rect.upload(&gpu.device, &gpu.queue, size);
+        gpu.popup_line.upload(&gpu.device, &gpu.queue, size);
 
         // 8. encode (base pass: clear + 全 base run を call order で render)
         {
