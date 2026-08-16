@@ -219,8 +219,8 @@ pub(crate) fn composite_scene(
     );
 
     // 5. instance buffer を合成先 size で upload (glyph は enqueue 内で済)。
-    rect.upload(queue, size);
-    line.upload(queue, size);
+    rect.upload(device, queue, size);
+    line.upload(device, queue, size);
     texture.upload(queue, size);
 
     // 6. render target を pool から確保 (size 別使い回し)。
