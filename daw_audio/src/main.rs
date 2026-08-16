@@ -1335,7 +1335,9 @@ async fn recv_loop(
                         // user export range walks cold from the range
                         // start (matches Play-from-here); full export walks 0..len.
                         let span = match range {
-                            Some((start, end)) => export::RenderSpan::RangeCold { start, end },
+                            Some((start_beat, end_beat)) => {
+                                export::RenderSpan::RangeCold { start_beat, end_beat }
+                            }
                             None => export::RenderSpan::Full,
                         };
                         let result = export::run_export(
@@ -1378,6 +1380,100 @@ async fn recv_loop(
                     });
                 }
             }
+            // r.md #54: 範囲ラウドネス解析。ExportWav と同じ engine 予約 /
+            // live park ハンドシェイク / cancel を共有し、走査の出力先だけ
+            // WAV writer から LoudnessCollector へ差し替える。
+            Ok(AudioCommand::AnalyzeLoudness { range }) => {
+                if engine_shared
+                    .export_running
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "AnalyzeLoudness received while a render is already running; ignoring"
+                    );
+                    let _ = out_tx.send(AudioEvent::LoudnessAnalysisComplete {
+                        report: None,
+                        error: Some("export already in progress".into()),
+                        cancelled: false,
+                    });
+                    continue;
+                }
+                let song_snap = shared.song.load();
+                let Some(song_arc) = song_snap.as_ref() else {
+                    tracing::warn!("AnalyzeLoudness received but no song loaded");
+                    engine_shared.export_running.store(false, Ordering::Release);
+                    let _ = out_tx.send(AudioEvent::LoudnessAnalysisComplete {
+                        report: None,
+                        error: Some("no song loaded".into()),
+                        cancelled: false,
+                    });
+                    continue;
+                };
+                let song = (**song_arc).clone();
+                drop(song_snap);
+                // Clear any stale cancel, synchronously on this receive loop so
+                // it is FIFO-ordered against a later CancelExport (same contract
+                // as the ExportWav path above).
+                engine_shared.export_cancel.store(false, Ordering::Release);
+                let engine_shared_clone = Arc::clone(&engine_shared);
+                let engine_shared_release = Arc::clone(&engine_shared);
+                let out_tx_clone = out_tx.clone();
+                let out_tx_progress = out_tx.clone();
+                let sample_rate = session_sample_rate;
+                if let Err(e) = std::thread::Builder::new()
+                    .name("daw-audio-loudness".into())
+                    .spawn(move || {
+                        // スロットルは sink 側 (250ms) が持つ。ここは送るだけ。
+                        let on_progress = move |report: common::loudness_report::LoudnessReport| {
+                            let _ = out_tx_progress
+                                .send(AudioEvent::LoudnessAnalysisProgress(Box::new(report)));
+                        };
+                        // 範囲は cold 走査 (= その範囲を書き出したのと同じ音)。
+                        let span = match range {
+                            Some((start_beat, end_beat)) => {
+                                export::RenderSpan::RangeCold { start_beat, end_beat }
+                            }
+                            None => export::RenderSpan::Full,
+                        };
+                        let result = export::run_loudness_analysis(
+                            engine_shared_clone,
+                            song,
+                            sample_rate,
+                            common::process_data::MAX_FRAMES,
+                            span,
+                            on_progress,
+                        );
+                        engine_shared_release
+                            .export_running
+                            .store(false, Ordering::Release);
+                        let event = match result {
+                            Ok(outcome) => AudioEvent::LoudnessAnalysisComplete {
+                                report: Some(Box::new(outcome.report)),
+                                error: None,
+                                cancelled: outcome.cancelled,
+                            },
+                            Err(e) => {
+                                tracing::error!(error = ?e, "offline loudness analysis failed");
+                                AudioEvent::LoudnessAnalysisComplete {
+                                    report: None,
+                                    error: Some(format!("{e:#}")),
+                                    cancelled: false,
+                                }
+                            }
+                        };
+                        let _ = out_tx_clone.send(event);
+                    })
+                {
+                    tracing::error!(error = ?e, "failed to spawn loudness analysis thread");
+                    engine_shared.export_running.store(false, Ordering::Release);
+                    let _ = out_tx.send(AudioEvent::LoudnessAnalysisComplete {
+                        report: None,
+                        error: Some(format!("failed to spawn loudness thread: {e}")),
+                        cancelled: false,
+                    });
+                }
+            }
             // CancelExport: raise the flag the freewheel loop polls. No-op
             // when no export is running (the next run clears it on entry).
             Ok(AudioCommand::CancelExport) => {
@@ -1390,8 +1486,8 @@ async fn recv_loop(
                 path,
                 source_track,
                 source_clip,
-                start_frame,
-                end_frame,
+                start_beat,
+                end_beat,
             }) => {
                 // Reserve the engine (same atomic reservation as ExportWav —
                 // bounce and WAV export share EngineShared / the CPAL-silence
@@ -1461,10 +1557,7 @@ async fn recv_loop(
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                            export::RenderSpan::RangeWarm {
-                                start: start_frame,
-                                end: end_frame,
-                            },
+                            export::RenderSpan::RangeWarm { start_beat, end_beat },
                             false,
                             // Clip-range bounce has no progress overlay (it
                             // completes quickly and replaces the clip in place).

@@ -687,6 +687,60 @@ pub enum ExportRangeKind {
     Wav,
     /// File → Export Video... (mp4)。 Windows 専用。
     Mp4,
+    /// r.md #54: 解析 → ラウドネス解析... (ファイルは書かず値だけ出す)。
+    Loudness,
+}
+
+impl ExportRangeKind {
+    /// ピッカーのタイトル。
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Wav => "WAV 書き出し範囲",
+            Self::Mp4 => "Video 書き出し設定",
+            Self::Loudness => "ラウドネス解析の範囲",
+        }
+    }
+
+    /// 確定ボタンのラベル。
+    #[must_use]
+    pub fn confirm_label(self) -> &'static str {
+        match self {
+            Self::Wav | Self::Mp4 => "書き出す...",
+            Self::Loudness => "解析",
+        }
+    }
+}
+
+/// レンジピッカーのワンクリック範囲プリセット (r.md #54)。
+/// 「今の関心領域」を拍で言い直すだけの純粋な写像で、どれも同じ
+/// `start_beat` / `end_beat` を書き換える (= ピッカーの値は 1 つ)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportRangeSource {
+    /// transport のループ帯。
+    Loop,
+    /// いま選択しているクリップ / ノートを包む範囲。
+    Selection,
+    /// プレイヘッドが乗っているセクション。
+    Section,
+    /// 曲全体 (0 .. `length_beats`)。
+    Whole,
+}
+
+impl ExportRangeSource {
+    /// ボタンに出すラベル。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Loop => "ループ範囲",
+            Self::Selection => "選択範囲",
+            Self::Section => "セクション",
+            Self::Whole => "曲全体",
+        }
+    }
+
+    /// ピッカーに並べる順 (左から)。
+    pub const ALL: [Self; 4] = [Self::Loop, Self::Selection, Self::Section, Self::Whole];
 }
 
 /// Export WAV / Video の前に出すレンジピッカーモーダルの状態。
@@ -1164,8 +1218,9 @@ pub enum ExportStage {
 }
 
 /// a WAV export held while plugins reinitialise — `(path,
-/// range_frames, write_mod_sidecar)`. See [`AppData::pending_export`].
-pub type PendingExport = (std::path::PathBuf, Option<(u64, u64)>, bool);
+/// range_beats, write_mod_sidecar)`. See [`AppData::pending_export`].
+/// 範囲は **拍** (r.md #54 で拍→サンプル換算を daw_audio 側へ一本化した)。
+pub type PendingExport = (std::path::PathBuf, Option<(f64, f64)>, bool);
 
 /// D3/D4: arrangement build のラベルキャッシュ。 `arrangement_view` の build は
 /// 毎フレーム全 track×clip ぶん track 名 `Arc::from` と `clip_display_label`
@@ -1254,10 +1309,10 @@ pub enum FileDialogKind {
         resolution: (u32, u32),
         framerate: f32,
     },
-    /// WAV 書き出し。 レンジピッカーで選んだ書き出し窓 (sample
-    /// frame; beat→frame 変換済み)。 `None` = 全曲。
+    /// WAV 書き出し。 レンジピッカーで選んだ書き出し窓 (**拍**)。 `None` = 全曲。
+    /// 拍→サンプル換算は daw_audio 側 SSoT が行う (r.md #54)。
     ExportWav {
-        range: Option<(u64, u64)>,
+        range: Option<(f64, f64)>,
     },
     /// MIDI (SMF) 書き出し。
     ExportMidi,

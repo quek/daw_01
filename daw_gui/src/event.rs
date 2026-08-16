@@ -1110,6 +1110,9 @@ pub enum AppEvent {
     SetExportRangeEnd(f64),
     /// レンジピッカーを「全曲」 (start=0, end=length_beats) に戻す。
     ResetExportRange,
+    /// r.md #54: レンジピッカーの範囲を、ワンクリックプリセット
+    /// (ループ範囲 / 選択範囲 / セクション / 曲全体) で置き換える。
+    SetExportRangeSource(crate::app_types::ExportRangeSource),
     /// video export の出力解像度 `(width, height)` を更新 (dropdown
     /// から)。 picker が開いている間だけ有効。 per-export override で Song /
     /// preview には反映しない。
@@ -1121,6 +1124,23 @@ pub enum AppEvent {
     ConfirmExportRange,
     /// レンジピッカーを破棄して export を中止する。
     CancelExportRange,
+
+    // -------- ラウドネス解析 (r.md #54) ----------------------------------
+    /// 解析 → 「ラウドネス解析...」 / ルーラー右クリック / マスターパネルの
+    /// 「解析」 / `Ctrl+L`: 範囲ピッカーを開く (既定 = ループ範囲)。
+    AnalyzeLoudness,
+    /// ラウドネスレポート window の開閉。
+    ToggleLoudnessReport,
+    /// 直近に測った範囲をもう一度測る (レポート窓の「測り直す」)。
+    /// レポートが無ければ何もしない。
+    RerunLoudnessAnalysis,
+    /// 走査中の解析を中止する (レポート窓の「中止」 / Esc)。
+    CancelLoudnessAnalysis,
+    /// 目標ラウドネス [LUFS] とトゥルーピーク上限 [dBTP] を同時に設定する
+    /// (配信プリセット)。マスターパネルのラウドネスメーターの 0 LU 線も動く。
+    SetLoudnessTarget { lufs: f32, ceiling_dbtp: f32 },
+    /// レポート内の秒位置 (範囲先頭起点) へプレイヘッドを飛ばす。
+    SeekToLoudnessPosition(f32),
     /// Phase 7 B4 Step E (2026-05-13): MIDI export menu trigger。 rfd で
     /// path 取得 → `midi_export::export_midi(&song, &path)` で SMF1 書き出し。
     /// 失敗時は status_message に error を出すのみ (= モーダル無し)。

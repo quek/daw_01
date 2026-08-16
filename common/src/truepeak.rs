@@ -1,4 +1,7 @@
-//! ITU-R BS.1770-5 Annex 2 のトゥルーピーク測定 (r.md #50)。
+//! ITU-R BS.1770-5 Annex 2 のトゥルーピーク測定。
+//!
+//! [`crate::loudness`] と同じく daw_gui のライブメーターと daw_audio の
+//! オフライン範囲解析が共有する (r.md #54)。
 //!
 //! 規格が推奨する **order 48 / 4 phase の補間 FIR** をそのまま使う
 //! (phase あたり 12 tap、phase2 = phase1 の逆順、phase3 = phase0 の逆順 =
@@ -7,6 +10,10 @@
 //!
 //! 規格の「12.04 dB 減衰 → 補間 → +12.04 dB 復元」は **整数演算のヘッドルーム
 //! 確保用**で、規格自身が「浮動小数なら不要」と明記しているので行わない。
+//!
+//! 履歴はゼロ初期化で、**充填中も補間出力を採る**。測定開始 / リセットの前は
+//! 無音とみなすのが正しく、捨てると先頭のピークを取りこぼす (詳細は
+//! [`Channel::push`])。
 
 /// phase あたりの tap 数。
 const TAPS: usize = 12;
@@ -61,7 +68,7 @@ fn reversed(src: &[f32; TAPS]) -> [f32; TAPS] {
 struct Channel {
     /// 最古 → 最新の順に並べた入力履歴。
     hist: [f32; TAPS],
-    /// フィルタが充填されるまでに流したサンプル数 (充填前の出力は捨てる)。
+    /// フィルタが充填されるまでに流したサンプル数 (充填前の**補間**出力は捨てる)。
     filled: usize,
 }
 
@@ -75,21 +82,28 @@ impl Channel {
         self.filled = 0;
     }
 
-    /// 1 サンプル入れて、そのサンプル位置での補間ピーク (線形振幅) を返す。
-    /// フィルタ充填中は `0.0` (= 過渡による過大読みを混ぜない)。
+    /// 1 サンプル入れて、そのサンプル位置でのトゥルーピーク (線形振幅) を返す。
+    ///
+    /// **素のサンプル値 `|x|` を常に下限に置く**。BS.1770 Annex 2 のトゥルーピークは
+    /// 定義上サンプルピーク以上なので、これで
+    /// - 充填中 (先頭 12 サンプル) に補間を捨てても**先頭のピークを取りこぼさない**
+    ///   (範囲解析は範囲の第 1 サンプルから測るので、ここを捨てると
+    ///   「トゥルーピークがサンプルピークより 30dB 低い」という表示が出る)、
+    /// - かといって充填の過渡 (無音→フルスケールの段差) を拾って過大に読むこともない
+    ///   (`|x|` は真のピークを超えないので、EBU Tech 3341 #15〜#19 の許容誤差を保つ)。
     #[inline]
     fn push(&mut self, x: f32, phases: &[[f32; TAPS]]) -> f32 {
         self.hist.copy_within(1.., 0);
         self.hist[TAPS - 1] = x;
+        let mut peak = x.abs();
         if self.filled < TAPS {
             self.filled += 1;
-            return 0.0;
+            return peak;
         }
         if phases.is_empty() {
             // fs >= 192kHz: 補間不要 (規格の n=1 相当)。
-            return x.abs();
+            return peak;
         }
-        let mut peak = 0.0_f32;
         for coeffs in phases {
             let mut acc = 0.0_f32;
             for (c, h) in coeffs.iter().zip(self.hist.iter()) {
@@ -115,6 +129,12 @@ pub struct TruePeakMeter {
     block_peak: f32,
     /// リセット以降の最大トゥルーピーク (線形振幅)。
     max_peak: f32,
+    /// リセット以降に流し込んだフレーム数 (= 位置の基準)。
+    frames_seen: u64,
+    /// `max_peak` を更新したフレーム位置 (リセット起点からの相対)。
+    /// オフライン解析のレポートが「どこで一番大きかったか」を返すのに使う
+    /// (ライブメーターは参照しない)。
+    max_at_frame: u64,
 }
 
 impl TruePeakMeter {
@@ -125,6 +145,8 @@ impl TruePeakMeter {
             channels: [Channel::new(), Channel::new()],
             block_peak: 0.0,
             max_peak: 0.0,
+            frames_seen: 0,
+            max_at_frame: 0,
         }
     }
 
@@ -159,6 +181,8 @@ impl TruePeakMeter {
     pub fn reset_max(&mut self) {
         self.max_peak = 0.0;
         self.block_peak = 0.0;
+        self.frames_seen = 0;
+        self.max_at_frame = 0;
         for c in &mut self.channels {
             c.reset();
         }
@@ -166,18 +190,24 @@ impl TruePeakMeter {
 
     pub fn process(&mut self, frames: &[[f32; 2]]) {
         let mut block = 0.0_f32;
-        for fr in frames {
+        for (i, fr) in frames.iter().enumerate() {
+            let mut frame_peak = 0.0_f32;
             for (ch, sample) in fr.iter().enumerate() {
                 let p = self.channels[ch].push(*sample, &self.phases);
-                if p > block {
-                    block = p;
+                if p > frame_peak {
+                    frame_peak = p;
                 }
+            }
+            if frame_peak > block {
+                block = frame_peak;
+            }
+            if frame_peak > self.max_peak {
+                self.max_peak = frame_peak;
+                self.max_at_frame = self.frames_seen + i as u64;
             }
         }
         self.block_peak = block;
-        if block > self.max_peak {
-            self.max_peak = block;
-        }
+        self.frames_seen += frames.len() as u64;
     }
 
     /// 直近ブロックのトゥルーピーク [dBTP]。無音は `f32::NEG_INFINITY`。
@@ -188,6 +218,15 @@ impl TruePeakMeter {
     /// リセット以降の最大トゥルーピーク [dBTP]。
     pub fn max_dbtp(&self) -> f32 {
         to_dbtp(self.max_peak)
+    }
+
+    /// [`Self::max_dbtp`] を記録したフレーム位置 (リセット起点からの相対)。
+    /// 一度も音が来ていなければ `None`。
+    ///
+    /// FIR の充填遅延 (`TAPS/2` サンプル) ぶんだけ実際の入力位置より後ろに出るが、
+    /// 48kHz で 0.25ms 未満なので「その辺りへ飛ぶ」用途では無視できる。
+    pub fn max_at_frame(&self) -> Option<u64> {
+        (self.max_peak > 0.0).then_some(self.max_at_frame)
     }
 }
 
@@ -256,13 +295,34 @@ mod tests {
         assert_within_tolerance(measure(48_000, 4.0, 1.41, 45.0), 3.0, "#19");
     }
 
-    /// 充填前の過渡を最大値に含めない (含めると +0.65 dB の過大読みが出る)。
+    /// 充填前の**補間**過渡は最大値に含めない (含めると +0.65 dB の過大読みが出る)。
+    /// ただし素のサンプルピークは下回らない (BS.1770 Annex 2: TP >= サンプルピーク)。
     #[test]
-    fn the_filter_fill_transient_is_discarded() {
+    fn the_filter_fill_transient_never_overreads_nor_loses_the_sample_peak() {
         let mut m = TruePeakMeter::new(48_000);
-        // いきなり 1.0 の DC を入れても、最初の 12 サンプルは 0 を返す。
+        // いきなり 1.0 の DC を入れる = 無音からの段差 (過渡の最悪ケース)。
         m.process(&vec![[1.0, 1.0]; TAPS]);
-        assert_eq!(m.max_dbtp(), f32::NEG_INFINITY);
+        let db = m.max_dbtp();
+        assert!(db <= 1e-4, "充填の過渡で過大に読んでいる: {db} dBTP");
+        assert!(db >= -1e-4, "サンプルピーク (0 dBFS) を下回っている: {db} dBTP");
+    }
+
+    /// r.md #54: 範囲の**第 1 サンプル**にピークがあっても取りこぼさない。
+    /// 範囲解析は `RangeCold` で範囲頭から測るので、ここを捨てると
+    /// 「トゥルーピークがサンプルピークより 30dB 低い」表示が日常的に出る。
+    #[test]
+    fn a_peak_on_the_very_first_frame_is_still_reported() {
+        let mut m = TruePeakMeter::new(48_000);
+        let mut frames = vec![[0.0_f32; 2]; 4800];
+        frames[0] = [0.98, 0.98];
+        m.process(&frames);
+        let tp = m.max_dbtp();
+        let sample_peak_db = 20.0 * 0.98_f32.log10();
+        assert!(
+            tp >= sample_peak_db - 1e-3,
+            "先頭フレームのピークを落としている: tp={tp} dBTP < sp={sample_peak_db} dBFS"
+        );
+        assert_eq!(m.max_at_frame(), Some(0), "位置も先頭を指すこと");
     }
 
     /// 192kHz では補間せず素のサンプルピークになる。

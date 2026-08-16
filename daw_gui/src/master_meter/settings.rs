@@ -178,7 +178,14 @@ pub struct MeterSettings {
     pub gonio_persistence: f32,
     // ---- ラウドネス ----
     /// 目標ラウドネス [LUFS]。-14 = 配信、-23 = EBU R128 放送。
+    ///
+    /// マスターパネルのラウドネスメーターの 0 LU 線と、範囲ラウドネス解析
+    /// (r.md #54) の目標を **兼ねる**。基準を 2 つ持つと「同じ曲を見ているのに
+    /// メーターと解析で違う目標を指す」状態になるので分けない。
     pub loudness_target_lufs: f32,
+    /// トゥルーピークの上限 [dBTP] (r.md #54)。配信プリセットの適合判定に使う
+    /// (-1.0 = EBU R128 / Spotify / YouTube、-2.0 = Amazon)。
+    pub loudness_true_peak_ceiling_dbtp: f32,
     pub loudness_scale: LoudnessScale,
     pub loudness_units: LoudnessUnits,
 }
@@ -199,6 +206,7 @@ impl Default for MeterSettings {
             scope_trigger: ScopeTrigger::RisingZero,
             gonio_persistence: 0.90,
             loudness_target_lufs: -14.0,
+            loudness_true_peak_ceiling_dbtp: -1.0,
             loudness_scale: LoudnessScale::Ebu9,
             loudness_units: LoudnessUnits::Lufs,
         }

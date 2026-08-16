@@ -38,8 +38,15 @@ impl AppData {
         // 独立だが、 混乱を避けて export 全体で一律に止める）。標準 WAV export も
         // `export_stage` が立つので同じ gate で止まる（旧構造では WAV export 中に
         // 再生できてしまい render を壊しえた）。
-        if self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some() {
-            self.ui_ephemeral.status_message = "書き出し中は再生できません".into();
+        // r.md #54: ラウドネス解析も同じ freewheel 経路なので同じ gate で止める
+        // (解析中はオーディオ出力が無音化され、プラグインは走査スレッドが占有する
+        // ので、そもそも音は出せない)。
+        if self.offline_render_busy() {
+            self.ui_ephemeral.status_message = if self.loudness.phase.is_busy() {
+                "ラウドネス解析中は再生できません".into()
+            } else {
+                "書き出し中は再生できません".into()
+            };
             return PlayOutcome::Refused;
         }
         // プロジェクトロードの asset decode 中は音声がまだ揃って
@@ -122,13 +129,19 @@ impl AppData {
         self.ui_ephemeral.home_toggle_at_first = false;
         self.transport.playhead_beat = Some(beat as f32);
         self.transport.playback_origin_beat = Some(beat as f32);
-        let sr = self.ipc.sample_rate as f64;
-        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
-        let samples = (beat * 60.0 / bpm * sr).max(0.0) as u64;
-        // ensure-synced: beat→sample 換算は song.bpm を使う。 直前の BPM 編集が
-        // 未 flush だと engine の再生グリッドが旧 bpm のままで seek 位置がずれる。
+        // ensure-synced: 換算は song のテンポカーブを使う。 直前の BPM 編集が
+        // 未 flush だと engine の再生グリッドが旧 tempo のままで seek 位置がずれる。
         // epoch 未変化なら no-op。
         self.flush_song_sync();
+        // r.md #54: 定数 BPM の線形換算をやめ、engine の sample↔beat 対応と同じ
+        // `beats_to_samples` (SongTempo カーブの積分) を通す。定数換算のままだと
+        // テンポオートメーションのある曲で「クリックした小節と実際に鳴り始める
+        // 位置」がずれ、ラウドネス解析の「最大値の位置へ飛ぶ」も外れる。
+        let samples = common::automation::beats_to_samples(
+            self.song_doc.song(),
+            self.ipc.sample_rate,
+            beat,
+        );
         self.send_audio(AudioCommand::SeekTo { samples });
     }
 
@@ -264,12 +277,17 @@ impl AppData {
         // play していない) なら playhead は触らない。
         if let Some(origin) = self.transport.playback_origin_beat.take() {
             self.transport.playhead_beat = Some(origin);
-            let sr = self.ipc.sample_rate as f64;
-            let bpm = self.song_doc.song().bpm.max(1.0) as f64;
-            let samples = (origin as f64 * 60.0 / bpm * sr).max(0.0) as u64;
-            // ensure-synced: SeekTo の beat→sample は song.bpm 依存 (seek_playhead_to
-            // と同旨)。 epoch 未変化なら no-op。
+            // ensure-synced: 換算は song のテンポカーブ依存 (seek_playhead_to と同旨)。
+            // epoch 未変化なら no-op。
             self.flush_song_sync();
+            // r.md #54: `seek_playhead_to` と同じ `beats_to_samples` (SongTempo
+            // カーブの積分) を通す。ここだけ定数 BPM のままだと、テンポカーブの
+            // ある曲で「停止で戻る位置」と「クリックで飛ぶ位置」が食い違う。
+            let samples = common::automation::beats_to_samples(
+                self.song_doc.song(),
+                self.ipc.sample_rate,
+                f64::from(origin),
+            );
             self.send_audio(AudioCommand::SeekTo { samples });
         }
         // 録音は transport に乗るモードなので、止まったら必ず閉じる

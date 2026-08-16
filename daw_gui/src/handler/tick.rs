@@ -40,6 +40,30 @@ impl AppData {
                 "音声エンジンが応答しないため書き出しを中止しました".into(),
             );
         }
+
+        // r.md #54: ラウドネス解析の watchdog。書き出しと同じ理由 (hang しても
+        // ChildDisconnected は来ない) で、進捗が止まったら窓と入力 gate を解放する。
+        // プラグイン再初期化待ち (`AwaitingReinit`) も対象 — plugin_host が hang して
+        // `PluginsReinitDone` が来ないと、走査を始める前の段階で固まるため。
+        if self.loudness.phase.is_busy()
+            && let Some(since) = self.loudness.progress_at
+            && since.elapsed()
+                > std::time::Duration::from_secs(crate::handler::loudness::LOUDNESS_WATCHDOG_SECS)
+        {
+            tracing::error!(
+                elapsed_s = since.elapsed().as_secs(),
+                phase = ?self.loudness.phase,
+                "loudness analysis stalled past watchdog timeout; aborting"
+            );
+            // `abort_loudness_analysis` は engine へ `CancelExport` を送る。
+            // 送らないと `export_running` が立ちっぱなしになり、CPAL が無音を
+            // 書き続けて「再生しても音が出ない」+ 以後の書き出しが全部弾かれる。
+            self.abort_loudness_analysis(
+                "音声エンジンが応答しないため解析を中止しました".into(),
+            );
+            self.loudness.error =
+                Some("音声エンジンが応答しないため解析を中止しました".into());
+        }
         // plugin host が crash でなく hang した場合 (プロセス・パイプは
         // 生存のまま state_save 等で停止) は ChildDisconnected も発火せず、
         // RequestAllStates の応答が永久に来ない。 すると pending_state_queue が

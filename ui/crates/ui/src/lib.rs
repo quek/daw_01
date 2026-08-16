@@ -46,6 +46,7 @@ pub use ui::{FrameStats, Ui, UiHost};
 pub use viewport::ViewportState1D;
 pub use widgets::goniometer::{CorrelationStyle, GoniometerStyle};
 pub use widgets::level_meter::{LevelMeterStyle, MeterBallistic, MeterScale};
+pub use widgets::loudness_graph::LoudnessGraphStyle;
 pub use widgets::loudness_meter::LoudnessMeterStyle;
 pub use widgets::oscilloscope::{OscilloscopeStyle, ScopeColumn};
 pub use widgets::spectrum::SpectrumStyle;

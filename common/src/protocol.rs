@@ -243,30 +243,44 @@ pub enum AudioCommand {
     /// the song using its existing AudioWorker pool + plugin handshake, then
     /// replies with `AudioEvent::ExportWavComplete`.
     ///
-    /// `range`:
+    /// `range` (r.md #54 で **拍** へ統一):
     /// - `None` — full-song export (frame 0 → `length_beats` + tail).
-    /// - `Some((start_frame, end_frame))` — render only that frame window
-    ///   (cold start at `start_frame`; matches pressing Play there).
+    /// - `Some((start_beat, end_beat))` — render only that window
+    ///   (cold start at `start_beat`; matches pressing Play there).
+    ///
+    /// 拍→サンプル換算は **daw_audio 側だけ**が行う (`beats_to_samples` =
+    /// tempo automation を積分する SSoT)。GUI 側で定数 BPM 換算してフレームを
+    /// 送っていた旧形は、テンポカーブのある曲で engine の走査位置と範囲の端が
+    /// ずれるため撤去した。
     ExportWav {
         path: std::path::PathBuf,
-        range: Option<(u64, u64)>,
+        range: Option<(f64, f64)>,
         /// Write the modulation-envelope sidecar (`.modenv`) next to the WAV.
         /// Only the offline video render consumes it.
         write_mod_sidecar: bool,
     },
-    /// Abort the in-flight offline render (= `ExportWav`). No-op when no
-    /// export is running.
+    /// (r.md #54) 範囲のラウドネスをオフラインで解析する。`ExportWav` と
+    /// **同じ freewheel 経路** (`render_master_buffer` → 出力先だけ差し替え) を
+    /// 通るので、解析値は同じ範囲を書き出した WAV の値と一致する。
+    ///
+    /// `range` は拍。`None` = 全曲。減衰 tail は測らない (範囲ちょうど)。
+    /// 途中経過は [`AudioEvent::LoudnessAnalysisProgress`]、確定は
+    /// [`AudioEvent::LoudnessAnalysisComplete`]。中断は `CancelExport` と共通。
+    AnalyzeLoudness { range: Option<(f64, f64)> },
+    /// Abort the in-flight offline render (= `ExportWav` / `AnalyzeLoudness`).
+    /// No-op when no offline render is running.
     CancelExport,
     /// Offline-render a clip range with the **full plugin chain** (= post-FX)
     /// to a WAV file (`Bounce (with FX)`, `docs/plan_audio_clip.md` §3.8).
     /// Walks the song from frame 0 so plugin state at `start_frame` is fully
     /// accumulated. Replies with `AudioEvent::BounceClipFxComplete`.
+    /// 範囲は拍 (`ExportWav` と同じく換算は engine 側 SSoT)。
     BounceClipFxOnline {
         path: std::path::PathBuf,
         source_track: u32,
         source_clip: u32,
-        start_frame: u64,
-        end_frame: u64,
+        start_beat: f64,
+        end_beat: f64,
     },
     /// Reposition the audio engine's playhead. `samples` is the absolute
     /// frame offset at the engine sample rate. Takes effect on the next
@@ -380,6 +394,20 @@ pub enum AudioEvent {
     },
     /// Offline WAV render progress (throttled by sender).
     ExportWavProgress { done: u64, total: u64 },
+    /// (r.md #54) 範囲ラウドネス解析の途中経過 (送信側でスロットル済み)。
+    /// 進捗バーだけでなく、その時点までの数値と曲線も入っているので、
+    /// レポート窓は走査に合わせて左から伸びていくグラフを描ける。
+    LoudnessAnalysisProgress(Box<crate::loudness_report::LoudnessReport>),
+    /// (r.md #54) 範囲ラウドネス解析の確定。
+    ///
+    /// `report` は走査が始まっていれば `Some` (中止でもそこまでの値が入る。
+    /// 範囲全体の Integrated ではないので、受け側は `cancelled` を見て捨てる)。
+    /// 走査に入る前に失敗した場合だけ `None` + `error`。
+    LoudnessAnalysisComplete {
+        report: Option<Box<crate::loudness_report::LoudnessReport>>,
+        error: Option<String>,
+        cancelled: bool,
+    },
     /// Offline plugin-FX bounce finished (or failed).
     BounceClipFxComplete {
         path: std::path::PathBuf,

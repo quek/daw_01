@@ -10,19 +10,23 @@
 //! (メトロノームやパニック declick は含まない)。設計は
 //! `docs/plan_master_meters.md`。
 
-pub mod loudness;
 pub mod scope;
 pub mod settings;
 pub mod spectrum;
 pub mod stereo;
-pub mod truepeak;
 
-use loudness::{LoudnessMeter, LoudnessReadout};
+// ラウドネス / トゥルーピークの測定器は `common` が持つ (r.md #54)。
+// daw_audio のオフライン範囲解析が同じ型を通るので、ライブメーターと
+// 解析レポートで値が食い違わない。
+pub use common::loudness;
+pub use common::truepeak;
+
+use common::loudness::{LoudnessMeter, LoudnessReadout};
+use common::truepeak::TruePeakMeter;
 use scope::{SCOPE_COLUMNS, ScopeCapture, ScopeColumn};
 use settings::{MeterControl, MeterSettings};
 use spectrum::{SPECTRUM_BANDS, SpectrumAnalyzer};
 use stereo::{StereoMeter, StereoReadout};
-use truepeak::TruePeakMeter;
 
 /// VU の 2 次系 (IEC 60268-17: 300ms で 99% 到達 / オーバーシュート 1.0%)。
 /// 「300ms 99% + Mp 1%」から数値的に逆算した値。
