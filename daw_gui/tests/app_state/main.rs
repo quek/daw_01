@@ -20,6 +20,7 @@ mod dirty_guard;
 mod group_track_lifecycle;
 mod linked_clip_bounds;
 mod make_unique;
+mod open_stays_clean;
 mod pending_state_queue;
 mod plugin_load_failure;
 mod state_roundtrip_watchdog;

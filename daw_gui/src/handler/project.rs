@@ -92,7 +92,6 @@ impl AppData {
         // -- 子プロセスに関する帳簿 (device_id / (track,index) keyed) -------
         // teardown_all_loaded_plugins が消し損ねる分をここで確実に落とす。
         self.ipc.plugin_param_values.clear();
-        self.ipc.plugin_latencies.clear();
         self.ipc.track_plugin_ids.clear();
         self.ipc.ara_doc_cache.clear();
         self.ipc.ara_pcm_materialized.clear();

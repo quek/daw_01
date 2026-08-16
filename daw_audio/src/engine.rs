@@ -539,6 +539,15 @@ pub struct EngineShared {
     /// export 共通 (§5 — 旧実装は CPAL interleave 段のみで export に乗らず、
     /// master gain が WAV に反映されなかった)。
     pub master_gain: AtomicU32,
+    /// 安定 `device_id` → プラグインが報告した processing latency (samples)。
+    /// `AudioCommand::SetDeviceLatency` で recv loop が差し替え、
+    /// `compile_schedule` (live publish / export の両方) が PDC の入力に読む。
+    ///
+    /// r.md #9: 報告値は実行時の観測値なので `Song` には載せない (載せると保存され、
+    /// 開き直しで host の報告と食い違って「開いただけで `*`」 になる)。 track /
+    /// master の合計は compile 側が device chain から導出するので、 GUI は集計しない。
+    /// 読むのは off-RT (recv loop / export thread) のみ。
+    pub device_latencies: ArcSwap<crate::graph::DeviceLatencies>,
     /// 直近の CPAL callback が処理した frames (= device period)。 audio
     /// thread が毎 buffer store し、recv loop が schedule compile の
     /// `buffer_frames` (leaf 宛 sidechain tap の 1-buffer 補償量) に使う。
@@ -603,6 +612,7 @@ impl EngineShared {
             preroll_remaining_samples: AtomicU64::new(0),
             recording_requested: AtomicBool::new(false),
             master_gain: AtomicU32::new(1.0_f32.to_bits()),
+            device_latencies: ArcSwap::from_pointee(HashMap::new()),
             last_buffer_frames: AtomicU32::new(0),
             mmcss_join_failed: AtomicBool::new(false),
             mmcss_warned: AtomicBool::new(false),
@@ -1459,6 +1469,40 @@ mod bundle_install_tests {
         t
     }
 
+    /// PDC 用テスト fixture: 「latency 4 を報告する device」 を 1 個持つ track。
+    /// 報告値は `Song` ではなく `DeviceLatencies` 側に居る (r.md #9) ので、
+    /// track には device を、 表には (device_id → samples) を置く。
+    const LATENT_DEVICE_ID: u64 = 20;
+    const LATENT_SAMPLES: u32 = 4;
+
+    fn latent_track(id: u32) -> Track {
+        let mut t = track(id);
+        t.devices = vec![common::model::PluginInstance {
+            id: LATENT_DEVICE_ID,
+            ..common::model::PluginInstance::with_ports(
+                "test.latent".into(),
+                common::plugin_format::PluginFormat::Clap,
+                common::port_config::PortConfig {
+                    has_note_input: false,
+                    has_note_output: false,
+                    has_audio_output: true,
+                    has_audio_input: true,
+                    has_video_input: false,
+                    has_video_output: false,
+                },
+            )
+        }];
+        t
+    }
+
+    /// 全 bundle 共通の報告 latency 表。 `latent_track` が載せる device しか
+    /// 持たないので、 その device が居ない song には何の影響も無い。
+    fn test_latencies() -> crate::graph::DeviceLatencies {
+        let mut lat = crate::graph::DeviceLatencies::new();
+        lat.insert(LATENT_DEVICE_ID, LATENT_SAMPLES);
+        lat
+    }
+
     fn make_bundle(song: &Arc<Song>) -> RtBundle {
         make_bundle_with_reset(song, false)
     }
@@ -1468,7 +1512,7 @@ mod bundle_install_tests {
         RtBundle {
             song: Some(Arc::clone(song)),
             tempo_map: common::tempo_map::TempoMap::from_song(song),
-            schedule: Some(compile_schedule(song, 48_000, 0).unwrap()),
+            schedule: Some(compile_schedule(song, &test_latencies(), 48_000, 0).unwrap()),
             reset_song_scoped_state: reset,
             input_delay_replacements: Vec::new(),
             plugin_refs: Arc::new(HashMap::new()),
@@ -1710,11 +1754,7 @@ mod bundle_install_tests {
         // 2 track、片方に latency → 補償 DelayLine が 1 本出る song。
         let mut s1 = Song::default();
         s1.tracks.push(track(1));
-        s1.tracks.push({
-            let mut t = track(2);
-            t.reported_latency_samples = 4;
-            t
-        });
+        s1.tracks.push(latent_track(2));
         let s1 = Arc::new(s1);
         bundle_tx.push(make_bundle(&s1)).unwrap();
         local.refresh_bundle();
@@ -1753,11 +1793,7 @@ mod bundle_install_tests {
 
         let mut s1 = Song::default();
         s1.tracks.push(track(1));
-        s1.tracks.push({
-            let mut t = track(2);
-            t.reported_latency_samples = 4;
-            t
-        });
+        s1.tracks.push(latent_track(2));
         let s1 = Arc::new(s1);
         bundle_tx.push(make_bundle(&s1)).unwrap();
         local.refresh_bundle();
@@ -1802,11 +1838,7 @@ mod bundle_install_tests {
 
         let mut s1 = Song::default();
         s1.tracks.push(track(1));
-        s1.tracks.push({
-            let mut t = track(2);
-            t.reported_latency_samples = 4;
-            t
-        });
+        s1.tracks.push(latent_track(2));
         let s1 = Arc::new(s1);
         bundle_tx.push(make_bundle(&s1)).unwrap();
         local.refresh_bundle();

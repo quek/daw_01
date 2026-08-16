@@ -218,7 +218,6 @@ impl AppData {
                 slot_has_gui: std::collections::HashMap::new(),
                 track_plugin_ids: std::collections::HashMap::new(),
                 loaded_slots: std::collections::HashMap::new(),
-                plugin_latencies: std::collections::HashMap::new(),
                 metrics: common::metrics_bridge::ResourceMetrics::default(),
                 metrics_bridge: None,
                 plugin_db,

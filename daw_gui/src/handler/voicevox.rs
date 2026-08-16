@@ -567,12 +567,22 @@ impl AppData {
                     else {
                         continue;
                     };
+                    // clip は content への「窓」なので、 窓の外に隠れている event は
+                    // 見えていない = 存在しないものとして畳む。 clamp を忘れると、
+                    // 端を trim した口 clip を開くたびに隠れ event が復活して目標形が
+                    // 現状と食い違い、 **開くだけで毎回 '*'** が付く (r.md #9)。
+                    let win_lo = clip.start_beat;
+                    let win_hi = clip.start_beat + clip.length_beats;
                     for ev in events {
                         if closed_id != 0 && ev.source_id == closed_id {
                             continue;
                         }
-                        let s = clip.content_to_song_beat(ev.event_start_in_clip_beats);
-                        let e = s + ev.event_length_beats;
+                        let s = clip
+                            .content_to_song_beat(ev.event_start_in_clip_beats)
+                            .max(win_lo);
+                        let e = (clip.content_to_song_beat(ev.event_start_in_clip_beats)
+                            + ev.event_length_beats)
+                            .min(win_hi);
                         if e > s {
                             spans.push((s, e, ev.source_id, i as u32));
                         }

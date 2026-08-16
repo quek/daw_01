@@ -59,7 +59,11 @@ pub struct ClipCopy {
     pub start_beat: f64,
     pub length_beats: f64,
     pub color: Option<[f32; 3]>,
-    pub auto_lipsync: bool,
+    // `auto_lipsync` (口パクの自動生成 clip か) は **運ばない**。 clipboard は
+    // ユーザーが明示的に置き直す内容を運ぶものなので、 paste した clip は
+    // 派生データではなくユーザーの持ち物になる。 運んでしまうと口 track に
+    // auto clip が 2 本並び、「高々 1 本」 (r.md #17) の不変条件が壊れて
+    // **開くたびに畳み直し = `*`** が付いた (r.md #9)。
     /// clip-level mute。 paste 先 clip へ引き継ぐ。 旧 clipboard JSON
     /// との互換のため serde default (`false`)。
     #[serde(default)]
@@ -407,7 +411,6 @@ mod tests {
             start_beat: start,
             length_beats: len,
             color: None,
-            auto_lipsync: false,
             muted: false,
             content_id: 0 as ContentId,
             content_offset_beats: 0.0,

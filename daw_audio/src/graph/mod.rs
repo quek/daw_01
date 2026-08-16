@@ -19,7 +19,9 @@ mod follower;
 mod port_buffer;
 mod schedule;
 
-pub use compile::{GraphError, compile_schedule};
+pub use compile::{DeviceLatencies, GraphError, compile_schedule};
+#[cfg(test)]
+pub(crate) use compile::compile_schedule_for_test;
 pub use delay_line::DelayLine;
 pub use execute::{
     execute_schedule_post_dispatch, process_master_fx_chain, process_track_owned,

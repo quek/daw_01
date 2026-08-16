@@ -239,6 +239,17 @@ pub enum AudioCommand {
     /// ループ状態を書き換える。
     SetLoop(crate::model::LoopRegion),
     SetMasterGain(f32),
+    /// プラグインが報告した自身の processing latency (samples)。 PDC の入力。
+    ///
+    /// これは **ユーザーが作った中身ではなく実行時の観測値** なので `Song` には
+    /// 載せない (`Song` に持つと保存され、開き直したときに host の報告と食い違って
+    /// 「開いただけで `*`」 になる — r.md #9)。 真実源は plugin host で、
+    /// daw_gui は `PluginEvent::PluginLatencyChanged` をそのまま中継するだけ。
+    ///
+    /// 宛先は安定 `device_id` (アーキ不変条件 1)。 track 合計は engine 側が
+    /// `compile_schedule` で chain から導出するので、 GUI は集計しない。
+    /// device が消えたときは `samples = 0` を送って entry を畳む。
+    SetDeviceLatency { device_id: u64, samples: u32 },
     /// Offline-render the song to a WAV file. daw_audio freewheels through
     /// the song using its existing AudioWorker pool + plugin handshake, then
     /// replies with `AudioEvent::ExportWavComplete`.
@@ -612,7 +623,8 @@ pub enum PluginEvent {
     SlotPluginUnloaded { device_id: u64 },
     /// Plugin が報告した自身の processing latency (samples 単位)。 activate
     /// 直後、および restart / reinit 完了直後に発火。 daw_gui は
-    /// `Track::reported_latency_samples` を更新し PDC を再計算させる。
+    /// これを [`AudioCommand::SetDeviceLatency`] としてそのまま engine へ中継し、
+    /// engine が PDC を再計算する (集計も保存もしない — r.md #9)。
     PluginLatencyChanged { device_id: u64, samples: u32 },
     /// Plugin の parameter 一覧。 activate 完了直後に 1 度、 rescan 要求で
     /// 再送。

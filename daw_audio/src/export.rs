@@ -364,8 +364,15 @@ fn render_loop(
     // (`ApplyDelay`), group buses, SidechainTap and master fx all flow from
     // it via `render_master_buffer`. `buffer_frames` = このループの処理単位
     // `max_frames` (leaf 宛 sidechain tap の 1-buffer 補償量、 live と同規則)。
-    let mut schedule = compile_schedule(song, sample_rate, max_frames as u32)
-        .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
+    // PDC の入力 (device 単位の報告 latency) は live publish と同じ表を読む
+    // (`compile_schedule` は live / export 共通なので入力も共通)。
+    let mut schedule = compile_schedule(
+        song,
+        &engine_shared.device_latencies.load(),
+        sample_rate,
+        max_frames as u32,
+    )
+    .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
 
     // r.md #39: PDC 遅延ぶん書き出し窓を後ろへずらす (下の helper に理由を集約)。
     let (write_start, write_end, total_samples) = shift_window_for_master_latency(

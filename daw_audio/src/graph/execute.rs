@@ -1408,7 +1408,7 @@ pub(crate) fn test_plugin_refs(
 #[cfg(test)]
 mod sidechain_tests {
     use super::*;
-    use crate::graph::compile_schedule;
+    use crate::graph::compile_schedule_for_test;
     use common::model::{PluginInstance, Song, Track};
     use common::plugin_format::PluginFormat;
 
@@ -1484,7 +1484,7 @@ mod sidechain_tests {
             ],
             ..Song::default()
         };
-        let mut schedule = compile_schedule(&song, 48_000, 0).unwrap();
+        let mut schedule = compile_schedule_for_test(&song, 48_000, 0).unwrap();
         assert!(schedule.nodes.iter().any(|op| matches!(op, NodeOp::SidechainTap { .. })));
 
         const FRAMES: usize = 64;
@@ -1561,7 +1561,7 @@ mod sidechain_tests {
             ],
             ..Song::default()
         };
-        let mut schedule = compile_schedule(&song, 48_000, 0).unwrap();
+        let mut schedule = compile_schedule_for_test(&song, 48_000, 0).unwrap();
 
         const FRAMES: usize = 16;
         let mut scratch: Vec<TrackScratch> =
@@ -1859,7 +1859,7 @@ mod send_tests {
 #[cfg(test)]
 mod render_master_tests {
     use super::*;
-    use crate::graph::compile_schedule;
+    use crate::graph::compile_schedule_for_test;
     use common::model::{LoopRegion, Song, Track};
     use std::collections::HashMap;
 
@@ -1881,7 +1881,7 @@ mod render_master_tests {
             tracks: vec![track(|t| t.id = 1)],
             ..Song::default()
         };
-        let mut schedule = compile_schedule(&song, 48_000, 0).unwrap();
+        let mut schedule = compile_schedule_for_test(&song, 48_000, 0).unwrap();
         let mut scratch: Vec<TrackScratch> = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
         let mut master_l = vec![7.0f32; 64]; // 前 buffer の残骸 — clear されるべき
         let mut master_r = vec![7.0f32; 64];

@@ -597,7 +597,12 @@ fn publish_bundle(
         let sched = match song.as_deref() {
             // compile 失敗は empty schedule (silent master) に fallback —
             // 壊れた graph は謎の音ではなく無音として聴こえる方が診断しやすい。
-            Some(s) => match compile_schedule(s, sample_rate, buffer_frames) {
+            Some(s) => match compile_schedule(
+                s,
+                &engine_shared.device_latencies.load(),
+                sample_rate,
+                buffer_frames,
+            ) {
                 Ok(sc) => sc,
                 Err(e) => {
                     tracing::warn!(?e, "graph compile failed; master goes silent");
@@ -905,6 +910,12 @@ async fn recv_loop(
                     shared
                         .recording_lanes
                         .store(Arc::new(std::collections::HashSet::new()));
+                    // device_id keyed の PDC 入力も同じく project スコープ。
+                    // 持ち越すと新 project の同番号 device が、 まだ何も報告して
+                    // いないのに前 project の latency で補償される。
+                    engine_shared
+                        .device_latencies
+                        .store(Arc::new(graph::DeviceLatencies::new()));
                 }
                 let project_dir_g = engine_shared.project_dir.load();
                 let project_dir: Option<std::path::PathBuf> =
@@ -975,6 +986,62 @@ async fn recv_loop(
                 engine_shared
                     .master_gain
                     .store(clamped.to_bits(), Ordering::Relaxed);
+            }
+            Ok(AudioCommand::SetDeviceLatency { device_id, samples }) => {
+                // 報告値はプラグイン (= 信頼できない外部コード) が返した u32 で、
+                // そのまま DelayLine の容量になる。 実在するプラグインの latency は
+                // 高々数百 ms なので、 10 秒相当で頭打ちにして異常値で確保を
+                // 暴走させない (FFI / IPC 境界の値域検証)。
+                let max_samples = session_sample_rate.saturating_mul(10);
+                let samples = if samples > max_samples {
+                    tracing::warn!(
+                        device_id,
+                        samples,
+                        max_samples,
+                        "plugin reported an implausible latency; clamping"
+                    );
+                    max_samples
+                } else {
+                    samples
+                };
+                // PDC の入力更新。 表は off-RT でしか読まれない (compile 時のみ)
+                // ので、 copy-on-write で差し替えて schedule を組み直す。
+                // 値が変わらないなら再 compile しない (plugin host は load ごとに
+                // 0 でも必ず報告してくるので、 無条件 recompile は起動時に
+                // device 数ぶんの無駄な再 compile を生む)。
+                let current = engine_shared.device_latencies.load();
+                let unchanged = match (current.get(&device_id), samples) {
+                    (None, 0) => true,
+                    (Some(&prev), s) => prev == s,
+                    _ => false,
+                };
+                if !unchanged {
+                    let mut next = (**current).clone();
+                    if samples == 0 {
+                        next.remove(&device_id);
+                    } else {
+                        next.insert(device_id, samples);
+                    }
+                    tracing::info!(device_id, samples, "device latency updated (PDC 再 compile)");
+                    engine_shared.device_latencies.store(Arc::new(next));
+                    // song が届く前の報告もあり得る (plugin load の方が速い) —
+                    // その場合は表だけ更新し、 次の LoadSong の compile が拾う。
+                    let song = shared.song.load_full();
+                    if song.is_some() {
+                        publish_bundle(
+                            &mut publisher,
+                            &shared,
+                            &engine_shared,
+                            song,
+                            session_sample_rate,
+                            // 同 project の再 compile。 DelayLine / FollowerSlot の
+                            // 走行状態は引き継ぐ (曲は変わっていない)。
+                            Topology::Recompile {
+                                reset_song_scoped_state: false,
+                            },
+                        );
+                    }
+                }
             }
             Ok(AudioCommand::OpenWorkerPool {
                 n_workers,
