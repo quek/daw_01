@@ -1246,9 +1246,8 @@ fn track_and_clip_color_bincode_round_trip() {
 
 #[test]
 fn v4_track_loads_forward_with_default_routing_fields() {
-    // A v4 .daw file (no `parent_group_id` / `reported_latency_samples`
-    // keys) must round-trip through serde_json into a v5 `Track`
-    // with defaulted graph fields.
+    // A v4 .daw file (no `parent_group_id` key) must round-trip through
+    // serde_json into a v5 `Track` with defaulted graph fields.
     let v4_json = r#"{
             "id": 7,
             "name": "Lead",
@@ -1259,7 +1258,6 @@ fn v4_track_loads_forward_with_default_routing_fields() {
     let track: Track = serde_json::from_str(v4_json).unwrap();
     assert_eq!(track.id, 7);
     assert_eq!(track.parent_group_id, None);
-    assert_eq!(track.reported_latency_samples, 0);
 }
 
 #[test]
@@ -2352,44 +2350,44 @@ fn v12_forward_migrates_image_fields_to_default() {
     assert_eq!(song.ids.next_image_source_id, 0);
 }
 
-// ---- master fx の latency 受け皿 (r.md #39) ---------------------------------
+// ---- プラグイン報告 latency は保存対象外 (r.md #9) ---------------------------
 
+/// 旧 `.daw` は plugin が報告した latency の合計を
+/// `Track::reported_latency_samples` / `Song::master_reported_latency_samples`
+/// として **保存していた**。 これは実行時の観測値であって曲の中身ではなく、
+/// 開き直したときに host の報告と食い違って「開いただけで `*`」 になっていた
+/// ので、モデルから外して engine へ device 単位で直送する形にした。
+///
+/// ここで守るのは移行の後方互換 — 旧キーが残った file はそのまま読め、
+/// 保存し直すとキーが消える (= 派生値がファイルに焼き付かない)。
 #[test]
-fn reported_latency_mut_routes_master_to_song_level_field() {
-    // master は `Track` を持たないので、旧 `track_by_id_mut(MASTER_TRACK_ID)` は
-    // 必ず None を返し、master fx の latency 合計が **黙って捨てられて** いた
-    // (= master に遅延プラグインを挿しても PDC / metronome / 書き出しに載らない)。
-    // sentinel 分岐付き accessor が Song 直下のフィールドへ通す。
-    let mut song = Song::default();
-    song.tracks.push(Track { id: 1, ..Default::default() });
-
-    assert!(
-        song.track_by_id_mut(MASTER_TRACK_ID).is_none(),
-        "master 行は tracks に存在しない (この前提が崩れたら本 accessor は不要)"
-    );
-
-    *song
-        .reported_latency_mut(MASTER_TRACK_ID)
-        .expect("master にも受け皿がある") = 2048;
-    assert_eq!(song.master_reported_latency_samples, 2048);
-
-    *song
-        .reported_latency_mut(1)
-        .expect("通常 track は Track のフィールド") = 512;
-    assert_eq!(song.tracks[0].reported_latency_samples, 512);
-    assert_eq!(song.master_reported_latency_samples, 2048, "互いに独立");
-
-    assert!(song.reported_latency_mut(999).is_none(), "存在しない track");
-}
-
-#[test]
-fn master_reported_latency_forward_migrates_to_zero() {
-    // 旧 file には key が無い → 0 (= 補償なし、既存挙動)。
-    let old = serde_json::json!({
+fn legacy_reported_latency_keys_are_ignored_and_never_written_back() {
+    let legacy = serde_json::json!({
         "bpm": 120.0,
         "time_sig": [4, 4],
         "length_beats": 64.0,
+        "master_reported_latency_samples": 2048,
+        "tracks": [{
+            "id": 1,
+            "name": "Lead",
+            "volume": 0.9,
+            "pan": 0.0,
+            "next_clip_id": 1,
+            "reported_latency_samples": 512,
+        }],
     });
-    let song: Song = serde_json::from_value(old).unwrap();
-    assert_eq!(song.master_reported_latency_samples, 0);
+    let song: Song = serde_json::from_value(legacy).expect("旧キー付きでも読める");
+    assert_eq!(song.tracks.len(), 1);
+
+    let written = serde_json::to_value(&song).unwrap();
+    assert!(
+        written.get("master_reported_latency_samples").is_none(),
+        "master の報告 latency は保存しない"
+    );
+    assert!(
+        written["tracks"][0]
+            .get("reported_latency_samples")
+            .is_none(),
+        "track の報告 latency は保存しない"
+    );
 }

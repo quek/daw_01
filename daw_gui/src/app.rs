@@ -167,6 +167,8 @@ impl AppData {
 
         let app = Self {
             theme,
+            // r.md #54: 解析はセッション限りなので既定 (Idle / レポート無し)。
+            loudness: crate::state::LoudnessState::default(),
             song_doc: SongDoc::new(song),
             transport: TransportState {
                 metronome_enabled: false,
@@ -218,7 +220,6 @@ impl AppData {
                 slot_has_gui: std::collections::HashMap::new(),
                 track_plugin_ids: std::collections::HashMap::new(),
                 loaded_slots: std::collections::HashMap::new(),
-                plugin_latencies: std::collections::HashMap::new(),
                 metrics: common::metrics_bridge::ResourceMetrics::default(),
                 metrics_bridge: None,
                 plugin_db,
@@ -316,6 +317,11 @@ impl AppData {
                 settings_open: app_config.settings_open,
                 settings_rect: app_config
                     .settings_rect
+                    .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
+                // r.md #54: ラウドネスレポート window の開閉/位置/サイズ。
+                loudness_report_open: app_config.loudness_report_open,
+                loudness_report_rect: app_config
+                    .loudness_report_rect
                     .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
                 // r.md #50: マスターパネルの開閉 / 幅 / セクション配分 / メーター設定。
                 master_panel_open: app_config.master_panel_open,
@@ -527,7 +533,9 @@ impl AppData {
         // 宙吊りになった round-trip は #64 watchdog (state round-trip) が export 後に
         // 回収する。 判断に迷う event は block しない (安全側 = 流す) ので、
         // 「新 variant の分類し忘れ = deadlock」 という故障モードが構造的に消える。
-        if self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some() {
+        // r.md #54: 範囲ラウドネス解析も同じ freewheel 経路 (engine の
+        // `export_running` を共有) なので、同じ block-list を適用する。
+        if self.offline_render_busy() {
             let block = matches!(
                 event,
                 AppEvent::Plugin(common::protocol::PluginEvent::SlotPluginLoaded { .. })
@@ -1612,6 +1620,26 @@ impl AppData {
                     p.end_beat = self.song_doc.song().length_beats.max(MIN_EXPORT_RANGE_BEATS);
                 }
             }
+            // r.md #54: 範囲プリセット。対象が無いときは何も変えず理由を出す
+            // (ボタンを押しても黙って無反応、を作らない)。
+            AppEvent::SetExportRangeSource(source) => {
+                match self.export_range_from_source(source) {
+                    Some((start, end)) => {
+                        let len = self.song_doc.song().length_beats;
+                        if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
+                            p.start_beat = start.max(0.0);
+                            p.end_beat = end.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
+                            // 曲末より後ろは掴めない (end 側の clamp と同じ規則)。
+                            let max = len.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
+                            p.end_beat = p.end_beat.min(max);
+                        }
+                    }
+                    None => {
+                        self.ui_ephemeral.status_message =
+                            format!("{}が無いので範囲を取れません", source.label());
+                    }
+                }
+            }
             AppEvent::SetExportResolution(w, h) => {
                 // dropdown はプリセット (全て偶数・正値) しか出さないが、
                 // 念のため 0 を弾く (encoder は w/h != 0 を要求)。
@@ -1633,8 +1661,38 @@ impl AppData {
                 self.confirm_export_range();
             }
             AppEvent::CancelExportRange => {
+                let was_loudness = self
+                    .ui_ephemeral
+                    .export_range_picker
+                    .is_some_and(|p| matches!(p.kind, ExportRangeKind::Loudness));
                 self.ui_ephemeral.export_range_picker = None;
-                self.ui_ephemeral.status_message = "Export をキャンセルしました".into();
+                self.ui_ephemeral.status_message = if was_loudness {
+                    "ラウドネス解析をキャンセルしました".into()
+                } else {
+                    "Export をキャンセルしました".into()
+                };
+            }
+            // -------- ラウドネス解析 (r.md #54) --------
+            AppEvent::AnalyzeLoudness => {
+                self.open_loudness_range_picker();
+            }
+            AppEvent::ToggleLoudnessReport => {
+                self.toggle_loudness_report();
+            }
+            AppEvent::RerunLoudnessAnalysis => {
+                if let Some(r) = self.loudness.report.as_ref() {
+                    let range = Some((r.range_start_beat, r.range_end_beat));
+                    self.begin_loudness_analysis(range);
+                }
+            }
+            AppEvent::CancelLoudnessAnalysis => {
+                self.cancel_loudness_analysis();
+            }
+            AppEvent::SetLoudnessTarget { lufs, ceiling_dbtp } => {
+                self.set_loudness_target(lufs, ceiling_dbtp);
+            }
+            AppEvent::SeekToLoudnessPosition(secs) => {
+                self.seek_to_loudness_position(secs);
             }
             AppEvent::ExportMidi => {
                 self.action_export_midi();

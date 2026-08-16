@@ -45,6 +45,12 @@ pub struct AppConfig {
     /// メーター設定 (各メーターの右クリックメニューで変える)。
     #[serde(default)]
     pub meter: crate::master_meter::settings::MeterSettings,
+    /// r.md #54: ラウドネスレポート window が開いているか (再起動を跨いで復元)。
+    #[serde(default)]
+    pub loudness_report_open: bool,
+    /// r.md #54: ラウドネスレポート window の位置・サイズ `[x, y, w, h]` (px)。
+    #[serde(default)]
+    pub loudness_report_rect: Option<[f32; 4]>,
 }
 
 fn default_master_panel_w() -> f32 {
@@ -77,6 +83,8 @@ impl Default for AppConfig {
             master_panel_w: default_master_panel_w(),
             master_panel_sections: default_master_panel_sections(),
             meter: crate::master_meter::settings::MeterSettings::default(),
+            loudness_report_open: false,
+            loudness_report_rect: None,
         }
     }
 }
@@ -123,8 +131,11 @@ mod tests {
             master_panel_sections: [0.4, 0.2, 0.2, 0.2],
             meter: crate::master_meter::settings::MeterSettings {
                 loudness_target_lufs: -23.0,
+                loudness_true_peak_ceiling_dbtp: -2.0,
                 ..Default::default()
             },
+            loudness_report_open: true,
+            loudness_report_rect: Some([5.0, 6.0, 720.0, 500.0]),
         };
         save(&path, &cfg).unwrap();
         let loaded = load(&path);
@@ -138,6 +149,9 @@ mod tests {
         assert_eq!(loaded.master_panel_w, 412.0);
         assert_eq!(loaded.master_panel_sections, [0.4, 0.2, 0.2, 0.2]);
         assert_eq!(loaded.meter.loudness_target_lufs, -23.0);
+        assert_eq!(loaded.meter.loudness_true_peak_ceiling_dbtp, -2.0);
+        assert!(loaded.loudness_report_open);
+        assert_eq!(loaded.loudness_report_rect, Some([5.0, 6.0, 720.0, 500.0]));
     }
 
     #[test]

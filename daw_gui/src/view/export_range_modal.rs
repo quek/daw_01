@@ -1,4 +1,9 @@
-//! Export WAV / Video の前に出す「書き出し範囲」 ピッカーモーダル。
+//! Export WAV / Video / ラウドネス解析の前に出す「範囲」 ピッカーモーダル。
+//!
+//! r.md #54 で「ループ範囲 / 選択範囲 / セクション / 曲全体」 のワンクリック
+//! プリセット行を足した (旧「全曲にリセット」 ボタンはその一般化として吸収)。
+//! プリセットは下の 開始 / 終了 と同じ値を書き換えるだけなので、 押してから
+//! 拍で微調整できる (= 値の SSoT は 1 つ)。
 //!
 //! Ardour / REAPER の time-selection export に倣い、 書き出す時間範囲を選ぶ。
 //! 表示/入力は 1-based **小節.拍** (例 "3.1") だが、 内部値は song の native 単位
@@ -17,6 +22,7 @@ use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, ExportRangeKind};
+use crate::app_types::ExportRangeSource;
 use crate::theme::Palette;
 
 // 「開始 / 終了」 のラベル列 (LABEL_W) をパネル内に入れ、 解像度 dropdown に
@@ -24,20 +30,17 @@ use crate::theme::Palette;
 // を収めるための幅。 旧 380px ではラベルがパネル左端の**外側** (暗転 backdrop の上)
 // に描かれ、 解像度の縦型 / 正方形プリセットが枠と ▼ アローを突き抜けていた。
 const PANEL_W: f32 = 440.0;
-const PANEL_H: f32 = 210.0;
+const PANEL_H: f32 = 248.0;
 /// Mp4 は範囲に加えて解像度 / fps の dropdown 行を最下段に持つので背が高い。
 /// dropdown の popup は panel 下端より下 (= 暗転 overlay、 widget 無し) に開くため、
 /// ボタン行を dropdown 行の **上** に置く (popup と button の z / 入力衝突を構造的に回避)。
-const PANEL_H_MP4: f32 = 220.0;
+const PANEL_H_MP4: f32 = 258.0;
 const PAD: f32 = 18.0;
 const ROW_H: f32 = 26.0;
 const FIELD_W: f32 = 130.0;
 const LABEL_W: f32 = 60.0;
 const BTN_H: f32 = 28.0;
 const BTN_W: f32 = 110.0;
-/// 「全曲にリセット」 は全角 7 文字 = 7 * 16 = 112px あり、 BTN_W(110) では
-/// 「全曲にリセッ…」 と省略されて意味が読めなくなるので専用幅を持つ。
-const RESET_BTN_W: f32 = 128.0;
 
 /// start / end 拍フィールドの scrubable_number スタイル。 sensitivity 0.25 =
 /// `1 px drag で 0.25 拍`。 clamp は handler 側 SSoT なので widget range は緩く
@@ -104,6 +107,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let is_mp4 = matches!(kind, ExportRangeKind::Mp4);
     let resolution = picker.resolution;
     let framerate = picker.framerate;
+    // 押せるプリセット (対象が実在するもの) を modal を組む前に解決しておく
+    // (closure の中では `app` を借りたままにできないため)。
+    let available: [bool; 4] = std::array::from_fn(|i| {
+        app.export_range_from_source(ExportRangeSource::ALL[i]).is_some()
+    });
     let panel_size = if is_mp4 { (PANEL_W, PANEL_H_MP4) } else { (PANEL_W, PANEL_H) };
 
     // 閉じるのは Export / キャンセル / ESC (body で拾う) のみなので、 パレット既定の
@@ -122,11 +130,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
         move |ui, panel| {
             // 文字が乗るのは modal panel (= パレットのクローム面) なので本文インクは `text`。
             let p = ui.palette();
-            let title = match kind {
-                ExportRangeKind::Wav => "WAV 書き出し範囲",
-                ExportRangeKind::Mp4 => "Video 書き出し設定",
-            };
-            ui.label_at("exr_title", title, panel.x + PAD, panel.y + PAD, 16.0, p.text);
+            ui.label_at("exr_title", kind.title(), panel.x + PAD, panel.y + PAD, 16.0, p.text);
 
             // ESC = キャンセル (close_on_escape: false なので body で拾う → フラッシュ回避)。
             if ui.take_shortcut("escape") {
@@ -135,8 +139,43 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 }));
             }
 
+            // ---- 範囲プリセット (r.md #54) ----
+            // 「今の関心領域」をワンクリックで拍範囲に写す。下の 開始/終了 は
+            // 同じ値を編集するので、押してから微調整できる。
+            let src_y = panel.y + PAD + 26.0;
+            let src_w = (panel.w - PAD * 2.0) / ExportRangeSource::ALL.len() as f32 - 4.0;
+            for (i, source) in ExportRangeSource::ALL.iter().enumerate() {
+                let r = Rect {
+                    x: panel.x + PAD + (src_w + 4.0) * i as f32,
+                    y: src_y,
+                    w: src_w,
+                    h: ROW_H,
+                };
+                // 対象が無いもの (ループ帯を引いていない / 何も選んでいない /
+                // セクションが 1 つも無い) は **押せない見た目** にする。
+                // 押せてしまうと、失敗の理由が status bar = この modal の暗転
+                // backdrop の裏に出て読めない (「押せるのに効かない」の典型)。
+                if !available[i] {
+                    ui.label_at(
+                        ("exr_src_off", i),
+                        source.label(),
+                        r.x + 6.0,
+                        r.y + 5.0,
+                        13.0,
+                        p.text_faint,
+                    );
+                    continue;
+                }
+                if ui.button_at_clicked(("exr_src", i), source.label(), r) {
+                    let source = *source;
+                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                        app.handle_event(AppEvent::SetExportRangeSource(source))
+                    }));
+                }
+            }
+
             // ---- 開始拍 ----
-            let row0_y = panel.y + PAD + 34.0;
+            let row0_y = src_y + ROW_H + 14.0;
             field_row(
                 ui,
                 "exr_start",
@@ -171,20 +210,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 },
             );
 
-            // 「全曲」 リセットリンク (右上寄り)。
-            let reset_rect = Rect {
-                x: panel.x + panel.w - PAD - RESET_BTN_W,
-                y: row0_y,
-                w: RESET_BTN_W,
-                h: ROW_H,
-            };
-            if ui.button_at_clicked("exr_reset", "全曲にリセット", reset_rect) {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::ResetExportRange)
-                }));
-            }
-
-            // ---- ボタン行 (右: Export / 左: キャンセル) ----
+            // ---- ボタン行 (右: 確定 / 左: キャンセル) ----
             // Mp4 は dropdown 行を最下段に置く (popup が panel 下端より下の
             // 暗転領域に開けるよう、 button より下に widget を置かない)。 ボタンは終了行
             // の直下に上げる。 Wav は従来どおり panel 最下部。
@@ -196,7 +222,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
             let export_x = panel.x + panel.w - PAD - BTN_W;
             if ui.button_at_clicked(
                 "exr_confirm",
-                "書き出す...",
+                kind.confirm_label(),
                 Rect { x: export_x, y: btn_y, w: BTN_W, h: BTN_H },
             ) {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {

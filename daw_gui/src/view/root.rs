@@ -11,7 +11,8 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent, EditSurface};
 use crate::view::{
     arrangement_view, bottom_panel, dirty_guard_modal, export_overlay, export_range_modal,
-    font_picker, load_overlay, master_panel, plugin_picker, recovery_modal, resource_monitor,
+    font_picker, load_overlay, loudness_report, master_panel, plugin_picker, recovery_modal,
+    resource_monitor,
     settings, shortcuts_help, snap, status_bar, track_inspector, track_picker, transport,
     undo_history, voicevox_overlay,
 };
@@ -45,10 +46,19 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // 占有する予約を **背景 widget 描画より前** に行う (= window の上の click が
     // アレンジ等に漏れず、 window の外は通常操作できる true floating)。 本体描画は
     // build_root 末尾で `undo_history::draw`。
-    undo_history::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
-    // r.md #48: 設定 window も同じ true-floating 機構 (背景を暗転しないので、
-    // テーマを選んだ瞬間に背後の全画面が切り替わるのを見ながら選べる)。
-    settings::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+    // r.md #54: 解析の走査中は他の floating window を出さない。これらは
+    // `with_floating_region` で raw pointer に戻すので、暗転の下でも押せてしまう
+    // (編集履歴の行を click すると走査中に Song が飛ぶ)。
+    let floating_ok = !app.loudness.phase.is_busy();
+    if floating_ok {
+        undo_history::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+        // r.md #48: 設定 window も同じ true-floating 機構 (背景を暗転しないので、
+        // テーマを選んだ瞬間に背後の全画面が切り替わるのを見ながら選べる)。
+        settings::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+    }
+    // r.md #54: ラウドネスレポート window。走査中は **画面全体** を予約して
+    // 背景を丸ごと inert にする (暗転と入力遮断が同じ 1 つの根拠から出る)。
+    loudness_report::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
     // ----- レイアウト計算 -----
     let menu_rect = Rect { x: 0.0, y: 0.0, w: sw, h: MENU_H };
@@ -133,10 +143,16 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // Undo 履歴 window (r.md #29): inline な true-floating window の本体描画
     // (背景描画の後 = z-order 最前面)。 pointer 占有予約は build_root 冒頭の
     // `undo_history::reserve`。
-    undo_history::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+    // r.md #54: 走査中は描かない (reserve と対) — 暗転の下に操作可能な窓を残さない。
+    if !app.loudness.phase.is_busy() {
+        undo_history::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
-    // 設定 window (r.md #48): 同上、 背景描画の後 = z-order 最前面。
-    settings::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+        // 設定 window (r.md #48): 同上、 背景描画の後 = z-order 最前面。
+        settings::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
+    }
+
+    // ラウドネスレポート window (r.md #54): 同上。走査中はここで暗転も描く。
+    loudness_report::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
     // Modal: plugin picker。draw 関数内で modal の open/close を app.ui_ephemeral.is_plugin_picker_open
     // と同期させる (常時呼び、内部で is_modal_open / open_modal を管理)。
@@ -351,6 +367,19 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             m.item("Performance Panel", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| {
                     app.handle_event(AppEvent::ToggleResourcePanel)
+                }));
+            });
+        });
+        // r.md #54: 解析系はここに集約する (今後の解析機能もこのメニューへ)。
+        mb.menu("解析", |m| {
+            m.item("ラウドネス解析... (Ctrl+L)", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::AnalyzeLoudness)
+                }));
+            });
+            m.item("ラウドネスレポートを開く", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::ToggleLoudnessReport)
                 }));
             });
         });
@@ -572,6 +601,25 @@ fn paste_noop(ui: &mut Ui<'_, AppData>) {
 /// `bottom_rect` は piano_roll active 判定用。マウスが bottom_panel 領域内 + Piano Roll
 /// タブが選択中なら G/X/1/2/3 を piano_roll 系に流す。それ以外は arrange 系。
 fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect) {
+    // r.md #54: 範囲ラウドネス解析の走査中は **Esc (= 中止) 以外の shortcut を
+    // 一切通さない**。
+    //
+    // レポート窓の全画面 `reserve_floating_region` が落とすのは pointer だけで、
+    // `take_shortcut` は素通りする。そのままだと Ctrl+Z / Ctrl+Y / 履歴ジャンプが
+    // freewheel 走査の最中に Song を差し替え、次フレームの `flush_song_sync` が
+    // 走査中の daw_audio へ `LoadSong` を、plugin_host へ `SetupAraDocument`
+    // (= プラグイン再初期化) を送ってしまう (undo / redo は `edit_song` を通らない
+    // ので編集ロックでも止まらない)。Ctrl+E は走査中に `ReinitAllPlugins` を撃つ。
+    // 書き出しは `export_overlay` が真のモーダル (capture_keyboard) なので同じ
+    // 事故が起きない — 解析だけがこの保護を欠いていた。
+    if app.loudness.phase.is_busy() {
+        if ui.take_shortcut("escape") {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::CancelLoudnessAnalysis)
+            }));
+        }
+        return;
+    }
     // 編集面 arbiter (clipboard / delete / `Z` zoom / `R` loop が共有)。 関数冒頭で
     // 1 度算出し、 先頭の `R` ブロックから末尾の全選択ブロックまで全シーケンスで使う。
     // `is_pianoroll_active`: マウスが bottom_panel 内 + Piano Roll タブ選択中か。
@@ -712,6 +760,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.toggle_settings") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ToggleSettings)
+        }));
+    }
+    // r.md #54: Ctrl+L で範囲ラウドネス解析 (解析メニューと同じイベント)。
+    if ui.take_shortcut("daw.analyze_loudness") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::AnalyzeLoudness)
         }));
     }
     // ----- Clipboard / Delete (統一 arbiter) -----
@@ -1216,6 +1270,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             // (rename / audio editor の後、 選択解除より優先)。
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::ToggleResourcePanel)
+            }));
+        } else if app.ui_prefs.loudness_report_open {
+            // r.md #54: レポート window が開いていれば Esc で閉じる (同順)。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.handle_event(AppEvent::ToggleLoudnessReport)
             }));
         } else if app.ui_prefs.undo_history_open {
             // r.md #29: 編集履歴 window が開いていれば Esc で閉じる

@@ -1669,10 +1669,9 @@ mod tests {
 
     #[test]
     fn load_accepts_v4_with_default_routing_fields() {
-        // v4 saves had no `kind` / `parent_group_id` /
-        // `reported_latency_samples` keys on each `Track`. Loading must
-        // succeed and fill those fields with their serde defaults
-        // (Audio / None / 0).
+        // v4 saves had no `kind` / `parent_group_id` keys on each `Track`.
+        // Loading must succeed and fill those fields with their serde
+        // defaults (Audio / None).
         let dir = tempdir().unwrap();
         let path = dir.path().join("v4.daw");
         let v4_json = r#"{
@@ -1698,7 +1697,6 @@ mod tests {
         assert_eq!(song.tracks.len(), 1);
         let t = &song.tracks[0];
         assert_eq!(t.parent_group_id, None);
-        assert_eq!(t.reported_latency_samples, 0);
     }
 
     #[test]

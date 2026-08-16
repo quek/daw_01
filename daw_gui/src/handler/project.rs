@@ -92,7 +92,6 @@ impl AppData {
         // -- 子プロセスに関する帳簿 (device_id / (track,index) keyed) -------
         // teardown_all_loaded_plugins が消し損ねる分をここで確実に落とす。
         self.ipc.plugin_param_values.clear();
-        self.ipc.plugin_latencies.clear();
         self.ipc.track_plugin_ids.clear();
         self.ipc.ara_doc_cache.clear();
         self.ipc.ara_pcm_materialized.clear();
@@ -100,6 +99,11 @@ impl AppData {
         // 進行中 bounce の完了通知を新 project に適用しない。
         self.ipc.pending_clip_fx_bounce = None;
         self.ipc.pending_vocal_synth_bounce = None;
+        // r.md #54: 前の曲のラウドネスレポート (数値も「範囲 x – y」の拍も) を
+        // 新しい曲のものとして見せない。走査中なら engine ごと畳む。
+        self.abort_loudness_analysis("プロジェクトを切り替えたのでラウドネス解析を中止しました".into());
+        self.loudness.report = None;
+        self.loudness.error = None;
 
         // ---- (B) **別プロジェクト**のときだけ無効になるもの ----------------
         // decode 済みメディアは「id + 実体」で同一性が決まるので、同じ project
@@ -242,6 +246,12 @@ impl AppData {
             master_panel_w: self.ui_prefs.master_panel_w,
             master_panel_sections: self.ui_prefs.master_panel_sections,
             meter: self.ui_prefs.meter_settings,
+            // r.md #54: レポート window の開閉と位置も「画面の使い方」側。
+            loudness_report_open: self.ui_prefs.loudness_report_open,
+            loudness_report_rect: self
+                .ui_prefs
+                .loudness_report_rect
+                .map(|r| [r.x, r.y, r.w, r.h]),
         };
         if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
             tracing::warn!(error = ?e, "failed to save app_config");

@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
+use common::loudness_report::{LoudnessCollector, LoudnessReport};
 use common::model::Song;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
@@ -57,6 +58,12 @@ pub struct ExportOutcome {
 /// How the offline render walks the song relative to the window it writes.
 /// The render always *writes* only `[write_start, write_end)` (plus tail),
 /// but where it starts *walking* differs by intent.
+///
+/// 範囲は **拍** で受ける (r.md #54)。拍→サンプル換算は
+/// [`common::automation::beats_to_samples`] = tempo automation を積分する
+/// SSoT 一本に統一してあり、GUI 側は換算しない。定数 BPM で換算したフレームを
+/// 送っていた旧形は、テンポカーブのある曲で「指定した小節と実際に走査する位置が
+/// ずれる」ので撤去した。
 #[derive(Debug, Clone, Copy)]
 pub enum RenderSpan {
     /// Full-song export: write (and walk) `0..song_length`. (`ExportWav`
@@ -66,11 +73,70 @@ pub enum RenderSpan {
     /// `start`** (cold). Audio whose note began before `start` (e.g. a
     /// VOICEVOX phrase, a held note) is therefore *not* retriggered — the
     /// result matches pressing Play at `start`. Plugin tails start dry.
-    RangeCold { start: u64, end: u64 },
+    RangeCold { start_beat: f64, end_beat: f64 },
     /// Clip-FX bounce: write `[start, end)` but walk **from frame 0** (warm)
     /// so plugin state at `start` is fully accumulated (reverb tails /
     /// parameter ramps / sidechain history). (`BounceClipFxOnline`.)
-    RangeWarm { start: u64, end: u64 },
+    RangeWarm { start_beat: f64, end_beat: f64 },
+}
+
+/// レンダされた 1 ブロックの受け取り先。
+///
+/// 不変条件 6 (live と export は同じ render 関数) の延長で、**offline 走査も
+/// 1 つ** にするための唯一の分岐点。`render_master_buffer` → 窓の切り出し →
+/// PDC シフト → tail 判定 → cancel を二重実装せず、「描いた音をどうするか」
+/// だけを差し替える。
+///
+/// 渡るのは書き出し窓 `[write_start, ..)` に入ったフレームだけ。
+pub trait RenderSink {
+    fn accept(&mut self, l: &[f32], r: &[f32]) -> Result<()>;
+}
+
+/// WAV ファイルへ書く sink (従来の書き出し)。
+struct WavSink<'a> {
+    writer: &'a mut WavWriter<std::io::BufWriter<std::fs::File>>,
+}
+
+impl RenderSink for WavSink<'_> {
+    fn accept(&mut self, l: &[f32], r: &[f32]) -> Result<()> {
+        for (a, b) in l.iter().zip(r.iter()) {
+            self.writer
+                .write_sample(*a)
+                .context("failed to write WAV sample (left)")?;
+            self.writer
+                .write_sample(*b)
+                .context("failed to write WAV sample (right)")?;
+        }
+        Ok(())
+    }
+}
+
+/// ラウドネスを積む sink (r.md #54)。進捗の送出もここが持つ — 収集器が
+/// 「どこまで測ったか」と「今の値」の両方を知っている唯一の場所なので、
+/// 走査ループ側の `on_progress` (フレーム数だけ) とは分けている。
+struct LoudnessSink<F: FnMut(LoudnessReport)> {
+    collector: LoudnessCollector,
+    on_progress: F,
+    last_at: std::time::Instant,
+}
+
+impl<F: FnMut(LoudnessReport)> RenderSink for LoudnessSink<F> {
+    fn accept(&mut self, l: &[f32], r: &[f32]) -> Result<()> {
+        self.collector.push(l, r);
+        // 走査は実時間より遥かに速いので、進捗は wall-clock で間引く
+        // (ExportWavProgress と同じ 250ms)。
+        if self.last_at.elapsed() >= std::time::Duration::from_millis(250) {
+            self.last_at = std::time::Instant::now();
+            (self.on_progress)(self.collector.report(false));
+        }
+        Ok(())
+    }
+}
+
+/// [`run_loudness_analysis`] の結果。
+pub struct LoudnessOutcome {
+    pub report: LoudnessReport,
+    pub cancelled: bool,
 }
 
 /// Run the offline WAV export to completion. Blocks the caller until the
@@ -110,36 +176,14 @@ pub fn run_export(
     write_mod_sidecar: bool,
     on_progress: impl FnMut(u64, u64),
 ) -> Result<ExportOutcome> {
-    if song.bpm <= 0.0 {
-        anyhow::bail!("song.bpm must be positive (got {})", song.bpm);
-    }
+    let win = RenderWindow::resolve(&song, sample_rate, span, true)?;
+    let (write_start, write_end, walk_start, total_samples) =
+        (win.write_start, win.write_end, win.walk_start, win.total_samples);
     // docs/plan_modulation.md §7: derive the modulation sidecar path up front,
     // before `path` is moved into the WAV writer below.
     let sidecar_path = common::mod_sidecar::ModEnvSidecar::sidecar_path(&path);
     let n_tracks = song.tracks.len().min(MAX_TRACKS);
-    // A2 (r.md #8): tempo automation を持つ曲も再生と同じ尺で焼くため、 song body の
-    // sample 長は SongTempo カーブを積分して求める (constant-bpm なら従来の線形
-    // `length_beats * 60*SR/bpm` と一致)。
-    let song_length_samples =
-        common::automation::beats_to_samples(&song, sample_rate, song.length_beats);
-    let tail_max_samples = u64::from(sample_rate) * TAIL_MAX_SECONDS;
-
-    // `write_*` = the window written to the WAV; `walk_start` = where the
-    // render starts processing. Cold range starts the walk at `write_start`
-    // (no pre-range retrigger); warm range / full start at 0.
-    let (write_start, write_end, walk_start) = match span {
-        RenderSpan::Full => (0, song_length_samples, 0),
-        RenderSpan::RangeCold { start, end } => (start, end, start),
-        RenderSpan::RangeWarm { start, end } => (start, end, 0),
-    };
-    if write_end < write_start {
-        anyhow::bail!(
-            "invalid export range: end_frame ({write_end}) < start_frame ({write_start})"
-        );
-    }
-    // walk past write_end by tail_max so plugin release tails / verbs can
-    // decay.
-    let total_samples = write_end.saturating_add(tail_max_samples);
+    let song_length_samples = win.song_length_samples;
 
     tracing::info!(
         path = %path.display(),
@@ -162,54 +206,28 @@ pub fn run_export(
     let mut writer = WavWriter::create(&path, spec)
         .with_context(|| format!("failed to create WAV {}", path.display()))?;
 
-    let mut scratch: Vec<TrackScratch> = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
-    let mut master_l: Vec<f32> = vec![0.0; max_frames];
-    let mut master_r: Vec<f32> = vec![0.0; max_frames];
-
-    // NB: `export_running` (the CPAL-silence flag) and `export_cancel` are
-    // both owned by the daw_audio receive loop, not by this function. The recv
-    // loop reserves `export_running` with a compare_exchange and resets
-    // `export_cancel` *before* spawning this thread (so both are FIFO-ordered
-    // against a later `CancelExport`), and the spawn closure releases
-    // `export_running` after this returns (on every path, including an early
-    // bail above). We only read `export_cancel` here.
-    //
-    // `export_running` is already set (by the recv loop), so wait for
-    // the live CPAL callback to actually park before we touch the shared
-    // plugin-host worker slots. Otherwise a CPAL buffer that was mid-
-    // `process_buffer` when the flag flipped would dispatch to the same worker
-    // slots concurrently with our render ("plugin processing collides"). Once
-    // `live_parked` is observed `true`, the live callback has gone through the
-    // gate and any in-flight buffer has fully drained (CPAL calls serially).
-    let park_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !engine_shared.live_parked.load(Ordering::Acquire) {
-        if std::time::Instant::now() >= park_deadline {
-            tracing::warn!("live callback did not report parked within 2s; proceeding anyway");
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    wait_for_live_park(&engine_shared);
 
     // Plugins are reinitialised (deactivate→activate) by the GUI's
     // `begin_wav_export` → `ReinitAllPlugins` handshake *before* this
     // render runs, so a cold range / full export starts from a clean state (no
     // live reverb tail / VOICEVOX phrase / synth voice bleeding into the head).
-    let render_result = render_loop(
-        &engine_shared,
-        &song,
-        sample_rate,
-        max_frames,
-        total_samples,
-        write_start,
-        write_end,
-        walk_start,
-        write_mod_sidecar,
-        &mut scratch,
-        &mut master_l,
-        &mut master_r,
-        &mut writer,
-        on_progress,
-    );
+    let render_result = {
+        let mut sink = WavSink { writer: &mut writer };
+        render_loop(
+            &engine_shared,
+            &song,
+            sample_rate,
+            max_frames,
+            total_samples,
+            write_start,
+            write_end,
+            walk_start,
+            write_mod_sidecar,
+            &mut sink,
+            on_progress,
+        )
+    };
 
     let (frames_written, env_sidecar, cancelled) = render_result?;
 
@@ -250,6 +268,152 @@ pub fn run_export(
     Ok(ExportOutcome { frames: frames_written, cancelled: false })
 }
 
+/// 走査する窓 (サンプル)。`RenderSpan` (拍) を engine 側 SSoT で解決した結果。
+struct RenderWindow {
+    /// 曲本体の長さ [samples] (tempo automation を積分した値)。
+    song_length_samples: u64,
+    /// sink へ渡し始める / 終える位置。
+    write_start: u64,
+    write_end: u64,
+    /// 走査を開始する位置 (cold = write_start、warm/full = 0)。
+    walk_start: u64,
+    /// 走査の終端 (= write_end + tail、tail 無しなら write_end)。
+    total_samples: u64,
+}
+
+impl RenderWindow {
+    /// 拍 → サンプル換算はここ 1 箇所 (`beats_to_samples` = tempo automation を
+    /// 積分する SSoT)。`tail` が false のときは減衰を測らず窓ちょうどで止める
+    /// (ラウドネス解析 = 「範囲のラウドネス」であって範囲外の残響ではない)。
+    fn resolve(song: &Song, sample_rate: u32, span: RenderSpan, tail: bool) -> Result<Self> {
+        if song.bpm <= 0.0 {
+            anyhow::bail!("song.bpm must be positive (got {})", song.bpm);
+        }
+        // A2 (r.md #8): tempo automation を持つ曲も再生と同じ尺で焼くため、 song body の
+        // sample 長は SongTempo カーブを積分して求める (constant-bpm なら従来の線形
+        // `length_beats * 60*SR/bpm` と一致)。
+        let song_length_samples =
+            common::automation::beats_to_samples(song, sample_rate, song.length_beats);
+        let to_frames = |beat: f64| {
+            common::automation::beats_to_samples(song, sample_rate, beat.max(0.0))
+        };
+        // `write_*` = the window handed to the sink; `walk_start` = where the
+        // render starts processing. Cold range starts the walk at `write_start`
+        // (no pre-range retrigger); warm range / full start at 0.
+        let (write_start, write_end, walk_start) = match span {
+            RenderSpan::Full => (0, song_length_samples, 0),
+            RenderSpan::RangeCold { start_beat, end_beat } => {
+                let s = to_frames(start_beat);
+                (s, to_frames(end_beat), s)
+            }
+            RenderSpan::RangeWarm { start_beat, end_beat } => {
+                (to_frames(start_beat), to_frames(end_beat), 0)
+            }
+        };
+        if write_end < write_start {
+            anyhow::bail!(
+                "invalid render range: end ({write_end}) < start ({write_start}) [samples]"
+            );
+        }
+        // walk past write_end by tail_max so plugin release tails / verbs can
+        // decay.
+        let total_samples = if tail {
+            write_end.saturating_add(u64::from(sample_rate) * TAIL_MAX_SECONDS)
+        } else {
+            write_end
+        };
+        Ok(Self { song_length_samples, write_start, write_end, walk_start, total_samples })
+    }
+}
+
+/// `export_running` は既に recv loop が立てているので、live CPAL コールバックが
+/// 実際に park するのを待ってから共有 plugin-host worker slot に触る。待たないと
+/// フラグを立てた瞬間に `process_buffer` の途中だったバッファが、この走査と同じ
+/// slot へ同時 dispatch する ("plugin processing collides")。`live_parked` が
+/// true を返した時点で live 側はゲートを通っており、in-flight のバッファは
+/// 完全に抜けている (CPAL は直列に呼ぶ)。
+fn wait_for_live_park(engine_shared: &EngineShared) {
+    let park_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !engine_shared.live_parked.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= park_deadline {
+            tracing::warn!("live callback did not report parked within 2s; proceeding anyway");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// r.md #54: 範囲のラウドネスをオフラインで解析する。
+///
+/// [`run_export`] と**同じ走査** (`render_loop` → `render_master_buffer`) を通り、
+/// 出力先だけ WAV 書き込みから [`LoudnessCollector`] へ差し替える。したがって
+/// 「解析した値」と「同じ範囲を書き出した WAV の値」は構造的に一致する。
+///
+/// 減衰 tail は測らない (`RenderWindow::resolve(.., tail = false)`) ので、
+/// 走査は範囲末尾ちょうどで止まる。中断は `EngineShared::export_cancel`
+/// (= `AudioCommand::CancelExport`) で、書き出しと共通。
+pub fn run_loudness_analysis(
+    engine_shared: Arc<EngineShared>,
+    song: Song,
+    sample_rate: u32,
+    max_frames: usize,
+    span: RenderSpan,
+    on_progress: impl FnMut(LoudnessReport),
+) -> Result<LoudnessOutcome> {
+    let win = RenderWindow::resolve(&song, sample_rate, span, false)?;
+    let (range_start_beat, range_end_beat) = match span {
+        RenderSpan::Full => (0.0, song.length_beats),
+        RenderSpan::RangeCold { start_beat, end_beat }
+        | RenderSpan::RangeWarm { start_beat, end_beat } => (start_beat, end_beat),
+    };
+    tracing::info!(
+        sample_rate,
+        write_start = win.write_start,
+        write_end = win.write_end,
+        range_start_beat,
+        range_end_beat,
+        "starting offline loudness analysis"
+    );
+
+    wait_for_live_park(&engine_shared);
+
+    let mut sink = LoudnessSink {
+        collector: LoudnessCollector::new(
+            sample_rate,
+            range_start_beat,
+            range_end_beat,
+            win.write_start,
+            win.write_end.saturating_sub(win.write_start),
+            max_frames,
+        ),
+        on_progress,
+        last_at: std::time::Instant::now(),
+    };
+    let (_frames, _sidecar, cancelled) = render_loop(
+        &engine_shared,
+        &song,
+        sample_rate,
+        max_frames,
+        win.total_samples,
+        win.write_start,
+        win.write_end,
+        win.walk_start,
+        false,
+        &mut sink,
+        |_, _| {},
+    )?;
+    let report = sink.collector.report(!cancelled);
+    tracing::info!(
+        integrated = report.integrated_lufs,
+        lra = report.lra_lu,
+        true_peak = report.true_peak_dbtp,
+        measured_secs = report.measured_secs,
+        cancelled,
+        "offline loudness analysis finished"
+    );
+    Ok(LoudnessOutcome { report, cancelled })
+}
+
 /// r.md #39: 書き出し窓と走査終端を master 出力の PDC 遅延ぶん **後ろ** へずらす。
 ///
 /// PDC は export でも有効なので (`compile_schedule` は live と共通)、`master_buffer[P]`
@@ -288,12 +452,16 @@ fn render_loop(
     write_end: u64,
     walk_start: u64,
     write_mod_sidecar: bool,
-    scratch: &mut [TrackScratch],
-    master_l: &mut [f32],
-    master_r: &mut [f32],
-    writer: &mut WavWriter<std::io::BufWriter<std::fs::File>>,
+    sink: &mut dyn RenderSink,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(u64, common::mod_sidecar::ModEnvSidecar, bool)> {
+    // heap 確保はここで一度だけ (この走査は off-RT)。
+    let mut scratch: Vec<TrackScratch> = (0..MAX_TRACKS).map(|_| TrackScratch::new()).collect();
+    let mut master_l: Vec<f32> = vec![0.0; max_frames];
+    let mut master_r: Vec<f32> = vec![0.0; max_frames];
+    let scratch = &mut scratch[..];
+    let master_l = &mut master_l[..];
+    let master_r = &mut master_r[..];
     // Tail-silence cutoff: stop early if the master bus stays under
     // -60 dB for half a second once we're past the song body.
     let silence_thresh: f32 = 0.001;
@@ -364,8 +532,15 @@ fn render_loop(
     // (`ApplyDelay`), group buses, SidechainTap and master fx all flow from
     // it via `render_master_buffer`. `buffer_frames` = このループの処理単位
     // `max_frames` (leaf 宛 sidechain tap の 1-buffer 補償量、 live と同規則)。
-    let mut schedule = compile_schedule(song, sample_rate, max_frames as u32)
-        .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
+    // PDC の入力 (device 単位の報告 latency) は live publish と同じ表を読む
+    // (`compile_schedule` は live / export 共通なので入力も共通)。
+    let mut schedule = compile_schedule(
+        song,
+        &engine_shared.device_latencies.load(),
+        sample_rate,
+        max_frames as u32,
+    )
+    .map_err(|e| anyhow::anyhow!("export schedule compile failed: {e:?}"))?;
 
     // r.md #39: PDC 遅延ぶん書き出し窓を後ろへずらす (下の helper に理由を集約)。
     let (write_start, write_end, total_samples) = shift_window_for_master_latency(
@@ -510,25 +685,16 @@ fn render_loop(
             block_peak = block_peak.max(l.abs()).max(r.abs());
         }
 
-        // Write only frames in [write_start, ∞). When the block
+        // Hand only frames in [write_start, ∞) to the sink. When the block
         // straddles write_start (e.g. write_start = 12000, block =
-        // [10000, 11500) → none written; block = [10000, 13000) →
-        // skip 0..2000, write 2000..3000), the suffix is written.
+        // [10000, 11500) → nothing; block = [10000, 13000) →
+        // skip 0..2000, hand 2000..3000), the suffix is handed over.
         // Before write_start, the entire block is rendered (= plugin
-        // state advances) but skipped from the WAV output.
+        // state advances) but skipped from the output.
         if block_end > write_start {
-            let local_start = (write_start.saturating_sub(block_start)) as usize;
-            for i in local_start..frames {
-                let l = master_l[i];
-                let r = master_r[i];
-                writer
-                    .write_sample(l)
-                    .context("failed to write WAV sample (left)")?;
-                writer
-                    .write_sample(r)
-                    .context("failed to write WAV sample (right)")?;
-                frames_written += 1;
-            }
+            let local_start = ((write_start.saturating_sub(block_start)) as usize).min(frames);
+            sink.accept(&master_l[local_start..frames], &master_r[local_start..frames])?;
+            frames_written += (frames - local_start) as u64;
         }
 
         playhead += frames as u64;
@@ -597,6 +763,83 @@ mod tests {
         assert_eq!(total, 124_096, "走査を L だけ延長して末尾を欠けさせない");
         // 書き出される長さは latency に依らず「要求された範囲」のまま。
         assert_eq!(total - ws, 120_000);
+    }
+
+    /// 120 BPM / 48kHz = 24,000 samples/beat の素の song。
+    fn song(length_beats: f64) -> Song {
+        Song { bpm: 120.0, length_beats, ..Song::default() }
+    }
+
+    #[test]
+    fn 全曲は曲末まで書いて減衰ぶん走査を延ばす() {
+        let w = RenderWindow::resolve(&song(16.0), 48_000, RenderSpan::Full, true).unwrap();
+        assert_eq!((w.write_start, w.write_end, w.walk_start), (0, 384_000, 0));
+        // 走査は write_end + TAIL_MAX_SECONDS。
+        assert_eq!(w.total_samples, 384_000 + 48_000 * TAIL_MAX_SECONDS);
+    }
+
+    #[test]
+    fn cold_範囲は先頭から走り_解析では減衰を測らない() {
+        let s = song(64.0);
+        let span = RenderSpan::RangeCold { start_beat: 8.0, end_beat: 24.0 };
+        // 書き出し (tail あり)。
+        let wav = RenderWindow::resolve(&s, 48_000, span, true).unwrap();
+        assert_eq!((wav.write_start, wav.write_end), (192_000, 576_000));
+        assert_eq!(wav.walk_start, 192_000, "cold は範囲の先頭から走る");
+        assert_eq!(wav.total_samples, 576_000 + 48_000 * TAIL_MAX_SECONDS);
+        // 解析 (tail なし) — r.md #54: 範囲ちょうどで止める。
+        let an = RenderWindow::resolve(&s, 48_000, span, false).unwrap();
+        assert_eq!(an.total_samples, an.write_end, "解析が範囲外の減衰まで測っている");
+        assert_eq!(
+            an.write_end - an.write_start,
+            384_000,
+            "測定長 = 16 拍 = 8 秒ぶんのフレーム"
+        );
+    }
+
+    #[test]
+    fn warm_範囲は曲頭から走ってプラグイン状態を温める() {
+        let w = RenderWindow::resolve(
+            &song(64.0),
+            48_000,
+            RenderSpan::RangeWarm { start_beat: 8.0, end_beat: 24.0 },
+            true,
+        )
+        .unwrap();
+        assert_eq!((w.write_start, w.write_end), (192_000, 576_000));
+        assert_eq!(w.walk_start, 0, "warm は 0 から走らないとプラグインが温まらない");
+    }
+
+    #[test]
+    fn 壊れた入力は走査せず失敗させる() {
+        let s = song(64.0);
+        // 逆順の範囲。
+        assert!(
+            RenderWindow::resolve(
+                &s,
+                48_000,
+                RenderSpan::RangeCold { start_beat: 24.0, end_beat: 8.0 },
+                false
+            )
+            .is_err()
+        );
+        // bpm が 0 以下 (拍→サンプル換算が定義できない)。
+        let bad = Song { bpm: 0.0, ..song(16.0) };
+        assert!(RenderWindow::resolve(&bad, 48_000, RenderSpan::Full, true).is_err());
+    }
+
+    #[test]
+    fn 空範囲は_0_フレームとして通す() {
+        // 「測るものが無い」は失敗ではない (GUI 側が事前に弾くが、engine も壊れない)。
+        let w = RenderWindow::resolve(
+            &song(16.0),
+            48_000,
+            RenderSpan::RangeCold { start_beat: 4.0, end_beat: 4.0 },
+            false,
+        )
+        .unwrap();
+        assert_eq!(w.write_start, w.write_end);
+        assert_eq!(w.total_samples, w.walk_start, "空範囲で走査ループが 1 度も回らない");
     }
 
     #[test]

@@ -54,6 +54,33 @@ impl PortConfig {
     pub fn is_video(&self) -> bool {
         self.has_video_input || self.has_video_output
     }
+
+    /// port 構成が「まだ解決されていない」 (= 全 false の初期値)。
+    #[must_use]
+    pub fn is_unresolved(&self) -> bool {
+        *self == PortConfig::default()
+    }
+
+    /// device が持つべき port 構成を決める **唯一の規則**。
+    ///
+    /// - 既に解決済み (= どれかの port が true) ならそれを保つ。 保存済み project /
+    ///   picker で挿した device の構成であり、 plugin DB が未 scan・scan 失敗・
+    ///   plugin 未インストールでも壊れないための durable な値。
+    /// - 未解決 (全 false) のときだけ plugin DB から導出する。 DB にも無ければ
+    ///   未解決のまま (= 役割導出は後続の rescan に委ねる)。
+    ///
+    /// この規則を 2 箇所で別々に書いていたのが r.md #9 の一因だった:
+    /// `SlotPluginLoaded` の backfill だけが DB を優先していたため、 DB と保存値が
+    /// 食い違う環境ではプラグインの load 応答が届くたびに `PluginInstance` が
+    /// 書き換わり、 **保存済みプロジェクトを開いただけで `*`** が付いた。
+    #[must_use]
+    pub fn resolve(existing: PortConfig, from_db: Option<PortConfig>) -> PortConfig {
+        if existing.is_unresolved() {
+            from_db.unwrap_or(existing)
+        } else {
+            existing
+        }
+    }
 }
 
 impl PortConfig {

@@ -4,6 +4,7 @@
 //! 「undo 対象か / 発火元は何か」 で判断する (§7.5 の表)。 group struct は
 //! 純データ (メソッドは AppData 側 / SongDoc のみ振る舞いを持つ)。
 
+pub mod loudness;
 pub mod song_doc;
 pub mod transport;
 pub mod selection;
@@ -15,6 +16,7 @@ pub mod ui_prefs;
 pub mod ui_ephemeral;
 pub mod activity;
 
+pub use loudness::{LoudnessPhase, LoudnessState};
 pub use song_doc::{EditScope, SongDoc, StreamGesture};
 pub use activity::ActivityState;
 pub use transport::TransportState;
@@ -48,6 +50,8 @@ pub struct AppData {
     pub ui_ephemeral: UiEphemeral,
     /// r.md #49: アプリの窓がアクティブか (省電力判定の材料)。
     pub activity: ActivityState,
+    /// r.md #54: 範囲ラウドネス解析の進行とレポート (session-only)。
+    pub loudness: LoudnessState,
     /// r.md #50: テレメトリスレッドの `MasterAnalyzer` へ渡す設定とリセット要求。
     /// UI スレッドが書き、解析スレッドが 1 ティック 1 回読む唯一の口
     /// (逆向きは `AppEvent::MasterMeterTick`)。
@@ -144,9 +148,23 @@ impl AppData {
     /// mutation の遮断はこの 1 箇所 (edit_song / normalize_song チョークポイント) に
     /// 集約する。 export 状態は transport が SSoT なので、 編集直前に毎回同期する
     /// (別途 toggle する scatter を作らない = 「解除し忘れ」故障モードを消す)。
-    fn sync_export_lock(&mut self) {
-        let exporting =
-            self.transport.pending_video_export.is_some() || self.transport.export_stage.is_some();
-        self.song_doc.set_export_lock(exporting);
+    /// `SongDoc` の編集ロックを現在のオフライン走査状況に合わせる。
+    ///
+    /// `edit_song` の入口だけでなく、**走査の開始 / 終了時にも呼ぶ**
+    /// (`handler::loudness` / `handler::export`)。`edit_song` を経由せず
+    /// `song_doc.edit` を直接呼ぶ経路 (BPM スクラブ等) があるので、入口同期だけだと
+    /// 「走査が始まった直後の編集が素通りする」窓が残るため。
+    pub(crate) fn sync_export_lock(&mut self) {
+        self.song_doc.set_export_lock(self.offline_render_busy());
+    }
+
+    /// オフライン走査 (WAV / video 書き出し・範囲ラウドネス解析) のいずれかが
+    /// 進行中か。engine は `export_running` でこれらを排他しているので、GUI 側も
+    /// 「編集を止める / 再生を止める / 背景を遮断する」判断を 1 つの述語に集約する。
+    #[must_use]
+    pub fn offline_render_busy(&self) -> bool {
+        self.transport.pending_video_export.is_some()
+            || self.transport.export_stage.is_some()
+            || self.loudness.phase.is_busy()
     }
 }

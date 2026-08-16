@@ -76,7 +76,7 @@ struct ScriptHost {
     bootstrap: Bootstrap,
     /// `--output` etc. を script に渡すための args bag。
     script_args: ScriptArgs,
-    /// 直前の `loadSongFromObject` で送った Song を keep。 `setTrackLatency`
+    /// 直前の `loadSongFromObject` で送った Song を keep。 `setGeneratedAudio`
     /// など差分更新が必要な API のために。
     last_loaded_song: Option<Song>,
     /// PR7 follow-up (JS test infra): GUI mode の `AppData` と同じ役割を
@@ -86,13 +86,10 @@ struct ScriptHost {
     /// app.handle_event 経由)。 dispatcher は test 用の Recording / Noop
     /// を使う (winit event loop 無し)。
     app: AppData,
-    /// PR3.3: GUI mode の `AppData` と同じ役割。 `pump_until` 内で
-    /// `SlotPluginLoaded` を見たときに `(device_id → track_id)` を覚えて
-    /// おき、 `PluginLatencyChanged` 受信時に track の累積 latency を
-    /// 計算して `last_loaded_song` を更新 → `LoadSong` を再送する
-    /// (v29: key は安定 device id)。
+    /// PR3.3: GUI mode の `AppData` と同じ役割。 `SlotPluginLoaded` で
+    /// `(device_id → track_id)` を覚え、 unload で落とす (v29: key は安定
+    /// device id)。 latency の中継は device 単位なのでこの map を経由しない。
     plugin_to_track: std::collections::HashMap<u64, u32>,
-    plugin_latencies: std::collections::HashMap<u64, u32>,
     track_plugin_ids: std::collections::HashMap<u32, Vec<u64>>,
     /// v29: 生 `daw.setSlotPlugin` 用の要求 generation counter (AppData の
     /// counter と衝突しないよう ScriptHost 側でも単調増加を維持し、 送信前に
@@ -169,7 +166,6 @@ impl ScriptHost {
             script_args: ScriptArgs { output, extra },
             last_loaded_song: None,
             plugin_to_track: std::collections::HashMap::new(),
-            plugin_latencies: std::collections::HashMap::new(),
             track_plugin_ids: std::collections::HashMap::new(),
             next_raw_load_generation: 0,
             plugin_load_events: PluginLoadEvents::default(),
@@ -202,9 +198,8 @@ impl ScriptHost {
     /// `spawn_incoming_bridge` 相当):
     ///   - `SlotPluginLoaded` → `OpenPluginShmem` を audio に forward + device
     ///     ↔ track を local map に記録
-    ///   - `PluginLatencyChanged` → plugin latency を local map に積み、
-    ///     track 累積を recompute、 `last_loaded_song` を更新して
-    ///     `LoadSong` を audio に再送 (PR3.3 PDC 反映経路)
+    ///   - `PluginLatencyChanged` → `AudioCommand::SetDeviceLatency` として
+    ///     そのまま audio へ中継 (PR3.3 PDC 反映経路。 集計は engine 側)
     ///   - `SlotPluginUnloaded` → device_id を 3 つの local map から退避
     ///
     /// timeout を超えたら `Err`。
@@ -293,17 +288,23 @@ impl ScriptHost {
                     }));
             }
             PluginEvent::SlotPluginUnloaded { device_id } => {
-                self.plugin_latencies.remove(device_id);
                 self.plugin_to_track.remove(device_id);
                 for v in self.track_plugin_ids.values_mut() {
                     v.retain(|p| p != device_id);
                 }
                 self.track_plugin_ids.retain(|_, v| !v.is_empty());
-                self.recompute_track_latencies();
+                let _ = self.bootstrap.audio_tx.send(AudioCommand::SetDeviceLatency {
+                    device_id: *device_id,
+                    samples: 0,
+                });
             }
             PluginEvent::PluginLatencyChanged { device_id, samples } => {
-                self.plugin_latencies.insert(*device_id, *samples);
-                self.recompute_track_latencies();
+                // GUI mode と同じく **device 単位のまま** engine へ中継する
+                // (track 合計は `compile_schedule` が導出する = 集計を二重に持たない)。
+                let _ = self.bootstrap.audio_tx.send(AudioCommand::SetDeviceLatency {
+                    device_id: *device_id,
+                    samples: *samples,
+                });
             }
             PluginEvent::SlotPluginLoadFailed {
                 device_id,
@@ -359,51 +360,6 @@ impl ScriptHost {
         }
     }
 
-    /// AppData::recompute_track_latencies の script-mode mirror。 song の
-    /// 各 track について plugin latencies を sum し、 値が変わったら
-    /// `LoadSong` を audio に再送して PDC を反映させる。
-    fn recompute_track_latencies(&mut self) {
-        let Some(song) = self.last_loaded_song.as_mut() else {
-            return;
-        };
-        let mut changed = false;
-        for (track_id, plugin_ids) in &self.track_plugin_ids {
-            let total: u32 = plugin_ids
-                .iter()
-                .map(|pid| self.plugin_latencies.get(pid).copied().unwrap_or(0))
-                .sum();
-            // r.md #39: master fx (MASTER_TRACK_ID) も sentinel 分岐付き accessor で
-            // 書き戻す (旧 `tracks` 線形探索では master 分が黙って捨てられていた)。
-            if let Some(slot) = song.reported_latency_mut(*track_id)
-                && *slot != total
-            {
-                *slot = total;
-                changed = true;
-            }
-        }
-        let track_ids_with_plugins: std::collections::HashSet<u32> =
-            self.track_plugin_ids.keys().copied().collect();
-        for t in &mut song.tracks {
-            if !track_ids_with_plugins.contains(&t.id)
-                && t.reported_latency_samples != 0
-            {
-                t.reported_latency_samples = 0;
-                changed = true;
-            }
-        }
-        if !track_ids_with_plugins.contains(&common::model::MASTER_TRACK_ID)
-            && song.master_reported_latency_samples != 0
-        {
-            song.master_reported_latency_samples = 0;
-            changed = true;
-        }
-        if changed {
-            // v29: Song を受けるのは daw_audio のみ (plugin_host は order-free
-            // な flat map になり LoadSong variant 自体が無い)。
-            let cloned = song.clone();
-            let _ = self.bootstrap.audio_tx.send(AudioCommand::LoadSong(cloned));
-        }
-    }
 }
 
 /// `HOST` を borrow_mut してクロージャを実行する短縮ヘルパ。
@@ -487,8 +443,13 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             4,
         )
         .function(
-            NativeFunction::from_fn_ptr(daw_set_track_latency),
-            js_string!("setTrackLatency"),
+            NativeFunction::from_fn_ptr(daw_analyze_loudness),
+            js_string!("analyzeLoudnessJson"),
+            3,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(daw_set_device_latency),
+            js_string!("setDeviceLatency"),
             2,
         )
         .function(
@@ -958,13 +919,16 @@ fn daw_reinit_for_export(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -
     Ok(JsValue::undefined())
 }
 
-/// `daw.exportWavRange(path, startFrame, endFrame, timeoutMs)` — offline export
-/// of a sample-frame range (the cold range, GUI's
+/// `daw.exportWavRange(path, startBeat, endBeat, timeoutMs)` — offline export
+/// of a beat range (the cold range, GUI's
 /// `AudioCommand::ExportWav { range: Some(..) }`), driven headlessly.
+///
+/// r.md #54: 引数は **拍** (旧: サンプルフレーム)。拍→サンプル換算は daw_audio 側
+/// (`beats_to_samples` = tempo automation を積分する SSoT) 一本になった。
 fn daw_export_wav_range(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let path_str = String::try_from_js(args.get_or_undefined(0), ctx)?;
-    let start = u64::try_from_js(args.get_or_undefined(1), ctx)?;
-    let end = u64::try_from_js(args.get_or_undefined(2), ctx)?;
+    let start = f64::try_from_js(args.get_or_undefined(1), ctx)?;
+    let end = f64::try_from_js(args.get_or_undefined(2), ctx)?;
     let timeout_ms = u64::try_from_js(args.get_or_undefined(3), ctx).unwrap_or(120_000);
     let pump_result = with_host(|h| {
         h.drain_pending_for(Duration::from_millis(50));
@@ -990,35 +954,98 @@ fn daw_export_wav_range(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
     }
 }
 
-fn daw_set_track_latency(
+/// `daw.analyzeLoudnessJson(startBeat, endBeat, timeoutMs)` — r.md #54 の範囲
+/// ラウドネス解析を headless で走らせ、確定レポートを JSON 文字列で返す。
+///
+/// `startBeat >= endBeat` を渡すと全曲 (`range = None`)。GUI と違って
+/// プラグイン再初期化は挟まないので、必要なら先に `daw.reinitForExport()` を呼ぶ
+/// (`exportWavRange` と同じ流儀)。
+fn daw_analyze_loudness(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let start = f64::try_from_js(args.get_or_undefined(0), ctx)?;
+    let end = f64::try_from_js(args.get_or_undefined(1), ctx)?;
+    let timeout_ms = u64::try_from_js(args.get_or_undefined(2), ctx).unwrap_or(120_000);
+    let range = (end > start).then_some((start, end));
+    let pump_result = with_host(|h| {
+        h.drain_pending_for(Duration::from_millis(50));
+        let _ = h
+            .bootstrap
+            .audio_tx
+            .send(AudioCommand::AnalyzeLoudness { range });
+        h.pump_until(
+            |msg| {
+                matches!(
+                    msg,
+                    ChildEvent::Audio(AudioEvent::LoudnessAnalysisComplete { .. })
+                )
+            },
+            Duration::from_millis(timeout_ms),
+        )
+    });
+    match pump_result {
+        Ok(ChildEvent::Audio(AudioEvent::LoudnessAnalysisComplete {
+            report: Some(r),
+            error: None,
+            cancelled: false,
+        })) => {
+            // 曲線とヒストグラムは巨大なので、スカラーだけを JSON にする
+            // (headless の検証で欲しいのは数値)。
+            let json = format!(
+                concat!(
+                    "{{\"integrated_lufs\":{},\"lra_lu\":{},\"max_momentary_lufs\":{},",
+                    "\"max_short_term_lufs\":{},\"true_peak_dbtp\":{},\"sample_peak_dbfs\":{},",
+                    "\"clipped_samples\":{},\"measured_secs\":{},\"total_frames\":{},",
+                    "\"sample_rate\":{}}}"
+                ),
+                json_f32(r.integrated_lufs),
+                json_f32(r.lra_lu),
+                json_f32(r.max_momentary_lufs),
+                json_f32(r.max_short_term_lufs),
+                json_f32(r.true_peak_dbtp),
+                json_f32(r.sample_peak_dbfs),
+                r.clipped_samples,
+                json_f32(r.measured_secs),
+                r.total_frames,
+                r.sample_rate,
+            );
+            Ok(JsValue::from(js_string!(json.as_str())))
+        }
+        Ok(ChildEvent::Audio(AudioEvent::LoudnessAnalysisComplete { error: Some(e), .. })) => {
+            Err(js_native(format!("analyzeLoudness failed: {e}")))
+        }
+        Ok(ChildEvent::Audio(AudioEvent::LoudnessAnalysisComplete { cancelled: true, .. })) => {
+            Err(js_native("analyzeLoudness cancelled".to_string()))
+        }
+        // `report: None` + `error: None` は daw_audio が出さない形。panic せず
+        // エラーで返す (headless driver を落とすより診断可能)。
+        Ok(other) => Err(js_native(format!("analyzeLoudness: unexpected {other:?}"))),
+        Err(e) => Err(js_native(format!("analyzeLoudness: {e}"))),
+    }
+}
+
+/// `-inf` / `NaN` は JSON に書けないので `null` にする。
+fn json_f32(v: f32) -> String {
+    if v.is_finite() { format!("{v:.4}") } else { "null".to_string() }
+}
+
+/// `daw.setDeviceLatency(deviceId, samples)` — plugin host の latency 報告を
+/// 手で注入する (実プラグイン無しで PDC を検証する headless テスト用)。
+///
+/// 旧 `setTrackLatency` は `Song` の track 合計フィールドを書き換えていたが、
+/// 報告 latency は `Song` から外れた (r.md #9) ので device 単位の中継に置き換えた。
+/// production の `PluginEvent::PluginLatencyChanged` 経路と同じコマンドを送る。
+fn daw_set_device_latency(
     _this: &JsValue,
     args: &[JsValue],
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    let track_id = u32::try_from_js(args.get_or_undefined(0), ctx)?;
+    let device_id = u64::try_from_js(args.get_or_undefined(0), ctx)?;
     let samples = u32::try_from_js(args.get_or_undefined(1), ctx)?;
-
-    let res = with_host(|h| -> Result<()> {
-        let song = h
-            .last_loaded_song
-            .as_mut()
-            .ok_or_else(|| anyhow!(
-                "setTrackLatency requires loadSongFromObject to have been called first"
-            ))?;
-        // r.md #39 同件: `track_by_id_mut` だと `MASTER_TRACK_ID` を渡したときに
-        // 黙って捨てられ、master fx の latency を注入する headless テストが
-        // 「何も起きていないのに pass」する。sentinel 分岐付き accessor で通す。
-        if let Some(slot) = song.reported_latency_mut(track_id) {
-            *slot = samples;
-        }
-        // v29: Song は daw_audio のみが受ける (plugin_host に LoadSong は無い)。
-        let cloned = song.clone();
-        let _ = h.bootstrap.audio_tx.send(AudioCommand::LoadSong(cloned));
-        Ok(())
+    with_host(|h| {
+        let _ = h
+            .bootstrap
+            .audio_tx
+            .send(AudioCommand::SetDeviceLatency { device_id, samples });
     });
-    res.map_err(|e| {
-        JsError::from_native(JsNativeError::error().with_message(format!("setTrackLatency: {e}")))
-    })?;
     Ok(JsValue::undefined())
 }
 

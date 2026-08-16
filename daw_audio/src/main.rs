@@ -597,7 +597,12 @@ fn publish_bundle(
         let sched = match song.as_deref() {
             // compile 失敗は empty schedule (silent master) に fallback —
             // 壊れた graph は謎の音ではなく無音として聴こえる方が診断しやすい。
-            Some(s) => match compile_schedule(s, sample_rate, buffer_frames) {
+            Some(s) => match compile_schedule(
+                s,
+                &engine_shared.device_latencies.load(),
+                sample_rate,
+                buffer_frames,
+            ) {
                 Ok(sc) => sc,
                 Err(e) => {
                     tracing::warn!(?e, "graph compile failed; master goes silent");
@@ -905,6 +910,12 @@ async fn recv_loop(
                     shared
                         .recording_lanes
                         .store(Arc::new(std::collections::HashSet::new()));
+                    // device_id keyed の PDC 入力も同じく project スコープ。
+                    // 持ち越すと新 project の同番号 device が、 まだ何も報告して
+                    // いないのに前 project の latency で補償される。
+                    engine_shared
+                        .device_latencies
+                        .store(Arc::new(graph::DeviceLatencies::new()));
                 }
                 let project_dir_g = engine_shared.project_dir.load();
                 let project_dir: Option<std::path::PathBuf> =
@@ -975,6 +986,62 @@ async fn recv_loop(
                 engine_shared
                     .master_gain
                     .store(clamped.to_bits(), Ordering::Relaxed);
+            }
+            Ok(AudioCommand::SetDeviceLatency { device_id, samples }) => {
+                // 報告値はプラグイン (= 信頼できない外部コード) が返した u32 で、
+                // そのまま DelayLine の容量になる。 実在するプラグインの latency は
+                // 高々数百 ms なので、 10 秒相当で頭打ちにして異常値で確保を
+                // 暴走させない (FFI / IPC 境界の値域検証)。
+                let max_samples = session_sample_rate.saturating_mul(10);
+                let samples = if samples > max_samples {
+                    tracing::warn!(
+                        device_id,
+                        samples,
+                        max_samples,
+                        "plugin reported an implausible latency; clamping"
+                    );
+                    max_samples
+                } else {
+                    samples
+                };
+                // PDC の入力更新。 表は off-RT でしか読まれない (compile 時のみ)
+                // ので、 copy-on-write で差し替えて schedule を組み直す。
+                // 値が変わらないなら再 compile しない (plugin host は load ごとに
+                // 0 でも必ず報告してくるので、 無条件 recompile は起動時に
+                // device 数ぶんの無駄な再 compile を生む)。
+                let current = engine_shared.device_latencies.load();
+                let unchanged = match (current.get(&device_id), samples) {
+                    (None, 0) => true,
+                    (Some(&prev), s) => prev == s,
+                    _ => false,
+                };
+                if !unchanged {
+                    let mut next = (**current).clone();
+                    if samples == 0 {
+                        next.remove(&device_id);
+                    } else {
+                        next.insert(device_id, samples);
+                    }
+                    tracing::info!(device_id, samples, "device latency updated (PDC 再 compile)");
+                    engine_shared.device_latencies.store(Arc::new(next));
+                    // song が届く前の報告もあり得る (plugin load の方が速い) —
+                    // その場合は表だけ更新し、 次の LoadSong の compile が拾う。
+                    let song = shared.song.load_full();
+                    if song.is_some() {
+                        publish_bundle(
+                            &mut publisher,
+                            &shared,
+                            &engine_shared,
+                            song,
+                            session_sample_rate,
+                            // 同 project の再 compile。 DelayLine / FollowerSlot の
+                            // 走行状態は引き継ぐ (曲は変わっていない)。
+                            Topology::Recompile {
+                                reset_song_scoped_state: false,
+                            },
+                        );
+                    }
+                }
             }
             Ok(AudioCommand::OpenWorkerPool {
                 n_workers,
@@ -1335,7 +1402,9 @@ async fn recv_loop(
                         // user export range walks cold from the range
                         // start (matches Play-from-here); full export walks 0..len.
                         let span = match range {
-                            Some((start, end)) => export::RenderSpan::RangeCold { start, end },
+                            Some((start_beat, end_beat)) => {
+                                export::RenderSpan::RangeCold { start_beat, end_beat }
+                            }
                             None => export::RenderSpan::Full,
                         };
                         let result = export::run_export(
@@ -1378,6 +1447,100 @@ async fn recv_loop(
                     });
                 }
             }
+            // r.md #54: 範囲ラウドネス解析。ExportWav と同じ engine 予約 /
+            // live park ハンドシェイク / cancel を共有し、走査の出力先だけ
+            // WAV writer から LoudnessCollector へ差し替える。
+            Ok(AudioCommand::AnalyzeLoudness { range }) => {
+                if engine_shared
+                    .export_running
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "AnalyzeLoudness received while a render is already running; ignoring"
+                    );
+                    let _ = out_tx.send(AudioEvent::LoudnessAnalysisComplete {
+                        report: None,
+                        error: Some("export already in progress".into()),
+                        cancelled: false,
+                    });
+                    continue;
+                }
+                let song_snap = shared.song.load();
+                let Some(song_arc) = song_snap.as_ref() else {
+                    tracing::warn!("AnalyzeLoudness received but no song loaded");
+                    engine_shared.export_running.store(false, Ordering::Release);
+                    let _ = out_tx.send(AudioEvent::LoudnessAnalysisComplete {
+                        report: None,
+                        error: Some("no song loaded".into()),
+                        cancelled: false,
+                    });
+                    continue;
+                };
+                let song = (**song_arc).clone();
+                drop(song_snap);
+                // Clear any stale cancel, synchronously on this receive loop so
+                // it is FIFO-ordered against a later CancelExport (same contract
+                // as the ExportWav path above).
+                engine_shared.export_cancel.store(false, Ordering::Release);
+                let engine_shared_clone = Arc::clone(&engine_shared);
+                let engine_shared_release = Arc::clone(&engine_shared);
+                let out_tx_clone = out_tx.clone();
+                let out_tx_progress = out_tx.clone();
+                let sample_rate = session_sample_rate;
+                if let Err(e) = std::thread::Builder::new()
+                    .name("daw-audio-loudness".into())
+                    .spawn(move || {
+                        // スロットルは sink 側 (250ms) が持つ。ここは送るだけ。
+                        let on_progress = move |report: common::loudness_report::LoudnessReport| {
+                            let _ = out_tx_progress
+                                .send(AudioEvent::LoudnessAnalysisProgress(Box::new(report)));
+                        };
+                        // 範囲は cold 走査 (= その範囲を書き出したのと同じ音)。
+                        let span = match range {
+                            Some((start_beat, end_beat)) => {
+                                export::RenderSpan::RangeCold { start_beat, end_beat }
+                            }
+                            None => export::RenderSpan::Full,
+                        };
+                        let result = export::run_loudness_analysis(
+                            engine_shared_clone,
+                            song,
+                            sample_rate,
+                            common::process_data::MAX_FRAMES,
+                            span,
+                            on_progress,
+                        );
+                        engine_shared_release
+                            .export_running
+                            .store(false, Ordering::Release);
+                        let event = match result {
+                            Ok(outcome) => AudioEvent::LoudnessAnalysisComplete {
+                                report: Some(Box::new(outcome.report)),
+                                error: None,
+                                cancelled: outcome.cancelled,
+                            },
+                            Err(e) => {
+                                tracing::error!(error = ?e, "offline loudness analysis failed");
+                                AudioEvent::LoudnessAnalysisComplete {
+                                    report: None,
+                                    error: Some(format!("{e:#}")),
+                                    cancelled: false,
+                                }
+                            }
+                        };
+                        let _ = out_tx_clone.send(event);
+                    })
+                {
+                    tracing::error!(error = ?e, "failed to spawn loudness analysis thread");
+                    engine_shared.export_running.store(false, Ordering::Release);
+                    let _ = out_tx.send(AudioEvent::LoudnessAnalysisComplete {
+                        report: None,
+                        error: Some(format!("failed to spawn loudness thread: {e}")),
+                        cancelled: false,
+                    });
+                }
+            }
             // CancelExport: raise the flag the freewheel loop polls. No-op
             // when no export is running (the next run clears it on entry).
             Ok(AudioCommand::CancelExport) => {
@@ -1390,8 +1553,8 @@ async fn recv_loop(
                 path,
                 source_track,
                 source_clip,
-                start_frame,
-                end_frame,
+                start_beat,
+                end_beat,
             }) => {
                 // Reserve the engine (same atomic reservation as ExportWav —
                 // bounce and WAV export share EngineShared / the CPAL-silence
@@ -1461,10 +1624,7 @@ async fn recv_loop(
                             song,
                             sample_rate,
                             common::process_data::MAX_FRAMES,
-                            export::RenderSpan::RangeWarm {
-                                start: start_frame,
-                                end: end_frame,
-                            },
+                            export::RenderSpan::RangeWarm { start_beat, end_beat },
                             false,
                             // Clip-range bounce has no progress overlay (it
                             // completes quickly and replaces the clip in place).

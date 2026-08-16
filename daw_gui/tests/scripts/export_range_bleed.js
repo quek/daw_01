@@ -29,4 +29,6 @@ if (doReinit) {
   daw.reinitForExport(30000);
 }
 
-daw.exportWavRange(out, 164571, 3620571, 120000);
+// r.md #54: 範囲は **拍** で渡す (旧: サンプルフレーム 164571 / 3620571。
+// この project は 140 BPM / 48kHz なので 8 拍 = 3.1 小節、176 拍 = 45.1 小節で同一区間)。
+daw.exportWavRange(out, 8, 176, 120000);

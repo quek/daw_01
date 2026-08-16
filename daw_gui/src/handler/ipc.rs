@@ -108,6 +108,14 @@ impl AppData {
                     self.transport.export_progress_at = Some(std::time::Instant::now());
                 }
             }
+            // r.md #54: 範囲ラウドネス解析。途中経過は数値も曲線も入っているので、
+            // レポート窓は走査に合わせて伸びるグラフをそのまま描ける。
+            AudioEvent::LoudnessAnalysisProgress(report) => {
+                self.on_loudness_progress(report);
+            }
+            AudioEvent::LoudnessAnalysisComplete { report, error, cancelled } => {
+                self.on_loudness_complete(report, error, cancelled);
+            }
             AudioEvent::BounceClipFxComplete {
                 path,
                 source_track,
@@ -183,6 +191,10 @@ impl AppData {
                         write_mod_sidecar,
                     });
                 }
+                // r.md #54: 同じ reinit ハンドシェイクでラウドネス解析も発火する
+                // (書き出しと解析は engine 側で排他なので、両方 pending になる
+                // ことはない)。
+                self.fire_pending_loudness_analysis();
                 // a panic's reinit just completed — release the audio
                 // engine's master declick hold so it fades back in over a now
                 // clean (silent) mix. Guard on `panic_reinit_due.is_none()` so a

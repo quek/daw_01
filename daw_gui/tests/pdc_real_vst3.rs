@@ -80,7 +80,8 @@ fn pdc_real_mcenter_aligns_master_output() {
 
     // 5. 仕組み (MCenter デフォルト latency = 4096 sample):
     //    - Track A: declared latency 0、 vocal impulse @0、 plugin 無し
-    //    - Track B: declared latency 4096 (= MCenter 実値、 `setTrackLatency`)、
+    //    - Track B: MCenter が自分で 4096 を報告 (`PluginLatencyChanged` →
+    //      `AudioCommand::SetDeviceLatency`)、
     //      MCenter loaded (Fx slot 0)、 vocal impulse @0
     //    PDC が効いていれば:
     //      Track A の path latency (0) を Track B の path latency (4096)

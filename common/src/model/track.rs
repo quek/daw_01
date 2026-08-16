@@ -104,12 +104,6 @@ pub struct Track {
     /// `1` から採番。
     #[serde(default)]
     pub next_send_id: u32,
-    /// Most recent plugin-reported latency for this track, populated by
-    /// the plugin host via the CLAP `latency` extension and cached on
-    /// the model so the GUI can display it and the routing graph can
-    /// recompile PDC compensation. Not user-editable.
-    #[serde(default)]
-    pub reported_latency_samples: u32,
     /// Per-target automation lanes attached to this track. Each lane
     /// carries a `default_value` (used outside any clip / when
     /// `enabled = false`) and a list of `AutomationClip` whose
@@ -239,7 +233,6 @@ impl Default for Track {
             parent_group_id: None,
             sends: Vec::new(),
             next_send_id: 1,
-            reported_latency_samples: 0,
             automation_lanes: Vec::new(),
             next_lane_id: 1,
             mod_routings: Vec::new(),

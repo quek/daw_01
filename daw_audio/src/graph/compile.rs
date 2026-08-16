@@ -34,6 +34,23 @@ pub enum GraphError {
     DanglingReference(u32),
 }
 
+/// 安定 `device_id` → プラグインが報告した processing latency (samples)。
+///
+/// r.md #9: 報告値は plugin host が持つ **実行時の観測値** であって曲の中身ではない
+/// ので `Song` には載せない (載せると保存され、開き直したときに host の報告と
+/// 食い違って「開いただけで `*`」 になる)。 engine は
+/// `AudioCommand::SetDeviceLatency` でこの表を更新し、 track / master の合計は
+/// [`chain_latency`] が chain から導出する (GUI 側では集計しない)。
+pub type DeviceLatencies = HashMap<u64, u32>;
+
+/// `chain` 上の device が報告している latency の合計 (samples)。
+/// 未報告 (= 表に無い) device は 0 として扱う。
+fn chain_latency(chain: &[common::model::PluginInstance], latencies: &DeviceLatencies) -> u32 {
+    chain.iter().fold(0u32, |acc, d| {
+        acc.saturating_add(latencies.get(&d.id).copied().unwrap_or(0))
+    })
+}
+
 /// Compile a `Schedule` from `song`. PR2 supports the group hierarchy:
 /// children → group `Mix` → `ProcessGroupFx` → upstream (parent group or
 /// master). Tracks without a `parent_group_id` feed the master bus
@@ -53,6 +70,7 @@ pub enum GraphError {
 /// RT から完全に消えている (`LocalState::refresh_bundle` 参照)。
 pub fn compile_schedule(
     song: &Song,
+    device_latencies: &DeviceLatencies,
     sample_rate: u32,
     buffer_frames: u32,
 ) -> Result<Schedule, GraphError> {
@@ -385,8 +403,12 @@ pub fn compile_schedule(
     // 不一致を `ApplyDelay` で補償する。 Ardour の `Latent` 基底クラス +
     // `route.cc::process_output_buffers` の流儀:
     //
-    //   path_latency(leaf)  = leaf.reported_latency_samples
-    //   path_latency(group) = max(child.path_latency) + group.reported_latency_samples
+    //   path_latency(leaf)  = leaf の chain_latency
+    //   path_latency(group) = max(child.path_latency) + group の chain_latency
+    //
+    // `chain_latency` は device 単位の報告値 (`device_latencies`) を track の
+    // device chain 上で合計したもの。 GUI は集計せず device 単位で送ってくる
+    // (r.md #9: 集計値を `Song` に持たせると保存されて「開いただけで `*`」)。
     //
     // ※ group では子達が group bus に流れ込むときに既に sibling alignment が
     //   行われている (ここで挿入する `ApplyDelay` で揃う) ので、 group の
@@ -396,11 +418,17 @@ pub fn compile_schedule(
     // 補償ルール: 各 Mix ノードの srcs の中で `path_latency` が最も小さい側に、
     //   `frames = max_path - this_path` の `ApplyDelay` を **Mix の直前に**
     //   挿入する。 こうすると合流点で全 src の累積 latency が揃う。
+    let track_chain_latency: Vec<u32> = song
+        .tracks
+        .iter()
+        .map(|t| chain_latency(&t.devices, device_latencies))
+        .collect();
     let mut path_latency = vec![u32::MAX; n];
     for i in 0..n {
         compute_path_latency(
             i as u32,
             &song.tracks,
+            &track_chain_latency,
             &is_group,
             &children_of,
             &id_to_idx,
@@ -437,7 +465,7 @@ pub fn compile_schedule(
                     continue;
                 };
                 let cand = path_latency[s_idx as usize]
-                    .saturating_add(dest.reported_latency_samples);
+                    .saturating_add(track_chain_latency[d_idx as usize]);
                 if cand > path_latency[d_idx as usize] {
                     path_latency[d_idx as usize] = cand;
                     changed = true;
@@ -610,7 +638,7 @@ pub fn compile_schedule(
         // ので、その報告 latency も足さないと master に遅延プラグインを挿したときだけ
         // click が先行し、書き出し WAV もその分ずれる。
         master_latency_samples: master_mix_latency
-            .saturating_add(song.master_reported_latency_samples),
+            .saturating_add(chain_latency(&song.master_fx_chain, device_latencies)),
     })
 }
 
@@ -677,7 +705,7 @@ fn emit_aux_input_taps(
 /// (memoization)。
 ///
 /// PR3: group (`is_group` メンバ) は子の path_latency の最大値を自身の input
-/// bus latency として、 そこに自身の `reported_latency_samples` を足す。
+/// bus latency として、 そこに自身の chain latency (device 報告値の合計) を足す。
 ///
 /// PR4 sidechain × PDC: track の単一 `devices` チェーン上の各 plugin の
 /// `aux_inputs` の tap も `input bus latency` に取り込む。 すなわち:
@@ -686,7 +714,7 @@ fn emit_aux_input_taps(
 ///       max(child.path_latency for child in children_of(T)),
 ///       max(source.path_latency for (P, source) in sidechain_inputs(T))
 ///   )
-///   path_latency(T) = input_latency(T) + T.reported_latency_samples
+///   path_latency(T) = input_latency(T) + T の chain latency
 ///
 /// 仕様根拠: Ardour `route.cc::process_output_buffers` の "feed-forward
 /// latency reporting" — sidechain edge も `Latent` の input の一種として
@@ -711,6 +739,8 @@ fn emit_aux_input_taps(
 fn compute_path_latency(
     idx: u32,
     tracks: &[common::model::Track],
+    // `tracks` と同順の「その track の device chain が報告する latency の合計」。
+    track_chain_latency: &[u32],
     is_group: &HashSet<u32>,
     children_of: &HashMap<u32, Vec<u32>>,
     id_to_idx: &HashMap<u32, u32>,
@@ -733,6 +763,7 @@ fn compute_path_latency(
                         compute_path_latency(
                             c,
                             tracks,
+                            track_chain_latency,
                             is_group,
                             children_of,
                             id_to_idx,
@@ -760,6 +791,7 @@ fn compute_path_latency(
             let l = compute_path_latency(
                 src_idx,
                 tracks,
+                track_chain_latency,
                 is_group,
                 children_of,
                 id_to_idx,
@@ -794,6 +826,7 @@ fn compute_path_latency(
             let l = compute_path_latency(
                 src_idx,
                 tracks,
+                track_chain_latency,
                 is_group,
                 children_of,
                 id_to_idx,
@@ -809,7 +842,7 @@ fn compute_path_latency(
     }
 
     let max_input = group_input.max(sidechain_input).max(send_input);
-    let total = max_input.saturating_add(track.reported_latency_samples);
+    let total = max_input.saturating_add(track_chain_latency[idx as usize]);
     cache[idx as usize] = total;
     total
 }
@@ -862,11 +895,42 @@ fn emit_mix_src_alignment(
     max_path
 }
 
+/// テスト用: 「どの device も latency を報告していない」 前提で compile する短縮形。
+/// PDC を検証するテストだけが `compile_schedule` に表を明示的に渡す。
+#[cfg(test)]
+pub(crate) fn compile_schedule_for_test(
+    song: &Song,
+    sample_rate: u32,
+    buffer_frames: u32,
+) -> Result<Schedule, GraphError> {
+    compile_schedule(song, &DeviceLatencies::new(), sample_rate, buffer_frames)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::{Song, Track};
+    use common::model::{PluginInstance, Song, Track};
+    use common::plugin_format::PluginFormat;
     use common::port_config::PortConfig;
+
+    /// PDC テスト用: `samples` を報告する device を 1 個持つ chain を作り、
+    /// 報告値を `lat` に登録する。 報告 latency は `Song` ではなく
+    /// `DeviceLatencies` 側に居る (r.md #9) ので、 テストも同じ形で組む。
+    fn latency_chain(
+        lat: &mut DeviceLatencies,
+        device_id: u64,
+        samples: u32,
+    ) -> Vec<PluginInstance> {
+        lat.insert(device_id, samples);
+        vec![PluginInstance {
+            id: device_id,
+            ..PluginInstance::with_ports(
+                format!("test.latent{device_id}"),
+                PluginFormat::Clap,
+                audio_fx_ports(),
+            )
+        }]
+    }
 
     /// v23 single-chain: `Track::default()` を mutator で埋める helper。
     /// downstream crate (daw_audio) の test で `Track { .., ..Track::default() }`
@@ -912,7 +976,7 @@ mod tests {
     #[test]
     fn empty_song_compiles_to_master_only_mix() {
         let song = Song::default();
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
         assert_eq!(sched.nodes.len(), 1);
         match &sched.nodes[0] {
             NodeOp::Mix { dst, srcs } => {
@@ -946,7 +1010,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
         // Depth ordering is stable for a flat song, so ProcessTrack ops
         // appear in reverse-track-order (depth=0 group is just descending
         // index order); both ways the Mix at the end carries both refs.
@@ -1007,7 +1071,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
 
         // Expect (in some order): two leaf ProcessTrack (kick, snare),
         // group's Mix-into-self + ProcessGroupFx, lead ProcessTrack, then
@@ -1120,7 +1184,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
 
         let audio_pos = sched
             .nodes
@@ -1173,7 +1237,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song, 48_000, 0).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule_for_test(&song, 48_000, 0).err(), Some(GraphError::Cycle));
     }
 
     #[test]
@@ -1193,7 +1257,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
         // Track 1 should emit Mix → TrackScratch(0) + ProcessGroupFx(0),
         // not ProcessTrack(0).
         let has_group_fx = sched
@@ -1221,7 +1285,7 @@ mod tests {
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&song, 48_000, 0).err(),
+            compile_schedule_for_test(&song, 48_000, 0).err(),
             Some(GraphError::DanglingReference(99))
         );
     }
@@ -1239,44 +1303,43 @@ mod tests {
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&plain, 48_000, 0).unwrap().master_latency_samples,
+            compile_schedule_for_test(&plain, 48_000, 0).unwrap().master_latency_samples,
             0
         );
 
         // 直列でない 2 track のうち片方が 2048 sample 報告 → master は 2048 で揃う。
+        let mut lat = DeviceLatencies::new();
         let latent = Song {
             tracks: vec![
-                track(|t| {
-                    t.id = 1;
-                    t.reported_latency_samples = 0;
-                }),
+                track(|t| t.id = 1),
                 track(|t| {
                     t.id = 2;
-                    t.reported_latency_samples = 2048;
+                    t.devices = latency_chain(&mut lat, 20, 2048);
                 }),
             ],
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&latent, 48_000, 0).unwrap().master_latency_samples,
+            compile_schedule(&latent, &lat, 48_000, 0).unwrap().master_latency_samples,
             2048
         );
 
         // group 経由 (= 親を指す子がいる) でも、子の latency が group の path latency
         // として master へ伝わる。master src は group 1 本だけ。
+        let mut lat = DeviceLatencies::new();
         let grouped = Song {
             tracks: vec![
                 track(|t| t.id = 1),
                 track(|t| {
                     t.id = 2;
                     t.parent_group_id = Some(1);
-                    t.reported_latency_samples = 512;
+                    t.devices = latency_chain(&mut lat, 20, 512);
                 }),
             ],
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&grouped, 48_000, 0).unwrap().master_latency_samples,
+            compile_schedule(&grouped, &lat, 48_000, 0).unwrap().master_latency_samples,
             512
         );
     }
@@ -1291,6 +1354,7 @@ mod tests {
 
         // (a) send/return: Vocal → Reverb(latency 100)。return が master src なので
         //     master 合流は 100 に揃う。
+        let mut lat = DeviceLatencies::new();
         let sends = Song {
             tracks: vec![
                 track(|t| {
@@ -1305,24 +1369,25 @@ mod tests {
                 }),
                 track(|t| {
                     t.id = 2;
-                    t.reported_latency_samples = 100;
+                    t.devices = latency_chain(&mut lat, 20, 100);
                 }),
             ],
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&sends, 48_000, 0).unwrap().master_latency_samples,
+            compile_schedule(&sends, &lat, 48_000, 0).unwrap().master_latency_samples,
             100,
             "send 先 (return) の latency も master 合流に効く"
         );
 
         // (b) パラアウト: Drums.aux → Snare(latency 256)。dest は独立 bus なので
         //     source の path latency を取り込んだ上で自分の chain latency を足す。
+        let mut lat = DeviceLatencies::new();
+        lat.insert(10, 64);
         let paraout = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
-                    t.reported_latency_samples = 64;
                     t.devices = vec![PluginInstance {
                         id: 10,
                         aux_outputs: vec![Some(AuxOutputRoute::to_track(4))],
@@ -1336,44 +1401,46 @@ mod tests {
                 }),
                 track(|t| {
                     t.id = 4;
-                    t.reported_latency_samples = 256;
+                    t.devices = latency_chain(&mut lat, 40, 256);
                 }),
             ],
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&paraout, 48_000, 0).unwrap().master_latency_samples,
+            compile_schedule(&paraout, &lat, 48_000, 0).unwrap().master_latency_samples,
             64 + 256,
             "paraout dest は source の path latency を取り込む"
         );
 
         // (c) master fx: track 側 latency 0 でも master chain の報告 latency を拾う。
         //     旧実装は master Mix の src だけを見ていたので 0 のまま = click が先行した。
+        let mut lat = DeviceLatencies::new();
         let master_fx = Song {
             tracks: vec![track(|t| t.id = 1)],
-            master_reported_latency_samples: 2048,
+            master_fx_chain: latency_chain(&mut lat, 90, 2048),
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&master_fx, 48_000, 0).unwrap().master_latency_samples,
+            compile_schedule(&master_fx, &lat, 48_000, 0).unwrap().master_latency_samples,
             2048,
             "master fx chain の latency も master 出力の遅延"
         );
 
         // (d) track 側と master fx は加算 (直列なので両方遅れる)。
+        let mut lat = DeviceLatencies::new();
         let both = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
-                    t.reported_latency_samples = 512;
+                    t.devices = latency_chain(&mut lat, 20, 512);
                 }),
                 track(|t| t.id = 2),
             ],
-            master_reported_latency_samples: 2048,
+            master_fx_chain: latency_chain(&mut lat, 90, 2048),
             ..Song::default()
         };
         assert_eq!(
-            compile_schedule(&both, 48_000, 0).unwrap().master_latency_samples,
+            compile_schedule(&both, &lat, 48_000, 0).unwrap().master_latency_samples,
             512 + 2048
         );
     }
@@ -1389,22 +1456,22 @@ mod tests {
     /// 挿入する。
     #[test]
     fn pdc_parallel_tracks_emit_compensating_delay_for_lower_latency_path() {
+        let mut lat = DeviceLatencies::new();
         let song = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
                     t.name = "Clean".into();
-                    t.reported_latency_samples = 0;
                 }),
                 track(|t| {
                     t.id = 2;
                     t.name = "Latent".into();
-                    t.reported_latency_samples = 100;
+                    t.devices = latency_chain(&mut lat, 20, 100);
                 }),
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
 
         // (a) DelayLine が 1 本以上、 capacity ≥ 100 で確保されている。
         assert!(
@@ -1494,22 +1561,22 @@ mod tests {
     fn pdc_two_track_impulse_aligns_at_master_with_loaded_latency_plugin() {
         const FRAMES: usize = 256;
 
+        let mut lat = DeviceLatencies::new();
         let song = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
                     t.name = "A".into();
-                    t.reported_latency_samples = 0;
                 }),
                 track(|t| {
                     t.id = 2;
                     t.name = "B".into();
-                    t.reported_latency_samples = 100;
+                    t.devices = latency_chain(&mut lat, 20, 100);
                 }),
             ],
             ..Song::default()
         };
-        let mut sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let mut sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
 
         // Track ごとに「ロードされた plugin」 を持たせる。 production の
         // CLAP/VST3 と違って format-agnostic な test stub だが、
@@ -1757,7 +1824,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
 
         // (a) SidechainTap が emit されている (安定 device id で addressing)。
         let tap_idx = sched
@@ -1829,7 +1896,7 @@ mod tests {
             }],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
 
         let tap_idx = sched
             .nodes
@@ -1900,18 +1967,20 @@ mod tests {
         use common::model::PluginInstance;
         use common::plugin_format::PluginFormat;
 
+        let mut lat = DeviceLatencies::new();
+        lat.insert(20, 50);
         let song = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
                     t.name = "Source".into();
-                    t.reported_latency_samples = 100;
+                    t.devices = latency_chain(&mut lat, 10, 100);
                 }),
                 track(|t| {
                     t.id = 2;
                     t.name = "Dest".into();
-                    t.reported_latency_samples = 50;
                     t.devices = vec![PluginInstance {
+                        id: 20,
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                         ..PluginInstance::with_ports(
                             "test.compressor".into(),
@@ -1923,7 +1992,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
 
         // Master Mix の input は (TrackScratch(0), TrackScratch(1)) の 2 本。
         // path_latency(A=0) = 100, path_latency(B=1) = 100 + 50 = 150 になっている
@@ -2002,18 +2071,20 @@ mod tests {
         use common::model::PluginInstance;
         use common::plugin_format::PluginFormat;
 
+        let mut lat = DeviceLatencies::new();
+        lat.insert(20, 50);
         let song = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
                     t.name = "Source".into();
-                    t.reported_latency_samples = 100;
+                    t.devices = latency_chain(&mut lat, 10, 100);
                 }),
                 track(|t| {
                     t.id = 2;
                     t.name = "Dest".into();
-                    t.reported_latency_samples = 50;
                     t.devices = vec![PluginInstance {
+                        id: 20,
                         aux_inputs: vec![Some(common::model::AuxInputRoute::post_fader(1))],
                         ..PluginInstance::with_ports(
                             "test.compressor".into(),
@@ -2029,7 +2100,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
 
         assert_eq!(
             sched.input_delay_per_track.len(),
@@ -2070,12 +2141,13 @@ mod tests {
                 audio_fx_ports(),
             )
         };
+        let mut lat = DeviceLatencies::new();
         let song = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
                     t.name = "Source".into();
-                    t.reported_latency_samples = 100;
+                    t.devices = latency_chain(&mut lat, 10, 100);
                     // Bus (id 3) へ send → id 3 は return bus になる。
                     t.sends = vec![Send {
                         id: 1,
@@ -2098,7 +2170,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, BUF).unwrap();
+        let sched = compile_schedule(&song, &lat, 48_000, BUF).unwrap();
 
         // leaf 宛: source path latency (100) + 1 buffer (512)。
         assert_eq!(
@@ -2126,12 +2198,13 @@ mod tests {
         use common::model::PluginInstance;
         use common::plugin_format::PluginFormat;
 
+        let mut lat = DeviceLatencies::new();
         let song = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
                     t.name = "Source".into();
-                    t.reported_latency_samples = 100;
+                    t.devices = latency_chain(&mut lat, 10, 100);
                 }),
                 track(|t| {
                     t.id = 2;
@@ -2151,7 +2224,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
 
         // path_latency は instrument の sidechain も拾う (= 100 + 0 = 100)
         // ので master mix の sibling alignment は機能する。
@@ -2201,7 +2274,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song, 48_000, 0).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule_for_test(&song, 48_000, 0).err(), Some(GraphError::Cycle));
     }
 
     /// 同じく compile-level test: `sidechain_sources` の対象 track が
@@ -2230,7 +2303,7 @@ mod tests {
             })],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
         assert!(
             !sched
                 .nodes
@@ -2268,7 +2341,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
 
         // Vocal is a leaf → ProcessTrack(0). Reverb has an incoming send,
         // so it is a bus → Mix(clear) + MixSend + ProcessGroupFx(1).
@@ -2370,7 +2443,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
         assert!(
             sched.nodes.iter().any(|op| matches!(
                 op,
@@ -2403,7 +2476,7 @@ mod tests {
             })],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song, 48_000, 0).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule_for_test(&song, 48_000, 0).err(), Some(GraphError::Cycle));
     }
 
     #[test]
@@ -2437,7 +2510,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(compile_schedule(&song, 48_000, 0).err(), Some(GraphError::Cycle));
+        assert_eq!(compile_schedule_for_test(&song, 48_000, 0).err(), Some(GraphError::Cycle));
     }
 
     #[test]
@@ -2458,7 +2531,7 @@ mod tests {
             })],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule_for_test(&song, 48_000, 0).unwrap();
         assert!(
             !sched
                 .nodes
@@ -2485,12 +2558,12 @@ mod tests {
         // latency 100) and also feeds master dry. Reverb's path latency =
         // max(send src Vocal = 0) + 100 = 100, so at the master mix the
         // dry Vocal (latency 0) must be delayed 100 to align with the wet.
+        let mut lat = DeviceLatencies::new();
         let song = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
                     t.name = "Vocal".into();
-                    t.reported_latency_samples = 0;
                     t.sends = vec![Send {
                         id: 1,
                         dest_track_id: 2,
@@ -2502,12 +2575,12 @@ mod tests {
                 track(|t| {
                     t.id = 2;
                     t.name = "Reverb".into();
-                    t.reported_latency_samples = 100;
+                    t.devices = latency_chain(&mut lat, 20, 100);
                 }),
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).unwrap();
+        let sched = compile_schedule(&song, &lat, 48_000, 0).unwrap();
 
         let master_mix = sched
             .nodes
@@ -2606,7 +2679,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).expect("全部子 must not cycle");
+        let sched = compile_schedule_for_test(&song, 48_000, 0).expect("全部子 must not cycle");
 
         // (a) ParallelOutTap per port: main(port0) → 子2(idx1), aux0(port1) → 子3(idx2).
         //     v29: source plugin は安定 device id (10) で焼き込まれる。
@@ -2717,7 +2790,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).expect("independent paraout must not cycle");
+        let sched = compile_schedule_for_test(&song, 48_000, 0).expect("independent paraout must not cycle");
 
         // A (idx 0) is a plain leaf: ProcessTrack, no MixAdditive.
         assert!(
@@ -2762,6 +2835,7 @@ mod tests {
         use common::model::{AuxOutputRoute, PluginInstance};
         use common::plugin_format::PluginFormat;
 
+        let mut lat = DeviceLatencies::new();
         let song = Song {
             tracks: vec![
                 track(|t| {
@@ -2787,7 +2861,7 @@ mod tests {
                     t.id = 2;
                     t.name = "Snare".into();
                     t.parent_group_id = Some(1);
-                    t.reported_latency_samples = 100; // 子に latency 持ち FX
+                    t.devices = latency_chain(&mut lat, 20, 100); // 子に latency 持ち FX
                 }),
                 track(|t| {
                     t.id = 3;
@@ -2798,7 +2872,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).expect("must compile");
+        let sched = compile_schedule(&song, &lat, 48_000, 0).expect("must compile");
 
         let add_mix = sched
             .nodes
@@ -2844,13 +2918,15 @@ mod tests {
         use common::model::{AuxOutputRoute, PluginInstance};
         use common::plugin_format::PluginFormat;
 
+        let mut lat = DeviceLatencies::new();
+        lat.insert(10, 100); // source に latency
         let song = Song {
             tracks: vec![
                 track(|t| {
                     t.id = 1;
                     t.name = "Drums".into();
-                    t.reported_latency_samples = 100; // source に latency
                     t.devices = vec![PluginInstance {
+                        id: 10,
                         aux_outputs: vec![Some(AuxOutputRoute::to_track(4))],
                         aux_output_count: 1,
                         ..PluginInstance::with_ports(
@@ -2871,7 +2947,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        let sched = compile_schedule(&song, 48_000, 0).expect("must compile");
+        let sched = compile_schedule(&song, &lat, 48_000, 0).expect("must compile");
 
         let master_mix = sched
             .nodes

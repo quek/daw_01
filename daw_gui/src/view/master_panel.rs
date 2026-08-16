@@ -421,8 +421,12 @@ fn draw_loudness_readout<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: R
             } else {
                 "-inf".to_string()
             },
-            // EBU R128 の上限 -1 dBTP を超えたら警告色。
-            if m.max_true_peak_dbtp > -1.0 { app.theme.daw.record } else { p.text },
+            // 設定中のトゥルーピーク上限 (r.md #54 で解析と共有) を超えたら警告色。
+            if m.max_true_peak_dbtp > s.loudness_true_peak_ceiling_dbtp {
+                app.theme.daw.record
+            } else {
+                p.text
+            },
         ),
     ];
     let mut y = rect.y;
@@ -474,6 +478,20 @@ fn draw_loudness_readout<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: R
                 || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ResetLoudness)),
             );
         }
+        y = clip_rect.y + RESET_BTN_H + 3.0;
+    }
+
+    // r.md #54: 「今のライブ値」の隣に「範囲の確定値」への導線を置く。ここは
+    // ラウドネス数値を見ている最中に「この区間の正式な値が欲しい」と思う場所
+    // なので、押す瞬間に手が届く (Ardour のマスターストリップと同じ発想)。
+    if y + RESET_BTN_H <= rect.y + rect.h {
+        ui.button_at_sized(
+            "mp_analyze_loudness",
+            "範囲を解析...",
+            Rect { x: rect.x, y, w: rect.w, h: RESET_BTN_H },
+            READ_FONT,
+            || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::AnalyzeLoudness)),
+        );
     }
 }
 
