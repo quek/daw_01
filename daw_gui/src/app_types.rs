@@ -1188,6 +1188,27 @@ pub(crate) struct ArrLabelCache {
         std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
 }
 
+/// r.md #56: 再生位置の秒表示用 [`common::tempo_map::TempoMap`] の `song_epoch`
+/// 世代キャッシュ。
+///
+/// `song_beat_to_seconds` は SongTempo automation lane がある曲で毎回
+/// `TempoMap::from_song` を走らせる (1/16 拍刻みで積分。 5 分の曲で ~9,600
+/// breakpoint = 約 77KB の `Vec` 確保)。 transport バーは常時・毎フレーム描画
+/// されるので、 そのまま呼ぶと曲長に比例して悪化する。 `TempoMap` は
+/// 「生成 O(曲長) / 引き O(log n)」 という設計 (tempo_map.rs 冒頭 doc
+/// 「Build off the audio thread (on song change)」) なので、 世代キャッシュに
+/// 載せるのが本来の使い方。 lane が無い曲は `map = None` を持ち、 定数 BPM の
+/// 高速経路 (table を張らない) にそのまま落ちる。
+#[derive(Default)]
+pub(crate) struct TempoMapCache {
+    /// このキャッシュ内容が対応する `AppData::song_epoch`。
+    pub(crate) epoch: u64,
+    /// 一度でも構築したか。 `epoch` の初期値 0 と実際の epoch 0 を区別する。
+    pub(crate) built: bool,
+    /// テンポカーブがある曲だけ `Some`。
+    pub(crate) map: Option<common::tempo_map::TempoMap>,
+}
+
 /// Windows native file dialog (rfd) を background thread で **owner-modal** に
 /// 開くための parent window ラッパー。 `rfd::FileDialog::set_parent` は
 /// `HasWindowHandle + HasDisplayHandle` を要求するが、 GUI スレッドの winit

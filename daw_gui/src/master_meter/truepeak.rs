@@ -115,6 +115,11 @@ pub struct TruePeakMeter {
     block_peak: f32,
     /// リセット以降の最大トゥルーピーク (線形振幅)。
     max_peak: f32,
+    /// r.md #57: `false` (= トランスポート停止) の間は `max_peak` を更新しない。
+    /// 最大トゥルーピークは `reset_loudness` が畳む測定セッション側の量なので、
+    /// Integrated / LRA と同じ stand-by の対象。直近ブロック TP はライブのまま。
+    /// 既定 `true` (オフライン解析は `set_running` を呼ばない)。
+    running: bool,
 }
 
 impl TruePeakMeter {
@@ -125,7 +130,13 @@ impl TruePeakMeter {
             channels: [Channel::new(), Channel::new()],
             block_peak: 0.0,
             max_peak: 0.0,
+            running: true,
         }
+    }
+
+    /// r.md #57: 最大トゥルーピークの積算を running / stand-by で切り替える。
+    pub fn set_running(&mut self, running: bool) {
+        self.running = running;
     }
 
     fn phases_for(sample_rate: u32) -> Vec<[f32; TAPS]> {
@@ -175,7 +186,7 @@ impl TruePeakMeter {
             }
         }
         self.block_peak = block;
-        if block > self.max_peak {
+        if self.running && block > self.max_peak {
             self.max_peak = block;
         }
     }

@@ -2142,8 +2142,13 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         };
 
         let viewport_key_hash: u64 = hash_inputs(viewport_key);
+        // r.md #58: フェードの掴む正方形を出す clip。 `response.hovered_clip` は上の
+        // 「hover 計算」 で **このフレーム中に** 確定済みなので、 caller 側ミラー
+        // (`app.ui_ephemeral.arrangement_hover_clip`、 1 フレーム遅れ) ではなくこちらを使う。
+        // `viewport_key` にも `fold_arrangement_clip_hash` にも入れないこと。
+        let hovered_clip_for_heavy: Option<ClipKey> = response.hovered_clip;
         ui.heavy(("arrangement_inner", &id), move |hctx| {
-            render::render_arrangement_heavy(hctx, tracks_owned, view_copy, style_copy, lanes, ruler, header_pane, header_pane_copy, arranger_rect_copy, arranger_header_rect_copy, arranger_lane_h_copy, beat_per_px, zoom_x_px_per_beat, id_for_inner, viewport_key_hash, clip_content, selected_set, selected_tracks_for_heavy, selected_automation_clips_set_for_heavy, selected_automation_points_for_heavy, mapping, sample_viewport, grid_style, ruler_style, drag_overlay_clone, drag_overlay_min_len, audio_drag_overlay, point_drag_overlay, automation_clip_drag_overlay, curve_param_overlay, lasso_overlay, section_drag_overlay, sections_for_draw, reorder_overlay, loop_preview_clone);
+            render::render_arrangement_heavy(hctx, tracks_owned, view_copy, style_copy, lanes, ruler, header_pane, header_pane_copy, arranger_rect_copy, arranger_header_rect_copy, arranger_lane_h_copy, beat_per_px, zoom_x_px_per_beat, id_for_inner, viewport_key_hash, hovered_clip_for_heavy, clip_content, selected_set, selected_tracks_for_heavy, selected_automation_clips_set_for_heavy, selected_automation_points_for_heavy, mapping, sample_viewport, grid_style, ruler_style, drag_overlay_clone, drag_overlay_min_len, audio_drag_overlay, point_drag_overlay, automation_clip_drag_overlay, curve_param_overlay, lasso_overlay, section_drag_overlay, sections_for_draw, reorder_overlay, loop_preview_clone);
         });
 
         release::commit_releases(ui, wid, &mut response, pointer, view, style, master_row, sections, selected_clips, selected_automation_clips, selected_automation_points, &visible_tracks, &press_tops, lanes, ruler, header_pane, arranger_rect, lanes_h, arranger_lane_h, beat_per_px, zoom_x_px_per_beat, clip_drag_release, clip_short_click_pos, audio_drag_release, point_drag_release, automation_clip_drag_release, automation_curve_param_release, automation_lasso_release, lane_resize_drag_release, section_drag_release, loop_drag_release, track_volume_release, pending_drop);

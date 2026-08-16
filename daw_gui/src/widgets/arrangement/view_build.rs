@@ -251,41 +251,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
     let row_h = app.ui_prefs.arrange_track_row_h.max(1.0);
     let lanes_w = (area.w - app.ui_prefs.arrange_header_w).max(1.0);
     let loop_range = app.transport.loop_region.range();
-    // data_generation: widget の glyph キャッシュ無効化キー (描画内容そのものを hash)。
-    let data_generation = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        tracks.len().hash(&mut h);
-        for (i, t) in tracks.iter().enumerate() {
-            i.hash(&mut h);
-            t.id.hash(&mut h);
-            t.name.hash(&mut h);
-            (t.muted, t.solo, t.armed).hash(&mut h);
-            t.volume.to_bits().hash(&mut h);
-            t.parent_id.hash(&mut h);
-            t.depth.hash(&mut h);
-            (t.collapsed, t.automation_lanes_collapsed).hash(&mut h);
-            t.clips.len().hash(&mut h);
-            for c in &t.clips {
-                c.id.hash(&mut h);
-                c.name.hash(&mut h);
-                c.in_active_group.hash(&mut h);
-                c.muted.hash(&mut h);
-                c.share_group_color.map(f32::to_bits).hash(&mut h);
-                if let Some(col) = c.color {
-                    [col.r, col.g, col.b, col.a].map(f32::to_bits).hash(&mut h);
-                }
-            }
-            for lane in &t.automation_lanes {
-                lane.label.hash(&mut h);
-                for ac in &lane.clips {
-                    ac.id.hash(&mut h);
-                    ac.name.hash(&mut h);
-                }
-            }
-        }
-        h.finish()
-    };
+    let data_generation = data_generation(&tracks);
 
     // r.md #53: 表示原点はデバイスピクセル境界に載せる (`clip_to_rect` が使うのと同じ
     // `beat_to_px` で丸めるので、スクロール中は全アイテムが整数 px の剛体平行移動になる)。
@@ -386,6 +352,50 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
 // ---------------------------------------------------------------------------
 // clip 表示名の導出 (SSoT)
 // ---------------------------------------------------------------------------
+
+/// widget の heavy cache 無効化キー (描画内容そのものを hash)。
+/// 使われるのは `run.rs` の `viewport_key` の 1 成分としてのみ。
+///
+/// r.md #58 同件: **hover 由来で毎フレーム変わる値を混ぜない**。 特に
+/// `ClipView::in_active_group` — これは hover したリンクグループを強調するためだけの
+/// 値で、 読むのは cached **外**の `draw_active_group_overlay` だけ。 混ぜると、
+/// リンククリップにマウスを乗せるたびにアレンジ全体 (グリッド + 全クリップ + 全
+/// オートメーションレーン) の heavy cache が捨てられて再構築される。
+/// widget 側は `fold_arrangement_clip_hash_ignores_in_active_group` で同じ契約を
+/// テスト固定しているが、 caller がここで迂回していた (2026-08-16 に是正)。
+pub(super) fn data_generation(tracks: &[ArrangementTrack]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tracks.len().hash(&mut h);
+    for (i, t) in tracks.iter().enumerate() {
+        i.hash(&mut h);
+        t.id.hash(&mut h);
+        t.name.hash(&mut h);
+        (t.muted, t.solo, t.armed).hash(&mut h);
+        t.volume.to_bits().hash(&mut h);
+        t.parent_id.hash(&mut h);
+        t.depth.hash(&mut h);
+        (t.collapsed, t.automation_lanes_collapsed).hash(&mut h);
+        t.clips.len().hash(&mut h);
+        for c in &t.clips {
+            c.id.hash(&mut h);
+            c.name.hash(&mut h);
+            c.muted.hash(&mut h);
+            c.share_group_color.map(f32::to_bits).hash(&mut h);
+            if let Some(col) = c.color {
+                [col.r, col.g, col.b, col.a].map(f32::to_bits).hash(&mut h);
+            }
+        }
+        for lane in &t.automation_lanes {
+            lane.label.hash(&mut h);
+            for ac in &lane.clips {
+                ac.id.hash(&mut h);
+                ac.name.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
 
 /// gui_01 #019: 共有 clip 群の識別用 hue 計算。golden ratio で `[0.0, 1.0)` 一様分布。
 fn content_id_to_hue(content_id: common::model::ContentId) -> f32 {

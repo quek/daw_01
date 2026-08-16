@@ -326,6 +326,13 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                     app.handle_event(AppEvent::ToggleMasterPanel)
                 }));
             });
+            // r.md #55: 開いているプラグインエディタ窓を一括で閉じる
+            // (Cubase の Window > Close All Plug-in Windows 相当)。
+            m.item("プラグインウィンドウをすべて閉じる", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::CloseAllPluginEditors)
+                }));
+            });
             m.item("Toggle Help", |ui| {
                 ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleHelp)));
             });
@@ -692,6 +699,13 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.toggle_master_panel") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ToggleMasterPanel)
+        }));
+    }
+    // r.md #55: Ctrl+Shift+W で開いているプラグインエディタ窓を全部閉じる。
+    // 転送対象なので、エディタ窓にフォーカスがある状態で押しても同じ経路に合流する。
+    if ui.take_shortcut("daw.close_all_plugin_editors") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::CloseAllPluginEditors)
         }));
     }
     // r.md #48: Ctrl+, で設定を開閉 (Edit メニュー「設定...」 と同じイベント)。

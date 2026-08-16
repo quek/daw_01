@@ -22,6 +22,10 @@ pub(super) fn render_arrangement_heavy(
     zoom_x_px_per_beat: f32,
     id_for_inner: u64,
     viewport_key_hash: u64,
+    // r.md #58: このフレームでマウスが乗っている clip (`ArrangementResponse::hovered_clip`
+    // と同じ値)。 フェードの掴む正方形を出す clip を決めるためだけに使う。
+    // **`viewport_key_hash` の材料にしてはいけない** (hover でアレンジ全体が再構築される)。
+    hovered_clip: Option<ClipKey>,
     clip_content: HashMap<ClipKey, ClipContentDraw>,
     selected_set: HashSet<ClipKey>,
     selected_tracks_for_heavy: Vec<u32>,
@@ -120,7 +124,9 @@ pub(super) fn render_arrangement_heavy(
                             // r.md #38: fade は content 種別に依らず全 clip 種別に描く
                             // (音声だけでなく映像 / 画像 / 字幕も同じ見た目)。
                             // r.md #46: fade の色は clip の実塗り色から auto-contrast。
-                            draw_clip_fades(
+                            // r.md #58: cached 層に残るのは**カーブだけ**。 掴む正方形は
+                            // hover 中の clip にだけ出すので cached 外の overlay で描く。
+                            draw_clip_fade_curves(
                                 hctx,
                                 r,
                                 c.len_beats,
@@ -299,6 +305,26 @@ pub(super) fn render_arrangement_heavy(
                 lanes,
                 &style_copy,
             );
+            // r.md #58: フェードの掴む正方形は hover 中の clip (+ フェードをドラッグ中の
+            // clip) にだけ出す。 選択リングより後 = 手前に描き、 ドラッグ ghost より前に
+            // 置く (掴む対象が最前面、 ドラッグ中のプレビューはさらにその上)。
+            //
+            // `with_clip_rect(lanes, ..)` の入れ子は必須。 `push_filled_rect` は
+            // `clip_rect: None` で外側スコープの scissor に依存しており、 `below_ruler` は
+            // トラックヘッダ帯を含むため、 これが無いと左へスクロールアウトした clip の
+            // 正方形がヘッダの上に漏れる。
+            hctx.with_clip_rect(lanes, |hctx| {
+                draw_fade_handle_overlay(
+                    hctx,
+                    &tracks_owned,
+                    &tops_owned_for_heavy,
+                    view_copy,
+                    lanes,
+                    hovered_clip,
+                    audio_drag_overlay.as_ref().map(|ad| ad.key),
+                    &style_copy,
+                );
+            });
             if let Some((nd, bd, td)) = drag_overlay_clone {
                 draw_drag_preview(
                     hctx,

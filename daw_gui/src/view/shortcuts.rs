@@ -131,6 +131,7 @@ pub static SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { name: "daw.toggle_triplet", keys: &["3"], category: ShortcutCategory::GridView, description: "三連符グリッド ON / OFF", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "daw.toggle_preview_window", keys: &["F12"], category: ShortcutCategory::GridView, description: "ビデオプレビューウィンドウを開く / 閉じる", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "daw.toggle_master_panel", keys: &["Ctrl+Alt+M"], category: ShortcutCategory::GridView, description: "マスターパネル (フェーダー + 各種メーター) を開く / 閉じる", hidden: false, forward_from_external_window: false },
+    ShortcutDef { name: "daw.close_all_plugin_editors", keys: &["Ctrl+Shift+W"], category: ShortcutCategory::GridView, description: "開いているプラグインのエディタ窓をまとめて閉じる", hidden: false, forward_from_external_window: true },
     // ----- オーディオエディタ -----
     ShortcutDef { name: "daw.duplicate_audio_event", keys: &["Ctrl+D"], category: ShortcutCategory::AudioEditor, description: "オーディオイベントを複製", hidden: false, forward_from_external_window: false },
     ShortcutDef { name: "daw.next_audio_event", keys: &["Ctrl+]"], category: ShortcutCategory::AudioEditor, description: "次のオーディオイベントへ", hidden: false, forward_from_external_window: false },
@@ -290,17 +291,22 @@ mod tests {
 
     // -------- r.md #36: プラグインエディタ窓からの転送 -----------------------
 
-    /// 転送対象は Space (再生 / 停止) と Ctrl+S (保存) だけ。
+    /// 転送対象は Space (再生 / 停止)、Ctrl+S (保存)、Ctrl+Shift+W
+    /// (エディタ窓を全部閉じる) の 3 つだけ。
     ///
     /// 素の英数字キー (P / R / F / S / D / …) を足すとプラグイン自身のショートカットと
     /// 衝突する。 Home / End / Delete / Ctrl+X / Ctrl+C / Ctrl+V / Ctrl+A は
     /// `is_typing_only_shortcut` が既に「テキスト入力へ譲る」 と宣言している集合なので
     /// 外部窓からも奪わない。 Esc / Tab / F1 はプラグイン自身のポップアップ閉じ /
     /// フォーカス移動 / ヘルプ。 この境界が緩むのを防ぐ。
+    ///
+    /// r.md #55 の Ctrl+Shift+W は「エディタ窓を操作している最中に押したい」 操作
+    /// そのものなので転送必須。 Ctrl+Shift 付きなのでプラグインのテキスト入力とは
+    /// 衝突しない。
     #[test]
-    fn only_transport_and_save_are_forwarded() {
+    fn forwarded_set_is_transport_save_and_close_editors() {
         let names: Vec<&str> = forwarded_editor_chords().into_iter().map(|(_, n)| n).collect();
-        assert_eq!(names, vec!["save", "daw.play_toggle"]);
+        assert_eq!(names, vec!["save", "daw.play_toggle", "daw.close_all_plugin_editors"]);
     }
 
     /// 転送 chord は Win32 仮想キーに正しく変換されている

@@ -1060,6 +1060,32 @@ impl AppData {
 
     // -------- Undo/Redo ----------------------------------------------------
 
+    /// r.md #56: song beat → 秒。 テンポカーブがある曲では [`TempoMap`] を
+    /// `song_epoch` 世代キャッシュに載せ、 引きだけを毎フレーム行う。
+    ///
+    /// [`common::tempo_map::song_beat_to_seconds`] をそのまま毎フレーム呼ぶと、
+    /// lane を 1 本引いただけで `TempoMap::from_song` が O(曲長) で走る (5 分の曲で
+    /// ~9,600 breakpoint ≒ 77KB の `Vec` 確保、 30 分なら ~460KB)。 transport バーは
+    /// 常時描画なので曲長に比例して悪化する。 `TempoMap` は「生成は曲の変更時に 1 回、
+    /// 引きは O(log n)」 という設計 (tempo_map.rs 冒頭 doc) なので、 世代キャッシュが
+    /// 本来の使い方。 lane が無い曲は table を張らず定数 BPM の高速経路に落ちる。
+    pub(crate) fn song_beat_to_seconds(&self, beat: f64) -> f64 {
+        let song = self.song_doc.song();
+        let epoch = self.song_doc.edit_epoch();
+        let mut cache = self.ui_ephemeral.tempo_map_cache.borrow_mut();
+        if !cache.built || cache.epoch != epoch {
+            cache.map = common::tempo_map::has_tempo_automation(song)
+                .then(|| common::tempo_map::TempoMap::from_song(song));
+            cache.epoch = epoch;
+            cache.built = true;
+        }
+        match cache.map.as_ref() {
+            Some(m) => m.beat_to_seconds(beat),
+            // lane 無し = `song_beat_to_seconds` の定数 BPM 高速経路 (table を張らない)。
+            None => common::tempo_map::song_beat_to_seconds(song, beat),
+        }
+    }
+
     /// D3/D4: arrangement build 用ラベルキャッシュ ([`ArrLabelCache`])。 `song_epoch`
     /// が進んでいれば全 track 名 + content ラベルを 1 度だけ作り直し、 通常フレームは
     /// 同一 `Arc<str>` の clone (refcount bump) を返す。 `clip_display_label` は

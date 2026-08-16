@@ -195,6 +195,10 @@ pub struct MasterMeterSnapshot {
     pub scope: Vec<ScopeColumn>,
     /// 共有リングを一周されてサンプルを取りこぼした (積算値の信頼性が落ちる)。
     pub overrun: bool,
+    /// r.md #57: 測定セッションが running か (EBU Tech 3341 §2.2)。`false` =
+    /// トランスポート停止で stand-by = I / LRA / 最大 M / 最大 S / 最大 TP /
+    /// 相関レンジが直前の値のまま保持されている。表示側はこれを見て「保持中」を出す。
+    pub loudness_running: bool,
     /// 実際に解析に使ったサンプルレート。
     pub sample_rate: u32,
     /// 再描画の要否判定に使うダイジェスト。表示が変わらない限り値も変わらない。
@@ -219,6 +223,7 @@ impl Default for MasterMeterSnapshot {
             spectrum_hold_db: vec![f32::NEG_INFINITY; SPECTRUM_BANDS],
             scope: vec![[0.0; 4]; SCOPE_COLUMNS],
             overrun: false,
+            loudness_running: false,
             sample_rate: 0,
             visual_digest: 0,
         }
@@ -247,6 +252,9 @@ pub struct MasterAnalyzer {
     last_peak_reset_epoch: u64,
     /// 無音かつ表示が変化しなかった連続ティック数 (`SETTLE_TICKS` で休止)。
     quiet_ticks: u32,
+    /// r.md #57: 前ティックの `rolling`。エッジ検出 (休止解除) と、スナップショットへ
+    /// 載せる「保持中か」の値をここから引く。
+    last_rolling: bool,
     snapshot: MasterMeterSnapshot,
 }
 
@@ -267,6 +275,9 @@ impl MasterAnalyzer {
             last_reset_epoch: 0,
             last_peak_reset_epoch: 0,
             quiet_ticks: 0,
+            // サブメーターの既定 (`running: true`) と揃える。最初の `tick` が
+            // 実際のトランスポート状態で上書きする。
+            last_rolling: true,
             snapshot: MasterMeterSnapshot::default(),
             settings,
         }
@@ -307,6 +318,13 @@ impl MasterAnalyzer {
 
     /// 1 ティック分の処理。`frames` が空なら `elapsed_secs` ぶんの無音を流す
     /// (エンジンが park している / 音が出ていない状態でメーターが凍らないように)。
+    ///
+    /// r.md #57: `rolling` は「トランスポートが走っているか」 (count-in 中は含まない)。
+    /// これが解析器に渡っていなかったのが「停止しても算出が止まらない」の根本原因で、
+    /// 唯一の停止条件が「サンプルがビット完全に 0 か」しか無かった。停止中もプラグインの
+    /// 残響やノイズフロアが流れ続けるので、その条件は実際にはほぼ成立しない。
+    /// **`MeterControl` に入れない** — engine が所有する事実を UI スレッドの Mutex 経由で
+    /// 往復させると SSoT を割るうえ、トランスポートのエッジが 1 往復ぶん遅れる。
     pub fn tick(
         &mut self,
         control: &MeterControl,
@@ -314,10 +332,21 @@ impl MasterAnalyzer {
         frames: &[[f32; 2]],
         elapsed_secs: f32,
         overrun: bool,
+        rolling: bool,
     ) -> &MasterMeterSnapshot {
         self.set_sample_rate(sample_rate);
         self.settings = control.settings;
         self.spectrum.apply(self.sample_rate, &self.settings);
+        // 「ティックごとの状態をサブメーターへ押し下げる」= `spectrum.apply` と同じ流儀。
+        self.loudness.set_running(rolling);
+        self.truepeak.set_running(rolling);
+        self.stereo.set_running(rolling);
+        if rolling != self.last_rolling {
+            self.last_rolling = rolling;
+            // 無音休止に入ったまま再生 / 停止すると `build_snapshot` を通らず、
+            // 「保持中」表示が切り替わらないまま固まる。エッジで休止を解く。
+            self.quiet_ticks = 0;
+        }
         if control.loudness_reset_epoch != self.last_reset_epoch {
             self.last_reset_epoch = control.loudness_reset_epoch;
             self.reset_loudness();
@@ -431,6 +460,7 @@ impl MasterAnalyzer {
         s.scope.clear();
         s.scope.extend_from_slice(self.scope.columns());
         s.overrun = overrun;
+        s.loudness_running = self.last_rolling;
         s.sample_rate = self.sample_rate;
         s.visual_digest = compute_digest(s);
     }
@@ -476,6 +506,10 @@ fn compute_digest(s: &MasterMeterSnapshot) -> u64 {
     ] {
         mix(q(v, 0.1));
     }
+    // LRA の暫定サフィックス `*` と dim 色は `lra_provisional` で切り替わるが、値そのもの
+    // (`lra_lu`) は変わらないことがある。混ぜていないと 60 秒経って確定へ変わった瞬間の
+    // 再描画が r.md #49 の抑止に食われて画面が古いままになる。
+    mix(i64::from(u8::from(l.lra_provisional)));
     mix(q(s.true_peak_dbtp, 0.1));
     mix(q(s.max_true_peak_dbtp, 0.1));
     let st = &s.stereo;
@@ -517,6 +551,9 @@ fn compute_digest(s: &MasterMeterSnapshot) -> u64 {
         }
     }
     mix(i64::from(u8::from(s.overrun)));
+    // r.md #57: 保持中かどうかで読み値の見た目が変わる (「保持」バッジ + ラベル色)。
+    // 混ぜないと、停止した瞬間に絵が変わるのに再描画が抑止されて切り替わらない。
+    mix(i64::from(u8::from(s.loudness_running)));
     h
 }
 
@@ -552,7 +589,7 @@ mod tests {
         // -6 dBFS のステレオ正弦を 4 秒。
         let amp = 10f32.powf(-6.0 / 20.0);
         for _ in 0..120 {
-            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 30, amp), 1.0 / 30.0, false);
+            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 30, amp), 1.0 / 30.0, false, true);
         }
         let s = a.snapshot();
         // ピーク = -6 dBFS
@@ -576,14 +613,14 @@ mod tests {
         let fs = 48_000;
         let mut a = MasterAnalyzer::new(fs);
         let c = control();
-        a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 4, 0.9), 0.25, false);
+        a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 4, 0.9), 0.25, false, true);
         // 30 秒ぶん無音を流し込んで弾道を落とし切る。
         for _ in 0..900 {
-            a.tick(&c, fs, &[], 1.0 / 30.0, false);
+            a.tick(&c, fs, &[], 1.0 / 30.0, false, true);
         }
         let d1 = a.snapshot().visual_digest;
         for _ in 0..10 {
-            a.tick(&c, fs, &[], 1.0 / 30.0, false);
+            a.tick(&c, fs, &[], 1.0 / 30.0, false, true);
         }
         assert_eq!(d1, a.snapshot().visual_digest, "digest never settled");
     }
@@ -599,16 +636,16 @@ mod tests {
         let fs = 48_000;
         let mut a = MasterAnalyzer::new(fs);
         let c = control();
-        a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 4, 0.9), 0.25, false);
+        a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 4, 0.9), 0.25, false, true);
         let lens = [1440_usize, 1600, 1920, 1520];
         for i in 0..900 {
             let n = lens[i % lens.len()];
-            a.tick(&c, fs, &vec![[0.0_f32, 0.0]; n], n as f32 / fs as f32, false);
+            a.tick(&c, fs, &vec![[0.0_f32, 0.0]; n], n as f32 / fs as f32, false, true);
         }
         let d1 = a.snapshot().visual_digest;
         for i in 0..20 {
             let n = lens[i % lens.len()];
-            a.tick(&c, fs, &vec![[0.0_f32, 0.0]; n], n as f32 / fs as f32, false);
+            a.tick(&c, fs, &vec![[0.0_f32, 0.0]; n], n as f32 / fs as f32, false, true);
         }
         assert_eq!(d1, a.snapshot().visual_digest, "無音でもブロック長で指紋が動く");
     }
@@ -620,11 +657,11 @@ mod tests {
         let mut a = MasterAnalyzer::new(fs);
         let c = control();
         for _ in 0..600 {
-            a.tick(&c, fs, &vec![[0.0_f32, 0.0]; 1600], 1.0 / 30.0, false);
+            a.tick(&c, fs, &vec![[0.0_f32, 0.0]; 1600], 1.0 / 30.0, false, true);
         }
         assert!(a.is_paused_on_silence(), "無音が続いても休止に入らない");
         // 音が戻れば次のティックで必ず再開してピークが立つ。
-        a.tick(&c, fs, &sine(fs, 1000.0, 1600, 0.8), 1.0 / 30.0, false);
+        a.tick(&c, fs, &sine(fs, 1000.0, 1600, 0.8), 1.0 / 30.0, false, true);
         assert!(!a.is_paused_on_silence());
         assert!(a.snapshot().peak[0] > 0.5, "peak = {}", a.snapshot().peak[0]);
     }
@@ -636,10 +673,10 @@ mod tests {
         let fs = 48_000;
         let mut a = MasterAnalyzer::new(fs);
         let c = control();
-        a.tick(&c, fs, &[[f32::NAN, f32::INFINITY]], 1.0 / 30.0, false);
+        a.tick(&c, fs, &[[f32::NAN, f32::INFINITY]], 1.0 / 30.0, false, true);
         let amp = 10f32.powf(-6.0 / 20.0);
         for _ in 0..150 {
-            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 30, amp), 1.0 / 30.0, false);
+            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 30, amp), 1.0 / 30.0, false, true);
         }
         let s = a.snapshot();
         assert!(s.peak[0] > 0.4, "peak が死んでいる: {}", s.peak[0]);
@@ -658,9 +695,9 @@ mod tests {
         let fs = 48_000;
         let mut a = MasterAnalyzer::new(fs);
         let c = control();
-        a.tick(&c, fs, &sine(fs, 440.0, 1600, 0.5), 1.0 / 30.0, false);
+        a.tick(&c, fs, &sine(fs, 440.0, 1600, 0.5), 1.0 / 30.0, false, true);
         let d1 = a.snapshot().visual_digest;
-        a.tick(&c, fs, &sine(fs, 440.0, 1600, 0.1), 1.0 / 30.0, false);
+        a.tick(&c, fs, &sine(fs, 440.0, 1600, 0.1), 1.0 / 30.0, false, true);
         assert_ne!(d1, a.snapshot().visual_digest);
     }
 
@@ -671,12 +708,12 @@ mod tests {
         let mut a = MasterAnalyzer::new(fs);
         let mut c = control();
         for _ in 0..120 {
-            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 30, 0.5), 1.0 / 30.0, false);
+            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 30, 0.5), 1.0 / 30.0, false, true);
         }
         assert!(a.snapshot().loudness.integrated_lufs.is_finite());
         assert!(a.snapshot().max_true_peak_dbtp.is_finite());
         c.loudness_reset_epoch += 1;
-        a.tick(&c, fs, &[], 1.0 / 30.0, false);
+        a.tick(&c, fs, &[], 1.0 / 30.0, false, true);
         let s = a.snapshot();
         assert_eq!(s.loudness.integrated_lufs, f32::NEG_INFINITY);
         assert_eq!(s.max_true_peak_dbtp, f32::NEG_INFINITY);
@@ -690,10 +727,10 @@ mod tests {
         let mut a = MasterAnalyzer::new(fs);
         let c = control();
         let frames = vec![[1.0_f32, 0.5], [0.2, -1.2], [0.1, 0.1]];
-        a.tick(&c, fs, &frames, 1.0 / 30.0, false);
+        a.tick(&c, fs, &frames, 1.0 / 30.0, false, true);
         assert_eq!(a.snapshot().clip_count, 2);
         a.reset_clip();
-        a.tick(&c, fs, &[], 1.0 / 30.0, false);
+        a.tick(&c, fs, &[], 1.0 / 30.0, false, true);
         assert_eq!(a.snapshot().clip_count, 0);
     }
 
@@ -704,11 +741,11 @@ mod tests {
         let mut a = MasterAnalyzer::new(fs);
         let c = control();
         let chunk = sine(fs, 1000.0, fs as usize / 100, 1.0); // 10ms
-        a.tick(&c, fs, &chunk, 0.01, false);
+        a.tick(&c, fs, &chunk, 0.01, false, true);
         let after_10ms = a.snapshot().vu[0];
         let peak_10ms = a.snapshot().peak[0];
         for _ in 0..29 {
-            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 100, 1.0), 0.01, false);
+            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 100, 1.0), 0.01, false, true);
         }
         let after_300ms = a.snapshot().vu[0];
         assert!(peak_10ms > 0.9, "peak should be instant, got {peak_10ms}");
@@ -727,9 +764,69 @@ mod tests {
     fn switching_sample_rate_reconfigures_every_meter() {
         let mut a = MasterAnalyzer::new(48_000);
         let c = control();
-        a.tick(&c, 48_000, &sine(48_000, 1000.0, 4800, 0.5), 0.1, false);
-        a.tick(&c, 96_000, &sine(96_000, 1000.0, 9600, 0.5), 0.1, false);
+        a.tick(&c, 48_000, &sine(48_000, 1000.0, 4800, 0.5), 0.1, false, true);
+        a.tick(&c, 96_000, &sine(96_000, 1000.0, 9600, 0.5), 0.1, false, true);
         assert_eq!(a.sample_rate(), 96_000);
         assert_eq!(a.snapshot().sample_rate, 96_000);
+    }
+
+    /// r.md #57: トランスポートを止めたら測定セッション側の量は 1 つも進まない。
+    /// ただし「今鳴っている音」を映すメーターは止まらない — 停止中もプラグインの
+    /// 残響や鍵盤プレビューで実際に音は出ているので、ここを凍らせると
+    /// 「音が出ているのに振れない」嘘の表示になる。
+    #[test]
+    fn stopping_the_transport_freezes_the_measurement_but_not_the_live_meters() {
+        let fs = 48_000;
+        let mut a = MasterAnalyzer::new(fs);
+        let c = control();
+        let amp = 10f32.powf(-18.0 / 20.0);
+        // 5 秒走らせて測定セッションを立ち上げる。
+        for _ in 0..150 {
+            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 30, amp), 1.0 / 30.0, false, true);
+        }
+        let running = a.snapshot().clone();
+        assert!(running.loudness_running, "走行中は running");
+        assert!(running.loudness.integrated_lufs.is_finite(), "I が出ている");
+
+        // **同じ音を流したまま** 停止 (= 残響が鳴り続けている状況の再現) を 10 秒。
+        for _ in 0..300 {
+            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 30, amp), 1.0 / 30.0, false, false);
+        }
+        let held = a.snapshot().clone();
+        assert!(!held.loudness_running, "停止中は stand-by");
+        for (name, before, after) in [
+            ("I", running.loudness.integrated_lufs, held.loudness.integrated_lufs),
+            ("LRA", running.loudness.lra_lu, held.loudness.lra_lu),
+            ("M max", running.loudness.max_momentary_lufs, held.loudness.max_momentary_lufs),
+            ("S max", running.loudness.max_short_term_lufs, held.loudness.max_short_term_lufs),
+            ("TP max", running.max_true_peak_dbtp, held.max_true_peak_dbtp),
+            ("corr max", running.stereo.correlation_max, held.stereo.correlation_max),
+            ("measured", running.loudness.measured_secs, held.loudness.measured_secs),
+        ] {
+            assert_eq!(before, after, "{name} は停止中に動かない");
+        }
+        // ライブ側は追従したまま。
+        assert!(
+            (held.loudness.momentary_lufs - (-18.0)).abs() < 1.0,
+            "M は停止中も今の音を映す ({})",
+            held.loudness.momentary_lufs
+        );
+        assert!(held.peak[0] > 0.0, "ピークバーも止まらない");
+        assert!(held.true_peak_dbtp.is_finite(), "直近ブロック TP も止まらない");
+        // 停止したまま 60 秒相当を跨いでも LRA の暫定表示が確定へ化けない
+        // (`measured_secs` が進まないことの帰結)。
+        assert!(held.loudness.lra_provisional, "停止中に LRA が確定扱いにならない");
+
+        // 再生を再開すれば続きから積算が動き出す (stand-by は「保持」であって
+        // 「終了」ではない = Tech 3341 の continue)。
+        for _ in 0..150 {
+            a.tick(&c, fs, &sine(fs, 1000.0, fs as usize / 30, amp), 1.0 / 30.0, false, true);
+        }
+        let resumed = a.snapshot();
+        assert!(resumed.loudness_running, "再開で running");
+        assert!(
+            resumed.loudness.measured_secs > held.loudness.measured_secs,
+            "再開したら経過時間が伸びる"
+        );
     }
 }
