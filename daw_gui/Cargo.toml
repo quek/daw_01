@@ -73,6 +73,10 @@ name = "device_chain_smoke"
 required-features = ["script"]
 
 [[test]]
+name = "loudness_analysis_smoke"
+required-features = ["script"]
+
+[[test]]
 name = "note_overlap_smoke"
 required-features = ["script"]
 

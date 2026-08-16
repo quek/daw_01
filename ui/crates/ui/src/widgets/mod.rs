@@ -19,6 +19,7 @@ pub mod knob;
 pub mod label;
 pub mod level_meter;
 pub mod list_view;
+pub mod loudness_graph;
 pub mod loudness_meter;
 pub mod menu;
 pub mod modal;

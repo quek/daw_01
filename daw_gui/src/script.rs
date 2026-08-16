@@ -443,6 +443,11 @@ fn register_daw_globals(ctx: &mut Context) -> Result<()> {
             4,
         )
         .function(
+            NativeFunction::from_fn_ptr(daw_analyze_loudness),
+            js_string!("analyzeLoudnessJson"),
+            3,
+        )
+        .function(
             NativeFunction::from_fn_ptr(daw_set_device_latency),
             js_string!("setDeviceLatency"),
             2,
@@ -914,13 +919,16 @@ fn daw_reinit_for_export(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -
     Ok(JsValue::undefined())
 }
 
-/// `daw.exportWavRange(path, startFrame, endFrame, timeoutMs)` — offline export
-/// of a sample-frame range (the cold range, GUI's
+/// `daw.exportWavRange(path, startBeat, endBeat, timeoutMs)` — offline export
+/// of a beat range (the cold range, GUI's
 /// `AudioCommand::ExportWav { range: Some(..) }`), driven headlessly.
+///
+/// r.md #54: 引数は **拍** (旧: サンプルフレーム)。拍→サンプル換算は daw_audio 側
+/// (`beats_to_samples` = tempo automation を積分する SSoT) 一本になった。
 fn daw_export_wav_range(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let path_str = String::try_from_js(args.get_or_undefined(0), ctx)?;
-    let start = u64::try_from_js(args.get_or_undefined(1), ctx)?;
-    let end = u64::try_from_js(args.get_or_undefined(2), ctx)?;
+    let start = f64::try_from_js(args.get_or_undefined(1), ctx)?;
+    let end = f64::try_from_js(args.get_or_undefined(2), ctx)?;
     let timeout_ms = u64::try_from_js(args.get_or_undefined(3), ctx).unwrap_or(120_000);
     let pump_result = with_host(|h| {
         h.drain_pending_for(Duration::from_millis(50));
@@ -944,6 +952,79 @@ fn daw_export_wav_range(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
         Ok(_) => unreachable!(),
         Err(e) => Err(js_native(format!("exportWavRange: {e}"))),
     }
+}
+
+/// `daw.analyzeLoudnessJson(startBeat, endBeat, timeoutMs)` — r.md #54 の範囲
+/// ラウドネス解析を headless で走らせ、確定レポートを JSON 文字列で返す。
+///
+/// `startBeat >= endBeat` を渡すと全曲 (`range = None`)。GUI と違って
+/// プラグイン再初期化は挟まないので、必要なら先に `daw.reinitForExport()` を呼ぶ
+/// (`exportWavRange` と同じ流儀)。
+fn daw_analyze_loudness(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let start = f64::try_from_js(args.get_or_undefined(0), ctx)?;
+    let end = f64::try_from_js(args.get_or_undefined(1), ctx)?;
+    let timeout_ms = u64::try_from_js(args.get_or_undefined(2), ctx).unwrap_or(120_000);
+    let range = (end > start).then_some((start, end));
+    let pump_result = with_host(|h| {
+        h.drain_pending_for(Duration::from_millis(50));
+        let _ = h
+            .bootstrap
+            .audio_tx
+            .send(AudioCommand::AnalyzeLoudness { range });
+        h.pump_until(
+            |msg| {
+                matches!(
+                    msg,
+                    ChildEvent::Audio(AudioEvent::LoudnessAnalysisComplete { .. })
+                )
+            },
+            Duration::from_millis(timeout_ms),
+        )
+    });
+    match pump_result {
+        Ok(ChildEvent::Audio(AudioEvent::LoudnessAnalysisComplete {
+            report: Some(r),
+            error: None,
+            cancelled: false,
+        })) => {
+            // 曲線とヒストグラムは巨大なので、スカラーだけを JSON にする
+            // (headless の検証で欲しいのは数値)。
+            let json = format!(
+                concat!(
+                    "{{\"integrated_lufs\":{},\"lra_lu\":{},\"max_momentary_lufs\":{},",
+                    "\"max_short_term_lufs\":{},\"true_peak_dbtp\":{},\"sample_peak_dbfs\":{},",
+                    "\"clipped_samples\":{},\"measured_secs\":{},\"total_frames\":{},",
+                    "\"sample_rate\":{}}}"
+                ),
+                json_f32(r.integrated_lufs),
+                json_f32(r.lra_lu),
+                json_f32(r.max_momentary_lufs),
+                json_f32(r.max_short_term_lufs),
+                json_f32(r.true_peak_dbtp),
+                json_f32(r.sample_peak_dbfs),
+                r.clipped_samples,
+                json_f32(r.measured_secs),
+                r.total_frames,
+                r.sample_rate,
+            );
+            Ok(JsValue::from(js_string!(json.as_str())))
+        }
+        Ok(ChildEvent::Audio(AudioEvent::LoudnessAnalysisComplete { error: Some(e), .. })) => {
+            Err(js_native(format!("analyzeLoudness failed: {e}")))
+        }
+        Ok(ChildEvent::Audio(AudioEvent::LoudnessAnalysisComplete { cancelled: true, .. })) => {
+            Err(js_native("analyzeLoudness cancelled".to_string()))
+        }
+        // `report: None` + `error: None` は daw_audio が出さない形。panic せず
+        // エラーで返す (headless driver を落とすより診断可能)。
+        Ok(other) => Err(js_native(format!("analyzeLoudness: unexpected {other:?}"))),
+        Err(e) => Err(js_native(format!("analyzeLoudness: {e}"))),
+    }
+}
+
+/// `-inf` / `NaN` は JSON に書けないので `null` にする。
+fn json_f32(v: f32) -> String {
+    if v.is_finite() { format!("{v:.4}") } else { "null".to_string() }
 }
 
 /// `daw.setDeviceLatency(deviceId, samples)` — plugin host の latency 報告を

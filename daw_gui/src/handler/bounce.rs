@@ -221,13 +221,13 @@ impl AppData {
             self.ui_ephemeral.status_message = "Bounce: audio / MIDI / 歌唱クリップのみ対象です".into();
             return;
         }
-        let engine_sr = self.ipc.sample_rate;
-        let bpm = self.song_doc.song().bpm.max(1.0) as f64;
-        let samples_per_beat = engine_sr as f64 * 60.0 / bpm;
-        let start_frame = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-        let end_frame =
-            ((clip.start_beat + clip.length_beats) * samples_per_beat).max(0.0) as u64;
-        if end_frame <= start_frame {
+        // r.md #54: 範囲は **拍のまま** engine へ送る (拍→サンプル換算は
+        // `beats_to_samples` = tempo automation を積分する SSoT 一本)。定数 BPM で
+        // ここで換算していた旧形は、テンポカーブのある曲で bounce した WAV の
+        // 長さが clip 長とずれた。
+        let start_beat = clip.start_beat.max(0.0);
+        let end_beat = clip.start_beat + clip.length_beats;
+        if end_beat <= start_beat {
             self.ui_ephemeral.status_message = "Bounce: clip 長が 0 です".into();
             return;
         }
@@ -267,8 +267,8 @@ impl AppData {
             path: out_path,
             source_track: target.track,
             source_clip: target.clip,
-            start_frame,
-            end_frame,
+            start_beat,
+            end_beat,
         });
         let label = match mode {
             BounceMode::InPlace => "Bounce In Place",

@@ -957,6 +957,13 @@ impl AppData {
         self.silence_monitor_notes();
         self.recording.active_param_gestures.clear();
         self.recording.latched_param_gestures.clear();
+        // r.md #54: 走査中の解析も畳む。子が落ちた以上 `LoudnessAnalysisComplete` は
+        // 永遠に来ないので、放置すると背景を暗転したまま watchdog の 60 秒まで
+        // 操作不能になる (書き出しの `abort_audio_export` と同じ理由・同じ位置)。
+        // plugin_host の切断でも畳む — `PluginsReinitDone` 待ちで固まるため。
+        self.abort_loudness_analysis(
+            "子プロセスが切断されたためラウドネス解析を中止しました".into(),
+        );
         // 音声 render 中の crash で export を中止したか。respawn 成功時の status に
         // 「書き出しを中止しました」を併記して、中止の事実が上書きで消えないようにする。
         let mut export_aborted = false;

@@ -700,6 +700,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // gui_01 #071: 空きレーン右クリック (`SecondaryClickEmpty`) → clip 生成 context menu。
     render_clip_create_menu_overlay(app, ui);
     render_section_menu_overlay(app, ui);
+    // r.md #54: ルーラー / ループ帯の右クリック → ラウドネス解析。範囲に対する
+    // 操作なので「範囲の上で右クリック」 が第一導線 (Ardour の Range メニューと同じ)。
+    render_ruler_menu_overlay(ui, resp.ruler_rect);
 
     // file drop の hint frame は widget の上に被せる。canvas (lanes) のみ受け付け。
     let canvas_area = Rect {
@@ -905,6 +908,30 @@ fn render_clip_create_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
                     app.ui_ephemeral.clip_create_menu = None;
                 }));
             }
+        },
+    );
+}
+
+/// r.md #54: ルーラー (時間目盛り + ループ帯) の右クリックメニュー。
+///
+/// `context_menu_for` (rect 由来 id) ではなく **安定 id の `context_menu_at`** を使う。
+/// ルーラーの rect はマスターパネル幅・インスペクタ幅・窓リサイズで動くので、
+/// 座標由来の id だと popup が `open_popups` に取り残されて不可視の入力デッドゾーンに
+/// なる (`master_panel::menu_at` と同じ理由)。
+fn render_ruler_menu_overlay(ui: &mut Ui<'_, AppData>, ruler_rect: Rect) {
+    // `take_secondary_click_in_rect` は右クリック確定フレームだけ `Some` を返す
+    // 1-shot なので、そのまま `open_at` に渡せる。
+    let open_at = ui.take_secondary_click_in_rect(ruler_rect);
+    ui.context_menu_at(
+        "arrange_ruler_menu",
+        open_at,
+        &["ラウドネス解析...", "ラウドネスレポートを開く"],
+        move |idx, ui| {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| match idx {
+                0 => app.handle_event(AppEvent::AnalyzeLoudness),
+                1 => app.handle_event(AppEvent::ToggleLoudnessReport),
+                _ => {}
+            }));
         },
     );
 }

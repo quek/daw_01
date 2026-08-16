@@ -23,6 +23,10 @@ const WIRE_SOURCES: &[&str] = &[
     "src/model/modulation.rs",
     "src/model/content.rs",
     "src/model/automation.rs",
+    "src/loudness_report.rs",
+    // Song.scale_changes が持つ型 (Scale / KeySignature 等) の定義。model.rs から
+    // 参照され `LoadSong` の wire に載るのに未登録だった (r.md #54 レビューで発覚)。
+    "src/scale.rs",
     "src/plugin_metadata.rs",
     "src/plugin_format.rs",
     "src/port_config.rs",
