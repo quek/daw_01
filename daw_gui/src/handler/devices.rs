@@ -106,7 +106,11 @@ impl AppData {
                 plugin_id_str: id.clone(),
             },
         );
-        self.ensure_first_track();
+        // 注意: ここで `ensure_first_track()` を呼んではいけない。 子プロセスの
+        // 応答が Song の構造 (トラック) を作ると、 track を 1 本も持たず master fx
+        // だけを持つプロジェクトを開いたときに、 その load 応答が幽霊トラック
+        // "Track 1" を生やして **開いただけで `*`** が付く (r.md #9)。
+        // 空プロジェクトへの最初の 1 本はユーザー操作の側 (plugin picker) が作る。
 
         // resolve ports from the plugin DB (役割導出の入力)。 不在なら既存値を
         // 引き継ぐ (= reconcile 由来の再 load で既存 instance がある場合)。
@@ -198,10 +202,13 @@ impl AppData {
                     // 再ロードの度にユーザー設定が消え、 かつ下の no-op 判定が誤って
                     // 「変化」 に倒れて開くだけで dirty 化する (r.md #9)。
                     send_all_keys_to_plugin: existing_send_all_keys,
+                    // r.md #9: port 解決の規則は `PortConfig::resolve` に一本化して
+                    // ある。 ここで DB を優先すると、 DB と保存値が食い違う環境で
+                    // load 応答のたびに instance が書き換わり「開いただけで `*`」。
                     ..common::model::PluginInstance::with_ports(
                         id,
                         format,
-                        db_ports.unwrap_or(existing_ports),
+                        common::port_config::PortConfig::resolve(existing_ports, db_ports),
                     )
                 };
                 // no-op 検出 (r.md #9): 再構築結果が既存と同一なら epoch を bump
@@ -415,74 +422,31 @@ impl AppData {
         // r.md #27: metadata 差分キャッシュも live device に揃える (unload された
         // device の stale entry を残さない。voicevox_synth_status と対称)。
         self.voicevox.voicevox_metadata_sent.remove(&device_id);
-        // PR3.3: drop the latency entry for the destroyed plugin and
-        // recompute every track's total since the chain shape changed.
-        self.ipc.plugin_latencies.remove(&device_id);
-        self.recompute_track_latencies();
+        // 消えた device の PDC 寄与も畳む (0 = entry を落とす)。
+        self.set_device_latency(device_id, 0);
     }
 
-    /// PR3.3: store the new per-plugin reported latency, recompute the
-    /// owning track's total (sum of all its plugin latencies), and push the
-    /// updated `Song` to daw_audio so `compile_schedule` regenerates the
-    /// PDC delay lines.
-    pub(crate) fn on_plugin_latency_changed(&mut self, device_id: u64, samples: u32) {
-        self.ipc.plugin_latencies.insert(device_id, samples);
-        self.recompute_track_latencies();
-    }
-
-    /// Walk every `track_plugin_ids` entry, sum the plugin latencies into the
-    /// matching `Track::reported_latency_samples`, and re-`flush_song_sync`
-    /// if anything changed. No-op when the totals already agree.
+    /// plugin host が報告した device の processing latency を engine へ中継する。
     ///
-    /// r.md #39: 書き戻し先は `Song::reported_latency_mut` (sentinel 分岐付き)。
-    /// 旧実装は `track_by_id_mut` だったので `MASTER_TRACK_ID` の合計が **黙って
-    /// 捨てられ**、master fx に latency 報告プラグインを挿しても PDC に載らなかった。
-    pub(crate) fn recompute_track_latencies(&mut self) {
-        // Compute per-track latency totals up front (reads self.ipc only) so
-        // the Song mutation can go through the `edit_song` chokepoint without
-        // holding a borrow of `self.ipc`.
-        let totals: Vec<(u32, u32)> = self
-            .ipc.track_plugin_ids
-            .iter()
-            .map(|(track_id, plugin_ids)| {
-                let total: u32 = plugin_ids
-                    .iter()
-                    .map(|pid| self.ipc.plugin_latencies.get(pid).copied().unwrap_or(0))
-                    .sum();
-                (*track_id, total)
-            })
-            .collect();
-        let track_ids_with_plugins: std::collections::HashSet<u32> =
-            self.ipc.track_plugin_ids.keys().copied().collect();
-        self.edit_song_checked(move |song| {
-            let mut changed = false;
-            for (track_id, total) in totals {
-                if let Some(slot) = song.reported_latency_mut(track_id)
-                    && *slot != total
-                {
-                    *slot = total;
-                    changed = true;
-                }
-            }
-            // Tracks with no loaded plugins should report 0 — clear any stale
-            // value (e.g. the last plugin in a track was just removed).
-            for track in &mut song.tracks {
-                if !track_ids_with_plugins.contains(&track.id)
-                    && track.reported_latency_samples != 0
-                {
-                    track.reported_latency_samples = 0;
-                    changed = true;
-                }
-            }
-            // master fx chain も同様に空なら 0 へ戻す (最後の master plugin を外した後)。
-            if !track_ids_with_plugins.contains(&common::model::MASTER_TRACK_ID)
-                && song.master_reported_latency_samples != 0
-            {
-                song.master_reported_latency_samples = 0;
-                changed = true;
-            }
-            changed
-        });
+    /// r.md #9: 報告値は **実行時の観測値であって曲の中身ではない** ので `Song` に
+    /// 書かない。 旧実装は track ごとに合計して `Track::reported_latency_samples`
+    /// へ `edit_song_checked` で書き戻していたため、
+    ///
+    /// - 保存ファイルに合計値が載る (プラグイン更新 / サンプルレート違いで乖離する)
+    /// - device の load 応答は 1 台ずつ届くので、 途中経過の**部分合計**や
+    ///   「まだ応答が来ていない track = plugin 無し」 という誤認で 0 に潰す書き込みが
+    ///   走り、 **保存済みプロジェクトを開いただけで `*` が付いた**
+    ///
+    /// という 2 つの問題があった。 いまは device 単位のまま engine へ送り、
+    /// track / master の合計は `compile_schedule` が chain から導出する
+    /// (集計の実装を GUI と engine に二重に持たない)。
+    pub(crate) fn on_plugin_latency_changed(&mut self, device_id: u64, samples: u32) {
+        self.set_device_latency(device_id, samples);
+    }
+
+    /// `AudioCommand::SetDeviceLatency` を送る唯一の口。
+    fn set_device_latency(&mut self, device_id: u64, samples: u32) {
+        self.send_audio(AudioCommand::SetDeviceLatency { device_id, samples });
     }
 
     pub(crate) fn toggle_slot_gui(&mut self, index: u32) {

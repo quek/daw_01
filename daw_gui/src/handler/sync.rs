@@ -398,36 +398,34 @@ impl AppData {
         out
     }
 
-    /// v23 (review fix): `ports` が default (全 false) の device を plugin DB
+    /// v23 (review fix): `ports` が未解決 (全 false) の device を plugin DB
     /// から解決する。旧 project load 直後の device は ports を持たないため、
     /// LoadSong 前にこれを呼ばないと daw_audio の役割導出が全 Inactive になり
-    /// 無音になる。既に解決済み (= いずれかの port が true) の device は触らない
-    /// (= picker 追加 / SlotPluginLoaded backfill 済みは no-op、DB 不在も保持)。
+    /// 無音になる。解決の規則は [`PortConfig::resolve`] が SSoT で、
+    /// `SlotPluginLoaded` の backfill (`handler/devices.rs`) と同じものを使う。
     pub(crate) fn resolve_default_device_ports(&mut self) {
         let Some(db) = self.ipc.plugin_db.clone() else {
             return;
         };
-        let default_ports = common::port_config::PortConfig::default();
         // 先に読みだけで解決の要否を判定する (steady state では bool 比較のみ)。
         // 解決は「ユーザー編集」ではない正規化なので normalize (undo 履歴に
         // 入れない。 epoch は進む = 子プロセス sync は走り、 2 周目は
-        // ports != default で no-op に収束する)。
+        // 解決済みで no-op に収束する)。
         let needs = {
             let song = self.song_doc.song();
             song.tracks
                 .iter()
                 .flat_map(|t| t.devices.iter())
                 .chain(song.master_fx_chain.iter())
-                .any(|d| d.ports == default_ports && db.find_by_id(&d.plugin_id).is_some())
+                .any(|d| d.ports.is_unresolved() && db.find_by_id(&d.plugin_id).is_some())
         };
         if !needs {
             return;
         }
         // r.md #9: no-op 検出付き normalize。 解決が実際に ports を書き換えたとき
-        // だけ epoch を bump する (port が既に非 default / plugin が無 port で
-        // 解決結果が同じなら dirty 化しない)。 旧 project の port 解決は本当に
-        // 内容が変わる migration なので、 そのときは dirty で正しい (= 再保存で
-        // 解決済み ports を永続化)。
+        // だけ epoch を bump する (既に解決済み / 解決結果が同じなら dirty 化
+        // しない)。 旧 project の port 解決は本当に内容が変わる migration なので、
+        // そのときは dirty で正しい (= 再保存で解決済み ports を永続化)。
         self.normalize_song_checked(|song| {
             let mut changed = false;
             for d in song
@@ -436,14 +434,13 @@ impl AppData {
                 .flat_map(|t| t.devices.iter_mut())
                 .chain(song.master_fx_chain.iter_mut())
             {
-                if d.ports == default_ports
-                    && let Some(entry) = db.find_by_id(&d.plugin_id)
-                {
-                    let resolved = port_config_of(entry);
-                    if resolved != d.ports {
-                        d.ports = resolved;
-                        changed = true;
-                    }
+                let resolved = common::port_config::PortConfig::resolve(
+                    d.ports,
+                    db.find_by_id(&d.plugin_id).map(port_config_of),
+                );
+                if resolved != d.ports {
+                    d.ports = resolved;
+                    changed = true;
                 }
             }
             changed

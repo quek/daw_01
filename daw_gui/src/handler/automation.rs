@@ -985,7 +985,6 @@ impl AppData {
                 start_beat: c.start_beat - base,
                 length_beats: c.length_beats,
                 color: c.color,
-                auto_lipsync: c.auto_lipsync,
                 // clip-level mute も clipboard へ。
                 muted: c.muted,
                 content_id: c.content_id,
@@ -1083,9 +1082,9 @@ impl AppData {
                     // clipboard が運んできた窓をそのまま復元 (r.md #44)。
                     content_offset_beats: cc.content_offset_beats,
                     color: cc.color,
-                    auto_lipsync: cc.auto_lipsync,
-                    // clipboard は配置世代を運ばないので「世代不明」= 0。
-                    // auto_lipsync clip なら次の load / 再生成で作り直される。
+                    // paste した clip は派生データではなくユーザーの持ち物
+                    // (clipboard は `auto_lipsync` を運ばない — clipboard.rs 参照)。
+                    auto_lipsync: false,
                     lipsync_gen: 0,
                     // clipboard の clip-level mute を paste 先 clip へ引き継ぐ。
                     muted: cc.muted,

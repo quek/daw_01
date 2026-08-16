@@ -76,14 +76,11 @@ pub struct IpcState {
     /// `SlotPluginUnloaded` 受信時に reverse-lookup retain、
     /// 削除系編集の `_inner` 関数内で track / device index 単位で remove。
     pub loaded_slots: std::collections::HashMap<(u32, u32), LoadedSlotInfo>,
-    /// PR3.3 PDC: `device_id → reported latency samples`。 plugin_host から
-    /// `PluginEvent::PluginLatencyChanged` を受信して更新、
-    /// `SlotPluginUnloaded` で drop。 各 track の累積 latency は
-    /// `track_plugin_ids[track_id].iter().map(|pid| plugin_latencies[pid]).sum()`
-    /// で計算して `Track::reported_latency_samples` に書く。 これが
-    /// `LoadSong` で daw_audio に渡って `compile_schedule` の PDC 補償に
-    /// 反映される (chain 内の plugin が直列に latency を加算する Ardour 流)。
-    pub plugin_latencies: std::collections::HashMap<u64, u32>,
+    // PDC の入力となる「plugin が報告した latency」 は daw_gui では **持たない**。
+    // plugin_host からの `PluginEvent::PluginLatencyChanged` を
+    // `AudioCommand::SetDeviceLatency` としてそのまま engine へ中継し、
+    // track / master の合計は `compile_schedule` が device chain から導出する
+    // (r.md #9: 集計値を `Song` に書き戻すと保存され、 開き直しで「開いただけで `*`」)。
 
     // -------- Resource monitor (r.md #3) --------
     /// 集計済みリソース指標 (DSP load / system CPU / fps / xrun / mem)。 poller

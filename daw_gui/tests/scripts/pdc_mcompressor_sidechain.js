@@ -29,7 +29,6 @@ const song = {
       pan: 0.0,
       muted: false,
       solo: false,
-      reported_latency_samples: 0,
       clips: [{ id: 1, name: "trigger", start_beat: 0.0, length_beats: 8.0 }],
     },
     {
@@ -39,7 +38,6 @@ const song = {
       pan: 0.0,
       muted: false,
       solo: false,
-      reported_latency_samples: 0,
       clips: [{ id: 1, name: "bass", start_beat: 0.0, length_beats: 8.0 }],
       devices: [
         {

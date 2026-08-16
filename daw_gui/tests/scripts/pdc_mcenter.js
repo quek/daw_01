@@ -38,7 +38,6 @@ const song = {
       pan: 0.0,
       muted: false,
       solo: false,
-      reported_latency_samples: 0,
       clips: [{ id: 1, name: "click", start_beat: 0.0, length_beats: 8.0 }],
     },
     {
@@ -48,7 +47,6 @@ const song = {
       pan: 0.0,
       muted: false,
       solo: false,
-      reported_latency_samples: 0,
       clips: [{ id: 1, name: "click", start_beat: 0.0, length_beats: 8.0 }],
       devices: [
         {
@@ -73,11 +71,11 @@ daw.setSlotPlugin(
 );
 daw.waitForPluginLoaded(2, 0, 30000);
 
-// PR3.3: plugin が `ChildToMain::PluginLatencyChanged { plugin_id, samples }`
-// で自身の latency を IPC 経由で通知する。 script.rs の `pump_until` が
-// 受信して last_loaded_song の `reported_latency_samples` を 4096 に更新し、
-// `LoadSong` を再送 → daw_audio が `compile_schedule` で PDC を再計算する。
-// `setTrackLatency` 手動 call は不要になった。
+// PR3.3: plugin が `PluginEvent::PluginLatencyChanged { device_id, samples }`
+// で自身の latency を IPC 経由で通知する。 script.rs の `pump_until` が受信して
+// `AudioCommand::SetDeviceLatency` として daw_audio へ中継し、engine が
+// `compile_schedule` で PDC を再計算する (r.md #9: 報告 latency は Song に
+// 載せない = 保存されない)。 `setDeviceLatency` 手動 call は不要。
 //
 // 確実に最新 latency が schedule に反映されてから vocal を inject する
 // よう、 `waitForPluginLoaded` の後に明示的に IPC drain を 1 frame 挟む

@@ -207,7 +207,7 @@ pub struct Schedule {
     pub mod_kinds: Vec<common::model::ModSourceKind>,
     /// master **出力** に現れる PDC 遅延量 (samples)。
     /// = master `Mix` の src の `path_latency` 最大値 (= 全 src がこの値に揃えられる)
-    ///   **＋ `Song::master_reported_latency_samples`** (master fx chain 自身の報告 latency)。
+    ///   **＋ master fx chain 上の device が報告している latency の合計**。
     ///
     /// 言い換えると `master_buffer[P]` に載っているのは曲位置 `P - master_latency_samples`
     /// の音、という写像の遅延量。
