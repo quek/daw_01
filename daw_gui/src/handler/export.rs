@@ -66,14 +66,15 @@ impl AppData {
             if is_full { None } else { Some((picker.start_beat, picker.end_beat)) };
         match picker.kind {
             ExportRangeKind::Wav => {
-                let range = range_beats.map(|(s, e)| self.export_beats_to_frames(s, e));
                 let dialog = rfd::FileDialog::new().add_filter("WAV", &["wav"]);
                 self.spawn_file_dialog(
                     dialog,
                     FileDialogMode::Save,
-                    FileDialogKind::ExportWav { range },
+                    FileDialogKind::ExportWav { range: range_beats },
                 );
             }
+            // r.md #54: ファイルを書かないのでダイアログ無しでそのまま走る。
+            ExportRangeKind::Loudness => self.begin_loudness_analysis(range_beats),
             ExportRangeKind::Mp4 => {
                 // picker で選んだ出力解像度 / fps を後段へ運ぶ。
                 let resolution = picker.resolution;
@@ -90,17 +91,42 @@ impl AppData {
         }
     }
 
-    /// 拍範囲 → sample frame 範囲。 audio engine と同じ式・同じ
-    /// sample rate (`self.ipc.sample_rate`、 AudioSession に渡す値)
-    /// で換算するので、 daw_audio 側 `run_export` の `samples_per_beat` と完全に
-    /// 一致する (bounce の `clip_range_to_frames` と同じ SSoT)。
-    pub(crate) fn export_beats_to_frames(&self, start_beat: f64, end_beat: f64) -> (u64, u64) {
-        let sr = f64::from(self.ipc.sample_rate);
-        let bpm = f64::from(self.song_doc.song().bpm).max(f64::EPSILON);
-        let spb = sr * 60.0 / bpm;
-        let s = (start_beat * spb).max(0.0) as u64;
-        let e = (end_beat * spb).max(0.0) as u64;
-        (s, e)
+    /// r.md #54: ワンクリック範囲プリセットを拍範囲へ解決する。
+    /// 対象が存在しなければ `None` (ボタンを無効表示にする根拠にもなる)。
+    ///
+    /// 拍のまま返すのが要点 — 拍→サンプル換算は daw_audio の
+    /// `beats_to_samples` (tempo automation を積分する SSoT) だけが行う。
+    pub(crate) fn export_range_from_source(
+        &self,
+        source: ExportRangeSource,
+    ) -> Option<(f64, f64)> {
+        let song = self.song_doc.song();
+        match source {
+            ExportRangeSource::Loop => self.transport.loop_region.range(),
+            // 通常クリップ面と automation 面のどちらで選んでいても拾う
+            // (last-selection-wins の面判定はここでは不要 — 両方の bounding を取る)。
+            ExportRangeSource::Selection => {
+                match (
+                    self.arrange_selection_beat_span(false),
+                    self.arrange_selection_beat_span(true),
+                ) {
+                    (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                }
+            }
+            // プレイヘッドが乗っているセクション (無ければ最初のセクション)。
+            ExportRangeSource::Section => {
+                let at = f64::from(self.transport.playhead_beat.unwrap_or(0.0));
+                song.sections
+                    .iter()
+                    .find(|s| at >= s.start_beat && at < s.end_beat())
+                    .or_else(|| song.sections.first())
+                    .map(|s| (s.start_beat, s.end_beat()))
+            }
+            ExportRangeSource::Whole => Some((0.0, song.length_beats)),
+        }
+        .filter(|(s, e)| e > s)
     }
 
     /// begin an offline WAV export the right way — stop playback,
@@ -114,7 +140,7 @@ impl AppData {
     pub(crate) fn begin_wav_export(
         &mut self,
         path: std::path::PathBuf,
-        range: Option<(u64, u64)>,
+        range: Option<(f64, f64)>,
         write_mod_sidecar: bool,
     ) {
         // 書き出しは freewheel render。 先に停止する (live dispatch と export
@@ -222,12 +248,11 @@ impl AppData {
         self.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
         self.transport.export_progress_at = Some(std::time::Instant::now());
         self.ui_ephemeral.status_message = "音声をレンダリング中...".into();
-        // 音声も video と同じ窓で freewheel render (beat→frame は audio engine と
-        // 同じ式)。 `None` で全曲。 stop → reinit plugins → ExportWav
-        // (begin_wav_export 経由)。 video render が `.modenv` sidecar を sample して
-        // modulation を再現するので、 ここだけ sidecar を書く。
-        let range = range_beats.map(|(s, e)| self.export_beats_to_frames(s, e));
-        self.begin_wav_export(temp_wav, range, true);
+        // 音声も video と同じ窓 (拍) で freewheel render する。 `None` で全曲。
+        // stop → reinit plugins → ExportWav (begin_wav_export 経由)。 video render が
+        // `.modenv` sidecar を sample して modulation を再現するので、 ここだけ
+        // sidecar を書く。
+        self.begin_wav_export(temp_wav, range_beats, true);
     }
 
     /// 音声 freewheel フェーズ (`AudioRender`) を強制終了する。daw_audio が

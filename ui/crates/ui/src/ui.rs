@@ -1217,6 +1217,31 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 .is_some_and(|(x, y)| rect.contains(x, y))
         {
             self.pointer = masked_pointer(self.pointer_raw);
+            // `pending_secondary_click` / `pending_double_click` は **生 pointer 由来**
+            // (フレーム冒頭で `pointer_raw` から算出) なので、`self.pointer` を mask
+            // しただけでは素通りする。落とさないと予約領域の上で右クリックした瞬間に
+            // 背景 widget が context menu を開いてしまい、その popup は mask された
+            // pointer しか読めないので **item も outside-click も効かない**
+            // = 消せないメニューが居座る (daw_01 r.md #54 レビューで発覚。全画面を
+            // 予約する用途で初めて表面化した)。
+            if self
+                .pending_secondary_click
+                .is_some_and(|(x, y)| rect.contains(x, y))
+            {
+                *self.pending_secondary_click = None;
+            }
+            if self
+                .pending_double_click
+                .is_some_and(|(x, y)| rect.contains(x, y))
+            {
+                *self.pending_double_click = None;
+            }
+            if self
+                .pending_double_click_press
+                .is_some_and(|(x, y)| rect.contains(x, y))
+            {
+                *self.pending_double_click_press = None;
+            }
         }
     }
 

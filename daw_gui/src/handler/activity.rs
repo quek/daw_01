@@ -38,6 +38,8 @@ impl AppData {
     pub fn app_busy(&self, now: std::time::Instant) -> bool {
         self.transport.export_stage.is_some()
             || self.transport.pending_video_export.is_some()
+            // r.md #54: 解析中はレポート窓に進捗バーと伸びるグラフが出ている。
+            || self.loudness.phase.is_busy()
             || self.ipc.is_rescanning
             || self.voicevox_animating(now)
     }
@@ -131,6 +133,15 @@ impl AppData {
         // watchdog が発火すると status_message / export 表示 / 録音状態が変わる。
         mix(self.ui_ephemeral.status_message.len() as u64);
         mix(u64::from(self.transport.export_stage.is_some()));
+        // r.md #54: 解析の進捗バーと曲線は 250ms ごとに更新される。走査済み
+        // フレーム数を混ぜて、進んだフレームだけ描き直す。
+        mix(u64::from(self.loudness.phase.is_busy()));
+        mix(
+            self.loudness
+                .report
+                .as_ref()
+                .map_or(0, |r| r.done_frames ^ u64::from(r.complete)),
+        );
         // Rec ボタンの表示は「要求」「実際に録っているか」「count-in 中か」で変わる。
         // count-in の残量は **有無だけ**混ぜる — 生の残量を混ぜると、画面に出ない
         // 数値が毎 tick 変わるだけで count-in 中ずっと 30fps 描き直すことになる

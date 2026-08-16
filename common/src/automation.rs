@@ -496,6 +496,9 @@ pub fn thin_collinear_and_insert(
 ///
 /// `beat` は累積 beat-domain playhead (= engine が integrate 維持)。
 pub fn evaluate_song_tempo(song: &Song, beat: f64) -> f32 {
+    if !has_song_tempo_automation(song) {
+        return song.bpm;
+    }
     for lane in &song.song_lanes {
         if !lane.enabled {
             continue;
@@ -515,6 +518,19 @@ pub fn evaluate_song_tempo(song: &Song, beat: f64) -> f32 {
     song.bpm
 }
 
+/// 有効な SongTempo オートメーションレーンを持つか。
+///
+/// 持たない曲では拍↔サンプルが線形なので、[`beats_to_samples`] /
+/// [`samples_to_beats`] の 1/64 拍刻み積分 (= `O(拍数)`) を丸ごと省ける。
+/// ルーラードラッグのように **毎フレーム** 換算する呼び出し元があるので、
+/// この早期パスは実用上必須 (長い曲では 1 回あたり数万反復になる)。
+#[must_use]
+pub fn has_song_tempo_automation(song: &Song) -> bool {
+    song.song_lanes
+        .iter()
+        .any(|l| l.enabled && matches!(l.target, AutomationTarget::SongTempo))
+}
+
 /// SongTempo カーブを積分して、 song の beat 位置 `target_beat` が出力 sample
 /// 何個目に当たるかを返す。 constant-bpm なら `target_beat * 60*SR/bpm` に一致。
 /// オフライン書き出し (WAV / 動画) が、 tempo automation を持つ曲を **再生と同じ
@@ -527,6 +543,11 @@ pub fn beats_to_samples(song: &Song, sample_rate: u32, target_beat: f64) -> u64 
         return 0;
     }
     let sr = f64::from(sample_rate);
+    // テンポカーブが無ければ線形 (積分と厳密に一致する閉形式)。
+    if !has_song_tempo_automation(song) {
+        let bpm = f64::from(song.bpm.clamp(1.0, 1000.0));
+        return (target_beat * 60.0 * sr / bpm).round() as u64;
+    }
     let mut beat = 0.0_f64;
     let mut samples = 0.0_f64;
     const STEP: f64 = 1.0 / 64.0;
@@ -550,6 +571,11 @@ pub fn samples_to_beats(song: &Song, sample_rate: u32, target_sample: u64) -> f6
     }
     let sr = f64::from(sample_rate);
     let target = target_sample as f64;
+    // テンポカーブが無ければ線形 ([`beats_to_samples`] と同じ早期パス)。
+    if !has_song_tempo_automation(song) {
+        let bpm = f64::from(song.bpm.clamp(1.0, 1000.0));
+        return target * bpm / (60.0 * sr);
+    }
     let mut beat = 0.0_f64;
     let mut samples = 0.0_f64;
     let chunk = (sr / 64.0).max(1.0);

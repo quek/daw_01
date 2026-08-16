@@ -1,4 +1,9 @@
-//! ITU-R BS.1770-5 / EBU Tech 3341 / Tech 3342 準拠のラウドネス測定 (r.md #50)。
+//! ITU-R BS.1770-5 / EBU Tech 3341 / Tech 3342 準拠のラウドネス測定。
+//!
+//! **測定器はプロセスをまたいで 1 つ** (r.md #54)。daw_gui のライブメーター
+//! (`master_meter::MasterAnalyzer`) と daw_audio のオフライン範囲解析
+//! (`daw_audio::export` の freewheel) が同じ [`LoudnessMeter`] を通るので、
+//! 「メーターの数値と解析レポートの数値が食い違う」が構造的に起きない。
 //!
 //! - K-weighting は 48kHz の表をハードコードせず**任意サンプルレートへ再設計**する。
 //!   48kHz を代入すると規格表と小数 14 桁まで一致することを回帰テストで固定した
@@ -31,9 +36,9 @@ const REL_GATE_LU: f64 = -10.0;
 const LRA_REL_GATE_LU: f64 = -20.0;
 
 /// ヒストグラムのビン数 / 分解能 / 下端。
-const HIST_BINS: usize = 1000;
+pub const HIST_BINS: usize = 1000;
 const HIST_STEP_DB: f64 = 0.1;
-const HIST_MIN_LUFS: f64 = -70.0;
+pub const HIST_MIN_LUFS: f64 = -70.0;
 
 /// Momentary 窓 = 400ms = 4 サブブロック。
 const MOMENTARY_BLOCKS: usize = 4;
@@ -231,6 +236,12 @@ pub struct LoudnessReadout {
     pub lra_provisional: bool,
     /// リセットからの測定経過時間 [秒]。
     pub measured_secs: f32,
+    /// `max_momentary_lufs` を出した 400ms 窓の**先頭**位置 [秒] (リセット起点)。
+    /// 未到達なら `None`。窓の先頭を返すのは、オフライン解析のレポートから
+    /// 「一番大きかったところ」へ飛んで**その頭から**聴けるようにするため。
+    pub max_momentary_at_secs: Option<f32>,
+    /// `max_short_term_lufs` を出した 3s 窓の**先頭**位置 [秒] (リセット起点)。
+    pub max_short_term_at_secs: Option<f32>,
 }
 
 impl Default for LoudnessReadout {
@@ -244,6 +255,8 @@ impl Default for LoudnessReadout {
             lra_lu: 0.0,
             lra_provisional: true,
             measured_secs: 0.0,
+            max_momentary_at_secs: None,
+            max_short_term_at_secs: None,
         }
     }
 }
@@ -267,6 +280,9 @@ pub struct LoudnessMeter {
     lra_hist: LoudnessHistogram,
     max_momentary: f64,
     max_short_term: f64,
+    /// `max_momentary` / `max_short_term` を出した窓の先頭サブブロック番号。
+    max_momentary_at_block: u64,
+    max_short_term_at_block: u64,
     /// リセットからの完了サブブロック数 (= 経過時間 × 10)。
     elapsed_blocks: u64,
 }
@@ -288,6 +304,8 @@ impl LoudnessMeter {
             lra_hist: LoudnessHistogram::new(),
             max_momentary: f64::NEG_INFINITY,
             max_short_term: f64::NEG_INFINITY,
+            max_momentary_at_block: 0,
+            max_short_term_at_block: 0,
             elapsed_blocks: 0,
         }
     }
@@ -311,6 +329,8 @@ impl LoudnessMeter {
         self.lra_hist.clear();
         self.max_momentary = f64::NEG_INFINITY;
         self.max_short_term = f64::NEG_INFINITY;
+        self.max_momentary_at_block = 0;
+        self.max_short_term_at_block = 0;
         self.elapsed_blocks = 0;
     }
 
@@ -348,18 +368,34 @@ impl LoudnessMeter {
         self.subblocks.push_back(mean_sq);
         self.elapsed_blocks += 1;
 
+        // **リセット地点をまたぐ窓は確定させない**。`reset_integrated` は
+        // 「今鳴っている音」の表示を途切れさせないために `subblocks` (直近 3 秒) を
+        // 残すので、経過ブロック数で見ないとリセット前の音が新しい測定の
+        // Integrated / LRA / 最大 M / 最大 S に混入する (相対ゲートの基準まで
+        // 押し上げるので、以後の静かな素材が全部ゲートで落ちて I が前回値に張り付く)。
+        let elapsed = self.elapsed_blocks;
+
         // Momentary (400ms) → 同時に Integrated のゲーティングブロックでもある
         // (窓 400ms / ホップ 100ms = 75% オーバーラップ)。
-        if let Some(m) = self.window_loudness(MOMENTARY_BLOCKS) {
+        if elapsed >= MOMENTARY_BLOCKS as u64
+            && let Some(m) = self.window_loudness(MOMENTARY_BLOCKS)
+        {
             if m > self.max_momentary {
                 self.max_momentary = m;
+                // 窓は直近 MOMENTARY_BLOCKS 個 = `[elapsed - n, elapsed)`。
+                self.max_momentary_at_block =
+                    self.elapsed_blocks.saturating_sub(MOMENTARY_BLOCKS as u64);
             }
             self.integrated_hist.add(m);
         }
         // Short-term (3s) → LRA の入力 (10Hz)。
-        if let Some(s) = self.window_loudness(SHORT_TERM_BLOCKS) {
+        if elapsed >= SHORT_TERM_BLOCKS as u64
+            && let Some(s) = self.window_loudness(SHORT_TERM_BLOCKS)
+        {
             if s > self.max_short_term {
                 self.max_short_term = s;
+                self.max_short_term_at_block =
+                    self.elapsed_blocks.saturating_sub(SHORT_TERM_BLOCKS as u64);
             }
             self.lra_hist.add(s);
         }
@@ -415,8 +451,40 @@ impl LoudnessMeter {
             lra_lu: self.lra().unwrap_or(0.0) as f32,
             lra_provisional: secs < LRA_PROVISIONAL_SECS,
             measured_secs: secs,
+            max_momentary_at_secs: self
+                .max_momentary
+                .is_finite()
+                .then(|| self.max_momentary_at_block as f32 / 10.0),
+            max_short_term_at_secs: self
+                .max_short_term
+                .is_finite()
+                .then(|| self.max_short_term_at_block as f32 / 10.0),
         }
     }
+
+    /// 現在の Momentary (400ms 窓) [LUFS]。窓が埋まっていなければ `None`。
+    /// `readout()` は Integrated (ヒストグラム 2 走査) まで計算するので、
+    /// オフライン解析が曲線を毎バッファ積むときはこちらを使う。
+    pub fn momentary_lufs(&self) -> Option<f64> {
+        self.window_loudness(MOMENTARY_BLOCKS)
+    }
+
+    /// 現在の Short-term (3s 窓) [LUFS]。窓が埋まっていなければ `None`。
+    pub fn short_term_lufs(&self) -> Option<f64> {
+        self.window_loudness(SHORT_TERM_BLOCKS)
+    }
+
+    /// Short-term の分布ヒストグラム (LRA の入力そのもの)。
+    /// bin `i` の中心ラウドネスは [`histogram_bin_lufs`]。
+    pub fn short_term_histogram(&self) -> &[u64] {
+        &self.lra_hist.counts
+    }
+}
+
+/// [`LoudnessMeter::short_term_histogram`] の bin `i` が表すラウドネス [LUFS] (ビン中央)。
+#[must_use]
+pub fn histogram_bin_lufs(i: usize) -> f64 {
+    LoudnessHistogram::bin_loudness(i)
 }
 
 #[cfg(test)]
@@ -425,6 +493,53 @@ mod tests {
 
     fn approx(a: f64, b: f64, eps: f64, what: &str) {
         assert!((a - b).abs() <= eps, "{what}: expected {b} ± {eps}, got {a}");
+    }
+
+    /// 指定 dBFS の 1kHz 正弦をステレオで `secs` 秒ぶん流し込む。
+    fn feed(m: &mut LoudnessMeter, sample_rate: u32, dbfs: f32, secs: f32) {
+        let amp = 10f32.powf(dbfs / 20.0);
+        let total = (sample_rate as f32 * secs) as usize;
+        let mut block = vec![[0.0f32; 2]; 1024];
+        let mut n = 0usize;
+        while n < total {
+            let k = 1024.min(total - n);
+            for (i, fr) in block.iter_mut().enumerate().take(k) {
+                let t = (n + i) as f32 / sample_rate as f32;
+                let v = amp * (std::f32::consts::TAU * 1000.0 * t).sin();
+                *fr = [v, v];
+            }
+            m.process(&block[..k]);
+            n += k;
+        }
+    }
+
+    /// リセット地点をまたぐ窓が新しい測定を汚染しないこと。
+    ///
+    /// `reset_integrated` は「今鳴っている音」の表示を途切れさせないために
+    /// 直近 3 秒のサブブロックを残すので、経過ブロック数で見ないとリセット前の
+    /// 大きい音が Integrated / 最大 M / 最大 S に載り、しかも相対ゲートの基準を
+    /// 押し上げて以後の静かな素材を全部落とす (= I が前回値に張り付く)。
+    #[test]
+    fn reset_後の測定にリセット前の音が混入しない() {
+        let mut m = LoudnessMeter::new(48_000);
+        feed(&mut m, 48_000, -10.0, 3.0);
+        m.reset_integrated();
+        // リセット後は静か → 少し大きい、の順。最大はリセット後の後半に出るはず。
+        feed(&mut m, 48_000, -40.0, 4.0);
+        feed(&mut m, 48_000, -30.0, 4.0);
+        let r = m.readout();
+        // 汚染していれば -13 前後に張り付く (リセット前の -10 dBFS が相対ゲートの
+        // 基準を押し上げ、以後の静かなブロックを全部落とすため)。
+        assert!(
+            r.integrated_lufs < -25.0,
+            "reset 前の音が Integrated に残っている: {}",
+            r.integrated_lufs
+        );
+        approx(f64::from(r.max_momentary_lufs), -30.0, 0.3, "reset 後の最大 M");
+        approx(f64::from(r.max_short_term_lufs), -30.0, 0.3, "reset 後の最大 S");
+        // 位置はリセット起点。リセット前の音を最大と誤認して 0 に飽和しない。
+        let at = r.max_momentary_at_secs.expect("最大 M の位置");
+        assert!(at >= 4.0, "リセット前の音を最大として拾っている: {at}");
     }
 
     /// BS.1770-5 Annex 1 Table 1 / Table 2 の 48kHz 係数と一致すること。

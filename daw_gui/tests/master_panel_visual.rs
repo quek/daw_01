@@ -74,6 +74,9 @@ fn playing_snapshot() -> MasterMeterSnapshot {
             lra_lu: 6.2,
             lra_provisional: false,
             measured_secs: 92.0,
+            // r.md #54 でオフライン解析用に足した発生位置 (ライブメーターは使わない)。
+            max_momentary_at_secs: Some(41.2),
+            max_short_term_at_secs: Some(38.0),
         },
         true_peak_dbtp: -0.9,
         max_true_peak_dbtp: -0.4,
