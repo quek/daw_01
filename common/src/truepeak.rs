@@ -129,6 +129,11 @@ pub struct TruePeakMeter {
     block_peak: f32,
     /// リセット以降の最大トゥルーピーク (線形振幅)。
     max_peak: f32,
+    /// r.md #57: `false` (= トランスポート停止) の間は `max_peak` を更新しない。
+    /// 最大トゥルーピークは `reset_loudness` が畳む測定セッション側の量なので、
+    /// Integrated / LRA と同じ stand-by の対象。直近ブロック TP はライブのまま。
+    /// 既定 `true` (オフライン解析は `set_running` を呼ばない)。
+    running: bool,
     /// リセット以降に流し込んだフレーム数 (= 位置の基準)。
     frames_seen: u64,
     /// `max_peak` を更新したフレーム位置 (リセット起点からの相対)。
@@ -145,9 +150,15 @@ impl TruePeakMeter {
             channels: [Channel::new(), Channel::new()],
             block_peak: 0.0,
             max_peak: 0.0,
+            running: true,
             frames_seen: 0,
             max_at_frame: 0,
         }
+    }
+
+    /// r.md #57: 最大トゥルーピークの積算を running / stand-by で切り替える。
+    pub fn set_running(&mut self, running: bool) {
+        self.running = running;
     }
 
     fn phases_for(sample_rate: u32) -> Vec<[f32; TAPS]> {
@@ -201,12 +212,16 @@ impl TruePeakMeter {
             if frame_peak > block {
                 block = frame_peak;
             }
-            if frame_peak > self.max_peak {
+            // r.md #57: stand-by (= トランスポート停止) 中は最大値を更新しない。
+            // 直近ブロック TP (`block_peak`) はライブのまま。
+            if self.running && frame_peak > self.max_peak {
                 self.max_peak = frame_peak;
                 self.max_at_frame = self.frames_seen + i as u64;
             }
         }
         self.block_peak = block;
+        // `frames_seen` は「リセット起点からのフレーム位置」なので stand-by 中も進める
+        // (止めると `max_at_frame` が指す位置が実時間とずれる)。
         self.frames_seen += frames.len() as u64;
     }
 

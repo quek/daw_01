@@ -438,13 +438,14 @@ fn spawn_playhead_poller(
             tick_count = tick_count.wrapping_add(1);
             let samples = bridge.playhead_samples();
             let preroll = bridge.preroll_remaining();
+            // r.md #51: 「走っているか」「録音してよいか」は engine が所有する
+            // 事実。GUI は他の telemetry と同じ面で観測する。
+            let playing = bridge.playing();
             if proxy
                 .send_event(AppEvent::Tick {
                     samples,
                     preroll,
-                    // r.md #51: 「走っているか」「録音してよいか」は engine が所有する
-                    // 事実。GUI は他の telemetry と同じ面で観測する。
-                    playing: bridge.playing(),
+                    playing,
                     recording_live: bridge.recording_live(),
                 })
                 .is_err()
@@ -468,6 +469,10 @@ fn spawn_playhead_poller(
             if let Some(control) = control
                 && control.active
             {
+                // r.md #57: 停止したら積算を止める (EBU Tech 3341 §2.2 の
+                // running / stand-by)。count-in 中は engine が scope リングへ何も
+                // 書かない = プログラムではないので running に含めない。
+                let rolling = playing && preroll == 0;
                 let snapshot = analyzer
                     .tick(
                         &control,
@@ -475,6 +480,7 @@ fn spawn_playhead_poller(
                         &scope_buf,
                         elapsed,
                         outcome.dropped > 0,
+                        rolling,
                     )
                     .clone();
                 if proxy

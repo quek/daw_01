@@ -230,9 +230,15 @@ pub struct ClipView {
     /// `None` で既存挙動 (clip 内 hit zone 全体が Move、 audio 描画なし)。
     pub audio_edit: Option<ClipViewAudioEdit>,
     /// r.md #38: この clip の各 event の fade。 content 種別 (audio / video / image / text)
-    /// に依らず、 空でなければ widget が event ごとに fade envelope + 掴み handle を描画し、
-    /// handle 領域に drag handler を bind して `SetClipFadeBeatsBatch` /
-    /// `SetClipFadeCurveBatch` を発行する。 MIDI / Automation clip は空 (fade を持たない)。
+    /// に依らず、 空でなければ widget が event ごとに fade を描画し、 handle 領域に
+    /// drag handler を bind して `SetClipFadeBeatsBatch` / `SetClipFadeCurveBatch` を
+    /// 発行する。 MIDI / Automation clip は空 (fade を持たない)。
+    ///
+    /// r.md #58: **カーブと掴む正方形で描画層が違う**。 カーブは曲の状態なので cached 層
+    /// (`viewport_key` は `fold_arrangement_clip_hash` 経由で fade の全パラメータを含む)、
+    /// 掴む正方形はポインタ位置の関数なので cached 外の overlay で、 **マウスが乗っている
+    /// clip (+ フェードをドラッグ中の clip) にだけ**描く。 hit zone は hover と無関係に
+    /// 常に生きている (`fade_geometry` が描画と hit-test 共通の SSoT)。
     ///
     /// r.md #38 以前は `audio_edit` (= audio の first event) 経由でしか渡らず、
     /// (a) 音声クリップにしか線が出ず、 (b) 複数 event を持つクリップでは 1 本目の
@@ -718,6 +724,10 @@ pub(crate) use crate::widgets::select_modifier::{RangeItem, range_block, range_o
 #[derive(Clone, Debug)]
 pub struct ArrangementResponse {
     pub hovered_track: Option<u32>,
+    /// ポインタ下の clip。 r.md #58 以降、 widget 内部でもフェードの掴む正方形を出す
+    /// ゲートに使っている。 **caller はこれ (やそのミラー) を `data_generation` などの
+    /// heavy cache キーに混ぜないこと** — 混ぜるとマウスを動かすたびにアレンジ全体が
+    /// 再構築される。
     pub hovered_clip: Option<ClipKey>,
     pub hovered_zone: Option<ClipDragKind>,
     pub dragging: Option<ClipDragKind>,

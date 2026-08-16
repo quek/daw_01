@@ -197,6 +197,38 @@ fn draw_section_header<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, sect: Rec
         HEADER_FONT,
         app.theme.core.text_dim,
     );
+    // r.md #57: トランスポートが止まっている間、測定セッション側の値
+    // (I / LRA / M max / S max / 最大 TP / 相関レンジ) は積算を止めて保持している
+    // (EBU Tech 3341 §2.2 の stand-by)。数字が動かないことの理由が画面に出ていないと
+    // 「壊れている」と読めるので、値を持つ MASTER セクションの見出し行に明示する。
+    //
+    // dim 色は使えない: `M max` / `S max` は常時 dim、`LRA` は暫定のとき dim と、
+    // このパネルで既に 2 つの意味を担っている (三重に過負荷すると、いちばん伝えたい
+    // 「保持中」が M max / S max ではまったく見えない)。見出し本文より **明るい**
+    // `text` で、右端に別の語として置く。
+    //
+    // **「何が」保持中かを名指しする**。 このセクションには最大到達ピークと CLIP
+    // カウントも同居しているが、 そちらは `peak_reset_epoch` という別系統のリセット
+    // (メーターのクリック) を持つ独立した測定で、 停止中にプラグインが 0 dBFS を
+    // 叩いたら点灯するのが正しい (クリップ検出は保護表示なので止めない)。 ただ
+    // 「保持中」 とだけ書くとそれらまで凍っていると読めるので、 対象を明示する。
+    if i == 0 && !app.transport.master_meter.loudness_running {
+        const HOLD: &str = "ラウドネス保持中";
+        let w = ui.measure_text(HOLD, HEADER_FONT);
+        let title_end = sect.x + PAD + ui.measure_text(SECTION_TITLES[i], HEADER_FONT);
+        let x = sect.x + sect.w - PAD - w;
+        // 見出しに重なるほど狭いときは出さない (パネル幅はユーザーが縮められる)。
+        if x > title_end + 8.0 {
+            ui.label_at(
+                "master_panel_loudness_hold",
+                HOLD,
+                x,
+                sect.y + 1.0,
+                HEADER_FONT,
+                app.theme.core.text,
+            );
+        }
+    }
 }
 
 /// セクション境界。上下ドラッグで隣り合う 2 セクションの配分を移す。

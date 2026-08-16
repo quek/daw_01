@@ -1267,20 +1267,17 @@ pub(super) fn db_to_handle_y(rect: Rect, gain_db: f32, style: &ArrangementStyle)
     rect.y + rect.h * 0.5 - rect.h * 0.5 * normalized
 }
 
-/// r.md #38: 1 event の fade envelope を描画 (event 左端 = In / 右端 = Out)。
+/// r.md #38: 1 event の fade envelope (カーブ + 掴む正方形) を描画
+/// (event 左端 = In / 右端 = Out)。
 ///
-/// **音・映像・画像・字幕に実際に掛かる envelope をそのまま描く**:
-/// - 無音 (ゲイン 0) = event 矩形の**下端**、 フル (ゲイン 1) = **上端**。
-///   r.md #38 以前は上下が逆で、 fade in が「頭で最大 → 下がる」 という
-///   fade out の絵になっていた。
-/// - 線の形は `common::audio_render::fade_curve_at` を刻んだ折れ線
-///   (Linear / Exponential / SCurve が形に出る)。 以前は直線 1 本だったので
-///   curve を切り替えても線が変わらなかった。
-/// - 掴む正方形は **fade の終端**に置く (fade 長で横に動く)。 以前は clip の角に
-///   固定されていて、 fade を伸ばしても動かなかった。
+/// r.md #58: 「カーブ + 掴む正方形」 をまとめて描く合成関数。
 ///
-/// `fade_beats = 0` でも正方形だけは描く (= 「掴める場所」 の hint)。 このとき
-/// 正方形は event の角にちょうど一致するので従来の見た目と同じ。
+/// **通常の描画経路はこれを使わない**。 カーブは曲の状態 (= Song の関数) なので
+/// cached 層 (`draw_clip_fade_curves`)、 掴む正方形はポインタ位置の関数なので
+/// cached 外の overlay (`draw_fade_handle_overlay`)、 と層が分かれている。
+/// ここに残っているのは **ドラッグ中の ghost** (`draw_audio_drag_ghost`) 用 —
+/// ghost は「今どうなるか」 のプレビューなので、 カーブと掴み位置の両方を同時に
+/// 出す必要がある。
 pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
@@ -1291,8 +1288,26 @@ pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     clip_bg: Color,
     style: &ArrangementStyle,
 ) {
-    use daw_ui_renderer::{LineBatch, LineSegment};
+    // 正方形 → カーブの順 (= 分割前と同じ z 順。 カーブの線が正方形の上に乗る)。
+    draw_fade_handle(hctx, clip_rect, clip_len_beats, fade, edge, clip_bg, style);
+    draw_fade_curve(hctx, clip_rect, clip_len_beats, fade, edge, clip_bg, style);
+}
 
+/// 掴む正方形だけを描く (hit zone と同じ rect = `fade_geometry` が SSoT)。
+///
+/// r.md #38: 正方形は **fade の終端**に置く (fade 長で横に動く)。 以前は clip の角に
+/// 固定されていて、 fade を伸ばしても動かなかった。 `fade_beats = 0` でも描く
+/// (= 「ここを掴めばフェードを付けられる」 の hint)。 このとき正方形は event の角に
+/// ちょうど一致する。
+pub(super) fn draw_fade_handle<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    clip_rect: Rect,
+    clip_len_beats: f64,
+    fade: &ClipEventFade,
+    edge: FadeEdge,
+    clip_bg: Color,
+    style: &ArrangementStyle,
+) {
     let g = fade_geometry(clip_rect, clip_len_beats, fade, edge, style);
     if g.event_rect.w <= 0.0 || g.event_rect.h <= 0.0 {
         return;
@@ -1300,7 +1315,6 @@ pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     // r.md #46: clip 色 (可変背景) と波形の上のどちらでも縁が立つよう、
     // 前景 + 逆極性の裏打ちの 2 層で描く。
     let (fg, backing) = fade_colors_for(hctx.palette(), style, clip_bg, style.bg);
-    // 掴む正方形 (hit zone と同じ rect = `fade_geometry` が SSoT)。
     // 裏打ちを 1 周り大きく敷いてから前景を重ねる = 1px の縁取り。
     push_filled_rect(hctx, g.handle_rect, backing);
     let inner = Rect {
@@ -1312,10 +1326,35 @@ pub(super) fn draw_fade_envelope<M: ?Sized + 'static>(
     if inner.w > 0.0 && inner.h > 0.0 {
         push_filled_rect(hctx, inner, fg);
     }
+}
 
+/// フェードカーブ (斜めの線) だけを描く。 fade 長 0 なら何も描かない。
+///
+/// r.md #38: **音・映像・画像・字幕に実際に掛かる envelope をそのまま描く**。
+/// 無音 (ゲイン 0) = event 矩形の**下端**、 フル (ゲイン 1) = **上端**
+/// (#38 以前は上下が逆で、 fade in が「頭で最大 → 下がる」 という fade out の絵に
+/// なっていた)。 線の形は `common::audio_render::fade_curve_at` を刻んだ折れ線で、
+/// Linear / Exponential / SCurve が形に出る (以前は直線 1 本だったので curve を
+/// 切り替えても線が変わらなかった)。
+pub(super) fn draw_fade_curve<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    clip_rect: Rect,
+    clip_len_beats: f64,
+    fade: &ClipEventFade,
+    edge: FadeEdge,
+    clip_bg: Color,
+    style: &ArrangementStyle,
+) {
+    use daw_ui_renderer::{LineBatch, LineSegment};
+
+    let g = fade_geometry(clip_rect, clip_len_beats, fade, edge, style);
+    if g.event_rect.w <= 0.0 || g.event_rect.h <= 0.0 {
+        return;
+    }
     if g.width_px <= 0.5 {
         return;
     }
+    let (fg, backing) = fade_colors_for(hctx.palette(), style, clip_bg, style.bg);
     let curve = match edge {
         FadeEdge::In => fade.fade.fade_in_curve,
         FadeEdge::Out => fade.fade.fade_out_curve,
@@ -1386,8 +1425,13 @@ pub(super) fn draw_clip_audio_overlay<M: ?Sized + 'static>(
     }
 }
 
-/// r.md #38: clip の全 event の fade envelope を描画 (content 種別に依らず共通)。
-pub(super) fn draw_clip_fades<M: ?Sized + 'static>(
+/// r.md #38: clip の全 event の fade **カーブ**を描画 (content 種別に依らず共通)。
+///
+/// r.md #58: 掴む正方形はここでは描かない。 カーブは曲の状態 (どこにどんなフェードが
+/// 掛かっているか) なので cached 層 (`viewport_key` は `fold_arrangement_clip_hash` 経由で
+/// fade の全パラメータを含む) が正しい置き場所。 正方形は「掴める場所」 = ポインタ位置の
+/// 関数なので cached 外の `draw_fade_handle_overlay` が描く。
+pub(super) fn draw_clip_fade_curves<M: ?Sized + 'static>(
     hctx: &mut HeavyCtx<'_, '_, M>,
     clip_rect: Rect,
     clip_len_beats: f64,
@@ -1397,14 +1441,79 @@ pub(super) fn draw_clip_fades<M: ?Sized + 'static>(
     style: &ArrangementStyle,
 ) {
     for f in fades {
-        // hit-test (`audio_grip_hit`) は handle が重なったとき **width_px の大きい方**を
-        // 採るので、 描画も「大きい方を後に (= 手前に) 描く」 に揃える (SSoT)。
-        let mut edges = [FadeEdge::In, FadeEdge::Out];
-        if f.fade.fade_in_beats > f.fade.fade_out_beats {
-            edges.swap(0, 1);
+        for edge in [FadeEdge::In, FadeEdge::Out] {
+            draw_fade_curve(hctx, clip_rect, clip_len_beats, f, edge, clip_bg, style);
         }
-        for edge in edges {
-            draw_fade_envelope(hctx, clip_rect, clip_len_beats, f, edge, clip_bg, style);
+    }
+}
+
+/// r.md #58: 掴む正方形を **マウスが乗っているクリップだけ** に描く overlay。
+///
+/// - **cached 外で毎フレーム描画**: hover は毎フレーム変わるので `viewport_key`
+///   (heavy cache key) に含めない — 含めた瞬間、 マウスを動かすたびにアレンジ全体
+///   (グリッド + 全クリップ + 全オートメーションレーン) が再構築される。
+///   `draw_active_group_overlay` / `draw_selection_overlay` と同 idiom。
+/// - **選択中かどうかは見ない**: 要望どおり「マウスオーバーしている時だけ」
+///   (Ableton Live / Ardour / Bitwig と同じ。 Cubase だけが「hover または選択」)。
+/// - **`drag_clip` を OR 条件に入れるのが必須**: フェードのカーブ切替は縦ドラッグなので
+///   カーソルが行の外へ出て `clip_hit` が None を返す。 hover だけを条件にすると、
+///   掴んでいる正方形が指の下で消える。
+/// - フェードを持つ全 clip 種別が対象 (r.md #38 で fade は content 非依存になった)。
+///   MIDI / オートメーションクリップは `fades` が空なので元から無関係。
+pub(super) fn draw_fade_handle_overlay<M: ?Sized + 'static>(
+    hctx: &mut HeavyCtx<'_, '_, M>,
+    visible_tracks: &[ArrangementTrack],
+    tops: &[f32],
+    view: ArrangementView,
+    lanes: Rect,
+    hovered_clip: Option<ClipKey>,
+    drag_clip: Option<ClipKey>,
+    style: &ArrangementStyle,
+) {
+    if hovered_clip.is_none() && drag_clip.is_none() {
+        return;
+    }
+    let view_end = view.start_beat + view.len_beats;
+    for (i, t) in visible_tracks.iter().enumerate() {
+        let row_top = tops[i];
+        let row_h = effective_track_row_h(t, view.track_row_h);
+        if row_top + row_h < lanes.y || row_top > lanes.y + lanes.h {
+            continue;
+        }
+        for c in &t.clips {
+            if c.fades.is_empty() {
+                continue;
+            }
+            let key = ClipKey { track: t.id, clip: c.id };
+            if Some(key) != hovered_clip && Some(key) != drag_clip {
+                continue;
+            }
+            let end = c.start_beat + c.len_beats;
+            if end < view.start_beat || c.start_beat > view_end {
+                continue;
+            }
+            let r = clip_to_rect(row_top, row_h, c, view, lanes);
+            if r.x + r.w < lanes.x || r.x > lanes.x + lanes.w {
+                continue;
+            }
+            // cached 層のカーブ描画 (render.rs) と同じ「細すぎる clip には掴み所を
+            // 出さない」 閾値。 hit-test (`audio_grip_hit`) 側とも揃っている。
+            if r.w < style.audio_min_clip_w_for_handles_px {
+                continue;
+            }
+            let bg = clip_effective_fill(c, t.kind, style);
+            for f in &c.fades {
+                // hit-test (`audio_grip_hit`) は handle が重なったとき **width_px の
+                // 大きい方**を採るので、 描画も「大きい方を後に (= 手前に) 描く」 に
+                // 揃える (SSoT)。 この規則は正方形にだけ意味がある。
+                let mut edges = [FadeEdge::In, FadeEdge::Out];
+                if f.fade.fade_in_beats > f.fade.fade_out_beats {
+                    edges.swap(0, 1);
+                }
+                for edge in edges {
+                    draw_fade_handle(hctx, r, c.len_beats, f, edge, bg, style);
+                }
+            }
         }
     }
 }

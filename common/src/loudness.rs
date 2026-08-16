@@ -285,6 +285,24 @@ pub struct LoudnessMeter {
     max_short_term_at_block: u64,
     /// リセットからの完了サブブロック数 (= 経過時間 × 10)。
     elapsed_blocks: u64,
+    /// r.md #57: EBU Tech 3341 §2.2 の running / stand-by。`false` の間は
+    /// **測定セッションに属する量** (Integrated / LRA / 最大 M / 最大 S / 経過時間) の
+    /// 積算を止めて直前の値を保持する。K-weighting フィルタと 100ms サブブロックの
+    /// 積み上げは止めない — 止めるとフィルタ状態が凍って再開時に過渡が出るし、
+    /// Momentary / Short-term は規格上つねにライブでなければならない。
+    ///
+    /// 既定は `true`。オフライン解析 (`LoudnessMeter` を直接使う経路) は
+    /// `set_running` を呼ばないので、既定が `false` だと全部 -inf になる。
+    running: bool,
+    /// stand-by / リセットを挟まずに連続で積んだサブブロック数。
+    ///
+    /// ゲーティング窓 (Momentary 400ms = 4 ブロック / Short-term 3s = 30 ブロック) は
+    /// `subblocks` の直近 n 個の平均なので、**stand-by 中に積んだブロックが窓に残って
+    /// いる間に積算を再開すると、停止中の音がそのまま Integrated / LRA / 最大値へ
+    /// 流れ込む**。停止中もプラグインの残響やモニタ音は出ている (engine は `playing` に
+    /// 関係なく scope リングへ書く) ので、これは実際に起きる。窓の中身が全部 running 由来に
+    /// なるまで積算対象にしないためのカウンタ。
+    running_blocks: usize,
 }
 
 impl LoudnessMeter {
@@ -307,11 +325,27 @@ impl LoudnessMeter {
             max_momentary_at_block: 0,
             max_short_term_at_block: 0,
             elapsed_blocks: 0,
+            running: true,
+            running_blocks: 0,
         }
     }
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// r.md #57: 測定セッションを running / stand-by に切り替える
+    /// (EBU Tech 3341 §2.2 の start/pause/continue)。stand-by は「保持」であって
+    /// 「リセット」ではない — continue できることが規格の要件で、リセットは
+    /// [`Self::reset_integrated`] という独立した操作。
+    pub fn set_running(&mut self, running: bool) {
+        if running == self.running {
+            return;
+        }
+        self.running = running;
+        // stand-by を跨いだら、ゲーティング窓の中身が全部 running 由来に戻るまで
+        // 積算しない (停止中の残響が再開後の Integrated / LRA / 最大値を汚さない)。
+        self.running_blocks = 0;
     }
 
     /// サンプルレートが変わったら設計し直す (フィルタ状態も履歴も捨てる)。
@@ -332,6 +366,12 @@ impl LoudnessMeter {
         self.max_momentary_at_block = 0;
         self.max_short_term_at_block = 0;
         self.elapsed_blocks = 0;
+        // `subblocks` (= M / S のライブ窓) は意図的に残す (リセットで M / S を
+        // 一瞬 -inf に落とさない)。 ただし窓にはリセット前の音が残っているので、
+        // **積算対象にするのは窓が入れ替わってから**。 再生開始時の自動リセット
+        // (`reset_master_loudness`) で、直前まで鳴っていた音が新しい測定の
+        // 1 個目のゲーティングブロックになるのを防ぐ。
+        self.running_blocks = 0;
     }
 
     /// フィルタ状態を含めて完全にリセットする。
@@ -366,18 +406,31 @@ impl LoudnessMeter {
             self.subblocks.pop_front();
         }
         self.subblocks.push_back(mean_sq);
-        self.elapsed_blocks += 1;
 
-        // **リセット地点をまたぐ窓は確定させない**。`reset_integrated` は
-        // 「今鳴っている音」の表示を途切れさせないために `subblocks` (直近 3 秒) を
-        // 残すので、経過ブロック数で見ないとリセット前の音が新しい測定の
-        // Integrated / LRA / 最大 M / 最大 S に混入する (相対ゲートの基準まで
-        // 押し上げるので、以後の静かな素材が全部ゲートで落ちて I が前回値に張り付く)。
-        let elapsed = self.elapsed_blocks;
+        // r.md #57: ここから下が「測定セッションに属する量」。stand-by (= トランス
+        // ポート停止) の間は 1 つも進めない。上のフィルタ処理とサブブロック積み上げは
+        // 止めない (Momentary / Short-term はライブ表示のまま)。
+        if !self.running {
+            return;
+        }
+        self.elapsed_blocks += 1;
+        self.running_blocks = self.running_blocks.saturating_add(1);
+
+        // **リセット地点 / 停止区間をまたぐ窓は確定させない**。`reset_integrated` は
+        // 「今鳴っている音」の表示を途切れさせないために `subblocks` (直近 3 秒) を残し、
+        // stand-by (r.md #57) 中もライブ表示のために積み上げ自体は続ける。よって窓の
+        // 中身が **全部「リセット後」かつ「running 由来」** になるまで待たないと、
+        // リセット前 / 停止中の音が新しい測定の Integrated / LRA / 最大 M / 最大 S に
+        // 混入する (相対ゲートの基準まで押し上げるので、以後の静かな素材が全部ゲートで
+        // 落ちて I が前回値に張り付く)。
+        //
+        // `running_blocks` は `reset_integrated` と stand-by 遷移の**両方**で 0 に戻り、
+        // running のときしか増えないので、r.md #54 の `elapsed_blocks` 条件を包含する。
+        // 連続 running なら `subblocks.len() >= n` と同時に成立するので通常再生は挙動不変。
 
         // Momentary (400ms) → 同時に Integrated のゲーティングブロックでもある
         // (窓 400ms / ホップ 100ms = 75% オーバーラップ)。
-        if elapsed >= MOMENTARY_BLOCKS as u64
+        if self.running_blocks >= MOMENTARY_BLOCKS
             && let Some(m) = self.window_loudness(MOMENTARY_BLOCKS)
         {
             if m > self.max_momentary {
@@ -389,7 +442,7 @@ impl LoudnessMeter {
             self.integrated_hist.add(m);
         }
         // Short-term (3s) → LRA の入力 (10Hz)。
-        if elapsed >= SHORT_TERM_BLOCKS as u64
+        if self.running_blocks >= SHORT_TERM_BLOCKS
             && let Some(s) = self.window_loudness(SHORT_TERM_BLOCKS)
         {
             if s > self.max_short_term {
@@ -433,21 +486,21 @@ impl LoudnessMeter {
 
     pub fn readout(&self) -> LoudnessReadout {
         let to_f32 = |v: Option<f64>| v.map_or(f32::NEG_INFINITY, |x| x as f32);
+        // r.md #57: BS.1770 は -70 LUFS **以下**のブロックを全測定から除外する
+        // (`LoudnessHistogram::add` と同じ閾値)。表示にも同じ床を敷く。敷かないと、
+        // 停止中のプラグインのノイズフロア / dither で「-95.3 LUFS」のような数字が
+        // 小刻みに動き続け、「止まっていない」ように見える。
+        let gated = |v: Option<f64>| match v {
+            Some(x) if x > ABS_GATE_LUFS => x as f32,
+            _ => f32::NEG_INFINITY,
+        };
         let secs = self.elapsed_blocks as f32 / 10.0;
         LoudnessReadout {
-            momentary_lufs: to_f32(self.window_loudness(MOMENTARY_BLOCKS)),
-            short_term_lufs: to_f32(self.window_loudness(SHORT_TERM_BLOCKS)),
+            momentary_lufs: gated(self.window_loudness(MOMENTARY_BLOCKS)),
+            short_term_lufs: gated(self.window_loudness(SHORT_TERM_BLOCKS)),
             integrated_lufs: to_f32(self.integrated()),
-            max_momentary_lufs: if self.max_momentary.is_finite() {
-                self.max_momentary as f32
-            } else {
-                f32::NEG_INFINITY
-            },
-            max_short_term_lufs: if self.max_short_term.is_finite() {
-                self.max_short_term as f32
-            } else {
-                f32::NEG_INFINITY
-            },
+            max_momentary_lufs: gated(Some(self.max_momentary)),
+            max_short_term_lufs: gated(Some(self.max_short_term)),
             lra_lu: self.lra().unwrap_or(0.0) as f32,
             lra_provisional: secs < LRA_PROVISIONAL_SECS,
             measured_secs: secs,
@@ -701,5 +754,59 @@ mod tests {
         let mut m = LoudnessMeter::new(fs);
         m.process(&sine(fs, 1000.0, 5.0, amp, true));
         assert!(m.readout().lra_provisional);
+    }
+
+    /// r.md #57: stand-by 中に積んだ 100ms サブブロックが、再開後の測定へ流れ込まない。
+    ///
+    /// ゲーティング窓は直近 4 個 (Momentary) / 30 個 (Short-term) のサブブロック平均
+    /// なので、素朴に「running のときだけ積算する」だけだと、再開直後の窓に
+    /// **停止中の音が最大 3 個 / 29 個**残ったまま Integrated と最大値へ入る。
+    /// 停止中もプラグインの残響やモニタ音は鳴る (engine は `playing` に関係なく
+    /// scope リングへ書く) ので、これは実際に起きる。
+    #[test]
+    fn audio_heard_while_stopped_does_not_leak_into_the_next_measurement() {
+        let fs = 48_000;
+        let mut m = LoudnessMeter::new(fs);
+        // 停止中に大きな音 (-6 dBFS) が 1 秒鳴っている。
+        m.set_running(false);
+        m.process(&sine(fs, 1000.0, 1.0, 10f64.powf(-6.0 / 20.0), true));
+        assert_eq!(m.readout().max_momentary_lufs, f32::NEG_INFINITY, "停止中は積まない");
+
+        // 再生開始。以後は静かな曲 (-30 dBFS) だけを測る。
+        m.set_running(true);
+        m.process(&sine(fs, 1000.0, 2.0, 10f64.powf(-30.0 / 20.0), true));
+        let r = m.readout();
+        // 混入すると最初の M ブロックが (停止中 3 個 + 再開後 1 個) の平均 ≒ -7.3 LUFS に
+        // なり、`M max` がそこへ張り付く。
+        assert!(
+            (r.max_momentary_lufs - (-30.0)).abs() < 2.0,
+            "M max は再開後の音だけを見る (got {})",
+            r.max_momentary_lufs
+        );
+        assert!(
+            (r.integrated_lufs - (-30.0)).abs() < 2.0,
+            "I も再開後の音だけ (got {})",
+            r.integrated_lufs
+        );
+    }
+
+    /// r.md #57: BS.1770 の絶対ゲート (-70 LUFS) 未満は「プログラムではない」ので
+    /// 数値表示も `-inf` にする。これが無いと、停止中にプラグインのノイズフロアで
+    /// `-95.3 LUFS` のような数字が小刻みに動き続けて「算出が止まっていない」ように見える。
+    #[test]
+    fn momentary_below_the_absolute_gate_reads_negative_infinity() {
+        let fs = 48_000;
+        let mut m = LoudnessMeter::new(fs);
+        // -95 dBFS の正弦 = K-weighting 後もゲート下。
+        m.process(&sine(fs, 1000.0, 4.0, 10f64.powf(-95.0 / 20.0), true));
+        let r = m.readout();
+        assert_eq!(r.momentary_lufs, f32::NEG_INFINITY, "M はゲート下で -inf");
+        assert_eq!(r.short_term_lufs, f32::NEG_INFINITY, "S はゲート下で -inf");
+        assert_eq!(r.max_momentary_lufs, f32::NEG_INFINITY, "M max も -inf");
+
+        // ゲート上の音なら従来どおり実測値が出る (床が効きすぎていないことの確認)。
+        let mut loud = LoudnessMeter::new(fs);
+        loud.process(&sine(fs, 1000.0, 4.0, 10f64.powf(-18.0 / 20.0), true));
+        assert!((loud.readout().momentary_lufs - (-18.0)).abs() < 1.0);
     }
 }

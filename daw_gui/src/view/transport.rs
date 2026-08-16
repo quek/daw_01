@@ -10,13 +10,32 @@ use common::model::{AutomationTarget, MASTER_TRACK_ID, RecordingMode};
 use daw_ui_core::{
     Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
-use daw_ui_renderer::Rect;
+use daw_ui_renderer::{Color, Rect};
 
 use crate::app::{AppData, AppEvent};
 use crate::theme::Theme;
 use crate::view::param_gesture::push_param_gesture_edges;
 
 const TS_DEN_ITEMS: &[&str] = &["2", "4", "8", "16"];
+
+/// r.md #56: 再生位置の読み値 (ビート / タイム) のフォントサイズ。
+const READOUT_FONT: f32 = 12.0;
+
+/// ビート表記 (`小節.拍.1/100拍`) の枠幅。
+///
+/// **固定幅にするのが要点**。 旧実装はバー右端の Panic ボタンから逆算した「残り幅」に
+/// 置かれたバー唯一の伸縮要素だったので、 桁が増えても他は何も動かなかった。 ボタン列の
+/// 途中へ移した以上、 幅が文字列長で変わると右側のボタン列が毎小節横滑りする。 枠を
+/// 固定幅にし、 中で **右寄せ** にすることで、 毎フレーム変わる下位桁 (1/100 拍 /
+/// ミリ秒) を固定端に留め、 稀にしか変わらない小節 / 分の桁増減を左へ逃がす。
+///
+/// 最長表記は `9999.64.99` (小節 4 桁 + 拍 2 桁 + 1/100 拍 2 桁)。 拍が 2 桁になるのは
+/// time_sig 分子が最大 32 (`scrub_style_tsig_num` の range) / 分母 2 で 1 小節 64 拍に
+/// なるため。 実 measure で収まることは `readouts_fit_fixed_width` が固定する。
+const BEAT_READOUT_W: f32 = 66.0;
+
+/// タイム表記 (`分:秒.ミリ秒`) の枠幅。 最長表記は `999:59.999`。
+const TIME_READOUT_W: f32 = 66.0;
 
 /// Phase 5 Step 5.1 follow-up (gui_01 #035): BPM scrubable_number style。
 /// sensitivity 0.5 = `1 px drag で 0.5 BPM 変化` (Ableton 流の感度)、
@@ -191,6 +210,54 @@ fn ts_index_to_den(idx: usize) -> u8 {
         3 => 16,
         _ => 4,
     }
+}
+
+/// r.md #56: 再生位置を (ビート表記, タイム表記) の 2 本に分けて組み立てる。
+///
+/// SSoT は `app.transport.playhead_beat` 一本。 小節.拍 は time_sig から
+/// (アレンジ / ピアノロールのルーラと同じ [`common::timing::beat_to_bar_beat`])、
+/// 秒は [`AppData::song_beat_to_seconds`] から導出する。 これは SongTempo automation
+/// lane があれば `TempoMap` を `song_epoch` 世代キャッシュに載せて引くだけの経路で、
+/// 無ければ定数 BPM の高速経路に落ちる。 旧実装は常に定数 BPM 換算の
+/// `timing::beat_to_seconds` だったので、 テンポカーブを引いた曲で秒表示だけが
+/// 実時間とずれていた。 なお `common::tempo_map::song_beat_to_seconds` を直に呼ぶと
+/// テンポカーブのある曲で毎フレーム O(曲長) の table 構築が走る (常時描画のバーなので
+/// 曲長に比例して悪化する) ため、 必ずキャッシュ側を通す。
+fn playhead_readout(app: &AppData) -> (String, String) {
+    let Some(b) = app.transport.playhead_beat else {
+        return ("--.-.--".to_string(), "--:--.---".to_string());
+    };
+    let beat = f64::from(b);
+    let song = app.song_doc.song();
+    let (bar, beat_in_bar) = common::timing::beat_to_bar_beat(beat, song.time_sig);
+    let beat_int = beat_in_bar.floor().max(1.0) as u32;
+    let sub = ((beat_in_bar - f64::from(beat_int)) * 100.0).floor().clamp(0.0, 99.0) as u32;
+    let secs = app.song_beat_to_seconds(beat);
+    let mins = (secs / 60.0).floor() as u64;
+    let rem = secs - (mins as f64) * 60.0;
+    let whole_s = rem.floor() as u64;
+    let ms = ((rem - whole_s as f64) * 1000.0).floor().clamp(0.0, 999.0) as u64;
+    (
+        format!("{bar}.{beat_int}.{sub:02}"),
+        format!("{mins:02}:{whole_s:02}.{ms:03}"),
+    )
+}
+
+/// 固定幅の枠に読み値を右寄せで描く (枠 / 背景は描かず、 transport の地の色の上に
+/// 数字だけを置く)。 `label_at` は clip も ellipsis も持たないので、 想定外に長い
+/// 表記が来ても隣のボタンへ左方向にはみ出さないよう左端で clamp する。
+fn draw_readout(
+    ui: &mut Ui<'_, AppData>,
+    id: &'static str,
+    text: &str,
+    x: f32,
+    w: f32,
+    y: f32,
+    color: Color,
+) {
+    let tw = ui.measure_text(text, READOUT_FONT);
+    let tx = (x + w - tw).max(x);
+    ui.label_at(id, text, tx, y, READOUT_FONT, color);
 }
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
@@ -399,6 +466,23 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }));
     }
     x += scale_w + 12.0;
+
+    // r.md #56: 再生位置 (音楽的位置 = 小節.拍.1/100拍 と 絶対時間 = 分:秒.ミリ秒) を
+    // **再生ボタンの左** に置く。 旧位置はバー右端で、 目線が「操作するボタン」 と
+    // 「今どこを再生しているか」 の間を画面幅ぶん往復していた。 Ableton Live の
+    // Control Bar (テンポ / スケール → Arrangement Position → トランスポート) と同じ並び。
+    //
+    // 2 つの独立した枠に分けているのは、 桁数の変動が互いに干渉しないようにするため
+    // (小節が 3 桁になってもタイム側の数字は 1px も動かない)。 旧実装が先頭に付けていた
+    // ▶ / ■ 記号は落とした — 再生ボタンの真隣に来ると ▶ が 2 つ並び、 しかも再生中は
+    // ボタンが ■ / 読み値が ▶ と意味が逆になって誤読を生む。 再生状態の SSoT は
+    // Play ボタン側。
+    let (beat_text, time_text) = playhead_readout(app);
+    let readout_y = area.y + (area.h - READOUT_FONT) * 0.5;
+    draw_readout(ui, "transport_pos_beat", &beat_text, x, BEAT_READOUT_W, readout_y, p.text);
+    x += BEAT_READOUT_W + 8.0;
+    draw_readout(ui, "transport_pos_time", &time_text, x, TIME_READOUT_W, readout_y, p.text);
+    x += TIME_READOUT_W + 12.0;
 
     // Play/Stop: icon (▶ / ■) + 緑色 toggle。 再生中は緑 LED で active 強調。
     let play_w = 36.0;
@@ -614,7 +698,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             })
         },
     );
-    x += learn_w + 12.0;
+    // MIDI Learn がバー左詰め列の最後尾。 r.md #56 で再生位置表示を Play の左へ移した
+    // 結果、 この右にはもう running x で置く要素が無い (Panic は右端固定)。 ここで
+    // `x` を進めても誰も読まないので進めない — 左詰め列に要素を足すときは、 直前の
+    // 要素の `x += w + gap;` を復活させてから足すこと。
 
     // PR-V4: 旧「Synth (V)」 ボタンは削除。 builtin VOICEVOX plugin が
     // 歌詞 / notes 変更時に自動 synth する (= sync_vocal_metadata 経由)。
@@ -627,48 +714,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 「選択トラックを Ctrl+G でまとめる」フローのみ提供する
     // (空のグループは意味がないため)。
 
-    // Playhead 位置 (text)。普通の DAW と同じく音楽的位置 (bar.beat.sub)
-    // と絶対時間 (分:秒.ms) を併記する。SSoT は app.transport.playhead_beat 一本で、
-    // bar.beat は time_sig、time は bpm から導出 (両表示が同じ source、かつ
-    // bar 番号はアレンジ / piano-roll ルーラと一致する)。
-    let playhead = match app.transport.playhead_beat {
-        Some(b) => {
-            let beat = f64::from(b);
-            let (bar, beat_in_bar) = common::timing::beat_to_bar_beat(beat, app.song_doc.song().time_sig);
-            let beat_int = beat_in_bar.floor().max(1.0) as u32;
-            let sub = ((beat_in_bar - f64::from(beat_int)) * 100.0).floor().clamp(0.0, 99.0) as u32;
-            let secs = common::timing::beat_to_seconds(beat, app.song_doc.song().bpm);
-            let mins = (secs / 60.0).floor() as u64;
-            let rem = secs - (mins as f64) * 60.0;
-            let whole_s = rem.floor() as u64;
-            let ms = ((rem - whole_s as f64) * 1000.0).floor().clamp(0.0, 999.0) as u64;
-            format!("\u{25b6} {bar}.{beat_int}.{sub:02}  |  {mins:02}:{whole_s:02}.{ms:03}")
-        }
-        None => "\u{25a0}  --.-.--  |  --:--.---".to_string(),
-    };
-    // 右端の Panic ボタンまでが再生位置表示の持ち分。 running x にそのまま置くと、
-    // 既定ウィンドウ幅 (1280) では左側のボタン列 (~1116px) の後に 152px を要求して
-    // Panic の矩形 (右端から 40px) に食われ、 秒 / ms が読めなくなる。 右端から
-    // 逆算した幅で clip + ellipsis する。
-    let panic_w = 28.0;
-    let playhead_right = area.x + area.w - pad - panic_w - 8.0;
-    ui.label_at_clipped(
-        "transport_playhead",
-        &playhead,
-        Rect {
-            x,
-            y: area.y + (area.h - 12.0) * 0.5,
-            w: (playhead_right - x).max(0.0),
-            h: 12.0 * 1.2,
-        },
-        12.0,
-        p.text,
-    );
+    // r.md #56: 再生位置表示はここ (バー右端) から Play ボタンの左へ移した。
+    // 旧実装は「右端の Panic から逆算した残り幅」 に置かれたバー唯一の伸縮要素で、
+    // 狭い窓では ellipsis して耐えていた。 移設に伴い固定幅 + 右寄せへ作り替えてある
+    // (`BEAT_READOUT_W` / `TIME_READOUT_W` の doc 参照)。
 
     // Panic ボタンは transport バーの **一番右** に右端揃えで固定配置する
     // (running `x` を使わず area 右端から逆算するので、 左側に何ボタンが増減しても常に
     // 右端に張り付く)。 ラベルは "!"、 背景は他ボタンと同じ中立色 (`style_panic`)。
     // click で `AppEvent::Panic` を発火 (再生停止 + 全 plugin 再初期化)。
+    let panic_w = 28.0;
     ui.toggle_button_at(
         "transport_panic",
         "!",
@@ -682,4 +737,39 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         &style_panic(&app.theme),
         |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Panic)),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daw_ui_core::{FrameInput, UiHost};
+    use daw_ui_platform::PhysicalSize;
+    use daw_ui_renderer::Scene;
+
+    /// r.md #56: 読み値は固定幅の枠に右寄せで置く。 `label_at` は clip も ellipsis も
+    /// 持たないので、 最長表記が枠を超えると隣のボタンの上へグリフが漏れる (溢れた
+    /// ぶんは左端 clamp で枠外へ出る)。 実フォントの advance を測って固定する。
+    #[test]
+    fn readouts_fit_fixed_width() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+
+        // 小節 4 桁 / 拍 2 桁 (time_sig 32/2 = 1 小節 64 拍) / 1/100 拍 2 桁、
+        // 分 3 桁 / 秒 2 桁 / ミリ秒 3 桁。 いずれも実用上の上限。
+        let (mut beat_w, mut time_w) = (0.0_f32, 0.0_f32);
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            beat_w = ui.measure_text("9999.64.99", READOUT_FONT);
+            time_w = ui.measure_text("999:59.999", READOUT_FONT);
+        });
+
+        assert!(
+            beat_w <= BEAT_READOUT_W,
+            "ビート最長表記 '9999.64.99' ({beat_w}px @ {READOUT_FONT}pt) が枠 {BEAT_READOUT_W}px に収まる"
+        );
+        assert!(
+            time_w <= TIME_READOUT_W,
+            "タイム最長表記 '999:59.999' ({time_w}px @ {READOUT_FONT}pt) が枠 {TIME_READOUT_W}px に収まる"
+        );
+    }
 }

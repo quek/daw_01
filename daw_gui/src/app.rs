@@ -344,6 +344,7 @@ impl AppData {
             },
             ui_ephemeral: UiEphemeral {
                 arr_label_cache: std::cell::RefCell::default(),
+                tempo_map_cache: std::cell::RefCell::default(),
                 // r.md #48: 設定 window を開いたときに `refresh_available_themes` が埋める。
                 // 起動時に settings_open が復元されるケースは `new()` 末尾で埋める。
                 available_themes: Vec::new(),
@@ -1371,6 +1372,12 @@ impl AppData {
             }
             AppEvent::ToggleSlotGui { index } => {
                 self.toggle_slot_gui(index);
+            }
+            // r.md #55: 閉じた 1 枚ごとに `SlotGuiClosed` が返ってくるので、
+            // `ipc.open_plugin_guis` の掃除は ✕ を押したときと同じ経路 (on_gui_closed)
+            // に任せる。ここで先回りして帳簿を clear しない (二重管理を作らない)。
+            AppEvent::CloseAllPluginEditors => {
+                self.send_plugin(PluginCommand::CloseAllSlotGuis);
             }
             AppEvent::SetVideoFxParam { device_index, param_id, value_real } => {
                 self.set_video_fx_param(device_index, param_id, value_real);

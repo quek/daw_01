@@ -1088,6 +1088,24 @@
         );
     }
 
+    /// r.md #58 同件: 上の契約は **caller 側でも** 守られていなければ意味がない。
+    /// `data_generation` は `viewport_key` の 1 成分なので、ここに `in_active_group` が
+    /// 混ざっていると widget 側でいくら除外しても hover でアレンジ全体が再構築される
+    /// (実際に混ざっていた)。widget 側テストは caller を守らないので両側で固定する。
+    #[test]
+    fn caller_data_generation_ignores_in_active_group() {
+        let c_off = shared_clip(false, Some(0.33));
+        let mut c_on = c_off.clone();
+        c_on.in_active_group = true;
+        let before = vec![track(0, "t0", vec![c_off])];
+        let after = vec![track(0, "t0", vec![c_on])];
+        assert_eq!(
+            crate::widgets::arrangement::view_build::data_generation(&before),
+            crate::widgets::arrangement::view_build::data_generation(&after),
+            "in_active_group 変化で heavy cache を捨てない"
+        );
+    }
+
     // ============================================================
     // M14 Phase 108 (daw_01 #080): share マークを Video-kind track の clip にも描く
     // ============================================================

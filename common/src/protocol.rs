@@ -508,6 +508,16 @@ pub enum PluginCommand {
     /// `title` is the window caption daw_gui composed.
     OpenSlotGuiEmbedded { device_id: u64, title: String },
     CloseSlotGui { device_id: u64 },
+    /// r.md #55: **開いているエディタ窓を全部閉じる** (`Ctrl+Shift+W`)。
+    ///
+    /// 列挙元は daw_gui ではなく **窓を所有する plugin_host** (`instances` の
+    /// `editor.is_some()`)。`UnloadAllPlugins` と同じ理由で「全部」は帳簿に依存しない
+    /// 唯一の表現になる: daw_gui 側の `open_plugin_guis` を列挙元にすると、
+    /// open 応答が返る前の device が帳簿に載っておらず永久に閉じ残る。
+    ///
+    /// 閉じた 1 枚ごとに `SlotGuiClosed` が返るので、daw_gui 側の帳簿は
+    /// 個別に ✕ を押したときとまったく同じ経路で整合する。
+    CloseAllSlotGuis,
     /// r.md #36: プラグインエディタ窓で押されたとき daw_gui へ転送してよいキーの一覧。
     ///
     /// **キー割り当ての意味論は daw_gui の `SHORTCUTS` テーブルだけが持つ**。

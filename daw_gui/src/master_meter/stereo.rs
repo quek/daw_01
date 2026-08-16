@@ -72,6 +72,11 @@ pub struct StereoMeter {
     bal_r: f32,
     corr_min: f32,
     corr_max: f32,
+    /// r.md #57: `false` (= トランスポート停止) の間は相関の観測レンジ
+    /// (`corr_min` / `corr_max`) を更新しない。`reset_range` が `reset_loudness`
+    /// から呼ばれている = 測定セッションに属する量であることが既に確定している。
+    /// 相関の現在値 / 幅 / バランス / ゴニオ点はライブのまま。既定 `true`。
+    running: bool,
     /// このティックで作ったゴニオ点 (正規化座標、`x = (R-L)/√2`, `y = (L+R)/√2`)。
     points: Vec<[f32; 2]>,
 }
@@ -96,10 +101,16 @@ impl StereoMeter {
             bal_r: 0.0,
             corr_min: 1.0,
             corr_max: -1.0,
+            running: true,
             points: Vec::with_capacity(MAX_GONIO_POINTS),
         };
         me.design();
         me
+    }
+
+    /// r.md #57: 相関レンジの積算を running / stand-by で切り替える。
+    pub fn set_running(&mut self, running: bool) {
+        self.running = running;
     }
 
     fn design(&mut self) {
@@ -172,11 +183,13 @@ impl StereoMeter {
         self.zrr += 1e-10;
 
         let c = self.correlation();
-        if c < self.corr_min {
-            self.corr_min = c;
-        }
-        if c > self.corr_max {
-            self.corr_max = c;
+        if self.running {
+            if c < self.corr_min {
+                self.corr_min = c;
+            }
+            if c > self.corr_max {
+                self.corr_max = c;
+            }
         }
 
         // --- ゴニオ点 ---

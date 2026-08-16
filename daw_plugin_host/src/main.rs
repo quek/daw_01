@@ -935,6 +935,20 @@ impl PluginHost {
             PluginCommand::CloseSlotGui { device_id } => {
                 self.close_slot_gui(device_id);
             }
+            // r.md #55: 開いている窓は host 自身が知っている。daw_gui から
+            // device_id を並べてもらう形にすると、open 応答が返る前の窓が
+            // 列挙から漏れて閉じ残る (UnloadAllPlugins と同じ理由)。
+            PluginCommand::CloseAllSlotGuis => {
+                let ids: Vec<u64> = self
+                    .instances
+                    .iter()
+                    .filter_map(|(&id, rec)| rec.editor.is_some().then_some(id))
+                    .collect();
+                tracing::info!(count = ids.len(), "CloseAllSlotGuis");
+                for id in ids {
+                    self.close_slot_gui(id);
+                }
+            }
             // r.md #36: daw_gui の SHORTCUTS から導出された chord 列をそのまま保持する。
             // ここに意味論 (どのキーが何をするか) は無い。
             PluginCommand::SetEditorForwardedKeys { chords } => {

@@ -762,6 +762,11 @@ pub enum AppEvent {
 
     /// 単一デバイスチェーン: `device_index` でアドレスする (役割別 slot 区分撤廃)。
     ToggleSlotGui { index: u32 },
+    /// r.md #55: 開いているプラグインエディタ窓を全部閉じる
+    /// (`Ctrl+Shift+W` / View メニュー)。どれが開いているかを知っているのは
+    /// 窓の所有者である plugin_host なので、daw_gui は broadcast を 1 通投げるだけ。
+    /// Song は触らないので Undo / dirty 対象外。
+    CloseAllPluginEditors,
     /// 内蔵映像 FX の param 調整パネルから 1 param を編集。
     /// `value_real` は表示の実レンジ値 → lane の保存値 (0..=1) へ逆写像して格納。
     SetVideoFxParam { device_index: u32, param_id: u32, value_real: f32 },
