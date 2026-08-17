@@ -692,6 +692,18 @@ struct Runner {
 }
 
 impl Runner {
+    /// OS が持つ実カーソル位置 (client 座標) を synthetic `PointerMoved` として
+    /// 流し込む。winit が座標を持たないイベント (file drop) や、`CursorMoved` を
+    /// 伴わないイベント (フォーカス取得を伴うクリック) の直前に呼ぶ。
+    /// 取得できないプラットフォームでは no-op (= 直近の cur_pos がそのまま使われる)。
+    fn sync_pointer_from_os(&mut self) {
+        if let Some(rs) = self.state.as_ref()
+            && let Some(pos) = query_cursor_pos_in_window(rs.window.inner())
+        {
+            self.dispatch_platform_event(PlatformEvent::PointerMoved(pos));
+        }
+    }
+
     fn dispatch_platform_event(&mut self, ev: PlatformEvent) {
         let Some(state) = self.state.as_mut() else { return };
         state.input.ingest(&ev);
@@ -869,11 +881,7 @@ impl ApplicationHandler<AppEvent> for Runner {
                 self.dispatch_platform_event(PlatformEvent::PointerLeft);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if let Some(rs) = self.state.as_ref()
-                    && let Some(pos) = query_cursor_pos_in_window(rs.window.inner())
-                {
-                    self.dispatch_platform_event(PlatformEvent::PointerMoved(pos));
-                }
+                self.sync_pointer_from_os();
                 self.dispatch_platform_event(PlatformEvent::PointerInput {
                     button: map_button(button),
                     state: map_state(state),
@@ -889,13 +897,25 @@ impl ApplicationHandler<AppEvent> for Runner {
             WindowEvent::Focused(f) => {
                 self.dispatch_platform_event(PlatformEvent::Focus(f));
             }
+            // **winit の file drop 系イベントは座標を持たない**。drop 位置は
+            // `InputAccumulator` が直近の cur_pos (= `PointerMoved` 由来) で代用するが、
+            // Windows のドラッグ中は OLE のドラッグループがマウスを握るため
+            // `CursorMoved` が一切来ず、cur_pos はドラッグ開始前の古い値
+            // (窓にカーソルが一度も入っていなければ `None` → `(0, 0)`) のまま。
+            // そのままだと drop 位置が実際の投下点と無関係になり、
+            // `take_file_drop_in_rect(canvas)` が黙って drop を捨てる
+            // (= 起動直後に Explorer から MIDI を放り込んでも何も起きない、r.md #66)。
+            // OS に実カーソル位置を問い合わせて先に同期する (MouseInput と同じ手当て)。
             WindowEvent::HoveredFile(path) => {
+                self.sync_pointer_from_os();
                 self.dispatch_platform_event(PlatformEvent::FileHovered(path));
             }
             WindowEvent::HoveredFileCancelled => {
                 self.dispatch_platform_event(PlatformEvent::FileHoverCancelled);
             }
             WindowEvent::DroppedFile(path) => {
+                self.sync_pointer_from_os();
+                tracing::info!(path = %path.display(), "file dropped");
                 self.dispatch_platform_event(PlatformEvent::FileDropped(path));
             }
             WindowEvent::ModifiersChanged(mods) => {

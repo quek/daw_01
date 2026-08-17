@@ -240,6 +240,17 @@ struct WinitRunner<H: AppHost, F: FnOnce(WinitWindow) -> H> {
     last_tick: Instant,
 }
 
+/// OS が持つ実カーソル位置 (client 座標) を `PointerMoved` として流し込む。
+/// winit が座標を持たないイベント (file drop) の直前に呼ぶ。取得できない
+/// プラットフォームでは no-op (= 従来どおり直近の cur_pos が使われる)。
+fn sync_pointer_from_os<H: AppHost>(window: Option<&WinitWindow>, host: &mut H) {
+    if let Some(w) = window
+        && let Some(pos) = query_cursor_pos_in_window(&w.inner)
+    {
+        host.on_event(AppEvent::PointerMoved(pos));
+    }
+}
+
 impl<H: AppHost, F: FnOnce(WinitWindow) -> H> ApplicationHandler for WinitRunner<H, F> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -341,14 +352,22 @@ impl<H: AppHost, F: FnOnce(WinitWindow) -> H> ApplicationHandler for WinitRunner
                 }
             }
             // M8 Phase 32: OS file drag&drop。winit が file を 1 つずつ通知する。
-            // position は別途送られないため、`InputAccumulator` が直近の cur_pos を補う。
+            // **winit の file drop 系イベントは座標を持たない**ので、`InputAccumulator` は
+            // 直近の cur_pos で代用する。ところが Windows のドラッグ中は OLE の
+            // ドラッグループがマウスを握るため `CursorMoved` が一切来ず、cur_pos は
+            // ドラッグ開始前の古い値 (窓に一度もカーソルが入っていなければ `None`) の
+            // まま。そのまま使うと drop 位置が実際の投下点と無関係になり、位置で
+            // 受け口を決めるアプリ (`take_file_drop_in_rect`) では drop が黙って
+            // 捨てられる。ここで OS に実カーソル位置を問い合わせて先に同期する。
             WindowEvent::HoveredFile(path) => {
+                sync_pointer_from_os(self.window.as_ref(), host);
                 host.on_event(AppEvent::FileHovered(path));
             }
             WindowEvent::HoveredFileCancelled => {
                 host.on_event(AppEvent::FileHoverCancelled);
             }
             WindowEvent::DroppedFile(path) => {
+                sync_pointer_from_os(self.window.as_ref(), host);
                 host.on_event(AppEvent::FileDropped(path));
             }
             _ => {}

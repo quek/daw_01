@@ -182,24 +182,24 @@ mod lipsync_fingerprint_tests {
 
 #[cfg(test)]
 mod image_drop_target_tests {
-    use crate::app_types::{resolve_image_drop_target, ImportTrackTarget};
+    use crate::app_types::{resolve_media_drop_target, ImportTrackTarget};
 
     #[test]
     fn resolves_existing_track_or_falls_back_to_new() {
         use ImportTrackTarget::*;
         // 既存 track を指す (drop が乗った) → その index に貼り付け。
-        assert_eq!(resolve_image_drop_target(Track(0), 3), Some(0));
-        assert_eq!(resolve_image_drop_target(Track(2), 3), Some(2));
+        assert_eq!(resolve_media_drop_target(Track(0), 3), Some(0));
+        assert_eq!(resolve_media_drop_target(Track(2), 3), Some(2));
         // 範囲外 index (= track の無い下の領域へのドロップ) → 新規 track (None = 一番下)。
-        assert_eq!(resolve_image_drop_target(Track(3), 3), None);
-        assert_eq!(resolve_image_drop_target(Track(99), 3), None);
+        assert_eq!(resolve_media_drop_target(Track(3), 3), None);
+        assert_eq!(resolve_media_drop_target(Track(99), 3), None);
         // 空きスペース drop (NewTrackBottom) / dialog 経由 (NoHint) → 新規 track (None = 一番下)。
-        assert_eq!(resolve_image_drop_target(NewTrackBottom, 3), None);
-        assert_eq!(resolve_image_drop_target(NoHint, 3), None);
+        assert_eq!(resolve_media_drop_target(NewTrackBottom, 3), None);
+        assert_eq!(resolve_media_drop_target(NoHint, 3), None);
         // track が 0 本 → 何を指しても新規 track。
-        assert_eq!(resolve_image_drop_target(Track(0), 0), None);
-        assert_eq!(resolve_image_drop_target(NewTrackBottom, 0), None);
-        assert_eq!(resolve_image_drop_target(NoHint, 0), None);
+        assert_eq!(resolve_media_drop_target(Track(0), 0), None);
+        assert_eq!(resolve_media_drop_target(NewTrackBottom, 0), None);
+        assert_eq!(resolve_media_drop_target(NoHint, 0), None);
     }
 }
 

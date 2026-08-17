@@ -1,4 +1,4 @@
-//! handler::media — audio/video/image/text の import
+//! handler::media — audio/video/image/text/MIDI の import
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
@@ -456,7 +456,7 @@ impl AppData {
         // (`NewTrackBottom`) や dialog 経由 (`NoHint`) は一番下に新規 track を作って
         // 貼る (r.md #31: 以前は arrangement 先頭 index 0 への insert だった)。
         let dest_track_idx: Option<usize> =
-            resolve_image_drop_target(target, self.song_doc.song().tracks.len());
+            resolve_media_drop_target(target, self.song_doc.song().tracks.len());
 
         // drag&drop の drop 位置 (`target_beat`) を最優先。 無いとき (dialog 経由)
         // は従来挙動: 既存 track に貼るときは playhead を seed に順送り配置
@@ -664,4 +664,337 @@ impl AppData {
         );
     }
 
+    /// File menu → "Import MIDI..." 経路 (r.md #66)。`rfd` の native picker を
+    /// 開いて選択 path を `action_import_midi` に転送する。起点が違うだけで
+    /// 解析 / track 生成 / 配置は drag&drop と完全に同じ pipeline。
+    pub(crate) fn action_open_import_midi_dialog(&mut self) {
+        let dialog = rfd::FileDialog::new()
+            .add_filter("MIDI", crate::midi_import::SUPPORTED_MIDI_EXTENSIONS)
+            .set_title("Import MIDI...");
+        self.spawn_file_dialog(dialog, FileDialogMode::PickFiles, FileDialogKind::ImportMidi);
+    }
+
+    /// MIDI (SMF) ファイルの取り込み (r.md #66、設計正本
+    /// [`docs/plan_midi_import.md`](../../../docs/plan_midi_import.md))。
+    ///
+    /// 1. 全ファイルを解析 (`midi_import::parse_midi_bytes`)。SMF track 1 本 =
+    ///    daw_01 track 1 本、1 SMF track に複数 channel が混在すれば channel 分割。
+    /// 2. 曲にクリップが 1 つも無いときだけ、SMF のテンポ / 拍子を採用する
+    ///    (既存クリップがある曲で BPM を変えると audio / video の実時間位置が
+    ///    全部ずれるため。ユーザー確定事項)。
+    /// 3. `target` が既存 track を指していれば 1 本目をその track に載せ、2 本目
+    ///    以降はその直下へ挿入 (`parent_group_id` はアンカー track から継承)。
+    ///    それ以外は全部一番下に追加 (r.md #31 の統一規則)。
+    /// 4. clip は「content の窓」として作る: content-local 拍は SMF tick 0 起点の
+    ///    まま保ち、`content_offset_beats` で音の始まる小節まで窓を進める。
+    ///
+    /// 解析 / ファイル I/O は `edit_song` の外で済ませ、Song 変更は 1 回の
+    /// `edit_song` に閉じる (= 1 undo step、dirty / 子プロセス sync は chokepoint 任せ)。
+    pub(crate) fn action_import_midi(
+        &mut self,
+        paths: Vec<PathBuf>,
+        target: ImportTrackTarget,
+        target_beat: Option<f64>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        // SMPTE timing (division 負値) の SMF は tick が「秒の細分」なので、
+        // 取り込み先プロジェクトのテンポで拍に直す。metrical のファイルでは使われない。
+        let tempo_map = common::tempo_map::TempoMap::from_song(self.song_doc.song());
+        let seconds_to_beat = |s: f64| tempo_map.seconds_to_beat(s);
+
+        let mut parsed_files: Vec<(PathBuf, String, crate::midi_import::ParsedMidi)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for path in &paths {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("MIDI")
+                .to_string();
+            match crate::midi_import::read_and_parse(path, &seconds_to_beat) {
+                Ok(p) => parsed_files.push((path.clone(), stem, p)),
+                Err(e) => errors.push(format!("{}: {e}", path.display())),
+            }
+        }
+        if parsed_files.is_empty() {
+            self.ui_ephemeral.status_message =
+                format!("MIDI import 失敗: {}", errors.join(" / "));
+            return;
+        }
+
+        // drop 位置 (無ければ playhead) が SMF tick 0 の置き場所。
+        let drop_beat = target_beat
+            .unwrap_or(self.transport.playhead_beat.unwrap_or(0.0) as f64)
+            .max(0.0);
+        let song_is_empty = song_has_no_clips(self.song_doc.song());
+        let anchor = resolve_media_drop_target(target, self.song_doc.song().tracks.len());
+
+        // ---- 採用するテンポ / 拍子を先に確定する (空の曲のときだけ) ----
+        let adopted_time_sig = if song_is_empty {
+            parsed_files[0].2.time_sig
+        } else {
+            None
+        };
+        let adopted_bpm: Option<f32> = if song_is_empty {
+            parsed_files[0].2.tempo.first().map(|&(_, bpm)| bpm)
+        } else {
+            None
+        };
+        // SMPTE (絶対時刻) のファイルは「秒 → 拍」を**取り込み前の**テンポで解いている。
+        // テンポを採用すると換算に使った BPM と再生 BPM が食い違い、SMPTE 経路が
+        // 守ろうとした実時間位置がずれる。採用後のテンポで解き直す。
+        if let Some(bpm) = adopted_bpm {
+            let adopted_conv = |s: f64| s * f64::from(bpm) / 60.0;
+            for (path, _, parsed) in parsed_files.iter_mut() {
+                if !parsed.is_smpte {
+                    continue;
+                }
+                match crate::midi_import::read_and_parse(path, &adopted_conv) {
+                    Ok(again) => *parsed = again,
+                    Err(e) => tracing::warn!(error = %e, path = %path.display(),
+                        "SMPTE MIDI の再解析に失敗 (取り込み前のテンポのまま配置する)"),
+                }
+            }
+        }
+        // テンポカーブを作るのは metrical のファイルだけ。SMPTE は絶対時刻が正本で
+        // tempo meta は再生タイミングの正本ではないので、曲頭 BPM だけ採用する。
+        let tempo_curve: &[(f64, f32)] = if adopted_bpm.is_some() && !parsed_files[0].2.is_smpte {
+            &parsed_files[0].2.tempo
+        } else {
+            &[]
+        };
+        // テンポ clip が覆うべき範囲 (= 取り込む素材の終端、content-local 拍)。
+        let content_end = parsed_files
+            .iter()
+            .map(|(_, _, p)| p.end_beat())
+            .fold(0.0_f64, f64::max);
+
+        let mut created_tracks = 0usize;
+        let mut placed_clips = 0usize;
+        let mut notes_total = 0usize;
+        let mut dropped_events = 0usize;
+        let mut tempo_adopted = false;
+
+        let applied = self.edit_song(|song| {
+            let mut song_end = 0.0_f64;
+            // ---- テンポ / 拍子 ----
+            if let Some(ts) = adopted_time_sig {
+                song.time_sig = ts;
+            }
+            // 小節長 (拍) — 拍子採用後の値で計算する。
+            let bar_beats =
+                f64::from(song.time_sig.0).max(1.0) * 4.0 / f64::from(song.time_sig.1).max(1.0);
+            if let Some(bpm) = adopted_bpm {
+                song.bpm = bpm;
+                tempo_adopted = true;
+                if tempo_curve.len() > 1 {
+                    song_end = song_end.max(install_song_tempo_lane(
+                        song,
+                        tempo_curve,
+                        drop_beat,
+                        content_end,
+                        bar_beats,
+                    ));
+                }
+            }
+
+            // ---- 配置 ----
+            // 1 本目だけ既存 track に載せ (anchor)、以降は insert_at に順次挿入する。
+            let mut anchor = anchor;
+            let mut insert_at = anchor.map(|i| i + 1);
+            let parent_group_id = anchor
+                .and_then(|i| song.tracks.get(i))
+                .and_then(|t| t.parent_group_id);
+            for (_, stem, parsed) in &parsed_files {
+                dropped_events += parsed.dropped_events;
+                for ptrack in &parsed.tracks {
+                    let (first_beat, last_beat) = ptrack.span_beats();
+                    // clip は content の窓: 音の始まる小節から、終わる小節まで。
+                    let win_start = (first_beat / bar_beats).floor() * bar_beats;
+                    let win_end = (((last_beat - 1e-9) / bar_beats).ceil() * bar_beats)
+                        .max(win_start + bar_beats);
+                    let name = midi_track_name(ptrack, stem);
+                    // clip 名は歌詞が無いときだけ入れる。明示名はクリップ表示で歌詞
+                    // より優先されるので、歌詞入り (.kar) では歌詞を隠してしまう
+                    // (`widgets/arrangement/view_build.rs` の表示優先順位)。
+                    let content_name = if ptrack.has_lyrics() {
+                        String::new()
+                    } else {
+                        name.clone()
+                    };
+                    let content_id = song.alloc_content(
+                        ClipContent::Midi(common::model::MidiContent {
+                            next_note_id: ptrack.notes.len() as u32 + 1,
+                            notes: ptrack.notes.clone(),
+                        }),
+                        content_name,
+                    );
+                    let dest_idx = match anchor.take() {
+                        Some(idx) => idx,
+                        None => {
+                            let track_id = song.alloc_track_id();
+                            let track = track_with(|t| {
+                                t.id = track_id;
+                                t.name = name;
+                                t.parent_group_id = parent_group_id;
+                            });
+                            created_tracks += 1;
+                            match insert_at {
+                                Some(at) => {
+                                    let at = at.min(song.tracks.len());
+                                    song.tracks.insert(at, track);
+                                    insert_at = Some(at + 1);
+                                    at
+                                }
+                                None => {
+                                    song.tracks.push(track);
+                                    song.tracks.len() - 1
+                                }
+                            }
+                        }
+                    };
+                    let track = &mut song.tracks[dest_idx];
+                    let clip_id = track.alloc_clip_id();
+                    let start_beat = drop_beat + win_start;
+                    let length_beats = win_end - win_start;
+                    track.clips.push(Clip {
+                        id: clip_id,
+                        start_beat,
+                        length_beats,
+                        content_id,
+                        content_offset_beats: win_start,
+                        ..Default::default()
+                    });
+                    song_end = song_end.max(start_beat + length_beats);
+                    placed_clips += 1;
+                    notes_total += ptrack.notes.len();
+                }
+            }
+            // 取り込みが曲の長さを超えたら伸ばす (伸ばさないと「全曲」書き出しが
+            // 既定 64 拍で切れる)。縮めることはしない。
+            song.length_beats = song.length_beats.max(song_end);
+        });
+        if applied.is_none() {
+            // 書き出し中は編集が拒否される。
+            return;
+        }
+        self.resize_track_peak_display();
+
+        let mut msg = format!(
+            "MIDI import 完了: {placed_clips} トラック / {notes_total} ノート"
+        );
+        if tempo_adopted {
+            msg.push_str("、テンポを取り込み");
+        }
+        if dropped_events > 0 {
+            msg.push_str(&format!(
+                "、CC / ピッチベンド等 {dropped_events} イベントは非対応のため破棄"
+            ));
+        }
+        if created_tracks > 0 {
+            msg.push_str("、新規トラックには音源が入っていません");
+        }
+        if !errors.is_empty() {
+            msg.push_str(&format!(" ({} 件エラー: {})", errors.len(), errors.join(" / ")));
+        }
+        self.ui_ephemeral.status_message = msg;
+    }
+}
+
+/// 曲にクリップが 1 つも無いか (= MIDI import がテンポ / 拍子を取り込んでよいか)。
+/// track の clip、track automation lane の clip、song automation lane の clip を
+/// すべて見る (「クリップが 1 つも無い曲」というユーザー向けの定義そのまま)。
+pub(crate) fn song_has_no_clips(song: &common::model::Song) -> bool {
+    song.tracks.iter().all(|t| {
+        t.clips.is_empty() && t.automation_lanes.iter().all(|l| l.clips.is_empty())
+    }) && song.song_lanes.iter().all(|l| l.clips.is_empty())
+}
+
+/// import した track の表示名。SMF の TrackName meta を優先し、無ければファイル名。
+/// 1 つの SMF track を channel で割った場合は ch 番号を付けて区別する。
+pub(crate) fn midi_track_name(track: &crate::midi_import::ParsedTrack, stem: &str) -> String {
+    let base = track.name.clone().unwrap_or_else(|| stem.to_string());
+    if track.channel_split {
+        format!("{base} ch{}", u16::from(track.channel) + 1)
+    } else {
+        base
+    }
+}
+
+/// SMF の tempo breakpoint を `SongTempo` automation lane として組み、作った
+/// automation clip の終端 (song 拍) を返す (`midi_export.rs` の階段近似の逆写像)。
+/// SMF は step tempo なので [`AutomationCurve::Hold`] を使う。`origin_beat` は
+/// SMF tick 0 を置いた song 拍、`content_end_beat` は取り込む素材の終端 (content-local)。
+///
+/// **clip は最後の breakpoint を厳密に内側に含む長さにする**。automation clip の
+/// 範囲は半開区間 `[start, start + length)` (`common/src/automation.rs` の
+/// `clip_covering`) なので、clip 長を「最後の breakpoint の拍」ぴったりにすると
+/// 最後のテンポ変化が評価されず、しかも clip の外は `lane.default_value` (= 曲頭
+/// BPM) に戻るため、テンポ変化が 2 点だけの普通のファイルでテンポマップが丸ごと
+/// 無効になる。
+fn install_song_tempo_lane(
+    song: &mut common::model::Song,
+    tempo: &[(f64, f32)],
+    origin_beat: f64,
+    content_end_beat: f64,
+    bar_beats: f64,
+) -> f64 {
+    use common::model::{
+        AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint,
+        AutomationTarget,
+    };
+    let Some(&(first_beat, first_bpm)) = tempo.first() else {
+        return 0.0;
+    };
+    let start_beat = origin_beat + first_beat;
+    // 最後の breakpoint より必ず先へ伸ばし、素材の終端まで覆う
+    // (半開区間なので「最後の point = clip 終端」だとその変化が効かない)。
+    let last_point_beat = origin_beat + tempo.last().map_or(first_beat, |&(b, _)| b);
+    let bar = bar_beats.max(1e-6);
+    let end_beat = (origin_beat + content_end_beat).max(last_point_beat + bar);
+    let points: Vec<AutomationPoint> = tempo
+        .iter()
+        .enumerate()
+        .map(|(i, &(beat, bpm))| AutomationPoint {
+            id: i as u32 + 1,
+            time_beat: (origin_beat + beat - start_beat).max(0.0),
+            value: f64::from(bpm),
+            curve: AutomationCurve::Hold,
+        })
+        .collect();
+    let content_id = song.alloc_content(
+        ClipContent::Automation(AutomationContent {
+            next_point_id: points.len() as u32 + 1,
+            points,
+        }),
+        String::new(),
+    );
+    // 既に SongTempo lane があればそこへ clip を足す (lane は target ごとに 1 本)。
+    let lane = if let Some(idx) = song
+        .song_lanes
+        .iter()
+        .position(|l| l.target == AutomationTarget::SongTempo)
+    {
+        &mut song.song_lanes[idx]
+    } else {
+        let lane_id = song.alloc_song_lane_id();
+        let mut lane = AutomationLane::new(AutomationTarget::SongTempo, f64::from(first_bpm));
+        lane.id = lane_id;
+        song.song_lanes.push(lane);
+        song.song_lanes.last_mut().expect("just pushed")
+    };
+    // clip の外 (= 取り込み位置より前) で使われる値。新規 lane / 再利用 lane で
+    // 挙動が割れないよう、どちらでも曲頭 BPM に揃える。
+    lane.default_value = f64::from(first_bpm);
+    let clip_id = lane.alloc_clip_id();
+    lane.clips.push(AutomationClip {
+        id: clip_id,
+        name: "Tempo".to_string(),
+        start_beat,
+        length_beats: (end_beat - start_beat).max(bar),
+        content_id,
+        content_offset_beats: 0.0,
+    });
+    end_beat
 }

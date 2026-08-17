@@ -1728,6 +1728,12 @@ impl AppData {
             AppEvent::OpenImportImageDialog => {
                 self.action_open_import_image_dialog();
             }
+            AppEvent::ImportMidi { paths, target, target_beat } => {
+                self.action_import_midi(paths, target, target_beat);
+            }
+            AppEvent::OpenImportMidiDialog => {
+                self.action_open_import_midi_dialog();
+            }
             AppEvent::AddTextClipAt { track, start_beat } => {
                 self.add_text_clip_to_track(track, start_beat);
             }

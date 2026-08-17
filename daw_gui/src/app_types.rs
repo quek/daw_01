@@ -1343,6 +1343,8 @@ pub enum FileDialogKind {
     ImportVideo,
     /// 画像取り込み (複数可)。
     ImportImage,
+    /// MIDI (SMF) 取り込み (複数可)。
+    ImportMidi,
     /// Audio Editor の "Add From Source..."。 取り込み先 clip と挿入位置を保持。
     AddAudioEvent {
         clip: ClipRef,
@@ -1803,12 +1805,13 @@ pub enum ImportTrackTarget {
     NoHint,
 }
 
-/// 画像ドロップの配置先を解決する (`action_import_image` の core 判定)。
-/// - `Some(idx)` (= `Track(idx)` で既存 track を指す): その track に画像 clip を貼る。
+/// メディアドロップの配置先を解決する (`action_import_image` / `action_import_midi`
+/// の core 判定)。
+/// - `Some(idx)` (= `Track(idx)` で既存 track を指す): その track に clip を貼る。
 /// - `None`: 一番下に新規 track を作って貼る。track の無い下の領域への drop
 ///   (`NewTrackBottom`)、範囲外 index の `Track`、dialog 経由 (`NoHint`) は
 ///   どれもこちら (= r.md #31 で「一番上への insert」を廃し全て末尾 push へ)。
-pub(crate) fn resolve_image_drop_target(target: ImportTrackTarget, n_tracks: usize) -> Option<usize> {
+pub(crate) fn resolve_media_drop_target(target: ImportTrackTarget, n_tracks: usize) -> Option<usize> {
     match target {
         ImportTrackTarget::Track(i) => {
             let i = i as usize;

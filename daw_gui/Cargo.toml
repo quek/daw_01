@@ -9,6 +9,7 @@ anyhow.workspace = true
 dirs.workspace = true
 reqwest.workspace = true
 boa_engine = { version = "0.21", optional = true }
+encoding_rs.workspace = true
 midir.workspace = true
 midly.workspace = true
 realfft.workspace = true

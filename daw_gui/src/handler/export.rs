@@ -407,6 +407,13 @@ impl AppData {
                     self.action_import_image(paths, ImportTrackTarget::NoHint, None);
                 }
             }
+            FileDialogKind::ImportMidi => {
+                if !paths.is_empty() {
+                    // dialog 経由は位置情報がないので NoHint (= 一番下に新規 track、
+                    // 開始位置は playhead)。
+                    self.action_import_midi(paths, ImportTrackTarget::NoHint, None);
+                }
+            }
             FileDialogKind::AddAudioEvent {
                 clip,
                 position_in_clip_beats,

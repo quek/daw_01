@@ -768,19 +768,24 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 + ((drop.position.0 - canvas_area.x) as f64 / zoom as f64);
             Some(arr_snap.snap_beat(raw.max(0.0), /* alt: */ false, zoom))
         };
-        // docs/plan_image_overlay.md P2: 3-way partition (video →
-        // image → audio). Video on Windows only (= libav/rsmpeg dependency);
+        // docs/plan_image_overlay.md P2 + r.md #66: 4-way partition (MIDI →
+        // video → image → audio). Video on Windows only (= libav/rsmpeg dependency);
         // image is OS-neutral (image crate); audio is the OS-neutral fallback
         // bucket (`common::audio_decode` handles WAV/AIFF/FLAC/MP3/OGG/M4A,
-        // r.md #19).
-        #[cfg(windows)]
-        let (video_paths, non_video_paths): (Vec<_>, Vec<_>) = drop
+        // r.md #19)。 audio が「残り全部」のバケツなので、 MIDI
+        // (`docs/plan_midi_import.md`) は その手前で拡張子判定して抜く
+        // (でないと .mid が audio decode に落ちて "Audio import 失敗" になる)。
+        let (midi_paths, non_midi_paths): (Vec<_>, Vec<_>) = drop
             .paths
+            .into_iter()
+            .partition(|p| crate::midi_import::looks_like_midi(p));
+        #[cfg(windows)]
+        let (video_paths, non_video_paths): (Vec<_>, Vec<_>) = non_midi_paths
             .into_iter()
             .partition(|p| crate::import_video::looks_like_video(p));
         #[cfg(not(windows))]
         let (video_paths, non_video_paths): (Vec<std::path::PathBuf>, Vec<_>) =
-            (Vec::new(), drop.paths);
+            (Vec::new(), non_midi_paths);
         let (image_paths, audio_paths): (Vec<_>, Vec<_>) = non_video_paths
             .into_iter()
             .partition(|p| crate::import_image::is_supported_extension(p));
@@ -805,6 +810,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             let paths = image_paths;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::ImportImage {
+                    paths,
+                    target,
+                    target_beat,
+                });
+            }));
+        }
+        if !midi_paths.is_empty() {
+            let paths = midi_paths;
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::ImportMidi {
                     paths,
                     target,
                     target_beat,

@@ -289,6 +289,12 @@ fn draw_menu_bar<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
                     app.handle_event(AppEvent::OpenImportImageDialog)
                 }));
             });
+            // r.md #66: Export MIDI と対称の取り込み導線 (D&D と同じ pipeline)。
+            m.item("Import MIDI...", |ui| {
+                ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                    app.handle_event(AppEvent::OpenImportMidiDialog)
+                }));
+            });
             // Text クリップは File メニューではなく、 アレンジの空きレーン右クリック →
             // "Text クリップ" で生成する (docs/plan_text_clip_creation.md)。 text トラックは
             // 存在せず、 他 clip と同じくタイムライン上で生成する。

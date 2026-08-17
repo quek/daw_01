@@ -1218,6 +1218,23 @@ pub enum AppEvent {
     /// extensions and dispatch the selection as `AppEvent::ImportImage`.
     OpenImportImageDialog,
 
+    /// r.md #66 (`docs/plan_midi_import.md`): MIDI (SMF) ファイルの取り込み。
+    /// 1 SMF track = daw_01 track 1 本 (`midi_export` の逆写像)、1 SMF track に
+    /// 複数 MIDI channel が混在していれば channel ごとに分割する。`target` が
+    /// 既存 track を指していれば 1 本目をその track に載せ、2 本目以降はその
+    /// 直下へ挿入する。それ以外は全部一番下に追加 (r.md #31 の統一規則)。
+    /// テンポ / 拍子は「曲にクリップが 1 つも無いとき」だけ取り込む。
+    ImportMidi {
+        paths: Vec<PathBuf>,
+        target: ImportTrackTarget,
+        /// drag&drop の drop X 位置から計算した beat (snap 済み)。SMF の tick 0 を
+        /// この beat に写す。`None` なら playhead フォールバック (dialog / File menu)。
+        target_beat: Option<f64>,
+    },
+    /// File menu → "Import MIDI..."。`rfd` の picker (mid / midi / smf / kar / rmi
+    /// filter) を開いて選択を `AppEvent::ImportMidi` に転送する。
+    OpenImportMidiDialog,
+
     /// docs/plan_text_clip_creation.md: 空きレーン右クリック → "Text クリップ" で
     /// `track` (track id) の `start_beat` 位置に `ClipContent::Text` clip を 1 個追加
     /// する。clip は単一 `TextEvent` を default 体裁 (= center band, 64 px white font)
@@ -1794,6 +1811,7 @@ impl AppEvent {
             E::ImportAudio { .. } => "オーディオ読み込み",
             E::ImportVideo { .. } => "動画読み込み",
             E::ImportImage { .. } => "画像読み込み",
+            E::ImportMidi { .. } => "MIDI 読み込み",
 
             // 非編集 event (snapshot を積まない) はここに落ちてラベルは記録
             // されない。 編集 event のラベル漏れも "編集" で名前を保証する。
