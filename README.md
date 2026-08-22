@@ -38,6 +38,52 @@ FFmpeg 共有ライブラリに依存する。
 VOICEVOX の合成機能を使うには **VOICEVOX を別途インストール**して起動しておく
 (daw_01 は `http://localhost:50021` に HTTP で話しかけるだけで、VOICEVOX 本体は同梱しない)。
 
+## Claude Code の hook が同梱されている (clone したら読むこと)
+
+このリポジトリは [`.claude/settings.json`](.claude/settings.json) を **git 追跡している**。
+そのため **clone したツリーを Claude Code で開くと、下の 8 本の hook が自動で有効になり、
+以後のツール呼び出しのたびにローカルで実行される**。
+
+これらは作者のエージェント運用ループ (CLAUDE.md の「Reflection の確認」節) のためのもので、
+**daw_01 のビルド・実行・テストには一切不要**。Claude Code を使わない場合は何も起きない。
+
+実体は [`.claude/hooks/`](.claude/hooks) と [`scripts/`](scripts) にある。
+
+| イベント | スクリプト | 何をするか |
+|---|---|---|
+| SessionStart | [`sessionstart_show_pending_reflections.sh`](.claude/hooks/sessionstart_show_pending_reflections.sh) | 前セッションが書き残した「要 triage」項目をセッション冒頭に提示し、ファイルを `.last` へ回転する |
+| PreToolUse (Edit/Write/Bash 等) | [`scripts/guard_engine.py`](scripts/guard_engine.py) | ユーザ home のルール DB (`guards.jsonl`) の正規表現をツール入力に当て、一致したら警告する。ルールの `action` が `block` のものは **そのツール呼び出しを取り消す** |
+| PreToolUse (Bash) | [`pretooluse_git_commit_review_reminder.sh`](.claude/hooks/pretooluse_git_commit_review_reminder.sh) | `git commit` の前にレビューと同件チェックの実施を促す文面を差し込む (警告のみ) |
+| PreToolUse (Bash) | [`scripts/check_destructive_delete.py`](scripts/check_destructive_delete.py) | 削除対象が変数・環境変数参照やルート相当のとき、再帰削除コマンドを **取り消す** (リテラルな部分パスの削除は通す) |
+| PostToolUse | [`scripts/log_metric.py`](scripts/log_metric.py) | ツール呼び出し 1 件につき 1 行を **ユーザ home の jsonl へ追記** (時刻 / セッション id / ツール名 / 対象の要約 / 成否) |
+| Stop | [`stop_session_reflect.sh`](.claude/hooks/stop_session_reflect.sh) | セッションの transcript から直近のやり取りを読み、修正・やり直しのパターンを検出して **抜粋つきで**次セッション用ファイルに書く |
+| Stop | [`scripts/reflect.py`](scripts/reflect.py) | 同じ警告ルールが 3 セッション以上で発火していたら `guards.jsonl` を書き換えて `warn` → `block` に自動昇格する (= 以後そのパターンはツール呼び出しごと取り消される)。Bash の連続失敗も検出して backlog に 1 行足す |
+| WorktreeRemove | [`scripts/worktree_remove_cleanup.py`](scripts/worktree_remove_cleanup.py) | worktree 削除がファイルロックで失敗して dir が残った場合に、ロック元を落として dir を消す (下記) |
+
+有効にする前に知っておくべき挙動が 3 つある。
+
+**1. `worktree_remove_cleanup.py` の削除範囲とプロセス kill は範囲が違う。**
+ディレクトリ削除 (`shutil.rmtree`) は **`<リポジトリ>/.claude/worktrees/` 配下に限定**され、
+それ以外のパスが渡されたら何もせずに戻る (main のチェックアウトや任意のパスは触らない)。
+一方、ロック元を落とす `taskkill /F /IM rust-analyzer.exe` (と `rust-analyzer-proc-macro-srv.exe`) は
+**イメージ名指定なのでマシン全体に効く** — 無関係な別プロジェクトで動いている rust-analyzer も
+一緒に落ちる。走るのは Windows で、かつ「削除に失敗して dir が実在する」ときだけ。
+
+**2. リポジトリの外に書き、プロンプトの抜粋を含む。**
+`log_metric.py` / `reflect.py` / `guard_engine.py` の書き込み先は
+`~/.claude/projects/F--dev-daw-01/` 配下 (`metrics/*.jsonl` / `guards.jsonl` /
+`guard_hits.jsonl` / `ahe_backlog.md`)。**このディレクトリ名は作者のパス由来でハードコード**
+されているので、別の場所に clone しても同じ名前の下に溜まる。
+`stop_session_reflect.sh` はセッションの transcript を読み、検出したユーザ発言の抜粋を
+main チェックアウトの `.claude/.session_reflect_pending.md` に書く。
+
+**3. 外部通信はしない。** 8 本とも読むのはローカルのファイルと標準入力だけで、
+ネットワークアクセスも認証情報の読み取りも行わない。
+
+無効化するには、clone 後に `.claude/settings.json` の `hooks` ブロックを削除する
+(追跡ファイルなので、差分を残したくなければ `git update-index --skip-worktree .claude/settings.json`
+を併用する)。`.claude/settings.local.json` は gitignore 対象なので clone には含まれない。
+
 ## ライセンス
 
 daw_01 は **GNU General Public License version 3 or later (GPL-3.0-or-later)** で頒布する。

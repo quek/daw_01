@@ -54,11 +54,20 @@ const song = {
 };
 daw.loadSongFromObject(song);
 
+// プラグインの絶対パスは呼び出し側 (sidechain_real_vst3.rs) が --arg plugin=... で渡す。
+// 開発機のパスをここに書かない (別マシンでは必ず外れ、個人の環境が repo に焼き付く)。
+const pluginPath = daw.scriptArgs.plugin;
+if (!pluginPath) {
+  throw new Error(
+    "pdc_mcompressor_sidechain.js: --arg plugin=<MCompressor.vst3 のパス> が必要です",
+  );
+}
+
 daw.setSlotPlugin(
   2,
   0,
   "vst3",
-  "C:/Program Files/Common Files/VST3/MeldaProduction/Dynamics/MCompressor.vst3",
+  pluginPath,
   "",
 );
 daw.waitForPluginLoaded(2, 0, 30000);

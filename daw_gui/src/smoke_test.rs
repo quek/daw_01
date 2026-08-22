@@ -18,6 +18,28 @@
 //!
 //! The pattern would have caught `c2ae697` in seconds.
 //!
+//! # The fixture
+//!
+//! `tests/fixtures/smoke_test.mp4` is a 2-second 320x240 30fps `testsrc`
+//! colour-bar pattern (author-generated content, no third-party footage).
+//! It is regenerated with the **pinned** FFmpeg we actually ship, so that the
+//! repository does not depend on whatever `ffmpeg` happens to be on the
+//! developer's PATH:
+//!
+//! ```text
+//! third_party/ffmpeg/bin/ffmpeg -f lavfi \
+//!   -i "testsrc=duration=2:size=320x240:rate=30" \
+//!   -c:v libopenh264 -pix_fmt yuv420p -y daw_gui/tests/fixtures/smoke_test.mp4
+//! ```
+//!
+//! `libopenh264` rather than `libx264` because the pinned build is configured
+//! `--disable-libx264` (see NOTICE). An earlier fixture had been encoded with a
+//! GPL-enabled system FFmpeg, which left `x264 ... Copyleft` strings inside the
+//! file — harmless for copyright (the *content* is ours and encoder output is
+//! not a derivative of the encoder) but it contradicted NOTICE and would be
+//! flagged by licence scanners. `crate::test_ffmpeg` holds the same choice for
+//! the fixtures that unit tests generate at runtime.
+//!
 //! # How it works
 //!
 //! 1. Caller spawns the orchestrator thread from `main.rs` **after** the
