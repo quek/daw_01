@@ -2168,6 +2168,30 @@ fn compute_automation_clip_drag_beat_delta(
     snapped - pivot
 }
 
+/// r.md #71: section の Move drag の **落とし先** (= 移動後の帯の開始拍)。
+/// overlay (ghost) と release commit がこの 1 本を共有する。
+///
+/// snap 済 delta を素の位置に足したあと、`common::model::resolve_section_move_dest` で
+/// 「他帯に食い込まない位置」 へ解決する (合法な位置は素通しなので、通常のドラッグの
+/// 感触は変わらない)。 `Song::move_section` も同じ関数を内部で通す = 冪等。
+fn section_move_dest(sections: &[SectionView], sd: &SectionDragSession, delta: f64) -> f64 {
+    common::model::resolve_section_move_dest(
+        sections.iter().filter(|s| s.id != sd.section_id).map(|s| (s.start_beat, s.len_beats)),
+        sd.anchor_start,
+        sd.anchor_len,
+        (sd.anchor_start + delta).max(0.0),
+    )
+}
+
+/// r.md #71 同件: Ctrl+drag (複製) の **落とし先**。 移動と違い close しないので、
+/// 障害物は全帯を現在位置のまま (元帯も含む)。 overlay (ghost) と release commit で共有。
+fn section_duplicate_dest(sections: &[SectionView], sd: &SectionDragSession, delta: f64) -> f64 {
+    common::model::resolve_section_drop_start(
+        sections.iter().map(|s| (s.start_beat, s.len_beats)),
+        (sd.anchor_start + delta).max(0.0),
+    )
+}
+
 /// M14 Phase 127 (daw_01 #105): section drag の snap 適用済 beat delta (`compute_clip_drag_beat_delta`
 /// の section 版)。 pivot = 編集対象端の **絶対位置** (Move/ResizeLeft = `anchor_start`、 ResizeRight =
 /// `anchor_start + anchor_len`、 Create = `anchor_press_beat` の固定端) を snap して差分を返す

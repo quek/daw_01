@@ -766,6 +766,8 @@ pub(super) fn push_selection_ring<M: ?Sized + 'static>(
 /// 同じ `compute_section_drag_beat_delta` を通すことで overlay == commit を保証する。
 pub(super) fn section_preview_start_len(
     s: &SectionView,
+    // r.md #71: Move の落とし先解決に他帯の位置が要る (食い込む位置は境界へ寄せる)。
+    sections: &[SectionView],
     section_drag: Option<SectionDragSession>,
     beat_per_px: f64,
     snap: &SnapConfig,
@@ -784,7 +786,9 @@ pub(super) fn section_preview_start_len(
             if sd.last_ctrl {
                 (s.start_beat, s.len_beats)
             } else {
-                ((s.start_beat + delta).max(0.0), s.len_beats)
+                // r.md #71: release commit と **同じ** `section_move_dest` を通す。
+                // 片方だけ解決すると「見えていた位置と違う所に落ちる」。
+                (section_move_dest(sections, &sd, delta), s.len_beats)
             }
         }
         SectionGesture::ResizeLeft => {
@@ -852,8 +856,14 @@ pub(super) fn draw_sections_lane<M: ?Sized + 'static>(
             .filter(|sd| sd.kind != SectionGesture::Create)
             .map(|sd| sd.section_id);
         let draw_band = |hctx: &mut HeavyCtx<'_, '_, M>, s: &SectionView| {
-            let (start, len) =
-                section_preview_start_len(s, section_drag, beat_per_px, snap, zoom_x_px_per_beat);
+            let (start, len) = section_preview_start_len(
+                s,
+                sections,
+                section_drag,
+                beat_per_px,
+                snap,
+                zoom_x_px_per_beat,
+            );
             let r = section_rect_from(start, len, view, arranger);
             draw_section_band(hctx, &s.name, s.color, r, s.selected, style);
         };
@@ -878,7 +888,8 @@ pub(super) fn draw_sections_lane<M: ?Sized + 'static>(
         match sd.kind {
             // Ctrl+drag (複製): 複製先に半透明 ghost 帯。
             SectionGesture::Move if sd.last_ctrl => {
-                let dest = (sd.anchor_start + delta).max(0.0);
+                // r.md #71 同件: release commit と同じ `section_duplicate_dest`。
+                let dest = section_duplicate_dest(sections, &sd, delta);
                 let r = section_rect_from(dest, sd.anchor_len, view, arranger);
                 push_filled_rect(hctx, r, style.arranger_preview_fill);
                 push_section_border(hctx, r, style.clip_border, 1.0);
