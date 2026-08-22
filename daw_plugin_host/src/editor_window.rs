@@ -1069,8 +1069,30 @@ fn describe_rect_and_visibility(w: HWND) -> String {
 ///
 /// 「前面なのに見えない」なら、何かが上に載っている可能性がある。別プロセスの窓
 /// (daw_gui 本体など) もここに出るので、覆っている犯人が特定できる。
+///
+/// # 読み方の罠 (実測で踏んだ)
+///
+/// **`GW_HWNDPREV` は「兄弟」の中をたどる**。`w` が子窓なら、これが測っているのは
+/// **親のクライアント領域内での順序**であってデスクトップ上の順序ではない。
+/// r.md #65 では、階層上まだ子だった view に対してこれが
+/// `(topmost among visible windows)` を返し、**「Z 順は問題なし」と誤読しかねない
+/// 形になっていた** (実際にはデスクトップ上ではブラウザの下だった)。
+///
+/// そこで **測っている空間を値に埋め込む**: 子窓なら `(container-relative)` と明示し、
+/// 何も無いときも「デスクトップ上で最前面」とは書かない。
 fn describe_windows_above(w: HWND, limit: usize) -> String {
-    use windows::Win32::UI::WindowsAndMessaging::{GW_HWNDPREV, IsWindowVisible};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_PARENT, GW_HWNDPREV, GetAncestor, GetDesktopWindow, IsWindowVisible,
+    };
+    // どの空間の Z 順を測っているのか。
+    let parent = unsafe { GetAncestor(w, GA_PARENT) };
+    let desktop = unsafe { GetDesktopWindow() };
+    let space = if parent.0.is_null() || parent == desktop {
+        "desktop".to_string()
+    } else {
+        format!("siblings-inside-{:#x}", parent.0 as usize)
+    };
+
     let mut out = Vec::new();
     let mut cur = w;
     for _ in 0..limit {
@@ -1086,9 +1108,9 @@ fn describe_windows_above(w: HWND, limit: usize) -> String {
         out.push(describe_hwnd(cur));
     }
     if out.is_empty() {
-        "(topmost among visible windows)".to_string()
+        format!("z-space={space} (nothing visible above it in THIS space)")
     } else {
-        out.join(" | ")
+        format!("z-space={space} {}", out.join(" | "))
     }
 }
 
@@ -1166,8 +1188,9 @@ fn describe_plugin_view(container: HWND, shared: &EditorShared) -> String {
     };
     format!(
         "{:#x} style={:#010x} verdict=\"{verdict}\" \
-         GetParent={:#x} GA_PARENT={:#x} GA_ROOT={:#x} GA_ROOTOWNER={:#x} GW_OWNER={:#x} \
-         desktop={:#x} is_child_of_container={} {} above=[{}]",
+         GetParent={:#x}(ambiguous) GA_PARENT={:#x} GA_ROOT={:#x} GA_ROOTOWNER={:#x} \
+         GW_OWNER={:#x} desktop={:#x} IsChild={}(false-negative-when-WS_CHILD-cleared) \
+         {} above=[{}]",
         view.0 as usize,
         unsafe { GetWindowLongPtrW(view, GWL_STYLE) } as u32,
         unsafe { GetParent(view) }.unwrap_or_default().0 as usize,
@@ -1176,6 +1199,10 @@ fn describe_plugin_view(container: HWND, shared: &EditorShared) -> String {
         unsafe { GetAncestor(view, GA_ROOTOWNER) }.0 as usize,
         unsafe { GetWindow(view, GW_OWNER) }.unwrap_or_default().0 as usize,
         desktop.0 as usize,
+        // **`IsChild` はこの状態の検出に使えない**: `WS_CHILD` の連鎖をたどるので、
+        // そのビットが落ちている今は必ず `false` を返す (偽陰性)。値は残すが、
+        // 「false だから子ではない」と読まれないよう名前で警告する。
+        // 判定に使うのは上の `GA_PARENT` / `GA_ROOT`。
         unsafe { IsChild(container, view) }.as_bool(),
         describe_rect_and_visibility(view),
         describe_windows_above(view, 4),
